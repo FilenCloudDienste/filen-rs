@@ -1,4 +1,4 @@
-use std::{borrow::Cow, sync::Arc};
+use std::{borrow::Cow, fmt::Debug, sync::Arc};
 
 use chrono::Utc;
 use filen_macros::shared_test_runtime;
@@ -10,6 +10,7 @@ use filen_sdk_rs::{
 		HasMetaExt, HasName, HasParent, HasUUID, NewDir, NewDirParent, dir::RemoteDirectory,
 		file::RemoteFile,
 	},
+	notes::{Note, NoteTag},
 	sync::lock::ResourceLock,
 };
 use filen_types::{
@@ -19,15 +20,16 @@ use filen_types::{
 			dir::{color, link::add},
 			exists, favorite,
 			file::stable,
-			linked, present, rename, restore, share, shared,
+			linked, notes as bulk_notes, present, rename, restore, share, shared,
 		},
 		contacts::Contact,
 		dir::{self, color::DirColor, link::PublicLinkExpiration},
-		file,
+		file, notes,
 	},
 	fs::{ObjectType, ParentUuid, StableUuid, Uuid},
 	traits::CowHelpers,
 };
+use serde::{Serialize, de::DeserializeOwned};
 
 mod drive_helpers;
 
@@ -1312,4 +1314,405 @@ fn names(items: &[impl HasName]) -> Vec<&str> {
 		.collect::<Vec<_>>();
 	names.sort_unstable();
 	names
+}
+
+/// Two new notes. The caller holds the notes test lock for the whole test, and deletes both at its
+/// end: notes are account-wide and nothing cleans them up.
+async fn two_notes(client: &Client) -> [Note; 2] {
+	[
+		client.create_note(None).await.unwrap(),
+		client.create_note(None).await.unwrap(),
+	]
+}
+
+/// Posts one bulk notes `request`, whose items are `items`, to `endpoint` and answers each item's
+/// result. The generic seam takes no lock, so this holds the notes write lock the single routes
+/// take.
+async fn post_notes<I, T: DeserializeOwned>(
+	client: &Client,
+	endpoint: &'static str,
+	request: &(impl Serialize + Debug),
+	items: &[I],
+) -> Vec<Result<T, Error>> {
+	let _lock = client.lock_notes().await.unwrap();
+	client
+		.post_bulk_for_test(endpoint, request, items)
+		.await
+		.unwrap()
+}
+
+/// Each of exactly `N` item results, unwrapped.
+fn all_ok<T: Debug, const N: usize>(results: Vec<Result<T, Error>>) -> [T; N] {
+	results
+		.into_iter()
+		.map(Result::unwrap)
+		.collect::<Vec<_>>()
+		.try_into()
+		.unwrap()
+}
+
+/// `note` as the server lists it now.
+async fn fetch_note(client: &Client, note: &Note) -> Note {
+	client.get_note(*note.uuid()).await.unwrap().unwrap()
+}
+
+async fn delete_notes(client: &Client, notes: impl IntoIterator<Item = Note>) {
+	for note in notes {
+		client.delete_note(note).await.unwrap();
+	}
+}
+
+fn tag_names(note: &Note) -> Vec<Option<&str>> {
+	note.tags().iter().map(NoteTag::name).collect()
+}
+
+#[shared_test_runtime]
+async fn notes_pinned_pins_and_unpins_notes() {
+	let client = test_utils::RESOURCES.client().await;
+	let _lock = client
+		.acquire_lock_with_default(test_utils::locks::NOTES)
+		.await
+		.unwrap();
+	let [n1, mut n2] = two_notes(&client).await;
+	client.set_note_pinned(&mut n2, true).await.unwrap();
+
+	let items = [
+		notes::pinned::Request {
+			uuid: *n1.uuid(),
+			pinned: true,
+		},
+		notes::pinned::Request {
+			uuid: *n2.uuid(),
+			pinned: false,
+		},
+	];
+	let [(), ()] = all_ok(
+		post_notes(
+			&client,
+			bulk_notes::pinned::ENDPOINT,
+			&bulk_notes::pinned::Request { items: &items },
+			&items,
+		)
+		.await,
+	);
+
+	assert!(fetch_note(&client, &n1).await.pinned(), "n1 pinned");
+	assert!(!fetch_note(&client, &n2).await.pinned(), "n2 unpinned");
+	delete_notes(&client, [n1, n2]).await;
+}
+
+#[shared_test_runtime]
+async fn notes_favorite_favorites_and_unfavorites_notes() {
+	let client = test_utils::RESOURCES.client().await;
+	let _lock = client
+		.acquire_lock_with_default(test_utils::locks::NOTES)
+		.await
+		.unwrap();
+	let [n1, mut n2] = two_notes(&client).await;
+	client.set_note_favorited(&mut n2, true).await.unwrap();
+
+	let items = [
+		notes::favorite::Request {
+			uuid: *n1.uuid(),
+			favorite: true,
+		},
+		notes::favorite::Request {
+			uuid: *n2.uuid(),
+			favorite: false,
+		},
+	];
+	let [(), ()] = all_ok(
+		post_notes(
+			&client,
+			bulk_notes::favorite::ENDPOINT,
+			&bulk_notes::favorite::Request { items: &items },
+			&items,
+		)
+		.await,
+	);
+
+	assert!(fetch_note(&client, &n1).await.favorited(), "n1 favorited");
+	assert!(
+		!fetch_note(&client, &n2).await.favorited(),
+		"n2 unfavorited"
+	);
+	delete_notes(&client, [n1, n2]).await;
+}
+
+#[shared_test_runtime]
+async fn notes_trash_trashes_notes_and_unarchives_them() {
+	let client = test_utils::RESOURCES.client().await;
+	let _lock = client
+		.acquire_lock_with_default(test_utils::locks::NOTES)
+		.await
+		.unwrap();
+	let [n1, mut n2] = two_notes(&client).await;
+	client.archive_note(&mut n2).await.unwrap();
+
+	let items = [
+		notes::trash::Request { uuid: *n1.uuid() },
+		notes::trash::Request { uuid: *n2.uuid() },
+	];
+	let [(), ()] = all_ok(
+		post_notes(
+			&client,
+			bulk_notes::trash::ENDPOINT,
+			&bulk_notes::trash::Request { items: &items },
+			&items,
+		)
+		.await,
+	);
+
+	for (name, note) in [("n1", &n1), ("n2", &n2)] {
+		let fetched = fetch_note(&client, note).await;
+		assert_eq!(
+			(fetched.trashed(), fetched.archived()),
+			(true, false),
+			"{name} (trashed, archived)"
+		);
+	}
+	delete_notes(&client, [n1, n2]).await;
+}
+
+#[shared_test_runtime]
+async fn notes_archive_archives_notes_and_untrashes_them() {
+	let client = test_utils::RESOURCES.client().await;
+	let _lock = client
+		.acquire_lock_with_default(test_utils::locks::NOTES)
+		.await
+		.unwrap();
+	let [n1, mut n2] = two_notes(&client).await;
+	client.trash_note(&mut n2).await.unwrap();
+
+	let items = [
+		notes::archive::Request { uuid: *n1.uuid() },
+		notes::archive::Request { uuid: *n2.uuid() },
+	];
+	let [(), ()] = all_ok(
+		post_notes(
+			&client,
+			bulk_notes::archive::ENDPOINT,
+			&bulk_notes::archive::Request { items: &items },
+			&items,
+		)
+		.await,
+	);
+
+	for (name, note) in [("n1", &n1), ("n2", &n2)] {
+		let fetched = fetch_note(&client, note).await;
+		assert_eq!(
+			(fetched.trashed(), fetched.archived()),
+			(false, true),
+			"{name} (trashed, archived)"
+		);
+	}
+	delete_notes(&client, [n1, n2]).await;
+}
+
+#[shared_test_runtime]
+async fn notes_restore_clears_trash_and_archive() {
+	let client = test_utils::RESOURCES.client().await;
+	let _lock = client
+		.acquire_lock_with_default(test_utils::locks::NOTES)
+		.await
+		.unwrap();
+	let [mut n1, mut n2] = two_notes(&client).await;
+	client.trash_note(&mut n1).await.unwrap();
+	client.archive_note(&mut n2).await.unwrap();
+
+	let items = [
+		notes::restore::Request { uuid: *n1.uuid() },
+		notes::restore::Request { uuid: *n2.uuid() },
+	];
+	let [(), ()] = all_ok(
+		post_notes(
+			&client,
+			bulk_notes::restore::ENDPOINT,
+			&bulk_notes::restore::Request { items: &items },
+			&items,
+		)
+		.await,
+	);
+
+	for (name, note) in [("n1", &n1), ("n2", &n2)] {
+		let fetched = fetch_note(&client, note).await;
+		assert_eq!(
+			(fetched.trashed(), fetched.archived()),
+			(false, false),
+			"{name} (trashed, archived)"
+		);
+	}
+	delete_notes(&client, [n1, n2]).await;
+}
+
+#[shared_test_runtime]
+async fn notes_delete_deletes_notes() {
+	let client = test_utils::RESOURCES.client().await;
+	let _lock = client
+		.acquire_lock_with_default(test_utils::locks::NOTES)
+		.await
+		.unwrap();
+	let [n1, n2] = two_notes(&client).await;
+
+	let items = [
+		notes::delete::Request { uuid: *n1.uuid() },
+		notes::delete::Request { uuid: *n2.uuid() },
+	];
+	let [(), ()] = all_ok(
+		post_notes(
+			&client,
+			bulk_notes::delete::ENDPOINT,
+			&bulk_notes::delete::Request { items: &items },
+			&items,
+		)
+		.await,
+	);
+
+	assert!(client.get_note(*n1.uuid()).await.unwrap().is_none(), "n1");
+	assert!(client.get_note(*n2.uuid()).await.unwrap().is_none(), "n2");
+}
+
+#[shared_test_runtime]
+async fn notes_tag_tags_notes() {
+	let client = test_utils::RESOURCES.client().await;
+	// Also keeps note_tag_manipulation, which deletes every tag, off this test's tag.
+	let _lock = client
+		.acquire_lock_with_default(test_utils::locks::NOTES)
+		.await
+		.unwrap();
+	let tag = client.create_note_tag("bulk tag".to_owned()).await.unwrap();
+	let [n1, n2] = two_notes(&client).await;
+
+	let items = [
+		notes::tag::Request {
+			uuid: *n1.uuid(),
+			tag: tag.uuid_for_test(),
+		},
+		notes::tag::Request {
+			uuid: *n2.uuid(),
+			tag: tag.uuid_for_test(),
+		},
+	];
+	// A newly tagged note answers the tag's new edit time.
+	let [_, _]: [notes::tag::Response; 2] = all_ok(
+		post_notes(
+			&client,
+			bulk_notes::tag::ENDPOINT,
+			&bulk_notes::tag::Request { items: &items },
+			&items,
+		)
+		.await,
+	);
+
+	for (name, note) in [("n1", &n1), ("n2", &n2)] {
+		assert_eq!(
+			tag_names(&fetch_note(&client, note).await),
+			[Some("bulk tag")],
+			"{name}"
+		);
+	}
+	delete_notes(&client, [n1, n2]).await;
+	client.delete_note_tag(tag).await.unwrap();
+}
+
+#[shared_test_runtime]
+async fn notes_untag_untags_notes() {
+	let client = test_utils::RESOURCES.client().await;
+	let _lock = client
+		.acquire_lock_with_default(test_utils::locks::NOTES)
+		.await
+		.unwrap();
+	let mut tag = client
+		.create_note_tag("bulk untag".to_owned())
+		.await
+		.unwrap();
+	let [mut n1, mut n2] = two_notes(&client).await;
+	client.add_tag_to_note(&mut n1, &mut tag).await.unwrap();
+	client.add_tag_to_note(&mut n2, &mut tag).await.unwrap();
+
+	let items = [
+		notes::untag::Request {
+			uuid: *n1.uuid(),
+			tag: tag.uuid_for_test(),
+		},
+		notes::untag::Request {
+			uuid: *n2.uuid(),
+			tag: tag.uuid_for_test(),
+		},
+	];
+	let [(), ()] = all_ok(
+		post_notes(
+			&client,
+			bulk_notes::untag::ENDPOINT,
+			&bulk_notes::untag::Request { items: &items },
+			&items,
+		)
+		.await,
+	);
+
+	for (name, note) in [("n1", &n1), ("n2", &n2)] {
+		assert_eq!(
+			tag_names(&fetch_note(&client, note).await),
+			[] as [Option<&str>; 0],
+			"{name}"
+		);
+	}
+	delete_notes(&client, [n1, n2]).await;
+	client.delete_note_tag(tag).await.unwrap();
+}
+
+#[shared_test_runtime]
+async fn notes_participants_add_adds_a_contact_who_can_read_the_note() {
+	let client = test_utils::RESOURCES.client().await;
+	let share_client = test_utils::SHARE_RESOURCES.client().await;
+	// The contact locks come before the notes lock, as in note_tests' note_sharing.
+	let (contact, _contact_locks) = contact(&client, &share_client).await;
+	let _lock = client
+		.acquire_lock_with_default(test_utils::locks::NOTES)
+		.await
+		.unwrap();
+	let mut note = client.create_note(None).await.unwrap();
+	client
+		.set_note_content(&mut note, "bulk shared content", "bulk".to_owned())
+		.await
+		.unwrap();
+
+	let items = [note.participant_item_for_test(&contact, false).unwrap()];
+	let [_]: [notes::participants::add::Response<'static>; 1] = all_ok(
+		post_notes(
+			&client,
+			bulk_notes::participants::add::ENDPOINT,
+			&bulk_notes::participants::add::Request {
+				uuid: *note.uuid(),
+				items: &items,
+			},
+			&items,
+		)
+		.await,
+	);
+
+	assert!(
+		fetch_note(&client, &note)
+			.await
+			.participants()
+			.iter()
+			.any(|participant| participant.user_id() == contact.user_id),
+		"the contact is a participant"
+	);
+	// The receiver decrypts the content with the note key it unwraps from the item's metadata.
+	let mut shared = share_client.get_note(*note.uuid()).await.unwrap().unwrap();
+	assert_eq!(
+		share_client
+			.get_note_content(&mut shared)
+			.await
+			.unwrap()
+			.as_deref(),
+		Some("bulk shared content")
+	);
+
+	client
+		.remove_note_participant(&mut note, contact.user_id)
+		.await
+		.unwrap();
+	client.delete_note(note).await.unwrap();
 }

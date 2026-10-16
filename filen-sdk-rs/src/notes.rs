@@ -84,6 +84,14 @@ impl NoteTag {
 	pub fn edited(&self) -> DateTime<Utc> {
 		self.edited_timestamp
 	}
+
+	// Test seam: the live tests name tags in `bulk/notes/tag` and `bulk/notes/untag` items. Gated
+	// behind the `test-seams` feature, which production builds never enable.
+	/// The tag's uuid, as the tag and untag requests name it. Test code only.
+	#[cfg(feature = "test-seams")]
+	pub fn uuid_for_test(&self) -> Uuid {
+		self.uuid
+	}
 }
 
 struct NoteParticipantParts {
@@ -239,6 +247,28 @@ impl Note {
 		key.decrypt_meta(meta)
 			.await
 			.context("decrypt_meta_with_note_key")
+	}
+
+	// Test seam: the live tests add participants through `bulk/notes/participants/add`. Gated
+	// behind the `test-seams` feature, which production builds never enable.
+	/// The `bulk/notes/participants/add` item that adds `contact` to this note, with this note's
+	/// key wrapped for the contact as [`Client::add_note_participant`] wraps it. Test code only.
+	#[cfg(feature = "test-seams")]
+	pub fn participant_item_for_test(
+		&self,
+		contact: &Contact<'_>,
+		write: bool,
+	) -> Result<filen_types::api::v3::bulk::notes::participants::add::Item<'static>, Error> {
+		Ok(filen_types::api::v3::bulk::notes::participants::add::Item {
+			contact_uuid: ContactUuid::Uuid(contact.uuid),
+			metadata: NoteOrChatKeyStruct::blocking_try_encrypt_rsa(
+				&contact.public_key,
+				self.encryption_key
+					.as_ref()
+					.ok_or(MetadataWasNotDecryptedError)?,
+			)?,
+			permissions_write: write,
+		})
 	}
 }
 
