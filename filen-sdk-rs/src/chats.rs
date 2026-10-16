@@ -192,6 +192,30 @@ impl Chat {
 			.context("decrypt_chat_message")
 	}
 
+	// Test seam: the live tests add participants through `bulk/chat/conversations/participants/add`.
+	// Gated behind the `test-seams` feature, which production builds never enable.
+	/// The `bulk/chat/conversations/participants/add` item that adds `contact` to this chat, with
+	/// this chat's key wrapped for the contact as [`Client::add_chat_participant`] wraps it. Test
+	/// code only.
+	#[cfg(feature = "test-seams")]
+	pub fn participant_item_for_test(
+		&self,
+		contact: &Contact<'_>,
+	) -> Result<
+		filen_types::api::v3::bulk::chat::conversations::participants::add::Item<'static>,
+		Error,
+	> {
+		Ok(
+			filen_types::api::v3::bulk::chat::conversations::participants::add::Item {
+				contact_uuid: contact.uuid,
+				metadata: NoteOrChatKeyStruct::blocking_try_encrypt_rsa(
+					&contact.public_key,
+					self.key.as_ref().ok_or(MetadataWasNotDecryptedError)?,
+				)?,
+			},
+		)
+	}
+
 	pub(crate) fn blocking_decrypt(
 		user_id: u64,
 		private_key: &RsaPrivateKey,

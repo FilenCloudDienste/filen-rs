@@ -1,10 +1,11 @@
-use std::{borrow::Cow, fmt::Debug, sync::Arc};
+use std::{borrow::Cow, fmt::Debug, slice, sync::Arc};
 
 use chrono::Utc;
 use filen_macros::shared_test_runtime;
 use filen_sdk_rs::{
 	Error, ErrorKind,
 	auth::Client,
+	chats::Chat,
 	connect::PublicLinkSharedClientExt,
 	fs::{
 		HasMetaExt, HasName, HasParent, HasUUID, NewDir, NewDirParent, dir::RemoteDirectory,
@@ -16,16 +17,18 @@ use filen_sdk_rs::{
 use filen_types::{
 	api::v3::{
 		bulk::{
-			FileOrDir,
+			FileOrDir, chat as bulk_chat,
 			dir::{color, link::add},
 			exists, favorite,
 			file::stable,
 			linked, notes as bulk_notes, present, rename, restore, share, shared,
 		},
+		chat,
 		contacts::Contact,
 		dir::{self, color::DirColor, link::PublicLinkExpiration},
 		file, notes,
 	},
+	crypto::rsa::RSAEncryptedString,
 	fs::{ObjectType, ParentUuid, StableUuid, Uuid},
 	traits::CowHelpers,
 };
@@ -1715,4 +1718,159 @@ async fn notes_participants_add_adds_a_contact_who_can_read_the_note() {
 		.await
 		.unwrap();
 	client.delete_note(note).await.unwrap();
+}
+
+/// The share account as a contact, then the share account's and this account's `test:chats`
+/// lock, in the order chat_tests' `lock_chats` takes them: both contact locks before either chats
+/// lock, and the share account's chats lock first. Taking them the other way round deadlocked
+/// against another leg.
+async fn chat_contact_and_locks(
+	client: &Client,
+	share_client: &Client,
+) -> (Contact<'static>, [Arc<ResourceLock>; 4]) {
+	let (contact, [contact_lock, share_contact_lock]) = contact(client, share_client).await;
+	let share_chat_lock = test_utils::lock_chat(share_client).await;
+	let chat_lock = test_utils::lock_chat(client).await;
+	(
+		contact,
+		[contact_lock, share_contact_lock, share_chat_lock, chat_lock],
+	)
+}
+
+/// Posts `items` to `bulk/chat/conversations/participants/add` for `chat` under the chats write
+/// lock the single route takes, and answers each item's result.
+async fn add_chat_participants(
+	client: &Client,
+	chat: &Chat,
+	items: &[bulk_chat::conversations::participants::add::Item<'_>],
+) -> Vec<Result<chat::conversations::participants::add::Response, Error>> {
+	let _lock = client.lock_chats().await.unwrap();
+	client
+		.post_bulk_for_test(
+			bulk_chat::conversations::participants::add::ENDPOINT,
+			&bulk_chat::conversations::participants::add::Request {
+				uuid: chat.uuid(),
+				items,
+			},
+			items,
+		)
+		.await
+		.unwrap()
+}
+
+async fn fetch_chat(client: &Client, uuid: Uuid) -> Chat {
+	client.get_chat(uuid).await.unwrap().unwrap()
+}
+
+fn sorted_emails<'a>(emails: impl IntoIterator<Item = &'a str>) -> Vec<&'a str> {
+	let mut emails = emails.into_iter().collect::<Vec<_>>();
+	emails.sort_unstable();
+	emails
+}
+
+/// How many reads [`unread_once_recorded`] makes at most: each is one round trip of a few tens of
+/// milliseconds, so this bounds the wait to a few seconds.
+const UNREAD_READS: usize = 100;
+
+/// `client`'s unread count in `chat` once it is no longer 0, or 0 after [`UNREAD_READS`] reads.
+/// `chat/send` answers before the server records the recipients' unread notifications (20 to
+/// 80 ms later when measured), so a read straight after the send can still see 0. The reads follow
+/// each other with no sleep between them.
+async fn unread_once_recorded(client: &Client, chat: &Chat) -> u64 {
+	for _ in 0..UNREAD_READS {
+		let unread = client.get_chat_unread_count(chat).await.unwrap();
+		if unread != 0 {
+			return unread;
+		}
+	}
+	0
+}
+
+#[shared_test_runtime]
+async fn chat_participants_add_adds_a_contact_who_can_use_the_chat() {
+	let client = test_utils::RESOURCES.client().await;
+	let share_client = test_utils::SHARE_RESOURCES.client().await;
+	let (contact, _locks) = chat_contact_and_locks(&client, &share_client).await;
+	let chat = client.create_chat(&[]).await.unwrap();
+
+	let items = [chat.participant_item_for_test(&contact).unwrap()];
+	let [_] = all_ok(add_chat_participants(&client, &chat, &items).await);
+
+	let fetched = fetch_chat(&client, chat.uuid()).await;
+	assert_eq!(
+		sorted_emails(fetched.participants().iter().map(|p| p.email())),
+		sorted_emails([client.email(), share_client.email()])
+	);
+	// The new participant sends with the chat key it unwraps from the item's metadata; a wrong
+	// wrap leaves its chat without a key and the send fails with MetadataWasNotDecrypted.
+	let mut shared = fetch_chat(&share_client, chat.uuid()).await;
+	share_client
+		.send_chat_message(&mut shared, "hello".to_owned(), None)
+		.await
+		.unwrap();
+
+	client.delete_chat(chat).await.unwrap();
+}
+
+#[shared_test_runtime]
+async fn chat_participants_add_fails_a_contact_that_does_not_exist() {
+	let client = test_utils::RESOURCES.client().await;
+	let _lock = test_utils::lock_chat(&client).await;
+	let chat = client.create_chat(&[]).await.unwrap();
+
+	// Hand-built: the server refuses an unknown contact before it looks at the metadata.
+	let items = [bulk_chat::conversations::participants::add::Item {
+		contact_uuid: Uuid::new_v4(),
+		metadata: RSAEncryptedString(Cow::Borrowed("x")),
+	}];
+	let [result] = add_chat_participants(&client, &chat, &items)
+		.await
+		.try_into()
+		.unwrap();
+
+	assert_eq!(
+		result.unwrap_err().server_code().as_deref(),
+		Some("contact_not_found")
+	);
+	assert_eq!(
+		fetch_chat(&client, chat.uuid()).await.participants().len(),
+		1
+	);
+	client.delete_chat(chat).await.unwrap();
+}
+
+#[shared_test_runtime]
+async fn chat_conversations_read_clears_the_unread_count() {
+	let client = test_utils::RESOURCES.client().await;
+	let share_client = test_utils::SHARE_RESOURCES.client().await;
+	let (contact, _locks) = chat_contact_and_locks(&client, &share_client).await;
+	let chat = client.create_chat(slice::from_ref(&contact)).await.unwrap();
+	let mut shared = fetch_chat(&share_client, chat.uuid()).await;
+	share_client
+		.send_chat_message(&mut shared, "unread".to_owned(), None)
+		.await
+		.unwrap();
+	assert_eq!(unread_once_recorded(&client, &chat).await, 1);
+
+	// An unknown conversation is a status-true no-op. The single route takes no lock, so neither
+	// does this.
+	let items = [
+		bulk_chat::conversations::read::Item { uuid: chat.uuid() },
+		bulk_chat::conversations::read::Item {
+			uuid: Uuid::new_v4(),
+		},
+	];
+	let [(), ()] = all_ok(
+		client
+			.post_bulk_for_test(
+				bulk_chat::conversations::read::ENDPOINT,
+				&bulk_chat::conversations::read::Request { items: &items },
+				&items,
+			)
+			.await
+			.unwrap(),
+	);
+
+	assert_eq!(client.get_chat_unread_count(&chat).await.unwrap(), 0);
+	client.delete_chat(chat).await.unwrap();
 }

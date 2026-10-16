@@ -3,7 +3,7 @@ use std::sync::Arc;
 use filen_macros::shared_test_runtime;
 use filen_sdk_rs::{auth::Client, chats::Chat, sync::lock::ResourceLock};
 use filen_types::traits::CowHelpers;
-use test_utils::set_up_contact;
+use test_utils::{lock_chat, set_up_contact};
 
 /// Janitor (mirrors `client_tests::cleanup_test_dirs`): sweep stale conversations that prior runs
 /// left behind — the per-test [`ChatGuard`] only clears when a chat test actually runs, so a run
@@ -90,22 +90,6 @@ async fn conversation_muting() {
 	assert!(!chat.muted());
 	let fetched = client.get_chat(chat.uuid()).await.unwrap().unwrap();
 	assert_eq!(chat, fetched);
-}
-
-/// Takes the account-wide `test:chats` lock, then re-reads `client`'s identity caches inside
-/// it. `Client` fetches its avatar URL and nickname once and keeps them for its lifetime, and
-/// `create_chat` / `send_chat_message` bake that snapshot into the `Chat` / `ChatMessage` they
-/// hand back. The lock stops `user_tests::upload_avatar` rotating the avatar DURING a chat
-/// test, but a process that filled the cache in an earlier critical section and then queued an
-/// hour for the lock still compares the old snapshot against the server (windows V2,
-/// 2026-09-03: every field equal but `avatar`). Refreshing here is what makes the lock enough.
-async fn lock_chat(client: &Client) -> Arc<ResourceLock> {
-	let lock = client
-		.acquire_lock_with_default(test_utils::locks::CHATS)
-		.await
-		.unwrap();
-	client.get_user_info().await.unwrap();
-	lock
 }
 
 /// Delete every conversation `client` owns or participates in (best-effort). Chat tests
