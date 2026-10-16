@@ -164,7 +164,7 @@ Test notes:
 | `sync-engine` | Local folder <-> remote folder sync engine (`src/sync_engine/`); implies `cache`, adds the `notify` watcher; native only. Gates the `sync_engine_blackbox_tests` / `sync_engine_stress_tests` / `sync_suite` test targets, and with `uniffi` the binding's `sync_engine_js_tests` |
 | `heif-decoder` | Thumbnail decoding for HEIF/HEIC — and AVIF, which the vendored libheif decodes through the same container path on its dav1d backend |
 | `bench-internals` | Exposes `cache::bench_support` for the insertion benchmark, and `sync_engine::probe` for the `sync_engine_probe` per-phase probe |
-| `test-seams` | Test-only: exposes the bulk directory create and trash (`create_dirs_for_test` / `trash_items_for_test`) to the live tests — never enable in production |
+| `test-seams` | Test-only: exposes the bulk operations and the item builders (`*_for_test`) the live `bulk_tests` send to the server — never enable in production |
 
 The mobile bindings build is `-F uniffi,heif-decoder,http-provider,cache,sync-engine` (see
 `filen-sdk-rs/web/ubrn.config.yaml`); `uniffi` together with `sync-engine` compiles the sync

@@ -1,6 +1,6 @@
 // Drive fixtures and copy drivers shared between the integration-test binaries that recreate
-// drive items (copy_tests, connect_tests, archive_tests); each binary compiles its own copy and
-// uses a subset.
+// drive items (copy_tests, connect_tests, archive_tests, bulk_tests); each binary compiles its own
+// copy and uses a subset.
 #![allow(dead_code)]
 
 use std::{

@@ -48,8 +48,8 @@ sync-engine = ["cache", "dep:notify", "dep:ignore", "dep:same-file"]
 # insertion benchmark only, and `nix` for the sync engine probe's peak resident set. Never enable
 # in production builds.
 bench-internals = ["cache", "dep:nix"]
-# Exposes the otherwise-`pub(crate)` bulk directory create and trash (`create_dirs_for_test`,
-# `trash_items_for_test`) for the live tests only. Never enable in production builds.
+# Exposes otherwise-`pub(crate)` bulk operations and the item builders they need (the `*_for_test`
+# items) so the live `bulk_tests` can send them to the server. Never enable in production builds.
 test-seams = []
 
 # The cache tests only exist when the `cache` feature is enabled.

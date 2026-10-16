@@ -16,6 +16,10 @@ use crate::{
 };
 
 pub(crate) mod create_dirs;
+// Test seam: the live tests send the other `bulk/*` endpoints to the server. Gated behind the
+// `test-seams` feature, which production builds never enable.
+#[cfg(feature = "test-seams")]
+pub(crate) mod test_seams;
 #[cfg(all(test, not(all(target_family = "wasm", target_os = "unknown"))))]
 mod tests;
 pub(crate) mod trash_items;
