@@ -327,6 +327,31 @@ test("Directory", async () => {
 	await state.deleteDirPermanently(dir)
 })
 
+// With a batch window, the calls of a burst after the first go to the bulk routes
+// (v3/bulk/dir/create, v3/bulk/trash) as one request. The JS side cannot observe whether
+// they merged; this checks that a batched burst answers exactly like single calls.
+test("a burst of dirs created and trashed with batching on answers like single calls", { timeout: cap(60_000) }, async () => {
+	const batched = UnauthClient.from_config({ batchWindowMs: 5 }).fromStringified(await state.toStringified())
+	const sub = await batched.createDir(testDir, "batched-burst")
+
+	const dirs = await Promise.all(Array.from({ length: 8 }, (_, i) => batched.createDir(sub, "b" + i)))
+	expect(new Set(dirs.map(d => d.uuid)).size).toBe(8)
+	for (const [i, dir] of dirs.entries()) {
+		expect(dir.parent).toBe(sub.uuid)
+		expect(getDirMeta(dir.meta)?.name).toBe("b" + i)
+	}
+	expect((await state.listDir(sub)).dirs.map(d => d.uuid).sort()).toEqual(dirs.map(d => d.uuid).sort())
+
+	// trashDir sets the parent itself, so ask the server which dirs it moved.
+	const trashed = await Promise.all(dirs.map(d => batched.trashDir(d)))
+	expect((await state.listDir(sub)).dirs).toHaveLength(0)
+	for (const dir of dirs) {
+		expect((await state.getDir(dir.uuid)).parent).toBe("trash")
+	}
+
+	await Promise.all(trashed.map(d => batched.deleteDirPermanently(d)))
+})
+
 test("an async call whose params do not parse rejects with Conversion, and the client keeps working", { timeout: cap(15_000) }, async () => {
 	const calls: [string, () => Promise<unknown>][] = [
 		["a params struct", () => state.listArchive({} as any)],
