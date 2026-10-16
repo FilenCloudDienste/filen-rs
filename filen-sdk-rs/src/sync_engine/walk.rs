@@ -1,17 +1,30 @@
 //! The scan's directory walk: depth-first, in pre-order and in the order each directory lists its
 //! entries, following symlinks.
 //!
-//! On unix it yields what `walkdir`'s `WalkDir::new(start).follow_links(true)` yields, entry for
-//! entry and error for error (the parity test below, unix-only, holds it to that): an entry reached
-//! through a symlink is stat'd to its target and classified by it, a link that does not resolve is
-//! an error at its path, and a followed directory that is one of the walk's own open ancestors is a
-//! loop error rather than a second descent. A directory is opened as it is handed over, so one the
-//! caller skips is never read and its listing error is never reported.
+//! An entry reached through a symlink is stat'd to its target and classified by it, a link that
+//! does not resolve is an error at its path, and a followed directory that is one of the walk's own
+//! open ancestors is a loop error rather than a second descent.
+//!
+//! A directory is not opened when it is handed over, only when the walk descends into it: on the
+//! next [`next`](Iterator::next) unless the caller skipped it first, or at [`Walk::enter`]. A
+//! directory the caller skips is never opened, by its listing or by the loop check, so a link to a
+//! folder the operating system guards (macOS asks the user before an app reads `~/Documents`) asks
+//! nothing when the scan ignores it.
 //!
 //! The loop check is `walkdir`'s own: a [`Handle`] opened on the followed directory, compared with
 //! one opened on each ancestor in turn (device and inode on unix, volume serial number and file
 //! index on Windows), both held open while they are compared. A handle that cannot be opened fails
-//! the check as an error that names no path.
+//! the check: at the followed directory's path for its own handle, as an error that names no path
+//! for an ancestor's.
+//!
+//! On unix it yields what `walkdir`'s `WalkDir::new(start).follow_links(true)` yields, entry for
+//! entry and error for error (the parity test below, unix-only, holds it to that), except where the
+//! descent decides. `walkdir` opens a directory and makes the loop check as it hands the directory
+//! over, so a followed directory that fails the check is, there, one error in place of the entry,
+//! and one the caller would have skipped is reported all the same. Here the entry is handed over,
+//! then the error follows if the caller descends, and nothing follows if it skips. A directory
+//! removed between its hand-over and its descent is a listing error here, where `walkdir` had it
+//! open already.
 //!
 //! On Windows `walkdir` opens and keeps a handle to each directory as it descends into it, where
 //! this walk, on every platform, opens one only for a loop check, as `walkdir` does on unix. So a
@@ -129,7 +142,8 @@ impl Entry {
 #[derive(Debug)]
 pub(super) enum WalkError {
 	/// An entry, a listing or a symlink that could not be read. `path` is `None` when the failure
-	/// has no one entry to name: a listing that failed partway, or an open the loop check made.
+	/// has no one entry to name: a listing that failed partway, or an ancestor's handle the loop
+	/// check could not open.
 	Io {
 		path: Option<PathBuf>,
 		source: io::Error,
@@ -179,6 +193,14 @@ struct Dir {
 	remaining: Remaining,
 }
 
+/// A directory handed over and not yet descended into.
+struct Unentered {
+	path: PathBuf,
+	depth: usize,
+	/// Whether it was reached through a symlink, and so is checked for a loop.
+	followed: bool,
+}
+
 /// The walk from one start (see the module docs).
 pub(super) struct Walk {
 	/// The start, until the first [`next`](Iterator::next) reads it.
@@ -189,6 +211,8 @@ pub(super) struct Walk {
 	/// The outermost of `inside` whose stream is still open; every one before it was read into
 	/// memory.
 	oldest_open: usize,
+	/// The directory last handed over, until the walk descends into it or the caller skips it.
+	unentered: Option<Unentered>,
 }
 
 impl Walk {
@@ -197,12 +221,34 @@ impl Walk {
 			start: Some(start.to_owned()),
 			inside: Vec::new(),
 			oldest_open: 0,
+			unentered: None,
 		}
 	}
 
-	/// Leave the directory last handed over unread from here on, everything under it included.
+	/// Leave the directory last handed over unread from here on, everything under it included. It
+	/// is never opened, unless [`enter`](Self::enter) opened it already.
 	pub(super) fn skip_current_dir(&mut self) {
-		self.leave();
+		if self.unentered.take().is_none() {
+			self.leave();
+		}
+	}
+
+	/// Descend into the directory last handed over now rather than on the next
+	/// [`next`](Iterator::next): check it for a loop if it was reached through a symlink, and open
+	/// it. A caller that records each directory it admits calls this first, so a loop is known
+	/// before the directory is recorded. On an error the directory is left unread and the walk goes
+	/// on after it, as if it had been skipped; the caller must not skip it again. Nothing to do if
+	/// the last thing handed over was not a directory, or was entered already.
+	pub(super) fn enter(&mut self) -> Result<(), WalkError> {
+		let Some(dir) = self.unentered.take() else {
+			return Ok(());
+		};
+		// Only a directory can loop, and only one reached through a symlink can be an ancestor.
+		if dir.followed {
+			self.check_loop(&dir.path)?;
+		}
+		self.open(dir);
+		Ok(())
 	}
 
 	fn leave(&mut self) {
@@ -210,34 +256,36 @@ impl Walk {
 		self.oldest_open = self.oldest_open.min(self.inside.len());
 	}
 
-	/// Follow `entry` if it is a symlink, and open it if it is a directory, which the walk then
-	/// lists before anything after it.
+	/// Follow `entry` if it is a symlink, and hold it for the descent if it is a directory, which
+	/// the walk then lists before anything after it. Following a link stats its target, which does
+	/// not open it.
 	fn reach(&mut self, entry: Entry) -> Listing {
 		let entry = if entry.file_type.is_symlink() {
-			self.follow(entry)?
+			Entry::at(entry.path, entry.depth, true)?
 		} else {
 			entry
 		};
 		if entry.file_type.is_dir() {
-			self.open(&entry);
-		}
-		Ok(entry)
-	}
-
-	fn follow(&self, entry: Entry) -> Listing {
-		let entry = Entry::at(entry.path, entry.depth, true)?;
-		// Only a directory can loop.
-		if entry.file_type.is_dir() {
-			self.check_loop(&entry.path)?;
+			self.unentered = Some(Unentered {
+				// Its own copy: the entry goes to the caller, and the walk needs the path until the
+				// descent.
+				path: entry.path.clone(),
+				depth: entry.depth,
+				followed: entry.followed,
+			});
 		}
 		Ok(entry)
 	}
 
 	fn check_loop(&self, child: &Path) -> Result<(), WalkError> {
-		let unchecked = |source| WalkError::Io { path: None, source };
-		let child_handle = Handle::from_path(child).map_err(unchecked)?;
+		let child_handle = Handle::from_path(child).map_err(|source| WalkError::Io {
+			path: Some(child.to_owned()),
+			source,
+		})?;
 		for ancestor in self.inside.iter().rev() {
-			if Handle::from_path(&ancestor.path).map_err(unchecked)? == child_handle {
+			let ancestor_handle = Handle::from_path(&ancestor.path)
+				.map_err(|source| WalkError::Io { path: None, source })?;
+			if ancestor_handle == child_handle {
 				return Err(WalkError::Loop {
 					ancestor: ancestor.path.clone(),
 					child: child.to_owned(),
@@ -247,7 +295,7 @@ impl Walk {
 		Ok(())
 	}
 
-	fn open(&mut self, dir: &Entry) {
+	fn open(&mut self, dir: Unentered) {
 		if self.inside.len() - self.oldest_open == MAX_OPEN {
 			if let Some(oldest) = self.inside.get_mut(self.oldest_open) {
 				let rest = (&mut oldest.remaining).collect::<Vec<_>>();
@@ -260,7 +308,7 @@ impl Walk {
 				stream,
 				depth: dir.depth + 1,
 			},
-			// Reported as the next thing listed, which a caller skipping the directory never sees.
+			// Reported as the next thing listed.
 			Err(source) => Remaining::Read(
 				vec![Err(WalkError::Io {
 					path: Some(dir.path.clone()),
@@ -270,7 +318,7 @@ impl Walk {
 			),
 		};
 		self.inside.push(Dir {
-			path: dir.path.clone(),
+			path: dir.path,
 			remaining,
 		});
 	}
@@ -282,6 +330,9 @@ impl Iterator for Walk {
 	fn next(&mut self) -> Option<Listing> {
 		if let Some(start) = self.start.take() {
 			return Some(Entry::at(start, 0, false).and_then(|start| self.reach(start)));
+		}
+		if let Err(err) = self.enter() {
+			return Some(Err(err));
 		}
 		while let Some(dir) = self.inside.last_mut() {
 			match dir.remaining.next() {
@@ -510,6 +561,73 @@ mod tests {
 		)
 	}
 
+	/// What `walkdir` yields where this walk yields `seen`. The two differ only where `walkdir` decides
+	/// at hand-over what this walk decides at the descent (see the module docs). A followed
+	/// directory this walk hands over and then fails the loop check of is, in `walkdir`, the check's
+	/// error alone in place of the entry; none of the directories that fail it here are skipped, so
+	/// `walkdir` reports the same error (one that is skipped is where the two disagree outright, see
+	/// `a_followed_directory_the_caller_skips_is_never_opened`). And `gone`, removed once handed
+	/// over, was open in `walkdir` already, which then lists nothing from it; here it is opened after
+	/// its removal, and its listing fails. A handle the check cannot open on a followed directory
+	/// is an error at its path here and one with no path in `walkdir`.
+	fn as_walkdir_orders_it(seen: Vec<Seen>) -> Vec<Seen> {
+		let mut ordered: Vec<Seen> = Vec::with_capacity(seen.len());
+		for item in seen {
+			let item = match item {
+				Seen::Error {
+					path: Some(path),
+					loop_ancestor: None,
+					kind,
+				} if matches!(
+					ordered.last(),
+					Some(Seen::Entry {
+						path: followed,
+						is_dir: true,
+						path_is_symlink: true,
+						..
+					}) if *followed == path
+				) =>
+				{
+					Seen::Error {
+						path: None,
+						loop_ancestor: None,
+						kind,
+					}
+				}
+				item => item,
+			};
+			if let Seen::Error {
+				path: Some(path),
+				loop_ancestor: None,
+				kind: Some(io::ErrorKind::NotFound),
+			} = &item && path.file_name() == Some(OsStr::new("gone"))
+			{
+				continue;
+			}
+			let failed_check = matches!(
+				item,
+				Seen::Error { path: None, .. }
+					| Seen::Error {
+						loop_ancestor: Some(_),
+						..
+					}
+			);
+			if failed_check
+				&& matches!(
+					ordered.last(),
+					Some(Seen::Entry {
+						is_dir: true,
+						path_is_symlink: true,
+						..
+					})
+				) {
+				ordered.pop();
+			}
+			ordered.push(item);
+		}
+		ordered
+	}
+
 	/// Both walks over a fresh copy of the same tree, from `start` (relative to the copy's base).
 	/// Each walk lists its own copy, so this holds only where two directories built the same way
 	/// list in the same order: APFS, ext4 and tmpfs do; a filesystem salting its hash order per
@@ -520,7 +638,7 @@ mod tests {
 		build(&theirs_base);
 		build(&ours_base);
 		let theirs = walkdirs(&theirs_base, &start(&theirs_base));
-		let mine = ours(&ours_base, &start(&ours_base));
+		let mine = as_walkdir_orders_it(ours(&ours_base, &start(&ours_base)));
 		// The first item the two differ at, rather than two whole walks to compare by eye.
 		let first_difference = mine
 			.iter()
@@ -564,6 +682,159 @@ mod tests {
 	#[test]
 	fn walks_a_subtree_start_as_walkdir_does() {
 		compare(|base| base.join("root").join("deep").join("l0"));
+	}
+
+	#[test]
+	fn a_followed_directory_the_caller_skips_is_never_opened() {
+		let base = TempRoot::new();
+		let (root, locked) = (base.join("root"), base.join("locked"));
+		fs::create_dir_all(&root).unwrap();
+		fs::create_dir_all(&locked).unwrap();
+		let link = root.join("skip_link");
+		symlink(&locked, &link).unwrap();
+		// A stat through the link still answers; opening the directory does not.
+		fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+		let unopenable = fs::read_dir(&locked).is_err();
+
+		let theirs = walkdir::WalkDir::new(&root)
+			.follow_links(true)
+			.into_iter()
+			.map(|item| {
+				item.map(|entry| entry.path().to_owned()).map_err(|err| {
+					(
+						err.path().map(Path::to_owned),
+						err.io_error().map(io::Error::kind),
+					)
+				})
+			})
+			.collect::<Vec<_>>();
+		let mut walk = Walk::new(&root);
+		let mut mine = Vec::new();
+		while let Some(item) = walk.next() {
+			let item = item.map(|entry| entry.path().to_owned());
+			if item.as_ref().is_ok_and(|path| *path == link) {
+				walk.skip_current_dir();
+			}
+			mine.push(item.map_err(|err| err.path().map(Path::to_owned)));
+		}
+
+		assert!(
+			unopenable,
+			"run as non-root: the case needs permissions enforced"
+		);
+		// `walkdir` opens the target for its loop check before the caller can skip the link, and
+		// fails there: an error in place of the entry, which no skip can take back. This walk is
+		// meant to differ here.
+		assert_eq!(
+			theirs,
+			vec![
+				Ok(root.clone()),
+				Err((None, Some(io::ErrorKind::PermissionDenied)))
+			]
+		);
+		assert_eq!(mine, vec![Ok(root), Ok(link)]);
+	}
+
+	#[test]
+	fn a_loop_under_an_entered_link_is_reported_at_the_link_after_its_entry() {
+		let base = TempRoot::new();
+		let root = base.join("root");
+		fs::create_dir_all(root.join("a")).unwrap();
+		let link = root.join("a").join("up");
+		symlink("..", &link).unwrap();
+
+		let theirs = walkdir::WalkDir::new(&root)
+			.follow_links(true)
+			.into_iter()
+			.map(|item| {
+				item.map(|entry| entry.path().to_owned()).map_err(|err| {
+					(
+						err.path().map(Path::to_owned),
+						err.loop_ancestor().map(Path::to_owned),
+					)
+				})
+			})
+			.collect::<Vec<_>>();
+		let loops = |enter: bool| {
+			let mut walk = Walk::new(&root);
+			let mut seen = Vec::new();
+			while let Some(item) = walk.next() {
+				match item {
+					Ok(entry) => {
+						seen.push(Ok(entry.path().to_owned()));
+						if enter && entry.path() == link {
+							match walk.enter() {
+								Err(WalkError::Loop { ancestor, child }) => {
+									seen.push(Err((Some(child), Some(ancestor))));
+								}
+								other => panic!("expected the loop, got {other:?}"),
+							}
+						}
+					}
+					Err(WalkError::Loop { ancestor, child }) => {
+						seen.push(Err((Some(child), Some(ancestor))));
+					}
+					Err(err) => panic!("unexpected {err:?}"),
+				}
+			}
+			seen
+		};
+		let (on_next, on_enter) = (loops(false), loops(true));
+
+		let loop_error = Err((Some(link.clone()), Some(root.clone())));
+		// The same error at the same link as `walkdir`'s, which reports it in place of the entry.
+		assert_eq!(
+			theirs,
+			vec![Ok(root.clone()), Ok(root.join("a")), loop_error.clone()]
+		);
+		let expected = vec![
+			Ok(root.clone()),
+			Ok(root.join("a")),
+			Ok(link.clone()),
+			loop_error,
+		];
+		assert_eq!(on_next, expected, "found as the walk descends");
+		assert_eq!(on_enter, expected, "found when the caller enters it");
+	}
+
+	/// Walks a root holding one plain directory, removes that directory once it is handed over, and
+	/// returns what the walk yields after it: the caller skips it first when `skip` is set.
+	fn after_removing_a_handed_over_dir(skip: bool) -> (PathBuf, Vec<Listing>) {
+		let base = TempRoot::new();
+		let dir = base.join("d");
+		fs::create_dir_all(&dir).unwrap();
+		let mut walk = Walk::new(&base);
+		assert_eq!(walk.next().unwrap().unwrap().path(), &*base);
+		assert_eq!(walk.next().unwrap().unwrap().path(), dir);
+		fs::remove_dir(&dir).unwrap();
+		if skip {
+			walk.skip_current_dir();
+		}
+		(dir, walk.collect())
+	}
+
+	#[test]
+	fn a_plain_directory_is_listed_only_once_the_walk_descends_into_it() {
+		let (dir, rest) = after_removing_a_handed_over_dir(false);
+		// Listed at hand-over, the removed directory would read as empty, with no error.
+		match rest.as_slice() {
+			[
+				Err(WalkError::Io {
+					path: Some(path),
+					source,
+				}),
+			] => {
+				assert_eq!(*path, dir);
+				assert_eq!(source.kind(), io::ErrorKind::NotFound);
+			}
+			other => panic!("expected the directory's listing error, got {other:?}"),
+		}
+	}
+
+	#[test]
+	fn a_plain_directory_the_caller_skips_is_never_listed() {
+		let (_dir, rest) = after_removing_a_handed_over_dir(true);
+		assert!(rest.is_empty(), "{rest:?}");
 	}
 
 	#[test]

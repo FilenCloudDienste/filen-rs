@@ -1075,7 +1075,8 @@ async fn path_06_symlink_escape_write_delete_confined() {}
 
 /// PATH-07 — a symlink loop / self-referential link must not hang the scan (local->remote).
 /// Already exercised by `races::race_19_symlink_and_loop_do_not_hang_scan` (a self-referential
-/// directory symlink under L, bounded-timeout sync, finite result, byte-exact real target). Recorded
+/// directory symlink under L, bounded-timeout sync, finite result, the link reported as an
+/// unsyncable alias of its parent and never entered, byte-exact real target). Recorded
 /// here for plan-coverage completeness so the PATH category maps 1:1 to the design; the assertion
 /// lives in `races.rs` to avoid a duplicate live network test.
 #[cfg(unix)]

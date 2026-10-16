@@ -16,7 +16,10 @@
 //! the engine never writes one); the walk's loop detection guards against cycles. A symlink that
 //! cannot be followed (dangling, or part of a loop) is recorded as an error but does not make the
 //! scan incomplete, unless the baseline tracks a directory at that path (see
-//! [`LocalScan::complete`]).
+//! [`LocalScan::complete`]). Only a directory the scan admits is checked for a loop, as only one it
+//! admits is opened: a link back onto a directory inside the root is the alias below and never
+//! checked, and a link the rules ignore is never opened, so a loop is an error only through a link
+//! leading outside the root.
 //!
 //! A symlinked DIRECTORY whose target lies inside the root is not walked: its target is walked under
 //! its real path, and walking the link as well would sync one subtree twice under two names. The
@@ -49,7 +52,7 @@ use super::{
 		FILENIGNORE, IgnoreDecision, IgnoreParseError, IgnoreRules, IgnoreSource,
 		MAX_RULE_FILE_BYTES, Origin, rule_file_text,
 	},
-	rows::Baseline,
+	rows::{Baseline, Cursor},
 	side::Side,
 	stage::{Paging, Stage, StageSink},
 	walk::{self, Walk, WalkError},
@@ -975,6 +978,55 @@ impl<S: ScanSink> Window<'_, S> {
 		);
 	}
 
+	/// Record what the walk could not read, with `rows` asked about the baseline row at its path.
+	fn walk_error(&mut self, err: WalkError, rows: &mut Cursor<'_>) -> Result<(), S::Error> {
+		let root = self.root;
+		let rel_path = err
+			.path()
+			.and_then(|p| p.strip_prefix(root).ok())
+			.and_then(normalize_rel_path)
+			.unwrap_or_default();
+		// A directory the walk listed but could not descend into does NOT get the rule the stat and
+		// the hash read use for an entry that vanished (see `settle`): its children were never
+		// listed, so their absence is not something the walk observed. Trusting it reads a
+		// directory moved or removed mid-walk as one deletion per file under it, and the
+		// destination — listed before the move — is not in this scan either, so the pass cannot
+		// fold the move: it would trash the remote copies and upload them again next pass. Holding
+		// those deletions for one pass costs nothing instead.
+		//
+		// An unreadable directory or entry means the tree is partial. A symlink that leads nowhere
+		// does not: there is nothing behind it to have missed — unless a DIRECTORY was synced
+		// through it (a link to an unmounted drive), whose subtree would otherwise read as deleted.
+		// A file synced as a link's copy is only that copy, and its deletion propagates like any
+		// other.
+		let unfollowable = unfollowable_symlink(&err);
+		if !unfollowable
+			|| rows
+				.get(&rel_path)
+				.is_some_and(|entry| entry.kind == NodeKind::Dir)
+		{
+			self.complete = false;
+		}
+		let below_root = err.path().is_some_and(|path| path != root);
+		let source = match err {
+			WalkError::Loop { ancestor, .. } => {
+				std::io::Error::other(format!("symlink loops back onto {}", ancestor.display()))
+			}
+			WalkError::Io { source, .. } => source,
+		};
+		// An entry gone or replaced since its directory was listed, or a directory gone or replaced
+		// by a file before its listing was read, changed under the walk: partial as above, but
+		// nothing is wrong with the tree, so nothing is reported. A missing pair root is reported,
+		// and so is an error that names no path, such as an ancestor's handle the loop check could
+		// not open: nothing places it below the root.
+		if below_root && !unfollowable && changed_under_walk(&source) {
+			self.caught_mid_change(&rel_path, source);
+			return Ok(());
+		}
+		self.push(Listed::Error(ScanError::Io { rel_path, source }))?;
+		Ok(())
+	}
+
 	/// The walk caught `rel_path` mid-change: the scan is partial, but nothing is reported.
 	fn caught_mid_change(&mut self, rel_path: &str, why: impl fmt::Display) {
 		self.complete = false;
@@ -1116,52 +1168,7 @@ fn scan_local_watched<S: ScanSink>(
 			let entry = match entry {
 				Ok(entry) => entry,
 				Err(err) => {
-					let rel_path = err
-						.path()
-						.and_then(|p| p.strip_prefix(root).ok())
-						.and_then(normalize_rel_path)
-						.unwrap_or_default();
-					// A directory the walk listed but could not descend into does NOT get the rule
-					// the stat and the hash read below use for an entry that vanished: its
-					// children were never listed, so their absence is not something the walk
-					// observed. Trusting it reads a directory moved or removed mid-walk as one
-					// deletion per file under it, and the destination — listed before the move — is
-					// not in this scan either, so the pass cannot fold the move: it would trash the
-					// remote copies and upload them again next pass. Holding those deletions for one
-					// pass costs nothing instead.
-					//
-					// An unreadable directory or entry means the tree is partial. A symlink that
-					// leads nowhere does not: there is nothing behind it to have missed — unless a
-					// DIRECTORY was synced through it (a link to an unmounted drive), whose subtree
-					// would otherwise read as deleted. A file synced as a link's copy is only that
-					// copy, and its deletion propagates like any other.
-					let unfollowable = unfollowable_symlink(&err);
-					if !unfollowable
-						|| rows
-							.get(&rel_path)
-							.is_some_and(|entry| entry.kind == NodeKind::Dir)
-					{
-						window.complete = false;
-					}
-					let below_root = err.path().is_some_and(|path| path != root);
-					let source = match err {
-						WalkError::Loop { ancestor, .. } => std::io::Error::other(format!(
-							"symlink loops back onto {}",
-							ancestor.display()
-						)),
-						WalkError::Io { source, .. } => source,
-					};
-					// An entry gone or replaced since its directory was listed, or a directory gone
-					// or replaced by a file before its listing was read, changed under the walk:
-					// partial as above, but nothing is wrong with the tree, so nothing is reported.
-					// A missing pair root is reported, and so is an error that names no path, such
-					// as the open the loop check makes on a followed directory: nothing places it
-					// below the root.
-					if below_root && !unfollowable && changed_under_walk(&source) {
-						window.caught_mid_change(&rel_path, source);
-						continue;
-					}
-					window.push(Listed::Error(ScanError::Io { rel_path, source }))?;
+					window.walk_error(err, &mut rows)?;
 					continue;
 				}
 			};
@@ -1210,16 +1217,6 @@ fn scan_local_watched<S: ScanSink>(
 						aliased_dirs.insert(mem::take(rel_path), target);
 						break 'filter false;
 					}
-					if is_dir && rule_files.reads(rel_path) {
-						load_rule_file(
-							root,
-							rel_path,
-							entry.path(),
-							&mut rules,
-							&mut ignore_blocked,
-							&mut rule_errors,
-						);
-					}
 					true
 				};
 			if !admitted {
@@ -1227,6 +1224,28 @@ fn scan_local_watched<S: ScanSink>(
 					walker.skip_current_dir();
 				}
 				continue;
+			}
+			// Entered before it is recorded or its rule file read, so a directory that loops back
+			// onto an ancestor is never recorded: in place of its entry is the loop's error, as if
+			// the walk had found the loop before handing the directory over. Recorded, it would be
+			// an empty directory with nothing under it. Only an admitted directory is entered: one
+			// the filter refused is never opened.
+			if is_dir && let Err(err) = walker.enter() {
+				window.walk_error(err, &mut rows)?;
+				continue;
+			}
+			if is_dir
+				&& let Some(rel_path) = rel_path.as_deref()
+				&& rule_files.reads(rel_path)
+			{
+				load_rule_file(
+					root,
+					rel_path,
+					entry.path(),
+					&mut rules,
+					&mut ignore_blocked,
+					&mut rule_errors,
+				);
 			}
 
 			if stopped() || on_listed(entry.path()).is_break() {
@@ -2455,7 +2474,7 @@ mod tests {
 
 	#[cfg(unix)]
 	#[test]
-	fn a_dangling_symlink_or_a_loop_is_reported_but_keeps_the_scan_complete() {
+	fn a_dangling_symlink_is_reported_and_a_loop_inside_the_root_is_an_alias_both_complete() {
 		use std::os::unix::fs::symlink;
 
 		let root = temp_root();
@@ -2489,10 +2508,76 @@ mod tests {
 			})
 			.collect();
 		errored.sort_unstable();
-		assert_eq!(errored, vec!["cycle/self", "dangling", "itself"]);
-		assert_eq!(scan.reported_errors().count(), 3);
+		assert_eq!(errored, vec!["dangling", "itself"]);
+		assert_eq!(scan.reported_errors().count(), 2);
+		// The loop leads back onto a directory inside the root, so the alias rule skips it before
+		// it is entered, and the loop check that would report it is never made.
+		assert_eq!(
+			scan.aliased_dirs,
+			BTreeMap::from([("cycle/self".to_string(), "cycle".to_string())])
+		);
 
 		fs::remove_dir_all(&root).ok();
+	}
+
+	/// A loop the alias rule does not catch: through a link leading outside the root, back onto that
+	/// link's target. The walk finds it only once the scan has admitted the looping link, and the
+	/// link is neither recorded nor has its rule file read: as an empty directory it would be created
+	/// on the remote, and a synced one would read as emptied.
+	#[cfg(unix)]
+	#[test]
+	fn a_loop_through_a_link_leading_outside_the_root_is_reported_and_not_recorded() {
+		use std::os::unix::fs::{PermissionsExt, symlink};
+
+		let root = temp_root();
+		let outside = temp_root();
+		fs::create_dir(outside.join("o")).unwrap();
+		fs::write(outside.join("o").join("f.txt"), b"f").unwrap();
+		// Read for `away`, and for the loop too if the scan read it before finding the loop.
+		fs::write(outside.join(FILENIGNORE), b"*.tmp").unwrap();
+		fs::set_permissions(outside.join(FILENIGNORE), fs::Permissions::from_mode(0o000)).unwrap();
+		symlink(&outside, outside.join("o").join("back")).unwrap();
+		symlink(&outside, root.join("away")).unwrap();
+
+		let unreadable = fs::read(outside.join(FILENIGNORE)).is_err();
+		let scan = scan_plain(&root, &HashMap::new());
+		fs::remove_dir_all(&root).ok();
+		fs::remove_dir_all(&outside).ok();
+		assert!(
+			unreadable,
+			"run as non-root: the case needs permissions enforced"
+		);
+
+		assert!(scan.complete, "{:?}", scan.errors);
+		let mut paths: Vec<String> = scan
+			.nodes
+			.whole()
+			.paths()
+			.map(|path| path.into_owned())
+			.collect();
+		paths.sort();
+		assert_eq!(paths, vec!["away", "away/o", "away/o/f.txt"]);
+		assert_eq!(scan.ignore_blocked, BTreeSet::from(["away".to_string()]));
+		match scan.errors.as_slice() {
+			[
+				ScanError::Io {
+					rel_path: looped,
+					source,
+				},
+				ScanError::Io {
+					rel_path: rule_file,
+					..
+				},
+			] => {
+				assert_eq!(looped, "away/o/back");
+				assert!(
+					source.to_string().starts_with("symlink loops back onto "),
+					"{source}"
+				);
+				assert_eq!(rule_file, &format!("away/{FILENIGNORE}"));
+			}
+			errors => panic!("expected the loop and one rule file, got {errors:?}"),
+		}
 	}
 
 	#[cfg(unix)]

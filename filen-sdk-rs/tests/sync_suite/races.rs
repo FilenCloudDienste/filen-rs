@@ -20,7 +20,7 @@ use filen_sdk_rs::fs::categories::{DirType, Normal};
 use filen_sdk_rs::fs::file::RemoteFile;
 use filen_sdk_rs::fs::{HasName, HasUUID};
 use filen_sdk_rs::sync_engine::{
-	SyncEngine, SyncEvent, SyncMode, SyncObserver, SyncReport, UnsyncablePath, UnsyncableReason,
+	SyncEngine, SyncEvent, SyncMode, SyncObserver, UnsyncablePath, UnsyncableReason,
 };
 use uuid::Uuid;
 
@@ -752,10 +752,11 @@ async fn race_23_mass_delete_guard_holds_bulk_vanish() {
 // ===========================================================================
 
 /// RACE-19 — a symlink and a symlink loop must not hang/recurse the scan. A file symlink uploads as
-/// a copy of its target; the loop is reported in the pass's errors on every pass, is not uploaded,
-/// and does not make the scan incomplete (so a local deletion still propagates). A symlink to a
-/// sibling directory is not uploaded a second time: the directory syncs once, under its real path,
-/// and the link is reported as unsyncable.
+/// a copy of its target. A symlink to a directory already inside the root is not uploaded a second
+/// time: the directory syncs once, under its real path, and the link is reported as unsyncable.
+/// That holds for a loop too: a link back onto its own parent is that parent's alias, reported as
+/// unsyncable on every pass and never entered, so it is no error, uploads nothing and does not make
+/// the scan incomplete (a local deletion still propagates).
 #[cfg(unix)]
 #[shared_test_runtime]
 async fn race_19_symlink_and_loop_do_not_hang_scan() {
@@ -776,31 +777,24 @@ async fn race_19_symlink_and_loop_do_not_hang_scan() {
 	let r1 = tokio::time::timeout(Duration::from_secs(180), sc.sync())
 		.await
 		.expect("sync hung on the symlink loop");
-	let loop_errors = |r: &SyncReport| -> Vec<String> {
-		r.errors
-			.iter()
-			.filter(|e| e.contains("cycle/self"))
-			.cloned()
-			.collect()
-	};
-	assert_eq!(
-		r1.errors.len(),
-		1,
-		"the loop is the pass's only error: {r1:?}"
-	);
-	assert_eq!(loop_errors(&r1).len(), 1, "the loop is reported: {r1:?}");
-	// target.txt, doomed.txt, link.txt and real/in.txt, and nothing through `alias`.
+	assert!(r1.errors.is_empty(), "the loop is no error: {r1:?}");
+	// target.txt, doomed.txt, link.txt and real/in.txt, and nothing through `alias` or the loop.
 	assert_eq!(r1.uploaded, 4, "{r1:?}");
-	assert_eq!(
-		r1.unsyncable,
-		vec![UnsyncablePath {
+	let aliases = vec![
+		UnsyncablePath {
 			rel_path: "alias".to_owned(),
 			reason: UnsyncableReason::LocalAlias {
 				target: "real".to_string(),
 			},
-		}],
-		"{r1:?}"
-	);
+		},
+		UnsyncablePath {
+			rel_path: "cycle/self".to_owned(),
+			reason: UnsyncableReason::LocalAlias {
+				target: "cycle".to_string(),
+			},
+		},
+	];
+	assert_eq!(r1.unsyncable, aliases, "{r1:?}");
 
 	// Deleting a synced file still propagates: the loop does not hold deletions.
 	std::fs::remove_file(sc.local.join("doomed.txt")).unwrap();
@@ -810,10 +804,10 @@ async fn race_19_symlink_and_loop_do_not_hang_scan() {
 	assert!(r2.guard.is_none(), "the loop held the deletion: {r2:?}");
 	assert_eq!(r2.remotely_trashed, 1, "{r2:?}");
 	assert_eq!(r2.uploaded, 0, "{r2:?}");
+	assert!(r2.errors.is_empty(), "{r2:?}");
 	assert_eq!(
-		r2.errors,
-		loop_errors(&r1),
-		"the loop is reported again, and nothing else: {r2:?}"
+		r2.unsyncable, aliases,
+		"both links are reported again, and nothing else: {r2:?}"
 	);
 
 	let (dirs, files) = list_root(&sc).await;
