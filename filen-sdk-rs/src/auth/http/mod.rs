@@ -81,6 +81,11 @@ const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// [`ClientConfig::with_read_timeout`] (or `None` to disable) if your largest listings are slower.
 const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// Default batch window ([`ClientConfig::with_batch_window`]). The first call of a burst goes out
+/// at once, so a lone call pays nothing for it; only the calls joining a window wait, up to about
+/// 6 ms with a 1 ms timer.
+const DEFAULT_BATCH_WINDOW: Duration = Duration::from_millis(5);
+
 pub struct ClientConfig {
 	concurrency: usize,
 	retry_budget: TpsBudget,
@@ -152,8 +157,8 @@ impl ClientConfig {
 	/// have got. When the bulk request's response is lost (a dropped connection, a timeout), all
 	/// of its calls fail together, with an error naming the bulk endpoint.
 	///
-	/// `Duration::ZERO`, the default, turns batching off: every call goes out alone, as before.
-	/// Values above one second count as one second.
+	/// 5 ms by default. `Duration::ZERO` turns batching off: every call goes out alone. Values
+	/// above one second count as one second.
 	pub fn with_batch_window(mut self, batch_window: Duration) -> Self {
 		self.batch_window = batch_window;
 		self
@@ -273,7 +278,7 @@ impl Default for ClientConfig {
 			archive_codec_mem_budget: crate::fs::archive::config::CODEC_MEM_BUDGET,
 			#[cfg(feature = "archive")]
 			archive_job_concurrency: crate::fs::archive::config::JOB_CONCURRENCY,
-			batch_window: Duration::ZERO,
+			batch_window: DEFAULT_BATCH_WINDOW,
 			file_io_memory_budget: {
 				#[cfg(not(target_os = "ios"))]
 				{
@@ -353,8 +358,8 @@ pub struct JsClientConfig {
 	#[cfg_attr(feature = "uniffi", uniffi(default = None))]
 	pub archive_job_concurrency: Option<u32>,
 	/// How long calls to a route with a bulk twin wait for others to send with them as one bulk
-	/// request, in milliseconds; the first call of a burst goes out at once. Off (every call
-	/// alone) when left out or 0, at most 1000.
+	/// request, in milliseconds; the first call of a burst goes out at once. 5 when left out; 0
+	/// turns batching off (every call alone); at most 1000.
 	#[cfg_attr(all(target_family = "wasm", target_os = "unknown"), serde(default))]
 	#[cfg_attr(feature = "uniffi", uniffi(default = None))]
 	pub batch_window_ms: Option<u32>,
@@ -2263,17 +2268,29 @@ mod js_client_config_tests {
 	}
 
 	#[test]
-	fn a_batch_window_left_out_keeps_batching_off() {
-		assert_eq!(ClientConfig::from(base()).batch_window, Duration::ZERO);
+	fn a_batch_window_left_out_is_five_milliseconds() {
+		assert_eq!(
+			ClientConfig::from(base()).batch_window,
+			Duration::from_millis(5)
+		);
+	}
+
+	#[test]
+	fn a_batch_window_of_zero_turns_batching_off() {
+		let config = ClientConfig::from(JsClientConfig {
+			batch_window_ms: Some(0),
+			..base()
+		});
+		assert_eq!(config.batch_window, Duration::ZERO);
 	}
 
 	#[test]
 	fn a_batch_window_in_milliseconds_reaches_the_client_config() {
 		let config = ClientConfig::from(JsClientConfig {
-			batch_window_ms: Some(5),
+			batch_window_ms: Some(20),
 			..base()
 		});
-		assert_eq!(config.batch_window, Duration::from_millis(5));
+		assert_eq!(config.batch_window, Duration::from_millis(20));
 	}
 
 	#[test]

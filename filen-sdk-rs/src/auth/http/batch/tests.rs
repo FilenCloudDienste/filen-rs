@@ -197,9 +197,9 @@ async fn burst(route: &BulkRoute, answer: Answering) -> (Server, Reply<Value>, R
 }
 
 #[test]
-fn the_default_config_turns_batching_off() {
+fn the_default_config_batches_within_five_milliseconds() {
 	let state = SharedClientState::new(ClientConfig::default()).expect("the defaults are valid");
-	assert_eq!(state.batch_window(), Duration::ZERO);
+	assert_eq!(state.batch_window(), Duration::from_millis(5));
 }
 
 #[tokio::test(start_paused = true)]
