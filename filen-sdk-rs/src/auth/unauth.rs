@@ -535,6 +535,7 @@ mod service_worker_client_tests {
 			archive_codec_mem_budget: None,
 			#[cfg(feature = "archive")]
 			archive_job_concurrency: None,
+			batch_window_ms: None,
 		}
 	}
 
@@ -678,8 +679,12 @@ pub(crate) mod test_support {
 	/// A client whose every request fails without leaving the machine: each one goes to a proxy
 	/// on a local port nothing listens on, which refuses the connection.
 	pub(crate) fn offline_unauthed() -> UnauthClient {
-		let mut unauthed =
-			UnauthClient::from_config(ClientConfig::default()).expect("the defaults are valid");
+		offline_unauthed_with(ClientConfig::default())
+	}
+
+	/// An [`offline_unauthed`] client built from `config`.
+	pub(crate) fn offline_unauthed_with(config: ClientConfig) -> UnauthClient {
+		let mut unauthed = UnauthClient::from_config(config).expect("a test config is valid");
 		unauthed.reqwest_client = reqwest::Client::builder()
 			.proxy(reqwest::Proxy::all("http://127.0.0.1:1").expect("a valid proxy URL"))
 			.build()

@@ -4,7 +4,7 @@ use serde::Deserialize;
 
 use crate::error::ResponseError;
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(bound = "T: Deserialize<'de>")]
 pub struct FilenResponse<'a, T> {
 	pub status: Option<bool>,

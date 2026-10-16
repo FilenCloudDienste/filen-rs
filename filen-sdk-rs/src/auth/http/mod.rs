@@ -20,7 +20,14 @@ use tower::{ServiceBuilder, ServiceExt, limit::GlobalConcurrencyLimitLayer};
 
 use crate::{
 	Error,
-	auth::{Client, http::auth::AuthLayer, unauth::UnauthClient},
+	auth::{
+		Client,
+		http::{
+			auth::AuthLayer,
+			batch::{Batcher, BulkRoute, Reply},
+		},
+		unauth::UnauthClient,
+	},
 	consts::{FULL_CHUNK_BYTES, gateway_url},
 	thumbnail::{MAX_THUMBNAIL_SOURCE_BYTES, REMOTE_SOURCE_RESIDENT_BYTES},
 	util::{MaybeSend, MaybeSendSync},
@@ -32,6 +39,7 @@ use bandwidth_limit::{
 };
 
 mod auth;
+pub(crate) mod batch;
 // can't actually cap bandwidth in wasm, so this would just add overhead
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 mod bandwidth_limit;
@@ -111,6 +119,8 @@ pub struct ClientConfig {
 	/// See [`ClientConfig::with_archive_job_concurrency`].
 	#[cfg(feature = "archive")]
 	pub(crate) archive_job_concurrency: usize,
+	/// See [`ClientConfig::with_batch_window`].
+	batch_window: Duration,
 }
 
 impl ClientConfig {
@@ -133,6 +143,19 @@ impl ClientConfig {
 	#[cfg(feature = "archive")]
 	pub fn with_archive_job_concurrency(mut self, archive_job_concurrency: usize) -> Self {
 		self.archive_job_concurrency = archive_job_concurrency;
+		self
+	}
+
+	/// How long calls to a route with a bulk twin wait for others to send with them. The first
+	/// call of a burst goes out at once, alone; calls to the same route arriving within the window
+	/// after it go out together as one bulk request, each getting the answer its single call would
+	/// have got. When the bulk request's response is lost (a dropped connection, a timeout), all
+	/// of its calls fail together, with an error naming the bulk endpoint.
+	///
+	/// `Duration::ZERO`, the default, turns batching off: every call goes out alone, as before.
+	/// Values above one second count as one second.
+	pub fn with_batch_window(mut self, batch_window: Duration) -> Self {
+		self.batch_window = batch_window;
 		self
 	}
 
@@ -250,6 +273,7 @@ impl Default for ClientConfig {
 			archive_codec_mem_budget: crate::fs::archive::config::CODEC_MEM_BUDGET,
 			#[cfg(feature = "archive")]
 			archive_job_concurrency: crate::fs::archive::config::JOB_CONCURRENCY,
+			batch_window: Duration::ZERO,
 			file_io_memory_budget: {
 				#[cfg(not(target_os = "ios"))]
 				{
@@ -328,6 +352,12 @@ pub struct JsClientConfig {
 	#[cfg_attr(all(target_family = "wasm", target_os = "unknown"), serde(default))]
 	#[cfg_attr(feature = "uniffi", uniffi(default = None))]
 	pub archive_job_concurrency: Option<u32>,
+	/// How long calls to a route with a bulk twin wait for others to send with them as one bulk
+	/// request, in milliseconds; the first call of a burst goes out at once. Off (every call
+	/// alone) when left out or 0, at most 1000.
+	#[cfg_attr(all(target_family = "wasm", target_os = "unknown"), serde(default))]
+	#[cfg_attr(feature = "uniffi", uniffi(default = None))]
+	pub batch_window_ms: Option<u32>,
 }
 
 #[cfg(any(
@@ -398,6 +428,9 @@ impl From<JsClientConfig> for ClientConfig {
 			if let Some(concurrency) = value.archive_job_concurrency {
 				config = config.with_archive_job_concurrency(concurrency as usize);
 			}
+		}
+		if let Some(ms) = value.batch_window_ms {
+			config = config.with_batch_window(Duration::from_millis(u64::from(ms)));
 		}
 		config
 	}
@@ -581,6 +614,10 @@ impl ThumbnailConfig {
 /// transfers can miss the window the lock's keep-alive gives it.
 const LOCK_REQUEST_CONCURRENCY: usize = 4;
 
+/// The longest batch window ([`ClientConfig::with_batch_window`]): a longer one only delays its
+/// callers, and the cap keeps a window's deadline (`Instant + window`) from overflowing.
+const MAX_BATCH_WINDOW: Duration = Duration::from_secs(1);
+
 #[derive(Clone)]
 pub(crate) struct SharedClientState {
 	concurrency: GlobalConcurrencyLimitLayer,
@@ -602,6 +639,8 @@ pub(crate) struct SharedClientState {
 	thumbnails: ThumbnailConfig,
 	#[cfg(feature = "archive")]
 	archives: crate::fs::archive::ArchiveConfig,
+	/// See [`ClientConfig::with_batch_window`], at most [`MAX_BATCH_WINDOW`].
+	batch_window: Duration,
 }
 
 impl SharedClientState {
@@ -693,7 +732,13 @@ impl SharedClientState {
 			thumbnails,
 			#[cfg(feature = "archive")]
 			archives,
+			batch_window: config.batch_window.min(MAX_BATCH_WINDOW),
 		})
+	}
+
+	/// How long a batched call waits for others; zero when batching is off.
+	pub(crate) fn batch_window(&self) -> Duration {
+		self.batch_window
 	}
 
 	pub(crate) fn memory_semaphore(&self) -> &Arc<tokio::sync::Semaphore> {
@@ -724,6 +769,9 @@ impl SharedClientState {
 pub struct AuthClient {
 	pub(crate) unauthed: UnauthClient,
 	api_key: Arc<RwLock<APIKey<'static>>>,
+	/// This client's open batch windows: per logged-in client, so one window never mixes two
+	/// clients' API keys.
+	batcher: Batcher,
 }
 
 impl std::fmt::Debug for AuthClient {
@@ -1148,7 +1196,11 @@ impl AuthClient {
 		unauthed: UnauthClient,
 		api_key: Arc<RwLock<APIKey<'static>>>,
 	) -> Self {
-		Self { unauthed, api_key }
+		Self {
+			unauthed,
+			api_key,
+			batcher: Batcher::default(),
+		}
 	}
 
 	pub(crate) fn to_unauthed(&self) -> UnauthClient {
@@ -1416,6 +1468,58 @@ impl AuthClient {
 				client: self.unauthed.reqwest_client.clone(),
 			})
 			.await // optional
+	}
+
+	/// [`Self::post_auth`] for a route with a bulk twin: with a batch window set, calls arriving
+	/// together go out as one request to `route`, each getting the answer its single call would
+	/// have got (see [`batch`]). With the window at zero, it is exactly `post_auth`.
+	pub(crate) async fn post_batched<Req, Res>(
+		&self,
+		route: &'static BulkRoute,
+		endpoint: &'static str,
+		request: &Req,
+	) -> Result<Res, Error>
+	where
+		Res: DeserializeOwned + Debug,
+		Req: Serialize + Debug,
+	{
+		let single = || self.post_auth::<Req, Res>(endpoint.into(), request);
+		let window = self.unauthed.state.batch_window();
+		if window.is_zero() {
+			return single().await;
+		}
+		let Some(lane) = batch::lane() else {
+			return single().await;
+		};
+		let Some(split) = route.split(request) else {
+			tracing::warn!(
+				endpoint,
+				via = route.endpoint,
+				"request does not split into a bulk item; sending it alone"
+			);
+			return single().await;
+		};
+		let reply = self
+			.batcher
+			.call::<Res, _, _>(route, lane, split, window, move |taken| async move {
+				self.post_auth(route.endpoint.into(), &*taken).await
+			})
+			.await;
+		match reply {
+			Reply::Alone => single().await,
+			Reply::Item(Ok(data)) => Ok(data),
+			Reply::Item(Err(e)) => {
+				let e = e.with_context(endpoint);
+				tracing::warn!(endpoint, via = route.endpoint, error = %e, "request failed");
+				Err(e)
+			}
+			// no context of its own: the stand-in reads as the shared error, which names the
+			// bulk endpoint
+			Reply::Failed(e) => {
+				tracing::warn!(endpoint, via = route.endpoint, error = %e, "request failed");
+				Err(e)
+			}
+		}
 	}
 
 	pub(crate) async fn post_large_response_auth<Req, Res, F>(
@@ -2079,7 +2183,9 @@ mod memory_budget_validation_tests {
 
 #[cfg(all(test, feature = "uniffi"))]
 mod js_client_config_tests {
-	use super::{ClientConfig, JsClientConfig};
+	use std::time::Duration;
+
+	use super::{ClientConfig, JsClientConfig, SharedClientState};
 
 	fn base() -> JsClientConfig {
 		JsClientConfig {
@@ -2094,6 +2200,7 @@ mod js_client_config_tests {
 			thumbnail_decode_concurrency: None,
 			archive_codec_mem_budget: None,
 			archive_job_concurrency: None,
+			batch_window_ms: None,
 		}
 	}
 
@@ -2153,5 +2260,29 @@ mod js_client_config_tests {
 			tokio::sync::Semaphore::MAX_PERMITS,
 			"an oversized budget must be clamped to Semaphore::MAX_PERMITS to avoid a panic"
 		);
+	}
+
+	#[test]
+	fn a_batch_window_left_out_keeps_batching_off() {
+		assert_eq!(ClientConfig::from(base()).batch_window, Duration::ZERO);
+	}
+
+	#[test]
+	fn a_batch_window_in_milliseconds_reaches_the_client_config() {
+		let config = ClientConfig::from(JsClientConfig {
+			batch_window_ms: Some(5),
+			..base()
+		});
+		assert_eq!(config.batch_window, Duration::from_millis(5));
+	}
+
+	#[test]
+	fn a_batch_window_above_one_second_counts_as_one_second() {
+		let state = SharedClientState::new(ClientConfig::from(JsClientConfig {
+			batch_window_ms: Some(u32::MAX),
+			..base()
+		}))
+		.expect("the defaults are valid");
+		assert_eq!(state.batch_window(), Duration::from_secs(1));
 	}
 }

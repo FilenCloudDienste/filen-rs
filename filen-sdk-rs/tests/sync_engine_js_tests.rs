@@ -48,6 +48,7 @@ fn js_client(base: &Client) -> JsClient {
 		archive_codec_mem_budget: None,
 		#[cfg(feature = "archive")]
 		archive_job_concurrency: None,
+		batch_window_ms: None,
 	};
 	UnauthJsClient::from_config(config)
 		.unwrap()

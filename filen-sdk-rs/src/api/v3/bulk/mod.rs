@@ -12,6 +12,7 @@ use serde_json::value::RawValue;
 
 use crate::error::{Error, ErrorKind};
 
+pub(crate) mod batched;
 pub(crate) mod delete;
 pub(crate) mod dir;
 pub(crate) mod file;
@@ -56,6 +57,18 @@ pub(crate) enum Sent<'a, I, T> {
 pub(crate) struct Answer<T> {
 	envelope: FilenResponse<'static, Box<RawValue>>,
 	data: PhantomData<fn() -> T>,
+}
+
+impl<T> Answer<T> {
+	/// A copy of this answer, to be decoded as `U`. The request batcher keeps one answer per
+	/// item and hands each caller waiting on that item its own copy, decoded as that caller's
+	/// type, since [`answered`] consumes the answer it decodes.
+	pub(crate) fn copy_as<U>(&self) -> Answer<U> {
+		Answer {
+			envelope: self.envelope.clone(),
+			data: PhantomData,
+		}
+	}
 }
 
 /// Why a chunk failed before or after it was sent.
