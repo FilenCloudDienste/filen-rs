@@ -10118,8 +10118,9 @@ mod tests {
 	#[test]
 	fn renaming_a_synced_file_into_a_rejected_name_leaves_the_remote_copy_alone() {
 		let root = scan_root("rename_file");
-		// `report.txt` was synced; the user has just renamed it to the reserved device name `CON`.
-		std::fs::write(root.join("CON"), b"payload").unwrap();
+		// `report.txt` was synced; the user has just renamed it to ` report.txt`, whose leading
+		// space the remote rejects.
+		std::fs::write(root.join(" report.txt"), b"payload").unwrap();
 		let hash: Blake3Hash = blake3::hash(b"payload").into();
 		let uuid = Uuid::new_v4();
 
@@ -10148,10 +10149,10 @@ mod tests {
 	#[test]
 	fn renaming_a_synced_dir_into_a_rejected_name_leaves_its_remote_subtree_alone() {
 		let root = scan_root("rename_dir");
-		// `docs/` was synced; the user has just renamed it to `bad.` (a trailing dot the remote
+		// `docs/` was synced; the user has just renamed it to ` docs` (a leading space the remote
 		// rejects), carrying its contents along.
-		std::fs::create_dir_all(root.join("bad.")).unwrap();
-		std::fs::write(root.join("bad.").join("a.txt"), b"payload").unwrap();
+		std::fs::create_dir_all(root.join(" docs")).unwrap();
+		std::fs::write(root.join(" docs").join("a.txt"), b"payload").unwrap();
 		let hash: Blake3Hash = blake3::hash(b"payload").into();
 		let (dir_uuid, file_uuid) = (Uuid::new_v4(), Uuid::new_v4());
 

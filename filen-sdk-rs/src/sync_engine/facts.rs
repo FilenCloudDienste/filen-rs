@@ -482,19 +482,20 @@ mod tests {
 			fs::write(root.join("keep.txt"), b"k").unwrap();
 			fs::create_dir(root.join("d")).unwrap();
 			fs::write(root.join("d").join("ok.txt"), b"o").unwrap();
-			// Reserved device name: creatable here, refused by the SDK's own name validator.
-			fs::write(root.join("d").join("CON"), b"c").unwrap();
+			// A leading space: stored as written on every platform, refused by the SDK's own name
+			// validator.
+			fs::write(root.join("d").join(" c.txt"), b"c").unwrap();
 			fs::write(root.join("d").join("x.log"), b"l").unwrap();
 			fs::create_dir(root.join("e")).unwrap();
-			fs::write(root.join("e").join("CON"), b"c").unwrap();
+			fs::write(root.join("e").join(" c.txt"), b"c").unwrap();
 			fs::write(root.join("e").join("y.log"), b"l").unwrap();
 		}
 		// Every shape of change to one directory: a blocked path that goes away, a new one that
 		// appears, and a newly hidden entry.
 		fn change(root: &Path) {
-			fs::remove_file(root.join("d").join("CON")).unwrap();
-			fs::create_dir(root.join("d").join("bad.")).unwrap();
-			fs::write(root.join("d").join("bad.").join("inner.txt"), b"i").unwrap();
+			fs::remove_file(root.join("d").join(" c.txt")).unwrap();
+			fs::create_dir(root.join("d").join(" bad")).unwrap();
+			fs::write(root.join("d").join(" bad").join("inner.txt"), b"i").unwrap();
 			fs::write(root.join("d").join("z.log"), b"l").unwrap();
 		}
 
@@ -511,7 +512,7 @@ mod tests {
 
 		assert_eq!(
 			keys(&whole.invalid_names),
-			vec!["d/bad.", "e/CON"],
+			vec!["d/ bad", "e/ c.txt"],
 			"the tree under test has to carry a fact on each side of the dirty directory"
 		);
 		assert_eq!(carried, whole);
@@ -527,18 +528,18 @@ mod tests {
 	fn a_re_observed_file_records_a_rejected_name_and_an_absent_one_drops_it() {
 		let root = temp_root();
 		fs::create_dir(root.join("d")).unwrap();
-		fs::write(root.join("d").join("CON"), b"c").unwrap();
+		fs::write(root.join("d").join(" c.txt"), b"c").unwrap();
 
 		let mut facts = PairFacts::default();
-		facts.observe_local(&observe(&root, &["d/CON"]));
+		facts.observe_local(&observe(&root, &["d/ c.txt"]));
 		assert!(
-			facts.invalid_names["d/CON"].contains("reserved"),
+			facts.invalid_names["d/ c.txt"].contains("start with a space"),
 			"the validator's own reason: {:?}",
 			facts.invalid_names
 		);
 
-		fs::rename(root.join("d").join("CON"), root.join("d").join("ok.txt")).unwrap();
-		facts.observe_local(&observe(&root, &["d/CON", "d/ok.txt"]));
+		fs::rename(root.join("d").join(" c.txt"), root.join("d").join("ok.txt")).unwrap();
+		facts.observe_local(&observe(&root, &["d/ c.txt", "d/ok.txt"]));
 		assert!(
 			facts.invalid_names.is_empty(),
 			"the path the file left is absent, and the one it took is syncable: {:?}",

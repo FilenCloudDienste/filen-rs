@@ -1726,13 +1726,14 @@ mod tests {
 	fn a_name_the_remote_would_reject_is_reported_once_but_still_observed() {
 		let root = temp_root();
 		fs::write(root.join("keep.txt"), b"x").unwrap();
-		// `CON` is a reserved device name and `bad.` ends in a dot: both are creatable on unix and
-		// both are refused by the SDK's own name validator, so no upload of them can ever succeed.
-		fs::write(root.join("CON"), b"reserved").unwrap();
-		fs::create_dir(root.join("bad.")).unwrap();
-		fs::write(root.join("bad.").join("inner.txt"), b"child").unwrap();
-		fs::create_dir_all(root.join("bad.").join("deeper")).unwrap();
-		fs::write(root.join("bad.").join("deeper").join("x.txt"), b"deep").unwrap();
+		// A leading space is refused by the SDK's own name validator, so no upload of either can
+		// ever succeed, yet every platform stores it as written. A reserved device name or a
+		// trailing dot would not do: Win32 opens the console for `CON` and strips the dot.
+		fs::write(root.join(" notes.txt"), b"rejected").unwrap();
+		fs::create_dir(root.join(" bad")).unwrap();
+		fs::write(root.join(" bad").join("inner.txt"), b"child").unwrap();
+		fs::create_dir_all(root.join(" bad").join("deeper")).unwrap();
+		fs::write(root.join(" bad").join("deeper").join("x.txt"), b"deep").unwrap();
 
 		let scan = scan_plain(&root, &HashMap::new());
 		let mut paths: Vec<String> = scan
@@ -1747,16 +1748,21 @@ mod tests {
 		assert_eq!(
 			paths,
 			vec![
-				"CON",
-				"bad.",
-				"bad./deeper",
-				"bad./deeper/x.txt",
-				"bad./inner.txt",
+				" bad",
+				" bad/deeper",
+				" bad/deeper/x.txt",
+				" bad/inner.txt",
+				" notes.txt",
 				"keep.txt"
 			]
 		);
 		assert!(
-			scan.nodes.whole().at("CON").unwrap().content_hash.is_some(),
+			scan.nodes
+				.whole()
+				.at(" notes.txt")
+				.unwrap()
+				.content_hash
+				.is_some(),
 			"a rejected name is hashed like any other file, so a rename of a synced file into one \
 			 is still recognized as that file"
 		);
@@ -1764,13 +1770,13 @@ mod tests {
 		let reported: Vec<_> = scan.invalid_names.keys().cloned().collect();
 		assert_eq!(
 			reported,
-			vec!["CON", "bad."],
+			vec![" bad", " notes.txt"],
 			"each rejected name is reported ONCE, not once per descendant"
 		);
 		assert!(
-			scan.invalid_names["bad."].contains("dot or space"),
+			scan.invalid_names[" bad"].contains("start with a space"),
 			"the report carries the validator's own reason: {:?}",
-			scan.invalid_names["bad."]
+			scan.invalid_names[" bad"]
 		);
 
 		// Crucially the scan still COMPLETED: an unsyncable name is not missing evidence, so the
@@ -3178,8 +3184,8 @@ mod tests {
 			"notes.md",
 			"x.log",
 			"\u{c4}rger",
-			"CON",
-			"bad.",
+			" lead",
+			" bad",
 			"z.txt",
 			"keep",
 		];
