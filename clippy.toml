@@ -1,0 +1,12 @@
+# Every rusqlite connection opens through `filen_sdk_rs::cache::{open_sqlite,
+# open_sqlite_with_flags, open_sqlite_in_memory}`, which initialize SQLite once before the first
+# open; two threads racing SQLite's first-time initialization can crash on arm64
+# (filen-sdk-rs/src/cache/sqlite.rs).
+disallowed-methods = [
+	{ path = "rusqlite::Connection::open", reason = "use filen_sdk_rs::cache::open_sqlite" },
+	{ path = "rusqlite::Connection::open_with_flags", reason = "use filen_sdk_rs::cache::open_sqlite_with_flags" },
+	{ path = "rusqlite::Connection::open_in_memory", reason = "use filen_sdk_rs::cache::open_sqlite_in_memory" },
+	{ path = "rusqlite::Connection::open_with_flags_and_vfs", reason = "add a wrapper in filen_sdk_rs::cache that initializes SQLite first" },
+	{ path = "rusqlite::Connection::open_in_memory_with_flags", reason = "add a wrapper in filen_sdk_rs::cache that initializes SQLite first" },
+	{ path = "rusqlite::Connection::open_in_memory_with_flags_and_vfs", reason = "add a wrapper in filen_sdk_rs::cache that initializes SQLite first" },
+]

@@ -114,8 +114,10 @@ Seal with the `clean-rust` skill's private-module `Sealed` supertrait if closure
   exception is `cast_possible_truncation`, which has no allows at all: a cast that could
   truncate becomes `T::try_from` (with `?`, a saturating `unwrap_or`, or an `expect` naming the
   invariant), and a float-to-int one `num_traits::ToPrimitive`; the diff policy blocks an allow
-  of it or of `clippy::pedantic`. There is no `clippy.toml`, and nothing enforces the import or
-  allow-comment conventions mechanically; review does.
+  of it or of `clippy::pedantic`. The root `clippy.toml` only disallows opening a rusqlite
+  `Connection` directly: open through `filen_sdk_rs::cache::open_sqlite` and its siblings, which
+  initialize SQLite once first (`cache/sqlite.rs`). Nothing enforces the import or allow-comment
+  conventions mechanically; review does.
 - `pin_project` (proc-macro, `project = Name`) is used **only** under `filen-sdk-rs/src/auth/http/`;
   everything else (`runtime.rs`, `socket/thread_handling.rs`, `js/managed_futures/*`) uses
   `pin_project_lite`. Follow the neighbourhood; do not mix them in one file.

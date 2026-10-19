@@ -2,6 +2,10 @@
 //! opens through these functions, so that SQLite runs its first-time initialization on one thread
 //! before any other thread reaches it (see [`initialize_sqlite_once`]).
 
+// The workspace's `clippy.toml` disallows opening a `Connection` directly anywhere else; this
+// module is the one place that does, after initializing SQLite.
+#![allow(clippy::disallowed_methods)]
+
 use std::{path::Path, sync::Once};
 
 use rusqlite::{Connection, OpenFlags};
@@ -47,8 +51,9 @@ pub fn open_sqlite_in_memory() -> rusqlite::Result<Connection> {
 ///
 /// Opening and dropping an in-memory connection runs `sqlite3_initialize` to completion on the
 /// thread that wins the [`Once`]; every other caller blocks until it returns, and the `Once`'s
-/// completion orders the whole mutex table before them. This can go once a libsqlite3-sys release
-/// bundles an SQLite whose initialization is safe to race.
+/// completion orders the whole mutex table before them. This, and the `clippy.toml` rule that
+/// routes every open through here, can go once a libsqlite3-sys release bundles an SQLite whose
+/// initialization is safe to race.
 ///
 /// On wasm, rusqlite runs on sqlite-wasm-rs, which builds SQLite with `SQLITE_THREADSAFE=0`: there
 /// is no mutex table to race on, and the in-memory open only initializes SQLite early. The cache
