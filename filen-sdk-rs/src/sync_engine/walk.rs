@@ -166,8 +166,10 @@ type Listing = Result<Entry, WalkError>;
 
 /// What is left of one directory's listing.
 enum Remaining {
-	/// Still being read from the directory's open stream.
-	Open { stream: ReadDir, depth: usize },
+	/// Still being read from the directory's open stream. Boxed because Windows' `ReadDir` holds
+	/// a whole `WIN32_FIND_DATAW` (over 600 bytes), which every directory read into memory would
+	/// otherwise carry too.
+	Open { stream: Box<ReadDir>, depth: usize },
 	/// Read into memory: the stream was closed to stay under [`MAX_OPEN`], or failed to open.
 	Read(vec::IntoIter<Listing>),
 }
@@ -305,7 +307,7 @@ impl Walk {
 		}
 		let remaining = match fs::read_dir(&dir.path) {
 			Ok(stream) => Remaining::Open {
-				stream,
+				stream: Box::new(stream),
 				depth: dir.depth + 1,
 			},
 			// Reported as the next thing listed.
