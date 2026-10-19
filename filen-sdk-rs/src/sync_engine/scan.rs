@@ -2239,7 +2239,9 @@ mod tests {
 		let twins = [root.join(upper), root.join(lower)];
 		fs::write(&twins[0], b"x").unwrap();
 		fs::write(&twins[1], b"y").unwrap();
-		(fs::read_dir(root).unwrap().count() == 2).then_some(twins)
+		// Told apart by content, not by counting `root`'s entries: a caller may pass a directory
+		// that holds more than the twins.
+		(fs::read(&twins[0]).unwrap() != fs::read(&twins[1]).unwrap()).then_some(twins)
 	}
 
 	/// A twin whose first spelling claimed the folded name and then bailed — a file the scan could
