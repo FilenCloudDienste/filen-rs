@@ -4864,6 +4864,7 @@ mod tests {
 		std::fs::remove_dir_all(&root).ok();
 	}
 
+	#[cfg(unix)]
 	#[test]
 	fn confine_rejects_writing_through_a_symlink_escaping_the_root() {
 		let root = temp_dir();
@@ -4881,6 +4882,7 @@ mod tests {
 		std::fs::remove_dir_all(&outside).ok();
 	}
 
+	#[cfg(unix)]
 	#[test]
 	fn confine_allows_a_symlink_that_stays_within_the_root() {
 		let root = temp_dir();

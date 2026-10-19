@@ -36,7 +36,9 @@ use filen_sdk_rs::fs::categories::{DirType, Normal};
 use filen_sdk_rs::fs::file::RemoteFile;
 use filen_sdk_rs::fs::file::meta::FileMetaChanges;
 use filen_sdk_rs::fs::{HasName, HasUUID};
-use filen_sdk_rs::sync_engine::{SyncMode, UnsyncableReason};
+use filen_sdk_rs::sync_engine::SyncMode;
+#[cfg(any(unix, feature = "malformed"))]
+use filen_sdk_rs::sync_engine::UnsyncableReason;
 #[cfg(feature = "malformed")]
 use filen_sdk_rs::{crypto::shared::MetaCrypter, sync_engine::UnsyncablePath};
 

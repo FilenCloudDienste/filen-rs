@@ -3183,6 +3183,7 @@ mod tests {
 			"z.txt",
 			"keep",
 		];
+		#[cfg(unix)]
 		let mut unreadable = 0usize;
 		for seed in 0..16u64 {
 			let mut rng = StdRng::seed_from_u64(seed);
@@ -3295,8 +3296,6 @@ mod tests {
 			unreadable > 2,
 			"only {unreadable} case(s) with an unreadable file"
 		);
-		#[cfg(not(unix))]
-		let _ = unreadable;
 	}
 
 	/// A map sink that also keeps everything put into it, in the order it was put.

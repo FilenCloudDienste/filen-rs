@@ -19,9 +19,9 @@ use filen_macros::shared_test_runtime;
 use filen_sdk_rs::fs::categories::{DirType, Normal};
 use filen_sdk_rs::fs::file::RemoteFile;
 use filen_sdk_rs::fs::{HasName, HasUUID};
-use filen_sdk_rs::sync_engine::{
-	SyncEngine, SyncEvent, SyncMode, SyncObserver, UnsyncablePath, UnsyncableReason,
-};
+use filen_sdk_rs::sync_engine::{SyncEngine, SyncEvent, SyncMode, SyncObserver};
+#[cfg(unix)]
+use filen_sdk_rs::sync_engine::{UnsyncablePath, UnsyncableReason};
 use uuid::Uuid;
 
 use crate::harness::*;
