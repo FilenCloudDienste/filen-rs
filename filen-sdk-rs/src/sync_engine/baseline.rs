@@ -20,6 +20,11 @@ use filen_types::{crypto::Blake3Hash, fs::StableUuid};
 use rusqlite::{Connection, OptionalExtension, Row, params, types::Type};
 use uuid::Uuid;
 
+use crate::cache::open_sqlite;
+// Only the test rows connection opens an in-memory database.
+#[cfg(test)]
+use crate::cache::open_sqlite_in_memory;
+
 use super::{
 	engine::PendingKind,
 	guard::DeleteGuard,
@@ -856,7 +861,7 @@ impl Readers {
 /// write the shared-memory index — but `query_only`, so nothing a pass does through it can write a
 /// row; the busy timeout covers the rare moment a reader waits on WAL recovery.
 fn open_reader(path: &Path) -> rusqlite::Result<Connection> {
-	let conn = Connection::open(path)?;
+	let conn = open_sqlite(path)?;
 	conn.busy_timeout(std::time::Duration::from_millis(30_000))?;
 	conn.execute_batch(&format!(
 		"PRAGMA query_only = ON; PRAGMA cache_size = -{READER_CACHE_KIB};"
@@ -907,7 +912,7 @@ const _: () = {
 /// through a [`Snapshot`] — the store's own statements on the store's own tables.
 #[cfg(test)]
 pub(super) fn test_rows_connection(pair: PairId) -> Connection {
-	let conn = Connection::open_in_memory().expect("opening a test connection");
+	let conn = open_sqlite_in_memory().expect("opening a test connection");
 	conn.execute_batch(&format!(
 		"PRAGMA page_size = {PAGE_SIZE}; PRAGMA foreign_keys = ON; PRAGMA recursive_triggers = ON;
 		 {SCHEMA} {ADDITIVE_SCHEMA}"
@@ -1109,7 +1114,7 @@ fn conflict_rows_walked_sql() -> String {
 impl BaselineStore {
 	/// Open (creating if needed) the baseline DB at `path`.
 	pub(crate) fn open(path: &Path) -> Result<Self, crate::Error> {
-		Self::init(Connection::open(path).map_err(open_error)?, path)
+		Self::init(open_sqlite(path).map_err(open_error)?, path)
 	}
 
 	/// A store no other test sees, removed with it.
@@ -2300,7 +2305,7 @@ mod tests {
 				"the refusal must name the version problem: {message}"
 			);
 			// Fails CLOSED: the DB is left as it was, neither migrated nor re-stamped in place.
-			let raw = Connection::open(&path).unwrap();
+			let raw = open_sqlite(&path).unwrap();
 			let still: i64 = raw
 				.query_row("PRAGMA user_version", [], |row| row.get(0))
 				.unwrap();
@@ -2325,7 +2330,7 @@ mod tests {
 		{
 			// Not opened through `BaselineStore`: this file has never been in WAL, and it has a
 			// table, so it reads as written rather than brand new.
-			let raw = Connection::open(&path).unwrap();
+			let raw = open_sqlite(&path).unwrap();
 			raw.execute_batch(&format!(
 				"CREATE TABLE something (id INTEGER PRIMARY KEY);
 				 PRAGMA user_version = {};",
@@ -2347,7 +2352,7 @@ mod tests {
 			),
 		}
 
-		let raw = Connection::open(&path).unwrap();
+		let raw = open_sqlite(&path).unwrap();
 		assert_eq!(
 			journal_mode(&raw),
 			"delete",
@@ -2368,7 +2373,7 @@ mod tests {
 		let path = temp_db_path("partial_schema");
 		let broken = format!("{SCHEMA}\nCREATE TABLE oops (id INTEGER PRIMARY KEY;");
 		{
-			let conn = Connection::open(&path).unwrap();
+			let conn = open_sqlite(&path).unwrap();
 			create_schema(&conn, &broken).expect_err("the broken batch must fail");
 			assert!(
 				is_unwritten(&conn).unwrap(),
@@ -2393,7 +2398,7 @@ mod tests {
 	#[test]
 	fn an_empty_db_file_is_created_from_scratch_rather_than_refused() {
 		let path = temp_db_path("empty_file");
-		drop(Connection::open(&path).unwrap());
+		drop(open_sqlite(&path).unwrap());
 		let store = BaselineStore::open(&path).unwrap();
 		assert_eq!(version_of(&store), SCHEMA_VERSION);
 		assert!(store.list_pairs().unwrap().is_empty());

@@ -194,6 +194,7 @@ What already exists on main:
 | `Debug` for a type holding a secret | the hashed `Debug` on `FileKey` (`crypto/v1.rs`) |
 | Ordered callback delivery on uniffi | `crate::js::spawn_ordered_dispatch` (`js/uniffi.rs`, uniffi-only) |
 | Live-test accounts, directories and cleanup | `test-utils` |
+| Opening an SQLite connection, tests included | `cache::{open_sqlite, open_sqlite_with_flags, open_sqlite_in_memory}` (`cache/sqlite.rs`), never `rusqlite::Connection::open*` |
 
 Check `std` and the crates already in `Cargo.toml` before writing an algorithm by hand (for
 example `cbc` for CBC chaining, `str::floor_char_boundary`). Adding a crate is the

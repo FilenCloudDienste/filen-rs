@@ -34,11 +34,13 @@ use filen_types::{
 };
 #[cfg(unix)]
 use nix::sys::resource::{UsageWho, getrusage};
-use rusqlite::Connection;
 use uuid::Uuid;
 
 use crate::{
-	cache::bench_support::{self, BenchCache},
+	cache::{
+		bench_support::{self, BenchCache},
+		open_sqlite,
+	},
 	crypto::file::FileKey,
 	fs::{dir::cache::CacheableDir, file::cache::CacheableFile},
 };
@@ -3066,7 +3068,7 @@ pub fn run() -> String {
 	// clones the file on APFS, and every page the phases below then write to the original would be
 	// a copy-on-write of a block the clone shares.
 	let pushed_db = fixture.dir.join("baseline-after-push.db");
-	Connection::open(&fixture.baseline_db)
+	open_sqlite(&fixture.baseline_db)
 		.and_then(|conn| conn.execute("VACUUM INTO ?1", [pushed_db.to_string_lossy()]))
 		.expect("copying the baseline DB");
 

@@ -610,10 +610,12 @@ impl AuthCacheState {
 
 #[cfg(test)]
 mod id_resolution_tests {
+	use filen_sdk_rs::cache::open_sqlite_in_memory;
+
 	use super::*;
 
 	fn db() -> Connection {
-		let conn = Connection::open_in_memory().unwrap();
+		let conn = open_sqlite_in_memory().unwrap();
 		crate::auth::configure_conn(&conn).unwrap();
 		conn.execute_batch(sql::statements::INIT).unwrap();
 		// The parent every row below hangs off; nothing resolves through it, it just makes the
@@ -747,10 +749,12 @@ mod id_resolution_tests {
 
 #[cfg(test)]
 mod change_feed_paging_tests {
+	use filen_sdk_rs::cache::open_sqlite_in_memory;
+
 	use super::*;
 
 	fn db() -> Connection {
-		let conn = Connection::open_in_memory().unwrap();
+		let conn = open_sqlite_in_memory().unwrap();
 		crate::auth::configure_conn(&conn).unwrap();
 		conn.execute_batch(sql::statements::INIT).unwrap();
 		add_dir(&conn, uuid(9));

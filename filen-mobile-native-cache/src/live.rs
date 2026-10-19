@@ -1413,6 +1413,7 @@ mod applier_tests {
 
 	use chrono::{DateTime, Utc};
 	use filen_sdk_rs::{
+		cache::open_sqlite_in_memory,
 		fs::{dir::meta::DirectoryMeta, file::meta::FileMeta},
 		socket as ev,
 	};
@@ -1431,7 +1432,7 @@ mod applier_tests {
 	const ROOT: u8 = 9;
 
 	fn db() -> Mutex<Connection> {
-		let conn = Connection::open_in_memory().unwrap();
+		let conn = open_sqlite_in_memory().unwrap();
 		crate::auth::configure_conn(&conn).unwrap();
 		conn.execute_batch(crate::sql::statements::INIT).unwrap();
 		conn.execute(

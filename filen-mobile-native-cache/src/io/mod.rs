@@ -1494,6 +1494,7 @@ mod tests {
 mod slot_rescue_tests {
 	use std::sync::Mutex;
 
+	use filen_sdk_rs::cache::open_sqlite_in_memory;
 	use filen_types::fs::StableUuid;
 	use rusqlite::Connection;
 
@@ -1513,7 +1514,7 @@ mod slot_rescue_tests {
 	}
 
 	fn db() -> Connection {
-		let conn = Connection::open_in_memory().unwrap();
+		let conn = open_sqlite_in_memory().unwrap();
 		crate::auth::configure_conn(&conn).unwrap();
 		conn.execute_batch(sql::statements::INIT).unwrap();
 		sql::install_slot_remint_log(&conn).unwrap();

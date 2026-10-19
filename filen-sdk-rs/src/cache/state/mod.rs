@@ -41,12 +41,16 @@ use wasmtimer::{std::Instant as TimerInstant, tokio::sleep_until};
 use crate::cache::{
 	CacheError,
 	handle::{CacheMessage, ResyncProgress},
+	open_sqlite,
 	search::ReadTask,
 	sql::{
 		PersistedEvent, UndecodableItem,
 		columns::{COUNT, FILES_STABLE_UUID, ITEMS_PARENT},
 	},
 };
+// Only the in-memory test constructors open an in-memory database.
+#[cfg(test)]
+use crate::cache::open_sqlite_in_memory;
 const BATCH_SIZE: usize = 256;
 
 /// Whether the membership gate must vet an event's parent before an upsert. SOCKET events are
@@ -256,7 +260,7 @@ impl CacheState {
 		drop(msg_receiver);
 
 		let mut state = Self {
-			db: rusqlite::Connection::open_in_memory().unwrap(),
+			db: open_sqlite_in_memory().unwrap(),
 			event_receiver,
 			control_receiver: PeekableReceiver::new(control_receiver),
 			msg_sender,
@@ -293,7 +297,7 @@ impl CacheState {
 		drop(msg_receiver);
 
 		let mut state = Self {
-			db: rusqlite::Connection::open(path).unwrap(),
+			db: open_sqlite(path).unwrap(),
 			event_receiver,
 			control_receiver: PeekableReceiver::new(control_receiver),
 			msg_sender,
@@ -328,7 +332,7 @@ impl CacheState {
 		let shed = Arc::new(AtomicBool::new(false));
 
 		let mut state = Self {
-			db: rusqlite::Connection::open_in_memory().unwrap(),
+			db: open_sqlite_in_memory().unwrap(),
 			event_receiver,
 			control_receiver: PeekableReceiver::new(control_receiver),
 			msg_sender,
@@ -550,7 +554,7 @@ impl CacheState {
 		msg_sender: tokio::sync::mpsc::Sender<Vec<CacheMessage>>,
 		client: Arc<Client>,
 	) -> Result<InitResult, crate::Error> {
-		let connection = rusqlite::Connection::open(cache_path).map_err(|e| {
+		let connection = open_sqlite(cache_path).map_err(|e| {
 			crate::Error::custom_with_source(
 				ErrorKind::Internal,
 				e,

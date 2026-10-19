@@ -996,13 +996,15 @@ impl ToSql for RawMeta<'_> {
 mod pending_upload_tests {
 	use std::collections::HashMap;
 
+	use filen_sdk_rs::cache::open_sqlite_in_memory;
+
 	use super::*;
 	use crate::sql::item::{self, combine_parent};
 
 	const MARKED_AT: i64 = 1_700_000_000_000;
 
 	fn db() -> Connection {
-		let conn = Connection::open_in_memory().unwrap();
+		let conn = open_sqlite_in_memory().unwrap();
 		crate::auth::configure_conn(&conn).unwrap();
 		conn.execute_batch(INIT).unwrap();
 		conn
@@ -1495,7 +1497,9 @@ mod trashed_listing_tests {
 	use std::borrow::Cow;
 
 	use chrono::Utc;
-	use filen_sdk_rs::{crypto::file::FileKey, fs::file::meta::DecryptedFileMeta};
+	use filen_sdk_rs::{
+		cache::open_sqlite_in_memory, crypto::file::FileKey, fs::file::meta::DecryptedFileMeta,
+	};
 	use filen_types::{auth::FileEncryptionVersion, fs::ParentUuid};
 
 	use super::*;
@@ -1505,7 +1509,7 @@ mod trashed_listing_tests {
 	/// Configured the way every real connection is, so the name-slot lookup the guard performs
 	/// has the `uuid_text` function those statements are written against.
 	fn db() -> Connection {
-		let conn = Connection::open_in_memory().unwrap();
+		let conn = open_sqlite_in_memory().unwrap();
 		crate::auth::configure_conn(&conn).unwrap();
 		conn.execute_batch(INIT).unwrap();
 		conn
@@ -1732,7 +1736,9 @@ mod change_tracking_tests {
 	use std::borrow::Cow;
 
 	use chrono::{DateTime, Utc};
-	use filen_sdk_rs::{crypto::file::FileKey, fs::file::meta::DecryptedFileMeta};
+	use filen_sdk_rs::{
+		cache::open_sqlite_in_memory, crypto::file::FileKey, fs::file::meta::DecryptedFileMeta,
+	};
 	use filen_types::{auth::FileEncryptionVersion, fs::ParentUuid};
 
 	use super::*;
@@ -1746,7 +1752,7 @@ mod change_tracking_tests {
 	/// triggers run under the production pragmas, `recursive_triggers` included, so a delete
 	/// cascade reaches past the first generation exactly as it does in the app.
 	fn db() -> Connection {
-		let conn = Connection::open_in_memory().unwrap();
+		let conn = open_sqlite_in_memory().unwrap();
 		crate::auth::configure_conn(&conn).unwrap();
 		conn.execute_batch(INIT).unwrap();
 		conn
@@ -3146,11 +3152,13 @@ mod change_tracking_tests {
 
 #[cfg(test)]
 mod slot_remint_tests {
+	use filen_sdk_rs::cache::open_sqlite_in_memory;
+
 	use super::*;
 	use crate::sql::item::{self, combine_parent};
 
 	fn db() -> Connection {
-		let conn = Connection::open_in_memory().unwrap();
+		let conn = open_sqlite_in_memory().unwrap();
 		crate::auth::configure_conn(&conn).unwrap();
 		conn.execute_batch(INIT).unwrap();
 		install_slot_remint_log(&conn).unwrap();
@@ -3269,11 +3277,13 @@ mod slot_remint_tests {
 
 #[cfg(test)]
 mod working_set_predicate_tests {
+	use filen_sdk_rs::cache::open_sqlite_in_memory;
+
 	use super::*;
 	use crate::sql::item::{self, combine_parent};
 
 	fn db() -> Connection {
-		let conn = Connection::open_in_memory().unwrap();
+		let conn = open_sqlite_in_memory().unwrap();
 		crate::auth::configure_conn(&conn).unwrap();
 		conn.execute_batch(INIT).unwrap();
 		conn.execute(

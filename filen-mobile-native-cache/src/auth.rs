@@ -10,6 +10,7 @@ use std::{
 use chrono::{DateTime, Utc};
 use filen_sdk_rs::{
 	auth::{StringifiedClient, http::ClientConfig, unauth::UnauthClient},
+	cache::{open_sqlite, open_sqlite_in_memory},
 	crypto::{shared::DataCrypter, v3::EncryptionKey},
 	fs::HasUUID,
 	thumbnail::{DEFAULT_THUMBNAIL_MEM_BUDGET, REMOTE_SOURCE_RESIDENT_BYTES},
@@ -344,7 +345,7 @@ fn init_db(
 	// `io::wipe_account_data`. Covers every reinit path (hash mismatch, version bump, owner
 	// swap, wipe interrupted between unlinks); `from_sdk_config` recreates the dirs afterwards.
 	crate::io::wipe_account_data(files_dir, db_dir)?;
-	let db = Connection::open(db_dir.join(DB_FILE_NAME))?;
+	let db = open_sqlite(db_dir.join(DB_FILE_NAME))?;
 	configure_conn(&db)?;
 	db.execute_batch(sql::statements::INIT)?;
 	sql::install_slot_remint_log(&db)?;
@@ -434,7 +435,7 @@ fn db_from_dir(
 			"Database hash matches, using existing database: {}",
 			db_path.display()
 		);
-		match Connection::open(&db_path).and_then(|conn| {
+		match open_sqlite(&db_path).and_then(|conn| {
 			configure_conn(&conn)?;
 			sql::install_slot_remint_log(&conn)?;
 			Ok(conn)
@@ -950,7 +951,7 @@ impl AuthCacheState {
 		let (cache_dir, tmp_dir, thumbnail_dir) = crate::io::init(files_dir.as_ref())?;
 		// No owner check here: the DB is in-memory and db_state.json is never read, so there is
 		// no previous account's tree to inherit.
-		let db = Connection::open_in_memory()?;
+		let db = open_sqlite_in_memory()?;
 		configure_conn(&db)?;
 		db.execute_batch(sql::statements::INIT)?;
 		sql::install_slot_remint_log(&db)?;
@@ -1307,7 +1308,7 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod connection_pragma_tests {
-	use rusqlite::Connection;
+	use filen_sdk_rs::cache::open_sqlite;
 
 	use super::{configure_conn, test_support::TempDbDir};
 	use crate::sql;
@@ -1323,12 +1324,12 @@ mod connection_pragma_tests {
 		let db_path = dir.0.join("native_cache.db");
 
 		{
-			let conn = Connection::open(&db_path).unwrap();
+			let conn = open_sqlite(&db_path).unwrap();
 			configure_conn(&conn).unwrap();
 			conn.execute_batch(sql::statements::INIT).unwrap();
 		}
 
-		let conn = Connection::open(&db_path).unwrap();
+		let conn = open_sqlite(&db_path).unwrap();
 		configure_conn(&conn).unwrap();
 
 		// root dir (A) -> child dir (B) -> grandchild file (C)

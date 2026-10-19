@@ -22,7 +22,11 @@ use uuid::Uuid;
 // Native-only: the engine opens its own read connection here (wasm routes reads through the
 // worker), so these are unused on the wasm cache build.
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-use {crate::cache::sql::bound_memory, rusqlite::OpenFlags, std::path::Path};
+use {
+	crate::cache::{open_sqlite_with_flags, sql::bound_memory},
+	rusqlite::OpenFlags,
+	std::path::Path,
+};
 
 use crate::{
 	crypto::file::FileKey,
@@ -180,7 +184,7 @@ impl NameMatchers {
 /// connection, so reads route to the worker instead (see [`ReadConn`]).
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 pub(in crate::cache) fn open_read_connection(path: &Path) -> rusqlite::Result<Connection> {
-	let conn = Connection::open_with_flags(
+	let conn = open_sqlite_with_flags(
 		path,
 		OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
 	)?;

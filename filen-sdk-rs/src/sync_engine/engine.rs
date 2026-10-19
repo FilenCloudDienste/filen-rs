@@ -6961,7 +6961,10 @@ mod tests {
 	use crate::{
 		alloc_meter,
 		auth::test_support::offline_client,
-		cache::{CacheState, test_support::rewrite_behind_sqlite},
+		cache::{
+			CacheState, open_sqlite, open_sqlite_in_memory, open_sqlite_with_flags,
+			test_support::rewrite_behind_sqlite,
+		},
 		sync::lock::MAX_SLEEP_TIME_DEFAULT,
 		sync_engine::{
 			PauseMode,
@@ -12611,7 +12614,7 @@ mod tests {
 			.unwrap();
 		// Once the pair's store is open, which creates the index.
 		engine.pair_store(pair).await.unwrap();
-		rusqlite::Connection::open(&db)
+		open_sqlite(&db)
 			.unwrap()
 			.execute_batch("DROP INDEX baseline_unconfirmed")
 			.unwrap();
@@ -14208,7 +14211,7 @@ mod tests {
 
 	/// A database already holding a table `t`, with `t`'s DDL.
 	fn db_with(table: &str) -> rusqlite::Connection {
-		let conn = rusqlite::Connection::open_in_memory().unwrap();
+		let conn = open_sqlite_in_memory().unwrap();
 		conn.execute_batch(&format!("CREATE TABLE t ({table});"))
 			.unwrap();
 		conn
@@ -14249,8 +14252,7 @@ mod tests {
 	#[test]
 	fn a_database_that_cannot_be_opened_is_an_io_error() {
 		let dir = tempfile::tempdir().unwrap();
-		let missing =
-			rusqlite::Connection::open(dir.path().join("missing").join("baseline.db")).unwrap_err();
+		let missing = open_sqlite(dir.path().join("missing").join("baseline.db")).unwrap_err();
 		assert_eq!(
 			missing.sqlite_error_code(),
 			Some(rusqlite::ErrorCode::CannotOpen)
@@ -14274,17 +14276,14 @@ mod tests {
 	fn a_write_to_a_database_opened_read_only_is_an_io_error() {
 		let dir = tempfile::tempdir().unwrap();
 		let path = dir.path().join("baseline.db");
-		rusqlite::Connection::open(&path)
+		open_sqlite(&path)
 			.unwrap()
 			.execute_batch("CREATE TABLE t (k INTEGER);")
 			.unwrap();
 		// How SQLite opens a file the file system will not let it write; the flag rather than a
 		// chmod, so the test holds when run as root too.
-		let conn = rusqlite::Connection::open_with_flags(
-			&path,
-			rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-		)
-		.unwrap();
+		let conn =
+			open_sqlite_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
 		let refused = conn.execute("INSERT INTO t VALUES (1)", []).unwrap_err();
 		assert_eq!(
 			refused.sqlite_error().map(|failure| failure.extended_code),

@@ -12,6 +12,7 @@ use std::{
 use chrono::Utc;
 use filen_sdk_rs::cache::{
 	CacheError, CacheEvent, CacheMessage, ResyncProgress, SyncRootCallback, SyncRootHandle,
+	open_sqlite_with_flags,
 };
 use filen_sdk_rs::{
 	auth::Client,
@@ -109,7 +110,7 @@ pub fn message_errors(msg: &CacheMessage) -> &[CacheError] {
 
 /// Open a read-only SQLite connection to the cache DB.
 pub fn open_read_db(path: &Path) -> rusqlite::Result<Connection> {
-	Connection::open_with_flags(
+	open_sqlite_with_flags(
 		path,
 		OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
 	)

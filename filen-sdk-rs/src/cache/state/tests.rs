@@ -3365,7 +3365,7 @@ fn file_root_callback_fires_after_the_commit() {
 
 	let successor = successor_of(&file, 11);
 	let successor_uuid = successor.uuid;
-	let reader = rusqlite::Connection::open(&path).unwrap();
+	let reader = open_sqlite(&path).unwrap();
 	let observed: Arc<std::sync::Mutex<Option<i64>>> = Arc::new(std::sync::Mutex::new(None));
 	let observed_cb = observed.clone();
 	let callback: SyncRootCallback = Box::new(move |_events| {

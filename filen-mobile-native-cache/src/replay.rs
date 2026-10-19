@@ -396,6 +396,7 @@ mod tests {
 
 	use chrono::TimeZone;
 	use filen_sdk_rs::{
+		cache::open_sqlite_in_memory,
 		fs::{
 			dir::RemoteDirectory, dir::meta::DirectoryMeta, file::RemoteFile, file::meta::FileMeta,
 		},
@@ -418,7 +419,7 @@ mod tests {
 	}
 
 	fn db() -> rusqlite::Connection {
-		let conn = rusqlite::Connection::open_in_memory().unwrap();
+		let conn = open_sqlite_in_memory().unwrap();
 		crate::auth::configure_conn(&conn).unwrap();
 		conn.execute_batch(crate::sql::statements::INIT).unwrap();
 		conn.execute(

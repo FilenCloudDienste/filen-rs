@@ -106,7 +106,7 @@ pub(super) use side::{Pages, Paging, StagedSide};
 pub(super) use test_support::{assert_views_alike, paging_of, staged_sides, staged_view};
 
 use super::baseline::{BaselineEntry, NodeKind, PairId};
-use crate::{Error, ErrorKind};
+use crate::{Error, ErrorKind, cache::open_sqlite};
 
 /// Every pragma of a stage's connection, set before its first page is written (see the module
 /// docs for why each).
@@ -160,7 +160,7 @@ impl Stage {
 			));
 		}
 		let file = StageFile(path);
-		let conn = Connection::open(&file.0)
+		let conn = open_sqlite(&file.0)
 			.and_then(|conn| conn.execute_batch(PRAGMAS).map(|()| conn))
 			.map_err(|error| {
 				super::engine::db_error(

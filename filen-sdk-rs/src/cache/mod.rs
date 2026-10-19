@@ -27,6 +27,7 @@ mod handle;
 pub mod js_impl;
 pub mod search;
 mod sql;
+mod sqlite;
 mod state;
 
 // `CacheControlMessage` is the INTERNAL worker control protocol — the public API exposes it only
@@ -57,6 +58,7 @@ pub use {
 		Search, SearchConfig, SearchHit, SearchItemType, SearchResult, SearchSnapshot,
 		SearchWindowCallback, SearchWindowHandle,
 	},
+	sqlite::{open_sqlite, open_sqlite_in_memory, open_sqlite_with_flags},
 	state::{
 		CacheEvent, CacheEventType, DirEvent, FileEvent, GlobalEvent, RootKey, SyncRootCallback,
 	},

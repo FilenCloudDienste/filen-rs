@@ -15,6 +15,7 @@
 use std::borrow::Cow;
 
 use filen_macros::shared_test_runtime;
+use filen_sdk_rs::cache::open_sqlite;
 use filen_sdk_rs::fs::categories::{DirType, Normal};
 use filen_sdk_rs::fs::dir::RemoteDirectory;
 use filen_sdk_rs::fs::file::RemoteFile;
@@ -69,7 +70,7 @@ async fn wait_cache_has(cache: &TestCache, uuid: Uuid) {
 /// A read/write connection onto a baseline DB the engine persisted — the only way, black-box, to
 /// plant a schema version the current build does not understand (MIGRATE-04).
 fn open_read_write_db(path: &std::path::Path) -> rusqlite::Connection {
-	rusqlite::Connection::open(path).unwrap()
+	open_sqlite(path).unwrap()
 }
 
 /// Assert a `SyncReport` is a perfectly clean no-op (every counter zero, no conflicts/errors).
