@@ -339,11 +339,18 @@ impl SyncEngine {
 			// is unknown, so no pass of this pair may narrow its local half down.
 			changes.degrade(FullPassReason::LocalEventsDegraded);
 		}
+		// `notify`'s ReadDirectoryChangesW backend (8.2.0 `windows.rs`) sets no `Flag::Rescan` and
+		// no info string on any event, so a dropped event there is indistinguishable from a quiet
+		// tree and a local changelist can never be known to be complete. Treat the watch as
+		// degraded from its start rather than narrow a pass down on it. A pair no watch covers
+		// reads its local side whole anyway, and says so with its own reason.
+		#[cfg(target_os = "windows")]
+		changes.degrade(FullPassReason::LocalEventsDegraded);
 		// From here on something IS recording local changes, so a pass may narrow its local half
 		// down to what the list holds. Before this — and after the loop below ends — an empty list
 		// means "nobody was looking", which is not evidence of a quiet tree.
 		changes.cover_local();
-		// A platform whose watcher cannot report a dropped event (see `PairChanges::new`) has its
+		// A platform whose watcher cannot report a dropped event (see above) has its
 		// events permanently distrusted; say so on the status, or a caller sees a healthy watch
 		// whose passes are all full and has nothing to point at.
 		if let Some(reason) = changes.degraded() {

@@ -193,12 +193,11 @@ moves and cannot describe a distribution; and a figure's movement between two ru
 is larger than its movement inside one. `BASELINE.md` carries the measured
 run-to-run figure, and that is the one to compare against.
 
-## What the harness cannot run on
+## What the harness has not run on
 
-Windows. `PairChanges::new` marks a pair `LocalEventsDegraded` there, so every pass
-falls back to a whole read and every change-scoped scenario fails its read-kind
-assertion — in the parent and in the memory children alike. Nothing in the harness
-checks for this; it simply fails. Every figure published here was taken on macOS.
+Windows. The harness covers the local side itself instead of starting a watch, so the
+`LocalEventsDegraded` a Windows watch starts with never reaches it, but it has never
+been run there. Every figure published here was taken on macOS.
 
 ## Why every scenario asserts a plan
 

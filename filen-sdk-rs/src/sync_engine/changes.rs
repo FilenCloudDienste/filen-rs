@@ -625,14 +625,7 @@ impl ChangeState {
 
 impl PairChanges {
 	pub(super) fn new() -> Self {
-		let changes = Self::default();
-		// `notify`'s ReadDirectoryChangesW backend (8.2.0 `windows.rs`) sets no `Flag::Rescan` and
-		// no info string on any event, so a dropped event there is indistinguishable from a quiet
-		// tree and a local changelist can never be known to be complete. Treat the source as
-		// degraded from the start rather than narrow a pass down on it.
-		#[cfg(target_os = "windows")]
-		changes.degrade(FullPassReason::LocalEventsDegraded);
-		changes
+		Self::default()
 	}
 
 	/// Record what one filesystem event means. `is_staging` names the engine's own download temp
