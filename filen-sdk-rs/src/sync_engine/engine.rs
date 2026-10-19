@@ -12272,29 +12272,30 @@ mod tests {
 		tokio::spawn(async move { engine.sync_once(pair).await })
 	}
 
+	/// How long a test waits on the paused clock for every task to get as far as it can. The clock
+	/// stands still while any task can run and while a `spawn_blocking` hop is in flight, so the
+	/// wait ends only once every task, and every blocking hop it awaits, is waiting on something
+	/// that will not come. Counting yields instead races those hops, which run on the blocking
+	/// pool. Short, so that no timer of the engine's fires inside it.
+	const SETTLED: Duration = Duration::from_millis(1);
+
 	/// Wait for that pass to reach its gate — it registers the pair's control channel before it
 	/// reads either side — and then to park in the read behind it.
 	async fn parked(engine: &SyncEngine, pair: PairId) {
-		for _ in 0..100 {
-			if engine.paused.lock().await.contains_key(&pair) {
-				tokio::task::yield_now().await;
-				return;
-			}
-			tokio::task::yield_now().await;
-		}
-		panic!("the pass never took its gate");
+		tokio::time::sleep(SETTLED).await;
+		assert!(
+			engine.paused.lock().await.contains_key(&pair),
+			"the pass never took its gate"
+		);
 	}
 
-	/// Let a task a control call just woke actually run: on the current-thread test runtime the
-	/// caller has to yield for the pass it cancelled to be polled at all.
-	async fn ended<T>(pass: &tokio::task::JoinHandle<T>) -> bool {
-		for _ in 0..100 {
-			if pass.is_finished() {
-				return true;
-			}
-			tokio::task::yield_now().await;
-		}
-		false
+	/// What a task a control call just woke ended with, or `None` if it is still waiting once
+	/// everything has settled (see [`SETTLED`]).
+	async fn ended<T>(task: &mut tokio::task::JoinHandle<T>) -> Option<T> {
+		tokio::time::timeout(SETTLED, task)
+			.await
+			.ok()
+			.map(|joined| joined.unwrap())
 	}
 
 	/// And a removal landing in that window reaches it: the read is dropped where it stands, the
@@ -12347,7 +12348,7 @@ mod tests {
 		let (engine, pair, path) = engine_with_pair("cancel_during_prepare").await;
 		let engine = Arc::new(engine);
 		let slot = engine.client.cache_slot.lock().await;
-		let pass = a_pass_parked_in_its_read(&engine, pair);
+		let mut pass = a_pass_parked_in_its_read(&engine, pair);
 		parked(&engine, pair).await;
 		assert!(
 			!pass.is_finished(),
@@ -12364,16 +12365,11 @@ mod tests {
 			)
 			.await
 			.unwrap();
-		assert!(
-			ended(&pass).await,
-			"the cancel never reached the pass reading the two sides"
-		);
-
-		drop(slot);
-		let report = pass
+		let report = ended(&mut pass)
 			.await
-			.unwrap()
+			.expect("the cancel never reached the pass reading the two sides")
 			.expect("a cancelled read is not a failure: the pair is still there to be reported on");
+		drop(slot);
 		assert_eq!(
 			report,
 			SyncReport {
@@ -12412,7 +12408,7 @@ mod tests {
 		let pass = a_pass_parked_in_its_read(&engine, pair);
 		parked(&engine, pair).await;
 
-		let resolving = tokio::spawn({
+		let mut resolving = tokio::spawn({
 			let engine = Arc::clone(&engine);
 			async move {
 				engine
@@ -12421,7 +12417,7 @@ mod tests {
 			}
 		});
 		assert!(
-			!ended(&resolving).await,
+			ended(&mut resolving).await.is_none(),
 			"the resolution landed while a pass was still reading the pair it would re-record"
 		);
 		assert!(
