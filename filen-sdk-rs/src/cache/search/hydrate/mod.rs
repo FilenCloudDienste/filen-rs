@@ -56,12 +56,12 @@ use wasmtimer::tokio::timeout as reply_timeout;
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 const READ_REPLY_TIMEOUT: Duration = Duration::from_secs(30);
 
-const SEARCH_WINDOW_ACCOUNT: &str = include_str!("raw/search_window_account.sql");
-const SEARCH_WINDOW_SUBTREE: &str = include_str!("raw/search_window_subtree.sql");
-const SEARCH_WINDOW_CHILDREN: &str = include_str!("raw/search_window_children.sql");
-const SEARCH_COUNT_ACCOUNT: &str = include_str!("raw/search_count_account.sql");
-const SEARCH_COUNT_SUBTREE: &str = include_str!("raw/search_count_subtree.sql");
-const SEARCH_COUNT_CHILDREN: &str = include_str!("raw/search_count_children.sql");
+const SEARCH_WINDOW_ACCOUNT: &str = include_str!("../raw/search_window_account.sql");
+const SEARCH_WINDOW_SUBTREE: &str = include_str!("../raw/search_window_subtree.sql");
+const SEARCH_WINDOW_CHILDREN: &str = include_str!("../raw/search_window_children.sql");
+const SEARCH_COUNT_ACCOUNT: &str = include_str!("../raw/search_count_account.sql");
+const SEARCH_COUNT_SUBTREE: &str = include_str!("../raw/search_count_subtree.sql");
+const SEARCH_COUNT_CHILDREN: &str = include_str!("../raw/search_count_children.sql");
 
 /// What part of the cache a search queries: the account root needs no scoping at all (everything
 /// cached lives under it), a subdir scope walks the recursive CTE, and non-recursive mode is a
