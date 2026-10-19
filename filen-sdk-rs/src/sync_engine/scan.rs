@@ -2140,6 +2140,8 @@ mod tests {
 	/// destination, listed before the move, is not in the scan either, so the pass cannot see the
 	/// move. One held pass costs nothing; the next one folds it. Nothing is wrong with the tree, so
 	/// nothing is reported.
+	// Windows does not remove a directory the walker holds open.
+	#[cfg(unix)]
 	#[test]
 	fn a_directory_the_walk_could_not_descend_into_leaves_the_scan_incomplete() {
 		let root = temp_root();
@@ -2407,6 +2409,8 @@ mod tests {
 	/// each of those entries being deleted. One stat after the walk tells the two apart; without it
 	/// the scan reports a complete observation of an empty tree, and every row of the pair reads as
 	/// a deletion.
+	// Windows does not remove a directory the walker holds open.
+	#[cfg(unix)]
 	#[test]
 	fn a_root_that_vanishes_during_the_walk_leaves_the_scan_incomplete() {
 		let root = temp_root();
