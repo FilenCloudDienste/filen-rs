@@ -306,12 +306,12 @@ building a configuration that never ships.
 | `filen-cli` | CLI tool for interacting with Filen drive |
 | `filen-rclone-wrapper` | Rclone integration wrapper |
 
-`ruzstd` comes from a fork pinned by rev (`filen-sdk-rs/Cargo.toml`): 0.9.0 plus a bound on
-what one zstd block decodes to, sent upstream as https://github.com/KillingSpark/zstd-rs/pull/124.
-`fs/archive/decode/zstd.rs` fails the build against a ruzstd without it. Its `unsafe` (in the
-ring and decode buffers) is upstream's, untouched by the fork. Once a release carries the bound,
-go back to it and drop the guard, or make it name what that release reports for a block past
-128 KiB.
+`ruzstd` is pinned by rev to upstream main (`filen-sdk-rs/Cargo.toml`, 91a3a6eb4), not a crates.io
+release: upstream's fix for bounding each block's decoded size, including a block's literals with
+no sequences (#128), has not shipped yet. ruzstd 0.9.1 on crates.io lacks the literals part.
+`fs/archive/decode/zstd.rs` fails the build against a ruzstd without the check. Its `unsafe` (in
+the ring and decode buffers) is upstream's. Once a release carries the bound, switch to it with
+the version requirement and drop the rev pin.
 
 ## Architecture
 

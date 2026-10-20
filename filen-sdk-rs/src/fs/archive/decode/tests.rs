@@ -769,8 +769,9 @@ fn a_zstd_block_decoding_past_its_maximum_is_refused_before_it_is_written() {
 	assert!(peak < MIB, "took {peak} bytes");
 }
 
-#[test]
-fn zstd_huffman_literals_stop_at_their_stated_size() {
+/// A block whose Huffman literals expand to nearly a million bytes before their stated count
+/// (4 literal words) is refused, and no sequences.
+fn zstd_huffman_expansion_block() -> Vec<u8> {
 	// 4 literal words stated, then 4 streams of ones under a 1-bit Huffman table: each bit is a
 	// literal, nearly a million of them in a block
 	const STREAM: usize = 29_998;
@@ -786,10 +787,46 @@ fn zstd_huffman_literals_stop_at_their_stated_size() {
 	block.extend(std::iter::repeat_n(0xFF, 4 * STREAM));
 	// no sequences
 	block.push(0);
+	block
+}
+
+#[test]
+fn zstd_huffman_literals_past_their_stated_size_stay_within_the_state_budget() {
+	let block = zstd_huffman_expansion_block();
 	let (result, peak) =
 		peak_bytes(|| decode(StreamCodec::Zstd, &zstd_crafted_frame(10, &block), BUDGET));
 	assert_eq!(corrupt(result), ZSTD_INVALID);
-	assert!(peak < 512 * 1024, "took {peak} bytes");
+	// ruzstd expands the whole stream before it compares the count with the stated size, so the
+	// refusal comes after about 1 MiB of literals, within the state budget's 2 MiB
+	assert!(peak < 2 * MIB, "took {peak} bytes");
+}
+
+#[test]
+fn zstd_expansion_after_a_valid_frame_stays_within_the_state_budget() {
+	// a valid frame first, so the decoder's buffers hold what it needed, then a block whose
+	// Huffman literals expand before their count is refused (as in the test above)
+	let data = sample(MIB_USIZE);
+	let mut stream = compress_to_vec(&data[..], CompressionLevel::Fastest);
+	stream.extend_from_slice(&zstd_crafted_frame(10, &zstd_huffman_expansion_block()));
+
+	// read in small chunks, so the caller's buffer is not what the peak measures
+	let (result, peak) = peak_bytes(|| {
+		let mut decoder = open_stream(StreamCodec::Zstd, &stream[..], BUDGET).unwrap();
+		let mut buf = vec![0u8; 64 * 1024];
+		loop {
+			match decoder.read(&mut buf) {
+				Ok(0) => break Ok(()),
+				Ok(_) => {}
+				Err(error) => break Err(error),
+			}
+		}
+	});
+	let error = result.expect_err("the expansion is refused");
+	assert_eq!(
+		codec_error(&error),
+		Some(&CodecError::Corrupt(ZSTD_INVALID))
+	);
+	assert!(peak < 2 * MIB, "took {peak} bytes");
 }
 
 #[test]

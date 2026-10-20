@@ -8,9 +8,10 @@
 //!
 //! A frame's window sets what it costs: ruzstd refuses a window over the limit it is given
 //! before allocating for it, so that limit is the largest window [`Budget`] can hold. That holds
-//! only while no block decodes to more than its 128 KiB maximum, which ruzstd 0.9 left
-//! unchecked (a few KiB of sequences could fill gigabytes): the SDK depends on a fork that
-//! refuses such a block before writing any of it (see the `ruzstd` entry in `Cargo.toml`).
+//! only while no block decodes to more than its 128 KiB maximum, which ruzstd 0.9.1 left
+//! unchecked (a few KiB of sequences could fill gigabytes, and so could a block's literals with
+//! no sequences): the SDK pins a ruzstd that refuses such a block before writing any of it (see
+//! the `ruzstd` entry in `Cargo.toml`).
 
 use std::{
 	io::{self, Read},
@@ -32,14 +33,15 @@ use super::{
 /// A frame's magic number, as the little-endian word the frame starts with.
 const MAGIC: u32 = u32::from_le_bytes(ZSTD_MAGIC);
 
-/// The largest block a frame holds, decoded (RFC 8878 §3.1.1.2.4), which the forked ruzstd
+/// The largest block a frame holds, decoded (RFC 8878 §3.1.1.2.4), which the pinned ruzstd
 /// enforces.
 pub(super) const MAX_BLOCK_BYTES: u64 = 128 * 1024;
 
 /// The decoder's state besides its window: the literals and block buffers (a block each), the
 /// sequences of a block (at most 43690 of 12 bytes, a match copying 3 bytes at least), and the
 /// entropy tables. The most measured, 0.99 MB with the ring of a 128 KiB window, is for the block
-/// holding the most sequences; Huffman literals stop at their stated size (see the tests).
+/// holding the most sequences. A Huffman block's literals can expand to about 1 MiB before their
+/// count is refused (see the tests).
 const STATE_BYTES: u64 = 2 * 1024 * 1024;
 
 /// The least a zstd decoder is charged before its frame's header states the window: its input
@@ -47,9 +49,9 @@ const STATE_BYTES: u64 = 2 * 1024 * 1024;
 /// that has to charge a decoder before it reaches the frame, as 7z's does, charges this.
 pub(crate) const MIN_DECODER_BYTES: u64 = 4 << 20;
 
-/// Fails the build against a ruzstd without the fork's patch that bounds what a block decodes
-/// to, which nothing else here would notice: the budget above rests on that bound.
-const _: fn(u64, u64) -> DecompressBlockError =
+/// Fails the build against a ruzstd without the check that bounds what a block decodes to, which
+/// nothing else here would notice: the budget above rests on that bound.
+const _: fn(usize, usize) -> DecompressBlockError =
 	|at_least, max| DecompressBlockError::DecompressedSizeTooLarge { at_least, max };
 
 pub(super) struct ZstdDecoder<R> {
