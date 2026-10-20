@@ -46,14 +46,18 @@ pub fn open_sqlite_in_memory() -> rusqlite::Result<Connection> {
 /// `xMutexAlloc` set goes on to load and call `xMutexInit` with no barrier between the two loads.
 /// On a weakly ordered CPU (arm64: Apple Silicon, iOS, Android) the loads can be reordered, so a
 /// second thread making its first SQLite call at the same moment can call a NULL `xMutexInit` and
-/// crash. That is the code in SQLite 3.51.3, which libsqlite3-sys 0.37 bundles, and it is
-/// unchanged through SQLite 3.55.0.
+/// crash. That is the code in SQLite 3.51.3, which libsqlite3-sys 0.37 bundles, and in every
+/// release through 3.54.1.
 ///
 /// Opening and dropping an in-memory connection runs `sqlite3_initialize` to completion on the
 /// thread that wins the [`Once`]; every other caller blocks until it returns, and the `Once`'s
-/// completion orders the whole mutex table before them. This, and the `clippy.toml` rule that
-/// routes every open through here, can go once a libsqlite3-sys release bundles an SQLite whose
-/// initialization is safe to race.
+/// completion orders the whole mutex table before them.
+///
+/// SQLite fixed the race on trunk in check-in 37b83ad2f5245217 (2026-10-20), which adds the
+/// missing barrier on the reader's side (<https://sqlite.org/bugs/forumpost/03b0bc9a0b>). Once a
+/// SQLite release containing that check-in is what libsqlite3-sys bundles, this function, the
+/// `open_sqlite*` wrappers above and the `clippy.toml` rule that routes every open through them can
+/// go, and callers can open a [`Connection`] directly again.
 ///
 /// On wasm, rusqlite runs on sqlite-wasm-rs, which builds SQLite with `SQLITE_THREADSAFE=0`: there
 /// is no mutex table to race on, and the in-memory open only initializes SQLite early. The cache
