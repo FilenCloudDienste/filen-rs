@@ -4941,9 +4941,12 @@ impl SyncEngine {
 	/// [`pause`](Self::pause_pair) is cut loose rather than left waiting for a resume that can no
 	/// longer be asked for. Nothing an interrupted action did is recorded half-way (see
 	/// [`pause_pair_with`](Self::pause_pair_with)), so the pair is retired mid-pass without leaving
-	/// either side half-written. This call waits for that pass to end — up to
+	/// either side half-written. This call waits until that pass can no longer write — until its
+	/// gate closes, which it holds for every read and write it makes — up to
 	/// [`REMOVE_CANCEL_GRACE`], after which the removal proceeds regardless and a straggler's write
-	/// fails on its foreign key. A pass still READING the two sides is reached too, and waited for:
+	/// fails on its foreign key. The pass's task may still be running its tail when this returns:
+	/// giving back its page cache and reporting how it ended, neither of which writes a row. A pass
+	/// still READING the two sides is reached too, and waited for:
 	/// it takes its gate before its scan, so the cancel drops the read where it stands and the pass
 	/// ends without planning anything. A control verb made while this waits cannot take that cancel
 	/// back: [`pause`](Self::pause_pair), [`resume`](Self::resume_pair) and

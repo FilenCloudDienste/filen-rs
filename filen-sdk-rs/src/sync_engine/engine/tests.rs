@@ -5327,8 +5327,8 @@ async fn ended<T>(task: &mut tokio::task::JoinHandle<T>) -> Option<T> {
 }
 
 /// And a removal landing in that window reaches it: the read is dropped where it stands, the
-/// pass ends without planning anything, and the removal waits for it instead of deleting the
-/// rows out from under a pass it never saw.
+/// pass ends without planning anything, and the removal waits for its gate to close instead of
+/// deleting the rows out from under a pass it never saw.
 #[tokio::test(start_paused = true)]
 async fn a_removal_during_the_read_half_ends_the_pass_before_it_plans() {
 	let (engine, pair, path) = engine_with_pair("remove_during_prepare").await;
@@ -5344,6 +5344,9 @@ async fn a_removal_during_the_read_half_ends_the_pass_before_it_plans() {
 	let started = tokio::time::Instant::now();
 	engine.remove_pair(pair).await.unwrap();
 	let elapsed = started.elapsed();
+	// The removal returns once the pass's gate has closed, while its task may still be giving
+	// back its page cache on the blocking pool and reporting how it ended; let that tail run.
+	tokio::time::sleep(SETTLED).await;
 	assert!(
 		pass.is_finished(),
 		"remove_pair returned with a pass still reading the pair it removed"
