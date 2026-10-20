@@ -630,3 +630,107 @@ fn defaults_parse_cleanly() {
 		IgnoreSource::parse(&DEFAULT_IGNORE_PATTERNS.join("\n"), Origin::Default).unwrap();
 	assert!(errors.is_empty(), "{errors:?}");
 }
+
+// A backslash is one character of a Filen name on every platform. Off unix, globset reads it as a
+// separator (its `Candidate` rewrites every `is_separator` byte to `/`), so without the stand-in
+// the matcher saw `bad\x` as `bad/x` on Windows: the rules below that hide it missed it there, and
+// the ones that miss it hid it.
+
+#[test]
+fn a_key_reaches_the_matcher_without_a_backslash_in_it() {
+	assert_eq!(backslash::path_key("Bad\\X/file.txt"), "badBx/file.txt");
+	assert_eq!(backslash::pattern_line("bad\\\\x"), "badBx");
+}
+
+#[test]
+fn no_folded_name_or_line_holds_the_backslash_stand_in() {
+	let mut buf = [0; 4];
+	for c in (0..=u32::from(char::MAX)).filter_map(char::from_u32) {
+		assert!(
+			!collision_key(c.encode_utf8(&mut buf)).contains(backslash::STAND_IN),
+			"{c:?}"
+		);
+	}
+}
+
+#[test]
+fn a_directory_rule_hides_a_directory_whose_name_holds_a_backslash() {
+	let rules = root_rules("bad*/");
+	assert!(ignored(&rules, "bad\\x", D));
+	assert!(
+		!ignored(&rules, "bad\\x", F),
+		"the rule is for directories only"
+	);
+	let (root, _) = rules
+		.ignored_root("bad\\x/file.txt", F, &mut HashMap::new())
+		.unwrap();
+	assert_eq!(root, "bad\\x");
+	let rules = root_rules("bad\\\\/");
+	assert!(ignored(&rules, "bad\\", D));
+	assert!(!ignored(&rules, "bad\\", F));
+}
+
+#[test]
+fn a_rule_naming_only_what_follows_a_backslash_misses_the_name() {
+	for pattern in ["x", "x/", "/x", "bad/x", "bad/", "bad/*"] {
+		let rules = root_rules(pattern);
+		assert!(!ignored(&rules, "bad\\x", D), "{pattern:?}");
+		assert!(!ignored(&rules, "bad\\x/file.txt", F), "{pattern:?}");
+	}
+}
+
+#[test]
+fn a_backslash_written_into_a_rule_matches_the_backslash_in_a_name() {
+	for pattern in [
+		"bad\\\\x",
+		"BAD\\\\X",
+		"/bad\\\\x",
+		"bad\\\\x/",
+		"bad?x",
+		"bad[\\]x",
+		"bad[\\\\]x",
+		"bad[!a]x",
+		"bad[ -~]x",
+		"bad[ -\u{3000}]x",
+		"bad[!a-z]x",
+		"bad{\\\\,y}x",
+	] {
+		let rules = root_rules(pattern);
+		assert!(ignored(&rules, "bad\\x", D), "{pattern:?}");
+	}
+	let rules = root_rules("bad\\\\x");
+	assert_eq!(decision(&rules, "bad\\x").pattern, "bad\\\\x");
+}
+
+#[test]
+fn a_rule_without_a_backslash_where_the_name_has_one_misses_it() {
+	for pattern in [
+		"bad\\x",
+		"bad\\\\\\\\x",
+		"bad[!\\]x",
+		"bad[a-z]x",
+		"bad[0-[]x",
+		"badBx",
+		"bad\\\\x/",
+	] {
+		let rules = root_rules(pattern);
+		assert!(!ignored(&rules, "bad\\x", F), "{pattern:?}");
+	}
+}
+
+#[test]
+fn an_escaped_backslash_before_a_trailing_space_keeps_the_space() {
+	let rules = root_rules("bad\\\\ ");
+	assert!(ignored(&rules, "bad\\ ", F));
+	assert!(!ignored(&rules, "bad\\", F));
+}
+
+#[test]
+fn a_class_naming_a_backslash_keeps_its_bracket_and_dash_literal() {
+	assert_eq!(backslash::pattern_line("bad[]\\-]x"), "bad[]\\B-]x");
+	let rules = root_rules("bad[]\\-]x");
+	for name in ["bad\\x", "bad]x", "bad-x"] {
+		assert!(ignored(&rules, name, F), "{name:?}");
+	}
+	assert!(!ignored(&rules, "badbx", F));
+}

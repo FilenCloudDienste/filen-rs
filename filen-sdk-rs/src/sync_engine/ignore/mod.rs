@@ -9,7 +9,8 @@
 //! Every line is NFC-normalised, because every engine path is NFC, and patterns match
 //! case-insensitively, because the server dedups names that way. Both the pattern and the path are
 //! folded with [`collision_key`]: globset's own case-insensitive flag folds ASCII only (it
-//! byte-escapes every non-ASCII literal), so `Ä*` would miss `ä.txt`.
+//! byte-escapes every non-ASCII literal), so `Ä*` would miss `ä.txt`. A backslash in a name is one
+//! character on every platform, never a separator (see [`backslash`]).
 //!
 //! An item under an ignored directory can never be re-included, as in git. `ignore`'s own
 //! `matched_path_or_any_parents` gets that wrong (it returns the leaf's whitelist before looking
@@ -32,6 +33,7 @@ use ignore::{
 use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
 
+use self::backslash::{path_key, pattern_line};
 use super::{
 	SyncMode,
 	baseline::NodeKind,
@@ -41,6 +43,8 @@ use super::{
 	side::{Nodes, NodesAt},
 };
 use crate::Error;
+
+mod backslash;
 
 /// The name of a per-directory rule file.
 pub(crate) const FILENIGNORE: &str = ".filenignore";
@@ -208,7 +212,8 @@ impl IgnoreSource {
 		for (i, line) in text.trim_start_matches('\u{feff}').lines().enumerate() {
 			let line = line.nfc().collect::<String>();
 			// `from` is only carried back on a match, so it holds the unfolded line for reporting.
-			if let Err(e) = builder.add_line(Some(PathBuf::from(&line)), &collision_key(&line)) {
+			let folded = collision_key(&line);
+			if let Err(e) = builder.add_line(Some(PathBuf::from(&line)), &pattern_line(&folded)) {
 				errors.push(IgnoreParseError {
 					origin: origin.to_string(),
 					line: Some(i + 1),
@@ -225,7 +230,7 @@ impl IgnoreSource {
 	}
 
 	fn matched(&self, rel_path: &str, is_dir: bool) -> Match<&str> {
-		match self.0.matched(Path::new(&collision_key(rel_path)), is_dir) {
+		match self.0.matched(Path::new(&path_key(rel_path)), is_dir) {
 			Match::None => Match::None,
 			Match::Ignore(glob) => Match::Ignore(as_written(glob)),
 			Match::Whitelist(glob) => Match::Whitelist(as_written(glob)),
