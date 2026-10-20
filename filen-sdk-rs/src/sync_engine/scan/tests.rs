@@ -181,6 +181,111 @@ fn fast_path_reuses_baseline_hash_when_size_and_mtime_match() {
 	fs::remove_dir_all(&root).ok();
 }
 
+/// A file written through a handle that is still open has a new size on disk while NTFS's copy in
+/// its parent's index, which the directory listing returns, still holds the old one. The scan stats
+/// it fresh, so the fast path misses and the new content is hashed. The write is not flushed:
+/// `FlushFileBuffers` may bring the parent's copy up to date, and the listing would then pass too.
+#[cfg(windows)]
+#[test]
+fn a_file_grown_through_a_handle_still_open_is_hashed_again() {
+	let root = temp_root();
+	let path = root.join("held.log");
+	let before = vec![b'a'; 100];
+	fs::write(&path, &before).unwrap();
+	let meta = fs::metadata(&path).unwrap();
+	let baseline = HashMap::from([(
+		"held.log".to_string(),
+		BaselineEntry {
+			rel_path: "held.log".to_string(),
+			kind: NodeKind::File,
+			remote_uuid: None,
+			content_hash: Some(Blake3Hash::from(blake3::hash(&before))),
+			size: Some(meta.len()),
+			local_mtime: Some(FilenMetaExt::modified(&meta).timestamp_millis()),
+			remote_modified: None,
+			state: BaselineState::Synced,
+			local_kind: None,
+			remote_kind: None,
+			remote_hash: None,
+			remote_size: None,
+			remote_stable_uuid: None,
+			agreed_hash: None,
+		},
+	)]);
+
+	let mut held = fs::OpenOptions::new().append(true).open(&path).unwrap();
+	std::io::Write::write_all(&mut held, &[b'b'; 1000]).unwrap();
+	let mut after = before;
+	after.extend_from_slice(&[b'b'; 1000]);
+
+	let scan = scan_plain(&root, &baseline);
+	let nodes = scan.nodes.whole();
+	let node = nodes.at("held.log").unwrap();
+	assert_eq!(node.size, 1100);
+	assert_eq!(
+		node.content_hash,
+		Some(Blake3Hash::from(blake3::hash(&after)))
+	);
+
+	drop(held);
+	fs::remove_dir_all(&root).ok();
+}
+
+/// Times the directory listing's own metadata against a fresh `symlink_metadata` per entry on 1, 4
+/// and 8 threads, over 100 directories of 1000 files, and prints both. Run it on Windows with
+/// `cargo test -p filen-sdk-rs --lib -F sync-engine sync_engine::scan::tests::stat_cost_probe --
+/// --ignored --nocapture`.
+///
+/// It asserts nothing, so drop it once a reading has been taken on Windows.
+#[cfg(windows)]
+#[test]
+#[ignore = "timing probe: prints the Windows listing's metadata cost against a fresh stat's"]
+fn stat_cost_probe() {
+	let root = tempfile::tempdir().unwrap();
+	let mut paths = Vec::new();
+	for d in 0..100 {
+		let dir = root.path().join(format!("d{d}"));
+		fs::create_dir(&dir).unwrap();
+		for f in 0..1000 {
+			let path = dir.join(format!("f{f}"));
+			fs::write(&path, b"x").unwrap();
+			paths.push(path);
+		}
+	}
+	let list = || {
+		let start = std::time::Instant::now();
+		for dir in fs::read_dir(root.path()).unwrap() {
+			for entry in fs::read_dir(dir.unwrap().path()).unwrap() {
+				entry.unwrap().metadata().unwrap();
+			}
+		}
+		start.elapsed()
+	};
+	// The first listing warms the cache.
+	list();
+	println!(
+		"entries {} listing+cached metadata {:?}",
+		paths.len(),
+		list()
+	);
+	for threads in [1, 4, 8] {
+		let start = std::time::Instant::now();
+		std::thread::scope(|scope| {
+			for chunk in paths.chunks(paths.len().div_ceil(threads)) {
+				scope.spawn(move || {
+					for path in chunk {
+						fs::symlink_metadata(path).unwrap();
+					}
+				});
+			}
+		});
+		println!(
+			"fresh symlink_metadata, {threads} threads: {:?}",
+			start.elapsed()
+		);
+	}
+}
+
 #[test]
 fn missing_root_is_reported_incomplete() {
 	let root = std::env::temp_dir().join(format!("filen_scan_absent_{}", Uuid::new_v4()));
@@ -565,8 +670,7 @@ fn map_window(root: &Path) -> Window<'_, MapSink> {
 }
 
 /// Settle the file at `root/name`, listed as `listed`, whose hash read failed as access denied, the
-/// way a stat taken before the read (Windows keeps the listing's) leaves it: the window it went
-/// through.
+/// way a stat taken before the read leaves it: the window it went through.
 fn settle_denied_read<'r>(
 	root: &'r Path,
 	name: &str,
@@ -590,9 +694,9 @@ fn settle_denied_read<'r>(
 	window
 }
 
-/// The case above as Windows reads it: its walker keeps the stat the listing made, so a file
-/// replaced by a directory still reads as a file, and opening it fails as access denied. The entry
-/// is stat'd again then, and taken as caught mid-change like on any other platform.
+/// The case above with the swap between the stat and the hash read: the entry still reads as a
+/// file, and opening it fails (as access denied on Windows). The entry is stat'd again then, and
+/// taken as caught mid-change.
 #[test]
 fn a_file_whose_read_fails_once_it_became_a_directory_leaves_the_scan_incomplete() {
 	let root = temp_root();

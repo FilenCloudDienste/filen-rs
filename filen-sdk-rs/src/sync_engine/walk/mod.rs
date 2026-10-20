@@ -58,10 +58,6 @@ pub(super) struct Entry {
 	followed: bool,
 	/// How far below the start: `0` for the start itself.
 	depth: usize,
-	/// What the listing said about an entry not reached through a symlink. On Windows the listing
-	/// carries it, so asking for it again would cost a call per entry.
-	#[cfg(windows)]
-	listed_metadata: fs::Metadata,
 }
 
 impl Entry {
@@ -78,8 +74,6 @@ impl Entry {
 				file_type: metadata.file_type(),
 				followed: follow,
 				depth,
-				#[cfg(windows)]
-				listed_metadata: metadata,
 			}),
 			Err(source) => Err(WalkError::Io {
 				path: Some(path),
@@ -90,17 +84,14 @@ impl Entry {
 
 	/// The entry a directory listed, not yet followed.
 	fn listed(entry: &fs::DirEntry, depth: usize) -> Result<Self, WalkError> {
-		let failed = |source| WalkError::Io {
-			path: Some(entry.path()),
-			source,
-		};
 		Ok(Self {
 			path: entry.path(),
-			file_type: entry.file_type().map_err(failed)?,
+			file_type: entry.file_type().map_err(|source| WalkError::Io {
+				path: Some(entry.path()),
+				source,
+			})?,
 			followed: false,
 			depth,
-			#[cfg(windows)]
-			listed_metadata: entry.metadata().map_err(failed)?,
 		})
 	}
 
@@ -125,24 +116,15 @@ impl Entry {
 		self.depth
 	}
 
-	/// The entry's metadata, read now: through the symlink for an entry reached through one, of
-	/// the entry itself otherwise (on Windows, what its listing said).
+	/// The entry's metadata as it is on disk now: through the symlink for an entry reached through
+	/// one, of the entry itself otherwise.
+	///
+	/// Stat'd on every platform, never taken from the listing. On Windows the listing's metadata is
+	/// the copy of each entry's times and size that NTFS keeps in its parent's index and updates
+	/// lazily: a file written through a handle still open, or a directory whose last child was
+	/// created since, lists what it was before. The scan's fast path trusts the size and mtime, so a
+	/// stale copy would keep a changed file's old hash.
 	pub(super) fn metadata(&self) -> io::Result<fs::Metadata> {
-		cfg_select! {
-			windows => {
-				if self.followed {
-					self.stat()
-				} else {
-					Ok(self.listed_metadata.clone())
-				}
-			}
-			_ => { self.stat() }
-		}
-	}
-
-	/// The entry's metadata as it is on disk now, on every platform: through the symlink for an
-	/// entry reached through one, of the entry itself otherwise.
-	pub(super) fn stat(&self) -> io::Result<fs::Metadata> {
 		if self.followed {
 			fs::metadata(&self.path)
 		} else {

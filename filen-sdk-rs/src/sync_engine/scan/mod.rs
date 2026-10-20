@@ -732,10 +732,9 @@ fn reading(
 /// file, a reading of that instead, so [`Window::settle`] holds the new type against the listed one
 /// and takes the entry as caught mid-change.
 ///
-/// The stat a reading is made from can be older than the hash read: on Windows the walker keeps
-/// what the listing said (see [`walk::Entry::metadata`]), so a file replaced by a directory still
-/// reads as a file there, and only opening it finds the directory, failing as access denied. A
-/// failed read of what is still a file keeps its error.
+/// The stat a reading is made from is taken before the hash read, so a file replaced by a directory
+/// in between still reads as a file, and only opening or reading it finds the directory (on
+/// Windows, failing as access denied). A failed read of what is still a file keeps its error.
 fn restat_failed_read(
 	read: Reading,
 	stat: impl FnOnce() -> std::io::Result<std::fs::Metadata>,
@@ -763,7 +762,7 @@ fn read_entry(entry: &walk::Entry, row: Option<&BaselineEntry>) -> std::io::Resu
 	let read = reading(&entry.metadata()?, |size, mtime_millis| {
 		fast_path_hash(row, size, mtime_millis).map_or_else(|| hash_file(entry.path()), Ok)
 	});
-	Ok(restat_failed_read(read, || entry.stat()))
+	Ok(restat_failed_read(read, || entry.metadata()))
 }
 
 /// An entry the walk listed, waiting in a [`Window`] for its turn to be put.
@@ -1332,7 +1331,7 @@ fn scan_local_watched<S: ScanSink>(
 							let read = reading(&metadata, |_, _| {
 								known.map_or_else(|| hash_file(entry.path()), Ok)
 							});
-							Next::Read(Ok(restat_failed_read(read, || entry.stat())))
+							Next::Read(Ok(restat_failed_read(read, || entry.metadata())))
 						}
 					}
 					Err(source) => Next::Read(Err(source)),
