@@ -16,7 +16,7 @@ use reqwest::{
 	header::{HeaderName, HeaderValue},
 };
 use serde::{Serialize, de::DeserializeOwned};
-use tower::{ServiceBuilder, ServiceExt, limit::GlobalConcurrencyLimitLayer};
+use tower::{ServiceBuilder, ServiceExt};
 
 use crate::{
 	Error,
@@ -43,6 +43,7 @@ pub(crate) mod batch;
 // can't actually cap bandwidth in wasm, so this would just add overhead
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 mod bandwidth_limit;
+mod class_limit;
 mod deserialize;
 mod download_body;
 mod limit;
@@ -54,6 +55,7 @@ pub(crate) mod test_support;
 mod tower_wasm_time;
 mod url_parser;
 
+use class_limit::{RequestClass, RequestLimits};
 use tower_wasm_time::tps_budget::TpsBudget;
 
 impl Client {
@@ -614,21 +616,14 @@ impl ThumbnailConfig {
 	}
 }
 
-/// How many lock requests (acquire, refresh, release) run at once, apart from
-/// [`ClientConfig::with_concurrency`]'s limit: a refresh queued behind that limit's chunk
-/// transfers can miss the window the lock's keep-alive gives it.
-const LOCK_REQUEST_CONCURRENCY: usize = 4;
-
 /// The longest batch window ([`ClientConfig::with_batch_window`]): a longer one only delays its
 /// callers, and the cap keeps a window's deadline (`Instant + window`) from overflowing.
 const MAX_BATCH_WINDOW: Duration = Duration::from_secs(1);
 
 #[derive(Clone)]
 pub(crate) struct SharedClientState {
-	concurrency: GlobalConcurrencyLimitLayer,
-	/// The limit lock requests are sent under instead of `concurrency`
-	/// ([`LOCK_REQUEST_CONCURRENCY`]).
-	lock_concurrency: GlobalConcurrencyLimitLayer,
+	/// The concurrency limits every request is sent under, by [`RequestClass`].
+	limits: RequestLimits,
 	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 	max_concurrency: usize,
 	retry: retry::RetryMapLayer,
@@ -713,7 +708,7 @@ impl SharedClientState {
 		};
 
 		// Same two hazards as the thumbnail gate, and the same reason to handle them here:
-		// `GlobalConcurrencyLimitLayer::new` builds a `tokio::sync::Semaphore`, which parks every
+		// `RequestLimits::new` builds a `tokio::sync::Semaphore` of this size, which parks every
 		// request forever at 0 permits and panics above `MAX_PERMITS` — a ceiling a 32-bit `usize`
 		// (wasm32) puts inside `u32`, so `JsClientConfig { concurrency }` can reach it. This is
 		// where every construction path converges.
@@ -722,8 +717,7 @@ impl SharedClientState {
 			.clamp(1, tokio::sync::Semaphore::MAX_PERMITS);
 
 		Ok(Self {
-			concurrency: GlobalConcurrencyLimitLayer::new(concurrency),
-			lock_concurrency: GlobalConcurrencyLimitLayer::new(LOCK_REQUEST_CONCURRENCY),
+			limits: RequestLimits::new(concurrency),
 			#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 			max_concurrency: concurrency,
 			retry: retry::RetryMapLayer::new(retry::RetryPolicy::new(config.retry_budget)),
@@ -1094,7 +1088,7 @@ impl UnauthClient {
 			.layer(logging::LogLayer::new(endpoint)) // optional logging
 			.layer(serialize::SerializeLayer::<Req>::new(body)) // required to serialize body
 			.layer(url_parser::UrlParseLayer) // required to parse URL string to reqwest::Url
-			.layer(self.state.concurrency.clone()) // optional
+			.layer(self.state.limits.layer(RequestClass::Control)) // the class's concurrency limits
 			.layer(self.state.retry.clone()) // required to map RetryError to Error
 			.layer(self.state.rate_limiter.clone()) // optional
 			.layer(deserialize::DeserializeLayer::<Res>::new()) // required to convert AsRef<u8> to T
@@ -1143,7 +1137,7 @@ impl UnauthClient {
 			.layer(logging::LogLayer::new(endpoint)) // optional logging
 			.layer(serialize::SerializeLayer::<Req>::new(body)) // required to serialize body
 			.layer(url_parser::UrlParseLayer) // required to parse URL string to reqwest::Url
-			.layer(self.state.concurrency.clone()) // optional
+			.layer(self.state.limits.layer(RequestClass::Control)) // the class's concurrency limits
 			.layer(self.state.retry.clone()) // required to map RetryError to Error
 			.layer(self.state.rate_limiter.clone()) // optional
 			.layer(deserialize::DeserializeLayer::<Res>::new()) // required to convert AsRef<u8> to T
@@ -1197,7 +1191,7 @@ impl UnauthClient {
 		let builder = ServiceBuilder::new()
 			.layer(logging::LogLayer::new(endpoint)) // optional logging
 			.layer(url_parser::UrlParseLayer) // required to parse URL string to reqwest::Url
-			.layer(self.state.concurrency.clone()) // optional
+			.layer(self.state.limits.layer(RequestClass::Control)) // the class's concurrency limits
 			.layer(self.state.retry.clone()) // required to map RetryError to Error
 			.layer(self.state.rate_limiter.clone()) // optional
 			.map_request(|request: Request<(), reqwest::Url>| {
@@ -1236,7 +1230,7 @@ impl AuthClient {
 		let builder = ServiceBuilder::new()
 			.layer(logging::LogLayer::new(endpoint)) // optional logging
 			.layer(url_parser::UrlParseLayer) // required to parse URL string to reqwest::Url
-			.layer(self.unauthed.state.concurrency.clone()) // optional
+			.layer(self.unauthed.state.limits.layer(RequestClass::Control)) // the class's concurrency limits
 			.layer(self.unauthed.state.retry.clone()) // required to map RetryError to Error
 			.layer(self.unauthed.state.rate_limiter.clone()) // optional
 			.layer(deserialize::DeserializeLayer::<Res>::new()) // required to convert AsRef<u8> to T
@@ -1285,7 +1279,7 @@ impl AuthClient {
 			.layer(logging::LogLayer::new(endpoint)) // optional logging
 			.layer(serialize::SerializeLayer::<Req>::new(body)) // required to serialize body
 			.layer(url_parser::UrlParseLayer) // required to parse URL string to reqwest::Url
-			.layer(self.unauthed.state.concurrency.clone()) // optional
+			.layer(self.unauthed.state.limits.layer(RequestClass::Control)) // the class's concurrency limits
 			.layer(self.unauthed.state.retry.clone()) // required to map RetryError to Error
 			.layer(self.unauthed.state.rate_limiter.clone()) // optional
 			.layer(deserialize::DeserializeLayer::<Res>::new()) // required to convert AsRef<u8> to T
@@ -1391,7 +1385,7 @@ impl AuthClient {
 			.layer(logging::LogLayer::new(endpoint)) // optional logging
 			.layer(serialize::SerializeLayer::<Req>::new(body)) // required to serialize body
 			.layer(url_parser::UrlParseLayer) // required to parse URL string to reqwest::Url
-			.layer(self.unauthed.state.concurrency.clone()) // optional
+			.layer(self.unauthed.state.limits.layer(RequestClass::Control)) // the class's concurrency limits
 			.layer(self.unauthed.state.retry.clone()) // required to map RetryError to Error
 			.layer(self.unauthed.state.rate_limiter.clone()) // optional
 			.layer(deserialize::DeserializeLayer::<Res>::new())
@@ -1435,12 +1429,13 @@ impl AuthClient {
 	where
 		Res: DeserializeOwned + Debug,
 	{
-		self.post_raw_bytes_auth_with(request, url, endpoint, &self.unauthed.state.concurrency)
+		self.post_raw_bytes_auth_with(request, url, endpoint, RequestClass::Control)
 			.await
 	}
 
-	/// [`Self::post_raw_bytes_auth`] for a lock request: sent under the lock requests' own
-	/// concurrency limit, so it does not queue behind the client's transfers.
+	/// [`Self::post_raw_bytes_auth`] for a lock request: sent as a [`RequestClass::Lock`], under
+	/// the lock requests' own concurrency limit, so it does not queue behind the client's
+	/// transfers.
 	pub(crate) async fn post_raw_bytes_auth_lock<Res>(
 		&self,
 		request: Bytes,
@@ -1450,22 +1445,17 @@ impl AuthClient {
 	where
 		Res: DeserializeOwned + Debug,
 	{
-		self.post_raw_bytes_auth_with(
-			request,
-			url,
-			endpoint,
-			&self.unauthed.state.lock_concurrency,
-		)
-		.await
+		self.post_raw_bytes_auth_with(request, url, endpoint, RequestClass::Lock)
+			.await
 	}
 
-	/// [`Self::post_raw_bytes_auth`] under the concurrency limit `concurrency`.
+	/// [`Self::post_raw_bytes_auth`] under the concurrency limit of `class`.
 	async fn post_raw_bytes_auth_with<Res>(
 		&self,
 		request: Bytes,
 		url: &str,
 		endpoint: Cow<'static, str>,
-		concurrency: &GlobalConcurrencyLimitLayer,
+		class: RequestClass,
 	) -> Result<Res, Error>
 	where
 		Res: DeserializeOwned + Debug,
@@ -1473,7 +1463,7 @@ impl AuthClient {
 		let builder = ServiceBuilder::new()
 			.layer(logging::LogLayer::new(endpoint)) // optional logging
 			.layer(url_parser::UrlParseLayer) // required to parse URL string to reqwest::Url
-			.layer(concurrency.clone()) // optional
+			.layer(self.unauthed.state.limits.layer(class)) // the class's concurrency limits
 			.layer(self.unauthed.state.retry.clone()) // required to map RetryError to Error
 			.layer(self.unauthed.state.rate_limiter.clone()) // optional
 			.layer(deserialize::DeserializeLayer::<Res>::new())
