@@ -551,6 +551,92 @@ fn a_file_replaced_by_a_directory_once_listed_leaves_the_scan_incomplete() {
 	fs::remove_dir_all(&root).ok();
 }
 
+/// An empty window over `root`, putting into a map.
+fn map_window(root: &Path) -> Window<'_, MapSink> {
+	Window {
+		root,
+		listed: VecDeque::new(),
+		front: 0,
+		sink: MapSink::with_capacity(1),
+		errors: Vec::new(),
+		complete: true,
+		invalid_names: BTreeMap::new(),
+	}
+}
+
+/// Settle the file at `root/name`, listed as `listed`, whose hash read failed as access denied, the
+/// way a stat taken before the read (Windows keeps the listing's) leaves it: the window it went
+/// through.
+fn settle_denied_read<'r>(
+	root: &'r Path,
+	name: &str,
+	listed: &fs::Metadata,
+) -> Window<'r, MapSink> {
+	let read = restat_failed_read(
+		reading(listed, |_, _| {
+			Err(std::io::Error::from(ErrorKind::PermissionDenied))
+		}),
+		|| fs::symlink_metadata(root.join(name)),
+	);
+	let mut window = map_window(root);
+	window
+		.push(Listed::Entry {
+			rel_path: name.to_owned(),
+			listed_type: listed.file_type(),
+			blocked_rule_file: false,
+			read: Some(Ok(read)),
+		})
+		.unwrap();
+	window
+}
+
+/// The case above as Windows reads it: its walker keeps the stat the listing made, so a file
+/// replaced by a directory still reads as a file, and opening it fails as access denied. The entry
+/// is stat'd again then, and taken as caught mid-change like on any other platform.
+#[test]
+fn a_file_whose_read_fails_once_it_became_a_directory_leaves_the_scan_incomplete() {
+	let root = temp_root();
+	let path = root.join("swap");
+	fs::write(&path, b"a file").unwrap();
+	let listed = fs::symlink_metadata(&path).unwrap();
+	fs::remove_file(&path).unwrap();
+	fs::create_dir(&path).unwrap();
+
+	let window = settle_denied_read(&root, "swap", &listed);
+
+	assert!(!window.complete);
+	assert!(window.errors.is_empty(), "{:?}", window.errors);
+	assert_eq!(window.sink.nodes.len(), 0);
+	assert_eq!(window.sink.claims, Vec::<String>::new());
+
+	fs::remove_dir_all(&root).ok();
+}
+
+/// The same failed read of an entry that is still a file is a real error, reported as one.
+#[test]
+fn a_file_whose_read_fails_while_still_a_file_is_an_io_error() {
+	let root = temp_root();
+	let path = root.join("denied");
+	fs::write(&path, b"a file").unwrap();
+	let listed = fs::symlink_metadata(&path).unwrap();
+
+	let window = settle_denied_read(&root, "denied", &listed);
+
+	assert!(!window.complete);
+	assert!(
+		matches!(
+			window.errors.as_slice(),
+			[ScanError::Io { rel_path, source }]
+				if rel_path == "denied" && source.kind() == ErrorKind::PermissionDenied
+		),
+		"{:?}",
+		window.errors
+	);
+	assert_eq!(window.sink.claims, vec!["denied".to_owned()]);
+
+	fs::remove_dir_all(&root).ok();
+}
+
 /// A file the walk listed that is a symlink by the time it is read is neither a file nor a
 /// directory to the read, which stats the entry itself. Dropped as unsyncable, it would read as
 /// the file's deletion, so the scan is partial instead, and again reports nothing.

@@ -128,12 +128,25 @@ impl Entry {
 	/// The entry's metadata, read now: through the symlink for an entry reached through one, of
 	/// the entry itself otherwise (on Windows, what its listing said).
 	pub(super) fn metadata(&self) -> io::Result<fs::Metadata> {
-		if self.followed {
-			return fs::metadata(&self.path);
-		}
 		cfg_select! {
-			windows => { Ok(self.listed_metadata.clone()) }
-			_ => { fs::symlink_metadata(&self.path) }
+			windows => {
+				if self.followed {
+					self.stat()
+				} else {
+					Ok(self.listed_metadata.clone())
+				}
+			}
+			_ => { self.stat() }
+		}
+	}
+
+	/// The entry's metadata as it is on disk now, on every platform: through the symlink for an
+	/// entry reached through one, of the entry itself otherwise.
+	pub(super) fn stat(&self) -> io::Result<fs::Metadata> {
+		if self.followed {
+			fs::metadata(&self.path)
+		} else {
+			fs::symlink_metadata(&self.path)
 		}
 	}
 }

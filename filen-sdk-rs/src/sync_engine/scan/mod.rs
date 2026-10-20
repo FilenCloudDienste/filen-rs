@@ -728,12 +728,42 @@ fn reading(
 	}
 }
 
+/// `read`, or, when it is a file whose hash read failed and `stat` now finds something other than a
+/// file, a reading of that instead, so [`Window::settle`] holds the new type against the listed one
+/// and takes the entry as caught mid-change.
+///
+/// The stat a reading is made from can be older than the hash read: on Windows the walker keeps
+/// what the listing said (see [`walk::Entry::metadata`]), so a file replaced by a directory still
+/// reads as a file there, and only opening it finds the directory, failing as access denied. A
+/// failed read of what is still a file keeps its error.
+fn restat_failed_read(
+	read: Reading,
+	stat: impl FnOnce() -> std::io::Result<std::fs::Metadata>,
+) -> Reading {
+	match read {
+		Reading::File {
+			size,
+			mtime_millis,
+			hash: Err(source),
+		} => match stat() {
+			Ok(now) if !now.is_file() => reading(&now, |_, _| Err(source)),
+			_ => Reading::File {
+				size,
+				mtime_millis,
+				hash: Err(source),
+			},
+		},
+		read => read,
+	}
+}
+
 /// Stat `entry` and, for a file, take the hash `row` holds when the fast path allows it and read the
 /// file otherwise.
 fn read_entry(entry: &walk::Entry, row: Option<&BaselineEntry>) -> std::io::Result<Reading> {
-	Ok(reading(&entry.metadata()?, |size, mtime_millis| {
+	let read = reading(&entry.metadata()?, |size, mtime_millis| {
 		fast_path_hash(row, size, mtime_millis).map_or_else(|| hash_file(entry.path()), Ok)
-	}))
+	});
+	Ok(restat_failed_read(read, || entry.stat()))
 }
 
 /// An entry the walk listed, waiting in a [`Window`] for its turn to be put.
@@ -1299,9 +1329,10 @@ fn scan_local_watched<S: ScanSink>(
 						if is_file && known.is_none() && max_read_workers > 0 {
 							Next::HandOver(None)
 						} else {
-							Next::Read(Ok(reading(&metadata, |_, _| {
+							let read = reading(&metadata, |_, _| {
 								known.map_or_else(|| hash_file(entry.path()), Ok)
-							})))
+							});
+							Next::Read(Ok(restat_failed_read(read, || entry.stat())))
 						}
 					}
 					Err(source) => Next::Read(Err(source)),
