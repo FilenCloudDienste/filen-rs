@@ -508,7 +508,12 @@ async fn path_22_nfc_remote_vs_nfd_local_conflict() {
 	assert!(r1.errors.is_empty(), "{r1:?}");
 	assert_eq!(r1.conflicts.len(), 0, "baseline pass must be clean: {r1:?}");
 
-	// Diverge BOTH sides on the normalization-equivalent path.
+	// Diverge BOTH sides on the normalization-equivalent path. The baseline pass downloaded the
+	// file under its NFC spelling; remove that first so the NFD spelling replaces it. A filesystem
+	// that folds the two (APFS) would overwrite it anyway, but one that stores names byte for byte
+	// (ext4, NTFS) would keep both, and two local names that fold together refuse the pass.
+	std::fs::remove_file(sc.local.join(nfc))
+		.expect("the baseline pass must have downloaded the NFC spelling");
 	write_file(&sc.local, nfd, b"LOCAL-via-NFD");
 	let new_rf = upload_root(&sc, nfc, b"REMOTE-via-NFC-different").await;
 	assert!(
