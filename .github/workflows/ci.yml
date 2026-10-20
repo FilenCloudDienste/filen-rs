@@ -67,10 +67,10 @@ jobs:
         run: cargo clippy --tests -- -D warnings
       - name: Run clippy on tests with cache
         run: cargo clippy --tests -F cache -- -D warnings
-      # The sync engine's test binaries are `required-features = ["sync-engine"]` and some
-      # cases need `malformed`, so none of the passes above compile them.
+      # The sync engine's live test binaries are `required-features = ["sync-engine-live-tests"]`
+      # and some cases need `malformed`, so none of the passes above compile them.
       - name: Run clippy on sync engine targets
-        run: cargo clippy -p filen-sdk-rs -F sync-engine,malformed --all-targets -- -D warnings
+        run: cargo clippy -p filen-sdk-rs -F sync-engine-live-tests,malformed --all-targets -- -D warnings
       # The desktop Node-API addon's feature set; no other pass enables `napi`.
       - name: Run clippy napi
         run: cargo clippy -p filen-sdk-rs -F napi,cache,sync-engine --all-targets -- -D warnings

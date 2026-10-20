@@ -161,10 +161,11 @@ Test notes:
 | `multi-threaded-crypto` | `rayon` / `wasm-bindgen-rayon` parallel crypto |
 | `archive` | Compress / extract (`fs::archive`) and its codec crates; `wasm-full` turns it on, and on wasm it refuses to build without `wasm-full` |
 | `malformed` | Test-only seams that put malformed state on the server on purpose (`create_malformed_dir` / `create_malformed_file` write arbitrary metadata, `create_dir_with_name_hash` bypasses the case-insensitive name dedup) — never enable in production |
-| `sync-engine` | Local folder <-> remote folder sync engine (`src/sync_engine/`); implies `cache`, adds the `notify` watcher; native only. Gates the `sync_engine_blackbox_tests` / `sync_engine_stress_tests` / `sync_suite` test targets, and with `uniffi` the binding's `sync_engine_js_tests` |
+| `sync-engine` | Local folder <-> remote folder sync engine (`src/sync_engine/`); implies `cache`, adds the `notify` watcher; native only. Gates, with `uniffi`, the binding's `sync_engine_js_tests` |
 | `heif-decoder` | Thumbnail decoding for HEIF/HEIC — and AVIF, which the vendored libheif decodes through the same container path on its dav1d backend |
 | `bench-internals` | Exposes `cache::bench_support` for the insertion benchmark, and `sync_engine::probe` for the `sync_engine_probe` per-phase probe |
 | `test-seams` | Test-only: exposes the bulk operations, a generic bulk post and the item builders (`*_for_test`) the live `bulk_tests` drive every `bulk/*` endpoint with — never enable in production |
+| `sync-engine-live-tests` | Test-only: implies `sync-engine` and gates the live `sync_engine_blackbox_tests` / `sync_engine_stress_tests` / `sync_suite` targets, so the test matrix's workspace-root `cargo test` (where filen-cli turns `sync-engine` on) does not build them; only `test.yml`'s sync engine jobs and the sync engine clippy pass enable it — never enable in production |
 
 The mobile bindings build is `-F uniffi,heif-decoder,http-provider,cache,sync-engine` (see
 `filen-sdk-rs/web/ubrn.config.yaml`); `uniffi` together with `sync-engine` compiles the sync
@@ -185,7 +186,7 @@ wasi-sdk. Every `heif-decoder` pass lives in pre-push.
 - **pre-commit** — `cargo fmt --all --check`, `cargo fmt` inside `filen-sdk-rs`, `taplo
   lint`/`fmt --check`, `sqlfluff` on staged `.sql`, then six clippy passes: workspace
   (`--exclude heif-decoder --all-targets`), `-p filen-sdk-rs -F uniffi,http-provider`,
-  `-p filen-sdk-rs -F sync-engine,malformed --all-targets` and
+  `-p filen-sdk-rs -F sync-engine-live-tests,malformed --all-targets` and
   `-p filen-sdk-rs -F napi,cache,sync-engine --all-targets` (the same commands as ci-linux), and
   wasm32 `-F wasm-full,cache` + `--no-default-features -F service-worker` (both run from the
   `filen-sdk-rs` directory). **On a cold cargo cache this takes several minutes** — warm the
@@ -245,7 +246,7 @@ against the pull request's target branch (`origin/main` for a push), unfolded fi
 The sync engine's live tests run only nightly (or on a `[test]` commit/PR), in `test.yml`'s
 `test-sync-engine` job: after the matrix and 2FA legs, Linux, V2 account, one
 `!cancelled()` step per binary — `cache_tests`, `cache_search_tests`,
-`sync_engine_blackbox_tests` and `sync_suite`, all `-p filen-sdk-rs -F sync-engine,malformed`,
+`sync_engine_blackbox_tests` and `sync_suite`, all `-p filen-sdk-rs -F sync-engine-live-tests,malformed`,
 then the mobile binding's `sync_engine_js_tests` with `-F uniffi,sync-engine`, the engine
 binaries with `--test-threads=1`, and last the desktop addon's `test:napi:live` after a
 `build:napi`.

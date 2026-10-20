@@ -52,6 +52,11 @@ bench-internals = ["cache", "dep:nix"]
 # need (the `*_for_test` items) so the live `bulk_tests` can send every `bulk/*` endpoint to the
 # server. Never enable in production builds.
 test-seams = []
+# Builds the sync engine's live suites (`sync_suite`, `sync_engine_blackbox_tests`,
+# `sync_engine_stress_tests`). They need the test account to themselves, so only test.yml's
+# sync engine jobs run them; another workspace member turning `sync-engine` on must not pull
+# them into the shared test matrix. Never enable in production builds.
+sync-engine-live-tests = ["sync-engine"]
 
 # The cache tests only exist when the `cache` feature is enabled.
 [[test]]
@@ -73,13 +78,13 @@ required-features = ["test-seams"]
 # Black-box e2e tests authored against the documented public API only (no internals).
 [[test]]
 name = "sync_engine_blackbox_tests"
-required-features = ["sync-engine"]
+required-features = ["sync-engine-live-tests"]
 
 # Heavy black-box scale/contention tests (large trees, two concurrent clients). All `#[ignore]`d —
 # run explicitly with `-- --ignored`. Scale is env-tunable via SYNC_STRESS_N.
 [[test]]
 name = "sync_engine_stress_tests"
-required-features = ["sync-engine"]
+required-features = ["sync-engine-live-tests"]
 
 # The sync engine's mobile binding (`sync_engine::js_impl`), driven live through its exports only.
 [[test]]
@@ -89,7 +94,7 @@ required-features = ["uniffi", "cache", "sync-engine"]
 # Grouped black-box sync suite: ONE binary, one module per category (tests/sync_suite/).
 [[test]]
 name = "sync_suite"
-required-features = ["sync-engine"]
+required-features = ["sync-engine-live-tests"]
 
 # The permanent per-phase cost probe (`src/sync_engine/probe.rs`, exposed by `bench-internals`).
 # All `#[ignore]`d — run explicitly; scaled by SYNC_PROBE_N / SYNC_PROBE_SHAPE.

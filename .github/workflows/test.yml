@@ -261,6 +261,10 @@ jobs:
     # which share each account concurrently. The engine's remote view is the cache, and
     # `sync-engine` implies `cache`, so they reuse this job's build.
     #
+    # The engine suites are `required-features = ["sync-engine-live-tests"]`, which only
+    # these jobs enable: filen-cli turns `sync-engine` on, so the matrix's workspace-root
+    # `cargo test` would otherwise build and run them alongside everything else.
+    #
     # One step per binary, each `!cancelled()`: a red early binary must not skip the rest.
     needs: [test, test-2fa]
     if: |
@@ -297,7 +301,7 @@ jobs:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -Zhigher-ranked-assumptions
       - name: Run cache_tests
         if: ${{ !cancelled() }}
-        run: cargo test -p filen-sdk-rs -F sync-engine,malformed --test cache_tests --no-fail-fast
+        run: cargo test -p filen-sdk-rs -F sync-engine-live-tests,malformed --test cache_tests --no-fail-fast
         env:
           TEST_EMAIL: ${{ secrets['V2_TEST_ACC_EMAIL'] }}
           TEST_PASSWORD: ${{ secrets['V2_TEST_ACC_PASS'] }}
@@ -306,7 +310,7 @@ jobs:
           RUST_LOG: filen_sdk_rs::cache=debug,info
       - name: Run cache_search_tests
         if: ${{ !cancelled() }}
-        run: cargo test -p filen-sdk-rs -F sync-engine,malformed --test cache_search_tests --no-fail-fast
+        run: cargo test -p filen-sdk-rs -F sync-engine-live-tests,malformed --test cache_search_tests --no-fail-fast
         env:
           TEST_EMAIL: ${{ secrets['V2_TEST_ACC_EMAIL'] }}
           TEST_PASSWORD: ${{ secrets['V2_TEST_ACC_PASS'] }}
@@ -315,7 +319,7 @@ jobs:
           RUST_LOG: filen_sdk_rs::cache=debug,info
       - name: Run sync_engine_blackbox_tests (single-threaded)
         if: ${{ !cancelled() }}
-        run: cargo test -p filen-sdk-rs -F sync-engine,malformed --test sync_engine_blackbox_tests --no-fail-fast -- --test-threads=1
+        run: cargo test -p filen-sdk-rs -F sync-engine-live-tests,malformed --test sync_engine_blackbox_tests --no-fail-fast -- --test-threads=1
         env:
           TEST_EMAIL: ${{ secrets['V2_TEST_ACC_EMAIL'] }}
           TEST_PASSWORD: ${{ secrets['V2_TEST_ACC_PASS'] }}
@@ -324,7 +328,7 @@ jobs:
           RUST_LOG: filen_sdk_rs::sync_engine=debug,info
       - name: Run sync_suite (single-threaded)
         if: ${{ !cancelled() }}
-        run: cargo test -p filen-sdk-rs -F sync-engine,malformed --test sync_suite --no-fail-fast -- --test-threads=1
+        run: cargo test -p filen-sdk-rs -F sync-engine-live-tests,malformed --test sync_suite --no-fail-fast -- --test-threads=1
         env:
           TEST_EMAIL: ${{ secrets['V2_TEST_ACC_EMAIL'] }}
           TEST_PASSWORD: ${{ secrets['V2_TEST_ACC_PASS'] }}
@@ -405,8 +409,8 @@ jobs:
       - name: Run sync_engine_stress_tests (single-threaded, ignored tests)
         # `/usr/bin/time -v` reports the run's wall time and maximum resident set size.
         run: |
-          cargo test -p filen-sdk-rs -F sync-engine,malformed --test sync_engine_stress_tests --no-run
-          /usr/bin/time -v cargo test -p filen-sdk-rs -F sync-engine,malformed --test sync_engine_stress_tests --no-fail-fast -- --ignored --test-threads=1
+          cargo test -p filen-sdk-rs -F sync-engine-live-tests,malformed --test sync_engine_stress_tests --no-run
+          /usr/bin/time -v cargo test -p filen-sdk-rs -F sync-engine-live-tests,malformed --test sync_engine_stress_tests --no-fail-fast -- --ignored --test-threads=1
         env:
           SYNC_STRESS_N: ${{ inputs.sync_stress_n }}
           TEST_EMAIL: ${{ secrets['V2_TEST_ACC_EMAIL'] }}

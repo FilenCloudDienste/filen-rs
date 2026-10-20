@@ -1,7 +1,7 @@
 //! Grouped sync-engine test suite — ONE integration-test binary, one module per category.
 //!
-//! Run all:          cargo test -p filen-sdk-rs -F sync-engine --test sync_suite
-//! Run one category: cargo test -p filen-sdk-rs -F sync-engine --test sync_suite -- basics::
+//! Run all:          cargo test -p filen-sdk-rs -F sync-engine-live-tests,malformed --test sync_suite
+//! Run one category: cargo test -p filen-sdk-rs -F sync-engine-live-tests,malformed --test sync_suite -- basics::
 //!
 //! Shared scaffolding lives in `harness`.
 

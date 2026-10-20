@@ -2,10 +2,10 @@
 //! only (`SyncEngine`, `SyncMode`, `SyncReport`, `WatchHandle`) — no knowledge of the engine's
 //! internals. Lives in the separate integration-test crate, which can only reach `pub` items.
 //!
-//! Run: `cargo test -p filen-sdk-rs --features sync-engine --test sync_engine_blackbox_tests`
+//! Run: `cargo test -p filen-sdk-rs --features sync-engine-live-tests --test sync_engine_blackbox_tests`
 //! (needs `.env` with TEST_EMAIL / TEST_PASSWORD). One test (`remote_case_collision_refused`)
 //! additionally needs the `malformed` feature to construct its precondition: run the suite with
-//! `-F sync-engine,malformed` to include it.
+//! `-F sync-engine-live-tests,malformed` to include it.
 
 use std::{borrow::Cow, path::PathBuf, sync::Arc, time::Duration};
 
@@ -1144,7 +1144,7 @@ async fn mass_delete_guard_holds_large_deletion() {
 // refuse the whole pass (surfacing an error) rather than do partial destructive work.
 //
 // Requires the `malformed` feature for the mismatched-hash seam:
-//   cargo test -p filen-sdk-rs -F sync-engine,malformed --test sync_engine_blackbox_tests
+//   cargo test -p filen-sdk-rs -F sync-engine-live-tests,malformed --test sync_engine_blackbox_tests
 #[cfg(feature = "malformed")]
 #[shared_test_runtime]
 async fn remote_case_collision_refused() {
