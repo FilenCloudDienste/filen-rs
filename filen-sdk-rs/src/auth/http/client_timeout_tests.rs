@@ -13,7 +13,8 @@ use tokio::{
 
 use super::{
 	AuthClient, ClientConfig, DEFAULT_CONNECT_TIMEOUT, DEFAULT_READ_TIMEOUT,
-	test_support::{client, read_head, respond_with},
+	class_limit::CONTROL_REQUEST_HEADROOM,
+	test_support::{GATEWAY_CONNECT, Stall, client, client_via_proxy, read_head, respond_with},
 };
 
 #[test]
@@ -170,53 +171,88 @@ async fn respond(socket: &mut TcpStream) {
 	respond_with(socket, r#"{"status":true}"#).await;
 }
 
-/// Sends a lock request with `send` while a request the server never answers holds the only
-/// permit of the client's shared concurrency limit, answering it with `answer`. A lock request
-/// must not wait for that limit, which chunk transfers can hold far longer than a refresh may
-/// take.
-async fn lock_request_beside_a_stalled_transfer<F, Fut>(answer: &'static str, send: F)
+/// Sends a lock request with `send` while requests the server never answers hold every place of
+/// a `with_concurrency(1)` client's request pool (one chunk transfer and
+/// `CONTROL_REQUEST_HEADROOM` control requests), answering it with `answer`. A lock request must
+/// not wait for that pool.
+async fn lock_request_beside_a_full_request_pool<F, Fut>(answer: &'static str, send: F)
 where
 	F: FnOnce(Arc<AuthClient>, String) -> Fut,
 	Fut: Future<Output = Result<(), crate::Error>>,
 {
 	let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
 	let addr = listener.local_addr().unwrap();
-	let (holding, held) = tokio::sync::oneshot::channel();
+	let (transferring, transfer_held) = tokio::sync::oneshot::channel();
+	let (filled, pool_full) = tokio::sync::oneshot::channel();
 	let server = tokio::spawn(async move {
-		// the shared request: read and never answered, so it keeps the only shared permit
-		let (mut stalled, _) = listener.accept().await.unwrap();
-		read_head(&mut stalled).await;
-		holding.send(()).unwrap();
+		// every request but the lock's is read and never answered, so each keeps its places
+		let (mut transfer, _) = listener.accept().await.unwrap();
+		let head = read_head(&mut transfer).await;
+		assert!(head.starts_with(Stall::Upload.connect_line()), "{head}");
+		transferring.send(()).unwrap();
+		let mut controls = Vec::new();
+		for _ in 0..CONTROL_REQUEST_HEADROOM {
+			let (mut control, _) = listener.accept().await.unwrap();
+			let head = read_head(&mut control).await;
+			assert!(head.starts_with(GATEWAY_CONNECT), "{head}");
+			controls.push(control);
+		}
+		filled.send(()).unwrap();
+		// plain http through a proxy: the request arrives in absolute form
 		let (mut lock, _) = listener.accept().await.unwrap();
-		read_head(&mut lock).await;
+		let head = read_head(&mut lock).await;
+		assert!(
+			head.starts_with("POST http://lock.test/v3/user/lock"),
+			"{head}"
+		);
 		respond_with(&mut lock, answer).await;
 		// kept open until the client has read the answer: closing a socket with the request
 		// body still unread resets the connection, which fails the request on Windows
-		(stalled, lock)
+		(transfer, controls, lock)
 	});
 
-	let client = Arc::new(client(ClientConfig::default().with_concurrency(1)));
-	let url = format!("http://{addr}/v3/user/lock");
-	let shared = tokio::spawn({
-		let (client, url) = (Arc::clone(&client), url.clone());
-		async move {
-			let _ = client
-				.post_raw_bytes_auth::<()>(Bytes::new(), &url, "v3/upload".into())
-				.await;
-		}
+	let client = Arc::new(client_via_proxy(
+		ClientConfig::default().with_concurrency(1),
+		addr,
+	));
+	let transfer = tokio::spawn({
+		let client = Arc::clone(&client);
+		async move { Stall::Upload.send(&client).await }
 	});
-	held.await.unwrap();
-	tokio::time::timeout(Duration::from_secs(10), send(client, url))
+	// each wait is bounded, so a pool that cannot fill fails the test instead of hanging it
+	tokio::time::timeout(Duration::from_secs(10), transfer_held)
 		.await
-		.expect("the lock request must not queue behind the shared request")
-		.unwrap();
-	shared.abort();
+		.expect("the chunk transfer must reach the network")
+		.expect("the scripted proxy reads the chunk transfer");
+	let controls = (0..CONTROL_REQUEST_HEADROOM)
+		.map(|_| {
+			let client = Arc::clone(&client);
+			tokio::spawn(async move {
+				let _ = client.get_auth::<()>("v3/user/info".into()).await;
+			})
+		})
+		.collect::<Vec<_>>();
+	tokio::time::timeout(Duration::from_secs(10), pool_full)
+		.await
+		.expect("the control requests must fill the request pool")
+		.expect("the scripted proxy reads every control request");
+	tokio::time::timeout(
+		Duration::from_secs(10),
+		send(client, "http://lock.test/v3/user/lock".to_owned()),
+	)
+	.await
+	.expect("the lock request must not queue behind the request pool")
+	.unwrap();
+	transfer.abort();
+	for control in controls {
+		control.abort();
+	}
 	drop(server.await.unwrap());
 }
 
 #[tokio::test]
-async fn lock_acquires_do_not_wait_for_the_shared_limit() {
-	lock_request_beside_a_stalled_transfer(LOCK_ANSWER, |client, url| async move {
+async fn lock_acquires_do_not_wait_for_the_request_pool() {
+	lock_request_beside_a_full_request_pool(LOCK_ANSWER, |client, url| async move {
 		// the poll acquire_lock sends
 		crate::sync::lock::send_acquire(&client, &url, Bytes::new())
 			.await
@@ -249,16 +285,16 @@ async fn send_lock_request(
 }
 
 #[tokio::test]
-async fn lock_refreshes_do_not_wait_for_the_shared_limit() {
-	lock_request_beside_a_stalled_transfer(LOCK_ANSWER, |client, url| {
+async fn lock_refreshes_do_not_wait_for_the_request_pool() {
+	lock_request_beside_a_full_request_pool(LOCK_ANSWER, |client, url| {
 		send_lock_request(client, url, LockType::Refresh)
 	})
 	.await;
 }
 
 #[tokio::test]
-async fn lock_releases_do_not_wait_for_the_shared_limit() {
-	lock_request_beside_a_stalled_transfer(LOCK_ANSWER, |client, url| {
+async fn lock_releases_do_not_wait_for_the_request_pool() {
+	lock_request_beside_a_full_request_pool(LOCK_ANSWER, |client, url| {
 		send_lock_request(client, url, LockType::Release)
 	})
 	.await;

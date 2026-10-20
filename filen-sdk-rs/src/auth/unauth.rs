@@ -675,6 +675,7 @@ pub(crate) mod test_support {
 	use rsa::pkcs8::EncodePrivateKey;
 
 	use super::*;
+	use crate::auth::http::test_support::unauthed_via_proxy;
 
 	/// A client whose every request fails without leaving the machine: each one goes to a proxy
 	/// on a local port nothing listens on, which refuses the connection.
@@ -684,12 +685,7 @@ pub(crate) mod test_support {
 
 	/// An [`offline_unauthed`] client built from `config`.
 	pub(crate) fn offline_unauthed_with(config: ClientConfig) -> UnauthClient {
-		let mut unauthed = UnauthClient::from_config(config).expect("a test config is valid");
-		unauthed.reqwest_client = reqwest::Client::builder()
-			.proxy(reqwest::Proxy::all("http://127.0.0.1:1").expect("a valid proxy URL"))
-			.build()
-			.expect("a client with a proxy builds");
-		unauthed
+		unauthed_via_proxy(config, "http://127.0.0.1:1")
 	}
 
 	/// A logged-in [`offline_unauthed`] client. The error a call fails with names the URL of the

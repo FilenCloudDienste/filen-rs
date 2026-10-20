@@ -1482,8 +1482,8 @@ async fn control_18_pause_mid_pass_coherent() {
 #[shared_test_runtime]
 async fn control_18b_suspend_parks_and_resume_finishes_the_pass() {
 	const N: usize = 60;
-	// The client's request concurrency, which is also the pass's window of concurrent transfers: at
-	// most this many are running when the suspension lands.
+	// The client's transfer concurrency (`with_concurrency`), which is also the pass's window of
+	// concurrent transfers: at most this many are running when the suspension lands.
 	const TRANSFER_WINDOW: usize = 16;
 	const QUIET: Duration = Duration::from_secs(2);
 

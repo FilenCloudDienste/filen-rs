@@ -166,6 +166,16 @@ impl ClientConfig {
 		self
 	}
 
+	/// How many file chunks upload or download at once, at least 1; 16 by default. Later ones
+	/// wait.
+	///
+	/// Every other request (listings, metadata changes, an upload's `done`, sign-in) shares the
+	/// same limit with 4 places more that chunk transfers never take, so while fewer than 4 other
+	/// such requests are in flight it gets a place at once, even with every transfer place taken.
+	/// Past that, places go out in the order they were asked for, chunks included. The client sends
+	/// at most this many plus 4 requests at once, and up to 4 drive-lock requests apart from those.
+	/// Only the places are kept apart: the request rate limit, and the bandwidth limits where they
+	/// are set, apply to these requests and to chunks alike.
 	pub fn with_concurrency(mut self, concurrency: usize) -> Self {
 		self.concurrency = concurrency;
 		self
@@ -316,6 +326,9 @@ pub enum LogLevel {
 ))]
 #[js_type(import, no_ser, wasm_all, napi)]
 pub struct JsClientConfig {
+	/// How many file chunks upload or download at once, later ones waiting; 16 when not set (null
+	/// or undefined), at least 1 (0 counts as 1). Other requests (listings, changes) have 4 places
+	/// more that chunks never take, so they go out while files transfer.
 	#[cfg_attr(all(target_family = "wasm", target_os = "unknown"), serde(default))]
 	pub concurrency: Option<u32>,
 	#[cfg_attr(all(target_family = "wasm", target_os = "unknown"), serde(default))]
@@ -707,19 +720,12 @@ impl SharedClientState {
 			}
 		};
 
-		// Same two hazards as the thumbnail gate, and the same reason to handle them here:
-		// `RequestLimits::new` builds a `tokio::sync::Semaphore` of this size, which parks every
-		// request forever at 0 permits and panics above `MAX_PERMITS` — a ceiling a 32-bit `usize`
-		// (wasm32) puts inside `u32`, so `JsClientConfig { concurrency }` can reach it. This is
-		// where every construction path converges.
-		let concurrency = config
-			.concurrency
-			.clamp(1, tokio::sync::Semaphore::MAX_PERMITS);
-
 		Ok(Self {
-			limits: RequestLimits::new(concurrency),
+			// both clamp the configured concurrency the same way, in `transfer_concurrency`, the
+			// one place every construction path converges on
+			limits: RequestLimits::new(config.concurrency),
 			#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-			max_concurrency: concurrency,
+			max_concurrency: class_limit::transfer_concurrency(config.concurrency),
 			retry: retry::RetryMapLayer::new(retry::RetryPolicy::new(config.retry_budget)),
 			rate_limiter: limit::GlobalRateLimitLayer::new(config.rate_limit_per_sec),
 			#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
@@ -759,6 +765,8 @@ impl SharedClientState {
 		self.file_io_memory_budget
 	}
 
+	/// How many chunk transfers run at once ([`ClientConfig::with_concurrency`], clamped): the
+	/// width transfer jobs fan out to (`io::dir_download`, the sync engine's apply window).
 	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 	pub(crate) fn max_concurrency(&self) -> usize {
 		self.max_concurrency
@@ -1173,6 +1181,9 @@ impl UnauthClient {
 	/// Lets callers report download progress *while a chunk arrives* rather than only once it is
 	/// fully buffered — important for heavily-parallel downloads, where every in-flight chunk shares
 	/// bandwidth and none completes (so none would report) for the first several seconds.
+	///
+	/// A chunk download: sent as a [`RequestClass::Transfer`], like its upload counterpart
+	/// [`AuthClient::post_raw_bytes_auth`].
 	pub(crate) async fn get_raw_bytes_with_callback<F>(
 		&self,
 		url: &str,
@@ -1191,7 +1202,7 @@ impl UnauthClient {
 		let builder = ServiceBuilder::new()
 			.layer(logging::LogLayer::new(endpoint)) // optional logging
 			.layer(url_parser::UrlParseLayer) // required to parse URL string to reqwest::Url
-			.layer(self.state.limits.layer(RequestClass::Control)) // the class's concurrency limits
+			.layer(self.state.limits.layer(RequestClass::Transfer)) // the class's concurrency limits
 			.layer(self.state.retry.clone()) // required to map RetryError to Error
 			.layer(self.state.rate_limiter.clone()) // optional
 			.map_request(|request: Request<(), reqwest::Url>| {
@@ -1420,6 +1431,10 @@ impl AuthClient {
 			.await
 	}
 
+	/// Uploads one file chunk: sent as a [`RequestClass::Transfer`], so it waits for a transfer
+	/// place before it takes a place in the request pool. Its only production caller is
+	/// `api::v3::upload::upload_file_chunk`; any other raw body sent through it would take a
+	/// transfer place it has no claim to.
 	pub(crate) async fn post_raw_bytes_auth<Res>(
 		&self,
 		request: Bytes,
@@ -1429,13 +1444,12 @@ impl AuthClient {
 	where
 		Res: DeserializeOwned + Debug,
 	{
-		self.post_raw_bytes_auth_with(request, url, endpoint, RequestClass::Control)
+		self.post_raw_bytes_auth_with(request, url, endpoint, RequestClass::Transfer)
 			.await
 	}
 
-	/// [`Self::post_raw_bytes_auth`] for a lock request: sent as a [`RequestClass::Lock`], under
-	/// the lock requests' own concurrency limit, so it does not queue behind the client's
-	/// transfers.
+	/// [`Self::post_raw_bytes_auth`] for a lock request: sent as a [`RequestClass::Lock`], in the
+	/// lock requests' own pool, so it waits neither for chunk transfers nor for the request pool.
 	pub(crate) async fn post_raw_bytes_auth_lock<Res>(
 		&self,
 		request: Bytes,
@@ -1449,7 +1463,7 @@ impl AuthClient {
 			.await
 	}
 
-	/// [`Self::post_raw_bytes_auth`] under the concurrency limit of `class`.
+	/// [`Self::post_raw_bytes_auth`] under the limits of `class`.
 	async fn post_raw_bytes_auth_with<Res>(
 		&self,
 		request: Bytes,
@@ -1565,8 +1579,12 @@ mod client_timeout_tests;
 #[cfg(all(test, not(all(target_family = "wasm", target_os = "unknown"))))]
 mod pre_send_connect_tests;
 
-// The layer keeps no readable permit count, so this pins the clamp through `max_concurrency`,
-// which the constructor feeds from the same clamped local.
+// Native-only: they drive the real entry points through a scripted local proxy.
+#[cfg(all(test, not(all(target_family = "wasm", target_os = "unknown"))))]
+mod request_class_tests;
+
+// Pins the clamp through `max_concurrency`, which the constructor feeds from the same
+// `transfer_concurrency` as the limits; the semaphores' counts are pinned in `class_limit`'s tests.
 #[cfg(all(test, not(all(target_family = "wasm", target_os = "unknown"))))]
 mod concurrency_limit_tests;
 
