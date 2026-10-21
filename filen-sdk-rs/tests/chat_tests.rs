@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use filen_macros::shared_test_runtime;
 use filen_sdk_rs::{auth::Client, chats::Chat, sync::lock::ResourceLock};
-use filen_types::traits::CowHelpers;
-use test_utils::{lock_chat, set_up_contact};
+use filen_types::{api::v3::contacts::Contact, traits::CowHelpers};
+use test_utils::{ensure_contact, lock_chat};
 
 /// Janitor (mirrors `client_tests::cleanup_test_dirs`): sweep stale conversations that prior runs
 /// left behind — the per-test [`ChatGuard`] only clears when a chat test actually runs, so a run
@@ -153,52 +153,29 @@ where
 	}
 }
 
+/// The share account as a contact, with both accounts' `test:chats` and `test:contact` locks.
 async fn lock_chats(
 	client: &Client,
 	share_client: &Client,
-) -> (
-	Arc<ResourceLock>,
-	Arc<ResourceLock>,
-	Arc<ResourceLock>,
-	Arc<ResourceLock>,
-) {
-	// Take the share account's locks — and both accounts' `test:contact`, including its 300s
-	// settle sleep — BEFORE this account's account-wide `test:chats`. Acquiring `test:chats` first
-	// meant a V2 chat test held an account-wide lock while queueing behind V1 legs on the share
-	// account, which every leg shares: that inversion kept `test:chats` shut for 27 minutes on the
-	// 2026-09-19 nightly and starved the wasm suite's `chats` test into its 1800s vitest timeout.
+) -> (Contact<'static>, [Arc<ResourceLock>; 4]) {
+	// Take the share account's locks, and both accounts' `test:contact`, BEFORE this account's
+	// account-wide `test:chats`. Acquiring `test:chats` first meant a V2 chat test held an
+	// account-wide lock while queueing behind V1 legs on the share account, which every leg
+	// shares: that inversion kept `test:chats` shut for 27 minutes on the 2026-09-19 nightly and
+	// starved the wasm suite's `chats` test into its 1800s vitest timeout.
 	// Every test that holds both takes `test:contact` first; socket_tests::chat once took them the
 	// other way round and deadlocked against this on the 2026-10-05 nightly.
-	let (lock3, lock4) = set_up_contact(client, share_client).await;
+	let (contact, [lock3, lock4]) = ensure_contact(client, share_client).await;
 	let lock2 = lock_chat(share_client).await;
 	let lock1 = lock_chat(client).await;
-	(lock1, lock2, lock3, lock4)
+	(contact, [lock1, lock2, lock3, lock4])
 }
 
-async fn make_chat(
-	client: &Client,
-	share_client: &Client,
-) -> (
-	(
-		Arc<ResourceLock>,
-		Arc<ResourceLock>,
-		Arc<ResourceLock>,
-		Arc<ResourceLock>,
-	),
-	Chat,
-) {
-	let locks = lock_chats(client, share_client).await;
+async fn make_chat(client: &Client, share_client: &Client) -> ([Arc<ResourceLock>; 4], Chat) {
+	let (contact, locks) = lock_chats(client, share_client).await;
 
 	clear_chats(client).await;
 	clear_chats(share_client).await;
-
-	let contact = client
-		.get_contacts()
-		.await
-		.unwrap()
-		.into_iter()
-		.find(|c| c.email == share_client.email())
-		.unwrap();
 
 	let chat = retry_rate_limited(|| client.create_chat(std::slice::from_ref(&contact))).await;
 	(locks, chat)
@@ -208,7 +185,7 @@ async fn make_chat(
 async fn conversation_participant_management() {
 	let client = test_utils::RESOURCES.client().await;
 	let share_client = test_utils::SHARE_RESOURCES.client().await;
-	let _locks = lock_chats(&client, &share_client).await;
+	let (contact, _locks) = lock_chats(&client, &share_client).await;
 
 	clear_chats(&client).await;
 	clear_chats(&share_client).await;
@@ -216,18 +193,6 @@ async fn conversation_participant_management() {
 	assert!(chats.is_empty());
 
 	let mut chat = retry_rate_limited(|| client.create_chat(&[])).await;
-
-	if let Ok(uuid) = client.send_contact_request(share_client.email()).await {
-		let _ = share_client.accept_contact_request(uuid).await;
-	}
-
-	let contact = client
-		.get_contacts()
-		.await
-		.unwrap()
-		.into_iter()
-		.find(|c| c.email == share_client.email())
-		.unwrap();
 
 	client
 		.add_chat_participant(&mut chat, &contact)
@@ -355,7 +320,7 @@ async fn user_info() {
 async fn test_blocking() {
 	let share_client = test_utils::SHARE_RESOURCES.client().await;
 	let client = test_utils::RESOURCES.client().await;
-	let _locks = set_up_contact(&client, &share_client).await;
+	let _locks = ensure_contact(&client, &share_client).await;
 
 	let contacts = share_client.get_contacts().await.unwrap();
 	let contact = contacts.iter().find(|c| c.email == client.email()).unwrap();

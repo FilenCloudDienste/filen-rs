@@ -380,21 +380,14 @@ async fn sharing_a_dir_with_batching_shares_every_item() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let share_client = test_utils::SHARE_RESOURCES.client().await;
 
-	let (_lock1, _lock2) = test_utils::set_up_contact(&resources.client, &share_client).await;
-	let contacts = resources
-		.client
-		.get_contacts()
-		.await
-		.expect("listing contacts");
-	let [contact] = contacts.as_slice() else {
-		panic!("expected exactly the share account as a contact, got {contacts:?}");
-	};
+	let (contact, _contact_locks) =
+		test_utils::ensure_contact(&resources.client, &share_client).await;
 
 	let (unbatched, unbatched_endpoints) = recorded_share(
 		&resources.client,
 		&resources.dir,
 		&share_client,
-		contact,
+		&contact,
 		Duration::ZERO,
 		"shared_window_0",
 	)
@@ -403,7 +396,7 @@ async fn sharing_a_dir_with_batching_shares_every_item() {
 		&resources.client,
 		&resources.dir,
 		&share_client,
-		contact,
+		&contact,
 		SHARE_WINDOW,
 		"shared_window_500ms",
 	)

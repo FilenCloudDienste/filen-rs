@@ -1,5 +1,5 @@
 use core::panic;
-use std::{borrow::Cow, fmt::Write, sync::Arc};
+use std::{borrow::Cow, fmt::Write};
 
 use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use filen_macros::shared_test_runtime;
@@ -14,7 +14,6 @@ use filen_sdk_rs::{
 		file::FileBuilder,
 	},
 	io::client_impl::IoSharedClientExt,
-	sync::lock::ResourceLock,
 };
 use filen_types::auth::{AuthVersion, FileEncryptionVersion};
 
@@ -59,47 +58,6 @@ fn get_compat_test_file(
 	(file, test_str)
 }
 
-async fn get_contact(
-	client: &Client,
-) -> (
-	filen_types::api::v3::contacts::Contact<'static>,
-	Arc<ResourceLock>,
-	Arc<ResourceLock>,
-) {
-	let share_client = test_utils::SHARE_RESOURCES.client().await;
-	let lock1 = client
-		.acquire_lock_with_default(test_utils::locks::CONTACT)
-		.await
-		.unwrap();
-	let lock2 = share_client
-		.acquire_lock_with_default(test_utils::locks::CONTACT)
-		.await
-		.unwrap();
-
-	let contacts = client.get_contacts().await.unwrap();
-	for contact in contacts {
-		if contact.email == share_client.email() {
-			return (contact, lock1, lock2);
-		}
-	}
-	let contact_uuid = client
-		.send_contact_request(share_client.email())
-		.await
-		.unwrap();
-	share_client
-		.accept_contact_request(contact_uuid)
-		.await
-		.unwrap();
-
-	let contacts = client.get_contacts().await.unwrap();
-	for contact in contacts {
-		if contact.email == share_client.email() {
-			return (contact, lock1, lock2);
-		}
-	}
-	panic!("Contact not found after sending request");
-}
-
 #[shared_test_runtime]
 async fn make_rs_compat_dir() {
 	let resources = test_utils::RESOURCES.get_resources().await;
@@ -126,7 +84,8 @@ async fn make_rs_compat_dir() {
 		.unwrap();
 	client.upload_file(empty_file, b"").await.unwrap();
 
-	let (contact, _lock1, _lock2) = get_contact(client).await;
+	let share_client = test_utils::SHARE_RESOURCES.client().await;
+	let (contact, _contact_locks) = test_utils::ensure_contact(client, &share_client).await;
 	client
 		.share_dir::<fn(u64, Option<u64>)>(&compat_dir, &contact, None)
 		.await
@@ -163,14 +122,7 @@ async fn make_rs_compat_dir() {
 async fn prep_shared_compat_tests(client: &Client, language: &str, shortened: &str) {
 	let share_client = &test_utils::SHARE_RESOURCES.client().await;
 
-	let _lock1 = client
-		.acquire_lock_with_default(test_utils::locks::CONTACT)
-		.await
-		.unwrap();
-	let _lock2 = share_client
-		.acquire_lock_with_default(test_utils::locks::CONTACT)
-		.await
-		.unwrap();
+	let _contact_locks = test_utils::lock_contact(client, share_client).await;
 
 	let share_dirs = share_client
 		.list_in_shared_root(None::<&fn(u64, Option<u64>)>)

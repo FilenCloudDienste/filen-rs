@@ -407,42 +407,6 @@ async fn create_dirs_fails_only_a_dir_named_like_a_file_in_its_parent() {
 	assert_eq!(names(&files), ["x"]);
 }
 
-/// The share account as a contact of the test account, with both accounts' contact lock, which
-/// the caller holds for the whole test and takes before the drive lock, as the share tests in
-/// connect_tests do.
-async fn contact(
-	client: &Client,
-	share_client: &Client,
-) -> (Contact<'static>, [Arc<ResourceLock>; 2]) {
-	let locks = [
-		client
-			.acquire_lock_with_default(test_utils::locks::CONTACT)
-			.await
-			.unwrap(),
-		share_client
-			.acquire_lock_with_default(test_utils::locks::CONTACT)
-			.await
-			.unwrap(),
-	];
-	if let Some(contact) = find_contact(client, share_client.email()).await {
-		return (contact, locks);
-	}
-	// Only when the accounts are not contacts yet: between contacts the server answers a request
-	// with the existing contact's uuid, which is no request to accept.
-	test_utils::add_contact(client, share_client).await;
-	let contact = find_contact(client, share_client.email()).await.unwrap();
-	(contact, locks)
-}
-
-async fn find_contact(client: &Client, email: &str) -> Option<Contact<'static>> {
-	client
-		.get_contacts()
-		.await
-		.unwrap()
-		.into_iter()
-		.find(|contact| contact.email == email)
-}
-
 /// The dir "shared" in `test_dir` and the file "f.txt" in it.
 async fn share_fixtures(
 	client: &Client,
@@ -469,7 +433,7 @@ async fn out_shared_count(client: &Client, uuid: Uuid) -> usize {
 async fn share_items_shares_a_dir_and_its_file_with_the_receiver() {
 	let client = test_utils::RESOURCES.client().await;
 	let share_client = test_utils::SHARE_RESOURCES.client().await;
-	let (contact, _contact_locks) = contact(&client, &share_client).await;
+	let (contact, _contact_locks) = test_utils::ensure_contact(&client, &share_client).await;
 	let (resources, _lock) = test_utils::RESOURCES.get_resources_with_lock().await;
 	let (d, f) = share_fixtures(&client, &resources.dir).await;
 
@@ -528,7 +492,7 @@ async fn share_items_shares_a_dir_and_its_file_with_the_receiver() {
 async fn share_items_fails_only_an_item_that_does_not_exist() {
 	let client = test_utils::RESOURCES.client().await;
 	let share_client = test_utils::SHARE_RESOURCES.client().await;
-	let (contact, _contact_locks) = contact(&client, &share_client).await;
+	let (contact, _contact_locks) = test_utils::ensure_contact(&client, &share_client).await;
 	let (resources, _lock) = test_utils::RESOURCES.get_resources_with_lock().await;
 	let (d, f) = share_fixtures(&client, &resources.dir).await;
 
@@ -577,7 +541,7 @@ async fn share_items_fails_only_an_item_that_does_not_exist() {
 async fn shared_reports_who_each_item_is_shared_with() {
 	let client = test_utils::RESOURCES.client().await;
 	let share_client = test_utils::SHARE_RESOURCES.client().await;
-	let (contact, _contact_locks) = contact(&client, &share_client).await;
+	let (contact, _contact_locks) = test_utils::ensure_contact(&client, &share_client).await;
 	let (resources, _lock) = test_utils::RESOURCES.get_resources_with_lock().await;
 	let (d, f) = share_fixtures(&client, &resources.dir).await;
 	let u = client
@@ -1251,7 +1215,7 @@ async fn shared_in_name(share_client: &Client, uuid: Uuid) -> Option<String> {
 async fn shared_rename_updates_an_items_name_for_its_receiver() {
 	let client = test_utils::RESOURCES.client().await;
 	let share_client = test_utils::SHARE_RESOURCES.client().await;
-	let (contact, _contact_locks) = contact(&client, &share_client).await;
+	let (contact, _contact_locks) = test_utils::ensure_contact(&client, &share_client).await;
 	let (resources, _lock) = test_utils::RESOURCES.get_resources_with_lock().await;
 
 	let d = client
@@ -1669,7 +1633,7 @@ async fn notes_participants_add_adds_a_contact_who_can_read_the_note() {
 	let client = test_utils::RESOURCES.client().await;
 	let share_client = test_utils::SHARE_RESOURCES.client().await;
 	// The contact locks come before the notes lock, as in note_tests' note_sharing.
-	let (contact, _contact_locks) = contact(&client, &share_client).await;
+	let (contact, _contact_locks) = test_utils::ensure_contact(&client, &share_client).await;
 	let _lock = client
 		.acquire_lock_with_default(test_utils::locks::NOTES)
 		.await
@@ -1728,7 +1692,8 @@ async fn chat_contact_and_locks(
 	client: &Client,
 	share_client: &Client,
 ) -> (Contact<'static>, [Arc<ResourceLock>; 4]) {
-	let (contact, [contact_lock, share_contact_lock]) = contact(client, share_client).await;
+	let (contact, [contact_lock, share_contact_lock]) =
+		test_utils::ensure_contact(client, share_client).await;
 	let share_chat_lock = test_utils::lock_chat(share_client).await;
 	let chat_lock = test_utils::lock_chat(client).await;
 	(

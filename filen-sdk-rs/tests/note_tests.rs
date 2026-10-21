@@ -437,29 +437,10 @@ async fn note_sharing() {
 	let client = test_utils::RESOURCES.client().await;
 	let share_client = test_utils::SHARE_RESOURCES.client().await;
 
-	let _lock1 = client
-		.acquire_lock_with_default(test_utils::locks::CONTACT)
-		.await
-		.unwrap();
-	let _lock2 = share_client
-		.acquire_lock_with_default(test_utils::locks::CONTACT)
-		.await
-		.unwrap();
+	let (contact, _contact_locks) = test_utils::ensure_contact(&client, &share_client).await;
 	let _lock = client
 		.acquire_lock_with_default(test_utils::locks::NOTES)
 		.await
-		.unwrap();
-
-	if let Ok(uuid) = client.send_contact_request(share_client.email()).await {
-		let _ = share_client.accept_contact_request(uuid).await;
-	}
-
-	let contact = client
-		.get_contacts()
-		.await
-		.unwrap()
-		.into_iter()
-		.find(|c| c.email == share_client.email())
 		.unwrap();
 
 	let mut note = client.create_note(None).await.unwrap();

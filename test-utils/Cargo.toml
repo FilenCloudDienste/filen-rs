@@ -10,6 +10,7 @@ license = "AGPL-3.0"
 base64 = "0.22.1"
 dotenv = "0.15.0"
 filen-sdk-rs = { path = "../filen-sdk-rs" }
+filen-types = { path = "../filen-types" }
 futures = "0.3.31"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 rand = "0.9.2"

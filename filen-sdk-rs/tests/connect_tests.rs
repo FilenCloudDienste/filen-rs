@@ -367,15 +367,10 @@ async fn share_added_mid_hold_reaches_what_is_uploaded_after_it() {
 	let client = &resources.client;
 	let test_dir = &resources.dir;
 	let share_client = test_utils::SHARE_RESOURCES.client().await;
-	let (_lock1, _lock2) = test_utils::set_up_contact(client, &share_client).await;
+	let (contact, _contact_locks) = test_utils::ensure_contact(client, &share_client).await;
 	// One hold for the whole test, taken after the contact locks: the order the other share tests
 	// take them in, so two of them never wait on each other.
 	let _drive_lock = client.lock_drive().await.unwrap();
-	let contacts = client.get_contacts().await.unwrap();
-	let contact = contacts
-		.iter()
-		.find(|contact| contact.email == share_client.email())
-		.unwrap();
 
 	let dir = client.create_dir(&test_dir.into(), "a").await.unwrap();
 	// Looks up `dir`'s shares while it has none.
@@ -383,7 +378,7 @@ async fn share_added_mid_hold_reaches_what_is_uploaded_after_it() {
 	client.upload_file(f1, b"before the share").await.unwrap();
 
 	client
-		.share_dir::<fn(u64, Option<u64>)>(&dir, contact, None)
+		.share_dir::<fn(u64, Option<u64>)>(&dir, &contact, None)
 		.await
 		.unwrap();
 
@@ -870,14 +865,9 @@ async fn share_dir() {
 	let file = client.make_file_builder("a.txt", sub_dir.uuid()).unwrap();
 	let sub_file = client.upload_file(file, b"").await.unwrap();
 
-	let (_lock1, _lock2) = test_utils::set_up_contact(client, share_client).await;
-
-	let contacts = client.get_contacts().await.unwrap();
-	assert_eq!(contacts.len(), 1);
-	let contact = &contacts[0];
-	assert_eq!(contact.email, share_client.email());
+	let (contact, _contact_locks) = test_utils::ensure_contact(client, share_client).await;
 	client
-		.share_dir::<fn(u64, Option<u64>)>(&dir, contact, None)
+		.share_dir::<fn(u64, Option<u64>)>(&dir, &contact, None)
 		.await
 		.unwrap();
 	// sleep because sometimes this takes a second to become available on the backend
@@ -1038,7 +1028,7 @@ async fn share_dir() {
 		share_client,
 		test_dir,
 		&share_resources.dir,
-		contact,
+		&contact,
 	)
 	.await;
 }

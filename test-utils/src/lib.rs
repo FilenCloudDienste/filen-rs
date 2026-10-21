@@ -16,6 +16,7 @@ use filen_sdk_rs::{
 	},
 	sync::lock::ResourceLock,
 };
+use filen_types::api::v3::contacts::Contact;
 
 use futures::{StreamExt, stream::FuturesUnordered};
 use tokio::sync::OnceCell;
@@ -237,18 +238,32 @@ pub static SHARE_RESOURCES: Resources = Resources {
 	account_prefix: "TEST_SHARE",
 };
 
+/// Both accounts' `test:contact` locks, `client`'s first. A test holds them while it uses the
+/// contact, or the shares, between the two accounts. A test that also takes any of the shared
+/// locks takes these first: then the share account's `test:chats`, then `client`'s, then
+/// `test:notes`, then the drive lock.
+pub async fn lock_contact(client: &Client, share_client: &Client) -> [Arc<ResourceLock>; 2] {
+	[
+		client
+			.acquire_lock_with_default(locks::CONTACT)
+			.await
+			.unwrap(),
+		share_client
+			.acquire_lock_with_default(locks::CONTACT)
+			.await
+			.unwrap(),
+	]
+}
+
+/// Deletes every contact, pending request, block and non-`compat-` share between the two
+/// accounts, then waits 300 s for the server to settle. Only for a test of the contact-request
+/// flow itself, which needs the accounts not to be contacts; a test that only needs a contact
+/// takes [`ensure_contact`].
 pub async fn set_up_contact_no_add<'a>(
 	client: &'a Client,
 	share_client: &'a Client,
 ) -> (Arc<ResourceLock>, Arc<ResourceLock>) {
-	let lock1 = client
-		.acquire_lock_with_default(locks::CONTACT)
-		.await
-		.unwrap();
-	let lock2 = share_client
-		.acquire_lock_with_default(locks::CONTACT)
-		.await
-		.unwrap();
+	let [lock1, lock2] = lock_contact(client, share_client).await;
 
 	let _ = futures::join!(
 		async {
@@ -353,6 +368,10 @@ pub async fn set_up_contact_no_add<'a>(
 	(lock1, lock2)
 }
 
+/// [`set_up_contact_no_add`], then a fresh request from `client` that `share_client` accepts. Only
+/// for a test of the contact-request flow itself: every call is one more send against the
+/// server's 30 per hour per sender, and the teardown costs 300 s. A test that only needs the two
+/// accounts to be contacts takes [`ensure_contact`].
 pub async fn set_up_contact<'a>(
 	client: &'a Client,
 	share_client: &'a Client,
@@ -363,7 +382,7 @@ pub async fn set_up_contact<'a>(
 }
 
 /// Makes `share_client` a contact of `client`: sends the request and accepts it. The caller holds
-/// both accounts' `test:contact` locks from [`set_up_contact_no_add`].
+/// both accounts' `test:contact` locks ([`lock_contact`]).
 pub async fn add_contact(client: &Client, share_client: &Client) {
 	let request_uuid = client
 		.send_contact_request(share_client.email())
@@ -378,6 +397,69 @@ pub async fn add_contact(client: &Client, share_client: &Client) {
 		.accept_contact_request(request_uuid)
 		.await
 		.unwrap();
+}
+
+/// The share account as a contact of `client`, under both accounts' `test:contact` locks
+/// ([`lock_contact`], whose doc gives the lock order), which the caller holds for the whole test.
+/// Reuses the existing contact and sends a request only when there is none to reuse: the server
+/// allows a sender 30 sends per hour, and counts a send between accounts that are already
+/// contacts. Use this unless the test exercises the contact-request flow, which takes
+/// [`set_up_contact`].
+///
+/// It leaves contacts, shares and requests with other accounts alone, and never sleeps. It lifts
+/// a block between the two accounts (`chat_tests::test_blocking` leaves one), and accepts a
+/// pending request between them rather than sending another (the wasm `block` test leaves one).
+pub async fn ensure_contact(
+	client: &Client,
+	share_client: &Client,
+) -> (Contact<'static>, [Arc<ResourceLock>; 2]) {
+	let locks = lock_contact(client, share_client).await;
+	futures::join!(
+		unblock(client, share_client.email()),
+		unblock(share_client, client.email())
+	);
+	if let Some(contact) = find_contact(client, share_client.email()).await {
+		return (contact, locks);
+	}
+	if !accept_pending_request(share_client, client.email()).await
+		&& !accept_pending_request(client, share_client.email()).await
+	{
+		// Between contacts the server answers a request with the existing contact's uuid, which is
+		// no request to accept, so this runs only once the lookup above came back empty.
+		add_contact(client, share_client).await;
+	}
+	let contact = find_contact(client, share_client.email())
+		.await
+		.expect("the share account is a contact after its request was accepted");
+	(contact, locks)
+}
+
+async fn find_contact(client: &Client, email: &str) -> Option<Contact<'static>> {
+	client
+		.get_contacts()
+		.await
+		.unwrap()
+		.into_iter()
+		.find(|contact| contact.email == email)
+}
+
+/// Lifts `client`'s block of `email`, if it has one.
+async fn unblock(client: &Client, email: &str) {
+	for blocked in client.get_blocked_contacts().await.unwrap() {
+		if blocked.email == email {
+			client.unblock_contact(blocked.uuid).await.unwrap();
+		}
+	}
+}
+
+/// Accepts `client`'s pending incoming request from `email`, and says whether there was one.
+async fn accept_pending_request(client: &Client, email: &str) -> bool {
+	let requests = client.list_incoming_contact_requests().await.unwrap();
+	let Some(request) = requests.into_iter().find(|request| request.email == email) else {
+		return false;
+	};
+	client.accept_contact_request(request.uuid).await.unwrap();
+	true
 }
 
 /// Takes the account-wide `test:chats` lock, then re-reads `client`'s identity caches inside
