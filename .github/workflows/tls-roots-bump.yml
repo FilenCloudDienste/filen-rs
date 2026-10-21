@@ -1,0 +1,71 @@
+name: TLS Roots Bump
+# The native builds verify TLS against the Mozilla roots compiled in from webpki-roots, with
+# rustls-webpki doing the path building and its own distrust list, not against the OS store. A
+# CA that browsers and operating systems distrust stays trusted here until Cargo.lock moves
+# (5f02c145 was one such bump), so this checks every day for compatible releases of both and
+# opens, or refreshes, one pull request with the lockfile update.
+on:
+  schedule:
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+permissions:
+  contents: write
+  pull-requests: write
+concurrency:
+  group: tls-roots-bump
+  cancel-in-progress: false
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    name: Bump webpki-roots and rustls-webpki
+    env:
+      BRANCH: deps/tls-roots
+      # Pull requests and pushes made with the default GITHUB_TOKEN start no workflows, so the
+      # pull request would get no CI. The bot token starts them; the default one is the
+      # fallback, and then CI runs once the pull request is closed and reopened.
+      GH_TOKEN: ${{ secrets.FILEN_BOT_PAT || github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.FILEN_BOT_PAT || github.token }}
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-02-20
+      - name: Update the lockfile
+        # Cargo.lock holds more than one major of each (webpki-roots 0.26 is a shim over 1.x,
+        # rustls-webpki 0.102 comes with the rustls 0.22 dev graph), and a bare `-p name` is
+        # ambiguous then, so update every locked version by its own spec. Each moves only
+        # within its semver range.
+        run: |
+          for name in webpki-roots rustls-webpki; do
+            for version in $(awk -v n="$name" '
+              $0 == "name = \"" n "\"" { found = 1; next }
+              found && /^version = / { gsub(/"/, "", $3); print $3; found = 0 }
+            ' Cargo.lock); do
+              cargo update -p "$name@$version"
+            done
+          done
+      - name: Open or refresh the pull request
+        run: |
+          if git diff --quiet -- Cargo.lock; then
+            echo "webpki-roots and rustls-webpki are current"
+            exit 0
+          fi
+          git diff -- Cargo.lock
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git switch -c "$BRANCH"
+          git add Cargo.lock
+          git commit -q -F - <<'EOF'
+          build(deps): update webpki-roots and rustls-webpki
+
+          The native builds trust the roots compiled in from webpki-roots, and
+          rustls-webpki carries the distrust list, so a root store change
+          reaches users only through this lockfile.
+          EOF
+          git push --force origin "$BRANCH"
+          if [ -z "$(gh pr list --head "$BRANCH" --state open --json number --jq '.[].number')" ]; then
+            gh pr create --base main --head "$BRANCH" \
+              --title 'build(deps): update webpki-roots and rustls-webpki' \
+              --body 'Scheduled update of the bundled TLS roots (`webpki-roots`) and of `rustls-webpki`, within their semver ranges. Check the upstream changelogs for added or removed roots and distrust entries before merging.'
+          fi
