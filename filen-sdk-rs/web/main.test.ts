@@ -750,8 +750,10 @@ test("Zip Download", async () => {
 })
 
 /// The share account as a contact of the main one, whatever state an earlier test left the
-/// pair in: already contacts, a request from the main account still pending (the "block"
-/// test ends that way), or nothing yet.
+/// pair in: already contacts (the shared/linked thumbnail test ends that way, so the next
+/// browser's run starts there), a request from the main account still pending (the "block"
+/// test ends that way), or nothing yet. Only the last sends a request: the server allows a
+/// sender 30 per hour, and counts one sent between accounts that are already contacts.
 async function ensureShareContact() {
 	const shareEmail = import.meta.env.VITE_TEST_SHARE_EMAIL!
 	const existing = (await state.getContacts()).find(c => c.email === shareEmail)
@@ -774,11 +776,11 @@ async function ensureShareContact() {
 	return contact
 }
 
-/// Every native leg holds `test:contact` for minutes at a time (test-utils'
-/// `set_up_contact_no_add` settles for 300 s under it), so a contact test can queue for over an
-/// hour behind them: it gets an explicit timeout, and its lock waits give up within it. A test
-/// that times out while still polling would otherwise take the lock later anyway and run under
-/// whichever test comes next.
+/// The native legs hold `test:contact` while they use the contact, `socket_tests::chat` for over
+/// five minutes (test-utils' `set_up_contact_no_add` settles for 300 s under it), so a contact
+/// test can queue behind them for a long time: it gets an explicit timeout, and its lock waits
+/// give up within it. A test that times out while still polling would otherwise take the lock
+/// later anyway and run under whichever test comes next.
 const CONTACT_TEST_TIMEOUT = cap(600_000)
 const CONTACT_LOCK = {
 	resource: "test:contact",
@@ -1240,9 +1242,10 @@ test("thumbnail verdicts are distinguishable", async () => {
 /// that last one through the `UnauthClient`, which is all a link viewer has. The Rust side
 /// used to accept the drive shape only, and `canMakeThumbnail` existed on it only.
 test("thumbnails and previews for shared and linked files", { timeout: CONTACT_TEST_TIMEOUT }, async () => {
-	// The native suites reset contacts and shares on BOTH accounts under this lock (test-utils'
-	// set_up_contact_no_add), and the nightly runs them alongside this suite — main account
-	// first, then the share account, the order they take it in.
+	// The native suites use the contact and its shares under this lock, and socket_tests::chat
+	// resets contacts and shares on BOTH accounts under it (test-utils' set_up_contact_no_add);
+	// the nightly runs them alongside this suite — main account first, then the share account,
+	// the order they take it in.
 	using _contactLock = await state.acquireLock(CONTACT_LOCK)
 	using _shareContactLock = await shareClient.acquireLock(CONTACT_LOCK)
 	const dir = await state.createDir(testDir, "any-file-thumbs")
@@ -1260,63 +1263,59 @@ test("thumbnails and previews for shared and linked files", { timeout: CONTACT_T
 	expectThumbnail(await state.makeThumbnailInMemory({ file: linked, ...size }))
 
 	// Shared with a contact: the file directly (a `SharedFile` at their shared-in root) and
-	// its folder (a stable-id-less `File` in that folder's listing).
+	// its folder (a stable-id-less `File` in that folder's listing). The contact is left in
+	// place: deleting it would make the next ensureShareContact send a fresh request.
 	const contact = await ensureShareContact()
-	try {
-		await state.shareFile(parrot, contact)
-		await state.shareDir(dir, contact, () => {})
-		const inShared = await shareClient.listInShared()
-		const sharedFile = inShared.files.find(f => f.uuid === parrot.uuid)
-		expect(sharedFile).toBeDefined()
-		expect(sharedFile!.canMakeThumbnail).toBe(true)
-		expectThumbnail(await shareClient.makeThumbnailInMemory({ file: sharedFile!, ...size }))
+	await state.shareFile(parrot, contact)
+	await state.shareDir(dir, contact, () => {})
+	const inShared = await shareClient.listInShared()
+	const sharedFile = inShared.files.find(f => f.uuid === parrot.uuid)
+	expect(sharedFile).toBeDefined()
+	expect(sharedFile!.canMakeThumbnail).toBe(true)
+	expectThumbnail(await shareClient.makeThumbnailInMemory({ file: sharedFile!, ...size }))
 
-		const sharedDir = inShared.dirs.find(d => d.inner.uuid === dir.uuid)
-		expect(sharedDir).toBeDefined()
-		const listed = (await shareClient.listSharedDir(sharedDir!, sharedDir!.sharingRole)).files.find(f => f.uuid === parrot.uuid)
-		expect(listed).toBeDefined()
-		expect(listed!.stableUUID).toBeUndefined()
-		expect(listed!.canMakeThumbnail).toBe(true)
-		expectThumbnail(await shareClient.makeThumbnailInMemory({ file: listed!, ...size }))
+	const sharedDir = inShared.dirs.find(d => d.inner.uuid === dir.uuid)
+	expect(sharedDir).toBeDefined()
+	const listed = (await shareClient.listSharedDir(sharedDir!, sharedDir!.sharingRole)).files.find(f => f.uuid === parrot.uuid)
+	expect(listed).toBeDefined()
+	expect(listed!.stableUUID).toBeUndefined()
+	expect(listed!.canMakeThumbnail).toBe(true)
+	expectThumbnail(await shareClient.makeThumbnailInMemory({ file: listed!, ...size }))
 
-		// The embedded preview through the same shapes, on a RAW fixture: linked (unauth) and
-		// shared. Skipped, like the RAW test, when the volunteer-run library is unreachable.
-		const fixture = RAW_FIXTURES.find(f => f.name === "7008.RW2")!
-		const res = await fetch(`raw-fixtures/${fixture.name}/${fixture.path}`)
-		if (!res.ok) {
-			console.warn(`SKIP preview half: ${res.status} from the fixture cache`)
-			return
-		}
-		const bytes = new Uint8Array(await res.arrayBuffer())
-		expect(await sha256Hex(bytes)).toBe(fixture.sha256)
-		const raw = await state.uploadFile(bytes, { parent: dir, name: `any-${fixture.name}` })
-		const rawLink = await state.publicLinkFile(raw)
-		const rawLinked = await unauthClient.getLinkedFile(rawLink.linkUuid, getFileMeta(raw.meta)!.key, null)
-		await state.shareFile(raw, contact)
-		const rawShared = (await shareClient.listInShared()).files.find(f => f.uuid === raw.uuid)
-		expect(rawShared).toBeDefined()
-		const root = await navigator.storage.getDirectory()
-		const previews: [string, Client | UnauthClient, AnyFile][] = [
-			["linked", unauthClient, rawLinked],
-			["shared", shareClient, rawShared!]
-		]
-		for (const [label, client, file] of previews) {
-			const opfsName = `any-${label}-${fixture.name}.preview.jpg`
-			const { result, written } = await writePreviewToOpfs(file, opfsName, client)
-			try {
-				expect(result.type, `${label} preview verdict`).toBe("preview")
-				if (result.type !== "preview") {
-					throw new Error("unreachable")
-				}
-				expect({ width: result.width, height: result.height }).toEqual(fixture.preview)
-				expect(written.size).toBe(Number(result.bytes))
-			} finally {
-				await root.removeEntry(opfsName)
+	// The embedded preview through the same shapes, on a RAW fixture: linked (unauth) and
+	// shared. Skipped, like the RAW test, when the volunteer-run library is unreachable.
+	const fixture = RAW_FIXTURES.find(f => f.name === "7008.RW2")!
+	const res = await fetch(`raw-fixtures/${fixture.name}/${fixture.path}`)
+	if (!res.ok) {
+		console.warn(`SKIP preview half: ${res.status} from the fixture cache`)
+		return
+	}
+	const bytes = new Uint8Array(await res.arrayBuffer())
+	expect(await sha256Hex(bytes)).toBe(fixture.sha256)
+	const raw = await state.uploadFile(bytes, { parent: dir, name: `any-${fixture.name}` })
+	const rawLink = await state.publicLinkFile(raw)
+	const rawLinked = await unauthClient.getLinkedFile(rawLink.linkUuid, getFileMeta(raw.meta)!.key, null)
+	await state.shareFile(raw, contact)
+	const rawShared = (await shareClient.listInShared()).files.find(f => f.uuid === raw.uuid)
+	expect(rawShared).toBeDefined()
+	const root = await navigator.storage.getDirectory()
+	const previews: [string, Client | UnauthClient, AnyFile][] = [
+		["linked", unauthClient, rawLinked],
+		["shared", shareClient, rawShared!]
+	]
+	for (const [label, client, file] of previews) {
+		const opfsName = `any-${label}-${fixture.name}.preview.jpg`
+		const { result, written } = await writePreviewToOpfs(file, opfsName, client)
+		try {
+			expect(result.type, `${label} preview verdict`).toBe("preview")
+			if (result.type !== "preview") {
+				throw new Error("unreachable")
 			}
+			expect({ width: result.width, height: result.height }).toEqual(fixture.preview)
+			expect(written.size).toBe(Number(result.bytes))
+		} finally {
+			await root.removeEntry(opfsName)
 		}
-	} finally {
-		// Best effort: a throw here would replace the assertion that actually failed.
-		await state.deleteContact(contact.uuid).catch(e => console.warn("deleteContact cleanup failed", e))
 	}
 })
 
