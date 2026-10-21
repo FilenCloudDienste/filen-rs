@@ -126,7 +126,6 @@ rand = "0.9.2"
 siphasher = "1"
 old_rng = { package = "rand", version = "0.8.5" } # for compatibility with rsa 0.9.8
 aes-gcm = { version = "0.10.3", features = ["std"] }
-generic-array = "1.4.2"
 thiserror = "2.0.14"
 base64 = "0.22.1"
 pbkdf2 = { version = "0.12.2", features = ["std", "sha2"] }
@@ -143,7 +142,6 @@ serde = "1.0.219"
 serde_json = "1.0.142"
 hex = { package = "const-hex", version = "1.18.1", features = ["serde"] }
 argon2 = { version = "0.5.3", features = ["std"] }
-serde_path_to_error = "0.1.17"
 sha1 = "0.10.6"
 futures = "0.3.31"
 # Waiting until https://github.com/abonander/mime_guess/pull/101 is in a released version
@@ -292,7 +290,6 @@ tracing-oslog = "0.3"
 
 # native (not wasm) only dependencies
 [target.'cfg(not(all(target_family = "wasm", target_os = "unknown")))'.dependencies]
-hyper-util = { version = "0.1.16", features = ["client-legacy"] }
 # fmt layer (span busy/idle timing) is native-only; LogTracer captures `log` records
 # emitted by deps (reqwest, tokio-tungstenite) into the tracing pipeline.
 tracing-subscriber = { version = "0.3", default-features = false, features = [

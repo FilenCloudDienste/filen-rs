@@ -1180,12 +1180,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "comma"
-version = "1.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "55b672471b4e9f9e95499ea597ff64941a309b2cdbffcc46f2cc5e2d971fd335"
-
-[[package]]
 name = "compact_str"
 version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1977,29 +1971,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "env_filter"
-version = "0.1.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "186e05a59d4c50738528153b83b0b0194d3a29507dfec16eccd4b342903397d0"
-dependencies = [
- "log",
- "regex",
-]
-
-[[package]]
-name = "env_logger"
-version = "0.11.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "13c863f0904021b108aa8b2f55046443e6b1ebde8fd4a15c399893aae4fa069f"
-dependencies = [
- "anstream",
- "anstyle",
- "env_filter",
- "jiff",
- "log",
-]
-
-[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2125,14 +2096,12 @@ dependencies = [
  "base64",
  "chrono",
  "clap",
- "clap_builder",
  "clap_complete",
  "comrak",
  "console 0.16.4",
  "ctrlc",
  "dirs",
  "dotenv",
- "env_logger",
  "filen-macros",
  "filen-rclone-wrapper",
  "filen-sdk-rs",
@@ -2151,7 +2120,6 @@ dependencies = [
  "rand 0.9.2",
  "regex",
  "reqwest",
- "rexpect",
  "self-replace",
  "semver",
  "serde",
@@ -2194,7 +2162,6 @@ dependencies = [
  "jni",
  "lazy_static",
  "libsqlite3-sys",
- "once_cell",
  "rand 0.9.2",
  "rusqlite",
  "serde",
@@ -2264,7 +2231,6 @@ dependencies = [
  "flate2",
  "futures",
  "futures-timer",
- "generic-array 1.4.2",
  "getrandom 0.2.16",
  "getrandom 0.4.2",
  "governor",
@@ -2274,7 +2240,6 @@ dependencies = [
  "http",
  "http-body",
  "http-body-util",
- "hyper-util",
  "ignore",
  "image",
  "imap",
@@ -2317,7 +2282,6 @@ dependencies = [
  "serde-wasm-bindgen",
  "serde_bytes",
  "serde_json",
- "serde_path_to_error",
  "sevenz-rust2",
  "sha1 0.10.6",
  "sha2 0.10.9",
@@ -2378,7 +2342,6 @@ dependencies = [
  "rsa",
  "rusqlite",
  "serde",
- "serde_bytes",
  "serde_json",
  "serde_repr",
  "sha2 0.10.9",
@@ -3589,30 +3552,6 @@ name = "jetscii"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47f142fe24a9c9944451e8349de0a56af5f3e7226dc46f3ed4d4ecc0b85af75e"
-
-[[package]]
-name = "jiff"
-version = "0.2.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "be1f93b8b1eb69c77f24bbb0afdf66f54b632ee39af40ca21c4365a1d7347e49"
-dependencies = [
- "jiff-static",
- "log",
- "portable-atomic",
- "portable-atomic-util",
- "serde",
-]
-
-[[package]]
-name = "jiff-static"
-version = "0.2.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "03343451ff899767262ec32146f6d559dd759fdadf42ff0e227c7c48f72594b4"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.106",
-]
 
 [[package]]
 name = "jni"
@@ -5140,15 +5079,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f84267b20a16ea918e43c6a88433c2d54fa145c92a811b5b047ccbe153674483"
 
 [[package]]
-name = "portable-atomic-util"
-version = "0.2.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d8a2f0d8d040d7848a709caf78912debcc3f33ee4b3cac47d73d1e1069e83507"
-dependencies = [
- "portable-atomic",
-]
-
-[[package]]
 name = "portable-pty"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5793,19 +5723,6 @@ dependencies = [
  "svgtypes",
  "tiny-skia",
  "usvg",
-]
-
-[[package]]
-name = "rexpect"
-version = "0.6.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2c1bcd4ac488e9d2d726d147031cceff5cff6425011ff1914049739770fa4726"
-dependencies = [
- "comma",
- "nix 0.30.1",
- "regex",
- "tempfile",
- "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -7615,7 +7532,6 @@ dependencies = [
  "cargo_metadata",
  "clap",
  "uniffi_bindgen",
- "uniffi_build",
  "uniffi_core",
  "uniffi_macros",
  "uniffi_pipeline",
@@ -7659,17 +7575,6 @@ dependencies = [
  "uniffi_meta",
  "uniffi_pipeline",
  "uniffi_udl",
-]
-
-[[package]]
-name = "uniffi_build"
-version = "0.29.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6683e6b665423cddeacd89a3f97312cf400b2fb245a26f197adaf65c45d505b2"
-dependencies = [
- "anyhow",
- "camino",
- "uniffi_bindgen",
 ]
 
 [[package]]
