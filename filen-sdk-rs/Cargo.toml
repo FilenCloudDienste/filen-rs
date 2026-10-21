@@ -301,7 +301,6 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
 tracing-log = "0.2"
 microthumb = { path = "../microthumb", features = ["svg"] }
 tokio-tungstenite = { version = "0.28.0", features = [
-	"rustls",
 	"rustls-tls-webpki-roots",
 ] }
 tungstenite = { version = "0.28.0", features = ["rustls-tls-webpki-roots"] }
@@ -329,7 +328,6 @@ napi = { version = "3.12.6", default-features = false, features = [
 # At least 3.6.12: earlier 3.6 releases accept napi-derive-backend 6.1.5, which moved to syn 3
 # and no longer builds with them.
 napi-derive = { version = "3.6.12", optional = true }
-tokio-rustls = { version = "0.26.4", default-features = false }
 walkdir = "2.5.0"
 # The sync engine's walk tells a directory loop as `walkdir` does, with the same crate (already
 # locked as `walkdir`'s own dependency).

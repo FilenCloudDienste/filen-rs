@@ -2329,7 +2329,6 @@ dependencies = [
  "test-utils",
  "thiserror 2.0.20",
  "tokio",
- "tokio-rustls",
  "tokio-stream",
  "tokio-tungstenite",
  "tokio-util",
