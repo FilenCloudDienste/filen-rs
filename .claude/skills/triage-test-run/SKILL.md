@@ -1,6 +1,6 @@
 ---
 name: triage-test-run
-description: Diagnose a red GitHub Actions run of this repo — the nightly `Tests` matrix (six native legs, test-wasm, test-2fa) or `Continuous Integration` — from a run id / URL or "why was last night red". Fetches every leg's log, parses the failures, groups them by root cause, investigates + live-confirms + adversarially refutes each cause with a fixed Sonnet/Opus/Fable workflow, and delivers a table (issue, kind, failures caused, legs, recurrence, confirmed?, suggested fix, complexity, blocks CI / owner) with per-issue details. Diagnosis only — fixes are suggested, never applied.
+description: Diagnose a red GitHub Actions run of this repo — the nightly `Tests` matrix (six native legs, test-wasm, test-2fa) or `Continuous Integration` — from a run id / URL or "why was last night red". Fetches every leg's log, parses the failures, groups them by root cause, investigates + live-confirms + adversarially refutes each cause with a fixed Sonnet/Opus workflow, and delivers a table (issue, kind, failures caused, legs, recurrence, confirmed?, suggested fix, complexity, blocks CI / owner) with per-issue details. Diagnosis only — fixes are suggested, never applied.
 ---
 
 # Triage a test run
@@ -31,8 +31,8 @@ Every step below names absolute paths. `$S` is the session scratchpad, `$R` the 
   a fixed sleep — those are `test` rows with a fix, never "transient". The one exemption is genuine
   server rate limiting (`rate_limited`), a `backend` row.
 - The workflow's model split is fixed in the script and matches the owner's rule: investigators and
-  the anomaly scan on Sonnet, live confirmation and the judge on Opus, refuters on Fable. Do not
-  launch it with inherited models, do not put Fable on bulk work.
+  the anomaly scan on Sonnet, live confirmation and the judge on Opus, refuters on Opus. Do not
+  launch it with inherited models, never put Fable in it (it is reserved for the main session).
 - Live confirmation (local reruns, read-only probes, mutating probes with cleanup) is allowed by
   default; the owner can restrict it per run through `args.allow`. Every probe is a throwaway file,
   deleted, with `git status --porcelain` proving it.
@@ -167,7 +167,7 @@ sitting on unpushed branches).
 
 Shape: `Investigate` (one Sonnet agent per cluster, plus one whole-run anomaly scan against the
 baseline) → `Confirm` (Opus, **serialized**: one cluster at a time may touch the shared test account;
-skipped when the plan is `none`/`source_only` or the kind is not allowed) → `Refute` (three Fable
+skipped when the plan is `none`/`source_only` or the kind is not allowed) → `Refute` (three Opus
 lenses per cluster: evidence, fix, classification; default refuted when a load-bearing claim cannot be
 verified) → `Synthesize` (Opus judge: merges/splits, priority, one row per mechanism). About five
 agents per cluster plus two: the 09-08 dry run (4 clusters) took 22 agents, 76 min and ~3 M tokens,

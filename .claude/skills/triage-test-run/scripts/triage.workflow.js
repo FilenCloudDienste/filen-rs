@@ -4,7 +4,7 @@ export const meta = {
   phases: [
     { title: 'Investigate', detail: 'one Sonnet investigator per cluster + one whole-run anomaly scan', model: 'sonnet' },
     { title: 'Confirm', detail: 'live confirmation (local rerun / probes), one cluster at a time on the shared account', model: 'opus' },
-    { title: 'Refute', detail: 'three Fable refuters per cluster: evidence, fix, classification', model: 'fable' },
+    { title: 'Refute', detail: 'three Opus refuters per cluster: evidence, fix, classification', model: 'opus' },
     { title: 'Synthesize', detail: 'Opus judge merges everything into the report rows', model: 'opus' },
   ],
 }
@@ -448,7 +448,7 @@ const perCluster = await pipeline(
   (r, c) => {
     if (!r) return null
     return parallel(Object.keys(LENSES).map((lens) => () =>
-      agent(refutePrompt(c, r.inv, r.conf, lens), { label: `refute:${c.id}:${lens}`, phase: 'Refute', model: 'fable', schema: REFUTE_SCHEMA })))
+      agent(refutePrompt(c, r.inv, r.conf, lens), { label: `refute:${c.id}:${lens}`, phase: 'Refute', model: 'opus', schema: REFUTE_SCHEMA })))
       .then((refs) => ({ cluster: c, investigation: r.inv, confirmation: r.conf, refutations: refs.filter(Boolean) }))
   },
 )
