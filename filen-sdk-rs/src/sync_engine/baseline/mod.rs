@@ -52,7 +52,13 @@ use super::{
 /// those reads seek, and the counts table the triggers keep. A version-2 file has none of them, so
 /// every one of those reads would fail on it — or, where a column happened to exist, read it as
 /// something it never recorded.
-const SCHEMA_VERSION: i64 = 3;
+///
+/// Moved to 4 when a pair began carrying the last synced state of the filen-sync pair it replaced
+/// (`legacy_synced`, see [`SCHEMA`] and [`SyncEngine::import_legacy_state`]). A version-3 file has
+/// no table for it, so the import, and every pass that weighs what it imported, would fail on it.
+///
+/// [`SyncEngine::import_legacy_state`]: super::SyncEngine::import_legacy_state
+const SCHEMA_VERSION: i64 = 4;
 
 /// Schema for the baseline DB, created whole on a fresh DB. `foreign_keys`, `synchronous` and the
 /// busy timeout are applied per-connection in [`BaselineStore::init`] (they reset on every open);
@@ -66,6 +72,12 @@ const SCHEMA_VERSION: i64 = 3;
 ///
 /// `user_ignore` holds the device-wide user ignore patterns: one row at most, shared by every pair,
 /// so it cascades with nothing.
+///
+/// `legacy_synced` is what the filen-sync pair a pair replaced last recorded as synced, imported
+/// from that engine's state files (see [`legacy`](super::legacy)): per path, the remote version it
+/// last listed there and the size and mtime (unix millis) the local file had then. It is evidence
+/// for a path with no `baseline` row and nothing else; it cascades with its pair, and the
+/// `AUTOINCREMENT` id below means it can never attach to a later pair.
 ///
 /// `sync_pairs.id` is `AUTOINCREMENT` for one reason: a removed pair's id must never come back. A
 /// watch loop finishes the pass it is in when its pair is removed, and that pass goes on writing
@@ -208,6 +220,15 @@ CREATE TABLE IF NOT EXISTS ignored_roots (
 	rel_path TEXT NOT NULL,
 	PRIMARY KEY (pair_id, rel_path)
 );
+
+CREATE TABLE IF NOT EXISTS legacy_synced (
+	pair_id INTEGER NOT NULL REFERENCES sync_pairs (id) ON DELETE CASCADE,
+	rel_path TEXT NOT NULL,
+	remote_uuid BLOB NOT NULL,
+	size INTEGER NOT NULL,
+	local_mtime INTEGER NOT NULL,
+	PRIMARY KEY (pair_id, rel_path)
+) WITHOUT ROWID;
 ";
 
 /// Objects added to the schema after version 1 was first written, created on EVERY open rather
@@ -262,6 +283,68 @@ const UPSERT_ENTRY: &str = "INSERT OR REPLACE INTO baseline
 	 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18,
 	  ?19)";
 const DELETE_ENTRY: &str = "DELETE FROM baseline WHERE pair_id = ?1 AND rel_path = ?2";
+
+/// The two tables [`BaselineStore::replace_legacy_synced`] stages a filen-sync pair's trees in.
+/// `TEMP`, so they are this connection's alone and live in SQLite's temporary database rather than
+/// the baseline file: filling them takes no lock another pair's writes wait on, however large the
+/// trees are. Dropped first, in case a failed drop left one behind.
+const LEGACY_STAGE: &str = "
+DROP TABLE IF EXISTS temp.legacy_local;
+DROP TABLE IF EXISTS temp.legacy_remote;
+CREATE TEMP TABLE legacy_local (
+	rel_path TEXT PRIMARY KEY,
+	raw TEXT NOT NULL,
+	is_file INTEGER NOT NULL,
+	size INTEGER,
+	mtime INTEGER,
+	ambiguous INTEGER NOT NULL DEFAULT 0
+) WITHOUT ROWID;
+CREATE TEMP TABLE legacy_remote (
+	rel_path TEXT PRIMARY KEY,
+	raw TEXT NOT NULL,
+	is_file INTEGER NOT NULL,
+	size INTEGER,
+	uuid BLOB,
+	ambiguous INTEGER NOT NULL DEFAULT 0
+) WITHOUT ROWID;
+";
+
+const LEGACY_UNSTAGE: &str = "
+DROP TABLE IF EXISTS temp.legacy_local;
+DROP TABLE IF EXISTS temp.legacy_remote;
+";
+
+/// One item into its tree's stage. The same raw path again replaces the item, as the old reader
+/// let the last line for a path win; a different raw path at the same NFC path marks it ambiguous
+/// for good. Every `SET` expression reads the row as it was before the update, so `ambiguous`
+/// compares the spelling already held with the new one.
+const LEGACY_PUT_LOCAL: &str = "INSERT INTO temp.legacy_local (rel_path, raw, is_file, size, mtime)
+	 VALUES (?1, ?2, ?3, ?4, ?5)
+	 ON CONFLICT (rel_path) DO UPDATE SET
+	  ambiguous = ambiguous OR raw <> excluded.raw,
+	  raw = excluded.raw, is_file = excluded.is_file, size = excluded.size, mtime = excluded.mtime";
+const LEGACY_PUT_REMOTE: &str =
+	"INSERT INTO temp.legacy_remote (rel_path, raw, is_file, size, uuid)
+	 VALUES (?1, ?2, ?3, ?4, ?5)
+	 ON CONFLICT (rel_path) DO UPDATE SET
+	  ambiguous = ambiguous OR raw <> excluded.raw,
+	  raw = excluded.raw, is_file = excluded.is_file, size = excluded.size, uuid = excluded.uuid";
+
+/// The staged trees joined into `legacy_synced`: a path both trees list as the same file, the
+/// remote with a version and the local with an mtime, at the same size in both. That both trees
+/// agree is what "the old engine recorded it as synced" is read as here — stricter than any one
+/// tree, never looser, so a path either tree is unsure of imports nothing.
+///
+/// The two trees also have to spell the path the same way, byte for byte. The old engine keyed and
+/// compared both by the raw path, so a local NFD `café.txt` and a remote NFC one were two paths to
+/// it, never one it had synced; the NFC key alone would pair them.
+const LEGACY_JOIN: &str =
+	"INSERT INTO legacy_synced (pair_id, rel_path, remote_uuid, size, local_mtime)
+	 SELECT ?1, r.rel_path, r.uuid, r.size, l.mtime
+	 FROM temp.legacy_remote r JOIN temp.legacy_local l ON l.rel_path = r.rel_path
+	 WHERE l.raw = r.raw
+	  AND r.is_file = 1 AND l.is_file = 1 AND r.ambiguous = 0 AND l.ambiguous = 0
+	  AND r.uuid IS NOT NULL AND l.mtime IS NOT NULL AND r.size = l.size";
 
 /// The id seek [`BaselineStore::synced_paths`] runs against `column`: one `IN` list of exactly
 /// [`SYNCED_CHUNK`] placeholders, so the text is the same on every call and `prepare_cached` plans
@@ -621,6 +704,34 @@ pub(crate) type DropRow<'a> = dyn FnMut(&str) -> rusqlite::Result<()> + 'a;
 /// whole-tree push, a row per item of the tree.
 pub(crate) type PutRow<'a> = dyn FnMut(&BaselineEntry) -> rusqlite::Result<()> + 'a;
 
+/// One item of a filen-sync tree, as [`BaselineStore::replace_legacy_synced`] stages it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LegacyItem<'a> {
+	/// The NFC path the item is at, keyed as the scan keys a local path.
+	pub(crate) rel_path: &'a str,
+	/// The path exactly as the tree spelled it. Two spellings of one `rel_path` (an NFC and an NFD
+	/// name, say) make the path ambiguous, and an ambiguous path is imported from neither.
+	pub(crate) raw: &'a str,
+	pub(crate) is_file: bool,
+	/// Bytes.
+	pub(crate) size: Option<i64>,
+	pub(crate) side: LegacySide,
+}
+
+/// Which of the two filen-sync trees a [`LegacyItem`] is from, with what only that tree records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LegacySide {
+	/// `previousLocalTree`: the local file's mtime as that engine last saw it, in unix millis.
+	Local { mtime: Option<i64> },
+	/// `previousRemoteTree`: the remote version that engine last listed at the path.
+	Remote { uuid: Option<Uuid> },
+}
+
+/// What stages one item of a filen-sync tree: the visitor
+/// [`BaselineStore::replace_legacy_synced`] hands its caller, which streams a tree of any size
+/// through it a line at a time.
+pub(crate) type PutLegacy<'a> = dyn FnMut(&LegacyItem<'_>) -> rusqlite::Result<()> + 'a;
+
 /// A registered sync pair, as returned by [`SyncEngine::list_pairs`](super::SyncEngine::list_pairs).
 #[derive(Debug, Clone, PartialEq)]
 pub struct PairRecord {
@@ -753,6 +864,19 @@ fn keep_first(slot: &mut Option<String>, rel_path: &str, what: &str) {
 /// chunk is padded by repeating an id it already holds, which matches the same rows and costs one
 /// extra seek rather than a second statement shape.
 const SYNCED_CHUNK: usize = 64;
+
+/// The staging tables of [`BaselineStore::replace_legacy_synced`], dropped with this however the
+/// import ends. A failed drop is logged and costs only the temporary database's space until the
+/// next import drops them first, or the connection closes.
+struct LegacyStage<'c>(&'c Connection);
+
+impl Drop for LegacyStage<'_> {
+	fn drop(&mut self) {
+		if let Err(error) = self.0.execute_batch(LEGACY_UNSTAGE) {
+			tracing::warn!("baseline store: could not drop the filen-sync staging tables: {error}");
+		}
+	}
+}
 
 /// The baseline DB handle (sole owner / single writer).
 ///
@@ -1838,6 +1962,70 @@ impl BaselineStore {
 			self.upsert_entry_once(pair, row)?;
 		}
 		tx.commit()
+	}
+
+	/// Replace what `pair` holds of the filen-sync state it was migrated from with the two trees
+	/// `items` stages, and return how many paths that imported.
+	///
+	/// The trees are staged in two `TEMP` tables (see [`LEGACY_STAGE`]) in one transaction, which
+	/// writes nothing to the baseline file, and then joined into `legacy_synced` in a second, whose
+	/// first statement drops what the pair held before. So the baseline file's write lock is held
+	/// for the join alone, and an error out of `items` leaves the pair's rows exactly as they were.
+	/// Memory stays flat whatever the size of the trees: they are streamed through the visitor.
+	pub(crate) fn replace_legacy_synced<E: From<rusqlite::Error>>(
+		&self,
+		pair: PairId,
+		items: impl FnOnce(&mut PutLegacy<'_>) -> Result<(), E>,
+	) -> Result<u64, E> {
+		self.conn.execute_batch(LEGACY_STAGE)?;
+		// Declared before either transaction, so it drops after both: a drop inside one that then
+		// rolls back would bring the tables back.
+		let _staged = LegacyStage(&self.conn);
+		{
+			let tx = self.conn.unchecked_transaction()?;
+			let mut local = self.conn.prepare(LEGACY_PUT_LOCAL)?;
+			let mut remote = self.conn.prepare(LEGACY_PUT_REMOTE)?;
+			items(&mut |item| {
+				match item.side {
+					LegacySide::Local { mtime } => local.execute(params![
+						item.rel_path,
+						item.raw,
+						item.is_file,
+						item.size,
+						mtime
+					])?,
+					LegacySide::Remote { uuid } => remote.execute(params![
+						item.rel_path,
+						item.raw,
+						item.is_file,
+						item.size,
+						uuid
+					])?,
+				};
+				Ok(())
+			})?;
+			drop((local, remote));
+			tx.commit()?;
+		}
+		let tx = self.conn.unchecked_transaction()?;
+		self.conn.execute(
+			"DELETE FROM legacy_synced WHERE pair_id = ?1",
+			params![pair],
+		)?;
+		let imported = self.conn.execute(LEGACY_JOIN, params![pair])?;
+		tx.commit()?;
+		Ok(u64::try_from(imported).expect("a row count fits in a u64 (should be impossible)"))
+	}
+
+	/// How many paths `pair` holds imported filen-sync state for, for the tests that read it back.
+	#[cfg(test)]
+	pub(crate) fn legacy_synced_count(&self, pair: PairId) -> rusqlite::Result<u64> {
+		let count: i64 = self.conn.query_row(
+			"SELECT COUNT(*) FROM legacy_synced WHERE pair_id = ?1",
+			params![pair],
+			|row| row.get(0),
+		)?;
+		u64::try_from(count).map_err(|_| corrupt("legacy_synced count", count))
 	}
 
 	/// [`apply_changes`](Self::apply_changes) for a local directory deletion that carries other

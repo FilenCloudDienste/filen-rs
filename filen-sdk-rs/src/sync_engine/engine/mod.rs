@@ -41,6 +41,7 @@ use super::{
 		IgnoreDecision, IgnoreLevel, IgnoreRules, IgnoreSource, IgnoredPath, Origin, RemoteRules,
 		RuleCandidates, load_remote_rules, parse_user_ignore, rule_file_dir, rule_file_paths,
 	},
+	legacy::{self, LegacyImport},
 	observe::{self, LocalObservation, LocalObservations},
 	outcome::{
 		PlanOutcome, PlannedAction, PlannedConflict, PlannedNodeKind, RefuseReason, UnsyncablePath,
@@ -3382,6 +3383,58 @@ impl SyncEngine {
 			.force(FullPassReason::FirstPass);
 		self.observe_pair(pair, remote_root).await;
 		Ok(pair)
+	}
+
+	/// Import what the filen-sync pair `pair` replaces last recorded as synced, from that pair's
+	/// state directory: `<dbPath>/state/v2/<pairUuid>/` of the old engine, which the caller resolves.
+	/// Only its `previousLocalTree` and `previousRemoteTree` are read (see [`LegacyImport`] for
+	/// what is counted).
+	///
+	/// Call it after [`add_pair`](Self::add_pair) and before the pair's first pass. What it imports
+	/// is evidence for the paths this engine has no baseline row for, so it is refused once the
+	/// pair has any row: by then the pair's own rows are the better record. A second import before
+	/// that replaces the first. A state directory without both tree files is the old engine's own
+	/// "nothing saved", and imports nothing.
+	///
+	/// Waits for a pass still reading the pair, as [`resolve_conflict`](Self::resolve_conflict)
+	/// does. A pass that read the pair before the import does not see it; its apply may then write
+	/// rows after the import found none, which only leaves the evidence unused at those paths.
+	///
+	/// Errors if the pair is unknown, is being removed or has a baseline row, if `state_dir` is not
+	/// a directory that can be read or a tree file in it cannot be read to the end
+	/// ([`ErrorKind::IO`]), or if the store write fails.
+	pub async fn import_legacy_state(
+		&self,
+		pair: PairId,
+		state_dir: PathBuf,
+	) -> Result<LegacyImport, Error> {
+		// The gate refuses an unknown pair and keeps a removal waiting; the reading lock keeps the
+		// import out of a pass's read. The retirement is read after the lock, as
+		// `resolve_conflict` reads it.
+		let gate = self.pass_gate(pair).await?;
+		let _reading = self.reading_lock(pair).await.lock_owned().await;
+		if gate.retired() {
+			return Err(being_removed(pair));
+		}
+		let store = self.pair_store(pair).await?;
+		// Off the runtime thread: the trees run to a line per item of the old pair.
+		off_store(&store, move |store| {
+			let synced = !store
+				.baseline(pair)
+				.map_err(|e| db_error(e, "reading the sync baseline"))?
+				.is_empty();
+			if synced {
+				return Err(Error::custom(
+					ErrorKind::InvalidState,
+					format!(
+						"sync pair {pair} has already synced: filen-sync state is imported only \
+						 before its first pass"
+					),
+				));
+			}
+			legacy::import(store, pair, &state_dir)
+		})
+		.await?
 	}
 
 	/// Change `pair`'s [`SyncMode`]. The new mode applies from the NEXT pass; nothing is re-run

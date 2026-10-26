@@ -36,6 +36,8 @@ mod ignore;
 // The JS bindings' surface: the mobile one (UniFFI) and the desktop one (napi).
 #[cfg(any(feature = "uniffi", feature = "napi"))]
 mod js_impl;
+// The import of the last synced state of a filen-sync pair this engine replaces.
+mod legacy;
 mod mode;
 // The local half of a change-scoped pass: re-observe the paths the changelist names.
 mod observe;
@@ -97,6 +99,7 @@ pub use js_impl::{
 };
 #[cfg(feature = "napi")]
 pub(crate) use js_impl::{JsSyncEngine, JsSyncPlan, JsSyncWatch, SyncRefusal, sync_refusal};
+pub use legacy::LegacyImport;
 pub use mode::{Backlog, SyncMode};
 pub use outcome::{
 	HaltReason, PlanOutcome, PlannedAction, PlannedActionKind, PlannedConflict, PlannedNodeKind,

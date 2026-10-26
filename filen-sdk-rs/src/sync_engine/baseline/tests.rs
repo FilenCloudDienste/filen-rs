@@ -1112,7 +1112,7 @@ fn the_derived_columns_are_pinned_to_the_schema_version() {
 		            SCHEMA_VERSION so a file written under the old rule is refused, then move this pin";
 	assert_eq!(
 		(SCHEMA_VERSION, char::UNICODE_VERSION),
-		(3, (17, 0, 0)),
+		(4, (17, 0, 0)),
 		"{owed}"
 	);
 	// Confirmed: this helper's rows otherwise carry a marker that is not their content.
@@ -2269,4 +2269,126 @@ fn a_carried_row_that_fails_rolls_the_whole_deletion_back() {
 	);
 	assert_eq!(paths(&store), ["docs", "docs/a.txt", "docs/b.txt"]);
 	assert_eq!(pending_count(&store), 0);
+}
+
+/// Stage one file listed alike in both filen-sync trees.
+fn put_synced(
+	put: &mut PutLegacy<'_>,
+	rel_path: &str,
+	uuid: Uuid,
+	size: i64,
+	mtime: i64,
+) -> rusqlite::Result<()> {
+	put(&LegacyItem {
+		rel_path,
+		raw: rel_path,
+		is_file: true,
+		size: Some(size),
+		side: LegacySide::Local { mtime: Some(mtime) },
+	})?;
+	put(&LegacyItem {
+		rel_path,
+		raw: rel_path,
+		is_file: true,
+		size: Some(size),
+		side: LegacySide::Remote { uuid: Some(uuid) },
+	})
+}
+
+fn legacy_paths(store: &BaselineStore, pair: PairId) -> Vec<String> {
+	store
+		.conn
+		.prepare("SELECT rel_path FROM legacy_synced WHERE pair_id = ?1 ORDER BY rel_path")
+		.unwrap()
+		.query_map(params![pair], |row| row.get(0))
+		.unwrap()
+		.collect::<rusqlite::Result<_>>()
+		.unwrap()
+}
+
+#[test]
+fn a_second_filen_sync_import_replaces_the_first_and_leaves_other_pairs_alone() {
+	let store = BaselineStore::open_in_memory().unwrap();
+	let (pair, _) = store
+		.create_pair("/a", Uuid::from_u128(1), SyncMode::TwoWay)
+		.unwrap();
+	let (other, _) = store
+		.create_pair("/b", Uuid::from_u128(2), SyncMode::TwoWay)
+		.unwrap();
+	let imported = store
+		.replace_legacy_synced(other, |put| {
+			put_synced(put, "kept.txt", Uuid::from_u128(9), 1, 1)
+		})
+		.unwrap();
+	assert_eq!(imported, 1);
+
+	let imported = store
+		.replace_legacy_synced(pair, |put| {
+			put_synced(put, "old-1.txt", Uuid::from_u128(10), 1, 1)?;
+			put_synced(put, "old-2.txt", Uuid::from_u128(11), 1, 1)
+		})
+		.unwrap();
+	assert_eq!(imported, 2);
+	let imported = store
+		.replace_legacy_synced(pair, |put| {
+			put_synced(put, "new.txt", Uuid::from_u128(12), 1, 1)
+		})
+		.unwrap();
+	assert_eq!(imported, 1);
+
+	assert_eq!(legacy_paths(&store, pair), vec!["new.txt".to_owned()]);
+	assert_eq!(store.legacy_synced_count(pair).unwrap(), 1);
+	assert_eq!(legacy_paths(&store, other), vec!["kept.txt".to_owned()]);
+}
+
+#[test]
+fn a_failed_filen_sync_import_leaves_the_earlier_one_and_no_staging_tables() {
+	let store = BaselineStore::open_in_memory().unwrap();
+	let (pair, _) = store
+		.create_pair("/a", Uuid::from_u128(1), SyncMode::TwoWay)
+		.unwrap();
+	store
+		.replace_legacy_synced(pair, |put| {
+			put_synced(put, "kept.txt", Uuid::from_u128(10), 1, 1)
+		})
+		.unwrap();
+
+	let failed = store.replace_legacy_synced(pair, |put| {
+		put_synced(put, "never.txt", Uuid::from_u128(11), 1, 1)?;
+		Err(rusqlite::Error::InvalidQuery)
+	});
+	assert!(matches!(failed, Err(rusqlite::Error::InvalidQuery)));
+	assert_eq!(legacy_paths(&store, pair), vec!["kept.txt".to_owned()]);
+
+	let staging: i64 = store
+		.conn
+		.query_row(
+			"SELECT COUNT(*) FROM temp.sqlite_master WHERE name LIKE 'legacy_%'",
+			[],
+			|row| row.get(0),
+		)
+		.unwrap();
+	assert_eq!(
+		staging, 0,
+		"the staging tables are dropped however the import ends"
+	);
+}
+
+#[test]
+fn removing_a_pair_removes_its_imported_filen_sync_state() {
+	let store = BaselineStore::open_in_memory().unwrap();
+	let (pair, _) = store
+		.create_pair("/a", Uuid::from_u128(1), SyncMode::TwoWay)
+		.unwrap();
+	store
+		.replace_legacy_synced(pair, |put| {
+			put_synced(put, "a.txt", Uuid::from_u128(10), 1, 1)
+		})
+		.unwrap();
+	store.delete_pair(pair).unwrap();
+	let left: i64 = store
+		.conn
+		.query_row("SELECT COUNT(*) FROM legacy_synced", [], |row| row.get(0))
+		.unwrap();
+	assert_eq!(left, 0);
 }

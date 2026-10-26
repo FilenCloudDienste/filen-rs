@@ -7807,3 +7807,83 @@ fn a_scoped_pass_does_not_seed_a_file_renamed_on_both_sides() {
 	assert_eq!(transfers(&screened), Vec::<&SyncAction>::new());
 	assert_eq!(conflict_paths(&screened), ["b.bin"]);
 }
+
+/// A filen-sync state directory whose two trees list one file alike.
+fn filen_sync_state() -> tempfile::TempDir {
+	let dir = tempfile::tempdir().unwrap();
+	std::fs::write(
+		dir.path().join("previousLocalTree"),
+		"{\"prop\":\"/a.txt\",\"data\":{\"type\":\"file\",\"size\":5,\"lastModified\":1700000000123}}\n",
+	)
+	.unwrap();
+	std::fs::write(
+		dir.path().join("previousRemoteTree"),
+		format!(
+			"{{\"prop\":\"/a.txt\",\"data\":{{\"type\":\"file\",\"uuid\":\"{}\",\"size\":5}}}}\n",
+			Uuid::from_u128(10)
+		),
+	)
+	.unwrap();
+	dir
+}
+
+#[tokio::test]
+async fn filen_sync_state_imports_into_a_pair_that_has_not_synced() {
+	let (engine, pair, path) = engine_with_pair("legacy_import").await;
+	let state = filen_sync_state();
+	let import = engine
+		.import_legacy_state(pair, state.path().to_path_buf())
+		.await
+		.unwrap();
+	assert_eq!(
+		import,
+		LegacyImport {
+			imported: 1,
+			skipped: 0
+		}
+	);
+	assert_eq!(
+		locked(&engine.control).legacy_synced_count(pair).unwrap(),
+		1
+	);
+	drop(engine);
+	std::fs::remove_file(&path).ok();
+}
+
+#[tokio::test]
+async fn filen_sync_state_is_refused_once_the_pair_has_a_row() {
+	let (engine, pair, path) = engine_with_pair("legacy_import_synced").await;
+	locked(&engine.control)
+		.upsert_entry(
+			pair,
+			&file_row("b.txt", Uuid::from_u128(5), Blake3Hash::from([1; 32])),
+		)
+		.unwrap();
+	let state = filen_sync_state();
+	let error = engine
+		.import_legacy_state(pair, state.path().to_path_buf())
+		.await
+		.unwrap_err();
+	assert_eq!(error.kind(), ErrorKind::InvalidState);
+	assert!(error.to_string().contains("has already synced"), "{error}");
+	assert_eq!(
+		locked(&engine.control).legacy_synced_count(pair).unwrap(),
+		0
+	);
+	drop(engine);
+	std::fs::remove_file(&path).ok();
+}
+
+#[tokio::test]
+async fn filen_sync_state_is_refused_for_an_unknown_pair() {
+	let (engine, pair, path) = engine_with_pair("legacy_import_unknown").await;
+	let state = filen_sync_state();
+	let error = engine
+		.import_legacy_state(pair + 1, state.path().to_path_buf())
+		.await
+		.unwrap_err();
+	assert_eq!(error.kind(), ErrorKind::InvalidState);
+	assert!(error.to_string().contains("unknown sync pair"), "{error}");
+	drop(engine);
+	std::fs::remove_file(&path).ok();
+}
