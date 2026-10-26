@@ -63,7 +63,7 @@ use crate::{
 	Error, ErrorKind,
 	auth::Client,
 	fs::HasUUID,
-	runtime::{do_on_commander, spawn},
+	runtime::{do_on_commander, spawn, spawned},
 	sync_engine::{
 		Backlog, BaselineInUse, ConflictResolution, DeleteGuard, IgnoredPath, PairId, PauseMode,
 		PauseOptions, PlanOutcome, PlannedAction, PlannedConflict, SyncEngine, SyncEvent, SyncMode,
@@ -73,6 +73,9 @@ use crate::{
 
 #[cfg(feature = "napi")]
 pub(crate) use self::types::sync_refusal;
+
+/// What an engine call that panicked fails with.
+const SYNC_ENGINE_PANICKED: &str = "a sync engine call panicked";
 
 /// How many events [`JsSyncEngine::recent_events`] keeps, engine-wide.
 const RECENT_EVENTS: usize = 500;
@@ -982,22 +985,7 @@ where
 	F: FnOnce(Arc<SyncEngineCore>) -> Fut + Send + 'static,
 	Fut: Future<Output = Result<T, Error>> + Send + 'static,
 {
-	do_on_commander(move || spawned(call(core))).await
-}
-
-/// Run `call` as a task of its own, which runs to the end even when the wait for it is dropped.
-async fn spawned<T, Fut>(call: Fut) -> Result<T, Error>
-where
-	T: Send + 'static,
-	Fut: Future<Output = Result<T, Error>> + Send + 'static,
-{
-	tokio::spawn(call).await.map_err(|error| {
-		Error::custom_with_source(
-			ErrorKind::Internal,
-			error,
-			Some("a sync engine call panicked"),
-		)
-	})?
+	do_on_commander(move || spawned(call(core), SYNC_ENGINE_PANICKED)).await
 }
 
 /// A sync engine open on one baseline DB. Every method fails with "the sync engine is closed"
@@ -1026,12 +1014,10 @@ impl JsSyncEngine {
 		// A task of its own, as every engine call is: a JS abort must not drop the claim on the
 		// baseline while the engine's open still runs on a blocking thread.
 		let core = do_on_commander(move || {
-			spawned(SyncEngineCore::open(
-				client,
-				PathBuf::from(db_path),
-				host,
-				listener,
-			))
+			spawned(
+				SyncEngineCore::open(client, PathBuf::from(db_path), host, listener),
+				SYNC_ENGINE_PANICKED,
+			)
 		})
 		.await?;
 		Ok(Self { core })

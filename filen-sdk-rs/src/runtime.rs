@@ -964,6 +964,21 @@ mod commander_thread {
 		inner_do_on_commander(Some(channel), f)
 	}
 }
+
+/// Runs `call` as a task of its own, which runs to the end even when the wait for it is dropped (a
+/// JS abort drops only the wait, never a binding call half-way). A panic in it fails with an
+/// [`ErrorKind::Internal`](crate::ErrorKind::Internal) error whose context is `panicked`.
+#[cfg(all(any(feature = "uniffi", feature = "napi"), feature = "sync-engine"))]
+pub(crate) async fn spawned<T, Fut>(call: Fut, panicked: &'static str) -> Result<T, crate::Error>
+where
+	T: Send + 'static,
+	Fut: Future<Output = Result<T, crate::Error>> + Send + 'static,
+{
+	tokio::spawn(call).await.map_err(|error| {
+		crate::Error::custom_with_source(crate::ErrorKind::Internal, error, Some(panicked))
+	})?
+}
+
 #[cfg(feature = "napi")]
 pub(crate) use commander_thread::do_on_commander;
 #[cfg(feature = "uniffi")]
