@@ -192,19 +192,19 @@ impl RcloneInstallation {
 	}
 }
 
-const RCLONE_VERSION: &str = "1.74.2";
+const RCLONE_VERSION: &str = "1.74.4";
 const RCLONE_CHECKSUM_LINUX_AMD64: [u8; 32] =
-	hex!("72a806370072015ccbe4d81bcd348cc5eaf3beca6c65ba693fd43fb31fcca5b1");
+	hex!("fe435e0c36228e7c2f116a8701f01127bb1f694005fc11d1f27186c8bca4115d");
 const RCLONE_CHECKSUM_LINUX_ARM64: [u8; 32] =
-	hex!("bc2b2eb8269b743ed7bcea869f3782cfb4931e41efa53fc8befc6dc8308b7a50");
+	hex!("97685285c9ad6a0cf17d5844115d2a67245af6444db672187074bd9c358de419");
 const RCLONE_CHECKSUM_OSX_AMD64: [u8; 32] =
-	hex!("fc24831eefa3918c278c4a10be4de78288422426e2f7e64509205167f845874d");
+	hex!("4188aa84043d7a6240912923f47639a9d2da21f3b40a521c065c8d92e66563f6");
 const RCLONE_CHECKSUM_OSX_ARM64: [u8; 32] =
-	hex!("e170fc4f225cbe3685695c4761259fe5883115a2b022a2f39b7298f946b8d898");
+	hex!("c2100e2d4a4b3be04c55cd45380cafe7647e1ad772bb055f52f00876ed701167");
 const RCLONE_CHECKSUM_WINDOWS_AMD64: [u8; 32] =
-	hex!("71f376f47428bd467bf92e8bfe7fb36f4c108a4fc4edd3df30fc74dd409c7eef");
+	hex!("ef097ef9de37a57feb7d9f9c7afb34148ad3c65be8025f1d8f7f521554a701ea");
 const RCLONE_CHECKSUM_WINDOWS_ARM64: [u8; 32] =
-	hex!("464c8abf9eab9dab843906aac90fbd63386eb07576cd8571d03fbd10483c763e");
+	hex!("72194ad0aaf210d7a55808801191fecc7e175444dab7be7491b7a63074521f3a");
 // info: when updating the rclone version here, also update the expected SHA256 checksums by copying them from the supplied file
 
 /// Returns the path to the rclone binary, downloading it if necessary.
