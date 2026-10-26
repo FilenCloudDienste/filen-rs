@@ -852,3 +852,115 @@ async fn migrate_13_empty_files_are_recorded_whatever_their_mtimes_but_a_1ms_mis
 
 	std::fs::remove_dir_all(&local).ok();
 }
+
+/// MIGRATE-14 — a hashless remote file the imported filen-sync state lists as synced is recorded
+/// as synced, though its remote `lastModified` is 5 s off the local mtime and the size-and-mtime
+/// evidence alone would not hold: the state names the remote version that is still there and the
+/// local size and mtime that are still there. A pair with the same two sides and no import raises
+/// the conflict instead, so the import is what decided it.
+#[cfg(feature = "malformed")]
+#[shared_test_runtime]
+async fn migrate_14_imported_filen_sync_state_records_a_hashless_file_as_synced() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let remote: Uuid = resources.dir.uuid();
+	let data = b"listed by filen-sync as synced";
+	let local_mtime = STAMP_MS + 5_000;
+	let staged = stage_hashless(&resources.client, remote, "f.bin", data, STAMP_MS).await;
+	let cache = cache_over_hashless(&resources, &[(&staged, STAMP_MS)]).await;
+	let local = fresh_local_dir("migrate14");
+	write_file_at(&local, "f.bin", data, local_mtime);
+	let db_path = temp_cache_path();
+
+	// The old pair's state directory, as filen-sync wrote it: one JSON line per item, keyed by
+	// "/"-rooted path. The remote item carries a `key` the import must never read.
+	let state = tempfile::tempdir().unwrap();
+	let size = data.len();
+	let remote_line = serde_json::json!({
+		"prop": "/f.bin",
+		"data": {
+			"type": "file",
+			"uuid": staged.uuid(),
+			"name": "f.bin",
+			"size": size,
+			"lastModified": STAMP_MS,
+			"key": "not-a-real-key",
+			"hash": "not-a-real-hash",
+		},
+	});
+	let local_line = serde_json::json!({
+		"prop": "/f.bin",
+		"data": {
+			"type": "file",
+			"path": "/f.bin",
+			"size": size,
+			"lastModified": local_mtime,
+			"creation": STAMP_MS,
+			"inode": 1,
+		},
+	});
+	std::fs::write(
+		state.path().join("previousRemoteTree"),
+		format!("{remote_line}\n"),
+	)
+	.unwrap();
+	std::fs::write(
+		state.path().join("previousLocalTree"),
+		format!("{local_line}\n"),
+	)
+	.unwrap();
+
+	let engine = SyncEngine::open(cache.client.clone(), db_path.clone())
+		.await
+		.unwrap();
+	let pair = engine
+		.add_pair(local.clone(), remote, SyncMode::TwoWay)
+		.await
+		.unwrap();
+	let import = engine
+		.import_legacy_state(pair, state.path().to_path_buf())
+		.await
+		.unwrap();
+	assert_eq!(import.imported, 1, "{import:?}");
+	assert_eq!(import.skipped, 0, "{import:?}");
+	assert_noop(&engine.sync_once(pair).await.unwrap());
+	assert_seeded(&db_path, "f.bin", data, staged.uuid());
+	assert_noop(&engine.sync_once(pair).await.unwrap());
+
+	// Control: the same two sides on a pair that imported nothing.
+	let local_ctrl = fresh_local_dir("migrate14ctrl");
+	write_file_at(&local_ctrl, "f.bin", data, local_mtime);
+	let engine_ctrl = SyncEngine::open(cache.client.clone(), temp_cache_path())
+		.await
+		.unwrap();
+	let pair_ctrl = engine_ctrl
+		.add_pair(local_ctrl.clone(), remote, SyncMode::TwoWay)
+		.await
+		.unwrap();
+	let r_ctrl = engine_ctrl.sync_once(pair_ctrl).await.unwrap();
+	assert!(r_ctrl.errors.is_empty(), "{r_ctrl:?}");
+	assert_eq!(r_ctrl.uploaded, 0, "{r_ctrl:?}");
+	assert_eq!(r_ctrl.downloaded, 0, "{r_ctrl:?}");
+	let conflicted: Vec<&str> = r_ctrl
+		.conflicts
+		.iter()
+		.map(|c| c.rel_path.as_str())
+		.collect();
+	assert_eq!(
+		conflicted,
+		["f.bin"],
+		"without the import the 5 s miss must conflict: {r_ctrl:?}"
+	);
+
+	let (_d, files) = list_dir(&cache, &resources.dir).await;
+	assert_eq!(files.len(), 1, "{files:?}");
+	assert_eq!(
+		find_file(&files, "f.bin")
+			.expect("f.bin missing remotely")
+			.uuid(),
+		staged.uuid(),
+		"the remote version changed"
+	);
+
+	std::fs::remove_dir_all(&local).ok();
+	std::fs::remove_dir_all(&local_ctrl).ok();
+}

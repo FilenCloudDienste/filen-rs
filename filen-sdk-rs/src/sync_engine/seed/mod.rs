@@ -13,6 +13,10 @@
 //! `Synced` row. The planner then reads the path as it reads any synced one, through those same
 //! fallbacks, and nothing is planned there. The evidence, in the order it is weighed:
 //!
+//! - the filen-sync state the pair imported (see [`legacy`](super::legacy)) lists the path as
+//!   synced, and nothing has moved since: the remote is still the version that engine last listed
+//!   there, and the local file has the size and mtime (to the millisecond) it last saw. A stale
+//!   version or a local edit since is no evidence here, and the path is weighed by what follows;
 //! - both files are empty: the content is provably the same, whatever the stamps say;
 //! - the sizes are equal and the remote's `lastModified` is the local mtime to the millisecond. A
 //!   remote stamp of 0 is a missing one and never matches. There is no tolerance: a miss goes the
@@ -32,7 +36,9 @@ use filen_types::fs::StableUuid;
 use uuid::Uuid;
 
 use super::{
-	baseline::{BaselineEntry, BaselineState, BaselineStore, NodeKind, PairId},
+	baseline::{
+		BaselineEntry, BaselineState, BaselineStore, LegacySynced, NodeKind, PairId, SyncedPaths,
+	},
 	plan::RemoteNode,
 	rows::Baseline,
 	scan::LocalNode,
@@ -57,6 +63,9 @@ pub(super) enum Seeding {
 /// Which evidence recorded a path as synced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Evidence {
+	/// The imported filen-sync state lists the path as synced at the remote's version and the
+	/// local file's size and mtime.
+	Imported,
 	/// Both files are empty.
 	Empty,
 	/// The same size, and the remote's `lastModified` is the local mtime to the millisecond.
@@ -66,6 +75,7 @@ pub(super) enum Evidence {
 /// How many paths a seeding recorded, by the evidence that recorded each.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(super) struct SeedCounts {
+	pub(super) imported: usize,
 	pub(super) empty: usize,
 	pub(super) size_and_mtime: usize,
 }
@@ -73,13 +83,14 @@ pub(super) struct SeedCounts {
 impl SeedCounts {
 	fn count(&mut self, evidence: Evidence) {
 		match evidence {
+			Evidence::Imported => self.imported += 1,
 			Evidence::Empty => self.empty += 1,
 			Evidence::SizeAndMtime => self.size_and_mtime += 1,
 		}
 	}
 
 	pub(super) fn total(&self) -> usize {
-		self.empty + self.size_and_mtime
+		self.imported + self.empty + self.size_and_mtime
 	}
 }
 
@@ -94,8 +105,20 @@ pub(super) fn candidate(local: &LocalNode, remote: &RemoteNode) -> bool {
 }
 
 /// The evidence that the two files of a [`candidate`] hold the same content, if there is any (see
-/// the module docs). Plain equality on both stamps: no arithmetic, no tolerance.
-pub(super) fn evidence(local: &LocalNode, remote: &RemoteNode) -> Option<Evidence> {
+/// the module docs), where `imported` is what the pair's imported filen-sync state recorded at the
+/// path. Plain equality on every stamp: no arithmetic, no tolerance.
+pub(super) fn evidence(
+	local: &LocalNode,
+	remote: &RemoteNode,
+	imported: Option<&LegacySynced>,
+) -> Option<Evidence> {
+	if imported.is_some_and(|synced| {
+		synced.remote_uuid == remote.remote_uuid
+			&& synced.size == local.size
+			&& synced.local_mtime == local.mtime_millis
+	}) {
+		return Some(Evidence::Imported);
+	}
 	if local.size != remote.size {
 		return None;
 	}
@@ -131,8 +154,58 @@ pub(super) fn seeded_row(rel_path: &str, local: &LocalNode, remote: &RemoteNode)
 	}
 }
 
+/// What the seeding stage reads and writes: the pair's imported filen-sync state, where the rows
+/// record the remote items it would seed, and the rows it seeds. [`BaselineStore`] is the one
+/// store; the tests count what is asked of it.
+pub(super) trait SeedStore {
+	/// See [`BaselineStore::has_legacy_synced`].
+	fn has_legacy_synced(&self, pair: PairId) -> rusqlite::Result<bool>;
+	/// See [`BaselineStore::legacy_synced`].
+	fn legacy_synced(&self, pair: PairId, rel_path: &str)
+	-> rusqlite::Result<Option<LegacySynced>>;
+	/// See [`BaselineStore::synced_paths`].
+	fn synced_paths(
+		&self,
+		pair: PairId,
+		uuids: &[Uuid],
+		lineages: &[StableUuid],
+	) -> rusqlite::Result<SyncedPaths>;
+	/// See [`BaselineStore::seed_rows`].
+	fn seed_rows(&self, pair: PairId, rows: &[BaselineEntry]) -> rusqlite::Result<()>;
+}
+
+impl SeedStore for BaselineStore {
+	fn has_legacy_synced(&self, pair: PairId) -> rusqlite::Result<bool> {
+		BaselineStore::has_legacy_synced(self, pair)
+	}
+
+	fn legacy_synced(
+		&self,
+		pair: PairId,
+		rel_path: &str,
+	) -> rusqlite::Result<Option<LegacySynced>> {
+		BaselineStore::legacy_synced(self, pair, rel_path)
+	}
+
+	fn synced_paths(
+		&self,
+		pair: PairId,
+		uuids: &[Uuid],
+		lineages: &[StableUuid],
+	) -> rusqlite::Result<SyncedPaths> {
+		BaselineStore::synced_paths(self, pair, uuids, lineages)
+	}
+
+	fn seed_rows(&self, pair: PairId, rows: &[BaselineEntry]) -> rusqlite::Result<()> {
+		BaselineStore::seed_rows(self, pair, rows)
+	}
+}
+
 /// Weigh each of `candidates` — remote nodes with the paths they are at — and write a row for every
 /// one the evidence records as synced, [`SEED_CHUNK`] rows a transaction.
+///
+/// The imported filen-sync state is looked up at a path only once it is a [`candidate`], and only
+/// when the pair imported any: a pair that did not pays one read per call.
 ///
 /// A path is left alone when `skip` says the pass does not act on it, when `baseline` has a row
 /// there, when `local` holds nothing there, or when the two nodes are no [`candidate`]. A row the
@@ -142,7 +215,7 @@ pub(super) fn seeded_row(rel_path: &str, local: &LocalNode, remote: &RemoteNode)
 /// statement, so nothing a pass's snapshot holds is overwritten: every path written is one that
 /// snapshot has no row at, and the pass holds the pair's gate.
 pub(super) fn seed<'a>(
-	store: &BaselineStore,
+	store: &impl SeedStore,
 	pair: PairId,
 	baseline: &Baseline,
 	local: &impl NodesAt<Node = LocalNode>,
@@ -151,6 +224,7 @@ pub(super) fn seed<'a>(
 ) -> rusqlite::Result<SeedCounts> {
 	let mut counts = SeedCounts::default();
 	let mut rows: Vec<(BaselineEntry, Evidence)> = Vec::new();
+	let any_imported = store.has_legacy_synced(pair)?;
 	for (path, remote) in candidates {
 		if skip(&path) || baseline.contains_key(&path) {
 			continue;
@@ -161,7 +235,12 @@ pub(super) fn seed<'a>(
 		if !candidate(&local, &remote) {
 			continue;
 		}
-		let Some(evidence) = evidence(&local, &remote) else {
+		let imported = if any_imported {
+			store.legacy_synced(pair, &path)?
+		} else {
+			None
+		};
+		let Some(evidence) = evidence(&local, &remote, imported.as_ref()) else {
 			continue;
 		};
 		rows.push((seeded_row(&path, &local, &remote), evidence));
@@ -178,7 +257,7 @@ pub(super) fn seed<'a>(
 /// Write the `rows` no row in the store already records the remote item of, by uuid or by lineage,
 /// counting each by its evidence, and empty `rows`.
 fn write_unclaimed(
-	store: &BaselineStore,
+	store: &impl SeedStore,
 	pair: PairId,
 	rows: &mut Vec<(BaselineEntry, Evidence)>,
 	counts: &mut SeedCounts,

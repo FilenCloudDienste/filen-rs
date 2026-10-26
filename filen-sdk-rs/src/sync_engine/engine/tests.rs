@@ -18,7 +18,7 @@ use crate::{
 	sync_engine::{
 		PauseMode,
 		apply::PassStart,
-		baseline::{BaselineChange, NodeKind},
+		baseline::{BaselineChange, LegacyItem, LegacySide, NodeKind},
 		changes::tests::{cacheable_dir, cacheable_file},
 		derive::Derived,
 		ignore::IgnoreRules,
@@ -7806,6 +7806,112 @@ fn a_scoped_pass_does_not_seed_a_file_renamed_on_both_sides() {
 	let screened = reconcile_and_screen_resident(&prep, screen_state(&prep));
 	assert_eq!(transfers(&screened), Vec::<&SyncAction>::new());
 	assert_eq!(conflict_paths(&screened), ["b.bin"]);
+}
+
+/// A [`seed_local`] touched after its remote was stamped, so the stamps alone are no evidence.
+fn touched_local(rel: &str) -> LocalNode {
+	LocalNode {
+		mtime_millis: SEED_STAMP + 5000,
+		..seed_local(rel)
+	}
+}
+
+/// Import a filen-sync state into `pair` that lists each of `files` — path and remote version — as
+/// synced at the size and mtime of [`touched_local`].
+fn import_touched(store: &BaselineStore, pair: PairId, files: &[(&str, u128)]) {
+	store
+		.replace_legacy_synced::<rusqlite::Error>(pair, |put| {
+			for &(rel_path, uuid) in files {
+				let raw = format!("/{rel_path}");
+				let item = |side| LegacyItem {
+					rel_path,
+					raw: &raw,
+					is_file: true,
+					size: Some(5),
+					side,
+				};
+				put(&item(LegacySide::Remote {
+					uuid: Some(Uuid::from_u128(uuid)),
+				}))?;
+				put(&item(LegacySide::Local {
+					mtime: Some(SEED_STAMP + 5000),
+				}))?;
+			}
+			Ok(())
+		})
+		.unwrap();
+}
+
+/// A hashless remote file whose local copy was touched after the remote was stamped, so the stamps
+/// alone are no evidence: planned in every mode without more, and recorded as synced, with nothing
+/// planned at it, once the pair's imported filen-sync state lists that version at the local size
+/// and mtime.
+#[test]
+fn a_hashless_file_the_imported_state_lists_plans_nothing_in_every_mode() {
+	let touched = touched_local("a.bin");
+	for mode in MODES {
+		let (store, mut prep) = prepared_on_store(
+			mode,
+			Vec::new(),
+			vec![touched.clone()],
+			vec![seed_remote("a.bin", 1)],
+		);
+		assert_eq!(
+			prep.seed_unhashed(&store).unwrap(),
+			SeedCounts::default(),
+			"{mode:?}"
+		);
+		assert!(
+			!planned_at(
+				&reconcile_and_screen_resident(&prep, screen_state(&prep)),
+				"a.bin"
+			)
+			.is_empty(),
+			"{mode:?}: without the import the path is planned"
+		);
+
+		import_touched(&store, prep.record.id, &[("a.bin", 1)]);
+		let seeded = prep.seed_unhashed(&store).unwrap();
+		assert_eq!(seeded.imported, 1, "{mode:?}");
+		assert_eq!(seeded.total(), 1, "{mode:?}");
+		let row = prep.baseline.get("a.bin").unwrap();
+		assert_eq!(row.local_mtime, Some(SEED_STAMP + 5000), "{mode:?}");
+		assert_eq!(row.remote_modified, Some(SEED_STAMP), "{mode:?}");
+		let screened = reconcile_and_screen_resident(&prep, screen_state(&prep));
+		assert_eq!(
+			planned_at(&screened, "a.bin"),
+			Vec::<String>::new(),
+			"{mode:?}"
+		);
+	}
+}
+
+/// A change-scoped pass weighs the imported state at the paths it decides: the one it decides is
+/// recorded as synced and planned nothing, and the one it does not decide is left without a row
+/// for the pass that does.
+#[test]
+fn a_scoped_pass_seeds_from_the_imported_state_only_the_paths_it_decides() {
+	let (store, mut prep) = prepared_on_store(
+		SyncMode::TwoWay,
+		Vec::new(),
+		vec![touched_local("a.bin"), touched_local("b.bin")],
+		vec![seed_remote("a.bin", 1), seed_remote("b.bin", 2)],
+	);
+	import_touched(&store, prep.record.id, &[("a.bin", 1), ("b.bin", 2)]);
+	prep.read = PassRead::Scoped(BTreeSet::from(["a.bin".to_string()]));
+	assert_eq!(
+		prep.seed_unhashed(&store).unwrap(),
+		SeedCounts {
+			imported: 1,
+			empty: 0,
+			size_and_mtime: 0,
+		}
+	);
+	assert!(prep.baseline.contains_key("a.bin"));
+	assert!(!prep.baseline.contains_key("b.bin"));
+	assert_eq!(store.entry(prep.record.id, "b.bin").unwrap(), None);
+	let screened = reconcile_and_screen_resident(&prep, screen_state(&prep));
+	assert_eq!(planned_at(&screened, "a.bin"), Vec::<String>::new());
 }
 
 /// A filen-sync state directory whose two trees list one file alike.

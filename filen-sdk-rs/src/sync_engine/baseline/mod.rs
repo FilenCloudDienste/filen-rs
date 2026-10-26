@@ -727,6 +727,17 @@ pub(crate) enum LegacySide {
 	Remote { uuid: Option<Uuid> },
 }
 
+/// What a pair's imported filen-sync state recorded as synced at one path: the remote version that
+/// engine last listed there, and the local file as it last saw it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LegacySynced {
+	pub(crate) remote_uuid: Uuid,
+	/// Bytes.
+	pub(crate) size: u64,
+	/// Unix millis.
+	pub(crate) local_mtime: i64,
+}
+
 /// What stages one item of a filen-sync tree: the visitor
 /// [`BaselineStore::replace_legacy_synced`] hands its caller, which streams a tree of any size
 /// through it a line at a time.
@@ -2026,6 +2037,36 @@ impl BaselineStore {
 			|row| row.get(0),
 		)?;
 		u64::try_from(count).map_err(|_| corrupt("legacy_synced count", count))
+	}
+
+	/// Whether `pair` holds any imported filen-sync state: asked once per seeding, so a pair that
+	/// imported none looks up none (see [`seed`](super::seed)).
+	pub(crate) fn has_legacy_synced(&self, pair: PairId) -> rusqlite::Result<bool> {
+		self.conn
+			.prepare_cached("SELECT EXISTS (SELECT 1 FROM legacy_synced WHERE pair_id = ?1)")?
+			.query_row(params![pair], |row| row.get(0))
+	}
+
+	/// What the imported filen-sync state of `pair` recorded as synced at `rel_path`, if anything.
+	pub(crate) fn legacy_synced(
+		&self,
+		pair: PairId,
+		rel_path: &str,
+	) -> rusqlite::Result<Option<LegacySynced>> {
+		self.conn
+			.prepare_cached(
+				"SELECT remote_uuid, size, local_mtime FROM legacy_synced
+				 WHERE pair_id = ?1 AND rel_path = ?2",
+			)?
+			.query_row(params![pair, rel_path], |row| {
+				let size: i64 = row.get(1)?;
+				Ok(LegacySynced {
+					remote_uuid: row.get(0)?,
+					size: u64::try_from(size).map_err(|_| corrupt("legacy_synced size", size))?,
+					local_mtime: row.get(2)?,
+				})
+			})
+			.optional()
 	}
 
 	/// [`apply_changes`](Self::apply_changes) for a local directory deletion that carries other

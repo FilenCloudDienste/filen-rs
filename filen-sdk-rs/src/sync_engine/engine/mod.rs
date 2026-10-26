@@ -2394,8 +2394,10 @@ impl Prepared {
 		}
 		tracing::info!(
 			"sync_once[pair {pair}]: recorded {} hashless remote file(s) as synced with the local \
-			 one: {} empty on both sides, {} of the same size and modification time",
+			 one: {} the imported filen-sync state lists as synced, {} empty on both sides, {} of \
+			 the same size and modification time",
 			seeded.total(),
+			seeded.imported,
 			seeded.empty,
 			seeded.size_and_mtime
 		);
@@ -3395,6 +3397,11 @@ impl SyncEngine {
 	/// pair has any row: by then the pair's own rows are the better record. A second import before
 	/// that replaces the first. A state directory without both tree files is the old engine's own
 	/// "nothing saved", and imports nothing.
+	///
+	/// A pass then records as synced a hashless remote file the import lists, at a path with no row,
+	/// while the remote is still the version the old engine listed there and the local file still
+	/// has the size and mtime it saw; anything else at the path is weighed as if nothing had been
+	/// imported.
 	///
 	/// Waits for a pass still reading the pair, as [`resolve_conflict`](Self::resolve_conflict)
 	/// does. A pass that read the pair before the import does not see it; its apply may then write
@@ -5000,10 +5007,10 @@ impl SyncEngine {
 	/// touching nothing — it runs the same [`prepare`](Self::prepare), so it makes that read's
 	/// server calls and retires the journal records that read settles. What it does NOT do is
 	/// persist the confirmations it observed, nor record as synced the hashless remote files a pass
-	/// would (see [`sync_once`](Self::sync_once)): where a pass would find a hashless file's size and
-	/// mtime agree with the local one's and plan nothing there, a dry run of a path that has never
-	/// synced shows the conflict (two-way) or the transfer (one-way) that the evidence spares the
-	/// pass. A [`paused`](Self::pause_pair) pair is planned like any other.
+	/// would (see [`sync_once`](Self::sync_once)): where a pass would find the evidence that a
+	/// hashless file agrees with the local one and plan nothing there, a dry run of a path that has
+	/// never synced shows the conflict (two-way) or the transfer (one-way) that the evidence spares
+	/// the pass. A [`paused`](Self::pause_pair) pair is planned like any other.
 	///
 	/// A read that fails is the call's error, as it is a pass's: a baseline read that fails panics
 	/// on purpose, and that panic comes back here as an [`ErrorKind::Internal`] error.
@@ -5780,10 +5787,12 @@ impl SyncEngine {
 	///
 	/// Before it plans, a pass records as synced every path that has never synced where both sides
 	/// hold a file, the remote one carries no BLAKE3 (another client uploaded it without one) and
-	/// either both are empty or their sizes are equal and the remote's modification time is the
-	/// local one to the millisecond. A tree another client synced before this engine then reads as
-	/// synced rather than as created on both sides. Those records stand even when the pass is
-	/// cancelled before it plans.
+	/// the two agree: the filen-sync state the pair imported
+	/// ([`import_legacy_state`](Self::import_legacy_state)) lists the path at the remote's version
+	/// and the local file's size and mtime, both files are empty, or their sizes are equal and the
+	/// remote's modification time is the local one to the millisecond. A tree another client
+	/// synced before this engine then reads as synced rather than as created on both sides. Those
+	/// records stand even when the pass is cancelled before it plans.
 	pub async fn sync_once(&self, pair: PairId) -> Result<SyncReport, Error> {
 		self.sync_once_observed(pair, &mut |_| {}).await
 	}
