@@ -1033,6 +1033,7 @@ fn prepared(
 			delete_guard: DeleteGuard::unlimited(),
 			paused: false,
 		},
+		tracked_at_start: baseline.len(),
 		baseline,
 		dir_moves: Vec::new(),
 		local_scan: LocalScan {
@@ -7431,4 +7432,378 @@ async fn a_walk_with_its_rule_file_on_disk_walks_the_tree_once() {
 		dry_run_over_a_remote_rule_file(SyncMode::TwoWay, &[(".filenignore", "b.*\n")], &[]).await;
 	assert_eq!(ignored, vec![("b.txt".to_owned(), "b.*".to_owned())]);
 	assert_eq!(stages, 3, "the snapshot, the plan and one walk");
+}
+
+/// The stamp a hashless remote file and its local copy share to the millisecond.
+const SEED_STAMP: i64 = 1_700_000_000_123;
+
+/// A hashed local file of 5 bytes, stamped [`SEED_STAMP`].
+fn seed_local(rel: &str) -> LocalNode {
+	LocalNode {
+		rel_path: rel.to_string(),
+		kind: NodeKind::File,
+		size: 5,
+		mtime_millis: SEED_STAMP,
+		content_hash: Some(hash(7)),
+	}
+}
+
+/// What another client uploaded at `rel` with no BLAKE3: the size and stamp of [`seed_local`].
+fn seed_remote(rel: &str, uuid: u128) -> RemoteNode {
+	RemoteNode {
+		content_hash: None,
+		size: 5,
+		modified_millis: SEED_STAMP,
+		..remote_file(rel, Uuid::from_u128(uuid), hash(7), 5)
+	}
+}
+
+/// [`prepared`] over `rows` as a store of its own holds them, read as a pass reads its rows, so its
+/// seeding stage has somewhere to write; with that store.
+fn prepared_on_store(
+	mode: SyncMode,
+	rows: Vec<BaselineEntry>,
+	local: Vec<LocalNode>,
+	remote: Vec<RemoteNode>,
+) -> (BaselineStore, Prepared) {
+	let store = BaselineStore::open_in_memory().unwrap();
+	let (pair, _) = store.create_pair("/local", Uuid::nil(), mode).unwrap();
+	for row in &rows {
+		store.upsert_entry(pair, row).unwrap();
+	}
+	let mut prep = prepared(
+		mode,
+		rows.into_iter()
+			.map(|row| (row.rel_path.clone(), row))
+			.collect(),
+		local,
+		view(remote, Vec::new(), &[]),
+		HashMap::new(),
+	);
+	prep.record.id = pair;
+	prep.baseline = store.baseline(pair).unwrap();
+	prep.tracked_at_start = prep.baseline.len();
+	(store, prep)
+}
+
+/// Every action and conflict a screened pass plans at `path`.
+fn planned_at(screened: &ResidentScreened, path: &str) -> Vec<String> {
+	screened
+		.decision
+		.safe
+		.iter()
+		.chain(&screened.decision.held)
+		.filter(|action| action.rel_path() == path)
+		.map(|action| format!("{action:?}"))
+		.chain(
+			screened
+				.conflicts
+				.iter()
+				.filter(|conflict| conflict.rel_path == path)
+				.map(|conflict| format!("{conflict:?}")),
+		)
+		.collect()
+}
+
+/// A hashless remote file with the local copy's size and stamp is recorded as synced before the
+/// pass plans, and then nothing is planned at it in any mode, where without the row every mode
+/// plans a conflict or a transfer there. Seeded over a whole pass's staged sides, read off the
+/// stage's index of hashless files; a second seeding finds nothing left to write.
+#[test]
+fn a_seeded_hashless_file_plans_nothing_in_every_mode() {
+	for mode in MODES {
+		let (store, mut unseeded) = prepared_on_store(
+			mode,
+			Vec::new(),
+			vec![seed_local("a.bin")],
+			vec![seed_remote("a.bin", 1)],
+		);
+		let control = reconcile_and_screen_resident(&unseeded, screen_state(&unseeded));
+		assert!(
+			!planned_at(&control, "a.bin").is_empty(),
+			"{mode:?}: without a row the path is planned"
+		);
+
+		let (_stages, local, remote) =
+			stage::staged_sides([seed_local("a.bin")], [seed_remote("a.bin", 1)], 2);
+		unseeded.local_scan.nodes = local;
+		unseeded.remote_view.nodes = remote;
+		let mut prep = unseeded;
+		let seeded = prep.seed_unhashed(&store).unwrap();
+		assert_eq!(seeded.size_and_mtime, 1, "{mode:?}");
+		assert!(prep.baseline.contains_key("a.bin"), "{mode:?}");
+		let screened = reconcile_and_screen_resident(&prep, screen_state(&prep));
+		assert_eq!(
+			planned_at(&screened, "a.bin"),
+			Vec::<String>::new(),
+			"{mode:?}"
+		);
+
+		assert_eq!(
+			prep.seed_unhashed(&store).unwrap(),
+			SeedCounts::default(),
+			"{mode:?}"
+		);
+		assert_eq!(store.entries(prep.record.id).unwrap().len(), 1, "{mode:?}");
+	}
+}
+
+/// The rows a pass seeds are no history: the pass that writes its pair's first rows is still a
+/// first sync, and the deletion it plans is still held for approval.
+#[test]
+fn seeding_a_first_sync_keeps_its_deletions_held() {
+	let (store, mut prep) = prepared_on_store(
+		SyncMode::LocalToRemote,
+		Vec::new(),
+		vec![seed_local("a.bin")],
+		vec![
+			seed_remote("a.bin", 1),
+			remote_file("gone.bin", Uuid::from_u128(2), hash(3), 4),
+		],
+	);
+	prep.record.delete_guard = DeleteGuard::default();
+	assert_eq!(prep.seed_unhashed(&store).unwrap().total(), 1);
+	assert!(!prep.baseline.is_empty());
+	let state = screen_state(&prep);
+	assert!(state.first_sync);
+	assert_eq!(state.tracked, 0);
+	let screened = reconcile_and_screen_resident(&prep, state);
+	assert_eq!(
+		screened.decision.reason,
+		Some(GuardReason::FirstSyncWithDeletions { deletions: 1 })
+	);
+	assert_eq!(
+		screened.decision.held,
+		[SyncAction::TrashRemote {
+			rel_path: "gone.bin".to_string(),
+			kind: NodeKind::File,
+			remote_uuid: Uuid::from_u128(2),
+		}]
+	);
+}
+
+/// The rows are read again once seeded, and the confirmation the pass made of a push of its own is
+/// put back on them: the confirmed row still reads as agreed, which the store's rows alone do not
+/// say until the pass persists it.
+#[test]
+fn the_confirmations_a_pass_made_survive_its_seeding() {
+	let pushed = BaselineEntry {
+		agreed_hash: None,
+		..file_row("pushed.bin", Uuid::from_u128(5), hash(4))
+	};
+	let (store, mut prep) = prepared_on_store(
+		SyncMode::TwoWay,
+		vec![pushed.clone()],
+		vec![seed_local("a.bin"), local_file("pushed.bin", hash(4))],
+		vec![
+			seed_remote("a.bin", 1),
+			remote_file("pushed.bin", Uuid::from_u128(5), hash(4), 4),
+		],
+	);
+	let confirmed = Confirmed::Held(vec![BaselineEntry {
+		agreed_hash: Some(hash(4)),
+		..pushed
+	}]);
+	prep.baseline.confirm(&confirmed);
+	prep.confirmed = confirmed;
+	assert!(!prep.baseline.any_unconfirmed());
+
+	assert_eq!(prep.seed_unhashed(&store).unwrap().total(), 1);
+	assert!(prep.baseline.contains_key("a.bin"));
+	assert_eq!(
+		prep.baseline.get("pushed.bin").unwrap().agreed_hash,
+		Some(hash(4))
+	);
+	assert!(!prep.baseline.any_unconfirmed());
+	assert!(
+		store.baseline(prep.record.id).unwrap().any_unconfirmed(),
+		"the store's own rows still await the confirmation"
+	);
+}
+
+/// A pass that will be refused plans nothing, and seeds nothing either.
+#[test]
+fn a_refused_pass_seeds_nothing() {
+	let (store, mut prep) = prepared_on_store(
+		SyncMode::TwoWay,
+		Vec::new(),
+		vec![seed_local("a.bin")],
+		vec![seed_remote("a.bin", 1)],
+	);
+	prep.local_scan.errors.push(ScanError::DuplicateName {
+		rel_path: "x/Y".to_string(),
+	});
+	assert_eq!(prep.seed_unhashed(&store).unwrap(), SeedCounts::default());
+	assert!(prep.baseline.is_empty());
+	assert_eq!(store.entries(prep.record.id).unwrap(), []);
+}
+
+/// A change-scoped pass seeds the paths it decides, and leaves a rowless path it does not decide to
+/// the pass that does.
+#[test]
+fn a_scoped_pass_seeds_only_the_paths_it_decides() {
+	let (store, mut prep) = prepared_on_store(
+		SyncMode::TwoWay,
+		vec![file_row("kept.bin", Uuid::from_u128(9), hash(1))],
+		vec![seed_local("a.bin"), seed_local("b.bin")],
+		vec![seed_remote("a.bin", 1), seed_remote("b.bin", 2)],
+	);
+	prep.read = PassRead::Scoped(BTreeSet::from(["a.bin".to_string()]));
+	assert_eq!(prep.seed_unhashed(&store).unwrap().total(), 1);
+	assert!(prep.baseline.contains_key("a.bin"));
+	assert!(!prep.baseline.contains_key("b.bin"));
+	assert_eq!(prep.tracked_at_start, 1);
+	assert_eq!(screen_state(&prep).tracked, 1);
+}
+
+/// A pass seeds only a path it acts on: not one under a remote path the cache shows mid-transition,
+/// one with a failure streak, one under a directory whose ignore rules it could not read, or a
+/// remote item it cannot sync. Only the plain file beside them is recorded.
+#[test]
+fn a_pass_seeds_no_path_it_holds_or_blocks() {
+	let paths = [
+		"held/a.bin",
+		"failing.bin",
+		"blocked/c.bin",
+		"unknown.bin",
+		"plain.bin",
+	];
+	let (store, mut prep) = prepared_on_store(
+		SyncMode::TwoWay,
+		Vec::new(),
+		paths.iter().map(|path| seed_local(path)).collect(),
+		paths
+			.iter()
+			.zip(1..)
+			.map(|(path, uuid)| seed_remote(path, uuid))
+			.collect(),
+	);
+	prep.holds.held_remote = BTreeSet::from(["held".to_string()]);
+	prep.failures = HashMap::from([("failing.bin".to_string(), failure(9, 0))]);
+	prep.facts.ignore_blocked = BTreeSet::from(["blocked".to_string()]);
+	prep.facts.unknown_remote = BTreeMap::from([(
+		"unknown.bin".to_string(),
+		UnsyncableReason::RemoteUndecodable,
+	)]);
+	assert_eq!(prep.seed_unhashed(&store).unwrap().total(), 1);
+	let seeded: Vec<String> = store
+		.entries(prep.record.id)
+		.unwrap()
+		.into_iter()
+		.map(|row| row.rel_path)
+		.collect();
+	assert_eq!(seeded, ["plain.bin"]);
+}
+
+/// A pass whose remote ignore rules for the whole pair could not be used acts on nothing, and seeds
+/// nothing either.
+#[test]
+fn a_pass_with_the_whole_pair_ignore_blocked_seeds_nothing() {
+	let (store, mut prep) = prepared_on_store(
+		SyncMode::TwoWay,
+		Vec::new(),
+		vec![seed_local("a.bin"), seed_local("dir/b.bin")],
+		vec![seed_remote("a.bin", 1), seed_remote("dir/b.bin", 2)],
+	);
+	prep.remote_blocked = BTreeSet::from([String::new()]);
+	assert_eq!(prep.seed_unhashed(&store).unwrap(), SeedCounts::default());
+	assert_eq!(store.entries(prep.record.id).unwrap(), []);
+}
+
+/// Every transfer a screened pass plans, safe or held.
+fn transfers(screened: &ResidentScreened) -> Vec<&SyncAction> {
+	screened
+		.decision
+		.safe
+		.iter()
+		.chain(&screened.decision.held)
+		.filter(|action| {
+			matches!(
+				action,
+				SyncAction::UploadFile { .. } | SyncAction::DownloadFile { .. }
+			)
+		})
+		.collect()
+}
+
+/// The path of every conflict a screened pass holds.
+fn conflict_paths(screened: &ResidentScreened) -> Vec<&str> {
+	screened
+		.conflicts
+		.iter()
+		.map(|conflict| conflict.rel_path.as_str())
+		.collect()
+}
+
+/// Whether two of `pair`'s rows in `store` record one remote uuid or one lineage.
+fn rows_share_a_remote_item(store: &BaselineStore, pair: PairId) -> bool {
+	let rows = store.entries(pair).unwrap();
+	let uuids: HashSet<Uuid> = rows.iter().filter_map(|row| row.remote_uuid).collect();
+	let lineages: HashSet<StableUuid> = rows
+		.iter()
+		.filter_map(|row| row.remote_stable_uuid)
+		.collect();
+	uuids.len() != rows.iter().filter(|row| row.remote_uuid.is_some()).count()
+		|| lineages.len()
+			!= rows
+				.iter()
+				.filter(|row| row.remote_stable_uuid.is_some())
+				.count()
+}
+
+/// A directory renamed the same way on both sides, holding a hashless file: the file's row under
+/// the old name still records its remote item, so nothing is seeded under the new name. The pass
+/// plans what it planned before the seeding stage existed: no transfer, and the file under the new
+/// name held as a conflict, the planner pairing no rename of a hashless file made on both sides.
+#[test]
+fn seeding_under_a_directory_renamed_on_both_sides_transfers_nothing() {
+	let (dir, file) = (Uuid::from_u128(20), Uuid::from_u128(21));
+	let (store, mut prep) = prepared_on_store(
+		SyncMode::TwoWay,
+		vec![
+			dir_row("old", dir),
+			BaselineEntry {
+				size: Some(5),
+				local_mtime: Some(SEED_STAMP),
+				remote_modified: Some(SEED_STAMP),
+				..file_row("old/f.bin", file, hash(7))
+			},
+		],
+		vec![local_dir("new"), seed_local("new/f.bin")],
+		vec![remote_dir("new", dir), seed_remote("new/f.bin", 21)],
+	);
+	assert_eq!(prep.seed_unhashed(&store).unwrap(), SeedCounts::default());
+	assert!(!rows_share_a_remote_item(&store, prep.record.id));
+	prep.fold_dir_moves().unwrap();
+	let screened = reconcile_and_screen_resident(&prep, screen_state(&prep));
+	assert_eq!(transfers(&screened), Vec::<&SyncAction>::new());
+	assert_eq!(conflict_paths(&screened), ["new/f.bin"]);
+}
+
+/// A hashless file renamed the same way on both sides, read by a change-scoped pass that decides
+/// both names: the row at the old name still records the file's remote item, so the new name is
+/// not seeded as a second row for it — the shape the directory-move fold refuses to read — and the
+/// rename is left to the planner, which holds the new name as a conflict and transfers nothing, as
+/// it did before the seeding stage existed.
+#[test]
+fn a_scoped_pass_does_not_seed_a_file_renamed_on_both_sides() {
+	let file = Uuid::from_u128(21);
+	let (store, mut prep) = prepared_on_store(
+		SyncMode::TwoWay,
+		vec![BaselineEntry {
+			size: Some(5),
+			local_mtime: Some(SEED_STAMP),
+			remote_modified: Some(SEED_STAMP),
+			..file_row("a.bin", file, hash(7))
+		}],
+		vec![seed_local("b.bin")],
+		vec![seed_remote("b.bin", 21)],
+	);
+	prep.read = PassRead::Scoped(BTreeSet::from(["a.bin".to_string(), "b.bin".to_string()]));
+	assert_eq!(prep.seed_unhashed(&store).unwrap(), SeedCounts::default());
+	assert!(!rows_share_a_remote_item(&store, prep.record.id));
+	prep.fold_dir_moves().unwrap();
+	let screened = reconcile_and_screen_resident(&prep, screen_state(&prep));
+	assert_eq!(transfers(&screened), Vec::<&SyncAction>::new());
+	assert_eq!(conflict_paths(&screened), ["b.bin"]);
 }

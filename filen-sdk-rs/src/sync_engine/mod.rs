@@ -54,6 +54,8 @@ mod rows;
 #[cfg(feature = "bench-internals")]
 pub mod probe;
 mod scan;
+// Before a pass plans: record as synced the hashless remote files the local side provably agrees on.
+mod seed;
 // The two sides a pass reconciles, behind the narrowest access each consumer needs.
 mod side;
 // A pass's scratch SQLite file: its plan, staged for the apply to read a page at a time.

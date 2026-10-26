@@ -13,14 +13,26 @@
 //! populated side), a genuine post-baseline change is still detected, move/rename identity (uuid)
 //! survives the reopen, and the reopen is idempotent and durable across multiple cold starts.
 use std::borrow::Cow;
+#[cfg(feature = "malformed")]
+use std::{
+	fs::{File, FileTimes},
+	path::Path,
+	time::{Duration, SystemTime},
+};
 
+#[cfg(feature = "malformed")]
+use chrono::DateTime;
 use filen_macros::shared_test_runtime;
+#[cfg(feature = "malformed")]
+use filen_sdk_rs::auth::Client;
 use filen_sdk_rs::cache::open_sqlite;
 use filen_sdk_rs::fs::categories::{DirType, Normal};
 use filen_sdk_rs::fs::dir::RemoteDirectory;
 use filen_sdk_rs::fs::file::RemoteFile;
 use filen_sdk_rs::fs::{HasName, HasUUID};
 use filen_sdk_rs::sync_engine::{SyncEngine, SyncMode, SyncReport};
+#[cfg(feature = "malformed")]
+use rusqlite::OptionalExtension;
 use uuid::Uuid;
 
 use crate::harness::*;
@@ -86,6 +98,127 @@ fn assert_noop(r: &SyncReport) {
 	assert_eq!(r.conflicts.len(), 0, "{r:?}");
 	assert_eq!(r.held_deletions(), 0, "{r:?}");
 	assert!(r.errors.is_empty(), "{r:?}");
+}
+
+/// A remote `lastModified` with a non-zero millisecond part, so a match proves millisecond
+/// precision on both sides.
+#[cfg(feature = "malformed")]
+const STAMP_MS: i64 = 1_700_000_000_123;
+
+/// `BaselineState::Synced` as the baseline table stores it.
+#[cfg(feature = "malformed")]
+const SYNCED: i64 = 0;
+
+/// Upload `data` as `name` under `parent` with `lastModified` = `modified_ms`, then rewrite its
+/// metadata without the BLAKE3: a file as filen-sync (or an older SDK) leaves it on the server.
+#[cfg(feature = "malformed")]
+async fn stage_hashless(
+	client: &Client,
+	parent: Uuid,
+	name: &str,
+	data: &[u8],
+	modified_ms: i64,
+) -> RemoteFile {
+	let modified = DateTime::from_timestamp_millis(modified_ms).unwrap();
+	let builder = client
+		.make_file_builder(name, parent)
+		.unwrap()
+		.modified(modified);
+	let mut file = client.upload_file(builder, data).await.unwrap();
+	client.strip_file_hash(&mut file).await.unwrap();
+	file
+}
+
+/// A cache over `remote` whose first listing already holds the staged files, each checked to be
+/// listed under the uuid it was uploaded with, with no BLAKE3 and with the `lastModified` it was
+/// staged with — what the engine's remote view then reads.
+#[cfg(feature = "malformed")]
+async fn cache_over_hashless(
+	resources: &test_utils::TestResources,
+	staged: &[(&RemoteFile, i64)],
+) -> TestCache {
+	let remote = resources.dir.uuid();
+	let cache = TestCache::new(&resources.client, remote).await;
+	assert!(
+		wait_for_converged_resync(&cache.messages, remote, 0, CACHE_CONVERGE_TIMEOUT).await,
+		"the cache never listed the test root"
+	);
+	for (file, modified_ms) in staged {
+		let (hash, modified) = cached_hash_and_modified(cache.db_path(), file.uuid())
+			.unwrap_or_else(|| panic!("the cache does not list {} by its uuid", file.uuid()));
+		assert_eq!(hash, None, "the stripped file is listed with a BLAKE3");
+		assert_eq!(
+			modified, *modified_ms,
+			"the staged lastModified did not stick"
+		);
+	}
+	cache
+}
+
+/// The cached BLAKE3 (raw bytes) and `lastModified` (ms) of the file `uuid`, or `None` when the
+/// cache lists no file under that uuid. Any other database error panics with its cause.
+#[cfg(feature = "malformed")]
+fn cached_hash_and_modified(db_path: &Path, uuid: Uuid) -> Option<(Option<Vec<u8>>, i64)> {
+	open_read_db(db_path)
+		.unwrap()
+		.query_row(
+			"SELECT f.hash, f.modified FROM items i JOIN files f ON f.id = i.id WHERE i.uuid = ?",
+			rusqlite::params![uuid],
+			|row| Ok((row.get(0)?, row.get(1)?)),
+		)
+		.optional()
+		.unwrap()
+}
+
+/// Write `data` at `rel` under `root` with its mtime set to `mtime_ms`, to the millisecond.
+#[cfg(feature = "malformed")]
+fn write_file_at(root: &Path, rel: &str, data: &[u8], mtime_ms: i64) {
+	write_file(root, rel, data);
+	let path = root.join(rel);
+	let at = SystemTime::UNIX_EPOCH + Duration::from_millis(u64::try_from(mtime_ms).unwrap());
+	File::options()
+		.write(true)
+		.open(&path)
+		.unwrap()
+		.set_times(FileTimes::new().set_modified(at))
+		.unwrap();
+	assert_eq!(
+		std::fs::metadata(&path).unwrap().modified().unwrap(),
+		at,
+		"the mtime could not be set, so this test proves nothing"
+	);
+}
+
+/// A pair's baseline row at `rel`, as `(state, content_hash, agreed_hash, remote_uuid)`.
+#[cfg(feature = "malformed")]
+type BaselineRow = (i64, Option<Vec<u8>>, Option<Vec<u8>>, Option<Uuid>);
+
+/// The baseline row the engine persisted at `rel` (the DB holds the test's one pair), or `None`
+/// when it has none. Any other database error panics with its cause.
+#[cfg(feature = "malformed")]
+fn baseline_row(db_path: &Path, rel: &str) -> Option<BaselineRow> {
+	open_read_db(db_path)
+		.unwrap()
+		.query_row(
+			"SELECT state, content_hash, agreed_hash, remote_uuid FROM baseline WHERE rel_path = ?",
+			rusqlite::params![rel],
+			|row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+		)
+		.optional()
+		.unwrap()
+}
+
+/// Assert `rel` has a `Synced` row recording the local BLAKE3 of `data` as both the content and
+/// the agreed hash, against the remote version `remote`.
+#[cfg(feature = "malformed")]
+fn assert_seeded(db_path: &Path, rel: &str, data: &[u8], remote: Uuid) {
+	let (state, content, agreed, remote_uuid) =
+		baseline_row(db_path, rel).unwrap_or_else(|| panic!("no baseline row at {rel}"));
+	let local_hash = blake3::hash(data).as_bytes().to_vec();
+	assert_eq!(state, SYNCED, "{rel} is not recorded as synced");
+	assert_eq!(content.as_ref(), Some(&local_hash), "{rel}: content hash");
+	assert_eq!(agreed.as_ref(), Some(&local_hash), "{rel}: agreed hash");
+	assert_eq!(remote_uuid, Some(remote), "{rel}: remote version");
 }
 
 // ===========================================================================
@@ -561,6 +694,161 @@ async fn migrate_04_a_foreign_schema_version_fails_closed() {
 		.await
 		.unwrap();
 	assert_noop(&engine2.sync_once(pair2).await.unwrap());
+
+	std::fs::remove_dir_all(&local).ok();
+}
+
+// ===========================================================================
+// Hashless remote files: a pair migrated from filen-sync. Its remote files carry no BLAKE3, so
+// the content comparison never holds for them; before the first pass plans, the engine records as
+// synced the ones whose size and mtime prove the two sides agree.
+// ===========================================================================
+
+/// MIGRATE-11 — a hashless remote file and a byte-identical local file of the same size, whose
+/// remote `lastModified` is the local mtime to the millisecond, are recorded as synced on a
+/// two-way pair's first pass: nothing is transferred, no conflict is raised, and the row records
+/// the local BLAKE3 against the remote version. The next pass is a no-op, and a later local edit
+/// is pushed over that row like any other.
+#[cfg(feature = "malformed")]
+#[shared_test_runtime]
+async fn migrate_11_a_hashless_remote_matching_size_and_mtime_is_recorded_as_synced() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let remote: Uuid = resources.dir.uuid();
+	let data = b"uploaded by filen-sync, never hashed";
+	let staged = stage_hashless(&resources.client, remote, "f.bin", data, STAMP_MS).await;
+	let cache = cache_over_hashless(&resources, &[(&staged, STAMP_MS)]).await;
+	let local = fresh_local_dir("migrate11");
+	write_file_at(&local, "f.bin", data, STAMP_MS);
+	let db_path = temp_cache_path();
+
+	let engine = SyncEngine::open(cache.client.clone(), db_path.clone())
+		.await
+		.unwrap();
+	let pair = engine
+		.add_pair(local.clone(), remote, SyncMode::TwoWay)
+		.await
+		.unwrap();
+	let r1 = engine.sync_once(pair).await.unwrap();
+	assert_noop(&r1);
+	assert_seeded(&db_path, "f.bin", data, staged.uuid());
+	assert_noop(&engine.sync_once(pair).await.unwrap());
+
+	// The row is an ordinary synced one: a local edit after it is pushed, not a conflict.
+	let edited = b"edited after the migration";
+	write_file(&local, "f.bin", edited);
+	let r3 = engine.sync_once(pair).await.unwrap();
+	assert!(r3.errors.is_empty(), "{r3:?}");
+	assert_eq!(r3.uploaded, 1, "the local edit must be pushed: {r3:?}");
+	assert_eq!(r3.downloaded, 0, "{r3:?}");
+	assert_eq!(r3.conflicts.len(), 0, "{r3:?}");
+	let (_d, files) = list_dir(&cache, &resources.dir).await;
+	let pushed = find_file(&files, "f.bin").expect("f.bin missing remotely");
+	assert_eq!(
+		pushed.size,
+		edited.len() as u64,
+		"the remote is not the edit"
+	);
+	assert_eq!(files.len(), 1, "the push left a second file: {files:?}");
+
+	std::fs::remove_dir_all(&local).ok();
+}
+
+/// MIGRATE-12 — the same evidence on a local-to-remote pair: the first pass records the file as
+/// synced instead of re-uploading it, so the remote keeps the version it had, and the next pass is
+/// a no-op.
+#[cfg(feature = "malformed")]
+#[shared_test_runtime]
+async fn migrate_12_a_hashless_remote_matching_size_and_mtime_is_not_reuploaded() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let remote: Uuid = resources.dir.uuid();
+	let data = b"one-way, uploaded by filen-sync";
+	let staged = stage_hashless(&resources.client, remote, "f.bin", data, STAMP_MS).await;
+	let cache = cache_over_hashless(&resources, &[(&staged, STAMP_MS)]).await;
+	let local = fresh_local_dir("migrate12");
+	write_file_at(&local, "f.bin", data, STAMP_MS);
+	let db_path = temp_cache_path();
+
+	let engine = SyncEngine::open(cache.client.clone(), db_path.clone())
+		.await
+		.unwrap();
+	let pair = engine
+		.add_pair(local.clone(), remote, SyncMode::LocalToRemote)
+		.await
+		.unwrap();
+	assert_noop(&engine.sync_once(pair).await.unwrap());
+	assert_seeded(&db_path, "f.bin", data, staged.uuid());
+	assert_noop(&engine.sync_once(pair).await.unwrap());
+
+	let (_d, files) = list_dir(&cache, &resources.dir).await;
+	assert_eq!(files.len(), 1, "{files:?}");
+	assert_eq!(
+		find_file(&files, "f.bin")
+			.expect("f.bin missing remotely")
+			.uuid(),
+		staged.uuid(),
+		"the remote version changed: the file was re-uploaded"
+	);
+
+	std::fs::remove_dir_all(&local).ok();
+}
+
+/// MIGRATE-13 — two empty files are recorded as synced whatever their stamps say, since their
+/// content is provably the same; a non-empty file whose remote `lastModified` is 1 ms off the local
+/// mtime is not, and stays the two-way conflict it was before seeding existed. There is no
+/// tolerance to creep back in.
+#[cfg(feature = "malformed")]
+#[shared_test_runtime]
+async fn migrate_13_empty_files_are_recorded_whatever_their_mtimes_but_a_1ms_miss_is_not() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let remote: Uuid = resources.dir.uuid();
+	let data = b"one millisecond apart";
+	let empty = stage_hashless(&resources.client, remote, "empty.bin", b"", STAMP_MS).await;
+	let off = stage_hashless(&resources.client, remote, "off.bin", data, STAMP_MS).await;
+	let cache = cache_over_hashless(&resources, &[(&empty, STAMP_MS), (&off, STAMP_MS)]).await;
+	let local = fresh_local_dir("migrate13");
+	write_file_at(&local, "empty.bin", b"", STAMP_MS + 3_600_000);
+	write_file_at(&local, "off.bin", data, STAMP_MS + 1);
+	let db_path = temp_cache_path();
+
+	let engine = SyncEngine::open(cache.client.clone(), db_path.clone())
+		.await
+		.unwrap();
+	let pair = engine
+		.add_pair(local.clone(), remote, SyncMode::TwoWay)
+		.await
+		.unwrap();
+	let r1 = engine.sync_once(pair).await.unwrap();
+	assert!(r1.errors.is_empty(), "{r1:?}");
+	assert_eq!(r1.uploaded, 0, "{r1:?}");
+	assert_eq!(r1.downloaded, 0, "{r1:?}");
+	let conflicted: Vec<&str> = r1.conflicts.iter().map(|c| c.rel_path.as_str()).collect();
+	assert_eq!(
+		conflicted,
+		["off.bin"],
+		"only the 1 ms miss may conflict: {r1:?}"
+	);
+	assert_seeded(&db_path, "empty.bin", b"", empty.uuid());
+	assert_ne!(
+		baseline_row(&db_path, "off.bin").map(|row| row.0),
+		Some(SYNCED),
+		"a 1 ms miss was recorded as synced"
+	);
+
+	// Both sides are left as they were.
+	assert!(read_eq(&local, "off.bin", data));
+	let (_d, files) = list_dir(&cache, &resources.dir).await;
+	assert_eq!(
+		find_file(&files, "off.bin")
+			.expect("off.bin missing remotely")
+			.uuid(),
+		off.uuid()
+	);
+	assert_eq!(
+		find_file(&files, "empty.bin")
+			.expect("empty.bin missing remotely")
+			.uuid(),
+		empty.uuid()
+	);
 
 	std::fs::remove_dir_all(&local).ok();
 }

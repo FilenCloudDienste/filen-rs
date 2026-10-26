@@ -128,7 +128,16 @@ const BY_LINEAGE: &str =
 /// [`FILE_OF_UUID`], by lineage.
 const FILE_OF_LINEAGE: &str =
 	"SELECT path FROM remote WHERE lineage = ?1 AND kind = 2 ORDER BY path DESC LIMIT 1";
-// The two statements above spell a file's kind out.
+/// Built by the first read of the files with no hash, which only a real whole pass's seeding stage
+/// makes (see `seed`): a pair whose every file carries a BLAKE3 reads one empty range of it.
+const BY_UNHASHED: &str =
+	"CREATE INDEX IF NOT EXISTS remote_unhashed ON remote (path) WHERE kind = 2 AND hash IS NULL";
+/// Up to `?2` FILES with no hash after the path `?1`, in path order, off [`BY_UNHASHED`]'s index.
+/// Named, so the read seeks the index or refuses to prepare rather than walking the table.
+const UNHASHED_AFTER: &str = "SELECT path, kind, uuid, lineage, hash, size, modified
+	 FROM remote INDEXED BY remote_unhashed
+	 WHERE kind = 2 AND hash IS NULL AND path > ?1 ORDER BY path LIMIT ?2";
+// The statements above spell a file's kind out.
 const _: () = assert!(NodeKind::File.as_i64() == 2);
 /// Every folded path two or more nodes have, off the folded index.
 const TWIN_KEYS: &str = "SELECT fold(path) FROM remote GROUP BY fold(path) HAVING count(*) > 1";
@@ -601,6 +610,43 @@ impl StagedSide<RemoteNode> {
 			conn.prepare_cached(FILE_OF_LINEAGE)?
 				.query_row([lineage], |row| row.get(0))
 				.optional()
+		})
+	}
+
+	/// Up to `limit` of the FILES it holds with no hash, after the path `after` (`""` for the first),
+	/// in path order; the first call builds the index they are read off.
+	pub(in super::super) fn unhashed_files_after(
+		&self,
+		after: &str,
+		limit: usize,
+	) -> Vec<RemoteNode> {
+		self.read("the files with no hash", |conn| {
+			conn.execute_batch(BY_UNHASHED)?;
+			conn.prepare_cached(UNHASHED_AFTER)?
+				.query_map(params![after, limit], node_of)?
+				.collect()
+		})
+	}
+
+	/// Every FILE it holds with no hash, in path order, a page at a time: the seeding stage's
+	/// candidates on a whole pass (see `seed`). None of the other rows is read.
+	pub(in super::super) fn unhashed_files(&self) -> impl Iterator<Item = RemoteNode> + '_ {
+		let limit = self.page().get();
+		let mut after = Some(String::new());
+		let mut page = Vec::new().into_iter();
+		std::iter::from_fn(move || {
+			loop {
+				if let Some(node) = page.next() {
+					return Some(node);
+				}
+				let from = after.take()?;
+				let nodes = self.unhashed_files_after(&from, limit);
+				// A short page was the last.
+				if nodes.len() == limit {
+					after = nodes.last().map(|node| node.rel_path.clone());
+				}
+				page = nodes.into_iter();
+			}
 		})
 	}
 

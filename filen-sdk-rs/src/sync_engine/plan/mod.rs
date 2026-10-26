@@ -1887,9 +1887,10 @@ fn reconcile_two_way(
 /// and the only endpoint such a row could match is its own path — which [`detect_moves`] refuses
 /// (`to != from`). The one shape that would break the equivalence is two `Synced` rows recording
 /// one remote uuid or one lineage id, and no write path produces one: a move commits the delete of
-/// its source and the insert of its destination in a single transaction. A debug build asserts it
-/// over the decided rows where the directory-move fold reads them (`FoldDirs::read`), whose
-/// pruning of what a proven move carried rests on it as well (see [`fold_dir_moves`]).
+/// its source and the insert of its destination in a single transaction, and the seeding stage
+/// (see [`seed`](super::seed)) writes no row for a remote item a row already records. A debug build
+/// asserts it over the decided rows where the directory-move fold reads them (`FoldDirs::read`),
+/// whose pruning of what a proven move carried rests on it as well (see [`fold_dir_moves`]).
 fn visit_move_sources(
 	paths: PassPaths<'_>,
 	baseline: &Baseline,

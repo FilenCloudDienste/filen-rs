@@ -563,6 +563,30 @@ impl Client {
 		Ok(uuid)
 	}
 
+	/// Rewrites `file`'s metadata without its BLAKE3, so a real upload reads like one from a client
+	/// that records no content hash (filen-sync, the older SDKs). The rest of the metadata is
+	/// written back as it is, `lastModified` included, and `file` is updated to match. The file's
+	/// shares and public links are not updated.
+	///
+	/// Test-only: it lets the sync engine's live tests stage a hashless remote file.
+	#[cfg(feature = "malformed")]
+	pub async fn strip_file_hash(&self, file: &mut RemoteFile) -> Result<(), Error> {
+		let _lock = self.lock_drive().await?;
+		let uuid = file.uuid();
+		let FileMeta::Decoded(meta) = &mut file.meta else {
+			return Err(MetadataWasNotDecryptedError.into());
+		};
+		let unchanged = FileMetaChanges::default();
+		let stripped = DecryptedFileMeta {
+			hash: None,
+			..meta.borrowed_with_changes(&unchanged)
+		};
+		let request = self.file_metadata_request(uuid, &stripped).await?;
+		api::v3::file::metadata::post(self.client(), &request).await?;
+		meta.hash = None;
+		Ok(())
+	}
+
 	/// Downloads a single file chunk by raw `region`/`bucket`/`uuid`/`chunk_idx`,
 	/// bypassing any local file metadata.
 	///

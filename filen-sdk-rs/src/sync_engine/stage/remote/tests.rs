@@ -11,7 +11,7 @@ use super::{
 			scan::QUARANTINE_DIR,
 			side::Nodes,
 		},
-		assert_views_alike, paging_of,
+		assert_views_alike, paging_of, staged_sides,
 		tests::row,
 	},
 	*,
@@ -518,5 +518,62 @@ fn a_staged_view_finds_items_by_uuid_as_a_walk_does() {
 			(Uuid::from_u128(10), "notes".to_owned()),
 			(Uuid::from_u128(11), "notes/a.txt".to_owned()),
 		])
+	);
+}
+
+/// The seeding stage's candidates on a whole pass: the files with no hash, in path order, a page
+/// at a time, with neither a hashed file nor a directory among them.
+#[test]
+fn a_staged_view_pages_its_hashless_files_in_path_order() {
+	let node = |path: &str, kind: NodeKind, hash: Option<Blake3Hash>, uuid: u128| RemoteNode {
+		rel_path: path.to_owned(),
+		kind,
+		remote_uuid: Uuid::from_u128(uuid),
+		stable_uuid: None,
+		content_hash: hash,
+		size: 1,
+		modified_millis: 1,
+	};
+	let hashed = Some(Blake3Hash::from([1; 32]));
+	let nodes = vec![
+		node("e.bin", NodeKind::File, None, 10),
+		node("a.bin", NodeKind::File, None, 11),
+		node("b.bin", NodeKind::File, hashed, 12),
+		node("c", NodeKind::Dir, None, 13),
+		node("c/d.bin", NodeKind::File, None, 14),
+		node("c/f.bin", NodeKind::File, hashed, 15),
+		node("z.bin", NodeKind::File, None, 16),
+	];
+	let (_dir, _local, remote) = staged_sides(std::iter::empty(), nodes, 2);
+	let Side::Staged(staged) = &remote else {
+		panic!("staged_sides stages the remote side");
+	};
+	let paths = |nodes: Vec<RemoteNode>| -> Vec<String> {
+		nodes.into_iter().map(|node| node.rel_path).collect()
+	};
+	assert_eq!(
+		paths(staged.unhashed_files_after("", 2)),
+		["a.bin", "c/d.bin"]
+	);
+	assert_eq!(
+		paths(staged.unhashed_files_after("c/d.bin", 2)),
+		["e.bin", "z.bin"]
+	);
+	assert!(staged.unhashed_files_after("z.bin", 2).is_empty());
+	// Across the page boundary, two rows a statement, and a last page that comes back full.
+	assert_eq!(
+		paths(staged.unhashed_files().collect()),
+		["a.bin", "c/d.bin", "e.bin", "z.bin"]
+	);
+	assert_eq!(
+		remote
+			.whole()
+			.unhashed_files()
+			.map(|(path, node)| {
+				assert_eq!(path, node.rel_path);
+				path.into_owned()
+			})
+			.collect::<Vec<_>>(),
+		["a.bin", "c/d.bin", "e.bin", "z.bin"]
 	);
 }

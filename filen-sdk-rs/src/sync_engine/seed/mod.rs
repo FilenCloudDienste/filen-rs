@@ -1,0 +1,221 @@
+//! The seeding stage: before a pass plans, record as synced the files both sides already agree on
+//! that the remote cannot prove it agrees on.
+//!
+//! A file uploaded by a client that writes no BLAKE3 (filen-sync, the older SDKs) has a remote with
+//! no content hash, so the direct comparison the reconcile makes between the two sides never holds
+//! for it. With a baseline row the planner has a fallback for that (`plan::remote_matches_local`,
+//! `plan::classify_remote_file`: the row's local hash and remote version are the evidence). Without
+//! one — a pair migrated from filen-sync, whose files were never synced by this engine — every such
+//! file reads as created on both sides: a conflict in two-way, a transfer in a one-way mode.
+//!
+//! So before the pass plans, every path with no row where both sides hold a FILE, the remote has no
+//! BLAKE3 and the local one has been hashed is weighed here, and where the evidence holds it gets a
+//! `Synced` row. The planner then reads the path as it reads any synced one, through those same
+//! fallbacks, and nothing is planned there. The evidence, in the order it is weighed:
+//!
+//! - both files are empty: the content is provably the same, whatever the stamps say;
+//! - the sizes are equal and the remote's `lastModified` is the local mtime to the millisecond. A
+//!   remote stamp of 0 is a missing one and never matches. There is no tolerance: a miss goes the
+//!   safe way, a conflict or a transfer, where a tolerance would adopt a different file.
+//!
+//! A file whose remote item another row already records — by its version or its whole-life id —
+//! is never seeded: that is the same file renamed on both sides, which the move detection carries
+//! as a move, and a second `Synced` row for one remote item is the one shape it and the
+//! directory-move fold must never read (see `plan::visit_move_sources`).
+//!
+//! Only a real pass seeds: a dry run, the adoption read of a mode switch and the benchmark read
+//! nothing into the store ([`Seeding::Skip`]).
+
+use std::borrow::Cow;
+
+use filen_types::fs::StableUuid;
+use uuid::Uuid;
+
+use super::{
+	baseline::{BaselineEntry, BaselineState, BaselineStore, NodeKind, PairId},
+	plan::RemoteNode,
+	rows::Baseline,
+	scan::LocalNode,
+	side::NodesAt,
+};
+
+/// How many seeded rows go into the store a transaction. A migrated pair can have a hashless file
+/// per item of its tree, and one transaction for the lot would hold the baseline file's write lock
+/// while the stage is read — every other pair's write waiting on it. Each row stands on its own
+/// (it records an agreement the pass observed), so a cut between two chunks loses nothing.
+const SEED_CHUNK: usize = 1024;
+
+/// Whether a pass's read may write the rows this stage seeds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Seeding {
+	/// A real pass: seed, then plan from the rows as the store holds them.
+	Write,
+	/// A read that writes nothing: a dry run, the adoption read of a mode switch, the benchmark.
+	Skip,
+}
+
+/// Which evidence recorded a path as synced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Evidence {
+	/// Both files are empty.
+	Empty,
+	/// The same size, and the remote's `lastModified` is the local mtime to the millisecond.
+	SizeAndMtime,
+}
+
+/// How many paths a seeding recorded, by the evidence that recorded each.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct SeedCounts {
+	pub(super) empty: usize,
+	pub(super) size_and_mtime: usize,
+}
+
+impl SeedCounts {
+	fn count(&mut self, evidence: Evidence) {
+		match evidence {
+			Evidence::Empty => self.empty += 1,
+			Evidence::SizeAndMtime => self.size_and_mtime += 1,
+		}
+	}
+
+	pub(super) fn total(&self) -> usize {
+		self.empty + self.size_and_mtime
+	}
+}
+
+/// Whether the two nodes at a rowless path are what this stage weighs: a file on both sides, the
+/// remote with no BLAKE3 and the local one hashed. A remote with a hash is never one — the direct
+/// comparison is the only test there.
+pub(super) fn candidate(local: &LocalNode, remote: &RemoteNode) -> bool {
+	local.kind == NodeKind::File
+		&& remote.kind == NodeKind::File
+		&& remote.content_hash.is_none()
+		&& local.content_hash.is_some()
+}
+
+/// The evidence that the two files of a [`candidate`] hold the same content, if there is any (see
+/// the module docs). Plain equality on both stamps: no arithmetic, no tolerance.
+pub(super) fn evidence(local: &LocalNode, remote: &RemoteNode) -> Option<Evidence> {
+	if local.size != remote.size {
+		return None;
+	}
+	if local.size == 0 {
+		return Some(Evidence::Empty);
+	}
+	(remote.modified_millis != 0 && remote.modified_millis == local.mtime_millis)
+		.then_some(Evidence::SizeAndMtime)
+}
+
+/// The row that records `rel_path` as synced, as `apply::adopt_outcome` records a converged file,
+/// except that the content is the local side's: the remote has no hash to give. Both markers are
+/// the local hash, so the row awaits no confirmation and a later pass carries it like any other.
+///
+/// The local mtime is the scan's, the read the hash belongs to — for the reason `adopt_outcome`
+/// gives: a fresh stat paired with the scan's hash could hide an edit made since the scan forever.
+pub(super) fn seeded_row(rel_path: &str, local: &LocalNode, remote: &RemoteNode) -> BaselineEntry {
+	BaselineEntry {
+		rel_path: rel_path.to_owned(),
+		kind: NodeKind::File,
+		remote_uuid: Some(remote.remote_uuid),
+		content_hash: local.content_hash,
+		size: Some(local.size),
+		local_mtime: Some(local.mtime_millis),
+		remote_modified: Some(remote.modified_millis),
+		state: BaselineState::Synced,
+		local_kind: None,
+		remote_kind: None,
+		remote_hash: None,
+		remote_size: None,
+		remote_stable_uuid: remote.stable_uuid,
+		agreed_hash: local.content_hash,
+	}
+}
+
+/// Weigh each of `candidates` — remote nodes with the paths they are at — and write a row for every
+/// one the evidence records as synced, [`SEED_CHUNK`] rows a transaction.
+///
+/// A path is left alone when `skip` says the pass does not act on it, when `baseline` has a row
+/// there, when `local` holds nothing there, or when the two nodes are no [`candidate`]. A row the
+/// evidence holds for is dropped when the store already records its remote uuid or lineage at
+/// another path (see the module docs); that is asked once a chunk, of the rows about to be
+/// written, so a pass seeding nothing asks nothing. The rows are written through the store's own
+/// statement, so nothing a pass's snapshot holds is overwritten: every path written is one that
+/// snapshot has no row at, and the pass holds the pair's gate.
+pub(super) fn seed<'a>(
+	store: &BaselineStore,
+	pair: PairId,
+	baseline: &Baseline,
+	local: &impl NodesAt<Node = LocalNode>,
+	candidates: impl Iterator<Item = (Cow<'a, str>, Cow<'a, RemoteNode>)>,
+	skip: impl Fn(&str) -> bool,
+) -> rusqlite::Result<SeedCounts> {
+	let mut counts = SeedCounts::default();
+	let mut rows: Vec<(BaselineEntry, Evidence)> = Vec::new();
+	for (path, remote) in candidates {
+		if skip(&path) || baseline.contains_key(&path) {
+			continue;
+		}
+		let Some(local) = local.at(&path) else {
+			continue;
+		};
+		if !candidate(&local, &remote) {
+			continue;
+		}
+		let Some(evidence) = evidence(&local, &remote) else {
+			continue;
+		};
+		rows.push((seeded_row(&path, &local, &remote), evidence));
+		if rows.len() == SEED_CHUNK {
+			write_unclaimed(store, pair, &mut rows, &mut counts)?;
+		}
+	}
+	if !rows.is_empty() {
+		write_unclaimed(store, pair, &mut rows, &mut counts)?;
+	}
+	Ok(counts)
+}
+
+/// Write the `rows` no row in the store already records the remote item of, by uuid or by lineage,
+/// counting each by its evidence, and empty `rows`.
+fn write_unclaimed(
+	store: &BaselineStore,
+	pair: PairId,
+	rows: &mut Vec<(BaselineEntry, Evidence)>,
+	counts: &mut SeedCounts,
+) -> rusqlite::Result<()> {
+	let uuids: Vec<Uuid> = rows.iter().filter_map(|(row, _)| row.remote_uuid).collect();
+	let lineages: Vec<StableUuid> = rows
+		.iter()
+		.filter_map(|(row, _)| row.remote_stable_uuid)
+		.collect();
+	let claimed = store.synced_paths(pair, &uuids, &lineages)?;
+	let unclaimed: Vec<BaselineEntry> = rows
+		.drain(..)
+		.filter_map(|(row, evidence)| {
+			let recorded_at = row
+				.remote_uuid
+				.and_then(|uuid| claimed.path_by_uuid(uuid))
+				.or_else(|| {
+					row.remote_stable_uuid
+						.and_then(|lineage| claimed.path_by_lineage(lineage))
+				});
+			if let Some(recorded_at) = recorded_at {
+				tracing::debug!(
+					"seed[pair {pair}]: not recording {:?} as synced: {recorded_at:?} records its \
+					 remote item",
+					row.rel_path
+				);
+				return None;
+			}
+			counts.count(evidence);
+			Some(row)
+		})
+		.collect();
+	if unclaimed.is_empty() {
+		return Ok(());
+	}
+	store.seed_rows(pair, &unclaimed)
+}
+
+#[cfg(test)]
+mod tests;

@@ -51,6 +51,7 @@ use super::{
 	remote::{RemoteObserved, cache_ancestry, delta_uuids, observe_remote},
 	rows::Baseline,
 	scan::{self, LocalScan, RuleFiles, ScanError},
+	seed::{self, SeedCounts, Seeding},
 	side::{Nodes, NodesAt, Side, SideRef},
 	stage::{self, Confirmed, Rows, Screen, ScreenError, Stage, StagedPlan},
 };
@@ -1879,7 +1880,8 @@ impl SyncEngine {
 		pair: PairId,
 		scope: Option<&mut PassScope>,
 	) -> Result<BenchPass, Error> {
-		let prep = self.prepare(pair, scope).await?;
+		// It applies nothing, so it seeds nothing either: the probe does not time the stage.
+		let prep = self.prepare(pair, scope, Seeding::Skip).await?;
 		super::step("prepare_tail");
 		let state = screen_state(&prep);
 		let at = self.stage_at(pair);
@@ -2257,6 +2259,11 @@ pub(super) fn unaccounted_key(
 struct Prepared {
 	record: PairRecord,
 	baseline: Baseline,
+	/// How many rows the pair tracked when the pass read its baseline, before the seeding stage
+	/// wrote any (see [`seed_unhashed`](Self::seed_unhashed)). The guard's whole-tree judgements are
+	/// made from this, so a pass that seeds its first rows is still a first sync and its deletions
+	/// are still held.
+	tracked_at_start: usize,
 	/// What this pass read, and why (see [`PassRead`]).
 	read: PassRead,
 	/// The announced remote changes this pass CONSUMED — kept so a pass cut short can hand them
@@ -2307,6 +2314,100 @@ struct Prepared {
 }
 
 impl Prepared {
+	/// The pass's seeding stage (see [`seed`]), on a blocking thread, where `seeding` lets it
+	/// write: the pass comes back reading the rows it seeded.
+	///
+	/// Run after everything else the read does and before the directory-move fold, the one step that
+	/// layers more onto the rows than the confirmations: a fresh snapshot keeps neither, and this
+	/// puts the confirmations back.
+	async fn seeded(self, store: &SharedStore, seeding: Seeding) -> Result<Self, Error> {
+		match seeding {
+			Seeding::Skip => Ok(self),
+			Seeding::Write => {
+				let store = Arc::clone(store);
+				let (prepared, seeded) = off_runtime(
+					"recording the hashless files both sides agree on",
+					move || {
+						let mut prepared = self;
+						let seeded = prepared.seed_unhashed(&locked(&store));
+						(prepared, seeded)
+					},
+				)
+				.await?;
+				seeded?;
+				Ok(prepared)
+			}
+		}
+	}
+
+	/// Record as synced every rowless path where both sides hold a file the remote has no BLAKE3
+	/// for and the evidence says the two agree (see [`seed`]), then read the rows again so the plan
+	/// sees them. Returns what it recorded, by evidence.
+	///
+	/// The candidates are what this pass decides: on a whole read the remote view's hashless files,
+	/// read off the stage's index of them; on a change-scoped one the paths its read decided. A path
+	/// the pass would not act on — held, blocked, hidden or failing — is left for a pass that does,
+	/// and a pass that will be refused writes nothing at all.
+	///
+	/// The rows are read again from the store rather than layered onto this pass's view, and the
+	/// confirmations the pass found are put back on them; the guard's first-sync and tracked counts
+	/// stay what the pass started from ([`tracked_at_start`](Self::tracked_at_start)).
+	fn seed_unhashed(&mut self, store: &BaselineStore) -> Result<SeedCounts, Error> {
+		if refusal(self).is_some() {
+			return Ok(SeedCounts::default());
+		}
+		let pair = self.record.id;
+		let seeded = {
+			let blocked = self.blocked_paths();
+			let skip = |path: &str| {
+				self.hides(path)
+					|| plan::at_or_under_root(&blocked, path)
+					|| plan::is_under_held_path(path, &self.holds.held_remote)
+			};
+			let local = self.local_scan.nodes.of(&self.baseline);
+			let remote = self.remote_view.nodes.of(&self.baseline);
+			match &self.read {
+				PassRead::Whole(_) => seed::seed(
+					store,
+					pair,
+					&self.baseline,
+					&local,
+					remote.unhashed_files(),
+					skip,
+				),
+				PassRead::Scoped(decided) => seed::seed(
+					store,
+					pair,
+					&self.baseline,
+					&local,
+					decided.iter().filter_map(|path| {
+						remote.at(path).map(|node| (Cow::from(path.as_str()), node))
+					}),
+					skip,
+				),
+			}
+			.map_err(|e| db_error(e, "recording the hashless files both sides agree on"))?
+		};
+		if seeded.total() == 0 {
+			return Ok(seeded);
+		}
+		tracing::info!(
+			"sync_once[pair {pair}]: recorded {} hashless remote file(s) as synced with the local \
+			 one: {} empty on both sides, {} of the same size and modification time",
+			seeded.total(),
+			seeded.empty,
+			seeded.size_and_mtime
+		);
+		// This pass's snapshot goes first, so the fresh one reads on the connection it gives back.
+		drop(mem::take(&mut self.baseline));
+		let mut fresh = store
+			.baseline(pair)
+			.map_err(|e| db_error(e, "reading the baseline again after seeding it"))?;
+		fresh.confirm(&self.confirmed);
+		self.baseline = fresh;
+		Ok(seeded)
+	}
+
 	/// Carry each directory move across as one move — a case-only rename included — and read the
 	/// rest of the pass where those subtrees end up (see [`plan::fold_dir_moves`]).
 	///
@@ -3362,7 +3463,8 @@ impl SyncEngine {
 			// A read that fails panics as a pass's does, and is this call's error as a pass's is.
 			Backlog::AdoptDestination => {
 				pass_panics_as_errors(pair, "the adoption read", async {
-					let prep = self.prepare(pair, None).await?;
+					// A read, not a pass: it seeds nothing.
+					let prep = self.prepare(pair, None, Seeding::Skip).await?;
 					// The adoption rewrites baseline rows from this one read, and every row it writes
 					// is for a path it reads as GONE on the source side — so it needs the same
 					// evidence a pass needs before acting on an absence. Read through an incomplete
@@ -4041,10 +4143,14 @@ impl SyncEngine {
 	///
 	/// `scope` is the pass's changelists, taken before this runs. `None` is a dry run, which always
 	/// reads whole: it is rare, and its report has to show the whole picture (plan 3.5).
+	///
+	/// `seeding` says whether the read may record hashless files both sides agree on before it hands
+	/// the pass over (see [`seed`]): only a pass that goes on to apply writes them.
 	async fn prepare(
 		&self,
 		pair: PairId,
 		scope: Option<&mut PassScope>,
+		seeding: Seeding,
 	) -> Result<Prepared, Error> {
 		let inputs = self.pass_inputs(pair).await?;
 		// The per-pass DB prologue, bounded on its own: five statements and a `spawn_blocking` hop,
@@ -4059,17 +4165,18 @@ impl SyncEngine {
 		if forced.is_none()
 			&& let Some(scope) = scope
 		{
-			match self.prepare_scoped(inputs, scope).await? {
+			match self.prepare_scoped(inputs, scope, seeding).await? {
 				Scoped::Prepared(prepared) => return Ok(*prepared),
 				// The derivation could not answer for something it was handed.
 				Scoped::Whole(inputs, reason) => {
 					return self
-						.prepare_whole(*inputs, PassRead::Whole(Some(reason)))
+						.prepare_whole(*inputs, PassRead::Whole(Some(reason)), seeding)
 						.await;
 				}
 			}
 		}
-		self.prepare_whole(inputs, PassRead::Whole(forced)).await
+		self.prepare_whole(inputs, PassRead::Whole(forced), seeding)
+			.await
 	}
 
 	/// The change-scoped half of [`prepare`](Self::prepare): re-observe the paths the changelists
@@ -4082,6 +4189,7 @@ impl SyncEngine {
 		&self,
 		mut inputs: PassInputs,
 		scope: &mut PassScope,
+		seeding: Seeding,
 	) -> Result<Scoped, Error> {
 		let pair = inputs.record.id;
 		// What the last pass left. Without it there is nothing to carry the blocked paths or the
@@ -4483,8 +4591,10 @@ impl SyncEngine {
 			ignore_blocked: BTreeSet::new(),
 		};
 		let remote_emptied = remote_emptied(&view.nodes.of(&inputs.baseline), &inputs.baseline);
-		let mut prepared = Prepared {
+		let store = Arc::clone(&inputs.store);
+		let prepared = Prepared {
 			record: inputs.record,
+			tracked_at_start: inputs.baseline.len(),
 			baseline: inputs.baseline,
 			read: PassRead::Scoped(mem::take(&mut derived.decided)),
 			remote_delta: delta,
@@ -4504,9 +4614,14 @@ impl SyncEngine {
 			confirmed,
 		};
 		super::step("local_scan_assembly");
+		// Before the fold, whose layers a fresh snapshot of the rows would lose.
+		let mut prepared = prepared.seeded(&store, seeding).await?;
 		if let Err(reason) = prepared.fold_dir_moves() {
 			// The fold may already have moved rows in this pass's view of them, so the whole read
-			// starts from the store's own — once this pass's maps and snapshot are let go.
+			// starts from the store's own — once this pass's maps and snapshot are let go. Those
+			// include any rows this pass seeded, so the whole read counts them as tracked: it cannot
+			// make a first sync of this one, which a change-scoped pass never is (an empty baseline
+			// always reads whole).
 			drop(prepared);
 			return Ok(Scoped::Whole(
 				Box::new(self.pass_inputs(pair).await?),
@@ -4519,7 +4634,12 @@ impl SyncEngine {
 
 	/// The whole-tree half of [`prepare`](Self::prepare): read both sides entire, which is the only
 	/// read that can find a change nothing announced.
-	async fn prepare_whole(&self, inputs: PassInputs, read: PassRead) -> Result<Prepared, Error> {
+	async fn prepare_whole(
+		&self,
+		inputs: PassInputs,
+		read: PassRead,
+		seeding: Seeding,
+	) -> Result<Prepared, Error> {
 		let PassInputs {
 			record,
 			user_ignore,
@@ -4781,8 +4901,9 @@ impl SyncEngine {
 		holds.held_remote = remote_view.held_paths.clone();
 		self.observed.prune_before(self.pending.oldest_stamp());
 
-		let mut prepared = Prepared {
+		let prepared = Prepared {
 			record,
+			tracked_at_start: baseline.len(),
 			baseline,
 			read,
 			// A whole read derives nothing from the announced changes, so it has none to hand on.
@@ -4800,6 +4921,8 @@ impl SyncEngine {
 			last_ignored,
 			confirmed,
 		};
+		// Before the fold, whose layers a fresh snapshot of the rows would lose.
+		let mut prepared = prepared.seeded(&store, seeding).await?;
 		// AFTER the pending-write fold: a move of ours the cache has not shown yet must read as done,
 		// not as the remote moving the directory back. On a blocking thread: the fold reads and
 		// re-keys both staged sides.
@@ -4823,8 +4946,11 @@ impl SyncEngine {
 	/// must not be something [`remove_pair`](Self::remove_pair) waits for. That is not the same as
 	/// touching nothing — it runs the same [`prepare`](Self::prepare), so it makes that read's
 	/// server calls and retires the journal records that read settles. What it does NOT do is
-	/// persist the confirmations it observed. A [`paused`](Self::pause_pair) pair is planned like
-	/// any other.
+	/// persist the confirmations it observed, nor record as synced the hashless remote files a pass
+	/// would (see [`sync_once`](Self::sync_once)): where a pass would find a hashless file's size and
+	/// mtime agree with the local one's and plan nothing there, a dry run of a path that has never
+	/// synced shows the conflict (two-way) or the transfer (one-way) that the evidence spares the
+	/// pass. A [`paused`](Self::pause_pair) pair is planned like any other.
 	///
 	/// A read that fails is the call's error, as it is a pass's: a baseline read that fails panics
 	/// on purpose, and that panic comes back here as an [`ErrorKind::Internal`] error.
@@ -4840,7 +4966,7 @@ impl SyncEngine {
 
 	/// [`plan_pair`](Self::plan_pair), up to giving back the page caches its read filled.
 	async fn plan_pair_unreleased(&self, pair: PairId) -> Result<PlanOutcome, Error> {
-		let prep = self.prepare(pair, None).await?;
+		let prep = self.prepare(pair, None, Seeding::Skip).await?;
 		if let Some(reason) = refusal(&prep) {
 			return Ok(PlanOutcome {
 				refused: Some(reason),
@@ -5598,6 +5724,13 @@ impl SyncEngine {
 	/// [`interrupted`](SyncReport::interrupted) counting what it did not do. A cancel that lands
 	/// before there is a plan to count returns the [`paused`](SyncReport::paused) report instead,
 	/// having read one side and applied nothing; if the pair was being REMOVED, that is an error.
+	///
+	/// Before it plans, a pass records as synced every path that has never synced where both sides
+	/// hold a file, the remote one carries no BLAKE3 (another client uploaded it without one) and
+	/// either both are empty or their sizes are equal and the remote's modification time is the
+	/// local one to the millisecond. A tree another client synced before this engine then reads as
+	/// synced rather than as created on both sides. Those records stand even when the pass is
+	/// cancelled before it plans.
 	pub async fn sync_once(&self, pair: PairId) -> Result<SyncReport, Error> {
 		self.sync_once_observed(pair, &mut |_| {}).await
 	}
@@ -5874,16 +6007,19 @@ impl SyncEngine {
 		let Some((recording, prepared)) = gate
 			.guard(async move {
 				let recording = reading.lock_owned().await;
-				let prepared = self.prepare(pair, Some(&mut scope)).await;
+				let prepared = self.prepare(pair, Some(&mut scope), Seeding::Write).await;
 				(recording, prepared)
 			})
 			.await
 		else {
-			// Cancelled while still reading: no plan was made, so nothing was applied and no
-			// baseline row written — the journal records the read had already retired stay retired,
-			// in memory and in the DB alike, which is what keeps the two halves in step. A removal
-			// took the pair with it and is said so; a plain cancel leaves the pair paused, which is
-			// the report a pause made a moment earlier would have produced.
+			// Cancelled while still reading: no plan was made, so nothing was applied — the journal
+			// records the read had already retired stay retired, in memory and in the DB alike,
+			// which is what keeps the two halves in step. The one kind of baseline row a read writes
+			// is a seeded one (see `Prepared::seed_unhashed`), which runs on a blocking thread and
+			// commits even when the cancel drops the pass: each records an agreement the read
+			// observed, and the next pass reads it as any synced row. A removal took the pair with
+			// it and is said so; a plain cancel leaves the pair paused, which is the report a pause
+			// made a moment earlier would have produced.
 			if gate.retired() {
 				return Err(being_removed(pair));
 			}
@@ -6871,8 +7007,10 @@ fn screen_state(prep: &Prepared) -> guard::ScreenState {
 			(true, true) => guard::RemoteEvidence::Emptied,
 			(true, false) => guard::RemoteEvidence::Listed,
 		},
-		first_sync: prep.baseline.is_empty(),
-		tracked: prep.baseline.len(),
+		// The rows as the pass found them, not as its seeding left them (see
+		// `Prepared::tracked_at_start`).
+		first_sync: prep.tracked_at_start == 0,
+		tracked: prep.tracked_at_start,
 	}
 }
 

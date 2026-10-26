@@ -1826,6 +1826,20 @@ impl BaselineStore {
 		)
 	}
 
+	/// Write `rows` in ONE transaction: the rows a pass's seeding stage records as synced before it
+	/// plans (see [`seed`](super::seed)).
+	///
+	/// Not wrapped in [`record_write`]: nothing has happened yet that the rows record an act of. A
+	/// failure is the pass's error before it has applied anything, and the next pass weighs the
+	/// same paths again.
+	pub(crate) fn seed_rows(&self, pair: PairId, rows: &[BaselineEntry]) -> rusqlite::Result<()> {
+		let tx = self.conn.unchecked_transaction()?;
+		for row in rows {
+			self.upsert_entry_once(pair, row)?;
+		}
+		tx.commit()
+	}
+
 	/// [`apply_changes`](Self::apply_changes) for a local directory deletion that carries other
 	/// deletions out along with its own: the same transaction also drops the row of every path
 	/// `carried` hands the visitor it is given (see [`DropRow`]).

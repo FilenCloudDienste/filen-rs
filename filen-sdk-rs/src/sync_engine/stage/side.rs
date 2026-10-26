@@ -218,6 +218,11 @@ impl<T> StagedSide<T> {
 		self.len
 	}
 
+	/// How many rows a walk of it reads a statement ([`Paging::page`]).
+	pub(super) fn page(&self) -> NonZeroUsize {
+		self.page
+	}
+
 	/// Whether it holds a node at `path`.
 	pub(in super::super) fn holds(&self, path: &str) -> bool {
 		self.point(path, |node| node.is_some())

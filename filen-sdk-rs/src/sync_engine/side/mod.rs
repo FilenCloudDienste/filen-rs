@@ -924,6 +924,36 @@ impl SideRef<'_, RemoteNode> {
 			.map(|(path, node)| (node.remote_uuid, path))
 			.collect()
 	}
+
+	/// Every FILE this side holds with no content hash, with its path: the seeding stage's
+	/// candidates (see `seed`), which leaves out the paths that have a row. A staged side reads them
+	/// off an index of its own and nothing else; a whole side filters its map.
+	///
+	/// A carried side answers from its overlay alone. What it leaves out is every node it derives,
+	/// and each of those is at a row's path, which the stage leaves out anyway.
+	pub(super) fn unhashed_files(
+		&self,
+	) -> impl Iterator<Item = (Cow<'_, str>, Cow<'_, RemoteNode>)> {
+		let unhashed =
+			|node: &RemoteNode| node.kind == NodeKind::File && node.content_hash.is_none();
+		match self.side {
+			Side::Whole(map) => Either::Left(Either::Left(
+				map.iter().filter(move |(_, node)| unhashed(node)).map(lent),
+			)),
+			Side::Carried(overlay) => Either::Left(Either::Right(
+				overlay
+					.nodes
+					.iter()
+					.filter(move |(_, node)| unhashed(node))
+					.map(lent),
+			)),
+			Side::Staged(staged) => Either::Right(
+				staged
+					.unhashed_files()
+					.map(|node| (Cow::Owned(node.rel_path.clone()), Cow::Owned(node))),
+			),
+		}
+	}
 }
 
 /// The backings' entries as one iterator, so [`Nodes`] can return a single type without the
