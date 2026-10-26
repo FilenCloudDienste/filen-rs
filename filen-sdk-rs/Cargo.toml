@@ -46,7 +46,7 @@ cache = ["dep:rusqlite", "dep:itertools", "filen-types/rusqlite"]
 sync-engine = ["cache", "dep:notify", "dep:ignore", "dep:same-file"]
 # rclone run as a child process (network drive mounts and `rclone serve`), from a binary the app
 # ships. Native-only (the module is cfg'd off on wasm).
-rclone = ["dep:port_check", "dep:sysinfo", "tokio/process"]
+rclone = ["dep:port_check", "dep:sysinfo", "tokio/process", "tokio/net"]
 # `rclone` plus the managed installation filen-cli uses: it downloads a pinned rclone release, which
 # brings the zip reader the desktop addon does without.
 rclone-managed = ["rclone", "dep:hex-literal", "dep:zip"]

@@ -55,6 +55,7 @@ use crate::{
 		private_file::write_private_file,
 		rc::{CoreStatsTransfer, RcClient},
 		recovery::{HTPASSWD_FILE, PIDFILE, PidRecord, force_unmount, recover_stale},
+		serve::ServeInfo,
 		system::identify,
 		vfs::VfsTuning,
 		watchdog::{self, Watchdog},
@@ -65,6 +66,11 @@ use crate::{
 pub(crate) const FILEN_REMOTE: &str = "Filen";
 /// The remote every read-only role uses.
 pub(crate) const FILEN_READ_ONLY_REMOTE: &str = "FilenRO";
+
+/// What a call on a stopped daemon fails with.
+pub(crate) fn stopped() -> Error {
+	Error::custom(ErrorKind::InvalidState, "the rclone daemon is stopped")
+}
 
 /// rc's basic-auth user. Only the password is secret.
 const RC_USER: &str = "filen";
@@ -158,6 +164,8 @@ pub struct RcloneStats {
 	pub transfers: Vec<RcloneTransfer>,
 	/// The mount points rclone has mounted.
 	pub mounts: Vec<String>,
+	/// The serves running now.
+	pub serves: Vec<ServeInfo>,
 }
 
 /// One running transfer.
@@ -489,6 +497,7 @@ impl RcloneDaemon {
 			out_of_space: false,
 			transfers: Vec::new(),
 			mounts: Vec::new(),
+			serves: Vec::new(),
 		};
 		for fs in self.rc.vfs_list().await?.vfses {
 			let Some(cache) = self.rc.vfs_stats(&fs).await?.disk_cache else {
@@ -523,6 +532,20 @@ impl RcloneDaemon {
 			.mount_points
 			.into_iter()
 			.map(|mount| mount.mount_point)
+			.collect();
+		stats.serves = self
+			.rc
+			.serve_list()
+			.await?
+			.list
+			.into_iter()
+			.filter_map(|serve| {
+				ServeInfo::try_from(serve)
+					.inspect_err(|kind| {
+						warn!("rclone runs a {kind} serve the daemon did not start")
+					})
+					.ok()
+			})
 			.collect();
 		Ok(stats)
 	}

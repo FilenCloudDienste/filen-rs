@@ -5,6 +5,8 @@
 //! release (`RcloneBinary::Managed`), writes an `rclone.conf` for the client's `filen`
 //! remote, and runs `rclone mount` (a network drive) or `rclone serve` as a child process.
 
+#[cfg(feature = "rclone-managed")]
+pub mod basic_server;
 mod binary;
 mod daemon;
 mod fuse;
@@ -19,8 +21,7 @@ pub mod rclone_installation;
 mod rclone_rc_api;
 mod recovery;
 mod refusal;
-#[cfg(feature = "rclone-managed")]
-pub mod serve;
+mod serve;
 mod system;
 mod vfs;
 mod watchdog;
@@ -34,4 +35,5 @@ pub use fuse::{FuseProvider, FuseStatus, fuse_status};
 pub use mount::{MountInfo, MountOptions, available_drive_letters};
 pub use recovery::{StaleRecovery, force_unmount, recover_stale, stop_rclone_under};
 pub use refusal::RcloneRefusal;
+pub use serve::{ServeAuth, ServeInfo, ServeOptions, ServeProtocol, ServeTls};
 pub use vfs::VfsTuning;

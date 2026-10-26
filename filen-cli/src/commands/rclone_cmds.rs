@@ -4,7 +4,7 @@
 
 use anyhow::{Context as _, Result};
 use filen_sdk_rs::rclone::{
-	rclone_installation::RcloneInstallationConfig, serve::BasicServerOptions,
+	basic_server::BasicServerOptions, rclone_installation::RcloneInstallationConfig,
 };
 use tokio::select;
 
@@ -69,7 +69,7 @@ pub(crate) async fn start_server(
 	let client = client.get(ui).await?;
 	let config_dir = config.config_dir.join("rclone");
 	check_already_downloaded(ui, &config_dir).await;
-	let mut server = filen_sdk_rs::rclone::serve::start_basic_server(
+	let mut server = filen_sdk_rs::rclone::basic_server::start_basic_server(
 		client,
 		&RcloneInstallationConfig::new(&config_dir),
 		server_type,

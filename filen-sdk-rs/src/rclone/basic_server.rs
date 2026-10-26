@@ -1,0 +1,95 @@
+use tokio::process::Child;
+
+use crate::{
+	Error, ErrorKind,
+	auth::Client,
+	rclone::rclone_installation::{RcloneInstallation, RcloneInstallationConfig},
+};
+
+pub struct BasicAuthentication {
+	pub user: String,
+	pub password: String,
+}
+
+pub struct BasicServerOptions {
+	pub address: String,
+	pub root: Option<String>,
+	pub user: Option<String>,
+	pub password: Option<String>,
+	pub read_only: bool,
+	pub cache_size: Option<String>,
+	pub transfers: Option<usize>,
+}
+
+pub struct BasicServerDetails {
+	pub address: String,
+	pub auth: Option<BasicAuthentication>,
+	/// Will be killed on drop.
+	pub process: Child,
+}
+
+/// Starts a "webdav", "ftp", "sftp", "http" or "s3" server over Rclone.
+/// "s3" server options take the Access Key ID as `options.user` and Secret Access Key as `options.password`.
+pub async fn start_basic_server(
+	client: &Client,
+	config: &RcloneInstallationConfig,
+	server_type: &str,
+	options: BasicServerOptions,
+	rclone_args: Vec<String>,
+) -> Result<BasicServerDetails, Error> {
+	if !["webdav", "ftp", "sftp", "http", "s3"].contains(&server_type) {
+		return Err(Error::custom(
+			ErrorKind::InvalidType,
+			format!("Unsupported server type: {}", server_type),
+		));
+	}
+	let remote_str = format!("filen:{}", options.root.unwrap_or("".to_string()));
+	let mut args = vec![
+		"serve",
+		server_type,
+		&remote_str,
+		"--addr",
+		&options.address,
+		if options.read_only { "--read-only" } else { "" },
+	];
+	let cache_args =
+		RcloneInstallation::construct_cache_args(&config.config_dir, options.cache_size.clone())?;
+	args.extend(cache_args.split(' '));
+	let transfers_str;
+	if let Some(t) = options.transfers.map(|t| t.to_string()) {
+		transfers_str = t;
+		args.push("--transfers");
+		args.push(&transfers_str);
+	}
+	let (user, password) = (
+		options.user.clone().unwrap_or("user".to_string()),
+		options.password.clone().unwrap_or("password".to_string()),
+	);
+	let auth_key_str = format!("{},{}", user, password);
+	if server_type == "s3" {
+		args.extend(["--auth-key", &auth_key_str]);
+	} else if options.user.is_some() || options.password.is_some() {
+		args.extend(["--user", &user, "--pass", &password]);
+	}
+	args.extend(rclone_args.iter().map(String::as_str));
+	let (process, _) = RcloneInstallation::initialize(config, Some(client))
+		.await?
+		.execute_in_background(&args)
+		.await?;
+	Ok(BasicServerDetails {
+		address: if options.address.starts_with(":") {
+			format!("127.0.0.1{}", options.address)
+		} else {
+			options.address.clone()
+		},
+		auth: if server_type == "s3" || (options.user.is_some() || options.password.is_some()) {
+			Some(BasicAuthentication {
+				user: user.clone(),
+				password: password.clone(),
+			})
+		} else {
+			None
+		},
+		process,
+	})
+}

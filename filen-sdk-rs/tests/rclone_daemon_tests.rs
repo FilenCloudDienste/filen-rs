@@ -9,12 +9,15 @@ use std::{
 	time::Duration,
 };
 
+use base64::{Engine as _, prelude::BASE64_STANDARD};
 use filen_sdk_rs::rclone::{
 	MountOptions, RcloneBinary, RcloneDaemon, RcloneDaemonConfig, RcloneExit, RcloneRefusal,
-	StopOptions, StopReport, VfsTuning, stop_rclone_under,
+	ServeAuth, ServeOptions, ServeProtocol, ServeTls, StopOptions, StopReport, VfsTuning,
+	stop_rclone_under,
 };
 use serde_json::json;
 use tempfile::TempDir;
+use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
 
 const GRACEFUL: StopOptions = StopOptions {
 	drain_timeout_ms: None,
@@ -532,33 +535,9 @@ async fn a_mount_and_a_serve_share_one_vfs() {
 	let daemon = dirs.start().await;
 	let mount_point = dirs.mount_point("drive");
 	daemon.mount(read_write(&mount_point)).await.unwrap();
-	let port = port_check::free_local_ipv4_port().unwrap();
 
-	// The command-line spelling of `VfsTuning::default()` and the fixed VFS options mounts get.
 	daemon
-		.rc_call_for_test(
-			"serve/start",
-			&json!({
-				"type": "webdav",
-				"fs": "Filen:",
-				"addr": format!("127.0.0.1:{port}"),
-				"user": "user",
-				"pass": "pass",
-				"vfs_cache_mode": "full",
-				"vfs_cache_max_size": "34359738368B",
-				"vfs_cache_min_free_space": "17179869184B",
-				"vfs_cache_max_age": "720h",
-				"dir_cache_time": "15s",
-				"vfs_write_back": "5s",
-				"vfs_read_chunk_size": "64Mi",
-				"vfs_read_chunk_streams": "8",
-				"vfs_read_ahead": "128Mi",
-				"file_perms": "0666",
-				"dir_perms": "0777",
-				"no_checksum": "true",
-				"read_only": "false",
-			}),
-		)
+		.start_serve(serve(ServeProtocol::Webdav, basic_auth()))
 		.await
 		.unwrap();
 
@@ -573,6 +552,282 @@ async fn a_mount_and_a_serve_share_one_vfs() {
 		.unwrap();
 	assert_eq!(vfses["vfses"].as_array().unwrap().len(), 1, "{vfses}");
 	assert_eq!(stats["inUse"], json!(2), "{stats}");
+	daemon.stop(GRACEFUL).await.unwrap();
+}
+
+const USER: &str = "filen-0a1b2c3d";
+const PASSWORD: &str = "correct-horse-battery";
+
+fn basic_auth() -> ServeAuth {
+	ServeAuth::Basic {
+		user: USER.to_owned(),
+		password: PASSWORD.to_owned(),
+	}
+}
+
+/// A serve of `protocol` on a free loopback port.
+fn serve(protocol: ServeProtocol, auth: ServeAuth) -> ServeOptions {
+	ServeOptions {
+		protocol,
+		host: "127.0.0.1".to_owned(),
+		port: port_check::free_local_ipv4_port().unwrap(),
+		auth,
+		tls: None,
+		read_only: false,
+	}
+}
+
+fn http_client() -> reqwest::Client {
+	reqwest::Client::builder().no_proxy().build().unwrap()
+}
+
+/// The FTP replies to logging in as `user` with `password`: the greeting, `USER` and `PASS`.
+async fn ftp_login(addr: &str, user: &str, password: &str) -> Vec<String> {
+	let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+	let (read, mut write) = stream.into_split();
+	let mut lines = tokio::io::BufReader::new(read).lines();
+	let mut replies = vec![lines.next_line().await.unwrap().unwrap()];
+	for command in [format!("USER {user}\r\n"), format!("PASS {password}\r\n")] {
+		write.write_all(command.as_bytes()).await.unwrap();
+		replies.push(lines.next_line().await.unwrap().unwrap());
+	}
+	replies
+}
+
+fn reply_codes(replies: &[String]) -> Vec<&str> {
+	replies
+		.iter()
+		.map(|reply| reply.get(..3).unwrap())
+		.collect()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn every_authenticated_protocol_refuses_an_unauthenticated_request() {
+	let dirs = Dirs::new();
+	let daemon = dirs.start().await;
+	let http = http_client();
+
+	for protocol in [
+		ServeProtocol::Webdav,
+		ServeProtocol::Http,
+		ServeProtocol::Restic,
+	] {
+		let info = daemon
+			.start_serve(serve(protocol, basic_auth()))
+			.await
+			.unwrap();
+		let url = format!("http://{}/", info.addr);
+		let anonymous = http.get(&url).send().await.unwrap().status().as_u16();
+		let wrong = http
+			.get(&url)
+			.basic_auth(USER, Some("wrong"))
+			.send()
+			.await
+			.unwrap()
+			.status()
+			.as_u16();
+		assert_eq!((anonymous, wrong), (401, 401), "{protocol:?}");
+	}
+	// restic answers its repository paths, not `/`, so only these two list the drive there.
+	for protocol in [ServeProtocol::Webdav, ServeProtocol::Http] {
+		let info = daemon
+			.start_serve(serve(protocol, basic_auth()))
+			.await
+			.unwrap();
+		let authenticated = http
+			.get(format!("http://{}/", info.addr))
+			.basic_auth(USER, Some(PASSWORD))
+			.send()
+			.await
+			.unwrap()
+			.status()
+			.as_u16();
+		assert_eq!(authenticated, 200, "{protocol:?}");
+	}
+
+	let s3 = daemon
+		.start_serve(serve(
+			ServeProtocol::S3,
+			ServeAuth::S3 {
+				access_key_id: "AKIA0123456789ABCDEF".to_owned(),
+				secret_access_key: "c2VjcmV0LXNlY3JldC1zZWNyZXQtc2VjcmV0LXNl".to_owned(),
+			},
+		))
+		.await
+		.unwrap();
+	let anonymous = http
+		.get(format!("http://{}/", s3.addr))
+		.send()
+		.await
+		.unwrap()
+		.status();
+	assert!(anonymous.is_client_error(), "{anonymous}");
+
+	let ftp = daemon
+		.start_serve(serve(ServeProtocol::Ftp, basic_auth()))
+		.await
+		.unwrap();
+	assert_eq!(
+		reply_codes(&ftp_login(&ftp.addr, "anonymous", "anonymous").await),
+		["220", "331", "530"]
+	);
+	assert_eq!(
+		reply_codes(&ftp_login(&ftp.addr, USER, "wrong").await),
+		["220", "331", "530"]
+	);
+	assert_eq!(
+		reply_codes(&ftp_login(&ftp.addr, USER, PASSWORD).await),
+		["220", "331", "230"]
+	);
+
+	// sftp is left out: there is no SSH client here. Its options never let in a key
+	// (`sftp_never_trusts_authorized_keys`) and need a password.
+	daemon.stop(GRACEFUL).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stats_list_the_running_serves() {
+	let dirs = Dirs::new();
+	let daemon = dirs.start().await;
+	let webdav = daemon
+		.start_serve(serve(ServeProtocol::Webdav, basic_auth()))
+		.await
+		.unwrap();
+	#[cfg(not(windows))]
+	let nfs = daemon
+		.start_serve(serve(ServeProtocol::Nfs, ServeAuth::Unauthenticated))
+		.await
+		.unwrap();
+
+	let mut serves = daemon.stats().await.unwrap().serves;
+	serves.sort_by(|a, b| a.id.cmp(&b.id));
+
+	#[cfg(not(windows))]
+	assert_eq!(serves, [nfs, webdav.clone()]);
+	#[cfg(windows)]
+	assert_eq!(serves, [webdav.clone()]);
+	daemon.stop_serve(&webdav.id).await.unwrap();
+	assert!(
+		!daemon
+			.stats()
+			.await
+			.unwrap()
+			.serves
+			.iter()
+			.any(|serve| serve.id == webdav.id)
+	);
+	daemon.stop(GRACEFUL).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn serve_types_list_every_protocol_the_daemon_serves() {
+	let dirs = Dirs::new();
+	let daemon = dirs.start().await;
+
+	let mut types = daemon.serve_types().await.unwrap();
+	types.sort_by_key(|protocol| format!("{protocol:?}"));
+
+	assert_eq!(
+		types,
+		[
+			ServeProtocol::Ftp,
+			ServeProtocol::Http,
+			#[cfg(not(windows))]
+			ServeProtocol::Nfs,
+			ServeProtocol::Restic,
+			ServeProtocol::S3,
+			ServeProtocol::Sftp,
+			ServeProtocol::Webdav,
+		]
+	);
+	daemon.stop(GRACEFUL).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn port_in_use_is_a_typed_refusal() {
+	let dirs = Dirs::new();
+	let daemon = dirs.start().await;
+	let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+	let port = taken.local_addr().unwrap().port();
+
+	let error = daemon
+		.start_serve(ServeOptions {
+			port,
+			..serve(ServeProtocol::Webdav, basic_auth())
+		})
+		.await
+		.unwrap_err();
+
+	assert_eq!(
+		error.downcast_ref::<RcloneRefusal>(),
+		Some(&RcloneRefusal::PortInUse { port })
+	);
+	assert_eq!(daemon.stats().await.unwrap().serves, []);
+	daemon.stop(GRACEFUL).await.unwrap();
+}
+
+/// A self-signed certificate for `localhost` and its key, as PEM files in `dir`, generated with
+/// the system's `openssl`; returns their paths and the certificate's DER.
+fn self_signed_certificate(dir: &Path) -> (PathBuf, PathBuf, Vec<u8>) {
+	let cert = dir.join("serve.crt");
+	let key = dir.join("serve.key");
+	let status = std::process::Command::new("openssl")
+		.args([
+			"req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
+		])
+		.args(["-subj", "/CN=localhost", "-keyout"])
+		.arg(&key)
+		.arg("-out")
+		.arg(&cert)
+		.stderr(std::process::Stdio::null())
+		.status()
+		.expect("openssl is needed to generate the test certificate");
+	assert!(status.success());
+	let pem = std::fs::read_to_string(&cert).unwrap();
+	let body = pem
+		.lines()
+		.filter(|line| !line.starts_with("-----"))
+		.collect::<String>();
+	let der = BASE64_STANDARD.decode(body).unwrap();
+	(cert, key, der)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn https_serve_presents_the_given_certificate() {
+	let dirs = Dirs::new();
+	let daemon = dirs.start().await;
+	let (cert, key, der) = self_signed_certificate(dirs.root.path());
+
+	let info = daemon
+		.start_serve(ServeOptions {
+			tls: Some(ServeTls {
+				cert_path: cert.to_str().unwrap().to_owned(),
+				key_path: key.to_str().unwrap().to_owned(),
+			}),
+			..serve(ServeProtocol::Webdav, basic_auth())
+		})
+		.await
+		.unwrap();
+
+	let https = reqwest::Client::builder()
+		.no_proxy()
+		.danger_accept_invalid_certs(true)
+		.tls_info(true)
+		.build()
+		.unwrap();
+	let response = https
+		.get(format!("https://{}/", info.addr))
+		.basic_auth(USER, Some(PASSWORD))
+		.send()
+		.await
+		.unwrap();
+	assert_eq!(response.status().as_u16(), 200);
+	let presented = response
+		.extensions()
+		.get::<reqwest::tls::TlsInfo>()
+		.and_then(reqwest::tls::TlsInfo::peer_certificate)
+		.unwrap();
+	assert_eq!(presented, der.as_slice());
 	daemon.stop(GRACEFUL).await.unwrap();
 }
 

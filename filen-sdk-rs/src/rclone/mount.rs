@@ -18,7 +18,7 @@ use crate::{
 	Error, ErrorKind,
 	rclone::{
 		RcloneDaemon, RcloneRefusal,
-		daemon::{FILEN_READ_ONLY_REMOTE, FILEN_REMOTE},
+		daemon::{FILEN_READ_ONLY_REMOTE, FILEN_REMOTE, stopped},
 		fuse::{FuseProvider, FuseStatus, fuse_status},
 		vfs::vfs_opt,
 	},
@@ -121,10 +121,6 @@ impl RcloneDaemon {
 		guard.record.mounts.retain(|known| known != mount_point);
 		guard.record_mounts(&self.pidfile)
 	}
-}
-
-fn stopped() -> Error {
-	Error::custom(ErrorKind::InvalidState, "the rclone daemon is stopped")
 }
 
 /// rc's `mountOpt` for `provider`, the old desktop client's per-platform options.

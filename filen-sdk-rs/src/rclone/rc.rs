@@ -106,6 +106,38 @@ pub(crate) struct ListedMount {
 	pub(crate) mount_point: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub(crate) struct ServeStarted {
+	pub(crate) id: String,
+	/// The address it listens on.
+	pub(crate) addr: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct ServeList {
+	pub(crate) list: Vec<ListedServe>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct ListedServe {
+	pub(crate) id: String,
+	pub(crate) addr: String,
+	/// The parameters it was started with, of which only the type is read: the others include
+	/// its credentials.
+	pub(crate) params: ListedServeParams,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct ListedServeParams {
+	#[serde(rename = "type")]
+	pub(crate) kind: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct ServeTypes {
+	pub(crate) types: Vec<String>,
+}
+
 /// What a call answered with when the caller needs nothing from it.
 #[derive(Debug, Deserialize)]
 pub(crate) struct Ignored {}
@@ -250,6 +282,26 @@ impl RcClient {
 	pub(crate) async fn mount_unmountall(&self) -> Result<(), Error> {
 		self.call::<Ignored>("mount/unmountall", &json!({})).await?;
 		Ok(())
+	}
+
+	/// Starts a serve with the JSON object `params`: its `type`, `fs` and `addr`, and its
+	/// command-line flags as `serve/start` takes them (see `vfs::vfs_flags`).
+	pub(crate) async fn serve_start(&self, params: &Value) -> Result<ServeStarted, Error> {
+		self.call("serve/start", params).await
+	}
+
+	pub(crate) async fn serve_stop(&self, id: &str) -> Result<(), Error> {
+		self.call::<Ignored>("serve/stop", &json!({ "id": id }))
+			.await?;
+		Ok(())
+	}
+
+	pub(crate) async fn serve_list(&self) -> Result<ServeList, Error> {
+		self.call("serve/list", &json!({})).await
+	}
+
+	pub(crate) async fn serve_types(&self) -> Result<ServeTypes, Error> {
+		self.call("serve/types", &json!({})).await
 	}
 
 	pub(crate) async fn serve_stopall(&self) -> Result<(), Error> {

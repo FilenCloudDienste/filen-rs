@@ -42,10 +42,40 @@ pub enum RcloneRefusal {
 	/// The drive letter is taken by another drive.
 	#[error("the drive letter is in use")]
 	DriveLetterInUse,
+	/// Another process listens on the serve's port.
+	#[error("port {port} is in use")]
+	PortInUse { port: u16 },
+	/// The serve's address is not one of this machine's.
+	#[error("the address is not one of this machine's")]
+	AddressNotLocal,
+	/// The serve's host is not an IP address or `localhost` (an empty one would listen on every
+	/// interface), or its port is 0.
+	#[error("the address must name an IP address or localhost and a port")]
+	ImplicitAddress,
+	/// The protocol needs credentials of its kind (access keys for s3, a user and password for the
+	/// others but nfs) and was given none or the other kind; or the serve answered a request that
+	/// carried none, and was stopped.
+	#[error("the serve requires authentication")]
+	AuthRequired,
+	/// A credential is empty, too long or holds a character it may not: any control character, a
+	/// `:` in a user name, a `,` or `"` in an s3 secret; an s3 access key ID is not 16 to 128
+	/// letters and digits; or credentials were given to nfs, which takes none.
+	#[error("the serve's credentials are not valid")]
+	InvalidCredentials,
+	/// An unauthenticated serve (nfs) may listen on loopback only.
+	#[error("an unauthenticated serve may listen on loopback only")]
+	UnauthenticatedOffLoopback,
+	/// The protocol is not served on this platform or by this rclone.
+	#[error("the protocol is not supported here")]
+	UnsupportedProtocol,
+	/// The protocol does not serve over TLS: only webdav, s3, http and restic do.
+	#[error("the protocol does not serve over TLS")]
+	TlsUnsupported,
 }
 
 impl RcloneRefusal {
-	/// The error kind a refusal is returned as: [`ErrorKind::IO`] for what is wrong on this machine.
+	/// The error kind a refusal is returned as: [`ErrorKind::IO`] for what is wrong on this
+	/// machine, [`ErrorKind::InvalidState`] for a serve's options the daemon does not run.
 	pub fn kind(&self) -> ErrorKind {
 		match self {
 			Self::BinaryMissing
@@ -56,7 +86,15 @@ impl RcloneRefusal {
 			| Self::MountPointInUse
 			| Self::MountPointNotEmpty
 			| Self::MountPointInvalid
-			| Self::DriveLetterInUse => ErrorKind::IO,
+			| Self::DriveLetterInUse
+			| Self::PortInUse { .. }
+			| Self::AddressNotLocal
+			| Self::UnsupportedProtocol => ErrorKind::IO,
+			Self::ImplicitAddress
+			| Self::AuthRequired
+			| Self::InvalidCredentials
+			| Self::UnauthenticatedOffLoopback
+			| Self::TlsUnsupported => ErrorKind::InvalidState,
 		}
 	}
 }
