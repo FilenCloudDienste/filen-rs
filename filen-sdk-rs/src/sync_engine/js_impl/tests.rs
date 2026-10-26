@@ -22,9 +22,9 @@ use crate::{
 		test_support::{offline_client, offline_client_with_root},
 	},
 	sync_engine::{
-		Backlog, BaselineInUse, ConflictResolution, DeleteGuard, GuardReason, PauseMode,
-		PlanOutcome, PlannedAction, PlannedActionKind, PlannedConflict, PlannedNodeKind, SyncEvent,
-		SyncMode, SyncReport, TransferDirection, WatchState, WatchStatus,
+		Backlog, BaselineInUse, ConflictResolution, DeleteGuard, GuardReason, LegacyImport,
+		PauseMode, PlanOutcome, PlannedAction, PlannedActionKind, PlannedConflict, PlannedNodeKind,
+		SyncEvent, SyncMode, SyncReport, TransferDirection, WatchState, WatchStatus,
 		baseline::{BaselineEntry, BaselineState, BaselineStore, NodeKind},
 	},
 };
@@ -915,6 +915,76 @@ async fn a_pair_without_conflicts_lists_an_empty_page() {
 	);
 }
 
+/// A filen-sync state directory whose two trees list one file alike.
+fn filen_sync_state() -> tempfile::TempDir {
+	let dir = tempfile::tempdir().unwrap();
+	std::fs::write(
+		dir.path().join("previousLocalTree"),
+		"{\"prop\":\"/a.txt\",\"data\":{\"type\":\"file\",\"size\":5,\"lastModified\":1700000000123}}\n",
+	)
+	.unwrap();
+	std::fs::write(
+		dir.path().join("previousRemoteTree"),
+		format!(
+			"{{\"prop\":\"/a.txt\",\"data\":{{\"type\":\"file\",\"uuid\":\"{}\",\"size\":5}}}}\n",
+			uuid::Uuid::from_u128(10)
+		),
+	)
+	.unwrap();
+	dir
+}
+
+fn state_dir(state: &tempfile::TempDir) -> String {
+	state.path().to_string_lossy().into_owned()
+}
+
+#[tokio::test]
+async fn filen_sync_state_imports_into_a_pair_that_has_not_synced() {
+	let scene = Scene::new();
+	let (core, pair) = scene.with_pair().await;
+	let state = filen_sync_state();
+
+	assert_eq!(
+		core.import_legacy_state(pair, state_dir(&state))
+			.await
+			.unwrap(),
+		LegacyImport {
+			imported: 1,
+			skipped: 0,
+		}
+	);
+}
+
+#[tokio::test]
+async fn filen_sync_state_is_refused_once_the_pair_has_a_row() {
+	let scene = Scene::new();
+	let (core, pair) = scene.with_pair().await;
+	hold_conflicts(&scene, pair, &["a.txt"]);
+	let state = filen_sync_state();
+
+	let refused = core
+		.import_legacy_state(pair, state_dir(&state))
+		.await
+		.unwrap_err();
+
+	assert_eq!(refused.kind(), ErrorKind::InvalidState);
+	assert!(
+		refused.to_string().contains("has already synced"),
+		"{refused}"
+	);
+}
+
+#[tokio::test]
+async fn filen_sync_state_for_a_pair_id_past_i64_is_refused_as_unknown() {
+	let scene = Scene::new();
+	let (core, _) = scene.with_pair().await;
+	let state = filen_sync_state();
+
+	let refused = refusal_message(core.import_legacy_state(u64::MAX, state_dir(&state)).await);
+
+	assert!(refused.contains("unknown sync pair"), "{refused}");
+}
+
 #[tokio::test]
 async fn every_control_verb_is_refused_once_the_engine_is_closed() {
 	let scene = Scene::new();
@@ -940,6 +1010,7 @@ async fn every_control_verb_is_refused_once_the_engine_is_closed() {
 		refusal_message(core.user_ignore().await),
 		refusal_message(core.set_user_ignore("*.tmp").await),
 		refusal_message(core.plan_pair(pair).await),
+		refusal_message(core.import_legacy_state(pair, scene.local()).await),
 	];
 	for refused in refusals {
 		assert!(refused.contains("the sync engine is closed"), "{refused}");

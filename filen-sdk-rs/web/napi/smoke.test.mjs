@@ -340,6 +340,7 @@ describe("exports", () => {
 			"approveDeletions",
 			"cancelPausedActions",
 			"close",
+			"importLegacyState",
 			"lastReport",
 			"listConflicts",
 			"listPairs",
@@ -842,6 +843,25 @@ describe("sync engine, offline", () => {
 		// The wrapper reads its params inside the promise, so an out-of-range u64 rejects.
 		await assert.rejects(engine.listConflicts(id, -1n, 0n), e => {
 			assert.equal(assertThrownLikeUbrn(e).kind(), ErrorKind.Conversion)
+			return true
+		})
+	})
+
+	test("importLegacyState reads a filen-sync state directory", async () => {
+		const state = join(dir, "filen-sync-state")
+		mkdirSync(state)
+		assert.deepEqual(await engine.importLegacyState(id, state), { imported: 0n, skipped: 0n })
+		writeFileSync(
+			join(state, "previousLocalTree"),
+			`${JSON.stringify({ prop: "/a.txt", data: { type: "file", size: 5, lastModified: 1700000000123 } })}\nnot json\n`
+		)
+		writeFileSync(
+			join(state, "previousRemoteTree"),
+			`${JSON.stringify({ prop: "/a.txt", data: { type: "file", uuid: randomUUID(), size: 5, lastModified: 1700000000000 } })}\n`
+		)
+		assert.deepEqual(await engine.importLegacyState(id, state), { imported: 1n, skipped: 1n })
+		await assert.rejects(engine.importLegacyState(id, join(dir, "missing-state")), e => {
+			assert.equal(assertThrownLikeUbrn(e).kind(), ErrorKind.Io)
 			return true
 		})
 	})

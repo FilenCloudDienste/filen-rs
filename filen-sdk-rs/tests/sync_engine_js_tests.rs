@@ -696,6 +696,10 @@ async fn a_closed_engine_refuses_every_verb() {
 	assert_closed("last_report", engine.last_report(pair).await);
 	assert_closed("recent_events", engine.recent_events().await);
 	assert_closed(
+		"import_legacy_state",
+		engine.import_legacy_state(pair, local.clone()).await,
+	);
+	assert_closed(
 		"add_pair",
 		engine
 			.add_pair(local, Uuid::from_u128(1), SyncMode::TwoWay)

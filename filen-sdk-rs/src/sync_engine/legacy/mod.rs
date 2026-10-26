@@ -25,6 +25,7 @@ use std::{
 	path::Path,
 };
 
+use filen_macros::js_type;
 use serde::Deserialize;
 use uuid::Uuid;
 
@@ -46,6 +47,7 @@ const WARNED_LINES: u64 = 16;
 
 /// What [`SyncEngine::import_legacy_state`](super::SyncEngine::import_legacy_state) imported.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[js_type(export, no_deser, no_default, napi)]
 pub struct LegacyImport {
 	/// How many paths the pair now holds filen-sync state for: files both trees list, at the same
 	/// size, with what each needs to be compared to this engine's view of them.

@@ -65,9 +65,10 @@ use crate::{
 	fs::HasUUID,
 	runtime::{do_on_commander, spawn, spawned},
 	sync_engine::{
-		Backlog, BaselineInUse, ConflictResolution, DeleteGuard, IgnoredPath, PairId, PauseMode,
-		PauseOptions, PlanOutcome, PlannedAction, PlannedConflict, SyncEngine, SyncEvent, SyncMode,
-		SyncObserver, UnsyncablePath, WatchConfig, WatchHandle, WatchState, WatchStatus,
+		Backlog, BaselineInUse, ConflictResolution, DeleteGuard, IgnoredPath, LegacyImport, PairId,
+		PauseMode, PauseOptions, PlanOutcome, PlannedAction, PlannedConflict, SyncEngine,
+		SyncEvent, SyncMode, SyncObserver, UnsyncablePath, WatchConfig, WatchHandle, WatchState,
+		WatchStatus,
 	},
 };
 
@@ -620,6 +621,18 @@ impl SyncEngineCore {
 		types::pair_id_out(pair)
 	}
 
+	async fn import_legacy_state(
+		&self,
+		pair_id: u64,
+		state_dir: String,
+	) -> Result<LegacyImport, Error> {
+		let pair = pair_id_in(pair_id)?;
+		self.engine()?
+			.engine
+			.import_legacy_state(pair, PathBuf::from(state_dir))
+			.await
+	}
+
 	async fn remove_pair(&self, pair_id: u64) -> Result<(), Error> {
 		let pair = pair_id_in(pair_id)?;
 		self.engine()?.engine.remove_pair(pair).await?;
@@ -1073,6 +1086,25 @@ impl JsSyncEngine {
 	) -> Result<u64, Error> {
 		detached(Arc::clone(&self.core), move |core| async move {
 			core.add_pair(local_root, remote_root, mode).await
+		})
+		.await
+	}
+
+	/// Import what the filen-sync pair this one replaces last recorded as synced, from that pair's
+	/// state directory, `<dbPath>/state/v2/<pairUuid>/` of the old engine. Call it after
+	/// [`add_pair`](Self::add_pair) and before the pair's first pass: it is refused once the pair has
+	/// synced anything, and a second import before that replaces the first. A directory without
+	/// both of filen-sync's tree files imports nothing. A pass then records a file uploaded without
+	/// a BLAKE3 as synced where that state still matches both sides, instead of reading it as
+	/// created on both.
+	#[napi_export]
+	pub async fn import_legacy_state(
+		&self,
+		pair_id: u64,
+		state_dir: String,
+	) -> Result<LegacyImport, Error> {
+		detached(Arc::clone(&self.core), move |core| async move {
+			core.import_legacy_state(pair_id, state_dir).await
 		})
 		.await
 	}
