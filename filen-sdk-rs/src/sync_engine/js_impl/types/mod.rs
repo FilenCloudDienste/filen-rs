@@ -235,6 +235,8 @@ pub struct SyncPairInfo {
 	/// Why the last pass this process saw end failed: its `PassFailed` error, or the
 	/// [`SyncPassReport::pass_error`] of its `PassCompleted`. `None` when it succeeded.
 	pub last_pass_error: Option<String>,
+	/// The [`ErrorKind`] of that failure, set exactly while `last_pass_error` is.
+	pub last_pass_error_kind: Option<ErrorKind>,
 	/// When (Unix epoch milliseconds) this process paused the pair; `None` while it runs, and for
 	/// a pause from before this process started (the engine persists only the flag).
 	pub paused_at_ms: Option<u64>,
@@ -267,6 +269,7 @@ impl TryFrom<PairRecord> for SyncPairInfo {
 			pass_in_flight: None,
 			last_pass_completed_at_ms: None,
 			last_pass_error: None,
+			last_pass_error_kind: None,
 			paused_at_ms: None,
 			pause_options: None,
 		})
@@ -327,12 +330,14 @@ pub struct SyncPassReport {
 	/// Why this pass FAILED although it returned a report, or `None` for a healthy one: the verdict
 	/// a watch backs off on.
 	pub pass_error: Option<String>,
+	/// The [`ErrorKind`] of that failure, set exactly while `pass_error` is.
+	pub pass_error_kind: Option<ErrorKind>,
 }
 
 impl From<SyncReport> for SyncPassReport {
 	fn from(report: SyncReport) -> Self {
 		// Both read lists the report gives up below.
-		let pass_error = report.pass_error();
+		let (pass_error, pass_error_kind) = report.pass_failure().unzip();
 		let held_deletions = report.held_deletions() as u64;
 		// Whole, so a field the engine adds does not silently stay behind.
 		let SyncReport {
@@ -358,7 +363,7 @@ impl From<SyncReport> for SyncPassReport {
 			interrupted,
 			halted,
 			full_pass,
-			// What these say for JS is `pass_error`, read above.
+			// What these say for JS is `pass_error` and its kind, read above.
 			lock_failed: _,
 			store_failed: _,
 			// The engine's own bookkeeping: `errors` renders the failures for people.
@@ -403,6 +408,7 @@ impl From<SyncReport> for SyncPassReport {
 			halted,
 			full_pass_reason: full_pass.map(|reason| reason.to_string()),
 			pass_error,
+			pass_error_kind,
 		}
 	}
 }
@@ -484,6 +490,7 @@ pub enum SyncEventMessage {
 	},
 	PassFailed {
 		error: String,
+		kind: ErrorKind,
 	},
 }
 
@@ -536,7 +543,7 @@ impl From<SyncEvent> for SyncEventMessage {
 			SyncEvent::PassCompleted { report } => Self::PassCompleted {
 				report: report.into(),
 			},
-			SyncEvent::PassFailed { error } => Self::PassFailed { error },
+			SyncEvent::PassFailed { error, kind } => Self::PassFailed { error, kind },
 		}
 	}
 }

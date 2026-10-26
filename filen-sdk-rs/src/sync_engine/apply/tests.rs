@@ -467,7 +467,7 @@ fn a_buried_version_whose_row_could_not_be_written_is_still_reported() {
 	);
 	assert_eq!(
 		report.store_failed,
-		Some(StoreFailure::RecordNotWritten),
+		Some(StoreFailure::RecordNotWritten(ErrorKind::Internal)),
 		"and the lost row must still fail the pass: {:?}",
 		report.errors
 	);
@@ -524,12 +524,21 @@ fn an_unread_plan_stops_the_pass_for_a_reason_a_lost_record_outranks() {
 	let unread = internal("reading a page of the pass's staged plan");
 	let mut report = SyncReport::default();
 	note_unread_plan(&mut report, &unread);
-	assert_eq!(report.store_failed, Some(StoreFailure::UnreadPlan));
+	assert_eq!(
+		report.store_failed,
+		Some(StoreFailure::UnreadPlan(ErrorKind::Internal))
+	);
 	assert!(!admits_more(&report));
 	note_failure(&mut report, "docs/a.txt", &contended_write_error());
-	assert_eq!(report.store_failed, Some(StoreFailure::RecordNotWritten));
+	assert_eq!(
+		report.store_failed,
+		Some(StoreFailure::RecordNotWritten(ErrorKind::Internal))
+	);
 	note_unread_plan(&mut report, &unread);
-	assert_eq!(report.store_failed, Some(StoreFailure::RecordNotWritten));
+	assert_eq!(
+		report.store_failed,
+		Some(StoreFailure::RecordNotWritten(ErrorKind::Internal))
+	);
 }
 
 /// The baseline write of an applied action records something that has already happened, so when
@@ -560,7 +569,7 @@ fn a_baseline_row_that_could_not_be_written_makes_the_pass_a_failed_one() {
 	}
 	assert_eq!(
 		report.store_failed,
-		Some(StoreFailure::RecordNotWritten),
+		Some(StoreFailure::RecordNotWritten(ErrorKind::Internal)),
 		"a lost record must mark the pass failed: {:?}",
 		report.errors
 	);
@@ -709,7 +718,10 @@ fn a_write_the_stage_cannot_record_fails_the_pass_but_not_its_path() {
 	plan.pager.break_stage();
 	let mut report = SyncReport::default();
 	note_written(&plan, &upload("up.txt"), &mut report);
-	assert_eq!(report.store_failed, Some(StoreFailure::RecordNotWritten));
+	assert_eq!(
+		report.store_failed,
+		Some(StoreFailure::RecordNotWritten(ErrorKind::Internal))
+	);
 	assert!(!admits_more(&report));
 	assert_eq!(report.errors.len(), 1, "{:?}", report.errors);
 	assert!(
@@ -1811,7 +1823,10 @@ fn a_landing_the_stage_cannot_read_fails_the_upload_and_the_pass() {
 	assert_eq!(report.failed_paths.len(), 1);
 	assert_eq!(report.failed_paths[0].0, "made/x.txt");
 	assert_eq!(report.halted, None);
-	assert_eq!(report.store_failed, Some(StoreFailure::RecordNotWritten));
+	assert_eq!(
+		report.store_failed,
+		Some(StoreFailure::RecordNotWritten(ErrorKind::Internal))
+	);
 	assert!(!admits_more(&report));
 }
 
@@ -1879,7 +1894,10 @@ async fn a_page_the_stage_cannot_read_fails_the_pass_once_the_transfers_in_fligh
 		events.last(),
 		Some(SyncEvent::Interrupted { actions: 1 })
 	));
-	assert_eq!(report.store_failed, Some(StoreFailure::UnreadPlan));
+	assert_eq!(
+		report.store_failed,
+		Some(StoreFailure::UnreadPlan(ErrorKind::Internal))
+	);
 	assert!(
 		report
 			.errors
@@ -1911,7 +1929,7 @@ fn a_pass_that_could_not_take_the_drive_lock_fails_with_the_locks_answer() {
 #[test]
 fn a_lock_failure_without_its_line_fails_with_the_bare_lock_line() {
 	let report = SyncReport {
-		lock_failed: true,
+		lock_failed: Some(ErrorKind::RetryFailed),
 		..SyncReport::default()
 	};
 	assert_eq!(
@@ -1937,7 +1955,7 @@ fn a_halted_pass_fails_with_what_it_held_back() {
 #[test]
 fn a_pass_whose_record_did_not_land_fails_with_the_store_line() {
 	let report = SyncReport {
-		store_failed: Some(StoreFailure::RecordNotWritten),
+		store_failed: Some(StoreFailure::RecordNotWritten(ErrorKind::IO)),
 		..SyncReport::default()
 	};
 	assert_eq!(
@@ -1950,16 +1968,16 @@ fn a_pass_whose_record_did_not_land_fails_with_the_store_line() {
 #[test]
 fn a_lock_failure_outranks_a_halt_and_a_halt_outranks_a_store_failure() {
 	let mut report = SyncReport {
-		lock_failed: true,
+		lock_failed: Some(ErrorKind::RetryFailed),
 		halted: Some(HaltReason::RemoteStorageFull),
-		store_failed: Some(StoreFailure::UnreadPlan),
+		store_failed: Some(StoreFailure::UnreadPlan(ErrorKind::IO)),
 		..SyncReport::default()
 	};
 	assert_eq!(
 		report.pass_error().as_deref(),
 		Some("failed to acquire the drive lock")
 	);
-	report.lock_failed = false;
+	report.lock_failed = None;
 	assert_eq!(
 		report.pass_error().as_deref(),
 		Some("the account's storage is full: no further uploads were started this pass")
@@ -2549,7 +2567,7 @@ fn a_record_that_cannot_be_written_stops_the_chunk_but_not_its_propagation() {
 	assert_eq!(landed.settled, 1);
 	assert_eq!(
 		landed.report.store_failed,
-		Some(StoreFailure::RecordNotWritten)
+		Some(StoreFailure::RecordNotWritten(ErrorKind::Internal))
 	);
 	assert_eq!(landed.report.remote_dirs_created, 0);
 	assert!(
@@ -2814,7 +2832,7 @@ async fn a_record_that_cannot_be_written_stops_the_chunk_of_trashes() {
 	assert_eq!(trashed.settled, 1);
 	assert_eq!(
 		trashed.report.store_failed,
-		Some(StoreFailure::RecordNotWritten)
+		Some(StoreFailure::RecordNotWritten(ErrorKind::Internal))
 	);
 	assert_eq!(trashed.report.remotely_trashed, 0);
 	assert_eq!(failures(&trashed.events), 1);

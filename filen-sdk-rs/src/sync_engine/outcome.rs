@@ -22,6 +22,7 @@ use super::{
 	scan::LocalNode,
 	side::NodesAt,
 };
+use crate::ErrorKind;
 
 /// Whether a planned action's item is a directory or a file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -282,6 +283,15 @@ impl HaltReason {
 		match self {
 			Self::LocalStorageFull => "downloads",
 			Self::RemoteStorageFull => "uploads",
+		}
+	}
+
+	/// The kind of error this condition is: the server's refusal of a write to a full account, or
+	/// the IO error of a write to a full disk.
+	pub(super) fn error_kind(self) -> ErrorKind {
+		match self {
+			Self::LocalStorageFull => ErrorKind::IO,
+			Self::RemoteStorageFull => ErrorKind::MaxStorageReached,
 		}
 	}
 

@@ -220,6 +220,9 @@ pub struct WatchStatus {
 	pub consecutive_failures: u32,
 	/// Why the last pass failed, or `None` while the watch is healthy.
 	pub last_error: Option<String>,
+	/// The [`ErrorKind`] of that failure, set exactly while `last_error` is: `Unauthenticated` when
+	/// the server no longer accepts the session.
+	pub last_error_kind: Option<ErrorKind>,
 	/// What the loop is doing — including the two ways it can END, which a caller has no other way
 	/// to tell apart.
 	pub state: WatchState,
@@ -743,7 +746,7 @@ async fn run_pass(
 			// A pass that failed outright read nothing it could finish with, so the net is still
 			// owed a whole-tree read; the engine has already forced the next pass full.
 			PassEnd {
-				error: Some(e.to_string()),
+				error: Some((e.to_string(), e.kind())),
 				owed: false,
 				read_whole: false,
 				read_cost: Duration::ZERO,
@@ -754,8 +757,8 @@ async fn run_pass(
 
 /// What one finished pass means for the loop.
 struct PassEnd {
-	/// The pass's own failure, if any.
-	error: Option<String>,
+	/// The pass's own failure, if any, and its kind.
+	error: Option<(String, ErrorKind)>,
 	/// Whether a pause cut it short, leaving the loop owing a pass (see [`owes_a_pass`]).
 	owed: bool,
 	/// Whether it read both sides whole (see [`read_both_sides_whole`]).
@@ -816,8 +819,8 @@ fn net_interval(floor: Duration, cost: Duration) -> Duration {
 /// of its own ([`StoreFailure::line`](super::apply::StoreFailure::line)).
 fn pass_outcome(report: &SyncReport) -> PassEnd {
 	PassEnd {
-		error: report.pass_error(),
-		owed: !report.lock_failed && owes_a_pass(report),
+		error: report.pass_failure(),
+		owed: report.lock_failed.is_none() && owes_a_pass(report),
 		// A pass that could not take the drive lock still READ both sides: the lock is only asked
 		// for once there is a plan to apply.
 		read_whole: read_both_sides_whole(report),
@@ -867,11 +870,13 @@ fn is_engine_staging(root: &Path, path: &Path) -> bool {
 fn publish_pass(
 	status: &tokio::sync::watch::Sender<WatchStatus>,
 	failures: u32,
-	error: Option<String>,
+	error: Option<(String, ErrorKind)>,
 ) {
+	let (error, kind) = error.unzip();
 	status.send_modify(|status| {
 		status.consecutive_failures = failures;
 		status.last_error = error;
+		status.last_error_kind = kind;
 		status.state = WatchState::Running;
 	});
 }

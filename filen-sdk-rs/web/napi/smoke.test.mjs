@@ -532,7 +532,15 @@ describe("sync engine, offline", () => {
 		assert.equal(pair.paused, false)
 		assert.equal(pair.activity, SyncPairActivity.Idle)
 		// napi leaves an absent Option's key out; read the value, as ubrn's caller would.
-		for (const key of ["watchStatus", "passInFlight", "lastPassCompletedAtMs", "lastPassError", "pausedAtMs", "pauseOptions"]) {
+		for (const key of [
+			"watchStatus",
+			"passInFlight",
+			"lastPassCompletedAtMs",
+			"lastPassError",
+			"lastPassErrorKind",
+			"pausedAtMs",
+			"pauseOptions"
+		]) {
 			assert.equal(pair[key], undefined, key)
 		}
 	})

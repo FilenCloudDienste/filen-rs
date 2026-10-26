@@ -326,7 +326,7 @@ fn a_passs_outcome_decides_whether_the_next_one_reads_everything() {
 		(
 			"a drive lock it could not take",
 			SyncReport {
-				lock_failed: true,
+				lock_failed: Some(ErrorKind::RetryFailed),
 				..SyncReport::default()
 			},
 		),
@@ -340,7 +340,7 @@ fn a_passs_outcome_decides_whether_the_next_one_reads_everything() {
 		(
 			"a record that did not land",
 			SyncReport {
-				store_failed: Some(apply::StoreFailure::RecordNotWritten),
+				store_failed: Some(apply::StoreFailure::RecordNotWritten(ErrorKind::IO)),
 				..SyncReport::default()
 			},
 		),
@@ -4783,7 +4783,8 @@ async fn a_pass_that_fails_outright_reports_pass_failed() {
 	assert_eq!(
 		events,
 		vec![SyncEvent::PassFailed {
-			error: error.to_string()
+			error: error.to_string(),
+			kind: ErrorKind::InvalidState,
 		}]
 	);
 

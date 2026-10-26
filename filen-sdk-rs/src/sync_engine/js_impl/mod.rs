@@ -239,6 +239,7 @@ struct PairLive {
 	last_report: Option<SyncPassReport>,
 	last_pass_completed_at_ms: Option<u64>,
 	last_pass_error: Option<String>,
+	last_pass_error_kind: Option<ErrorKind>,
 	/// The last pause this process made, until a resume clears it.
 	pause: Option<PauseRecord>,
 }
@@ -314,14 +315,16 @@ impl LiveState {
 					live.pass_in_flight = None;
 					live.last_pass_completed_at_ms = Some(event.emitted_at_ms);
 					live.last_pass_error = report.pass_error.clone();
+					live.last_pass_error_kind = report.pass_error_kind;
 					// The binding keeps its own copy for `last_report`; the listener gets the
 					// event's. Capped, so at most a few thousand entries.
 					live.last_report = Some(report.clone());
 					return;
 				}
-				SyncEventMessage::PassFailed { error } => {
+				SyncEventMessage::PassFailed { error, kind } => {
 					live.pass_in_flight = None;
 					live.last_pass_error = Some(error.clone());
+					live.last_pass_error_kind = Some(*kind);
 				}
 				SyncEventMessage::Progress { .. } => return,
 				_ => {}
@@ -569,6 +572,7 @@ impl SyncEngineCore {
 				info.pass_in_flight = live.pass_in_flight;
 				info.last_pass_completed_at_ms = live.last_pass_completed_at_ms;
 				info.last_pass_error.clone_from(&live.last_pass_error);
+				info.last_pass_error_kind = live.last_pass_error_kind;
 				// Only while the engine says the pair is paused: a resume whose sweep failed after
 				// the pair had resumed leaves the record behind.
 				if info.paused
@@ -913,6 +917,8 @@ fn ended(latest: WatchStatus) -> WatchStatus {
 	WatchStatus {
 		state: WatchState::Stopped,
 		last_error: Some(LOOP_ENDED.to_owned()),
+		// A loop that ended without saying so died, a panic for one: a broken invariant.
+		last_error_kind: Some(ErrorKind::Internal),
 		..latest
 	}
 }

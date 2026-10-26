@@ -49,6 +49,7 @@ use super::{
 	stage::{Carried, Pager, Run, Screen, Staged, StagedPlan},
 };
 use crate::{
+	ErrorKind,
 	api::v3::bulk::trash,
 	auth::Client,
 	cache::{SearchResult, hydrate_cached_items_at},
@@ -142,11 +143,11 @@ pub struct SyncReport {
 	/// never dropped before its row — and the next pass re-plans them. Zero on a pass that ran to
 	/// the end, including one that was merely SUSPENDED and resumed.
 	pub interrupted: usize,
-	/// Set when the pass could not take the drive lock, so it applied nothing. The report is still
-	/// returned (conflicts and held deletions were recorded before the lock was asked for), but a
-	/// watch loop must count the pass as failed rather than healthy. The error itself is the entry
-	/// in `errors` that starts with [`LOCK_FAILURE`].
-	pub(super) lock_failed: bool,
+	/// Set, to the kind of the lock's own error, when the pass could not take the drive lock, so it
+	/// applied nothing. The report is still returned (conflicts and held deletions were recorded
+	/// before the lock was asked for), but a watch loop must count the pass as failed rather than
+	/// healthy. The error itself is the entry in `errors` that starts with [`LOCK_FAILURE`].
+	pub(super) lock_failed: Option<ErrorKind>,
 	/// Set when a write that RECORDS work already done could not be persisted: a baseline row, a
 	/// journal row, a journal retirement, or the pass's own record in its stage of a directory it
 	/// created or of a write a later deletion must not take down. The act itself stands — the
@@ -225,17 +226,26 @@ impl SyncReport {
 	/// written or a staged plan that could not be read. Per-path failures alone do not fail a pass;
 	/// they stay in `errors`.
 	pub fn pass_error(&self) -> Option<String> {
-		if self.lock_failed {
-			return Some(
-				self.errors
-					.iter()
-					.find(|error| error.starts_with(LOCK_FAILURE))
-					.map_or_else(|| LOCK_FAILURE.to_string(), String::clone),
-			);
+		self.pass_failure().map(|(line, _)| line)
+	}
+
+	/// [`pass_error`](Self::pass_error) and the [`ErrorKind`] of what failed the pass: the lock's
+	/// own error, the halt's kind ([`HaltReason::error_kind`]), or the store's own error.
+	pub(super) fn pass_failure(&self) -> Option<(String, ErrorKind)> {
+		if let Some(kind) = self.lock_failed {
+			let line = self
+				.errors
+				.iter()
+				.find(|error| error.starts_with(LOCK_FAILURE))
+				.map_or_else(|| LOCK_FAILURE.to_string(), String::clone);
+			return Some((line, kind));
 		}
 		self.halted
-			.map(HaltReason::held_line)
-			.or_else(|| self.store_failed.map(|failure| failure.line().into()))
+			.map(|halt| (halt.held_line(), halt.error_kind()))
+			.or_else(|| {
+				self.store_failed
+					.map(|failure| (failure.line().into(), failure.kind()))
+			})
 	}
 }
 
@@ -1293,7 +1303,7 @@ pub(super) fn note_lock_failure(
 	observer: &mut (dyn FnMut(SyncEvent) + Send),
 ) {
 	report.errors.push(format!("{LOCK_FAILURE}: {error}"));
-	report.lock_failed = true;
+	report.lock_failed = Some(error.kind());
 	note_interrupted(report, remaining, observer);
 }
 
@@ -1308,23 +1318,31 @@ pub(super) const STORE_FAILURE: &str = "a record of work already done could not 
 /// answer is already in [`SyncReport::errors`].
 pub(super) const UNREAD_PLAN: &str = "the plan this pass staged could not be read";
 
-/// What stopped a pass admitting more work ([`SyncReport::store_failed`]).
+/// What stopped a pass admitting more work ([`SyncReport::store_failed`]), with the kind of the
+/// store's own error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum StoreFailure {
 	/// A write recording work already done did not land (see [`record_not_written`]). It outranks
 	/// an [`UnreadPlan`](Self::UnreadPlan) in the same pass: it leaves an act no record describes,
 	/// where an unread plan only stops the pass short.
-	RecordNotWritten,
+	RecordNotWritten(ErrorKind),
 	/// A read of the pass's staged plan failed (see [`note_unread_plan`]).
-	UnreadPlan,
+	UnreadPlan(ErrorKind),
 }
 
 impl StoreFailure {
 	/// How a pass it stopped reports that to a watch loop.
 	pub(super) fn line(self) -> &'static str {
 		match self {
-			Self::RecordNotWritten => STORE_FAILURE,
-			Self::UnreadPlan => UNREAD_PLAN,
+			Self::RecordNotWritten(_) => STORE_FAILURE,
+			Self::UnreadPlan(_) => UNREAD_PLAN,
+		}
+	}
+
+	/// The kind of the store's error that stopped the pass.
+	pub(super) fn kind(self) -> ErrorKind {
+		match self {
+			Self::RecordNotWritten(kind) | Self::UnreadPlan(kind) => kind,
 		}
 	}
 }
@@ -1558,7 +1576,9 @@ fn unless_unread<T>(read: Result<Option<T>, crate::Error>, report: &mut SyncRepo
 fn note_unread_plan(report: &mut SyncReport, error: &crate::Error) {
 	tracing::error!("apply: {error}; the pass starts nothing more");
 	report.errors.push(error.to_string());
-	report.store_failed.get_or_insert(StoreFailure::UnreadPlan);
+	report
+		.store_failed
+		.get_or_insert(StoreFailure::UnreadPlan(error.kind()));
 }
 
 /// What a transfer reads that its entry does not carry, looked up as the apply takes it: the remote
@@ -2425,7 +2445,7 @@ fn note_written(plan: &PagedPlan, action: &SyncAction, report: &mut SyncReport) 
 		report
 			.errors
 			.push(format!("{}: {error}", action.rel_path()));
-		report.store_failed = Some(StoreFailure::RecordNotWritten);
+		report.store_failed = Some(StoreFailure::RecordNotWritten(error.kind()));
 	}
 }
 
@@ -2444,7 +2464,7 @@ fn note_failure(
 ) -> Option<HaltReason> {
 	report.errors.push(format!("{rel_path}: {error}"));
 	if record_not_written(error) {
-		report.store_failed = Some(StoreFailure::RecordNotWritten);
+		report.store_failed = Some(StoreFailure::RecordNotWritten(error.kind()));
 	}
 	let Some(reason) = pass_halt(error) else {
 		report

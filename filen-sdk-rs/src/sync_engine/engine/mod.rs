@@ -5659,6 +5659,7 @@ impl SyncEngine {
 		if let Err(error) = &result {
 			observer(SyncEvent::PassFailed {
 				error: error.to_string(),
+				kind: error.kind(),
 			});
 		}
 		result
@@ -6049,7 +6050,7 @@ impl SyncEngine {
 				// record did not land is a failed pass, not a healthy one that mentions a problem.
 				report.errors.push(format!("{rel_path}: {error}"));
 				if apply::record_not_written(&error) {
-					report.store_failed = Some(apply::StoreFailure::RecordNotWritten);
+					report.store_failed = Some(apply::StoreFailure::RecordNotWritten(error.kind()));
 				}
 			}
 			observer(SyncEvent::Conflict {
@@ -6264,7 +6265,7 @@ fn next_pass_scope(report: &SyncReport) -> Option<FullPassReason> {
 	// Each leaves paths owed with nothing left holding them: a dropped action's evidence was an
 	// observation or an announcement this pass consumed, and a derived map rebuilds neither — the
 	// baseline row it would derive from is the one that says the change never happened.
-	if report.lock_failed
+	if report.lock_failed.is_some()
 		|| report.store_failed.is_some()
 		|| report.halted.is_some()
 		|| !report.failed_paths.is_empty()

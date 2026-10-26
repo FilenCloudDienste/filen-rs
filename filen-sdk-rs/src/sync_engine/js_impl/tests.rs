@@ -392,6 +392,7 @@ fn planned() -> SyncEvent {
 fn failed() -> SyncEvent {
 	SyncEvent::PassFailed {
 		error: "offline".to_owned(),
+		kind: ErrorKind::Reqwest,
 	}
 }
 
@@ -438,6 +439,7 @@ fn a_pairs_live_state_follows_its_passes() {
 		assert_eq!(pair.pass_in_flight, None);
 		assert!(pair.last_pass_completed_at_ms.is_some());
 		assert_eq!(pair.last_pass_error, None);
+		assert_eq!(pair.last_pass_error_kind, None);
 		assert_eq!(
 			pair.last_report.as_ref().map(|report| report.uploaded),
 			Some(2)
@@ -449,6 +451,7 @@ fn a_pairs_live_state_follows_its_passes() {
 	let pairs = lock(&live.pairs);
 	assert_eq!(pairs[&1].pass_in_flight, None);
 	assert_eq!(pairs[&1].last_pass_error.as_deref(), Some("offline"));
+	assert_eq!(pairs[&1].last_pass_error_kind, Some(ErrorKind::Reqwest));
 	assert_eq!(
 		pairs[&1].last_report.as_ref().map(|report| report.uploaded),
 		Some(2),
@@ -539,6 +542,7 @@ async fn a_loop_that_ends_without_a_terminal_status_is_reported_stopped() {
 		WatchStatus {
 			consecutive_failures: 1,
 			last_error: Some(LOOP_ENDED.to_owned()),
+			last_error_kind: Some(ErrorKind::Internal),
 			state: WatchState::Stopped,
 			..WatchStatus::default()
 		}

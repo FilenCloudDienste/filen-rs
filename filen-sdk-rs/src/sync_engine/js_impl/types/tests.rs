@@ -119,7 +119,10 @@ fn a_report_carries_its_counts_and_why_its_pass_failed() {
 		mirrored.pass_error.as_deref(),
 		Some("the local disk is full: no further downloads were started this pass")
 	);
-	assert_eq!(SyncPassReport::from(SyncReport::default()).pass_error, None);
+	assert_eq!(mirrored.pass_error_kind, Some(ErrorKind::IO));
+	let healthy = SyncPassReport::from(SyncReport::default());
+	assert_eq!(healthy.pass_error, None);
+	assert_eq!(healthy.pass_error_kind, None);
 }
 
 #[test]
@@ -214,9 +217,11 @@ fn events_map_with_their_payloads() {
 		(
 			SyncEvent::PassFailed {
 				error: "gone".to_owned(),
+				kind: ErrorKind::Unauthenticated,
 			},
 			SyncEventMessage::PassFailed {
 				error: "gone".to_owned(),
+				kind: ErrorKind::Unauthenticated,
 			},
 		),
 	];

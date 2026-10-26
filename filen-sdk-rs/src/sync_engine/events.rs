@@ -15,6 +15,7 @@ use std::{
 use filen_macros::js_type;
 
 use super::{SyncMode, apply::SyncReport};
+use crate::ErrorKind;
 
 /// A single event from a sync pass, delivered to a [`SyncObserver`] in the order it happens.
 ///
@@ -135,8 +136,10 @@ pub enum SyncEvent {
 	/// [`sync_once_observed`](super::SyncEngine::sync_once_observed) returns (an unknown or
 	/// removed pair, an unreadable baseline, a sync root the server no longer has). The last event
 	/// of that pass; no [`PassCompleted`](Self::PassCompleted) follows. Failures of single actions
-	/// are [`ActionFailed`](Self::ActionFailed) instead.
-	PassFailed { error: String },
+	/// are [`ActionFailed`](Self::ActionFailed) instead. `kind` is that error's [`ErrorKind`], so a
+	/// caller can tell a session the server no longer accepts (`Unauthenticated`) from the rest
+	/// without reading `error`.
+	PassFailed { error: String, kind: ErrorKind },
 }
 
 /// Which way a file transfer moves its bytes.

@@ -676,7 +676,7 @@ fn print_event(ui: &mut UI, printed_failures: &mut HashSet<String>, event: &Sync
 		SyncEvent::PassCompleted { report } => {
 			print_report(ui, &mem::take(printed_failures), report);
 		}
-		SyncEvent::PassFailed { error } => {
+		SyncEvent::PassFailed { error, .. } => {
 			*printed_failures = HashSet::new();
 			ui.print_failure(&format!("Sync pass failed: {error}"));
 		}

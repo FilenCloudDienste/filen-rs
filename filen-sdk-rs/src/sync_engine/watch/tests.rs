@@ -147,13 +147,14 @@ async fn a_watcher_error_wakes_the_loop_and_marks_the_watch_degraded() {
 	);
 
 	// A pass finishing afterwards does not clear it: the lost coverage does not come back.
-	publish_pass(&status, 1, Some("boom".to_string()));
+	publish_pass(&status, 1, Some(("boom".to_string(), ErrorKind::Reqwest)));
 	let after = health.borrow().clone();
 	assert_eq!(
 		after,
 		WatchStatus {
 			consecutive_failures: 1,
 			last_error: Some("boom".to_string()),
+			last_error_kind: Some(ErrorKind::Reqwest),
 			state: WatchState::Running,
 			local_events_degraded: Some("OS file watch limit reached.".to_string()),
 			remote_events_degraded: None,
@@ -726,7 +727,7 @@ fn a_pass_that_could_not_take_the_drive_lock_counts_as_a_failure() {
 	let end = pass_outcome(&report);
 	assert_eq!(
 		end.error,
-		Some(format!("{LOCK_FAILURE}: {cause}")),
+		Some((format!("{LOCK_FAILURE}: {cause}"), ErrorKind::RetryFailed)),
 		"a pass that could not take the drive lock must publish its cause"
 	);
 	assert!(
@@ -739,6 +740,44 @@ fn a_pass_that_could_not_take_the_drive_lock_counts_as_a_failure() {
 	);
 }
 
+/// A pass whose drive lock the server refused because it no longer accepts the session fails
+/// with that kind, and the watch publishes it beside the line: a revoked key reads as
+/// `Unauthenticated` without matching the message. The gateway answers such a request with
+/// `api_key_not_found`.
+#[test]
+fn a_pass_failing_unauthenticated_reports_the_kind() {
+	let mut report = SyncReport::default();
+	let cause = Error::from(filen_types::error::ResponseError::ApiError {
+		message: Some("API key not found.".to_owned()),
+		code: Some("api_key_not_found".to_owned()),
+	});
+	note_lock_failure(&mut report, 1, &cause, &mut |_| {});
+	let end = pass_outcome(&report);
+	assert_eq!(
+		end.error,
+		Some((
+			format!("{LOCK_FAILURE}: {cause}"),
+			ErrorKind::Unauthenticated
+		))
+	);
+
+	let (status, health) = tokio::sync::watch::channel(WatchStatus::default());
+	publish_pass(&status, 1, end.error);
+	assert_eq!(
+		*health.borrow(),
+		WatchStatus {
+			consecutive_failures: 1,
+			last_error: Some(format!("{LOCK_FAILURE}: {cause}")),
+			last_error_kind: Some(ErrorKind::Unauthenticated),
+			..WatchStatus::default()
+		}
+	);
+
+	// The next pass that succeeds clears both.
+	publish_pass(&status, 0, None);
+	assert_eq!(*health.borrow(), WatchStatus::default());
+}
+
 /// A pass that applied its actions but could not RECORD one of them ran the act without its
 /// record. The loop must count it as a failed pass — the same way it counts a lock it could not
 /// take — so the next one waits out the backoff instead of losing the next record to the same
@@ -747,13 +786,13 @@ fn a_pass_that_could_not_take_the_drive_lock_counts_as_a_failure() {
 fn a_pass_whose_record_did_not_land_counts_as_a_failure() {
 	let report = SyncReport {
 		uploaded: 1,
-		store_failed: Some(StoreFailure::RecordNotWritten),
+		store_failed: Some(StoreFailure::RecordNotWritten(ErrorKind::IO)),
 		..SyncReport::default()
 	};
 	let end = pass_outcome(&report);
 	assert_eq!(
-		end.error.as_deref(),
-		Some(STORE_FAILURE),
+		end.error,
+		Some((STORE_FAILURE.to_string(), ErrorKind::IO)),
 		"a pass that lost a record must publish a cause, not read as healthy"
 	);
 	assert!(
@@ -768,11 +807,11 @@ fn a_pass_whose_record_did_not_land_counts_as_a_failure() {
 fn a_pass_whose_plan_could_not_be_read_counts_as_a_failure_of_its_own() {
 	let report = SyncReport {
 		uploaded: 1,
-		store_failed: Some(StoreFailure::UnreadPlan),
+		store_failed: Some(StoreFailure::UnreadPlan(ErrorKind::IO)),
 		..SyncReport::default()
 	};
 	let end = pass_outcome(&report);
-	assert_eq!(end.error.as_deref(), Some(UNREAD_PLAN));
+	assert_eq!(end.error, Some((UNREAD_PLAN.to_string(), ErrorKind::IO)));
 	assert!(
 		!end.owed,
 		"a failed pass is retried on the backoff, not re-armed at the debounce"

@@ -1,3 +1,5 @@
+use filen_sdk_rs::ErrorKind;
+
 use super::*;
 
 const MIB: u64 = 1024 * 1024;
@@ -215,6 +217,7 @@ fn there_are_no_rates_outside_a_pass() {
 	rates.record(
 		&SyncEvent::PassFailed {
 			error: "failed".to_owned(),
+			kind: ErrorKind::Reqwest,
 		},
 		at(start, 1000),
 	);

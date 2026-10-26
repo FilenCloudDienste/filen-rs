@@ -1176,7 +1176,8 @@ async fn control_05_remove_pair_leaves_both_sides_intact() {
 		assert_eq!(
 			events,
 			vec![SyncEvent::PassFailed {
-				error: error.to_string()
+				error: error.to_string(),
+				kind: error.kind(),
 			}],
 			"a pass that fails outright must report it"
 		);
