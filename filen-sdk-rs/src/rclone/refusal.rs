@@ -1,4 +1,4 @@
-use crate::{Error, ErrorKind};
+use crate::{Error, ErrorKind, rclone::binary::MIN_RCLONE};
 
 /// What the rclone module refuses with that a caller can tell apart without reading the message.
 ///
@@ -13,13 +13,24 @@ pub enum RcloneRefusal {
 	/// The bundled rclone binary's SHA-256 is not the one it was shipped with.
 	#[error("the rclone binary does not match its expected checksum")]
 	BinaryChecksum,
+	/// The rclone binary is older than the oldest one the daemon runs, or its version cannot be
+	/// read. `found` is the version it reported.
+	#[error(
+		"rclone {found} is not supported: the daemon needs rclone v{}.{}.{} or later",
+		MIN_RCLONE.0,
+		MIN_RCLONE.1,
+		MIN_RCLONE.2
+	)]
+	UnsupportedVersion { found: String },
 }
 
 impl RcloneRefusal {
 	/// The error kind a refusal is returned as: [`ErrorKind::IO`] for what is wrong on this machine.
 	pub fn kind(&self) -> ErrorKind {
 		match self {
-			Self::BinaryMissing | Self::BinaryChecksum => ErrorKind::IO,
+			Self::BinaryMissing | Self::BinaryChecksum | Self::UnsupportedVersion { .. } => {
+				ErrorKind::IO
+			}
 		}
 	}
 }

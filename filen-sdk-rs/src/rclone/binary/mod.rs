@@ -74,5 +74,30 @@ async fn resolve_bundled(path: PathBuf, sha256: Option<[u8; 32]>) -> Result<Path
 	})?
 }
 
+/// The oldest rclone the daemon runs: the first release whose rc has everything it relies on
+/// (`serve/start`, `mount/mount` with `vfsOpt`/`mountOpt`, `config/create` into an in-memory
+/// config) and its `filen` backend the options it is configured with.
+pub(crate) const MIN_RCLONE: (u32, u32, u32) = (1, 74, 3);
+
+/// The `(major, minor, patch)` of an rclone version string: `rc core/version`'s `v1.74.3`, or the
+/// first line of `rclone version`'s output, `rclone v1.74.3`. A suffix after the patch number
+/// (`-beta.8836.abcdef`, `-DEV`) is ignored.
+pub(crate) fn parse_version(text: &str) -> Option<(u32, u32, u32)> {
+	let line = text.lines().next()?.trim();
+	let version = line
+		.strip_prefix("rclone ")
+		.unwrap_or(line)
+		.strip_prefix('v')?;
+	let mut parts = version.splitn(3, '.');
+	let major = parts.next()?.parse().ok()?;
+	let minor = parts.next()?.parse().ok()?;
+	let rest = parts.next()?;
+	let patch_end = rest
+		.find(|c: char| !c.is_ascii_digit())
+		.unwrap_or(rest.len());
+	let patch = rest.get(..patch_end)?.parse().ok()?;
+	Some((major, minor, patch))
+}
+
 #[cfg(test)]
 mod tests;

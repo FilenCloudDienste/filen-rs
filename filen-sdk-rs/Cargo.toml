@@ -97,6 +97,12 @@ required-features = ["sync-engine-live-tests"]
 name = "sync_engine_js_tests"
 required-features = ["uniffi", "cache", "sync-engine"]
 
+# The rclone daemon against a real rclone (`FILEN_TEST_RCLONE`, or the managed download with
+# `rclone-managed`) whose remotes are an alias of a local directory: no account, no network.
+[[test]]
+name = "rclone_daemon_tests"
+required-features = ["rclone", "test-seams"]
+
 # Mounts a network drive through the managed rclone (`rclone-managed`).
 [[test]]
 name = "network_drive_tests"
