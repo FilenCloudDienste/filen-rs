@@ -6,7 +6,10 @@ use rand::{Rng, SeedableRng, rngs::StdRng};
 use uuid::Uuid;
 
 use super::*;
-use crate::sync_engine::{baseline::BaselineState, ignore::IgnoreLevel};
+use crate::sync_engine::{
+	baseline::BaselineState,
+	ignore::{IgnoreLevel, parse_user_ignore},
+};
 
 fn temp_root() -> std::path::PathBuf {
 	let dir = std::env::temp_dir().join(format!("filen_scan_test_{}", Uuid::new_v4()));
@@ -1520,6 +1523,65 @@ fn an_ignored_entry_is_pruned_and_reported_top_most() {
 	assert_eq!(only.ignored.keys().collect::<Vec<_>>(), vec!["sub/tmp"]);
 	assert_eq!(only.ignored_default_untracked, 1);
 	assert!(rules.decide("x.log", false).is_none());
+
+	fs::remove_dir_all(&root).ok();
+}
+
+/// A device-wide user rule that hides every dot file except the root's rule file still hides the
+/// nested one from syncing, but not from being READ: hiding a rule file is about whether it syncs,
+/// and its directory's rules apply either way.
+#[test]
+fn a_user_level_dotfile_rule_still_reads_rule_files() {
+	let root = temp_root();
+	fs::write(root.join(FILENIGNORE), "*.tmp\n").unwrap();
+	fs::write(root.join(".a"), b"a").unwrap();
+	fs::write(root.join("x.tmp"), b"x").unwrap();
+	fs::create_dir(root.join("d")).unwrap();
+	fs::write(root.join("d").join(FILENIGNORE), "*.log\n").unwrap();
+	fs::write(root.join("d").join(".b"), b"b").unwrap();
+	fs::write(root.join("d").join("y.log"), b"y").unwrap();
+	fs::write(root.join("d").join("keep.txt"), b"k").unwrap();
+
+	let user = parse_user_ignore(".*\n!/.filenignore").unwrap();
+	let (scan, rules) = scan_local(
+		&root,
+		&Baseline::default(),
+		IgnoreRules::new(Some(user)),
+		RuleFiles::Read,
+	);
+	assert!(scan.complete, "{:?}", scan.errors);
+	assert!(scan.errors.is_empty(), "{:?}", scan.errors);
+	assert_eq!(sorted_paths(&scan), vec![".filenignore", "d", "d/keep.txt"]);
+	let by = |level: IgnoreLevel, pattern: &str| IgnoreDecision {
+		level,
+		pattern: pattern.to_string(),
+	};
+	assert_eq!(
+		scan.ignored,
+		BTreeMap::from([
+			(".a".to_string(), by(IgnoreLevel::User, ".*")),
+			("d/.b".to_string(), by(IgnoreLevel::User, ".*")),
+			("d/.filenignore".to_string(), by(IgnoreLevel::User, ".*")),
+			(
+				"d/y.log".to_string(),
+				by(
+					IgnoreLevel::File {
+						dir: "d".to_string()
+					},
+					"*.log"
+				)
+			),
+			(
+				"x.tmp".to_string(),
+				by(IgnoreLevel::File { dir: String::new() }, "*.tmp")
+			),
+		])
+	);
+	assert!(scan.ignore_blocked.is_empty());
+	assert!(
+		rules.decide("d/z.log", false).is_some(),
+		"the hidden rule file's rules apply"
+	);
 
 	fs::remove_dir_all(&root).ok();
 }
