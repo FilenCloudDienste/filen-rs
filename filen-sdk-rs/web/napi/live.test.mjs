@@ -1,6 +1,7 @@
 // Live test of the Node-API addon (`npm run build:napi` first): it logs in to the test account and
 // drives a real sync between a temp folder and a fresh remote directory, through the addon only,
-// the way the desktop app does. Needs TEST_EMAIL / TEST_PASSWORD, from the environment or from the
+// the way the desktop app does, then serves the account over webdav from a real rclone
+// (FILEN_TEST_RCLONE, as rclone_daemon_tests take it; that part is skipped without it). Needs TEST_EMAIL / TEST_PASSWORD, from the environment or from the
 // nearest dotenv file up from this package, as the Rust tests read them; skipped without them.
 //
 // The addon has no API to create a remote directory, so test-utils' `remote-test-dir` lends one
@@ -11,8 +12,10 @@
 
 import assert from "node:assert/strict"
 import { spawn } from "node:child_process"
+import { randomBytes, randomUUID } from "node:crypto"
 import { once } from "node:events"
 import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs"
+import { createServer } from "node:net"
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import { performance } from "node:perf_hooks"
@@ -26,6 +29,8 @@ import {
 	FilenSdkError,
 	IgnoreLevel_Tags,
 	PlannedActionKind_Tags,
+	ServeAuth_Tags,
+	ServeProtocol,
 	SyncEventMessage_Tags,
 	SyncMode,
 	UnauthJsClient,
@@ -321,3 +326,93 @@ describe("the addon against the server", { skip: email && password ? false : "TE
 		})
 	})
 })
+
+/** A loopback port no one listens on now. */
+async function freePort() {
+	const server = createServer()
+	server.listen(0, "127.0.0.1")
+	await once(server, "listening")
+	const { port } = server.address()
+	server.close()
+	await once(server, "close")
+	return port
+}
+
+describe(
+	"the rclone daemon against the server",
+	{
+		skip: !(email && password) ? "TEST_EMAIL / TEST_PASSWORD are unset" : process.env.FILEN_TEST_RCLONE ? false : "FILEN_TEST_RCLONE is unset"
+	},
+	() => {
+		let dir, daemon
+
+		before(async () => {
+			dir = realpathSync.native(mkdtempSync(join(tmpdir(), "filen-sdk-rs-live-rclone-")))
+			const client = await UnauthJsClient.fromConfig({}).login({ email, password, twoFactorCode: undefined })
+			daemon = await client.startRcloneDaemon({
+				binaryPath: process.env.FILEN_TEST_RCLONE,
+				binarySha256: undefined,
+				stateDir: join(dir, "state"),
+				cacheDir: join(dir, "cache"),
+				logFile: join(dir, "rclone.log"),
+				userAgent: "filen-sdk-rs-live",
+				vfs: { cacheMaxSize: 1n << 30n, cacheMinFreeSpace: 1n << 30n, cacheMaxAgeSecs: 3600n, dirCacheTimeSecs: 15 }
+			})
+		})
+
+		after(
+			async () => {
+				try {
+					await daemon?.stop({ drainTimeoutMs: 60_000, graceMs: 10_000 })
+				} finally {
+					if (dir) {
+						rmSync(dir, { recursive: true, force: true, maxRetries: 10 })
+					}
+				}
+			},
+			{ timeout: 2 * 60_000 }
+		)
+
+		test("a loopback webdav serve with random credentials round-trips a file and refuses a request without them", async () => {
+			const user = `filen-${randomBytes(4).toString("hex")}`
+			const pass = randomBytes(32).toString("base64url")
+			const serve = await daemon.startServe({
+				protocol: ServeProtocol.Webdav,
+				host: "127.0.0.1",
+				port: await freePort(),
+				auth: { tag: ServeAuth_Tags.Basic, inner: { user, password: pass } },
+				tls: undefined,
+				readOnly: false
+			})
+			const base = `http://${serve.addr}/filen-sdk-rs-napi-rclone-${randomUUID()}`
+			const authorization = `Basic ${Buffer.from(`${user}:${pass}`).toString("base64")}`
+			const request = (path, init = {}) => fetch(`${base}${path}`, { ...init, headers: { authorization, ...init.headers } })
+
+			assert.equal((await fetch(`http://${serve.addr}/`)).status, 401)
+			assert.equal((await request("", { method: "MKCOL" })).status, 201)
+			try {
+				assert.equal((await request("/file.txt", { method: "PUT", body: "round trip" })).status, 201)
+				// Uploaded once the VFS cache's write-back delay (5 s) has passed.
+				const deadline = performance.now() + 120_000
+				for (;;) {
+					const stats = await daemon.stats()
+					if (stats.uploadsInProgress + stats.uploadsQueued === 0) {
+						break
+					}
+					assert.ok(performance.now() < deadline, "the file was not uploaded within 120 s")
+					await sleep(500)
+				}
+				const read = await request("/file.txt")
+				assert.equal(read.status, 200)
+				assert.equal(await read.text(), "round trip")
+				assert.deepEqual(
+					(await daemon.stats()).serves.map(({ id, protocol }) => [id, protocol]),
+					[[serve.id, ServeProtocol.Webdav]]
+				)
+			} finally {
+				assert.equal((await request("", { method: "DELETE" })).status, 204)
+				await daemon.stopServe(serve.id)
+			}
+		})
+	}
+)

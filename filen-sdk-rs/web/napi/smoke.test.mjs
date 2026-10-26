@@ -24,16 +24,21 @@ const {
 	DeleteGuardState_Tags,
 	ErrorKind,
 	FilenSdkError,
+	FuseProvider,
+	FuseStatus_Tags,
 	HaltReason,
 	JsClient,
+	JsRcloneDaemon,
 	JsSyncEngine,
 	JsSyncPlan,
 	JsSyncWatch,
 	LogLevel,
 	PauseMode,
 	PlannedNodeKind,
+	RcloneRefusal_Tags,
 	RefuseReason,
 	ResyncProgressMessage_Tags,
+	ServeProtocol,
 	SyncMode,
 	SyncPairActivity,
 	SyncRefusal_Tags,
@@ -96,7 +101,7 @@ function assertThrownLikeUbrn(e) {
 }
 
 describe("exports", () => {
-	test("are the classes, enums and functions ubrn exposes for login, the cache and the sync engine", () => {
+	test("are the classes, enums and functions ubrn exposes for login, the cache, the sync engine and rclone", () => {
 		// napi's loader also exports each enum and class under its Rust name where that differs
 		// (the *Napi mirrors, *Tags), and the binding flavor it loaded.
 		assert.deepEqual(Object.keys(sdk).sort(), [
@@ -112,11 +117,16 @@ describe("exports", () => {
 			"ErrorKindNapi",
 			"FilenSdkError",
 			"FilenSdkErrorNapi",
+			"FuseProvider",
+			"FuseProviderNapi",
+			"FuseStatusTags",
+			"FuseStatus_Tags",
 			"HaltReason",
 			"HaltReasonNapi",
 			"IgnoreLevelTags",
 			"IgnoreLevel_Tags",
 			"JsClient",
+			"JsRcloneDaemon",
 			"JsSyncEngine",
 			"JsSyncPlan",
 			"JsSyncWatch",
@@ -128,10 +138,18 @@ describe("exports", () => {
 			"PlannedActionKind_Tags",
 			"PlannedNodeKind",
 			"PlannedNodeKindNapi",
+			"RcloneExitTags",
+			"RcloneExit_Tags",
+			"RcloneRefusalTags",
+			"RcloneRefusal_Tags",
 			"RefuseReason",
 			"RefuseReasonNapi",
 			"ResyncProgressMessageTags",
 			"ResyncProgressMessage_Tags",
+			"ServeAuthTags",
+			"ServeAuth_Tags",
+			"ServeProtocol",
+			"ServeProtocolNapi",
 			"SyncEventMessageTags",
 			"SyncEventMessage_Tags",
 			"SyncGuardReasonTags",
@@ -152,6 +170,12 @@ describe("exports", () => {
 			"__napiBindingTarget",
 			"defaultSyncIgnorePatterns",
 			"init",
+			"rcloneAvailableDriveLetters",
+			"rcloneClearCache",
+			"rcloneForceUnmount",
+			"rcloneFuseStatus",
+			"rcloneRecoverStale",
+			"rcloneStopUnder",
 			"setLogLevel"
 		])
 		assert.equal(sdk.__napiBindingTarget, "native")
@@ -341,6 +365,56 @@ describe("exports", () => {
 		assert.equal(typeof JsClient.prototype.openSyncEngine, "function")
 	})
 
+	test("number rclone's flat enums from 0 in declaration order", () => {
+		assert.deepEqual({ ...FuseProvider }, { MacFuse: 0, NfsMount: 1, WinFsp: 2, Fuse3: 3 })
+		assert.deepEqual({ ...ServeProtocol }, { Webdav: 0, S3: 1, Ftp: 2, Sftp: 3, Http: 4, Restic: 5, Nfs: 6 })
+	})
+
+	test("name rclone's data enums' tags as strings", () => {
+		assert.deepEqual({ ...FuseStatus_Tags }, tags(["Ready", "Missing"]))
+		assert.deepEqual({ ...sdk.RcloneExit_Tags }, tags(["Stopped", "Crashed"]))
+		assert.deepEqual({ ...sdk.ServeAuth_Tags }, tags(["Basic", "S3", "Unauthenticated"]))
+		assert.deepEqual(
+			{ ...RcloneRefusal_Tags },
+			tags([
+				"BinaryMissing",
+				"BinaryChecksum",
+				"UnsupportedVersion",
+				"WatchdogUnavailable",
+				"FuseMissing",
+				"MountPointInUse",
+				"MountPointNotEmpty",
+				"MountPointInvalid",
+				"DriveLetterInUse",
+				"PortInUse",
+				"AddressNotLocal",
+				"ImplicitAddress",
+				"AuthRequired",
+				"InvalidCredentials",
+				"UnauthenticatedOffLoopback",
+				"UnsupportedProtocol",
+				"TlsUnsupported",
+				"UploadsPending",
+				"CacheInUse"
+			])
+		)
+	})
+
+	test("the rclone daemon class carries ubrn's methods", () => {
+		assert.deepEqual(Object.getOwnPropertyNames(JsRcloneDaemon.prototype).filter(name => name !== "constructor").sort(), [
+			"exited",
+			"mount",
+			"pid",
+			"serveTypes",
+			"startServe",
+			"stats",
+			"stop",
+			"stopServe",
+			"unmount"
+		])
+		assert.equal(typeof JsClient.prototype.startRcloneDaemon, "function")
+	})
+
 	test("defaultSyncIgnorePatterns lists the OS clutter", () => {
 		const patterns = sdk.defaultSyncIgnorePatterns()
 		assert.ok(Array.isArray(patterns) && patterns.length > 0)
@@ -490,6 +564,187 @@ function watchInWorker(dbPath, rootUuid) {
 		workerData: { addon, dbPath, twoWay: SyncMode.TwoWay, stringified: synthStringified(rootUuid) }
 	})
 }
+
+describe("rclone, offline", () => {
+	let dir
+
+	before(() => {
+		dir = tempDir("filen-sdk-rs-rclone-")
+	})
+
+	after(() => removeDir(dir))
+
+	test("rcloneFuseStatus names this system's mount backend", async () => {
+		const status = await sdk.rcloneFuseStatus()
+		if (process.platform === "darwin") {
+			// macOS always has one: macFUSE when installed, rclone's nfsmount otherwise.
+			assert.equal(status.tag, FuseStatus_Tags.Ready)
+			assert.ok([FuseProvider.MacFuse, FuseProvider.NfsMount].includes(status.inner.provider), `${status.inner.provider}`)
+		} else {
+			assert.ok([FuseStatus_Tags.Ready, FuseStatus_Tags.Missing].includes(status.tag), status.tag)
+		}
+	})
+
+	test("rcloneAvailableDriveLetters lists free letters on Windows only", async () => {
+		const letters = await sdk.rcloneAvailableDriveLetters()
+		if (process.platform === "win32") {
+			assert.ok(letters.every(letter => /^[D-Z]$/.test(letter)), `${letters}`)
+		} else {
+			assert.deepEqual(letters, [])
+		}
+	})
+
+	test("rcloneRecoverStale on a fresh state directory recovers nothing", async () => {
+		assert.deepEqual(await sdk.rcloneRecoverStale(join(dir, "state")), { stopped: false, unmounted: [] })
+	})
+
+	test("rcloneStopUnder a missing directory stops nothing", async () => {
+		assert.equal(await sdk.rcloneStopUnder(join(dir, "missing"), 1000), 0)
+	})
+
+	test("a cache with an upload pending is refused with an rclone refusal", async () => {
+		const meta = join(dir, "cache", "vfsMeta", "Filen")
+		mkdirSync(meta, { recursive: true })
+		writeFileSync(join(meta, "file.txt"), JSON.stringify({ Size: 7, Dirty: true }))
+		await assert.rejects(sdk.rcloneClearCache(join(dir, "state"), join(dir, "cache")), e => {
+			const inner = assertThrownLikeUbrn(e)
+			assert.equal(inner.kind(), ErrorKind.Io)
+			assert.deepEqual(inner.rcloneRefusal(), { tag: RcloneRefusal_Tags.UploadsPending, inner: { count: 1 } })
+			assert.equal(inner.syncRefusal(), undefined)
+			return true
+		})
+	})
+
+	test("a daemon whose binary is missing is refused with BinaryMissing", async () => {
+		const client = synthClient(randomUUID())
+		await assert.rejects(
+			client.startRcloneDaemon({
+				binaryPath: join(dir, "rclone"),
+				binarySha256: undefined,
+				stateDir: join(dir, "state"),
+				cacheDir: join(dir, "cache"),
+				logFile: undefined,
+				userAgent: "filen-sdk-rs-smoke",
+				vfs: { cacheMaxSize: 1n << 30n, cacheMinFreeSpace: 1n << 30n, cacheMaxAgeSecs: 3600n, dirCacheTimeSecs: 15 }
+			}),
+			e => {
+				assert.deepEqual(assertThrownLikeUbrn(e).rcloneRefusal(), { tag: RcloneRefusal_Tags.BinaryMissing })
+				return true
+			}
+		)
+	})
+
+	test("a binary checksum that is not 64 hex digits rejects as a conversion error", async () => {
+		const client = synthClient(randomUUID())
+		await assert.rejects(
+			client.startRcloneDaemon({
+				binaryPath: join(dir, "rclone"),
+				binarySha256: "not-hex",
+				stateDir: join(dir, "state"),
+				cacheDir: join(dir, "cache"),
+				logFile: undefined,
+				userAgent: "filen-sdk-rs-smoke",
+				vfs: { cacheMaxSize: 0n, cacheMinFreeSpace: 0n, cacheMaxAgeSecs: 0n, dirCacheTimeSecs: 0 }
+			}),
+			e => {
+				const inner = assertThrownLikeUbrn(e)
+				assert.equal(inner.kind(), ErrorKind.Conversion)
+				assert.equal(inner.rcloneRefusal(), undefined)
+				return true
+			}
+		)
+	})
+})
+
+// A real rclone (FILEN_TEST_RCLONE, as rclone_daemon_tests take it) under a client whose keys no
+// server knows: starting, reading stats and stopping never reach the account, as rclone's Filen
+// remote logs in only once a mount or serve first reads it.
+const rclone = process.env.FILEN_TEST_RCLONE
+
+const daemonOptions = dir => ({
+	binaryPath: rclone,
+	binarySha256: undefined,
+	stateDir: join(dir, "state"),
+	cacheDir: join(dir, "cache"),
+	logFile: join(dir, "rclone.log"),
+	userAgent: "filen-sdk-rs-smoke",
+	vfs: { cacheMaxSize: 1n << 30n, cacheMinFreeSpace: 1n << 30n, cacheMaxAgeSecs: 3600n, dirCacheTimeSecs: 15 }
+})
+
+/** Whether a process with `pid` runs. */
+function isRunning(pid) {
+	try {
+		process.kill(pid, 0)
+		return true
+	} catch (e) {
+		return e.code === "EPERM"
+	}
+}
+
+describe("rclone daemon, offline", { skip: rclone ? false : "FILEN_TEST_RCLONE is unset" }, () => {
+	let dir
+
+	before(() => {
+		dir = tempDir("filen-sdk-rs-rclone-daemon-")
+	})
+
+	after(() => removeDir(dir))
+
+	test("a daemon starts, refuses a serve without credentials, and stops", async () => {
+		const daemon = await synthClient(randomUUID()).startRcloneDaemon(daemonOptions(join(dir, "stopped")))
+		assert.ok(daemon instanceof JsRcloneDaemon)
+		const pid = daemon.pid()
+		assert.ok(isRunning(pid))
+		const stats = await daemon.stats()
+		assert.deepEqual(
+			[stats.uploadsInProgress, stats.uploadsQueued, stats.transfers, stats.mounts, stats.serves],
+			[0, 0, [], [], []]
+		)
+		assert.ok((await daemon.serveTypes()).includes(ServeProtocol.Webdav))
+		await assert.rejects(
+			daemon.startServe({
+				protocol: ServeProtocol.Webdav,
+				host: "127.0.0.1",
+				port: 1900,
+				auth: { tag: sdk.ServeAuth_Tags.Unauthenticated },
+				tls: undefined,
+				readOnly: false
+			}),
+			e => {
+				assert.deepEqual(assertThrownLikeUbrn(e).rcloneRefusal(), { tag: RcloneRefusal_Tags.AuthRequired })
+				return true
+			}
+		)
+
+		assert.deepEqual(await daemon.stop({ drainTimeoutMs: undefined, graceMs: 10_000 }), { pendingUploads: 0, forced: false })
+		assert.deepEqual(await daemon.exited(), { tag: sdk.RcloneExit_Tags.Stopped })
+		assert.equal(isRunning(pid), false)
+	})
+
+	test("a daemon left running stops with its process", () => {
+		const script = `
+			import { generateKeyPairSync } from "node:crypto"
+			import { join } from "node:path"
+			const { UnauthJsClient } = await import(${JSON.stringify(addon)})
+			${synthStringified.toString()}
+			const rclone = process.env.FILEN_TEST_RCLONE
+			const dir = process.argv.at(-1)
+			const daemonOptions = ${daemonOptions.toString()}
+			const client = UnauthJsClient.fromConfig({}).fromStringified(synthStringified(crypto.randomUUID()))
+			const daemon = await client.startRcloneDaemon(daemonOptions(dir))
+			console.log(daemon.pid())
+		`
+		const run = spawnSync(process.execPath, ["--input-type=module", "-e", script, join(dir, "left")], {
+			encoding: "utf8",
+			timeout: 30_000
+		})
+		assert.equal(run.error, undefined, "the process did not exit within 30 s")
+		assert.equal(run.status, 0, run.stderr)
+		const pid = Number(run.stdout.trim())
+		assert.ok(pid > 0, run.stdout)
+		assert.equal(isRunning(pid), false)
+	})
+})
 
 describe("sync engine, offline", () => {
 	const listener = { onEvents() {}, onWatchStatus() {} }

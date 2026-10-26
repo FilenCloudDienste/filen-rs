@@ -101,8 +101,8 @@ fi
 # Node-API clippy for filen-sdk-rs (the desktop addon's build surface, which no other pass
 # enables). Same command as ci-linux's napi pass.
 if have cargo; then
-	run "cargo clippy -p filen-sdk-rs -F napi,cache,sync-engine -- -D warnings" \
-		cargo clippy -p filen-sdk-rs -F napi,cache,sync-engine --all-targets -- -D warnings
+	run "cargo clippy -p filen-sdk-rs -F napi,cache,sync-engine,rclone -- -D warnings" \
+		cargo clippy -p filen-sdk-rs -F napi,cache,sync-engine,rclone --all-targets -- -D warnings
 fi
 
 # WASM clippy: the two configurations wasm-pack.sh ships (the service-worker one

@@ -28,6 +28,7 @@ use std::{
 };
 
 use base64::{Engine as _, prelude::BASE64_STANDARD};
+use filen_macros::js_type;
 use filen_types::auth::FilenSDKConfig;
 use num_traits::ToPrimitive as _;
 use port_check::{free_local_ipv4_port, is_local_ipv4_port_free};
@@ -135,7 +136,7 @@ pub struct RcloneDaemonConfig {
 }
 
 /// How an [`RcloneDaemon`]'s rclone ended.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[js_type(export, no_deser, tagged, napi)]
 pub enum RcloneExit {
 	/// It was stopped ([`RcloneDaemon::stop`]) or the daemon was dropped.
 	Stopped,
@@ -148,7 +149,7 @@ pub enum RcloneExit {
 }
 
 /// What the daemon's VFS caches and transfers are doing, summed over every remote in use.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[js_type(export, no_deser, napi)]
 pub struct RcloneStats {
 	/// Files being uploaded from the cache now.
 	pub uploads_in_progress: u32,
@@ -169,7 +170,7 @@ pub struct RcloneStats {
 }
 
 /// One running transfer.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[js_type(export, no_deser, napi)]
 pub struct RcloneTransfer {
 	/// The file's path in its remote.
 	pub name: String,
@@ -183,6 +184,7 @@ pub struct RcloneTransfer {
 
 /// How [`RcloneDaemon::stop`] stops rclone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[js_type(import, no_ser, no_default, napi)]
 pub struct StopOptions {
 	/// With `Some`, how long, in milliseconds, uploads waiting in the VFS cache may finish before
 	/// rclone is asked to quit. Whatever is still waiting then stays in the cache and is uploaded
@@ -194,6 +196,7 @@ pub struct StopOptions {
 
 /// What [`RcloneDaemon::stop`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[js_type(export, no_deser, no_default, napi)]
 pub struct StopReport {
 	/// Uploads still waiting in the VFS cache when rclone was asked to quit (in progress and
 	/// queued), 0 when they could not be read.
@@ -466,7 +469,8 @@ impl RcloneDaemon {
 		}
 	}
 
-	fn has_exited(&self) -> bool {
+	/// Whether rclone has exited.
+	pub(crate) fn has_exited(&self) -> bool {
 		self.exit.borrow().is_some()
 	}
 

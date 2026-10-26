@@ -113,6 +113,24 @@ impl IntoWire for crate::sync_engine::JsSyncWatch {
 	}
 }
 
+#[cfg(feature = "rclone")]
+#[napi(js_name = "JsRcloneDaemon")]
+pub(crate) struct JsRcloneDaemon(pub(crate) crate::rclone::JsRcloneDaemon);
+
+#[cfg(feature = "rclone")]
+#[deny(unsafe_code)]
+impl Wire for crate::rclone::JsRcloneDaemon {
+	type Wire = JsRcloneDaemon;
+}
+
+#[cfg(feature = "rclone")]
+#[deny(unsafe_code)]
+impl IntoWire for crate::rclone::JsRcloneDaemon {
+	fn into_wire(self) -> JsRcloneDaemon {
+		JsRcloneDaemon(self)
+	}
+}
+
 /// Installs the SDK's tracing subscriber (stdout on desktop) unless the host already installed
 /// one. Idempotent.
 #[napi(js_name = "init", ts_args_type = "", ts_return_type = "void")]

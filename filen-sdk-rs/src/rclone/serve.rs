@@ -17,6 +17,7 @@ use std::{
 	time::Duration,
 };
 
+use filen_macros::js_type;
 use serde_json::{Map, Value};
 use tokio::{
 	io::{AsyncBufRead, AsyncBufReadExt as _, AsyncWriteExt as _, BufReader},
@@ -45,6 +46,7 @@ const MIN_TLS_VERSION: &str = "tls1.2";
 
 /// A protocol rclone serves the drive over.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[js_type(import, export, no_default, napi)]
 pub enum ServeProtocol {
 	Webdav,
 	S3,
@@ -103,6 +105,7 @@ impl ServeProtocol {
 
 /// The credentials a serve takes.
 #[derive(Clone, PartialEq, Eq)]
+#[js_type(import, no_ser, no_default, napi)]
 pub enum ServeAuth {
 	/// A user name and password, for webdav, ftp, sftp, http and restic.
 	Basic { user: String, password: String },
@@ -132,7 +135,7 @@ impl fmt::Debug for ServeAuth {
 }
 
 /// The certificate an https serve presents.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[js_type(import, no_ser, napi)]
 pub struct ServeTls {
 	/// A PEM file with the certificate, followed by its chain.
 	pub cert_path: String,
@@ -141,7 +144,7 @@ pub struct ServeTls {
 }
 
 /// What to serve.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[js_type(import, no_ser, napi)]
 pub struct ServeOptions {
 	pub protocol: ServeProtocol,
 	/// The IP address to listen on, or `localhost`. `0.0.0.0` or `::` listens on every interface.
@@ -157,7 +160,7 @@ pub struct ServeOptions {
 }
 
 /// A serve that is up.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[js_type(export, no_deser, napi)]
 pub struct ServeInfo {
 	/// The id [`RcloneDaemon::stop_serve`] takes.
 	pub id: String,

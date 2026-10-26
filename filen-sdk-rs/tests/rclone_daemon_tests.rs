@@ -53,6 +53,7 @@ struct Dirs {
 	root: TempDir,
 	/// Forced off before the directories are removed, so a failed test leaves no mount behind
 	/// (removing a stale mount's directory blocks).
+	#[cfg(unix)]
 	mount_points: std::sync::Mutex<Vec<String>>,
 }
 
@@ -62,6 +63,7 @@ impl Dirs {
 		std::fs::create_dir(root.path().join("remote")).unwrap();
 		Self {
 			root,
+			#[cfg(unix)]
 			mount_points: std::sync::Mutex::default(),
 		}
 	}
@@ -71,6 +73,7 @@ impl Dirs {
 	}
 
 	/// An empty mount point, by its resolved path, which is what the system lists mounts by.
+	#[cfg(unix)]
 	fn mount_point(&self, name: &str) -> String {
 		let path = self.root.path().join(name);
 		std::fs::create_dir(&path).unwrap();
@@ -105,6 +108,7 @@ impl Dirs {
 	}
 }
 
+#[cfg(unix)]
 impl Drop for Dirs {
 	fn drop(&mut self) {
 		for mount_point in self.mount_points.lock().unwrap().iter() {
@@ -295,7 +299,7 @@ async fn stop_rclone_under_ignores_other_binaries() {
 	let rclone = binary().resolve().await.unwrap();
 	let old_bin = dirs.root.path().join("old-client").join("bin");
 	std::fs::create_dir_all(&old_bin).unwrap();
-	let old_rclone = old_bin.join("rclone");
+	let old_rclone = old_bin.join(format!("rclone{}", std::env::consts::EXE_SUFFIX));
 	std::fs::copy(&rclone, &old_rclone).unwrap();
 	let mut old = idle_rcd(&old_rclone);
 	let mut other = idle_rcd(&rclone);
@@ -375,6 +379,7 @@ async fn eventually_holds(path: &Path, content: &str, timeout: Duration) -> bool
 	false
 }
 
+#[cfg(unix)]
 fn kill_9(pid: u32) {
 	let killed = std::process::Command::new("kill")
 		.args(["-9", &pid.to_string()])
@@ -383,6 +388,8 @@ fn kill_9(pid: u32) {
 	assert!(killed.success());
 }
 
+// Unix: the mount point is a directory, where Windows mounts on a drive letter.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_mount_writes_through_to_the_remote_and_unmounts() {
 	let dirs = Dirs::new();
@@ -422,6 +429,8 @@ async fn a_mount_writes_through_to_the_remote_and_unmounts() {
 	daemon.stop(GRACEFUL).await.unwrap();
 }
 
+// Unix: the mount point is a directory, where Windows mounts on a drive letter.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_mount_point_in_use_is_refused() {
 	let dirs = Dirs::new();
@@ -438,6 +447,8 @@ async fn a_mount_point_in_use_is_refused() {
 	daemon.stop(GRACEFUL).await.unwrap();
 }
 
+// Unix: the mount point is a directory, where Windows mounts on a drive letter.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn stop_drains_pending_uploads_within_the_timeout() {
 	let dirs = Dirs::new();
@@ -529,6 +540,8 @@ async fn a_stale_mount_is_force_unmounted_before_mounting() {
 	daemon.stop(GRACEFUL).await.unwrap();
 }
 
+// Unix: the mount point is a directory, where Windows mounts on a drive letter.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_mount_and_a_serve_share_one_vfs() {
 	let dirs = Dirs::new();
@@ -552,6 +565,37 @@ async fn a_mount_and_a_serve_share_one_vfs() {
 		.unwrap();
 	assert_eq!(vfses["vfses"].as_array().unwrap().len(), 1, "{vfses}");
 	assert_eq!(stats["inUse"], json!(2), "{stats}");
+	daemon.stop(GRACEFUL).await.unwrap();
+}
+
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_drive_letter_mount_writes_through_to_the_remote_and_unmounts() {
+	let dirs = Dirs::new();
+	let daemon = dirs.start().await;
+	let letter = filen_sdk_rs::rclone::available_drive_letters()
+		.await
+		.pop()
+		.expect("no free drive letter");
+	let drive = format!("{letter}:");
+
+	let info = daemon.mount(read_write(&letter)).await.unwrap();
+
+	assert_eq!(info.mount_point, drive);
+	tokio::fs::write(format!(r"{drive}\file.txt"), "content")
+		.await
+		.unwrap();
+	// Uploaded once the VFS cache's write-back delay (5 s) has passed.
+	assert!(
+		eventually_holds(
+			&dirs.remote().join("file.txt"),
+			"content",
+			Duration::from_secs(20)
+		)
+		.await
+	);
+	daemon.unmount(&drive).await.unwrap();
+	assert!(!Path::new(&format!(r"{drive}\")).exists());
 	daemon.stop(GRACEFUL).await.unwrap();
 }
 

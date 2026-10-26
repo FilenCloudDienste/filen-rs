@@ -73,7 +73,11 @@ jobs:
         run: cargo clippy -p filen-sdk-rs -F sync-engine-live-tests,malformed --all-targets -- -D warnings
       # The desktop Node-API addon's feature set; no other pass enables `napi`.
       - name: Run clippy napi
-        run: cargo clippy -p filen-sdk-rs -F napi,cache,sync-engine --all-targets -- -D warnings
+        run: cargo clippy -p filen-sdk-rs -F napi,cache,sync-engine,rclone --all-targets -- -D warnings
+      # rclone's UniFFI exports, which ci-napi's parity check generates its reference from, and
+      # the hermetic rclone_daemon_tests (`test-seams`).
+      - name: Run clippy rclone with uniffi
+        run: cargo clippy -p filen-sdk-rs -F uniffi,http-provider,cache,sync-engine,rclone,test-seams --all-targets -- -D warnings
       - name: Run rustfmt
         run: cargo fmt --all -- --check
       - name: Install TOML linter
@@ -365,6 +369,10 @@ jobs:
       - name: Build the napi addon
         run: npm run build:napi
         working-directory: ./filen-sdk-rs/web
+      # The smoke test starts a real rclone daemon and checks it stops with the process.
+      - name: Fetch rclone
+        shell: bash
+        run: echo "FILEN_TEST_RCLONE=$(scripts/fetch-rclone.sh "$RUNNER_TEMP/rclone")" >> "$GITHUB_ENV"
       - name: Smoke-test the napi addon
         run: npm run test:napi
         working-directory: ./filen-sdk-rs/web
@@ -374,3 +382,49 @@ jobs:
         if: runner.os == 'Linux'
         run: npm run check:napi-parity
         working-directory: ./filen-sdk-rs/web
+  ci-rclone:
+    # The rclone daemon against a real rclone, the managed installation's pinned release (fetched
+    # and checked against its checksum by the tests themselves), whose remotes alias a local
+    # directory: no account, no Filen server. Linux mounts with FUSE 3, Windows with WinFsp.
+    # Package-scoped, so no heif-decoder tooling.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    name: CI on rclone (${{ matrix.os }})
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-02-20
+      - uses: Swatinem/rust-cache@a84bfdc502f07db5a85dd9d7a30f91a931516cc5
+        with:
+          shared-key: cargo-build-ci-rclone-${{ matrix.os }}
+          prefix-key: ''
+          add-rust-environment-hash-key: 'false'
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Install Wild linker
+        # .cargo/config.toml links every native linux-gnu target through Wild; see ci-linux.
+        if: runner.os == 'Linux'
+        uses: taiki-e/cache-cargo-install-action@v2
+        with:
+          tool: wild-linker@0.9.0
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: cc
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -Zhigher-ranked-assumptions
+      - name: Install FUSE 3
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fuse3
+          # See test.yml: a stray non-setuid /usr/local/bin/fusermount3 on some images shadows the
+          # real helper and breaks unprivileged mounts (actions/runner-images#14516).
+          if [ -e /usr/local/bin/fusermount3 ]; then
+            sudo rm /usr/local/bin/fusermount3
+          fi
+      - name: Install WinFsp
+        if: runner.os == 'Windows'
+        run: choco install winfsp -y
+      - name: Run the rclone daemon's tests
+        run: cargo test -p filen-sdk-rs -F rclone-managed,test-seams --test rclone_daemon_tests --no-fail-fast

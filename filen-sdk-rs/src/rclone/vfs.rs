@@ -4,11 +4,13 @@
 
 use std::time::Duration;
 
+use filen_macros::js_type;
 use serde_json::{Map, Value, json};
 
 /// The VFS cache's limits, which a user may tune. Every other VFS option is fixed. The defaults
 /// are the old desktop client's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[js_type(import, export, no_default, napi)]
 pub struct VfsTuning {
 	/// The most the VFS cache keeps on disk, in bytes; files not in use are evicted beyond it.
 	pub cache_max_size: u64,

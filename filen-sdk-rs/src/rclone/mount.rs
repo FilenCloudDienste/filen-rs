@@ -8,6 +8,7 @@
 use std::path::Path;
 use std::time::Duration;
 
+use filen_macros::js_type;
 use serde_json::{Value, json};
 use tokio::time::Instant;
 use tracing::warn;
@@ -31,7 +32,7 @@ const UNMOUNTED_TIMEOUT: Duration = Duration::from_secs(5);
 const MOUNT_POLL: Duration = Duration::from_millis(100);
 
 /// What to mount.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[js_type(import, no_ser, napi)]
 pub struct MountOptions {
 	/// On Unix an existing empty directory, by an absolute path that is not a symlink. On Windows
 	/// a free drive letter: `X`, `X:` or `X:\`.
@@ -41,7 +42,7 @@ pub struct MountOptions {
 }
 
 /// A mount that is up.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[js_type(export, no_deser, napi)]
 pub struct MountInfo {
 	/// Where it is mounted: the directory, or on Windows the drive, as `X:`.
 	pub mount_point: String,

@@ -1,3 +1,5 @@
+use filen_macros::js_type;
+
 use crate::{Error, ErrorKind, rclone::binary::MIN_RCLONE};
 
 /// What the rclone module refuses with that a caller can tell apart without reading the message.
@@ -5,7 +7,8 @@ use crate::{Error, ErrorKind, rclone::binary::MIN_RCLONE};
 /// Carried as the source of the returned [`Error`], of the kind [`RcloneRefusal::kind`] names,
 /// so a caller recovers it with [`Error::downcast_ref`]. The error's context says which path,
 /// address or item it was about.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[derive(thiserror::Error)]
+#[js_type(export, no_deser, tagged, napi)]
 pub enum RcloneRefusal {
 	/// The rclone binary is not where it was expected, or is not a file.
 	#[error("the rclone binary is missing")]
@@ -71,6 +74,12 @@ pub enum RcloneRefusal {
 	/// The protocol does not serve over TLS: only webdav, s3, http and restic do.
 	#[error("the protocol does not serve over TLS")]
 	TlsUnsupported,
+	/// The cache holds `count` files that are not uploaded yet, so it is kept.
+	#[error("{count} files in the cache are not uploaded yet")]
+	UploadsPending { count: u32 },
+	/// A daemon runs on the cache.
+	#[error("an rclone daemon uses the cache")]
+	CacheInUse,
 }
 
 impl RcloneRefusal {
@@ -89,7 +98,9 @@ impl RcloneRefusal {
 			| Self::DriveLetterInUse
 			| Self::PortInUse { .. }
 			| Self::AddressNotLocal
-			| Self::UnsupportedProtocol => ErrorKind::IO,
+			| Self::UnsupportedProtocol
+			| Self::UploadsPending { .. }
+			| Self::CacheInUse => ErrorKind::IO,
 			Self::ImplicitAddress
 			| Self::AuthRequired
 			| Self::InvalidCredentials

@@ -47,5 +47,13 @@
 	"UnsyncableReason_InvalidName_Inner": "napi cannot inline a data-enum variant's payload, so it names it; ubrn inlines it in the variant",
 	"UnsyncableReason_LocalAlias_Inner": "napi cannot inline a data-enum variant's payload, so it names it; ubrn inlines it in the variant",
 	"UnsyncableReason_RemoteInvalidName_Inner": "napi cannot inline a data-enum variant's payload, so it names it; ubrn inlines it in the variant",
-	"UnsyncableReason_RepeatedFailure_Inner": "napi cannot inline a data-enum variant's payload, so it names it; ubrn inlines it in the variant"
+	"UnsyncableReason_RepeatedFailure_Inner": "napi cannot inline a data-enum variant's payload, so it names it; ubrn inlines it in the variant",
+	"FuseStatus_Missing_Inner": "napi cannot inline a data-enum variant's payload, so it names it; ubrn inlines it in the variant",
+	"FuseStatus_Ready_Inner": "napi cannot inline a data-enum variant's payload, so it names it; ubrn inlines it in the variant",
+	"RcloneExit_Crashed_Inner": "napi cannot inline a data-enum variant's payload, so it names it; ubrn inlines it in the variant",
+	"RcloneRefusal_PortInUse_Inner": "napi cannot inline a data-enum variant's payload, so it names it; ubrn inlines it in the variant",
+	"RcloneRefusal_UnsupportedVersion_Inner": "napi cannot inline a data-enum variant's payload, so it names it; ubrn inlines it in the variant",
+	"RcloneRefusal_UploadsPending_Inner": "napi cannot inline a data-enum variant's payload, so it names it; ubrn inlines it in the variant",
+	"ServeAuth_Basic_Inner": "napi cannot inline a data-enum variant's payload, so it names it; ubrn inlines it in the variant",
+	"ServeAuth_S3_Inner": "napi cannot inline a data-enum variant's payload, so it names it; ubrn inlines it in the variant"
 }

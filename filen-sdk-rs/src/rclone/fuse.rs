@@ -18,11 +18,14 @@
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
 use std::path::Path;
 
+use filen_macros::js_type;
+
 #[cfg(windows)]
 use crate::rclone::system::system_command;
 
 /// A mount backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[js_type(export, no_deser, no_default, napi)]
 pub enum FuseProvider {
 	/// macFUSE, on macOS.
 	MacFuse,
@@ -46,7 +49,7 @@ impl FuseProvider {
 }
 
 /// Whether mounts can be made, and with what.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[js_type(export, no_deser, tagged, napi)]
 pub enum FuseStatus {
 	/// Mounts use `provider`, at `version` where the system says.
 	Ready {

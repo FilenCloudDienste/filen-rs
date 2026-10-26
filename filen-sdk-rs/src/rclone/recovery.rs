@@ -10,23 +10,28 @@ use std::{
 	time::Duration,
 };
 
+use filen_macros::js_type;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use crate::{
-	Error,
+	Error, ErrorKind,
 	error::ResultExt as _,
 	rclone::{
+		RcloneRefusal,
 		private_file::write_private_file,
 		system::{ProcessIdentity, identify, processes_under, stop_processes},
 	},
 };
 
 #[cfg(unix)]
-use crate::{ErrorKind, rclone::system::system_command};
+use crate::rclone::system::system_command;
 
 /// The pidfile in a daemon's state directory.
 pub(crate) const PIDFILE: &str = "rcd.json";
+/// The VFS cache's file contents and metadata in a daemon's cache directory.
+const VFS_DIR: &str = "vfs";
+const VFS_META_DIR: &str = "vfsMeta";
 /// rc's credentials file in a daemon's state directory.
 pub(crate) const HTPASSWD_FILE: &str = "rc.htpasswd";
 /// How long a stale rclone has to quit before it is killed.
@@ -92,7 +97,7 @@ impl PidRecord {
 }
 
 /// What [`recover_stale`] did.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[js_type(export, no_deser, napi)]
 pub struct StaleRecovery {
 	/// Whether the rclone a crashed host left running was stopped.
 	pub stopped: bool,
@@ -164,6 +169,87 @@ pub async fn stop_rclone_under(dir: &Path, grace_ms: u32) -> Result<u32, Error> 
 		return Ok(0);
 	}
 	stop_processes(&processes, Duration::from_millis(grace_ms.into())).await
+}
+
+/// Deletes the VFS caches in a daemon's `cache_dir` (its `vfs` and `vfsMeta` directories), keeping
+/// the rest, such as the sftp serve's host keys.
+///
+/// Refused with [`RcloneRefusal::CacheInUse`] while the rclone `state_dir`'s pidfile names still
+/// runs, and with [`RcloneRefusal::UploadsPending`] while the cache holds files not uploaded yet
+/// (rclone marks them dirty in their metadata), which the next daemon on it uploads.
+pub async fn clear_cache(state_dir: &Path, cache_dir: &Path) -> Result<(), Error> {
+	if let Some(record) = PidRecord::read(state_dir)?
+		&& let Some(process) = identify(record.pid).await?
+		&& is_recorded_rclone(&process, &record)
+	{
+		return Err(RcloneRefusal::CacheInUse.into());
+	}
+	let cache_dir = cache_dir.to_path_buf();
+	tokio::task::spawn_blocking(move || {
+		let pending = dirty_files(&cache_dir.join(VFS_META_DIR))?;
+		if pending > 0 {
+			return Err(RcloneRefusal::UploadsPending { count: pending }.into());
+		}
+		for dir in [VFS_DIR, VFS_META_DIR] {
+			let dir = cache_dir.join(dir);
+			match std::fs::remove_dir_all(&dir) {
+				Ok(()) => {}
+				Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+				Err(e) => {
+					return Err(
+						Error::from(e).with_context(format!("failed to delete {}", dir.display()))
+					);
+				}
+			}
+		}
+		Ok(())
+	})
+	.await
+	.map_err(|e| {
+		Error::custom_with_source(
+			ErrorKind::Internal,
+			e,
+			Some("the cache clearing task failed"),
+		)
+	})?
+}
+
+/// How many files the VFS cache metadata under `meta_dir` marks dirty: written, and not uploaded
+/// yet. A metadata file that cannot be read as rclone's counts as dirty, so the cache is kept.
+fn dirty_files(meta_dir: &Path) -> Result<u32, Error> {
+	#[derive(Deserialize)]
+	struct ItemMeta {
+		#[serde(rename = "Dirty", default)]
+		dirty: bool,
+	}
+
+	let mut dirty = 0_u32;
+	for entry in walkdir::WalkDir::new(meta_dir) {
+		let entry = match entry {
+			Ok(entry) => entry,
+			Err(e) if e.io_error().map(io::Error::kind) == Some(io::ErrorKind::NotFound) => {
+				continue;
+			}
+			Err(e) => {
+				return Err(Error::custom_with_source(
+					ErrorKind::IO,
+					e,
+					Some(format!("failed to list {}", meta_dir.display())),
+				));
+			}
+		};
+		if !entry.file_type().is_file() {
+			continue;
+		}
+		let is_dirty = std::fs::read(entry.path())
+			.ok()
+			.and_then(|json| serde_json::from_slice::<ItemMeta>(&json).ok())
+			.is_none_or(|meta| meta.dirty);
+		if is_dirty {
+			dirty = dirty.saturating_add(1);
+		}
+	}
+	Ok(dirty)
 }
 
 /// Whether something is mounted at a path, as far as `stat` can tell.
@@ -292,7 +378,102 @@ fn remove_if_present(path: &Path) -> Result<(), Error> {
 mod tests {
 	use std::path::Path;
 
-	use super::{HTPASSWD_FILE, PIDFILE, PidRecord, StaleRecovery, recover_stale};
+	use super::{HTPASSWD_FILE, PIDFILE, PidRecord, StaleRecovery, clear_cache, recover_stale};
+	use crate::rclone::{RcloneRefusal, system::identify};
+
+	/// A cache directory with one VFS item whose metadata is marked `dirty`, and the sftp serve's
+	/// host key.
+	fn cache_with_item(dirty: bool) -> tempfile::TempDir {
+		let cache = tempfile::tempdir().unwrap();
+		let data = cache.path().join("vfs/Filen/dir");
+		let meta = cache.path().join("vfsMeta/Filen/dir");
+		std::fs::create_dir_all(&data).unwrap();
+		std::fs::create_dir_all(&meta).unwrap();
+		std::fs::create_dir_all(cache.path().join("serve-sftp")).unwrap();
+		std::fs::write(cache.path().join("serve-sftp/id_ed25519"), "key").unwrap();
+		std::fs::write(data.join("file.txt"), "content").unwrap();
+		std::fs::write(
+			meta.join("file.txt"),
+			format!(
+				r#"{{"ModTime":"2026-10-26T22:03:15.21951+01:00","Size":7,"Rs":[{{"Pos":0,"Size":7}}],"Fingerprint":"","Dirty":{dirty}}}"#
+			),
+		)
+		.unwrap();
+		cache
+	}
+
+	#[tokio::test]
+	async fn clear_cache_deletes_the_vfs_caches_only() {
+		let state = tempfile::tempdir().unwrap();
+		let cache = cache_with_item(false);
+
+		clear_cache(state.path(), cache.path()).await.unwrap();
+
+		assert!(!cache.path().join("vfs").exists());
+		assert!(!cache.path().join("vfsMeta").exists());
+		assert!(cache.path().join("serve-sftp/id_ed25519").exists());
+	}
+
+	#[tokio::test]
+	async fn clear_cache_keeps_a_cache_with_pending_uploads() {
+		let state = tempfile::tempdir().unwrap();
+		let cache = cache_with_item(true);
+
+		let error = clear_cache(state.path(), cache.path()).await.unwrap_err();
+
+		assert_eq!(
+			error.downcast_ref::<RcloneRefusal>(),
+			Some(&RcloneRefusal::UploadsPending { count: 1 })
+		);
+		assert!(cache.path().join("vfs/Filen/dir/file.txt").exists());
+	}
+
+	#[tokio::test]
+	async fn clear_cache_counts_unreadable_metadata_as_pending() {
+		let state = tempfile::tempdir().unwrap();
+		let cache = cache_with_item(false);
+		std::fs::write(cache.path().join("vfsMeta/Filen/dir/broken.txt"), "{").unwrap();
+
+		let error = clear_cache(state.path(), cache.path()).await.unwrap_err();
+
+		assert_eq!(
+			error.downcast_ref::<RcloneRefusal>(),
+			Some(&RcloneRefusal::UploadsPending { count: 1 })
+		);
+	}
+
+	#[tokio::test]
+	async fn clear_cache_of_a_missing_cache_does_nothing() {
+		let state = tempfile::tempdir().unwrap();
+
+		clear_cache(state.path(), &state.path().join("missing"))
+			.await
+			.unwrap();
+	}
+
+	#[tokio::test]
+	async fn clear_cache_refuses_a_cache_a_running_daemon_uses() {
+		let state = tempfile::tempdir().unwrap();
+		let cache = cache_with_item(false);
+		// This test process stands in for the rclone the pidfile names.
+		let running = identify(std::process::id()).await.unwrap().unwrap();
+		PidRecord {
+			pid: running.pid,
+			started_at: running.started_at,
+			binary: running.exe.unwrap(),
+			mounts: Vec::new(),
+		}
+		.write(&state.path().join(PIDFILE))
+		.unwrap();
+
+		let error = clear_cache(state.path(), cache.path()).await.unwrap_err();
+
+		assert_eq!(
+			error.downcast_ref::<RcloneRefusal>(),
+			Some(&RcloneRefusal::CacheInUse)
+		);
+		assert!(cache.path().join("vfs").exists());
+	}
 
 	#[test]
 	fn a_pid_record_reads_back_as_written() {

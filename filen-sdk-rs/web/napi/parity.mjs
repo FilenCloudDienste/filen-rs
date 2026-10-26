@@ -5,7 +5,7 @@
 //   node napi/parity.mjs [--reference <dir>] [--napi <d.ts>] [--allowlist <json>] [--keep]
 //
 // The reference is generated from this tree: the host cdylib built with the mobile binding's
-// features (`uniffi,http-provider,cache,sync-engine`), then
+// features (`uniffi,http-provider,cache,sync-engine,rclone`), then
 // `ubrn generate jsi bindings --library`.
 // `--reference <dir>` takes a directory of ubrn-generated .ts instead.
 //
@@ -48,7 +48,7 @@ function run(command, commandArgs, options = {}) {
 /** Builds the uniffi cdylib of this tree and generates ubrn's TS from it into `dir`. */
 function generateReference(dir) {
 	const manifest = join(sdkDir, "Cargo.toml")
-	run("cargo", ["build", "--manifest-path", manifest, "--lib", "--features", "uniffi,http-provider,cache,sync-engine"])
+	run("cargo", ["build", "--manifest-path", manifest, "--lib", "--features", "uniffi,http-provider,cache,sync-engine,rclone"])
 	const metadata = run("cargo", ["metadata", "--manifest-path", manifest, "--format-version", "1", "--no-deps"], {
 		stdio: ["ignore", "pipe", "inherit"],
 		encoding: "utf8",

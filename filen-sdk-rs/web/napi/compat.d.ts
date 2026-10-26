@@ -33,6 +33,12 @@
  * every engine it opened that is still open, waiting up to 5 s for them; one still closing after
  * that keeps its baseline until it has. Closing an engine explicitly is still how to wait for it.
  *
+ * An rclone daemon (startRcloneDaemon) belongs to the Node environment that started it in the
+ * same way: its teardown stops every daemon it started that still runs (serves stopped, drives
+ * unmounted, rclone asked to quit and killed after 3 s), waiting up to 5 s, and rclone's watchdog
+ * stops one that outlasts that. A JsRcloneDaemon that is garbage-collected kills its rclone; stop
+ * is how to stop it gracefully.
+ *
  * This header declares what napi cannot generate from Rust. */
 /* eslint-disable */
 
@@ -47,6 +53,7 @@ export type FilenSdkErrorInterface = FilenSdkError
 export type JsSyncEngineInterface = JsSyncEngine
 export type JsSyncPlanInterface = JsSyncPlan
 export type JsSyncWatchInterface = JsSyncWatch
+export type JsRcloneDaemonInterface = JsRcloneDaemon
 
 /**
  * Receives every status-message batch the cache worker emits (see [`CacheStatusMessage`]).

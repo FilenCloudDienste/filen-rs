@@ -103,14 +103,20 @@ cargo build --features heif-decoder
 # offline under node; check:napi-parity compares its typings with what ubrn generates
 # from this tree (it builds the uniffi cdylib and the ubrn CLI first; --reference <dir>
 # takes generated ubrn TS instead) and fails on a difference not in
-# napi/parity-allowlist.json, or on an allowlist entry that no longer fails
+# napi/parity-allowlist.json, or on an allowlist entry that no longer fails. The smoke test
+# also runs a real rclone daemon when FILEN_TEST_RCLONE names an rclone binary
+# (scripts/fetch-rclone.sh <dir> downloads the managed release and prints its path)
 npm --prefix filen-sdk-rs/web run build:napi
 npm --prefix filen-sdk-rs/web run test:napi
 npm --prefix filen-sdk-rs/web run check:napi-parity
 # Live: the addon drives a real sync on a fresh remote directory, which test-utils'
-# remote-test-dir lends it (cargo run, package-scoped). TEST_EMAIL / TEST_PASSWORD from the
-# environment or the nearest .env up from the package; skipped without them
+# remote-test-dir lends it (cargo run, package-scoped), and with FILEN_TEST_RCLONE serves the
+# account over webdav. TEST_EMAIL / TEST_PASSWORD from the environment or the nearest .env up
+# from the package; skipped without them
 npm --prefix filen-sdk-rs/web run test:napi:live
+# The rclone daemon against a real rclone whose remotes alias a local directory (no account):
+# FILEN_TEST_RCLONE, or -F rclone-managed,test-seams for the managed download
+FILEN_TEST_RCLONE=/path/to/rclone cargo test -p filen-sdk-rs -F rclone,test-seams --test rclone_daemon_tests
 ```
 
 Integration tests require environment variables (can be in `.env`):
@@ -154,7 +160,7 @@ Test notes:
 |---------|-----------------|
 | `cache` | SQLite metadata cache (`src/cache/`, `rusqlite`); gates the `cache_tests` / `cache_search_tests` test targets |
 | `uniffi` | UniFFI scaffolding for the mobile bindings |
-| `napi` | Node-API addon (napi-rs) for the desktop app, its TypeScript matching what ubrn generates for the same items (`src/js/napi/`; items opt in with `#[js_type(.., napi)]` / `#[napi_export]`). Adds the crate's `build.rs` (`napi_build::setup()`'s link args). Scope: login, cache configuration and, with `sync-engine`, the sync engine (`sync_engine/js_impl/napi_impl.rs`; its listener is one weak threadsafe function the delivery thread calls in Blocking mode, and an engine belongs to the Node environment that opened it, whose cleanup hook closes it). One Node environment per process, the Electron main process (or a `utilityProcess`); the commander runtime serves it as it serves uniffi. Desktop targets with Windows on msvc only (napi-build panics on windows-gnu). Native only, and never with `uniffi`: both combinations are a `compile_error!` in `lib.rs` |
+| `napi` | Node-API addon (napi-rs) for the desktop app, its TypeScript matching what ubrn generates for the same items (`src/js/napi/`; items opt in with `#[js_type(.., napi)]` / `#[napi_export]`). Adds the crate's `build.rs` (`napi_build::setup()`'s link args). Scope: login, cache configuration and, with `sync-engine`, the sync engine (`sync_engine/js_impl/napi_impl.rs`; its listener is one weak threadsafe function the delivery thread calls in Blocking mode, and an engine belongs to the Node environment that opened it, whose cleanup hook closes it) and, with `rclone`, the rclone daemon (`rclone/js_impl/napi_impl.rs`; a daemon belongs to the Node environment that started it, whose cleanup hook stops it). One Node environment per process, the Electron main process (or a `utilityProcess`); the commander runtime serves it as it serves uniffi. Desktop targets with Windows on msvc only (napi-build panics on windows-gnu). Native only, and never with `uniffi`: both combinations are a `compile_error!` in `lib.rs` |
 | `http-provider` | Local `axum` server handing out `http://127.0.0.1` URLs for remote files (range requests), so platform media players can stream them |
 | `wasm-full` | Browser WASM build (with threads) |
 | `service-worker` | WASM service-worker build |
@@ -162,7 +168,7 @@ Test notes:
 | `archive` | Compress / extract (`fs::archive`) and its codec crates; `wasm-full` turns it on, and on wasm it refuses to build without `wasm-full` |
 | `malformed` | Test-only seams that put malformed state on the server on purpose (`create_malformed_dir` / `create_malformed_file` write arbitrary metadata, `create_dir_with_name_hash` bypasses the case-insensitive name dedup) — never enable in production |
 | `sync-engine` | Local folder <-> remote folder sync engine (`src/sync_engine/`); implies `cache`, adds the `notify` watcher; native only. Gates, with `uniffi`, the binding's `sync_engine_js_tests` |
-| `rclone` | rclone as a child process (`src/rclone/`) from a binary the app ships (`RcloneBinary::Bundled`, checked against an optional SHA-256): `RcloneDaemon` runs one `rclone rcd` and drives it over its rc API, with no secret in its argv, environment or files; native only. With `test-seams`, gates `rclone_daemon_tests`, which run a real rclone (`FILEN_TEST_RCLONE`, or the managed download with `rclone-managed`) against a local directory, no account needed |
+| `rclone` | rclone as a child process (`src/rclone/`) from a binary the app ships (`RcloneBinary::Bundled`, checked against an optional SHA-256): `RcloneDaemon` runs one `rclone rcd` and drives it over its rc API, with no secret in its argv, environment or files; native only. With `napi` or `uniffi`, its binding (`JsClient.startRcloneDaemon`, `JsRcloneDaemon`, the `rclone*` functions, `FilenSdkError.rcloneRefusal`). With `test-seams`, gates `rclone_daemon_tests`, which run a real rclone (`FILEN_TEST_RCLONE`, or the managed download with `rclone-managed`) against a local directory, no account needed |
 | `rclone-managed` | `rclone` plus the managed installation: downloads a pinned rclone release (`RcloneBinary::Managed`), writes the account's `rclone.conf` and runs `rclone mount` (network drive) or `rclone serve` as a child process. filen-cli turns it on. Gates the live `network_drive_tests` |
 | `heif-decoder` | Thumbnail decoding for HEIF/HEIC — and AVIF, which the vendored libheif decodes through the same container path on its dav1d backend |
 | `bench-internals` | Exposes `cache::bench_support` for the insertion benchmark, and `sync_engine::probe` for the `sync_engine_probe` per-phase probe |
@@ -172,7 +178,9 @@ Test notes:
 The mobile bindings build is `-F uniffi,heif-decoder,http-provider,cache,sync-engine` (see
 `filen-sdk-rs/web/ubrn.config.yaml`); `uniffi` together with `sync-engine` compiles the sync
 engine's binding (`sync_engine::js_impl`); so does `napi` together with `sync-engine`, for the
-desktop addon (`build:napi` enables both).
+desktop addon (`build:napi` enables both). Likewise `rclone` with either binding compiles the
+rclone daemon's (`rclone::js_impl`): `build:napi` enables it, and so does the parity check's
+uniffi reference, which the mobile build leaves out.
 
 ## Git Hooks
 
@@ -189,7 +197,7 @@ wasi-sdk. Every `heif-decoder` pass lives in pre-push.
   lint`/`fmt --check`, `sqlfluff` on staged `.sql`, then six clippy passes: workspace
   (`--exclude heif-decoder --all-targets`), `-p filen-sdk-rs -F uniffi,http-provider`,
   `-p filen-sdk-rs -F sync-engine-live-tests,malformed --all-targets` and
-  `-p filen-sdk-rs -F napi,cache,sync-engine --all-targets` (the same commands as ci-linux), and
+  `-p filen-sdk-rs -F napi,cache,sync-engine,rclone --all-targets` (the same commands as ci-linux), and
   wasm32 `-F wasm-full,cache` + `--no-default-features -F service-worker` (both run from the
   `filen-sdk-rs` directory). **On a cold cargo cache this takes several minutes** — warm the
   cache by running those clippy invocations first, or the commit may be killed by a tool/CI
@@ -216,14 +224,15 @@ wasi-sdk. Every `heif-decoder` pass lives in pre-push.
   repository; cite another repository's commit as `<repo>@<sha>`.
   `fixup!`/`squash!`/`amend!` subjects pass, so the `fold-fixups` flow works.
 - **pre-push** — first refuses to push unfolded `fixup!`/`squash!`/`amend!` commits. Then
-  the heavier checks: the `heif-decoder` feature-combination clippy, `clippy --tests`,
-  both wasm32 passes on the feature sets `ci-wasm` uses (`-F wasm-full,cache,heif-decoder`
+  the heavier checks: the `heif-decoder` feature-combination clippy, `clippy --tests`, the
+  `-p filen-sdk-rs -F uniffi,http-provider,cache,sync-engine,rclone,test-seams --all-targets`
+  clippy pass (rclone's uniffi exports and `rclone_daemon_tests`, as ci-linux runs it), both wasm32 passes on the feature sets `ci-wasm` uses (`-F wasm-full,cache,heif-decoder`
   and `--no-default-features -F service-worker,heif-decoder`, i.e. what `wasm-pack.sh`
   ships), full `sqlfluff lint .`, `cargo test --lib --no-fail-fast`, and a package-scoped
   `cargo test -p filen-sdk-rs --lib -F uniffi,http-provider,cache,sync-engine` for the binding
   layers' tests (`fs/*/js_impl*`, `js/uniffi.rs`, `sync_engine/js_impl`), which are gated on
   `uniffi` and so never built by the workspace run, since no workspace member turns it on, and
-  likewise `cargo test -p filen-sdk-rs --lib -F napi,cache,sync-engine` for `js/napi`'s (the test
+  likewise `cargo test -p filen-sdk-rs --lib -F napi,cache,sync-engine,rclone` for `js/napi`'s (the test
   binary links without Node: napi's `dyn-symbols` resolves N-API only when Node loads the addon,
   and the tests touch none). This is the hook that needs `meson` / `ninja` (/ `nasm` on x86) and
   `WASI_SDK_PATH`; it stops with an
@@ -237,7 +246,8 @@ Neither hook is CI parity, by design: both run a subset. `ci.yml` additionally l
 package-scoped `clippy -p filen-sdk-rs --no-default-features -F uniffi,http-provider,cache,sync-engine --lib`
 that builds the SDK without `archive`, cross-compiles for Android, iOS and Windows, and
 builds and smoke-tests the napi addon on Linux, macOS and Windows and checks its typings
-against ubrn's on Linux (`ci-napi`) — none of
+against ubrn's on Linux (`ci-napi`), and runs `rclone_daemon_tests` against the managed rclone
+with FUSE 3 on Linux and WinFsp on Windows (`ci-rclone`) — none of
 which the hooks attempt. `ci.yml`
 runs only on `main`, `dev` and pull requests into them. Every other branch push, and every
 pull request into `main` or `dev` (from a fork too), runs `branch-lint.yml`, the fast checks

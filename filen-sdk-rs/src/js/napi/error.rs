@@ -155,6 +155,25 @@ impl FilenSdkErrorNapi {
 	}
 }
 
+// Like `syncRefusal`, in its own block for its `cfg`.
+#[cfg(feature = "rclone")]
+#[napi]
+impl FilenSdkErrorNapi {
+	/// The rclone refusal this error is, for a UI to act on without reading the message: a missing
+	/// binary or FUSE, a mount point or port in use, a serve without credentials, a cache with
+	/// uploads pending, and the rest of `RcloneRefusal`. `None` for every other error.
+	#[napi(
+		js_name = "rcloneRefusal",
+		ts_args_type = "",
+		ts_return_type = "RcloneRefusal | undefined"
+	)]
+	pub fn rclone_refusal(
+		&self,
+	) -> Either<<crate::rclone::RcloneRefusal as Wire>::Wire, Undefined> {
+		OptionReturn(crate::rclone::rclone_refusal(&self.0)).into_wire()
+	}
+}
+
 // The helpers below are plain Rust, so they stay under the workspace's `unsafe_code` deny, which
 // `js` lifts for this module only for napi-derive's glue.
 

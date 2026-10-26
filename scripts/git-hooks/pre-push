@@ -149,6 +149,10 @@ run "cargo clippy${heif_scope:+ $heif_scope} -- -D warnings" \
 	cargo clippy $heif_scope -- -D warnings
 run "cargo clippy${heif_scope:+ $heif_scope} --tests -- -D warnings" \
 	cargo clippy $heif_scope --tests -- -D warnings
+# rclone's UniFFI exports (the napi parity check's reference) and the hermetic
+# rclone_daemon_tests, which no pass above enables. Same command as ci-linux's.
+run "cargo clippy -p filen-sdk-rs -F uniffi,http-provider,cache,sync-engine,rclone,test-seams -- -D warnings" \
+	cargo clippy -p filen-sdk-rs -F uniffi,http-provider,cache,sync-engine,rclone,test-seams --all-targets -- -D warnings
 
 # WASM clippy: the two configurations wasm-pack.sh actually ships (the
 # service-worker one with default features OFF and its RUSTFLAGS), on the same
@@ -217,9 +221,10 @@ if [ "${SKIP_TESTS:-0}" != "1" ]; then
 	# says; the features are the mobile bindings' minus heif-decoder (matches CI).
 	run "cargo test -p filen-sdk-rs --lib -F uniffi,http-provider,cache,sync-engine --no-fail-fast" \
 		cargo test -p filen-sdk-rs --lib -F uniffi,http-provider,cache,sync-engine --no-fail-fast
-	# The same for the napi layer's tests (js/napi), gated on `napi`.
-	run "cargo test -p filen-sdk-rs --lib -F napi,cache,sync-engine --no-fail-fast" \
-		cargo test -p filen-sdk-rs --lib -F napi,cache,sync-engine --no-fail-fast
+	# The same for the napi layer's tests (js/napi, the rclone daemon's binding),
+	# gated on `napi`, with the desktop addon's features.
+	run "cargo test -p filen-sdk-rs --lib -F napi,cache,sync-engine,rclone --no-fail-fast" \
+		cargo test -p filen-sdk-rs --lib -F napi,cache,sync-engine,rclone --no-fail-fast
 else
 	printf '%sSKIP_TESTS=1, skipping cargo test --lib%s\n' "$yellow" "$reset"
 fi

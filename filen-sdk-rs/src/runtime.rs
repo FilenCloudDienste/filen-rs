@@ -968,7 +968,11 @@ mod commander_thread {
 /// Runs `call` as a task of its own, which runs to the end even when the wait for it is dropped (a
 /// JS abort drops only the wait, never a binding call half-way). A panic in it fails with an
 /// [`ErrorKind::Internal`](crate::ErrorKind::Internal) error whose context is `panicked`.
-#[cfg(all(any(feature = "uniffi", feature = "napi"), feature = "sync-engine"))]
+#[cfg(all(
+	any(feature = "uniffi", feature = "napi"),
+	any(feature = "sync-engine", feature = "rclone"),
+	not(target_family = "wasm")
+))]
 pub(crate) async fn spawned<T, Fut>(call: Fut, panicked: &'static str) -> Result<T, crate::Error>
 where
 	T: Send + 'static,

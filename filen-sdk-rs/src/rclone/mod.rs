@@ -10,6 +10,9 @@ pub mod basic_server;
 mod binary;
 mod daemon;
 mod fuse;
+// The JS bindings' surface: the desktop one (napi), and UniFFI for the typings it is checked against.
+#[cfg(any(feature = "uniffi", feature = "napi"))]
+mod js_impl;
 mod mount;
 #[cfg(feature = "rclone-managed")]
 pub mod network_drive;
@@ -32,8 +35,12 @@ pub use daemon::{
 	StopReport,
 };
 pub use fuse::{FuseProvider, FuseStatus, fuse_status};
+#[cfg(any(feature = "uniffi", feature = "napi"))]
+pub use js_impl::RcloneDaemonOptions;
+#[cfg(feature = "napi")]
+pub(crate) use js_impl::{JsRcloneDaemon, rclone_refusal};
 pub use mount::{MountInfo, MountOptions, available_drive_letters};
-pub use recovery::{StaleRecovery, force_unmount, recover_stale, stop_rclone_under};
+pub use recovery::{StaleRecovery, clear_cache, force_unmount, recover_stale, stop_rclone_under};
 pub use refusal::RcloneRefusal;
 pub use serve::{ServeAuth, ServeInfo, ServeOptions, ServeProtocol, ServeTls};
 pub use vfs::VfsTuning;

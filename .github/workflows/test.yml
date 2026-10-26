@@ -359,6 +359,10 @@ jobs:
           npm ci
           npm run build:napi
         working-directory: ./filen-sdk-rs/web
+      # Its rclone daemon test serves the account over webdav from a real rclone.
+      - name: Fetch rclone
+        if: ${{ !cancelled() && steps.build-napi.outcome == 'success' }}
+        run: echo "FILEN_TEST_RCLONE=$(scripts/fetch-rclone.sh "$RUNNER_TEMP/rclone")" >> "$GITHUB_ENV"
       - name: Run the napi addon's live test
         if: ${{ !cancelled() && steps.build-napi.outcome == 'success' }}
         run: npm run test:napi:live

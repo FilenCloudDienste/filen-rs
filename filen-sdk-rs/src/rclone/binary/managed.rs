@@ -25,7 +25,7 @@ const RCLONE_CHECKSUM_WINDOWS_AMD64: [u8; 32] =
 	hex!("ef097ef9de37a57feb7d9f9c7afb34148ad3c65be8025f1d8f7f521554a701ea");
 const RCLONE_CHECKSUM_WINDOWS_ARM64: [u8; 32] =
 	hex!("72194ad0aaf210d7a55808801191fecc7e175444dab7be7491b7a63074521f3a");
-// info: when updating the rclone version here, also update the expected SHA256 checksums by copying them from the supplied file
+// info: when updating the rclone version here, also update the expected SHA256 checksums by copying them from the supplied file, and both in scripts/fetch-rclone.sh
 
 /// Returns the path to the managed rclone binary in `config_dir`, downloading it first if it is
 /// not there and `allow_download` is set. Without it, a missing binary is the error "Rclone not
