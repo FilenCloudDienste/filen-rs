@@ -11,8 +11,8 @@ async fn start_rclone_mount() {
 		network_drive::NetworkDrive, rclone_installation::RcloneInstallationConfig,
 	};
 	use filen_sdk_rs::{fs::categories::NonRootFileType, io::client_impl::IoSharedClientExt};
-	use log::{debug, info, trace};
 	use tokio::fs;
+	use tracing::{debug, info, trace};
 
 	const TEST_ROOT_DIR_PREFIX: &str = "filen-rs-filen-network-drive-tests";
 	const TEST_FILE_CONTENT: &str = "This is a test file for filen-network-drive tests.";
@@ -22,8 +22,8 @@ async fn start_rclone_mount() {
 	// todo: see what the underlying issue for needing to explicitly unmount is
 	#[cfg(target_os = "linux")]
 	{
-		use log::warn;
 		use tokio::process::Command;
+		use tracing::warn;
 		let mount_path = "/tmp/filen";
 		let umount_status = Command::new("fusermount")
 			.arg("-u")

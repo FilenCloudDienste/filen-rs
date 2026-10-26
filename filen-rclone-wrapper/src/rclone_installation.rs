@@ -2,10 +2,8 @@
 //! Responsible for downloading the binary, writing config files
 //! and executing Rclone commands.
 
-use anyhow::{Context, Result};
-use filen_sdk_rs::auth::Client;
+use filen_sdk_rs::{Error, ErrorKind, auth::Client, error::ResultExt as _};
 use hex_literal::hex;
-use log::{debug, info};
 use port_check::free_local_ipv4_port;
 use sha2::{Digest as _, Sha256};
 use std::{
@@ -19,6 +17,7 @@ use tokio::{
 	io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader},
 	process::{Child, Command},
 };
+use tracing::{debug, info};
 
 use crate::rclone_rc_api::RcloneApiClient;
 
@@ -56,7 +55,7 @@ impl RcloneInstallation {
 	pub async fn initialize(
 		config: &RcloneInstallationConfig,
 		client: Option<&Client>,
-	) -> Result<Self> {
+	) -> Result<Self, Error> {
 		fs::create_dir_all(&config.config_dir)
 			.await
 			.context("Failed to create Rclone installation directory")?;
@@ -70,7 +69,7 @@ impl RcloneInstallation {
 	}
 
 	/// Executes an rclone command and waits for it to finish.
-	pub async fn execute(&self, args: &[&str]) -> Result<ExitStatus> {
+	pub async fn execute(&self, args: &[&str]) -> Result<ExitStatus, Error> {
 		debug!("Executing rclone with args: {}", args.join(" "));
 		let status = self
 			.configured_rclone(args)
@@ -84,9 +83,13 @@ impl RcloneInstallation {
 	}
 
 	/// Executes an rclone command in the background, exposing the Rclone RC API and piping stdout/stderr to logs.
-	pub async fn execute_in_background(&self, args: &[&str]) -> Result<(Child, RcloneApiClient)> {
-		let rc_port = free_local_ipv4_port()
-			.ok_or(anyhow::anyhow!("Failed to find free port for Rclone RC"))?;
+	pub async fn execute_in_background(
+		&self,
+		args: &[&str],
+	) -> Result<(Child, RcloneApiClient), Error> {
+		let rc_port = free_local_ipv4_port().ok_or_else(|| {
+			Error::custom(ErrorKind::IO, "Failed to find free port for Rclone RC")
+		})?;
 		let rc_username = "filen-rclone-wrapper".to_string();
 		let rc_password = {
 			let random_bytes: [u8; 16] = rand::random();
@@ -119,20 +122,24 @@ impl RcloneInstallation {
 			.context("Failed to execute rclone command")?;
 
 		// pipe stdout and stderr to logs
-		let process_stdout = process
-			.stdout
-			.take()
-			.context("Failed to take stdout of rclone process")?;
+		let process_stdout = process.stdout.take().ok_or_else(|| {
+			Error::custom(
+				ErrorKind::Internal,
+				"Failed to take stdout of rclone process",
+			)
+		})?;
 		tokio::spawn(async move {
 			let mut reader = BufReader::new(process_stdout).lines();
 			while let Ok(Some(line)) = reader.next_line().await {
 				info!("[rclone stdout] {}", line);
 			}
 		});
-		let process_stderr = process
-			.stderr
-			.take()
-			.context("Failed to take stderr of rclone process")?;
+		let process_stderr = process.stderr.take().ok_or_else(|| {
+			Error::custom(
+				ErrorKind::Internal,
+				"Failed to take stderr of rclone process",
+			)
+		})?;
 		tokio::spawn(async move {
 			let mut reader = BufReader::new(process_stderr).lines();
 			while let Ok(Some(line)) = reader.next_line().await {
@@ -153,7 +160,10 @@ impl RcloneInstallation {
 		cmd
 	}
 
-	pub fn construct_cache_args(config_dir: &Path, cache_size: Option<String>) -> Result<String> {
+	pub fn construct_cache_args(
+		config_dir: &Path,
+		cache_size: Option<String>,
+	) -> Result<String, Error> {
 		let cache_path = config_dir.join("network-drive-rclone/cache");
 
 		let cache_size = match cache_size {
@@ -174,7 +184,7 @@ impl RcloneInstallation {
 			"--vfs-cache-mode full --cache-dir {} --vfs-cache-max-size {} --vfs-cache-min-free-space 5Gi --vfs-cache-max-age 720h --vfs-cache-poll-interval 1m --dir-cache-time 3s --cache-info-age 5s",
 			cache_path
 				.to_str()
-				.ok_or(anyhow::anyhow!("Failed to format cache path"))?,
+				.ok_or_else(|| Error::custom(ErrorKind::Conversion, "Failed to format cache path"))?,
 			cache_size
 		).to_string())
 	}
@@ -197,7 +207,10 @@ const RCLONE_CHECKSUM_WINDOWS_ARM64: [u8; 32] =
 
 /// Returns the path to the rclone binary, downloading it if necessary.
 /// When `disallow_downloading` is true, returns an error "Rclone not found" instead of downloading it.
-async fn ensure_rclone_binary(config_dir: &Path, disallow_downloading: bool) -> Result<PathBuf> {
+async fn ensure_rclone_binary(
+	config_dir: &Path,
+	disallow_downloading: bool,
+) -> Result<PathBuf, Error> {
 	// determine download url
 	let platform_str = match std::env::consts::OS {
 		"windows" => Some("windows"),
@@ -213,10 +226,13 @@ async fn ensure_rclone_binary(config_dir: &Path, disallow_downloading: bool) -> 
 	let rclone_zip_name = match (platform_str, arch_str) {
 		(Some(platform), Some(arch)) => format!("rclone-v{}-{}-{}", RCLONE_VERSION, platform, arch),
 		_ => {
-			return Err(anyhow::anyhow!(
-				"Unsupported platform/architecture: {} {}",
-				std::env::consts::OS,
-				std::env::consts::ARCH
+			return Err(Error::custom(
+				ErrorKind::IO,
+				format!(
+					"Unsupported platform/architecture: {} {}",
+					std::env::consts::OS,
+					std::env::consts::ARCH
+				),
 			));
 		}
 	};
@@ -237,7 +253,7 @@ async fn ensure_rclone_binary(config_dir: &Path, disallow_downloading: bool) -> 
 		info!("Rclone binary already exists, skipping download");
 	} else {
 		if disallow_downloading {
-			return Err(anyhow::anyhow!("Rclone not found"));
+			return Err(Error::custom(ErrorKind::IO, "Rclone not found"));
 		}
 
 		info!(
@@ -263,18 +279,26 @@ async fn ensure_rclone_binary(config_dir: &Path, disallow_downloading: bool) -> 
 			_ => unreachable!(),
 		};
 		if zip_checksum.as_slice() != expected_zip_checksum {
-			return Err(anyhow::anyhow!(
-				"Downloaded Rclone zip's checksum doesn't match!"
+			return Err(Error::custom(
+				ErrorKind::Response,
+				"Downloaded Rclone zip's checksum doesn't match!",
 			));
 		}
 
-		let mut zip = zip::ZipArchive::new(std::io::Cursor::new(zip_bytes))
-			.context("Failed to read Rclone zip")?;
+		let mut zip = zip::ZipArchive::new(std::io::Cursor::new(zip_bytes)).map_err(|e| {
+			Error::custom_with_source(ErrorKind::Response, e, Some("Failed to read Rclone zip"))
+		})?;
 		zip.file_names()
-			.for_each(|name| log::info!("Zip file contains: {}", name));
+			.for_each(|name| info!("Zip file contains: {}", name));
 		let mut rclone_file = zip
 			.by_name(format!("{}/rclone{}", rclone_zip_name, file_ending).as_str())
-			.context("Failed to find Rclone file in zip")?;
+			.map_err(|e| {
+				Error::custom_with_source(
+					ErrorKind::Response,
+					e,
+					Some("Failed to find Rclone file in zip"),
+				)
+			})?;
 		let mut bytes = Vec::new();
 		rclone_file
 			.read_to_end(&mut bytes)
@@ -303,7 +327,7 @@ async fn write_rclone_config(
 	rclone_binary_path: &Path,
 	client: Option<&Client>,
 	config_dir: &Path,
-) -> Result<PathBuf> {
+) -> Result<PathBuf, Error> {
 	let rclone_config_path = config_dir.join("rclone.conf");
 
 	let rclone_config_content = if let Some(client) = client {
@@ -336,7 +360,10 @@ async fn write_rclone_config(
 	Ok(rclone_config_path)
 }
 
-async fn obscure_password_for_rclone(rclone_binary_path: &Path, password: &str) -> Result<String> {
+async fn obscure_password_for_rclone(
+	rclone_binary_path: &Path,
+	password: &str,
+) -> Result<String, Error> {
 	// the password goes through stdin (`-`) because argv is world-readable via /proc/<pid>/cmdline
 	let mut child = Command::new(rclone_binary_path)
 		.args(["obscure", "-"])
@@ -346,10 +373,12 @@ async fn obscure_password_for_rclone(rclone_binary_path: &Path, password: &str) 
 		.kill_on_drop(true)
 		.spawn()
 		.context("Failed to spawn rclone to obscure password for Rclone config")?;
-	let mut stdin = child
-		.stdin
-		.take()
-		.context("Failed to take stdin of rclone obscure process")?;
+	let mut stdin = child.stdin.take().ok_or_else(|| {
+		Error::custom(
+			ErrorKind::Internal,
+			"Failed to take stdin of rclone obscure process",
+		)
+	})?;
 	stdin
 		.write_all(password.as_bytes())
 		.await
@@ -359,26 +388,35 @@ async fn obscure_password_for_rclone(rclone_binary_path: &Path, password: &str) 
 		.wait_with_output()
 		.await
 		.context("Failed to obscure password for Rclone config")?;
-	anyhow::ensure!(
-		output.status.success(),
-		"rclone obscure exited with {}",
-		output.status
-	);
-	let obscured_password = String::from_utf8(output.stdout)
-		.context("Failed to read obscured password for Rclone config")?;
+	if !output.status.success() {
+		return Err(Error::custom(
+			ErrorKind::IO,
+			format!("rclone obscure exited with {}", output.status),
+		));
+	}
+	let obscured_password = String::from_utf8(output.stdout).map_err(|e| {
+		Error::custom_with_source(
+			ErrorKind::Conversion,
+			e,
+			Some("Failed to read obscured password for Rclone config"),
+		)
+	})?;
 	Ok(obscured_password.trim().to_string())
 }
 
-fn get_available_disk_space(path: &Path) -> Result<u64> {
+fn get_available_disk_space(path: &Path) -> Result<u64, Error> {
 	Disks::new_with_refreshed_list()
 		.list()
 		.iter()
 		.find(|disk| path.starts_with(disk.mount_point()))
 		.map(|disk| disk.available_space())
 		.ok_or_else(|| {
-			anyhow::anyhow!(
-				"Failed to get available disk space for path: {}",
-				path.display()
+			Error::custom(
+				ErrorKind::IO,
+				format!(
+					"Failed to get available disk space for path: {}",
+					path.display()
+				),
 			)
 		})
 }

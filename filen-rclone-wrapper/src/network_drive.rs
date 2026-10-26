@@ -1,9 +1,8 @@
 use std::{borrow::Cow, path::Path, process::ExitStatus};
 use tokio::{fs, process::Child};
 
-use anyhow::{Context, Result};
-use filen_sdk_rs::auth::Client;
-use log::trace;
+use filen_sdk_rs::{Error, ErrorKind, auth::Client, error::ResultExt as _};
+use tracing::trace;
 
 use crate::{
 	rclone_installation::{RcloneInstallation, RcloneInstallationConfig},
@@ -29,7 +28,7 @@ impl NetworkDrive {
 		cache_size: Option<String>,
 		transfers: Option<usize>,
 		rclone_args: Vec<String>,
-	) -> Result<NetworkDrive> {
+	) -> Result<NetworkDrive, Error> {
 		let rclone = RcloneInstallation::initialize(config, Some(client)).await?;
 		let mount_point = resolve_mount_point(mount_point).await?;
 
@@ -78,11 +77,9 @@ impl NetworkDrive {
 		let log_file_path: Option<&Path> = None; // todo: add option for log file
 		if let Some(log_file_path) = log_file_path {
 			args.push("--log-file");
-			args.push(
-				log_file_path
-					.to_str()
-					.ok_or(anyhow::anyhow!("Failed to format log file path"))?,
-			);
+			args.push(log_file_path.to_str().ok_or_else(|| {
+				Error::custom(ErrorKind::Conversion, "Failed to format log file path")
+			})?);
 		}
 		#[cfg(target_family = "windows")]
 		{
@@ -132,7 +129,7 @@ impl NetworkDrive {
 	}
 }
 
-async fn resolve_mount_point(mount_point: Option<&str>) -> Result<Cow<'_, str>> {
+async fn resolve_mount_point(mount_point: Option<&str>) -> Result<Cow<'_, str>, Error> {
 	#[cfg(windows)]
 	{
 		match mount_point {
@@ -142,9 +139,12 @@ async fn resolve_mount_point(mount_point: Option<&str>) -> Result<Cow<'_, str>> 
 					.unwrap()
 					.captures(mount_point);
 				let Some(drive_letter) = drive_letter else {
-					return Err(anyhow::anyhow!(
-						"Invalid Windows mount point (not a drive letter): {}",
-						mount_point
+					return Err(Error::custom(
+						ErrorKind::InvalidName,
+						format!(
+							"Invalid Windows mount point (not a drive letter): {}",
+							mount_point
+						),
 					));
 				};
 				let drive_letter = drive_letter.get(1).unwrap().as_str().to_uppercase();
@@ -156,9 +156,9 @@ async fn resolve_mount_point(mount_point: Option<&str>) -> Result<Cow<'_, str>> 
 				{
 					Ok(Cow::Owned(drive_path))
 				} else {
-					Err(anyhow::anyhow!(
-						"Drive letter {} is not available",
-						drive_letter
+					Err(Error::custom(
+						ErrorKind::IO,
+						format!("Drive letter {} is not available", drive_letter),
 					))
 				}
 			}
@@ -181,7 +181,7 @@ async fn resolve_mount_point(mount_point: Option<&str>) -> Result<Cow<'_, str>> 
 
 /// Lists available drive letters, e.g. `C:\` (Windows)
 #[cfg(windows)]
-pub async fn get_available_drive_letters() -> Result<Vec<String>> {
+pub async fn get_available_drive_letters() -> Result<Vec<String>, Error> {
 	let mut available_letters = Vec::new();
 	for letter in "ABCDEFGHIJKLMNOPQRSTUVWXYZ".chars() {
 		let drive_path = format!("{}:\\", letter);
@@ -227,21 +227,25 @@ impl NetworkDrive {
 		NetworkDriveStatus::Active
 	}
 
-	pub async fn wait_until_active(&mut self) -> Result<()> {
+	pub async fn wait_until_active(&mut self) -> Result<(), Error> {
 		let mut i = 0;
 		loop {
 			match self.is_active().await {
 				NetworkDriveStatus::Active => return Ok(()),
 				NetworkDriveStatus::Exited { status_code } => {
-					return Err(anyhow::anyhow!(
-						"Rclone mount process has exited with status code: {}",
-						status_code
+					return Err(Error::custom(
+						ErrorKind::IO,
+						format!(
+							"Rclone mount process has exited with status code: {}",
+							status_code
+						),
 					));
 				}
 				_ => {
 					if i >= 300 {
-						return Err(anyhow::anyhow!(
-							"Timed out waiting for network drive to become active"
+						return Err(Error::custom(
+							ErrorKind::IO,
+							"Timed out waiting for network drive to become active",
 						));
 					}
 					i += 1;
@@ -269,7 +273,7 @@ pub struct NetworkDriveTransfer {
 }
 
 impl NetworkDrive {
-	pub async fn get_stats(&self) -> Result<NetworkDriveStats> {
+	pub async fn get_stats(&self) -> Result<NetworkDriveStats, Error> {
 		let core_stats = self.api_client.core_stats().await?;
 		let vfs_stats = self.api_client.vfs_stats().await?;
 		Ok(NetworkDriveStats {

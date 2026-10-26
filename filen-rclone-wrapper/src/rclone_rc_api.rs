@@ -1,6 +1,6 @@
-use anyhow::{Context, Result};
-use log::debug;
+use filen_sdk_rs::Error;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use tracing::debug;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CoreStatsResponse {
@@ -56,7 +56,7 @@ impl RcloneApiClient {
 		&self,
 		endpoint: &str,
 		body: Option<serde_json::Value>,
-	) -> Result<T> {
+	) -> Result<T, Error> {
 		let response = self
 			.client
 			.post(format!("{}/{}", self.root, endpoint))
@@ -68,11 +68,11 @@ impl RcloneApiClient {
 			})
 			.send()
 			.await
-			.with_context(|| {
-				format!(
+			.map_err(|e| {
+				Error::from(e).with_context(format!(
 					"Failed to send request to Rclone API at endpoint: {}",
 					endpoint
-				)
+				))
 			})?;
 		let response = response.bytes().await?;
 		debug!(
@@ -82,22 +82,22 @@ impl RcloneApiClient {
 		);
 		match serde_json::from_slice::<T>(&response) {
 			Ok(result) => Ok(result),
-			Err(_) => Err(anyhow::anyhow!(
+			Err(e) => Err(Error::from(e).with_context(format!(
 				"Failed to parse Rclone response; response body: {}",
 				String::from_utf8_lossy(&response)
-			)),
+			))),
 		}
 	}
 
-	pub async fn core_stats(&self) -> Result<CoreStatsResponse> {
+	pub async fn core_stats(&self) -> Result<CoreStatsResponse, Error> {
 		self.request("core/stats", None).await
 	}
 
-	pub async fn vfs_stats(&self) -> Result<VfsStatsResponse> {
+	pub async fn vfs_stats(&self) -> Result<VfsStatsResponse, Error> {
 		self.request("vfs/stats", None).await
 	}
 
-	pub async fn vfs_list(&self) -> Result<VfsListResponse> {
+	pub async fn vfs_list(&self) -> Result<VfsListResponse, Error> {
 		self.request("vfs/list", None).await
 	}
 }

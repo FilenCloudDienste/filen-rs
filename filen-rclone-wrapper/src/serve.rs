@@ -1,5 +1,4 @@
-use anyhow::{Result, anyhow};
-use filen_sdk_rs::auth::Client;
+use filen_sdk_rs::{Error, ErrorKind, auth::Client};
 use tokio::process::Child;
 
 use crate::rclone_installation::{RcloneInstallation, RcloneInstallationConfig};
@@ -34,9 +33,12 @@ pub async fn start_basic_server(
 	server_type: &str,
 	options: BasicServerOptions,
 	rclone_args: Vec<String>,
-) -> Result<BasicServerDetails> {
+) -> Result<BasicServerDetails, Error> {
 	if !["webdav", "ftp", "sftp", "http", "s3"].contains(&server_type) {
-		return Err(anyhow!("Unsupported server type: {}", server_type));
+		return Err(Error::custom(
+			ErrorKind::InvalidType,
+			format!("Unsupported server type: {}", server_type),
+		));
 	}
 	let remote_str = format!("filen:{}", options.root.unwrap_or("".to_string()));
 	let mut args = vec![
