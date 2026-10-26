@@ -13,7 +13,7 @@
 use std::{
 	borrow::Cow,
 	collections::BTreeSet,
-	path::Path,
+	path::{Path, PathBuf},
 	sync::{
 		Arc,
 		atomic::{AtomicUsize, Ordering},
@@ -125,7 +125,8 @@ fn count_files(root: &Path) -> usize {
 		.count()
 }
 
-/// Files in the quarantine bin (`.filen-sync-trash`), keyed by quarantine-relative path -> bytes.
+/// Files in the quarantine bin (`.filen-sync-trash`), keyed by their path inside their day's
+/// bucket (`.filen-sync-trash/YYYY-MM-DD/<path>`) -> bytes.
 fn quarantine_files(root: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
 	let mut out = std::collections::BTreeMap::new();
 	let bin = root.join(".filen-sync-trash");
@@ -144,9 +145,13 @@ fn quarantine_files(root: &Path) -> std::collections::BTreeMap<String, Vec<u8>> 
 			if ft.is_dir() {
 				stack.push(path);
 			} else if ft.is_file() {
+				// Past the bucket: the path the item had in the tree.
 				let rel = path
 					.strip_prefix(&bin)
 					.unwrap()
+					.components()
+					.skip(1)
+					.collect::<PathBuf>()
 					.to_string_lossy()
 					.replace('\\', "/");
 				out.insert(rel, std::fs::read(&path).unwrap());
@@ -999,8 +1004,17 @@ async fn scale_22_remote_subtree_delete_removes_local_subtree() {
 		q, expected,
 		"the subtree must sit in the quarantine bin whole, where it stood"
 	);
+	assert!(
+		binned(&sc.local, "doomed").is_some(),
+		"the subtree is in the bin"
+	);
+	// Across every day's bucket, not only the one holding `doomed`: a later pass may run past
+	// midnight and bin a second, emptied copy (`doomed`, or `doomed (1)`) under the next day.
 	let bin_top: Vec<String> = std::fs::read_dir(sc.local.join(".filen-sync-trash"))
 		.unwrap()
+		.map(|bucket| bucket.unwrap().path())
+		.filter(|bucket| bucket.is_dir())
+		.flat_map(|bucket| std::fs::read_dir(bucket).unwrap())
 		.map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
 		.collect();
 	assert_eq!(

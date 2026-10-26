@@ -897,7 +897,7 @@ async fn matrix_15_backup_move_is_mirrored_as_a_move() {
 		"the moved copy must not linger under its old name"
 	);
 	assert!(
-		!rb.local.join(".filen-sync-trash").join("H.txt").exists(),
+		binned(&rb.local, "H.txt").is_none(),
 		"a move must not quarantine anything"
 	);
 	rb.cleanup();

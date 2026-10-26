@@ -70,8 +70,9 @@ pub enum PlannedActionKind {
 	},
 	/// Send the remote item to the Filen trash (recoverable).
 	TrashRemote,
-	/// Move the local item into the pair's `.filen-sync-trash/` quarantine dir. Local deletions are
-	/// never destructive; the bytes stay recoverable inside the sync root.
+	/// Move the local item into the pair's `.filen-sync-trash/` quarantine dir, under the bucket of
+	/// the UTC day it was moved (`.filen-sync-trash/YYYY-MM-DD/<path>`). Local deletions are never
+	/// destructive; the bytes stay recoverable inside the sync root.
 	DeleteLocal,
 	/// Record a path that is already identical on both sides into the baseline. Transfers nothing;
 	/// it exists so a later one-sided change at that path is classified correctly.

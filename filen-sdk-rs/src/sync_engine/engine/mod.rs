@@ -33,6 +33,7 @@ use super::{
 		BaselineEntry, BaselineState, BaselineStore, NodeKind, PairId, PairRecord, PathFailure,
 		PendingRow, SyncedPaths,
 	},
+	bin,
 	changes::{DIRTY_CAP, FullPassReason, PairChanges, PassScope, RemoteDeltaEntry, past_cap},
 	derive,
 	facts::{self, PairFacts},
@@ -3588,7 +3589,7 @@ impl SyncEngine {
 	/// the download would otherwise destroy the only copy.
 	///
 	/// Returns where in the bin that copy went, so a caller can offer those bytes back without
-	/// walking `.filen-sync-trash` and guessing among ` (N)` siblings — the same thing
+	/// walking `.filen-sync-trash`'s day buckets and guessing among ` (N)` siblings — the same thing
 	/// [`SyncEvent::Quarantined`](super::SyncEvent::Quarantined) does for a copy a PASS moved
 	/// aside. `None` when nothing was moved: the two sides held the same content, or the
 	/// resolution kept the local copy. [`KeepBoth`](ConflictResolution::KeepBoth) is `None` too —
@@ -3673,7 +3674,11 @@ impl SyncEngine {
 			// The losing local edit goes to the bin, as the `Overwritten` shape's does. Anchoring the
 			// row to it instead would let the next pass vouch for it and download straight over it.
 			// With the local side emptied the path resolves the way `KeepBoth` leaves it.
-			quarantined = apply::quarantine_local(Path::new(&record.local_root), rel_path)?;
+			quarantined = bin::quarantine_local(
+				Path::new(&record.local_root),
+				rel_path,
+				Utc::now().date_naive(),
+			)?;
 			tracing::debug!(
 				"resolve_conflict[pair {pair}]: quarantined the local copy of {rel_path:?} as {quarantined:?}"
 			);
@@ -3785,7 +3790,7 @@ impl SyncEngine {
 				}
 				// Our own copy goes to the bin rather than under the download: the restored version
 				// is what this resolution asked for, and the bytes it replaces are not lost.
-				quarantined = apply::quarantine_local(local_root, rel_path)?;
+				quarantined = bin::quarantine_local(local_root, rel_path, Utc::now().date_naive())?;
 				tracing::debug!(
 					"resolve_conflict[pair {pair}]: restored the version buried at {rel_path:?} and quarantined the local copy as {quarantined:?}"
 				);
@@ -6369,6 +6374,7 @@ impl SyncEngine {
 			observed: &self.observed,
 			gate: &gate,
 			lock_budget: self.lock_budget,
+			bin_day: Utc::now().date_naive(),
 		};
 		apply::apply(ctx, plan, &mut report, observer).await;
 		// The pass let go of its hold of the drive lock; what it looked up during it goes too.

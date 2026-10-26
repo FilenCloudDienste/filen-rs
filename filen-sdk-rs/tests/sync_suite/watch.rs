@@ -1064,9 +1064,8 @@ async fn watch_24_remote_backup_keeps_local_on_delete() {
 		"RemoteBackup wrongly mirrored the remote delete to the local side"
 	);
 	assert_eq!(log.locally_deleted(), 0, "backup deleted local data");
-	let bin = sc.local.join(".filen-sync-trash");
 	assert!(
-		!bin.join("cloud.txt").exists(),
+		binned(&sc.local, "cloud.txt").is_none(),
 		"backup quarantined the local file it was meant to retain"
 	);
 

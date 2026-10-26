@@ -15,7 +15,9 @@ use crate::{
 	sync_engine::{
 		SyncMode,
 		baseline::BaselineStore,
+		bin::test_support::{bucket, day},
 		changes::tests::{cacheable_dir, cacheable_file},
+		scan::QUARANTINE_DIR,
 		stage::{PAGE_ROWS, PlanWriter, Stage},
 	},
 };
@@ -955,37 +957,6 @@ fn confine_allows_a_symlink_that_stays_within_the_root() {
 	std::fs::remove_dir_all(&root).ok();
 }
 
-#[test]
-fn quarantine_makes_a_unique_dest_on_collision_never_overwriting() {
-	let root = temp_dir();
-	let trash = root.join(QUARANTINE_DIR);
-
-	std::fs::write(root.join("x.txt"), b"first").unwrap();
-	assert_eq!(
-		quarantine_local(&root, "x.txt").unwrap(),
-		Some(trash.join("x.txt"))
-	);
-	assert_eq!(std::fs::read(trash.join("x.txt")).unwrap(), b"first");
-
-	// A second deletion at the same rel path must NOT clobber the first quarantined copy.
-	std::fs::write(root.join("x.txt"), b"second").unwrap();
-	assert_eq!(
-		quarantine_local(&root, "x.txt").unwrap(),
-		Some(trash.join("x.txt (1)"))
-	);
-	assert_eq!(
-		std::fs::read(trash.join("x.txt")).unwrap(),
-		b"first",
-		"first copy preserved"
-	);
-	assert_eq!(
-		std::fs::read(trash.join("x.txt (1)")).unwrap(),
-		b"second",
-		"second copy under a unique name"
-	);
-	std::fs::remove_dir_all(&root).ok();
-}
-
 fn local_node(rel: &str, mtime: i64, hash: Option<Blake3Hash>) -> LocalNode {
 	LocalNode {
 		rel_path: rel.to_string(),
@@ -1148,14 +1119,16 @@ async fn a_local_move_onto_an_unsynced_file_stashes_it_first() {
 	let root = temp_dir();
 	std::fs::write(root.join("dest.txt"), b"never synced").unwrap();
 
-	let _stashed = stash_local_target(&root, "dest.txt", None).await.unwrap();
+	let _stashed = stash_local_target(&root, "dest.txt", None, day())
+		.await
+		.unwrap();
 
 	assert!(
 		!root.join("dest.txt").exists(),
 		"the destination is cleared for the rename"
 	);
 	assert_eq!(
-		std::fs::read(root.join(QUARANTINE_DIR).join("dest.txt")).unwrap(),
+		std::fs::read(bucket(&root, day()).join("dest.txt")).unwrap(),
 		b"never synced",
 		"and the file the baseline could not vouch for is recoverable"
 	);
@@ -1172,7 +1145,7 @@ async fn cleared_move_target(
 ) -> (SyncReport, Vec<SyncEvent>) {
 	let mut report = SyncReport::default();
 	let mut events = Vec::new();
-	stash_move_target(root, to_path, base, &mut report, &mut |event| {
+	stash_move_target(root, to_path, base, day(), &mut report, &mut |event| {
 		events.push(event)
 	})
 	.await
@@ -1224,12 +1197,12 @@ async fn a_destination_that_only_looks_like_the_source_is_still_stashed() {
 		events,
 		vec![SyncEvent::Quarantined {
 			rel_path: "REPORT.TXT".to_string(),
-			bin_path: root.join(QUARANTINE_DIR).join("REPORT.TXT"),
+			bin_path: bucket(&root, day()).join("REPORT.TXT"),
 		}]
 	);
 
 	assert_eq!(
-		std::fs::read(root.join(QUARANTINE_DIR).join("REPORT.TXT")).unwrap(),
+		std::fs::read(bucket(&root, day()).join("REPORT.TXT")).unwrap(),
 		b"never synced"
 	);
 	std::fs::remove_dir_all(&root).ok();
@@ -1242,7 +1215,7 @@ async fn a_local_move_onto_a_synced_copy_stashes_nothing() {
 	let root = temp_dir();
 	let (path, base) = synced_file(&root, b"abc");
 
-	let stashed = stash_local_target(&root, "a.txt", Some(&base))
+	let stashed = stash_local_target(&root, "a.txt", Some(&base), day())
 		.await
 		.unwrap();
 	assert_eq!(stashed, None, "nothing was stashed, so nothing to put back");
@@ -1283,7 +1256,7 @@ async fn a_pull_over_a_size_and_mtime_preserving_edit_quarantines_first() {
 		local_holds_unsynced_content(&path, Some(&base)),
 		"only the bytes tell this edit from the copy the row vouches for"
 	);
-	let stashed = stash_local_target(&root, "a.txt", Some(&base))
+	let stashed = stash_local_target(&root, "a.txt", Some(&base), day())
 		.await
 		.unwrap()
 		.expect("an edit no stat can see must still be stashed");
@@ -1310,7 +1283,7 @@ async fn a_row_without_a_recorded_hash_is_not_vouched_for() {
 	base.content_hash = None;
 
 	assert!(local_holds_unsynced_content(&path, Some(&base)));
-	let stashed = stash_local_target(&root, "a.txt", Some(&base))
+	let stashed = stash_local_target(&root, "a.txt", Some(&base), day())
 		.await
 		.unwrap()
 		.expect("a copy no row vouches for must be kept");
@@ -1361,17 +1334,6 @@ fn moving_a_row_with_no_local_content_records_none_at_the_new_path() {
 	assert_eq!(row.local_mtime, Some(4242), "the renamed file's own mtime");
 }
 
-#[test]
-fn quarantine_of_a_missing_source_is_a_noop() {
-	let root = temp_dir();
-	// e.g. the item already moved as part of an ancestor's quarantine.
-	assert_eq!(
-		quarantine_local(&root, "already/gone.txt").expect("missing source is a no-op"),
-		None
-	);
-	std::fs::remove_dir_all(&root).ok();
-}
-
 /// A download the pause dropped (or one that failed) never writes at its target, so the copy
 /// stashed out of its way goes BACK: left in the bin, the path is empty, and the next pass
 /// reads a baseline row with nothing on disk as a local deletion — a conflict over a deletion
@@ -1381,7 +1343,9 @@ async fn a_write_that_never_landed_puts_its_stashed_target_back() {
 	let root = temp_dir();
 	std::fs::write(root.join("a.txt"), b"a local edit").unwrap();
 
-	let stashed = stash_local_target(&root, "a.txt", None).await.unwrap();
+	let stashed = stash_local_target(&root, "a.txt", None, day())
+		.await
+		.unwrap();
 	assert!(
 		stashed.is_some(),
 		"a copy the baseline cannot vouch for must be stashed before the download"
@@ -1396,7 +1360,7 @@ async fn a_write_that_never_landed_puts_its_stashed_target_back() {
 		"the interrupted download left the path empty"
 	);
 	assert!(
-		!root.join(QUARANTINE_DIR).join("a.txt").exists(),
+		!bucket(&root, day()).join("a.txt").exists(),
 		"and nothing is left duplicated in the bin"
 	);
 	std::fs::remove_dir_all(&root).ok();
@@ -1408,14 +1372,16 @@ async fn a_write_that_never_landed_puts_its_stashed_target_back() {
 async fn a_restore_never_overwrites_what_took_the_path() {
 	let root = temp_dir();
 	std::fs::write(root.join("a.txt"), b"a local edit").unwrap();
-	let stashed = stash_local_target(&root, "a.txt", None).await.unwrap();
+	let stashed = stash_local_target(&root, "a.txt", None, day())
+		.await
+		.unwrap();
 	std::fs::write(root.join("a.txt"), b"written since").unwrap();
 
 	restore_stashed(stashed, &root.join("a.txt"));
 
 	assert_eq!(std::fs::read(root.join("a.txt")).unwrap(), b"written since");
 	assert_eq!(
-		std::fs::read(root.join(QUARANTINE_DIR).join("a.txt")).unwrap(),
+		std::fs::read(bucket(&root, day()).join("a.txt")).unwrap(),
 		b"a local edit",
 		"the stashed copy must stay recoverable"
 	);
@@ -1439,7 +1405,7 @@ async fn a_pull_over_an_invisible_edit_announces_the_copy_it_moved_aside() {
 		.set_times(std::fs::FileTimes::new().set_modified(mtime))
 		.unwrap();
 
-	let bin = stash_local_target(&root, "a.txt", Some(&base))
+	let bin = stash_local_target(&root, "a.txt", Some(&base), day())
 		.await
 		.unwrap()
 		.expect("an edit no stat can see must still be stashed");
@@ -1484,7 +1450,7 @@ async fn a_move_onto_an_occupied_destination_announces_it_too() {
 
 	let (report, events) = cleared_move_target(&root, "dest.txt", None).await;
 
-	let bin = root.join(QUARANTINE_DIR).join("dest.txt");
+	let bin = bucket(&root, day()).join("dest.txt");
 	assert_eq!(
 		events,
 		vec![SyncEvent::Quarantined {
@@ -1749,6 +1715,7 @@ impl Borrowed {
 			observed: &self.observed,
 			gate: &self.gate,
 			lock_budget: LockBudget::default(),
+			bin_day: day(),
 		}
 	}
 }

@@ -19,6 +19,7 @@ use crate::{
 		PauseMode,
 		apply::PassStart,
 		baseline::{BaselineChange, LegacyItem, LegacySide, NodeKind},
+		bin::test_support::bucket,
 		changes::tests::{cacheable_dir, cacheable_file},
 		derive::Derived,
 		ignore::IgnoreRules,
@@ -5560,15 +5561,19 @@ async fn keeping_remote_quarantines_a_local_edit_the_remote_never_had() {
 	locked(&engine.pair_store(pair).await.unwrap())
 		.upsert_entry(pair, &diverged)
 		.unwrap();
+	// The resolution takes its day from the clock: either side of the call brackets it, so the
+	// assertion holds across a midnight.
+	let before = Utc::now().date_naive();
 	let quarantined = engine
 		.resolve_conflict(pair, "a.txt", ConflictResolution::KeepRemote)
 		.await
 		.unwrap()
 		.expect("the resolution has to say where it put the copy it moved aside");
-	assert_eq!(
-		quarantined,
-		root.join(scan::QUARANTINE_DIR).join("a.txt"),
-		"the path it named is not where the copy went"
+	let after = Utc::now().date_naive();
+	let in_bucket = |day| bucket(&root, day).join("a.txt");
+	assert!(
+		quarantined == in_bucket(before) || quarantined == in_bucket(after),
+		"the path it named is not the day's bucket of the bin: {quarantined:?}"
 	);
 	assert_eq!(
 		std::fs::read(&quarantined).unwrap(),
@@ -5602,7 +5607,9 @@ async fn keeping_remote_quarantines_a_local_edit_the_remote_never_had() {
 		"nothing was moved aside, so there is no path to name"
 	);
 	assert!(root.join("b.txt").exists());
-	assert!(!root.join(scan::QUARANTINE_DIR).join("b.txt").exists());
+	for bucket in std::fs::read_dir(root.join(scan::QUARANTINE_DIR)).unwrap() {
+		assert!(!bucket.unwrap().path().join("b.txt").exists());
+	}
 
 	drop(engine);
 	std::fs::remove_file(&path).ok();

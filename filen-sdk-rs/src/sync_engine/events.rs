@@ -96,8 +96,9 @@ pub enum SyncEvent {
 	/// A local copy the pass moved into the pair's quarantine bin to clear the way for a write it
 	/// was about to make: a remote-wins download over a copy the baseline cannot vouch for, or a
 	/// move onto a destination that was occupied by the time the pass got there. `bin_path` is
-	/// where that copy went, under `.filen-sync-trash` in the pair's local root, and the bytes
-	/// stay there until somebody recovers them.
+	/// where that copy went: under `.filen-sync-trash/YYYY-MM-DD/` in the pair's local root, the
+	/// bucket of the UTC day the pass moved it, at its original path, and the bytes stay there
+	/// until somebody recovers them.
 	///
 	/// Nothing else the pass says names that path: no action failed, and the edit such a copy
 	/// holds is by definition one no scan could see — which is why the write was planned over it

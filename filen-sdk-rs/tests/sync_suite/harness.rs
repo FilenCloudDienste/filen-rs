@@ -91,6 +91,25 @@ fn walk_into(root: &Path, dir: &Path, map: &mut TreeMap) {
 	}
 }
 
+/// Where `rel` sits in the engine's local bin under `root`, whichever day's bucket holds it (the
+/// bin is filed as `.filen-sync-trash/YYYY-MM-DD/<rel>`, by the UTC day the item was binned):
+/// `None` when no bucket does. A test cannot name the bucket up front without racing midnight, so it
+/// looks the item up instead. Panics when several buckets hold `rel`, which no single test bins.
+pub fn binned(root: &Path, rel: &str) -> Option<PathBuf> {
+	let Ok(buckets) = std::fs::read_dir(root.join(".filen-sync-trash")) else {
+		return None;
+	};
+	let mut found: Vec<PathBuf> = buckets
+		.map(|bucket| bucket.unwrap().path().join(rel))
+		.filter(|path| path.symlink_metadata().is_ok())
+		.collect();
+	assert!(
+		found.len() <= 1,
+		"{rel:?} sits in several buckets: {found:?}"
+	);
+	found.pop()
+}
+
 /// True once the two local trees are byte-for-byte identical (quarantine bin ignored).
 pub fn trees_equal(a: &Path, b: &Path) -> bool {
 	walk_tree(a) == walk_tree(b)

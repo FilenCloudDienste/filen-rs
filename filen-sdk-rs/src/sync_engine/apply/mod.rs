@@ -20,7 +20,7 @@ use std::{
 	time::Duration,
 };
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use filen_types::{
 	api::v3::{bulk::FileOrDir, dir, file},
 	fs::StableUuid,
@@ -30,6 +30,7 @@ use uuid::Uuid;
 
 use super::{
 	baseline::{BaselineChange, BaselineEntry, BaselineState, NodeKind, PairId, PendingRow},
+	bin::quarantine_local,
 	changes::FullPassReason,
 	engine::{
 		LockBudget, Observations, PASS_LOCK_MAX_SLEEP, PendingKind, PendingWrites, SYNC_BULK_CHUNK,
@@ -44,7 +45,7 @@ use super::{
 	pause::PassGate,
 	plan::{RemoteNode, SyncAction, is_under},
 	rows::{Baseline, Cursor},
-	scan::{LocalNode, QUARANTINE_DIR, collision_key, hash_file},
+	scan::{LocalNode, collision_key, hash_file},
 	side::{NodesAt, Side},
 	stage::{Carried, Pager, Run, Screen, Staged, StagedPlan},
 };
@@ -118,7 +119,8 @@ pub struct SyncReport {
 	pub errors: Vec<String>,
 	/// Paths whose local copy this pass moved into the pair's quarantine bin to clear the way for a
 	/// write: a remote-wins download over a copy the baseline cannot vouch for, and a move onto an
-	/// occupied destination. The bytes stay recoverable under `.filen-sync-trash`.
+	/// occupied destination. The bytes stay recoverable under `.filen-sync-trash`, in the bucket of
+	/// the UTC day the pass moved them (`.filen-sync-trash/YYYY-MM-DD/<path>`).
 	///
 	/// Nothing else in the report mentions those paths — the edit such a copy holds is by
 	/// definition one no scan could see (that is why the write was planned at all), and no action
@@ -291,6 +293,9 @@ pub(super) struct ApplyContext<'a> {
 	pub(super) gate: &'a PassGate,
 	/// The bounds of each hold of the drive-write lock (see [`Lease`]).
 	pub(super) lock_budget: LockBudget,
+	/// The UTC day whose bucket of the local bin everything this pass moves aside is filed under
+	/// (see [`quarantine_local`]): taken once, when the pass starts applying.
+	pub(super) bin_day: NaiveDate,
 }
 
 /// One action of the plan, with what the apply reads for it as the pass started: made by
@@ -533,7 +538,7 @@ fn unpaired() -> crate::Error {
 	internal("an entry's pass-start inputs are not its action's (should be impossible)")
 }
 
-fn local_path(root: &Path, rel_path: &str) -> PathBuf {
+pub(super) fn local_path(root: &Path, rel_path: &str) -> PathBuf {
 	rel_path
 		.split('/')
 		.fold(root.to_path_buf(), |p, c| p.join(c))
@@ -2708,7 +2713,7 @@ async fn apply_transfer(
 				_ => None,
 			};
 			let base = base.as_deref().or(written.as_ref());
-			let stashed = stash_local_target(ctx.local_root, rel_path, base).await?;
+			let stashed = stash_local_target(ctx.local_root, rel_path, base, ctx.bin_day).await?;
 			let Some(downloaded) = ctx
 				.gate
 				.guard(ctx.client.download_file_to_path(
@@ -2966,7 +2971,7 @@ async fn apply_one(
 			}
 			// Read before the act, which nothing then stands between and its record.
 			let carried = plan.pager.carried(action);
-			let _stashed = quarantine_local(ctx.local_root, rel_path)?;
+			let _stashed = quarantine_local(ctx.local_root, rel_path, ctx.bin_day)?;
 			match carried {
 				None => delete_baseline(ctx, rel_path).await?,
 				// The carried rows scale with the subtree, so they are dropped off the runtime thread.
@@ -3094,6 +3099,7 @@ async fn apply_one(
 				ctx.local_root,
 				to_path,
 				base.as_deref(),
+				ctx.bin_day,
 				report,
 				&mut *observer,
 			)
@@ -3285,6 +3291,7 @@ async fn stash_local_target(
 	local_root: &Path,
 	rel_path: &str,
 	base: Option<&BaselineEntry>,
+	bin_day: NaiveDate,
 ) -> Result<Option<PathBuf>, crate::Error> {
 	let path = local_path(local_root, rel_path);
 	let base = base.cloned();
@@ -3293,7 +3300,7 @@ async fn stash_local_target(
 			.await
 			.map_err(|e| internal_owned(format!("reading a local write target panicked: {e}")))?;
 	if unsynced {
-		return quarantine_local(local_root, rel_path);
+		return quarantine_local(local_root, rel_path, bin_day);
 	}
 	Ok(None)
 }
@@ -3756,31 +3763,6 @@ async fn delete_baseline(ctx: &ApplyContext<'_>, rel_path: &str) -> Result<(), c
 		.map_err(db_err)
 }
 
-/// Move a locally-deleted item into the pair's quarantine dir (recoverable) rather than destroying
-/// it. The original tree position is preserved under the quarantine root. The destination is made
-/// UNIQUE on collision (` (N)` suffix): two deletions at the same path over time must not overwrite
-/// each other (data loss), and renaming a directory onto an existing non-empty quarantine entry
-/// would otherwise fail and wedge the pass forever (a re-failing, never-advancing deletion).
-///
-/// Returns where the item went, so a caller whose write then does NOT happen can put it back (see
-/// [`restore_stashed`]); `None` when there was nothing to move.
-pub(super) fn quarantine_local(
-	root: &Path,
-	rel_path: &str,
-) -> Result<Option<PathBuf>, crate::Error> {
-	let source = local_path(root, rel_path);
-	// A missing source is a no-op — e.g. it already moved as part of an ancestor's quarantine.
-	if source.symlink_metadata().is_err() {
-		return Ok(None);
-	}
-	let dest = unique_quarantine_dest(local_path(&root.join(QUARANTINE_DIR), rel_path));
-	if let Some(parent) = dest.parent() {
-		std::fs::create_dir_all(parent).map_err(io_err)?;
-	}
-	std::fs::rename(&source, &dest).map_err(io_err)?;
-	Ok(Some(dest))
-}
-
 /// Put a [`stash_local_target`] back where it came from, for a write that never landed after all —
 /// a download the pair's pause dropped mid-flight. Without this the path is left EMPTY: the next
 /// pass reads a baseline row with nothing on disk as a local deletion and conflicts over a
@@ -3824,6 +3806,7 @@ async fn stash_move_target(
 	local_root: &Path,
 	to_path: &str,
 	base: Option<&BaselineEntry>,
+	bin_day: NaiveDate,
 	report: &mut SyncReport,
 	observer: &mut (dyn FnMut(SyncEvent) + Send),
 ) -> Result<(), crate::Error> {
@@ -3831,7 +3814,7 @@ async fn stash_move_target(
 		return Ok(());
 	}
 	// The rename that follows always lands, so nothing here is ever put back.
-	let stashed = stash_local_target(local_root, to_path, base).await?;
+	let stashed = stash_local_target(local_root, to_path, base, bin_day).await?;
 	note_quarantined(
 		report,
 		observer,
@@ -3852,30 +3835,7 @@ fn has_own_directory_entry(path: &Path) -> bool {
 	})
 }
 
-/// A quarantine destination that does not already exist: `base`, else `base (1)`, `base (2)`, ...
-/// (the suffix is appended to the whole file name, which is fine for a recovery bin).
-fn unique_quarantine_dest(base: PathBuf) -> PathBuf {
-	if base.symlink_metadata().is_err() {
-		return base;
-	}
-	let parent = base
-		.parent()
-		.map(Path::to_path_buf)
-		.unwrap_or_else(|| PathBuf::from("."));
-	let name = base
-		.file_name()
-		.and_then(|n| n.to_str())
-		.unwrap_or("quarantined");
-	for n in 1..100_000 {
-		let candidate = parent.join(format!("{name} ({n})"));
-		if candidate.symlink_metadata().is_err() {
-			return candidate;
-		}
-	}
-	base
-}
-
-fn io_err(error: std::io::Error) -> crate::Error {
+pub(super) fn io_err(error: std::io::Error) -> crate::Error {
 	crate::Error::custom_with_source(crate::ErrorKind::IO, error, None::<String>)
 }
 
