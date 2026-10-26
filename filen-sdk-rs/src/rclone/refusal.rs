@@ -26,6 +26,22 @@ pub enum RcloneRefusal {
 	/// run at all.
 	#[error("the rclone watchdog could not be started")]
 	WatchdogUnavailable,
+	/// The system has no mount backend: WinFsp on Windows, FUSE 3 on Linux. macOS always has one.
+	#[error("no FUSE is installed")]
+	FuseMissing,
+	/// Something is mounted at the mount point already.
+	#[error("the mount point is in use")]
+	MountPointInUse,
+	/// The mount point directory is not empty.
+	#[error("the mount point is not empty")]
+	MountPointNotEmpty,
+	/// The mount point is not an existing directory by an absolute path that is not a symlink, or
+	/// on Windows not a drive letter.
+	#[error("the mount point is not a usable directory or drive letter")]
+	MountPointInvalid,
+	/// The drive letter is taken by another drive.
+	#[error("the drive letter is in use")]
+	DriveLetterInUse,
 }
 
 impl RcloneRefusal {
@@ -35,7 +51,12 @@ impl RcloneRefusal {
 			Self::BinaryMissing
 			| Self::BinaryChecksum
 			| Self::UnsupportedVersion { .. }
-			| Self::WatchdogUnavailable => ErrorKind::IO,
+			| Self::WatchdogUnavailable
+			| Self::FuseMissing
+			| Self::MountPointInUse
+			| Self::MountPointNotEmpty
+			| Self::MountPointInvalid
+			| Self::DriveLetterInUse => ErrorKind::IO,
 		}
 	}
 }

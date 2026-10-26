@@ -14,7 +14,7 @@ use super::{
 };
 use crate::{
 	ErrorKind,
-	rclone::{RcloneBinary, RcloneRefusal},
+	rclone::{RcloneBinary, RcloneRefusal, VfsTuning},
 };
 
 fn sdk_config() -> FilenSDKConfig {
@@ -45,6 +45,7 @@ fn daemon_config(log_file: Option<PathBuf>) -> RcloneDaemonConfig {
 		cache_dir: PathBuf::from("/home/user/.filen/mounts/cache"),
 		log_file,
 		user_agent: "filen-desktop/4.0.0".to_owned(),
+		vfs: VfsTuning::default(),
 	}
 }
 

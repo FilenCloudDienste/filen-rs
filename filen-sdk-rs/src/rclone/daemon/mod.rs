@@ -54,8 +54,9 @@ use crate::{
 		binary::{MIN_RCLONE, parse_version},
 		private_file::write_private_file,
 		rc::{CoreStatsTransfer, RcClient},
-		recovery::{HTPASSWD_FILE, PIDFILE, PidRecord, recover_stale},
+		recovery::{HTPASSWD_FILE, PIDFILE, PidRecord, force_unmount, recover_stale},
 		system::identify,
+		vfs::VfsTuning,
 		watchdog::{self, Watchdog},
 	},
 };
@@ -123,6 +124,8 @@ pub struct RcloneDaemonConfig {
 	pub log_file: Option<PathBuf>,
 	/// The user agent rclone sends.
 	pub user_agent: String,
+	/// The VFS cache's limits, the same for every mount and serve.
+	pub vfs: VfsTuning,
 }
 
 /// How an [`RcloneDaemon`]'s rclone ended.
@@ -153,6 +156,8 @@ pub struct RcloneStats {
 	pub out_of_space: bool,
 	/// The transfers running now.
 	pub transfers: Vec<RcloneTransfer>,
+	/// The mount points rclone has mounted.
+	pub mounts: Vec<String>,
 }
 
 /// One running transfer.
@@ -195,7 +200,7 @@ pub struct StopReport {
 /// Every method takes `&self`, so a binding can share one daemon between calls: after
 /// [`RcloneDaemon::stop`] the others fail, as rc no longer answers.
 pub struct RcloneDaemon {
-	rc: RcClient,
+	pub(super) rc: RcClient,
 	pid: u32,
 	exit: watch::Receiver<Option<RcloneExit>>,
 	/// Firing it, or dropping it with the daemon, makes the task supervising rclone kill it.
@@ -203,10 +208,35 @@ pub struct RcloneDaemon {
 	/// Set before rclone is stopped or killed on purpose, so its exit is not taken for a crash.
 	stopping: Arc<AtomicBool>,
 	htpasswd: Htpasswd,
-	/// `None` until rclone is configured, and again once it is stopped: dropping it disarms it.
-	watchdog: Mutex<Option<Watchdog>>,
+	/// What a crash must be recovered from. `None` until rclone is configured and again once it
+	/// is stopped. Held through every mount and unmount, which it records, so they run one at a
+	/// time.
+	pub(super) guard: tokio::sync::Mutex<Option<Guard>>,
 	/// The pidfile, written once the watchdog is armed and removed once rclone is stopped.
-	pidfile: PathBuf,
+	pub(super) pidfile: PathBuf,
+	/// The VFS options every role gets.
+	pub(super) vfs: VfsTuning,
+}
+
+/// The pidfile's record of the running rclone, and the watchdog armed for the same mounts.
+pub(super) struct Guard {
+	pub(super) record: PidRecord,
+	/// Dropping it disarms it.
+	watchdog: Watchdog,
+}
+
+impl Guard {
+	/// Records the mounts in `self.record` as rclone's: arms a watchdog for them before the one
+	/// for the old set is disarmed, so there is always one, and rewrites the pidfile.
+	pub(super) fn record_mounts(&mut self, pidfile: &Path) -> Result<(), Error> {
+		self.watchdog = watchdog::arm(
+			std::process::id(),
+			self.record.pid,
+			self.record.started_at,
+			&self.record.mounts,
+		)?;
+		self.record.write(pidfile)
+	}
 }
 
 /// The backend and options both remotes are created with. Holds the account's keys, so it has no
@@ -298,16 +328,17 @@ impl RcloneDaemon {
 		let rclone = identify(self.pid).await?.ok_or_else(|| {
 			Error::custom(ErrorKind::IO, "rclone rcd exited while it was configured")
 		})?;
-		let armed = watchdog::arm(std::process::id(), self.pid, rclone.started_at, &[])?;
-		*self.watchdog.lock().unwrap_or_else(PoisonError::into_inner) = Some(armed);
-		PidRecord {
+		let record = PidRecord {
 			pid: self.pid,
 			started_at: rclone.started_at,
 			// What the system reports, which is what a later recovery compares it with.
 			binary: rclone.exe.unwrap_or_else(|| binary.to_path_buf()),
 			mounts: Vec::new(),
-		}
-		.write(&self.pidfile)
+		};
+		let watchdog = watchdog::arm(std::process::id(), self.pid, record.started_at, &[])?;
+		record.write(&self.pidfile)?;
+		*self.guard.lock().await = Some(Guard { record, watchdog });
+		Ok(())
 	}
 
 	/// Starts rclone until one answers on rc, returning it with the version it reported. Only an
@@ -394,8 +425,9 @@ impl RcloneDaemon {
 			kill: Mutex::new(Some(kill)),
 			stopping,
 			htpasswd,
-			watchdog: Mutex::new(None),
+			guard: tokio::sync::Mutex::new(None),
 			pidfile: config.state_dir.join(PIDFILE),
+			vfs: config.vfs,
 		})
 	}
 
@@ -456,6 +488,7 @@ impl RcloneDaemon {
 			cache_bytes_used: 0,
 			out_of_space: false,
 			transfers: Vec::new(),
+			mounts: Vec::new(),
 		};
 		for fs in self.rc.vfs_list().await?.vfses {
 			let Some(cache) = self.rc.vfs_stats(&fs).await?.disk_cache else {
@@ -483,6 +516,14 @@ impl RcloneDaemon {
 			.into_iter()
 			.map(RcloneTransfer::from)
 			.collect();
+		stats.mounts = self
+			.rc
+			.mount_listmounts()
+			.await?
+			.mount_points
+			.into_iter()
+			.map(|mount| mount.mount_point)
+			.collect();
 		Ok(stats)
 	}
 
@@ -499,6 +540,8 @@ impl RcloneDaemon {
 	/// within `grace_ms`. A step that fails is logged and the next one runs; the daemon is
 	/// stopped when this returns.
 	pub async fn stop(&self, options: StopOptions) -> Result<StopReport, Error> {
+		// Waits for a mount or unmount in progress, and keeps new ones out.
+		let mut guard = self.guard.lock().await;
 		self.stopping.store(true, Ordering::Release);
 		if let Err(e) = self.rc.serve_stopall().await {
 			warn!("stopping rclone's serves failed: {e}");
@@ -525,13 +568,16 @@ impl RcloneDaemon {
 			self.exited().await;
 		}
 		self.htpasswd.remove();
-		// rclone is gone: the watchdog has nothing left to guard, nor the pidfile to name.
-		drop(
-			self.watchdog
-				.lock()
-				.unwrap_or_else(PoisonError::into_inner)
-				.take(),
-		);
+		// rclone is gone: the watchdog has nothing left to guard, nor the pidfile to name. A mount
+		// rclone did not take down with it is stale now.
+		if let Some(Guard { record, watchdog }) = guard.take() {
+			drop(watchdog);
+			for mount in record.mounts {
+				if let Err(e) = force_unmount(Path::new(&mount)).await {
+					warn!("force-unmounting {mount} after rclone stopped failed: {e}");
+				}
+			}
+		}
 		if let Err(e) = std::fs::remove_file(&self.pidfile)
 			&& e.kind() != std::io::ErrorKind::NotFound
 		{

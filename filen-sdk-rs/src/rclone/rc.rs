@@ -94,6 +94,18 @@ pub(crate) struct VfsDiskCache {
 	pub(crate) out_of_space: bool,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ListMounts {
+	pub(crate) mount_points: Vec<ListedMount>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct ListedMount {
+	#[serde(rename = "MountPoint")]
+	pub(crate) mount_point: String,
+}
+
 /// What a call answered with when the caller needs nothing from it.
 #[derive(Debug, Deserialize)]
 pub(crate) struct Ignored {}
@@ -200,6 +212,39 @@ impl RcClient {
 		)
 		.await?;
 		Ok(())
+	}
+
+	/// Mounts `fs` at `mount_point` with the `mountType` `mount_type` and the given options.
+	pub(crate) async fn mount_mount(
+		&self,
+		fs: &str,
+		mount_point: &str,
+		mount_type: &str,
+		vfs_opt: &Value,
+		mount_opt: &Value,
+	) -> Result<(), Error> {
+		self.call::<Ignored>(
+			"mount/mount",
+			&json!({
+				"fs": fs,
+				"mountPoint": mount_point,
+				"mountType": mount_type,
+				"vfsOpt": vfs_opt,
+				"mountOpt": mount_opt,
+			}),
+		)
+		.await?;
+		Ok(())
+	}
+
+	pub(crate) async fn mount_unmount(&self, mount_point: &str) -> Result<(), Error> {
+		self.call::<Ignored>("mount/unmount", &json!({ "mountPoint": mount_point }))
+			.await?;
+		Ok(())
+	}
+
+	pub(crate) async fn mount_listmounts(&self) -> Result<ListMounts, Error> {
+		self.call("mount/listmounts", &json!({})).await
 	}
 
 	pub(crate) async fn mount_unmountall(&self) -> Result<(), Error> {

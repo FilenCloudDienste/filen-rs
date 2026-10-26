@@ -7,6 +7,8 @@
 
 mod binary;
 mod daemon;
+mod fuse;
+mod mount;
 #[cfg(feature = "rclone-managed")]
 pub mod network_drive;
 mod private_file;
@@ -20,6 +22,7 @@ mod refusal;
 #[cfg(feature = "rclone-managed")]
 pub mod serve;
 mod system;
+mod vfs;
 mod watchdog;
 
 pub use binary::RcloneBinary;
@@ -27,5 +30,8 @@ pub use daemon::{
 	RcloneDaemon, RcloneDaemonConfig, RcloneExit, RcloneStats, RcloneTransfer, StopOptions,
 	StopReport,
 };
+pub use fuse::{FuseProvider, FuseStatus, fuse_status};
+pub use mount::{MountInfo, MountOptions, available_drive_letters};
 pub use recovery::{StaleRecovery, force_unmount, recover_stale, stop_rclone_under};
 pub use refusal::RcloneRefusal;
+pub use vfs::VfsTuning;

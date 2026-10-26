@@ -10,8 +10,8 @@ use std::{
 };
 
 use filen_sdk_rs::rclone::{
-	RcloneBinary, RcloneDaemon, RcloneDaemonConfig, RcloneExit, RcloneRefusal, StopOptions,
-	StopReport, stop_rclone_under,
+	MountOptions, RcloneBinary, RcloneDaemon, RcloneDaemonConfig, RcloneExit, RcloneRefusal,
+	StopOptions, StopReport, VfsTuning, stop_rclone_under,
 };
 use serde_json::json;
 use tempfile::TempDir;
@@ -48,17 +48,36 @@ fn managed_binary() -> RcloneBinary {
 /// A daemon's directories, removed with it.
 struct Dirs {
 	root: TempDir,
+	/// Forced off before the directories are removed, so a failed test leaves no mount behind
+	/// (removing a stale mount's directory blocks).
+	mount_points: std::sync::Mutex<Vec<String>>,
 }
 
 impl Dirs {
 	fn new() -> Self {
 		let root = tempfile::tempdir().unwrap();
 		std::fs::create_dir(root.path().join("remote")).unwrap();
-		Self { root }
+		Self {
+			root,
+			mount_points: std::sync::Mutex::default(),
+		}
 	}
 
 	fn remote(&self) -> PathBuf {
 		self.root.path().join("remote")
+	}
+
+	/// An empty mount point, by its resolved path, which is what the system lists mounts by.
+	fn mount_point(&self, name: &str) -> String {
+		let path = self.root.path().join(name);
+		std::fs::create_dir(&path).unwrap();
+		let mount_point = std::fs::canonicalize(path)
+			.unwrap()
+			.into_os_string()
+			.into_string()
+			.unwrap();
+		self.mount_points.lock().unwrap().push(mount_point.clone());
+		mount_point
 	}
 
 	fn state(&self) -> PathBuf {
@@ -72,6 +91,7 @@ impl Dirs {
 			cache_dir: self.root.path().join("cache"),
 			log_file: Some(self.root.path().join("rclone.log")),
 			user_agent: "filen-rs-tests".to_owned(),
+			vfs: VfsTuning::default(),
 		}
 	}
 
@@ -79,6 +99,24 @@ impl Dirs {
 		RcloneDaemon::start_local_for_test(self.config(), &self.remote())
 			.await
 			.unwrap()
+	}
+}
+
+impl Drop for Dirs {
+	fn drop(&mut self) {
+		for mount_point in self.mount_points.lock().unwrap().iter() {
+			let (program, args): (&str, &[&str]) = if cfg!(target_os = "macos") {
+				("/sbin/umount", &["-f"])
+			} else {
+				("fusermount3", &["-uz"])
+			};
+			// Nothing mounted there is the usual case, and its failure is expected.
+			let _ = std::process::Command::new(program)
+				.args(args)
+				.arg(mount_point)
+				.stderr(std::process::Stdio::null())
+				.status();
+		}
 	}
 }
 
@@ -310,6 +348,232 @@ async fn wait_for_exec(child: &tokio::process::Child, program: &Path) {
 		tokio::time::sleep(Duration::from_millis(20)).await;
 	}
 	panic!("{} did not start", program.display());
+}
+
+fn read_write(mount_point: &str) -> MountOptions {
+	MountOptions {
+		mount_point: mount_point.to_owned(),
+		read_only: false,
+	}
+}
+
+/// Waits up to `timeout` for `path` to hold `content`.
+async fn eventually_holds(path: &Path, content: &str, timeout: Duration) -> bool {
+	let deadline = tokio::time::Instant::now() + timeout;
+	while tokio::time::Instant::now() < deadline {
+		if tokio::fs::read_to_string(path)
+			.await
+			.is_ok_and(|read| read == content)
+		{
+			return true;
+		}
+		tokio::time::sleep(Duration::from_millis(200)).await;
+	}
+	false
+}
+
+fn kill_9(pid: u32) {
+	let killed = std::process::Command::new("kill")
+		.args(["-9", &pid.to_string()])
+		.status()
+		.unwrap();
+	assert!(killed.success());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_mount_writes_through_to_the_remote_and_unmounts() {
+	let dirs = Dirs::new();
+	let daemon = dirs.start().await;
+	let mount_point = dirs.mount_point("drive");
+
+	let info = daemon.mount(read_write(&mount_point)).await.unwrap();
+
+	assert_eq!(info.mount_point, mount_point);
+	assert_eq!(
+		daemon.stats().await.unwrap().mounts,
+		std::slice::from_ref(&mount_point)
+	);
+	tokio::fs::write(Path::new(&mount_point).join("file.txt"), "content")
+		.await
+		.unwrap();
+	assert_eq!(
+		tokio::fs::read_to_string(Path::new(&mount_point).join("file.txt"))
+			.await
+			.unwrap(),
+		"content"
+	);
+	// Uploaded once the VFS cache's write-back delay (5 s) has passed.
+	assert!(
+		eventually_holds(
+			&dirs.remote().join("file.txt"),
+			"content",
+			Duration::from_secs(20)
+		)
+		.await
+	);
+
+	daemon.unmount(&mount_point).await.unwrap();
+
+	assert_eq!(daemon.stats().await.unwrap().mounts, Vec::<String>::new());
+	assert_eq!(std::fs::read_dir(&mount_point).unwrap().count(), 0);
+	daemon.stop(GRACEFUL).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_mount_point_in_use_is_refused() {
+	let dirs = Dirs::new();
+	let daemon = dirs.start().await;
+	let mount_point = dirs.mount_point("drive");
+	daemon.mount(read_write(&mount_point)).await.unwrap();
+
+	let error = daemon.mount(read_write(&mount_point)).await.unwrap_err();
+
+	assert_eq!(
+		error.downcast_ref::<RcloneRefusal>(),
+		Some(&RcloneRefusal::MountPointInUse)
+	);
+	daemon.stop(GRACEFUL).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stop_drains_pending_uploads_within_the_timeout() {
+	let dirs = Dirs::new();
+	let daemon = dirs.start().await;
+	let mount_point = dirs.mount_point("drive");
+	daemon.mount(read_write(&mount_point)).await.unwrap();
+	tokio::fs::write(Path::new(&mount_point).join("file.txt"), "content")
+		.await
+		.unwrap();
+
+	let report = daemon
+		.stop(StopOptions {
+			drain_timeout_ms: Some(30_000),
+			grace_ms: 10_000,
+		})
+		.await
+		.unwrap();
+
+	assert_eq!(
+		report,
+		StopReport {
+			pending_uploads: 0,
+			forced: false
+		}
+	);
+	assert_eq!(
+		std::fs::read_to_string(dirs.remote().join("file.txt")).unwrap(),
+		"content"
+	);
+	assert_eq!(std::fs::read_dir(&mount_point).unwrap().count(), 0);
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dirty_cache_item_is_uploaded_on_the_next_start() {
+	let dirs = Dirs::new();
+	let mount_point = dirs.mount_point("drive");
+	let crashed = dirs.start().await;
+	crashed.mount(read_write(&mount_point)).await.unwrap();
+	tokio::fs::write(Path::new(&mount_point).join("file.txt"), "content")
+		.await
+		.unwrap();
+	// Well inside the 5 s write-back delay: the file is only in the cache.
+	kill_9(crashed.pid());
+	tokio::time::timeout(Duration::from_secs(10), crashed.exited())
+		.await
+		.unwrap();
+	drop(crashed);
+	assert!(!dirs.remote().join("file.txt").exists());
+
+	// The new daemon finds the crashed one's mount stale and forces it off, and the mount
+	// creates the VFS that finds the file in the cache.
+	let daemon = dirs.start().await;
+	daemon.mount(read_write(&mount_point)).await.unwrap();
+
+	assert!(
+		eventually_holds(
+			&dirs.remote().join("file.txt"),
+			"content",
+			Duration::from_secs(30)
+		)
+		.await
+	);
+	daemon.stop(GRACEFUL).await.unwrap();
+}
+
+// Linux only: macOS's NFS client keeps answering `stat` from its attribute cache for a few seconds
+// after rclone dies, so there a stale mount without a pidfile first reads as in use. The pidfile's
+// recovery and the watchdog are what take it down on macOS.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stale_mount_is_force_unmounted_before_mounting() {
+	let dirs = Dirs::new();
+	let mount_point = dirs.mount_point("drive");
+	let crashed = dirs.start().await;
+	crashed.mount(read_write(&mount_point)).await.unwrap();
+	kill_9(crashed.pid());
+	tokio::time::timeout(Duration::from_secs(10), crashed.exited())
+		.await
+		.unwrap();
+	drop(crashed);
+	// Without the pidfile no recovery runs at start, so the mount itself meets the stale mount.
+	std::fs::remove_file(dirs.state().join("rcd.json")).unwrap();
+	let daemon = dirs.start().await;
+
+	daemon.mount(read_write(&mount_point)).await.unwrap();
+
+	assert_eq!(daemon.stats().await.unwrap().mounts, [mount_point]);
+	daemon.stop(GRACEFUL).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_mount_and_a_serve_share_one_vfs() {
+	let dirs = Dirs::new();
+	let daemon = dirs.start().await;
+	let mount_point = dirs.mount_point("drive");
+	daemon.mount(read_write(&mount_point)).await.unwrap();
+	let port = port_check::free_local_ipv4_port().unwrap();
+
+	// The command-line spelling of `VfsTuning::default()` and the fixed VFS options mounts get.
+	daemon
+		.rc_call_for_test(
+			"serve/start",
+			&json!({
+				"type": "webdav",
+				"fs": "Filen:",
+				"addr": format!("127.0.0.1:{port}"),
+				"user": "user",
+				"pass": "pass",
+				"vfs_cache_mode": "full",
+				"vfs_cache_max_size": "34359738368B",
+				"vfs_cache_min_free_space": "17179869184B",
+				"vfs_cache_max_age": "720h",
+				"dir_cache_time": "15s",
+				"vfs_write_back": "5s",
+				"vfs_read_chunk_size": "64Mi",
+				"vfs_read_chunk_streams": "8",
+				"vfs_read_ahead": "128Mi",
+				"file_perms": "0666",
+				"dir_perms": "0777",
+				"no_checksum": "true",
+				"read_only": "false",
+			}),
+		)
+		.await
+		.unwrap();
+
+	let vfses = daemon
+		.rc_call_for_test("vfs/list", &json!({}))
+		.await
+		.unwrap();
+	let fs = vfses["vfses"][0].as_str().unwrap().to_owned();
+	let stats = daemon
+		.rc_call_for_test("vfs/stats", &json!({ "fs": fs }))
+		.await
+		.unwrap();
+	assert_eq!(vfses["vfses"].as_array().unwrap().len(), 1, "{vfses}");
+	assert_eq!(stats["inUse"], json!(2), "{stats}");
+	daemon.stop(GRACEFUL).await.unwrap();
 }
 
 fn files_named_conf(dir: &Path) -> Vec<PathBuf> {
