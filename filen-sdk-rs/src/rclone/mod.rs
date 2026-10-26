@@ -15,13 +15,17 @@ mod rc;
 pub mod rclone_installation;
 #[cfg(feature = "rclone-managed")]
 mod rclone_rc_api;
+mod recovery;
 mod refusal;
 #[cfg(feature = "rclone-managed")]
 pub mod serve;
+mod system;
+mod watchdog;
 
 pub use binary::RcloneBinary;
 pub use daemon::{
 	RcloneDaemon, RcloneDaemonConfig, RcloneExit, RcloneStats, RcloneTransfer, StopOptions,
 	StopReport,
 };
+pub use recovery::{StaleRecovery, force_unmount, recover_stale, stop_rclone_under};
 pub use refusal::RcloneRefusal;

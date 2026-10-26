@@ -22,15 +22,20 @@ pub enum RcloneRefusal {
 		MIN_RCLONE.2
 	)]
 	UnsupportedVersion { found: String },
+	/// The watchdog that stops rclone when its host dies could not be started, so rclone is not
+	/// run at all.
+	#[error("the rclone watchdog could not be started")]
+	WatchdogUnavailable,
 }
 
 impl RcloneRefusal {
 	/// The error kind a refusal is returned as: [`ErrorKind::IO`] for what is wrong on this machine.
 	pub fn kind(&self) -> ErrorKind {
 		match self {
-			Self::BinaryMissing | Self::BinaryChecksum | Self::UnsupportedVersion { .. } => {
-				ErrorKind::IO
-			}
+			Self::BinaryMissing
+			| Self::BinaryChecksum
+			| Self::UnsupportedVersion { .. }
+			| Self::WatchdogUnavailable => ErrorKind::IO,
 		}
 	}
 }

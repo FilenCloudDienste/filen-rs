@@ -41,6 +41,10 @@ use tokio::{
 };
 use tracing::{info, warn};
 
+#[cfg(windows)]
+use crate::rclone::system::CREATE_NO_WINDOW;
+#[cfg(unix)]
+use crate::rclone::system::with_system_path;
 use crate::{
 	Error, ErrorKind,
 	auth::Client,
@@ -50,6 +54,9 @@ use crate::{
 		binary::{MIN_RCLONE, parse_version},
 		private_file::write_private_file,
 		rc::{CoreStatsTransfer, RcClient},
+		recovery::{HTPASSWD_FILE, PIDFILE, PidRecord, recover_stale},
+		system::identify,
+		watchdog::{self, Watchdog},
 	},
 };
 
@@ -98,16 +105,6 @@ const TRANSFER_ARGS: [&str; 19] = [
 	"--log-level",
 	"INFO",
 ];
-
-/// The directories a mount needs on `PATH`: nfsmount runs `mount` and `umount` from `/sbin`, and
-/// fuse3 `fusermount3` from `/usr/bin`. An app started from a desktop launcher may get a `PATH`
-/// without them.
-#[cfg(unix)]
-const SYSTEM_PATH: [&str; 4] = ["/usr/bin", "/bin", "/usr/sbin", "/sbin"];
-
-/// <https://learn.microsoft.com/en-us/windows/win32/procthread/process-creation-flags>
-#[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// How to start an [`RcloneDaemon`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -206,6 +203,10 @@ pub struct RcloneDaemon {
 	/// Set before rclone is stopped or killed on purpose, so its exit is not taken for a crash.
 	stopping: Arc<AtomicBool>,
 	htpasswd: Htpasswd,
+	/// `None` until rclone is configured, and again once it is stopped: dropping it disarms it.
+	watchdog: Mutex<Option<Watchdog>>,
+	/// The pidfile, written once the watchdog is armed and removed once rclone is stopped.
+	pidfile: PathBuf,
 }
 
 /// The backend and options both remotes are created with. Holds the account's keys, so it has no
@@ -273,6 +274,10 @@ impl RcloneDaemon {
 		let binary = config.binary.resolve().await?;
 		create_private_dir(&config.state_dir).await?;
 		create_private_dir(&config.cache_dir).await?;
+		let recovered = recover_stale(&config.state_dir).await?;
+		if recovered.stopped || !recovered.unmounted.is_empty() {
+			info!("recovered from a crashed rclone daemon: {recovered:?}");
+		}
 
 		let password = hex::encode(rand::random::<[u8; 32]>());
 		let (daemon, version) = Self::spawn_until_ready(&binary, &config, &password).await?;
@@ -284,7 +289,25 @@ impl RcloneDaemon {
 				.await
 				.context(format!("failed to create rclone's {name} remote"))?;
 		}
+		daemon.guard(&binary).await?;
 		Ok(daemon)
+	}
+
+	/// Arms the watchdog for the running rclone and writes the pidfile that names it.
+	async fn guard(&self, binary: &Path) -> Result<(), Error> {
+		let rclone = identify(self.pid).await?.ok_or_else(|| {
+			Error::custom(ErrorKind::IO, "rclone rcd exited while it was configured")
+		})?;
+		let armed = watchdog::arm(std::process::id(), self.pid, rclone.started_at, &[])?;
+		*self.watchdog.lock().unwrap_or_else(PoisonError::into_inner) = Some(armed);
+		PidRecord {
+			pid: self.pid,
+			started_at: rclone.started_at,
+			// What the system reports, which is what a later recovery compares it with.
+			binary: rclone.exe.unwrap_or_else(|| binary.to_path_buf()),
+			mounts: Vec::new(),
+		}
+		.write(&self.pidfile)
 	}
 
 	/// Starts rclone until one answers on rc, returning it with the version it reported. Only an
@@ -371,6 +394,8 @@ impl RcloneDaemon {
 			kill: Mutex::new(Some(kill)),
 			stopping,
 			htpasswd,
+			watchdog: Mutex::new(None),
+			pidfile: config.state_dir.join(PIDFILE),
 		})
 	}
 
@@ -500,6 +525,18 @@ impl RcloneDaemon {
 			self.exited().await;
 		}
 		self.htpasswd.remove();
+		// rclone is gone: the watchdog has nothing left to guard, nor the pidfile to name.
+		drop(
+			self.watchdog
+				.lock()
+				.unwrap_or_else(PoisonError::into_inner)
+				.take(),
+		);
+		if let Err(e) = std::fs::remove_file(&self.pidfile)
+			&& e.kind() != std::io::ErrorKind::NotFound
+		{
+			warn!("removing {} failed: {e}", self.pidfile.display());
+		}
 		Ok(StopReport {
 			pending_uploads: pending,
 			forced,
@@ -642,23 +679,6 @@ fn environment_overrides(
 	overrides
 }
 
-/// `path` with every one of [`SYSTEM_PATH`] it lacks appended.
-#[cfg(unix)]
-fn with_system_path(path: Option<OsString>) -> OsString {
-	let mut dirs: Vec<PathBuf> = path
-		.as_deref()
-		.map(|path| std::env::split_paths(path).collect())
-		.unwrap_or_default();
-	for dir in SYSTEM_PATH {
-		if !dirs.iter().any(|known| known == Path::new(dir)) {
-			dirs.push(dir.into());
-		}
-	}
-	// The entries came from splitting a PATH, or are the constants above, so none holds the
-	// separator that would make joining them fail.
-	std::env::join_paths(dirs).unwrap_or_else(|_| path.unwrap_or_default())
-}
-
 /// Waits for rclone to exit, killing it first when `kill` fires or its sender is dropped, and
 /// publishes how it ended.
 async fn supervise(
@@ -755,7 +775,7 @@ struct Htpasswd {
 
 impl Htpasswd {
 	fn write(state_dir: &Path, password: &str) -> Result<Self, Error> {
-		let path = state_dir.join("rc.htpasswd");
+		let path = state_dir.join(HTPASSWD_FILE);
 		write_private_file(&path, &htpasswd_line(RC_USER, password))
 			.context(format!("failed to write {}", path.display()))?;
 		Ok(Self { path })

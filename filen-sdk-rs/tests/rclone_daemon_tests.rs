@@ -11,7 +11,7 @@ use std::{
 
 use filen_sdk_rs::rclone::{
 	RcloneBinary, RcloneDaemon, RcloneDaemonConfig, RcloneExit, RcloneRefusal, StopOptions,
-	StopReport,
+	StopReport, stop_rclone_under,
 };
 use serde_json::json;
 use tempfile::TempDir;
@@ -216,6 +216,100 @@ async fn a_missing_bundled_binary_starts_nothing() {
 		Some(&RcloneRefusal::BinaryMissing)
 	);
 	assert!(!dirs.state().exists());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_pidfile_names_rclone_until_it_is_stopped() {
+	let dirs = Dirs::new();
+	let daemon = dirs.start().await;
+	let pidfile = dirs.state().join("rcd.json");
+
+	let record: serde_json::Value =
+		serde_json::from_slice(&std::fs::read(&pidfile).unwrap()).unwrap();
+	assert_eq!(record["pid"], json!(daemon.pid()));
+	assert_eq!(record["mounts"], json!([]));
+
+	daemon.stop(GRACEFUL).await.unwrap();
+	assert!(!pidfile.exists());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_new_daemon_stops_the_rclone_a_crashed_host_left() {
+	let dirs = Dirs::new();
+	let crashed = dirs.start().await;
+	let stale_pid = crashed.pid();
+	// What a crashed host leaves: rclone running, its pidfile in place, the watchdog armed.
+	std::mem::forget(crashed);
+
+	let daemon = dirs.start().await;
+
+	assert!(!process_is_running(stale_pid));
+	assert_ne!(daemon.pid(), stale_pid);
+	daemon.stop(GRACEFUL).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stop_rclone_under_ignores_other_binaries() {
+	let dirs = Dirs::new();
+	let rclone = binary().resolve().await.unwrap();
+	let old_bin = dirs.root.path().join("old-client").join("bin");
+	std::fs::create_dir_all(&old_bin).unwrap();
+	let old_rclone = old_bin.join("rclone");
+	std::fs::copy(&rclone, &old_rclone).unwrap();
+	let mut old = idle_rcd(&old_rclone);
+	let mut other = idle_rcd(&rclone);
+	wait_for_exec(&old, &old_rclone).await;
+
+	let stopped = stop_rclone_under(&old_bin, 5_000).await.unwrap();
+
+	assert_eq!(stopped, 1);
+	tokio::time::timeout(Duration::from_secs(5), old.wait())
+		.await
+		.expect("the old client's rclone is still running")
+		.unwrap();
+	assert!(
+		tokio::time::timeout(Duration::from_millis(500), other.wait())
+			.await
+			.is_err(),
+		"an rclone outside the directory was stopped"
+	);
+}
+
+/// An `rclone rcd` that does nothing until it is stopped.
+fn idle_rcd(program: &Path) -> tokio::process::Child {
+	tokio::process::Command::new(program)
+		.args([
+			"rcd",
+			"--config",
+			"",
+			"--rc-addr",
+			"127.0.0.1:0",
+			"--rc-no-auth",
+		])
+		.stdout(std::process::Stdio::null())
+		.stderr(std::process::Stdio::null())
+		.kill_on_drop(true)
+		.spawn()
+		.unwrap()
+}
+
+/// Waits until `child`'s executable is `program`: right after the spawn it may still be a fork of
+/// the test binary.
+async fn wait_for_exec(child: &tokio::process::Child, program: &Path) {
+	let pid = sysinfo::Pid::from_u32(child.id().unwrap());
+	for _ in 0..100 {
+		let mut system = sysinfo::System::new();
+		system.refresh_processes_specifics(
+			sysinfo::ProcessesToUpdate::Some(&[pid]),
+			true,
+			sysinfo::ProcessRefreshKind::nothing().with_exe(sysinfo::UpdateKind::Always),
+		);
+		if system.process(pid).and_then(sysinfo::Process::exe) == Some(program) {
+			return;
+		}
+		tokio::time::sleep(Duration::from_millis(20)).await;
+	}
+	panic!("{} did not start", program.display());
 }
 
 fn files_named_conf(dir: &Path) -> Vec<PathBuf> {
