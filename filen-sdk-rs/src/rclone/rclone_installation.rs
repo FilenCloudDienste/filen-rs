@@ -2,7 +2,6 @@
 //! Responsible for downloading the binary, writing config files
 //! and executing Rclone commands.
 
-use filen_sdk_rs::{Error, ErrorKind, auth::Client, error::ResultExt as _};
 use hex_literal::hex;
 use port_check::free_local_ipv4_port;
 use sha2::{Digest as _, Sha256};
@@ -19,7 +18,9 @@ use tokio::{
 };
 use tracing::{debug, info};
 
-use crate::rclone_rc_api::RcloneApiClient;
+use crate::{
+	Error, ErrorKind, auth::Client, error::ResultExt as _, rclone::rclone_rc_api::RcloneApiClient,
+};
 
 pub struct RcloneInstallationConfig {
 	/// Where the Rclone config and other files (cache, ...) will be stored

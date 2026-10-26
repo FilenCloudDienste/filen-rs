@@ -1,12 +1,15 @@
 use std::{borrow::Cow, path::Path, process::ExitStatus};
 use tokio::{fs, process::Child};
-
-use filen_sdk_rs::{Error, ErrorKind, auth::Client, error::ResultExt as _};
 use tracing::trace;
 
 use crate::{
-	rclone_installation::{RcloneInstallation, RcloneInstallationConfig},
-	rclone_rc_api::{RcloneApiClient, VfsListResponse},
+	Error, ErrorKind,
+	auth::Client,
+	error::ResultExt as _,
+	rclone::{
+		rclone_installation::{RcloneInstallation, RcloneInstallationConfig},
+		rclone_rc_api::{RcloneApiClient, VfsListResponse},
+	},
 };
 
 pub struct NetworkDrive {

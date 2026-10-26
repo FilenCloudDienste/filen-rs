@@ -10,9 +10,12 @@ metadata.workspaces = { independent = true }
 [dependencies]
 anyhow = "1.0.98"
 clap = { version = "4.5.53", features = ["derive", "env"] }
-filen-sdk-rs = { path = "../filen-sdk-rs", features = ["cache", "sync-engine"] }
+filen-sdk-rs = { path = "../filen-sdk-rs", features = [
+	"cache",
+	"sync-engine",
+	"rclone",
+] }
 filen-types = { path = "../filen-types" }
-filen-rclone-wrapper = { path = "../filen-rclone-wrapper" }
 filen-macros = { path = "../filen-macros" }
 log = "0.4.27"
 # The CLI keeps its own `log`-based logger (CustomLogger); the `log` feature bridges the SDK's

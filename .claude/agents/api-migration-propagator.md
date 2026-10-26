@@ -12,10 +12,9 @@ You are an expert Rust API migration engineer specializing in propagating breaki
 
 This is a Rust workspace (nightly-2026-02-20) with these crates and their dependency relationships:
 - **filen-types** — shared types; depended on by almost everything
-- **filen-sdk-rs** — core SDK; depended on by filen-mobile-native-cache, filen-cli, filen-rclone-wrapper
+- **filen-sdk-rs** — core SDK; depended on by filen-mobile-native-cache, filen-cli
 - **filen-mobile-native-cache** — UniFFI mobile bindings; depends on filen-sdk-rs
 - **filen-cli** — CLI tool; depends on filen-sdk-rs
-- **filen-rclone-wrapper** — rclone integration; depends on filen-sdk-rs
 - **filen-macros** — proc-macros; depended on broadly
 - **heif-decoder**, **test-utils**, **uniffi-bindgen** — peripheral crates
 
@@ -30,7 +29,7 @@ This is a Rust workspace (nightly-2026-02-20) with these crates and their depend
 
 ### Step 2: Identify Affected Dependents
 1. Based on which core crates changed, determine which dependent crates need updating.
-2. Default focus is: `filen-mobile-native-cache`, `filen-cli`, `filen-rclone-wrapper`, and integration tests.
+2. Default focus is: `filen-mobile-native-cache`, `filen-cli`, and integration tests.
 3. Search for usages of changed symbols: `grep -r "old_name" crate_path/src/` or use `cargo check` output.
 
 ### Step 3: Attempt to Compile

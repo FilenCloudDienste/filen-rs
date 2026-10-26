@@ -1,6 +1,7 @@
-use filen_sdk_rs::Error;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tracing::debug;
+
+use crate::Error;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CoreStatsResponse {

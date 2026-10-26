@@ -67,6 +67,13 @@ pub mod js;
 pub mod notes;
 pub mod obs;
 pub(crate) mod progress;
+// Managed rclone (network drive mounts and `rclone serve`). Native-only: it runs rclone as a child
+// process.
+#[cfg(all(
+	feature = "rclone",
+	not(all(target_family = "wasm", target_os = "unknown"))
+))]
+pub mod rclone;
 pub mod runtime;
 pub(crate) mod serde;
 #[cfg(any(

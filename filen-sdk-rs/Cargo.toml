@@ -44,6 +44,15 @@ cache = ["dep:rusqlite", "dep:itertools", "filen-types/rusqlite"]
 # `notify` FS watcher for the continuous engine, `ignore` for gitignore-syntax `.filenignore`
 # matching, and `same-file` for the local walk's directory loop check.
 sync-engine = ["cache", "dep:notify", "dep:ignore", "dep:same-file"]
+# Managed rclone (network drive mounts and `rclone serve`). Native-only (the module is cfg'd off on
+# wasm): it downloads a pinned rclone release and runs it as a child process.
+rclone = [
+	"dep:hex-literal",
+	"dep:port_check",
+	"dep:sysinfo",
+	"dep:zip",
+	"tokio/process",
+]
 # Exposes the otherwise-`pub(crate)` cache apply path (`cache::bench_support`) for the criterion
 # insertion benchmark only, and `nix` for the sync engine probe's peak resident set. Never enable
 # in production builds.
@@ -90,6 +99,11 @@ required-features = ["sync-engine-live-tests"]
 [[test]]
 name = "sync_engine_js_tests"
 required-features = ["uniffi", "cache", "sync-engine"]
+
+# Mounts a network drive through the managed rclone (`rclone`).
+[[test]]
+name = "network_drive_tests"
+required-features = ["rclone"]
 
 # Grouped black-box sync suite: ONE binary, one module per category (tests/sync_suite/).
 [[test]]
@@ -331,6 +345,21 @@ walkdir = "2.5.0"
 same-file = { version = "1.0.6", optional = true }
 # gitignore(5) pattern matching for the sync engine's `.filenignore` rules (pure Rust).
 ignore = { version = "0.4.25", optional = true }
+# Managed rclone (`rclone`): the pinned release's checksums, a free port for its RC API, the free
+# disk space its default cache size is taken from, and the release zip it extracts.
+hex-literal = { version = "1.1.0", optional = true }
+port_check = { version = "0.3.0", optional = true }
+sysinfo = { version = "0.37.2", optional = true }
+# most default features except for encryption, which we definitely won't need to extract Rclone zip
+zip = { version = "8.6.0", default-features = false, features = [
+	"bzip2",
+	"deflate",
+	"deflate64",
+	"lzma",
+	"ppmd",
+	"xz",
+	"zstd",
+], optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }
@@ -396,6 +425,8 @@ filen-types = { path = "../filen-types", features = ["test-seams"] }
 [target.'cfg(not(all(target_family="wasm", target_os= "unknown")))'.dev-dependencies]
 multer = "3.1.0"
 dotenv = "0.15.0"
+# `network_drive_tests` keeps its rclone download in the user's config directory across runs.
+dirs = "6.0.0"
 # `test-util` (paused clock for deterministic time-dependent tests) is intentionally NOT part of
 # tokio's `full`, so it must be listed explicitly.
 tokio = { version = "1.47.1", features = ["full", "test-util"] }

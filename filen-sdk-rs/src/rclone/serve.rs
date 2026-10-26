@@ -1,7 +1,10 @@
-use filen_sdk_rs::{Error, ErrorKind, auth::Client};
 use tokio::process::Child;
 
-use crate::rclone_installation::{RcloneInstallation, RcloneInstallationConfig};
+use crate::{
+	Error, ErrorKind,
+	auth::Client,
+	rclone::rclone_installation::{RcloneInstallation, RcloneInstallationConfig},
+};
 
 pub struct BasicAuthentication {
 	pub user: String,

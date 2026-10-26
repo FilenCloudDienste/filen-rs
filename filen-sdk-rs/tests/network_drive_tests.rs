@@ -7,10 +7,11 @@
 async fn start_rclone_mount() {
 	use std::{borrow::Cow, path::PathBuf, time::Duration};
 
-	use filen_rclone_wrapper::{
-		network_drive::NetworkDrive, rclone_installation::RcloneInstallationConfig,
+	use filen_sdk_rs::{
+		fs::categories::NonRootFileType,
+		io::client_impl::IoSharedClientExt,
+		rclone::{network_drive::NetworkDrive, rclone_installation::RcloneInstallationConfig},
 	};
-	use filen_sdk_rs::{fs::categories::NonRootFileType, io::client_impl::IoSharedClientExt};
 	use tokio::fs;
 	use tracing::{debug, info, trace};
 

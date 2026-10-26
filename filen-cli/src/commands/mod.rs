@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use clap::Subcommand;
 use clap_complete::engine::{ArgValueCompleter, PathCompleter};
-use filen_rclone_wrapper::serve::BasicServerOptions;
+use filen_sdk_rs::rclone::serve::BasicServerOptions;
 use serde_json::json;
 
 use crate::{

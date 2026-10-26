@@ -3,7 +3,7 @@
 //! It is automatically downloaded and configured (authenticated) when you run the commands like `rclone`, `mount`, etc.
 
 use anyhow::{Context as _, Result};
-use filen_rclone_wrapper::{
+use filen_sdk_rs::rclone::{
 	rclone_installation::RcloneInstallationConfig, serve::BasicServerOptions,
 };
 use tokio::select;
@@ -22,7 +22,7 @@ pub(crate) async fn mount(
 	let client = client.get(ui).await?;
 	let config_dir = config.config_dir.join("rclone");
 	check_already_downloaded(ui, &config_dir).await;
-	let mut network_drive = filen_rclone_wrapper::network_drive::NetworkDrive::mount(
+	let mut network_drive = filen_sdk_rs::rclone::network_drive::NetworkDrive::mount(
 		client,
 		&RcloneInstallationConfig::new(&config_dir),
 		mount_point.as_deref(),
@@ -69,7 +69,7 @@ pub(crate) async fn start_server(
 	let client = client.get(ui).await?;
 	let config_dir = config.config_dir.join("rclone");
 	check_already_downloaded(ui, &config_dir).await;
-	let mut server = filen_rclone_wrapper::serve::start_basic_server(
+	let mut server = filen_sdk_rs::rclone::serve::start_basic_server(
 		client,
 		&RcloneInstallationConfig::new(&config_dir),
 		server_type,
@@ -139,7 +139,7 @@ pub(crate) async fn execute_rclone(
 ) -> Result<()> {
 	let config_dir = config.config_dir.join("rclone");
 	check_already_downloaded(ui, &config_dir).await;
-	let rclone = filen_rclone_wrapper::rclone_installation::RcloneInstallation::initialize(
+	let rclone = filen_sdk_rs::rclone::rclone_installation::RcloneInstallation::initialize(
 		&RcloneInstallationConfig::new(&config_dir),
 		Some(client.get(ui).await?),
 	)
@@ -158,7 +158,7 @@ pub(crate) async fn execute_rclone(
 }
 
 async fn check_already_downloaded(ui: &mut UI, config_dir: &std::path::Path) {
-	if !filen_rclone_wrapper::rclone_installation::RcloneInstallation::check_already_downloaded(
+	if !filen_sdk_rs::rclone::rclone_installation::RcloneInstallation::check_already_downloaded(
 		&RcloneInstallationConfig::new(config_dir),
 	)
 	.await

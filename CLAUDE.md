@@ -162,6 +162,7 @@ Test notes:
 | `archive` | Compress / extract (`fs::archive`) and its codec crates; `wasm-full` turns it on, and on wasm it refuses to build without `wasm-full` |
 | `malformed` | Test-only seams that put malformed state on the server on purpose (`create_malformed_dir` / `create_malformed_file` write arbitrary metadata, `create_dir_with_name_hash` bypasses the case-insensitive name dedup) — never enable in production |
 | `sync-engine` | Local folder <-> remote folder sync engine (`src/sync_engine/`); implies `cache`, adds the `notify` watcher; native only. Gates, with `uniffi`, the binding's `sync_engine_js_tests` |
+| `rclone` | Managed rclone (`src/rclone/`): downloads a pinned rclone release, writes the account's `rclone.conf` and runs `rclone mount` (network drive) or `rclone serve` as a child process; native only. filen-cli turns it on. Gates the live `network_drive_tests` |
 | `heif-decoder` | Thumbnail decoding for HEIF/HEIC — and AVIF, which the vendored libheif decodes through the same container path on its dav1d backend |
 | `bench-internals` | Exposes `cache::bench_support` for the insertion benchmark, and `sync_engine::probe` for the `sync_engine_probe` per-phase probe |
 | `test-seams` | Test-only: exposes the bulk operations, a generic bulk post and the item builders (`*_for_test`) the live `bulk_tests` drive every `bulk/*` endpoint with — never enable in production |
@@ -305,7 +306,6 @@ building a configuration that never ships.
 | `test-utils` | Shared integration test infrastructure (accounts, cleanup, async runtime) |
 | `uniffi-bindgen` / `uniffi-bindgen-swift` | Thin wrappers to drive UniFFI codegen for Kotlin and Swift |
 | `filen-cli` | CLI tool for interacting with Filen drive |
-| `filen-rclone-wrapper` | Rclone integration wrapper |
 
 `ruzstd` is pinned by rev to upstream main (`filen-sdk-rs/Cargo.toml`, 91a3a6eb4), not a crates.io
 release: upstream's fix for bounding each block's decoded size, including a block's literals with
@@ -343,6 +343,7 @@ Filen Backend (HTTPS/JSON)
 - **`io/`** — local filesystem tree operations for sync
 - **`sync/`** — drive locking (`ResourceLock`) and sync state
 - **`sync_engine/`** (`sync-engine`, native only) — keeps a local folder in sync with a remote folder: cache snapshot + local `scan` + persisted SQLite `baseline` → `plan` → `guard` (mass-delete screen) → `apply`, plus `watch` (the continuous `notify` loop), `pause` and the `outcome`/`events` reporting types
+- **`rclone/`** (`rclone`, native only) — managed rclone: `rclone_installation` (download, `rclone.conf`, running rclone with its RC API), `network_drive` (`rclone mount`) and `serve` (`rclone serve`)
 
 ### `filen-types` Internal Structure
 

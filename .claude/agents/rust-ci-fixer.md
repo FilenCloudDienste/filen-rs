@@ -18,7 +18,6 @@ You are working in a Cargo workspace with these crates:
 - `heif-decoder` — HEIF/HEIC decoder (C++ sources, broken incremental builds)
 - `test-utils` — Shared integration test infrastructure
 - `filen-cli` — CLI tool
-- `filen-rclone-wrapper` — Rclone integration wrapper
 
 **Important**: Exclude `heif-decoder` from builds unless specifically required (`--exclude heif-decoder`), as it has broken incremental builds due to a cmake-rs bug.
 
