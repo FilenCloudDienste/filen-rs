@@ -57,6 +57,7 @@ use crate::{
 	fs::{
 		HasUUID,
 		bulk::create_dirs::{CreatedDir, NewDir, NewDirParent},
+		categories::{DirType, Normal},
 		dir::meta::DirectoryMetaChanges,
 		file::{FileBuilderOptionalName, meta::FileMetaChanges},
 		name::ValidatedName,
@@ -262,8 +263,8 @@ pub(super) struct ApplyContext<'a> {
 	/// runs on the caller's thread; the exception is a directory move's subtree re-key, which does
 	/// not (see [`commit_dir_move`]).
 	pub(super) store: &'a SharedStore,
-	/// The sync root resolved to a remote directory (every top-level parent).
-	pub(super) root_remote: RemoteDirectory,
+	/// The sync root (every top-level parent): the drive root itself, or a directory in it.
+	pub(super) root_remote: DirType<'a, Normal>,
 	/// The cache DB each page of the plan reads the remote objects it acts on from (see
 	/// [`PageObjects::hydrate`]); `None` when the client has no cache configured, and every action
 	/// then asks the server for its own.

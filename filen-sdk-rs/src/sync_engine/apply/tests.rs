@@ -1,4 +1,4 @@
-use std::{sync::Mutex, time::Duration};
+use std::{borrow::Cow, sync::Mutex, time::Duration};
 
 use filen_types::crypto::Blake3Hash;
 use tokio::runtime::Runtime;
@@ -1740,7 +1740,9 @@ impl Borrowed {
 			pair: 1,
 			mode: SyncMode::TwoWay,
 			store: &self.store,
-			root_remote: RemoteDirectory::from(cacheable_dir(root, root, "root")),
+			root_remote: DirType::Dir(Cow::Owned(RemoteDirectory::from(cacheable_dir(
+				root, root, "root",
+			)))),
 			cache_db,
 			absence_trusted: true,
 			pending: &self.pending,

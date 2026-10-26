@@ -63,7 +63,7 @@ use crate::{
 		CacheEvent, CacheEventType, DirEvent, FileEvent, SearchResult, SyncRootCallback,
 		SyncRootHandle,
 	},
-	fs::{HasParent, HasUUID},
+	fs::{HasParent, HasUUID, categories::DirType},
 	io::client_impl::IoSharedClientExt,
 };
 
@@ -3318,8 +3318,8 @@ impl SyncEngine {
 		Ok(chain)
 	}
 
-	/// Register a sync pair, returning its id. `remote_root` must be a sync-rooted SUBFOLDER the
-	/// cache covers (not the account root).
+	/// Register a sync pair, returning its id. `remote_root` is the drive root or a directory in
+	/// it.
 	///
 	/// Idempotent for the same `(local_root, remote_root, mode)`: the existing pair's id comes back
 	/// and nothing is disturbed. The same roots with a DIFFERENT mode is an ERROR, not a silent
@@ -6333,9 +6333,15 @@ impl SyncEngine {
 			return Ok(report);
 		};
 
-		// Resolve the sync root to a remote directory (every top-level parent). Errors if the root
-		// is not a reachable subfolder.
-		let root_remote = self.client.get_dir(prep.record.remote_root).await?;
+		// Resolve the sync root (every top-level parent). The drive root is the client's own; any
+		// other directory is read from the server, which errors if it is gone.
+		let root_remote = if prep.record.remote_root == self.client.root().uuid() {
+			DirType::Root(Cow::Borrowed(self.client.root()))
+		} else {
+			DirType::Dir(Cow::Owned(
+				self.client.get_dir(prep.record.remote_root).await?,
+			))
+		};
 
 		let (screen, ends) = off_runtime("reading the pass's screened plan", move || {
 			let ends = endable_streaks(&screen, streaks.as_ref());
