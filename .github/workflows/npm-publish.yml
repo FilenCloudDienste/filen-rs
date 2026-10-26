@@ -12,7 +12,98 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  build-napi:
+    # The desktop Node-API addon, one per target in web/package.json's `napi.targets`, each
+    # published below as @filen/sdk-rs-<platform>: the packages the addon's loader falls back to
+    # when node/ holds no binary for its host. Package-scoped (--manifest-path ../Cargo.toml), so
+    # no heif-decoder tooling. Each leg builds on the OS it targets, so every addon links as
+    # ci-napi's do (dynamic_lookup on macOS, -z nodelete on linux-gnu, msvc on Windows); the
+    # arm64 Windows and Linux and the x86_64 macOS addons are cross-compiled from the x86_64 and
+    # arm64 runners, as napi-rs builds them, and only the legs whose host can load the addon
+    # smoke-test it.
+    strategy:
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            smoke-test: true
+            # The loader and the typings do not depend on the target; this leg hands them to
+            # the publish job.
+            loader: true
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            smoke-test: true
+          - target: aarch64-pc-windows-msvc
+            os: windows-latest
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            smoke-test: true
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    name: Build the napi addon (${{ matrix.target }})
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-02-20
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@a84bfdc502f07db5a85dd9d7a30f91a931516cc5
+        with:
+          shared-key: cargo-build-napi-release-${{ matrix.target }}
+          prefix-key: ''
+          add-rust-environment-hash-key: 'false'
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24.x'
+      - name: Install dependencies
+        run: npm ci
+        working-directory: ./filen-sdk-rs/web
+      - name: Build the napi addon
+        shell: bash
+        run: |
+          # On linux-gnu the addon is linked against @napi-rs/cross-toolchain's glibc 2.17
+          # sysroot (--use-napi-cross), so it loads on older distributions than the runner. That
+          # toolchain links with its own gcc, which rejects the Wild flag .cargo/config.toml
+          # gives these targets: RUSTFLAGS replaces the config's list (a
+          # CARGO_TARGET_<triple>_RUSTFLAGS would be appended to it). It is set only for them,
+          # since even an empty value would drop the other targets' flags too.
+          if [[ $target == *-linux-gnu ]]; then
+            export RUSTFLAGS=-Zhigher-ranked-assumptions
+            npm run build:napi:release -- --target "$target" --use-napi-cross
+          else
+            npm run build:napi:release -- --target "$target"
+          fi
+        working-directory: ./filen-sdk-rs/web
+        env:
+          target: ${{ matrix.target }}
+      - name: Smoke-test the napi addon
+        if: matrix.smoke-test
+        run: node --test napi/smoke.test.mjs
+        working-directory: ./filen-sdk-rs/web
+      - name: Upload the napi addon
+        uses: actions/upload-artifact@v4
+        with:
+          name: napi-binary-${{ matrix.target }}
+          path: ./filen-sdk-rs/web/node/sdk-rs.*.node
+          if-no-files-found: error
+      - name: Upload the napi loader and typings
+        if: matrix.loader
+        uses: actions/upload-artifact@v4
+        with:
+          name: napi-loader
+          path: |
+            ./filen-sdk-rs/web/node/index.js
+            ./filen-sdk-rs/web/node/index.d.ts
+          if-no-files-found: error
+
   build:
+    needs: build-napi
     runs-on: macos-latest
     steps:
       - name: Checkout
@@ -94,8 +185,32 @@ jobs:
           for lib in "$@"; do "$objcopy" --remove-section=__LLVM,__bitcode "$lib"; done
           du -h "$@"
         working-directory: ./filen-sdk-rs/web
+      - name: Download the napi addons
+        uses: actions/download-artifact@v4
+        with:
+          pattern: napi-binary-*
+          path: ./filen-sdk-rs/web/artifacts
+      - name: Download the napi loader and typings
+        uses: actions/download-artifact@v4
+        with:
+          name: napi-loader
+          path: ./filen-sdk-rs/web/node
+      - name: Lay out the per-platform napi packages
+        # One npm/<platform>/ package per target, at the package's version, each holding its
+        # addon. The addons are also copied next to package.json, where `files` leaves them out.
+        run: npx napi create-npm-dirs && npx napi artifacts
+        working-directory: ./filen-sdk-rs/web
       - name: Configure npm for publishing
         run: echo "//registry.npmjs.org/:_authToken=${{ secrets.NPM_PUBLISH_TOKEN }}" > ~/.npmrc
+      - name: Publish the per-platform napi packages
+        # Publishes each npm/<platform>/ package (a version already on the registry is skipped,
+        # so a rerun after a failed publish goes on) and lists them all in package.json's
+        # optionalDependencies, at the same version, for the publish below. No GitHub release.
+        run: npx napi pre-publish --no-gh-release
+        working-directory: ./filen-sdk-rs/web
+        env:
+          # Scoped packages are published restricted unless told otherwise.
+          npm_config_access: public
       - name: Publish
         run: npm publish --access public
         working-directory: ./filen-sdk-rs/web

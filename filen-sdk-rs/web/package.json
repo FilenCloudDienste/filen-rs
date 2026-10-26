@@ -39,7 +39,9 @@
 		"ios",
 		"FilenSdkRsFramework.xcframework",
 		"src",
-		"SdkRs.podspec"
+		"SdkRs.podspec",
+		"node/index.js",
+		"node/index.d.ts"
 	],
 	"main": "./sdk-rs.js",
 	"react-native": "./src/index.tsx",

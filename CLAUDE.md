@@ -386,10 +386,13 @@ configuration: `node --conditions=filen-desktop` (or in `NODE_OPTIONS`), the bun
 `customConditions: ["filen-desktop"]` with `moduleResolution` `bundler`, `node16` or `nodenext`.
 `build:napi` writes the loader, the typings (prefixed with `napi/compat.d.ts`, what napi
 cannot generate) and the host's `sdk-rs.<platform>.node` to `node/`, which is local build
-output (git-ignored, not in `files` yet). Binaries are to ship as napi's per-platform packages
-(`@filen/sdk-rs-<platform>`, in `optionalDependencies`), which the loader falls back to when
-`node/` holds no binary for the host; the release job that publishes them adds `node/` to
-`files`. The generated loader is ESM (`--esm`, the package
+output (git-ignored). `files` takes only the loader and the typings from it: the binaries ship as
+napi's per-platform packages (`@filen/sdk-rs-<platform>`), which the loader falls back to when
+`node/` holds no binary for the host. `npm-publish.yml`'s `build-napi` job builds them for the
+six `napi.targets` (linux-gnu against glibc 2.17, `--use-napi-cross`), and the publish job lays
+them out under `npm/` (`napi create-npm-dirs`, `napi artifacts`) and publishes them before the
+package, which `napi pre-publish` gives them as `optionalDependencies` at its own version; none of
+that is committed. The generated loader is ESM (`--esm`, the package
 is `"type": "module"`), so a CommonJS Electron main loads it with `import()`, through a bundler,
 or with `require()` on Node 22.12+ (`require(esm)`).
 
