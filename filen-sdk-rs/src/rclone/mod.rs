@@ -1,12 +1,10 @@
 //! rclone, run as a child process for network drive mounts and `rclone serve`.
 //!
-//! [`RcloneDaemon`] runs one `rclone rcd` and drives it over its remote control API.
-//! `rclone-managed` adds the managed installation filen-cli uses: it downloads a pinned rclone
-//! release (`RcloneBinary::Managed`), writes an `rclone.conf` for the client's `filen`
-//! remote, and runs `rclone mount` (a network drive) or `rclone serve` as a child process.
+//! [`RcloneDaemon`] runs one `rclone rcd` and drives it over its remote control API: mounts and
+//! serves. `rclone-managed` adds what filen-cli uses besides: a pinned rclone release downloaded
+//! into a directory (`RcloneBinary::Managed`), and `run_rclone`, which runs any rclone command in
+//! the foreground with the account as its `filen` remote.
 
-#[cfg(feature = "rclone-managed")]
-pub mod basic_server;
 mod binary;
 mod daemon;
 mod fuse;
@@ -15,13 +13,9 @@ mod fuse;
 mod js_impl;
 mod mount;
 #[cfg(feature = "rclone-managed")]
-pub mod network_drive;
+mod passthrough;
 mod private_file;
 mod rc;
-#[cfg(feature = "rclone-managed")]
-pub mod rclone_installation;
-#[cfg(feature = "rclone-managed")]
-mod rclone_rc_api;
 mod recovery;
 mod refusal;
 mod serve;
@@ -40,6 +34,8 @@ pub use js_impl::RcloneDaemonOptions;
 #[cfg(feature = "napi")]
 pub(crate) use js_impl::{JsRcloneDaemon, rclone_refusal};
 pub use mount::{MountInfo, MountOptions, available_drive_letters};
+#[cfg(feature = "rclone-managed")]
+pub use passthrough::run_rclone;
 pub use recovery::{StaleRecovery, clear_cache, force_unmount, recover_stale, stop_rclone_under};
 pub use refusal::RcloneRefusal;
 pub use serve::{ServeAuth, ServeInfo, ServeOptions, ServeProtocol, ServeTls};

@@ -40,6 +40,20 @@ impl RcloneBinary {
 	}
 }
 
+#[cfg(feature = "rclone-managed")]
+impl RcloneBinary {
+	/// Whether [`RcloneBinary::resolve`] finds the binary without downloading it: a bundled binary
+	/// is a file at its path, a managed one was downloaded before.
+	pub async fn is_installed(&self) -> bool {
+		match self {
+			Self::Bundled { path, .. } => tokio::fs::metadata(path)
+				.await
+				.is_ok_and(|metadata| metadata.is_file()),
+			Self::Managed { dir } => managed::ensure(dir, false).await.is_ok(),
+		}
+	}
+}
+
 /// `path` once it is known to be a file and, with `sha256`, to hash to it. Takes the path by value
 /// to move it into the blocking task that hashes the file, and to return it.
 async fn resolve_bundled(path: PathBuf, sha256: Option<[u8; 32]>) -> Result<PathBuf, Error> {

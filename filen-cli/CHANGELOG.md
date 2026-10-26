@@ -7,7 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
-- /
+### Changed
+
+- `mount` and `serve` run through one Rclone process configured in memory: no `rclone.conf` is written (a leftover one is deleted), and on Ctrl-C uploads still in the cache get up to 30 seconds to finish
+- `serve` listens on 127.0.0.1 and a port per server type unless `--addr` says otherwise, and uses random credentials (printed when it starts) unless `--user` and `--password` are both given
+- `serve` refuses an address without an IP (`:<port>`); use `0.0.0.0:<port>` to listen on every network interface
+- `mount` on macOS works without macFUSE, through Rclone's NFS mount
+
+### Added
+
+- `serve restic` and `serve nfs` (NFS has no authentication and listens on 127.0.0.1 only)
+- `serve --cert` and `--key` to serve WebDAV, S3, HTTP and restic over HTTPS
+
+### Removed
+
+- `mount` and `serve`: `--transfers` and additional Rclone arguments; `serve`: `--root`
 
 ## 0.2.9 - 2026-10-02
 

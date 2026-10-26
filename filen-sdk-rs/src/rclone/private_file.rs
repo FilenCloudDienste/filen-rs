@@ -5,9 +5,8 @@ use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::{io::Write as _, path::Path};
 
 /// Write `contents` to `path`, creating or truncating it with owner-only permissions
-/// (mode `0o600` on Unix). The files written with it hold secrets (the auth config's master keys,
-/// private key and API key; the rc password's hash), so they must never be left group- or
-/// world-readable for other users on the machine.
+/// (mode `0o600` on Unix). The files written with it are the rc password's hash and the pidfile,
+/// which must never be left group- or world-readable, or writable, for other users on the machine.
 pub(crate) fn write_private_file(path: &Path, contents: &str) -> std::io::Result<()> {
 	let mut options = std::fs::OpenOptions::new();
 	options.write(true).create(true).truncate(true);

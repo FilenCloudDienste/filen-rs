@@ -1,7 +1,6 @@
 use anyhow::{Context, Result};
 use clap::Subcommand;
 use clap_complete::engine::{ArgValueCompleter, PathCompleter};
-use filen_sdk_rs::rclone::basic_server::BasicServerOptions;
 use serde_json::json;
 
 use crate::{
@@ -188,46 +187,39 @@ pub(crate) enum Commands {
 	},
 	/// Mount Filen as a network drive
 	Mount {
-		/// Where to mount the network drive (default: system default)
+		/// Where to mount the network drive: an empty directory (default: /tmp/filen), or on Windows a drive letter (default: X)
 		mount_point: Option<String>,
-		/// The maximum cache size (e.g. "500Mi", "10Gi") (default: calculated from available disk space)
-		#[arg(long)]
-		cache_size: Option<String>,
-		/// The number of parallel transfers
-		#[arg(long)]
-		transfers: Option<usize>,
-		/// Additional arguments to Rclone
-		rclone_args: Vec<String>,
+		/// The maximum cache size (e.g. "500Mi", "10Gi") (default: 32Gi)
+		#[arg(long, value_parser = rclone_cmds::parse_size)]
+		cache_size: Option<u64>,
 	},
-	/// Runs a WebDAV, S3, FTP, SFTP or HTTP server exposing your Filen drive
+	/// Runs a WebDAV, S3, FTP, SFTP, HTTP, restic or NFS server exposing your Filen drive
 	Serve {
-		/// The type of server to run: webdav, s3, ftp, sftp, http
+		/// The type of server to run: webdav, s3, ftp, sftp, http, restic, nfs
 		server: String,
-		/// IP and port for the server (`<ip>:<port>` or `:<port>`)
-		#[arg(long = "addr", default_value = ":80")]
-		address: String,
-		/// Directory that the server exposes (default: the entire Filen drive)
-		#[arg(long, add = FilenCompleter::directory())]
-		root: Option<String>,
-		/// Username for authentication to the server (default: no authentication).
-		/// On S3 servers, this is the Access Key ID.
+		/// IP and port for the server (`<ip>:<port>`; `0.0.0.0:<port>` for every network interface) (default: 127.0.0.1 and a port per type)
+		#[arg(long = "addr")]
+		address: Option<String>,
+		/// Username for authentication to the server (default: random, printed when the server starts).
+		/// On S3 servers, this is the Access Key ID. NFS servers have no authentication and listen on 127.0.0.1 only.
 		#[arg(long)]
 		user: Option<String>,
-		/// Password for authentication to the server (default: no authentication).
+		/// Password for authentication to the server (default: random, printed when the server starts).
 		/// On S3 servers, this is the Secret Access Key.
 		#[arg(long)]
 		password: Option<String>,
 		/// The server is read-only
 		#[arg(long)]
 		read_only: bool,
-		/// The maximum cache size (e.g. "500Mi", "10Gi") (default: calculated from available disk space)
+		/// The maximum cache size (e.g. "500Mi", "10Gi") (default: 32Gi)
+		#[arg(long, value_parser = rclone_cmds::parse_size)]
+		cache_size: Option<u64>,
+		/// TLS certificate (PEM) to serve HTTPS with (WebDAV, S3, HTTP and restic; requires --key)
 		#[arg(long)]
-		cache_size: Option<String>,
-		/// The number of parallel transfers
+		cert: Option<String>,
+		/// TLS private key (PEM) for --cert
 		#[arg(long)]
-		transfers: Option<usize>,
-		/// Additional arguments to Rclone
-		rclone_args: Vec<String>,
+		key: Option<String>,
 	},
 	/// Exports your user API key (for use with non-managed Rclone)
 	ExportApiKey,
@@ -449,61 +441,35 @@ pub(crate) async fn execute_command(
 		Commands::Mount {
 			mount_point,
 			cache_size,
-			transfers,
-			rclone_args,
 		} => {
-			rclone_cmds::mount(
-				config,
-				ui,
-				client,
-				mount_point,
-				cache_size,
-				transfers,
-				rclone_args,
-			)
-			.await?;
+			rclone_cmds::mount(config, ui, client, mount_point, cache_size).await?;
 			None
 		}
 		Commands::Serve {
 			server,
 			address,
-			root,
 			user,
 			password,
 			read_only,
 			cache_size,
-			transfers,
-			rclone_args,
+			cert,
+			key,
 		} => {
-			let display_server_type = match server.as_str() {
-				"webdav" => "WebDAV",
-				"ftp" => "FTP",
-				"sftp" => "SFTP",
-				"http" => "HTTP",
-				"s3" => "S3",
-				_ => {
-					return Err(UI::failure(&format!(
-						"Unsupported server type: {}. Supported types are: webdav, ftp, sftp, http, s3",
-						server
-					)));
-				}
-			};
+			let protocol = rclone_cmds::parse_protocol(&server)?;
 			rclone_cmds::start_server(
 				config,
 				ui,
 				client,
-				&server,
-				display_server_type,
-				BasicServerOptions {
+				rclone_cmds::ServeArgs {
+					protocol,
 					address,
-					root,
 					user,
 					password,
 					read_only,
 					cache_size,
-					transfers,
+					cert,
+					key,
 				},
-				rclone_args,
 			)
 			.await?;
 			None

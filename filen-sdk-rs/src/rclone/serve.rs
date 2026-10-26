@@ -17,7 +17,9 @@ use std::{
 	time::Duration,
 };
 
+use base64::{Engine as _, prelude::BASE64_URL_SAFE_NO_PAD};
 use filen_macros::js_type;
+use rand::{Rng as _, distr::Alphanumeric};
 use serde_json::{Map, Value};
 use tokio::{
 	io::{AsyncBufRead, AsyncBufReadExt as _, AsyncWriteExt as _, BufReader},
@@ -116,6 +118,34 @@ pub enum ServeAuth {
 	},
 	/// None, for nfs only.
 	Unauthenticated,
+}
+
+impl ServeAuth {
+	/// Random credentials for a serve over `protocol`: an access key ID of 20 letters and digits and
+	/// a secret of 40 characters for s3, the user `filen-<8 hex digits>` and a password of 256
+	/// random bits (43 characters) for the others, and none for nfs.
+	pub fn random(protocol: ServeProtocol) -> Self {
+		let mut rng = rand::rng();
+		match protocol {
+			ServeProtocol::S3 => Self::S3 {
+				access_key_id: (&mut rng)
+					.sample_iter(Alphanumeric)
+					.take(20)
+					.map(char::from)
+					.collect(),
+				secret_access_key: BASE64_URL_SAFE_NO_PAD.encode(rng.random::<[u8; 30]>()),
+			},
+			ServeProtocol::Webdav
+			| ServeProtocol::Ftp
+			| ServeProtocol::Sftp
+			| ServeProtocol::Http
+			| ServeProtocol::Restic => Self::Basic {
+				user: format!("filen-{}", hex::encode(rng.random::<[u8; 4]>())),
+				password: BASE64_URL_SAFE_NO_PAD.encode(rng.random::<[u8; 32]>()),
+			},
+			ServeProtocol::Nfs => Self::Unauthenticated,
+		}
+	}
 }
 
 impl fmt::Debug for ServeAuth {
@@ -882,6 +912,47 @@ mod tests {
 		assert_eq!(params["cert"], json!("/certs/serve.crt"));
 		assert_eq!(params["key"], json!("/certs/serve.key"));
 		assert_eq!(params["min_tls_version"], json!("tls1.2"));
+	}
+
+	#[test]
+	fn serve_without_credentials_generates_them() {
+		for protocol in [
+			ServeProtocol::Webdav,
+			ServeProtocol::S3,
+			ServeProtocol::Ftp,
+			ServeProtocol::Sftp,
+			ServeProtocol::Http,
+			ServeProtocol::Restic,
+		] {
+			let auth = ServeAuth::random(protocol);
+
+			assert!(
+				check(&options(protocol, auth.clone())).is_ok(),
+				"{protocol:?}"
+			);
+			assert_ne!(auth, ServeAuth::random(protocol), "{protocol:?}");
+		}
+		let ServeAuth::S3 {
+			access_key_id,
+			secret_access_key,
+		} = ServeAuth::random(ServeProtocol::S3)
+		else {
+			panic!("s3 got basic credentials");
+		};
+		assert_eq!((access_key_id.len(), secret_access_key.len()), (20, 40));
+		let ServeAuth::Basic { user, password } = ServeAuth::random(ServeProtocol::Webdav) else {
+			panic!("webdav got s3 credentials");
+		};
+		assert!(
+			user.strip_prefix("filen-")
+				.is_some_and(|id| id.len() == 8 && id.chars().all(|c| c.is_ascii_hexdigit())),
+			"{user}"
+		);
+		assert_eq!(password.len(), 43);
+		assert_eq!(
+			ServeAuth::random(ServeProtocol::Nfs),
+			ServeAuth::Unauthenticated
+		);
 	}
 
 	#[test]

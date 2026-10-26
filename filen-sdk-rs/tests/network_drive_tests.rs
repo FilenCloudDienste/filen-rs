@@ -1,239 +1,143 @@
-// according to https://github.com/actions/runner-images/issues/598
-// and https://github.com/actions/runner-images/issues/5583#issuecomment-1196763627,
-// macFUSE does not work on GitHub runners, therefore we can't test it in ci
-// for local tests, run with `cargo test -- --ignored`
-#[cfg(not(target_os = "macos"))]
+//! A network drive mounted by the rclone daemon from the managed rclone, against the test
+//! account.
+//!
+//! Not on macOS: GitHub's macOS runners have no macFUSE (actions/runner-images#598, #5583), and
+//! the daemon's `nfsmount` is not tried there; `rclone_daemon_tests` mount through it locally.
+
+#![cfg(not(target_os = "macos"))]
+
+use std::{path::PathBuf, time::Duration};
+
+use filen_sdk_rs::{
+	fs::categories::NonRootFileType,
+	io::client_impl::IoSharedClientExt,
+	rclone::{
+		MountOptions, RcloneBinary, RcloneDaemon, RcloneDaemonConfig, StopOptions, VfsTuning,
+	},
+};
+use tokio::fs;
+use tracing::info;
+
+const TEST_ROOT_DIR_PREFIX: &str = "filen-rs-filen-network-drive-tests";
+const TEST_FILE_CONTENT: &str = "This is a test file for filen-network-drive tests.";
+
+/// Where the drive is mounted: an empty directory in `dir`, or on Windows a free drive letter.
+#[cfg(not(windows))]
+async fn mount_point(dir: &std::path::Path) -> String {
+	let mount_point = dir.join("drive");
+	fs::create_dir(&mount_point).await.unwrap();
+	mount_point.into_os_string().into_string().unwrap()
+}
+
+#[cfg(windows)]
+async fn mount_point(_dir: &std::path::Path) -> String {
+	filen_sdk_rs::rclone::available_drive_letters()
+		.await
+		.pop()
+		.expect("no free drive letter")
+}
+
 #[filen_macros::shared_test_runtime]
 async fn start_rclone_mount() {
-	use std::{borrow::Cow, path::PathBuf, time::Duration};
-
-	use filen_sdk_rs::{
-		fs::categories::NonRootFileType,
-		io::client_impl::IoSharedClientExt,
-		rclone::{network_drive::NetworkDrive, rclone_installation::RcloneInstallationConfig},
-	};
-	use tokio::fs;
-	use tracing::{debug, info, trace};
-
-	const TEST_ROOT_DIR_PREFIX: &str = "filen-rs-filen-network-drive-tests";
-	const TEST_FILE_CONTENT: &str = "This is a test file for filen-network-drive tests.";
-
-	// for some reason, the directory has to be explicitly unounted on linux after killing the process
-	// this does not seem to be a problem when using it through the filen-cli
-	// todo: see what the underlying issue for needing to explicitly unmount is
-	#[cfg(target_os = "linux")]
-	{
-		use tokio::process::Command;
-		use tracing::warn;
-		let mount_path = "/tmp/filen";
-		let umount_status = Command::new("fusermount")
-			.arg("-u")
-			.arg(mount_path)
-			/* .stdout(Stdio::null())
-			.stderr(Stdio::null()) */
-			.status()
-			.await
-			.unwrap()
-			.success();
-		if !umount_status {
-			warn!("Failed to unmount network drive at {}", mount_path);
-		} else {
-			info!("Network drive unmounted successfully");
-		}
-	}
-
 	let test_root_dir = format!("{}-{}", TEST_ROOT_DIR_PREFIX, uuid::Uuid::new_v4());
-
 	let client = test_utils::RESOURCES.client().await;
 	let config_dir = dirs::config_dir().unwrap().join(TEST_ROOT_DIR_PREFIX);
+	let dir = tempfile::tempdir().unwrap();
 
-	#[cfg(windows)]
-	{
-		// try to mount on invalid drive letter
-		assert!(
-			NetworkDrive::mount(
-				&client,
-				&RcloneInstallationConfig::new(&config_dir),
-				Some("C:\\"),
-				false,
-				None,
-				None,
-				vec![]
-			)
-			.await
-			.is_err(),
-			"Mounting on used drive letter should fail"
-		);
-		info!("Tested mounting on used drive letter fails as expected");
-	}
-
-	// mount network drive (is killed on drop)
-	let mut network_drive = NetworkDrive::mount(
+	let daemon = RcloneDaemon::start(
 		&client,
-		&RcloneInstallationConfig::new(&config_dir),
-		None,
-		false,
-		None,
-		None,
-		vec![],
+		RcloneDaemonConfig {
+			// Kept across runs, so the release is downloaded once.
+			binary: RcloneBinary::Managed {
+				dir: config_dir.join("bin"),
+			},
+			state_dir: dir.path().join("state"),
+			cache_dir: dir.path().join("cache"),
+			log_file: None,
+			user_agent: "filen-rs-network-drive-tests".to_owned(),
+			vfs: VfsTuning::default(),
+		},
 	)
 	.await
 	.unwrap();
-	info!("Network drive mounted at: {}", network_drive.mount_point);
 
-	let created_dir_path = format!("{}/created_dir", test_root_dir);
+	#[cfg(windows)]
+	assert!(
+		daemon
+			.mount(MountOptions {
+				mount_point: "C".to_owned(),
+				read_only: false,
+			})
+			.await
+			.is_err(),
+		"mounting on a drive letter in use should fail"
+	);
 
-	network_drive.wait_until_active().await.unwrap();
-
-	// get stats
-	let stats = network_drive.get_stats().await.unwrap();
-	debug!("Stats: {:?}", stats);
-
-	// create remote test root dir if it doesn't exist
-	let remote_test_root = match client.find_item_at_path(&test_root_dir).await.unwrap() {
-		None => Cow::Owned(
-			client
-				.create_dir(&client.root().into(), &test_root_dir)
-				.await
-				.unwrap(),
-		),
-		Some(item) => match item {
-			NonRootFileType::Dir(dir) => dir,
-			_ => panic!("Test root path already exists but is not a directory"),
-		},
+	let mount = daemon
+		.mount(MountOptions {
+			mount_point: mount_point(dir.path()).await,
+			read_only: false,
+		})
+		.await
+		.unwrap();
+	info!("Network drive mounted at: {}", mount.mount_point);
+	// A drive letter's root is `X:\`; `X:` alone is the drive's current directory.
+	let root = if cfg!(windows) {
+		PathBuf::from(format!(r"{}\", mount.mount_point))
+	} else {
+		PathBuf::from(&mount.mount_point)
 	};
 
-	// check that dir doesn't exist before creation
-	if client
-		.find_item_at_path(&created_dir_path)
-		.await
-		.unwrap()
-		.is_some()
-	{
-		panic!("Directory already exists remotely before creation");
-	}
-
-	// list mount directory
-	let mut entries = fs::read_dir(&network_drive.mount_point).await.unwrap();
-	while let Some(entry) = entries.next_entry().await.unwrap() {
-		info!("Mount entry: {}", entry.path().display());
-	}
-
-	// create local dir inside mount
-	debug!(
-		"Trying to create local dir at: {}",
-		PathBuf::from(network_drive.mount_point.clone())
-			.join(&created_dir_path)
-			.display()
-	);
-	fs::create_dir_all(PathBuf::from(network_drive.mount_point.clone()).join(&created_dir_path))
+	let remote_test_root = client
+		.create_dir(&client.root().into(), &test_root_dir)
 		.await
 		.unwrap();
 
-	// check that dir exists remotely and clean it up
-	match client.find_item_at_path(&created_dir_path).await.unwrap() {
-		None => panic!("Directory was not created remotely"),
-		Some(item) => {
-			info!("Directory was created remotely");
-			match item {
-				NonRootFileType::Dir(dir) => {
-					client
-						.delete_dir_permanently(dir.into_owned())
-						.await
-						.unwrap();
-					debug!("Cleaned up remote directory");
-				}
-				_ => panic!("Created item is not a directory"),
-			}
-		}
-	}
-
-	// todo: upload file, check stats
-
-	let uploaded_file_path = format!("{}/uploaded_file.txt", test_root_dir);
-
-	// check that file doesn't exist before upload
-	if client
-		.find_item_at_path(&uploaded_file_path)
+	// A directory created in the mount is created remotely.
+	let created_dir_path = format!("{test_root_dir}/created_dir");
+	fs::create_dir_all(root.join(&created_dir_path))
 		.await
-		.unwrap()
-		.is_some()
-	{
-		panic!("File already exists remotely before upload");
-	}
-
-	// create local file inside mount
-	debug!(
-		"Trying to create local file at: {}",
-		PathBuf::from(network_drive.mount_point.clone())
-			.join(&uploaded_file_path)
-			.display()
+		.unwrap();
+	assert!(
+		matches!(
+			client.find_item_at_path(&created_dir_path).await.unwrap(),
+			Some(NonRootFileType::Dir(_))
+		),
+		"the directory was not created remotely"
 	);
-	fs::write(
-		PathBuf::from(network_drive.mount_point.clone()).join(&uploaded_file_path),
-		TEST_FILE_CONTENT,
-	)
-	.await
-	.unwrap();
 
-	// check that upload stats work
-	let mut has_found_transfer = false;
-	let mut transfer_i = 0;
-	loop {
-		transfer_i += 1;
-		if transfer_i > 300 {
-			panic!("Upload transfer did not complete in time (30s)");
-		}
-		let stats = network_drive.get_stats().await.unwrap();
-		let transfers = stats.transfers.len();
-		if transfers == 0 {
-			trace!("Still no transfers");
-			if has_found_transfer {
-				info!("Upload transfer completed");
-				break;
-			}
-		} else {
-			if has_found_transfer {
-				trace!("Transfer still found");
-			} else {
-				info!("Transfer found");
-			}
-			has_found_transfer = true;
+	// A file written to the mount is uploaded once the VFS cache's write-back delay has passed.
+	let uploaded_file_path = format!("{test_root_dir}/uploaded_file.txt");
+	fs::write(root.join(&uploaded_file_path), TEST_FILE_CONTENT)
+		.await
+		.unwrap();
+	let mut uploaded = None;
+	for _ in 0..600 {
+		let stats = daemon.stats().await.unwrap();
+		if stats.uploads_in_progress + stats.uploads_queued == 0
+			&& let Some(NonRootFileType::File(file)) =
+				client.find_item_at_path(&uploaded_file_path).await.unwrap()
+		{
+			uploaded = Some(file);
+			break;
 		}
 		tokio::time::sleep(Duration::from_millis(100)).await;
 	}
+	let file = uploaded.expect("the file was not uploaded within 60 s");
+	let content = client.download_file(&*file).await.unwrap();
+	assert_eq!(String::from_utf8_lossy(&content), TEST_FILE_CONTENT);
 
-	// check that file exists remotely with right content and clean it up
-	tokio::time::sleep(Duration::from_secs(2)).await; // wait a bit for rclone to sync
-	match client.find_item_at_path(&uploaded_file_path).await.unwrap() {
-		None => panic!("File was not uploaded remotely"),
-		Some(item) => {
-			info!("File was uploaded remotely");
-			match item {
-				NonRootFileType::File(file) => {
-					let content = client.download_file(&*file).await.unwrap();
-					let content = String::from_utf8_lossy(&content);
-					assert_eq!(content, TEST_FILE_CONTENT);
-					info!("Uploaded file content is correct");
-					client
-						.delete_file_permanently(file.into_owned())
-						.await
-						.unwrap();
-					debug!("Cleaned up remote file");
-				}
-				_ => panic!("Uploaded item is not a file"),
-			}
-		}
-	}
+	let report = daemon
+		.stop(StopOptions {
+			drain_timeout_ms: Some(30_000),
+			grace_ms: 10_000,
+		})
+		.await
+		.unwrap();
+	assert_eq!(report.pending_uploads, 0);
 
-	// wait for process to end
-	network_drive.process.kill().await.unwrap();
-	network_drive.process.wait().await.unwrap();
-	info!("Network drive process killed");
-
-	// cleanup test root dir
 	client
-		.delete_dir_permanently(remote_test_root.into_owned())
+		.delete_dir_permanently(remote_test_root)
 		.await
 		.unwrap();
 }
