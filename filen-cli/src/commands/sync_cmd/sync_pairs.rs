@@ -43,11 +43,7 @@ pub(crate) async fn register_sync_pairs(
 				.context("Failed to find remote directory")?
 			{
 				Some(NonRootFileType::Dir(dir)) => dir.uuid(),
-				Some(NonRootFileType::Root(_)) => {
-					return Err(UI::failure(
-						"Cannot sync the root of the Filen drive, choose a directory inside it",
-					));
-				}
+				Some(NonRootFileType::Root(root)) => root.uuid(),
 				Some(NonRootFileType::File(_)) => {
 					return Err(UI::failure(&format!(
 						"{} is a file, not a directory",
