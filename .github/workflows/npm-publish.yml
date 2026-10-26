@@ -75,6 +75,9 @@ jobs:
           # since even an empty value would drop the other targets' flags too.
           if [[ $target == *-linux-gnu ]]; then
             export RUSTFLAGS=-Zhigher-ranked-assumptions
+            # The toolchain's aarch64 gcc predates the __ARM_ARCH predefine that ring's assembly
+            # checks for, so the build states it (ARMv8, the only aarch64 profile).
+            export CFLAGS_aarch64_unknown_linux_gnu=-D__ARM_ARCH=8
             npm run build:napi:release -- --target "$target" --use-napi-cross
           else
             npm run build:napi:release -- --target "$target"
