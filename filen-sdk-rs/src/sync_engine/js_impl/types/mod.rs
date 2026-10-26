@@ -12,10 +12,10 @@ use crate::{
 	Error, ErrorKind,
 	job::millis,
 	sync_engine::{
-		BaselineInUse, DeleteGuard, GuardReason, HaltReason, IgnoredPath, PairId, PairOverlap,
-		PairRecord, PauseMode, PauseOptions, PlanOutcome, PlannedAction, PlannedActionKind,
-		PlannedConflict, RefuseReason, SyncEvent, SyncMode, SyncReport, TransferDirection,
-		UnsyncablePath, WatchConfig, WatchStatus,
+		BaselineInUse, BaselineSchemaMismatch, DeleteGuard, GuardReason, HaltReason, IgnoredPath,
+		PairId, PairOverlap, PairRecord, PauseMode, PauseOptions, PlanOutcome, PlannedAction,
+		PlannedActionKind, PlannedConflict, RefuseReason, SyncEvent, SyncMode, SyncReport,
+		TransferDirection, UnsyncablePath, WatchConfig, WatchStatus,
 	},
 };
 
@@ -628,6 +628,13 @@ pub struct SyncConflictPage {
 pub enum SyncRefusal {
 	/// Another sync engine, in this process or another, has this baseline DB open.
 	BaselineInUse { path: String },
+	/// This baseline DB is stamped at schema version `found`, and this build reads only `expected`.
+	/// It was left as it was; removing it re-syncs every pair it held from scratch.
+	BaselineSchemaMismatch {
+		path: String,
+		found: i64,
+		expected: i64,
+	},
 	/// Sync pair `pair` already syncs this local folder.
 	LocalRootInUse { pair: u64, existing: String },
 	/// The local folder is inside sync pair `pair`'s.
@@ -646,6 +653,16 @@ impl From<&BaselineInUse> for SyncRefusal {
 	fn from(in_use: &BaselineInUse) -> Self {
 		Self::BaselineInUse {
 			path: in_use.path.to_string_lossy().into_owned(),
+		}
+	}
+}
+
+impl From<&BaselineSchemaMismatch> for SyncRefusal {
+	fn from(mismatch: &BaselineSchemaMismatch) -> Self {
+		Self::BaselineSchemaMismatch {
+			path: mismatch.path.to_string_lossy().into_owned(),
+			found: mismatch.found,
+			expected: mismatch.expected,
 		}
 	}
 }
@@ -687,6 +704,9 @@ impl TryFrom<&PairOverlap> for SyncRefusal {
 pub(crate) fn sync_refusal(error: &Error) -> Option<SyncRefusal> {
 	if let Some(in_use) = error.downcast_ref::<BaselineInUse>() {
 		return Some(in_use.into());
+	}
+	if let Some(mismatch) = error.downcast_ref::<BaselineSchemaMismatch>() {
+		return Some(mismatch.into());
 	}
 	let overlap = error.downcast_ref::<PairOverlap>()?;
 	match SyncRefusal::try_from(overlap) {

@@ -10,6 +10,7 @@ import { copyFileSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSy
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import { performance } from "node:perf_hooks"
+import { DatabaseSync } from "node:sqlite"
 import { after, before, describe, test } from "node:test"
 import { fileURLToPath } from "node:url"
 import { Worker } from "node:worker_threads"
@@ -288,6 +289,7 @@ describe("exports", () => {
 			{ ...SyncRefusal_Tags },
 			tags([
 				"BaselineInUse",
+				"BaselineSchemaMismatch",
 				"LocalRootInUse",
 				"LocalRootNested",
 				"LocalRootContains",
@@ -631,6 +633,34 @@ describe("sync engine, offline", () => {
 			assert.equal(assertThrownLikeUbrn(e).kind(), ErrorKind.Io)
 			return true
 		})
+	})
+
+	test("an open of a baseline at another schema version is refused and leaves it as it was", async () => {
+		const userVersion = path => {
+			const db = new DatabaseSync(path, { readOnly: true })
+			try {
+				return db.prepare("PRAGMA user_version").get().user_version
+			} finally {
+				db.close()
+			}
+		}
+		// The version this build stamps, read off the baseline the suite's engine created.
+		const expected = userVersion(dbPath)
+		const foreignPath = join(dir, "foreign.db")
+		const foreign = new DatabaseSync(foreignPath)
+		foreign.exec("CREATE TABLE something (id INTEGER PRIMARY KEY); PRAGMA user_version = 1000;")
+		foreign.close()
+
+		await assert.rejects(client.openSyncEngine(foreignPath, listener), e => {
+			const inner = assertThrownLikeUbrn(e)
+			assert.equal(inner.kind(), ErrorKind.InvalidState)
+			assert.deepEqual(inner.syncRefusal(), {
+				tag: SyncRefusal_Tags.BaselineSchemaMismatch,
+				inner: { path: foreignPath, found: 1000n, expected: BigInt(expected) }
+			})
+			return true
+		})
+		assert.equal(userVersion(foreignPath), 1000)
 	})
 
 	test("close is idempotent and ends every handle", async () => {

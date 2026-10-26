@@ -37,6 +37,7 @@
 	"SyncGuardReason_RemoteEmptied_Inner": "napi cannot inline a data-enum variant's payload, so it names it; ubrn inlines it in the variant",
 	"SyncGuardReason_RemoteUnconverged_Inner": "napi cannot inline a data-enum variant's payload, so it names it; ubrn inlines it in the variant",
 	"SyncRefusal_BaselineInUse_Inner": "napi cannot inline a data-enum variant's payload, so it names it; ubrn inlines it in the variant",
+	"SyncRefusal_BaselineSchemaMismatch_Inner": "napi cannot inline a data-enum variant's payload, so it names it; ubrn inlines it in the variant",
 	"SyncRefusal_LocalRootContains_Inner": "napi cannot inline a data-enum variant's payload, so it names it; ubrn inlines it in the variant",
 	"SyncRefusal_LocalRootInUse_Inner": "napi cannot inline a data-enum variant's payload, so it names it; ubrn inlines it in the variant",
 	"SyncRefusal_LocalRootNested_Inner": "napi cannot inline a data-enum variant's payload, so it names it; ubrn inlines it in the variant",

@@ -141,8 +141,8 @@ impl FilenSdkErrorNapi {
 #[napi]
 impl FilenSdkErrorNapi {
 	/// The sync refusal this error is, for a UI to act on without reading the message: a baseline
-	/// another sync engine has open, or a pair whose roots overlap an existing one's. `None` for
-	/// every other error.
+	/// another sync engine has open, a baseline at a schema version this build does not read, or a
+	/// pair whose roots overlap an existing one's. `None` for every other error.
 	#[napi(
 		js_name = "syncRefusal",
 		ts_args_type = "",

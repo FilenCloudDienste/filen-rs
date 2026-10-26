@@ -299,7 +299,8 @@ mod class {
 		/// the chunks already handed to the JS thread and those not yet handed over. If it has it
 		/// open for another account, or another environment of this process has it open, or is
 		/// still shutting it down, or another process has it open, this fails with the
-		/// `BaselineInUse` sync refusal.
+		/// `BaselineInUse` sync refusal. A DB at a schema version this build does not read fails
+		/// with the `BaselineSchemaMismatch` one, and is left as it was.
 		///
 		/// The engine closes with this Node environment: when the environment goes away (process
 		/// exit, a worker ending, a reload), its teardown closes every engine it opened that is

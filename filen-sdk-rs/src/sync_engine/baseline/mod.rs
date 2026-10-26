@@ -26,7 +26,7 @@ use crate::cache::open_sqlite;
 use crate::cache::open_sqlite_in_memory;
 
 use super::{
-	engine::PendingKind,
+	engine::{BaselineSchemaMismatch, PendingKind},
 	guard::DeleteGuard,
 	ignore::FILENIGNORE,
 	mode::SyncMode,
@@ -1182,9 +1182,9 @@ impl BaselineStore {
 	}
 
 	/// A fresh DB is created whole and stamped at [`SCHEMA_VERSION`]. An existing one is opened only
-	/// when it carries exactly that version: anything else — older or newer — is refused rather than
-	/// read, since there is no migration chain to bring it here and reading foreign rows under these
-	/// rules would misplan them into deletes.
+	/// when it carries exactly that version: anything else — older or newer — is refused with a
+	/// [`BaselineSchemaMismatch`] rather than read, since there is no migration chain to bring it here
+	/// and reading foreign rows under these rules would misplan them into deletes.
 	fn init(conn: Connection, path: &Path) -> Result<Self, crate::Error> {
 		// Both are per-connection, reset on every open, and neither writes to the file — so they are
 		// safe to apply before this build knows whether the DB is even one it can read. The timeout
@@ -1218,13 +1218,14 @@ impl BaselineStore {
 		if is_unwritten(&conn).map_err(open_error)? {
 			create_schema(&conn, SCHEMA).map_err(open_error)?;
 		} else if version != SCHEMA_VERSION {
-			return Err(crate::Error::custom(
+			return Err(crate::Error::custom_with_source(
 				crate::ErrorKind::InvalidState,
-				format!(
-					"sync baseline DB is at schema version {version}, but this build reads only \
-					 version {SCHEMA_VERSION}: refusing to open it (it was not written by this \
-					 engine; remove the baseline DB to re-sync from scratch)"
-				),
+				BaselineSchemaMismatch {
+					path: path.to_path_buf(),
+					found: version,
+					expected: SCHEMA_VERSION,
+				},
+				None::<&str>,
 			));
 		}
 		// Last, and only once the DB is one this build owns: `journal_mode` is the one pragma here

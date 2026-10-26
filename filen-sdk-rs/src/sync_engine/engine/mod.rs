@@ -2795,6 +2795,28 @@ pub struct BaselineInUse {
 	pub path: PathBuf,
 }
 
+/// Why [`SyncEngine::open`] refused a baseline DB: it is stamped at a schema version this build
+/// does not read. There is no migration chain, so a DB at any other version, older or newer, was
+/// not written by this engine, and reading its rows under these rules would misplan them into
+/// deletes. The DB is left as it was.
+///
+/// Carried as the source of the returned [`Error`], of kind [`ErrorKind::InvalidState`], so a
+/// caller can recover it with [`Error::downcast`].
+#[derive(Debug, thiserror::Error)]
+#[error(
+	"sync baseline DB is at schema version {found}, but this build reads only version \
+	 {expected}: refusing to open it (it was not written by this engine; remove the baseline DB \
+	 to re-sync from scratch)"
+)]
+pub struct BaselineSchemaMismatch {
+	/// The baseline DB that was asked for.
+	pub path: PathBuf,
+	/// The schema version the DB is stamped at (its `PRAGMA user_version`).
+	pub found: i64,
+	/// The one schema version this build reads.
+	pub expected: i64,
+}
+
 /// An exclusive OS lock on `<db>-lock`, the file beside a baseline DB that keeps every other engine
 /// off it for as long as the lock is held (see [`BaselineLock::take`]).
 struct BaselineLock(std::fs::File);
@@ -2896,6 +2918,9 @@ impl SyncEngine {
 	/// lock on the file `<db_path>-lock` until it is dropped; the file itself stays. Where the
 	/// platform has no file locks (Android, on this toolchain), the engine opens without one and
 	/// logs a warning, and a second engine is not refused.
+	///
+	/// A baseline DB stamped at a schema version this build does not read is refused with an
+	/// [`ErrorKind::InvalidState`] error carrying a [`BaselineSchemaMismatch`], and left as it was.
 	pub async fn open(client: Arc<Client>, db_path: PathBuf) -> Result<Self, Error> {
 		// First, so an engine that is refused touches nothing of the baseline another one holds.
 		let lock = BaselineLock::take(&db_path)?;

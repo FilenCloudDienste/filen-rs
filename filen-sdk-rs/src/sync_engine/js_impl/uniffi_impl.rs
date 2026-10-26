@@ -66,7 +66,8 @@ impl JsClient {
 	/// to that engine instead: its watches keep running, and `listener` replaces the old one from
 	/// the next delivery round. The old one still receives the rest of the round in progress. If
 	/// it has it open for another account, or is still shutting it down, or another process has
-	/// it open, this fails with the `BaselineInUse` sync refusal.
+	/// it open, this fails with the `BaselineInUse` sync refusal. A DB at a schema version this
+	/// build does not read fails with the `BaselineSchemaMismatch` one, and is left as it was.
 	/// On Android nothing guards across processes: open it in one process only.
 	pub async fn open_sync_engine(
 		&self,
@@ -82,8 +83,8 @@ impl JsClient {
 #[uniffi::export]
 impl FilenSdkError {
 	/// The sync refusal this error is, for a UI to act on without reading the message: a baseline
-	/// another sync engine has open, or a pair whose roots overlap an existing one's. `None` for
-	/// every other error.
+	/// another sync engine has open, a baseline at a schema version this build does not read, or a
+	/// pair whose roots overlap an existing one's. `None` for every other error.
 	pub fn sync_refusal(&self) -> Option<SyncRefusal> {
 		sync_refusal(self)
 	}

@@ -3,6 +3,7 @@ use std::{path::PathBuf, sync::Arc};
 use super::*;
 use crate::{
 	auth::test_support::offline_client,
+	cache::open_sqlite,
 	sync_engine::{IgnoreLevel, PlannedActionKind, PlannedNodeKind, SyncEngine, UnsyncableReason},
 };
 
@@ -307,6 +308,46 @@ async fn a_baseline_in_use_reads_as_its_refusal() {
 		Some(SyncRefusal::BaselineInUse {
 			path: path.to_string_lossy().into_owned(),
 		})
+	);
+}
+
+/// The refusal an open of a baseline stamped at a schema version this build does not read fails
+/// with, read off the engine's own error and naming both versions, and the DB left as it was.
+#[tokio::test]
+async fn a_baseline_at_another_schema_version_is_refused_as_a_typed_refusal() {
+	let dir = tempfile::tempdir().unwrap();
+	let path = dir.path().join("baseline.db");
+	drop(
+		SyncEngine::open(Arc::new(offline_client()), path.clone())
+			.await
+			.unwrap(),
+	);
+	let user_version = |conn: &rusqlite::Connection| -> i64 {
+		conn.query_row("PRAGMA user_version", [], |row| row.get(0))
+			.unwrap()
+	};
+	let conn = open_sqlite(&path).unwrap();
+	let current = user_version(&conn);
+	conn.execute_batch("PRAGMA user_version = 1000;").unwrap();
+	drop(conn);
+
+	let error = match SyncEngine::open(Arc::new(offline_client()), path.clone()).await {
+		Ok(_) => panic!("an engine opened a baseline at another schema version"),
+		Err(error) => error,
+	};
+	assert_eq!(error.kind(), ErrorKind::InvalidState);
+	assert_eq!(
+		sync_refusal(&error),
+		Some(SyncRefusal::BaselineSchemaMismatch {
+			path: path.to_string_lossy().into_owned(),
+			found: 1000,
+			expected: current,
+		})
+	);
+	assert_eq!(
+		user_version(&open_sqlite(&path).unwrap()),
+		1000,
+		"the refused DB was rewritten"
 	);
 }
 
