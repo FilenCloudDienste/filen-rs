@@ -19,7 +19,7 @@ use std::{
 	time::{Duration, Instant},
 };
 
-use chrono::Utc;
+use chrono::{NaiveDate, Utc};
 use filen_macros::js_type;
 use filen_types::fs::ParentUuid;
 use futures::FutureExt;
@@ -1653,6 +1653,11 @@ pub struct SyncEngine {
 	/// refresh it nor corrupt it. Bounded by the pair count and, within a pair, by the paths it
 	/// blocks rather than by the tree.
 	carried: Mutex<HashMap<PairId, PairCarry>>,
+	/// The UTC day each pair's local bin was last pruned (see
+	/// [`prune_bin_daily`](SyncEngine::prune_bin_daily)), so a pair's passes prune it at most once
+	/// a day. In memory only: the first pass after the engine opens always prunes, which costs one
+	/// listing of the bin's top level. Bounded by the pair count; an entry goes with its pair.
+	bin_pruned: Mutex<HashMap<PairId, NaiveDate>>,
 	/// Bumped once [`set_user_ignore`](SyncEngine::set_user_ignore) has COMMITTED new patterns, so
 	/// every running watch loop runs a pass with them instead of waiting out its safety net. A
 	/// [`watch`](tokio::sync::watch) channel rather than a [`Notify`](tokio::sync::Notify): every
@@ -3077,6 +3082,7 @@ impl SyncEngine {
 			remote_rule_bodies: Mutex::new(HashMap::new()),
 			changes: Mutex::new(HashMap::new()),
 			carried: Mutex::new(HashMap::new()),
+			bin_pruned: Mutex::new(HashMap::new()),
 			user_ignore_changed: tokio::sync::watch::channel(0).0,
 			stages: AtomicU64::new(0),
 			_lock: lock,
@@ -5213,6 +5219,7 @@ impl SyncEngine {
 		// same id — sqlite reuses one — starts from an empty changelist and a forced first pass).
 		self.changes.lock().await.remove(&pair);
 		self.carried.lock().await.remove(&pair);
+		self.bin_pruned.lock().await.remove(&pair);
 		// The pair's connection goes with the pair. Last, so nothing above can reopen it, and the
 		// file handle closes as soon as the cascade above lets this function's own handle go.
 		self.stores.lock().await.remove(&pair);
@@ -5977,6 +5984,61 @@ impl SyncEngine {
 		);
 	}
 
+	/// Prune `pair`'s local bin under `local_root` as of `today` (see [`bin::prune_bin`]), unless it
+	/// was already pruned on `today`. Returns what the prune did, or `None` when it did not run.
+	///
+	/// The prune stops between bin entries once `gate` says the pass is paused or cancelled; a
+	/// prune that stopped does not count, so the pair's next pass prunes again. One that hit errors
+	/// does count — each was logged, and retrying them every pass would only log them again.
+	///
+	/// Housekeeping, so nothing here fails the pass: a prune that panicked is logged and left for
+	/// the next pass.
+	async fn prune_bin_daily(
+		&self,
+		pair: PairId,
+		local_root: &Path,
+		today: NaiveDate,
+		gate: &PassGate,
+	) -> Option<bin::PruneSummary> {
+		if self.bin_pruned.lock().await.get(&pair) == Some(&today) {
+			return None;
+		}
+		// Owned copies for the blocking thread: the root is one path, and the gate's clone is two
+		// channel handles.
+		let root = local_root.to_path_buf();
+		let gate = gate.clone();
+		let summary = match off_runtime("pruning the sync bin", move || {
+			bin::prune_bin(&root, today, || gate.running())
+		})
+		.await
+		{
+			Ok(summary) => summary,
+			Err(e) => {
+				tracing::warn!("sync_once[pair {pair}]: the local bin was not pruned: {e}");
+				return None;
+			}
+		};
+		let bin::PruneSummary {
+			removed,
+			adopted,
+			errors,
+			stopped,
+		} = summary;
+		if removed > 0 || adopted > 0 || errors > 0 {
+			tracing::info!(
+				"sync_once[pair {pair}]: pruned the local bin as of {today}: deleted {removed} \
+				 bucket(s) older than {} days, filed {adopted} undated item(s) under today, \
+				 {errors} error(s){}",
+				bin::RETENTION_DAYS,
+				if stopped { "; stopped by a pause" } else { "" },
+			);
+		}
+		if !stopped {
+			self.bin_pruned.lock().await.insert(pair, today);
+		}
+		Some(summary)
+	}
+
 	/// Where a new stage for a pass of `pair` goes (see [`stage`](super::stage)), numbered by this
 	/// engine so that no two of its passes share one — nor a dry run that stages its own work,
 	/// whatever pass of the same pair is running. A number never made into a stage is skipped.
@@ -6167,6 +6229,17 @@ impl SyncEngine {
 			});
 			return Ok(report);
 		}
+
+		// After the refusal: a pass that will not act on what it read (a name collision on either
+		// side) leaves the bin alone as well. A root that is missing or unmounted has no bin under
+		// it, and the prune creates none (see `bin::prune_bin`).
+		self.prune_bin_daily(
+			pair,
+			Path::new(&prep.record.local_root),
+			Utc::now().date_naive(),
+			&gate,
+		)
+		.await;
 
 		let state = screen_state(&prep);
 		let at = self.stage_at(pair);

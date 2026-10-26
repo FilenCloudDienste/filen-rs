@@ -6,9 +6,9 @@
 //! since the actions are independent and the next pass re-plans from truth. The exception is a
 //! failure no transfer to that side can get past — a full local disk or a full account — which
 //! stops the pass starting any more of those (see [`SyncReport::halted`]). Local deletions move
-//! to the pair's quarantine dir (recoverable); remote deletions go to Filen trash. The local mtime
-//! written to the baseline after a download is read back from disk (not the value we asked for) so
-//! the scanner's fast-path stays stable.
+//! to the pair's quarantine dir (recoverable for 30 days); remote deletions go to Filen trash. The
+//! local mtime written to the baseline after a download is read back from disk (not the value we
+//! asked for) so the scanner's fast-path stays stable.
 
 use std::{
 	collections::{HashMap, HashSet},
@@ -76,8 +76,8 @@ pub struct SyncReport {
 	pub uploaded: usize,
 	pub local_dirs_created: usize,
 	pub remote_dirs_created: usize,
-	/// Items moved into the pair's local quarantine bin — a directory counts once, whatever its
-	/// subtree holds.
+	/// Items moved into the pair's local quarantine bin, where they are kept for 30 days and then
+	/// deleted permanently — a directory counts once, whatever its subtree holds.
 	pub locally_deleted: usize,
 	/// Items moved to the Filen trash — a directory counts once, whatever its subtree holds.
 	pub remotely_trashed: usize,
@@ -120,7 +120,8 @@ pub struct SyncReport {
 	/// Paths whose local copy this pass moved into the pair's quarantine bin to clear the way for a
 	/// write: a remote-wins download over a copy the baseline cannot vouch for, and a move onto an
 	/// occupied destination. The bytes stay recoverable under `.filen-sync-trash`, in the bucket of
-	/// the UTC day the pass moved them (`.filen-sync-trash/YYYY-MM-DD/<path>`).
+	/// the UTC day the pass moved them (`.filen-sync-trash/YYYY-MM-DD/<path>`), for 30 days; then
+	/// the engine deletes that bucket permanently.
 	///
 	/// Nothing else in the report mentions those paths — the edit such a copy holds is by
 	/// definition one no scan could see (that is why the write was planned at all), and no action

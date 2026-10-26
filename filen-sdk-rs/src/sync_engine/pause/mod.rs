@@ -188,6 +188,16 @@ impl PassGate {
 			.is_some_and(|control| *control.borrow() == PassControl::Retired)
 	}
 
+	/// Whether the pass may go on right now: its pair is neither paused nor cancelled nor being
+	/// removed. A cheap synchronous look, for work between steps that cannot await
+	/// [`wait_to_start`](Self::wait_to_start) — housekeeping on a blocking thread, which stops at
+	/// a pause rather than park there.
+	pub(super) fn running(&self) -> bool {
+		self.control
+			.as_ref()
+			.is_none_or(|control| *control.borrow() == PassControl::Run)
+	}
+
 	/// Race `work` against a cancel of the pass. `None` means it was DROPPED where it stood, which
 	/// is safe only for work that has left nothing behind when it is dropped part-way — so this
 	/// wraps an action's NETWORK op alone, never the baseline/journal row that records it: a

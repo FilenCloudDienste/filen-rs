@@ -19,7 +19,10 @@ use crate::{
 		PauseMode,
 		apply::PassStart,
 		baseline::{BaselineChange, LegacyItem, LegacySide, NodeKind},
-		bin::test_support::bucket,
+		bin::{
+			PruneSummary,
+			test_support::{bucket, dated_bin, day},
+		},
 		changes::tests::{cacheable_dir, cacheable_file},
 		derive::Derived,
 		ignore::IgnoreRules,
@@ -5614,6 +5617,86 @@ async fn keeping_remote_quarantines_a_local_edit_the_remote_never_had() {
 	drop(engine);
 	std::fs::remove_file(&path).ok();
 	std::fs::remove_dir_all(&root).ok();
+}
+
+/// A pass prunes its pair's bin at most once a UTC day: the first pass of a day deletes the
+/// expired buckets, a second one that day does not look again, and the next day's does.
+#[tokio::test]
+async fn a_pairs_bin_is_pruned_once_a_day() {
+	let (engine, pair, path) = engine_with_pair("bin_prune_daily").await;
+	let root = tempfile::tempdir().unwrap();
+	dated_bin(root.path());
+	let old = bucket(root.path(), NaiveDate::from_ymd_opt(2026, 9, 1).unwrap());
+	std::fs::create_dir_all(&old).unwrap();
+	let gate = PassGate::default();
+
+	assert_eq!(
+		engine
+			.prune_bin_daily(pair, root.path(), day(), &gate)
+			.await,
+		Some(PruneSummary {
+			removed: 1,
+			adopted: 0,
+			errors: 0,
+			stopped: false,
+		})
+	);
+	assert!(!old.exists());
+
+	std::fs::create_dir_all(&old).unwrap();
+	assert_eq!(
+		engine
+			.prune_bin_daily(pair, root.path(), day(), &gate)
+			.await,
+		None,
+		"the second pass of the day pruned again"
+	);
+	assert!(old.exists());
+
+	let next_day = day().succ_opt().unwrap();
+	assert_eq!(
+		engine
+			.prune_bin_daily(pair, root.path(), next_day, &gate)
+			.await
+			.map(|pruned| pruned.removed),
+		Some(1)
+	);
+	assert!(!old.exists());
+
+	drop(engine);
+	std::fs::remove_file(&path).ok();
+}
+
+/// A prune a pause stopped does not count as the day's: the pair's next pass prunes again.
+#[tokio::test]
+async fn a_bin_prune_stopped_by_a_pause_runs_again_on_the_next_pass() {
+	let (engine, pair, path) = engine_with_pair("bin_prune_paused").await;
+	let root = tempfile::tempdir().unwrap();
+	dated_bin(root.path());
+	let old = bucket(root.path(), NaiveDate::from_ymd_opt(2026, 9, 1).unwrap());
+	std::fs::create_dir_all(&old).unwrap();
+	let paused = PassGate::new(tokio::sync::watch::Sender::new(PassControl::Cancelled));
+
+	assert_eq!(
+		engine
+			.prune_bin_daily(pair, root.path(), day(), &paused)
+			.await
+			.map(|pruned| pruned.stopped),
+		Some(true)
+	);
+	assert!(old.exists(), "a stopped prune deleted a bucket");
+
+	assert_eq!(
+		engine
+			.prune_bin_daily(pair, root.path(), day(), &PassGate::default())
+			.await
+			.map(|pruned| pruned.removed),
+		Some(1)
+	);
+	assert!(!old.exists());
+
+	drop(engine);
+	std::fs::remove_file(&path).ok();
 }
 
 /// A dry run stays a pure read: it takes NO pass gate, so it neither leaves control state behind

@@ -1912,3 +1912,68 @@ async fn delete_during_a_pass_propagates_on_the_next_one() {
 
 	sc.cleanup();
 }
+
+/// A bin laid out as it was before it was filed by day, as a first pass after the upgrade finds
+/// it: a real pass prunes it, filing every top-level entry under today's bucket. That includes an
+/// entry named like a day long past — a deleted user folder named `2019-07-14` — which is the
+/// user's item, not an expired bucket, and must not be deleted.
+#[shared_test_runtime]
+async fn delete_bin_a_pass_files_an_undated_bin_under_today() {
+	let sc = single_client(SyncMode::TwoWay).await;
+	let bin = sc.local.join(".filen-sync-trash");
+	write_file(&bin, "2019-07-14/photo.jpg", b"old photo");
+	write_file(&bin, "loose.txt", b"loose");
+
+	let report = sc.sync().await;
+	assert!(report.errors.is_empty(), "{report:?}");
+	assert_eq!(report.uploaded, 0, "the bin was synced: {report:?}");
+
+	let photo = binned(&sc.local, "2019-07-14/photo.jpg")
+		.expect("the date-named folder was not filed under today's bucket");
+	assert_eq!(std::fs::read(&photo).unwrap(), b"old photo");
+	let loose = binned(&sc.local, "loose.txt").expect("loose.txt was not filed under a bucket");
+	assert_eq!(std::fs::read(&loose).unwrap(), b"loose");
+	assert_eq!(
+		photo.parent().and_then(Path::parent),
+		loose.parent(),
+		"both went to the one bucket of the pass's day"
+	);
+	assert!(!bin.join("loose.txt").exists());
+
+	sc.cleanup();
+}
+
+/// A refused pass (a remote name collision) acts on nothing it read, and leaves the bin alone too:
+/// an un-bucketed entry stays where it is.
+#[cfg(feature = "malformed")]
+#[shared_test_runtime]
+async fn delete_bin_a_refused_pass_leaves_the_bin_alone() {
+	let sc = single_client(SyncMode::TwoWay).await;
+	stage_case_colliding_dirs(&sc, "Readme", "README").await;
+	let bin = sc.local.join(".filen-sync-trash");
+	write_file(&bin, "2019-07-14/photo.jpg", b"old photo");
+	write_file(&bin, "loose.txt", b"loose");
+
+	let report = sc.sync().await;
+	assert_eq!(
+		report.refused,
+		Some(filen_sdk_rs::sync_engine::RefuseReason::RemoteCollision),
+		"{report:?}"
+	);
+
+	assert!(read_eq(&bin, "2019-07-14/photo.jpg", b"old photo"));
+	assert!(read_eq(&bin, "loose.txt", b"loose"));
+	let top: Vec<String> = std::fs::read_dir(&bin)
+		.unwrap()
+		.map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+		.collect::<std::collections::BTreeSet<_>>()
+		.into_iter()
+		.collect();
+	assert_eq!(
+		top,
+		["2019-07-14", "loose.txt"],
+		"the refused pass touched the bin"
+	);
+
+	sc.cleanup();
+}
