@@ -252,7 +252,7 @@ fn dirty_files(meta_dir: &Path) -> Result<u32, Error> {
 	Ok(dirty)
 }
 
-/// Whether something is mounted at a path, as far as `stat` can tell.
+/// Whether something is mounted at a path, as far as `stat` and opening it can tell.
 #[cfg(unix)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MountState {
@@ -260,8 +260,8 @@ pub(crate) enum MountState {
 	NotMounted,
 	/// The path is on a device of its own.
 	Mounted,
-	/// `stat` fails as it does on a mount whose server is gone (`ENOTCONN`, `EIO`, `ENXIO`), or
-	/// does not answer within [`STAT_TIMEOUT`].
+	/// `stat` or opening the path fails as it does on a mount whose server is gone (`ENOTCONN`,
+	/// `EIO`, `ENXIO`), or does not answer within [`STAT_TIMEOUT`].
 	Stale,
 }
 
@@ -293,20 +293,26 @@ fn stat_mount(path: &Path) -> io::Result<MountState> {
 	let metadata = match std::fs::metadata(path) {
 		Ok(metadata) => metadata,
 		Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(MountState::NotMounted),
-		Err(e)
-			if e.kind() == io::ErrorKind::NotConnected
-				|| matches!(e.raw_os_error(), Some(EIO | ENXIO)) =>
-		{
-			return Ok(MountState::Stale);
-		}
+		Err(e) if is_disconnected(&e) => return Ok(MountState::Stale),
 		Err(e) => return Err(e),
 	};
 	let parent = path.parent().unwrap_or(path);
-	Ok(if std::fs::metadata(parent)?.dev() == metadata.dev() {
-		MountState::NotMounted
-	} else {
-		MountState::Mounted
+	if std::fs::metadata(parent)?.dev() == metadata.dev() {
+		return Ok(MountState::NotMounted);
+	}
+	// `stat` may be answered from the kernel's attribute cache, which FUSE on Linux keeps for the
+	// attribute timeout even once the server is gone; opening the directory asks the
+	// server. Any other error still means something is mounted there.
+	Ok(match std::fs::read_dir(path) {
+		Err(e) if is_disconnected(&e) => MountState::Stale,
+		_ => MountState::Mounted,
 	})
+}
+
+/// Whether `e` is what a mount whose server is gone fails with.
+#[cfg(unix)]
+fn is_disconnected(e: &io::Error) -> bool {
+	e.kind() == io::ErrorKind::NotConnected || matches!(e.raw_os_error(), Some(EIO | ENXIO))
 }
 
 /// Unmounts whatever is mounted at `path`, even when it is stale or busy: on macOS
