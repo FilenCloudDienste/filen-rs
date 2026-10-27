@@ -59,15 +59,14 @@ impl RcloneBinary {
 async fn resolve_bundled(path: PathBuf, sha256: Option<[u8; 32]>) -> Result<PathBuf, Error> {
 	tokio::task::spawn_blocking(move || {
 		let mut file = match std::fs::File::open(&path) {
-			Ok(file) => file,
-			Err(e) if e.kind() == io::ErrorKind::NotFound => {
+			Ok(file) if file.metadata()?.is_file() => file,
+			Ok(_) => return Err(RcloneRefusal::BinaryMissing.into()),
+			// Windows refuses to open a directory as a file, with access denied.
+			Err(e) if e.kind() == io::ErrorKind::NotFound || path.is_dir() => {
 				return Err(RcloneRefusal::BinaryMissing.into());
 			}
 			Err(e) => return Err(Error::from(e)),
 		};
-		if !file.metadata()?.is_file() {
-			return Err(RcloneRefusal::BinaryMissing.into());
-		}
 		if let Some(expected) = sha256 {
 			// Streamed: the binary is tens of megabytes.
 			let mut hasher = Sha256::new();
