@@ -361,6 +361,62 @@ fn more_rows_than_a_chunk_are_all_written() {
 	assert_eq!(store.entries(pair).unwrap().len(), count);
 }
 
+/// A preview weighs what a seeding weighs and hands back the rows it would write, in the order it
+/// would write them, writing none.
+#[test]
+fn a_preview_hands_back_the_rows_a_seeding_would_write_and_writes_none() {
+	let (store, pair) = store();
+	let old = seeded_row(
+		"old.bin",
+		&local("old.bin", 5, STAMP),
+		&hashless("old.bin", 1, 5, STAMP),
+	);
+	store.upsert_entry(pair, &old).unwrap();
+	let baseline = store.baseline(pair).unwrap();
+	let locals: HashMap<String, LocalNode> = ["same.bin", "empty.bin", "renamed.bin", "off.bin"]
+		.into_iter()
+		.map(|rel| {
+			let size = if rel == "empty.bin" { 0 } else { 5 };
+			(rel.to_owned(), local(rel, size, STAMP))
+		})
+		.collect();
+	let remotes = [
+		hashless("same.bin", 2, 5, STAMP),
+		hashless("empty.bin", 3, 0, 0),
+		// Recorded at `old.bin` already.
+		hashless("renamed.bin", 1, 5, STAMP),
+		hashless("off.bin", 4, 5, STAMP + 1),
+	];
+	let preview = Preview::new(&store);
+	let counts = seed(
+		&preview,
+		pair,
+		&baseline,
+		&locals,
+		remotes
+			.iter()
+			.map(|node| (Cow::from(node.rel_path.as_str()), Cow::Borrowed(node))),
+		|_| false,
+	)
+	.unwrap();
+	assert_eq!(
+		counts,
+		SeedCounts {
+			imported: 0,
+			empty: 1,
+			size_and_mtime: 1,
+		}
+	);
+	assert_eq!(
+		preview.into_rows(),
+		[
+			seeded_row("same.bin", &locals["same.bin"], &remotes[0]),
+			seeded_row("empty.bin", &locals["empty.bin"], &remotes[1]),
+		]
+	);
+	assert_eq!(store.entries(pair).unwrap(), [old]);
+}
+
 /// What an imported filen-sync state recorded at a path: remote version `uuid`, local `size` and
 /// `local_mtime`.
 fn synced(uuid: u128, size: u64, local_mtime: i64) -> LegacySynced {
@@ -604,8 +660,8 @@ impl SeedStore for Counting<'_> {
 		self.store.synced_paths(pair, uuids, lineages)
 	}
 
-	fn seed_rows(&self, pair: PairId, rows: &[BaselineEntry]) -> rusqlite::Result<()> {
-		self.store.seed_rows(pair, rows)
+	fn seed_rows(&self, pair: PairId, rows: Vec<BaselineEntry>) -> rusqlite::Result<()> {
+		self.store.seed_rows(pair, &rows)
 	}
 }
 

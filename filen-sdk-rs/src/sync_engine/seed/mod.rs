@@ -27,10 +27,12 @@
 //! as a move, and a second `Synced` row for one remote item is the one shape it and the
 //! directory-move fold must never read (see `plan::visit_move_sources`).
 //!
-//! Only a real pass seeds: a dry run, the adoption read of a mode switch and the benchmark read
-//! nothing into the store ([`Seeding::Skip`]).
+//! Only a real pass writes what it seeds into the store. A dry run weighs the same evidence through
+//! the same [`seed`], over the same paths, and reads each row it would write into its own view of
+//! the rows instead ([`Seeding::Preview`]), so it plans what the pass after it would. The adoption
+//! read of a mode switch and the benchmark weigh nothing ([`Seeding::Skip`]).
 
-use std::borrow::Cow;
+use std::{borrow::Cow, cell::RefCell};
 
 use filen_types::fs::StableUuid;
 use uuid::Uuid;
@@ -56,7 +58,10 @@ const SEED_CHUNK: usize = 1024;
 pub(super) enum Seeding {
 	/// A real pass: seed, then plan from the rows as the store holds them.
 	Write,
-	/// A read that writes nothing: a dry run, the adoption read of a mode switch, the benchmark.
+	/// A dry run: weigh what a real pass would, and plan from the rows it would seed, written into
+	/// the read's own view of the rows and never into the store.
+	Preview,
+	/// A read that weighs nothing: the adoption read of a mode switch, the benchmark.
 	Skip,
 }
 
@@ -170,8 +175,9 @@ pub(super) trait SeedStore {
 		uuids: &[Uuid],
 		lineages: &[StableUuid],
 	) -> rusqlite::Result<SyncedPaths>;
-	/// See [`BaselineStore::seed_rows`].
-	fn seed_rows(&self, pair: PairId, rows: &[BaselineEntry]) -> rusqlite::Result<()>;
+	/// See [`BaselineStore::seed_rows`]; the rows are handed over, so a store that keeps them
+	/// copies none.
+	fn seed_rows(&self, pair: PairId, rows: Vec<BaselineEntry>) -> rusqlite::Result<()>;
 }
 
 impl SeedStore for BaselineStore {
@@ -196,8 +202,62 @@ impl SeedStore for BaselineStore {
 		BaselineStore::synced_paths(self, pair, uuids, lineages)
 	}
 
-	fn seed_rows(&self, pair: PairId, rows: &[BaselineEntry]) -> rusqlite::Result<()> {
-		BaselineStore::seed_rows(self, pair, rows)
+	fn seed_rows(&self, pair: PairId, rows: Vec<BaselineEntry>) -> rusqlite::Result<()> {
+		BaselineStore::seed_rows(self, pair, &rows)
+	}
+}
+
+/// A [`SeedStore`] that writes nothing: it reads what the stage asks of `store` and keeps the rows
+/// the stage would write there, for a dry run to read into its own view (see [`Seeding::Preview`]).
+///
+/// Each chunk's rows are asked about against the store as the pass found it, not with the chunks
+/// before it written in, which a real pass reads them against. Those chunks claim nothing a later
+/// one holds: the remote view places each remote item at one path, so no two candidates of one
+/// pass are the same item.
+pub(super) struct Preview<'a> {
+	store: &'a BaselineStore,
+	rows: RefCell<Vec<BaselineEntry>>,
+}
+
+impl<'a> Preview<'a> {
+	pub(super) fn new(store: &'a BaselineStore) -> Self {
+		Self {
+			store,
+			rows: RefCell::new(Vec::new()),
+		}
+	}
+
+	/// The rows the stage would have written, in the order it would have written them.
+	pub(super) fn into_rows(self) -> Vec<BaselineEntry> {
+		self.rows.into_inner()
+	}
+}
+
+impl SeedStore for Preview<'_> {
+	fn has_legacy_synced(&self, pair: PairId) -> rusqlite::Result<bool> {
+		self.store.has_legacy_synced(pair)
+	}
+
+	fn legacy_synced(
+		&self,
+		pair: PairId,
+		rel_path: &str,
+	) -> rusqlite::Result<Option<LegacySynced>> {
+		self.store.legacy_synced(pair, rel_path)
+	}
+
+	fn synced_paths(
+		&self,
+		pair: PairId,
+		uuids: &[Uuid],
+		lineages: &[StableUuid],
+	) -> rusqlite::Result<SyncedPaths> {
+		self.store.synced_paths(pair, uuids, lineages)
+	}
+
+	fn seed_rows(&self, _pair: PairId, rows: Vec<BaselineEntry>) -> rusqlite::Result<()> {
+		self.rows.borrow_mut().extend(rows);
+		Ok(())
 	}
 }
 
@@ -293,7 +353,7 @@ fn write_unclaimed(
 	if unclaimed.is_empty() {
 		return Ok(());
 	}
-	store.seed_rows(pair, &unclaimed)
+	store.seed_rows(pair, unclaimed)
 }
 
 #[cfg(test)]

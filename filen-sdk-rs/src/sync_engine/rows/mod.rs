@@ -27,7 +27,7 @@
 //! | [`unconfirmed`](Baseline::unconfirmed), [`unconfirmed_page`](Baseline::unconfirmed_page) | the unconfirmed rows | the partial index `baseline_unconfirmed`, keyset-paged: on the pass after a whole-tree push it is the tree |
 //! | [`uncarryable_paths`](Baseline::uncarryable_paths) | small set | the partial index `baseline_uncarryable` |
 //! | [`rule_file_rows`](Baseline::rule_file_rows) | small set | the partial index `baseline_rule_files` |
-//! | [`confirm`](Baseline::confirm), [`move_subtree`](Baseline::move_subtree) | pass-private WRITE | a layer of [`Edits`], never a store write (see below) |
+//! | [`confirm`](Baseline::confirm), [`move_subtree`](Baseline::move_subtree), [`write_seeded`](Baseline::write_seeded) | pass-private WRITE | a layer of [`Edits`], never a store write (see below) |
 //!
 //! The whole-set questions a pass asks before it reads either side — the counts, whether anything
 //! is unconfirmed, which rows are uncarryable or rule files — are a counts row and three partial
@@ -54,17 +54,20 @@
 //! are what keep `docsx` out of `docs`: `/` is 0x2F and `0` 0x30, so only a separator continues the
 //! prefix.
 //!
-//! # The two writes, and the fold window
+//! # The writes, and the fold window
 //!
-//! [`move_subtree`](Baseline::move_subtree) (`plan::fold_dir_moves`) and
-//! [`confirm`](Baseline::confirm) (the confirmation, `SyncEngine::confirm`) edit the PASS's view of
-//! the rows, never the store's: a dry run persists neither, and a real pass persists the
-//! confirmations itself and commits the move when it applies it. Each is a LAYER of the pass's
+//! [`move_subtree`](Baseline::move_subtree) (`plan::fold_dir_moves`),
+//! [`confirm`](Baseline::confirm) (the confirmation, `SyncEngine::confirm`) and
+//! [`write_seeded`](Baseline::write_seeded) (a dry run's seeding stage, see `seed`) edit the PASS's
+//! view of the rows, never the store's: a dry run persists none of them, and a real pass persists
+//! the confirmations itself, commits the move when it applies it, and writes what it seeds into the
+//! store and reads the rows again rather than seeding its view. Each is a LAYER of the pass's
 //! [`Edits`], read over the table and the layers beneath it, and each costs what the pass changed:
 //!
 //! - a confirmation is a marker keyed by the path it advanced ([`Block`]) — held one by one up to a
 //!   window of them, and past that read out of the stage the confirmation wrote them into
 //!   ([`Marks::Staged`]), as the bottom layer, keyed by the paths the pass began with;
+//! - a seeded row is a row written ([`Block`]), at a path the view held no row at;
 //! - a folded directory move is the MAPPING it is ([`Layer::Moved`]) — two paths, whatever the moved
 //!   directory holds: a path under the destination is read as the same path under the source, one
 //!   step per layer. That holds because the destination held nothing once the source had left it,
@@ -1479,6 +1482,26 @@ impl Baseline {
 					 without the markers they advanced"
 				)
 			});
+	}
+
+	/// Write each of `rows` — the rows a dry run's seeding stage would record (see `seed`) — at its
+	/// path in THIS view: an edit, like [`move_subtree`](Self::move_subtree), which the dry run
+	/// plans from and never persists.
+	///
+	/// Each is at a path this view holds no row at, as the stage seeds nowhere else (it asks this
+	/// view first), so none replaces a row and the counts only grow.
+	pub(super) fn write_seeded(&mut self, rows: Vec<BaselineEntry>) {
+		if rows.is_empty() {
+			return;
+		}
+		let edits = self.edits_mut();
+		for row in &rows {
+			edits.count(row);
+		}
+		let block = edits.top_block();
+		for row in rows {
+			block.write(row);
+		}
 	}
 
 	/// Advance the marker of each of `rows` — this view's own, each as it stands confirmed — in the

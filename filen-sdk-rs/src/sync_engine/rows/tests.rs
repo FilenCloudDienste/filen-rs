@@ -652,6 +652,43 @@ fn an_edit_never_reaches_the_table() {
 	assert!(!pass.contains_key("docs/a.txt") && pass.contains_key("moved/a.txt"));
 }
 
+/// The rows a dry run seeds read as a copy with them written in does — at fresh paths, under a
+/// directory the table holds rows in, a case variant of a row beside it, over a staged
+/// confirmation and under a move folded after them — and never reach the table.
+#[test]
+fn seeded_rows_answer_as_a_copy_with_them_written_in_does() {
+	let rows = corpus();
+	let before = Baseline::from_rows(rows.clone());
+	let mut view = before.clone();
+	let mut oracle = Tree::from_rows(rows.clone());
+	let (_stage_dir, stage) = Stage::in_temp_dir();
+	confirm_staged(&mut view, &mut oracle, |_| true, stage);
+	let seeded = vec![
+		file("docs/seeded.bin", 21),
+		file("DOCS/A.TXT.bin", 22),
+		file("fresh/deep/seeded.bin", 23),
+	];
+	view.write_seeded(seeded.clone());
+	for row in &seeded {
+		oracle.upsert(row);
+	}
+	let probes = probes(seeded.iter().map(|row| row.rel_path.clone()));
+	assert_alike("seeded", &view, &oracle, &probes);
+	view.move_subtree("docs", "moved");
+	oracle.move_subtree("docs", "moved");
+	assert_alike(
+		"seeded, then moved",
+		&view,
+		&oracle,
+		&probes
+			.iter()
+			.cloned()
+			.chain(["moved/seeded.bin".to_string()])
+			.collect::<Vec<_>>(),
+	);
+	assert_eq!(before.iter().collect::<Vec<_>>(), by_path(rows));
+}
+
 /// A staged confirmation of more markers than the stage reads a page — every other row of a
 /// directory larger than that — reads as markers held one by one do, through a walk across the
 /// stage's page boundaries, lookups in and out of order, and a move of part of it on top.

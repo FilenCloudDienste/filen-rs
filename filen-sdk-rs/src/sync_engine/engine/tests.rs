@@ -8149,6 +8149,307 @@ fn a_scoped_pass_seeds_from_the_imported_state_only_the_paths_it_decides() {
 	assert_eq!(planned_at(&screened, "a.bin"), Vec::<String>::new());
 }
 
+/// [`prepared_on_store`] over a whole read of `local` and `remote` as a pass stages them, so the
+/// seeding stage reads its candidates off the stage's index of hashless files; with that store
+/// and the directory holding the stages.
+fn staged_on_store(
+	mode: SyncMode,
+	local: Vec<LocalNode>,
+	remote: Vec<RemoteNode>,
+) -> (BaselineStore, Prepared, tempfile::TempDir) {
+	let (store, mut prep) = prepared_on_store(mode, Vec::new(), local.clone(), remote.clone());
+	let (stages, local, remote) = stage::staged_sides(local, remote, 2);
+	prep.local_scan.nodes = local;
+	prep.remote_view.nodes = remote;
+	(store, prep, stages)
+}
+
+/// A dry run weighs a hashless file by the evidence a pass weighs it by, and plans nothing at one a
+/// pass would record as synced, in every mode — from the row the pass would write, held in the dry
+/// run's own view of the rows: the store gains none, and the read is still a first sync.
+#[test]
+fn a_dry_run_plans_nothing_at_a_hashless_file_a_pass_would_seed_and_writes_no_row() {
+	for mode in MODES {
+		let (store, mut prep, _stages) = staged_on_store(
+			mode,
+			vec![seed_local("a.bin")],
+			vec![seed_remote("a.bin", 1)],
+		);
+		assert_eq!(
+			prep.preview_unhashed(&store).unwrap(),
+			SeedCounts {
+				imported: 0,
+				empty: 0,
+				size_and_mtime: 1,
+			},
+			"{mode:?}"
+		);
+		assert_eq!(
+			prep.baseline.get("a.bin"),
+			Some(seed::seeded_row(
+				"a.bin",
+				&seed_local("a.bin"),
+				&seed_remote("a.bin", 1)
+			)),
+			"{mode:?}"
+		);
+		let state = screen_state(&prep);
+		assert!(state.first_sync, "{mode:?}");
+		assert_eq!(state.tracked, 0, "{mode:?}");
+		assert_eq!(
+			planned_at(&reconcile_and_screen_resident(&prep, state), "a.bin"),
+			Vec::<String>::new(),
+			"{mode:?}"
+		);
+		assert_eq!(store.entries(prep.record.id).unwrap(), [], "{mode:?}");
+	}
+}
+
+/// A dry run weighs the pair's imported filen-sync state too: a hashless file whose stamps say
+/// nothing, but which that state lists at the remote's version and the local size and mtime, is
+/// planned nothing, and neither the store's rows nor the imported state change.
+#[test]
+fn a_dry_run_plans_nothing_at_a_hashless_file_the_imported_state_lists() {
+	for mode in MODES {
+		let (store, mut prep, _stages) = staged_on_store(
+			mode,
+			vec![touched_local("a.bin")],
+			vec![seed_remote("a.bin", 1)],
+		);
+		import_touched(&store, prep.record.id, &[("a.bin", 1)]);
+		assert_eq!(
+			prep.preview_unhashed(&store).unwrap(),
+			SeedCounts {
+				imported: 1,
+				empty: 0,
+				size_and_mtime: 0,
+			},
+			"{mode:?}"
+		);
+		assert_eq!(
+			planned_at(
+				&reconcile_and_screen_resident(&prep, screen_state(&prep)),
+				"a.bin"
+			),
+			Vec::<String>::new(),
+			"{mode:?}"
+		);
+		assert_eq!(store.entries(prep.record.id).unwrap(), [], "{mode:?}");
+		assert_eq!(
+			store.legacy_synced_count(prep.record.id).unwrap(),
+			1,
+			"{mode:?}"
+		);
+	}
+}
+
+/// Where the evidence does not hold — the stamps differ and the imported state lists another
+/// remote version — a dry run still plans the path, as the pass after it will: a conflict in
+/// two-way, a transfer in the one-way modes.
+#[test]
+fn a_dry_run_still_plans_a_hashless_file_the_evidence_does_not_hold_for() {
+	for mode in MODES {
+		let (store, mut prep, _stages) = staged_on_store(
+			mode,
+			vec![touched_local("a.bin")],
+			vec![seed_remote("a.bin", 1)],
+		);
+		import_touched(&store, prep.record.id, &[("a.bin", 2)]);
+		assert_eq!(
+			prep.preview_unhashed(&store).unwrap(),
+			SeedCounts::default(),
+			"{mode:?}"
+		);
+		assert!(!prep.baseline.contains_key("a.bin"), "{mode:?}");
+		let screened = reconcile_and_screen_resident(&prep, screen_state(&prep));
+		if mode == SyncMode::TwoWay {
+			assert_eq!(conflict_paths(&screened), ["a.bin"]);
+		} else {
+			assert_eq!(transfers(&screened).len(), 1, "{mode:?}");
+		}
+	}
+}
+
+/// A dry run of a pass that will be refused weighs nothing, as the pass seeds nothing.
+#[test]
+fn a_refused_dry_run_weighs_nothing() {
+	let (store, mut prep, _stages) = staged_on_store(
+		SyncMode::TwoWay,
+		vec![seed_local("a.bin")],
+		vec![seed_remote("a.bin", 1)],
+	);
+	prep.local_scan.errors.push(ScanError::DuplicateName {
+		rel_path: "x/Y".to_string(),
+	});
+	assert_eq!(
+		prep.preview_unhashed(&store).unwrap(),
+		SeedCounts::default()
+	);
+	assert!(prep.baseline.is_empty());
+}
+
+/// A dry run reads the rows it would seed over the confirmations the pass made, which stay on the
+/// rows it already had.
+#[test]
+fn the_confirmations_a_dry_run_made_survive_its_seeding() {
+	let pushed = BaselineEntry {
+		agreed_hash: None,
+		..file_row("pushed.bin", Uuid::from_u128(5), hash(4))
+	};
+	let (store, mut prep) = prepared_on_store(
+		SyncMode::TwoWay,
+		vec![pushed.clone()],
+		vec![seed_local("a.bin"), local_file("pushed.bin", hash(4))],
+		vec![
+			seed_remote("a.bin", 1),
+			remote_file("pushed.bin", Uuid::from_u128(5), hash(4), 4),
+		],
+	);
+	prep.baseline.confirm(&Confirmed::Held(vec![BaselineEntry {
+		agreed_hash: Some(hash(4)),
+		..pushed
+	}]));
+	assert_eq!(prep.preview_unhashed(&store).unwrap().total(), 1);
+	assert!(prep.baseline.contains_key("a.bin"));
+	assert_eq!(
+		prep.baseline.get("pushed.bin").unwrap().agreed_hash,
+		Some(hash(4))
+	);
+	assert_eq!(prep.baseline.len(), 2);
+	assert_eq!(store.entries(prep.record.id).unwrap().len(), 1);
+}
+
+/// A remote file's size and `lastModified` as [`cacheable_file`] caches one, with no BLAKE3.
+const CACHED_SIZE: u64 = 7;
+const CACHED_STAMP: i64 = 1_234;
+
+/// An engine with a fresh two-way pair and no rows, whose local root holds `a.bin`, [`CACHED_SIZE`]
+/// bytes stamped `local_mtime`, and whose remote root holds a hashless `a.bin` as
+/// [`cacheable_file`] caches one: what a pair migrated from filen-sync reads first. Offline: the
+/// remote is the cache's rows. With the directory everything is in and the cache, which must
+/// outlive the engine's reads.
+async fn engine_over_a_hashless_file(
+	local_mtime: i64,
+) -> (tempfile::TempDir, SyncEngine, PairId, CacheState) {
+	let dir = tempfile::tempdir().unwrap();
+	let root = dir.path().join("local");
+	std::fs::create_dir(&root).unwrap();
+	let file = root.join("a.bin");
+	std::fs::write(&file, [b'x'; 7]).unwrap();
+	std::fs::File::options()
+		.write(true)
+		.open(&file)
+		.unwrap()
+		.set_modified(
+			std::time::UNIX_EPOCH + Duration::from_millis(u64::try_from(local_mtime).unwrap()),
+		)
+		.unwrap();
+	let account = Uuid::from_u128(1);
+	let remote_root = Uuid::from_u128(2);
+	let cache = dir.path().join("cache.db");
+	let mut state = CacheState::new_on_path(&cache, account);
+	state
+		.upsert_dirs([&cacheable_dir(remote_root, account, "pair")].into_iter())
+		.unwrap();
+	let remote = cacheable_file(Uuid::from_u128(3), remote_root, "a.bin");
+	assert_eq!(
+		(remote.size, remote.last_modified.timestamp_millis()),
+		(CACHED_SIZE, CACHED_STAMP)
+	);
+	state.upsert_files([&remote].into_iter()).unwrap();
+	let client = Arc::new(offline_client());
+	client.configure_cache(cache, |_| {}).await.unwrap();
+	let engine = SyncEngine::open(client, dir.path().join("sync.db"))
+		.await
+		.unwrap();
+	let (pair, _) = locked(&engine.control)
+		.create_pair(root.to_str().unwrap(), remote_root, SyncMode::TwoWay)
+		.unwrap();
+	(dir, engine, pair, state)
+}
+
+/// The paths `pair`'s rows are at, as its store holds them.
+async fn stored_paths(engine: &SyncEngine, pair: PairId) -> Vec<String> {
+	let store = engine.pair_store(pair).await.unwrap();
+	locked(&store)
+		.entries(pair)
+		.unwrap()
+		.into_iter()
+		.map(|row| row.rel_path)
+		.collect()
+}
+
+/// `plan_pair` on a pair that has never synced plans nothing at a hashless file whose size and
+/// stamp match the local one, and writes no row; the pass after it records the row as before.
+#[tokio::test]
+async fn a_dry_run_of_a_never_synced_pair_plans_what_its_first_pass_will() {
+	let (_dir, engine, pair, _cache) = engine_over_a_hashless_file(CACHED_STAMP).await;
+	let outcome = engine.plan_pair(pair).await.unwrap();
+	assert_eq!(outcome.refused, None);
+	assert_eq!(outcome.conflicts, []);
+	assert_eq!(outcome.actions, []);
+	assert_eq!(outcome.held, []);
+	assert_eq!(stored_paths(&engine, pair).await, Vec::<String>::new());
+
+	drop(engine.prepare(pair, None, Seeding::Write).await.unwrap());
+	assert_eq!(stored_paths(&engine, pair).await, ["a.bin"]);
+}
+
+/// The same for a file only the imported filen-sync state vouches for: its local copy was touched
+/// since the hashless upload, and that state lists it at the local size and mtime.
+#[tokio::test]
+async fn a_dry_run_plans_nothing_at_a_file_the_imported_state_lists() {
+	let touched = CACHED_STAMP + 5000;
+	let (_dir, engine, pair, _cache) = engine_over_a_hashless_file(touched).await;
+	let state = tempfile::tempdir().unwrap();
+	std::fs::write(
+		state.path().join("previousLocalTree"),
+		format!(
+			"{{\"prop\":\"/a.bin\",\"data\":{{\"type\":\"file\",\"size\":{CACHED_SIZE},\"lastModified\":{touched}}}}}\n"
+		),
+	)
+	.unwrap();
+	std::fs::write(
+		state.path().join("previousRemoteTree"),
+		format!(
+			"{{\"prop\":\"/a.bin\",\"data\":{{\"type\":\"file\",\"uuid\":\"{}\",\"size\":{CACHED_SIZE}}}}}\n",
+			Uuid::from_u128(3)
+		),
+	)
+	.unwrap();
+	assert_eq!(
+		engine
+			.import_legacy_state(pair, state.path().to_path_buf())
+			.await
+			.unwrap()
+			.imported,
+		1
+	);
+
+	let outcome = engine.plan_pair(pair).await.unwrap();
+	assert_eq!(outcome.conflicts, []);
+	assert_eq!(outcome.actions, []);
+	assert_eq!(stored_paths(&engine, pair).await, Vec::<String>::new());
+
+	drop(engine.prepare(pair, None, Seeding::Write).await.unwrap());
+	assert_eq!(stored_paths(&engine, pair).await, ["a.bin"]);
+}
+
+/// Without evidence — the local copy was touched, and nothing was imported — the dry run still
+/// shows the conflict the pass will hold.
+#[tokio::test]
+async fn a_dry_run_still_shows_the_conflict_where_no_evidence_holds() {
+	let (_dir, engine, pair, _cache) = engine_over_a_hashless_file(CACHED_STAMP + 1).await;
+	let outcome = engine.plan_pair(pair).await.unwrap();
+	let conflicts: Vec<&str> = outcome
+		.conflicts
+		.iter()
+		.map(|conflict| conflict.rel_path.as_str())
+		.collect();
+	assert_eq!(conflicts, ["a.bin"]);
+	assert_eq!(stored_paths(&engine, pair).await, Vec::<String>::new());
+}
+
 /// A filen-sync state directory whose two trees list one file alike.
 fn filen_sync_state() -> tempfile::TempDir {
 	let dir = tempfile::tempdir().unwrap();

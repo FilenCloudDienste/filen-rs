@@ -2340,80 +2340,43 @@ struct Prepared {
 }
 
 impl Prepared {
-	/// The pass's seeding stage (see [`seed`]), on a blocking thread, where `seeding` lets it
-	/// write: the pass comes back reading the rows it seeded.
+	/// The pass's seeding stage (see [`seed`]), on a blocking thread, as `seeding` says: the pass
+	/// comes back reading the rows it seeded, written into the store or, on a dry run, into its own
+	/// view of the rows alone.
 	///
 	/// Run after everything else the read does and before the directory-move fold, the one step that
 	/// layers more onto the rows than the confirmations: a fresh snapshot keeps neither, and this
 	/// puts the confirmations back.
 	async fn seeded(self, store: &SharedStore, seeding: Seeding) -> Result<Self, Error> {
-		match seeding {
-			Seeding::Skip => Ok(self),
-			Seeding::Write => {
-				let store = Arc::clone(store);
-				let (prepared, seeded) = off_runtime(
-					"recording the hashless files both sides agree on",
-					move || {
-						let mut prepared = self;
-						let seeded = prepared.seed_unhashed(&locked(&store));
-						(prepared, seeded)
-					},
-				)
-				.await?;
-				seeded?;
-				Ok(prepared)
-			}
-		}
+		let seed: fn(&mut Self, &BaselineStore) -> Result<SeedCounts, Error> = match seeding {
+			Seeding::Write => Self::seed_unhashed,
+			Seeding::Preview => Self::preview_unhashed,
+			Seeding::Skip => return Ok(self),
+		};
+		let store = Arc::clone(store);
+		let (prepared, seeded) = off_runtime(
+			"recording the hashless files both sides agree on",
+			move || {
+				let mut prepared = self;
+				let seeded = seed(&mut prepared, &locked(&store));
+				(prepared, seeded)
+			},
+		)
+		.await?;
+		seeded?;
+		Ok(prepared)
 	}
 
 	/// Record as synced every rowless path where both sides hold a file the remote has no BLAKE3
 	/// for and the evidence says the two agree (see [`seed`]), then read the rows again so the plan
 	/// sees them. Returns what it recorded, by evidence.
 	///
-	/// The candidates are what this pass decides: on a whole read the remote view's hashless files,
-	/// read off the stage's index of them; on a change-scoped one the paths its read decided. A path
-	/// the pass would not act on — held, blocked, hidden or failing — is left for a pass that does,
-	/// and a pass that will be refused writes nothing at all.
-	///
 	/// The rows are read again from the store rather than layered onto this pass's view, and the
 	/// confirmations the pass found are put back on them; the guard's first-sync and tracked counts
 	/// stay what the pass started from ([`tracked_at_start`](Self::tracked_at_start)).
 	fn seed_unhashed(&mut self, store: &BaselineStore) -> Result<SeedCounts, Error> {
-		if refusal(self).is_some() {
-			return Ok(SeedCounts::default());
-		}
 		let pair = self.record.id;
-		let seeded = {
-			let blocked = self.blocked_paths();
-			let skip = |path: &str| {
-				self.hides(path)
-					|| plan::at_or_under_root(&blocked, path)
-					|| plan::is_under_held_path(path, &self.holds.held_remote)
-			};
-			let local = self.local_scan.nodes.of(&self.baseline);
-			let remote = self.remote_view.nodes.of(&self.baseline);
-			match &self.read {
-				PassRead::Whole(_) => seed::seed(
-					store,
-					pair,
-					&self.baseline,
-					&local,
-					remote.unhashed_files(),
-					skip,
-				),
-				PassRead::Scoped(decided) => seed::seed(
-					store,
-					pair,
-					&self.baseline,
-					&local,
-					decided.iter().filter_map(|path| {
-						remote.at(path).map(|node| (Cow::from(path.as_str()), node))
-					}),
-					skip,
-				),
-			}
-			.map_err(|e| db_error(e, "recording the hashless files both sides agree on"))?
-		};
+		let seeded = self.weigh_unhashed(store)?;
 		if seeded.total() == 0 {
 			return Ok(seeded);
 		}
@@ -2434,6 +2397,67 @@ impl Prepared {
 		fresh.confirm(&self.confirmed);
 		self.baseline = fresh;
 		Ok(seeded)
+	}
+
+	/// [`seed_unhashed`](Self::seed_unhashed) for a dry run: weigh the same paths by the same
+	/// evidence, and write each row a pass would record into this read's own view of the rows
+	/// instead of into `store`, which it only reads. Returns what a pass would record, by evidence.
+	fn preview_unhashed(&mut self, store: &BaselineStore) -> Result<SeedCounts, Error> {
+		let preview = seed::Preview::new(store);
+		let seeded = self.weigh_unhashed(&preview)?;
+		if seeded.total() > 0 {
+			tracing::debug!(
+				"plan_pair[pair {}]: reading {} hashless remote file(s) as synced with the local one, \
+				 as a pass would record them",
+				self.record.id,
+				seeded.total()
+			);
+			self.baseline.write_seeded(preview.into_rows());
+		}
+		Ok(seeded)
+	}
+
+	/// The seeding stage's weighing, through `store` (see [`seed`]): every candidate this pass
+	/// decides that the evidence records as synced is handed to the store's
+	/// [`seed_rows`](seed::SeedStore::seed_rows). Returns what was handed over, by evidence.
+	///
+	/// The candidates are what this pass decides: on a whole read the remote view's hashless files,
+	/// read off the stage's index of them; on a change-scoped one the paths its read decided. A path
+	/// the pass would not act on — held, blocked, hidden or failing — is left for a pass that does,
+	/// and a pass that will be refused weighs nothing at all.
+	fn weigh_unhashed(&self, store: &impl seed::SeedStore) -> Result<SeedCounts, Error> {
+		if refusal(self).is_some() {
+			return Ok(SeedCounts::default());
+		}
+		let blocked = self.blocked_paths();
+		let skip = |path: &str| {
+			self.hides(path)
+				|| plan::at_or_under_root(&blocked, path)
+				|| plan::is_under_held_path(path, &self.holds.held_remote)
+		};
+		let local = self.local_scan.nodes.of(&self.baseline);
+		let remote = self.remote_view.nodes.of(&self.baseline);
+		match &self.read {
+			PassRead::Whole(_) => seed::seed(
+				store,
+				self.record.id,
+				&self.baseline,
+				&local,
+				remote.unhashed_files(),
+				skip,
+			),
+			PassRead::Scoped(decided) => seed::seed(
+				store,
+				self.record.id,
+				&self.baseline,
+				&local,
+				decided.iter().filter_map(|path| {
+					remote.at(path).map(|node| (Cow::from(path.as_str()), node))
+				}),
+				skip,
+			),
+		}
+		.map_err(|e| db_error(e, "recording the hashless files both sides agree on"))
 	}
 
 	/// Carry each directory move across as one move — a case-only rename included — and read the
@@ -3546,7 +3570,9 @@ impl SyncEngine {
 			// A read that fails panics as a pass's does, and is this call's error as a pass's is.
 			Backlog::AdoptDestination => {
 				pass_panics_as_errors(pair, "the adoption read", async {
-					// A read, not a pass: it seeds nothing.
+					// A read, not a pass: it seeds nothing, and weighs nothing either. A seeded row is
+					// for a path both sides hold, and the adoption writes rows only where one side has
+					// nothing, so what the stage would record changes nothing it adopts.
 					let prep = self.prepare(pair, None, Seeding::Skip).await?;
 					// The adoption rewrites baseline rows from this one read, and every row it writes
 					// is for a path it reads as GONE on the source side — so it needs the same
@@ -4231,8 +4257,9 @@ impl SyncEngine {
 	/// `scope` is the pass's changelists, taken before this runs. `None` is a dry run, which always
 	/// reads whole: it is rare, and its report has to show the whole picture (plan 3.5).
 	///
-	/// `seeding` says whether the read may record hashless files both sides agree on before it hands
-	/// the pass over (see [`seed`]): only a pass that goes on to apply writes them.
+	/// `seeding` says whether the read weighs the hashless files both sides agree on before it hands
+	/// the pass over (see [`seed`]), and where it records them: only a pass that goes on to apply
+	/// writes them into the store, and a dry run reads them into its own view.
 	async fn prepare(
 		&self,
 		pair: PairId,
@@ -5034,10 +5061,10 @@ impl SyncEngine {
 	/// touching nothing — it runs the same [`prepare`](Self::prepare), so it makes that read's
 	/// server calls and retires the journal records that read settles. What it does NOT do is
 	/// persist the confirmations it observed, nor record as synced the hashless remote files a pass
-	/// would (see [`sync_once`](Self::sync_once)): where a pass would find the evidence that a
-	/// hashless file agrees with the local one and plan nothing there, a dry run of a path that has
-	/// never synced shows the conflict (two-way) or the transfer (one-way) that the evidence spares
-	/// the pass. A [`paused`](Self::pause_pair) pair is planned like any other.
+	/// would (see [`sync_once`](Self::sync_once)): it weighs the same evidence at the same paths and
+	/// plans from the rows a pass would record, held in its own read alone, so where a pass would
+	/// plan nothing at a hashless file that agrees with the local one, so does the dry run. A
+	/// [`paused`](Self::pause_pair) pair is planned like any other.
 	///
 	/// A read that fails is the call's error, as it is a pass's: a baseline read that fails panics
 	/// on purpose, and that panic comes back here as an [`ErrorKind::Internal`] error.
@@ -5053,7 +5080,7 @@ impl SyncEngine {
 
 	/// [`plan_pair`](Self::plan_pair), up to giving back the page caches its read filled.
 	async fn plan_pair_unreleased(&self, pair: PairId) -> Result<PlanOutcome, Error> {
-		let prep = self.prepare(pair, None, Seeding::Skip).await?;
+		let prep = self.prepare(pair, None, Seeding::Preview).await?;
 		if let Some(reason) = refusal(&prep) {
 			return Ok(PlanOutcome {
 				refused: Some(reason),
