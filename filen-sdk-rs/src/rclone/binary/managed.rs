@@ -3,7 +3,10 @@
 
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt as _;
-use std::path::{Path, PathBuf};
+use std::{
+	path::{Path, PathBuf},
+	time::Duration,
+};
 
 use hex_literal::hex;
 use sha2::{Digest as _, Sha256};
@@ -89,8 +92,19 @@ pub(crate) async fn ensure(config_dir: &Path, allow_download: bool) -> Result<Pa
 			("macos", "aarch64") => RCLONE_CHECKSUM_OSX_ARM64,
 			_ => unreachable!(),
 		};
-		let zip_part_path = config_dir.join(format!("{}.zip{}", rclone_zip_name, PART_SUFFIX));
-		let binary_part_path = part_path(&rclone_binary_path);
+		fs::create_dir_all(config_dir)
+			.await
+			.context("Failed to create the Rclone directory")?;
+		// Downloads into one directory may run at once (threads, or several processes), so each
+		// attempt writes to parts of its own: a part another attempt renamed into place, or
+		// truncated, while this one was still writing to it would leave a corrupt binary, which
+		// macOS kills on exec once its pages no longer match its signature.
+		let attempt = format!("{}-{:016x}", std::process::id(), rand::random::<u64>());
+		let zip_part_path = part_path(
+			&config_dir.join(format!("{}.zip", rclone_zip_name)),
+			&attempt,
+		);
+		let binary_part_path = part_path(&rclone_binary_path, &attempt);
 		let downloaded = async {
 			download_verified(
 				&rclone_zip_download_url,
@@ -112,9 +126,7 @@ pub(crate) async fn ensure(config_dir: &Path, allow_download: bool) -> Result<Pa
 			remove_if_present(&binary_part_path).await;
 			return Err(e);
 		}
-		fs::rename(&binary_part_path, &rclone_binary_path)
-			.await
-			.context("Failed to move the Rclone binary into place")?;
+		install(&binary_part_path, &rclone_binary_path).await?;
 		prune_other_versions(config_dir, &rclone_binary_path).await;
 	}
 
@@ -122,15 +134,52 @@ pub(crate) async fn ensure(config_dir: &Path, allow_download: bool) -> Result<Pa
 	Ok(rclone_binary_path)
 }
 
-/// What a file being written is called until it is complete. Nothing reads a path with it: a
+/// What a file being written ends in until it is complete. Nothing reads a path with it: a
 /// download or extraction cut short by a crash leaves only such a file, never a truncated binary
 /// at the path that is taken as installed.
 const PART_SUFFIX: &str = ".part";
 
-fn part_path(path: &Path) -> PathBuf {
+/// How long a part goes unmodified before pruning takes it for a crashed attempt's. A download
+/// in progress writes to its part as the release arrives, and extraction follows it at once.
+const STALE_PART_AGE: Duration = Duration::from_secs(60 * 60);
+
+/// `path` as `attempt` writes it before it is complete: `<path>.<attempt>.part`.
+fn part_path(path: &Path, attempt: &str) -> PathBuf {
 	let mut name = path.as_os_str().to_os_string();
-	name.push(PART_SUFFIX);
+	name.push(format!(".{attempt}{PART_SUFFIX}"));
 	PathBuf::from(name)
+}
+
+/// Moves the complete binary at `part` to `target`, unless another attempt installed one there
+/// meanwhile: that one stays, since it may already be running, and `part` is removed.
+///
+/// A hard link is the move that fails rather than replace an existing file. On a filesystem
+/// without hard links it is a rename once `target` is found missing, which can replace a binary
+/// installed in between; that binary is as complete as this one, and a process already running
+/// it keeps running its own file.
+async fn install(part: &Path, target: &Path) -> Result<(), Error> {
+	match fs::hard_link(part, target).await {
+		Ok(()) => {}
+		Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+			debug!(
+				"Another download installed {} first, discarding this one",
+				target.display()
+			);
+		}
+		Err(e) => {
+			debug!("Failed to hard-link the Rclone binary into place, renaming it instead: {e}");
+			if !fs::try_exists(target)
+				.await
+				.context("Failed to move the Rclone binary into place")?
+			{
+				return fs::rename(part, target)
+					.await
+					.context("Failed to move the Rclone binary into place");
+			}
+		}
+	}
+	remove_if_present(part).await;
+	Ok(())
 }
 
 /// Streams `url` into `path`, checking it against `expected_sha256` as it is written, without
@@ -209,8 +258,9 @@ async fn extract_rclone(zip_path: &Path, entry: String, binary_path: &Path) -> R
 }
 
 /// Removes every other managed release from `dir`: older versions' binaries, and the parts a
-/// cut-short download left. Only what a managed download names `rclone-v*` is touched; a file
-/// that cannot be removed is logged and left.
+/// cut-short download left. Only what a managed download names `rclone-v*` is touched, and a part
+/// only once it is [`STALE_PART_AGE`] old, since a younger one may be another attempt's still in
+/// progress. A file that cannot be removed or dated is logged and left.
 async fn prune_other_versions(dir: &Path, keep: &Path) {
 	let mut entries = match fs::read_dir(dir).await {
 		Ok(entries) => entries,
@@ -235,8 +285,25 @@ async fn prune_other_versions(dir: &Path, keep: &Path) {
 			}
 		};
 		let path = entry.path();
-		if path == keep || !entry.file_name().to_string_lossy().starts_with("rclone-v") {
+		let name = entry.file_name();
+		let name = name.to_string_lossy();
+		if path == keep || !name.starts_with("rclone-v") {
 			continue;
+		}
+		if name.ends_with(PART_SUFFIX) {
+			let age = entry
+				.metadata()
+				.await
+				.and_then(|metadata| metadata.modified())
+				.map(|modified| modified.elapsed().unwrap_or_default());
+			match age {
+				Ok(age) if age > STALE_PART_AGE => {}
+				Ok(_) => continue,
+				Err(e) => {
+					warn!("Failed to date the Rclone part {}: {e}", path.display());
+					continue;
+				}
+			}
 		}
 		if let Err(e) = fs::remove_file(&path).await {
 			warn!(
@@ -257,7 +324,11 @@ async fn remove_if_present(path: &Path) {
 
 #[cfg(test)]
 mod tests {
+	use std::time::SystemTime;
+
 	use super::*;
+
+	const ATTEMPT: &str = "1234-00000000000000ff";
 
 	/// The managed binary's name on every platform, so a test can plant its leftovers here.
 	fn every_platform_binary_name() -> Vec<String> {
@@ -270,15 +341,45 @@ mod tests {
 		names
 	}
 
+	/// Writes `path`, last modified `age` ago.
+	fn plant(path: &Path, age: Duration) {
+		std::fs::write(path, b"x").unwrap();
+		std::fs::File::options()
+			.write(true)
+			.open(path)
+			.unwrap()
+			.set_modified(SystemTime::now() - age)
+			.unwrap();
+	}
+
+	fn names_in(dir: &Path) -> Vec<String> {
+		let mut names = std::fs::read_dir(dir)
+			.unwrap()
+			.map(|entry| entry.unwrap().file_name().into_string().unwrap())
+			.collect::<Vec<_>>();
+		names.sort();
+		names
+	}
+
+	#[test]
+	fn each_attempt_writes_its_own_part() {
+		let binary = Path::new("/cache/rclone-v1.74.4-osx-arm64");
+
+		assert_eq!(
+			part_path(binary, ATTEMPT),
+			Path::new("/cache/rclone-v1.74.4-osx-arm64.1234-00000000000000ff.part")
+		);
+		assert_ne!(
+			part_path(binary, ATTEMPT),
+			part_path(binary, "1234-00000000000000fe")
+		);
+	}
+
 	#[tokio::test]
 	async fn a_part_file_left_by_a_crash_is_never_taken_as_the_binary() {
 		let dir = tempfile::tempdir().unwrap();
 		for name in every_platform_binary_name() {
-			std::fs::write(
-				dir.path().join(format!("{name}{PART_SUFFIX}")),
-				b"truncated",
-			)
-			.unwrap();
+			std::fs::write(part_path(&dir.path().join(name), ATTEMPT), b"truncated").unwrap();
 		}
 
 		let error = ensure(dir.path(), false).await.unwrap_err();
@@ -291,33 +392,88 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn installing_moves_the_part_into_place() {
+		let dir = tempfile::tempdir().unwrap();
+		let target = dir.path().join("rclone");
+		let part = part_path(&target, ATTEMPT);
+		std::fs::write(&part, b"rclone binary").unwrap();
+
+		install(&part, &target).await.unwrap();
+
+		assert_eq!(std::fs::read(&target).unwrap(), b"rclone binary");
+		assert_eq!(names_in(dir.path()), ["rclone"]);
+	}
+
+	#[tokio::test]
+	async fn installing_never_replaces_a_binary_another_attempt_installed() {
+		let dir = tempfile::tempdir().unwrap();
+		let target = dir.path().join("rclone");
+		let part = part_path(&target, ATTEMPT);
+		std::fs::write(&target, b"installed first").unwrap();
+		std::fs::write(&part, b"installed second").unwrap();
+
+		install(&part, &target).await.unwrap();
+
+		assert_eq!(std::fs::read(&target).unwrap(), b"installed first");
+		assert_eq!(names_in(dir.path()), ["rclone"]);
+	}
+
+	#[tokio::test]
 	async fn pruning_keeps_the_current_binary_and_what_is_not_a_managed_release() {
 		let dir = tempfile::tempdir().unwrap();
 		let keep = dir
 			.path()
 			.join(format!("rclone-v{RCLONE_VERSION}-osx-arm64"));
-		for name in [
-			format!("rclone-v{RCLONE_VERSION}-osx-arm64"),
-			format!("rclone-v{RCLONE_VERSION}-osx-arm64{PART_SUFFIX}"),
-			format!("rclone-v{RCLONE_VERSION}-osx-arm64.zip{PART_SUFFIX}"),
-			"rclone-v1.0.0-osx-arm64".to_string(),
-			"rclone.conf".to_string(),
-		] {
-			std::fs::write(dir.path().join(name), b"x").unwrap();
-		}
+		let stale = STALE_PART_AGE + Duration::from_secs(60);
+		plant(&keep, stale);
+		plant(&part_path(&keep, ATTEMPT), stale);
+		plant(
+			&part_path(
+				&dir.path()
+					.join(format!("rclone-v{RCLONE_VERSION}-osx-arm64.zip")),
+				ATTEMPT,
+			),
+			stale,
+		);
+		plant(
+			&dir.path()
+				.join(format!("rclone-v{RCLONE_VERSION}-osx-arm64{PART_SUFFIX}")),
+			stale,
+		);
+		plant(&dir.path().join("rclone-v1.0.0-osx-arm64"), Duration::ZERO);
+		plant(&dir.path().join("rclone.conf"), stale);
 
 		prune_other_versions(dir.path(), &keep).await;
 
-		let mut left = std::fs::read_dir(dir.path())
-			.unwrap()
-			.map(|entry| entry.unwrap().file_name().into_string().unwrap())
-			.collect::<Vec<_>>();
-		left.sort();
 		assert_eq!(
-			left,
+			names_in(dir.path()),
 			[
 				format!("rclone-v{RCLONE_VERSION}-osx-arm64"),
 				"rclone.conf".to_string()
+			]
+		);
+	}
+
+	#[tokio::test]
+	async fn pruning_leaves_the_parts_of_a_download_still_in_progress() {
+		let dir = tempfile::tempdir().unwrap();
+		let keep = dir
+			.path()
+			.join(format!("rclone-v{RCLONE_VERSION}-osx-arm64"));
+		std::fs::write(&keep, b"x").unwrap();
+		let zip_part = format!("rclone-v{RCLONE_VERSION}-osx-arm64.zip.{ATTEMPT}{PART_SUFFIX}");
+		let binary_part = format!("rclone-v{RCLONE_VERSION}-osx-arm64.{ATTEMPT}{PART_SUFFIX}");
+		plant(&dir.path().join(&zip_part), Duration::from_secs(60));
+		plant(&dir.path().join(&binary_part), Duration::ZERO);
+
+		prune_other_versions(dir.path(), &keep).await;
+
+		assert_eq!(
+			names_in(dir.path()),
+			[
+				format!("rclone-v{RCLONE_VERSION}-osx-arm64"),
+				binary_part,
+				zip_part,
 			]
 		);
 	}

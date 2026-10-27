@@ -25,26 +25,38 @@ const GRACEFUL: StopOptions = StopOptions {
 };
 
 fn binary() -> RcloneBinary {
-	if let Some(path) = std::env::var_os("FILEN_TEST_RCLONE") {
-		return RcloneBinary::Bundled {
-			path: PathBuf::from(path),
-			sha256: None,
-		};
-	}
-	managed_binary()
+	let path = match std::env::var_os("FILEN_TEST_RCLONE") {
+		Some(path) => PathBuf::from(path),
+		None => managed_rclone().to_path_buf(),
+	};
+	RcloneBinary::Bundled { path, sha256: None }
 }
 
+/// The managed download, resolved once per test binary: the tests run in parallel, and on an
+/// empty cache each would download the release itself.
 #[cfg(feature = "rclone-managed")]
-fn managed_binary() -> RcloneBinary {
-	RcloneBinary::Managed {
-		dir: dirs::cache_dir()
-			.expect("no user cache directory for the managed rclone")
-			.join("filen-rs-rclone-daemon-tests"),
-	}
+fn managed_rclone() -> &'static Path {
+	static PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+	PATH.get_or_init(|| {
+		let managed = RcloneBinary::Managed {
+			dir: dirs::cache_dir()
+				.expect("no user cache directory for the managed rclone")
+				.join("filen-rs-rclone-daemon-tests"),
+		};
+		// On a runtime of its own: the calling test's runtime is blocked until it is resolved.
+		std::thread::spawn(move || {
+			tokio::runtime::Runtime::new()
+				.unwrap()
+				.block_on(managed.resolve())
+				.unwrap()
+		})
+		.join()
+		.unwrap()
+	})
 }
 
 #[cfg(not(feature = "rclone-managed"))]
-fn managed_binary() -> RcloneBinary {
+fn managed_rclone() -> &'static Path {
 	panic!("set FILEN_TEST_RCLONE to an rclone binary, or enable `rclone-managed`")
 }
 
@@ -318,6 +330,38 @@ async fn stop_rclone_under_ignores_other_binaries() {
 			.is_err(),
 		"an rclone outside the directory was stopped"
 	);
+}
+
+/// Downloads of the managed release into one empty directory at once all resolve to one binary,
+/// which runs, and leave nothing else behind.
+#[cfg(feature = "rclone-managed")]
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_managed_downloads_install_one_runnable_binary() {
+	let dir = tempfile::tempdir().unwrap();
+	let managed = RcloneBinary::Managed {
+		dir: dir.path().to_path_buf(),
+	};
+	let mut downloads = tokio::task::JoinSet::new();
+	for _ in 0..3 {
+		let managed = managed.clone();
+		downloads.spawn(async move { managed.resolve().await.unwrap() });
+	}
+
+	let paths = downloads.join_all().await;
+
+	assert!(paths.iter().all(|path| *path == paths[0]));
+	let left = std::fs::read_dir(dir.path())
+		.unwrap()
+		.map(|entry| entry.unwrap().path())
+		.collect::<Vec<_>>();
+	assert_eq!(left, [paths[0].clone()]);
+	let version = tokio::process::Command::new(&paths[0])
+		.arg("version")
+		.output()
+		.await
+		.unwrap();
+	assert!(version.status.success(), "{version:?}");
+	assert!(version.stdout.starts_with(b"rclone v"), "{version:?}");
 }
 
 /// An `rclone rcd` that does nothing until it is stopped.
