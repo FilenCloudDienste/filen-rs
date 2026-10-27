@@ -426,6 +426,33 @@ async fn eventually_holds(path: &Path, content: &str, timeout: Duration) -> bool
 	false
 }
 
+/// Waits up to 5 s for the VFS to queue `name`, `size` bytes, for upload, and asserts that its
+/// upload has not started.
+#[cfg(unix)]
+async fn wait_queued_for_upload(daemon: &RcloneDaemon, name: &str, size: usize) {
+	let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+	loop {
+		let queue = daemon
+			.rc_call_for_test("vfs/queue", &json!({}))
+			.await
+			.unwrap();
+		if let Some(item) = queue["queue"]
+			.as_array()
+			.unwrap()
+			.iter()
+			.find(|item| item["name"] == name && item["size"] == size)
+		{
+			assert_eq!(item["uploading"], json!(false), "{queue}");
+			return;
+		}
+		assert!(
+			tokio::time::Instant::now() < deadline,
+			"{name} was not queued for upload: {queue}"
+		);
+		tokio::time::sleep(Duration::from_millis(20)).await;
+	}
+}
+
 #[cfg(unix)]
 fn kill_9(pid: u32) {
 	let killed = std::process::Command::new("kill")
@@ -538,6 +565,10 @@ async fn a_dirty_cache_item_is_uploaded_on_the_next_start() {
 	tokio::fs::write(Path::new(&mount_point).join("file.txt"), "content")
 		.await
 		.unwrap();
+	// FUSE hands rclone the close after `close` has returned, and rclone then rewrites the
+	// file's cache metadata by truncating it first: a kill in that window leaves it empty, and
+	// the next rclone drops the file as corrupt. Once queued the metadata is on disk.
+	wait_queued_for_upload(&crashed, "file.txt", "content".len()).await;
 	// Well inside the 5 s write-back delay: the file is only in the cache.
 	kill_9(crashed.pid());
 	tokio::time::timeout(Duration::from_secs(10), crashed.exited())
