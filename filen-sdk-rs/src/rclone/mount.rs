@@ -203,7 +203,7 @@ async fn usable_mount_point(mount_point: &str, mounted: &[String]) -> Result<Str
 			.with_context(format!("{mount_point}: not a drive letter"))
 	})?;
 	let drive = format!("{letter}:");
-	let in_use = mounted.iter().any(|known| *known == drive)
+	let in_use = mounted.contains(&drive)
 		|| tokio::fs::try_exists(format!(r"{drive}\"))
 			.await
 			.unwrap_or(true);
