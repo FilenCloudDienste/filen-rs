@@ -9,6 +9,7 @@
 use std::{
 	borrow::Cow,
 	collections::{BTreeMap, BTreeSet, HashMap, HashSet, btree_map},
+	ffi::OsStr,
 	hash::Hash,
 };
 
@@ -24,7 +25,7 @@ use super::{
 	ignore::{IgnoreDecision, IgnoreLevel, IgnoreRules},
 	outcome::{UnsyncablePath, UnsyncableReason},
 	rows::Baseline,
-	scan::{LocalNode, QUARANTINE_DIR, collision_hash, collision_key},
+	scan::{LocalNode, QUARANTINE_DIR, collision_hash, collision_key, is_legacy_trash},
 	side::{Nodes, NodesAt, Side, SideRef},
 };
 use crate::cache::{RemoteItem, UndecodableItem};
@@ -305,11 +306,18 @@ pub(super) fn join_path(parent_path: &str, name: &str) -> String {
 	}
 }
 
-/// Whether `rel_path` is the local quarantine dir or inside it. The local scan never lists it, so
-/// the remote view leaves out a remote folder that happens to carry the name too — it is never
-/// mistaken for (or synced into) the quarantine area.
-pub(super) fn in_quarantine(rel_path: &str) -> bool {
-	rel_path == QUARANTINE_DIR || rel_path.starts_with(&format!("{QUARANTINE_DIR}/"))
+/// Whether `rel_path` is a path the engine never syncs: the local quarantine dir or inside it, or a
+/// path with filen-sync's trash folder as any component (see [`is_legacy_trash`]). The local scan
+/// never lists either, so the remote view leaves out a remote item that happens to carry the name
+/// too, with everything under it: it is never mistaken for (or synced into) the quarantine area,
+/// never downloaded, and never trashed by a deletion propagated to it. A deletion of a directory
+/// above it still trashes it with that directory, which is what the remote does with any content.
+pub(super) fn is_reserved_path(rel_path: &str) -> bool {
+	rel_path == QUARANTINE_DIR
+		|| rel_path.starts_with(&format!("{QUARANTINE_DIR}/"))
+		|| rel_path
+			.split('/')
+			.any(|component| is_legacy_trash(OsStr::new(component)))
 }
 
 /// The remote view of a sync root's subtree, plus whether it is safe to reconcile against.
@@ -558,8 +566,8 @@ impl ViewBuilder {
 		item: &RemoteItem,
 		stable_uuid: Option<StableUuid>,
 	) {
-		// The engine's own directory comes before every rule, and is never reported as ignored.
-		if in_quarantine(&rel_path) {
+		// The engine's reserved paths come before every rule, and are never reported as ignored.
+		if is_reserved_path(&rel_path) {
 			return;
 		}
 		// Byte-identical names under one parent cannot exist on the server, so a second item at
@@ -1032,10 +1040,10 @@ struct Skipped {
 }
 
 impl Skipped {
-	/// Record an item with its own reason — unless it sits in the quarantine dir, which the view
-	/// leaves out without a word (and its descendants with it).
+	/// Record an item with its own reason — unless it sits at a reserved path (the quarantine dir,
+	/// filen-sync's trash), which the view leaves out without a word (and its descendants with it).
 	fn record(&mut self, skip: SkippedRemote) {
-		if in_quarantine(&skip.rel_path) {
+		if is_reserved_path(&skip.rel_path) {
 			return;
 		}
 		self.recorded.push(skip);
@@ -1044,7 +1052,7 @@ impl Skipped {
 	/// [`record`](Self::record) for a record that belongs at the head of the answer (see
 	/// [`first`](Self::first)).
 	fn record_first(&mut self, skip: SkippedRemote) {
-		if in_quarantine(&skip.rel_path) {
+		if is_reserved_path(&skip.rel_path) {
 			return;
 		}
 		self.first.push(skip);
@@ -1056,8 +1064,8 @@ impl Skipped {
 
 	/// Resolve every item under a skipped directory to the record of the directory that has one: the
 	/// nearest skipped ancestor may itself sit under another, so the walk climbs, one skipped
-	/// directory per step. An item whose chain ends in nothing recorded (the quarantine dir) stays
-	/// out unrecorded.
+	/// directory per step. An item whose chain ends in nothing recorded (a reserved path) stays out
+	/// unrecorded.
 	fn finish(mut self) -> Vec<SkippedRemote> {
 		let mut recorded = std::mem::take(&mut self.first);
 		recorded.append(&mut self.recorded);

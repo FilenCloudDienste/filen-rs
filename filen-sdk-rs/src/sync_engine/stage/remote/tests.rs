@@ -8,7 +8,7 @@ use super::{
 			ignore::{IgnoreRules, IgnoreSource, Origin},
 			plan::{ViewFilter, place_remote_items},
 			rows::Baseline,
-			scan::QUARANTINE_DIR,
+			scan::{LEGACY_TRASH_DIR, QUARANTINE_DIR},
 			side::Nodes,
 		},
 		assert_views_alike, paging_of, staged_sides,
@@ -33,7 +33,7 @@ const ACCOUNT: Uuid = Uuid::from_u128(3);
 
 /// The names a generated snapshot draws from: case twins, plain and non-ASCII; two spellings NFC
 /// folds into one, so two siblings drawing them are held back; every unsafe name; the engine's
-/// own quarantine directory; and names the filter's rules hide.
+/// own quarantine directory and filen-sync's trash; and names the filter's rules hide.
 const NAMES: &[&str] = &[
 	"a",
 	"A",
@@ -44,6 +44,7 @@ const NAMES: &[&str] = &[
 	"e\u{301}",
 	"\u{e9}",
 	QUARANTINE_DIR,
+	LEGACY_TRASH_DIR,
 	"build",
 	"x.tmp",
 	".DS_Store",

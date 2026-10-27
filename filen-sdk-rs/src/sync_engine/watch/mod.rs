@@ -49,7 +49,7 @@ use super::{
 	baseline::PairId,
 	changes::{FullPassReason, PairChanges},
 	engine::SyncEngine,
-	scan::QUARANTINE_DIR,
+	scan::{QUARANTINE_DIR, is_legacy_trash},
 };
 use crate::{
 	Error, ErrorKind,
@@ -845,9 +845,10 @@ fn owes_a_pass(report: &SyncReport) -> bool {
 ///
 /// Everything is, except the engine's own staging writes: the `<uuid>.filendl` temp file a
 /// download writes before renaming it into place (the rename is itself an event), and the
-/// quarantine bin, which the scan never descends into. A user file that happens to end in
-/// `.filendl` is not lost, only delayed to the next safety-net pass. A pathless event (a watcher
-/// rescan notice) always counts.
+/// quarantine bin, which the scan never descends into. Nor is anything at or under filen-sync's
+/// trash folder, which the scan never reads either (see [`is_legacy_trash`]). A user file that
+/// happens to end in `.filendl` is not lost, only delayed to the next safety-net pass. A pathless
+/// event (a watcher rescan notice) always counts.
 fn triggers_pass(root: &Path, event: &notify::Event) -> bool {
 	event.paths.is_empty()
 		|| event
@@ -856,13 +857,15 @@ fn triggers_pass(root: &Path, event: &notify::Event) -> bool {
 			.any(|path| !is_engine_staging(root, path))
 }
 
-/// Whether `path` is one of the engine's own staging locations under `root` (see [`triggers_pass`]).
+/// Whether `path` is one of the engine's own staging locations under `root`, or at or under
+/// filen-sync's trash folder at any depth (see [`triggers_pass`]).
 fn is_engine_staging(root: &Path, path: &Path) -> bool {
 	let Ok(rel) = path.strip_prefix(root) else {
 		return false;
 	};
 	rel.extension() == Some(OsStr::new(DOWNLOAD_TMP_EXT))
 		|| rel.components().next().map(|c| c.as_os_str()) == Some(OsStr::new(QUARANTINE_DIR))
+		|| rel.components().any(|c| is_legacy_trash(c.as_os_str()))
 }
 
 /// Publish a finished pass's health. Only the pass's own fields change: a degraded trigger source

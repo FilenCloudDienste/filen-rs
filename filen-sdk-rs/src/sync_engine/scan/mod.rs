@@ -66,6 +66,33 @@ use crate::{
 /// being destroyed). Always excluded from the scan so it is never itself synced back up.
 pub(crate) const QUARANTINE_DIR: &str = ".filen-sync-trash";
 
+/// The folder filen-sync, the engine this one replaces, kept a pair's local deletions in: one at
+/// the pair's local root, holding each deleted item by its base name. filen-sync never synced a
+/// path with a component of that name, on either side, and neither does this engine (see
+/// [`is_legacy_trash`]), so a pair moved over from it does not upload its old trash as content.
+pub(crate) const LEGACY_TRASH_DIR: &str = ".filen.trash.local";
+
+/// Whether an entry named `name` is filen-sync's trash folder ([`LEGACY_TRASH_DIR`]), at whatever
+/// depth: never read by the local scan or the watcher, never placed in the remote view, so nothing
+/// at or under it is uploaded, downloaded or deleted on its own account. A deleted ancestor still
+/// takes it along, as it takes any content: a local deletion of `Photos` trashes the remote
+/// `Photos` with its `.filen.trash.local`, and a remote one moves the local `Photos`, reserved
+/// folder and all, into the bin. The match is exact and case-sensitive, as filen-sync's was:
+/// `.Filen.Trash.Local` and `.filen.trash.local.txt` are the user's items.
+///
+/// The one place the name is matched; a path is reserved when any of its components is.
+pub(crate) fn is_legacy_trash(name: &OsStr) -> bool {
+	name == OsStr::new(LEGACY_TRASH_DIR)
+}
+
+/// Whether `name` is a case variant of filen-sync's trash folder's name (see [`is_legacy_trash`]),
+/// such as `.Filen.Trash.Local`: the user's item, synced like any other, but one that a
+/// case-insensitive filesystem or the server's case-insensitive name dedup can resolve onto a
+/// reserved folder the other side never shows. The reserved folder itself is not one.
+pub(crate) fn folds_onto_legacy_trash(name: &str) -> bool {
+	name != LEGACY_TRASH_DIR && collision_key(name) == LEGACY_TRASH_DIR
+}
+
 /// One item observed under the local root.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LocalNode {
@@ -1213,6 +1240,11 @@ fn scan_local_watched<S: ScanSink>(
 					// The engine's own files come before every rule, so no pattern can re-include one.
 					// Never descend into our own quarantine dir (it holds locally-deleted items).
 					if depth == 1 && entry.file_name() == OsStr::new(QUARANTINE_DIR) {
+						break 'filter false;
+					}
+					// Nor into filen-sync's trash, at any depth (its contents are the old engine's
+					// deletions, never content to sync).
+					if is_legacy_trash(entry.file_name()) {
 						break 'filter false;
 					}
 					// A `<uuid>.filendl` FILE is the temp file a download in flight is writing into this

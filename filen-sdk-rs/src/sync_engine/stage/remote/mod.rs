@@ -58,7 +58,7 @@ use super::{
 	super::{
 		baseline::NodeKind,
 		plan::{
-			MAX_REMOTE_DEPTH, RemoteNode, RemoteView, SkippedRemote, ViewBuilder, in_quarantine,
+			MAX_REMOTE_DEPTH, RemoteNode, RemoteView, SkippedRemote, ViewBuilder, is_reserved_path,
 			is_safe_name, join_path,
 		},
 		side::Side,
@@ -421,8 +421,8 @@ impl Walk<'_> {
 
 	/// Place `item` at `path` as `ViewBuilder::insert` does, handing the path back.
 	fn place(&mut self, path: String, dir: bool, item: &RemoteItem) -> rusqlite::Result<String> {
-		// The engine's own directory comes before every rule, and a path held back stays held.
-		if in_quarantine(&path) || self.held.contains(&path) {
+		// The engine's reserved paths come before every rule, and a path held back stays held.
+		if is_reserved_path(&path) || self.held.contains(&path) {
 			return Ok(path);
 		}
 		let node = RemoteNode {

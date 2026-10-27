@@ -957,6 +957,44 @@ fn confine_allows_a_symlink_that_stays_within_the_root() {
 	std::fs::remove_dir_all(&root).ok();
 }
 
+/// No write lands in filen-sync's trash folder, by its own name or through a path that resolves
+/// into it.
+#[test]
+fn confine_rejects_writing_into_filen_syncs_trash_folder() {
+	let root = temp_dir();
+	assert!(confined_local_target(&root, ".filen.trash.local/x.txt").is_err());
+	std::fs::create_dir_all(root.join("sub/.filen.trash.local")).unwrap();
+	assert!(confined_local_target(&root, "sub/.filen.trash.local/x.txt").is_err());
+	assert!(confined_local_target(&root, "sub/.filen.trash.local.txt").is_ok());
+	std::fs::remove_dir_all(&root).ok();
+}
+
+/// A case variant of the folder's name is the user's own path where the filesystem tells the two
+/// apart, and resolves into the reserved folder where it does not — and that write is refused.
+#[test]
+fn confine_rejects_a_case_variant_only_where_it_resolves_into_filen_syncs_trash() {
+	let root = temp_dir();
+	std::fs::create_dir_all(root.join(".filen.trash.local")).unwrap();
+	let case_insensitive = root.join(".FILEN.TRASH.LOCAL").exists();
+	let result = confined_local_target(&root, ".Filen.Trash.Local/y.txt");
+	assert_eq!(
+		result.is_err(),
+		case_insensitive,
+		"case-insensitive filesystem: {case_insensitive}, got {result:?}"
+	);
+	std::fs::remove_dir_all(&root).ok();
+}
+
+#[cfg(unix)]
+#[test]
+fn confine_rejects_writing_through_a_link_into_filen_syncs_trash_folder() {
+	let root = temp_dir();
+	std::fs::create_dir_all(root.join(".filen.trash.local")).unwrap();
+	std::os::unix::fs::symlink(root.join(".filen.trash.local"), root.join("link")).unwrap();
+	assert!(confined_local_target(&root, "link/x.txt").is_err());
+	std::fs::remove_dir_all(&root).ok();
+}
+
 fn local_node(rel: &str, mtime: i64, hash: Option<Blake3Hash>) -> LocalNode {
 	LocalNode {
 		rel_path: rel.to_string(),
@@ -2389,6 +2427,65 @@ fn a_failed_create_records_nothing() {
 	assert_eq!(failures(&landed.events), 2);
 	assert_eq!(landed.report.remote_dirs_created, 0);
 	assert_eq!(plan.pager.created_at("a").unwrap(), None);
+}
+
+/// A create in another case of filen-sync's trash folder's name that the server merged into an
+/// existing directory was merged into the reserved folder, which no view shows: neither it nor the
+/// create under it is recorded, and both are reported failed.
+#[test]
+fn a_create_merged_into_filen_syncs_trash_folder_records_nothing() {
+	let chunk = [
+		create_at(".Filen.Trash.Local", None),
+		create_at(".Filen.Trash.Local/sub", None),
+	];
+	let (_dir, mut plan) = staged_entries(&chunk);
+	let (borrowed, hold) = (borrowed_with_pair(), UndrivenHold::new());
+	let landed = run_chunk(
+		&borrowed,
+		&hold,
+		&[],
+		&chunk,
+		&mut plan,
+		Some(vec![
+			created_dir(Uuid::from_u128(1), true),
+			created_dir(Uuid::from_u128(2), false),
+		]),
+	);
+	assert_eq!(landed.settled, 2);
+	assert!(locked(&borrowed.store).entries(1).unwrap().is_empty());
+	let failed: Vec<&str> = landed
+		.report
+		.failed_paths
+		.iter()
+		.map(|(path, _)| path.as_str())
+		.collect();
+	assert_eq!(failed, [".Filen.Trash.Local", ".Filen.Trash.Local/sub"]);
+	assert_eq!(landed.report.remote_dirs_created, 0);
+	assert_eq!(plan.pager.created_at(".Filen.Trash.Local").unwrap(), None);
+}
+
+/// The same create, answered with a directory of its own, is the user's directory like any other.
+#[test]
+fn a_fresh_create_named_like_filen_syncs_trash_in_another_case_is_recorded() {
+	let chunk = [create_at(".Filen.Trash.Local", None)];
+	let (_dir, mut plan) = staged_entries(&chunk);
+	let (borrowed, hold) = (borrowed_with_pair(), UndrivenHold::new());
+	let made = Uuid::from_u128(1);
+	let landed = run_chunk(
+		&borrowed,
+		&hold,
+		&[],
+		&chunk,
+		&mut plan,
+		Some(vec![created_dir(made, false)]),
+	);
+	assert_eq!(landed.settled, 1);
+	assert!(landed.report.failed_paths.is_empty());
+	assert_eq!(landed.report.remote_dirs_created, 1);
+	assert_eq!(
+		plan.pager.created_at(".Filen.Trash.Local").unwrap(),
+		Some(made)
+	);
 }
 
 #[test]

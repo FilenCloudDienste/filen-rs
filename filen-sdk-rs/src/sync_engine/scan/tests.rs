@@ -1766,6 +1766,52 @@ fn the_engines_own_files_stay_outside_every_rule() {
 	fs::remove_dir_all(&root).ok();
 }
 
+/// filen-sync's trash folder is never read, at the root or nested, whatever a rule says — but only
+/// an entry named exactly that: a longer name or another case is the user's.
+#[test]
+fn the_scan_skips_filen_syncs_trash_at_any_depth_and_only_by_its_exact_name() {
+	let root = temp_root();
+	fs::write(root.join(FILENIGNORE), "!.filen.trash.local/\n").unwrap();
+	fs::create_dir(root.join(LEGACY_TRASH_DIR)).unwrap();
+	fs::write(root.join(LEGACY_TRASH_DIR).join("old.txt"), b"old").unwrap();
+	let nested = root.join("Photos").join(LEGACY_TRASH_DIR);
+	fs::create_dir_all(nested.join("deep")).unwrap();
+	fs::write(nested.join("deep").join("x.jpg"), b"x").unwrap();
+	// A file with the folder's name is reserved too: the name is, whatever it names.
+	fs::create_dir(root.join("docs")).unwrap();
+	fs::write(root.join("docs").join(LEGACY_TRASH_DIR), b"f").unwrap();
+	fs::write(root.join(".filen.trash.local.txt"), b"mine").unwrap();
+	// In a directory of its own: a case-insensitive file system would take it for the one above.
+	fs::create_dir_all(root.join("other").join(".Filen.Trash.Local")).unwrap();
+	fs::write(
+		root.join("other").join(".Filen.Trash.Local").join("y.txt"),
+		b"y",
+	)
+	.unwrap();
+
+	let scan = scan_plain(&root, &HashMap::new());
+	assert!(scan.complete, "{:?}", scan.errors);
+	assert_eq!(
+		sorted_paths(&scan),
+		vec![
+			".filen.trash.local.txt",
+			FILENIGNORE,
+			"Photos",
+			"docs",
+			"other",
+			"other/.Filen.Trash.Local",
+			"other/.Filen.Trash.Local/y.txt",
+		]
+	);
+	assert!(
+		scan.ignored.is_empty(),
+		"filen-sync's trash is not an ignored item: {:?}",
+		scan.ignored
+	);
+
+	fs::remove_dir_all(&root).ok();
+}
+
 /// A subtree walk keys against the pair ROOT and starts at its own directory. The rules that go
 /// by depth still mean the root: the quarantine bin is the root's own child, so a user directory
 /// of that name nested deeper is an ordinary item.

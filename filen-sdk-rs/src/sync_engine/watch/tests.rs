@@ -249,6 +249,27 @@ fn only_the_engines_own_staging_writes_are_filtered_out() {
 			&["/sync/root/.filen-sync-trash/gone.txt"]
 		)
 	));
+	// Nor does anything in filen-sync's trash, at the root or nested, the folder itself included.
+	for path in [
+		"/sync/root/.filen.trash.local",
+		"/sync/root/.filen.trash.local/old.txt",
+		"/sync/root/Photos/.filen.trash.local/deep/x.jpg",
+	] {
+		assert!(
+			!triggers_pass(root, &event(EventKind::Create(CreateKind::File), &[path])),
+			"{path}"
+		);
+	}
+	// Only the exact name is filen-sync's.
+	for path in [
+		"/sync/root/.filen.trash.local.txt",
+		"/sync/root/Photos/.Filen.Trash.Local/y.txt",
+	] {
+		assert!(
+			triggers_pass(root, &event(EventKind::Create(CreateKind::File), &[path])),
+			"{path}"
+		);
+	}
 	// A batch that mentions both still wakes the loop, for the real path.
 	assert!(triggers_pass(
 		root,

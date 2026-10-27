@@ -8,6 +8,7 @@ use super::{
 		derive,
 		engine::{Observations, PendingKind, PendingWrites},
 		ignore::{IgnoreLevel, IgnoreSource, Origin},
+		scan::LEGACY_TRASH_DIR,
 		side::{FromRow, test_support::copied},
 		stage::{Stage, WINDOW, reconcile_windows, staged_sides},
 	},
@@ -4916,6 +4917,57 @@ fn build_remote_view_excludes_the_quarantine_dir_name() {
 		view.nodes.whole().is_empty(),
 		"a remote folder named like the quarantine dir must be excluded from the view"
 	);
+}
+
+/// A remote item named like filen-sync's trash is in no view, at the root or nested, and nor is
+/// anything under it — so nothing there is downloaded, or trashed for being absent locally. Only
+/// the exact name is reserved: a longer name or another case is synced like any item.
+#[test]
+fn build_remote_view_excludes_filen_syncs_trash_at_any_depth_by_its_exact_name() {
+	let root = Uuid::from_u128(1);
+	let top_trash = remote_dir(LEGACY_TRASH_DIR, root);
+	let photos = remote_dir("Photos", root);
+	let nested_trash = remote_dir(LEGACY_TRASH_DIR, photos.uuid);
+	let deep = remote_dir("deep", nested_trash.uuid);
+	let other_case = remote_dir(".Filen.Trash.Local", root);
+	let files = [
+		cacheable_file(top_trash.uuid, "old.txt"),
+		cacheable_file(deep.uuid, "x.jpg"),
+		// A file with the folder's name is reserved too.
+		cacheable_file(root, LEGACY_TRASH_DIR),
+		cacheable_file(root, ".filen.trash.local.txt"),
+		cacheable_file(other_case.uuid, "y.txt"),
+	];
+	let view = build_remote_view(
+		root,
+		&[top_trash, photos, nested_trash, deep, other_case],
+		&files,
+		&[],
+		None,
+	);
+
+	let mut paths: Vec<String> = view
+		.nodes
+		.whole()
+		.paths()
+		.map(|path| path.into_owned())
+		.collect();
+	paths.sort();
+	assert_eq!(
+		paths,
+		vec![
+			".Filen.Trash.Local",
+			".Filen.Trash.Local/y.txt",
+			".filen.trash.local.txt",
+			"Photos",
+		]
+	);
+	assert!(
+		view.skipped.is_empty(),
+		"filen-sync's trash is left out without a record: {:?}",
+		view.skipped
+	);
+	assert!(!view.has_collisions);
 }
 
 #[test]

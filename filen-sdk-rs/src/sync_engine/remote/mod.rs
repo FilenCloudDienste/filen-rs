@@ -36,7 +36,7 @@ use super::{
 	baseline::{NodeKind, SyncedPaths},
 	changes::{FullPassReason, RemoteChange, RemoteDeltaEntry, SUBTREE_CAP, past_cap},
 	ignore::rule_file_dir,
-	plan::{self, RemoteNode, in_quarantine, is_safe_name, join_path},
+	plan::{self, RemoteNode, is_reserved_path, is_safe_name, join_path},
 	rows::Baseline,
 	side::{Nodes, NodesAt, Side},
 };
@@ -377,9 +377,9 @@ impl RemoteObservation {
 			};
 		}
 		let path = join_path(parent, name);
-		// The engine's own bin is in no view (`place_remote_items`), so an item moved into it
-		// leaves, exactly as a whole-tree read would show it leaving.
-		if in_quarantine(&path) {
+		// The engine's own bin and filen-sync's trash are in no view (`place_remote_items`), so an
+		// item moved into either leaves, exactly as a whole-tree read would show it leaving.
+		if is_reserved_path(&path) {
 			return self.vacate(baseline, uuid);
 		}
 		// A held path is one the pass may not act on; a third item arriving on it changes nothing

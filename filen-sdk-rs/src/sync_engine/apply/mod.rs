@@ -12,6 +12,7 @@
 
 use std::{
 	collections::{HashMap, HashSet},
+	ffi::OsStr,
 	path::{Path, PathBuf},
 	sync::{
 		Arc, PoisonError,
@@ -45,7 +46,7 @@ use super::{
 	pause::PassGate,
 	plan::{RemoteNode, SyncAction, is_under},
 	rows::{Baseline, Cursor},
-	scan::{LocalNode, collision_key, hash_file},
+	scan::{LocalNode, collision_key, folds_onto_legacy_trash, hash_file, is_legacy_trash},
 	side::{NodesAt, Side},
 	stage::{Carried, Pager, Run, Screen, Staged, StagedPlan},
 };
@@ -549,7 +550,8 @@ pub(super) fn local_path(root: &Path, rel_path: &str) -> PathBuf {
 /// a `.`/`..`/empty component (lexical traversal) and — to defeat a symlink in the tree that points
 /// outside — canonicalizes the deepest existing ancestor and verifies it stays under the
 /// canonicalized root. Without this, downloading `link/x` where `link` is a symlink to `/etc` would
-/// write outside the sync folder. Reads/quarantine moves are unaffected; only writes are confined.
+/// write outside the sync folder. A target that resolves into filen-sync's trash folder is
+/// rejected too. Reads/quarantine moves are unaffected; only writes are confined.
 fn confined_local_target(root: &Path, rel_path: &str) -> Result<PathBuf, crate::Error> {
 	if rel_path
 		.split('/')
@@ -574,9 +576,25 @@ fn confined_local_target(root: &Path, rel_path: &str) -> Result<PathBuf, crate::
 		}
 	};
 	let existing_canon = std::fs::canonicalize(existing).map_err(io_err)?;
-	if !existing_canon.starts_with(&root_canon) {
+	let Ok(within) = existing_canon.strip_prefix(&root_canon) else {
 		return Err(internal_owned(format!(
 			"refusing to write outside the sync root via {rel_path:?}"
+		)));
+	};
+	// Nor into filen-sync's trash folder, which the plan never names (it is never scanned or
+	// viewed) but a path can still resolve into: a case variant of its name (see
+	// [`folds_onto_legacy_trash`]) on a case-insensitive filesystem, or a link. The canonical path
+	// carries the names on disk, as macOS and Windows resolve them; a case-insensitive Linux
+	// directory (casefold) hands back the spelling asked for, and is not caught here.
+	if within
+		.components()
+		.any(|component| is_legacy_trash(component.as_os_str()))
+		|| rel_path
+			.split('/')
+			.any(|component| is_legacy_trash(OsStr::new(component)))
+	{
+		return Err(internal_owned(format!(
+			"refusing to write into filen-sync's trash folder via {rel_path:?}"
 		)));
 	}
 	Ok(target)
@@ -2066,6 +2084,7 @@ async fn land_creates(
 	report: &mut SyncReport,
 	observer: &mut (dyn FnMut(SyncEvent) + Send),
 ) -> usize {
+	let answers = refuse_merges_into_legacy_trash(composed, answers);
 	propagate_chunk(chunk_ctx, composed, &answers).await;
 	let mut settled = 0;
 	for (create, answer) in composed.iter().zip(answers) {
@@ -2082,6 +2101,49 @@ async fn land_creates(
 		}
 	}
 	settled
+}
+
+/// `answers` to the creates `composed`, with a failure in place of each one the server merged into
+/// filen-sync's trash folder, and of every create under such a one.
+///
+/// A create named like that folder but in another case (see [`folds_onto_legacy_trash`]) is the
+/// user's directory. The view leaves the reserved folder out, so the plan cannot see that the
+/// server's case-insensitive name dedup will hand the create that folder: recorded, the row would
+/// name a directory no view ever shows, and the next pass would read the user's directory as
+/// deleted remotely and move it into the bin. Failed instead, it records nothing, and the pass
+/// reports it. The server has already made the creates under it inside the reserved folder; they
+/// are empty, and in a folder neither engine syncs.
+fn refuse_merges_into_legacy_trash(
+	composed: &[ComposedCreate<'_>],
+	answers: Vec<Result<CreatedDir, crate::Error>>,
+) -> Vec<Result<CreatedDir, crate::Error>> {
+	let mut refused: Vec<bool> = Vec::with_capacity(composed.len());
+	composed
+		.iter()
+		.zip(answers)
+		.map(|(create, answer)| {
+			let under_refused = matches!(
+				create.dir.parent,
+				NewDirParent::Earlier(index) if refused.get(index).copied().unwrap_or(false)
+			);
+			let merged_into_trash = answer
+				.as_ref()
+				.is_ok_and(|created| created.merged && folds_onto_legacy_trash(create.dir.name));
+			refused.push(under_refused || merged_into_trash);
+			match answer {
+				Ok(_) if merged_into_trash => Err(internal_owned(format!(
+					"refusing to record {:?}: the server merged it into filen-sync's trash folder, \
+					 which is never synced",
+					create.action.rel_path()
+				))),
+				Ok(_) if under_refused => Err(internal_owned(format!(
+					"refusing to record {:?}: its parent was merged into filen-sync's trash folder",
+					create.action.rel_path()
+				))),
+				answer => answer,
+			}
+		})
+		.collect()
 }
 
 /// Add each directory the creates `composed` made to its parent's links and shares
