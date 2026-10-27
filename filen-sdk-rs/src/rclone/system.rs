@@ -68,8 +68,13 @@ pub(crate) struct ProcessIdentity {
 	pub(crate) exe: Option<PathBuf>,
 }
 
+/// Without tasks: sysinfo otherwise lists each thread of a process on Linux as a process of its own,
+/// with the process's executable, so a multi-threaded rclone would be found and counted once per
+/// thread.
 fn refresh_kind() -> ProcessRefreshKind {
-	ProcessRefreshKind::nothing().with_exe(UpdateKind::OnlyIfNotSet)
+	ProcessRefreshKind::nothing()
+		.without_tasks()
+		.with_exe(UpdateKind::OnlyIfNotSet)
 }
 
 /// The running process `pid`, or `None` when there is none, or only a zombie.
@@ -180,7 +185,7 @@ fn refreshed(pids: &[(Pid, u64)]) -> System {
 	system.refresh_processes_specifics(
 		ProcessesToUpdate::Some(&pids),
 		true,
-		ProcessRefreshKind::nothing(),
+		ProcessRefreshKind::nothing().without_tasks(),
 	);
 	system
 }
