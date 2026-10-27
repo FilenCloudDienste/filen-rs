@@ -912,7 +912,8 @@ fn nested_dir_moves_commit_each_step_from_the_store() {
 #[test]
 fn confine_allows_paths_under_the_root() {
 	let root = temp_dir();
-	let target = confined_local_target(&root, "sub/file.txt").expect("in-root path allowed");
+	let target = confined_local_target(&root, PairRoot::Directory, "sub/file.txt")
+		.expect("in-root path allowed");
 	assert!(target.starts_with(&root));
 	std::fs::remove_dir_all(&root).ok();
 }
@@ -921,10 +922,10 @@ fn confine_allows_paths_under_the_root() {
 fn confine_rejects_lexical_traversal() {
 	let root = temp_dir();
 	assert!(
-		confined_local_target(&root, "../escape.txt").is_err(),
+		confined_local_target(&root, PairRoot::Directory, "../escape.txt").is_err(),
 		".. component must be refused"
 	);
-	assert!(confined_local_target(&root, "a/../../b").is_err());
+	assert!(confined_local_target(&root, PairRoot::Directory, "a/../../b").is_err());
 	std::fs::remove_dir_all(&root).ok();
 }
 
@@ -936,7 +937,7 @@ fn confine_rejects_writing_through_a_symlink_escaping_the_root() {
 	// `root/link` -> `outside`. Writing `root/link/x` would land in `outside` without confinement.
 	std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
 
-	let result = confined_local_target(&root, "link/x.txt");
+	let result = confined_local_target(&root, PairRoot::Directory, "link/x.txt");
 	assert!(
 		result.is_err(),
 		"writing through a symlink that escapes the root must be refused, got {result:?}"
@@ -953,7 +954,7 @@ fn confine_allows_a_symlink_that_stays_within_the_root() {
 	std::fs::create_dir_all(root.join("real")).unwrap();
 	std::os::unix::fs::symlink(root.join("real"), root.join("link")).unwrap();
 	// `root/link` -> `root/real` (inside) — writing through it stays confined.
-	assert!(confined_local_target(&root, "link/x.txt").is_ok());
+	assert!(confined_local_target(&root, PairRoot::Directory, "link/x.txt").is_ok());
 	std::fs::remove_dir_all(&root).ok();
 }
 
@@ -962,10 +963,14 @@ fn confine_allows_a_symlink_that_stays_within_the_root() {
 #[test]
 fn confine_rejects_writing_into_filen_syncs_trash_folder() {
 	let root = temp_dir();
-	assert!(confined_local_target(&root, ".filen.trash.local/x.txt").is_err());
+	assert!(confined_local_target(&root, PairRoot::Directory, ".filen.trash.local/x.txt").is_err());
 	std::fs::create_dir_all(root.join("sub/.filen.trash.local")).unwrap();
-	assert!(confined_local_target(&root, "sub/.filen.trash.local/x.txt").is_err());
-	assert!(confined_local_target(&root, "sub/.filen.trash.local.txt").is_ok());
+	assert!(
+		confined_local_target(&root, PairRoot::Directory, "sub/.filen.trash.local/x.txt").is_err()
+	);
+	assert!(
+		confined_local_target(&root, PairRoot::Directory, "sub/.filen.trash.local.txt").is_ok()
+	);
 	std::fs::remove_dir_all(&root).ok();
 }
 
@@ -976,7 +981,7 @@ fn confine_rejects_a_case_variant_only_where_it_resolves_into_filen_syncs_trash(
 	let root = temp_dir();
 	std::fs::create_dir_all(root.join(".filen.trash.local")).unwrap();
 	let case_insensitive = root.join(".FILEN.TRASH.LOCAL").exists();
-	let result = confined_local_target(&root, ".Filen.Trash.Local/y.txt");
+	let result = confined_local_target(&root, PairRoot::Directory, ".Filen.Trash.Local/y.txt");
 	assert_eq!(
 		result.is_err(),
 		case_insensitive,
@@ -991,7 +996,43 @@ fn confine_rejects_writing_through_a_link_into_filen_syncs_trash_folder() {
 	let root = temp_dir();
 	std::fs::create_dir_all(root.join(".filen.trash.local")).unwrap();
 	std::os::unix::fs::symlink(root.join(".filen.trash.local"), root.join("link")).unwrap();
-	assert!(confined_local_target(&root, "link/x.txt").is_err());
+	assert!(confined_local_target(&root, PairRoot::Directory, "link/x.txt").is_err());
+	std::fs::remove_dir_all(&root).ok();
+}
+
+/// No write of a drive-rooted pair lands in the account's data directory, by its own name in any
+/// case or through a link that resolves into it; a pair rooted at a directory writes there, and
+/// `.filen` deeper down is the user's either way.
+#[test]
+fn confine_rejects_writing_into_the_account_data_directory_of_a_drive_rooted_pair() {
+	let root = temp_dir();
+	for rel_path in [".filen/x.txt", ".filen", ".FILEN/x.txt", ".Filen/a/b.txt"] {
+		assert!(
+			confined_local_target(&root, PairRoot::Drive, rel_path).is_err(),
+			"{rel_path}"
+		);
+		assert!(
+			confined_local_target(&root, PairRoot::Directory, rel_path).is_ok(),
+			"{rel_path}"
+		);
+	}
+	for rel_path in ["docs/.filen/x.txt", ".filen.txt"] {
+		assert!(
+			confined_local_target(&root, PairRoot::Drive, rel_path).is_ok(),
+			"{rel_path}"
+		);
+	}
+	std::fs::remove_dir_all(&root).ok();
+}
+
+#[cfg(unix)]
+#[test]
+fn confine_rejects_writing_through_a_link_into_the_account_data_directory() {
+	let root = temp_dir();
+	std::fs::create_dir_all(root.join(".filen")).unwrap();
+	std::os::unix::fs::symlink(root.join(".filen"), root.join("link")).unwrap();
+	assert!(confined_local_target(&root, PairRoot::Drive, "link/x.txt").is_err());
+	assert!(confined_local_target(&root, PairRoot::Directory, "link/x.txt").is_ok());
 	std::fs::remove_dir_all(&root).ok();
 }
 

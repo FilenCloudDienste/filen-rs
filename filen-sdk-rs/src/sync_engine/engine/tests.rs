@@ -480,6 +480,7 @@ fn a_synced_path_whose_remote_item_left_the_view_is_blocked_not_deleted() {
 	)]);
 	let view = plan::build_remote_view(
 		root,
+		PairRoot::Directory,
 		&[],
 		&[],
 		&[crate::cache::UndecodableItem {
@@ -3022,7 +3023,10 @@ fn planned_over_scan(
 	remote: &impl Nodes<Node = RemoteNode>,
 ) -> Vec<SyncAction> {
 	let (scan, _) = scan::scan_local(
-		root,
+		ScanRoot {
+			path: root,
+			pair_root: PairRoot::Directory,
+		},
 		&Baseline::default(),
 		IgnoreRules::default(),
 		RuleFiles::Read,
@@ -6915,7 +6919,7 @@ fn staged_wide_view(nodes: u32) -> (tempfile::TempDir, Side<RemoteNode>) {
 			let uuid = Uuid::from_u128(u128::from(i));
 			(false, item(uuid, dir, format!("file-{i}.txt")))
 		}));
-	let (stage_dir, view) = super::stage::staged_view(root, items, &[]);
+	let (stage_dir, view) = super::stage::staged_view(root, PairRoot::Directory, items, &[]);
 	(stage_dir, view.nodes)
 }
 
@@ -8448,6 +8452,70 @@ async fn a_dry_run_still_shows_the_conflict_where_no_evidence_holds() {
 		.collect();
 	assert_eq!(conflicts, ["a.bin"]);
 	assert_eq!(stored_paths(&engine, pair).await, Vec::<String>::new());
+}
+
+/// Only a pair whose remote root is the drive root holds the account's data directory.
+#[tokio::test]
+async fn only_a_pair_rooted_at_the_drive_root_is_drive_rooted() {
+	let (engine, _, path) = engine_with_pair("pair_root").await;
+	assert_eq!(
+		engine.pair_root(engine.client.root().uuid()),
+		PairRoot::Drive
+	);
+	assert_eq!(engine.pair_root(Uuid::from_u128(7)), PairRoot::Directory);
+	drop(engine);
+	std::fs::remove_file(&path).ok();
+}
+
+/// A dry run of a pair rooted at the drive plans nothing in the account's data directory on
+/// either side — neither the remote one's file nor a local one's — while everything beside it
+/// plans as usual. Offline: the remote is the cache's rows.
+#[tokio::test]
+async fn a_drive_rooted_dry_run_plans_nothing_in_the_account_data_directory() {
+	let dir = tempfile::tempdir().unwrap();
+	let root = dir.path().join("local");
+	std::fs::create_dir_all(root.join(".filen")).unwrap();
+	std::fs::write(root.join(".filen").join("local.bin"), b"l").unwrap();
+	std::fs::write(root.join("kept.txt"), b"k").unwrap();
+	let client = Arc::new(offline_client());
+	let drive = client.root().uuid();
+	let account_data = Uuid::from_u128(2);
+	let cache = dir.path().join("cache.db");
+	let mut state = CacheState::new_on_path(&cache, drive);
+	state
+		.upsert_dirs([&cacheable_dir(account_data, drive, ".filen")].into_iter())
+		.unwrap();
+	state
+		.upsert_files(
+			[
+				&cacheable_file(Uuid::from_u128(3), account_data, "chat.bin"),
+				&cacheable_file(Uuid::from_u128(4), drive, "docs.txt"),
+			]
+			.into_iter(),
+		)
+		.unwrap();
+	client.configure_cache(cache, |_| {}).await.unwrap();
+	let engine = SyncEngine::open(client, dir.path().join("sync.db"))
+		.await
+		.unwrap();
+	let (pair, _) = locked(&engine.control)
+		.create_pair(root.to_str().unwrap(), drive, SyncMode::TwoWay)
+		.unwrap();
+
+	let outcome = engine.plan_pair(pair).await.unwrap();
+	assert_eq!(outcome.refused, None);
+	let mut planned: Vec<&str> = outcome
+		.actions
+		.iter()
+		.chain(&outcome.held)
+		.map(|action| action.rel_path.as_str())
+		.collect();
+	planned.sort_unstable();
+	assert_eq!(planned, ["docs.txt", "kept.txt"]);
+	assert_eq!(outcome.conflicts, []);
+	assert_eq!(outcome.unsyncable, []);
+	assert_eq!(outcome.ignored, []);
+	drop((engine, state));
 }
 
 /// A filen-sync state directory whose two trees list one file alike.

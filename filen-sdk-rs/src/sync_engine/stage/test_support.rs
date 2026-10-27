@@ -7,7 +7,7 @@ use uuid::Uuid;
 use super::{
 	super::{
 		plan::{RemoteNode, RemoteView},
-		scan::{Found, LocalNode, ScanSink, collision_key},
+		scan::{Found, LocalNode, PairRoot, ScanSink, collision_key},
 		side::{Nodes, Side},
 	},
 	Paging, RemoteSink, Stage, StageSink, stage_path,
@@ -54,7 +54,7 @@ pub(in super::super) fn staged_sides(
 	}
 	let local = walk.finish().expect("staging the walk");
 	let mut remote_side = RemoteSink::new(stage(1), paging)
-		.and_then(|snapshot| snapshot.finish(Uuid::nil()))
+		.and_then(|snapshot| snapshot.finish(Uuid::nil(), PairRoot::Directory))
 		.expect("an empty staged snapshot")
 		.nodes;
 	remote_side.extend(remote.into_iter().map(|node| (node.rel_path.clone(), node)));
@@ -65,6 +65,7 @@ pub(in super::super) fn staged_sides(
 /// a stage of its own and placed under `root`; with the directory its stage is in.
 pub(in super::super) fn staged_view(
 	root: Uuid,
+	pair_root: PairRoot,
 	items: impl IntoIterator<Item = (bool, RemoteItem)>,
 	undecodable: &[UndecodableItem],
 ) -> (tempfile::TempDir, RemoteView) {
@@ -74,7 +75,11 @@ pub(in super::super) fn staged_view(
 	for (is_dir, item) in items {
 		sink.item(is_dir, item);
 	}
-	(dir, sink.finish(root).expect("placing the staged snapshot"))
+	(
+		dir,
+		sink.finish(root, pair_root)
+			.expect("placing the staged snapshot"),
+	)
 }
 
 /// Hold a view a whole pass staged to the one `ViewBuilder` built from the same items: the same

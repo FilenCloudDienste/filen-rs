@@ -30,7 +30,7 @@ use chrono::{Days, NaiveDate};
 
 use super::{
 	apply::{io_err, local_path},
-	scan::{QUARANTINE_DIR, is_legacy_trash},
+	scan::{PairRoot, QUARANTINE_DIR, is_account_data, is_legacy_trash},
 };
 
 #[cfg(test)]
@@ -354,7 +354,9 @@ pub(super) struct MigrateSummary {
 ///
 /// The walk follows no symbolic link: a link is never descended into, and one named like the folder
 /// is moved as the link, its target untouched. It does not descend into a folder it found either,
-/// so a trash folder inside another moves with it, nor into the bin at the root. Bounded by the
+/// so a trash folder inside another moves with it, nor into the bin at the root, nor — in a pair
+/// `pair_root` says is rooted at the drive — into the account's data directory, which the engine
+/// never touches (see [`is_account_data`]). Bounded by the
 /// tree: every directory is listed once, and only the found folders' paths are held, all of them
 /// before the first moves, so no listing is taken while its directory changes.
 ///
@@ -367,11 +369,12 @@ pub(super) struct MigrateSummary {
 /// moved; `false` stops the migration where it is.
 pub(super) fn migrate_legacy_trash(
 	root: &Path,
+	pair_root: PairRoot,
 	day: NaiveDate,
 	keep_going: impl Fn() -> bool,
 ) -> MigrateSummary {
 	let mut summary = MigrateSummary::default();
-	let found = find_legacy_trash(root, &keep_going, &mut summary);
+	let found = find_legacy_trash(root, pair_root, &keep_going, &mut summary);
 	for rel_path in found {
 		if !keep_going() {
 			summary.stopped = true;
@@ -397,6 +400,7 @@ pub(super) fn migrate_legacy_trash(
 /// [`migrate_legacy_trash`]; on-disk names, not normalized, so each still opens what it names.
 fn find_legacy_trash(
 	root: &Path,
+	pair_root: PairRoot,
 	keep_going: &impl Fn() -> bool,
 	summary: &mut MigrateSummary,
 ) -> Vec<String> {
@@ -455,6 +459,9 @@ fn find_legacy_trash(
 			} else {
 				format!("{rel_dir}/{name}")
 			};
+			if is_account_data(&rel_path, pair_root) {
+				continue;
+			}
 			if trash {
 				found.push(rel_path);
 			} else {

@@ -61,6 +61,7 @@ use super::{
 			MAX_REMOTE_DEPTH, RemoteNode, RemoteView, SkippedRemote, ViewBuilder, is_reserved_path,
 			is_safe_name, join_path,
 		},
+		scan::PairRoot,
 		side::Side,
 	},
 	BatchWriter, Stage, hash_at, hash_bytes,
@@ -273,11 +274,16 @@ impl RemoteSink {
 		})
 	}
 
-	/// Place every row the read copied under `root` (see the module docs): the view a whole pass
-	/// reads the remote from, its nodes staged and its skipped items, held paths and nothing else
-	/// filled in, as `ViewBuilder::finish` hands its view over. A row the copy could not write fails
-	/// it with that row's error, before anything is placed.
-	pub(in super::super) fn finish(self, root: Uuid) -> rusqlite::Result<RemoteView> {
+	/// Place every row the read copied under `root` (see the module docs), which `pair_root` says
+	/// is or is not the drive root: the view a whole pass reads the remote from, its nodes staged and
+	/// its skipped items, held paths and nothing else filled in, as `ViewBuilder::finish` hands its
+	/// view over. A row the copy could not write fails it with that row's error, before anything is
+	/// placed.
+	pub(in super::super) fn finish(
+		self,
+		root: Uuid,
+		pair_root: PairRoot,
+	) -> rusqlite::Result<RemoteView> {
 		let Self {
 			batch,
 			rows,
@@ -303,6 +309,7 @@ impl RemoteSink {
 			reached: 0,
 			placed: 0,
 			held: BTreeSet::new(),
+			pair_root,
 		};
 		walk.run(root)?;
 		let Walk {
@@ -319,7 +326,7 @@ impl RemoteSink {
 		} else {
 			Vec::new()
 		};
-		let skipped = replay(&stage.conn, root, undecodable, left)?;
+		let skipped = replay(&stage.conn, root, pair_root, undecodable, left)?;
 		stage.conn.execute_batch(PLACED)?;
 		Ok(RemoteView {
 			nodes: Side::Staged(StagedSide::new(stage, placed, REMOTE, paging)),
@@ -379,6 +386,9 @@ struct Walk<'u> {
 	placed: usize,
 	/// The paths two items resolved to, which neither is placed at.
 	held: BTreeSet<String>,
+	/// Whether the walk is under the drive root, whose account data directory it never places (see
+	/// `plan::is_reserved_path`).
+	pair_root: PairRoot,
 }
 
 impl Walk<'_> {
@@ -422,7 +432,7 @@ impl Walk<'_> {
 	/// Place `item` at `path` as `ViewBuilder::insert` does, handing the path back.
 	fn place(&mut self, path: String, dir: bool, item: &RemoteItem) -> rusqlite::Result<String> {
 		// The engine's reserved paths come before every rule, and a path held back stays held.
-		if is_reserved_path(&path) || self.held.contains(&path) {
+		if is_reserved_path(&path, self.pair_root) || self.held.contains(&path) {
 			return Ok(path);
 		}
 		let node = RemoteNode {
@@ -557,6 +567,7 @@ fn unplaced(conn: &Connection, visited: &Visited) -> rusqlite::Result<Vec<(bool,
 fn replay(
 	conn: &Connection,
 	root: Uuid,
+	pair_root: PairRoot,
 	undecodable: Vec<UndecodableItem>,
 	left: Vec<(bool, RemoteItem)>,
 ) -> rusqlite::Result<Vec<SkippedRemote>> {
@@ -585,7 +596,7 @@ fn replay(
 			at = parent;
 		}
 	}
-	Ok(ViewBuilder::replay(root, dir_index, undecodable, left).finish_unplaced())
+	Ok(ViewBuilder::replay(root, pair_root, dir_index, undecodable, left).finish_unplaced())
 }
 
 impl StagedSide<RemoteNode> {

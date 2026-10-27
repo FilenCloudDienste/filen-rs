@@ -71,8 +71,8 @@ use super::{
 	plan::{ancestors, is_under, subtree_bounds},
 	rows::Baseline,
 	scan::{
-		LocalNode, LocalScan, RuleFiles, ScanError, collision_key, fast_path_hash, hash_file,
-		load_rule_file, name_rejection, record, scan_subtree,
+		LocalNode, LocalScan, PairRoot, RuleFiles, ScanError, ScanRoot, collision_key,
+		fast_path_hash, hash_file, load_rule_file, name_rejection, record, scan_subtree,
 	},
 	side::Nodes,
 };
@@ -413,12 +413,14 @@ impl<'a> Origins<'a> {
 /// is the source of truth) and comes back carrying every `.filenignore` this observation read: the
 /// ancestors of each dirty path, top down, and whatever its subtree walks found. Loading the
 /// ancestors first is what makes the rules in force the same ones a whole-tree walk would have
-/// applied at that depth.
+/// applied at that depth. `pair_root` says whether the tree holds the account's data directory,
+/// which its subtree walks never enter, as a whole walk does not.
 ///
 /// `Err` is a dirty path whose subtree is too large to narrow a pass to (see the module docs): the
 /// observation stops there, and the pass reads the local side whole instead.
 pub(super) fn observe_local(
 	root: &Path,
+	pair_root: PairRoot,
 	baseline: &Baseline,
 	mut rules: IgnoreRules,
 	rule_files: &RuleFiles,
@@ -537,7 +539,10 @@ pub(super) fn observe_local(
 				// walk stops once it says the directory paired with is too large.
 				let source = RefCell::new(Source::Unprobed);
 				let (mut scan, mut carried) = scan_subtree(
-					root,
+					ScanRoot {
+						path: root,
+						pair_root,
+					},
 					path,
 					baseline,
 					rules,
@@ -564,7 +569,10 @@ pub(super) fn observe_local(
 						root.display()
 					);
 					(scan, carried) = scan_subtree(
-						root,
+						ScanRoot {
+							path: root,
+							pair_root,
+						},
 						path,
 						baseline,
 						carried,

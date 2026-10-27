@@ -8,7 +8,7 @@ use super::{
 			ignore::{IgnoreRules, IgnoreSource, Origin},
 			plan::{ViewFilter, place_remote_items},
 			rows::Baseline,
-			scan::{LEGACY_TRASH_DIR, QUARANTINE_DIR},
+			scan::{ACCOUNT_DATA_DIR, LEGACY_TRASH_DIR, QUARANTINE_DIR},
 			side::Nodes,
 		},
 		assert_views_alike, paging_of, staged_sides,
@@ -33,7 +33,8 @@ const ACCOUNT: Uuid = Uuid::from_u128(3);
 
 /// The names a generated snapshot draws from: case twins, plain and non-ASCII; two spellings NFC
 /// folds into one, so two siblings drawing them are held back; every unsafe name; the engine's
-/// own quarantine directory and filen-sync's trash; and names the filter's rules hide.
+/// own quarantine directory, filen-sync's trash and the account's data directory, in two cases;
+/// and names the filter's rules hide.
 const NAMES: &[&str] = &[
 	"a",
 	"A",
@@ -45,6 +46,8 @@ const NAMES: &[&str] = &[
 	"\u{e9}",
 	QUARANTINE_DIR,
 	LEGACY_TRASH_DIR,
+	ACCOUNT_DATA_DIR,
+	".FILEN",
 	"build",
 	"x.tmp",
 	".DS_Store",
@@ -56,11 +59,12 @@ const NAMES: &[&str] = &[
 	"n\0l",
 ];
 
-/// A generated snapshot: its items in the order a read hands them over, and its undecodable
-/// records.
+/// A generated snapshot: its items in the order a read hands them over, its undecodable records,
+/// and whether [`ROOT`] stands for the drive root.
 struct Snapshot {
 	items: Vec<(bool, RemoteItem)>,
 	undecodable: Vec<UndecodableItem>,
+	pair_root: PairRoot,
 }
 
 /// What `seed` generates: a tree drawn from [`NAMES`], with items under a file, under a parent
@@ -161,12 +165,21 @@ fn snapshot(seed: u64) -> Snapshot {
 		items.push((false, item(fresh(), parent, "foot.txt", false, &mut rng)));
 	}
 	items.shuffle(&mut rng);
-	Snapshot { items, undecodable }
+	Snapshot {
+		items,
+		undecodable,
+		// Every other seed, so a seed draws the tree it always drew.
+		pair_root: if seed.is_multiple_of(2) {
+			PairRoot::Drive
+		} else {
+			PairRoot::Directory
+		},
+	}
 }
 
 /// The view `ViewBuilder` builds from `snapshot`, its rows streamed in in order.
 fn resident(snapshot: &Snapshot) -> RemoteView {
-	let mut builder = ViewBuilder::with_capacity(ROOT, 0);
+	let mut builder = ViewBuilder::with_capacity(ROOT, snapshot.pair_root, 0);
 	builder.undecodable(snapshot.undecodable.clone());
 	for (is_dir, item) in &snapshot.items {
 		builder.item(*is_dir, item.clone());
@@ -182,7 +195,7 @@ fn staged(snapshot: &Snapshot, paging: Paging) -> (tempfile::TempDir, RemoteView
 	for (is_dir, item) in &snapshot.items {
 		sink.item(*is_dir, item.clone());
 	}
-	(dir, sink.finish(ROOT).unwrap())
+	(dir, sink.finish(ROOT, snapshot.pair_root).unwrap())
 }
 
 /// Root rules that hide `build/` and `*.tmp`, over the built-in defaults, which hide every
@@ -283,12 +296,18 @@ fn the_staged_view_of_a_cache_read_is_the_one_the_builder_builds() {
 
 		let read = read_subtree_snapshot(&path, ROOT).unwrap();
 		items_read += read.dirs.len() + read.files.len();
-		let mut resident = place_remote_items(ROOT, &read.dirs, &read.files, &read.undecodable);
+		let mut resident = place_remote_items(
+			ROOT,
+			PairRoot::Directory,
+			&read.dirs,
+			&read.files,
+			&read.undecodable,
+		);
 		let (_stage_dir, stage) = Stage::in_temp_dir();
 		let mut sink = RemoteSink::new(stage, Paging::PASS).unwrap();
 		let watermark = read_subtree_snapshot_into(&path, ROOT, &mut sink).unwrap();
 		assert_eq!(watermark, read.watermark, "seed {seed}");
-		let mut staged = sink.finish(ROOT).unwrap();
+		let mut staged = sink.finish(ROOT, PairRoot::Directory).unwrap();
 		assert_views_alike(&format!("seed {seed}: as placed"), &resident, &staged);
 		resident.filter(None);
 		staged.filter(None);
@@ -331,11 +350,17 @@ fn a_sync_root_listed_under_its_own_child_is_walked_once() {
 		3,
 		"the read lists the root's row"
 	);
-	let resident = place_remote_items(ROOT, &read.dirs, &read.files, &read.undecodable);
+	let resident = place_remote_items(
+		ROOT,
+		PairRoot::Directory,
+		&read.dirs,
+		&read.files,
+		&read.undecodable,
+	);
 	let (_stage_dir, stage) = Stage::in_temp_dir();
 	let mut sink = RemoteSink::new(stage, Paging::PASS).unwrap();
 	read_subtree_snapshot_into(&path, ROOT, &mut sink).unwrap();
-	let staged = sink.finish(ROOT).unwrap();
+	let staged = sink.finish(ROOT, PairRoot::Directory).unwrap();
 	assert_views_alike("the root under its own child", &resident, &staged);
 	let paths: Vec<String> = staged
 		.nodes
@@ -382,7 +407,7 @@ fn a_row_the_stage_cannot_take_fails_the_copy_with_its_error() {
 		sink.rows, 1,
 		"only the row before the refused one is copied"
 	);
-	let Err(error) = sink.finish(ROOT) else {
+	let Err(error) = sink.finish(ROOT, PairRoot::Directory) else {
 		panic!("a copy missing a row was placed");
 	};
 	assert!(
@@ -428,7 +453,7 @@ fn staging_and_placing_a_snapshot_holds_a_page_of_it() {
 		}))
 		.collect();
 	let builder_peak = alloc_meter::peak_bytes(|| {
-		let mut builder = ViewBuilder::with_capacity(ROOT, 0);
+		let mut builder = ViewBuilder::with_capacity(ROOT, PairRoot::Directory, 0);
 		builder.undecodable(Vec::new());
 		for (is_dir, item) in &items {
 			builder.item(*is_dir, item.clone());
@@ -444,7 +469,7 @@ fn staging_and_placing_a_snapshot_holds_a_page_of_it() {
 		for (is_dir, item) in &items {
 			sink.item(*is_dir, item.clone());
 		}
-		let view = sink.finish(ROOT).unwrap();
+		let view = sink.finish(ROOT, PairRoot::Directory).unwrap();
 		view.nodes.whole().iter().count()
 	});
 	assert_eq!(read, items.len());
@@ -490,6 +515,7 @@ fn a_staged_view_finds_items_by_uuid_as_a_walk_does() {
 			),
 		],
 		undecodable: Vec::new(),
+		pair_root: PairRoot::Directory,
 	};
 	let resident = resident(&snapshot);
 	let (_dir, mut staged) = staged(&snapshot, Paging::PASS);

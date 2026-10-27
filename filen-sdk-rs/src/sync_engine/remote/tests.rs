@@ -149,7 +149,15 @@ fn observed_with(
 	let mut uuids = delta_uuids(delta);
 	uuids.extend_from_slice(also);
 	let placed = baseline.synced_paths(&uuids, &[]);
-	observe_remote(root(), baseline, nodes, delta, placed, ancestry)
+	observe_remote(
+		root(),
+		PairRoot::Directory,
+		baseline,
+		nodes,
+		delta,
+		placed,
+		ancestry,
+	)
 }
 
 fn applied(observed: RemoteObserved) -> RemoteObservation {
@@ -210,6 +218,53 @@ fn entries_naming_one_path_are_applied_in_dispatch_order() {
 	));
 	assert_eq!(paths(&out), vec!["a.txt"], "the create is the last word");
 	assert_eq!(out.path_of(&empty, file).as_deref(), Some("a.txt"));
+}
+
+/// An item that arrives in the account's data directory of a drive-rooted pair is in no view, as a
+/// whole read leaves it out, and one that moves there leaves the view; a pair rooted at a
+/// directory places both.
+#[test]
+fn an_item_arriving_in_the_account_data_directory_of_a_drive_rooted_pair_is_in_no_view() {
+	let (account, moved, created) = (Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(3));
+	let events = [
+		cache_event(
+			Some(1),
+			CacheEventType::File(FileEvent::New(cacheable_file(created, account, "c.bin"))),
+		),
+		cache_event(
+			Some(2),
+			CacheEventType::File(FileEvent::New(cacheable_file(moved, account, "a.txt"))),
+		),
+	];
+	let delta = delta(&events);
+	// Neither view holds the directory: the cache's ancestry is what places it.
+	let mut ancestry = |uuid: Uuid| -> rusqlite::Result<Vec<RemoteItem>> {
+		Ok(vec![
+			item_file(uuid, account, "f"),
+			item_dir(account, root(), ".filen"),
+		])
+	};
+	let mut observe = |pair_root| {
+		let (baseline, nodes) = derived([
+			file_node("a.txt", moved),
+			file_node("b.txt", Uuid::from_u128(4)),
+		]);
+		let placed = baseline.synced_paths(&delta_uuids(&delta), &[]);
+		applied(observe_remote(
+			root(),
+			pair_root,
+			&baseline,
+			nodes,
+			&delta,
+			placed,
+			&mut ancestry,
+		))
+	};
+	assert_eq!(paths(&observe(PairRoot::Drive)), vec!["b.txt"]);
+	assert_eq!(
+		paths(&observe(PairRoot::Directory)),
+		vec![".filen/a.txt", ".filen/c.bin", "b.txt"]
+	);
 }
 
 /// A subtree created — or moved in — out of view: neither the derived map nor the baseline has

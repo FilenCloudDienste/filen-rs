@@ -20,7 +20,10 @@ fn temp_root() -> std::path::PathBuf {
 /// A scan with no user level, reading the `.filenignore` files on disk.
 fn scan_plain(root: &Path, baseline: &HashMap<String, BaselineEntry>) -> LocalScan {
 	scan_local(
-		root,
+		ScanRoot {
+			path: root,
+			pair_root: PairRoot::Directory,
+		},
 		&tree(baseline),
 		IgnoreRules::default(),
 		RuleFiles::Read,
@@ -1015,7 +1018,10 @@ fn a_twin_that_vanishes_before_its_hash_is_read_is_no_collision() {
 
 	let mut asked: Vec<String> = Vec::new();
 	let Ok((scan, _)) = scan_local_watched(
-		&root,
+		ScanRoot {
+			path: &root,
+			pair_root: PairRoot::Directory,
+		},
 		"",
 		&Baseline::default(),
 		IgnoreRules::default(),
@@ -1453,7 +1459,10 @@ fn an_ignored_entry_is_pruned_and_reported_top_most() {
 	fs::create_dir(root.join("tmp")).unwrap();
 
 	let (scan, rules) = scan_local(
-		&root,
+		ScanRoot {
+			path: &root,
+			pair_root: PairRoot::Directory,
+		},
 		&Baseline::default(),
 		IgnoreRules::default(),
 		RuleFiles::Read,
@@ -1497,7 +1506,10 @@ fn an_ignored_entry_is_pruned_and_reported_top_most() {
 
 	// When the remote copies are the ones that count, the files on disk are ordinary items.
 	let (skipped, rules) = scan_local(
-		&root,
+		ScanRoot {
+			path: &root,
+			pair_root: PairRoot::Directory,
+		},
 		&Baseline::default(),
 		IgnoreRules::default(),
 		RuleFiles::Only(BTreeSet::new()),
@@ -1514,7 +1526,10 @@ fn an_ignored_entry_is_pruned_and_reported_top_most() {
 	assert!(rules.decide("x.log", false).is_none());
 	// Except the ones named: a synced rule file the remote has lost still governs.
 	let (only, rules) = scan_local(
-		&root,
+		ScanRoot {
+			path: &root,
+			pair_root: PairRoot::Directory,
+		},
 		&Baseline::default(),
 		IgnoreRules::default(),
 		RuleFiles::Only(BTreeSet::from(["sub".to_string()])),
@@ -1544,7 +1559,10 @@ fn a_user_level_dotfile_rule_still_reads_rule_files() {
 
 	let user = parse_user_ignore(".*\n!/.filenignore").unwrap();
 	let (scan, rules) = scan_local(
-		&root,
+		ScanRoot {
+			path: &root,
+			pair_root: PairRoot::Directory,
+		},
 		&Baseline::default(),
 		IgnoreRules::new(Some(user)),
 		RuleFiles::Read,
@@ -1732,7 +1750,10 @@ fn a_whitelist_inside_an_ignored_directory_has_no_effect() {
 	fs::write(root.join("dir").join("keep"), b"k").unwrap();
 
 	let (scan, rules) = scan_local(
-		&root,
+		ScanRoot {
+			path: &root,
+			pair_root: PairRoot::Directory,
+		},
 		&Baseline::default(),
 		IgnoreRules::default(),
 		RuleFiles::Read,
@@ -1812,6 +1833,140 @@ fn the_scan_skips_filen_syncs_trash_at_any_depth_and_only_by_its_exact_name() {
 	fs::remove_dir_all(&root).ok();
 }
 
+/// The account's data directory is a top-level name, matched case-insensitively, of a pair rooted
+/// at the drive only.
+#[test]
+fn only_the_top_of_a_drive_rooted_pair_holds_the_account_data_directory() {
+	for path in [".filen", ".filen/chats/a.bin", ".FILEN", ".Filen/x"] {
+		assert!(is_account_data(path, PairRoot::Drive), "{path}");
+		assert!(!is_account_data(path, PairRoot::Directory), "{path}");
+	}
+	for path in [
+		".filen.txt",
+		".filenx/a",
+		"docs/.filen",
+		"docs/.filen/a",
+		"",
+	] {
+		assert!(!is_account_data(path, PairRoot::Drive), "{path}");
+	}
+}
+
+/// A drive-rooted pair's scan never reads the account's data directory, whatever a rule says, nor
+/// reports it ignored. A `.filen` deeper down, a longer name, and the same tree under a pair rooted
+/// at a directory are the user's.
+#[test]
+fn a_drive_rooted_scan_skips_the_account_data_directory_at_its_top_only() {
+	let root = temp_root();
+	fs::write(root.join(FILENIGNORE), "!.filen/\n").unwrap();
+	fs::create_dir_all(root.join(ACCOUNT_DATA_DIR).join("chats")).unwrap();
+	fs::write(
+		root.join(ACCOUNT_DATA_DIR).join("chats").join("a.bin"),
+		b"a",
+	)
+	.unwrap();
+	fs::create_dir_all(root.join("Photos").join(ACCOUNT_DATA_DIR)).unwrap();
+	fs::write(
+		root.join("Photos").join(ACCOUNT_DATA_DIR).join("x.jpg"),
+		b"x",
+	)
+	.unwrap();
+	fs::write(root.join(".filen.txt"), b"mine").unwrap();
+	let scan = |pair_root| {
+		scan_local(
+			ScanRoot {
+				path: &root,
+				pair_root,
+			},
+			&Baseline::default(),
+			IgnoreRules::default(),
+			RuleFiles::Read,
+		)
+		.0
+	};
+
+	let drive = scan(PairRoot::Drive);
+	assert!(drive.complete, "{:?}", drive.errors);
+	assert_eq!(
+		sorted_paths(&drive),
+		vec![
+			".filen.txt",
+			FILENIGNORE,
+			"Photos",
+			"Photos/.filen",
+			"Photos/.filen/x.jpg",
+		]
+	);
+	assert!(
+		drive.ignored.is_empty(),
+		"the account's data directory is not an ignored item: {:?}",
+		drive.ignored
+	);
+	assert_eq!(
+		sorted_paths(&scan(PairRoot::Directory)),
+		vec![
+			".filen",
+			".filen.txt",
+			".filen/chats",
+			".filen/chats/a.bin",
+			FILENIGNORE,
+			"Photos",
+			"Photos/.filen",
+			"Photos/.filen/x.jpg",
+		]
+	);
+
+	fs::remove_dir_all(&root).ok();
+}
+
+/// A case variant of the name is the account's directory too: the drive root's names are deduped
+/// case-insensitively, so it could only ever be merged into that directory.
+#[test]
+fn a_drive_rooted_scan_skips_a_case_variant_of_the_account_data_directory() {
+	let root = temp_root();
+	fs::create_dir(root.join(".Filen")).unwrap();
+	fs::write(root.join(".Filen").join("y.txt"), b"y").unwrap();
+	fs::write(root.join("kept.txt"), b"k").unwrap();
+	let (scan, _) = scan_local(
+		ScanRoot {
+			path: &root,
+			pair_root: PairRoot::Drive,
+		},
+		&Baseline::default(),
+		IgnoreRules::default(),
+		RuleFiles::Read,
+	);
+	assert_eq!(sorted_paths(&scan), vec!["kept.txt"]);
+
+	fs::remove_dir_all(&root).ok();
+}
+
+/// A subtree walk from the root of a drive-rooted pair leaves the account's data directory out as
+/// a whole walk does.
+#[test]
+fn a_subtree_walk_from_a_drive_rooted_pairs_root_skips_the_account_data_directory() {
+	let root = temp_root();
+	fs::create_dir(root.join(ACCOUNT_DATA_DIR)).unwrap();
+	fs::write(root.join(ACCOUNT_DATA_DIR).join("a.bin"), b"a").unwrap();
+	fs::write(root.join("kept.txt"), b"k").unwrap();
+	let (scan, _) = scan_subtree(
+		ScanRoot {
+			path: &root,
+			pair_root: PairRoot::Drive,
+		},
+		"",
+		&Baseline::default(),
+		IgnoreRules::default(),
+		&RuleFiles::Read,
+		&mut |_, _, _| None,
+		&|_| false,
+	)
+	.unwrap();
+	assert_eq!(sorted_paths(&scan), vec!["kept.txt"]);
+
+	fs::remove_dir_all(&root).ok();
+}
+
 /// A subtree walk keys against the pair ROOT and starts at its own directory. The rules that go
 /// by depth still mean the root: the quarantine bin is the root's own child, so a user directory
 /// of that name nested deeper is an ordinary item.
@@ -1826,7 +1981,10 @@ fn a_subtree_walk_keys_against_the_root_and_starts_at_its_own_directory() {
 	fs::write(nested.join("mine.txt"), b"m").unwrap();
 
 	let (scan, _) = scan_subtree(
-		&root,
+		ScanRoot {
+			path: &root,
+			pair_root: PairRoot::Directory,
+		},
 		"sub",
 		&Baseline::default(),
 		IgnoreRules::default(),
@@ -1866,7 +2024,10 @@ fn a_subtree_start_removed_during_the_walk_leaves_the_scan_incomplete_and_unrepo
 	}
 
 	let (scan, _) = scan_subtree(
-		&root,
+		ScanRoot {
+			path: &root,
+			pair_root: PairRoot::Directory,
+		},
 		"sub",
 		&Baseline::default(),
 		IgnoreRules::default(),
@@ -1899,7 +2060,10 @@ fn a_subtree_start_gone_before_the_walk_reads_it_leaves_the_scan_incomplete_and_
 	let root = temp_root();
 
 	let (scan, _) = scan_subtree(
-		&root,
+		ScanRoot {
+			path: &root,
+			pair_root: PairRoot::Directory,
+		},
 		"sub",
 		&Baseline::default(),
 		IgnoreRules::default(),
@@ -1946,7 +2110,10 @@ fn a_subtree_walk_is_sized_to_the_walk_and_a_whole_one_to_the_pair() {
 	assert_eq!(baseline.len(), rows);
 
 	let (subtree, _) = scan_subtree(
-		&root,
+		ScanRoot {
+			path: &root,
+			pair_root: PairRoot::Directory,
+		},
 		"sub",
 		&baseline,
 		IgnoreRules::default(),
@@ -1955,7 +2122,16 @@ fn a_subtree_walk_is_sized_to_the_walk_and_a_whole_one_to_the_pair() {
 		&|_| false,
 	)
 	.expect("a walk nothing stops");
-	let whole = scan_local(&root, &baseline, IgnoreRules::default(), RuleFiles::Read).0;
+	let whole = scan_local(
+		ScanRoot {
+			path: &root,
+			pair_root: PairRoot::Directory,
+		},
+		&baseline,
+		IgnoreRules::default(),
+		RuleFiles::Read,
+	)
+	.0;
 
 	assert_eq!(sorted_paths(&subtree), vec!["sub", "sub/a.txt"]);
 	let subtree_room = subtree.nodes.into_whole().capacity();
@@ -2027,7 +2203,10 @@ fn a_whole_walk_into_the_stage_finds_what_a_walk_into_a_map_finds() {
 			Baseline::default()
 		} else {
 			let walked = scan_local(
-				&root,
+				ScanRoot {
+					path: &root,
+					pair_root: PairRoot::Directory,
+				},
 				&Baseline::default(),
 				IgnoreRules::default(),
 				RuleFiles::Read,
@@ -2060,10 +2239,21 @@ fn a_whole_walk_into_the_stage_finds_what_a_walk_into_a_map_finds() {
 			file
 		});
 
-		let (map, _) = scan_local(&root, &baseline, IgnoreRules::default(), RuleFiles::Read);
+		let (map, _) = scan_local(
+			ScanRoot {
+				path: &root,
+				pair_root: PairRoot::Directory,
+			},
+			&baseline,
+			IgnoreRules::default(),
+			RuleFiles::Read,
+		);
 		let (_dir, stage) = Stage::in_temp_dir();
 		let (staged, _) = scan_local_staged(
-			&root,
+			ScanRoot {
+				path: &root,
+				pair_root: PairRoot::Directory,
+			},
 			&baseline,
 			IgnoreRules::default(),
 			RuleFiles::Read,
@@ -2201,7 +2391,10 @@ fn a_walk_reading_entries_on_workers_finds_what_one_reading_them_inline_finds() 
 	let walk = |baseline: &Baseline, max_read_workers: usize| {
 		let mut put = Vec::new();
 		let Ok((scan, _)) = scan_local_watched(
-			&root,
+			ScanRoot {
+				path: &root,
+				pair_root: PairRoot::Directory,
+			},
 			"",
 			baseline,
 			IgnoreRules::default(),
@@ -2408,7 +2601,10 @@ fn a_staged_walk_stopped_before_it_starts_stages_nothing() {
 	}
 	let (_dir, stage) = Stage::in_temp_dir();
 	let (scan, _) = scan_local_staged(
-		&root,
+		ScanRoot {
+			path: &root,
+			pair_root: PairRoot::Directory,
+		},
 		&Baseline::default(),
 		IgnoreRules::default(),
 		RuleFiles::Read,
@@ -2429,7 +2625,10 @@ fn a_walk_cut_short_while_listing_puts_none_of_the_reads_under_way() {
 	let root = flat_tree(300);
 	let mut listed = 0usize;
 	let Ok((scan, _)) = scan_local_watched(
-		&root,
+		ScanRoot {
+			path: &root,
+			pair_root: PairRoot::Directory,
+		},
 		"",
 		&Baseline::default(),
 		IgnoreRules::default(),
@@ -2465,7 +2664,10 @@ fn a_walk_stopped_while_it_waits_on_its_reads_waits_for_no_more_of_them() {
 	let root = flat_tree(300);
 	let stop = AtomicBool::new(false);
 	let Ok((scan, _)) = scan_local_watched(
-		&root,
+		ScanRoot {
+			path: &root,
+			pair_root: PairRoot::Directory,
+		},
 		"",
 		&Baseline::default(),
 		IgnoreRules::default(),
@@ -2495,7 +2697,10 @@ fn scan_watched(
 	on_listed: &mut dyn FnMut(&Path) -> ControlFlow<()>,
 ) -> LocalScan {
 	let Ok((scan, _)) = scan_local_watched(
-		root,
+		ScanRoot {
+			path: root,
+			pair_root: PairRoot::Directory,
+		},
 		"",
 		baseline,
 		IgnoreRules::default(),

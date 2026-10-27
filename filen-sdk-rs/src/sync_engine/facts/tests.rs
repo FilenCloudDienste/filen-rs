@@ -11,7 +11,7 @@ use crate::sync_engine::{
 	observe::observe_local,
 	outcome::PlannedNodeKind,
 	plan::SyncAction,
-	scan::{RuleFiles, scan_local},
+	scan::{PairRoot, RuleFiles, ScanRoot, scan_local},
 };
 
 fn temp_root() -> std::path::PathBuf {
@@ -25,7 +25,10 @@ fn temp_root() -> std::path::PathBuf {
 fn empty_scan() -> LocalScan {
 	let root = temp_root();
 	let scan = scan_local(
-		&root,
+		ScanRoot {
+			path: &root,
+			pair_root: PairRoot::Directory,
+		},
 		&Baseline::default(),
 		IgnoreRules::default(),
 		RuleFiles::Read,
@@ -38,7 +41,10 @@ fn empty_scan() -> LocalScan {
 
 fn whole_tree_facts(root: &Path) -> PairFacts {
 	let scan = scan_local(
-		root,
+		ScanRoot {
+			path: root,
+			pair_root: PairRoot::Directory,
+		},
 		&Baseline::default(),
 		IgnoreRules::default(),
 		RuleFiles::Read,
@@ -55,6 +61,7 @@ fn observe(root: &Path, dirty: &[&str]) -> LocalObservations {
 	let dirty: BTreeSet<String> = dirty.iter().map(|path| (*path).to_owned()).collect();
 	observe_local(
 		root,
+		PairRoot::Directory,
 		&Baseline::default(),
 		IgnoreRules::default(),
 		&RuleFiles::Read,

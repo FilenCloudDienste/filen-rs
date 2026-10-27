@@ -8,7 +8,7 @@ use super::{
 	quarantine_local,
 	test_support::{dated_bin, day},
 };
-use crate::sync_engine::scan::{LEGACY_TRASH_DIR, QUARANTINE_DIR};
+use crate::sync_engine::scan::{ACCOUNT_DATA_DIR, LEGACY_TRASH_DIR, PairRoot, QUARANTINE_DIR};
 
 fn root() -> TempDir {
 	tempfile::tempdir().expect("a temp dir")
@@ -531,7 +531,7 @@ fn filen_syncs_trash_folders_move_into_the_days_bucket_at_their_tree_positions()
 	fs::write(root.path().join("Photos").join("keep.jpg"), b"keep").unwrap();
 	fs::write(root.path().join(".filen.trash.local.txt"), b"mine").unwrap();
 
-	let migrated = migrate_legacy_trash(root.path(), day(), || true);
+	let migrated = migrate_legacy_trash(root.path(), PairRoot::Directory, day(), || true);
 
 	assert_eq!(
 		migrated,
@@ -573,6 +573,29 @@ fn filen_syncs_trash_folders_move_into_the_days_bucket_at_their_tree_positions()
 	);
 }
 
+/// A pair rooted at the drive leaves the account's data directory alone, a trash folder inside it
+/// included; one rooted at a directory moves that folder like any other.
+#[test]
+fn a_drive_rooted_pair_moves_nothing_out_of_the_account_data_directory() {
+	let root = root();
+	let inside = root.path().join(ACCOUNT_DATA_DIR).join(LEGACY_TRASH_DIR);
+	fs::create_dir_all(&inside).unwrap();
+	fs::write(inside.join("old.txt"), b"old").unwrap();
+
+	assert_eq!(
+		migrate_legacy_trash(root.path(), PairRoot::Drive, day(), || true),
+		MigrateSummary::default()
+	);
+	assert!(inside.join("old.txt").is_file());
+	assert!(!root.path().join(QUARANTINE_DIR).exists());
+
+	assert_eq!(
+		migrate_legacy_trash(root.path(), PairRoot::Directory, day(), || true).moved,
+		1
+	);
+	assert!(!inside.exists());
+}
+
 /// A tree with no filen-sync trash folder is left exactly as it was: no bin is created for it.
 #[test]
 fn a_tree_without_filen_syncs_trash_gets_no_bin() {
@@ -581,7 +604,7 @@ fn a_tree_without_filen_syncs_trash_gets_no_bin() {
 	fs::write(root.path().join("Photos").join("a.jpg"), b"a").unwrap();
 
 	assert_eq!(
-		migrate_legacy_trash(root.path(), day(), || true),
+		migrate_legacy_trash(root.path(), PairRoot::Directory, day(), || true),
 		MigrateSummary::default()
 	);
 	assert!(!root.path().join(QUARANTINE_DIR).exists());
@@ -594,7 +617,7 @@ fn a_missing_root_migrates_nothing_and_creates_nothing() {
 	let missing = parent.path().join("unmounted");
 
 	assert_eq!(
-		migrate_legacy_trash(&missing, day(), || true),
+		migrate_legacy_trash(&missing, PairRoot::Directory, day(), || true),
 		MigrateSummary::default()
 	);
 	assert!(!missing.exists());
@@ -614,7 +637,7 @@ fn the_migration_leaves_what_the_bin_holds_alone() {
 	fs::write(binned.join("old.txt"), b"old").unwrap();
 
 	assert_eq!(
-		migrate_legacy_trash(root.path(), day(), || true),
+		migrate_legacy_trash(root.path(), PairRoot::Directory, day(), || true),
 		MigrateSummary::default()
 	);
 	assert_eq!(fs::read(binned.join("old.txt")).unwrap(), b"old");
@@ -636,7 +659,7 @@ fn a_link_named_like_filen_syncs_trash_moves_as_the_link() {
 	// A link to a directory holding a trash folder of its own: that folder is outside the tree.
 	std::os::unix::fs::symlink(outside.path(), root.path().join("linked")).unwrap();
 
-	let migrated = migrate_legacy_trash(root.path(), day(), || true);
+	let migrated = migrate_legacy_trash(root.path(), PairRoot::Directory, day(), || true);
 
 	assert_eq!(migrated.moved, 1, "{migrated:?}");
 	let moved = root
@@ -668,7 +691,7 @@ fn a_migration_told_to_stop_leaves_the_rest_in_place() {
 	fs::create_dir(root.path().join(LEGACY_TRASH_DIR)).unwrap();
 
 	assert_eq!(
-		migrate_legacy_trash(root.path(), day(), || false),
+		migrate_legacy_trash(root.path(), PairRoot::Directory, day(), || false),
 		MigrateSummary {
 			moved: 0,
 			errors: 0,

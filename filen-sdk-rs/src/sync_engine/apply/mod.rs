@@ -46,7 +46,10 @@ use super::{
 	pause::PassGate,
 	plan::{RemoteNode, SyncAction, is_under},
 	rows::{Baseline, Cursor},
-	scan::{LocalNode, collision_key, folds_onto_legacy_trash, hash_file, is_legacy_trash},
+	scan::{
+		LocalNode, PairRoot, collision_key, folds_onto_legacy_trash, hash_file, is_account_data,
+		is_legacy_trash,
+	},
 	side::{NodesAt, Side},
 	stage::{Carried, Pager, Run, Screen, Staged, StagedPlan},
 };
@@ -300,6 +303,17 @@ pub(super) struct ApplyContext<'a> {
 	pub(super) bin_day: NaiveDate,
 }
 
+impl ApplyContext<'_> {
+	/// Whether the pair is rooted at the drive, whose account data directory no local write may
+	/// resolve into (see [`confined_local_target`]).
+	fn pair_root(&self) -> PairRoot {
+		match self.root_remote {
+			DirType::Root(_) => PairRoot::Drive,
+			DirType::Dir(_) => PairRoot::Directory,
+		}
+	}
+}
+
 /// One action of the plan, with what the apply reads for it as the pass started: made by
 /// [`PlannedEntry::stage`] and staged with it, and read back out of the stage by the apply.
 #[derive(Debug, PartialEq, Eq)]
@@ -551,8 +565,14 @@ pub(super) fn local_path(root: &Path, rel_path: &str) -> PathBuf {
 /// outside — canonicalizes the deepest existing ancestor and verifies it stays under the
 /// canonicalized root. Without this, downloading `link/x` where `link` is a symlink to `/etc` would
 /// write outside the sync folder. A target that resolves into filen-sync's trash folder is
-/// rejected too. Reads/quarantine moves are unaffected; only writes are confined.
-fn confined_local_target(root: &Path, rel_path: &str) -> Result<PathBuf, crate::Error> {
+/// rejected too, and so is one that resolves into the account's data directory in a pair
+/// `pair_root` says is rooted at the drive. Reads/quarantine moves are unaffected; only writes are
+/// confined.
+fn confined_local_target(
+	root: &Path,
+	pair_root: PairRoot,
+	rel_path: &str,
+) -> Result<PathBuf, crate::Error> {
 	if rel_path
 		.split('/')
 		.any(|c| c.is_empty() || c == "." || c == "..")
@@ -597,6 +617,20 @@ fn confined_local_target(root: &Path, rel_path: &str) -> Result<PathBuf, crate::
 			"refusing to write into filen-sync's trash folder via {rel_path:?}"
 		)));
 	}
+	// Nor into the account's data directory, which the plan never names either but a link can
+	// resolve into; its name is matched case-insensitively (see [`is_account_data`]), so a case
+	// variant is caught on the relative path whatever spelling the filesystem hands back.
+	if is_account_data(rel_path, pair_root)
+		|| within
+			.components()
+			.next()
+			.and_then(|component| component.as_os_str().to_str())
+			.is_some_and(|name| is_account_data(name, pair_root))
+	{
+		return Err(internal_owned(format!(
+			"refusing to write into the account's data directory via {rel_path:?}"
+		)));
+	}
 	Ok(target)
 }
 
@@ -608,12 +642,16 @@ fn confined_local_target(root: &Path, rel_path: &str) -> Result<PathBuf, crate::
 ///
 /// `None` if there is nothing at `rel_path` any more — the copy the caller meant to keep was
 /// deleted since the conflict was recorded, so there is nothing to move and nothing to fail over.
-pub(super) fn rename_aside(root: &Path, rel_path: &str) -> Result<Option<String>, crate::Error> {
-	let source = confined_local_target(root, rel_path)?;
+pub(super) fn rename_aside(
+	root: &Path,
+	pair_root: PairRoot,
+	rel_path: &str,
+) -> Result<Option<String>, crate::Error> {
+	let source = confined_local_target(root, pair_root, rel_path)?;
 	if source.symlink_metadata().is_err() {
 		return Ok(None);
 	}
-	let (rel, dest) = aside_target(root, rel_path)?;
+	let (rel, dest) = aside_target(root, pair_root, rel_path)?;
 	std::fs::rename(&source, &dest).map_err(io_err)?;
 	Ok(Some(rel))
 }
@@ -621,7 +659,11 @@ pub(super) fn rename_aside(root: &Path, rel_path: &str) -> Result<Option<String>
 /// A free `<stem>.old.<ext>` name beside `rel_path` (`<stem>.old.N.<ext>` when that is taken), with
 /// its confined local path. What [`rename_aside`] moves the losing copy to, and where a keep-both
 /// resolution of a buried version downloads it.
-pub(super) fn aside_target(root: &Path, rel_path: &str) -> Result<(String, PathBuf), crate::Error> {
+pub(super) fn aside_target(
+	root: &Path,
+	pair_root: PairRoot,
+	rel_path: &str,
+) -> Result<(String, PathBuf), crate::Error> {
 	let (parent, name) = parent_and_name(rel_path);
 	let (stem, ext) = match name.rsplit_once('.') {
 		Some((stem, ext)) if !stem.is_empty() => (stem, Some(ext)),
@@ -642,7 +684,7 @@ pub(super) fn aside_target(root: &Path, rel_path: &str) -> Result<(String, PathB
 		} else {
 			format!("{parent}/{candidate}")
 		};
-		let dest = confined_local_target(root, &rel)?;
+		let dest = confined_local_target(root, pair_root, &rel)?;
 		if dest.symlink_metadata().is_err() {
 			return Ok((rel, dest));
 		}
@@ -2755,7 +2797,7 @@ async fn apply_transfer(
 				return Ok(Transfer::Interrupted);
 			};
 			let remote_file = remote_file?;
-			let path = confined_local_target(ctx.local_root, rel_path)?;
+			let path = confined_local_target(ctx.local_root, ctx.pair_root(), rel_path)?;
 			if let Some(parent) = path.parent() {
 				std::fs::create_dir_all(parent).map_err(io_err)?;
 			}
@@ -2999,7 +3041,7 @@ async fn apply_one(
 	let action = &planned.action;
 	match (action, &planned.start) {
 		(SyncAction::CreateLocalDir { rel_path }, PassStart::Remote { remote }) => {
-			let path = confined_local_target(ctx.local_root, rel_path)?;
+			let path = confined_local_target(ctx.local_root, ctx.pair_root(), rel_path)?;
 			std::fs::create_dir_all(&path).map_err(io_err)?;
 			let remote_uuid = remote.as_deref().map(|n| n.remote_uuid);
 			upsert_dir_baseline(ctx, rel_path, remote_uuid, local_mtime_of(&path)).await?;
@@ -3153,7 +3195,7 @@ async fn apply_one(
 			},
 		) => {
 			let from = local_path(ctx.local_root, from_path);
-			let to = confined_local_target(ctx.local_root, to_path)?;
+			let to = confined_local_target(ctx.local_root, ctx.pair_root(), to_path)?;
 			// The reconciler only plans a move onto a destination the SCAN saw free, but a pass
 			// waits on the drive lock in between and a file can land there meanwhile — and
 			// `rename` would destroy it without a trace. Same window, and same remedy, as the
@@ -3255,7 +3297,7 @@ async fn apply_one(
 			_,
 		) => {
 			let from = local_path(ctx.local_root, from_path);
-			let to = confined_local_target(ctx.local_root, to_path)?;
+			let to = confined_local_target(ctx.local_root, ctx.pair_root(), to_path)?;
 			// The destination can have become a directory of its own since the scan, and a rename
 			// onto an empty one would silently replace it. A case-only rename cannot ask for the path
 			// itself — a case-insensitive filesystem answers with the source — so it asks the parent

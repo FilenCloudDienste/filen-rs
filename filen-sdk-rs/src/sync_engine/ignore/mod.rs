@@ -3,9 +3,10 @@
 //! Sources, highest precedence first: the `.filenignore` in the item's own directory, the
 //! shallower `.filenignore` files up to the pair root, the device-wide user level, then
 //! [`DEFAULT_IGNORE_PATTERNS`]. Within one source the last matching line decides. The engine's
-//! own internals (the quarantine directory, partial downloads, the watch staging filter) and
-//! filen-sync's trash folder (`LEGACY_TRASH_DIR`, at any depth) are not patterns and stay outside
-//! every level.
+//! own internals (the quarantine directory, partial downloads, the watch staging filter),
+//! filen-sync's trash folder (`LEGACY_TRASH_DIR`, at any depth) and, in a pair rooted at the drive,
+//! the account's data directory (`ACCOUNT_DATA_DIR`) are not patterns and stay outside every
+//! level.
 //!
 //! Every line is NFC-normalised, because every engine path is NFC, and patterns match
 //! case-insensitively, because the server dedups names that way. Both the pattern and the path are

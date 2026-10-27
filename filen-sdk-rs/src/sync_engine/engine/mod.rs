@@ -52,7 +52,7 @@ use super::{
 	plan::{self, RemoteNode, RemoteView, SyncAction},
 	remote::{RemoteObserved, cache_ancestry, delta_uuids, observe_remote},
 	rows::Baseline,
-	scan::{self, LocalScan, RuleFiles, ScanError},
+	scan::{self, LocalScan, PairRoot, RuleFiles, ScanError, ScanRoot},
 	seed::{self, SeedCounts, Seeding},
 	side::{Nodes, NodesAt, Side, SideRef},
 	stage::{self, Confirmed, Rows, Screen, ScreenError, Stage, StagedPlan},
@@ -3370,7 +3370,8 @@ impl SyncEngine {
 	}
 
 	/// Register a sync pair, returning its id. `remote_root` is the drive root or a directory in
-	/// it.
+	/// it. A pair rooted at the drive root never syncs the `.filen` directory at its top, in any
+	/// case, which Filen's apps keep the account's own data in.
 	///
 	/// Idempotent for the same `(local_root, remote_root, mode)`: the existing pair's id comes back
 	/// and nothing is disturbed. The same roots with a DIFFERENT mode is an ERROR, not a silent
@@ -3706,7 +3707,11 @@ impl SyncEngine {
 			// Move the losing local copy out of the way FIRST, then resolve the path itself to the
 			// remote: the moved-aside copy has no baseline row, so it uploads as a new file.
 			if held.local_kind.is_some() {
-				let moved = apply::rename_aside(Path::new(&record.local_root), rel_path)?;
+				let moved = apply::rename_aside(
+					Path::new(&record.local_root),
+					self.pair_root(record.remote_root),
+					rel_path,
+				)?;
 				tracing::debug!(
 					"resolve_conflict[pair {pair}]: kept the local copy of {rel_path:?} aside as {moved:?}"
 				);
@@ -3798,7 +3803,8 @@ impl SyncEngine {
 			ConflictResolution::KeepLocal => {}
 			ConflictResolution::KeepBoth => {
 				let buried = self.client.get_file(buried_uuid).await?;
-				let (aside, path) = apply::aside_target(local_root, rel_path)?;
+				let (aside, path) =
+					apply::aside_target(local_root, self.pair_root(record.remote_root), rel_path)?;
 				self.client
 					.download_file_to_path(&buried, &path, None)
 					.await?;
@@ -4329,6 +4335,7 @@ impl SyncEngine {
 		};
 		let delta = scope.take_remote();
 		let root = inputs.record.remote_root;
+		let pair_root = self.pair_root(root);
 		let for_remote = inputs.baseline.clone();
 		let nodes = mem::take(&mut derived.remote);
 		// The delta comes back out with the observation: `observe_remote` only borrows it, and a
@@ -4344,7 +4351,15 @@ impl SyncEngine {
 			let observed = locked(&pair_store)
 				.synced_paths(pair, &delta_uuids(&delta), &[])
 				.map(|placed| {
-					observe_remote(root, &for_remote, nodes, &delta, placed, &mut ancestry)
+					observe_remote(
+						root,
+						pair_root,
+						&for_remote,
+						nodes,
+						&delta,
+						placed,
+						&mut ancestry,
+					)
 				});
 			(observed, delta)
 		})
@@ -4454,7 +4469,14 @@ impl SyncEngine {
 		let dirty = mem::take(&mut derived.dirty);
 		let pass_rules = remote_rules.rules;
 		let observed = tokio::task::spawn_blocking(move || {
-			observe::observe_local(&local_root, &for_local, pass_rules, &rule_files, &dirty)
+			observe::observe_local(
+				&local_root,
+				pair_root,
+				&for_local,
+				pass_rules,
+				&rule_files,
+				&dirty,
+			)
 		})
 		.await
 		.map_err(|e| {
@@ -4763,6 +4785,7 @@ impl SyncEngine {
 			last_ignored,
 		} = inputs;
 		let pair = record.id;
+		let pair_root = self.pair_root(record.remote_root);
 
 		// Copied BEFORE the snapshot is read: an event the cache commits afterwards describes a
 		// state this snapshot predates, so it must not retire a pending write this pass.
@@ -4783,6 +4806,7 @@ impl SyncEngine {
 			Some(LocalWalk::start(
 				self.stage(pair)?,
 				PathBuf::from(&record.local_root),
+				pair_root,
 				scan_baseline.clone(),
 				IgnoreRules::new(user),
 				RuleFiles::Read,
@@ -4818,7 +4842,7 @@ impl SyncEngine {
 			// Every row the pass still needs is in the view now; the objects it ACTS on are read back
 			// whole by uuid, for the handful a plan names.
 			let root = record.remote_root;
-			let mut view = tokio::task::spawn_blocking(move || copied.finish(root))
+			let mut view = tokio::task::spawn_blocking(move || copied.finish(root, pair_root))
 				.await
 				.map_err(|e| {
 					Error::custom(
@@ -4903,6 +4927,7 @@ impl SyncEngine {
 				LocalWalk::start(
 					self.stage(pair)?,
 					PathBuf::from(&record.local_root),
+					pair_root,
 					scan_baseline,
 					remote_rules.rules,
 					rule_files,
@@ -6104,8 +6129,11 @@ impl SyncEngine {
 			return;
 		}
 		let record = locked(&self.control).pair(pair);
-		let local_root = match record {
-			Ok(Some(record)) => PathBuf::from(record.local_root),
+		let (local_root, pair_root) = match record {
+			Ok(Some(record)) => (
+				PathBuf::from(record.local_root),
+				self.pair_root(record.remote_root),
+			),
 			// The read that follows reports an unknown pair, and a failed registry read, itself.
 			Ok(None) => return,
 			Err(e) => {
@@ -6138,7 +6166,7 @@ impl SyncEngine {
 		// One day for the whole migration, so everything it moves lands in one bucket.
 		let day = Utc::now().date_naive();
 		let summary = match off_runtime("moving filen-sync's trash into the bin", move || {
-			bin::migrate_legacy_trash(&local_root, day, || gate.not_cancelled())
+			bin::migrate_legacy_trash(&local_root, pair_root, day, || gate.not_cancelled())
 		})
 		.await
 		{
@@ -6167,6 +6195,16 @@ impl SyncEngine {
 					""
 				},
 			);
+		}
+	}
+
+	/// Whether a pair whose remote root is `remote_root` is rooted at the drive root, whose account
+	/// data directory it never syncs (see [`scan::is_account_data`]).
+	pub(super) fn pair_root(&self, remote_root: Uuid) -> PairRoot {
+		if remote_root == self.client.root().uuid() {
+			PairRoot::Drive
+		} else {
+			PairRoot::Directory
 		}
 	}
 
@@ -6553,12 +6591,11 @@ impl SyncEngine {
 
 		// Resolve the sync root (every top-level parent). The drive root is the client's own; any
 		// other directory is read from the server, which errors if it is gone.
-		let root_remote = if prep.record.remote_root == self.client.root().uuid() {
-			DirType::Root(Cow::Borrowed(self.client.root()))
-		} else {
-			DirType::Dir(Cow::Owned(
+		let root_remote = match self.pair_root(prep.record.remote_root) {
+			PairRoot::Drive => DirType::Root(Cow::Borrowed(self.client.root())),
+			PairRoot::Directory => DirType::Dir(Cow::Owned(
 				self.client.get_dir(prep.record.remote_root).await?,
-			))
+			)),
 		};
 
 		let (screen, ends) = off_runtime("reading the pass's screened plan", move || {
@@ -7358,6 +7395,7 @@ impl LocalWalk {
 	fn start(
 		stage: Stage,
 		root: PathBuf,
+		pair_root: PairRoot,
 		baseline: Baseline,
 		rules: IgnoreRules,
 		rule_files: RuleFiles,
@@ -7366,7 +7404,17 @@ impl LocalWalk {
 		let stop = Arc::new(AtomicBool::new(false));
 		let walking = Arc::clone(&stop);
 		let handle = tokio::task::spawn_blocking(move || {
-			scan::scan_local_staged(&root, &baseline, rules, rule_files, stage, &walking)
+			scan::scan_local_staged(
+				ScanRoot {
+					path: &root,
+					pair_root,
+				},
+				&baseline,
+				rules,
+				rule_files,
+				stage,
+				&walking,
+			)
 		});
 		Self { handle, stop, at }
 	}

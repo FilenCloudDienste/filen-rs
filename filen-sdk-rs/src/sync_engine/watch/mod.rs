@@ -49,7 +49,7 @@ use super::{
 	baseline::PairId,
 	changes::{FullPassReason, PairChanges},
 	engine::SyncEngine,
-	scan::{QUARANTINE_DIR, is_legacy_trash},
+	scan::{PairRoot, QUARANTINE_DIR, is_account_data, is_legacy_trash},
 };
 use crate::{
 	Error, ErrorKind,
@@ -327,6 +327,7 @@ impl SyncEngine {
 		let handler = local_event_handler(
 			pair,
 			watch_root,
+			self.pair_root(record.remote_root),
 			Arc::clone(&dirty),
 			status_tx.clone(),
 			Arc::clone(&changes),
@@ -846,26 +847,32 @@ fn owes_a_pass(report: &SyncReport) -> bool {
 /// Everything is, except the engine's own staging writes: the `<uuid>.filendl` temp file a
 /// download writes before renaming it into place (the rename is itself an event), and the
 /// quarantine bin, which the scan never descends into. Nor is anything at or under filen-sync's
-/// trash folder, which the scan never reads either (see [`is_legacy_trash`]). A user file that
-/// happens to end in `.filendl` is not lost, only delayed to the next safety-net pass. A pathless
-/// event (a watcher rescan notice) always counts.
-fn triggers_pass(root: &Path, event: &notify::Event) -> bool {
+/// trash folder, which the scan never reads either (see [`is_legacy_trash`]), or — in a pair
+/// `pair_root` says is rooted at the drive — at or under the account's data directory (see
+/// [`is_account_data`]). A user file that happens to end in `.filendl` is not lost, only delayed
+/// to the next safety-net pass. A pathless event (a watcher rescan notice) always counts.
+fn triggers_pass(root: &Path, pair_root: PairRoot, event: &notify::Event) -> bool {
 	event.paths.is_empty()
 		|| event
 			.paths
 			.iter()
-			.any(|path| !is_engine_staging(root, path))
+			.any(|path| !is_engine_staging(root, pair_root, path))
 }
 
 /// Whether `path` is one of the engine's own staging locations under `root`, or at or under
-/// filen-sync's trash folder at any depth (see [`triggers_pass`]).
-fn is_engine_staging(root: &Path, path: &Path) -> bool {
+/// filen-sync's trash folder at any depth, or under the account's data directory in a pair rooted
+/// at the drive (see [`triggers_pass`]).
+fn is_engine_staging(root: &Path, pair_root: PairRoot, path: &Path) -> bool {
 	let Ok(rel) = path.strip_prefix(root) else {
 		return false;
 	};
+	let top = rel.components().next().map(|c| c.as_os_str());
 	rel.extension() == Some(OsStr::new(DOWNLOAD_TMP_EXT))
-		|| rel.components().next().map(|c| c.as_os_str()) == Some(OsStr::new(QUARANTINE_DIR))
+		|| top == Some(OsStr::new(QUARANTINE_DIR))
 		|| rel.components().any(|c| is_legacy_trash(c.as_os_str()))
+		|| top
+			.and_then(OsStr::to_str)
+			.is_some_and(|name| is_account_data(name, pair_root))
 }
 
 /// Publish a finished pass's health. Only the pass's own fields change: a degraded trigger source
@@ -920,14 +927,17 @@ fn start_local_watcher<W: Watcher>(
 fn local_event_handler(
 	pair: PairId,
 	root: PathBuf,
+	pair_root: PairRoot,
 	dirty: Arc<Notify>,
 	status: tokio::sync::watch::Sender<WatchStatus>,
 	changes: Arc<PairChanges>,
 ) -> impl FnMut(notify::Result<notify::Event>) + Send + 'static {
 	move |res| match res {
 		Ok(event) => {
-			changes.note_local_event(&root, &event, |path| is_engine_staging(&root, path));
-			if triggers_pass(&root, &event) {
+			changes.note_local_event(&root, &event, |path| {
+				is_engine_staging(&root, pair_root, path)
+			});
+			if triggers_pass(&root, pair_root, &event) {
 				dirty.notify_one();
 			}
 		}

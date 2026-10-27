@@ -13,7 +13,7 @@ use tokio::sync::Notify;
 
 use super::{
 	BASE_BACKOFF, DEBOUNCE, FullPassReason, MAX_BACKOFF, MAX_DEBOUNCE_BURST, MAX_SAFETY_NET,
-	PairChanges, SAFETY_NET, SAFETY_NET_DUTY, Stop, SyncReport, WatchConfig, WatchState,
+	PairChanges, PairRoot, SAFETY_NET, SAFETY_NET_DUTY, Stop, SyncReport, WatchConfig, WatchState,
 	WatchStatus, backoff, local_event_handler, net_due, net_interval, owes_a_pass, pass_outcome,
 	publish_pass, read_both_sides_whole, start_local_watcher, triggers_pass, wait_for_next_pass,
 	wait_while_paused,
@@ -105,6 +105,7 @@ async fn a_watcher_error_wakes_the_loop_and_marks_the_watch_degraded() {
 	let mut handler = local_event_handler(
 		1,
 		PathBuf::from("/sync/root"),
+		PairRoot::Directory,
 		Arc::clone(&dirty),
 		status.clone(),
 		Arc::clone(&changes),
@@ -214,21 +215,28 @@ fn only_the_engines_own_staging_writes_are_filtered_out() {
 	// Real changes wake the loop.
 	assert!(triggers_pass(
 		root,
+		PairRoot::Directory,
 		&event(EventKind::Create(CreateKind::File), &["/sync/root/a.txt"])
 	));
 	// The rename that commits a download does too — it is the real file appearing.
 	assert!(triggers_pass(
 		root,
+		PairRoot::Directory,
 		&event(
 			EventKind::Modify(ModifyKind::Name(RenameMode::Any)),
 			&["/sync/root/a.txt"]
 		)
 	));
 	// A pathless rescan notice always counts.
-	assert!(triggers_pass(root, &event(EventKind::Other, &[])));
+	assert!(triggers_pass(
+		root,
+		PairRoot::Directory,
+		&event(EventKind::Other, &[])
+	));
 	// A path outside the root is not ours to classify.
 	assert!(triggers_pass(
 		root,
+		PairRoot::Directory,
 		&event(
 			EventKind::Create(CreateKind::File),
 			&["/elsewhere/x.filendl"]
@@ -237,6 +245,7 @@ fn only_the_engines_own_staging_writes_are_filtered_out() {
 	// The engine's own staging writes do not.
 	assert!(!triggers_pass(
 		root,
+		PairRoot::Directory,
 		&event(
 			EventKind::Create(CreateKind::File),
 			&["/sync/root/sub/dee76e0e-0000-0000-0000-000000000000.filendl"]
@@ -244,6 +253,7 @@ fn only_the_engines_own_staging_writes_are_filtered_out() {
 	));
 	assert!(!triggers_pass(
 		root,
+		PairRoot::Directory,
 		&event(
 			EventKind::Create(CreateKind::File),
 			&["/sync/root/.filen-sync-trash/gone.txt"]
@@ -256,7 +266,11 @@ fn only_the_engines_own_staging_writes_are_filtered_out() {
 		"/sync/root/Photos/.filen.trash.local/deep/x.jpg",
 	] {
 		assert!(
-			!triggers_pass(root, &event(EventKind::Create(CreateKind::File), &[path])),
+			!triggers_pass(
+				root,
+				PairRoot::Directory,
+				&event(EventKind::Create(CreateKind::File), &[path])
+			),
 			"{path}"
 		);
 	}
@@ -266,13 +280,40 @@ fn only_the_engines_own_staging_writes_are_filtered_out() {
 		"/sync/root/Photos/.Filen.Trash.Local/y.txt",
 	] {
 		assert!(
-			triggers_pass(root, &event(EventKind::Create(CreateKind::File), &[path])),
+			triggers_pass(
+				root,
+				PairRoot::Directory,
+				&event(EventKind::Create(CreateKind::File), &[path])
+			),
+			"{path}"
+		);
+	}
+	// Nor does anything in the account's data directory of a pair rooted at the drive, in any case,
+	// the directory itself included; a `.filen` deeper down, a longer name, and the same paths in a
+	// pair rooted at a directory do.
+	for path in [
+		"/sync/root/.filen",
+		"/sync/root/.filen/chats/a.bin",
+		"/sync/root/.FILEN/y.txt",
+	] {
+		let created = event(EventKind::Create(CreateKind::File), &[path]);
+		assert!(!triggers_pass(root, PairRoot::Drive, &created), "{path}");
+		assert!(triggers_pass(root, PairRoot::Directory, &created), "{path}");
+	}
+	for path in ["/sync/root/Photos/.filen/x.jpg", "/sync/root/.filen.txt"] {
+		assert!(
+			triggers_pass(
+				root,
+				PairRoot::Drive,
+				&event(EventKind::Create(CreateKind::File), &[path])
+			),
 			"{path}"
 		);
 	}
 	// A batch that mentions both still wakes the loop, for the real path.
 	assert!(triggers_pass(
 		root,
+		PairRoot::Directory,
 		&event(
 			EventKind::Create(CreateKind::File),
 			&["/sync/root/.filen-sync-trash/gone.txt", "/sync/root/a.txt"]
@@ -931,6 +972,7 @@ fn the_handler_records_what_changed_for_the_next_pass() {
 	let mut handler = local_event_handler(
 		1,
 		root.clone(),
+		PairRoot::Directory,
 		Arc::clone(&dirty),
 		status,
 		Arc::clone(&changes),

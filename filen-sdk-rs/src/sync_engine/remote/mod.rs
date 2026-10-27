@@ -38,6 +38,7 @@ use super::{
 	ignore::rule_file_dir,
 	plan::{self, RemoteNode, is_reserved_path, is_safe_name, join_path},
 	rows::Baseline,
+	scan::PairRoot,
 	side::{Nodes, NodesAt, Side},
 };
 use crate::cache::{RemoteItem, SearchResult, hydrate_by_uuids, read_ancestors};
@@ -100,6 +101,9 @@ pub(super) struct RemoteObservation {
 	/// pair, which is the whole point: the resident `Uuid -> row` map this replaces cost 36.75 MiB
 	/// at a million rows and was consulted a handful of times a pass.
 	placed: SyncedPaths,
+	/// Whether the pair is rooted at the drive, whose account data directory is in no view (see
+	/// [`is_reserved_path`]).
+	pair_root: PairRoot,
 }
 
 /// The outcome of applying a delta: the derived view, or the reason this pass has to read the
@@ -145,21 +149,23 @@ pub(super) fn delta_uuids(delta: &[RemoteDeltaEntry]) -> Vec<Uuid> {
 
 /// Apply `delta` to `nodes` — the remote view derived from the baseline rows — in dispatch order.
 ///
-/// `root` is the pair's remote root uuid, the item every derived path is relative to. `baseline` is
-/// the resident tree, asked where the view does not know an item's parent, before the cache is.
+/// `root` is the pair's remote root uuid, the item every derived path is relative to, and
+/// `pair_root` whether that is the drive root. `baseline` is the resident tree, asked where the view
+/// does not know an item's parent, before the cache is.
 ///
 /// A delta that EMPTIES the view is not applied: an emptied remote is the one shape the guard
 /// weighs against whole-tree evidence (`remote_emptied`), so it is a full-pass trigger rather than
 /// a derivation (plan 3.5).
 pub(super) fn observe_remote(
 	root: Uuid,
+	pair_root: PairRoot,
 	baseline: &Baseline,
 	nodes: Side<RemoteNode>,
 	delta: &[RemoteDeltaEntry],
 	placed: SyncedPaths,
 	ancestry: Ancestry<'_>,
 ) -> RemoteObserved {
-	let mut out = RemoteObservation::new(nodes, placed);
+	let mut out = RemoteObservation::new(nodes, placed, pair_root);
 	for entry in delta {
 		if let Err(reason) = out.apply(root, baseline, &entry.change, &mut *ancestry) {
 			return RemoteObserved::Full(reason);
@@ -212,7 +218,7 @@ fn as_item(result: &SearchResult) -> RemoteItem {
 }
 
 impl RemoteObservation {
-	fn new(nodes: Side<RemoteNode>, placed: SyncedPaths) -> Self {
+	fn new(nodes: Side<RemoteNode>, placed: SyncedPaths, pair_root: PairRoot) -> Self {
 		Self {
 			nodes,
 			moved: HashMap::new(),
@@ -222,6 +228,7 @@ impl RemoteObservation {
 			rule_dirs: BTreeSet::new(),
 			superseded: HashMap::new(),
 			placed,
+			pair_root,
 		}
 	}
 
@@ -377,9 +384,10 @@ impl RemoteObservation {
 			};
 		}
 		let path = join_path(parent, name);
-		// The engine's own bin and filen-sync's trash are in no view (`place_remote_items`), so an
-		// item moved into either leaves, exactly as a whole-tree read would show it leaving.
-		if is_reserved_path(&path) {
+		// The engine's own bin, filen-sync's trash and the account's data directory are in no view
+		// (`place_remote_items`), so an item moved into one leaves, exactly as a whole-tree read
+		// would show it leaving.
+		if is_reserved_path(&path, self.pair_root) {
 			return self.vacate(baseline, uuid);
 		}
 		// A held path is one the pass may not act on; a third item arriving on it changes nothing

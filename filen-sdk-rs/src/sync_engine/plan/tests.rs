@@ -8,7 +8,7 @@ use super::{
 		derive,
 		engine::{Observations, PendingKind, PendingWrites},
 		ignore::{IgnoreLevel, IgnoreSource, Origin},
-		scan::LEGACY_TRASH_DIR,
+		scan::{ACCOUNT_DATA_DIR, LEGACY_TRASH_DIR},
 		side::{FromRow, test_support::copied},
 		stage::{Stage, WINDOW, reconcile_windows, staged_sides},
 	},
@@ -4156,6 +4156,7 @@ fn a_traversal_name_never_enters_the_view_and_its_subtree_shares_its_record() {
 	let under_evil = remote_dir("x", evil.uuid);
 	let view = build_remote_view(
 		root,
+		PairRoot::Directory,
 		&[evil.clone(), ok, under_evil.clone()],
 		&[],
 		&[],
@@ -4191,6 +4192,7 @@ fn undecodable_items_are_recorded_under_their_parent_when_they_belong_to_the_roo
 	let elsewhere = undecodable(Uuid::new_v4(), None);
 	let view = build_remote_view(
 		root,
+		PairRoot::Directory,
 		std::slice::from_ref(&sub),
 		&[],
 		&[in_sub, garbled_dir, under_garbled, elsewhere],
@@ -4232,6 +4234,7 @@ fn a_synced_item_moved_under_a_skipped_directory_is_unknown_not_absent() {
 	let in_garbled = undecodable(garbled.uuid, None);
 	let view = build_remote_view(
 		root,
+		PairRoot::Directory,
 		&[evil.clone(), nested.clone()],
 		&[moved.clone(), stranger, deep.clone()],
 		&[garbled, in_garbled],
@@ -4379,6 +4382,7 @@ fn a_default_rule_hit_on_the_remote_is_a_root_only_where_a_row_sits_at_or_under_
 
 	let untracked = build_remote_view(
 		root,
+		PairRoot::Directory,
 		&dirs,
 		&files,
 		&[],
@@ -4410,6 +4414,7 @@ fn a_default_rule_hit_on_the_remote_is_a_root_only_where_a_row_sits_at_or_under_
 
 	let tracked = build_remote_view(
 		root,
+		PairRoot::Directory,
 		&dirs,
 		&files,
 		&[],
@@ -4451,7 +4456,14 @@ fn an_ignored_remote_item_leaves_the_view_and_only_its_top_is_recorded() {
 	let stranger = undecodable(root, None);
 	let undecodables = [undecodable(build.uuid, Some(lineage)), stranger];
 
-	let raw = build_remote_view(root, &dirs, &files, &undecodables, None);
+	let raw = build_remote_view(
+		root,
+		PairRoot::Directory,
+		&dirs,
+		&files,
+		&undecodables,
+		None,
+	);
 	assert!(raw.has_collisions, "unfiltered, the twins collide");
 	assert_eq!(raw.skipped.len(), 3, "{:?}", raw.skipped);
 	assert!(raw.ignored.is_empty());
@@ -4459,6 +4471,7 @@ fn an_ignored_remote_item_leaves_the_view_and_only_its_top_is_recorded() {
 	let rules = root_rules("build/\n*.tmp");
 	let view = build_remote_view(
 		root,
+		PairRoot::Directory,
 		&dirs,
 		&files,
 		&undecodables,
@@ -4544,7 +4557,7 @@ fn the_narrowed_filter_hides_the_decided_paths_and_leaves_the_carried_ones() {
 
 	// Nothing the rules hide was decided: the whole ignored subtree is still carried, and the
 	// pass reports no root of its own (the carried facts hold the ones earlier passes found).
-	let mut carried = place_remote_items(root, &dirs, &files, &[]);
+	let mut carried = place_remote_items(root, PairRoot::Directory, &dirs, &files, &[]);
 	carried.filter_changed(filter(), &decided(&["keep.txt"]));
 	assert_eq!(
 		sorted(&carried),
@@ -4554,14 +4567,14 @@ fn the_narrowed_filter_hides_the_decided_paths_and_leaves_the_carried_ones() {
 	assert!(carried.ignored.is_empty(), "{:?}", carried.ignored);
 
 	// The directory itself decided — a remote move of it into view — takes its subtree with it.
-	let mut moved = place_remote_items(root, &dirs, &files, &[]);
+	let mut moved = place_remote_items(root, PairRoot::Directory, &dirs, &files, &[]);
 	moved.filter_changed(filter(), &decided(&["build"]));
 	assert_eq!(sorted(&moved), ["keep.txt"]);
 	assert_eq!(moved.ignored.keys().collect::<Vec<_>>(), vec!["build"]);
 
 	// One item created under an ALREADY ignored directory: only that key was decided, so only
 	// it leaves — and the root recorded is the directory the rule names, not the item.
-	let mut created = place_remote_items(root, &dirs, &files, &[]);
+	let mut created = place_remote_items(root, PairRoot::Directory, &dirs, &files, &[]);
 	created.filter_changed(filter(), &decided(&["build/deep/x.bin"]));
 	assert_eq!(
 		sorted(&created),
@@ -4571,7 +4584,7 @@ fn the_narrowed_filter_hides_the_decided_paths_and_leaves_the_carried_ones() {
 
 	// The same three inputs read WHOLE: every hidden node goes, whatever was decided. This is
 	// what the narrowed form is allowed to differ from, and the difference is the saving.
-	let mut whole = place_remote_items(root, &dirs, &files, &[]);
+	let mut whole = place_remote_items(root, PairRoot::Directory, &dirs, &files, &[]);
 	whole.filter(Some(filter()));
 	assert_eq!(sorted(&whole), ["keep.txt"]);
 }
@@ -4604,7 +4617,13 @@ fn the_narrowed_collision_check_folds_every_key_a_decided_one_can_meet() {
 		base_file("note.txt", lower.uuid, [3; 32]),
 	)]);
 	let carried_rows = tree(&rows);
-	let mut against_carried = place_remote_items(root, &[], &[lower.clone(), upper.clone()], &[]);
+	let mut against_carried = place_remote_items(
+		root,
+		PairRoot::Directory,
+		&[],
+		&[lower.clone(), upper.clone()],
+		&[],
+	);
 	against_carried.resolve_collisions_changed(&carried_rows, &decided(&["Note.txt"]));
 	assert!(against_carried.has_collisions);
 	assert!(
@@ -4614,7 +4633,13 @@ fn the_narrowed_collision_check_folds_every_key_a_decided_one_can_meet() {
 	assert!(against_carried.nodes.whole().holds("note.txt"));
 
 	// Against another DECIDED key, with no row behind either.
-	let mut both_decided = place_remote_items(root, &[], &[lower.clone(), upper.clone()], &[]);
+	let mut both_decided = place_remote_items(
+		root,
+		PairRoot::Directory,
+		&[],
+		&[lower.clone(), upper.clone()],
+		&[],
+	);
 	both_decided.resolve_collisions_changed(&no_rows, &decided(&["Note.txt", "note.txt"]));
 	assert!(both_decided.has_collisions);
 	assert_eq!(
@@ -4624,14 +4649,20 @@ fn the_narrowed_collision_check_folds_every_key_a_decided_one_can_meet() {
 	);
 
 	// Against a HELD path, which took its key when the view held it.
-	let mut against_held = place_remote_items(root, &[], std::slice::from_ref(&upper), &[]);
+	let mut against_held = place_remote_items(
+		root,
+		PairRoot::Directory,
+		&[],
+		std::slice::from_ref(&upper),
+		&[],
+	);
 	against_held.held_paths = decided(&["note.txt"]);
 	against_held.resolve_collisions_changed(&no_rows, &decided(&["Note.txt"]));
 	assert!(against_held.has_collisions);
 	assert!(!against_held.nodes.whole().holds("Note.txt"));
 
 	// Two keys the pass merely CARRIED: not folded, by the induction above.
-	let mut carried_only = place_remote_items(root, &[], &[lower, upper], &[]);
+	let mut carried_only = place_remote_items(root, PairRoot::Directory, &[], &[lower, upper], &[]);
 	carried_only.resolve_collisions_changed(&carried_rows, &BTreeSet::new());
 	assert!(
 		!carried_only.has_collisions,
@@ -4702,12 +4733,13 @@ fn ignoring_everything_empties_only_the_filtered_view() {
 		cacheable_file(sub.uuid, "f.txt"),
 	];
 	let dirs = std::slice::from_ref(&sub);
-	let raw = build_remote_view(root, dirs, &files, &[], None);
+	let raw = build_remote_view(root, PairRoot::Directory, dirs, &files, &[], None);
 	assert_eq!(raw.nodes.whole().len(), 3);
 	assert!(raw.nodes.whole().holds(".filenignore"));
 
 	let view = build_remote_view(
 		root,
+		PairRoot::Directory,
 		dirs,
 		&files,
 		&[],
@@ -4750,7 +4782,7 @@ fn a_streamed_view_is_the_view_the_slices_build() {
 
 	let dirs = [a.clone(), deep.clone(), bad.clone()];
 	let files = [leaf.clone(), under_bad.clone(), orphan.clone()];
-	let materialized = place_remote_items(root, &dirs, &files, &undecodable);
+	let materialized = place_remote_items(root, PairRoot::Directory, &dirs, &files, &undecodable);
 	assert!(
 		materialized.nodes.whole().holds("A/deep/leaf.txt") && materialized.skipped.len() == 4,
 		"the fixture has to exercise placement AND every way of failing it: {:?} {:?}",
@@ -4758,7 +4790,7 @@ fn a_streamed_view_is_the_view_the_slices_build() {
 		materialized.skipped,
 	);
 
-	let mut builder = ViewBuilder::with_capacity(root, 0);
+	let mut builder = ViewBuilder::with_capacity(root, PairRoot::Directory, 0);
 	crate::cache::SnapshotSink::undecodable(&mut builder, undecodable.to_vec());
 	// Children first, every parent last: the worst order a read could hand these over in.
 	for (is_dir, item) in [
@@ -4799,7 +4831,7 @@ fn a_directory_only_rule_hides_what_was_recorded_under_an_unplaceable_directory(
 	let dirs = [bad];
 	let files = [child];
 
-	let placed = place_remote_items(root, &dirs, &files, &[]);
+	let placed = place_remote_items(root, PairRoot::Directory, &dirs, &files, &[]);
 	assert!(
 		placed.nodes.whole().is_empty(),
 		"{:?}",
@@ -4817,7 +4849,7 @@ fn a_directory_only_rule_hides_what_was_recorded_under_an_unplaceable_directory(
 		placed.skipped
 	);
 
-	let mut view = place_remote_items(root, &dirs, &files, &[]);
+	let mut view = place_remote_items(root, PairRoot::Directory, &dirs, &files, &[]);
 	view.filter(Some(ViewFilter {
 		rules: &root_rules("bad*/"),
 		baseline: &Baseline::default(),
@@ -4843,7 +4875,7 @@ fn the_placed_view_keeps_both_case_twins_and_the_filter_resolves_them() {
 	};
 	let files = [lower, upper];
 
-	let mut view = place_remote_items(root, &[], &files, &[]);
+	let mut view = place_remote_items(root, PairRoot::Directory, &[], &files, &[]);
 	let mut placed: Vec<String> = view
 		.nodes
 		.whole()
@@ -4879,7 +4911,7 @@ fn a_held_duplicate_the_rules_hide_stays_held_and_is_not_reported_as_ignored() {
 	let dirs = [build];
 	let files = [twin, second];
 
-	let mut view = place_remote_items(root, &dirs, &files, &[]);
+	let mut view = place_remote_items(root, PairRoot::Directory, &dirs, &files, &[]);
 	assert_eq!(
 		view.held_paths
 			.iter()
@@ -4912,7 +4944,14 @@ fn a_held_duplicate_the_rules_hide_stays_held_and_is_not_reported_as_ignored() {
 fn build_remote_view_excludes_the_quarantine_dir_name() {
 	let root = Uuid::new_v4();
 	let trash = remote_dir(QUARANTINE_DIR, root);
-	let view = build_remote_view(root, std::slice::from_ref(&trash), &[], &[], None);
+	let view = build_remote_view(
+		root,
+		PairRoot::Directory,
+		std::slice::from_ref(&trash),
+		&[],
+		&[],
+		None,
+	);
 	assert!(
 		view.nodes.whole().is_empty(),
 		"a remote folder named like the quarantine dir must be excluded from the view"
@@ -4940,6 +4979,7 @@ fn build_remote_view_excludes_filen_syncs_trash_at_any_depth_by_its_exact_name()
 	];
 	let view = build_remote_view(
 		root,
+		PairRoot::Directory,
 		&[top_trash, photos, nested_trash, deep, other_case],
 		&files,
 		&[],
@@ -4968,6 +5008,73 @@ fn build_remote_view_excludes_filen_syncs_trash_at_any_depth_by_its_exact_name()
 		view.skipped
 	);
 	assert!(!view.has_collisions);
+}
+
+/// The account's data directory is in no view of a pair rooted at the drive, in any case, and nor
+/// is anything under it — not even a record of an item it could not place. A `.filen` deeper down,
+/// a longer name, and the same tree under a pair rooted at a directory are the user's.
+#[test]
+fn build_remote_view_excludes_the_account_data_directory_at_the_top_of_a_drive_rooted_pair() {
+	let root = Uuid::from_u128(1);
+	let account = remote_dir(ACCOUNT_DATA_DIR, root);
+	let chats = remote_dir("chats", account.uuid);
+	let photos = remote_dir("Photos", root);
+	let nested = remote_dir(ACCOUNT_DATA_DIR, photos.uuid);
+	let files = [
+		cacheable_file(chats.uuid, "a.bin"),
+		// An unsafe name, which anywhere else is recorded as unsyncable.
+		cacheable_file(chats.uuid, ".."),
+		cacheable_file(nested.uuid, "x.jpg"),
+		cacheable_file(root, ".filen.txt"),
+	];
+	let dirs = [account, chats, photos, nested];
+	let paths = |view: &RemoteView| {
+		let mut paths: Vec<String> = view
+			.nodes
+			.whole()
+			.paths()
+			.map(|path| path.into_owned())
+			.collect();
+		paths.sort();
+		paths
+	};
+
+	let drive = build_remote_view(root, PairRoot::Drive, &dirs, &files, &[], None);
+	assert_eq!(
+		paths(&drive),
+		vec![
+			".filen.txt",
+			"Photos",
+			"Photos/.filen",
+			"Photos/.filen/x.jpg"
+		]
+	);
+	assert!(
+		drive.skipped.is_empty(),
+		"the account's data directory is left out without a record: {:?}",
+		drive.skipped
+	);
+	assert!(!drive.has_collisions);
+	// The server dedups the drive root's names case-insensitively, so this is that directory too.
+	let other_case = remote_dir(".Filen", root);
+	let under = cacheable_file(other_case.uuid, "y.txt");
+	let view = build_remote_view(root, PairRoot::Drive, &[other_case], &[under], &[], None);
+	assert_eq!(paths(&view), Vec::<String>::new());
+
+	let directory = build_remote_view(root, PairRoot::Directory, &dirs, &files, &[], None);
+	assert_eq!(
+		paths(&directory),
+		vec![
+			".filen",
+			".filen.txt",
+			".filen/chats",
+			".filen/chats/a.bin",
+			"Photos",
+			"Photos/.filen",
+			"Photos/.filen/x.jpg",
+		]
+	);
+	assert_eq!(directory.skipped.len(), 1, "{:?}", directory.skipped);
 }
 
 #[test]
@@ -5421,6 +5528,7 @@ fn a_byte_identical_duplicate_remote_name_holds_only_that_path() {
 
 	let view = build_remote_view(
 		root,
+		PairRoot::Directory,
 		&[],
 		&[predecessor, successor, sibling.clone()],
 		&[],
@@ -5503,7 +5611,7 @@ fn a_case_only_remote_collision_still_refuses_the_pass() {
 		..lower.clone()
 	};
 
-	let view = build_remote_view(root, &[], &[lower, upper], &[], None);
+	let view = build_remote_view(root, PairRoot::Directory, &[], &[lower, upper], &[], None);
 
 	assert!(
 		view.has_collisions,
@@ -5525,6 +5633,7 @@ fn build_remote_view_resolves_paths_and_flags_collisions() {
 
 	let view = build_remote_view(
 		root,
+		PairRoot::Directory,
 		std::slice::from_ref(&sub),
 		&[file.clone(), orphan.clone()],
 		&[],

@@ -88,7 +88,7 @@ use super::{
 	plan,
 	probe::{self, Fixture, NameStyle, Shape, baseline_rows, probe_rules},
 	rows::Baseline,
-	scan::{self, RuleFiles},
+	scan::{self, PairRoot, RuleFiles, ScanRoot},
 };
 use crate::{
 	auth::test_support::offline_client,
@@ -1655,13 +1655,25 @@ async fn prepare_bed(scenario: &Scenario) -> Bed {
 	// The converged baseline: what the local walk and the cache snapshot BOTH say, which is the
 	// state a pair is in the pass after it converged.
 	let empty = Baseline::default();
-	let (scan, _) = scan::scan_local(fixture.root(), &empty, probe_rules(), RuleFiles::Read);
+	let (scan, _) = scan::scan_local(
+		ScanRoot {
+			path: fixture.root(),
+			pair_root: PairRoot::Directory,
+		},
+		&empty,
+		probe_rules(),
+		RuleFiles::Read,
+	);
 	assert!(
 		scan.complete && scan.errors.is_empty(),
 		"the fixture tree must scan cleanly: {:?}",
 		scan.errors
 	);
-	let mut builder = plan::ViewBuilder::with_capacity(fixture.remote_root(), fixture.nodes());
+	let mut builder = plan::ViewBuilder::with_capacity(
+		fixture.remote_root(),
+		PairRoot::Directory,
+		fixture.nodes(),
+	);
 	bench_support::snapshot_into(fixture.cache_db(), fixture.remote_root(), &mut builder)
 		.expect("streaming the cache snapshot the fixture just wrote");
 	let view = builder.finish();

@@ -25,7 +25,10 @@ use super::{
 	ignore::{IgnoreDecision, IgnoreLevel, IgnoreRules},
 	outcome::{UnsyncablePath, UnsyncableReason},
 	rows::Baseline,
-	scan::{LocalNode, QUARANTINE_DIR, collision_hash, collision_key, is_legacy_trash},
+	scan::{
+		LocalNode, PairRoot, QUARANTINE_DIR, collision_hash, collision_key, is_account_data,
+		is_legacy_trash,
+	},
 	side::{Nodes, NodesAt, Side, SideRef},
 };
 use crate::cache::{RemoteItem, UndecodableItem};
@@ -306,18 +309,22 @@ pub(super) fn join_path(parent_path: &str, name: &str) -> String {
 	}
 }
 
-/// Whether `rel_path` is a path the engine never syncs: the local quarantine dir or inside it, or a
-/// path with filen-sync's trash folder as any component (see [`is_legacy_trash`]). The local scan
-/// never lists either, so the remote view leaves out a remote item that happens to carry the name
-/// too, with everything under it: it is never mistaken for (or synced into) the quarantine area,
-/// never downloaded, and never trashed by a deletion propagated to it. A deletion of a directory
-/// above it still trashes it with that directory, which is what the remote does with any content.
-pub(super) fn is_reserved_path(rel_path: &str) -> bool {
+/// Whether `rel_path` is a path the engine never syncs in a pair rooted at `root`: the local
+/// quarantine dir or inside it, a path with filen-sync's trash folder as any component (see
+/// [`is_legacy_trash`]), or — in a pair rooted at the drive — the account's data directory or
+/// inside it (see [`is_account_data`]). The local scan never lists any of them, so the remote view
+/// leaves out a remote item that happens to carry the name too, with everything under it: it is
+/// never mistaken for (or synced into) the quarantine area, never downloaded, and never trashed by
+/// a deletion propagated to it. A deletion of a directory above it still trashes it with that
+/// directory, which is what the remote does with any content; the account's data directory has
+/// none above it but the root.
+pub(super) fn is_reserved_path(rel_path: &str, root: PairRoot) -> bool {
 	rel_path == QUARANTINE_DIR
 		|| rel_path.starts_with(&format!("{QUARANTINE_DIR}/"))
 		|| rel_path
 			.split('/')
 			.any(|component| is_legacy_trash(OsStr::new(component)))
+		|| is_account_data(rel_path, root)
 }
 
 /// The remote view of a sync root's subtree, plus whether it is safe to reconcile against.
@@ -418,6 +425,9 @@ const HIDE_MEMO: usize = 4096;
 /// happens to hand over parents first sets nothing aside at all.
 pub(crate) struct ViewBuilder {
 	root: Uuid,
+	/// Whether `root` is the drive root, whose account data directory the view leaves out (see
+	/// [`is_reserved_path`]).
+	pair_root: PairRoot,
 	/// uuid -> (NFC name, parent) for every directory seen so far, which is what resolves a path.
 	dir_index: HashMap<Uuid, (String, Uuid)>,
 	/// Held until [`finish`](Self::finish): resolving an undecodable record's path needs the
@@ -442,15 +452,16 @@ impl ViewBuilder {
 	/// What a pass built its view with before it staged it (see `stage::remote`): the tests and the
 	/// probe build one beside the staged view, which has to come out the same.
 	#[cfg(any(test, feature = "bench-internals"))]
-	pub(crate) fn with_capacity(root: Uuid, items: usize) -> Self {
+	pub(crate) fn with_capacity(root: Uuid, pair_root: PairRoot, items: usize) -> Self {
 		Self {
 			root,
+			pair_root,
 			dir_index: HashMap::new(),
 			undecodable: Vec::new(),
 			undecodable_dirs: HashSet::new(),
 			nodes: HashMap::with_capacity(items),
 			held_paths: BTreeSet::new(),
-			skipped: Skipped::default(),
+			skipped: Skipped::new(pair_root),
 			deferred: Vec::new(),
 		}
 	}
@@ -461,18 +472,20 @@ impl ViewBuilder {
 	/// exactly as it does with the whole snapshot's index.
 	pub(super) fn replay(
 		root: Uuid,
+		pair_root: PairRoot,
 		dir_index: HashMap<Uuid, (String, Uuid)>,
 		undecodable: Vec<UndecodableItem>,
 		items: Vec<(bool, RemoteItem)>,
 	) -> Self {
 		let mut builder = Self {
 			root,
+			pair_root,
 			dir_index,
 			undecodable: Vec::new(),
 			undecodable_dirs: HashSet::new(),
 			nodes: HashMap::new(),
 			held_paths: BTreeSet::new(),
-			skipped: Skipped::default(),
+			skipped: Skipped::new(pair_root),
 			deferred: items,
 		};
 		builder.take_undecodable(undecodable);
@@ -567,7 +580,7 @@ impl ViewBuilder {
 		stable_uuid: Option<StableUuid>,
 	) {
 		// The engine's reserved paths come before every rule, and are never reported as ignored.
-		if is_reserved_path(&rel_path) {
+		if is_reserved_path(&rel_path, self.pair_root) {
 			return;
 		}
 		// Byte-identical names under one parent cannot exist on the server, so a second item at
@@ -657,11 +670,12 @@ impl crate::cache::SnapshotSink for ViewBuilder {
 #[cfg(any(test, feature = "bench-internals"))]
 pub(crate) fn place_remote_items(
 	root: Uuid,
+	pair_root: PairRoot,
 	dirs: &[RemoteItem],
 	files: &[RemoteItem],
 	undecodable: &[UndecodableItem],
 ) -> RemoteView {
-	let mut builder = ViewBuilder::with_capacity(root, dirs.len() + files.len());
+	let mut builder = ViewBuilder::with_capacity(root, pair_root, dirs.len() + files.len());
 	builder.take_undecodable(undecodable.to_vec());
 	// Set aside and answered at `finish` exactly as a streamed row is: these slices are in no
 	// more of an order than the read's rows are, and a directory that follows its own children
@@ -1007,18 +1021,19 @@ impl RemoteView {
 #[cfg(test)]
 pub(crate) fn build_remote_view(
 	root: Uuid,
+	pair_root: PairRoot,
 	dirs: &[RemoteItem],
 	files: &[RemoteItem],
 	undecodable: &[UndecodableItem],
 	filter: Option<ViewFilter<'_>>,
 ) -> RemoteView {
-	let mut view = place_remote_items(root, dirs, files, undecodable);
+	let mut view = place_remote_items(root, pair_root, dirs, files, undecodable);
 	view.filter(filter);
 	let items = dirs
 		.iter()
 		.map(|dir| (true, dir.clone()))
 		.chain(files.iter().map(|file| (false, file.clone())));
-	let (_dir, mut staged) = super::stage::staged_view(root, items, undecodable);
+	let (_dir, mut staged) = super::stage::staged_view(root, pair_root, items, undecodable);
 	staged.filter(filter);
 	super::stage::assert_views_alike("the staged twin", &view, &staged);
 	view
@@ -1026,8 +1041,9 @@ pub(crate) fn build_remote_view(
 
 /// The skipped items of a view being built: the ones recorded with a reason of their own, and the
 /// ones under a skipped directory, which take that directory's record once every item is placed.
-#[derive(Default)]
 struct Skipped {
+	/// The pair's root, which says what its reserved paths are (see [`is_reserved_path`]).
+	pair_root: PairRoot,
 	/// The records that belong at the HEAD of the answer: the undecodable ones, which a
 	/// materialized build resolved before it placed anything and a streamed build can only
 	/// resolve once every directory has arrived. Keeping them apart is what makes the two builds
@@ -1040,10 +1056,20 @@ struct Skipped {
 }
 
 impl Skipped {
+	fn new(pair_root: PairRoot) -> Self {
+		Self {
+			pair_root,
+			first: Vec::new(),
+			recorded: Vec::new(),
+			under: Vec::new(),
+		}
+	}
+
 	/// Record an item with its own reason — unless it sits at a reserved path (the quarantine dir,
-	/// filen-sync's trash), which the view leaves out without a word (and its descendants with it).
+	/// filen-sync's trash, the account's data directory), which the view leaves out without a word
+	/// (and its descendants with it).
 	fn record(&mut self, skip: SkippedRemote) {
-		if is_reserved_path(&skip.rel_path) {
+		if is_reserved_path(&skip.rel_path, self.pair_root) {
 			return;
 		}
 		self.recorded.push(skip);
@@ -1052,7 +1078,7 @@ impl Skipped {
 	/// [`record`](Self::record) for a record that belongs at the head of the answer (see
 	/// [`first`](Self::first)).
 	fn record_first(&mut self, skip: SkippedRemote) {
-		if is_reserved_path(&skip.rel_path) {
+		if is_reserved_path(&skip.rel_path, self.pair_root) {
 			return;
 		}
 		self.first.push(skip);

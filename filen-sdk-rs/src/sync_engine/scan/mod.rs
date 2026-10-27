@@ -93,6 +93,44 @@ pub(crate) fn folds_onto_legacy_trash(name: &str) -> bool {
 	name != LEGACY_TRASH_DIR && collision_key(name) == LEGACY_TRASH_DIR
 }
 
+/// The directory Filen's apps keep the account's own data in (chat uploads among it), at the top of
+/// the drive. Only a pair whose remote root is the drive root has it in its tree (see
+/// [`is_account_data`]).
+pub(crate) const ACCOUNT_DATA_DIR: &str = ".filen";
+
+/// Where a pair's remote root is, which decides whether its tree holds the account's own data
+/// directory (see [`is_account_data`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PairRoot {
+	/// The drive root, whose top level holds [`ACCOUNT_DATA_DIR`].
+	Drive,
+	/// A directory in the drive: everything under it is the user's.
+	Directory,
+}
+
+/// Whether `rel_path` is the account's data directory ([`ACCOUNT_DATA_DIR`]) or under it, in a pair
+/// rooted at `root`: in a pair rooted at the drive, a top-level entry of that name, matched as the
+/// server matches names, case-insensitively. Never read by the local scan or the watcher, never
+/// placed in the remote view, so nothing at or under it is uploaded, downloaded or deleted, and a
+/// local write that resolves into it is refused. A pair rooted at a directory syncs a `.filen` in
+/// it like anything else.
+///
+/// A case variant is reserved too, on both sides, where filen-sync's trash folder reserves only its
+/// exact name ([`is_legacy_trash`]): the server dedups the drive root's names case-insensitively,
+/// so `.Filen` there IS the account's directory however the apps spelled it, and a local `.Filen`
+/// could only ever be merged into it.
+pub(crate) fn is_account_data(rel_path: &str, root: PairRoot) -> bool {
+	root == PairRoot::Drive && at_or_under_folded(rel_path, ACCOUNT_DATA_DIR)
+}
+
+/// The local root a walk reads, and where the pair's remote root is: together, what the walk keys
+/// its entries against and which of them it never enters (see [`is_account_data`]).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ScanRoot<'a> {
+	pub(crate) path: &'a Path,
+	pub(crate) pair_root: PairRoot,
+}
+
 /// One item observed under the local root.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LocalNode {
@@ -615,7 +653,7 @@ pub(super) fn load_rule_file(
 /// probe hold the staged walk to.
 #[cfg(any(test, feature = "bench-internals"))]
 pub(crate) fn scan_local(
-	root: &Path,
+	root: ScanRoot<'_>,
 	baseline: &Baseline,
 	rules: IgnoreRules,
 	rule_files: RuleFiles,
@@ -650,7 +688,10 @@ pub(crate) fn scan_local(
 ///
 /// Entries `rules` ignore are pruned: recorded in [`LocalScan::ignored`] and never descended into.
 /// Each directory's `.filenignore` that `rule_files` reads joins `rules` before its children are
-/// matched. The rules come back as the scan used them, for the rest of the pass to match with.
+/// matched. The rules come back as the scan used them, for the rest of the pass to match with. The
+/// engine's reserved entries are left out before any rule, unrecorded: the bin, filen-sync's
+/// trash and, in a pair `root` says is rooted at the drive, the account's data directory (see
+/// [`is_account_data`]).
 ///
 /// Once `stop` is set the walk lists and hands over nothing more, and comes back incomplete once each
 /// worker has finished the read it is in, to its end (a hash read cannot be interrupted). That is
@@ -659,7 +700,7 @@ pub(crate) fn scan_local(
 /// `Err` when the stage cannot be written — a full disk — which fails the pass before it has
 /// planned anything.
 pub(crate) fn scan_local_staged(
-	root: &Path,
+	root: ScanRoot<'_>,
 	baseline: &Baseline,
 	rules: IgnoreRules,
 	rule_files: RuleFiles,
@@ -1119,7 +1160,10 @@ fn read_worker(jobs: &Mutex<mpsc::Receiver<ReadJob>>, done: &mpsc::Sender<ReadAn
 /// survive without calling the tree partial. [`scan_subtree`] uses it to stop a walk that has
 /// listed too much.
 fn scan_local_watched<S: ScanSink>(
-	root: &Path,
+	ScanRoot {
+		path: root,
+		pair_root,
+	}: ScanRoot<'_>,
 	start: &str,
 	baseline: &Baseline,
 	mut rules: IgnoreRules,
@@ -1245,6 +1289,14 @@ fn scan_local_watched<S: ScanSink>(
 					// Nor into filen-sync's trash, at any depth (its contents are the old engine's
 					// deletions, never content to sync).
 					if is_legacy_trash(entry.file_name()) {
+						break 'filter false;
+					}
+					// Nor into the account's own data, in a pair rooted at the drive.
+					if depth == 1
+						&& rel_path
+							.as_deref()
+							.is_some_and(|rel_path| is_account_data(rel_path, pair_root))
+					{
 						break 'filter false;
 					}
 					// A `<uuid>.filendl` FILE is the temp file a download in flight is writing into this
@@ -1512,7 +1564,7 @@ fn scan_local_watched<S: ScanSink>(
 /// that lists more than it would hold a node for each of, and reads whole instead. What such a
 /// walk found is evidence of nothing, so none of it is handed back.
 pub(crate) fn scan_subtree(
-	root: &Path,
+	root: ScanRoot<'_>,
 	start: &str,
 	baseline: &Baseline,
 	rules: IgnoreRules,
@@ -1520,7 +1572,7 @@ pub(crate) fn scan_subtree(
 	moved_hash: &mut dyn FnMut(&str, u64, i64) -> Option<Blake3Hash>,
 	stop: &dyn Fn(usize) -> bool,
 ) -> Option<(LocalScan, IgnoreRules)> {
-	let start_path = root.join(start);
+	let start_path = root.path.join(start);
 	let mut listed = 0usize;
 	let mut cut = false;
 	let Ok(walked) = scan_local_watched(

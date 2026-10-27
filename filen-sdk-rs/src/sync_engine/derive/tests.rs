@@ -26,7 +26,7 @@ use crate::{
 		observe::observe_local,
 		plan::{PassHolds, RemoteView, SyncAction, place_remote_items},
 		remote::{RemoteObserved, delta_uuids, observe_remote},
-		scan::{LocalScan, RuleFiles, scan_local},
+		scan::{LocalScan, PairRoot, RuleFiles, ScanRoot, scan_local},
 	},
 };
 
@@ -58,7 +58,16 @@ fn write(root: &Path, rel_path: &str, body: &[u8]) {
 }
 
 fn scan(root: &Path, baseline: &Baseline) -> LocalScan {
-	scan_local(root, baseline, IgnoreRules::default(), RuleFiles::Read).0
+	scan_local(
+		ScanRoot {
+			path: root,
+			pair_root: PairRoot::Directory,
+		},
+		baseline,
+		IgnoreRules::default(),
+		RuleFiles::Read,
+	)
+	.0
 }
 
 /// The remote item one scanned node stands for, keyed by the uuids `Pair` handed out: a file
@@ -97,7 +106,7 @@ fn view(items: &[RemoteItem]) -> RemoteView {
 		.iter()
 		.cloned()
 		.partition(|item| item.stable_uuid.is_none());
-	let mut view = place_remote_items(REMOTE_ROOT, &dirs, &files, &[]);
+	let mut view = place_remote_items(REMOTE_ROOT, PairRoot::Directory, &dirs, &files, &[]);
 	// A whole-read view: its backing never consults a baseline, so an empty one is exact.
 	view.filter(None);
 	view
@@ -213,6 +222,7 @@ fn assembled(
 	let placed = baseline.synced_paths(&delta_uuids(delta), &[]);
 	let mut observed = match observe_remote(
 		REMOTE_ROOT,
+		PairRoot::Directory,
 		baseline,
 		std::mem::take(&mut derived.remote),
 		delta,
@@ -230,6 +240,7 @@ fn assembled(
 	derived.decided.append(&mut observed.changed);
 	let (mut local, _) = observe_local(
 		root,
+		PairRoot::Directory,
 		baseline,
 		IgnoreRules::default(),
 		&RuleFiles::Read,
@@ -843,6 +854,7 @@ fn a_hidden_path_with_a_carried_row_is_dropped_held_and_plans_nothing() {
 	let mut derived = from_baseline(&baseline, dirty_paths(&["docs/deep"]));
 	let (mut observed, rules) = observe_local(
 		&pair.root,
+		PairRoot::Directory,
 		&baseline,
 		IgnoreRules::default(),
 		&RuleFiles::Read,
@@ -919,6 +931,7 @@ fn an_incomplete_walk_drops_no_row() {
 	let mut derived = from_baseline(&baseline, BTreeSet::from(["docs".to_string()]));
 	let (mut observed, _) = observe_local(
 		&pair.root,
+		PairRoot::Directory,
 		&baseline,
 		IgnoreRules::default(),
 		&RuleFiles::Read,
@@ -1092,6 +1105,7 @@ fn merging_a_walk_moves_its_nodes_and_leaves_the_assembly_bounds_as_they_were() 
 	let observe = || {
 		observe_local(
 			&pair.root,
+			PairRoot::Directory,
 			&baseline,
 			IgnoreRules::default(),
 			&RuleFiles::Read,

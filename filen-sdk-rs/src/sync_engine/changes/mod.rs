@@ -629,9 +629,9 @@ impl PairChanges {
 	}
 
 	/// Record what one filesystem event means. `is_staging` names the engine's own download temp
-	/// files and quarantine bin, and filen-sync's trash, whose paths are dropped rather than
-	/// re-observed — the rename that commits a download is an event on the destination, which is
-	/// not staging and is collected.
+	/// files and quarantine bin, filen-sync's trash and, in a pair rooted at the drive, the
+	/// account's data directory, whose paths are dropped rather than re-observed — the rename that
+	/// commits a download is an event on the destination, which is not staging and is collected.
 	pub(super) fn note_local_event(
 		&self,
 		root: &Path,

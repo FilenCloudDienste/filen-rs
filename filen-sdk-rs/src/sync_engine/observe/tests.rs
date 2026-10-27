@@ -50,6 +50,7 @@ fn observed_or_whole(
 	let dirty: BTreeSet<String> = paths.iter().map(|path| (*path).to_owned()).collect();
 	observe_local(
 		root,
+		PairRoot::Directory,
 		baseline,
 		IgnoreRules::default(),
 		&RuleFiles::Read,
@@ -998,6 +999,7 @@ fn a_standing_adopted_directory_past_the_cap_leaves_the_pass_narrowed() {
 
 		let observed = observe_local(
 			&root,
+			PairRoot::Directory,
 			&baseline,
 			IgnoreRules::default(),
 			&RuleFiles::Read,

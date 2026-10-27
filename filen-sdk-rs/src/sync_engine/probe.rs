@@ -62,7 +62,7 @@ use super::{
 	plan::{self, PassHolds, RemoteNode, RemoteView, SyncAction},
 	remote::{RemoteObserved, cache_ancestry, observe_remote},
 	rows::Baseline,
-	scan::{self, LocalNode, LocalScan, RuleFiles},
+	scan::{self, LocalNode, LocalScan, PairRoot, RuleFiles, ScanRoot},
 	side::{FromRow, Nodes, NodesAt, Side},
 	stage::{self, Paging, RemoteSink, Stage},
 };
@@ -1129,7 +1129,10 @@ fn pass_after_push(
 	baseline.confirm(&confirmed);
 	drop(confirmed);
 	let (scan, rules_used) = scan::scan_local_staged(
-		&place.root,
+		ScanRoot {
+			path: &place.root,
+			pair_root: PairRoot::Directory,
+		},
 		&scan_baseline,
 		probe_rules(),
 		RuleFiles::Read,
@@ -1204,7 +1207,7 @@ fn stage_snapshot(place: &PassPlace) -> RemoteView {
 	bench_support::snapshot_into(&place.cache_db, place.remote_root, &mut copied)
 		.expect("streaming the cache snapshot");
 	copied
-		.finish(place.remote_root)
+		.finish(place.remote_root, PairRoot::Directory)
 		.expect("placing the probe's staged snapshot")
 }
 
@@ -1217,7 +1220,10 @@ fn stage_pass_sides(
 ) -> (Side<LocalNode>, Side<RemoteNode>) {
 	let mut view = stage_snapshot(place);
 	let (scan, rules_used) = scan::scan_local_staged(
-		&place.root,
+		ScanRoot {
+			path: &place.root,
+			pair_root: PairRoot::Directory,
+		},
 		baseline,
 		probe_rules(),
 		RuleFiles::Read,
@@ -1371,6 +1377,7 @@ fn prepare_scoped(
 	let (observed, elapsed) = timed(|| {
 		observe_remote(
 			fixture.remote_root,
+			PairRoot::Directory,
 			&baseline,
 			nodes,
 			&[],
@@ -1509,6 +1516,7 @@ fn prepare_scoped(
 	let dirty = mem::take(&mut derived.dirty);
 	let (mut observations, rules) = observe::observe_local(
 		&fixture.root,
+		PairRoot::Directory,
 		&baseline,
 		remote_rules.rules,
 		&rule_files,
@@ -1772,8 +1780,17 @@ pub fn run() -> String {
 
 	// The scan with nothing in the baseline: every file misses the fast path and is hashed.
 	let no_baseline = Baseline::default();
-	let ((cold_scan, _), cold) =
-		timed(|| scan::scan_local(&fixture.root, &no_baseline, probe_rules(), RuleFiles::Read));
+	let ((cold_scan, _), cold) = timed(|| {
+		scan::scan_local(
+			ScanRoot {
+				path: &fixture.root,
+				pair_root: PairRoot::Directory,
+			},
+			&no_baseline,
+			probe_rules(),
+			RuleFiles::Read,
+		)
+	});
 	probe.record(
 		"scan_cold",
 		nodes,
@@ -1818,6 +1835,7 @@ pub fn run() -> String {
 	let (mut view, placed) = timed(|| {
 		plan::place_remote_items(
 			fixture.remote_root,
+			PairRoot::Directory,
 			&snapshot.dirs,
 			&snapshot.files,
 			&snapshot.undecodable,
@@ -1836,7 +1854,8 @@ pub fn run() -> String {
 	// at this run's scale rather than only on the handful of items a unit test can spell out.
 	let before_stream = current_rss_bytes();
 	let ((streamed, streamed_watermark), streamed_time) = timed(|| {
-		let mut builder = plan::ViewBuilder::with_capacity(fixture.remote_root, nodes);
+		let mut builder =
+			plan::ViewBuilder::with_capacity(fixture.remote_root, PairRoot::Directory, nodes);
 		let watermark =
 			bench_support::snapshot_into(&fixture.cache_db, fixture.remote_root, &mut builder)
 				.expect("streaming the snapshot");
@@ -1883,7 +1902,7 @@ pub fn run() -> String {
 	);
 	let (mut staged, place_time) = timed(|| {
 		copied
-			.finish(fixture.remote_root)
+			.finish(fixture.remote_root, PairRoot::Directory)
 			.expect("placing the staged snapshot")
 	});
 	let holding_staged = current_rss_bytes();
@@ -2369,14 +2388,26 @@ pub fn run() -> String {
 		"upsert while a pass holds the copy: one Arc::make_mut clone of the whole tree",
 	);
 
-	let ((warm_scan, _), warm_time) =
-		timed(|| scan::scan_local(&fixture.root, &baseline, probe_rules(), RuleFiles::Read));
+	let ((warm_scan, _), warm_time) = timed(|| {
+		scan::scan_local(
+			ScanRoot {
+				path: &fixture.root,
+				pair_root: PairRoot::Directory,
+			},
+			&baseline,
+			probe_rules(),
+			RuleFiles::Read,
+		)
+	});
 	probe.record("scan_warm", nodes, warm_time, "fast path, no re-hashing");
 	// The walk a whole pass makes: the same scan, into a stage rather than a map. Timed with the
 	// stage's creation, as `prepare_whole` pays it.
 	let (staged_scan, staged_time) = timed(|| {
 		scan::scan_local_staged(
-			&fixture.root,
+			ScanRoot {
+				path: &fixture.root,
+				pair_root: PairRoot::Directory,
+			},
 			&baseline,
 			probe_rules(),
 			RuleFiles::Read,
