@@ -19,7 +19,8 @@
 
 mod apply;
 mod baseline;
-// The local bin every copy the engine moves aside goes to, filed by day.
+// The local bin every copy the engine moves aside goes to, filed by day, and where a pair's first
+// pass moves filen-sync's local trash.
 mod bin;
 // The named-scenario cost harness, driven by `tests/sync_engine_bench.rs`. Unlike `probe` below it
 // drives `SyncEngine::prepare` itself rather than a hand-assembled copy of it, which is why the

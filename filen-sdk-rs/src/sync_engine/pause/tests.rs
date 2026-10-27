@@ -16,6 +16,21 @@ fn suspended(after: Duration) -> PassControl {
 	})
 }
 
+/// Only a cancel or a removal stops work that a suspension lets run on.
+#[test]
+fn only_a_cancel_or_a_removal_is_cancelled() {
+	assert!(PassGate::default().not_cancelled());
+	for (state, not_cancelled) in [
+		(PassControl::Run, true),
+		(PassControl::Suspended { escalate_at: None }, true),
+		(PassControl::Cancelled, false),
+		(PassControl::Retired, false),
+	] {
+		let (_tx, gate) = gate(state);
+		assert_eq!(gate.not_cancelled(), not_cancelled, "{state:?}");
+	}
+}
+
 /// A pass nothing can pause runs straight through — the shape every non-engine caller gets.
 #[tokio::test]
 async fn an_ungated_pass_never_parks() {

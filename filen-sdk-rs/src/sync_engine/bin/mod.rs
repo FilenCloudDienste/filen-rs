@@ -12,6 +12,12 @@
 //!
 //! The bin is not kept forever: a bucket more than [`RETENTION_DAYS`] days older than the day the
 //! engine looks at it is deleted PERMANENTLY, with everything in it (see [`prune_bin`]).
+//!
+//! filen-sync, the engine this one replaces, kept its deletions in a `.filen.trash.local` folder
+//! instead, which neither engine ever syncs (see [`is_legacy_trash`]). A pair's first pass moves
+//! every folder of that name in the local tree into the bin under that day's bucket, at its tree
+//! position (see [`migrate_legacy_trash`]), so filen-sync's deletions are recoverable from the bin
+//! and pruned with it.
 
 use std::{
 	ffi::OsStr,
@@ -24,7 +30,7 @@ use chrono::{Days, NaiveDate};
 
 use super::{
 	apply::{io_err, local_path},
-	scan::QUARANTINE_DIR,
+	scan::{QUARANTINE_DIR, is_legacy_trash},
 };
 
 #[cfg(test)]
@@ -325,6 +331,138 @@ fn adopt(root: &Path, path: &Path, name: &OsStr, today: NaiveDate) -> io::Result
 		));
 	}
 	fs::rename(path, dest)
+}
+
+/// What one [`migrate_legacy_trash`] did.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(super) struct MigrateSummary {
+	/// filen-sync trash folders moved into the bin.
+	pub(super) moved: usize,
+	/// Directories that could not be listed and trash folders that could not be moved, each logged
+	/// with its cause.
+	pub(super) errors: usize,
+	/// Whether `keep_going` stopped the migration before it had walked and moved everything.
+	pub(super) stopped: bool,
+}
+
+/// Move every entry named `.filen.trash.local` (see [`is_legacy_trash`]) in the local tree under
+/// `root`, at the root or nested, into the bin under `day`'s bucket at its tree position:
+/// `<root>/.filen.trash.local` to `.filen-sync-trash/<day>/.filen.trash.local`,
+/// `<root>/Photos/.filen.trash.local` to `.filen-sync-trash/<day>/Photos/.filen.trash.local`, each
+/// with its contents, through [`quarantine_local`]. They then age like anything else binned on
+/// `day`.
+///
+/// The walk follows no symbolic link: a link is never descended into, and one named like the folder
+/// is moved as the link, its target untouched. It does not descend into a folder it found either,
+/// so a trash folder inside another moves with it, nor into the bin at the root. Bounded by the
+/// tree: every directory is listed once, and only the found folders' paths are held, all of them
+/// before the first moves, so no listing is taken while its directory changes.
+///
+/// Nothing is created unless something is moved: a tree with no such folder, a missing root and an
+/// empty mount point all leave the root as they found it.
+///
+/// Best effort: a directory that cannot be listed and a folder that cannot be moved are logged with
+/// their cause and counted, and the rest go on — what is left behind is still never synced (see
+/// [`is_legacy_trash`]). `keep_going` is asked before each directory is listed and each folder is
+/// moved; `false` stops the migration where it is.
+pub(super) fn migrate_legacy_trash(
+	root: &Path,
+	day: NaiveDate,
+	keep_going: impl Fn() -> bool,
+) -> MigrateSummary {
+	let mut summary = MigrateSummary::default();
+	let found = find_legacy_trash(root, &keep_going, &mut summary);
+	for rel_path in found {
+		if !keep_going() {
+			summary.stopped = true;
+			break;
+		}
+		match quarantine_local(root, &rel_path, day) {
+			Ok(Some(_)) => summary.moved += 1,
+			// Gone since the walk listed it: nothing left to move.
+			Ok(None) => {}
+			Err(e) => {
+				tracing::warn!(
+					"cannot move filen-sync's trash folder {rel_path:?} under {root:?} into the \
+					 sync bin: {e}"
+				);
+				summary.errors += 1;
+			}
+		}
+	}
+	summary
+}
+
+/// The root-relative, `/`-joined paths of every `.filen.trash.local` entry under `root`, for
+/// [`migrate_legacy_trash`]; on-disk names, not normalized, so each still opens what it names.
+fn find_legacy_trash(
+	root: &Path,
+	keep_going: &impl Fn() -> bool,
+	summary: &mut MigrateSummary,
+) -> Vec<String> {
+	let mut found = Vec::new();
+	// Each directory still to list, with its root-relative path (`""` is the root).
+	let mut open = vec![(root.to_path_buf(), String::new())];
+	while let Some((dir, rel_dir)) = open.pop() {
+		if !keep_going() {
+			summary.stopped = true;
+			break;
+		}
+		let listing = match fs::read_dir(&dir) {
+			Ok(listing) => listing,
+			// A root that is not there has nothing to migrate, and a directory gone since its parent
+			// was listed has nothing left in it.
+			Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+			Err(e) => {
+				tracing::warn!("cannot list {dir:?} to look for filen-sync's trash folder: {e}");
+				summary.errors += 1;
+				continue;
+			}
+		};
+		for entry in listing {
+			let (name, kind) =
+				match entry.and_then(|entry| Ok((entry.file_name(), entry.file_type()?))) {
+					Ok(entry) => entry,
+					Err(e) => {
+						tracing::warn!(
+							"cannot read an entry of {dir:?} to look for filen-sync's trash folder: {e}"
+						);
+						summary.errors += 1;
+						continue;
+					}
+				};
+			// The bin holds what the engine moved aside, filen-sync's trash among it.
+			if rel_dir.is_empty() && name == OsStr::new(QUARANTINE_DIR) {
+				continue;
+			}
+			// `file_type` does not follow a link, so a link is neither a directory to descend into
+			// nor anything but itself to move.
+			let trash = is_legacy_trash(&name);
+			if !trash && !kind.is_dir() {
+				continue;
+			}
+			let Some(name) = name.to_str() else {
+				// No synced path runs through a name that is not UTF-8 (the scan reports it instead),
+				// and a trash folder below it is never synced either.
+				tracing::debug!(
+					"not looking for filen-sync's trash folder under {:?}, whose name is not UTF-8",
+					dir.join(&name)
+				);
+				continue;
+			};
+			let rel_path = if rel_dir.is_empty() {
+				name.to_owned()
+			} else {
+				format!("{rel_dir}/{name}")
+			};
+			if trash {
+				found.push(rel_path);
+			} else {
+				open.push((dir.join(name), rel_path));
+			}
+		}
+	}
+	found
 }
 
 #[cfg(test)]

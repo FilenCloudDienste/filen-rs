@@ -1580,6 +1580,18 @@ where
 		.map_err(|e| Error::custom(ErrorKind::Internal, format!("{what} panicked: {e}")))
 }
 
+/// Whether `pair` has synced: it has a baseline row. Before its first pass it has none, which is
+/// when filen-sync's state may be imported (see [`SyncEngine::import_legacy_state`]) and its trash
+/// is moved into the bin (see [`SyncEngine::migrate_legacy_trash`]). A pair whose rows have all
+/// gone since (every synced item deleted on both sides) reads as not synced again; for both callers
+/// that only means repeating harmless work.
+fn has_synced(store: &BaselineStore, pair: PairId) -> Result<bool, Error> {
+	Ok(!store
+		.baseline(pair)
+		.map_err(|e| db_error(e, "reading the sync baseline"))?
+		.is_empty())
+}
+
 /// A configured sync engine: an `Arc<Client>` (whose cache supplies the remote view) plus one
 /// baseline connection per pair.
 pub struct SyncEngine {
@@ -1658,6 +1670,13 @@ pub struct SyncEngine {
 	/// a day. In memory only: the first pass after the engine opens always prunes, which costs one
 	/// listing of the bin's top level. Bounded by the pair count; an entry goes with its pair.
 	bin_pruned: Mutex<HashMap<PairId, NaiveDate>>,
+	/// The pairs whose filen-sync trash this engine has finished looking for (see
+	/// [`migrate_legacy_trash`](SyncEngine::migrate_legacy_trash)), or found already synced, so the
+	/// tree is walked for it at most once per pair and engine: a pair whose first pass is refused
+	/// or cancelled again and again does not walk its whole tree once more on each attempt. In
+	/// memory only, so an engine opened later looks again while the pair still has no baseline row.
+	/// Bounded by the pair count; an entry goes with its pair.
+	legacy_trash_looked: Mutex<HashSet<PairId>>,
 	/// Bumped once [`set_user_ignore`](SyncEngine::set_user_ignore) has COMMITTED new patterns, so
 	/// every running watch loop runs a pass with them instead of waiting out its safety net. A
 	/// [`watch`](tokio::sync::watch) channel rather than a [`Notify`](tokio::sync::Notify): every
@@ -3083,6 +3102,7 @@ impl SyncEngine {
 			changes: Mutex::new(HashMap::new()),
 			carried: Mutex::new(HashMap::new()),
 			bin_pruned: Mutex::new(HashMap::new()),
+			legacy_trash_looked: Mutex::new(HashSet::new()),
 			user_ignore_changed: tokio::sync::watch::channel(0).0,
 			stages: AtomicU64::new(0),
 			_lock: lock,
@@ -3433,11 +3453,7 @@ impl SyncEngine {
 		let store = self.pair_store(pair).await?;
 		// Off the runtime thread: the trees run to a line per item of the old pair.
 		off_store(&store, move |store| {
-			let synced = !store
-				.baseline(pair)
-				.map_err(|e| db_error(e, "reading the sync baseline"))?
-				.is_empty();
-			if synced {
+			if has_synced(store, pair)? {
 				return Err(Error::custom(
 					ErrorKind::InvalidState,
 					format!(
@@ -5220,6 +5236,7 @@ impl SyncEngine {
 		self.changes.lock().await.remove(&pair);
 		self.carried.lock().await.remove(&pair);
 		self.bin_pruned.lock().await.remove(&pair);
+		self.legacy_trash_looked.lock().await.remove(&pair);
 		// The pair's connection goes with the pair. Last, so nothing above can reopen it, and the
 		// file handle closes as soon as the cascade above lets this function's own handle go.
 		self.stores.lock().await.remove(&pair);
@@ -6039,6 +6056,93 @@ impl SyncEngine {
 		Some(summary)
 	}
 
+	/// Move filen-sync's local trash into `pair`'s bin (see [`bin::migrate_legacy_trash`]) on the
+	/// pair's first pass: while it has no baseline row (see [`has_synced`]). A pair moved over from
+	/// filen-sync has its old deletions binned, under the day of this pass, before anything reads
+	/// the tree; any other pair finds nothing, and creates nothing. The walk runs once per pair and
+	/// engine (see [`legacy_trash_looked`](Self::legacy_trash_looked)): a first pass refused or
+	/// cancelled after it does not walk the tree again. An engine opened later walks it again while
+	/// the pair has no row, as one does for a pair whose rows have all gone again, which moves only
+	/// what has been given filen-sync's name since.
+	///
+	/// Before the pass has read anything, so a pass refused afterwards has still migrated. The walk
+	/// stops between directories and moves once `gate` says the pass is cancelled or its pair
+	/// removed, never at a suspension: the read after it runs on through one and can write rows,
+	/// after which no pass would look again (see [`PassGate::not_cancelled`]). A cancelled pass
+	/// writes no row, so the next pass, still without one, takes up the rest.
+	///
+	/// Housekeeping, so nothing here fails the pass: what is left behind is never synced anyway.
+	async fn migrate_legacy_trash(&self, pair: PairId, gate: PassGate) {
+		if self.legacy_trash_looked.lock().await.contains(&pair) {
+			return;
+		}
+		let record = locked(&self.control).pair(pair);
+		let local_root = match record {
+			Ok(Some(record)) => PathBuf::from(record.local_root),
+			// The read that follows reports an unknown pair, and a failed registry read, itself.
+			Ok(None) => return,
+			Err(e) => {
+				tracing::warn!(
+					"sync_once[pair {pair}]: filen-sync's trash was not looked for: cannot read the \
+					 pair: {e}"
+				);
+				return;
+			}
+		};
+		let synced = match self.pair_store(pair).await {
+			Ok(store) => off_store(&store, move |store| has_synced(store, pair))
+				.await
+				.and_then(|synced| synced),
+			Err(e) => Err(e),
+		};
+		match synced {
+			Ok(false) => {}
+			Ok(true) => {
+				self.legacy_trash_looked.lock().await.insert(pair);
+				return;
+			}
+			Err(e) => {
+				tracing::warn!(
+					"sync_once[pair {pair}]: filen-sync's trash was not looked for: {e}"
+				);
+				return;
+			}
+		}
+		// One day for the whole migration, so everything it moves lands in one bucket.
+		let day = Utc::now().date_naive();
+		let summary = match off_runtime("moving filen-sync's trash into the bin", move || {
+			bin::migrate_legacy_trash(&local_root, day, || gate.not_cancelled())
+		})
+		.await
+		{
+			Ok(summary) => summary,
+			Err(e) => {
+				tracing::warn!("sync_once[pair {pair}]: filen-sync's trash was not moved: {e}");
+				return;
+			}
+		};
+		let bin::MigrateSummary {
+			moved,
+			errors,
+			stopped,
+		} = summary;
+		if !stopped {
+			self.legacy_trash_looked.lock().await.insert(pair);
+		}
+		if moved > 0 || errors > 0 || stopped {
+			tracing::info!(
+				"sync_once[pair {pair}]: moved {moved} filen-sync trash folder(s) into the sync \
+				 bin's bucket for {day}, {errors} error(s){}",
+				if stopped {
+					"; stopped by a cancel or the pair's removal (after a cancel, the rest moves on \
+					 the next pass that still has no baseline row)"
+				} else {
+					""
+				},
+			);
+		}
+	}
+
 	/// Where a new stage for a pass of `pair` goes (see [`stage`](super::stage)), numbered by this
 	/// engine so that no two of its passes share one — nor a dry run that stages its own work,
 	/// whatever pass of the same pair is running. A number never made into a stage is skipped.
@@ -6131,13 +6235,22 @@ impl SyncEngine {
 		let mut scope = changes.take();
 		let (dirty_local, dirty_remote) = scope.sizes();
 		// What reading both sides costs this pair — measured over the read and nothing else, since
-		// the watch's safety net scales its interval by it (see `SyncReport::read_cost`).
+		// the watch's safety net scales its interval by it (see `SyncReport::read_cost`). The
+		// migration's walk is housekeeping that runs once, and is taken back out.
 		let read_started = Instant::now();
-		let Some((recording, prepared)) = gate
+		// A clone for the migration's blocking thread: two channel handles.
+		let migrating = gate.clone();
+		let Some((recording, migration, prepared)) = gate
 			.guard(async move {
 				let recording = reading.lock_owned().await;
+				// Before the local side is read, so the read sees the tree as the migration left it,
+				// and inside the reading lock, so no import lands between its look at the baseline
+				// and the read's.
+				let migration_started = Instant::now();
+				self.migrate_legacy_trash(pair, migrating).await;
+				let migration = migration_started.elapsed();
 				let prepared = self.prepare(pair, Some(&mut scope), Seeding::Write).await;
-				(recording, prepared)
+				(recording, migration, prepared)
 			})
 			.await
 		else {
@@ -6160,7 +6273,7 @@ impl SyncEngine {
 		};
 		// The read ends here: everything above it is the baseline, the scan, the snapshot and the
 		// view; everything below writes something.
-		let read_cost = read_started.elapsed();
+		let read_cost = read_started.elapsed().saturating_sub(migration);
 		let mut prep = prepared?;
 		let store = self.pair_store(pair).await?;
 		// Persist what this pass confirmed, before anything is reconciled. Only a real pass writes

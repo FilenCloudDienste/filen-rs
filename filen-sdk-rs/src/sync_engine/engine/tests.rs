@@ -5699,6 +5699,151 @@ async fn a_bin_prune_stopped_by_a_pause_runs_again_on_the_next_pass() {
 	std::fs::remove_file(&path).ok();
 }
 
+/// A pair with no baseline row (its first pass) has filen-sync's trash moved into its bin, under
+/// the day of the pass.
+#[tokio::test]
+async fn filen_syncs_trash_is_binned_while_the_pair_has_no_row() {
+	let path = std::env::temp_dir().join(format!("filen_sync_legacy_trash_{}.db", Uuid::new_v4()));
+	let engine = SyncEngine::open(Arc::new(offline_client()), path.clone())
+		.await
+		.unwrap();
+	let root = tempfile::tempdir().unwrap();
+	let (pair, _) = locked(&engine.control)
+		.create_pair(
+			root.path().to_str().unwrap(),
+			Uuid::new_v4(),
+			SyncMode::TwoWay,
+		)
+		.unwrap();
+	let trash = root.path().join(scan::LEGACY_TRASH_DIR);
+	std::fs::create_dir(&trash).unwrap();
+	std::fs::write(trash.join("old.txt"), b"old").unwrap();
+
+	let before = Utc::now().date_naive();
+	engine.migrate_legacy_trash(pair, PassGate::default()).await;
+	let after = Utc::now().date_naive();
+
+	assert!(!trash.exists());
+	let binned = [before, after]
+		.into_iter()
+		.map(|day| {
+			bucket(root.path(), day)
+				.join(scan::LEGACY_TRASH_DIR)
+				.join("old.txt")
+		})
+		.find(|binned| binned.exists())
+		.expect("the trash was binned under the day of the pass");
+	assert_eq!(std::fs::read(binned).unwrap(), b"old");
+
+	drop(engine);
+	std::fs::remove_file(&path).ok();
+}
+
+/// A suspension does not stop the migration: the read after it runs on through one and can write
+/// rows, after which no pass would look again. Only a cancel stops it.
+#[tokio::test]
+async fn filen_syncs_trash_is_binned_through_a_suspension_but_not_after_a_cancel() {
+	let path = std::env::temp_dir().join(format!("filen_sync_legacy_trash_{}.db", Uuid::new_v4()));
+	let engine = SyncEngine::open(Arc::new(offline_client()), path.clone())
+		.await
+		.unwrap();
+	let root = tempfile::tempdir().unwrap();
+	let (pair, _) = locked(&engine.control)
+		.create_pair(
+			root.path().to_str().unwrap(),
+			Uuid::new_v4(),
+			SyncMode::TwoWay,
+		)
+		.unwrap();
+	let trash = root.path().join(scan::LEGACY_TRASH_DIR);
+	std::fs::create_dir(&trash).unwrap();
+
+	let (control, _rx) = tokio::sync::watch::channel(PassControl::Cancelled);
+	engine
+		.migrate_legacy_trash(pair, PassGate::new(control.clone()))
+		.await;
+	assert!(trash.exists(), "a cancelled pass moved filen-sync's trash");
+
+	control.send_replace(PassControl::Suspended { escalate_at: None });
+	engine
+		.migrate_legacy_trash(pair, PassGate::new(control))
+		.await;
+	assert!(
+		!trash.exists(),
+		"a suspended pass left filen-sync's trash behind"
+	);
+	assert!(root.path().join(scan::QUARANTINE_DIR).exists());
+
+	drop(engine);
+	std::fs::remove_file(&path).ok();
+}
+
+/// The walk runs once per pair and engine: a first pass refused or cancelled after it does not walk
+/// the tree again, so a folder that appears after the walk stays where it is (and still never
+/// synced).
+#[tokio::test]
+async fn filen_syncs_trash_is_looked_for_once_per_engine() {
+	let path = std::env::temp_dir().join(format!("filen_sync_legacy_trash_{}.db", Uuid::new_v4()));
+	let engine = SyncEngine::open(Arc::new(offline_client()), path.clone())
+		.await
+		.unwrap();
+	let root = tempfile::tempdir().unwrap();
+	let (pair, _) = locked(&engine.control)
+		.create_pair(
+			root.path().to_str().unwrap(),
+			Uuid::new_v4(),
+			SyncMode::TwoWay,
+		)
+		.unwrap();
+
+	engine.migrate_legacy_trash(pair, PassGate::default()).await;
+	let trash = root.path().join(scan::LEGACY_TRASH_DIR);
+	std::fs::create_dir(&trash).unwrap();
+	std::fs::write(trash.join("late.txt"), b"late").unwrap();
+	engine.migrate_legacy_trash(pair, PassGate::default()).await;
+
+	assert_eq!(std::fs::read(trash.join("late.txt")).unwrap(), b"late");
+	assert!(!root.path().join(scan::QUARANTINE_DIR).exists());
+
+	drop(engine);
+	std::fs::remove_file(&path).ok();
+}
+
+/// Once the pair has a baseline row it has synced, and filen-sync's trash is not looked for: a
+/// folder of that name is left where it is (and still never synced).
+#[tokio::test]
+async fn filen_syncs_trash_is_left_alone_once_the_pair_has_a_row() {
+	let path = std::env::temp_dir().join(format!("filen_sync_legacy_trash_{}.db", Uuid::new_v4()));
+	let engine = SyncEngine::open(Arc::new(offline_client()), path.clone())
+		.await
+		.unwrap();
+	let root = tempfile::tempdir().unwrap();
+	let (pair, _) = locked(&engine.control)
+		.create_pair(
+			root.path().to_str().unwrap(),
+			Uuid::new_v4(),
+			SyncMode::TwoWay,
+		)
+		.unwrap();
+	locked(&engine.control)
+		.upsert_entry(
+			pair,
+			&file_row("b.txt", Uuid::from_u128(5), Blake3Hash::from([1; 32])),
+		)
+		.unwrap();
+	let trash = root.path().join(scan::LEGACY_TRASH_DIR);
+	std::fs::create_dir(&trash).unwrap();
+	std::fs::write(trash.join("new.txt"), b"new").unwrap();
+
+	engine.migrate_legacy_trash(pair, PassGate::default()).await;
+
+	assert_eq!(std::fs::read(trash.join("new.txt")).unwrap(), b"new");
+	assert!(!root.path().join(scan::QUARANTINE_DIR).exists());
+
+	drop(engine);
+	std::fs::remove_file(&path).ok();
+}
+
 /// A dry run stays a pure read: it takes NO pass gate, so it neither leaves control state behind
 /// for a pair nobody paused nor makes a removal wait for a call that writes nothing.
 #[tokio::test]

@@ -1977,3 +1977,49 @@ async fn delete_bin_a_refused_pass_leaves_the_bin_alone() {
 
 	sc.cleanup();
 }
+
+/// A pair moved over from filen-sync still holds that engine's local trash, `.filen.trash.local`,
+/// at its root and in subfolders. The first pass moves each into the bin at its tree position
+/// before reading the tree, so none of it reaches the remote, and syncs the rest as usual.
+#[shared_test_runtime]
+async fn delete_bin_a_first_pass_bins_filen_syncs_trash() {
+	let sc = single_client(SyncMode::TwoWay).await;
+	write_file(&sc.local, ".filen.trash.local/old.txt", b"old");
+	write_file(&sc.local, "sub/.filen.trash.local/x.txt", b"x");
+	write_file(&sc.local, "sub/keep.txt", b"keep");
+	write_file(&sc.local, "top.txt", b"top");
+
+	let report = sc.sync().await;
+	assert!(report.errors.is_empty(), "{report:?}");
+
+	let old = binned(&sc.local, ".filen.trash.local/old.txt")
+		.expect("the root trash folder was not binned");
+	assert_eq!(std::fs::read(&old).unwrap(), b"old");
+	let x = binned(&sc.local, "sub/.filen.trash.local/x.txt")
+		.expect("the nested trash folder was not binned");
+	assert_eq!(std::fs::read(&x).unwrap(), b"x");
+	assert!(!sc.local.join(".filen.trash.local").exists());
+	assert!(!sc.local.join("sub").join(".filen.trash.local").exists());
+
+	let (dirs, files) = list_root(&sc).await;
+	assert!(
+		find_dir(&dirs, ".filen.trash.local").is_none(),
+		"filen-sync's trash reached the remote root"
+	);
+	assert!(
+		find_file(&files, "top.txt").is_some(),
+		"top.txt was not uploaded"
+	);
+	let sub = find_dir(&dirs, "sub").expect("sub was not uploaded");
+	let (sub_dirs, sub_files) = list_dir(&sc, sub).await;
+	assert!(
+		find_dir(&sub_dirs, ".filen.trash.local").is_none(),
+		"filen-sync's nested trash reached the remote"
+	);
+	assert!(
+		find_file(&sub_files, "keep.txt").is_some(),
+		"sub/keep.txt was not uploaded"
+	);
+
+	sc.cleanup();
+}

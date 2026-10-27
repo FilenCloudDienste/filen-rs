@@ -198,6 +198,19 @@ impl PassGate {
 			.is_none_or(|control| *control.borrow() == PassControl::Run)
 	}
 
+	/// Whether the pass has been neither cancelled nor had its pair removed: unlike
+	/// [`running`](Self::running), `true` through a suspension. For work before the pass reads that
+	/// a suspension lets run on, as [`guard`](Self::guard) lets the read run on: stopping it there
+	/// would leave it behind a read that goes on to write rows anyway.
+	pub(super) fn not_cancelled(&self) -> bool {
+		self.control.as_ref().is_none_or(|control| {
+			!matches!(
+				*control.borrow(),
+				PassControl::Cancelled | PassControl::Retired
+			)
+		})
+	}
+
 	/// Race `work` against a cancel of the pass. `None` means it was DROPPED where it stood, which
 	/// is safe only for work that has left nothing behind when it is dropped part-way — so this
 	/// wraps an action's NETWORK op alone, never the baseline/journal row that records it: a

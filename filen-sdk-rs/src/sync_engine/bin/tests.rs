@@ -4,10 +4,11 @@ use chrono::NaiveDate;
 use tempfile::TempDir;
 
 use super::{
-	DATED_MARKER, PruneSummary, parse_bucket, prune_bin, quarantine_local,
+	DATED_MARKER, MigrateSummary, PruneSummary, migrate_legacy_trash, parse_bucket, prune_bin,
+	quarantine_local,
 	test_support::{dated_bin, day},
 };
-use crate::sync_engine::scan::QUARANTINE_DIR;
+use crate::sync_engine::scan::{LEGACY_TRASH_DIR, QUARANTINE_DIR};
 
 fn root() -> TempDir {
 	tempfile::tempdir().expect("a temp dir")
@@ -514,4 +515,166 @@ fn a_prune_told_to_stop_leaves_the_remaining_entries_alone() {
 		.filter(|entry| entry.as_ref().unwrap().file_name() != DATED_MARKER)
 		.count();
 	assert_eq!(left, 1, "one bucket was not reached and stays");
+}
+
+/// Every filen-sync trash folder, at the root and nested, moves into the day's bucket at its tree
+/// position with what it holds; the rest of the tree stays where it is.
+#[test]
+fn filen_syncs_trash_folders_move_into_the_days_bucket_at_their_tree_positions() {
+	let root = root();
+	let top = root.path().join(LEGACY_TRASH_DIR);
+	fs::create_dir(&top).unwrap();
+	fs::write(top.join("old.txt"), b"old").unwrap();
+	let nested = root.path().join("Photos").join(LEGACY_TRASH_DIR);
+	fs::create_dir_all(nested.join("deep")).unwrap();
+	fs::write(nested.join("deep").join("x.jpg"), b"x").unwrap();
+	fs::write(root.path().join("Photos").join("keep.jpg"), b"keep").unwrap();
+	fs::write(root.path().join(".filen.trash.local.txt"), b"mine").unwrap();
+
+	let migrated = migrate_legacy_trash(root.path(), day(), || true);
+
+	assert_eq!(
+		migrated,
+		MigrateSummary {
+			moved: 2,
+			errors: 0,
+			stopped: false,
+		}
+	);
+	let bucket = root.path().join(QUARANTINE_DIR).join("2026-10-26");
+	assert_eq!(
+		fs::read(bucket.join(LEGACY_TRASH_DIR).join("old.txt")).unwrap(),
+		b"old"
+	);
+	assert_eq!(
+		fs::read(
+			bucket
+				.join("Photos")
+				.join(LEGACY_TRASH_DIR)
+				.join("deep")
+				.join("x.jpg")
+		)
+		.unwrap(),
+		b"x"
+	);
+	assert!(!top.exists());
+	assert!(!nested.exists());
+	assert_eq!(
+		fs::read(root.path().join("Photos").join("keep.jpg")).unwrap(),
+		b"keep"
+	);
+	assert_eq!(
+		fs::read(root.path().join(".filen.trash.local.txt")).unwrap(),
+		b"mine"
+	);
+	assert!(
+		root.path().join(QUARANTINE_DIR).join(DATED_MARKER).is_dir(),
+		"the bin the migration created is marked as filed by day"
+	);
+}
+
+/// A tree with no filen-sync trash folder is left exactly as it was: no bin is created for it.
+#[test]
+fn a_tree_without_filen_syncs_trash_gets_no_bin() {
+	let root = root();
+	fs::create_dir(root.path().join("Photos")).unwrap();
+	fs::write(root.path().join("Photos").join("a.jpg"), b"a").unwrap();
+
+	assert_eq!(
+		migrate_legacy_trash(root.path(), day(), || true),
+		MigrateSummary::default()
+	);
+	assert!(!root.path().join(QUARANTINE_DIR).exists());
+}
+
+/// A missing root (an unmounted volume) has nothing to migrate, and nothing is created at it.
+#[test]
+fn a_missing_root_migrates_nothing_and_creates_nothing() {
+	let parent = root();
+	let missing = parent.path().join("unmounted");
+
+	assert_eq!(
+		migrate_legacy_trash(&missing, day(), || true),
+		MigrateSummary::default()
+	);
+	assert!(!missing.exists());
+}
+
+/// A filen-sync trash folder inside the bin is the bin's: a second migration does not move it
+/// again, or the one inside it.
+#[test]
+fn the_migration_leaves_what_the_bin_holds_alone() {
+	let root = root();
+	let binned = root
+		.path()
+		.join(QUARANTINE_DIR)
+		.join("2026-10-01")
+		.join(LEGACY_TRASH_DIR);
+	fs::create_dir_all(&binned).unwrap();
+	fs::write(binned.join("old.txt"), b"old").unwrap();
+
+	assert_eq!(
+		migrate_legacy_trash(root.path(), day(), || true),
+		MigrateSummary::default()
+	);
+	assert_eq!(fs::read(binned.join("old.txt")).unwrap(), b"old");
+	assert!(!root.path().join(QUARANTINE_DIR).join("2026-10-26").exists());
+}
+
+/// A symlink named like filen-sync's trash folder is moved as the link: what it points at is not
+/// moved, read or changed. A link to a directory elsewhere is not walked into either.
+#[cfg(unix)]
+#[test]
+fn a_link_named_like_filen_syncs_trash_moves_as_the_link() {
+	let root = root();
+	let outside = tempfile::tempdir().unwrap();
+	fs::write(outside.path().join("target.txt"), b"elsewhere").unwrap();
+	let outside_trash = outside.path().join(LEGACY_TRASH_DIR);
+	fs::create_dir(&outside_trash).unwrap();
+	fs::write(outside_trash.join("theirs.txt"), b"theirs").unwrap();
+	std::os::unix::fs::symlink(outside.path(), root.path().join(LEGACY_TRASH_DIR)).unwrap();
+	// A link to a directory holding a trash folder of its own: that folder is outside the tree.
+	std::os::unix::fs::symlink(outside.path(), root.path().join("linked")).unwrap();
+
+	let migrated = migrate_legacy_trash(root.path(), day(), || true);
+
+	assert_eq!(migrated.moved, 1, "{migrated:?}");
+	let moved = root
+		.path()
+		.join(QUARANTINE_DIR)
+		.join("2026-10-26")
+		.join(LEGACY_TRASH_DIR);
+	assert!(
+		moved.symlink_metadata().unwrap().file_type().is_symlink(),
+		"the link itself was moved"
+	);
+	assert_eq!(fs::read_link(&moved).unwrap(), outside.path());
+	assert!(root.path().join("linked").symlink_metadata().is_ok());
+	assert_eq!(
+		fs::read(outside.path().join("target.txt")).unwrap(),
+		b"elsewhere"
+	);
+	assert_eq!(
+		fs::read(outside_trash.join("theirs.txt")).unwrap(),
+		b"theirs",
+		"the trash folder behind a link was moved"
+	);
+}
+
+/// A migration told to stop moves nothing more, and says so.
+#[test]
+fn a_migration_told_to_stop_leaves_the_rest_in_place() {
+	let root = root();
+	fs::create_dir(root.path().join(LEGACY_TRASH_DIR)).unwrap();
+
+	assert_eq!(
+		migrate_legacy_trash(root.path(), day(), || false),
+		MigrateSummary {
+			moved: 0,
+			errors: 0,
+			stopped: true,
+		}
+	);
+	assert!(root.path().join(LEGACY_TRASH_DIR).is_dir());
+	assert!(!root.path().join(QUARANTINE_DIR).exists());
 }
