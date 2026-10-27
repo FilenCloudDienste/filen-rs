@@ -220,13 +220,16 @@ async fn no_config_file_is_written() {
 		.rc_call_for_test("config/paths", &json!({}))
 		.await
 		.unwrap();
-	let remotes = daemon
+	let mut listed = daemon
 		.rc_call_for_test("config/listremotes", &json!({}))
 		.await
 		.unwrap();
+	// rclone lists them in no fixed order.
+	let mut remotes = serde_json::from_value::<Vec<String>>(listed["remotes"].take()).unwrap();
+	remotes.sort();
 
 	assert_eq!(paths["config"], json!(""));
-	assert_eq!(remotes, json!({ "remotes": ["Filen", "FilenRO"] }));
+	assert_eq!(remotes, ["Filen", "FilenRO"]);
 	daemon.stop(GRACEFUL).await.unwrap();
 	assert_eq!(files_named_conf(dirs.root.path()), Vec::<PathBuf>::new());
 }
