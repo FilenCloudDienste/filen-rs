@@ -12,6 +12,8 @@ use super::{
 	Htpasswd, RcloneDaemonConfig, RemoteBackend, StderrTail, check_version, environment_overrides,
 	htpasswd_line, rcd_args,
 };
+#[cfg(unix)]
+use super::{RcloneDaemon, SPAWN_ATTEMPTS};
 use crate::{
 	ErrorKind,
 	rclone::{RcloneBinary, RcloneRefusal, VfsTuning},
@@ -286,4 +288,40 @@ fn the_stderr_tail_keeps_the_last_lines_cut_short() {
 	assert_eq!(lines.len(), 20);
 	assert_eq!(lines.first(), Some(&"line 6"));
 	assert_eq!(lines.last().map(|line| line.len()), Some(512));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn an_rclone_that_exits_before_its_rc_answers_is_started_again() {
+	let dir = tempfile::tempdir().unwrap();
+	let starts = dir.path().join("starts");
+	let binary = dir.path().join("rclone");
+	std::fs::write(
+		&binary,
+		format!(
+			"#!/bin/sh\necho started >> '{}'\nexit 1\n",
+			starts.display()
+		),
+	)
+	.unwrap();
+	std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+	let config = RcloneDaemonConfig {
+		state_dir: dir.path().to_path_buf(),
+		..daemon_config(None)
+	};
+
+	let error = RcloneDaemon::spawn_until_ready(&binary, &config, "password")
+		.await
+		.err()
+		.unwrap();
+
+	assert_eq!(
+		error.to_string(),
+		"Error of kind IO: context: rclone rcd exited before its rc answered: Crashed { code: \
+		 Some(1), stderr_tail: \"\" }"
+	);
+	assert_eq!(
+		std::fs::read_to_string(&starts).unwrap().lines().count(),
+		usize::try_from(SPAWN_ATTEMPTS).unwrap()
+	);
 }

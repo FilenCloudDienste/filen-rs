@@ -31,7 +31,7 @@ use base64::{Engine as _, prelude::BASE64_STANDARD};
 use filen_macros::js_type;
 use filen_types::auth::FilenSDKConfig;
 use num_traits::ToPrimitive as _;
-use port_check::{free_local_ipv4_port, is_local_ipv4_port_free};
+use port_check::free_local_ipv4_port;
 use serde_json::{Map, Value};
 use sha1::{Digest as _, Sha1};
 use tokio::{
@@ -78,8 +78,9 @@ const RC_USER: &str = "filen";
 /// How long rclone has to answer on rc after it is started.
 const READY_TIMEOUT: Duration = Duration::from_secs(15);
 const READY_POLL: Duration = Duration::from_millis(100);
-/// How often rclone is started before giving up when another process takes its rc port between
-/// the moment it is found free and rclone binding it.
+/// How often rclone is started before giving up when it exits before its rc answers, as it does
+/// when another process takes its rc port between the moment it is found free and rclone binding
+/// it.
 const SPAWN_ATTEMPTS: u32 = 3;
 const DRAIN_POLL: Duration = Duration::from_millis(500);
 /// How long the end of rclone's stderr is waited for once it has exited. A mount helper it started
@@ -352,8 +353,10 @@ impl RcloneDaemon {
 		Ok(())
 	}
 
-	/// Starts rclone until one answers on rc, returning it with the version it reported. Only an
-	/// rclone that exited while another process now holds its port is started again.
+	/// Starts rclone until one answers on rc, returning it with the version it reported. An rclone
+	/// that exits before it answers is started again on a new port, up to [`SPAWN_ATTEMPTS`] times:
+	/// it may have lost its port to a process that held it only for a moment, which is gone by the
+	/// time it could be checked for.
 	async fn spawn_until_ready(
 		binary: &Path,
 		config: &RcloneDaemonConfig,
@@ -366,12 +369,10 @@ impl RcloneDaemon {
 			let daemon = Self::spawn(binary, config, port, password)?;
 			match daemon.wait_ready().await {
 				Ok(version) => return Ok((daemon, version)),
-				Err(e)
-					if attempt < SPAWN_ATTEMPTS
-						&& daemon.has_exited()
-						&& !is_local_ipv4_port_free(port) =>
-				{
-					warn!("rclone could not bind its rc to port {port}, starting it again: {e}");
+				Err(e) if attempt < SPAWN_ATTEMPTS && daemon.has_exited() => {
+					warn!(
+						"rclone exited before its rc answered on port {port}, starting it again: {e}"
+					);
 					attempt += 1;
 				}
 				Err(e) => return Err(e),
