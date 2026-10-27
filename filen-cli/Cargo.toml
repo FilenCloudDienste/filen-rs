@@ -37,6 +37,7 @@ keyring = { version = "3", features = [
 ] }
 serde = "1.0.219"
 serde_json = "1.0.142"
+serde_yaml = "0.9.34"
 base64 = "0.22.1"
 tiny-gradient = "0.1.0"
 termsize = "0.1.9"
@@ -69,6 +70,7 @@ strum = { version = "0.28.0", features = ["derive"] }
 inquire = { git = "https://github.com/JupiterPi/inquire.git", branch = "async-autocomplete" }
 console = "0.16.4"
 ctrlc = "3.5.2"
+futures = "0.3.34"
 
 [dev-dependencies]
 test-utils = { path = "../test-utils", features = ["cli"] }

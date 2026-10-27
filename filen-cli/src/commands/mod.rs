@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use anyhow::{Context, Result};
 use clap::Subcommand;
 use clap_complete::engine::{ArgValueCompleter, PathCompleter};
@@ -128,14 +130,27 @@ pub(crate) enum Commands {
 		#[arg(add = ArgValueCompleter::new(PathCompleter::dir()))]
 		destination: Option<String>,
 	},
-	/// Keep a local directory and a directory in the Filen drive in sync (two-way), until Ctrl-C
+	/// Continuously sync one or more sync pairs
 	Sync {
-		/// Local directory to sync
-		#[arg(add = ArgValueCompleter::new(PathCompleter::dir()))]
-		local: String,
-		/// Directory in the Filen drive to sync with (not the drive root)
-		#[arg(add = FilenCompleter::directory())]
-		remote: String,
+		/// Pair of local and remote directories to sync.
+		/// Format: `<local>:<remote>` or `<local>:<mode>:<remote>`, where `<mode>` is one of `twoWay`, `localBackup`, `remoteBackup`, `localToRemote`, `remoteToLocal`.
+		/// Alternatively, specify a syncPairs.yaml.
+		/// If none are specified, the default syncPairs.yaml under the config dir is included.
+		// todo: better command docs!
+		#[arg(short = 'p', long = "pair")]
+		pairs: Vec<String>,
+		/// Disables the delete guard (applied only on the first sync pass).
+		#[arg(long)]
+		approve_mass_deletions: bool,
+		/// When conflict occurs at the given path, keep local side (applied only on the first sync pass).
+		#[arg(long, value_name = "RELATIVE_PATH")]
+		keep_local: Vec<String>,
+		/// When conflict occurs at the given path, keep remote side (applied only on the first sync pass).
+		#[arg(long, value_name = "RELATIVE_PATH")]
+		keep_remote: Vec<String>,
+		/// When conflict occurs at the given path, keep both sides (applied only on the first sync pass).
+		#[arg(long, value_name = "RELATIVE_PATH")]
+		keep_both: Vec<String>,
 	},
 	/// Export all notes to a local directory
 	ExportNotes {
@@ -346,8 +361,42 @@ pub(crate) async fn execute_command(
 				.await?;
 			None
 		}
-		Commands::Sync { local, remote } => {
-			sync_cmd::sync(config, ui, client, working_path, &local, &remote).await?;
+		Commands::Sync {
+			pairs,
+			approve_mass_deletions: allow_deletions,
+			keep_local,
+			keep_remote,
+			keep_both,
+		} => {
+			let mut conflict_resolutions = HashMap::new();
+			for path in keep_local {
+				conflict_resolutions.insert(
+					path,
+					filen_sdk_rs::sync_engine::ConflictResolution::KeepLocal,
+				);
+			}
+			for path in keep_remote {
+				conflict_resolutions.insert(
+					path,
+					filen_sdk_rs::sync_engine::ConflictResolution::KeepRemote,
+				);
+			}
+			for path in keep_both {
+				conflict_resolutions.insert(
+					path,
+					filen_sdk_rs::sync_engine::ConflictResolution::KeepBoth,
+				);
+			}
+			sync_cmd::sync(
+				config,
+				ui,
+				client,
+				working_path,
+				&pairs,
+				allow_deletions,
+				conflict_resolutions,
+			)
+			.await?;
 			None
 		}
 		Commands::ExportNotes { path } => {

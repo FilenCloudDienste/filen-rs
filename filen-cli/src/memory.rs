@@ -1,3 +1,6 @@
+#![allow(dead_code)]
+// todo: use this again in the CLI sync command
+
 //! Keeps the memory a long-running command frees from staying with the process on Linux.
 //!
 //! glibc's malloc gives a thread that finds the arenas busy an arena of its own, up to 8 per core,
