@@ -376,8 +376,6 @@ fn remove_if_present(path: &Path) -> Result<(), Error> {
 
 #[cfg(test)]
 mod tests {
-	use std::path::Path;
-
 	use super::{HTPASSWD_FILE, PIDFILE, PidRecord, StaleRecovery, clear_cache, recover_stale};
 	use crate::rclone::{RcloneRefusal, system::identify};
 
@@ -631,6 +629,6 @@ mod tests {
 		let unmounted = super::force_unmount(dir.path()).await.unwrap();
 
 		assert!(!unmounted);
-		assert!(Path::new(dir.path()).exists());
+		assert!(dir.path().exists());
 	}
 }
