@@ -467,6 +467,36 @@ impl Client {
 			)
 		})
 	}
+
+	/// The generation at which the cache this client is configured with holds sync root `root`
+	/// converged, or none while it has not finished listing it (see [`SnapshotMark::converged`]).
+	/// Two reads that return the same generation saw no resync start in between. Errors if the
+	/// cache was never configured.
+	pub(crate) async fn sync_root_converged(&self, root: Uuid) -> Result<Option<u64>, Error> {
+		let path = self.cache_slot.lock().await.db_path().ok_or_else(|| {
+			Error::custom(
+				ErrorKind::InvalidState,
+				"cache is not configured; call configure_cache first",
+			)
+		})?;
+		tokio::task::spawn_blocking(move || {
+			converged_generation_on(&open_read_connection(&path)?, root)
+		})
+		.await
+		.map_err(|e| {
+			Error::custom(
+				ErrorKind::Internal,
+				format!("convergence read task failed: {e}"),
+			)
+		})?
+		.map_err(|e| {
+			Error::custom_with_source(
+				ErrorKind::Internal,
+				CacheError::db(e, format!("reading whether sync root {root} converged")),
+				Some("reading cache convergence".to_string()),
+			)
+		})
+	}
 }
 
 #[cfg(test)]

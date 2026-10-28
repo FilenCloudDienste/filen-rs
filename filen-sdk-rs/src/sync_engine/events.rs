@@ -31,7 +31,9 @@ use crate::ErrorKind;
 /// transfer ticks [`Progress`](Self::Progress) while it runs.
 ///
 /// A pass that fails outright ends with [`PassFailed`](Self::PassFailed) instead of
-/// `PassCompleted` — with or without a `PassStarted` before it, depending on how far it got.
+/// `PassCompleted` — with or without a `PassStarted` before it, depending on how far it got. A
+/// pass that has to wait for the cache to finish listing the remote reports
+/// [`AwaitingRemote`](Self::AwaitingRemote) before any of that.
 // The report inline makes every event as large as `PassCompleted`, a copy of a few hundred bytes per
 // action event, which is noise beside the transfer it reports. Boxing it would make callers match
 // and compare through a `Box` for a variant delivered once per pass.
@@ -141,6 +143,15 @@ pub enum SyncEvent {
 	/// caller can tell a session the server no longer accepts (`Unauthenticated`) from the rest
 	/// without reading `error`.
 	PassFailed { error: String, kind: ErrorKind },
+	/// The cache has not finished listing the pair's remote folder — its first listing, or a
+	/// relist after it lost track of the drive or after a change its events do not carry whole (a
+	/// folder moved in from outside or restored from the trash, a file version restored, an event
+	/// it could not read) — so the pass waits for it before it reads either
+	/// side, as a plan against part of the remote would upload over what the listing has not
+	/// reached. Sent once, before [`PassStarted`](Self::PassStarted); a wait that runs out ends
+	/// in [`PassFailed`](Self::PassFailed) with [`ErrorKind::StaleState`] instead, and the next
+	/// pass waits again.
+	AwaitingRemote,
 }
 
 /// Which way a file transfer moves its bytes.

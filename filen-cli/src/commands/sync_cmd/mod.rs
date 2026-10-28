@@ -255,5 +255,6 @@ fn format_sync_event(event: &SyncEvent) -> String {
 			report.errors.len(),
 		),
 		SyncEvent::PassFailed { error, .. } => format!("Sync pass failed: {error}"),
+		SyncEvent::AwaitingRemote => "Waiting for the remote folder to finish indexing".to_string(),
 	}
 }

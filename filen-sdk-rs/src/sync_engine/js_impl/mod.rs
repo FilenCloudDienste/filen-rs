@@ -287,7 +287,8 @@ impl LiveState {
 
 	/// Tag `event` with its pass, record it, and queue it for the listener. `pass` is the id of the
 	/// pass in flight: every `PassStarted` mints a fresh one, as does any other event that finds
-	/// none, and the pass's terminal event clears it.
+	/// none, and the pass's terminal event clears it. An `AwaitingRemote` comes before the pass's
+	/// `PassStarted` and stands alone, so it clears it too.
 	fn observe(&self, pair: PairId, pair_id: u64, pass: &mut Option<u64>, event: SyncEvent) {
 		let pass_id = match *pass {
 			Some(pass_id) if !matches!(event, SyncEvent::PassStarted { .. }) => pass_id,
@@ -295,7 +296,9 @@ impl LiveState {
 		};
 		let ends = matches!(
 			event,
-			SyncEvent::PassCompleted { .. } | SyncEvent::PassFailed { .. }
+			SyncEvent::PassCompleted { .. }
+				| SyncEvent::PassFailed { .. }
+				| SyncEvent::AwaitingRemote
 		);
 		*pass = (!ends).then_some(pass_id);
 		let event = SyncPassEvent {
@@ -469,7 +472,8 @@ impl SyncEngineCore {
 	}
 
 	/// Stop every watch, wait for every other activity to end, then let the engine go. A one-shot
-	/// pass parked on a pause is cut loose until it returns; a transfer in flight is waited for.
+	/// pass parked on a pause, or waiting for the cache to finish listing its remote folder, is cut
+	/// loose until it returns; a transfer in flight is waited for.
 	///
 	/// A close that finds the engine already taken waits for the same activities to end, so it
 	/// returns no earlier than the first; only the first, which holds the engine, cuts passes
@@ -508,7 +512,7 @@ impl SyncEngineCore {
 			.await;
 			if let Some(open) = &open {
 				for pair in syncing_once {
-					open.engine.cancel_suspended_pass(pair).await;
+					open.engine.cut_loose_pass(pair).await;
 				}
 			}
 			// What is left frees itself: a watch being started sees the engine closed and stops it,
@@ -1043,8 +1047,9 @@ impl JsSyncEngine {
 #[cfg_attr(all(test, feature = "napi"), allow(dead_code))]
 #[cfg_attr(feature = "uniffi", uniffi::export)]
 impl JsSyncEngine {
-	/// Stop every watch and let the engine go. A pass parked on a pause is cut loose; a transfer
-	/// in flight (at most one per active pair) is waited for. Idempotent: a call made while another
+	/// Stop every watch and let the engine go. A pass parked on a pause, or waiting for the cache
+	/// to finish listing its remote folder, is cut loose; a transfer in flight (at most one per
+	/// active pair) is waited for. Idempotent: a call made while another
 	/// is still closing returns once that one is done.
 	#[napi_export]
 	pub async fn close(&self) -> Result<(), Error> {

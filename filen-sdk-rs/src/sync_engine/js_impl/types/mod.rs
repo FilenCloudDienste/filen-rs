@@ -492,6 +492,9 @@ pub enum SyncEventMessage {
 		error: String,
 		kind: ErrorKind,
 	},
+	/// The pass waits for the cache to finish listing the pair's remote folder; sent before its
+	/// `PassStarted`, under a pass id of its own.
+	AwaitingRemote,
 }
 
 impl From<SyncEvent> for SyncEventMessage {
@@ -544,6 +547,7 @@ impl From<SyncEvent> for SyncEventMessage {
 				report: report.into(),
 			},
 			SyncEvent::PassFailed { error, kind } => Self::PassFailed { error, kind },
+			SyncEvent::AwaitingRemote => Self::AwaitingRemote,
 		}
 	}
 }

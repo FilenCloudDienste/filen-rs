@@ -118,6 +118,16 @@ pub const PATH_FAILURE_RETRY_INTERVAL: Duration = Duration::from_secs(60 * 60);
 /// id next.
 const REMOVE_CANCEL_GRACE: Duration = Duration::from_secs(10);
 
+/// How often a pass waiting for the cache to finish listing its pair's remote folder asks again
+/// (see [`SyncEngine::await_remote_view`]). One read of one `cache_meta` row each time.
+const CONVERGENCE_POLL: Duration = Duration::from_secs(1);
+
+/// How long one pass waits for that listing before it fails, leaving the next pass to wait again.
+/// Long enough for the first listing of a large drive, which takes minutes; a root the cache never
+/// converges (one the server deleted, or one it cannot register while offline) fails the pass
+/// rather than holding its gate forever.
+const CONVERGENCE_WAIT: Duration = Duration::from_secs(15 * 60);
+
 /// How many items of a pass one bulk request carries: the server runs a bulk request in groups of
 /// 50 items and takes its per-user lock once per group, so this is one group.
 ///
@@ -1961,6 +1971,15 @@ impl SyncEngine {
 		pair: PairId,
 		scope: Option<&mut PassScope>,
 	) -> Result<BenchPass, Error> {
+		let scope = match scope {
+			Some(scope) => Some(ScopedRead {
+				converged: self
+					.await_remote_view(pair, None, std::future::pending())
+					.await?,
+				scope,
+			}),
+			None => None,
+		};
 		// It applies nothing, so it seeds nothing either: the probe does not time the stage.
 		let prep = self.prepare(pair, scope, Seeding::Skip).await?;
 		super::step("prepare_tail");
@@ -2147,6 +2166,13 @@ pub(super) enum WhenIdle {
 	/// Skip it entirely. A watch wake with nothing announced has nothing to do, and reading two
 	/// trees to discover that is the whole cost change-scoping exists to remove.
 	Skip,
+}
+
+/// A pass's changelists, taken while the cache held the pair's remote root converged at
+/// generation `converged` (see [`SyncEngine::await_remote_view`]).
+struct ScopedRead<'a> {
+	scope: &'a mut PassScope,
+	converged: u64,
 }
 
 /// The per-pair reads every pass makes before it looks at either tree.
@@ -3639,8 +3665,10 @@ impl SyncEngine {
 	/// Errors if the pair is unknown, and — for [`Backlog::AdoptDestination`] only — if that read
 	/// cannot be trusted to say what either side no longer has: a name collision, an incomplete local
 	/// scan, or a remote view that has never converged or came back wholly empty — or if the read
-	/// fails, a failed baseline read included (see [`plan_pair`](Self::plan_pair)). The mode is left
-	/// exactly as it was, so the call is safe to retry. Re-registering an existing pair through
+	/// fails, a failed baseline read included (see [`plan_pair`](Self::plan_pair)). A remote folder
+	/// the cache has not finished listing fails it with [`ErrorKind::StaleState`] at once, as it
+	/// fails [`plan_pair`](Self::plan_pair): unlike a pass, the call does not wait for the listing.
+	/// The mode is left exactly as it was, so the call is safe to retry. Re-registering an existing pair through
 	/// [`add_pair`](Self::add_pair) with a different mode is an error rather than a silent switch,
 	/// so a mode change is always this explicit call.
 	pub async fn reconfigure_pair(
@@ -4314,6 +4342,46 @@ impl SyncEngine {
 		rules
 	}
 
+	/// Wait until the cache holds `pair`'s remote root converged — a whole, current view a pass may
+	/// plan against (see `SnapshotMark::converged`) — and answer the generation it holds it at.
+	///
+	/// At once when it already does, which is every pass but a pair's first after the cache started
+	/// and those during a relist. Otherwise `observer` hears [`SyncEvent::AwaitingRemote`] once, and
+	/// this asks again every [`CONVERGENCE_POLL`] for up to [`CONVERGENCE_WAIT`], then fails with
+	/// [`ErrorKind::StaleState`]. A pair with no cache subscription has a root the cache may not
+	/// track, which would never converge: it is subscribed again before the wait (see
+	/// [`resubscribe`](Self::resubscribe)), and a refusal fails the wait at once, as that error.
+	/// `give_up` resolving fails it at once with [`ErrorKind::StaleState`] too, as a wait that ran
+	/// out does.
+	pub(super) async fn await_remote_view(
+		&self,
+		pair: PairId,
+		observer: Option<&mut (dyn FnMut(SyncEvent) + Send)>,
+		give_up: impl Future<Output = ()>,
+	) -> Result<u64, Error> {
+		let remote_root = locked(&self.control)
+			.pair(pair)
+			.map_err(|e| db_error(e, "loading the sync pair"))?
+			.ok_or_else(|| Error::custom(ErrorKind::InvalidState, "unknown sync pair"))?
+			.remote_root;
+		let before_waiting = async {
+			self.resubscribe(pair).await?;
+			if let Some(observer) = observer {
+				observer(SyncEvent::AwaitingRemote);
+			}
+			Ok(())
+		};
+		await_convergence(
+			|| self.client.sync_root_converged(remote_root),
+			before_waiting,
+			CONVERGENCE_POLL,
+			CONVERGENCE_WAIT,
+			give_up,
+		)
+		.await?
+		.ok_or_else(|| remote_not_converged(pair, remote_root))
+	}
+
 	/// The per-pair reads every pass makes before it looks at either tree, whichever way it then
 	/// reads them.
 	async fn pass_inputs(&self, pair: PairId) -> Result<PassInputs, Error> {
@@ -4364,8 +4432,9 @@ impl SyncEngine {
 	/// the view — or only what changed since the last pass, with everything else derived from the
 	/// baseline rows (see [`PassRead`], and the optimization plan's section 3.4).
 	///
-	/// `scope` is the pass's changelists, taken before this runs. `None` is a dry run, which always
-	/// reads whole: it is rare, and its report has to show the whole picture (plan 3.5).
+	/// `scope` is the pass's changelists, taken before this runs, with the convergence they were
+	/// taken under. `None` is a dry run, which always reads whole: it is rare, and its report has to
+	/// show the whole picture (plan 3.5).
 	///
 	/// `seeding` says whether the read weighs the hashless files both sides agree on before it hands
 	/// the pass over (see [`seed`]), and where it records them: only a pass that goes on to apply
@@ -4373,7 +4442,7 @@ impl SyncEngine {
 	async fn prepare(
 		&self,
 		pair: PairId,
-		scope: Option<&mut PassScope>,
+		scope: Option<ScopedRead<'_>>,
 		seeding: Seeding,
 	) -> Result<Prepared, Error> {
 		let inputs = self.pass_inputs(pair).await?;
@@ -4383,13 +4452,13 @@ impl SyncEngine {
 		// The changelists' own reasons, plus the one row of the trigger table that needs the
 		// baseline: an empty one is a first sync, and the whole tree is the evidence for it.
 		let forced = match &scope {
-			Some(scope) => scope.full_pass_reason(inputs.baseline.len()),
+			Some(read) => read.scope.full_pass_reason(inputs.baseline.len()),
 			None => None,
 		};
 		if forced.is_none()
-			&& let Some(scope) = scope
+			&& let Some(read) = scope
 		{
-			match self.prepare_scoped(inputs, scope, seeding).await? {
+			match self.prepare_scoped(inputs, read, seeding).await? {
 				Scoped::Prepared(prepared) => return Ok(*prepared),
 				// The derivation could not answer for something it was handed.
 				Scoped::Whole(inputs, reason) => {
@@ -4412,7 +4481,7 @@ impl SyncEngine {
 	async fn prepare_scoped(
 		&self,
 		mut inputs: PassInputs,
-		scope: &mut PassScope,
+		ScopedRead { scope, converged }: ScopedRead<'_>,
 		seeding: Seeding,
 	) -> Result<Scoped, Error> {
 		let pair = inputs.record.id;
@@ -4476,6 +4545,15 @@ impl SyncEngine {
 		})?;
 		let observed =
 			observed.map_err(|e| db_error(e, "resolving where the delta's items are recorded"))?;
+		// The delta is what the cache announced up to the take, which came after the cache held
+		// the root converged at `converged`. A resync that started since — the generation moved, or
+		// the root is not converged at all — may have announced part of its listing before the
+		// take and the rest after it, and the rows derived here cannot tell the two apart. A root
+		// that is not converged may also have taken an event its rows cannot follow (a dir moved in
+		// or restored), which only its relist makes whole.
+		if self.client.sync_root_converged(root).await? != Some(converged) {
+			return Err(remote_not_converged(pair, root));
+		}
 		let mut observation = match observed {
 			RemoteObserved::Applied(observation) => *observation,
 			RemoteObserved::Full(reason) => return Ok(Scoped::Whole(Box::new(inputs), reason)),
@@ -5206,7 +5284,11 @@ impl SyncEngine {
 	/// [`paused`](Self::pause_pair) pair is planned like any other.
 	///
 	/// A read that fails is the call's error, as it is a pass's: a baseline read that fails panics
-	/// on purpose, and that panic comes back here as an [`ErrorKind::Internal`] error.
+	/// on purpose, and that panic comes back here as an [`ErrorKind::Internal`] error. So is a remote
+	/// folder the cache has not finished listing (its first listing, or a relist), which fails with
+	/// [`ErrorKind::StaleState`] at once: every item the listing has not reached would plan as
+	/// absent, and unlike a pass a dry run does not wait for the listing (see
+	/// [`sync_once`](Self::sync_once)), so a caller retries once the cache has finished.
 	pub async fn plan_pair(&self, pair: PairId) -> Result<PlanOutcome, Error> {
 		let planned =
 			pass_panics_as_errors(pair, "the dry run", self.plan_pair_unreleased(pair)).await;
@@ -5527,11 +5609,17 @@ impl SyncEngine {
 
 	/// [`cancel_paused_actions`](Self::cancel_paused_actions) for a caller inside the engine, on a
 	/// pair it need not have checked first: it cuts loose a pass parked on a suspension without
-	/// touching the persisted paused flag. A watch being stopped uses it, so a loop whose pass is
-	/// parked ends instead of waiting for a resume that whoever stopped it is not going to send.
-	pub(super) async fn cancel_suspended_pass(&self, pair: PairId) {
+	/// touching the persisted paused flag, and ends one waiting for the cache to finish listing the
+	/// pair's remote folder, which then fails with [`ErrorKind::StaleState`] as a wait that ran out
+	/// does. A watch being stopped and an engine being closed use it, so a pass ends instead of
+	/// waiting for a resume that whoever stopped it is not going to send, or for a listing nobody
+	/// is left to sync.
+	pub(super) async fn cut_loose_pass(&self, pair: PairId) {
 		if let Some(control) = self.paused.lock().await.get(&pair) {
 			cancel_suspension(control);
+		}
+		if let Some(changes) = self.existing_pair_changes(pair).await {
+			changes.stop_waiting();
 		}
 	}
 
@@ -5982,8 +6070,14 @@ impl SyncEngine {
 	///
 	/// A pass plans only against a remote view the cache has finished listing: while the cache is
 	/// still listing the pair's remote folder (its first listing, or a relist after it lost track of
-	/// the drive), the pass fails with [`ErrorKind::StaleState`] and applies nothing, since every
-	/// item the listing has not reached would read as absent and plan an upload over it.
+	/// the drive), every item the listing has not reached would read as absent and plan an upload
+	/// over it. So the pass first waits for the listing, reporting
+	/// [`SyncEvent::AwaitingRemote`] once, for up to 15 minutes; a wait that runs out, or a
+	/// listing that started after the wait ended, fails the pass with [`ErrorKind::StaleState`]
+	/// and applies nothing. A cancel or removal reaches a pass in this wait as it does one reading,
+	/// and so does a suspension, which ends the wait instead of parking it: the wait has nothing in
+	/// flight to carry on with, so the pass reports itself paused as a cancelled one does. A watch
+	/// being stopped, or the engine being closed, ends the wait as one that ran out.
 	///
 	/// Before it plans, a pass records as synced every path that has never synced where both sides
 	/// hold a file, the remote one carries no BLAKE3 (another client uploaded it without one) and
@@ -6440,6 +6534,35 @@ impl SyncEngine {
 		reading: Arc<Mutex<()>>,
 		changes: Arc<PairChanges>,
 	) -> Result<SyncReport, Error> {
+		// The remote view this pass may plan against, waited for BEFORE the changelists are taken:
+		// a change-scoped read checks that the cache still holds the root at this generation once
+		// it has read the delta, which only proves that nothing relisted the root across the take
+		// if the generation was read before it. Under the gate, so a cancel reaches the wait, and
+		// outside the read's cost, which the wait for a first listing would swamp.
+		//
+		// A suspension ends the wait as well, where the gate would let it run on: the wait has
+		// nothing in flight for a resume to carry on with, and parked behind it the pass would hold
+		// its caller for up to the whole wait. So does a watch being stopped or the engine being
+		// closed (`cut_loose_pass`), which leave nobody to wait for.
+		let given_up = async {
+			tokio::select! {
+				() = changes.waiting_stopped() => {}
+				() = gate.halted() => {}
+			}
+		};
+		let Some(converged) = gate
+			.guard(self.await_remote_view(pair, Some(&mut *observer), given_up))
+			.await
+		else {
+			return cancelled_reading(&gate, pair);
+		};
+		let converged = match converged {
+			Ok(converged) => converged,
+			// Ended by a pause, or failed while one landed: either way the pair is paused, and the
+			// pass reports so as one cancelled while reading does.
+			Err(_) if !gate.running() => return cancelled_reading(&gate, pair),
+			Err(error) => return Err(error),
+		};
 		// Both changelists, taken BEFORE either side is read: everything in them is either already
 		// in the snapshot this pass is about to read (a harmless duplicate) or not yet, and this
 		// pass has it. What arrives from here on belongs to the next pass (see `changes`).
@@ -6460,27 +6583,16 @@ impl SyncEngine {
 				let migration_started = Instant::now();
 				self.migrate_legacy_trash(pair, migrating).await;
 				let migration = migration_started.elapsed();
-				let prepared = self.prepare(pair, Some(&mut scope), Seeding::Write).await;
+				let read = ScopedRead {
+					scope: &mut scope,
+					converged,
+				};
+				let prepared = self.prepare(pair, Some(read), Seeding::Write).await;
 				(recording, migration, prepared)
 			})
 			.await
 		else {
-			// Cancelled while still reading: no plan was made, so nothing was applied — the journal
-			// records the read had already retired stay retired, in memory and in the DB alike,
-			// which is what keeps the two halves in step. The one kind of baseline row a read writes
-			// is a seeded one (see `Prepared::seed_unhashed`), which runs on a blocking thread and
-			// commits even when the cancel drops the pass: each records an agreement the read
-			// observed, and the next pass reads it as any synced row. A removal took the pair with
-			// it and is said so; a plain cancel leaves the pair paused, which is the report a pause
-			// made a moment earlier would have produced.
-			if gate.retired() {
-				return Err(being_removed(pair));
-			}
-			tracing::debug!("sync_once[pair {pair}]: cancelled while reading the two sides");
-			return Ok(SyncReport {
-				paused: true,
-				..SyncReport::default()
-			});
+			return cancelled_reading(&gate, pair);
 		};
 		// The read ends here: everything above it is the baseline, the scan, the snapshot and the
 		// view; everything below writes something.
@@ -7526,10 +7638,63 @@ pub(super) fn db_error(error: rusqlite::Error, context: &str) -> Error {
 	Error::custom_with_source(kind, error, Some(context.to_string()))
 }
 
-/// The refusal every control verb gets once [`SyncEngine::remove_pair`] has started on the pair: its
-/// row is deleted moments later, so there is nothing left for a pause or a resume to describe — and
-/// either would take back the cancel the removal is waiting on — and nothing for a cancel of the
-/// paused actions to convert, the removal's own cancel being final.
+/// What a pass cancelled while still reading returns: no plan was made, so nothing was applied —
+/// the journal records the read had already retired stay retired, in memory and in the DB alike,
+/// which is what keeps the two halves in step. The one kind of baseline row a read writes is a
+/// seeded one (see `Prepared::seed_unhashed`), which runs on a blocking thread and commits even
+/// when the cancel drops the pass: each records an agreement the read observed, and the next pass
+/// reads it as any synced row. A removal took the pair with it and is said so; a plain cancel
+/// leaves the pair paused, which is the report a pause made a moment earlier would have produced.
+fn cancelled_reading(gate: &PassGate, pair: PairId) -> Result<SyncReport, Error> {
+	if gate.retired() {
+		return Err(being_removed(pair));
+	}
+	tracing::debug!("sync_once[pair {pair}]: cancelled while reading the two sides");
+	Ok(SyncReport {
+		paused: true,
+		..SyncReport::default()
+	})
+}
+
+/// Ask `converged` until it answers a generation, every `poll`, for at most `wait`: `None` when it
+/// never did. `before_waiting` runs once, after a first answer of none and before the first wait,
+/// so a caller hears of a wait only when there is one; its error ends the wait. `give_up`
+/// resolving ends it too, wherever it stands, with the `None` of a wait that ran out — unless the
+/// answer it was racing came first.
+async fn await_convergence<A, F>(
+	mut converged: A,
+	before_waiting: impl Future<Output = Result<(), Error>>,
+	poll: Duration,
+	wait: Duration,
+	give_up: impl Future<Output = ()>,
+) -> Result<Option<u64>, Error>
+where
+	A: FnMut() -> F,
+	F: Future<Output = Result<Option<u64>, Error>>,
+{
+	let waiting = async {
+		if let Some(generation) = converged().await? {
+			return Ok(Some(generation));
+		}
+		before_waiting.await?;
+		let deadline = tokio::time::Instant::now() + wait;
+		loop {
+			tokio::time::sleep(poll).await;
+			if let Some(generation) = converged().await? {
+				return Ok(Some(generation));
+			}
+			if tokio::time::Instant::now() >= deadline {
+				return Ok(None);
+			}
+		}
+	};
+	tokio::select! {
+		biased;
+		answer = waiting => answer,
+		() = give_up => Ok(None),
+	}
+}
+
 /// The error of a pass that found the cache had not finished listing `pair`'s remote root
 /// `remote_root`: it plans nothing against a partial view. Stale state, as the view is: the next pass
 /// reads it again.
@@ -7543,6 +7708,10 @@ fn remote_not_converged(pair: PairId, remote_root: Uuid) -> Error {
 	)
 }
 
+/// The refusal every control verb gets once [`SyncEngine::remove_pair`] has started on the pair: its
+/// row is deleted moments later, so there is nothing left for a pause or a resume to describe — and
+/// either would take back the cancel the removal is waiting on — and nothing for a cancel of the
+/// paused actions to convert, the removal's own cancel being final.
 fn being_removed(pair: PairId) -> Error {
 	Error::custom(
 		ErrorKind::InvalidState,

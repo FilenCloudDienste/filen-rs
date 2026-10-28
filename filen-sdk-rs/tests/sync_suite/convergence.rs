@@ -1920,3 +1920,57 @@ async fn versioning_disabled_body(sc: &SingleClient) {
 	);
 	assert!(read_eq(&sc.local, "vd.txt", b"v2 is longer"));
 }
+
+// ============================================================================
+// CONVERGE — A remote dir trashed and restored between passes is planned against whole
+// ============================================================================
+/// The trash takes a synced dir's contents out of the cache, and the restore brings back the dir
+/// alone: no event sends its contents again. A pass that planned against that view would read the
+/// file inside as deleted on the remote and delete the local copy. It waits for the cache to list
+/// the pair again instead, and finds nothing to do.
+#[shared_test_runtime]
+async fn converge_a_dir_restored_between_passes_is_planned_against_whole() {
+	let sc = single_client(SyncMode::TwoWay).await;
+	let client = &sc.resources.client;
+	// A test holding the trash lock waits for the drive lock, never the other way round.
+	let _trash_lock = client
+		.acquire_lock_with_default(test_utils::locks::TRASH)
+		.await
+		.unwrap();
+	let parent = DirType::<Normal>::Dir(Cow::Borrowed(&sc.resources.dir));
+	let mut docs = client.create_dir(&parent, "docs").await.unwrap();
+	let inside = upload_to(client, docs.uuid(), "inside.txt", b"kept").await;
+	assert!(
+		poll_for_item(sc.cache.db_path(), inside.uuid(), CACHE_CONVERGE_TIMEOUT).await,
+		"cache never observed inside.txt"
+	);
+	let r1 = sc.sync().await;
+	assert!(r1.errors.is_empty(), "{r1:?}");
+	assert_eq!(r1.downloaded, 1, "{r1:?}");
+	assert!(read_eq(&sc.local, "docs/inside.txt", b"kept"));
+
+	client.trash_dir(&mut docs).await.unwrap();
+	assert!(
+		poll_for_item_absent(sc.cache.db_path(), inside.uuid(), CACHE_CONVERGE_TIMEOUT).await,
+		"cache never observed the trash"
+	);
+	client.restore_dir(&mut docs).await.unwrap();
+	assert!(
+		poll_for_item(sc.cache.db_path(), docs.uuid(), CACHE_CONVERGE_TIMEOUT).await,
+		"cache never observed the restore"
+	);
+
+	let r2 = sc.sync().await;
+	assert!(r2.errors.is_empty(), "{r2:?}");
+	assert_eq!(r2.locally_deleted, 0, "{r2:?}");
+	assert_eq!(r2.remotely_trashed, 0, "{r2:?}");
+	assert_eq!(r2.uploaded, 0, "{r2:?}");
+	assert_eq!(r2.downloaded, 0, "{r2:?}");
+	assert!(r2.held.is_empty(), "{r2:?}");
+	assert!(read_eq(&sc.local, "docs/inside.txt", b"kept"));
+	assert!(
+		query_cached_file(sc.cache.db_path(), inside.uuid()).is_some(),
+		"the relist the pass waited for brought inside.txt back"
+	);
+	sc.cleanup();
+}

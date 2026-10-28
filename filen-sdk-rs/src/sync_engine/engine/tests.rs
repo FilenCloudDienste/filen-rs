@@ -11,7 +11,7 @@ use crate::{
 	alloc_meter,
 	auth::test_support::offline_client,
 	cache::{
-		CacheState, open_sqlite, open_sqlite_in_memory, open_sqlite_with_flags,
+		CacheSlot, CacheState, open_sqlite, open_sqlite_in_memory, open_sqlite_with_flags,
 		test_support::rewrite_behind_sqlite,
 	},
 	sync::lock::MAX_SLEEP_TIME_DEFAULT,
@@ -4885,7 +4885,7 @@ async fn removing_a_paused_pair_never_lets_its_parked_action_start() {
 }
 
 /// The two things that cut a pass loose — a watch being stopped (whose engine-side half is
-/// [`SyncEngine::cancel_suspended_pass`], polled by the loop's unparking for as long as it
+/// [`SyncEngine::cut_loose_pass`], polled by the loop's unparking for as long as it
 /// lives) and the pair being removed — both wait for something, and neither may end up waiting
 /// on the other. Nor may a pause that never escalates park the removal.
 #[tokio::test]
@@ -4896,7 +4896,7 @@ async fn a_stop_and_a_removal_of_the_same_pair_never_wait_on_each_other() {
 	engine.pause_pair(pair).await.unwrap();
 	let pass = pass_in_flight(engine.pass_gate(pair).await.unwrap());
 	tokio::task::yield_now().await;
-	engine.cancel_suspended_pass(pair).await;
+	engine.cut_loose_pass(pair).await;
 	engine.remove_pair(pair).await.unwrap();
 	assert!(
 		pass.is_finished(),
@@ -4913,7 +4913,7 @@ async fn a_stop_and_a_removal_of_the_same_pair_never_wait_on_each_other() {
 	let pass = pass_in_flight(engine.pass_gate(pair).await.unwrap());
 	tokio::task::yield_now().await;
 	engine.remove_pair(pair).await.unwrap();
-	engine.cancel_suspended_pass(pair).await;
+	engine.cut_loose_pass(pair).await;
 	assert!(
 		pass.is_finished(),
 		"the removal did not end the parked pass"
@@ -5307,15 +5307,51 @@ async fn a_pass_that_ends_no_streak_still_records_its_failures() {
 	std::fs::remove_file(&path).ok();
 }
 
-/// A REAL pass, parked in its read half: the remote enumeration is the first thing that wants
-/// the client's cache slot, so holding that slot stops `sync_once` inside `prepare` — under the
-/// gate it took first, which is the window the two tests below land a control call in.
-fn a_pass_parked_in_its_read(
+/// A pair whose cache holds its remote root converged, so a pass gets past its wait for the remote
+/// view without asking a server, over an empty local root in `dir`. Answers the cache DB's path.
+async fn engine_with_a_converged_pair(dir: &Path) -> (SyncEngine, PairId, PathBuf) {
+	let local = dir.join("local");
+	std::fs::create_dir(&local).unwrap();
+	let account = Uuid::from_u128(1);
+	let remote_root = Uuid::from_u128(2);
+	let cache = dir.join("cache.db");
+	let mut state = CacheState::new_on_path(&cache, account);
+	state
+		.upsert_dirs([&cacheable_dir(remote_root, account, "pair")].into_iter())
+		.unwrap();
+	state.add_converged_roots(&[remote_root]).unwrap();
+	let client = Arc::new(offline_client());
+	client.configure_cache(cache.clone(), |_| {}).await.unwrap();
+	let engine = SyncEngine::open(client, dir.join("sync.db")).await.unwrap();
+	let (pair, _) = locked(&engine.control)
+		.create_pair(local.to_str().unwrap(), remote_root, SyncMode::TwoWay)
+		.unwrap();
+	(engine, pair, cache)
+}
+
+/// A REAL pass of a [`engine_with_a_converged_pair`] pair, parked in its read half — under the
+/// gate it took first, which is the window the tests below land a control call in — and the
+/// client's cache slot it is parked on. The remote enumeration is the first thing in the read
+/// that wants the slot, but the wait for the remote view before the read wants it too, so the
+/// slot is taken only once the pass is past that wait: while the pass is held at the start of its
+/// read by the engine's record of the pairs it looked for filen-sync's trash in.
+async fn a_pass_parked_in_its_read(
 	engine: &Arc<SyncEngine>,
 	pair: PairId,
-) -> tokio::task::JoinHandle<Result<SyncReport, Error>> {
-	let engine = Arc::clone(engine);
-	tokio::spawn(async move { engine.sync_once(pair).await })
+) -> (
+	tokio::task::JoinHandle<Result<SyncReport, Error>>,
+	tokio::sync::MutexGuard<'_, CacheSlot>,
+) {
+	let held = engine.legacy_trash_looked.lock().await;
+	let pass = tokio::spawn({
+		let engine = Arc::clone(engine);
+		async move { engine.sync_once(pair).await }
+	});
+	parked(engine, pair).await;
+	let slot = engine.client.cache_slot.lock().await;
+	drop(held);
+	tokio::time::sleep(SETTLED).await;
+	(pass, slot)
 }
 
 /// How long a test waits on the paused clock for every task to get as far as it can. The clock
@@ -5349,11 +5385,10 @@ async fn ended<T>(task: &mut tokio::task::JoinHandle<T>) -> Option<T> {
 /// deleting the rows out from under a pass it never saw.
 #[tokio::test(start_paused = true)]
 async fn a_removal_during_the_read_half_ends_the_pass_before_it_plans() {
-	let (engine, pair, path) = engine_with_pair("remove_during_prepare").await;
+	let dir = tempfile::tempdir().unwrap();
+	let (engine, pair, _) = engine_with_a_converged_pair(dir.path()).await;
 	let engine = Arc::new(engine);
-	let slot = engine.client.cache_slot.lock().await;
-	let pass = a_pass_parked_in_its_read(&engine, pair);
-	parked(&engine, pair).await;
+	let (pass, slot) = a_pass_parked_in_its_read(&engine, pair).await;
 	assert!(
 		!pass.is_finished(),
 		"the pass was supposed to be stuck in its read"
@@ -5384,9 +5419,6 @@ async fn a_removal_during_the_read_half_ends_the_pass_before_it_plans() {
 		refused.to_string().contains("is being removed"),
 		"a pass dropped by a removal must say so, not report a read that failed: {refused}"
 	);
-
-	drop(engine);
-	std::fs::remove_file(&path).ok();
 }
 
 /// The same window, CANCELLED rather than removed: the pair is still there, so the pass reports
@@ -5394,11 +5426,10 @@ async fn a_removal_during_the_read_half_ends_the_pass_before_it_plans() {
 /// produced, with nothing planned, applied or recorded.
 #[tokio::test(start_paused = true)]
 async fn a_cancel_during_the_read_half_ends_the_pass_with_the_paused_report() {
-	let (engine, pair, path) = engine_with_pair("cancel_during_prepare").await;
+	let dir = tempfile::tempdir().unwrap();
+	let (engine, pair, _) = engine_with_a_converged_pair(dir.path()).await;
 	let engine = Arc::new(engine);
-	let slot = engine.client.cache_slot.lock().await;
-	let mut pass = a_pass_parked_in_its_read(&engine, pair);
-	parked(&engine, pair).await;
+	let (mut pass, slot) = a_pass_parked_in_its_read(&engine, pair).await;
 	assert!(
 		!pass.is_finished(),
 		"the pass was supposed to be stuck in its read"
@@ -5438,6 +5469,113 @@ async fn a_cancel_during_the_read_half_ends_the_pass_with_the_paused_report() {
 		engine.is_paused(pair).await,
 		"the cancel left the pair running"
 	);
+}
+
+/// So does a cancel landing while the pass still waits for the cache to finish listing the
+/// remote, before either side is read: the wait is under the gate too.
+#[tokio::test(start_paused = true)]
+async fn a_cancel_during_the_wait_for_the_remote_ends_the_pass_with_the_paused_report() {
+	let (engine, pair, path) = engine_with_pair("cancel_during_wait").await;
+	let engine = Arc::new(engine);
+	// Whether the cache holds the root converged is the first thing a pass asks of the slot.
+	let slot = engine.client.cache_slot.lock().await;
+	let mut pass = tokio::spawn({
+		let engine = Arc::clone(&engine);
+		async move { engine.sync_once(pair).await }
+	});
+	parked(&engine, pair).await;
+
+	engine
+		.pause_pair_with(
+			pair,
+			PauseOptions {
+				mode: PauseMode::Cancel,
+				cancel_after: None,
+			},
+		)
+		.await
+		.unwrap();
+	let report = ended(&mut pass)
+		.await
+		.expect("the cancel never reached the pass waiting for the remote")
+		.expect("a cancelled wait is not a failure");
+	drop(slot);
+	assert_eq!(
+		report,
+		SyncReport {
+			paused: true,
+			..SyncReport::default()
+		}
+	);
+
+	drop(engine);
+	std::fs::remove_file(&path).ok();
+}
+
+/// A pause that only suspends, and never escalates, ends a pass waiting for the cache to finish
+/// listing the remote, rather than parking it: the wait has nothing in flight for a resume to
+/// carry on with, and parked it would hold the caller for the whole wait.
+#[tokio::test(start_paused = true)]
+async fn a_suspension_during_the_wait_for_the_remote_ends_the_pass_with_the_paused_report() {
+	let (engine, pair, path) = engine_with_pair("suspend_during_wait").await;
+	let engine = Arc::new(engine);
+	// Whether the cache holds the root converged is the first thing a pass asks of the slot.
+	let slot = engine.client.cache_slot.lock().await;
+	let mut pass = tokio::spawn({
+		let engine = Arc::clone(&engine);
+		async move { engine.sync_once(pair).await }
+	});
+	parked(&engine, pair).await;
+
+	engine
+		.pause_pair_with(
+			pair,
+			PauseOptions {
+				mode: PauseMode::Suspend,
+				cancel_after: None,
+			},
+		)
+		.await
+		.unwrap();
+	let report = ended(&mut pass)
+		.await
+		.expect("the suspension never reached the pass waiting for the remote")
+		.expect("a suspended wait is not a failure");
+	drop(slot);
+	assert_eq!(
+		report,
+		SyncReport {
+			paused: true,
+			..SyncReport::default()
+		}
+	);
+
+	drop(engine);
+	std::fs::remove_file(&path).ok();
+}
+
+/// A watch being stopped, or the engine being closed, cuts a pass loose from its wait for the
+/// cache to finish listing the remote: it fails at once as a wait that ran out does, and the
+/// pair, which nobody paused, stays running.
+#[tokio::test(start_paused = true)]
+async fn cutting_a_pass_loose_ends_its_wait_for_the_remote() {
+	let (engine, pair, path) = engine_with_pair("cut_loose_during_wait").await;
+	let engine = Arc::new(engine);
+	let slot = engine.client.cache_slot.lock().await;
+	let mut pass = tokio::spawn({
+		let engine = Arc::clone(&engine);
+		async move { engine.sync_once(pair).await }
+	});
+	parked(&engine, pair).await;
+
+	engine.cut_loose_pass(pair).await;
+	let failed = ended(&mut pass)
+		.await
+		.expect("cutting the pass loose never reached its wait for the remote")
+		.expect_err("a wait given up on plans nothing");
+	drop(slot);
+	assert_eq!(failed.kind(), ErrorKind::StaleState, "{failed}");
+	assert!(!engine.is_paused(pair).await);
 
 	drop(engine);
 	std::fs::remove_file(&path).ok();
@@ -5448,14 +5586,13 @@ async fn a_cancel_during_the_read_half_ends_the_pass_with_the_paused_report() {
 /// `Conflicted` with nobody told — and, for `KeepBoth`, with the local copy already renamed.
 #[tokio::test(start_paused = true)]
 async fn a_resolution_waits_for_the_pass_reading_the_pair() {
-	let (engine, pair, path) = engine_with_pair("resolve_during_prepare").await;
+	let dir = tempfile::tempdir().unwrap();
+	let (engine, pair, cache) = engine_with_a_converged_pair(dir.path()).await;
 	let engine = Arc::new(engine);
 	locked(&engine.pair_store(pair).await.unwrap())
 		.upsert_entry(pair, &converged_conflict(Uuid::new_v4()))
 		.unwrap();
-	let slot = engine.client.cache_slot.lock().await;
-	let pass = a_pass_parked_in_its_read(&engine, pair);
-	parked(&engine, pair).await;
+	let (pass, slot) = a_pass_parked_in_its_read(&engine, pair).await;
 
 	let mut resolving = tokio::spawn({
 		let engine = Arc::clone(&engine);
@@ -5477,7 +5614,9 @@ async fn a_resolution_waits_for_the_pass_reading_the_pair() {
 		"the resolution wrote its row under the pass"
 	);
 
-	// The offline pass fails in its read once it gets the slot, and lets the resolution through.
+	// With its cache gone, the pass fails in its read once it gets the slot, and lets the
+	// resolution through.
+	std::fs::remove_file(&cache).unwrap();
 	drop(slot);
 	assert!(pass.await.unwrap().is_err());
 	assert_eq!(
@@ -5492,9 +5631,6 @@ async fn a_resolution_waits_for_the_pass_reading_the_pair() {
 			.map(|row| row.state),
 		Some(BaselineState::Synced)
 	);
-
-	drop(engine);
-	std::fs::remove_file(&path).ok();
 }
 
 /// A paused pair holds its conflicts like any other, and the caller must be able to settle them
@@ -7636,6 +7772,163 @@ fn a_database_file_moved_away_while_open_is_an_io_error() {
 		None,
 	);
 	assert_eq!(db_error(moved, "writing").kind(), ErrorKind::IO);
+}
+
+/// Answers `generations` in turn, one per ask, counting the asks.
+fn convergence_answers(
+	generations: Vec<Option<u64>>,
+	asked: &AtomicUsize,
+) -> impl FnMut() -> std::future::Ready<Result<Option<u64>, Error>> + '_ {
+	let mut answers = generations.into_iter();
+	move || {
+		asked.fetch_add(1, Ordering::Relaxed);
+		std::future::ready(Ok(answers.next().flatten()))
+	}
+}
+
+/// A root the cache already holds converged is read at once: nothing waits, and nothing is told
+/// of a wait.
+#[tokio::test(start_paused = true)]
+async fn a_converged_root_is_read_without_waiting() {
+	let asked = AtomicUsize::new(0);
+	let waited = AtomicBool::new(false);
+	let started = tokio::time::Instant::now();
+
+	let generation = await_convergence(
+		convergence_answers(vec![Some(4)], &asked),
+		async {
+			waited.store(true, Ordering::Relaxed);
+			Ok(())
+		},
+		CONVERGENCE_POLL,
+		CONVERGENCE_WAIT,
+		std::future::pending(),
+	)
+	.await
+	.unwrap();
+
+	assert_eq!(generation, Some(4));
+	assert_eq!(asked.load(Ordering::Relaxed), 1);
+	assert!(!waited.load(Ordering::Relaxed));
+	assert_eq!(started.elapsed(), Duration::ZERO);
+}
+
+/// A root the cache is still listing is waited for, the wait announced once, until the cache
+/// holds it converged.
+#[tokio::test(start_paused = true)]
+async fn a_root_still_being_listed_is_waited_for_until_it_converges() {
+	let asked = AtomicUsize::new(0);
+	let announced = AtomicUsize::new(0);
+	let started = tokio::time::Instant::now();
+
+	let generation = await_convergence(
+		convergence_answers(vec![None, None, Some(9)], &asked),
+		async {
+			announced.fetch_add(1, Ordering::Relaxed);
+			Ok(())
+		},
+		CONVERGENCE_POLL,
+		CONVERGENCE_WAIT,
+		std::future::pending(),
+	)
+	.await
+	.unwrap();
+
+	assert_eq!(generation, Some(9));
+	assert_eq!(asked.load(Ordering::Relaxed), 3);
+	assert_eq!(announced.load(Ordering::Relaxed), 1);
+	assert_eq!(started.elapsed(), CONVERGENCE_POLL * 2);
+}
+
+/// What fails before the wait — the cache refusing the pair's subscription, which would leave
+/// nothing to converge the root — ends it at once, as that error.
+#[tokio::test(start_paused = true)]
+async fn a_failure_before_the_wait_ends_it_at_once() {
+	let asked = AtomicUsize::new(0);
+	let started = tokio::time::Instant::now();
+
+	let failed = await_convergence(
+		convergence_answers(vec![None, Some(1)], &asked),
+		async { Err(Error::custom(ErrorKind::Server, "refused")) },
+		CONVERGENCE_POLL,
+		CONVERGENCE_WAIT,
+		std::future::pending(),
+	)
+	.await
+	.expect_err("the subscription was refused");
+
+	assert_eq!(failed.kind(), ErrorKind::Server);
+	assert_eq!(asked.load(Ordering::Relaxed), 1);
+	assert_eq!(started.elapsed(), Duration::ZERO);
+}
+
+/// A root the cache never converges is given up on once the wait runs out, rather than holding
+/// the pass forever.
+#[tokio::test(start_paused = true)]
+async fn a_root_that_never_converges_is_given_up_on_after_the_wait() {
+	let asked = AtomicUsize::new(0);
+	let started = tokio::time::Instant::now();
+
+	let generation = await_convergence(
+		convergence_answers(Vec::new(), &asked),
+		async { Ok(()) },
+		Duration::from_secs(1),
+		Duration::from_secs(5),
+		std::future::pending(),
+	)
+	.await
+	.unwrap();
+
+	assert_eq!(generation, None);
+	assert_eq!(started.elapsed(), Duration::from_secs(5));
+	assert_eq!(
+		asked.load(Ordering::Relaxed),
+		6,
+		"once, then once a second for five"
+	);
+}
+
+/// A wait given up on ends where it stands, with the none of a wait that ran out.
+#[tokio::test(start_paused = true)]
+async fn a_wait_given_up_on_ends_at_once() {
+	let asked = AtomicUsize::new(0);
+	let started = tokio::time::Instant::now();
+
+	let generation = await_convergence(
+		convergence_answers(Vec::new(), &asked),
+		async { Ok(()) },
+		Duration::from_secs(1),
+		Duration::from_secs(60),
+		tokio::time::sleep(Duration::from_millis(2500)),
+	)
+	.await
+	.unwrap();
+
+	assert_eq!(generation, None);
+	assert_eq!(started.elapsed(), Duration::from_millis(2500));
+	assert_eq!(
+		asked.load(Ordering::Relaxed),
+		3,
+		"once, then at one and two seconds"
+	);
+}
+
+/// Giving up takes nothing from a root already converged: its answer comes first.
+#[tokio::test(start_paused = true)]
+async fn giving_up_does_not_preempt_a_converged_answer() {
+	let asked = AtomicUsize::new(0);
+
+	let generation = await_convergence(
+		convergence_answers(vec![Some(7)], &asked),
+		async { Ok(()) },
+		CONVERGENCE_POLL,
+		CONVERGENCE_WAIT,
+		std::future::ready(()),
+	)
+	.await
+	.unwrap();
+
+	assert_eq!(generation, Some(7));
 }
 
 /// A dry run over a remote root the cache has not finished listing plans nothing: the file the

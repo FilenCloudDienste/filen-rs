@@ -168,7 +168,9 @@ impl WatchHandle {
 	/// open: stopping the watch gives that pass's transfers up (as
 	/// [`cancel_paused_actions`](super::SyncEngine::cancel_paused_actions) would) so it can unwind
 	/// and release the drive-write lock — including a pause that lands after this was called, which
-	/// is the one nobody is left to reverse. The pair itself stays paused.
+	/// is the one nobody is left to reverse. The pair itself stays paused. Nor does a pass waiting
+	/// for the cache to finish listing the pair's remote folder: it ends at once, failed as a wait
+	/// that ran out is.
 	pub async fn stop(self) {
 		let Self {
 			shutdown,
@@ -605,8 +607,8 @@ async fn run_loop(watch: WatchLoop) {
 }
 
 /// Wait for the watch to be stopped, then keep cutting loose a pass PARKED on the pair's
-/// suspension — and never resolve, so this only ever ends the pass it is racing, never the wait for
-/// it.
+/// suspension, or waiting for the cache to finish listing the pair's remote folder — and never
+/// resolve, so this only ever ends the pass it is racing, never the wait for it.
 ///
 /// A suspended pass comes back when the pair is resumed or its actions cancelled; a stopped watch
 /// has nobody left to ask for either, so without this the loop (and [`WatchHandle::stop`], and the
@@ -614,11 +616,13 @@ async fn run_loop(watch: WatchLoop) {
 /// ever if the pause was made with no window at all. Repeated on a `poll` timer rather than done
 /// once, because a pause can land at any moment while the pass runs — including AFTER the stop,
 /// which is exactly when there is nobody left to un-park it. Polled for the same reason
-/// [`wait_while_paused`] is: the alternative is per-pair wakeup plumbing through the engine.
+/// [`wait_while_paused`] is: the alternative is per-pair wakeup plumbing through the engine. A
+/// pass waiting for the listing would otherwise hold the stop for up to the whole wait, 15
+/// minutes; cut loose, it fails as a wait that ran out does.
 async fn unpark_on_stop(engine: &SyncEngine, pair: PairId, stop: &mut Stop, poll: Duration) {
 	stop.ended().await;
 	loop {
-		engine.cancel_suspended_pass(pair).await;
+		engine.cut_loose_pass(pair).await;
 		tokio::time::sleep(poll).await;
 	}
 }

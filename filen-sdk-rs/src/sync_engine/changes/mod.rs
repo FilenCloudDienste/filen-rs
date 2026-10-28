@@ -92,7 +92,7 @@ use notify::{
 	Event, EventKind,
 	event::{AccessKind, AccessMode},
 };
-use tokio::sync::Notify;
+use tokio::sync::{Notify, futures::Notified};
 use uuid::Uuid;
 
 use super::{ignore::FILENIGNORE, scan::normalize_rel_path};
@@ -555,6 +555,10 @@ pub(super) struct PairChanges {
 	/// one: a change event must wait out the backoff, a "sync now" must not. Kept like the
 	/// doorbell, and an `Arc` for the same reason.
 	requested: Arc<Notify>,
+	/// Rung to end a pass's wait for the cache to finish listing the pair's remote folder (see
+	/// [`stop_waiting`](Self::stop_waiting)). Owned here for the same reason as the doorbell: the
+	/// engine rings it without knowing whether a pass is waiting.
+	stop_waiting: Notify,
 }
 
 #[derive(Debug, Default)]
@@ -834,6 +838,20 @@ impl PairChanges {
 	/// backing off after a failed pass.
 	pub(super) fn request(&self) {
 		self.requested.notify_one();
+	}
+
+	/// End every wait in progress of a pass of this pair for the cache to finish listing its remote
+	/// folder (see `SyncEngine::await_remote_view`): rung for a watch being stopped and an engine
+	/// being closed, which leave nobody to wait for. A pass not waiting is left alone, and so is the
+	/// next one to wait: nothing is kept for a wait that starts later.
+	pub(super) fn stop_waiting(&self) {
+		self.stop_waiting.notify_waiters();
+	}
+
+	/// Resolves at the next [`stop_waiting`](Self::stop_waiting) after this was called, whether or
+	/// not it has been polled by then.
+	pub(super) fn waiting_stopped(&self) -> Notified<'_> {
+		self.stop_waiting.notified()
 	}
 
 	/// Take both changelists for a pass — called BEFORE it reads either side (see the module docs

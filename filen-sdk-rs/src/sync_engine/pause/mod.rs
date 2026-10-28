@@ -211,6 +211,22 @@ impl PassGate {
 		})
 	}
 
+	/// Resolves once the pair is paused in either flavour, cancelled or being removed — any state but
+	/// [`Run`](PassControl::Run) — and never for a pass nothing can pause. For work that has nothing
+	/// in flight for a suspension to keep, which [`guard`](Self::guard) would let run on: the wait
+	/// for the cache to finish listing the pair's remote folder.
+	pub(super) async fn halted(&self) {
+		let Some(control) = &self.control else {
+			return std::future::pending().await;
+		};
+		let mut state = control.subscribe();
+		if state.wait_for(|control| control.is_paused()).await.is_err() {
+			// Nobody can change this pass's state any more — impossible while the gate holds a
+			// sender. Never resolve, as `await_change` does not.
+			std::future::pending::<()>().await;
+		}
+	}
+
 	/// Race `work` against a cancel of the pass. `None` means it was DROPPED where it stood, which
 	/// is safe only for work that has left nothing behind when it is dropped part-way — so this
 	/// wraps an action's NETWORK op alone, never the baseline/journal row that records it: a
