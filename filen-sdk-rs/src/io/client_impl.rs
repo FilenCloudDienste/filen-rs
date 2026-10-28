@@ -574,6 +574,54 @@ where
 	Ok(())
 }
 
+/// What lets a download onto a path leave the local file there instead: a file of any other size
+/// is always replaced.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KeepLocalWhen {
+	/// Its blake3 matches the remote's declared hash or, where the remote declares none, its mtime
+	/// is not older than the remote's.
+	SameHashOrNotOlder,
+	/// Its blake3 matches the remote's declared hash; with no declared hash it is replaced. For a
+	/// caller that records the path as holding the remote's bytes afterwards, which an mtime
+	/// cannot vouch for: a same-size remote replacement stamped no newer than the local file
+	/// would otherwise leave the old bytes in place. The sync engine is that caller.
+	#[cfg(feature = "sync-engine")]
+	SameHash,
+}
+
+/// Whether the file at `path` has to be (re)downloaded to hold `size` bytes hashing to `hash`,
+/// stamped `mtime`, under `keep`.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+fn needs_download(
+	path: &Path,
+	size: u64,
+	hash: Option<Blake3Hash>,
+	mtime: chrono::DateTime<chrono::Utc>,
+	keep: KeepLocalWhen,
+) -> std::io::Result<bool> {
+	let file = match std::fs::File::open(path) {
+		Ok(f) => f,
+		Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+		Err(e) => return Err(e),
+	};
+	let meta = file.metadata()?;
+	if FilenMetaExt::size(&meta) != size {
+		return Ok(true);
+	}
+	match (hash, keep) {
+		(Some(expected_hash), _) => {
+			let mut hasher = blake3::Hasher::new();
+			hasher.update_reader(&file)?;
+			let computed_hash: Blake3Hash = hasher.finalize().into();
+			Ok(computed_hash != expected_hash)
+		}
+		(None, KeepLocalWhen::SameHashOrNotOlder) => Ok(FilenMetaExt::modified(&meta) < mtime),
+		#[cfg(feature = "sync-engine")]
+		(None, KeepLocalWhen::SameHash) => Ok(true),
+	}
+}
+
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 #[tracing::instrument(level = "debug", name = "download_file", skip_all)]
 pub(crate) async fn inner_download_to_path_with_hash_check<SC>(
@@ -581,6 +629,7 @@ pub(crate) async fn inner_download_to_path_with_hash_check<SC>(
 	remote_file: &dyn File,
 	path: CanonicalPath,
 	callback: Option<MaybeSendCallback<'_, u64>>,
+	keep: KeepLocalWhen,
 ) -> (Result<(), Error>, CanonicalPath)
 where
 	SC: SharedClient,
@@ -590,38 +639,11 @@ where
 	let mtime = remote_file
 		.last_modified()
 		.unwrap_or_else(|| remote_file.timestamp());
-	let (need_download, path) =
-		tokio::task::spawn_blocking(move || -> (Result<bool, std::io::Error>, CanonicalPath) {
-			let file = match std::fs::File::open(&path) {
-				Ok(f) => f,
-				Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (Ok(true), path),
-				Err(e) => return (Err(e), path),
-			};
-			let meta = match file.metadata() {
-				Ok(m) => m,
-				Err(e) => return (Err(e), path),
-			};
-
-			if FilenMetaExt::size(&meta) != size {
-				return (Ok(true), path);
-			}
-
-			if let Some(expected_hash) = hash {
-				let mut hasher = blake3::Hasher::new();
-				match hasher.update_reader(&file) {
-					Ok(_) => {}
-					Err(e) => return (Err(e), path),
-				};
-				let computed_hash: Blake3Hash = hasher.finalize().into();
-				(Ok(computed_hash != expected_hash), path)
-			} else {
-				// fallback to mtime check
-				let local_mtime = FilenMetaExt::modified(&meta);
-				(Ok(local_mtime < mtime), path)
-			}
-		})
-		.await
-		.unwrap();
+	let (need_download, path) = tokio::task::spawn_blocking(move || {
+		(needs_download(path.as_ref(), size, hash, mtime, keep), path)
+	})
+	.await
+	.unwrap();
 	let need_download = match need_download {
 		Ok(v) => v,
 		Err(e) => return (Err(e.into()), path),
@@ -633,6 +655,35 @@ where
 	} else {
 		(Ok(()), path)
 	}
+}
+
+/// Downloads `remote_file` to `path` unless the file already there is the same, judged by `keep`.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+pub(crate) async fn download_to_path<'b, SC>(
+	client: &'b SC,
+	remote_file: &'b dyn File,
+	path: &Path,
+	callback: Option<MaybeSendCallback<'b, u64>>,
+	keep: KeepLocalWhen,
+) -> Result<(), Error>
+where
+	SC: SharedClient,
+{
+	let (res, _path) = inner_download_to_path_with_hash_check(
+		client,
+		remote_file,
+		CanonicalPath::new(path).map_err(|e| {
+			Error::custom_with_source(
+				ErrorKind::IO,
+				e,
+				Some(format!("Failed to canonicalize path: {}", path.display())),
+			)
+		})?,
+		callback,
+		keep,
+	)
+	.await;
+	res
 }
 
 /// A reader over bytes `start..end` of `file`, and the throttled progress it reports to
@@ -756,20 +807,14 @@ where
 		path: &Path,
 		callback: Option<MaybeSendCallback<'b, u64>>,
 	) -> Result<(), Error> {
-		let (res, _path) = inner_download_to_path_with_hash_check(
+		download_to_path(
 			self,
 			remote_file,
-			CanonicalPath::new(path).map_err(|e| {
-				Error::custom_with_source(
-					ErrorKind::IO,
-					e,
-					Some(format!("Failed to canonicalize path: {}", path.display())),
-				)
-			})?,
+			path,
 			callback,
+			KeepLocalWhen::SameHashOrNotOlder,
 		)
-		.await;
-		res
+		.await
 	}
 }
 
@@ -1153,5 +1198,87 @@ mod path_transfer_tests {
 		);
 
 		assert!(peak < 64 * 1024, "the waiting download held {peak} bytes");
+	}
+}
+
+#[cfg(all(test, not(all(target_family = "wasm", target_os = "unknown"))))]
+mod needs_download_tests {
+	use std::{
+		fs::FileTimes,
+		path::{Path, PathBuf},
+		time::{Duration, SystemTime},
+	};
+
+	use chrono::{DateTime, Utc};
+	use filen_types::crypto::Blake3Hash;
+	use tempfile::TempDir;
+
+	use super::{KeepLocalWhen, needs_download};
+
+	const CONTENTS: &[u8] = b"local bytes";
+
+	fn remote_stamp() -> DateTime<Utc> {
+		DateTime::from_timestamp(1_700_000_000, 0).unwrap()
+	}
+
+	/// A file holding [`CONTENTS`], stamped a minute after [`remote_stamp`].
+	fn newer_local_file() -> (TempDir, PathBuf) {
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().join("a.txt");
+		std::fs::write(&path, CONTENTS).unwrap();
+		let newer = SystemTime::from(remote_stamp()) + Duration::from_secs(60);
+		std::fs::File::options()
+			.write(true)
+			.open(&path)
+			.unwrap()
+			.set_times(FileTimes::new().set_modified(newer))
+			.unwrap();
+		(dir, path)
+	}
+
+	fn len() -> u64 {
+		u64::try_from(CONTENTS.len()).unwrap()
+	}
+
+	fn check(path: &Path, hash: Option<Blake3Hash>, keep: KeepLocalWhen) -> bool {
+		needs_download(path, len(), hash, remote_stamp(), keep).unwrap()
+	}
+
+	#[test]
+	fn a_hashless_remote_of_the_same_size_keeps_a_newer_local_file_on_mtime() {
+		let (_dir, path) = newer_local_file();
+		assert!(!check(&path, None, KeepLocalWhen::SameHashOrNotOlder));
+	}
+
+	#[cfg(feature = "sync-engine")]
+	#[test]
+	fn a_hashless_remote_of_the_same_size_replaces_a_newer_local_file_when_only_a_hash_may_keep_it()
+	{
+		let (_dir, path) = newer_local_file();
+		assert!(check(&path, None, KeepLocalWhen::SameHash));
+	}
+
+	#[test]
+	fn a_remote_declaring_the_local_files_hash_keeps_it() {
+		let (_dir, path) = newer_local_file();
+		let hash = Blake3Hash::from(blake3::hash(CONTENTS));
+		assert!(!check(&path, Some(hash), KeepLocalWhen::SameHashOrNotOlder));
+	}
+
+	#[test]
+	fn a_remote_declaring_another_hash_replaces_the_local_file() {
+		let (_dir, path) = newer_local_file();
+		let hash = Blake3Hash::from(blake3::hash(b"other bytes"));
+		assert!(check(&path, Some(hash), KeepLocalWhen::SameHashOrNotOlder));
+	}
+
+	#[test]
+	fn a_missing_local_file_is_downloaded() {
+		let dir = tempfile::tempdir().unwrap();
+		assert!(check(
+			&dir.path().join("absent"),
+			None,
+			KeepLocalWhen::SameHashOrNotOlder
+		));
 	}
 }

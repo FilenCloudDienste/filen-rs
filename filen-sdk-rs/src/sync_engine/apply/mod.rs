@@ -67,7 +67,10 @@ use crate::{
 		file::{FileBuilderOptionalName, meta::FileMetaChanges},
 		name::ValidatedName,
 	},
-	io::{RemoteDirectory, RemoteFile, client_impl::IoSharedClientExt},
+	io::{
+		RemoteDirectory, RemoteFile,
+		client_impl::{KeepLocalWhen, download_to_path},
+	},
 	sync::lock::{ATTEMPTS_DEFAULT, ResourceLock, confirm_or_retake},
 	util::{MaybeArc, MaybeSendCallback},
 };
@@ -2819,9 +2822,14 @@ async fn apply_transfer(
 			};
 			let base = base.as_deref().or(written.as_ref());
 			let stashed = stash_local_target(ctx.local_root, rel_path, base, ctx.bin_day).await?;
+			// Keep what is at the path only when its hash matches the remote's: the row written
+			// below records the path as holding the remote's bytes, and an mtime no older than the
+			// remote's says nothing of that — a same-size remote replacement stamped no newer than
+			// the local copy would leave the old bytes there, recorded as synced.
 			let Some(downloaded) = ctx
 				.gate
-				.guard(ctx.client.download_file_to_path(
+				.guard(download_to_path(
+					ctx.client,
 					&remote_file,
 					&path,
 					Some(progress_callback(
@@ -2830,6 +2838,7 @@ async fn apply_transfer(
 						TransferDirection::Download,
 						remote.as_deref().map_or(0, |node| node.size),
 					)),
+					KeepLocalWhen::SameHash,
 				))
 				.await
 			else {

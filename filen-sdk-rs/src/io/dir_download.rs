@@ -11,9 +11,11 @@ use crate::{
 	error::{ErrorExt, ResultExt},
 	fs::categories::{Category, DirType, NonRootItemType, fs::CategoryFSExt},
 	io::{
-		CanonicalPath, abort_on_drop::AbortOnDropHandle,
-		client_impl::inner_download_to_path_with_hash_check,
-		fs_tree::build_fs_tree_from_remote_iterator, meta_ext::DirTimesExt,
+		CanonicalPath,
+		abort_on_drop::AbortOnDropHandle,
+		client_impl::{KeepLocalWhen, inner_download_to_path_with_hash_check},
+		fs_tree::build_fs_tree_from_remote_iterator,
+		meta_ext::DirTimesExt,
 	},
 };
 
@@ -64,6 +66,7 @@ pub(crate) trait CategoryDirDownloadExt: CategoryFSExt {
 				Some(Arc::new(|bytes| {
 					downloaded_bytes.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
 				})),
+				KeepLocalWhen::SameHashOrNotOlder,
 			)
 			.await;
 
