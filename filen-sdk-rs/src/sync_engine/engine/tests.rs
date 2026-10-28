@@ -25,7 +25,7 @@ use crate::{
 		},
 		changes::tests::{cacheable_dir, cacheable_file},
 		derive::Derived,
-		ignore::IgnoreRules,
+		ignore::{FILENIGNORE, IgnoreRules},
 		plan::{
 			RemoteNode,
 			test_support::{first_dir_deletion, folded},
@@ -8047,25 +8047,23 @@ async fn a_dry_run_plans_nothing_against_a_remote_root_the_cache_has_not_converg
 /// The remote root's `.filenignore` in [`dry_run_over_a_remote_rule_file`]'s cache.
 const REMOTE_RULE_FILE: Uuid = Uuid::from_u128(3);
 
-/// A dry run of a pair in `mode` over a local tree holding `a.tmp`, `b.txt` and `local` (paths
-/// and contents), whose remote root holds a `.filenignore` reading `*.tmp` and nothing else,
-/// with `rows` for its baseline. Offline: the remote is the cache's rows, and the rule file's
-/// body is handed over as the one the pair's last pass read, so no server is asked for it.
-/// Answers the paths the pass ignores, each with its deciding line, and how many stage numbers
-/// the read took: the snapshot's, the plan's, one per walk of the tree, and the confirmation's
-/// where a row awaits one.
-async fn dry_run_over_a_remote_rule_file(
+/// A dry run of a pair in `mode`, offline: the local tree is `local` (paths and contents), the
+/// remote root holds the files `remote` names, `rule_body` is the body of the one among them that
+/// is [`REMOTE_RULE_FILE`], handed over as the one the pair's last pass read so no server is asked
+/// for it, and `rows` are the baseline. Answers the outcome, and how many stage numbers the read
+/// took: the snapshot's, the plan's, one per walk of the tree, and the confirmation's where a row
+/// awaits one.
+async fn offline_dry_run(
 	mode: SyncMode,
-	local: &[(&str, &str)],
+	local: &[(&str, &[u8])],
+	remote: &[(Uuid, &str)],
+	rule_body: Option<&str>,
 	rows: &[BaselineEntry],
-) -> (Vec<(String, String)>, u64) {
+) -> (PlanOutcome, u64) {
 	let dir = tempfile::tempdir().unwrap();
 	let root = dir.path().join("local");
 	std::fs::create_dir(&root).unwrap();
-	for (path, contents) in [("a.tmp", "scratch"), ("b.txt", "kept")]
-		.iter()
-		.chain(local)
-	{
+	for (path, contents) in local {
 		std::fs::write(root.join(path), contents).unwrap();
 	}
 	let account = Uuid::from_u128(1);
@@ -8075,16 +8073,11 @@ async fn dry_run_over_a_remote_rule_file(
 	state
 		.upsert_dirs([&cacheable_dir(remote_root, account, "pair")].into_iter())
 		.unwrap();
-	state
-		.upsert_files(
-			[&cacheable_file(
-				REMOTE_RULE_FILE,
-				remote_root,
-				".filenignore",
-			)]
-			.into_iter(),
-		)
-		.unwrap();
+	let files: Vec<_> = remote
+		.iter()
+		.map(|(uuid, name)| cacheable_file(*uuid, remote_root, name))
+		.collect();
+	state.upsert_files(files.iter()).unwrap();
 	state.add_converged_roots(&[remote_root]).unwrap();
 	let client = Arc::new(offline_client());
 	client.configure_cache(cache, |_| {}).await.unwrap();
@@ -8097,21 +8090,52 @@ async fn dry_run_over_a_remote_rule_file(
 	let store = engine.pair_store(pair).await.unwrap();
 	let changes: Vec<BaselineChange<'_>> = rows.iter().map(BaselineChange::Upsert).collect();
 	locked(&store).apply_changes(pair, &changes).unwrap();
-	engine.remote_rule_bodies.lock().await.insert(
-		pair,
-		HashMap::from([(REMOTE_RULE_FILE, Arc::from("*.tmp\n"))]),
-	);
+	if let Some(body) = rule_body {
+		engine
+			.remote_rule_bodies
+			.lock()
+			.await
+			.insert(pair, HashMap::from([(REMOTE_RULE_FILE, Arc::from(body))]));
+	}
 
 	let before = engine.stages.load(Ordering::Relaxed);
 	let outcome = engine.plan_pair(pair).await.unwrap();
 	let stages = engine.stages.load(Ordering::Relaxed) - before;
 	drop((engine, store, state));
-	let ignored = outcome
+	(outcome, stages)
+}
+
+/// The ignored paths of `outcome`, each with its deciding line.
+fn ignored_lines(outcome: PlanOutcome) -> Vec<(String, String)> {
+	outcome
 		.ignored
 		.into_iter()
 		.map(|ignored| (ignored.rel_path, ignored.pattern))
+		.collect()
+}
+
+/// An [`offline_dry_run`] over a local tree holding `a.tmp`, `b.txt` and `local`, whose remote
+/// root holds a `.filenignore` reading `*.tmp` and nothing else. Answers the paths the pass ignores,
+/// each with its deciding line, and the stage numbers the read took.
+async fn dry_run_over_a_remote_rule_file(
+	mode: SyncMode,
+	local: &[(&str, &str)],
+	rows: &[BaselineEntry],
+) -> (Vec<(String, String)>, u64) {
+	let local: Vec<(&str, &[u8])> = [("a.tmp", "scratch"), ("b.txt", "kept")]
+		.iter()
+		.chain(local)
+		.map(|(path, contents)| (*path, contents.as_bytes()))
 		.collect();
-	(ignored, stages)
+	let (outcome, stages) = offline_dry_run(
+		mode,
+		&local,
+		&[(REMOTE_RULE_FILE, FILENIGNORE)],
+		Some("*.tmp\n"),
+		rows,
+	)
+	.await;
+	(ignored_lines(outcome), stages)
 }
 
 /// A two-way pair whose only `.filenignore` is the remote's walks its tree with that file's
@@ -8153,6 +8177,161 @@ async fn a_walk_with_its_rule_file_on_disk_walks_the_tree_once() {
 		dry_run_over_a_remote_rule_file(SyncMode::TwoWay, &[(".filenignore", "b.*\n")], &[]).await;
 	assert_eq!(ignored, vec![("b.txt".to_owned(), "b.*".to_owned())]);
 	assert_eq!(stages, 3, "the snapshot, the plan and one walk");
+}
+
+/// The rules a migrated `excludeDotFiles` pair is given at its local root.
+const DOT_FILES_RULES: &str = ".*\n!/.filenignore\n";
+
+/// An [`offline_dry_run`] over a local tree of `local`, whose remote root holds `.env` and `a.txt`,
+/// plus a `.filenignore` reading `remote_rules` where that is set. Answers the planned actions and
+/// the ignored paths, each as a path and what was planned or which line hid it.
+async fn dry_run_with_local_root_rules(
+	mode: SyncMode,
+	local: &[(&str, &[u8])],
+	remote_rules: Option<&str>,
+	rows: &[BaselineEntry],
+) -> (Vec<String>, Vec<(String, String)>) {
+	let mut remote = vec![
+		(Uuid::from_u128(10), ".env"),
+		(Uuid::from_u128(11), "a.txt"),
+	];
+	if remote_rules.is_some() {
+		remote.push((REMOTE_RULE_FILE, FILENIGNORE));
+	}
+	let (outcome, _) = offline_dry_run(mode, local, &remote, remote_rules, rows).await;
+	assert_eq!(outcome.refused, None);
+	let actions = outcome
+		.actions
+		.iter()
+		.chain(&outcome.held)
+		.map(ToString::to_string)
+		.collect();
+	(actions, ignored_lines(outcome))
+}
+
+/// A pair that only pulls honours the local root `.filenignore` the remote does not hold: the dot
+/// files it names stay on the remote, and the file itself is local configuration — a mirror does
+/// not bin it as an extra, and nothing uploads it.
+#[tokio::test]
+async fn a_pull_only_pair_honours_a_local_root_rule_file_the_remote_lacks() {
+	for mode in [SyncMode::RemoteToLocal, SyncMode::RemoteBackup] {
+		let (actions, ignored) = dry_run_with_local_root_rules(
+			mode,
+			&[(FILENIGNORE, DOT_FILES_RULES.as_bytes())],
+			None,
+			&[],
+		)
+		.await;
+		assert_eq!(actions, vec![r#"download file "a.txt""#], "{mode:?}");
+		assert_eq!(
+			ignored,
+			vec![(".env".to_owned(), ".*".to_owned())],
+			"{mode:?}"
+		);
+	}
+}
+
+/// Where the remote holds a root `.filenignore` too, both apply, the local one's lines deciding
+/// first, and the remote one is not downloaded over the local one.
+#[tokio::test]
+async fn a_pull_only_pair_keeps_its_local_root_rule_file_beside_the_remote_one() {
+	for mode in [SyncMode::RemoteToLocal, SyncMode::RemoteBackup] {
+		let (actions, ignored) = dry_run_with_local_root_rules(
+			mode,
+			&[(FILENIGNORE, DOT_FILES_RULES.as_bytes())],
+			Some("a.*\n!.env\n"),
+			&[],
+		)
+		.await;
+		assert_eq!(actions, Vec::<String>::new(), "{mode:?}");
+		assert_eq!(
+			ignored,
+			vec![
+				(".env".to_owned(), ".*".to_owned()),
+				("a.txt".to_owned(), "a.*".to_owned()),
+			],
+			"{mode:?}"
+		);
+	}
+}
+
+/// A root `.filenignore` no row records that holds exactly the remote one's bytes — a pair migrated
+/// from filen-sync, or removed and added again — is the remote file's copy, not local
+/// configuration: it syncs as an ordinary file both sides hold, so a later edit of the remote rules
+/// reaches it. Here the fixture's remote file is hashless and of another size, so no evidence
+/// seeds a row and the remote copy is pulled over the local one.
+#[tokio::test]
+async fn a_pull_only_pair_syncs_an_unrecorded_root_rule_file_identical_to_the_remote_one() {
+	for mode in [SyncMode::RemoteToLocal, SyncMode::RemoteBackup] {
+		let (actions, ignored) = dry_run_with_local_root_rules(
+			mode,
+			&[(FILENIGNORE, DOT_FILES_RULES.as_bytes())],
+			Some(DOT_FILES_RULES),
+			&[],
+		)
+		.await;
+		assert_eq!(
+			actions,
+			vec![
+				r#"download file ".filenignore""#,
+				r#"download file "a.txt""#
+			],
+			"{mode:?}"
+		);
+		assert_eq!(
+			ignored,
+			vec![(".env".to_owned(), ".*".to_owned())],
+			"{mode:?}"
+		);
+	}
+}
+
+/// A root `.filenignore` a row records is the synced copy of the remote's, as before: the remote
+/// copy's rules apply, and the copy on disk is no local configuration.
+#[tokio::test]
+async fn a_synced_root_rule_file_stays_the_remote_copy_in_a_pull_only_pair() {
+	let synced = synced_file(FILENIGNORE, REMOTE_RULE_FILE, Blake3Hash::from([1; 32]), 6);
+	let (actions, ignored) = dry_run_with_local_root_rules(
+		SyncMode::RemoteBackup,
+		&[(FILENIGNORE, DOT_FILES_RULES.as_bytes())],
+		Some("a.*\n"),
+		&[synced],
+	)
+	.await;
+	assert!(
+		actions.contains(&r#"download file ".env""#.to_owned()),
+		"{actions:?}"
+	);
+	assert_eq!(ignored, vec![("a.txt".to_owned(), "a.*".to_owned())]);
+}
+
+/// A pair switched to a mode that pushes reads the same file as its root rule file, and uploads it
+/// as an ordinary file.
+#[tokio::test]
+async fn a_pair_that_pushes_uploads_the_local_root_rule_file() {
+	let (actions, ignored) = dry_run_with_local_root_rules(
+		SyncMode::TwoWay,
+		&[(FILENIGNORE, DOT_FILES_RULES.as_bytes())],
+		None,
+		&[],
+	)
+	.await;
+	assert_eq!(
+		actions,
+		vec![r#"upload file ".filenignore""#, r#"download file "a.txt""#]
+	);
+	assert_eq!(ignored, vec![(".env".to_owned(), ".*".to_owned())]);
+}
+
+/// A local root rule file a pull-only pair cannot use blocks the whole tree, as any root rule file
+/// does: nothing is pulled past rules that could not be read, and the file is not binned.
+#[tokio::test]
+async fn an_unusable_local_root_rule_file_blocks_a_pull_only_pair() {
+	for mode in [SyncMode::RemoteToLocal, SyncMode::RemoteBackup] {
+		let (actions, _) =
+			dry_run_with_local_root_rules(mode, &[(FILENIGNORE, b".*\n\xff\n")], None, &[]).await;
+		assert_eq!(actions, Vec::<String>::new(), "{mode:?}");
+	}
 }
 
 /// The stamp a hashless remote file and its local copy share to the millisecond.

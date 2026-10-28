@@ -1491,19 +1491,8 @@ fn prepare_scoped(
 	// which is why this function takes a mode: both answers are measured rather than one being read
 	// off the other. It reads the baseline's rule-file index instead of iterating every row, so
 	// the row it records is O(rule files) and not a tree scan.
-	let (rule_files, elapsed) = timed(|| {
-		if mode.pushes() {
-			RuleFiles::Read
-		} else {
-			RuleFiles::Only(
-				baseline
-					.rule_file_rows()
-					.filter(|rel_path| !view.nodes.of(&baseline).holds(rel_path))
-					.filter_map(|rel_path| rule_file_dir(&rel_path).map(str::to_owned))
-					.collect(),
-			)
-		}
-	});
+	let (rule_files, elapsed) =
+		timed(|| RuleFiles::for_pass(mode, &baseline, &view, remote_rules.root_body.as_ref()));
 	costs.push(
 		"rule_files_only",
 		elapsed,

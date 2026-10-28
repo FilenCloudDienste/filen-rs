@@ -37,7 +37,7 @@ use std::{
 	ops::ControlFlow,
 	path::{Component, Path, PathBuf},
 	sync::{
-		Mutex,
+		Arc, Mutex,
 		atomic::{AtomicBool, Ordering},
 		mpsc,
 	},
@@ -50,13 +50,15 @@ use unicode_normalization::{UnicodeNormalization, is_nfc};
 use uuid::Uuid;
 
 use super::{
+	SyncMode,
 	baseline::{BaselineEntry, NodeKind},
 	ignore::{
 		FILENIGNORE, IgnoreDecision, IgnoreParseError, IgnoreRules, IgnoreSource,
-		MAX_RULE_FILE_BYTES, Origin, rule_file_text,
+		MAX_RULE_FILE_BYTES, Origin, rule_file_dir, rule_file_text,
 	},
+	plan::RemoteView,
 	rows::{Baseline, Cursor},
-	side::Side,
+	side::{NodesAt, Side},
 	stage::{Paging, Stage, StageSink},
 	walk::{self, Walk, WalkError},
 };
@@ -616,19 +618,97 @@ pub(super) fn fast_path_hash(
 pub(crate) enum RuleFiles {
 	/// Read each accepted directory's file, replacing any rules already given for it.
 	Read,
-	/// Read only the files of these root-relative directories (`""` is the root) and leave the rest
-	/// alone: the rules come from somewhere else (the remote copies, when the remote is the source of
-	/// truth).
-	Only(BTreeSet<String>),
+	/// What a mode that only pulls reads: the rules come from the remote copies, so only these files
+	/// are read and the rest left alone.
+	Only {
+		/// The root-relative directories (`""` is the root) of the synced rule files the remote has
+		/// lost: each is read in place of the remote copy, replacing any rules given for it.
+		synced: BTreeSet<String>,
+		/// Set while no baseline row records the pair root's file, so never together with `""` in
+		/// `synced`: that file, where there is one, is read as local configuration (see
+		/// [`IgnoreRules::insert_local_root`]) unless it is a copy of the remote root file.
+		local_root: Option<UnrecordedRoot>,
+	},
+}
+
+/// The pair root's `.filenignore` in a pass that only pulls, while no baseline row records it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UnrecordedRoot {
+	/// The body of the remote root `.filenignore` the pass read, if it read one. A file on disk
+	/// holding exactly these bytes is that file's copy — what a pair migrated from filen-sync, or
+	/// removed and added again, holds — so it is synced as one and is no local configuration:
+	/// otherwise it would hide the remote file for good, and a later remote edit of the rules would
+	/// never reach this device.
+	pub(crate) remote_copy: Option<Arc<str>>,
 }
 
 impl RuleFiles {
+	/// What a pass in `mode` reads on disk, with `baseline` its rows and `remote` the view its
+	/// remote rules were read from.
+	///
+	/// A mode that pushes reads every `.filenignore` on disk, over any remote copy read for the same
+	/// directory. A mode that pulls alone reads on disk only the synced ones the remote has lost:
+	/// they govern until that loss propagates, so a directory trashed on the remote keeps what they
+	/// hide here. It also reads the pair root's file as local configuration while no row records it,
+	/// so a rule a device keeps for itself applies without the remote holding it, unless the file is
+	/// a copy of `remote_root`, the body of the remote root file this pass read.
+	pub(super) fn for_pass(
+		mode: SyncMode,
+		baseline: &Baseline,
+		remote: &RemoteView,
+		remote_root: Option<&Arc<str>>,
+	) -> Self {
+		if mode.pushes() {
+			return Self::Read;
+		}
+		Self::Only {
+			synced: baseline
+				.rule_file_rows()
+				.filter(|rel_path| !remote.nodes.of(baseline).holds(rel_path))
+				.filter_map(|rel_path| rule_file_dir(&rel_path).map(str::to_owned))
+				.collect(),
+			local_root: (!baseline.contains_key(FILENIGNORE)).then(|| UnrecordedRoot {
+				remote_copy: remote_root.map(Arc::clone),
+			}),
+		}
+	}
+
 	pub(super) fn reads(&self, dir: &str) -> bool {
 		match self {
 			Self::Read => true,
-			Self::Only(dirs) => dirs.contains(dir),
+			Self::Only { synced, local_root } => {
+				synced.contains(dir) || (local_root.is_some() && dir.is_empty())
+			}
 		}
 	}
+
+	/// How `dir`'s file, reading `text`, joins the rules.
+	fn reads_as(&self, dir: &str, text: &str) -> ReadAs {
+		match self {
+			Self::Only {
+				local_root: Some(root),
+				..
+			} if dir.is_empty() => {
+				if root.remote_copy.as_deref() == Some(text) {
+					ReadAs::RemoteCopy
+				} else {
+					ReadAs::LocalRoot
+				}
+			}
+			Self::Read | Self::Only { .. } => ReadAs::Own,
+		}
+	}
+}
+
+/// How [`load_rule_file`] reads a file [`RuleFiles::reads`].
+enum ReadAs {
+	/// As its directory's own rules, replacing any given for it.
+	Own,
+	/// As the local root file (see [`IgnoreRules::insert_local_root`]).
+	LocalRoot,
+	/// Not at all: it is a copy of the remote root file, whose rules already joined (and whose bad
+	/// lines were already reported). It stays an ordinary item, which the pass records as synced.
+	RemoteCopy,
 }
 
 /// The metadata of the `.filenignore` in `dir_path`, if a FILE by exactly that name is there.
@@ -652,14 +732,17 @@ pub(crate) fn rule_file_metadata(dir_path: &Path) -> std::io::Result<Option<std:
 	Ok(None)
 }
 
-/// Loads the `.filenignore` of the root-relative directory `dir` at `dir_path` into `rules`. No such
-/// file is no rules. A file that cannot be read, that the remote side would refuse (see
-/// [`rule_file_text`]) or that does not compile at all blocks `dir`: guessing could push what the
-/// user meant to hide. A bad line is only reported.
+/// Loads the `.filenignore` of the root-relative directory `dir` at `dir_path` into `rules`, as the
+/// local root file where `rule_files` says so, and not at all where it is a copy of the remote root
+/// file (see [`UnrecordedRoot`]). No such file is no rules. A file that cannot be read,
+/// that the remote side would refuse (see [`rule_file_text`]) or that does not compile at all
+/// blocks `dir`: guessing could push what the user meant to hide, or pull what they meant to keep
+/// out. A bad line is only reported.
 pub(super) fn load_rule_file(
 	root: &Path,
 	dir: &str,
 	dir_path: &Path,
+	rule_files: &RuleFiles,
 	rules: &mut IgnoreRules,
 	blocked: &mut BTreeSet<String>,
 	errors: &mut Vec<ScanError>,
@@ -705,9 +788,18 @@ pub(super) fn load_rule_file(
 			return;
 		}
 	};
+	let as_local_root = match rule_files.reads_as(dir, &text) {
+		ReadAs::Own => false,
+		ReadAs::LocalRoot => true,
+		ReadAs::RemoteCopy => return,
+	};
 	match IgnoreSource::parse(&text, Origin::File { dir }) {
 		Ok((source, line_errors)) => {
-			rules.insert_file(dir.to_owned(), source);
+			if as_local_root {
+				rules.insert_local_root(source);
+			} else {
+				rules.insert_file(dir.to_owned(), source);
+			}
 			for error in line_errors {
 				record(errors, root, ScanError::IgnoreRules(error));
 			}
@@ -1306,6 +1398,7 @@ fn scan_local_watched<S: ScanSink>(
 			root,
 			"",
 			root,
+			rule_files,
 			&mut rules,
 			&mut ignore_blocked,
 			&mut rule_errors,
@@ -1457,6 +1550,7 @@ fn scan_local_watched<S: ScanSink>(
 					root,
 					rel_path,
 					entry.path(),
+					rule_files,
 					&mut rules,
 					&mut ignore_blocked,
 					&mut rule_errors,

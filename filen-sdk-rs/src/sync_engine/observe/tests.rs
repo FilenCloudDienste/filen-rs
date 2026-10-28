@@ -5,7 +5,7 @@ use super::super::{derive::from_baseline, side::NodesAt};
 use uuid::Uuid;
 
 use super::*;
-use crate::alloc_meter;
+use crate::{alloc_meter, sync_engine::scan::UnrecordedRoot};
 
 fn temp_root() -> std::path::PathBuf {
 	let dir = std::env::temp_dir().join(format!("filen_observe_test_{}", Uuid::new_v4()));
@@ -218,6 +218,47 @@ fn the_rules_in_force_at_depth_are_the_ancestors_own_rule_files() {
 	};
 	assert!(node.content_hash.is_some(), "a present file is hashed");
 	assert!(name_rejection.is_none());
+
+	fs::remove_dir_all(&root).ok();
+}
+
+/// A pair that only pulls reads its local root file in a change-scoped pass as a whole one does:
+/// its rules decide the dirty paths, and the file itself is no item of the observation.
+#[test]
+fn a_pulling_pairs_local_root_rule_file_decides_a_scoped_observation() {
+	let root = temp_root();
+	fs::write(root.join(FILENIGNORE), ".*\n!/.filenignore\n").unwrap();
+	fs::write(root.join(".env"), b"e").unwrap();
+	fs::write(root.join("a.txt"), b"a").unwrap();
+	let dirty: BTreeSet<String> = [".env", "a.txt"].map(str::to_owned).into();
+	let rule_files = RuleFiles::Only {
+		synced: BTreeSet::new(),
+		local_root: Some(UnrecordedRoot { remote_copy: None }),
+	};
+
+	let (out, rules) = observe_local(
+		&root,
+		PairRoot::Directory,
+		&Baseline::default(),
+		IgnoreRules::default(),
+		&rule_files,
+		&dirty,
+	)
+	.expect("a dirty set the caps narrow a pass to");
+
+	assert!(out.complete, "{:?}", out.errors);
+	let LocalObservation::Hidden(decision) = &out.observed[".env"] else {
+		panic!("{:?}", out.observed);
+	};
+	assert_eq!(decision.pattern, ".*");
+	assert!(matches!(
+		out.observed["a.txt"],
+		LocalObservation::File { .. }
+	));
+	assert!(
+		rules.decide(FILENIGNORE, false).is_some(),
+		"the file keeps itself out"
+	);
 
 	fs::remove_dir_all(&root).ok();
 }

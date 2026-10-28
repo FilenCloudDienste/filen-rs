@@ -1,12 +1,20 @@
 //! `.filenignore` rules: gitignore(5) syntax and precedence, evaluated against root-relative paths.
 //!
 //! Sources, highest precedence first: the `.filenignore` in the item's own directory, the
-//! shallower `.filenignore` files up to the pair root, the device-wide user level, then
+//! shallower `.filenignore` files up to the pair root (where a pair that only pulls reads its local
+//! root file before the remote one, see below), the device-wide user level, then
 //! [`DEFAULT_IGNORE_PATTERNS`]. Within one source the last matching line decides. The engine's
 //! own internals (the quarantine directory, partial downloads, the watch staging filter),
 //! filen-sync's trash folder (`LEGACY_TRASH_DIR`, at any depth) and, in a pair rooted at the drive,
 //! the account's data directory (`ACCOUNT_DATA_DIR`) are not patterns and stay outside every
 //! level.
+//!
+//! A pair that only pulls takes its `.filenignore` files from the remote, and can also hold a
+//! LOCAL root file (see [`IgnoreRules::insert_local_root`]): the pair root's `.filenignore` on disk
+//! when no baseline row says it was synced and its bytes differ from the remote root file's (an
+//! identical one is that file's copy, synced as such). It is read at the root level, before the remote root
+//! file — as if its lines followed that file's — so it sits below every nested file and above the
+//! remote root file, the user level and the defaults.
 //!
 //! Every line is NFC-normalised, because every engine path is NFC, and patterns match
 //! case-insensitively, because the server dedups names that way. Both the pattern and the path are
@@ -123,7 +131,10 @@ pub enum IgnoreLevel {
 	Default,
 	/// The device-wide user patterns.
 	User,
-	/// The `.filenignore` in this root-relative directory (`""` is the pair root).
+	/// The `.filenignore` in this root-relative directory (`""` is the pair root). In a pair that
+	/// only pulls, `""` also stands for the pair root's file on disk that no pass has synced and
+	/// that differs from the remote root file, which such a pair reads as local configuration beside
+	/// the remote root file.
 	File { dir: String },
 }
 
@@ -283,6 +294,8 @@ pub(crate) struct IgnoreRules {
 	user: Option<IgnoreSource>,
 	/// Keyed by root-relative directory, `""` for the pair root.
 	files: HashMap<String, IgnoreSource>,
+	/// The local root file of a pair that only pulls (see [`Self::insert_local_root`]).
+	local_root: Option<IgnoreSource>,
 }
 
 impl IgnoreRules {
@@ -290,12 +303,13 @@ impl IgnoreRules {
 		Self {
 			user,
 			files: HashMap::new(),
+			local_root: None,
 		}
 	}
 
 	/// Whether any `.filenignore` has joined the user's rules.
 	pub(crate) fn has_files(&self) -> bool {
-		!self.files.is_empty()
+		!self.files.is_empty() || self.local_root.is_some()
 	}
 
 	/// Adds the `.filenignore` of `dir`, replacing any earlier one.
@@ -303,11 +317,46 @@ impl IgnoreRules {
 		self.files.insert(dir, source);
 	}
 
+	/// Adds the pair root's `.filenignore` on disk as LOCAL configuration of a pair that only pulls,
+	/// beside any remote root file rather than in its place. The caller adds it only while no
+	/// baseline row records that path, and only where its bytes differ from the remote root file's:
+	/// a row, or identical bytes, mean the file is the synced copy of the remote's.
+	///
+	/// Its rules decide at the root level before the remote root file's (see the module docs), and
+	/// the file itself is kept out of the sync on both sides while it is here: never deleted or
+	/// binned as an extra, never uploaded, and the remote root file never downloaded over it. Kept
+	/// out the way a built-in default keeps out an untracked `.DS_Store` — hidden, not reported —
+	/// which is exact because no row sits at its path. Its own lines cannot re-include it, as no
+	/// pattern can re-include the engine's own files.
+	pub(crate) fn insert_local_root(&mut self, source: IgnoreSource) {
+		self.local_root = Some(source);
+	}
+
 	/// The decision for `rel_path` alone, nearest source first. Ancestors are not consulted: use
 	/// [`Self::is_ignored_with_ancestors`] unless every ancestor is already known to be synced.
 	pub(crate) fn decide(&self, rel_path: &str, is_dir: bool) -> Option<IgnoreHit<'_>> {
+		if self.local_root.is_some() && !is_dir && rel_path == FILENIGNORE {
+			return Some(IgnoreHit {
+				origin: Origin::Default,
+				pattern: FILENIGNORE,
+			});
+		}
 		let mut dir = parent(rel_path);
 		loop {
+			if dir.is_empty()
+				&& let Some(source) = &self.local_root
+			{
+				match source.matched(rel_path, is_dir) {
+					Match::Whitelist(_) => return None,
+					Match::Ignore(pattern) => {
+						return Some(IgnoreHit {
+							origin: Origin::File { dir: "" },
+							pattern,
+						});
+					}
+					Match::None => {}
+				}
+			}
 			if let Some((key, source)) = self.files.get_key_value(dir) {
 				// A pattern in `dir`'s file sees the path below `dir`.
 				let rel = match dir {
@@ -383,6 +432,10 @@ pub(crate) struct RemoteRules {
 	/// Every body read this pass, by remote uuid: the cache the next pass starts from. A content edit
 	/// mints a new uuid, so a cached body is never stale.
 	pub(crate) bodies: HashMap<Uuid, Arc<str>>,
+	/// The body of the remote root `.filenignore` read this pass, if one was: what tells a pair that
+	/// only pulls a copy of it on disk from local configuration (see
+	/// [`UnrecordedRoot`](super::scan::UnrecordedRoot)).
+	pub(crate) root_body: Option<Arc<str>>,
 }
 
 /// Reads the remote `.filenignore` files whose rules `mode` takes from the remote, on top of the
@@ -401,6 +454,10 @@ pub(crate) struct RemoteRules {
 /// [`MAX_RULE_FILE_BYTES`], one that cannot be fetched, is not UTF-8 or does not compile blocks its
 /// directory for the pass: guessing its rules could sync what the user meant to hide. So does one
 /// the view holds back as listed twice, unless a mode that only pulls ignores its directory anyway.
+///
+/// A pair that only pulls may also have a local root file (see [`IgnoreRules::insert_local_root`]),
+/// which the scan reads after this, comparing it with [`RemoteRules::root_body`]: a remote file under a directory only that file ignores is still
+/// read here, and a failure to read it still blocks that directory.
 pub(crate) async fn load_remote_rules<Fetch, Fut>(
 	mode: SyncMode,
 	candidates: RuleCandidates<'_>,
@@ -472,6 +529,9 @@ where
 				out.blocked.insert(dir.to_owned());
 				out.errors.push(format!("remote {error}"));
 			}
+		}
+		if dir.is_empty() {
+			out.root_body = Some(Arc::clone(&body));
 		}
 		out.bodies.insert(node.remote_uuid, body);
 	}

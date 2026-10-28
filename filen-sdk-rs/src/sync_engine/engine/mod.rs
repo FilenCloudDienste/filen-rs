@@ -4641,18 +4641,12 @@ impl SyncEngine {
 			remote_rules.blocked.insert(String::new());
 			remote_rules.errors.push(error.to_string());
 		}
-		let rule_files = if inputs.record.mode.pushes() {
-			RuleFiles::Read
-		} else {
-			RuleFiles::Only(
-				inputs
-					.baseline
-					.rule_file_rows()
-					.filter(|rel_path| !view.nodes.of(&inputs.baseline).holds(rel_path))
-					.filter_map(|rel_path| rule_file_dir(&rel_path).map(str::to_owned))
-					.collect(),
-			)
-		};
+		let rule_files = RuleFiles::for_pass(
+			inputs.record.mode,
+			&inputs.baseline,
+			&view,
+			remote_rules.root_body.as_ref(),
+		);
 
 		super::step("rule_files_only");
 
@@ -5105,21 +5099,14 @@ impl SyncEngine {
 			remote_rules.blocked.insert(String::new());
 			remote_rules.errors.push(error.to_string());
 		}
-		// Rules come from the side that is the source of truth: a mode that pushes reads the
-		// `.filenignore` files on disk, over any remote copy read for the same directory. A mode that
-		// pulls alone reads on disk only the synced ones the remote has lost: they govern until that
-		// loss propagates, so a directory trashed on the remote keeps what they hide here.
-		let rule_files = if record.mode.pushes() {
-			RuleFiles::Read
-		} else {
-			RuleFiles::Only(
-				baseline
-					.rule_file_rows()
-					.filter(|rel_path| !view.nodes.of(&baseline).holds(rel_path))
-					.filter_map(|rel_path| rule_file_dir(&rel_path).map(str::to_owned))
-					.collect(),
-			)
-		};
+		// Rules come from the side that is the source of truth, plus a pulling pair's local root file
+		// (see `RuleFiles::for_pass`).
+		let rule_files = RuleFiles::for_pass(
+			record.mode,
+			&baseline,
+			&view,
+			remote_rules.root_body.as_ref(),
+		);
 		// The early walk stands when the remote read added no rule file to the user's rules:
 		// `load_remote_rules` starts from those and changes them only by adding one, so the rules it
 		// came back with are then the very rules that walk matched with. Otherwise it is given up and

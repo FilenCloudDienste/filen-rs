@@ -624,6 +624,81 @@ async fn a_cached_body_is_not_downloaded_again() {
 	assert_eq!(kept, expected, "only the bodies this pass read are kept");
 }
 
+/// The rules a migrated `excludeDotFiles` pair is given, as the pair root's local file.
+fn local_root_rules(text: &str) -> IgnoreRules {
+	let mut rules = IgnoreRules::default();
+	rules.insert_local_root(source(text, Origin::File { dir: "" }));
+	rules
+}
+
+#[test]
+fn a_local_root_rule_file_hides_what_it_names_as_the_root_level() {
+	let rules = local_root_rules(".*\n!/.filenignore\n");
+	assert!(rules.has_files());
+	assert_eq!(
+		decision(&rules, ".env.local"),
+		IgnoreDecision {
+			level: IgnoreLevel::File { dir: String::new() },
+			pattern: ".*".to_owned(),
+		}
+	);
+	assert!(ignored(&rules, "sub/.hidden", F));
+	assert!(!ignored(&rules, "sub/visible.txt", F));
+}
+
+/// Its own path is out of the sync whatever its lines say, `!/.filenignore` included, and only as
+/// a file at the root: a directory by that name, or a nested rule file, is an ordinary item.
+#[test]
+fn a_local_root_rule_file_keeps_itself_out_of_the_sync() {
+	let rules = local_root_rules("*.tmp\n!/.filenignore\n");
+	assert_eq!(
+		rules.decide(FILENIGNORE, F),
+		Some(IgnoreHit {
+			origin: Origin::Default,
+			pattern: FILENIGNORE,
+		})
+	);
+	assert!(rules.decide(FILENIGNORE, D).is_none());
+	assert!(rules.decide("sub/.filenignore", F).is_none());
+
+	let without = root_rules("*.tmp\n");
+	assert!(without.decide(FILENIGNORE, F).is_none());
+}
+
+/// The local root file reads as the remote root file's text with its own lines appended: it decides
+/// before the remote root file and the user level, and a nested rule file still decides before it.
+#[test]
+fn a_local_root_rule_file_sits_between_the_nested_files_and_the_remote_root_file() {
+	let mut rules = IgnoreRules::new(Some(source("!.user-kept\n", Origin::User)));
+	rules.insert_file(
+		String::new(),
+		source("*.log\n!.remote-kept\n", Origin::File { dir: "" }),
+	);
+	rules.insert_file(
+		"sub".into(),
+		source("!.nested-kept\n", Origin::File { dir: "sub" }),
+	);
+	rules.insert_local_root(source(".*\n", Origin::File { dir: "" }));
+
+	assert!(
+		ignored(&rules, ".remote-kept", F),
+		"local beats the remote root file"
+	);
+	assert!(
+		ignored(&rules, ".user-kept", F),
+		"local beats the user level"
+	);
+	assert!(
+		ignored(&rules, "a.log", F),
+		"the remote root file still applies"
+	);
+	assert!(
+		!ignored(&rules, "sub/.nested-kept", F),
+		"a nested file beats it"
+	);
+	assert!(ignored(&rules, "sub/.other", F));
+}
+
 #[test]
 fn defaults_parse_cleanly() {
 	let (_, errors) =

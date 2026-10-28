@@ -21,8 +21,8 @@ use filen_sdk_rs::{
 	},
 	io::client_impl::IoSharedClientExt,
 	sync_engine::{
-		GuardReason, IgnoreLevel, IgnoredPath, SyncEngine, SyncEvent, SyncMode, SyncReport,
-		WatchConfig,
+		Backlog, GuardReason, IgnoreLevel, IgnoredPath, SyncEngine, SyncEvent, SyncMode,
+		SyncReport, WatchConfig,
 	},
 };
 
@@ -327,6 +327,125 @@ async fn filter_plan_pair_reports_ignored() {
 	let report = sc.sync().await;
 	clean(&report);
 	assert_eq!(report.ignored, plan.ignored);
+
+	sc.cleanup();
+}
+
+/// The local root `.filenignore` a migrated `excludeDotFiles` pair is given.
+const DOT_FILES_RULES: &[u8] = b".*\n!/.filenignore\n";
+
+/// A pair that only pulls honours a local root `.filenignore` the remote does not hold: the remote
+/// dot file stays on the remote, and the rule file is local configuration — not binned as an extra
+/// of the mirror, not uploaded. A root `.filenignore` the remote gains later applies beside it and
+/// is not downloaded over it.
+#[shared_test_runtime]
+async fn filter_pull_only_local_root_filenignore_applies() {
+	let sc = single_client(SyncMode::RemoteToLocal).await;
+	upload_remote(&sc.cache, &sc.resources.dir, ".env", b"remote secret").await;
+	upload_remote(&sc.cache, &sc.resources.dir, "a.txt", b"synced").await;
+	write_file(&sc.local, ".filenignore", DOT_FILES_RULES);
+
+	let first = sc.sync().await;
+	clean(&first);
+	assert_eq!(first.downloaded, 1, "only a.txt downloads: {first:?}");
+	assert_eq!(first.locally_deleted, 0, "{first:?}");
+	assert_eq!(first.ignored, vec![by_root_file(".env", ".*", false)]);
+	let steady = sc.sync().await;
+	clean(&steady);
+	assert_eq!(
+		(steady.downloaded, steady.locally_deleted),
+		(0, 0),
+		"{steady:?}"
+	);
+	assert!(read_eq(&sc.local, ".filenignore", DOT_FILES_RULES));
+	assert!(
+		!sc.local.join(".env").exists(),
+		"a hidden dot file downloaded"
+	);
+	assert!(!sc.local.join(".filen-sync-trash").exists(), "{steady:?}");
+	assert_eq!(
+		remote_paths(&sc.cache.client, &sc.resources.dir).await,
+		paths(&[".env", "a.txt"])
+	);
+
+	upload_remote(&sc.cache, &sc.resources.dir, ".filenignore", b"*.log\n").await;
+	upload_remote(&sc.cache, &sc.resources.dir, "b.log", b"remote log").await;
+	let both = sc.sync().await;
+	clean(&both);
+	assert_eq!((both.downloaded, both.locally_deleted), (0, 0), "{both:?}");
+	assert_eq!(
+		both.ignored,
+		vec![
+			by_root_file(".env", ".*", false),
+			by_root_file("b.log", "*.log", false)
+		]
+	);
+	assert!(read_eq(&sc.local, ".filenignore", DOT_FILES_RULES));
+
+	sc.cleanup();
+}
+
+/// A root `.filenignore` no row records that holds exactly the remote one's bytes — what a pair
+/// migrated from filen-sync, or removed and added again, holds — is the remote file's copy, not
+/// local configuration: the pass records it as synced, and a later edit of the remote rules is
+/// pulled over it and governs.
+#[shared_test_runtime]
+async fn filter_pull_only_identical_root_filenignore_follows_the_remote() {
+	let sc = single_client(SyncMode::RemoteToLocal).await;
+	upload_remote(&sc.cache, &sc.resources.dir, ".filenignore", b"*.log\n").await;
+	upload_remote(&sc.cache, &sc.resources.dir, "a.txt", b"synced").await;
+	upload_remote(&sc.cache, &sc.resources.dir, "b.log", b"remote log").await;
+	write_file(&sc.local, ".filenignore", b"*.log\n");
+
+	let first = sc.sync().await;
+	clean(&first);
+	assert_eq!(
+		(first.downloaded, first.locally_deleted),
+		(1, 0),
+		"only a.txt downloads, the identical rule file is adopted: {first:?}"
+	);
+	assert_eq!(first.ignored, vec![by_root_file("b.log", "*.log", false)]);
+	let steady = sc.sync().await;
+	clean(&steady);
+	assert_eq!(
+		(steady.downloaded, steady.locally_deleted),
+		(0, 0),
+		"{steady:?}"
+	);
+
+	upload_remote(&sc.cache, &sc.resources.dir, ".filenignore", b"*.tmp\n").await;
+	let edited = sc.sync().await;
+	clean(&edited);
+	assert_eq!(
+		edited.downloaded, 2,
+		"the edited rule file, and b.log it no longer hides: {edited:?}"
+	);
+	assert!(read_eq(&sc.local, ".filenignore", b"*.tmp\n"));
+	assert!(read_eq(&sc.local, "b.log", b"remote log"));
+	assert_eq!(edited.ignored, Vec::<IgnoredPath>::new());
+
+	sc.cleanup();
+}
+
+/// A pull-only pair switched to two-way pushes its local root `.filenignore` as an ordinary file.
+#[shared_test_runtime]
+async fn filter_local_root_filenignore_uploads_once_the_pair_pushes() {
+	let sc = single_client(SyncMode::RemoteBackup).await;
+	upload_remote(&sc.cache, &sc.resources.dir, ".env", b"remote secret").await;
+	write_file(&sc.local, ".filenignore", DOT_FILES_RULES);
+	let pulled = sc.sync().await;
+	clean(&pulled);
+	assert_eq!((pulled.uploaded, pulled.downloaded), (0, 0), "{pulled:?}");
+
+	sc.engine
+		.reconfigure_pair(sc.pair, SyncMode::TwoWay, Backlog::Propagate)
+		.await
+		.unwrap();
+	let pushed = sc.sync().await;
+	clean(&pushed);
+	assert_eq!(pushed.uploaded, 1, "{pushed:?}");
+	assert_eq!(pushed.ignored, vec![by_root_file(".env", ".*", false)]);
+	assert_eq!(remote_bytes(&sc, ".filenignore").await, DOT_FILES_RULES);
 
 	sc.cleanup();
 }

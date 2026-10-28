@@ -1628,7 +1628,10 @@ fn an_ignored_entry_is_pruned_and_reported_top_most() {
 		},
 		&Baseline::default(),
 		IgnoreRules::default(),
-		RuleFiles::Only(BTreeSet::new()),
+		RuleFiles::Only {
+			synced: BTreeSet::new(),
+			local_root: None,
+		},
 	);
 	assert!(skipped.nodes.whole().holds("build/deep/a.txt"));
 	// With no rule file read, the built-in defaults are all that hides anything, and nothing was
@@ -1648,12 +1651,132 @@ fn an_ignored_entry_is_pruned_and_reported_top_most() {
 		},
 		&Baseline::default(),
 		IgnoreRules::default(),
-		RuleFiles::Only(BTreeSet::from(["sub".to_string()])),
+		RuleFiles::Only {
+			synced: BTreeSet::from(["sub".to_string()]),
+			local_root: None,
+		},
 	);
 	assert!(only.nodes.whole().holds("build/deep/a.txt"));
 	assert_eq!(only.ignored.keys().collect::<Vec<_>>(), vec!["sub/tmp"]);
 	assert_eq!(only.ignored_default_untracked, 1);
 	assert!(rules.decide("x.log", false).is_none());
+	// And the root's file, read as local configuration: its rules apply, and the file itself is
+	// no item of the scan, hidden as an untracked default hit is.
+	let (local, rules) = scan_local(
+		ScanRoot {
+			path: &root,
+			pair_root: PairRoot::Directory,
+		},
+		&Baseline::default(),
+		IgnoreRules::default(),
+		RuleFiles::Only {
+			synced: BTreeSet::new(),
+			local_root: Some(UnrecordedRoot { remote_copy: None }),
+		},
+	);
+	assert!(!local.nodes.whole().holds(FILENIGNORE));
+	assert!(local.nodes.whole().holds("keep.txt"));
+	assert!(
+		local.nodes.whole().holds("sub/.filenignore"),
+		"a nested one is an item"
+	);
+	assert_eq!(
+		local.ignored.keys().collect::<Vec<_>>(),
+		vec!["build", "x.log"]
+	);
+	assert_eq!(
+		local.ignored_default_untracked, 2,
+		"sub/.DS_Store and the rule file"
+	);
+	assert!(rules.decide("x.log", false).is_some());
+
+	fs::remove_dir_all(&root).ok();
+}
+
+/// A scan of `root` by a pair that only pulls, with no baseline row at its root `.filenignore`,
+/// whose remote root file reads `remote_rules` where it has one. The remote file's rules are in the
+/// rules the scan starts from, as `load_remote_rules` leaves them.
+fn scan_with_unrecorded_root(root: &Path, remote_rules: Option<&str>) -> LocalScan {
+	let mut rules = IgnoreRules::default();
+	if let Some(text) = remote_rules {
+		let (source, line_errors) = IgnoreSource::parse(text, Origin::File { dir: "" }).unwrap();
+		assert!(line_errors.is_empty(), "{line_errors:?}");
+		rules.insert_file(String::new(), source);
+	}
+	scan_local(
+		ScanRoot {
+			path: root,
+			pair_root: PairRoot::Directory,
+		},
+		&Baseline::default(),
+		rules,
+		RuleFiles::Only {
+			synced: BTreeSet::new(),
+			local_root: Some(UnrecordedRoot {
+				remote_copy: remote_rules.map(Arc::from),
+			}),
+		},
+	)
+	.0
+}
+
+/// A root `.filenignore` no row records that holds exactly the remote root file's bytes is that
+/// file's copy, as a pair migrated from filen-sync or removed and added again holds it: an ordinary
+/// item of the scan, so the pass can record it as synced, and no local configuration.
+#[test]
+fn an_unrecorded_root_rule_file_identical_to_the_remote_one_is_an_item() {
+	let root = temp_root();
+	fs::write(root.join(FILENIGNORE), "*.log\n").unwrap();
+	fs::write(root.join("x.log"), b"x").unwrap();
+	fs::write(root.join("keep.txt"), b"k").unwrap();
+
+	let scan = scan_with_unrecorded_root(&root, Some("*.log\n"));
+
+	assert!(scan.errors.is_empty(), "{:?}", scan.errors);
+	assert_eq!(sorted_paths(&scan), vec![".filenignore", "keep.txt"]);
+	assert_eq!(scan.ignored.keys().collect::<Vec<_>>(), vec!["x.log"]);
+	assert_eq!(scan.ignored_default_untracked, 0);
+
+	fs::remove_dir_all(&root).ok();
+}
+
+/// One that differs from the remote root file by a single byte is local configuration: hidden
+/// from the sync, its rules applied beside the remote file's.
+#[test]
+fn an_unrecorded_root_rule_file_differing_from_the_remote_one_stays_local() {
+	let root = temp_root();
+	fs::write(root.join(FILENIGNORE), "*.log\n*.tmp\n").unwrap();
+	fs::write(root.join("x.log"), b"x").unwrap();
+	fs::write(root.join("y.tmp"), b"y").unwrap();
+	fs::write(root.join("keep.txt"), b"k").unwrap();
+
+	let scan = scan_with_unrecorded_root(&root, Some("*.log\n"));
+
+	assert!(scan.errors.is_empty(), "{:?}", scan.errors);
+	assert_eq!(sorted_paths(&scan), vec!["keep.txt"]);
+	assert_eq!(
+		scan.ignored.keys().collect::<Vec<_>>(),
+		vec!["x.log", "y.tmp"]
+	);
+	assert_eq!(scan.ignored_default_untracked, 1, "the rule file");
+
+	fs::remove_dir_all(&root).ok();
+}
+
+/// With no remote root file at all, it is local configuration too.
+#[test]
+fn an_unrecorded_root_rule_file_with_no_remote_one_stays_local() {
+	let root = temp_root();
+	fs::write(root.join(FILENIGNORE), "*.log\n").unwrap();
+	fs::write(root.join("x.log"), b"x").unwrap();
+	fs::write(root.join("keep.txt"), b"k").unwrap();
+
+	let scan = scan_with_unrecorded_root(&root, None);
+
+	assert!(scan.errors.is_empty(), "{:?}", scan.errors);
+	assert_eq!(sorted_paths(&scan), vec!["keep.txt"]);
+	assert_eq!(scan.ignored.keys().collect::<Vec<_>>(), vec!["x.log"]);
+	assert_eq!(scan.ignored_default_untracked, 1, "the rule file");
 
 	fs::remove_dir_all(&root).ok();
 }
