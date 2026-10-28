@@ -224,7 +224,8 @@ pub struct SyncPairInfo {
 	pub delete_guard: DeleteGuardState,
 	/// Whether the pair is paused (persisted by the engine).
 	pub paused: bool,
-	/// Whether a pass of the pair has completed cleanly (persisted by the engine).
+	/// Whether a pass of the pair has completed cleanly (persisted by the engine). Until one has,
+	/// every pass is a first sync, and the guard holds its deletions for approval.
 	pub first_pass_completed: bool,
 	pub activity: SyncPairActivity,
 	/// The watch's latest status; set exactly while `activity` is `Watching` or `Stopping`.

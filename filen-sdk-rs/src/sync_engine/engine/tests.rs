@@ -8503,9 +8503,94 @@ fn after_a_first_pass_wrote_a_row() -> (BaselineStore, Prepared) {
 	(store, prep)
 }
 
-/// Which passes complete a first pass. Each of the shortfalls below leaves it a first sync; held
-/// deletions, conflicts and failed paths do not, since any of them can stand for as long as the
-/// pair does.
+/// What the next pass's guard does with the deletion `after_a_first_pass_wrote_a_row` plans.
+fn next_pass_reason(store: &BaselineStore, mut prep: Prepared) -> Option<GuardReason> {
+	prep.record = store.pair(prep.record.id).unwrap().unwrap();
+	reconcile_and_screen_resident(&prep, screen_state(&prep))
+		.decision
+		.reason
+}
+
+/// A first pass cut short after it committed a row has not completed, so the pass after it is
+/// still a first sync and still holds the deletion for approval, where reading "no rows" as the
+/// first sync let it through under the guard's limit.
+#[test]
+fn an_interrupted_first_pass_keeps_the_next_pass_holding_its_deletions() {
+	let (store, prep) = after_a_first_pass_wrote_a_row();
+	let interrupted = SyncReport {
+		interrupted: 1,
+		..SyncReport::default()
+	};
+	assert!(!completes_first_pass(
+		&prep,
+		&screen_state(&prep),
+		&interrupted
+	));
+	assert_eq!(
+		next_pass_reason(&store, prep),
+		Some(GuardReason::FirstSyncWithDeletions { deletions: 1 })
+	);
+}
+
+/// A first pass whose deletions the guard held has not completed, however clean the rest of it
+/// was: the pass after it plans the same deletion, and without approval it is still a first sync
+/// and still holds it, where completing would have let it through under the guard's limit.
+#[test]
+fn a_first_pass_that_held_its_deletions_keeps_the_next_pass_holding_them() {
+	let (store, prep) = after_a_first_pass_wrote_a_row();
+	let state = screen_state(&prep);
+	let first = reconcile_and_screen_resident(&prep, state);
+	let reason = Some(GuardReason::FirstSyncWithDeletions { deletions: 1 });
+	assert_eq!(first.decision.reason, reason);
+	let held = SyncReport {
+		guard: first.decision.reason,
+		..SyncReport::default()
+	};
+	assert!(!completes_first_pass(&prep, &state, &held));
+	assert_eq!(next_pass_reason(&store, prep), reason);
+}
+
+/// A first pass that completed cleanly and held nothing is recorded as such, and the pass after it
+/// is no first sync: a deletion it plans (of an item the first pass did not see) is under the
+/// default guard's limit and runs.
+#[test]
+fn a_clean_first_pass_that_held_nothing_lifts_the_hold_from_the_next_pass() {
+	let (store, prep) = after_a_first_pass_wrote_a_row();
+	assert!(completes_first_pass(
+		&prep,
+		&screen_state(&prep),
+		&SyncReport::default()
+	));
+	store.mark_first_pass_completed(prep.record.id).unwrap();
+	assert_eq!(next_pass_reason(&store, prep), None);
+}
+
+/// A pair that tracks nothing at the start of a pass has no established relationship to read a
+/// deletion against, whatever its record says: a mirror whose source is empty, or whose first pass
+/// found both sides empty, still holds every deletion it plans for approval.
+#[test]
+fn a_pair_that_tracks_nothing_stays_a_first_sync_past_its_first_pass() {
+	let (store, mut prep) = prepared_on_store(
+		SyncMode::RemoteToLocal,
+		Vec::new(),
+		vec![local_file("kept.bin", hash(1))],
+		Vec::new(),
+	);
+	store.mark_first_pass_completed(prep.record.id).unwrap();
+	prep.record = store.pair(prep.record.id).unwrap().unwrap();
+	prep.record.delete_guard = DeleteGuard::default();
+	assert!(prep.record.first_pass_completed);
+	let state = screen_state(&prep);
+	assert!(state.first_sync);
+	assert_eq!(
+		reconcile_and_screen_resident(&prep, state).decision.reason,
+		Some(GuardReason::FirstSyncWithDeletions { deletions: 1 })
+	);
+}
+
+/// Which passes complete a first pass. Each of the shortfalls below leaves it a first sync, and so
+/// do held first-sync deletions; conflicts and failed paths do not, since either can stand for as
+/// long as the pair does.
 #[test]
 fn a_first_pass_completes_only_when_nothing_cut_it_short_or_made_its_read_untrustworthy() {
 	let (_store, prep) = after_a_first_pass_wrote_a_row();
@@ -8613,7 +8698,52 @@ fn a_first_pass_completes_only_when_nothing_cut_it_short_or_made_its_read_untrus
 		errors: vec!["a.bin: boom".to_string()],
 		..SyncReport::default()
 	};
+	assert!(
+		!completes_first_pass(&prep, &state, &settled),
+		"a pass holding first-sync deletions completed the first pass"
+	);
+	let settled = SyncReport {
+		held: Vec::new(),
+		guard: None,
+		..settled
+	};
 	assert!(completes_first_pass(&prep, &state, &settled));
+}
+
+/// A mirror whose source is empty: every item of its destination is a deletion the pair never
+/// saw propagate. Its first pass holds them, so it completes no first pass, and every pass after it
+/// holds them again, unapproved, where completing would have let the second delete all eight under
+/// the guard's floor of 10.
+#[test]
+fn a_mirror_with_an_empty_source_holds_its_destination_on_every_pass() {
+	let local: Vec<_> = (0..8)
+		.map(|n| local_file(&format!("mine-{n}.bin"), hash(1)))
+		.collect();
+	let (store, mut prep) =
+		prepared_on_store(SyncMode::RemoteToLocal, Vec::new(), local, Vec::new());
+	let held = Some(GuardReason::FirstSyncWithDeletions { deletions: 8 });
+	for pass in 1..=3 {
+		prep.record = store.pair(prep.record.id).unwrap().unwrap();
+		prep.record.delete_guard = DeleteGuard::default();
+		let state = screen_state(&prep);
+		let screened = reconcile_and_screen_resident(&prep, state);
+		assert_eq!(screened.decision.reason, held, "pass {pass}");
+		assert_eq!(screened.decision.held.len(), 8, "pass {pass}");
+		let report = SyncReport {
+			guard: screened.decision.reason,
+			..SyncReport::default()
+		};
+		if completes_first_pass(&prep, &state, &report) {
+			store.mark_first_pass_completed(prep.record.id).unwrap();
+		}
+	}
+	assert!(
+		!store
+			.pair(prep.record.id)
+			.unwrap()
+			.unwrap()
+			.first_pass_completed
+	);
 }
 
 /// The remote root of an [`offline_pair`].
@@ -8662,6 +8792,18 @@ fn first_pass_recorded(engine: &SyncEngine, pair: PairId) -> bool {
 		.first_pass_completed
 }
 
+/// Eight local files a mirror from an empty remote would delete.
+const EIGHT: [&str; 8] = [
+	"mine-0.bin",
+	"mine-1.bin",
+	"mine-2.bin",
+	"mine-3.bin",
+	"mine-4.bin",
+	"mine-5.bin",
+	"mine-6.bin",
+	"mine-7.bin",
+];
+
 /// What the guard held a pass of `pair` for, the pass run to its end: the reason and the number
 /// of held deletions.
 async fn held_by_a_pass(engine: &SyncEngine, pair: PairId) -> (Option<GuardReason>, usize) {
@@ -8670,6 +8812,41 @@ async fn held_by_a_pass(engine: &SyncEngine, pair: PairId) -> (Option<GuardReaso
 		.await
 		.expect("a pass that applies nothing needs no server");
 	(report.guard.clone(), report.held_deletions())
+}
+
+/// A real pass whose first-sync deletions the guard held records no completed first pass.
+#[tokio::test]
+async fn a_pass_holding_first_sync_deletions_records_no_first_pass() {
+	let dir = tempfile::tempdir().unwrap();
+	let (engine, pair, _cache) = offline_pair(dir.path(), SyncMode::RemoteToLocal, &EIGHT).await;
+
+	assert_eq!(
+		held_by_a_pass(&engine, pair).await,
+		(
+			Some(GuardReason::FirstSyncWithDeletions { deletions: 8 }),
+			8
+		)
+	);
+	assert!(!first_pass_recorded(&engine, pair));
+}
+
+/// A real pass of a pair recorded past its first pass, which tracks nothing (both sides were
+/// empty), is still a first sync: the destination populated since is held, not deleted.
+#[tokio::test]
+async fn a_pair_that_tracks_nothing_holds_its_destination_after_its_first_pass() {
+	let dir = tempfile::tempdir().unwrap();
+	let (engine, pair, _cache) = offline_pair(dir.path(), SyncMode::RemoteToLocal, &EIGHT).await;
+	locked(&engine.control)
+		.mark_first_pass_completed(pair)
+		.unwrap();
+
+	assert_eq!(
+		held_by_a_pass(&engine, pair).await,
+		(
+			Some(GuardReason::FirstSyncWithDeletions { deletions: 8 }),
+			8
+		)
+	);
 }
 
 /// The marker is the engine's record of a pass: a dry run plans without passing and a paused pair

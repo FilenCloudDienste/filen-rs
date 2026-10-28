@@ -108,11 +108,12 @@ pub enum GuardReason {
 	/// The local scan did not complete, so apparent deletions may be phantom (an unmounted root,
 	/// an unreadable subtree). All deletions are held unconditionally.
 	ScanIncomplete,
-	/// First sync of the pair (empty baseline): with no established sync relationship, a
-	/// "deletion" is really a pre-existing destination item the source happens to lack — not a
-	/// propagated removal. Held so a first sync against a non-empty destination cannot wipe it
-	/// (the locked "start from an empty destination" expectation; surfaced rather than silently
-	/// destroyed).
+	/// First sync of the pair (no pass of it has completed cleanly, see
+	/// [`PairRecord::first_pass_completed`](super::PairRecord::first_pass_completed), or it tracks
+	/// no item at the start of the pass): with no established sync relationship, a "deletion" is
+	/// really a pre-existing destination item the source happens to lack — not a propagated
+	/// removal. Held so a first sync against a non-empty destination cannot wipe it (the locked
+	/// "start from an empty destination" expectation; surfaced rather than silently destroyed).
 	FirstSyncWithDeletions { deletions: usize },
 	/// The remote view has never converged (the cache snapshot carries no watermark), so its
 	/// apparent emptiness is untrustworthy — a "remote deletion" may just be an un-observed item.
@@ -183,7 +184,8 @@ pub(crate) struct ScreenState {
 	pub(crate) scan_complete: bool,
 	/// What the remote view can say about absence.
 	pub(crate) remote: RemoteEvidence,
-	/// This is the pair's first sync (the baseline is empty — no established relationship).
+	/// This is the pair's first sync: no pass of it has completed cleanly, so there is no
+	/// established relationship, whatever rows an earlier pass left; or it tracks no item at all.
 	pub(crate) first_sync: bool,
 	/// How many items the pair's baseline currently tracks (the ratio denominator).
 	pub(crate) tracked: usize,

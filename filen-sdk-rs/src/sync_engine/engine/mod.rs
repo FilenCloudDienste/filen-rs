@@ -2383,9 +2383,10 @@ struct Prepared {
 	record: PairRecord,
 	baseline: Baseline,
 	/// How many rows the pair tracked when the pass read its baseline, before the seeding stage
-	/// wrote any (see [`seed_unhashed`](Self::seed_unhashed)). The guard's whole-tree judgements are
-	/// made from this, so a pass that seeds its first rows is still a first sync and its deletions
-	/// are still held.
+	/// wrote any (see [`seed_unhashed`](Self::seed_unhashed)). The guard's limit is computed from
+	/// this, so the rows a pass seeds do not raise the number of deletions it lets through, and a
+	/// pass that starts from none is a first sync whatever the record says. Otherwise, whether it is
+	/// one is the record's [`first_pass_completed`](PairRecord::first_pass_completed).
 	tracked_at_start: usize,
 	/// What this pass read, and why (see [`PassRead`]).
 	read: PassRead,
@@ -6200,7 +6201,7 @@ impl SyncEngine {
 
 	/// Record that `pair` has completed its first pass, when this is the pass that did (see
 	/// [`completes_first_pass`]). A record that cannot be written is the report's error, and the
-	/// next pass that completes cleanly records it.
+	/// next pass is a first sync again: the side a lost record errs on is holding deletions.
 	async fn note_first_pass(
 		&self,
 		pair: PairId,
@@ -7641,29 +7642,41 @@ fn screen_state(prep: &Prepared) -> guard::ScreenState {
 			(true, true) => guard::RemoteEvidence::Emptied,
 			(true, false) => guard::RemoteEvidence::Listed,
 		},
+		// Not "the pair has no rows" alone: a first pass interrupted after it wrote some — a seeded
+		// row, a conflict, a completed action — would otherwise lift the hold from the next one,
+		// which plans the same deletions the interrupted one held. Nor the record alone: a pair that
+		// tracks nothing has no relationship to read a deletion against, whatever passes it had —
+		// a mirror whose first pass found both sides empty, then a destination populated since.
+		first_sync: !prep.record.first_pass_completed || prep.tracked_at_start == 0,
 		// The rows as the pass found them, not as its seeding left them (see
 		// `Prepared::tracked_at_start`).
-		first_sync: prep.tracked_at_start == 0,
 		tracked: prep.tracked_at_start,
 	}
 }
 
-/// Whether a pass that got as far as `report` completed CLEANLY, which is what
-/// [`PairRecord::first_pass_completed`] records. Decided purely so the rule is
+/// Whether a pass that got as far as `report` completed CLEANLY, which is what ends the pair's
+/// first sync (see [`PairRecord::first_pass_completed`]). Decided purely so the rule is
 /// unit-testable.
 ///
 /// Clean means the pass established the whole relationship between the two trees, so the next
 /// pass may read a deletion as one: it was not refused, paused or cancelled, nothing it planned was
 /// left undone ([`interrupted`](SyncReport::interrupted)), nothing failed it as a whole
 /// ([`pass_error`](SyncReport::pass_error): the drive lock, a full side, a record not written),
-/// it read both sides WHOLE, and what each said was absent could be trusted (a complete local
-/// scan and a converged, non-empty remote view). A pass short of any of these did not see, or did
-/// not act on, all of what a first sync must hold.
+/// it read both sides WHOLE, what each said was absent could be trusted (a complete local scan and
+/// a converged, non-empty remote view), and the guard held none of its deletions. A pass short of
+/// any of these did not see, or did not act on, all of what a first sync must hold, so the next
+/// pass is a first sync again.
 ///
-/// What does not stop it: a deletion the guard held, which this pass reported for approval; a
-/// conflict, which it recorded; and a path whose action failed, which counts against that path's
-/// own streak. Each of those can stand for as long as the pair does, and a pair would never
-/// complete a pass that waited for them.
+/// A held deletion is a first sync's own hold ([`GuardReason::FirstSyncWithDeletions`]: on a
+/// trusted read no other reason comes first), over an item the source lacks that the pair has no
+/// history of. The pass after it plans the same deletion, and were it no first sync it would run
+/// it under the guard's limit with nobody having approved it. So the first pass completes only
+/// once that batch is gone: approved and applied (an approval clears the pass's reason), or no
+/// longer planned at all. Until then every pass holds it again, as the first did.
+///
+/// What does not stop it: a conflict, which the pass recorded, and a path whose action failed,
+/// which counts against that path's own streak. Either can stand for as long as the pair does, and
+/// a pair that could never leave its first sync would hold every deletion for good.
 fn completes_first_pass(prep: &Prepared, state: &guard::ScreenState, report: &SyncReport) -> bool {
 	report.refused.is_none()
 		&& !report.paused
@@ -7671,6 +7684,7 @@ fn completes_first_pass(prep: &Prepared, state: &guard::ScreenState, report: &Sy
 		&& report.pass_failure().is_none()
 		&& !prep.read.is_scoped()
 		&& state.absence_trusted()
+		&& report.guard.is_none()
 }
 
 fn overlap_error(overlap: PairOverlap) -> Error {

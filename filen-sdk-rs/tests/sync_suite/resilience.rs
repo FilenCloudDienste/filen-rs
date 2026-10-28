@@ -18,7 +18,7 @@ use filen_macros::shared_test_runtime;
 use filen_sdk_rs::fs::categories::{DirType, Normal};
 use filen_sdk_rs::fs::file::RemoteFile;
 use filen_sdk_rs::fs::{HasName, HasUUID};
-use filen_sdk_rs::sync_engine::{SyncEngine, SyncMode};
+use filen_sdk_rs::sync_engine::{GuardReason, SyncEngine, SyncMode, SyncReport};
 use uuid::Uuid;
 
 use crate::harness::*;
@@ -79,6 +79,39 @@ fn assert_noop(r: &filen_sdk_rs::sync_engine::SyncReport) {
 	assert!(r.errors.is_empty(), "{r:?}");
 }
 
+/// A first sync holds its one destination-only deletion until it is approved: `first` held it,
+/// another pass without approval holds it again, and the pass after the approval applies it.
+/// Returns that pass's report.
+async fn approve_the_first_sync_deletion(sc: &SingleClient, first: &SyncReport) -> SyncReport {
+	fn assert_held(held: &SyncReport) {
+		assert!(held.errors.is_empty(), "{held:?}");
+		assert!(
+			matches!(
+				held.guard,
+				Some(GuardReason::FirstSyncWithDeletions { deletions: 1 })
+			),
+			"a first sync holds its deletion until approved: {held:?}"
+		);
+		assert_eq!(held.held_deletions(), 1, "{held:?}");
+		assert_eq!(held.remotely_trashed + held.locally_deleted, 0, "{held:?}");
+	}
+	assert_held(first);
+	let again = sc.sync().await;
+	assert_held(&again);
+	let token = again
+		.deletion_token
+		.expect("the held deletion carries a token");
+	sc.engine.approve_deletions(sc.pair, &token).await;
+	let approved = sc.sync().await;
+	assert!(approved.errors.is_empty(), "{approved:?}");
+	assert_eq!(
+		approved.remotely_trashed + approved.locally_deleted,
+		1,
+		"the approved deletion is applied: {approved:?}"
+	);
+	approved
+}
+
 // ===========================================================================
 // IMPLEMENTED — idempotency / re-plan-from-truth (no mid-pass fault needed)
 // ===========================================================================
@@ -118,9 +151,10 @@ async fn resil_11_read_after_write_no_duplicate_no_self_delete() {
 
 /// RESIL-12 (local->remote) — first run with NO prior baseline against a populated REMOTE. In a
 /// LOCAL-authoritative mode the local-only files are pushed up and the remote-only files are
-/// mirrored to match local (the DEFINED one-way semantics — local is the source of truth). The
-/// resilience property here is that the SOURCE (local) side is never harmed, the identical overlap
-/// is reconciled in place (not duplicated), the pass does not error against a populated destination,
+/// mirrored to match local (the DEFINED one-way semantics — local is the source of truth), once
+/// the first sync's held deletion is approved: until then every pass holds it. The resilience
+/// property here is that the SOURCE (local) side is never harmed, the identical overlap is
+/// reconciled in place (not duplicated), the pass does not error against a populated destination,
 /// and it converges to a clean no-op. (The remote-only file being trashed is correct mirroring, NOT
 /// the no-baseline-wipe bug — that bug is the TWO-WAY case below, where neither side is
 /// authoritative.)
@@ -142,9 +176,21 @@ async fn resil_12_first_run_populated_destination_local_to_remote_mirrors_source
 	let r1 = sc.sync().await;
 	assert!(r1.errors.is_empty(), "{r1:?}");
 
+	// The first sync pushes local's files and holds the mirror-delete of the remote-only q1.
+	let (_dirs, files) = list_root(&sc).await;
+	assert!(
+		find_file(&files, "q1.txt").is_some(),
+		"q1 trashed unapproved: {files:?}"
+	);
+	let approved = approve_the_first_sync_deletion(&sc, &r1).await;
+
 	// Remote converges to mirror local exactly: p1/p2/common present, the remote-only q1 mirrored
 	// away (local is authoritative). common.txt must NOT be duplicated.
 	let (_dirs, files) = list_root(&sc).await;
+	assert!(
+		find_file(&files, "q1.txt").is_none(),
+		"q1 not mirrored away: {files:?}"
+	);
 	assert!(
 		find_file(&files, "p1.txt").is_some(),
 		"p1 not pushed: {files:?}"
@@ -167,9 +213,8 @@ async fn resil_12_first_run_populated_destination_local_to_remote_mirrors_source
 		"common changed locally"
 	);
 
-	// The destination mirror-delete of the remote-only file may settle on a later pass (the engine
-	// re-plans against converged truth). Drive to a clean no-op — the converged, no-churn state.
-	let mut last = r1;
+	// Drive to a clean no-op — the converged, no-churn state.
+	let mut last = approved;
 	for _ in 0..6 {
 		last = sc.sync().await;
 		assert!(last.errors.is_empty(), "{last:?}");
@@ -190,7 +235,8 @@ async fn resil_12_first_run_populated_destination_local_to_remote_mirrors_source
 
 /// RESIL-12 (remote->local) — first run with no baseline against a populated remote. In a
 /// REMOTE-authoritative mode the remote files are pulled down and a pre-existing local-only file is
-/// mirrored away to match the remote (the DEFINED one-way semantics). The resilience property is
+/// mirrored away to match the remote (the DEFINED one-way semantics), once the first sync's held
+/// deletion is approved: until then every pass holds it. The resilience property is
 /// that the SOURCE (remote) side is never harmed, the pull is byte-exact, the pass does not error,
 /// and it converges to a clean no-op.
 #[shared_test_runtime]
@@ -226,9 +272,15 @@ async fn resil_12_first_run_populated_destination_remote_to_local_mirrors_source
 		"q2 lost on remote: {files:?}"
 	);
 
-	// Drive to convergence: the destination mirror-delete of the local-only file may settle on a
-	// later pass. Loop to a clean no-op.
-	let mut last = r1;
+	// The first sync holds the mirror-delete of the local-only file until it is approved.
+	assert!(
+		read_eq(&sc.local, "local_only.txt", b"keep me"),
+		"local_only.txt deleted unapproved"
+	);
+	let approved = approve_the_first_sync_deletion(&sc, &r1).await;
+
+	// Drive to a clean no-op.
+	let mut last = approved;
 	for _ in 0..6 {
 		last = sc.sync().await;
 		assert!(last.errors.is_empty(), "{last:?}");

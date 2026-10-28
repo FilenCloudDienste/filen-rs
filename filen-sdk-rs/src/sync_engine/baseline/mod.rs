@@ -58,8 +58,10 @@ use super::{
 /// no table for it, so the import, and every pass that weighs what it imported, would fail on it.
 ///
 /// Moved to 5 when a pair began recording whether a pass of it has completed cleanly
-/// (`sync_pairs.first_pass_completed`, see [`PairRecord::first_pass_completed`]). A version-4
-/// file has no column for it, so every read of its pairs would fail on it.
+/// (`sync_pairs.first_pass_completed`, see [`PairRecord::first_pass_completed`]): from then on a
+/// pass is a first sync until that is set, as well as whenever the pair has no rows, which alone
+/// made one before. A version-4 file has no column for it, so every read of its pairs would fail
+/// on it.
 ///
 /// [`SyncEngine::import_legacy_state`]: super::SyncEngine::import_legacy_state
 const SCHEMA_VERSION: i64 = 5;
@@ -766,8 +768,10 @@ pub struct PairRecord {
 	/// does not have to ask again per pair.
 	pub paused: bool,
 	/// Whether a pass of the pair has completed cleanly: it read both sides whole and could trust
-	/// what each said was absent, and nothing failed, refused, cancelled or interrupted it. Set by
-	/// the engine, never by a caller.
+	/// what each said was absent, nothing failed, refused, cancelled or interrupted it, and the
+	/// guard held none of its deletions. Until one has, every pass is a first sync and the guard
+	/// holds its deletions for approval, however many rows earlier passes left behind; so is a pass
+	/// of a pair that tracks no row, whatever this says. Set by the engine, never by a caller.
 	pub first_pass_completed: bool,
 }
 
