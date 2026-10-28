@@ -1054,6 +1054,7 @@ fn prepared(
 			ignored: BTreeMap::new(),
 			ignored_default_untracked: 0,
 			ignore_blocked: BTreeSet::new(),
+			stale_downloads: Vec::new(),
 		},
 		holds: plan::PassHolds {
 			trashed: HashSet::new(),
@@ -1119,6 +1120,7 @@ fn the_assembly_check_catches_a_path_no_observation_dropped() {
 		ignored: BTreeMap::new(),
 		ignored_default_untracked: 0,
 		ignore_blocked: BTreeSet::new(),
+		stale_downloads: Vec::new(),
 	};
 	let observed = LocalObservations {
 		observed: BTreeMap::from([("docs".to_string(), LocalObservation::Dir(Box::new(scan)))]),
@@ -1338,6 +1340,7 @@ fn the_assembly_check_subtracts_nested_pruned_roots_and_held_rows_once() {
 		]),
 		ignored_default_untracked: 0,
 		ignore_blocked: BTreeSet::new(),
+		stale_downloads: Vec::new(),
 	};
 	let observed = LocalObservations {
 		observed: BTreeMap::from([("docs".to_string(), LocalObservation::Dir(Box::new(scan)))]),

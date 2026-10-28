@@ -35,17 +35,19 @@ use std::{
 	mem,
 	num::NonZero,
 	ops::ControlFlow,
-	path::{Component, Path},
+	path::{Component, Path, PathBuf},
 	sync::{
 		Mutex,
 		atomic::{AtomicBool, Ordering},
 		mpsc,
 	},
+	time::{Duration, SystemTime},
 };
 
 use chrono::{DateTime, Utc};
 use filen_types::crypto::Blake3Hash;
 use unicode_normalization::{UnicodeNormalization, is_nfc};
+use uuid::Uuid;
 
 use super::{
 	baseline::{BaselineEntry, NodeKind},
@@ -361,6 +363,11 @@ pub(crate) struct LocalScan {
 	/// Directories whose `.filenignore` could not be used (unreadable, or not compilable as a whole).
 	/// Their subtrees are still scanned into `nodes`, since they exist; `""` is the root.
 	pub(crate) ignore_blocked: BTreeSet<String>,
+	/// Download temp files the walk passed that no download can still be writing (see
+	/// [`is_stale_download`]): what a download killed before its cleanup ran left behind. Like every
+	/// `.filendl` file they are not in `nodes`; the pass removes them
+	/// ([`remove_stale_downloads`]).
+	pub(crate) stale_downloads: Vec<PathBuf>,
 }
 
 impl LocalScan {
@@ -373,6 +380,61 @@ impl LocalScan {
 			.filter(|e| !matches!(e, ScanError::DuplicateName { .. }))
 			.map(|e| format!("local scan: {e}"))
 	}
+}
+
+/// How long a download temp file goes unmodified before the scan takes it for one a killed
+/// download left behind. A download writes into its temp file as each chunk arrives, so one still
+/// in flight touches it far more often than this; a day leaves room for a transfer stalled on the
+/// network or the memory budget.
+const STALE_DOWNLOAD_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Whether the `.filendl` file at `path` is a download temp file nothing is writing any more: named
+/// `<uuid>.filendl` as a download names it (a user's `notes.filendl` is left alone, though the scan
+/// never syncs it), a plain file rather than a link, and unmodified for [`STALE_DOWNLOAD_AGE`] as
+/// of `now`.
+///
+/// The one window this misreads: a download stamps its temp file with the remote's mtime just
+/// before renaming it into place, so a file swept in between fails that download at its rename.
+/// The download is retried by the next pass and its destination never holds a partial file.
+pub(super) fn is_stale_download(path: &Path, now: SystemTime) -> bool {
+	let named_by_a_download = path
+		.file_stem()
+		.and_then(OsStr::to_str)
+		.is_some_and(|stem| Uuid::try_parse(stem).is_ok())
+		&& path.extension() == Some(OsStr::new(DOWNLOAD_TMP_EXT));
+	named_by_a_download
+		&& std::fs::symlink_metadata(path)
+			.and_then(|meta| {
+				if meta.is_file() {
+					meta.modified().map(Some)
+				} else {
+					Ok(None)
+				}
+			})
+			.ok()
+			.flatten()
+			.and_then(|modified| now.duration_since(modified).ok())
+			.is_some_and(|age| age > STALE_DOWNLOAD_AGE)
+}
+
+/// Remove the download temp files a scan found stale ([`LocalScan::stale_downloads`]), each asked
+/// again first, since the pass's read and this removal are apart. Returns how many went; a removal
+/// that fails is logged with its cause and the file is looked at again by the next scan.
+pub(super) fn remove_stale_downloads(paths: &[PathBuf], now: SystemTime) -> usize {
+	let mut removed = 0;
+	for path in paths {
+		if !is_stale_download(path, now) {
+			continue;
+		}
+		match std::fs::remove_file(path) {
+			Ok(()) => removed += 1,
+			Err(e) if e.kind() == ErrorKind::NotFound => {}
+			Err(e) => {
+				tracing::warn!("cannot remove the stale download temp file {path:?}: {e}");
+			}
+		}
+	}
+	removed
 }
 
 /// Log `error` and collect it.
@@ -1230,6 +1292,9 @@ fn scan_local_watched<S: ScanSink>(
 	let mut ignored = BTreeMap::new();
 	let mut ignored_default_untracked = 0usize;
 	let mut ignore_blocked = BTreeSet::new();
+	let mut stale_downloads = Vec::new();
+	// One instant for the walk, so each temp file's age is measured against the same now.
+	let now = SystemTime::now();
 	// Apart from `errors`: the rule files' errors are reported after the walk's.
 	let mut rule_errors = Vec::new();
 	// Canonical, so a root reached through a symlink (macOS's `/var`) compares with the canonical
@@ -1336,6 +1401,11 @@ fn scan_local_watched<S: ScanSink>(
 					// read as a local item to upload. A directory with that suffix is a legitimate user
 					// item.
 					if !is_dir && entry.path().extension() == Some(OsStr::new(DOWNLOAD_TMP_EXT)) {
+						// One a killed download left behind is collected for the pass to remove: no
+						// cleanup of its own will ever run, and nothing else would see it.
+						if !entry.path_is_symlink() && is_stale_download(entry.path(), now) {
+							stale_downloads.push(entry.path().to_path_buf());
+						}
 						break 'filter false;
 					}
 					let Some(rel_path) = rel_path.as_mut() else {
@@ -1568,6 +1638,7 @@ fn scan_local_watched<S: ScanSink>(
 		ignored,
 		ignored_default_untracked,
 		ignore_blocked,
+		stale_downloads,
 	};
 	Ok((scan, rules))
 }

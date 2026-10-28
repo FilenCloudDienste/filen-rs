@@ -16,7 +16,7 @@ use std::{
 		Arc, MutexGuard, PoisonError,
 		atomic::{AtomicBool, AtomicU64, Ordering},
 	},
-	time::{Duration, Instant},
+	time::{Duration, Instant, SystemTime},
 };
 
 use chrono::{NaiveDate, Utc};
@@ -1578,6 +1578,29 @@ where
 	tokio::task::spawn_blocking(work)
 		.await
 		.map_err(|e| Error::custom(ErrorKind::Internal, format!("{what} panicked: {e}")))
+}
+
+/// Remove the download temp files `pair`'s scan found left behind by a killed download (see
+/// [`scan::remove_stale_downloads`]). Housekeeping, so nothing here fails the pass: a temp file is
+/// never synced, and one left in place is looked at again by the next whole read.
+async fn remove_stale_downloads(pair: PairId, stale: Vec<PathBuf>) {
+	if stale.is_empty() {
+		return;
+	}
+	let found = stale.len();
+	match off_runtime("removing stale download temp files", move || {
+		scan::remove_stale_downloads(&stale, SystemTime::now())
+	})
+	.await
+	{
+		Ok(removed) => tracing::info!(
+			"sync_once[pair {pair}]: removed {removed} of {found} download temp file(s) a killed \
+			 download left behind"
+		),
+		Err(e) => tracing::warn!(
+			"sync_once[pair {pair}]: stale download temp files were not removed: {e}"
+		),
+	}
 }
 
 /// Whether `pair` has synced: it has a baseline row. Before its first pass it has none, which is
@@ -4725,6 +4748,9 @@ impl SyncEngine {
 			ignored: BTreeMap::new(),
 			ignored_default_untracked: 0,
 			ignore_blocked: BTreeSet::new(),
+			// Left to the next whole read, which walks every directory a leftover can sit in: the
+			// watcher announces no temp file, so a change-scoped pass is never asked to look at one.
+			stale_downloads: Vec::new(),
 		};
 		let remote_emptied = remote_emptied(&view.nodes.of(&inputs.baseline), &inputs.baseline);
 		let store = Arc::clone(&inputs.store);
@@ -6422,6 +6448,9 @@ impl SyncEngine {
 			&gate,
 		)
 		.await;
+		// After the refusal for the same reason, and before the apply: its downloads write temp
+		// files of their own, though none old enough to be taken for a leftover.
+		remove_stale_downloads(pair, mem::take(&mut prep.local_scan.stale_downloads)).await;
 
 		let state = screen_state(&prep);
 		let at = self.stage_at(pair);

@@ -371,6 +371,88 @@ fn in_flight_download_temp_files_are_excluded() {
 	fs::remove_dir_all(&root).ok();
 }
 
+/// Stamp `path` as last modified `ago` before now.
+fn age(path: &Path, ago: Duration) {
+	fs::File::options()
+		.write(true)
+		.open(path)
+		.unwrap()
+		.set_times(fs::FileTimes::new().set_modified(SystemTime::now() - ago))
+		.unwrap();
+}
+
+const TWO_DAYS: Duration = Duration::from_secs(2 * 24 * 60 * 60);
+
+/// A `<uuid>.filendl` file untouched for over a day is what a killed download left behind: the
+/// scan names it for removal. A fresh one is a download in flight, and a `.filendl` file not named
+/// by a download is the user's: both stay.
+#[test]
+fn a_download_temp_file_left_for_a_day_is_named_for_removal() {
+	let root = temp_root();
+	let stale = root.join("dee76e0e-0000-0000-0000-000000000001.filendl");
+	fs::write(&stale, b"half").unwrap();
+	age(&stale, TWO_DAYS);
+	let in_flight = root.join("dee76e0e-0000-0000-0000-000000000002.filendl");
+	fs::write(&in_flight, b"half").unwrap();
+	let users = root.join("notes.filendl");
+	fs::write(&users, b"mine").unwrap();
+	age(&users, TWO_DAYS);
+	fs::create_dir(root.join("sub")).unwrap();
+	let nested = root
+		.join("sub")
+		.join("dee76e0e-0000-0000-0000-000000000003.filendl");
+	fs::write(&nested, b"half").unwrap();
+	age(&nested, TWO_DAYS);
+
+	let mut found = scan_plain(&root, &HashMap::new()).stale_downloads;
+	found.sort();
+
+	assert_eq!(found, vec![stale, nested]);
+	fs::remove_dir_all(&root).ok();
+}
+
+/// The removal asks again: a file written to since the scan named it is left in place, and one
+/// already gone is no error.
+#[test]
+fn stale_download_temp_files_are_removed_unless_written_to_since() {
+	let root = temp_root();
+	let stale = root.join("dee76e0e-0000-0000-0000-000000000001.filendl");
+	fs::write(&stale, b"half").unwrap();
+	age(&stale, TWO_DAYS);
+	let revived = root.join("dee76e0e-0000-0000-0000-000000000002.filendl");
+	fs::write(&revived, b"half").unwrap();
+	let gone = root.join("dee76e0e-0000-0000-0000-000000000003.filendl");
+
+	let removed =
+		remove_stale_downloads(&[stale.clone(), revived.clone(), gone], SystemTime::now());
+
+	assert_eq!(removed, 1);
+	assert!(!stale.exists());
+	assert!(revived.exists());
+	fs::remove_dir_all(&root).ok();
+}
+
+/// A link named like a download temp file is never taken for one: removing it would take the
+/// user's link.
+#[cfg(unix)]
+#[test]
+fn a_link_named_like_a_download_temp_file_is_not_stale() {
+	let root = temp_root();
+	let target = root.join("target.bin");
+	fs::write(&target, b"x").unwrap();
+	age(&target, TWO_DAYS);
+	let link = root.join("dee76e0e-0000-0000-0000-000000000001.filendl");
+	std::os::unix::fs::symlink(&target, &link).unwrap();
+
+	assert!(!is_stale_download(&link, SystemTime::now()));
+	assert!(
+		scan_plain(&root, &HashMap::new())
+			.stale_downloads
+			.is_empty()
+	);
+	fs::remove_dir_all(&root).ok();
+}
+
 #[test]
 fn a_name_the_remote_would_reject_is_reported_once_but_still_observed() {
 	let root = temp_root();
@@ -1206,6 +1288,7 @@ fn a_name_collision_is_not_reported_as_an_error_line() {
 		ignored: BTreeMap::new(),
 		ignored_default_untracked: 0,
 		ignore_blocked: BTreeSet::new(),
+		stale_downloads: Vec::new(),
 	};
 	let reported: Vec<String> = scan.reported_errors().collect();
 	assert_eq!(
