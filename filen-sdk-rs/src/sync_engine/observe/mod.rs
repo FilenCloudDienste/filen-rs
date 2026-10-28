@@ -72,7 +72,8 @@ use super::{
 	rows::Baseline,
 	scan::{
 		LocalNode, LocalScan, PairRoot, RuleFiles, ScanError, ScanRoot, collision_key,
-		fast_path_hash, hash_file, load_rule_file, name_rejection, record, scan_subtree,
+		fast_path_hash, hash_file, load_rule_file, mtime_nanos, name_rejection, record,
+		scan_subtree,
 	},
 	side::Nodes,
 };
@@ -626,6 +627,7 @@ pub(super) fn observe_local(
 					kind: NodeKind::File,
 					size,
 					mtime_millis: mtime,
+					mtime_nanos: mtime_nanos(&metadata, mtime),
 					content_hash,
 				};
 				insert(

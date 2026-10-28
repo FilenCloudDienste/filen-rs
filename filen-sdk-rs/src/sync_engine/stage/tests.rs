@@ -346,6 +346,7 @@ fn every_entry_reads_back_as_it_was_staged() {
 		kind: NodeKind::File,
 		size: u64::try_from(i64::MAX).unwrap(),
 		mtime_millis: -3,
+		mtime_nanos: 0,
 		content_hash: Some(Blake3Hash::from([2; 32])),
 	};
 	let remote = RemoteNode {
@@ -701,6 +702,7 @@ fn paging_through_a_plan_holds_a_page_of_it() {
 			kind: NodeKind::File,
 			size: 3,
 			mtime_millis: 20,
+			mtime_nanos: 0,
 			content_hash: Some(Blake3Hash::from([1; 32])),
 		};
 		writer

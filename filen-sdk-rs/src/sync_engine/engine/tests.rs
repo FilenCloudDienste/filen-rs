@@ -475,6 +475,7 @@ fn a_synced_path_whose_remote_item_left_the_view_is_blocked_not_deleted() {
 			kind: NodeKind::File,
 			size: 4,
 			mtime_millis: 0,
+			mtime_nanos: 0,
 			content_hash: Some(hash),
 		},
 	)]);
@@ -1102,6 +1103,7 @@ fn the_assembly_check_catches_a_path_no_observation_dropped() {
 		kind: NodeKind::File,
 		size: 4,
 		mtime_millis: 1,
+		mtime_nanos: 0,
 		content_hash: Some(hash),
 	};
 	// One observation: a COMPLETE walk of `docs`, which found both of its rows again.
@@ -1505,6 +1507,7 @@ fn local_dir(rel: &str) -> LocalNode {
 		kind: NodeKind::Dir,
 		size: 0,
 		mtime_millis: 0,
+		mtime_nanos: 0,
 		content_hash: None,
 	}
 }
@@ -1515,6 +1518,7 @@ fn local_file(rel: &str, hash: Blake3Hash) -> LocalNode {
 		kind: NodeKind::File,
 		size: 4,
 		mtime_millis: 0,
+		mtime_nanos: 0,
 		content_hash: Some(hash),
 	}
 }
@@ -3654,6 +3658,7 @@ fn local_map(hash: Blake3Hash) -> HashMap<String, LocalNode> {
 			kind: NodeKind::File,
 			size: 5,
 			mtime_millis: 111,
+			mtime_nanos: 0,
 			content_hash: Some(hash),
 		},
 	)])
@@ -6148,6 +6153,7 @@ fn a_pending_move_is_folded_to_its_destination() {
 			kind: NodeKind::File,
 			size: 5,
 			mtime_millis: 111,
+			mtime_nanos: 0,
 			content_hash: Some(hash(3)),
 		},
 	)]);
@@ -6205,6 +6211,7 @@ fn a_move_whose_destination_was_taken_still_vacates_the_pre_move_path() {
 			kind: NodeKind::File,
 			size: 5,
 			mtime_millis: 111,
+			mtime_nanos: 0,
 			content_hash: Some(hash(3)),
 		},
 	)]);
@@ -6559,6 +6566,7 @@ fn a_conflicted_path_is_re_reported_even_with_a_write_folded_at_it() {
 			kind: NodeKind::File,
 			size: 5,
 			mtime_millis: 111,
+			mtime_nanos: 0,
 			content_hash: Some(hash(2)),
 		},
 	)]);
@@ -7683,6 +7691,7 @@ fn seed_local(rel: &str) -> LocalNode {
 		kind: NodeKind::File,
 		size: 5,
 		mtime_millis: SEED_STAMP,
+		mtime_nanos: 0,
 		content_hash: Some(hash(7)),
 	}
 }
@@ -8328,12 +8337,12 @@ const CACHED_SIZE: u64 = 7;
 const CACHED_STAMP: i64 = 1_234;
 
 /// An engine with a fresh two-way pair and no rows, whose local root holds `a.bin`, [`CACHED_SIZE`]
-/// bytes stamped `local_mtime`, and whose remote root holds a hashless `a.bin` as
+/// bytes stamped `local_mtime` past the epoch, and whose remote root holds a hashless `a.bin` as
 /// [`cacheable_file`] caches one: what a pair migrated from filen-sync reads first. Offline: the
 /// remote is the cache's rows. With the directory everything is in and the cache, which must
 /// outlive the engine's reads.
 async fn engine_over_a_hashless_file(
-	local_mtime: i64,
+	local_mtime: Duration,
 ) -> (tempfile::TempDir, SyncEngine, PairId, CacheState) {
 	let dir = tempfile::tempdir().unwrap();
 	let root = dir.path().join("local");
@@ -8344,9 +8353,7 @@ async fn engine_over_a_hashless_file(
 		.write(true)
 		.open(&file)
 		.unwrap()
-		.set_modified(
-			std::time::UNIX_EPOCH + Duration::from_millis(u64::try_from(local_mtime).unwrap()),
-		)
+		.set_modified(std::time::UNIX_EPOCH + local_mtime)
 		.unwrap();
 	let account = Uuid::from_u128(1);
 	let remote_root = Uuid::from_u128(2);
@@ -8383,11 +8390,15 @@ async fn stored_paths(engine: &SyncEngine, pair: PairId) -> Vec<String> {
 		.collect()
 }
 
-/// `plan_pair` on a pair that has never synced plans nothing at a hashless file whose size and
-/// stamp match the local one, and writes no row; the pass after it records the row as before.
-#[tokio::test]
-async fn a_dry_run_of_a_never_synced_pair_plans_what_its_first_pass_will() {
-	let (_dir, engine, pair, _cache) = engine_over_a_hashless_file(CACHED_STAMP).await;
+/// [`CACHED_STAMP`] plus `millis`, as a time past the epoch.
+fn cached_stamp_plus(millis: u64) -> Duration {
+	Duration::from_millis(u64::try_from(CACHED_STAMP).unwrap() + millis)
+}
+
+/// `plan_pair` over [`engine_over_a_hashless_file`] with the local copy stamped `local_mtime`
+/// plans nothing and writes no row, and the pass after it records the row.
+async fn assert_dry_run_plans_what_the_first_pass_records(local_mtime: Duration) {
+	let (_dir, engine, pair, _cache) = engine_over_a_hashless_file(local_mtime).await;
 	let outcome = engine.plan_pair(pair).await.unwrap();
 	assert_eq!(outcome.refused, None);
 	assert_eq!(outcome.conflicts, []);
@@ -8399,12 +8410,37 @@ async fn a_dry_run_of_a_never_synced_pair_plans_what_its_first_pass_will() {
 	assert_eq!(stored_paths(&engine, pair).await, ["a.bin"]);
 }
 
+/// `plan_pair` on a pair that has never synced plans nothing at a hashless file whose size and
+/// stamp match the local one, and writes no row; the pass after it records the row as before.
+#[tokio::test]
+async fn a_dry_run_of_a_never_synced_pair_plans_what_its_first_pass_will() {
+	assert_dry_run_plans_what_the_first_pass_records(cached_stamp_plus(0)).await;
+}
+
+/// The same for a local copy 0.6 ms past the remote stamp, which this engine reads at the next
+/// millisecond on Unix: filen-sync stamped it `Math.floor` of Node's `mtimeMs`, the stamp's own
+/// millisecond.
+#[tokio::test]
+async fn a_dry_run_plans_nothing_at_a_file_filen_sync_stamped_from_its_local_copy() {
+	assert_dry_run_plans_what_the_first_pass_records(
+		cached_stamp_plus(0) + Duration::from_micros(600),
+	)
+	.await;
+}
+
+/// The same for a local copy in whole seconds, as a file system that keeps no more holds it, at
+/// the second the remote stamp falls in.
+#[tokio::test]
+async fn a_dry_run_plans_nothing_at_a_file_stamped_in_the_whole_second_its_local_copy_holds() {
+	assert_dry_run_plans_what_the_first_pass_records(Duration::from_secs(1)).await;
+}
+
 /// The same for a file only the imported filen-sync state vouches for: its local copy was touched
 /// since the hashless upload, and that state lists it at the local size and mtime.
 #[tokio::test]
 async fn a_dry_run_plans_nothing_at_a_file_the_imported_state_lists() {
 	let touched = CACHED_STAMP + 5000;
-	let (_dir, engine, pair, _cache) = engine_over_a_hashless_file(touched).await;
+	let (_dir, engine, pair, _cache) = engine_over_a_hashless_file(cached_stamp_plus(5000)).await;
 	let state = tempfile::tempdir().unwrap();
 	std::fs::write(
 		state.path().join("previousLocalTree"),
@@ -8439,11 +8475,12 @@ async fn a_dry_run_plans_nothing_at_a_file_the_imported_state_lists() {
 	assert_eq!(stored_paths(&engine, pair).await, ["a.bin"]);
 }
 
-/// Without evidence — the local copy was touched, and nothing was imported — the dry run still
-/// shows the conflict the pass will hold.
+/// Without evidence — the local copy was touched, a millisecond into the stamp's second, and
+/// nothing was imported — the dry run still shows the conflict the pass will hold: a local mtime
+/// with a sub-second part is never compared at seconds.
 #[tokio::test]
 async fn a_dry_run_still_shows_the_conflict_where_no_evidence_holds() {
-	let (_dir, engine, pair, _cache) = engine_over_a_hashless_file(CACHED_STAMP + 1).await;
+	let (_dir, engine, pair, _cache) = engine_over_a_hashless_file(cached_stamp_plus(1)).await;
 	let outcome = engine.plan_pair(pair).await.unwrap();
 	let conflicts: Vec<&str> = outcome
 		.conflicts

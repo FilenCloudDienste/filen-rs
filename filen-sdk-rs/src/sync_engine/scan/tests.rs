@@ -1,4 +1,4 @@
-use std::fs;
+use std::{fs, time::Duration};
 
 use super::super::side::{Nodes, NodesAt, test_support::sorted_entries};
 
@@ -127,6 +127,39 @@ fn scans_a_tree_into_normalized_nodes() {
 		nodes.at("sub").unwrap().content_hash.is_none(),
 		"dirs have no hash"
 	);
+
+	fs::remove_dir_all(&root).ok();
+}
+
+/// The scan reads a file's mtime to the millisecond and keeps the nanoseconds that reading drops,
+/// however the platform rounds it: 1.2346 s past the epoch, which Unix reads as 1235 ms and
+/// Windows as 1234.
+#[test]
+fn a_file_keeps_the_nanoseconds_its_millisecond_mtime_drops() {
+	let root = temp_root();
+	for (name, mtime) in [
+		("a.txt", Duration::from_nanos(1_234_600_000)),
+		("b.txt", Duration::from_secs(1)),
+	] {
+		let file = root.join(name);
+		fs::write(&file, b"hello").unwrap();
+		fs::File::options()
+			.write(true)
+			.open(&file)
+			.unwrap()
+			.set_modified(std::time::UNIX_EPOCH + mtime)
+			.unwrap();
+	}
+
+	let scan = scan_plain(&root, &HashMap::new());
+	let nodes = scan.nodes.whole();
+	let a = nodes.at("a.txt").unwrap();
+	assert_eq!(
+		i128::from(a.mtime_millis) * 1_000_000 + i128::from(a.mtime_nanos),
+		1_234_600_000
+	);
+	let b = nodes.at("b.txt").unwrap();
+	assert_eq!((b.mtime_millis, b.mtime_nanos), (1000, 0));
 
 	fs::remove_dir_all(&root).ok();
 }

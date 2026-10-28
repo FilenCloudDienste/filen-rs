@@ -296,10 +296,10 @@ fn sorted(keys: impl IntoIterator<Item = String>) -> Vec<String> {
 	keys
 }
 
-/// The two maps, node for node, against what a whole-tree read produces — with the one
-/// difference derivation cannot avoid named rather than skipped: a directory row records no
-/// remote stamp, so a derived directory carries `0` where the view carries the server's created
-/// stamp (see the module docs).
+/// The two maps, node for node, against what a whole-tree read produces — with the differences
+/// derivation cannot avoid named rather than skipped: a directory row records no remote stamp, so a
+/// derived directory carries `0` where the view carries the server's created stamp, and a file row
+/// records its mtime to the millisecond only (see the module docs).
 fn assert_same_maps(
 	baseline: &Baseline,
 	derived: &Derived,
@@ -330,7 +330,17 @@ fn assert_same_maps(
 				"local directory at {path:?} differs by more than its mtime"
 			);
 		} else {
-			assert_eq!(derived_node, node, "local node at {path:?}");
+			assert_eq!(
+				&LocalNode {
+					mtime_nanos: 0,
+					..derived_node.clone()
+				},
+				&LocalNode {
+					mtime_nanos: 0,
+					..node.clone()
+				},
+				"local file at {path:?} differs by more than what its row cannot record"
+			);
 		}
 	}
 	let visible: Vec<String> = remote_nodes
@@ -1257,6 +1267,7 @@ fn renamed_dir_peak(files: usize) -> (usize, u64) {
 		kind: NodeKind::Dir,
 		size: 0,
 		mtime_millis: 99,
+		mtime_nanos: 0,
 		content_hash: None,
 	};
 	let dir_remote = RemoteNode {
@@ -1281,6 +1292,7 @@ fn renamed_dir_peak(files: usize) -> (usize, u64) {
 			kind: NodeKind::File,
 			size: 1,
 			mtime_millis,
+			mtime_nanos: 0,
 			content_hash: Some(hash),
 		};
 		let remote = RemoteNode {

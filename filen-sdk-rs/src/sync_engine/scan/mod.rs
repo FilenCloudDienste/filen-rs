@@ -43,6 +43,7 @@ use std::{
 	},
 };
 
+use chrono::{DateTime, Utc};
 use filen_types::crypto::Blake3Hash;
 use unicode_normalization::{UnicodeNormalization, is_nfc};
 
@@ -141,6 +142,13 @@ pub(crate) struct LocalNode {
 	pub(crate) size: u64,
 	/// Modification time in epoch millis.
 	pub(crate) mtime_millis: i64,
+	/// How many nanoseconds the file system's mtime lies past [`mtime_millis`](Self::mtime_millis),
+	/// the precision that reading of it drops: it rounds to the nearest millisecond on Unix and
+	/// truncates on Windows, so this is negative where it rounded up. The seeding stage weighs a
+	/// remote stamp written in whole seconds or by filen-sync by it (see `seed::evidence`). 0 for a
+	/// directory, and on a node built from a row or read back from a staged plan, which record
+	/// milliseconds only: the seeding weighs neither.
+	pub(crate) mtime_nanos: i32,
 	/// BLAKE3 of the content (files only): reused from the baseline when `(size, mtime)` matched
 	/// (the fast-path) — the row at its own path, or the one at the path a caller proved its
 	/// directory was renamed from — otherwise freshly computed.
@@ -768,6 +776,7 @@ enum Reading {
 	File {
 		size: u64,
 		mtime_millis: i64,
+		mtime_nanos: i32,
 		/// The baseline's hash when the fast path took it (or `moved_hash` answered), read otherwise.
 		hash: std::io::Result<Blake3Hash>,
 	},
@@ -789,11 +798,30 @@ fn reading(
 		Reading::File {
 			size,
 			mtime_millis,
+			mtime_nanos: mtime_nanos(metadata, mtime_millis),
 			hash: hash(size, mtime_millis),
 		}
 	} else {
 		Reading::Other
 	}
+}
+
+/// How many nanoseconds `metadata`'s mtime lies past `mtime_millis`, the milliseconds
+/// [`FilenMetaExt::modified`] reads it as (see [`LocalNode::mtime_nanos`]); 0 where the file system
+/// gives no mtime, or where the two readings are further apart than an `i32` of nanoseconds (an
+/// mtime past the range of either).
+pub(crate) fn mtime_nanos(metadata: &std::fs::Metadata, mtime_millis: i64) -> i32 {
+	let (Ok(modified), Some(read)) = (
+		metadata.modified(),
+		DateTime::from_timestamp_millis(mtime_millis),
+	) else {
+		return 0;
+	};
+	DateTime::<Utc>::from(modified)
+		.signed_duration_since(read)
+		.num_nanoseconds()
+		.and_then(|nanos| i32::try_from(nanos).ok())
+		.unwrap_or(0)
 }
 
 /// `read`, or, when it is a file whose hash read failed and `stat` now finds something other than a
@@ -811,12 +839,14 @@ fn restat_failed_read(
 		Reading::File {
 			size,
 			mtime_millis,
+			mtime_nanos,
 			hash: Err(source),
 		} => match stat() {
 			Ok(now) if !now.is_file() => reading(&now, |_, _| Err(source)),
 			_ => Reading::File {
 				size,
 				mtime_millis,
+				mtime_nanos,
 				hash: Err(source),
 			},
 		},
@@ -983,13 +1013,14 @@ impl<S: ScanSink> Window<'_, S> {
 			}
 			_ => {}
 		}
-		let (kind, size, mtime_millis, hash) = match read {
-			Ok(Reading::Dir { mtime_millis }) => (NodeKind::Dir, 0, mtime_millis, None),
+		let (kind, size, mtime_millis, mtime_nanos, hash) = match read {
+			Ok(Reading::Dir { mtime_millis }) => (NodeKind::Dir, 0, mtime_millis, 0, None),
 			Ok(Reading::File {
 				size,
 				mtime_millis,
+				mtime_nanos,
 				hash,
-			}) => (NodeKind::File, size, mtime_millis, Some(hash)),
+			}) => (NodeKind::File, size, mtime_millis, mtime_nanos, Some(hash)),
 			Ok(Reading::Other) => return None,
 			// Gone since the walk listed it: the walk observed this entry and something removed it
 			// meanwhile, so nothing was missed and the scan still completed. Its absence is real
@@ -1064,6 +1095,7 @@ impl<S: ScanSink> Window<'_, S> {
 			kind,
 			size,
 			mtime_millis,
+			mtime_nanos,
 			content_hash,
 		}))
 	}

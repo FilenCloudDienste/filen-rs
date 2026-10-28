@@ -43,6 +43,10 @@
 //! a pass reads — `plan::classify_local` and `plan::classify_remote` answer `Unchanged` for a
 //! directory pair whatever their stamps say — and the tests below pin that by planning against the
 //! derived maps and the whole-tree ones and comparing the plans.
+//!
+//! A file's mtime past the millisecond is the last: a row records milliseconds, so a derived file
+//! carries no [`mtime_nanos`](LocalNode::mtime_nanos). Only the seeding stage reads it, and that
+//! never weighs a path with a row.
 
 use std::{collections::BTreeSet, mem};
 
@@ -172,6 +176,7 @@ fn extracted(row: &BaselineEntry) -> Option<(LocalNode, RemoteNode)> {
 			kind: NodeKind::Dir,
 			size: 0,
 			mtime_millis: row.local_mtime.unwrap_or(0),
+			mtime_nanos: 0,
 			content_hash: None,
 		},
 		// A file's every field IS read — the hash classifies it, the `(size, mtime)` pair is the
@@ -184,6 +189,7 @@ fn extracted(row: &BaselineEntry) -> Option<(LocalNode, RemoteNode)> {
 				kind: NodeKind::File,
 				size: row.size?,
 				mtime_millis: row.local_mtime?,
+				mtime_nanos: 0,
 				content_hash: Some(row.content_hash?),
 			}
 		}

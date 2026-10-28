@@ -1942,6 +1942,7 @@ fn local_file(rel: &str, hash: [u8; 32]) -> LocalNode {
 		kind: NodeKind::File,
 		size: 10,
 		mtime_millis: 1,
+		mtime_nanos: 0,
 		content_hash: Some(Blake3Hash::from(hash)),
 	}
 }
@@ -1952,6 +1953,7 @@ fn local_dir(rel: &str) -> LocalNode {
 		kind: NodeKind::Dir,
 		size: 0,
 		mtime_millis: 1,
+		mtime_nanos: 0,
 		content_hash: None,
 	}
 }

@@ -1066,6 +1066,8 @@ fn entry_of(row: &Row<'_>) -> rusqlite::Result<(SyncAction, StagedInputs)> {
 			kind: kind_of(kind)?,
 			size: row.get(10)?,
 			mtime_millis: row.get(11)?,
+			// Not staged: only the seeding reads it, before the plan.
+			mtime_nanos: 0,
 			content_hash: hash_at(row, 12)?,
 		})),
 	};

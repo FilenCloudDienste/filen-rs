@@ -316,6 +316,32 @@ fn a_dirty_rule_file_re_observes_its_directory() {
 	fs::remove_dir_all(&root).ok();
 }
 
+/// An observed file keeps the nanoseconds its millisecond mtime drops, as the scan does.
+#[test]
+fn a_present_file_keeps_the_nanoseconds_its_millisecond_mtime_drops() {
+	let root = temp_root();
+	let file = root.join("a.txt");
+	fs::write(&file, b"hello").unwrap();
+	fs::File::options()
+		.write(true)
+		.open(&file)
+		.unwrap()
+		.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_nanos(1_234_600_000))
+		.unwrap();
+
+	let out = observe_with(&root, &Baseline::default(), &["a.txt"]);
+
+	let LocalObservation::File { node, .. } = &out.observed["a.txt"] else {
+		panic!("{:?}", out.observed);
+	};
+	assert_eq!(
+		i128::from(node.mtime_millis) * 1_000_000 + i128::from(node.mtime_nanos),
+		1_234_600_000
+	);
+
+	fs::remove_dir_all(&root).ok();
+}
+
 /// A present file carries the whole-tree walk's own fast-path: unchanged `(size, mtime)` reuses
 /// the baseline's hash instead of re-reading the file.
 #[test]

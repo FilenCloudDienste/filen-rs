@@ -21,6 +21,7 @@ fn local(rel: &str, size: u64, mtime_millis: i64) -> LocalNode {
 		kind: NodeKind::File,
 		size,
 		mtime_millis,
+		mtime_nanos: 0,
 		content_hash: Some(hash(7)),
 	}
 }
@@ -75,6 +76,121 @@ fn a_missing_remote_stamp_never_matches_a_file_with_content() {
 		evidence(&local("a", 5, 0), &hashless("a", 1, 5, 0), None),
 		None
 	);
+}
+
+/// A second on the remote stamps below, in epoch millis.
+const SECOND: i64 = 1_743_472_771_000;
+
+/// A hashed local file of 5 bytes read at `mtime_millis`, the file system holding it `mtime_nanos`
+/// past that.
+fn read_at(mtime_millis: i64, mtime_nanos: i32) -> LocalNode {
+	LocalNode {
+		mtime_nanos,
+		..local("a", 5, mtime_millis)
+	}
+}
+
+/// The evidence for `local` against a hashless remote of 5 bytes stamped `remote_millis`.
+fn weighed(local: &LocalNode, remote_millis: i64) -> Option<Evidence> {
+	evidence(local, &hashless("a", 1, 5, remote_millis), None)
+}
+
+/// 440.9999 ms into the second, read at 440 as Windows reads it: Node's `mtimeMs` is the double
+/// `...440.9999`, which rounds up to `...441` before filen-sync floored it.
+#[test]
+fn filen_sync_s_stamp_rounded_up_to_the_next_millisecond_is_evidence() {
+	let file = read_at(SECOND + 440, 999_900);
+	assert_eq!(weighed(&file, SECOND + 441), Some(Evidence::SizeAndMtime));
+	assert_eq!(weighed(&file, SECOND + 440), Some(Evidence::SizeAndMtime));
+	assert_eq!(weighed(&file, SECOND + 442), None);
+	assert_eq!(weighed(&file, SECOND + 439), None);
+}
+
+/// The same with the nanoseconds a float-seconds `utimes` leaves, `1743472771440999961`, read at
+/// the millisecond below.
+#[test]
+fn filen_sync_s_stamp_of_a_float_seconds_mtime_is_evidence() {
+	let file = read_at(SECOND + 440, 999_961);
+	assert_eq!(weighed(&file, SECOND + 441), Some(Evidence::SizeAndMtime));
+	assert_eq!(weighed(&file, SECOND + 442), None);
+}
+
+/// 440.6 ms into the second, read at 441 as Unix reads it: filen-sync floored Node's
+/// `...440.6` to `...440`.
+#[test]
+fn filen_sync_s_floor_below_a_millisecond_this_engine_rounds_up_is_evidence() {
+	let file = read_at(SECOND + 441, -400_000);
+	assert_eq!(weighed(&file, SECOND + 440), Some(Evidence::SizeAndMtime));
+	assert_eq!(weighed(&file, SECOND + 441), Some(Evidence::SizeAndMtime));
+	assert_eq!(weighed(&file, SECOND + 439), None);
+	assert_eq!(weighed(&file, SECOND + 442), None);
+}
+
+#[test]
+fn a_whole_second_local_mtime_matches_a_remote_stamp_anywhere_in_that_second() {
+	let file = read_at(SECOND, 0);
+	for remote in [SECOND, SECOND + 1, SECOND + 441, SECOND + 999] {
+		assert_eq!(
+			weighed(&file, remote),
+			Some(Evidence::SizeAndMtime),
+			"remote stamp {remote}"
+		);
+	}
+	for remote in [SECOND - 1, SECOND + 1000] {
+		assert_eq!(weighed(&file, remote), None, "remote stamp {remote}");
+	}
+}
+
+/// The second is the one the mtime is in, before the epoch too.
+#[test]
+fn a_whole_second_before_the_epoch_matches_the_stamps_of_that_second() {
+	let file = read_at(-1000, 0);
+	assert_eq!(weighed(&file, -1), Some(Evidence::SizeAndMtime));
+	assert_eq!(weighed(&file, -999), Some(Evidence::SizeAndMtime));
+	assert_eq!(weighed(&file, -1001), None);
+}
+
+#[test]
+fn a_local_mtime_with_a_sub_second_part_is_never_compared_at_seconds() {
+	for (file, what) in [
+		(read_at(SECOND + 440, 0), "440 ms in"),
+		(read_at(SECOND, 1), "a nanosecond past the second"),
+		// 999.6 ms in, which Unix reads as the next whole second.
+		(
+			read_at(SECOND + 1000, -400_000),
+			"rounded up to the next second",
+		),
+	] {
+		for remote in [SECOND + 1, SECOND + 441, SECOND + 1441] {
+			assert_eq!(
+				weighed(&file, remote),
+				None,
+				"{what}, remote stamp {remote}"
+			);
+		}
+	}
+}
+
+#[test]
+fn a_size_off_by_one_is_no_evidence_however_the_stamps_are_read() {
+	for (file, remote) in [
+		(read_at(SECOND + 440, 999_900), SECOND + 441),
+		(read_at(SECOND + 441, -400_000), SECOND + 440),
+		(read_at(SECOND, 0), SECOND + 441),
+	] {
+		assert_eq!(
+			evidence(&file, &hashless("a", 1, 6, remote), None),
+			None,
+			"remote stamp {remote}"
+		);
+	}
+}
+
+#[test]
+fn a_missing_remote_stamp_never_matches_however_the_local_mtime_is_read() {
+	for file in [read_at(0, 0), read_at(0, 400_000), read_at(1, -600_000)] {
+		assert_eq!(weighed(&file, 0), None, "{file:?}");
+	}
 }
 
 #[test]

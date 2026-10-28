@@ -6,7 +6,8 @@
 //!
 //! `local` holds a row per entry: its root-relative path, its kind — [`NodeKind`]'s code, as the
 //! plan table writes it, or [`CLAIM`] for an entry that took its folded name and then could not
-//! become a node (see `scan::Found::Claim`) — and its size, mtime and content hash. A rowid table,
+//! become a node (see `scan::Found::Claim`) — and its size, mtime, content hash and the
+//! nanoseconds its mtime lies past the millisecond (`LocalNode::mtime_nanos`). A rowid table,
 //! so a directory move rewrites its rows' paths in the indexes rather than moving the rows.
 //!
 //! Two unique indexes: the path's own, which every read seeks, and the folded path's,
@@ -38,7 +39,8 @@ CREATE TABLE local (
 	kind INTEGER NOT NULL,
 	size INTEGER,
 	mtime INTEGER,
-	hash BLOB
+	hash BLOB,
+	nanos INTEGER
 );
 CREATE UNIQUE INDEX local_fold ON local (fold(path));
 CREATE INDEX local_dirs ON local (path) WHERE kind = 1;
@@ -58,22 +60,23 @@ const DELETE_CLAIMS: &str = "DELETE FROM local WHERE kind = 0";
 
 /// The statements of [`LOCAL`].
 const LOCAL_SQL: Sql = Sql {
-	page_from: "SELECT path, kind, size, mtime, hash FROM local
+	page_from: "SELECT path, kind, size, mtime, hash, nanos FROM local
 		 WHERE path >= ?1 ORDER BY path LIMIT ?2",
-	page_after: "SELECT path, kind, size, mtime, hash FROM local
+	page_after: "SELECT path, kind, size, mtime, hash, nanos FROM local
 		 WHERE path > ?1 ORDER BY path LIMIT ?2",
-	page_from_below: "SELECT path, kind, size, mtime, hash FROM local
+	page_from_below: "SELECT path, kind, size, mtime, hash, nanos FROM local
 		 WHERE path >= ?1 AND path < ?2 ORDER BY path LIMIT ?3",
-	page_after_below: "SELECT path, kind, size, mtime, hash FROM local
+	page_after_below: "SELECT path, kind, size, mtime, hash, nanos FROM local
 		 WHERE path > ?1 AND path < ?2 ORDER BY path LIMIT ?3",
-	dirs_from: "SELECT path, kind, size, mtime, hash FROM local
+	dirs_from: "SELECT path, kind, size, mtime, hash, nanos FROM local
 		 WHERE kind = 1 AND path >= ?1 ORDER BY path LIMIT ?2",
-	dirs_after: "SELECT path, kind, size, mtime, hash FROM local
+	dirs_after: "SELECT path, kind, size, mtime, hash, nanos FROM local
 		 WHERE kind = 1 AND path > ?1 ORDER BY path LIMIT ?2",
-	insert: "INSERT INTO local (path, kind, size, mtime, hash) VALUES (?1, ?2, ?3, ?4, ?5)
+	insert:
+		"INSERT INTO local (path, kind, size, mtime, hash, nanos) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
 		 ON CONFLICT DO NOTHING",
-	update: "UPDATE local SET kind = ?2, size = ?3, mtime = ?4, hash = ?5 WHERE path = ?1",
-	remove: "DELETE FROM local WHERE path = ?1 RETURNING path, kind, size, mtime, hash",
+	update: "UPDATE local SET kind = ?2, size = ?3, mtime = ?4, hash = ?5, nanos = ?6 WHERE path = ?1",
+	remove: "DELETE FROM local WHERE path = ?1 RETURNING path, kind, size, mtime, hash, nanos",
 	forget: "DELETE FROM local WHERE path = ?1",
 	forget_under: "DELETE FROM local WHERE path >= ?1 || '/' AND path < ?1 || '0'",
 	occupied: "SELECT EXISTS (SELECT 1 FROM local WHERE fold(path) = ?1)
@@ -119,6 +122,7 @@ fn node_of(row: &Row<'_>) -> rusqlite::Result<LocalNode> {
 		kind: kind_at(row, 1)?,
 		size: row.get(2)?,
 		mtime_millis: row.get(3)?,
+		mtime_nanos: row.get(5)?,
 		content_hash: hash_at(row, 4)?,
 	})
 }
@@ -147,6 +151,7 @@ fn write_node(
 		node.size,
 		node.mtime_millis,
 		hash_bytes(node.content_hash.as_ref()),
+		node.mtime_nanos,
 	])
 }
 
@@ -191,7 +196,8 @@ impl ScanSink for StageSink {
 					CLAIM,
 					None::<u64>,
 					None::<i64>,
-					None::<&[u8]>
+					None::<&[u8]>,
+					None::<i32>
 				])?,
 			};
 			if written == 0 {

@@ -28,6 +28,8 @@ fn node(rel_path: &str, kind: NodeKind, version: u8) -> LocalNode {
 			NodeKind::Dir => 0,
 		},
 		mtime_millis: 1_700_000_000_000 + i64::from(version),
+		// Either side of the millisecond, as Unix reads an mtime.
+		mtime_nanos: (i32::from(version) - 128) * 3_000,
 		content_hash: (kind == NodeKind::File).then(|| Blake3Hash::from([version; 32])),
 	}
 }

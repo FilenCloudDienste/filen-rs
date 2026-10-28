@@ -18,9 +18,24 @@
 //!   there, and the local file has the size and mtime (to the millisecond) it last saw. A stale
 //!   version or a local edit since is no evidence here, and the path is weighed by what follows;
 //! - both files are empty: the content is provably the same, whatever the stamps say;
-//! - the sizes are equal and the remote's `lastModified` is the local mtime to the millisecond. A
-//!   remote stamp of 0 is a missing one and never matches. There is no tolerance: a miss goes the
-//!   safe way, a conflict or a transfer, where a tolerance would adopt a different file.
+//! - the sizes are equal and the remote's `lastModified` is the local mtime, read one of the ways a
+//!   client that stamped it can have read it:
+//!   - to the millisecond, as this engine reads it ([`LocalNode::mtime_millis`]);
+//!   - as filen-sync read it, the stamp it gave every file it uploaded: `Math.floor(stats.mtimeMs)`,
+//!     where Node computes `mtimeMs` as `sec * 1000 + nsec / 1e6` in doubles. That is the
+//!     millisecond below where this engine rounds up to the next one (on Unix); and where the
+//!     nanoseconds lie a fraction of a microsecond short of a millisecond, as the mtimes filen-sync
+//!     set from float seconds on the files it downloaded can, the double rounds up to it before
+//!     the floor. So the stamp is computed as Node computes it, in `f64`, and only then floored;
+//!   - in whole seconds, where the local mtime has no sub-second part: a file system that keeps
+//!     whole seconds only (older HFS+, some network shares), or a writer that set it so, drops the
+//!     remote stamp's milliseconds, so a remote stamp anywhere in that second matches. FAT keeps
+//!     two-second steps, so there only a remote stamp in the second it kept does. A local mtime
+//!     with any sub-second part is never compared at seconds.
+//!
+//!   A remote stamp of 0 is a missing one and never matches. There is no tolerance beyond these: a
+//!   miss goes the safe way, a conflict or a transfer, where a tolerance would adopt a different
+//!   file.
 //!
 //! A file whose remote item another row already records — by its version or its whole-life id —
 //! is never seeded: that is the same file renamed on both sides, which the move detection carries
@@ -35,6 +50,7 @@
 use std::{borrow::Cow, cell::RefCell};
 
 use filen_types::fs::StableUuid;
+use num_traits::ToPrimitive;
 use uuid::Uuid;
 
 use super::{
@@ -73,7 +89,8 @@ pub(super) enum Evidence {
 	Imported,
 	/// Both files are empty.
 	Empty,
-	/// The same size, and the remote's `lastModified` is the local mtime to the millisecond.
+	/// The same size, and the remote's `lastModified` is the local mtime, read to the millisecond,
+	/// as filen-sync read it, or in whole seconds where it has no sub-second part.
 	SizeAndMtime,
 }
 
@@ -111,7 +128,7 @@ pub(super) fn candidate(local: &LocalNode, remote: &RemoteNode) -> bool {
 
 /// The evidence that the two files of a [`candidate`] hold the same content, if there is any (see
 /// the module docs), where `imported` is what the pair's imported filen-sync state recorded at the
-/// path. Plain equality on every stamp: no arithmetic, no tolerance.
+/// path. Equality on every stamp, each read only the ways the module docs list: no tolerance.
 pub(super) fn evidence(
 	local: &LocalNode,
 	remote: &RemoteNode,
@@ -130,8 +147,44 @@ pub(super) fn evidence(
 	if local.size == 0 {
 		return Some(Evidence::Empty);
 	}
-	(remote.modified_millis != 0 && remote.modified_millis == local.mtime_millis)
+	(remote.modified_millis != 0 && same_mtime(local, remote.modified_millis))
 		.then_some(Evidence::SizeAndMtime)
+}
+
+/// Whether a remote `lastModified` of `remote_millis` is `local`'s mtime, read to the millisecond,
+/// as filen-sync read it, or in whole seconds where it has no sub-second part (see the module docs).
+fn same_mtime(local: &LocalNode, remote_millis: i64) -> bool {
+	if remote_millis == local.mtime_millis {
+		return true;
+	}
+	let Some((secs, nanos)) = mtime_parts(local) else {
+		return false;
+	};
+	if nanos == 0 {
+		return remote_millis.div_euclid(1000) == secs;
+	}
+	node_mtime_millis(secs, nanos) == Some(remote_millis)
+}
+
+/// `local`'s mtime as the file system holds it: whole seconds since the epoch, and the nanoseconds
+/// past them. `None` only past the range of an `i64` of seconds.
+fn mtime_parts(local: &LocalNode) -> Option<(i64, u32)> {
+	let nanos = local.mtime_millis.rem_euclid(1000) * 1_000_000 + i64::from(local.mtime_nanos);
+	let secs = local
+		.mtime_millis
+		.div_euclid(1000)
+		.checked_add(nanos.div_euclid(1_000_000_000))?;
+	Some((secs, u32::try_from(nanos.rem_euclid(1_000_000_000)).ok()?))
+}
+
+/// `Math.floor(stats.mtimeMs)` for an mtime of `secs` and `nanos`, the stamp filen-sync gave a file
+/// it uploaded: Node computes `mtimeMs` as `sec * 1000 + nsec / 1e6` in doubles, which can round up
+/// to the next millisecond before the floor, so it is computed the same way here. `None` past the
+/// range of an `i64`.
+fn node_mtime_millis(secs: i64, nanos: u32) -> Option<i64> {
+	(secs.to_f64()? * 1000.0 + f64::from(nanos) / 1_000_000.0)
+		.floor()
+		.to_i64()
 }
 
 /// The row that records `rel_path` as synced, as `apply::adopt_outcome` records a converged file,

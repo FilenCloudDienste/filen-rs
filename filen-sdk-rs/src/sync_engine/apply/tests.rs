@@ -1042,6 +1042,7 @@ fn local_node(rel: &str, mtime: i64, hash: Option<Blake3Hash>) -> LocalNode {
 		kind: NodeKind::File,
 		size: 3,
 		mtime_millis: mtime,
+		mtime_nanos: 0,
 		content_hash: hash,
 	}
 }

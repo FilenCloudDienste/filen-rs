@@ -499,6 +499,7 @@ mod tests {
 				kind: NodeKind::File,
 				size,
 				mtime_millis: 0,
+				mtime_nanos: 0,
 				content_hash: None,
 			},
 		)

@@ -725,6 +725,7 @@ mod tests {
 			kind: NodeKind::File,
 			size: 1,
 			mtime_millis: 1,
+			mtime_nanos: 0,
 			content_hash: Some(ours),
 		};
 		let (_stages, local, remote) =
@@ -791,6 +792,7 @@ mod tests {
 			kind: NodeKind::Dir,
 			size: 0,
 			mtime_millis: 1_700_000_000_000,
+			mtime_nanos: 0,
 			content_hash: None,
 		});
 		let files = (0..FILES).map(|n| {
@@ -801,6 +803,7 @@ mod tests {
 				kind: NodeKind::File,
 				size: 1,
 				mtime_millis: 1_700_000_000_000,
+				mtime_nanos: 0,
 				content_hash: Some(Blake3Hash::from(hash)),
 			}
 		});
