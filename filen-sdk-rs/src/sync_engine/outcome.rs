@@ -96,6 +96,16 @@ impl PlannedActionKind {
 	}
 }
 
+/// What a planned upload or download does at the path it writes to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[js_type(export, no_deser, no_default, napi)]
+pub enum PlannedTransfer {
+	/// The side it writes to holds no file at the path: the transfer writes a new one.
+	Create,
+	/// The side it writes to holds a file at the path, which the transfer replaces.
+	Replace,
+}
+
 /// One action a pass would apply (or a held one it would not), in apply order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[js_type(export, no_deser, no_default, napi)]
@@ -108,6 +118,11 @@ pub struct PlannedAction {
 	/// The file's size in bytes where the pass knows it (a transfer, a move of a tracked file);
 	/// `None` for directories and for anything whose size neither side reported.
 	pub size: Option<u64>,
+	/// For an upload or a download, whether it writes a new file at `rel_path` or replaces the file
+	/// the side it writes to holds there, as the pass read that side; `None` for every other action.
+	/// A directory at the path is no file to replace: a type flip removes it with a deletion of its
+	/// own, planned ahead of the transfer, which then creates.
+	pub transfer: Option<PlannedTransfer>,
 }
 
 impl fmt::Display for PlannedAction {
@@ -424,25 +439,37 @@ pub(super) fn planned_action(
 	let rel_path = action.endpoints().0.to_string();
 	let local_size = |path: &str| local.at(path).map(|node| node.size);
 	let remote_size = |path: &str| remote.at(path).map(|node| node.size);
-	let (kind, node, size) = match action {
+	let transfer = |holds_file: bool| {
+		Some(if holds_file {
+			PlannedTransfer::Replace
+		} else {
+			PlannedTransfer::Create
+		})
+	};
+	let is_file = |kind: NodeKind| kind == NodeKind::File;
+	let (kind, node, size, transfer) = match action {
 		SyncAction::UploadFile { rel_path } => (
 			PlannedActionKind::UploadFile,
 			PlannedNodeKind::File,
 			local_size(rel_path),
+			transfer(remote.at(rel_path).is_some_and(|node| is_file(node.kind))),
 		),
 		SyncAction::DownloadFile { rel_path, .. } => (
 			PlannedActionKind::DownloadFile,
 			PlannedNodeKind::File,
 			remote_size(rel_path),
+			transfer(local.at(rel_path).is_some_and(|node| is_file(node.kind))),
 		),
 		SyncAction::CreateRemoteDir { .. } => (
 			PlannedActionKind::CreateRemoteDir,
 			PlannedNodeKind::Dir,
 			None,
+			None,
 		),
 		SyncAction::CreateLocalDir { .. } => (
 			PlannedActionKind::CreateLocalDir,
 			PlannedNodeKind::Dir,
+			None,
 			None,
 		),
 		// A file's size is read at the source path, where each side still holds the bytes; a
@@ -456,6 +483,7 @@ pub(super) fn planned_action(
 				NodeKind::File => local_size(&rel_path),
 				NodeKind::Dir => None,
 			},
+			None,
 		),
 		SyncAction::MoveLocal { to_path, kind, .. } => (
 			PlannedActionKind::MoveLocal {
@@ -466,16 +494,19 @@ pub(super) fn planned_action(
 				NodeKind::File => remote_size(&rel_path),
 				NodeKind::Dir => None,
 			},
+			None,
 		),
 		SyncAction::TrashRemote { rel_path, kind, .. } => (
 			PlannedActionKind::TrashRemote,
 			(*kind).into(),
 			remote_size(rel_path),
+			None,
 		),
 		SyncAction::DeleteLocal { rel_path, kind } => (
 			PlannedActionKind::DeleteLocal,
 			(*kind).into(),
 			local_size(rel_path),
+			None,
 		),
 		// A conflict is not an executable action; it never reaches this mapping (the engine splits
 		// it out into `conflicts` first). Rendering it as an adopt keeps the mapping total without
@@ -486,7 +517,7 @@ pub(super) fn planned_action(
 				.map(|n| n.kind)
 				.or_else(|| remote.at(rel_path).map(|n| n.kind))
 				.map_or(PlannedNodeKind::File, PlannedNodeKind::from);
-			(PlannedActionKind::AdoptBaseline, node, None)
+			(PlannedActionKind::AdoptBaseline, node, None, None)
 		}
 	};
 	PlannedAction {
@@ -494,6 +525,7 @@ pub(super) fn planned_action(
 		rel_path,
 		node,
 		size: (node == PlannedNodeKind::File).then_some(size).flatten(),
+		transfer,
 	}
 }
 
@@ -574,6 +606,111 @@ mod tests {
 			&remote,
 		);
 		assert_eq!(download.size, Some(22), "the pull side knows the size");
+	}
+
+	fn upload(rel: &str) -> SyncAction {
+		SyncAction::UploadFile {
+			rel_path: rel.to_string(),
+		}
+	}
+
+	fn download(rel: &str) -> SyncAction {
+		SyncAction::DownloadFile {
+			rel_path: rel.to_string(),
+			remote_uuid: Uuid::nil(),
+		}
+	}
+
+	fn local_dir(rel: &str) -> (String, LocalNode) {
+		let (path, node) = local_file(rel, 0);
+		(
+			path,
+			LocalNode {
+				kind: NodeKind::Dir,
+				..node
+			},
+		)
+	}
+
+	fn remote_dir(rel: &str) -> (String, RemoteNode) {
+		let (path, node) = remote_file(rel, 0);
+		(
+			path,
+			RemoteNode {
+				kind: NodeKind::Dir,
+				..node
+			},
+		)
+	}
+
+	#[test]
+	fn an_upload_over_a_remote_file_replaces_it_and_one_to_a_free_path_creates() {
+		let local = HashMap::from([local_file("new.txt", 1), local_file("edited.txt", 2)]);
+		let remote = HashMap::from([remote_file("edited.txt", 3)]);
+		assert_eq!(
+			planned_action(&upload("new.txt"), &local, &remote).transfer,
+			Some(PlannedTransfer::Create)
+		);
+		assert_eq!(
+			planned_action(&upload("edited.txt"), &local, &remote).transfer,
+			Some(PlannedTransfer::Replace)
+		);
+	}
+
+	#[test]
+	fn a_download_over_a_local_file_replaces_it_and_one_to_a_free_path_creates() {
+		let local = HashMap::from([local_file("edited.txt", 2)]);
+		let remote = HashMap::from([remote_file("new.txt", 1), remote_file("edited.txt", 3)]);
+		assert_eq!(
+			planned_action(&download("new.txt"), &local, &remote).transfer,
+			Some(PlannedTransfer::Create)
+		);
+		assert_eq!(
+			planned_action(&download("edited.txt"), &local, &remote).transfer,
+			Some(PlannedTransfer::Replace)
+		);
+	}
+
+	/// A directory at the path is no file to replace: a type flip trashes or quarantines it with a
+	/// deletion of its own, and the transfer then writes a new file.
+	#[test]
+	fn a_transfer_onto_a_directory_creates() {
+		let local = HashMap::from([local_file("flip", 1), local_dir("other")]);
+		let remote = HashMap::from([remote_dir("flip"), remote_file("other", 2)]);
+		assert_eq!(
+			planned_action(&upload("flip"), &local, &remote).transfer,
+			Some(PlannedTransfer::Create)
+		);
+		assert_eq!(
+			planned_action(&download("other"), &local, &remote).transfer,
+			Some(PlannedTransfer::Create)
+		);
+	}
+
+	#[test]
+	fn an_action_that_transfers_nothing_says_neither() {
+		let local = HashMap::from([local_file("a.txt", 1)]);
+		let remote = HashMap::from([remote_file("a.txt", 1)]);
+		for action in [
+			SyncAction::TrashRemote {
+				rel_path: "a.txt".to_string(),
+				kind: NodeKind::File,
+				remote_uuid: Uuid::nil(),
+			},
+			SyncAction::DeleteLocal {
+				rel_path: "a.txt".to_string(),
+				kind: NodeKind::File,
+			},
+			SyncAction::AdoptBaseline {
+				rel_path: "a.txt".to_string(),
+			},
+		] {
+			assert_eq!(
+				planned_action(&action, &local, &remote).transfer,
+				None,
+				"{action:?}"
+			);
+		}
 	}
 
 	#[test]

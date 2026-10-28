@@ -8724,6 +8724,7 @@ fn a_first_pass_completes_only_when_nothing_cut_it_short_or_made_its_read_untrus
 			rel_path: "gone.bin".to_string(),
 			node: PlannedNodeKind::File,
 			size: Some(4),
+			transfer: None,
 		}],
 		guard: Some(GuardReason::FirstSyncWithDeletions { deletions: 1 }),
 		conflicts: vec![PlannedConflict {

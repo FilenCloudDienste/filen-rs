@@ -106,7 +106,7 @@ pub use legacy::LegacyImport;
 pub use mode::{Backlog, SyncMode};
 pub use outcome::{
 	HaltReason, PlanOutcome, PlannedAction, PlannedActionKind, PlannedConflict, PlannedNodeKind,
-	RefuseReason, UnsyncablePath, UnsyncableReason,
+	PlannedTransfer, RefuseReason, UnsyncablePath, UnsyncableReason,
 };
 pub use pause::{DEFAULT_CANCEL_AFTER, PauseMode, PauseOptions};
 pub use watch::{WatchConfig, WatchHandle, WatchState, WatchStatus};

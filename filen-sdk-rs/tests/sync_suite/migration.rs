@@ -31,7 +31,7 @@ use filen_sdk_rs::fs::dir::RemoteDirectory;
 use filen_sdk_rs::fs::file::RemoteFile;
 use filen_sdk_rs::fs::{HasName, HasUUID};
 #[cfg(feature = "malformed")]
-use filen_sdk_rs::sync_engine::PlannedActionKind;
+use filen_sdk_rs::sync_engine::{PlannedActionKind, PlannedTransfer};
 use filen_sdk_rs::sync_engine::{SyncEngine, SyncMode, SyncReport};
 #[cfg(feature = "malformed")]
 use rusqlite::OptionalExtension;
@@ -828,6 +828,11 @@ async fn migrate_15_a_dry_run_plans_no_upload_of_a_file_the_pass_records_as_sync
 		planned,
 		[(PlannedActionKind::UploadFile, "new.bin")],
 		"{plan}"
+	);
+	assert_eq!(
+		plan.actions.first().and_then(|action| action.transfer),
+		Some(PlannedTransfer::Create),
+		"the remote holds no file at new.bin"
 	);
 	assert_eq!(
 		baseline_row(&db_path, "f.bin"),

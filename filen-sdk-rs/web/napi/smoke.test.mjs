@@ -138,6 +138,8 @@ describe("exports", () => {
 			"PlannedActionKind_Tags",
 			"PlannedNodeKind",
 			"PlannedNodeKindNapi",
+			"PlannedTransfer",
+			"PlannedTransferNapi",
 			"RcloneExitTags",
 			"RcloneExit_Tags",
 			"RcloneRefusalTags",
@@ -259,6 +261,7 @@ describe("exports", () => {
 		assert.deepEqual({ ...RefuseReason }, { RemoteCollision: 0, LocalCollision: 1 })
 		assert.deepEqual({ ...HaltReason }, { LocalStorageFull: 0, RemoteStorageFull: 1, RemoteUnavailable: 2, Unauthenticated: 3 })
 		assert.deepEqual({ ...PlannedNodeKind }, { Dir: 0, File: 1 })
+		assert.deepEqual({ ...sdk.PlannedTransfer }, { Create: 0, Replace: 1 })
 		assert.deepEqual({ ...WatchState }, { Running: 0, Paused: 1, Stopped: 2, PairRemoved: 3 })
 		assert.deepEqual({ ...SyncPairActivity }, { Idle: 0, Starting: 1, Watching: 2, Stopping: 3, SyncingOnce: 4 })
 	})

@@ -21,6 +21,7 @@ fn trash(index: usize) -> PlannedAction {
 		rel_path: format!("trash-{index}"),
 		node: PlannedNodeKind::File,
 		size: Some(1),
+		transfer: None,
 	}
 }
 

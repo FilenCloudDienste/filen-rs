@@ -573,6 +573,7 @@ fn action(kind: PlannedActionKind, index: usize, size: Option<u64>) -> PlannedAc
 		rel_path: format!("action-{index}"),
 		node: PlannedNodeKind::File,
 		size,
+		transfer: None,
 	}
 }
 
