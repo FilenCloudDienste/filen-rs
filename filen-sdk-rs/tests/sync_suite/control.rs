@@ -2580,6 +2580,64 @@ async fn control_09c_a_deleted_pair_root_does_not_block_a_new_pair() {
 	std::fs::remove_dir_all(&local_gone).ok();
 }
 
+/// CONTROL-09d — a pair whose remote root another client deletes while the engine runs. The cache
+/// drops the root from its registrations without telling the engine's handle of it, so the pass
+/// after must not take that handle for a live subscription and wait out the 15 minutes the cache
+/// would never converge the root in: it asks the cache again and fails at once, as a pass of an
+/// engine opened after the deletion does.
+#[shared_test_runtime]
+async fn control_09d_a_pass_over_a_root_deleted_under_the_engine_fails_at_once() {
+	let (resources, cache, _root, local) = raw_setup("c09d").await;
+	let engine = SyncEngine::open(cache.client.clone(), temp_cache_path())
+		.await
+		.unwrap();
+	let root_dt = DirType::<Normal>::Dir(std::borrow::Cow::Borrowed(&resources.dir));
+	let mut doomed = cache
+		.client
+		.create_dir(&root_dt, "c09d_doomed")
+		.await
+		.unwrap();
+	let doomed_uuid = doomed.uuid();
+	let pair = engine
+		.add_pair(local.clone(), doomed_uuid, SyncMode::TwoWay)
+		.await
+		.unwrap();
+	engine
+		.sync_once(pair)
+		.await
+		.expect("the pair syncs while its remote root exists");
+
+	// Held from here to the delete, so another test's account-wide empty-trash cannot purge
+	// `doomed` mid-test.
+	let _trash_lock = resources
+		.client
+		.acquire_lock_with_default(test_utils::locks::TRASH)
+		.await
+		.unwrap();
+	resources.client.trash_dir(&mut doomed).await.unwrap();
+	assert!(
+		poll_for_item_absent(cache.db_path(), doomed_uuid, CACHE_CONVERGE_TIMEOUT).await,
+		"the cache never heard the pair's remote root was trashed"
+	);
+
+	let failed = tokio::time::timeout(Duration::from_secs(120), engine.sync_once(pair))
+		.await
+		.expect("the pass waited for a remote root the cache no longer tracks")
+		.expect_err("a pass over a trashed remote root cannot succeed");
+	assert_eq!(
+		failed.kind(),
+		filen_sdk_rs::ErrorKind::InvalidState,
+		"the cache's refusal of the trashed root, not a wait that ran out: {failed}"
+	);
+
+	resources
+		.client
+		.delete_dir_permanently(doomed)
+		.await
+		.unwrap();
+	std::fs::remove_dir_all(&local).ok();
+}
+
 /// CONTROL-09 — overlapping REMOTE roots are refused: the same remote folder outright, and a
 /// nested one whether or not the cache can already relate the two uuids.
 #[shared_test_runtime]

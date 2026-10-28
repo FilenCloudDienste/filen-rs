@@ -821,6 +821,31 @@ impl Drop for SyncRootHandle {
 	}
 }
 
+// Only the sync engine's tests hold handles they never use.
+#[cfg(all(test, feature = "sync-engine"))]
+impl SyncRootHandle {
+	/// A handle to dir root `uuid` with no worker or registration behind it, whose drop sends
+	/// nothing: for a test of a caller that holds handles, never one that uses them.
+	pub(crate) fn unregistered_for_test(uuid: Uuid) -> Self {
+		let (control_sender, _) = tokio::sync::mpsc::unbounded_channel();
+		let (manual_event_sender, _) = tokio::sync::mpsc::channel(1);
+		let (read_task_sender, _) = tokio::sync::mpsc::unbounded_channel();
+		Self {
+			key: RootKey::Dir(uuid),
+			registration_id: 0,
+			disarmed: true,
+			shared: Arc::new(CacheWorkerShared {
+				db_path: PathBuf::new(),
+				control_sender,
+				manual_event_sender,
+				read_task_sender,
+				next_registration_id: AtomicU64::new(0),
+				listener_handle: std::sync::Mutex::new(None),
+			}),
+		}
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;

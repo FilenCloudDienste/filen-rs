@@ -13,7 +13,7 @@ use std::{
 	ops::RangeInclusive,
 	path::{Path, PathBuf},
 	sync::{
-		Arc, MutexGuard, PoisonError,
+		Arc, MutexGuard, PoisonError, Weak,
 		atomic::{AtomicBool, AtomicU64, Ordering},
 	},
 	time::{Duration, Instant, SystemTime},
@@ -678,6 +678,27 @@ fn event_uuids(event: &CacheEvent<'_>) -> [Option<Uuid>; 2] {
 	}
 }
 
+/// A pair's cache subscription: the handle that keeps it, and whether the cache still holds it.
+pub(super) struct Subscription {
+	/// Kept to be dropped: that unsubscribes the pair.
+	_handle: SyncRootHandle,
+	/// Alive for as long as the cache holds the subscription's callback, which owns the strong
+	/// end (see [`observation_callback`]). The cache drops the callback when it ends the
+	/// registration on its own — the server deleted the root, which the cache drops from its active
+	/// set (`CacheMessage::SyncRootsDeleted`), or the worker shut down (`Client::flush_cache`) —
+	/// and the handle is not told: it stays, inert, and nothing it subscribed to is announced or
+	/// converged any more.
+	registered: Weak<()>,
+}
+
+impl Subscription {
+	/// Whether the cache still holds this subscription, rather than having ended it under the
+	/// handle.
+	pub(super) fn live(&self) -> bool {
+		self.registered.strong_count() > 0
+	}
+}
+
 /// The sync-root callback the engine registers per pair: it records the uuids of every committed
 /// cache batch — the evidence that retires a pending write — and the batch's changes as the pair's
 /// remote changelist. It runs on the cache worker thread, so it never awaits and never touches the
@@ -685,11 +706,17 @@ fn event_uuids(event: &CacheEvent<'_>) -> [Option<Uuid>; 2] {
 ///
 /// The events are borrowed for the length of the call and cannot be read twice, so they are
 /// collected into one `Vec` of references (pointers, not payloads) and handed to both records.
+///
+/// It owns `registered`, so the cache dropping it is what tells a [`Subscription`] the cache ended
+/// it.
 fn observation_callback(
 	observations: Arc<Observations>,
 	changes: Arc<PairChanges>,
+	registered: Arc<()>,
 ) -> SyncRootCallback {
 	Box::new(move |events| {
+		// Captured to be owned, and dropped with the callback; it carries nothing to read.
+		let _registered = &registered;
 		let batch: Vec<&CacheEvent<'_>> = events.collect();
 		changes.note_remote_batch(&mut batch.iter().copied());
 		observations.note(&mut batch.iter().copied());
@@ -1646,8 +1673,8 @@ pub struct SyncEngine {
 	/// that retires a pending write (see [`Observations`]).
 	pub(super) observed: Arc<Observations>,
 	/// One cache sync-root registration per pair, kept alive for as long as the pair is
-	/// registered; dropping a handle unsubscribes it.
-	roots: Mutex<HashMap<PairId, SyncRootHandle>>,
+	/// registered; dropping one unsubscribes it.
+	roots: Mutex<HashMap<PairId, Subscription>>,
 	/// One-shot mass-delete approvals: pair -> the batch token the caller approved. The next pass
 	/// whose held batch hashes to that token executes it; any other batch is held again.
 	approvals: Mutex<HashMap<PairId, String>>,
@@ -3194,28 +3221,77 @@ impl SyncEngine {
 	/// appear in a snapshot at all.
 	///
 	/// Best-effort: a root the cache refuses (deleted, trashed, unreachable) leaves that pair on the
-	/// [`PENDING_CREATE_GRACE`] fallback rather than failing the whole engine. The watch loop
-	/// registers its own subscription for wakeups; the two are independent.
+	/// [`PENDING_CREATE_GRACE`] fallback rather than failing the whole engine, until a pass
+	/// subscribes it again (see [`resubscribe`](Self::resubscribe)). The watch loop registers its
+	/// own subscription for wakeups; the two are independent.
 	async fn observe_pair(&self, pair: PairId, remote_root: Uuid) {
+		if let Err(error) = self.subscribe(pair, remote_root).await {
+			tracing::warn!(
+				"sync pair {pair}: cache notifications are unavailable ({error}); its pending writes will retire on the grace window alone"
+			);
+		}
+	}
+
+	/// [`observe_pair`](Self::observe_pair), answering the cache's refusal instead of logging it.
+	async fn subscribe(&self, pair: PairId, remote_root: Uuid) -> Result<(), Error> {
 		let changes = self.pair_changes(pair).await;
-		let callback = observation_callback(Arc::clone(&self.observed), Arc::clone(&changes));
+		let registered = Arc::new(());
+		let subscription = Arc::downgrade(&registered);
+		let callback =
+			observation_callback(Arc::clone(&self.observed), Arc::clone(&changes), registered);
 		match Arc::clone(&self.client)
 			.add_sync_root(remote_root, callback)
 			.await
 		{
 			Ok(handle) => {
-				self.roots.lock().await.insert(pair, handle);
+				self.roots.lock().await.insert(
+					pair,
+					Subscription {
+						_handle: handle,
+						registered: subscription,
+					},
+				);
+				Ok(())
 			}
 			Err(error) => {
 				// Without the subscription no remote change is announced at all, so no pass can
 				// narrow its remote half down: every one reads the whole subtree, as they all do
 				// today.
 				changes.degrade(FullPassReason::RemoteEventsDegraded);
-				tracing::warn!(
-					"sync pair {pair}: cache notifications are unavailable ({error}); its pending writes will retire on the grace window alone"
-				);
+				Err(error)
 			}
 		}
+	}
+
+	/// Subscribe `pair` to the cache again if it has no subscription: one the cache refused when the
+	/// pair was added or the engine opened (offline, say) is otherwise never asked for again, and
+	/// the pair goes without remote announcements for the engine's life. Answers the cache's
+	/// refusal if it refuses again; nothing is asked of it while the pair is subscribed.
+	///
+	/// A subscription the cache ended under its handle (see [`Subscription::live`]) counts as
+	/// none, and is dropped before the cache is asked again. For a root the server deleted that
+	/// answers the refusal a restarted engine gets, at once, rather than a wait for a root the
+	/// cache no longer tracks; a root restored from the trash since is subscribed again.
+	pub(super) async fn resubscribe(&self, pair: PairId) -> Result<(), Error> {
+		{
+			let mut roots = self.roots.lock().await;
+			match roots.get(&pair) {
+				Some(subscription) if subscription.live() => return Ok(()),
+				Some(_) => {
+					tracing::warn!(
+						"sync pair {pair}: the cache ended its subscription (the remote folder was deleted, or the cache shut down); asking for it again"
+					);
+					roots.remove(&pair);
+				}
+				None => {}
+			}
+		}
+		let remote_root = locked(&self.control)
+			.pair(pair)
+			.map_err(|e| db_error(e, "loading the sync pair"))?
+			.ok_or_else(|| Error::custom(ErrorKind::InvalidState, "unknown sync pair"))?
+			.remote_root;
+		self.subscribe(pair, remote_root).await
 	}
 
 	/// `pair`'s changelists, created on first use — shared with the pair's cache callback and, while
@@ -6398,6 +6474,16 @@ impl SyncEngine {
 		// view; everything below writes something.
 		let read_cost = read_started.elapsed().saturating_sub(migration);
 		let mut prep = prepared?;
+		// A pair the cache refused to subscribe asks again, so a refusal while offline lasts until
+		// the first pass after the cache can be reached; this pass read whole either way. After a
+		// read that worked, so the read is not held up by it and a pass that could not read asks
+		// nothing, and still under the gate, so a removal cannot drop the pair between this and
+		// the subscription it records.
+		if let Err(error) = self.resubscribe(pair).await {
+			tracing::warn!(
+				"sync pair {pair}: the cache refused its subscription again ({error}); the next pass reads the remote whole too"
+			);
+		}
 		let store = self.pair_store(pair).await?;
 		// Persist what this pass confirmed, before anything is reconciled. Only a real pass writes
 		// it: `plan_pair` stays a pure read, so a dry run inside the confirmation window just leaves

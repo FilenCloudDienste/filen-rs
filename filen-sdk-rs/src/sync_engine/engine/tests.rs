@@ -8699,3 +8699,107 @@ async fn filen_sync_state_is_refused_for_an_unknown_pair() {
 	drop(engine);
 	std::fs::remove_file(&path).ok();
 }
+
+/// A subscription the cache ended under its handle — a root the server deleted, or a cache that
+/// shut down — counts as none: it is dropped and asked for again, so a deleted root fails as it does
+/// for an engine opened after the deletion rather than as a wait for a root the cache no longer
+/// tracks.
+#[tokio::test]
+async fn a_subscription_the_cache_ended_is_asked_for_again() {
+	let dir = tempfile::tempdir().unwrap();
+	// No cache configured: the cache refuses every subscription without asking a server.
+	let engine = SyncEngine::open(Arc::new(offline_client()), dir.path().join("sync.db"))
+		.await
+		.unwrap();
+	let remote_root = Uuid::from_u128(2);
+	let (pair, _) = locked(&engine.control)
+		.create_pair("/root", remote_root, SyncMode::TwoWay)
+		.unwrap();
+	engine.roots.lock().await.insert(
+		pair,
+		Subscription {
+			_handle: SyncRootHandle::unregistered_for_test(remote_root),
+			registered: Weak::new(),
+		},
+	);
+
+	let refused = engine
+		.resubscribe(pair)
+		.await
+		.expect_err("the ended subscription was taken for a live one");
+	assert_eq!(refused.kind(), ErrorKind::InvalidState, "{refused}");
+	assert!(!engine.roots.lock().await.contains_key(&pair));
+}
+
+/// A subscription the cache still holds is left alone: nothing is asked of the cache.
+#[tokio::test]
+async fn a_live_subscription_is_not_asked_for_again() {
+	let dir = tempfile::tempdir().unwrap();
+	let engine = SyncEngine::open(Arc::new(offline_client()), dir.path().join("sync.db"))
+		.await
+		.unwrap();
+	let remote_root = Uuid::from_u128(2);
+	let (pair, _) = locked(&engine.control)
+		.create_pair("/root", remote_root, SyncMode::TwoWay)
+		.unwrap();
+	let registered = Arc::new(());
+	engine.roots.lock().await.insert(
+		pair,
+		Subscription {
+			_handle: SyncRootHandle::unregistered_for_test(remote_root),
+			registered: Arc::downgrade(&registered),
+		},
+	);
+
+	engine.resubscribe(pair).await.unwrap();
+	assert!(engine.roots.lock().await[&pair].live());
+}
+
+/// The cache ending a subscription is dropping its callback, and that is what the subscription
+/// reads as ended.
+#[test]
+fn a_subscription_ends_with_its_callback() {
+	let registered = Arc::new(());
+	let subscription = Arc::downgrade(&registered);
+	let callback = observation_callback(
+		Arc::new(Observations::default()),
+		Arc::new(PairChanges::new()),
+		registered,
+	);
+	assert_eq!(subscription.strong_count(), 1, "the callback holds it");
+
+	drop(callback);
+	assert_eq!(subscription.strong_count(), 0);
+}
+
+/// A pair the cache refused to subscribe is asked for again by the next pass rather than left
+/// unsubscribed for the engine's life, and a refusal that repeats is answered each time.
+#[tokio::test]
+async fn a_refused_subscription_is_asked_for_again() {
+	let dir = tempfile::tempdir().unwrap();
+	// No cache configured: the cache refuses every subscription without asking a server.
+	let engine = SyncEngine::open(Arc::new(offline_client()), dir.path().join("sync.db"))
+		.await
+		.unwrap();
+	let (pair, _) = locked(&engine.control)
+		.create_pair("/root", Uuid::from_u128(2), SyncMode::TwoWay)
+		.unwrap();
+
+	for attempt in 0..2 {
+		let refused = engine
+			.resubscribe(pair)
+			.await
+			.expect_err("the cache is not configured");
+		assert_eq!(
+			refused.kind(),
+			ErrorKind::InvalidState,
+			"attempt {attempt}: {refused}"
+		);
+		assert!(!engine.roots.lock().await.contains_key(&pair));
+	}
+	assert_eq!(
+		engine.pair_changes(pair).await.degraded(),
+		Some(FullPassReason::RemoteEventsDegraded),
+		"a pass reads the remote whole while nothing announces it"
+	);
+}
