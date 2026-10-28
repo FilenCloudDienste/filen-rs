@@ -2241,6 +2241,15 @@ impl BaselineStore {
 			.collect()
 	}
 
+	/// Forget every failure streak of `pair`, leaving every other pair's alone.
+	pub(crate) fn clear_all_failures(&self, pair: PairId) -> rusqlite::Result<()> {
+		self.conn.execute(
+			"DELETE FROM path_failures WHERE pair_id = ?1",
+			params![pair],
+		)?;
+		Ok(())
+	}
+
 	/// Retire journal rows the in-memory journal has dropped (the cache caught up, or the grace
 	/// window ran out).
 	///

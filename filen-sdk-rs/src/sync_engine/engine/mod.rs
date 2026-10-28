@@ -5988,6 +5988,30 @@ impl SyncEngine {
 			.map_err(|e| db_error(e, "clearing a path's failure count"))
 	}
 
+	/// [`retry_path`](Self::retry_path) for every path of `pair` with a failure streak: each is
+	/// planned again on the next pass, whatever its failure history, and every other pair's streaks
+	/// are left alone. For a pair whose paths all failed through one outage, which would otherwise
+	/// have to be retried one path at a time.
+	///
+	/// Like `retry_path`, it runs no pass itself: the next one plans the paths, and
+	/// [`request_pass`](Self::request_pass) asks for it now. Idempotent — a pair with no streak is
+	/// left alone rather than erroring. Errors only if the pair is unknown.
+	pub async fn retry_all(&self, pair: PairId) -> Result<(), Error> {
+		if locked(&self.control)
+			.pair(pair)
+			.map_err(|e| db_error(e, "loading the sync pair"))?
+			.is_none()
+		{
+			return Err(Error::custom(ErrorKind::InvalidState, "unknown sync pair"));
+		}
+		let store = self.pair_store(pair).await?;
+		// One statement, but behind the pair's store lock like `retry_path`'s, which a pass in
+		// flight may hold for as long as its baseline read takes.
+		off_store(&store, move |store| store.clear_all_failures(pair))
+			.await?
+			.map_err(|e| db_error(e, "clearing the pair's failure counts"))
+	}
+
 	/// Ask `pair`'s [`watch`](Self::watch) for a pass now — a "sync now" button — rather than at
 	/// its next change or safety-net tick. The pass runs at the watch's debounce, after the pass in
 	/// flight if there is one; a watch backing off after a failed pass cuts the backoff short and

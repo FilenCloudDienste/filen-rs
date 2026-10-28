@@ -353,6 +353,7 @@ describe("exports", () => {
 			"requestPass",
 			"resolveConflict",
 			"resumePair",
+			"retryAll",
 			"retryPath",
 			"setDeleteGuard",
 			"setDeleteGuardUnlimited",

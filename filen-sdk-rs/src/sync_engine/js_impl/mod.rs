@@ -847,6 +847,11 @@ impl SyncEngineCore {
 		self.engine()?.engine.retry_path(pair, rel_path).await
 	}
 
+	async fn retry_all(&self, pair_id: u64) -> Result<(), Error> {
+		let pair = pair_id_in(pair_id)?;
+		self.engine()?.engine.retry_all(pair).await
+	}
+
 	async fn user_ignore(&self) -> Result<String, Error> {
 		self.engine()?.engine.user_ignore().await
 	}
@@ -1295,6 +1300,16 @@ impl JsSyncEngine {
 	pub async fn retry_path(&self, pair_id: u64, rel_path: String) -> Result<(), Error> {
 		detached(Arc::clone(&self.core), move |core| async move {
 			core.retry_path(pair_id, &rel_path).await
+		})
+		.await
+	}
+
+	/// Plan every path of the pair that kept failing again on the next pass, without waiting out
+	/// the engine's hourly retry.
+	#[napi_export]
+	pub async fn retry_all(&self, pair_id: u64) -> Result<(), Error> {
+		detached(Arc::clone(&self.core), move |core| async move {
+			core.retry_all(pair_id).await
 		})
 		.await
 	}

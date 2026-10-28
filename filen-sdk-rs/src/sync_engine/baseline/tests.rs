@@ -529,6 +529,35 @@ fn a_spaced_failure_counts_only_once_per_window() {
 	assert_eq!(spaced("down", 12_500), streak(4, "down", 12_500));
 }
 
+/// Clearing a pair's streaks clears every one of them and no other pair's.
+#[test]
+fn clearing_all_of_a_pairs_streaks_leaves_every_other_pairs_alone() {
+	let store = BaselineStore::open_in_memory().unwrap();
+	let (pair, _) = store
+		.create_pair("/root", Uuid::new_v4(), SyncMode::TwoWay)
+		.unwrap();
+	let (other, _) = store
+		.create_pair("/other", Uuid::new_v4(), SyncMode::TwoWay)
+		.unwrap();
+	for path in ["a.txt", "b/c.txt"] {
+		store.record_failure(pair, path, "boom", 1_000).unwrap();
+		store.record_failure(other, path, "boom", 1_000).unwrap();
+	}
+
+	store.clear_all_failures(pair).unwrap();
+	assert!(store.failures(pair).unwrap().is_empty());
+	assert_eq!(
+		store
+			.failures(other)
+			.unwrap()
+			.into_keys()
+			.collect::<BTreeSet<_>>(),
+		BTreeSet::from(["a.txt".to_string(), "b/c.txt".to_string()])
+	);
+	// A pair with no streak left is a no-op, not an error.
+	store.clear_all_failures(pair).unwrap();
+}
+
 /// A removed pair's id must never be handed to a later pair. A watch loop finishes the pass it
 /// is in when its pair is removed, so that pass still writes baseline and journal rows keyed by
 /// the old id: with the id reused, they land in the successor — whose first sync is supposed to

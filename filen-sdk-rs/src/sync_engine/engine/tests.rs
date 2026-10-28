@@ -3985,6 +3985,43 @@ async fn a_create_a_previous_engine_journalled_is_folded_after_a_reopen() {
 	std::fs::remove_file(&path).ok();
 }
 
+/// `retry_all` clears every failure streak of the pair it names and none of another pair's, and
+/// refuses a pair nobody registered.
+#[tokio::test]
+async fn retry_all_clears_every_streak_of_its_pair_alone() {
+	let dir = tempfile::tempdir().unwrap();
+	let engine = SyncEngine::open(Arc::new(offline_client()), dir.path().join("baseline.db"))
+		.await
+		.unwrap();
+	let (pair, other) = {
+		let control = locked(&engine.control);
+		let (pair, _) = control
+			.create_pair("/root", Uuid::new_v4(), SyncMode::TwoWay)
+			.unwrap();
+		let (other, _) = control
+			.create_pair("/other", Uuid::new_v4(), SyncMode::TwoWay)
+			.unwrap();
+		for path in ["a.txt", "b/c.txt"] {
+			control.record_failure(pair, path, "boom", 1_000).unwrap();
+			control.record_failure(other, path, "boom", 1_000).unwrap();
+		}
+		(pair, other)
+	};
+
+	engine.retry_all(pair).await.unwrap();
+	{
+		let control = locked(&engine.control);
+		assert!(control.failures(pair).unwrap().is_empty());
+		assert_eq!(control.failures(other).unwrap().len(), 2);
+	}
+
+	let unknown = engine.retry_all(pair + 9_999).await.unwrap_err();
+	assert!(
+		unknown.to_string().contains("unknown sync pair"),
+		"{unknown}"
+	);
+}
+
 /// Watching a paused pair is refused rather than started idle: a handle whose loop runs nothing
 /// looks exactly like a broken watch, and the caller who paused the pair is the one who can say
 /// whether it should be running.

@@ -748,6 +748,7 @@ async fn a_closed_engine_refuses_every_verb() {
 		"retry_path",
 		engine.retry_path(pair, "a.txt".to_owned()).await,
 	);
+	assert_closed("retry_all", engine.retry_all(pair).await);
 	assert_closed("user_ignore", engine.user_ignore().await);
 	assert_closed(
 		"set_user_ignore",

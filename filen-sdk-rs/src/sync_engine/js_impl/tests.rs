@@ -1015,6 +1015,7 @@ async fn every_control_verb_is_refused_once_the_engine_is_closed() {
 				.await,
 		),
 		refusal_message(core.retry_path(pair, "a").await),
+		refusal_message(core.retry_all(pair).await),
 		refusal_message(core.user_ignore().await),
 		refusal_message(core.set_user_ignore("*.tmp").await),
 		refusal_message(core.plan_pair(pair).await),
