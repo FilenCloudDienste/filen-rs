@@ -224,6 +224,8 @@ pub struct SyncPairInfo {
 	pub delete_guard: DeleteGuardState,
 	/// Whether the pair is paused (persisted by the engine).
 	pub paused: bool,
+	/// Whether a pass of the pair has completed cleanly (persisted by the engine).
+	pub first_pass_completed: bool,
 	pub activity: SyncPairActivity,
 	/// The watch's latest status; set exactly while `activity` is `Watching` or `Stopping`.
 	pub watch_status: Option<WatchStatus>,
@@ -256,6 +258,7 @@ impl TryFrom<PairRecord> for SyncPairInfo {
 			mode,
 			delete_guard,
 			paused,
+			first_pass_completed,
 		} = record;
 		Ok(Self {
 			id: pair_id_out(id)?,
@@ -264,6 +267,7 @@ impl TryFrom<PairRecord> for SyncPairInfo {
 			mode,
 			delete_guard: delete_guard.into(),
 			paused,
+			first_pass_completed,
 			activity: SyncPairActivity::Idle,
 			watch_status: None,
 			pass_in_flight: None,

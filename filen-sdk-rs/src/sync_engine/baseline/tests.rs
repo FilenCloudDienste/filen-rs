@@ -192,6 +192,38 @@ fn every_open_runs_in_wal_with_normal_sync_and_a_busy_timeout() {
 	}
 }
 
+/// A pair is registered without a completed first pass, and marking one marks that pair alone,
+/// for good.
+#[test]
+fn a_pair_has_completed_no_first_pass_until_one_is_marked() {
+	let store = BaselineStore::open_in_memory().unwrap();
+	let (pair, _) = store
+		.create_pair("/root", Uuid::new_v4(), SyncMode::TwoWay)
+		.unwrap();
+	let (other, _) = store
+		.create_pair("/other", Uuid::new_v4(), SyncMode::TwoWay)
+		.unwrap();
+	store.upsert_entry(pair, &dir_entry("d")).unwrap();
+	assert!(
+		!store.pair(pair).unwrap().unwrap().first_pass_completed,
+		"rows alone do not complete a first pass"
+	);
+
+	store.mark_first_pass_completed(pair).unwrap();
+	store.mark_first_pass_completed(pair).unwrap();
+	assert!(store.pair(pair).unwrap().unwrap().first_pass_completed);
+	assert!(!store.pair(other).unwrap().unwrap().first_pass_completed);
+	assert_eq!(
+		store
+			.list_pairs()
+			.unwrap()
+			.into_iter()
+			.map(|record| (record.id, record.first_pass_completed))
+			.collect::<Vec<_>>(),
+		[(pair, true), (other, false)]
+	);
+}
+
 #[test]
 fn a_fresh_db_is_stamped_at_the_current_schema_version() {
 	let store = BaselineStore::open_in_memory().unwrap();
@@ -1149,7 +1181,7 @@ fn the_derived_columns_are_pinned_to_the_schema_version() {
 		            SCHEMA_VERSION so a file written under the old rule is refused, then move this pin";
 	assert_eq!(
 		(SCHEMA_VERSION, char::UNICODE_VERSION),
-		(4, (17, 0, 0)),
+		(5, (17, 0, 0)),
 		"{owed}"
 	);
 	// Confirmed: this helper's rows otherwise carry a marker that is not their content.

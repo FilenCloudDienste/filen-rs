@@ -1038,6 +1038,9 @@ fn prepared(
 			mode,
 			delete_guard: DeleteGuard::unlimited(),
 			paused: false,
+			// A pair with rows has completed a pass, as every test written before the marker
+			// existed assumed.
+			first_pass_completed: !baseline.is_empty(),
 		},
 		tracked_at_start: baseline.len(),
 		baseline,
@@ -8480,6 +8483,217 @@ fn seeding_a_first_sync_keeps_its_deletions_held() {
 			kind: NodeKind::File,
 			remote_uuid: Uuid::from_u128(2),
 		}]
+	);
+}
+
+/// A mirror pair whose first pass wrote one row before it stopped: `kept.bin` has its row, and
+/// `gone.bin`, on the remote alone, is what a first sync must not delete unasked. The record is the
+/// store's own, so it says whether a pass of the pair has completed.
+fn after_a_first_pass_wrote_a_row() -> (BaselineStore, Prepared) {
+	let (store, mut prep) = prepared_on_store(
+		SyncMode::LocalToRemote,
+		vec![file_row("kept.bin", Uuid::from_u128(1), hash(1))],
+		vec![local_file("kept.bin", hash(1))],
+		vec![
+			remote_file("kept.bin", Uuid::from_u128(1), hash(1), 4),
+			remote_file("gone.bin", Uuid::from_u128(2), hash(3), 4),
+		],
+	);
+	prep.record = store.pair(prep.record.id).unwrap().unwrap();
+	(store, prep)
+}
+
+/// Which passes complete a first pass. Each of the shortfalls below leaves it a first sync; held
+/// deletions, conflicts and failed paths do not, since any of them can stand for as long as the
+/// pair does.
+#[test]
+fn a_first_pass_completes_only_when_nothing_cut_it_short_or_made_its_read_untrustworthy() {
+	let (_store, prep) = after_a_first_pass_wrote_a_row();
+	let state = screen_state(&prep);
+	for (label, report) in [
+		(
+			"refused",
+			SyncReport {
+				refused: Some(RefuseReason::LocalCollision),
+				..SyncReport::default()
+			},
+		),
+		(
+			"paused",
+			SyncReport {
+				paused: true,
+				..SyncReport::default()
+			},
+		),
+		(
+			"interrupted",
+			SyncReport {
+				interrupted: 2,
+				..SyncReport::default()
+			},
+		),
+		(
+			"no drive lock",
+			SyncReport {
+				lock_failed: Some(ErrorKind::RetryFailed),
+				..SyncReport::default()
+			},
+		),
+		(
+			"a full side",
+			SyncReport {
+				halted: Some(crate::sync_engine::HaltReason::LocalStorageFull),
+				..SyncReport::default()
+			},
+		),
+		(
+			"a record not written",
+			SyncReport {
+				store_failed: Some(apply::StoreFailure::RecordNotWritten(ErrorKind::IO)),
+				..SyncReport::default()
+			},
+		),
+	] {
+		assert!(
+			!completes_first_pass(&prep, &state, &report),
+			"{label} completed the first pass"
+		);
+	}
+
+	for (label, state) in [
+		(
+			"an incomplete scan",
+			guard::ScreenState {
+				scan_complete: false,
+				..state
+			},
+		),
+		(
+			"an unconverged remote",
+			guard::ScreenState {
+				remote: guard::RemoteEvidence::Unconverged,
+				..state
+			},
+		),
+		(
+			"an emptied remote",
+			guard::ScreenState {
+				remote: guard::RemoteEvidence::Emptied,
+				..state
+			},
+		),
+	] {
+		assert!(
+			!completes_first_pass(&prep, &state, &SyncReport::default()),
+			"{label} completed the first pass"
+		);
+	}
+
+	let mut scoped = after_a_first_pass_wrote_a_row().1;
+	scoped.read = PassRead::Scoped(BTreeSet::from(["kept.bin".to_string()]));
+	assert!(
+		!completes_first_pass(&scoped, &state, &SyncReport::default()),
+		"a change-scoped read completed the first pass"
+	);
+
+	let settled = SyncReport {
+		held: vec![PlannedAction {
+			kind: PlannedActionKind::TrashRemote,
+			rel_path: "gone.bin".to_string(),
+			node: PlannedNodeKind::File,
+			size: Some(4),
+		}],
+		guard: Some(GuardReason::FirstSyncWithDeletions { deletions: 1 }),
+		conflicts: vec![PlannedConflict {
+			rel_path: "c.bin".to_string(),
+			local: None,
+			remote: None,
+		}],
+		failed_paths: vec![("a.bin".to_string(), "boom".to_string())],
+		errors: vec!["a.bin: boom".to_string()],
+		..SyncReport::default()
+	};
+	assert!(completes_first_pass(&prep, &state, &settled));
+}
+
+/// The remote root of an [`offline_pair`].
+const OFFLINE_ROOT: Uuid = Uuid::from_u128(2);
+
+/// A pair in `mode` that ONE pass runs on offline: its local root (in `dir`) holds the files
+/// `local` names, and its remote root, which the cache holds converged at a watermark, is empty.
+/// The pass gets as far as applying nothing without asking a server, under the default delete
+/// guard `create_pair` starts it on; one that applies anything resolves the remote root first,
+/// which an offline client cannot. Only one: the pass asks the cache to subscribe the root, and
+/// the cache worker that spawns to answer starts a resync, which stops it holding the root
+/// converged.
+async fn offline_pair(
+	dir: &Path,
+	mode: SyncMode,
+	local: &[&str],
+) -> (SyncEngine, PairId, CacheState) {
+	let root = dir.join("local");
+	std::fs::create_dir(&root).unwrap();
+	for path in local {
+		std::fs::write(root.join(path), "local").unwrap();
+	}
+	let account = Uuid::from_u128(1);
+	let cache = dir.join("cache.db");
+	let mut state = CacheState::new_on_path(&cache, account);
+	state
+		.upsert_dirs([&cacheable_dir(OFFLINE_ROOT, account, "pair")].into_iter())
+		.unwrap();
+	state.add_converged_roots(&[OFFLINE_ROOT]).unwrap();
+	state.set_watermark(1).unwrap();
+	let client = Arc::new(offline_client());
+	client.configure_cache(cache, |_| {}).await.unwrap();
+	let engine = SyncEngine::open(client, dir.join("sync.db")).await.unwrap();
+	let (pair, _) = locked(&engine.control)
+		.create_pair(root.to_str().unwrap(), OFFLINE_ROOT, mode)
+		.unwrap();
+	(engine, pair, state)
+}
+
+/// Whether the engine's record of `pair` says a pass of it has completed.
+fn first_pass_recorded(engine: &SyncEngine, pair: PairId) -> bool {
+	locked(&engine.control)
+		.pair(pair)
+		.unwrap()
+		.unwrap()
+		.first_pass_completed
+}
+
+/// What the guard held a pass of `pair` for, the pass run to its end: the reason and the number
+/// of held deletions.
+async fn held_by_a_pass(engine: &SyncEngine, pair: PairId) -> (Option<GuardReason>, usize) {
+	let report = engine
+		.sync_once(pair)
+		.await
+		.expect("a pass that applies nothing needs no server");
+	(report.guard.clone(), report.held_deletions())
+}
+
+/// The marker is the engine's record of a pass: a dry run plans without passing and a paused pair
+/// runs no pass, so neither records one, and the clean pass after them does.
+#[tokio::test]
+async fn only_a_clean_pass_records_the_first_pass() {
+	let dir = tempfile::tempdir().unwrap();
+	let (engine, pair, _cache) = offline_pair(dir.path(), SyncMode::TwoWay, &[]).await;
+
+	engine.plan_pair(pair).await.unwrap();
+	assert!(!first_pass_recorded(&engine, pair), "a dry run recorded it");
+
+	engine.pause_pair(pair).await.unwrap();
+	assert!(engine.sync_once(pair).await.unwrap().paused);
+	assert!(
+		!first_pass_recorded(&engine, pair),
+		"a paused pass recorded it"
+	);
+
+	engine.resume_pair(pair).await.unwrap();
+	assert_eq!(held_by_a_pass(&engine, pair).await, (None, 0));
+	assert!(
+		first_pass_recorded(&engine, pair),
+		"the clean pass did not record it"
 	);
 }
 

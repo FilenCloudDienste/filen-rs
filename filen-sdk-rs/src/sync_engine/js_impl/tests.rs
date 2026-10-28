@@ -725,6 +725,14 @@ async fn pair_info(core: &SyncEngineCore) -> SyncPairInfo {
 	pairs.remove(0)
 }
 
+/// A pair no pass has run for reads as not past its first pass: every pass of it is a first sync.
+#[tokio::test]
+async fn a_new_pair_reads_as_not_past_its_first_pass() {
+	let scene = Scene::new();
+	let (core, _pair) = scene.with_pair().await;
+	assert!(!pair_info(&core).await.first_pass_completed);
+}
+
 #[tokio::test]
 async fn a_pairs_delete_guard_reads_back_as_set() {
 	let scene = Scene::new();

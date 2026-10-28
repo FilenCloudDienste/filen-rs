@@ -787,6 +787,7 @@ describe("sync engine, offline", () => {
 		assert.equal(pair.mode, SyncMode.TwoWay)
 		assert.deepEqual(pair.deleteGuard, { tag: DeleteGuardState_Tags.Limited, inner: { floor: 10n, ratio: 0.5 } })
 		assert.equal(pair.paused, false)
+		assert.equal(pair.firstPassCompleted, false)
 		assert.equal(pair.activity, SyncPairActivity.Idle)
 		// napi leaves an absent Option's key out; read the value, as ubrn's caller would.
 		for (const key of [

@@ -57,8 +57,12 @@ use super::{
 /// (`legacy_synced`, see [`SCHEMA`] and [`SyncEngine::import_legacy_state`]). A version-3 file has
 /// no table for it, so the import, and every pass that weighs what it imported, would fail on it.
 ///
+/// Moved to 5 when a pair began recording whether a pass of it has completed cleanly
+/// (`sync_pairs.first_pass_completed`, see [`PairRecord::first_pass_completed`]). A version-4
+/// file has no column for it, so every read of its pairs would fail on it.
+///
 /// [`SyncEngine::import_legacy_state`]: super::SyncEngine::import_legacy_state
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 /// Schema for the baseline DB, created whole on a fresh DB. `foreign_keys`, `synchronous` and the
 /// busy timeout are applied per-connection in [`BaselineStore::init`] (they reset on every open);
@@ -123,6 +127,7 @@ CREATE TABLE IF NOT EXISTS sync_pairs (
 	guard_floor INTEGER,
 	guard_ratio REAL,
 	paused INTEGER NOT NULL DEFAULT 0,
+	first_pass_completed INTEGER NOT NULL DEFAULT 0,
 	UNIQUE (local_root, remote_root)
 );
 
@@ -760,6 +765,10 @@ pub struct PairRecord {
 	/// [`SyncEngine::is_paused`](super::SyncEngine::is_paused) gives, so a caller listing the pairs
 	/// does not have to ask again per pair.
 	pub paused: bool,
+	/// Whether a pass of the pair has completed cleanly: it read both sides whole and could trust
+	/// what each said was absent, and nothing failed, refused, cancelled or interrupted it. Set by
+	/// the engine, never by a caller.
+	pub first_pass_completed: bool,
 }
 
 /// A registered pair's id, handed back by [`SyncEngine::add_pair`](super::SyncEngine::add_pair).
@@ -1462,7 +1471,7 @@ impl BaselineStore {
 	pub(crate) fn pair(&self, id: PairId) -> rusqlite::Result<Option<PairRecord>> {
 		self.conn
 			.query_row(
-				"SELECT id, local_root, remote_root, mode, guard_floor, guard_ratio, paused FROM sync_pairs WHERE id = ?1",
+				"SELECT id, local_root, remote_root, mode, guard_floor, guard_ratio, paused, first_pass_completed FROM sync_pairs WHERE id = ?1",
 				params![id],
 				Self::row_to_pair,
 			)
@@ -1471,7 +1480,7 @@ impl BaselineStore {
 
 	pub(crate) fn list_pairs(&self) -> rusqlite::Result<Vec<PairRecord>> {
 		self.conn
-			.prepare("SELECT id, local_root, remote_root, mode, guard_floor, guard_ratio, paused FROM sync_pairs ORDER BY id")?
+			.prepare("SELECT id, local_root, remote_root, mode, guard_floor, guard_ratio, paused, first_pass_completed FROM sync_pairs ORDER BY id")?
 			.query_map([], Self::row_to_pair)?
 			.collect()
 	}
@@ -1492,6 +1501,16 @@ impl BaselineStore {
 			.prepare("SELECT id FROM sync_pairs WHERE paused != 0")?
 			.query_map([], |row| row.get(0))?
 			.collect()
+	}
+
+	/// Record that a pass of `pair` has completed cleanly (see
+	/// [`PairRecord::first_pass_completed`]). Once set it stays set for the life of the pair.
+	pub(crate) fn mark_first_pass_completed(&self, id: PairId) -> rusqlite::Result<()> {
+		self.conn.execute(
+			"UPDATE sync_pairs SET first_pass_completed = 1 WHERE id = ?1",
+			params![id],
+		)?;
+		Ok(())
 	}
 
 	pub(crate) fn delete_pair(&self, id: PairId) -> rusqlite::Result<()> {
@@ -1598,6 +1617,7 @@ impl BaselineStore {
 			mode: SyncMode::from_i64(mode_raw).ok_or_else(|| corrupt("mode", mode_raw))?,
 			delete_guard,
 			paused: row.get("paused")?,
+			first_pass_completed: row.get("first_pass_completed")?,
 		})
 	}
 

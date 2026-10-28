@@ -267,6 +267,7 @@ describe("the addon against the server", { skip: email && password ? false : "TE
 		assert.ok(recent.some(event => event.passId === done.passId && event.event.tag === SyncEventMessage_Tags.PassStarted))
 		const [info] = await engine.listPairs()
 		assert.deepEqual([info.id, info.remoteRoot, info.paused, info.passInFlight], [pair, remoteRoot, false, undefined])
+		assert.equal(info.firstPassCompleted, true)
 		assert.equal(typeof info.lastPassCompletedAtMs, "bigint")
 	})
 

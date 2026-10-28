@@ -1856,7 +1856,7 @@ impl SyncEngine {
 	}
 
 	/// Seed a converged baseline in ONE transaction, so a million rows is one commit rather than a
-	/// million.
+	/// million, and mark the pair as past its first pass, as the pass that converged it would have.
 	pub(super) async fn bench_seed_rows(
 		&self,
 		pair: PairId,
@@ -1867,8 +1867,10 @@ impl SyncEngine {
 			.iter()
 			.map(super::baseline::BaselineChange::Upsert)
 			.collect();
-		locked(&store)
+		let store = locked(&store);
+		store
 			.apply_changes(pair, &changes)
+			.and_then(|()| store.mark_first_pass_completed(pair))
 			.map_err(|e| db_error(e, "seeding the benchmark baseline"))
 	}
 
@@ -6196,6 +6198,31 @@ impl SyncEngine {
 		}
 	}
 
+	/// Record that `pair` has completed its first pass, when this is the pass that did (see
+	/// [`completes_first_pass`]). A record that cannot be written is the report's error, and the
+	/// next pass that completes cleanly records it.
+	async fn note_first_pass(
+		&self,
+		pair: PairId,
+		prep: &Prepared,
+		state: &guard::ScreenState,
+		report: &mut SyncReport,
+	) {
+		if prep.record.first_pass_completed || !completes_first_pass(prep, state, report) {
+			return;
+		}
+		let recorded = async {
+			let store = self.pair_store(pair).await?;
+			off_store(&store, move |store| store.mark_first_pass_completed(pair))
+				.await?
+				.map_err(|e| db_error(e, "recording the pair's first completed pass"))
+		};
+		if let Err(error) = recorded.await {
+			tracing::warn!("sync pair {pair}: {error}");
+			report.errors.push(error.to_string());
+		}
+	}
+
 	/// Drop the baseline rows at or under every path this pass found ignored, touching neither tree:
 	/// the path stops syncing, and once no rule hides it any more it is read like a first sync. Then
 	/// record the ignored roots the next pass needs to tell when that happens (see
@@ -6864,6 +6891,7 @@ impl SyncEngine {
 				report.deferred_paths,
 			);
 			self.untrack_ignored(pair, &prep, &mut report).await;
+			self.note_first_pass(pair, &prep, &state, &mut report).await;
 			observer(SyncEvent::PassCompleted {
 				report: report.clone(),
 			});
@@ -6924,6 +6952,7 @@ impl SyncEngine {
 		}
 		// After the apply, which carries rows along with the directory moves the roots were re-keyed by.
 		self.untrack_ignored(pair, &prep, &mut report).await;
+		self.note_first_pass(pair, &prep, &state, &mut report).await;
 		tracing::debug!(
 			"sync_once[pair {pair}]: done — {} uploaded, {} downloaded, {} remote dir(s), {} local dir(s), {} trashed, {} locally deleted, {} moved remote, {} moved local, {} conflict(s), {} held, {} deferred, {} interrupted, {} error(s)",
 			report.uploaded,
@@ -7617,6 +7646,31 @@ fn screen_state(prep: &Prepared) -> guard::ScreenState {
 		first_sync: prep.tracked_at_start == 0,
 		tracked: prep.tracked_at_start,
 	}
+}
+
+/// Whether a pass that got as far as `report` completed CLEANLY, which is what
+/// [`PairRecord::first_pass_completed`] records. Decided purely so the rule is
+/// unit-testable.
+///
+/// Clean means the pass established the whole relationship between the two trees, so the next
+/// pass may read a deletion as one: it was not refused, paused or cancelled, nothing it planned was
+/// left undone ([`interrupted`](SyncReport::interrupted)), nothing failed it as a whole
+/// ([`pass_error`](SyncReport::pass_error): the drive lock, a full side, a record not written),
+/// it read both sides WHOLE, and what each said was absent could be trusted (a complete local
+/// scan and a converged, non-empty remote view). A pass short of any of these did not see, or did
+/// not act on, all of what a first sync must hold.
+///
+/// What does not stop it: a deletion the guard held, which this pass reported for approval; a
+/// conflict, which it recorded; and a path whose action failed, which counts against that path's
+/// own streak. Each of those can stand for as long as the pair does, and a pair would never
+/// complete a pass that waited for them.
+fn completes_first_pass(prep: &Prepared, state: &guard::ScreenState, report: &SyncReport) -> bool {
+	report.refused.is_none()
+		&& !report.paused
+		&& report.interrupted == 0
+		&& report.pass_failure().is_none()
+		&& !prep.read.is_scoped()
+		&& state.absence_trusted()
 }
 
 fn overlap_error(overlap: PairOverlap) -> Error {
