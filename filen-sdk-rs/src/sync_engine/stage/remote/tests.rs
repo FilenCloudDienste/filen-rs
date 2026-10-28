@@ -243,7 +243,7 @@ fn the_staged_view_is_the_one_the_builder_builds() {
 				let (_dir, mut staged) = self::staged(&snapshot, paging);
 				staged.filter(filter);
 				assert_views_alike(&at("filtered"), &resident, &staged);
-				collided += usize::from(resident.has_collisions);
+				collided += usize::from(resident.has_collisions());
 				hidden += resident.ignored.len();
 				untracked += resident.ignored_default_untracked;
 			}

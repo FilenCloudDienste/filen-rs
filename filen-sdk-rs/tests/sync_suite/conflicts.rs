@@ -2035,10 +2035,11 @@ async fn remote_file_size(sc: &SingleClient, name: &str) -> Option<u64> {
 // ===========================================================================
 
 /// CONFLICT-10 — on an established two-way pair, two remote directories differing only in case
-/// (`Readme`/`README`) appear. The pass refuses as a remote collision: neither is merged into the
-/// other, a local edit staged meanwhile is held rather than pushed or lost, both remote copies stay
-/// intact, and a re-run refuses the same way. Once one of the two is trashed the pair converges on
-/// its own. Needs `-F malformed` for the name-hash seam.
+/// (`Readme`/`README`) appear. Both are held back as a remote name collision: neither is merged
+/// into the other or materialized locally, both remote copies stay intact, and a re-run holds them
+/// back the same way, while the rest of the pair syncs — a local edit staged meanwhile is pushed.
+/// Once one of the two is trashed the pair converges on its own. Needs `-F malformed` for the
+/// name-hash seam.
 ///
 /// The case-colliding shape staged is two DIRECTORIES: the name-hash seam exists only for directory
 /// creation, so two sibling FILES differing only in case (`Readme.txt`/`README.TXT`) are not
@@ -2052,14 +2053,14 @@ async fn conflict_10_case_only_collision() {
 	assert_eq!(r1.uploaded, 1, "{r1:?}");
 
 	let (upper, mut lower) = stage_case_colliding_dirs(&sc, "Readme", "README").await;
-	write_file(&sc.local, "keep.txt", b"v2 edited while refused");
+	write_file(&sc.local, "keep.txt", b"v2 edited beside the collision");
 
 	for round in 0..2 {
 		let report = sc.sync().await;
-		assert_eq!(
-			report.refused,
-			Some(filen_sdk_rs::sync_engine::RefuseReason::RemoteCollision),
-			"round {round}: the collision must refuse the pass: {report:?}"
+		assert_eq!(report.refused, None, "round {round}: {report:?}");
+		assert!(
+			holds_back_remote_twins(&report, ["README", "Readme"]),
+			"round {round}: both twins must be held back: {report:?}"
 		);
 		assert_eq!(
 			(
@@ -2068,12 +2069,12 @@ async fn conflict_10_case_only_collision() {
 				report.remotely_trashed,
 				report.locally_deleted
 			),
-			(0, 0, 0, 0),
-			"round {round}: a refused pass does nothing: {report:?}"
+			(usize::from(round == 0), 0, 0, 0),
+			"round {round}: only the edit beside the twins syncs, once: {report:?}"
 		);
 		assert!(
-			read_eq(&sc.local, "keep.txt", b"v2 edited while refused"),
-			"round {round}: the held local edit was lost"
+			read_eq(&sc.local, "keep.txt", b"v2 edited beside the collision"),
+			"round {round}: the local edit was lost"
 		);
 		assert!(
 			!sc.local.join("Readme").exists(),
@@ -2105,8 +2106,11 @@ async fn conflict_10_case_only_collision() {
 	);
 	let resolved = sc.sync().await;
 	assert!(resolved.errors.is_empty(), "{resolved:?}");
-	assert_eq!(resolved.refused, None, "{resolved:?}");
-	assert_eq!(resolved.uploaded, 1, "the held edit goes up: {resolved:?}");
+	assert_eq!(resolved.unsyncable, [], "{resolved:?}");
+	assert_eq!(
+		resolved.uploaded, 0,
+		"the edit went up already: {resolved:?}"
+	);
 	assert_eq!(
 		resolved.downloaded, 1,
 		"the surviving copy comes down: {resolved:?}"
@@ -2117,8 +2121,8 @@ async fn conflict_10_case_only_collision() {
 	);
 	assert_eq!(
 		remote_file_size(&sc, "keep.txt").await,
-		Some(b"v2 edited while refused".len() as u64),
-		"the held edit did not reach the remote"
+		Some(b"v2 edited beside the collision".len() as u64),
+		"the edit did not reach the remote"
 	);
 	sc.cleanup();
 }

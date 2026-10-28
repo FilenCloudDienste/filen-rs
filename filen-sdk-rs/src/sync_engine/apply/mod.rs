@@ -108,7 +108,8 @@ pub struct SyncReport {
 	/// The top of each subtree the ignore rules hide, on either side, reported on every pass the rule
 	/// stands. One only the built-in defaults hide is left out unless this pass stopped tracking it.
 	pub ignored: Vec<IgnoredPath>,
-	/// Set when the pass refused to run: nothing was applied.
+	/// Set when the pass refused to run: nothing was applied. No pass sets it any more (see
+	/// [`RefuseReason`]).
 	pub refused: Option<RefuseReason>,
 	/// How many paths the pass deliberately left alone rather than acting on: a name the cache is
 	/// listing twice (so the view cannot resolve it), or a remote deletion this engine has already

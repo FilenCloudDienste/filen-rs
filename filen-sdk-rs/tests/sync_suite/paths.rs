@@ -850,8 +850,9 @@ async fn path_09_trailing_space_or_dot_names() {}
 
 /// PATH-11 — two remote sibling directories differing only in case (`Data`/`DATA`, staged past the
 /// server's case-insensitive dedup) cannot both map onto one local path, so a remote->local pass
-/// refuses as a remote collision: nothing is materialized locally (no silent clobber of one by the
-/// other), both remote items and their contents stay put, and a re-run refuses the same way.
+/// holds both back as a remote name collision: nothing is materialized locally (no silent clobber
+/// of one by the other), both remote items and their contents stay put, and a re-run holds them
+/// back the same way.
 /// Needs `-F malformed` for the name-hash seam.
 ///
 /// Only the DIRECTORY shape is staged: the name-hash seam exists only for directory creation, so two
@@ -864,16 +865,15 @@ async fn path_11_case_colliding_remote_siblings() {
 
 	for round in 0..2 {
 		let report = sc.sync().await;
-		assert_eq!(
-			report.refused,
-			Some(filen_sdk_rs::sync_engine::RefuseReason::RemoteCollision),
-			"round {round}: the collision must refuse the pass: {report:?}"
+		assert_eq!(report.refused, None, "round {round}: {report:?}");
+		assert!(
+			holds_back_remote_twins(&report, ["DATA", "Data"]),
+			"round {round}: both twins must be held back: {report:?}"
 		);
-		assert!(!report.errors.is_empty(), "round {round}: {report:?}");
 		assert_eq!(
 			(report.downloaded, report.local_dirs_created),
 			(0, 0),
-			"round {round}: a refused pass writes nothing: {report:?}"
+			"round {round}: nothing of the twins is written: {report:?}"
 		);
 		assert!(
 			walk_tree(&sc.local).is_empty(),

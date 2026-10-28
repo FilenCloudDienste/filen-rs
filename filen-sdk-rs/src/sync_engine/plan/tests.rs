@@ -4466,7 +4466,7 @@ fn an_ignored_remote_item_leaves_the_view_and_only_its_top_is_recorded() {
 		&undecodables,
 		None,
 	);
-	assert!(raw.has_collisions, "unfiltered, the twins collide");
+	assert!(raw.has_collisions(), "unfiltered, the twins collide");
 	assert_eq!(raw.skipped.len(), 3, "{:?}", raw.skipped);
 	assert!(raw.ignored.is_empty());
 
@@ -4486,7 +4486,7 @@ fn an_ignored_remote_item_leaves_the_view_and_only_its_top_is_recorded() {
 		view.nodes.whole().paths().collect::<Vec<_>>(),
 		vec!["keep.txt"]
 	);
-	assert!(!view.has_collisions);
+	assert!(!view.has_collisions());
 	let by = |pattern: &str| IgnoreDecision {
 		level: IgnoreLevel::File { dir: String::new() },
 		pattern: pattern.to_string(),
@@ -4593,12 +4593,13 @@ fn the_narrowed_filter_hides_the_decided_paths_and_leaves_the_carried_ones() {
 
 /// The narrowed collision check folds each decided key against the other decided keys, the held
 /// paths and the CARRIED keys — the last asked of the baseline rather than by scanning the
-/// view — and refuses the pass on any of the three.
+/// view — and records both twins on any of the three.
 ///
 /// The last case in this test is the one the narrowing deliberately does not check: two keys
-/// the pass merely carried. A pass that finds a collision refuses, and a refusal forces the
-/// next pass to read whole, so no such pair can reach a scoped pass undetected. Pinned here so
-/// that reasoning has to be revisited if the refusal ever stops forcing a whole read.
+/// the pass merely carried. A pass that finds a collision forces the next pass to read whole,
+/// and so does every one after it while the collision stands, so no such pair can reach a scoped
+/// pass undetected. Pinned here so that reasoning has to be revisited if a collision ever stops
+/// forcing a whole read.
 #[test]
 fn the_narrowed_collision_check_folds_every_key_a_decided_one_can_meet() {
 	let root = Uuid::new_v4();
@@ -4627,7 +4628,11 @@ fn the_narrowed_collision_check_folds_every_key_a_decided_one_can_meet() {
 		&[],
 	);
 	against_carried.resolve_collisions_changed(&carried_rows, &decided(&["Note.txt"]));
-	assert!(against_carried.has_collisions);
+	assert_eq!(
+		against_carried.collisions,
+		decided(&["Note.txt", "note.txt"]),
+		"both twins are held back"
+	);
 	assert!(
 		!against_carried.nodes.whole().holds("Note.txt"),
 		"the decided key is the loser; the carried one the pass is not touching stays"
@@ -4643,7 +4648,7 @@ fn the_narrowed_collision_check_folds_every_key_a_decided_one_can_meet() {
 		&[],
 	);
 	both_decided.resolve_collisions_changed(&no_rows, &decided(&["Note.txt", "note.txt"]));
-	assert!(both_decided.has_collisions);
+	assert_eq!(both_decided.collisions, decided(&["Note.txt", "note.txt"]));
 	assert_eq!(
 		both_decided.nodes.whole().len(),
 		1,
@@ -4660,15 +4665,15 @@ fn the_narrowed_collision_check_folds_every_key_a_decided_one_can_meet() {
 	);
 	against_held.held_paths = decided(&["note.txt"]);
 	against_held.resolve_collisions_changed(&no_rows, &decided(&["Note.txt"]));
-	assert!(against_held.has_collisions);
+	assert_eq!(against_held.collisions, decided(&["Note.txt", "note.txt"]));
 	assert!(!against_held.nodes.whole().holds("Note.txt"));
 
 	// Two keys the pass merely CARRIED: not folded, by the induction above.
 	let mut carried_only = place_remote_items(root, PairRoot::Directory, &[], &[lower, upper], &[]);
 	carried_only.resolve_collisions_changed(&carried_rows, &BTreeSet::new());
 	assert!(
-		!carried_only.has_collisions,
-		"a pass that found this pair would have refused and forced the next read whole"
+		!carried_only.has_collisions(),
+		"a pass that found this pair would have forced the next read whole"
 	);
 	assert_eq!(carried_only.nodes.whole().len(), 2);
 }
@@ -4699,7 +4704,7 @@ fn a_scoped_filter_reads_the_decided_rows_once_for_both_of_its_halves() {
 	let rules = IgnoreRules::default();
 	let mut view = RemoteView {
 		nodes: Side::carried(),
-		has_collisions: false,
+		collisions: BTreeSet::new(),
 		held_paths: BTreeSet::new(),
 		skipped: Vec::new(),
 		ignored: BTreeMap::new(),
@@ -4714,7 +4719,7 @@ fn a_scoped_filter_reads_the_decided_rows_once_for_both_of_its_halves() {
 		&decided,
 	);
 	let after = baseline.reads_for_test();
-	assert!(!view.has_collisions);
+	assert!(!view.has_collisions());
 	let (statements, rows) = (after.0 - before.0, after.1 - before.1);
 	assert!(
 		rows < 5 * FILES / 2,
@@ -4865,7 +4870,7 @@ fn a_directory_only_rule_hides_what_was_recorded_under_an_unplaceable_directory(
 
 /// The placed view keeps BOTH halves of a case-only pair — the consumers that read the view
 /// before it is filtered see the remote as it is — and the filter is what resolves them and
-/// refuses the pass.
+/// records both as colliding.
 #[test]
 fn the_placed_view_keeps_both_case_twins_and_the_filter_resolves_them() {
 	let root = Uuid::new_v4();
@@ -4887,13 +4892,17 @@ fn the_placed_view_keeps_both_case_twins_and_the_filter_resolves_them() {
 	placed.sort_unstable();
 	assert_eq!(placed, vec!["Note.txt", "note.txt"]);
 	assert!(
-		!view.has_collisions,
-		"placement itself refuses nothing: the reads that come before the filter are about the \
-			 remote as it is"
+		!view.has_collisions(),
+		"placement itself holds nothing back: the reads that come before the filter are about \
+			 the remote as it is"
 	);
 
 	view.filter(None);
-	assert!(view.has_collisions, "the filter is what refuses the pass");
+	assert_eq!(
+		view.collisions,
+		BTreeSet::from(["Note.txt".to_string(), "note.txt".to_string()]),
+		"the filter is what finds the twins"
+	);
 	assert_eq!(view.nodes.whole().len(), 1, "the loser leaves the view");
 }
 
@@ -5009,7 +5018,7 @@ fn build_remote_view_excludes_filen_syncs_trash_at_any_depth_by_its_exact_name()
 		"filen-sync's trash is left out without a record: {:?}",
 		view.skipped
 	);
-	assert!(!view.has_collisions);
+	assert!(!view.has_collisions());
 }
 
 /// The account's data directory is in no view of a pair rooted at the drive, in any case, and nor
@@ -5056,7 +5065,7 @@ fn build_remote_view_excludes_the_account_data_directory_at_the_top_of_a_drive_r
 		"the account's data directory is left out without a record: {:?}",
 		drive.skipped
 	);
-	assert!(!drive.has_collisions);
+	assert!(!drive.has_collisions());
 	// The server dedups the drive root's names case-insensitively, so this is that directory too.
 	let other_case = remote_dir(".Filen", root);
 	let under = cacheable_file(other_case.uuid, "y.txt");
@@ -5538,7 +5547,7 @@ fn a_byte_identical_duplicate_remote_name_holds_only_that_path() {
 	);
 
 	assert!(
-		!view.has_collisions,
+		!view.has_collisions(),
 		"a cache in transition must not refuse the pass"
 	);
 	assert_eq!(view.held_paths, BTreeSet::from(["note.txt".to_string()]));
@@ -5601,10 +5610,10 @@ fn a_subtree_range_holds_exactly_the_subtree() {
 	assert!(roots.range(subtree_bounds("b")).next().is_none());
 }
 
-/// A case-only collision is a real one — the server does allow both names, and no 1:1 local
-/// mapping exists — so the whole-pass refusal stays.
+/// A case-only collision is a real one — a non-conforming client can write both names, and no
+/// 1:1 local mapping exists — so both twins are held back, not merely the one the view drops.
 #[test]
-fn a_case_only_remote_collision_still_refuses_the_pass() {
+fn a_case_only_remote_collision_holds_back_both_twins() {
 	let root = Uuid::new_v4();
 	let lower = cacheable_file(root, "note.txt");
 	let upper = RemoteItem {
@@ -5615,10 +5624,12 @@ fn a_case_only_remote_collision_still_refuses_the_pass() {
 
 	let view = build_remote_view(root, PairRoot::Directory, &[], &[lower, upper], &[], None);
 
-	assert!(
-		view.has_collisions,
+	assert_eq!(
+		view.collisions,
+		BTreeSet::from(["Note.txt".to_string(), "note.txt".to_string()]),
 		"a case-only collision is not a transition"
 	);
+	assert_eq!(view.nodes.whole().len(), 1, "one twin stays in the view");
 	assert!(view.held_paths.is_empty());
 }
 
@@ -5641,7 +5652,7 @@ fn build_remote_view_resolves_paths_and_flags_collisions() {
 		&[],
 		None,
 	);
-	assert!(!view.has_collisions);
+	assert!(!view.has_collisions());
 	let mut paths: Vec<String> = view
 		.nodes
 		.whole()
@@ -6841,7 +6852,7 @@ mod scoped {
 		fn view(&self) -> RemoteView {
 			RemoteView {
 				nodes: copied(&self.nodes),
-				has_collisions: false,
+				collisions: BTreeSet::new(),
 				held_paths: self.held_paths.clone(),
 				skipped: self.skipped.clone(),
 				ignored: BTreeMap::new(),
@@ -6925,7 +6936,7 @@ mod scoped {
 	/// Both removals are things an earlier whole read already did. A carried node came off a
 	/// baseline row, and a row only exists where the rules let the node through — the rules
 	/// stand still across a scoped pass, so no carried node is hidden by them. And a pass that
-	/// finds a fold REFUSES, which forces the next pass to read whole, so no two carried keys
+	/// finds a fold forces the next pass to read whole, so no two carried keys
 	/// fold together either. Without this the properties would be comparing the narrowed form
 	/// against inputs no pass can be handed, and the divergences they found would be the two
 	/// this module pins deliberately in
@@ -7183,18 +7194,17 @@ mod scoped {
 
 	/// Everything the two collision checks must agree on.
 	///
-	/// The REFUSAL is the contract at every case: a fold either leaves no 1:1 local mapping or
-	/// it does not, and [`has_collisions`](RemoteView::has_collisions) is the whole of what the
-	/// engine reads of this step. Where none fired, the two views must also be identical
-	/// outright — there is no licence to differ at all.
+	/// Whether a fold fired is the contract at every case: a fold either leaves no 1:1 local
+	/// mapping or it does not. Where none fired, the two views must also be identical outright —
+	/// there is no licence to differ at all.
 	///
-	/// Where one DID fire, the pass is refused before it reconciles anything and the view is
-	/// dropped unread, so what a refused view still holds is not a contract — and the two forms
-	/// do differ there. The narrowed one can empty a whole fold class where the whole form keeps
-	/// a spelling: its losers leave only once the loop is over, so two decided twins each still
-	/// find the other's row and node and both are dropped. What is still owed in that case is
-	/// the direction a LOST refusal would show up in — the narrowed form never keeps a name the
-	/// whole one dropped.
+	/// Where one DID fire, the two forms may differ in which spellings they keep. The narrowed one
+	/// can empty a whole fold class where the whole form keeps a spelling: its losers leave only
+	/// once the loop is over, so two decided twins each still find the other's row and node and
+	/// both are dropped. The engine holds back every path a form records as colliding, and reads
+	/// nothing it dropped, so what is owed is that the narrowed form never keeps a name the whole
+	/// one dropped, and that every node it dropped where the whole one kept it is a collision it
+	/// records.
 	fn assert_same_claimed(
 		seed: u64,
 		baseline: &Baseline,
@@ -7203,14 +7213,22 @@ mod scoped {
 		scoped: &RemoteView,
 	) {
 		assert_eq!(
-			whole.has_collisions, scoped.has_collisions,
-			"seed {seed}, {what}: the two forms disagree about refusing the pass"
+			whole.has_collisions(),
+			scoped.has_collisions(),
+			"seed {seed}, {what}: the two forms disagree about a collision"
 		);
-		if whole.has_collisions {
+		if whole.has_collisions() {
 			assert!(
 				claimed_keys(baseline, scoped).is_subset(&claimed_keys(baseline, whole)),
 				"seed {seed}, {what}: the narrowed form kept a name the whole one dropped"
 			);
+			let kept = sorted_paths(baseline, scoped);
+			for path in sorted_paths(baseline, whole) {
+				assert!(
+					kept.contains(&path) || scoped.collisions.contains(&path),
+					"seed {seed}, {what}: the narrowed form dropped {path:?} without holding it back"
+				);
+			}
 			return;
 		}
 		assert_eq!(
@@ -7237,10 +7255,10 @@ mod scoped {
 		seen.assert_reached();
 	}
 
-	/// The narrowed collision check refuses exactly what the whole one refuses, and leaves the
-	/// same names claimed.
+	/// The narrowed collision check finds a collision exactly where the whole one does, and
+	/// leaves the same names claimed.
 	#[test]
-	fn a_scoped_collision_check_refuses_what_a_whole_one_refuses() {
+	fn a_scoped_collision_check_finds_what_a_whole_one_finds() {
 		let (cases, seen) = view_cases();
 		for (seed, case) in &cases {
 			let mut whole = case.view();
@@ -7298,8 +7316,8 @@ mod scoped {
 	/// Both are the safe direction. A carried node's LOCAL half comes off the same row, so the
 	/// pair reads as converged there and a reconcile driven by the decided set plans nothing
 	/// at it; dropping the remote half alone is what would read as a local deletion. The
-	/// second shape only DELAYS a refusal: the held path is decided, so the pass after the one
-	/// that unholds it folds it against the carried row and refuses then.
+	/// second shape only DELAYS the collision: the held path is decided, so the pass after the
+	/// one that unholds it folds it against the carried row and holds both back then.
 	#[test]
 	fn a_scoped_filter_keeps_the_two_carried_shapes_a_whole_one_drops() {
 		let of = |path: &str| {
@@ -7325,9 +7343,9 @@ mod scoped {
 		whole.filter(Some(case.filter()));
 		assert!(
 			sorted_paths(&case.baseline, &whole).is_empty(),
-			"the whole form drops the rows left at a hidden path and refuses the folded one"
+			"the whole form drops the rows left at a hidden path and the folded one"
 		);
-		assert!(whole.has_collisions);
+		assert!(whole.has_collisions());
 		assert_eq!(whole.ignored.keys().collect::<Vec<_>>(), vec!["z"]);
 
 		let mut scoped = case.view();
@@ -7338,8 +7356,8 @@ mod scoped {
 			"a carried row at a hidden path, and one folding onto a held path, both stay"
 		);
 		assert!(
-			!scoped.has_collisions,
-			"the pass is not refused over a pair it is not reconciling"
+			!scoped.has_collisions(),
+			"nothing is held back over a pair the pass is not reconciling"
 		);
 		assert!(
 			scoped.ignored.is_empty(),
@@ -7350,7 +7368,7 @@ mod scoped {
 	/// The same two shapes once the pass DECIDED their keys — a directory renamed away records
 	/// every row under its old name — are asked about like any other decided key, and the
 	/// narrowed filter drops them exactly as the whole one does: the hidden rows leave with
-	/// their root recorded, and the row folding onto a held path refuses the pass. The nodes
+	/// their root recorded, and the row folding onto a held path is a collision. The nodes
 	/// are carried off the rows here, so what the view holds at each key is the rows' answer.
 	#[test]
 	fn a_scoped_filter_drops_the_two_carried_shapes_once_they_are_decided() {
@@ -7377,9 +7395,9 @@ mod scoped {
 		for (form, view) in [("whole", &whole), ("scoped", &scoped)] {
 			assert!(
 				sorted_paths(&case.baseline, view).is_empty(),
-				"{form}: the rows at a hidden path leave, and the folded one is refused"
+				"{form}: the rows at a hidden path leave, and so does the folded one"
 			);
-			assert!(view.has_collisions, "{form}");
+			assert!(view.has_collisions(), "{form}");
 			assert_eq!(view.ignored.keys().collect::<Vec<_>>(), vec!["z"], "{form}");
 		}
 	}

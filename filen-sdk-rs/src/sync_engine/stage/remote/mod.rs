@@ -147,6 +147,21 @@ const DROP_TWINS: &str = "DELETE FROM remote WHERE fold(path) = ?1
 	 AND path > (SELECT min(path) FROM remote WHERE fold(path) = ?1)";
 /// Every node whose path folds as the held path `?1` does.
 const DROP_HELD_TWINS: &str = "DELETE FROM remote WHERE fold(path) = fold(?1)";
+/// The paths of every node whose folded path is `?1`.
+const FOLDED_LIKE_KEY: &str = "SELECT path FROM remote WHERE fold(path) = ?1";
+/// The paths of every node whose path folds as `?1` does.
+const FOLDED_LIKE_PATH: &str = "SELECT path FROM remote WHERE fold(path) = fold(?1)";
+
+/// The paths `statement` (one of [`FOLDED_LIKE_KEY`] and [`FOLDED_LIKE_PATH`]) reads for `at`.
+fn paths_folding(
+	conn: &rusqlite::Connection,
+	statement: &str,
+	at: &str,
+) -> rusqlite::Result<Vec<String>> {
+	conn.prepare_cached(statement)?
+		.query_map([at], |row| row.get::<_, String>(0))?
+		.collect()
+}
 
 /// How many children of a directory the walk reads a statement.
 pub(super) const CHILDREN_PAGE: NonZeroUsize = NonZeroUsize::new(256).expect("256 is not zero");
@@ -330,7 +345,7 @@ impl RemoteSink {
 		stage.conn.execute_batch(PLACED)?;
 		Ok(RemoteView {
 			nodes: Side::Staged(StagedSide::new(stage, placed, REMOTE, paging)),
-			has_collisions: false,
+			collisions: BTreeSet::new(),
 			held_paths: held,
 			skipped,
 			ignored: BTreeMap::new(),
@@ -679,11 +694,15 @@ impl StagedSide<RemoteNode> {
 
 	/// Drop every node whose path folds together with another's but the first of them in path
 	/// order, and every node whose path folds as one of `held` does — a held path took its folded
-	/// name when the view held it. Whether it dropped any: the view's collisions (see
-	/// `RemoteView::resolve_collisions`).
+	/// name when the view held it. Returns every path of each such group, the first and the held
+	/// path included: the view's collisions (see `RemoteView::resolve_collisions`).
 	///
 	/// The folded paths are compared whole, so two that merely share a digest never collide.
-	pub(in super::super) fn drop_fold_twins(&mut self, held: &BTreeSet<String>) -> bool {
+	pub(in super::super) fn drop_fold_twins(
+		&mut self,
+		held: &BTreeSet<String>,
+	) -> BTreeSet<String> {
+		let mut collisions = BTreeSet::new();
 		let dropped = self.edit("the folded twins dropped", |conn| {
 			let keys = conn
 				.prepare_cached(TWIN_KEYS)?
@@ -694,15 +713,23 @@ impl StagedSide<RemoteNode> {
 				tracing::debug!(
 					"remote view: two or more remote items fold onto {key:?}, so no 1:1 local mapping exists"
 				);
+				collisions.extend(paths_folding(conn, FOLDED_LIKE_KEY, key)?);
 				dropped += conn.prepare_cached(DROP_TWINS)?.execute([key])?;
 			}
 			for path in held {
+				// What the twins above left of a group folding onto a held path is still in the
+				// stage, so this reads the whole of it.
+				let twins = paths_folding(conn, FOLDED_LIKE_PATH, path)?;
+				if !twins.is_empty() {
+					collisions.extend(twins);
+					collisions.insert(path.clone());
+				}
 				dropped += conn.prepare_cached(DROP_HELD_TWINS)?.execute([path])?;
 			}
 			Ok(dropped)
 		});
 		self.dropped(dropped);
-		dropped > 0
+		collisions
 	}
 }
 

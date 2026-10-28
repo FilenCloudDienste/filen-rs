@@ -5,7 +5,9 @@ use std::{
 
 use anyhow::{Context, Result};
 use console::style;
-use filen_sdk_rs::sync_engine::{ConflictResolution, SyncEngine, SyncEvent, TransferDirection};
+use filen_sdk_rs::sync_engine::{
+	ConflictResolution, SyncEngine, SyncEvent, TransferDirection, UnsyncablePath, UnsyncableReason,
+};
 use tokio::sync::mpsc;
 
 use crate::{
@@ -146,6 +148,13 @@ pub(crate) async fn sync(
 			}
 		}
 
+		// paths the engine leaves alone, which no other event names
+		if let SyncEvent::PassCompleted { ref report } = event {
+			for notice in unsyncable_notices(&report.unsyncable) {
+				print_needs_attention(&notice);
+			}
+		}
+
 		// resolve conflicts
 		if let SyncEvent::Conflict { ref rel_path } = event {
 			if is_first_pass
@@ -186,6 +195,28 @@ pub(crate) async fn sync(
 	}
 
 	Ok(())
+}
+
+/// One line for each path the pass left alone and why, so files that go unsynced, a name
+/// collision's above all, do not hide behind a pass that otherwise completed without errors.
+fn unsyncable_notices(unsyncable: &[UnsyncablePath]) -> Vec<String> {
+	unsyncable
+		.iter()
+		.map(|path| {
+			let hint = match path.reason {
+				UnsyncableReason::LocalNameCollision | UnsyncableReason::RemoteNameCollision => {
+					". Rename one of them to sync both"
+				}
+				UnsyncableReason::InvalidName { .. }
+				| UnsyncableReason::RepeatedFailure { .. }
+				| UnsyncableReason::RemoteUndecodable
+				| UnsyncableReason::RemoteInvalidName { .. }
+				| UnsyncableReason::RemoteBrokenParent
+				| UnsyncableReason::LocalAlias { .. } => "",
+			};
+			format!("Cannot sync {}: {}{hint}", path.rel_path, path.reason)
+		})
+		.collect()
 }
 
 fn format_sync_event(event: &SyncEvent) -> String {
@@ -264,5 +295,65 @@ fn format_sync_event(event: &SyncEvent) -> String {
 			progress.bytes_hashed,
 			progress.bytes_to_hash,
 		),
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use filen_sdk_rs::sync_engine::{UnsyncablePath, UnsyncableReason};
+
+	use super::unsyncable_notices;
+
+	/// A pass that held case twins back completes with no errors, so the twins are named on their
+	/// own lines, with what resolves them.
+	#[test]
+	fn a_pass_that_held_back_name_collisions_names_each_path() {
+		let unsyncable = [
+			UnsyncablePath {
+				rel_path: "docs/Report.txt".to_string(),
+				reason: UnsyncableReason::LocalNameCollision,
+			},
+			UnsyncablePath {
+				rel_path: "docs/report.txt".to_string(),
+				reason: UnsyncableReason::LocalNameCollision,
+			},
+			UnsyncablePath {
+				rel_path: "R.txt".to_string(),
+				reason: UnsyncableReason::RemoteNameCollision,
+			},
+		];
+
+		assert_eq!(
+			unsyncable_notices(&unsyncable),
+			[
+				"Cannot sync docs/Report.txt: another local item's name is the same once case and \
+				 Unicode form are folded. Rename one of them to sync both",
+				"Cannot sync docs/report.txt: another local item's name is the same once case and \
+				 Unicode form are folded. Rename one of them to sync both",
+				"Cannot sync R.txt: another remote item's name is the same once case is folded. \
+				 Rename one of them to sync both",
+			]
+		);
+	}
+
+	/// Every other reason a path is left alone is named the same way, without the rename hint.
+	#[test]
+	fn a_pass_that_left_a_path_alone_for_another_reason_names_it() {
+		let unsyncable = [UnsyncablePath {
+			rel_path: "nul".to_string(),
+			reason: UnsyncableReason::InvalidName {
+				detail: "reserved".to_string(),
+			},
+		}];
+
+		assert_eq!(
+			unsyncable_notices(&unsyncable),
+			["Cannot sync nul: the remote would reject this name: reserved"]
+		);
+	}
+
+	#[test]
+	fn a_pass_that_left_nothing_alone_has_no_notices() {
+		assert!(unsyncable_notices(&[]).is_empty());
 	}
 }

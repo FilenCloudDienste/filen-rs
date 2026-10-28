@@ -335,7 +335,7 @@ describe("exports", () => {
 		)
 		assert.deepEqual(
 			{ ...sdk.UnsyncableReason_Tags },
-			tags(["InvalidName", "RepeatedFailure", "RemoteUndecodable", "RemoteInvalidName", "RemoteBrokenParent", "LocalAlias"])
+			tags(["InvalidName", "RepeatedFailure", "RemoteUndecodable", "RemoteInvalidName", "RemoteBrokenParent", "LocalAlias", "LocalNameCollision", "RemoteNameCollision"])
 		)
 	})
 

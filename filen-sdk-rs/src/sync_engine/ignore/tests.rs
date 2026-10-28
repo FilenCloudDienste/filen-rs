@@ -340,7 +340,7 @@ fn rule_view(nodes: Vec<RemoteNode>, held: &[&str]) -> RemoteView {
 			.into_iter()
 			.map(|node| (node.rel_path.clone(), node))
 			.collect(),
-		has_collisions: false,
+		collisions: BTreeSet::new(),
 		held_paths: held.iter().map(|path| (*path).to_owned()).collect(),
 		skipped: Vec::new(),
 		ignored: BTreeMap::new(),

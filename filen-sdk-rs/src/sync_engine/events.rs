@@ -45,7 +45,9 @@ use crate::ErrorKind;
 pub enum SyncEvent {
 	/// A pass began (after the read-only prepare), in this mode.
 	PassStarted { mode: SyncMode },
-	/// The pass refused to run (e.g. an unresolved name collision); no actions were applied.
+	/// The pass refused to run; no actions were applied. No pass sends it any more: a name
+	/// collision holds back only the colliding paths (see
+	/// [`UnsyncableReason::LocalNameCollision`](super::UnsyncableReason::LocalNameCollision)).
 	Refused { reason: String },
 	/// How many executable actions this pass will apply (after guard screening) — the denominator
 	/// for progress; the in-progress events below tick through it.

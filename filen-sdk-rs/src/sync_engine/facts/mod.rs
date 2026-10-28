@@ -29,8 +29,10 @@
 //!
 //! # What is NOT carried, and why
 //!
-//! - `has_collisions`: a pass that finds one REFUSES, and a refusal forces the next pass full
-//!   (`next_pass_scope`), which recomputes it. Carrying the bool would be state nothing ever reads.
+//! - the name collisions (`LocalScan::collisions`, `RemoteView::collisions`): a pass that finds one
+//!   forces the next pass full (`next_pass_scope`'s `FullPassReason::NameCollision`), which
+//!   recomputes them, and so on for as long as one stands. A change-scoped pass therefore never
+//!   follows one, and holds back only what it finds itself.
 //! - the remote half of `ignore_blocked` (`RemoteRules::blocked`) and `remote_rule_errors`: both
 //!   come from `SyncEngine::remote_rules`, which reads the rule files the BASELINE names and so
 //!   costs the same on a change-scoped pass as on a whole one. Recomputed, not carried; the caller

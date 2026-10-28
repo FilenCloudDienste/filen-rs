@@ -7,10 +7,12 @@
 //! fast path misses at its own path may take the hash of the row it left (see [`scan_subtree`]).
 //!
 //! Paths are NFC-normalized (macOS hands back NFD) and `/`-joined so they key 1:1 against the
-//! NFC-normalized remote snapshot and the baseline. Two entries that normalize to the same key are
-//! a collision (the engine refuses to reconcile a pair with one — a 1:1 local mapping is
-//! required). The scan reports whether it completed: a partial scan (an unreadable subtree, a
-//! missing root) must never let the mass-delete guard propagate deletions.
+//! NFC-normalized remote snapshot and the baseline. Two entries whose keys fold together (see
+//! [`collision_key`]) are a collision: the first takes the name, the other is left out of the
+//! nodes, and both are recorded in [`LocalScan::collisions`], which the engine leaves alone on both
+//! sides rather than map one of them onto the other. The scan reports whether it completed: a
+//! partial scan (an unreadable subtree, a missing root) must never let the mass-delete guard
+//! propagate deletions.
 //!
 //! Symlinks are followed and their targets read as regular files (Filen has no symlink concept and
 //! the engine never writes one); the walk's loop detection guards against cycles. A symlink that
@@ -170,9 +172,8 @@ pub(crate) struct LocalNode {
 }
 
 /// What went wrong for one entry during a scan. Non-fatal individually: the walk carries on, every
-/// error is logged at `warn` as it is recorded, and all but a
-/// [`DuplicateName`](Self::DuplicateName) (which refuses the pass instead) are reported in the
-/// pass's [`SyncReport::errors`](super::SyncReport::errors). Any error marks the whole scan
+/// error is logged at `warn` as it is recorded, and each is reported in the pass's
+/// [`SyncReport::errors`](super::SyncReport::errors). Any error marks the whole scan
 /// [`incomplete`](LocalScan::complete), except a symlink that cannot be followed and a
 /// `.filenignore` that could not be used: what its rules cover is blocked instead (see
 /// [`LocalScan::ignore_blocked`]), so nothing was missed, only withheld.
@@ -191,9 +192,6 @@ pub(crate) enum ScanError {
 	},
 	/// An entry whose name is not valid UTF-8 — Filen names are UTF-8, so it cannot be synced.
 	NonUtf8Name { lossy_path: String },
-	/// Two entries normalize to the same key — the pair cannot be reconciled until the user
-	/// resolves it (a single local path cannot hold both).
-	DuplicateName { rel_path: String },
 	/// A `.filenignore` line that was skipped, or a whole file that did not compile.
 	IgnoreRules(IgnoreParseError),
 }
@@ -208,12 +206,6 @@ impl fmt::Display for ScanError {
 			Self::Io { rel_path, source } => write!(f, "{rel_path}: {source}"),
 			Self::NonUtf8Name { lossy_path } => {
 				write!(f, "{lossy_path}: the name is not valid UTF-8")
-			}
-			Self::DuplicateName { rel_path } => {
-				write!(
-					f,
-					"{rel_path}: the names collide once case and Unicode form are folded"
-				)
 			}
 			Self::IgnoreRules(error) => error.fmt(f),
 		}
@@ -301,7 +293,7 @@ impl ScanSink for MapSink {
 		let key = collision_key(found.rel_path());
 		// Naming the twin means folding the paths already taken, which is why it happens on a
 		// digest hit only. Finding none means the digests collided rather than the names, and a pair
-		// is never refused over that.
+		// is never held back over that.
 		if !self.claimed.insert(collision_hash(&key))
 			&& let Some(taken) = self
 				.nodes
@@ -334,8 +326,9 @@ impl ScanSink for MapSink {
 pub(crate) struct LocalScan {
 	pub(crate) nodes: Side<LocalNode>,
 	/// `false` if the node set may be INCOMPLETE — a missing/unreadable root, an unreadable
-	/// subtree, a directory that changed under the walk (which has no [`ScanError`]), a non-UTF-8
-	/// name, or a normalized-name collision. The mass-delete guard refuses to propagate deletions
+	/// subtree, a directory that changed under the walk (which has no [`ScanError`]), or a non-UTF-8
+	/// name. A name collision does not make it so: every path of one is in
+	/// [`collisions`](Self::collisions), which the engine acts on nowhere. The mass-delete guard refuses to propagate deletions
 	/// from an incomplete scan (an empty/half-read source must not nuke the destination).
 	///
 	/// A symlink that cannot be followed (dangling, or looping back onto an ancestor) leaves it
@@ -385,17 +378,23 @@ pub(crate) struct LocalScan {
 	/// `.filendl` file they are not in `nodes`; the pass removes them
 	/// ([`remove_stale_downloads`]).
 	pub(crate) stale_downloads: Vec<PathBuf>,
+	/// Every path of each group of entries whose paths fold together ([`collision_key`]): the one
+	/// that took the name and each one refused it. Only the first of a group is in `nodes` — a
+	/// stage holds one node per folded name — and NFC/NFD twins share their key, so one path
+	/// stands for the pair.
+	///
+	/// Like [`invalid_names`](Self::invalid_names), deliberately NOT an entry in `errors`: every
+	/// one of them was observed, so nothing was missed and the guard has no reason to hold the
+	/// pair's deletions. The engine blocks each path, its subtree and every path folding like it,
+	/// on both sides, and withholds the deletion of a directory above one (see
+	/// `engine::Collisions`): a refused twin's absence from `nodes` is not a deletion.
+	pub(crate) collisions: BTreeSet<String>,
 }
 
 impl LocalScan {
-	/// One line per scan error a pass reports in [`SyncReport::errors`](super::SyncReport::errors):
-	/// every error but a [`DuplicateName`](ScanError::DuplicateName), which refuses the pass with
-	/// its own line instead.
+	/// One line per scan error a pass reports in [`SyncReport::errors`](super::SyncReport::errors).
 	pub(crate) fn reported_errors(&self) -> impl Iterator<Item = String> + '_ {
-		self.errors
-			.iter()
-			.filter(|e| !matches!(e, ScanError::DuplicateName { .. }))
-			.map(|e| format!("local scan: {e}"))
+		self.errors.iter().map(|e| format!("local scan: {e}"))
 	}
 }
 
@@ -1099,6 +1098,7 @@ struct Window<'r, S> {
 	complete: bool,
 	gaps: ScanGaps,
 	invalid_names: BTreeMap<String, String>,
+	collisions: BTreeSet<String>,
 }
 
 impl<S: ScanSink> Window<'_, S> {
@@ -1148,14 +1148,13 @@ impl<S: ScanSink> Window<'_, S> {
 			// that vanishes before its hash read is not one, and a twin whose read fails is
 			// reported for both.
 			if let Some(Collision { taken, refused }) = self.sink.put(found)? {
-				self.complete = false;
-				record(
-					&mut self.errors,
-					self.root,
-					ScanError::DuplicateName {
-						rel_path: format!("{taken} / {refused}"),
-					},
+				tracing::warn!(
+					"local scan of {}: {taken:?} and {refused:?} collide once case and Unicode form \
+					 are folded; neither is synced until one is renamed",
+					self.root.display()
 				);
+				self.collisions.insert(taken);
+				self.collisions.insert(refused);
 			}
 		}
 		Ok(())
@@ -1478,6 +1477,7 @@ fn scan_local_watched<S: ScanSink>(
 			complete: true,
 			gaps: ScanGaps::default(),
 			invalid_names: BTreeMap::new(),
+			collisions: BTreeSet::new(),
 		};
 		let wait = |window: &mut Window<'_, S>| {
 			let (seq, read) = done_rx
@@ -1748,6 +1748,7 @@ fn scan_local_watched<S: ScanSink>(
 		mut complete,
 		mut gaps,
 		invalid_names,
+		collisions,
 		..
 	} = walked?;
 
@@ -1798,6 +1799,7 @@ fn scan_local_watched<S: ScanSink>(
 		ignored_default_untracked,
 		ignore_blocked,
 		stale_downloads,
+		collisions,
 	};
 	Ok((scan, rules))
 }

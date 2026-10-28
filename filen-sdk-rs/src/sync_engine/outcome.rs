@@ -213,6 +213,21 @@ pub enum UnsyncableReason {
 	/// path before nor anything the remote holds there is deleted, and nothing is written through
 	/// the link.
 	LocalAlias { target: String },
+	/// Another local item in the same directory has the same name once case and Unicode form are
+	/// folded (`Report.txt` and `report.txt`, or the NFC and NFD spellings of one name), so the two
+	/// cannot be told apart on the remote, whose names are unique case-insensitively. Every item of
+	/// the group is reported and left alone on both sides, subtree and all: nothing is pushed or
+	/// pulled at any of their paths, nothing there is deleted, and neither is a directory holding
+	/// them. Renaming one of them resolves it, and the next pass syncs both. The NFC and NFD
+	/// spellings of one name share one path, so such a pair is reported once, though both items are
+	/// left alone.
+	LocalNameCollision,
+	/// Another remote item in the same directory has the same name once case is folded (only a
+	/// non-conforming client can write such a pair, as the server's own name dedup is
+	/// case-insensitive), so the two cannot be told apart on a local disk. Handled like
+	/// [`LocalNameCollision`](Self::LocalNameCollision): every item of the group is left alone on
+	/// both sides until one of them is renamed.
+	RemoteNameCollision,
 }
 
 impl fmt::Display for UnsyncableReason {
@@ -243,6 +258,12 @@ impl fmt::Display for UnsyncableReason {
 				f,
 				"failed {attempts} time(s) in a row; last error: {last_error}"
 			),
+			Self::LocalNameCollision => f.write_str(
+				"another local item's name is the same once case and Unicode form are folded",
+			),
+			Self::RemoteNameCollision => {
+				f.write_str("another remote item's name is the same once case is folded")
+			}
 		}
 	}
 }
@@ -261,8 +282,13 @@ impl fmt::Display for UnsyncablePath {
 	}
 }
 
-/// Why the engine refused to run a pass at all. Both cases make a 1:1 path mapping between the two
-/// sides impossible, so NOTHING is applied until the caller resolves the collision by hand.
+/// Why the engine refused to run a pass at all.
+///
+/// No pass refuses any more: a name collision leaves only the colliding paths alone, each reported
+/// as [`UnsyncableReason::LocalNameCollision`] or [`UnsyncableReason::RemoteNameCollision`], and
+/// the rest of the pair syncs. The type stays part of the report, and a switch that adopts the
+/// destination ([`Backlog::AdoptDestination`](super::Backlog::AdoptDestination)) still names one
+/// of these when it will not adopt across a collision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[js_type(export, no_deser, no_default, napi)]
 pub enum RefuseReason {
@@ -361,7 +387,7 @@ impl fmt::Display for HaltReason {
 /// that touches neither side and advances no baseline.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PlanOutcome {
-	/// Every action the pass would apply, in apply order. Empty when `refused` is set.
+	/// Every action the pass would apply, in apply order.
 	pub actions: Vec<PlannedAction>,
 	/// Deletions the mass-delete guard would hold back — plus the create half of a held type flip,
 	/// which is only meaningful together with its delete. Not included in `actions`. One per item:
@@ -380,7 +406,8 @@ pub struct PlanOutcome {
 	pub unsyncable: Vec<UnsyncablePath>,
 	/// The ignored paths the pass would report, as in [`SyncReport::ignored`](super::SyncReport::ignored).
 	pub ignored: Vec<IgnoredPath>,
-	/// Set when the pass would refuse to run; everything above is then empty.
+	/// Set when the pass would refuse to run; everything above is then empty. No dry run sets it
+	/// any more (see [`RefuseReason`]).
 	pub refused: Option<RefuseReason>,
 }
 

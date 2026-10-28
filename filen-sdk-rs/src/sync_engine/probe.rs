@@ -1413,7 +1413,7 @@ fn prepare_scoped(
 	let held_rows = mem::take(&mut derived.held);
 	let mut view = RemoteView {
 		nodes: observation.nodes,
-		has_collisions: false,
+		collisions: BTreeSet::new(),
 		skipped: Vec::new(),
 		ignored: BTreeMap::new(),
 		ignored_default_untracked: 0,

@@ -283,7 +283,7 @@ fn remote_facts_are_pruned_by_the_paths_the_delta_touched() {
 	};
 	let view = RemoteView {
 		nodes: Side::default(),
-		has_collisions: false,
+		collisions: BTreeSet::new(),
 		held_paths: BTreeSet::from(["c".to_owned()]),
 		skipped: Vec::new(),
 		ignored: BTreeMap::from([("c".to_owned(), decision("c"))]),
@@ -345,7 +345,7 @@ fn a_carried_ignored_root_under_a_touched_path_lives_while_rows_sit_under_it() {
 	// recorded no root, and whatever survives here survives as a carried fact.
 	let derived_view = || RemoteView {
 		nodes: Side::default(),
-		has_collisions: false,
+		collisions: BTreeSet::new(),
 		held_paths: BTreeSet::new(),
 		skipped: Vec::new(),
 		ignored: BTreeMap::new(),

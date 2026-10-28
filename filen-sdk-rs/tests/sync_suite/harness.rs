@@ -279,6 +279,28 @@ pub async fn stage_case_colliding_dirs(
 	(upper_dir, lower_dir)
 }
 
+/// Whether `report` holds back `names` — the top-level directories [`stage_case_colliding_dirs`]
+/// made — as a remote name collision, and nothing for any other reason: the twins and the files
+/// under them, which fold together too.
+#[cfg(feature = "malformed")]
+pub fn holds_back_remote_twins(report: &SyncReport, names: [&str; 2]) -> bool {
+	let held: std::collections::BTreeSet<&str> = report
+		.unsyncable
+		.iter()
+		.filter(|path| {
+			path.reason == filen_sdk_rs::sync_engine::UnsyncableReason::RemoteNameCollision
+		})
+		.map(|path| path.rel_path.as_str())
+		.collect();
+	report.unsyncable.len() == held.len()
+		&& names.iter().all(|name| held.contains(name))
+		&& held.iter().all(|path| {
+			names
+				.iter()
+				.any(|name| path.split('/').next() == Some(name))
+		})
+}
+
 /// Two independent client+cache+engine stacks syncing the SAME remote dir, each with its own local
 /// dir — for two-way / convergence / conflict / contention tests.
 pub struct TwoClients {

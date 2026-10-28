@@ -934,6 +934,7 @@ fn every_reason_says_why() {
 		R::SafetyNet,
 		R::Requested,
 		R::PreviousRefusal,
+		R::NameCollision,
 		R::DeletionHold,
 		R::InterruptedPass,
 		R::RulesChanged,

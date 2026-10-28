@@ -82,7 +82,7 @@ use crate::io::FilenMetaExt;
 
 /// Every name one directory holds, folded by [`collision_key`]: the folded name, to the names that
 /// folded onto it. More than one name under a key is a collision — a single local path cannot hold
-/// both, and the engine refuses to reconcile a pair with one.
+/// both, and the engine holds every name of the group back.
 pub(super) type FoldedNames = BTreeMap<String, BTreeSet<String>>;
 
 /// Evidence that nothing is at a path.
@@ -167,9 +167,7 @@ pub(super) struct LocalObservations {
 	/// The paths that made the observation incomplete, and why, as [`LocalScan::gaps`] has them for
 	/// a whole-tree walk; a dirty subtree's own are moved up here from its walk.
 	pub(super) gaps: ScanGaps,
-	/// Every error, in the shape a whole-tree scan reports them. A
-	/// [`DuplicateName`](ScanError::DuplicateName) can only come from a subtree walk, inside its
-	/// own [`LocalObservation::Dir`] scan.
+	/// Every error, in the shape a whole-tree scan reports them.
 	pub(super) errors: Vec<ScanError>,
 }
 

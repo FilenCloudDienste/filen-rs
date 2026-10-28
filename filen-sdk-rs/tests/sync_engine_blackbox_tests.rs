@@ -3,7 +3,7 @@
 //! internals. Lives in the separate integration-test crate, which can only reach `pub` items.
 //!
 //! Run: `cargo test -p filen-sdk-rs --features sync-engine-live-tests --test sync_engine_blackbox_tests`
-//! (needs `.env` with TEST_EMAIL / TEST_PASSWORD). One test (`remote_case_collision_refused`)
+//! (needs `.env` with TEST_EMAIL / TEST_PASSWORD). One test (`remote_case_collision_held_back`)
 //! additionally needs the `malformed` feature to construct its precondition: run the suite with
 //! `-F sync-engine-live-tests,malformed` to include it.
 
@@ -1134,20 +1134,20 @@ async fn mass_delete_guard_holds_large_deletion() {
 }
 
 // ============================================================================
-// Case-insensitivity collision refusal
+// Case-insensitivity collision
 // ============================================================================
 
 // Two same-parent items differing ONLY in case can coexist on a real remote: the server dedups
 // case-insensitively via a client-supplied name hash, so a non-conforming client that sends a
 // MISMATCHED hash (here, `create_dir_with_name_hash`) bypasses the dedup. Pulling both onto a
 // case-insensitive local FS would clobber/lose data, so the engine must DETECT the collision and
-// refuse the whole pass (surfacing an error) rather than do partial destructive work.
+// hold both back, reporting each as unsyncable, rather than do partial destructive work.
 //
 // Requires the `malformed` feature for the mismatched-hash seam:
 //   cargo test -p filen-sdk-rs -F sync-engine-live-tests,malformed --test sync_engine_blackbox_tests
 #[cfg(feature = "malformed")]
 #[shared_test_runtime]
-async fn remote_case_collision_refused() {
+async fn remote_case_collision_held_back() {
 	let fx = Fixture::new().await;
 	let parent = fx.root_dirtype();
 
@@ -1194,23 +1194,25 @@ async fn remote_case_collision_refused() {
 		.add_pair(fx.local.clone(), fx.remote_uuid, SyncMode::RemoteToLocal)
 		.await
 		.unwrap();
-	let result = engine.sync_once(pair).await;
+	let report = engine.sync_once(pair).await.unwrap();
 
-	// Refusal can be a hard Err, or a report carrying an error and NO partial destructive work.
-	match result {
-		Err(_) => { /* hard refusal is acceptable */ }
-		Ok(report) => {
-			assert!(
-				!report.errors.is_empty() || !report.conflicts.is_empty(),
-				"engine must surface the case collision as an error/conflict: {report:?}"
-			);
-			// The engine must not materialize BOTH colliding names onto a case-insensitive FS.
-			assert!(
-				report.local_dirs_created < 2,
-				"engine must not create both colliding names locally: {report:?}"
-			);
-		}
-	}
+	let held: Vec<&str> = report
+		.unsyncable
+		.iter()
+		.filter(|path| {
+			path.reason == filen_sdk_rs::sync_engine::UnsyncableReason::RemoteNameCollision
+		})
+		.map(|path| path.rel_path.as_str())
+		.collect();
+	assert_eq!(
+		held,
+		["Note", "note"],
+		"both colliding names must be reported: {report:?}"
+	);
+	assert_eq!(
+		report.local_dirs_created, 0,
+		"neither colliding name may be created locally: {report:?}"
+	);
 
 	fx.cleanup();
 }

@@ -1943,37 +1943,26 @@ async fn delete_bin_a_pass_files_an_undated_bin_under_today() {
 	sc.cleanup();
 }
 
-/// A refused pass (a remote name collision) acts on nothing it read, and leaves the bin alone too:
-/// an un-bucketed entry stays where it is.
+/// A remote name collision holds back only the twins: the pass runs, and prunes the bin as any
+/// pass does, filing an un-bucketed entry under today's bucket.
 #[cfg(feature = "malformed")]
 #[shared_test_runtime]
-async fn delete_bin_a_refused_pass_leaves_the_bin_alone() {
+async fn delete_bin_a_pass_with_a_name_collision_still_prunes_the_bin() {
 	let sc = single_client(SyncMode::TwoWay).await;
 	stage_case_colliding_dirs(&sc, "Readme", "README").await;
 	let bin = sc.local.join(".filen-sync-trash");
-	write_file(&bin, "2019-07-14/photo.jpg", b"old photo");
 	write_file(&bin, "loose.txt", b"loose");
 
 	let report = sc.sync().await;
-	assert_eq!(
-		report.refused,
-		Some(filen_sdk_rs::sync_engine::RefuseReason::RemoteCollision),
+	assert_eq!(report.refused, None, "{report:?}");
+	assert!(
+		holds_back_remote_twins(&report, ["README", "Readme"]),
 		"{report:?}"
 	);
 
-	assert!(read_eq(&bin, "2019-07-14/photo.jpg", b"old photo"));
-	assert!(read_eq(&bin, "loose.txt", b"loose"));
-	let top: Vec<String> = std::fs::read_dir(&bin)
-		.unwrap()
-		.map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-		.collect::<std::collections::BTreeSet<_>>()
-		.into_iter()
-		.collect();
-	assert_eq!(
-		top,
-		["2019-07-14", "loose.txt"],
-		"the refused pass touched the bin"
-	);
+	let loose = binned(&sc.local, "loose.txt").expect("loose.txt was not filed under a bucket");
+	assert_eq!(std::fs::read(&loose).unwrap(), b"loose");
+	assert!(!bin.join("loose.txt").exists());
 
 	sc.cleanup();
 }

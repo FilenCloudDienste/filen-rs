@@ -881,7 +881,7 @@ fn a_hidden_path_with_a_carried_row_is_dropped_held_and_plans_nothing() {
 	// what `prepare_scoped` does a few lines after its own `merge_local`.
 	let mut view = RemoteView {
 		nodes: std::mem::take(&mut derived.remote),
-		has_collisions: false,
+		collisions: BTreeSet::new(),
 		held_paths: BTreeSet::new(),
 		skipped: Vec::new(),
 		ignored: BTreeMap::new(),

@@ -53,7 +53,7 @@ use super::{
 	remote::{RemoteObserved, cache_ancestry, delta_uuids, observe_remote},
 	rows::Baseline,
 	scan::{
-		self, LocalScan, PairRoot, RuleFiles, ScanError, ScanGaps, ScanRoot, WalkProgress,
+		self, LocalScan, PairRoot, RuleFiles, ScanGaps, ScanRoot, WalkProgress,
 		report_scan_progress,
 	},
 	seed::{self, SeedCounts, Seeding},
@@ -2340,6 +2340,46 @@ pub(super) fn assembly_bounds(
 	lowest..=lowest.saturating_add(slack)
 }
 
+/// The colliding paths a change-scoped pass holds back, from what it `observed` and the `local`
+/// side it assembled from that: what a subtree walk found colliding inside the directory it
+/// walked, as a whole walk finds it anywhere, and the names in an observed path's directory that
+/// fold together, wherever `local` holds a node for more than one of them.
+///
+/// The second is the per-directory check a whole walk makes with its `claimed` set: two names in
+/// one directory that fold together have no 1:1 local mapping, so both are held back until the
+/// user resolves it. Narrower than the walk's on purpose — only names this pass holds a node for
+/// count — so a collision between two paths it never looked at holds nothing back in a pass that
+/// is not touching them; the next whole read finds it.
+fn scoped_collisions(
+	observed: &LocalObservations,
+	local: &impl NodesAt<Node = scan::LocalNode>,
+) -> BTreeSet<String> {
+	let mut collisions: BTreeSet<String> = observed
+		.observed
+		.values()
+		.filter_map(|observation| match observation {
+			LocalObservation::Dir(scan) => Some(scan.collisions.iter().cloned()),
+			LocalObservation::File { .. }
+			| LocalObservation::Absent(_)
+			| LocalObservation::Hidden(_) => None,
+		})
+		.flatten()
+		.collect();
+	for (dir, folded) in &observed.siblings {
+		for names in folded.values().filter(|names| names.len() > 1) {
+			let present: Vec<String> = names
+				.iter()
+				.map(|name| plan::join_path(dir, name))
+				.filter(|path| local.holds(path))
+				.collect();
+			if present.len() > 1 {
+				collisions.extend(present);
+			}
+		}
+	}
+	collisions
+}
+
 /// The paths in `set` strictly under `dir`, as [`Baseline::count_subtree`] reads "under": `""`
 /// holds every path but itself.
 fn strictly_under<'s>(set: &'s BTreeSet<String>, dir: &str) -> impl Iterator<Item = &'s String> {
@@ -2529,16 +2569,15 @@ impl Prepared {
 	///
 	/// The candidates are what this pass decides: on a whole read the remote view's hashless files,
 	/// read off the stage's index of them; on a change-scoped one the paths its read decided. A path
-	/// the pass would not act on — held, blocked, hidden or failing — is left for a pass that does,
-	/// and a pass that will be refused weighs nothing at all.
+	/// the pass would not act on — held, blocked, hidden, failing or colliding — is left for a pass
+	/// that does.
 	fn weigh_unhashed(&self, store: &impl seed::SeedStore) -> Result<SeedCounts, Error> {
-		if refusal(self).is_some() {
-			return Ok(SeedCounts::default());
-		}
 		let blocked = self.blocked_paths();
+		let collisions = self.collisions();
 		let skip = |path: &str| {
 			self.hides(path)
 				|| plan::at_or_under_root(&blocked, path)
+				|| collisions.covers(path)
 				|| plan::is_under_held_path(path, &self.holds.held_remote)
 		};
 		let local = self.local_scan.nodes.of(&self.baseline);
@@ -2600,10 +2639,7 @@ impl Prepared {
 			self.failures.remove(from);
 			rekey_paths(&mut self.failures, from, to);
 			for blocked in [&mut self.facts.ignore_blocked, &mut self.remote_blocked] {
-				*blocked = mem::take(blocked)
-					.into_iter()
-					.map(|path| plan::moved_path(&path, from, to).unwrap_or(path))
-					.collect();
+				rekey_set(blocked, from, to);
 			}
 			if matches!(action, SyncAction::MoveRemote { .. }) {
 				// Keyed like the remote view, which only a remote move re-keys.
@@ -2613,9 +2649,11 @@ impl Prepared {
 					}
 				}
 				rekey_ignored(&mut self.facts.ignored_remote, from, to);
+				rekey_set(&mut self.remote_view.collisions, from, to);
 			} else {
 				// Keyed like the local scan, which only a local move re-keys.
 				rekey_ignored(&mut self.facts.ignored_local, from, to);
+				rekey_set(&mut self.local_scan.collisions, from, to);
 				rekey_paths(&mut self.facts.invalid_names, from, to);
 				rekey_paths(&mut self.facts.aliased_dirs, from, to);
 				for target in self.facts.aliased_dirs.values_mut() {
@@ -2721,6 +2759,24 @@ impl Prepared {
 						},
 					}),
 			)
+			.chain(
+				self.local_scan
+					.collisions
+					.iter()
+					.map(|rel_path| UnsyncablePath {
+						rel_path: rel_path.clone(),
+						reason: UnsyncableReason::LocalNameCollision,
+					}),
+			)
+			.chain(
+				self.remote_view
+					.collisions
+					.iter()
+					.map(|rel_path| UnsyncablePath {
+						rel_path: rel_path.clone(),
+						reason: UnsyncableReason::RemoteNameCollision,
+					}),
+			)
 			.collect();
 		// One stable order, so a caller diffing consecutive reports sees only real changes.
 		all.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
@@ -2728,14 +2784,17 @@ impl Prepared {
 	}
 
 	/// Every path this pass must not plan an action for: a name the remote would reject, a local
-	/// symlink to a directory inside the root, a path whose failure streak ran out, and a synced path
-	/// whose remote item is out of the view, all reported by [`unsyncable`](Self::unsyncable); and an
-	/// ignored path, or one whose ignore rules could not be read.
+	/// symlink to a directory inside the root, a path whose failure streak ran out, a synced path
+	/// whose remote item is out of the view, and a path of a name collision on either side, all
+	/// reported by [`unsyncable`](Self::unsyncable); and an ignored path, or one whose ignore rules
+	/// could not be read. What else a collision holds back is [`collisions`](Self::collisions)'s.
 	fn blocked_paths(&self) -> BTreeSet<String> {
 		self.failures
 			.keys()
 			.chain(self.facts.invalid_names.keys())
 			.chain(self.facts.aliased_dirs.keys())
+			.chain(&self.local_scan.collisions)
+			.chain(&self.remote_view.collisions)
 			.chain(self.facts.unknown_remote.keys())
 			.chain(self.facts.ignored_local.keys())
 			.chain(self.facts.ignored_remote.keys())
@@ -2743,6 +2802,16 @@ impl Prepared {
 			.chain(&self.remote_blocked)
 			.cloned()
 			.collect()
+	}
+
+	/// The name collisions this pass found on either side, folded (see [`Collisions`]).
+	fn collisions(&self) -> Collisions {
+		Collisions::new(
+			self.local_scan
+				.collisions
+				.iter()
+				.chain(&self.remote_view.collisions),
+		)
 	}
 
 	/// Every directory whose ignore rules this pass could not use, from either side (see
@@ -2878,6 +2947,14 @@ fn rekey_ignored(map: &mut BTreeMap<String, IgnoreDecision>, from: &str, to: &st
 /// out of it, or a root `.filenignore` of `*` would read as a vanished remote on every pass.
 fn remote_emptied(nodes: &impl Nodes<Node = RemoteNode>, baseline: &Baseline) -> bool {
 	nodes.is_empty() && baseline.has_remote_rows()
+}
+
+/// Re-key every path at or under `from` in `set` to the same place under `to`.
+fn rekey_set(set: &mut BTreeSet<String>, from: &str, to: &str) {
+	*set = mem::take(set)
+		.into_iter()
+		.map(|path| plan::moved_path(&path, from, to).unwrap_or(path))
+		.collect();
 }
 
 /// Re-key every path at or under `from` in `map` to the same place under `to`.
@@ -3742,7 +3819,9 @@ impl SyncEngine {
 					// backlog the caller wanted kept, or it adopts a whole pair from whichever side
 					// still lists something and drops the other side's anchors. Refuse instead — the
 					// mode is left as it was, and the caller can retry once the view is healthy.
-					if let Some(reason) = adoption_refusal(refusal(&prep), &screen_state(&prep)) {
+					if let Some(reason) =
+						adoption_refusal(collision_refusal(&prep), &screen_state(&prep))
+					{
 						return Err(Error::custom(
 							ErrorKind::InvalidState,
 							format!("cannot adopt the destination: {reason}"),
@@ -4614,7 +4693,7 @@ impl SyncEngine {
 			// A derived view places what the rows and the delta describe and nothing else: an item
 			// it cannot place asks for a whole read rather than being skipped, and two items at one
 			// path cannot arise from rows that are keyed by path.
-			has_collisions: false,
+			collisions: BTreeSet::new(),
 			skipped: Vec::new(),
 			ignored: BTreeMap::new(),
 			ignored_default_untracked: 0,
@@ -4888,32 +4967,13 @@ impl SyncEngine {
 		holds.held_remote = view.held_paths.clone();
 		self.observed.prune_before(self.pending.oldest_stamp());
 
+		let collisions = scoped_collisions(&observations, &derived.local.of(&inputs.baseline));
 		let LocalObservations {
-			siblings,
-			mut errors,
+			errors,
 			complete,
 			gaps: observed_gaps,
 			..
 		} = observations;
-		// The per-directory collision check a whole walk makes with its `claimed` set: two names in
-		// one directory that fold together have no 1:1 local mapping, and the pair is refused until
-		// the user resolves it. Narrower than the walk's on purpose — only names this pass holds a
-		// node for count — so a collision between two paths it never looked at cannot refuse a pass
-		// that is not touching them.
-		for (dir, folded) in &siblings {
-			for names in folded.values().filter(|names| names.len() > 1) {
-				let present: Vec<String> = names
-					.iter()
-					.map(|name| plan::join_path(dir, name))
-					.filter(|path| derived.local.of(&inputs.baseline).holds(path))
-					.collect();
-				if let Some(rel_path) = present.get(1) {
-					errors.push(ScanError::DuplicateName {
-						rel_path: rel_path.clone(),
-					});
-				}
-			}
-		}
 
 		// Plan 3.4's composition: the last whole read's walk was complete, every dirty stat and
 		// walk of this one succeeded, and nothing has since made the next pass a whole-tree one —
@@ -4935,6 +4995,7 @@ impl SyncEngine {
 			complete: carried.scan_complete && complete && narrowed_read_is_whole,
 			gaps,
 			errors,
+			collisions,
 			// A change-scoped pass reads these off `facts`, which is where the carried ones live.
 			// The scan struct is only the shape the rest of the pass expects its nodes in.
 			invalid_names: BTreeMap::new(),
@@ -5335,12 +5396,6 @@ impl SyncEngine {
 		let prep = self
 			.prepare(pair, None, Seeding::Preview, &Arc::default())
 			.await?;
-		if let Some(reason) = refusal(&prep) {
-			return Ok(PlanOutcome {
-				refused: Some(reason),
-				..PlanOutcome::default()
-			});
-		}
 		let state = screen_state(&prep);
 		let at = self.stage_at(pair);
 		// On a blocking thread, as a pass screens its plan: the reconcile, the screening and the
@@ -6756,31 +6811,13 @@ impl SyncEngine {
 
 		report.unsyncable = prep.unsyncable();
 		report.ignored = prep.ignored();
-		// Before the refusal check, so a refused pass still says what the scan could not read.
 		report.errors.extend(prep.local_scan.reported_errors());
 		// Capped at the source, so this copies a hundred paths at most.
 		(report.scan_gaps, report.scan_gaps_total) = prep.local_scan.gaps.clone().into_parts();
 		report.errors.append(&mut prep.remote_rule_errors);
 
-		if let Some(refusal) = refusal(&prep) {
-			tracing::debug!("sync_once[pair {pair}]: refused — {refusal:?}");
-			let reason = refusal.to_string();
-			report.refused = Some(refusal);
-			observer(SyncEvent::Refused {
-				reason: reason.clone(),
-			});
-			report
-				.errors
-				.push(format!("refused: {reason}; resolve it and retry"));
-			observer(SyncEvent::PassCompleted {
-				report: report.clone(),
-			});
-			return Ok(report);
-		}
-
-		// After the refusal: a pass that will not act on what it read (a name collision on either
-		// side) leaves the bin alone as well. A root that is missing or unmounted has no bin under
-		// it, and the prune creates none (see `bin::prune_bin`).
+		// A root that is missing or unmounted has no bin under it, and the prune creates none (see
+		// `bin::prune_bin`).
 		self.prune_bin_daily(
 			pair,
 			Path::new(&prep.record.local_root),
@@ -7077,6 +7114,18 @@ fn next_pass_scope(report: &SyncReport) -> Option<FullPassReason> {
 	if report.refused.is_some() {
 		return Some(FullPassReason::PreviousRefusal);
 	}
+	// A change-scoped pass folds only the names it decides against the rest, which is sound only
+	// while no two carried names fold together (see `RemoteView::resolve_collisions_changed`):
+	// every pass reads whole until the collision is gone, and the one that finds it gone narrows
+	// again from the next.
+	if report.unsyncable.iter().any(|path| {
+		matches!(
+			path.reason,
+			UnsyncableReason::LocalNameCollision | UnsyncableReason::RemoteNameCollision
+		)
+	}) {
+		return Some(FullPassReason::NameCollision);
+	}
 	// Either shape of a cut-short pass, and they part company here.
 	//
 	// A cancel that landed before there was a plan (`paused`) took both changelists and has
@@ -7120,17 +7169,17 @@ fn next_pass_scope(report: &SyncReport) -> Option<FullPassReason> {
 	None
 }
 
-/// A name collision (local or remote) makes a 1:1 mapping impossible — refuse the pass.
-fn refusal(prep: &Prepared) -> Option<RefuseReason> {
-	if prep
-		.local_scan
-		.errors
-		.iter()
-		.any(|e| matches!(e, ScanError::DuplicateName { .. }))
-	{
+/// The name collision, local or remote, that leaves `prep` with no 1:1 path mapping, if any.
+///
+/// A pass holds back only the colliding paths (see [`Collisions`]); this is for the one reader
+/// that cannot: an adoption of the destination rewrites the rows of every path the source no
+/// longer has in one judgement over the whole pair, and a twin the scan or the view left out of
+/// its side reads there as gone.
+fn collision_refusal(prep: &Prepared) -> Option<RefuseReason> {
+	if !prep.local_scan.collisions.is_empty() {
 		return Some(RefuseReason::LocalCollision);
 	}
-	if prep.remote_view.has_collisions {
+	if prep.remote_view.has_collisions() {
 		return Some(RefuseReason::RemoteCollision);
 	}
 	None
@@ -7313,7 +7362,8 @@ fn screen_plan(
 	// that planned them — a local observation, an announced remote change — was consumed here.
 	let mut dropped = 0;
 	let (blocked, ignored) = (prep.blocked_paths(), prep.ignored_roots());
-	if let Some(mut blocking) = Blocking::new(&blocked, &ignored) {
+	let collisions = prep.collisions();
+	if let Some(mut blocking) = Blocking::new(&blocked, &ignored, &collisions) {
 		screen.each(Rows::Moves, |action| blocking.note(&action))?;
 		dropped += screen.retain(Rows::All, |action| blocking.keeps(action))?;
 	}
@@ -7323,6 +7373,7 @@ fn screen_plan(
 		&prep.holds.held_remote,
 		[&prep.facts.ignored_local, &prep.facts.ignored_remote],
 		&blocked_rules,
+		&collisions,
 	);
 	if withholding.may_withhold() {
 		screen.each(Rows::Deletes, |action| withholding.note(&action))?;
@@ -7420,20 +7471,32 @@ fn released_paths(screened: &Screened) -> rusqlite::Result<BTreeSet<String>> {
 /// copy there is no longer synced, so it must not be moved away. Nothing is stranded by that, since
 /// the deletions at the source are blocked already, and whether a directory above it may still be
 /// deleted is for [`Withholding`] to decide.
+///
+/// A name collision (`collisions`) blocks more than its own paths: everything a pass would act on
+/// at a path folding like one of them, which an upload or a create would land on since the
+/// server's name dedup is case-insensitive. A move whose source folds like one goes too, as an
+/// ignored one does: a twin the scan or the view left out of its side is still there, so its
+/// absence is not a move away.
 struct Blocking<'s> {
 	blocked: &'s BTreeSet<String>,
 	ignored: &'s BTreeSet<String>,
+	collisions: &'s Collisions,
 	/// The sources of the moves this drops: their content is staying exactly where it is.
 	stranded: Vec<String>,
 }
 
 impl<'s> Blocking<'s> {
-	/// What drops actions for `blocked` and `ignored`; `None` when both are empty, and nothing is
-	/// dropped.
-	fn new(blocked: &'s BTreeSet<String>, ignored: &'s BTreeSet<String>) -> Option<Self> {
-		(!blocked.is_empty() || !ignored.is_empty()).then(|| Self {
+	/// What drops actions for `blocked`, `ignored` and `collisions`; `None` when all three are
+	/// empty, and nothing is dropped.
+	fn new(
+		blocked: &'s BTreeSet<String>,
+		ignored: &'s BTreeSet<String>,
+		collisions: &'s Collisions,
+	) -> Option<Self> {
+		(!blocked.is_empty() || !ignored.is_empty() || !collisions.is_empty()).then(|| Self {
 			blocked,
 			ignored,
+			collisions,
 			stranded: Vec::new(),
 		})
 	}
@@ -7445,20 +7508,25 @@ impl<'s> Blocking<'s> {
 		roots.contains("") || plan::at_or_under_root(roots, path)
 	}
 
-	/// Whether `action` is a move whose source is ignored.
+	/// Whether `action` is a move whose source is ignored, or folds like a name collision.
 	fn moves_ignored(&self, action: &SyncAction) -> bool {
 		matches!(
 			action,
 			SyncAction::MoveRemote { from_path, .. } | SyncAction::MoveLocal { from_path, .. }
-				if Self::at_or_under(self.ignored, from_path)
+				if Self::at_or_under(self.ignored, from_path) || self.collisions.covers(from_path)
 		)
+	}
+
+	/// Whether no action may be planned at `path`.
+	fn blocks(&self, path: &str) -> bool {
+		Self::at_or_under(self.blocked, path) || self.collisions.covers(path)
 	}
 
 	/// Note the source `action` strands, when it is a move this drops for the path it moves to.
 	fn note(&mut self, action: &SyncAction) {
 		if let SyncAction::MoveRemote { from_path, .. } | SyncAction::MoveLocal { from_path, .. } =
 			action && !self.moves_ignored(action)
-			&& Self::at_or_under(self.blocked, action.rel_path())
+			&& self.blocks(action.rel_path())
 		{
 			self.stranded.push(from_path.clone());
 		}
@@ -7468,16 +7536,16 @@ impl<'s> Blocking<'s> {
 	fn keeps(&self, action: &SyncAction) -> bool {
 		if self.moves_ignored(action) {
 			tracing::debug!(
-				"reconcile: skipping {} — it moves an ignored item",
+				"reconcile: skipping {} — it moves an ignored or colliding item",
 				action.describe()
 			);
 			return false;
 		}
 		let path = action.rel_path();
-		if Self::at_or_under(self.blocked, path) {
+		if self.blocks(path) {
 			tracing::debug!(
 				"reconcile: skipping {} — its path is blocked (a name the remote rejects, \
-				 {MAX_PATH_FAILURES} consecutive failures, or an ignore rule)",
+				 {MAX_PATH_FAILURES} consecutive failures, an ignore rule, or a name collision)",
 				action.describe()
 			);
 			return false;
@@ -7520,6 +7588,8 @@ impl<'s> Blocking<'s> {
 ///   each Mac for its `.DS_Store`. Counted as deferred (`over_ignored`).
 /// - Over a subtree whose ignore rules could not be read (`ignore_blocked`), on either side, the
 ///   same: what those rules hide cannot be told apart from what they do not.
+/// - Above a path of a name collision (`collisions`), on either side, both deletions wait: a twin
+///   the scan or the view left out of its side is still there, and the directory is not empty.
 ///
 /// A deletion around a path blocked for any other reason (a rejected name, an alias, a park) runs as
 /// it did, into the recoverable quarantine or trash.
@@ -7531,6 +7601,7 @@ struct Withholding<'s> {
 	held: &'s BTreeSet<String>,
 	ignored: [&'s BTreeMap<String, IgnoreDecision>; 2],
 	ignore_blocked: &'s BTreeSet<String>,
+	collisions: &'s Collisions,
 	/// The paths whose deletions and creates wait: the directories withheld, and the `.filenignore`
 	/// files whose rules keep one — deleted, they would leave the next pass no rule there, and the
 	/// ignored content would go down with the directory after all.
@@ -7545,24 +7616,27 @@ impl<'s> Withholding<'s> {
 		held: &'s BTreeSet<String>,
 		ignored: [&'s BTreeMap<String, IgnoreDecision>; 2],
 		ignore_blocked: &'s BTreeSet<String>,
+		collisions: &'s Collisions,
 	) -> Self {
 		Self {
 			unknown,
 			held,
 			ignored,
 			ignore_blocked,
+			collisions,
 			withheld: BTreeSet::new(),
 			over_ignored: 0,
 		}
 	}
 
-	/// Whether any deletion can wait: none does with nothing held, unknown, ignored or under rules
-	/// that could not be read.
+	/// Whether any deletion can wait: none does with nothing held, unknown, ignored, under rules
+	/// that could not be read, or colliding.
 	fn may_withhold(&self) -> bool {
 		!self.held.is_empty()
 			|| !self.unknown.is_empty()
 			|| self.ignored.iter().any(|ignored| !ignored.is_empty())
 			|| !self.ignore_blocked.is_empty()
+			|| !self.collisions.is_empty()
 	}
 
 	/// Whether a deletion noted so far waits.
@@ -7585,7 +7659,8 @@ impl<'s> Withholding<'s> {
 	/// Note `action`, when it is a deletion that waits.
 	fn note(&mut self, action: &SyncAction) {
 		let dir = action.rel_path();
-		let above_held = self.held.range(plan::subtree_bounds(dir)).next().is_some();
+		let above_held = self.held.range(plan::subtree_bounds(dir)).next().is_some()
+			|| self.collisions.under(dir);
 		let [ignored_local, ignored_remote] = self.ignored;
 		let (unreachable, ignored, side) = match action {
 			SyncAction::DeleteLocal { .. } => (
@@ -7630,6 +7705,48 @@ impl<'s> Withholding<'s> {
 			);
 		}
 		!waits
+	}
+}
+
+/// The name collisions a pass found, on either side ([`LocalScan::collisions`],
+/// [`RemoteView::collisions`]), by their folded paths ([`scan::collision_key`]): what the pass holds
+/// back beyond the colliding paths themselves (see [`Blocking`] and [`Withholding`]).
+///
+/// Folded, because the server's name dedup is case-insensitive: an upload of any spelling of a
+/// colliding name, or of a directory above one, lands on the twins themselves. Every question costs
+/// a fold of the asked path, and none is asked when the pass found no collision.
+#[derive(Debug, Default)]
+struct Collisions {
+	folded: BTreeSet<String>,
+}
+
+impl Collisions {
+	fn new<'p>(paths: impl IntoIterator<Item = &'p String>) -> Self {
+		Self {
+			folded: paths
+				.into_iter()
+				.map(|path| scan::collision_key(path))
+				.collect(),
+		}
+	}
+
+	fn is_empty(&self) -> bool {
+		self.folded.is_empty()
+	}
+
+	/// Whether `path` folds like a colliding path or like one under it.
+	fn covers(&self, path: &str) -> bool {
+		!self.is_empty() && plan::at_or_under_root(&self.folded, &scan::collision_key(path))
+	}
+
+	/// Whether a colliding path folds like one strictly under `dir`.
+	fn under(&self, dir: &str) -> bool {
+		!self.is_empty()
+			&& self
+				.folded
+				.range(plan::subtree_bounds(&scan::collision_key(dir)))
+				.next()
+				.is_some()
 	}
 }
 

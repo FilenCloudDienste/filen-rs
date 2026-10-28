@@ -331,10 +331,12 @@ pub(super) fn is_reserved_path(rel_path: &str, root: PairRoot) -> bool {
 #[derive(Debug)]
 pub(crate) struct RemoteView {
 	pub(crate) nodes: Side<RemoteNode>,
-	/// `true` if two distinct remote items resolved to the same case-insensitive path but NOT the
-	/// same byte-identical one. The engine refuses to reconcile such a pair (a 1:1 local mapping is
-	/// impossible) until the user cleans it up.
-	pub(crate) has_collisions: bool,
+	/// Every path of each group of distinct remote items that resolved to the same
+	/// case-insensitive path but NOT the same byte-identical one. All but the first of a group
+	/// leave `nodes`; the engine leaves every path here alone on both sides (see
+	/// `engine::Collisions`), so a twin's absence from `nodes` is not a deletion, until the user
+	/// renames one of them. A [held](Self::held_paths) path a twin folds onto is one of them.
+	pub(crate) collisions: BTreeSet<String>,
 	/// Paths two byte-identically named remote items resolved to. The server never allows that —
 	/// its dedup is on the lowercased name hash — so it can only be a cache mid-transition: a
 	/// re-upload whose successor has been applied while the predecessor's trash has not. Only that
@@ -644,7 +646,7 @@ impl ViewBuilder {
 		}
 		RemoteView {
 			nodes: self.nodes.into(),
-			has_collisions: false,
+			collisions: BTreeSet::new(),
 			held_paths: self.held_paths,
 			skipped: self.skipped.finish(),
 			ignored: BTreeMap::new(),
@@ -694,7 +696,7 @@ impl RemoteView {
 	/// two steps that turn a placed view ([`place_remote_items`]) into the set a pass reconciles,
 	/// folds and applies against.
 	///
-	/// The rules come off first, so ignored case-twins never refuse a pass. With no filter nothing
+	/// The rules come off first, so ignored case-twins are never collisions. With no filter nothing
 	/// is hidden and the view stays the remote as it is, collisions resolved.
 	///
 	/// The two halves are `pub(super)` so the probe can time them apart — they are the largest
@@ -888,25 +890,33 @@ impl RemoteView {
 			UnsyncableReason::InvalidName { .. }
 			| UnsyncableReason::RepeatedFailure { .. }
 			| UnsyncableReason::RemoteBrokenParent
-			| UnsyncableReason::LocalAlias { .. } => true,
+			| UnsyncableReason::LocalAlias { .. }
+			| UnsyncableReason::LocalNameCollision
+			| UnsyncableReason::RemoteNameCollision => true,
 		});
 		kept
 	}
 
+	/// Whether two remote items fold together anywhere in the view.
+	pub(crate) fn has_collisions(&self) -> bool {
+		!self.collisions.is_empty()
+	}
+
 	/// The collision half of [`filter`](Self::filter): two remote items whose paths fold together
-	/// case-insensitively have no 1:1 local mapping, so the loser leaves the view and the pass is
-	/// refused ([`has_collisions`](Self::has_collisions)).
+	/// case-insensitively have no 1:1 local mapping, so every one of them is recorded in
+	/// [`collisions`](Self::collisions) and all but the first leave the view.
 	pub(super) fn resolve_collisions(&mut self, baseline: &Baseline) {
 		// A staged view groups its folded index instead: the first of each group in path order
-		// stays, where this keeps whichever the map's order met first. The pass is refused either
-		// way, and neither keeps a node per item to find the groups.
+		// stays, where this keeps whichever the map's order met first. Every path of a group is
+		// recorded either way, and neither keeps a node per item to find the groups.
 		if let Side::Staged(staged) = &mut self.nodes {
-			self.has_collisions |= staged.drop_fold_twins(&self.held_paths);
+			self.collisions
+				.extend(staged.drop_fold_twins(&self.held_paths));
 			return;
 		}
 		// A digest of every collision key taken so far. The keys themselves are not kept: a hit is
 		// rare and is resolved against the paths already placed, which is what tells a real
-		// case-twin from two keys that merely share a digest — a pass is never refused over that.
+		// case-twin from two keys that merely share a digest — no path is held back over that.
 		let mut claimed: HashSet<u128> =
 			HashSet::with_capacity(self.nodes.of(baseline).len() + self.held_paths.len());
 		// A held path took its key when the view held it, so a case-variant of one still collides.
@@ -923,21 +933,29 @@ impl RemoteView {
 		}
 		for rel_path in clashes {
 			let key = collision_key(&rel_path);
-			// Which item already folded that way — asked on the error path only. A held path
+			// Which items already folded that way — asked on the error path only. A held path
 			// counts: both halves of such a name were taken back out of `nodes`.
 			let folds_like = |taken: &str| taken != rel_path && collision_key(taken) == key;
-			let folds_onto = self
+			let mut onto: Vec<String> = self
 				.nodes
 				.of(baseline)
 				.paths()
-				.any(|taken| folds_like(&taken))
-				|| self.held_paths.iter().any(|taken| folds_like(taken));
-			if folds_onto {
+				.filter(|taken| folds_like(taken))
+				.map(Cow::into_owned)
+				.collect();
+			onto.extend(
+				self.held_paths
+					.iter()
+					.filter(|taken| folds_like(taken))
+					.cloned(),
+			);
+			if !onto.is_empty() {
 				tracing::debug!(
-					"remote view: {rel_path:?} folds onto another remote item's name, so no 1:1 local mapping exists"
+					"remote view: {rel_path:?} folds onto {onto:?}, so no 1:1 local mapping exists"
 				);
-				self.has_collisions = true;
+				self.collisions.extend(onto);
 				self.nodes.remove(baseline, &rel_path);
+				self.collisions.insert(rel_path);
 			}
 		}
 	}
@@ -946,11 +964,12 @@ impl RemoteView {
 	/// which folds only the keys that pass decided.
 	///
 	/// The pass's CARRIED keys are not folded against each other, and that is not a gap. A pass
-	/// that finds a collision REFUSES, and a refusal forces the next pass to read both sides whole
-	/// (`next_pass_scope`'s `FullPassReason::PreviousRefusal`). So every pass since the last whole
-	/// read folded exactly the keys it could itself have introduced — its decided set, which is
-	/// what this does — and by induction no two carried keys fold together undetected. The whole
-	/// read that starts the chain folded every one of them.
+	/// that finds a collision forces the next pass to read both sides whole (`next_pass_scope`'s
+	/// `FullPassReason::NameCollision`), and so does every pass after it for as long as the
+	/// collision stands. So every pass since the last whole read folded exactly the keys it could
+	/// itself have introduced — its decided set, which is what this does — and by induction no two
+	/// carried keys fold together undetected. The whole read that starts the chain folded every
+	/// one of them.
 	///
 	/// Each decided key is folded against three things, which together are every other key the view
 	/// can hold: the other decided keys, the held paths (a held path took its key when the view
@@ -959,8 +978,8 @@ impl RemoteView {
 	/// ([`Baseline::folded_row_paths`]).
 	///
 	/// A row the baseline names is only a collision where the view still HOLDS it: the delta may
-	/// have detached that node, and refusing a pass over a row nothing is reconciling against
-	/// would stall the pair for as long as the row lasted. Real keys are compared rather than
+	/// have detached that node, and holding a path back over a row nothing is reconciling against
+	/// would stall it for as long as the row lasted. Real keys are compared rather than
 	/// digests of them, which the whole form uses to keep one `u128` per node instead of a second
 	/// copy of every path — the decided set is a handful of paths, so there is nothing to save.
 	///
@@ -999,14 +1018,15 @@ impl RemoteView {
 				tracing::debug!(
 					"remote view: {rel_path:?} folds onto {onto:?}, so no 1:1 local mapping exists"
 				);
+				self.collisions.insert(onto);
 				clashes.push(rel_path.clone());
 			} else {
 				claimed.insert(key, rel_path.clone());
 			}
 		}
 		for rel_path in clashes {
-			self.has_collisions = true;
 			self.nodes.remove(baseline, &rel_path);
+			self.collisions.insert(rel_path);
 		}
 	}
 }

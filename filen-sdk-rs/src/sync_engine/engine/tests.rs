@@ -26,6 +26,7 @@ use crate::{
 		changes::tests::{cacheable_dir, cacheable_file},
 		derive::Derived,
 		ignore::{FILENIGNORE, IgnoreRules},
+		observe::FoldedNames,
 		plan::{
 			RemoteNode,
 			test_support::{first_dir_deletion, folded},
@@ -62,13 +63,20 @@ fn reconcile_and_screen_resident(prep: &Prepared, state: guard::ScreenState) -> 
 	let mut actions = prep.dir_moves.clone();
 	actions.extend(plan.actions);
 	let planned = actions.len();
-	let actions = drop_blocked(actions, &prep.blocked_paths(), &prep.ignored_roots());
+	let collisions = prep.collisions();
+	let actions = drop_blocked(
+		actions,
+		&prep.blocked_paths(),
+		&prep.ignored_roots(),
+		&collisions,
+	);
 	let (actions, over_ignored) = withhold_deletions_over_unreachable(
 		actions,
 		&prep.facts.unknown_remote,
 		&prep.holds.held_remote,
 		[&prep.facts.ignored_local, &prep.facts.ignored_remote],
 		&prep.blocked_rules(),
+		&collisions,
 	);
 	let dropped = planned - actions.len();
 	let deferred_paths = plan.deferred_paths + over_ignored;
@@ -128,8 +136,9 @@ fn drop_blocked(
 	actions: Vec<SyncAction>,
 	blocked: &BTreeSet<String>,
 	ignored: &BTreeSet<String>,
+	collisions: &Collisions,
 ) -> Vec<SyncAction> {
-	let Some(mut blocking) = Blocking::new(blocked, ignored) else {
+	let Some(mut blocking) = Blocking::new(blocked, ignored, collisions) else {
 		return actions;
 	};
 	for action in &actions {
@@ -148,8 +157,9 @@ fn withhold_deletions_over_unreachable(
 	held: &BTreeSet<String>,
 	ignored: [&BTreeMap<String, IgnoreDecision>; 2],
 	ignore_blocked: &BTreeSet<String>,
+	collisions: &Collisions,
 ) -> (Vec<SyncAction>, usize) {
-	let mut withholding = Withholding::new(unknown, held, ignored, ignore_blocked);
+	let mut withholding = Withholding::new(unknown, held, ignored, ignore_blocked, collisions);
 	for action in &actions {
 		withholding.note(action);
 	}
@@ -265,6 +275,33 @@ fn a_passs_outcome_decides_whether_the_next_one_reads_everything() {
 			..SyncReport::default()
 		}),
 		Some(FullPassReason::PreviousRefusal)
+	);
+	for reason in [
+		UnsyncableReason::LocalNameCollision,
+		UnsyncableReason::RemoteNameCollision,
+	] {
+		assert_eq!(
+			next_pass_scope(&SyncReport {
+				unsyncable: vec![UnsyncablePath {
+					rel_path: "a.txt".to_string(),
+					reason: reason.clone(),
+				}],
+				..SyncReport::default()
+			}),
+			Some(FullPassReason::NameCollision),
+			"{reason:?}: a carried name may fold onto a collision only a whole read finds"
+		);
+	}
+	assert_eq!(
+		next_pass_scope(&SyncReport {
+			unsyncable: vec![UnsyncablePath {
+				rel_path: "a.txt".to_string(),
+				reason: UnsyncableReason::RemoteUndecodable,
+			}],
+			..SyncReport::default()
+		}),
+		None,
+		"any other unsyncable path leaves the next pass to its changelists"
 	);
 	assert_eq!(
 		next_pass_scope(&SyncReport {
@@ -438,15 +475,25 @@ fn a_blocked_path_takes_its_subtree_but_not_its_lookalikes_out_of_the_plan() {
 		upload("badge/y.txt"),
 	];
 	let blocked = BTreeSet::from(["bad".to_string()]);
-	let kept: Vec<String> = drop_blocked(actions.clone(), &blocked, &BTreeSet::new())
-		.iter()
-		.map(|a| a.rel_path().to_string())
-		.collect();
+	let kept: Vec<String> = drop_blocked(
+		actions.clone(),
+		&blocked,
+		&BTreeSet::new(),
+		&Collisions::default(),
+	)
+	.iter()
+	.map(|a| a.rel_path().to_string())
+	.collect();
 	assert_eq!(kept, vec!["ok.txt", "badly.txt", "badge/y.txt"]);
 
 	// Nothing blocked -> the plan is untouched.
 	assert_eq!(
-		drop_blocked(actions.clone(), &BTreeSet::new(), &BTreeSet::new()),
+		drop_blocked(
+			actions.clone(),
+			&BTreeSet::new(),
+			&BTreeSet::new(),
+			&Collisions::default(),
+		),
 		actions
 	);
 }
@@ -532,7 +579,8 @@ fn a_synced_path_whose_remote_item_left_the_view_is_blocked_not_deleted() {
 		drop_blocked(
 			reconciled.actions,
 			&unknown.keys().cloned().collect(),
-			&BTreeSet::new()
+			&BTreeSet::new(),
+			&Collisions::default(),
 		)
 		.is_empty(),
 		"the unknown path plans nothing"
@@ -1059,6 +1107,7 @@ fn prepared(
 			ignored_default_untracked: 0,
 			ignore_blocked: BTreeSet::new(),
 			stale_downloads: Vec::new(),
+			collisions: BTreeSet::new(),
 		},
 		holds: plan::PassHolds {
 			trashed: HashSet::new(),
@@ -1126,6 +1175,7 @@ fn the_assembly_check_catches_a_path_no_observation_dropped() {
 		ignored_default_untracked: 0,
 		ignore_blocked: BTreeSet::new(),
 		stale_downloads: Vec::new(),
+		collisions: BTreeSet::new(),
 	};
 	let observed = LocalObservations {
 		observed: BTreeMap::from([("docs".to_string(), LocalObservation::Dir(Box::new(scan)))]),
@@ -1350,6 +1400,7 @@ fn the_assembly_check_subtracts_nested_pruned_roots_and_held_rows_once() {
 		ignored_default_untracked: 0,
 		ignore_blocked: BTreeSet::new(),
 		stale_downloads: Vec::new(),
+		collisions: BTreeSet::new(),
 	};
 	let observed = LocalObservations {
 		observed: BTreeMap::from([("docs".to_string(), LocalObservation::Dir(Box::new(scan)))]),
@@ -1543,7 +1594,7 @@ fn view(nodes: Vec<RemoteNode>, skipped: Vec<plan::SkippedRemote>, held: &[&str]
 			.into_iter()
 			.map(|node| (node.rel_path.clone(), node))
 			.collect(),
-		has_collisions: false,
+		collisions: BTreeSet::new(),
 		held_paths: held.iter().map(|path| path.to_string()).collect(),
 		skipped,
 		ignored: BTreeMap::new(),
@@ -2707,6 +2758,7 @@ fn a_withheld_directory_keeps_the_rule_files_that_keep_it() {
 			&BTreeSet::new(),
 			sides,
 			&BTreeSet::new(),
+			&Collisions::default(),
 		);
 		let kept: Vec<&str> = kept.iter().map(SyncAction::rel_path).collect();
 		assert_eq!(kept, vec!["proj/a.txt", ".filenignore"], "local: {local}");
@@ -3066,7 +3118,7 @@ fn planned_over_scan(
 		.chain(&scan.ignore_blocked)
 		.cloned()
 		.collect();
-	drop_blocked(plan.actions, &blocked, &ignored)
+	drop_blocked(plan.actions, &blocked, &ignored, &Collisions::default())
 }
 
 /// A root `.filenignore` that cannot be read blocks the whole tree, not only the items under
@@ -8959,21 +9011,31 @@ fn the_confirmations_a_pass_made_survive_its_seeding() {
 	);
 }
 
-/// A pass that will be refused plans nothing, and seeds nothing either.
+/// A pass seeds no path of a name collision, on either side, nor one folding like one; the plain
+/// file beside them is recorded as before.
 #[test]
-fn a_refused_pass_seeds_nothing() {
+fn a_pass_seeds_no_colliding_path() {
+	let paths = ["a.bin", "B.bin", "plain.bin"];
 	let (store, mut prep) = prepared_on_store(
 		SyncMode::TwoWay,
 		Vec::new(),
-		vec![seed_local("a.bin")],
-		vec![seed_remote("a.bin", 1)],
+		paths.iter().map(|path| seed_local(path)).collect(),
+		paths
+			.iter()
+			.zip(1..)
+			.map(|(path, uuid)| seed_remote(path, uuid))
+			.collect(),
 	);
-	prep.local_scan.errors.push(ScanError::DuplicateName {
-		rel_path: "x/Y".to_string(),
-	});
-	assert_eq!(prep.seed_unhashed(&store).unwrap(), SeedCounts::default());
-	assert!(prep.baseline.is_empty());
-	assert_eq!(store.entries(prep.record.id).unwrap(), []);
+	prep.local_scan.collisions = BTreeSet::from(["A.bin".to_string(), "a.bin".to_string()]);
+	prep.remote_view.collisions = BTreeSet::from(["b.bin".to_string(), "b.BIN".to_string()]);
+	assert_eq!(prep.seed_unhashed(&store).unwrap().total(), 1);
+	let seeded: Vec<String> = store
+		.entries(prep.record.id)
+		.unwrap()
+		.into_iter()
+		.map(|row| row.rel_path)
+		.collect();
+	assert_eq!(seeded, ["plain.bin"]);
 }
 
 /// A change-scoped pass seeds the paths it decides, and leaves a rowless path it does not decide to
@@ -9373,17 +9435,16 @@ fn a_dry_run_still_plans_a_hashless_file_the_evidence_does_not_hold_for() {
 	}
 }
 
-/// A dry run of a pass that will be refused weighs nothing, as the pass seeds nothing.
+/// A dry run weighs nothing at a path whose name collides with a twin, as the pass seeds nothing
+/// there.
 #[test]
-fn a_refused_dry_run_weighs_nothing() {
+fn a_dry_run_weighs_nothing_at_a_colliding_path() {
 	let (store, mut prep, _stages) = staged_on_store(
 		SyncMode::TwoWay,
 		vec![seed_local("a.bin")],
 		vec![seed_remote("a.bin", 1)],
 	);
-	prep.local_scan.errors.push(ScanError::DuplicateName {
-		rel_path: "x/Y".to_string(),
-	});
+	prep.local_scan.collisions = BTreeSet::from(["A.bin".to_string(), "a.bin".to_string()]);
 	assert_eq!(
 		prep.preview_unhashed(&store).unwrap(),
 		SeedCounts::default()
@@ -9839,4 +9900,488 @@ async fn a_refused_subscription_is_asked_for_again() {
 		Some(FullPassReason::RemoteEventsDegraded),
 		"a pass reads the remote whole while nothing announces it"
 	);
+}
+
+/// What a two-way pass plans and reports over `rows`, `local` and `remote` when the local scan found
+/// `local_twins` colliding and the remote view `remote_twins`, folded and screened as a pass does.
+fn colliding_pass(
+	mode: SyncMode,
+	rows: Vec<BaselineEntry>,
+	(local, local_twins): (Vec<LocalNode>, &[&str]),
+	(remote, remote_twins): (Vec<RemoteNode>, &[&str]),
+) -> (Vec<SyncAction>, Vec<UnsyncablePath>) {
+	let mut remote_view = view(remote, Vec::new(), &[]);
+	remote_view.collisions = remote_twins.iter().map(|path| path.to_string()).collect();
+	let mut prep = prepared(
+		mode,
+		rows.into_iter()
+			.map(|row| (row.rel_path.clone(), row))
+			.collect(),
+		local,
+		remote_view,
+		HashMap::new(),
+	);
+	prep.local_scan.collisions = local_twins.iter().map(|path| path.to_string()).collect();
+	run_prepared(prep)
+}
+
+/// One unsyncable report per path, each for `reason`.
+fn collision_reports(paths: &[&str], reason: &UnsyncableReason) -> Vec<UnsyncablePath> {
+	paths
+		.iter()
+		.map(|path| UnsyncablePath {
+			rel_path: path.to_string(),
+			reason: reason.clone(),
+		})
+		.collect()
+}
+
+/// Local case twins are left alone on both sides — the synced spelling the scan left out of its
+/// side is not trashed, the new one is not uploaded over it — and reported, while the rest of the
+/// pair syncs.
+#[test]
+fn local_case_twins_are_left_alone_and_the_rest_of_the_pair_syncs() {
+	let (dir, report) = (Uuid::from_u128(1), Uuid::from_u128(2));
+	let (actions, unsyncable) = colliding_pass(
+		SyncMode::TwoWay,
+		vec![
+			dir_row("docs", dir),
+			file_row("docs/report.txt", report, hash(1)),
+		],
+		(
+			// `Report.txt` took the folded name, so `report.txt` is not a node.
+			vec![
+				local_dir("docs"),
+				local_file("docs/Report.txt", hash(2)),
+				local_file("new.txt", hash(3)),
+			],
+			&["docs/Report.txt", "docs/report.txt"],
+		),
+		(
+			vec![
+				remote_dir("docs", dir),
+				remote_file("docs/report.txt", report, hash(1), 4),
+			],
+			&[],
+		),
+	);
+	assert_eq!(
+		actions,
+		vec![SyncAction::UploadFile {
+			rel_path: "new.txt".to_string()
+		}]
+	);
+	assert_eq!(
+		unsyncable,
+		collision_reports(
+			&["docs/Report.txt", "docs/report.txt"],
+			&UnsyncableReason::LocalNameCollision
+		)
+	);
+}
+
+/// NFC and NFD spellings of one name share their key, so one path stands for the pair: nothing is
+/// pushed there, whichever of the two the scan read, and the rest of the pair syncs.
+#[test]
+fn nfc_and_nfd_twins_are_left_alone_and_the_rest_of_the_pair_syncs() {
+	let (cafe, other) = (Uuid::from_u128(1), Uuid::from_u128(2));
+	let (actions, unsyncable) = colliding_pass(
+		SyncMode::TwoWay,
+		vec![
+			file_row("caf\u{e9}.txt", cafe, hash(1)),
+			file_row("other.txt", other, hash(4)),
+		],
+		(
+			vec![
+				local_file("caf\u{e9}.txt", hash(2)),
+				local_file("other.txt", hash(5)),
+			],
+			&["caf\u{e9}.txt"],
+		),
+		(
+			vec![
+				remote_file("caf\u{e9}.txt", cafe, hash(1), 4),
+				remote_file("other.txt", other, hash(4), 4),
+			],
+			&[],
+		),
+	);
+	assert_eq!(
+		actions,
+		vec![SyncAction::UploadFile {
+			rel_path: "other.txt".to_string()
+		}]
+	);
+	assert_eq!(
+		unsyncable,
+		collision_reports(&["caf\u{e9}.txt"], &UnsyncableReason::LocalNameCollision)
+	);
+}
+
+/// A directory the remote trashed while it holds local twins is not deleted locally: one of the
+/// twins was never synced, and the directory is not empty.
+#[test]
+fn a_remote_trash_of_a_directory_holding_local_twins_deletes_nothing() {
+	for mode in [SyncMode::TwoWay, SyncMode::RemoteToLocal] {
+		let (actions, _) = colliding_pass(
+			mode,
+			vec![
+				dir_row("docs", Uuid::from_u128(1)),
+				file_row("docs/report.txt", Uuid::from_u128(2), hash(1)),
+			],
+			(
+				vec![local_dir("docs"), local_file("docs/Report.txt", hash(2))],
+				&["docs/Report.txt", "docs/report.txt"],
+			),
+			(Vec::new(), &[]),
+		);
+		assert_eq!(actions, [], "{mode:?}");
+	}
+}
+
+/// A directory deleted locally while the remote holds twins in it is not trashed: the twin the
+/// view left out of its side is still there.
+#[test]
+fn a_local_deletion_of_a_directory_holding_remote_twins_trashes_nothing() {
+	for mode in [SyncMode::TwoWay, SyncMode::LocalToRemote] {
+		let (dir, a) = (Uuid::from_u128(1), Uuid::from_u128(2));
+		let (actions, unsyncable) = colliding_pass(
+			mode,
+			vec![dir_row("docs", dir), file_row("docs/a.txt", a, hash(1))],
+			(Vec::new(), &[]),
+			(
+				// `A.txt` left the view as the loser of the pair.
+				vec![
+					remote_dir("docs", dir),
+					remote_file("docs/a.txt", a, hash(1), 4),
+				],
+				&["docs/A.txt", "docs/a.txt"],
+			),
+		);
+		assert_eq!(actions, [], "{mode:?}");
+		assert_eq!(
+			unsyncable,
+			collision_reports(
+				&["docs/A.txt", "docs/a.txt"],
+				&UnsyncableReason::RemoteNameCollision
+			),
+			"{mode:?}"
+		);
+	}
+}
+
+/// A synced file renamed onto a twin's name is not moved there, and its remote copy is not
+/// trashed either: the move is the only thing that relocates it, and it waits with the twins.
+#[test]
+fn a_file_renamed_onto_a_twins_name_keeps_its_remote_copy() {
+	let (x, a) = (Uuid::from_u128(1), Uuid::from_u128(2));
+	let (actions, _) = colliding_pass(
+		SyncMode::TwoWay,
+		vec![file_row("x.txt", x, hash(1)), file_row("a.txt", a, hash(2))],
+		(
+			// `x.txt` renamed to `A.txt`, which took the name before `a.txt`.
+			vec![local_file("A.txt", hash(1))],
+			&["A.txt", "a.txt"],
+		),
+		(
+			vec![
+				remote_file("x.txt", x, hash(1), 4),
+				remote_file("a.txt", a, hash(2), 4),
+			],
+			&[],
+		),
+	);
+	assert_eq!(actions, []);
+}
+
+/// A twin the scan left out of its side is still there, so its row is no move source: a copy of its
+/// content elsewhere does not carry the remote item away. The copy waits with the twins, as the
+/// move it was planned as does.
+#[test]
+fn a_twins_absence_is_no_move_away() {
+	let a = Uuid::from_u128(1);
+	let (actions, _) = colliding_pass(
+		SyncMode::TwoWay,
+		vec![file_row("a.txt", a, hash(1))],
+		(
+			vec![
+				local_file("A.txt", hash(2)),
+				local_file("copy.txt", hash(1)),
+			],
+			&["A.txt", "a.txt"],
+		),
+		(vec![remote_file("a.txt", a, hash(1), 4)], &[]),
+	);
+	assert!(
+		!actions
+			.iter()
+			.any(|action| action.is_delete() || action.endpoints().0 == "a.txt"),
+		"{actions:?}"
+	);
+}
+
+/// Nothing is pushed under any spelling of a remote twin's name — the server's dedup would land
+/// it on one of the twins — and neither twin is pulled, while the rest of the pair syncs.
+#[test]
+fn nothing_lands_on_a_remote_twins_name() {
+	let (actions, unsyncable) = colliding_pass(
+		SyncMode::TwoWay,
+		Vec::new(),
+		(
+			vec![
+				local_file("R.TXT", hash(1)),
+				local_file("plain.txt", hash(2)),
+			],
+			&[],
+		),
+		(
+			vec![remote_file("R.txt", Uuid::from_u128(1), hash(3), 4)],
+			&["R.txt", "r.txt"],
+		),
+	);
+	assert_eq!(
+		actions,
+		vec![SyncAction::UploadFile {
+			rel_path: "plain.txt".to_string()
+		}]
+	);
+	assert_eq!(
+		unsyncable,
+		collision_reports(&["R.txt", "r.txt"], &UnsyncableReason::RemoteNameCollision)
+	);
+}
+
+/// Once the user renames one twin apart, the next pass finds no collision and syncs both: the
+/// edited synced spelling and the renamed one.
+#[test]
+fn twins_renamed_apart_both_sync() {
+	let (dir, report) = (Uuid::from_u128(1), Uuid::from_u128(2));
+	let (actions, unsyncable) = colliding_pass(
+		SyncMode::TwoWay,
+		vec![
+			dir_row("docs", dir),
+			file_row("docs/report.txt", report, hash(1)),
+		],
+		(
+			vec![
+				local_dir("docs"),
+				local_file("docs/report.txt", hash(3)),
+				local_file("docs/Report 2.txt", hash(2)),
+			],
+			&[],
+		),
+		(
+			vec![
+				remote_dir("docs", dir),
+				remote_file("docs/report.txt", report, hash(1), 4),
+			],
+			&[],
+		),
+	);
+	let mut uploaded: Vec<&str> = actions
+		.iter()
+		.filter(|action| matches!(action, SyncAction::UploadFile { .. }))
+		.map(SyncAction::rel_path)
+		.collect();
+	uploaded.sort_unstable();
+	assert_eq!(
+		uploaded,
+		["docs/Report 2.txt", "docs/report.txt"],
+		"{actions:?}"
+	);
+	assert_eq!(actions.len(), 2, "{actions:?}");
+	assert_eq!(unsyncable, []);
+}
+
+/// What a change-scoped two-way pass makes of `observations` over `rows` and `remote`: the
+/// observations merged into the carried rows as `prepare_scoped` merges them, the collisions
+/// gathered from both with [`scoped_collisions`], and the pass reconciled over what it decided on
+/// that carried local side, folded and screened in memory, as a change-scoped pass is.
+fn scoped_colliding_pass(
+	rows: Vec<BaselineEntry>,
+	mut observations: LocalObservations,
+	remote: Vec<RemoteNode>,
+) -> (BTreeSet<String>, Vec<SyncAction>, Vec<UnsyncablePath>) {
+	let mut prep = prepared(
+		SyncMode::TwoWay,
+		rows.into_iter()
+			.map(|row| (row.rel_path.clone(), row))
+			.collect(),
+		Vec::new(),
+		view(remote, Vec::new(), &[]),
+		HashMap::new(),
+	);
+	let mut derived = derive::from_baseline(
+		&prep.baseline,
+		observations.observed.keys().cloned().collect(),
+	);
+	derive::merge_local(&mut derived, &prep.baseline, &mut observations);
+	assert_eq!(
+		derived.held,
+		BTreeSet::new(),
+		"every row of the fixture is carried, as a synced row is"
+	);
+	let collisions = scoped_collisions(&observations, &derived.local.of(&prep.baseline));
+	prep.local_scan.nodes = derived.local;
+	prep.local_scan.collisions = collisions.clone();
+	prep.read = PassRead::Scoped(derived.decided);
+	prep.fold_dir_moves().unwrap();
+	let resident = reconcile_and_screen_resident(&prep, screen_state(&prep));
+	let (_dir, stage) = Stage::in_temp_dir();
+	let in_memory = reconcile_and_screen(&prep, screen_state(&prep), || Ok(stage)).unwrap();
+	assert_screened_as(in_memory, &resident, "reconciled in memory");
+	let mut actions = resident.decision.safe;
+	actions.extend(resident.decision.held);
+	(collisions, actions, prep.unsyncable())
+}
+
+/// Observations of `observed` alone, complete, with `siblings` as the folded names of the
+/// directories they sit in.
+fn observations(
+	observed: Vec<(&str, LocalObservation)>,
+	siblings: Vec<(&str, FoldedNames)>,
+) -> LocalObservations {
+	LocalObservations {
+		observed: observed
+			.into_iter()
+			.map(|(at, observation)| (at.to_string(), observation))
+			.collect(),
+		siblings: siblings
+			.into_iter()
+			.map(|(dir, folded)| (dir.to_string(), folded))
+			.collect(),
+		ignore_blocked: BTreeSet::new(),
+		complete: true,
+		gaps: ScanGaps::default(),
+		errors: Vec::new(),
+	}
+}
+
+/// The folded names one directory holds, grouped as `read_siblings` groups them.
+fn folded_names(names: &[&str]) -> FoldedNames {
+	let mut folded = FoldedNames::new();
+	for name in names {
+		folded
+			.entry(scan::collision_key(name))
+			.or_default()
+			.insert((*name).to_string());
+	}
+	folded
+}
+
+/// A synced `docs/report.txt`, on both sides, in a synced `docs`, with rows a change-scoped pass
+/// carries rather than holds.
+fn synced_report() -> (Vec<BaselineEntry>, Vec<RemoteNode>) {
+	let (dir, report) = (Uuid::from_u128(1), Uuid::from_u128(2));
+	(
+		vec![
+			dir_row("docs", dir),
+			BaselineEntry {
+				remote_modified: Some(0),
+				..file_row("docs/report.txt", report, hash(1))
+			},
+		],
+		vec![
+			remote_dir("docs", dir),
+			remote_file("docs/report.txt", report, hash(1), 4),
+		],
+	)
+}
+
+/// A case twin of a synced file that a watched pass sees appear on its own is a collision with
+/// the carried row of the synced spelling: both are held back and reported, and nothing is pushed
+/// onto the remote copy the server would fold the new name into.
+#[test]
+fn a_twin_a_scoped_pass_observes_beside_a_carried_row_is_held_back() {
+	let (rows, remote) = synced_report();
+	let (collisions, actions, unsyncable) = scoped_colliding_pass(
+		rows,
+		observations(
+			vec![(
+				"docs/Report.txt",
+				LocalObservation::File {
+					node: local_file("docs/Report.txt", hash(2)),
+					name_rejection: None,
+				},
+			)],
+			vec![("docs", folded_names(&["Report.txt", "report.txt"]))],
+		),
+		remote,
+	);
+	let twins = ["docs/Report.txt", "docs/report.txt"];
+	assert_eq!(collisions, twins.map(str::to_string).into());
+	assert_eq!(actions, []);
+	assert_eq!(
+		unsyncable,
+		collision_reports(&twins, &UnsyncableReason::LocalNameCollision)
+	);
+}
+
+/// A watched pass that walks a directory whose walk found case twins holds both back, the synced
+/// spelling the walk left out of its nodes included: that spelling is no local deletion, so its
+/// remote copy is not trashed, and the new one is not uploaded over it.
+#[test]
+fn a_twin_a_scoped_walk_finds_keeps_the_synced_spellings_remote_copy() {
+	let (rows, remote) = synced_report();
+	let twins = ["docs/Report.txt", "docs/report.txt"];
+	// `Report.txt` took the folded name, so `report.txt` is not one of the walk's nodes.
+	let walk = LocalScan {
+		nodes: [local_dir("docs"), local_file("docs/Report.txt", hash(2))]
+			.into_iter()
+			.map(|node| (node.rel_path.clone(), node))
+			.collect(),
+		complete: true,
+		gaps: ScanGaps::default(),
+		errors: Vec::new(),
+		invalid_names: BTreeMap::new(),
+		aliased_dirs: BTreeMap::new(),
+		ignored: BTreeMap::new(),
+		ignored_default_untracked: 0,
+		ignore_blocked: BTreeSet::new(),
+		stale_downloads: Vec::new(),
+		collisions: twins.map(str::to_string).into(),
+	};
+	let (collisions, actions, unsyncable) = scoped_colliding_pass(
+		rows,
+		observations(
+			vec![("docs", LocalObservation::Dir(Box::new(walk)))],
+			Vec::new(),
+		),
+		remote,
+	);
+	assert_eq!(collisions, twins.map(str::to_string).into());
+	assert_eq!(actions, []);
+	assert_eq!(
+		unsyncable,
+		collision_reports(&twins, &UnsyncableReason::LocalNameCollision)
+	);
+}
+
+/// Only names the pass holds a node for collide: a twin on disk that the pass has no row and no
+/// observation for holds nothing back in a pass that is not touching it, and the observed file
+/// beside it syncs.
+#[test]
+fn a_twin_a_scoped_pass_holds_no_node_for_is_no_collision() {
+	let (collisions, actions, unsyncable) = scoped_colliding_pass(
+		Vec::new(),
+		observations(
+			vec![(
+				"Notes.txt",
+				LocalObservation::File {
+					node: local_file("Notes.txt", hash(1)),
+					name_rejection: None,
+				},
+			)],
+			vec![("", folded_names(&["Notes.txt", "notes.txt"]))],
+		),
+		Vec::new(),
+	);
+	assert_eq!(collisions, BTreeSet::new());
+	assert_eq!(
+		actions,
+		vec![SyncAction::UploadFile {
+			rel_path: "Notes.txt".to_string()
+		}]
+	);
+	assert_eq!(unsyncable, []);
 }

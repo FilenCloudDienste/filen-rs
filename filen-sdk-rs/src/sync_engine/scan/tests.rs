@@ -789,6 +789,7 @@ fn map_window(root: &Path) -> Window<'_, MapSink> {
 		complete: true,
 		gaps: ScanGaps::default(),
 		invalid_names: BTreeMap::new(),
+		collisions: BTreeSet::new(),
 	}
 }
 
@@ -835,6 +836,45 @@ fn a_file_whose_read_fails_once_it_became_a_directory_leaves_the_scan_incomplete
 	assert!(window.errors.is_empty(), "{:?}", window.errors);
 	assert_eq!(window.sink.nodes.len(), 0);
 	assert_eq!(window.sink.claims, Vec::<String>::new());
+
+	fs::remove_dir_all(&root).ok();
+}
+
+/// NFC and NFD spellings of one name key alike, so the walk hands the sink one path twice: the
+/// second is refused, the path is recorded once as a collision, the first stays the node, and the
+/// scan is complete — nothing was missed, and the engine holds the path back on both sides.
+#[test]
+fn nfc_and_nfd_twins_are_one_collision_and_leave_the_scan_complete() {
+	let root = temp_root();
+	let name = "caf\u{e9}.txt";
+	fs::write(root.join(name), b"either").unwrap();
+	let listed = fs::symlink_metadata(root.join(name)).unwrap();
+	let mut window = map_window(&root);
+	for content in [1u8, 2] {
+		window
+			.push(Listed::Entry {
+				rel_path: name.to_owned(),
+				listed_type: listed.file_type(),
+				blocked_rule_file: false,
+				read: Some(Ok(reading(&listed, |_, _| {
+					Ok(Blake3Hash::from([content; 32]))
+				}))),
+			})
+			.unwrap();
+	}
+
+	assert!(window.complete);
+	assert!(window.errors.is_empty(), "{:?}", window.errors);
+	assert_eq!(window.collisions, BTreeSet::from([name.to_owned()]));
+	assert_eq!(
+		window
+			.sink
+			.nodes
+			.get(name)
+			.and_then(|node| node.content_hash),
+		Some(Blake3Hash::from([1; 32])),
+		"the first spelling keeps the name"
+	);
 
 	fs::remove_dir_all(&root).ok();
 }
@@ -1071,9 +1111,10 @@ fn case_twins(root: &Path) -> Option<[std::path::PathBuf; 2]> {
 }
 
 /// A twin whose first spelling claimed the folded name and then bailed — a file the scan could
-/// not read — must still refuse the pass. The claim is what says the name is taken; forgetting
-/// it lets the second spelling through as an ordinary new file, and since the server folds case
-/// too, uploading it lands on top of the remote copy the first spelling is synced as.
+/// not read — must still be a collision of both spellings. The claim is what says the name is
+/// taken; forgetting it lets the second spelling through as an ordinary new file, and since the
+/// server folds case too, uploading it lands on top of the remote copy the first spelling is
+/// synced as.
 #[cfg(unix)]
 #[test]
 fn a_twin_whose_first_spelling_could_not_be_read_is_still_a_collision() {
@@ -1102,12 +1143,10 @@ fn a_twin_whose_first_spelling_could_not_be_read_is_still_a_collision() {
 		},
 	);
 
-	assert!(
-		scan.errors
-			.iter()
-			.any(|error| matches!(error, ScanError::DuplicateName { .. })),
-		"the pass must still be refused over the collision: {:?}",
-		scan.errors
+	assert_eq!(
+		scan.collisions,
+		BTreeSet::from(["A.txt".to_string(), "a.txt".to_string()]),
+		"both spellings must still be held back"
 	);
 	assert!(
 		sorted_paths(&scan).is_empty(),
@@ -1172,8 +1211,8 @@ fn a_twin_that_vanishes_before_its_hash_is_read_is_no_collision() {
 }
 
 /// A twin whose hash cannot be read, reached once the other spelling holds the name, reports
-/// both what stopped the read and the collision: the pass is refused over the twin, and told
-/// why that file was not read.
+/// what stopped the read and records the collision of both: the twins are held back, and the
+/// pass is told why that file was not read.
 #[cfg(unix)]
 #[test]
 fn a_twin_whose_second_spelling_could_not_be_read_reports_the_read_and_the_collision() {
@@ -1214,13 +1253,15 @@ fn a_twin_whose_second_spelling_could_not_be_read_reports_the_read_and_the_colli
 		ScanError::Io {
 			rel_path: unread, ..
 		},
-		ScanError::DuplicateName { rel_path: named },
 	] = scan.errors.as_slice()
 	else {
-		panic!("the read error, then the collision: {:?}", scan.errors)
+		panic!("the read error alone: {:?}", scan.errors)
 	};
 	assert_eq!(unread, second);
-	assert_eq!(named, &format!("{first} / {second}"));
+	assert_eq!(
+		scan.collisions,
+		BTreeSet::from([first.clone(), second.clone()])
+	);
 	assert_eq!(sorted_paths(&scan), vec![first.clone()]);
 
 	fs::remove_dir_all(&root).ok();
@@ -1269,6 +1310,8 @@ fn a_root_that_vanishes_during_the_walk_leaves_the_scan_incomplete() {
 	fs::remove_dir_all(&root).ok();
 }
 
+/// Every scan error is a line of the pass's report, and a name collision is none: it is reported
+/// per path, as unsyncable.
 #[test]
 fn a_name_collision_is_not_reported_as_an_error_line() {
 	let scan = LocalScan {
@@ -1276,9 +1319,6 @@ fn a_name_collision_is_not_reported_as_an_error_line() {
 		complete: false,
 		gaps: ScanGaps::default(),
 		errors: vec![
-			ScanError::DuplicateName {
-				rel_path: "A.txt / a.txt".to_string(),
-			},
 			ScanError::NonUtf8Name {
 				lossy_path: "bad\u{FFFD}".to_string(),
 			},
@@ -1293,6 +1333,7 @@ fn a_name_collision_is_not_reported_as_an_error_line() {
 		ignored_default_untracked: 0,
 		ignore_blocked: BTreeSet::new(),
 		stale_downloads: Vec::new(),
+		collisions: BTreeSet::from(["A.txt".to_string(), "a.txt".to_string()]),
 	};
 	let reported: Vec<String> = scan.reported_errors().collect();
 	assert_eq!(
@@ -1304,7 +1345,7 @@ fn a_name_collision_is_not_reported_as_an_error_line() {
 				std::io::Error::from(std::io::ErrorKind::NotFound)
 			),
 		],
-		"a collision refuses the pass with its own line; everything else is reported"
+		"a collision has no line; everything else is reported"
 	);
 }
 
@@ -1848,7 +1889,7 @@ fn a_user_level_dotfile_rule_still_reads_rule_files() {
 }
 
 #[test]
-fn ignored_case_twins_do_not_refuse_the_pass() {
+fn ignored_case_twins_are_no_collision() {
 	let root = temp_root();
 	fs::write(root.join("Twin.txt"), b"a").unwrap();
 	fs::write(root.join("twin.txt"), b"b").unwrap();
@@ -1856,7 +1897,16 @@ fn ignored_case_twins_do_not_refuse_the_pass() {
 	// names, and there is nothing to collide.
 	if fs::read_dir(&root).unwrap().count() == 2 {
 		let unruled = scan_plain(&root, &HashMap::new());
-		assert!(!unruled.complete, "without a rule the twins collide");
+		assert_eq!(
+			unruled.collisions,
+			BTreeSet::from(["Twin.txt".to_string(), "twin.txt".to_string()]),
+			"without a rule the twins collide"
+		);
+		assert!(
+			unruled.complete,
+			"a collision misses nothing: {:?}",
+			unruled.errors
+		);
 
 		fs::write(root.join(FILENIGNORE), "TWIN.TXT\n").unwrap();
 		let scan = scan_plain(&root, &HashMap::new());
@@ -2758,13 +2808,10 @@ fn a_walk_reading_entries_on_workers_finds_what_one_reading_them_inline_finds() 
 		inline.errors
 	);
 	assert_eq!(
-		inline
-			.errors
-			.iter()
-			.any(|error| matches!(error, ScanError::DuplicateName { .. })),
+		!inline.collisions.is_empty(),
 		twins,
 		"{:?}",
-		inline.errors
+		inline.collisions
 	);
 	assert!(!inline.complete);
 	assert_eq!(

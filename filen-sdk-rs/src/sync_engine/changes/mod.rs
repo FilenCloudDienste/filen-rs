@@ -191,9 +191,16 @@ pub enum FullPassReason {
 	/// A caller asked for a pass ([`request_pass`](super::SyncEngine::request_pass)), which reads
 	/// both sides whole like a [`SafetyNet`](Self::SafetyNet) tick.
 	Requested,
-	/// The previous pass refused to run (a name collision on either side), which is whole-tree
-	/// state.
+	/// The previous pass refused to run, which is whole-tree state. No pass refuses any more (see
+	/// [`RefuseReason`](super::RefuseReason)); a name collision is
+	/// [`NameCollision`](Self::NameCollision).
 	PreviousRefusal,
+	/// The previous pass found a name collision on either side and left the colliding paths alone
+	/// (see [`UnsyncableReason::LocalNameCollision`](super::UnsyncableReason::LocalNameCollision)).
+	/// Whole-tree state: a change-scoped pass folds only the names it decided against the others,
+	/// which is sound only while every carried name is known to be free of collisions, so every pass
+	/// reads both sides whole until the collision is resolved.
+	NameCollision,
 	/// The previous pass held deletions back, and something else has since given the pair a pass
 	/// to run.
 	///
@@ -272,6 +279,7 @@ impl fmt::Display for FullPassReason {
 			Self::SafetyNet => "the periodic safety-net pass",
 			Self::Requested => "a caller asked for a pass",
 			Self::PreviousRefusal => "the previous pass refused to run",
+			Self::NameCollision => "the previous pass found a name collision",
 			Self::DeletionHold => "the previous pass held deletions for whole-tree evidence",
 			Self::InterruptedPass => "the previous pass was cancelled part-way through",
 			Self::RulesChanged => "the ignore patterns or the pair's mode changed",

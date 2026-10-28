@@ -85,17 +85,15 @@ pub(in super::super) fn staged_view(
 /// Hold a view a whole pass staged to the one `ViewBuilder` built from the same items: the same
 /// nodes at the same paths, the same held paths, ignored roots and count of untracked default hits,
 /// and the same records in any order (nothing reads them in order: `unknown_remote_paths` keys them
-/// by path). Where the views found collisions, each kept one node of every folded name, and which
-/// one is the one thing they may differ in: the pass is refused either way.
+/// by path). Where the views found collisions, both name the same paths for them and each kept one
+/// node of every folded name, and which one is the one thing they may differ in: the pass holds
+/// back every path of the group either way.
 pub(in super::super) fn assert_views_alike(at: &str, resident: &RemoteView, staged: &RemoteView) {
 	assert!(
 		matches!(staged.nodes, Side::Staged(_)),
 		"{at}: the staged view is staged"
 	);
-	assert_eq!(
-		staged.has_collisions, resident.has_collisions,
-		"{at}: has_collisions"
-	);
+	assert_eq!(staged.collisions, resident.collisions, "{at}: collisions");
 	assert_eq!(staged.held_paths, resident.held_paths, "{at}: held_paths");
 	assert_eq!(staged.ignored, resident.ignored, "{at}: ignored");
 	assert_eq!(
@@ -121,7 +119,7 @@ pub(in super::super) fn assert_views_alike(at: &str, resident: &RemoteView, stag
 		staged_nodes.len(),
 		"{at}: the staged view counts what it holds"
 	);
-	if !resident.has_collisions {
+	if !resident.has_collisions() {
 		assert_eq!(staged_nodes, resident_nodes, "{at}: nodes");
 		return;
 	}
