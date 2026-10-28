@@ -49,8 +49,8 @@ use super::{
 	plan::{RemoteNode, SyncAction, is_under},
 	rows::{Baseline, Cursor},
 	scan::{
-		LocalNode, PairRoot, collision_key, folds_onto_legacy_trash, hash_file, is_account_data,
-		is_legacy_trash,
+		LocalNode, PairRoot, ScanGap, collision_key, folds_onto_legacy_trash, hash_file,
+		is_account_data, is_legacy_trash,
 	},
 	side::{NodesAt, Side},
 	stage::{Carried, Pager, Run, Screen, Staged, StagedPlan},
@@ -126,6 +126,15 @@ pub struct SyncReport {
 	/// Per-action failures (the pass continues past them; one that ran out of room or found the
 	/// remote out of reach also holds back the actions behind it, see [`halted`](Self::halted)).
 	pub errors: Vec<String>,
+	/// The paths that left the local read incomplete, and why: the first 100 the read met, in the
+	/// order it met them. Every deletion of a pass whose read was incomplete is held as
+	/// [`GuardReason::ScanIncomplete`](super::GuardReason::ScanIncomplete), and these are what a
+	/// caller can show for it. Empty on a complete read, and on an incomplete one that has no path
+	/// to name: a walk cut short, or a name collision, which refuses the pass with its own report.
+	/// A change-scoped pass that carries an earlier incomplete read on lists that read's paths too.
+	pub scan_gaps: Vec<ScanGap>,
+	/// How many such paths the read met, of which `scan_gaps` lists the first 100.
+	pub scan_gaps_total: usize,
 	/// Paths whose local copy this pass moved into the pair's quarantine bin to clear the way for a
 	/// write: a remote-wins download over a copy the baseline cannot vouch for, and a move onto an
 	/// occupied destination. The bytes stay recoverable under `.filen-sync-trash`, in the bucket of

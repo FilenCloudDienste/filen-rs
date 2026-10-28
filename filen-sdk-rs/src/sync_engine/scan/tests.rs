@@ -787,6 +787,7 @@ fn map_window(root: &Path) -> Window<'_, MapSink> {
 		sink: MapSink::with_capacity(1),
 		errors: Vec::new(),
 		complete: true,
+		gaps: ScanGaps::default(),
 		invalid_names: BTreeMap::new(),
 	}
 }
@@ -1273,6 +1274,7 @@ fn a_name_collision_is_not_reported_as_an_error_line() {
 	let scan = LocalScan {
 		nodes: Side::default(),
 		complete: false,
+		gaps: ScanGaps::default(),
 		errors: vec![
 			ScanError::DuplicateName {
 				rel_path: "A.txt / a.txt".to_string(),
@@ -3002,6 +3004,7 @@ fn counted_walk(root: &Path, baseline: &Baseline, max_read_workers: usize) -> Lo
 		MapSink::with_capacity(16),
 	);
 	assert!(scan.complete, "{:?}", scan.errors);
+	assert_eq!(scan.gaps, ScanGaps::default());
 	progress.snapshot()
 }
 
@@ -3086,4 +3089,138 @@ fn what_the_rules_hide_is_not_counted() {
 		}
 	);
 	fs::remove_dir_all(&root).unwrap();
+}
+
+/// What `scan` found missing, sorted by path.
+fn sorted_gaps(scan: &LocalScan) -> (Vec<ScanGap>, usize) {
+	let (mut gaps, total) = scan.gaps.clone().into_parts();
+	gaps.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+	(gaps, total)
+}
+
+#[cfg(unix)]
+#[test]
+fn an_unreadable_directory_and_file_are_the_gaps_of_the_scan() {
+	use std::os::unix::fs::PermissionsExt;
+
+	let root = temp_root();
+	fs::write(root.join("keep.txt"), b"x").unwrap();
+	fs::write(root.join("secret.txt"), b"s").unwrap();
+	fs::create_dir(root.join("locked")).unwrap();
+	fs::write(root.join("locked").join("inner.txt"), b"y").unwrap();
+	for path in ["locked", "secret.txt"] {
+		fs::set_permissions(root.join(path), fs::Permissions::from_mode(0o000)).unwrap();
+	}
+
+	let scan = scan_plain(&root, &HashMap::new());
+	fs::set_permissions(root.join("locked"), fs::Permissions::from_mode(0o755)).unwrap();
+	fs::set_permissions(root.join("secret.txt"), fs::Permissions::from_mode(0o644)).unwrap();
+
+	assert!(!scan.complete);
+	let denied = |rel_path: &str| ScanGap {
+		rel_path: rel_path.to_owned(),
+		cause: ScanGapCause::Unreadable {
+			kind: ErrorKind::PermissionDenied,
+		},
+	};
+	assert_eq!(
+		sorted_gaps(&scan),
+		(vec![denied("locked"), denied("secret.txt")], 2)
+	);
+
+	fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn a_missing_root_is_the_gap_of_its_scan() {
+	let root = temp_root().join("gone");
+
+	let scan = scan_plain(&root, &HashMap::new());
+
+	assert!(!scan.complete);
+	assert_eq!(
+		sorted_gaps(&scan),
+		(
+			vec![ScanGap {
+				rel_path: String::new(),
+				cause: ScanGapCause::Unreadable {
+					kind: ErrorKind::NotFound,
+				},
+			}],
+			1
+		)
+	);
+}
+
+// macOS refuses to create a name that is not valid UTF-8.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_non_utf8_name_is_a_gap_of_the_scan() {
+	use std::os::unix::ffi::OsStrExt;
+
+	let root = temp_root();
+	fs::write(root.join(OsStr::from_bytes(b"bad\xff.txt")), b"x").unwrap();
+
+	let scan = scan_plain(&root, &HashMap::new());
+
+	assert!(!scan.complete);
+	assert_eq!(
+		sorted_gaps(&scan),
+		(
+			vec![ScanGap {
+				rel_path: "bad\u{fffd}.txt".to_owned(),
+				cause: ScanGapCause::NonUtf8Name,
+			}],
+			1
+		)
+	);
+	fs::remove_dir_all(&root).ok();
+}
+
+/// A directory removed between the walk listing it and reading its listing changed under the walk:
+/// the scan is partial, nothing is reported as an error, and the gap names it.
+#[test]
+fn a_directory_removed_under_the_walk_is_a_gap_of_the_scan() {
+	let root = temp_root();
+	fs::create_dir(root.join("going")).unwrap();
+	fs::write(root.join("going").join("a.txt"), b"a").unwrap();
+	let going = root.join("going");
+
+	let Ok((scan, _)) = scan_local_watched(
+		ScanRoot {
+			path: &root,
+			pair_root: PairRoot::Directory,
+		},
+		"",
+		&Baseline::default(),
+		IgnoreRules::default(),
+		&RuleFiles::Read,
+		Hooks {
+			on_listed: &mut |path| {
+				if path == going {
+					fs::remove_dir_all(path).unwrap();
+				}
+				ControlFlow::Continue(())
+			},
+			stop: None,
+			moved_hash: None,
+			max_read_workers: 0,
+			progress: &WalkProgress::default(),
+		},
+		MapSink::with_capacity(16),
+	);
+
+	assert!(!scan.complete);
+	assert!(scan.errors.is_empty(), "{:?}", scan.errors);
+	assert_eq!(
+		sorted_gaps(&scan),
+		(
+			vec![ScanGap {
+				rel_path: "going".to_owned(),
+				cause: ScanGapCause::ChangedDuringScan,
+			}],
+			1
+		)
+	);
+	fs::remove_dir_all(&root).ok();
 }

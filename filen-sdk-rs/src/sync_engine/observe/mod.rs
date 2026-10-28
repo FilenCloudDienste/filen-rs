@@ -58,6 +58,7 @@ use std::{
 	cell::RefCell,
 	collections::{BTreeMap, BTreeSet, HashMap},
 	io::ErrorKind,
+	mem,
 	path::Path,
 };
 
@@ -71,9 +72,9 @@ use super::{
 	plan::{ancestors, is_under, subtree_bounds},
 	rows::Baseline,
 	scan::{
-		LocalNode, LocalScan, PairRoot, RuleFiles, ScanError, ScanRoot, collision_key,
-		fast_path_hash, hash_file, load_rule_file, mtime_nanos, name_rejection, record,
-		scan_subtree,
+		LocalNode, LocalScan, PairRoot, RuleFiles, ScanError, ScanGapCause, ScanGaps, ScanRoot,
+		collision_key, fast_path_hash, hash_file, load_rule_file, mtime_nanos, name_rejection,
+		record, scan_subtree,
 	},
 	side::Nodes,
 };
@@ -163,6 +164,9 @@ pub(super) struct LocalObservations {
 	/// complete observation produces is what the pass may act on; an incomplete one holds
 	/// deletions, exactly as an incomplete scan does.
 	pub(super) complete: bool,
+	/// The paths that made the observation incomplete, and why, as [`LocalScan::gaps`] has them for
+	/// a whole-tree walk; a dirty subtree's own are moved up here from its walk.
+	pub(super) gaps: ScanGaps,
 	/// Every error, in the shape a whole-tree scan reports them. A
 	/// [`DuplicateName`](ScanError::DuplicateName) can only come from a subtree walk, inside its
 	/// own [`LocalObservation::Dir`] scan.
@@ -432,6 +436,7 @@ pub(super) fn observe_local(
 		siblings: BTreeMap::new(),
 		ignore_blocked: BTreeSet::new(),
 		complete: true,
+		gaps: ScanGaps::default(),
 		errors: Vec::new(),
 	};
 	// Nothing below the root is evidence of anything unless the root is there: a removed volume, a
@@ -439,6 +444,7 @@ pub(super) fn observe_local(
 	// reading that as a tree of deletions is what the walk's own closing stat guards against.
 	if let Err(source) = std::fs::metadata(root) {
 		out.complete = false;
+		out.gaps.unreadable("", &source);
 		record(
 			&mut out.errors,
 			root,
@@ -586,6 +592,7 @@ pub(super) fn observe_local(
 				}
 				rules = carried;
 				out.complete &= scan.complete;
+				out.gaps.append(mem::take(&mut scan.gaps));
 				insert(&mut out, root, path, LocalObservation::Dir(Box::new(scan)));
 			}
 			Ok(metadata) if metadata.is_file() => {
@@ -611,6 +618,7 @@ pub(super) fn observe_local(
 						}
 						Err(source) => {
 							out.complete = false;
+							out.gaps.unreadable(path, &source);
 							record(
 								&mut out.errors,
 								root,
@@ -662,6 +670,7 @@ pub(super) fn observe_local(
 			}
 			Err(source) => {
 				out.complete = false;
+				out.gaps.unreadable(path, &source);
 				record(
 					&mut out.errors,
 					root,
@@ -679,6 +688,7 @@ pub(super) fn observe_local(
 	// was observed present is still true; what was observed absent is not evidence any more.
 	if let Err(source) = std::fs::metadata(root) {
 		out.complete = false;
+		out.gaps.unreadable("", &source);
 		record(
 			&mut out.errors,
 			root,
@@ -767,6 +777,7 @@ fn walk_ancestors<'p>(
 			}
 			Err(source) => {
 				out.complete = false;
+				out.gaps.unreadable(ancestor, &source);
 				record(
 					&mut out.errors,
 					root,
@@ -809,6 +820,7 @@ fn changed_under_observation(
 	source: &std::io::Error,
 ) {
 	out.complete = false;
+	out.gaps.note(path, ScanGapCause::ChangedDuringScan);
 	tracing::debug!(
 		"local observation of {}: {path:?} changed under the observation, leaving it partial: \
 		 {source}",
@@ -867,6 +879,7 @@ fn read_siblings(root: &Path, dir: &str, out: &mut LocalObservations) -> Option<
 		}
 		Err(source) => {
 			out.complete = false;
+			out.gaps.unreadable(dir, &source);
 			record(
 				&mut out.errors,
 				root,
@@ -884,6 +897,7 @@ fn read_siblings(root: &Path, dir: &str, out: &mut LocalObservations) -> Option<
 			Ok(entry) => entry,
 			Err(source) => {
 				out.complete = false;
+				out.gaps.unreadable(dir, &source);
 				record(
 					&mut out.errors,
 					root,
@@ -898,6 +912,12 @@ fn read_siblings(root: &Path, dir: &str, out: &mut LocalObservations) -> Option<
 		let name = entry.file_name();
 		let Some(name) = name.to_str().map(|name| name.nfc().collect::<String>()) else {
 			out.complete = false;
+			let lossy_name = name.to_string_lossy();
+			let rel_path = match dir {
+				"" => lossy_name.into_owned(),
+				dir => format!("{dir}/{lossy_name}"),
+			};
+			out.gaps.note(&rel_path, ScanGapCause::NonUtf8Name);
 			record(
 				&mut out.errors,
 				root,

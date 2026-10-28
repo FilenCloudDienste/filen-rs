@@ -162,6 +162,8 @@ describe("exports", () => {
 			"SyncPairActivityNapi",
 			"SyncRefusalTags",
 			"SyncRefusal_Tags",
+			"SyncScanGapCauseTags",
+			"SyncScanGapCause_Tags",
 			"TransferDirection",
 			"TransferDirectionNapi",
 			"UnauthJsClient",
@@ -309,6 +311,10 @@ describe("exports", () => {
 				"AwaitingRemote",
 				"Scanning"
 			])
+		)
+		assert.deepEqual(
+			{ ...sdk.SyncScanGapCause_Tags },
+			tags(["Unreadable", "ChangedDuringScan", "NonUtf8Name"])
 		)
 		assert.deepEqual(
 			{ ...sdk.SyncGuardReason_Tags },

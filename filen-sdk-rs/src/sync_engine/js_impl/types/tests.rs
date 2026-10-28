@@ -127,6 +127,53 @@ fn a_report_carries_its_counts_and_why_its_pass_failed() {
 }
 
 #[test]
+fn a_report_names_the_paths_its_scan_could_not_read_and_why() {
+	let report = SyncReport {
+		guard: Some(GuardReason::ScanIncomplete),
+		scan_gaps: vec![
+			ScanGap {
+				rel_path: "locked".to_owned(),
+				cause: ScanGapCause::Unreadable {
+					kind: std::io::ErrorKind::PermissionDenied,
+				},
+			},
+			ScanGap {
+				rel_path: "moving".to_owned(),
+				cause: ScanGapCause::ChangedDuringScan,
+			},
+			ScanGap {
+				rel_path: "bad\u{fffd}".to_owned(),
+				cause: ScanGapCause::NonUtf8Name,
+			},
+		],
+		scan_gaps_total: 250,
+		..SyncReport::default()
+	};
+	let mirrored = SyncPassReport::from(report);
+
+	assert_eq!(
+		mirrored.scan_gaps,
+		vec![
+			SyncScanGap {
+				rel_path: "locked".to_owned(),
+				cause: SyncScanGapCause::Unreadable {
+					kind: "PermissionDenied".to_owned(),
+				},
+			},
+			SyncScanGap {
+				rel_path: "moving".to_owned(),
+				cause: SyncScanGapCause::ChangedDuringScan,
+			},
+			SyncScanGap {
+				rel_path: "bad\u{fffd}".to_owned(),
+				cause: SyncScanGapCause::NonUtf8Name,
+			},
+		]
+	);
+	assert_eq!(mirrored.scan_gaps_total, 250);
+}
+
+#[test]
 fn guard_reasons_map_with_their_counts() {
 	let cases = [
 		(GuardReason::ScanIncomplete, SyncGuardReason::ScanIncomplete),

@@ -1051,6 +1051,7 @@ fn prepared(
 				.map(|node| (node.rel_path.clone(), node))
 				.collect(),
 			complete: true,
+			gaps: ScanGaps::default(),
 			errors: Vec::new(),
 			invalid_names: BTreeMap::new(),
 			aliased_dirs: BTreeMap::new(),
@@ -1117,6 +1118,7 @@ fn the_assembly_check_catches_a_path_no_observation_dropped() {
 			.map(|node| (node.rel_path.clone(), node))
 			.collect(),
 		complete: true,
+		gaps: ScanGaps::default(),
 		errors: Vec::new(),
 		invalid_names: BTreeMap::new(),
 		aliased_dirs: BTreeMap::new(),
@@ -1130,6 +1132,7 @@ fn the_assembly_check_catches_a_path_no_observation_dropped() {
 		siblings: BTreeMap::new(),
 		ignore_blocked: BTreeSet::new(),
 		complete: true,
+		gaps: ScanGaps::default(),
 		errors: Vec::new(),
 	};
 	let none = BTreeSet::new();
@@ -1219,6 +1222,7 @@ fn the_assembly_check_expects_a_hidden_path_to_take_its_rows() {
 		siblings: BTreeMap::new(),
 		ignore_blocked: BTreeSet::new(),
 		complete: true,
+		gaps: ScanGaps::default(),
 		errors: Vec::new(),
 	};
 	let none = BTreeSet::new();
@@ -1275,6 +1279,7 @@ fn the_assembly_check_does_not_subtract_a_held_row_twice() {
 		siblings: BTreeMap::new(),
 		ignore_blocked: BTreeSet::new(),
 		complete: true,
+		gaps: ScanGaps::default(),
 		errors: Vec::new(),
 	};
 	let assembled = Derived {
@@ -1334,6 +1339,7 @@ fn the_assembly_check_subtracts_nested_pruned_roots_and_held_rows_once() {
 		.map(|node| (node.rel_path.clone(), node))
 		.collect(),
 		complete: true,
+		gaps: ScanGaps::default(),
 		errors: Vec::new(),
 		invalid_names: BTreeMap::new(),
 		aliased_dirs: BTreeMap::from([("docs/link".to_string(), "elsewhere".to_string())]),
@@ -1350,6 +1356,7 @@ fn the_assembly_check_subtracts_nested_pruned_roots_and_held_rows_once() {
 		siblings: BTreeMap::new(),
 		ignore_blocked: BTreeSet::new(),
 		complete: true,
+		gaps: ScanGaps::default(),
 		errors: Vec::new(),
 	};
 
@@ -1384,6 +1391,7 @@ fn the_assembly_check_counts_the_rows_it_replaces_without_reading_them() {
 		siblings: BTreeMap::new(),
 		ignore_blocked: BTreeSet::new(),
 		complete: true,
+		gaps: ScanGaps::default(),
 		errors: Vec::new(),
 	};
 	let before = baseline.reads_for_test();

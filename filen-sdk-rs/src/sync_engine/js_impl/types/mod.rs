@@ -14,8 +14,9 @@ use crate::{
 	sync_engine::{
 		BaselineInUse, BaselineSchemaMismatch, DeleteGuard, GuardReason, HaltReason, IgnoredPath,
 		LocalScanProgress, PairId, PairOverlap, PairRecord, PauseMode, PauseOptions, PlanOutcome,
-		PlannedAction, PlannedActionKind, PlannedConflict, RefuseReason, SyncEvent, SyncMode,
-		SyncReport, TransferDirection, UnsyncablePath, WatchConfig, WatchStatus,
+		PlannedAction, PlannedActionKind, PlannedConflict, RefuseReason, ScanGap, ScanGapCause,
+		SyncEvent, SyncMode, SyncReport, TransferDirection, UnsyncablePath, WatchConfig,
+		WatchStatus,
 	},
 };
 
@@ -338,6 +339,47 @@ pub struct SyncPassReport {
 	pub pass_error: Option<String>,
 	/// The [`ErrorKind`] of that failure, set exactly while `pass_error` is.
 	pub pass_error_kind: Option<ErrorKind>,
+	/// The paths that left the local read incomplete, and why: the first 100 it met. Every deletion
+	/// of such a pass is held as `ScanIncomplete`.
+	pub scan_gaps: Vec<SyncScanGap>,
+	/// How many such paths the read met.
+	pub scan_gaps_total: u64,
+}
+
+/// Mirror of [`ScanGap`]: a path the local read could not vouch for.
+#[js_type(export, no_deser, napi)]
+pub struct SyncScanGap {
+	/// Relative to the local root, `/`-joined; `""` is the root itself.
+	pub rel_path: String,
+	pub cause: SyncScanGapCause,
+}
+
+/// Mirror of [`ScanGapCause`].
+#[js_type(export, no_deser, tagged, napi)]
+pub enum SyncScanGapCause {
+	/// Reading or listing it failed. `kind` names the `std::io::ErrorKind`, as in
+	/// `PermissionDenied`.
+	Unreadable { kind: String },
+	/// It changed while the read was looking at it; the next pass reads it as it settled.
+	ChangedDuringScan,
+	/// Its name is not valid UTF-8.
+	NonUtf8Name,
+}
+
+impl From<ScanGap> for SyncScanGap {
+	fn from(gap: ScanGap) -> Self {
+		let ScanGap { rel_path, cause } = gap;
+		Self {
+			rel_path,
+			cause: match cause {
+				ScanGapCause::Unreadable { kind } => SyncScanGapCause::Unreadable {
+					kind: format!("{kind:?}"),
+				},
+				ScanGapCause::ChangedDuringScan => SyncScanGapCause::ChangedDuringScan,
+				ScanGapCause::NonUtf8Name => SyncScanGapCause::NonUtf8Name,
+			},
+		}
+	}
 }
 
 impl From<SyncReport> for SyncPassReport {
@@ -364,6 +406,8 @@ impl From<SyncReport> for SyncPassReport {
 			guard,
 			deletion_token,
 			errors,
+			scan_gaps,
+			scan_gaps_total,
 			quarantined,
 			paused,
 			interrupted,
@@ -416,6 +460,9 @@ impl From<SyncReport> for SyncPassReport {
 			full_pass_reason: full_pass.map(|reason| reason.to_string()),
 			pass_error,
 			pass_error_kind,
+			// Capped at the source already.
+			scan_gaps: scan_gaps.into_iter().map(Into::into).collect(),
+			scan_gaps_total: scan_gaps_total as u64,
 		}
 	}
 }

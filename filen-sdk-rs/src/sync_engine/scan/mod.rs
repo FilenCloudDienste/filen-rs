@@ -26,6 +26,8 @@
 //! real path is the one synced, whichever of the two the walk reaches first; the link is recorded in
 //! [`LocalScan::aliased_dirs`].
 
+// The paths that left a read incomplete.
+mod gaps;
 // How far a whole walk has got, and the events a pass reports it with.
 mod progress;
 
@@ -52,7 +54,11 @@ use filen_types::crypto::Blake3Hash;
 use unicode_normalization::{UnicodeNormalization, is_nfc};
 use uuid::Uuid;
 
-pub(crate) use self::progress::{WalkProgress, report_scan_progress};
+pub use self::gaps::{ScanGap, ScanGapCause};
+pub(crate) use self::{
+	gaps::ScanGaps,
+	progress::{WalkProgress, report_scan_progress},
+};
 use super::{
 	SyncMode,
 	baseline::{BaselineEntry, NodeKind},
@@ -339,6 +345,11 @@ pub(crate) struct LocalScan {
 	/// and reading that subtree as deleted would propagate it. A file row there is only the copy a
 	/// file link was synced as, and its deletion propagates like any other.
 	pub(crate) complete: bool,
+	/// The paths that made the scan incomplete, and why: every way an entry can leave it incomplete
+	/// names its path here, except a name collision, which refuses the pass with its own report. A
+	/// walk cut short, and a change-scoped pass whose narrowed read cannot stand for a whole one,
+	/// are incomplete with no path to name.
+	pub(crate) gaps: ScanGaps,
 	pub(crate) errors: Vec<ScanError>,
 	/// Paths whose NAME the remote would reject, mapped to the validator's own message. Reported
 	/// once at the TOP of a rejected subtree; the engine screens every action for such a path and
@@ -1086,6 +1097,7 @@ struct Window<'r, S> {
 	sink: S,
 	errors: Vec<ScanError>,
 	complete: bool,
+	gaps: ScanGaps,
 	invalid_names: BTreeMap<String, String>,
 }
 
@@ -1223,6 +1235,7 @@ impl<S: ScanSink> Window<'_, S> {
 			}
 			Err(source) => {
 				self.complete = false;
+				self.gaps.unreadable(&rel_path, &source);
 				record(
 					&mut self.errors,
 					self.root,
@@ -1264,6 +1277,7 @@ impl<S: ScanSink> Window<'_, S> {
 			}
 			Some(Err(source)) => {
 				self.complete = false;
+				self.gaps.unreadable(&rel_path, &source);
 				record(
 					&mut self.errors,
 					self.root,
@@ -1314,13 +1328,10 @@ impl<S: ScanSink> Window<'_, S> {
 		// A file synced as a link's copy is only that copy, and its deletion propagates like any
 		// other.
 		let unfollowable = unfollowable_symlink(&err);
-		if !unfollowable
+		let incomplete = !unfollowable
 			|| rows
 				.get(&rel_path)
-				.is_some_and(|entry| entry.kind == NodeKind::Dir)
-		{
-			self.complete = false;
-		}
+				.is_some_and(|entry| entry.kind == NodeKind::Dir);
 		let below_root = err.path().is_some_and(|path| path != root);
 		let source = match err {
 			WalkError::Loop { ancestor, .. } => {
@@ -1337,6 +1348,10 @@ impl<S: ScanSink> Window<'_, S> {
 			self.caught_mid_change(&rel_path, source);
 			return Ok(());
 		}
+		if incomplete {
+			self.complete = false;
+			self.gaps.unreadable(&rel_path, &source);
+		}
 		self.push(Listed::Error(ScanError::Io { rel_path, source }))?;
 		Ok(())
 	}
@@ -1344,6 +1359,7 @@ impl<S: ScanSink> Window<'_, S> {
 	/// The walk caught `rel_path` mid-change: the scan is partial, but nothing is reported.
 	fn caught_mid_change(&mut self, rel_path: &str, why: impl fmt::Display) {
 		self.complete = false;
+		self.gaps.note(rel_path, ScanGapCause::ChangedDuringScan);
 		tracing::debug!(
 			"local scan of {}: {rel_path:?} changed under the walk, leaving the scan partial: {why}",
 			self.root.display()
@@ -1460,6 +1476,7 @@ fn scan_local_watched<S: ScanSink>(
 			sink,
 			errors: Vec::new(),
 			complete: true,
+			gaps: ScanGaps::default(),
 			invalid_names: BTreeMap::new(),
 		};
 		let wait = |window: &mut Window<'_, S>| {
@@ -1608,10 +1625,10 @@ fn scan_local_watched<S: ScanSink>(
 				continue;
 			};
 			let Some(rel_path) = rel_path else {
+				let lossy_path = rel.to_string_lossy().into_owned();
 				window.complete = false;
-				window.push(Listed::Error(ScanError::NonUtf8Name {
-					lossy_path: rel.to_string_lossy().into_owned(),
-				}))?;
+				window.gaps.note(&lossy_path, ScanGapCause::NonUtf8Name);
+				window.push(Listed::Error(ScanError::NonUtf8Name { lossy_path }))?;
 				continue;
 			};
 
@@ -1729,6 +1746,7 @@ fn scan_local_watched<S: ScanSink>(
 		sink,
 		mut errors,
 		mut complete,
+		mut gaps,
 		invalid_names,
 		..
 	} = walked?;
@@ -1745,12 +1763,18 @@ fn scan_local_watched<S: ScanSink>(
 		// subtree walk's caller, `observe_local`, stats the pair root again and reports a removed
 		// volume there.
 		if !start.is_empty() && changed_under_walk(&source) {
+			gaps.note(start, ScanGapCause::ChangedDuringScan);
 			tracing::debug!(
 				"local scan of {}: {start:?} changed under the walk, leaving the scan partial: \
 				 {source}",
 				root.display()
 			);
 		} else {
+			// A root already gone when the walk began failed the walk's first read too, and is
+			// named once.
+			if !gaps.names(start) {
+				gaps.unreadable(start, &source);
+			}
 			record(
 				&mut errors,
 				root,
@@ -1766,6 +1790,7 @@ fn scan_local_watched<S: ScanSink>(
 	let scan = LocalScan {
 		nodes: sink.finish()?,
 		complete,
+		gaps,
 		errors,
 		invalid_names,
 		aliased_dirs,

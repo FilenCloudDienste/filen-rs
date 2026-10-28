@@ -109,4 +109,5 @@ pub use outcome::{
 	PlannedTransfer, RefuseReason, UnsyncablePath, UnsyncableReason,
 };
 pub use pause::{DEFAULT_CANCEL_AFTER, PauseMode, PauseOptions};
+pub use scan::{ScanGap, ScanGapCause};
 pub use watch::{WatchConfig, WatchHandle, WatchState, WatchStatus};

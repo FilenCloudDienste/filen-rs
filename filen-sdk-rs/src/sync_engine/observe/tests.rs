@@ -5,7 +5,10 @@ use super::super::{derive::from_baseline, side::NodesAt};
 use uuid::Uuid;
 
 use super::*;
-use crate::{alloc_meter, sync_engine::scan::UnrecordedRoot};
+use crate::{
+	alloc_meter,
+	sync_engine::{ScanGap, scan::UnrecordedRoot},
+};
 
 fn temp_root() -> std::path::PathBuf {
 	let dir = std::env::temp_dir().join(format!("filen_observe_test_{}", Uuid::new_v4()));
@@ -431,6 +434,7 @@ fn an_ancestor_replaced_by_a_file_leaves_the_observation_incomplete_and_unreport
 		siblings: BTreeMap::new(),
 		ignore_blocked: BTreeSet::new(),
 		complete: true,
+		gaps: ScanGaps::default(),
 		errors: Vec::new(),
 	};
 	let mut walked = BTreeSet::from(["a".to_owned()]);
@@ -478,6 +482,17 @@ fn a_permission_denial_is_missing_evidence_not_an_absence() {
 		out.observed
 	);
 	assert_eq!(out.errors.len(), 2, "{:?}", out.errors);
+	let denied = |rel_path: &str| ScanGap {
+		rel_path: rel_path.to_owned(),
+		cause: ScanGapCause::Unreadable {
+			kind: ErrorKind::PermissionDenied,
+		},
+	};
+	assert_eq!(
+		out.gaps.clone().into_parts(),
+		(vec![denied("locked/a.txt"), denied("locked/sub")], 2),
+		"each read the locked directory refused names its path"
+	);
 
 	fs::remove_dir_all(&root).ok();
 }

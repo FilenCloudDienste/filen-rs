@@ -106,7 +106,8 @@ impl DeleteGuard {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GuardReason {
 	/// The local scan did not complete, so apparent deletions may be phantom (an unmounted root,
-	/// an unreadable subtree). All deletions are held unconditionally.
+	/// an unreadable subtree). All deletions are held unconditionally. The pass's report names the
+	/// paths behind it in [`SyncReport::scan_gaps`](super::SyncReport::scan_gaps).
 	ScanIncomplete,
 	/// First sync of the pair (no pass of it has completed cleanly, see
 	/// [`PairRecord::first_pass_completed`](super::PairRecord::first_pass_completed), or it tracks

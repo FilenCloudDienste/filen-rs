@@ -53,7 +53,7 @@ use super::{
 	remote::{RemoteObserved, cache_ancestry, delta_uuids, observe_remote},
 	rows::Baseline,
 	scan::{
-		self, LocalScan, PairRoot, RuleFiles, ScanError, ScanRoot, WalkProgress,
+		self, LocalScan, PairRoot, RuleFiles, ScanError, ScanGaps, ScanRoot, WalkProgress,
 		report_scan_progress,
 	},
 	seed::{self, SeedCounts, Seeding},
@@ -1887,6 +1887,7 @@ impl SyncEngine {
 				facts: PairFacts::default(),
 				remote_converged: true,
 				scan_complete: true,
+				scan_gaps: ScanGaps::default(),
 			},
 		);
 	}
@@ -2232,6 +2233,8 @@ struct PairCarry {
 	remote_converged: bool,
 	/// Whether that read's local walk was complete — the other half of the same rule.
 	scan_complete: bool,
+	/// The paths that left it incomplete, which a pass that carries the judgement on reports.
+	scan_gaps: ScanGaps,
 }
 
 /// The sizes the local map a change-scoped pass assembles may have and still account for the rows
@@ -4889,6 +4892,7 @@ impl SyncEngine {
 			siblings,
 			mut errors,
 			complete,
+			gaps: observed_gaps,
 			..
 		} = observations;
 		// The per-directory collision check a whole walk makes with its `claimed` set: two names in
@@ -4919,9 +4923,17 @@ impl SyncEngine {
 			Some(changes) => !changes.full_pending(),
 			None => false,
 		};
+		// The paths behind the incompleteness this pass carries on, then this pass's own.
+		let mut gaps = if carried.scan_complete {
+			ScanGaps::default()
+		} else {
+			carried.scan_gaps
+		};
+		gaps.append(observed_gaps);
 		let local_scan = LocalScan {
 			nodes: mem::take(&mut derived.local),
 			complete: carried.scan_complete && complete && narrowed_read_is_whole,
+			gaps,
 			errors,
 			// A change-scoped pass reads these off `facts`, which is where the carried ones live.
 			// The scan struct is only the shape the rest of the pass expects its nodes in.
@@ -6345,6 +6357,7 @@ impl SyncEngine {
 				// what the last whole read found, which is what it planned with.
 				remote_converged: prep.remote_converged,
 				scan_complete: prep.local_scan.complete,
+				scan_gaps: prep.local_scan.gaps.clone(),
 			},
 		);
 	}
@@ -6745,6 +6758,8 @@ impl SyncEngine {
 		report.ignored = prep.ignored();
 		// Before the refusal check, so a refused pass still says what the scan could not read.
 		report.errors.extend(prep.local_scan.reported_errors());
+		// Capped at the source, so this copies a hundred paths at most.
+		(report.scan_gaps, report.scan_gaps_total) = prep.local_scan.gaps.clone().into_parts();
 		report.errors.append(&mut prep.remote_rule_errors);
 
 		if let Some(refusal) = refusal(&prep) {

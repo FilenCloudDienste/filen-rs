@@ -26,7 +26,7 @@ use crate::{
 		observe::observe_local,
 		plan::{PassHolds, RemoteView, SyncAction, place_remote_items},
 		remote::{RemoteObserved, delta_uuids, observe_remote},
-		scan::{LocalScan, PairRoot, RuleFiles, ScanRoot, scan_local},
+		scan::{LocalScan, PairRoot, RuleFiles, ScanGaps, ScanRoot, scan_local},
 	},
 };
 
@@ -1089,6 +1089,7 @@ fn a_dirty_path_with_no_observation_keeps_its_row() {
 		siblings: BTreeMap::new(),
 		ignore_blocked: BTreeSet::new(),
 		complete: true,
+		gaps: ScanGaps::default(),
 		errors: Vec::new(),
 	};
 
