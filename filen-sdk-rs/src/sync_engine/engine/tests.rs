@@ -5821,6 +5821,68 @@ async fn filen_syncs_trash_is_looked_for_once_per_engine() {
 	std::fs::remove_file(&path).ok();
 }
 
+/// A trash folder the first pass could not move is moved again on a later pass, once the pair has
+/// synced as well, and lands there once the cause is gone.
+#[tokio::test]
+async fn a_failed_move_of_filen_syncs_trash_is_retried_on_later_passes() {
+	let path = std::env::temp_dir().join(format!("filen_sync_legacy_trash_{}.db", Uuid::new_v4()));
+	let engine = SyncEngine::open(Arc::new(offline_client()), path.clone())
+		.await
+		.unwrap();
+	let root = tempfile::tempdir().unwrap();
+	let (pair, _) = locked(&engine.control)
+		.create_pair(
+			root.path().to_str().unwrap(),
+			Uuid::new_v4(),
+			SyncMode::TwoWay,
+		)
+		.unwrap();
+	let trash = root.path().join(scan::LEGACY_TRASH_DIR);
+	std::fs::create_dir(&trash).unwrap();
+	std::fs::write(trash.join("old.txt"), b"old").unwrap();
+	// A file where the bin goes: no bucket can be made under it.
+	let in_the_way = root.path().join(scan::QUARANTINE_DIR);
+	std::fs::write(&in_the_way, b"in the way").unwrap();
+
+	engine.migrate_legacy_trash(pair, PassGate::default()).await;
+	assert!(trash.exists());
+
+	// The first pass went on to sync something.
+	locked(&engine.control)
+		.upsert_entry(
+			pair,
+			&file_row("b.txt", Uuid::from_u128(5), Blake3Hash::from([1; 32])),
+		)
+		.unwrap();
+	engine.migrate_legacy_trash(pair, PassGate::default()).await;
+	assert!(trash.exists(), "the cause is still there");
+
+	std::fs::remove_file(&in_the_way).unwrap();
+	let before = Utc::now().date_naive();
+	engine.migrate_legacy_trash(pair, PassGate::default()).await;
+	let after = Utc::now().date_naive();
+
+	assert!(!trash.exists(), "the failed move was not retried");
+	let binned = [before, after]
+		.into_iter()
+		.map(|day| {
+			bucket(root.path(), day)
+				.join(scan::LEGACY_TRASH_DIR)
+				.join("old.txt")
+		})
+		.find(|binned| binned.exists())
+		.expect("the trash was binned under the day of the retry");
+	assert_eq!(std::fs::read(binned).unwrap(), b"old");
+	assert_eq!(
+		engine.legacy_trash_looked.lock().await.get(&pair),
+		Some(&Vec::new()),
+		"nothing is owed once the move landed"
+	);
+
+	drop(engine);
+	std::fs::remove_file(&path).ok();
+}
+
 /// Once the pair has a baseline row it has synced, and filen-sync's trash is not looked for: a
 /// folder of that name is left where it is (and still never synced).
 #[tokio::test]

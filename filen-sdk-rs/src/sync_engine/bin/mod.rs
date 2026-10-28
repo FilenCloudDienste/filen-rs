@@ -333,8 +333,8 @@ fn adopt(root: &Path, path: &Path, name: &OsStr, today: NaiveDate) -> io::Result
 	fs::rename(path, dest)
 }
 
-/// What one [`migrate_legacy_trash`] did.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+/// What one [`migrate_legacy_trash`] or [`retry_legacy_trash`] did.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(super) struct MigrateSummary {
 	/// filen-sync trash folders moved into the bin.
 	pub(super) moved: usize,
@@ -343,6 +343,10 @@ pub(super) struct MigrateSummary {
 	pub(super) errors: usize,
 	/// Whether `keep_going` stopped the migration before it had walked and moved everything.
 	pub(super) stopped: bool,
+	/// The root-relative paths of the trash folders found and still in place: each one that could
+	/// not be moved, and each one not tried once `keep_going` stopped the moves. For
+	/// [`retry_legacy_trash`] to try again.
+	pub(super) unmoved: Vec<String>,
 }
 
 /// Move every entry named `.filen.trash.local` (see [`is_legacy_trash`]) in the local tree under
@@ -375,10 +379,41 @@ pub(super) fn migrate_legacy_trash(
 ) -> MigrateSummary {
 	let mut summary = MigrateSummary::default();
 	let found = find_legacy_trash(root, pair_root, &keep_going, &mut summary);
-	for rel_path in found {
+	move_legacy_trash(root, found, day, &keep_going, &mut summary);
+	summary
+}
+
+/// Move the trash folders an earlier [`migrate_legacy_trash`] left in place
+/// ([`MigrateSummary::unmoved`]) into the bin under `day`'s bucket, as it would have, without
+/// walking the tree again. A folder gone since is dropped; one that still cannot be moved, or is
+/// not tried once `keep_going` says to stop, is in the summary's `unmoved` again.
+pub(super) fn retry_legacy_trash(
+	root: &Path,
+	unmoved: Vec<String>,
+	day: NaiveDate,
+	keep_going: impl Fn() -> bool,
+) -> MigrateSummary {
+	let mut summary = MigrateSummary::default();
+	move_legacy_trash(root, unmoved, day, &keep_going, &mut summary);
+	summary
+}
+
+/// Move each of the trash folders `found` into the bin under `day`'s bucket (see
+/// [`migrate_legacy_trash`]), counting into `summary` and listing what stays in place there.
+fn move_legacy_trash(
+	root: &Path,
+	found: Vec<String>,
+	day: NaiveDate,
+	keep_going: &impl Fn() -> bool,
+	summary: &mut MigrateSummary,
+) {
+	let mut found = found.into_iter();
+	while let Some(rel_path) = found.next() {
 		if !keep_going() {
 			summary.stopped = true;
-			break;
+			summary.unmoved.push(rel_path);
+			summary.unmoved.extend(found);
+			return;
 		}
 		match quarantine_local(root, &rel_path, day) {
 			Ok(Some(_)) => summary.moved += 1,
@@ -390,10 +425,10 @@ pub(super) fn migrate_legacy_trash(
 					 sync bin: {e}"
 				);
 				summary.errors += 1;
+				summary.unmoved.push(rel_path);
 			}
 		}
 	}
-	summary
 }
 
 /// The root-relative, `/`-joined paths of every `.filen.trash.local` entry under `root`, for

@@ -5,7 +5,7 @@ use tempfile::TempDir;
 
 use super::{
 	DATED_MARKER, MigrateSummary, PruneSummary, migrate_legacy_trash, parse_bucket, prune_bin,
-	quarantine_local,
+	quarantine_local, retry_legacy_trash,
 	test_support::{dated_bin, day},
 };
 use crate::sync_engine::scan::{ACCOUNT_DATA_DIR, LEGACY_TRASH_DIR, PairRoot, QUARANTINE_DIR};
@@ -539,6 +539,7 @@ fn filen_syncs_trash_folders_move_into_the_days_bucket_at_their_tree_positions()
 			moved: 2,
 			errors: 0,
 			stopped: false,
+			unmoved: Vec::new(),
 		}
 	);
 	let bucket = root.path().join(QUARANTINE_DIR).join("2026-10-26");
@@ -696,8 +697,89 @@ fn a_migration_told_to_stop_leaves_the_rest_in_place() {
 			moved: 0,
 			errors: 0,
 			stopped: true,
+			unmoved: Vec::new(),
 		}
 	);
 	assert!(root.path().join(LEGACY_TRASH_DIR).is_dir());
 	assert!(!root.path().join(QUARANTINE_DIR).exists());
+}
+
+/// A trash folder that cannot be moved stays where it is and is listed for a retry, which moves it
+/// once the cause is gone, without walking the tree again.
+#[test]
+fn a_trash_folder_that_could_not_be_moved_is_listed_and_moved_by_a_retry() {
+	let root = root();
+	let trash = root.path().join(LEGACY_TRASH_DIR);
+	fs::create_dir(&trash).unwrap();
+	fs::write(trash.join("old.txt"), b"old").unwrap();
+	// A file where the bin goes: no bucket can be made under it.
+	fs::write(root.path().join(QUARANTINE_DIR), b"in the way").unwrap();
+
+	let migrated = migrate_legacy_trash(root.path(), PairRoot::Directory, day(), || true);
+
+	assert_eq!(
+		migrated,
+		MigrateSummary {
+			moved: 0,
+			errors: 1,
+			stopped: false,
+			unmoved: vec![LEGACY_TRASH_DIR.to_string()],
+		}
+	);
+	assert!(trash.is_dir());
+
+	fs::remove_file(root.path().join(QUARANTINE_DIR)).unwrap();
+	assert_eq!(
+		retry_legacy_trash(root.path(), migrated.unmoved, day(), || true),
+		MigrateSummary {
+			moved: 1,
+			errors: 0,
+			stopped: false,
+			unmoved: Vec::new(),
+		}
+	);
+	assert!(!trash.exists());
+	assert_eq!(
+		fs::read(
+			root.path()
+				.join(QUARANTINE_DIR)
+				.join("2026-10-26")
+				.join(LEGACY_TRASH_DIR)
+				.join("old.txt")
+		)
+		.unwrap(),
+		b"old"
+	);
+}
+
+/// A retry drops a folder that is gone since, and keeps every folder it was stopped before trying.
+#[test]
+fn a_retry_drops_a_gone_folder_and_keeps_the_ones_it_did_not_try() {
+	let root = root();
+	fs::create_dir(root.path().join(LEGACY_TRASH_DIR)).unwrap();
+
+	assert_eq!(
+		retry_legacy_trash(
+			root.path(),
+			vec![format!("gone/{LEGACY_TRASH_DIR}")],
+			day(),
+			|| true
+		),
+		MigrateSummary::default()
+	);
+	assert_eq!(
+		retry_legacy_trash(
+			root.path(),
+			vec![LEGACY_TRASH_DIR.to_string()],
+			day(),
+			|| false
+		),
+		MigrateSummary {
+			moved: 0,
+			errors: 0,
+			stopped: true,
+			unmoved: vec![LEGACY_TRASH_DIR.to_string()],
+		}
+	);
+	assert!(root.path().join(LEGACY_TRASH_DIR).is_dir());
 }

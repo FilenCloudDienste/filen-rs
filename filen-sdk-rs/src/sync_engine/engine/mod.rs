@@ -1699,7 +1699,12 @@ pub struct SyncEngine {
 	/// or cancelled again and again does not walk its whole tree once more on each attempt. In
 	/// memory only, so an engine opened later looks again while the pair still has no baseline row.
 	/// Bounded by the pair count; an entry goes with its pair.
-	legacy_trash_looked: Mutex<HashSet<PairId>>,
+	///
+	/// Each with the trash folders the walk found that are still in place (a move that failed),
+	/// which every later pass of this engine moves again, without a walk and whether or not the
+	/// pair has rows by then, until the move lands or the folder is gone. Empty once nothing is
+	/// owed.
+	legacy_trash_looked: Mutex<HashMap<PairId, Vec<String>>>,
 	/// Bumped once [`set_user_ignore`](SyncEngine::set_user_ignore) has COMMITTED new patterns, so
 	/// every running watch loop runs a pass with them instead of waiting out its safety net. A
 	/// [`watch`](tokio::sync::watch) channel rather than a [`Notify`](tokio::sync::Notify): every
@@ -3149,7 +3154,7 @@ impl SyncEngine {
 			changes: Mutex::new(HashMap::new()),
 			carried: Mutex::new(HashMap::new()),
 			bin_pruned: Mutex::new(HashMap::new()),
-			legacy_trash_looked: Mutex::new(HashSet::new()),
+			legacy_trash_looked: Mutex::new(HashMap::new()),
 			user_ignore_changed: tokio::sync::watch::channel(0).0,
 			stages: AtomicU64::new(0),
 			_lock: lock,
@@ -6145,9 +6150,13 @@ impl SyncEngine {
 	/// engine (see [`legacy_trash_looked`](Self::legacy_trash_looked)): a first pass refused or
 	/// cancelled after it does not walk the tree again. An engine opened later walks it again while
 	/// the pair has no row, as one does for a pair whose rows have all gone again, which moves only
-	/// what has been given filen-sync's name since.
+	/// what has been given filen-sync's name since. A folder the walk found but could not move is
+	/// moved again on each later pass of this engine, until the move lands or the folder is gone.
 	///
-	/// Before the pass has read anything, so a pass refused afterwards has still migrated. The walk
+	/// Before the pass has read anything, so a pass refused afterwards has still migrated: the
+	/// folders are never synced, so no refusal is about them, a moved one is recoverable from the
+	/// bin, and the read can write seeded rows, after which [`has_synced`] would never let a later
+	/// pass walk the tree for them. The walk
 	/// stops between directories and moves once `gate` says the pass is cancelled or its pair
 	/// removed, never at a suspension: the read after it runs on through one and can write rows,
 	/// after which no pass would look again (see [`PassGate::not_cancelled`]). A cancelled pass
@@ -6155,9 +6164,11 @@ impl SyncEngine {
 	///
 	/// Housekeeping, so nothing here fails the pass: what is left behind is never synced anyway.
 	async fn migrate_legacy_trash(&self, pair: PairId, gate: PassGate) {
-		if self.legacy_trash_looked.lock().await.contains(&pair) {
-			return;
-		}
+		// An owned copy for the blocking thread: the few folders a move failed for, if any.
+		let owed = match self.legacy_trash_looked.lock().await.get(&pair) {
+			Some(owed) if owed.is_empty() => return,
+			owed => owed.cloned(),
+		};
 		let record = locked(&self.control).pair(pair);
 		let (local_root, pair_root) = match record {
 			Ok(Some(record)) => (
@@ -6174,29 +6185,41 @@ impl SyncEngine {
 				return;
 			}
 		};
-		let synced = match self.pair_store(pair).await {
-			Ok(store) => off_store(&store, move |store| has_synced(store, pair))
-				.await
-				.and_then(|synced| synced),
-			Err(e) => Err(e),
-		};
-		match synced {
-			Ok(false) => {}
-			Ok(true) => {
-				self.legacy_trash_looked.lock().await.insert(pair);
-				return;
-			}
-			Err(e) => {
-				tracing::warn!(
-					"sync_once[pair {pair}]: filen-sync's trash was not looked for: {e}"
-				);
-				return;
+		// A retry moves what the walk left whether or not the pair has synced since: those folders
+		// are filen-sync's, found while it had not.
+		let retrying = owed.is_some();
+		if !retrying {
+			let synced = match self.pair_store(pair).await {
+				Ok(store) => off_store(&store, move |store| has_synced(store, pair))
+					.await
+					.and_then(|synced| synced),
+				Err(e) => Err(e),
+			};
+			match synced {
+				Ok(false) => {}
+				Ok(true) => {
+					self.legacy_trash_looked
+						.lock()
+						.await
+						.insert(pair, Vec::new());
+					return;
+				}
+				Err(e) => {
+					tracing::warn!(
+						"sync_once[pair {pair}]: filen-sync's trash was not looked for: {e}"
+					);
+					return;
+				}
 			}
 		}
 		// One day for the whole migration, so everything it moves lands in one bucket.
 		let day = Utc::now().date_naive();
 		let summary = match off_runtime("moving filen-sync's trash into the bin", move || {
-			bin::migrate_legacy_trash(&local_root, pair_root, day, || gate.not_cancelled())
+			let keep_going = || gate.not_cancelled();
+			match owed {
+				Some(owed) => bin::retry_legacy_trash(&local_root, owed, day, keep_going),
+				None => bin::migrate_legacy_trash(&local_root, pair_root, day, keep_going),
+			}
 		})
 		.await
 		{
@@ -6210,17 +6233,22 @@ impl SyncEngine {
 			moved,
 			errors,
 			stopped,
+			unmoved,
 		} = summary;
-		if !stopped {
-			self.legacy_trash_looked.lock().await.insert(pair);
+		let left = unmoved.len();
+		// A walk cut short is taken up whole by the next pass that still has no row; a retry, and a
+		// walk that ran to its end, leave the next pass exactly the folders still in place.
+		if retrying || !stopped {
+			self.legacy_trash_looked.lock().await.insert(pair, unmoved);
 		}
 		if moved > 0 || errors > 0 || stopped {
 			tracing::info!(
 				"sync_once[pair {pair}]: moved {moved} filen-sync trash folder(s) into the sync \
-				 bin's bucket for {day}, {errors} error(s){}",
+				 bin's bucket for {day}, {errors} error(s), {left} left to move on a later \
+				 pass{}",
 				if stopped {
 					"; stopped by a cancel or the pair's removal (after a cancel, the rest moves on \
-					 the next pass that still has no baseline row)"
+					 a later pass)"
 				} else {
 					""
 				},
