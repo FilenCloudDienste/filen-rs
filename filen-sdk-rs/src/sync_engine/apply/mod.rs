@@ -5,7 +5,8 @@
 //! Each action is best-effort: a failure is recorded in the [`SyncReport`] and the pass continues,
 //! since the actions are independent and the next pass re-plans from truth. The exception is a
 //! failure no transfer to that side can get past — a full local disk or a full account — which
-//! stops the pass starting any more of those (see [`SyncReport::halted`]). Local deletions move
+//! stops the pass starting any more of those, and a remote out of reach or refusing the session,
+//! which stops it starting any more remote actions (see [`SyncReport::halted`]). Local deletions move
 //! to the pair's quarantine dir (recoverable for 30 days); remote deletions go to Filen trash. The
 //! local mtime written to the baseline after a download is read back from disk (not the value we
 //! asked for) so the scanner's fast-path stays stable.
@@ -27,6 +28,7 @@ use filen_types::{
 	fs::StableUuid,
 };
 use futures::{StreamExt, future::join_all, stream::FuturesUnordered};
+use reqwest::StatusCode;
 use uuid::Uuid;
 
 use super::{
@@ -56,7 +58,7 @@ use super::{
 use crate::{
 	ErrorKind,
 	api::v3::bulk::trash,
-	auth::Client,
+	auth::{Client, http::is_connection_lost},
 	cache::{SearchResult, hydrate_cached_items_at},
 	connect::ParentTargets,
 	fs::{
@@ -121,8 +123,8 @@ pub struct SyncReport {
 	/// can never leak onto a different set of deletions, nor onto the same ones held for a reason
 	/// the caller was never shown.
 	pub deletion_token: Option<String>,
-	/// Per-action failures (the pass continues past them; one that ran out of room also holds back
-	/// the transfers behind it, see [`halted`](Self::halted)).
+	/// Per-action failures (the pass continues past them; one that ran out of room or found the
+	/// remote out of reach also holds back the actions behind it, see [`halted`](Self::halted)).
 	pub errors: Vec<String>,
 	/// Paths whose local copy this pass moved into the pair's quarantine bin to clear the way for a
 	/// write: a remote-wins download over a copy the baseline cannot vouch for, and a move onto an
@@ -175,19 +177,25 @@ pub struct SyncReport {
 	/// again (see `next_pass_scope`). Distinct from [`deferred_paths`](Self::deferred_paths),
 	/// which counts what the reconcile itself left alone, whether or not it planned anything there.
 	pub(super) dropped_actions: usize,
-	/// Set when a side ran out of room during the pass: the local disk or the account, whichever
-	/// was found full first. The action that ran into it — and any transfer already running that
-	/// did too — is in [`errors`](Self::errors) but counts against no path's failure streak, since
-	/// the path itself is not what is broken. Each side found full has its own line there, so a
-	/// pass that fills both says so.
+	/// Set when a side ran out of room during the pass — the local disk or the account — or the
+	/// remote could not be reached or refused the session, whichever was found first. The action
+	/// that ran into it — and any action already running that did too — is in
+	/// [`errors`](Self::errors) but counts against no path's failure streak, since the path itself
+	/// is not what is broken (a remote outage counts only spaced out, see
+	/// [`HaltReason::RemoteUnavailable`] and the engine's `TRANSIENT_FAILURE_SPACING`). Each
+	/// condition found has its own line there, so a pass that fills both sides says so.
 	///
 	/// From then on the pass starts no further transfer that WRITES to a full side (see
 	/// [`HaltReason::held_transfers`]): no upload once the account is full, no download once the
 	/// disk is. Everything else still runs — the other direction's transfers, directory creates,
 	/// moves and deletions — so a full account does not stop a two-way pair pulling the other
 	/// devices' changes, and deletions that free room are not held behind the transfers that need
-	/// it. [`interrupted`](Self::interrupted) does not count the held transfers: the next pass
-	/// re-plans them. A watch treats such a pass as a failed one and backs off before the next.
+	/// it. A remote out of reach or refusing the session holds back every action that touches the
+	/// remote — transfers both ways, remote directory creates, moves and trashes, and everything
+	/// under a remote directory move it held — while the local-only ones (local directory creates,
+	/// moves and deletions, baseline adoptions) still run. [`interrupted`](Self::interrupted) does
+	/// not count the held actions: the next pass re-plans them. A watch treats such a pass as a
+	/// failed one and backs off before the next.
 	pub halted: Option<HaltReason>,
 	/// Why this pass read both sides WHOLE rather than only what changed since the last one, or
 	/// `None` when its changelists described every change (see [`FullPassReason`]).
@@ -211,6 +219,12 @@ pub struct SyncReport {
 	/// a file another device has since replaced, which only the next pass can re-plan (see
 	/// `note_action_failed`).
 	pub(super) failed_paths: Vec<(String, String)>,
+	/// The `(rel_path, error)` of every action that failed because the remote was out of reach or
+	/// refused the session ([`HaltReason::is_remote_outage`]). Not in
+	/// [`failed_paths`](Self::failed_paths): the engine counts these against their paths' streaks
+	/// only spaced out (see its `TRANSIENT_FAILURE_SPACING`), so an outage does not block the paths
+	/// it happened to catch, while a path the server refuses with a 5xx on every pass still is.
+	pub(super) transient_failures: Vec<(String, String)>,
 }
 
 impl SyncReport {
@@ -233,9 +247,9 @@ impl SyncReport {
 	///
 	/// A pass that could not take the drive lock outranks the rest, since it applied nothing: its
 	/// line is the entry in [`errors`](Self::errors) naming the lock's own answer. Then a side that
-	/// ran out of room ([`halted`](Self::halted)), then a record of work done that could not be
-	/// written or a staged plan that could not be read. Per-path failures alone do not fail a pass;
-	/// they stay in `errors`.
+	/// ran out of room or a remote out of reach or refusing the session ([`halted`](Self::halted)),
+	/// then a record of work done that could not be written or a staged plan that could not be
+	/// read. Per-path failures alone do not fail a pass; they stay in `errors`.
 	pub fn pass_error(&self) -> Option<String> {
 		self.pass_failure().map(|(line, _)| line)
 	}
@@ -771,7 +785,7 @@ pub(super) async fn apply(
 		if !ctx.gate.wait_to_start().await {
 			return note_interrupted(report, total - applied, observer);
 		}
-		if !failed.skips(action, report, observer) {
+		if !failed.skips(action, report, observer) && !holds_serial(&full, &mut failed, action) {
 			match lease.prepare(&ctx, action, releasable).await {
 				Some(Ok(())) => {}
 				Some(Err(error)) => {
@@ -838,8 +852,8 @@ pub(super) async fn apply(
 	}
 
 	// The transfers under a directory whose move just failed are failed before any transfer starts,
-	// and passed over below.
-	if !failed.dirs.is_empty() {
+	// those under one that was held are held, and both are passed over below.
+	if !failed.dirs.is_empty() || !failed.held.is_empty() {
 		let swept = plan.sweep(Some(Run::Transfers), |entry| {
 			if failed.skips(&entry.action, report, observer) {
 				applied += 1;
@@ -869,10 +883,14 @@ pub(super) async fn apply(
 			{
 				let (action, releasable) = (&staged.entry.action, staged.releasable);
 				// Once an action finds a side full, the transfers already running finish, and the ones
-				// not started yet that write to that side never start (they record nothing). Held back
-				// for want of room: carried out as far as this pass can, owed to no pause.
+				// not started yet that write to that side never start (they record nothing); once one
+				// finds the remote out of reach, none not started yet does. Held back for want of room
+				// or of a remote: carried out as far as this pass can, owed to no pause.
 				if full.holds(action) {
-					tracing::debug!("apply: {} held, its side is full", action.describe());
+					tracing::debug!(
+						"apply: {} held, its side is full or the remote is out of reach",
+						action.describe()
+					);
 					unless_unread(plan.next_in(&ctx, Run::Transfers).await, report);
 					applied += 1;
 					continue;
@@ -1001,7 +1019,7 @@ pub(super) async fn apply(
 		if !ctx.gate.wait_to_start().await {
 			return note_interrupted(report, total - applied, observer);
 		}
-		if !failed.skips(action, report, observer) {
+		if !failed.skips(action, report, observer) && !holds_serial(&full, &mut failed, action) {
 			match lease.prepare(&ctx, action, releasable).await {
 				Some(Ok(())) => {}
 				Some(Err(error)) => {
@@ -1269,34 +1287,52 @@ fn hold_spent(budget: &LockBudget, since: Instant, writes: usize, now: Instant) 
 	now.saturating_duration_since(since) >= budget.hold || writes >= budget.batch
 }
 
-/// Where the directory moves that failed this pass were headed: nothing under those paths is
-/// attempted. As many as moves failed, which the fold makes one per moved subtree.
+/// Where the directory moves that failed this pass, or that it held back, were headed: nothing
+/// under those paths is attempted. As many as moves failed or were held, which the fold makes one
+/// per moved subtree.
 #[derive(Debug, Default)]
 struct FailedDirMoves {
 	dirs: Vec<String>,
+	/// The moves the pass held back, or that failed on the condition that halted it (see
+	/// [`SyncReport::halted`]): what is under them is held too, silently and counting against no
+	/// streak, and the next pass re-plans it.
+	held: Vec<String>,
 }
 
 impl FailedDirMoves {
-	/// The directory whose move failed this pass at or above either end of `action`: the plan names
-	/// that subtree by a path neither side carries.
+	/// The directory whose move failed or was held this pass at or above either end of `action`:
+	/// the plan names that subtree by a path neither side carries.
 	fn holds_back(&self, action: &SyncAction) -> Option<&str> {
+		Self::above(&self.dirs, action).or_else(|| Self::above(&self.held, action))
+	}
+
+	/// The directory of `dirs` at or above either end of `action`.
+	fn above<'d>(dirs: &'d [String], action: &SyncAction) -> Option<&'d str> {
 		let (from, to) = action.endpoints();
-		self.dirs.iter().map(String::as_str).find(|dir| {
+		dirs.iter().map(String::as_str).find(|dir| {
 			[from, to]
 				.into_iter()
 				.any(|path| path == *dir || is_under(path, dir))
 		})
 	}
 
-	/// Skip `action` when a directory move that failed this pass holds it back (see
-	/// [`holds_back`](Self::holds_back)), recording it as a failure of its own.
+	/// Skip `action` when a directory move that failed or was held this pass holds it back (see
+	/// [`holds_back`](Self::holds_back)): under a failed one recording it as a failure of its own,
+	/// under a held one holding it as well.
 	fn skips(
 		&self,
 		action: &SyncAction,
 		report: &mut SyncReport,
 		observer: &mut (dyn FnMut(SyncEvent) + Send),
 	) -> bool {
-		let Some(dir) = self.holds_back(action) else {
+		if let Some(dir) = Self::above(&self.held, action) {
+			tracing::debug!(
+				"apply: {} held, under the held move of {dir:?}",
+				action.describe()
+			);
+			return true;
+		}
+		let Some(dir) = Self::above(&self.dirs, action) else {
 			return false;
 		};
 		let error = internal_owned(format!(
@@ -1810,6 +1846,33 @@ async fn dir_or_fetch(
 	})
 }
 
+/// Whether an action touches the remote at all: a remote write, or a download.
+fn touches_remote(action: &SyncAction) -> bool {
+	mutates_remote(action) || matches!(action, SyncAction::DownloadFile { .. })
+}
+
+/// Whether `full` holds back the serial action `action` (see [`FullSides::holds`]). A remote
+/// directory move it holds keeps everything under its destination from running too, as one that
+/// failed does: the plan names that subtree by a path the remote does not carry yet.
+fn holds_serial(full: &FullSides, failed: &mut FailedDirMoves, action: &SyncAction) -> bool {
+	if !full.holds(action) {
+		return false;
+	}
+	tracing::debug!(
+		"apply: {} held, the remote is out of reach",
+		action.describe()
+	);
+	if let SyncAction::MoveRemote {
+		to_path,
+		kind: NodeKind::Dir,
+		..
+	} = action
+	{
+		failed.held.push(to_path.clone());
+	}
+	true
+}
+
 /// Whether an action writes to the remote (so the pass must hold the drive-write lock).
 fn mutates_remote(action: &SyncAction) -> bool {
 	matches!(
@@ -1853,7 +1916,13 @@ async fn apply_serial(
 		..
 	} = action
 	{
-		failed.dirs.push(to_path.clone());
+		// A move that halted the pass is the pass's failure, not the subtree's: what is under it is
+		// held, as everything after it that the halt stops is, and counts against no streak.
+		if pass_halt(&error).is_some() {
+			failed.held.push(to_path.clone());
+		} else {
+			failed.dirs.push(to_path.clone());
+		}
 	}
 	note_action_failed(action, &error, full, report, observer);
 }
@@ -2567,10 +2636,12 @@ fn note_written(plan: &PagedPlan, action: &SyncAction, report: &mut SyncReport) 
 /// per-path failure counter consumes, so a path that fails every pass is eventually reported as
 /// unsyncable instead of retried forever.
 ///
-/// A failure that says a side has no room left (see [`pass_halt`]) is not the path's fault and
-/// counts against no streak: it sets [`halted`](SyncReport::halted) instead (if nothing did yet),
-/// with one line per side saying so, and is returned so the caller holds back the transfers that
-/// write there.
+/// A failure that says a side has no room left, or that the remote is out of reach or refuses the
+/// session (see [`pass_halt`]), is not the path's fault: it sets [`halted`](SyncReport::halted)
+/// instead (if nothing did yet), with one line per condition saying so, and is returned so the
+/// caller holds back the actions it stops. A full side counts against no streak; a remote outage
+/// goes to [`transient_failures`](SyncReport::transient_failures), which the engine counts only
+/// spaced out.
 fn note_failure(
 	report: &mut SyncReport,
 	rel_path: &str,
@@ -2586,6 +2657,11 @@ fn note_failure(
 			.push((rel_path.to_string(), error.to_string()));
 		return None;
 	};
+	if reason.is_remote_outage() {
+		report
+			.transient_failures
+			.push((rel_path.to_string(), error.to_string()));
+	}
 	let line = reason.held_line();
 	if !report.errors.contains(&line) {
 		report.errors.push(line);
@@ -2641,12 +2717,15 @@ fn admits_more(report: &SyncReport) -> bool {
 	report.store_failed.is_none()
 }
 
-/// The sides of a pass found full so far, read by the transfers as they start. Atomics, because
-/// those run concurrently while the apply loop records their failures.
+/// The sides of a pass found full so far, and whether the remote was found out of reach, read by
+/// the actions as they start. Atomics, because the transfers run concurrently while the apply loop
+/// records their failures.
 #[derive(Default)]
 struct FullSides {
 	local: AtomicBool,
 	remote: AtomicBool,
+	/// The remote could not be reached or refused the session ([`HaltReason::is_remote_outage`]).
+	unreachable: AtomicBool,
 }
 
 impl FullSides {
@@ -2654,13 +2733,18 @@ impl FullSides {
 		match reason {
 			HaltReason::LocalStorageFull => &self.local,
 			HaltReason::RemoteStorageFull => &self.remote,
+			HaltReason::RemoteUnavailable | HaltReason::Unauthenticated => &self.unreachable,
 		}
 		.store(true, Ordering::Relaxed);
 	}
 
-	/// Whether `action` writes to a side found full, and so must not start: an upload once the
-	/// account is full, a download once the local disk is.
+	/// Whether `action` must not start: it writes to a side found full (an upload once the account
+	/// is full, a download once the local disk is), or it touches the remote once the remote was
+	/// found out of reach.
 	fn holds(&self, action: &SyncAction) -> bool {
+		if touches_remote(action) && self.unreachable.load(Ordering::Relaxed) {
+			return true;
+		}
 		match action {
 			SyncAction::UploadFile { .. } => self.remote.load(Ordering::Relaxed),
 			SyncAction::DownloadFile { .. } => self.local.load(Ordering::Relaxed),
@@ -2669,21 +2753,23 @@ impl FullSides {
 	}
 }
 
-/// Whether `error` means a side of this pass has no room left: the local disk, or the account. Looked for along the whole error chain, including inside an `io::Error` wrapping
-/// another error — which is how the upload writer hands on a server refusal.
+/// Whether `error` stops the pass rather than failing its own path, and why: a side with no room
+/// left (the local disk, or the account), or a remote out of reach or refusing the session (see
+/// [`remote_outage`]). Looked for along the whole error chain, including inside an `io::Error`
+/// wrapping another error — which is how the upload writer hands on a server refusal. A full side
+/// found anywhere in the chain wins over an outage found above it.
 fn pass_halt(error: &crate::Error) -> Option<HaltReason> {
+	let mut outage = None;
 	let mut next: Option<&(dyn std::error::Error + 'static)> = Some(error);
 	while let Some(current) = next {
 		if current
 			.downcast_ref::<crate::Error>()
-			.is_some_and(|sdk| sdk.kind() == crate::ErrorKind::MaxStorageReached)
-			|| matches!(
-				current.downcast_ref::<filen_types::error::ResponseError>(),
-				Some(filen_types::error::ResponseError::ApiError { code: Some(code), .. })
-					if code == "max_storage_reached"
-			) {
+			.is_some_and(|sdk| sdk.kind() == ErrorKind::MaxStorageReached)
+			|| api_code(current) == Some("max_storage_reached")
+		{
 			return Some(HaltReason::RemoteStorageFull);
 		}
+		outage = outage.or_else(|| remote_outage(current));
 		next = match current.downcast_ref::<std::io::Error>() {
 			Some(io)
 				if matches!(
@@ -2701,7 +2787,54 @@ fn pass_halt(error: &crate::Error) -> Option<HaltReason> {
 			None => current.source(),
 		};
 	}
-	None
+	outage
+}
+
+/// The code of the server's refusal `error` is, if it is one.
+fn api_code<'e>(error: &'e (dyn std::error::Error + 'static)) -> Option<&'e str> {
+	match error.downcast_ref::<filen_types::error::ResponseError>() {
+		Some(filen_types::error::ResponseError::ApiError {
+			code: Some(code), ..
+		}) => Some(code.as_str()),
+		_ => None,
+	}
+}
+
+/// Whether one link of an error chain says the remote is out of reach or refuses the session —
+/// a condition of the whole pass that the next one may find gone — rather than anything about the
+/// request's own path:
+///
+/// - [`HaltReason::Unauthenticated`]: an SDK error of kind [`ErrorKind::Unauthenticated`]
+///   (the server does not know the API key, `api_key_not_found`), that code on its own, or an
+///   HTTP 401.
+/// - [`HaltReason::RemoteUnavailable`]: an HTTP 5xx, 408 or 429 the retries could not get past,
+///   or a transport error with no response at all — a connect that failed (refused, unresolvable,
+///   timed out), a request that timed out, or a connection that died under the request
+///   ([`is_connection_lost`]).
+///
+/// Only the HTTP client's own error decides the second: an IO error on its own is the local disk's
+/// as often as the network's, and a request error that is neither of those (a body that could not
+/// be read from a local file, a malformed request) is the path's. Every other status — 404, 403,
+/// 400 and the like — and every server refusal by code other than the session's is the path's
+/// too.
+fn remote_outage(link: &(dyn std::error::Error + 'static)) -> Option<HaltReason> {
+	if link
+		.downcast_ref::<crate::Error>()
+		.is_some_and(|sdk| sdk.kind() == ErrorKind::Unauthenticated)
+		|| api_code(link) == Some("api_key_not_found")
+	{
+		return Some(HaltReason::Unauthenticated);
+	}
+	let transport = link.downcast_ref::<reqwest::Error>()?;
+	match transport.status() {
+		Some(StatusCode::UNAUTHORIZED) => Some(HaltReason::Unauthenticated),
+		Some(status) => (status.is_server_error()
+			|| status == StatusCode::REQUEST_TIMEOUT
+			|| status == StatusCode::TOO_MANY_REQUESTS)
+			.then_some(HaltReason::RemoteUnavailable),
+		None => (transport.is_connect() || transport.is_timeout() || is_connection_lost(transport))
+			.then_some(HaltReason::RemoteUnavailable),
+	}
 }
 
 /// Whether one transfer ran at all — the pass can be cancelled before it starts, or while its

@@ -2147,6 +2147,31 @@ impl BaselineStore {
 		Ok(())
 	}
 
+	/// Count one failed attempt at `rel_path`, made at `at` (unix millis), as
+	/// [`record_failure`](Self::record_failure) does — but only when the streak's last failure is
+	/// at least `spacing` (millis) older, or there is no streak yet. A failure inside the window
+	/// changes nothing, not even the remembered error; one dated before the last (the clock went
+	/// back) is inside it.
+	pub(crate) fn record_spaced_failure(
+		&self,
+		pair: PairId,
+		rel_path: &str,
+		error: &str,
+		at: i64,
+		spacing: i64,
+	) -> rusqlite::Result<()> {
+		self.conn.execute(
+			"INSERT INTO path_failures (pair_id, rel_path, attempts, last_error, last_failure_at)
+			 VALUES (?1, ?2, 1, ?3, ?4)
+			 ON CONFLICT (pair_id, rel_path)
+			 DO UPDATE SET attempts = attempts + 1, last_error = excluded.last_error,
+			 last_failure_at = excluded.last_failure_at
+			 WHERE path_failures.last_failure_at <= excluded.last_failure_at - ?5",
+			params![pair, rel_path, error, at, spacing],
+		)?;
+		Ok(())
+	}
+
 	/// Forget `rel_path`'s failure streak — it succeeded, or the caller asked for a retry.
 	pub(crate) fn clear_failure(&self, pair: PairId, rel_path: &str) -> rusqlite::Result<()> {
 		self.clear_failures(pair, std::slice::from_ref(&rel_path))

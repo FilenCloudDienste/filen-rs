@@ -1,13 +1,13 @@
 use std::{borrow::Cow, sync::Mutex, time::Duration};
 
 use filen_types::crypto::Blake3Hash;
-use tokio::runtime::Runtime;
+use tokio::{io::AsyncWriteExt, net::TcpListener, runtime::Runtime};
 use uuid::Uuid;
 
 use super::*;
 use crate::{
 	ErrorKind, alloc_meter,
-	auth::test_support::offline_client,
+	auth::{http::test_support::read_head, test_support::offline_client, unauth},
 	cache::{CacheState, hydrate_by_uuids},
 	connect::ConnectedTargets,
 	fs::bulk::create_dirs::CreateDirsError,
@@ -1768,8 +1768,13 @@ struct Borrowed {
 
 impl Borrowed {
 	fn new() -> Self {
+		Self::with_client(offline_client())
+	}
+
+	/// [`new`](Self::new), with `client` behind the pass.
+	fn with_client(client: Client) -> Self {
 		Self {
-			client: offline_client(),
+			client,
 			local: tempfile::tempdir().unwrap(),
 			store: Arc::new(Mutex::new(BaselineStore::open_in_memory().unwrap())),
 			pending: PendingWrites::default(),
@@ -3031,5 +3036,333 @@ async fn a_whole_trash_request_failure_fails_each_item_once() {
 	assert_eq!(
 		rows_and_journal(&borrowed),
 		(vec!["a.txt".to_string(), "b.txt".to_string()], vec![])
+	);
+}
+
+/// The error of a request a local server answered with `status`.
+async fn status_error(status: u16) -> reqwest::Error {
+	let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+	let addr = listener.local_addr().unwrap();
+	let server = tokio::spawn(async move {
+		let (mut socket, _) = listener.accept().await.unwrap();
+		read_head(&mut socket).await;
+		socket
+			.write_all(format!("HTTP/1.1 {status} Status\r\nContent-Length: 0\r\n\r\n").as_bytes())
+			.await
+			.unwrap();
+		socket
+	});
+	let response = reqwest::Client::builder()
+		.no_proxy()
+		.build()
+		.unwrap()
+		.get(format!("http://{addr}/"))
+		.send()
+		.await
+		.unwrap();
+	server.await.unwrap();
+	response.error_for_status().unwrap_err()
+}
+
+/// The error of a connect to a local port nothing listens on.
+async fn refused_error() -> reqwest::Error {
+	let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+	let addr = listener.local_addr().unwrap();
+	drop(listener);
+	reqwest::Client::builder()
+		.no_proxy()
+		.build()
+		.unwrap()
+		.get(format!("http://{addr}/"))
+		.send()
+		.await
+		.unwrap_err()
+}
+
+fn session_refused() -> crate::Error {
+	filen_types::error::ResponseError::ApiError {
+		message: None,
+		code: Some("api_key_not_found".to_string()),
+	}
+	.into()
+}
+
+/// A remote out of reach, overloaded or rate limiting, and a session the server refuses, are found
+/// wherever the SDK put them: straight from the HTTP client, inside the `io::Error` the upload
+/// writer wraps a failed chunk in, and inside the error a bulk request shares between its items.
+#[tokio::test]
+async fn a_remote_outage_is_found_anywhere_in_the_error_chain() {
+	let unavailable = Some(HaltReason::RemoteUnavailable);
+	assert_eq!(
+		pass_halt(&crate::Error::from(refused_error().await)),
+		unavailable
+	);
+	for status in [500, 502, 503, 504, 408, 429] {
+		assert_eq!(
+			pass_halt(&crate::Error::from(status_error(status).await)),
+			unavailable,
+			"HTTP {status}"
+		);
+	}
+	assert_eq!(
+		pass_halt(&crate::Error::from(std::io::Error::other(
+			crate::Error::from(status_error(503).await).with_context("uploading a chunk")
+		))),
+		unavailable,
+		"the upload writer hands a failed chunk on inside an io::Error"
+	);
+	for shared in all_failed::<()>(crate::Error::from(status_error(503).await), 2) {
+		assert_eq!(pass_halt(&shared.unwrap_err()), unavailable, "a bulk item");
+	}
+
+	let unauthenticated = Some(HaltReason::Unauthenticated);
+	assert_eq!(pass_halt(&session_refused()), unauthenticated);
+	assert_eq!(
+		pass_halt(&crate::Error::from(
+			std::io::Error::other(session_refused())
+		)),
+		unauthenticated
+	);
+	assert_eq!(
+		pass_halt(&crate::Error::custom(
+			ErrorKind::Unauthenticated,
+			"session expired"
+		)),
+		unauthenticated
+	);
+	assert_eq!(
+		pass_halt(&crate::Error::from(status_error(401).await)),
+		unauthenticated
+	);
+}
+
+/// What is the path's own stays the path's: any other 4xx, a server refusal by code, a local IO
+/// error of any kind (the disk's as often as the network's), and an error that only says it came
+/// from the HTTP client without carrying the client's own error. A full side found under an
+/// outage still wins.
+#[tokio::test]
+async fn a_failure_that_is_the_paths_own_is_no_remote_outage() {
+	for status in [400, 403, 404, 409, 410] {
+		assert_eq!(
+			pass_halt(&crate::Error::from(status_error(status).await)),
+			None,
+			"HTTP {status}"
+		);
+	}
+	for kind in [
+		std::io::ErrorKind::ConnectionReset,
+		std::io::ErrorKind::TimedOut,
+		std::io::ErrorKind::PermissionDenied,
+	] {
+		assert_eq!(pass_halt(&io_err(io_kind(kind))), None, "{kind:?}");
+	}
+	assert_eq!(
+		pass_halt(&crate::Error::custom(ErrorKind::Reqwest, "a lost source")),
+		None
+	);
+	assert_eq!(
+		pass_halt(&crate::Error::custom_with_source(
+			ErrorKind::Unauthenticated,
+			std::io::Error::other(over_quota()),
+			None::<String>,
+		)),
+		Some(HaltReason::RemoteStorageFull)
+	);
+}
+
+/// A remote outage halts the pass once, with one line saying why, and fails it with a kind a host
+/// can show; the failure goes to the spaced-out count rather than the path's streak, while an
+/// ordinary failure next to it still counts against its own.
+#[tokio::test]
+async fn a_remote_outage_halts_the_pass_instead_of_counting_against_its_path() {
+	let mut report = SyncReport::default();
+	note_failure(
+		&mut report,
+		"locked.txt",
+		&crate::Error::from(io_kind(std::io::ErrorKind::PermissionDenied)),
+	);
+	note_failure(
+		&mut report,
+		"a.bin",
+		&crate::Error::from(status_error(503).await),
+	);
+	note_failure(
+		&mut report,
+		"b.bin",
+		&crate::Error::from(refused_error().await),
+	);
+
+	assert_eq!(report.halted, Some(HaltReason::RemoteUnavailable));
+	let paths = |failures: &[(String, String)]| -> Vec<String> {
+		failures.iter().map(|(path, _)| path.clone()).collect()
+	};
+	assert_eq!(paths(&report.failed_paths), ["locked.txt"]);
+	assert_eq!(paths(&report.transient_failures), ["a.bin", "b.bin"]);
+	let line = "the remote could not be reached or is unavailable: no further remote actions were \
+	            started this pass";
+	assert_eq!(
+		report.errors.iter().filter(|error| *error == line).count(),
+		1,
+		"{:?}",
+		report.errors
+	);
+	assert_eq!(report.errors.len(), 4, "{:?}", report.errors);
+	assert_eq!(
+		report.pass_failure(),
+		Some((line.to_string(), ErrorKind::Reqwest))
+	);
+
+	let mut report = SyncReport::default();
+	note_failure(&mut report, "c.bin", &session_refused());
+	assert_eq!(report.halted, Some(HaltReason::Unauthenticated));
+	assert!(report.failed_paths.is_empty());
+	assert_eq!(paths(&report.transient_failures), ["c.bin"]);
+	assert_eq!(
+		report.pass_failure(),
+		Some((
+			"the server no longer accepts this session: no further remote actions were started \
+			 this pass"
+				.to_string(),
+			ErrorKind::Unauthenticated
+		))
+	);
+}
+
+/// A remote out of reach holds back every action that touches the remote and none that does
+/// not.
+#[test]
+fn a_remote_outage_holds_every_remote_action_and_no_local_one() {
+	let remote = [
+		upload("up.bin"),
+		download("down.bin"),
+		trash("gone.bin", NodeKind::File),
+		SyncAction::CreateRemoteDir {
+			rel_path: "made".to_string(),
+		},
+		SyncAction::MoveRemote {
+			from_path: "a".to_string(),
+			to_path: "b".to_string(),
+			kind: NodeKind::Dir,
+			remote_uuid: Uuid::from_u128(1),
+		},
+	];
+	let local = [
+		SyncAction::CreateLocalDir {
+			rel_path: "here".to_string(),
+		},
+		delete_local("old.txt", NodeKind::File),
+		SyncAction::MoveLocal {
+			from_path: "c".to_string(),
+			to_path: "d".to_string(),
+			kind: NodeKind::Dir,
+		},
+	];
+	for reason in [HaltReason::RemoteUnavailable, HaltReason::Unauthenticated] {
+		let full = FullSides::default();
+		full.note(reason);
+		assert_eq!(
+			remote.each_ref().map(|action| full.holds(action)),
+			[true; 5]
+		);
+		assert_eq!(
+			local.each_ref().map(|action| full.holds(action)),
+			[false; 3]
+		);
+	}
+}
+
+/// A remote directory move the outage held back holds everything under its destination with it,
+/// silently: the plan names that subtree by a path the remote does not carry yet, and nothing
+/// under it failed.
+#[test]
+fn a_held_directory_move_holds_its_subtree_without_failing_it() {
+	let full = FullSides::default();
+	full.note(HaltReason::RemoteUnavailable);
+	let mut failed = FailedDirMoves::default();
+	let moved = SyncAction::MoveRemote {
+		from_path: "a".to_string(),
+		to_path: "b".to_string(),
+		kind: NodeKind::Dir,
+		remote_uuid: Uuid::from_u128(1),
+	};
+	assert!(holds_serial(&full, &mut failed, &moved));
+	assert_eq!(failed.held, ["b"]);
+
+	let mut report = SyncReport::default();
+	let mut events = Vec::new();
+	assert!(failed.skips(
+		&delete_local("b/x.txt", NodeKind::File),
+		&mut report,
+		&mut |event| events.push(event)
+	));
+	assert!(!failed.skips(
+		&delete_local("c/x.txt", NodeKind::File),
+		&mut report,
+		&mut |event| events.push(event)
+	));
+	assert!(events.is_empty());
+	assert!(report.errors.is_empty(), "{:?}", report.errors);
+	assert!(report.failed_paths.is_empty());
+	assert!(report.transient_failures.is_empty());
+}
+
+/// A pass whose transfers find the remote out of reach starts no transfer after the first ones
+/// fail: only those already in flight — the client's concurrency's worth — fail, none counts
+/// against its path's streak, the rest are held for the next pass, and the local deletion after
+/// them still runs. The pass fails, so a watch backs off.
+#[tokio::test(start_paused = true)]
+async fn a_remote_outage_starts_no_more_remote_actions_and_lets_local_ones_run() {
+	let cache_dir = tempfile::tempdir().unwrap();
+	let cache = cache_dir.path().join("cache.db");
+	let root = Uuid::from_u128(u128::MAX);
+	let borrowed = Borrowed::with_client(unauth::test_support::offline_client());
+	let concurrency = borrowed.client.unauthed().state().max_concurrency();
+	let downloads = concurrency * 3;
+	let file_uuid = |n: usize| Uuid::from_u128(u128::try_from(n).unwrap() + 1);
+	let mut state = CacheState::new_on_path(&cache, root);
+	state
+		.upsert_files((0..downloads).map(|n| cacheable_file(file_uuid(n), root, &format!("f{n}"))))
+		.unwrap();
+	std::fs::write(borrowed.local.path().join("old.txt"), b"old").unwrap();
+	let (_dir, stage) = Stage::in_temp_dir();
+	let mut writer = PlanWriter::new(stage).unwrap();
+	for n in 0..downloads {
+		writer
+			.push(&PlannedEntry::bare(SyncAction::DownloadFile {
+				rel_path: format!("f{n}"),
+				remote_uuid: file_uuid(n),
+			}))
+			.unwrap();
+	}
+	writer
+		.push(&PlannedEntry::bare(delete_local("old.txt", NodeKind::File)))
+		.unwrap();
+	let mut report = SyncReport::default();
+	let mut events = Vec::new();
+	apply(
+		borrowed.ctx(root, Some(cache)),
+		writer.finish().unwrap(),
+		&mut report,
+		&mut |event| events.push(event),
+	)
+	.await;
+
+	assert_eq!(report.halted, Some(HaltReason::RemoteUnavailable));
+	assert_eq!(report.transient_failures.len(), concurrency);
+	assert!(report.failed_paths.is_empty(), "{:?}", report.failed_paths);
+	assert_eq!(
+		events
+			.iter()
+			.filter(|event| matches!(event, SyncEvent::ActionFailed { .. }))
+			.count(),
+		concurrency
+	);
+	assert_eq!(report.downloaded, 0);
+	assert_eq!(report.interrupted, 0);
+	assert_eq!(report.locally_deleted, 1);
+	assert!(!borrowed.local.path().join("old.txt").exists());
+	assert_eq!(
+		report.pass_failure().map(|(_, kind)| kind),
+		Some(ErrorKind::Reqwest)
 	);
 }

@@ -107,6 +107,20 @@ const MAX_PATH_FAILURES: u32 = 3;
 /// is broken for good.
 pub const PATH_FAILURE_RETRY_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
+/// How far apart two failures of one path on a remote outage
+/// ([`HaltReason::is_remote_outage`](super::HaltReason::is_remote_outage): the
+/// remote out of reach, answering 5xx, 408 or 429, or refusing the session) must be for the second
+/// to extend its streak: a third of [`PATH_FAILURE_RETRY_INTERVAL`].
+///
+/// Such a failure fails the whole pass, and a watch backs off on it, but it says nothing about the
+/// path it happened to catch: counted like any other, the transfers an hour-long outage caught
+/// would all be blocked for another hour after it. Not counted at all, a path the server answers
+/// with a 5xx on every pass, while the rest of the drive works, would fail every pass forever.
+/// Spaced out, an outage costs a path at most one failure in each such window, which a success
+/// clears, while the path that always fails reaches [`MAX_PATH_FAILURES`] — and is blocked, so its
+/// passes stop failing — after two windows.
+const TRANSIENT_FAILURE_SPACING: Duration = Duration::from_secs(20 * 60);
+
 /// How long [`SyncEngine::remove_pair`] waits for the pass it cancelled to end before it retires
 /// the pair's rows anyway.
 ///
@@ -5876,8 +5890,9 @@ impl SyncEngine {
 		}
 	}
 
-	/// Record what this pass's actions did: a failure extends that path's streak, and a success ends
-	/// the streaks `ends` pairs it with (see [`endable_streaks`]). Once a streak reaches
+	/// Record what this pass's actions did: a failure extends that path's streak — one on a remote
+	/// outage only once per [`TRANSIENT_FAILURE_SPACING`] — and a success ends the streaks `ends`
+	/// pairs it with (see [`endable_streaks`]). Once a streak reaches
 	/// [`MAX_PATH_FAILURES`] the path stops being planned and is reported as
 	/// [`UnsyncableReason::RepeatedFailure`] instead of failing on every pass forever — until
 	/// [`PATH_FAILURE_RETRY_INTERVAL`] after its last failure, when it is tried once more.
@@ -5910,6 +5925,9 @@ impl SyncEngine {
 			.iter()
 			.map(|(path, error)| ((*path).to_string(), (*error).to_string()))
 			.collect();
+		// Owned for the closure that writes them, as `recorded` is.
+		let transient = report.transient_failures.clone();
+		let spacing = i64::try_from(TRANSIENT_FAILURE_SPACING.as_millis()).unwrap_or(i64::MAX);
 		let store = match self.pair_store(pair).await {
 			Ok(store) => store,
 			Err(error) => {
@@ -5926,6 +5944,11 @@ impl SyncEngine {
 			let mut problems = Vec::new();
 			for (path, error) in &recorded {
 				if let Err(e) = store.record_failure(pair, path, error, now) {
+					problems.push(format!("{path}: recording the failure count failed: {e}"));
+				}
+			}
+			for (path, error) in &transient {
+				if let Err(e) = store.record_spaced_failure(pair, path, error, now, spacing) {
 					problems.push(format!("{path}: recording the failure count failed: {e}"));
 				}
 			}

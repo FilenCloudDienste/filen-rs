@@ -460,6 +460,43 @@ fn path_failures_count_consecutively_and_reset_on_a_clear() {
 	assert!(store.failures(pair).unwrap().is_empty());
 }
 
+/// A spaced failure starts a streak like any other, then extends it only once the streak's last
+/// failure is at least the spacing old; one inside the window, or dated before the last, changes
+/// nothing at all.
+#[test]
+fn a_spaced_failure_counts_only_once_per_window() {
+	let store = BaselineStore::open_in_memory().unwrap();
+	let (pair, _) = store
+		.create_pair("/root", Uuid::new_v4(), SyncMode::TwoWay)
+		.unwrap();
+	let spaced = |error: &str, at: i64| {
+		store
+			.record_spaced_failure(pair, "a.txt", error, at, 1_000)
+			.unwrap();
+		store.failures(pair).unwrap()["a.txt"].clone()
+	};
+	let streak = |attempts, last_error: &str, last_failure_at| PathFailure {
+		attempts,
+		last_error: last_error.to_string(),
+		last_failure_at,
+	};
+
+	assert_eq!(spaced("down", 10_000), streak(1, "down", 10_000));
+	assert_eq!(spaced("still down", 10_999), streak(1, "down", 10_000));
+	assert_eq!(spaced("back in time", 9_000), streak(1, "down", 10_000));
+	assert_eq!(
+		spaced("down again", 11_000),
+		streak(2, "down again", 11_000)
+	);
+
+	// It extends a streak an ordinary failure started, under the same window.
+	store
+		.record_failure(pair, "a.txt", "refused", 11_500)
+		.unwrap();
+	assert_eq!(spaced("down", 12_000), streak(3, "refused", 11_500));
+	assert_eq!(spaced("down", 12_500), streak(4, "down", 12_500));
+}
+
 /// A removed pair's id must never be handed to a later pair. A watch loop finishes the pass it
 /// is in when its pair is removed, so that pass still writes baseline and journal rows keyed by
 /// the old id: with the id reused, they land in the successor — whose first sync is supposed to

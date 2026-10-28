@@ -5307,6 +5307,75 @@ async fn a_pass_that_ends_no_streak_still_records_its_failures() {
 	std::fs::remove_file(&path).ok();
 }
 
+/// A failure on a remote outage starts the path's streak, but a second one within
+/// [`TRANSIENT_FAILURE_SPACING`] does not extend it, while an ordinary failure in the same pass
+/// still counts in full.
+#[tokio::test]
+async fn a_remote_outage_counts_against_its_path_only_once_per_spacing() {
+	let (engine, pair, path) = engine_with_pair("transient_spaced").await;
+
+	for _ in 0..2 {
+		let mut report = SyncReport {
+			failed_paths: vec![("broken.txt".to_string(), "refused".to_string())],
+			transient_failures: vec![("caught.txt".to_string(), "unreachable".to_string())],
+			..SyncReport::default()
+		};
+		engine
+			.note_path_outcomes(pair, Vec::new(), &mut report)
+			.await;
+		assert!(report.errors.is_empty(), "{:?}", report.errors);
+	}
+
+	let after = locked(&engine.pair_store(pair).await.unwrap())
+		.failures(pair)
+		.unwrap();
+	assert_eq!(
+		after.get("caught.txt").map(|failure| failure.attempts),
+		Some(1)
+	);
+	assert_eq!(
+		after.get("broken.txt").map(|failure| failure.attempts),
+		Some(2)
+	);
+
+	drop(engine);
+	std::fs::remove_file(&path).ok();
+}
+
+/// A path the server answers with a 5xx on every pass, while the rest of the drive works, fails
+/// each of its passes as an outage. Counted once per [`TRANSIENT_FAILURE_SPACING`] however often
+/// the watch retries it, it reaches [`MAX_PATH_FAILURES`] two spacings after its first failure
+/// and is blocked from then on, so its passes stop failing.
+#[test]
+fn a_path_that_always_fails_on_an_outage_is_blocked_after_two_spacings() {
+	const START: i64 = 1_800_000_000_000;
+	let spacing = i64::try_from(TRANSIENT_FAILURE_SPACING.as_millis()).unwrap();
+	// The watch's longest backoff.
+	let retry = 300_000;
+	let store = BaselineStore::open_in_memory().unwrap();
+	let (pair, _) = store
+		.create_pair("/root", Uuid::new_v4(), SyncMode::TwoWay)
+		.unwrap();
+	let blocked_at = |now: i64| streak_blocks(&store.failures(pair).unwrap()["bad.bin"], now);
+
+	let mut now = START;
+	while now < START + 2 * spacing {
+		store
+			.record_spaced_failure(pair, "bad.bin", "HTTP 503", now, spacing)
+			.unwrap();
+		assert!(!blocked_at(now), "blocked {} ms in", now - START);
+		now += retry;
+	}
+	store
+		.record_spaced_failure(pair, "bad.bin", "HTTP 503", now, spacing)
+		.unwrap();
+	assert_eq!(
+		store.failures(pair).unwrap()["bad.bin"].attempts,
+		MAX_PATH_FAILURES
+	);
+	assert!(blocked_at(now));
+}
+
 /// A pair whose cache holds its remote root converged, so a pass gets past its wait for the remote
 /// view without asking a server, over an empty local root in `dir`. Answers the cache DB's path.
 async fn engine_with_a_converged_pair(dir: &Path) -> (SyncEngine, PairId, PathBuf) {

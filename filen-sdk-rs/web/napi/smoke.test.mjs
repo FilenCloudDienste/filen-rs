@@ -257,7 +257,7 @@ describe("exports", () => {
 		assert.deepEqual({ ...ConflictResolution }, { KeepLocal: 0, KeepRemote: 1, KeepBoth: 2 })
 		assert.deepEqual({ ...TransferDirection }, { Upload: 0, Download: 1 })
 		assert.deepEqual({ ...RefuseReason }, { RemoteCollision: 0, LocalCollision: 1 })
-		assert.deepEqual({ ...HaltReason }, { LocalStorageFull: 0, RemoteStorageFull: 1 })
+		assert.deepEqual({ ...HaltReason }, { LocalStorageFull: 0, RemoteStorageFull: 1, RemoteUnavailable: 2, Unauthenticated: 3 })
 		assert.deepEqual({ ...PlannedNodeKind }, { Dir: 0, File: 1 })
 		assert.deepEqual({ ...WatchState }, { Running: 0, Paused: 1, Stopped: 2, PairRemoved: 3 })
 		assert.deepEqual({ ...SyncPairActivity }, { Idle: 0, Starting: 1, Watching: 2, Stopping: 3, SyncingOnce: 4 })

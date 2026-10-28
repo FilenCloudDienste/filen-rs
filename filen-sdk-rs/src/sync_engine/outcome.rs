@@ -266,9 +266,10 @@ impl fmt::Display for RefuseReason {
 	}
 }
 
-/// A side of a pass that ran out of room: no transfer writing to it can succeed, so the pass holds
-/// those back, and the failure counts against no path's failure streak (see
-/// [`SyncReport::halted`](super::SyncReport::halted)).
+/// Why a pass stopped starting some of its work part-way: a side that ran out of room, or a remote
+/// it could not reach or was refused by. No action that runs into one can succeed until it clears,
+/// so the pass holds those actions back, and the failure counts against no path's failure streak
+/// (see [`SyncReport::halted`](super::SyncReport::halted)).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[js_type(export, no_deser, no_default, napi)]
 pub enum HaltReason {
@@ -276,28 +277,52 @@ pub enum HaltReason {
 	LocalStorageFull,
 	/// The account's storage is used up: the server refused a write with `max_storage_reached`.
 	RemoteStorageFull,
+	/// The remote could not be reached or turned the request away for now: the connection failed,
+	/// was lost or timed out, or the server answered with a 5xx status, 408 or 429. The kind of
+	/// error is [`ErrorKind::Reqwest`], so a host can show the pair as offline.
+	RemoteUnavailable,
+	/// The server no longer accepts the client's session: an API key it does not know, or a 401.
+	/// The kind of error is [`ErrorKind::Unauthenticated`], so a host can ask the user to sign in
+	/// again.
+	Unauthenticated,
 }
 
 impl HaltReason {
-	/// The transfers this condition holds back: `"uploads"` for a full account, `"downloads"` for a
-	/// full local disk.
+	/// The actions this condition holds back: `"uploads"` for a full account, `"downloads"` for a
+	/// full local disk, and `"remote actions"` (transfers, remote directory creates, moves and
+	/// trashes) for a remote out of reach or refusing the session.
 	pub fn held_transfers(self) -> &'static str {
 		match self {
 			Self::LocalStorageFull => "downloads",
 			Self::RemoteStorageFull => "uploads",
+			Self::RemoteUnavailable | Self::Unauthenticated => "remote actions",
 		}
 	}
 
-	/// The kind of error this condition is: the server's refusal of a write to a full account, or
-	/// the IO error of a write to a full disk.
+	/// The kind of error this condition is: the server's refusal of a write to a full account, the
+	/// IO error of a write to a full disk, the transport's error, or the server's refusal of the
+	/// session.
 	pub(super) fn error_kind(self) -> ErrorKind {
 		match self {
 			Self::LocalStorageFull => ErrorKind::IO,
 			Self::RemoteStorageFull => ErrorKind::MaxStorageReached,
+			Self::RemoteUnavailable => ErrorKind::Reqwest,
+			Self::Unauthenticated => ErrorKind::Unauthenticated,
 		}
 	}
 
-	/// The line a pass's [`errors`](super::SyncReport::errors) carries once it found this side full.
+	/// Whether this condition is the remote being out of reach for now, rather than a side out of
+	/// room: such a failure says nothing about its path, yet the same answer on every pass may be
+	/// the path's own, so it counts against the path's streak only spaced out (see the engine's
+	/// `TRANSIENT_FAILURE_SPACING`).
+	pub(super) fn is_remote_outage(self) -> bool {
+		match self {
+			Self::LocalStorageFull | Self::RemoteStorageFull => false,
+			Self::RemoteUnavailable | Self::Unauthenticated => true,
+		}
+	}
+
+	/// The line a pass's [`errors`](super::SyncReport::errors) carries once it halted on this.
 	pub(super) fn held_line(self) -> String {
 		format!(
 			"{self}: no further {} were started this pass",
@@ -311,6 +336,8 @@ impl fmt::Display for HaltReason {
 		f.write_str(match self {
 			Self::LocalStorageFull => "the local disk is full",
 			Self::RemoteStorageFull => "the account's storage is full",
+			Self::RemoteUnavailable => "the remote could not be reached or is unavailable",
+			Self::Unauthenticated => "the server no longer accepts this session",
 		})
 	}
 }

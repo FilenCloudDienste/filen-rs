@@ -323,7 +323,8 @@ pub struct SyncPassReport {
 	pub paused: bool,
 	/// Planned actions the pass did not carry out (a cancel, or a drive lock it could not take).
 	pub interrupted: u64,
-	/// Set when a side ran out of room during the pass.
+	/// Set when a side ran out of room during the pass, or the remote was out of reach or refused
+	/// the session.
 	pub halted: Option<HaltReason>,
 	/// Why the pass read both sides whole; diagnostic text only.
 	pub full_pass_reason: Option<String>,
@@ -370,6 +371,7 @@ impl From<SyncReport> for SyncPassReport {
 			dropped_actions: _,
 			read_cost: _,
 			failed_paths: _,
+			transient_failures: _,
 		} = report;
 		let (conflicts, conflicts_total) = capped(conflicts);
 		let (held, held_total) = capped(held);

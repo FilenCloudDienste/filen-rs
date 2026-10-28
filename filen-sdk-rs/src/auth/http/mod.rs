@@ -832,8 +832,7 @@ async fn execute_request(
 			if is_pre_send_connect_failure(&e) {
 				return retry::RetryError::RetryAfterBackoff(Error::from(e));
 			}
-			let dead_connection = dead_connection_io_error(&e);
-			if let Some(io_error) = dead_connection {
+			if let Some(io_error) = dead_connection_io_error(&e) {
 				// The request's own log line reports only the final error, by Display, so a failure
 				// the retry absorbs would otherwise leave no trace of what killed the connection.
 				tracing::warn!(
@@ -846,7 +845,7 @@ async fn execute_request(
 				e.status(),
 				e.is_builder(),
 				e.is_request(),
-				is_dispatch_gone(&e) || is_incomplete_message(&e) || dead_connection.is_some(),
+				is_connection_lost(&e),
 			);
 			retry::RetryError::from_retryable(retryable, Error::from(e))
 		})
@@ -980,6 +979,14 @@ fn dead_connection_io_error(err: &reqwest::Error) -> Option<&io::Error> {
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 fn dead_connection_io_error(_err: &reqwest::Error) -> Option<&io::Error> {
 	None
+}
+
+/// Whether `err` is a connection that died under the request: one of the dead-connection classes
+/// [`is_attempt_retryable`] retries ([`is_dispatch_gone`], [`is_incomplete_message`],
+/// [`dead_connection_io_error`]). A caller that sees one after the retries ran out is looking at
+/// the network, not at the request.
+pub(crate) fn is_connection_lost(err: &reqwest::Error) -> bool {
+	is_dispatch_gone(err) || is_incomplete_message(err) || dead_connection_io_error(err).is_some()
 }
 
 /// The first I/O error in `err`'s [`source`](std::error::Error::source) chain whose kind means the
