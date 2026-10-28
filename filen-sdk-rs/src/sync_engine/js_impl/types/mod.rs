@@ -13,9 +13,9 @@ use crate::{
 	job::millis,
 	sync_engine::{
 		BaselineInUse, BaselineSchemaMismatch, DeleteGuard, GuardReason, HaltReason, IgnoredPath,
-		PairId, PairOverlap, PairRecord, PauseMode, PauseOptions, PlanOutcome, PlannedAction,
-		PlannedActionKind, PlannedConflict, RefuseReason, SyncEvent, SyncMode, SyncReport,
-		TransferDirection, UnsyncablePath, WatchConfig, WatchStatus,
+		LocalScanProgress, PairId, PairOverlap, PairRecord, PauseMode, PauseOptions, PlanOutcome,
+		PlannedAction, PlannedActionKind, PlannedConflict, RefuseReason, SyncEvent, SyncMode,
+		SyncReport, TransferDirection, UnsyncablePath, WatchConfig, WatchStatus,
 	},
 };
 
@@ -502,6 +502,11 @@ pub enum SyncEventMessage {
 	/// The pass waits for the cache to finish listing the pair's remote folder; sent before its
 	/// `PassStarted`, under a pass id of its own.
 	AwaitingRemote,
+	/// How far the local walk of a whole read has got: at most one every 500 ms, BEFORE the pass's
+	/// `PassStarted`, and under the same `pass_id`.
+	Scanning {
+		progress: LocalScanProgress,
+	},
 }
 
 impl From<SyncEvent> for SyncEventMessage {
@@ -555,6 +560,7 @@ impl From<SyncEvent> for SyncEventMessage {
 			},
 			SyncEvent::PassFailed { error, kind } => Self::PassFailed { error, kind },
 			SyncEvent::AwaitingRemote => Self::AwaitingRemote,
+			SyncEvent::Scanning { progress } => Self::Scanning { progress },
 		}
 	}
 }
@@ -565,8 +571,9 @@ pub struct SyncPassEvent {
 	/// The pair whose pass this is.
 	pub pair_id: u64,
 	/// Minted by the binding, increasing across the engine: every event of one pass carries the
-	/// same id, and every `PassStarted` mints a fresh one. A pass's events end with its
-	/// `PassCompleted` or `PassFailed`.
+	/// same id, and every `PassStarted` mints a fresh one unless the same pass's `Scanning` events
+	/// came first, whose id it takes. A pass's events end with its `PassCompleted` or
+	/// `PassFailed`.
 	pub pass_id: u64,
 	/// When (Unix epoch milliseconds) the binding saw the event.
 	pub emitted_at_ms: u64,

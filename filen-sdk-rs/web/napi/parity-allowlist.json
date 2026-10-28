@@ -30,6 +30,7 @@
 	"SyncEventMessage_Progress_Inner": "napi cannot inline a data-enum variant's payload, so it names it; ubrn inlines it in the variant",
 	"SyncEventMessage_Quarantined_Inner": "napi cannot inline a data-enum variant's payload, so it names it; ubrn inlines it in the variant",
 	"SyncEventMessage_Refused_Inner": "napi cannot inline a data-enum variant's payload, so it names it; ubrn inlines it in the variant",
+	"SyncEventMessage_Scanning_Inner": "napi cannot inline a data-enum variant's payload, so it names it; ubrn inlines it in the variant",
 	"SyncEventMessage_TrashingRemote_Inner": "napi cannot inline a data-enum variant's payload, so it names it; ubrn inlines it in the variant",
 	"SyncEventMessage_Uploading_Inner": "napi cannot inline a data-enum variant's payload, so it names it; ubrn inlines it in the variant",
 	"SyncGuardReason_ExceededThreshold_Inner": "napi cannot inline a data-enum variant's payload, so it names it; ubrn inlines it in the variant",

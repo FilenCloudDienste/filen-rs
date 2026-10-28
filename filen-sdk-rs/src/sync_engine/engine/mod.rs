@@ -52,7 +52,10 @@ use super::{
 	plan::{self, RemoteNode, RemoteView, SyncAction},
 	remote::{RemoteObserved, cache_ancestry, delta_uuids, observe_remote},
 	rows::Baseline,
-	scan::{self, LocalScan, PairRoot, RuleFiles, ScanError, ScanRoot},
+	scan::{
+		self, LocalScan, PairRoot, RuleFiles, ScanError, ScanRoot, WalkProgress,
+		report_scan_progress,
+	},
 	seed::{self, SeedCounts, Seeding},
 	side::{Nodes, NodesAt, Side, SideRef},
 	stage::{self, Confirmed, Rows, Screen, ScreenError, Stage, StagedPlan},
@@ -1997,7 +2000,9 @@ impl SyncEngine {
 			None => None,
 		};
 		// It applies nothing, so it seeds nothing either: the probe does not time the stage.
-		let prep = self.prepare(pair, scope, Seeding::Skip).await?;
+		let prep = self
+			.prepare(pair, scope, Seeding::Skip, &Arc::default())
+			.await?;
 		super::step("prepare_tail");
 		let state = screen_state(&prep);
 		let at = self.stage_at(pair);
@@ -3723,7 +3728,9 @@ impl SyncEngine {
 					// A read, not a pass: it seeds nothing, and weighs nothing either. A seeded row is
 					// for a path both sides hold, and the adoption writes rows only where one side has
 					// nothing, so what the stage would record changes nothing it adopts.
-					let prep = self.prepare(pair, None, Seeding::Skip).await?;
+					let prep = self
+						.prepare(pair, None, Seeding::Skip, &Arc::default())
+						.await?;
 					// The adoption rewrites baseline rows from this one read, and every row it writes
 					// is for a path it reads as GONE on the source side — so it needs the same
 					// evidence a pass needs before acting on an absence. Read through an incomplete
@@ -4456,11 +4463,16 @@ impl SyncEngine {
 	/// `seeding` says whether the read weighs the hashless files both sides agree on before it hands
 	/// the pass over (see [`seed`]), and where it records them: only a pass that goes on to apply
 	/// writes them into the store, and a dry run reads them into its own view.
+	///
+	/// A whole read's walk counts what it lists and hashes into `progress`, for a pass to report
+	/// while it waits (see [`report_scan_progress`]); a caller that reports nothing hands in a fresh
+	/// one.
 	async fn prepare(
 		&self,
 		pair: PairId,
 		scope: Option<ScopedRead<'_>>,
 		seeding: Seeding,
+		progress: &Arc<WalkProgress>,
 	) -> Result<Prepared, Error> {
 		let inputs = self.pass_inputs(pair).await?;
 		// The per-pass DB prologue, bounded on its own: five statements and a `spawn_blocking` hop,
@@ -4480,12 +4492,12 @@ impl SyncEngine {
 				// The derivation could not answer for something it was handed.
 				Scoped::Whole(inputs, reason) => {
 					return self
-						.prepare_whole(*inputs, PassRead::Whole(Some(reason)), seeding)
+						.prepare_whole(*inputs, PassRead::Whole(Some(reason)), seeding, progress)
 						.await;
 				}
 			}
 		}
-		self.prepare_whole(inputs, PassRead::Whole(forced), seeding)
+		self.prepare_whole(inputs, PassRead::Whole(forced), seeding, progress)
 			.await
 	}
 
@@ -4965,12 +4977,13 @@ impl SyncEngine {
 	}
 
 	/// The whole-tree half of [`prepare`](Self::prepare): read both sides entire, which is the only
-	/// read that can find a change nothing announced.
+	/// read that can find a change nothing announced. Every walk it starts counts into `progress`.
 	async fn prepare_whole(
 		&self,
 		inputs: PassInputs,
 		read: PassRead,
 		seeding: Seeding,
+		progress: &Arc<WalkProgress>,
 	) -> Result<Prepared, Error> {
 		let PassInputs {
 			record,
@@ -5006,6 +5019,7 @@ impl SyncEngine {
 				scan_baseline.clone(),
 				IgnoreRules::new(user),
 				RuleFiles::Read,
+				Arc::clone(progress),
 			))
 		} else {
 			None
@@ -5127,6 +5141,7 @@ impl SyncEngine {
 					scan_baseline,
 					remote_rules.rules,
 					rule_files,
+					Arc::clone(progress),
 				)
 			}
 		};
@@ -5305,7 +5320,9 @@ impl SyncEngine {
 
 	/// [`plan_pair`](Self::plan_pair), up to giving back the page caches its read filled.
 	async fn plan_pair_unreleased(&self, pair: PairId) -> Result<PlanOutcome, Error> {
-		let prep = self.prepare(pair, None, Seeding::Preview).await?;
+		let prep = self
+			.prepare(pair, None, Seeding::Preview, &Arc::default())
+			.await?;
 		if let Some(reason) = refusal(&prep) {
 			return Ok(PlanOutcome {
 				refused: Some(reason),
@@ -6636,23 +6653,31 @@ impl SyncEngine {
 		let read_started = Instant::now();
 		// A clone for the migration's blocking thread: two channel handles.
 		let migrating = gate.clone();
-		let Some((recording, migration, prepared)) = gate
-			.guard(async move {
-				let recording = reading.lock_owned().await;
-				// Before the local side is read, so the read sees the tree as the migration left it,
-				// and inside the reading lock, so no import lands between its look at the baseline
-				// and the read's.
-				let migration_started = Instant::now();
-				self.migrate_legacy_trash(pair, migrating).await;
-				let migration = migration_started.elapsed();
-				let read = ScopedRead {
-					scope: &mut scope,
-					converged,
-				};
-				let prepared = self.prepare(pair, Some(read), Seeding::Write).await;
-				(recording, migration, prepared)
-			})
-			.await
+		// What a whole read's walk has got through, reported while the read runs: a first pass
+		// hashes every file before anything else is said.
+		let progress = Arc::new(WalkProgress::default());
+		let counting = &progress;
+		// Boxed: the read is the largest future of the pass, and holding it inline both here and in
+		// the progress reporter that polls it overflowed a 2 MiB worker stack in a debug build.
+		let read = Box::pin(gate.guard(async move {
+			let recording = reading.lock_owned().await;
+			// Before the local side is read, so the read sees the tree as the migration left it,
+			// and inside the reading lock, so no import lands between its look at the baseline
+			// and the read's.
+			let migration_started = Instant::now();
+			self.migrate_legacy_trash(pair, migrating).await;
+			let migration = migration_started.elapsed();
+			let read = ScopedRead {
+				scope: &mut scope,
+				converged,
+			};
+			let prepared = self
+				.prepare(pair, Some(read), Seeding::Write, counting)
+				.await;
+			(recording, migration, prepared)
+		}));
+		let Some((recording, migration, prepared)) =
+			report_scan_progress(read, &progress, observer).await
 		else {
 			return cancelled_reading(&gate, pair);
 		};
@@ -7842,6 +7867,8 @@ impl LocalWalk {
 		baseline: Baseline,
 		rules: IgnoreRules,
 		rule_files: RuleFiles,
+		// Shared with the walk's thread like `stop`, and with whoever reports it.
+		progress: Arc<WalkProgress>,
 	) -> Self {
 		let at = stage.path().display().to_string();
 		let stop = Arc::new(AtomicBool::new(false));
@@ -7857,6 +7884,7 @@ impl LocalWalk {
 				rule_files,
 				stage,
 				&walking,
+				&progress,
 			)
 		});
 		Self { handle, stop, at }

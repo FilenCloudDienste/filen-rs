@@ -93,7 +93,7 @@ pub use engine::{
 	BaselineInUse, BaselineSchemaMismatch, CONFIRM_TENURE, ConflictResolution,
 	PATH_FAILURE_RETRY_INTERVAL, PairOverlap, SyncEngine,
 };
-pub use events::{SyncEvent, SyncObserver, TransferDirection};
+pub use events::{LocalScanProgress, SyncEvent, SyncObserver, TransferDirection};
 pub use guard::{DeleteGuard, GuardReason};
 #[cfg(feature = "uniffi")]
 pub use js_impl::{

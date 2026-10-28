@@ -8,6 +8,7 @@ use uuid::Uuid;
 use super::*;
 use crate::sync_engine::{
 	baseline::BaselineState,
+	events::LocalScanProgress,
 	ignore::{IgnoreLevel, parse_user_ignore},
 };
 
@@ -1154,6 +1155,7 @@ fn a_twin_that_vanishes_before_its_hash_is_read_is_no_collision() {
 				None
 			}),
 			max_read_workers: MAX_READ_WORKERS,
+			progress: &WalkProgress::default(),
 		},
 		MapSink::with_capacity(4),
 	);
@@ -2498,6 +2500,7 @@ fn a_whole_walk_into_the_stage_finds_what_a_walk_into_a_map_finds() {
 			RuleFiles::Read,
 			stage,
 			&AtomicBool::new(false),
+			&WalkProgress::default(),
 		)
 		.unwrap();
 
@@ -2648,6 +2651,7 @@ fn a_walk_reading_entries_on_workers_finds_what_one_reading_them_inline_finds() 
 				stop: None,
 				moved_hash: None,
 				max_read_workers,
+				progress: &WalkProgress::default(),
 			},
 			Recording {
 				map: MapSink::with_capacity(1024),
@@ -2849,6 +2853,7 @@ fn a_staged_walk_stopped_before_it_starts_stages_nothing() {
 		RuleFiles::Read,
 		stage,
 		&AtomicBool::new(true),
+		&WalkProgress::default(),
 	)
 	.unwrap();
 	assert!(!scan.complete);
@@ -2884,6 +2889,7 @@ fn a_walk_cut_short_while_listing_puts_none_of_the_reads_under_way() {
 			stop: None,
 			moved_hash: None,
 			max_read_workers: 1,
+			progress: &WalkProgress::default(),
 		},
 		Recording {
 			map: MapSink::with_capacity(300),
@@ -2916,6 +2922,7 @@ fn a_walk_stopped_while_it_waits_on_its_reads_waits_for_no_more_of_them() {
 			stop: Some(&stop),
 			moved_hash: None,
 			max_read_workers: 1,
+			progress: &WalkProgress::default(),
 		},
 		StopAt {
 			map: MapSink::with_capacity(300),
@@ -2949,6 +2956,7 @@ fn scan_watched(
 			stop: None,
 			moved_hash: None,
 			max_read_workers: MAX_READ_WORKERS,
+			progress: &WalkProgress::default(),
 		},
 		MapSink::with_capacity(1024),
 	);
@@ -2958,4 +2966,124 @@ fn scan_watched(
 /// The rows a test spells as a path-keyed map, as the pass's resident baseline.
 fn tree(rows: &HashMap<String, BaselineEntry>) -> Baseline {
 	Baseline::from_rows(rows.values().cloned())
+}
+
+/// A tree of one directory and four files, 26 bytes in all.
+fn progress_tree() -> std::path::PathBuf {
+	let root = temp_root();
+	fs::create_dir(root.join("d")).unwrap();
+	fs::write(root.join("d/a.txt"), b"aaa").unwrap();
+	fs::write(root.join("d/b.txt"), b"bbbbb").unwrap();
+	fs::write(root.join("d/c.txt"), b"ccccccc").unwrap();
+	fs::write(root.join("top.txt"), b"ttttttttttt").unwrap();
+	root
+}
+
+/// A whole walk of `root` against `baseline` on up to `max_read_workers` workers, and what it
+/// counted.
+fn counted_walk(root: &Path, baseline: &Baseline, max_read_workers: usize) -> LocalScanProgress {
+	let progress = WalkProgress::default();
+	let Ok((scan, _)) = scan_local_watched(
+		ScanRoot {
+			path: root,
+			pair_root: PairRoot::Directory,
+		},
+		"",
+		baseline,
+		IgnoreRules::default(),
+		&RuleFiles::Read,
+		Hooks {
+			on_listed: &mut |_| ControlFlow::Continue(()),
+			stop: None,
+			moved_hash: None,
+			max_read_workers,
+			progress: &progress,
+		},
+		MapSink::with_capacity(16),
+	);
+	assert!(scan.complete, "{:?}", scan.errors);
+	progress.snapshot()
+}
+
+#[test]
+fn a_whole_walk_counts_every_entry_and_every_file_it_hashes() {
+	let root = progress_tree();
+	// Read on the walk's own thread, and on workers.
+	for max_read_workers in [0, MAX_READ_WORKERS] {
+		assert_eq!(
+			counted_walk(&root, &Baseline::default(), max_read_workers),
+			LocalScanProgress {
+				entries: 5,
+				files_to_hash: 4,
+				bytes_to_hash: 26,
+				files_hashed: 4,
+				bytes_hashed: 26,
+			},
+			"with {max_read_workers} workers"
+		);
+	}
+	fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn a_walk_the_fast_path_answers_hashes_nothing() {
+	let root = progress_tree();
+	let walked = scan_local(
+		ScanRoot {
+			path: &root,
+			pair_root: PairRoot::Directory,
+		},
+		&Baseline::default(),
+		IgnoreRules::default(),
+		RuleFiles::Read,
+	)
+	.0;
+	let baseline = Baseline::from_rows(sorted_entries(&walked.nodes.whole()).into_iter().map(
+		|(rel_path, node)| BaselineEntry {
+			rel_path,
+			kind: node.kind,
+			remote_uuid: None,
+			content_hash: node.content_hash,
+			size: Some(node.size),
+			local_mtime: Some(node.mtime_millis),
+			remote_modified: None,
+			state: BaselineState::Synced,
+			local_kind: None,
+			remote_kind: None,
+			remote_hash: None,
+			remote_size: None,
+			remote_stable_uuid: None,
+			agreed_hash: None,
+		},
+	));
+
+	for max_read_workers in [0, MAX_READ_WORKERS] {
+		assert_eq!(
+			counted_walk(&root, &baseline, max_read_workers),
+			LocalScanProgress {
+				entries: 5,
+				..LocalScanProgress::default()
+			},
+			"with {max_read_workers} workers"
+		);
+	}
+	fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn what_the_rules_hide_is_not_counted() {
+	let root = progress_tree();
+	fs::write(root.join(FILENIGNORE), "d/\n").unwrap();
+	assert_eq!(
+		counted_walk(&root, &Baseline::default(), MAX_READ_WORKERS),
+		LocalScanProgress {
+			// `top.txt` and the rule file itself.
+			entries: 2,
+			files_to_hash: 2,
+			bytes_to_hash: 14,
+			files_hashed: 2,
+			bytes_hashed: 14,
+		}
+	);
+	fs::remove_dir_all(&root).unwrap();
 }

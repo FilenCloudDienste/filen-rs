@@ -192,6 +192,26 @@ fn events_map_with_their_payloads() {
 			},
 		),
 		(
+			SyncEvent::Scanning {
+				progress: LocalScanProgress {
+					entries: 9,
+					files_to_hash: 4,
+					bytes_to_hash: 400,
+					files_hashed: 3,
+					bytes_hashed: 350,
+				},
+			},
+			SyncEventMessage::Scanning {
+				progress: LocalScanProgress {
+					entries: 9,
+					files_to_hash: 4,
+					bytes_to_hash: 400,
+					files_hashed: 3,
+					bytes_hashed: 350,
+				},
+			},
+		),
+		(
 			SyncEvent::Quarantined {
 				rel_path: "a/b.txt".to_owned(),
 				bin_path: PathBuf::from("/root/.filen-sync-trash/b.txt"),

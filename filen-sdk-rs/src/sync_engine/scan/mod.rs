@@ -26,6 +26,9 @@
 //! real path is the one synced, whichever of the two the walk reaches first; the link is recorded in
 //! [`LocalScan::aliased_dirs`].
 
+// How far a whole walk has got, and the events a pass reports it with.
+mod progress;
+
 use std::{
 	collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
 	convert::Infallible,
@@ -49,6 +52,7 @@ use filen_types::crypto::Blake3Hash;
 use unicode_normalization::{UnicodeNormalization, is_nfc};
 use uuid::Uuid;
 
+pub(crate) use self::progress::{WalkProgress, report_scan_progress};
 use super::{
 	SyncMode,
 	baseline::{BaselineEntry, NodeKind},
@@ -597,6 +601,20 @@ pub(super) fn hash_file(path: &Path) -> std::io::Result<Blake3Hash> {
 	Ok(hasher.finalize().into())
 }
 
+/// [`hash_file`] of a file the walk listed `size` bytes long, counted in `progress` as it is read.
+/// The same bytes reach the hasher: the count only looks at how many each read returned.
+fn hash_file_counted(
+	path: &Path,
+	size: u64,
+	progress: &WalkProgress,
+) -> std::io::Result<Blake3Hash> {
+	let mut read = progress.hash_read(size);
+	let file = std::fs::File::open(path)?;
+	let mut hasher = blake3::Hasher::new();
+	hasher.update_reader(read.reader(&file))?;
+	Ok(hasher.finalize().into())
+}
+
 /// The fast-path: reuse the baseline's content hash when the file's `(size, mtime)` are unchanged,
 /// so an untouched file is never re-hashed. `None` means "diverged or unknown — must hash".
 pub(super) fn fast_path_hash(
@@ -833,6 +851,7 @@ pub(crate) fn scan_local(
 			stop: None,
 			moved_hash: None,
 			max_read_workers: MAX_READ_WORKERS,
+			progress: &WalkProgress::default(),
 		},
 		MapSink::with_capacity(baseline.len().max(1024)),
 	);
@@ -855,6 +874,9 @@ pub(crate) fn scan_local(
 /// trash and, in a pair `root` says is rooted at the drive, the account's data directory (see
 /// [`is_account_data`]).
 ///
+/// `progress` counts what the walk lists and hashes as it goes, for the pass to report (see
+/// [`report_scan_progress`]).
+///
 /// Once `stop` is set the walk lists and hands over nothing more, and comes back incomplete once each
 /// worker has finished the read it is in, to its end (a hash read cannot be interrupted). That is
 /// how a pass gives up a walk it started before it knew the rules to walk with.
@@ -868,6 +890,7 @@ pub(crate) fn scan_local_staged(
 	rule_files: RuleFiles,
 	stage: Stage,
 	stop: &AtomicBool,
+	progress: &WalkProgress,
 ) -> rusqlite::Result<(LocalScan, IgnoreRules)> {
 	scan_local_watched(
 		root,
@@ -880,6 +903,7 @@ pub(crate) fn scan_local_staged(
 			stop: Some(stop),
 			moved_hash: None,
 			max_read_workers: MAX_READ_WORKERS,
+			progress,
 		},
 		StageSink::new(stage, Paging::PASS)?,
 	)
@@ -920,6 +944,8 @@ struct Hooks<'h> {
 	/// How many threads, at most, read entries ([`MAX_READ_WORKERS`] outside the tests), and no more
 	/// than the machine's available parallelism; `0` reads them all on the walk's own thread.
 	max_read_workers: usize,
+	/// What the walk has listed and hashed so far.
+	progress: &'h WalkProgress,
 }
 
 /// What a listed entry turned out to be once read, followed through a symlink.
@@ -1009,10 +1035,15 @@ fn restat_failed_read(
 }
 
 /// Stat `entry` and, for a file, take the hash `row` holds when the fast path allows it and read the
-/// file otherwise.
-fn read_entry(entry: &walk::Entry, row: Option<&BaselineEntry>) -> std::io::Result<Reading> {
+/// file otherwise, counting the read in `progress`.
+fn read_entry(
+	entry: &walk::Entry,
+	row: Option<&BaselineEntry>,
+	progress: &WalkProgress,
+) -> std::io::Result<Reading> {
 	let read = reading(&entry.metadata()?, |size, mtime_millis| {
-		fast_path_hash(row, size, mtime_millis).map_or_else(|| hash_file(entry.path()), Ok)
+		fast_path_hash(row, size, mtime_millis)
+			.map_or_else(|| hash_file_counted(entry.path(), size, progress), Ok)
 	});
 	Ok(restat_failed_read(read, || entry.metadata()))
 }
@@ -1330,10 +1361,14 @@ type ReadAnswer = (usize, std::thread::Result<std::io::Result<Reading>>);
 /// Read the entries handed over `jobs`, answering each with its sequence number over `done`, until
 /// either channel closes. A panic in a read is carried over `done` to the walk's thread and resumed
 /// there, as if the walk had read the entry itself.
-fn read_worker(jobs: &Mutex<mpsc::Receiver<ReadJob>>, done: &mpsc::Sender<ReadAnswer>) {
+fn read_worker(
+	jobs: &Mutex<mpsc::Receiver<ReadJob>>,
+	done: &mpsc::Sender<ReadAnswer>,
+	progress: &WalkProgress,
+) {
 	// The lock is let go before the read: only taking a job is serialized.
 	while let Ok(Ok((seq, entry, row))) = jobs.lock().map(|jobs| jobs.recv()) {
-		let read = std::panic::catch_unwind(|| read_entry(&entry, row.as_ref()));
+		let read = std::panic::catch_unwind(|| read_entry(&entry, row.as_ref(), progress));
 		if done.send((seq, read)).is_err() {
 			return;
 		}
@@ -1359,6 +1394,7 @@ fn scan_local_watched<S: ScanSink>(
 		stop,
 		mut moved_hash,
 		max_read_workers,
+		progress,
 	}: Hooks<'_>,
 	sink: S,
 ) -> Result<(LocalScan, IgnoreRules), S::Error> {
@@ -1566,6 +1602,7 @@ fn scan_local_watched<S: ScanSink>(
 			if depth == 0 {
 				continue;
 			}
+			progress.listed();
 
 			let Some(rel) = rel else {
 				continue;
@@ -1608,8 +1645,11 @@ fn scan_local_watched<S: ScanSink>(
 						if is_file && known.is_none() && max_read_workers > 0 {
 							Next::HandOver(None)
 						} else {
-							let read = reading(&metadata, |_, _| {
-								known.map_or_else(|| hash_file(entry.path()), Ok)
+							let read = reading(&metadata, |size, _| {
+								known.map_or_else(
+									|| hash_file_counted(entry.path(), size, progress),
+									Ok,
+								)
 							});
 							Next::Read(Ok(restat_failed_read(read, || entry.metadata())))
 						}
@@ -1650,7 +1690,7 @@ fn scan_local_watched<S: ScanSink>(
 				let (jobs, done) = (&job_rx, done_tx.clone());
 				match std::thread::Builder::new()
 					.name("filen-sync-scan".to_owned())
-					.spawn_scoped(scope, move || read_worker(jobs, &done))
+					.spawn_scoped(scope, move || read_worker(jobs, &done, progress))
 				{
 					Ok(_) => workers += 1,
 					// Out of threads: the walk goes on with the workers it has, and reads on its
@@ -1667,7 +1707,7 @@ fn scan_local_watched<S: ScanSink>(
 			// A job is sent only with a worker started to answer it: the waits on `done_rx` would
 			// otherwise never return.
 			if workers == 0 {
-				window.answer(seq, read_entry(&entry, row.as_ref()))?;
+				window.answer(seq, read_entry(&entry, row.as_ref(), progress))?;
 			} else {
 				jobs.send((seq, entry, row))
 					.expect("the workers' channel outlives the walk (should be impossible)");
@@ -1792,6 +1832,8 @@ pub(crate) fn scan_subtree(
 			stop: None,
 			moved_hash: Some(moved_hash),
 			max_read_workers: MAX_READ_WORKERS,
+			// A subtree walk reads what a pass found changed, and reports nothing while it runs.
+			progress: &WalkProgress::default(),
 		},
 		// Sized to the walk and not to the pair: a subtree walk covers one directory, and the pair's
 		// count would size its table to the tree instead — a 50k-entry directory of a 100k-row pair

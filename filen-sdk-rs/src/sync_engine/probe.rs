@@ -1139,6 +1139,7 @@ fn pass_after_push(
 		RuleFiles::Read,
 		probe_stage(),
 		&AtomicBool::new(false),
+		&scan::WalkProgress::default(),
 	)
 	.expect("staging the probe's scan");
 	drop((rules_used, scan_baseline));
@@ -1230,6 +1231,7 @@ fn stage_pass_sides(
 		RuleFiles::Read,
 		probe_stage(),
 		&AtomicBool::new(false),
+		&scan::WalkProgress::default(),
 	)
 	.expect("staging the probe's scan");
 	drop(rules_used);
@@ -2404,6 +2406,7 @@ pub fn run() -> String {
 			RuleFiles::Read,
 			probe_stage(),
 			&AtomicBool::new(false),
+			&scan::WalkProgress::default(),
 		)
 		.expect("staging the probe's scan")
 	});

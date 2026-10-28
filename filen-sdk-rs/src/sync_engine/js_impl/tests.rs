@@ -23,8 +23,9 @@ use crate::{
 	},
 	sync_engine::{
 		Backlog, BaselineInUse, ConflictResolution, DeleteGuard, GuardReason, LegacyImport,
-		PauseMode, PlanOutcome, PlannedAction, PlannedActionKind, PlannedConflict, PlannedNodeKind,
-		SyncEvent, SyncMode, SyncReport, TransferDirection, WatchState, WatchStatus,
+		LocalScanProgress, PauseMode, PlanOutcome, PlannedAction, PlannedActionKind,
+		PlannedConflict, PlannedNodeKind, SyncEvent, SyncMode, SyncReport, TransferDirection,
+		WatchState, WatchStatus,
 		baseline::{BaselineEntry, BaselineState, BaselineStore, NodeKind},
 	},
 };
@@ -422,6 +423,53 @@ fn a_pass_shares_one_id_and_every_start_mints_a_fresh_one() {
 	observer(planned());
 
 	assert_eq!(pass_ids(&mut received), vec![1, 1, 1, 2, 2, 3, 3, 4, 5]);
+}
+
+fn scanning(entries: u64) -> SyncEvent {
+	SyncEvent::Scanning {
+		progress: LocalScanProgress {
+			entries,
+			..LocalScanProgress::default()
+		},
+	}
+}
+
+#[test]
+fn a_walks_progress_takes_the_id_of_the_pass_it_precedes() {
+	let (live, mut received) = live();
+	let mut observer = live.observer(1, 1, None);
+
+	for event in [scanning(1), scanning(2), started(), planned(), completed()] {
+		observer(event);
+	}
+	// A pass whose walk failed it before it started.
+	for event in [scanning(1), failed()] {
+		observer(event);
+	}
+	// A pass that walked nothing whole.
+	for event in [started(), completed()] {
+		observer(event);
+	}
+
+	assert_eq!(pass_ids(&mut received), vec![1, 1, 1, 1, 1, 2, 2, 3, 3]);
+}
+
+#[test]
+fn a_walks_progress_is_neither_a_pass_in_flight_nor_a_recent_event() {
+	let (live, _received) = live();
+	let mut observer = live.observer(1, 1, None);
+
+	observer(scanning(3));
+	assert_eq!(
+		lock(&live.pairs)
+			.get(&1)
+			.and_then(|pair| pair.pass_in_flight),
+		None
+	);
+	assert!(lock(&live.recent).is_empty());
+
+	observer(started());
+	assert_eq!(lock(&live.pairs)[&1].pass_in_flight, Some(1));
 }
 
 #[test]

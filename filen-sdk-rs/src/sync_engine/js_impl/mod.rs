@@ -256,12 +256,24 @@ struct PauseRecord {
 	options: SyncPauseOptions,
 }
 
+/// Where an observer's passes stand, for the `pass_id` the next event is sent under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PassTag {
+	/// No pass in flight.
+	Idle,
+	/// A pass whose walk has reported progress, and which has not started yet.
+	Scanning(u64),
+	/// A pass that has sent its `PassStarted`, or an event that found no pass in flight.
+	Started(u64),
+}
+
 /// The part of the core every pass's observer writes to. Its own `Arc` rather than the core's, so
 /// a watch loop holds no strong core, and the events of a pass still running when the core drops
 /// still reach the listener.
 struct LiveState {
 	pairs: Mutex<HashMap<PairId, PairLive>>,
-	/// The last [`RECENT_EVENTS`] events, oldest first, without `Progress` and `PassCompleted`.
+	/// The last [`RECENT_EVENTS`] events, oldest first, without `Progress`, `Scanning` and
+	/// `PassCompleted`.
 	recent: Mutex<VecDeque<SyncPassEvent>>,
 	deliveries: UnboundedSender<Delivery>,
 	/// The next pass id.
@@ -278,29 +290,38 @@ impl LiveState {
 		loop_alive: Option<oneshot::Sender<()>>,
 	) -> SyncObserver {
 		let live = Arc::clone(self);
-		let mut pass = None;
+		let mut pass = PassTag::Idle;
 		Box::new(move |event| {
 			let _loop_alive = &loop_alive;
 			live.observe(pair, pair_id, &mut pass, event);
 		})
 	}
 
-	/// Tag `event` with its pass, record it, and queue it for the listener. `pass` is the id of the
-	/// pass in flight: every `PassStarted` mints a fresh one, as does any other event that finds
-	/// none, and the pass's terminal event clears it. An `AwaitingRemote` comes before the pass's
-	/// `PassStarted` and stands alone, so it clears it too.
-	fn observe(&self, pair: PairId, pair_id: u64, pass: &mut Option<u64>, event: SyncEvent) {
+	/// Tag `event` with its pass, record it, and queue it for the listener. `pass` is the pass in
+	/// flight: every `PassStarted` mints a fresh id, as does any other event that finds none, and
+	/// the pass's terminal event clears it. An `AwaitingRemote` comes before the pass's
+	/// `PassStarted` and stands alone, so it clears it too. A `PassStarted` that follows the same
+	/// pass's `Scanning` events takes the id they were sent under instead, since they are that
+	/// pass's own walk.
+	///
+	/// A pass cancelled while it was still reading sends no terminal event, as before: one that had
+	/// sent `Scanning` leaves its id to the next pass of the pair.
+	fn observe(&self, pair: PairId, pair_id: u64, pass: &mut PassTag, event: SyncEvent) {
+		let started = matches!(event, SyncEvent::PassStarted { .. });
 		let pass_id = match *pass {
-			Some(pass_id) if !matches!(event, SyncEvent::PassStarted { .. }) => pass_id,
-			_ => self.passes.fetch_add(1, Ordering::Relaxed),
+			PassTag::Scanning(pass_id) => pass_id,
+			PassTag::Started(pass_id) if !started => pass_id,
+			PassTag::Started(_) | PassTag::Idle => self.passes.fetch_add(1, Ordering::Relaxed),
 		};
-		let ends = matches!(
-			event,
+		*pass = match &event {
 			SyncEvent::PassCompleted { .. }
-				| SyncEvent::PassFailed { .. }
-				| SyncEvent::AwaitingRemote
-		);
-		*pass = (!ends).then_some(pass_id);
+			| SyncEvent::PassFailed { .. }
+			| SyncEvent::AwaitingRemote => PassTag::Idle,
+			SyncEvent::Scanning { .. } if !matches!(*pass, PassTag::Started(_)) => {
+				PassTag::Scanning(pass_id)
+			}
+			_ => PassTag::Started(pass_id),
+		};
 		let event = SyncPassEvent {
 			pair_id,
 			pass_id,
@@ -333,7 +354,7 @@ impl LiveState {
 					live.last_pass_error = Some(error.clone());
 					live.last_pass_error_kind = Some(*kind);
 				}
-				SyncEventMessage::Progress { .. } => return,
+				SyncEventMessage::Progress { .. } | SyncEventMessage::Scanning { .. } => return,
 				_ => {}
 			}
 		}
@@ -1078,7 +1099,8 @@ impl JsSyncEngine {
 		self.core.last_report(pair_id)
 	}
 
-	/// The last 500 events of every pair, oldest first, without `Progress` and `PassCompleted`
+	/// The last 500 events of every pair, oldest first, without `Progress`, `Scanning` and
+	/// `PassCompleted`
 	/// (its report is [`last_report`](Self::last_report)), to rebuild an activity feed after a JS
 	/// reload. Not persisted.
 	#[napi_export]

@@ -9489,7 +9489,12 @@ async fn assert_dry_run_plans_what_the_first_pass_records(local_mtime: Duration)
 	assert_eq!(outcome.held, []);
 	assert_eq!(stored_paths(&engine, pair).await, Vec::<String>::new());
 
-	drop(engine.prepare(pair, None, Seeding::Write).await.unwrap());
+	drop(
+		engine
+			.prepare(pair, None, Seeding::Write, &Arc::default())
+			.await
+			.unwrap(),
+	);
 	assert_eq!(stored_paths(&engine, pair).await, ["a.bin"]);
 }
 
@@ -9554,7 +9559,12 @@ async fn a_dry_run_plans_nothing_at_a_file_the_imported_state_lists() {
 	assert_eq!(outcome.actions, []);
 	assert_eq!(stored_paths(&engine, pair).await, Vec::<String>::new());
 
-	drop(engine.prepare(pair, None, Seeding::Write).await.unwrap());
+	drop(
+		engine
+			.prepare(pair, None, Seeding::Write, &Arc::default())
+			.await
+			.unwrap(),
+	);
 	assert_eq!(stored_paths(&engine, pair).await, ["a.bin"]);
 }
 

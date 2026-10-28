@@ -34,6 +34,9 @@ use crate::ErrorKind;
 /// `PassCompleted` — with or without a `PassStarted` before it, depending on how far it got. A
 /// pass that has to wait for the cache to finish listing the remote reports
 /// [`AwaitingRemote`](Self::AwaitingRemote) before any of that.
+///
+/// A pass that walks the whole local tree reports how far the walk has got with
+/// [`Scanning`](Self::Scanning) while it runs, which is before `PassStarted`.
 // The report inline makes every event as large as `PassCompleted`, a copy of a few hundred bytes per
 // action event, which is noise beside the transfer it reports. Boxing it would make callers match
 // and compare through a `Box` for a variant delivered once per pass.
@@ -152,6 +155,41 @@ pub enum SyncEvent {
 	/// in [`PassFailed`](Self::PassFailed) with [`ErrorKind::StaleState`] instead, and the next
 	/// pass waits again.
 	AwaitingRemote,
+	/// How far the pass's walk of the whole local tree has got. Delivered BEFORE
+	/// [`PassStarted`](Self::PassStarted): the walk is part of the read that a pass starts once it
+	/// has done, and the read a pair's first pass makes hashes every file it finds, which on a large
+	/// tree takes hours.
+	///
+	/// At most one every 500 ms per pass, and only when a figure moved since the last one; once the
+	/// walk has ended, one more with its final figures unless the last one already carried them. A
+	/// walk that ends within its first 500 ms reports none, and a pass that walks nothing whole (it
+	/// re-read only what changed since the last one) reports none either. Every figure only grows
+	/// within a pass, and the figures of a walk the pass gave up to walk again with other ignore
+	/// rules stay counted.
+	Scanning { progress: LocalScanProgress },
+}
+
+/// How far a walk of a pair's local tree has got (see [`SyncEvent::Scanning`]).
+///
+/// The walk finds the files it has to hash as it goes, so `files_to_hash` and `bytes_to_hash` grow
+/// with it and are the totals only once it has ended. `files_hashed` never exceeds `files_to_hash`,
+/// nor `bytes_hashed` `bytes_to_hash`.
+#[js_type(export, no_deser, napi)]
+#[derive(Default, Copy)]
+pub struct LocalScanProgress {
+	/// Entries the walk has listed, files and directories alike; what the ignore rules hide is not
+	/// listed.
+	pub entries: u64,
+	/// Files found so far whose content has to be read: a file whose size and modification time
+	/// still match what the last pass synced is not read again.
+	pub files_to_hash: u64,
+	/// The combined size of those files in bytes, as listed.
+	pub bytes_to_hash: u64,
+	/// Of those, the files whose read has ended, read whole or failed.
+	pub files_hashed: u64,
+	/// Bytes of those files read so far, each file counted up to its listed size; a file whose read
+	/// ended counts in full.
+	pub bytes_hashed: u64,
 }
 
 /// Which way a file transfer moves its bytes.

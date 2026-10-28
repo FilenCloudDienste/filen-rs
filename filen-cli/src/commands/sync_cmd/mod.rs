@@ -256,5 +256,13 @@ fn format_sync_event(event: &SyncEvent) -> String {
 		),
 		SyncEvent::PassFailed { error, .. } => format!("Sync pass failed: {error}"),
 		SyncEvent::AwaitingRemote => "Waiting for the remote folder to finish indexing".to_string(),
+		SyncEvent::Scanning { progress } => format!(
+			"Scanning local files: {} found, {}/{} file(s) hashed ({}/{} bytes)",
+			progress.entries,
+			progress.files_hashed,
+			progress.files_to_hash,
+			progress.bytes_hashed,
+			progress.bytes_to_hash,
+		),
 	}
 }

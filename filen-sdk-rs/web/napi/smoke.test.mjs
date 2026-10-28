@@ -306,7 +306,8 @@ describe("exports", () => {
 				"AdoptedBaseline",
 				"PassCompleted",
 				"PassFailed",
-				"AwaitingRemote"
+				"AwaitingRemote",
+				"Scanning"
 			])
 		)
 		assert.deepEqual(

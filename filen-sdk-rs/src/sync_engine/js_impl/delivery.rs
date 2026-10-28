@@ -114,11 +114,13 @@ fn deliver(listener: &(dyn Fn(Vec<Delivery>) + Send + Sync), drained: Vec<Delive
 	}
 }
 
-/// `deliveries` without each `Progress` a later one in the same list supersedes: the same pair,
-/// pass, path and direction. The latest keeps its own position, so it still comes before the event
-/// that ends its transfer. Nothing else is dropped.
+/// `deliveries` without each `Progress` a later one in the same list supersedes (the same pair,
+/// pass, path and direction), and without each `Scanning` a later one supersedes (the same pair and
+/// pass). The latest keeps its own position, so it still comes before the event that ends its
+/// transfer, or the `PassStarted` that follows its walk. Nothing else is dropped.
 fn coalesce(deliveries: Vec<Delivery>) -> Vec<Delivery> {
 	let mut seen = HashSet::new();
+	let mut scanned = HashSet::new();
 	// From the back, so the first sighting of a key is its latest tick.
 	let mut keep: Vec<bool> = deliveries
 		.iter()
@@ -139,6 +141,12 @@ fn coalesce(deliveries: Vec<Delivery>) -> Vec<Delivery> {
 				rel_path.as_str(),
 				*direction == TransferDirection::Upload,
 			)),
+			Delivery::Event(SyncPassEvent {
+				pair_id,
+				pass_id,
+				event: SyncEventMessage::Scanning { .. },
+				..
+			}) => scanned.insert((*pair_id, *pass_id)),
 			_ => true,
 		})
 		.collect();
@@ -155,7 +163,7 @@ mod tests {
 	use std::sync::mpsc;
 
 	use super::*;
-	use crate::sync_engine::WatchState;
+	use crate::sync_engine::{LocalScanProgress, SyncMode, WatchState};
 
 	fn event(pass_id: u64, event: SyncEventMessage) -> Delivery {
 		Delivery::Event(SyncPassEvent {
@@ -228,6 +236,41 @@ mod tests {
 				uploading("a"),
 				progress("b", TransferDirection::Upload, 90),
 			]
+		);
+	}
+
+	fn scanning(pass_id: u64, entries: u64) -> Delivery {
+		event(
+			pass_id,
+			SyncEventMessage::Scanning {
+				progress: LocalScanProgress {
+					entries,
+					..LocalScanProgress::default()
+				},
+			},
+		)
+	}
+
+	#[test]
+	fn only_the_latest_scanning_of_a_pass_is_kept_and_it_stays_before_the_start() {
+		let started = event(
+			7,
+			SyncEventMessage::PassStarted {
+				mode: SyncMode::TwoWay,
+			},
+		);
+		let coalesced = coalesce(vec![
+			scanning(6, 50),
+			scanning(7, 10),
+			status(1),
+			scanning(7, 20),
+			scanning(7, 30),
+			started.clone(),
+		]);
+
+		assert_eq!(
+			coalesced,
+			vec![scanning(6, 50), status(1), scanning(7, 30), started]
 		);
 	}
 
