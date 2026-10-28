@@ -22,6 +22,12 @@ pub(in crate::cache) mod columns;
 mod diff;
 mod event;
 pub(crate) use event::PersistedEvent;
+// Read by `cache::enumerate`, compiled under the same gate.
+#[cfg(all(
+	feature = "sync-engine",
+	not(all(target_family = "wasm", target_os = "unknown"))
+))]
+pub(in crate::cache) use event::converged_generation_on;
 mod item;
 mod membership;
 mod root;
@@ -278,9 +284,11 @@ impl CacheState {
 	/// Wipe every non-root item (cascading to `dirs`/`files` via FK + trigger). The account-root item,
 	/// the `events` store, and the `cache_meta` watermark are intentionally left intact — so the caller
 	/// is responsible for scheduling a resync to re-converge the now-empty item cache. No sync root is
-	/// held whole afterwards, so the listed-roots record is cleared first.
+	/// held whole or converged afterwards, so the listed-roots and converged-roots records are cleared
+	/// first.
 	pub(crate) fn delete_all_non_root(&mut self) -> rusqlite::Result<()> {
 		event::forget_listed_roots_on(&self.db)?;
+		event::reset_converged_roots_on(&self.db)?;
 		self.db.execute(statements::ITEM_DELETE_ALL_NON_ROOT, [])?;
 		self.db.execute(statements::UNDECODABLE_DELETE_ALL, [])?;
 		Ok(())
@@ -394,6 +402,9 @@ impl CacheState {
 		self.root_id = self
 			.db
 			.query_one(statements::SELECT_ROOT_ID, (), |row| row.get(ITEMS_ID))?;
+		// A worker starting on this DB converged nothing yet: the drive may have moved on while no
+		// worker listened, and each root converges again once it is registered.
+		event::reset_converged_roots_on(&self.db)?;
 		Ok(())
 	}
 }

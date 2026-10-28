@@ -95,6 +95,10 @@ pub(crate) const NEEDS_RESYNC_KEY: &str = "needs_resync";
 /// (see `listed_roots_on` in `sql/event`). Absent or NULL when it holds none. Like `needs_resync` it has
 /// no seed row, so a DB written before it existed reads as holding none.
 pub(crate) const LISTED_ROOTS_KEY: &str = "listed_roots";
+/// Key for the sync roots whose cached subtree is a whole, current view of the remote, and the
+/// generation of that record (see `converged_roots_on` in `sql/event`). Absent reads as generation
+/// 0 holding none.
+pub(crate) const CONVERGED_ROOTS_KEY: &str = "converged_roots";
 
 pub(crate) const DIR_UPDATE_COLOR: &str = include_str!("raw/dir_update_color.sql");
 pub(crate) const DIR_UPDATE_NAME: &str = include_str!("raw/dir_update_name.sql");

@@ -3793,6 +3793,406 @@ fn a_reopened_cache_adds_a_root_it_listed_whole_without_relisting_it() {
 	let _ = std::fs::remove_file(path.with_extension("db-shm"));
 }
 
+/// A root the cache has not listed yet is not converged, and one whose listing committed is: a sync
+/// pass reads the first as a partial view and plans nothing against it.
+#[test]
+fn a_root_is_converged_once_its_listing_commits_and_not_before() {
+	let mut state = CacheState::new_in_memory();
+	let root = cache_dir(1, state.root_uuid);
+	state.set_test_sync_roots(only_root(root.uuid));
+	assert_eq!(state.converged_generation(root.uuid), None);
+
+	list_root(&mut state, &root, vec![cache_file(2, root.uuid, 100)], 100);
+
+	assert_eq!(state.converged_generation(root.uuid), Some(1));
+}
+
+/// A listing that held a record the cache could not decode keeps its root out of the listed-roots
+/// record, so its next add relists; it still converges, as a snapshot carries that record.
+#[test]
+fn a_root_whose_listing_held_an_undecodable_record_converges_all_the_same() {
+	let mut state = CacheState::new_in_memory();
+	let root = cache_dir(1, state.root_uuid);
+	state.set_test_sync_roots(only_root(root.uuid));
+	state.upsert_dirs(once(&root)).unwrap();
+
+	state
+		.apply_resync(
+			vec![(root.uuid, Vec::new(), vec![cache_file(2, root.uuid, 100)])],
+			&[root.uuid],
+			Vec::new(),
+			100,
+			false,
+		)
+		.unwrap();
+
+	assert_eq!(state.roots_held_whole().unwrap(), Vec::<Uuid>::new());
+	assert_eq!(state.converged_generation(root.uuid), Some(1));
+}
+
+/// A cache opened on a DB a previous worker left converged nothing yet, whatever that worker did:
+/// the drive may have moved on meanwhile. Adding the root converges it again, here without a
+/// relist, as the DB still holds its listing.
+#[test]
+fn a_reopened_cache_converges_a_root_only_once_it_is_added_again() {
+	let path = std::env::temp_dir().join(format!("filen-cache-converged-{}.db", Uuid::new_v4()));
+	let account = Uuid::new_v4();
+	let root = cache_dir(1, account);
+	{
+		let mut state = CacheState::new_on_path(&path, account);
+		state.set_test_sync_roots(only_root(root.uuid));
+		list_root(&mut state, &root, Vec::new(), 100);
+		assert_eq!(state.converged_generation(root.uuid), Some(1));
+	}
+
+	{
+		let mut state = CacheState::new_on_path(&path, account);
+		state.set_test_sync_roots(HashMap::new());
+		assert_eq!(state.converged_generation(root.uuid), None);
+
+		assert!(!add_root_relists(&mut state, root.uuid));
+		assert_eq!(
+			state.converged_generation(root.uuid),
+			Some(2),
+			"converged under the generation the reopen moved to"
+		);
+	}
+
+	let _ = std::fs::remove_file(&path);
+	let _ = std::fs::remove_file(path.with_extension("db-wal"));
+	let _ = std::fs::remove_file(path.with_extension("db-shm"));
+}
+
+/// A root registered under a converged root is not listed on its own: the root covering it kept
+/// its rows current, so it is converged with it, and stays so once that root's registration goes.
+#[test]
+fn a_root_registered_under_a_converged_root_converges_with_it() {
+	let mut state = CacheState::new_in_memory();
+	let outer = cache_dir(1, state.root_uuid);
+	let inner = cache_dir(2, outer.uuid);
+	state.set_test_sync_roots(only_root(outer.uuid));
+	state.upsert_dirs(once(&outer)).unwrap();
+	state
+		.apply_resync(
+			vec![(outer.uuid, vec![inner.clone()], Vec::new())],
+			&[],
+			Vec::new(),
+			100,
+			false,
+		)
+		.unwrap();
+	assert_eq!(state.converged_generation(inner.uuid), None);
+
+	assert!(!add_root_relists(&mut state, inner.uuid));
+	assert_eq!(state.converged_generation(inner.uuid), Some(1));
+
+	assert!(!drive(state.remove_registration(outer.uuid, 0, false)).unwrap());
+	assert_eq!(state.converged_generation(outer.uuid), None);
+	assert_eq!(state.converged_generation(inner.uuid), Some(1));
+}
+
+/// A root whose last registration goes is kept current by nothing, so it leaves the converged
+/// roots; the other root stays, at the same generation.
+#[test]
+fn removing_a_roots_last_registration_takes_it_out_of_the_converged_roots() {
+	let mut state = CacheState::new_in_memory();
+	let kept = cache_dir(1, state.root_uuid);
+	let removed = cache_dir(2, state.root_uuid);
+	let mut roots = only_root(kept.uuid);
+	roots.insert(removed.uuid, Box::new(|_| {}));
+	state.set_test_sync_roots(roots);
+	state.upsert_dirs([&kept, &removed].into_iter()).unwrap();
+	state
+		.apply_resync(
+			vec![
+				(kept.uuid, Vec::new(), Vec::new()),
+				(removed.uuid, Vec::new(), Vec::new()),
+			],
+			&[],
+			Vec::new(),
+			100,
+			false,
+		)
+		.unwrap();
+	assert_eq!(state.converged_generation(removed.uuid), Some(1));
+
+	assert!(!drive(state.remove_registration(removed.uuid, 0, false)).unwrap());
+
+	assert_eq!(state.converged_generation(removed.uuid), None);
+	assert_eq!(state.converged_generation(kept.uuid), Some(1));
+}
+
+/// A wipe of every cached row leaves no root converged, under a new generation.
+#[test]
+fn a_wipe_takes_every_root_out_of_the_converged_roots() {
+	let mut state = CacheState::new_in_memory();
+	let root = cache_dir(1, state.root_uuid);
+	state.set_test_sync_roots(only_root(root.uuid));
+	list_root(&mut state, &root, Vec::new(), 100);
+	state.add_converged_roots(&[root.uuid]).unwrap();
+
+	state.delete_all_non_root().unwrap();
+
+	assert_eq!(state.converged_generation(root.uuid), None);
+	state.add_converged_roots(&[root.uuid]).unwrap();
+	assert_eq!(state.converged_generation(root.uuid), Some(2));
+}
+
+/// The roots a socket write left short, waiting for their relist.
+fn short_roots(state: &CacheState) -> Vec<Uuid> {
+	state
+		.short_roots
+		.as_ref()
+		.map(|short| short.roots.clone())
+		.unwrap_or_default()
+}
+
+/// A dir the cache never held, moved into a converged root, lands as its own row and its contents
+/// never arrive: the root leaves the converged roots, and its relist is scheduled.
+#[test]
+fn a_dir_moved_into_a_converged_root_from_outside_unconverges_it_until_a_relist() {
+	let mut state = CacheState::new_in_memory();
+	let account = state.root_uuid;
+	let root = cache_dir(1, account);
+	let elsewhere = cache_dir(2, account);
+	let moved = cache_dir(3, elsewhere.uuid);
+	state.upsert_dirs([&elsewhere, &moved].into_iter()).unwrap();
+	state.set_test_sync_roots(only_root(root.uuid));
+	list_root(&mut state, &root, Vec::new(), 100);
+	assert_eq!(state.converged_generation(root.uuid), Some(1));
+
+	let mut moved_in = moved.clone();
+	moved_in.parent = root.uuid;
+	drain_socket_event(
+		&mut state,
+		101,
+		CacheEventType::Dir(DirEvent::Move(moved_in)),
+	);
+
+	assert_eq!(item_parent(&state, moved.uuid), Some(root.uuid));
+	assert_eq!(state.converged_generation(root.uuid), None);
+	assert_eq!(short_roots(&state), vec![root.uuid]);
+	assert!(
+		!state.needs_resync().unwrap(),
+		"the relist waits for the settle delay"
+	);
+}
+
+/// A dir moved between two places inside a converged root takes its contents along: the root stays
+/// converged, and nothing is relisted.
+#[test]
+fn a_dir_moved_within_a_converged_root_keeps_it_converged() {
+	let mut state = CacheState::new_in_memory();
+	let root = cache_dir(1, state.root_uuid);
+	let from = cache_dir(2, root.uuid);
+	let to = cache_dir(3, root.uuid);
+	let moved = cache_dir(4, from.uuid);
+	state.set_test_sync_roots(only_root(root.uuid));
+	state.upsert_dirs(once(&root)).unwrap();
+	state
+		.apply_resync(
+			vec![(root.uuid, vec![from, to.clone(), moved.clone()], Vec::new())],
+			&[],
+			Vec::new(),
+			100,
+			false,
+		)
+		.unwrap();
+
+	let mut moved_on = moved.clone();
+	moved_on.parent = to.uuid;
+	drain_socket_event(
+		&mut state,
+		101,
+		CacheEventType::Dir(DirEvent::Move(moved_on)),
+	);
+
+	assert_eq!(item_parent(&state, moved.uuid), Some(to.uuid));
+	assert_eq!(state.converged_generation(root.uuid), Some(1));
+	assert_eq!(short_roots(&state), Vec::<Uuid>::new());
+}
+
+/// A dir created in a converged root has no contents yet: the root stays converged.
+#[test]
+fn a_dir_created_in_a_converged_root_keeps_it_converged() {
+	let mut state = CacheState::new_in_memory();
+	let root = cache_dir(1, state.root_uuid);
+	state.set_test_sync_roots(only_root(root.uuid));
+	list_root(&mut state, &root, Vec::new(), 100);
+
+	drain_socket_event(
+		&mut state,
+		101,
+		CacheEventType::Dir(DirEvent::New(cache_dir(2, root.uuid))),
+	);
+
+	assert_eq!(state.converged_generation(root.uuid), Some(1));
+	assert_eq!(short_roots(&state), Vec::<Uuid>::new());
+}
+
+/// A dir restored from the trash into a converged root comes back without its contents, which the
+/// trash took out of the cache and the restore does not send again: the root leaves the converged
+/// roots until its relist.
+#[test]
+fn a_dir_restored_into_a_converged_root_unconverges_it_until_a_relist() {
+	let mut state = CacheState::new_in_memory();
+	let root = cache_dir(1, state.root_uuid);
+	state.set_test_sync_roots(only_root(root.uuid));
+	list_root(&mut state, &root, Vec::new(), 100);
+
+	drain_socket_event(
+		&mut state,
+		101,
+		CacheEventType::Dir(DirEvent::Restored(cache_dir(2, root.uuid))),
+	);
+
+	assert_eq!(state.converged_generation(root.uuid), None);
+	assert_eq!(short_roots(&state), vec![root.uuid]);
+}
+
+/// A file restored over a version the cache still holds can leave that version cached beside it:
+/// the root leaves the converged roots until its relist.
+#[test]
+fn a_file_restored_in_a_converged_root_unconverges_it_until_a_relist() {
+	let mut state = CacheState::new_in_memory();
+	let root = cache_dir(1, state.root_uuid);
+	let current = cache_file(2, root.uuid, 100);
+	state.set_test_sync_roots(only_root(root.uuid));
+	list_root(&mut state, &root, vec![current.clone()], 100);
+
+	let mut restored = cache_file(3, root.uuid, 50);
+	restored.stable_uuid = current.stable_uuid;
+	drain_socket_event(
+		&mut state,
+		101,
+		CacheEventType::File(FileEvent::Changed(restored)),
+	);
+
+	assert_eq!(state.converged_generation(root.uuid), None);
+	assert_eq!(short_roots(&state), vec![root.uuid]);
+}
+
+/// A drive event the cache could not apply names no root, so every registered root leaves the
+/// converged roots until its relist.
+#[test]
+fn an_event_the_cache_could_not_apply_unconverges_every_root_until_a_relist() {
+	let mut state = CacheState::new_in_memory();
+	let root = cache_dir(1, state.root_uuid);
+	state.set_test_sync_roots(only_root(root.uuid));
+	list_root(&mut state, &root, Vec::new(), 100);
+
+	state.drain_pending(Some(CacheThreadEvent::Socket(
+		CacheEventMaybeDecrypted::FrontierAdvance { id: 101 },
+	)));
+
+	assert_eq!(state.watermark().unwrap(), Some(101));
+	assert_eq!(state.converged_generation(root.uuid), None);
+	assert_eq!(short_roots(&state), vec![root.uuid]);
+}
+
+/// A manual listing is not ordered against the watermark and can put back an item an event
+/// deleted: no root stays converged after it, and no relist is scheduled for it.
+#[test]
+fn a_manual_listing_unconverges_every_root_without_a_relist() {
+	let mut state = CacheState::new_in_memory();
+	let root = cache_dir(1, state.root_uuid);
+	state.set_test_sync_roots(only_root(root.uuid));
+	list_root(&mut state, &root, Vec::new(), 100);
+
+	state
+		.handle_manual_event(ManualEvent::ListDirRecursive(Vec::new(), Vec::new()))
+		.unwrap();
+
+	assert_eq!(state.converged_generation(root.uuid), None);
+	assert_eq!(short_roots(&state), Vec::<Uuid>::new());
+	assert!(!state.needs_resync().unwrap());
+}
+
+/// A resync that commits before a short root's relist is due may have listed it before the server
+/// caught up with the write: it leaves the root out of the converged and the listed roots, and the
+/// relist stays scheduled.
+#[test]
+fn a_resync_before_the_relist_is_due_leaves_a_short_root_unconverged() {
+	let mut state = CacheState::new_in_memory();
+	let root = cache_dir(1, state.root_uuid);
+	let other = cache_dir(2, state.root_uuid);
+	let mut roots = only_root(root.uuid);
+	roots.insert(other.uuid, Box::new(|_| {}));
+	state.set_test_sync_roots(roots);
+	state.upsert_dirs([&root, &other].into_iter()).unwrap();
+	let listing = || {
+		vec![
+			(root.uuid, Vec::new(), Vec::new()),
+			(other.uuid, Vec::new(), Vec::new()),
+		]
+	};
+	state
+		.apply_resync(listing(), &[], Vec::new(), 100, false)
+		.unwrap();
+	drain_socket_event(
+		&mut state,
+		101,
+		CacheEventType::Dir(DirEvent::Restored(cache_dir(3, root.uuid))),
+	);
+
+	state
+		.apply_resync(listing(), &[], Vec::new(), 101, false)
+		.unwrap();
+
+	assert_eq!(state.converged_generation(root.uuid), None);
+	assert!(state.converged_generation(other.uuid).is_some());
+	assert_eq!(short_roots(&state), vec![root.uuid]);
+	state.set_test_sync_roots(HashMap::new());
+	assert!(add_root_relists(&mut state, root.uuid));
+}
+
+/// Each write that leaves a root short pushes its relist back to a full settle delay from that
+/// write, so the relist lists the drive once the server has caught up with the last of them.
+#[tokio::test(start_paused = true)]
+async fn a_later_short_write_pushes_the_relist_back() {
+	let mut state = CacheState::new_in_memory();
+	let root = cache_dir(1, state.root_uuid);
+	state.set_test_sync_roots(only_root(root.uuid));
+	list_root(&mut state, &root, Vec::new(), 100);
+	drain_socket_event(
+		&mut state,
+		101,
+		CacheEventType::Dir(DirEvent::Restored(cache_dir(2, root.uuid))),
+	);
+	tokio::time::advance(Duration::from_secs(3)).await;
+
+	drain_socket_event(
+		&mut state,
+		102,
+		CacheEventType::Dir(DirEvent::Restored(cache_dir(3, root.uuid))),
+	);
+
+	let due = state.short_roots.as_ref().map(|short| short.due);
+	assert_eq!(due, Some(TimerInstant::now() + SHORT_ROOTS_SETTLE));
+}
+
+/// The due relist records the resync that lists every root and clears the schedule, so the
+/// listing it runs converges the short root again.
+#[tokio::test]
+async fn the_due_relist_records_a_resync_that_converges_the_short_root() {
+	let mut state = CacheState::new_in_memory();
+	let root = cache_dir(1, state.root_uuid);
+	state.set_test_sync_roots(only_root(root.uuid));
+	list_root(&mut state, &root, Vec::new(), 100);
+	drain_socket_event(
+		&mut state,
+		101,
+		CacheEventType::Dir(DirEvent::Restored(cache_dir(2, root.uuid))),
+	);
+
+	state.relist_short_roots().await;
+
+	assert!(state.needs_resync().unwrap());
+	assert_eq!(short_roots(&state), Vec::<Uuid>::new());
+	list_root(&mut state, &root, Vec::new(), 101);
+	assert!(state.converged_generation(root.uuid).is_some());
+}
+
 /// A root whose rows are cached only because an enclosing root was listed was never listed itself,
 /// so adding it relists.
 #[test]

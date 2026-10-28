@@ -16,7 +16,7 @@ use crate::{
 	},
 	sync::lock::MAX_SLEEP_TIME_DEFAULT,
 	sync_engine::{
-		PauseMode,
+		PauseMode, PlannedActionKind,
 		apply::PassStart,
 		baseline::{BaselineChange, LegacyItem, LegacySide, NodeKind},
 		bin::{
@@ -5942,7 +5942,9 @@ async fn a_dry_run_takes_no_pass_gate() {
 async fn engine_whose_baseline_read_fails() -> (SyncEngine, PairId, tempfile::TempDir) {
 	let dir = tempfile::tempdir().unwrap();
 	let cache = dir.path().join("cache.db");
-	drop(CacheState::new_on_path(&cache, Uuid::from_u128(1)));
+	CacheState::new_on_path(&cache, Uuid::from_u128(1))
+		.add_converged_roots(&[Uuid::from_u128(2)])
+		.unwrap();
 	let client = Arc::new(offline_client());
 	client.configure_cache(cache, |_| {}).await.unwrap();
 	let db = dir.path().join("sync.db");
@@ -7636,6 +7638,50 @@ fn a_database_file_moved_away_while_open_is_an_io_error() {
 	assert_eq!(db_error(moved, "writing").kind(), ErrorKind::IO);
 }
 
+/// A dry run over a remote root the cache has not finished listing plans nothing: the file the
+/// listing has not reached yet would read as absent, and the plan would upload the local one over
+/// it. Once the cache records the root converged, the same rows plan that upload.
+#[tokio::test]
+async fn a_dry_run_plans_nothing_against_a_remote_root_the_cache_has_not_converged() {
+	let dir = tempfile::tempdir().unwrap();
+	let root = dir.path().join("local");
+	std::fs::create_dir(&root).unwrap();
+	std::fs::write(root.join("a.txt"), "local").unwrap();
+	let account = Uuid::from_u128(1);
+	let remote_root = Uuid::from_u128(2);
+	let cache = dir.path().join("cache.db");
+	let mut state = CacheState::new_on_path(&cache, account);
+	state
+		.upsert_dirs([&cacheable_dir(remote_root, account, "pair")].into_iter())
+		.unwrap();
+	let client = Arc::new(offline_client());
+	client.configure_cache(cache, |_| {}).await.unwrap();
+	let engine = SyncEngine::open(client, dir.path().join("sync.db"))
+		.await
+		.unwrap();
+	let (pair, _) = locked(&engine.control)
+		.create_pair(root.to_str().unwrap(), remote_root, SyncMode::TwoWay)
+		.unwrap();
+
+	let refused = engine
+		.plan_pair(pair)
+		.await
+		.expect_err("the cache has not converged the remote root");
+	assert_eq!(refused.kind(), ErrorKind::StaleState, "{refused}");
+
+	state.add_converged_roots(&[remote_root]).unwrap();
+	let outcome = engine.plan_pair(pair).await.unwrap();
+	assert_eq!(
+		outcome
+			.actions
+			.iter()
+			.map(|action| (action.kind.clone(), action.rel_path.as_str()))
+			.collect::<Vec<_>>(),
+		vec![(PlannedActionKind::UploadFile, "a.txt")]
+	);
+	drop((engine, state));
+}
+
 /// The remote root's `.filenignore` in [`dry_run_over_a_remote_rule_file`]'s cache.
 const REMOTE_RULE_FILE: Uuid = Uuid::from_u128(3);
 
@@ -7677,6 +7723,7 @@ async fn dry_run_over_a_remote_rule_file(
 			.into_iter(),
 		)
 		.unwrap();
+	state.add_converged_roots(&[remote_root]).unwrap();
 	let client = Arc::new(offline_client());
 	client.configure_cache(cache, |_| {}).await.unwrap();
 	let engine = SyncEngine::open(client, dir.path().join("sync.db"))
@@ -8433,6 +8480,7 @@ async fn engine_over_a_hashless_file(
 		(CACHED_SIZE, CACHED_STAMP)
 	);
 	state.upsert_files([&remote].into_iter()).unwrap();
+	state.add_converged_roots(&[remote_root]).unwrap();
 	let client = Arc::new(offline_client());
 	client.configure_cache(cache, |_| {}).await.unwrap();
 	let engine = SyncEngine::open(client, dir.path().join("sync.db"))
@@ -8596,6 +8644,7 @@ async fn a_drive_rooted_dry_run_plans_nothing_in_the_account_data_directory() {
 			.into_iter(),
 		)
 		.unwrap();
+	state.add_converged_roots(&[drive]).unwrap();
 	client.configure_cache(cache, |_| {}).await.unwrap();
 	let engine = SyncEngine::open(client, dir.path().join("sync.db"))
 		.await

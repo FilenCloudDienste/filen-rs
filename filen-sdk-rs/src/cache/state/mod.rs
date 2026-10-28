@@ -120,6 +120,22 @@ const RESYNC_LOCK_PATIENT_ATTEMPTS: usize = 60;
 /// After a patient acquisition still times out (or any listing failure), the worker waits this
 /// long before re-attempting — so even a quiet account with no further events re-tries.
 const RESYNC_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+/// How long the drive must stay quiet about the sync roots a socket write left short (see
+/// [`ShortRoots`]) before the worker lists them again. For a moment after it answers a restore the
+/// server lists the restored dir without what was in it (measured at well under a second), and a
+/// listing taken then would record that short listing as whole, so the relist waits this long past
+/// the last such write. A sync pass over such a root waits for the relist, so this is also what a
+/// restore adds to the next pass.
+const SHORT_ROOTS_SETTLE: Duration = Duration::from_secs(10);
+
+/// Dir sync roots a socket write left short of the remote, or holding a version it replaced (a dir
+/// moved in from outside or restored, a file restored, an event the cache could not apply): out of
+/// the converged-roots record until the relist `due` lists them, which no resync that commits before
+/// then may put them back in (see `converged_roots_on` in `sql/event`).
+struct ShortRoots {
+	roots: Vec<Uuid>,
+	due: TimerInstant,
+}
 
 /// `None` under unit-test construction (no live client); the resync path logs and no-ops when
 /// it is absent.
@@ -223,6 +239,9 @@ pub(crate) struct CacheState {
 	/// lowest-priority select arm sleeps until it and re-attempts. The retry itself is gated on
 	/// the durable `needs_resync` flag, so a stale fire is a no-op. `None` ⇒ nothing scheduled.
 	resync_retry: Option<TimerInstant>,
+	/// The roots a socket write left short and when the worker lists them again; `None` when no
+	/// write did since the last such relist started.
+	short_roots: Option<ShortRoots>,
 	/// Search read queries served against THIS connection between drains — the wasm read path
 	/// (the wasm VFS supports neither WAL nor a second connection). Native search engines read
 	/// via their own connection and never send here. `None` once every sender is gone (the arm
@@ -273,6 +292,7 @@ impl CacheState {
 			head_fetch_failures: HashMap::new(),
 			resync: None,
 			resync_retry: None,
+			short_roots: None,
 			read_tasks: None,
 			startup_gap_check: StartupGapCheck::AwaitingSubscription,
 		};
@@ -310,6 +330,7 @@ impl CacheState {
 			head_fetch_failures: HashMap::new(),
 			resync: None,
 			resync_retry: None,
+			short_roots: None,
 			read_tasks: None,
 			startup_gap_check: StartupGapCheck::AwaitingSubscription,
 		};
@@ -345,6 +366,7 @@ impl CacheState {
 			head_fetch_failures: HashMap::new(),
 			resync: None,
 			resync_retry: None,
+			short_roots: None,
 			read_tasks: None,
 			startup_gap_check: StartupGapCheck::AwaitingSubscription,
 		};
@@ -494,8 +516,8 @@ fn route_thread_event(
 	}
 }
 
-/// Sleep until the resync-retry deadline. The `None` case is unreachable: the select arm is
-/// guarded by `is_some()`.
+/// Sleep until `deadline`: the resync retry's, or the short roots' relist. The `None` case is
+/// unreachable: each select arm is guarded by `is_some()`.
 async fn resync_retry_sleep(deadline: Option<TimerInstant>) {
 	if let Some(deadline) = deadline {
 		sleep_until(deadline).await;
@@ -582,6 +604,7 @@ impl CacheState {
 			head_fetch_failures: HashMap::new(),
 			resync: Some(ResyncDeps { client }),
 			resync_retry: None,
+			short_roots: None,
 			read_tasks: Some(read_task_receiver),
 			startup_gap_check: StartupGapCheck::AwaitingSubscription,
 		};
@@ -704,6 +727,9 @@ impl CacheState {
 					tracing::debug!("resync: retry timer fired");
 					self.resync_retry = None;
 					self.maybe_run_resync().await;
+				},
+				_ = resync_retry_sleep(self.short_roots.as_ref().map(|short| short.due)), if self.short_roots.is_some() => {
+					self.relist_short_roots().await;
 				},
 			}
 		}
@@ -852,8 +878,12 @@ impl CacheState {
 			CacheEventType::Global(global_event) => self.handle_global_event(global_event),
 			// Frontier-advance marker: no item mutation; the drain still advances the watermark for
 			// it. It stands for a drive event the cache could not apply, which may have changed a
-			// listed root's subtree, so no root is held whole past it.
-			CacheEventType::NoOp => self.forget_listed_roots().map_err(|e| vec![*e]),
+			// listed root's subtree, so no root is held whole past it, nor converged until a relist.
+			CacheEventType::NoOp => {
+				self.forget_listed_roots().map_err(|e| vec![*e])?;
+				let registered: Vec<Uuid> = self.sync_roots.keys().copied().collect();
+				self.hold_short(&registered)
+			}
 		}
 	}
 
@@ -1153,10 +1183,25 @@ impl CacheState {
 			.sync_roots
 			.keys()
 			.all(|root| per_root_synthetics.iter().any(|(anchor, _)| anchor == root));
+		// A root a socket write left short since its last relist was due is not whole in this listing
+		// either, if the server had not yet caught up with the write when it listed: it waits for
+		// the relist the write scheduled.
+		let short = |anchor: &Uuid| {
+			self.short_roots
+				.as_ref()
+				.is_some_and(|short| short.roots.contains(anchor))
+		};
 		let listed: Vec<Uuid> = per_root_synthetics
 			.iter()
 			.map(|(anchor, _)| *anchor)
-			.filter(|anchor| !partial.contains(anchor))
+			.filter(|anchor| !partial.contains(anchor) && !short(anchor))
+			.collect();
+		// Every root listed here converges with the commit, the partial ones included: their
+		// undecodable records are stored beside the rows, and a snapshot carries them.
+		let converged: Vec<Uuid> = per_root_synthetics
+			.iter()
+			.map(|(anchor, _)| *anchor)
+			.filter(|anchor| !short(anchor))
 			.collect();
 		for (anchor, synthetics) in per_root_synthetics {
 			self.apply_synthetics_direct(anchor, synthetics, all_roots_listed)?;
@@ -1165,7 +1210,7 @@ impl CacheState {
 		// The watermark jump + flag write commit LAST — strictly after every synthetic landed —
 		// so a crash anywhere above leaves the old watermark and a detectable gap (the durable
 		// flag for triggered resyncs; the startup gap-check otherwise), forcing a fresh listing.
-		self.commit_resync_watermark(remote_under_lock, mark_resync, &listed)?;
+		self.commit_resync_watermark(remote_under_lock, mark_resync, &listed, &converged)?;
 
 		// Drain any REAL events persisted before or during the resync. If the drain observes a
 		// FRESH hole (a buffered event above the snapshot id broke the frontier),
@@ -1789,6 +1834,11 @@ impl CacheState {
 				return false;
 			}
 		}
+		// A root that cannot be recorded converged relists instead, which records it.
+		if let Err(e) = self.add_converged_roots(roots) {
+			self.surface_one(e);
+			return false;
+		}
 		tracing::debug!(
 			"sync root(s) {roots:?} added; already held whole at the remote drive id, no relist"
 		);
@@ -1950,6 +2000,20 @@ impl CacheState {
 			);
 			self.sync_roots
 				.insert(uuid, vec![(registration_id, callback)]);
+			// No convergence runs for it, so it is as converged as the root covering it, and
+			// recorded so before the ack lets a sync pass ask.
+			if let Err(e) = self
+				.ancestors_of(uuid)
+				.map_err(|e| {
+					Box::new(CacheError::db(
+						e,
+						format!("reading the ancestry of covered sync root {uuid}"),
+					))
+				})
+				.and_then(|ancestry| self.inherit_convergence(uuid, &ancestry))
+			{
+				self.surface_one(e);
+			}
 			let _ = ack.send(Ok(()));
 			return false;
 		}
@@ -2099,6 +2163,8 @@ impl CacheState {
 			return Ok(false);
 		}
 		self.sync_roots.remove(&uuid);
+		// Nothing keeps its rows current from here, and a later add converges it again.
+		self.drop_converged_roots(&[uuid])?;
 		if !evict {
 			return Ok(false);
 		}
@@ -2293,6 +2359,14 @@ impl CacheState {
 		for root in &deleted_roots {
 			self.sync_roots.remove(root);
 			tracing::warn!("sync root {root} was deleted server-side; dropped from the active set");
+		}
+		// Their rows are gone, so no reader may take them for a converged view. Failing that, no
+		// root's view is vouched for at all, rather than these ones wrongly.
+		if let Err(e) = self.drop_converged_roots(&deleted_roots) {
+			self.surface_one(e);
+			if let Err(e) = self.reset_converged_roots() {
+				self.surface_one(e);
+			}
 		}
 		// The app MUST learn these roots are gone (it has to re-issue `add_sync_root` to resume them —
 		// see `CacheMessage::SyncRootsDeleted`). If the status channel is full the notification is lost
@@ -2588,6 +2662,10 @@ impl CacheState {
 			);
 			return Ok(());
 		};
+		// A resync runs because the cache may have missed what the drive did, and its apply lands
+		// in chunks: from here until its commit no root's rows are a view a sync pass may plan
+		// against. The commit names the roots it converged again.
+		self.reset_converged_roots()?;
 
 		let account_root = self.root_uuid;
 		let sync_roots: Vec<Uuid> = self.sync_roots.keys().copied().collect();
@@ -2640,10 +2718,9 @@ impl CacheState {
 					let any_transient =
 						self.note_head_fetch_round(&heads.heads, &heads.deleted, &heads.transient);
 					self.reap_deleted_file_roots(heads.deleted);
-					match self
-						.apply_file_root_heads(heads.heads)
-						.and_then(|()| self.commit_resync_watermark(ids.drive, any_transient, &[]))
-					{
+					match self.apply_file_root_heads(heads.heads).and_then(|()| {
+						self.commit_resync_watermark(ids.drive, any_transient, &[], &[])
+					}) {
 						Ok(()) => !any_transient,
 						Err(e) => {
 							// The head apply or the watermark write failed; keep the durable flag
@@ -3157,6 +3234,78 @@ impl CacheState {
 		Ok(holding)
 	}
 
+	/// Before a socket event upserts `dir` into a sync root, take the roots it lands in out of the
+	/// converged-roots record and schedule their relist (see [`hold_short`](Self::hold_short)),
+	/// unless a converged, registered root already holds `kept_through`: the rule of
+	/// [`forget_listings_unless_kept`](Self::forget_listings_unless_kept), held against the roots
+	/// the drain keeps current rather than those an add may skip the relist for.
+	fn unconverge_unless_kept(
+		&mut self,
+		dir: &CacheableDir<'_>,
+		kept_through: Option<Uuid>,
+	) -> Result<(), Vec<CacheError>> {
+		if let Some(seed) = kept_through {
+			let keepers: HashMap<Uuid, ()> = self
+				.converged_roots()
+				.map_err(|e| vec![*e])?
+				.into_iter()
+				.filter(|root| self.sync_roots.contains_key(root))
+				.map(|root| (root, ()))
+				.collect();
+			let kept = self
+				.in_any_sync_root(seed, &keepers)
+				.map_err(|e| db_err_vec(e, format!("checking sync-root membership of {seed}")))?;
+			if kept {
+				return Ok(());
+			}
+		}
+		let mut landing = self.roots_holding(dir.parent)?;
+		landing.push(dir.uuid);
+		self.hold_short(&landing)
+	}
+
+	/// Take the registered sync roots among `roots` out of the converged-roots record ahead of a
+	/// socket write that leaves their rows short of the remote, or holding a version it replaced,
+	/// and (re)schedule their relist [`SHORT_ROOTS_SETTLE`] from now: until a listing taken then
+	/// commits, no sync pass may plan against them. In the drain's bulk transaction the record
+	/// write rolls back with the batch; the schedule stays, which costs at most a relist.
+	fn hold_short(&mut self, roots: &[Uuid]) -> Result<(), Vec<CacheError>> {
+		let registered: Vec<Uuid> = roots
+			.iter()
+			.copied()
+			.filter(|root| self.sync_roots.contains_key(root))
+			.collect();
+		if registered.is_empty() {
+			return Ok(());
+		}
+		self.drop_converged_roots(&registered)
+			.map_err(|e| vec![*e])?;
+		let due = TimerInstant::now() + SHORT_ROOTS_SETTLE;
+		let short = self.short_roots.get_or_insert_with(|| ShortRoots {
+			roots: Vec::new(),
+			due,
+		});
+		short.due = due;
+		for root in registered {
+			if !short.roots.contains(&root) {
+				short.roots.push(root);
+			}
+		}
+		tracing::debug!(
+			"a socket event left sync roots {:?} short; relisting them in {SHORT_ROOTS_SETTLE:?}",
+			short.roots
+		);
+		Ok(())
+	}
+
+	/// The relist [`hold_short`](Self::hold_short) scheduled is due: record the resync that lists
+	/// every root, and run it. A write that leaves roots short from here on schedules its own.
+	async fn relist_short_roots(&mut self) {
+		self.short_roots = None;
+		self.mark_needs_resync_surfacing_errors();
+		self.maybe_run_resync().await;
+	}
+
 	/// Upsert the dir of a socket `New`, `Restored` or `Changed`, gated like every socket upsert,
 	/// taking the roots it lands in out of the listed-roots record unless `kept_through` is held
 	/// (see [`forget_listings_unless_kept`](Self::forget_listings_unless_kept)).
@@ -3177,6 +3326,7 @@ impl CacheState {
 		}
 		if trust == EventTrust::Checked {
 			self.forget_listings_unless_kept(dir, kept_through)?;
+			self.unconverge_unless_kept(dir, kept_through)?;
 		}
 		self.upsert_dirs(once(dir))
 			.map_err(|e| db_err_vec(e, format!("failed to upsert dir: {}", dir.uuid)))
@@ -3221,6 +3371,7 @@ impl CacheState {
 					}
 					self.forget_listed_roots_among(&touched)
 						.map_err(|e| vec![*e])?;
+					self.hold_short(&touched)?;
 				}
 				self.upsert_files(once(&file)).map_err(|e| {
 					// Identify the item by uuid only — the file payload carries the FileKey, which must
@@ -3326,6 +3477,7 @@ impl CacheState {
 				{
 					if trust == EventTrust::Checked {
 						self.forget_listings_unless_kept(&dir, Some(dir.uuid))?;
+						self.unconverge_unless_kept(&dir, Some(dir.uuid))?;
 					}
 					self.upsert_dirs(once(&dir)).map_err(|e| {
 						db_err_vec(e, format!("failed to upsert moved dir: {}", dir.uuid))
@@ -3401,6 +3553,9 @@ impl CacheState {
 				// The upserts are not ordered against the watermark and can put back what a listed
 				// root no longer has, so no root is held whole after them.
 				self.forget_listed_roots().map_err(|e| vec![*e])?;
+				// Nor converged: the record goes whole, as the listing names no root, and no relist is
+				// scheduled (see `converged_roots_on`).
+				self.reset_converged_roots().map_err(|e| vec![*e])?;
 				// Eagerly convert FIRST (collecting any per-item conversion errors), then upsert, so a DB
 				// error on the bulk insert is surfaced ALONGSIDE the conversion errors rather than
 				// discarding the ones accumulated so far.

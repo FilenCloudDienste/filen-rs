@@ -412,7 +412,7 @@ fn commit_resync_watermark_advances_watermark_and_clears_flag() {
 	let mut state = CacheState::new_in_memory();
 	state.mark_needs_resync().unwrap();
 
-	state.commit_resync_watermark(99, false, &[]).unwrap();
+	state.commit_resync_watermark(99, false, &[], &[]).unwrap();
 
 	// Watermark advanced to the snapshot id; resync flag cleared — atomically, with no
 	// events-store traffic (synthetics apply directly from RAM now).
@@ -434,7 +434,7 @@ fn commit_resync_watermark_with_mark_resync_keeps_the_flag_set() {
 	let mut state = CacheState::new_in_memory();
 	assert!(!state.needs_resync().unwrap());
 
-	state.commit_resync_watermark(42, true, &[]).unwrap();
+	state.commit_resync_watermark(42, true, &[], &[]).unwrap();
 
 	assert_eq!(state.watermark().unwrap(), Some(42), "progress committed");
 	assert!(

@@ -29,6 +29,14 @@ impl BenchCache {
 			.expect("bench upsert_files");
 	}
 
+	/// Record `root` as converged, as a worker does once its listing commits: a sync pass plans
+	/// against no other root's rows.
+	pub fn mark_converged(&mut self, root: Uuid) {
+		self.0
+			.add_converged_roots(&[root])
+			.expect("bench converged-roots write");
+	}
+
 	/// Fold the WAL back into the main DB (the post-apply checkpoint a real resync performs). The
 	/// larger transaction size shifts work into this fold, so benchmarks track it separately.
 	pub fn checkpoint(&mut self) {
@@ -58,7 +66,7 @@ pub(crate) fn snapshot(
 }
 
 /// The same read STREAMED into `sink` — what a pass does — so the probe can measure the two
-/// against each other on one tree. Returns the watermark, as the engine's own entrance does.
+/// against each other on one tree. Returns the snapshot's mark, as the engine's own entrance does.
 #[cfg(all(
 	feature = "sync-engine",
 	not(all(target_family = "wasm", target_os = "unknown"))
@@ -67,6 +75,6 @@ pub(crate) fn snapshot_into(
 	path: &Path,
 	root: Uuid,
 	sink: &mut dyn super::enumerate::SnapshotSink,
-) -> rusqlite::Result<Option<u64>> {
+) -> rusqlite::Result<super::enumerate::SnapshotMark> {
 	super::enumerate::read_subtree_snapshot_into(path, root, sink)
 }

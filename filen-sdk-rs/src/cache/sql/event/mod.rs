@@ -161,6 +161,96 @@ pub(super) fn forget_listed_roots_on(conn: &rusqlite::Connection) -> rusqlite::R
 	set_listed_roots_on(conn, 0, &[])
 }
 
+/// The converged-roots record on `conn`: the dir sync roots whose cached subtree is a whole,
+/// current view of the remote, stamped with a generation. A reader that sees its root in the record
+/// can plan against the rows it reads in the same transaction; one that does not is reading a
+/// subtree the cache has not finished listing.
+///
+/// A root joins the record when this worker converged it: a resync that listed it committed (its
+/// rows and the watermark jump land before the record names it), or it was registered while the
+/// cache already held its listing at the remote's current drive id. From then on the drain keeps it
+/// current. It leaves the record when that stops being true: every root does when a worker starts
+/// (the drive moved on while none listened), when a resync starts (it runs because events were
+/// lost, and its apply commits in chunks), and when the rows are wiped; one root does when its last
+/// registration goes or the server deleted it.
+///
+/// What the drain keeps current is what events carry, so a root also leaves the record ahead of a
+/// write the worker applies that can leave its rows short of the remote or stale:
+/// - a socket upsert that lands an item whose contents no event sends: a dir moved in from where no
+///   root in the record kept it current, or restored from the trash, and a file restored over a
+///   version the cache may still hold. The roots it lands in leave the record;
+/// - a drained `NoOp` marker, a drive event the cache could not decode or did not know, which names
+///   no root: every registered root leaves the record;
+/// - an injected manual listing (`SyncRootHandle::update_list_dir_recursive`), which is not ordered
+///   against the watermark and can put back an item an event deleted: the record is cleared under a
+///   new generation.
+///
+/// After a socket write the worker lists the roots it took out again, once the drive has been quiet
+/// about them for a settle delay (`SHORT_ROOTS_SETTLE` in `cache::state`): for a moment after a
+/// restore the server lists the restored dir without its contents, and a listing taken then would
+/// record that short listing whole. A resync that commits before the delay is up leaves those roots
+/// out of this record and the listed-roots one. A manual listing schedules no listing: it is a
+/// legacy initial-population path the sync engine never takes, and a root it cleared rejoins at the
+/// next resync or add that lists it.
+///
+/// The listed-roots record (see [`listed_roots_on`]) answers a different question, whether a new
+/// registration may skip the relist, and holds back a root whose listing held an undecodable
+/// record; that root is converged all the same, as the snapshot carries the record itself.
+///
+/// Every clear bumps the generation, so a reader that saw its root converged at generation `g` and
+/// sees it again at `g` knows no resync started in between. Absent (a fresh or older DB) it reads
+/// as generation 0 with no roots.
+fn converged_roots_on(conn: &rusqlite::Connection) -> rusqlite::Result<RootRecord> {
+	Ok(root_record_on(
+		conn,
+		super::statements::CONVERGED_ROOTS_KEY,
+		"converged-roots",
+	)?
+	.unwrap_or(RootRecord {
+		stamp: 0,
+		roots: Vec::new(),
+	}))
+}
+
+/// Store `roots` as converged at `generation` on `conn`. Written even when `roots` is empty, so the
+/// generation a clear moved to stays.
+fn set_converged_roots_on(
+	conn: &rusqlite::Connection,
+	generation: u64,
+	roots: &[Uuid],
+) -> rusqlite::Result<()> {
+	set_root_record_on(
+		conn,
+		super::statements::CONVERGED_ROOTS_KEY,
+		Some(RootRecord::encode(generation, roots)),
+	)
+}
+
+/// Take every root out of the converged-roots record on `conn`, under a new generation.
+pub(super) fn reset_converged_roots_on(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+	let record = converged_roots_on(conn)?;
+	// One bump per clear; wrapping only after 2^64 resyncs, and a wrap still differs from the
+	// generation a reader holds unless exactly 2^64 clears landed during one pass.
+	set_converged_roots_on(conn, record.stamp.wrapping_add(1), &[])
+}
+
+/// The generation `root` is converged at on `conn` (see [`converged_roots_on`]), or none while the
+/// cache has not finished listing it. Only the sync engine's reads (`cache::enumerate`) ask.
+#[cfg(any(
+	test,
+	all(
+		feature = "sync-engine",
+		not(all(target_family = "wasm", target_os = "unknown"))
+	)
+))]
+pub(in crate::cache) fn converged_generation_on(
+	conn: &rusqlite::Connection,
+	root: Uuid,
+) -> rusqlite::Result<Option<u64>> {
+	let record = converged_roots_on(conn)?;
+	Ok(record.roots.contains(&root).then_some(record.stamp))
+}
+
 impl CacheState {
 	/// Persist ONE event to the durable `events` store. `INSERT OR IGNORE` drops an at-least-once
 	/// redelivery of the same `drive_message_id`; synthetic events (`id: None`) are exempt from the dedup
@@ -360,6 +450,77 @@ impl CacheState {
 			.map_err(|e| db_err(e, "taking roots out of the listed roots"))
 	}
 
+	/// Take every root out of the converged-roots record, under a new generation (see
+	/// `converged_roots_on`): ahead of work that leaves the cached rows short of the remote until it
+	/// commits — a resync, a wipe — and when a worker starts on a DB a previous one left.
+	pub(crate) fn reset_converged_roots(&self) -> Result<(), Box<CacheError>> {
+		reset_converged_roots_on(&self.db).map_err(|e| db_err(e, "clearing the converged roots"))
+	}
+
+	/// Add `roots` to the converged-roots record, at its current generation: their rows were
+	/// already a whole, current view, so no reader of another root learns anything new.
+	pub(crate) fn add_converged_roots(&self, roots: &[Uuid]) -> Result<(), Box<CacheError>> {
+		let mut record =
+			converged_roots_on(&self.db).map_err(|e| db_err(e, "reading the converged roots"))?;
+		let before = record.roots.len();
+		for root in roots {
+			if !record.roots.contains(root) {
+				record.roots.push(*root);
+			}
+		}
+		if record.roots.len() == before {
+			return Ok(());
+		}
+		set_converged_roots_on(&self.db, record.stamp, &record.roots)
+			.map_err(|e| db_err(e, "adding to the converged roots"))
+	}
+
+	/// Add `root` to the converged-roots record when a root in it holds `root` — is one of
+	/// `ancestry`, its cached ancestor chain. Registered under a root whose rows the drain has kept
+	/// current since it converged, `root`'s rows are as whole and as current as that root's, and
+	/// stay so once that root's own registration goes.
+	pub(crate) fn inherit_convergence(
+		&self,
+		root: Uuid,
+		ancestry: &[Uuid],
+	) -> Result<(), Box<CacheError>> {
+		let record =
+			converged_roots_on(&self.db).map_err(|e| db_err(e, "reading the converged roots"))?;
+		if record.roots.contains(&root) || !ancestry.iter().any(|a| record.roots.contains(a)) {
+			return Ok(());
+		}
+		self.add_converged_roots(&[root])
+	}
+
+	/// Take `roots` out of the converged-roots record, leaving the generation and every other root
+	/// as they are: nothing the cache holds for the other roots changed. A reader that saw one of
+	/// `roots` converged at generation `g` reads none for it now, so the drop is never mistaken for
+	/// no change.
+	pub(crate) fn drop_converged_roots(&self, roots: &[Uuid]) -> Result<(), Box<CacheError>> {
+		let mut record =
+			converged_roots_on(&self.db).map_err(|e| db_err(e, "reading the converged roots"))?;
+		let before = record.roots.len();
+		record.roots.retain(|root| !roots.contains(root));
+		if record.roots.len() == before {
+			return Ok(());
+		}
+		set_converged_roots_on(&self.db, record.stamp, &record.roots)
+			.map_err(|e| db_err(e, "taking roots out of the converged roots"))
+	}
+
+	/// The roots in the converged-roots record (see `converged_roots_on`).
+	pub(crate) fn converged_roots(&self) -> Result<Vec<Uuid>, Box<CacheError>> {
+		Ok(converged_roots_on(&self.db)
+			.map_err(|e| db_err(e, "reading the converged roots"))?
+			.roots)
+	}
+
+	/// The generation `root` is converged at, or none (see `converged_roots_on`).
+	#[cfg(test)]
+	pub(crate) fn converged_generation(&self, root: Uuid) -> Option<u64> {
+		converged_generation_on(&self.db, root).unwrap()
+	}
+
 	/// Remove one consumed event from the durable store by its `seq` (rowid).
 	#[cfg(test)] // the drain deletes inline in `commit_drain_batch`
 	pub(crate) fn delete_event(&self, seq: i64) -> Result<(), Box<CacheError>> {
@@ -512,11 +673,15 @@ impl CacheState {
 	///
 	/// `listed` — the dir roots this resync listed and stored whole — replaces the listed-roots
 	/// record in the same transaction: a root it did not list missed the events the jump skips.
+	/// `converged` — every dir root this resync listed and applied, undecodable records and all —
+	/// replaces the converged-roots record the same way, at the generation the resync started
+	/// under.
 	pub(crate) fn commit_resync_watermark(
 		&mut self,
 		remote_under_lock: u64,
 		mark_resync: bool,
 		listed: &[Uuid],
+		converged: &[Uuid],
 	) -> Result<(), Box<CacheError>> {
 		let tx = self
 			.db
@@ -524,6 +689,11 @@ impl CacheState {
 			.map_err(|e| db_err(e, "begin resync-commit transaction"))?;
 		set_listed_roots_on(&tx, remote_under_lock, listed)
 			.map_err(|e| db_err(e, "recording the listed roots in resync commit"))?;
+		let generation = converged_roots_on(&tx)
+			.map_err(|e| db_err(e, "reading the converged roots in resync commit"))?
+			.stamp;
+		set_converged_roots_on(&tx, generation, converged)
+			.map_err(|e| db_err(e, "recording the converged roots in resync commit"))?;
 		set_watermark_on(&tx, remote_under_lock)
 			.map_err(|e| db_err(e, "advancing watermark in resync commit"))?;
 		set_needs_resync_on(&tx, mark_resync)

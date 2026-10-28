@@ -305,7 +305,9 @@ fn the_staged_view_of_a_cache_read_is_the_one_the_builder_builds() {
 		);
 		let (_stage_dir, stage) = Stage::in_temp_dir();
 		let mut sink = RemoteSink::new(stage, Paging::PASS).unwrap();
-		let watermark = read_subtree_snapshot_into(&path, ROOT, &mut sink).unwrap();
+		let watermark = read_subtree_snapshot_into(&path, ROOT, &mut sink)
+			.unwrap()
+			.watermark;
 		assert_eq!(watermark, read.watermark, "seed {seed}");
 		let mut staged = sink.finish(ROOT, PairRoot::Directory).unwrap();
 		assert_views_alike(&format!("seed {seed}: as placed"), &resident, &staged);

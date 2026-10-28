@@ -405,3 +405,23 @@ fn watermark_is_none_on_a_fresh_cache_and_reflects_a_set_value() {
 		"the snapshot reads the same watermark the worker advances"
 	);
 }
+
+/// The snapshot says, from the same read, whether the cache converged the root it read: only
+/// that root, and only until a resync starts.
+#[test]
+fn a_snapshot_reads_its_root_converged_only_while_the_cache_records_it() {
+	let f = fixture();
+	let converged = |root| {
+		read_subtree_snapshot_into(&f.path, root, &mut Materialize::default())
+			.unwrap()
+			.converged
+	};
+	assert!(!converged(f.a.uuid), "nothing converged on a fresh cache");
+
+	f.state.add_converged_roots(&[f.a.uuid]).unwrap();
+	assert!(converged(f.a.uuid));
+	assert!(!converged(f.b.uuid), "another root is not");
+
+	f.state.reset_converged_roots().unwrap();
+	assert!(!converged(f.a.uuid), "a resync takes it out again");
+}

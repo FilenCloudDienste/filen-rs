@@ -13,7 +13,9 @@
 //! `drive_message_id <= watermark` (already reflected here) and applies the rest — aligning the
 //! snapshot with the live stream with no gap and no double-apply. Reading the items and the
 //! watermark inside one deferred read transaction guarantees they describe the same committed
-//! instant even while the worker writes concurrently (WAL).
+//! instant even while the worker writes concurrently (WAL). The same transaction reads whether the
+//! cache has finished listing the root ([`SnapshotMark::converged`]): a subtree it has not is not a
+//! view of the remote, and the engine plans against no other.
 //!
 //! Native only: like the search engine it opens its OWN read-only connection, which the wasm
 //! single-connection VFS does not support — and the sync engine that consumes it is native-only.
@@ -33,7 +35,7 @@ use crate::{
 		sql::{
 			UndecodableItem,
 			columns::ITEMS_UUID,
-			list_undecodable,
+			converged_generation_on, list_undecodable,
 			statements::{
 				ANCESTRY_OF_UUID, CACHE_META_GET, ENUMERATE_SUBTREE, HYDRATE_BY_UUIDS,
 				WATERMARK_KEY,
@@ -57,6 +59,20 @@ pub(crate) struct SubtreeSnapshot {
 	/// NOT scoped to `root`: the table holds every sync root's, and a record is only placeable by
 	/// its parent, which the caller resolves against `dirs`.
 	pub(crate) undecodable: Vec<UndecodableItem>,
+}
+
+/// What a snapshot read learnt about the cache beside the rows, in the same read transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SnapshotMark {
+	/// The cache's contiguous-prefix watermark (`last_drive_message_id`) at the snapshot instant;
+	/// see [`SubtreeSnapshot::watermark`].
+	pub(crate) watermark: Option<u64>,
+	/// Whether the rows read are a whole, current view of the root's remote subtree: the cache
+	/// converged the root and no resync has started since (see `converged_roots_on`). False while a
+	/// first listing, or the apply of a later one, has not committed, and from a write that can
+	/// leave the rows short or stale (a dir moved in from outside or restored, a file restored, an
+	/// event the cache could not apply, a manual listing) until a listing makes them whole again.
+	pub(crate) converged: bool,
 }
 
 /// One item of a sync root's cached subtree, in the columns the sync engine's remote view reads
@@ -149,14 +165,14 @@ pub(crate) trait SnapshotSink {
 	fn item(&mut self, is_dir: bool, item: RemoteItem);
 }
 
-/// The undecodable records, then every descendant of `root`, then the watermark — all read
-/// through the one open transaction `tx`, so they describe the same committed instant. The anchor
-/// itself is never handed over.
+/// The undecodable records, then every descendant of `root`, then the watermark and whether the
+/// root is converged — all read through the one open transaction `tx`, so they describe the same
+/// committed instant. The anchor itself is never handed over.
 fn read_into(
 	tx: &Connection,
 	root: Uuid,
 	sink: &mut dyn SnapshotSink,
-) -> rusqlite::Result<Option<u64>> {
+) -> rusqlite::Result<SnapshotMark> {
 	sink.undecodable(list_undecodable(tx)?);
 	let mut stmt = tx.prepare_cached(ENUMERATE_SUBTREE)?;
 	let rows = stmt.query_map(params![root], slim_item)?;
@@ -164,7 +180,10 @@ fn read_into(
 		let (is_dir, item) = row?;
 		sink.item(is_dir, item);
 	}
-	read_watermark(tx)
+	Ok(SnapshotMark {
+		watermark: read_watermark(tx)?,
+		converged: converged_generation_on(tx, root)?.is_some(),
+	})
 }
 
 /// Read the contiguous-prefix watermark from `conn`, mirroring `CacheState::watermark` (the
@@ -179,22 +198,23 @@ fn read_watermark(conn: &Connection) -> rusqlite::Result<Option<u64>> {
 }
 
 /// Read a consistent [`SubtreeSnapshot`] of `root` from the cache DB at `path`. Opens a fresh
-/// read-only connection (WAL-concurrent with the worker's writer) and reads the subtree AND the
-/// watermark inside ONE deferred read transaction, so the two describe the same committed instant.
+/// read-only connection (WAL-concurrent with the worker's writer) and reads the subtree AND its
+/// [`SnapshotMark`] inside ONE deferred read transaction, so they describe the same committed
+/// instant.
 /// Synchronous SQLite work — async callers go through [`Client::enumerate_sync_root_snapshot`].
 pub(crate) fn read_subtree_snapshot_into(
 	path: &Path,
 	root: Uuid,
 	sink: &mut dyn SnapshotSink,
-) -> rusqlite::Result<Option<u64>> {
+) -> rusqlite::Result<SnapshotMark> {
 	let mut conn = open_read_connection(path)?;
 	// One deferred read transaction = one stable snapshot for every read below, even
 	// mid-worker-write.
 	let tx = conn.transaction()?;
-	let watermark = read_into(&tx, root, sink)?;
+	let mark = read_into(&tx, root, sink)?;
 	// Read-only: dropping the deferred transaction just ends the snapshot (nothing to commit).
 	drop(tx);
-	Ok(watermark)
+	Ok(mark)
 }
 
 /// The sink that materializes: the whole subtree as the two `Vec`s [`read_subtree_snapshot`]
@@ -228,8 +248,8 @@ impl SnapshotSink for Materialize {
 #[cfg(any(test, feature = "bench-internals"))]
 pub(crate) fn read_subtree_snapshot(path: &Path, root: Uuid) -> rusqlite::Result<SubtreeSnapshot> {
 	let mut sink = Materialize::default();
-	let watermark = read_subtree_snapshot_into(path, root, &mut sink)?;
-	Ok(sink.into_snapshot(watermark))
+	let mark = read_subtree_snapshot_into(path, root, &mut sink)?;
+	Ok(sink.into_snapshot(mark.watermark))
 }
 
 #[cfg(any(test, feature = "bench-internals"))]
@@ -281,8 +301,8 @@ pub(crate) fn read_capped_subtree_snapshot(
 		inner: Materialize::default(),
 		max_items,
 	};
-	let watermark = read_subtree_snapshot_into(path, root, &mut sink)?;
-	Ok(sink.inner.into_snapshot(watermark))
+	let mark = read_subtree_snapshot_into(path, root, &mut sink)?;
+	Ok(sink.inner.into_snapshot(mark.watermark))
 }
 
 /// How many uuids one [`hydrate_by_uuids`] statement binds. The sync engine's apply asks for what
@@ -409,7 +429,7 @@ impl Client {
 
 	/// Stream a consistent snapshot of the cached subtree under sync root `root` into `sink` — the
 	/// remote-state half the sync engine reconciles against — and hand back the sink with the
-	/// contiguous-prefix watermark at the same instant. Errors if the cache was never configured.
+	/// [`SnapshotMark`] read at the same instant. Errors if the cache was never configured.
 	/// The blocking SQLite read runs on a blocking thread so it never stalls the async runtime.
 	///
 	/// A read that fails partway takes the sink down with it: what it held is PART of a subtree,
@@ -418,7 +438,7 @@ impl Client {
 		&self,
 		root: Uuid,
 		mut sink: S,
-	) -> Result<(S, Option<u64>), Error>
+	) -> Result<(S, SnapshotMark), Error>
 	where
 		S: SnapshotSink + Send + 'static,
 	{
@@ -429,8 +449,8 @@ impl Client {
 			)
 		})?;
 		tokio::task::spawn_blocking(move || {
-			let watermark = read_subtree_snapshot_into(&path, root, &mut sink)?;
-			Ok::<_, rusqlite::Error>((sink, watermark))
+			let mark = read_subtree_snapshot_into(&path, root, &mut sink)?;
+			Ok::<_, rusqlite::Error>((sink, mark))
 		})
 		.await
 		.map_err(|e| {

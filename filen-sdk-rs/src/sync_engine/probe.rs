@@ -322,6 +322,7 @@ impl Fixture {
 		let cache_db = dir.join("cache.db");
 		let mut cache = BenchCache::open(&cache_db, remote_root);
 		cache.upsert(&dirs, &files);
+		cache.mark_converged(remote_root);
 		// Fold the WAL back in, so the snapshot phase measures the read and not the populate's
 		// leftovers.
 		cache.checkpoint();
@@ -1858,7 +1859,8 @@ pub fn run() -> String {
 			plan::ViewBuilder::with_capacity(fixture.remote_root, PairRoot::Directory, nodes);
 		let watermark =
 			bench_support::snapshot_into(&fixture.cache_db, fixture.remote_root, &mut builder)
-				.expect("streaming the snapshot");
+				.expect("streaming the snapshot")
+				.watermark;
 		(builder.finish(), watermark)
 	});
 	let holding_stream = current_rss_bytes();

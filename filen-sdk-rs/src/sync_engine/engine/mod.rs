@@ -4942,10 +4942,17 @@ impl SyncEngine {
 			let at = stage.path().display().to_string();
 			let sink = stage::RemoteSink::new(stage, stage::Paging::PASS)
 				.map_err(|e| db_error(e, &format!("staging the remote snapshot in {at}")))?;
-			let (copied, watermark) = self
+			let (copied, mark) = self
 				.client
 				.stream_sync_root_snapshot(record.remote_root, sink)
 				.await?;
+			// A root the cache has not finished listing is not a view of the remote: every item it
+			// is still missing reads as absent, which plans an upload over newer remote content (a
+			// same-name upload replaces the remote file) as readily as a deletion. Read in the same
+			// transaction as the rows, so a resync that starts after this read cannot pass.
+			if !mark.converged {
+				return Err(remote_not_converged(pair, record.remote_root));
+			}
 			// Every row the pass still needs is in the view now; the objects it ACTS on are read back
 			// whole by uuid, for the handful a plan names.
 			let root = record.remote_root;
@@ -4971,7 +4978,7 @@ impl SyncEngine {
 				lent.put_back(&mut view.nodes);
 				confirmed = rows;
 			}
-			Ok::<_, Error>((view, watermark.is_some(), confirmed))
+			Ok::<_, Error>((view, mark.watermark.is_some(), confirmed))
 		}
 		.await;
 		let (mut view, remote_converged, confirmed) = match remote {
@@ -5972,6 +5979,11 @@ impl SyncEngine {
 	/// [`interrupted`](SyncReport::interrupted) counting what it did not do. A cancel that lands
 	/// before there is a plan to count returns the [`paused`](SyncReport::paused) report instead,
 	/// having read one side and applied nothing; if the pair was being REMOVED, that is an error.
+	///
+	/// A pass plans only against a remote view the cache has finished listing: while the cache is
+	/// still listing the pair's remote folder (its first listing, or a relist after it lost track of
+	/// the drive), the pass fails with [`ErrorKind::StaleState`] and applies nothing, since every
+	/// item the listing has not reached would read as absent and plan an upload over it.
 	///
 	/// Before it plans, a pass records as synced every path that has never synced where both sides
 	/// hold a file, the remote one carries no BLAKE3 (another client uploaded it without one) and
@@ -7518,6 +7530,19 @@ pub(super) fn db_error(error: rusqlite::Error, context: &str) -> Error {
 /// row is deleted moments later, so there is nothing left for a pause or a resume to describe — and
 /// either would take back the cancel the removal is waiting on — and nothing for a cancel of the
 /// paused actions to convert, the removal's own cancel being final.
+/// The error of a pass that found the cache had not finished listing `pair`'s remote root
+/// `remote_root`: it plans nothing against a partial view. Stale state, as the view is: the next pass
+/// reads it again.
+fn remote_not_converged(pair: PairId, remote_root: Uuid) -> Error {
+	Error::custom(
+		ErrorKind::StaleState,
+		format!(
+			"sync pair {pair}: the cache has not finished listing the remote folder {remote_root}, \
+			 so no pass plans against it yet"
+		),
+	)
+}
+
 fn being_removed(pair: PairId) -> Error {
 	Error::custom(
 		ErrorKind::InvalidState,

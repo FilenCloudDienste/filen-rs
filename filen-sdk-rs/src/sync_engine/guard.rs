@@ -116,7 +116,10 @@ pub enum GuardReason {
 	FirstSyncWithDeletions { deletions: usize },
 	/// The remote view has never converged (the cache snapshot carries no watermark), so its
 	/// apparent emptiness is untrustworthy — a "remote deletion" may just be an un-observed item.
-	/// Held until the cache converges at least once.
+	/// Held until the cache converges at least once. A backstop: a pass whose snapshot the cache
+	/// has not converged fails before it plans (see
+	/// [`SyncEngine::sync_once`](super::SyncEngine::sync_once)), so no plan reaches the guard on such
+	/// a view.
 	RemoteUnconverged { deletions: usize },
 	/// The remote view came back COMPLETELY empty while the baseline still tracks remote items,
 	/// and this pass would delete MORE THAN ONE of them. A converged-but-empty listing is exactly

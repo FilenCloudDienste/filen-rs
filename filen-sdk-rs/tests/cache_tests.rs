@@ -836,13 +836,10 @@ async fn test_cache_reopen_confirms_a_listed_root_a_dir_was_made_in() {
 }
 
 /// A dir restored from the trash under a root the cache holds whole comes back without the file
-/// the trash took out of the cache, and no event brings it back, so the next session lists the
-/// root, which does.
-///
-/// The drive lock keeps the drive id still between sessions, so the listing is down to the
-/// restore and not to a moved drive.
+/// the trash took out of the cache, and no event brings it back, so the cache lists the root again
+/// once the restore has settled, which does.
 #[shared_test_runtime]
-async fn test_cache_reopen_lists_a_listed_root_a_dir_was_restored_in() {
+async fn test_cache_relists_a_root_a_dir_was_restored_in() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = derive_client(resources.client.as_ref());
 	let root: Uuid = resources.dir.uuid();
@@ -861,66 +858,31 @@ async fn test_cache_reopen_lists_a_listed_root_a_dir_was_restored_in() {
 	let lock = client.lock_drive().await.unwrap();
 
 	let (session, _) = open_session(&client, root, &messages).await;
-	close_session(&client, session).await;
-
-	// Session 2: a dir with a file in it goes to the trash and comes back.
-	let (session, _) = open_session(&client, root, &messages).await;
-	settle_session_start(&client, &resources.dir, &path, &messages).await;
+	let since = settle_session_start(&client, &resources.dir, &path, &messages).await;
 	let (mut restored, file) =
 		create_dir_with_file(&client, &resources.dir, "restored_while_open").await;
 	wait_until_caught_up(&client, &path).await;
 	assert!(query_cached_file(&path, file.uuid()).is_some());
+	assert!(
+		!listed_since(&messages, root, since),
+		"the dir and its file came from the socket, not a listing"
+	);
 	client.trash_dir(&mut restored).await.unwrap();
 	client.restore_dir(&mut restored).await.unwrap();
-	// For a moment after it answers the restore, the server lists the dir without what was in it.
-	// Wait until a listing of the root, read the way session 3's add reads it but by a client with
-	// no cache, has the file back in the dir.
-	let deadline = tokio::time::Instant::now() + CACHE_CONVERGE_TIMEOUT;
-	loop {
-		let (_, files) = resources
-			.client
-			.list_dir_recursive::<_, fn(u64, Option<u64>)>(&(&resources.dir).into(), None, ())
-			.await
-			.unwrap();
-		if files.iter().any(|listed| {
-			listed.uuid() == file.uuid() && *listed.parent() == ParentUuid::Uuid(restored.uuid())
-		}) {
-			break;
-		}
-		assert!(
-			tokio::time::Instant::now() < deadline,
-			"the server lists {} in the restored dir",
-			file.uuid()
-		);
-		tokio::time::sleep(Duration::from_millis(50)).await;
-	}
-	let held_at = wait_until_caught_up(&client, &path).await;
+
+	assert!(
+		poll_for_item(&path, file.uuid(), CACHE_CONVERGE_TIMEOUT).await,
+		"the relist brings the file in the restored dir back"
+	);
 	assert!(
 		query_cached_dir(&path, restored.uuid()).is_some(),
 		"the restored dir is back"
 	);
 	assert!(
-		query_cached_file(&path, file.uuid()).is_none(),
-		"the file in it is not"
-	);
-	close_session(&client, session).await;
-
-	// Session 3: the add lists the root, which brings the file back.
-	let (session, since) = open_session(&client, root, &messages).await;
-	assert!(
-		query_cached_file(&path, file.uuid()).is_some(),
-		"the listing brings the file back"
-	);
-	close_session(&client, session).await;
-	assert_eq!(
-		client.get_last_event_ids().await.unwrap().drive,
-		held_at,
-		"the drive id moved during the re-add, so whether it listed proves nothing"
-	);
-	assert!(
 		listed_since(&messages, root, since),
-		"a dir restored under a root held whole makes its next add list it"
+		"a dir restored under a root held whole makes the cache list it again"
 	);
+	close_session(&client, session).await;
 	drop(lock);
 }
 
