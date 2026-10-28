@@ -60,45 +60,27 @@ fn set_needs_resync_on(conn: &rusqlite::Connection, on: bool) -> rusqlite::Resul
 	)
 }
 
-/// The sync roots whose whole subtree the cache holds as the drive stood at watermark `at`: each
-/// was listed by a resync that committed and stored every record of its listing, and every event
-/// drained since applied in full while it was registered. A root whose listing held a record the
-/// cache could not store (metadata that does not decode) is never recorded: with no row for that
-/// record, events under it are gated out, a move into it deletes what moved, and a rename that
-/// makes it readable patches nothing. Every write that can leave a recorded root's rows short of
-/// that takes that root out of the record. A socket upsert takes out the roots it lands in: of a
-/// dir that no registered root the cache holds whole kept current (a restore, a move in from
-/// outside the registered roots or from a root that is not recorded, whose gaps move along) or of
-/// a file it held no row for (a restore). A new dir takes out nothing when such a root holds its
-/// parent, as it has no contents yet. The writes that cannot name the roots they touch clear the
-/// record whole: a drained `NoOp` marker (an event the cache could not apply), and the row writes
-/// that move no watermark (evictions, wipes, a manual listing, a resync's apply until its commit).
-/// Any watermark move that does not carry the record forward leaves `at` behind, which voids it,
-/// so a watermark writer that predates the record can only cost a relist. A build that predates it
-/// and changes rows without moving the watermark (an eviction through `SyncRootHandle::evict`)
-/// leaves the record standing.
-///
-/// Stored under [`LISTED_ROOTS_KEY`](super::statements::LISTED_ROOTS_KEY) as `at` (8 bytes, little
-/// endian) followed by each root's 16 uuid bytes.
-struct ListedRoots {
-	at: u64,
+/// A set of sync roots stamped with one number, as `cache_meta` stores it under one key: the stamp
+/// (8 bytes, little endian) followed by each root's 16 uuid bytes.
+struct RootRecord {
+	stamp: u64,
 	roots: Vec<Uuid>,
 }
 
-impl ListedRoots {
+impl RootRecord {
 	fn decode(bytes: &[u8]) -> Option<Self> {
-		let (at, rest) = bytes.split_first_chunk::<8>()?;
+		let (stamp, rest) = bytes.split_first_chunk::<8>()?;
 		let (uuids, []) = rest.as_chunks::<16>() else {
 			return None;
 		};
 		Some(Self {
-			at: u64::from_le_bytes(*at),
+			stamp: u64::from_le_bytes(*stamp),
 			roots: uuids.iter().map(|bytes| Uuid::from_bytes(*bytes)).collect(),
 		})
 	}
 
-	fn encode(at: u64, roots: &[Uuid]) -> Vec<u8> {
-		let mut bytes = at.to_le_bytes().to_vec();
+	fn encode(stamp: u64, roots: &[Uuid]) -> Vec<u8> {
+		let mut bytes = stamp.to_le_bytes().to_vec();
 		for root in roots {
 			bytes.extend_from_slice(root.as_bytes());
 		}
@@ -106,26 +88,62 @@ impl ListedRoots {
 	}
 }
 
-/// The listed-roots record on `conn`, if there is one. A value that does not decode reads as none,
-/// which only costs a relist.
-fn listed_roots_on(conn: &rusqlite::Connection) -> rusqlite::Result<Option<ListedRoots>> {
+/// The root record stored under `key` on `conn`, if there is one. A value that does not decode
+/// reads as none; `what` names the record in the log line that says so.
+fn root_record_on(
+	conn: &rusqlite::Connection,
+	key: &str,
+	what: &str,
+) -> rusqlite::Result<Option<RootRecord>> {
 	let value: Option<Option<Vec<u8>>> = conn
 		.prepare_cached(super::statements::CACHE_META_GET)?
-		.query_row(params![super::statements::LISTED_ROOTS_KEY], |row| {
-			row.get(CACHE_META_VALUE)
-		})
+		.query_row(params![key], |row| row.get(CACHE_META_VALUE))
 		.optional()?;
 	let Some(bytes) = value.flatten() else {
 		return Ok(None);
 	};
-	let listed = ListedRoots::decode(&bytes);
-	if listed.is_none() {
+	let record = RootRecord::decode(&bytes);
+	if record.is_none() {
 		tracing::debug!(
-			"the listed-roots record ({} bytes) does not decode; reading it as none",
+			"the {what} record ({} bytes) does not decode; reading it as none",
 			bytes.len()
 		);
 	}
-	Ok(listed)
+	Ok(record)
+}
+
+/// Store `value` (an encoded [`RootRecord`], or none) under `key` on `conn`.
+fn set_root_record_on(
+	conn: &rusqlite::Connection,
+	key: &str,
+	value: Option<Vec<u8>>,
+) -> rusqlite::Result<()> {
+	conn.execute(super::statements::CACHE_META_SET, params![key, value])?;
+	Ok(())
+}
+
+/// The listed-roots record on `conn`: the sync roots whose whole subtree the cache holds as the
+/// drive stood at the watermark in its stamp. Each was listed by a resync that committed and
+/// stored every record of its listing, and every event drained since applied in full while it was
+/// registered. A root whose listing held a record the cache could not store (metadata that does
+/// not decode) is never recorded: with no row for that record, events under it are gated out, a
+/// move into it deletes what moved, and a rename that makes it readable patches nothing. Every
+/// write that can leave a recorded root's rows short of that takes that root out of the record. A
+/// socket upsert takes out the roots it lands in: of a dir that no registered root the cache holds
+/// whole kept current (a restore, a move in from outside the registered roots or from a root that
+/// is not recorded, whose gaps move along) or of a file it held no row for (a restore). A new dir
+/// takes out nothing when such a root holds its parent, as it has no contents yet. The writes that
+/// cannot name the roots they touch clear the record whole: a drained `NoOp` marker (an event the
+/// cache could not apply), and the row writes that move no watermark (evictions, wipes, a manual
+/// listing, a resync's apply until its commit). Any watermark move that does not carry the record
+/// forward leaves the stamp behind, which voids it, so a watermark writer that predates the record
+/// can only cost a relist. A build that predates it and changes rows without moving the watermark
+/// (an eviction through `SyncRootHandle::evict`) leaves the record standing.
+///
+/// Stored under [`LISTED_ROOTS_KEY`](super::statements::LISTED_ROOTS_KEY). A value that does not
+/// decode reads as none, which only costs a relist.
+fn listed_roots_on(conn: &rusqlite::Connection) -> rusqlite::Result<Option<RootRecord>> {
+	root_record_on(conn, super::statements::LISTED_ROOTS_KEY, "listed-roots")
 }
 
 /// Record `roots` as held whole at watermark `at` on `conn`; none clears the record.
@@ -134,12 +152,8 @@ fn set_listed_roots_on(
 	at: u64,
 	roots: &[Uuid],
 ) -> rusqlite::Result<()> {
-	let value = (!roots.is_empty()).then(|| ListedRoots::encode(at, roots));
-	conn.execute(
-		super::statements::CACHE_META_SET,
-		params![super::statements::LISTED_ROOTS_KEY, value],
-	)?;
-	Ok(())
+	let value = (!roots.is_empty()).then(|| RootRecord::encode(at, roots));
+	set_root_record_on(conn, super::statements::LISTED_ROOTS_KEY, value)
 }
 
 /// Clear the listed-roots record on `conn`: every root relists on its next add.
@@ -298,7 +312,7 @@ impl CacheState {
 
 	/// Whether this cache holds the whole subtree of every one of `roots` as the drive stood at its
 	/// watermark, with no resync pending: each was listed by a resync that committed and stayed
-	/// registered for every event applied since (see `ListedRoots`). Says nothing about what the
+	/// registered for every event applied since (see `listed_roots_on`). Says nothing about what the
 	/// drive did after the watermark — that is the remote drive id's to tell.
 	pub(crate) fn holds_listings_of(&self, roots: &[Uuid]) -> Result<bool, Box<CacheError>> {
 		if self.needs_resync()? {
@@ -308,7 +322,7 @@ impl CacheState {
 		Ok(roots.iter().all(|root| held.contains(root)))
 	}
 
-	/// The roots the listed-roots record holds whole at the current watermark (see `ListedRoots`);
+	/// The roots the listed-roots record holds whole at the current watermark (see `listed_roots_on`);
 	/// none when there is no record or it is void.
 	pub(crate) fn roots_held_whole(&self) -> Result<Vec<Uuid>, Box<CacheError>> {
 		let Some(listed) =
@@ -316,20 +330,20 @@ impl CacheState {
 		else {
 			return Ok(Vec::new());
 		};
-		if Some(listed.at) != self.watermark()? {
+		if Some(listed.stamp) != self.watermark()? {
 			return Ok(Vec::new());
 		}
 		Ok(listed.roots)
 	}
 
 	/// Clear the listed-roots record, ahead of a change that can leave a root's cached rows short of
-	/// a listing (see `ListedRoots`): every root relists on its next add.
+	/// a listing (see `listed_roots_on`): every root relists on its next add.
 	pub(crate) fn forget_listed_roots(&self) -> Result<(), Box<CacheError>> {
 		forget_listed_roots_on(&self.db).map_err(|e| db_err(e, "clearing the listed roots"))
 	}
 
 	/// Take `roots` out of the listed-roots record, ahead of a change that can leave their cached
-	/// rows short of a listing (see `ListedRoots`): each relists on its next add, and every other
+	/// rows short of a listing (see `listed_roots_on`): each relists on its next add, and every other
 	/// root keeps its claim. With no record, or none of `roots` in it, nothing is written.
 	pub(crate) fn forget_listed_roots_among(&self, roots: &[Uuid]) -> Result<(), Box<CacheError>> {
 		let Some(mut listed) =
@@ -342,7 +356,7 @@ impl CacheState {
 		if listed.roots.len() == before {
 			return Ok(());
 		}
-		set_listed_roots_on(&self.db, listed.at, &listed.roots)
+		set_listed_roots_on(&self.db, listed.stamp, &listed.roots)
 			.map_err(|e| db_err(e, "taking roots out of the listed roots"))
 	}
 
@@ -428,7 +442,7 @@ impl CacheState {
 			let listed = listed_roots_on(conn)
 				.map_err(|e| db_err(e, "reading the listed roots in drain commit"))?;
 			if let Some(mut listed) = listed {
-				if Some(listed.at) == self.watermark()? {
+				if Some(listed.stamp) == self.watermark()? {
 					listed.roots.retain(|root| registered.contains_key(root));
 				} else {
 					listed.roots.clear();
