@@ -4,7 +4,13 @@
 //! files/dirs, empty files/dirs, deeply nested trees, byte-exact content, idempotency, initial
 //! sync into empty/non-empty destinations, mixed batches, assorted sizes, ordinary names,
 //! updates, deletions, renames, path reuse, and the round-trip. Black-box: PUBLIC API only.
-use std::{borrow::Cow, sync::Arc, time::Duration};
+use std::{
+	borrow::Cow,
+	sync::Arc,
+	time::{Duration, SystemTime},
+};
+
+use chrono::{DateTime, TimeZone, Utc};
 
 use filen_macros::shared_test_runtime;
 use filen_sdk_rs::{
@@ -12,7 +18,7 @@ use filen_sdk_rs::{
 		HasName, HasUUID,
 		categories::{DirType, Normal},
 		dir::RemoteDirectory,
-		file::RemoteFile,
+		file::{RemoteFile, traits::HasFileInfo},
 	},
 	sync_engine::{SyncEngine, SyncMode},
 };
@@ -1609,5 +1615,40 @@ async fn basic_add_recreate_after_delete_push() {
 	let r4 = sc.sync().await;
 	assert_eq!(r4.uploaded, 0, "{r4:?}");
 	assert_eq!(r4.remotely_trashed, 0, "{r4:?}");
+	sc.cleanup();
+}
+
+// ============================================================================
+// BASIC — an uploaded photo keeps the local file's mtime, not its EXIF date
+// ============================================================================
+
+/// JPEG whose EXIF `DateTimeOriginal`, `CreateDate` and `ModifyDate` are all
+/// `2020:06:15 10:30:00` (the fixture `exif_tests` already pins).
+const EXIF_SAMPLE_JPEG: &[u8] = include_bytes!("../fixtures/exif_sample.jpg");
+
+#[shared_test_runtime]
+async fn basic_photo_upload_keeps_the_local_mtime_not_the_exif_date() {
+	let sc = single_client(SyncMode::LocalToRemote).await;
+	write_file(&sc.local, "photo.jpg", EXIF_SAMPLE_JPEG);
+	// Years away from the EXIF date, and whole seconds so every filesystem stores it exactly.
+	let mtime: DateTime<Utc> = Utc.with_ymd_and_hms(2024, 3, 9, 8, 7, 6).unwrap();
+	std::fs::OpenOptions::new()
+		.write(true)
+		.open(sc.local.join("photo.jpg"))
+		.unwrap()
+		.set_modified(SystemTime::from(mtime))
+		.unwrap();
+
+	let report = sc.sync().await;
+	assert!(report.errors.is_empty(), "errors: {report:?}");
+	assert_eq!(report.uploaded, 1, "{report:?}");
+
+	let (_dirs, files) = list_remote_root(&sc).await;
+	let photo = find_file(&files, "photo.jpg").expect("photo.jpg missing on remote");
+	assert_eq!(
+		photo.last_modified(),
+		Some(mtime),
+		"the remote lastModified must be the local mtime, not the EXIF ModifyDate"
+	);
 	sc.cleanup();
 }

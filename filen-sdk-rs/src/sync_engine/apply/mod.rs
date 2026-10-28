@@ -3060,10 +3060,17 @@ async fn apply_transfer(
 				.parent
 				.ok_or_else(|| internal("remote parent dir for upload is missing"))?;
 			let path = local_path(ctx.local_root, rel_path);
+			// The remote keeps the file's own times, as filen-sync wrote them: an EXIF date would
+			// become the remote lastModified (a naive one read as UTC), skew what a pull writes
+			// back, and hide an edit that kept the date from devices that pull on a newer
+			// lastModified. The upload sets both times from the file's metadata, so with the
+			// override off EXIF could fill nothing either, and its parse is skipped altogether.
+			let mut builder = FileBuilderOptionalName::new(parent);
+			builder.no_exif();
 			let Some(upload) = ctx
 				.gate
 				.guard(ctx.client.upload_file_from_path_with_builder(
-					FileBuilderOptionalName::new(parent),
+					builder,
 					path,
 					Some(progress_callback(
 						progress,
