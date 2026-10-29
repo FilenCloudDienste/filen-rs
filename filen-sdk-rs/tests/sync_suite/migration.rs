@@ -30,6 +30,8 @@ use filen_sdk_rs::fs::categories::{DirType, Normal};
 use filen_sdk_rs::fs::dir::RemoteDirectory;
 use filen_sdk_rs::fs::file::RemoteFile;
 use filen_sdk_rs::fs::{HasName, HasUUID};
+#[cfg(feature = "malformed")]
+use filen_sdk_rs::sync_engine::PlannedActionKind;
 use filen_sdk_rs::sync_engine::{SyncEngine, SyncMode, SyncReport};
 #[cfg(feature = "malformed")]
 use rusqlite::OptionalExtension;
@@ -788,6 +790,55 @@ async fn migrate_12_a_hashless_remote_matching_size_and_mtime_is_not_reuploaded(
 		staged.uuid(),
 		"the remote version changed: the file was re-uploaded"
 	);
+
+	std::fs::remove_dir_all(&local).ok();
+}
+
+/// MIGRATE-15 — a dry run of a local-to-remote pair's first pass plans what that pass does: no
+/// upload of the hashless file whose size and mtime the local copy matches, and an upload of the
+/// file only the local side holds. It records nothing; the pass that follows records the file as
+/// synced and uploads the other one alone.
+#[cfg(feature = "malformed")]
+#[shared_test_runtime]
+async fn migrate_15_a_dry_run_plans_no_upload_of_a_file_the_pass_records_as_synced() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let remote: Uuid = resources.dir.uuid();
+	let data = b"one-way, uploaded by filen-sync";
+	let staged = stage_hashless(&resources.client, remote, "f.bin", data, STAMP_MS).await;
+	let cache = cache_over_hashless(&resources, &[(&staged, STAMP_MS)]).await;
+	let local = fresh_local_dir("migrate15");
+	write_file_at(&local, "f.bin", data, STAMP_MS);
+	write_file_at(&local, "new.bin", b"only the local side has this", STAMP_MS);
+	let db_path = temp_cache_path();
+
+	let engine = SyncEngine::open(cache.client.clone(), db_path.clone())
+		.await
+		.unwrap();
+	let pair = engine
+		.add_pair(local.clone(), remote, SyncMode::LocalToRemote)
+		.await
+		.unwrap();
+	let plan = engine.plan_pair(pair).await.unwrap();
+	let planned: Vec<(PlannedActionKind, &str)> = plan
+		.actions
+		.iter()
+		.map(|action| (action.kind.clone(), action.rel_path.as_str()))
+		.collect();
+	assert_eq!(
+		planned,
+		[(PlannedActionKind::UploadFile, "new.bin")],
+		"{plan}"
+	);
+	assert_eq!(
+		baseline_row(&db_path, "f.bin"),
+		None,
+		"the dry run recorded a row"
+	);
+
+	let r1 = engine.sync_once(pair).await.unwrap();
+	assert!(r1.errors.is_empty(), "{r1:?}");
+	assert_eq!(r1.uploaded, 1, "{r1:?}");
+	assert_seeded(&db_path, "f.bin", data, staged.uuid());
 
 	std::fs::remove_dir_all(&local).ok();
 }
