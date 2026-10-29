@@ -588,6 +588,53 @@ fn imported_state_a_byte_or_a_millisecond_off_the_local_file_is_no_evidence() {
 	}
 }
 
+/// 440.6 ms into the second, read at 441 as Unix reads it: filen-sync recorded the local mtime as
+/// `Math.floor(stats.mtimeMs)`, `...440`.
+#[test]
+fn imported_state_holding_filen_sync_s_floor_below_a_millisecond_this_engine_rounds_up_is_evidence()
+{
+	let (file, remote) = (read_at(SECOND + 441, -400_000), hashless("a", 1, 5, STAMP));
+	for mtime in [SECOND + 440, SECOND + 441] {
+		assert_eq!(
+			evidence(&file, &remote, Some(&synced(1, 5, mtime))),
+			Some(Evidence::Imported),
+			"imported mtime {mtime}"
+		);
+	}
+	for mtime in [SECOND + 439, SECOND + 442] {
+		assert_eq!(
+			evidence(&file, &remote, Some(&synced(1, 5, mtime))),
+			None,
+			"imported mtime {mtime}"
+		);
+	}
+}
+
+/// 440.9999 ms into the second, read at 440: Node's `mtimeMs` rounds up to `...441` before the floor.
+#[test]
+fn imported_state_holding_filen_sync_s_stamp_rounded_up_to_the_next_millisecond_is_evidence() {
+	let (file, remote) = (read_at(SECOND + 440, 999_900), hashless("a", 1, 5, STAMP));
+	assert_eq!(
+		evidence(&file, &remote, Some(&synced(1, 5, SECOND + 441))),
+		Some(Evidence::Imported)
+	);
+	assert_eq!(
+		evidence(&file, &remote, Some(&synced(1, 5, SECOND + 442))),
+		None
+	);
+}
+
+/// The imported state is never read at whole seconds: filen-sync recorded the same whole second
+/// this engine reads there.
+#[test]
+fn imported_state_is_never_compared_at_seconds() {
+	let (file, remote) = (read_at(SECOND, 0), hashless("a", 1, 5, STAMP));
+	assert_eq!(
+		evidence(&file, &remote, Some(&synced(1, 5, SECOND + 441))),
+		None
+	);
+}
+
 /// Import a filen-sync state into `pair` that lists each of `files` — path, remote version, size
 /// and local mtime — as synced, replacing what it held.
 fn import(store: &BaselineStore, pair: PairId, files: &[(&str, u128, i64, i64)]) {

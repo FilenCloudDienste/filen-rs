@@ -15,8 +15,10 @@
 //!
 //! - the filen-sync state the pair imported (see [`legacy`](super::legacy)) lists the path as
 //!   synced, and nothing has moved since: the remote is still the version that engine last listed
-//!   there, and the local file has the size and mtime (to the millisecond) it last saw. A stale
-//!   version or a local edit since is no evidence here, and the path is weighed by what follows;
+//!   there, and the local file has the size it last saw and the mtime it recorded: filen-sync
+//!   recorded `Math.floor(stats.mtimeMs)`, so the local mtime matches to the millisecond as this
+//!   engine reads it or as filen-sync read it (see the remote stamps below). A stale version or a
+//!   local edit since is no evidence here, and the path is weighed by what follows;
 //! - both files are empty: the content is provably the same, whatever the stamps say;
 //! - the sizes are equal and the remote's `lastModified` is the local mtime, read one of the ways a
 //!   client that stamped it can have read it:
@@ -137,7 +139,7 @@ pub(super) fn evidence(
 	if imported.is_some_and(|synced| {
 		synced.remote_uuid == remote.remote_uuid
 			&& synced.size == local.size
-			&& synced.local_mtime == local.mtime_millis
+			&& same_millisecond(local, synced.local_mtime)
 	}) {
 		return Some(Evidence::Imported);
 	}
@@ -154,16 +156,20 @@ pub(super) fn evidence(
 /// Whether a remote `lastModified` of `remote_millis` is `local`'s mtime, read to the millisecond,
 /// as filen-sync read it, or in whole seconds where it has no sub-second part (see the module docs).
 fn same_mtime(local: &LocalNode, remote_millis: i64) -> bool {
-	if remote_millis == local.mtime_millis {
+	if same_millisecond(local, remote_millis) {
 		return true;
 	}
-	let Some((secs, nanos)) = mtime_parts(local) else {
-		return false;
-	};
-	if nanos == 0 {
-		return remote_millis.div_euclid(1000) == secs;
-	}
-	node_mtime_millis(secs, nanos) == Some(remote_millis)
+	mtime_parts(local)
+		.is_some_and(|(secs, nanos)| nanos == 0 && remote_millis.div_euclid(1000) == secs)
+}
+
+/// Whether a stamp of `millis` is `local`'s mtime to the millisecond, as this engine reads it or as
+/// filen-sync read it ([`node_mtime_millis`]). filen-sync recorded that stamp both in the state the
+/// pair imported and as the `lastModified` of every file it uploaded.
+fn same_millisecond(local: &LocalNode, millis: i64) -> bool {
+	millis == local.mtime_millis
+		|| mtime_parts(local).and_then(|(secs, nanos)| node_mtime_millis(secs, nanos))
+			== Some(millis)
 }
 
 /// `local`'s mtime as the file system holds it: whole seconds since the epoch, and the nanoseconds

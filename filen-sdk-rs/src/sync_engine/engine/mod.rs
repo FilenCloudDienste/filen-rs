@@ -5870,8 +5870,9 @@ impl SyncEngine {
 	/// hold a file, the remote one carries no BLAKE3 (another client uploaded it without one) and
 	/// the two agree: the filen-sync state the pair imported
 	/// ([`import_legacy_state`](Self::import_legacy_state)) lists the path at the remote's version
-	/// and the local file's size and mtime, both files are empty, or their sizes are equal and the
-	/// remote's modification time is the local one: to the millisecond, as filen-sync computed it
+	/// and the local file's size and mtime (to the millisecond, or as filen-sync computed it), both
+	/// files are empty, or their sizes are equal and the remote's modification time is the local
+	/// one: to the millisecond, as filen-sync computed it
 	/// from the local one (`Math.floor` of Node's floating-point `mtimeMs`), or anywhere in the
 	/// same second where the local one has no sub-second part, as on a file system that keeps whole
 	/// seconds. A tree another client synced before this engine then reads as synced rather than
