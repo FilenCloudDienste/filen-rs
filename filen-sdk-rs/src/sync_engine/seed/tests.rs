@@ -533,6 +533,62 @@ fn a_preview_hands_back_the_rows_a_seeding_would_write_and_writes_none() {
 	assert_eq!(store.entries(pair).unwrap(), [old]);
 }
 
+/// Past a chunk, a writing seeding finds the rows it wrote in the chunks before and drops a file
+/// whose lineage one of them records; a preview finds the rows it kept, and drops the same file.
+#[test]
+fn a_preview_drops_what_a_written_seeding_drops_past_a_chunk() {
+	let paths: Vec<String> = (0..=SEED_CHUNK).map(|n| format!("f{n:05}.bin")).collect();
+	let mut remote: Vec<RemoteNode> = paths
+		.iter()
+		.zip(1u128..)
+		.map(|(path, uuid)| hashless(path, uuid, 5, STAMP))
+		.collect();
+	// The last file, in the second chunk, shares the first one's lineage.
+	let first_lineage = remote[0].stable_uuid;
+	remote
+		.last_mut()
+		.expect("more than a chunk of files")
+		.stable_uuid = first_lineage;
+	let local: Vec<LocalNode> = paths.iter().map(|path| local(path, 5, STAMP)).collect();
+
+	let (written_store, written_pair) = store();
+	let written = seed_all(&written_store, written_pair, &local, &remote, |_| false);
+	let written_paths: Vec<String> = written_store
+		.entries(written_pair)
+		.unwrap()
+		.into_iter()
+		.map(|row| row.rel_path)
+		.collect();
+	assert_eq!(written.size_and_mtime, SEED_CHUNK);
+
+	let (store, pair) = store();
+	let preview = Preview::new(&store);
+	let baseline = store.baseline(pair).unwrap();
+	let locals: HashMap<String, LocalNode> = local
+		.iter()
+		.map(|node| (node.rel_path.clone(), node.clone()))
+		.collect();
+	let counts = seed(
+		&preview,
+		pair,
+		&baseline,
+		&locals,
+		remote
+			.iter()
+			.map(|node| (Cow::from(node.rel_path.as_str()), Cow::Borrowed(node))),
+		|_| false,
+	)
+	.unwrap();
+	let kept: Vec<String> = preview
+		.into_rows()
+		.into_iter()
+		.map(|row| row.rel_path)
+		.collect();
+	assert_eq!(counts, written);
+	assert_eq!(kept, written_paths);
+	assert_eq!(store.entries(pair).unwrap(), []);
+}
+
 /// What an imported filen-sync state recorded at a path: remote version `uuid`, local `size` and
 /// `local_mtime`.
 fn synced(uuid: u128, size: u64, local_mtime: i64) -> LegacySynced {

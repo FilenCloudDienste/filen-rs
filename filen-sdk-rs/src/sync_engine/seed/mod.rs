@@ -49,7 +49,7 @@
 //! the rows instead ([`Seeding::Preview`]), so it plans what the pass after it would. The adoption
 //! read of a mode switch and the benchmark weigh nothing ([`Seeding::Skip`]).
 
-use std::{borrow::Cow, cell::RefCell};
+use std::{borrow::Cow, cell::RefCell, collections::HashMap};
 
 use filen_types::fs::StableUuid;
 use num_traits::ToPrimitive;
@@ -269,26 +269,35 @@ impl SeedStore for BaselineStore {
 /// A [`SeedStore`] that writes nothing: it reads what the stage asks of `store` and keeps the rows
 /// the stage would write there, for a dry run to read into its own view (see [`Seeding::Preview`]).
 ///
-/// Each chunk's rows are asked about against the store as the pass found it, not with the chunks
-/// before it written in, which a real pass reads them against. Those chunks claim nothing a later
-/// one holds: the remote view places each remote item at one path, so no two candidates of one
-/// pass are the same item.
+/// Each chunk's rows are asked about against the store as the pass found it and against the rows
+/// kept from the chunks before it, as a real pass reads them against the store with those chunks
+/// written in. The remote view places each remote uuid at one path, but not each lineage: a remote
+/// file a later chunk holds under a lineage an earlier chunk's row records is dropped by the pass,
+/// and so here.
 pub(super) struct Preview<'a> {
 	store: &'a BaselineStore,
-	rows: RefCell<Vec<BaselineEntry>>,
+	kept: RefCell<Kept>,
+}
+
+/// The rows a [`Preview`] kept, and which of them records each remote uuid and lineage.
+#[derive(Default)]
+struct Kept {
+	rows: Vec<BaselineEntry>,
+	by_uuid: HashMap<Uuid, usize>,
+	by_lineage: HashMap<StableUuid, usize>,
 }
 
 impl<'a> Preview<'a> {
 	pub(super) fn new(store: &'a BaselineStore) -> Self {
 		Self {
 			store,
-			rows: RefCell::new(Vec::new()),
+			kept: RefCell::new(Kept::default()),
 		}
 	}
 
 	/// The rows the stage would have written, in the order it would have written them.
 	pub(super) fn into_rows(self) -> Vec<BaselineEntry> {
-		self.rows.into_inner()
+		self.kept.into_inner().rows
 	}
 }
 
@@ -311,11 +320,36 @@ impl SeedStore for Preview<'_> {
 		uuids: &[Uuid],
 		lineages: &[StableUuid],
 	) -> rusqlite::Result<SyncedPaths> {
-		self.store.synced_paths(pair, uuids, lineages)
+		let mut out = self.store.synced_paths(pair, uuids, lineages)?;
+		let kept = self.kept.borrow();
+		let by_uuid = uuids
+			.iter()
+			.filter_map(|uuid| kept.by_uuid.get(uuid).map(|&at| (Some(*uuid), None, at)));
+		let by_lineage = lineages.iter().filter_map(|lineage| {
+			kept.by_lineage
+				.get(lineage)
+				.map(|&at| (None, Some(*lineage), at))
+		});
+		for (uuid, lineage, at) in by_uuid.chain(by_lineage) {
+			if let Some(row) = kept.rows.get(at) {
+				out.offer(&row.rel_path, uuid, lineage);
+			}
+		}
+		Ok(out)
 	}
 
 	fn seed_rows(&self, _pair: PairId, rows: Vec<BaselineEntry>) -> rusqlite::Result<()> {
-		self.rows.borrow_mut().extend(rows);
+		let mut kept = self.kept.borrow_mut();
+		for row in rows {
+			let at = kept.rows.len();
+			if let Some(uuid) = row.remote_uuid {
+				kept.by_uuid.entry(uuid).or_insert(at);
+			}
+			if let Some(lineage) = row.remote_stable_uuid {
+				kept.by_lineage.entry(lineage).or_insert(at);
+			}
+			kept.rows.push(row);
+		}
 		Ok(())
 	}
 }
