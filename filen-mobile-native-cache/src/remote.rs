@@ -728,10 +728,10 @@ impl AuthCacheState {
 
 	/// The file an id names, as the cache held it before this call and as the server has it now —
 	/// the shared front half of the download calls.
-	async fn resolve_file_to_download(
-		&self,
-		id: &FfiId,
-	) -> Result<(Option<DBFile>, DBFile), CacheError> {
+	///
+	/// [`ToDownload::Unreachable`] when the server could not be reached at all to ask about a file
+	/// the cache already holds a row for; see [`AuthCacheState::cached_copy_offline`].
+	async fn resolve_file_to_download(&self, id: &FfiId) -> Result<ToDownload, CacheError> {
 		// Identity-form (`stable/`) ids resolve row-direct (see `resolve_stable_object`):
 		// serving bytes through a rebuilt display path can hand out a same-named sibling's
 		// content.
@@ -740,8 +740,25 @@ impl AuthCacheState {
 				Some(DBObject::File(file)) => Some(file),
 				_ => None,
 			};
+			// What `resolve_stable_object` does for a row the cache holds, with the server's
+			// failure kept apart from its answer.
+			if let Some(cached) = old_file {
+				let _listing = self.listing_barrier.read().await;
+				return match self.refresh_file_reaching(cached.clone()).await? {
+					Ok(Some(DBObject::File(file))) => {
+						Ok(ToDownload::Fresh(Some(Box::new(cached)), file))
+					}
+					Ok(None) => Err(CacheError::DoesNotExist(
+						format!("No item found for id: {id}").into(),
+					)),
+					Ok(Some(_)) => Err(CacheError::remote(format!(
+						"Id {id} does not point to a file"
+					))),
+					Err(e) => Ok(ToDownload::Unreachable(cached, Box::new(e))),
+				};
+			}
 			return match self.resolve_stable_object(id).await? {
-				DBObject::File(file) => Ok((old_file, file)),
+				DBObject::File(file) => Ok(ToDownload::Fresh(None, file)),
 				_ => Err(CacheError::remote(format!(
 					"Id {id} does not point to a file"
 				))),
@@ -756,7 +773,9 @@ impl AuthCacheState {
 		};
 
 		match self.update_items_in_path(&path_values).await? {
-			UpdateItemsInPath::Complete(DBObject::File(file)) => Ok((old_file, file)),
+			UpdateItemsInPath::Complete(DBObject::File(file)) => {
+				Ok(ToDownload::Fresh(old_file.map(Box::new), file))
+			}
 			// The walk reached the server and the path stops resolving before the file: the item
 			// is GONE, not unreachable (a transport failure propagates as its own error above).
 			// Reporting this as a remote error read as `.serverUnreachable` on iOS, and the
@@ -781,9 +800,21 @@ impl AuthCacheState {
 		progress_callback: Option<Arc<dyn ProgressCallback>>,
 	) -> Result<String, CacheError> {
 		debug!("Downloading file to path: {}", file_path.0);
-		let (old_file, file) = self.resolve_file_to_download(&file_path).await?;
-		self.inner_download_file_if_changed(old_file, file, progress_callback, None)
-			.await
+		match self.resolve_file_to_download(&file_path).await? {
+			ToDownload::Fresh(old_file, file) => {
+				self.inner_download_file_if_changed(
+					old_file.map(|f| *f),
+					file,
+					progress_callback,
+					None,
+				)
+				.await
+			}
+			ToDownload::Unreachable(cached, e) => self
+				.cached_copy_offline(&cached, e)
+				.await
+				.map(|(path, _)| path),
+		}
 	}
 
 	pub(crate) async fn download_file_if_changed_with_item(
@@ -796,7 +827,16 @@ impl AuthCacheState {
 		// Before the refresh below, which is already a server round trip: a call cancelled before
 		// it started must not go near the network at all.
 		check_not_aborted(abort.as_ref())?;
-		let (old_file, file) = self.resolve_file_to_download(&id).await?;
+		let (old_file, file) = match self.resolve_file_to_download(&id).await? {
+			ToDownload::Fresh(old_file, file) => (old_file.map(|f| *f), file),
+			ToDownload::Unreachable(cached, e) => {
+				let (path, file) = self.cached_copy_offline(&cached, e).await?;
+				return Ok(DownloadResponse {
+					path,
+					file: file.into(),
+				});
+			}
+		};
 		let uuid = file.uuid;
 		let path = self
 			.inner_download_file_if_changed(old_file, file, progress_callback, abort)
@@ -1227,15 +1267,61 @@ impl AuthCacheState {
 	/// the stable tier lands it on this very row. A trashed head is still this item and comes back
 	/// as one, carrying the parent a restore would put it back in.
 	async fn refresh_file(&self, file: DBFile) -> Result<Option<DBObject>, CacheError> {
+		self.refresh_file_reaching(file).await?.map_err(Into::into)
+	}
+
+	/// [`Self::refresh_file`], telling a server that could not be reached (the inner `Err`) apart
+	/// from its answer.
+	async fn refresh_file_reaching(
+		&self,
+		file: DBFile,
+	) -> Result<Result<Option<DBObject>, filen_sdk_rs::error::Error>, CacheError> {
 		let head = match self.client.get_file_by_stable_uuid(file.stable_uuid).await {
 			Ok(head) => head,
 			Err(e) if e.kind() == ErrorKind::FileNotFound => {
-				return self.forget_item(DBObject::File(file)).await;
+				return Ok(Ok(self.forget_item(DBObject::File(file)).await?));
 			}
+			Err(e) if is_unreachable(e.kind()) => return Ok(Err(e)),
 			Err(e) => return Err(e.into()),
 		};
 		let file = DBFile::upsert_from_remote(&mut self.conn(), head)?;
-		Ok(Some(DBObject::File(file)))
+		Ok(Ok(Some(DBObject::File(file))))
+	}
+
+	/// The cache's own copy of `file`, for when the server cannot be asked whether it is current
+	/// (`unreachable` is that failure, returned if there is no copy to serve).
+	///
+	/// Served only from the slot named by the row's uuid: the server re-mints a file's uuid with
+	/// every content edit, so those bytes are the version the cache last knew to be current, and
+	/// no fresher one can have been seen without the server. Downloads and imports land in the
+	/// slot by rename, so a slot that exists is complete. An unsent local edit is served too,
+	/// exactly as the online path serves it. Online, nothing here runs: the server's answer
+	/// always comes first.
+	async fn cached_copy_offline(
+		&self,
+		file: &DBFile,
+		unreachable: Box<filen_sdk_rs::error::Error>,
+	) -> Result<(String, DBFile), CacheError> {
+		// The same order as the online path: a re-minted slot is moved under the row's uuid
+		// first, then the slot is read under the item's lock.
+		self.rescue_reminted_slots().await;
+		let _local_file_guard = self.lock_local_file(file.uuid).await;
+		let Some(file) = DBFile::select(&self.conn(), file.uuid).optional()? else {
+			return Err((*unreachable).into());
+		};
+		match cached_copy(&self.cache_dir, &file).await? {
+			Some(path) => {
+				debug!(
+					"Server unreachable, serving the cached copy of {}",
+					file.uuid
+				);
+				let path = path.into_os_string().into_string().map_err(|e| {
+					CacheError::conversion(format!("Failed to convert path to string: {e:?}"))
+				})?;
+				Ok((path, file))
+			}
+			None => Err((*unreachable).into()),
+		}
 	}
 
 	async fn refresh_dir(&self, dir: DBDir) -> Result<Option<DBObject>, CacheError> {
@@ -2521,5 +2607,147 @@ impl AuthCacheState {
 			}
 		}
 		Ok(spare)
+	}
+}
+
+/// What [`AuthCacheState::resolve_file_to_download`] found.
+enum ToDownload {
+	/// The server answered: the file as the cache held it before (if it did), and as it is now.
+	Fresh(Option<Box<DBFile>>, DBFile),
+	/// The server could not be reached about a file the cache holds a row for.
+	Unreachable(DBFile, Box<filen_sdk_rs::error::Error>),
+}
+
+/// Whether a failure is the network's — the request never got an answer — rather than the
+/// server's. Not an authentication failure, not a not-found, not a server error reply.
+fn is_unreachable(kind: ErrorKind) -> bool {
+	kind == ErrorKind::Reqwest
+}
+
+/// The complete copy of `file`'s current version in the cache, if there is one: the file in
+/// the slot its row's uuid names. See [`AuthCacheState::cached_copy_offline`].
+async fn cached_copy(cache_dir: &Path, file: &DBFile) -> std::io::Result<Option<PathBuf>> {
+	let name = match &file.meta {
+		DBFileMeta::Decoded(meta) => Some(meta.name.as_str()),
+		_ => None,
+	};
+	let path = crate::io::cached_file_path(cache_dir, &file.uuid.to_string(), name);
+	match tokio::fs::metadata(&path).await {
+		Ok(meta) if meta.is_file() => Ok(Some(path)),
+		Ok(_) => Ok(None),
+		Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+		Err(e) => Err(e),
+	}
+}
+
+#[cfg(test)]
+mod offline_copy_tests {
+	use filen_sdk_rs::cache::open_sqlite_in_memory;
+	use filen_types::fs::StableUuid;
+	use rusqlite::Connection;
+
+	use super::*;
+	use crate::sql::{item::combine_parent, statements::UPSERT_ITEM};
+
+	fn uuid(byte: u8) -> Uuid {
+		Uuid::from_bytes([byte; 16])
+	}
+
+	fn db() -> Connection {
+		let conn = open_sqlite_in_memory().unwrap();
+		crate::auth::configure_conn(&conn).unwrap();
+		conn.execute_batch(sql::statements::INIT).unwrap();
+		conn.execute(
+			"INSERT INTO items (uuid, parent, type) VALUES (?1, NULL, 0);",
+			[uuid(9)],
+		)
+		.unwrap();
+		conn
+	}
+
+	/// A file row with decoded metadata; a second call with a new `uuid_` is a re-mint.
+	fn file(conn: &Connection, uuid_: Uuid, name: &str) -> DBFile {
+		let mut stmt = conn.prepare_cached(UPSERT_ITEM).unwrap();
+		let (id, _, _) = crate::sql::item::upsert_file_item_with_stmts(
+			uuid_,
+			StableUuid::new_for_test(uuid(2)),
+			combine_parent(Some(uuid(9)), false),
+			Some(name),
+			None,
+			&mut stmt,
+		)
+		.unwrap();
+		drop(stmt);
+		conn.execute(
+			"INSERT OR IGNORE INTO files (id, size, chunks, region, bucket, timestamp, metadata_state)
+			VALUES (?1, 0, 0, '', '', 0, 0);",
+			[id],
+		)
+		.unwrap();
+		conn.execute(
+			"INSERT INTO files_meta (id, name, mime, file_key, file_key_version, modified)
+			VALUES (?1, ?2, '', '', 3, 0)
+			ON CONFLICT (id) DO UPDATE SET name = excluded.name;",
+			rusqlite::params![id, name],
+		)
+		.unwrap();
+		DBFile::select(conn, uuid_).unwrap()
+	}
+
+	fn slot(cache_dir: &Path, uuid_: Uuid, name: &str) -> PathBuf {
+		let slot = cache_dir.join(uuid_.to_string());
+		std::fs::create_dir_all(&slot).unwrap();
+		let path = slot.join(name);
+		std::fs::write(&path, b"bytes").unwrap();
+		path
+	}
+
+	fn cache_dir(tag: &str) -> PathBuf {
+		let dir = std::env::temp_dir().join(format!("filen-offline-{tag}-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&dir);
+		std::fs::create_dir_all(&dir).unwrap();
+		dir
+	}
+
+	/// Only a request that never got an answer is the network's; an answer of any kind is the
+	/// server's, and is acted on as one.
+	#[test]
+	fn only_a_transport_failure_is_unreachable() {
+		assert!(is_unreachable(ErrorKind::Reqwest));
+		for kind in [
+			ErrorKind::Unauthenticated,
+			ErrorKind::FileNotFound,
+			ErrorKind::Server,
+			ErrorKind::Response,
+			ErrorKind::RetryFailed,
+		] {
+			assert!(!is_unreachable(kind), "{kind:?} is an answer");
+		}
+	}
+
+	/// The copy in the slot the row's uuid names is the current version, and is served.
+	#[tokio::test]
+	async fn the_current_versions_copy_is_served() {
+		let conn = db();
+		let dir = cache_dir("current");
+		let row = file(&conn, uuid(1), "a.txt");
+		let path = slot(&dir, uuid(1), "a.txt");
+
+		assert_eq!(cached_copy(&dir, &row).await.unwrap(), Some(path));
+		std::fs::remove_dir_all(&dir).unwrap();
+	}
+
+	/// After a remote content edit re-minted the uuid, the old slot holds a stale version and is
+	/// not served; neither is anything when the cache holds no bytes.
+	#[tokio::test]
+	async fn a_stale_or_missing_copy_is_not_served() {
+		let conn = db();
+		let dir = cache_dir("stale");
+		file(&conn, uuid(1), "a.txt");
+		slot(&dir, uuid(1), "a.txt");
+		let reminted = file(&conn, uuid(3), "a.txt");
+
+		assert_eq!(cached_copy(&dir, &reminted).await.unwrap(), None);
+		std::fs::remove_dir_all(&dir).unwrap();
 	}
 }
