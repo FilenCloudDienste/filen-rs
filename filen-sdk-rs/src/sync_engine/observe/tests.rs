@@ -5,10 +5,7 @@ use super::super::{derive::from_baseline, side::NodesAt};
 use uuid::Uuid;
 
 use super::*;
-use crate::{
-	alloc_meter,
-	sync_engine::{ScanGap, scan::UnrecordedRoot},
-};
+use crate::{alloc_meter, sync_engine::scan::UnrecordedRoot};
 
 fn temp_root() -> std::path::PathBuf {
 	let dir = std::env::temp_dir().join(format!("filen_observe_test_{}", Uuid::new_v4()));
@@ -462,6 +459,8 @@ fn an_ancestor_replaced_by_a_file_leaves_the_observation_incomplete_and_unreport
 #[test]
 fn a_permission_denial_is_missing_evidence_not_an_absence() {
 	use std::os::unix::fs::PermissionsExt;
+
+	use crate::sync_engine::ScanGap;
 
 	let root = temp_root();
 	let locked = root.join("locked");
