@@ -9,7 +9,7 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use filen_sdk_rs::{
-	auth::{StringifiedClient, http::ClientConfig, unauth::UnauthClient},
+	auth::{Client, StringifiedClient, http::ClientConfig, unauth::UnauthClient},
 	cache::{open_sqlite, open_sqlite_in_memory},
 	crypto::{shared::DataCrypter, v3::EncryptionKey},
 	fs::HasUUID,
@@ -58,7 +58,12 @@ pub struct AuthCacheState {
 	pub(crate) tmp_dir: PathBuf,
 	pub(crate) cache_dir: PathBuf,
 	pub(crate) thumbnail_dir: PathBuf,
-	pub(crate) client: Arc<filen_sdk_rs::auth::Client>,
+	/// Replaced in place, under the state write lock, when auth.json carries a refreshed session
+	/// for the same account (see [`adopt_session`]).
+	pub(crate) client: Arc<Client>,
+	/// With the root uuid, what tells a refreshed session for this account from another
+	/// account's.
+	user_id: u64,
 	pub(crate) last_recents_update: RwLock<Option<Instant>>,
 	pub(crate) last_trash_update: RwLock<Option<Instant>>,
 	pub(crate) thumbnail_file_budget: u64,
@@ -145,6 +150,9 @@ pub(crate) struct CacheState {
 	// document storage inside the app group) is.
 	pub(crate) db_dir: PathBuf,
 	last_update: std::sync::RwLock<Option<Instant>>,
+	/// Digest of the decrypted auth.json the current status was built from, so the authenticated
+	/// re-check skips an unchanged file without parsing it.
+	auth_digest: Option<blake3::Hash>,
 	/// Single-flight gate for the delayed disabled-state wipe confirmation: every
 	/// unauthenticated FFI call launches a cleanup task, and each Disabled confirmation sleeps
 	/// before re-reading auth.json — without the gate those pile up, each redundantly
@@ -517,6 +525,13 @@ fn thumbnail_client_config(settings: &AuthFile) -> ClientConfig {
 	config
 }
 
+fn client_from_config(config: FilenSDKConfig, settings: &AuthFile) -> Result<Client, CacheError> {
+	Ok(
+		UnauthClient::from_config(thumbnail_client_config(settings))?
+			.from_stringified(config.into())?,
+	)
+}
+
 /// `None` means the file's contents are UNKNOWN (unreadable, undecryptable, or unparseable) —
 /// distinct from the trusted default an absent file yields, because callers must fail closed on
 /// unknown without ever treating it as an affirmative disable.
@@ -576,19 +591,43 @@ fn decrypt_auth_bytes(bytes: &[u8], dek: Option<&EncryptionKey>) -> Result<Strin
 	})
 }
 
-fn sync_get_auth_file(path: &Path, dek: Option<&EncryptionKey>) -> Option<AuthFile> {
-	parse_auth_file(std::fs::read(path).and_then(|bytes| decrypt_auth_bytes(&bytes, dek)))
+fn sync_read_auth_plaintext(
+	path: &Path,
+	dek: Option<&EncryptionKey>,
+) -> Result<String, std::io::Error> {
+	std::fs::read(path).and_then(|bytes| decrypt_auth_bytes(&bytes, dek))
+}
+
+async fn async_read_auth_plaintext(
+	path: &Path,
+	dek: Option<&EncryptionKey>,
+) -> Result<String, std::io::Error> {
+	tokio::fs::read(path)
+		.await
+		.and_then(|bytes| decrypt_auth_bytes(&bytes, dek))
+}
+
+/// `None` when there is no plaintext: the file is absent or unreadable.
+fn plaintext_digest(plaintext: &Result<String, std::io::Error>) -> Option<blake3::Hash> {
+	plaintext
+		.as_ref()
+		.ok()
+		.map(|plaintext| blake3::hash(plaintext.as_bytes()))
+}
+
+/// [`parse_auth_file`], keeping the digest [`update_state`] records.
+fn parse_auth_read(
+	plaintext: Result<String, std::io::Error>,
+) -> (Option<AuthFile>, Option<blake3::Hash>) {
+	let digest = plaintext_digest(&plaintext);
+	(parse_auth_file(plaintext), digest)
 }
 
 pub(crate) async fn async_get_auth_file(
 	path: &Path,
 	dek: Option<&EncryptionKey>,
 ) -> Option<AuthFile> {
-	parse_auth_file(
-		tokio::fs::read(path)
-			.await
-			.and_then(|bytes| decrypt_auth_bytes(&bytes, dek)),
-	)
+	parse_auth_file(async_read_auth_plaintext(path, dek).await)
 }
 
 impl CacheState {
@@ -609,7 +648,8 @@ pub(crate) async fn confirm_disabled(auth_file: &Path, dek: Option<&EncryptionKe
 	)
 }
 
-fn update_state(state: &mut CacheState, auth_file: Option<AuthFile>) {
+fn update_state(state: &mut CacheState, auth_file: Option<AuthFile>, digest: Option<blake3::Hash>) {
+	state.auth_digest = digest;
 	let Some(mut auth_file) = auth_file else {
 		debug!("Auth file unavailable; failing closed without treating it as a disable");
 		state.status = AuthStatus::Unauthenticated(UnauthCacheState {
@@ -657,6 +697,123 @@ fn update_state(state: &mut CacheState, auth_file: Option<AuthFile>) {
 	last_update.replace(Instant::now());
 }
 
+/// A trusted, enabled auth.json that differs from the one the session was built from, with its
+/// client already built: that parses the account's keys, which no lock should wait on.
+struct RefreshedSession {
+	client: Client,
+	user_id: u64,
+	digest: blake3::Hash,
+}
+
+/// The authenticated re-check. An unchanged file costs one read, one decrypt and one hash. Only a
+/// TRUSTED read changes the session: an unavailable file is no evidence of a logout, and demoting
+/// on it tore down a session whose credentials were already validated over a read blip.
+async fn recheck_authenticated(
+	state: &tokio::sync::RwLock<CacheState>,
+	coordinator: &tokio::sync::Mutex<()>,
+	auth_file_path: &Path,
+	dek: Option<&EncryptionKey>,
+	current_digest: Option<blake3::Hash>,
+) {
+	let plaintext = async_read_auth_plaintext(auth_file_path, dek).await;
+	let digest = plaintext_digest(&plaintext);
+	if digest.is_some() && digest == current_digest {
+		return;
+	}
+	let Some(mut auth_file) = parse_auth_file(plaintext) else {
+		return;
+	};
+	let session = match (auth_file.provider_enabled, digest) {
+		(true, Some(digest)) => match auth_file.sdk_config.take() {
+			Some(config) => {
+				let user_id = config.user_id;
+				match client_from_config(config, &auth_file) {
+					Ok(client) => Some(RefreshedSession {
+						client,
+						user_id,
+						digest,
+					}),
+					// Keeps the running session, as an unreadable file does. Retried on the next
+					// re-check, at the cost of one key parse, until the file is rewritten.
+					Err(e) => {
+						tracing::error!("Failed to build a client from the changed auth file: {e}");
+						return;
+					}
+				}
+			}
+			None => None,
+		},
+		_ => None,
+	};
+	// Behind the same coordinator every other writer takes, so the coordinated try_read/try_write
+	// fast paths stay truthful (their expects assume no uncoordinated writer exists).
+	let _coordinator_guard = coordinator.lock().await;
+	let mut state = state.write().await;
+	match session {
+		Some(session) => adopt_session(&mut state, session, &auth_file),
+		None => update_state(&mut state, Some(auth_file), digest),
+	}
+}
+
+/// Applies a refreshed session. The same account (user id and root uuid) keeps everything but
+/// the client: the cache DB, the gap bookkeeping, the materialized set, the file locks. Every
+/// operation holds the state read guard for its whole duration, so this runs only once those
+/// already in flight are done with the old client. The live path is reset to resubscribe on the
+/// new client, since the socket authenticates with the api key, and the search, bound to the old
+/// client, is dropped for the next query to recreate. Thumbnail settings arrive with the new
+/// client's config; the file budgets apply at the next full build.
+///
+/// Another account goes the way of a fresh auth, with the old state dropped first so its
+/// connection is closed before `from_client`'s owner check wipes the files under it.
+fn adopt_session(state: &mut CacheState, session: RefreshedSession, settings: &AuthFile) {
+	let RefreshedSession {
+		client,
+		user_id,
+		digest,
+	} = session;
+	if state.auth_digest == Some(digest) {
+		return;
+	}
+	match &mut state.status {
+		AuthStatus::Authenticated(auth)
+			if auth.user_id == user_id && auth.client.root().uuid() == client.root().uuid() =>
+		{
+			info!("Auth file changed for the same account; adopting the new session");
+			auth.client = Arc::new(client);
+			auth.live = crate::live::LiveState::default();
+			*auth.search.get_mut() = None;
+		}
+		_ => {
+			drop(std::mem::replace(
+				&mut state.status,
+				AuthStatus::Unauthenticated(UnauthCacheState {
+					reason: UnauthReason::Unauthenticated,
+				}),
+			));
+			state.status = match AuthCacheState::from_client(
+				client,
+				user_id,
+				settings,
+				&state.files_dir,
+				&state.db_dir,
+			) {
+				Ok(auth_state) => {
+					info!("Authenticated with Filen SDK");
+					AuthStatus::Authenticated(auth_state)
+				}
+				Err(e) => {
+					tracing::error!("Failed to create AuthCacheState: {e}");
+					AuthStatus::Unauthenticated(UnauthCacheState {
+						reason: UnauthReason::Unauthenticated,
+					})
+				}
+			};
+		}
+	}
+	state.auth_digest = Some(digest);
+	state.last_update.write().unwrap().replace(Instant::now());
+}
+
 impl FilenMobileCacheState {
 	fn match_state<T>(&self, state: T, now: Instant) -> Option<T>
 	where
@@ -676,24 +833,23 @@ impl FilenMobileCacheState {
 
 					let auth_file_path = state.auth_file.clone();
 					let dek = state.dek;
+					let current_digest = state.auth_digest;
 					let state_arc = self.state.clone();
 					let coordinator = self.state_write_coordinator.clone();
+					let tasks = self.tasks.clone();
 
 					// run the update but do it async
 					self.tasks.spawn(async move {
-						let auth_file = async_get_auth_file(&auth_file_path, dek.as_ref()).await;
-						// Only a TRUSTED read demotes an authenticated session: an unavailable
-						// file is no evidence of a logout, and demoting on it tore down a
-						// session whose credentials were already validated over a read blip.
-						if let Some(auth_file) = auth_file
-							&& (!auth_file.provider_enabled || auth_file.sdk_config.is_none())
-						{
-							// Behind the same coordinator every other writer takes, so the
-							// coordinated try_read/try_write fast paths stay truthful (their
-							// expects assume no uncoordinated writer exists).
-							let _coordinator_guard = coordinator.lock().await;
-							update_state(&mut *state_arc.write().await, Some(auth_file));
-						}
+						recheck_authenticated(
+							&state_arc,
+							&coordinator,
+							&auth_file_path,
+							dek.as_ref(),
+							current_digest,
+						)
+						.await;
+						// Resubscribes a live path the re-check reset; a no-op otherwise.
+						crate::live::ensure_started(&state_arc, &tasks);
 					});
 				}
 			}
@@ -733,9 +889,11 @@ impl FilenMobileCacheState {
 		let mut write_state = self.state.write().await;
 
 		// actually perform the update
-		let auth_file = async_get_auth_file(&write_state.auth_file, write_state.dek.as_ref()).await;
+		let (auth_file, digest) = parse_auth_read(
+			async_read_auth_plaintext(&write_state.auth_file, write_state.dek.as_ref()).await,
+		);
 
-		update_state(&mut write_state, auth_file);
+		update_state(&mut write_state, auth_file, digest);
 		// A (re)established auth is what the live socket path keys off; idempotent otherwise.
 		crate::live::ensure_started(&self.state, &self.tasks);
 
@@ -758,8 +916,11 @@ impl FilenMobileCacheState {
 		let _coordinator_guard = self.state_write_coordinator.try_lock().ok()?;
 		let mut write_state = self.state.try_write().ok()?;
 
-		let file = sync_get_auth_file(&write_state.auth_file, write_state.dek.as_ref());
-		update_state(&mut write_state, file);
+		let (file, digest) = parse_auth_read(sync_read_auth_plaintext(
+			&write_state.auth_file,
+			write_state.dek.as_ref(),
+		));
+		update_state(&mut write_state, file, digest);
 		crate::live::ensure_started(&self.state, &self.tasks);
 
 		Some(write_state.downgrade())
@@ -811,9 +972,11 @@ impl FilenMobileCacheState {
 		let mut write_state = self.state.clone().write_owned().await;
 
 		// actually perform the update
-		let auth_file = async_get_auth_file(&write_state.auth_file, write_state.dek.as_ref()).await;
+		let (auth_file, digest) = parse_auth_read(
+			async_read_auth_plaintext(&write_state.auth_file, write_state.dek.as_ref()).await,
+		);
 
-		update_state(&mut write_state, auth_file);
+		update_state(&mut write_state, auth_file, digest);
 		crate::live::ensure_started(&self.state, &self.tasks);
 
 		write_state.downgrade()
@@ -835,8 +998,11 @@ impl FilenMobileCacheState {
 		let _coordinator_guard = self.state_write_coordinator.try_lock().ok()?;
 		let mut write_state = self.state.clone().try_write_owned().ok()?;
 
-		let file = sync_get_auth_file(&write_state.auth_file, write_state.dek.as_ref());
-		update_state(&mut write_state, file);
+		let (file, digest) = parse_auth_read(sync_read_auth_plaintext(
+			&write_state.auth_file,
+			write_state.dek.as_ref(),
+		));
+		update_state(&mut write_state, file, digest);
 		crate::live::ensure_started(&self.state, &self.tasks);
 
 		Some(write_state.downgrade())
@@ -874,9 +1040,18 @@ impl AuthCacheState {
 		files_dir: &Path,
 		db_dir: &Path,
 	) -> Result<Self, CacheError> {
-		let unauth_client = UnauthClient::from_config(thumbnail_client_config(settings))?;
-		let client = unauth_client.from_stringified(config.into())?;
+		let user_id = config.user_id;
+		let client = client_from_config(config, settings)?;
+		Self::from_client(client, user_id, settings, files_dir, db_dir)
+	}
 
+	fn from_client(
+		client: Client,
+		user_id: u64,
+		settings: &AuthFile,
+		files_dir: &Path,
+		db_dir: &Path,
+	) -> Result<Self, CacheError> {
 		let cache_state_file = db_dir.join("db_state.json");
 
 		// The account's root uuid is the cache's owner stamp: db_dir is keyed by the domain
@@ -897,6 +1072,7 @@ impl AuthCacheState {
 			cache_dir,
 			thumbnail_dir,
 			client: Arc::new(client),
+			user_id,
 			last_recents_update: RwLock::new(None),
 			last_trash_update: RwLock::new(None),
 			thumbnail_file_budget: settings
@@ -951,6 +1127,7 @@ impl AuthCacheState {
 
 		let unauth_client =
 			UnauthClient::from_config(thumbnail_client_config(&AuthFile::default()))?;
+		let user_id = client.user_id;
 		let client = unauth_client.from_stringified(client)?;
 
 		let cache_state_file = std::convert::AsRef::<Path>::as_ref(files_dir).join("db_state.json");
@@ -967,6 +1144,7 @@ impl AuthCacheState {
 			std::convert::AsRef::<Path>::as_ref(files_dir).join(crate::search::SDK_CACHE_DB_NAME);
 		let new = Self {
 			client: Arc::new(client),
+			user_id,
 			conn: Mutex::new(db),
 			cache_state_file,
 			cache_dir,
@@ -1188,6 +1366,7 @@ impl FilenMobileCacheState {
 				files_dir: PathBuf::from(files_dir),
 				db_dir: PathBuf::from(db_dir),
 				last_update: std::sync::RwLock::new(None),
+				auth_digest: None,
 				disabled_wipe_gate: Arc::new(tokio::sync::Semaphore::new(1)),
 				working_set_listener: Mutex::new(None),
 			})),
@@ -1219,6 +1398,7 @@ impl FilenMobileCacheState {
 				files_dir: PathBuf::from(files_dir),
 				db_dir: PathBuf::from(files_dir),
 				last_update: std::sync::RwLock::new(None),
+				auth_digest: None,
 				disabled_wipe_gate: Arc::new(tokio::sync::Semaphore::new(1)),
 				working_set_listener: Mutex::new(None),
 			})),
@@ -1622,5 +1802,261 @@ mod pending_reconcile_state_tests {
 			Some(4),
 			"the rest survives the parse"
 		);
+	}
+}
+
+#[cfg(test)]
+mod session_refresh_tests {
+	use std::{
+		path::{Path, PathBuf},
+		sync::Arc,
+	};
+
+	use filen_sdk_rs::{
+		auth::Client,
+		crypto::{shared::DataCrypter, v3::EncryptionKey},
+		fs::HasUUID,
+	};
+	use filen_types::auth::{AuthVersion, FilenSDKConfig};
+
+	use super::{
+		AuthCacheState, AuthFile, AuthStatus, CacheState, UnauthCacheState, UnauthReason,
+		parse_auth_read, recheck_authenticated, sync_read_auth_plaintext, test_support::TempDbDir,
+		update_state,
+	};
+
+	/// A throwaway 512-bit PKCS#8 key: it only has to parse, and generating one per test would
+	/// need a dependency this crate does not have.
+	const TEST_PRIVATE_KEY: &str = "MIIBVAIBADANBgkqhkiG9w0BAQEFAASCAT4wggE6AgEAAkEArb1qLZWNKBX6g2xbVllG53W1vfZe8I0zjn+9o0k5yF1wgqKYs3RM3pDpaGSm9fjyhZ5dY+mahX7mFto/IeOWAQIDAQABAkAbWmzzDE6S9xLfyhl/OMMPAdtBMx6zZKevUbE7mfW886aXQmS5KMhX9xJ54ijx3MUk7rZa7RU+4YTL4i0KCPyhAiEA3savlb6LqUJ/+WbF8u9oazX54zapC0ogoKOlbfV7g8UCIQDHppZeH5iPvgWpkagpFVvnfGe1PGadhiEx0IVuErOhDQIge86j6m65I1oH0U1imX6f42Vd+P55uAJ8W4pW9+NDv5kCIAuhjt0I5jBpl5bbX3qVPfdsbfZHAItoxwJJ7ZwOBtz5AiEAmrbd5UB4b9U7JndP5nFtm65xyG5wZr6NoH5vjohrE2M=";
+	const ROOT_A: &str = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+	const ROOT_B: &str = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+
+	fn sdk_config(user_id: u64, root: &str, api_key: &str) -> FilenSDKConfig {
+		FilenSDKConfig {
+			email: "offline@example.invalid".to_owned(),
+			password: String::new(),
+			two_factor_code: String::new(),
+			master_keys: vec!["0".repeat(64)],
+			api_key: api_key.to_owned(),
+			public_key: String::new(),
+			private_key: TEST_PRIVATE_KEY.to_owned(),
+			auth_version: AuthVersion::V2,
+			base_folder_uuid: root.to_owned(),
+			user_id,
+			metadata_cache: false,
+			tmp_path: String::new(),
+			connect_to_socket: false,
+		}
+	}
+
+	fn enabled(config: FilenSDKConfig) -> Vec<u8> {
+		serde_json::to_vec(&AuthFile {
+			provider_enabled: true,
+			sdk_config: Some(config),
+			..AuthFile::default()
+		})
+		.unwrap()
+	}
+
+	// Mirrors the app-side seal (fileProvider.ts): version(0x01) ++ nonce(12) ++ ciphertext ++ tag(16).
+	fn write_sealed(path: &Path, dek: &EncryptionKey, plaintext: &[u8]) {
+		let mut data = plaintext.to_vec();
+		dek.blocking_encrypt_data(&mut data).unwrap();
+		let mut blob = vec![0x01];
+		blob.extend_from_slice(&data);
+		std::fs::write(path, blob).unwrap();
+	}
+
+	/// An authenticated state built from a sealed auth.json, the way the FFI entry points build
+	/// it, with one marker row in its cache DB.
+	struct Session {
+		dir: TempDbDir,
+		dek: EncryptionKey,
+		state: tokio::sync::RwLock<CacheState>,
+		coordinator: tokio::sync::Mutex<()>,
+	}
+
+	impl Session {
+		fn start(config: FilenSDKConfig) -> Self {
+			let dir = TempDbDir::create("filen-cache-session-refresh");
+			let dek = EncryptionKey::new([7u8; 32]);
+			let auth_file = dir.0.join("auth.json");
+			write_sealed(&auth_file, &dek, &enabled(config));
+			let mut state = CacheState {
+				status: AuthStatus::Unauthenticated(UnauthCacheState {
+					reason: UnauthReason::Disabled,
+				}),
+				auth_file: Arc::new(auth_file),
+				dek: Some(dek),
+				files_dir: dir.0.clone(),
+				db_dir: dir.0.clone(),
+				last_update: std::sync::RwLock::new(None),
+				auth_digest: None,
+				disabled_wipe_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+				working_set_listener: std::sync::Mutex::new(None),
+			};
+			let (file, digest) =
+				parse_auth_read(sync_read_auth_plaintext(&state.auth_file, Some(&dek)));
+			update_state(&mut state, file, digest);
+			let session = Session {
+				dir,
+				dek,
+				state: tokio::sync::RwLock::new(state),
+				coordinator: tokio::sync::Mutex::new(()),
+			};
+			session
+				.auth()
+				.conn()
+				.execute_batch(
+					"INSERT INTO items (uuid, stable_uuid, parent, type)
+					VALUES (x'CC000000000000000000000000000000', NULL, NULL, 1);",
+				)
+				.unwrap();
+			session
+		}
+
+		fn auth_path(&self) -> PathBuf {
+			self.dir.0.join("auth.json")
+		}
+
+		fn write_sealed(&self, plaintext: &[u8]) {
+			write_sealed(&self.auth_path(), &self.dek, plaintext);
+		}
+
+		/// What the periodic re-check spawned from `match_state` runs.
+		async fn recheck(&self) {
+			let current_digest = self.state.read().await.auth_digest;
+			recheck_authenticated(
+				&self.state,
+				&self.coordinator,
+				&self.auth_path(),
+				Some(&self.dek),
+				current_digest,
+			)
+			.await;
+		}
+
+		fn auth(&self) -> tokio::sync::RwLockReadGuard<'_, AuthCacheState> {
+			tokio::sync::RwLockReadGuard::map(self.state.try_read().unwrap(), |state| match &state
+				.status
+			{
+				AuthStatus::Authenticated(auth) => auth,
+				AuthStatus::Unauthenticated(_) => panic!("the session is not authenticated"),
+			})
+		}
+
+		fn client(&self) -> Arc<Client> {
+			self.auth().client.clone()
+		}
+
+		fn has_marker(&self) -> bool {
+			self.auth()
+				.conn()
+				.query_row(
+					"SELECT COUNT(*) FROM items WHERE uuid = x'CC000000000000000000000000000000'",
+					[],
+					|row| row.get::<_, i64>(0),
+				)
+				.unwrap() == 1
+		}
+
+		fn unauth_reason(&self) -> Option<&'static str> {
+			match &self.state.try_read().unwrap().status {
+				AuthStatus::Authenticated(_) => None,
+				AuthStatus::Unauthenticated(unauth) => Some(match unauth.reason {
+					UnauthReason::Disabled => "disabled",
+					UnauthReason::Unauthenticated => "unauthenticated",
+					UnauthReason::Unavailable => "unavailable",
+				}),
+			}
+		}
+	}
+
+	#[tokio::test]
+	async fn a_new_api_key_for_the_same_account_swaps_only_the_client() {
+		let session = Session::start(sdk_config(1, ROOT_A, "old-key"));
+		let before = session.client();
+		assert_eq!(before.to_stringified().api_key, "old-key");
+
+		session.write_sealed(&enabled(sdk_config(1, ROOT_A, "new-key")));
+		session.recheck().await;
+
+		let after = session.client();
+		assert!(!Arc::ptr_eq(&before, &after), "the client was not rebuilt");
+		assert_eq!(after.to_stringified().api_key, "new-key");
+		assert!(
+			session.has_marker(),
+			"the same account's cache rows were lost"
+		);
+	}
+
+	#[tokio::test]
+	async fn an_unchanged_auth_file_keeps_the_running_client() {
+		let session = Session::start(sdk_config(1, ROOT_A, "old-key"));
+		let before = session.client();
+
+		session.recheck().await;
+
+		assert!(Arc::ptr_eq(&before, &session.client()));
+	}
+
+	#[tokio::test]
+	async fn another_account_takes_the_wipe_path() {
+		let session = Session::start(sdk_config(1, ROOT_A, "old-key"));
+
+		session.write_sealed(&enabled(sdk_config(2, ROOT_B, "other-key")));
+		session.recheck().await;
+
+		let client = session.client();
+		assert_eq!(client.root().uuid().to_string(), ROOT_B);
+		assert_eq!(client.to_stringified().api_key, "other-key");
+		assert!(
+			!session.has_marker(),
+			"another account's session inherited the previous account's rows"
+		);
+	}
+
+	#[tokio::test]
+	async fn an_undecryptable_auth_file_changes_nothing() {
+		let session = Session::start(sdk_config(1, ROOT_A, "old-key"));
+		let before = session.client();
+
+		std::fs::write(session.auth_path(), b"\x01not a sealed blob").unwrap();
+		session.recheck().await;
+
+		assert!(Arc::ptr_eq(&before, &session.client()));
+		assert!(session.has_marker());
+	}
+
+	#[tokio::test]
+	async fn an_unparseable_auth_file_changes_nothing() {
+		let session = Session::start(sdk_config(1, ROOT_A, "old-key"));
+		let before = session.client();
+
+		session.write_sealed(b"{\"providerEnabled\":tr");
+		session.recheck().await;
+
+		assert!(Arc::ptr_eq(&before, &session.client()));
+		assert!(session.has_marker());
+	}
+
+	#[tokio::test]
+	async fn a_disabled_auth_file_still_demotes() {
+		let session = Session::start(sdk_config(1, ROOT_A, "old-key"));
+
+		session.write_sealed(br#"{"providerEnabled":false,"sdkConfig":null}"#);
+		session.recheck().await;
+
+		assert_eq!(session.unauth_reason(), Some("disabled"));
+	}
+
+	#[tokio::test]
+	async fn a_deleted_auth_file_still_demotes() {
+		let session = Session::start(sdk_config(1, ROOT_A, "old-key"));
+
+		std::fs::remove_file(session.auth_path()).unwrap();
+		session.recheck().await;
+
+		assert_eq!(session.unauth_reason(), Some("disabled"));
 	}
 }
