@@ -485,7 +485,8 @@ pub struct AuthFile {
 
 /// The extension decodes under the SAFE preset, not the SDK's app-process default: it has ~20 MB
 /// before jetsam, so ONE 12 MiB decode at a time is all that fits — and this gate also covers the
-/// single-item `get_thumbnail` path (Android's only route). auth.json may raise either.
+/// single-item `get_thumbnail` path (Android's only route). auth.json may raise either. On macOS
+/// it also halves the file I/O budget.
 fn thumbnail_client_config(settings: &AuthFile) -> ClientConfig {
 	let mut config = ClientConfig::default()
 		.with_thumbnail_mem_budget(settings.thumbnail_mem_budget.map_or(
@@ -506,6 +507,12 @@ fn thumbnail_client_config(settings: &AuthFile) -> ClientConfig {
 		);
 	if let Some(max_source_bytes) = settings.thumbnail_max_source_bytes {
 		config = config.with_thumbnail_max_source_bytes(max_source_bytes);
+	}
+	// 8 full chunks in flight, the SDK's iOS default; its macOS one (16) is sized for the app.
+	#[cfg(target_os = "macos")]
+	{
+		use filen_sdk_rs::consts::{CHUNK_SIZE, FILE_CHUNK_SIZE_EXTRA_USIZE};
+		config = config.with_memory_budget(8 * (CHUNK_SIZE + FILE_CHUNK_SIZE_EXTRA_USIZE));
 	}
 	config
 }
@@ -1163,6 +1170,8 @@ impl FilenMobileCacheState {
 impl FilenMobileCacheState {
 	fn new_internal(files_dir: String, db_dir: String, auth_file: String, dek: Vec<u8>) -> Self {
 		crate::env::init_logger();
+		#[cfg(target_vendor = "apple")]
+		crate::env::init_rayon_pool();
 		debug!(
 			"Initializing FilenMobileCacheState with files_dir: {files_dir}, db_dir: {db_dir} and auth_dir: {auth_file}"
 		);
@@ -1197,6 +1206,8 @@ impl FilenMobileCacheState {
 		files_dir: &str,
 	) -> Result<Self, CacheError> {
 		crate::env::init_logger();
+		#[cfg(target_vendor = "apple")]
+		crate::env::init_rayon_pool();
 		Ok(Self {
 			state: Arc::new(tokio::sync::RwLock::new(CacheState {
 				status: AuthStatus::Authenticated(AuthCacheState::from_stringified_in_memory(

@@ -10,10 +10,29 @@ use tokio::{
 
 static RUNTIME: OnceLock<Runtime> = OnceLock::new();
 
-/// Idempotent; installs the per-target tracing subscriber (logcat on Android, os_log on iOS,
-/// fmt on desktop) unless a host already installed one.
+/// Idempotent; installs the per-target tracing subscriber (logcat on Android, os_log on Apple
+/// targets, fmt elsewhere) unless a host already installed one.
 pub(crate) fn init_logger() {
-	filen_sdk_rs::obs::try_init(filen_sdk_rs::auth::http::LogLevel::Debug);
+	#[cfg(target_vendor = "apple")]
+	let level = filen_sdk_rs::auth::http::LogLevel::Info;
+	#[cfg(not(target_vendor = "apple"))]
+	let level = filen_sdk_rs::auth::http::LogLevel::Debug;
+	filen_sdk_rs::obs::try_init(level);
+}
+
+/// Idempotent; caps the global rayon pool at 2 threads so the extension stays near-idle. Must
+/// run before anything uses the pool, or the pool keeps its default size.
+#[cfg(target_vendor = "apple")]
+pub(crate) fn init_rayon_pool() {
+	static INIT: std::sync::Once = std::sync::Once::new();
+	INIT.call_once(|| {
+		if let Err(e) = rayon::ThreadPoolBuilder::new()
+			.num_threads(2)
+			.build_global()
+		{
+			tracing::warn!("Failed to size the rayon pool: {e}");
+		}
+	});
 }
 
 #[cfg(target_os = "android")]
@@ -28,7 +47,7 @@ pub extern "system" fn java_init(env: jni::JNIEnv, _class: jni::objects::JClass)
 	_ = VM.set(vm);
 }
 
-#[cfg(target_os = "ios")]
+#[cfg(any(target_os = "ios", target_os = "macos"))]
 fn build_tokio_runtime() -> Runtime {
 	Builder::new_multi_thread()
 		.enable_all()
@@ -51,7 +70,7 @@ fn build_tokio_runtime() -> Runtime {
 		.expect("Failed to create Tokio runtime")
 }
 
-#[cfg(not(any(target_os = "ios", target_os = "android")))]
+#[cfg(not(any(target_os = "ios", target_os = "macos", target_os = "android")))]
 fn build_tokio_runtime() -> Runtime {
 	Builder::new_multi_thread()
 		.enable_all()

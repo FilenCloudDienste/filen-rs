@@ -18,7 +18,12 @@ malformed = ["filen-sdk-rs/malformed"]
 heif-decoder = ["filen-sdk-rs/heif-decoder"]
 
 [dependencies]
-filen-sdk-rs = { path = "../filen-sdk-rs", features = ["cache"] }
+# No `archive`: nothing here compresses or extracts. `oslog` routes logs to os_log on macOS too.
+filen-sdk-rs = { path = "../filen-sdk-rs", default-features = false, features = [
+	"cache",
+	"multi-threaded-crypto",
+	"oslog",
+] }
 futures = "0.3.31"
 uniffi = { version = "0.29.4", features = ["cli"] }
 # Must track the libsqlite3-sys version rusqlite resolves to: `links = "sqlite3"` allows only
@@ -52,6 +57,10 @@ blake3 = { version = "1.8.3", features = ["rayon", "mmap"] }
 
 [target.'cfg(target_os="android")'.dependencies]
 jni = "0.21.1"
+
+# Sizes the global pool the SDK's crypto and blake3's mmap hashing share.
+[target.'cfg(target_vendor="apple")'.dependencies]
+rayon = "1.11.0"
 
 [dev-dependencies]
 # `test-seams` lets fixtures mint a `StableUuid`, which production code cannot.

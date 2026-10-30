@@ -2153,6 +2153,7 @@ dependencies = [
  "lazy_static",
  "libsqlite3-sys",
  "rand 0.9.2",
+ "rayon",
  "rusqlite",
  "serde",
  "serde_json",
