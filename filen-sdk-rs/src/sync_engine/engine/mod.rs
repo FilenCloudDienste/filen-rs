@@ -5966,7 +5966,8 @@ impl SyncEngine {
 
 	/// Record what this pass's actions did: a failure extends that path's streak — one on a remote
 	/// outage only once per [`TRANSIENT_FAILURE_SPACING`] — and a success ends the streaks `ends`
-	/// pairs it with (see [`endable_streaks`]). Once a streak reaches
+	/// pairs it with (see [`endable_streaks`]), in any pass, a halted or cancelled one too: what
+	/// counts is that the action landed ([`SyncReport::landed`]), not that the pass ran to its end. Once a streak reaches
 	/// [`MAX_PATH_FAILURES`] the path stops being planned and is reported as
 	/// [`UnsyncableReason::RepeatedFailure`] instead of failing on every pass forever — until
 	/// [`PATH_FAILURE_RETRY_INTERVAL`] after its last failure, when it is tried once more.
@@ -5984,17 +5985,17 @@ impl SyncEngine {
 			.iter()
 			.map(|(path, error)| (path.as_str(), error.as_str()))
 			.collect();
-		// A pass cut short by a cancel cannot tell which of its actions ran, and an action that
-		// never ran proves nothing about the path: clearing its streak would hand a permanently
-		// broken path a fresh set of retries every time someone pauses. Only the failures count. A
-		// pass that found a side full held back transfers the same way.
-		let cleared: Option<Vec<String>> = (report.interrupted == 0 && report.halted.is_none())
-			.then(|| {
-				ends.into_iter()
-					.filter(|(by, _)| !failed.contains_key(by.as_str()))
-					.map(|(_, ended)| ended)
-					.collect()
-			});
+		// Only an action that landed ends a streak. One a cancel dropped, a halt held back, or a
+		// directory create or move that failed held under it never ran, and proves nothing about
+		// its path: clearing its streak would hand a permanently broken path a fresh set of retries
+		// every time someone pauses or the remote is down. One that landed but whose record failed
+		// is a failure too, and keeps its streak.
+		let landed: HashSet<&str> = report.landed.iter().map(String::as_str).collect();
+		let cleared: Vec<String> = ends
+			.into_iter()
+			.filter(|(by, _)| landed.contains(by.as_str()) && !failed.contains_key(by.as_str()))
+			.map(|(_, ended)| ended)
+			.collect();
 		let recorded: Vec<(String, String)> = failed
 			.iter()
 			.map(|(path, error)| ((*path).to_string(), (*error).to_string()))
@@ -6026,7 +6027,7 @@ impl SyncEngine {
 					problems.push(format!("{path}: recording the failure count failed: {e}"));
 				}
 			}
-			if let Some(cleared) = cleared {
+			if !cleared.is_empty() {
 				let cleared: Vec<&str> = cleared.iter().map(String::as_str).collect();
 				if let Err(e) = store.clear_failures(pair, &cleared) {
 					problems.push(format!(
@@ -7021,6 +7022,7 @@ impl SyncEngine {
 		// upload (see `Baseline::close`).
 		let plan = prep.stage_plan(screen).await?;
 		let local_root = PathBuf::from(&prep.record.local_root);
+		let streaked: HashSet<&str> = ends.iter().map(|(by, _)| by.as_str()).collect();
 		let ctx = ApplyContext {
 			client: &self.client,
 			// Before the first action, and never again this pass (see `ApplyContext::cache_db`).
@@ -7036,6 +7038,7 @@ impl SyncEngine {
 			gate: &gate,
 			lock_budget: self.lock_budget,
 			bin_day: Utc::now().date_naive(),
+			streaked: &streaked,
 		};
 		apply::apply(ctx, plan, &mut report, observer).await;
 		// The pass let go of its hold of the drive lock; what it looked up during it goes too.

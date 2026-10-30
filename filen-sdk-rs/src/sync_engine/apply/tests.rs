@@ -718,8 +718,14 @@ fn a_key_sorting_between_a_dir_and_its_children_does_not_hide_them() {
 fn a_write_the_stage_cannot_record_fails_the_pass_but_not_its_path() {
 	let (_dir, plan) = paged([upload("up.txt"), trash("Up.txt", NodeKind::File)]);
 	plan.pager.break_stage();
+	let borrowed = Borrowed::new();
 	let mut report = SyncReport::default();
-	note_written(&plan, &upload("up.txt"), &mut report);
+	note_written(
+		&borrowed.ctx(Uuid::from_u128(1), None),
+		&plan,
+		&upload("up.txt"),
+		&mut report,
+	);
 	assert_eq!(
 		report.store_failed,
 		Some(StoreFailure::RecordNotWritten(ErrorKind::Internal))
@@ -1764,6 +1770,8 @@ struct Borrowed {
 	pending: PendingWrites,
 	observed: Observations,
 	gate: PassGate,
+	/// The paths whose success ends a streak: none.
+	streaked: HashSet<&'static str>,
 }
 
 impl Borrowed {
@@ -1780,6 +1788,7 @@ impl Borrowed {
 			pending: PendingWrites::default(),
 			observed: Observations::default(),
 			gate: PassGate::default(),
+			streaked: HashSet::new(),
 		}
 	}
 
@@ -1801,6 +1810,7 @@ impl Borrowed {
 			gate: &self.gate,
 			lock_budget: LockBudget::default(),
 			bin_day: day(),
+			streaked: &self.streaked,
 		}
 	}
 }
@@ -3365,4 +3375,18 @@ async fn a_remote_outage_starts_no_more_remote_actions_and_lets_local_ones_run()
 		report.pass_failure().map(|(_, kind)| kind),
 		Some(ErrorKind::Reqwest)
 	);
+}
+
+/// What landed is recorded for the engine to end streaks by, but only where a success ends one:
+/// the list stays as long as the paths with a streak, not as the pass.
+#[test]
+fn a_landing_is_recorded_only_where_it_ends_a_streak() {
+	let (_dir, plan) = paged([upload("streaked.txt"), upload("clean.txt")]);
+	let mut borrowed = Borrowed::new();
+	borrowed.streaked.insert("streaked.txt");
+	let ctx = borrowed.ctx(Uuid::from_u128(1), None);
+	let mut report = SyncReport::default();
+	note_written(&ctx, &plan, &upload("streaked.txt"), &mut report);
+	note_written(&ctx, &plan, &upload("clean.txt"), &mut report);
+	assert_eq!(report.landed, ["streaked.txt"]);
 }

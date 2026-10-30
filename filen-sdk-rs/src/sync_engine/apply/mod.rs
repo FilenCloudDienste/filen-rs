@@ -235,6 +235,10 @@ pub struct SyncReport {
 	/// only spaced out (see its `TRANSIENT_FAILURE_SPACING`), so an outage does not block the paths
 	/// it happened to catch, while a path the server refuses with a 5xx on every pass still is.
 	pub(super) transient_failures: Vec<(String, String)>,
+	/// The paths of the actions that landed this pass, among those whose success ends a failure
+	/// streak ([`ApplyContext::streaked`]): what the engine clears the streaks of. Only those, so a
+	/// pass of a million actions keeps a list as long as its paths with a streak, not its actions.
+	pub(super) landed: Vec<String>,
 }
 
 impl SyncReport {
@@ -328,6 +332,9 @@ pub(super) struct ApplyContext<'a> {
 	/// The UTC day whose bucket of the local bin everything this pass moves aside is filed under
 	/// (see [`quarantine_local`]): taken once, when the pass starts applying.
 	pub(super) bin_day: NaiveDate,
+	/// The paths of the pass's actions whose success ends a failure streak (the engine's
+	/// `endable_streaks`): which of them landed is recorded in [`SyncReport::landed`].
+	pub(super) streaked: &'a HashSet<&'a str>,
 }
 
 impl ApplyContext<'_> {
@@ -987,7 +994,7 @@ pub(super) async fn apply(
 				}
 				Ok(Transfer::Done) => {
 					applied += 1;
-					note_written(&plan, &action, report);
+					note_written(&ctx, &plan, &action, report);
 					tracing::debug!("apply: {} done", action.describe());
 					observer(action.to_event());
 					match action {
@@ -1003,7 +1010,7 @@ pub(super) async fn apply(
 					unrecorded,
 				}) => {
 					applied += 1;
-					note_written(&plan, &action, report);
+					note_written(&ctx, &plan, &action, report);
 					observer(action.to_event());
 					observer(SyncEvent::Conflict {
 						rel_path: conflict.rel_path.clone(),
@@ -1910,7 +1917,7 @@ async fn apply_serial(
 	tracing::debug!("apply: {}", action.describe());
 	let error = match apply_one(ctx, planned, plan, report, &mut *observer).await {
 		Ok(()) => {
-			note_written(plan, action, report);
+			note_written(ctx, plan, action, report);
 			return;
 		}
 		Err(error) => error,
@@ -2460,7 +2467,7 @@ async fn record_create(
 	// put under it or deleted.
 	plan.record_created(rel_path, uuid)?;
 	report.remote_dirs_created += 1;
-	note_written(plan, create.action, report);
+	note_written(ctx, plan, create.action, report);
 	Ok(())
 }
 
@@ -2615,7 +2622,7 @@ async fn land_trashes(
 			break;
 		}
 		report.remotely_trashed += 1;
-		note_written(plan, action, report);
+		note_written(ctx, plan, action, report);
 		if !admits_more(report) {
 			break;
 		}
@@ -2628,7 +2635,18 @@ async fn land_trashes(
 /// A record the stage cannot take leaves that write unshielded, so the pass then admits nothing
 /// more, as it does once a baseline row is lost ([`admits_more`]): no deletion runs after it to
 /// take the write down. The write itself stands, and its path keeps no failure streak for it.
-fn note_written(plan: &PagedPlan, action: &SyncAction, report: &mut SyncReport) {
+///
+/// It is also what the engine ends failure streaks by: an action that landed is recorded in
+/// [`SyncReport::landed`] when its success ends one.
+fn note_written(
+	ctx: &ApplyContext<'_>,
+	plan: &PagedPlan,
+	action: &SyncAction,
+	report: &mut SyncReport,
+) {
+	if ctx.streaked.contains(action.rel_path()) {
+		report.landed.push(action.rel_path().to_string());
+	}
 	if let Err(error) = plan.pager.note_written(action) {
 		let error = super::engine::db_error(error, "recording what this pass wrote in its stage");
 		tracing::error!(

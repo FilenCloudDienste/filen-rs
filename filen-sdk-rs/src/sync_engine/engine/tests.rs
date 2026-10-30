@@ -5339,7 +5339,10 @@ async fn streak_under_a_folded_directory(
 async fn a_directory_deletion_that_succeeds_ends_the_streaks_of_the_deletions_it_carried() {
 	let (engine, pair, path, ends) = streak_under_a_folded_directory("folded_streak_cleared").await;
 
-	let mut report = SyncReport::default();
+	let mut report = SyncReport {
+		landed: vec!["docs".to_string()],
+		..SyncReport::default()
+	};
 	engine.note_path_outcomes(pair, ends, &mut report).await;
 
 	assert!(report.errors.is_empty(), "{:?}", report.errors);
@@ -10384,4 +10387,72 @@ fn a_twin_a_scoped_pass_holds_no_node_for_is_no_collision() {
 		}]
 	);
 	assert_eq!(unsyncable, []);
+}
+
+/// A path whose action landed has synced, whatever else the pass ran into: its streak ends even in
+/// a pass that halted, while one of an action the halt held back, which never ran, keeps its own.
+#[tokio::test]
+async fn a_success_in_a_halted_pass_ends_its_streak_and_a_held_action_keeps_its_own() {
+	let (engine, pair, path) = engine_with_pair("halted_pass_streaks").await;
+	{
+		let pair_store = engine.pair_store(pair).await.unwrap();
+		let store = locked(&pair_store);
+		let now = Utc::now().timestamp_millis();
+		for streaked in ["landed.txt", "held.txt"] {
+			store.record_failure(pair, streaked, "boom", now).unwrap();
+		}
+	}
+	let ends = ["landed.txt", "held.txt"]
+		.map(|path| (path.to_string(), path.to_string()))
+		.to_vec();
+	let mut report = SyncReport {
+		halted: Some(super::super::HaltReason::RemoteUnavailable),
+		transient_failures: vec![("caught.txt".to_string(), "unreachable".to_string())],
+		landed: vec!["landed.txt".to_string()],
+		..SyncReport::default()
+	};
+	engine.note_path_outcomes(pair, ends, &mut report).await;
+
+	assert!(report.errors.is_empty(), "{:?}", report.errors);
+	let after = locked(&engine.pair_store(pair).await.unwrap())
+		.failures(pair)
+		.unwrap();
+	assert!(!after.contains_key("landed.txt"), "{after:?}");
+	assert_eq!(
+		after.get("held.txt").map(|failure| failure.attempts),
+		Some(1)
+	);
+
+	drop(engine);
+	std::fs::remove_file(&path).ok();
+}
+
+/// An action that neither landed nor failed never ran — held back under a directory the pass
+/// could not make or move there — even in a pass that did not halt: its streak stays as it was.
+#[tokio::test]
+async fn an_action_that_never_ran_keeps_its_streak_in_a_pass_that_went_on() {
+	let (engine, pair, path) = engine_with_pair("held_subtree_streaks").await;
+	{
+		let pair_store = engine.pair_store(pair).await.unwrap();
+		locked(&pair_store)
+			.record_failure(pair, "a/f.txt", "boom", Utc::now().timestamp_millis())
+			.unwrap();
+	}
+	let ends = vec![("a/f.txt".to_string(), "a/f.txt".to_string())];
+	let mut report = SyncReport {
+		failed_paths: vec![("a".to_string(), "HTTP 503".to_string())],
+		..SyncReport::default()
+	};
+	engine.note_path_outcomes(pair, ends, &mut report).await;
+
+	let after = locked(&engine.pair_store(pair).await.unwrap())
+		.failures(pair)
+		.unwrap();
+	assert_eq!(
+		after.get("a/f.txt").map(|failure| failure.attempts),
+		Some(1)
+	);
+
+	drop(engine);
+	std::fs::remove_file(&path).ok();
 }
