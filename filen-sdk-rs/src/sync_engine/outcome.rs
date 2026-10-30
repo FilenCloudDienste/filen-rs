@@ -319,7 +319,9 @@ pub enum HaltReason {
 	/// The account's storage is used up: the server refused a write with `max_storage_reached`.
 	RemoteStorageFull,
 	/// The remote could not be reached or turned the request away for now: the connection failed,
-	/// was lost or timed out, or the server answered with a 5xx status, 408 or 429. The kind of
+	/// was lost or timed out, or the server answered with a 5xx status, 408 or 429 — while that
+	/// server was not shown answering anything else. A server that answers other requests while
+	/// it turns one away halts nothing: that is a failure of the request's own path. The kind of
 	/// error is [`ErrorKind::Reqwest`], so a host can show the pair as offline.
 	RemoteUnavailable,
 	/// The server no longer accepts the client's session: an API key it does not know, or a 401.
@@ -354,8 +356,8 @@ impl HaltReason {
 
 	/// Whether this condition is the remote being out of reach for now, rather than a side out of
 	/// room: such a failure says nothing about its path, yet the same answer on every pass may be
-	/// the path's own, so it counts against the path's streak only spaced out (see the engine's
-	/// `TRANSIENT_FAILURE_SPACING`).
+	/// the path's own when nothing else showed the server answering, so it counts against the
+	/// path's streak only spaced out (see the engine's `TRANSIENT_FAILURE_SPACING`).
 	pub(super) fn is_remote_outage(self) -> bool {
 		match self {
 			Self::LocalStorageFull | Self::RemoteStorageFull => false,

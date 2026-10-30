@@ -112,16 +112,21 @@ pub const PATH_FAILURE_RETRY_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 /// How far apart two failures of one path on a remote outage
 /// ([`HaltReason::is_remote_outage`](super::HaltReason::is_remote_outage): the
-/// remote out of reach, answering 5xx, 408 or 429, or refusing the session) must be for the second
-/// to extend its streak: a third of [`PATH_FAILURE_RETRY_INTERVAL`].
+/// remote out of reach, answering 5xx, 408 or 429 while not shown answering anything else, or
+/// refusing the session) must be for the second to extend its streak: a third of
+/// [`PATH_FAILURE_RETRY_INTERVAL`].
 ///
 /// Such a failure fails the whole pass, and a watch backs off on it, but it says nothing about the
 /// path it happened to catch: counted like any other, the transfers an hour-long outage caught
-/// would all be blocked for another hour after it. Not counted at all, a path the server answers
-/// with a 5xx on every pass, while the rest of the drive works, would fail every pass forever.
-/// Spaced out, an outage costs a path at most one failure in each such window, which a success
-/// clears, while the path that always fails reaches [`MAX_PATH_FAILURES`] — and is blocked, so its
-/// passes stop failing — after two windows.
+/// would all be blocked for another hour after it. A server that answers other requests while it
+/// turns a path away is no outage, and that failure counts in full (see the apply's `reach`
+/// module), so a path the server always fails while the rest of the drive works is blocked after
+/// [`MAX_PATH_FAILURES`] passes. What is left to this spacing is the failure nothing could show
+/// was the path's: one caught by a real outage, and one whose server answered nothing else while
+/// it ran — a transfer whose every neighbour on that server failed too. Not counted at all, such a
+/// path would fail every pass forever. Spaced out, an outage costs a path at most one failure in
+/// each such window, which a success clears, while a path that always fails that way reaches
+/// [`MAX_PATH_FAILURES`] — and is blocked, so its passes stop failing — after two windows.
 const TRANSIENT_FAILURE_SPACING: Duration = Duration::from_secs(20 * 60);
 
 /// How long [`SyncEngine::remove_pair`] waits for the pass it cancelled to end before it retires

@@ -149,9 +149,12 @@ async fn incomplete_message_is_retryable() {
 	});
 
 	let client = ClientConfig::default().build_reqwest_client().unwrap();
-	let err = super::execute_request(client.get(format!("http://{addr}/")))
-		.await
-		.expect_err("a connection closed before responding must error");
+	let err = super::execute_request(
+		client.get(format!("http://{addr}/")),
+		std::sync::Arc::default(),
+	)
+	.await
+	.expect_err("a connection closed before responding must error");
 
 	match err {
 		super::retry::RetryError::Retry(_) => {}

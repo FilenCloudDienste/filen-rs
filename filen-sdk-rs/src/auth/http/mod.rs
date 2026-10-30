@@ -38,6 +38,7 @@ use bandwidth_limit::{
 	new_upload_bandwidth_limiter, set_upload_bandwidth_limit,
 };
 
+mod answers;
 mod auth;
 pub(crate) mod batch;
 // can't actually cap bandwidth in wasm, so this would just add overhead
@@ -55,6 +56,9 @@ pub(crate) mod test_support;
 mod tower_wasm_time;
 mod url_parser;
 
+#[cfg(feature = "sync-engine")]
+pub(crate) use answers::AnswerMark;
+pub(crate) use answers::ServerAnswers;
 use class_limit::{RequestClass, RequestLimits};
 use tower_wasm_time::tps_budget::TpsBudget;
 
@@ -654,6 +658,9 @@ pub(crate) struct SharedClientState {
 	archives: crate::fs::archive::ArchiveConfig,
 	/// See [`ClientConfig::with_batch_window`], at most [`MAX_BATCH_WINDOW`].
 	batch_window: Duration,
+	/// The servers this client heard back from (see [`ServerAnswers`]), shared by every client
+	/// cloned from it.
+	answers: Arc<ServerAnswers>,
 }
 
 impl SharedClientState {
@@ -738,7 +745,14 @@ impl SharedClientState {
 			#[cfg(feature = "archive")]
 			archives,
 			batch_window: config.batch_window.min(MAX_BATCH_WINDOW),
+			answers: Arc::default(),
 		})
+	}
+
+	/// The servers this client heard back from: read only by the sync engine.
+	#[cfg(any(feature = "sync-engine", test))]
+	pub(crate) fn answers(&self) -> &Arc<ServerAnswers> {
+		&self.answers
 	}
 
 	/// How long a batched call waits for others; zero when batching is off.
@@ -814,8 +828,13 @@ impl PartialEq for AuthClient {
 
 impl Eq for AuthClient {}
 
+/// Send one attempt of `request`, and note in `answers` the server's answer to it, if it got one
+/// (see [`ServerAnswers`]). `answers` is a handle of its own, cloned per attempt, because the
+/// authenticated stacks need an attempt's future to outlive the borrow of the client that built
+/// it; one count bump beside a network round trip.
 async fn execute_request(
 	request: RequestBuilder,
+	answers: Arc<ServerAnswers>,
 ) -> Result<reqwest::Response, retry::RetryError<Error>> {
 	let (client, request) = request.build_split();
 	let request = request
@@ -824,6 +843,7 @@ async fn execute_request(
 	client
 		.execute(request)
 		.await
+		.inspect(|resp| answers.note(resp.url(), resp.status()))
 		.and_then(|resp| resp.error_for_status())
 		.map_err(|e| {
 			// Classified before `is_attempt_retryable`, which would otherwise reject it as a
@@ -903,13 +923,19 @@ fn is_attempt_retryable(
 		return true;
 	}
 	match status {
-		Some(status) => {
-			status.is_server_error()
-				|| status == reqwest::StatusCode::REQUEST_TIMEOUT
-				|| status == reqwest::StatusCode::TOO_MANY_REQUESTS
-		}
+		Some(status) => is_transient_status(status),
 		None => !(is_builder || is_request),
 	}
+}
+
+/// Whether `status` says the server cannot serve anything for now rather than anything about the
+/// request: any 5xx, 408 (Request Timeout) or 429 (Too Many Requests). The statuses an attempt is
+/// retried on (see [`is_attempt_retryable`]), and the ones that are no answer from the server (see
+/// [`ServerAnswers`]).
+pub(crate) fn is_transient_status(status: reqwest::StatusCode) -> bool {
+	status.is_server_error()
+		|| status == reqwest::StatusCode::REQUEST_TIMEOUT
+		|| status == reqwest::StatusCode::TOO_MANY_REQUESTS
 }
 
 /// `err` followed by its [`source`](std::error::Error::source) chain.
@@ -1125,7 +1151,7 @@ impl UnauthClient {
 		};
 
 		builder
-			.service_fn(execute_request)
+			.service_fn(move |request| execute_request(request, Arc::clone(&self.state.answers)))
 			.oneshot(Request {
 				method: RequestMethod::Post(()),
 				response_type: ResponseType::Standard,
@@ -1175,12 +1201,14 @@ impl UnauthClient {
 			}
 		};
 
-		builder.service_fn(execute_request).oneshot(Request {
-			method: RequestMethod::Post(()),
-			response_type: ResponseType::Large,
-			url,
-			client: self.reqwest_client.clone(),
-		})
+		builder
+			.service_fn(move |request| execute_request(request, Arc::clone(&self.state.answers)))
+			.oneshot(Request {
+				method: RequestMethod::Post(()),
+				response_type: ResponseType::Large,
+				url,
+				client: self.reqwest_client.clone(),
+			})
 	}
 
 	/// Streams a GET response body to bytes, invoking `callback(bytes_so_far, content_length)` as
@@ -1227,7 +1255,7 @@ impl UnauthClient {
 			}
 		};
 		builder
-			.service_fn(execute_request)
+			.service_fn(move |request| execute_request(request, Arc::clone(&self.state.answers)))
 			.oneshot(Request {
 				method: RequestMethod::Get,
 				response_type: ResponseType::Standard,
@@ -1270,7 +1298,9 @@ impl AuthClient {
 
 		builder
 			.layer(auth::AuthLayer::new(&self.api_key))
-			.service_fn(execute_request)
+			.service_fn(move |request| {
+				execute_request(request, Arc::clone(&self.unauthed.state.answers))
+			})
 			.oneshot(Request {
 				method: RequestMethod::Get,
 				response_type: ResponseType::Standard,
@@ -1322,7 +1352,9 @@ impl AuthClient {
 
 		builder
 			.layer(AuthLayer::new(&self.api_key))
-			.service_fn(execute_request)
+			.service_fn(move |request| {
+				execute_request(request, Arc::clone(&self.unauthed.state.answers))
+			})
 			.oneshot(Request {
 				method: RequestMethod::Post(()),
 				response_type: ResponseType::Standard,
@@ -1440,7 +1472,9 @@ impl AuthClient {
 		};
 		builder
 			.layer(auth::AuthLayer::new(&self.api_key))
-			.service_fn(execute_request)
+			.service_fn(move |request| {
+				execute_request(request, Arc::clone(&self.unauthed.state.answers))
+			})
 			.oneshot(Request {
 				method: RequestMethod::Post(()),
 				response_type: ResponseType::Large,
@@ -1521,7 +1555,9 @@ impl AuthClient {
 
 		builder
 			.layer(auth::AuthLayer::new(&self.api_key))
-			.service_fn(execute_request)
+			.service_fn(move |request| {
+				execute_request(request, Arc::clone(&self.unauthed.state.answers))
+			})
 			.oneshot(Request {
 				method: RequestMethod::Post(request),
 				response_type: ResponseType::Standard,

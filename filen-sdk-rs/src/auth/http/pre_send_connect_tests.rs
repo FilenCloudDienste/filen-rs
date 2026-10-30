@@ -29,7 +29,12 @@ async fn refused_connect_is_classified_as_pre_send_connect() {
 		"the general classifier still refuses it — which is exactly why this class exists"
 	);
 
-	match super::execute_request(client.get(format!("http://{addr}/"))).await {
+	match super::execute_request(
+		client.get(format!("http://{addr}/")),
+		std::sync::Arc::default(),
+	)
+	.await
+	{
 		Err(retry::RetryError::RetryAfterBackoff(_)) => {}
 		Err(other) => panic!("must classify as RetryAfterBackoff, got {other:?}"),
 		Ok(_) => panic!("a connect to a closed port must not succeed"),

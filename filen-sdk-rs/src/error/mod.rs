@@ -362,6 +362,16 @@ impl FilenSdkError {
 			.unwrap_or_else(|shared| Self::custom_with_source(shared.kind(), shared, None::<&str>))
 	}
 
+	/// Whether this error and `other` stand in for one shared error ([`Self::unshared`]): the
+	/// answers to the items of one request that failed as a whole.
+	#[cfg(feature = "sync-engine")]
+	pub(crate) fn shares_with(&self, other: &Self) -> bool {
+		matches!(
+			(self.stand_in_for(), other.stand_in_for()),
+			(Some(shared), Some(other)) if std::ptr::eq(shared, other)
+		)
+	}
+
 	/// The shared error this one stands in for, made by [`Self::unshared`]: one of the same kind,
 	/// with no context of its own, wrapping nothing but it.
 	fn stand_in_for(&self) -> Option<&Self> {

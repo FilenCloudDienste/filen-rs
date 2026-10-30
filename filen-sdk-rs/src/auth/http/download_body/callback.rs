@@ -225,6 +225,8 @@ mod native {
 			collected: Vec<u8>,
 			last_update_time: Instant,
 			real_content_length: Option<u64>,
+			/// The URL the response came from, for the error a failed read of its body is.
+			url: reqwest::Url,
 			// The transport-level declared length (Content-Length via the body's size hint), NOT
 			// `X-Cl`: `real_content_length` is Filen's application header and does not describe
 			// the wire body.
@@ -281,6 +283,7 @@ mod native {
 										Some("content length too large"),
 									))
 								})?;
+							let url = response.url().clone();
 							let (_, body) = http::Response::from(response).into_parts();
 							let collected =
 								Vec::try_with_capacity(content_length).map_err(|e| {
@@ -297,6 +300,7 @@ mod native {
 									collected,
 									last_update_time: Instant::now(),
 									real_content_length,
+									url,
 									expected,
 								});
 						}
@@ -308,6 +312,7 @@ mod native {
 						collected,
 						last_update_time,
 						real_content_length,
+						url,
 						expected,
 					} => loop {
 						match body.as_mut().poll_frame(cx) {
@@ -340,9 +345,12 @@ mod native {
 								// (connection reset, incomplete framing — and, over-broadly but
 								// bounded by MAX_RETRIES, decompression errors) is classified as
 								// transient transport loss and redriven.
+								// A body error names no URL of its own (reqwest sets one only on errors
+								// before the response), so it gets the request's: what tells the sync
+								// engine which server it failed on (`sync_engine::apply::reach`).
 								return Poll::Ready(Err(RetryError::from_retryable(
 									!e.is_timeout(),
-									Error::from(e),
+									Error::from(e.with_url(url.clone())),
 								)));
 							}
 							Poll::Ready(None) => {

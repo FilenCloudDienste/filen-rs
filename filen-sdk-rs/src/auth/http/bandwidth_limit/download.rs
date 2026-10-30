@@ -2,6 +2,7 @@ use std::num::NonZeroU32;
 
 use bytes::Bytes;
 use futures::{Stream, StreamExt, future::BoxFuture};
+use reqwest::ResponseBuilderExt;
 use tower::{Layer, Service};
 
 use crate::auth::http::limit::RateLimiter;
@@ -76,8 +77,12 @@ pub fn limit_download_response(
 	limiter: RateLimiter,
 	response: reqwest::Response,
 ) -> reqwest::Response {
+	// Converting the response to `http` and back loses the URL it came from, which the errors of
+	// its body name (see `download_body`), so it is put back.
+	let url = response.url().clone();
 	let http_response: http::Response<reqwest::Body> = response.into();
-	let (parts, body) = http_response.into_parts();
+	let (mut parts, body) = http_response.into_parts();
+	keep_url(&mut parts, url);
 	if body.as_bytes().is_some() {
 		return http::Response::from_parts(parts, body).into();
 	}
@@ -86,6 +91,14 @@ pub fn limit_download_response(
 	let limited_body = reqwest::Body::wrap_stream(limited_stream);
 	let limited_response = http::Response::from_parts(parts, limited_body);
 	limited_response.into()
+}
+
+/// Carry `url` in `parts`, where the `reqwest::Response` made from them reads it back as
+/// [`url`](reqwest::Response::url); the only way in is reqwest's response builder.
+fn keep_url(parts: &mut http::response::Parts, url: reqwest::Url) {
+	if let Ok(carrier) = http::Response::builder().url(url).body(()) {
+		parts.extensions.extend(carrier.into_parts().0.extensions);
+	}
 }
 
 fn limit_response_stream<S, E>(

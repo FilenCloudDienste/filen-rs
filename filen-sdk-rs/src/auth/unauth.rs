@@ -691,9 +691,22 @@ pub(crate) mod test_support {
 	/// A logged-in [`offline_unauthed`] client. The error a call fails with names the URL of the
 	/// request that failed, so a test can tell which request the call sent first.
 	pub(crate) fn offline_client() -> Client {
+		logged_in(offline_unauthed())
+	}
+
+	#[cfg(feature = "sync-engine")]
+	/// A logged-in client built from `config` whose every request goes through the HTTP proxy at
+	/// `proxy`: an `https` request arrives there as `CONNECT <host>:443`, and whatever the proxy
+	/// answers it with is what the request fails with.
+	pub(crate) fn client_via_proxy(config: ClientConfig, proxy: std::net::SocketAddr) -> Client {
+		logged_in(unauthed_via_proxy(config, &format!("http://{proxy}")))
+	}
+
+	/// `unauthed`, logged in to an account that does not exist.
+	fn logged_in(unauthed: UnauthClient) -> Client {
 		// tiny key: never used for real crypto, only to make a client that parses
 		let key = RsaPrivateKey::new(&mut old_rng::thread_rng(), 512).expect("a test key");
-		offline_unauthed()
+		unauthed
 			.from_stringified(StringifiedClient {
 				email: "offline@example.com".to_owned(),
 				user_id: 1,

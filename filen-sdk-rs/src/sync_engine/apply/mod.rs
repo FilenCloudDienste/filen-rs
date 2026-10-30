@@ -6,7 +6,9 @@
 //! since the actions are independent and the next pass re-plans from truth. The exception is a
 //! failure no transfer to that side can get past — a full local disk or a full account — which
 //! stops the pass starting any more of those, and a remote out of reach or refusing the session,
-//! which stops it starting any more remote actions (see [`SyncReport::halted`]). Local deletions move
+//! which stops it starting any more remote actions (see [`SyncReport::halted`]); a server that
+//! answers other requests while it turns one away is that request's failure alone (see
+//! [`reach`]). Local deletions move
 //! to the pair's quarantine dir (recoverable for 30 days); remote deletions go to Filen trash. The
 //! local mtime written to the baseline after a download is read back from disk (not the value we
 //! asked for) so the scanner's fast-path stays stable.
@@ -58,7 +60,10 @@ use super::{
 use crate::{
 	ErrorKind,
 	api::v3::bulk::trash,
-	auth::{Client, http::is_connection_lost},
+	auth::{
+		Client,
+		http::{AnswerMark, is_connection_lost, is_transient_status},
+	},
 	cache::{SearchResult, hydrate_cached_items_at},
 	connect::ParentTargets,
 	fs::{
@@ -76,6 +81,7 @@ use crate::{
 	sync::lock::{ATTEMPTS_DEFAULT, ResourceLock, confirm_or_retake},
 	util::{MaybeArc, MaybeSendCallback},
 };
+use reach::Reach;
 use tokio::{sync::mpsc::UnboundedSender, time::Instant};
 
 /// Outcome of one apply pass.
@@ -195,6 +201,11 @@ pub struct SyncReport {
 	/// [`HaltReason::RemoteUnavailable`] and the engine's `TRANSIENT_FAILURE_SPACING`). Each
 	/// condition found has its own line there, so a pass that fills both sides says so.
 	///
+	/// A server answering 5xx, 408 or 429, or not at all, halts the pass only while it was not
+	/// shown answering other requests as the failing action ran; once it was, the failure is the
+	/// path's own and halts nothing (see the apply's `reach` module for the whole policy). A
+	/// session the server refuses always halts it.
+	///
 	/// From then on the pass starts no further transfer that WRITES to a full side (see
 	/// [`HaltReason::held_transfers`]): no upload once the account is full, no download once the
 	/// disk is. Everything else still runs — the other direction's transfers, directory creates,
@@ -230,10 +241,12 @@ pub struct SyncReport {
 	/// `note_action_failed`).
 	pub(super) failed_paths: Vec<(String, String)>,
 	/// The `(rel_path, error)` of every action that failed because the remote was out of reach or
-	/// refused the session ([`HaltReason::is_remote_outage`]). Not in
+	/// refused the session ([`HaltReason::is_remote_outage`]): the failures that halted the pass,
+	/// and those that came in after it with the server still not shown answering. Not in
 	/// [`failed_paths`](Self::failed_paths): the engine counts these against their paths' streaks
 	/// only spaced out (see its `TRANSIENT_FAILURE_SPACING`), so an outage does not block the paths
-	/// it happened to catch, while a path the server refuses with a 5xx on every pass still is.
+	/// it happened to catch. A transient failure while the server was shown answering is in
+	/// `failed_paths` instead (see the apply's `reach` module).
 	pub(super) transient_failures: Vec<(String, String)>,
 	/// The paths of the actions that landed this pass, among those whose success ends a failure
 	/// streak ([`ApplyContext::streaked`]): what the engine clears the streaks of. Only those, so a
@@ -789,6 +802,12 @@ pub(super) async fn apply(
 	let mut failed = FailedDirMoves::default();
 	// The sides found full so far: each holds back the transfers that write to it.
 	let full = FullSides::default();
+	// Whether the servers answered while each action that failed on them ran.
+	let reach = Reach::new(ctx.client);
+	let findings = Findings {
+		full: &full,
+		reach: &reach,
+	};
 	// Creates and moves first, in order (a run of remote directory creates a chunk at a time): they
 	// make the directories the transfers land in, and run parent before child. The deletion half of
 	// a type flip runs among them, before the create at its path, or the server rejects that create
@@ -822,7 +841,8 @@ pub(super) async fn apply(
 						}
 					};
 				applied +=
-					apply_trashes(&ctx, chunk, &mut plan, &failed, &full, report, observer).await;
+					apply_trashes(&ctx, findings, chunk, &mut plan, &failed, report, observer)
+						.await;
 				continue;
 			}
 			if is_remote_dir_create(action) {
@@ -849,9 +869,12 @@ pub(super) async fn apply(
 					ctx: &ctx,
 					hold,
 					full: &full,
+					reach: &reach,
+					since: reach.mark(),
 				};
 				applied +=
-					apply_creates(&chunk_ctx, chunk, &mut plan, &failed, report, observer).await;
+					apply_creates(&chunk_ctx, chunk, &mut plan, &mut failed, report, observer)
+						.await;
 				continue;
 			}
 			apply_serial(
@@ -859,7 +882,7 @@ pub(super) async fn apply(
 				&entry,
 				&mut plan,
 				&mut failed,
-				&full,
+				findings,
 				report,
 				observer,
 			)
@@ -928,13 +951,15 @@ pub(super) async fn apply(
 					Ok(target) => target,
 					Err(error) => {
 						applied += 1;
-						note_action_failed(&entry.action, &error, &full, report, observer);
+						// A read of the stage: nothing was sent.
+						let verdict = Verdict::of(pass_halt(&error));
+						note_action_failed(&entry.action, &error, verdict, &full, report, observer);
 						continue;
 					}
 				};
 				lease.note_start(&entry.action);
 				remote_in_flight += usize::from(mutates_remote(&entry.action));
-				in_flight.push(run_transfer(&ctx, entry, target, &progress));
+				in_flight.push(run_transfer(&ctx, &reach, entry, target, &progress));
 			}
 			let next = tokio::select! {
 				biased;
@@ -962,7 +987,9 @@ pub(super) async fn apply(
 					Ok(target) => target,
 					Err(error) => {
 						applied += 1;
-						note_action_failed(&entry.action, &error, &full, report, observer);
+						// A read of the stage: nothing was sent.
+						let verdict = Verdict::of(pass_halt(&error));
+						note_action_failed(&entry.action, &error, verdict, &full, report, observer);
 						continue;
 					}
 				};
@@ -974,7 +1001,7 @@ pub(super) async fn apply(
 					None => return note_interrupted(report, total - applied, observer),
 				}
 				remote_in_flight += usize::from(mutates_remote(&entry.action));
-				in_flight.push(run_transfer(&ctx, entry, target, &progress));
+				in_flight.push(run_transfer(&ctx, &reach, entry, target, &progress));
 				continue;
 			};
 			remote_in_flight -= usize::from(mutates_remote(&action));
@@ -1017,9 +1044,9 @@ pub(super) async fn apply(
 					});
 					note_overwrote(report, action.rel_path(), *conflict, unrecorded);
 				}
-				Err(error) => {
+				Err(Failed { error, verdict }) => {
 					applied += 1;
-					note_action_failed(&action, &error, &full, report, observer);
+					note_action_failed(&action, &error, verdict, &full, report, observer);
 				}
 			}
 		}
@@ -1062,7 +1089,8 @@ pub(super) async fn apply(
 					}
 				};
 				applied +=
-					apply_trashes(&ctx, chunk, &mut plan, &failed, &full, report, observer).await;
+					apply_trashes(&ctx, findings, chunk, &mut plan, &failed, report, observer)
+						.await;
 				continue;
 			}
 			apply_serial(
@@ -1070,7 +1098,7 @@ pub(super) async fn apply(
 				&entry,
 				&mut plan,
 				&mut failed,
-				&full,
+				findings,
 				report,
 				observer,
 			)
@@ -1107,19 +1135,77 @@ async fn next_transfer<'p>(
 ///
 /// It owns its entry and its target, so the apply holds the entry and the target of each transfer
 /// in flight and the page it reads from, and nothing else of its plan.
+///
+/// A failure is classified here, as it comes in (see [`Reach::halt`]), against the answers since
+/// the transfer started.
 async fn run_transfer(
 	ctx: &ApplyContext<'_>,
+	reach: &Reach<'_>,
 	planned: PlannedEntry,
 	target: TransferTarget,
 	progress: &UnboundedSender<SyncEvent>,
 ) -> (
 	SyncAction,
 	Option<(String, PathBuf)>,
-	Result<Transfer, crate::Error>,
+	Result<Transfer, Failed>,
 ) {
+	let since = reach.mark();
 	let mut quarantined = None;
-	let result = apply_transfer(ctx, &planned, target, progress, &mut quarantined).await;
+	let result = match apply_transfer(ctx, &planned, target, progress, &mut quarantined).await {
+		Ok(transfer) => Ok(transfer),
+		Err(error) => Err(Failed {
+			verdict: Verdict::of(reach.halt(&error, since).await),
+			error,
+		}),
+	};
 	(planned.action, quarantined, result)
+}
+
+/// What the pass has found out so far about where its actions can go: the sides found full, and
+/// whether the servers answered while each action that failed on them ran.
+#[derive(Clone, Copy)]
+struct Findings<'p, 'c> {
+	full: &'p FullSides,
+	reach: &'p Reach<'c>,
+}
+
+/// An action's failure, with what it counts as (see [`Verdict`]).
+struct Failed {
+	error: crate::Error,
+	verdict: Verdict,
+}
+
+impl Failed {
+	/// A failure no request was sent for: a read or a record of the pass's own, or a refusal made
+	/// before anything was asked of the server. Its condition is [`pass_halt`]'s, which only a full
+	/// local disk can make one.
+	fn local(error: crate::Error) -> Self {
+		Self {
+			verdict: Verdict::of(pass_halt(&error)),
+			error,
+		}
+	}
+}
+
+/// What a failure counts as: against its path's streak, and towards halting the pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+	/// The path's own failure: counted in full against its streak.
+	Own,
+	/// No path's own, and no reason to halt the pass: counted against the path's streak only
+	/// spaced out. The failure of a bulk request as a whole that its server answered around (see
+	/// [`classified`]).
+	Spaced,
+	/// A condition of the whole pass, which it halts (see [`SyncReport::halted`]): counted against
+	/// no streak when a side is full, and only spaced out when the remote is out of reach.
+	Halts(HaltReason),
+}
+
+impl Verdict {
+	/// The verdict on a failure that halts the pass on `halt`, if any, and is otherwise its path's.
+	fn of(halt: Option<HaltReason>) -> Self {
+		halt.map_or(Self::Own, Self::Halts)
+	}
 }
 
 /// Record an action that failed — its event and its failure (see [`note_failure`]), and the side
@@ -1134,6 +1220,7 @@ async fn run_transfer(
 fn note_action_failed(
 	action: &SyncAction,
 	error: &crate::Error,
+	verdict: Verdict,
 	full: &FullSides,
 	report: &mut SyncReport,
 	observer: &mut (dyn FnMut(SyncEvent) + Send),
@@ -1154,7 +1241,7 @@ fn note_action_failed(
 		rel_path: action.rel_path().to_string(),
 		error: error.to_string(),
 	});
-	if let Some(reason) = note_failure(report, action.rel_path(), error) {
+	if let Some(reason) = note_failure(report, action.rel_path(), error, verdict) {
 		full.note(reason);
 	}
 }
@@ -1359,7 +1446,7 @@ impl FailedDirMoves {
 			rel_path: action.rel_path().to_string(),
 			error: error.to_string(),
 		});
-		note_failure(report, action.rel_path(), &error);
+		note_failure(report, action.rel_path(), &error, Verdict::Own);
 		true
 	}
 }
@@ -1902,19 +1989,20 @@ fn mutates_remote(action: &SyncAction) -> bool {
 }
 
 /// Apply one action serially: emit its in-progress event, run it, and record success/failure (see
-/// [`note_action_failed`]).
+/// [`note_action_failed`]), a failure classified as it comes in (see [`Reach::halt`]).
 async fn apply_serial(
 	ctx: &ApplyContext<'_>,
 	planned: &PlannedEntry,
 	plan: &mut PagedPlan,
 	failed: &mut FailedDirMoves,
-	full: &FullSides,
+	Findings { full, reach }: Findings<'_, '_>,
 	report: &mut SyncReport,
 	observer: &mut (dyn FnMut(SyncEvent) + Send),
 ) {
 	let action = &planned.action;
 	observer(action.to_event());
 	tracing::debug!("apply: {}", action.describe());
+	let since = reach.mark();
 	let error = match apply_one(ctx, planned, plan, report, &mut *observer).await {
 		Ok(()) => {
 			note_written(ctx, plan, action, report);
@@ -1933,15 +2021,17 @@ async fn apply_serial(
 		..
 	} = action
 	{
-		// A move that halted the pass is the pass's failure, not the subtree's: what is under it is
-		// held, as everything after it that the halt stops is, and counts against no streak.
+		// A move that failed on a condition of the remote rather than of its path — even one the
+		// pass counts against the path, as the server answered meanwhile — is not the subtree's
+		// failure: what is under it is held, and counts against no streak.
 		if pass_halt(&error).is_some() {
 			failed.held.push(to_path.clone());
 		} else {
 			failed.dirs.push(to_path.clone());
 		}
 	}
-	note_action_failed(action, &error, full, report, observer);
+	let verdict = Verdict::of(reach.halt(&error, since).await);
+	note_action_failed(action, &error, verdict, full, report, observer);
 }
 
 /// Whether `action` is one [`apply_creates`] carries out.
@@ -1991,6 +2081,12 @@ struct ChunkContext<'p, 'c> {
 	hold: &'p Arc<ResourceLock>,
 	/// The sides found full so far.
 	full: &'p FullSides,
+	/// Whether the servers answered while the chunk's requests ran.
+	reach: &'p Reach<'c>,
+	/// Where the client's answers stood as the chunk started, before its lookups: what a failed
+	/// lookup is classified against. The create request itself takes its own mark once they are
+	/// done (see [`apply_creates`]).
+	since: AnswerMark,
 }
 
 /// A remote directory create of a chunk, ready to send (see [`compose_creates`]).
@@ -2012,11 +2108,14 @@ struct ComposedCreate<'c> {
 ///
 /// Each create's event goes out as it is composed, so the events of a chunk come before the
 /// failures its answers bring.
+///
+/// A create that failed on a condition of the remote rather than of its path holds what is under
+/// it (see [`hold_under_failed_create`]).
 async fn apply_creates(
 	chunk_ctx: &ChunkContext<'_, '_>,
 	chunk: Vec<PlannedEntry>,
 	plan: &mut PagedPlan,
-	failed: &FailedDirMoves,
+	failed: &mut FailedDirMoves,
 	report: &mut SyncReport,
 	observer: &mut (dyn FnMut(SyncEvent) + Send),
 ) -> usize {
@@ -2038,11 +2137,119 @@ async fn apply_creates(
 		"apply: creating {} remote directories in one request",
 		dirs.len()
 	);
-	let answers = match chunk_ctx.ctx.client.create_dirs(&dirs).await {
+	// Marked once the lookups are done: their answers say nothing about the request that creates.
+	let request = chunk_ctx.ctx.client.create_dirs(&dirs);
+	let answers = sent_and_classified(chunk_ctx.reach, dirs.len(), request).await;
+	settled
+		+ land_creates(
+			chunk_ctx, &composed, answers, plan, failed, report, observer,
+		)
+		.await
+}
+
+/// Send `request`, a bulk request for `count` items that has not been polled yet, and classify its
+/// answers against what came in while it was out (see [`classified`]). A request that could not
+/// be sent at all fails each item with its error (see [`all_failed`]).
+async fn sent_and_classified<T>(
+	reach: &Reach<'_>,
+	count: usize,
+	request: impl Future<Output = Result<Vec<Result<T, crate::Error>>, crate::Error>>,
+) -> Vec<Result<T, Failed>> {
+	let sent = reach.mark();
+	let answers = match request.await {
 		Ok(answers) => answers,
-		Err(error) => all_failed(error, dirs.len()),
+		Err(error) => all_failed(error, count),
 	};
-	settled + land_creates(chunk_ctx, &composed, answers, plan, report, observer).await
+	classified(reach, sent, answers).await
+}
+
+/// `answers` to a bulk request sent at `since`, each failure with what it counts as, classified
+/// as the answers come in (see [`Reach::halt`]).
+///
+/// A request that failed as a whole answers every item it carried with the one error they share
+/// ([`crate::Error::unshared`]). That is one failure, not one per item: it is classified once, so
+/// at most one probe is sent for it, and when it is transient and its server was shown answering,
+/// it is no item's own — nothing says which item, if any, the server would not serve — so it
+/// halts nothing and each item counts only spaced out ([`Verdict::Spaced`]): at most one count per
+/// item in each spacing window, however often the request fails. Only an item the request carried
+/// alone has it as its own. Every other failure — an item's own answer, or a whole request refused
+/// for what it asked — is classified on its own, as any other.
+async fn classified<T>(
+	reach: &Reach<'_>,
+	since: AnswerMark,
+	answers: Vec<Result<T, crate::Error>>,
+) -> Vec<Result<T, Failed>> {
+	let errors: Vec<&crate::Error> = answers
+		.iter()
+		.filter_map(|answer| answer.as_ref().err())
+		.collect();
+	let mut verdicts: Vec<Verdict> = Vec::with_capacity(errors.len());
+	for (at, error) in errors.iter().enumerate() {
+		// The verdict on the first error this one shares with, if it came earlier.
+		let earlier = errors
+			.iter()
+			.take(at)
+			.position(|other| other.shares_with(error))
+			.and_then(|earlier| verdicts.get(earlier).copied());
+		let verdict = match earlier {
+			Some(verdict) => verdict,
+			None => {
+				let sharing = errors
+					.iter()
+					.filter(|other| other.shares_with(error))
+					.count();
+				match reach.halt(error, since).await {
+					None if sharing > 1
+						&& pass_halt(error) == Some(HaltReason::RemoteUnavailable) =>
+					{
+						Verdict::Spaced
+					}
+					halt => Verdict::of(halt),
+				}
+			}
+		};
+		verdicts.push(verdict);
+	}
+	let mut verdicts = verdicts.into_iter();
+	answers
+		.into_iter()
+		.map(|answer| {
+			answer.map_err(|error| Failed {
+				verdict: verdicts
+					.next()
+					.expect("a verdict per failed answer (should be impossible)"),
+				error,
+			})
+		})
+		.collect()
+}
+
+/// Record that the remote directory create `action` failed with `error`, whose condition `halt`
+/// halts the pass, if any — unless it is under a create of the same chunk that failed on a
+/// condition of the remote, which holds it.
+///
+/// A create that fails on a condition of the remote rather than of its path (see [`pass_halt`]: a
+/// full account, the session refused, a server answering 5xx, 408 or 429 or not at all) holds what
+/// is under it, silently and counting against no streak, as a directory move that fails so does:
+/// what is under it failed for want of its directory, which is the remote's doing, not theirs.
+/// That holds even when the server was shown answering and the create's own failure counts against
+/// its path, which the next pass plans again. What is under it is the rest of the chunk under it,
+/// the creates of later chunks and the uploads (see [`FailedDirMoves::skips`]).
+fn hold_under_failed_create(
+	chunk_ctx: &ChunkContext<'_, '_>,
+	action: &SyncAction,
+	Failed { error, verdict }: &Failed,
+	failed: &mut FailedDirMoves,
+	report: &mut SyncReport,
+	observer: &mut (dyn FnMut(SyncEvent) + Send),
+) {
+	if failed.skips(action, report, observer) {
+		return;
+	}
+	if pass_halt(error).is_some() {
+		failed.held.push(action.rel_path().to_string());
+	}
+	note_action_failed(action, error, *verdict, chunk_ctx.full, report, observer);
 }
 
 /// The answers to `count` items whose request failed as a whole with `error`: a lock that could not
@@ -2071,8 +2278,8 @@ async fn compose_creates<'c>(
 	chunk_ctx: &ChunkContext<'_, '_>,
 	chunk: &'c [PlannedEntry],
 	plan: &PagedPlan,
-	failed: &FailedDirMoves,
-	looked_up: &mut HashMap<Uuid, Result<(), Arc<crate::Error>>>,
+	failed: &mut FailedDirMoves,
+	looked_up: &mut HashMap<Uuid, Result<(), Arc<Failed>>>,
 	report: &mut SyncReport,
 	observer: &mut (dyn FnMut(SyncEvent) + Send),
 ) -> (Vec<ComposedCreate<'c>>, usize) {
@@ -2098,7 +2305,9 @@ async fn compose_creates<'c>(
 			}
 			Err(error) => {
 				settled += 1;
-				note_action_failed(action, &error, chunk_ctx.full, report, observer);
+				// A read of the stage, or a parent the pass has none for: nothing was sent.
+				let verdict = Verdict::of(pass_halt(&error));
+				note_action_failed(action, &error, verdict, chunk_ctx.full, report, observer);
 			}
 		}
 	}
@@ -2115,9 +2324,17 @@ async fn compose_creates<'c>(
 		})
 		.collect();
 	let (client, hold) = (chunk_ctx.ctx.client, chunk_ctx.hold);
+	let reach = chunk_ctx.reach;
+	let since = chunk_ctx.since;
 	let lookups = join_all(missing.into_iter().map(|dir| async move {
-		let lookup = client.held_connected_targets(hold, dir).await;
-		(dir, lookup.map(|_| ()).map_err(Arc::new))
+		let lookup = match client.held_connected_targets(hold, dir).await {
+			Ok(_) => Ok(()),
+			Err(error) => Err(Arc::new(Failed {
+				verdict: Verdict::of(reach.halt(&error, since).await),
+				error,
+			})),
+		};
+		(dir, lookup)
 	}))
 	.await;
 	looked_up.extend(lookups);
@@ -2126,31 +2343,30 @@ async fn compose_creates<'c>(
 	// where each create of `composed` went in `sent`, or the lookup error that failed it and every
 	// create under it.
 	let mut sent = Vec::with_capacity(composed.len());
-	let mut placed: Vec<Result<usize, Arc<crate::Error>>> = Vec::with_capacity(composed.len());
+	let mut placed: Vec<Result<usize, Arc<Failed>>> = Vec::with_capacity(composed.len());
 	for mut create in composed {
 		let place = match create.dir.parent {
 			NewDirParent::Existing(dir) => match looked_up.get(&dir) {
 				Some(Ok(())) => Ok(sent.len()),
-				Some(Err(error)) => Err(Arc::clone(error)),
-				None => Err(Arc::new(internal(
+				Some(Err(failure)) => Err(Arc::clone(failure)),
+				None => Err(Arc::new(Failed::local(internal(
 					"a parent's links and shares were not looked up (should be impossible)",
-				))),
+				)))),
 			},
 			NewDirParent::Earlier(index) => match placed.get(index) {
 				Some(Ok(moved)) => {
 					create.dir.parent = NewDirParent::Earlier(*moved);
 					Ok(sent.len())
 				}
-				Some(Err(error)) => Err(Arc::clone(error)),
-				None => Err(Arc::new(internal(
+				Some(Err(failure)) => Err(Arc::clone(failure)),
+				None => Err(Arc::new(Failed::local(internal(
 					"a create's parent comes after it in the chunk (should be impossible)",
-				))),
+				)))),
 			},
 		};
-		if let Err(error) = &place {
+		if let Err(failure) = &place {
 			settled += 1;
-			let error = crate::Error::unshared(Arc::clone(error));
-			note_action_failed(create.action, &error, chunk_ctx.full, report, observer);
+			hold_under_failed_create(chunk_ctx, create.action, failure, failed, report, observer);
 		} else {
 			sent.push(create);
 		}
@@ -2210,8 +2426,9 @@ fn compose_create<'c>(
 async fn land_creates(
 	chunk_ctx: &ChunkContext<'_, '_>,
 	composed: &[ComposedCreate<'_>],
-	answers: Vec<Result<CreatedDir, crate::Error>>,
+	answers: Vec<Result<CreatedDir, Failed>>,
 	plan: &mut PagedPlan,
+	failed: &mut FailedDirMoves,
 	report: &mut SyncReport,
 	observer: &mut (dyn FnMut(SyncEvent) + Send),
 ) -> usize {
@@ -2221,11 +2438,14 @@ async fn land_creates(
 	for (create, answer) in composed.iter().zip(answers) {
 		settled += 1;
 		let landed = match answer {
-			Ok(created) => record_create(chunk_ctx.ctx, create, created.uuid, plan, report).await,
-			Err(error) => Err(error),
+			Ok(created) => record_create(chunk_ctx.ctx, create, created.uuid, plan, report)
+				.await
+				// A record of the stage or the store: nothing more was sent.
+				.map_err(Failed::local),
+			Err(failure) => Err(failure),
 		};
-		if let Err(error) = landed {
-			note_action_failed(create.action, &error, chunk_ctx.full, report, observer);
+		if let Err(failure) = landed {
+			hold_under_failed_create(chunk_ctx, create.action, &failure, failed, report, observer);
 		}
 		if !admits_more(report) {
 			break;
@@ -2246,8 +2466,8 @@ async fn land_creates(
 /// are empty, and in a folder neither engine syncs.
 fn refuse_merges_into_legacy_trash(
 	composed: &[ComposedCreate<'_>],
-	answers: Vec<Result<CreatedDir, crate::Error>>,
-) -> Vec<Result<CreatedDir, crate::Error>> {
+	answers: Vec<Result<CreatedDir, Failed>>,
+) -> Vec<Result<CreatedDir, Failed>> {
 	let mut refused: Vec<bool> = Vec::with_capacity(composed.len());
 	composed
 		.iter()
@@ -2262,15 +2482,15 @@ fn refuse_merges_into_legacy_trash(
 				.is_ok_and(|created| created.merged && folds_onto_legacy_trash(create.dir.name));
 			refused.push(under_refused || merged_into_trash);
 			match answer {
-				Ok(_) if merged_into_trash => Err(internal_owned(format!(
+				Ok(_) if merged_into_trash => Err(Failed::local(internal_owned(format!(
 					"refusing to record {:?}: the server merged it into filen-sync's trash folder, \
 					 which is never synced",
 					create.action.rel_path()
-				))),
-				Ok(_) if under_refused => Err(internal_owned(format!(
+				)))),
+				Ok(_) if under_refused => Err(Failed::local(internal_owned(format!(
 					"refusing to record {:?}: its parent was merged into filen-sync's trash folder",
 					create.action.rel_path()
-				))),
+				)))),
 				answer => answer,
 			}
 		})
@@ -2288,7 +2508,7 @@ fn refuse_merges_into_legacy_trash(
 async fn propagate_chunk(
 	chunk_ctx: &ChunkContext<'_, '_>,
 	composed: &[ComposedCreate<'_>],
-	answers: &[Result<CreatedDir, crate::Error>],
+	answers: &[Result<CreatedDir, Failed>],
 ) {
 	// The uuid each create was answered, by its place in `composed`, for the creates under it.
 	let answered: Vec<Option<Uuid>> = answers
@@ -2490,10 +2710,10 @@ struct ComposedTrash<'c> {
 /// Returns how many of the chunk it carried out or failed, as [`apply_creates`] does.
 async fn apply_trashes(
 	ctx: &ApplyContext<'_>,
+	Findings { full, reach }: Findings<'_, '_>,
 	chunk: Vec<PlannedEntry>,
 	plan: &mut PagedPlan,
 	failed: &FailedDirMoves,
-	full: &FullSides,
 	report: &mut SyncReport,
 	observer: &mut (dyn FnMut(SyncEvent) + Send),
 ) -> usize {
@@ -2507,10 +2727,8 @@ async fn apply_trashes(
 		"apply: trashing {} remote items in one request",
 		items.len()
 	);
-	let answers = match ctx.client.trash_items(&items).await {
-		Ok(answers) => answers,
-		Err(error) => all_failed(error, items.len()),
-	};
+	let request = ctx.client.trash_items(&items);
+	let answers = sent_and_classified(reach, items.len(), request).await;
 	settled + land_trashes(ctx, composed, answers, plan, full, report, observer).await
 }
 
@@ -2540,7 +2758,9 @@ fn compose_trashes<'c>(
 			Ok(trash) => composed.push(trash),
 			Err(error) => {
 				settled += 1;
-				note_action_failed(action, &error, full, report, observer);
+				// A refusal of the pass's own: nothing was sent.
+				let verdict = Verdict::of(pass_halt(&error));
+				note_action_failed(action, &error, verdict, full, report, observer);
 			}
 		}
 	}
@@ -2595,7 +2815,7 @@ fn compose_trash<'c>(
 async fn land_trashes(
 	ctx: &ApplyContext<'_>,
 	trashes: Vec<ComposedTrash<'_>>,
-	answers: Vec<Result<(), crate::Error>>,
+	answers: Vec<Result<(), Failed>>,
 	plan: &PagedPlan,
 	full: &FullSides,
 	report: &mut SyncReport,
@@ -2610,15 +2830,17 @@ async fn land_trashes(
 			carried,
 			..
 		} = trash;
-		if let Err(error) = answer {
-			note_action_failed(action, &error, full, report, observer);
+		if let Err(Failed { error, verdict }) = answer {
+			note_action_failed(action, &error, verdict, full, report, observer);
 			continue;
 		}
 		// The row is about to go, so a snapshot that has not applied the trash yet reads this item
 		// as an untracked remote one with nothing local — a deletion to make all over again. Record
 		// the trash so the next pass suppresses that.
 		if let Err(error) = commit_trash(ctx, remote_uuid, action.rel_path(), carried).await {
-			note_action_failed(action, &error, full, report, observer);
+			// A record of the store: nothing more was sent.
+			let verdict = Verdict::of(pass_halt(&error));
+			note_action_failed(action, &error, verdict, full, report, observer);
 			break;
 		}
 		report.remotely_trashed += 1;
@@ -2664,26 +2886,38 @@ fn note_written(
 /// per-path failure counter consumes, so a path that fails every pass is eventually reported as
 /// unsyncable instead of retried forever.
 ///
-/// A failure that says a side has no room left, or that the remote is out of reach or refuses the
-/// session (see [`pass_halt`]), is not the path's fault: it sets [`halted`](SyncReport::halted)
-/// instead (if nothing did yet), with one line per condition saying so, and is returned so the
-/// caller holds back the actions it stops. A full side counts against no streak; a remote outage
-/// goes to [`transient_failures`](SyncReport::transient_failures), which the engine counts only
-/// spaced out.
+/// `verdict` is what the failure counts as: [`pass_halt`]'s condition for an error no request was
+/// sent for, [`Reach::halt`]'s for one that may have been (see [`Verdict`]). A failure that halts
+/// the pass — a side with no room left, or a remote out of reach or refusing the session — is not
+/// the path's fault: it sets [`halted`](SyncReport::halted) instead (if nothing did yet), with one
+/// line per condition saying so, and is returned so the caller holds back the actions it stops. A
+/// full side counts against no streak; a remote outage, and a failure that is only
+/// [`Spaced`](Verdict::Spaced), go to [`transient_failures`](SyncReport::transient_failures),
+/// which the engine counts only spaced out.
 fn note_failure(
 	report: &mut SyncReport,
 	rel_path: &str,
 	error: &crate::Error,
+	verdict: Verdict,
 ) -> Option<HaltReason> {
 	report.errors.push(format!("{rel_path}: {error}"));
 	if record_not_written(error) {
 		report.store_failed = Some(StoreFailure::RecordNotWritten(error.kind()));
 	}
-	let Some(reason) = pass_halt(error) else {
-		report
-			.failed_paths
-			.push((rel_path.to_string(), error.to_string()));
-		return None;
+	let reason = match verdict {
+		Verdict::Own => {
+			report
+				.failed_paths
+				.push((rel_path.to_string(), error.to_string()));
+			return None;
+		}
+		Verdict::Spaced => {
+			report
+				.transient_failures
+				.push((rel_path.to_string(), error.to_string()));
+			return None;
+		}
+		Verdict::Halts(reason) => reason,
 	};
 	if reason.is_remote_outage() {
 		report
@@ -2722,7 +2956,7 @@ fn note_overwrote(
 			 buried version could not be written ({error}), so unless the caller resolves it from \
 			 this report, the next pass reads both sides holding our bytes and adopts them"
 		);
-		note_failure(report, rel_path, &error);
+		note_failure(report, rel_path, &error, Verdict::of(pass_halt(&error)));
 	}
 }
 
@@ -2788,34 +3022,51 @@ impl FullSides {
 /// found anywhere in the chain wins over an outage found above it.
 fn pass_halt(error: &crate::Error) -> Option<HaltReason> {
 	let mut outage = None;
-	let mut next: Option<&(dyn std::error::Error + 'static)> = Some(error);
-	while let Some(current) = next {
-		if current
+	for link in links(error) {
+		if link
 			.downcast_ref::<crate::Error>()
 			.is_some_and(|sdk| sdk.kind() == ErrorKind::MaxStorageReached)
-			|| api_code(current) == Some("max_storage_reached")
+			|| api_code(link) == Some("max_storage_reached")
 		{
 			return Some(HaltReason::RemoteStorageFull);
 		}
-		outage = outage.or_else(|| remote_outage(current));
-		next = match current.downcast_ref::<std::io::Error>() {
-			Some(io)
-				if matches!(
-					io.kind(),
-					std::io::ErrorKind::StorageFull | std::io::ErrorKind::QuotaExceeded
-				) =>
-			{
-				return Some(HaltReason::LocalStorageFull);
-			}
+		if link.downcast_ref::<std::io::Error>().is_some_and(|io| {
+			matches!(
+				io.kind(),
+				std::io::ErrorKind::StorageFull | std::io::ErrorKind::QuotaExceeded
+			)
+		}) {
+			return Some(HaltReason::LocalStorageFull);
+		}
+		outage = outage.or_else(|| remote_outage(link));
+	}
+	outage
+}
+
+/// `error` and the errors under it, including the one inside an `io::Error` wrapping another.
+fn links(error: &crate::Error) -> impl Iterator<Item = &(dyn std::error::Error + 'static)> {
+	std::iter::successors(
+		Some(error as &(dyn std::error::Error + 'static)),
+		|current| match current.downcast_ref::<std::io::Error>() {
 			// `io::Error::source` skips the error it wraps and reports that error's own source, so
 			// step into the wrapped one directly.
 			Some(io) => io
 				.get_ref()
 				.map(|inner| inner as &(dyn std::error::Error + 'static)),
 			None => current.source(),
-		};
-	}
-	outage
+		},
+	)
+}
+
+/// The host of the server whose transient answer, or lack of one, `error` failed on (see
+/// [`remote_outage`]): what [`Reach`] asks about.
+fn transient_server(error: &crate::Error) -> Option<&str> {
+	links(error).find_map(|link| {
+		let transport = link.downcast_ref::<reqwest::Error>()?;
+		(remote_outage(link) == Some(HaltReason::RemoteUnavailable))
+			.then(|| transport.url().and_then(reqwest::Url::host_str))
+			.flatten()
+	})
 }
 
 /// The code of the server's refusal `error` is, if it is one.
@@ -2856,10 +3107,7 @@ fn remote_outage(link: &(dyn std::error::Error + 'static)) -> Option<HaltReason>
 	let transport = link.downcast_ref::<reqwest::Error>()?;
 	match transport.status() {
 		Some(StatusCode::UNAUTHORIZED) => Some(HaltReason::Unauthenticated),
-		Some(status) => (status.is_server_error()
-			|| status == StatusCode::REQUEST_TIMEOUT
-			|| status == StatusCode::TOO_MANY_REQUESTS)
-			.then_some(HaltReason::RemoteUnavailable),
+		Some(status) => is_transient_status(status).then_some(HaltReason::RemoteUnavailable),
 		None => (transport.is_connect() || transport.is_timeout() || is_connection_lost(transport))
 			.then_some(HaltReason::RemoteUnavailable),
 	}
@@ -4132,6 +4380,8 @@ fn internal(message: &'static str) -> crate::Error {
 fn internal_owned(message: String) -> crate::Error {
 	crate::Error::custom(crate::ErrorKind::Internal, message)
 }
+
+mod reach;
 
 /// A plan the tests stage for the apply without screening it, and entries with nothing read.
 #[cfg(test)]

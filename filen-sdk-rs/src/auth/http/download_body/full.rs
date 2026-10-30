@@ -102,6 +102,8 @@ mod native {
 			body: reqwest::Body,
 			collected: Vec<u8>,
 			expected: Option<u64>,
+			/// The URL the response came from, for the error a failed read of its body is.
+			url: reqwest::Url,
 		},
 	}
 
@@ -126,6 +128,7 @@ mod native {
 				match this {
 					DownloadBodyFutureProj::AwaitingInner { fut, .. } => match fut.poll(cx) {
 						Poll::Ready(Ok(response)) => {
+							let url = response.url().clone();
 							let (_, body) = http::Response::from(response).into_parts();
 							let sizes = body.size_hint();
 							let size_to_alloc = sizes.exact().unwrap_or_else(|| {
@@ -138,6 +141,7 @@ mod native {
 							});
 							self.set(DownloadBodyFuture::ReadingBody {
 								expected: sizes.exact(),
+								url,
 								body,
 								collected: Vec::try_with_capacity(
 									size_to_alloc.try_into().map_err(|e| {
@@ -167,6 +171,7 @@ mod native {
 						mut body,
 						collected,
 						expected,
+						url,
 					} => loop {
 						match body.as_mut().poll_frame(cx) {
 							Poll::Ready(Some(Ok(frame))) => {
@@ -183,9 +188,12 @@ mod native {
 								// bounded by MAX_RETRIES, decompression errors) is classified as
 								// transient transport loss and redriven instead of surfacing a
 								// body that was never fully received.
+								// A body error names no URL of its own (reqwest sets one only on errors
+								// before the response), so it gets the request's: what tells the sync
+								// engine which server it failed on (`sync_engine::apply::reach`).
 								return Poll::Ready(Err(RetryError::from_retryable(
 									!e.is_timeout(),
-									Error::from(e),
+									Error::from(e.with_url(url.clone())),
 								)));
 							}
 							Poll::Ready(None) => {

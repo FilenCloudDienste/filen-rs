@@ -1,13 +1,20 @@
 use std::{borrow::Cow, sync::Mutex, time::Duration};
 
 use filen_types::crypto::Blake3Hash;
-use tokio::{io::AsyncWriteExt, net::TcpListener, runtime::Runtime};
+use tokio::{net::TcpListener, runtime::Runtime};
 use uuid::Uuid;
 
-use super::*;
+use super::{
+	test_support::{refuse_every_request, refused_error, session_refused, status_error},
+	*,
+};
 use crate::{
 	ErrorKind, alloc_meter,
-	auth::{http::test_support::read_head, test_support::offline_client, unauth},
+	auth::{
+		http::{ClientConfig, ServerAnswers},
+		test_support::offline_client,
+		unauth,
+	},
 	cache::{CacheState, hydrate_by_uuids},
 	connect::ConnectedTargets,
 	fs::bulk::create_dirs::CreateDirsError,
@@ -182,6 +189,16 @@ fn only_a_remote_write_waits_for_the_lock() {
 	}
 }
 
+/// [`note_failure`] of `error` as the pass takes it when no server was shown answering while its
+/// action ran (see [`Reach::halt`]): with the condition [`pass_halt`] finds in it.
+fn note_failure_unshown(
+	report: &mut SyncReport,
+	rel_path: &str,
+	error: &crate::Error,
+) -> Option<HaltReason> {
+	note_failure(report, rel_path, error, Verdict::of(pass_halt(error)))
+}
+
 fn over_quota() -> crate::Error {
 	filen_types::error::ResponseError::ApiError {
 		message: None,
@@ -283,22 +300,22 @@ fn storage_full_is_found_anywhere_in_the_error_chain() {
 #[test]
 fn a_storage_full_failure_halts_the_pass_instead_of_counting_against_its_path() {
 	let mut report = SyncReport::default();
-	note_failure(
+	note_failure_unshown(
 		&mut report,
 		"locked.txt",
 		&crate::Error::from(io_kind(std::io::ErrorKind::PermissionDenied)),
 	);
-	note_failure(
+	note_failure_unshown(
 		&mut report,
 		"big.bin",
 		&io_err(io_kind(std::io::ErrorKind::StorageFull)),
 	);
-	note_failure(
+	note_failure_unshown(
 		&mut report,
 		"again.bin",
 		&io_err(io_kind(std::io::ErrorKind::StorageFull)),
 	);
-	note_failure(&mut report, "other.bin", &over_quota());
+	note_failure_unshown(&mut report, "other.bin", &over_quota());
 
 	assert_eq!(report.halted, Some(HaltReason::LocalStorageFull));
 	assert_eq!(
@@ -351,6 +368,7 @@ fn a_move_of_a_file_replaced_since_the_pass_read_it_is_left_to_the_next_pass() {
 	note_action_failed(
 		&action,
 		&refused("file_is_versioned"),
+		Verdict::Own,
 		&full,
 		&mut report,
 		&mut |event| events.push(event),
@@ -371,6 +389,7 @@ fn a_move_of_a_file_replaced_since_the_pass_read_it_is_left_to_the_next_pass() {
 	note_action_failed(
 		&action,
 		&refused("file_not_found"),
+		Verdict::Own,
 		&full,
 		&mut report,
 		&mut |event| events.push(event),
@@ -496,7 +515,7 @@ fn a_buried_version_whose_row_could_not_be_written_is_still_reported() {
 fn a_lost_record_stops_the_pass_admitting_more_work() {
 	let mut report = SyncReport::default();
 	assert!(admits_more(&report), "a healthy pass admits its actions");
-	note_failure(
+	note_failure_unshown(
 		&mut report,
 		"docs/a.txt",
 		&internal("the server refused this one"),
@@ -506,7 +525,7 @@ fn a_lost_record_stops_the_pass_admitting_more_work() {
 		"an action that failed on its own leaves the pass running: {:?}",
 		report.errors
 	);
-	note_failure(&mut report, "docs/b.txt", &contended_write_error());
+	note_failure_unshown(&mut report, "docs/b.txt", &contended_write_error());
 	assert!(
 		!admits_more(&report),
 		"a record that did not land stops the pass: {:?}",
@@ -531,7 +550,7 @@ fn an_unread_plan_stops_the_pass_for_a_reason_a_lost_record_outranks() {
 		Some(StoreFailure::UnreadPlan(ErrorKind::Internal))
 	);
 	assert!(!admits_more(&report));
-	note_failure(&mut report, "docs/a.txt", &contended_write_error());
+	note_failure_unshown(&mut report, "docs/a.txt", &contended_write_error());
 	assert_eq!(
 		report.store_failed,
 		Some(StoreFailure::RecordNotWritten(ErrorKind::Internal))
@@ -567,7 +586,7 @@ fn a_baseline_row_that_could_not_be_written_makes_the_pass_a_failed_one() {
 			.map_err(db_err)
 			.expect_err("the contended row write must fail rather than wait");
 		assert!(record_not_written(&error), "{error}");
-		note_failure(&mut report, "docs", &error);
+		note_failure_unshown(&mut report, "docs", &error);
 	}
 	assert_eq!(
 		report.store_failed,
@@ -1876,6 +1895,7 @@ fn a_landing_the_stage_cannot_read_fails_the_upload_and_the_pass() {
 	note_action_failed(
 		&entry.action,
 		&error,
+		Verdict::of(pass_halt(&error)),
 		&FullSides::default(),
 		&mut report,
 		&mut |event| events.push(event),
@@ -2106,6 +2126,24 @@ struct Landed {
 	report: SyncReport,
 	events: Vec<SyncEvent>,
 	settled: usize,
+	/// What the chunk holds back of what comes after it.
+	failed: FailedDirMoves,
+}
+
+/// How a chunk of creates is run (see [`run_chunk_with`]).
+#[derive(Default)]
+struct ChunkRun<'t> {
+	/// The listed directories whose links and shares are kept empty, beside [`ROOT`].
+	listed: &'t [Uuid],
+	/// The answers to land, if the chunk is sent.
+	answers: Option<Vec<Result<CreatedDir, crate::Error>>>,
+	/// The lookups made already.
+	looked_up: HashMap<Uuid, Result<(), Arc<Failed>>>,
+	/// The server an answer came in from while the chunk looked up its parents, before its
+	/// request was sent.
+	answered_while_composing: Option<&'t str>,
+	/// The server an answer came in from while the chunk's request was out.
+	answered_by: Option<&'t str>,
 }
 
 /// Compose `chunk` over `plan` and, given `answers`, land it, with the links and shares of
@@ -2130,8 +2168,33 @@ fn run_chunk_looked_up(
 	chunk: &[PlannedEntry],
 	plan: &mut PagedPlan,
 	answers: Option<Vec<Result<CreatedDir, crate::Error>>>,
-	mut looked_up: HashMap<Uuid, Result<(), Arc<crate::Error>>>,
+	looked_up: HashMap<Uuid, Result<(), Arc<Failed>>>,
 ) -> Landed {
+	let run = ChunkRun {
+		listed,
+		answers,
+		looked_up,
+		..ChunkRun::default()
+	};
+	run_chunk_with(borrowed, hold, chunk, plan, run)
+}
+
+/// Compose `chunk` over `plan` and land it as `run` says.
+fn run_chunk_with(
+	borrowed: &Borrowed,
+	hold: &UndrivenHold,
+	chunk: &[PlannedEntry],
+	plan: &mut PagedPlan,
+	run: ChunkRun<'_>,
+) -> Landed {
+	let ChunkRun {
+		listed,
+		answers,
+		mut looked_up,
+		answered_while_composing,
+		answered_by,
+	} = run;
+	let answers_of = || borrowed.client.unauthed().state().answers();
 	for dir in std::iter::once(&ROOT).chain(listed) {
 		borrowed
 			.client
@@ -2139,31 +2202,47 @@ fn run_chunk_looked_up(
 	}
 	let ctx = borrowed.ctx(ROOT, None);
 	let full = FullSides::default();
+	let reach = Reach::new(&borrowed.client);
 	let chunk_ctx = ChunkContext {
 		ctx: &ctx,
 		hold: &hold.lock,
 		full: &full,
+		reach: &reach,
+		since: reach.mark(),
 	};
 	let mut report = SyncReport::default();
 	let mut events = Vec::new();
 	let mut observer = |event| events.push(event);
+	let mut failed = FailedDirMoves::default();
 	let (composed, settled) = hold.runtime.block_on(async {
 		let (composed, mut settled) = compose_creates(
 			&chunk_ctx,
 			chunk,
 			plan,
-			&FailedDirMoves::default(),
+			&mut failed,
 			&mut looked_up,
 			&mut report,
 			&mut observer,
 		)
 		.await;
+		if let Some(answer) = answered_while_composing {
+			answers_of().note_answer_from(answer);
+		}
 		if let Some(answers) = answers {
+			let count = answers.len();
+			let request = async {
+				if let Some(answer) = answered_by {
+					answers_of().note_answer_from(answer);
+				}
+				Ok(answers)
+			};
+			let answers = sent_and_classified(&reach, count, request).await;
 			settled += land_creates(
 				&chunk_ctx,
 				&composed,
 				answers,
 				plan,
+				&mut failed,
 				&mut report,
 				&mut observer,
 			)
@@ -2175,6 +2254,7 @@ fn run_chunk_looked_up(
 		)
 	});
 	Landed {
+		failed,
 		composed,
 		report,
 		events,
@@ -2285,7 +2365,10 @@ fn a_failed_lookup_fails_every_create_under_its_directory_before_anything_is_sen
 	];
 	let (_dir, mut plan) = staged_entries(&chunk);
 	let (borrowed, hold) = (Borrowed::new(), UndrivenHold::new());
-	let looked_up = HashMap::from([(listed, Err(Arc::new(internal("lookup refused"))))]);
+	let looked_up = HashMap::from([(
+		listed,
+		Err(Arc::new(Failed::local(internal("lookup refused")))),
+	)]);
 	let landed = run_chunk_looked_up(&borrowed, &hold, &[], &chunk, &mut plan, None, looked_up);
 	assert_eq!(landed.composed, [NewDirParent::Existing(ROOT)]);
 	assert_eq!(landed.settled, 3);
@@ -2317,7 +2400,10 @@ fn a_create_after_one_whose_lookup_failed_names_its_parent_by_its_new_place() {
 	];
 	let (_dir, mut plan) = staged_entries(&chunk);
 	let (borrowed, hold) = (Borrowed::new(), UndrivenHold::new());
-	let looked_up = HashMap::from([(listed, Err(Arc::new(internal("lookup refused"))))]);
+	let looked_up = HashMap::from([(
+		listed,
+		Err(Arc::new(Failed::local(internal("lookup refused")))),
+	)]);
 	let landed = run_chunk_looked_up(&borrowed, &hold, &[], &chunk, &mut plan, None, looked_up);
 	assert_eq!(
 		landed.composed,
@@ -2745,6 +2831,18 @@ async fn run_trashes(
 	plan: &PagedPlan,
 	answers: Option<Vec<Result<(), crate::Error>>>,
 ) -> Trashed {
+	run_trashes_answered(borrowed, chunk, plan, answers, None).await
+}
+
+/// [`run_trashes`], with an answer from the server `answered_by` coming in while the request is
+/// out.
+async fn run_trashes_answered(
+	borrowed: &Borrowed,
+	chunk: &[PlannedEntry],
+	plan: &PagedPlan,
+	answers: Option<Vec<Result<(), crate::Error>>>,
+	answered_by: Option<&str>,
+) -> Trashed {
 	let ctx = borrowed.ctx(ROOT, None);
 	let full = FullSides::default();
 	let mut report = SyncReport::default();
@@ -2766,6 +2864,20 @@ async fn run_trashes(
 		})
 		.collect();
 	if let Some(answers) = answers {
+		let reach = Reach::new(&borrowed.client);
+		let count = answers.len();
+		let request = async {
+			if let Some(answer) = answered_by {
+				borrowed
+					.client
+					.unauthed()
+					.state()
+					.answers()
+					.note_answer_from(answer);
+			}
+			Ok(answers)
+		};
+		let answers = sent_and_classified(&reach, count, request).await;
 		settled += land_trashes(
 			&ctx,
 			composed,
@@ -3049,54 +3161,6 @@ async fn a_whole_trash_request_failure_fails_each_item_once() {
 	);
 }
 
-/// The error of a request a local server answered with `status`.
-async fn status_error(status: u16) -> reqwest::Error {
-	let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-	let addr = listener.local_addr().unwrap();
-	let server = tokio::spawn(async move {
-		let (mut socket, _) = listener.accept().await.unwrap();
-		read_head(&mut socket).await;
-		socket
-			.write_all(format!("HTTP/1.1 {status} Status\r\nContent-Length: 0\r\n\r\n").as_bytes())
-			.await
-			.unwrap();
-		socket
-	});
-	let response = reqwest::Client::builder()
-		.no_proxy()
-		.build()
-		.unwrap()
-		.get(format!("http://{addr}/"))
-		.send()
-		.await
-		.unwrap();
-	server.await.unwrap();
-	response.error_for_status().unwrap_err()
-}
-
-/// The error of a connect to a local port nothing listens on.
-async fn refused_error() -> reqwest::Error {
-	let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-	let addr = listener.local_addr().unwrap();
-	drop(listener);
-	reqwest::Client::builder()
-		.no_proxy()
-		.build()
-		.unwrap()
-		.get(format!("http://{addr}/"))
-		.send()
-		.await
-		.unwrap_err()
-}
-
-fn session_refused() -> crate::Error {
-	filen_types::error::ResponseError::ApiError {
-		message: None,
-		code: Some("api_key_not_found".to_string()),
-	}
-	.into()
-}
-
 /// A remote out of reach, overloaded or rate limiting, and a session the server refuses, are found
 /// wherever the SDK put them: straight from the HTTP client, inside the `io::Error` the upload
 /// writer wraps a failed chunk in, and inside the error a bulk request shares between its items.
@@ -3186,17 +3250,17 @@ async fn a_failure_that_is_the_paths_own_is_no_remote_outage() {
 #[tokio::test]
 async fn a_remote_outage_halts_the_pass_instead_of_counting_against_its_path() {
 	let mut report = SyncReport::default();
-	note_failure(
+	note_failure_unshown(
 		&mut report,
 		"locked.txt",
 		&crate::Error::from(io_kind(std::io::ErrorKind::PermissionDenied)),
 	);
-	note_failure(
+	note_failure_unshown(
 		&mut report,
 		"a.bin",
 		&crate::Error::from(status_error(503).await),
 	);
-	note_failure(
+	note_failure_unshown(
 		&mut report,
 		"b.bin",
 		&crate::Error::from(refused_error().await),
@@ -3223,7 +3287,7 @@ async fn a_remote_outage_halts_the_pass_instead_of_counting_against_its_path() {
 	);
 
 	let mut report = SyncReport::default();
-	note_failure(&mut report, "c.bin", &session_refused());
+	note_failure_unshown(&mut report, "c.bin", &session_refused());
 	assert_eq!(report.halted, Some(HaltReason::Unauthenticated));
 	assert!(report.failed_paths.is_empty());
 	assert_eq!(paths(&report.transient_failures), ["c.bin"]);
@@ -3377,6 +3441,347 @@ async fn a_remote_outage_starts_no_more_remote_actions_and_lets_local_ones_run()
 	);
 }
 
+/// A download of the file `n` at `rel_path`: of a file with no bytes, which lands without a
+/// request, when `rel_path` starts with `empty`, and else of one only the server has.
+fn download_of(n: u128, rel_path: &str) -> SyncAction {
+	SyncAction::DownloadFile {
+		rel_path: rel_path.to_string(),
+		remote_uuid: Uuid::from_u128(n),
+	}
+}
+
+/// What one [`apply`] of `actions` left behind, on a client running at most `concurrency`
+/// transfers at a time whose servers turn away every request it sends (see
+/// [`refuse_every_request`]), noting an answer to another request first when `answered`. The cache
+/// lists the file of every download (see [`download_of`]); each event goes to `on_event` with the
+/// client's answers as it is delivered.
+async fn refused_pass(
+	concurrency: usize,
+	answered: bool,
+	actions: &[SyncAction],
+	mut on_event: impl FnMut(&SyncEvent, &ServerAnswers) + Send,
+) -> (SyncReport, Vec<SyncEvent>) {
+	let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+	let client = unauth::test_support::client_via_proxy(
+		ClientConfig::default().with_concurrency(concurrency),
+		listener.local_addr().unwrap(),
+	);
+	let answers = Arc::clone(client.unauthed().state().answers());
+	let (proxy, _) = refuse_every_request(listener, answered.then(|| Arc::clone(&answers)));
+	let borrowed = Borrowed::with_client(client);
+	let root = Uuid::from_u128(u128::MAX);
+	locked(&borrowed.store)
+		.create_pair("/local", root, SyncMode::TwoWay)
+		.unwrap();
+	let cache_dir = tempfile::tempdir().unwrap();
+	let cache = cache_dir.path().join("cache.db");
+	let mut state = CacheState::new_on_path(&cache, root);
+	state
+		.upsert_files(actions.iter().filter_map(|action| {
+			let SyncAction::DownloadFile {
+				rel_path,
+				remote_uuid,
+			} = action
+			else {
+				return None;
+			};
+			let mut file = cacheable_file(*remote_uuid, root, rel_path);
+			if rel_path.starts_with("empty") {
+				file.size = 0;
+				file.chunks = 0;
+				file.chunks_size = 0;
+			}
+			Some(file)
+		}))
+		.unwrap();
+	let (_dir, stage) = Stage::in_temp_dir();
+	let mut writer = PlanWriter::new(stage).unwrap();
+	for action in actions {
+		writer.push(&PlannedEntry::bare(action.clone())).unwrap();
+	}
+	let mut report = SyncReport::default();
+	let mut events = Vec::new();
+	apply(
+		borrowed.ctx(root, Some(cache)),
+		writer.finish().unwrap(),
+		&mut report,
+		&mut |event| {
+			on_event(&event, &answers);
+			events.push(event);
+		},
+	)
+	.await;
+	proxy.abort();
+	(report, events)
+}
+
+fn paths_of(failures: &[(String, String)]) -> Vec<&str> {
+	failures.iter().map(|(path, _)| path.as_str()).collect()
+}
+
+/// A transfer the server turns away while it answers the client's other requests is a failure
+/// of its own path, counted in full, and halts nothing: the transfer after it still runs.
+#[tokio::test(start_paused = true)]
+async fn a_transfer_turned_away_while_its_server_answers_fails_its_path_and_not_the_pass() {
+	let (report, events) = refused_pass(
+		1,
+		true,
+		&[download_of(1, "a-poison.bin"), download_of(2, "empty.bin")],
+		|_, _| {},
+	)
+	.await;
+
+	assert_eq!(report.halted, None, "{:?}", report.errors);
+	assert_eq!(paths_of(&report.failed_paths), ["a-poison.bin"]);
+	assert!(
+		report.transient_failures.is_empty(),
+		"{:?}",
+		report.transient_failures
+	);
+	assert_eq!(report.downloaded, 1);
+	assert_eq!(failures(&events), 1);
+	assert_eq!(report.pass_failure(), None);
+}
+
+/// A download of a file with no bytes lands without asking the server anything, so it shows
+/// nothing about the server: the outage after it still halts the pass, and the failure it caught
+/// counts only spaced out.
+#[tokio::test(start_paused = true)]
+async fn an_empty_download_landing_in_an_outage_shows_no_server_answering() {
+	let (report, _) = refused_pass(
+		1,
+		false,
+		&[
+			download_of(1, "empty.bin"),
+			download_of(2, "x.bin"),
+			download_of(3, "y.bin"),
+		],
+		|_, _| {},
+	)
+	.await;
+
+	assert_eq!(report.downloaded, 1);
+	assert_eq!(report.halted, Some(HaltReason::RemoteUnavailable));
+	assert_eq!(paths_of(&report.transient_failures), ["x.bin"]);
+	assert!(report.failed_paths.is_empty(), "{:?}", report.failed_paths);
+}
+
+/// A failure the pass took for an outage stays one when the server answers after it, and when a
+/// transfer in flight lands after it: what the pass knew as the failure came in decides it, and
+/// nothing after that charges it to its path.
+#[tokio::test(start_paused = true)]
+async fn an_answer_after_the_pass_halted_charges_none_of_its_failures_to_their_paths() {
+	let (report, _) = refused_pass(
+		2,
+		false,
+		&[download_of(1, "a.bin"), download_of(2, "empty.bin")],
+		|event, answers| {
+			if matches!(event, SyncEvent::ActionFailed { .. }) {
+				answers.note_answer_from("egest.filen.io");
+			}
+		},
+	)
+	.await;
+
+	assert_eq!(report.halted, Some(HaltReason::RemoteUnavailable));
+	assert_eq!(paths_of(&report.transient_failures), ["a.bin"]);
+	assert!(report.failed_paths.is_empty(), "{:?}", report.failed_paths);
+	assert_eq!(report.downloaded, 1);
+}
+
+/// Whether `failed` holds `action` back silently, without failing it.
+fn holds_silently(failed: &FailedDirMoves, action: &SyncAction) -> bool {
+	let mut report = SyncReport::default();
+	let mut events = Vec::new();
+	failed.skips(action, &mut report, &mut |event| events.push(event))
+		&& report.errors.is_empty()
+		&& events.is_empty()
+}
+
+/// A remote directory create that fails in an outage halts the pass, counts only spaced out, and
+/// holds what is under it — the rest of its chunk, and the uploads after it — without failing any
+/// of it: those are owed to the outage, not to their paths.
+#[test]
+fn a_create_that_fails_in_an_outage_holds_its_subtree_without_charging_it() {
+	let chunk = [
+		create_at("a", None),
+		create_at("a/b", None),
+		create_at("c", None),
+	];
+	let (_dir, mut plan) = staged_entries(&chunk);
+	let (borrowed, hold) = (borrowed_with_pair(), UndrivenHold::new());
+	let error = crate::Error::from(hold.runtime.block_on(status_error(503)));
+	let landed = run_chunk(
+		&borrowed,
+		&hold,
+		&[],
+		&chunk,
+		&mut plan,
+		Some(all_failed(error, chunk.len())),
+	);
+
+	assert_eq!(landed.settled, 3);
+	assert_eq!(landed.report.halted, Some(HaltReason::RemoteUnavailable));
+	assert_eq!(paths_of(&landed.report.transient_failures), ["a", "c"]);
+	assert!(
+		landed.report.failed_paths.is_empty(),
+		"{:?}",
+		landed.report.failed_paths
+	);
+	assert_eq!(failures(&landed.events), 2);
+	assert_eq!(landed.failed.held, ["a", "c"]);
+	assert!(holds_silently(&landed.failed, &upload("a/b/f.txt")));
+	assert!(!holds_silently(&landed.failed, &upload("d/f.txt")));
+}
+
+/// A request of creates the server turns away as a whole while it answers the client's other
+/// requests is one failure, and no item's own: it halts nothing, each create it carried counts only
+/// spaced out, and what is under them is held, not charged.
+#[test]
+fn a_create_request_turned_away_while_its_server_answers_counts_its_items_spaced_out() {
+	let chunk = [
+		create_at("a", None),
+		create_at("a/b", None),
+		create_at("c", None),
+	];
+	let (_dir, mut plan) = staged_entries(&chunk);
+	let (borrowed, hold) = (borrowed_with_pair(), UndrivenHold::new());
+	let error = crate::Error::from(hold.runtime.block_on(status_error(503)));
+	let landed = run_chunk_with(
+		&borrowed,
+		&hold,
+		&chunk,
+		&mut plan,
+		ChunkRun {
+			answers: Some(all_failed(error, chunk.len())),
+			answered_by: Some("127.0.0.1"),
+			..ChunkRun::default()
+		},
+	);
+
+	assert_eq!(landed.settled, 3);
+	assert_eq!(landed.report.halted, None, "{:?}", landed.report.errors);
+	assert_eq!(paths_of(&landed.report.transient_failures), ["a", "c"]);
+	assert!(
+		landed.report.failed_paths.is_empty(),
+		"{:?}",
+		landed.report.failed_paths
+	);
+	assert_eq!(failures(&landed.events), 2);
+	assert_eq!(landed.failed.held, ["a", "c"]);
+	assert!(holds_silently(&landed.failed, &upload("a/b/f.txt")));
+}
+
+/// A create its request carried alone, turned away while the server answers the client's other
+/// requests, is its path's own failure: counted in full, halting nothing, and holding what is
+/// under it.
+#[test]
+fn a_create_its_request_carried_alone_turned_away_while_its_server_answers_is_its_own() {
+	let chunk = [create_at("a", None)];
+	let (_dir, mut plan) = staged_entries(&chunk);
+	let (borrowed, hold) = (borrowed_with_pair(), UndrivenHold::new());
+	let error = crate::Error::from(hold.runtime.block_on(status_error(503)));
+	let landed = run_chunk_with(
+		&borrowed,
+		&hold,
+		&chunk,
+		&mut plan,
+		ChunkRun {
+			answers: Some(all_failed(error, chunk.len())),
+			answered_by: Some("127.0.0.1"),
+			..ChunkRun::default()
+		},
+	);
+
+	assert_eq!(landed.report.halted, None, "{:?}", landed.report.errors);
+	assert_eq!(paths_of(&landed.report.failed_paths), ["a"]);
+	assert!(landed.report.transient_failures.is_empty());
+	assert_eq!(landed.failed.held, ["a"]);
+}
+
+/// An answer that came in while the chunk looked up its parents' links and shares shows nothing
+/// about the request that creates, sent after them: that request failing with no answer during it
+/// halts the pass.
+#[test]
+fn an_answer_while_the_chunk_looked_up_its_parents_shows_nothing_about_its_request() {
+	let chunk = [create_at("a", None), create_at("c", None)];
+	let (_dir, mut plan) = staged_entries(&chunk);
+	let (borrowed, hold) = (borrowed_with_pair(), UndrivenHold::new());
+	let error = crate::Error::from(hold.runtime.block_on(status_error(503)));
+	let landed = run_chunk_with(
+		&borrowed,
+		&hold,
+		&chunk,
+		&mut plan,
+		ChunkRun {
+			answers: Some(all_failed(error, chunk.len())),
+			answered_while_composing: Some("127.0.0.1"),
+			..ChunkRun::default()
+		},
+	);
+
+	assert_eq!(landed.report.halted, Some(HaltReason::RemoteUnavailable));
+	assert_eq!(paths_of(&landed.report.transient_failures), ["a", "c"]);
+	assert!(landed.report.failed_paths.is_empty());
+}
+
+/// A trash request the server turns away as a whole while it answers the client's other requests
+/// is one failure: classified once, it halts nothing and counts each item it carried only spaced
+/// out, however many it carried.
+#[tokio::test]
+async fn a_trash_request_turned_away_while_its_server_answers_counts_its_items_spaced_out() {
+	let borrowed = borrowed_with_rows(&["a.txt", "b.txt", "c.txt"]);
+	let chunk = [
+		trash_at("a.txt", NodeKind::File, Uuid::from_u128(1), None),
+		trash_at("b.txt", NodeKind::File, Uuid::from_u128(2), None),
+		trash_at("c.txt", NodeKind::File, Uuid::from_u128(3), None),
+	];
+	let (_dir, plan) = staged_entries(&chunk);
+	let error = crate::Error::from(status_error(503).await);
+	let trashed = run_trashes_answered(
+		&borrowed,
+		&chunk,
+		&plan,
+		Some(all_failed(error, chunk.len())),
+		Some("127.0.0.1"),
+	)
+	.await;
+
+	assert_eq!(trashed.report.halted, None, "{:?}", trashed.report.errors);
+	assert_eq!(
+		paths_of(&trashed.report.transient_failures),
+		["a.txt", "b.txt", "c.txt"]
+	);
+	assert!(trashed.report.failed_paths.is_empty());
+	assert_eq!(failures(&trashed.events), 3);
+}
+
+/// Each item of a trash request that the server answered item by item is classified on its own:
+/// one item's refusal is its path's, whatever the others got.
+#[tokio::test]
+async fn an_item_refused_inside_an_answered_request_is_its_own() {
+	let borrowed = borrowed_with_rows(&["a.txt", "b.txt"]);
+	let chunk = [
+		trash_at("a.txt", NodeKind::File, Uuid::from_u128(1), None),
+		trash_at("b.txt", NodeKind::File, Uuid::from_u128(2), None),
+	];
+	let (_dir, plan) = staged_entries(&chunk);
+	let refused = crate::Error::from(status_error(503).await);
+	let trashed = run_trashes_answered(
+		&borrowed,
+		&chunk,
+		&plan,
+		Some(vec![Err(refused), Ok(())]),
+		Some("127.0.0.1"),
+	)
+	.await;
+
+	assert_eq!(trashed.report.halted, None);
+	assert_eq!(paths_of(&trashed.report.failed_paths), ["a.txt"]);
+	assert!(trashed.report.transient_failures.is_empty());
+	assert_eq!(trashed.report.remotely_trashed, 1);
+}
+
 /// What landed is recorded for the engine to end streaks by, but only where a success ends one:
 /// the list stays as long as the paths with a streak, not as the pass.
 #[test]
@@ -3389,4 +3794,29 @@ fn a_landing_is_recorded_only_where_it_ends_a_streak() {
 	note_written(&ctx, &plan, &upload("streaked.txt"), &mut report);
 	note_written(&ctx, &plan, &upload("clean.txt"), &mut report);
 	assert_eq!(report.landed, ["streaked.txt"]);
+}
+
+/// A halt is the pass's, not the server's: a transfer taken for its server's outage holds back
+/// the remote actions after it on every server, here a trash bound for the gateway, which
+/// answers. The trash is held, not failed and not counted, and the next pass plans it again.
+#[tokio::test(start_paused = true)]
+async fn a_transfer_taken_for_its_servers_outage_holds_the_other_servers_work_too() {
+	let (report, events) = refused_pass(
+		1,
+		false,
+		&[download_of(1, "x.bin"), trash("old.bin", NodeKind::File)],
+		|event, answers| {
+			if matches!(event, SyncEvent::ActionFailed { .. }) {
+				answers.note_answer_from("gateway.filen.io");
+			}
+		},
+	)
+	.await;
+
+	assert_eq!(report.halted, Some(HaltReason::RemoteUnavailable));
+	assert_eq!(paths_of(&report.transient_failures), ["x.bin"]);
+	assert!(report.failed_paths.is_empty(), "{:?}", report.failed_paths);
+	assert_eq!(failures(&events), 1);
+	assert_eq!(report.remotely_trashed, 0);
+	assert_eq!(report.interrupted, 0);
 }
