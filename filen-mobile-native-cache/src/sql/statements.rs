@@ -112,6 +112,91 @@ pub(crate) const SELECT_IS_PERMANENTLY_DELETED: &str = "SELECT EXISTS (
 		SELECT 1 FROM items WHERE items.parent = ?2 AND items.trashed = FALSE
 	)
 );";
+// Pinned items: what the user asked to keep on the device. A directory pin covers everything
+// below it. Lives OUTSIDE init.sql: an init.sql edit flips DB_INIT_HASH and wipes the account's
+// cache, and every pin with it.
+/// Created by `configure_conn`, like the slot-remint table. Keyed by the whole-life id the
+/// providers persist — a directory's uuid, a file's stable id — so a remote content edit that
+/// re-mints a file's uuid keeps its pin. `kind` is `items.type`, as in `tombstones`.
+pub(crate) const CREATE_PINNED_ITEMS_TABLE: &str = "CREATE TABLE IF NOT EXISTS pinned_items (
+	kind SMALLINT NOT NULL,
+	item_id BLOB NOT NULL,
+	PRIMARY KEY (kind, item_id)
+) WITHOUT ROWID;";
+/// Pins the dir or file whose CURRENT uuid is `?1`.
+pub(crate) const INSERT_PINNED_ITEM: &str = "INSERT OR IGNORE INTO pinned_items (kind, item_id)
+SELECT type, COALESCE(stable_uuid, uuid) FROM items WHERE uuid = ?1 AND type != 0;";
+pub(crate) const DELETE_PINNED_ITEM: &str = "DELETE FROM pinned_items
+WHERE (kind, item_id) IN (
+	SELECT type, COALESCE(stable_uuid, uuid) FROM items WHERE uuid = ?1
+);";
+pub(crate) const SELECT_PINNED_ITEM_IDS: &str = "SELECT item_id FROM pinned_items;";
+/// Drops the pins of a row and of everything deleting that row takes with it. Paired with the
+/// DELETE in `sql::delete_item`, in one transaction, and walks exactly what the cascade reaches
+/// (see `clear_pending_upload_subtree.sql`). A file's stable id another row still carries keeps
+/// its pin: duplicate stable ids are legal, and the survivor is the same file.
+pub(crate) const DELETE_PINNED_SUBTREE: &str = "WITH RECURSIVE doomed (uuid) AS (
+	SELECT ?1 AS uuid
+	UNION
+	SELECT i.uuid
+	FROM items AS i
+	INNER JOIN doomed AS d ON i.parent = d.uuid
+	WHERE i.trashed = FALSE
+)
+DELETE FROM pinned_items
+WHERE (kind, item_id) IN (
+	SELECT items.type, COALESCE(items.stable_uuid, items.uuid) FROM items
+	WHERE items.uuid IN (SELECT uuid FROM doomed)
+		AND NOT EXISTS (
+			SELECT 1 FROM items AS survivor
+			WHERE survivor.stable_uuid = items.stable_uuid
+				AND survivor.uuid NOT IN (SELECT uuid FROM doomed)
+		)
+);";
+/// Every live item a pin covers: the pinned rows themselves, then everything under a pinned
+/// directory. A trashed row ends the walk — the trash is not something to keep — and `UNION`
+/// both folds a pin nested inside another and keeps the walk from revisiting a row.
+macro_rules! pinned_tree {
+	() => {
+		"WITH RECURSIVE pinned_tree (uuid, type) AS (
+	SELECT items.uuid, items.type FROM pinned_items
+	INNER JOIN items ON items.uuid = pinned_items.item_id AND items.type = 1
+	WHERE pinned_items.kind = 1 AND items.trashed = FALSE
+	UNION
+	SELECT items.uuid, items.type FROM pinned_items
+	INNER JOIN items ON items.stable_uuid = pinned_items.item_id AND items.type = 2
+	WHERE pinned_items.kind = 2 AND items.trashed = FALSE
+	UNION
+	SELECT items.uuid, items.type FROM pinned_tree
+	INNER JOIN items ON items.parent = pinned_tree.uuid
+	WHERE pinned_tree.type = 1 AND items.trashed = FALSE
+)
+"
+	};
+}
+/// The current uuid of every file a pin covers: the cache slots the size sweep leaves alone.
+pub(crate) const SELECT_PINNED_FILE_UUIDS: &str = concat!(
+	pinned_tree!(),
+	"SELECT uuid FROM pinned_tree WHERE type = 2;"
+);
+/// The stable id of every covered file with no bytes on the device and no outstanding edit.
+pub(crate) const SELECT_PINNED_FILES_TO_FETCH: &str = concat!(
+	pinned_tree!(),
+	"SELECT items.stable_uuid FROM pinned_tree
+INNER JOIN items ON items.uuid = pinned_tree.uuid
+WHERE pinned_tree.type = 2
+	AND items.materialised_at IS NULL
+	AND items.pending_upload_at IS NULL;"
+);
+/// The uuid of every covered directory this cache has never listed, whose files it therefore
+/// cannot name yet.
+pub(crate) const SELECT_PINNED_DIRS_TO_LIST: &str = concat!(
+	pinned_tree!(),
+	"SELECT pinned_tree.uuid FROM pinned_tree
+INNER JOIN items ON items.uuid = pinned_tree.uuid
+INNER JOIN dirs ON dirs.id = items.id
+WHERE pinned_tree.type = 1 AND dirs.last_listed = 0;"
+);
 pub(crate) const MARK_PENDING_UPLOAD: &str = include_str!("../../sql/mark_pending_upload.sql");
 pub(crate) const CLEAR_PENDING_UPLOAD: &str = include_str!("../../sql/clear_pending_upload.sql");
 pub(crate) const CLEAR_PENDING_UPLOAD_BY_UUID: &str =

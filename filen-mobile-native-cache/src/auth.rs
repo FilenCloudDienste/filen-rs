@@ -319,6 +319,9 @@ pub(crate) fn configure_conn(conn: &Connection) -> Result<(), rusqlite::Error> {
 	conn.execute_batch(sql::statements::CREATE_SLOT_REMINTS_TABLE)?;
 	// Also outside init.sql (see the statement), so also created here, for every connection.
 	conn.execute_batch(sql::statements::CREATE_PERMANENT_DELETIONS_TABLE)?;
+	// Also outside init.sql, so a schema change does not take the user's pins with the cache;
+	// created here because the size sweep reads it on every connection.
+	conn.execute_batch(sql::statements::CREATE_PINNED_ITEMS_TABLE)?;
 	conn.create_scalar_function(
 		"uuid_text",
 		1,

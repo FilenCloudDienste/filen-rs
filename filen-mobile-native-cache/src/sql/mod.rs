@@ -180,6 +180,10 @@ pub(crate) fn delete_item(conn: &mut Connection, item_uuid: Uuid) -> Result<(), 
 	let tx = conn.transaction()?;
 	tx.prepare_cached(CLEAR_PENDING_UPLOAD_SUBTREE)?
 		.execute([item_uuid])?;
+	// A pin names something the user asked to keep; once the server has deleted it for good
+	// there is nothing left to keep.
+	tx.prepare_cached(DELETE_PINNED_SUBTREE)?
+		.execute([item_uuid])?;
 	let (_, before) = select_change_meta(&tx)?;
 	tx.prepare_cached(DELETE_BY_UUID)?.execute([item_uuid])?;
 	let (_, after) = select_change_meta(&tx)?;
@@ -388,6 +392,52 @@ where
 	let mut stmt = conn.prepare_cached(CLEAR_MATERIALISED_NOT_IN_CACHE)?;
 	stmt.execute((uuids_json_array(uuids), listed_at_millis))?;
 	Ok(())
+}
+
+/// Pins or unpins the dir or file whose current uuid is `uuid`. Both are idempotent; pinning a
+/// uuid with no dir or file row pins nothing, so the caller checks the row first.
+pub(crate) fn set_pinned(
+	conn: &Connection,
+	uuid: Uuid,
+	pinned: bool,
+) -> Result<(), rusqlite::Error> {
+	let mut stmt = conn.prepare_cached(if pinned {
+		INSERT_PINNED_ITEM
+	} else {
+		DELETE_PINNED_ITEM
+	})?;
+	stmt.execute([uuid])?;
+	Ok(())
+}
+
+/// The whole-life id of every pin: a directory's uuid, a file's stable id.
+pub(crate) fn select_pinned_item_ids(conn: &Connection) -> Result<Vec<Uuid>, rusqlite::Error> {
+	select_uuids(conn, SELECT_PINNED_ITEM_IDS)
+}
+
+/// The cache slot (current uuid) of every file a pin covers; see [`SELECT_PINNED_FILE_UUIDS`].
+pub(crate) fn select_pinned_file_uuids(
+	conn: &Connection,
+) -> Result<std::collections::HashSet<Uuid>, rusqlite::Error> {
+	let mut stmt = conn.prepare_cached(SELECT_PINNED_FILE_UUIDS)?;
+	stmt.query_map([], |row| row.get(0))?.collect()
+}
+
+/// See [`SELECT_PINNED_FILES_TO_FETCH`].
+pub(crate) fn select_pinned_files_to_fetch(
+	conn: &Connection,
+) -> Result<Vec<Uuid>, rusqlite::Error> {
+	select_uuids(conn, SELECT_PINNED_FILES_TO_FETCH)
+}
+
+/// See [`SELECT_PINNED_DIRS_TO_LIST`].
+pub(crate) fn select_pinned_dirs_to_list(conn: &Connection) -> Result<Vec<Uuid>, rusqlite::Error> {
+	select_uuids(conn, SELECT_PINNED_DIRS_TO_LIST)
+}
+
+fn select_uuids(conn: &Connection, sql: &str) -> Result<Vec<Uuid>, rusqlite::Error> {
+	let mut stmt = conn.prepare_cached(sql)?;
+	stmt.query_map([], |row| row.get(0))?.collect()
 }
 
 /// Installs the slot-remint log (see [`statements::INSTALL_SLOT_REMINT_LOG`]) on a connection.
@@ -1033,3 +1083,6 @@ mod slot_remint_tests;
 
 #[cfg(test)]
 mod working_set_predicate_tests;
+
+#[cfg(test)]
+mod pinned_items_tests;

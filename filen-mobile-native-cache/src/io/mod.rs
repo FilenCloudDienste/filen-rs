@@ -167,7 +167,7 @@ pub(crate) async fn update_task(
 /// included) controls it: one that is not a single path component (`..`, `/abs`, `a/b`, empty)
 /// would escape `cache_dir` once joined, so it falls back to the uuid like an undecryptable
 /// (`None`) name does.
-fn cached_file_path(cache_dir: &Path, uuid: &str, name: Option<&str>) -> PathBuf {
+pub(crate) fn cached_file_path(cache_dir: &Path, uuid: &str, name: Option<&str>) -> PathBuf {
 	let name = name.filter(|n| is_safe_descendant(n)).unwrap_or(uuid);
 	cache_dir.join(uuid).join(name)
 }
@@ -1019,14 +1019,35 @@ where
 	Ok(total_size)
 }
 
-async fn remove_old_cache_files(cache_dir: &Path, size_budget: u64) {
-	if let Err(e) = remove_old_files(cache_dir, size_budget, count_cache_files).await {
+/// The size sweep over the content cache. The slots of pinned files (`pinned`, see
+/// [`sql::select_pinned_file_uuids`]) are left out entirely, neither evicted nor charged against
+/// the budget: the user asked to keep them, and counting them would push every unpinned file out
+/// in their place. The budget bounds what the cache keeps on its own account.
+async fn remove_old_cache_files(
+	cache_dir: &Path,
+	size_budget: u64,
+	pinned: &std::collections::HashSet<Uuid>,
+) {
+	let unpinned = async |dir: &Path| {
+		let mut files = count_cache_files(dir).await?;
+		files.retain(|(path, _, _)| !is_pinned_slot(path, pinned));
+		Ok(files)
+	};
+	if let Err(e) = remove_old_files(cache_dir, size_budget, unpinned).await {
 		error!(
 			"Failed to remove old cache files in {}: {}",
 			cache_dir.display(),
 			e
 		);
 	}
+}
+
+/// Whether a cache file (`cache/<uuid>/<name>`) sits in the slot of a pinned file.
+fn is_pinned_slot(path: &Path, pinned: &std::collections::HashSet<Uuid>) -> bool {
+	path.parent()
+		.and_then(Path::file_name)
+		.and_then(|slot| Uuid::from_str(&slot.to_string_lossy()).ok())
+		.is_some_and(|slot| pinned.contains(&slot))
 }
 
 async fn remove_old_thumbnails(thumbnail_dir: &Path, size_budget: u64) {
@@ -1112,11 +1133,23 @@ impl AuthCacheState {
 		// under its current uuid instead of clearing the row's marker.
 		self.rescue_reminted_slots().await;
 
+		// Read before the sweeps, and a failed read skips the size sweep this round: sweeping
+		// without it would take the very files the user asked to keep.
+		let pinned = sql::select_pinned_file_uuids(&self.conn())
+			.inspect_err(|e| {
+				error!("Failed to read the pinned files, skipping the size sweep: {e}")
+			})
+			.ok();
+
 		futures::join!(
 			cleanup_uuid_dir(self, &self.cache_dir),
 			cleanup_uuid_dir(self, &self.tmp_dir),
 			remove_stale_staging(&self.tmp_dir, STAGING_MAX_AGE),
-			remove_old_cache_files(&self.cache_dir, self.cache_file_budget,),
+			async {
+				if let Some(pinned) = &pinned {
+					remove_old_cache_files(&self.cache_dir, self.cache_file_budget, pinned).await;
+				}
+			},
 			remove_old_thumbnails(&self.thumbnail_dir, self.thumbnail_file_budget,),
 			cleanup_uuid_dir(self, &self.thumbnail_dir)
 		);
@@ -1485,6 +1518,45 @@ mod tests {
 			total, 400,
 			"both evicted sizes come off the total, the second on its own turn"
 		);
+
+		std::fs::remove_dir_all(&dir).unwrap();
+	}
+
+	/// A content-cache slot, `cache/<uuid>/<name>`, last touched `age` ago.
+	fn slot(dir: &Path, byte: u8, bytes: usize, age: Duration) -> (Uuid, PathBuf) {
+		let uuid = Uuid::from_bytes([byte; 16]);
+		let path = thumbnail(dir, &uuid.to_string(), "name", bytes, age);
+		(uuid, path)
+	}
+
+	/// A pinned slot is never evicted, however old, and its bytes are not charged against the
+	/// budget: here the unpinned files fit it on their own, so nothing goes.
+	#[tokio::test]
+	async fn pinned_slots_are_neither_evicted_nor_charged() {
+		let dir = std::env::temp_dir().join(format!("filen-pinned-sweep-{}", std::process::id()));
+		std::fs::create_dir_all(&dir).unwrap();
+		let hour = Duration::from_secs(3600);
+		let (pinned_uuid, pinned) = slot(&dir, 1, 1000, 10 * hour);
+		let unpinned: Vec<_> = (2..8).map(|byte| slot(&dir, byte, 100, hour).1).collect();
+		let pins = std::collections::HashSet::from([pinned_uuid]);
+
+		remove_old_cache_files(&dir, 601, &pins).await;
+
+		assert!(pinned.exists(), "the pinned slot was evicted");
+		for path in &unpinned {
+			assert!(
+				path.exists(),
+				"{} was evicted to make room for pinned bytes",
+				path.display()
+			);
+		}
+
+		// Over budget the unpinned files go, oldest first, and the pinned one still stays.
+		remove_old_cache_files(&dir, 0, &pins).await;
+
+		assert!(pinned.exists(), "the pinned slot was evicted over budget");
+		let left = unpinned.iter().filter(|path| path.exists()).count();
+		assert_eq!(left, MIN_CACHED_FILES - 1, "the sweep stops at the floor");
 
 		std::fs::remove_dir_all(&dir).unwrap();
 	}

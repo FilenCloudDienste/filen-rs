@@ -9,7 +9,7 @@ use crate::{
 	CacheError,
 	auth::{AuthCacheState, FilenMobileCacheState},
 	ffi::{
-		FfiChanges, FfiId, FfiObject, FfiRoot, FfiWorkingSet, QueryChildrenResponse,
+		FfiChanges, FfiId, FfiObject, FfiRoot, FfiWorkingSet, ItemType, QueryChildrenResponse,
 		QueryNonDirChildrenResponse,
 	},
 	sql::{
@@ -88,6 +88,47 @@ impl FilenMobileCacheState {
 	) -> Result<FfiObject, CacheError> {
 		self.sync_execute_authed(|auth_state| {
 			auth_state.insert_into_local_data_for_path(path, key, value)
+		})
+	}
+
+	/// Pins (`pinned`) or unpins a dir or file: the user asked to keep it, and for a dir everything
+	/// below it, on the device. The cached bytes of every file a pin covers are exempt from the
+	/// size sweep.
+	///
+	/// `id` takes the forms [`resolve_uuid_or_stable`] does. The pin is keyed by the item's
+	/// whole-life id, so content edits, moves and renames keep it. Purely local, and idempotent
+	/// both ways. Pinning needs the row: [`CacheError::DoesNotExist`] when the cache does not hold
+	/// it, [`CacheError::Unsupported`] for a root. Unpinning an id with no row is a no-op.
+	pub fn set_pinned(&self, id: &str, pinned: bool) -> Result<(), CacheError> {
+		self.sync_execute_authed(|auth_state| auth_state.set_pinned(id, pinned))
+	}
+
+	/// Every pin, as `stable/<id>`, the form the providers identify items by. A permanent delete
+	/// drops the pins it takes; a row that only leaves the cache keeps its pin listed.
+	pub fn pinned_ids(&self) -> Result<Vec<String>, CacheError> {
+		self.sync_execute_authed(|auth_state| {
+			Ok(stable_ids(sql::select_pinned_item_ids(&auth_state.conn())?))
+		})
+	}
+
+	/// The files a pin covers whose bytes are not on the device, as `stable/<id>`: what to
+	/// download to honour the pins. Only files the cache knows; see [`Self::pinned_dirs_to_list`].
+	pub fn pinned_files_to_fetch(&self) -> Result<Vec<String>, CacheError> {
+		self.sync_execute_authed(|auth_state| {
+			Ok(stable_ids(sql::select_pinned_files_to_fetch(
+				&auth_state.conn(),
+			)?))
+		})
+	}
+
+	/// The directories a pin covers that the cache has never listed, as `stable/<id>`. Listing
+	/// them until this comes back empty is what lets [`Self::pinned_files_to_fetch`] name every
+	/// covered file.
+	pub fn pinned_dirs_to_list(&self) -> Result<Vec<String>, CacheError> {
+		self.sync_execute_authed(|auth_state| {
+			Ok(stable_ids(sql::select_pinned_dirs_to_list(
+				&auth_state.conn(),
+			)?))
 		})
 	}
 
@@ -170,6 +211,12 @@ impl FilenMobileCacheState {
 			Ok(FfiWorkingSet { anchor, items })
 		})
 	}
+}
+
+fn stable_ids(ids: Vec<Uuid>) -> Vec<String> {
+	ids.into_iter()
+		.map(|id| format!("{STABLE_PREFIX}{id}"))
+		.collect()
 }
 
 /// The namespace an id uses to name a row outright, where every other id form describes a
@@ -407,6 +454,29 @@ impl AuthCacheState {
 			parent: dir.into(),
 			objects: children.into_iter().map(Into::into).collect(),
 		}))
+	}
+
+	pub(crate) fn set_pinned(&self, id: &str, pinned: bool) -> Result<(), CacheError> {
+		debug!("Setting pinned = {pinned} for {id}");
+		let conn = self.conn();
+		let uuid = resolve_uuid_or_stable(&conn, id)?;
+		if pinned {
+			match RawDBItem::select(&conn, uuid)? {
+				None => {
+					return Err(CacheError::DoesNotExist(
+						format!("No item to pin for id: {id}").into(),
+					));
+				}
+				Some(item) if item.type_ == ItemType::Root => {
+					return Err(CacheError::Unsupported(
+						format!("A root cannot be pinned: {id}").into(),
+					));
+				}
+				Some(_) => {}
+			}
+		}
+		sql::set_pinned(&conn, uuid, pinned)?;
+		Ok(())
 	}
 
 	pub(crate) fn query_recents(
