@@ -71,6 +71,47 @@ pub(crate) const DELETE_SLOT_REMINT: &str = "DELETE FROM slot_remints WHERE id =
 /// the row's bytes may be sitting in a slot the rescue has not moved yet.
 pub(crate) const SLOT_REMINT_TARGETS_UUID: &str =
 	"SELECT EXISTS (SELECT 1 FROM slot_remints WHERE new_uuid = ?);";
+// Permanent-deletion log: the sequence ranges whose tombstones a server-confirmed
+// deletion wrote, so every id it retired (the whole subtree, through the delete
+// cascade) answers as gone without asking the server, whose answer for a
+// descendant of a permanently deleted directory is `trash: true`, naming a
+// trashed item no trash listing contains. A tombstone counts only while it still
+// carries the sequence that deletion gave it: an id that resolves again loses
+// its tombstone, and a later retirement re-stamps it outside the range. Lives
+// OUTSIDE init.sql: a database without it just has no ranges, which is no reason
+// for the full wipe and resync an init.sql hash change forces.
+/// Created by `configure_conn`, like the slot-remint table.
+pub(crate) const CREATE_PERMANENT_DELETIONS_TABLE: &str =
+	"CREATE TABLE IF NOT EXISTS permanent_deletions (
+	through_seq INTEGER PRIMARY KEY,
+	after_seq INTEGER NOT NULL
+);";
+/// Moves the end of the range ending at `?1` to `?2`: back-to-back deletions share one row.
+pub(crate) const EXTEND_PERMANENT_DELETION: &str =
+	"UPDATE permanent_deletions SET through_seq = ?2 WHERE through_seq = ?1;";
+pub(crate) const INSERT_PERMANENT_DELETION: &str =
+	"INSERT INTO permanent_deletions (after_seq, through_seq) VALUES (?1, ?2);";
+/// Whether the provider id `?2` of kind `?1` (as in `tombstones`) was retired by a permanent
+/// deletion and still is. Ranges are disjoint, so the first one ending at or above the
+/// tombstone's sequence is the only one that can hold it: one step down the primary key.
+///
+/// A non-trashed row filed under the id lifts it: a listing, search or recents answer that put
+/// something live under that directory shows it is not gone (a cascade can reach a child that
+/// moved away remotely without this cache knowing), and the server is asked as before. Trashed
+/// rows stay filed under their original parent, so they do not count. A file has no children,
+/// so for one the guard always holds.
+pub(crate) const SELECT_IS_PERMANENTLY_DELETED: &str = "SELECT EXISTS (
+	SELECT 1 FROM tombstones
+	WHERE tombstones.kind = ?1 AND tombstones.item_id = ?2
+	AND tombstones.seq > (
+		SELECT permanent_deletions.after_seq FROM permanent_deletions
+		WHERE permanent_deletions.through_seq >= tombstones.seq
+		ORDER BY permanent_deletions.through_seq ASC LIMIT 1
+	)
+	AND NOT EXISTS (
+		SELECT 1 FROM items WHERE items.parent = ?2 AND items.trashed = FALSE
+	)
+);";
 pub(crate) const MARK_PENDING_UPLOAD: &str = include_str!("../../sql/mark_pending_upload.sql");
 pub(crate) const CLEAR_PENDING_UPLOAD: &str = include_str!("../../sql/clear_pending_upload.sql");
 pub(crate) const CLEAR_PENDING_UPLOAD_BY_UUID: &str =

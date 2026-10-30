@@ -1411,3 +1411,181 @@ fn the_uuid_overwrite_cascade_spares_pending_children() {
 		"the dir's retired uuid and its clean child are tombstoned; the pending child is not"
 	);
 }
+
+/// Whether resolving `id` would be answered as gone without asking the server, for each form the
+/// unknown-id probe checks: a dir's uuid, a file's stable id.
+fn known_gone(conn: &Connection, kind: ItemType, id: Uuid) -> bool {
+	is_permanently_deleted(conn, kind, id).unwrap()
+}
+
+/// After a permanent delete the server reports a descendant as trashed, though no trash listing
+/// holds it: asked, it would come back as a ghost in the trash. Every id the cascade retired,
+/// at any depth, has to be answered from the cache as gone.
+#[test]
+fn a_permanent_delete_answers_for_its_whole_subtree() {
+	let mut conn = db();
+	add_dir(&conn, uuid(1), uuid(9), "deleted");
+	add_file(&conn, uuid(2), stable(3), uuid(1), "child.txt");
+	add_dir(&conn, uuid(4), uuid(1), "nested");
+	add_file(&conn, uuid(5), stable(6), uuid(4), "grandchild.txt");
+
+	delete_item(&mut conn, uuid(1)).unwrap();
+
+	assert!(known_gone(&conn, ItemType::Dir, uuid(1)), "the deleted dir");
+	assert!(known_gone(&conn, ItemType::File, uuid(3)), "its file");
+	assert!(known_gone(&conn, ItemType::Dir, uuid(4)), "its subdir");
+	assert!(
+		known_gone(&conn, ItemType::File, uuid(6)),
+		"the file below that"
+	);
+	assert!(
+		!known_gone(&conn, ItemType::Dir, uuid(3)),
+		"a file's stable id is not a dir's uuid"
+	);
+}
+
+/// A trash is not a permanent delete: the row stays, trashed, and an id the trash relisting
+/// swept is still asked about, so the server's trashed answer stands. A trashed child the
+/// cascade spares keeps its row too.
+#[test]
+fn a_trashed_item_is_never_taken_for_permanently_deleted() {
+	let mut conn = db();
+	add_dir(&conn, uuid(1), uuid(9), "deleted");
+	add_file(&conn, uuid(2), stable(3), uuid(1), "trashed-before.txt");
+	conn.execute(
+		"UPDATE items SET trashed = TRUE WHERE uuid = ?1;",
+		[uuid(2)],
+	)
+	.unwrap();
+	add_file(&conn, uuid(4), stable(5), uuid(9), "trashed-elsewhere.txt");
+	conn.execute(
+		"UPDATE items SET trashed = TRUE WHERE uuid = ?1;",
+		[uuid(4)],
+	)
+	.unwrap();
+
+	delete_item(&mut conn, uuid(1)).unwrap();
+	let spared: bool = conn
+		.query_row(
+			"SELECT trashed FROM items WHERE uuid = ?1;",
+			[uuid(2)],
+			|r| r.get(0),
+		)
+		.unwrap();
+	assert!(
+		spared,
+		"the cascade spares a trashed child, and it stays trashed"
+	);
+	assert!(!known_gone(&conn, ItemType::File, uuid(3)));
+
+	assert!(
+		!known_gone(&conn, ItemType::File, uuid(5)),
+		"a trashed item is not gone"
+	);
+	conn.execute(MARK_STALE_TRASHED, []).unwrap();
+	conn.execute(DELETE_STALE_TRASHED, []).unwrap();
+	assert!(
+		retired(&conn).contains(&(2, uuid(5))),
+		"the trash relisting retired it"
+	);
+	assert!(
+		!known_gone(&conn, ItemType::File, uuid(5)),
+		"but a sweep is not the server saying gone, so it is still asked about"
+	);
+}
+
+/// A listing that stopped mentioning a dir is no proof it is gone: it may have moved somewhere
+/// this cache never listed. Its id stays one the server is asked about.
+#[test]
+fn a_listing_sweep_is_not_a_permanent_delete() {
+	let conn = db();
+	add_dir(&conn, uuid(1), uuid(9), "moved-away");
+	conn.execute(MARK_STALE_WITH_PARENT, [uuid(9)]).unwrap();
+	conn.execute(DELETE_STALE_WITH_PARENT, [uuid(9)]).unwrap();
+
+	assert_eq!(retired(&conn), vec![(1, uuid(1))]);
+	assert!(!known_gone(&conn, ItemType::Dir, uuid(1)));
+}
+
+/// An id that resolves again loses its tombstone, and with it the permanent-delete answer; a
+/// later retirement stamps a fresh sequence, outside the range the delete logged.
+#[test]
+fn an_id_that_resolves_again_is_no_longer_permanently_deleted() {
+	let mut conn = db();
+	add_dir(&conn, uuid(1), uuid(9), "deleted");
+	add_dir(&conn, uuid(4), uuid(1), "nested");
+	delete_item(&mut conn, uuid(1)).unwrap();
+	assert!(known_gone(&conn, ItemType::Dir, uuid(4)));
+
+	add_dir(&conn, uuid(4), uuid(8), "nested");
+	assert!(
+		!known_gone(&conn, ItemType::Dir, uuid(4)),
+		"it resolves again"
+	);
+
+	conn.execute(MARK_STALE_WITH_PARENT, [uuid(8)]).unwrap();
+	conn.execute(DELETE_STALE_WITH_PARENT, [uuid(8)]).unwrap();
+	assert!(retired(&conn).contains(&(1, uuid(4))));
+	assert!(
+		!known_gone(&conn, ItemType::Dir, uuid(4)),
+		"retired again, by a sweep this time"
+	);
+	assert!(
+		known_gone(&conn, ItemType::Dir, uuid(1)),
+		"the deleted dir itself is untouched"
+	);
+}
+
+/// A cascade can reach a dir that had moved away remotely without this cache knowing. A live
+/// row landing under it (from a search or recents answer) shows it exists, so the server is asked
+/// again. A trashed row filed under it shows nothing: trashed rows keep their original parent.
+#[test]
+fn a_live_row_under_a_permanently_deleted_dir_lifts_the_answer() {
+	let mut conn = db();
+	add_dir(&conn, uuid(1), uuid(9), "deleted");
+	add_dir(&conn, uuid(4), uuid(1), "moved-away");
+	delete_item(&mut conn, uuid(1)).unwrap();
+
+	conn.execute(
+		"INSERT INTO items (uuid, stable_uuid, parent, type, trashed)
+			VALUES (?1, ?2, ?3, 2, TRUE);",
+		rusqlite::params![uuid(5), stable(6), uuid(4)],
+	)
+	.unwrap();
+	assert!(known_gone(&conn, ItemType::Dir, uuid(4)));
+
+	add_file(&conn, uuid(7), stable(8), uuid(4), "found-in-recents.txt");
+	assert!(!known_gone(&conn, ItemType::Dir, uuid(4)));
+	assert!(known_gone(&conn, ItemType::Dir, uuid(1)));
+}
+
+/// One range per run of back-to-back deletes, so the log grows with the deletes that something
+/// else came between, not with every delete. A delete that found nothing logs nothing.
+#[test]
+fn back_to_back_permanent_deletes_share_one_range() {
+	let mut conn = db();
+	let ranges = |conn: &Connection| -> i64 {
+		conn.query_row("SELECT COUNT(*) FROM permanent_deletions;", [], |r| {
+			r.get(0)
+		})
+		.unwrap()
+	};
+	add_dir(&conn, uuid(1), uuid(9), "a");
+	add_dir(&conn, uuid(2), uuid(9), "b");
+	add_dir(&conn, uuid(3), uuid(9), "c");
+
+	delete_item(&mut conn, uuid(1)).unwrap();
+	delete_item(&mut conn, uuid(2)).unwrap();
+	assert_eq!(ranges(&conn), 1);
+
+	delete_item(&mut conn, uuid(7)).unwrap();
+	assert_eq!(ranges(&conn), 1, "nothing was deleted");
+
+	add_dir(&conn, uuid(4), uuid(9), "d");
+	delete_item(&mut conn, uuid(3)).unwrap();
+	assert_eq!(ranges(&conn), 2);
+	for dir in [1, 2, 3] {
+		assert!(known_gone(&conn, ItemType::Dir, uuid(dir)), "dir {dir}");
+	}
+	assert!(!known_gone(&conn, ItemType::Dir, uuid(4)));
+}

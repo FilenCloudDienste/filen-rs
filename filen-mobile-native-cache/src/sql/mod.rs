@@ -172,12 +172,39 @@ pub(crate) fn update_root(
 /// `materialised_at` is deliberately untouched: it is not part of the trigger's guard, because
 /// those bytes are a copy of what the server holds and evicting them along with the item is the
 /// point.
+///
+/// The sequences the delete spent are logged as a permanent deletion (see
+/// [`is_permanently_deleted`]): every caller runs it on the server's word that the item is gone
+/// for good. Nothing but this delete's triggers can move the counter inside the transaction.
 pub(crate) fn delete_item(conn: &mut Connection, item_uuid: Uuid) -> Result<(), rusqlite::Error> {
 	let tx = conn.transaction()?;
 	tx.prepare_cached(CLEAR_PENDING_UPLOAD_SUBTREE)?
 		.execute([item_uuid])?;
+	let (_, before) = select_change_meta(&tx)?;
 	tx.prepare_cached(DELETE_BY_UUID)?.execute([item_uuid])?;
+	let (_, after) = select_change_meta(&tx)?;
+	if after != before
+		&& tx
+			.prepare_cached(EXTEND_PERMANENT_DELETION)?
+			.execute([before, after])?
+			== 0
+	{
+		tx.prepare_cached(INSERT_PERMANENT_DELETION)?
+			.execute([before, after])?;
+	}
 	tx.commit()
+}
+
+/// Whether `id`, a provider id of kind `kind` (a dir's uuid, a file's stable id), was retired by
+/// [`delete_item`] and still names nothing, so the server's word on it is already known: gone.
+/// See [`statements::SELECT_IS_PERMANENTLY_DELETED`] for what lifts it.
+pub(crate) fn is_permanently_deleted(
+	conn: &Connection,
+	kind: ItemType,
+	id: Uuid,
+) -> Result<bool, rusqlite::Error> {
+	conn.prepare_cached(SELECT_IS_PERMANENTLY_DELETED)?
+		.query_one((kind, id), |row| row.get(0))
 }
 
 fn get_all_descendant_paths_with_stmt(

@@ -317,6 +317,8 @@ pub(crate) fn configure_conn(conn: &Connection) -> Result<(), rusqlite::Error> {
 	// OUTSIDE init.sql: an init.sql edit flips DB_INIT_HASH and wipes the account's cache, which
 	// is precisely the data the log protects.
 	conn.execute_batch(sql::statements::CREATE_SLOT_REMINTS_TABLE)?;
+	// Also outside init.sql (see the statement), so also created here, for every connection.
+	conn.execute_batch(sql::statements::CREATE_PERMANENT_DELETIONS_TABLE)?;
 	conn.create_scalar_function(
 		"uuid_text",
 		1,

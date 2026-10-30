@@ -62,7 +62,7 @@ use crate::{
 	auth::{AuthCacheState, FilenMobileCacheState},
 	ffi::{
 		CreateFileResponse, DirWithPathResponse, DownloadResponse, FfiId, FfiObject,
-		FileWithPathResponse, ObjectWithPathResponse, ParsedFfiId, PathFfiId,
+		FileWithPathResponse, ItemType, ObjectWithPathResponse, ParsedFfiId, PathFfiId,
 		QueryChildrenResponse, QueryNonDirChildrenResponse, SearchQueryArgs,
 		SearchQueryResponseEntry, UploadFileInfo,
 	},
@@ -1129,7 +1129,8 @@ impl AuthCacheState {
 	/// they describe locations only this cache can translate. The item lands through the same
 	/// upsert a refresh uses, which leaves it exactly as a listing would have — including a parent
 	/// we may still know nothing about, and which the next query resolves the same way, one level
-	/// per ask.
+	/// per ask. An id a permanent delete retired is answered as gone without asking (see
+	/// [`sql::is_permanently_deleted`]).
 	async fn resolve_unknown_id(&self, id: &FfiId) -> Result<Option<DBObject>, CacheError> {
 		let (addressed_stable, bare) = match id.0.strip_prefix(STABLE_PREFIX) {
 			Some(rest) => (true, rest),
@@ -1138,6 +1139,18 @@ impl AuthCacheState {
 		let Ok(uuid) = bare.parse::<Uuid>() else {
 			return Ok(None);
 		};
+		// A permanent delete already settled it, for the deleted item and everything under it.
+		// Asking again would cost a round trip per id and, for a descendant, get a wrong answer:
+		// the server reports it as trashed though no trash listing holds it.
+		let known_gone = {
+			let conn = self.conn();
+			sql::is_permanently_deleted(&conn, ItemType::Dir, uuid)?
+				|| (addressed_stable && sql::is_permanently_deleted(&conn, ItemType::File, uuid)?)
+		};
+		if known_gone {
+			debug!("{id} was permanently deleted; not asking the server");
+			return Ok(None);
+		}
 		match self.client.get_dir(uuid).await {
 			Ok(remote_dir) => {
 				debug!("Learned unlisted dir {uuid} from the server");
