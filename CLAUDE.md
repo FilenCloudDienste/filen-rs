@@ -165,6 +165,7 @@ Test notes:
 | `wasm-full` | Browser WASM build (with threads) |
 | `service-worker` | WASM service-worker build |
 | `multi-threaded-crypto` | `rayon` / `wasm-bindgen-rayon` parallel crypto |
+| `oslog` | The os_log sink (`tracing-oslog`) on every Apple target; iOS has it regardless. Off, macOS logs `fmt` to stdout, which the desktop app captures. `filen-mobile-native-cache` turns it on |
 | `archive` | Compress / extract (`fs::archive`) and its codec crates; `wasm-full` turns it on, and on wasm it refuses to build without `wasm-full` |
 | `malformed` | Test-only seams that put malformed state on the server on purpose (`create_malformed_dir` / `create_malformed_file` write arbitrary metadata, `create_dir_with_name_hash` bypasses the case-insensitive name dedup) — never enable in production |
 | `sync-engine` | Local folder <-> remote folder sync engine (`src/sync_engine/`); implies `cache`, adds the `notify` watcher; native only. Gates, with `uniffi`, the binding's `sync_engine_js_tests` |

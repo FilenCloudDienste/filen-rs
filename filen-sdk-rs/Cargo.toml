@@ -37,6 +37,9 @@ archive = [
 ]
 service-worker = ["filen-types/service-worker"]
 multi-threaded-crypto = ["dep:rayon", "dep:wasm-bindgen-rayon"]
+# Logs to Apple unified logging (os_log) on every Apple target, not only iOS. Off, the other
+# Apple targets log to stdout, which the desktop app captures into its log file.
+oslog = ["dep:tracing-oslog"]
 http-provider = ["dep:axum", "dep:axum-extra"]
 cache = ["dep:rusqlite", "dep:itertools", "filen-types/rusqlite"]
 # The folder<->folder sync engine (local <-> remote). Native-only (the module is cfg'd off on
@@ -301,6 +304,10 @@ notify = { version = "8.2.0", optional = true }
 [target.'cfg(target_os="ios")'.dependencies]
 # tracing -> Apple unified logging (os_log) sink
 tracing-oslog = "0.3"
+
+# The same sink on the other Apple targets, behind `oslog`
+[target.'cfg(all(target_vendor="apple", not(target_os="ios")))'.dependencies]
+tracing-oslog = { version = "0.3", optional = true }
 
 # android dependencies: the tracing -> logcat sink is a custom MakeWriter in src/obs/ over the
 # NDK `__android_log_write` (linked via `#[link(name = "log")]`), so no logging crate is needed.

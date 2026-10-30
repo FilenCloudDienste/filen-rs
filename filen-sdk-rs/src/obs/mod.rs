@@ -15,7 +15,8 @@
 //!   is wrapped in a [`reload`] layer. [`set_log_level`] flips verbosity live via the
 //!   stored [`reload::Handle`] — e.g. a "verbose logging" toggle on a device.
 //!
-//! - **Sinks (per target).** native desktop → `fmt` to stdout · iOS → `tracing-oslog` ·
+//! - **Sinks (per target).** native desktop → `fmt` to stdout · iOS (and other Apple targets
+//!   with the `oslog` feature) → `tracing-oslog` ·
 //!   Android → our own [`LogcatMakeWriter`](android) over the NDK `__android_log_write`
 //!   (no unmaintained crate) · wasm → `wasm-tracing` (console + Performance API; avoids
 //!   `fmt`'s `Instant::now()` panic on `wasm32-unknown-unknown`). On native targets,
@@ -169,7 +170,8 @@ where
 	#[cfg(all(
 		not(all(target_family = "wasm", target_os = "unknown")),
 		not(target_os = "android"),
-		not(target_os = "ios")
+		not(target_os = "ios"),
+		not(all(target_vendor = "apple", feature = "oslog"))
 	))]
 	{
 		base.with(
@@ -196,8 +198,8 @@ where
 		.is_ok()
 	}
 
-	// iOS: Apple unified logging (os_log) via tracing-oslog.
-	#[cfg(target_os = "ios")]
+	// iOS, and other Apple targets with `oslog`: Apple unified logging (os_log) via tracing-oslog.
+	#[cfg(any(target_os = "ios", all(target_vendor = "apple", feature = "oslog")))]
 	{
 		base.with(tracing_oslog::OsLogger::new(
 			"io.filen.filen-sdk-rs",
