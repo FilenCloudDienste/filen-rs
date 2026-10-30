@@ -12,7 +12,30 @@ use wasmtimer::std::Instant;
 
 use tower::Service;
 
-use crate::Error;
+use crate::{Error, ErrorKind};
+
+/// Whether a failed request's error is the server's not-found answer about an item. Probes expect
+/// it (`ResultExt::optional`), and a caller for whom it is a failure reports it itself, so it is
+/// logged at debug; every other failure stays at warn.
+pub(crate) fn is_not_found_answer(e: &Error) -> bool {
+	matches!(
+		e.kind(),
+		ErrorKind::FileNotFound | ErrorKind::FolderNotFound
+	)
+}
+
+/// A failed request's log line: `warn!`, or `debug!` for a not-found answer (see
+/// [`is_not_found_answer`]).
+macro_rules! log_request_failure {
+	($error:expr, $($arg:tt)+) => {
+		if $crate::auth::http::logging::is_not_found_answer($error) {
+			tracing::debug!($($arg)+)
+		} else {
+			tracing::warn!($($arg)+)
+		}
+	};
+}
+pub(crate) use log_request_failure;
 
 /// Monotonic per-request id, used to correlate the (possibly retried) log records of a single
 /// HTTP request as it crosses async boundaries and the retry/rate-limit layers.
@@ -71,7 +94,7 @@ where
 	fn call(&mut self, req: Req) -> Self::Future {
 		// An info-level span so the in-flight watchdog tracks the request at the default level
 		// (this is the "still running after Ns" hang signal). The span emits nothing on its own:
-		// success latency is the fmt layer's busy/idle on close, failures are the warn! below.
+		// success latency is the fmt layer's busy/idle on close, failures are logged below.
 		let span = tracing::info_span!(
 			"http_request",
 			endpoint = %self.endpoint,
@@ -110,7 +133,8 @@ where
 			Poll::Ready(Ok(res)) => Poll::Ready(Ok(res)),
 			Poll::Ready(Err(e)) => {
 				let e = e.with_context(this.endpoint.clone());
-				tracing::warn!(
+				log_request_failure!(
+					&e,
 					elapsed_ms = u64::try_from(this.started.elapsed().as_millis()).unwrap_or(u64::MAX),
 					error = %e,
 					"request failed",
@@ -119,5 +143,67 @@ where
 			}
 			Poll::Pending => Poll::Pending,
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use std::sync::{Arc, Mutex};
+
+	use filen_types::error::ResponseError;
+	use tracing::{Level, Subscriber};
+	use tracing_subscriber::{
+		layer::{Context, Layer, SubscriberExt},
+		registry,
+	};
+
+	use super::*;
+
+	/// Records the level of every event.
+	struct Levels(Arc<Mutex<Vec<Level>>>);
+
+	impl<S: Subscriber> Layer<S> for Levels {
+		fn on_event(&self, event: &tracing::Event<'_>, _: Context<'_, S>) {
+			self.0
+				.lock()
+				.expect("no test thread panics holding it")
+				.push(*event.metadata().level());
+		}
+	}
+
+	/// The levels a request failing with the server's `code` is logged at.
+	fn logged_levels(code: &str) -> Vec<Level> {
+		let levels = Arc::new(Mutex::new(Vec::new()));
+		let subscriber = registry().with(Levels(Arc::clone(&levels)));
+		let error = Error::from(ResponseError::ApiError {
+			message: None,
+			code: Some(code.to_owned()),
+		});
+		tracing::subscriber::with_default(subscriber, || {
+			let failed = LoggedFuture {
+				inner: std::future::ready(Err::<(), _>(error)),
+				span: tracing::Span::none(),
+				endpoint: "v3/dir".into(),
+				started: Instant::now(),
+			};
+			assert!(futures::executor::block_on(failed).is_err());
+		});
+		Arc::into_inner(levels)
+			.expect("the subscriber is gone")
+			.into_inner()
+			.expect("no test thread panics holding it")
+	}
+
+	#[test]
+	fn a_not_found_answer_is_logged_at_debug() {
+		assert_eq!(logged_levels("folder_not_found"), [Level::DEBUG]);
+		assert_eq!(logged_levels("invalid_folder"), [Level::DEBUG]);
+		assert_eq!(logged_levels("file_not_found"), [Level::DEBUG]);
+	}
+
+	#[test]
+	fn every_other_failure_is_still_logged_at_warn() {
+		assert_eq!(logged_levels("internal_error"), [Level::WARN]);
+		assert_eq!(logged_levels("api_key_not_found"), [Level::WARN]);
 	}
 }

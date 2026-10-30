@@ -1372,13 +1372,25 @@ impl AuthClient {
 			Reply::Item(Ok(data)) => Ok(data),
 			Reply::Item(Err(e)) => {
 				let e = e.with_context(endpoint);
-				tracing::warn!(endpoint, via = route.endpoint, error = %e, "request failed");
+				logging::log_request_failure!(
+					&e,
+					endpoint,
+					via = route.endpoint,
+					error = %e,
+					"request failed"
+				);
 				Err(e)
 			}
 			// no context of its own: the stand-in reads as the shared error, which names the
 			// bulk endpoint
 			Reply::Failed(e) => {
-				tracing::warn!(endpoint, via = route.endpoint, error = %e, "request failed");
+				logging::log_request_failure!(
+					&e,
+					endpoint,
+					via = route.endpoint,
+					error = %e,
+					"request failed"
+				);
 				Err(e)
 			}
 		}
