@@ -1016,7 +1016,17 @@ mod tests {
 
 		ensure_bindable(socket).await.unwrap();
 
-		assert_eq!(started.elapsed(), BIND_CHECK_PAUSE * 2);
+		// Bound on a retry after the release, before the window ran out. Which retry is the kernel's
+		// business (the port's release is not on the paused clock), so only the bounds are pinned.
+		let elapsed = started.elapsed();
+		assert!(
+			elapsed >= BIND_CHECK_PAUSE * 2,
+			"bound before the port was freed: {elapsed:?}"
+		);
+		assert!(
+			elapsed < BIND_CHECK_PAUSE * (BIND_CHECK_ATTEMPTS - 1),
+			"bound only at the last attempt or later: {elapsed:?}"
+		);
 		release.await.unwrap();
 	}
 
