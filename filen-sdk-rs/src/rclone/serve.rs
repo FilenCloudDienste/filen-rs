@@ -394,7 +394,7 @@ impl RcloneDaemon {
 		if !self.serve_types().await?.contains(&options.protocol) {
 			return Err(RcloneRefusal::UnsupportedProtocol.into());
 		}
-		ensure_bindable(listen.socket)?;
+		ensure_bindable(listen.socket).await?;
 		let ServeStarted { id, addr } = self
 			.rc
 			.serve_start(&serve_params(&options, &listen.addr, &self.vfs))
@@ -448,18 +448,35 @@ impl RcloneDaemon {
 	}
 }
 
+/// How often a port found in use is checked, and the pause between checks.
+const BIND_CHECK_ATTEMPTS: u32 = 5;
+const BIND_CHECK_PAUSE: Duration = Duration::from_millis(100);
+
 /// Refuses an address another process listens on, or one that is not this machine's.
-fn ensure_bindable(socket: SocketAddr) -> Result<(), Error> {
-	match TcpListener::bind(socket) {
-		Ok(_) => Ok(()),
-		Err(e) if e.kind() == io::ErrorKind::AddrInUse => Err(RcloneRefusal::PortInUse {
-			port: socket.port(),
+///
+/// A port found in use is checked again for about half a second before it is refused: the
+/// listener an earlier check opened is inherited by a child another thread of this process forks
+/// meanwhile, and stays open in it until it execs, after the check here has closed it.
+async fn ensure_bindable(socket: SocketAddr) -> Result<(), Error> {
+	let mut attempt = 1;
+	loop {
+		match TcpListener::bind(socket) {
+			Ok(_) => return Ok(()),
+			Err(e) if e.kind() == io::ErrorKind::AddrInUse => {
+				if attempt == BIND_CHECK_ATTEMPTS {
+					return Err(RcloneRefusal::PortInUse {
+						port: socket.port(),
+					}
+					.into());
+				}
+				attempt += 1;
+				tokio::time::sleep(BIND_CHECK_PAUSE).await;
+			}
+			Err(e) if e.kind() == io::ErrorKind::AddrNotAvailable => {
+				return Err(RcloneRefusal::AddressNotLocal.into());
+			}
+			Err(e) => return Err(Error::from(e).with_context(format!("failed to bind {socket}"))),
 		}
-		.into()),
-		Err(e) if e.kind() == io::ErrorKind::AddrNotAvailable => {
-			Err(RcloneRefusal::AddressNotLocal.into())
-		}
-		Err(e) => Err(Error::from(e).with_context(format!("failed to bind {socket}"))),
 	}
 }
 
@@ -965,12 +982,14 @@ mod tests {
 		);
 	}
 
-	#[test]
-	fn a_port_in_use_is_refused_before_rclone_sees_it() {
+	// On a paused clock: the pauses between checks pass at once, in order with the test's own.
+	#[tokio::test(start_paused = true)]
+	async fn a_port_in_use_for_the_whole_window_is_refused() {
 		let taken = TcpListener::bind("127.0.0.1:0").unwrap();
 		let socket = taken.local_addr().unwrap();
+		let started = tokio::time::Instant::now();
 
-		let error = ensure_bindable(socket).unwrap_err();
+		let error = ensure_bindable(socket).await.unwrap_err();
 
 		assert_eq!(
 			error.downcast_ref::<RcloneRefusal>(),
@@ -978,6 +997,27 @@ mod tests {
 				port: socket.port()
 			})
 		);
+		assert_eq!(
+			started.elapsed(),
+			BIND_CHECK_PAUSE * (BIND_CHECK_ATTEMPTS - 1)
+		);
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn a_port_freed_within_the_window_is_bindable() {
+		let taken = TcpListener::bind("127.0.0.1:0").unwrap();
+		let socket = taken.local_addr().unwrap();
+		// Freed between the second check and the third.
+		let release = tokio::spawn(async move {
+			tokio::time::sleep(BIND_CHECK_PAUSE * 3 / 2).await;
+			drop(taken);
+		});
+		let started = tokio::time::Instant::now();
+
+		ensure_bindable(socket).await.unwrap();
+
+		assert_eq!(started.elapsed(), BIND_CHECK_PAUSE * 2);
+		release.await.unwrap();
 	}
 
 	#[test]

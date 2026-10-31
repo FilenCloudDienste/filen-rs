@@ -16,7 +16,7 @@
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt as _;
 use std::{
-	collections::VecDeque,
+	collections::{BTreeSet, VecDeque},
 	ffi::{OsStr, OsString},
 	path::{Path, PathBuf},
 	process::Stdio,
@@ -57,7 +57,7 @@ use crate::{
 		rc::{CoreStatsTransfer, RcClient},
 		recovery::{HTPASSWD_FILE, PIDFILE, PidRecord, force_unmount, recover_stale},
 		serve::ServeInfo,
-		system::identify,
+		system::{identify, spawn_rclone},
 		vfs::VfsTuning,
 		watchdog::{self, Watchdog},
 	},
@@ -188,8 +188,9 @@ pub struct RcloneTransfer {
 #[js_type(import, no_ser, no_default, napi)]
 pub struct StopOptions {
 	/// With `Some`, how long, in milliseconds, uploads waiting in the VFS cache may finish before
-	/// rclone is asked to quit. Whatever is still waiting then stays in the cache and is uploaded
-	/// by the next daemon on it.
+	/// rclone is asked to quit: files queued or being uploaded, and files written and not queued
+	/// yet, as one whose writer has just closed it or still holds it open. Whatever is still
+	/// waiting then stays in the cache and is uploaded by the next daemon on it.
 	pub drain_timeout_ms: Option<u32>,
 	/// How long, in milliseconds, rclone has to quit once asked before it is killed.
 	pub grace_ms: u32,
@@ -199,8 +200,10 @@ pub struct StopOptions {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[js_type(export, no_deser, no_default, napi)]
 pub struct StopReport {
-	/// Uploads still waiting in the VFS cache when rclone was asked to quit (in progress and
-	/// queued), 0 when they could not be read.
+	/// Uploads still waiting in the VFS cache when rclone was asked to quit: in progress, queued,
+	/// and written but not queued yet. 0 means every file written was uploaded, unless rclone's
+	/// cache could not be read: its stats not at all (then 0), or its metadata, which shows the
+	/// files not queued yet (then queued and in progress alone); both are logged.
 	pub pending_uploads: u32,
 	/// Whether rclone did not quit within the grace period and was killed.
 	pub forced: bool,
@@ -228,6 +231,12 @@ pub struct RcloneDaemon {
 	pub(super) pidfile: PathBuf,
 	/// The VFS options every role gets.
 	pub(super) vfs: VfsTuning,
+	/// Where rclone keeps its VFS caches' metadata, under the cache directory; a metadata root
+	/// `vfs/stats` reports outside it is not read.
+	vfs_meta_root: PathBuf,
+	/// How long a written file waits before it is uploaded, when a test changes it for its mounts.
+	#[cfg(feature = "test-seams")]
+	pub(super) write_back_for_test: Option<Duration>,
 }
 
 /// The pidfile's record of the running rclone, and the watchdog armed for the same mounts.
@@ -366,7 +375,7 @@ impl RcloneDaemon {
 		loop {
 			let port = free_local_ipv4_port()
 				.ok_or_else(|| Error::custom(ErrorKind::IO, "no free port for rclone's rc"))?;
-			let daemon = Self::spawn(binary, config, port, password)?;
+			let daemon = Self::spawn(binary, config, port, password).await?;
 			match daemon.wait_ready().await {
 				Ok(version) => return Ok((daemon, version)),
 				Err(e) if attempt < SPAWN_ATTEMPTS && daemon.has_exited() => {
@@ -380,7 +389,7 @@ impl RcloneDaemon {
 		}
 	}
 
-	fn spawn(
+	async fn spawn(
 		binary: &Path,
 		config: &RcloneDaemonConfig,
 		port: u16,
@@ -410,7 +419,9 @@ impl RcloneDaemon {
 		command.creation_flags(CREATE_NO_WINDOW);
 
 		let rc = RcClient::new(port, RC_USER, password)?;
-		let mut child = command.spawn().context("failed to start rclone rcd")?;
+		let mut child = spawn_rclone(&mut command)
+			.await
+			.context("failed to start rclone rcd")?;
 		let pid = child.id().ok_or_else(|| {
 			Error::custom(
 				ErrorKind::Internal,
@@ -440,6 +451,12 @@ impl RcloneDaemon {
 			guard: tokio::sync::Mutex::new(None),
 			pidfile: config.state_dir.join(PIDFILE),
 			vfs: config.vfs,
+			// rclone makes `--cache-dir` absolute, without resolving symlinks.
+			vfs_meta_root: std::path::absolute(&config.cache_dir)
+				.unwrap_or_else(|_| config.cache_dir.clone())
+				.join("vfsMeta"),
+			#[cfg(feature = "test-seams")]
+			write_back_for_test: None,
 		})
 	}
 
@@ -555,12 +572,79 @@ impl RcloneDaemon {
 		Ok(stats)
 	}
 
-	/// Uploads in progress and queued in the VFS caches.
-	async fn pending_uploads(&self) -> Result<u32, Error> {
-		let stats = self.stats().await?;
-		Ok(stats
-			.uploads_in_progress
-			.saturating_add(stats.uploads_queued))
+	/// Uploads still waiting in the VFS caches: those in progress and queued, and the files the
+	/// caches' metadata marks written and not uploaded, among them those rclone has not queued yet
+	/// (see [`dirty`]). The metadata is read only when nothing is queued or with `always_read_dirty`,
+	/// since a queued upload is waited for anyway. Metadata that cannot be read is logged and left
+	/// out, which counts what is queued alone.
+	async fn pending_uploads(&self, always_read_dirty: bool) -> Result<u32, Error> {
+		let mut queued = 0_u32;
+		let mut meta_roots = Vec::new();
+		for fs in self.rc.vfs_list().await?.vfses {
+			let Some(cache) = self.rc.vfs_stats(&fs).await?.disk_cache else {
+				continue;
+			};
+			queued = queued
+				.saturating_add(count(cache.uploads_in_progress))
+				.saturating_add(count(cache.uploads_queued));
+			meta_roots.push((fs, cache.path_meta));
+		}
+		if queued > 0 && !always_read_dirty {
+			return Ok(queued);
+		}
+		// VFSes on one remote with different options share its cache, and so its metadata.
+		let mut roots = BTreeSet::new();
+		for (fs, root) in meta_roots {
+			match root {
+				Some(root) if root.starts_with(&self.vfs_meta_root) => {
+					roots.insert(root);
+				}
+				Some(root) => {
+					warn!(
+						"rclone's VFS {fs} keeps its cache metadata at {}, outside {}: counting \
+						 queued uploads only",
+						root.display(),
+						self.vfs_meta_root.display()
+					);
+					return Ok(queued);
+				}
+				None => {
+					warn!(
+						"rclone does not report where VFS {fs} keeps its cache metadata: counting \
+						 queued uploads only"
+					);
+					return Ok(queued);
+				}
+			}
+		}
+		if roots.is_empty() {
+			return Ok(queued);
+		}
+		let dirty = tokio::task::spawn_blocking(move || {
+			roots.iter().try_fold(0_u32, |dirty, root| {
+				dirty::count_dirty(root).map(|n| dirty.saturating_add(n))
+			})
+		})
+		.await
+		.map_err(|e| {
+			Error::custom_with_source(
+				ErrorKind::Internal,
+				e,
+				Some("reading rclone's VFS cache metadata failed"),
+			)
+		})?;
+		match dirty {
+			// A queued or uploading file is dirty too, until its upload has finished.
+			Ok(dirty) => Ok(queued.max(dirty)),
+			Err(dirty::Unreadable { path, reason }) => {
+				warn!(
+					"rclone's VFS cache metadata at {} cannot be read ({reason}), counting queued \
+					 uploads only",
+					path.display()
+				);
+				Ok(queued)
+			}
+		}
 	}
 
 	/// Stops rclone: stops every serve, lets pending uploads finish for up to
@@ -576,7 +660,7 @@ impl RcloneDaemon {
 		}
 		let pending = match options.drain_timeout_ms {
 			Some(timeout_ms) => self.drain(Duration::from_millis(timeout_ms.into())).await,
-			None => self.pending_uploads().await,
+			None => self.pending_uploads(true).await,
 		};
 		let pending = pending.unwrap_or_else(|e| {
 			warn!("reading rclone's pending uploads failed: {e}");
@@ -622,8 +706,9 @@ impl RcloneDaemon {
 	async fn drain(&self, timeout: Duration) -> Result<u32, Error> {
 		let deadline = Instant::now() + timeout;
 		loop {
-			let pending = self.pending_uploads().await?;
-			if pending == 0 || Instant::now() >= deadline {
+			let last = Instant::now() >= deadline;
+			let pending = self.pending_uploads(last).await?;
+			if pending == 0 || last {
 				return Ok(pending);
 			}
 			tokio::time::sleep(DRAIN_POLL).await;
@@ -665,6 +750,21 @@ impl RcloneDaemon {
 	/// The loopback port rclone's rc listens on.
 	pub fn rc_port_for_test(&self) -> u16 {
 		self.rc.port()
+	}
+
+	/// Makes every mount from now on wait `write_back` before it uploads a written file, instead of
+	/// the 5 s every mount waits.
+	pub fn set_write_back_for_test(&mut self, write_back: Duration) {
+		self.write_back_for_test = Some(write_back);
+	}
+
+	/// `vfs_opt` with the write-back delay [`RcloneDaemon::set_write_back_for_test`] set.
+	pub(super) fn with_write_back_for_test(&self, mut vfs_opt: Value) -> Value {
+		if let Some(write_back) = self.write_back_for_test {
+			vfs_opt["WriteBack"] =
+				Value::from(i64::try_from(write_back.as_nanos()).unwrap_or(i64::MAX));
+		}
+		vfs_opt
 	}
 
 	/// Calls the rc method `path` with `body`.
@@ -891,5 +991,6 @@ async fn create_private_dir(dir: &Path) -> Result<(), Error> {
 	Ok(())
 }
 
+mod dirty;
 #[cfg(test)]
 mod tests;

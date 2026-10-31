@@ -75,12 +75,15 @@ impl RcloneDaemon {
 				FILEN_REMOTE
 			}
 		);
+		let vfs_opt = vfs_opt(&self.vfs, options.read_only);
+		#[cfg(feature = "test-seams")]
+		let vfs_opt = self.with_write_back_for_test(vfs_opt);
 		self.rc
 			.mount_mount(
 				&fs,
 				&mount_point,
 				provider.mount_type(),
-				&vfs_opt(&self.vfs, options.read_only),
+				&vfs_opt,
 				&mount_opt(provider),
 			)
 			.await?;

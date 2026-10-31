@@ -4,6 +4,7 @@
 #[cfg(unix)]
 use std::ffi::OsString;
 use std::{
+	io,
 	path::{Path, PathBuf},
 	time::Duration,
 };
@@ -11,7 +12,7 @@ use std::{
 use sysinfo::{
 	Pid, ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, Signal, System, UpdateKind,
 };
-use tokio::process::Command;
+use tokio::process::{Child, Command};
 
 use crate::{Error, ErrorKind};
 
@@ -57,6 +58,27 @@ pub(crate) fn system_command(program: &str) -> Command {
 	command.creation_flags(CREATE_NO_WINDOW);
 	command.kill_on_drop(true);
 	command
+}
+
+/// How often rclone is started while its binary is busy, and the pause between attempts.
+const BUSY_ATTEMPTS: u32 = 20;
+const BUSY_PAUSE: Duration = Duration::from_millis(50);
+
+/// Starts `command`, which runs rclone. A start refused as the binary is open for writing
+/// (`ETXTBSY`) is tried again: a binary this process has just written, as the managed download
+/// does, stays open in every child another thread forked while it was being written, until that
+/// child execs. `O_CLOEXEC` closes it only at that exec, so there is nothing to wait on instead.
+pub(crate) async fn spawn_rclone(command: &mut Command) -> io::Result<Child> {
+	let mut attempt = 1;
+	loop {
+		match command.spawn() {
+			Err(e) if e.kind() == io::ErrorKind::ExecutableFileBusy && attempt < BUSY_ATTEMPTS => {
+				attempt += 1;
+				tokio::time::sleep(BUSY_PAUSE).await;
+			}
+			started => return started,
+		}
+	}
 }
 
 /// A process as it was seen: its pid, its start time in seconds since the Unix epoch, and its

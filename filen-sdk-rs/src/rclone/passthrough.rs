@@ -14,7 +14,12 @@ use std::{
 use filen_types::auth::FilenSDKConfig;
 use tokio::{io::AsyncWriteExt as _, process::Command};
 
-use crate::{Error, ErrorKind, auth::Client, error::ResultExt as _, rclone::RcloneBinary};
+use crate::{
+	Error, ErrorKind,
+	auth::Client,
+	error::ResultExt as _,
+	rclone::{RcloneBinary, system::spawn_rclone},
+};
 
 /// The remote's name, which filen-cli documents.
 const REMOTE: &str = "FILEN";
@@ -28,8 +33,8 @@ pub async fn run_rclone(
 ) -> Result<ExitStatus, Error> {
 	let binary = binary.resolve().await?;
 	let remote = remote_env(&binary, &client.to_sdk_config()).await?;
-	passthrough_command(&binary, args, remote)
-		.spawn()
+	spawn_rclone(&mut passthrough_command(&binary, args, remote))
+		.await
 		.context("failed to start rclone")?
 		.wait()
 		.await
@@ -78,14 +83,16 @@ async fn remote_env(
 /// `secret` obscured as rclone's config holds a password option, by `rclone obscure`, which reads
 /// it from stdin: its argv is readable by every user.
 async fn obscure(binary: &Path, secret: &str) -> Result<String, Error> {
-	let mut child = Command::new(binary)
-		.args(["obscure", "-"])
-		.stdin(Stdio::piped())
-		.stdout(Stdio::piped())
-		.stderr(Stdio::null())
-		.kill_on_drop(true)
-		.spawn()
-		.context("failed to start rclone obscure")?;
+	let mut child = spawn_rclone(
+		Command::new(binary)
+			.args(["obscure", "-"])
+			.stdin(Stdio::piped())
+			.stdout(Stdio::piped())
+			.stderr(Stdio::null())
+			.kill_on_drop(true),
+	)
+	.await
+	.context("failed to start rclone obscure")?;
 	let mut stdin = child.stdin.take().ok_or_else(|| {
 		Error::custom(ErrorKind::Internal, "rclone obscure's stdin was not piped")
 	})?;

@@ -4,7 +4,7 @@
 //! logged, and a failed call carries only rc's `error` line: `config/create` bodies hold the
 //! account's keys, and rc echoes a failed call's input back in its answer.
 
-use std::{fmt, time::Duration};
+use std::{fmt, path::PathBuf, time::Duration};
 
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Map, Value, json};
@@ -92,6 +92,9 @@ pub(crate) struct VfsDiskCache {
 	pub(crate) uploads_queued: i64,
 	pub(crate) errored_files: i64,
 	pub(crate) out_of_space: bool,
+	/// The root of the cache's metadata files, one per cached file. Absent from an rclone that
+	/// does not report it.
+	pub(crate) path_meta: Option<PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]
