@@ -315,7 +315,7 @@ async fn stop_rclone_under_ignores_other_binaries() {
 	let old_bin = dirs.root.path().join("old-client").join("bin");
 	std::fs::create_dir_all(&old_bin).unwrap();
 	let old_rclone = old_bin.join(format!("rclone{}", std::env::consts::EXE_SUFFIX));
-	std::fs::copy(&rclone, &old_rclone).unwrap();
+	copy_executable(&rclone, &old_rclone);
 	let mut old = idle_rcd(&old_rclone);
 	let mut other = idle_rcd(&rclone);
 	wait_for_exec(&old, &old_rclone).await;
@@ -365,6 +365,23 @@ async fn concurrent_managed_downloads_install_one_runnable_binary() {
 		.unwrap();
 	assert!(version.status.success(), "{version:?}");
 	assert!(version.stdout.starts_with(b"rclone v"), "{version:?}");
+}
+
+/// Copies the executable `from` to `to`. On Unix in a `cp` of its own: a child another test forks
+/// while this process holds `to` open for writing keeps it open until it execs, `O_CLOEXEC` or not,
+/// and running `to` meanwhile fails with `ETXTBSY`.
+fn copy_executable(from: &Path, to: &Path) {
+	#[cfg(unix)]
+	{
+		let status = std::process::Command::new("cp")
+			.arg(from)
+			.arg(to)
+			.status()
+			.unwrap();
+		assert!(status.success(), "{status}");
+	}
+	#[cfg(not(unix))]
+	std::fs::copy(from, to).unwrap();
 }
 
 /// An `rclone rcd` that does nothing until it is stopped.
@@ -529,6 +546,8 @@ async fn stop_drains_pending_uploads_within_the_timeout() {
 	let daemon = dirs.start().await;
 	let mount_point = dirs.mount_point("drive");
 	daemon.mount(read_write(&mount_point)).await.unwrap();
+	// Stopped right after `close` returns: FUSE hands rclone the close later, and rclone queues
+	// the file only then, so the drain may find it written and not queued yet.
 	tokio::fs::write(Path::new(&mount_point).join("file.txt"), "content")
 		.await
 		.unwrap();
@@ -555,12 +574,98 @@ async fn stop_drains_pending_uploads_within_the_timeout() {
 	assert_eq!(std::fs::read_dir(&mount_point).unwrap().count(), 0);
 }
 
+/// A file still open for writing is written and not queued: FUSE queues it only once it is closed.
+#[cfg(unix)]
+fn open_written(mount_point: &str) -> std::fs::File {
+	use std::io::Write as _;
+
+	let mut file = std::fs::File::create(Path::new(mount_point).join("file.txt")).unwrap();
+	file.write_all(b"content").unwrap();
+	file.sync_all().unwrap();
+	file
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn stop_waits_for_a_file_written_and_not_queued_yet() {
+	let dirs = Dirs::new();
+	let daemon = dirs.start().await;
+	let mount_point = dirs.mount_point("drive");
+	daemon.mount(read_write(&mount_point)).await.unwrap();
+	// Stopped first by `stop`, so once it is gone the drain has begun.
+	daemon
+		.start_serve(serve(ServeProtocol::Webdav, basic_auth()))
+		.await
+		.unwrap();
+	let file = open_written(&mount_point);
+
+	let (report, ()) = tokio::join!(
+		daemon.stop(StopOptions {
+			drain_timeout_ms: Some(30_000),
+			grace_ms: 10_000,
+		}),
+		async {
+			while !daemon.stats().await.unwrap().serves.is_empty() {
+				tokio::task::yield_now().await;
+			}
+			drop(file);
+		}
+	);
+
+	assert_eq!(
+		report.unwrap(),
+		StopReport {
+			pending_uploads: 0,
+			forced: false
+		}
+	);
+	assert_eq!(
+		std::fs::read_to_string(dirs.remote().join("file.txt")).unwrap(),
+		"content"
+	);
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn stop_counts_a_file_not_uploaded_by_the_timeout() {
+	let dirs = Dirs::new();
+	let mut daemon = dirs.start().await;
+	// Nothing is uploaded before the timeout, wherever the platform's mount queues the file.
+	daemon.set_write_back_for_test(Duration::from_secs(60 * 60));
+	let mount_point = dirs.mount_point("drive");
+	daemon.mount(read_write(&mount_point)).await.unwrap();
+	let file = open_written(&mount_point);
+	// FUSE queues it once it is closed: until then only the cache's metadata shows it.
+	#[cfg(target_os = "linux")]
+	assert_eq!(daemon.stats().await.unwrap().uploads_queued, 0);
+
+	let report = daemon
+		.stop(StopOptions {
+			drain_timeout_ms: Some(1_000),
+			grace_ms: 10_000,
+		})
+		.await
+		.unwrap();
+	drop(file);
+
+	assert_eq!(
+		report,
+		StopReport {
+			pending_uploads: 1,
+			forced: false
+		}
+	);
+	assert!(!dirs.remote().join("file.txt").exists());
+}
+
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_dirty_cache_item_is_uploaded_on_the_next_start() {
 	let dirs = Dirs::new();
 	let mount_point = dirs.mount_point("drive");
-	let crashed = dirs.start().await;
+	let mut crashed = dirs.start().await;
+	// Nothing is uploaded before the kill, however long the steps up to it take.
+	crashed.set_write_back_for_test(Duration::from_secs(60 * 60));
 	crashed.mount(read_write(&mount_point)).await.unwrap();
 	tokio::fs::write(Path::new(&mount_point).join("file.txt"), "content")
 		.await
@@ -569,7 +674,6 @@ async fn a_dirty_cache_item_is_uploaded_on_the_next_start() {
 	// file's cache metadata by truncating it first: a kill in that window leaves it empty, and
 	// the next rclone drops the file as corrupt. Once queued the metadata is on disk.
 	wait_queued_for_upload(&crashed, "file.txt", "content".len()).await;
-	// Well inside the 5 s write-back delay: the file is only in the cache.
 	kill_9(crashed.pid());
 	tokio::time::timeout(Duration::from_secs(10), crashed.exited())
 		.await
@@ -687,15 +791,43 @@ fn basic_auth() -> ServeAuth {
 	}
 }
 
-/// A serve of `protocol` on a free loopback port.
+/// A serve of `protocol` on a free loopback port of its own.
 fn serve(protocol: ServeProtocol, auth: ServeAuth) -> ServeOptions {
 	ServeOptions {
 		protocol,
 		host: "127.0.0.1".to_owned(),
-		port: port_check::free_local_ipv4_port().unwrap(),
+		port: serve_port(),
 		auth,
 		tls: None,
 		read_only: false,
+	}
+}
+
+/// A loopback port nothing listens on, which no other serve here gets.
+///
+/// Not found free by binding it: a child another test forks meanwhile inherits that listener
+/// and holds the port until it execs, past the moment the serve binds it. Nor one the OS picks:
+/// it may hand the same port to a connection or another `:0` next. These come from below every
+/// system's ephemeral range (Linux 32768, macOS and Windows 49152) and rclone's FTP passive ports
+/// (30000-32000), each once per test binary, from a stretch that depends on the process so
+/// parallel binaries start apart; one something answers on is skipped.
+fn serve_port() -> u16 {
+	const FIRST: u32 = 20_000;
+	const COUNT: u32 = 10_000;
+	static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+	let start = std::process::id().wrapping_mul(97) % COUNT;
+	loop {
+		let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+		assert!(n < COUNT, "no free serve port left");
+		let port = u16::try_from(FIRST + (start + n) % COUNT).unwrap();
+		// A listener answers on loopback at once; Windows retries a refused one for seconds.
+		let answered = std::net::TcpStream::connect_timeout(
+			&(std::net::Ipv4Addr::LOCALHOST, port).into(),
+			Duration::from_millis(100),
+		);
+		if answered.is_err() {
+			return port;
+		}
 	}
 }
 
