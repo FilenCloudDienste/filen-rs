@@ -45,7 +45,7 @@ use crate::cache::{
 	search::ReadTask,
 	sql::{
 		PersistedEvent, UndecodableItem,
-		columns::{COUNT, FILES_STABLE_UUID, ITEMS_PARENT},
+		columns::{FILES_STABLE_UUID, ITEMS_PARENT},
 	},
 };
 // Only the in-memory test constructors open an in-memory database.
@@ -429,6 +429,21 @@ pub type SyncRootCallback = Box<dyn Fn(&mut dyn Iterator<Item = &CacheEvent<'_>>
 /// registration, every callback is notified on dispatch, and the uuid stops being a sync root only
 /// when its last registration is removed.
 pub(crate) type RootRegistrations = Vec<(u64, SyncRootCallback)>;
+
+/// The cached items a resync's diff removes, across every listed root.
+fn removals(per_root: &[(Uuid, Vec<CacheEvent<'static>>)]) -> usize {
+	per_root
+		.iter()
+		.flat_map(|(_, events)| events)
+		.filter(|event| {
+			matches!(
+				event.event,
+				CacheEventType::File(FileEvent::Removed(_))
+					| CacheEventType::Dir(DirEvent::Removed(_))
+			)
+		})
+		.count()
+}
 
 /// Default whole-account sync: the root uuid gates all membership and its no-op callback lets tests
 /// exercise the drain/apply/resync machinery without subscribing to notifications. Also compiled
@@ -1152,23 +1167,16 @@ impl CacheState {
 		// reaching here), so an all-empty result among the roots that DID list is either a genuinely-emptied
 		// drive or a rare backend glitch. We proceed — the cache is rebuildable from the server on the next
 		// resync — but log loudly when every root that listed came back EMPTY while the cache still holds
-		// items. (Guarded by `had_listings` so an all-skipped resync, which deletes nothing, stays quiet.)
+		// items under them. (Guarded by `had_listings` so an all-skipped resync, which deletes nothing,
+		// stays quiet.) The count is the removals the diff produced, so it names only cached items under
+		// the listed roots: a root's own row, and items under roots that did not list, never count, and an
+		// empty root with nothing cached under it (a new pair's empty remote) stays quiet.
 		if had_listings && !any_listed {
-			// `type != 0` = all non-root items (type 0 = root, 1 = dir, 2 = file). The lone bit of inline
-			// SQL in this module — kept here because it is a one-off guard-rail count, not part of the
-			// reusable sql-layer surface.
-			let cached_non_root: i64 = self
-				.db
-				.query_row(
-					"SELECT COUNT(*) AS count FROM items WHERE type != 0",
-					[],
-					|row| row.get(COUNT),
-				)
-				.map_err(|e| db_err(e, "counting cached items for the empty-listing guard"))?;
-			if cached_non_root > 0 {
+			let removed = removals(&per_root_synthetics);
+			if removed > 0 {
 				tracing::warn!(
-					"resync: every sync root listed EMPTY but the cache holds {cached_non_root} \
-					 item(s); converging will delete them. Proceeding — expected only if the drive was \
+					"resync: every sync root listed EMPTY but the cache holds {removed} item(s) under \
+					 them; converging will delete them. Proceeding — expected only if the drive was \
 					 genuinely emptied."
 				);
 			}

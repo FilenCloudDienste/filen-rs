@@ -1,7 +1,7 @@
 use super::*;
 use crate::cache::sql::columns::{
-	FILES_SIZE, ITEM_EXISTS, ITEMS_CONTENT_HASH, ITEMS_ID, PRAGMA_CACHE_SIZE, PRAGMA_MMAP_SIZE,
-	PRAGMA_SYNCHRONOUS, PRAGMA_TEMP_STORE,
+	COUNT, FILES_SIZE, ITEM_EXISTS, ITEMS_CONTENT_HASH, ITEMS_ID, PRAGMA_CACHE_SIZE,
+	PRAGMA_MMAP_SIZE, PRAGMA_SYNCHRONOUS, PRAGMA_TEMP_STORE,
 };
 use crate::cache::test_support::rewrite_behind_sqlite;
 use crate::fs::{
@@ -864,6 +864,33 @@ fn apply_resync_converges_each_sync_root_independently() {
 	);
 	// One watermark advance across both roots.
 	assert_eq!(state.watermark().unwrap(), Some(500));
+}
+
+/// The empty-listing warning counts what the diff removes: a root listed empty with nothing
+/// cached under it (a new pair's empty remote) counts nothing, however much else the cache holds,
+/// and only items under the listed root count once it has some.
+#[test]
+fn an_empty_listing_counts_only_the_items_it_removes() {
+	let mut state = CacheState::new_in_memory();
+	let account_root = state.root_uuid;
+	let root = cache_dir(1, account_root);
+	let other = cache_dir(2, account_root);
+	let elsewhere = cache_file(20, other.uuid, 100);
+	state.upsert_dirs([&root, &other].into_iter()).unwrap();
+	state.upsert_files([&elsewhere].into_iter()).unwrap();
+
+	fn empty(state: &mut CacheState, root: Uuid) -> usize {
+		state.reset_diff_incoming().unwrap();
+		let synthetics = state
+			.compute_resync_synthetics(root, &HashMap::new(), &HashMap::new())
+			.unwrap();
+		removals(&[(root, synthetics)])
+	}
+	assert_eq!(empty(&mut state, root.uuid), 0);
+
+	let under = cache_file(10, root.uuid, 100);
+	state.upsert_files([&under].into_iter()).unwrap();
+	assert_eq!(empty(&mut state, root.uuid), 1);
 }
 
 /// An all-skipped resync (every root failed to list → empty `per_root`) still advances
