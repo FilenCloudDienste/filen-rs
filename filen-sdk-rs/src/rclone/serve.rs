@@ -458,10 +458,19 @@ const BIND_CHECK_PAUSE: Duration = Duration::from_millis(100);
 /// listener an earlier check opened is inherited by a child another thread of this process forks
 /// meanwhile, and stays open in it until it execs, after the check here has closed it.
 async fn ensure_bindable(socket: SocketAddr) -> Result<(), Error> {
+	check_bindable(socket, |socket| TcpListener::bind(socket).map(drop)).await
+}
+
+/// [`ensure_bindable`] with the bind it tries injected, so the retries can be tested without
+/// racing the kernel over a real port.
+async fn check_bindable(
+	socket: SocketAddr,
+	mut bind: impl FnMut(SocketAddr) -> io::Result<()>,
+) -> Result<(), Error> {
 	let mut attempt = 1;
 	loop {
-		match TcpListener::bind(socket) {
-			Ok(_) => return Ok(()),
+		match bind(socket) {
+			Ok(()) => return Ok(()),
 			Err(e) if e.kind() == io::ErrorKind::AddrInUse => {
 				if attempt == BIND_CHECK_ATTEMPTS {
 					return Err(RcloneRefusal::PortInUse {
@@ -1003,27 +1012,46 @@ mod tests {
 		);
 	}
 
+	// The bind is injected: a real port freed mid-window races the kernel and, in a parallel test
+	// run, other sockets that may take the freed ephemeral port.
 	#[tokio::test(start_paused = true)]
 	async fn a_port_freed_within_the_window_is_bindable() {
-		let taken = TcpListener::bind("127.0.0.1:0").unwrap();
-		let socket = taken.local_addr().unwrap();
-		// Freed between the second check and the third.
-		let release = tokio::spawn(async move {
-			tokio::time::sleep(BIND_CHECK_PAUSE * 3 / 2).await;
-			drop(taken);
-		});
+		let socket: SocketAddr = "127.0.0.1:1".parse().unwrap();
+		let mut tries = 0;
 		let started = tokio::time::Instant::now();
 
-		// A port freed inside the window is bound, not refused, and only on a retry. Which retry is
-		// the kernel's business: the release is not on the paused clock, and under a parallel test
-		// run another socket can hold the freed ephemeral port for a moment.
-		ensure_bindable(socket).await.unwrap();
-		let elapsed = started.elapsed();
-		assert!(
-			elapsed >= BIND_CHECK_PAUSE,
-			"bound before any retry: {elapsed:?}"
+		check_bindable(socket, |_| {
+			tries += 1;
+			if tries < 3 {
+				Err(io::ErrorKind::AddrInUse.into())
+			} else {
+				Ok(())
+			}
+		})
+		.await
+		.unwrap();
+
+		assert_eq!(tries, 3);
+		assert_eq!(started.elapsed(), BIND_CHECK_PAUSE * 2);
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn a_bind_failing_otherwise_is_not_retried() {
+		let socket: SocketAddr = "127.0.0.1:1".parse().unwrap();
+		let mut tries = 0;
+
+		let error = check_bindable(socket, |_| {
+			tries += 1;
+			Err(io::ErrorKind::AddrNotAvailable.into())
+		})
+		.await
+		.unwrap_err();
+
+		assert_eq!(tries, 1);
+		assert_eq!(
+			error.downcast_ref::<RcloneRefusal>(),
+			Some(&RcloneRefusal::AddressNotLocal)
 		);
-		release.await.unwrap();
 	}
 
 	#[test]
