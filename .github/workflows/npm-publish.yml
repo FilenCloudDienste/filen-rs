@@ -18,9 +18,11 @@ jobs:
     # when node/ holds no binary for its host. Package-scoped (--manifest-path ../Cargo.toml), so
     # no heif-decoder tooling. Each leg builds on the OS it targets, so every addon links as
     # ci-napi's do (dynamic_lookup on macOS, -z nodelete on linux-gnu, msvc on Windows); the
-    # arm64 Windows and Linux and the x86_64 macOS addons are cross-compiled from the x86_64 and
-    # arm64 runners, as napi-rs builds them, and only the legs whose host can load the addon
-    # smoke-test it.
+    # arm64 Windows and the x86_64 macOS addons are cross-compiled from the x86_64 and arm64
+    # runners, as napi-rs builds them, and only the legs whose host can load the addon test it.
+    # Both linux-gnu addons build natively: --use-napi-cross's C compiler is the toolchain's GCC
+    # 4.8.5, which cc-rs takes (TARGET_CC) only when cross-compiling, and ring built by it for
+    # aarch64 fails every certificate signature check (invalid peer certificate: BadSignature).
     strategy:
       matrix:
         include:
@@ -41,7 +43,8 @@ jobs:
             os: ubuntu-latest
             smoke-test: true
           - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-24.04-arm
+            smoke-test: true
     runs-on: ${{ matrix.os }}
     name: Build the napi addon (${{ matrix.target }})
     steps:
@@ -53,7 +56,7 @@ jobs:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@a84bfdc502f07db5a85dd9d7a30f91a931516cc5
         with:
-          shared-key: cargo-build-napi-release-${{ matrix.target }}
+          shared-key: cargo-build-napi-release-${{ matrix.target }}-${{ runner.arch }}
           prefix-key: ''
           add-rust-environment-hash-key: 'false'
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -72,12 +75,11 @@ jobs:
           # toolchain links with its own gcc, which rejects the Wild flag .cargo/config.toml
           # gives these targets: RUSTFLAGS replaces the config's list (a
           # CARGO_TARGET_<triple>_RUSTFLAGS would be appended to it). It is set only for them,
-          # since even an empty value would drop the other targets' flags too.
+          # since even an empty value would drop the other targets' flags too. These legs build
+          # on a host of their own architecture, so C code (ring) is compiled by the runner's gcc,
+          # never the toolchain's 4.8.5; the next step checks that.
           if [[ $target == *-linux-gnu ]]; then
             export RUSTFLAGS=-Zhigher-ranked-assumptions
-            # The toolchain's aarch64 gcc predates the __ARM_ARCH predefine that ring's assembly
-            # checks for, so the build states it (ARMv8, the only aarch64 profile).
-            export CFLAGS_aarch64_unknown_linux_gnu=-D__ARM_ARCH=8
             npm run build:napi:release -- --target "$target" --use-napi-cross
           else
             npm run build:napi:release -- --target "$target"
@@ -85,9 +87,51 @@ jobs:
         working-directory: ./filen-sdk-rs/web
         env:
           target: ${{ matrix.target }}
+      - name: Check the linux-gnu addon's C compiler and glibc floor
+        if: endsWith(matrix.target, '-linux-gnu')
+        shell: bash
+        run: |
+          addon=$(echo node/sdk-rs.*.node)
+          # cc-rs reads TARGET_CC (the toolchain's GCC 4.8.5) only when it cross-compiles, and
+          # logs each variable it reads to the build script's output: ring's must show the native
+          # lookup. The addon's .comment cannot tell, since the toolchain links its own
+          # crtbeginS.o and crtendS.o, which say "GCC: (GNU) 4.8.5", into every build.
+          shopt -s nullglob
+          ring=(../../target/"$target"/release/build/ring-*/output)
+          if (( ${#ring[@]} == 0 )); then
+            echo "::error::no ring build script output under target/$target"
+            exit 1
+          fi
+          grep -h '^\(HOST\|TARGET\)_CC = ' "${ring[@]}"
+          if grep -q '^TARGET_CC = ' "${ring[@]}" || ! grep -q '^HOST_CC = ' "${ring[@]}"; then
+            echo "::error::ring was cross-compiled with --use-napi-cross's GCC 4.8.5"
+            exit 1
+          fi
+          comment=$(strings -a "$addon" | grep '^GCC: ' | sort -u)
+          echo "$comment"
+          if ! grep -q '^GCC: (Ubuntu ' <<<"$comment"; then
+            echo "::error::$addon has no code compiled by the runner's gcc"
+            exit 1
+          fi
+          # Nothing newer than the glibc 2.17 the sysroot provides.
+          newest=$(objdump -T "$addon" | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -n 1)
+          echo "newest glibc symbol: $newest"
+          if [[ $(printf '%s\n' "$newest" GLIBC_2.17 | sort -V | tail -n 1) != GLIBC_2.17 ]]; then
+            echo "::error::$addon needs $newest, newer than glibc 2.17"
+            exit 1
+          fi
+        working-directory: ./filen-sdk-rs/web
+        env:
+          target: ${{ matrix.target }}
       - name: Smoke-test the napi addon
         if: matrix.smoke-test
         run: node --test napi/smoke.test.mjs
+        working-directory: ./filen-sdk-rs/web
+      # One login attempt for an account that does not exist: its HTTPS request must pass
+      # certificate verification and get the server's refusal back.
+      - name: Check the napi addon's TLS
+        if: matrix.smoke-test
+        run: node --test napi/tls.test.mjs
         working-directory: ./filen-sdk-rs/web
       - name: Upload the napi addon
         uses: actions/upload-artifact@v4
