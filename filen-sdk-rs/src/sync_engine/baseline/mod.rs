@@ -1118,6 +1118,101 @@ fn create_schema(conn: &Connection, schema: &str) -> rusqlite::Result<()> {
 	tx.commit()
 }
 
+/// Rewrite every stored local root `add_pair` would no longer store in that spelling: on Windows,
+/// one canonicalized with the verbatim prefix (`\\?\C:\x`) before `add_pair` simplified it, becomes
+/// `C:\x` (see [`root_rewrites`]). What `dunce` keeps verbatim stays: a root the plain form could
+/// mean another directory by, and a UNC share, which `add_pair` stores verbatim too.
+///
+/// Run on every open, like [`ADDITIVE_SCHEMA`], and for the same reason [`SCHEMA_VERSION`] does
+/// not move: the row still names the same directory, and every column means what it meant.
+/// Only on Windows, the one platform `dunce` simplifies on; elsewhere every root is already in its
+/// simplified spelling and the open reads nothing. Writes only when there is something to rewrite,
+/// in one transaction, so a later open finds nothing left to do and takes no write lock.
+fn simplify_local_roots(conn: &Connection) -> rusqlite::Result<()> {
+	if !cfg!(windows) {
+		return Ok(());
+	}
+	let roots = conn
+		.prepare("SELECT id, local_root FROM sync_pairs")?
+		.query_map([], |row| {
+			let id: PairId = row.get(0)?;
+			let stored: String = row.get(1)?;
+			let simplified = dunce::simplified(Path::new(&stored))
+				.to_string_lossy()
+				.into_owned();
+			Ok(StoredRoot {
+				id,
+				stored,
+				simplified,
+			})
+		})?
+		.collect::<rusqlite::Result<Vec<_>>>()?;
+	let RootRewrites { rewrites, collided } = root_rewrites(&roots);
+	if !collided.is_empty() {
+		tracing::warn!(
+			"baseline store: sync pairs {collided:?} are registered for the same local directory under different spellings; their roots are left as stored"
+		);
+	}
+	if rewrites.is_empty() {
+		return Ok(());
+	}
+	let tx = conn.unchecked_transaction()?;
+	{
+		let mut update = conn.prepare("UPDATE sync_pairs SET local_root = ?1 WHERE id = ?2")?;
+		for (id, root) in &rewrites {
+			update.execute(params![root, id])?;
+		}
+	}
+	tx.commit()
+}
+
+/// A pair's local root as stored, and as `dunce` simplifies it.
+#[derive(Debug)]
+struct StoredRoot {
+	id: PairId,
+	stored: String,
+	simplified: String,
+}
+
+/// What [`simplify_local_roots`] does with the stored roots.
+#[derive(Debug, PartialEq, Eq)]
+struct RootRewrites<'a> {
+	/// Each pair whose root it rewrites, with the spelling it gets.
+	rewrites: Vec<(PairId, &'a str)>,
+	/// The pairs it leaves as stored although their root has a simpler spelling, because another
+	/// pair's root simplifies to that same spelling.
+	collided: Vec<PairId>,
+}
+
+/// The rewrites of [`simplify_local_roots`]: every root whose simplified spelling differs from the
+/// stored one, except where two or more pairs' roots simplify to the same spelling.
+///
+/// Those name the same directory, which no two pairs may share, so the registry already holds a
+/// pair the overlap check would have refused had it seen through the spelling. Nothing here can
+/// tell which of them the user meant to keep: each has its own baseline rows, journal and guard
+/// state, so dropping or merging one would lose state a pass plans from, and a rewrite of both
+/// would also break `UNIQUE (local_root, remote_root)` when they share the remote root. Such a
+/// group is left exactly as it is: the pairs keep syncing as they did, `local_overlap` compares
+/// simplified spellings and so refuses any further pair at that directory, and removing one of
+/// them is the user's call. A pair whose root already reads simplified is in its group but needs
+/// no rewrite, so only the others are reported.
+fn root_rewrites(roots: &[StoredRoot]) -> RootRewrites<'_> {
+	let mut spellings: HashMap<&str, usize> = HashMap::with_capacity(roots.len());
+	for root in roots {
+		*spellings.entry(root.simplified.as_str()).or_default() += 1;
+	}
+	let mut rewrites = Vec::new();
+	let mut collided = Vec::new();
+	for root in roots.iter().filter(|root| root.simplified != root.stored) {
+		if spellings[root.simplified.as_str()] > 1 {
+			collided.push(root.id);
+		} else {
+			rewrites.push((root.id, root.simplified.as_str()));
+		}
+	}
+	RootRewrites { rewrites, collided }
+}
+
 /// Whether `error` is SQLite saying another connection holds the single write lock.
 fn is_write_lock_contention(error: &rusqlite::Error) -> bool {
 	match error {
@@ -1403,6 +1498,14 @@ impl BaselineStore {
 		// Then the additive objects, on every open: a DB written before one of them existed gains it
 		// here, and a fresh one has just been created without them (see [`ADDITIVE_SCHEMA`]).
 		conn.execute_batch(ADDITIVE_SCHEMA).map_err(open_error)?;
+		// Not a reason to refuse the open: a root left in its old spelling names the same directory,
+		// and every comparison of roots sees through it (see `local_overlap`). The next open tries
+		// again.
+		if let Err(error) = simplify_local_roots(&conn) {
+			tracing::warn!(
+				"baseline store: the stored local roots were not simplified, tried again on the next open: {error}"
+			);
+		}
 		Ok(Self {
 			conn,
 			readers: Arc::new(Readers {

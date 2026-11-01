@@ -2204,7 +2204,7 @@ async fn control_add_persisted_pairs_autoload_on_fresh_start() {
 	assert!(!reloaded_active.paused);
 	assert_eq!(
 		std::path::Path::new(&reloaded_active.local_root),
-		local_active.canonicalize().unwrap(),
+		dunce::canonicalize(&local_active).unwrap(),
 		"the active pair's local root"
 	);
 	assert_eq!(reloaded_paused.remote_root, remote_paused);
@@ -2215,7 +2215,7 @@ async fn control_add_persisted_pairs_autoload_on_fresh_start() {
 	);
 	assert_eq!(
 		std::path::Path::new(&reloaded_paused.local_root),
-		local_paused.canonicalize().unwrap(),
+		dunce::canonicalize(&local_paused).unwrap(),
 		"the paused pair's local root"
 	);
 

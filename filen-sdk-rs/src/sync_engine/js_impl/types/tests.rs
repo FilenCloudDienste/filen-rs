@@ -452,7 +452,7 @@ async fn an_overlapping_pair_reads_as_its_refusal() {
 		sync_refusal(&nested),
 		Some(SyncRefusal::LocalRootNested {
 			pair,
-			existing: std::fs::canonicalize(&outer)
+			existing: dunce::canonicalize(&outer)
 				.unwrap()
 				.to_string_lossy()
 				.into_owned(),

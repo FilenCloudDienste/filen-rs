@@ -2490,3 +2490,116 @@ fn removing_a_pair_removes_its_imported_filen_sync_state() {
 		.unwrap();
 	assert_eq!(left, 0);
 }
+
+fn stored_root(id: PairId, stored: &str, simplified: &str) -> StoredRoot {
+	StoredRoot {
+		id,
+		stored: stored.to_string(),
+		simplified: simplified.to_string(),
+	}
+}
+
+/// A root whose simplified spelling differs is rewritten to it; one already simplified, and those
+/// `dunce` keeps verbatim (a long path, a UNC share: the simplified spelling is the stored one),
+/// are left alone.
+#[test]
+fn only_a_root_with_a_simpler_spelling_is_rewritten() {
+	let long = format!(r"\\?\C:\{}", "a".repeat(300));
+	let roots = [
+		stored_root(1, r"\\?\C:\Users\u\Work", r"C:\Users\u\Work"),
+		stored_root(2, r"D:\Photos", r"D:\Photos"),
+		stored_root(3, &long, &long),
+		// `dunce` never simplifies a UNC share.
+		stored_root(4, r"\\?\UNC\server\share\x", r"\\?\UNC\server\share\x"),
+	];
+	assert_eq!(
+		root_rewrites(&roots),
+		RootRewrites {
+			rewrites: vec![(1, r"C:\Users\u\Work")],
+			collided: vec![],
+		}
+	);
+}
+
+/// Two pairs whose roots simplify to the same spelling are the same directory: neither is
+/// rewritten, the one that would have been is reported, and an unrelated root is still rewritten.
+#[test]
+fn roots_that_simplify_to_one_directory_are_left_as_stored() {
+	let roots = [
+		stored_root(1, r"\\?\C:\Sync", r"C:\Sync"),
+		stored_root(2, r"C:\Sync", r"C:\Sync"),
+		stored_root(3, r"\\?\D:\A", r"D:\A"),
+		stored_root(4, r"\\?\D:\A", r"D:\A"),
+		stored_root(5, r"\\?\E:\Other", r"E:\Other"),
+	];
+	assert_eq!(
+		root_rewrites(&roots),
+		RootRewrites {
+			rewrites: vec![(5, r"E:\Other")],
+			collided: vec![1, 3, 4],
+		}
+	);
+}
+
+#[test]
+fn no_stored_root_means_no_rewrite() {
+	assert_eq!(
+		root_rewrites(&[]),
+		RootRewrites {
+			rewrites: vec![],
+			collided: vec![],
+		}
+	);
+}
+
+/// The open rewrites a drive root an older `add_pair` stored with the verbatim prefix, keeps a
+/// long path and a UNC share verbatim, leaves two spellings of one directory as they were, and
+/// keeps each pair's id and rows.
+#[cfg(windows)]
+#[test]
+fn an_open_simplifies_the_verbatim_roots_an_older_build_stored() {
+	let path = temp_db_path("simplify_roots");
+	let long = format!(r"\\?\C:\{}", "a".repeat(300));
+	let entry = file_entry("a.txt", [1u8; 32], 3);
+	let (drive, unc, kept, first, second) = {
+		let store = BaselineStore::open(&path).unwrap();
+		let add = |root: &str, remote: u128| {
+			store
+				.create_pair(root, Uuid::from_u128(remote), SyncMode::TwoWay)
+				.unwrap()
+				.0
+		};
+		let drive = add(r"\\?\C:\Users\u\Work", 1);
+		let unc = add(r"\\?\UNC\server\share\x", 2);
+		let kept = add(&long, 3);
+		let first = add(r"\\?\D:\Same", 4);
+		let second = add(r"D:\Same", 5);
+		store.upsert_entry(drive, &entry).unwrap();
+		(drive, unc, kept, first, second)
+	};
+
+	let reopened = BaselineStore::open(&path).unwrap();
+	let roots: HashMap<PairId, String> = reopened
+		.list_pairs()
+		.unwrap()
+		.into_iter()
+		.map(|pair| (pair.id, pair.local_root))
+		.collect();
+	assert_eq!(roots[&drive], r"C:\Users\u\Work");
+	assert_eq!(
+		roots[&unc], r"\\?\UNC\server\share\x",
+		"`dunce` keeps a UNC share verbatim, as `add_pair` stores it"
+	);
+	assert_eq!(roots[&kept], long, "a long path needs the prefix");
+	assert_eq!(roots[&first], r"\\?\D:\Same", "the same directory twice");
+	assert_eq!(roots[&second], r"D:\Same");
+	assert_eq!(
+		reopened.entry(drive, "a.txt").unwrap().as_ref(),
+		Some(&entry),
+		"the rewrite keeps the pair's rows"
+	);
+	drop(reopened);
+	for suffix in ["", "-wal", "-shm"] {
+		std::fs::remove_file(format!("{}{suffix}", path.display())).ok();
+	}
+}

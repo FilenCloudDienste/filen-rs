@@ -3555,6 +3555,136 @@ fn local_roots_overlap_only_when_one_actually_contains_the_other() {
 	assert!(local_overlap(Path::new("/elsewhere"), existing, 1).is_none());
 }
 
+/// A Windows drive root stored with the verbatim prefix overlaps a candidate in the plain
+/// spelling as the same directory would, though the two parse to different prefixes.
+#[cfg(windows)]
+#[test]
+fn a_verbatim_root_overlaps_its_plain_spelling() {
+	let drive = Path::new(r"\\?\C:\Sync\Data");
+	assert!(matches!(
+		local_overlap(Path::new(r"C:\Sync\Data"), drive, 1),
+		Some(PairOverlap::LocalRootInUse { pair: 1, .. })
+	));
+	assert!(matches!(
+		local_overlap(Path::new(r"C:\Sync\Data\Sub"), drive, 1),
+		Some(PairOverlap::LocalRootNested { pair: 1, .. })
+	));
+	assert!(matches!(
+		local_overlap(Path::new(r"C:\Sync"), drive, 1),
+		Some(PairOverlap::LocalRootContains { pair: 1, .. })
+	));
+	assert!(local_overlap(Path::new(r"C:\Sync\Database"), drive, 1).is_none());
+}
+
+/// The error `add_pair` refused with.
+#[cfg(windows)]
+fn refused(result: Result<PairId, Error>) -> Error {
+	match result {
+		Ok(pair) => panic!("registered as pair {pair} over an overlapping root"),
+		Err(error) => error,
+	}
+}
+
+/// `add_pair` stores a Windows root without the verbatim prefix, and either spelling of a
+/// registered root finds the same pair again.
+#[cfg(windows)]
+#[tokio::test]
+async fn add_pair_stores_a_windows_root_without_the_verbatim_prefix() {
+	let dir = tempfile::tempdir().unwrap();
+	let root = dir.path().join("root");
+	std::fs::create_dir(&root).unwrap();
+	let engine = SyncEngine::open(Arc::new(offline_client()), dir.path().join("baseline.db"))
+		.await
+		.unwrap();
+	let remote = Uuid::from_u128(1);
+
+	let pair = engine
+		.add_pair(root.clone(), remote, SyncMode::TwoWay)
+		.await
+		.unwrap();
+	let pairs = engine.list_pairs().await.unwrap();
+	assert_eq!(pairs.len(), 1);
+	let stored = &pairs[0].local_root;
+	assert!(
+		!stored.starts_with(r"\\?\"),
+		"the stored root keeps the verbatim prefix: {stored}"
+	);
+	assert_eq!(Path::new(stored), dunce::canonicalize(&root).unwrap());
+
+	let verbatim = std::fs::canonicalize(&root).unwrap();
+	assert!(verbatim.to_string_lossy().starts_with(r"\\?\"));
+	for spelling in [root.clone(), verbatim, PathBuf::from(stored)] {
+		assert_eq!(
+			engine
+				.add_pair(spelling.clone(), remote, SyncMode::TwoWay)
+				.await
+				.unwrap(),
+			pair,
+			"{spelling:?} registered another pair"
+		);
+	}
+	assert_eq!(engine.list_pairs().await.unwrap().len(), 1);
+}
+
+/// A root an older build stored with the verbatim prefix is the directory it names: a candidate
+/// at it, inside it or around it is refused, rather than registered beside it under the plain
+/// spelling.
+#[cfg(windows)]
+#[tokio::test]
+async fn a_verbatim_root_an_older_build_stored_is_still_overlapped() {
+	let dir = tempfile::tempdir().unwrap();
+	let outer = dir.path().join("outer");
+	let root = outer.join("root");
+	let inner = root.join("inner");
+	std::fs::create_dir_all(&inner).unwrap();
+	let engine = SyncEngine::open(Arc::new(offline_client()), dir.path().join("baseline.db"))
+		.await
+		.unwrap();
+	// As an `add_pair` that stored `std::fs::canonicalize`'s spelling did. Written after the open,
+	// so no open has simplified it.
+	let verbatim = std::fs::canonicalize(&root).unwrap();
+	let verbatim = verbatim.to_string_lossy();
+	assert!(verbatim.starts_with(r"\\?\"));
+	let remote = Uuid::from_u128(1);
+	let (pair, _) = locked(&engine.control)
+		.create_pair(&verbatim, remote, SyncMode::TwoWay)
+		.unwrap();
+
+	assert!(matches!(
+		refused(engine.add_pair(root.clone(), remote, SyncMode::TwoWay).await)
+			.downcast_ref::<PairOverlap>(),
+		Some(PairOverlap::LocalRootInUse { pair: p, .. }) if *p == pair
+	));
+	assert!(matches!(
+		refused(
+			engine
+				.add_pair(root, Uuid::from_u128(2), SyncMode::TwoWay)
+				.await
+		)
+		.downcast_ref::<PairOverlap>(),
+		Some(PairOverlap::LocalRootInUse { pair: p, .. }) if *p == pair
+	));
+	assert!(matches!(
+		refused(
+			engine
+				.add_pair(inner, Uuid::from_u128(3), SyncMode::TwoWay)
+				.await
+		)
+		.downcast_ref::<PairOverlap>(),
+		Some(PairOverlap::LocalRootNested { pair: p, .. }) if *p == pair
+	));
+	assert!(matches!(
+		refused(
+			engine
+				.add_pair(outer, Uuid::from_u128(4), SyncMode::TwoWay)
+				.await
+		)
+		.downcast_ref::<PairOverlap>(),
+		Some(PairOverlap::LocalRootContains { pair: p, .. }) if *p == pair
+	));
+	assert_eq!(engine.list_pairs().await.unwrap().len(), 1);
+}
+
 /// The same relation between two REMOTE roots, decided from their ancestor chains. The chains
 /// are what a partial cache view used to get wrong: `docs` is an ancestor of `reports` whether
 /// or not anything has enumerated it, so the answer must come from a chain that reaches the

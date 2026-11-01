@@ -2094,8 +2094,13 @@ pub enum PairOverlap {
 
 /// How a candidate local root relates to an existing pair's, or `None` when they are disjoint.
 /// Both paths are canonical (every stored root was canonicalized when it was registered), so a
-/// prefix comparison is a real containment test rather than a string coincidence.
+/// prefix comparison is a real containment test rather than a string coincidence. Both are
+/// compared in their simplified spelling: on Windows a root stored with the verbatim prefix
+/// (`\\?\C:\x`, before `add_pair` simplified it, or one [`BaselineStore::open`] left as it was)
+/// names the same directory as `C:\x`, yet the two parse to different path prefixes.
 fn local_overlap(candidate: &Path, existing: &Path, pair: PairId) -> Option<PairOverlap> {
+	let candidate = dunce::simplified(candidate);
+	let existing = dunce::simplified(existing);
 	let shown = || existing.to_string_lossy().into_owned();
 	if candidate == existing {
 		Some(PairOverlap::LocalRootInUse {
@@ -3466,6 +3471,9 @@ impl SyncEngine {
 		remote_root: Uuid,
 	) -> Result<(), Error> {
 		let existing = self.list_pairs().await?;
+		// The stored spelling exactly, as `create_pair` finds the row by it: a row whose root only
+		// SIMPLIFIES to the candidate is not the pair being re-registered, and `local_overlap`
+		// refuses it as the same directory rather than letting a second row in beside it.
 		let same_pair =
 			|record: &PairRecord| record.local_root == local && record.remote_root == remote_root;
 		let others: Vec<&PairRecord> = existing.iter().filter(|r| !same_pair(r)).collect();
@@ -3619,14 +3627,18 @@ impl SyncEngine {
 	/// `local_root` must already EXIST and be a directory; it is canonicalized before being stored,
 	/// so the pair's identity (and the write-confinement anchor) is symlink-stable. A missing or
 	/// non-directory root is rejected here rather than surfacing a pass later as an
-	/// incomplete-scan guard hold with every deletion withheld.
+	/// incomplete-scan guard hold with every deletion withheld. On Windows the canonical path is
+	/// stored without the verbatim prefix (`C:\x`, not `\\?\C:\x`), as `dunce` simplifies it, so
+	/// the root every caller reads back is one it can show and hand to the shell. A path the plain
+	/// form could mean another directory by (a long path, a reserved name) keeps the prefix, and so
+	/// does a UNC share (`\\?\UNC\server\share`), which `dunce` never simplifies.
 	pub async fn add_pair(
 		&self,
 		local_root: PathBuf,
 		remote_root: Uuid,
 		mode: SyncMode,
 	) -> Result<PairId, Error> {
-		let local_root = std::fs::canonicalize(&local_root).map_err(|error| {
+		let local_root = dunce::canonicalize(&local_root).map_err(|error| {
 			Error::custom_with_source(
 				ErrorKind::IO,
 				error,

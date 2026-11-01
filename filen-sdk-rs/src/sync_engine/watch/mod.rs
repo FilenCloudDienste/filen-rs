@@ -324,11 +324,13 @@ impl SyncEngine {
 		};
 
 		// Local-change trigger: a recursive filesystem watcher on the local root. The watcher
-		// reports canonicalized paths, so the root it filters against must be canonical too.
-		let watch_root = std::fs::canonicalize(&local_root).unwrap_or_else(|_| local_root.clone());
+		// reports canonicalized paths on macOS, and on Linux and Windows paths under the one it was
+		// given, so it is given the very root it filters against: canonical, and simplified as
+		// `add_pair` stores it, whichever spelling the baseline holds.
+		let watch_root = dunce::canonicalize(&local_root).unwrap_or_else(|_| local_root.clone());
 		let handler = local_event_handler(
 			pair,
-			watch_root,
+			watch_root.clone(),
 			self.pair_root(record.remote_root),
 			Arc::clone(&dirty),
 			status_tx.clone(),
@@ -336,7 +338,7 @@ impl SyncEngine {
 		);
 		let watcher = start_local_watcher::<notify::RecommendedWatcher>(
 			pair,
-			&local_root,
+			&watch_root,
 			handler,
 			&status_tx,
 		);
