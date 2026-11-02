@@ -19,6 +19,8 @@ use std::{
 };
 
 use anyhow::{Context as _, Result};
+use clap::Subcommand;
+use clap_complete::engine::{ArgValueCompleter, PathCompleter};
 use console::{Term, style};
 use filen_sdk_rs::{
 	Error,
@@ -37,10 +39,65 @@ use filen_sdk_rs::{
 use tokio::select;
 
 use crate::{
+	CommandResult,
 	auth::LazyClient,
+	commands::CommandContext,
+	completion::FilenCompleter,
+	docs::DocElement,
 	ui::{self, UI},
 	util::RemotePath,
 };
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum TransferCommands {
+	/// Upload a local file or directory (recursively) into a directory in the Filen drive
+	Upload {
+		/// Local file or directory to upload
+		#[arg(add = ArgValueCompleter::new(PathCompleter::any()))]
+		source: String,
+		/// Destination directory in the Filen drive (default: the current working directory)
+		#[arg(add = FilenCompleter::directory())]
+		destination: Option<String>,
+	},
+	/// Download a file or directory (recursively) from the Filen drive into a local directory
+	Download {
+		/// File or directory to download ("/" for the entire Filen drive)
+		#[arg(add = FilenCompleter::file_or_directory())]
+		source: String,
+		/// Local destination directory (default: the current local directory)
+		#[arg(add = ArgValueCompleter::new(PathCompleter::dir()))]
+		destination: Option<String>,
+	},
+}
+
+/// The docs' "Transferring Files" section, before `sync`.
+pub(crate) const DOCS: &[DocElement] = &[
+	DocElement::DocFragment("transfers"),
+	DocElement::CommandHelp("upload"),
+	DocElement::CommandHelp("download"),
+];
+
+impl TransferCommands {
+	pub(super) async fn execute(self, ctx: CommandContext<'_>) -> Result<CommandResult> {
+		let CommandContext {
+			ui,
+			client,
+			working_path,
+			..
+		} = ctx;
+		match self {
+			Self::Upload {
+				source,
+				destination,
+			} => upload(ui, client, working_path, &source, destination.as_deref()).await?,
+			Self::Download {
+				source,
+				destination,
+			} => download(ui, client, working_path, &source, destination.as_deref()).await?,
+		}
+		Ok(CommandResult::default())
+	}
+}
 
 /// Upload a local file, or a local directory and everything below it, into a remote directory.
 pub(crate) async fn upload(

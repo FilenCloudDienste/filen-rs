@@ -1,11 +1,16 @@
 use std::borrow::Cow;
 
 use crate::{
+	CommandResult,
 	auth::LazyClient,
+	commands::CommandContext,
+	completion::FilenCompleter,
+	docs::DocElement,
 	ui::{self, UI},
 	util::RemotePath,
 };
 use anyhow::{Context as _, Result};
+use clap::Subcommand;
 use console::style;
 use filen_sdk_rs::{
 	auth::Client,
@@ -18,6 +23,217 @@ use filen_sdk_rs::{
 	io::{RemoteDirectory, RemoteFile, client_impl::IoSharedClientExt},
 };
 use serde_json::json;
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum FsCommands {
+	/// Change the working directory (in REPL)
+	Cd {
+		/// Directory to navigate into (supports "..")
+		#[arg(add = FilenCompleter::directory())]
+		directory: String,
+	},
+	/// List files in a directory
+	Ls {
+		/// Directory to list files in (default: the current working directory)
+		#[arg(add = FilenCompleter::directory())]
+		directory: Option<String>,
+		/// Use a long listing format with file sizes
+		#[arg(short = 'l', long)]
+		long: bool,
+	},
+	/// Print the contents of a file
+	Cat {
+		/// File to print
+		#[arg(add = FilenCompleter::file())]
+		file: String,
+	},
+	/// Print the first lines of a file
+	Head {
+		/// File to print
+		#[arg(add = FilenCompleter::file())]
+		file: String,
+		/// Number of lines to print
+		#[arg(short = 'n', long, default_value_t = 10)]
+		lines: usize,
+	},
+	/// Print the last lines of a file
+	Tail {
+		/// File to print
+		#[arg(add = FilenCompleter::file())]
+		file: String,
+		/// Number of lines to print
+		#[arg(short = 'n', long, default_value_t = 10)]
+		lines: usize,
+	},
+	/// Show information about a file, a directory or the Filen drive
+	Stat {
+		/// File or directory to show information about ("/" for the Filen drive)
+		#[arg(add = FilenCompleter::file_or_directory())]
+		file_or_directory: String,
+	},
+	/// Create a new directory
+	Mkdir {
+		/// Directory to create
+		#[arg(add = FilenCompleter::directory())]
+		directory: String,
+		/// Recursively create parent directories
+		#[arg(short, long)]
+		recursive: bool,
+	},
+	/// Remove a file or directory
+	Rm {
+		/// File or directory to remove
+		#[arg(add = FilenCompleter::file_or_directory())]
+		file_or_directory: String,
+		/// Permanently delete the file or directory (default: move to trash)
+		#[arg(short, long)]
+		permanent: bool,
+	},
+	/// Move and/or rename a file or directory
+	Mv {
+		/// Source file or directory
+		#[arg(add = FilenCompleter::file_or_directory())]
+		source: String,
+		/// Destination: an existing directory to move the source into,
+		/// or the new path of the source (to move and/or rename it)
+		#[arg(add = FilenCompleter::file_or_directory())]
+		destination: String,
+	},
+	/// Copy a file or directory
+	Cp {
+		/// Source file or directory
+		#[arg(add = FilenCompleter::file_or_directory())]
+		source: String,
+		/// Destination parent directory
+		#[arg(add = FilenCompleter::directory())]
+		destination: String,
+	},
+	/// List favorited items
+	ListFavorites,
+	/// Favorite a file or directory
+	Favorite {
+		/// File or directory to favorite
+		#[arg(add = FilenCompleter::file_or_directory())]
+		file_or_directory: String,
+	},
+	/// Unfavorite a file or directory
+	Unfavorite {
+		/// File or directory to unfavorite
+		#[arg(add = FilenCompleter::file_or_directory())]
+		file_or_directory: String,
+	},
+	/// List recently accessed items
+	ListRecents,
+	/// List trashed items
+	ListTrash,
+	/// Restore a trashed item interactively
+	TrashRestore,
+	/// Permanently delete a trashed item interactively
+	TrashDelete,
+	/// Permanently delete all trashed items
+	EmptyTrash,
+}
+
+/// The commands that open the docs' "Accessing Files" section, before `search`.
+pub(crate) const BROWSING_DOCS: &[DocElement] = &[
+	DocElement::CommandHelp("cd"),
+	DocElement::CommandHelp("ls"),
+	DocElement::CommandHelp("cat"),
+	DocElement::CommandHelp("head"),
+	DocElement::CommandHelp("tail"),
+	DocElement::CommandHelp("stat"),
+];
+
+/// The commands of the docs' "Accessing Files" section after `search`.
+pub(crate) const ORGANIZING_DOCS: &[DocElement] = &[
+	DocElement::CommandHelp("mkdir"),
+	DocElement::CommandHelp("rm"),
+	DocElement::CommandHelp("mv"),
+	DocElement::CommandHelp("cp"),
+	DocElement::CommandHelp("list-favorites"),
+	DocElement::CommandHelp("favorite"),
+	DocElement::CommandHelp("unfavorite"),
+	DocElement::CommandHelp("list-recents"),
+	DocElement::CommandHelp("list-trash"),
+	DocElement::CommandHelp("trash-restore"),
+	DocElement::CommandHelp("trash-delete"),
+	DocElement::CommandHelp("empty-trash"),
+];
+
+impl FsCommands {
+	pub(super) async fn execute(self, ctx: CommandContext<'_>) -> Result<CommandResult> {
+		let CommandContext {
+			ui,
+			client,
+			working_path,
+			..
+		} = ctx;
+		match self {
+			Self::Cd { directory } => {
+				let working_path = cd(ui, client, working_path, &directory).await?;
+				return Ok(CommandResult {
+					working_path: Some(working_path),
+					..Default::default()
+				});
+			}
+			Self::Ls { directory, long } => {
+				list_directory(ui, client, working_path, directory, long).await?;
+			}
+			Self::Cat { file } => {
+				print_file(ui, client, working_path, &file, PrintFileLines::Full).await?;
+			}
+			Self::Head { file, lines } => {
+				print_file(ui, client, working_path, &file, PrintFileLines::Head(lines)).await?;
+			}
+			Self::Tail { file, lines } => {
+				print_file(ui, client, working_path, &file, PrintFileLines::Tail(lines)).await?;
+			}
+			Self::Stat { file_or_directory } => {
+				print_file_or_directory_info(ui, client, working_path, &file_or_directory).await?;
+			}
+			Self::Mkdir {
+				directory,
+				recursive,
+			} => {
+				create_directory(ui, client, working_path, &directory, recursive).await?;
+			}
+			Self::Rm {
+				file_or_directory,
+				permanent,
+			} => {
+				delete_file_or_directory(ui, client, working_path, &file_or_directory, permanent)
+					.await?;
+			}
+			Self::Mv {
+				source,
+				destination,
+			} => {
+				move_file_or_directory(ui, client, working_path, &source, &destination).await?;
+			}
+			Self::Cp {
+				source,
+				destination,
+			} => {
+				copy_file_or_directory(ui, client, working_path, &source, &destination).await?;
+			}
+			Self::ListFavorites => list_favorites(ui, client).await?,
+			Self::Favorite { file_or_directory } => {
+				set_file_or_directory_favorite(ui, client, working_path, &file_or_directory, true)
+					.await?;
+			}
+			Self::Unfavorite { file_or_directory } => {
+				set_file_or_directory_favorite(ui, client, working_path, &file_or_directory, false)
+					.await?;
+			}
+			Self::ListRecents => list_recents(ui, client).await?,
+			Self::ListTrash => list_trash(ui, client).await?,
+			Self::TrashRestore => select_trash_item(ui, client, TrashAction::Restore).await?,
+			Self::TrashDelete => select_trash_item(ui, client, TrashAction::Delete).await?,
+			Self::EmptyTrash => empty_trash(ui, client).await?,
+		}
+		Ok(CommandResult::default())
+	}
+}
 
 pub(crate) async fn cd(
 	ui: &mut UI,

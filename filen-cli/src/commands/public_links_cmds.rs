@@ -1,7 +1,14 @@
 use crate::{
-	auth::LazyClient, commands::fs_cmds::print_items_with_full_paths, ui::UI, util::RemotePath,
+	CommandResult,
+	auth::LazyClient,
+	commands::{CommandContext, fs_cmds::print_items_with_full_paths},
+	completion::FilenCompleter,
+	docs::DocElement,
+	ui::UI,
+	util::RemotePath,
 };
 use anyhow::{Context as _, Result};
+use clap::Subcommand;
 use filen_sdk_rs::{
 	ErrorKind,
 	auth::Client,
@@ -11,6 +18,43 @@ use filen_sdk_rs::{
 };
 use filen_types::api::v3::dir::link::PublicLinkExpiration;
 use std::fmt::{Display, Write as _};
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum PublicLinksCommands {
+	/// List public links
+	ListPublicLinks,
+	/// Create, update or delete a public link for a file or directory
+	PublicLink {
+		/// File or directory to create, update or delete a public link for
+		#[arg(add = FilenCompleter::file_or_directory())]
+		file_or_directory: String,
+	},
+}
+
+/// The commands that close the docs' "Accessing Files" section.
+pub(crate) const DOCS: &[DocElement] = &[
+	DocElement::CommandHelp("list-public-links"),
+	DocElement::CommandHelp("public-link"),
+];
+
+impl PublicLinksCommands {
+	pub(super) async fn execute(self, ctx: CommandContext<'_>) -> Result<CommandResult> {
+		let CommandContext {
+			ui,
+			client,
+			working_path,
+			..
+		} = ctx;
+		match self {
+			Self::ListPublicLinks => list_public_links(ui, client).await?,
+			Self::PublicLink { file_or_directory } => {
+				view_or_create_or_edit_public_link(ui, client, working_path, &file_or_directory)
+					.await?;
+			}
+		}
+		Ok(CommandResult::default())
+	}
+}
 
 /// Where the web app opens public links, as filen-web's `PUBLIC_LINK_BASE_URL` builds them.
 const PUBLIC_LINK_BASE_URL: &str = "https://app.filen.io/#/";

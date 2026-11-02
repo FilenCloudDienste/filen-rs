@@ -7,6 +7,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result, anyhow};
+use clap::Subcommand;
 use filen_sdk_rs::{
 	auth::Client,
 	rclone::{
@@ -15,9 +16,128 @@ use filen_sdk_rs::{
 		run_rclone,
 	},
 };
+use serde_json::json;
 use tokio::select;
 
-use crate::{CliConfig, auth::LazyClient, ui::UI};
+use crate::{
+	CliConfig, CommandResult, auth::LazyClient, commands::CommandContext, docs::DocElement, ui::UI,
+};
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum RcloneCommands {
+	/// Execute an Rclone command using the managed installation
+	Rclone {
+		/// The command to execute. Your Filen drive is available as the "filen" remote.
+		#[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+		cmd: Vec<String>,
+	},
+	/// Mount Filen as a network drive
+	Mount {
+		/// Where to mount the network drive: an empty directory (default: /tmp/filen), or on Windows a drive letter (default: X)
+		mount_point: Option<String>,
+		/// The maximum cache size (e.g. "500Mi", "10Gi") (default: 32Gi)
+		#[arg(long, value_parser = parse_size)]
+		cache_size: Option<u64>,
+	},
+	/// Runs a WebDAV, S3, FTP, SFTP, HTTP, restic or NFS server exposing your Filen drive
+	Serve {
+		/// The type of server to run: webdav, s3, ftp, sftp, http, restic, nfs
+		server: String,
+		/// IP and port for the server (`<ip>:<port>`; `0.0.0.0:<port>` for every network interface) (default: 127.0.0.1 and a port per type)
+		#[arg(long = "addr")]
+		address: Option<String>,
+		/// Username for authentication to the server (default: random, printed when the server starts).
+		/// On S3 servers, this is the Access Key ID. NFS servers have no authentication and listen on 127.0.0.1 only.
+		#[arg(long)]
+		user: Option<String>,
+		/// Password for authentication to the server (default: random, printed when the server starts).
+		/// On S3 servers, this is the Secret Access Key.
+		#[arg(long)]
+		password: Option<String>,
+		/// The server is read-only
+		#[arg(long)]
+		read_only: bool,
+		/// The maximum cache size (e.g. "500Mi", "10Gi") (default: 32Gi)
+		#[arg(long, value_parser = parse_size)]
+		cache_size: Option<u64>,
+		/// TLS certificate (PEM) to serve HTTPS with (WebDAV, S3, HTTP and restic; requires --key)
+		#[arg(long)]
+		cert: Option<String>,
+		/// TLS private key (PEM) for --cert
+		#[arg(long)]
+		key: Option<String>,
+	},
+	/// Exports your user API key (for use with non-managed Rclone)
+	ExportApiKey,
+}
+
+/// The docs' "Managed Rclone" section.
+pub(crate) const DOCS: &[DocElement] = &[
+	DocElement::DocFragment("managed-rclone"),
+	DocElement::CommandHelp("rclone"),
+	DocElement::CommandHelp("mount"),
+	DocElement::CommandHelp("serve"),
+	DocElement::CommandHelp("export-api-key"),
+];
+
+impl RcloneCommands {
+	pub(super) async fn execute(self, ctx: CommandContext<'_>) -> Result<CommandResult> {
+		let CommandContext {
+			config, ui, client, ..
+		} = ctx;
+		match self {
+			Self::Rclone { cmd } => execute_rclone(config, ui, client, cmd).await?,
+			Self::Mount {
+				mount_point,
+				cache_size,
+			} => mount(config, ui, client, mount_point, cache_size).await?,
+			Self::Serve {
+				server,
+				address,
+				user,
+				password,
+				read_only,
+				cache_size,
+				cert,
+				key,
+			} => {
+				let protocol = parse_protocol(&server)?;
+				start_server(
+					config,
+					ui,
+					client,
+					ServeArgs {
+						protocol,
+						address,
+						user,
+						password,
+						read_only,
+						cache_size,
+						cert,
+						key,
+					},
+				)
+				.await?;
+			}
+			Self::ExportApiKey => {
+				let client = client.get(ui).await?.to_stringified();
+				if ui.json {
+					ui.print_json(json!({
+						"email": client.email,
+						"apiKey": client.api_key,
+					}))?;
+				} else {
+					ui.print_warning("Keep your API key secret! Do not share it with anyone.");
+					ui.print_key_value_table(&[(
+						&format!("API Key for {}:", client.email),
+						client.api_key.as_str(),
+					)]);
+				}
+			}
+		}
+		Ok(CommandResult::default())
+	}
+}
 
 /// How long uploads waiting in the cache may finish when the CLI stops a drive or server.
 const STOP: StopOptions = StopOptions {

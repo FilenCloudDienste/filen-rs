@@ -3,13 +3,46 @@ use std::{
 	time::Duration,
 };
 
-use crate::{CommandResult, auth::LazyClient, ui::UI, util::RemotePath};
+use crate::{
+	CommandResult, auth::LazyClient, commands::CommandContext, docs::DocElement, ui::UI,
+	util::RemotePath,
+};
 use anyhow::{Context, Result, anyhow};
+use clap::Subcommand;
 use filen_sdk_rs::{
 	cache::{CacheMessage, ResyncProgress, SearchConfig, SearchSnapshot},
 	fs::HasUUID as _,
 };
 use serde_json::json;
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum SearchCommands {
+	/// Search for a file or directory interactively, or specify a query
+	Search { query: Option<String> },
+}
+
+/// The docs' "Accessing Files" section places `search` between browsing and organizing files.
+pub(crate) const DOCS: &[DocElement] = &[DocElement::CommandHelp("search")];
+
+impl SearchCommands {
+	pub(super) async fn execute(self, ctx: CommandContext<'_>) -> Result<CommandResult> {
+		let CommandContext {
+			ui,
+			client,
+			working_path,
+			..
+		} = ctx;
+		match self {
+			Self::Search { query: Some(query) } => {
+				search_cmd_non_interactive(ui, client, working_path, &query).await?;
+				Ok(CommandResult::default())
+			}
+			Self::Search { query: None } => Ok(search_cmd(ui, client, working_path)
+				.await?
+				.unwrap_or_default()),
+		}
+	}
+}
 
 // todo: allow non-interactive search
 

@@ -5,10 +5,35 @@ use std::{
 };
 
 use anyhow::{Context as _, Result};
+use clap::Subcommand;
+use clap_complete::engine::{ArgValueCompleter, PathCompleter};
 use filen_sdk_rs::{auth::Client, notes::Note};
 use filen_types::api::v3::notes::NoteType;
 
-use crate::{auth::LazyClient, ui::UI};
+use crate::{CommandResult, auth::LazyClient, commands::CommandContext, docs::DocElement, ui::UI};
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum NotesCommands {
+	/// Export all notes to a local directory
+	ExportNotes {
+		/// Local directory to export the notes to (default: the current local directory)
+		#[arg(add = ArgValueCompleter::new(PathCompleter::dir()))]
+		path: Option<String>,
+	},
+}
+
+/// The docs' "Notes" section.
+pub(crate) const DOCS: &[DocElement] = &[DocElement::CommandHelp("export-notes")];
+
+impl NotesCommands {
+	pub(super) async fn execute(self, ctx: CommandContext<'_>) -> Result<CommandResult> {
+		let CommandContext { ui, client, .. } = ctx;
+		match self {
+			Self::ExportNotes { path } => export_notes(ui, client, path.as_deref()).await?,
+		}
+		Ok(CommandResult::default())
+	}
+}
 
 use checklist_parser::checklist_html_to_markdown;
 

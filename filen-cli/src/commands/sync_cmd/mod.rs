@@ -1,6 +1,7 @@
 use std::{collections::HashSet, sync::Arc};
 
 use anyhow::{Context, Result};
+use clap::Subcommand;
 use console::style;
 use filen_sdk_rs::{
 	auth::Client,
@@ -12,13 +13,92 @@ use filen_sdk_rs::{
 use tokio::{select, sync::mpsc};
 
 use crate::{
-	CliConfig, commands::sync_cmd::sync_pairs::format_sync_pair, ui::UI, util::RemotePath,
+	CliConfig, CommandResult,
+	commands::{CommandContext, sync_cmd::sync_pairs::format_sync_pair},
+	docs::DocElement,
+	ui::UI,
+	util::RemotePath,
 };
 
 mod conflict_resolutions;
 mod sync_pairs;
 
-pub(crate) use conflict_resolutions::ConflictResolutions;
+use conflict_resolutions::ConflictResolutions;
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum SyncCommands {
+	/// Continuously sync one or more sync pairs
+	Sync {
+		/// Pair of local and remote directories to sync.
+		/// Format: `<local>:<remote>` or `<local>:<mode>:<remote>`, where `<mode>` is one of `twoWay`, `localBackup`, `remoteBackup`, `localToRemote`, `remoteToLocal`.
+		/// Alternatively, specify a syncPairs.yaml.
+		/// If none are specified, the default syncPairs.yaml under the config dir is included.
+		// todo: better command docs!
+		#[arg(short = 'p', long = "pair")]
+		pairs: Vec<String>,
+		/// Only run a single sync pass and exit.
+		#[arg(long)]
+		once: bool,
+		/// Disables the delete guard (applied only on the first sync pass).
+		#[arg(long)]
+		approve_mass_deletions: bool,
+		/// When a conflict occurs at the given path or under it, keep the local side.
+		/// The path is relative to the root of each sync pair.
+		/// Applied only on the first sync pass.
+		#[arg(long, value_name = "RELATIVE_PATH")]
+		keep_local: Vec<String>,
+		/// When a conflict occurs at the given path or under it, keep the remote side.
+		/// The path is relative to the root of each sync pair.
+		/// Applied only on the first sync pass.
+		#[arg(long, value_name = "RELATIVE_PATH")]
+		keep_remote: Vec<String>,
+		/// When a conflict occurs at the given path or under it, keep both sides.
+		/// The path is relative to the root of each sync pair.
+		/// Applied only on the first sync pass.
+		#[arg(long, value_name = "RELATIVE_PATH")]
+		keep_both: Vec<String>,
+	},
+}
+
+/// The commands that close the docs' "Transferring Files" section.
+pub(crate) const DOCS: &[DocElement] = &[DocElement::CommandHelp("sync")];
+
+impl SyncCommands {
+	pub(super) async fn execute(self, ctx: CommandContext<'_>) -> Result<CommandResult> {
+		let CommandContext {
+			config,
+			ui,
+			client,
+			working_path,
+		} = ctx;
+		match self {
+			Self::Sync {
+				pairs,
+				once,
+				approve_mass_deletions,
+				keep_local,
+				keep_remote,
+				keep_both,
+			} => {
+				let conflict_resolutions =
+					ConflictResolutions::new(keep_local, keep_remote, keep_both)?;
+				let client = client.get(ui).await?;
+				sync(
+					config,
+					ui,
+					client.clone(),
+					working_path,
+					&pairs,
+					once,
+					approve_mass_deletions,
+					conflict_resolutions,
+				)
+				.await?;
+			}
+		}
+		Ok(CommandResult::default())
+	}
+}
 
 // todo: better command documentation
 

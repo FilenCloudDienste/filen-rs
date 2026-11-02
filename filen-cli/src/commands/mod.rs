@@ -1,258 +1,53 @@
-use anyhow::{Context, Result};
+//! The CLI's commands. Each domain module owns a clap `Subcommand` enum for its commands,
+//! executes them, and exports the doc outline parts that place them in the docs
+//! (see [`crate::docs`]). [`Commands`] flattens the domain enums into one command line.
+
+use anyhow::Result;
 use clap::Subcommand;
-use clap_complete::engine::{ArgValueCompleter, PathCompleter};
-use serde_json::json;
 
-use crate::{
-	CliConfig, CommandResult,
-	auth::{self, LazyClient, export_auth_config},
-	completion::FilenCompleter,
-	docs::{print_in_app_docs, serve_markdown_docs_as_html},
-	ui::UI,
-	util::RemotePath,
-};
+use crate::{CliConfig, CommandResult, auth::LazyClient, ui::UI, util::RemotePath};
 
-mod fs_cmds;
-mod notes_cmds;
-mod public_links_cmds;
-mod rclone_cmds;
-mod search_cmd;
-mod sync_cmd;
-mod transfer_cmds;
+pub(crate) mod auth_cmds;
+pub(crate) mod fs_cmds;
+pub(crate) mod misc_cmds;
+pub(crate) mod notes_cmds;
+pub(crate) mod public_links_cmds;
+pub(crate) mod rclone_cmds;
+pub(crate) mod search_cmd;
+pub(crate) mod sync_cmd;
+pub(crate) mod transfer_cmds;
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum Commands {
-	/// Print help about a command or topic (default: general help)
-	Help {
-		/// Command or topic to show help about
-		#[arg(add = FilenCompleter::help_topic())]
-		command_or_topic: Option<String>,
-	},
-	/// Change the working directory (in REPL)
-	Cd {
-		/// Directory to navigate into (supports "..")
-		#[arg(add = FilenCompleter::directory())]
-		directory: String,
-	},
-	/// List files in a directory
-	Ls {
-		/// Directory to list files in (default: the current working directory)
-		#[arg(add = FilenCompleter::directory())]
-		directory: Option<String>,
-		/// Use a long listing format with file sizes
-		#[arg(short = 'l', long)]
-		long: bool,
-	},
-	/// Print the contents of a file
-	Cat {
-		/// File to print
-		#[arg(add = FilenCompleter::file())]
-		file: String,
-	},
-	/// Print the first lines of a file
-	Head {
-		/// File to print
-		#[arg(add = FilenCompleter::file())]
-		file: String,
-		/// Number of lines to print
-		#[arg(short = 'n', long, default_value_t = 10)]
-		lines: usize,
-	},
-	/// Print the last lines of a file
-	Tail {
-		/// File to print
-		#[arg(add = FilenCompleter::file())]
-		file: String,
-		/// Number of lines to print
-		#[arg(short = 'n', long, default_value_t = 10)]
-		lines: usize,
-	},
-	/// Show information about a file, a directory or the Filen drive
-	Stat {
-		/// File or directory to show information about ("/" for the Filen drive)
-		#[arg(add = FilenCompleter::file_or_directory())]
-		file_or_directory: String,
-	},
-	/// Create a new directory
-	Mkdir {
-		/// Directory to create
-		#[arg(add = FilenCompleter::directory())]
-		directory: String,
-		/// Recursively create parent directories
-		#[arg(short, long)]
-		recursive: bool,
-	},
-	/// Remove a file or directory
-	Rm {
-		/// File or directory to remove
-		#[arg(add = FilenCompleter::file_or_directory())]
-		file_or_directory: String,
-		/// Permanently delete the file or directory (default: move to trash)
-		#[arg(short, long)]
-		permanent: bool,
-	},
-	/// Move and/or rename a file or directory
-	Mv {
-		/// Source file or directory
-		#[arg(add = FilenCompleter::file_or_directory())]
-		source: String,
-		/// Destination: an existing directory to move the source into,
-		/// or the new path of the source (to move and/or rename it)
-		#[arg(add = FilenCompleter::file_or_directory())]
-		destination: String,
-	},
-	/// Copy a file or directory
-	Cp {
-		/// Source file or directory
-		#[arg(add = FilenCompleter::file_or_directory())]
-		source: String,
-		/// Destination parent directory
-		#[arg(add = FilenCompleter::directory())]
-		destination: String,
-	},
-	/// Upload a local file or directory (recursively) into a directory in the Filen drive
-	Upload {
-		/// Local file or directory to upload
-		#[arg(add = ArgValueCompleter::new(PathCompleter::any()))]
-		source: String,
-		/// Destination directory in the Filen drive (default: the current working directory)
-		#[arg(add = FilenCompleter::directory())]
-		destination: Option<String>,
-	},
-	/// Download a file or directory (recursively) from the Filen drive into a local directory
-	Download {
-		/// File or directory to download ("/" for the entire Filen drive)
-		#[arg(add = FilenCompleter::file_or_directory())]
-		source: String,
-		/// Local destination directory (default: the current local directory)
-		#[arg(add = ArgValueCompleter::new(PathCompleter::dir()))]
-		destination: Option<String>,
-	},
-	/// Continuously sync one or more sync pairs
-	Sync {
-		/// Pair of local and remote directories to sync.
-		/// Format: `<local>:<remote>` or `<local>:<mode>:<remote>`, where `<mode>` is one of `twoWay`, `localBackup`, `remoteBackup`, `localToRemote`, `remoteToLocal`.
-		/// Alternatively, specify a syncPairs.yaml.
-		/// If none are specified, the default syncPairs.yaml under the config dir is included.
-		// todo: better command docs!
-		#[arg(short = 'p', long = "pair")]
-		pairs: Vec<String>,
-		/// Only run a single sync pass and exit.
-		#[arg(long)]
-		once: bool,
-		/// Disables the delete guard (applied only on the first sync pass).
-		#[arg(long)]
-		approve_mass_deletions: bool,
-		/// When a conflict occurs at the given path or under it, keep the local side.
-		/// The path is relative to the root of each sync pair.
-		/// Applied only on the first sync pass.
-		#[arg(long, value_name = "RELATIVE_PATH")]
-		keep_local: Vec<String>,
-		/// When a conflict occurs at the given path or under it, keep the remote side.
-		/// The path is relative to the root of each sync pair.
-		/// Applied only on the first sync pass.
-		#[arg(long, value_name = "RELATIVE_PATH")]
-		keep_remote: Vec<String>,
-		/// When a conflict occurs at the given path or under it, keep both sides.
-		/// The path is relative to the root of each sync pair.
-		/// Applied only on the first sync pass.
-		#[arg(long, value_name = "RELATIVE_PATH")]
-		keep_both: Vec<String>,
-	},
-	/// Export all notes to a local directory
-	ExportNotes {
-		/// Local directory to export the notes to (default: the current local directory)
-		#[arg(add = ArgValueCompleter::new(PathCompleter::dir()))]
-		path: Option<String>,
-	},
-	/// Search for a file or directory interactively, or specify a query
-	Search { query: Option<String> },
-	/// List favorited items
-	ListFavorites,
-	/// Favorite a file or directory
-	Favorite {
-		/// File or directory to favorite
-		#[arg(add = FilenCompleter::file_or_directory())]
-		file_or_directory: String,
-	},
-	/// Unfavorite a file or directory
-	Unfavorite {
-		/// File or directory to unfavorite
-		#[arg(add = FilenCompleter::file_or_directory())]
-		file_or_directory: String,
-	},
-	/// List recently accessed items
-	ListRecents,
-	/// List trashed items
-	ListTrash,
-	/// Restore a trashed item interactively
-	TrashRestore,
-	/// Permanently delete a trashed item interactively
-	TrashDelete,
-	/// Permanently delete all trashed items
-	EmptyTrash,
-	/// List public links
-	ListPublicLinks,
-	/// Create, update or delete a public link for a file or directory
-	PublicLink {
-		/// File or directory to create, update or delete a public link for
-		#[arg(add = FilenCompleter::file_or_directory())]
-		file_or_directory: String,
-	},
-	/// Export an auth config (to be used with --auth-config-path option)
-	ExportAuthConfig,
-	/// Execute an Rclone command using the managed installation
-	Rclone {
-		/// The command to execute. Your Filen drive is available as the "filen" remote.
-		#[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-		cmd: Vec<String>,
-	},
-	/// Mount Filen as a network drive
-	Mount {
-		/// Where to mount the network drive: an empty directory (default: /tmp/filen), or on Windows a drive letter (default: X)
-		mount_point: Option<String>,
-		/// The maximum cache size (e.g. "500Mi", "10Gi") (default: 32Gi)
-		#[arg(long, value_parser = rclone_cmds::parse_size)]
-		cache_size: Option<u64>,
-	},
-	/// Runs a WebDAV, S3, FTP, SFTP, HTTP, restic or NFS server exposing your Filen drive
-	Serve {
-		/// The type of server to run: webdav, s3, ftp, sftp, http, restic, nfs
-		server: String,
-		/// IP and port for the server (`<ip>:<port>`; `0.0.0.0:<port>` for every network interface) (default: 127.0.0.1 and a port per type)
-		#[arg(long = "addr")]
-		address: Option<String>,
-		/// Username for authentication to the server (default: random, printed when the server starts).
-		/// On S3 servers, this is the Access Key ID. NFS servers have no authentication and listen on 127.0.0.1 only.
-		#[arg(long)]
-		user: Option<String>,
-		/// Password for authentication to the server (default: random, printed when the server starts).
-		/// On S3 servers, this is the Secret Access Key.
-		#[arg(long)]
-		password: Option<String>,
-		/// The server is read-only
-		#[arg(long)]
-		read_only: bool,
-		/// The maximum cache size (e.g. "500Mi", "10Gi") (default: 32Gi)
-		#[arg(long, value_parser = rclone_cmds::parse_size)]
-		cache_size: Option<u64>,
-		/// TLS certificate (PEM) to serve HTTPS with (WebDAV, S3, HTTP and restic; requires --key)
-		#[arg(long)]
-		cert: Option<String>,
-		/// TLS private key (PEM) for --cert
-		#[arg(long)]
-		key: Option<String>,
-	},
-	/// Exports your user API key (for use with non-managed Rclone)
-	ExportApiKey,
-	/// View the documentation (same as --help) locally in a browser rendered as HTML
-	ViewHtmlDocs,
-	/// Delete saved credentials and exit
-	Logout,
-	/// Exit the REPL
-	Exit,
+	#[command(flatten)]
+	Misc(misc_cmds::MiscCommands),
+	#[command(flatten)]
+	Fs(fs_cmds::FsCommands),
+	#[command(flatten)]
+	Transfer(transfer_cmds::TransferCommands),
+	#[command(flatten)]
+	Sync(sync_cmd::SyncCommands),
+	#[command(flatten)]
+	Notes(notes_cmds::NotesCommands),
+	#[command(flatten)]
+	Search(search_cmd::SearchCommands),
+	#[command(flatten)]
+	PublicLinks(public_links_cmds::PublicLinksCommands),
+	#[command(flatten)]
+	Auth(auth_cmds::AuthCommands),
+	#[command(flatten)]
+	Rclone(rclone_cmds::RcloneCommands),
 }
-// (!) every command needs to be mentioned in the docs outline
+// (!) every command needs to be in its module's doc outline parts (`DOCS`), which
+// `docs::DOC_OUTLINE` places into the doc sections
+
+/// What a command runs with.
+struct CommandContext<'a> {
+	config: &'a CliConfig,
+	ui: &'a mut UI,
+	client: &'a mut LazyClient,
+	working_path: &'a RemotePath,
+}
 
 pub(crate) async fn execute_command(
 	config: &CliConfig,
@@ -261,295 +56,21 @@ pub(crate) async fn execute_command(
 	working_path: &RemotePath,
 	command: Commands,
 ) -> Result<CommandResult> {
-	let result: Option<CommandResult> = match command {
-		Commands::Help { command_or_topic } => {
-			print_in_app_docs(ui, command_or_topic)?;
-			None
-		}
-		Commands::Cd { directory } => {
-			let working_path = fs_cmds::cd(ui, client, working_path, &directory).await?;
-			Some(CommandResult {
-				working_path: Some(working_path),
-				..Default::default()
-			})
-		}
-		Commands::Ls { directory, long } => {
-			fs_cmds::list_directory(ui, client, working_path, directory, long).await?;
-			None
-		}
-		Commands::Cat { file } => {
-			fs_cmds::print_file(
-				ui,
-				client,
-				working_path,
-				&file,
-				fs_cmds::PrintFileLines::Full,
-			)
-			.await?;
-			None
-		}
-		Commands::Head { file, lines } => {
-			fs_cmds::print_file(
-				ui,
-				client,
-				working_path,
-				&file,
-				fs_cmds::PrintFileLines::Head(lines),
-			)
-			.await?;
-			None
-		}
-		Commands::Tail { file, lines } => {
-			fs_cmds::print_file(
-				ui,
-				client,
-				working_path,
-				&file,
-				fs_cmds::PrintFileLines::Tail(lines),
-			)
-			.await?;
-			None
-		}
-		Commands::Stat { file_or_directory } => {
-			fs_cmds::print_file_or_directory_info(ui, client, working_path, &file_or_directory)
-				.await?;
-			None
-		}
-		Commands::Mkdir {
-			directory,
-			recursive,
-		} => {
-			fs_cmds::create_directory(ui, client, working_path, &directory, recursive).await?;
-			None
-		}
-		Commands::Rm {
-			file_or_directory,
-			permanent,
-		} => {
-			fs_cmds::delete_file_or_directory(
-				ui,
-				client,
-				working_path,
-				&file_or_directory,
-				permanent,
-			)
-			.await?;
-			None
-		}
-		Commands::Mv {
-			source,
-			destination,
-		} => {
-			fs_cmds::move_file_or_directory(ui, client, working_path, &source, &destination)
-				.await?;
-			None
-		}
-		Commands::Cp {
-			source,
-			destination,
-		} => {
-			fs_cmds::copy_file_or_directory(ui, client, working_path, &source, &destination)
-				.await?;
-			None
-		}
-		Commands::Upload {
-			source,
-			destination,
-		} => {
-			transfer_cmds::upload(ui, client, working_path, &source, destination.as_deref())
-				.await?;
-			None
-		}
-		Commands::Download {
-			source,
-			destination,
-		} => {
-			transfer_cmds::download(ui, client, working_path, &source, destination.as_deref())
-				.await?;
-			None
-		}
-		Commands::Sync {
-			pairs,
-			once,
-			approve_mass_deletions: allow_deletions,
-			keep_local,
-			keep_remote,
-			keep_both,
-		} => {
-			let conflict_resolutions =
-				sync_cmd::ConflictResolutions::new(keep_local, keep_remote, keep_both)?;
-			let client = client.get(ui).await?;
-			sync_cmd::sync(
-				config,
-				ui,
-				client.clone(),
-				working_path,
-				&pairs,
-				once,
-				allow_deletions,
-				conflict_resolutions,
-			)
-			.await?;
-			None
-		}
-		Commands::ExportNotes { path } => {
-			notes_cmds::export_notes(ui, client, path.as_deref()).await?;
-			None
-		}
-		Commands::Search { query } => {
-			if let Some(query) = query {
-				search_cmd::search_cmd_non_interactive(ui, client, working_path, &query).await?;
-				None
-			} else {
-				search_cmd::search_cmd(ui, client, working_path).await?
-			}
-		}
-		Commands::ListFavorites => {
-			fs_cmds::list_favorites(ui, client).await?;
-			None
-		}
-		Commands::Favorite { file_or_directory } => {
-			fs_cmds::set_file_or_directory_favorite(
-				ui,
-				client,
-				working_path,
-				&file_or_directory,
-				true,
-			)
-			.await?;
-			None
-		}
-		Commands::Unfavorite { file_or_directory } => {
-			fs_cmds::set_file_or_directory_favorite(
-				ui,
-				client,
-				working_path,
-				&file_or_directory,
-				false,
-			)
-			.await?;
-			None
-		}
-		Commands::ListRecents => {
-			fs_cmds::list_recents(ui, client).await?;
-			None
-		}
-		Commands::ListTrash => {
-			fs_cmds::list_trash(ui, client).await?;
-			None
-		}
-		Commands::TrashRestore => {
-			fs_cmds::select_trash_item(ui, client, fs_cmds::TrashAction::Restore).await?;
-			None
-		}
-		Commands::TrashDelete => {
-			fs_cmds::select_trash_item(ui, client, fs_cmds::TrashAction::Delete).await?;
-			None
-		}
-		Commands::EmptyTrash => {
-			fs_cmds::empty_trash(ui, client).await?;
-			None
-		}
-		Commands::ListPublicLinks => {
-			public_links_cmds::list_public_links(ui, client).await?;
-			None
-		}
-		Commands::PublicLink { file_or_directory } => {
-			public_links_cmds::view_or_create_or_edit_public_link(
-				ui,
-				client,
-				working_path,
-				&file_or_directory,
-			)
-			.await?;
-			None
-		}
-		Commands::ExportAuthConfig => {
-			let client = client.get(ui).await?;
-			let export_path = export_auth_config(
-				client,
-				&std::env::current_dir().context("Failed to get current working directory")?,
-			)?;
-			ui.print_success(&format!(
-				"Exported auth config to {}",
-				export_path.display()
-			));
-			None
-		}
-		Commands::Rclone { cmd } => {
-			rclone_cmds::execute_rclone(config, ui, client, cmd).await?;
-			None
-		}
-		Commands::Mount {
-			mount_point,
-			cache_size,
-		} => {
-			rclone_cmds::mount(config, ui, client, mount_point, cache_size).await?;
-			None
-		}
-		Commands::Serve {
-			server,
-			address,
-			user,
-			password,
-			read_only,
-			cache_size,
-			cert,
-			key,
-		} => {
-			let protocol = rclone_cmds::parse_protocol(&server)?;
-			rclone_cmds::start_server(
-				config,
-				ui,
-				client,
-				rclone_cmds::ServeArgs {
-					protocol,
-					address,
-					user,
-					password,
-					read_only,
-					cache_size,
-					cert,
-					key,
-				},
-			)
-			.await?;
-			None
-		}
-		Commands::ExportApiKey => {
-			let client = client.get(ui).await?.to_stringified();
-			if ui.json {
-				ui.print_json(json!({
-					"email": client.email,
-					"apiKey": client.api_key,
-				}))?;
-			} else {
-				ui.print_warning("Keep your API key secret! Do not share it with anyone.");
-				ui.print_key_value_table(&[(
-					&format!("API Key for {}:", client.email),
-					client.api_key.as_str(),
-				)]);
-			}
-			None
-		}
-		Commands::ViewHtmlDocs => {
-			serve_markdown_docs_as_html(ui).context("Failed to serve markdown docs as HTML")?;
-			None
-		}
-		Commands::Logout => {
-			if auth::logout(config, ui)? {
-				Some(CommandResult {
-					exit: true,
-					..Default::default()
-				})
-			} else {
-				None
-			}
-		}
-		Commands::Exit => Some(CommandResult {
-			exit: true,
-			..Default::default()
-		}),
+	let ctx = CommandContext {
+		config,
+		ui,
+		client,
+		working_path,
 	};
-	Ok(result.unwrap_or_default())
+	match command {
+		Commands::Misc(command) => command.execute(ctx),
+		Commands::Fs(command) => command.execute(ctx).await,
+		Commands::Transfer(command) => command.execute(ctx).await,
+		Commands::Sync(command) => command.execute(ctx).await,
+		Commands::Notes(command) => command.execute(ctx).await,
+		Commands::Search(command) => command.execute(ctx).await,
+		Commands::PublicLinks(command) => command.execute(ctx).await,
+		Commands::Auth(command) => command.execute(ctx).await,
+		Commands::Rclone(command) => command.execute(ctx).await,
+	}
 }

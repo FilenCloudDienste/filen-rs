@@ -13,12 +13,21 @@ use clap::{CommandFactory, builder::Styles};
 use filen_macros::extract_cli_doc_fragments;
 use tiny_http::{Header, Response};
 
-use crate::{CliArgs, ui::UI};
+use crate::{
+	CliArgs,
+	commands::{
+		auth_cmds, fs_cmds, misc_cmds, notes_cmds, public_links_cmds, rclone_cmds, search_cmd,
+		sync_cmd, transfer_cmds,
+	},
+	ui::UI,
+};
 
 extract_cli_doc_fragments!();
 
+/// One piece of a doc section. Each command module exports the pieces that document its
+/// commands (`DOCS` consts), and [`DOC_OUTLINE`] places them into sections.
 #[derive(Debug)]
-enum DocElement {
+pub(crate) enum DocElement {
 	Heading1(&'static str),
 	DocFragment(&'static str),
 	CommandHelp(&'static str),
@@ -37,7 +46,14 @@ enum ParsedDocElement {
 struct DocSection {
 	id: &'static str,
 	title: &'static str,
-	elements: Vec<DocElement>,
+	/// The section's elements, in order: its parts are concatenated.
+	parts: &'static [&'static [DocElement]],
+}
+
+impl DocSection {
+	fn elements(&self) -> impl Iterator<Item = &'static DocElement> {
+		self.parts.iter().flat_map(|part| part.iter())
+	}
 }
 
 #[derive(Debug, Clone)]
@@ -47,100 +63,67 @@ struct ParsedDocSection {
 	elements: Vec<ParsedDocElement>,
 }
 
+const USAGE_INTRO_DOCS: &[DocElement] = &[
+	DocElement::DocFragment("main-usage"),
+	DocElement::Heading1("Options"),
+	DocElement::GlobalOptions,
+	DocElement::Heading1("Updates"),
+	DocElement::DocFragment("updates"),
+	DocElement::Heading1("Commands"),
+];
+
+/// The sections of the docs, in order. Every command and doc fragment must appear exactly once.
+const DOC_OUTLINE: &[DocSection] = &[
+	DocSection {
+		id: "usage",
+		title: "Usage",
+		parts: &[USAGE_INTRO_DOCS, misc_cmds::DOCS],
+	},
+	DocSection {
+		id: "auth",
+		title: "Authentication",
+		parts: &[auth_cmds::DOCS],
+	},
+	DocSection {
+		id: "access-files",
+		title: "Accessing Files",
+		parts: &[
+			fs_cmds::BROWSING_DOCS,
+			search_cmd::DOCS,
+			fs_cmds::ORGANIZING_DOCS,
+			public_links_cmds::DOCS,
+		],
+	},
+	DocSection {
+		id: "transfer-files",
+		title: "Transferring Files",
+		parts: &[transfer_cmds::DOCS, sync_cmd::DOCS],
+	},
+	DocSection {
+		id: "notes",
+		title: "Notes",
+		parts: &[notes_cmds::DOCS],
+	},
+	DocSection {
+		id: "managed-rclone",
+		title: "Managed Rclone",
+		parts: &[rclone_cmds::DOCS],
+	},
+];
+
 const MAIN_SECTION: &str = "usage";
 static PARSED_DOC_OUTLINE: LazyLock<Result<Vec<ParsedDocSection>>> = LazyLock::new(|| {
-	let doc_outline = [
-		DocSection {
-			id: "usage",
-			title: "Usage",
-			elements: vec![
-				DocElement::DocFragment("main-usage"),
-				DocElement::Heading1("Options"),
-				DocElement::GlobalOptions,
-				DocElement::Heading1("Updates"),
-				DocElement::DocFragment("updates"),
-				DocElement::Heading1("Commands"),
-				DocElement::CommandHelp("help"),
-				DocElement::CommandHelp("view-html-docs"),
-				DocElement::CommandHelp("exit"),
-			],
-		},
-		DocSection {
-			id: "auth",
-			title: "Authentication",
-			elements: vec![
-				DocElement::DocFragment("auth-methods"),
-				DocElement::CommandHelp("export-auth-config"),
-				DocElement::CommandHelp("logout"),
-			],
-		},
-		DocSection {
-			id: "access-files",
-			title: "Accessing Files",
-			elements: vec![
-				DocElement::CommandHelp("cd"),
-				DocElement::CommandHelp("ls"),
-				DocElement::CommandHelp("cat"),
-				DocElement::CommandHelp("head"),
-				DocElement::CommandHelp("tail"),
-				DocElement::CommandHelp("stat"),
-				DocElement::CommandHelp("search"),
-				DocElement::CommandHelp("mkdir"),
-				DocElement::CommandHelp("rm"),
-				DocElement::CommandHelp("mv"),
-				DocElement::CommandHelp("cp"),
-				DocElement::CommandHelp("list-favorites"),
-				DocElement::CommandHelp("favorite"),
-				DocElement::CommandHelp("unfavorite"),
-				DocElement::CommandHelp("list-recents"),
-				DocElement::CommandHelp("list-trash"),
-				DocElement::CommandHelp("trash-restore"),
-				DocElement::CommandHelp("trash-delete"),
-				DocElement::CommandHelp("empty-trash"),
-				DocElement::CommandHelp("list-public-links"),
-				DocElement::CommandHelp("public-link"),
-			],
-		},
-		DocSection {
-			id: "transfer-files",
-			title: "Transferring Files",
-			elements: vec![
-				DocElement::DocFragment("transfers"),
-				DocElement::CommandHelp("upload"),
-				DocElement::CommandHelp("download"),
-				DocElement::CommandHelp("sync"),
-			],
-		},
-		DocSection {
-			id: "notes",
-			title: "Notes",
-			elements: vec![DocElement::CommandHelp("export-notes")],
-		},
-		DocSection {
-			id: "managed-rclone",
-			title: "Managed Rclone",
-			elements: vec![
-				DocElement::DocFragment("managed-rclone"),
-				DocElement::CommandHelp("rclone"),
-				DocElement::CommandHelp("mount"),
-				DocElement::CommandHelp("serve"),
-				DocElement::CommandHelp("export-api-key"),
-			],
-		},
-	];
-
 	// parse doc elements
 	let mut commands = CliArgs::command();
 	let mut used_commands = HashSet::new();
 	let cli_doc_fragments = get_cli_doc_fragments();
 	let mut used_doc_fragments = HashSet::new();
 	let mut used_global_options = false;
-	let parsed_outline = doc_outline
+	let parsed_outline = DOC_OUTLINE
 		.iter()
 		.map(|section| {
 			let parsed_elements = section
-				.elements
-				.iter()
+				.elements()
 				.map(|element| match element {
 					DocElement::Heading1(text) => Ok(ParsedDocElement::Heading1 {
 						text: text.to_string(),
@@ -224,10 +207,10 @@ static PARSED_DOC_OUTLINE: LazyLock<Result<Vec<ParsedDocSection>>> = LazyLock::n
 
 	// ensure ids are unique among doc fragments and commands
 	// (sections are allowed to have the same id, then they take precedence)
-	let mut ids = doc_outline
+	let mut ids = DOC_OUTLINE
 		.iter()
 		.flat_map(|section| {
-			section.elements.iter().filter_map(|element| match element {
+			section.elements().filter_map(|element| match element {
 				DocElement::DocFragment(fragment_id) => Some(*fragment_id),
 				DocElement::CommandHelp(command_id) => Some(*command_id),
 				_ => None,
@@ -575,3 +558,15 @@ a:hover{text-decoration:underline}
 @media (max-width:640px){body{margin:14px;font-size:14px} h1{font-size:22px}}
 </style>
 ";
+
+#[cfg(test)]
+mod tests {
+	use super::PARSED_DOC_OUTLINE;
+
+	#[test]
+	fn doc_outline_documents_every_command_and_fragment_once() {
+		if let Err(e) = PARSED_DOC_OUTLINE.as_ref() {
+			panic!("the doc outline is incomplete: {e:#}");
+		}
+	}
+}
