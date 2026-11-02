@@ -9,8 +9,6 @@
 //! When a single item inside a directory transfer fails, the rest of the transfer still completes
 //! and the failures are listed at the end. Press Ctrl+C to cancel a running transfer.
 
-// AI: written by Claude Code 11/08/2026
-
 use std::{
 	borrow::Cow,
 	path::{Path, PathBuf},
