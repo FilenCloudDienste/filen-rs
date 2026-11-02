@@ -298,14 +298,44 @@ async fn a_new_daemon_stops_the_rclone_a_crashed_host_left() {
 	let dirs = Dirs::new();
 	let crashed = dirs.start().await;
 	let stale_pid = crashed.pid();
-	// What a crashed host leaves: rclone running, its pidfile in place, the watchdog armed.
-	std::mem::forget(crashed);
+	crashed.abandon_for_test();
 
 	let daemon = dirs.start().await;
 
 	assert!(!process_is_running(stale_pid));
 	assert_ne!(daemon.pid(), stale_pid);
 	daemon.stop(GRACEFUL).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_second_daemon_on_the_same_cache_is_refused_and_leaves_the_first_running() {
+	let dirs = Dirs::new();
+	let first = dirs.start().await;
+
+	let error = RcloneDaemon::start_local_for_test(dirs.config(), &dirs.remote())
+		.await
+		.err()
+		.unwrap();
+
+	assert_eq!(
+		error.downcast_ref::<RcloneRefusal>(),
+		Some(&RcloneRefusal::CacheInUse)
+	);
+	assert!(process_is_running(first.pid()));
+	// Its rc still takes its credentials.
+	first.stats().await.unwrap();
+	first.stop(GRACEFUL).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stopped_daemon_releases_its_cache_to_the_next() {
+	let dirs = Dirs::new();
+	let first = dirs.start().await;
+	first.stop(GRACEFUL).await.unwrap();
+
+	let second = dirs.start().await;
+
+	second.stop(GRACEFUL).await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -22,7 +22,7 @@ pub struct RcloneDaemonOptions {
 	/// A directory only the daemon uses, for its own state. Created (0700 on Unix) if missing.
 	pub state_dir: String,
 	/// rclone's cache directory, whose VFS cache holds what is not uploaded yet. Created (0700 on
-	/// Unix) if missing.
+	/// Unix) if missing. One daemon at a time uses it: another is refused with `cacheInUse`.
 	pub cache_dir: String,
 	/// rclone's log file, rotated at 10 MB with three old ones kept. Without one, rclone's output
 	/// goes to the SDK's log.

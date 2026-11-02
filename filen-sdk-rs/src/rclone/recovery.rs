@@ -19,6 +19,7 @@ use crate::{
 	error::ResultExt as _,
 	rclone::{
 		RcloneRefusal,
+		lock::{FileLock, try_lock},
 		private_file::write_private_file,
 		system::{ProcessIdentity, identify, processes_under, stop_processes},
 	},
@@ -34,6 +35,9 @@ const VFS_DIR: &str = "vfs";
 const VFS_META_DIR: &str = "vfsMeta";
 /// rc's credentials file in a daemon's state directory.
 pub(crate) const HTPASSWD_FILE: &str = "rc.htpasswd";
+/// The file in a cache directory whose lock the daemon using it holds: two rclones on one VFS cache
+/// corrupt it.
+const CACHE_LOCK: &str = "daemon.lock";
 /// How long a stale rclone has to quit before it is killed.
 const STALE_GRACE: Duration = Duration::from_secs(5);
 /// How long a mount point may take to answer `stat` before it is taken for a stale mount: a
@@ -151,6 +155,15 @@ fn is_recorded_rclone(process: &ProcessIdentity, record: &PidRecord) -> bool {
 			.is_some_and(|exe| exe == record.binary)
 }
 
+/// Takes the lock on `cache_dir`, an existing directory, for a daemon to use it. Refused with
+/// [`RcloneRefusal::CacheInUse`] while another daemon holds it.
+pub(crate) fn lock_cache(cache_dir: &Path) -> Result<FileLock, Error> {
+	let path = cache_dir.join(CACHE_LOCK);
+	try_lock(&path)
+		.context(format!("failed to lock {}", path.display()))?
+		.ok_or_else(|| RcloneRefusal::CacheInUse.into())
+}
+
 /// Stops every process whose executable is inside `dir`, such as the old desktop client's rclone
 /// under `<userData>/rclone/bin`: asks it to terminate and kills it after `grace_ms`. Returns how
 /// many it stopped; a missing `dir` stops none.
@@ -174,9 +187,10 @@ pub async fn stop_rclone_under(dir: &Path, grace_ms: u32) -> Result<u32, Error> 
 /// Deletes the VFS caches in a daemon's `cache_dir` (its `vfs` and `vfsMeta` directories), keeping
 /// the rest, such as the sftp serve's host keys.
 ///
-/// Refused with [`RcloneRefusal::CacheInUse`] while the rclone `state_dir`'s pidfile names still
-/// runs, and with [`RcloneRefusal::UploadsPending`] while the cache holds files not uploaded yet
-/// (rclone marks them dirty in their metadata), which the next daemon on it uploads.
+/// Refused with [`RcloneRefusal::CacheInUse`] while a daemon uses the cache or the rclone
+/// `state_dir`'s pidfile names still runs, and with [`RcloneRefusal::UploadsPending`] while the
+/// cache holds files not uploaded yet (rclone marks them dirty in their metadata), which the next
+/// daemon on it uploads.
 pub async fn clear_cache(state_dir: &Path, cache_dir: &Path) -> Result<(), Error> {
 	if let Some(record) = PidRecord::read(state_dir)?
 		&& let Some(process) = identify(record.pid).await?
@@ -184,8 +198,22 @@ pub async fn clear_cache(state_dir: &Path, cache_dir: &Path) -> Result<(), Error
 	{
 		return Err(RcloneRefusal::CacheInUse.into());
 	}
+	// Held while the caches are deleted, so no daemon starts on them meanwhile.
+	let lock_path = cache_dir.join(CACHE_LOCK);
+	let lock = match try_lock(&lock_path) {
+		Ok(Some(lock)) => Some(lock),
+		Ok(None) => return Err(RcloneRefusal::CacheInUse.into()),
+		// No cache directory: there is nothing to delete.
+		Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+		Err(e) => {
+			return Err(
+				Error::from(e).with_context(format!("failed to lock {}", lock_path.display()))
+			);
+		}
+	};
 	let cache_dir = cache_dir.to_path_buf();
 	tokio::task::spawn_blocking(move || {
+		let _lock = lock;
 		let pending = dirty_files(&cache_dir.join(VFS_META_DIR))?;
 		if pending > 0 {
 			return Err(RcloneRefusal::UploadsPending { count: pending }.into());
@@ -382,7 +410,9 @@ fn remove_if_present(path: &Path) -> Result<(), Error> {
 
 #[cfg(test)]
 mod tests {
-	use super::{HTPASSWD_FILE, PIDFILE, PidRecord, StaleRecovery, clear_cache, recover_stale};
+	use super::{
+		HTPASSWD_FILE, PIDFILE, PidRecord, StaleRecovery, clear_cache, lock_cache, recover_stale,
+	};
 	use crate::rclone::{RcloneRefusal, system::identify};
 
 	/// A cache directory with one VFS item whose metadata is marked `dirty`, and the sftp serve's
@@ -477,6 +507,37 @@ mod tests {
 			Some(&RcloneRefusal::CacheInUse)
 		);
 		assert!(cache.path().join("vfs").exists());
+	}
+
+	#[tokio::test]
+	async fn clear_cache_refuses_a_cache_a_daemon_holds() {
+		let state = tempfile::tempdir().unwrap();
+		let cache = cache_with_item(false);
+		let held = lock_cache(cache.path()).unwrap();
+
+		let error = clear_cache(state.path(), cache.path()).await.unwrap_err();
+
+		assert_eq!(
+			error.downcast_ref::<RcloneRefusal>(),
+			Some(&RcloneRefusal::CacheInUse)
+		);
+		assert!(cache.path().join("vfs").exists());
+		drop(held);
+	}
+
+	#[test]
+	fn a_second_daemon_is_refused_the_cache_until_the_first_releases_it() {
+		let cache = tempfile::tempdir().unwrap();
+		let first = lock_cache(cache.path()).unwrap();
+
+		let refused = lock_cache(cache.path()).unwrap_err();
+		assert_eq!(
+			refused.downcast_ref::<RcloneRefusal>(),
+			Some(&RcloneRefusal::CacheInUse)
+		);
+
+		drop(first);
+		lock_cache(cache.path()).unwrap();
 	}
 
 	#[test]

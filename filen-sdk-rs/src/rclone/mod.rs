@@ -11,6 +11,7 @@ mod fuse;
 // The JS bindings' surface: the desktop one (napi), and UniFFI for the typings it is checked against.
 #[cfg(any(feature = "uniffi", feature = "napi"))]
 mod js_impl;
+mod lock;
 mod mount;
 #[cfg(feature = "rclone-managed")]
 mod passthrough;

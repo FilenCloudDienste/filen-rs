@@ -53,9 +53,10 @@ use crate::{
 	rclone::{
 		RcloneBinary, RcloneRefusal,
 		binary::{MIN_RCLONE, parse_version},
+		lock::FileLock,
 		private_file::write_private_file,
 		rc::{CoreStatsTransfer, RcClient},
-		recovery::{HTPASSWD_FILE, PIDFILE, PidRecord, force_unmount, recover_stale},
+		recovery::{HTPASSWD_FILE, PIDFILE, PidRecord, force_unmount, lock_cache, recover_stale},
 		serve::ServeInfo,
 		system::{identify, spawn_rclone},
 		vfs::VfsTuning,
@@ -125,7 +126,9 @@ pub struct RcloneDaemonConfig {
 	pub state_dir: PathBuf,
 	/// rclone's cache directory (`--cache-dir`). Its VFS cache holds what was written to a mount
 	/// or a serve and is not uploaded yet, which the next daemon on the same directory uploads.
-	/// Created (0700 on Unix) if it is missing.
+	/// Created (0700 on Unix) if it is missing. One daemon at a time uses it: another is refused
+	/// with [`RcloneRefusal::CacheInUse`] until it is stopped, as two rclones on one VFS cache
+	/// corrupt it.
 	pub cache_dir: PathBuf,
 	/// rclone's log file, rotated at 10 MB with three old ones kept. Without one, rclone logs to
 	/// its stderr, which is logged here at `info`.
@@ -234,6 +237,8 @@ pub struct RcloneDaemon {
 	/// Where rclone keeps its VFS caches' metadata, under the cache directory; a metadata root
 	/// `vfs/stats` reports outside it is not read.
 	vfs_meta_root: PathBuf,
+	/// The cache directory's lock, held until rclone is stopped.
+	cache_lock: Mutex<Option<FileLock>>,
 	/// How long a written file waits before it is uploaded, when a test changes it for its mounts.
 	#[cfg(feature = "test-seams")]
 	pub(super) write_back_for_test: Option<Duration>,
@@ -310,8 +315,9 @@ impl RemoteBackend {
 impl RcloneDaemon {
 	/// Starts `rclone rcd` for `client`'s account.
 	///
-	/// Resolves the binary, starts rclone on a free loopback port with rc behind a random
-	/// password, waits up to 15 s for rc to answer, refuses an rclone older than 1.74.3
+	/// Resolves the binary, refuses a cache directory another daemon uses
+	/// ([`RcloneRefusal::CacheInUse`]), starts rclone on a free loopback port with rc behind a
+	/// random password, waits up to 15 s for rc to answer, refuses an rclone older than 1.74.3
 	/// ([`RcloneRefusal::UnsupportedVersion`]), and creates the `Filen` and `FilenRO` remotes in its
 	/// in-memory config. Fails, with rclone killed, if any step does.
 	pub async fn start(client: &Client, config: RcloneDaemonConfig) -> Result<Self, Error> {
@@ -325,6 +331,9 @@ impl RcloneDaemon {
 		let binary = config.binary.resolve().await?;
 		create_private_dir(&config.state_dir).await?;
 		create_private_dir(&config.cache_dir).await?;
+		// Taken before anything is recovered, so a daemon refused the cache leaves the one using it
+		// alone.
+		let cache_lock = lock_cache(&config.cache_dir)?;
 		let recovered = recover_stale(&config.state_dir).await?;
 		if recovered.stopped || !recovered.unmounted.is_empty() {
 			info!("recovered from a crashed rclone daemon: {recovered:?}");
@@ -332,6 +341,10 @@ impl RcloneDaemon {
 
 		let password = hex::encode(rand::random::<[u8; 32]>());
 		let (daemon, version) = Self::spawn_until_ready(&binary, &config, &password).await?;
+		*daemon
+			.cache_lock
+			.lock()
+			.unwrap_or_else(PoisonError::into_inner) = Some(cache_lock);
 		check_version(version)?;
 		for name in [FILEN_REMOTE, FILEN_READ_ONLY_REMOTE] {
 			daemon
@@ -455,6 +468,7 @@ impl RcloneDaemon {
 			vfs_meta_root: std::path::absolute(&config.cache_dir)
 				.unwrap_or_else(|_| config.cache_dir.clone())
 				.join("vfsMeta"),
+			cache_lock: Mutex::new(None),
 			#[cfg(feature = "test-seams")]
 			write_back_for_test: None,
 		})
@@ -695,6 +709,13 @@ impl RcloneDaemon {
 		{
 			warn!("removing {} failed: {e}", self.pidfile.display());
 		}
+		// No rclone uses the cache any more.
+		drop(
+			self.cache_lock
+				.lock()
+				.unwrap_or_else(PoisonError::into_inner)
+				.take(),
+		);
 		Ok(StopReport {
 			pending_uploads: pending,
 			forced,
@@ -745,6 +766,18 @@ impl RcloneDaemon {
 		dir: &Path,
 	) -> Result<Self, Error> {
 		Self::start_with(config, &RemoteBackend::local(dir)).await
+	}
+
+	/// Leaves what a host that crashed leaves: rclone running, its pidfile and watchdog in place,
+	/// and the daemon's locks released, as the system releases a dead process's.
+	pub fn abandon_for_test(self) {
+		drop(
+			self.cache_lock
+				.lock()
+				.unwrap_or_else(PoisonError::into_inner)
+				.take(),
+		);
+		std::mem::forget(self);
 	}
 
 	/// The loopback port rclone's rc listens on.
