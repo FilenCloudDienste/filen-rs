@@ -315,8 +315,14 @@ async fn async_main(arenas_limited: bool) {
 	let mut ui = ui::UI::new();
 	// call ui.initialize() later after parsing args
 
+	let finished = inner_main(&mut ui, arenas_limited).await;
+	// whatever the command made of being cut short, nobody reads what is left to print
+	if interrupt::stdout_closed() {
+		info!("Exiting, as stdout was closed");
+		std::process::exit(0);
+	}
 	// translate errors to non-zero exit code
-	match inner_main(&mut ui, arenas_limited).await {
+	match finished {
 		Ok(Finished::Success) => {}
 		Ok(Finished::ScriptLineFailed(code)) => std::process::exit(code),
 		Err(e) => {
@@ -525,6 +531,9 @@ async fn inner_main(ui: &mut ui::UI, arenas_limited: bool) -> Result<Finished> {
 				LineOutcome::Failed(code) => last_failure = Some(code),
 				LineOutcome::Exit => break,
 			}
+			if interrupt::stdout_closed() {
+				break;
+			}
 		}
 		Ok(last_failure.map_or(Finished::Success, Finished::ScriptLineFailed))
 	} else {
@@ -554,6 +563,9 @@ async fn inner_main(ui: &mut ui::UI, arenas_limited: bool) -> Result<Finished> {
 			match lines.run(ui, &mut working_path, &line).await {
 				LineOutcome::Done | LineOutcome::Failed(_) => {}
 				LineOutcome::Exit => break,
+			}
+			if interrupt::stdout_closed() {
+				break;
 			}
 		}
 		Ok(Finished::Success)

@@ -5,6 +5,10 @@
 //! transfer, `mount`, `serve` and `sync` do to stop cleanly. A further Ctrl-C while a cancelled
 //! command has not ended yet, or while a command stops after Ctrl-C ([`Owning::into_stopping`]),
 //! quits the CLI.
+//!
+//! A closed stdout ([`close_stdout`]), as `head` closes it once it has read its lines, ends the
+//! CLI the same way, once: the running command is cancelled, or stopped as Ctrl-C stops it, and
+//! the CLI exits with 0, as the reader has what it wanted.
 
 use std::{
 	process,
@@ -28,6 +32,7 @@ static STATE: Mutex<State> = Mutex::new(State {
 	owning: 0,
 	stopping: 0,
 	cancelling: false,
+	stdout_closed: false,
 });
 
 /// Installs the Ctrl-C handler. Called once, when the CLI starts.
@@ -37,12 +42,29 @@ pub(crate) fn install() -> Result<(), ctrlc::Error> {
 
 /// What the handler does on Ctrl-C.
 fn on_ctrl_c() {
-	match lock_state().press() {
-		Action::Quit => quit(),
+	act(lock_state().press());
+}
+
+/// Ends the running command, or the CLI if none runs, as Ctrl-C does, after a write to stdout
+/// found it closed. Only the first call does: the command may print more while it stops.
+pub(crate) fn close_stdout() {
+	act(lock_state().close_stdout());
+}
+
+/// Whether stdout was closed ([`close_stdout`]), so the CLI exits with 0 and runs no further
+/// command.
+pub(crate) fn stdout_closed() -> bool {
+	lock_state().stdout_closed
+}
+
+fn act(action: Action) {
+	match action {
+		Action::Quit(code) => quit(code),
 		Action::Send(press) => {
 			// No receiver is not an error: the command that owns Ctrl-C may be ending.
 			let _ = PRESSES.send(press);
 		}
+		Action::Nothing => {}
 	}
 }
 
@@ -50,15 +72,15 @@ fn lock_state() -> std::sync::MutexGuard<'static, State> {
 	STATE.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Quits the CLI after Ctrl-C.
-fn quit() -> ! {
+/// Quits the CLI with `code`, after Ctrl-C or once stdout is closed.
+fn quit(code: i32) -> ! {
 	// A progress bar hides the cursor, which would stay hidden in the shell.
 	let term = console::Term::stderr();
 	if term.is_term() {
 		let _ = term.show_cursor();
 	}
-	log::info!("Quit by Ctrl-C");
-	process::exit(EXIT_INTERRUPTED)
+	log::info!("Quit with exit code {code}");
+	process::exit(code)
 }
 
 /// What the CLI is doing about Ctrl-C.
@@ -72,13 +94,17 @@ struct State {
 	stopping: usize,
 	/// Whether a Ctrl-C has cancelled a command that has not ended yet.
 	cancelling: bool,
+	/// Whether stdout was closed.
+	stdout_closed: bool,
 }
 
 /// What a Ctrl-C does.
 #[derive(Debug, PartialEq)]
 enum Action {
-	Quit,
+	/// Quit the CLI with this exit code.
+	Quit(i32),
 	Send(Press),
+	Nothing,
 }
 
 /// A Ctrl-C, as sent to the commands.
@@ -91,8 +117,24 @@ struct Press {
 impl State {
 	fn press(&mut self) -> Action {
 		if self.catching == 0 || self.cancelling || self.stopping > 0 {
-			return Action::Quit;
+			return Action::Quit(EXIT_INTERRUPTED);
 		}
+		self.end_running_command()
+	}
+
+	fn close_stdout(&mut self) -> Action {
+		if self.stdout_closed {
+			return Action::Nothing;
+		}
+		self.stdout_closed = true;
+		if self.catching == 0 {
+			return Action::Quit(0);
+		}
+		self.end_running_command()
+	}
+
+	/// Cancels the running command, or has it stop if it handles Ctrl-C itself.
+	fn end_running_command(&mut self) -> Action {
 		let owned = self.owning > 0;
 		if !owned {
 			self.cancelling = true;
@@ -145,14 +187,20 @@ impl Drop for Catching {
 }
 
 /// Runs `command` until it ends or Ctrl-C cancels it, unless it handles Ctrl-C itself ([`own`]).
-/// Cancelling drops `command` and fails with [`CliError::Interrupted`].
+/// Cancelling drops `command` and fails with [`CliError::Interrupted`], or
+/// [`CliError::StdoutClosed`] when a closed stdout cancelled it.
 pub(crate) async fn cancellable<T>(
 	command: impl Future<Output = anyhow::Result<T>>,
 ) -> anyhow::Result<T> {
 	let mut catching = catch();
 	tokio::select! {
 		result = command => result,
-		() = catching.cancelled() => Err(CliError::Interrupted.into()),
+		() = catching.cancelled() => Err(if stdout_closed() {
+			CliError::StdoutClosed
+		} else {
+			CliError::Interrupted
+		}
+		.into()),
 	}
 }
 
@@ -226,12 +274,13 @@ mod tests {
 			owning,
 			stopping: 0,
 			cancelling: false,
+			stdout_closed: false,
 		}
 	}
 
 	#[test]
 	fn ctrl_c_with_no_command_running_quits() {
-		assert_eq!(state(0, 0).press(), Action::Quit);
+		assert_eq!(state(0, 0).press(), Action::Quit(EXIT_INTERRUPTED));
 	}
 
 	#[test]
@@ -245,7 +294,7 @@ mod tests {
 	fn a_second_ctrl_c_before_the_cancelled_command_ended_quits() {
 		let mut state = state(1, 0);
 		state.press();
-		assert_eq!(state.press(), Action::Quit);
+		assert_eq!(state.press(), Action::Quit(EXIT_INTERRUPTED));
 	}
 
 	#[test]
@@ -270,7 +319,36 @@ mod tests {
 		let mut state = state(1, 1);
 		state.press();
 		state.stopping += 1;
-		assert_eq!(state.press(), Action::Quit);
+		assert_eq!(state.press(), Action::Quit(EXIT_INTERRUPTED));
+	}
+
+	#[test]
+	fn a_closed_stdout_with_no_command_running_quits_with_0() {
+		let mut state = state(0, 0);
+		assert_eq!(state.close_stdout(), Action::Quit(0));
+		assert!(state.stdout_closed);
+	}
+
+	#[test]
+	fn a_closed_stdout_cancels_a_running_command() {
+		let mut state = state(1, 0);
+		assert_eq!(state.close_stdout(), Action::Send(Press { owned: false }));
+		assert!(state.cancelling);
+	}
+
+	#[test]
+	fn a_closed_stdout_stops_a_command_that_handles_ctrl_c() {
+		let mut state = state(1, 1);
+		assert_eq!(state.close_stdout(), Action::Send(Press { owned: true }));
+		assert!(!state.cancelling);
+	}
+
+	#[test]
+	fn stdout_found_closed_again_while_the_command_stops_does_nothing() {
+		let mut state = state(1, 1);
+		state.close_stdout();
+		state.stopping += 1;
+		assert_eq!(state.close_stdout(), Action::Nothing);
 	}
 
 	#[tokio::test]

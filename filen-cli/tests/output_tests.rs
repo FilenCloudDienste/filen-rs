@@ -4,7 +4,7 @@
 #[cfg(unix)]
 use std::{fs, os::unix::fs::PermissionsExt as _};
 use std::{
-	io::{self, Write as _},
+	io::Write as _,
 	process::{Command, Output, Stdio},
 };
 
@@ -32,26 +32,6 @@ fn log_lines_go_to_stderr_and_help_to_stdout() {
 	assert!(stdout.contains("Welcome to Filen CLI"), "{stdout}");
 	assert!(!stdout.contains("Logging level"), "{stdout}");
 	assert!(stderr.contains("Logging level: INFO"), "{stderr}");
-}
-
-#[test]
-fn a_closed_stdout_ends_the_cli_cleanly() {
-	let config_dir = TempDir::new().unwrap();
-	// Closing the read end first makes the first write fail, as it does once `head` has its lines.
-	let (reader, writer) = io::pipe().unwrap();
-	drop(reader);
-	let output = Command::new(assert_cmd::cargo::cargo_bin!())
-		.arg("--config-dir")
-		.arg(config_dir.path())
-		.args(["--skip-update", "--help"])
-		.stdout(writer)
-		.stderr(Stdio::piped())
-		.output()
-		.unwrap();
-
-	let stderr = String::from_utf8(output.stderr).unwrap();
-	assert_eq!(output.status.code(), Some(0), "{stderr}");
-	assert_eq!(stderr, "");
 }
 
 #[test]

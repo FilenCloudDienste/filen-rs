@@ -24,6 +24,7 @@ use crate::{
 	CliArgs,
 	completion::async_completions_available,
 	error::{CliError, find_cli_error},
+	interrupt,
 	util::RemotePath,
 };
 
@@ -376,8 +377,9 @@ impl UI {
 					self.print_failure("It seems you are running the CLI in a Docker container. Make sure to run the container with the -it flags to enable interactive input.");
 				}
 			}
-			// the child process reported its own error
-			Some(CliError::ChildExit(_)) => {}
+			// the child process reported its own error, and nobody reads the output that was cut
+			// short
+			Some(CliError::ChildExit(_) | CliError::StdoutClosed) => {}
 			None => {
 				self.print_failure(&format!("An unexpected error occurred: {}", err));
 				self.print_failure("If you believe this is a bug, please report it at https://github.com/FilenCloudDienste/filen-rs/issues");
@@ -747,12 +749,13 @@ impl UI {
 }
 
 /// Writes `line` to `out`, which is stdout outside the tests. A reader that closed stdout, as
-/// `head` does once it has read its lines, wants no more output, so the CLI exits then, with code
-/// 0 as if the command had finished.
+/// `head` does once it has read its lines, wants no more output: the line is dropped, and the
+/// running command ends as Ctrl-C would end it ([`interrupt::close_stdout`]), so that a sync,
+/// mount or serve stops cleanly and a command cut short does not exit with 0.
 pub(crate) fn write_stdout_line(out: &mut (impl Write + ?Sized), line: &str) {
 	match writeln!(out, "{}", line) {
 		Ok(()) => {}
-		Err(e) if e.kind() == io::ErrorKind::BrokenPipe => std::process::exit(0),
+		Err(e) if e.kind() == io::ErrorKind::BrokenPipe => interrupt::close_stdout(),
 		// Any other failed write panics, with the message `println!` panics with.
 		Err(e) => panic!("failed printing to stdout: {e}"),
 	}

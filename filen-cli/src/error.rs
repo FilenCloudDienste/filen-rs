@@ -3,6 +3,7 @@
 //! - `0` when the command succeeded,
 //! - `1` when it failed, with the error printed to stderr,
 //! - `2` when the command line was invalid, such as an unknown command or flags that do not go together,
+//! - `0` too when stdout was closed first, as `head` closes it once it has its lines,
 //! - `130` when Ctrl-C cancelled the command or quit the CLI,
 //! - the exit code of Rclone when `filen rclone ...` failed in Rclone.
 
@@ -30,6 +31,9 @@ pub(crate) enum CliError {
 	ChildExit(i32),
 	/// Ctrl-C cancelled the command; exit code [`EXIT_INTERRUPTED`].
 	Interrupted,
+	/// A closed stdout cancelled the command; exit code 0. Nothing reads what the CLI would print
+	/// about it.
+	StdoutClosed,
 }
 
 /// Exit code of a command that failed.
@@ -44,6 +48,7 @@ impl CliError {
 			CliError::Usage(_) => EXIT_USAGE,
 			CliError::ChildExit(code) => *code,
 			CliError::Interrupted => EXIT_INTERRUPTED,
+			CliError::StdoutClosed => 0,
 		}
 	}
 }
@@ -55,6 +60,7 @@ impl fmt::Display for CliError {
 			CliError::TerminalInput(_) => f.write_str("Failed to read input prompt"),
 			CliError::ChildExit(code) => write!(f, "Exited with code {code}"),
 			CliError::Interrupted => f.write_str("Canceled"),
+			CliError::StdoutClosed => f.write_str("Canceled, as stdout was closed"),
 		}
 	}
 }
@@ -66,7 +72,8 @@ impl Error for CliError {
 			CliError::Failure(_)
 			| CliError::Usage(_)
 			| CliError::ChildExit(_)
-			| CliError::Interrupted => None,
+			| CliError::Interrupted
+			| CliError::StdoutClosed => None,
 		}
 	}
 }
@@ -133,6 +140,13 @@ mod tests {
 
 		assert_eq!(exit_code(&err), 130);
 		assert_eq!(format!("{err:#}"), "Failed to download: Canceled");
+	}
+
+	#[test]
+	fn a_command_cancelled_by_a_closed_stdout_exits_with_0() {
+		let err = anyhow::Error::from(CliError::StdoutClosed).context("Failed to list");
+
+		assert_eq!(exit_code(&err), 0);
 	}
 
 	#[test]
