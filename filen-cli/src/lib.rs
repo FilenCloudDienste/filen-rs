@@ -296,15 +296,7 @@ async fn inner_main(ui: &mut ui::UI, arenas_limited: bool) -> Result<()> {
 
 	// --help
 	if let Some(help_topic) = cli_args.help {
-		print_in_app_docs(
-			ui,
-			if help_topic.is_empty() {
-				None
-			} else {
-				Some(help_topic)
-			},
-		)?;
-		return Ok(());
+		return print_in_app_docs(ui, help_topic_or_general(help_topic));
 	}
 
 	// a single command has no working directory to change
@@ -393,18 +385,16 @@ async fn inner_main(ui: &mut ui::UI, arenas_limited: bool) -> Result<()> {
 					continue;
 				}
 			};
-			if cli_args.command.is_none() {
+			if let Some(help_topic) = cli_args.help {
+				if let Err(e) = print_in_app_docs(ui, help_topic_or_general(help_topic)) {
+					ui.print_failure_or_error(&e);
+				}
 				continue;
 			}
-			match execute_command(
-				&config,
-				ui,
-				&mut client,
-				&working_path,
-				cli_args.command.unwrap(),
-			)
-			.await
-			{
+			let Some(command) = cli_args.command else {
+				continue;
+			};
+			match execute_command(&config, ui, &mut client, &working_path, command).await {
 				Ok(result) => {
 					if result.exit {
 						break;
@@ -450,6 +440,11 @@ fn parse_repl_line(line: &str) -> Result<CliArgs, ReplLineError> {
 	let mut args = shlex::split(line.trim()).ok_or(ReplLineError::Quoting)?;
 	args.insert(0, String::from("filen"));
 	CliArgs::try_parse_from(args).map_err(ReplLineError::Arguments)
+}
+
+/// The help topic `--help` asked for, or `None` for the general help.
+fn help_topic_or_general(help_topic: String) -> Option<String> {
+	(!help_topic.is_empty()).then_some(help_topic)
 }
 
 /// Completes a REPL input line as the REPL's tab completion does, waiting for remote paths to
@@ -548,6 +543,22 @@ mod tests {
 			panic!("parsed an unknown command");
 		};
 		assert_eq!(e.kind(), ErrorKind::InvalidSubcommand);
+	}
+
+	#[test]
+	fn a_repl_line_asking_for_help_on_a_topic_is_parsed() {
+		let cli_args = parse_repl_line("--help ls").unwrap();
+		assert_eq!(cli_args.help.as_deref(), Some("ls"));
+		assert!(cli_args.command.is_none());
+	}
+
+	#[test]
+	fn an_empty_help_topic_asks_for_the_general_help() {
+		assert_eq!(help_topic_or_general(String::new()), None);
+		assert_eq!(
+			help_topic_or_general("ls".to_owned()),
+			Some("ls".to_owned())
+		);
 	}
 
 	#[test]
