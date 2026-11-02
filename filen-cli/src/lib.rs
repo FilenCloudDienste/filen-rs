@@ -43,7 +43,7 @@ use crate::{
 		fs_cmds::{self, FsCommands},
 	},
 	docs::{generate_markdown_docs, print_in_app_docs},
-	log_files::{LogFiles, LogLimits},
+	log_files::{ChosenLogFile, LogFiles, LogLimits},
 	ui::{ConsoleLogLevel, CustomLogger, ReplPrompt},
 	updater::check_for_updates,
 	util::RemotePath,
@@ -94,6 +94,14 @@ pub(crate) struct CliArgs {
 	/// Config directory (overrides system default)
 	#[arg(long, global = true)]
 	config_dir: Option<PathBuf>,
+
+	/// Append the log to this file instead of writing it to the config directory
+	#[arg(long, global = true, value_name = "PATH")]
+	log_file: Option<PathBuf>,
+
+	/// Do not write a log file
+	#[arg(long, global = true, conflicts_with = "log_file")]
+	no_log_file: bool,
 
 	/// Filen account email (requires --password)
 	#[arg(short, long, env = "FILEN_CLI_EMAIL", global = true)]
@@ -195,6 +203,47 @@ const LOG_LIMITS: LogLimits = LogLimits {
 
 /// The level of the lines written to the log files.
 const LOG_FILES_LEVEL: LevelFilter = LevelFilter::Debug;
+
+/// The log the CLI writes besides what it prints.
+struct OpenedLog {
+	// An `Arc` because ftail builds each channel from a `'static` `Fn`, which can only hand out
+	// clones of it.
+	log: Arc<dyn log::Log + Send + Sync>,
+	/// The file that holds this run's full log.
+	path: PathBuf,
+}
+
+/// Opens the log the CLI writes: the file `--log-file` names, none with `--no-log-file`, or
+/// otherwise the log files in `log_dir` ([`open_log_files`]). Fails only when the file
+/// `--log-file` names cannot be opened.
+fn open_log_destination(
+	log_dir: &Path,
+	log_file: Option<&Path>,
+	no_log_file: bool,
+) -> Result<(Option<OpenedLog>, Vec<String>)> {
+	if no_log_file {
+		return Ok((None, Vec::new()));
+	}
+	if let Some(path) = log_file {
+		let file = ChosenLogFile::open(path, LOG_FILES_LEVEL).map_err(|e| {
+			ui::UI::failure(&format!(
+				"Failed to open the log file {}: {e}",
+				path.display()
+			))
+		})?;
+		let log = OpenedLog {
+			log: Arc::new(file),
+			path: path.to_owned(),
+		};
+		return Ok((Some(log), Vec::new()));
+	}
+	let (log_files, warnings) = open_log_files(log_dir);
+	let log = log_files.map(|log_files| OpenedLog {
+		log: Arc::new(log_files),
+		path: log_dir.join(log_files::LATEST),
+	});
+	Ok((log, warnings))
+}
 
 /// Opens the log files in `log_dir`, creating it if needed. Returns them, or none if they cannot
 /// be opened, and a warning for each thing that went wrong: the CLI runs on without log files
@@ -317,7 +366,8 @@ async fn inner_main(ui: &mut ui::UI, arenas_limited: bool) -> Result<Finished> {
 	let log_dir = config.config_dir.join("logs");
 	let command_options = CommandOptions::of(&cli_args);
 	let logging_level = command_options.log_level();
-	let (log_files, log_files_warnings) = open_log_files(&log_dir);
+	let (log_files, log_files_warnings) =
+		open_log_destination(&log_dir, cli_args.log_file.as_deref(), cli_args.no_log_file)?;
 	let log_files_level = match log_files {
 		Some(_) => LOG_FILES_LEVEL,
 		None => LevelFilter::Off,
@@ -337,24 +387,22 @@ async fn inner_main(ui: &mut ui::UI, arenas_limited: bool) -> Result<Finished> {
 		},
 		logging_level,
 	);
-	if let Some(log_files) = log_files {
-		// An `Arc` because ftail builds each channel from a `'static` `Fn`, which can only hand
-		// out clones of it.
-		let log_files = Arc::new(log_files);
-		logger = logger.custom(
-			move |_| Box::new(Arc::clone(&log_files)) as Box<dyn log::Log + Send + Sync>,
-			log_files_level,
-		);
-	}
+	let log_file_path = match log_files {
+		Some(OpenedLog { log, path }) => {
+			logger = logger.custom(
+				move |_| Box::new(Arc::clone(&log)) as Box<dyn log::Log + Send + Sync>,
+				log_files_level,
+			);
+			Some(path)
+		}
+		None => None,
+	};
 	logger.init().context("Failed to initialize logger")?;
 	// ftail passes every record on to its channels, and no channel takes one past both levels.
 	console_log_level.set(logging_level);
 	info!("Logging level: {}", logging_level);
-	if log_files_level != LevelFilter::Off {
-		info!(
-			"Full log file: {}",
-			log_dir.join(log_files::LATEST).display()
-		);
+	if let Some(path) = log_file_path {
+		info!("Full log file: {}", path.display());
 	}
 	for warning in &log_files_warnings {
 		warn!("{warning}");

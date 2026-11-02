@@ -204,13 +204,7 @@ impl Log for LogFiles {
 
 impl LogFiles {
 	fn write_record(&self, now: DateTime<Local>, record: &Record) {
-		let line = format!(
-			"{} {} {} {}\n",
-			now.format(DATETIME_FORMAT),
-			record.level(),
-			record.target(),
-			record.args()
-		);
+		let line = format_line(now, record);
 		let mut files = self.files.lock().unwrap_or_else(PoisonError::into_inner);
 		let files = &mut *files;
 		// A record stamped just before midnight that takes the lock after one stamped just after it
@@ -239,6 +233,60 @@ impl LogFiles {
 			self.prune(files);
 		}
 	}
+}
+
+/// `record` as a line of a log file, logged at `now`.
+fn format_line(now: DateTime<Local>, record: &Record) -> String {
+	format!(
+		"{} {} {} {}\n",
+		now.format(DATETIME_FORMAT),
+		record.level(),
+		record.target(),
+		record.args()
+	)
+}
+
+/// The log file `--log-file` names, which the CLI writes instead of [`LogFiles`]. Each line is
+/// appended to it, in the format of [`LogFiles`], and it is never moved aside, emptied or
+/// deleted, as it is the user's.
+pub(crate) struct ChosenLogFile {
+	level: LevelFilter,
+	file: Mutex<File>,
+}
+
+impl ChosenLogFile {
+	/// Opens the file at `path` for appending, creating it with [`PRIVATE_FILE_MODE`] on unix if
+	/// it does not exist. The mode of an existing file is left as it is.
+	pub(crate) fn open(path: &Path, level: LevelFilter) -> io::Result<Self> {
+		Ok(Self {
+			level,
+			file: Mutex::new(
+				private_file_options()
+					.create(true)
+					.append(true)
+					.open(path)?,
+			),
+		})
+	}
+}
+
+impl Log for ChosenLogFile {
+	fn enabled(&self, metadata: &Metadata) -> bool {
+		metadata.level() <= self.level
+	}
+
+	fn log(&self, record: &Record) {
+		if self.enabled(record.metadata()) {
+			let line = format_line(Local::now(), record);
+			let mut file = self.file.lock().unwrap_or_else(PoisonError::into_inner);
+			// A logger has nowhere to report its own failure, so a line that cannot be written is
+			// dropped.
+			let _ = file.write_all(line.as_bytes());
+		}
+	}
+
+	// Every line is written straight to the file, so there is nothing buffered to flush.
+	fn flush(&self) {}
 }
 
 impl LogFile {
@@ -430,6 +478,33 @@ mod tests {
 		);
 
 		assert_eq!(read(&dir, LATEST), "");
+	}
+
+	#[test]
+	fn a_chosen_log_file_is_appended_to_and_never_moved_aside() {
+		let dir = TempDir::new().unwrap();
+		let path = dir.path().join("cli.log");
+		fs::write(&path, "an earlier line\n").unwrap();
+		let file = ChosenLogFile::open(&path, LevelFilter::Info).unwrap();
+		for message in ["a", "b"] {
+			file.log(
+				&Record::builder()
+					.level(Level::Info)
+					.target("target")
+					.args(format_args!("{message}"))
+					.build(),
+			);
+		}
+		file.log(
+			&Record::builder()
+				.level(Level::Debug)
+				.args(format_args!("hidden"))
+				.build(),
+		);
+
+		assert_eq!(messages(&read(&dir, "cli.log")), ["line", "a", "b"]);
+		let names = fs::read_dir(dir.path()).unwrap().count();
+		assert_eq!(names, 1);
 	}
 
 	#[test]

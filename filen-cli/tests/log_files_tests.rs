@@ -130,3 +130,74 @@ fn printed_output_is_not_written_to_the_log_file() {
 	assert!(printed.lines().count() > 10, "{printed}");
 	assert_eq!(logged_lines, Vec::<&str>::new());
 }
+
+#[test]
+fn log_file_writes_the_log_to_the_file_it_names_instead() {
+	let config_dir = TempDir::new().unwrap();
+	let log_dir = TempDir::new().unwrap();
+	let log_file = log_dir.path().join("cli.log");
+	fs::write(&log_file, "an earlier line\n").unwrap();
+	let output = Command::new(assert_cmd::cargo::cargo_bin!())
+		.arg("--config-dir")
+		.arg(config_dir.path())
+		.args(["--skip-update", "--help", "--log-file"])
+		.arg(&log_file)
+		.output()
+		.unwrap();
+	assert!(output.status.success(), "{}", output.status);
+
+	let log = fs::read_to_string(&log_file).unwrap();
+	assert!(log.starts_with("an earlier line\n"), "{log}");
+	assert!(log.contains("Logging level: OFF"), "{log}");
+	assert!(!config_dir.path().join("logs").exists());
+}
+
+#[test]
+fn no_log_file_writes_no_log() {
+	let config_dir = TempDir::new().unwrap();
+	let output = Command::new(assert_cmd::cargo::cargo_bin!())
+		.arg("--config-dir")
+		.arg(config_dir.path())
+		.args(["--skip-update", "--no-log-file", "--help"])
+		.output()
+		.unwrap();
+	assert!(output.status.success(), "{}", output.status);
+
+	assert!(!config_dir.path().join("logs").exists());
+}
+
+#[test]
+fn a_log_file_that_cannot_be_opened_fails_the_cli() {
+	let config_dir = TempDir::new().unwrap();
+	let missing = config_dir.path().join("missing").join("cli.log");
+	let output = Command::new(assert_cmd::cargo::cargo_bin!())
+		.arg("--config-dir")
+		.arg(config_dir.path())
+		.args(["--skip-update", "--help", "--log-file"])
+		.arg(&missing)
+		.output()
+		.unwrap();
+
+	assert_eq!(output.status.code(), Some(1));
+	let stderr = String::from_utf8(output.stderr).unwrap();
+	assert!(stderr.contains("Failed to open the log file"), "{stderr}");
+}
+
+#[test]
+fn log_file_and_no_log_file_together_are_a_usage_error() {
+	let config_dir = TempDir::new().unwrap();
+	let output = Command::new(assert_cmd::cargo::cargo_bin!())
+		.arg("--config-dir")
+		.arg(config_dir.path())
+		.args([
+			"--skip-update",
+			"--no-log-file",
+			"--log-file",
+			"cli.log",
+			"exit",
+		])
+		.output()
+		.unwrap();
+
+	assert_eq!(output.status.code(), Some(2));
+}
