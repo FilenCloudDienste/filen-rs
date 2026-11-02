@@ -12,16 +12,19 @@ use notify::{
 use tokio::sync::Notify;
 
 use super::{
-	BASE_BACKOFF, DEBOUNCE, FullPassReason, MAX_BACKOFF, MAX_DEBOUNCE_BURST, MAX_SAFETY_NET,
-	PairChanges, PairRoot, SAFETY_NET, SAFETY_NET_DUTY, Stop, SyncReport, WatchConfig, WatchState,
-	WatchStatus, backoff, local_event_handler, net_due, net_interval, owes_a_pass, pass_outcome,
-	publish_pass, read_both_sides_whole, start_local_watcher, triggers_pass, wait_for_next_pass,
+	BASE_BACKOFF, Backoff, DEBOUNCE, FullPassReason, MAX_BACKOFF, MAX_DEBOUNCE_BURST,
+	MAX_SAFETY_NET, PairChanges, PairRoot, RemoteDoorbell, SAFETY_NET, SAFETY_NET_DUTY, Stop,
+	SyncReport, WatchConfig, WatchState, WatchStatus, backoff, local_event_handler, net_due,
+	net_interval, owes_a_pass, pass_outcome, publish_pass, reached_no_server,
+	read_both_sides_whole, start_local_watcher, triggers_pass, wait_for_next_pass,
 	wait_while_paused,
 };
 use crate::{
 	Error, ErrorKind,
-	sync_engine::apply::{
-		LOCK_FAILURE, STORE_FAILURE, StoreFailure, UNREAD_PLAN, note_lock_failure,
+	cache::SyncRootCallback,
+	sync_engine::{
+		HaltReason,
+		apply::{LOCK_FAILURE, STORE_FAILURE, StoreFailure, UNREAD_PLAN, note_lock_failure},
 	},
 };
 
@@ -343,7 +346,10 @@ async fn a_failed_pass_retries_on_the_backoff_schedule() {
 			&mut safety_net,
 			&mut rules,
 			DEBOUNCE,
-			Some(BASE_BACKOFF)
+			Some(Backoff {
+				delay: BASE_BACKOFF,
+				reconnected: None,
+			})
 		)
 		.await,
 		"a backoff that elapsed means retry, not stop"
@@ -364,7 +370,10 @@ async fn a_failed_pass_retries_on_the_backoff_schedule() {
 			&mut safety_net,
 			&mut rules,
 			DEBOUNCE,
-			Some(BASE_BACKOFF)
+			Some(Backoff {
+				delay: BASE_BACKOFF,
+				reconnected: None,
+			})
 		)
 		.await
 	);
@@ -417,7 +426,10 @@ async fn a_requested_pass_runs_at_the_debounce_and_through_a_backoff() {
 			&mut safety_net,
 			&mut rules,
 			DEBOUNCE,
-			Some(MAX_BACKOFF)
+			Some(Backoff {
+				delay: MAX_BACKOFF,
+				reconnected: None,
+			})
 		)
 		.await
 	);
@@ -430,6 +442,263 @@ async fn a_requested_pass_runs_at_the_debounce_and_through_a_backoff() {
 		dirty.notified().now_or_never().is_some(),
 		"the change event must still be pending, not consumed by the backoff"
 	);
+}
+
+/// After a pass that could not reach the server, the socket connecting again ends the backoff:
+/// the network is back, and the retry must not wait out up to [`MAX_BACKOFF`] for it.
+#[tokio::test(start_paused = true)]
+async fn an_offline_backoff_ends_when_the_socket_connects() {
+	let (_shutdown_tx, _removed_tx, mut stop) = stop();
+	let mut safety_net = safety_net().await;
+	let (_rules_tx, mut rules) = user_ignore();
+	let (connection, mut connected) = tokio::sync::watch::channel(());
+
+	let (dirty, requested) = (Notify::new(), Notify::new());
+	let start = tokio::time::Instant::now();
+	let (retry, ()) = tokio::join!(
+		wait_for_next_pass(
+			&mut stop,
+			&dirty,
+			&requested,
+			&mut safety_net,
+			&mut rules,
+			DEBOUNCE,
+			Some(Backoff {
+				delay: MAX_BACKOFF,
+				reconnected: Some(&mut connected),
+			})
+		),
+		async {
+			tokio::time::sleep(Duration::from_secs(3)).await;
+			connection.send_replace(());
+		}
+	);
+	assert!(retry, "a connection means retry, not stop");
+	assert_eq!(
+		start.elapsed(),
+		Duration::from_secs(3),
+		"the retry runs as the socket connects"
+	);
+}
+
+/// Only a connection the wait has not seen ends it: one from before the failed pass, which the
+/// loop marks seen as the pass starts, says nothing about what that pass failed on. Nor does a
+/// listener the socket dropped: a closed channel must not turn the backoff into a hot loop.
+#[tokio::test(start_paused = true)]
+async fn a_seen_connection_or_a_dropped_listener_leaves_the_backoff_whole() {
+	let (_shutdown_tx, _removed_tx, mut stop) = stop();
+	let mut safety_net = safety_net().await;
+	let (_rules_tx, mut rules) = user_ignore();
+	let (connection, mut connected) = tokio::sync::watch::channel(());
+
+	connection.send_replace(());
+	connected.mark_unchanged();
+	let start = tokio::time::Instant::now();
+	assert!(
+		wait_for_next_pass(
+			&mut stop,
+			&Notify::new(),
+			&Notify::new(),
+			&mut safety_net,
+			&mut rules,
+			DEBOUNCE,
+			Some(Backoff {
+				delay: BASE_BACKOFF,
+				reconnected: Some(&mut connected),
+			})
+		)
+		.await
+	);
+	assert_eq!(
+		start.elapsed(),
+		BASE_BACKOFF,
+		"a connection already seen must not end the wait"
+	);
+
+	drop(connection);
+	let start = tokio::time::Instant::now();
+	assert!(
+		wait_for_next_pass(
+			&mut stop,
+			&Notify::new(),
+			&Notify::new(),
+			&mut safety_net,
+			&mut rules,
+			DEBOUNCE,
+			Some(Backoff {
+				delay: BASE_BACKOFF,
+				reconnected: Some(&mut connected),
+			})
+		)
+		.await
+	);
+	assert_eq!(
+		start.elapsed(),
+		BASE_BACKOFF,
+		"a dropped listener must not end the wait"
+	);
+}
+
+/// A failure that was not the server being out of reach hears no connection: its backoff is the
+/// whole wait however often the socket connects, since a connection fixes nothing it failed on.
+#[tokio::test(start_paused = true)]
+async fn any_other_failure_waits_out_its_whole_backoff() {
+	let (_shutdown_tx, _removed_tx, mut stop) = stop();
+	let mut safety_net = safety_net().await;
+	let (_rules_tx, mut rules) = user_ignore();
+	let (connection, _connected) = tokio::sync::watch::channel(());
+
+	let (dirty, requested) = (Notify::new(), Notify::new());
+	let start = tokio::time::Instant::now();
+	let (retry, ()) = tokio::join!(
+		wait_for_next_pass(
+			&mut stop,
+			&dirty,
+			&requested,
+			&mut safety_net,
+			&mut rules,
+			DEBOUNCE,
+			Some(Backoff {
+				delay: BASE_BACKOFF,
+				reconnected: None,
+			})
+		),
+		async {
+			tokio::time::sleep(Duration::from_millis(500)).await;
+			connection.send_replace(());
+		}
+	);
+	assert!(retry);
+	assert_eq!(start.elapsed(), BASE_BACKOFF);
+}
+
+/// A watch whose cache subscription was refused as it started, offline, asks for it again once
+/// the network is back and a pass succeeds: it subscribes exactly once, its status hears remote
+/// changes again, and a remote change then wakes it at the debounce rather than on the safety net.
+#[tokio::test(start_paused = true)]
+async fn a_subscription_refused_at_the_start_is_taken_once_the_network_is_back() {
+	let (_shutdown_tx, _removed_tx, mut stop) = stop();
+	let mut safety_net = safety_net().await;
+	let (_rules_tx, mut rules) = user_ignore();
+	let (status, health) = tokio::sync::watch::channel(WatchStatus::default());
+	let (dirty, requested) = (Arc::new(Notify::new()), Notify::new());
+	let mut remote = RemoteDoorbell::<()>::new(1, Arc::clone(&dirty));
+
+	remote
+		.subscribe(
+			|_| {
+				std::future::ready(Err(Error::custom(
+					ErrorKind::Reqwest,
+					"error sending request",
+				)))
+			},
+			&status,
+		)
+		.await;
+	assert_eq!(
+		health.borrow().remote_events_degraded.as_deref(),
+		Some("Error of kind Reqwest: context: error sending request")
+	);
+
+	// The first pass failed as the server could not be reached; the socket connects.
+	let (connection, mut connected) = tokio::sync::watch::channel(());
+	connection.send_replace(());
+	let start = tokio::time::Instant::now();
+	assert!(
+		wait_for_next_pass(
+			&mut stop,
+			&dirty,
+			&requested,
+			&mut safety_net,
+			&mut rules,
+			DEBOUNCE,
+			Some(Backoff {
+				delay: MAX_BACKOFF,
+				reconnected: Some(&mut connected),
+			})
+		)
+		.await
+	);
+	assert_eq!(start.elapsed(), Duration::ZERO);
+
+	// The pass that follows succeeds, and so does the one after it.
+	let mut asked = 0;
+	let mut granted: Option<SyncRootCallback> = None;
+	for _ in 0..2 {
+		remote
+			.subscribe(
+				|callback| {
+					asked += 1;
+					granted = Some(callback);
+					std::future::ready(Ok::<(), Error>(()))
+				},
+				&status,
+			)
+			.await;
+	}
+	assert_eq!(asked, 1, "a subscribed watch never subscribes again");
+	assert_eq!(health.borrow().remote_events_degraded, None);
+
+	let ring = granted.expect("the subscription carries the doorbell");
+	ring(&mut std::iter::empty());
+	let start = tokio::time::Instant::now();
+	assert!(
+		wait_for_next_pass(
+			&mut stop,
+			&dirty,
+			&requested,
+			&mut safety_net,
+			&mut rules,
+			DEBOUNCE,
+			None
+		)
+		.await
+	);
+	assert_eq!(
+		start.elapsed(),
+		DEBOUNCE,
+		"a remote change wakes the loop at the debounce"
+	);
+}
+
+/// The failures that wait for the network as well as for their backoff are exactly the ones that
+/// could not reach the server, which is also what a host shows as offline: the transport's own
+/// error, a pass halted on an unavailable remote, and a lock request that got no answer.
+#[test]
+fn only_a_server_out_of_reach_waits_for_the_network() {
+	let failed_outright = Some(("error sending request".to_owned(), ErrorKind::Reqwest));
+	assert!(reached_no_server(failed_outright.as_ref()));
+
+	let unavailable = SyncReport {
+		halted: Some(HaltReason::RemoteUnavailable),
+		..SyncReport::default()
+	};
+	assert!(reached_no_server(pass_outcome(&unavailable).error.as_ref()));
+
+	let mut unanswered_lock = SyncReport::default();
+	let cause = Error::custom(ErrorKind::Reqwest, "error sending request");
+	note_lock_failure(&mut unanswered_lock, 1, &cause, &mut |_| {});
+	assert!(reached_no_server(
+		pass_outcome(&unanswered_lock).error.as_ref()
+	));
+
+	for halted in [
+		HaltReason::LocalStorageFull,
+		HaltReason::RemoteStorageFull,
+		HaltReason::Unauthenticated,
+	] {
+		let report = SyncReport {
+			halted: Some(halted),
+			..SyncReport::default()
+		};
+		assert!(
+			!reached_no_server(pass_outcome(&report).error.as_ref()),
+			"{halted:?}"
+		);
+	}
+	let invalid = Some(("unknown sync pair".to_owned(), ErrorKind::InvalidState));
+	assert!(!reached_no_server(invalid.as_ref()));
+	assert!(!reached_no_server(None));
 }
 
 /// A healthy wait is unchanged: a change event, coalesced over [`DEBOUNCE`], or the safety net.
@@ -570,7 +839,10 @@ async fn a_stop_interrupts_the_backoff() {
 			&mut safety_net,
 			&mut rules,
 			DEBOUNCE,
-			Some(MAX_BACKOFF)
+			Some(Backoff {
+				delay: MAX_BACKOFF,
+				reconnected: None,
+			})
 		)
 		.await,
 		"a stopped watch must not wait out the backoff"
@@ -598,7 +870,10 @@ async fn a_removed_pair_ends_the_wait_wherever_the_loop_is() {
 			&mut safety_net,
 			&mut rules,
 			DEBOUNCE,
-			Some(MAX_BACKOFF)
+			Some(Backoff {
+				delay: MAX_BACKOFF,
+				reconnected: None,
+			})
 		)
 		.await,
 		"a removed pair must not wait out the backoff"

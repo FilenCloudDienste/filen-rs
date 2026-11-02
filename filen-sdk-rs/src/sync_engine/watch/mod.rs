@@ -12,7 +12,8 @@
 //! whole tree (on Linux, typically a tree with more directories than `fs.inotify.max_user_watches`
 //! allows) and a cache subscription the cache refuses are logged, recorded on the
 //! [`WatchStatus`], and leave that side on the safety net alone — a slower sync, not none. A
-//! watcher error at runtime is recorded the same way, and wakes the loop for a pass.
+//! watcher error at runtime is recorded the same way, and wakes the loop for a pass. A refused
+//! subscription is asked for again after every pass that succeeds, until the cache takes it.
 //!
 //! Self-induced changes (the engine's own writes/uploads) re-trigger the watcher and the cache
 //! subscription; that costs at most one extra pass, which the baseline recognizes as already
@@ -33,6 +34,7 @@
 //! rebuild.
 
 use std::{
+	borrow::Cow,
 	ffi::OsStr,
 	path::{Path, PathBuf},
 	sync::Arc,
@@ -43,6 +45,7 @@ use filen_macros::js_type;
 use notify::{EventHandler, RecursiveMode, Watcher};
 use tokio::{sync::Notify, time::Instant};
 use tracing::Instrument;
+use uuid::Uuid;
 
 use super::{
 	SyncEvent, SyncObserver, SyncReport,
@@ -53,8 +56,10 @@ use super::{
 };
 use crate::{
 	Error, ErrorKind,
+	auth::Client,
 	cache::{SyncRootCallback, SyncRootHandle},
 	io::DOWNLOAD_TMP_EXT,
+	socket::{DecryptedSocketEvent, ListenerHandle},
 };
 
 /// Default quiet window a burst of change events is coalesced over before a sync pass runs.
@@ -153,10 +158,10 @@ pub struct WatchHandle {
 	// Resolves when the background loop has returned; `stop` awaits it.
 	loop_done: tokio::task::JoinHandle<()>,
 	status: tokio::sync::watch::Receiver<WatchStatus>,
-	// Holds the FS watcher and the cache registration alive for the watch's lifetime. Either is
-	// `None` when it could not be set up; the status says so (see [`WatchStatus`]).
+	// Holds the FS watcher alive for the watch's lifetime; `None` when it could not be set up, and
+	// the status says so (see [`WatchStatus`]). The cache registration lives in the loop, which
+	// asks for it again while it has none (see [`RemoteDoorbell`]).
 	_watcher: Option<notify::RecommendedWatcher>,
-	_sync_root: Option<SyncRootHandle>,
 }
 
 impl WatchHandle {
@@ -177,7 +182,6 @@ impl WatchHandle {
 			loop_done,
 			status: _status,
 			_watcher,
-			_sync_root,
 		} = self;
 		drop(shutdown);
 		// The loop only fails to join if it panicked; nothing left to wait for either way.
@@ -237,7 +241,8 @@ pub struct WatchStatus {
 	pub local_events_degraded: Option<String>,
 	/// Why the watch hears about no REMOTE changes as they happen, or `None` while its cache
 	/// subscription is registered. Set when the cache refused the subscription; remote changes are
-	/// then picked up by the safety-net pass. Stays set for the life of the watch.
+	/// then picked up by the safety-net pass. Holds the first refusal, and is cleared once a later
+	/// attempt, made after a pass that succeeds, gets the subscription.
 	pub remote_events_degraded: Option<String>,
 }
 
@@ -300,28 +305,15 @@ impl SyncEngine {
 		//
 		// A doorbell only. WHAT changed remotely is recorded by the engine's own per-pair
 		// subscription, which exists with or without a watch, so this one failing costs wake-ups,
-		// never the remote changelist.
-		let remote_dirty = Arc::clone(&dirty);
-		let callback: SyncRootCallback = Box::new(move |_events| {
-			remote_dirty.notify_one();
-		});
-		let sync_root = match self
-			.client
-			.clone()
-			.add_sync_root(record.remote_root, callback)
-			.await
-		{
-			Ok(handle) => Some(handle),
-			Err(error) => {
-				tracing::warn!(
-					"sync pair {pair}: remote change notifications are unavailable ({error}); remote changes will sync on the safety net"
-				);
-				status_tx.send_modify(|status| {
-					status.remote_events_degraded = Some(error.to_string());
-				});
-				None
-			}
-		};
+		// never the remote changelist. One the cache refuses here (offline, say) is asked for again
+		// after the passes that succeed, until it is granted (see [`RemoteDoorbell`]).
+		let mut remote = RemoteDoorbell::new(pair, Arc::clone(&dirty));
+		remote
+			.subscribe(
+				|callback| Arc::clone(&self.client).add_sync_root(record.remote_root, callback),
+				&status_tx,
+			)
+			.await;
 
 		// Local-change trigger: a recursive filesystem watcher on the local root. The watcher
 		// reports canonicalized paths on macOS, and on Linux and Windows paths under the one it was
@@ -394,6 +386,8 @@ impl SyncEngine {
 				stop,
 				observer,
 				status: status_tx,
+				remote_root: record.remote_root,
+				remote,
 			})
 			.in_current_span(),
 		);
@@ -403,7 +397,6 @@ impl SyncEngine {
 			loop_done,
 			status: status_rx,
 			_watcher: watcher,
-			_sync_root: sync_root,
 		})
 	}
 }
@@ -459,6 +452,10 @@ struct WatchLoop {
 	stop: Stop,
 	observer: SyncObserver,
 	status: tokio::sync::watch::Sender<WatchStatus>,
+	/// The pair's remote root, which [`remote`](Self::remote) subscribes to.
+	remote_root: Uuid,
+	/// The watch's own cache subscription for remote changes, which rings `dirty`.
+	remote: RemoteDoorbell<SyncRootHandle>,
 }
 
 /// The background loop: an initial pass, then debounced passes on `dirty`, plus a periodic pass,
@@ -477,8 +474,13 @@ async fn run_loop(watch: WatchLoop) {
 		mut stop,
 		mut observer,
 		status,
+		remote_root,
+		mut remote,
 	} = watch;
 	let mut failures: u32 = 0;
+	// Held from the first pass of a run of failures that could not reach the server until a pass
+	// succeeds (see [`Reconnects`]).
+	let mut reconnects: Option<Reconnects> = None;
 	// When a pass last read both sides whole — what the safety net measures from (see [`net_due`]).
 	// The initial pass below is one: a pair's first pass of a process has no changelist to narrow
 	// itself with.
@@ -514,6 +516,11 @@ async fn run_loop(watch: WatchLoop) {
 				.force_full_pass(pair, FullPassReason::SafetyNet)
 				.await;
 		}
+		// A connection made while the pass runs comes after whatever it failed on, so it counts
+		// for the wait after it; one from before it does not.
+		if let Some(reconnects) = &mut reconnects {
+			reconnects.connected.mark_unchanged();
+		}
 		let PassEnd {
 			error,
 			owed,
@@ -548,6 +555,16 @@ async fn run_loop(watch: WatchLoop) {
 		}
 		if error.is_none() {
 			failures = 0;
+			reconnects = None;
+			// A pass that succeeded holds the engine's own subscription to the same root (its wait
+			// for the remote view asks for it), so a watch that has none joins that registration
+			// without the cache asking the server anything.
+			remote
+				.subscribe(
+					|callback| Arc::clone(&engine.client).add_sync_root(remote_root, callback),
+					&status,
+				)
+				.await;
 			// The net measures time since the last SUCCESSFUL pass, not since the last tick: a pass
 			// that just succeeded has already done everything the net would do, so a tick that came
 			// due during it buys nothing but a no-op pass right after. A FAILED pass deliberately
@@ -568,6 +585,10 @@ async fn run_loop(watch: WatchLoop) {
 			// resume, with nothing else to wake it (the work it skipped changed neither side).
 			dirty.notify_one();
 		}
+		let offline = reached_no_server(error.as_ref());
+		if offline && reconnects.is_none() {
+			reconnects = Reconnects::listen(&engine.client, pair).await;
+		}
 		publish_pass(&status, failures, error);
 		let delay = backoff(failures);
 		if let Some(delay) = delay {
@@ -583,7 +604,13 @@ async fn run_loop(watch: WatchLoop) {
 			&mut safety_net,
 			&mut rules,
 			config.debounce,
-			delay,
+			delay.map(|delay| Backoff {
+				delay,
+				reconnected: reconnects
+					.as_mut()
+					.filter(|_| offline)
+					.map(|reconnects| &mut reconnects.connected),
+			}),
 		)
 		.await
 		{
@@ -648,7 +675,10 @@ async fn wait_while_paused(stop: &mut Stop, poll: Duration) -> bool {
 /// After a failed pass that `backoff` delay *is* the whole wait: it is the retry timer, so a
 /// persistent failure retries on the backoff schedule rather than falling through to whatever the
 /// safety net or a change event happens to offer next. Only a caller's request (`requested`) cuts
-/// it short: someone asked for this retry, typically after fixing what failed. While healthy the
+/// it short: someone asked for this retry, typically after fixing what failed. So does a socket
+/// connection ([`Backoff::reconnected`], see [`Reconnects`]) after a pass that could not reach
+/// the server: the network that pass was missing is back, and nothing else would retry before the
+/// backoff runs out, up to [`MAX_BACKOFF`] later. While healthy the
 /// wait ends on the periodic safety-net tick, on new device-wide user ignore patterns (`rules`), or
 /// on a change event or a request once the burst behind it has gone quiet for `debounce`. New
 /// patterns are not debounced: they arrive one deliberate call at a time, and a burst of calls is
@@ -664,13 +694,14 @@ async fn wait_for_next_pass(
 	safety_net: &mut tokio::time::Interval,
 	rules: &mut tokio::sync::watch::Receiver<u64>,
 	debounce: Duration,
-	backoff: Option<Duration>,
+	backoff: Option<Backoff<'_>>,
 ) -> bool {
-	if let Some(delay) = backoff {
+	if let Some(Backoff { delay, reconnected }) = backoff {
 		return tokio::select! {
 			biased;
 			_ = stop.ended() => false,
 			_ = requested.notified() => true,
+			() = connection_after(reconnected) => true,
 			_ = tokio::time::sleep(delay) => true,
 		};
 	}
@@ -706,6 +737,156 @@ async fn wait_for_next_pass(
 		}
 	}
 	true
+}
+
+/// Whether a pass with this failure could not reach the server: the transport's own error, a pass
+/// halted because the remote was unavailable, or a lock request that got no answer, which all
+/// carry [`ErrorKind::Reqwest`]. Such a failure's retry also waits for the network to come back
+/// (see [`Reconnects`]); every other one waits out its backoff.
+fn reached_no_server(error: Option<&(String, ErrorKind)>) -> bool {
+	error.is_some_and(|(_, kind)| *kind == ErrorKind::Reqwest)
+}
+
+/// The wait after a failed pass (see [`wait_for_next_pass`]).
+struct Backoff<'a> {
+	/// How long it lasts at most: [`backoff`] for the run of failures.
+	delay: Duration,
+	/// What ends it on a socket connection, for a pass that could not reach the server
+	/// ([`reached_no_server`]); `None` for every other failure.
+	reconnected: Option<&'a mut tokio::sync::watch::Receiver<()>>,
+}
+
+/// Resolves once `reconnected` has seen a socket connection it had not yet seen — never without
+/// one, nor once its sender is gone with the socket listener, so neither can end a wait early.
+async fn connection_after(reconnected: Option<&mut tokio::sync::watch::Receiver<()>>) {
+	if let Some(reconnected) = reconnected
+		&& reconnected.changed().await.is_ok()
+	{
+		return;
+	}
+	std::future::pending().await
+}
+
+/// The watch's own cache subscription for remote changes: a registration on the pair's remote
+/// root whose callback rings the pair's doorbell when a batch of remote changes lands.
+///
+/// Asked for as the watch starts, and again after every pass that succeeds while the cache has
+/// not granted it, until it does: a watch that started offline would otherwise hear remote
+/// changes only on the safety net for the rest of its life. A subscribed watch asks nothing again,
+/// so there is never a second registration, and the retry costs a healthy watch nothing. Generic
+/// over the handle so the retry can be driven without a cache.
+struct RemoteDoorbell<H> {
+	pair: PairId,
+	dirty: Arc<Notify>,
+	handle: Option<H>,
+}
+
+impl<H> RemoteDoorbell<H> {
+	fn new(pair: PairId, dirty: Arc<Notify>) -> Self {
+		Self {
+			pair,
+			dirty,
+			handle: None,
+		}
+	}
+
+	/// Ask `subscribe` for the registration if there is none yet, with a callback that rings the
+	/// doorbell, and record on `status` whether remote changes are heard: the first refusal is
+	/// kept until one is granted, which clears it.
+	async fn subscribe<F, Fut>(
+		&mut self,
+		subscribe: F,
+		status: &tokio::sync::watch::Sender<WatchStatus>,
+	) where
+		F: FnOnce(SyncRootCallback) -> Fut,
+		Fut: Future<Output = Result<H, Error>>,
+	{
+		if self.handle.is_some() {
+			return;
+		}
+		let dirty = Arc::clone(&self.dirty);
+		let callback: SyncRootCallback = Box::new(move |_events| {
+			dirty.notify_one();
+		});
+		let pair = self.pair;
+		match subscribe(callback).await {
+			Ok(handle) => {
+				self.handle = Some(handle);
+				status.send_if_modified(|status| status.remote_events_degraded.take().is_some());
+			}
+			Err(error) => {
+				status.send_if_modified(|status| {
+					if status.remote_events_degraded.is_some() {
+						tracing::debug!(
+							"sync pair {pair}: remote change notifications are still unavailable ({error})"
+						);
+						return false;
+					}
+					tracing::warn!(
+						"sync pair {pair}: remote change notifications are unavailable ({error}); remote changes will sync on the safety net until the cache takes the subscription"
+					);
+					status.remote_events_degraded = Some(error.to_string());
+					true
+				});
+			}
+		}
+	}
+}
+
+/// Hears every connection the client's socket makes, while a watch's passes cannot reach the
+/// server: the signal that the network a failed pass was missing is back (see
+/// [`wait_for_next_pass`]).
+///
+/// It asks nothing of the server. The listener only filters for the socket's `authSuccess`, the
+/// event the cache reads as `Connected`. While the cache keeps the socket open for its
+/// subscriptions, which is whenever any registration is live, it is one more callback on that
+/// connection; only when nothing else holds the socket does the listener keep it trying to
+/// connect, at the socket's own reconnect cadence, which is the probe the wake-up needs. A socket
+/// that keeps dropping and reconnecting while the gateway stays down costs one pass per
+/// reconnect; a socket that stays connected costs none.
+///
+/// Held from the first pass of a run of failures that could not reach the server to the next pass
+/// that succeeds, and dropped then, which removes the listener. A socket that is connected already
+/// when the listener is added answers it with a connection at once, so the first wait after it may
+/// end straight away; from then on only a new connection, after the socket lost the last one, ends
+/// a wait.
+struct Reconnects {
+	_listener: ListenerHandle,
+	/// Marked changed on every connection; what the backoff wait listens to.
+	connected: tokio::sync::watch::Receiver<()>,
+}
+
+impl Reconnects {
+	/// Listen to `client`'s socket, or `None` (logged) if it takes no listener, which leaves the
+	/// pair on its backoff alone.
+	async fn listen(client: &Client, pair: PairId) -> Option<Self> {
+		let (connection, connected) = tokio::sync::watch::channel(());
+		let callback = Box::new(move |event: &DecryptedSocketEvent<'_>| {
+			if matches!(event, DecryptedSocketEvent::AuthSuccess) {
+				connection.send_replace(());
+			}
+		});
+		match client
+			.add_event_listener_sync(
+				callback,
+				Some(vec![Cow::Borrowed(
+					DecryptedSocketEvent::AuthSuccess.event_type(),
+				)]),
+			)
+			.await
+		{
+			Ok(listener) => Some(Self {
+				_listener: listener,
+				connected,
+			}),
+			Err(error) => {
+				tracing::warn!(
+					"sync pair {pair}: socket connections cannot be heard ({error}); the pair retries on its backoff alone"
+				);
+				None
+			}
+		}
+	}
 }
 
 /// Resolves once the device-wide user ignore patterns have changed since `rules` last saw them —
