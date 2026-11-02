@@ -6,6 +6,11 @@ use std::{
 	sync::{Mutex, PoisonError},
 	time::{Duration, SystemTime},
 };
+#[cfg(unix)]
+use std::{
+	fs::Permissions,
+	os::unix::fs::{OpenOptionsExt, PermissionsExt},
+};
 
 use chrono::{DateTime, Local, NaiveDate};
 use log::{LevelFilter, Log, Metadata, Record};
@@ -17,6 +22,33 @@ pub(crate) const LATEST: &str = "latest.log";
 const DATETIME_FORMAT: &str = "%Y-%m-%d %H:%M:%S";
 
 const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
+
+/// The mode of each log file on unix: only its owner can read or write it, as the log files can
+/// hold paths, file names and error details from the account.
+#[cfg(unix)]
+const PRIVATE_FILE_MODE: u32 = 0o600;
+
+/// The mode of the log directory on unix: only its owner can list or enter it.
+#[cfg(unix)]
+const PRIVATE_DIR_MODE: u32 = 0o700;
+
+/// Options that create a file with [`PRIVATE_FILE_MODE`] on unix.
+fn private_file_options() -> OpenOptions {
+	let mut options = OpenOptions::new();
+	#[cfg(unix)]
+	options.mode(PRIVATE_FILE_MODE);
+	options
+}
+
+/// Opens `path` with `options`, then sets [`PRIVATE_FILE_MODE`] on it on unix: the mode in
+/// `options` applies only to a file the open creates, and a log file that already exists may have
+/// been created with the default mode by an older CLI.
+fn open_private(options: &OpenOptions, path: &Path) -> io::Result<File> {
+	let file = options.open(path)?;
+	#[cfg(unix)]
+	file.set_permissions(Permissions::from_mode(PRIVATE_FILE_MODE))?;
+	Ok(file)
+}
 
 /// The CLI's log files: `latest.log`, and a `<date>.log` per day next to it.
 ///
@@ -56,15 +88,21 @@ impl LogFiles {
 		max_file_size: u64,
 		retention_days: u64,
 	) -> io::Result<Self> {
+		// Older CLIs created the log files with the default mode, and the moved-aside and earlier
+		// daily ones are never opened again, so the directory is closed to other users as well.
+		#[cfg(unix)]
+		fs::set_permissions(dir, Permissions::from_mode(PRIVATE_DIR_MODE))?;
 		let path = dir.join(LATEST);
 		// Overwrites from the start without truncating, as ftail's `single_file` did, so a run
 		// that logs less than the one before it leaves the end of that run's lines behind.
 		let latest = LogFile {
-			file: OpenOptions::new()
-				.create(true)
-				.write(true)
-				.truncate(false)
-				.open(&path)?,
+			file: open_private(
+				private_file_options()
+					.create(true)
+					.write(true)
+					.truncate(false),
+				&path,
+			)?,
 			path,
 		};
 		let day = Local::now().date_naive();
@@ -164,7 +202,7 @@ impl LogFile {
 	fn open_daily(dir: &Path, day: NaiveDate) -> io::Result<Self> {
 		let path = dir.join(format!("{}.log", day.format("%Y-%m-%d")));
 		Ok(Self {
-			file: OpenOptions::new().create(true).append(true).open(&path)?,
+			file: open_private(private_file_options().create(true).append(true), &path)?,
 			path,
 		})
 	}
@@ -190,10 +228,7 @@ impl LogFile {
 			Err(e) if e.kind() == io::ErrorKind::NotFound => {}
 			Err(e) => return Err(e),
 		}
-		self.file = OpenOptions::new()
-			.create(true)
-			.append(true)
-			.open(&self.path)?;
+		self.file = open_private(private_file_options().create(true).append(true), &self.path)?;
 		Ok(())
 	}
 
@@ -221,7 +256,7 @@ impl LogFile {
 				0 => self.with_suffix(".old"),
 				n => self.with_suffix(&format!(".old{n}")),
 			};
-			match OpenOptions::new()
+			match private_file_options()
 				.write(true)
 				.create_new(true)
 				.open(&candidate)
@@ -338,6 +373,57 @@ mod tests {
 		assert_eq!(messages(&read(&dir, "latest.log.old")), ["a", "b"]);
 		assert_eq!(messages(&read(&dir, "latest.log.old1")), ["c", "d"]);
 		assert_eq!(messages(&read(&dir, LATEST)), ["e"]);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn every_log_file_including_moved_aside_ones_is_readable_by_its_owner_only() {
+		let dir = TempDir::new().unwrap();
+		let cap = u64::try_from("2026-01-01 00:00:00 INFO target a\n".len()).unwrap();
+		let files = LogFiles::open(dir.path(), LevelFilter::Debug, cap, 3).unwrap();
+		let now = Local::now();
+		for message in ["a", "b", "c"] {
+			log_line_at(&files, now, message);
+		}
+
+		let mut modes = fs::read_dir(dir.path())
+			.unwrap()
+			.map(|entry| {
+				let entry = entry.unwrap();
+				let mode = entry.metadata().unwrap().permissions().mode() & 0o777;
+				(entry.file_name().into_string().unwrap(), mode)
+			})
+			.collect::<Vec<_>>();
+		modes.sort_unstable();
+		let today = daily_file_name(now);
+		let mut expected = [
+			(LATEST.to_owned(), 0o600),
+			(format!("{LATEST}.old"), 0o600),
+			(today.clone(), 0o600),
+			(format!("{today}.old"), 0o600),
+		];
+		expected.sort_unstable();
+		assert_eq!(modes, expected);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn log_files_an_older_cli_left_readable_by_others_are_closed_to_them_on_open() {
+		let dir = TempDir::new().unwrap();
+		let today = daily_file_name(Local::now());
+		let old = format!("{LATEST}.old");
+		for name in [LATEST, today.as_str(), old.as_str()] {
+			fs::write(dir.path().join(name), "secret\n").unwrap();
+			fs::set_permissions(dir.path().join(name), Permissions::from_mode(0o644)).unwrap();
+		}
+		fs::set_permissions(dir.path(), Permissions::from_mode(0o755)).unwrap();
+
+		let _files = LogFiles::open(dir.path(), LevelFilter::Debug, 1024, 3).unwrap();
+
+		let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+		assert_eq!(mode(dir.path()), 0o700);
+		assert_eq!(mode(&dir.path().join(LATEST)), 0o600);
+		assert_eq!(mode(&dir.path().join(&today)), 0o600);
 	}
 
 	#[test]
