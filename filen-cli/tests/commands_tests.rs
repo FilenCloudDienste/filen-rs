@@ -140,6 +140,43 @@ async fn cmd_list_trash_empty_trash() {
 }
 
 #[shared_test_runtime]
+async fn working_path_must_be_an_existing_directory() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = &resources.dir;
+	let test_dir_name = test_dir.name().unwrap();
+
+	let file = client
+		.make_file_builder("file_in_working_path.txt", test_dir.uuid)
+		.unwrap();
+	client.upload_file(file, b"content").await.unwrap();
+
+	authenticated_cli_with_args!("--working-path", test_dir_name, "ls")
+		.success()
+		.stdout(predicates::str::contains("file_in_working_path.txt"));
+
+	authenticated_cli_with_args!(
+		"--working-path",
+		&format!("{test_dir_name}/does_not_exist"),
+		"ls"
+	)
+	.code(1)
+	.stderr(predicates::str::contains(format!(
+		"Invalid --working-path: No such directory: /{test_dir_name}/does_not_exist"
+	)));
+
+	authenticated_cli_with_args!(
+		"--working-path",
+		&format!("{test_dir_name}/file_in_working_path.txt"),
+		"ls"
+	)
+	.code(1)
+	.stderr(predicates::str::contains(
+		"Invalid --working-path: Not a directory",
+	));
+}
+
+#[shared_test_runtime]
 async fn cmd_export_notes() {
 	let client = test_utils::RESOURCES.client().await;
 

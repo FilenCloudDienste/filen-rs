@@ -27,7 +27,9 @@ export MANUEL_TMP="$(mktemp -d /tmp/filen-cli-test-XXXXXX)"
 # (will cd $MANUEL_TMP at the end of the script)
 # generate a unique remote cwd for this test run
 MANUEL_REMOTE_CWD_candidate="filen-cli-testing/manuel-$RANDOM"
+# (the directory is created first: the CLI refuses a --working-path that does not exist)
 set-remote-cwd() {
+    filen --quiet mkdir "/$MANUEL_REMOTE_CWD_candidate" > /dev/null || return 1
     export MANUEL_REMOTE_CWD="$MANUEL_REMOTE_CWD_candidate"
 }
 

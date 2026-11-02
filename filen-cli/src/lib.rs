@@ -17,7 +17,10 @@ use ftail::Ftail;
 use log::{LevelFilter, info, warn};
 
 use crate::{
-	commands::{Commands, execute_command, fs_cmds::FsCommands},
+	commands::{
+		Commands, execute_command,
+		fs_cmds::{self, FsCommands},
+	},
 	docs::{generate_markdown_docs, print_in_app_docs},
 	log_files::LogFiles,
 	ui::{CustomLogger, ReplPromptResult},
@@ -341,9 +344,9 @@ async fn inner_main(ui: &mut ui::UI, arenas_limited: bool) -> Result<()> {
 		client_config_args,
 	);
 
-	let mut working_path = RemotePath::new(&cli_args.working_path.unwrap_or_default());
-
 	if let Some(command) = cli_args.command {
+		let working_path =
+			initial_working_path(ui, &mut client, cli_args.working_path.as_deref()).await?;
 		let _ = execute_command(&config, ui, &mut client, &working_path, command).await?;
 		Ok(())
 	} else {
@@ -354,6 +357,9 @@ async fn inner_main(ui: &mut ui::UI, arenas_limited: bool) -> Result<()> {
 		// this essentially defeats the purpose of LazyClient, but:
 		// it does make a difference so non-authenticated commands (e.g. logout) can still be run ..
 		// .. without authentication when called directly (no REPL)
+
+		let mut working_path =
+			initial_working_path(ui, &mut client, cli_args.working_path.as_deref()).await?;
 
 		loop {
 			let repl_result = ui.prompt_repl(client.get_arc().unwrap(), &working_path)?;
@@ -411,6 +417,22 @@ async fn inner_main(ui: &mut ui::UI, arenas_limited: bool) -> Result<()> {
 			}
 		}
 		Ok(())
+	}
+}
+
+/// The working path to start in: the drive's root, or `--working-path`, which must be a
+/// directory on the drive.
+async fn initial_working_path(
+	ui: &mut ui::UI,
+	client: &mut auth::LazyClient,
+	working_path: Option<&str>,
+) -> Result<RemotePath> {
+	let root = RemotePath::new("");
+	match working_path {
+		None => Ok(root),
+		Some(path) => fs_cmds::cd(ui, client, &root, path)
+			.await
+			.context("Invalid --working-path"),
 	}
 }
 
