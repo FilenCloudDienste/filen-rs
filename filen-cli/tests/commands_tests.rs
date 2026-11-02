@@ -284,6 +284,8 @@ async fn cmd_sync() {
 	// its own config dir, so the engine's database starts empty and is deleted afterwards
 	let config_dir = assert_fs::TempDir::new().unwrap();
 	let (_auth_config_dir, auth_config) = test_utils::cli::prepare_cli_auth_config().await;
+	// `<local>:<remote>`, which syncs two-way
+	let pair = format!("{}:{test_dir_name}", local.path().to_str().unwrap());
 	let mut cli = Command::new(env!("CARGO_BIN_EXE_filen-cli"))
 		.args([
 			"--auth-config-path",
@@ -292,8 +294,8 @@ async fn cmd_sync() {
 			config_dir.path().to_str().unwrap(),
 			"--skip-update",
 			"sync",
-			local.path().to_str().unwrap(),
-			test_dir_name,
+			"--pair",
+			&pair,
 		])
 		.stdout(Stdio::piped())
 		.stderr(Stdio::piped())
@@ -334,6 +336,6 @@ async fn cmd_sync() {
 		output.status.success(),
 		"the CLI did not stop cleanly:\n{stdout}"
 	);
-	assert!(stdout.contains("upload    from_local.txt"), "{stdout}");
-	assert!(stdout.contains("download  from_remote.txt"), "{stdout}");
+	assert!(stdout.contains("Uploaded from_local.txt"), "{stdout}");
+	assert!(stdout.contains("Downloaded from_remote.txt"), "{stdout}");
 }
