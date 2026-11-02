@@ -177,6 +177,25 @@ async fn working_path_must_be_an_existing_directory() {
 }
 
 #[shared_test_runtime]
+async fn options_after_the_command_apply_to_it() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = &resources.dir;
+
+	let file = client
+		.make_file_builder("file_listed_as_json.txt", test_dir.uuid)
+		.unwrap();
+	client.upload_file(file, b"content").await.unwrap();
+
+	let assert = authenticated_cli_with_args!("ls", test_dir.name().unwrap(), "--json").success();
+	let listing: serde_json::Value = serde_json::from_slice(&assert.get_output().stdout).unwrap();
+	assert!(
+		listing.to_string().contains("file_listed_as_json.txt"),
+		"{listing}"
+	);
+}
+
+#[shared_test_runtime]
 async fn cmd_export_notes() {
 	let client = test_utils::RESOURCES.client().await;
 

@@ -6,6 +6,9 @@
 //!
 //! Invoke the Filen CLI with no command specified to enter interactive mode (REPL).
 //! There, you can specify absolute paths (starting with "/") or relative paths (supports "." and "..").
+//!
+//! Options can go before or after the command (`filen --json ls` or `filen ls --json`),
+//! except for `--password` and `--two-factor-code`, which go before it.
 
 use std::{ffi::OsString, fs, num::NonZeroU32, path::PathBuf, sync::Arc, time::Duration};
 
@@ -62,21 +65,23 @@ pub(crate) struct CliArgs {
 	help: Option<String>,
 
 	/// Increase verbosity (-v, -vv, -vvv)
-	#[arg(short, long, action = clap::ArgAction::Count)]
+	#[arg(short, long, action = clap::ArgAction::Count, global = true)]
 	verbose: u8,
 
 	/// Hide progress bars and other non-essential output (overrides -v)
-	#[arg(short, long)]
+	#[arg(short, long, global = true)]
 	quiet: bool,
 
 	/// Config directory (overrides system default)
-	#[arg(long)]
+	#[arg(long, global = true)]
 	config_dir: Option<PathBuf>,
 
 	/// Filen account email (requires --password)
-	#[arg(short, long, env = "FILEN_CLI_EMAIL")]
+	#[arg(short, long, env = "FILEN_CLI_EMAIL", global = true)]
 	email: Option<String>,
 
+	// The password and the two-factor code go before the command, unlike the other options: `-p`
+	// after it is `rm -p` or `sync -p`, and `--password` is `serve --password`.
 	/// Filen account password (requires --email)
 	#[arg(short, long, env = "FILEN_CLI_PASSWORD")]
 	password: Option<String>,
@@ -86,52 +91,52 @@ pub(crate) struct CliArgs {
 	two_factor_code: Option<String>,
 
 	/// Path to auth config file (exported via `filen export-auth-config`)
-	#[arg(long)]
+	#[arg(long, global = true)]
 	auth_config_path: Option<String>,
 
 	/// Limit concurrent API connections
-	#[arg(long)]
+	#[arg(long, global = true)]
 	concurrency: Option<usize>,
 
 	/// Maximum number of API requests per second
-	#[arg(long)]
+	#[arg(long, global = true)]
 	requests_per_sec: Option<NonZeroU32>,
 
 	/// Cap upload bandwidth, in kilobytes per second
-	#[arg(long)]
+	#[arg(long, global = true)]
 	upload_bandwidth_kbps: Option<NonZeroU32>,
 
 	/// Cap download bandwidth, in kilobytes per second
-	#[arg(long)]
+	#[arg(long, global = true)]
 	download_bandwidth_kbps: Option<NonZeroU32>,
 
 	/// Memory budget for file I/O, in bytes
-	#[arg(long)]
+	#[arg(long, global = true)]
 	memory_budget_bytes: Option<usize>,
 
 	/// Connection timeout, in seconds
-	#[arg(long)]
+	#[arg(long, global = true)]
 	connect_timeout_secs: Option<u64>,
 
 	/// Skip checking for updates
-	#[arg(long)]
+	#[arg(long, global = true)]
 	skip_update: bool,
 
 	/// Force checking for updates
-	#[arg(long)]
+	#[arg(long, global = true)]
 	force_update_check: bool,
 
 	/// Force checking for updates and install them automatically.
 	/// Usually, updates are only installed in REPL mode
-	#[arg(long)]
+	#[arg(long, global = true)]
 	always_update: bool,
 
 	/// Sets autocomplete to be less eager, only completing remote paths after pressing tab
-	#[arg(long)]
+	#[arg(long, global = true)]
 	reluctant_autocomplete: bool,
 
 	/// Format command output as machine-readable JSON (where applicable)
-	#[arg(long)]
+	#[arg(long, global = true)]
 	json: bool,
 
 	#[command(subcommand)]
@@ -144,7 +149,7 @@ pub(crate) struct CliArgs {
 	make_output_environment_agnostic_for_replay_testing: bool,
 
 	/// The initial working path for the REPL or non-interactive commands (defaults to "/")
-	#[arg(long)]
+	#[arg(long, global = true)]
 	working_path: Option<String>,
 }
 
@@ -632,6 +637,60 @@ mod tests {
 	fn help_before_an_rclone_command_is_the_clis() {
 		let cli_args = parse_args(["filen", "rclone", "--help"]).unwrap();
 		assert_eq!(cli_args.help.as_deref(), Some("rclone"));
+	}
+
+	#[test]
+	fn the_options_and_commands_do_not_collide() {
+		CliArgs::command().debug_assert();
+	}
+
+	#[test]
+	fn an_option_after_the_command_is_the_clis() {
+		let cli_args = parse_args(["filen", "ls", "/dir", "--json", "-vv"]).unwrap();
+		assert!(cli_args.json);
+		assert_eq!(cli_args.verbose, 2);
+		let Some(Commands::Fs(FsCommands::Ls { directory, .. })) = cli_args.command else {
+			panic!("parsed {:?}", cli_args.command);
+		};
+		assert_eq!(directory.as_deref(), Some("/dir"));
+	}
+
+	#[test]
+	fn a_password_after_the_command_is_the_commands_option() {
+		let cli_args = parse_args(["filen", "rm", "file", "-p"]).unwrap();
+		assert!(cli_args.password.is_none());
+		let Some(Commands::Fs(FsCommands::Rm { permanent, .. })) = cli_args.command else {
+			panic!("parsed {:?}", cli_args.command);
+		};
+		assert!(permanent);
+	}
+
+	#[test]
+	fn a_password_after_a_command_without_that_option_is_an_error() {
+		let Err(e) = parse_args(["filen", "ls", "-p", "secret"]) else {
+			panic!("parsed a password after the command");
+		};
+		assert_eq!(e.kind(), ErrorKind::UnknownArgument);
+	}
+
+	#[test]
+	fn an_option_before_the_rclone_command_is_the_clis() {
+		let cli_args = parse_args(["filen", "rclone", "-v", "ls"]).unwrap();
+		assert_eq!(cli_args.verbose, 1);
+		let Some(Commands::Rclone(RcloneCommands::Rclone { cmd })) = cli_args.command else {
+			panic!("parsed {:?}", cli_args.command);
+		};
+		assert_eq!(cmd, ["ls"]);
+	}
+
+	#[test]
+	fn an_option_inside_an_rclone_command_goes_to_rclone() {
+		let cli_args = parse_args(["filen", "rclone", "ls", "-v"]).unwrap();
+		assert_eq!(cli_args.verbose, 0);
+		let Some(Commands::Rclone(RcloneCommands::Rclone { cmd })) = cli_args.command else {
+			panic!("parsed {:?}", cli_args.command);
+		};
+		assert_eq!(cmd, ["ls", "-v"]);
 	}
 
 	#[test]
