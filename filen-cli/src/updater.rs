@@ -82,13 +82,17 @@ pub(crate) async fn check_for_updates(
 				github_api.get_announcements(),
 			)
 		},
+		// installing an update is not what --yes confirms
+		|ui, question| ui.prompt_yes_no(question, true),
 	)
 	.await;
 }
 
 /// Shows the announcements and handles the latest release that `fetch` returns, printing a
 /// warning for each part that fails, then writes the time of the check to
-/// `last_checked_config`, whether the check succeeded or not.
+/// `last_checked_config`, whether the check succeeded or not. A running `version` that is not a
+/// semver version fails the whole check, before anything is fetched. `confirm` asks whether to
+/// install the update the REPL offers, [`UI::prompt_yes_no`] outside the tests.
 async fn run_update_check(
 	ui: &mut UI,
 	version: &str,
@@ -96,23 +100,42 @@ async fn run_update_check(
 	is_repl: bool,
 	last_checked_config: Option<&LastCheckedConfig>,
 	fetch: impl AsyncFnOnce() -> (Result<GitHubRelease>, Result<Vec<Announcement>>),
+	confirm: impl FnOnce(&mut UI, &str) -> Result<bool>,
 ) {
-	let (latest_release, announcements) = fetch().await;
+	match semver::Version::parse(version) {
+		Ok(current) => {
+			let (latest_release, announcements) = fetch().await;
 
-	if let Err(e) =
-		announcements.and_then(|announcements| show_announcements(ui, version, announcements))
-	{
-		ui.print_side_warning(&format!("Failed to fetch announcements: {e:#}"));
-	}
+			match announcements {
+				Ok(announcements) => show_announcements(ui, &current, announcements),
+				Err(e) => ui.print_side_warning(&format!("Failed to fetch announcements: {e:#}")),
+			}
 
-	let updated = match latest_release {
-		Ok(latest_release) => {
-			handle_latest_release(ui, version, &latest_release, automatically_update, is_repl).await
+			let running = RunningVersion {
+				current: &current,
+				version,
+			};
+			let updated = match latest_release {
+				Ok(latest_release) => {
+					handle_latest_release(
+						ui,
+						running,
+						&latest_release,
+						automatically_update,
+						is_repl,
+						confirm,
+					)
+					.await
+				}
+				Err(e) => Err(e),
+			};
+			if let Err(e) = updated {
+				ui.print_side_warning(&format!("Update check failed: {e:#}"));
+			}
 		}
-		Err(e) => Err(e),
-	};
-	if let Err(e) = updated {
-		ui.print_side_warning(&format!("Update check failed: {e:#}"));
+		Err(e) => ui.print_side_warning(&format!(
+			"Update check failed: Failed to parse the running version {version}: {e}"
+		)),
 	}
 
 	if let Some(last_checked_config) = last_checked_config
@@ -123,51 +146,101 @@ async fn run_update_check(
 }
 
 /// Shows the announcements targeted at `version`.
-fn show_announcements(ui: &mut UI, version: &str, announcements: Vec<Announcement>) -> Result<()> {
-	let version = semver::Version::parse(version)?;
+fn show_announcements(ui: &mut UI, version: &semver::Version, announcements: Vec<Announcement>) {
 	announcements
 		.into_iter()
-		.filter(|announcement| announcement.version_range.matches(&version))
+		.filter(|announcement| announcement.version_range.matches(version))
 		.for_each(|announcement| ui.print_announcement(&announcement.message));
-	Ok(())
 }
 
-/// Offers, announces or installs `latest_release` if it is not `version`.
+/// The version of the running CLI.
+#[derive(Clone, Copy)]
+struct RunningVersion<'a> {
+	current: &'a semver::Version,
+	/// As it was given, which the name of an executable that carries its version holds.
+	version: &'a str,
+}
+
+/// What to do about the latest release.
+#[derive(Debug, PartialEq, Eq)]
+enum ReleaseAction {
+	/// It is not newer than the running version.
+	Nothing,
+	/// Tell the user to update from the REPL, outside of which the CLI does not update.
+	Announce,
+	/// Ask the user whether to install it.
+	Offer,
+	/// Install it without asking, for `--always-update`.
+	Install,
+}
+
+/// Chooses what to do about the `latest` release when running `current`. Only a release of
+/// higher semver precedence is offered or installed, never an older one (a GitHub release
+/// marked latest by mistake, or a newer local build).
+fn release_action(
+	current: &semver::Version,
+	latest: &semver::Version,
+	automatically_update: bool,
+	is_repl: bool,
+) -> ReleaseAction {
+	if latest.cmp_precedence(current).is_le() {
+		ReleaseAction::Nothing
+	} else if automatically_update {
+		ReleaseAction::Install
+	} else if is_repl {
+		ReleaseAction::Offer
+	} else {
+		ReleaseAction::Announce
+	}
+}
+
+/// Offers, announces or installs `latest_release` if it is newer than the running version. An
+/// offer that cannot be asked is announced instead, as outside the REPL; declining it is not a
+/// failure, the CLI carries on with the running version.
 async fn handle_latest_release(
 	ui: &mut UI,
-	version: &str,
+	RunningVersion { current, version }: RunningVersion<'_>,
 	latest_release: &GitHubRelease,
 	automatically_update: bool,
 	is_repl: bool,
+	confirm: impl FnOnce(&mut UI, &str) -> Result<bool>,
 ) -> Result<()> {
 	let latest_tag = latest_release.tag_name.trim_start_matches('v');
-	if latest_tag == version {
-		log::info!("Up to date: {}", version);
-		return Ok(());
-	}
-	if !is_repl && !automatically_update {
+	let latest = semver::Version::parse(latest_tag)
+		.with_context(|| format!("Failed to parse the latest release's version {latest_tag}"))?;
+	let announce = |ui: &mut UI| {
 		ui.print_announcement(&format!(
 			"Please update from v{} to v{} by invoking the CLI with no command specified (REPL).",
 			version, latest_tag
 		));
-		return Ok(());
-	}
-	if automatically_update {
-		ui.print_muted_to_stderr(&format!(
-			"Automatically updating from v{} to v{}...",
-			version, latest_tag
-		));
-	} else if !ui
-		// installing an update is not what --yes confirms
-		.prompt_yes_no(
-			&format!("Update now from v{} to v{}", version, latest_tag),
-			true,
-		)
-		.context("Failed to read confirmation")?
-	{
-		// the CLI carries on with this version, and asks again after the next check
-		log::info!("Update to v{latest_tag} declined");
-		return Ok(());
+	};
+	match release_action(current, &latest, automatically_update, is_repl) {
+		ReleaseAction::Nothing => {
+			log::info!("Up to date: v{version} (latest release: v{latest_tag})");
+			return Ok(());
+		}
+		ReleaseAction::Announce => {
+			announce(ui);
+			return Ok(());
+		}
+		ReleaseAction::Install => {
+			ui.print_muted_to_stderr(&format!(
+				"Automatically updating from v{} to v{}...",
+				version, latest_tag
+			));
+		}
+		ReleaseAction::Offer => {
+			let question = format!("Update now from v{} to v{}", version, latest_tag);
+			if ui.ensure_can_prompt(&question).is_err() {
+				announce(ui);
+				return Ok(());
+			}
+			if !confirm(ui, &question).context("Failed to read confirmation")? {
+				// the CLI carries on with this version, and asks again after the next check
+				log::info!("Update to v{latest_tag} declined");
+				return Ok(());
+			}
+		}
 	}
 	let asset = latest_release
 		.assets
@@ -534,6 +607,7 @@ mod tests {
 					Ok(vec![announcement(">=0.2.0", "Hello")]),
 				)
 			},
+			not_asked,
 		)
 		.await;
 
@@ -563,6 +637,7 @@ mod tests {
 						Err(anyhow::anyhow!("connection refused")),
 					)
 				},
+				not_asked,
 			)
 			.await;
 
@@ -588,6 +663,7 @@ mod tests {
 					Err(anyhow::anyhow!("connection refused")),
 				)
 			},
+			not_asked,
 		)
 		.await;
 
@@ -612,6 +688,7 @@ mod tests {
 			false,
 			Some(&LastCheckedConfig::new(config_dir.path())),
 			async || (Ok(release("v0.3.0")), Ok(Vec::new())),
+			not_asked,
 		)
 		.await;
 
@@ -625,15 +702,239 @@ mod tests {
 		assert!(written_stamp(config_dir.path()).is_some());
 	}
 
+	/// The answer to an update offer the test does not expect.
+	fn not_asked(_: &mut UI, question: &str) -> Result<bool> {
+		panic!("asked {question:?}")
+	}
+
+	#[tokio::test]
+	async fn a_declined_update_starts_quietly_and_writes_the_stamp() {
+		let config_dir = tempfile::tempdir().unwrap();
+		let printed = Printed::default();
+		let mut ui = printed.prompting_ui();
+		let asked = Cell::new(None);
+
+		run_update_check(
+			&mut ui,
+			"0.2.9",
+			false,
+			true,
+			Some(&LastCheckedConfig::new(config_dir.path())),
+			async || (Ok(release("v0.3.0")), Ok(Vec::new())),
+			|_, question| {
+				asked.set(Some(question.to_owned()));
+				Ok(false)
+			},
+		)
+		.await;
+
+		assert_eq!(
+			asked.into_inner().as_deref(),
+			Some("Update now from v0.2.9 to v0.3.0")
+		);
+		assert_eq!(printed.lines_or_empty(), "");
+		assert!(written_stamp(config_dir.path()).is_some());
+	}
+
+	#[tokio::test]
+	async fn a_canceled_update_offer_is_a_warning_and_still_writes_the_stamp() {
+		let config_dir = tempfile::tempdir().unwrap();
+		let printed = Printed::default();
+		let mut ui = printed.prompting_ui();
+
+		run_update_check(
+			&mut ui,
+			"0.2.9",
+			false,
+			true,
+			Some(&LastCheckedConfig::new(config_dir.path())),
+			async || (Ok(release("v0.3.0")), Ok(Vec::new())),
+			|_, _| Err(UI::failure("Canceled")),
+		)
+		.await;
+
+		assert_eq!(
+			console::strip_ansi_codes(&printed.lines()),
+			"⚠ Update check failed: Failed to read confirmation: Canceled"
+		);
+		assert!(written_stamp(config_dir.path()).is_some());
+	}
+
+	#[tokio::test]
+	async fn an_update_offer_nobody_can_answer_is_announced_instead() {
+		let printed = Printed::default();
+		let mut ui = printed.terminal_ui();
+		ui.disable_prompts();
+
+		run_update_check(
+			&mut ui,
+			"0.2.9",
+			false,
+			true,
+			None,
+			async || (Ok(release("v0.3.0")), Ok(Vec::new())),
+			not_asked,
+		)
+		.await;
+
+		assert_eq!(
+			console::strip_ansi_codes(&printed.lines()),
+			"[i] Please update from v0.2.9 to v0.3.0 by invoking the CLI with no command \
+			 specified (REPL)."
+		);
+	}
+
+	#[tokio::test]
+	async fn a_running_version_that_is_not_semver_is_one_warning() {
+		let config_dir = tempfile::tempdir().unwrap();
+		let printed = Printed::default();
+		let mut ui = printed.terminal_ui();
+
+		run_update_check(
+			&mut ui,
+			"dev",
+			false,
+			false,
+			Some(&LastCheckedConfig::new(config_dir.path())),
+			async || -> (Result<GitHubRelease>, Result<Vec<Announcement>>) {
+				panic!("fetched with a running version that is not semver")
+			},
+			not_asked,
+		)
+		.await;
+
+		assert_eq!(
+			console::strip_ansi_codes(&printed.lines()),
+			"⚠ Update check failed: Failed to parse the running version dev: unexpected \
+			 character 'd' while parsing major version number"
+		);
+		assert!(written_stamp(config_dir.path()).is_some());
+	}
+
+	fn version(version: &str) -> semver::Version {
+		semver::Version::parse(version).unwrap()
+	}
+
+	#[test]
+	fn a_newer_release_is_announced_outside_the_repl() {
+		assert_eq!(
+			release_action(&version("0.2.9"), &version("0.2.10"), false, false),
+			ReleaseAction::Announce
+		);
+	}
+
+	#[test]
+	fn a_newer_release_is_offered_in_the_repl() {
+		assert_eq!(
+			release_action(&version("0.2.9"), &version("0.3.0"), false, true),
+			ReleaseAction::Offer
+		);
+	}
+
+	#[test]
+	fn a_newer_release_is_installed_with_always_update() {
+		assert_eq!(
+			release_action(&version("0.2.9"), &version("1.0.0"), true, false),
+			ReleaseAction::Install
+		);
+	}
+
+	#[test]
+	fn the_running_release_is_left_alone() {
+		assert_eq!(
+			release_action(&version("0.2.9"), &version("0.2.9"), true, true),
+			ReleaseAction::Nothing
+		);
+	}
+
+	#[test]
+	fn an_older_release_is_never_offered_or_installed() {
+		for (automatically_update, is_repl) in [(false, false), (false, true), (true, false)] {
+			assert_eq!(
+				release_action(
+					&version("0.2.10"),
+					&version("0.2.9"),
+					automatically_update,
+					is_repl
+				),
+				ReleaseAction::Nothing
+			);
+		}
+	}
+
+	#[test]
+	fn a_release_is_newer_than_a_prerelease_of_it() {
+		assert_eq!(
+			release_action(&version("0.3.0-beta.1"), &version("0.3.0"), true, false),
+			ReleaseAction::Install
+		);
+	}
+
+	#[test]
+	fn build_metadata_does_not_make_a_release_newer() {
+		assert_eq!(
+			release_action(&version("0.2.9"), &version("0.2.9+build.2"), true, false),
+			ReleaseAction::Nothing
+		);
+	}
+
+	#[tokio::test]
+	async fn an_older_latest_release_is_not_announced() {
+		let printed = Printed::default();
+		let mut ui = printed.terminal_ui();
+
+		run_update_check(
+			&mut ui,
+			"0.2.10",
+			false,
+			false,
+			None,
+			async || (Ok(release("v0.2.9")), Ok(Vec::new())),
+			not_asked,
+		)
+		.await;
+
+		assert_eq!(printed.lines_or_empty(), "");
+	}
+
+	#[tokio::test]
+	async fn an_unparsable_release_tag_is_a_warning() {
+		let printed = Printed::default();
+		let mut ui = printed.ui();
+
+		run_update_check(
+			&mut ui,
+			"0.2.9",
+			true,
+			false,
+			None,
+			async || (Ok(release("nightly")), Ok(Vec::new())),
+			not_asked,
+		)
+		.await;
+
+		assert_eq!(
+			console::strip_ansi_codes(&printed.lines()),
+			"⚠ Update check failed: Failed to parse the latest release's version nightly: \
+			 unexpected character 'n' while parsing major version number"
+		);
+	}
+
 	#[tokio::test]
 	async fn a_forced_check_writes_no_stamp() {
 		let config_dir = tempfile::tempdir().unwrap();
 		let printed = Printed::default();
 		let mut ui = printed.ui();
 
-		run_update_check(&mut ui, "0.2.9", false, false, None, async || {
-			(Ok(release("v0.2.9")), Ok(Vec::new()))
-		})
+		run_update_check(
+			&mut ui,
+			"0.2.9",
+			false,
+			false,
+			None,
+			async || (Ok(release("v0.2.9")), Ok(Vec::new())),
+			not_asked,
+		)
 		.await;
 
 		assert_eq!(printed.lines_or_empty(), "");
