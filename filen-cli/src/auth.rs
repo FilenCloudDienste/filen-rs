@@ -309,7 +309,8 @@ async fn authenticate_from_prompt(
 	let client = login_and_optionally_prompt_two_factor_code(
 		ui,
 		email.trim().to_string(),
-		password.trim(),
+		// as typed: a password can start or end with a space, as one given with --password can
+		&password,
 		None,
 		client_config_args,
 	)
