@@ -9,12 +9,13 @@
 //!
 //! Options can go before or after the command (`filen --json ls` or `filen ls --json`),
 //! except for `--password` and `--two-factor-code`, which go before it.
+//! In the REPL, a line can add `--json`, `--quiet` or `-v` for its own command.
 
 use std::{ffi::OsString, fs, num::NonZeroU32, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, anyhow};
 use base64::{Engine as _, engine::general_purpose::STANDARD as base64};
-use clap::{CommandFactory as _, FromArgMatches as _, Parser};
+use clap::{ArgMatches, CommandFactory as _, FromArgMatches as _, Parser, parser::ValueSource};
 use filen_sdk_rs::auth::{Client, StringifiedClient, http::ClientConfig, unauth::UnauthClient};
 use ftail::Ftail;
 use log::{LevelFilter, info, warn};
@@ -26,7 +27,7 @@ use crate::{
 	},
 	docs::{generate_markdown_docs, print_in_app_docs},
 	log_files::LogFiles,
-	ui::{CustomLogger, ReplPromptResult},
+	ui::{ConsoleLogLevel, CustomLogger, ReplPromptResult},
 	updater::check_for_updates,
 	util::RemotePath,
 };
@@ -218,7 +219,9 @@ async fn async_main(arenas_limited: bool) {
 }
 
 async fn inner_main(ui: &mut ui::UI, arenas_limited: bool) -> Result<()> {
-	let cli_args = parse_args(std::env::args_os()).unwrap_or_else(|e| e.exit());
+	let cli_args = parse_args(std::env::args_os())
+		.unwrap_or_else(|e| e.exit())
+		.args;
 
 	let is_dev = cfg!(debug_assertions);
 	let config = CliConfig {
@@ -245,16 +248,8 @@ async fn inner_main(ui: &mut ui::UI, arenas_limited: bool) -> Result<()> {
 	// setup logging
 	let log_dir = config.config_dir.join("logs");
 	fs::create_dir_all(&log_dir).context("Failed to create logs dir")?;
-	let logging_level = if cli_args.quiet {
-		LevelFilter::Off
-	} else {
-		match cli_args.verbose {
-			0 => LevelFilter::Off,
-			1 => LevelFilter::Info,
-			2 => LevelFilter::Debug,
-			_ => LevelFilter::Trace,
-		}
-	};
+	let output_options = OutputOptions::of(&cli_args);
+	let logging_level = output_options.log_level();
 	let log_file = log_dir.join(log_files::LATEST);
 	let log_files_level = LevelFilter::Debug;
 	// An `Arc` because ftail builds each channel from a `'static` `Fn`, which can only hand out
@@ -263,11 +258,16 @@ async fn inner_main(ui: &mut ui::UI, arenas_limited: bool) -> Result<()> {
 		LogFiles::open(&log_dir, log_files_level, 10 * 1024 * 1024, 3)
 			.context("Failed to open log files")?,
 	);
+	// An `Arc` because the logger keeps it for the rest of the process, while the REPL changes it
+	// for each line's command.
+	let console_log_level = Arc::new(ConsoleLogLevel::new(logging_level, log_files_level));
+	let logger_level = Arc::clone(&console_log_level);
 	Ftail::new()
 		.custom(
 			move |config| {
 				Box::new(CustomLogger {
 					config,
+					level: Arc::clone(&logger_level),
 					make_output_environment_agnostic_for_replay_testing: cli_args
 						.make_output_environment_agnostic_for_replay_testing,
 				}) as Box<dyn log::Log + Send + Sync>
@@ -281,7 +281,7 @@ async fn inner_main(ui: &mut ui::UI, arenas_limited: bool) -> Result<()> {
 		.init()
 		.context("Failed to initialize logger")?;
 	// ftail passes every record on to its channels, and no channel takes one past both levels.
-	log::set_max_level(logging_level.max(log_files_level));
+	console_log_level.set(logging_level);
 	info!("Logging level: {}", logging_level);
 	info!("Full log file: {}", log_file.display());
 
@@ -295,8 +295,8 @@ async fn inner_main(ui: &mut ui::UI, arenas_limited: bool) -> Result<()> {
 	}
 
 	ui.initialize(
-		cli_args.quiet,
-		cli_args.json,
+		output_options.quiet,
+		output_options.json,
 		None,
 		cli_args.reluctant_autocomplete,
 		cli_args.make_output_environment_agnostic_for_replay_testing,
@@ -384,8 +384,8 @@ async fn inner_main(ui: &mut ui::UI, arenas_limited: bool) -> Result<()> {
 					exit: false,
 				} => continue,
 			};
-			let cli_args = match parse_repl_line(&line) {
-				Ok(cli_args) => cli_args,
+			let line_args = match parse_repl_line(&line) {
+				Ok(line_args) => line_args,
 				Err(ReplLineError::Quoting) => {
 					ui.print_failure("Invalid quoting");
 					continue;
@@ -397,29 +397,104 @@ async fn inner_main(ui: &mut ui::UI, arenas_limited: bool) -> Result<()> {
 					}
 					continue;
 				}
+				Err(ReplLineError::StartupOptions(options)) => {
+					ui.print_failure(&format!(
+						"{} can only be given when starting the CLI, not in the REPL",
+						options.join(", ")
+					));
+					continue;
+				}
 			};
-			if let Some(help_topic) = cli_args.help {
-				if let Err(e) = print_in_app_docs(ui, help_topic_or_general(help_topic)) {
-					ui.print_failure_or_error(&e);
-				}
-				continue;
-			}
-			let Some(command) = cli_args.command else {
-				continue;
-			};
-			match execute_command(&config, ui, &mut client, &working_path, command).await {
-				Ok(result) => {
-					if result.exit {
-						break;
-					}
-					working_path = result.working_path.unwrap_or(working_path);
-				}
-				Err(e) => {
-					ui.print_failure_or_error(&e);
-				}
+			output_options
+				.with_repl_line(&line_args)
+				.apply(ui, &console_log_level);
+			let exit = run_repl_line(&config, ui, &mut client, &mut working_path, line_args).await;
+			output_options.apply(ui, &console_log_level);
+			if exit {
+				break;
 			}
 		}
 		Ok(())
+	}
+}
+
+/// Runs a parsed REPL line: prints the help it asks for, or runs its command and prints its
+/// failure. Returns whether the REPL should exit.
+async fn run_repl_line(
+	config: &CliConfig,
+	ui: &mut ui::UI,
+	client: &mut auth::LazyClient,
+	working_path: &mut RemotePath,
+	line_args: CliArgs,
+) -> bool {
+	if let Some(help_topic) = line_args.help {
+		if let Err(e) = print_in_app_docs(ui, help_topic_or_general(help_topic)) {
+			ui.print_failure_or_error(&e);
+		}
+		return false;
+	}
+	let Some(command) = line_args.command else {
+		return false;
+	};
+	match execute_command(config, ui, client, working_path, command).await {
+		Ok(result) => {
+			if let Some(new_working_path) = result.working_path {
+				*working_path = new_working_path;
+			}
+			result.exit
+		}
+		Err(e) => {
+			ui.print_failure_or_error(&e);
+			false
+		}
+	}
+}
+
+/// The options that shape a command's output: the CLI's, and in the REPL those its line adds.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct OutputOptions {
+	quiet: bool,
+	json: bool,
+	/// How often `-v` was given.
+	verbose: u8,
+}
+
+impl OutputOptions {
+	fn of(cli_args: &CliArgs) -> Self {
+		Self {
+			quiet: cli_args.quiet,
+			json: cli_args.json,
+			verbose: cli_args.verbose,
+		}
+	}
+
+	/// These options with those a REPL line gives added: a line can turn `--quiet` and `--json`
+	/// on, and raise the verbosity, but not undo the CLI's.
+	fn with_repl_line(self, line_args: &CliArgs) -> Self {
+		Self {
+			quiet: self.quiet || line_args.quiet,
+			json: self.json || line_args.json,
+			verbose: self.verbose.max(line_args.verbose),
+		}
+	}
+
+	/// The level of the log lines printed to the terminal: none with `--quiet`, which overrides
+	/// `-v`.
+	fn log_level(self) -> LevelFilter {
+		if self.quiet {
+			return LevelFilter::Off;
+		}
+		match self.verbose {
+			0 => LevelFilter::Off,
+			1 => LevelFilter::Info,
+			2 => LevelFilter::Debug,
+			_ => LevelFilter::Trace,
+		}
+	}
+
+	fn apply(self, ui: &mut ui::UI, console_log_level: &ConsoleLogLevel) {
+		ui.set_quiet_and_json(self.quiet, self.json);
+		console_log_level.set(self.log_level());
 	}
 }
 
@@ -446,13 +521,37 @@ enum ReplLineError {
 	Quoting,
 	/// The arguments are not a valid command line.
 	Arguments(clap::Error),
+	/// The line gives options that only apply when the CLI starts, such as `--config-dir`; these
+	/// are their names.
+	StartupOptions(Vec<String>),
 }
+
+/// The ids of the CLI's options a REPL line can give for its command. The others only apply when
+/// the CLI starts.
+const REPL_LINE_OPTIONS: &[&str] = &["help", "quiet", "json", "verbose"];
 
 /// Parses a REPL line as the arguments the CLI would be invoked with.
 fn parse_repl_line(line: &str) -> Result<CliArgs, ReplLineError> {
 	let mut args = shlex::split(line.trim()).ok_or(ReplLineError::Quoting)?;
 	args.insert(0, String::from("filen"));
-	parse_args(args).map_err(ReplLineError::Arguments)
+	let ParsedArgs { args, matches } = parse_args(args).map_err(ReplLineError::Arguments)?;
+	let startup_options = CliArgs::command()
+		.get_arguments()
+		.filter(|arg| !REPL_LINE_OPTIONS.contains(&arg.get_id().as_str()))
+		.filter(|arg| matches.value_source(arg.get_id().as_str()) == Some(ValueSource::CommandLine))
+		.filter_map(|arg| arg.get_long().map(|long| format!("--{long}")))
+		.collect::<Vec<_>>();
+	if !startup_options.is_empty() {
+		return Err(ReplLineError::StartupOptions(startup_options));
+	}
+	Ok(args)
+}
+
+/// A parsed command line.
+struct ParsedArgs {
+	args: CliArgs,
+	/// What clap parsed it from, which tells where each value came from.
+	matches: ArgMatches,
 }
 
 /// Parses the command line (the program name first).
@@ -460,7 +559,7 @@ fn parse_repl_line(line: &str) -> Result<CliArgs, ReplLineError> {
 /// `-h`/`--help` after a command asks for that command's help, which [`CliArgs::help`] then
 /// names, and leaves [`CliArgs::command`] empty. It does so even when the rest of the command
 /// is incomplete, as `filen cat --help` is without a file, as clap's own help flag would.
-fn parse_args<I, T>(args: I) -> Result<CliArgs, clap::Error>
+fn parse_args<I, T>(args: I) -> Result<ParsedArgs, clap::Error>
 where
 	I: IntoIterator<Item = T>,
 	T: Into<OsString> + Clone,
@@ -473,11 +572,23 @@ where
 		&& let Some(help_topic) = matches.get_one::<String>("help").cloned()
 	{
 		let command = matches.remove_subcommand().map(|(name, _)| name);
-		let mut cli_args = CliArgs::from_arg_matches(&matches)?;
+		let mut cli_args = from_matches(&matches)?;
 		cli_args.help = Some(command.unwrap_or(help_topic));
-		return Ok(cli_args);
+		return Ok(ParsedArgs {
+			args: cli_args,
+			matches,
+		});
 	}
-	CliArgs::try_parse_from(args)
+	let matches = CliArgs::command().try_get_matches_from(args)?;
+	Ok(ParsedArgs {
+		args: from_matches(&matches)?,
+		matches,
+	})
+}
+
+/// The [`CliArgs`] in `matches`, with an error formatted as clap formats one it parses.
+fn from_matches(matches: &ArgMatches) -> Result<CliArgs, clap::Error> {
+	CliArgs::from_arg_matches(matches).map_err(|e| e.format(&mut CliArgs::command()))
 }
 
 /// The help topic `--help` asked for, or `None` for the general help.
@@ -586,46 +697,50 @@ mod tests {
 
 	#[test]
 	fn help_after_a_command_asks_for_that_commands_help() {
-		let cli_args = parse_args(["filen", "ls", "--help"]).unwrap();
+		let cli_args = parse_args(["filen", "ls", "--help"]).unwrap().args;
 		assert_eq!(cli_args.help.as_deref(), Some("ls"));
 		assert!(cli_args.command.is_none());
 	}
 
 	#[test]
 	fn help_after_an_incomplete_command_asks_for_that_commands_help() {
-		let cli_args = parse_args(["filen", "cat", "-h"]).unwrap();
+		let cli_args = parse_args(["filen", "cat", "-h"]).unwrap().args;
 		assert_eq!(cli_args.help.as_deref(), Some("cat"));
 		assert!(cli_args.command.is_none());
 	}
 
 	#[test]
 	fn help_after_a_command_ignores_what_follows_it() {
-		let cli_args = parse_args(["filen", "ls", "--help", "/some/dir"]).unwrap();
+		let cli_args = parse_args(["filen", "ls", "--help", "/some/dir"])
+			.unwrap()
+			.args;
 		assert_eq!(cli_args.help.as_deref(), Some("ls"));
 	}
 
 	#[test]
 	fn help_after_a_command_keeps_the_options_before_it() {
-		let cli_args = parse_args(["filen", "-v", "cat", "--help"]).unwrap();
+		let cli_args = parse_args(["filen", "-v", "cat", "--help"]).unwrap().args;
 		assert_eq!(cli_args.verbose, 1);
 	}
 
 	#[test]
 	fn help_before_a_topic_asks_for_that_topic() {
-		let cli_args = parse_args(["filen", "--help", "ls"]).unwrap();
+		let cli_args = parse_args(["filen", "--help", "ls"]).unwrap().args;
 		assert_eq!(cli_args.help.as_deref(), Some("ls"));
 		assert!(cli_args.command.is_none());
 	}
 
 	#[test]
 	fn help_alone_asks_for_the_general_help() {
-		let cli_args = parse_args(["filen", "--help"]).unwrap();
+		let cli_args = parse_args(["filen", "--help"]).unwrap().args;
 		assert_eq!(cli_args.help.as_deref(), Some(""));
 	}
 
 	#[test]
 	fn help_inside_an_rclone_command_goes_to_rclone() {
-		let cli_args = parse_args(["filen", "rclone", "ls", "--help"]).unwrap();
+		let cli_args = parse_args(["filen", "rclone", "ls", "--help"])
+			.unwrap()
+			.args;
 		assert!(cli_args.help.is_none());
 		let Some(Commands::Rclone(RcloneCommands::Rclone { cmd })) = cli_args.command else {
 			panic!("parsed {:?}", cli_args.command);
@@ -635,7 +750,7 @@ mod tests {
 
 	#[test]
 	fn help_before_an_rclone_command_is_the_clis() {
-		let cli_args = parse_args(["filen", "rclone", "--help"]).unwrap();
+		let cli_args = parse_args(["filen", "rclone", "--help"]).unwrap().args;
 		assert_eq!(cli_args.help.as_deref(), Some("rclone"));
 	}
 
@@ -646,7 +761,9 @@ mod tests {
 
 	#[test]
 	fn an_option_after_the_command_is_the_clis() {
-		let cli_args = parse_args(["filen", "ls", "/dir", "--json", "-vv"]).unwrap();
+		let cli_args = parse_args(["filen", "ls", "/dir", "--json", "-vv"])
+			.unwrap()
+			.args;
 		assert!(cli_args.json);
 		assert_eq!(cli_args.verbose, 2);
 		let Some(Commands::Fs(FsCommands::Ls { directory, .. })) = cli_args.command else {
@@ -657,7 +774,7 @@ mod tests {
 
 	#[test]
 	fn a_password_after_the_command_is_the_commands_option() {
-		let cli_args = parse_args(["filen", "rm", "file", "-p"]).unwrap();
+		let cli_args = parse_args(["filen", "rm", "file", "-p"]).unwrap().args;
 		assert!(cli_args.password.is_none());
 		let Some(Commands::Fs(FsCommands::Rm { permanent, .. })) = cli_args.command else {
 			panic!("parsed {:?}", cli_args.command);
@@ -675,7 +792,7 @@ mod tests {
 
 	#[test]
 	fn an_option_before_the_rclone_command_is_the_clis() {
-		let cli_args = parse_args(["filen", "rclone", "-v", "ls"]).unwrap();
+		let cli_args = parse_args(["filen", "rclone", "-v", "ls"]).unwrap().args;
 		assert_eq!(cli_args.verbose, 1);
 		let Some(Commands::Rclone(RcloneCommands::Rclone { cmd })) = cli_args.command else {
 			panic!("parsed {:?}", cli_args.command);
@@ -685,12 +802,94 @@ mod tests {
 
 	#[test]
 	fn an_option_inside_an_rclone_command_goes_to_rclone() {
-		let cli_args = parse_args(["filen", "rclone", "ls", "-v"]).unwrap();
+		let cli_args = parse_args(["filen", "rclone", "ls", "-v"]).unwrap().args;
 		assert_eq!(cli_args.verbose, 0);
 		let Some(Commands::Rclone(RcloneCommands::Rclone { cmd })) = cli_args.command else {
 			panic!("parsed {:?}", cli_args.command);
 		};
 		assert_eq!(cmd, ["ls", "-v"]);
+	}
+
+	#[test]
+	fn a_repl_line_gives_output_options_for_its_command() {
+		let line_args = parse_repl_line("ls --json -q -vv").unwrap();
+		assert!(line_args.json);
+		assert!(line_args.quiet);
+		assert_eq!(line_args.verbose, 2);
+	}
+
+	#[test]
+	fn a_repl_line_giving_an_option_for_the_start_of_the_cli_is_rejected() {
+		let Err(ReplLineError::StartupOptions(options)) =
+			parse_repl_line("ls --config-dir /tmp --skip-update")
+		else {
+			panic!("parsed an option for the start of the CLI");
+		};
+		assert_eq!(options, ["--config-dir", "--skip-update"]);
+	}
+
+	#[test]
+	fn a_repl_line_giving_an_account_option_is_rejected() {
+		let Err(ReplLineError::StartupOptions(options)) =
+			parse_repl_line("-e someone@example.com ls")
+		else {
+			panic!("parsed an account option");
+		};
+		assert_eq!(options, ["--email"]);
+	}
+
+	#[test]
+	fn a_repl_line_with_help_and_an_option_for_the_start_of_the_cli_is_rejected() {
+		let Err(ReplLineError::StartupOptions(options)) =
+			parse_repl_line("ls --working-path /dir --help")
+		else {
+			panic!("parsed an option for the start of the CLI");
+		};
+		assert_eq!(options, ["--working-path"]);
+	}
+
+	#[test]
+	fn a_repl_line_adds_to_the_clis_output_options() {
+		let cli = OutputOptions {
+			quiet: false,
+			json: true,
+			verbose: 1,
+		};
+		let line_args = parse_repl_line("ls -q -vvv").unwrap();
+		assert_eq!(
+			cli.with_repl_line(&line_args),
+			OutputOptions {
+				quiet: true,
+				json: true,
+				verbose: 3,
+			}
+		);
+	}
+
+	#[test]
+	fn a_repl_line_without_output_options_keeps_the_clis() {
+		let cli = OutputOptions {
+			quiet: true,
+			json: true,
+			verbose: 2,
+		};
+		let line_args = parse_repl_line("ls").unwrap();
+		assert_eq!(cli.with_repl_line(&line_args), cli);
+	}
+
+	#[test]
+	fn quiet_hides_the_log_lines_whatever_the_verbosity() {
+		let options = |quiet, verbose| OutputOptions {
+			quiet,
+			json: false,
+			verbose,
+		};
+		assert_eq!(options(false, 0).log_level(), LevelFilter::Off);
+		assert_eq!(options(false, 1).log_level(), LevelFilter::Info);
+		assert_eq!(options(false, 2).log_level(), LevelFilter::Debug);
+		assert_eq!(options(false, 3).log_level(), LevelFilter::Trace);
+		assert_eq!(options(false, 4).log_level(), LevelFilter::Trace);
+		assert_eq!(options(true, 3).log_level(), LevelFilter::Off);
 	}
 
 	#[test]

@@ -1,6 +1,9 @@
 use std::{
 	io::{self, IsTerminal, Write},
-	sync::Arc,
+	sync::{
+		Arc,
+		atomic::{AtomicUsize, Ordering},
+	},
 };
 
 use anyhow::{Context, Result};
@@ -12,7 +15,7 @@ use inquire::{
 	history::SimpleHistory,
 	ui::{RenderConfig, Styled},
 };
-use log::{error, info, warn};
+use log::{LevelFilter, error, info, warn};
 use tiny_gradient::{GradientStr, RGB};
 use unicode_width::{UnicodeWidthChar as _, UnicodeWidthStr};
 
@@ -23,15 +26,50 @@ use crate::{
 	util::RemotePath,
 };
 
+/// The level of the log lines printed to the terminal. A REPL line's `-v` or `-q` changes it for
+/// that line's command.
+pub(crate) struct ConsoleLogLevel {
+	/// The [`LevelFilter`], as its index in [`LevelFilter::iter`].
+	level: AtomicUsize,
+	/// The level of the log files, which [`log::max_level`] must not drop below.
+	file_level: LevelFilter,
+}
+
+impl ConsoleLogLevel {
+	/// Starts at `level`. Takes effect once [`ConsoleLogLevel::set`] has set the logger's maximum.
+	pub(crate) fn new(level: LevelFilter, file_level: LevelFilter) -> Self {
+		Self {
+			level: AtomicUsize::new(level as usize),
+			file_level,
+		}
+	}
+
+	pub(crate) fn get(&self) -> LevelFilter {
+		LevelFilter::iter()
+			.nth(self.level.load(Ordering::Relaxed))
+			.expect("only a LevelFilter is stored (should be impossible)")
+	}
+
+	/// Sets the level, and the maximum the `log` macros pass on, which the log files' level
+	/// keeps from dropping below theirs.
+	pub(crate) fn set(&self, level: LevelFilter) {
+		self.level.store(level as usize, Ordering::Relaxed);
+		log::set_max_level(level.max(self.file_level));
+	}
+}
+
 pub(crate) struct CustomLogger {
 	pub(crate) config: ftail::Config,
+	// An `Arc` because ftail keeps the logger for the rest of the process, and the REPL changes
+	// the level for each line's command.
+	pub(crate) level: Arc<ConsoleLogLevel>,
 	/// Whether to redact things that depend on the runtime environment, like: paths, ...
 	pub(crate) make_output_environment_agnostic_for_replay_testing: bool,
 }
 
 impl log::Log for CustomLogger {
 	fn enabled(&self, metadata: &log::Metadata) -> bool {
-		metadata.level() <= self.config.level_filter
+		metadata.level() <= self.level.get()
 	}
 
 	fn log(&self, record: &log::Record) {
@@ -134,6 +172,12 @@ impl UI {
 
 	pub(crate) fn is_quiet(&self) -> bool {
 		self.quiet
+	}
+
+	/// Sets `--quiet` and `--json`, which a REPL line can turn on for its command.
+	pub(crate) fn set_quiet_and_json(&mut self, quiet: bool, json: bool) {
+		self.quiet = quiet;
+		self.json = json;
 	}
 
 	fn get_terminal_width(&self) -> Option<usize> {
@@ -859,6 +903,13 @@ mod tests {
 			"{stdout}{}",
 			String::from_utf8_lossy(&output.stderr)
 		);
+	}
+
+	#[test]
+	fn the_console_log_level_reads_back_each_level() {
+		for level in LevelFilter::iter() {
+			assert_eq!(ConsoleLogLevel::new(level, LevelFilter::Debug).get(), level);
+		}
 	}
 
 	#[test]
