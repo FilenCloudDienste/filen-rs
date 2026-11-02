@@ -42,6 +42,8 @@ use crate::{
 	commands::CommandContext,
 	completion::FilenCompleter,
 	docs::DocElement,
+	error::CliError,
+	interrupt,
 	ui::{self, UI},
 	util::RemotePath,
 };
@@ -245,13 +247,13 @@ async fn run_cancellable<T>(
 	progress: &TransferProgress,
 	transfer: impl Future<Output = Result<T>>,
 ) -> Result<Result<T>> {
-	let mut stop_rx = crate::CTRLC_TX.subscribe();
+	let mut ctrl_c = interrupt::own();
 	let outcome = select! {
-		_ = stop_rx.recv() => None,
+		() = ctrl_c.pressed() => None,
 		result = transfer => Some(result),
 	};
 	progress.clear();
-	outcome.ok_or_else(|| UI::failure("Canceled"))
+	outcome.ok_or_else(|| CliError::Interrupted.into())
 }
 
 /// Print the per-item failures the SDK reported through the progress callbacks, then either the

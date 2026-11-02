@@ -3,11 +3,14 @@
 //! - `0` when the command succeeded,
 //! - `1` when it failed, with the error printed to stderr,
 //! - `2` when the command line was invalid, such as an unknown command or flags that do not go together,
+//! - `130` when Ctrl-C cancelled the command or quit the CLI,
 //! - the exit code of Rclone when `filen rclone ...` failed in Rclone.
 
 use std::{error::Error, fmt};
 
 use inquire::InquireError;
+
+use crate::interrupt::EXIT_INTERRUPTED;
 
 /// An error the CLI reports to the user as it is, with the exit code it maps to. Any other error
 /// in a command's result is unexpected: it is reported as a possible bug and exits with code 1.
@@ -25,6 +28,8 @@ pub(crate) enum CliError {
 	/// A child process (Rclone) exited with this code and reported its own error; its code is the
 	/// CLI's exit code.
 	ChildExit(i32),
+	/// Ctrl-C cancelled the command; exit code [`EXIT_INTERRUPTED`].
+	Interrupted,
 }
 
 /// Exit code of a command that failed.
@@ -38,6 +43,7 @@ impl CliError {
 			CliError::Failure(_) | CliError::TerminalInput(_) => EXIT_FAILURE,
 			CliError::Usage(_) => EXIT_USAGE,
 			CliError::ChildExit(code) => *code,
+			CliError::Interrupted => EXIT_INTERRUPTED,
 		}
 	}
 }
@@ -48,6 +54,7 @@ impl fmt::Display for CliError {
 			CliError::Failure(msg) | CliError::Usage(msg) => f.write_str(msg),
 			CliError::TerminalInput(_) => f.write_str("Failed to read input prompt"),
 			CliError::ChildExit(code) => write!(f, "Exited with code {code}"),
+			CliError::Interrupted => f.write_str("Canceled"),
 		}
 	}
 }
@@ -56,7 +63,10 @@ impl Error for CliError {
 	fn source(&self) -> Option<&(dyn Error + 'static)> {
 		match self {
 			CliError::TerminalInput(e) => Some(e),
-			CliError::Failure(_) | CliError::Usage(_) | CliError::ChildExit(_) => None,
+			CliError::Failure(_)
+			| CliError::Usage(_)
+			| CliError::ChildExit(_)
+			| CliError::Interrupted => None,
 		}
 	}
 }
@@ -115,6 +125,14 @@ mod tests {
 		let err = anyhow::Error::from(CliError::ChildExit(7));
 
 		assert_eq!(exit_code(&err), 7);
+	}
+
+	#[test]
+	fn a_cancelled_command_exits_with_the_code_of_an_interrupted_process() {
+		let err = anyhow::Error::from(CliError::Interrupted).context("Failed to download");
+
+		assert_eq!(exit_code(&err), 130);
+		assert_eq!(format!("{err:#}"), "Failed to download: Canceled");
 	}
 
 	#[test]

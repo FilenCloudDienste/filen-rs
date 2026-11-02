@@ -21,7 +21,7 @@ use tokio::select;
 
 use crate::{
 	CliConfig, CommandResult, auth::LazyClient, commands::CommandContext, docs::DocElement,
-	error::CliError, ui::UI,
+	error::CliError, interrupt, ui::UI,
 };
 
 #[derive(Debug, Subcommand)]
@@ -171,7 +171,7 @@ pub(crate) async fn mount(
 		Some(mount_point) => mount_point,
 		None => default_mount_point().await?,
 	};
-	let daemon = start_daemon(config, ui, client, cache_size).await?;
+	let (daemon, ctrl_c) = start_daemon(config, ui, client, cache_size).await?;
 	let mounted = daemon
 		.mount(MountOptions {
 			mount_point,
@@ -183,7 +183,7 @@ pub(crate) async fn mount(
 		"Mounted network drive at {} (press Ctrl-C to unmount and exit)",
 		mounted.mount_point
 	));
-	wait_and_stop(ui, &daemon, "Unmounting network drive").await
+	wait_and_stop(ui, &daemon, ctrl_c, "Unmounting network drive").await
 }
 
 pub(crate) async fn start_server(
@@ -208,7 +208,7 @@ pub(crate) async fn start_server(
 	};
 	let scheme = if tls.is_some() { "https" } else { "http" };
 	let client = client.get(ui).await?;
-	let daemon = start_daemon(config, ui, client, args.cache_size).await?;
+	let (daemon, ctrl_c) = start_daemon(config, ui, client, args.cache_size).await?;
 	let serve = daemon
 		.start_serve(ServeOptions {
 			protocol: args.protocol,
@@ -242,7 +242,7 @@ pub(crate) async fn start_server(
 	ui.print_success(&format!(
 		"Started {name} server on {address} {credentials} (press Ctrl-C to stop)"
 	));
-	wait_and_stop(ui, &daemon, &format!("Stopping {name} server")).await
+	wait_and_stop(ui, &daemon, ctrl_c, &format!("Stopping {name} server")).await
 }
 
 pub(crate) async fn execute_rclone(
@@ -290,16 +290,21 @@ async fn remove_old_config(dir: &Path) {
 	}
 }
 
+/// Starts the daemon, and has Ctrl-C stop it from then on: a Ctrl-C while it starts, or while the
+/// command mounts or serves through it, waits in the returned [`interrupt::Owning`] for
+/// [`wait_and_stop`], which stops the daemon cleanly, rather than dropping it.
 async fn start_daemon(
 	config: &CliConfig,
 	ui: &mut UI,
 	client: &Client,
 	cache_size: Option<u64>,
-) -> Result<RcloneDaemon> {
+) -> Result<(RcloneDaemon, interrupt::Owning)> {
+	// a Ctrl-C while the managed rclone downloads still cancels the command
 	let binary = prepare_binary(config, ui).await;
+	let ctrl_c = interrupt::own();
 	let dir = rclone_dir(config);
 	let defaults = VfsTuning::default();
-	RcloneDaemon::start(
+	let daemon = RcloneDaemon::start(
 		client,
 		RcloneDaemonConfig {
 			binary,
@@ -314,15 +319,20 @@ async fn start_daemon(
 		},
 	)
 	.await
-	.context("Failed to start Rclone (use --verbose for more info)")
+	.context("Failed to start Rclone (use --verbose for more info)")?;
+	Ok((daemon, ctrl_c))
 }
 
 /// Waits for Ctrl-C, then stops the daemon, letting uploads finish for a while; fails if rclone
 /// exits first.
-async fn wait_and_stop(ui: &mut UI, daemon: &RcloneDaemon, stopping: &str) -> Result<()> {
-	let mut stop_rx = crate::CTRLC_TX.subscribe();
+async fn wait_and_stop(
+	ui: &mut UI,
+	daemon: &RcloneDaemon,
+	mut ctrl_c: interrupt::Owning,
+	stopping: &str,
+) -> Result<()> {
 	select! {
-		_ = stop_rx.recv() => {}
+		() = ctrl_c.pressed() => {}
 		exit = daemon.exited() => {
 			return Err(anyhow!(match exit {
 				RcloneExit::Crashed { code: Some(code), .. } => {

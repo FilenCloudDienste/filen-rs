@@ -43,6 +43,7 @@ mod commands;
 mod completion;
 mod docs;
 mod error;
+mod interrupt;
 mod log_files;
 mod memory;
 mod ui;
@@ -173,18 +174,6 @@ pub(crate) struct CliConfig {
 	pub(crate) config_dir: PathBuf,
 }
 
-pub(crate) static CTRLC_TX: std::sync::LazyLock<tokio::sync::broadcast::Sender<()>> =
-	std::sync::LazyLock::new(|| {
-		let (tx, _) = tokio::sync::broadcast::channel(1);
-		let tx_clone = tx.clone();
-		ctrlc::set_handler(move || {
-			let _ = tx_clone.send(());
-		})
-		.expect("Error setting Ctrl-C handler");
-		tx
-	});
-// todo: might we also be able to use this for general cancellability? (e.g. for long-running commands like upload/download)
-
 /// How large the log files grow and how long they are kept: a file is moved aside past 10 MiB,
 /// and they are deleted after three days, or the oldest first once they hold 100 MiB together.
 const LOG_LIMITS: LogLimits = LogLimits {
@@ -244,6 +233,7 @@ async fn inner_main(ui: &mut ui::UI, arenas_limited: bool) -> Result<()> {
 	let cli_args = parse_args(std::env::args_os())
 		.unwrap_or_else(|e| e.exit())
 		.args;
+	interrupt::install().context("Failed to set up Ctrl-C")?;
 
 	let is_dev = cfg!(debug_assertions);
 	let config = CliConfig {
@@ -385,7 +375,7 @@ async fn inner_main(ui: &mut ui::UI, arenas_limited: bool) -> Result<()> {
 	if let Some(command) = cli_args.command {
 		let working_path =
 			initial_working_path(ui, &mut client, cli_args.working_path.as_deref()).await?;
-		let _ = execute_command(&config, ui, &mut client, &working_path, command).await?;
+		let _ = execute_cancellable(&config, ui, &mut client, &working_path, command).await?;
 		Ok(())
 	} else {
 		ui.print_banner();
@@ -469,7 +459,7 @@ async fn run_repl_line(
 	let Some(command) = line_args.command else {
 		return false;
 	};
-	match execute_command(config, ui, client, working_path, command).await {
+	match execute_cancellable(config, ui, client, working_path, command).await {
 		Ok(result) => {
 			if let Some(new_working_path) = result.working_path {
 				*working_path = new_working_path;
@@ -481,6 +471,18 @@ async fn run_repl_line(
 			false
 		}
 	}
+}
+
+/// Runs `command` until it ends or Ctrl-C cancels it, unless it handles Ctrl-C itself
+/// ([`interrupt::own`]).
+async fn execute_cancellable(
+	config: &CliConfig,
+	ui: &mut ui::UI,
+	client: &mut auth::LazyClient,
+	working_path: &RemotePath,
+	command: Commands,
+) -> Result<CommandResult> {
+	interrupt::cancellable(execute_command(config, ui, client, working_path, command)).await
 }
 
 /// The options that shape how a command runs, its output and its confirmations: the CLI's, and

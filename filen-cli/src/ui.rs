@@ -367,7 +367,7 @@ impl UI {
 	pub(crate) fn print_failure_or_error(&mut self, err: &anyhow::Error) {
 		error!("{:#}", err);
 		match find_cli_error(err) {
-			Some(CliError::Failure(_) | CliError::Usage(_)) => {
+			Some(CliError::Failure(_) | CliError::Usage(_) | CliError::Interrupted) => {
 				self.print_failure(&format!("{:#}", err))
 			}
 			Some(CliError::TerminalInput(_)) => {

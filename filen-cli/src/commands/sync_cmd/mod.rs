@@ -16,6 +16,7 @@ use crate::{
 	CliConfig, CommandResult,
 	commands::{CommandContext, sync_cmd::sync_pairs::format_sync_pair},
 	docs::DocElement,
+	interrupt,
 	ui::UI,
 	util::RemotePath,
 };
@@ -151,6 +152,9 @@ pub(crate) async fn sync(
 			.context("Failed to list sync pairs")?,
 		&pair_ids,
 	)?;
+	// before the watches start, so that Ctrl-C stops every watch that started rather than
+	// dropping them
+	let mut ctrl_c = interrupt::own();
 
 	let (events_tx, mut events_rx) = mpsc::unbounded_channel();
 
@@ -189,11 +193,10 @@ pub(crate) async fn sync(
 	let stop_handles = futures::future::join_all(watch_handles.into_iter().map(|h| h.stop())); // won't be called until awaited
 
 	let mut pairs_that_have_had_passes = HashSet::new();
-	let mut ctrlc = crate::CTRLC_TX.subscribe();
 
 	loop {
 		select! {
-			_ = ctrlc.recv() => {
+			() = ctrl_c.pressed() => {
 				ui.print_muted("Stopping...");
 				stop_handles.await;
 				ui.print_muted("Stopped.");
