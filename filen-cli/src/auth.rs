@@ -19,13 +19,15 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow};
-use filen_cli::{ClientConfigArgs, deserialize_auth_config, serialize_auth_config};
 use filen_sdk_rs::{
 	ErrorKind,
 	auth::{Client, unauth::UnauthClient},
 };
 
-use crate::{CliConfig, ui::UI, util::LongKeyringEntry};
+use crate::{
+	CliConfig, ClientConfigArgs, build_client_config, deserialize_auth_config,
+	serialize_auth_config, ui::UI, util::LongKeyringEntry,
+};
 
 /// A lazily authenticated client.
 /// Since some commands (e. g. logout) don't need the user to be authenticated, we only authenticate when necessary.
@@ -178,8 +180,7 @@ async fn login_and_optionally_prompt_two_factor_code(
 	two_factor_code: Option<&str>,
 	client_config_args: &ClientConfigArgs,
 ) -> Result<Client> {
-	let unauth_client =
-		UnauthClient::from_config(filen_cli::build_client_config(client_config_args))?;
+	let unauth_client = UnauthClient::from_config(build_client_config(client_config_args))?;
 
 	match unauth_client
 		.login(email.clone(), password, two_factor_code.unwrap_or("XXXXXX"))
