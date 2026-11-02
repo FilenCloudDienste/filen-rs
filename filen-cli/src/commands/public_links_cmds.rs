@@ -252,7 +252,7 @@ async fn prompt_public_link_file_settings(
 	file: &RemoteFile,
 	mut link: FilePublicLink,
 ) -> Result<()> {
-	let expiration = prompt_expiration()?;
+	let expiration = prompt_expiration(ui)?;
 	link.set_expiration(expiration);
 	let password = ui.prompt("Password (leave empty for no password):")?;
 	if password.is_empty() {
@@ -304,7 +304,7 @@ async fn prompt_public_link_dir_settings(
 	dir: &RemoteDirectory,
 	mut link: DirPublicLinkRW,
 ) -> Result<()> {
-	let expiration = prompt_expiration()?;
+	let expiration = prompt_expiration(ui)?;
 	link.set_expiration(expiration);
 	let password = ui.prompt("Password (leave empty for no password):")?;
 	if password.is_empty() {
@@ -379,13 +379,7 @@ fn print_public_link_url(ui: &mut UI, url: Option<&str>) {
 
 struct LinkExpirationOption(&'static str, PublicLinkExpiration);
 
-impl std::fmt::Display for LinkExpirationOption {
-	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		write!(f, "{}", self.0)
-	}
-}
-
-fn prompt_expiration() -> Result<PublicLinkExpiration> {
+fn prompt_expiration(ui: &mut UI) -> Result<PublicLinkExpiration> {
 	let expiration_options = vec![
 		LinkExpirationOption("Never", PublicLinkExpiration::Never),
 		LinkExpirationOption("1 hour", PublicLinkExpiration::OneHour),
@@ -396,8 +390,20 @@ fn prompt_expiration() -> Result<PublicLinkExpiration> {
 		LinkExpirationOption("2 weeks", PublicLinkExpiration::TwoWeeks),
 		LinkExpirationOption("30 days", PublicLinkExpiration::ThirtyDays),
 	];
-	let expiration = inquire::Select::new("Expires after:", expiration_options).prompt()?;
-	Ok(expiration.1)
+	let selection = ui
+		.prompt_select(
+			"Expires after:",
+			expiration_options
+				.iter()
+				.map(|option| option.0.to_owned())
+				.collect(),
+		)?
+		.ok_or_else(|| UI::failure("Canceled"))?;
+	expiration_options
+		.into_iter()
+		.find(|option| option.0 == selection)
+		.map(|option| option.1)
+		.context("Failed to resolve selected expiration")
 }
 
 #[cfg(test)]
