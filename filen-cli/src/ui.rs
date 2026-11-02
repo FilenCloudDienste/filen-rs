@@ -502,9 +502,16 @@ impl UI {
 				info!("[PROMPT] canceled");
 				Ok(ReplPrompt::cancelled(&typed))
 			}
+			// Ctrl-C
 			Err(InquireError::OperationInterrupted) => {
 				info!("[PROMPT] interrupted");
-				Ok(ReplPrompt::Exit)
+				let prompt = ReplPrompt::cancelled(&typed);
+				if prompt == ReplPrompt::Cleared {
+					// inquire leaves the cursor after the dropped line, where the next prompt would
+					// start.
+					self.print_to_stderr("");
+				}
+				Ok(prompt)
 			}
 			Err(e) => {
 				error!("[PROMPT] failed to read input");
@@ -770,8 +777,8 @@ pub(crate) enum ReplPrompt {
 }
 
 impl ReplPrompt {
-	/// After Ctrl-D, which leaves the REPL on an empty line, as in a shell, and otherwise drops the
-	/// line.
+	/// After Ctrl-C or Ctrl-D, which leave the REPL on an empty line, as Ctrl-D does in a shell,
+	/// and otherwise drop the line.
 	fn cancelled(typed: &TypedLine) -> Self {
 		if typed.is_empty() {
 			ReplPrompt::Exit
@@ -1439,7 +1446,7 @@ mod tests {
 	}
 
 	#[test]
-	fn ctrl_d_on_an_empty_repl_line_leaves_the_repl() {
+	fn ctrl_c_or_ctrl_d_on_an_empty_repl_line_leaves_the_repl() {
 		assert_eq!(
 			ReplPrompt::cancelled(&TypedLine::default()),
 			ReplPrompt::Exit
@@ -1447,7 +1454,7 @@ mod tests {
 	}
 
 	#[test]
-	fn ctrl_d_after_typing_drops_the_line() {
+	fn ctrl_c_or_ctrl_d_after_typing_drops_the_line() {
 		let typed = TypedLine::default();
 		typed.set("ls");
 		assert_eq!(ReplPrompt::cancelled(&typed), ReplPrompt::Cleared);
