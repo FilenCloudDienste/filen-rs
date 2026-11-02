@@ -298,7 +298,7 @@ impl UI {
 
 	/// Prints a line to stderr, which is for failures, warnings and notices, so that they stay out
 	/// of output piped into another program. It is not logged, like [`UI::print`].
-	fn print_to_stderr(&mut self, msg: &str) {
+	pub(crate) fn print_to_stderr(&mut self, msg: &str) {
 		let msg = self.redact_for_replay_testing(msg.to_string());
 		// With nowhere left to report a failed write, it is dropped.
 		let _ = writeln!(self.err, "{}", msg);

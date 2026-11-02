@@ -2,7 +2,7 @@
 //! account: each process stops before it would log in.
 
 use std::{
-	io,
+	io::{self, Write as _},
 	process::{Command, Output, Stdio},
 };
 
@@ -250,10 +250,88 @@ fn trash_delete_without_a_terminal_fails_before_logging_in() {
 }
 
 #[test]
-fn no_input_without_a_command_is_a_usage_error() {
-	let output = run(&["--no-input"]);
+fn no_input_without_a_command_runs_the_commands_piped_in() {
+	let output = run_script(&["--no-input"], "--help cat\n");
+
+	let stderr = String::from_utf8(output.stderr).unwrap();
+	assert_eq!(output.status.code(), Some(0), "{stderr}");
+	let stdout = String::from_utf8(output.stdout).unwrap();
+	assert!(stdout.contains("Print the contents of a file"), "{stdout}");
+}
+
+/// Runs the CLI with `args` and without a command on a fresh config directory, with `script`
+/// piped into it.
+fn run_script(args: &[&str], script: &str) -> Output {
+	let config_dir = TempDir::new().unwrap();
+	let mut cli = Command::new(assert_cmd::cargo::cargo_bin!())
+		.env("FILEN_CLI_TESTING_DISABLE_KEYRING", "1")
+		.env("FILEN_CLI_TESTING_DISABLE_AUTODETECTED_AUTH_CONFIG", "1")
+		.env_remove("FILEN_CLI_EMAIL")
+		.env_remove("FILEN_CLI_PASSWORD")
+		.env_remove("FILEN_CLI_2FA_CODE")
+		.arg("--config-dir")
+		.arg(config_dir.path())
+		.arg("--skip-update")
+		.args(args)
+		.stdin(Stdio::piped())
+		.stdout(Stdio::piped())
+		.stderr(Stdio::piped())
+		.spawn()
+		.unwrap();
+	cli.stdin
+		.take()
+		.unwrap()
+		.write_all(script.as_bytes())
+		.unwrap();
+	cli.wait_with_output().unwrap()
+}
+
+#[test]
+fn commands_piped_in_run_one_after_another() {
+	let output = run_script(&[], "--help ls\n\n--help cat\n");
+
+	let stderr = String::from_utf8(output.stderr).unwrap();
+	assert_eq!(output.status.code(), Some(0), "{stderr}");
+	let stdout = String::from_utf8(output.stdout).unwrap();
+	let ls = stdout.find("List files in a directory").unwrap();
+	let cat = stdout.find("Print the contents of a file").unwrap();
+	assert!(ls < cat, "{stdout}");
+	// no banner and no login: the commands did not need one
+	assert!(!stdout.contains("Filen CLI v"), "{stdout}");
+}
+
+#[test]
+fn nothing_piped_in_runs_nothing() {
+	let output = run_script(&[], "");
+
+	assert_eq!(output.status.code(), Some(0));
+	assert_eq!(String::from_utf8(output.stdout).unwrap(), "");
+}
+
+#[test]
+fn commands_piped_in_go_on_after_a_failure_and_exit_with_its_code() {
+	let output = run_script(&[], "unknowncommand\n--help cat\n");
+
+	assert_eq!(output.status.code(), Some(2));
+	let stdout = String::from_utf8(output.stdout).unwrap();
+	assert!(stdout.contains("Print the contents of a file"), "{stdout}");
+	let stderr = String::from_utf8(output.stderr).unwrap();
+	assert!(stderr.contains("unknowncommand"), "{stderr}");
+}
+
+#[test]
+fn exit_piped_in_stops_the_commands_after_it() {
+	let output = run_script(&[], "exit\n--help cat\n");
+
+	assert_eq!(output.status.code(), Some(0));
+	assert_eq!(String::from_utf8(output.stdout).unwrap(), "");
+}
+
+#[test]
+fn a_command_piped_in_that_would_prompt_fails_instead() {
+	let output = run_script(&[], "ls\n");
 
 	assert_eq!(output.status.code(), Some(2));
 	let stderr = String::from_utf8(output.stderr).unwrap();
-	assert!(stderr.contains("--no-input needs a command"), "{stderr}");
+	assert!(stderr.contains("stdin is not a terminal"), "{stderr}");
 }

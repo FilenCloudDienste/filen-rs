@@ -7,6 +7,9 @@
 //! Invoke the Filen CLI with no command specified to enter interactive mode (REPL).
 //! There, you can specify absolute paths (starting with "/") or relative paths (supports "." and "..").
 //!
+//! Without a terminal on stdin, it runs the commands piped into it instead, one per line,
+//! and exits with the code of the last one that failed.
+//!
 //! A command asks at the terminal for what it needs and was not given, such as a password or a
 //! confirmation. When stdin is not a terminal, as with `filen rm -p file < list` or commands piped
 //! in, it asks at the controlling terminal instead (`/dev/tty`, or the console on Windows), as git
@@ -17,7 +20,15 @@
 //! except for `--password` and `--two-factor-code`, which go before it.
 //! In the REPL, a line can add `--json`, `--quiet`, `-v` or `--yes` for its own command.
 
-use std::{ffi::OsString, fs, num::NonZeroU32, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+	ffi::OsString,
+	fs,
+	io::{self, IsTerminal as _},
+	num::NonZeroU32,
+	path::PathBuf,
+	sync::Arc,
+	time::Duration,
+};
 
 use anyhow::{Context, Result, anyhow};
 use base64::{Engine as _, engine::general_purpose::STANDARD as base64};
@@ -223,13 +234,25 @@ async fn async_main(arenas_limited: bool) {
 	// call ui.initialize() later after parsing args
 
 	// translate errors to non-zero exit code
-	if let Err(e) = inner_main(&mut ui, arenas_limited).await {
-		ui.print_failure_or_error(&e);
-		std::process::exit(error::exit_code(&e));
+	match inner_main(&mut ui, arenas_limited).await {
+		Ok(Finished::Success) => {}
+		Ok(Finished::ScriptLineFailed(code)) => std::process::exit(code),
+		Err(e) => {
+			ui.print_failure_or_error(&e);
+			std::process::exit(error::exit_code(&e));
+		}
 	}
 }
 
-async fn inner_main(ui: &mut ui::UI, arenas_limited: bool) -> Result<()> {
+/// How a run of the CLI that did not fail ended.
+enum Finished {
+	Success,
+	/// Commands piped into the CLI ran, and the last of those that failed exits with this code.
+	/// It printed its failure already.
+	ScriptLineFailed(i32),
+}
+
+async fn inner_main(ui: &mut ui::UI, arenas_limited: bool) -> Result<Finished> {
 	let cli_args = parse_args(std::env::args_os())
 		.unwrap_or_else(|e| e.exit())
 		.args;
@@ -320,12 +343,13 @@ async fn inner_main(ui: &mut ui::UI, arenas_limited: bool) -> Result<()> {
 
 	// --export-markdown-docs
 	if cli_args.export_markdown_docs {
-		return generate_markdown_docs();
+		return generate_markdown_docs().map(|()| Finished::Success);
 	}
 
 	// --help
 	if let Some(help_topic) = cli_args.help {
-		return print_in_app_docs(ui, help_topic_or_general(help_topic));
+		return print_in_app_docs(ui, help_topic_or_general(help_topic))
+			.map(|()| Finished::Success);
 	}
 
 	// a single command has no working directory to change
@@ -336,8 +360,11 @@ async fn inner_main(ui: &mut ui::UI, arenas_limited: bool) -> Result<()> {
 		));
 	}
 
+	// Without a command, the CLI runs the commands piped into it, or the REPL at a terminal.
+	let script = cli_args.command.is_none() && !io::stdin().is_terminal();
+
 	// the REPL reads its commands from the terminal
-	if cli_args.no_input && cli_args.command.is_none() {
+	if cli_args.no_input && cli_args.command.is_none() && !script {
 		return Err(ui::UI::usage_failure(
 			"--no-input needs a command: the REPL reads its commands from the terminal.",
 		));
@@ -349,7 +376,7 @@ async fn inner_main(ui: &mut ui::UI, arenas_limited: bool) -> Result<()> {
 			cli_args.force_update_check || cli_args.always_update,
 			cli_args.always_update,
 			&config.config_dir,
-			cli_args.command.is_none(),
+			cli_args.command.is_none() && !script,
 		)
 		.await;
 	}
@@ -376,7 +403,39 @@ async fn inner_main(ui: &mut ui::UI, arenas_limited: bool) -> Result<()> {
 		let working_path =
 			initial_working_path(ui, &mut client, cli_args.working_path.as_deref()).await?;
 		let _ = execute_cancellable(&config, ui, &mut client, &working_path, command).await?;
-		Ok(())
+		Ok(Finished::Success)
+	} else if script {
+		let mut working_path =
+			initial_working_path(ui, &mut client, cli_args.working_path.as_deref()).await?;
+		let mut lines = Lines {
+			config: &config,
+			client: &mut client,
+			command_options,
+			console_log_level: &console_log_level,
+		};
+		let mut last_failure = None;
+		let mut line = String::new();
+		loop {
+			line.clear();
+			if io::stdin()
+				.read_line(&mut line)
+				.context("Failed to read the commands from stdin")?
+				== 0
+			{
+				break;
+			}
+			match lines.run(ui, &mut working_path, &line).await {
+				LineOutcome::Done => {}
+				// Ctrl-C stops the commands piped in, not just the one it cancelled.
+				LineOutcome::Failed(code @ interrupt::EXIT_INTERRUPTED) => {
+					last_failure = Some(code);
+					break;
+				}
+				LineOutcome::Failed(code) => last_failure = Some(code),
+				LineOutcome::Exit => break,
+			}
+		}
+		Ok(last_failure.map_or(Finished::Success, Finished::ScriptLineFailed))
 	} else {
 		ui.print_banner();
 
@@ -389,77 +448,141 @@ async fn inner_main(ui: &mut ui::UI, arenas_limited: bool) -> Result<()> {
 		let mut working_path =
 			initial_working_path(ui, &mut client, cli_args.working_path.as_deref()).await?;
 
+		let mut lines = Lines {
+			config: &config,
+			client: &mut client,
+			command_options,
+			console_log_level: &console_log_level,
+		};
 		loop {
-			let line = match ui.prompt_repl(client.get_arc().unwrap(), &working_path)? {
-				ReplPrompt::Line(line) if line.is_empty() => continue,
+			let line = match ui.prompt_repl(lines.client.get_arc().unwrap(), &working_path)? {
 				ReplPrompt::Line(line) => line,
 				ReplPrompt::Cleared => continue,
 				ReplPrompt::Exit => break,
 			};
-			let line_args = match parse_repl_line(&line) {
-				Ok(line_args) => line_args,
-				Err(ReplLineError::Quoting) => {
-					ui.print_failure("Invalid quoting");
-					continue;
-				}
-				Err(ReplLineError::Arguments(e)) => {
-					// as clap prints it when the CLI is invoked with the same arguments
-					if let Err(print_error) = e.print() {
-						warn!("Failed to print an argument error: {print_error}");
-					}
-					continue;
-				}
-				Err(ReplLineError::StartupOptions(options)) => {
-					ui.print_failure(&format!(
-						"{} can only be given when starting the CLI, not in the REPL",
-						options.join(", ")
-					));
-					continue;
-				}
-			};
-			command_options
-				.with_repl_line(&line_args)
-				.apply(ui, &console_log_level);
-			let exit = run_repl_line(&config, ui, &mut client, &mut working_path, line_args).await;
-			command_options.apply(ui, &console_log_level);
-			if exit {
-				break;
+			match lines.run(ui, &mut working_path, &line).await {
+				LineOutcome::Done | LineOutcome::Failed(_) => {}
+				LineOutcome::Exit => break,
 			}
 		}
-		Ok(())
+		Ok(Finished::Success)
 	}
 }
 
-/// Runs a parsed REPL line: prints the help it asks for, or runs its command and prints its
-/// failure. Returns whether the REPL should exit.
-async fn run_repl_line(
-	config: &CliConfig,
-	ui: &mut ui::UI,
-	client: &mut auth::LazyClient,
-	working_path: &mut RemotePath,
-	line_args: CliArgs,
-) -> bool {
-	if let Some(help_topic) = line_args.help {
-		if let Err(e) = print_in_app_docs(ui, help_topic_or_general(help_topic)) {
-			ui.print_failure_or_error(&e);
+/// What it takes to run the lines of the REPL, or of the commands piped into the CLI.
+struct Lines<'a> {
+	config: &'a CliConfig,
+	client: &'a mut auth::LazyClient,
+	/// The CLI's options, to which each line can add its own.
+	command_options: CommandOptions,
+	console_log_level: &'a ConsoleLogLevel,
+}
+
+/// How a line of the REPL, or of the commands piped into the CLI, ended.
+#[derive(Debug, PartialEq)]
+enum LineOutcome {
+	/// It did what it asked, or was empty.
+	Done,
+	/// It failed with this exit code, and printed why.
+	Failed(i32),
+	/// It asked to leave the REPL.
+	Exit,
+}
+
+impl Lines<'_> {
+	/// Runs a line: prints the help it asks for, or runs its command, and prints its failure.
+	async fn run(
+		&mut self,
+		ui: &mut ui::UI,
+		working_path: &mut RemotePath,
+		line: &str,
+	) -> LineOutcome {
+		if line.trim().is_empty() {
+			return LineOutcome::Done;
 		}
-		return false;
-	}
-	let Some(command) = line_args.command else {
-		return false;
-	};
-	match execute_cancellable(config, ui, client, working_path, command).await {
-		Ok(result) => {
-			if let Some(new_working_path) = result.working_path {
-				*working_path = new_working_path;
+		let line_args = match parse_repl_line(line) {
+			Ok(line_args) => line_args,
+			Err(ReplLineError::Quoting) => {
+				ui.print_failure("Invalid quoting");
+				return LineOutcome::Failed(error::EXIT_USAGE);
 			}
-			result.exit
+			Err(ReplLineError::Arguments(e)) => return print_argument_error(ui, &e),
+			Err(ReplLineError::StartupOptions(options)) => {
+				ui.print_failure(&format!(
+					"{} can only be given when starting the CLI, not in the REPL",
+					options.join(", ")
+				));
+				return LineOutcome::Failed(error::EXIT_USAGE);
+			}
+		};
+		self.command_options
+			.with_repl_line(&line_args)
+			.apply(ui, self.console_log_level);
+		let outcome = self.run_line_args(ui, working_path, line_args).await;
+		self.command_options.apply(ui, self.console_log_level);
+		outcome
+	}
+
+	async fn run_line_args(
+		&mut self,
+		ui: &mut ui::UI,
+		working_path: &mut RemotePath,
+		line_args: CliArgs,
+	) -> LineOutcome {
+		if let Some(help_topic) = line_args.help {
+			return match print_in_app_docs(ui, help_topic_or_general(help_topic)) {
+				Ok(()) => LineOutcome::Done,
+				Err(e) => failed(ui, &e),
+			};
 		}
-		Err(e) => {
-			ui.print_failure_or_error(&e);
-			false
+		let Some(command) = line_args.command else {
+			return LineOutcome::Done;
+		};
+		match execute_cancellable(self.config, ui, self.client, working_path, command).await {
+			Ok(result) => {
+				if let Some(new_working_path) = result.working_path {
+					*working_path = new_working_path;
+				}
+				match result.exit {
+					true => LineOutcome::Exit,
+					false => LineOutcome::Done,
+				}
+			}
+			Err(e) => failed(ui, &e),
 		}
 	}
+}
+
+/// Prints `err`, clap's error for a line's arguments, with the text clap prints when the CLI is
+/// invoked with the same arguments, and returns the outcome of the line. It is printed through the
+/// UI like any other line's output: what `--version` asks for to stdout, a failure to stderr.
+fn print_argument_error(ui: &mut ui::UI, err: &clap::Error) -> LineOutcome {
+	let rendered = err.render();
+	match err.exit_code() {
+		0 => {
+			ui.print(styled(&rendered, console::colors_enabled()).trim_end());
+			LineOutcome::Done
+		}
+		code => {
+			ui.print_to_stderr(styled(&rendered, console::colors_enabled_stderr()).trim_end());
+			LineOutcome::Failed(code)
+		}
+	}
+}
+
+/// `text` with its styles as ANSI escapes if `colors`, or as plain text.
+fn styled(text: &clap::builder::StyledStr, colors: bool) -> String {
+	if colors {
+		text.ansi().to_string()
+	} else {
+		text.to_string()
+	}
+}
+
+/// Prints `err` and returns the outcome of the line that failed with it.
+fn failed(ui: &mut ui::UI, err: &anyhow::Error) -> LineOutcome {
+	ui.print_failure_or_error(err);
+	LineOutcome::Failed(error::exit_code(err))
 }
 
 /// Runs `command` until it ends or Ctrl-C cancels it, unless it handles Ctrl-C itself
@@ -709,7 +832,7 @@ mod tests {
 	use clap::error::ErrorKind;
 
 	use super::*;
-	use crate::commands::rclone_cmds::RcloneCommands;
+	use crate::{commands::rclone_cmds::RcloneCommands, ui::test_support::Printed};
 
 	#[test]
 	fn a_repl_line_with_an_unclosed_quote_is_a_quoting_error() {
@@ -725,6 +848,40 @@ mod tests {
 			panic!("parsed an unknown command");
 		};
 		assert_eq!(e.kind(), ErrorKind::InvalidSubcommand);
+	}
+
+	#[test]
+	fn a_repl_lines_argument_error_is_printed_to_stderr_through_the_ui() {
+		let Err(ReplLineError::Arguments(e)) = parse_repl_line("unknowncommand") else {
+			panic!("parsed an unknown command");
+		};
+		let out = Printed::default();
+		let err = Printed::default();
+		let mut ui = Printed::split_ui(&out, &err);
+
+		assert_eq!(print_argument_error(&mut ui, &e), LineOutcome::Failed(2));
+		assert_eq!(out.lines_or_empty(), "");
+		assert_eq!(
+			console::strip_ansi_codes(&err.lines()),
+			"error: unrecognized subcommand 'unknowncommand'\n\nUsage: filen [OPTIONS] [COMMAND]"
+		);
+	}
+
+	#[test]
+	fn a_repl_line_asking_for_the_version_prints_it_to_stdout() {
+		let Err(ReplLineError::Arguments(e)) = parse_repl_line("--version") else {
+			panic!("parsed --version as a command line");
+		};
+		let out = Printed::default();
+		let err = Printed::default();
+		let mut ui = Printed::split_ui(&out, &err);
+
+		assert_eq!(print_argument_error(&mut ui, &e), LineOutcome::Done);
+		assert_eq!(
+			console::strip_ansi_codes(&out.lines()),
+			format!("Filen CLI {}", env!("CARGO_PKG_VERSION"))
+		);
+		assert_eq!(err.lines_or_empty(), "");
 	}
 
 	#[test]
