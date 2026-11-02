@@ -176,10 +176,7 @@ impl UI {
 	/// decrypted file contents, which must not reach the log files.
 	pub(crate) fn print(&mut self, msg: &str) {
 		let msg = self.redact_for_replay_testing(msg.to_string());
-		// A failed write panics, with the message `println!` panics with.
-		if let Err(e) = writeln!(self.out, "{}", msg) {
-			panic!("failed printing to stdout: {e}");
-		}
+		write_stdout_line(&mut self.out, &msg);
 	}
 
 	/// Prints a line to stderr, which is for failures, warnings and notices, so that they stay out
@@ -549,6 +546,18 @@ impl UI {
 
 	pub(crate) fn format_text_heading(text: &str) -> String {
 		style(text).bold().underlined().to_string()
+	}
+}
+
+/// Writes `line` to `out`, which is stdout outside the tests. A reader that closed stdout, as
+/// `head` does once it has read its lines, wants no more output, so the CLI exits then, with code
+/// 0 as if the command had finished.
+pub(crate) fn write_stdout_line(out: &mut (impl Write + ?Sized), line: &str) {
+	match writeln!(out, "{}", line) {
+		Ok(()) => {}
+		Err(e) if e.kind() == io::ErrorKind::BrokenPipe => std::process::exit(0),
+		// Any other failed write panics, with the message `println!` panics with.
+		Err(e) => panic!("failed printing to stdout: {e}"),
 	}
 }
 
