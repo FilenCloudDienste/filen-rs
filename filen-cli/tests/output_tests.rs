@@ -1,6 +1,8 @@
 //! Which of stdout and stderr the CLI writes to, and the exit codes it exits with. These need no
 //! account: each process stops before it would log in.
 
+#[cfg(unix)]
+use std::{fs, os::unix::fs::PermissionsExt as _};
 use std::{
 	io::{self, Write as _},
 	process::{Command, Output, Stdio},
@@ -334,4 +336,28 @@ fn a_command_piped_in_that_would_prompt_fails_instead() {
 	assert_eq!(output.status.code(), Some(2));
 	let stderr = String::from_utf8(output.stderr).unwrap();
 	assert!(stderr.contains("stdin is not a terminal"), "{stderr}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_config_dir_where_logs_cannot_be_written_only_warns() {
+	let config_dir = TempDir::new().unwrap();
+	fs::set_permissions(config_dir.path(), fs::Permissions::from_mode(0o500)).unwrap();
+	let output = Command::new(assert_cmd::cargo::cargo_bin!())
+		.arg("--config-dir")
+		.arg(config_dir.path())
+		.args(["--skip-update", "--help"])
+		.output()
+		.unwrap();
+	fs::set_permissions(config_dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+
+	let stderr = String::from_utf8(output.stderr).unwrap();
+	assert_eq!(output.status.code(), Some(0), "{stderr}");
+	assert!(
+		stderr.contains("Not writing log files: failed to create"),
+		"{stderr}"
+	);
+	let stdout = String::from_utf8(output.stdout).unwrap();
+	assert!(stdout.contains("Welcome to Filen CLI"), "{stdout}");
+	assert!(!config_dir.path().join("logs").exists());
 }

@@ -25,7 +25,7 @@ use std::{
 	fs,
 	io::{self, IsTerminal as _},
 	num::NonZeroU32,
-	path::PathBuf,
+	path::{Path, PathBuf},
 	sync::Arc,
 	time::Duration,
 };
@@ -193,6 +193,39 @@ const LOG_LIMITS: LogLimits = LogLimits {
 	max_total_size: 100 * 1024 * 1024,
 };
 
+/// The level of the lines written to the log files.
+const LOG_FILES_LEVEL: LevelFilter = LevelFilter::Debug;
+
+/// Opens the log files in `log_dir`, creating it if needed. Returns them, or none if they cannot
+/// be opened, and a warning for each thing that went wrong: the CLI runs on without log files
+/// rather than failing over them, as on a read-only config directory.
+fn open_log_files(log_dir: &Path) -> (Option<LogFiles>, Vec<String>) {
+	let mut warnings = Vec::new();
+	if let Err(e) = fs::create_dir_all(log_dir) {
+		warnings.push(format!(
+			"Not writing log files: failed to create {}: {e}",
+			log_dir.display()
+		));
+		return (None, warnings);
+	}
+	if let Err(e) = log_files::close_to_others(log_dir) {
+		warnings.push(format!(
+			"Failed to make {} readable by you only: {e}",
+			log_dir.display()
+		));
+	}
+	match LogFiles::open(log_dir, LOG_FILES_LEVEL, LOG_LIMITS) {
+		Ok(log_files) => (Some(log_files), warnings),
+		Err(e) => {
+			warnings.push(format!(
+				"Not writing log files: failed to open them in {}: {e}",
+				log_dir.display()
+			));
+			(None, warnings)
+		}
+	}
+}
+
 /// The most blocking threads the runtime runs at once, in place of tokio's default of 512.
 ///
 /// Every `tokio::fs` call (each read and write of a transferred file, its open, metadata and
@@ -282,43 +315,50 @@ async fn inner_main(ui: &mut ui::UI, arenas_limited: bool) -> Result<Finished> {
 
 	// setup logging
 	let log_dir = config.config_dir.join("logs");
-	fs::create_dir_all(&log_dir).context("Failed to create logs dir")?;
 	let command_options = CommandOptions::of(&cli_args);
 	let logging_level = command_options.log_level();
-	let log_file = log_dir.join(log_files::LATEST);
-	let log_files_level = LevelFilter::Debug;
-	// An `Arc` because ftail builds each channel from a `'static` `Fn`, which can only hand out
-	// clones of it.
-	let log_files = Arc::new(
-		LogFiles::open(&log_dir, log_files_level, LOG_LIMITS)
-			.context("Failed to open log files")?,
-	);
+	let (log_files, log_files_warnings) = open_log_files(&log_dir);
+	let log_files_level = match log_files {
+		Some(_) => LOG_FILES_LEVEL,
+		None => LevelFilter::Off,
+	};
 	// An `Arc` because the logger keeps it for the rest of the process, while the REPL changes it
 	// for each line's command.
 	let console_log_level = Arc::new(ConsoleLogLevel::new(logging_level, log_files_level));
 	let logger_level = Arc::clone(&console_log_level);
-	Ftail::new()
-		.custom(
-			move |config| {
-				Box::new(CustomLogger {
-					config,
-					level: Arc::clone(&logger_level),
-					make_output_environment_agnostic_for_replay_testing: cli_args
-						.make_output_environment_agnostic_for_replay_testing,
-				}) as Box<dyn log::Log + Send + Sync>
-			},
-			logging_level,
-		)
-		.custom(
+	let mut logger = Ftail::new().custom(
+		move |config| {
+			Box::new(CustomLogger {
+				config,
+				level: Arc::clone(&logger_level),
+				make_output_environment_agnostic_for_replay_testing: cli_args
+					.make_output_environment_agnostic_for_replay_testing,
+			}) as Box<dyn log::Log + Send + Sync>
+		},
+		logging_level,
+	);
+	if let Some(log_files) = log_files {
+		// An `Arc` because ftail builds each channel from a `'static` `Fn`, which can only hand
+		// out clones of it.
+		let log_files = Arc::new(log_files);
+		logger = logger.custom(
 			move |_| Box::new(Arc::clone(&log_files)) as Box<dyn log::Log + Send + Sync>,
 			log_files_level,
-		)
-		.init()
-		.context("Failed to initialize logger")?;
+		);
+	}
+	logger.init().context("Failed to initialize logger")?;
 	// ftail passes every record on to its channels, and no channel takes one past both levels.
 	console_log_level.set(logging_level);
 	info!("Logging level: {}", logging_level);
-	info!("Full log file: {}", log_file.display());
+	if log_files_level != LevelFilter::Off {
+		info!(
+			"Full log file: {}",
+			log_dir.join(log_files::LATEST).display()
+		);
+	}
+	for warning in &log_files_warnings {
+		warn!("{warning}");
+	}
 
 	if cfg!(debug_assertions) {
 		info!("Filen CLI (version omitted for replay testing)")
@@ -337,6 +377,9 @@ async fn inner_main(ui: &mut ui::UI, arenas_limited: bool) -> Result<Finished> {
 		cli_args.make_output_environment_agnostic_for_replay_testing,
 	);
 	ui.set_assume_yes(command_options.assume_yes);
+	for warning in &log_files_warnings {
+		ui.print_warning(warning);
+	}
 	if cli_args.no_input {
 		ui.disable_prompts();
 	}

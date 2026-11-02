@@ -91,12 +91,20 @@ struct LogFile {
 	file: File,
 }
 
+/// Closes the log directory `dir` to other users on unix: older CLIs created the log files with
+/// the default mode, and the moved-aside and earlier daily ones are never opened again to set
+/// theirs.
+pub(crate) fn close_to_others(dir: &Path) -> io::Result<()> {
+	#[cfg(unix)]
+	fs::set_permissions(dir, Permissions::from_mode(PRIVATE_DIR_MODE))?;
+	#[cfg(not(unix))]
+	let _ = dir;
+	Ok(())
+}
+
 impl LogFiles {
+	/// Opens the log files in `dir`, which [`close_to_others`] has closed to other users.
 	pub(crate) fn open(dir: &Path, level: LevelFilter, limits: LogLimits) -> io::Result<Self> {
-		// Older CLIs created the log files with the default mode, and the moved-aside and earlier
-		// daily ones are never opened again, so the directory is closed to other users as well.
-		#[cfg(unix)]
-		fs::set_permissions(dir, Permissions::from_mode(PRIVATE_DIR_MODE))?;
 		let latest = LogFile::open_latest(dir)?;
 		let day = Local::now().date_naive();
 		Ok(Self {
@@ -508,6 +516,7 @@ mod tests {
 		}
 		fs::set_permissions(dir.path(), Permissions::from_mode(0o755)).unwrap();
 
+		close_to_others(dir.path()).unwrap();
 		let _files = LogFiles::open(dir.path(), LevelFilter::Debug, limits(1024)).unwrap();
 
 		let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
