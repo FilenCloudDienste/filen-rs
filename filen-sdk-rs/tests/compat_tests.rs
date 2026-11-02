@@ -133,10 +133,16 @@ async fn prep_shared_compat_tests(client: &Client, language: &str, shortened: &s
 		.filter(|d| d.get_dir().name() == Some(format!("compat-{shortened}").as_str()))
 		.collect::<Vec<_>>();
 
-	assert_eq!(
-		share_dirs.len(),
-		3,
-		"Expected 3 compat-{shortened} shares (one for each auth version)"
+	// The other SDK's tests share compat-{shortened} from every account they run on, this leg's
+	// test account among them. Only that share is required, not one per auth version: no leg runs
+	// on a V3 account. Every share found is still checked below.
+	assert!(
+		share_dirs
+			.iter()
+			.any(|d| d.sharing_role().email() == client.email()),
+		"no compat-{shortened} share from {} among the {} found",
+		client.email(),
+		share_dirs.len()
 	);
 
 	for dir in share_dirs {
