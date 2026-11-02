@@ -30,8 +30,6 @@ pub(crate) async fn sync(
 ) -> Result<()> {
 	let client = client.get(ui).await?;
 
-	// todo: handle ctrl-c better?
-
 	// init sync engine
 	let db_path = config.config_dir.join("sync-engine.db");
 	let engine = Arc::new(
@@ -90,11 +88,28 @@ pub(crate) async fn sync(
 			.with_context(|| format!("Failed to watch sync pair {}", pair_friendly_name))?;
 		Ok::<_, anyhow::Error>(watch)
 	});
-	let _watch_handles = futures::future::join_all(watch_handles).await;
+	// a pair whose watch could not be started is skipped, and its error dropped
+	let watch_handles = futures::future::join_all(watch_handles)
+		.await
+		.into_iter()
+		.flatten()
+		.collect::<Vec<_>>();
 
-	// receive events and print them
+	// receive events and print them, until Ctrl-C
+	let ctrl_c = tokio::signal::ctrl_c();
+	tokio::pin!(ctrl_c);
 	let mut pairs_that_have_had_passes = HashSet::new();
-	while let Some((pair_id, event)) = events_rx.recv().await {
+	loop {
+		let (pair_id, event) = tokio::select! {
+			event = events_rx.recv() => match event {
+				Some(event) => event,
+				None => break,
+			},
+			result = &mut ctrl_c => {
+				result.context("Failed to listen for Ctrl-C")?;
+				break;
+			}
+		};
 		let pair = pairs.iter().find(|p| p.id == pair_id).with_context(|| {
 			format!("Received an event for unknown sync pair with id {pair_id}")
 		})?;
@@ -194,6 +209,8 @@ pub(crate) async fn sync(
 		}
 	}
 
+	// waits for each pair's pass in flight, so it finishes and releases the drive lock
+	futures::future::join_all(watch_handles.into_iter().map(|watch| watch.stop())).await;
 	Ok(())
 }
 
