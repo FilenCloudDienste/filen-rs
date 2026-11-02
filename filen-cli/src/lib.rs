@@ -7,11 +7,11 @@
 //! Invoke the Filen CLI with no command specified to enter interactive mode (REPL).
 //! There, you can specify absolute paths (starting with "/") or relative paths (supports "." and "..").
 
-use std::{fs, num::NonZeroU32, path::PathBuf, sync::Arc, time::Duration};
+use std::{ffi::OsString, fs, num::NonZeroU32, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, anyhow};
 use base64::{Engine as _, engine::general_purpose::STANDARD as base64};
-use clap::Parser;
+use clap::{CommandFactory as _, FromArgMatches as _, Parser};
 use filen_sdk_rs::auth::{Client, StringifiedClient, http::ClientConfig, unauth::UnauthClient};
 use ftail::Ftail;
 use log::{LevelFilter, info, warn};
@@ -50,7 +50,15 @@ mod util;
 #[allow(clippy::struct_excessive_bools)]
 pub(crate) struct CliArgs {
 	/// Print help about a command or topic
-	#[arg(short, long, num_args = 0..=1, default_missing_value = "", hide = true)]
+	// global: after a command, it asks for that command's help (see `parse_args`)
+	#[arg(
+		short,
+		long,
+		num_args = 0..=1,
+		default_missing_value = "",
+		hide = true,
+		global = true
+	)]
 	help: Option<String>,
 
 	/// Increase verbosity (-v, -vv, -vvv)
@@ -205,7 +213,7 @@ async fn async_main(arenas_limited: bool) {
 }
 
 async fn inner_main(ui: &mut ui::UI, arenas_limited: bool) -> Result<()> {
-	let cli_args = CliArgs::parse();
+	let cli_args = parse_args(std::env::args_os()).unwrap_or_else(|e| e.exit());
 
 	let is_dev = cfg!(debug_assertions);
 	let config = CliConfig {
@@ -439,7 +447,32 @@ enum ReplLineError {
 fn parse_repl_line(line: &str) -> Result<CliArgs, ReplLineError> {
 	let mut args = shlex::split(line.trim()).ok_or(ReplLineError::Quoting)?;
 	args.insert(0, String::from("filen"));
-	CliArgs::try_parse_from(args).map_err(ReplLineError::Arguments)
+	parse_args(args).map_err(ReplLineError::Arguments)
+}
+
+/// Parses the command line (the program name first).
+///
+/// `-h`/`--help` after a command asks for that command's help, which [`CliArgs::help`] then
+/// names, and leaves [`CliArgs::command`] empty. It does so even when the rest of the command
+/// is incomplete, as `filen cat --help` is without a file, as clap's own help flag would.
+fn parse_args<I, T>(args: I) -> Result<CliArgs, clap::Error>
+where
+	I: IntoIterator<Item = T>,
+	T: Into<OsString> + Clone,
+{
+	let args = args.into_iter().collect::<Vec<T>>();
+	// Without validation, so that the help is found on an incomplete command.
+	if let Ok(mut matches) = CliArgs::command()
+		.ignore_errors(true)
+		.try_get_matches_from(args.iter().cloned())
+		&& let Some(help_topic) = matches.get_one::<String>("help").cloned()
+	{
+		let command = matches.remove_subcommand().map(|(name, _)| name);
+		let mut cli_args = CliArgs::from_arg_matches(&matches)?;
+		cli_args.help = Some(command.unwrap_or(help_topic));
+		return Ok(cli_args);
+	}
+	CliArgs::try_parse_from(args)
 }
 
 /// The help topic `--help` asked for, or `None` for the general help.
@@ -528,6 +561,7 @@ mod tests {
 	use clap::error::ErrorKind;
 
 	use super::*;
+	use crate::commands::rclone_cmds::RcloneCommands;
 
 	#[test]
 	fn a_repl_line_with_an_unclosed_quote_is_a_quoting_error() {
@@ -543,6 +577,61 @@ mod tests {
 			panic!("parsed an unknown command");
 		};
 		assert_eq!(e.kind(), ErrorKind::InvalidSubcommand);
+	}
+
+	#[test]
+	fn help_after_a_command_asks_for_that_commands_help() {
+		let cli_args = parse_args(["filen", "ls", "--help"]).unwrap();
+		assert_eq!(cli_args.help.as_deref(), Some("ls"));
+		assert!(cli_args.command.is_none());
+	}
+
+	#[test]
+	fn help_after_an_incomplete_command_asks_for_that_commands_help() {
+		let cli_args = parse_args(["filen", "cat", "-h"]).unwrap();
+		assert_eq!(cli_args.help.as_deref(), Some("cat"));
+		assert!(cli_args.command.is_none());
+	}
+
+	#[test]
+	fn help_after_a_command_ignores_what_follows_it() {
+		let cli_args = parse_args(["filen", "ls", "--help", "/some/dir"]).unwrap();
+		assert_eq!(cli_args.help.as_deref(), Some("ls"));
+	}
+
+	#[test]
+	fn help_after_a_command_keeps_the_options_before_it() {
+		let cli_args = parse_args(["filen", "-v", "cat", "--help"]).unwrap();
+		assert_eq!(cli_args.verbose, 1);
+	}
+
+	#[test]
+	fn help_before_a_topic_asks_for_that_topic() {
+		let cli_args = parse_args(["filen", "--help", "ls"]).unwrap();
+		assert_eq!(cli_args.help.as_deref(), Some("ls"));
+		assert!(cli_args.command.is_none());
+	}
+
+	#[test]
+	fn help_alone_asks_for_the_general_help() {
+		let cli_args = parse_args(["filen", "--help"]).unwrap();
+		assert_eq!(cli_args.help.as_deref(), Some(""));
+	}
+
+	#[test]
+	fn help_inside_an_rclone_command_goes_to_rclone() {
+		let cli_args = parse_args(["filen", "rclone", "ls", "--help"]).unwrap();
+		assert!(cli_args.help.is_none());
+		let Some(Commands::Rclone(RcloneCommands::Rclone { cmd })) = cli_args.command else {
+			panic!("parsed {:?}", cli_args.command);
+		};
+		assert_eq!(cmd, ["ls", "--help"]);
+	}
+
+	#[test]
+	fn help_before_an_rclone_command_is_the_clis() {
+		let cli_args = parse_args(["filen", "rclone", "--help"]).unwrap();
+		assert_eq!(cli_args.help.as_deref(), Some("rclone"));
 	}
 
 	#[test]

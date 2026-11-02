@@ -124,3 +124,15 @@ fn cd_outside_the_repl_is_a_usage_error() {
 	assert!(stderr.contains("`cd` only works in the REPL"), "{stderr}");
 	assert!(stderr.contains("--working-path"), "{stderr}");
 }
+
+#[test]
+fn help_after_a_command_prints_that_commands_help() {
+	for help_flag in ["--help", "-h"] {
+		let output = run(&["cat", help_flag]);
+
+		let stderr = String::from_utf8(output.stderr).unwrap();
+		assert_eq!(output.status.code(), Some(0), "{stderr}");
+		let stdout = String::from_utf8(output.stdout).unwrap();
+		assert!(stdout.contains("Print the contents of a file"), "{stdout}");
+	}
+}
