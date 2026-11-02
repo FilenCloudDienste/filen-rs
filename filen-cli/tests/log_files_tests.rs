@@ -94,3 +94,26 @@ fn processes_moving_the_same_full_log_files_aside_at_once_all_succeed_and_keep_t
 		);
 	}
 }
+
+#[test]
+fn printed_output_is_not_written_to_the_log_file() {
+	let config_dir = TempDir::new().unwrap();
+	let output = Command::new(assert_cmd::cargo::cargo_bin!())
+		.arg("--config-dir")
+		.arg(config_dir.path())
+		.args(["--skip-update", "--help"])
+		.output()
+		.unwrap();
+	assert!(output.status.success(), "{}", output.status);
+
+	let printed = String::from_utf8(output.stdout).unwrap();
+	let log = fs::read_to_string(config_dir.path().join("logs").join("latest.log")).unwrap();
+	assert!(log.contains("Logging level: OFF"), "{log}");
+	let logged_lines = printed
+		.lines()
+		.map(str::trim)
+		.filter(|line| !line.is_empty() && log.contains(line))
+		.collect::<Vec<_>>();
+	assert!(printed.lines().count() > 10, "{printed}");
+	assert_eq!(logged_lines, Vec::<&str>::new());
+}

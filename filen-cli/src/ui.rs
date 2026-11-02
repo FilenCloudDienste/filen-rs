@@ -55,12 +55,10 @@ impl log::Log for CustomLogger {
 		} else {
 			msg
 		};
-		if !msg.starts_with("[PRINT]") {
-			println!(
-				"{} {} {} {}",
-				formatted_timestamp, formatted_level, formatted_target, msg
-			);
-		}
+		println!(
+			"{} {} {} {}",
+			formatted_timestamp, formatted_level, formatted_target, msg
+		);
 	}
 
 	fn flush(&self) {}
@@ -161,16 +159,14 @@ impl UI {
 		}
 	}
 
+	/// Prints a line. It is not logged: printed output includes API keys, serve credentials and
+	/// decrypted file contents, which must not reach the log files.
 	pub(crate) fn print(&mut self, msg: &str) {
 		let msg = self.redact_for_replay_testing(msg.to_string());
 		// A failed write panics, with the message `println!` panics with.
 		if let Err(e) = writeln!(self.out, "{}", msg) {
 			panic!("failed printing to stdout: {e}");
 		}
-		info!("[PRINT] {}", msg);
-	}
-	pub(crate) fn print_hidden(&self, msg: &str) {
-		info!("[PRINT] {}", msg);
 	}
 
 	// print with formatting
@@ -189,8 +185,6 @@ impl UI {
 	pub(crate) fn print_success(&mut self, msg: &str) {
 		if !self.quiet {
 			self.print(&format!("{} {}", style("✔").green(), msg));
-		} else {
-			self.print_hidden(&format!("{} {}", style("✔").green(), msg));
 		}
 	}
 
@@ -326,7 +320,7 @@ impl UI {
 			.prompt_skippable()
 		{
 			Ok(Some(answer)) => {
-				info!("[PROMPT] answer: {}", answer);
+				log_repl_line(&answer);
 				if self.history.first().map(|s| s != &answer).unwrap_or(true) {
 					// avoid duplicate entries in history
 					self.history.insert(0, answer.clone());
@@ -368,7 +362,7 @@ impl UI {
 	/// Returns None if the user cancels the prompt (Ctrl+C or Esc)
 	pub(crate) fn prompt(&mut self, msg: &str) -> Result<String> {
 		info!("[PROMPT] prompt with message: {}", msg);
-		match Self::handle_prompt_result(inquire::Text::new(msg.trim()).prompt(), true) {
+		match Self::handle_prompt_result(inquire::Text::new(msg.trim()).prompt()) {
 			Ok(Some(answer)) => Ok(answer),
 			Ok(None) => Err(UI::failure("Canceled")),
 			Err(e) => Err(e)?,
@@ -384,7 +378,6 @@ impl UI {
 				.with_display_mode(inquire::PasswordDisplayMode::Masked)
 				.without_confirmation()
 				.prompt(),
-			false,
 		) {
 			Ok(Some(answer)) => Ok(answer),
 			Ok(None) => Err(UI::failure("Canceled")),
@@ -392,17 +385,12 @@ impl UI {
 		}
 	}
 
-	fn handle_prompt_result(
-		result: Result<String, InquireError>,
-		log_answer: bool,
-	) -> Result<Option<String>> {
+	/// Text answers are never logged: a prompt may ask for a two-factor code or a password, even
+	/// one whose input is shown.
+	fn handle_prompt_result(result: Result<String, InquireError>) -> Result<Option<String>> {
 		match result {
 			Ok(answer) => {
-				if log_answer {
-					info!("[PROMPT] answer: {}", answer);
-				} else {
-					info!("[PROMPT] answer not displayed in logs");
-				}
+				info!("[PROMPT] answer not displayed in logs");
 				Ok(Some(answer))
 			}
 			Err(InquireError::OperationCanceled) | Err(InquireError::OperationInterrupted) => {
@@ -550,6 +538,13 @@ impl UI {
 	pub(crate) fn format_text_heading(text: &str) -> String {
 		style(text).bold().underlined().to_string()
 	}
+}
+
+/// Logs the command a REPL line runs, without its arguments, which can hold a password (as in
+/// `serve-webdav --password`).
+fn log_repl_line(line: &str) {
+	let command = line.split_whitespace().next().unwrap_or_default();
+	info!("[PROMPT] command: {}", command);
 }
 
 pub(crate) struct ReplPromptResult {
@@ -700,7 +695,117 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
+	use std::{env, process::Command};
+
 	use super::{test_support::Printed, *};
+
+	/// Tests that read back what was logged. `log` takes one logger per process and other tests in
+	/// this binary install theirs (test-utils' tracing subscriber), so each of these runs alone in a
+	/// process of its own, started by the test of the same name in the parent module.
+	mod alone {
+		use std::sync::Mutex;
+
+		use log::{LevelFilter, Log, Metadata, Record};
+
+		use crate::ui::{UI, log_repl_line, test_support::Printed};
+
+		static LOGGED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+		struct CapturingLogger;
+
+		impl Log for CapturingLogger {
+			fn enabled(&self, _: &Metadata) -> bool {
+				true
+			}
+
+			fn log(&self, record: &Record) {
+				LOGGED.lock().unwrap().push(record.args().to_string());
+			}
+
+			fn flush(&self) {}
+		}
+
+		fn capture_logs() {
+			log::set_logger(&CapturingLogger).unwrap();
+			log::set_max_level(LevelFilter::Trace);
+		}
+
+		fn logged() -> Vec<String> {
+			LOGGED.lock().unwrap().clone()
+		}
+
+		#[test]
+		#[ignore = "run in a process of its own by ui::tests::printed_lines_are_not_logged"]
+		fn printed_lines_are_not_logged() {
+			capture_logs();
+			let printed = Printed::default();
+			let mut ui = printed.ui();
+			ui.print("api-key-1234");
+			ui.print_success("Saved");
+			ui.initialize(true, false, None, true, false);
+			ui.print_success("Saved quietly");
+
+			// Whether the tick is colored depends on the terminal.
+			let printed = printed.lines();
+			assert!(printed.starts_with("api-key-1234\n"), "{printed:?}");
+			assert!(printed.ends_with(" Saved"), "{printed:?}");
+			assert_eq!(logged(), Vec::<String>::new());
+		}
+
+		#[test]
+		#[ignore = "run in a process of its own by ui::tests::prompt_answers_are_not_logged"]
+		fn prompt_answers_are_not_logged() {
+			capture_logs();
+			let answer = UI::handle_prompt_result(Ok("123456".to_owned())).unwrap();
+
+			assert_eq!(answer.as_deref(), Some("123456"));
+			assert_eq!(logged(), ["[PROMPT] answer not displayed in logs"]);
+		}
+
+		#[test]
+		#[ignore = "run in a process of its own by ui::tests::a_repl_line_is_logged_without_its_arguments"]
+		fn a_repl_line_is_logged_without_its_arguments() {
+			capture_logs();
+			log_repl_line("serve-webdav --user me --password hunter2");
+
+			assert_eq!(logged(), ["[PROMPT] command: serve-webdav"]);
+		}
+	}
+
+	/// Runs the ignored test `ui::tests::alone::<name>`, and only it, in a new process of this
+	/// test binary.
+	fn run_alone(name: &str) {
+		let output = Command::new(env::current_exe().unwrap())
+			.args([
+				"--exact",
+				&format!("ui::tests::alone::{name}"),
+				"--ignored",
+				"--test-threads=1",
+			])
+			.output()
+			.unwrap();
+		let stdout = String::from_utf8_lossy(&output.stdout);
+		assert!(
+			output.status.success() && stdout.contains("test result: ok. 1 passed"),
+			"{stdout}{}",
+			String::from_utf8_lossy(&output.stderr)
+		);
+	}
+
+	#[test]
+	fn printed_lines_are_not_logged() {
+		run_alone("printed_lines_are_not_logged");
+	}
+
+	#[test]
+	fn prompt_answers_are_not_logged() {
+		run_alone("prompt_answers_are_not_logged");
+	}
+
+	#[test]
+	fn a_repl_line_is_logged_without_its_arguments() {
+		run_alone("a_repl_line_is_logged_without_its_arguments");
+	}
 
 	// run using: cargo insta test --review -- --test test_ui
 
@@ -711,7 +816,6 @@ mod tests {
 		fn test(ui: &mut UI) {
 			ui.print_banner_("0.0.0-test");
 			ui.print("Should just show");
-			ui.print_hidden("Shouldn't show");
 			ui.print_success("Success!");
 			ui.print_failure("Something went wrong");
 			ui.print_muted("This is muted text");
