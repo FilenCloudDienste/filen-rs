@@ -8,7 +8,6 @@
 # ({{ $MANUEL_EMAIL }}) /{{ $MANUEL_REMOTE_CWD }} mkdir .                                     #
 # ({{ $MANUEL_EMAIL }}) /{{ $MANUEL_REMOTE_CWD }} upload asdf.txt .                           #
 # ({{ $MANUEL_EMAIL }}) /{{ $MANUEL_REMOTE_CWD }} head asdf.txt                               #
-# > File is larger than 1KB, do you want to continue? Yes                                     #
 # This is line 1 of a local file with many lines for testing.                                 #
 # This is line 2 of a local file with many lines for testing.                                 #
 # This is line 3 of a local file with many lines for testing.                                 #
@@ -20,12 +19,10 @@
 # This is line 9 of a local file with many lines for testing.                                 #
 # This is line 10 of a local file with many lines for testing.                                #
 # ({{ $MANUEL_EMAIL }}) /{{ $MANUEL_REMOTE_CWD }} head asdf.txt -n3                           #
-# > File is larger than 1KB, do you want to continue? Yes                                     #
 # This is line 1 of a local file with many lines for testing.                                 #
 # This is line 2 of a local file with many lines for testing.                                 #
 # This is line 3 of a local file with many lines for testing.                                 #
 # ({{ $MANUEL_EMAIL }}) /{{ $MANUEL_REMOTE_CWD }} tail asdf.txt                               #
-# > File is larger than 1KB, do you want to continue? Yes                                     #
 # This is line 91 of a local file with many lines for testing.                                #
 # This is line 92 of a local file with many lines for testing.                                #
 # This is line 93 of a local file with many lines for testing.                                #
@@ -37,7 +34,6 @@
 # This is line 99 of a local file with many lines for testing.                                #
 # This is line 100 of a local file with many lines for testing.                               #
 # ({{ $MANUEL_EMAIL }}) /{{ $MANUEL_REMOTE_CWD }} tail asdf.txt -n3                           #
-# > File is larger than 1KB, do you want to continue? Yes                                     #
 # This is line 98 of a local file with many lines for testing.                                #
 # This is line 99 of a local file with many lines for testing.                                #
 # This is line 100 of a local file with many lines for testing.                               #
@@ -304,13 +300,7 @@ recording_items:
 - !Output "\e[?25l\e[62D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m head asdf.txt \e[K\r\e[61C\e[?25h"
 - !Input
   - 13
-- !Output "\e[?25l\e[61D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m \e[38;5;14mhead asdf.txt\e[39m\e[K\r\n\e[?25h\e[?25h\e[?2004l\e[?2004h\e[?25l\e[38;5;10m?\e[39m File is larger than 1KB, do you want to continue? (y/N)  \r\e[58C\e[?25h"
-- !Input
-  - 121
-- !Output "\e[?25l\e[58D\e[38;5;10m?\e[39m File is larger than 1KB, do you want to continue? (y/N) y \e[K\r\e[59C\e[?25h"
-- !Input
-  - 13
-- !Output "\e[?25l\e[59D\e[38;5;10m>\e[39m File is larger than 1KB, do you want to continue? \e[38;5;14mYes\e[39m\e[K\r\n\e[?25h\e[?25h\e[?2004lThis is line 1 of a local file with many lines for testing.\r\nThis is line 2 of a local file with many lines for testing.\r\nThis is line 3 of a local file with many lines for testing.\r\nThis is line 4 of a local file with many lines for testing.\r\nThis is line 5 of a local file with many lines for testing.\r\nThis is line 6 of a local file with many lines for testing.\r\nThis is line 7 of a local file with many lines for testing.\r\nThis is line 8 of a local file with many lines for testing.\r\nThis is line 9 of a local file with many lines for testing.\r\nThis is line 10 of a local file with many lines for testing.\r\n\e[?2004h\e[?25l\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m  \r\e[48C\e[?25h"
+- !Output "\e[?25l\e[61D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m \e[38;5;14mhead asdf.txt\e[39m\e[K\r\n\e[?25h\e[?25h\e[?2004lThis is line 1 of a local file with many lines for testing.\r\nThis is line 2 of a local file with many lines for testing.\r\nThis is line 3 of a local file with many lines for testing.\r\nThis is line 4 of a local file with many lines for testing.\r\nThis is line 5 of a local file with many lines for testing.\r\nThis is line 6 of a local file with many lines for testing.\r\nThis is line 7 of a local file with many lines for testing.\r\nThis is line 8 of a local file with many lines for testing.\r\nThis is line 9 of a local file with many lines for testing.\r\nThis is line 10 of a local file with many lines for testing.\r\n\e[?2004h\e[?25l\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m  \r\e[48C\e[?25h"
 - !Input
   - 104
 - !Input
@@ -353,13 +343,7 @@ recording_items:
 - !Output "\e[?25l\e[66D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m head asdf.txt -n3 \e[K\r\e[65C\e[?25h"
 - !Input
   - 13
-- !Output "\e[?25l\e[65D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m \e[38;5;14mhead asdf.txt -n3\e[39m\e[K\r\n\e[?25h\e[?25h\e[?2004l\e[?2004h\e[?25l\e[38;5;10m?\e[39m File is larger than 1KB, do you want to continue? (y/N)  \r\e[58C\e[?25h"
-- !Input
-  - 121
-- !Output "\e[?25l\e[58D\e[38;5;10m?\e[39m File is larger than 1KB, do you want to continue? (y/N) y \e[K\r\e[59C\e[?25h"
-- !Input
-  - 13
-- !Output "\e[?25l\e[59D\e[38;5;10m>\e[39m File is larger than 1KB, do you want to continue? \e[38;5;14mYes\e[39m\e[K\r\n\e[?25h\e[?25h\e[?2004lThis is line 1 of a local file with many lines for testing.\r\nThis is line 2 of a local file with many lines for testing.\r\nThis is line 3 of a local file with many lines for testing.\r\n\e[?2004h\e[?25l\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m  \r\e[48C\e[?25h"
+- !Output "\e[?25l\e[65D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m \e[38;5;14mhead asdf.txt -n3\e[39m\e[K\r\n\e[?25h\e[?25h\e[?2004lThis is line 1 of a local file with many lines for testing.\r\nThis is line 2 of a local file with many lines for testing.\r\nThis is line 3 of a local file with many lines for testing.\r\n\e[?2004h\e[?25l\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m  \r\e[48C\e[?25h"
 - !Input
   - 116
 - !Input
@@ -394,13 +378,7 @@ recording_items:
 - !Output "\e[?25l\e[62D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m tail asdf.txt \e[K\r\e[61C\e[?25h"
 - !Input
   - 13
-- !Output "\e[?25l\e[61D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m \e[38;5;14mtail asdf.txt\e[39m\e[K\r\n\e[?25h\e[?25h\e[?2004l\e[?2004h\e[?25l\e[38;5;10m?\e[39m File is larger than 1KB, do you want to continue? (y/N)  \r\e[58C\e[?25h"
-- !Input
-  - 121
-- !Output "\e[?25l\e[58D\e[38;5;10m?\e[39m File is larger than 1KB, do you want to continue? (y/N) y \e[K\r\e[59C\e[?25h"
-- !Input
-  - 13
-- !Output "\e[?25l\e[59D\e[38;5;10m>\e[39m File is larger than 1KB, do you want to continue? \e[38;5;14mYes\e[39m\e[K\r\n\e[?25h\e[?25h\e[?2004lThis is line 91 of a local file with many lines for testing.\r\nThis is line 92 of a local file with many lines for testing.\r\nThis is line 93 of a local file with many lines for testing.\r\nThis is line 94 of a local file with many lines for testing.\r\nThis is line 95 of a local file with many lines for testing.\r\nThis is line 96 of a local file with many lines for testing.\r\nThis is line 97 of a local file with many lines for testing.\r\nThis is line 98 of a local file with many lines for testing.\r\nThis is line 99 of a local file with many lines for testing.\r\nThis is line 100 of a local file with many lines for testing.\r\n\e[?2004h\e[?25l\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m  \r\e[48C\e[?25h"
+- !Output "\e[?25l\e[61D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m \e[38;5;14mtail asdf.txt\e[39m\e[K\r\n\e[?25h\e[?25h\e[?2004lThis is line 91 of a local file with many lines for testing.\r\nThis is line 92 of a local file with many lines for testing.\r\nThis is line 93 of a local file with many lines for testing.\r\nThis is line 94 of a local file with many lines for testing.\r\nThis is line 95 of a local file with many lines for testing.\r\nThis is line 96 of a local file with many lines for testing.\r\nThis is line 97 of a local file with many lines for testing.\r\nThis is line 98 of a local file with many lines for testing.\r\nThis is line 99 of a local file with many lines for testing.\r\nThis is line 100 of a local file with many lines for testing.\r\n\e[?2004h\e[?25l\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m  \r\e[48C\e[?25h"
 - !Input
   - 116
 - !Input
@@ -443,13 +421,7 @@ recording_items:
 - !Output "\e[?25l\e[66D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m tail asdf.txt -n3 \e[K\r\e[65C\e[?25h"
 - !Input
   - 13
-- !Output "\e[?25l\e[65D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m \e[38;5;14mtail asdf.txt -n3\e[39m\e[K\r\n\e[?25h\e[?25h\e[?2004l\e[?2004h\e[?25l\e[38;5;10m?\e[39m File is larger than 1KB, do you want to continue? (y/N)  \r\e[58C\e[?25h"
-- !Input
-  - 121
-- !Output "\e[?25l\e[58D\e[38;5;10m?\e[39m File is larger than 1KB, do you want to continue? (y/N) y \e[K\r\e[59C\e[?25h"
-- !Input
-  - 13
-- !Output "\e[?25l\e[59D\e[38;5;10m>\e[39m File is larger than 1KB, do you want to continue? \e[38;5;14mYes\e[39m\e[K\r\n\e[?25h\e[?25h\e[?2004lThis is line 98 of a local file with many lines for testing.\r\nThis is line 99 of a local file with many lines for testing.\r\nThis is line 100 of a local file with many lines for testing.\r\n\e[?2004h\e[?25l\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m  \r\e[48C\e[?25h"
+- !Output "\e[?25l\e[65D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m \e[38;5;14mtail asdf.txt -n3\e[39m\e[K\r\n\e[?25h\e[?25h\e[?2004lThis is line 98 of a local file with many lines for testing.\r\nThis is line 99 of a local file with many lines for testing.\r\nThis is line 100 of a local file with many lines for testing.\r\n\e[?2004h\e[?25l\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m  \r\e[48C\e[?25h"
 - !Input
   - 101
 - !Input

@@ -395,6 +395,26 @@ pub(crate) enum PrintFileLines {
 	Tail(usize),
 }
 
+/// The largest file, in bytes, that is printed to a terminal without asking first.
+const PRINT_WITHOUT_ASKING_MAX_SIZE: u64 = 8 * 1024;
+
+/// Whether to print a file of `size` bytes: a larger one than
+/// [`PRINT_WITHOUT_ASKING_MAX_SIZE`] only after asking, and only when a person reads the output.
+/// Output piped into another program or printed as JSON was asked for as it is.
+fn confirm_printing_file(ui: &mut UI, size: u64) -> Result<bool> {
+	if size <= PRINT_WITHOUT_ASKING_MAX_SIZE || !ui.output_is_read_by_a_person() {
+		return Ok(true);
+	}
+	ui.prompt_confirm(
+		&format!(
+			"File is {} (more than {}), do you want to continue?",
+			ui::format_size(size),
+			ui::format_size(PRINT_WITHOUT_ASKING_MAX_SIZE)
+		),
+		false,
+	)
+}
+
 pub(crate) async fn print_file(
 	ui: &mut UI,
 	client: &mut LazyClient,
@@ -415,9 +435,7 @@ pub(crate) async fn print_file(
 		NonRootFileType::File(file) => file,
 		_ => return Err(UI::failure(&format!("Not a file: {}", file_str))),
 	};
-	if file.size() < 1024
-		|| ui.prompt_confirm("File is larger than 1KB, do you want to continue?", false)?
-	{
+	if confirm_printing_file(ui, file.size())? {
 		let content = client.download_file(file.as_ref()).await?;
 		let content = String::from_utf8_lossy(&content);
 		let content = match lines {
@@ -1233,4 +1251,32 @@ pub(crate) async fn empty_trash(ui: &mut UI, client: &mut LazyClient) -> Result<
 	client.empty_trash().await?;
 	ui.print_success("Emptied trash");
 	Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::ui::test_support::Printed;
+
+	#[test]
+	fn a_file_up_to_the_limit_is_printed_to_a_terminal_without_asking() {
+		let mut ui = Printed::default().terminal_ui();
+
+		assert!(confirm_printing_file(&mut ui, PRINT_WITHOUT_ASKING_MAX_SIZE).unwrap());
+	}
+
+	#[test]
+	fn a_large_file_is_printed_without_asking_when_stdout_is_not_a_terminal() {
+		let mut ui = Printed::default().ui();
+
+		assert!(confirm_printing_file(&mut ui, 1024 * 1024).unwrap());
+	}
+
+	#[test]
+	fn a_large_file_is_printed_without_asking_as_json() {
+		let mut ui = Printed::default().terminal_ui();
+		ui.json = true;
+
+		assert!(confirm_printing_file(&mut ui, 1024 * 1024).unwrap());
+	}
 }

@@ -174,6 +174,11 @@ impl UI {
 		self.quiet
 	}
 
+	/// Whether a person reads the output: stdout is a terminal and the output is not JSON.
+	pub(crate) fn output_is_read_by_a_person(&self) -> bool {
+		self.stdout_is_terminal && !self.json
+	}
+
 	/// Sets `--quiet` and `--json`, which a REPL line can turn on for its command.
 	pub(crate) fn set_quiet_and_json(&mut self, quiet: bool, json: bool) {
 		self.quiet = quiet;
@@ -782,6 +787,13 @@ pub(crate) mod test_support {
 		/// A UI that prints into this buffer, as a terminal shows stdout and stderr together.
 		pub(crate) fn ui(&self) -> UI {
 			UI::with_writers(self.clone(), self.clone())
+		}
+
+		/// [`Printed::ui`], as if stdout were a terminal.
+		pub(crate) fn terminal_ui(&self) -> UI {
+			let mut ui = self.ui();
+			ui.stdout_is_terminal = true;
+			ui
 		}
 
 		/// A UI that prints stdout into `out` and stderr into `err`.
