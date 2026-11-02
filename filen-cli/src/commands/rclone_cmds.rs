@@ -323,8 +323,8 @@ async fn start_daemon(
 	Ok((daemon, ctrl_c))
 }
 
-/// Waits for Ctrl-C, then stops the daemon, letting uploads finish for a while; fails if rclone
-/// exits first.
+/// Waits for Ctrl-C, then stops the daemon, letting uploads finish for a while unless Ctrl-C is
+/// pressed again; fails if rclone exits first.
 async fn wait_and_stop(
 	ui: &mut UI,
 	daemon: &RcloneDaemon,
@@ -347,6 +347,7 @@ async fn wait_and_stop(
 	ui.print_muted(&format!(
 		"{stopping}, letting uploads finish for up to 30 seconds..."
 	));
+	let _stopping = ctrl_c.into_stopping(ui);
 	let report = daemon.stop(STOP).await.context("Failed to stop Rclone")?;
 	if report.pending_uploads > 0 {
 		ui.print_warning(&format!(

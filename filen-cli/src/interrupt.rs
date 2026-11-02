@@ -3,7 +3,8 @@
 //! While no command runs, Ctrl-C quits the CLI, as it would without a handler. While one runs,
 //! Ctrl-C cancels it ([`catch`]), unless the command handles Ctrl-C itself ([`own`]), as a
 //! transfer, `mount`, `serve` and `sync` do to stop cleanly. A further Ctrl-C while a cancelled
-//! command has not ended yet quits the CLI.
+//! command has not ended yet, or while a command stops after Ctrl-C ([`Owning::into_stopping`]),
+//! quits the CLI.
 
 use std::{
 	process,
@@ -12,7 +13,7 @@ use std::{
 
 use tokio::sync::broadcast::{self, error::RecvError};
 
-use crate::error::CliError;
+use crate::{error::CliError, ui::UI};
 
 /// The exit code of the CLI when Ctrl-C quit it or cancelled its command, the one a shell
 /// reports for a process that SIGINT ended.
@@ -25,6 +26,7 @@ static PRESSES: LazyLock<broadcast::Sender<Press>> = LazyLock::new(|| broadcast:
 static STATE: Mutex<State> = Mutex::new(State {
 	catching: 0,
 	owning: 0,
+	stopping: 0,
 	cancelling: false,
 });
 
@@ -66,6 +68,8 @@ struct State {
 	catching: usize,
 	/// How many commands are running that handle Ctrl-C themselves.
 	owning: usize,
+	/// How many of those are stopping after a Ctrl-C, which a further Ctrl-C does not wait for.
+	stopping: usize,
 	/// Whether a Ctrl-C has cancelled a command that has not ended yet.
 	cancelling: bool,
 }
@@ -86,7 +90,7 @@ struct Press {
 
 impl State {
 	fn press(&mut self) -> Action {
-		if self.catching == 0 || self.cancelling {
+		if self.catching == 0 || self.cancelling || self.stopping > 0 {
 			return Action::Quit;
 		}
 		let owned = self.owning > 0;
@@ -179,10 +183,32 @@ impl Owning {
 	}
 }
 
+impl Owning {
+	/// Lets a further Ctrl-C quit the CLI while the command stops after one, rather than wait for
+	/// it, until the returned [`Stopping`] is dropped, and says so.
+	pub(crate) fn into_stopping(self, ui: &mut UI) -> Stopping {
+		ui.print_muted_to_stderr("Press Ctrl-C again to quit.");
+		lock_state().stopping += 1;
+		// `self` is dropped after this, so the command counts as stopping before it no longer
+		// counts as handling Ctrl-C.
+		Stopping
+	}
+}
+
 impl Drop for Owning {
 	fn drop(&mut self) {
 		let mut state = lock_state();
 		state.owning = state.owning.saturating_sub(1);
+	}
+}
+
+/// Held while a command stops after Ctrl-C: see [`Owning::into_stopping`].
+pub(crate) struct Stopping;
+
+impl Drop for Stopping {
+	fn drop(&mut self) {
+		let mut state = lock_state();
+		state.stopping = state.stopping.saturating_sub(1);
 	}
 }
 
@@ -198,6 +224,7 @@ mod tests {
 		State {
 			catching,
 			owning,
+			stopping: 0,
 			cancelling: false,
 		}
 	}
@@ -236,6 +263,14 @@ mod tests {
 		assert_eq!(state.press(), Action::Send(Press { owned: true }));
 		assert_eq!(state.press(), Action::Send(Press { owned: true }));
 		assert!(!state.cancelling);
+	}
+
+	#[test]
+	fn ctrl_c_while_a_command_stops_after_one_quits() {
+		let mut state = state(1, 1);
+		state.press();
+		state.stopping += 1;
+		assert_eq!(state.press(), Action::Quit);
 	}
 
 	#[tokio::test]

@@ -194,17 +194,11 @@ pub(crate) async fn sync(
 
 	let mut pairs_that_have_had_passes = HashSet::new();
 
-	loop {
+	let stopped_by_ctrl_c = loop {
 		select! {
-			() = ctrl_c.pressed() => {
-				ui.print_muted("Stopping...");
-				stop_handles.await;
-				ui.print_muted("Stopped.");
-				events_rx.close();
-				break;
-			},
+			() = ctrl_c.pressed() => break true,
 			event = events_rx.recv() => {
-				let Some((pair_id, event)) = event else { break };
+				let Some((pair_id, event)) = event else { break false };
 				// receive and print events
 
 				let pair = pairs.iter().find(|p| p.id == pair_id).with_context(|| {
@@ -238,7 +232,7 @@ pub(crate) async fn sync(
 				// if --once is set, stop after all have completed
 				if once && pairs_that_have_had_passes.len() == pairs.len() {
 					ui.print_success("All pairs synced.");
-					break;
+					break false;
 				}
 
 				// approve deletions
@@ -310,8 +304,17 @@ pub(crate) async fn sync(
 				}
 			}
 		}
-	}
+	};
 
+	let _stopping = stopped_by_ctrl_c.then(|| {
+		ui.print_muted_to_stderr("Stopping the sync, letting the passes in flight finish...");
+		ctrl_c.into_stopping(ui)
+	});
+	// waits for each pair's pass in flight, so it finishes and releases the drive lock
+	stop_handles.await;
+	if stopped_by_ctrl_c {
+		ui.print_muted("Stopped.");
+	}
 	Ok(())
 }
 
