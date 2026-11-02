@@ -135,8 +135,9 @@ impl Client {
 	/// directory definitively no longer exists or is in the trash (do not retry unless it is
 	/// restored);
 	/// [`SyncRootUnavailable`](crate::cache::CacheError::SyncRootUnavailable) means the check
-	/// itself failed (network — retry the same uuid). Must be called from within the app's
-	/// Tokio runtime.
+	/// itself failed (network — retry the same uuid), and the error then has the failed check's
+	/// kind ([`ErrorKind::Reqwest`] for a server that could not be reached). Must be called from
+	/// within the app's Tokio runtime.
 	///
 	/// HOSTING (wasm): the engine task is spawned on the CALLING thread's local executor and
 	/// pins that thread for the search's lifetime — call this on a long-lived host (the FFI

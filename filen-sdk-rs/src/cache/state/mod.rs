@@ -387,6 +387,12 @@ impl CacheState {
 			.collect();
 	}
 
+	/// Validate the roots added from here on against `client`, as a worker does, where a unit
+	/// construction validates nothing.
+	pub(crate) fn set_test_resync_client(&mut self, client: Arc<Client>) {
+		self.resync = Some(ResyncDeps { client });
+	}
+
 	pub(crate) fn set_test_file_roots(&mut self, map: HashMap<StableUuid, SyncRootCallback>) {
 		self.file_roots = map
 			.into_iter()
@@ -2047,7 +2053,7 @@ impl CacheState {
 					tracing::warn!(
 						"AddSyncRoot {uuid}: validation failed transiently ({e}); rejecting"
 					);
-					let error = CacheError::sync_root_unavailable(uuid, e.to_string());
+					let error = CacheError::sync_root_unavailable(uuid, e);
 					let _ = ack.send(Err(Box::new(error)));
 					return false;
 				}

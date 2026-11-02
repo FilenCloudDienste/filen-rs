@@ -1,4 +1,5 @@
 use crate::{
+	ErrorKind,
 	error::FilenSdkError,
 	io::{RemoteDirectory, RemoteFile},
 };
@@ -45,11 +46,13 @@ pub enum CacheError {
 		message: String,
 	},
 	/// An `AddSyncRoot` uuid could not be validated because the check itself failed
-	/// (network/server trouble, NOT a not-found), so the root was NOT added. `message` is the
-	/// underlying SDK error. Retry the same uuid once connectivity recovers.
+	/// (network/server trouble, NOT a not-found), so the root was NOT added. `error` is the
+	/// underlying SDK error, also this error's `source()`; the registration error that carries
+	/// this one takes its kind ([`ErrorKind::Reqwest`] for a server that could not be reached).
+	/// Retry the same uuid once connectivity recovers.
 	SyncRootUnavailable {
 		uuid: uuid::Uuid,
-		message: String,
+		error: FilenSdkError,
 	},
 }
 
@@ -78,8 +81,24 @@ impl CacheError {
 		Self::InvalidSyncRoot { uuid, message }
 	}
 
-	pub(crate) fn sync_root_unavailable(uuid: uuid::Uuid, message: String) -> Self {
-		Self::SyncRootUnavailable { uuid, message }
+	pub(crate) fn sync_root_unavailable(uuid: uuid::Uuid, error: FilenSdkError) -> Self {
+		Self::SyncRootUnavailable { uuid, error }
+	}
+
+	/// The kind of the [`FilenSdkError`] that rejecting a sync-root registration with this error
+	/// carries: the underlying error's own kind when the check could not be made, so a server
+	/// that could not be reached reads as [`ErrorKind::Reqwest`] like any other request, and
+	/// [`ErrorKind::InvalidState`] for every other refusal.
+	pub(crate) fn registration_kind(&self) -> ErrorKind {
+		match self {
+			Self::SyncRootUnavailable { error, .. } => error.kind(),
+			Self::FileCacheableConversion(_)
+			| Self::DirCacheableConversion(_)
+			| Self::DB(_)
+			| Self::Serialization(_)
+			| Self::SyncRootCallbackPanic(_)
+			| Self::InvalidSyncRoot { .. } => ErrorKind::InvalidState,
+		}
 	}
 }
 
@@ -106,8 +125,8 @@ impl std::fmt::Display for CacheError {
 			Self::InvalidSyncRoot { uuid, message } => {
 				write!(f, "invalid sync root {uuid}: {message}")
 			}
-			Self::SyncRootUnavailable { uuid, message } => {
-				write!(f, "sync root {uuid} could not be validated: {message}")
+			Self::SyncRootUnavailable { uuid, error } => {
+				write!(f, "sync root {uuid} could not be validated: {error}")
 			}
 		}
 	}
@@ -119,10 +138,10 @@ impl std::error::Error for CacheError {
 			Self::DB(db) => Some(&db.error),
 			Self::FileCacheableConversion(e) => Some(&e.error),
 			Self::DirCacheableConversion(e) => Some(&e.error),
+			Self::SyncRootUnavailable { error, .. } => Some(error),
 			Self::Serialization(_)
 			| Self::SyncRootCallbackPanic(_)
-			| Self::InvalidSyncRoot { .. }
-			| Self::SyncRootUnavailable { .. } => None,
+			| Self::InvalidSyncRoot { .. } => None,
 		}
 	}
 }
@@ -153,6 +172,35 @@ mod tests {
 		assert!(
 			std::error::Error::source(&ser).is_none(),
 			"Serialization has no underlying source"
+		);
+	}
+
+	/// A registration refused because the check could not be made takes the kind of the check's
+	/// own error; a root that is gone, and every other refusal, stays `InvalidState`.
+	#[test]
+	fn a_refused_registration_takes_the_kind_of_its_failed_check_alone() {
+		let uuid = uuid::Uuid::from_u128(5);
+		let unavailable = CacheError::sync_root_unavailable(
+			uuid,
+			FilenSdkError::custom(ErrorKind::Reqwest, "error sending request"),
+		);
+		assert_eq!(unavailable.registration_kind(), ErrorKind::Reqwest);
+		assert_eq!(
+			unavailable.to_string(),
+			format!(
+				"sync root {uuid} could not be validated: Error of kind Reqwest: context: error sending request"
+			)
+		);
+		assert!(
+			std::error::Error::source(&unavailable).is_some(),
+			"the failed check is the source"
+		);
+
+		let gone = CacheError::invalid_sync_root(uuid, "the directory is in the trash".to_owned());
+		assert_eq!(gone.registration_kind(), ErrorKind::InvalidState);
+		assert_eq!(
+			CacheError::serialization("boom").registration_kind(),
+			ErrorKind::InvalidState
 		);
 	}
 }

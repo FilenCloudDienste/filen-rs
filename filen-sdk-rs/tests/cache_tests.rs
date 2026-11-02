@@ -10,6 +10,7 @@ use filen_sdk_rs::cache::{
 	CacheError, CacheEvent, CacheMessage, ResyncProgress, SyncRootCallback, SyncRootHandle,
 };
 use filen_sdk_rs::{
+	ErrorKind,
 	auth::Client,
 	fs::{HasParent, HasUUID, dir::meta::DirectoryMetaChanges, file::meta::FileMetaChanges},
 	io::{RemoteDirectory, RemoteFile},
@@ -946,6 +947,11 @@ async fn test_cache_re_add_of_permanently_deleted_sync_root_is_rejected() {
 		),
 		"the rejection should carry CacheError::InvalidSyncRoot for the gone root, got {err:?}"
 	);
+	assert_eq!(
+		err.kind(),
+		ErrorKind::InvalidState,
+		"a root that is gone is refused, not unreachable: {err}"
+	);
 
 	// The definitive not-found also wiped the stale subtree session 1 cached under the root —
 	// without it those rows would be stranded forever (membership-gated out of live events,
@@ -1025,6 +1031,11 @@ async fn test_cache_re_add_of_trashed_sync_root_is_rejected() {
 			Some(CacheError::InvalidSyncRoot { uuid, .. }) if *uuid == trashed.uuid()
 		),
 		"the rejection should carry CacheError::InvalidSyncRoot for the trashed root, got {err:?}"
+	);
+	assert_eq!(
+		err.kind(),
+		ErrorKind::InvalidState,
+		"a root that is gone is refused, not unreachable: {err}"
 	);
 	assert!(
 		poll_for_item_absent(&path, trashed.uuid(), Duration::from_secs(30)).await,

@@ -337,7 +337,9 @@ impl Client {
 	/// the trash (any stale subtree a prior session cached under it has been wiped — do not retry
 	/// unless it is restored);
 	/// [`CacheError::SyncRootUnavailable`] means the validation itself failed (network/server —
-	/// retry the same uuid). Must be called from within the app's Tokio runtime.
+	/// retry the same uuid), and the returned error then has the kind of the failed check
+	/// ([`ErrorKind::Reqwest`] for a server that could not be reached); every other rejection is
+	/// [`ErrorKind::InvalidState`]. Must be called from within the app's Tokio runtime.
 	///
 	/// Do NOT move the returned handle (or anything that owns it) into a [`SyncRootCallback`]: the
 	/// worker owns the callbacks, so a captured handle keeps the worker's control channel open from
@@ -420,7 +422,7 @@ impl Client {
 					// removal would only be a logged no-op on the worker).
 					handle.disarmed = true;
 					Err(Error::custom_with_source(
-						ErrorKind::InvalidState,
+						e.registration_kind(),
 						*e,
 						Some(format!("registering sync root {key:?}")),
 					))

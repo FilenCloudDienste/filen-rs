@@ -9,10 +9,10 @@ use rand::{Rng, SeedableRng, rngs::StdRng};
 use super::*;
 use crate::{
 	alloc_meter,
-	auth::test_support::offline_client,
+	auth::{test_support::offline_client, unauth},
 	cache::{
-		CacheSlot, CacheState, open_sqlite, open_sqlite_in_memory, open_sqlite_with_flags,
-		test_support::rewrite_behind_sqlite,
+		CacheError, CacheSlot, CacheState, open_sqlite, open_sqlite_in_memory,
+		open_sqlite_with_flags, test_support::rewrite_behind_sqlite,
 	},
 	sync::lock::MAX_SLEEP_TIME_DEFAULT,
 	sync_engine::{
@@ -10032,6 +10032,68 @@ async fn a_refused_subscription_is_asked_for_again() {
 		engine.pair_changes(pair).await.degraded(),
 		Some(FullPassReason::RemoteEventsDegraded),
 		"a pass reads the remote whole while nothing announces it"
+	);
+}
+
+/// An engine opened while the server cannot be reached: a cache whose check of the pair's root
+/// gets no answer, over a local root that exists.
+async fn engine_that_cannot_reach_the_server(dir: &Path) -> (SyncEngine, PairId, Uuid) {
+	let local = dir.join("local");
+	std::fs::create_dir(&local).unwrap();
+	let client = Arc::new(unauth::test_support::offline_client());
+	// A cache a previous session left, which has never listed the root.
+	let cache = dir.join("cache.db");
+	drop(CacheState::new_on_path(&cache, client.root().uuid()));
+	client.configure_cache(cache, |_| {}).await.unwrap();
+	let engine = SyncEngine::open(client, dir.join("sync.db")).await.unwrap();
+	let remote_root = Uuid::from_u128(2);
+	let (pair, _) = locked(&engine.control)
+		.create_pair(local.to_str().unwrap(), remote_root, SyncMode::TwoWay)
+		.unwrap();
+	(engine, pair, remote_root)
+}
+
+/// The cache refusing a subscription because it could not reach the server to check the root is
+/// the server being out of reach, not a refused root: the error reads as `Reqwest`, which a host
+/// shows as offline, and is still the cache's refusal underneath.
+#[tokio::test]
+async fn a_subscription_the_server_could_not_be_reached_for_fails_as_offline() {
+	let dir = tempfile::tempdir().unwrap();
+	let (engine, pair, remote_root) = engine_that_cannot_reach_the_server(dir.path()).await;
+
+	let refused = engine
+		.resubscribe(pair)
+		.await
+		.expect_err("the cache cannot check the root");
+	assert_eq!(refused.kind(), ErrorKind::Reqwest, "{refused}");
+	assert!(
+		matches!(
+			refused.downcast_ref::<CacheError>(),
+			Some(CacheError::SyncRootUnavailable { uuid, .. }) if *uuid == remote_root
+		),
+		"{refused}"
+	);
+	assert!(!engine.roots.lock().await.contains_key(&pair));
+}
+
+/// A pass of a pair the engine opened offline fails as offline: its wait for the remote view asks
+/// the cache for the subscription it never got, and that refusal is the pass's error.
+#[tokio::test]
+async fn a_pass_opened_offline_fails_as_offline() {
+	let dir = tempfile::tempdir().unwrap();
+	let (engine, pair, remote_root) = engine_that_cannot_reach_the_server(dir.path()).await;
+
+	let failed = engine
+		.sync_once(pair)
+		.await
+		.expect_err("nothing can reach the server");
+	assert_eq!(failed.kind(), ErrorKind::Reqwest, "{failed}");
+	assert!(
+		matches!(
+			failed.downcast_ref::<CacheError>(),
+			Some(CacheError::SyncRootUnavailable { uuid, .. }) if *uuid == remote_root
+		),
+		"the pass fails on its subscription: {failed}"
 	);
 }
 

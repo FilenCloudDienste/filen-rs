@@ -1,4 +1,5 @@
 use super::*;
+use crate::auth::unauth::test_support::offline_client;
 use crate::cache::sql::columns::{
 	COUNT, FILES_SIZE, ITEM_EXISTS, ITEMS_CONTENT_HASH, ITEMS_ID, PRAGMA_CACHE_SIZE,
 	PRAGMA_MMAP_SIZE, PRAGMA_SYNCHRONOUS, PRAGMA_TEMP_STORE,
@@ -2481,6 +2482,47 @@ fn add_registration_for_new_root_acks_and_requests_resync() {
 	assert!(needs_resync, "a newly-active root must be converged");
 	assert!(matches!(ack_rx.try_recv(), Ok(Ok(()))), "acked Ok");
 	assert!(state.sync_roots.contains_key(&b.uuid));
+}
+
+/// A root whose check could not reach the server is rejected as unavailable and carries the
+/// transport's error itself, its source: the registration error handed to the caller then reads
+/// as `Reqwest`, the kind every other request that could not reach the server has, not as a
+/// refused root.
+#[tokio::test(start_paused = true)]
+async fn a_root_whose_check_cannot_reach_the_server_is_unavailable_with_the_transport_error() {
+	let mut state = CacheState::new_in_memory();
+	state.set_test_sync_roots(HashMap::new());
+	state.set_test_resync_client(Arc::new(offline_client()));
+	let uuid = Uuid::from_u128(5);
+
+	let (ack, mut ack_rx) = tokio::sync::oneshot::channel();
+	let needs_resync = state
+		.handle_add_sync_root(uuid, 1, Box::new(|_| {}), ack)
+		.await;
+
+	assert!(!needs_resync, "a rejected root needs no resync");
+	assert!(!state.sync_roots.contains_key(&uuid), "never registered");
+	let Ok(Err(refused)) = ack_rx.try_recv() else {
+		panic!("the add must be rejected");
+	};
+	let CacheError::SyncRootUnavailable {
+		uuid: refused_uuid,
+		error,
+	} = &*refused
+	else {
+		panic!("the check could not be made, so the root is unavailable: {refused}");
+	};
+	assert_eq!(*refused_uuid, uuid);
+	assert_eq!(error.kind(), ErrorKind::Reqwest, "{error}");
+	assert_eq!(refused.registration_kind(), ErrorKind::Reqwest);
+	assert_eq!(
+		refused.to_string(),
+		format!("sync root {uuid} could not be validated: {error}")
+	);
+	let source = std::error::Error::source(&*refused)
+		.and_then(|source| source.downcast_ref::<crate::Error>())
+		.expect("the transport's error is the source");
+	assert_eq!(source.kind(), ErrorKind::Reqwest);
 }
 
 /// removing ONE of two registrations keeps the root active and SKIPS the requested
