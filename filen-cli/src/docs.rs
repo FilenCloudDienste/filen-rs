@@ -413,7 +413,10 @@ pub(crate) fn print_in_app_docs(
 		// command help
 		ui.print(&UI::format_command_help(&mut command.clone()));
 	} else {
-		ui.print_failure(&format!("No help found for '{}'", command_or_topic));
+		return Err(UI::failure(&format!(
+			"No help found for '{}'",
+			command_or_topic
+		)));
 	}
 
 	Ok(())

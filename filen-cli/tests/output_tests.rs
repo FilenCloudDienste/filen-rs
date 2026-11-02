@@ -51,3 +51,16 @@ fn a_closed_stdout_ends_the_cli_cleanly() {
 	assert_eq!(output.status.code(), Some(0), "{stderr}");
 	assert_eq!(stderr, "");
 }
+
+#[test]
+fn help_for_an_unknown_topic_fails() {
+	let output = run(&["--help", "nonexistent"]);
+
+	assert_eq!(output.status.code(), Some(1));
+	assert_eq!(String::from_utf8(output.stdout).unwrap(), "");
+	let stderr = String::from_utf8(output.stderr).unwrap();
+	assert!(
+		stderr.contains("No help found for 'nonexistent'"),
+		"{stderr}"
+	);
+}
