@@ -44,7 +44,7 @@ fn test_updater() {
 		.args(["-vv", "--config-dir", dir.path().to_str().unwrap(), "exit"])
 		.assert()
 		.success()
-		.stdout(predicates::str::contains(
+		.stderr(predicates::str::contains(
 			"Wrote last update check timestamp",
 		));
 
@@ -53,7 +53,7 @@ fn test_updater() {
 		.args(["-vv", "--config-dir", dir.path().to_str().unwrap(), "exit"])
 		.assert()
 		.success()
-		.stdout(predicates::str::contains(
+		.stderr(predicates::str::contains(
 			"Skipping update check; last check",
 		));
 

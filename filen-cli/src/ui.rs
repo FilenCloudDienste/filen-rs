@@ -58,9 +58,15 @@ impl log::Log for CustomLogger {
 		} else {
 			msg
 		};
-		println!(
+		// Log lines go to stderr, apart from the output that can be piped into another program.
+		// With nowhere left to report a failed write, it is dropped.
+		let _ = writeln!(
+			io::stderr().lock(),
 			"{} {} {} {}",
-			formatted_timestamp, formatted_level, formatted_target, msg
+			formatted_timestamp,
+			formatted_level,
+			formatted_target,
+			msg
 		);
 	}
 
@@ -75,6 +81,8 @@ pub(crate) struct UI {
 	override_terminal_width: Option<usize>,
 	/// Where printed lines go: stdout, except in the tests.
 	out: Box<dyn Write + Send + Sync>,
+	/// Where failures and warnings go: stderr, except in the tests.
+	err: Box<dyn Write + Send + Sync>,
 	/// Whether to output machine-readable JSON where applicable
 	pub(crate) json: bool,
 	disable_suggestions: bool,
@@ -84,15 +92,19 @@ pub(crate) struct UI {
 
 impl UI {
 	pub(crate) fn new() -> Self {
-		Self::with_writer(io::stdout())
+		Self::with_writers(io::stdout(), io::stderr())
 	}
 
-	fn with_writer(out: impl Write + Send + Sync + 'static) -> Self {
+	fn with_writers(
+		out: impl Write + Send + Sync + 'static,
+		err: impl Write + Send + Sync + 'static,
+	) -> Self {
 		UI {
 			quiet: false,
 			history: Vec::new(),
 			override_terminal_width: None,
 			out: Box::new(out),
+			err: Box::new(err),
 			json: false,
 			disable_suggestions: false,
 			make_output_environment_agnostic_for_replay_testing: false,
@@ -170,6 +182,14 @@ impl UI {
 		}
 	}
 
+	/// Prints a line to stderr, which is for failures, warnings and notices, so that they stay out
+	/// of output piped into another program. It is not logged, like [`UI::print`].
+	fn print_to_stderr(&mut self, msg: &str) {
+		let msg = self.redact_for_replay_testing(msg.to_string());
+		// With nowhere left to report a failed write, it is dropped.
+		let _ = writeln!(self.err, "{}", msg);
+	}
+
 	// print with formatting
 
 	/// Print an announcement message (used for important info from updates)
@@ -191,12 +211,12 @@ impl UI {
 
 	/// Print a message with a warning icon
 	pub(crate) fn print_warning(&mut self, msg: &str) {
-		self.print(&format!("{} {}", style("⚠").yellow(), style(msg).yellow()));
+		self.print_to_stderr(&format!("{} {}", style("⚠").yellow(), style(msg).yellow()));
 	}
 
 	/// Print a message with a failure icon
 	pub(crate) fn print_failure(&mut self, msg: &str) {
-		self.print(&format!("{} {}", style("✘").red(), msg));
+		self.print_to_stderr(&format!("{} {}", style("✘").red(), msg));
 	}
 
 	/// Return an error with a user-friendly error message
@@ -681,9 +701,14 @@ pub(crate) mod test_support {
 	}
 
 	impl Printed {
-		/// A UI that prints into this buffer.
+		/// A UI that prints into this buffer, as a terminal shows stdout and stderr together.
 		pub(crate) fn ui(&self) -> UI {
-			UI::with_writer(self.clone())
+			UI::with_writers(self.clone(), self.clone())
+		}
+
+		/// A UI that prints stdout into `out` and stderr into `err`.
+		pub(crate) fn split_ui(out: &Printed, err: &Printed) -> UI {
+			UI::with_writers(out.clone(), err.clone())
 		}
 
 		/// The printed lines joined by `\n`, without the one ending the last line.
@@ -847,6 +872,25 @@ mod tests {
 		// no color
 		console::set_colors_enabled(false);
 		insta::assert_snapshot!(printed(100));
+	}
+
+	#[test]
+	fn failures_and_warnings_go_to_stderr() {
+		let out = Printed::default();
+		let err = Printed::default();
+		let mut ui = Printed::split_ui(&out, &err);
+
+		ui.print("result");
+		ui.print_warning("careful");
+		ui.print_failure("No such file: /a");
+		ui.print_failure_or_error(&UI::failure("Canceled"));
+
+		assert_eq!(out.lines(), "result");
+		// Whether the icons are colored depends on the terminal.
+		assert_eq!(
+			console::strip_ansi_codes(&err.lines()),
+			"⚠ careful\n✘ No such file: /a\n✘ Canceled"
+		);
 	}
 
 	#[test]

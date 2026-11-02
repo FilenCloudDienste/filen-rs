@@ -35,7 +35,7 @@ fn authenticate_from_cli_args() {
 		// (use stat command to verify successful authentication)
 		.assert()
 		.success()
-		.stdout(predicates::str::contains(
+		.stderr(predicates::str::contains(
 			"Authenticated from CLI arguments",
 		));
 }
@@ -69,7 +69,7 @@ async fn export_and_authenticate_from_auth_config() {
 		])
 		.assert()
 		.success()
-		.stdout(predicates::str::contains(
+		.stderr(predicates::str::contains(
 			"Authenticated from auth config file",
 		));
 }
