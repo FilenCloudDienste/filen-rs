@@ -10,7 +10,7 @@ use filen_sdk_rs::{
 		HasUUID as _,
 		categories::{NonRootFileType, NonRootItemType},
 	},
-	sync_engine::{DeleteGuard, PairRecord, SyncEngine, SyncMode},
+	sync_engine::{DeleteGuard, PairId, PairRecord, SyncEngine, SyncMode},
 };
 use serde::Deserialize;
 
@@ -19,12 +19,15 @@ use crate::{ui::UI, util::RemotePath};
 /// Adds a sync pair to `engine` for each of `pair_definitions`, which are either `<local>:<remote>` (two-way),
 /// `<local>:<mode>:<remote>`, or the path to a syncPairs.yaml file. Relative remote paths are resolved
 /// against `working_path`, relative local paths in a file against the file's directory.
+///
+/// Returns the ids of the pairs registered, each once, in the order they were given.
 pub(crate) async fn register_sync_pairs(
 	engine: &SyncEngine,
 	client: &Client,
 	working_path: &RemotePath,
 	pair_definitions: &Vec<String>,
-) -> Result<()> {
+) -> Result<Vec<PairId>> {
+	let mut pair_ids = Vec::new();
 	for pair in pair_definitions {
 		let path = Path::new(pair);
 		let pair_definitions = if path.is_file() {
@@ -77,9 +80,31 @@ pub(crate) async fn register_sync_pairs(
 						local.display()
 					)
 				})?;
+			// the same pair given twice is registered (and watched) once
+			if !pair_ids.contains(&pair) {
+				pair_ids.push(pair);
+			}
 		}
 	}
-	Ok(())
+	Ok(pair_ids)
+}
+
+/// The records of the pairs `pair_ids` names, in that order, out of every pair `registered`
+/// holds, which includes the pairs earlier runs registered.
+pub(crate) fn records_of(
+	mut registered: Vec<PairRecord>,
+	pair_ids: &[PairId],
+) -> Result<Vec<PairRecord>> {
+	pair_ids
+		.iter()
+		.map(|id| {
+			let index = registered
+				.iter()
+				.position(|pair| pair.id == *id)
+				.with_context(|| format!("Sync pair {id} is not registered"))?;
+			Ok(registered.swap_remove(index))
+		})
+		.collect()
 }
 
 /// Parses `<local>:<remote>` or `<local>:<mode>:<remote>`.
@@ -175,4 +200,44 @@ pub(crate) async fn format_sync_pair(client: &Client, pair: &PairRecord) -> Resu
 		// a directory's path ends with `/`
 		remote_path.trim_end_matches('/')
 	))
+}
+
+#[cfg(test)]
+mod tests {
+	use filen_sdk_rs::sync_engine::{DeleteGuard, PairRecord, SyncMode};
+
+	use super::records_of;
+
+	fn record(id: i64) -> PairRecord {
+		PairRecord {
+			id,
+			local_root: format!("/local/{id}"),
+			remote_root: Default::default(),
+			mode: SyncMode::TwoWay,
+			delete_guard: DeleteGuard::default(),
+			paused: false,
+			first_pass_completed: true,
+		}
+	}
+
+	/// The database keeps every pair any run registered; a run watches only the pairs it was given.
+	#[test]
+	fn a_run_takes_only_the_pairs_it_registered() {
+		let registered = vec![record(1), record(2), record(3), record(4)];
+
+		let ids = records_of(registered, &[4, 2])
+			.unwrap()
+			.into_iter()
+			.map(|pair| pair.id)
+			.collect::<Vec<_>>();
+
+		assert_eq!(ids, [4, 2]);
+	}
+
+	#[test]
+	fn a_pair_missing_from_the_database_is_an_error() {
+		let error = records_of(vec![record(1)], &[1, 2]).unwrap_err();
+
+		assert_eq!(error.to_string(), "Sync pair 2 is not registered");
+	}
 }

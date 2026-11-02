@@ -59,14 +59,18 @@ pub(crate) async fn sync(
 	} else {
 		pair_definitions
 	};
-	sync_pairs::register_sync_pairs(&engine, &client, working_path, pair_definitions)
+	let pair_ids = sync_pairs::register_sync_pairs(&engine, &client, working_path, pair_definitions)
 		.await
 		.context("Failed to add sync pairs")?;
 
-	let pairs = engine
-		.list_pairs()
-		.await
-		.context("Failed to list sync pairs")?;
+	// only this run's pairs: the database also holds every pair earlier runs registered
+	let pairs = sync_pairs::records_of(
+		engine
+			.list_pairs()
+			.await
+			.context("Failed to list sync pairs")?,
+		&pair_ids,
+	)?;
 
 	let (events_tx, mut events_rx) = mpsc::unbounded_channel();
 
