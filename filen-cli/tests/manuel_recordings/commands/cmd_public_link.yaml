@@ -55,7 +55,7 @@
 # ({{ $MANUEL_EMAIL }}) /{{ $MANUEL_REMOTE_CWD }} public-link asdf.txt                #
 #       File asdf.txt                                                                 #
 # Expiration 1 hour                                                                   #
-#   Password No                                                                       #
+#   Password Yes                                                                      #
 #                                                                                     #
 # > This is an existing public link. Edit                                             #
 # > Expires after: 1 hour                                                             #
@@ -64,7 +64,7 @@
 # ({{ $MANUEL_EMAIL }}) /{{ $MANUEL_REMOTE_CWD }} public-link asdf.txt                #
 #       File asdf.txt                                                                 #
 # Expiration 1 hour                                                                   #
-#   Password No                                                                       #
+#   Password Yes                                                                      #
 #                                                                                     #
 # > This is an existing public link. Delete                                           #
 # ✔ Public link deleted.                                                              #
@@ -582,7 +582,7 @@ recording_items:
 - !Output "\e[?25l\e[48D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m public-link asdf.txt \e[K\r\e[68C\e[?25h"
 - !Input
   - 13
-- !Output "\e[?25l\e[68D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m \e[38;5;14mpublic-link asdf.txt\e[39m\e[K\r\n\e[?25h\e[?25h\e[?2004l\e[2m      File\e[0m asdf.txt\r\n\e[2mExpiration\e[0m 1 hour\r\n\e[2m  Password\e[0m No\r\n\r\n\e[?2004h\e[?25l\e[38;5;10m?\e[39m This is an existing public link.  \r\n\e[38;5;14m>\e[39m \e[38;5;14mCancel\e[39m\r\n\e[38;5;14m \e[39m Edit\r\n\e[38;5;14m \e[39m Delete\r\n\e[38;5;14m[\e[39m\e[38;5;14m↑↓ to move, enter to select, type to filter\e[39m\e[38;5;14m]\e[39m\r\e[4A\e[35C\e[?25h"
+- !Output "\e[?25l\e[68D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m \e[38;5;14mpublic-link asdf.txt\e[39m\e[K\r\n\e[?25h\e[?25h\e[?2004l\e[2m      File\e[0m asdf.txt\r\n\e[2mExpiration\e[0m 1 hour\r\n\e[2m  Password\e[0m Yes\r\n\r\n\e[?2004h\e[?25l\e[38;5;10m?\e[39m This is an existing public link.  \r\n\e[38;5;14m>\e[39m \e[38;5;14mCancel\e[39m\r\n\e[38;5;14m \e[39m Edit\r\n\e[38;5;14m \e[39m Delete\r\n\e[38;5;14m[\e[39m\e[38;5;14m↑↓ to move, enter to select, type to filter\e[39m\e[38;5;14m]\e[39m\r\e[4A\e[35C\e[?25h"
 - !Input
   - 27
   - 91
@@ -621,7 +621,7 @@ recording_items:
 - !Output "\e[?25l\e[48D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m public-link asdf.txt \e[K\r\e[68C\e[?25h"
 - !Input
   - 13
-- !Output "\e[?25l\e[68D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m \e[38;5;14mpublic-link asdf.txt\e[39m\e[K\r\n\e[?25h\e[?25h\e[?2004l\e[2m      File\e[0m asdf.txt\r\n\e[2mExpiration\e[0m 1 hour\r\n\e[2m  Password\e[0m No\r\n\r\n\e[?2004h\e[?25l\e[38;5;10m?\e[39m This is an existing public link.  \r\n\e[38;5;14m>\e[39m \e[38;5;14mCancel\e[39m\r\n\e[38;5;14m \e[39m Edit\r\n\e[38;5;14m \e[39m Delete\r\n\e[38;5;14m[\e[39m\e[38;5;14m↑↓ to move, enter to select, type to filter\e[39m\e[38;5;14m]\e[39m\r\e[4A\e[35C\e[?25h"
+- !Output "\e[?25l\e[68D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m \e[38;5;14mpublic-link asdf.txt\e[39m\e[K\r\n\e[?25h\e[?25h\e[?2004l\e[2m      File\e[0m asdf.txt\r\n\e[2mExpiration\e[0m 1 hour\r\n\e[2m  Password\e[0m Yes\r\n\r\n\e[?2004h\e[?25l\e[38;5;10m?\e[39m This is an existing public link.  \r\n\e[38;5;14m>\e[39m \e[38;5;14mCancel\e[39m\r\n\e[38;5;14m \e[39m Edit\r\n\e[38;5;14m \e[39m Delete\r\n\e[38;5;14m[\e[39m\e[38;5;14m↑↓ to move, enter to select, type to filter\e[39m\e[38;5;14m]\e[39m\r\e[4A\e[35C\e[?25h"
 - !Input
   - 27
   - 91

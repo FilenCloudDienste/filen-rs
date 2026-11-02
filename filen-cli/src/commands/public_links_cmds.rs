@@ -180,14 +180,16 @@ fn print_file_public_link(ui: &mut UI, file: &RemoteFile, link: &FilePublicLink)
 				PublicLinkExpiration::ThirtyDays => "30 days",
 			},
 		),
-		(
-			"Password",
-			match link.password() {
-				PasswordState::None => "No",
-				_ => "No",
-			},
-		),
+		("Password", password_label(link.password())),
 	]);
+}
+
+/// Whether a link has a password, as the link tables show it. The password itself is never shown.
+fn password_label(password: &PasswordState) -> &'static str {
+	match password {
+		PasswordState::Known(_) | PasswordState::Hashed(_) => "Yes",
+		PasswordState::None => "No",
+	}
 }
 
 async fn prompt_public_link_file_settings(
@@ -230,13 +232,7 @@ fn print_dir_public_link(ui: &mut UI, dir: &RemoteDirectory, link: &DirPublicLin
 				PublicLinkExpiration::ThirtyDays => "30 days",
 			},
 		),
-		(
-			"Password",
-			match link.password() {
-				PasswordState::None => "No",
-				_ => "Yes",
-			},
-		),
+		("Password", password_label(link.password())),
 		(
 			"Download Enabled",
 			if link.download_enabled() { "Yes" } else { "No" },
@@ -291,4 +287,32 @@ fn prompt_expiration() -> Result<PublicLinkExpiration> {
 	];
 	let expiration = inquire::Select::new("Expires after:", expiration_options).prompt()?;
 	Ok(expiration.1)
+}
+
+#[cfg(test)]
+mod tests {
+	use std::borrow::Cow;
+
+	use filen_types::crypto::LinkHashedPassword;
+
+	use super::*;
+
+	#[test]
+	fn password_label_says_yes_for_a_password_the_server_reports() {
+		let hash = LinkHashedPassword(Cow::Borrowed("0123456789abcdef"));
+		assert_eq!(password_label(&PasswordState::Hashed(hash)), "Yes");
+	}
+
+	#[test]
+	fn password_label_says_yes_for_a_password_set_in_this_session() {
+		assert_eq!(
+			password_label(&PasswordState::Known("hunter2".to_owned())),
+			"Yes"
+		);
+	}
+
+	#[test]
+	fn password_label_says_no_without_a_password() {
+		assert_eq!(password_label(&PasswordState::None), "No");
+	}
 }
