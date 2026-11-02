@@ -1,5 +1,5 @@
 use std::{
-	io::{self, Write},
+	io::{self, IsTerminal, Write},
 	sync::Arc,
 };
 
@@ -83,6 +83,8 @@ pub(crate) struct UI {
 	out: Box<dyn Write + Send + Sync>,
 	/// Where failures and warnings go: stderr, except in the tests.
 	err: Box<dyn Write + Send + Sync>,
+	/// Whether stdout is a terminal, so a person reads it rather than a program.
+	stdout_is_terminal: bool,
 	/// Whether to output machine-readable JSON where applicable
 	pub(crate) json: bool,
 	disable_suggestions: bool,
@@ -92,7 +94,9 @@ pub(crate) struct UI {
 
 impl UI {
 	pub(crate) fn new() -> Self {
-		Self::with_writers(io::stdout(), io::stderr())
+		let mut ui = Self::with_writers(io::stdout(), io::stderr());
+		ui.stdout_is_terminal = io::stdout().is_terminal();
+		ui
 	}
 
 	fn with_writers(
@@ -105,6 +109,7 @@ impl UI {
 			override_terminal_width: None,
 			out: Box::new(out),
 			err: Box::new(err),
+			stdout_is_terminal: false,
 			json: false,
 			disable_suggestions: false,
 			make_output_environment_agnostic_for_replay_testing: false,
@@ -189,10 +194,15 @@ impl UI {
 
 	// print with formatting
 
-	/// Print an announcement message (used for important info from updates)
+	/// Print an announcement message (used for important info from updates) to stderr. It is only
+	/// shown to a person at a terminal: not with `--json` or `--quiet`, nor when stdout is piped
+	/// or redirected.
 	pub(crate) fn print_announcement(&mut self, msg: &str) {
 		warn!("[ANNOUNCEMENT] {}", msg);
-		self.print(&format!(
+		if self.quiet || self.json || !self.stdout_is_terminal {
+			return;
+		}
+		self.print_to_stderr(&format!(
 			"{} {}",
 			style("[i]").yellow().bold(),
 			style(msg).yellow()
@@ -246,6 +256,12 @@ impl UI {
 
 	pub(crate) fn print_muted(&mut self, msg: &str) {
 		self.print(&style(msg).dim().to_string());
+	}
+
+	/// Print a muted message about the CLI itself, such as its update's progress, to stderr, out
+	/// of the command's output.
+	pub(crate) fn print_muted_to_stderr(&mut self, msg: &str) {
+		self.print_to_stderr(&style(msg).dim().to_string());
 	}
 
 	/// Print a table of key-value pairs
@@ -726,6 +742,15 @@ pub(crate) mod test_support {
 			let text = str::from_utf8(&bytes).unwrap();
 			text.strip_suffix('\n').unwrap().to_owned()
 		}
+
+		/// [`Printed::lines`], or an empty string if nothing was printed.
+		pub(crate) fn lines_or_empty(&self) -> String {
+			if self.0.lock().unwrap().is_empty() {
+				String::new()
+			} else {
+				self.lines()
+			}
+		}
 	}
 }
 
@@ -899,6 +924,50 @@ mod tests {
 		assert_eq!(
 			console::strip_ansi_codes(&err.lines()),
 			"⚠ careful\n✘ No such file: /a\n✘ Canceled"
+		);
+	}
+
+	/// What `print_announcement` prints to stdout and to stderr, after `set_up`.
+	fn printed_announcement(set_up: impl FnOnce(&mut UI)) -> (String, String) {
+		let out = Printed::default();
+		let err = Printed::default();
+		let mut ui = Printed::split_ui(&out, &err);
+		ui.stdout_is_terminal = true;
+		set_up(&mut ui);
+		ui.print_announcement("Version 1 is deprecated");
+		let printed = |p: &Printed| console::strip_ansi_codes(&p.lines_or_empty()).into_owned();
+		(printed(&out), printed(&err))
+	}
+
+	#[test]
+	fn an_announcement_goes_to_stderr_at_a_terminal() {
+		assert_eq!(
+			printed_announcement(|_| {}),
+			(String::new(), "[i] Version 1 is deprecated".to_owned())
+		);
+	}
+
+	#[test]
+	fn an_announcement_is_skipped_with_json_output() {
+		assert_eq!(
+			printed_announcement(|ui| ui.json = true),
+			(String::new(), String::new())
+		);
+	}
+
+	#[test]
+	fn an_announcement_is_skipped_when_quiet() {
+		assert_eq!(
+			printed_announcement(|ui| ui.quiet = true),
+			(String::new(), String::new())
+		);
+	}
+
+	#[test]
+	fn an_announcement_is_skipped_when_stdout_is_not_a_terminal() {
+		assert_eq!(
+			printed_announcement(|ui| ui.stdout_is_terminal = false),
+			(String::new(), String::new())
 		);
 	}
 

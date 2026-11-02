@@ -2,6 +2,7 @@
 //! The updater checks for new releases from https://github.com/FilenCloudDienste/filen-cli-releases
 //! when the CLI is run (unless skipped in the 5mins since the last check, or through the `--skip-update` flag).
 //! The executable will be replaced in place, with the filename updated if it contains the version number.
+//! Update notices and announcements are printed to stderr, and only when stdout is a terminal and neither `--json` nor `--quiet` is given.
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -116,7 +117,7 @@ pub(crate) async fn check_for_updates(
 		));
 	} else {
 		if automatically_update {
-			ui.print_muted(&format!(
+			ui.print_muted_to_stderr(&format!(
 				"Automatically updating from v{} to v{}...",
 				version, latest_tag
 			));
@@ -166,7 +167,7 @@ pub(crate) async fn check_for_updates(
 				.map(|()| update_path)
 			})
 			.await??;
-			ui.print_muted(&format!("Downloaded update to {}", update_path.display()));
+			ui.print_muted_to_stderr(&format!("Downloaded update to {}", update_path.display()));
 		} else {
 			tokio::task::spawn_blocking(move || {
 				install_replacing_update(&executable_dir, &content, |staged| {
@@ -174,7 +175,7 @@ pub(crate) async fn check_for_updates(
 				})
 			})
 			.await??;
-			ui.print_muted(
+			ui.print_muted_to_stderr(
 				"Update installed successfully. It will take effect the next time you run the application.",
 			);
 		}

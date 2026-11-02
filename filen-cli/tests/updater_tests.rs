@@ -25,11 +25,11 @@ fn test_updater() {
 		])
 		.assert()
 		.success()
-		.stdout(predicates::str::contains("Update installed successfully"));
+		.stderr(predicates::str::contains("Update installed successfully"));
 	let output = assert.get_output();
 	let new_version = Regex::new(r#"Automatically updating from v.* to v(.*)\.\.\."#)
 		.unwrap()
-		.captures(std::str::from_utf8(&output.stdout).unwrap())
+		.captures(std::str::from_utf8(&output.stderr).unwrap())
 		.unwrap()
 		.get(1)
 		.unwrap()
