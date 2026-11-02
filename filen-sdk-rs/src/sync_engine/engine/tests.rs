@@ -11,7 +11,7 @@ use crate::{
 	alloc_meter,
 	auth::{test_support::offline_client, unauth},
 	cache::{
-		CacheError, CacheSlot, CacheState, open_sqlite, open_sqlite_in_memory,
+		CacheError, CacheSlot, CacheState, ResyncReach, open_sqlite, open_sqlite_in_memory,
 		open_sqlite_with_flags, test_support::rewrite_behind_sqlite,
 	},
 	sync::lock::MAX_SLEEP_TIME_DEFAULT,
@@ -8088,6 +8088,11 @@ fn convergence_answers(
 	}
 }
 
+/// The cache's answer while its latest attempt reached the server, or is still waiting on it.
+fn reachable() -> std::future::Ready<Option<Error>> {
+	std::future::ready(None)
+}
+
 /// A root the cache already holds converged is read at once: nothing waits, and nothing is told
 /// of a wait.
 #[tokio::test(start_paused = true)]
@@ -8098,6 +8103,7 @@ async fn a_converged_root_is_read_without_waiting() {
 
 	let generation = await_convergence(
 		convergence_answers(vec![Some(4)], &asked),
+		reachable,
 		async {
 			waited.store(true, Ordering::Relaxed);
 			Ok(())
@@ -8125,6 +8131,7 @@ async fn a_root_still_being_listed_is_waited_for_until_it_converges() {
 
 	let generation = await_convergence(
 		convergence_answers(vec![None, None, Some(9)], &asked),
+		reachable,
 		async {
 			announced.fetch_add(1, Ordering::Relaxed);
 			Ok(())
@@ -8151,6 +8158,7 @@ async fn a_failure_before_the_wait_ends_it_at_once() {
 
 	let failed = await_convergence(
 		convergence_answers(vec![None, Some(1)], &asked),
+		reachable,
 		async { Err(Error::custom(ErrorKind::Server, "refused")) },
 		CONVERGENCE_POLL,
 		CONVERGENCE_WAIT,
@@ -8173,6 +8181,7 @@ async fn a_root_that_never_converges_is_given_up_on_after_the_wait() {
 
 	let generation = await_convergence(
 		convergence_answers(Vec::new(), &asked),
+		reachable,
 		async { Ok(()) },
 		Duration::from_secs(1),
 		Duration::from_secs(5),
@@ -8198,6 +8207,7 @@ async fn a_wait_given_up_on_ends_at_once() {
 
 	let generation = await_convergence(
 		convergence_answers(Vec::new(), &asked),
+		reachable,
 		async { Ok(()) },
 		Duration::from_secs(1),
 		Duration::from_secs(60),
@@ -8222,6 +8232,7 @@ async fn giving_up_does_not_preempt_a_converged_answer() {
 
 	let generation = await_convergence(
 		convergence_answers(vec![Some(7)], &asked),
+		reachable,
 		async { Ok(()) },
 		CONVERGENCE_POLL,
 		CONVERGENCE_WAIT,
@@ -8231,6 +8242,190 @@ async fn giving_up_does_not_preempt_a_converged_answer() {
 	.unwrap();
 
 	assert_eq!(generation, Some(7));
+}
+
+/// What a pass reads of `reach` while it waits on `remote_root` for `pair`, as
+/// [`SyncEngine::await_remote_view`] reads the cache worker's.
+fn unreachable_on(
+	reach: &ResyncReach,
+	pair: PairId,
+	remote_root: Uuid,
+) -> impl FnMut() -> std::future::Ready<Option<Error>> + '_ {
+	move || {
+		std::future::ready(
+			reach
+				.unreachable()
+				.map(|failure| remote_unreachable(pair, remote_root, failure)),
+		)
+	}
+}
+
+/// The transport failure an offline cache's resync fails on: its drive lock got no answer.
+fn lock_unanswered() -> Error {
+	Error::custom(
+		ErrorKind::Reqwest,
+		"v3/user/lock: error sending request: connection refused",
+	)
+}
+
+/// A root whose listing the cache could not reach the server for is not waited on: the pass fails
+/// at once, before it is told of a wait, as a pass that could not reach the server, carrying the
+/// cache's own failure.
+#[tokio::test(start_paused = true)]
+async fn a_root_the_cache_cannot_reach_the_server_for_fails_the_wait_at_once() {
+	let reach = ResyncReach::default();
+	reach.failed(reach.mark(), lock_unanswered());
+	let asked = AtomicUsize::new(0);
+	let announced = AtomicBool::new(false);
+	let started = tokio::time::Instant::now();
+
+	let failed = await_convergence(
+		convergence_answers(Vec::new(), &asked),
+		unreachable_on(&reach, 4, Uuid::from_u128(2)),
+		async {
+			announced.store(true, Ordering::Relaxed);
+			Ok(())
+		},
+		CONVERGENCE_POLL,
+		CONVERGENCE_WAIT,
+		std::future::pending(),
+	)
+	.await
+	.expect_err("the cache could not reach the server");
+
+	assert_eq!(failed.kind(), ErrorKind::Reqwest, "{failed}");
+	assert_eq!(started.elapsed(), Duration::ZERO);
+	assert!(!announced.load(Ordering::Relaxed), "no wait to announce");
+	let cause = std::error::Error::source(&failed)
+		.and_then(|source| source.downcast_ref::<Arc<Error>>())
+		.expect("the cache's failure is the source");
+	assert_eq!(cause.kind(), ErrorKind::Reqwest);
+	let message = failed.to_string();
+	assert!(message.contains("sync pair 4"), "{message}");
+	assert!(message.contains("v3/user/lock"), "{message}");
+}
+
+/// A resync that fails on the network while a pass waits on it ends the wait at the next ask,
+/// not when the wait runs out.
+#[tokio::test(start_paused = true)]
+async fn a_resync_that_loses_the_network_during_the_wait_ends_it_at_the_next_ask() {
+	let reach = ResyncReach::default();
+	let since = reach.mark();
+	let asked = AtomicUsize::new(0);
+	let started = tokio::time::Instant::now();
+
+	let (failed, ()) = tokio::join!(
+		await_convergence(
+			convergence_answers(Vec::new(), &asked),
+			unreachable_on(&reach, 1, Uuid::from_u128(2)),
+			async { Ok(()) },
+			CONVERGENCE_POLL,
+			CONVERGENCE_WAIT,
+			std::future::pending(),
+		),
+		async {
+			tokio::time::sleep(Duration::from_millis(2500)).await;
+			reach.failed(since, lock_unanswered());
+		},
+	);
+
+	assert_eq!(failed.unwrap_err().kind(), ErrorKind::Reqwest);
+	assert_eq!(started.elapsed(), CONVERGENCE_POLL * 3);
+}
+
+/// A listing that is only slow is waited for, however long it takes within the wait: no failure
+/// was observed, so the time it takes never reads as the server being unreachable.
+#[tokio::test(start_paused = true)]
+async fn a_slow_listing_that_reaches_the_server_is_waited_for() {
+	let reach = ResyncReach::default();
+	// The attempt before the one under way reached the server.
+	reach.reached();
+	let asked = AtomicUsize::new(0);
+	let started = tokio::time::Instant::now();
+	let mut answers = vec![None; 600];
+	answers.push(Some(3));
+
+	let generation = await_convergence(
+		convergence_answers(answers, &asked),
+		unreachable_on(&reach, 1, Uuid::from_u128(2)),
+		async { Ok(()) },
+		CONVERGENCE_POLL,
+		CONVERGENCE_WAIT,
+		std::future::pending(),
+	)
+	.await
+	.unwrap();
+
+	assert_eq!(generation, Some(3));
+	assert_eq!(started.elapsed(), CONVERGENCE_POLL * 600);
+}
+
+/// Once a later attempt reaches the server, or the socket connects again, the failure no longer
+/// stands, and the next pass waits for the listing as before.
+#[tokio::test(start_paused = true)]
+async fn a_failure_cleared_by_a_later_attempt_or_connection_is_waited_past() {
+	for by_connection in [false, true] {
+		let connections = Arc::new(std::sync::atomic::AtomicU64::new(0));
+		let reach = ResyncReach::new(Arc::clone(&connections));
+		reach.failed(reach.mark(), lock_unanswered());
+		let asked = AtomicUsize::new(0);
+
+		let failed = await_convergence(
+			convergence_answers(Vec::new(), &asked),
+			unreachable_on(&reach, 1, Uuid::from_u128(2)),
+			async { Ok(()) },
+			CONVERGENCE_POLL,
+			CONVERGENCE_WAIT,
+			std::future::pending(),
+		)
+		.await
+		.expect_err("the failure stands");
+		assert_eq!(failed.kind(), ErrorKind::Reqwest);
+
+		if by_connection {
+			connections.fetch_add(1, Ordering::SeqCst);
+		} else {
+			reach.reached();
+		}
+		let asked = AtomicUsize::new(0);
+		let generation = await_convergence(
+			convergence_answers(vec![None, None, Some(8)], &asked),
+			unreachable_on(&reach, 1, Uuid::from_u128(2)),
+			async { Ok(()) },
+			CONVERGENCE_POLL,
+			CONVERGENCE_WAIT,
+			std::future::pending(),
+		)
+		.await
+		.unwrap();
+		assert_eq!(generation, Some(8));
+	}
+}
+
+/// A failure the server answered, such as a lock another device holds or a server error, is not an
+/// unreachable server: the pass waits on.
+#[tokio::test(start_paused = true)]
+async fn a_failure_the_server_answered_does_not_end_the_wait() {
+	for answered in [
+		Error::custom(ErrorKind::RetryFailed, "the drive lock is held elsewhere"),
+		Error::custom(ErrorKind::Server, "internal error"),
+	] {
+		let reach = ResyncReach::default();
+		reach.failed(reach.mark(), answered);
+		let asked = AtomicUsize::new(0);
+
+		let generation = await_convergence(
+			convergence_answers(vec![None, Some(2)], &asked),
+			unreachable_on(&reach, 1, Uuid::from_u128(2)),
+			async { Ok(()) },
+			CONVERGENCE_POLL,
+			CONVERGENCE_WAIT,
+			std::future::pending(),
+		)
+		.await
+		.unwrap();
+		assert_eq!(generation, Some(2));
+	}
 }
 
 /// A dry run over a remote root the cache has not finished listing plans nothing: the file the

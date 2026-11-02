@@ -566,7 +566,8 @@ async fn run_async_websocket_task<W, S, R, RV, US, UR, T, UW, PT>(
 		};
 
 		// Promote
-		let mut connected_listeners = disconnected_listeners.into_connected();
+		let mut connected_listeners =
+			disconnected_listeners.into_connected(config.client.state().socket_connections());
 
 		let should_retry = handle_initialized_websocket(
 			&config,

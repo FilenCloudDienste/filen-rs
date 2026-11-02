@@ -2525,6 +2525,89 @@ async fn a_root_whose_check_cannot_reach_the_server_is_unavailable_with_the_tran
 	assert_eq!(source.kind(), ErrorKind::Reqwest);
 }
 
+/// A resync whose drive lock gets no answer records the lock's own transport failure, which every
+/// root it was converging is then held back by: the attempt could not reach the server.
+#[tokio::test(start_paused = true)]
+async fn a_resync_whose_drive_lock_gets_no_answer_records_the_server_unreachable() {
+	let (mut state, _producer) = CacheState::new_in_memory_with_producer();
+	state.set_test_resync_client(Arc::new(offline_client()));
+	assert!(
+		!state.sync_roots.is_empty(),
+		"a dir root takes the drive lock"
+	);
+
+	state.run_resync().await.unwrap();
+
+	let failure = state
+		.reach
+		.unreachable()
+		.expect("the server was not reached");
+	assert_eq!(failure.kind(), ErrorKind::Reqwest, "{failure}");
+	assert!(
+		crate::auth::unauth::test_support::is_lock_request_failure(&failure),
+		"the lock's own failure: {failure}"
+	);
+}
+
+/// A gap-check whose read of the remote drive id gets no answer records it too.
+#[tokio::test(start_paused = true)]
+async fn a_gap_check_that_gets_no_answer_records_the_server_unreachable() {
+	let (mut state, _producer) = CacheState::new_in_memory_with_producer();
+	state.set_test_resync_client(Arc::new(offline_client()));
+
+	state.run_gap_check().await;
+
+	let failure = state
+		.reach
+		.unreachable()
+		.expect("the server was not reached");
+	assert_eq!(failure.kind(), ErrorKind::Reqwest, "{failure}");
+}
+
+/// A socket connection outdates a standing failure, and a request sent before the connection that
+/// fails after it is not recorded, the network being back; an answer clears it too.
+#[test]
+fn a_socket_connection_outdates_the_failure_and_requests_sent_before_it() {
+	let connections = Arc::new(std::sync::atomic::AtomicU64::new(0));
+	let reach = ResyncReach::new(Arc::clone(&connections));
+	let unanswered = || crate::Error::custom(ErrorKind::Reqwest, "error sending request");
+	reach.failed(reach.mark(), unanswered());
+	assert!(reach.unreachable().is_some());
+
+	let before = reach.mark();
+	connections.fetch_add(1, Ordering::SeqCst);
+	assert!(reach.unreachable().is_none(), "outdated by the connection");
+
+	reach.failed(before, unanswered());
+	assert!(
+		reach.unreachable().is_none(),
+		"a request sent before the connection does not count"
+	);
+	reach.failed(reach.mark(), unanswered());
+	assert!(reach.unreachable().is_some(), "one sent after it does");
+	reach.reached();
+	assert!(reach.unreachable().is_none(), "an answer clears it");
+}
+
+/// A failure the server answered is not an unreachable server: it records nothing, and clears a
+/// transport failure that stood before it.
+#[test]
+fn a_failure_the_server_answered_is_not_the_server_unreachable() {
+	let reach = ResyncReach::default();
+	reach.failed(
+		reach.mark(),
+		crate::Error::custom(ErrorKind::Reqwest, "error sending request"),
+	);
+	for answered in [
+		ErrorKind::RetryFailed,
+		ErrorKind::Server,
+		ErrorKind::Internal,
+	] {
+		reach.failed(reach.mark(), crate::Error::custom(answered, "answered"));
+		assert!(reach.unreachable().is_none(), "{answered:?}");
+	}
+}
+
 /// removing ONE of two registrations keeps the root active and SKIPS the requested
 /// eviction (deleting the subtree out from under the surviving registration would fight the
 /// membership gate); the ack reports `Ok(false)`.

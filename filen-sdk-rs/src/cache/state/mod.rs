@@ -177,6 +177,13 @@ struct ResyncListing {
 	remote_under_lock: u64,
 }
 
+/// Keep `error` as an attempt's transport failure when it is one and the attempt has none yet.
+fn note_transport(transport: &mut Option<crate::Error>, error: crate::Error) {
+	if transport.is_none() && error.kind() == ErrorKind::Reqwest {
+		*transport = Some(error);
+	}
+}
+
 /// The outcome of one pass of per-lineage head fetches: the heads that resolved, and the lineages
 /// the server reported definitively gone. Everything else was skipped (see
 /// [`fetch_file_root_heads`](CacheState::fetch_file_root_heads)).
@@ -252,6 +259,10 @@ pub(crate) struct CacheState {
 	/// observe the releasing `Connected`, including the one inside `run_resync`'s lock-wait, which
 	/// discards its drain signal; a local there would drop the release and strand the check.
 	startup_gap_check: StartupGapCheck,
+	/// Whether this worker's latest attempt to converge its roots could reach the server, shared
+	/// with the socket callback and with the worker's shared handle state, which a sync pass reads
+	/// it through.
+	reach: Arc<ResyncReach>,
 }
 
 /// The startup gap-check's three states. A gap-check is only sound once the socket is subscribed
@@ -295,6 +306,7 @@ impl CacheState {
 			short_roots: None,
 			read_tasks: None,
 			startup_gap_check: StartupGapCheck::AwaitingSubscription,
+			reach: Arc::default(),
 		};
 		state.init_db().unwrap();
 		state
@@ -333,6 +345,7 @@ impl CacheState {
 			short_roots: None,
 			read_tasks: None,
 			startup_gap_check: StartupGapCheck::AwaitingSubscription,
+			reach: Arc::default(),
 		};
 		state.init_db().unwrap();
 		state
@@ -369,6 +382,7 @@ impl CacheState {
 			short_roots: None,
 			read_tasks: None,
 			startup_gap_check: StartupGapCheck::AwaitingSubscription,
+			reach: Arc::default(),
 		};
 		state.init_db().unwrap();
 
@@ -388,8 +402,11 @@ impl CacheState {
 	}
 
 	/// Validate the roots added from here on against `client`, as a worker does, where a unit
-	/// construction validates nothing.
+	/// construction validates nothing, and read its socket's connections as a worker does.
 	pub(crate) fn set_test_resync_client(&mut self, client: Arc<Client>) {
+		self.reach = Arc::new(ResyncReach::new(Arc::clone(
+			client.unauthed().state().socket_connections(),
+		)));
 		self.resync = Some(ResyncDeps { client });
 	}
 
@@ -588,6 +605,7 @@ type InitResult = (
 	UnboundedSender<CacheControlMessage>,
 	tokio::sync::mpsc::Sender<CacheThreadEvent>,
 	UnboundedSender<ReadTask>,
+	Arc<ResyncReach>,
 );
 
 impl CacheState {
@@ -623,12 +641,16 @@ impl CacheState {
 			sync_roots: HashMap::new(),
 			file_roots: HashMap::new(),
 			head_fetch_failures: HashMap::new(),
+			reach: Arc::new(ResyncReach::new(Arc::clone(
+				client.unauthed().state().socket_connections(),
+			))),
 			resync: Some(ResyncDeps { client }),
 			resync_retry: None,
 			short_roots: None,
 			read_tasks: Some(read_task_receiver),
 			startup_gap_check: StartupGapCheck::AwaitingSubscription,
 		};
+		let reach = cache_state.reach.clone();
 
 		cache_state.init_db().map_err(|e| {
 			crate::Error::custom_with_source(
@@ -659,6 +681,7 @@ impl CacheState {
 			control_sender,
 			event_sender,
 			read_task_sender,
+			reach,
 		))
 	}
 
@@ -1835,12 +1858,17 @@ impl CacheState {
 		// Unit-test construction has no client to ask, so the local evidence decides, as in
 		// `run_gap_check`.
 		if let Some(deps) = self.resync.clone() {
+			let since = self.reach.mark();
 			let remote = match deps.client.get_last_event_ids().await {
-				Ok(ids) => ids.drive,
+				Ok(ids) => {
+					self.reach.reached();
+					ids.drive
+				}
 				Err(e) => {
 					tracing::debug!(
 						"sync root(s) added; could not read the remote drive id ({e}), relisting"
 					);
+					self.reach.failed(since, e);
 					return false;
 				}
 			};
@@ -2616,13 +2644,18 @@ impl CacheState {
 			self.maybe_run_resync().await;
 			return;
 		};
+		let since = self.reach.mark();
 		let remote = match deps.client.get_last_event_ids().await {
-			Ok(ids) => ids.drive,
+			Ok(ids) => {
+				self.reach.reached();
+				ids.drive
+			}
 			Err(e) => {
 				tracing::warn!(
 					"gap-check: could not read the remote drive id ({e}); falling back to the \
 					 durable resync flag"
 				);
+				self.reach.failed(since, e);
 				self.maybe_run_resync().await;
 				return;
 			}
@@ -2680,6 +2713,7 @@ impl CacheState {
 		// in chunks: from here until its commit no root's rows are a view a sync pass may plan
 		// against. The commit names the roots it converged again.
 		self.reset_converged_roots()?;
+		let since = self.reach.mark();
 
 		let account_root = self.root_uuid;
 		let sync_roots: Vec<Uuid> = self.sync_roots.keys().copied().collect();
@@ -2724,6 +2758,7 @@ impl CacheState {
 			Self::send_resync_progress(&self.msg_sender, ResyncProgress::Applying);
 			let converged = match deps.client.get_last_event_ids().await {
 				Ok(ids) => {
+					self.reach.reached();
 					let heads = Self::fetch_file_root_heads(&deps.client, &file_roots).await;
 					// A transiently-skipped head keeps `needs_resync` SET through the commit
 					// (`mark_resync`) while the watermark still advances, so the drain-paced
@@ -2751,6 +2786,7 @@ impl CacheState {
 					// (the gap-check re-fires on the next event) and arm the retry timer for a
 					// quiet account.
 					tracing::debug!("resync: no dir sync roots; deferring watermark advance ({e})");
+					self.reach.failed(since, e);
 					self.mark_needs_resync_surfacing_errors();
 					false
 				}
@@ -2827,7 +2863,10 @@ impl CacheState {
 			}
 		};
 		let lock = match lock {
-			Ok(lock) => lock,
+			Ok(lock) => {
+				self.reach.reached();
+				lock
+			}
 			Err(e) => {
 				if matches!(e.kind(), ErrorKind::RetryFailed) {
 					tracing::debug!(
@@ -2838,6 +2877,8 @@ impl CacheState {
 						"resync: drive lock acquisition failed ({e}); retrying in {RESYNC_RETRY_INTERVAL:?}"
 					);
 				}
+				// A lock still contended is the server answering.
+				self.reach.failed(since, e);
 				self.abort_resync_unconverged(true);
 				return Ok(());
 			}
@@ -2858,6 +2899,9 @@ impl CacheState {
 			// Set when a root fails with a NON-not-found (network/server) error. `finalize_resync` uses it
 			// to keep an all-transient resync from advancing the watermark past a gap it never reconciled.
 			let mut any_transient = false;
+			// The first transport failure among them: an attempt it leaves unconverged could not
+			// reach the server.
+			let mut transport = None;
 			for (root_index, root) in sync_roots.iter().enumerate() {
 				let root_node: Option<RemoteDirectory> = if *root == account_root {
 					// The account root always exists and resyncs via `client.root()`, not `get_dir`.
@@ -2896,6 +2940,7 @@ impl CacheState {
 								"resync: skipping sync root {root} (get_dir failed: {e})"
 							);
 							any_transient = true;
+							note_transport(&mut transport, e);
 							continue;
 						}
 					}
@@ -2954,11 +2999,12 @@ impl CacheState {
 					Err(e) => {
 						tracing::debug!("resync: skipping sync root {root} (listing failed: {e})");
 						any_transient = true;
+						note_transport(&mut transport, e);
 					}
 				}
 			}
 			let file_heads = Self::fetch_file_root_heads(&deps.client, &file_roots).await;
-			Ok(ResyncListing {
+			let listing = ResyncListing {
 				per_root_raw,
 				file_root_heads: file_heads.heads,
 				deleted_file_roots: file_heads.deleted,
@@ -2970,7 +3016,8 @@ impl CacheState {
 				// bounded per-lineage ledger in `finalize_resync`.
 				file_transient: file_heads.transient,
 				remote_under_lock,
-			})
+			};
+			Ok((listing, transport))
 		};
 		// Serve search read queries WHILE the listing runs (minutes on a large account): the wasm
 		// read path has no other server, so without this every search query would queue for the
@@ -2992,7 +3039,7 @@ impl CacheState {
 		// Release the drive lock now — `finalize_resync` is local-only DB work.
 		drop(lock);
 
-		let listing = match listing {
+		let (listing, transport) = match listing {
 			Ok(listing) => listing,
 			Err(e) => {
 				// A snapshot-id read or per-root listing failed (the lock was already held) —
@@ -3002,6 +3049,7 @@ impl CacheState {
 				tracing::debug!(
 					"resync listing failed ({e}); retrying in {RESYNC_RETRY_INTERVAL:?}"
 				);
+				self.reach.failed(since, e);
 				self.abort_resync_unconverged(true);
 				return Ok(());
 			}
@@ -3014,6 +3062,10 @@ impl CacheState {
 		// transaction that commits any progress, so `Ok` + a clear flag is exactly "nothing
 		// pending".
 		let converged = result.is_ok() && matches!(self.needs_resync(), Ok(false));
+		match transport {
+			Some(error) if !converged => self.reach.failed(since, error),
+			_ => self.reach.reached(),
+		}
 		Self::send_resync_progress(&self.msg_sender, ResyncProgress::Finished { converged });
 		self.schedule_retry_if_unconverged(converged);
 		result
@@ -3672,6 +3724,8 @@ fn dispatch_presnapshot_target(event: &CacheEventType<'_>) -> Option<Uuid> {
 }
 
 mod event;
+mod reach;
+pub(crate) use reach::ResyncReach;
 // The applied-event types are part of the public API (the `SyncRootCallback` receives `&CacheEvent`).
 pub use event::{CacheEvent, CacheEventType, DirEvent, FileEvent, GlobalEvent};
 // Internal only: the channel-carried wrapper never reaches a callback.

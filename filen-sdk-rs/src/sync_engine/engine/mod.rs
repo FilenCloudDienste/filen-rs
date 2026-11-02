@@ -4475,7 +4475,10 @@ impl SyncEngine {
 	/// track, which would never converge: it is subscribed again before the wait (see
 	/// [`resubscribe`](Self::resubscribe)), and a refusal fails the wait at once, as that error.
 	/// `give_up` resolving fails it at once with [`ErrorKind::StaleState`] too, as a wait that ran
-	/// out does.
+	/// out does. While the cache's latest attempt to list it could not reach the server, the wait
+	/// fails at once instead, before or during it, with that transport failure's kind
+	/// ([`ErrorKind::Reqwest`]) and the failure as its source, so the pair reads as offline and
+	/// its watch resumes once the network is back; a listing that is only slow is waited for.
 	pub(super) async fn await_remote_view(
 		&self,
 		pair: PairId,
@@ -4496,6 +4499,10 @@ impl SyncEngine {
 		};
 		await_convergence(
 			|| self.client.sync_root_converged(remote_root),
+			|| async {
+				let failure = self.client.cache_unreachable().await?;
+				Some(remote_unreachable(pair, remote_root, failure))
+			},
 			before_waiting,
 			CONVERGENCE_POLL,
 			CONVERGENCE_WAIT,
@@ -7936,12 +7943,16 @@ fn cancelled_reading(gate: &PassGate, pair: PairId) -> Result<SyncReport, Error>
 }
 
 /// Ask `converged` until it answers a generation, every `poll`, for at most `wait`: `None` when it
-/// never did. `before_waiting` runs once, after a first answer of none and before the first wait,
-/// so a caller hears of a wait only when there is one; its error ends the wait. `give_up`
-/// resolving ends it too, wherever it stands, with the `None` of a wait that ran out — unless the
-/// answer it was racing came first.
-async fn await_convergence<A, F>(
+/// never did. After each answer of none, `unreachable` is asked whether the cache's latest attempt
+/// to converge could not reach the server, and its error ends the wait at once: a listing that
+/// cannot be made is not waited on, while one that is only slow is, for as long as it takes, as
+/// that answer comes only from a failure the cache observed. `before_waiting` runs once, after a
+/// first answer of none and before the first wait, so a caller hears of a wait only when there is
+/// one; its error ends the wait. `give_up` resolving ends it too, wherever it stands, with the
+/// `None` of a wait that ran out — unless the answer it was racing came first.
+async fn await_convergence<A, F, U, G>(
 	mut converged: A,
+	mut unreachable: U,
 	before_waiting: impl Future<Output = Result<(), Error>>,
 	poll: Duration,
 	wait: Duration,
@@ -7950,10 +7961,15 @@ async fn await_convergence<A, F>(
 where
 	A: FnMut() -> F,
 	F: Future<Output = Result<Option<u64>, Error>>,
+	U: FnMut() -> G,
+	G: Future<Output = Option<Error>>,
 {
 	let waiting = async {
 		if let Some(generation) = converged().await? {
 			return Ok(Some(generation));
+		}
+		if let Some(error) = unreachable().await {
+			return Err(error);
 		}
 		before_waiting.await?;
 		let deadline = tokio::time::Instant::now() + wait;
@@ -7961,6 +7977,9 @@ where
 			tokio::time::sleep(poll).await;
 			if let Some(generation) = converged().await? {
 				return Ok(Some(generation));
+			}
+			if let Some(error) = unreachable().await {
+				return Err(error);
 			}
 			if tokio::time::Instant::now() >= deadline {
 				return Ok(None);
@@ -7984,6 +8003,21 @@ fn remote_not_converged(pair: PairId, remote_root: Uuid) -> Error {
 			"sync pair {pair}: the cache has not finished listing the remote folder {remote_root}, \
 			 so no pass plans against it yet"
 		),
+	)
+}
+
+/// The error of a pass that found the cache could not reach the server to finish listing `pair`'s
+/// remote root `remote_root`: the transport failure the cache observed, `failure`, as its source,
+/// and its kind, so the pass reads as one that could not reach the server, as any request that
+/// failed so does.
+fn remote_unreachable(pair: PairId, remote_root: Uuid, failure: Arc<Error>) -> Error {
+	Error::custom_with_source(
+		failure.kind(),
+		failure,
+		Some(format!(
+			"sync pair {pair}: the cache could not reach the server to finish listing the remote \
+			 folder {remote_root}"
+		)),
 	)
 }
 

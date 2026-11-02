@@ -27,7 +27,7 @@ use uuid::Uuid;
 use crate::cache::{
 	CacheControlMessage, CacheError, CacheState, RootKey, SyncRootCallback,
 	search::ReadTask,
-	state::{CacheThreadEvent, ManualEvent},
+	state::{CacheThreadEvent, ManualEvent, ResyncReach},
 };
 
 /// How long [`spawn_cache_worker`] waits for the new worker's init ack before presuming it dead.
@@ -162,6 +162,9 @@ pub(crate) struct CacheWorkerShared {
 	/// takes it — inert handles outliving a flush must not keep the websocket subscribed (and
 	/// decrypting every drive event) for a dead worker.
 	listener_handle: std::sync::Mutex<Option<ListenerHandle>>,
+	/// Whether the worker's latest attempt to converge its roots could reach the server (see
+	/// [`Client::cache_unreachable`]).
+	reach: Arc<ResyncReach>,
 }
 
 /// Every live cache worker in this PROCESS, keyed by the DB it owns. Weak on purpose: the registry
@@ -521,6 +524,22 @@ impl Client {
 		Ok(shared)
 	}
 
+	/// The transport failure that left the live cache worker unable to reach the server on its
+	/// latest attempt to converge its roots, while it stands (see [`ResyncReach`]): what a sync pass
+	/// waiting on a root the cache has not converged fails with instead of waiting on. `None` with
+	/// no live worker, or when its latest attempt reached the server or is still waiting on it.
+	#[cfg_attr(
+		not(all(
+			feature = "sync-engine",
+			not(all(target_family = "wasm", target_os = "unknown"))
+		)),
+		allow(dead_code)
+	)]
+	pub(crate) async fn cache_unreachable(&self) -> Option<Arc<Error>> {
+		let worker = self.cache_slot.lock().await.worker.upgrade()?;
+		worker.reach.unreachable()
+	}
+
 	/// Clear the slot's weak worker pointer if it still references `shared`, so the next
 	/// [`add_sync_root`](Client::add_sync_root) respawns instead of re-targeting a dead worker.
 	/// The pointer comparison keeps a NEWER worker (spawned by a concurrent caller) intact.
@@ -576,13 +595,14 @@ async fn spawn_cache_worker(
 			return;
 		}
 		let state = match CacheState::new(&cache_path, root_uuid, msg_sender, worker_client) {
-			Ok((state, callback, control_sender, event_sender, read_task_sender)) => {
+			Ok((state, callback, control_sender, event_sender, read_task_sender, reach)) => {
 				if res_sender
 					.send(Ok((
 						callback,
 						control_sender,
 						event_sender,
 						read_task_sender,
+						reach,
 					)))
 					.is_err()
 				{
@@ -628,46 +648,42 @@ async fn spawn_cache_worker(
 	// and one that got past the check exits at its failed ack send — but a straggler frozen
 	// MID-init can still briefly overlap a successor; native therefore KEEPS the exit signal
 	// (see the timeout arm) so respawns wait stragglers out.
-	let (callback, control_sender, manual_event_sender, read_task_sender) = match ack_timeout(
-		CACHE_INIT_ACK_TIMEOUT,
-		res_receiver,
-	)
-	.await
-	{
-		Ok(Ok(Ok(parts))) => parts,
-		// `CacheState::new` failed (or the worker died before reporting); the thread is
-		// already exiting on its own and stays reapable via the slot.
-		Ok(Ok(Err(e))) => return Err(e),
-		Ok(Err(_)) => {
-			return Err(Error::custom(
-				ErrorKind::Internal,
-				"cache worker thread exited before initialization completed",
-			));
-		}
-		Err(_) => {
-			tracing::error!(
-				"cache worker did not acknowledge initialization within {CACHE_INIT_ACK_TIMEOUT:?}; presuming it dead"
-			);
-			// Tell a late starter to exit at entry instead of initializing onto a DB a
-			// successor may be using (stored BEFORE any successor can spawn — the slot lock is
-			// still held).
-			abandoned.store(true, Ordering::Release);
-			// NATIVE: keep the exit signal — a stalled-but-alive worker that got PAST the
-			// abandoned check still owns the DB file and always fires the signal eventually
-			// (unwind included), so the next add/flush waits it out rather than overlapping
-			// it. WASM: a dead worker can never fire the signal (panic=abort leaks it, no
-			// unwinding) and a late starter exits at the abandoned check, so clearing it here
-			// is what keeps the cache recoverable.
-			#[cfg(all(target_family = "wasm", target_os = "unknown"))]
-			{
-				slot.finished = None;
+	let (callback, control_sender, manual_event_sender, read_task_sender, reach) =
+		match ack_timeout(CACHE_INIT_ACK_TIMEOUT, res_receiver).await {
+			Ok(Ok(Ok(parts))) => parts,
+			// `CacheState::new` failed (or the worker died before reporting); the thread is
+			// already exiting on its own and stays reapable via the slot.
+			Ok(Ok(Err(e))) => return Err(e),
+			Ok(Err(_)) => {
+				return Err(Error::custom(
+					ErrorKind::Internal,
+					"cache worker thread exited before initialization completed",
+				));
 			}
-			return Err(Error::custom(
-				ErrorKind::Internal,
-				"cache worker did not initialize in time (worker startup failure?)",
-			));
-		}
-	};
+			Err(_) => {
+				tracing::error!(
+					"cache worker did not acknowledge initialization within {CACHE_INIT_ACK_TIMEOUT:?}; presuming it dead"
+				);
+				// Tell a late starter to exit at entry instead of initializing onto a DB a
+				// successor may be using (stored BEFORE any successor can spawn — the slot lock is
+				// still held).
+				abandoned.store(true, Ordering::Release);
+				// NATIVE: keep the exit signal — a stalled-but-alive worker that got PAST the
+				// abandoned check still owns the DB file and always fires the signal eventually
+				// (unwind included), so the next add/flush waits it out rather than overlapping
+				// it. WASM: a dead worker can never fire the signal (panic=abort leaks it, no
+				// unwinding) and a late starter exits at the abandoned check, so clearing it here
+				// is what keeps the cache recoverable.
+				#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+				{
+					slot.finished = None;
+				}
+				return Err(Error::custom(
+					ErrorKind::Internal,
+					"cache worker did not initialize in time (worker startup failure?)",
+				));
+			}
+		};
 
 	// Register the socket listener inline via `add_event_listener_sync`, which inserts the callback
 	// into the routing table and returns its handle WITHOUT awaiting a connect ack. `add_event_listener`
@@ -685,6 +701,7 @@ async fn spawn_cache_worker(
 			read_task_sender,
 			next_registration_id: AtomicU64::new(0),
 			listener_handle: std::sync::Mutex::new(Some(listener_handle)),
+			reach,
 		})),
 		Err(e) => {
 			// Listener registration failed — dropping the just-spawned worker's senders
@@ -843,6 +860,7 @@ impl SyncRootHandle {
 				read_task_sender,
 				next_registration_id: AtomicU64::new(0),
 				listener_handle: std::sync::Mutex::new(None),
+				reach: Arc::default(),
 			}),
 		}
 	}
@@ -866,6 +884,7 @@ mod tests {
 				read_task_sender,
 				next_registration_id: AtomicU64::new(0),
 				listener_handle: std::sync::Mutex::new(None),
+				reach: Arc::default(),
 			})
 		}
 	}

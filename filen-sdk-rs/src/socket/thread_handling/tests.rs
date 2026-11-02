@@ -554,7 +554,8 @@ mod pipeline {
 		);
 
 		let (_request_sender, mut request_receiver) = tokio::sync::mpsc::channel(16);
-		let mut listeners = DisconnectedListenerManager::new().into_connected();
+		let mut listeners = DisconnectedListenerManager::new()
+			.into_connected(&std::sync::atomic::AtomicU64::new(0));
 
 		let should_retry = tokio::time::timeout(
 			Duration::from_secs(3600),
@@ -597,7 +598,8 @@ mod pipeline {
 		);
 
 		let (_request_sender, mut request_receiver) = tokio::sync::mpsc::channel(16);
-		let mut listeners = DisconnectedListenerManager::new().into_connected();
+		let mut listeners = DisconnectedListenerManager::new()
+			.into_connected(&std::sync::atomic::AtomicU64::new(0));
 
 		let should_retry = tokio::time::timeout(
 			Duration::from_secs(3600),

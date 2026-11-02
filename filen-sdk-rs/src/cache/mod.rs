@@ -50,6 +50,8 @@ pub(crate) use handle::CacheSlot;
 	not(all(target_family = "wasm", target_os = "unknown"))
 ))]
 pub(crate) use sql::UndecodableItem;
+#[cfg(test)]
+pub(crate) use state::ResyncReach;
 pub(crate) use state::{CacheControlMessage, CacheState};
 pub use {
 	error::CacheError,

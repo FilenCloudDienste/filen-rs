@@ -3,7 +3,7 @@ use std::{
 	fmt::Debug,
 	io,
 	num::NonZeroU32,
-	sync::{Arc, RwLock},
+	sync::{Arc, RwLock, atomic::AtomicU64},
 	time::Duration,
 };
 
@@ -661,6 +661,18 @@ pub(crate) struct SharedClientState {
 	/// The servers this client heard back from (see [`ServerAnswers`]), shared by every client
 	/// cloned from it.
 	answers: Arc<ServerAnswers>,
+	/// How many times this client's socket has connected, shared by every client cloned from it:
+	/// counted before any listener hears of the connection (see
+	/// `ConnectedListenerManager::into_connected`).
+	#[cfg_attr(
+		all(
+			target_family = "wasm",
+			target_os = "unknown",
+			not(feature = "wasm-full")
+		),
+		allow(dead_code)
+	)]
+	socket_connections: Arc<AtomicU64>,
 }
 
 impl SharedClientState {
@@ -746,7 +758,21 @@ impl SharedClientState {
 			archives,
 			batch_window: config.batch_window.min(MAX_BATCH_WINDOW),
 			answers: Arc::default(),
+			socket_connections: Arc::default(),
 		})
+	}
+
+	/// How many times this client's socket has connected so far.
+	#[cfg_attr(
+		all(
+			target_family = "wasm",
+			target_os = "unknown",
+			not(feature = "wasm-full")
+		),
+		allow(dead_code)
+	)]
+	pub(crate) fn socket_connections(&self) -> &Arc<AtomicU64> {
+		&self.socket_connections
 	}
 
 	/// The servers this client heard back from: read only by the sync engine.

@@ -2,6 +2,7 @@ use std::{
 	borrow::Cow,
 	collections::HashMap,
 	hash::{BuildHasherDefault, Hasher},
+	sync::atomic::{AtomicU64, Ordering},
 };
 
 use filen_types::api::v3::socket::SocketEvent;
@@ -206,7 +207,10 @@ impl DisconnectedListenerManager {
 		}
 	}
 
-	pub(crate) fn into_connected(mut self) -> ConnectedListenerManager {
+	/// Promote on a new connection, counting it in `connections` before any listener hears of it:
+	/// a listener woken by the `AuthSuccess` broadcast here, and whatever it wakes in turn, reads
+	/// the count with this connection in it, whatever order the listeners run in.
+	pub(crate) fn into_connected(mut self, connections: &AtomicU64) -> ConnectedListenerManager {
 		let mut ids_to_remove = Vec::new();
 
 		// we drain here so we can call ListenerManagerExtInner::remove_listener
@@ -242,6 +246,7 @@ impl DisconnectedListenerManager {
 			last_id,
 		};
 
+		connections.fetch_add(1, Ordering::SeqCst);
 		new.broadcast_event(&DecryptedSocketEvent::AuthSuccess);
 		new
 	}
@@ -423,6 +428,66 @@ mod tests {
 
 	use super::*;
 
+	/// A connection is counted before any listener hears of it: a listener woken by its
+	/// `AuthSuccess`, as a sync watch is, already reads the cache's transport failure from before
+	/// it as outdated, whether it was registered before the cache's own listener or after it.
+	#[cfg(feature = "cache")]
+	#[test]
+	fn a_connection_outdates_the_caches_failure_before_any_listener_hears_of_it() {
+		use std::sync::{Arc, atomic::AtomicBool};
+
+		use crate::cache::ResyncReach;
+
+		let connections = Arc::new(AtomicU64::new(0));
+		let reach = Arc::new(ResyncReach::new(Arc::clone(&connections)));
+		reach.failed(
+			reach.mark(),
+			Error::custom(
+				crate::ErrorKind::Reqwest,
+				"v3/user/lock: error sending request",
+			),
+		);
+		let mut manager = DisconnectedListenerManager::new();
+		let mut heard = Vec::new();
+		for event_types in [
+			Some(vec![Cow::Borrowed(
+				DecryptedSocketEvent::AuthSuccess.event_type(),
+			)]),
+			None,
+		] {
+			let saw_cleared = Arc::new(AtomicBool::new(false));
+			let (reach, seen) = (Arc::clone(&reach), Arc::clone(&saw_cleared));
+			let (id_sender, id_receiver) = tokio::sync::oneshot::channel();
+			let (_canceller, cancel_receiver) = tokio::sync::oneshot::channel();
+			ListenerManagerExt::add_listener(
+				&mut manager,
+				Box::new(move |event: &DecryptedSocketEvent<'_>| {
+					if matches!(event, DecryptedSocketEvent::AuthSuccess) {
+						seen.store(reach.unreachable().is_none(), Ordering::SeqCst);
+					}
+				}),
+				cancel_receiver,
+				id_sender,
+				event_types.map(Vec::into_iter),
+			);
+			std::mem::forget(id_receiver);
+			heard.push(saw_cleared);
+		}
+		assert!(
+			reach.unreachable().is_some(),
+			"the failure stands until the connection"
+		);
+
+		let _connected = manager.into_connected(&connections);
+
+		for (listener, saw_cleared) in heard.iter().enumerate() {
+			assert!(
+				saw_cleared.load(Ordering::SeqCst),
+				"listener {listener} read the failure as outdated"
+			);
+		}
+	}
+
 	fn manager_filtered_on(event_type: &'static str) -> ConnectedListenerManager {
 		let mut manager = DisconnectedListenerManager::new();
 		let (id_sender, id_receiver) = tokio::sync::oneshot::channel();
@@ -437,7 +502,7 @@ mod tests {
 		// keep the registration alive through promotion: a dropped id receiver
 		// makes into_connected discard the listener
 		std::mem::forget(id_receiver);
-		manager.into_connected()
+		manager.into_connected(&AtomicU64::new(0))
 	}
 
 	// Renames are folded into *MetadataChanged during decryption, so the
