@@ -232,7 +232,7 @@ jobs:
 
       # generate markdown docs
       - name: Generate markdown docs
-        run: cargo run -- --export-markdown-docs exit
+        run: cargo run -- --export-markdown-docs
         working-directory: ./filen-cli
         env:
           # This job doesn't install Wild, so undo .cargo/config.toml's clang+Wild for the

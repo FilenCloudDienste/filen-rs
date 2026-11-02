@@ -288,7 +288,7 @@ async fn inner_main(ui: &mut ui::UI, arenas_limited: bool) -> Result<()> {
 
 	// --export-markdown-docs
 	if cli_args.export_markdown_docs {
-		generate_markdown_docs()?;
+		return generate_markdown_docs();
 	}
 
 	// --help

@@ -88,3 +88,28 @@ fn an_unknown_command_is_a_usage_error() {
 	assert_eq!(output.status.code(), Some(2));
 	assert_eq!(String::from_utf8(output.stdout).unwrap(), "");
 }
+
+#[test]
+fn exporting_the_markdown_docs_exits_after_writing_them() {
+	let config_dir = TempDir::new().unwrap();
+	let working_dir = TempDir::new().unwrap();
+	let output = Command::new(assert_cmd::cargo::cargo_bin!())
+		.current_dir(working_dir.path())
+		.arg("--config-dir")
+		.arg(config_dir.path())
+		.args(["--skip-update", "--export-markdown-docs"])
+		.stdin(Stdio::null())
+		.output()
+		.unwrap();
+
+	let stderr = String::from_utf8(output.stderr).unwrap();
+	assert_eq!(output.status.code(), Some(0), "{stderr}");
+	// no banner and no login prompt: the REPL did not start
+	assert_eq!(String::from_utf8(output.stdout).unwrap(), "");
+	assert!(
+		working_dir
+			.path()
+			.join("filen-cli-markdown-docs/01-usage.md")
+			.is_file()
+	);
+}
