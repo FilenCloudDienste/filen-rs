@@ -1,6 +1,13 @@
 //! What a daemon leaves behind for the next one: its pidfile, and the recovery from a daemon whose
 //! host crashed (its rclone may still run, its mounts may be stale) or from the old desktop
 //! client's rclone.
+//!
+//! Several daemons may share a state directory. Each keeps its pidfile and rc credentials in an
+//! instance directory of its own under `instances/`, whose lock file its host holds for as long as
+//! the daemon runs; the system releases the lock when the host dies, however it dies. Recovery
+//! takes an instance's lock before it touches it, so it recovers only instances whose host is
+//! gone. A start lock on the state directory keeps a recovery from taking an instance a starting
+//! daemon has created and not locked yet.
 
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt as _;
@@ -19,7 +26,7 @@ use crate::{
 	error::ResultExt as _,
 	rclone::{
 		RcloneRefusal,
-		lock::{FileLock, try_lock},
+		lock::{FileLock, lock, try_lock},
 		private_file::write_private_file,
 		system::{ProcessIdentity, identify, processes_under, stop_processes},
 	},
@@ -38,6 +45,13 @@ pub(crate) const HTPASSWD_FILE: &str = "rc.htpasswd";
 /// The file in a cache directory whose lock the daemon using it holds: two rclones on one VFS cache
 /// corrupt it.
 const CACHE_LOCK: &str = "daemon.lock";
+/// The directory in a state directory that holds one directory per daemon.
+const INSTANCES_DIR: &str = "instances";
+/// The file in an instance directory whose lock the daemon's host holds while the daemon runs.
+const INSTANCE_LOCK: &str = "instance.lock";
+/// The file in a state directory whose lock is held while the directory is recovered or a daemon
+/// creates its instance directory in it.
+const START_LOCK: &str = "start.lock";
 /// How long a stale rclone has to quit before it is killed.
 const STALE_GRACE: Duration = Duration::from_secs(5);
 /// How long a mount point may take to answer `stat` before it is taken for a stale mount: a
@@ -109,21 +123,103 @@ pub struct StaleRecovery {
 	pub unmounted: Vec<String>,
 }
 
+/// A daemon's own directory in a state directory, with its lock held: by the daemon's host while
+/// the daemon runs, or by the recovery cleaning up after a host that is gone.
+pub(crate) struct Instance {
+	dir: PathBuf,
+	lock: FileLock,
+}
+
+impl Instance {
+	/// The directory, where the daemon keeps its pidfile and rc credentials.
+	pub(crate) fn dir(&self) -> &Path {
+		&self.dir
+	}
+
+	/// Releases the lock and deletes the directory.
+	pub(crate) fn remove(self) {
+		let Self { dir, lock } = self;
+		// Released first: Windows does not delete a directory holding an open file.
+		drop(lock);
+		match std::fs::remove_dir_all(&dir) {
+			Ok(()) => {}
+			Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+			Err(e) => warn!("removing {} failed: {e}", dir.display()),
+		}
+	}
+}
+
 /// Recovers from a daemon on `state_dir` whose host ended without stopping it.
 ///
-/// When its pidfile names a process that is still the rclone it started (same pid, start time
-/// and executable), that rclone is asked to terminate and killed after 5 s. A process that only
+/// For every daemon on `state_dir` whose host is gone, and none whose host still runs: when its
+/// pidfile names a process that is still the rclone it started (same pid, start time and
+/// executable), that rclone is asked to terminate and killed after 5 s. A process that only
 /// reuses the pid is left alone. The mounts it recorded are then force-unmounted where they are
-/// still mounted, and the pidfile and rc credentials file are removed. [`RcloneDaemon::start`]
+/// still mounted, and its pidfile and rc credentials file are removed. [`RcloneDaemon::start`]
 /// runs this first; a host may also run it on its own at startup.
 ///
 /// [`RcloneDaemon::start`]: crate::rclone::RcloneDaemon::start
 pub async fn recover_stale(state_dir: &Path) -> Result<StaleRecovery, Error> {
+	match tokio::fs::metadata(state_dir).await {
+		Ok(_) => {}
+		// No daemon ever ran on it.
+		Err(e) if e.kind() == io::ErrorKind::NotFound => {
+			return Ok(StaleRecovery {
+				stopped: false,
+				unmounted: Vec::new(),
+			});
+		}
+		Err(e) => {
+			return Err(
+				Error::from(e).with_context(format!("failed to read {}", state_dir.display()))
+			);
+		}
+	}
+	let _start = lock(state_dir.join(START_LOCK)).await?;
+	recover_dead_instances(state_dir).await
+}
+
+/// Recovers `state_dir`, an existing directory, as [`recover_stale`] does, then creates and locks
+/// the instance directory of a daemon starting on it, under one start lock.
+pub(crate) async fn recover_and_create_instance(
+	state_dir: &Path,
+) -> Result<(StaleRecovery, Instance), Error> {
+	let _start = lock(state_dir.join(START_LOCK)).await?;
+	let recovery = recover_dead_instances(state_dir).await?;
+	let instance = create_instance(state_dir)?;
+	Ok((recovery, instance))
+}
+
+/// Recovers every instance in `state_dir` whose lock is free, and what a daemon from before
+/// instance directories left in `state_dir` itself. The caller holds the start lock.
+async fn recover_dead_instances(state_dir: &Path) -> Result<StaleRecovery, Error> {
 	let mut recovery = StaleRecovery {
 		stopped: false,
 		unmounted: Vec::new(),
 	};
-	if let Some(record) = PidRecord::read(state_dir)? {
+	recover_dir(state_dir, &mut recovery).await?;
+	for dir in instance_dirs(state_dir)? {
+		let lock_path = dir.join(INSTANCE_LOCK);
+		let lock = match try_lock(&lock_path) {
+			Ok(Some(lock)) => lock,
+			// Its host runs.
+			Ok(None) => continue,
+			Err(e) => {
+				warn!("leaving {} alone, as locking it failed: {e}", dir.display());
+				continue;
+			}
+		};
+		let instance = Instance { dir, lock };
+		recover_dir(instance.dir(), &mut recovery).await?;
+		instance.remove();
+	}
+	Ok(recovery)
+}
+
+/// Stops the rclone the pidfile in `dir` names, force-unmounts its mounts, and removes the
+/// pidfile and rc credentials file, adding what it did to `recovery`.
+async fn recover_dir(dir: &Path, recovery: &mut StaleRecovery) -> Result<(), Error> {
+	if let Some(record) = PidRecord::read(dir)? {
 		if let Some(process) = identify(record.pid).await?
 			&& is_recorded_rclone(&process, &record)
 		{
@@ -131,7 +227,7 @@ pub async fn recover_stale(state_dir: &Path) -> Result<StaleRecovery, Error> {
 				"stopping the rclone (pid {}) a previous host left running",
 				record.pid
 			);
-			recovery.stopped = stop_processes(&[process], STALE_GRACE).await? > 0;
+			recovery.stopped |= stop_processes(&[process], STALE_GRACE).await? > 0;
 		}
 		for mount in record.mounts {
 			match force_unmount(Path::new(&mount)).await {
@@ -142,9 +238,58 @@ pub async fn recover_stale(state_dir: &Path) -> Result<StaleRecovery, Error> {
 		}
 	}
 	for file in [PIDFILE, HTPASSWD_FILE] {
-		remove_if_present(&state_dir.join(file))?;
+		remove_if_present(&dir.join(file))?;
 	}
-	Ok(recovery)
+	Ok(())
+}
+
+/// Creates a new instance directory in `state_dir`, and locks it. The caller holds the start lock.
+fn create_instance(state_dir: &Path) -> Result<Instance, Error> {
+	let instances = state_dir.join(INSTANCES_DIR);
+	std::fs::create_dir_all(&instances)
+		.context(format!("failed to create {}", instances.display()))?;
+	// 64 random bits: a name taken already fails the start rather than being shared.
+	let dir = instances.join(hex::encode(rand::random::<[u8; 8]>()));
+	std::fs::create_dir(&dir).context(format!("failed to create {}", dir.display()))?;
+	let lock_path = dir.join(INSTANCE_LOCK);
+	let lock = try_lock(&lock_path)
+		.context(format!("failed to lock {}", lock_path.display()))?
+		.ok_or_else(|| {
+			Error::custom(
+				ErrorKind::Internal,
+				format!(
+					"{} was locked as it was created (should be impossible)",
+					dir.display()
+				),
+			)
+		})?;
+	Ok(Instance { dir, lock })
+}
+
+/// Every instance directory in `state_dir`, live or not.
+fn instance_dirs(state_dir: &Path) -> Result<Vec<PathBuf>, Error> {
+	let instances = state_dir.join(INSTANCES_DIR);
+	let entries = match std::fs::read_dir(&instances) {
+		Ok(entries) => entries,
+		Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+		Err(e) => {
+			return Err(
+				Error::from(e).with_context(format!("failed to list {}", instances.display()))
+			);
+		}
+	};
+	let mut dirs = Vec::new();
+	for entry in entries {
+		let entry = entry.context(format!("failed to list {}", instances.display()))?;
+		if entry
+			.file_type()
+			.context(format!("failed to read {}", entry.path().display()))?
+			.is_dir()
+		{
+			dirs.push(entry.path());
+		}
+	}
+	Ok(dirs)
 }
 
 fn is_recorded_rclone(process: &ProcessIdentity, record: &PidRecord) -> bool {
@@ -187,16 +332,18 @@ pub async fn stop_rclone_under(dir: &Path, grace_ms: u32) -> Result<u32, Error> 
 /// Deletes the VFS caches in a daemon's `cache_dir` (its `vfs` and `vfsMeta` directories), keeping
 /// the rest, such as the sftp serve's host keys.
 ///
-/// Refused with [`RcloneRefusal::CacheInUse`] while a daemon uses the cache or the rclone
-/// `state_dir`'s pidfile names still runs, and with [`RcloneRefusal::UploadsPending`] while the
+/// Refused with [`RcloneRefusal::CacheInUse`] while a daemon uses the cache or an rclone a pidfile
+/// in `state_dir` names still runs, and with [`RcloneRefusal::UploadsPending`] while the
 /// cache holds files not uploaded yet (rclone marks them dirty in their metadata), which the next
 /// daemon on it uploads.
 pub async fn clear_cache(state_dir: &Path, cache_dir: &Path) -> Result<(), Error> {
-	if let Some(record) = PidRecord::read(state_dir)?
-		&& let Some(process) = identify(record.pid).await?
-		&& is_recorded_rclone(&process, &record)
-	{
-		return Err(RcloneRefusal::CacheInUse.into());
+	for dir in std::iter::once(state_dir.to_path_buf()).chain(instance_dirs(state_dir)?) {
+		if let Some(record) = PidRecord::read(&dir)?
+			&& let Some(process) = identify(record.pid).await?
+			&& is_recorded_rclone(&process, &record)
+		{
+			return Err(RcloneRefusal::CacheInUse.into());
+		}
 	}
 	// Held while the caches are deleted, so no daemon starts on them meanwhile.
 	let lock_path = cache_dir.join(CACHE_LOCK);
@@ -411,7 +558,8 @@ fn remove_if_present(path: &Path) -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
 	use super::{
-		HTPASSWD_FILE, PIDFILE, PidRecord, StaleRecovery, clear_cache, lock_cache, recover_stale,
+		HTPASSWD_FILE, PIDFILE, PidRecord, StaleRecovery, clear_cache, create_instance, lock_cache,
+		recover_and_create_instance, recover_stale,
 	};
 	use crate::rclone::{RcloneRefusal, system::identify};
 
@@ -510,6 +658,49 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn clear_cache_refuses_a_cache_while_an_instance_s_rclone_runs() {
+		let state = tempfile::tempdir().unwrap();
+		let cache = cache_with_item(false);
+		let instance = create_instance(state.path()).unwrap();
+		// This test process stands in for the rclone the instance's pidfile names.
+		let running = identify(std::process::id()).await.unwrap().unwrap();
+		PidRecord {
+			pid: running.pid,
+			started_at: running.started_at,
+			binary: running.exe.unwrap(),
+			mounts: Vec::new(),
+		}
+		.write(&instance.dir().join(PIDFILE))
+		.unwrap();
+
+		let error = clear_cache(state.path(), cache.path()).await.unwrap_err();
+
+		assert_eq!(
+			error.downcast_ref::<RcloneRefusal>(),
+			Some(&RcloneRefusal::CacheInUse)
+		);
+		assert!(cache.path().join("vfs").exists());
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn daemons_starting_at_once_get_instances_of_their_own() {
+		let state = tempfile::tempdir().unwrap();
+
+		let (first, second) = tokio::join!(
+			recover_and_create_instance(state.path()),
+			recover_and_create_instance(state.path())
+		);
+		let (first_recovery, first) = first.unwrap();
+		let (second_recovery, second) = second.unwrap();
+
+		assert_eq!(first_recovery, nothing_done());
+		assert_eq!(second_recovery, nothing_done());
+		assert_ne!(first.dir(), second.dir());
+		assert!(first.dir().is_dir());
+		assert!(second.dir().is_dir());
+	}
+
+	#[tokio::test]
 	async fn clear_cache_refuses_a_cache_a_daemon_holds() {
 		let state = tempfile::tempdir().unwrap();
 		let cache = cache_with_item(false);
@@ -572,6 +763,17 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn a_missing_state_directory_has_nothing_to_recover() {
+		let dir = tempfile::tempdir().unwrap();
+		let state = dir.path().join("missing");
+
+		let recovery = recover_stale(&state).await.unwrap();
+
+		assert_eq!(recovery, nothing_done());
+		assert!(!state.exists());
+	}
+
+	#[tokio::test]
 	async fn without_a_pidfile_nothing_is_recovered() {
 		let dir = tempfile::tempdir().unwrap();
 		std::fs::write(dir.path().join(HTPASSWD_FILE), "filen:{SHA}x\n").unwrap();
@@ -597,7 +799,10 @@ mod tests {
 
 		use super::{super::stop_rclone_under, nothing_done};
 		use crate::rclone::{
-			recovery::{PIDFILE, PidRecord, StaleRecovery, recover_stale},
+			recovery::{
+				PIDFILE, PidRecord, StaleRecovery, create_instance, recover_and_create_instance,
+				recover_stale,
+			},
 			system::identify,
 		};
 
@@ -674,6 +879,96 @@ mod tests {
 
 			assert_eq!(recovery, nothing_done());
 			assert!(!dir.path().join(PIDFILE).exists());
+		}
+
+		#[tokio::test(flavor = "multi_thread")]
+		async fn a_live_instance_is_left_alone() {
+			let state = tempfile::tempdir().unwrap();
+			let mut rclone = sleeper();
+			let live = create_instance(state.path()).unwrap();
+			record_of(&rclone)
+				.await
+				.write(&live.dir().join(PIDFILE))
+				.unwrap();
+
+			let recovery = recover_stale(state.path()).await.unwrap();
+
+			assert_eq!(recovery, nothing_done());
+			assert!(!exits_within(&mut rclone, Duration::from_millis(500)).await);
+			assert!(live.dir().join(PIDFILE).exists());
+		}
+
+		#[tokio::test(flavor = "multi_thread")]
+		async fn an_instance_whose_host_is_gone_is_recovered_and_removed() {
+			let state = tempfile::tempdir().unwrap();
+			let mut rclone = sleeper();
+			let dead = create_instance(state.path()).unwrap();
+			let dir = dead.dir().to_path_buf();
+			record_of(&rclone).await.write(&dir.join(PIDFILE)).unwrap();
+			// What the system does when the host dies.
+			drop(dead);
+
+			let recovery = recover_stale(state.path()).await.unwrap();
+
+			assert_eq!(
+				recovery,
+				StaleRecovery {
+					stopped: true,
+					unmounted: Vec::new()
+				}
+			);
+			assert!(exits_within(&mut rclone, Duration::from_secs(5)).await);
+			assert!(!dir.exists());
+		}
+
+		#[tokio::test(flavor = "multi_thread")]
+		async fn a_daemon_from_before_instances_is_recovered_with_dead_instances() {
+			let state = tempfile::tempdir().unwrap();
+			let mut legacy = sleeper();
+			record_of(&legacy)
+				.await
+				.write(&state.path().join(PIDFILE))
+				.unwrap();
+			let mut instanced = sleeper();
+			let dead = create_instance(state.path()).unwrap();
+			let dir = dead.dir().to_path_buf();
+			record_of(&instanced)
+				.await
+				.write(&dir.join(PIDFILE))
+				.unwrap();
+			// What the system does when the host dies.
+			drop(dead);
+
+			let recovery = recover_stale(state.path()).await.unwrap();
+
+			assert_eq!(
+				recovery,
+				StaleRecovery {
+					stopped: true,
+					unmounted: Vec::new()
+				}
+			);
+			assert!(exits_within(&mut legacy, Duration::from_secs(5)).await);
+			assert!(exits_within(&mut instanced, Duration::from_secs(5)).await);
+			assert!(!state.path().join(PIDFILE).exists());
+			assert!(!dir.exists());
+		}
+
+		#[tokio::test(flavor = "multi_thread")]
+		async fn a_starting_daemon_gets_an_instance_of_its_own() {
+			let state = tempfile::tempdir().unwrap();
+			let mut rclone = sleeper();
+			let running = create_instance(state.path()).unwrap();
+			record_of(&rclone)
+				.await
+				.write(&running.dir().join(PIDFILE))
+				.unwrap();
+
+			let (recovery, starting) = recover_and_create_instance(state.path()).await.unwrap();
+
+			assert_eq!(recovery, nothing_done());
+			assert_ne!(starting.dir(), running.dir());
+			assert!(!exits_within(&mut rclone, Duration::from_millis(500)).await);
 		}
 
 		#[tokio::test]

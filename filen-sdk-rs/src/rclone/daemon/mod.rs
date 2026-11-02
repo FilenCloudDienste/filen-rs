@@ -56,7 +56,10 @@ use crate::{
 		lock::FileLock,
 		private_file::write_private_file,
 		rc::{CoreStatsTransfer, RcClient},
-		recovery::{HTPASSWD_FILE, PIDFILE, PidRecord, force_unmount, lock_cache, recover_stale},
+		recovery::{
+			HTPASSWD_FILE, Instance, PIDFILE, PidRecord, force_unmount, lock_cache,
+			recover_and_create_instance,
+		},
 		serve::ServeInfo,
 		system::{identify, spawn_rclone},
 		vfs::VfsTuning,
@@ -121,8 +124,9 @@ const TRANSFER_ARGS: [&str; 19] = [
 pub struct RcloneDaemonConfig {
 	/// The rclone binary to run.
 	pub binary: RcloneBinary,
-	/// A directory only the daemon uses, for its own state: the rc credentials while it starts.
-	/// Created (0700 on Unix) if it is missing.
+	/// A directory for the daemon's own state: the rc credentials while it starts, and the pidfile
+	/// a later daemon recovers from when its host crashes. Several daemons may share it, each in a
+	/// directory of its own under it. Created (0700 on Unix) if it is missing.
 	pub state_dir: PathBuf,
 	/// rclone's cache directory (`--cache-dir`). Its VFS cache holds what was written to a mount
 	/// or a serve and is not uploaded yet, which the next daemon on the same directory uploads.
@@ -239,6 +243,9 @@ pub struct RcloneDaemon {
 	vfs_meta_root: PathBuf,
 	/// The cache directory's lock, held until rclone is stopped.
 	cache_lock: Mutex<Option<FileLock>>,
+	/// The daemon's directory in the state directory, held until rclone is stopped and deleted
+	/// then.
+	instance: Mutex<Option<Instance>>,
 	/// How long a written file waits before it is uploaded, when a test changes it for its mounts.
 	#[cfg(feature = "test-seams")]
 	pub(super) write_back_for_test: Option<Duration>,
@@ -334,17 +341,42 @@ impl RcloneDaemon {
 		// Taken before anything is recovered, so a daemon refused the cache leaves the one using it
 		// alone.
 		let cache_lock = lock_cache(&config.cache_dir)?;
-		let recovered = recover_stale(&config.state_dir).await?;
+		let (recovered, instance) = recover_and_create_instance(&config.state_dir).await?;
 		if recovered.stopped || !recovered.unmounted.is_empty() {
 			info!("recovered from a crashed rclone daemon: {recovered:?}");
 		}
+		// From here on the daemon's state lives in its instance directory.
+		let config = RcloneDaemonConfig {
+			state_dir: instance.dir().to_path_buf(),
+			..config
+		};
+		match Self::spawn_configured(&binary, &config, backend).await {
+			Ok(daemon) => {
+				*daemon
+					.cache_lock
+					.lock()
+					.unwrap_or_else(PoisonError::into_inner) = Some(cache_lock);
+				*daemon
+					.instance
+					.lock()
+					.unwrap_or_else(PoisonError::into_inner) = Some(instance);
+				Ok(daemon)
+			}
+			Err(e) => {
+				instance.remove();
+				Err(e)
+			}
+		}
+	}
 
+	/// Starts rclone with its state in `config.state_dir`, creates both remotes and guards it.
+	async fn spawn_configured(
+		binary: &Path,
+		config: &RcloneDaemonConfig,
+		backend: &RemoteBackend,
+	) -> Result<Self, Error> {
 		let password = hex::encode(rand::random::<[u8; 32]>());
-		let (daemon, version) = Self::spawn_until_ready(&binary, &config, &password).await?;
-		*daemon
-			.cache_lock
-			.lock()
-			.unwrap_or_else(PoisonError::into_inner) = Some(cache_lock);
+		let (daemon, version) = Self::spawn_until_ready(binary, config, &password).await?;
 		check_version(version)?;
 		for name in [FILEN_REMOTE, FILEN_READ_ONLY_REMOTE] {
 			daemon
@@ -353,7 +385,7 @@ impl RcloneDaemon {
 				.await
 				.context(format!("failed to create rclone's {name} remote"))?;
 		}
-		daemon.guard(&binary).await?;
+		daemon.guard(binary).await?;
 		Ok(daemon)
 	}
 
@@ -469,6 +501,7 @@ impl RcloneDaemon {
 				.unwrap_or_else(|_| config.cache_dir.clone())
 				.join("vfsMeta"),
 			cache_lock: Mutex::new(None),
+			instance: Mutex::new(None),
 			#[cfg(feature = "test-seams")]
 			write_back_for_test: None,
 		})
@@ -709,13 +742,21 @@ impl RcloneDaemon {
 		{
 			warn!("removing {} failed: {e}", self.pidfile.display());
 		}
-		// No rclone uses the cache any more.
+		// No rclone uses the cache or the instance directory any more.
 		drop(
 			self.cache_lock
 				.lock()
 				.unwrap_or_else(PoisonError::into_inner)
 				.take(),
 		);
+		let instance = self
+			.instance
+			.lock()
+			.unwrap_or_else(PoisonError::into_inner)
+			.take();
+		if let Some(instance) = instance {
+			instance.remove();
+		}
 		Ok(StopReport {
 			pending_uploads: pending,
 			forced,
@@ -773,6 +814,13 @@ impl RcloneDaemon {
 	pub fn abandon_for_test(self) {
 		drop(
 			self.cache_lock
+				.lock()
+				.unwrap_or_else(PoisonError::into_inner)
+				.take(),
+		);
+		// Dropping the instance releases its lock and keeps its directory.
+		drop(
+			self.instance
 				.lock()
 				.unwrap_or_else(PoisonError::into_inner)
 				.take(),

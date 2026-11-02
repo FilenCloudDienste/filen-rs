@@ -10,10 +10,12 @@ use std::os::unix::fs::OpenOptionsExt as _;
 use std::{
 	fs::{File, OpenOptions, TryLockError},
 	io,
-	path::Path,
+	path::{Path, PathBuf},
 };
 
 use tracing::warn;
+
+use crate::{Error, ErrorKind};
 
 /// A held lock on a file, released when dropped.
 #[derive(Debug)]
@@ -41,6 +43,24 @@ pub(crate) fn try_lock(path: &Path) -> io::Result<Option<FileLock>> {
 	}
 }
 
+/// Takes the lock on the file at `path`, created (0600 on Unix) if it is missing, waiting for the
+/// holder to release it. The wait runs on a blocking thread.
+pub(crate) async fn lock(path: PathBuf) -> Result<FileLock, Error> {
+	tokio::task::spawn_blocking(move || {
+		let file = open(&path).and_then(|file| file.lock().map(|()| file));
+		match file {
+			Ok(file) => Ok(FileLock { file }),
+			Err(e) => {
+				Err(Error::from(e).with_context(format!("failed to lock {}", path.display())))
+			}
+		}
+	})
+	.await
+	.map_err(|e| {
+		Error::custom_with_source(ErrorKind::Internal, e, Some("the file locking task failed"))
+	})?
+}
+
 fn open(path: &Path) -> io::Result<File> {
 	let mut options = OpenOptions::new();
 	// The file only carries the lock: it is never written, and an existing one is kept as it is.
@@ -52,7 +72,7 @@ fn open(path: &Path) -> io::Result<File> {
 
 #[cfg(test)]
 mod tests {
-	use super::try_lock;
+	use super::{lock, try_lock};
 
 	#[test]
 	fn a_held_lock_is_refused_until_it_is_dropped() {
@@ -88,5 +108,19 @@ mod tests {
 		let error = try_lock(&dir.path().join("missing/lock")).unwrap_err();
 
 		assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+	}
+
+	#[tokio::test]
+	async fn waiting_for_a_lock_takes_it_once_released() {
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().join("lock");
+		let held = try_lock(&path).unwrap().unwrap();
+
+		let waiting = tokio::spawn(lock(path.clone()));
+		drop(held);
+		let taken = waiting.await.unwrap().unwrap();
+
+		assert!(try_lock(&path).unwrap().is_none());
+		drop(taken);
 	}
 }

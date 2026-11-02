@@ -102,6 +102,22 @@ impl Dirs {
 		self.root.path().join("state")
 	}
 
+	/// The daemons' instance directories in the state directory.
+	fn instances(&self) -> Vec<PathBuf> {
+		match std::fs::read_dir(self.state().join("instances")) {
+			Ok(entries) => entries.map(|entry| entry.unwrap().path()).collect(),
+			Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+			Err(e) => panic!("listing the instances failed: {e}"),
+		}
+	}
+
+	/// The one daemon's instance directory.
+	fn instance(&self) -> PathBuf {
+		let instances = self.instances();
+		assert_eq!(instances.len(), 1, "{instances:?}");
+		instances.into_iter().next().unwrap()
+	}
+
 	fn config(&self) -> RcloneDaemonConfig {
 		RcloneDaemonConfig {
 			binary: binary(),
@@ -180,11 +196,13 @@ async fn daemon_starts_and_stops_gracefully() {
 async fn the_rc_credentials_file_is_gone_once_stopped() {
 	let dirs = Dirs::new();
 	let daemon = dirs.start().await;
-	assert!(dirs.state().join("rc.htpasswd").exists());
+	let htpasswd = dirs.instance().join("rc.htpasswd");
+	assert!(htpasswd.exists());
 
 	daemon.stop(GRACEFUL).await.unwrap();
 
-	assert!(!dirs.state().join("rc.htpasswd").exists());
+	assert!(!htpasswd.exists());
+	assert_eq!(dirs.instances(), Vec::<PathBuf>::new());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -282,7 +300,7 @@ async fn a_missing_bundled_binary_starts_nothing() {
 async fn the_pidfile_names_rclone_until_it_is_stopped() {
 	let dirs = Dirs::new();
 	let daemon = dirs.start().await;
-	let pidfile = dirs.state().join("rcd.json");
+	let pidfile = dirs.instance().join("rcd.json");
 
 	let record: serde_json::Value =
 		serde_json::from_slice(&std::fs::read(&pidfile).unwrap()).unwrap();
@@ -304,6 +322,53 @@ async fn a_new_daemon_stops_the_rclone_a_crashed_host_left() {
 
 	assert!(!process_is_running(stale_pid));
 	assert_ne!(daemon.pid(), stale_pid);
+	// The crashed host's instance directory is gone, the new daemon's is left.
+	dirs.instance();
+	daemon.stop(GRACEFUL).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn daemons_on_one_state_directory_and_caches_of_their_own_run_side_by_side() {
+	let dirs = Dirs::new();
+	let first = dirs.start().await;
+	let config = RcloneDaemonConfig {
+		cache_dir: dirs.root.path().join("cache-2"),
+		..dirs.config()
+	};
+
+	let second = RcloneDaemon::start_local_for_test(config, &dirs.remote())
+		.await
+		.unwrap();
+
+	assert!(process_is_running(first.pid()));
+	// Its rc still takes its credentials, which the second did not overwrite.
+	first.stats().await.unwrap();
+	second.stats().await.unwrap();
+	assert_eq!(dirs.instances().len(), 2);
+	second.stop(GRACEFUL).await.unwrap();
+	assert!(process_is_running(first.pid()));
+	first.stats().await.unwrap();
+	first.stop(GRACEFUL).await.unwrap();
+	assert_eq!(dirs.instances(), Vec::<PathBuf>::new());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_daemon_on_another_cache_stops_the_rclone_a_crashed_host_left() {
+	let dirs = Dirs::new();
+	let crashed = dirs.start().await;
+	let stale_pid = crashed.pid();
+	crashed.abandon_for_test();
+	let config = RcloneDaemonConfig {
+		cache_dir: dirs.root.path().join("cache-2"),
+		..dirs.config()
+	};
+
+	let daemon = RcloneDaemon::start_local_for_test(config, &dirs.remote())
+		.await
+		.unwrap();
+
+	assert!(!process_is_running(stale_pid));
+	dirs.instance();
 	daemon.stop(GRACEFUL).await.unwrap();
 }
 
@@ -743,7 +808,7 @@ async fn a_stale_mount_is_force_unmounted_before_mounting() {
 		.unwrap();
 	drop(crashed);
 	// Without the pidfile no recovery runs at start, so the mount itself meets the stale mount.
-	std::fs::remove_file(dirs.state().join("rcd.json")).unwrap();
+	std::fs::remove_file(dirs.instance().join("rcd.json")).unwrap();
 	let daemon = dirs.start().await;
 
 	daemon.mount(read_write(&mount_point)).await.unwrap();
