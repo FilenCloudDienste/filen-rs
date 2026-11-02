@@ -44,7 +44,7 @@ pub(crate) async fn view_or_create_or_edit_public_link(
 	match file_or_directory {
 		NonRootFileType::File(file) => {
 			let existing_link = match client.get_file_link_status(&file).await {
-				Ok(link) => link.is_some(),
+				Ok(link) => link,
 				Err(e) => {
 					if e.kind() == ErrorKind::Server
 						&& let Some(code) = e.server_code()
@@ -58,12 +58,7 @@ pub(crate) async fn view_or_create_or_edit_public_link(
 					}
 				}
 			};
-			if existing_link {
-				let existing_link = client
-					.public_link_file(&file)
-					.await
-					.context("Failed to modify public link")?;
-
+			if let Some(existing_link) = existing_link {
 				print_file_public_link(ui, &file, &existing_link);
 				ui.print("");
 
