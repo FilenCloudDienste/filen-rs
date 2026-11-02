@@ -365,12 +365,17 @@ async fn inner_main(ui: &mut ui::UI, arenas_limited: bool) -> Result<()> {
 					exit: false,
 				} => continue,
 			};
-			let mut args = shlex::split(line.trim()).context("Invalid quoting")?;
-			args.insert(0, String::from("filen"));
-			let cli_args = match CliArgs::try_parse_from(args) {
-				Ok(cli) => cli,
-				Err(e) => {
-					ui.print_failure_or_error(&anyhow::anyhow!(e));
+			let cli_args = match parse_repl_line(&line) {
+				Ok(cli_args) => cli_args,
+				Err(ReplLineError::Quoting) => {
+					ui.print_failure("Invalid quoting");
+					continue;
+				}
+				Err(ReplLineError::Arguments(e)) => {
+					// as clap prints it when the CLI is invoked with the same arguments
+					if let Err(print_error) = e.print() {
+						warn!("Failed to print an argument error: {print_error}");
+					}
 					continue;
 				}
 			};
@@ -399,6 +404,22 @@ async fn inner_main(ui: &mut ui::UI, arenas_limited: bool) -> Result<()> {
 		}
 		Ok(())
 	}
+}
+
+/// Why a REPL line could not be parsed into a command.
+#[derive(Debug)]
+enum ReplLineError {
+	/// A quote is not closed.
+	Quoting,
+	/// The arguments are not a valid command line.
+	Arguments(clap::Error),
+}
+
+/// Parses a REPL line as the arguments the CLI would be invoked with.
+fn parse_repl_line(line: &str) -> Result<CliArgs, ReplLineError> {
+	let mut args = shlex::split(line.trim()).ok_or(ReplLineError::Quoting)?;
+	args.insert(0, String::from("filen"));
+	CliArgs::try_parse_from(args).map_err(ReplLineError::Arguments)
 }
 
 /// Completes a REPL input line as the REPL's tab completion does, waiting for remote paths to
@@ -475,4 +496,33 @@ pub fn deserialize_auth_config(
 		.from_stringified(sdk_config)
 		.context("Failed to create client from SDK config")?;
 	Ok(client)
+}
+
+#[cfg(test)]
+mod tests {
+	use clap::error::ErrorKind;
+
+	use super::*;
+
+	#[test]
+	fn a_repl_line_with_an_unclosed_quote_is_a_quoting_error() {
+		assert!(matches!(
+			parse_repl_line("ls 'my dir"),
+			Err(ReplLineError::Quoting)
+		));
+	}
+
+	#[test]
+	fn a_repl_line_with_an_unknown_command_is_an_argument_error() {
+		let Err(ReplLineError::Arguments(e)) = parse_repl_line("unknowncommand") else {
+			panic!("parsed an unknown command");
+		};
+		assert_eq!(e.kind(), ErrorKind::InvalidSubcommand);
+	}
+
+	#[test]
+	fn a_repl_line_with_a_quoted_argument_is_parsed() {
+		let cli_args = parse_repl_line("ls 'my dir'").unwrap();
+		assert!(format!("{:?}", cli_args.command).contains("\"my dir\""));
+	}
 }
