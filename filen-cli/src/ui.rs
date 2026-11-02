@@ -333,6 +333,17 @@ impl UI {
 		self.print_to_stderr(&format!("{} {}", style("⚠").yellow(), style(msg).yellow()));
 	}
 
+	/// Print a warning about what the CLI does besides the command, such as its update check, which
+	/// is logged, and printed as [`UI::print_warning`] prints one but not with `--quiet` or
+	/// `--json`, like an announcement.
+	pub(crate) fn print_side_warning(&mut self, msg: &str) {
+		warn!("{msg}");
+		if self.quiet || self.json {
+			return;
+		}
+		self.print_warning(msg);
+	}
+
 	/// Print a message with a failure icon
 	pub(crate) fn print_failure(&mut self, msg: &str) {
 		self.print_to_stderr(&format!("{} {}", style("✘").red(), msg));
@@ -1153,6 +1164,40 @@ mod tests {
 	fn an_announcement_is_skipped_when_quiet() {
 		assert_eq!(
 			printed_announcement(|ui| ui.quiet = true),
+			(String::new(), String::new())
+		);
+	}
+
+	fn printed_side_warning(set_up: impl FnOnce(&mut UI)) -> (String, String) {
+		let out = Printed::default();
+		let err = Printed::default();
+		let mut ui = Printed::split_ui(&out, &err);
+		set_up(&mut ui);
+		ui.print_side_warning("Update check failed: offline");
+		let printed = |p: &Printed| console::strip_ansi_codes(&p.lines_or_empty()).into_owned();
+		(printed(&out), printed(&err))
+	}
+
+	#[test]
+	fn a_side_warning_goes_to_stderr() {
+		assert_eq!(
+			printed_side_warning(|_| {}),
+			(String::new(), "⚠ Update check failed: offline".to_owned())
+		);
+	}
+
+	#[test]
+	fn a_side_warning_is_skipped_with_json_output() {
+		assert_eq!(
+			printed_side_warning(|ui| ui.json = true),
+			(String::new(), String::new())
+		);
+	}
+
+	#[test]
+	fn a_side_warning_is_skipped_when_quiet() {
+		assert_eq!(
+			printed_side_warning(|ui| ui.quiet = true),
 			(String::new(), String::new())
 		);
 	}

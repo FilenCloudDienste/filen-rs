@@ -353,7 +353,7 @@ async fn inner_main(ui: &mut ui::UI, arenas_limited: bool) -> Result<()> {
 			&config.config_dir,
 			cli_args.command.is_none(),
 		)
-		.await?;
+		.await;
 	}
 
 	let client_config_args = ClientConfigArgs {

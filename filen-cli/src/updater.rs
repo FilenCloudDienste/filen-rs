@@ -3,6 +3,7 @@
 //! when the CLI is run (unless skipped in the 5mins since the last check, or through the `--skip-update` flag).
 //! The executable will be replaced in place, with the filename updated if it contains the version number.
 //! Update notices and announcements are printed to stderr, and only when stdout is a terminal and neither `--json` nor `--quiet` is given.
+//! A failed update check (for example when offline) is printed as a warning to stderr and does not stop the command.
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -21,7 +22,8 @@ use crate::ui::UI;
 
 const BUILD_TARGET: &str = env!("BUILD_TARGET"); // injected in build.rs
 
-const LAST_CHECK_VALIDITY: std::time::Duration = std::time::Duration::from_mins(5);
+/// How long after a check the next one is skipped, in seconds.
+const LAST_CHECK_VALIDITY_SECS: i64 = 5 * 60;
 
 /// Checks for updates by querying the GitHub releases API and downloading
 /// and installing the latest release if a newer version is available.
@@ -34,13 +36,16 @@ const LAST_CHECK_VALIDITY: std::time::Duration = std::time::Duration::from_mins(
 /// Annnouncements targeted at the current version will also be displayed.
 /// When not using REPL, updates are not automatically installed, only
 /// a message is shown to the user.
+/// A failed check (offline, an error from GitHub, a failed install) is printed as a warning
+/// and never fails the command. It still counts as a check, so the next one waits as long as
+/// after a successful one.
 pub(crate) async fn check_for_updates(
 	ui: &mut UI,
 	force_update_check: bool,
 	automatically_update: bool,
-	config_path: &std::path::Path,
+	config_dir: &Path,
 	is_repl: bool,
-) -> Result<()> {
+) {
 	let (is_testing, version) = match std::env::var("FILEN_CLI_TESTING_MOCK_VERSION") {
 		Ok(val) if val != "off" => (true, val),
 		_ => (false, env!("CARGO_PKG_VERSION").to_string()),
@@ -48,144 +53,167 @@ pub(crate) async fn check_for_updates(
 
 	if cfg!(debug_assertions) && !is_testing {
 		log::info!("Skipping update check in debug build");
-		return Ok(());
+		return;
 	}
 
-	// handle last checked config
-	let write_update_check: Option<_>;
-	if force_update_check {
+	// a forced check is not recorded, so it does not delay the next regular one
+	let last_checked_config = if force_update_check {
 		log::info!("Update check forced via --force-update-check");
-		write_update_check = None;
+		None
 	} else {
-		let last_checked_config = LastCheckedConfig::new(config_path);
-		let last_checked = match last_checked_config.read().await {
-			Ok(timestamp) => chrono::DateTime::from_timestamp(timestamp, 0)
-				.ok_or(anyhow::anyhow!("Failed to parse timestamp"))?,
-			Err(e) => {
-				log::warn!("Failed to read last update check: {}", e);
-				chrono::DateTime::<chrono::Utc>::MIN_UTC
-			}
-		};
-		if last_checked.timestamp() + LAST_CHECK_VALIDITY.as_secs() as i64
-			> chrono::Utc::now().timestamp()
-		{
-			log::info!(
-				"Skipping update check; last checked at {} UTC",
-				last_checked.format("%Y-%m-%d %H:%M:%S")
-			);
-			return Ok(());
-		} else if last_checked == chrono::DateTime::<chrono::Utc>::MIN_UTC {
-			log::info!("No previous update check found, proceeding with update check");
-		} else {
-			log::info!(
-				"Last update check at {} UTC, proceeding with update check",
-				last_checked.format("%Y-%m-%d %H:%M:%S")
-			);
+		let last_checked_config = LastCheckedConfig::new(config_dir);
+		if !last_checked_config.is_check_due().await {
+			return;
 		}
-		write_update_check = Some(move || async move { last_checked_config.write().await });
-	}
+		Some(last_checked_config)
+	};
 
-	// access GitHub API
 	let github_api = GitHubApiClient::new();
-	let (latest_release, announcements) = tokio::join!(
-		github_api.get_latest_release(),
-		github_api.get_announcements(),
-	);
-	let latest_release = latest_release?;
-	let announcements = announcements?;
+	run_update_check(
+		ui,
+		&version,
+		automatically_update,
+		is_repl,
+		last_checked_config.as_ref(),
+		async || {
+			tokio::join!(
+				github_api.get_latest_release(),
+				github_api.get_announcements(),
+			)
+		},
+	)
+	.await;
+}
 
-	// display announcements
+/// Shows the announcements and handles the latest release that `fetch` returns, printing a
+/// warning for each part that fails, then writes the time of the check to
+/// `last_checked_config`, whether the check succeeded or not.
+async fn run_update_check(
+	ui: &mut UI,
+	version: &str,
+	automatically_update: bool,
+	is_repl: bool,
+	last_checked_config: Option<&LastCheckedConfig>,
+	fetch: impl AsyncFnOnce() -> (Result<GitHubRelease>, Result<Vec<Announcement>>),
+) {
+	let (latest_release, announcements) = fetch().await;
+
+	if let Err(e) =
+		announcements.and_then(|announcements| show_announcements(ui, version, announcements))
 	{
-		let version = semver::Version::parse(&version)?;
-		announcements
-			.into_iter()
-			.filter(|announcement| announcement.version_range.matches(&version))
-			.map(|announcement| announcement.message)
-			.for_each(|announcement| {
-				ui.print_announcement(&announcement);
-			});
+		ui.print_side_warning(&format!("Failed to fetch announcements: {e:#}"));
 	}
 
-	// handle updates
+	let updated = match latest_release {
+		Ok(latest_release) => {
+			handle_latest_release(ui, version, &latest_release, automatically_update, is_repl).await
+		}
+		Err(e) => Err(e),
+	};
+	if let Err(e) = updated {
+		ui.print_side_warning(&format!("Update check failed: {e:#}"));
+	}
+
+	if let Some(last_checked_config) = last_checked_config
+		&& let Err(e) = last_checked_config.write().await
+	{
+		log::warn!("{e:#}");
+	}
+}
+
+/// Shows the announcements targeted at `version`.
+fn show_announcements(ui: &mut UI, version: &str, announcements: Vec<Announcement>) -> Result<()> {
+	let version = semver::Version::parse(version)?;
+	announcements
+		.into_iter()
+		.filter(|announcement| announcement.version_range.matches(&version))
+		.for_each(|announcement| ui.print_announcement(&announcement.message));
+	Ok(())
+}
+
+/// Offers, announces or installs `latest_release` if it is not `version`.
+async fn handle_latest_release(
+	ui: &mut UI,
+	version: &str,
+	latest_release: &GitHubRelease,
+	automatically_update: bool,
+	is_repl: bool,
+) -> Result<()> {
 	let latest_tag = latest_release.tag_name.trim_start_matches('v');
 	if latest_tag == version {
 		log::info!("Up to date: {}", version);
-	} else if !is_repl && !automatically_update {
+		return Ok(());
+	}
+	if !is_repl && !automatically_update {
 		ui.print_announcement(&format!(
 			"Please update from v{} to v{} by invoking the CLI with no command specified (REPL).",
 			version, latest_tag
 		));
-	} else {
-		if automatically_update {
-			ui.print_muted_to_stderr(&format!(
-				"Automatically updating from v{} to v{}...",
-				version, latest_tag
-			));
-		} else if !ui
-			// installing an update is not what --yes confirms
-			.prompt_yes_no(
-				&format!("Update now from v{} to v{}", version, latest_tag),
-				true,
+		return Ok(());
+	}
+	if automatically_update {
+		ui.print_muted_to_stderr(&format!(
+			"Automatically updating from v{} to v{}...",
+			version, latest_tag
+		));
+	} else if !ui
+		// installing an update is not what --yes confirms
+		.prompt_yes_no(
+			&format!("Update now from v{} to v{}", version, latest_tag),
+			true,
+		)
+		.context("Failed to read confirmation")?
+	{
+		return Err(UI::failure("Update rejected by user"));
+	}
+	let asset = latest_release
+		.assets
+		.iter()
+		.find(|asset| asset.name.contains(BUILD_TARGET))
+		.ok_or_else(|| {
+			anyhow::anyhow!(
+				"No suitable release asset found for target: {}",
+				BUILD_TARGET
 			)
-			.context("Failed to read confirmation")?
-		{
-			return Err(UI::failure("Update rejected by user"));
-		}
-		let asset = latest_release
-			.assets
-			.iter()
-			.find(|asset| asset.name.contains(BUILD_TARGET))
-			.ok_or_else(|| {
-				anyhow::anyhow!(
-					"No suitable release asset found for target: {}",
-					BUILD_TARGET
-				)
-			})?;
-		let current_executable =
-			std::env::current_exe().context("Failed to get current executable")?;
-		let current_executable_name = current_executable
-			.file_name()
-			.ok_or(anyhow::anyhow!("Failed to get current executable name"))?
-			.to_str()
-			.ok_or(anyhow::anyhow!("Failed to get current executable name"))?;
-		// owned, because the install below runs on a blocking thread
-		let executable_dir = current_executable
-			.parent()
-			.ok_or(anyhow::anyhow!(
-				"Failed to get current executable directory"
-			))?
-			.to_path_buf();
-		let content = download_file(&asset.browser_download_url).await?;
-		if current_executable_name.contains(&version) {
-			let update_path = current_executable
-				.with_file_name(current_executable_name.replace(&version, latest_tag));
-			// writing, syncing and renaming a multi-MB binary blocks, so keep it off the
-			// runtime's workers
-			let update_path = tokio::task::spawn_blocking(move || {
-				install_renamed_update(&executable_dir, &content, &update_path, || {
-					self_replace::self_delete()
-				})
-				.map(|()| update_path)
+		})?;
+	let current_executable = std::env::current_exe().context("Failed to get current executable")?;
+	let current_executable_name = current_executable
+		.file_name()
+		.ok_or(anyhow::anyhow!("Failed to get current executable name"))?
+		.to_str()
+		.ok_or(anyhow::anyhow!("Failed to get current executable name"))?;
+	// owned, because the install below runs on a blocking thread
+	let executable_dir = current_executable
+		.parent()
+		.ok_or(anyhow::anyhow!(
+			"Failed to get current executable directory"
+		))?
+		.to_path_buf();
+	let content = download_file(&asset.browser_download_url).await?;
+	if current_executable_name.contains(version) {
+		let update_path =
+			current_executable.with_file_name(current_executable_name.replace(version, latest_tag));
+		// writing, syncing and renaming a multi-MB binary blocks, so keep it off the
+		// runtime's workers
+		let update_path = tokio::task::spawn_blocking(move || {
+			install_renamed_update(&executable_dir, &content, &update_path, || {
+				self_replace::self_delete()
 			})
-			.await??;
-			ui.print_muted_to_stderr(&format!("Downloaded update to {}", update_path.display()));
-		} else {
-			tokio::task::spawn_blocking(move || {
-				install_replacing_update(&executable_dir, &content, |staged| {
-					self_replace::self_replace(staged)
-				})
+			.map(|()| update_path)
+		})
+		.await??;
+		ui.print_muted_to_stderr(&format!("Downloaded update to {}", update_path.display()));
+	} else {
+		tokio::task::spawn_blocking(move || {
+			install_replacing_update(&executable_dir, &content, |staged| {
+				self_replace::self_replace(staged)
 			})
-			.await??;
-			ui.print_muted_to_stderr(
-				"Update installed successfully. It will take effect the next time you run the application.",
-			);
-		}
+		})
+		.await??;
+		ui.print_muted_to_stderr(
+			"Update installed successfully. It will take effect the next time you run the application.",
+		);
 	}
-
-	if let Some(write_update_check) = write_update_check {
-		write_update_check().await?;
-	}
-
 	Ok(())
 }
 
@@ -269,6 +297,29 @@ impl LastCheckedConfig {
 		}
 	}
 
+	/// Whether the last check is too long ago (or unknown) to skip this one.
+	async fn is_check_due(&self) -> bool {
+		let last_checked = match self.read().await {
+			Ok(timestamp) => Some(timestamp),
+			Err(e) => {
+				log::info!("No previous update check found: {e:#}");
+				None
+			}
+		};
+		let due = is_check_due(last_checked, chrono::Utc::now().timestamp());
+		if let Some(last_checked) = last_checked {
+			let last_checked = chrono::DateTime::from_timestamp(last_checked, 0)
+				.map(|date| date.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+				.unwrap_or_else(|| last_checked.to_string());
+			if due {
+				log::info!("Last update check at {last_checked}, proceeding with update check");
+			} else {
+				log::info!("Skipping update check; last checked at {last_checked}");
+			}
+		}
+		due
+	}
+
 	async fn read(&self) -> Result<i64> {
 		let content = fs::read_to_string(&self.path).await.with_context(|| {
 			format!(
@@ -298,6 +349,15 @@ impl LastCheckedConfig {
 		);
 		Ok(())
 	}
+}
+
+/// Whether an update check is due at `now`, given when the last one was (both in seconds since
+/// the epoch). A check is due when there was none, or when the last one is
+/// [`LAST_CHECK_VALIDITY_SECS`] or more ago.
+fn is_check_due(last_checked: Option<i64>, now: i64) -> bool {
+	last_checked
+		.and_then(|last_checked| last_checked.checked_add(LAST_CHECK_VALIDITY_SECS))
+		.is_none_or(|next_check| next_check <= now)
 }
 
 // github api
@@ -410,6 +470,172 @@ mod tests {
 	use std::cell::Cell;
 
 	use super::*;
+	use crate::ui::test_support::Printed;
+
+	/// A release tagged `tag` with no assets.
+	fn release(tag: &str) -> GitHubRelease {
+		GitHubRelease {
+			prerelease: false,
+			tag_name: tag.to_owned(),
+			assets: Vec::new(),
+		}
+	}
+
+	fn announcement(version_range: &str, message: &str) -> Announcement {
+		Announcement {
+			version_range: VersionReq::parse(version_range).unwrap(),
+			message: message.to_owned(),
+		}
+	}
+
+	/// The time of the last check written to `config_dir`, if any.
+	fn written_stamp(config_dir: &Path) -> Option<i64> {
+		std::fs::read_to_string(config_dir.join("last_update_check"))
+			.ok()
+			.map(|stamp| stamp.parse().unwrap())
+	}
+
+	#[test]
+	fn a_check_is_due_without_a_previous_one() {
+		assert!(is_check_due(None, 1_000_000));
+	}
+
+	#[test]
+	fn a_check_is_skipped_until_the_last_one_expires() {
+		let now = 1_000_000;
+		assert!(!is_check_due(Some(now), now));
+		assert!(!is_check_due(Some(now - LAST_CHECK_VALIDITY_SECS + 1), now));
+		assert!(is_check_due(Some(now - LAST_CHECK_VALIDITY_SECS), now));
+	}
+
+	#[test]
+	fn a_check_is_due_when_the_last_ones_time_is_out_of_range() {
+		assert!(is_check_due(Some(i64::MAX), 1_000_000));
+	}
+
+	#[tokio::test]
+	async fn a_failed_release_fetch_is_a_warning_and_still_writes_the_stamp() {
+		let config_dir = tempfile::tempdir().unwrap();
+		let printed = Printed::default();
+		let mut ui = printed.terminal_ui();
+
+		run_update_check(
+			&mut ui,
+			"0.2.9",
+			false,
+			false,
+			Some(&LastCheckedConfig::new(config_dir.path())),
+			async || {
+				(
+					Err(anyhow::anyhow!("GitHub API returned 503")),
+					Ok(vec![announcement(">=0.2.0", "Hello")]),
+				)
+			},
+		)
+		.await;
+
+		assert_eq!(
+			console::strip_ansi_codes(&printed.lines()),
+			"[i] Hello\n⚠ Update check failed: GitHub API returned 503"
+		);
+		assert!(written_stamp(config_dir.path()).is_some());
+	}
+
+	#[tokio::test]
+	async fn a_failed_check_prints_no_warning_when_quiet_or_with_json_output() {
+		for json in [false, true] {
+			let printed = Printed::default();
+			let mut ui = printed.terminal_ui();
+			ui.set_quiet_and_json(!json, json);
+
+			run_update_check(
+				&mut ui,
+				"0.2.9",
+				false,
+				false,
+				None,
+				async || {
+					(
+						Err(anyhow::anyhow!("GitHub API returned 503")),
+						Err(anyhow::anyhow!("connection refused")),
+					)
+				},
+			)
+			.await;
+
+			assert_eq!(printed.lines_or_empty(), "", "json: {json}");
+		}
+	}
+
+	#[tokio::test]
+	async fn a_failed_announcements_fetch_is_a_warning_and_still_handles_the_release() {
+		let config_dir = tempfile::tempdir().unwrap();
+		let printed = Printed::default();
+		let mut ui = printed.terminal_ui();
+
+		run_update_check(
+			&mut ui,
+			"0.2.9",
+			false,
+			false,
+			Some(&LastCheckedConfig::new(config_dir.path())),
+			async || {
+				(
+					Ok(release("v0.3.0")),
+					Err(anyhow::anyhow!("connection refused")),
+				)
+			},
+		)
+		.await;
+
+		assert_eq!(
+			console::strip_ansi_codes(&printed.lines()),
+			"⚠ Failed to fetch announcements: connection refused\n[i] Please update from \
+			 v0.2.9 to v0.3.0 by invoking the CLI with no command specified (REPL)."
+		);
+		assert!(written_stamp(config_dir.path()).is_some());
+	}
+
+	#[tokio::test]
+	async fn a_release_without_an_asset_for_this_target_is_a_warning() {
+		let config_dir = tempfile::tempdir().unwrap();
+		let printed = Printed::default();
+		let mut ui = printed.ui();
+
+		run_update_check(
+			&mut ui,
+			"0.2.9",
+			true,
+			false,
+			Some(&LastCheckedConfig::new(config_dir.path())),
+			async || (Ok(release("v0.3.0")), Ok(Vec::new())),
+		)
+		.await;
+
+		assert_eq!(
+			console::strip_ansi_codes(&printed.lines()),
+			format!(
+				"Automatically updating from v0.2.9 to v0.3.0...\n⚠ Update check failed: No \
+				 suitable release asset found for target: {BUILD_TARGET}"
+			)
+		);
+		assert!(written_stamp(config_dir.path()).is_some());
+	}
+
+	#[tokio::test]
+	async fn a_forced_check_writes_no_stamp() {
+		let config_dir = tempfile::tempdir().unwrap();
+		let printed = Printed::default();
+		let mut ui = printed.ui();
+
+		run_update_check(&mut ui, "0.2.9", false, false, None, async || {
+			(Ok(release("v0.2.9")), Ok(Vec::new()))
+		})
+		.await;
+
+		assert_eq!(printed.lines_or_empty(), "");
+		assert_eq!(written_stamp(config_dir.path()), None);
+	}
 
 	/// Lists the names of the files in `dir`, sorted.
 	fn file_names(dir: &Path) -> Vec<String> {
