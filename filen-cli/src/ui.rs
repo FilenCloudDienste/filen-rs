@@ -231,6 +231,12 @@ impl UI {
 		CliError::Failure(msg.to_owned()).into()
 	}
 
+	/// Return an error with a user-friendly message about an invalid command line, which exits
+	/// with code 2
+	pub(crate) fn usage_failure(msg: &str) -> anyhow::Error {
+		CliError::Usage(msg.to_owned()).into()
+	}
+
 	/// Print an error or failure message
 	/// User-friendly failures created with `UI::failure` will be printed as-is, along with any
 	/// context they were wrapped in, other errors will be printed with a generic message and a
@@ -238,7 +244,9 @@ impl UI {
 	pub(crate) fn print_failure_or_error(&mut self, err: &anyhow::Error) {
 		error!("{:#}", err);
 		match find_cli_error(err) {
-			Some(CliError::Failure(_)) => self.print_failure(&format!("{:#}", err)),
+			Some(CliError::Failure(_) | CliError::Usage(_)) => {
+				self.print_failure(&format!("{:#}", err))
+			}
 			Some(CliError::TerminalInput(_)) => {
 				self.print_failure("Failed to read input from terminal. Please ensure that the terminal supports interactive input.");
 				if cfg!(feature = "is_docker") {

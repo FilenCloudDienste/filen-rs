@@ -209,7 +209,7 @@ async fn inner_main(ui: &mut ui::UI, arenas_limited: bool) -> Result<()> {
 		config_dir: match cli_args.config_dir {
 			Some(ref dir) => {
 				if !dir.exists() {
-					return Err(anyhow::anyhow!("Config dir does not exist"));
+					return Err(ui::UI::usage_failure("Config dir does not exist"));
 				}
 				dir.clone()
 			}

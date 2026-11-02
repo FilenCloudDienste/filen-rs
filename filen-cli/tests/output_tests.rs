@@ -64,3 +64,27 @@ fn help_for_an_unknown_topic_fails() {
 		"{stderr}"
 	);
 }
+
+#[test]
+fn a_config_dir_that_does_not_exist_is_a_usage_error() {
+	let parent = TempDir::new().unwrap();
+	let output = Command::new(assert_cmd::cargo::cargo_bin!())
+		.arg("--config-dir")
+		.arg(parent.path().join("missing"))
+		.args(["--skip-update", "--help"])
+		.output()
+		.unwrap();
+
+	assert_eq!(output.status.code(), Some(2));
+	assert_eq!(String::from_utf8(output.stdout).unwrap(), "");
+	let stderr = String::from_utf8(output.stderr).unwrap();
+	assert!(stderr.contains("Config dir does not exist"), "{stderr}");
+}
+
+#[test]
+fn an_unknown_command_is_a_usage_error() {
+	let output = run(&["unknowncommand"]);
+
+	assert_eq!(output.status.code(), Some(2));
+	assert_eq!(String::from_utf8(output.stdout).unwrap(), "");
+}

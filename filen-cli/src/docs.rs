@@ -69,6 +69,8 @@ const USAGE_INTRO_DOCS: &[DocElement] = &[
 	DocElement::GlobalOptions,
 	DocElement::Heading1("Updates"),
 	DocElement::DocFragment("updates"),
+	DocElement::Heading1("Exit codes"),
+	DocElement::DocFragment("exit-codes"),
 	DocElement::Heading1("Commands"),
 ];
 

@@ -1,4 +1,9 @@
-//! Errors the CLI reports to the user, and the exit codes they map to.
+//! [cli-doc] exit-codes
+//! The Filen CLI exits with:
+//! - `0` when the command succeeded,
+//! - `1` when it failed, with the error printed to stderr,
+//! - `2` when the command line was invalid, such as an unknown command or flags that do not go together,
+//! - the exit code of Rclone when `filen rclone ...` failed in Rclone.
 
 use std::{error::Error, fmt};
 
@@ -13,6 +18,8 @@ use inquire::InquireError;
 pub(crate) enum CliError {
 	/// The command could not do what was asked; exit code 1.
 	Failure(String),
+	/// The command line was invalid; exit code 2.
+	Usage(String),
 	/// The terminal could not show a prompt or read its answer; exit code 1.
 	TerminalInput(InquireError),
 	/// A child process (Rclone) exited with this code and reported its own error; its code is the
@@ -22,11 +29,14 @@ pub(crate) enum CliError {
 
 /// Exit code of a command that failed.
 pub(crate) const EXIT_FAILURE: i32 = 1;
+/// Exit code of an invalid command line, the one clap exits with on an invalid command line.
+pub(crate) const EXIT_USAGE: i32 = 2;
 
 impl CliError {
 	pub(crate) fn exit_code(&self) -> i32 {
 		match self {
 			CliError::Failure(_) | CliError::TerminalInput(_) => EXIT_FAILURE,
+			CliError::Usage(_) => EXIT_USAGE,
 			CliError::ChildExit(code) => *code,
 		}
 	}
@@ -35,7 +45,7 @@ impl CliError {
 impl fmt::Display for CliError {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
-			CliError::Failure(msg) => f.write_str(msg),
+			CliError::Failure(msg) | CliError::Usage(msg) => f.write_str(msg),
 			CliError::TerminalInput(_) => f.write_str("Failed to read input prompt"),
 			CliError::ChildExit(code) => write!(f, "Exited with code {code}"),
 		}
@@ -46,7 +56,7 @@ impl Error for CliError {
 	fn source(&self) -> Option<&(dyn Error + 'static)> {
 		match self {
 			CliError::TerminalInput(e) => Some(e),
-			CliError::Failure(_) | CliError::ChildExit(_) => None,
+			CliError::Failure(_) | CliError::Usage(_) | CliError::ChildExit(_) => None,
 		}
 	}
 }
@@ -88,6 +98,16 @@ mod tests {
 
 		assert!(find_cli_error(&err).is_none());
 		assert_eq!(exit_code(&err), 1);
+	}
+
+	#[test]
+	fn a_usage_error_wrapped_in_context_exits_with_code_2() {
+		let err = anyhow::Error::from(CliError::Usage(
+			"Give both --user and --password, or neither".to_owned(),
+		))
+		.context("Failed to serve");
+
+		assert_eq!(exit_code(&err), 2);
 	}
 
 	#[test]

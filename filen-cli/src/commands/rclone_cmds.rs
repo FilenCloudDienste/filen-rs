@@ -204,7 +204,7 @@ pub(crate) async fn start_server(
 			key_path,
 		}),
 		(None, None) => None,
-		_ => return Err(UI::failure("Give both --cert and --key, or neither")),
+		_ => return Err(UI::usage_failure("Give both --cert and --key, or neither")),
 	};
 	let scheme = if tls.is_some() { "https" } else { "http" };
 	let client = client.get(ui).await?;
@@ -411,7 +411,7 @@ fn default_port(protocol: ServeProtocol) -> u16 {
 /// The host and port of `address`, `<host>:<port>` with an IPv6 host in brackets. The daemon
 /// refuses a host that is not an IP address or `localhost`, such as the empty one of `:<port>`.
 fn parse_address(address: &str) -> Result<(String, u16)> {
-	let invalid = || UI::failure(&format!("Invalid address {address}: expected <ip>:<port>"));
+	let invalid = || UI::usage_failure(&format!("Invalid address {address}: expected <ip>:<port>"));
 	let (host, port) = address.rsplit_once(':').ok_or_else(invalid)?;
 	let port = port.parse().map_err(|_| invalid())?;
 	let host = host
@@ -429,13 +429,15 @@ fn serve_auth(
 ) -> Result<ServeAuth> {
 	match (protocol, user, password) {
 		(_, None, None) => Ok(ServeAuth::random(protocol)),
-		(ServeProtocol::Nfs, _, _) => Err(UI::failure("NFS servers take no credentials")),
+		(ServeProtocol::Nfs, _, _) => Err(UI::usage_failure("NFS servers take no credentials")),
 		(ServeProtocol::S3, Some(access_key_id), Some(secret_access_key)) => Ok(ServeAuth::S3 {
 			access_key_id,
 			secret_access_key,
 		}),
 		(_, Some(user), Some(password)) => Ok(ServeAuth::Basic { user, password }),
-		_ => Err(UI::failure("Give both --user and --password, or neither")),
+		_ => Err(UI::usage_failure(
+			"Give both --user and --password, or neither",
+		)),
 	}
 }
 
