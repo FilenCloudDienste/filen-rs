@@ -1,7 +1,4 @@
-use std::{
-	collections::{HashMap, HashSet},
-	sync::Arc,
-};
+use std::{collections::HashSet, sync::Arc};
 
 use anyhow::{Context, Result};
 use console::style;
@@ -18,7 +15,10 @@ use crate::{
 	CliConfig, commands::sync_cmd::sync_pairs::format_sync_pair, ui::UI, util::RemotePath,
 };
 
+mod conflict_resolutions;
 mod sync_pairs;
+
+pub(crate) use conflict_resolutions::ConflictResolutions;
 
 // todo: better command documentation
 
@@ -31,7 +31,7 @@ pub(crate) async fn sync(
 	pair_definitions: &Vec<String>,
 	once: bool,
 	approve_mass_deletions: bool,
-	conflict_resolutions: HashMap<String, ConflictResolution>,
+	conflict_resolutions: ConflictResolutions,
 ) -> Result<()> {
 	// init sync engine
 	let db_path = config.config_dir.join("sync-engine.db");
@@ -185,13 +185,9 @@ pub(crate) async fn sync(
 
 				// resolve conflicts
 				if let SyncEvent::Conflict { ref rel_path } = event {
-					if is_first_pass
-						&& let Some((_, resolution)) = conflict_resolutions
-							.iter()
-							.find(|(path, _)| path.starts_with(rel_path))
-					{
+					if is_first_pass && let Some(resolution) = conflict_resolutions.for_path(rel_path) {
 						let resolved = engine
-							.resolve_conflict(pair_id, rel_path, *resolution)
+							.resolve_conflict(pair_id, rel_path, resolution)
 							.await
 							.with_context(|| {
 								format!(

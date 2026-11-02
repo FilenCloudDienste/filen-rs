@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use anyhow::{Context, Result};
 use clap::Subcommand;
 use clap_complete::engine::{ArgValueCompleter, PathCompleter};
@@ -145,13 +143,19 @@ pub(crate) enum Commands {
 		/// Disables the delete guard (applied only on the first sync pass).
 		#[arg(long)]
 		approve_mass_deletions: bool,
-		/// When conflict occurs at the given path, keep local side (applied only on the first sync pass).
+		/// When a conflict occurs at the given path or under it, keep the local side.
+		/// The path is relative to the root of each sync pair.
+		/// Applied only on the first sync pass.
 		#[arg(long, value_name = "RELATIVE_PATH")]
 		keep_local: Vec<String>,
-		/// When conflict occurs at the given path, keep remote side (applied only on the first sync pass).
+		/// When a conflict occurs at the given path or under it, keep the remote side.
+		/// The path is relative to the root of each sync pair.
+		/// Applied only on the first sync pass.
 		#[arg(long, value_name = "RELATIVE_PATH")]
 		keep_remote: Vec<String>,
-		/// When conflict occurs at the given path, keep both sides (applied only on the first sync pass).
+		/// When a conflict occurs at the given path or under it, keep both sides.
+		/// The path is relative to the root of each sync pair.
+		/// Applied only on the first sync pass.
 		#[arg(long, value_name = "RELATIVE_PATH")]
 		keep_both: Vec<String>,
 	},
@@ -372,25 +376,8 @@ pub(crate) async fn execute_command(
 			keep_remote,
 			keep_both,
 		} => {
-			let mut conflict_resolutions = HashMap::new();
-			for path in keep_local {
-				conflict_resolutions.insert(
-					path,
-					filen_sdk_rs::sync_engine::ConflictResolution::KeepLocal,
-				);
-			}
-			for path in keep_remote {
-				conflict_resolutions.insert(
-					path,
-					filen_sdk_rs::sync_engine::ConflictResolution::KeepRemote,
-				);
-			}
-			for path in keep_both {
-				conflict_resolutions.insert(
-					path,
-					filen_sdk_rs::sync_engine::ConflictResolution::KeepBoth,
-				);
-			}
+			let conflict_resolutions =
+				sync_cmd::ConflictResolutions::new(keep_local, keep_remote, keep_both)?;
 			let client = client.get(ui).await?;
 			sync_cmd::sync(
 				config,
