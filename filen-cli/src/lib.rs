@@ -29,6 +29,7 @@ mod auth;
 mod commands;
 mod completion;
 mod docs;
+mod error;
 mod log_files;
 mod memory;
 mod ui;
@@ -141,12 +142,6 @@ pub(crate) struct CliConfig {
 	pub(crate) config_dir: PathBuf,
 }
 
-pub(crate) const EXIT_CODE_ERROR_PREFIX: &str = "Exit with code ";
-
-pub(crate) fn construct_exit_code_error(code: i32) -> anyhow::Error {
-	anyhow::anyhow!("{}{}", EXIT_CODE_ERROR_PREFIX, code)
-}
-
 pub(crate) static CTRLC_TX: std::sync::LazyLock<tokio::sync::broadcast::Sender<()>> =
 	std::sync::LazyLock::new(|| {
 		let (tx, _) = tokio::sync::broadcast::channel(1);
@@ -200,21 +195,9 @@ async fn async_main(arenas_limited: bool) {
 	// call ui.initialize() later after parsing args
 
 	// translate errors to non-zero exit code
-	match inner_main(&mut ui, arenas_limited).await {
-		Ok(_) => {}
-		Err(e) if e.to_string().starts_with(EXIT_CODE_ERROR_PREFIX) => {
-			ui.print_failure_or_error(&e);
-			if let Some(code_str) = e.to_string().strip_prefix(EXIT_CODE_ERROR_PREFIX)
-				&& let Ok(code) = code_str.parse::<i32>()
-			{
-				std::process::exit(code);
-			}
-			std::process::exit(1);
-		}
-		Err(e) => {
-			ui.print_failure_or_error(&e);
-			std::process::exit(1);
-		}
+	if let Err(e) = inner_main(&mut ui, arenas_limited).await {
+		ui.print_failure_or_error(&e);
+		std::process::exit(error::exit_code(&e));
 	}
 }
 

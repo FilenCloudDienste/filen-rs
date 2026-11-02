@@ -17,7 +17,10 @@ use tiny_gradient::{GradientStr, RGB};
 use unicode_width::{UnicodeWidthChar as _, UnicodeWidthStr};
 
 use crate::{
-	CliArgs, EXIT_CODE_ERROR_PREFIX, completion::async_completions_available, util::RemotePath,
+	CliArgs,
+	completion::async_completions_available,
+	error::{CliError, find_cli_error},
+	util::RemotePath,
 };
 
 pub(crate) struct CustomLogger {
@@ -63,8 +66,6 @@ impl log::Log for CustomLogger {
 
 	fn flush(&self) {}
 }
-
-const FAILED_TO_READ_INPUT_PROMPT: &str = "Failed to read input prompt";
 
 // Independent output settings, each set from its own CLI flag.
 #[allow(clippy::struct_excessive_bools)]
@@ -200,29 +201,29 @@ impl UI {
 
 	/// Return an error with a user-friendly error message
 	pub(crate) fn failure(msg: &str) -> anyhow::Error {
-		anyhow::anyhow!("{} {}", style("✘").red(), msg)
+		CliError::Failure(msg.to_owned()).into()
 	}
 
 	/// Print an error or failure message
-	/// User-friendly failures created with `UI::failure` will be printed as-is,
-	/// other errors will be printed with a generic message and a link to report bugs.
+	/// User-friendly failures created with `UI::failure` will be printed as-is, along with any
+	/// context they were wrapped in, other errors will be printed with a generic message and a
+	/// link to report bugs.
 	pub(crate) fn print_failure_or_error(&mut self, err: &anyhow::Error) {
 		error!("{:#}", err);
-		let err_msg = format!("{}", err);
-		if err_msg.starts_with(EXIT_CODE_ERROR_PREFIX) {
-			return;
-		}
-		let is_failure = err_msg.starts_with(&format!("{}", style("✘").red()));
-		if is_failure {
-			self.print(&err_msg);
-		} else if err_msg.contains(FAILED_TO_READ_INPUT_PROMPT) {
-			self.print_failure("Failed to read input from terminal. Please ensure that the terminal supports interactive input.");
-			if cfg!(feature = "is_docker") {
-				self.print_failure("It seems you are running the CLI in a Docker container. Make sure to run the container with the -it flags to enable interactive input.");
+		match find_cli_error(err) {
+			Some(CliError::Failure(_)) => self.print_failure(&format!("{:#}", err)),
+			Some(CliError::TerminalInput(_)) => {
+				self.print_failure("Failed to read input from terminal. Please ensure that the terminal supports interactive input.");
+				if cfg!(feature = "is_docker") {
+					self.print_failure("It seems you are running the CLI in a Docker container. Make sure to run the container with the -it flags to enable interactive input.");
+				}
 			}
-		} else {
-			self.print_failure(&format!("An unexpected error occurred: {}", err));
-			self.print_failure("If you believe this is a bug, please report it at https://github.com/FilenCloudDienste/filen-rs/issues");
+			// the child process reported its own error
+			Some(CliError::ChildExit(_)) => {}
+			None => {
+				self.print_failure(&format!("An unexpected error occurred: {}", err));
+				self.print_failure("If you believe this is a bug, please report it at https://github.com/FilenCloudDienste/filen-rs/issues");
+			}
 		}
 	}
 
@@ -353,7 +354,7 @@ impl UI {
 			}
 			Err(e) => {
 				error!("[PROMPT] failed to read input");
-				Err(anyhow::anyhow!("{}: {}", FAILED_TO_READ_INPUT_PROMPT, e))
+				Err(CliError::TerminalInput(e).into())
 			}
 		}
 	}
@@ -398,10 +399,7 @@ impl UI {
 				Ok(None)
 			}
 			Err(InquireError::IO(e)) => Err(anyhow::anyhow!("IO error: {}", e)),
-			/* Err(InquireError::IO(_)) | Err(InquireError::NotTTY) => {
-				Err(anyhow::anyhow!("{}", FAILED_TO_READ_INPUT_PROMPT))
-			} */
-			Err(e) => Err(anyhow::anyhow!("Failed to read input prompt: {}", e)),
+			Err(e) => Err(CliError::TerminalInput(e).into()),
 		}
 	}
 
@@ -420,10 +418,7 @@ impl UI {
 				info!("[PROMPT] canceled");
 				Err(UI::failure("Canceled"))
 			}
-			Err(InquireError::IO(_)) | Err(InquireError::NotTTY) => {
-				Err(anyhow::anyhow!("{}", FAILED_TO_READ_INPUT_PROMPT))
-			}
-			Err(e) => Err(anyhow::anyhow!("Failed to read input prompt: {}", e)),
+			Err(e) => Err(CliError::TerminalInput(e).into()),
 		}
 	}
 
@@ -451,10 +446,7 @@ impl UI {
 				info!("[PROMPT] canceled");
 				Ok(None)
 			}
-			Err(InquireError::IO(_)) | Err(InquireError::NotTTY) => {
-				Err(anyhow::anyhow!("{}", FAILED_TO_READ_INPUT_PROMPT))
-			}
-			Err(e) => Err(anyhow::anyhow!("Failed to read input prompt: {}", e)),
+			Err(e) => Err(CliError::TerminalInput(e).into()),
 		}
 	}
 
@@ -855,6 +847,37 @@ mod tests {
 		// no color
 		console::set_colors_enabled(false);
 		insta::assert_snapshot!(printed(100));
+	}
+
+	#[test]
+	fn a_failure_wrapped_in_context_is_printed_as_a_failure() {
+		let printed = Printed::default();
+		let mut ui = printed.ui();
+		let err = Err::<(), _>(UI::failure("Canceled"))
+			.context("Failed to read confirmation")
+			.unwrap_err();
+
+		ui.print_failure_or_error(&err);
+
+		// Whether the cross is colored depends on the terminal.
+		assert_eq!(
+			console::strip_ansi_codes(&printed.lines()),
+			"✘ Failed to read confirmation: Canceled"
+		);
+	}
+
+	#[test]
+	fn an_unexpected_error_is_printed_with_a_bug_report_link() {
+		let printed = Printed::default();
+		let mut ui = printed.ui();
+
+		ui.print_failure_or_error(&anyhow::anyhow!("connection reset"));
+
+		assert_eq!(
+			console::strip_ansi_codes(&printed.lines()),
+			"✘ An unexpected error occurred: connection reset\n\
+			 ✘ If you believe this is a bug, please report it at https://github.com/FilenCloudDienste/filen-rs/issues"
+		);
 	}
 
 	#[test]

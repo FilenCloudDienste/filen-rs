@@ -20,7 +20,8 @@ use serde_json::json;
 use tokio::select;
 
 use crate::{
-	CliConfig, CommandResult, auth::LazyClient, commands::CommandContext, docs::DocElement, ui::UI,
+	CliConfig, CommandResult, auth::LazyClient, commands::CommandContext, docs::DocElement,
+	error::CliError, ui::UI,
 };
 
 #[derive(Debug, Subcommand)]
@@ -259,7 +260,7 @@ pub(crate) async fn execute_rclone(
 	if let Some(exit_code) = exit_code
 		&& exit_code != 0
 	{
-		return Err(crate::construct_exit_code_error(exit_code));
+		return Err(CliError::ChildExit(exit_code).into());
 	}
 	Ok(())
 }
