@@ -6,10 +6,17 @@ use filen_sdk_rs::{
 	ErrorKind,
 	auth::Client,
 	connect::{DirPublicLinkRW, FilePublicLink, PasswordState},
-	fs::{HasName, categories::NonRootFileType},
+	fs::{HasName, categories::NonRootFileType, file::traits::HasFileInfo as _},
 	io::{RemoteDirectory, RemoteFile},
 };
 use filen_types::api::v3::dir::link::PublicLinkExpiration;
+use std::fmt::{Display, Write as _};
+
+/// Where the web app opens public links, as filen-web's `PUBLIC_LINK_BASE_URL` builds them.
+const PUBLIC_LINK_BASE_URL: &str = "https://app.filen.io/#/";
+
+/// Shown in place of a public link's URL when the key in it could not be decrypted.
+const LINK_URL_UNAVAILABLE: &str = "unavailable (the key could not be decrypted)";
 
 pub(crate) async fn list_public_links(ui: &mut UI, client: &mut LazyClient) -> Result<()> {
 	let client = client.get(ui).await?;
@@ -165,6 +172,8 @@ fn prompt_for_operation(ui: &mut UI) -> Result<Option<PublicLinkOperation>> {
 }
 
 fn print_file_public_link(ui: &mut UI, file: &RemoteFile, link: &FilePublicLink) {
+	let url = file_public_link_url(file, link);
+	let url = url_or_unavailable(ui, url.as_deref());
 	ui.print_key_value_table(&[
 		("File", file.name().unwrap_or_default()),
 		(
@@ -181,6 +190,7 @@ fn print_file_public_link(ui: &mut UI, file: &RemoteFile, link: &FilePublicLink)
 			},
 		),
 		("Password", password_label(link.password())),
+		("URL", url),
 	]);
 }
 
@@ -212,11 +222,14 @@ async fn prompt_public_link_file_settings(
 		.await
 		.context("Failed to update public link")?;
 	ui.print_success("Public link saved.");
+	print_public_link_url(ui, file_public_link_url(file, &link).as_deref());
 
 	Ok(())
 }
 
 fn print_dir_public_link(ui: &mut UI, dir: &RemoteDirectory, link: &DirPublicLinkRW) {
+	let url = dir_public_link_url(link);
+	let url = url_or_unavailable(ui, url.as_deref());
 	ui.print_key_value_table(&[
 		("Directory", dir.name().unwrap_or_default()),
 		(
@@ -237,6 +250,7 @@ fn print_dir_public_link(ui: &mut UI, dir: &RemoteDirectory, link: &DirPublicLin
 			"Download Enabled",
 			if link.download_enabled() { "Yes" } else { "No" },
 		),
+		("URL", url),
 	]);
 }
 
@@ -262,8 +276,61 @@ async fn prompt_public_link_dir_settings(
 		.await
 		.context("Failed to update public link")?;
 	ui.print_success("Public link saved.");
+	print_public_link_url(ui, dir_public_link_url(&link).as_deref());
 
 	Ok(())
+}
+
+/// What a public link opens in the web app.
+enum PublicLinkKind {
+	File,
+	Directory,
+}
+
+impl PublicLinkKind {
+	/// The web app's route for this kind: `d` (download) for a file, `f` (folder) for a directory.
+	fn route(&self) -> &'static str {
+		match self {
+			PublicLinkKind::File => "d",
+			PublicLinkKind::Directory => "f",
+		}
+	}
+}
+
+/// The URL of a public link, as the web app copies it: its route, the link's uuid, then an
+/// escaped `#` (`%23`) and the key that decrypts the item, hex-encoded from its UTF-8 bytes. The
+/// web app decodes a hex key back and takes any other key as it is, so the raw form of a key that
+/// is itself hex (a v3 key) would be misread; the hex form never is.
+fn public_link_url(kind: PublicLinkKind, link_uuid: impl Display, key: &str) -> String {
+	let mut url = format!("{PUBLIC_LINK_BASE_URL}{}/{link_uuid}%23", kind.route());
+	for byte in key.bytes() {
+		write!(url, "{byte:02x}").expect("writing to a String cannot fail (should be impossible)");
+	}
+	url
+}
+
+/// The URL of a file's public link, whose key is the file's own, or `None` when the file's
+/// metadata, which holds that key, could not be decrypted.
+fn file_public_link_url(file: &RemoteFile, link: &FilePublicLink) -> Option<String> {
+	file.key()
+		.map(|key| public_link_url(PublicLinkKind::File, link.uuid(), key.to_str().as_ref()))
+}
+
+/// The URL of a directory's public link, or `None` when its link key could not be decrypted.
+fn dir_public_link_url(link: &DirPublicLinkRW) -> Option<String> {
+	link.key_string()
+		.map(|key| public_link_url(PublicLinkKind::Directory, link.uuid(), &key))
+}
+
+/// The URL to print for a public link: `url`, the placeholder while replay testing (the link's
+/// uuid and key differ on every run), or a note when it could not be built.
+fn url_or_unavailable<'a>(ui: &UI, url: Option<&'a str>) -> &'a str {
+	url.map_or(LINK_URL_UNAVAILABLE, |url| ui.omit_for_replay_testing(url))
+}
+
+fn print_public_link_url(ui: &mut UI, url: Option<&str>) {
+	let url = url_or_unavailable(ui, url);
+	ui.print_key_value_table(&[("URL", url)]);
 }
 
 struct LinkExpirationOption(&'static str, PublicLinkExpiration);
@@ -314,5 +381,33 @@ mod tests {
 	#[test]
 	fn password_label_says_no_without_a_password() {
 		assert_eq!(password_label(&PasswordState::None), "No");
+	}
+
+	const LINK_UUID: &str = "0f8fad5b-d9cb-469f-a165-70867728950e";
+
+	#[test]
+	fn file_link_url_uses_the_download_route_and_a_hex_encoded_key() {
+		assert_eq!(
+			public_link_url(PublicLinkKind::File, LINK_UUID, "abcXYZ09"),
+			"https://app.filen.io/#/d/0f8fad5b-d9cb-469f-a165-70867728950e%2361626358595a3039"
+		);
+	}
+
+	#[test]
+	fn directory_link_url_uses_the_folder_route() {
+		assert_eq!(
+			public_link_url(PublicLinkKind::Directory, LINK_UUID, "key"),
+			"https://app.filen.io/#/f/0f8fad5b-d9cb-469f-a165-70867728950e%236b6579"
+		);
+	}
+
+	#[test]
+	fn link_url_hex_encodes_a_key_that_is_already_hex() {
+		let key = "00ff".repeat(16);
+		let url = public_link_url(PublicLinkKind::File, LINK_UUID, &key);
+		assert_eq!(
+			url.split_once("%23").map(|(_, key)| key),
+			Some("30306666".repeat(16).as_str())
+		);
 	}
 }

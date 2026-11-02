@@ -654,6 +654,16 @@ impl UI {
 			output
 		}
 	}
+
+	/// `value`, or `[omit]` while replay testing: for output that differs on every run, such as
+	/// a newly created id or key, which no recording could match.
+	pub(crate) fn omit_for_replay_testing<'a>(&self, value: &'a str) -> &'a str {
+		if self.make_output_environment_agnostic_for_replay_testing {
+			"[omit]"
+		} else {
+			value
+		}
+	}
 }
 
 #[cfg(test)]
@@ -845,6 +855,20 @@ mod tests {
 		// no color
 		console::set_colors_enabled(false);
 		insta::assert_snapshot!(printed(100));
+	}
+
+	#[test]
+	fn omit_for_replay_testing_keeps_the_value_outside_replay_testing() {
+		let mut ui = Printed::default().ui();
+		ui.initialize(false, false, None, true, false);
+		assert_eq!(ui.omit_for_replay_testing("value"), "value");
+	}
+
+	#[test]
+	fn omit_for_replay_testing_hides_the_value_while_replay_testing() {
+		let mut ui = Printed::default().ui();
+		ui.initialize(false, false, None, true, true);
+		assert_eq!(ui.omit_for_replay_testing("value"), "[omit]");
 	}
 
 	#[test]
