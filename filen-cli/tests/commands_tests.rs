@@ -1,11 +1,18 @@
 #[cfg(unix)]
 use std::{
+	path::Path,
 	process::{Command, Stdio},
+	sync::Arc,
 	time::{Duration, Instant},
 };
 
 use filen_macros::shared_test_runtime;
 use filen_sdk_rs::fs::{HasName, categories::NonRootFileType};
+#[cfg(unix)]
+use filen_sdk_rs::{
+	auth::Client,
+	sync_engine::{DeleteGuard, SyncEngine},
+};
 use filen_types::api::v3::notes::NoteType;
 use rand::TryRngCore;
 use test_utils::authenticated_cli_with_args;
@@ -258,8 +265,6 @@ async fn cmd_export_notes() {
 	}
 }
 
-// Unix only: the CLI is stopped the way a user stops it, with SIGINT, so the engine finishes its pass
-// and releases the drive lock instead of leaving it to expire on the shared test account.
 #[cfg(unix)]
 #[shared_test_runtime]
 async fn cmd_sync() {
@@ -283,41 +288,109 @@ async fn cmd_sync() {
 
 	// its own config dir, so the engine's database starts empty and is deleted afterwards
 	let config_dir = assert_fs::TempDir::new().unwrap();
-	let (_auth_config_dir, auth_config) = test_utils::cli::prepare_cli_auth_config().await;
 	// `<local>:<remote>`, which syncs two-way
 	let pair = format!("{}:{test_dir_name}", local.path().to_str().unwrap());
+	let uploaded_path = format!("{test_dir_name}/from_local.txt");
+	let stdout = sync_until(config_dir.path(), &pair, async || {
+		let downloaded = std::fs::read_to_string(local.path().join("from_remote.txt")).ok();
+		downloaded.as_deref() == Some("from the remote side")
+			&& is_remote_file(client, &uploaded_path).await
+	})
+	.await;
+	assert!(stdout.contains("Uploaded from_local.txt"), "{stdout}");
+	assert!(stdout.contains("Downloaded from_remote.txt"), "{stdout}");
+}
+
+/// A pair an earlier version of the CLI registered kept the delete guard it stored, which held
+/// every deletion of a pair with fewer than a million items. Running the pair again puts it back on
+/// the default guard.
+#[cfg(unix)]
+#[shared_test_runtime]
+async fn cmd_sync_puts_a_registered_pair_back_on_the_default_delete_guard() {
+	// Not `get_resources_with_lock`, for the reason `cmd_sync` gives.
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir_name = resources.dir.name().unwrap();
+	let local = assert_fs::TempDir::new().unwrap();
+	let config_dir = assert_fs::TempDir::new().unwrap();
+	let db_path = config_dir.path().join("sync-engine.db");
+	let pair = format!("{}:{test_dir_name}", local.path().to_str().unwrap());
+
+	std::fs::write(local.path().join("first.txt"), "first").unwrap();
+	let first_path = format!("{test_dir_name}/first.txt");
+	sync_until(config_dir.path(), &pair, async || {
+		is_remote_file(client, &first_path).await
+	})
+	.await;
+
+	// the guard those versions stored
+	let engine = SyncEngine::open(Arc::clone(client), db_path.clone())
+		.await
+		.unwrap();
+	let pairs = engine.list_pairs().await.unwrap();
+	let [registered] = pairs.as_slice() else {
+		panic!("expected the one pair the CLI registered, got {pairs:?}");
+	};
+	engine
+		.set_delete_guard(registered.id, DeleteGuard::new(0, 0.000001).unwrap())
+		.await
+		.unwrap();
+	// releases the database's lock for the CLI
+	drop(engine);
+
+	std::fs::write(local.path().join("second.txt"), "second").unwrap();
+	let second_path = format!("{test_dir_name}/second.txt");
+	sync_until(config_dir.path(), &pair, async || {
+		is_remote_file(client, &second_path).await
+	})
+	.await;
+
+	let engine = SyncEngine::open(Arc::clone(client), db_path).await.unwrap();
+	let guards = engine
+		.list_pairs()
+		.await
+		.unwrap()
+		.into_iter()
+		.map(|pair| pair.delete_guard)
+		.collect::<Vec<_>>();
+	assert_eq!(guards, [DeleteGuard::default()]);
+}
+
+/// Runs `sync --pair <pair>` with `config_dir` until `synced` holds, then stops it and returns its
+/// stdout.
+///
+/// Unix only: the CLI is stopped the way a user stops it, with SIGINT, so the engine finishes its
+/// pass and releases the drive lock instead of leaving it to expire on the shared test account.
+#[cfg(unix)]
+async fn sync_until(
+	config_dir: &Path,
+	pair: &str,
+	mut synced: impl AsyncFnMut() -> bool,
+) -> String {
+	let (_auth_config_dir, auth_config) = test_utils::cli::prepare_cli_auth_config().await;
 	let mut cli = Command::new(env!("CARGO_BIN_EXE_filen-cli"))
 		.args([
 			"--auth-config-path",
 			auth_config.to_str().unwrap(),
 			"--config-dir",
-			config_dir.path().to_str().unwrap(),
+			config_dir.to_str().unwrap(),
 			"--skip-update",
 			"sync",
 			"--pair",
-			&pair,
+			pair,
 		])
 		.stdout(Stdio::piped())
 		.stderr(Stdio::piped())
 		.spawn()
 		.unwrap();
 
-	let uploaded_path = format!("{test_dir_name}/from_local.txt");
 	let deadline = Instant::now() + Duration::from_secs(300);
-	loop {
-		let downloaded = std::fs::read_to_string(local.path().join("from_remote.txt")).ok();
-		let uploaded = matches!(
-			client.find_item_at_path(&uploaded_path).await.unwrap(),
-			Some(NonRootFileType::File(_))
-		);
-		if downloaded.as_deref() == Some("from the remote side") && uploaded {
-			break;
-		}
+	while !synced().await {
 		if Instant::now() >= deadline || cli.try_wait().unwrap().is_some() {
 			let _ = cli.kill();
 			let output = cli.wait_with_output().unwrap();
 			panic!(
-				"sync did not bring both files across (downloaded: {downloaded:?}, uploaded: {uploaded})\nstdout:\n{}\nstderr:\n{}",
+				"sync did not get there\nstdout:\n{}\nstderr:\n{}",
 				String::from_utf8_lossy(&output.stdout),
 				String::from_utf8_lossy(&output.stderr)
 			);
@@ -331,11 +404,18 @@ async fn cmd_sync() {
 		.unwrap();
 	assert!(interrupted.success());
 	let output = cli.wait_with_output().unwrap();
-	let stdout = String::from_utf8_lossy(&output.stdout);
+	let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
 	assert!(
 		output.status.success(),
 		"the CLI did not stop cleanly:\n{stdout}"
 	);
-	assert!(stdout.contains("Uploaded from_local.txt"), "{stdout}");
-	assert!(stdout.contains("Downloaded from_remote.txt"), "{stdout}");
+	stdout
+}
+
+#[cfg(unix)]
+async fn is_remote_file(client: &Client, path: &str) -> bool {
+	matches!(
+		client.find_item_at_path(path).await.unwrap(),
+		Some(NonRootFileType::File(_))
+	)
 }

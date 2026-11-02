@@ -10,7 +10,7 @@ use filen_sdk_rs::{
 		HasUUID as _,
 		categories::{NonRootFileType, NonRootItemType},
 	},
-	sync_engine::{PairRecord, SyncEngine, SyncMode},
+	sync_engine::{DeleteGuard, PairRecord, SyncEngine, SyncMode},
 };
 use serde::Deserialize;
 
@@ -57,7 +57,7 @@ pub(crate) async fn register_sync_pairs(
 					)));
 				}
 			};
-			engine
+			let pair = engine
 				.add_pair(local.clone(), remote_uuid, mode)
 				.await
 				.map_err(|e| {
@@ -65,6 +65,17 @@ pub(crate) async fn register_sync_pairs(
 						"Failed to set up the sync pair {} <> {remote_path}: {e}",
 						local.display()
 					))
+				})?;
+			// Set on every run, not only when the pair is new: earlier versions stored a guard that
+			// held every deletion, and a pair they registered keeps it until it is overwritten.
+			engine
+				.set_delete_guard(pair, DeleteGuard::default())
+				.await
+				.with_context(|| {
+					format!(
+						"Failed to set the delete guard of the sync pair {} <> {remote_path}",
+						local.display()
+					)
 				})?;
 		}
 	}
