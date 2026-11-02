@@ -17,7 +17,7 @@ use ftail::Ftail;
 use log::{LevelFilter, info, warn};
 
 use crate::{
-	commands::{Commands, execute_command},
+	commands::{Commands, execute_command, fs_cmds::FsCommands},
 	docs::{generate_markdown_docs, print_in_app_docs},
 	log_files::LogFiles,
 	ui::{CustomLogger, ReplPromptResult},
@@ -302,6 +302,14 @@ async fn inner_main(ui: &mut ui::UI, arenas_limited: bool) -> Result<()> {
 			},
 		)?;
 		return Ok(());
+	}
+
+	// a single command has no working directory to change
+	if let Some(Commands::Fs(FsCommands::Cd { .. })) = cli_args.command {
+		return Err(ui::UI::usage_failure(
+			"`cd` only works in the REPL. To run a command in another directory, pass \
+			 --working-path, or run `filen` without a command to enter the REPL.",
+		));
 	}
 
 	if !cli_args.skip_update {

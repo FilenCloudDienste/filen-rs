@@ -113,3 +113,14 @@ fn exporting_the_markdown_docs_exits_after_writing_them() {
 			.is_file()
 	);
 }
+
+#[test]
+fn cd_outside_the_repl_is_a_usage_error() {
+	let output = run(&["cd", "/some/dir"]);
+
+	assert_eq!(output.status.code(), Some(2));
+	assert_eq!(String::from_utf8(output.stdout).unwrap(), "");
+	let stderr = String::from_utf8(output.stderr).unwrap();
+	assert!(stderr.contains("`cd` only works in the REPL"), "{stderr}");
+	assert!(stderr.contains("--working-path"), "{stderr}");
+}
