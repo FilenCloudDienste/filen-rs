@@ -3,9 +3,17 @@
 //! when the CLI is run (unless skipped in the 5mins since the last check, or through the `--skip-update` flag).
 //! The executable will be replaced in place, with the filename updated if it contains the version number.
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+use std::{
+	io::{self, Write},
+	path::Path,
+};
+
 use anyhow::{Context, Result};
 use semver::VersionReq;
 use serde::{Deserialize, Serialize};
+use tempfile::TempPath;
 use tokio::fs;
 
 use crate::ui::UI;
@@ -131,25 +139,41 @@ pub(crate) async fn check_for_updates(
 					BUILD_TARGET
 				)
 			})?;
-		let tempdir = tempfile::tempdir()?;
-		let download_path = &tempdir.path().join(&asset.name);
-		download_file(&asset.browser_download_url, download_path).await?;
-		let curent_executable =
+		let current_executable =
 			std::env::current_exe().context("Failed to get current executable")?;
-		let current_executable_name = curent_executable
+		let current_executable_name = current_executable
 			.file_name()
 			.ok_or(anyhow::anyhow!("Failed to get current executable name"))?
 			.to_str()
 			.ok_or(anyhow::anyhow!("Failed to get current executable name"))?;
+		// owned, because the install below runs on a blocking thread
+		let executable_dir = current_executable
+			.parent()
+			.ok_or(anyhow::anyhow!(
+				"Failed to get current executable directory"
+			))?
+			.to_path_buf();
+		let content = download_file(&asset.browser_download_url).await?;
 		if current_executable_name.contains(&version) {
-			let update_path = curent_executable
+			let update_path = current_executable
 				.with_file_name(current_executable_name.replace(&version, latest_tag));
-			tokio::fs::rename(download_path, &update_path).await?;
+			// writing, syncing and renaming a multi-MB binary blocks, so keep it off the
+			// runtime's workers
+			let update_path = tokio::task::spawn_blocking(move || {
+				install_renamed_update(&executable_dir, &content, &update_path, || {
+					self_replace::self_delete()
+				})
+				.map(|()| update_path)
+			})
+			.await??;
 			ui.print_muted(&format!("Downloaded update to {}", update_path.display()));
-			self_replace::self_delete().context("Failed to delete old binary")?;
 		} else {
-			self_replace::self_replace(download_path)
-				.context("Failed to replace binary with update")?;
+			tokio::task::spawn_blocking(move || {
+				install_replacing_update(&executable_dir, &content, |staged| {
+					self_replace::self_replace(staged)
+				})
+			})
+			.await??;
 			ui.print_muted(
 				"Update installed successfully. It will take effect the next time you run the application.",
 			);
@@ -165,14 +189,69 @@ pub(crate) async fn check_for_updates(
 
 // util
 
-async fn download_file(url: &str, destination: &std::path::Path) -> Result<()> {
+async fn download_file(url: &str) -> Result<Vec<u8>> {
 	let response = reqwest::get(url)
 		.await
 		.with_context(|| format!("Failed to download file from {}", url))?;
-	let mut file = tokio::fs::File::create(destination).await?;
-	let content = response.bytes().await?;
-	tokio::io::copy(&mut content.as_ref(), &mut file).await?;
-	Ok(())
+	Ok(response.bytes().await?.into())
+}
+
+/// Prefix of the temporary file an update is written to before it is moved into place.
+const STAGED_UPDATE_PREFIX: &str = ".filen-cli-update-";
+
+/// Writes a downloaded update to a temporary file in `executable_dir`, the directory of the
+/// executable it replaces, so that installing it is a rename within one filesystem (a rename
+/// from a temp dir fails with EXDEV on tmpfs, or across Windows volumes).
+/// On unix the file is made executable (0755) before anything is replaced.
+/// The file is deleted when the returned path is dropped without being persisted.
+fn stage_update(executable_dir: &Path, content: &[u8]) -> io::Result<TempPath> {
+	let mut file = tempfile::Builder::new()
+		.prefix(STAGED_UPDATE_PREFIX)
+		.tempfile_in(executable_dir)?;
+	file.write_all(content)?;
+	file.as_file().sync_all()?;
+	#[cfg(unix)]
+	file.as_file()
+		.set_permissions(std::fs::Permissions::from_mode(0o755))?;
+	Ok(file.into_temp_path())
+}
+
+/// Atomically moves a staged update to `update_path`, replacing any file there.
+/// On failure the staged file is deleted and nothing else is touched.
+fn move_into_place(staged: TempPath, update_path: &Path) -> io::Result<()> {
+	// `error.path` is dropped here, which deletes the staged file
+	staged.persist(update_path).map_err(|error| error.error)
+}
+
+/// Installs an update under a new file name, for a binary whose name carries its version:
+/// stages `content` in `executable_dir`, moves it to `update_path`, and only then calls
+/// `delete_old` to remove the running binary. If staging or moving fails, `delete_old` is
+/// never called, so the old binary stays usable, and the staged file is removed.
+fn install_renamed_update(
+	executable_dir: &Path,
+	content: &[u8],
+	update_path: &Path,
+	delete_old: impl FnOnce() -> io::Result<()>,
+) -> Result<()> {
+	let staged = stage_update(executable_dir, content)
+		.with_context(|| format!("Failed to write update to {}", executable_dir.display()))?;
+	move_into_place(staged, update_path)
+		.with_context(|| format!("Failed to move update to {}", update_path.display()))?;
+	delete_old().context("Failed to delete old binary")
+}
+
+/// Installs an update over the running binary, for a binary whose name carries no version:
+/// stages `content` in `executable_dir` and hands its path to `replace` (`self_replace`, which
+/// copies the file over the old binary and keeps the old binary's permissions). The staged
+/// file is removed afterwards, whether `replace` succeeded or not.
+fn install_replacing_update(
+	executable_dir: &Path,
+	content: &[u8],
+	replace: impl FnOnce(&Path) -> io::Result<()>,
+) -> Result<()> {
+	let staged = stage_update(executable_dir, content)
+		.with_context(|| format!("Failed to write update to {}", executable_dir.display()))?;
+	replace(&staged).context("Failed to replace binary with update")
 }
 
 // last checked config
@@ -321,5 +400,130 @@ impl GitHubApiClient {
 				})
 			})
 			.collect::<Vec<Announcement>>())
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use std::cell::Cell;
+
+	use super::*;
+
+	/// Lists the names of the files in `dir`, sorted.
+	fn file_names(dir: &Path) -> Vec<String> {
+		let mut names = std::fs::read_dir(dir)
+			.unwrap()
+			.map(|entry| entry.unwrap().file_name().into_string().unwrap())
+			.collect::<Vec<_>>();
+		names.sort();
+		names
+	}
+
+	#[cfg(unix)]
+	fn mode(path: &Path) -> u32 {
+		std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+	}
+
+	#[test]
+	fn staged_update_is_written_next_to_the_executable() {
+		let dir = tempfile::tempdir().unwrap();
+		let staged = stage_update(dir.path(), b"new binary").unwrap();
+		assert_eq!(staged.parent(), Some(dir.path()));
+		assert!(
+			staged
+				.file_name()
+				.unwrap()
+				.to_str()
+				.unwrap()
+				.starts_with(STAGED_UPDATE_PREFIX)
+		);
+		assert_eq!(std::fs::read(&staged).unwrap(), b"new binary");
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn staged_update_is_executable() {
+		let dir = tempfile::tempdir().unwrap();
+		let staged = stage_update(dir.path(), b"new binary").unwrap();
+		assert_eq!(mode(&staged), 0o755);
+	}
+
+	#[test]
+	fn renamed_update_is_moved_into_place_before_the_old_binary_is_deleted() {
+		let dir = tempfile::tempdir().unwrap();
+		let old = dir.path().join("filen-cli-v0.2.8-linux-x64");
+		std::fs::write(&old, b"old binary").unwrap();
+		let update_path = dir.path().join("filen-cli-v0.2.9-linux-x64");
+
+		install_renamed_update(dir.path(), b"new binary", &update_path, || {
+			// the new binary must be complete and in place when the old one goes
+			assert_eq!(std::fs::read(&update_path).unwrap(), b"new binary");
+			#[cfg(unix)]
+			assert_eq!(mode(&update_path), 0o755);
+			std::fs::remove_file(&old)
+		})
+		.unwrap();
+
+		assert_eq!(file_names(dir.path()), ["filen-cli-v0.2.9-linux-x64"]);
+	}
+
+	#[test]
+	fn failed_renamed_update_keeps_the_old_binary_and_deletes_the_staged_file() {
+		let dir = tempfile::tempdir().unwrap();
+		let old = dir.path().join("filen-cli-v0.2.8-linux-x64");
+		std::fs::write(&old, b"old binary").unwrap();
+		// the parent directory does not exist, so the move fails
+		let update_path = dir
+			.path()
+			.join("missing")
+			.join("filen-cli-v0.2.9-linux-x64");
+		let delete_called = Cell::new(false);
+
+		let error = install_renamed_update(dir.path(), b"new binary", &update_path, || {
+			delete_called.set(true);
+			Ok(())
+		})
+		.unwrap_err();
+
+		assert_eq!(
+			error.downcast_ref::<io::Error>().unwrap().kind(),
+			io::ErrorKind::NotFound
+		);
+		assert!(!delete_called.get());
+		assert_eq!(std::fs::read(&old).unwrap(), b"old binary");
+		assert_eq!(file_names(dir.path()), ["filen-cli-v0.2.8-linux-x64"]);
+	}
+
+	#[test]
+	fn replacing_update_is_staged_next_to_the_executable_and_then_removed() {
+		let dir = tempfile::tempdir().unwrap();
+		let old = dir.path().join("filen-cli");
+		std::fs::write(&old, b"old binary").unwrap();
+
+		install_replacing_update(dir.path(), b"new binary", |staged| {
+			assert_eq!(staged.parent(), Some(dir.path()));
+			#[cfg(unix)]
+			assert_eq!(mode(staged), 0o755);
+			std::fs::copy(staged, &old).map(|_| ())
+		})
+		.unwrap();
+
+		assert_eq!(std::fs::read(&old).unwrap(), b"new binary");
+		assert_eq!(file_names(dir.path()), ["filen-cli"]);
+	}
+
+	#[test]
+	fn failed_replacing_update_keeps_the_old_binary_and_deletes_the_staged_file() {
+		let dir = tempfile::tempdir().unwrap();
+		let old = dir.path().join("filen-cli");
+		std::fs::write(&old, b"old binary").unwrap();
+
+		install_replacing_update(dir.path(), b"new binary", |_| {
+			Err(io::Error::other("replace failed"))
+		})
+		.unwrap_err();
+
+		assert_eq!(std::fs::read(&old).unwrap(), b"old binary");
+		assert_eq!(file_names(dir.path()), ["filen-cli"]);
 	}
 }
