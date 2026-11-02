@@ -40,8 +40,7 @@ struct Files {
 	daily: LogFile,
 	/// The day `daily` is for.
 	day: NaiveDate,
-	/// Whether expired files are still to be deleted, which waits for a record so that
-	/// `latest.log` is written to first: a `latest.log` left by a run days ago would expire too.
+	/// Whether the next record first deletes expired files.
 	prune_due: bool,
 }
 
@@ -93,21 +92,27 @@ impl LogFiles {
 		}
 		if files.prune_due {
 			files.prune_due = false;
-			self.delete_expired();
+			self.delete_expired(files);
 		}
 		files.daily.write(line, self.max_file_size)
 	}
 
-	/// Deletes every `.log` file in `dir` last written more than `retention_days` ago. One that
-	/// cannot be read or deleted is left for the next pass.
-	fn delete_expired(&self) {
+	/// Deletes every `.log` file in `dir` last written more than `retention_days` ago, except the
+	/// two in `files`, which this logger writes to however old they look: on Windows a directory
+	/// listing can report the time a file was last written before it was opened, and today's file
+	/// is not written to until after this. One that cannot be read or deleted is left for the next
+	/// pass.
+	fn delete_expired(&self, files: &Files) {
 		let Ok(entries) = fs::read_dir(&self.dir) else {
 			return;
 		};
 		let now = SystemTime::now();
 		for entry in entries.flatten() {
 			let path = entry.path();
-			if path.extension().is_none_or(|ext| ext != "log") {
+			if path.extension().is_none_or(|ext| ext != "log")
+				|| path == files.latest.path
+				|| path == files.daily.path
+			{
 				continue;
 			}
 			let age = entry
@@ -395,6 +400,23 @@ mod tests {
 		assert!(dir.path().join("2020-01-05.log").exists());
 		assert!(dir.path().join("2020-01-01.log.old").exists());
 		assert_eq!(messages(&read(&dir, LATEST)), ["hello"]);
+	}
+
+	#[test]
+	fn the_first_record_keeps_the_files_it_writes_to_however_old_they_look() {
+		let dir = TempDir::new().unwrap();
+		let today = Local::now();
+		for name in [LATEST.to_owned(), daily_file_name(today)] {
+			File::create(dir.path().join(name))
+				.unwrap()
+				.set_times(days_ago(10))
+				.unwrap();
+		}
+		let files = LogFiles::open(dir.path(), LevelFilter::Debug, 1024, 3).unwrap();
+		log_line_at(&files, today, "hello");
+
+		assert_eq!(messages(&read(&dir, LATEST)), ["hello"]);
+		assert_eq!(messages(&read(&dir, &daily_file_name(today))), ["hello"]);
 	}
 
 	#[test]
