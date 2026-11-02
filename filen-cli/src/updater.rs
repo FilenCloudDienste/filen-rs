@@ -35,7 +35,8 @@ const LAST_CHECK_VALIDITY_SECS: i64 = 5 * 60;
 /// be replaced in place.
 /// Annnouncements targeted at the current version will also be displayed.
 /// When not using REPL, updates are not automatically installed, only
-/// a message is shown to the user.
+/// a message is shown to the user. Declining the update in the REPL
+/// starts the REPL with the current version.
 /// A failed check (offline, an error from GitHub, a failed install) is printed as a warning
 /// and never fails the command. It still counts as a check, so the next one waits as long as
 /// after a successful one.
@@ -164,7 +165,9 @@ async fn handle_latest_release(
 		)
 		.context("Failed to read confirmation")?
 	{
-		return Err(UI::failure("Update rejected by user"));
+		// the CLI carries on with this version, and asks again after the next check
+		log::info!("Update to v{latest_tag} declined");
+		return Ok(());
 	}
 	let asset = latest_release
 		.assets
