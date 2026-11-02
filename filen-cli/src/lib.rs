@@ -33,7 +33,7 @@ use crate::{
 	},
 	docs::{generate_markdown_docs, print_in_app_docs},
 	log_files::{LogFiles, LogLimits},
-	ui::{ConsoleLogLevel, CustomLogger, ReplPromptResult},
+	ui::{ConsoleLogLevel, CustomLogger, ReplPrompt},
 	updater::check_for_updates,
 	util::RemotePath,
 };
@@ -390,22 +390,11 @@ async fn inner_main(ui: &mut ui::UI, arenas_limited: bool) -> Result<()> {
 			initial_working_path(ui, &mut client, cli_args.working_path.as_deref()).await?;
 
 		loop {
-			let repl_result = ui.prompt_repl(client.get_arc().unwrap(), &working_path)?;
-			let line = match repl_result {
-				ReplPromptResult {
-					input: Some(line), ..
-				} if line.is_empty() => continue,
-				ReplPromptResult {
-					input: Some(line), ..
-				} => line,
-				ReplPromptResult {
-					input: None,
-					exit: true,
-				} => break,
-				ReplPromptResult {
-					input: None,
-					exit: false,
-				} => continue,
+			let line = match ui.prompt_repl(client.get_arc().unwrap(), &working_path)? {
+				ReplPrompt::Line(line) if line.is_empty() => continue,
+				ReplPrompt::Line(line) => line,
+				ReplPrompt::Cleared => continue,
+				ReplPrompt::Exit => break,
 			};
 			let line_args = match parse_repl_line(&line) {
 				Ok(line_args) => line_args,

@@ -2,7 +2,7 @@ use std::{
 	fs,
 	io::{self, IsTerminal, Write},
 	sync::{
-		Arc,
+		Arc, Mutex, PoisonError,
 		atomic::{AtomicUsize, Ordering},
 	},
 };
@@ -12,8 +12,8 @@ use clap::{CommandFactory, builder::Styles};
 use console::{self, style};
 use filen_sdk_rs::auth::Client;
 use inquire::{
-	Autocomplete, InquireError,
-	history::SimpleHistory,
+	Autocomplete, CustomUserError, InquireError,
+	history::{History, Replacement, SimpleHistory},
 	ui::{RenderConfig, Styled},
 };
 use log::{LevelFilter, error, info, warn};
@@ -463,7 +463,7 @@ impl UI {
 		&mut self,
 		client: Arc<Client>,
 		working_path: &RemotePath,
-	) -> Result<ReplPromptResult> {
+	) -> Result<ReplPrompt> {
 		info!("[PROMPT] prompt_repl with path: {}", working_path);
 		let prompt_prefix = self.redact_for_replay_testing(format!("({})", client.email()));
 		let render_config = RenderConfig::default()
@@ -474,14 +474,19 @@ impl UI {
 				Styled::new(prompt_prefix.as_str()).with_fg(inquire::ui::Color::LightCyan),
 			);
 		let working_path_str = self.redact_for_replay_testing(format!("{}", working_path));
+		let typed = TypedLine::default();
 		match inquire::Text::new(&working_path_str)
 			.with_render_config(render_config)
 			.with_autocomplete(InquireCompleter {
 				client,
 				working_path: working_path.clone(),
 				disable_suggestions: self.disable_suggestions,
+				typed: typed.clone(),
 			})
-			.with_history(SimpleHistory::new(self.history.clone()))
+			.with_history(TypedHistory {
+				history: SimpleHistory::new(self.history.clone()),
+				typed: typed.clone(),
+			})
 			.prompt_skippable()
 		{
 			Ok(Some(answer)) => {
@@ -490,31 +495,16 @@ impl UI {
 					// avoid duplicate entries in history
 					self.history.insert(0, answer.clone());
 				}
-				Ok(ReplPromptResult {
-					input: Some(answer),
-					exit: false,
-				})
+				Ok(ReplPrompt::Line(answer))
 			}
-			Ok(None) => {
-				info!("[PROMPT] skipped");
-				Ok(ReplPromptResult {
-					input: None,
-					exit: false,
-				})
-			}
-			Err(InquireError::OperationCanceled) => {
+			// Ctrl-D, which inquire cannot tell apart from Esc
+			Ok(None) | Err(InquireError::OperationCanceled) => {
 				info!("[PROMPT] canceled");
-				Ok(ReplPromptResult {
-					input: None,
-					exit: false,
-				})
+				Ok(ReplPrompt::cancelled(&typed))
 			}
 			Err(InquireError::OperationInterrupted) => {
 				info!("[PROMPT] interrupted");
-				Ok(ReplPromptResult {
-					input: None,
-					exit: true,
-				})
+				Ok(ReplPrompt::Exit)
 			}
 			Err(e) => {
 				error!("[PROMPT] failed to read input");
@@ -768,9 +758,79 @@ fn log_repl_line(line: &str) {
 	info!("[PROMPT] command: {}", command);
 }
 
-pub(crate) struct ReplPromptResult {
-	pub(crate) input: Option<String>,
-	pub(crate) exit: bool,
+/// What the REPL prompt read.
+#[derive(Debug, PartialEq)]
+pub(crate) enum ReplPrompt {
+	/// A line to run.
+	Line(String),
+	/// The line was dropped before it was entered; prompt again.
+	Cleared,
+	/// Leave the REPL.
+	Exit,
+}
+
+impl ReplPrompt {
+	/// After Ctrl-D, which leaves the REPL on an empty line, as in a shell, and otherwise drops the
+	/// line.
+	fn cancelled(typed: &TypedLine) -> Self {
+		if typed.is_empty() {
+			ReplPrompt::Exit
+		} else {
+			ReplPrompt::Cleared
+		}
+	}
+}
+
+/// The text typed at the REPL prompt so far, which inquire does not hand out when the prompt is
+/// cancelled. The prompt's autocompletion and history see every change to it: typing goes through
+/// [`Autocomplete::get_suggestions`], tab completion through [`Autocomplete::get_completion`] and
+/// the arrow keys through [`TypedHistory`].
+// An `Arc` because the autocompletion and the history inquire takes are clones of one another,
+// read after the prompt has ended.
+#[derive(Clone, Default)]
+struct TypedLine(Arc<Mutex<String>>);
+
+impl TypedLine {
+	fn set(&self, line: &str) {
+		let mut typed = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+		typed.clear();
+		typed.push_str(line);
+	}
+
+	fn is_empty(&self) -> bool {
+		self.0
+			.lock()
+			.unwrap_or_else(PoisonError::into_inner)
+			.is_empty()
+	}
+}
+
+/// The REPL's history, telling [`TypedLine`] of the line each arrow key puts at the prompt.
+#[derive(Clone)]
+struct TypedHistory {
+	history: SimpleHistory,
+	typed: TypedLine,
+}
+
+impl History for TypedHistory {
+	fn earlier_element(&mut self) -> Result<Replacement, CustomUserError> {
+		let replacement = self.history.earlier_element()?;
+		if let Some(line) = &replacement {
+			self.typed.set(line);
+		}
+		Ok(replacement)
+	}
+
+	fn later_element(&mut self) -> Result<Replacement, CustomUserError> {
+		let replacement = self.history.later_element()?;
+		// Past the latest line, inquire empties the prompt.
+		self.typed.set(replacement.as_deref().unwrap_or_default());
+		Ok(replacement)
+	}
+
+	fn prepend_element(&mut self, line: String) {
+		self.history.prepend_element(line);
+	}
 }
 
 pub(crate) fn format_date(date: &chrono::DateTime<chrono::Utc>) -> String {
@@ -809,6 +869,7 @@ struct InquireCompleter {
 	client: Arc<Client>,
 	working_path: RemotePath,
 	disable_suggestions: bool,
+	typed: TypedLine,
 }
 
 impl Autocomplete for InquireCompleter {
@@ -817,19 +878,24 @@ impl Autocomplete for InquireCompleter {
 		input: &str,
 		highlighted_suggestion: Option<String>,
 	) -> std::prelude::v1::Result<inquire::autocompletion::Replacement, inquire::CustomUserError> {
-		if highlighted_suggestion.is_some() {
-			Ok(highlighted_suggestion)
+		let completion = if highlighted_suggestion.is_some() {
+			highlighted_suggestion
 		} else {
 			let completions =
 				crate::completion::completer(input, self.client.clone(), &self.working_path, true);
-			Ok(completions.first().cloned())
+			completions.first().cloned()
+		};
+		if let Some(line) = &completion {
+			self.typed.set(line);
 		}
+		Ok(completion)
 	}
 
 	fn get_suggestions(
 		&mut self,
 		input: &str,
 	) -> std::prelude::v1::Result<Vec<String>, inquire::CustomUserError> {
+		self.typed.set(input);
 		if self.disable_suggestions {
 			return Ok(Vec::new());
 		}
@@ -1370,6 +1436,36 @@ mod tests {
 			);
 			assert_eq!(crate::error::exit_code(&err), 2);
 		}
+	}
+
+	#[test]
+	fn ctrl_d_on_an_empty_repl_line_leaves_the_repl() {
+		assert_eq!(
+			ReplPrompt::cancelled(&TypedLine::default()),
+			ReplPrompt::Exit
+		);
+	}
+
+	#[test]
+	fn ctrl_d_after_typing_drops_the_line() {
+		let typed = TypedLine::default();
+		typed.set("ls");
+		assert_eq!(ReplPrompt::cancelled(&typed), ReplPrompt::Cleared);
+	}
+
+	#[test]
+	fn a_line_brought_back_from_the_history_counts_as_typed() {
+		let typed = TypedLine::default();
+		let mut history = TypedHistory {
+			history: SimpleHistory::new(vec!["ls".to_owned()]),
+			typed: typed.clone(),
+		};
+
+		assert_eq!(history.earlier_element().unwrap().as_deref(), Some("ls"));
+		assert_eq!(ReplPrompt::cancelled(&typed), ReplPrompt::Cleared);
+		// past the latest line, the prompt is empty again
+		assert_eq!(history.later_element().unwrap(), None);
+		assert_eq!(ReplPrompt::cancelled(&typed), ReplPrompt::Exit);
 	}
 
 	#[test]
