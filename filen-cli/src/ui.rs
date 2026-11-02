@@ -455,7 +455,8 @@ impl UI {
 		}
 	}
 
-	/// Prompt the user for a password (hidden).
+	/// Prompt the user for a secret, such as a password or a two-factor code, masking what is
+	/// typed.
 	/// Returns None if the user cancels the prompt (Ctrl+C or Esc)
 	pub(crate) fn prompt_password(&mut self, msg: &str) -> Result<String> {
 		info!("[PROMPT] prompt_password with message: {}", msg);

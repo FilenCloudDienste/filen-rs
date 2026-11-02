@@ -188,7 +188,7 @@ async fn login_and_optionally_prompt_two_factor_code(
 	{
 		Ok(client) => Ok(client),
 		Err(e) if e.kind() == ErrorKind::Enter2fa => {
-			let two_factor_code = ui.prompt("Two-factor authentication code: ")?;
+			let two_factor_code = ui.prompt_password("Two-factor authentication code: ")?;
 			match unauth_client
 				.login(email, password, two_factor_code.trim())
 				.await
