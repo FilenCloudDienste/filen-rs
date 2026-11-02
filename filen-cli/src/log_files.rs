@@ -92,19 +92,7 @@ impl LogFiles {
 		// daily ones are never opened again, so the directory is closed to other users as well.
 		#[cfg(unix)]
 		fs::set_permissions(dir, Permissions::from_mode(PRIVATE_DIR_MODE))?;
-		let path = dir.join(LATEST);
-		// Overwrites from the start without truncating, as ftail's `single_file` did, so a run
-		// that logs less than the one before it leaves the end of that run's lines behind.
-		let latest = LogFile {
-			file: open_private(
-				private_file_options()
-					.create(true)
-					.write(true)
-					.truncate(false),
-				&path,
-			)?,
-			path,
-		};
+		let latest = LogFile::open_latest(dir)?;
 		let day = Local::now().date_naive();
 		Ok(Self {
 			dir: dir.to_owned(),
@@ -199,6 +187,26 @@ impl LogFiles {
 }
 
 impl LogFile {
+	/// Opens `latest.log` emptied, so that it holds this run's lines only, and for appending, so
+	/// that the lines of another CLI process writing to it at the same time go after this one's
+	/// rather than over them. The previous run's lines are still in its daily file.
+	fn open_latest(dir: &Path) -> io::Result<Self> {
+		let path = dir.join(LATEST);
+		// Emptied by a separate open, since a file opened for appending cannot be truncated on
+		// Windows.
+		open_private(
+			private_file_options()
+				.create(true)
+				.write(true)
+				.truncate(true),
+			&path,
+		)?;
+		Ok(Self {
+			file: open_private(private_file_options().create(true).append(true), &path)?,
+			path,
+		})
+	}
+
 	fn open_daily(dir: &Path, day: NaiveDate) -> io::Result<Self> {
 		let path = dir.join(format!("{}.log", day.format("%Y-%m-%d")));
 		Ok(Self {
@@ -358,6 +366,32 @@ mod tests {
 		);
 
 		assert_eq!(read(&dir, LATEST), "");
+	}
+
+	#[test]
+	fn latest_holds_only_the_lines_of_the_last_run() {
+		let dir = TempDir::new().unwrap();
+		let first = LogFiles::open(dir.path(), LevelFilter::Debug, 1024, 3).unwrap();
+		log_line(&first, "a longer line from the first run");
+		drop(first);
+		let second = LogFiles::open(dir.path(), LevelFilter::Debug, 1024, 3).unwrap();
+		log_line(&second, "short");
+
+		assert_eq!(messages(&read(&dir, LATEST)), ["short"]);
+	}
+
+	#[test]
+	fn loggers_opening_latest_one_after_the_other_append_after_each_other() {
+		let dir = TempDir::new().unwrap();
+		let first = LogFiles::open(dir.path(), LevelFilter::Debug, 1024, 3).unwrap();
+		log_line(&first, "first-1");
+		let second = LogFiles::open(dir.path(), LevelFilter::Debug, 1024, 3).unwrap();
+		log_line(&first, "first-2");
+		log_line(&second, "second-1");
+
+		let latest = read(&dir, LATEST);
+		assert!(!latest.contains('\0'), "{latest:?}");
+		assert_eq!(messages(&latest), ["first-2", "second-1"]);
 	}
 
 	#[test]

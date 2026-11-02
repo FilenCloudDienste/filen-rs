@@ -69,7 +69,7 @@ fn processes_deleting_the_same_expired_log_files_at_once_all_succeed() {
 }
 
 #[test]
-fn processes_moving_the_same_full_log_files_aside_at_once_all_succeed_and_keep_them() {
+fn processes_moving_the_same_full_daily_file_aside_at_once_all_succeed_and_keep_it() {
 	let config_dir = TempDir::new().unwrap();
 	let logs = config_dir.path().join("logs");
 	fs::create_dir(&logs).unwrap();
@@ -85,14 +85,27 @@ fn processes_moving_the_same_full_log_files_aside_at_once_all_succeed_and_keep_t
 
 	run_at_once(config_dir.path());
 
-	for prefix in ["latest.log", &today] {
-		let sizes = sizes_of_files_starting_with(&logs, prefix);
-		assert_eq!(
-			sizes.iter().filter(|&&size| size == full).count(),
-			1,
-			"{prefix}: {sizes:?}"
-		);
-	}
+	let sizes = sizes_of_files_starting_with(&logs, &today);
+	assert_eq!(
+		sizes.iter().filter(|&&size| size == full).count(),
+		1,
+		"{today}: {sizes:?}"
+	);
+	// `latest.log` starts empty in each run, so the full one is gone rather than moved aside.
+	let sizes = sizes_of_files_starting_with(&logs, "latest.log");
+	assert!(sizes.iter().all(|&size| size < full), "{sizes:?}");
+}
+
+#[test]
+fn processes_writing_latest_at_once_leave_whole_lines_only() {
+	let config_dir = TempDir::new().unwrap();
+
+	run_at_once(config_dir.path());
+
+	let log = fs::read_to_string(config_dir.path().join("logs").join("latest.log")).unwrap();
+	assert!(!log.contains('\0'), "{log:?}");
+	assert!(log.ends_with('\n'), "{log:?}");
+	assert!(log.contains("Logging level: OFF"), "{log}");
 }
 
 #[test]
