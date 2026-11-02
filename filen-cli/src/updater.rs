@@ -122,7 +122,8 @@ pub(crate) async fn check_for_updates(
 				version, latest_tag
 			));
 		} else if !ui
-			.prompt_confirm(
+			// installing an update is not what --yes confirms
+			.prompt_yes_no(
 				&format!("Update now from v{} to v{}", version, latest_tag),
 				true,
 			)

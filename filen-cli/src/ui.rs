@@ -1,4 +1,5 @@
 use std::{
+	fs,
 	io::{self, IsTerminal, Write},
 	sync::{
 		Arc,
@@ -111,6 +112,47 @@ impl log::Log for CustomLogger {
 	fn flush(&self) {}
 }
 
+/// Where the answers to the CLI's prompts come from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PromptInput {
+	/// A terminal: the one on stdin, or the controlling terminal when stdin is not one.
+	Terminal,
+	/// Nowhere, as `--no-input` asks.
+	NoInputFlag,
+	/// Nowhere, as stdin is not a terminal and there is no other to ask at.
+	NotATerminal,
+}
+
+impl PromptInput {
+	/// Where prompts are answered: at the terminal on stdin, or, when stdin is not one (a file
+	/// redirected to it, or commands piped in), at the controlling terminal, as git, ssh and sudo
+	/// ask, if there is one (`controlling_terminal`) and stderr, which the prompts are shown on, is
+	/// a terminal too. inquire reads the keys from the controlling terminal itself when stdin is not
+	/// a terminal.
+	fn detect(
+		stdin_is_terminal: bool,
+		stderr_is_terminal: bool,
+		controlling_terminal: impl FnOnce() -> bool,
+	) -> Self {
+		if stdin_is_terminal || (stderr_is_terminal && controlling_terminal()) {
+			PromptInput::Terminal
+		} else {
+			PromptInput::NotATerminal
+		}
+	}
+}
+
+/// Whether the process has a controlling terminal to read answers from: `/dev/tty`, or on Windows
+/// the console's input, `CONIN$`, where inquire reads keys from when stdin is not a terminal.
+fn has_controlling_terminal() -> bool {
+	let terminal = if cfg!(windows) { "CONIN$" } else { "/dev/tty" };
+	fs::OpenOptions::new()
+		.read(true)
+		.write(true)
+		.open(terminal)
+		.is_ok()
+}
+
 // Independent output settings, each set from its own CLI flag.
 #[allow(clippy::struct_excessive_bools)]
 pub(crate) struct UI {
@@ -125,6 +167,9 @@ pub(crate) struct UI {
 	stdout_is_terminal: bool,
 	/// Whether to output machine-readable JSON where applicable
 	pub(crate) json: bool,
+	/// Whether to answer yes to every confirmation, as `--yes` asks.
+	assume_yes: bool,
+	prompt_input: PromptInput,
 	disable_suggestions: bool,
 	/// Whether to redact things that depend on the runtime environment, like: paths, ...
 	make_output_environment_agnostic_for_replay_testing: bool,
@@ -134,6 +179,11 @@ impl UI {
 	pub(crate) fn new() -> Self {
 		let mut ui = Self::with_writers(io::stdout(), io::stderr());
 		ui.stdout_is_terminal = io::stdout().is_terminal();
+		ui.prompt_input = PromptInput::detect(
+			io::stdin().is_terminal(),
+			io::stderr().is_terminal(),
+			has_controlling_terminal,
+		);
 		ui
 	}
 
@@ -149,6 +199,8 @@ impl UI {
 			err: Box::new(err),
 			stdout_is_terminal: false,
 			json: false,
+			assume_yes: false,
+			prompt_input: PromptInput::NotATerminal,
 			disable_suggestions: false,
 			make_output_environment_agnostic_for_replay_testing: false,
 		}
@@ -168,6 +220,17 @@ impl UI {
 		self.disable_suggestions = disable_suggestions;
 		self.make_output_environment_agnostic_for_replay_testing =
 			make_output_environment_agnostic_for_replay_testing;
+	}
+
+	/// Never prompts from now on, as `--no-input` asks: a prompt fails instead, and a
+	/// confirmation unless [`UI::set_assume_yes`] answers it.
+	pub(crate) fn disable_prompts(&mut self) {
+		self.prompt_input = PromptInput::NoInputFlag;
+	}
+
+	/// Sets `--yes`, which a REPL line can turn on for its command.
+	pub(crate) fn set_assume_yes(&mut self, assume_yes: bool) {
+		self.assume_yes = assume_yes;
 	}
 
 	pub(crate) fn is_quiet(&self) -> bool {
@@ -453,6 +516,7 @@ impl UI {
 	/// Returns None if the user cancels the prompt (Ctrl+C or Esc)
 	pub(crate) fn prompt(&mut self, msg: &str) -> Result<String> {
 		info!("[PROMPT] prompt with message: {}", msg);
+		self.ensure_can_prompt(msg)?;
 		match Self::handle_prompt_result(inquire::Text::new(msg.trim()).prompt()) {
 			Ok(Some(answer)) => Ok(answer),
 			Ok(None) => Err(UI::failure("Canceled")),
@@ -465,6 +529,7 @@ impl UI {
 	/// Returns None if the user cancels the prompt (Ctrl+C or Esc)
 	pub(crate) fn prompt_password(&mut self, msg: &str) -> Result<String> {
 		info!("[PROMPT] prompt_password with message: {}", msg);
+		self.ensure_can_prompt(msg)?;
 		match Self::handle_prompt_result(
 			inquire::Password::new(msg.trim())
 				.with_display_mode(inquire::PasswordDisplayMode::Masked)
@@ -494,9 +559,58 @@ impl UI {
 		}
 	}
 
-	/// Prompt the user for a yes/no input
+	/// Fails unless a prompt asking `msg` can be shown: with `--no-input`, or without a terminal
+	/// ([`PromptInput::detect`]), nobody could answer it. A usage error, since the command line has to give what the
+	/// prompt would ask for instead.
+	pub(crate) fn ensure_can_prompt(&self, msg: &str) -> Result<()> {
+		self.ensure_prompt_input(msg, "")
+	}
+
+	/// [`UI::ensure_can_prompt`], with `hint` after the reason.
+	fn ensure_prompt_input(&self, msg: &str, hint: &str) -> Result<()> {
+		let reason = match self.prompt_input {
+			PromptInput::Terminal => return Ok(()),
+			PromptInput::NoInputFlag => "--no-input was given",
+			PromptInput::NotATerminal => "stdin is not a terminal",
+		};
+		Err(UI::usage_failure(&format!(
+			"Cannot ask \"{}\": {reason}.{hint}",
+			msg.trim()
+		)))
+	}
+
+	/// Ask the user to confirm what the command is about to do. `--yes` answers yes without
+	/// asking; without it, the confirmation fails when it cannot be asked
+	/// ([`UI::ensure_can_prompt`]), saying to pass `--yes`.
 	pub(crate) fn prompt_confirm(&mut self, msg: &str, default: bool) -> Result<bool> {
 		info!("[PROMPT] prompt_confirm with message: {}", msg);
+		self.ensure_can_confirm(msg)?;
+		if self.assume_yes {
+			info!("[PROMPT] answered yes by --yes");
+			return Ok(true);
+		}
+		self.ask_yes_no(msg, default)
+	}
+
+	/// Fails unless the confirmation `msg` can be answered, by `--yes` or at the terminal, as
+	/// [`UI::prompt_confirm`] would. A command calls it before the work that leads up to the
+	/// confirmation, so that a script learns it needs `--yes` before anything is looked up.
+	pub(crate) fn ensure_can_confirm(&self, msg: &str) -> Result<()> {
+		if self.assume_yes {
+			return Ok(());
+		}
+		self.ensure_prompt_input(msg, " Pass --yes to answer yes.")
+	}
+
+	/// Ask the user a yes/no question that is not a confirmation, such as a setting to choose,
+	/// which `--yes` does not answer.
+	pub(crate) fn prompt_yes_no(&mut self, msg: &str, default: bool) -> Result<bool> {
+		info!("[PROMPT] prompt_yes_no with message: {}", msg);
+		self.ensure_can_prompt(msg)?;
+		self.ask_yes_no(msg, default)
+	}
+
+	fn ask_yes_no(&mut self, msg: &str, default: bool) -> Result<bool> {
 		let result = inquire::Confirm::new(&self.redact_for_replay_testing(msg.trim().to_string()))
 			.with_default(default)
 			.prompt();
@@ -523,6 +637,7 @@ impl UI {
 			"[PROMPT] prompt_select with message: {} and options: {:?}",
 			msg, options
 		);
+		self.ensure_can_prompt(msg)?;
 		let result = inquire::Select::new(
 			&self.redact_for_replay_testing(msg.trim().to_string()),
 			options,
@@ -787,6 +902,13 @@ pub(crate) mod test_support {
 		/// A UI that prints into this buffer, as a terminal shows stdout and stderr together.
 		pub(crate) fn ui(&self) -> UI {
 			UI::with_writers(self.clone(), self.clone())
+		}
+
+		/// [`Printed::ui`], as if stdin were a terminal, so that a prompt could be asked.
+		pub(crate) fn prompting_ui(&self) -> UI {
+			let mut ui = self.ui();
+			ui.prompt_input = PromptInput::Terminal;
+			ui
 		}
 
 		/// [`Printed::ui`], as if stdout were a terminal.
@@ -1086,6 +1208,123 @@ mod tests {
 		let mut ui = Printed::default().ui();
 		ui.initialize(false, false, None, true, true);
 		assert_eq!(ui.omit_for_replay_testing("value"), "[omit]");
+	}
+
+	#[test]
+	fn yes_answers_a_confirmation_without_asking() {
+		let mut ui = Printed::default().ui();
+		ui.disable_prompts();
+		ui.set_assume_yes(true);
+
+		assert!(ui.prompt_confirm("Permanently delete /a?", false).unwrap());
+	}
+
+	#[test]
+	fn a_confirmation_with_no_input_fails_with_a_usage_error_naming_yes() {
+		let mut ui = Printed::default().ui();
+		ui.disable_prompts();
+
+		let err = ui
+			.prompt_confirm("Permanently delete /a?", false)
+			.unwrap_err();
+		assert_eq!(
+			err.to_string(),
+			"Cannot ask \"Permanently delete /a?\": --no-input was given. Pass --yes to answer yes."
+		);
+		assert_eq!(crate::error::exit_code(&err), 2);
+	}
+
+	#[test]
+	fn a_prompt_can_be_asked_with_a_terminal_on_stdin() {
+		let ui = Printed::default().prompting_ui();
+
+		ui.ensure_can_prompt("Email:").unwrap();
+		ui.ensure_can_confirm("Permanently delete /a?").unwrap();
+	}
+
+	#[test]
+	fn a_confirmation_can_be_answered_by_yes_without_input() {
+		let mut ui = Printed::default().ui();
+		ui.disable_prompts();
+		ui.set_assume_yes(true);
+
+		ui.ensure_can_confirm("Permanently delete /a?").unwrap();
+		assert!(ui.ensure_can_prompt("Email:").is_err());
+	}
+
+	#[test]
+	fn prompts_are_answered_at_the_terminal_on_stdin() {
+		assert_eq!(
+			PromptInput::detect(true, false, || panic!("stdin is the terminal")),
+			PromptInput::Terminal
+		);
+	}
+
+	#[test]
+	fn without_a_terminal_on_stdin_prompts_are_answered_at_the_controlling_terminal() {
+		assert_eq!(
+			PromptInput::detect(false, true, || true),
+			PromptInput::Terminal
+		);
+	}
+
+	#[test]
+	fn without_a_terminal_anywhere_prompts_cannot_be_answered() {
+		assert_eq!(
+			PromptInput::detect(false, true, || false),
+			PromptInput::NotATerminal
+		);
+	}
+
+	#[test]
+	fn prompts_shown_on_a_redirected_stderr_are_not_asked_at_the_controlling_terminal() {
+		assert_eq!(
+			PromptInput::detect(false, false, || panic!("nobody would see the prompt")),
+			PromptInput::NotATerminal
+		);
+	}
+
+	#[test]
+	fn a_confirmation_without_a_terminal_on_stdin_fails_naming_yes() {
+		let mut ui = Printed::default().ui();
+
+		let err = ui.prompt_confirm("Delete credentials?", false).unwrap_err();
+		assert_eq!(
+			err.to_string(),
+			"Cannot ask \"Delete credentials?\": stdin is not a terminal. Pass --yes to answer yes."
+		);
+	}
+
+	#[test]
+	fn yes_does_not_answer_a_question_that_is_not_a_confirmation() {
+		let mut ui = Printed::default().ui();
+		ui.set_assume_yes(true);
+
+		let err = ui.prompt_yes_no("Enable download?", false).unwrap_err();
+		assert_eq!(
+			err.to_string(),
+			"Cannot ask \"Enable download?\": stdin is not a terminal."
+		);
+	}
+
+	#[test]
+	fn a_text_prompt_with_no_input_fails_even_with_yes() {
+		let mut ui = Printed::default().ui();
+		ui.disable_prompts();
+		ui.set_assume_yes(true);
+
+		for err in [
+			ui.prompt("Email:").unwrap_err(),
+			ui.prompt_password("Password: ").unwrap_err(),
+			ui.prompt_select("Expires after:", vec!["Never".to_owned()])
+				.unwrap_err(),
+		] {
+			assert!(
+				err.to_string().ends_with(": --no-input was given."),
+				"{err}"
+			);
+			assert_eq!(crate::error::exit_code(&err), 2);
+		}
 	}
 
 	#[test]

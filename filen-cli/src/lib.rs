@@ -7,9 +7,15 @@
 //! Invoke the Filen CLI with no command specified to enter interactive mode (REPL).
 //! There, you can specify absolute paths (starting with "/") or relative paths (supports "." and "..").
 //!
+//! A command asks at the terminal for what it needs and was not given, such as a password or a
+//! confirmation. When stdin is not a terminal, as with `filen rm -p file < list` or commands piped
+//! in, it asks at the controlling terminal instead (`/dev/tty`, or the console on Windows), as git
+//! and ssh do. `--yes` answers confirmations without asking, and `--no-input` never asks. A question that cannot be asked, with `--no-input` or without any terminal, fails the
+//! command with exit code 2, naming the option that answers it instead where there is one.
+//!
 //! Options can go before or after the command (`filen --json ls` or `filen ls --json`),
 //! except for `--password` and `--two-factor-code`, which go before it.
-//! In the REPL, a line can add `--json`, `--quiet` or `-v` for its own command.
+//! In the REPL, a line can add `--json`, `--quiet`, `-v` or `--yes` for its own command.
 
 use std::{ffi::OsString, fs, num::NonZeroU32, path::PathBuf, sync::Arc, time::Duration};
 
@@ -140,6 +146,14 @@ pub(crate) struct CliArgs {
 	#[arg(long, global = true)]
 	json: bool,
 
+	/// Answer yes to every confirmation prompt, such as `rm -p`'s
+	#[arg(short, long, global = true)]
+	yes: bool,
+
+	/// Never prompt: fail where a prompt would be needed (pass --yes to answer confirmations)
+	#[arg(long, global = true)]
+	no_input: bool,
+
 	#[command(subcommand)]
 	command: Option<Commands>,
 
@@ -248,8 +262,8 @@ async fn inner_main(ui: &mut ui::UI, arenas_limited: bool) -> Result<()> {
 	// setup logging
 	let log_dir = config.config_dir.join("logs");
 	fs::create_dir_all(&log_dir).context("Failed to create logs dir")?;
-	let output_options = OutputOptions::of(&cli_args);
-	let logging_level = output_options.log_level();
+	let command_options = CommandOptions::of(&cli_args);
+	let logging_level = command_options.log_level();
 	let log_file = log_dir.join(log_files::LATEST);
 	let log_files_level = LevelFilter::Debug;
 	// An `Arc` because ftail builds each channel from a `'static` `Fn`, which can only hand out
@@ -295,12 +309,16 @@ async fn inner_main(ui: &mut ui::UI, arenas_limited: bool) -> Result<()> {
 	}
 
 	ui.initialize(
-		output_options.quiet,
-		output_options.json,
+		command_options.quiet,
+		command_options.json,
 		None,
 		cli_args.reluctant_autocomplete,
 		cli_args.make_output_environment_agnostic_for_replay_testing,
 	);
+	ui.set_assume_yes(command_options.assume_yes);
+	if cli_args.no_input {
+		ui.disable_prompts();
+	}
 
 	// --export-markdown-docs
 	if cli_args.export_markdown_docs {
@@ -317,6 +335,13 @@ async fn inner_main(ui: &mut ui::UI, arenas_limited: bool) -> Result<()> {
 		return Err(ui::UI::usage_failure(
 			"`cd` only works in the REPL. To run a command in another directory, pass \
 			 --working-path, or run `filen` without a command to enter the REPL.",
+		));
+	}
+
+	// the REPL reads its commands from the terminal
+	if cli_args.no_input && cli_args.command.is_none() {
+		return Err(ui::UI::usage_failure(
+			"--no-input needs a command: the REPL reads its commands from the terminal.",
 		));
 	}
 
@@ -405,11 +430,11 @@ async fn inner_main(ui: &mut ui::UI, arenas_limited: bool) -> Result<()> {
 					continue;
 				}
 			};
-			output_options
+			command_options
 				.with_repl_line(&line_args)
 				.apply(ui, &console_log_level);
 			let exit = run_repl_line(&config, ui, &mut client, &mut working_path, line_args).await;
-			output_options.apply(ui, &console_log_level);
+			command_options.apply(ui, &console_log_level);
 			if exit {
 				break;
 			}
@@ -450,31 +475,38 @@ async fn run_repl_line(
 	}
 }
 
-/// The options that shape a command's output: the CLI's, and in the REPL those its line adds.
+/// The options that shape how a command runs, its output and its confirmations: the CLI's, and
+/// in the REPL those its line adds.
 #[derive(Debug, Clone, Copy, PartialEq)]
-struct OutputOptions {
+// Each bool is an independent clap flag.
+#[allow(clippy::struct_excessive_bools)]
+struct CommandOptions {
 	quiet: bool,
 	json: bool,
 	/// How often `-v` was given.
 	verbose: u8,
+	/// `--yes`.
+	assume_yes: bool,
 }
 
-impl OutputOptions {
+impl CommandOptions {
 	fn of(cli_args: &CliArgs) -> Self {
 		Self {
 			quiet: cli_args.quiet,
 			json: cli_args.json,
 			verbose: cli_args.verbose,
+			assume_yes: cli_args.yes,
 		}
 	}
 
-	/// These options with those a REPL line gives added: a line can turn `--quiet` and `--json`
-	/// on, and raise the verbosity, but not undo the CLI's.
+	/// These options with those a REPL line gives added: a line can turn `--quiet`, `--json` and
+	/// `--yes` on, and raise the verbosity, but not undo the CLI's.
 	fn with_repl_line(self, line_args: &CliArgs) -> Self {
 		Self {
 			quiet: self.quiet || line_args.quiet,
 			json: self.json || line_args.json,
 			verbose: self.verbose.max(line_args.verbose),
+			assume_yes: self.assume_yes || line_args.yes,
 		}
 	}
 
@@ -494,6 +526,7 @@ impl OutputOptions {
 
 	fn apply(self, ui: &mut ui::UI, console_log_level: &ConsoleLogLevel) {
 		ui.set_quiet_and_json(self.quiet, self.json);
+		ui.set_assume_yes(self.assume_yes);
 		console_log_level.set(self.log_level());
 	}
 }
@@ -528,7 +561,7 @@ enum ReplLineError {
 
 /// The ids of the CLI's options a REPL line can give for its command. The others only apply when
 /// the CLI starts.
-const REPL_LINE_OPTIONS: &[&str] = &["help", "quiet", "json", "verbose"];
+const REPL_LINE_OPTIONS: &[&str] = &["help", "quiet", "json", "verbose", "yes"];
 
 /// Parses a REPL line as the arguments the CLI would be invoked with.
 fn parse_repl_line(line: &str) -> Result<CliArgs, ReplLineError> {
@@ -850,28 +883,59 @@ mod tests {
 
 	#[test]
 	fn a_repl_line_adds_to_the_clis_output_options() {
-		let cli = OutputOptions {
+		let cli = CommandOptions {
 			quiet: false,
 			json: true,
 			verbose: 1,
+			assume_yes: false,
 		};
 		let line_args = parse_repl_line("ls -q -vvv").unwrap();
 		assert_eq!(
 			cli.with_repl_line(&line_args),
-			OutputOptions {
+			CommandOptions {
 				quiet: true,
 				json: true,
 				verbose: 3,
+				assume_yes: false,
 			}
 		);
 	}
 
 	#[test]
+	fn a_repl_line_can_answer_its_commands_confirmations() {
+		let cli = CommandOptions::of(&parse_args(["filen"]).unwrap().args);
+		let line_args = parse_repl_line("rm -p some_file -y").unwrap();
+		assert!(cli.with_repl_line(&line_args).assume_yes);
+		assert!(!cli.assume_yes);
+	}
+
+	#[test]
+	fn yes_after_the_command_is_the_clis() {
+		let cli_args = parse_args(["filen", "rm", "-p", "some_file", "--yes"])
+			.unwrap()
+			.args;
+		assert!(cli_args.yes);
+		let Some(Commands::Fs(FsCommands::Rm { permanent, .. })) = cli_args.command else {
+			panic!("parsed {:?}", cli_args.command);
+		};
+		assert!(permanent);
+	}
+
+	#[test]
+	fn a_repl_line_giving_no_input_is_rejected() {
+		let Err(ReplLineError::StartupOptions(options)) = parse_repl_line("ls --no-input") else {
+			panic!("parsed --no-input on a REPL line");
+		};
+		assert_eq!(options, ["--no-input"]);
+	}
+
+	#[test]
 	fn a_repl_line_without_output_options_keeps_the_clis() {
-		let cli = OutputOptions {
+		let cli = CommandOptions {
 			quiet: true,
 			json: true,
 			verbose: 2,
+			assume_yes: true,
 		};
 		let line_args = parse_repl_line("ls").unwrap();
 		assert_eq!(cli.with_repl_line(&line_args), cli);
@@ -879,10 +943,11 @@ mod tests {
 
 	#[test]
 	fn quiet_hides_the_log_lines_whatever_the_verbosity() {
-		let options = |quiet, verbose| OutputOptions {
+		let options = |quiet, verbose| CommandOptions {
 			quiet,
 			json: false,
 			verbose,
+			assume_yes: false,
 		};
 		assert_eq!(options(false, 0).log_level(), LevelFilter::Off);
 		assert_eq!(options(false, 1).log_level(), LevelFilter::Info);

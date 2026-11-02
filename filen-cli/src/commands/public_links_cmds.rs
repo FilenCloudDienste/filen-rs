@@ -312,7 +312,8 @@ async fn prompt_public_link_dir_settings(
 	} else {
 		link.set_password(password);
 	}
-	let enable_download = ui.prompt_confirm("Enable download?", false)?;
+	// a setting, which --yes does not choose
+	let enable_download = ui.prompt_yes_no("Enable download?", false)?;
 	link.set_enable_download(enable_download);
 
 	client

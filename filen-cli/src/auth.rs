@@ -310,6 +310,8 @@ async fn authenticate_from_prompt(
 	ui: &mut UI,
 	client_config_args: &ClientConfigArgs,
 ) -> Result<Client> {
+	ui.ensure_can_prompt("Email:")
+		.context("Not logged in: log in with --email and --password, or with --auth-config-path")?;
 	let email = ui.prompt("Email:")?;
 	let password = ui.prompt_password("Password: ")?;
 	let client = login_and_optionally_prompt_two_factor_code(
@@ -331,7 +333,8 @@ async fn authenticate_from_prompt(
 			}
 			Err(_) => {
 				ui.print_failure("Failed to save credentials in keyring");
-				if ui.prompt_confirm(
+				// a choice of where to keep the credentials, which --yes does not make
+				if ui.prompt_yes_no(
 					&format!(
 						"Instead, export an auth config to {}?",
 						config.config_dir.join(AUTH_CONFIG_FILENAME).display()
@@ -385,7 +388,8 @@ pub(crate) fn export_auth_config(client: &Client, parent_dir: &Path) -> Result<P
 	Ok(path)
 }
 
-/// Log out by deleting stored credentials from the keyring and auth config files, prompting the user for confirmation.
+/// Log out by deleting stored credentials from the keyring and auth config files, prompting the
+/// user to confirm each (`--yes` confirms them all).
 pub(crate) fn logout(config: &CliConfig, ui: &mut UI) -> Result<bool> {
 	let mut found_any_credentials = false;
 	if !keyring_disabled_for_testing()

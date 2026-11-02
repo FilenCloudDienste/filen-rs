@@ -85,7 +85,8 @@ pub(crate) enum FsCommands {
 		/// File or directory to remove
 		#[arg(add = FilenCompleter::file_or_directory())]
 		file_or_directory: String,
-		/// Permanently delete the file or directory (default: move to trash)
+		/// Permanently delete the file or directory, asking first unless --yes is given (default:
+		/// move to trash)
 		#[arg(short, long)]
 		permanent: bool,
 	},
@@ -128,7 +129,7 @@ pub(crate) enum FsCommands {
 	ListTrash,
 	/// Restore a trashed item interactively
 	TrashRestore,
-	/// Permanently delete a trashed item interactively
+	/// Permanently delete a trashed item interactively (--yes skips the last confirmation)
 	TrashDelete,
 	/// Permanently delete all trashed items
 	EmptyTrash,
@@ -647,6 +648,11 @@ pub(crate) async fn delete_file_or_directory(
 	permanent: bool,
 ) -> Result<()> {
 	let file_or_directory_str = working_path.navigate(file_or_directory_str).0;
+	let confirmation = format!("Permanently delete {}?", file_or_directory_str);
+	// before logging in and looking the item up, so that a script missing --yes fails at once
+	if permanent {
+		ui.ensure_can_confirm(&confirmation)?;
+	}
 	let client = client.get(ui).await?;
 	let Some(item) = client
 		.find_item_at_path(&file_or_directory_str)
@@ -658,11 +664,7 @@ pub(crate) async fn delete_file_or_directory(
 			file_or_directory_str
 		)));
 	};
-	if permanent
-		&& !ui.prompt_confirm(
-			&format!("Permanently delete {}?", file_or_directory_str),
-			false,
-		)? {
+	if permanent && !ui.prompt_confirm(&confirmation, false)? {
 		return Ok(());
 	}
 	match item {
@@ -1138,6 +1140,13 @@ pub(crate) async fn select_trash_item(
 	client: &mut LazyClient,
 	action: TrashAction,
 ) -> Result<()> {
+	let select_message = match action {
+		TrashAction::Restore => "Select an item to restore",
+		TrashAction::Delete => "Select an item to permanently delete",
+	};
+	// before logging in and listing the trash, so that a script fails at once: nothing answers
+	// the selection, not even --yes
+	ui.ensure_can_prompt(select_message)?;
 	let client = client.get(ui).await?;
 	let (dirs, files) = client
 		.list_trash(None::<&fn(u64, Option<u64>)>)
@@ -1188,14 +1197,7 @@ pub(crate) async fn select_trash_item(
 			label
 		})
 		.collect::<Vec<String>>();
-	let Some(selection) = ui.prompt_select(
-		match action {
-			TrashAction::Restore => "Select an item to restore",
-			TrashAction::Delete => "Select an item to permanently delete",
-		},
-		options.clone(),
-	)?
-	else {
+	let Some(selection) = ui.prompt_select(select_message, options.clone())? else {
 		return Ok(());
 	};
 	let index = options
@@ -1270,6 +1272,26 @@ mod tests {
 		let mut ui = Printed::default().ui();
 
 		assert!(confirm_printing_file(&mut ui, 1024 * 1024).unwrap());
+	}
+
+	#[test]
+	fn a_large_file_is_printed_to_a_terminal_when_yes_confirms_it() {
+		let mut ui = Printed::default().terminal_ui();
+		ui.set_assume_yes(true);
+
+		assert!(confirm_printing_file(&mut ui, PRINT_WITHOUT_ASKING_MAX_SIZE + 1).unwrap());
+	}
+
+	#[test]
+	fn a_large_file_printed_to_a_terminal_without_input_asks_for_yes() {
+		let mut ui = Printed::default().terminal_ui();
+
+		let err = confirm_printing_file(&mut ui, 12 * 1024).unwrap_err();
+		assert_eq!(
+			err.to_string(),
+			"Cannot ask \"File is 12 KiB (more than 8 KiB), do you want to continue?\": stdin is \
+			 not a terminal. Pass --yes to answer yes."
+		);
 	}
 
 	#[test]

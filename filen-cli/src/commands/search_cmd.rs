@@ -94,6 +94,7 @@ pub(crate) async fn search_cmd(
 		} else {
 			format!("Search in {}:", working_path)
 		};
+		ui.ensure_can_prompt(&prompt_text)?;
 		let prompt_text = ui.redact_for_replay_testing(prompt_text);
 		tokio::task::spawn_blocking(move || {
 			inquire::Text::new(&prompt_text)

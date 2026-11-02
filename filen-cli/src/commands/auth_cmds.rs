@@ -12,7 +12,7 @@ use crate::{
 pub(crate) enum AuthCommands {
 	/// Export an auth config (to be used with --auth-config-path option)
 	ExportAuthConfig,
-	/// Delete saved credentials and exit
+	/// Delete saved credentials and exit, asking before each (--yes deletes them all)
 	Logout,
 }
 
