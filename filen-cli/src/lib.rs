@@ -32,7 +32,7 @@ use crate::{
 		fs_cmds::{self, FsCommands},
 	},
 	docs::{generate_markdown_docs, print_in_app_docs},
-	log_files::LogFiles,
+	log_files::{LogFiles, LogLimits},
 	ui::{ConsoleLogLevel, CustomLogger, ReplPromptResult},
 	updater::check_for_updates,
 	util::RemotePath,
@@ -185,6 +185,14 @@ pub(crate) static CTRLC_TX: std::sync::LazyLock<tokio::sync::broadcast::Sender<(
 	});
 // todo: might we also be able to use this for general cancellability? (e.g. for long-running commands like upload/download)
 
+/// How large the log files grow and how long they are kept: a file is moved aside past 10 MiB,
+/// and they are deleted after three days, or the oldest first once they hold 100 MiB together.
+const LOG_LIMITS: LogLimits = LogLimits {
+	max_file_size: 10 * 1024 * 1024,
+	retention_days: 3,
+	max_total_size: 100 * 1024 * 1024,
+};
+
 /// The most blocking threads the runtime runs at once, in place of tokio's default of 512.
 ///
 /// Every `tokio::fs` call (each read and write of a transferred file, its open, metadata and
@@ -269,7 +277,7 @@ async fn inner_main(ui: &mut ui::UI, arenas_limited: bool) -> Result<()> {
 	// An `Arc` because ftail builds each channel from a `'static` `Fn`, which can only hand out
 	// clones of it.
 	let log_files = Arc::new(
-		LogFiles::open(&log_dir, log_files_level, 10 * 1024 * 1024, 3)
+		LogFiles::open(&log_dir, log_files_level, LOG_LIMITS)
 			.context("Failed to open log files")?,
 	);
 	// An `Arc` because the logger keeps it for the rest of the process, while the REPL changes it

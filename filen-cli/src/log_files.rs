@@ -1,5 +1,5 @@
 use std::{
-	ffi::OsString,
+	ffi::{OsStr, OsString},
 	fs::{self, File, OpenOptions},
 	io::{self, Write},
 	path::{Path, PathBuf},
@@ -54,17 +54,27 @@ fn open_private(options: &OpenOptions, path: &Path) -> io::Result<File> {
 ///
 /// Writes what ftail's `single_file` and `daily_file` channels wrote, line for line, but formats
 /// each record once and writes it to both files under one lock. ftail also listed and stat'ed the
-/// whole directory on every record to delete expired daily files; this does it on the first record
-/// and on the first record of each later day.
+/// whole directory on every record to delete expired daily files; this prunes the directory
+/// ([`LogLimits`]) after the first record, the first record of each later day and each record that
+/// started a new file.
 pub(crate) struct LogFiles {
 	dir: PathBuf,
 	level: LevelFilter,
-	/// A file is moved aside before a write once it holds more than this, in bytes.
-	max_file_size: u64,
-	/// A `.log` file in `dir` is deleted once more than this many whole days have passed since it
-	/// was last written, checked on the first record and on the first record of each later day.
-	retention_days: u64,
+	limits: LogLimits,
 	files: Mutex<Files>,
+}
+
+/// How large the log files grow and how long they are kept.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct LogLimits {
+	/// A file is moved aside before a write once it holds more than this, in bytes.
+	pub(crate) max_file_size: u64,
+	/// A log file in the directory, moved-aside ones included, is deleted once more than this many
+	/// whole days have passed since it was last written.
+	pub(crate) retention_days: u64,
+	/// Once the log files in the directory hold more than this together, in bytes, the oldest are
+	/// deleted until they do not. The two files being written count but are never deleted.
+	pub(crate) max_total_size: u64,
 }
 
 struct Files {
@@ -72,7 +82,7 @@ struct Files {
 	daily: LogFile,
 	/// The day `daily` is for.
 	day: NaiveDate,
-	/// Whether the next record first deletes expired files.
+	/// Whether the directory is pruned after the next record.
 	prune_due: bool,
 }
 
@@ -82,12 +92,7 @@ struct LogFile {
 }
 
 impl LogFiles {
-	pub(crate) fn open(
-		dir: &Path,
-		level: LevelFilter,
-		max_file_size: u64,
-		retention_days: u64,
-	) -> io::Result<Self> {
+	pub(crate) fn open(dir: &Path, level: LevelFilter, limits: LogLimits) -> io::Result<Self> {
 		// Older CLIs created the log files with the default mode, and the moved-aside and earlier
 		// daily ones are never opened again, so the directory is closed to other users as well.
 		#[cfg(unix)]
@@ -97,8 +102,7 @@ impl LogFiles {
 		Ok(Self {
 			dir: dir.to_owned(),
 			level,
-			max_file_size,
-			retention_days,
+			limits,
 			files: Mutex::new(Files {
 				latest,
 				daily: LogFile::open_daily(dir, day)?,
@@ -108,50 +112,71 @@ impl LogFiles {
 		})
 	}
 
-	fn write_daily(&self, files: &mut Files, now: NaiveDate, line: &str) -> io::Result<()> {
-		// A record stamped just before midnight that takes the lock after one stamped just after it
-		// goes to the newer day's file, as with ftail, rather than switching back.
-		if now > files.day {
-			files.daily = LogFile::open_daily(&self.dir, now)?;
-			files.day = now;
-			files.prune_due = true;
-		}
-		if files.prune_due {
-			files.prune_due = false;
-			self.delete_expired(files);
-		}
-		files.daily.write(line, self.max_file_size)
-	}
-
-	/// Deletes every `.log` file in `dir` last written more than `retention_days` ago, except the
-	/// two in `files`, which this logger writes to however old they look: on Windows a directory
-	/// listing can report the time a file was last written before it was opened, and today's file
-	/// is not written to until after this. One that cannot be read or deleted is left for the next
-	/// pass.
-	fn delete_expired(&self, files: &Files) {
+	/// Deletes the log files in `dir` ([`is_log_file_name`]) last written more than
+	/// `retention_days` ago, then the oldest of the others while they hold more than
+	/// `max_total_size` together. The two files in `files` are never deleted, as this logger writes
+	/// to them however old they look: on Windows a directory listing can report the time a file was
+	/// last written before it was opened. One that cannot be read or deleted is left for the next
+	/// pass, and one another process deleted first is not an error.
+	fn prune(&self, files: &Files) {
 		let Ok(entries) = fs::read_dir(&self.dir) else {
 			return;
 		};
 		let now = SystemTime::now();
+		let mut total = 0_u64;
+		let mut deletable = Vec::new();
 		for entry in entries.flatten() {
-			let path = entry.path();
-			if path.extension().is_none_or(|ext| ext != "log")
-				|| path == files.latest.path
-				|| path == files.daily.path
-			{
+			if !is_log_file_name(&entry.file_name()) {
 				continue;
 			}
-			let age = entry
-				.metadata()
-				.and_then(|metadata| metadata.modified())
-				.ok()
-				.and_then(|modified| now.duration_since(modified).ok())
-				.unwrap_or(Duration::ZERO);
-			if age.as_secs() / SECONDS_PER_DAY > self.retention_days {
-				let _ = fs::remove_file(&path);
+			let Ok(metadata) = entry.metadata() else {
+				continue;
+			};
+			let path = entry.path();
+			let size = metadata.len();
+			if path == files.latest.path || path == files.daily.path {
+				total = total.saturating_add(size);
+				continue;
+			}
+			// A file whose age cannot be told counts as just written.
+			let modified = metadata.modified().unwrap_or(now);
+			let age = now.duration_since(modified).unwrap_or(Duration::ZERO);
+			if age.as_secs() / SECONDS_PER_DAY > self.limits.retention_days && remove(&path) {
+				continue;
+			}
+			total = total.saturating_add(size);
+			deletable.push((modified, size, path));
+		}
+		deletable.sort_unstable();
+		for (_, size, path) in deletable {
+			if total <= self.limits.max_total_size {
+				break;
+			}
+			if remove(&path) {
+				total = total.saturating_sub(size);
 			}
 		}
 	}
+}
+
+/// Deletes the file at `path`; returns whether it is gone, deleted by another process included.
+fn remove(path: &Path) -> bool {
+	match fs::remove_file(path) {
+		Ok(()) => true,
+		Err(e) => e.kind() == io::ErrorKind::NotFound,
+	}
+}
+
+/// Whether `name` is the name of a log file: `<name>.log`, or one moved aside from it,
+/// `<name>.log.old`, `<name>.log.old1`, `<name>.log.old2`, ...
+fn is_log_file_name(name: &OsStr) -> bool {
+	let Some(name) = name.to_str() else {
+		return false;
+	};
+	name.ends_with(".log")
+		|| name
+			.rsplit_once(".log.old")
+			.is_some_and(|(_, n)| n.bytes().all(|b| b.is_ascii_digit()))
 }
 
 impl Log for LogFiles {
@@ -179,10 +204,32 @@ impl LogFiles {
 			record.args()
 		);
 		let mut files = self.files.lock().unwrap_or_else(PoisonError::into_inner);
+		let files = &mut *files;
+		// A record stamped just before midnight that takes the lock after one stamped just after it
+		// goes to the newer day's file, as with ftail, rather than switching back.
+		let day = now.date_naive();
+		if day > files.day {
+			// The line still goes to `latest.log` when the new day's file cannot be opened.
+			if let Ok(daily) = LogFile::open_daily(&self.dir, day) {
+				files.daily = daily;
+				files.day = day;
+				files.prune_due = true;
+			}
+		}
 		// A logger has nowhere to report its own failure, so a line that cannot be written to a
 		// file is dropped from it (ftail panicked instead).
-		let _ = files.latest.write(&line, self.max_file_size);
-		let _ = self.write_daily(&mut files, now.date_naive(), &line);
+		for file in [&mut files.latest, &mut files.daily] {
+			if file
+				.write(&line, self.limits.max_file_size)
+				.unwrap_or(false)
+			{
+				files.prune_due = true;
+			}
+		}
+		if files.prune_due {
+			files.prune_due = false;
+			self.prune(files);
+		}
 	}
 }
 
@@ -216,14 +263,14 @@ impl LogFile {
 	}
 
 	/// Writes `line`, first moving the file aside and starting a new one if it holds more than
-	/// `max_file_size` bytes. The size is read from the file each time because another process
-	/// may be appending to the same file. A file that cannot be moved aside is written past the
-	/// cap rather than losing the line.
-	fn write(&mut self, line: &str, max_file_size: u64) -> io::Result<()> {
-		if self.file.metadata()?.len() > max_file_size {
-			let _ = self.rotate(max_file_size);
-		}
-		self.file.write_all(line.as_bytes())
+	/// `max_file_size` bytes; returns whether it did. The size is read from the file each time
+	/// because another process may be appending to the same file. A file that cannot be moved aside
+	/// is written past the cap rather than losing the line.
+	fn write(&mut self, line: &str, max_file_size: u64) -> io::Result<bool> {
+		let full = self.file.metadata()?.len() > max_file_size;
+		let rotated = full && self.rotate(max_file_size).is_ok();
+		self.file.write_all(line.as_bytes())?;
+		Ok(rotated)
 	}
 
 	/// Moves the file at `path` aside if it holds more than `max_file_size` bytes, then opens the
@@ -315,6 +362,15 @@ mod tests {
 		);
 	}
 
+	/// The limits with `max_file_size`, three days' retention and no total size worth mentioning.
+	fn limits(max_file_size: u64) -> LogLimits {
+		LogLimits {
+			max_file_size,
+			retention_days: 3,
+			max_total_size: u64::MAX,
+		}
+	}
+
 	fn read(dir: &TempDir, name: &str) -> String {
 		fs::read_to_string(dir.path().join(name)).unwrap()
 	}
@@ -338,7 +394,7 @@ mod tests {
 	#[test]
 	fn a_record_goes_to_latest_and_to_the_daily_file_in_ftails_format() {
 		let dir = TempDir::new().unwrap();
-		let files = LogFiles::open(dir.path(), LevelFilter::Debug, 1024, 3).unwrap();
+		let files = LogFiles::open(dir.path(), LevelFilter::Debug, limits(1024)).unwrap();
 		log_line(&files, "hello");
 
 		let latest = read(&dir, LATEST);
@@ -357,7 +413,7 @@ mod tests {
 	#[test]
 	fn a_record_above_the_level_is_not_written() {
 		let dir = TempDir::new().unwrap();
-		let files = LogFiles::open(dir.path(), LevelFilter::Info, 1024, 3).unwrap();
+		let files = LogFiles::open(dir.path(), LevelFilter::Info, limits(1024)).unwrap();
 		files.log(
 			&Record::builder()
 				.level(Level::Debug)
@@ -371,10 +427,10 @@ mod tests {
 	#[test]
 	fn latest_holds_only_the_lines_of_the_last_run() {
 		let dir = TempDir::new().unwrap();
-		let first = LogFiles::open(dir.path(), LevelFilter::Debug, 1024, 3).unwrap();
+		let first = LogFiles::open(dir.path(), LevelFilter::Debug, limits(1024)).unwrap();
 		log_line(&first, "a longer line from the first run");
 		drop(first);
-		let second = LogFiles::open(dir.path(), LevelFilter::Debug, 1024, 3).unwrap();
+		let second = LogFiles::open(dir.path(), LevelFilter::Debug, limits(1024)).unwrap();
 		log_line(&second, "short");
 
 		assert_eq!(messages(&read(&dir, LATEST)), ["short"]);
@@ -383,9 +439,9 @@ mod tests {
 	#[test]
 	fn loggers_opening_latest_one_after_the_other_append_after_each_other() {
 		let dir = TempDir::new().unwrap();
-		let first = LogFiles::open(dir.path(), LevelFilter::Debug, 1024, 3).unwrap();
+		let first = LogFiles::open(dir.path(), LevelFilter::Debug, limits(1024)).unwrap();
 		log_line(&first, "first-1");
-		let second = LogFiles::open(dir.path(), LevelFilter::Debug, 1024, 3).unwrap();
+		let second = LogFiles::open(dir.path(), LevelFilter::Debug, limits(1024)).unwrap();
 		log_line(&first, "first-2");
 		log_line(&second, "second-1");
 
@@ -399,7 +455,7 @@ mod tests {
 		let dir = TempDir::new().unwrap();
 		// Exactly one line, so the second line is written at the cap and the third past it.
 		let cap = u64::try_from("2026-01-01 00:00:00 INFO target a\n".len()).unwrap();
-		let files = LogFiles::open(dir.path(), LevelFilter::Debug, cap, 3).unwrap();
+		let files = LogFiles::open(dir.path(), LevelFilter::Debug, limits(cap)).unwrap();
 		for message in ["a", "b", "c", "d", "e"] {
 			log_line(&files, message);
 		}
@@ -414,7 +470,7 @@ mod tests {
 	fn every_log_file_including_moved_aside_ones_is_readable_by_its_owner_only() {
 		let dir = TempDir::new().unwrap();
 		let cap = u64::try_from("2026-01-01 00:00:00 INFO target a\n".len()).unwrap();
-		let files = LogFiles::open(dir.path(), LevelFilter::Debug, cap, 3).unwrap();
+		let files = LogFiles::open(dir.path(), LevelFilter::Debug, limits(cap)).unwrap();
 		let now = Local::now();
 		for message in ["a", "b", "c"] {
 			log_line_at(&files, now, message);
@@ -452,7 +508,7 @@ mod tests {
 		}
 		fs::set_permissions(dir.path(), Permissions::from_mode(0o755)).unwrap();
 
-		let _files = LogFiles::open(dir.path(), LevelFilter::Debug, 1024, 3).unwrap();
+		let _files = LogFiles::open(dir.path(), LevelFilter::Debug, limits(1024)).unwrap();
 
 		let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
 		assert_eq!(mode(dir.path()), 0o700);
@@ -465,7 +521,7 @@ mod tests {
 		let dir = TempDir::new().unwrap();
 		// Each logger stands in for a CLI process: its own lock and its own open files.
 		let loggers = (0..8)
-			.map(|_| LogFiles::open(dir.path(), LevelFilter::Debug, 512, 3).unwrap())
+			.map(|_| LogFiles::open(dir.path(), LevelFilter::Debug, limits(512)).unwrap())
 			.collect::<Vec<_>>();
 		let now = Local::now();
 		thread::scope(|scope| {
@@ -499,27 +555,128 @@ mod tests {
 	}
 
 	#[test]
-	fn the_first_record_deletes_expired_log_files_but_keeps_latest_and_moved_aside_ones() {
+	fn the_first_record_deletes_expired_log_files_moved_aside_ones_included() {
 		let dir = TempDir::new().unwrap();
 		for (name, age) in [
 			(LATEST, 10),
 			("2020-01-01.log", 10),
 			("2020-01-05.log", 3),
 			("2020-01-01.log.old", 10),
+			("2020-01-01.log.old12", 10),
+			("latest.log.old3", 10),
+			("2020-01-05.log.old", 3),
+			("notes.txt", 10),
+			("2020-01-01.log.older", 10),
 		] {
 			File::create(dir.path().join(name))
 				.unwrap()
 				.set_times(days_ago(age))
 				.unwrap();
 		}
-		let files = LogFiles::open(dir.path(), LevelFilter::Debug, 1024, 3).unwrap();
+		let files = LogFiles::open(dir.path(), LevelFilter::Debug, limits(1024)).unwrap();
 		assert!(dir.path().join("2020-01-01.log").exists());
 		log_line(&files, "hello");
 
-		assert!(!dir.path().join("2020-01-01.log").exists());
-		assert!(dir.path().join("2020-01-05.log").exists());
-		assert!(dir.path().join("2020-01-01.log.old").exists());
+		let mut left = fs::read_dir(dir.path())
+			.unwrap()
+			.map(|entry| entry.unwrap().file_name().into_string().unwrap())
+			.collect::<Vec<_>>();
+		left.sort_unstable();
+		let mut expected = vec![
+			"2020-01-01.log.older".to_owned(),
+			"2020-01-05.log".to_owned(),
+			"2020-01-05.log.old".to_owned(),
+			LATEST.to_owned(),
+			daily_file_name(Local::now()),
+			"notes.txt".to_owned(),
+		];
+		expected.sort_unstable();
+		assert_eq!(left, expected);
 		assert_eq!(messages(&read(&dir, LATEST)), ["hello"]);
+	}
+
+	#[test]
+	fn the_oldest_log_files_are_deleted_while_they_hold_more_than_the_total_cap() {
+		let dir = TempDir::new().unwrap();
+		for (name, age) in [
+			("2020-01-05.log", 1),
+			("2020-01-04.log.old", 2),
+			("2020-01-03.log", 3),
+			("2020-01-04.log", 2),
+		] {
+			let file = File::create(dir.path().join(name)).unwrap();
+			file.set_len(100).unwrap();
+			file.set_times(days_ago(age)).unwrap();
+		}
+		let files = LogFiles::open(
+			dir.path(),
+			LevelFilter::Debug,
+			LogLimits {
+				max_file_size: 1024,
+				retention_days: 3,
+				max_total_size: 250,
+			},
+		)
+		.unwrap();
+		log_line(&files, "hello");
+
+		// 400 bytes and the line in each file being written: deleting the three oldest leaves 100
+		// bytes and the two lines, two leave 200 and the two lines, more than 250.
+		assert!(!dir.path().join("2020-01-03.log").exists());
+		assert!(!dir.path().join("2020-01-04.log").exists());
+		assert!(!dir.path().join("2020-01-04.log.old").exists());
+		assert!(dir.path().join("2020-01-05.log").exists());
+		assert_eq!(messages(&read(&dir, LATEST)), ["hello"]);
+	}
+
+	#[test]
+	fn a_file_moved_aside_prunes_the_directory_to_the_total_cap() {
+		let dir = TempDir::new().unwrap();
+		let line = u64::try_from("2026-01-01 00:00:00 INFO target a\n".len()).unwrap();
+		let files = LogFiles::open(
+			dir.path(),
+			LevelFilter::Debug,
+			LogLimits {
+				max_file_size: line,
+				retention_days: 3,
+				// The two files being written, a line each, and one moved-aside file of two lines.
+				max_total_size: 5 * line,
+			},
+		)
+		.unwrap();
+		let now = Local::now();
+		for message in ["a", "b", "c", "d", "e", "f", "g"] {
+			log_line_at(&files, now, message);
+		}
+
+		let mut left = fs::read_dir(dir.path())
+			.unwrap()
+			.map(|entry| entry.unwrap().file_name().into_string().unwrap())
+			.collect::<Vec<_>>();
+		left.sort_unstable();
+		assert_eq!(left.len(), 3, "{left:?}");
+		assert_eq!(messages(&read(&dir, LATEST)), ["g"]);
+	}
+
+	#[test]
+	fn log_file_names_are_told_apart_from_others() {
+		for name in [
+			"latest.log",
+			"2020-01-01.log",
+			"latest.log.old",
+			"latest.log.old42",
+		] {
+			assert!(is_log_file_name(OsStr::new(name)), "{name}");
+		}
+		for name in [
+			"latest.txt",
+			"latest.log.older",
+			"latest.log.old4a",
+			"log",
+			"rclone.conf",
+		] {
+			assert!(!is_log_file_name(OsStr::new(name)), "{name}");
+		}
 	}
 
 	#[test]
@@ -532,7 +689,7 @@ mod tests {
 				.set_times(days_ago(10))
 				.unwrap();
 		}
-		let files = LogFiles::open(dir.path(), LevelFilter::Debug, 1024, 3).unwrap();
+		let files = LogFiles::open(dir.path(), LevelFilter::Debug, limits(1024)).unwrap();
 		log_line_at(&files, today, "hello");
 
 		assert_eq!(messages(&read(&dir, LATEST)), ["hello"]);
@@ -542,7 +699,7 @@ mod tests {
 	#[test]
 	fn the_first_record_of_a_later_day_starts_its_file_and_deletes_expired_ones() {
 		let dir = TempDir::new().unwrap();
-		let files = LogFiles::open(dir.path(), LevelFilter::Debug, 1024, 3).unwrap();
+		let files = LogFiles::open(dir.path(), LevelFilter::Debug, limits(1024)).unwrap();
 		let today = Local::now();
 		log_line_at(&files, today, "today");
 		let expired = dir.path().join("2020-01-01.log");
