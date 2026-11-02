@@ -279,11 +279,17 @@ pub(crate) fn get_auth_config_default_locations(config: &CliConfig) -> Vec<PathB
 
 const KEYRING_SDK_CONFIG_NAME: &str = "sdk-config";
 
+/// Whether the tests turned the keyring off, so that they neither read nor delete the
+/// credentials of whoever runs them.
+fn keyring_disabled_for_testing() -> bool {
+	std::env::var("FILEN_CLI_TESTING_DISABLE_KEYRING") == Ok("1".to_string())
+}
+
 /// Authenticate using SDK config stored in the keyring.
 async fn authenticate_from_keyring(
 	client_config_args: &ClientConfigArgs,
 ) -> Result<Option<Client>> {
-	if std::env::var("FILEN_CLI_TESTING_DISABLE_KEYRING") == Ok("1".to_string()) {
+	if keyring_disabled_for_testing() {
 		return Ok(None);
 	}
 	let sdk_config = LongKeyringEntry::new(KEYRING_SDK_CONFIG_NAME)
@@ -382,7 +388,9 @@ pub(crate) fn export_auth_config(client: &Client, parent_dir: &Path) -> Result<P
 /// Log out by deleting stored credentials from the keyring and auth config files, prompting the user for confirmation.
 pub(crate) fn logout(config: &CliConfig, ui: &mut UI) -> Result<bool> {
 	let mut found_any_credentials = false;
-	if let Ok(Some(_)) = LongKeyringEntry::new(KEYRING_SDK_CONFIG_NAME).read() {
+	if !keyring_disabled_for_testing()
+		&& let Ok(Some(_)) = LongKeyringEntry::new(KEYRING_SDK_CONFIG_NAME).read()
+	{
 		found_any_credentials = true;
 		if ui.prompt_confirm("Delete credentials stored in system keyring?", false)? {
 			let deleted = LongKeyringEntry::new(KEYRING_SDK_CONFIG_NAME)
