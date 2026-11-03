@@ -427,6 +427,11 @@ impl SharedRootFile {
 		&self.file
 	}
 
+	/// Who shared the file with this account, or whom this account shared it with.
+	pub fn sharing_role(&self) -> &SharingRole {
+		&self.sharing_role
+	}
+
 	pub fn get_source_id(&self) -> u64 {
 		match &self.sharing_role {
 			SharingRole::Sharer(info) | SharingRole::Receiver(info) => info.id,
