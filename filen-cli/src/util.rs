@@ -6,31 +6,32 @@ use std::fmt::Display;
 pub(crate) struct RemotePath(pub(crate) String);
 
 impl RemotePath {
+	/// The normalized path of `path`, read from the root whether or not it starts with '/'.
 	pub(crate) fn new(path: &str) -> Self {
-		RemotePath(String::from("/") + path.trim_start_matches("/"))
+		RemotePath(String::from("/")).navigate(path)
 	}
 
 	/// Navigate to a new path.
 	/// If the path starts with '/', it replaces the current path, otherwise it interprets it as a relative path.
-	/// Supports ".." and ".". Paths will always start with "/".
+	/// Supports ".." and ".", and ignores empty segments, so a trailing or doubled '/' changes
+	/// nothing. Paths will always start with "/" and never end with one, except the root.
 	pub(crate) fn navigate(&self, navigation: &str) -> Self {
-		if navigation.starts_with("/") {
-			RemotePath::new(navigation)
+		let mut segments: Vec<&str> = if navigation.starts_with('/') {
+			Vec::new()
 		} else {
-			let mut new_path = self.0.clone();
-			navigation.split("/").for_each(|part| {
-				if part == ".." {
-					let (parent, _) = new_path.rsplit_once('/').unwrap_or(("/", ""));
-					new_path = parent.to_string();
-				} else if part != "." && !part.is_empty() {
-					if !new_path.ends_with("/") {
-						new_path.push('/');
-					}
-					new_path.push_str(part);
+			self.0.split('/').filter(|part| !part.is_empty()).collect()
+		};
+		for part in navigation.split('/') {
+			match part {
+				"" | "." => {}
+				// the root is its own parent
+				".." => {
+					segments.pop();
 				}
-			});
-			RemotePath::new(&new_path)
+				name => segments.push(name),
+			}
 		}
+		RemotePath(format!("/{}", segments.join("/")))
 	}
 
 	/// Returns the base name (last segment) of the path.
@@ -305,5 +306,52 @@ mod tests {
 			RemotePath::new("/dir/file.txt").parent(),
 			RemotePath::new("/dir")
 		);
+	}
+
+	#[test]
+	fn an_absolute_path_resolves_parent_and_current_directory_segments() {
+		let path = RemotePath::new("/root/dir");
+		assert_eq!(path.navigate("/a/../b").0, "/b");
+		assert_eq!(path.navigate("/a/./b").0, "/a/b");
+		assert_eq!(path.navigate("/a/b/c/../../d/./e").0, "/a/d/e");
+	}
+
+	#[test]
+	fn an_absolute_path_drops_a_trailing_slash() {
+		let path = RemotePath::new("/root/dir").navigate("/a/b/");
+		assert_eq!(path.0, "/a/b");
+		assert_eq!(path.basename(), Some("b"));
+		assert_eq!(path.parent(), RemotePath::new("/a"));
+	}
+
+	#[test]
+	fn an_absolute_path_collapses_repeated_slashes() {
+		let path = RemotePath::new("/root/dir");
+		assert_eq!(path.navigate("//a//b").0, "/a/b");
+		assert_eq!(path.navigate("/").0, "/");
+		assert_eq!(path.navigate("//").0, "/");
+	}
+
+	#[test]
+	fn an_absolute_path_never_goes_above_the_root() {
+		let path = RemotePath::new("/root/dir");
+		assert_eq!(path.navigate("/..").0, "/");
+		assert_eq!(path.navigate("/../../a").0, "/a");
+		assert_eq!(path.navigate("/..").basename(), None);
+	}
+
+	#[test]
+	fn a_relative_path_drops_a_trailing_slash() {
+		let path = RemotePath::new("/root").navigate("dir/sub/");
+		assert_eq!(path.0, "/root/dir/sub");
+		assert_eq!(path.basename(), Some("sub"));
+		assert_eq!(path.parent(), RemotePath::new("/root/dir"));
+	}
+
+	#[test]
+	fn a_new_path_is_normalized() {
+		assert_eq!(RemotePath::new("a/../b/").0, "/b");
+		assert_eq!(RemotePath::new("").0, "/");
+		assert_eq!(RemotePath::new("/x//y/.").0, "/x/y");
 	}
 }
