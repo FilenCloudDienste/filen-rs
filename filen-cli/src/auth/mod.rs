@@ -32,6 +32,7 @@
 //!
 //! (development builds use `filen-cli-dev` instead)
 
+mod account;
 mod old_cli;
 
 #[cfg(unix)]
@@ -51,6 +52,7 @@ use filen_sdk_rs::{
 	fs::HasUUID as _,
 };
 
+pub(crate) use self::account::{change_email, change_password, export_master_keys};
 use crate::{
 	CliConfig, ClientConfigArgs, build_client_config, default_config_dir, deserialize_auth_config,
 	serialize_auth_config,
@@ -74,7 +76,32 @@ pub(crate) enum LazyClient {
 		cache_callback_rx: tokio::sync::mpsc::UnboundedReceiver<filen_sdk_rs::cache::CacheMessage>,
 		/// Kept for logout, which offers to delete the file.
 		auth_config_path_arg: Option<String>,
+		/// Where the login is kept, which a change of the credentials updates.
+		kept_login: KeptLogin,
 	},
+}
+
+/// Where the login a client was made from is kept, so that a command that changes the credentials
+/// can update it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum KeptLogin {
+	/// Given with `--email` and `--password`, or their environment variables, on each run.
+	Arguments,
+	/// In this auth config file.
+	AuthConfig(PathBuf),
+	/// In the system keyring's entry of the config dir.
+	Keyring,
+	/// In the credentials the old CLI saved at this path, which it was imported from on this run
+	/// without being kept, so that it is imported from there again on the next run.
+	OldCli(PathBuf),
+	/// Nowhere: the login was typed at the prompt, and not kept.
+	Nowhere,
+}
+
+/// A client that logged in, and where its login is kept.
+struct Login {
+	client: Client,
+	kept: KeptLogin,
 }
 
 impl LazyClient {
@@ -97,8 +124,18 @@ impl LazyClient {
 	}
 
 	pub(crate) async fn get(&mut self, ui: &mut UI) -> Result<&Arc<Client>> {
+		Ok(self.get_with_kept_login(ui).await?.0)
+	}
+
+	/// [`LazyClient::get`], with where its login is kept.
+	pub(crate) async fn get_with_kept_login(
+		&mut self,
+		ui: &mut UI,
+	) -> Result<(&Arc<Client>, &KeptLogin)> {
 		match self {
-			Self::Authenticated { client, .. } => Ok(client),
+			Self::Authenticated {
+				client, kept_login, ..
+			} => Ok((client, kept_login)),
 			Self::Unauthenticated {
 				config,
 				email_arg,
@@ -107,7 +144,7 @@ impl LazyClient {
 				two_factor_code_arg,
 				client_config_args,
 			} => {
-				let client = authenticate_and_get_password(
+				let Login { client, kept } = authenticate_and_get_password(
 					config,
 					ui,
 					email_arg.as_deref(),
@@ -133,11 +170,15 @@ impl LazyClient {
 					client: Arc::new(client),
 					cache_callback_rx,
 					auth_config_path_arg,
+					kept_login: kept,
 				};
-				let Self::Authenticated { client, .. } = self else {
+				let Self::Authenticated {
+					client, kept_login, ..
+				} = self
+				else {
 					unreachable!();
 				};
-				Ok(client)
+				Ok((client, kept_login))
 			}
 		}
 	}
@@ -185,8 +226,7 @@ impl LazyClient {
 }
 
 /// Authenticate by one of the available authentication methods.
-/// Also returns the password (it's needed for Rclone config).
-pub(crate) async fn authenticate_and_get_password(
+async fn authenticate_and_get_password(
 	config: &CliConfig,
 	ui: &mut UI,
 	email_arg: Option<&str>,
@@ -194,7 +234,7 @@ pub(crate) async fn authenticate_and_get_password(
 	two_factor_code_arg: Option<&str>,
 	auth_config_path_arg: Option<&str>,
 	client_config_args: &ClientConfigArgs,
-) -> Result<Client> {
+) -> Result<Login> {
 	if let Some(credentials) =
 		cli_credentials(email_arg, password_arg, two_factor_code_arg, |name| {
 			std::env::var(name).ok()
@@ -208,7 +248,10 @@ pub(crate) async fn authenticate_and_get_password(
 		)
 		.await?;
 		log::info!("Authenticated from CLI arguments");
-		Ok(client)
+		Ok(Login {
+			client,
+			kept: KeptLogin::Arguments,
+		})
 	} else if let Some((client, export_path)) =
 		authenticate_from_auth_config(config, ui, auth_config_path_arg, client_config_args).await?
 	{
@@ -216,24 +259,30 @@ pub(crate) async fn authenticate_and_get_password(
 			"Authenticated from auth config file {}",
 			export_path.display()
 		);
-		Ok(client)
+		Ok(Login {
+			client,
+			kept: KeptLogin::AuthConfig(export_path),
+		})
 	} else {
 		match authenticate_from_keyring(config, ui, client_config_args).await {
 			Ok(Some(client)) => {
 				log::info!("Authenticated from keyring");
-				return Ok(client);
+				return Ok(Login {
+					client,
+					kept: KeptLogin::Keyring,
+				});
 			}
 			Ok(None) => {}
 			Err(e) => log::warn!("Failed to authenticate from keyring: {:?}", e),
 		}
-		if let Some((client, path)) =
+		if let Some((login, path)) =
 			authenticate_from_old_cli(config, ui, client_config_args).await?
 		{
 			log::info!(
 				"Authenticated from credentials of the old CLI at {}",
 				path.display()
 			);
-			return Ok(client);
+			return Ok(login);
 		}
 		authenticate_from_prompt(config, ui, client_config_args).await
 	}
@@ -923,7 +972,7 @@ async fn authenticate_from_prompt(
 	config: &CliConfig,
 	ui: &mut UI,
 	client_config_args: &ClientConfigArgs,
-) -> Result<Client> {
+) -> Result<Login> {
 	ui.ensure_can_prompt("Email:")
 		.context("Not logged in: log in with --email and --password, or with --auth-config-path")?;
 	let client = login_at_prompt(
@@ -936,8 +985,8 @@ async fn authenticate_from_prompt(
 		},
 	)
 	.await?;
-	offer_to_keep_logged_in(config, ui, &client)?;
-	Ok(client)
+	let kept = offer_to_keep_logged_in(config, ui, &client)?;
+	Ok(Login { client, kept })
 }
 
 /// Log in with the email and password `ask` asks for, by `login`, asking again after a login
@@ -982,10 +1031,10 @@ const KEEP_LOGGED_IN_PROMPT: &str = "Keep me logged in?";
 
 /// Offer to save the login of `client` in the keyring, or, where that is not possible, in an auth
 /// config file. The answer defaults to yes, unlike in the old Filen CLI, since the login is kept
-/// in the system keyring, not in a file.
-fn offer_to_keep_logged_in(config: &CliConfig, ui: &mut UI, client: &Client) -> Result<()> {
+/// in the system keyring, not in a file. Returns where the login was kept.
+fn offer_to_keep_logged_in(config: &CliConfig, ui: &mut UI, client: &Client) -> Result<KeptLogin> {
 	if !ui.prompt_confirm(KEEP_LOGGED_IN_PROMPT, true)? {
-		return Ok(());
+		return Ok(KeptLogin::Nowhere);
 	}
 	let sdk_config = serialize_auth_config(client)?;
 	let location = KeyringLocation::of(config);
@@ -1009,18 +1058,18 @@ fn confirm_auth_config(ui: &mut UI, msg: &str) -> Result<bool> {
 
 /// Save the login `sdk_config` in `keyring_entry`, or, without one or if that fails, explain the
 /// other ways to stay logged in and offer, through `ask`, to save it in an auth config file in
-/// `config_dir`. (! referenced in module docs)
+/// `config_dir`. Returns where the login was kept. (! referenced in module docs)
 fn keep_login(
 	config_dir: &Path,
 	ui: &mut UI,
 	sdk_config: &str,
 	keyring_entry: Option<&LongKeyringEntry<'_>>,
 	ask: impl FnOnce(&mut UI, &str) -> Result<bool>,
-) -> Result<()> {
+) -> Result<KeptLogin> {
 	let problem = match keyring_entry.map(|entry| entry.write(sdk_config)) {
 		Some(Ok(())) => {
 			ui.print_success("Saved credentials");
-			return Ok(());
+			return Ok(KeptLogin::Keyring);
 		}
 		Some(Err(e)) => {
 			log::warn!("Failed to save the credentials in the keyring: {:#}", e);
@@ -1037,13 +1086,13 @@ fn keep_login(
 			config_dir.display()
 		),
 	)? {
-		return Ok(());
+		return Ok(KeptLogin::Nowhere);
 	}
 	let path = config_dir.join(AUTH_CONFIG_FILENAME);
 	write_private_file(&path, sdk_config)
 		.with_context(|| format!("Failed to write auth config to file {}", path.display()))?;
 	ui.print_success(&format!("Saved credentials to {}", path.display()));
-	Ok(())
+	Ok(KeptLogin::AuthConfig(path))
 }
 
 /// The ways to stay logged in without the system keyring, with the config dir `config_dir`.
@@ -1067,7 +1116,7 @@ async fn authenticate_from_old_cli(
 	config: &CliConfig,
 	ui: &mut UI,
 	client_config_args: &ClientConfigArgs,
-) -> Result<Option<(Client, PathBuf)>> {
+) -> Result<Option<(Login, PathBuf)>> {
 	if testing_switch_is_on(TESTING_DISABLE_AUTODETECTED_AUTH_CONFIG) {
 		return Ok(None);
 	}
@@ -1110,7 +1159,7 @@ async fn import_old_cli_login(
 	saved: Vec<old_cli::SavedLogin>,
 	client_config_args: &ClientConfigArgs,
 	keychain: impl Fn(&str) -> Result<Option<String>>,
-) -> Result<Option<(Client, PathBuf)>> {
+) -> Result<Option<(Login, PathBuf)>> {
 	let key_name = old_cli::keychain_key_name(cfg!(debug_assertions));
 	for saved in saved {
 		match restore_old_cli_login(&saved, client_config_args, || keychain(key_name)).await {
@@ -1121,12 +1170,18 @@ async fn import_old_cli_login(
 					saved.path.display()
 				));
 				// without a terminal or --yes, the login is used once and imported again next time
-				if !keyring_disabled_for_testing()
+				let kept = if !keyring_disabled_for_testing()
 					&& ui.ensure_can_confirm(KEEP_LOGGED_IN_PROMPT).is_ok()
 				{
-					offer_to_keep_logged_in(config, ui, &client)?;
-				}
-				return Ok(Some((client, saved.path)));
+					offer_to_keep_logged_in(config, ui, &client)?
+				} else {
+					KeptLogin::Nowhere
+				};
+				let kept = match kept {
+					KeptLogin::Nowhere => KeptLogin::OldCli(saved.path.clone()),
+					kept => kept,
+				};
+				return Ok(Some((Login { client, kept }, saved.path)));
 			}
 			Err(e) => {
 				log::warn!(
@@ -2214,7 +2269,7 @@ mod tests {
 		let entry = LongKeyringEntry::new(&store, "sdk-config");
 		let printed = Printed::default();
 
-		keep_login(
+		let kept = keep_login(
 			dir.path(),
 			&mut printed.ui(),
 			"the sdk config",
@@ -2222,6 +2277,8 @@ mod tests {
 			|_, _| panic!("a login saved in the keyring needs no other place"),
 		)
 		.unwrap();
+
+		assert_eq!(kept, KeptLogin::Keyring);
 
 		assert_eq!(entry.read().unwrap().as_deref(), Some("the sdk config"));
 		assert!(!dir.path().join(AUTH_CONFIG_FILENAME).exists());
@@ -2239,7 +2296,7 @@ mod tests {
 		let printed = Printed::default();
 		let mut asked = None;
 
-		keep_login(
+		let kept = keep_login(
 			dir.path(),
 			&mut printed.ui(),
 			"the sdk config",
@@ -2250,6 +2307,8 @@ mod tests {
 			},
 		)
 		.unwrap();
+
+		assert_eq!(kept, KeptLogin::Nowhere);
 
 		assert_eq!(
 			asked,
@@ -2281,7 +2340,7 @@ mod tests {
 		let mut ui = Printed::default().ui();
 		ui.set_assume_yes(true);
 
-		keep_login(
+		let kept = keep_login(
 			dir.path(),
 			&mut ui,
 			"the sdk config",
@@ -2291,6 +2350,7 @@ mod tests {
 		.unwrap();
 
 		let path = dir.path().join(AUTH_CONFIG_FILENAME);
+		assert_eq!(kept, KeptLogin::AuthConfig(path.clone()));
 		assert_eq!(std::fs::read_to_string(&path).unwrap(), "the sdk config");
 	}
 
@@ -2300,7 +2360,7 @@ mod tests {
 		let (dir, _config) = config_in_temp_dir();
 		let printed = Printed::default();
 
-		keep_login(
+		let kept = keep_login(
 			dir.path(),
 			&mut printed.ui(),
 			"the sdk config",
@@ -2310,6 +2370,7 @@ mod tests {
 		.unwrap();
 
 		let path = dir.path().join(AUTH_CONFIG_FILENAME);
+		assert_eq!(kept, KeptLogin::AuthConfig(path.clone()));
 		assert_eq!(std::fs::read_to_string(&path).unwrap(), "the sdk config");
 		assert_eq!(
 			std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,

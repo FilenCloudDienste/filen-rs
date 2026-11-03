@@ -26,6 +26,16 @@ pub(crate) enum AuthCommands {
 	/// Delete saved credentials, including the --auth-config-path file, and exit, asking before
 	/// each (--yes deletes them all); then offer to delete the local cache
 	Logout,
+	/// Change your password, and update the kept login (asks for the current and the new password)
+	ChangePassword,
+	/// Request to change your email, which Filen asks you to confirm by email (asks for your
+	/// password)
+	ChangeEmail {
+		/// The new email
+		new_email: String,
+	},
+	/// Print your master keys, which decrypt all your files, after confirming it (--yes answers)
+	ExportMasterKeys,
 }
 
 /// The authentication section of the docs.
@@ -34,6 +44,10 @@ pub(crate) const DOCS: &[DocElement] = &[
 	DocElement::CommandHelp("whoami"),
 	DocElement::CommandHelp("export-auth-config"),
 	DocElement::CommandHelp("logout"),
+	DocElement::DocFragment("account-credentials"),
+	DocElement::CommandHelp("change-password"),
+	DocElement::CommandHelp("change-email"),
+	DocElement::CommandHelp("export-master-keys"),
 ];
 
 impl AuthCommands {
@@ -65,6 +79,9 @@ impl AuthCommands {
 					});
 				}
 			}
+			Self::ChangePassword => auth::change_password(config, ui, client).await?,
+			Self::ChangeEmail { new_email } => auth::change_email(ui, client, &new_email).await?,
+			Self::ExportMasterKeys => auth::export_master_keys(ui, client).await?,
 		}
 		Ok(CommandResult::default())
 	}
