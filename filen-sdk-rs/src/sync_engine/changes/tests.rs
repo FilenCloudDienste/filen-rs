@@ -889,33 +889,52 @@ fn only_the_safety_net_and_a_request_want_the_remote_as_it_stands() {
 	let changes = sized_pair();
 	note(&changes, &create("a.txt"));
 	assert!(
-		!changes.take().wants_current_remote(),
+		changes.take().wants_current_remote().is_none(),
 		"a change-scoped pass reads what was announced"
 	);
 	changes.force(R::UnappliedWork);
-	assert!(!changes.take().wants_current_remote());
+	assert!(changes.take().wants_current_remote().is_none());
 
-	for reason in [R::SafetyNet, R::Requested] {
+	for (reason, wants) in [
+		(R::SafetyNet, CatchUp::Recent),
+		(R::Requested, CatchUp::Now),
+	] {
 		changes.force(R::UnappliedWork);
 		changes.force(reason);
 		let mut scope = changes.take();
 		assert_eq!(scope.full, Some(R::UnappliedWork), "the first reason stays");
-		assert!(scope.wants_current_remote(), "{reason:?}");
+		assert_eq!(scope.wants_current_remote(), Some(wants), "{reason:?}");
 		scope.note_remote_events_degraded();
 		assert_eq!(scope.full_pass_reason(10), Some(R::RemoteEventsDegraded));
 		assert!(
-			!changes.take().wants_current_remote(),
+			changes.take().wants_current_remote().is_none(),
 			"taken by the one pass"
 		);
 	}
 
+	changes.force(R::Requested);
 	changes.force(R::SafetyNet);
-	changes.take();
-	changes.owe_current_remote();
-	changes.force(R::InterruptedPass);
-	assert!(
+	assert_eq!(
 		changes.take().wants_current_remote(),
+		Some(CatchUp::Now),
+		"a safety-net tick does not weaken a request"
+	);
+
+	changes.force(R::SafetyNet);
+	let scope = changes.take();
+	changes.owe_current_remote(scope.wants_current_remote().unwrap());
+	changes.force(R::InterruptedPass);
+	assert_eq!(
+		changes.take().wants_current_remote(),
+		Some(CatchUp::Recent),
 		"handed on to the pass after one that could not catch up"
+	);
+	changes.owe_current_remote(CatchUp::Now);
+	changes.force(R::SafetyNet);
+	assert_eq!(
+		changes.take().wants_current_remote(),
+		Some(CatchUp::Now),
+		"as currently as it was asked"
 	);
 }
 

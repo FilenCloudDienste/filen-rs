@@ -96,7 +96,9 @@ use tokio::sync::{Notify, futures::Notified};
 use uuid::Uuid;
 
 use super::{ignore::FILENIGNORE, scan::normalize_rel_path};
-use crate::cache::{CacheEvent, CacheEventType, DirEvent, FileEvent, GlobalEvent, RemoteItem};
+use crate::cache::{
+	CacheEvent, CacheEventType, CatchUp, DirEvent, FileEvent, GlobalEvent, RemoteItem,
+};
 
 /// The most entries a changelist holds before it collapses to a full pass, whatever the tree size.
 ///
@@ -604,9 +606,10 @@ struct ChangeState {
 	/// [`Requested`](FullPassReason::Requested) reason, and taken with the lists like
 	/// [`forced`](Self::forced): the next pass is one that reads the remote whole AS IT STANDS, so
 	/// it has the cache catch up with the server first when the cache's socket is not live (see
-	/// [`PassScope::wants_current_remote`]). Kept apart from `forced`, which keeps only the FIRST
-	/// reason recorded and would lose a safety-net tick behind any earlier one.
-	current_remote: bool,
+	/// [`PassScope::wants_current_remote`]): with [`CatchUp::Now`] for a request, which a catch-up
+	/// the safety net had moments ago does not answer. Kept apart from `forced`, which keeps only
+	/// the FIRST reason recorded and would lose a safety-net tick behind any earlier one.
+	current_remote: Option<CatchUp>,
 	/// Whether a filesystem watcher is currently recording local changes onto this list.
 	///
 	/// False until one starts and true only while it runs, because the local list is evidence only
@@ -829,19 +832,21 @@ impl PairChanges {
 		if state.forced.is_none() {
 			state.forced = Some(reason);
 		}
-		if matches!(
-			reason,
-			FullPassReason::SafetyNet | FullPassReason::Requested
-		) {
-			state.current_remote = true;
-		}
+		let wants = match reason {
+			FullPassReason::SafetyNet => CatchUp::Recent,
+			FullPassReason::Requested => CatchUp::Now,
+			_ => return,
+		};
+		state.current_remote = state.current_remote.max(Some(wants));
 	}
 
 	/// Hand a [`wants_current_remote`](PassScope::wants_current_remote) back to the next pass, for
 	/// a pass that took it and could not have the cache catch up: the pass failed, so the next one
-	/// reads whole anyway (see `SyncEngine::sync_pass`), and this makes it ask again.
-	pub(super) fn owe_current_remote(&self) {
-		self.state().current_remote = true;
+	/// reads whole anyway (see `SyncEngine::sync_pass`), and this makes it ask again, as currently
+	/// as it asked.
+	pub(super) fn owe_current_remote(&self, wants: CatchUp) {
+		let mut state = self.state();
+		state.current_remote = state.current_remote.max(Some(wants));
 	}
 
 	/// Record that the pass that just ended held deletions back, so the next pass to run reads both
@@ -953,7 +958,7 @@ pub(super) struct PassScope {
 	local: BTreeSet<String>,
 	remote: Vec<RemoteDeltaEntry>,
 	full: Option<FullPassReason>,
-	current_remote: bool,
+	current_remote: Option<CatchUp>,
 }
 
 impl PassScope {
@@ -970,9 +975,10 @@ impl PassScope {
 
 	/// Whether this pass reads the remote whole for a reason that wants it as it stands NOW — the
 	/// safety net or a caller's request — rather than as the cache last heard of it: while the
-	/// cache's socket is not live, such a pass has the cache catch up with the server first.
-	pub(super) fn wants_current_remote(&self) -> bool {
-		self.current_remote && self.full.is_some()
+	/// cache's socket is not live, such a pass has the cache catch up with the server first, as
+	/// currently as the answer says.
+	pub(super) fn wants_current_remote(&self) -> Option<CatchUp> {
+		self.current_remote.filter(|_| self.full.is_some())
 	}
 
 	/// Record that this pass reads a remote nothing has been announcing changes for: its reason

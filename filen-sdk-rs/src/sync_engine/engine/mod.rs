@@ -65,7 +65,7 @@ use crate::{
 	Error, ErrorKind,
 	auth::Client,
 	cache::{
-		CacheEvent, CacheEventType, DirEvent, FileEvent, RemoteEvents, SearchResult,
+		CacheEvent, CacheEventType, CatchUp, DirEvent, FileEvent, RemoteEvents, SearchResult,
 		SyncRootCallback, SyncRootHandle,
 	},
 	fs::{HasParent, HasUUID, categories::DirType},
@@ -3515,11 +3515,12 @@ impl SyncEngine {
 		pair: PairId,
 		remote_root: Uuid,
 		events: RemoteEvents,
+		wants: CatchUp,
 	) -> Result<(), Error> {
 		tracing::info!(
 			"sync pair {pair}: the cache's socket is not connected, so no remote change is announced; asking the cache to catch up with the server before this pass reads the remote"
 		);
-		match tokio::time::timeout(CONVERGENCE_WAIT, events.catch_up()).await {
+		match tokio::time::timeout(CONVERGENCE_WAIT, events.catch_up(wants)).await {
 			Ok(Ok(())) => Ok(()),
 			Ok(Err(failure)) if failure.kind() == ErrorKind::Reqwest => {
 				Err(remote_unreachable(pair, remote_root, failure))
@@ -6296,7 +6297,9 @@ impl SyncEngine {
 	/// a safety-net tick, so it also finds what both changelists silently missed. On a large tree
 	/// that is the cost of a full pass, not of the changes since the last one. While the cache's
 	/// socket is not connected it also has the cache catch up with the server first, as a
-	/// safety-net pass does, and reports [`FullPassReason::RemoteEventsDegraded`].
+	/// safety-net pass does, and reports [`FullPassReason::RemoteEventsDegraded`]. Unlike the
+	/// safety net's, that catch-up always reads the server: one another pair's safety net had the
+	/// cache run moments ago does not answer it.
 	///
 	/// Without a watch nothing runs: the request is recorded, and the next
 	/// [`sync_once`](Self::sync_once) is that whole pass. Errors if the pair is unknown, being
@@ -6921,9 +6924,9 @@ impl SyncEngine {
 		gate: &PassGate,
 		observer: &mut (dyn FnMut(SyncEvent) + Send),
 	) -> Result<Option<u64>, Result<SyncReport, Error>> {
-		if !scope.wants_current_remote() {
+		let Some(wants) = scope.wants_current_remote() else {
 			return Ok(None);
-		}
+		};
 		let Some(events) = self.unannounced_remote(pair).await else {
 			return Ok(None);
 		};
@@ -6939,7 +6942,7 @@ impl SyncEngine {
 			tokio::select! {
 				biased;
 				() = given_up.as_mut() => return Err(remote_not_converged(pair, remote_root)),
-				caught_up = self.catch_up_remote(pair, remote_root, events) => caught_up?,
+				caught_up = self.catch_up_remote(pair, remote_root, events, wants) => caught_up?,
 			}
 			self.await_remote_view(pair, Some(observer), given_up).await
 		};
@@ -7010,7 +7013,9 @@ impl SyncEngine {
 			Ok(Some(caught_up)) => caught_up,
 			Ok(None) => converged,
 			Err(ended) => {
-				changes.owe_current_remote();
+				if let Some(wants) = scope.wants_current_remote() {
+					changes.owe_current_remote(wants);
+				}
 				return ended;
 			}
 		};

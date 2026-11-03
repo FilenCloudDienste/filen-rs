@@ -265,10 +265,10 @@ pub(crate) struct CacheState {
 	/// including the one inside `run_resync`'s lock-wait; a local there would drop the release and
 	/// strand the check.
 	gap_check: GapCheck,
-	/// Requests to catch up with the server now (see [`CatchUpAck`]), answered between drains.
+	/// Requests to catch up with the server now (see [`CatchUpRequest`]), answered between drains.
 	/// `None` once every sender is gone (the arm disables itself, like `read_tasks`) and in
 	/// unit-test construction.
-	catch_ups: Option<UnboundedReceiver<CatchUpAck>>,
+	catch_ups: Option<UnboundedReceiver<CatchUpRequest>>,
 	/// When the latest catch-up that reached the server ran (see [`CATCH_UP_REUSE`]).
 	caught_up_at: Option<TimerInstant>,
 	/// Whether this worker's latest attempt to converge its roots could reach the server, shared
@@ -297,6 +297,32 @@ pub(crate) enum GapCheck {
 /// gap-check could not read the remote drive id, with that failure, or when a transport failure
 /// left the cache unable to reach the server since (see [`ResyncReach::unreachable`]).
 pub(crate) type CatchUpAck = tokio::sync::oneshot::Sender<Result<(), Arc<crate::Error>>>;
+
+/// How current a request to catch up wants the cache (see `RemoteEvents::catch_up`). Ordered: of
+/// requests answered together, the most demanding decides.
+// Asked for only by the native sync engine; other builds construct neither variant.
+#[cfg_attr(
+	not(all(
+		feature = "sync-engine",
+		not(all(target_family = "wasm", target_os = "unknown"))
+	)),
+	allow(dead_code)
+)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum CatchUp {
+	/// A catch-up that reached the server less than [`CATCH_UP_REUSE`] ago answers it: what the
+	/// safety net asks, on a clock, for each pair the cache serves.
+	Recent,
+	/// Read the server now, whatever ran before: what a pass a caller asked for wants ("sync now"),
+	/// which an answer from before the request would leave as stale as the cache it found.
+	Now,
+}
+
+/// A request to catch up with the server, as the worker receives it.
+pub(crate) struct CatchUpRequest {
+	pub(crate) wants: CatchUp,
+	pub(crate) ack: CatchUpAck,
+}
 
 #[cfg(test)]
 impl CacheState {
@@ -623,8 +649,8 @@ async fn recv_read_task(read_tasks: &mut Option<UnboundedReceiver<ReadTask>>) ->
 
 /// The `None` receiver case is unreachable: the select arm is guarded by `is_some()`.
 async fn recv_catch_up(
-	catch_ups: &mut Option<UnboundedReceiver<CatchUpAck>>,
-) -> Option<CatchUpAck> {
+	catch_ups: &mut Option<UnboundedReceiver<CatchUpRequest>>,
+) -> Option<CatchUpRequest> {
 	match catch_ups {
 		Some(receiver) => receiver.recv().await,
 		None => None,
@@ -658,7 +684,7 @@ type InitResult = (
 	tokio::sync::mpsc::Sender<CacheThreadEvent>,
 	UnboundedSender<ReadTask>,
 	Arc<ResyncReach>,
-	UnboundedSender<CatchUpAck>,
+	UnboundedSender<CatchUpRequest>,
 );
 
 impl CacheState {
@@ -816,9 +842,9 @@ impl CacheState {
 					// now. (A reconnect's gap-check waits for the subscription, at the loop's top.)
 					self.maybe_run_resync().await;
 				},
-				ack = recv_catch_up(&mut self.catch_ups), if self.catch_ups.is_some() => {
-					match ack {
-						Some(ack) => self.catch_up(ack).await,
+				request = recv_catch_up(&mut self.catch_ups), if self.catch_ups.is_some() => {
+					match request {
+						Some(request) => self.catch_up(request).await,
 						// Every sender gone: disable the arm, as `handle_read_task` does.
 						None => self.catch_ups = None,
 					}
@@ -2735,19 +2761,26 @@ impl CacheState {
 	/// A catch-up that reached the server less than [`CATCH_UP_REUSE`] ago answers the requests
 	/// instead, with nothing read, unless a hole is durably flagged since (a relist that did not
 	/// converge flags one): one relist serves every pair this worker serves for that long, where
-	/// each pair's safety net asking on its own clock would relist every root once per pair.
+	/// each pair's safety net asking on its own clock would relist every root once per pair. Not
+	/// when any of them wants the server read now ([`CatchUp::Now`]): a pass a caller asked for.
 	///
 	/// Each request is answered with the failure to read the remote drive id, or else the transport
 	/// failure that left the cache unable to reach the server, while one stands; a request whose
 	/// asker has gone is dropped unanswered.
-	async fn catch_up(&mut self, first: CatchUpAck) {
-		let mut acks = vec![first];
+	async fn catch_up(&mut self, first: CatchUpRequest) {
+		let mut wants = first.wants;
+		let mut acks = vec![first.ack];
 		if let Some(catch_ups) = &mut self.catch_ups {
-			while let Ok(ack) = catch_ups.try_recv() {
-				acks.push(ack);
+			while let Ok(request) = catch_ups.try_recv() {
+				wants = wants.max(request.wants);
+				acks.push(request.ack);
 			}
 		}
-		let outcome = if let Some(ago) = self.recent_catch_up() {
+		let recent = match wants {
+			CatchUp::Recent => self.recent_catch_up(),
+			CatchUp::Now => None,
+		};
+		let outcome = if let Some(ago) = recent {
 			tracing::debug!(
 				"catch-up: {} request(s) answered by the catch-up of {ago:?} ago",
 				acks.len()

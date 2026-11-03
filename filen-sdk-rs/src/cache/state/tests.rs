@@ -23,6 +23,14 @@ fn drive<F: Future>(fut: F) -> F::Output {
 		.block_on(fut)
 }
 
+/// A request to catch up as the safety net asks: a recent catch-up answers it.
+fn recent(ack: CatchUpAck) -> CatchUpRequest {
+	CatchUpRequest {
+		wants: CatchUp::Recent,
+		ack,
+	}
+}
+
 fn item_count(state: &CacheState) -> i64 {
 	state
 		.db
@@ -230,7 +238,7 @@ async fn queued_catch_ups_are_answered_by_one_gap_check() {
 	let mut answers = Vec::new();
 	for _ in 0..3 {
 		let (ack, answer) = tokio::sync::oneshot::channel();
-		sender.send(ack).unwrap();
+		sender.send(recent(ack)).unwrap();
 		answers.push(answer);
 	}
 
@@ -289,7 +297,7 @@ async fn a_catch_up_whose_gap_check_failed_fails_though_reach_keeps_nothing() {
 	state.set_test_resync_client(Arc::new(client));
 
 	let (ack, mut answer) = tokio::sync::oneshot::channel();
-	state.catch_up(ack).await;
+	state.catch_up(recent(ack)).await;
 	proxy.abort();
 
 	assert!(
@@ -321,7 +329,7 @@ async fn a_catch_up_answers_those_after_it_for_a_window() {
 	let (mut state, _producer) = CacheState::new_in_memory_with_producer();
 	// No client: the gap-check reads nothing and the catch-up succeeds.
 	let (ack, mut answer) = tokio::sync::oneshot::channel();
-	state.catch_up(ack).await;
+	state.catch_up(recent(ack)).await;
 	answer.try_recv().unwrap().unwrap();
 	assert!(
 		state.caught_up_at.is_some(),
@@ -333,7 +341,7 @@ async fn a_catch_up_answers_those_after_it_for_a_window() {
 	for _ in 0..5 {
 		tokio::time::advance(CATCH_UP_REUSE / 10).await;
 		let (ack, mut answer) = tokio::sync::oneshot::channel();
-		state.catch_up(ack).await;
+		state.catch_up(recent(ack)).await;
 		answer
 			.try_recv()
 			.expect("the request is answered")
@@ -342,7 +350,7 @@ async fn a_catch_up_answers_those_after_it_for_a_window() {
 
 	tokio::time::advance(CATCH_UP_REUSE / 2).await;
 	let (ack, mut answer) = tokio::sync::oneshot::channel();
-	state.catch_up(ack).await;
+	state.catch_up(recent(ack)).await;
 	let failure = answer
 		.try_recv()
 		.unwrap()
@@ -352,11 +360,58 @@ async fn a_catch_up_answers_those_after_it_for_a_window() {
 	state.caught_up_at = Some(TimerInstant::now());
 	state.mark_needs_resync().unwrap();
 	let (ack, mut answer) = tokio::sync::oneshot::channel();
-	state.catch_up(ack).await;
+	state.catch_up(recent(ack)).await;
 	answer
 		.try_recv()
 		.unwrap()
 		.expect_err("a hole flagged since is read for, inside the window too");
+}
+
+/// A catch-up for a pass a caller asked for ("sync now") reads the server inside the window too,
+/// and so do the safety net's queued with it: the latest catch-up may predate the change the
+/// caller is syncing for.
+#[tokio::test(start_paused = true)]
+async fn a_catch_up_for_a_requested_pass_reads_the_server_inside_the_window() {
+	let (mut state, _producer) = CacheState::new_in_memory_with_producer();
+	let (ack, mut answer) = tokio::sync::oneshot::channel();
+	state.catch_up(recent(ack)).await;
+	answer.try_recv().unwrap().unwrap();
+
+	// From here any read fails at once: a catch-up that fails read the server.
+	state.set_test_resync_client(Arc::new(offline_client()));
+	tokio::time::advance(CATCH_UP_REUSE / 10).await;
+	let (ack, mut answer) = tokio::sync::oneshot::channel();
+	state
+		.catch_up(CatchUpRequest {
+			wants: CatchUp::Now,
+			ack,
+		})
+		.await;
+	let failure = answer
+		.try_recv()
+		.unwrap()
+		.expect_err("a requested pass's catch-up reads the server");
+	assert_eq!(failure.kind(), ErrorKind::Reqwest, "{failure}");
+
+	state.caught_up_at = Some(TimerInstant::now());
+	let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+	state.catch_ups = Some(receiver);
+	let (ack, mut safety_net) = tokio::sync::oneshot::channel();
+	let first = recent(ack);
+	let (ack, mut requested) = tokio::sync::oneshot::channel();
+	sender
+		.send(CatchUpRequest {
+			wants: CatchUp::Now,
+			ack,
+		})
+		.unwrap();
+	state.catch_up(first).await;
+	for answer in [&mut safety_net, &mut requested] {
+		answer
+			.try_recv()
+			.unwrap()
+			.expect_err("one request wanting the server read now reads it for all");
+	}
 }
 
 /// The run loop runs the gap-check a disconnect owes at its top once the socket subscribes again:
@@ -406,7 +461,7 @@ async fn a_catch_up_whose_asker_has_gone_is_dropped() {
 	let mut state = CacheState::new_in_memory();
 	let (ack, answer) = tokio::sync::oneshot::channel();
 	drop(answer);
-	state.catch_up(ack).await;
+	state.catch_up(recent(ack)).await;
 	assert!(!state.needs_resync().unwrap());
 }
 

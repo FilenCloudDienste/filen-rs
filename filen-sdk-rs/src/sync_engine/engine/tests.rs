@@ -11082,7 +11082,7 @@ async fn a_pair_whose_cache_socket_is_down(
 	PairId,
 	PathBuf,
 	Arc<crate::cache::ResyncReach>,
-	tokio::sync::mpsc::UnboundedReceiver<crate::cache::CatchUpAck>,
+	tokio::sync::mpsc::UnboundedReceiver<crate::cache::CatchUpRequest>,
 	Arc<()>,
 ) {
 	// Rooted at the drive, whose root is the client's own: a pass resolves it without a server.
@@ -11144,10 +11144,16 @@ async fn a_safety_net_pass_has_a_disconnected_cache_catch_up_and_finds_the_cloud
 		let remote_root = Uuid::from_u128(1);
 		let cloud = Uuid::from_u128(3);
 		let relisted = tokio::spawn(async move {
-			let ack = catch_ups
+			let request = catch_ups
 				.recv()
 				.await
 				.expect("the pass asks the cache to catch up");
+			assert_eq!(
+				request.wants,
+				CatchUp::Recent,
+				"the safety net takes a catch-up of moments ago"
+			);
+			let ack = request.ack;
 			// What the relist commits: the file, and the root converged again.
 			let mut state = CacheState::new_on_path(&cache, Uuid::from_u128(1));
 			state
@@ -11226,15 +11232,22 @@ async fn a_requested_pass_whose_catch_up_cannot_reach_the_server_fails_offline()
 	engine.sync_once(pair).await.unwrap();
 
 	let answering = tokio::spawn(async move {
-		let ack = catch_ups
+		let request = catch_ups
 			.recv()
 			.await
 			.expect("the pass asks the cache to catch up");
-		ack.send(Err(Arc::new(Error::custom(
-			ErrorKind::Reqwest,
-			"error sending request",
-		))))
-		.unwrap();
+		assert_eq!(
+			request.wants,
+			CatchUp::Now,
+			"a requested pass has the cache read the server, whatever it read moments ago"
+		);
+		request
+			.ack
+			.send(Err(Arc::new(Error::custom(
+				ErrorKind::Reqwest,
+				"error sending request",
+			))))
+			.unwrap();
 		catch_ups
 	});
 	engine.request_pass(pair).await.unwrap();
@@ -11246,9 +11259,10 @@ async fn a_requested_pass_whose_catch_up_cannot_reach_the_server_fails_offline()
 	let mut catch_ups = answering.await.unwrap();
 
 	let changes = engine.pair_changes(pair).await;
-	assert!(
+	assert_eq!(
 		changes.take().wants_current_remote(),
-		"the next pass asks the cache again"
+		Some(CatchUp::Now),
+		"the next pass asks the cache again, as currently"
 	);
 	assert!(catch_ups.try_recv().is_err());
 }
@@ -11267,7 +11281,8 @@ async fn a_catch_up_the_server_answered_with_an_error_fails_the_pass() {
 		let ack = catch_ups
 			.recv()
 			.await
-			.expect("the pass asks the cache to catch up");
+			.expect("the pass asks the cache to catch up")
+			.ack;
 		ack.send(Err(Arc::new(Error::from(
 			filen_types::error::ResponseError::ApiError {
 				message: None,
@@ -11294,7 +11309,8 @@ async fn a_catch_up_the_server_answered_with_an_error_fails_the_pass() {
 			.pair_changes(pair)
 			.await
 			.take()
-			.wants_current_remote(),
+			.wants_current_remote()
+			.is_some(),
 		"the next pass asks the cache again"
 	);
 }

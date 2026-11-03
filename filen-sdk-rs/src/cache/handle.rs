@@ -28,7 +28,7 @@ use uuid::Uuid;
 use crate::cache::{
 	CacheControlMessage, CacheError, CacheState, RootKey, SyncRootCallback,
 	search::ReadTask,
-	state::{CacheThreadEvent, CatchUpAck, ManualEvent, ResyncReach},
+	state::{CacheThreadEvent, CatchUp, CatchUpRequest, ManualEvent, ResyncReach},
 };
 
 /// How long [`spawn_cache_worker`] waits for the new worker's init ack before presuming it dead.
@@ -175,7 +175,7 @@ pub(crate) struct CacheWorkerShared {
 		)),
 		allow(dead_code)
 	)]
-	catch_up_sender: UnboundedSender<CatchUpAck>,
+	catch_up_sender: UnboundedSender<CatchUpRequest>,
 }
 
 /// Every live cache worker in this PROCESS, keyed by the DB it owns. Weak on purpose: the registry
@@ -755,7 +755,7 @@ async fn spawn_cache_worker(
 #[derive(Clone)]
 pub(crate) struct RemoteEvents {
 	reach: Arc<ResyncReach>,
-	catch_up: UnboundedSender<CatchUpAck>,
+	catch_up: UnboundedSender<CatchUpRequest>,
 }
 
 // Used only by the native sync engine; other builds compile it unused.
@@ -781,16 +781,16 @@ impl RemoteEvents {
 
 	/// Bring the worker up to date with the server now: it reads the remote drive id and relists
 	/// its roots if the drive moved since what it holds (the gap-check its socket runs after every
-	/// reconnect), coalescing requests that arrive together, and answering from a catch-up that
-	/// reached the server moments ago. Resolves once that has run: `Ok` when the server was
-	/// reached, and `Err` with the failure when it could not be (a transport failure is
-	/// [`ErrorKind::Reqwest`]) or the worker has exited ([`ErrorKind::Internal`]). Unbounded: the
-	/// worker answers between its other work, a relist under a contended drive lock included, so a
-	/// caller bounds the wait.
+	/// reconnect), coalescing requests that arrive together, and, as `wants` allows, answering from
+	/// a catch-up that reached the server moments ago (see [`CatchUp`]). Resolves once that has
+	/// run: `Ok` when the server was reached, and `Err` with the failure when it could not be (a
+	/// transport failure is [`ErrorKind::Reqwest`]) or the worker has exited
+	/// ([`ErrorKind::Internal`]). Unbounded: the worker answers between its other work, a relist
+	/// under a contended drive lock included, so a caller bounds the wait.
 	///
 	/// A relist that has not converged when this returns (the drive lock is contended) is still
 	/// pending; the root reads as not converged until it lands.
-	pub(crate) async fn catch_up(&self) -> Result<(), Arc<Error>> {
+	pub(crate) async fn catch_up(&self, wants: CatchUp) -> Result<(), Arc<Error>> {
 		let worker_gone = || {
 			Arc::new(Error::custom(
 				ErrorKind::Internal,
@@ -798,7 +798,9 @@ impl RemoteEvents {
 			))
 		};
 		let (ack, answer) = tokio::sync::oneshot::channel();
-		self.catch_up.send(ack).map_err(|_| worker_gone())?;
+		self.catch_up
+			.send(CatchUpRequest { wants, ack })
+			.map_err(|_| worker_gone())?;
 		answer.await.map_err(|_| worker_gone())?
 	}
 }
@@ -963,7 +965,7 @@ impl SyncRootHandle {
 	pub(crate) fn unregistered_for_test_with(
 		uuid: Uuid,
 		reach: Arc<ResyncReach>,
-		catch_up_sender: UnboundedSender<CatchUpAck>,
+		catch_up_sender: UnboundedSender<CatchUpRequest>,
 	) -> Self {
 		let (control_sender, _) = tokio::sync::mpsc::unbounded_channel();
 		let (manual_event_sender, _) = tokio::sync::mpsc::channel(1);

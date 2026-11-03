@@ -55,9 +55,14 @@ pub(crate) use handle::RemoteEvents;
 	not(all(target_family = "wasm", target_os = "unknown"))
 ))]
 pub(crate) use sql::UndecodableItem;
+#[cfg(all(
+	feature = "sync-engine",
+	not(all(target_family = "wasm", target_os = "unknown"))
+))]
+pub(crate) use state::CatchUp;
 pub(crate) use state::{CacheControlMessage, CacheState};
 #[cfg(test)]
-pub(crate) use state::{CatchUpAck, ResyncReach};
+pub(crate) use state::{CatchUpRequest, ResyncReach};
 pub use {
 	error::CacheError,
 	handle::{CacheMessage, ResyncProgress, SyncRootHandle},
