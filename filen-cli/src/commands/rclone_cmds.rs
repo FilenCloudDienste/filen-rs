@@ -364,6 +364,7 @@ pub(crate) async fn mount(
 		.mount(MountOptions {
 			mount_point,
 			read_only,
+			root: None,
 		})
 		.await
 		.map_err(|e| {
@@ -419,6 +420,7 @@ pub(crate) async fn start_server(
 			auth: auth.clone(),
 			tls,
 			read_only: args.read_only,
+			root: None,
 		})
 		.await
 		.map_err(|e| rclone_error(e, format!("Failed to start {name} server")))?;

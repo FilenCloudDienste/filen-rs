@@ -1,7 +1,7 @@
 //! Mounting the daemon's remotes as network drives over rc.
 //!
-//! A mount uses the system's backend ([`fuse_status`]), `Filen:` (or `FilenRO:` when read-only)
-//! with the VFS options every role shares, and is recorded in the daemon's pidfile and watchdog
+//! A mount uses the system's backend ([`fuse_status`]), `Filen:` (or `FilenRO:` when read-only),
+//! followed by its root directory if it has one, with the VFS options every role shares, and is recorded in the daemon's pidfile and watchdog
 //! before it is reported, so a crashed host's mount is taken down with its rclone.
 
 #[cfg(unix)]
@@ -19,8 +19,9 @@ use crate::{
 	Error, ErrorKind,
 	rclone::{
 		RcloneDaemon, RcloneRefusal,
-		daemon::{FILEN_READ_ONLY_REMOTE, FILEN_REMOTE, stopped},
+		daemon::stopped,
 		fuse::{FuseProvider, FuseStatus, fuse_status},
+		root::role_fs,
 		vfs::vfs_opt,
 	},
 };
@@ -39,6 +40,10 @@ pub struct MountOptions {
 	pub mount_point: String,
 	/// Whether the drive is read-only. It then uses its own remote and VFS cache.
 	pub read_only: bool,
+	/// The directory of the drive to mount, by its path from the drive's root (`Photos/2024`); the
+	/// whole drive without one. A `.` or `..` segment, a backslash or a control character is
+	/// refused.
+	pub root: Option<String>,
 }
 
 /// A mount that is up.
@@ -58,8 +63,10 @@ impl RcloneDaemon {
 	/// ([`RcloneRefusal::MountPointNotEmpty`]), already mounted
 	/// ([`RcloneRefusal::MountPointInUse`]) or, on Windows, a drive letter that is taken
 	/// ([`RcloneRefusal::DriveLetterInUse`]). A stale mount left on the mount point by a crashed
-	/// rclone is forced off first. Mounts and unmounts run one at a time.
+	/// rclone is forced off first. Mounts and unmounts run one at a time. An invalid
+	/// `options.root` is refused as [`ErrorKind::InvalidState`].
 	pub async fn mount(&self, options: MountOptions) -> Result<MountInfo, Error> {
+		let fs = role_fs(options.read_only, options.root.as_deref())?;
 		let provider = match fuse_status().await {
 			FuseStatus::Ready { provider, .. } => provider,
 			FuseStatus::Missing { .. } => return Err(RcloneRefusal::FuseMissing.into()),
@@ -67,14 +74,6 @@ impl RcloneDaemon {
 		let mut guard = self.guard.lock().await;
 		let guard = guard.as_mut().ok_or_else(stopped)?;
 		let mount_point = usable_mount_point(&options.mount_point, &guard.record.mounts).await?;
-		let fs = format!(
-			"{}:",
-			if options.read_only {
-				FILEN_READ_ONLY_REMOTE
-			} else {
-				FILEN_REMOTE
-			}
-		);
 		let vfs_opt = vfs_opt(&self.vfs, options.read_only);
 		#[cfg(feature = "test-seams")]
 		let vfs_opt = self.with_write_back_for_test(vfs_opt);

@@ -67,6 +67,7 @@ async fn start_rclone_mount() {
 			.mount(MountOptions {
 				mount_point: "C".to_owned(),
 				read_only: false,
+				root: None,
 			})
 			.await
 			.is_err(),
@@ -77,6 +78,7 @@ async fn start_rclone_mount() {
 		.mount(MountOptions {
 			mount_point: mount_point(dir.path()).await,
 			read_only: false,
+			root: None,
 		})
 		.await
 		.unwrap();

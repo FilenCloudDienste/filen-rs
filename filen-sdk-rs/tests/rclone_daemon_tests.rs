@@ -520,6 +520,7 @@ fn read_write(mount_point: &str) -> MountOptions {
 	MountOptions {
 		mount_point: mount_point.to_owned(),
 		read_only: false,
+		root: None,
 	}
 }
 
@@ -895,7 +896,56 @@ fn serve(protocol: ServeProtocol, auth: ServeAuth) -> ServeOptions {
 		auth,
 		tls: None,
 		read_only: false,
+		root: None,
 	}
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_serve_with_a_root_serves_only_that_directory() {
+	let dirs = Dirs::new();
+	std::fs::create_dir_all(dirs.remote().join("Photos/2024")).unwrap();
+	std::fs::write(dirs.remote().join("Photos/2024/inside.txt"), "inside").unwrap();
+	std::fs::write(dirs.remote().join("outside.txt"), "outside").unwrap();
+	let daemon = dirs.start().await;
+	let http = http_client();
+
+	let info = daemon
+		.start_serve(ServeOptions {
+			root: Some("/Photos/2024/".to_owned()),
+			..serve(ServeProtocol::Http, basic_auth())
+		})
+		.await
+		.unwrap();
+	let get = |path: &str| {
+		http.get(format!("http://{}/{path}", info.addr))
+			.basic_auth(USER, Some(PASSWORD))
+			.send()
+	};
+	let inside = get("inside.txt").await.unwrap();
+	let inside = (inside.status().as_u16(), inside.text().await.unwrap());
+	let outside = get("outside.txt").await.unwrap().status().as_u16();
+
+	assert_eq!(inside, (200, "inside".to_owned()));
+	assert_eq!(outside, 404);
+	daemon.stop(GRACEFUL).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_serve_with_a_root_outside_the_drive_is_refused() {
+	let dirs = Dirs::new();
+	let daemon = dirs.start().await;
+
+	let error = daemon
+		.start_serve(ServeOptions {
+			root: Some("../".to_owned()),
+			..serve(ServeProtocol::Http, basic_auth())
+		})
+		.await
+		.unwrap_err();
+
+	assert_eq!(error.kind(), filen_sdk_rs::ErrorKind::InvalidState);
+	assert_eq!(daemon.stats().await.unwrap().serves, []);
+	daemon.stop(GRACEFUL).await.unwrap();
 }
 
 /// A loopback port nothing listens on, which no other serve here gets.

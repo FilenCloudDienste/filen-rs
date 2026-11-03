@@ -19,6 +19,7 @@ mod private_file;
 mod rc;
 mod recovery;
 mod refusal;
+mod root;
 mod serve;
 mod system;
 mod vfs;

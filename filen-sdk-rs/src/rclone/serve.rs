@@ -7,8 +7,9 @@
 //! only; sftp never reads `~/.ssh/authorized_keys`. Once rclone serves it, an unauthenticated
 //! request must be refused, or the serve is stopped again.
 //!
-//! A serve uses `Filen:`, or `FilenRO:` when read-only, with the VFS options every role shares, so
-//! it shares its VFS and cache with a mount on the same remote. restic is the exception: it writes
+//! A serve uses `Filen:`, or `FilenRO:` when read-only, followed by its root directory if it has
+//! one, with the VFS options every role shares, so it shares its VFS and cache with a mount on the
+//! same remote and root. restic is the exception: it writes
 //! to the remote directly, without a VFS, so it is never read-only.
 
 use std::{
@@ -31,8 +32,9 @@ use crate::{
 	Error, ErrorKind,
 	rclone::{
 		RcloneDaemon, RcloneRefusal, VfsTuning,
-		daemon::{FILEN_READ_ONLY_REMOTE, FILEN_REMOTE, stopped},
+		daemon::stopped,
 		rc::{ListedServe, RcCallFailed, ServeStarted},
+		root::role_fs,
 		vfs::vfs_flags,
 	},
 };
@@ -187,6 +189,10 @@ pub struct ServeOptions {
 	/// Whether the serve is read-only. It then uses its own remote and VFS cache, as read-only
 	/// mounts do. restic is never read-only.
 	pub read_only: bool,
+	/// The directory of the drive to serve, by its path from the drive's root (`Photos/2024`);
+	/// the whole drive without one. A `.` or `..` segment, a backslash or a control character is
+	/// refused.
+	pub root: Option<String>,
 }
 
 /// A serve that is up.
@@ -318,8 +324,9 @@ fn credential_valid(credential: &str, forbidden: &[char]) -> bool {
 }
 
 /// rc `serve/start`'s parameters for `options`, listening on `addr`, with `vfs` as every role's
-/// VFS options.
-fn serve_params(options: &ServeOptions, addr: &str, vfs: &VfsTuning) -> Value {
+/// VFS options. Refused when `options.root` is invalid.
+fn serve_params(options: &ServeOptions, addr: &str, vfs: &VfsTuning) -> Result<Value, Error> {
+	let fs = role_fs(options.read_only, options.root.as_deref())?;
 	let mut params = if options.protocol == ServeProtocol::Restic {
 		Map::new()
 	} else {
@@ -327,12 +334,7 @@ fn serve_params(options: &ServeOptions, addr: &str, vfs: &VfsTuning) -> Value {
 	};
 	let mut set = |key: &str, value: String| params.insert(key.to_owned(), Value::String(value));
 	set("type", options.protocol.rc_type().to_owned());
-	let remote = if options.read_only {
-		FILEN_READ_ONLY_REMOTE
-	} else {
-		FILEN_REMOTE
-	};
-	set("fs", format!("{remote}:"));
+	set("fs", fs);
 	set("addr", addr.to_owned());
 	// Owned copies of the credentials for the body, which is sent once.
 	match &options.auth {
@@ -361,7 +363,7 @@ fn serve_params(options: &ServeOptions, addr: &str, vfs: &VfsTuning) -> Value {
 		set("key", tls.key_path.clone());
 		set("min_tls_version", MIN_TLS_VERSION.to_owned());
 	}
-	Value::Object(params)
+	Ok(Value::Object(params))
 }
 
 impl RcloneDaemon {
@@ -377,9 +379,11 @@ impl RcloneDaemon {
 	/// ([`RcloneRefusal::UnauthenticatedOffLoopback`]), on TLS for a protocol without it
 	/// ([`RcloneRefusal::TlsUnsupported`]), and on a protocol not served here
 	/// ([`RcloneRefusal::UnsupportedProtocol`]). A serve that answers an unauthenticated request is
-	/// stopped and refused with [`RcloneRefusal::AuthRequired`].
+	/// stopped and refused with [`RcloneRefusal::AuthRequired`]. An invalid `options.root` is
+	/// refused as [`ErrorKind::InvalidState`].
 	pub async fn start_serve(&self, options: ServeOptions) -> Result<ServeInfo, Error> {
 		let listen = check(&options)?;
+		let params = serve_params(&options, &listen.addr, &self.vfs)?;
 		if options.protocol == ServeProtocol::Restic && options.read_only {
 			return Err(Error::custom(
 				ErrorKind::InvalidState,
@@ -397,7 +401,7 @@ impl RcloneDaemon {
 		ensure_bindable(listen.socket).await?;
 		let ServeStarted { id, addr } = self
 			.rc
-			.serve_start(&serve_params(&options, &listen.addr, &self.vfs))
+			.serve_start(&params)
 			.await
 			.map_err(|e| bind_refusal(e, listen.socket.port()))?;
 		let answered = match options.protocol {
@@ -621,6 +625,7 @@ mod tests {
 			auth,
 			tls: None,
 			read_only: false,
+			root: None,
 		}
 	}
 
@@ -847,7 +852,7 @@ mod tests {
 	fn webdav_params_carry_its_credentials_and_the_shared_vfs_options() {
 		let options = options(ServeProtocol::Webdav, basic());
 
-		let params = serve_params(&options, "127.0.0.1:1900", &VfsTuning::default());
+		let params = serve_params(&options, "127.0.0.1:1900", &VfsTuning::default()).unwrap();
 
 		let mut expected = vfs_flags(&VfsTuning::default(), false);
 		for (key, value) in [
@@ -869,10 +874,34 @@ mod tests {
 			..options(ServeProtocol::Http, basic())
 		};
 
-		let params = serve_params(&options, "127.0.0.1:1900", &VfsTuning::default());
+		let params = serve_params(&options, "127.0.0.1:1900", &VfsTuning::default()).unwrap();
 
 		assert_eq!(params["fs"], json!("FilenRO:"));
 		assert_eq!(params["read_only"], json!("true"));
+	}
+
+	#[test]
+	fn a_serve_with_a_root_serves_that_directory() {
+		let options = ServeOptions {
+			root: Some("/Photos/2024/".to_owned()),
+			..options(ServeProtocol::Webdav, basic())
+		};
+
+		let params = serve_params(&options, "127.0.0.1:1900", &VfsTuning::default()).unwrap();
+
+		assert_eq!(params["fs"], json!("Filen:Photos/2024"));
+	}
+
+	#[test]
+	fn a_serve_with_a_root_outside_the_drive_is_refused() {
+		let options = ServeOptions {
+			root: Some("Photos/../../etc".to_owned()),
+			..options(ServeProtocol::Webdav, basic())
+		};
+
+		let error = serve_params(&options, "127.0.0.1:1900", &VfsTuning::default()).unwrap_err();
+
+		assert_eq!(error.kind(), ErrorKind::InvalidState);
 	}
 
 	#[test]
@@ -881,7 +910,8 @@ mod tests {
 			&options(ServeProtocol::S3, s3_keys()),
 			"127.0.0.1:1800",
 			&VfsTuning::default(),
-		);
+		)
+		.unwrap();
 
 		assert_eq!(
 			params["auth_key"],
@@ -897,7 +927,8 @@ mod tests {
 			&options(ServeProtocol::Sftp, basic()),
 			"127.0.0.1:2022",
 			&VfsTuning::default(),
-		);
+		)
+		.unwrap();
 
 		assert_eq!(params["authorized_keys"], json!(""));
 		assert_eq!(params.get("no_auth"), None);
@@ -909,7 +940,8 @@ mod tests {
 			&options(ServeProtocol::Restic, basic()),
 			"127.0.0.1:1600",
 			&VfsTuning::default(),
-		);
+		)
+		.unwrap();
 
 		assert_eq!(
 			params,
@@ -933,7 +965,7 @@ mod tests {
 			..options(ServeProtocol::Webdav, basic())
 		};
 
-		let params = serve_params(&options, "127.0.0.1:1900", &VfsTuning::default());
+		let params = serve_params(&options, "127.0.0.1:1900", &VfsTuning::default()).unwrap();
 
 		assert_eq!(params["cert"], json!("/certs/serve.crt"));
 		assert_eq!(params["key"], json!("/certs/serve.key"));
