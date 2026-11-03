@@ -2,6 +2,7 @@ use std::{
 	borrow::Cow,
 	collections::{HashMap, HashSet},
 	fmt::Display,
+	io,
 	path::{Path, PathBuf},
 	slice,
 };
@@ -126,11 +127,12 @@ fn pair_by_alias(pairs: &[ParsedPair], alias: &str) -> Result<ParsedPair> {
 }
 
 /// The pairs `parsed` holds, with each remote root found. Relative remote paths are resolved
-/// against `working_path`. A remote root that does not exist is created once the user confirms it
-/// (or passed `--yes`).
+/// against `working_path`. A local or remote root that does not exist is created once the user
+/// confirms it (or passed `--yes`).
 ///
-/// Every remote root is looked up before any is created, and all of them before any pair is
-/// registered, so a bad definition fails the run before anything is created or stored.
+/// Every root is looked up, and every missing one asked about, before any is created, and all of
+/// them before any pair is registered, so a bad definition or a "no" fails the run before anything
+/// is created or stored. A root that several pairs share is asked about and created once.
 pub(crate) async fn resolve_sync_pairs(
 	ui: &mut UI,
 	client: &Client,
@@ -138,10 +140,35 @@ pub(crate) async fn resolve_sync_pairs(
 	parsed: Vec<ParsedPair>,
 ) -> Result<Vec<PairDefinition>> {
 	let mut found = Vec::with_capacity(parsed.len());
+	// each remote root once, however many pairs share it
+	let mut remote_roots = HashMap::new();
 	for pair in parsed {
 		let remote_path = working_path.navigate(&pair.remote);
-		let remote_root = find_remote_root(client, &remote_path).await?;
-		found.push((pair, remote_path, remote_root));
+		let remote_root = match remote_roots.get(&remote_path) {
+			Some(remote_root) => *remote_root,
+			None => {
+				let remote_root = find_remote_root(client, &remote_path).await?;
+				remote_roots.insert(remote_path.clone(), remote_root);
+				remote_root
+			}
+		};
+		let local_exists = local_root_exists(&pair.local)?;
+		found.push((pair, remote_path, remote_root, local_exists));
+	}
+	let (missing_locals, missing_remotes) = missing_roots(&found);
+	for local in &missing_locals {
+		confirm_local_root(ui, local)?;
+	}
+	for remote_path in &missing_remotes {
+		confirm_remote_root(ui, remote_path)?;
+	}
+	for local in missing_locals {
+		create_local_root(ui, local)?;
+	}
+	let mut created_remotes = HashMap::with_capacity(missing_remotes.len());
+	for remote_path in missing_remotes {
+		let remote_root = create_remote_root(ui, client, remote_path).await?;
+		created_remotes.insert(remote_path.clone(), remote_root);
 	}
 	let mut pairs = Vec::with_capacity(found.len());
 	for (
@@ -158,12 +185,17 @@ pub(crate) async fn resolve_sync_pairs(
 		},
 		remote_path,
 		remote_root,
+		// created above
+		_,
 	) in found
 	{
-		let remote_root = match remote_root {
-			Some(remote_root) => remote_root,
-			None => create_remote_root(ui, client, &remote_path).await?,
-		};
+		let remote_root = remote_root
+			.or_else(|| created_remotes.get(&remote_path).copied())
+			.with_context(|| {
+				format!(
+					"Remote directory {remote_path} was neither found nor created (should be impossible)"
+				)
+			})?;
 		pairs.push(PairDefinition {
 			local,
 			mode,
@@ -173,6 +205,24 @@ pub(crate) async fn resolve_sync_pairs(
 		});
 	}
 	Ok(pairs)
+}
+
+/// The local and the remote roots that `found`, each pair with its remote path, its remote root
+/// if it exists and whether its local root does, misses, each once in the order first given.
+fn missing_roots(
+	found: &[(ParsedPair, RemotePath, Option<Uuid>, bool)],
+) -> (Vec<&Path>, Vec<&RemotePath>) {
+	let mut locals = Vec::new();
+	let mut remotes = Vec::new();
+	for (pair, remote_path, remote_root, local_exists) in found {
+		if !local_exists && !locals.contains(&pair.local.as_path()) {
+			locals.push(pair.local.as_path());
+		}
+		if remote_root.is_none() && !remotes.contains(&remote_path) {
+			remotes.push(remote_path);
+		}
+	}
+	(locals, remotes)
 }
 
 /// The uuid of the remote directory at `remote_path`, or `None` if there is nothing there.
@@ -191,21 +241,75 @@ async fn find_remote_root(client: &Client, remote_path: &RemotePath) -> Result<O
 	}
 }
 
-/// Creates the missing remote root `remote_path`, with every missing directory above it, once the
-/// user confirms it, and returns its uuid.
+/// Whether the local root `local` exists. One that exists but is not a directory is an error.
+fn local_root_exists(local: &Path) -> Result<bool> {
+	match std::fs::metadata(local) {
+		Ok(metadata) if metadata.is_dir() => Ok(true),
+		Ok(_) => Err(UI::failure(&format!(
+			"{} is not a directory",
+			local.display()
+		))),
+		Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+		Err(e) => Err(UI::failure(&format!(
+			"Failed to read the local directory {}: {e}",
+			local.display()
+		))),
+	}
+}
+
+/// Asks whether to create the missing local root `local`, and fails unless the answer is yes.
+fn confirm_local_root(ui: &mut UI, local: &Path) -> Result<()> {
+	if ui.prompt_confirm(
+		&format!(
+			"Local directory {} does not exist. Create it?",
+			local.display()
+		),
+		true,
+	)? {
+		Ok(())
+	} else {
+		Err(UI::failure(&format!(
+			"Local directory {} not found",
+			local.display()
+		)))
+	}
+}
+
+/// Creates the missing local root `local`, with every missing directory above it, which the user
+/// confirmed with [`confirm_local_root`].
+fn create_local_root(ui: &mut UI, local: &Path) -> Result<()> {
+	std::fs::create_dir_all(local).map_err(|e| {
+		UI::failure(&format!(
+			"Failed to create the local directory {}: {e}",
+			local.display()
+		))
+	})?;
+	ui.print_success(&format!("Created the local directory {}", local.display()));
+	Ok(())
+}
+
+/// Asks whether to create the missing remote root `remote_path`, and fails unless the answer is
+/// yes.
+fn confirm_remote_root(ui: &mut UI, remote_path: &RemotePath) -> Result<()> {
+	if ui.prompt_confirm(
+		&format!("Remote directory {remote_path} does not exist. Create it?"),
+		true,
+	)? {
+		Ok(())
+	} else {
+		Err(UI::failure(&format!(
+			"Remote directory {remote_path} not found"
+		)))
+	}
+}
+
+/// Creates the missing remote root `remote_path`, with every missing directory above it, which the
+/// user confirmed with [`confirm_remote_root`], and returns its uuid.
 async fn create_remote_root(
 	ui: &mut UI,
 	client: &Client,
 	remote_path: &RemotePath,
 ) -> Result<Uuid> {
-	if !ui.prompt_confirm(
-		&format!("Remote directory {remote_path} does not exist. Create it?"),
-		true,
-	)? {
-		return Err(UI::failure(&format!(
-			"Remote directory {remote_path} not found"
-		)));
-	}
 	let dir = client
 		.find_or_create_dir(&remote_path.0)
 		.await
@@ -710,14 +814,17 @@ mod tests {
 	use std::path::{Path, PathBuf};
 
 	use filen_sdk_rs::sync_engine::{DeleteGuard, PairOverlap, PairRecord, SyncMode};
+	use filen_types::fs::Uuid;
 
 	use super::{
-		ParsedPair, expand_home, fallback_label, local_path_in_file, local_trash_warnings,
-		overlap_message, parse_sync_mode_str, parse_sync_pair_definition, parse_sync_pairs,
-		read_sync_pairs_file, records_of, sync_mode_str,
+		ParsedPair, create_local_root, expand_home, fallback_label, local_path_in_file,
+		local_root_exists, local_trash_warnings, missing_roots, overlap_message,
+		parse_sync_mode_str, parse_sync_pair_definition, parse_sync_pairs, read_sync_pairs_file,
+		records_of, sync_mode_str,
 	};
 	use crate::{
 		error::{CliError, exit_code, find_cli_error},
+		ui::UI,
 		util::RemotePath,
 	};
 
@@ -791,6 +898,75 @@ mod tests {
 			"Cannot set up the sync pair /home/me/docs <> /docs: its local folder is inside the \
 			 local folder of the sync pair /home/me <(twoWay)> /backup, and sync pairs may not \
 			 overlap. A sync pair stays registered after the run that set it up."
+		);
+	}
+
+	#[test]
+	fn a_local_root_that_is_a_directory_exists() {
+		let dir = tempfile::tempdir().unwrap();
+
+		assert!(local_root_exists(dir.path()).unwrap());
+		assert!(!local_root_exists(&dir.path().join("missing")).unwrap());
+	}
+
+	/// A file where the local root should be is not replaced by a directory, but reported.
+	#[test]
+	fn a_local_root_that_is_a_file_is_a_failure() {
+		let dir = tempfile::tempdir().unwrap();
+		let file = dir.path().join("file");
+		std::fs::write(&file, "").unwrap();
+
+		let error = local_root_exists(&file).unwrap_err();
+
+		assert_eq!(exit_code(&error), 1);
+		assert_eq!(
+			error.to_string(),
+			format!("{} is not a directory", file.display())
+		);
+	}
+
+	#[test]
+	fn a_missing_local_root_is_created_with_the_directories_above_it_under_yes() {
+		let dir = tempfile::tempdir().unwrap();
+		let local = dir.path().join("a").join("b");
+		let mut ui = UI::new();
+		ui.set_assume_yes(true);
+
+		create_local_root(&mut ui, &local).unwrap();
+
+		assert!(local.is_dir());
+	}
+
+	/// Two pairs sharing a missing root are asked about it, and create it, once.
+	#[test]
+	fn a_missing_root_two_pairs_share_is_named_once() {
+		let shared = pair("/new/local", SyncMode::TwoWay, "/new/remote");
+		let found = [
+			(shared.clone(), RemotePath::new("/new/remote"), None, false),
+			(
+				pair("/old/local", SyncMode::TwoWay, "/old/remote"),
+				RemotePath::new("/old/remote"),
+				Some(Uuid::from_u128(1)),
+				true,
+			),
+			(shared, RemotePath::new("/new/remote"), None, false),
+			(
+				pair("/old/local", SyncMode::TwoWay, "/other/remote"),
+				RemotePath::new("/other/remote"),
+				None,
+				true,
+			),
+		];
+
+		let (locals, remotes) = missing_roots(&found);
+
+		assert_eq!(locals, [Path::new("/new/local")]);
+		assert_eq!(
+			remotes,
+			[
+				&RemotePath::new("/new/remote"),
+				&RemotePath::new("/other/remote")
+			]
 		);
 	}
 

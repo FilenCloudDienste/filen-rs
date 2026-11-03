@@ -235,6 +235,37 @@ async fn sync_once_with_yes_creates_a_missing_remote_directory() {
 	);
 }
 
+/// A local directory that does not exist is created, with the missing one above it, when `--yes`
+/// answers the question whether to create it, and a pair that only downloads fills it.
+#[shared_test_runtime]
+async fn sync_once_with_yes_creates_a_missing_local_directory() {
+	// Not `get_resources_with_lock`, for the reason the first test gives.
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir_name = resources.dir.name().unwrap();
+	let file = client
+		.make_file_builder("down.txt", resources.dir.uuid)
+		.unwrap();
+	client.upload_file(file, b"comes down").await.unwrap();
+	let parent = assert_fs::TempDir::new().unwrap();
+	let local = parent.path().join("missing").join("nested");
+	let config_dir = assert_fs::TempDir::new().unwrap();
+	let pair = format!("{}:remoteToLocal:{test_dir_name}", local.to_str().unwrap());
+
+	let output = sync_once(config_dir.path(), &pair, &["--yes"]).await;
+
+	assert_success(&output);
+	assert!(
+		String::from_utf8_lossy(&output.stdout).contains("Created the local directory"),
+		"{}",
+		describe(&output)
+	);
+	assert_eq!(
+		std::fs::read_to_string(local.join("down.txt")).unwrap(),
+		"comes down"
+	);
+}
+
 /// Without a terminal to ask at and without `--yes`, a missing remote directory is not created,
 /// and the command says to pass `--yes`.
 #[shared_test_runtime]

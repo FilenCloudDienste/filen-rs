@@ -22,10 +22,12 @@
 //! set them up. A run that cannot set up one of its sync pairs registers none of them. Only one
 //! `filen sync` can use that database at a time.
 //!
-//! When the remote directory of a sync pair does not exist, `sync` asks whether to create it, and
-//! creates it with any missing directory above it; `--yes` answers yes. Without a terminal to ask
-//! at and without `--yes`, the command fails instead. Every sync pair is checked before any
-//! directory is created.
+//! When the local or the remote directory of a sync pair does not exist, `sync` asks whether to
+//! create it, and creates it with any missing directory above it; `--yes` answers yes. Without a
+//! terminal to ask at and without `--yes`, the command fails instead. A local path that is a file
+//! is an error. `sync` looks up every sync pair's directories, and asks about each missing one
+//! once, before it creates any. A sync pair the sync database then refuses, such as one that
+//! overlaps another, leaves behind the directories created for it.
 //!
 //! A sync pairs file is YAML, or JSON as the TypeScript CLI's syncPairs.json was, that lists sync
 //! pairs under `syncPairs` or is a list of them. Each has a `local` and a `remote` path, and may
