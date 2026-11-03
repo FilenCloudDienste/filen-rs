@@ -1,27 +1,33 @@
 use crate::{
-	CommandResult,
-	auth::LazyClient,
-	commands::{CommandContext, fs_cmds::print_items_with_full_paths},
-	completion::FilenCompleter,
-	docs::DocElement,
-	ui::UI,
-	util::RemotePath,
+	CommandResult, auth::LazyClient, commands::CommandContext, completion::FilenCompleter,
+	docs::DocElement, ui::UI, util::RemotePath,
 };
 use anyhow::{Context as _, Result};
 use clap::Subcommand;
+use console::style;
 use filen_sdk_rs::{
 	ErrorKind,
 	auth::Client,
 	connect::{DirPublicLinkRW, FilePublicLink, PasswordState},
-	fs::{HasName, categories::NonRootFileType, file::traits::HasFileInfo as _},
+	fs::{
+		HasName, HasUUID as _,
+		categories::{NonRootFileType, NonRootItemType, Normal},
+		file::traits::HasFileInfo as _,
+	},
 	io::{RemoteDirectory, RemoteFile},
 };
 use filen_types::api::v3::dir::link::PublicLinkExpiration;
-use std::fmt::{Display, Write as _};
+use futures::{StreamExt as _, TryStreamExt as _, stream};
+use serde_json::json;
+use std::{
+	borrow::Cow,
+	fmt::{Display, Write as _},
+};
+use unicode_width::UnicodeWidthStr as _;
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum PublicLinksCommands {
-	/// List public links
+	/// List public links, with the path and URL of each linked file or directory
 	ListPublicLinks,
 	/// Create, update or delete a public link for a file or directory
 	PublicLink {
@@ -62,6 +68,28 @@ const PUBLIC_LINK_BASE_URL: &str = "https://app.filen.io/#/";
 /// Shown in place of a public link's URL when the key in it could not be decrypted.
 const LINK_URL_UNAVAILABLE: &str = "unavailable (the key could not be decrypted)";
 
+/// Shown in place of a public link's URL when the link was deleted while it was being listed.
+const LINK_REMOVED: &str = "none (the link was removed while listing)";
+
+/// How many items `list-public-links` resolves (path and link status) at once.
+const LINK_STATUS_CONCURRENCY: usize = 8;
+
+/// A linked item, as `list-public-links` prints it.
+struct ListedPublicLink {
+	/// The item's absolute path, or its uuid when the path could not be resolved.
+	path: String,
+	kind: PublicLinkKind,
+	item_uuid: String,
+	/// `None` when the link was removed between listing the linked items and fetching its status.
+	link: Option<ListedLinkStatus>,
+}
+
+struct ListedLinkStatus {
+	link_uuid: String,
+	/// `None` when the key in the link could not be decrypted.
+	url: Option<String>,
+}
+
 pub(crate) async fn list_public_links(ui: &mut UI, client: &mut LazyClient) -> Result<()> {
 	let client = client.get(ui).await?;
 	let (dirs, files) = client
@@ -69,8 +97,123 @@ pub(crate) async fn list_public_links(ui: &mut UI, client: &mut LazyClient) -> R
 		.await
 		.context("Failed to list public links")?;
 
-	print_items_with_full_paths(ui, client, dirs, files, "No public links").await?;
+	let mut links = {
+		// resolving a path walks up the tree, and `get_item_path` takes the drive lock for each
+		// walk; holding one here means those all share it instead of re-acquiring it per item
+		let _lock = client.lock_drive().await.context("Failed to lock drive")?;
+		let mut links = stream::iter(dirs.iter().map(|dir| listed_dir_link(client, dir)))
+			.buffered(LINK_STATUS_CONCURRENCY)
+			.try_collect::<Vec<_>>()
+			.await?;
+		links.extend(
+			stream::iter(files.iter().map(|file| listed_file_link(client, file)))
+				.buffered(LINK_STATUS_CONCURRENCY)
+				.try_collect::<Vec<_>>()
+				.await?,
+		);
+		links
+	};
+	links.sort_by(|a, b| a.path.cmp(&b.path));
 
+	print_public_links(ui, &links)
+}
+
+async fn listed_dir_link(client: &Client, dir: &RemoteDirectory) -> Result<ListedPublicLink> {
+	let path = item_path(client, &NonRootItemType::Dir(Cow::Borrowed(dir))).await;
+	let link = client
+		.get_dir_link_rw(dir)
+		.await
+		.with_context(|| format!("Failed to get the public link of {path}"))?;
+	Ok(ListedPublicLink {
+		path,
+		kind: PublicLinkKind::Directory,
+		item_uuid: dir.uuid().to_string(),
+		link: link.map(|link| ListedLinkStatus {
+			link_uuid: link.uuid().to_string(),
+			url: dir_public_link_url(&link),
+		}),
+	})
+}
+
+async fn listed_file_link(client: &Client, file: &RemoteFile) -> Result<ListedPublicLink> {
+	let path = item_path(client, &NonRootItemType::File(Cow::Borrowed(file))).await;
+	let link = client
+		.get_file_link_status(file)
+		.await
+		.with_context(|| format!("Failed to get the public link of {path}"))?;
+	Ok(ListedPublicLink {
+		path,
+		kind: PublicLinkKind::File,
+		item_uuid: file.uuid().to_string(),
+		link: link.map(|link| ListedLinkStatus {
+			link_uuid: link.uuid().to_string(),
+			url: file_public_link_url(file, &link),
+		}),
+	})
+}
+
+/// The item's absolute path, without the trailing slash `get_item_path` puts on directories.
+/// Falls back to the uuid, as the other listings do, so that one unresolvable item doesn't fail
+/// the whole listing.
+async fn item_path(client: &Client, item: &NonRootItemType<'_, Normal>) -> String {
+	match client.get_item_path(item).await {
+		Ok((path, _)) => format!("/{}", path.trim_end_matches('/')),
+		Err(e) => {
+			log::warn!("Failed to resolve path of item {}: {}", item.uuid(), e);
+			item.uuid().to_string()
+		}
+	}
+}
+
+/// Prints the linked items, expected sorted by path: a path and URL column, directories in blue,
+/// or with `--json` one array of `{path, type, uuid, linkUuid, url}` objects, where `linkUuid` and
+/// `url` are `null` for a link that is gone and `url` is `null` when its key could not be
+/// decrypted.
+fn print_public_links(ui: &mut UI, links: &[ListedPublicLink]) -> Result<()> {
+	if ui.json {
+		let json = links
+			.iter()
+			.map(|link| {
+				json!({
+					"path": link.path,
+					"type": link.kind.json_type(),
+					"uuid": ui.omit_for_replay_testing(&link.item_uuid),
+					"linkUuid": link
+						.link
+						.as_ref()
+						.map(|status| ui.omit_for_replay_testing(&status.link_uuid)),
+					"url": link
+						.link
+						.as_ref()
+						.and_then(|status| status.url.as_deref())
+						.map(|url| ui.omit_for_replay_testing(url)),
+				})
+			})
+			.collect::<serde_json::Value>();
+		return ui.print_json(json);
+	}
+	if links.is_empty() {
+		ui.print_muted("No public links yet.");
+		return Ok(());
+	}
+	let path_width = links
+		.iter()
+		.map(|link| link.path.width())
+		.max()
+		.unwrap_or(0);
+	for link in links {
+		// pad before styling, so the ANSI codes don't count towards the column width
+		let padding = " ".repeat(path_width.saturating_sub(link.path.width()));
+		let path = style(link.path.as_str());
+		let path = match link.kind {
+			PublicLinkKind::Directory => path.blue(),
+			PublicLinkKind::File => path,
+		};
+		let url = link.link.as_ref().map_or(LINK_REMOVED, |status| {
+			url_or_unavailable(ui, status.url.as_deref())
+		});
+		ui.print(&format!("{path}{padding}  {url}"));
+	}
 	Ok(())
 }
 
@@ -340,6 +483,14 @@ impl PublicLinkKind {
 			PublicLinkKind::Directory => "f",
 		}
 	}
+
+	/// The item type as the `--json` listings name it.
+	fn json_type(&self) -> &'static str {
+		match self {
+			PublicLinkKind::File => "file",
+			PublicLinkKind::Directory => "directory",
+		}
+	}
 }
 
 /// The URL of a public link, as the web app copies it: its route, the link's uuid, then an
@@ -414,6 +565,111 @@ mod tests {
 	use filen_types::crypto::LinkHashedPassword;
 
 	use super::*;
+	use crate::ui::test_support::Printed;
+
+	fn listed(
+		path: &str,
+		kind: PublicLinkKind,
+		link: Option<ListedLinkStatus>,
+	) -> ListedPublicLink {
+		ListedPublicLink {
+			path: path.to_owned(),
+			kind,
+			item_uuid: "00000000-0000-0000-0000-000000000001".to_owned(),
+			link,
+		}
+	}
+
+	fn status(url: Option<&str>) -> Option<ListedLinkStatus> {
+		Some(ListedLinkStatus {
+			link_uuid: LINK_UUID.to_owned(),
+			url: url.map(str::to_owned),
+		})
+	}
+
+	fn printed_links(json: bool, links: &[ListedPublicLink]) -> String {
+		let printed = Printed::default();
+		let mut ui = printed.ui();
+		ui.json = json;
+		print_public_links(&mut ui, links).unwrap();
+		console::strip_ansi_codes(&printed.lines()).into_owned()
+	}
+
+	#[test]
+	fn an_empty_link_listing_says_there_are_no_links_yet() {
+		assert_eq!(printed_links(false, &[]), "No public links yet.");
+	}
+
+	#[test]
+	fn an_empty_link_listing_is_an_empty_json_array() {
+		assert_eq!(printed_links(true, &[]), "[]");
+	}
+
+	#[test]
+	fn listed_links_print_their_path_and_url_in_aligned_columns() {
+		let links = [
+			listed(
+				"/docs",
+				PublicLinkKind::Directory,
+				status(Some("https://dir")),
+			),
+			listed(
+				"/docs/report.pdf",
+				PublicLinkKind::File,
+				status(Some("https://file")),
+			),
+			listed("/gone.txt", PublicLinkKind::File, None),
+			listed("/locked", PublicLinkKind::Directory, status(None)),
+		];
+		assert_eq!(
+			printed_links(false, &links),
+			"/docs             https://dir\n\
+			 /docs/report.pdf  https://file\n\
+			 /gone.txt         none (the link was removed while listing)\n\
+			 /locked           unavailable (the key could not be decrypted)"
+		);
+	}
+
+	#[test]
+	fn listed_links_as_json_have_null_link_fields_for_a_removed_link() {
+		let links = [
+			listed(
+				"/docs",
+				PublicLinkKind::Directory,
+				status(Some("https://dir")),
+			),
+			listed("/gone.txt", PublicLinkKind::File, None),
+			listed("/locked", PublicLinkKind::Directory, status(None)),
+		];
+		let printed: serde_json::Value =
+			serde_json::from_str(&printed_links(true, &links)).unwrap();
+		assert_eq!(
+			printed,
+			json!([
+				{
+					"path": "/docs",
+					"type": "directory",
+					"uuid": "00000000-0000-0000-0000-000000000001",
+					"linkUuid": LINK_UUID,
+					"url": "https://dir",
+				},
+				{
+					"path": "/gone.txt",
+					"type": "file",
+					"uuid": "00000000-0000-0000-0000-000000000001",
+					"linkUuid": null,
+					"url": null,
+				},
+				{
+					"path": "/locked",
+					"type": "directory",
+					"uuid": "00000000-0000-0000-0000-000000000001",
+					"linkUuid": LINK_UUID,
+					"url": null,
+				},
+			])
+		);
+	}
 
 	#[test]
 	fn password_label_says_yes_for_a_password_the_server_reports() {
