@@ -207,6 +207,64 @@ async fn sync_once_with_exclude_dot_files_keeps_dot_files_local() {
 	);
 }
 
+/// A remote directory that does not exist is created, with the missing one above it, when `--yes`
+/// answers the question whether to create it.
+#[shared_test_runtime]
+async fn sync_once_with_yes_creates_a_missing_remote_directory() {
+	// Not `get_resources_with_lock`, for the reason the first test gives.
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir_name = resources.dir.name().unwrap();
+	let local = assert_fs::TempDir::new().unwrap();
+	std::fs::write(local.path().join("up.txt"), "goes up").unwrap();
+	let config_dir = assert_fs::TempDir::new().unwrap();
+	let remote = format!("{test_dir_name}/missing/nested");
+	let pair = format!("{}:{remote}", local.path().to_str().unwrap());
+
+	let output = sync_once(config_dir.path(), &pair, &["--yes"]).await;
+
+	assert_success(&output);
+	assert!(
+		String::from_utf8_lossy(&output.stdout).contains("Created the remote directory"),
+		"{}",
+		describe(&output)
+	);
+	assert_eq!(
+		remote_content(client, &format!("{remote}/up.txt")).await,
+		b"goes up"
+	);
+}
+
+/// Without a terminal to ask at and without `--yes`, a missing remote directory is not created,
+/// and the command says to pass `--yes`.
+#[shared_test_runtime]
+async fn sync_once_without_yes_or_a_terminal_leaves_a_missing_remote_directory_alone() {
+	// Not `get_resources_with_lock`, for the reason the first test gives.
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let test_dir_name = resources.dir.name().unwrap();
+	let local = assert_fs::TempDir::new().unwrap();
+	let config_dir = assert_fs::TempDir::new().unwrap();
+	let remote = format!("{test_dir_name}/missing");
+	let pair = format!("{}:{remote}", local.path().to_str().unwrap());
+
+	let output = sync_once(config_dir.path(), &pair, &[]).await;
+
+	assert_eq!(output.status.code(), Some(2), "{}", describe(&output));
+	assert!(
+		String::from_utf8_lossy(&output.stderr).contains("Pass --yes to answer yes."),
+		"{}",
+		describe(&output)
+	);
+	assert!(
+		resources
+			.client
+			.find_item_at_path(&remote)
+			.await
+			.unwrap()
+			.is_none()
+	);
+}
+
 /// A pair whose first `sync --once` agreed on `fight.txt`, which has since been changed on both
 /// sides, with the local root and the config dir that holds its database.
 async fn diverged_pair(

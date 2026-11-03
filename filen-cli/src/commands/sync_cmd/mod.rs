@@ -22,6 +22,11 @@
 //! set them up. A run that cannot set up one of its sync pairs registers none of them. Only one
 //! `filen sync` can use that database at a time.
 //!
+//! When the remote directory of a sync pair does not exist, `sync` asks whether to create it, and
+//! creates it with any missing directory above it; `--yes` answers yes. Without a terminal to ask
+//! at and without `--yes`, the command fails instead. Every sync pair is checked before any
+//! directory is created.
+//!
 //! A sync pairs file is YAML, or JSON as the TypeScript CLI's syncPairs.json was, that lists sync
 //! pairs under `syncPairs` or is a list of them. Each has a `local` and a `remote` path, and may
 //! have a `mode` (or `syncMode`; `twoWay` if not given), an `alias`, by which `filen sync <alias>`
@@ -169,16 +174,7 @@ impl SyncCommands {
 					ui.print_warning(&warning);
 				}
 				let client = client.get(ui).await?;
-				sync(
-					config,
-					ui,
-					client.clone(),
-					working_path,
-					parsed,
-					once,
-					&settle,
-				)
-				.await?;
+				sync(config, ui, client, working_path, parsed, once, &settle).await?;
 			}
 		}
 		Ok(CommandResult::default())
@@ -199,14 +195,14 @@ struct Settle {
 async fn sync(
 	config: &CliConfig,
 	ui: &mut UI,
-	client: Arc<Client>,
+	client: &Arc<Client>,
 	working_path: &RemotePath,
 	parsed: Vec<sync_pairs::ParsedPair>,
 	once: bool,
 	settle: &Settle,
 ) -> Result<()> {
 	// before the engine is opened, so that a bad definition leaves its database as it was
-	let pair_definitions = sync_pairs::resolve_sync_pairs(&client, working_path, parsed).await?;
+	let pair_definitions = sync_pairs::resolve_sync_pairs(ui, client, working_path, parsed).await?;
 
 	// init sync engine
 	let db_path = config.config_dir.join("sync-engine.db");
@@ -215,7 +211,7 @@ async fn sync(
 			.await
 			.map_err(|e| UI::failure(&open_failure(&e, &db_path)))?,
 	);
-	let pair_ids = sync_pairs::register_sync_pairs(&engine, &client, &pair_definitions)
+	let pair_ids = sync_pairs::register_sync_pairs(&engine, client, &pair_definitions)
 		.await
 		.context("Failed to add sync pairs")?;
 
@@ -228,7 +224,7 @@ async fn sync(
 		&pair_ids,
 	)?;
 	// once, before the passes start: labelling an event must not ask the server for anything
-	let labels = sync_pairs::pair_labels(&client, &pairs).await;
+	let labels = sync_pairs::pair_labels(client, &pairs).await;
 	let log = EventLog::new(&labels, settle);
 	if once {
 		once::sync_once(ui, &engine, &pairs, log, settle).await

@@ -126,47 +126,43 @@ fn pair_by_alias(pairs: &[ParsedPair], alias: &str) -> Result<ParsedPair> {
 }
 
 /// The pairs `parsed` holds, with each remote root found. Relative remote paths are resolved
-/// against `working_path`.
+/// against `working_path`. A remote root that does not exist is created once the user confirms it
+/// (or passed `--yes`).
 ///
-/// Every remote root is found before any pair is registered, so a bad definition fails the run
-/// before anything is stored.
+/// Every remote root is looked up before any is created, and all of them before any pair is
+/// registered, so a bad definition fails the run before anything is created or stored.
 pub(crate) async fn resolve_sync_pairs(
+	ui: &mut UI,
 	client: &Client,
 	working_path: &RemotePath,
 	parsed: Vec<ParsedPair>,
 ) -> Result<Vec<PairDefinition>> {
-	let mut pairs = Vec::with_capacity(parsed.len());
-	for ParsedPair {
-		local,
-		mode,
-		remote,
-		// it selected the pair, and is done with
-		alias: _,
-		ignore,
-		// warned about before logging in
-		disable_local_trash: _,
-	} in parsed
+	let mut found = Vec::with_capacity(parsed.len());
+	for pair in parsed {
+		let remote_path = working_path.navigate(&pair.remote);
+		let remote_root = find_remote_root(client, &remote_path).await?;
+		found.push((pair, remote_path, remote_root));
+	}
+	let mut pairs = Vec::with_capacity(found.len());
+	for (
+		ParsedPair {
+			local,
+			mode,
+			// resolved into `remote_path`
+			remote: _,
+			// it selected the pair, and is done with
+			alias: _,
+			ignore,
+			// warned about before logging in
+			disable_local_trash: _,
+		},
+		remote_path,
+		remote_root,
+	) in found
 	{
-		let remote_path = working_path.navigate(&remote);
-		let remote_root = match client
-			.find_item_at_path(&remote_path.0)
-			.await
-			.context("Failed to find remote directory")?
-		{
-			Some(NonRootFileType::Dir(dir)) => dir.uuid(),
-			Some(NonRootFileType::Root(root)) => root.uuid(),
-			Some(NonRootFileType::File(_)) => {
-				return Err(UI::failure(&format!(
-					"{} is a file, not a directory",
-					remote_path
-				)));
-			}
-			None => {
-				return Err(UI::failure(&format!(
-					"Remote directory {} not found",
-					remote_path
-				)));
-			}
+		let remote_root = match remote_root {
+			Some(remote_root) => remote_root,
+			None => create_remote_root(ui, client, &remote_path).await?,
 		};
 		pairs.push(PairDefinition {
 			local,
@@ -177,6 +173,45 @@ pub(crate) async fn resolve_sync_pairs(
 		});
 	}
 	Ok(pairs)
+}
+
+/// The uuid of the remote directory at `remote_path`, or `None` if there is nothing there.
+async fn find_remote_root(client: &Client, remote_path: &RemotePath) -> Result<Option<Uuid>> {
+	match client
+		.find_item_at_path(&remote_path.0)
+		.await
+		.context("Failed to find remote directory")?
+	{
+		Some(NonRootFileType::Dir(dir)) => Ok(Some(dir.uuid())),
+		Some(NonRootFileType::Root(root)) => Ok(Some(root.uuid())),
+		Some(NonRootFileType::File(_)) => Err(UI::failure(&format!(
+			"{remote_path} is a file, not a directory"
+		))),
+		None => Ok(None),
+	}
+}
+
+/// Creates the missing remote root `remote_path`, with every missing directory above it, once the
+/// user confirms it, and returns its uuid.
+async fn create_remote_root(
+	ui: &mut UI,
+	client: &Client,
+	remote_path: &RemotePath,
+) -> Result<Uuid> {
+	if !ui.prompt_confirm(
+		&format!("Remote directory {remote_path} does not exist. Create it?"),
+		true,
+	)? {
+		return Err(UI::failure(&format!(
+			"Remote directory {remote_path} not found"
+		)));
+	}
+	let dir = client
+		.find_or_create_dir(&remote_path.0)
+		.await
+		.with_context(|| format!("Failed to create the remote directory {remote_path}"))?;
+	ui.print_success(&format!("Created the remote directory {remote_path}"));
+	Ok(dir.uuid())
 }
 
 /// Adds each of `pairs` to `engine`, or finds it there from an earlier run.
