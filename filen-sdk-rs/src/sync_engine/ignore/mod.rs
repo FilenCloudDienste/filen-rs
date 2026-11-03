@@ -52,7 +52,7 @@ use super::{
 	scan::collision_key,
 	side::{Nodes, NodesAt},
 };
-use crate::Error;
+use crate::{Error, io::PathMatcher};
 
 mod backslash;
 
@@ -258,6 +258,72 @@ pub(crate) fn parse_user_ignore(text: &str) -> Result<IgnoreSource, IgnoreParseE
 	match errors.into_iter().next() {
 		Some(error) => Err(error),
 		None => Ok(source),
+	}
+}
+
+/// Path patterns in gitignore(5) syntax, for a directory transfer's
+/// [`TransferFilter`](crate::io::TransferFilter). They match as `.filenignore` lines do, against
+/// the path relative to the transferred directory: case-insensitively, a pattern holding a `/`
+/// anchored to that directory and one ending in `/` matching directories only, and a pattern
+/// starting with `!` taking back what an earlier one matched.
+#[derive(Debug)]
+pub struct PathPatterns(IgnoreSource);
+
+impl PathPatterns {
+	/// Compiles `patterns`, each one line of a gitignore file. The first that does not compile,
+	/// or holds a line break, refuses them all.
+	pub fn parse<'a>(patterns: impl IntoIterator<Item = &'a str>) -> Result<Self, PatternError> {
+		let patterns = patterns.into_iter().collect::<Vec<_>>();
+		if let Some(pattern) = patterns
+			.iter()
+			.find(|pattern| pattern.contains(['\n', '\r']))
+		{
+			return Err(PatternError {
+				pattern: (*pattern).to_owned(),
+				reason: "a pattern cannot hold a line break".to_owned(),
+			});
+		}
+		let (source, errors) =
+			IgnoreSource::parse(&patterns.join("\n"), Origin::User).map_err(|error| {
+				PatternError {
+					pattern: patterns.join("\n"),
+					reason: error.reason,
+				}
+			})?;
+		match errors.into_iter().next() {
+			Some(error) => Err(PatternError {
+				pattern: error
+					.line
+					.and_then(|line| patterns.get(line.checked_sub(1)?))
+					.map_or_else(String::new, |pattern| (*pattern).to_owned()),
+				reason: error.reason,
+			}),
+			None => Ok(Self(source)),
+		}
+	}
+}
+
+impl PathMatcher for PathPatterns {
+	fn matches(&self, rel_path: &str, is_dir: bool) -> bool {
+		match self.0.matched(rel_path, is_dir) {
+			Match::Ignore(_) => true,
+			Match::None | Match::Whitelist(_) => false,
+		}
+	}
+}
+
+/// A path pattern [`PathPatterns::parse`] refused.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("invalid pattern {pattern:?}: {reason}")]
+pub struct PatternError {
+	pattern: String,
+	reason: String,
+}
+
+impl PatternError {
+	/// The pattern as given.
+	pub fn pattern(&self) -> &str {
+		&self.pattern
 	}
 }
 

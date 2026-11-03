@@ -17,6 +17,7 @@ use crate::{Error, ErrorKind, consts::CALLBACK_INTERVAL};
 
 use super::{WalkError, entry::*};
 
+mod filtered;
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 pub(super) mod local;
 pub(super) mod remote;
@@ -258,6 +259,44 @@ where
 	<DFSE::WalkerDirEntry as DFSWalkerDirEntry>::Extra,
 	<DFSE::WalkerFileEntry as DFSWalkerFileEntry>::Extra,
 >;
+
+/// Where building a tree reports as it goes.
+pub(crate) struct ScanCallbacks<'a, E, P> {
+	/// The entries that could not be taken into the tree.
+	pub(crate) errors: &'a mut E,
+	/// The directories, files and bytes found so far.
+	pub(crate) progress: &'a mut P,
+}
+
+/// [`build_fs_tree`] over the entries of `dfs_iterator` that `filter` takes.
+fn build_filtered_fs_tree<DFSE>(
+	dfs_iterator: impl Iterator<Item = Result<DFSE, WalkError>>,
+	filter: &crate::io::filter::TransferFilter,
+	error_callback: &mut impl FnMut(Vec<Error>),
+	progress_callback: &mut impl FnMut(u64, u64, u64),
+	should_cancel: &AtomicBool,
+) -> Result<(FSTreeForDFSE<DFSE>, FSStats), Error>
+where
+	DFSE: DFSWalkerEntry,
+	<<DFSE as DFSWalkerEntry>::WalkerDirEntry as DFSWalkerDirEntry>::Extra: std::fmt::Debug,
+	<<DFSE as DFSWalkerEntry>::WalkerFileEntry as DFSWalkerFileEntry>::Extra: std::fmt::Debug,
+{
+	if filter.takes_all() {
+		build_fs_tree(
+			dfs_iterator,
+			error_callback,
+			progress_callback,
+			should_cancel,
+		)
+	} else {
+		build_fs_tree(
+			filtered::FilteredWalk::new(dfs_iterator, filter),
+			error_callback,
+			progress_callback,
+			should_cancel,
+		)
+	}
+}
 
 // should not receive the root entry
 fn build_fs_tree<DFSE>(
@@ -769,6 +808,10 @@ mod tests {
 
 		fn name(&self) -> Result<&str, WalkError> {
 			self.name.map_err(WalkError::EncryptedMeta)
+		}
+
+		fn is_dir(&self) -> bool {
+			self.dir
 		}
 
 		fn into_entry_type(

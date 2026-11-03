@@ -72,7 +72,7 @@ use filen_sdk_rs::{
 	io::{
 		CategoryDirDownloadExtPub as _, DirDownloadCallback, DirDownloadOptions, DirUploadCallback,
 		DirUploadOptions, ExistingLocalFile, ExistingRemoteFile, RemoteDirectory, RemoteFile,
-		SymlinkPolicy, client_impl::IoSharedClientExt as _, is_safe_descendant,
+		SymlinkPolicy, TransferFilter, client_impl::IoSharedClientExt as _, is_safe_descendant,
 	},
 	util::MaybeSendCallback,
 };
@@ -163,6 +163,7 @@ impl TransferCommands {
 						SymlinkPolicy::Follow
 					},
 					existing: existing_remote_policy(skip_existing, update),
+					filter: TransferFilter::default(),
 				};
 				upload(
 					ui,
@@ -185,6 +186,7 @@ impl TransferCommands {
 					} else {
 						ExistingLocalFile::ReplaceUnlessSame
 					},
+					filter: TransferFilter::default(),
 				};
 				download(
 					ui,

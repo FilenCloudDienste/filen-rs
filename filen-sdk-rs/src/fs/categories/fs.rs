@@ -229,10 +229,13 @@ pub trait CategoryFSExt: CategoryFS {
 		let (tree, stats) = crate::io::fs_tree::build_fs_tree_from_remote_iterator::<F, Self>(
 			&client,
 			dir,
-			scan_errors_callback,
-			&mut |_dirs, _files, _bytes| {
-				// this can be a noop because we download everything all at once and then scan it
-				// which means that this should be very fast
+			&crate::io::TransferFilter::default(),
+			crate::io::fs_tree::ScanCallbacks {
+				errors: scan_errors_callback,
+				progress: &mut |_dirs, _files, _bytes| {
+					// this can be a noop because we download everything all at once and then scan
+					// it which means that this should be very fast
+				},
 			},
 			list_dir_progress_callback,
 			drop_canceller.cancelled(),

@@ -87,7 +87,9 @@ use bench::mark as step;
 #[inline(always)]
 fn step(_name: &'static str) {}
 
-pub use self::ignore::{DEFAULT_IGNORE_PATTERNS, IgnoreLevel, IgnoredPath};
+pub use self::ignore::{
+	DEFAULT_IGNORE_PATTERNS, IgnoreLevel, IgnoredPath, PathPatterns, PatternError,
+};
 pub use apply::SyncReport;
 pub use baseline::{PairId, PairRecord};
 pub use changes::FullPassReason;

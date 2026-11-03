@@ -15,6 +15,8 @@ pub(super) trait DFSWalkerEntry {
 		>;
 	fn depth(&self) -> usize;
 	fn name(&self) -> Result<&str, WalkError>;
+	/// Whether the entry is a directory, which [`Self::into_entry_type`] makes it.
+	fn is_dir(&self) -> bool;
 	fn into_entry_type(
 		self,
 	) -> Result<EntryType<Self::WalkerDirEntry, Self::WalkerFileEntry>, WalkError>;
@@ -199,6 +201,13 @@ where
 		match &self.inner {
 			SecondPassEntryInner::Dir(d) => Ok(d.name),
 			SecondPassEntryInner::File(f) => Ok(f.name),
+		}
+	}
+
+	fn is_dir(&self) -> bool {
+		match &self.inner {
+			SecondPassEntryInner::Dir(_) => true,
+			SecondPassEntryInner::File(_) => false,
 		}
 	}
 

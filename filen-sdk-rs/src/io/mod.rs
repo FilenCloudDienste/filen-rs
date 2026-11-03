@@ -6,6 +6,7 @@ mod abort_on_drop;
 mod dir_download;
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 mod dir_upload;
+pub(crate) mod filter;
 pub(crate) mod fs_tree;
 #[cfg(feature = "uniffi")]
 mod js_impl;
@@ -27,6 +28,7 @@ pub use dir_download::{
 };
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 pub use dir_upload::{DirUploadCallback, DirUploadOptions, ExistingRemoteFile, SymlinkPolicy};
+pub use filter::{PathMatcher, TransferFilter};
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 pub use meta_ext::FilenMetaExt;
 

@@ -15,7 +15,7 @@ pub(crate) use entry::{
 	local::{ExtraLocalDirData, ExtraLocalFileData},
 };
 
-pub(crate) use tree::{FSTree, remote::build_fs_tree_from_remote_iterator};
+pub(crate) use tree::{FSTree, ScanCallbacks, remote::build_fs_tree_from_remote_iterator};
 
 #[cfg(test)]
 pub(crate) use tree::remote::test_support;

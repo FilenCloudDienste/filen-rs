@@ -41,6 +41,13 @@ where
 		HasName::name(&self.obj).ok_or_else(|| WalkError::EncryptedMeta(self.obj.uuid()))
 	}
 
+	fn is_dir(&self) -> bool {
+		match &self.obj {
+			NonRootItemType::<Cat>::Dir(_) => true,
+			NonRootItemType::<Cat>::File(_) => false,
+		}
+	}
+
 	fn into_entry_type(self) -> Result<super::EntryType<Cat::Dir, Cat::File>, WalkError> {
 		match self.obj {
 			NonRootItemType::<Cat>::Dir(dir) => Ok(super::EntryType::Dir(dir.into_owned())),

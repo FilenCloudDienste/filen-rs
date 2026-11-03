@@ -20,6 +20,10 @@ impl super::DFSWalkerEntry for DirEntry {
 			.ok_or_else(|| WalkError::InvalidName(self.path().to_path_buf()))
 	}
 
+	fn is_dir(&self) -> bool {
+		self.file_type().is_dir()
+	}
+
 	fn into_entry_type(self) -> Result<super::EntryType<LocalDirEntry, LocalFileEntry>, WalkError> {
 		let file_type = self.file_type();
 		if file_type.is_dir() {
@@ -137,7 +141,7 @@ mod tests {
 	use crate::{
 		Error, ErrorKind,
 		io::{
-			SymlinkPolicy,
+			SymlinkPolicy, TransferFilter,
 			fs_tree::{WalkError, build_fs_tree_from_walkdir_iterator},
 		},
 	};
@@ -157,6 +161,7 @@ mod tests {
 		let (tree, stats) = build_fs_tree_from_walkdir_iterator(
 			root,
 			symlinks,
+			&TransferFilter::default(),
 			&mut |errs| errors.extend(errs),
 			&mut |_, _, _| {},
 			&mut |path| skipped.push(path),
@@ -255,6 +260,7 @@ mod tests {
 		let (tree, stats) = build_fs_tree_from_walkdir_iterator(
 			dir.path(),
 			SymlinkPolicy::Follow,
+			&TransferFilter::default(),
 			&mut |errs| errors.extend(errs),
 			&mut |_, _, _| {},
 			&mut |path| panic!("no symlink is skipped when following: {}", path.display()),

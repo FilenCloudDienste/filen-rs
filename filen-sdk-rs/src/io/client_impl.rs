@@ -187,7 +187,11 @@ impl Client {
 	where
 		C: super::dir_upload::DirUploadCallback + ?Sized,
 	{
-		let super::DirUploadOptions { symlinks, existing } = options;
+		let super::DirUploadOptions {
+			symlinks,
+			existing,
+			filter,
+		} = options;
 		let ref_callback = callback.deref();
 		let mut skipped_symlinks = Vec::new();
 
@@ -198,6 +202,7 @@ impl Client {
 				super::fs_tree::build_fs_tree_from_walkdir_iterator(
 					&dir_path,
 					symlinks,
+					&filter,
 					&mut |errors| {
 						let _ = events.send(ScanEvent::Errors(errors));
 					},

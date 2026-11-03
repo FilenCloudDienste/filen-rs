@@ -6,16 +6,19 @@ use crate::{
 		HasParent, HasUUID,
 		categories::{Category, DirType, NonRootItemType, fs::CategoryFSExt},
 	},
-	io::fs_tree::{
-		WalkError,
-		entry::{DFSWalkerDirEntry, DFSWalkerFileEntry, remote::RemoteFSObjectEntry},
+	io::{
+		filter::TransferFilter,
+		fs_tree::{
+			WalkError,
+			entry::{DFSWalkerDirEntry, DFSWalkerFileEntry, remote::RemoteFSObjectEntry},
+		},
 	},
 };
 
 use filen_types::fs::ParentUuid;
 use uuid::Uuid;
 
-use super::{FSStats, FSTree};
+use super::{FSStats, FSTree, ScanCallbacks};
 
 pub(crate) struct WalkDirFromHashMap<Cat: Category + ?Sized> {
 	map: HashMap<Uuid, Vec<NonRootItemType<'static, Cat>>>,
@@ -119,12 +122,13 @@ where
 	}
 }
 
+/// Lists `dir` and builds the tree of what `filter` takes below it.
 #[allow(private_bounds)]
 pub(crate) async fn build_fs_tree_from_remote_iterator<F, Cat>(
 	client: &Cat::Client,
 	dir: DirType<'_, Cat>,
-	error_callback: &mut impl FnMut(Vec<Error>),
-	progress_callback: &mut impl FnMut(u64, u64, u64),
+	filter: &TransferFilter,
+	callbacks: ScanCallbacks<'_, impl FnMut(Vec<Error>), impl FnMut(u64, u64, u64)>,
 	list_dir_progress_callback: Option<&F>,
 	should_cancel: &std::sync::atomic::AtomicBool,
 	context: Cat::ListDirContext<'_>,
@@ -140,7 +144,13 @@ where
 		Cat::list_dir_recursive(client, &dir, list_dir_progress_callback, context).await?;
 	let iter = WalkDirFromHashMap::<Cat>::new(root_uuid, dirs, files)?;
 
-	super::build_fs_tree(iter, error_callback, progress_callback, should_cancel)
+	super::build_filtered_fs_tree(
+		iter,
+		filter,
+		callbacks.errors,
+		callbacks.progress,
+		should_cancel,
+	)
 }
 
 #[cfg(test)]

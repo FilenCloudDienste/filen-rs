@@ -809,3 +809,36 @@ fn a_class_naming_a_backslash_keeps_its_bracket_and_dash_literal() {
 	}
 	assert!(!ignored(&rules, "badbx", F));
 }
+
+fn patterns(lines: &[&str]) -> PathPatterns {
+	PathPatterns::parse(lines.iter().copied()).unwrap()
+}
+
+#[test]
+fn path_patterns_match_like_gitignore_lines() {
+	let patterns = patterns(&["*.jpg", "build/", "docs/*.md", "!keep.jpg"]);
+	assert!(patterns.matches("a.jpg", F));
+	assert!(patterns.matches("photos/b.jpg", F));
+	assert!(!patterns.matches("keep.jpg", F));
+	assert!(patterns.matches("src/build", D));
+	assert!(!patterns.matches("src/build", F));
+	assert!(patterns.matches("docs/a.md", F));
+	assert!(!patterns.matches("other/docs/a.md", F));
+}
+
+#[test]
+fn path_patterns_match_case_insensitively() {
+	assert!(patterns(&["*.JPG"]).matches("Photo.jpg", F));
+}
+
+#[test]
+fn a_path_pattern_that_does_not_compile_is_refused() {
+	let error = PathPatterns::parse(["*.jpg", "[z-a]", "b"]).unwrap_err();
+	assert_eq!(error.pattern(), "[z-a]");
+}
+
+#[test]
+fn a_path_pattern_holding_a_line_break_is_refused() {
+	let error = PathPatterns::parse(["a\nb"]).unwrap_err();
+	assert_eq!(error.pattern(), "a\nb");
+}

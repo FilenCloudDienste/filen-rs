@@ -11,10 +11,10 @@ use crate::{
 	error::{ErrorExt, ResultExt},
 	fs::categories::{Category, DirType, NonRootItemType, fs::CategoryFSExt},
 	io::{
-		CanonicalPath,
+		CanonicalPath, TransferFilter,
 		abort_on_drop::AbortOnDropHandle,
 		client_impl::{KeepLocalWhen, LocalWrite, inner_download_to_path_with_hash_check},
-		fs_tree::build_fs_tree_from_remote_iterator,
+		fs_tree::{ScanCallbacks, build_fs_tree_from_remote_iterator},
 		meta_ext::DirTimesExt,
 	},
 };
@@ -88,6 +88,8 @@ impl ExistingLocalFile {
 pub struct DirDownloadOptions {
 	/// What to do with a local file already at the path of a file the download writes.
 	pub existing: ExistingLocalFile,
+	/// Which items inside the remote directory to download.
+	pub filter: TransferFilter,
 }
 
 pub(crate) trait CategoryDirDownloadExt: CategoryFSExt {
@@ -450,7 +452,7 @@ pub trait CategoryDirDownloadExtPub: CategoryDirDownloadExt {
 	{
 		use tracing::Instrument as _;
 
-		let DirDownloadOptions { existing } = options;
+		let DirDownloadOptions { existing, filter } = options;
 
 		let span = tracing::info_span!("download_dir_recursively", dir_path = %dir_path);
 		async move {
@@ -465,11 +467,14 @@ pub trait CategoryDirDownloadExtPub: CategoryDirDownloadExt {
 			let (tree, stats) = build_fs_tree_from_remote_iterator::<_, Self>(
 				&client,
 				target.as_borrowed_cow(),
-				&mut |errors| {
-					callback_ref.on_scan_errors(errors);
-				},
-				&mut |dirs, files, bytes| {
-					callback_ref.on_scan_progress(dirs, files, bytes);
+				&filter,
+				ScanCallbacks {
+					errors: &mut |errors| {
+						callback_ref.on_scan_errors(errors);
+					},
+					progress: &mut |dirs, files, bytes| {
+						callback_ref.on_scan_progress(dirs, files, bytes);
+					},
 				},
 				Some(&|current_bytes, total_bytes| {
 					callback_ref.on_query_download_progress(current_bytes, total_bytes);

@@ -23,7 +23,7 @@ use crate::{
 		file::{FileBuilderOptionalName, RemoteFile, traits::HasFileInfo},
 	},
 	io::{
-		FilenMetaExt,
+		FilenMetaExt, TransferFilter,
 		abort_on_drop::AbortOnDropHandle,
 		fs_tree::{DirChildrenInfo, Entry},
 	},
@@ -139,6 +139,8 @@ pub struct DirUploadOptions {
 	pub symlinks: SymlinkPolicy,
 	/// What to do with a file the remote directory already holds a file of the same name as.
 	pub existing: ExistingRemoteFile,
+	/// Which items inside the directory to upload.
+	pub filter: TransferFilter,
 }
 
 /// The files of a remote directory a [`ExistingRemoteFile`] other than `Replace` looks at, by
