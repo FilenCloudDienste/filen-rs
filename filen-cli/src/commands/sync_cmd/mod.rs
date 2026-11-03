@@ -29,7 +29,8 @@
 //! `.filenignore` (gitignore) syntax, and `excludeDotFiles: true`, which stands for the rules `.*`
 //! and `!/.filenignore`: every dot file and dot directory is left out of the sync, but the
 //! `.filenignore` itself. A leading `~` in a local path is the home directory, and a
-//! relative one is relative to the file's directory.
+//! relative one is relative to the file's directory. The TypeScript CLI's `disableLocalTrash` key
+//! is read but only gives a warning, since the local trash cannot be turned off.
 //!
 //! Before a sync pair is synced, the rules of its sync pairs file that the `.filenignore`
 //! at its local root lacks are added to the end of that file, which is created if there is none.
@@ -39,6 +40,11 @@
 //! only downloads (`remoteToLocal`, `remoteBackup`), a `.filenignore` at the local root that was
 //! never synced stays local and applies on top of the remote's. There is no `--ignore` flag:
 //! ignore rules belong to a sync pair, in its `.filenignore` or its sync pairs file.
+//!
+//! A local file or directory that a sync deletes, or replaces with the remote's version, is not
+//! destroyed but moved into `.filen-sync-trash` at the sync pair's local root, under the day it was
+//! moved (`.filen-sync-trash/YYYY-MM-DD/<path>`), and deleted from there after 30 days. That
+//! folder is never synced. The trash is always on, and there is no flag to turn it off.
 
 use std::{
 	borrow::Cow,
@@ -158,6 +164,9 @@ impl SyncCommands {
 				let pairs = given_pairs(pairs, pair_options);
 				// before logging in, so that a bad definition fails at once
 				let parsed = sync_pairs::parse_sync_pairs(&config.config_dir, &pairs)?;
+				for warning in sync_pairs::local_trash_warnings(&parsed) {
+					ui.print_warning(&warning);
+				}
 				let client = client.get(ui).await?;
 				sync(
 					config,

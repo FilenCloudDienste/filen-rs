@@ -42,6 +42,9 @@ pub(crate) struct ParsedPair {
 	alias: Option<String>,
 	/// The ignore rules to add to the `.filenignore` at the local root.
 	ignore: Vec<String>,
+	/// Whether a sync pairs file asks for the local trash to be turned off, which the CLI cannot do
+	/// and warns about (see [`local_trash_warnings`]).
+	disable_local_trash: bool,
 }
 
 /// The pairs `pair_definitions` define, each of which is either `<local>:<remote>` (two-way),
@@ -73,6 +76,23 @@ pub(crate) fn parse_sync_pairs(
 		}
 	}
 	Ok(parsed)
+}
+
+/// A warning for each of `parsed` whose sync pairs file asks for `disableLocalTrash`: the sync
+/// engine always keeps what a pass deletes or replaces locally, for a fixed 30 days.
+pub(crate) fn local_trash_warnings(parsed: &[ParsedPair]) -> Vec<String> {
+	parsed
+		.iter()
+		.filter(|pair| pair.disable_local_trash)
+		.map(|pair| {
+			format!(
+				"The sync pair {} asks for disableLocalTrash, which is not supported: the local \
+				 files a sync deletes or replaces are kept in {} for 30 days.",
+				pair.local.display(),
+				pair.local.join(".filen-sync-trash").display()
+			)
+		})
+		.collect()
 }
 
 /// Whether `definition`, which names no file, is meant as an alias: a word, without the `:` of
@@ -123,6 +143,8 @@ pub(crate) async fn resolve_sync_pairs(
 		// it selected the pair, and is done with
 		alias: _,
 		ignore,
+		// warned about before logging in
+		disable_local_trash: _,
 	} in parsed
 	{
 		let remote_path = working_path.navigate(&remote);
@@ -348,6 +370,7 @@ fn parse_sync_pair_definition(pair: &str) -> Result<ParsedPair> {
 		remote: remote.to_owned(),
 		alias: None,
 		ignore: Vec::new(),
+		disable_local_trash: false,
 	})
 }
 
@@ -486,6 +509,7 @@ fn read_sync_pairs_file(path: &Path) -> Result<Vec<ParsedPair>> {
 				remote: entry.remote,
 				alias: entry.alias,
 				ignore: entry_ignore_rules(entry.exclude_dot_files, entry.ignore),
+				disable_local_trash: entry.disable_local_trash,
 			})
 		})
 		.collect()
@@ -543,6 +567,10 @@ struct SyncPairEntry {
 	/// Whether to leave out every dot file and dot directory, through [`EXCLUDE_DOT_FILES_RULES`].
 	#[serde(default)]
 	exclude_dot_files: bool,
+	/// The TypeScript CLI's switch for its local trash. The sync engine's cannot be turned off, so
+	/// this only gives a warning.
+	#[serde(default)]
+	disable_local_trash: bool,
 }
 
 /// Every mode with the names it is given by: the SDK's name in camelCase first, then the "cloud"
@@ -648,9 +676,9 @@ mod tests {
 	use filen_sdk_rs::sync_engine::{DeleteGuard, PairOverlap, PairRecord, SyncMode};
 
 	use super::{
-		ParsedPair, expand_home, fallback_label, local_path_in_file, overlap_message,
-		parse_sync_mode_str, parse_sync_pair_definition, parse_sync_pairs, read_sync_pairs_file,
-		records_of, sync_mode_str,
+		ParsedPair, expand_home, fallback_label, local_path_in_file, local_trash_warnings,
+		overlap_message, parse_sync_mode_str, parse_sync_pair_definition, parse_sync_pairs,
+		read_sync_pairs_file, records_of, sync_mode_str,
 	};
 	use crate::{
 		error::{CliError, exit_code, find_cli_error},
@@ -664,6 +692,7 @@ mod tests {
 			remote: remote.to_owned(),
 			alias: None,
 			ignore: Vec::new(),
+			disable_local_trash: false,
 		}
 	}
 
@@ -985,6 +1014,26 @@ mod tests {
 				},
 				pair("/m", SyncMode::TwoWay, "/r"),
 			]
+		);
+	}
+
+	/// The local trash cannot be turned off, which a pair whose file asks for it is warned about.
+	#[test]
+	fn disable_local_trash_gives_a_warning() {
+		let (_dir, path) = sync_pairs_file(
+			"syncPairs.json",
+			r#"[{"local": "/l", "remote": "/r", "disableLocalTrash": true},
+			    {"local": "/m", "remote": "/r", "disableLocalTrash": false}]"#,
+		);
+		let parsed = read_sync_pairs_file(&path).unwrap();
+
+		assert_eq!(
+			local_trash_warnings(&parsed),
+			[format!(
+				"The sync pair /l asks for disableLocalTrash, which is not supported: the local \
+				 files a sync deletes or replaces are kept in {} for 30 days.",
+				Path::new("/l").join(".filen-sync-trash").display()
+			)]
 		);
 	}
 
