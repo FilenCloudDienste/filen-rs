@@ -1,0 +1,63 @@
+use filen_macros::shared_test_runtime;
+use filen_sdk_rs::fs::{HasName, categories::NonRootFileType};
+use test_utils::authenticated_cli_with_args;
+
+#[shared_test_runtime]
+async fn uploading_a_directory_uploads_its_files() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir_name = resources.dir.name().unwrap();
+
+	let local = tempfile::tempdir().unwrap();
+	let source = local.path().join("uploaded");
+	std::fs::create_dir_all(source.join("nested")).unwrap();
+	std::fs::write(source.join("nested").join("a.txt"), b"contents").unwrap();
+
+	authenticated_cli_with_args!("upload", source.to_str().unwrap(), test_dir_name).success();
+
+	assert!(matches!(
+		client
+			.find_item_at_path(&format!("{test_dir_name}/uploaded/nested/a.txt"))
+			.await
+			.unwrap(),
+		Some(NonRootFileType::File(_))
+	));
+}
+
+#[cfg(unix)]
+#[shared_test_runtime]
+async fn uploading_a_symlinked_file_keeps_the_links_name() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir_name = resources.dir.name().unwrap();
+
+	let local = tempfile::tempdir().unwrap();
+	std::fs::write(local.path().join("target.txt"), b"contents").unwrap();
+	std::os::unix::fs::symlink(
+		local.path().join("target.txt"),
+		local.path().join("link.txt"),
+	)
+	.unwrap();
+
+	authenticated_cli_with_args!(
+		"upload",
+		local.path().join("link.txt").to_str().unwrap(),
+		test_dir_name
+	)
+	.success();
+
+	assert!(matches!(
+		client
+			.find_item_at_path(&format!("{test_dir_name}/link.txt"))
+			.await
+			.unwrap(),
+		Some(NonRootFileType::File(_))
+	));
+	assert!(
+		client
+			.find_item_at_path(&format!("{test_dir_name}/target.txt"))
+			.await
+			.unwrap()
+			.is_none()
+	);
+}
