@@ -7,6 +7,7 @@ use clap::Subcommand;
 
 use crate::{CliConfig, CommandResult, auth::LazyClient, ui::UI, util::RemotePath};
 
+pub(crate) mod account_cmds;
 pub(crate) mod auth_cmds;
 pub(crate) mod fs_cmds;
 pub(crate) mod misc_cmds;
@@ -40,6 +41,8 @@ pub(crate) enum Commands {
 	Rclone(rclone_cmds::RcloneCommands),
 	#[command(flatten)]
 	Shell(shell_cmds::ShellCommands),
+	#[command(flatten)]
+	Account(account_cmds::AccountCommands),
 }
 
 impl Commands {
@@ -87,5 +90,6 @@ pub(crate) async fn execute_command(
 		Commands::Auth(command) => command.execute(ctx).await,
 		Commands::Rclone(command) => command.execute(ctx).await,
 		Commands::Shell(command) => command.execute(ctx).await,
+		Commands::Account(command) => command.execute(ctx).await,
 	}
 }

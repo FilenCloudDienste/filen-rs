@@ -16,8 +16,8 @@ use tiny_http::{Header, Request, Response};
 use crate::{
 	CliArgs,
 	commands::{
-		auth_cmds, fs_cmds, misc_cmds, notes_cmds, public_links_cmds, rclone_cmds, search_cmd,
-		shell_cmds, sync_cmd, transfer_cmds,
+		account_cmds, auth_cmds, fs_cmds, misc_cmds, notes_cmds, public_links_cmds, rclone_cmds,
+		search_cmd, shell_cmds, sync_cmd, transfer_cmds,
 	},
 	interrupt,
 	ui::UI,
@@ -92,6 +92,11 @@ const DOC_OUTLINE: &[DocSection] = &[
 		id: "auth",
 		title: "Authentication",
 		parts: &[auth_cmds::DOCS],
+	},
+	DocSection {
+		id: "account",
+		title: "Account",
+		parts: &[account_cmds::DOCS],
 	},
 	DocSection {
 		id: "access-files",
