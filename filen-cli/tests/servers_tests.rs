@@ -14,6 +14,7 @@ use std::{
 };
 
 use assert_fs::{TempDir, prelude::*};
+use base64::Engine as _;
 use filen_macros::shared_test_runtime;
 use filen_sdk_rs::{
 	fs::HasName as _,
@@ -22,6 +23,7 @@ use filen_sdk_rs::{
 use regex::Regex;
 use reqwest::{Method, StatusCode};
 use serde_json::Value;
+use sha2::{Digest as _, Sha256};
 use test_utils::cli::prepare_cli_auth_config;
 use tokio::{
 	io::{AsyncBufReadExt, AsyncReadExt, BufReader, Lines},
@@ -419,6 +421,69 @@ async fn a_server_prints_its_address_and_credentials_as_json_under_json() {
 	let (status, stderr) = cli.exit().await;
 	assert_eq!(status.code(), Some(0), "{stderr}");
 	assert!(stderr.contains("Stopping WebDAV server"), "{stderr}");
+}
+
+#[shared_test_runtime]
+async fn a_self_signed_server_serves_https_with_the_certificate_whose_fingerprint_it_prints() {
+	let port = free_port();
+	let address = format!("127.0.0.1:{port}");
+	let mut cli = Cli::spawn(&[
+		"serve",
+		"webdav",
+		"--addr",
+		&address,
+		"--self-signed",
+		"--json",
+	])
+	.await;
+
+	let json = cli.json_object().await;
+	assert_eq!(json["url"], format!("https://{address}").as_str());
+	let pem = std::fs::read(config_dir().join("serve-tls").join("cert.pem")).unwrap();
+	let cert = reqwest::Certificate::from_pem(&pem).unwrap();
+	let body = std::str::from_utf8(&pem).unwrap();
+	let base64_body = body
+		.lines()
+		.filter(|line| !line.starts_with("-----"))
+		.collect::<String>();
+	let fingerprint = Sha256::digest(
+		base64::engine::general_purpose::STANDARD
+			.decode(base64_body)
+			.unwrap(),
+	)
+	.iter()
+	.map(|byte| format!("{byte:02X}"))
+	.collect::<Vec<_>>()
+	.join(":");
+	assert_eq!(json["certificateSha256"], fingerprint.as_str());
+	// a client that trusts the certificate alone accepts it for 127.0.0.1
+	let status = reqwest::Client::builder()
+		.tls_built_in_root_certs(false)
+		.add_root_certificate(cert)
+		.build()
+		.unwrap()
+		.request(
+			Method::from_bytes(b"PROPFIND").unwrap(),
+			format!("https://{address}/"),
+		)
+		.header("Depth", "0")
+		.basic_auth(
+			json["user"].as_str().unwrap(),
+			Some(json["password"].as_str().unwrap()),
+		)
+		.send()
+		.await
+		.unwrap()
+		.status();
+	assert_eq!(status, StatusCode::MULTI_STATUS);
+
+	cli.interrupt();
+	let (status, stderr) = cli.exit().await;
+	assert_eq!(status.code(), Some(0), "{stderr}");
+	assert!(
+		stderr.contains(&format!("SHA-256 fingerprint {fingerprint}")),
+		"{stderr}"
+	);
 }
 
 #[shared_test_runtime]

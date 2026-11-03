@@ -68,6 +68,7 @@ mod local_glob;
 mod log_files;
 mod memory;
 mod repl_history;
+mod serve_cert;
 mod ts_leftovers;
 mod ui;
 mod updater;

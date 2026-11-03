@@ -63,6 +63,13 @@ anstyle = "1.0.13"
 semver = "1.0.27"
 # checks a downloaded update against the SHA-256 digest its release lists
 sha2 = "0.10.9"
+# `serve --self-signed`'s certificate, signed with ring, which rustls already brings. Pinned below
+# 0.14.10, whose pem 4 would add a second major of base64.
+rcgen = { version = "=0.14.9", default-features = false, features = [
+	"crypto",
+	"pem",
+	"ring",
+] }
 comrak = { version = "0.52.0", default-features = false, features = [
 	"bon",
 ] } # needed to remove feature "clap", since it would cause clap_builder's dependency "terminal_size" to be included, which would make ugly line breaks in the help rendering

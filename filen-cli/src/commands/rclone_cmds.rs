@@ -36,11 +36,11 @@
 //!   instead.
 //!
 //! [cli-doc] serve-s3-clients
-//! S3 clients connect to `http://127.0.0.1:1800` by default (`https://` with `--cert`), with the
-//! Access Key ID and Secret Access Key `serve` prints (or the `--user` and `--password` given), and
-//! must use path-style addressing: the bucket in the path, not in the host name. Any region is
-//! accepted, e.g. `us-east-1`. Each directory in the root of your drive is a bucket; files directly
-//! in the root are not listed.
+//! S3 clients connect to `http://127.0.0.1:1800` by default (`https://` with `--cert` or
+//! `--self-signed`), with the Access Key ID and Secret Access Key `serve` prints (or the `--user`
+//! and `--password` given), and must use path-style addressing: the bucket in the path, not in the
+//! host name. Any region is accepted, e.g. `us-east-1`. Each directory in the root of your drive
+//! is a bucket; files directly in the root are not listed.
 //!
 //! [cli-doc] serve-https
 //! `serve --cert <file> --key <file>` serves WebDAV, S3, HTTP and restic over HTTPS, with a
@@ -54,6 +54,14 @@
 //!
 //! Clients reject a self-signed certificate until you tell them to trust it (for example by
 //! adding `cert.pem` to the system's trusted certificates).
+//!
+//! `serve --self-signed` does without OpenSSL: it makes a self-signed certificate (an ECDSA P-256
+//! key, valid for a year) in `serve-tls` in the config directory, and reuses it on every later
+//! `serve`, so that a client that trusts it keeps trusting it. It names `localhost`, `127.0.0.1`
+//! and `::1`, and the addresses servers listened on, and is made again when it is about to expire
+//! or a server listens on an address it does not name. A server listening on every interface
+//! (`0.0.0.0`) is reached by an address the certificate cannot name: clients pin the SHA-256
+//! fingerprint that `serve` prints (`certificateSha256` with `--json`) instead.
 
 use std::{
 	fmt,
@@ -63,6 +71,7 @@ use std::{
 };
 
 use anyhow::{Context as _, Result, anyhow};
+use chrono::Utc;
 use clap::{Subcommand, ValueEnum};
 use filen_sdk_rs::{
 	ErrorKind,
@@ -87,6 +96,7 @@ use crate::{
 	docs::DocElement,
 	error::CliError,
 	interrupt,
+	serve_cert::{self, CertOrigin, SelfSignedCert},
 	ui::{self, StderrLine, UI},
 	util::RemotePath,
 };
@@ -151,12 +161,15 @@ pub(crate) enum RcloneCommands {
 		/// The maximum cache size (e.g. "500Mi", "10Gi") (default: 32Gi)
 		#[arg(long, value_parser = parse_size)]
 		cache_size: Option<u64>,
-		/// TLS certificate (PEM) to serve HTTPS with (WebDAV, S3, HTTP and restic; requires --key; `filen help managed-rclone` shows how to make a self-signed one)
+		/// TLS certificate (PEM) to serve HTTPS with (WebDAV, S3, HTTP and restic; requires --key; or use --self-signed)
 		#[arg(long)]
 		cert: Option<String>,
 		/// TLS private key (PEM) for --cert
 		#[arg(long)]
 		key: Option<String>,
+		/// Serve HTTPS (WebDAV, S3, HTTP and restic) with a self-signed certificate, made once in the config directory and reused; its SHA-256 fingerprint is printed for clients to pin
+		#[arg(long, conflicts_with_all = ["cert", "key"])]
+		self_signed: bool,
 		/// Also mount the drive, on the same Rclone and cache as the servers (read-only with --read-only, of --root only with --root)
 		#[arg(long)]
 		mount: bool,
@@ -323,6 +336,7 @@ impl RcloneCommands {
 				cache_size,
 				cert,
 				key,
+				self_signed,
 				mount,
 				mount_point,
 			} => {
@@ -343,6 +357,7 @@ impl RcloneCommands {
 						cache_size,
 						cert,
 						key,
+						self_signed,
 						mount: mount.then_some(match mount_point {
 							Some(mount_point) => MountPoint::At(mount_point),
 							None => MountPoint::Default,
@@ -430,6 +445,9 @@ pub(crate) struct ServeArgs {
 	pub(crate) cache_size: Option<u64>,
 	pub(crate) cert: Option<String>,
 	pub(crate) key: Option<String>,
+	/// Whether the servers that serve HTTPS do so with the certificate in the config directory,
+	/// made if there is none that fits.
+	pub(crate) self_signed: bool,
 	/// Where the drive is also mounted, on the servers' Rclone; not mounted without one.
 	pub(crate) mount: Option<MountPoint>,
 }
@@ -452,6 +470,8 @@ struct Server {
 	/// Whether `auth` was generated, so that it is printed even with `--quiet`.
 	credentials_generated: bool,
 	tls: Option<ServeTls>,
+	/// The fingerprint of the self-signed certificate `tls` names, for a client to pin.
+	self_signed_fingerprint: Option<String>,
 }
 
 /// A server that `serve` started.
@@ -463,6 +483,7 @@ struct StartedServer {
 	url: Option<String>,
 	auth: ServeAuth,
 	credentials_generated: bool,
+	self_signed_fingerprint: Option<String>,
 }
 
 /// What `mount` mounts.
@@ -521,7 +542,12 @@ pub(crate) async fn start_server(
 	binary: &RcloneBinaryArg,
 	args: ServeArgs,
 ) -> Result<()> {
-	let servers = plan_servers(&args)?;
+	let mut servers = plan_servers(&args)?;
+	let self_signed = if args.self_signed {
+		Some(use_self_signed_cert(&config.config_dir, &mut servers).await?)
+	} else {
+		None
+	};
 	let client = client.get(ui).await?;
 	let root = drive_dir(client, args.root.as_deref()).await?;
 	let mount_point = match args.mount {
@@ -548,6 +574,10 @@ pub(crate) async fn start_server(
 		}
 	};
 	let alone = started.len() == 1 && mounted.is_none();
+	// on stderr with --json, whose output carries the fingerprint too
+	if let Some(cert) = &self_signed {
+		print_notice(ui, &self_signed_notice(cert));
+	}
 	if ui.json {
 		let mut printed: Vec<Value> = started.iter().map(started_json).collect();
 		if let Some(mounted) = &mounted {
@@ -607,6 +637,11 @@ fn plan_servers(args: &ServeArgs) -> Result<Vec<Server>> {
 		(None, None) => None,
 		_ => return Err(UI::usage_failure("Give both --cert and --key, or neither")),
 	};
+	if args.self_signed && !args.protocols.iter().copied().any(serves_tls) {
+		return Err(UI::usage_failure(
+			"--self-signed serves HTTPS, which only WebDAV, S3, HTTP and restic servers do",
+		));
+	}
 	let host = args.host.as_deref().map(parse_host).transpose()?;
 	let credentials_given = args.user.is_some() || args.password.is_some();
 	let mut servers = Vec::with_capacity(args.protocols.len());
@@ -640,9 +675,49 @@ fn plan_servers(args: &ServeArgs) -> Result<Vec<Server>> {
 			auth,
 			credentials_generated,
 			tls,
+			self_signed_fingerprint: None,
 		});
 	}
 	Ok(servers)
+}
+
+/// Gives the servers among `servers` that serve HTTPS the self-signed certificate in
+/// `config_dir`, made now if there is none that names every address they listen on.
+async fn use_self_signed_cert(config_dir: &Path, servers: &mut [Server]) -> Result<SelfSignedCert> {
+	let config_dir = config_dir.to_owned();
+	let hosts = servers
+		.iter()
+		.filter(|server| serves_tls(server.protocol))
+		.map(|server| server.host.clone())
+		.collect::<Vec<_>>();
+	let cert = tokio::task::spawn_blocking(move || {
+		let hosts = hosts.iter().map(String::as_str).collect::<Vec<_>>();
+		serve_cert::ensure(&config_dir, &hosts, Utc::now())
+	})
+	.await
+	.context("Failed to make the self-signed certificate")?
+	.context("Failed to make the self-signed certificate")?;
+	for server in servers
+		.iter_mut()
+		.filter(|server| serves_tls(server.protocol))
+	{
+		// One copy per server.
+		server.tls = Some(cert.tls.clone());
+		server.self_signed_fingerprint = Some(cert.fingerprint.clone());
+	}
+	Ok(cert)
+}
+
+/// What `serve` says about the self-signed certificate it serves HTTPS with.
+fn self_signed_notice(cert: &SelfSignedCert) -> String {
+	let made = match cert.origin {
+		CertOrigin::Generated => "made now",
+		CertOrigin::Reused => "made earlier",
+	};
+	format!(
+		"HTTPS uses the self-signed certificate {} ({made}), SHA-256 fingerprint {}",
+		cert.tls.cert_path, cert.fingerprint
+	)
 }
 
 /// Starts `servers`, and then the mount at `mount_point` if there is one, on `daemon`, all of
@@ -689,6 +764,7 @@ async fn start_servers_and_mount(
 			url,
 			auth: server.auth,
 			credentials_generated: server.credentials_generated,
+			self_signed_fingerprint: server.self_signed_fingerprint,
 		});
 	}
 	let Some(mount_point) = mount_point else {
@@ -744,12 +820,16 @@ fn started_line(server: &StartedServer) -> String {
 
 /// What `serve --json` prints for a started server.
 fn started_json(server: &StartedServer) -> Value {
-	serve_json(
+	let mut started = serve_json(
 		server.protocol,
 		&server.addr,
 		server.url.as_deref(),
 		&server.auth,
-	)
+	);
+	if let Some(fingerprint) = &server.self_signed_fingerprint {
+		started["certificateSha256"] = json!(fingerprint);
+	}
+	started
 }
 
 /// What `serve` says when it stops the servers named `names` and, with `mounted`, the mount.
@@ -1815,6 +1895,7 @@ mod tests {
 			cache_size: None,
 			cert: None,
 			key: None,
+			self_signed: false,
 			mount: None,
 		}
 	}
@@ -2014,6 +2095,120 @@ mod tests {
 	}
 
 	#[test]
+	fn self_signed_and_a_certificate_are_a_usage_error() {
+		let Err(err) = parse_args([
+			"filen",
+			"serve",
+			"webdav",
+			"--self-signed",
+			"--cert",
+			"cert.pem",
+			"--key",
+			"key.pem",
+		]) else {
+			panic!("parsed both --self-signed and --cert");
+		};
+
+		assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+	}
+
+	#[test]
+	fn self_signed_without_a_server_serving_https_is_a_usage_error() {
+		let args = ServeArgs {
+			self_signed: true,
+			..serve_args(&[ServeProtocol::Ftp, ServeProtocol::Nfs])
+		};
+
+		let err = plan_servers(&args).unwrap_err();
+
+		assert_eq!(exit_code(&err), 2);
+		assert_eq!(
+			format!("{err:#}"),
+			"--self-signed serves HTTPS, which only WebDAV, S3, HTTP and restic servers do"
+		);
+	}
+
+	#[tokio::test]
+	async fn only_the_servers_serving_https_get_the_self_signed_certificate() {
+		let config_dir = tempfile::tempdir().unwrap();
+		let args = ServeArgs {
+			host: Some("192.168.1.5".to_owned()),
+			self_signed: true,
+			..serve_args(&[ServeProtocol::Webdav, ServeProtocol::Ftp])
+		};
+		let mut servers = plan_servers(&args).unwrap();
+
+		let cert = use_self_signed_cert(config_dir.path(), &mut servers)
+			.await
+			.unwrap();
+
+		assert_eq!(cert.origin, CertOrigin::Generated);
+		assert_eq!(
+			servers
+				.iter()
+				.map(|server| (
+					server.tls.as_ref(),
+					server.self_signed_fingerprint.as_deref()
+				))
+				.collect::<Vec<_>>(),
+			[
+				(Some(&cert.tls), Some(cert.fingerprint.as_str())),
+				(None, None)
+			]
+		);
+		assert!(
+			cert.tls
+				.cert_path
+				.starts_with(config_dir.path().to_str().unwrap())
+		);
+		let again = use_self_signed_cert(config_dir.path(), &mut servers)
+			.await
+			.unwrap();
+		assert_eq!(again.origin, CertOrigin::Reused);
+		assert_eq!(again.fingerprint, cert.fingerprint);
+	}
+
+	#[test]
+	fn the_self_signed_notice_names_the_certificate_and_its_fingerprint() {
+		let cert = SelfSignedCert {
+			tls: ServeTls {
+				cert_path: "/config/serve-tls/cert.pem".to_owned(),
+				key_path: "/config/serve-tls/key.pem".to_owned(),
+			},
+			fingerprint: "AB:CD".to_owned(),
+			origin: CertOrigin::Reused,
+		};
+
+		assert_eq!(
+			self_signed_notice(&cert),
+			"HTTPS uses the self-signed certificate /config/serve-tls/cert.pem (made earlier), \
+			 SHA-256 fingerprint AB:CD"
+		);
+	}
+
+	#[test]
+	fn a_server_with_the_self_signed_certificate_prints_its_fingerprint_as_json() {
+		let server = StartedServer {
+			protocol: ServeProtocol::Http,
+			addr: "127.0.0.1:1700".to_owned(),
+			url: Some("https://127.0.0.1:1700".to_owned()),
+			auth: ServeAuth::Unauthenticated,
+			credentials_generated: false,
+			self_signed_fingerprint: Some("AB:CD".to_owned()),
+		};
+
+		assert_eq!(
+			started_json(&server),
+			json!({
+				"protocol": "http",
+				"address": "127.0.0.1:1700",
+				"url": "https://127.0.0.1:1700",
+				"certificateSha256": "AB:CD",
+			})
+		);
+	}
+
+	#[test]
 	fn a_read_only_restic_server_among_several_is_a_usage_error() {
 		let args = ServeArgs {
 			read_only: true,
@@ -2053,6 +2248,7 @@ mod tests {
 				password: "secret".to_owned(),
 			},
 			credentials_generated: false,
+			self_signed_fingerprint: None,
 		};
 
 		assert_eq!(
