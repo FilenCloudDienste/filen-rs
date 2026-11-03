@@ -16,13 +16,14 @@ use crate::{
 	util::RemotePath,
 };
 use anyhow::{Context as _, Result};
+use chrono::{DateTime, Utc};
 use clap::Subcommand;
 use console::{Term, style};
 use filen_sdk_rs::{
 	ErrorKind,
 	auth::Client,
 	fs::{
-		HasName as _, HasParent as _, HasUUID,
+		HasName as _, HasParent as _, HasRemoteInfo as _, HasUUID,
 		categories::{DirType, NonRootFileType, NonRootItemType, Normal, fs::CategoryFS},
 		copy::{
 			CopiedTopLevel, CopyCallback, CopyConfig, CopyFailed, CopyPhase, CopyReport,
@@ -52,7 +53,8 @@ pub(crate) enum FsCommands {
 		/// Directory to list files in (default: the current working directory)
 		#[arg(add = FilenCompleter::directory())]
 		directory: Option<String>,
-		/// Use a long listing format with file sizes
+		/// Use a long listing format: sizes, modification dates (creation dates of directories)
+		/// and (*) after favorited items
 		#[arg(short = 'l', long)]
 		long: bool,
 	},
@@ -356,6 +358,10 @@ struct ListedItem {
 	path: Option<String>,
 	/// The file's size in bytes; directories have none.
 	size: Option<u64>,
+	/// When the file was last modified; directories have no such date.
+	modified: Option<DateTime<Utc>>,
+	created: Option<DateTime<Utc>>,
+	favorited: bool,
 	uuid: Uuid,
 }
 
@@ -366,6 +372,9 @@ impl ListedItem {
 			name: name_or_uuid(dir.name(), dir.uuid()),
 			path: None,
 			size: None,
+			modified: None,
+			created: dir.created(),
+			favorited: dir.favorited(),
 			uuid: dir.uuid(),
 		}
 	}
@@ -376,6 +385,9 @@ impl ListedItem {
 			name: name_or_uuid(file.name(), file.uuid()),
 			path: None,
 			size: Some(file.size()),
+			modified: file.last_modified(),
+			created: file.created(),
+			favorited: file.favorited(),
 			uuid: file.uuid(),
 		}
 	}
@@ -388,6 +400,14 @@ impl ListedItem {
 			(ListedBy::Name, _) => Cow::Borrowed(&self.name),
 			(ListedBy::Path, Some(path)) => Cow::Borrowed(path),
 			(ListedBy::Path, None) => Cow::Owned(self.uuid.to_string()),
+		}
+	}
+
+	/// The date `ls -l` shows: when a file was last modified, when a directory was created.
+	fn date(&self) -> Option<DateTime<Utc>> {
+		match self.kind {
+			ListedKind::Directory => self.created,
+			ListedKind::File => self.modified,
 		}
 	}
 }
@@ -403,6 +423,44 @@ fn sort_listing(items: &mut [ListedItem], by: ListedBy) {
 			.cmp(&b.kind)
 			.then_with(|| a.label(by).cmp(&b.label(by)))
 	});
+}
+
+/// Prints one item per line: a right-aligned size column (directories have none), the date
+/// column, the label, and `(*)` after a favorited item.
+fn print_long_listing(ui: &mut UI, items: &[ListedItem], by: ListedBy) {
+	let rows = items
+		.iter()
+		.map(|item| {
+			(
+				item.size.map_or_else(|| "-".to_string(), ui::format_size),
+				item.date()
+					.map_or_else(|| "-".to_string(), |date| ui::format_date(&date)),
+			)
+		})
+		.collect::<Vec<(String, String)>>();
+	let size_width = rows.iter().map(|(size, _)| size.len()).max().unwrap_or(0);
+	let date_width = rows.iter().map(|(_, date)| date.len()).max().unwrap_or(0);
+	for (item, (size, date)) in items.iter().zip(rows) {
+		// pad before styling, so the ANSI codes don't count towards the column width
+		let size = format!("{:>size_width$}", size);
+		let date = format!("{:<date_width$}", date);
+		let label = match item.kind {
+			ListedKind::Directory => style(item.label(by)).blue().to_string(),
+			ListedKind::File => item.label(by).into_owned(),
+		};
+		let size = match item.kind {
+			ListedKind::Directory => style(size).dim().to_string(),
+			ListedKind::File => size,
+		};
+		let favorite = if item.favorited { " (*)" } else { "" };
+		ui.print(&format!(
+			"{}  {}  {}{}",
+			size,
+			style(date).dim(),
+			label,
+			favorite
+		));
+	}
 }
 
 /// Prints a listing, in the order of `items`.
@@ -432,23 +490,7 @@ fn print_listing(
 		return Ok(());
 	}
 	if long {
-		// one item per line, with a right-aligned size column (directories have no size)
-		let sizes = items
-			.iter()
-			.map(|item| item.size.map_or_else(|| "-".to_string(), ui::format_size))
-			.collect::<Vec<String>>();
-		let size_width = sizes.iter().map(|s| s.len()).max().unwrap_or(0).max(1);
-		for (item, size) in items.iter().zip(sizes.iter()) {
-			// pad before styling, so the ANSI codes don't count towards the column width
-			let size = format!("{:>size_width$}", size);
-			let line = match item.kind {
-				ListedKind::Directory => {
-					format!("{}  {}", style(size).dim(), style(item.label(by)).blue())
-				}
-				ListedKind::File => format!("{}  {}", size, item.label(by)),
-			};
-			ui.print(&line);
-		}
+		print_long_listing(ui, items, by);
 		return Ok(());
 	}
 	// print directory names in blue
@@ -1804,6 +1846,7 @@ pub(crate) async fn empty_trash(ui: &mut UI, client: &mut LazyClient) -> Result<
 mod tests {
 	use super::*;
 	use crate::ui::test_support::Printed;
+	use chrono::TimeZone as _;
 	use filen_sdk_rs::fs::copy::SkippedEntry;
 
 	#[test]
@@ -2253,12 +2296,19 @@ mod tests {
 		assert!(confirm_printing_file(&mut ui, 1024 * 1024).unwrap());
 	}
 
+	fn date(year: i32, month: u32, day: u32) -> DateTime<Utc> {
+		Utc.with_ymd_and_hms(year, month, day, 10, 20, 30).unwrap()
+	}
+
 	fn listed_dir(name: &str, uuid: u128) -> ListedItem {
 		ListedItem {
 			kind: ListedKind::Directory,
 			name: name.to_owned(),
 			path: None,
 			size: None,
+			modified: None,
+			created: None,
+			favorited: false,
 			uuid: Uuid::from_u128(uuid),
 		}
 	}
@@ -2269,6 +2319,9 @@ mod tests {
 			name: name.to_owned(),
 			path: None,
 			size: Some(size),
+			modified: None,
+			created: None,
+			favorited: false,
 			uuid: Uuid::from_u128(uuid),
 		}
 	}
@@ -2293,7 +2346,50 @@ mod tests {
 
 		assert_eq!(
 			printed_listing(items, ListedBy::Name, true, false),
-			"    -  docs\n  5 B  a.txt\n2 KiB  b.txt"
+			"    -  -  docs\n  5 B  -  a.txt\n2 KiB  -  b.txt"
+		);
+	}
+
+	#[test]
+	fn a_long_listing_shows_when_a_file_was_modified_and_a_directory_created() {
+		let items = vec![
+			ListedItem {
+				modified: Some(date(2024, 3, 9)),
+				created: Some(date(2020, 1, 1)),
+				..listed_file("a.txt", 5, 1)
+			},
+			ListedItem {
+				created: Some(date(2023, 12, 31)),
+				..listed_dir("docs", 2)
+			},
+			listed_file("b.txt", 5, 3),
+		];
+
+		assert_eq!(
+			printed_listing(items, ListedBy::Name, true, false),
+			"  -  2023-12-31 10:20:30 (UTC)  docs\n\
+			 5 B  2024-03-09 10:20:30 (UTC)  a.txt\n\
+			 5 B  -                          b.txt"
+		);
+	}
+
+	#[test]
+	fn a_long_listing_marks_favorited_items() {
+		let items = vec![
+			ListedItem {
+				favorited: true,
+				..listed_dir("docs", 1)
+			},
+			ListedItem {
+				favorited: true,
+				..listed_file("a.txt", 5, 2)
+			},
+			listed_file("b.txt", 5, 3),
+		];
+
+		assert_eq!(
+			printed_listing(items, ListedBy::Name, true, false),
+			"  -  -  docs (*)\n5 B  -  a.txt (*)\n5 B  -  b.txt"
 		);
 	}
 
