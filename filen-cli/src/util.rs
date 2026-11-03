@@ -65,8 +65,6 @@ impl Display for RemotePath {
 	}
 }
 
-const KEYRING_SERVICE_NAME: &str = "filen-cli-rs";
-
 /// The most bytes one keyring entry holds of a [`LongKeyringEntry`]'s value.
 const KEYRING_CHUNK_LEN: usize = 1000;
 
@@ -80,18 +78,24 @@ pub(crate) trait ChunkStore {
 	fn delete(&self, key: &str) -> Result<bool>;
 }
 
-/// The system keyring, with each value an entry of the CLI's service.
-pub(crate) struct KeyringChunkStore;
+/// The system keyring, with each value an entry of one service.
+pub(crate) struct KeyringChunkStore {
+	service: &'static str,
+}
 
 impl KeyringChunkStore {
-	fn entry(key: &str) -> Result<keyring::Entry> {
-		keyring::Entry::new(KEYRING_SERVICE_NAME, key).context("Failed to create keyring entry")
+	pub(crate) fn new(service: &'static str) -> Self {
+		KeyringChunkStore { service }
+	}
+
+	fn entry(&self, key: &str) -> Result<keyring::Entry> {
+		keyring::Entry::new(self.service, key).context("Failed to create keyring entry")
 	}
 }
 
 impl ChunkStore for KeyringChunkStore {
 	fn get(&self, key: &str) -> Result<Option<String>> {
-		match Self::entry(key)?.get_password() {
+		match self.entry(key)?.get_password() {
 			Ok(value) => Ok(Some(value)),
 			Err(keyring::Error::NoEntry) => Ok(None),
 			Err(e) => Err(anyhow!(e)).context("Failed to read keyring entry"),
@@ -99,13 +103,13 @@ impl ChunkStore for KeyringChunkStore {
 	}
 
 	fn set(&self, key: &str, value: &str) -> Result<()> {
-		Self::entry(key)?
+		self.entry(key)?
 			.set_password(value)
 			.context("Failed to save chunk to keyring")
 	}
 
 	fn delete(&self, key: &str) -> Result<bool> {
-		match Self::entry(key)?.delete_credential() {
+		match self.entry(key)?.delete_credential() {
 			Ok(()) => Ok(true),
 			Err(keyring::Error::NoEntry) => Ok(false),
 			Err(e) => Err(anyhow!(e)).context("Failed to delete keyring entry"),

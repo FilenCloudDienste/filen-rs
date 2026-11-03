@@ -15,6 +15,7 @@
 //!   to other users: restrict it with `chmod 600`)
 //! - if none of these is set, you will be prompted for credentials,
 //!   with the option to save them securely in the system keychain
+//!   (a `--config-dir` other than the default keeps a login of its own there)
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -30,7 +31,7 @@ use filen_sdk_rs::{
 };
 
 use crate::{
-	CliConfig, ClientConfigArgs, build_client_config, deserialize_auth_config,
+	CliConfig, ClientConfigArgs, build_client_config, default_config_dir, deserialize_auth_config,
 	serialize_auth_config,
 	ui::UI,
 	util::{KeyringChunkStore, LongKeyringEntry},
@@ -166,7 +167,7 @@ pub(crate) async fn authenticate_and_get_password(
 		);
 		Ok(client)
 	} else {
-		match authenticate_from_keyring(client_config_args).await {
+		match authenticate_from_keyring(config, client_config_args).await {
 			Ok(Some(client)) => {
 				log::info!("Authenticated from keyring");
 				Ok(client)
@@ -382,7 +383,64 @@ pub(crate) fn get_auth_config_default_locations(
 		.collect()
 }
 
+/// The keyring service of release builds, which keeps the existing logins.
+const KEYRING_SERVICE: &str = "filen-cli-rs";
+/// The keyring service of debug builds, so that they never use or delete a release login.
+const KEYRING_SERVICE_DEV: &str = "filen-cli-rs-dev";
+/// The keyring entry of the credentials used with the default config dir.
 const KEYRING_SDK_CONFIG_NAME: &str = "sdk-config";
+
+/// Where the keyring keeps the credentials used with a config dir.
+#[derive(Debug, PartialEq, Eq)]
+struct KeyringLocation {
+	service: &'static str,
+	entry_name: String,
+}
+
+impl KeyringLocation {
+	/// The location of the credentials used with `config`'s config dir in this build.
+	fn of(config: &CliConfig) -> Self {
+		let is_dev = cfg!(debug_assertions);
+		let default_dir = default_config_dir(is_dev).map(|dir| canonical_or_given(&dir));
+		Self::for_config_dir(
+			is_dev,
+			&canonical_or_given(&config.config_dir),
+			default_dir.as_deref(),
+		)
+	}
+
+	/// The location of the credentials used with `config_dir`: the default config dir keeps the
+	/// entry the CLI always used, and any other one an entry named after it, so that a
+	/// `--config-dir` keeps its own login.
+	fn for_config_dir(is_dev: bool, config_dir: &Path, default_config_dir: Option<&Path>) -> Self {
+		let service = match is_dev {
+			true => KEYRING_SERVICE_DEV,
+			false => KEYRING_SERVICE,
+		};
+		let entry_name = if default_config_dir == Some(config_dir) {
+			KEYRING_SDK_CONFIG_NAME.to_owned()
+		} else {
+			format!("{KEYRING_SDK_CONFIG_NAME}@{}", config_dir.display())
+		};
+		KeyringLocation {
+			service,
+			entry_name,
+		}
+	}
+
+	fn store(&self) -> KeyringChunkStore {
+		KeyringChunkStore::new(self.service)
+	}
+}
+
+/// `path` with symlinks and relative components resolved, so that one directory always names one
+/// keyring entry, or `path` itself if it cannot be resolved.
+fn canonical_or_given(path: &Path) -> PathBuf {
+	path.canonicalize().unwrap_or_else(|e| {
+		log::warn!("Failed to resolve the path {}: {:?}", path.display(), e);
+		path.to_path_buf()
+	})
+}
 
 /// Whether the tests turned the keyring off, so that they neither read nor delete the
 /// credentials of whoever runs them.
@@ -392,12 +450,14 @@ fn keyring_disabled_for_testing() -> bool {
 
 /// Authenticate using SDK config stored in the keyring.
 async fn authenticate_from_keyring(
+	config: &CliConfig,
 	client_config_args: &ClientConfigArgs,
 ) -> Result<Option<Client>> {
 	if keyring_disabled_for_testing() {
 		return Ok(None);
 	}
-	let sdk_config = LongKeyringEntry::new(&KeyringChunkStore, KEYRING_SDK_CONFIG_NAME)
+	let location = KeyringLocation::of(config);
+	let sdk_config = LongKeyringEntry::new(&location.store(), &location.entry_name)
 		.read()
 		.context("Failed to read SDK config from keyring")?;
 	let Some(sdk_config) = sdk_config else {
@@ -432,8 +492,8 @@ async fn authenticate_from_prompt(
 	// optionally, save credentials
 	if ui.prompt_confirm("Keep me logged in?", true)? {
 		let sdk_config = serialize_auth_config(&client)?;
-		match LongKeyringEntry::new(&KeyringChunkStore, KEYRING_SDK_CONFIG_NAME).write(&sdk_config)
-		{
+		let location = KeyringLocation::of(config);
+		match LongKeyringEntry::new(&location.store(), &location.entry_name).write(&sdk_config) {
 			Ok(_) => {
 				ui.print_success("Saved credentials");
 			}
@@ -498,13 +558,15 @@ pub(crate) fn export_auth_config(client: &Client, parent_dir: &Path) -> Result<P
 /// user to confirm each (`--yes` confirms them all).
 pub(crate) fn logout(config: &CliConfig, ui: &mut UI) -> Result<bool> {
 	let mut found_any_credentials = false;
+	let keyring_location = KeyringLocation::of(config);
+	let keyring_store = keyring_location.store();
+	let keyring_entry = LongKeyringEntry::new(&keyring_store, &keyring_location.entry_name);
 	if !keyring_disabled_for_testing()
-		&& let Ok(Some(_)) =
-			LongKeyringEntry::new(&KeyringChunkStore, KEYRING_SDK_CONFIG_NAME).read()
+		&& let Ok(Some(_)) = keyring_entry.read()
 	{
 		found_any_credentials = true;
 		if ui.prompt_confirm("Delete credentials stored in system keyring?", false)? {
-			let deleted = LongKeyringEntry::new(&KeyringChunkStore, KEYRING_SDK_CONFIG_NAME)
+			let deleted = keyring_entry
 				.delete()
 				.context("Failed to delete SDK config from keyring")?;
 			if deleted {
@@ -618,6 +680,53 @@ mod tests {
 		let mut ui = printed.ui();
 		check_auth_config_access(&mut ui, &path, AuthConfigLocation::WorkingDir).unwrap();
 		assert_eq!(printed.lines_or_empty(), "");
+	}
+
+	#[test]
+	fn the_default_config_dir_keeps_the_keyring_entry_of_earlier_versions() {
+		let dir = Path::new("/home/user/.config/filen-cli");
+		assert_eq!(
+			KeyringLocation::for_config_dir(false, dir, Some(dir)),
+			KeyringLocation {
+				service: "filen-cli-rs",
+				entry_name: "sdk-config".to_owned(),
+			}
+		);
+	}
+
+	#[test]
+	fn another_config_dir_has_a_keyring_entry_of_its_own() {
+		assert_eq!(
+			KeyringLocation::for_config_dir(
+				false,
+				Path::new("/srv/filen"),
+				Some(Path::new("/home/user/.config/filen-cli"))
+			),
+			KeyringLocation {
+				service: "filen-cli-rs",
+				entry_name: "sdk-config@/srv/filen".to_owned(),
+			}
+		);
+	}
+
+	#[test]
+	fn a_config_dir_without_a_default_has_a_keyring_entry_of_its_own() {
+		assert_eq!(
+			KeyringLocation::for_config_dir(false, Path::new("/srv/filen"), None).entry_name,
+			"sdk-config@/srv/filen"
+		);
+	}
+
+	#[test]
+	fn a_debug_build_uses_a_keyring_service_of_its_own() {
+		let dir = Path::new("/home/user/.config/filen-cli-dev");
+		assert_eq!(
+			KeyringLocation::for_config_dir(true, dir, Some(dir)),
+			KeyringLocation {
+				service: "filen-cli-rs-dev",
+				entry_name: "sdk-config".to_owned(),
+			}
+		);
 	}
 
 	#[test]

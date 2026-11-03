@@ -346,6 +346,14 @@ enum Finished {
 	ScriptLineFailed(i32),
 }
 
+/// The config dir used without `--config-dir`, or `None` if the system has no config dir.
+pub(crate) fn default_config_dir(is_dev: bool) -> Option<PathBuf> {
+	Some(dirs::config_dir()?.join(match is_dev {
+		true => "filen-cli-dev",
+		false => "filen-cli",
+	}))
+}
+
 async fn inner_main(ui: &mut ui::UI, arenas_limited: bool) -> Result<Finished> {
 	let cli_args = parse_args(std::env::args_os())
 		.unwrap_or_else(|e| e.exit())
@@ -362,12 +370,7 @@ async fn inner_main(ui: &mut ui::UI, arenas_limited: bool) -> Result<Finished> {
 				dir.clone()
 			}
 			None => {
-				let dir = dirs::config_dir()
-					.context("Failed to get config dir")?
-					.join(match is_dev {
-						true => "filen-cli-dev",
-						false => "filen-cli",
-					});
+				let dir = default_config_dir(is_dev).context("Failed to get config dir")?;
 				fs::create_dir_all(&dir).context("Failed to create config dir")?;
 				dir
 			}
