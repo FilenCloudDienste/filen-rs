@@ -2,8 +2,8 @@ use std::{
 	borrow::Cow,
 	collections::{HashMap, HashSet},
 	fmt::Display,
-	io,
-	path::{Path, PathBuf},
+	fs, io,
+	path::{self, Path, PathBuf},
 	slice,
 };
 
@@ -413,10 +413,15 @@ async fn add_sync_pairs(
 						let other = other_pair_label(engine, client, overlap_pair(overlap)).await;
 						overlap_message(local, remote_path, overlap, &other)
 					}
-					None => format!(
-						"Failed to set up the sync pair {} <> {remote_path}: {e}",
-						local.display()
-					),
+					None => match registered_mode(engine, local, *remote_root).await {
+						Some(registered) if registered != *mode => {
+							mode_mismatch_message(local, remote_path, *mode, registered)
+						}
+						_ => format!(
+							"Failed to set up the sync pair {} <> {remote_path}: {e}",
+							local.display()
+						),
+					},
 				};
 				return Err(UI::failure(&message));
 			}
@@ -497,6 +502,48 @@ async fn import_legacy_state(
 			state_dir.display()
 		)),
 	}
+}
+
+/// The mode of the registered pair of `local` and `remote_root`, if there is one.
+async fn registered_mode(engine: &SyncEngine, local: &Path, remote_root: Uuid) -> Option<SyncMode> {
+	let pairs = match engine.list_pairs().await {
+		Ok(pairs) => pairs,
+		Err(e) => {
+			log::warn!("Failed to list the sync pairs: {e}");
+			return None;
+		}
+	};
+	let local = resolved(local);
+	pairs
+		.into_iter()
+		.find(|pair| {
+			pair.remote_root == remote_root && resolved(Path::new(&pair.local_root)) == local
+		})
+		.map(|pair| pair.mode)
+}
+
+/// `path` as the operating system resolves it, or, when it cannot (it no longer exists), made
+/// absolute against the working directory.
+fn resolved(path: &Path) -> PathBuf {
+	fs::canonicalize(path)
+		.or_else(|_| path::absolute(path))
+		.unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Why the pair `local` <> `remote` cannot be set up in `mode`: it is registered in the mode
+/// `registered`.
+fn mode_mismatch_message(
+	local: &Path,
+	remote: &RemotePath,
+	mode: SyncMode,
+	registered: SyncMode,
+) -> String {
+	let (mode, registered) = (sync_mode_str(mode), sync_mode_str(registered));
+	format!(
+		"Cannot set up the sync pair {} <> {remote} as {mode}: it is registered as {registered}. \
+		 Give its mode as {registered}.",
+		local.display()
+	)
 }
 
 /// The registered pair `overlap` names.
@@ -984,8 +1031,9 @@ mod tests {
 	use super::{
 		ParsedPair, SyncDirs, create_local_root, expand_home, fallback_label, legacy_state_dir,
 		local_path_in_file, local_root_exists, local_trash_warnings, missing_roots,
-		overlap_message, parse_sync_mode_str, parse_sync_pair_definition, parse_sync_pairs,
-		print_set_up, read_sync_pairs_file, records_of, sync_mode_str, typescript_home_dir,
+		mode_mismatch_message, overlap_message, parse_sync_mode_str, parse_sync_pair_definition,
+		parse_sync_pairs, print_set_up, read_sync_pairs_file, records_of, sync_mode_str,
+		typescript_home_dir,
 	};
 	use crate::{
 		error::{CliError, exit_code, find_cli_error},
@@ -1071,6 +1119,21 @@ mod tests {
 			"Cannot set up the sync pair /home/me/docs <> /docs: its local folder is inside the \
 			 local folder of the sync pair /home/me <(twoWay)> /backup, and sync pairs may not \
 			 overlap. A sync pair stays registered after the run that set it up."
+		);
+	}
+
+	/// A pair given in another mode than it is registered in says how to sync it in either.
+	#[test]
+	fn a_pair_registered_in_another_mode_says_so() {
+		assert_eq!(
+			mode_mismatch_message(
+				Path::new("/home/me/docs"),
+				&RemotePath::new("/docs"),
+				SyncMode::TwoWay,
+				SyncMode::LocalBackup,
+			),
+			"Cannot set up the sync pair /home/me/docs <> /docs as twoWay: it is registered as \
+			 localBackup. Give its mode as localBackup."
 		);
 	}
 

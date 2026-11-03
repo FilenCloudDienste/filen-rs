@@ -435,6 +435,40 @@ async fn sync_once_imports_the_typescript_clis_state_of_a_new_pair() {
 	);
 }
 
+/// A pair given in another mode than the one it is registered in is refused, with the mode it has.
+#[shared_test_runtime]
+async fn sync_with_a_pair_in_another_mode_than_registered_names_its_mode() {
+	// Not `get_resources_with_lock`, for the reason the first test gives.
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let test_dir_name = resources.dir.name().unwrap();
+	let local = assert_fs::TempDir::new().unwrap();
+	let config_dir = assert_fs::TempDir::new().unwrap();
+	let local_root = local.path().to_str().unwrap();
+	assert_success(
+		&sync_once(
+			config_dir.path(),
+			&format!("{local_root}:{test_dir_name}"),
+			&[],
+		)
+		.await,
+	);
+
+	let output = sync_once(
+		config_dir.path(),
+		&format!("{local_root}:lb:{test_dir_name}"),
+		&[],
+	)
+	.await;
+
+	assert_eq!(output.status.code(), Some(1), "{}", describe(&output));
+	assert!(
+		String::from_utf8_lossy(&output.stderr)
+			.contains("as localBackup: it is registered as twoWay. Give its mode as twoWay"),
+		"{}",
+		describe(&output)
+	);
+}
+
 /// A pair whose first `sync --once` agreed on `fight.txt`, which has since been changed on both
 /// sides, with the local root and the config dir that holds its database.
 async fn diverged_pair(
