@@ -227,6 +227,19 @@ pub struct DirPublicLinkRW {
 	link_key_version: Option<u8>,
 	password: PasswordState,
 	expiration: PublicLinkExpiration,
+	/// When the link expires, as the server reported it when the link was read. `None` for a link
+	/// that never expires, and for one whose expiry the server has not reported: a link this
+	/// client created, or one whose expiration was changed since it was read.
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		tsify(type = "bigint"),
+		serde(
+			with = "filen_types::serde::time::optional",
+			skip_serializing_if = "Option::is_none",
+			default
+		)
+	)]
+	expires_at: Option<DateTime<Utc>>,
 	enable_download: bool,
 	salt: LinkPasswordSalt,
 }
@@ -239,6 +252,7 @@ impl From<crate::connect::DirPublicLinkRW> for DirPublicLinkRW {
 			link_key: value.link_key.map(|k| k.to_string()),
 			password: value.password,
 			expiration: value.expiration,
+			expires_at: value.expires_at,
 			enable_download: value.enable_download,
 			salt: value.salt,
 		}
@@ -271,6 +285,7 @@ impl TryFrom<DirPublicLinkRW> for crate::connect::DirPublicLinkRW {
 			},
 			password: value.password,
 			expiration: value.expiration,
+			expires_at: value.expires_at,
 			enable_download: value.enable_download,
 			salt: value.salt,
 		})
@@ -288,6 +303,7 @@ mod tests {
 			link_key_version,
 			password: PasswordState::None,
 			expiration: PublicLinkExpiration::Never,
+			expires_at: None,
 			enable_download: true,
 			salt: LinkPasswordSalt::None,
 		}

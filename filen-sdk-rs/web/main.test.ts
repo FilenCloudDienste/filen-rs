@@ -1704,6 +1704,43 @@ test("listLinkedItems", async () => {
 	expect(foundFile).toEqual(file)
 })
 
+/// A link read back reports when it expires, in milliseconds, and the link handed back in keeps
+/// it: `updateFileLink` / `updateDirLink` return the link they were given.
+test("public links report when they expire", async () => {
+	const dir = await state.createDir(testDir, "link-expiry-dir")
+	const file = await state.uploadFile(new TextEncoder().encode("expiring"), {
+		parent: dir,
+		name: "expiring.txt"
+	})
+	// an hour from when the server set it, with a few minutes either way for the two clocks
+	const expectInAboutAnHour = (expiresAt: bigint | undefined) => {
+		expect(typeof expiresAt).toBe("bigint")
+		const fromNow = Number(expiresAt!) - Date.now()
+		expect(fromNow).toBeGreaterThan(55 * 60_000)
+		expect(fromNow).toBeLessThan(65 * 60_000)
+	}
+
+	const fileLink = await state.publicLinkFile(file)
+	expect(fileLink.expiresAt).toBeUndefined()
+	expect((await state.getFileLinkStatus(file))!.expiresAt).toBeUndefined()
+	await state.updateFileLink(file, { ...fileLink, expiration: "1h" })
+	const readFileLink = (await state.getFileLinkStatus(file))!
+	expect(readFileLink.expiration).toBe("1h")
+	expectInAboutAnHour(readFileLink.expiresAt)
+	const passedFileLink = await state.updateFileLink(file, readFileLink)
+	expect(passedFileLink.expiresAt).toBe(readFileLink.expiresAt)
+
+	const dirLink = await state.publicLinkDir(dir, () => {})
+	expect(dirLink.expiresAt).toBeUndefined()
+	expect((await state.getDirLinkStatus(dir))!.expiresAt).toBeUndefined()
+	await state.updateDirLink(dir, { ...dirLink, expiration: "1h" })
+	const readDirLink = (await state.getDirLinkStatus(dir))!
+	expect(readDirLink.expiration).toBe("1h")
+	expectInAboutAnHour(readDirLink.expiresAt)
+	const passedDirLink = await state.updateDirLink(dir, readDirLink)
+	expect(passedDirLink.expiresAt).toBe(readDirLink.expiresAt)
+})
+
 test("Linked Dir Zip Download", async () => {
 	const linkedZipDir = await state.createDir(testDir, "linked-zip-dir")
 	const subDir = await state.createDir(linkedZipDir, "sub")

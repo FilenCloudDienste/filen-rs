@@ -5,6 +5,7 @@ use std::{
 	sync::{Arc, MutexGuard, PoisonError, Weak},
 };
 
+use chrono::{DateTime, Utc};
 use filen_macros::js_type;
 use filen_types::{
 	api::v3::{
@@ -48,6 +49,24 @@ pub mod contacts;
 pub mod fs;
 #[cfg(any(feature = "wasm-full", feature = "uniffi"))]
 pub mod js_impls;
+
+/// The expiry a link status reports: `None` for a link that never expires, whatever timestamp the
+/// server sends with it.
+fn reported_expiry(
+	expiration: PublicLinkExpiration,
+	expires_at: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+	match expiration {
+		PublicLinkExpiration::Never => None,
+		PublicLinkExpiration::OneHour
+		| PublicLinkExpiration::SixHours
+		| PublicLinkExpiration::OneDay
+		| PublicLinkExpiration::ThreeDays
+		| PublicLinkExpiration::OneWeek
+		| PublicLinkExpiration::TwoWeeks
+		| PublicLinkExpiration::ThirtyDays => Some(expires_at),
+	}
+}
 
 pub(crate) trait MakePasswordSaltAndHash {
 	fn password(&self) -> &PasswordState;
@@ -101,6 +120,19 @@ pub struct FilePublicLink {
 	link_uuid: Uuid,
 	password: PasswordState,
 	expiration: PublicLinkExpiration,
+	/// When the link expires, as the server reported it when the link was read. `None` for a link
+	/// that never expires, and for one whose expiry the server has not reported: a link this
+	/// client created, or one whose expiration was changed since it was read.
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown", feature = "wasm-full"),
+		tsify(type = "bigint"),
+		serde(
+			with = "filen_types::serde::time::optional",
+			skip_serializing_if = "Option::is_none",
+			default
+		)
+	)]
+	expires_at: Option<DateTime<Utc>>,
 	downloadable: bool,
 	salt: LinkPasswordSalt,
 }
@@ -125,6 +157,8 @@ impl PartialEq for FilePublicLink {
 			_ => false,
 		};
 
+		// `expires_at` is left out: it is the server's reading of when the link runs out, not one
+		// of the link's settings, so a link compares equal to the one it was read back as.
 		self.link_uuid == other.link_uuid
 			&& password_match
 			&& self.expiration == other.expiration
@@ -144,6 +178,11 @@ impl FilePublicLink {
 
 	pub fn expiration(&self) -> PublicLinkExpiration {
 		self.expiration
+	}
+
+	/// When the link expires, see [`FilePublicLink`]'s field of the same name.
+	pub fn expires_at(&self) -> Option<DateTime<Utc>> {
+		self.expires_at
 	}
 
 	pub fn downloadable(&self) -> bool {
@@ -172,8 +211,11 @@ impl FilePublicLink {
 		self.salt = crate::crypto::connect::new_random_salt();
 	}
 
+	/// Sets the expiration, and forgets the expiry the server reported, which the server
+	/// computes anew from the expiration on the update.
 	pub fn set_expiration(&mut self, expiration: PublicLinkExpiration) {
 		self.expiration = expiration;
+		self.expires_at = None;
 	}
 
 	pub fn set_downloadable(&mut self, enable_download: bool) {
@@ -187,6 +229,7 @@ impl FilePublicLink {
 			link_uuid: Uuid::new_v4(),
 			password: PasswordState::None,
 			expiration: PublicLinkExpiration::Never,
+			expires_at: None,
 			downloadable: true,
 			salt: LinkPasswordSalt::None,
 		}
@@ -252,14 +295,40 @@ impl DirPublicLink {
 	}
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Eq)]
 pub struct DirPublicLinkRW {
 	pub(crate) link_uuid: Uuid,
 	pub(crate) link_key: Option<MetaKey>,
 	pub(crate) password: PasswordState,
 	pub(crate) expiration: PublicLinkExpiration,
+	/// When the link expires, as the server reported it when the link was read. `None` for a link
+	/// that never expires, and for one whose expiry the server has not reported: a link this
+	/// client created, or one whose expiration was changed since it was read.
+	pub(crate) expires_at: Option<DateTime<Utc>>,
 	pub(crate) enable_download: bool,
 	pub(crate) salt: LinkPasswordSalt,
+}
+
+impl PartialEq for DirPublicLinkRW {
+	fn eq(&self, other: &Self) -> bool {
+		let Self {
+			link_uuid,
+			link_key,
+			password,
+			expiration,
+			// left out: the server's reading of when the link runs out, not one of the link's
+			// settings, so a link compares equal to the one it was read back as
+			expires_at: _,
+			enable_download,
+			salt,
+		} = self;
+		*link_uuid == other.link_uuid
+			&& *link_key == other.link_key
+			&& *password == other.password
+			&& *expiration == other.expiration
+			&& *enable_download == other.enable_download
+			&& *salt == other.salt
+	}
 }
 
 impl TryFrom<DirPublicLinkRW> for DirPublicLink {
@@ -288,6 +357,7 @@ impl DirPublicLinkRW {
 			link_key: Some(link_key),
 			password: PasswordState::None,
 			expiration: PublicLinkExpiration::Never,
+			expires_at: None,
 			enable_download: true,
 			salt: LinkPasswordSalt::None,
 		}
@@ -311,6 +381,11 @@ impl DirPublicLinkRW {
 		self.expiration
 	}
 
+	/// When the link expires, see [`DirPublicLinkRW`]'s field of the same name.
+	pub fn expires_at(&self) -> Option<DateTime<Utc>> {
+		self.expires_at
+	}
+
 	pub fn download_enabled(&self) -> bool {
 		self.enable_download
 	}
@@ -325,8 +400,11 @@ impl DirPublicLinkRW {
 		self.salt = LinkPasswordSalt::None;
 	}
 
+	/// Sets the expiration, and forgets the expiry the server reported, which the server
+	/// computes anew from the expiration on the update.
 	pub fn set_expiration(&mut self, expiration: PublicLinkExpiration) {
 		self.expiration = expiration;
+		self.expires_at = None;
 	}
 
 	pub fn set_enable_download(&mut self, enable_download: bool) {
@@ -1138,6 +1216,7 @@ impl Client {
 			link_uuid: link_status.uuid,
 			password,
 			expiration: link_status.expiration_text,
+			expires_at: reported_expiry(link_status.expiration_text, link_status.expiration),
 			downloadable: link_status.download_btn,
 			salt: password_response.salt,
 		}))
@@ -1185,6 +1264,7 @@ impl Client {
 			link_key: decrypted_link_key.ok(),
 			password,
 			expiration: link_status.expiration_text,
+			expires_at: reported_expiry(link_status.expiration_text, link_status.expiration),
 			enable_download: link_status.download_btn,
 			salt: info_response.salt.unwrap_or_default(),
 		}))

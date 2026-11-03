@@ -1,5 +1,6 @@
 use std::{borrow::Cow, sync::Arc};
 
+use chrono::{DateTime, TimeDelta, Utc};
 use filen_macros::shared_test_runtime;
 #[cfg(feature = "malformed")]
 use filen_sdk_rs::crypto::shared::MetaCrypter;
@@ -21,6 +22,17 @@ use filen_types::api::v3::{contacts::Contact, dir::link::PublicLinkExpiration};
 
 mod drive_helpers;
 use drive_helpers::{Recorder, SignalOnCreate, contents, copy, data, upload, wait_until_paused};
+
+/// Asserts that a link given an expiration of one hour just now expires in about an hour, with a
+/// few minutes either way for the clocks of this machine and the server.
+fn assert_expires_in_about_an_hour(expires_at: Option<DateTime<Utc>>) {
+	let expires_at = expires_at.expect("a link that expires reports when");
+	let from_now = expires_at - Utc::now();
+	assert!(
+		(TimeDelta::minutes(55)..=TimeDelta::minutes(65)).contains(&from_now),
+		"expected the link to expire in about an hour, it expires at {expires_at}"
+	);
+}
 
 #[shared_test_runtime]
 async fn dir_public_link() {
@@ -59,6 +71,7 @@ async fn dir_public_link() {
 		&link_rw, &found_link,
 		"get_dir_link_status didn't match created link"
 	);
+	assert_eq!(found_link.expires_at(), None);
 
 	let link: DirPublicLink = found_link.try_into().unwrap();
 	let info = unauth_client
@@ -101,6 +114,7 @@ async fn dir_public_link() {
 		&found_link.uuid(),
 		"get_dir_link_status didn't match created link"
 	);
+	assert_expires_in_about_an_hour(found_link.expires_at());
 
 	let mut sub_sub_dir = client
 		.create_dir(&(&sub_dir).into(), "sub_sub_dir")
@@ -593,6 +607,7 @@ async fn file_public_link() {
 		&found_link.uuid(),
 		"get_file_link_status didn't match created link"
 	);
+	assert_eq!(found_link.expires_at(), None);
 	let file_key = file.key().unwrap().to_str();
 
 	let linked_file = unauth_client
@@ -609,6 +624,7 @@ async fn file_public_link() {
 	link.set_downloadable(false);
 	client.update_file_link(&file, &link).await.unwrap();
 	let found_link = client.get_file_link_status(&file).await.unwrap().unwrap();
+	assert_expires_in_about_an_hour(found_link.expires_at());
 	let mut cloned_found_link = found_link.clone();
 	cloned_found_link.set_password(password.to_string());
 	assert_eq!(&link, &cloned_found_link);

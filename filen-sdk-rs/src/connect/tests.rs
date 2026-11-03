@@ -24,6 +24,7 @@ fn dir_public_link_rw_to_dir_public_link_preserves_hashed_password() {
 		link_key: Some(test_meta_key()),
 		password: PasswordState::Hashed(hashed),
 		expiration: PublicLinkExpiration::Never,
+		expires_at: None,
 		enable_download: true,
 		salt: LinkPasswordSalt::None,
 	};
@@ -35,6 +36,64 @@ fn dir_public_link_rw_to_dir_public_link_preserves_hashed_password() {
 		Cow::Borrowed("deadbeefhash"),
 		"hashed credential must survive the conversion instead of deriving to \"empty\""
 	);
+}
+
+fn expiring_dir_link(expires_at: Option<DateTime<Utc>>) -> DirPublicLinkRW {
+	DirPublicLinkRW {
+		link_uuid: Uuid::from_u128(1),
+		link_key: Some(test_meta_key()),
+		password: PasswordState::None,
+		expiration: PublicLinkExpiration::OneDay,
+		expires_at,
+		enable_download: true,
+		salt: LinkPasswordSalt::None,
+	}
+}
+
+#[test]
+fn a_link_that_never_expires_reports_no_expiry() {
+	let sent = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+	assert_eq!(reported_expiry(PublicLinkExpiration::Never, sent), None);
+}
+
+#[test]
+fn a_link_that_expires_reports_the_servers_expiry() {
+	let sent = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+	assert_eq!(
+		reported_expiry(PublicLinkExpiration::OneDay, sent),
+		Some(sent)
+	);
+}
+
+#[test]
+fn setting_a_dir_links_expiration_forgets_the_reported_expiry() {
+	let mut link = expiring_dir_link(DateTime::from_timestamp(1_700_000_000, 0));
+	link.set_expiration(PublicLinkExpiration::OneHour);
+	assert_eq!(link.expires_at(), None);
+}
+
+#[test]
+fn setting_a_file_links_expiration_forgets_the_reported_expiry() {
+	let mut link = FilePublicLink::new();
+	link.expires_at = DateTime::from_timestamp(1_700_000_000, 0);
+	link.set_expiration(PublicLinkExpiration::OneHour);
+	assert_eq!(link.expires_at(), None);
+}
+
+#[test]
+fn a_dir_link_equals_the_one_it_was_read_back_as_whatever_its_expiry() {
+	assert_eq!(
+		expiring_dir_link(None),
+		expiring_dir_link(DateTime::from_timestamp(1_700_000_000, 0))
+	);
+}
+
+#[test]
+fn a_file_link_equals_the_one_it_was_read_back_as_whatever_its_expiry() {
+	let created = FilePublicLink::new();
+	let mut read = created.clone();
+	read.expires_at = DateTime::from_timestamp(1_700_000_000, 0);
+	assert_eq!(created, read);
 }
 
 fn test_dir(name: &str) -> NonRootItemType<'static, Normal> {
