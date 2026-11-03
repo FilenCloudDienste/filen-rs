@@ -14,78 +14,116 @@ use filen_sdk_rs::{
 	},
 	sync_engine::{DeleteGuard, PairId, PairRecord, SyncEngine, SyncMode},
 };
+use filen_types::fs::Uuid;
 use serde::Deserialize;
 
 use crate::{ui::UI, util::RemotePath};
 
-/// Adds a sync pair to `engine` for each of `pair_definitions`, which are either `<local>:<remote>` (two-way),
-/// `<local>:<mode>:<remote>`, or the path to a syncPairs.yaml file. Relative remote paths are resolved
-/// against `working_path`, relative local paths in a file against the file's directory.
+/// A sync pair to register: its local root, its mode and the remote directory it syncs with.
+pub(crate) struct PairDefinition {
+	local: PathBuf,
+	mode: SyncMode,
+	remote_path: RemotePath,
+	remote_root: Uuid,
+}
+
+/// The pairs `pair_definitions` define, each of which is either `<local>:<remote>` (two-way),
+/// `<local>:<mode>:<remote>`, or the path to a syncPairs.yaml file, with each remote root found.
+/// Relative remote paths are resolved against `working_path`, relative local paths in a file
+/// against the file's directory.
 ///
-/// Returns the ids of the pairs registered, each once, in the order they were given.
-pub(crate) async fn register_sync_pairs(
-	engine: &SyncEngine,
+/// Every definition is read and every remote root found before any pair is registered, so a bad
+/// definition fails the run before anything is stored.
+pub(crate) async fn resolve_sync_pairs(
 	client: &Client,
 	working_path: &RemotePath,
-	pair_definitions: &Vec<String>,
-) -> Result<Vec<PairId>> {
-	let mut pair_ids = Vec::new();
+	pair_definitions: &[String],
+) -> Result<Vec<PairDefinition>> {
+	let mut parsed = Vec::new();
 	for pair in pair_definitions {
 		let path = Path::new(pair);
-		let pair_definitions = if path.is_file() {
+		if path.is_file() {
 			// if it is a file, read it as a syncPairs.yaml file
-			read_sync_pairs_file(path)?
+			parsed.extend(read_sync_pairs_file(path)?);
 		} else {
 			// otherwise, parse the sync pair definition
-			vec![parse_sync_pair_definition(pair)?]
-		};
-		for (local, mode, remote) in pair_definitions {
-			// resolve remote root
-			let remote_path = working_path.navigate(&remote);
-			let remote_uuid = match client
-				.find_item_at_path(&remote_path.0)
-				.await
-				.context("Failed to find remote directory")?
-			{
-				Some(NonRootFileType::Dir(dir)) => dir.uuid(),
-				Some(NonRootFileType::Root(root)) => root.uuid(),
-				Some(NonRootFileType::File(_)) => {
-					return Err(UI::failure(&format!(
-						"{} is a file, not a directory",
-						remote_path
-					)));
-				}
-				None => {
-					return Err(UI::failure(&format!(
-						"Remote directory {} not found",
-						remote_path
-					)));
-				}
-			};
-			let pair = engine
-				.add_pair(local.clone(), remote_uuid, mode)
-				.await
-				.map_err(|e| {
-					UI::failure(&format!(
-						"Failed to set up the sync pair {} <> {remote_path}: {e}",
-						local.display()
-					))
-				})?;
-			// Set on every run, not only when the pair is new: earlier versions stored a guard that
-			// held every deletion, and a pair they registered keeps it until it is overwritten.
-			engine
-				.set_delete_guard(pair, DeleteGuard::default())
-				.await
-				.with_context(|| {
-					format!(
-						"Failed to set the delete guard of the sync pair {} <> {remote_path}",
-						local.display()
-					)
-				})?;
-			// the same pair given twice is registered (and watched) once
-			if !pair_ids.contains(&pair) {
-				pair_ids.push(pair);
+			parsed.push(parse_sync_pair_definition(pair)?);
+		}
+	}
+	let mut pairs = Vec::with_capacity(parsed.len());
+	for (local, mode, remote) in parsed {
+		let remote_path = working_path.navigate(&remote);
+		let remote_root = match client
+			.find_item_at_path(&remote_path.0)
+			.await
+			.context("Failed to find remote directory")?
+		{
+			Some(NonRootFileType::Dir(dir)) => dir.uuid(),
+			Some(NonRootFileType::Root(root)) => root.uuid(),
+			Some(NonRootFileType::File(_)) => {
+				return Err(UI::failure(&format!(
+					"{} is a file, not a directory",
+					remote_path
+				)));
 			}
+			None => {
+				return Err(UI::failure(&format!(
+					"Remote directory {} not found",
+					remote_path
+				)));
+			}
+		};
+		pairs.push(PairDefinition {
+			local,
+			mode,
+			remote_path,
+			remote_root,
+		});
+	}
+	Ok(pairs)
+}
+
+/// Adds each of `pairs` to `engine`, or finds it there from an earlier run.
+///
+/// Returns the ids of the pairs registered, each once, in the order they were given. A pair the
+/// engine refuses fails the run, but the pairs registered before it stay registered, as every
+/// pair does after the run that set it up.
+pub(crate) async fn register_sync_pairs(
+	engine: &SyncEngine,
+	pairs: &[PairDefinition],
+) -> Result<Vec<PairId>> {
+	let mut pair_ids = Vec::new();
+	for PairDefinition {
+		local,
+		mode,
+		remote_path,
+		remote_root,
+	} in pairs
+	{
+		// the engine takes the path, which the message below still names
+		let pair = engine
+			.add_pair(local.clone(), *remote_root, *mode)
+			.await
+			.map_err(|e| {
+				UI::failure(&format!(
+					"Failed to set up the sync pair {} <> {remote_path}: {e}",
+					local.display()
+				))
+			})?;
+		// Set on every run, not only when the pair is new: earlier versions stored a guard that
+		// held every deletion, and a pair they registered keeps it until it is overwritten.
+		engine
+			.set_delete_guard(pair, DeleteGuard::default())
+			.await
+			.with_context(|| {
+				format!(
+					"Failed to set the delete guard of the sync pair {} <> {remote_path}",
+					local.display()
+				)
+			})?;
+		// the same pair given twice is registered (and watched) once
+		if !pair_ids.contains(&pair) {
+			pair_ids.push(pair);
 		}
 	}
 	Ok(pair_ids)

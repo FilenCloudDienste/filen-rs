@@ -114,18 +114,6 @@ pub(crate) async fn sync(
 	approve_mass_deletions: bool,
 	conflict_resolutions: ConflictResolutions,
 ) -> Result<()> {
-	// init sync engine
-	let db_path = config.config_dir.join("sync-engine.db");
-	let engine = Arc::new(
-		SyncEngine::open(client.clone(), db_path.clone())
-			.await
-			.map_err(|e| {
-				UI::failure(&format!(
-					"Failed to open the sync engine at {}: {e}",
-					db_path.display()
-				))
-			})?,
-	);
 	let default_pair_definitions = vec![
 		config
 			.config_dir
@@ -140,10 +128,25 @@ pub(crate) async fn sync(
 	} else {
 		pair_definitions
 	};
-	let pair_ids =
-		sync_pairs::register_sync_pairs(&engine, &client, working_path, pair_definitions)
+	// before the engine is opened, so that a bad definition leaves its database as it was
+	let pair_definitions =
+		sync_pairs::resolve_sync_pairs(&client, working_path, pair_definitions).await?;
+
+	// init sync engine
+	let db_path = config.config_dir.join("sync-engine.db");
+	let engine = Arc::new(
+		SyncEngine::open(client.clone(), db_path.clone())
 			.await
-			.context("Failed to add sync pairs")?;
+			.map_err(|e| {
+				UI::failure(&format!(
+					"Failed to open the sync engine at {}: {e}",
+					db_path.display()
+				))
+			})?,
+	);
+	let pair_ids = sync_pairs::register_sync_pairs(&engine, &pair_definitions)
+		.await
+		.context("Failed to add sync pairs")?;
 
 	// only this run's pairs: the database also holds every pair earlier runs registered
 	let pairs = sync_pairs::records_of(
