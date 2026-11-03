@@ -1,3 +1,28 @@
+//! [cli-doc] public-links
+//! `public-link <path>` shows the public link of a file or directory: its settings and its URL,
+//! the address to share. `list-public-links` lists the path and URL of every linked item (with
+//! `--json`, also each link's `linkUuid`).
+//!
+//! In a terminal, `public-link` offers to edit or delete an existing link, and asks for a new
+//! link's settings: when it expires, a password, and whether the item can be downloaded. The link
+//! is created as soon as its settings are confirmed, and its URL is printed then. Press Esc to
+//! cancel a prompt, which creates and changes nothing. `--yes` answers "Enable download?" with yes,
+//! as it answers every yes/no question, so editing a link without downloads turns them on, which it
+//! says on stderr (`--no-download` keeps them off); the other settings are still asked. Without a
+//! terminal to
+//! prompt on (or with `--no-input`), `public-link` only prints an existing link, and fails with
+//! exit code 2 instead of creating a missing one: the setting options below create it without
+//! prompting.
+//!
+//! The options do the same without prompting. `--expires <never|1h|6h|1d|3d|7d|14d|30d>`,
+//! `--password <PASSWORD>` or `--no-password`, and `--download` or `--no-download` create the link
+//! if there is none, and change only the settings given. `--show` prints the link and changes
+//! nothing. `--delete` deletes it after asking to confirm, which `--yes` answers.
+//!
+//! A password given with `--password` is part of the command line, so your shell saves it in its
+//! history, and other users of the computer can see it while the command runs. The CLI never reads
+//! a link password from the environment: to keep one out of the history, enter it at the prompt.
+
 use crate::{
 	CommandResult, auth::LazyClient, commands::CommandContext, completion::FilenCompleter,
 	docs::DocElement, ui::UI, util::RemotePath,
@@ -203,6 +228,7 @@ impl LinkChanges {
 
 /// The commands that close the docs' "Accessing Files" section.
 pub(crate) const DOCS: &[DocElement] = &[
+	DocElement::DocFragment("public-links"),
 	DocElement::CommandHelp("list-public-links"),
 	DocElement::CommandHelp("public-link"),
 ];

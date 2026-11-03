@@ -1,3 +1,17 @@
+//! [cli-doc] notes-export
+//! `export-notes <dir>` writes every note to a file in a local directory. A directory that does
+//! not exist yet, or is empty, gets the notes directly (it is created only when there are notes to
+//! export). One that already holds something gets a new `filen-notes-export-<timestamp>`
+//! subdirectory for them, so that no existing file is overwritten.
+//!
+//! Notes go into the export directory itself, trashed notes into its `trash/` subdirectory and
+//! archived notes into `archive/`; each subdirectory is created only when a note goes into it. A
+//! file is named after its note's title, with characters a file name cannot hold replaced by `_`
+//! (a note whose title cannot be decrypted is named `note-<uuid>`), and `-1`, `-2`, ... appended
+//! to tell notes with the same title apart. The extension follows the note's type: rich text notes
+//! are exported as `.html`, Markdown notes and checklists as `.md` (a checklist as a Markdown task
+//! list), and plain text and code notes as `.txt`.
+
 use std::{
 	collections::HashSet,
 	io,
@@ -32,7 +46,10 @@ pub(crate) enum NotesCommands {
 }
 
 /// The docs' "Notes" section.
-pub(crate) const DOCS: &[DocElement] = &[DocElement::CommandHelp("export-notes")];
+pub(crate) const DOCS: &[DocElement] = &[
+	DocElement::DocFragment("notes-export"),
+	DocElement::CommandHelp("export-notes"),
+];
 
 impl NotesCommands {
 	pub(super) async fn execute(self, ctx: CommandContext<'_>) -> Result<CommandResult> {
