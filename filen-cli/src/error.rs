@@ -4,8 +4,8 @@
 //! - `1` when it failed, with the error printed to stderr,
 //! - `2` when the command line was invalid, such as an unknown command or flags that do not go together,
 //! - `0` too when stdout was closed first, as `head` closes it once it has its lines, except
-//!   while the command was writing a file's content to stdout (`download <file> -`), where the
-//!   reader did not get all of it: `1`,
+//!   while the command was writing a file's content to stdout (`cat`, `head`, `tail`,
+//!   `download <file> -`), where the reader did not get all of it: `1`,
 //! - `130` when Ctrl-C cancelled the command or quit the CLI,
 //! - the exit code of Rclone when `filen rclone ...` failed in Rclone.
 

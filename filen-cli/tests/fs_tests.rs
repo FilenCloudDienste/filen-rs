@@ -1,6 +1,7 @@
 use std::sync::Arc;
 #[cfg(unix)]
 use std::{
+	io::Read as _,
 	process::{Command, Stdio},
 	time::{Duration, Instant},
 };
@@ -2628,4 +2629,47 @@ async fn edit_uploads_the_changes_to_a_file_without_a_path() {
 		b"original\nappended\n"
 	);
 	assert_eq!(files_under(&tmp_dir), Vec::<std::path::PathBuf>::new());
+}
+
+#[cfg(unix)]
+#[shared_test_runtime]
+async fn cat_stops_when_its_reader_closes_stdout() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = format!("/{}", resources.dir.name().unwrap());
+	// several chunks, so that cat is still writing when the reader goes
+	let content = (0..=255u8)
+		.cycle()
+		.take(3 * CHUNK_SIZE)
+		.collect::<Vec<u8>>();
+	upload(client, &resources.dir, "a.bin", &content).await;
+
+	let (_auth_config_dir, auth_config) = test_utils::cli::prepare_cli_auth_config().await;
+	let mut cli = Command::new(env!("CARGO_BIN_EXE_filen-cli"))
+		.args([
+			"--auth-config-path",
+			auth_config.to_str().unwrap(),
+			"--skip-update",
+			"cat",
+			&format!("{test_dir}/a.bin"),
+		])
+		.stdout(Stdio::piped())
+		.stderr(Stdio::piped())
+		.spawn()
+		.unwrap();
+	// read a little, as `head -c` would, then close the pipe
+	let mut stdout = cli.stdout.take().unwrap();
+	let mut first = [0u8; 1000];
+	stdout.read_exact(&mut first).unwrap();
+	drop(stdout);
+	let output = cli.wait_with_output().unwrap();
+	let stderr = String::from_utf8_lossy(&output.stderr);
+
+	assert_eq!(first.as_slice(), content.get(..1000).unwrap());
+	// the reader did not get the whole file
+	assert_eq!(output.status.code(), Some(1), "stderr:\n{stderr}");
+	assert_eq!(
+		console::strip_ansi_codes(&stderr),
+		"✘ Stdout was closed before the whole file was written to it\n"
+	);
 }

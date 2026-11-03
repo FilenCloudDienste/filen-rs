@@ -999,8 +999,8 @@ pub(crate) async fn print_file(
 
 /// Where [`print_files`] and [`print_file`] put the content they print.
 enum PrintedContent {
-	/// Straight to stdout.
-	Stdout,
+	/// Straight to stdout, where a reader that goes cuts it short.
+	Stdout(interrupt::DataStream),
 	/// Collected, to be printed as JSON.
 	Json(Vec<u8>),
 }
@@ -1011,7 +1011,7 @@ impl PrintedContent {
 		if ui.json {
 			Self::Json(Vec::new())
 		} else {
-			Self::Stdout
+			Self::Stdout(interrupt::stream_data())
 		}
 	}
 
@@ -1031,7 +1031,7 @@ impl PrintedContent {
 
 	fn write(&mut self, ui: &mut UI, bytes: &[u8]) -> Result<()> {
 		match self {
-			Self::Stdout => ui.write_stdout_bytes(bytes),
+			Self::Stdout(_) => ui.write_stdout_bytes(bytes),
 			Self::Json(content) => {
 				content.extend_from_slice(bytes);
 				Ok(())
