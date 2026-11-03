@@ -8,6 +8,7 @@
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::{
+	fmt,
 	io::{self, Write},
 	path::Path,
 };
@@ -15,6 +16,7 @@ use std::{
 use anyhow::{Context, Result};
 use semver::VersionReq;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tempfile::TempPath;
 use tokio::fs;
 
@@ -266,6 +268,7 @@ async fn handle_latest_release(
 		))?
 		.to_path_buf();
 	let content = download_file(&asset.browser_download_url).await?;
+	verify_download(asset, &content)?;
 	if current_executable_name.contains(version) {
 		let update_path =
 			current_executable.with_file_name(current_executable_name.replace(version, latest_tag));
@@ -312,6 +315,107 @@ async fn download_file(url: &str) -> Result<Vec<u8>> {
 		.await
 		.with_context(|| format!("Failed to download file from {}", url))?
 		.into())
+}
+
+/// Checks a downloaded release asset against the size and the digest its release lists, either of
+/// which may be missing (older releases carry no digest). A digest in an algorithm other than
+/// SHA-256 cannot be checked, so the download is refused rather than installed unchecked.
+fn verify_download(asset: &GitHubReleaseAsset, content: &[u8]) -> Result<()> {
+	if let Some(expected) = asset.size {
+		let downloaded = u64::try_from(content.len()).context("Download size out of range")?;
+		if downloaded != expected {
+			anyhow::bail!(
+				"The download of {} is {downloaded} bytes, but its release lists {expected} bytes",
+				asset.name
+			);
+		}
+	}
+	match asset
+		.digest
+		.as_deref()
+		.map(AssetDigest::parse)
+		.transpose()?
+	{
+		Some(AssetDigest::Sha256(expected)) => {
+			let actual = Sha256Digest::of(content);
+			if actual != expected {
+				anyhow::bail!(
+					"The download of {} has the SHA-256 digest {actual}, but its release lists \
+					 {expected}",
+					asset.name
+				);
+			}
+			Ok(())
+		}
+		Some(AssetDigest::Unsupported(algorithm)) => anyhow::bail!(
+			"The release lists a {algorithm} digest for {}, which cannot be checked",
+			asset.name
+		),
+		None => {
+			log::info!("The release lists no digest for {}", asset.name);
+			Ok(())
+		}
+	}
+}
+
+/// A SHA-256 digest.
+#[derive(Debug, PartialEq, Eq)]
+struct Sha256Digest([u8; 32]);
+
+impl Sha256Digest {
+	/// The digest of `content`.
+	fn of(content: &[u8]) -> Self {
+		Self(Sha256::digest(content).into())
+	}
+
+	/// Parses 64 hex digits, in either case.
+	fn parse_hex(hex: &str) -> Option<Self> {
+		let (pairs, rest) = hex.as_bytes().as_chunks::<2>();
+		if !rest.is_empty() {
+			return None;
+		}
+		let nibble = |digit: u8| {
+			char::from(digit)
+				.to_digit(16)
+				.and_then(|value| u8::try_from(value).ok())
+		};
+		let mut digest = [0; 32];
+		if pairs.len() != digest.len() {
+			return None;
+		}
+		for (byte, [high, low]) in digest.iter_mut().zip(pairs) {
+			*byte = (nibble(*high)? << 4) | nibble(*low)?;
+		}
+		Some(Self(digest))
+	}
+}
+
+impl fmt::Display for Sha256Digest {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		self.0.iter().try_for_each(|byte| write!(f, "{byte:02x}"))
+	}
+}
+
+/// The `digest` GitHub lists for a release asset, `<algorithm>:<hex digest>`.
+#[derive(Debug, PartialEq, Eq)]
+enum AssetDigest<'a> {
+	Sha256(Sha256Digest),
+	/// A digest in another algorithm, by its name.
+	Unsupported(&'a str),
+}
+
+impl<'a> AssetDigest<'a> {
+	fn parse(digest: &'a str) -> Result<Self> {
+		let (algorithm, hex) = digest
+			.split_once(':')
+			.with_context(|| format!("Malformed release asset digest {digest:?}"))?;
+		if algorithm != "sha256" {
+			return Ok(Self::Unsupported(algorithm));
+		}
+		Sha256Digest::parse_hex(hex)
+			.map(Self::Sha256)
+			.with_context(|| format!("Malformed release asset SHA-256 digest {digest:?}"))
+	}
 }
 
 /// Prefix of the temporary file an update is written to before it is moved into place.
@@ -461,7 +565,10 @@ struct GitHubRelease {
 struct GitHubReleaseAsset {
 	name: String,
 	browser_download_url: String,
-	digest: String,
+	/// `<algorithm>:<hex digest>`, missing on assets GitHub uploaded before it listed digests.
+	digest: Option<String>,
+	/// In bytes.
+	size: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -986,6 +1093,103 @@ mod tests {
 			serve_once("HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\nbinary");
 
 		assert_eq!(download_file(&url).await.unwrap(), b"binary");
+	}
+
+	/// An asset of `size` bytes with `digest`.
+	fn asset(size: Option<u64>, digest: Option<&str>) -> GitHubReleaseAsset {
+		GitHubReleaseAsset {
+			name: "filen-cli-v0.3.0-linux-x64".to_owned(),
+			browser_download_url: "https://example.com/asset".to_owned(),
+			digest: digest.map(str::to_owned),
+			size,
+		}
+	}
+
+	const SHA256_OF_BINARY: &str =
+		"sha256:9a3a45d01531a20e89ac6ae10b0b0beb0492acd7216a368aa062d1a5fecaf9cd";
+
+	#[test]
+	fn an_asset_without_a_digest_deserializes() {
+		let asset: GitHubReleaseAsset = serde_json::from_str(
+			r#"{"name": "filen-cli-v0.2.0-linux-x64", "browser_download_url": "https://example.com/a", "size": 6}"#,
+		)
+		.unwrap();
+		assert_eq!(asset.digest, None);
+		assert_eq!(asset.size, Some(6));
+	}
+
+	#[test]
+	fn a_sha256_digest_parses() {
+		let AssetDigest::Sha256(digest) = AssetDigest::parse(SHA256_OF_BINARY).unwrap() else {
+			panic!("not a SHA-256 digest");
+		};
+		assert_eq!(
+			format!("sha256:{digest}"),
+			SHA256_OF_BINARY,
+			"the digest prints as it was given"
+		);
+	}
+
+	#[test]
+	fn a_digest_in_another_algorithm_is_unsupported() {
+		assert_eq!(
+			AssetDigest::parse("sha512:abcd").unwrap(),
+			AssetDigest::Unsupported("sha512")
+		);
+	}
+
+	#[test]
+	fn a_malformed_sha256_digest_is_an_error() {
+		for digest in [
+			"sha256",
+			"sha256:abc",
+			"sha256:9a3a45d01531a20e89ac6ae10b0b0beb0492acd7216a368aa062d1a5fecaf9c",
+			"sha256:9a3a45d01531a20e89ac6ae10b0b0beb0492acd7216a368aa062d1a5fecaf9cdff",
+			"sha256:9a3a45d01531a20e89ac6ae10b0b0beb0492acd7216a368aa062d1a5fecaf9cg",
+		] {
+			assert!(AssetDigest::parse(digest).is_err(), "{digest}");
+		}
+	}
+
+	#[test]
+	fn a_download_of_the_listed_size_and_digest_passes() {
+		verify_download(&asset(Some(6), Some(SHA256_OF_BINARY)), b"binary").unwrap();
+	}
+
+	#[test]
+	fn a_download_of_another_size_fails() {
+		let error = verify_download(&asset(Some(7), None), b"binary").unwrap_err();
+		assert_eq!(
+			error.to_string(),
+			"The download of filen-cli-v0.3.0-linux-x64 is 6 bytes, but its release lists 7 bytes"
+		);
+	}
+
+	#[test]
+	fn a_download_with_another_digest_fails() {
+		let error =
+			verify_download(&asset(Some(6), Some(SHA256_OF_BINARY)), b"bin4ry").unwrap_err();
+		assert_eq!(
+			error.to_string(),
+			"The download of filen-cli-v0.3.0-linux-x64 has the SHA-256 digest \
+			 2dfce159e56ebc75f14698bc654e14aa3dd21f3db365866a219e8ff481299242, but its release lists \
+			 9a3a45d01531a20e89ac6ae10b0b0beb0492acd7216a368aa062d1a5fecaf9cd"
+		);
+	}
+
+	#[test]
+	fn a_download_with_an_unsupported_digest_fails() {
+		let error = verify_download(&asset(None, Some("sha512:abcd")), b"binary").unwrap_err();
+		assert_eq!(
+			error.to_string(),
+			"The release lists a sha512 digest for filen-cli-v0.3.0-linux-x64, which cannot be \
+			 checked"
+		);
+	}
+
+	#[test]
+	fn a_download_with_a_malformed_digest_fails() {
+		assert!(verify_download(&asset(None, Some("sha256:00")), b"binary").is_err());
 	}
 
 	/// Lists the names of the files in `dir`, sorted.
