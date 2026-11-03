@@ -179,6 +179,7 @@ async fn uploading_with_json_prints_the_result_as_json() {
 			"destination": format!("/{test_dir_name}/a.txt"),
 			"files": 1,
 			"bytes": 8,
+			"skipped": 0,
 			"skipped_symlinks": [],
 			"failed": [],
 		})

@@ -20,6 +20,13 @@
 //! each file's modification and creation times, and downloads set the modification time on the
 //! local file (and the creation time on macOS and Windows).
 //!
+//! With `--skip-existing`, `upload` leaves out each file the drive already holds a file of the same
+//! name for (the drive compares names case-insensitively), and with `--update` it leaves one out
+//! unless its size differs or it was modified after the drive's copy. With `--no-clobber`,
+//! `download` never replaces a local file. The files left out are counted in the result and listed
+//! with `-v`, and so are the files a directory download leaves as they are for already holding
+//! the same contents.
+//!
 //! An uploaded symlink is uploaded under its own name with the contents it points to. Inside an
 //! uploaded directory, symlinks are followed the same way; with `--no-follow-symlinks` they are
 //! skipped instead (neither the link nor what it points to is uploaded): listed with `-v`, counted
@@ -34,10 +41,10 @@
 //! When a single item inside a directory transfer fails, the rest of the transfer still completes,
 //! the failures are listed at the end, and the command exits with a nonzero status. With
 //! `--json`, the result is printed as one object instead: `{"destination": ..., "files": ...,
-//! "bytes": ..., "skipped_symlinks": [...], "failed": [{"path": ..., "error": ...}]}`, where
-//! `path` is `null` for a failure not about a single item. Press Ctrl+C to cancel a running
-//! transfer: what was transferred by then is reported on stderr and the command exits with status
-//! 130, where the TypeScript CLI printed "Aborted".
+//! "bytes": ..., "skipped": ..., "skipped_symlinks": [...], "failed": [{"path": ...,
+//! "error": ...}]}`, where `path` is `null` for a failure not about a single item. Press Ctrl+C
+//! to cancel a running transfer: what was transferred by then is reported on stderr and the
+//! command exits with status 130, where the TypeScript CLI printed "Aborted".
 
 use std::{
 	borrow::Cow,
@@ -63,9 +70,9 @@ use filen_sdk_rs::{
 		name::ValidatedName,
 	},
 	io::{
-		CategoryDirDownloadExtPub as _, DirDownloadCallback, DirUploadCallback, DirUploadOptions,
-		ExistingRemoteFile, RemoteDirectory, RemoteFile, SymlinkPolicy,
-		client_impl::IoSharedClientExt as _, is_safe_descendant,
+		CategoryDirDownloadExtPub as _, DirDownloadCallback, DirDownloadOptions, DirUploadCallback,
+		DirUploadOptions, ExistingLocalFile, ExistingRemoteFile, RemoteDirectory, RemoteFile,
+		SymlinkPolicy, client_impl::IoSharedClientExt as _, is_safe_descendant,
 	},
 	util::MaybeSendCallback,
 };
@@ -101,6 +108,14 @@ pub(crate) enum TransferCommands {
 		/// (counted in the result, listed with -v)
 		#[arg(long)]
 		no_follow_symlinks: bool,
+		/// Skip each file the drive already holds a file of the same name for, instead of
+		/// replacing it (listed with -v)
+		#[arg(long, conflicts_with = "update")]
+		skip_existing: bool,
+		/// Replace a file the drive already holds a file of the same name for only when its size
+		/// differs or it was modified since, and skip it otherwise (listed with -v)
+		#[arg(long)]
+		update: bool,
 	},
 	/// Download a file or directory (recursively) from the Filen drive
 	Download {
@@ -112,6 +127,9 @@ pub(crate) enum TransferCommands {
 		/// created (default: the current local directory)
 		#[arg(add = ArgValueCompleter::new(PathCompleter::any()))]
 		destination: Option<String>,
+		/// Never replace a local file: skip each file whose local path is taken (listed with -v)
+		#[arg(long)]
+		no_clobber: bool,
 	},
 }
 
@@ -135,11 +153,16 @@ impl TransferCommands {
 				source,
 				destination,
 				no_follow_symlinks,
+				skip_existing,
+				update,
 			} => {
-				let symlinks = if no_follow_symlinks {
-					SymlinkPolicy::Skip
-				} else {
-					SymlinkPolicy::Follow
+				let options = DirUploadOptions {
+					symlinks: if no_follow_symlinks {
+						SymlinkPolicy::Skip
+					} else {
+						SymlinkPolicy::Follow
+					},
+					existing: existing_remote_policy(skip_existing, update),
 				};
 				upload(
 					ui,
@@ -147,28 +170,58 @@ impl TransferCommands {
 					working_path,
 					&source,
 					destination.as_deref(),
-					symlinks,
+					options,
 				)
 				.await?
 			}
 			Self::Download {
 				source,
 				destination,
-			} => download(ui, client, working_path, &source, destination.as_deref()).await?,
+				no_clobber,
+			} => {
+				let options = DirDownloadOptions {
+					existing: if no_clobber {
+						ExistingLocalFile::Keep
+					} else {
+						ExistingLocalFile::ReplaceUnlessSame
+					},
+				};
+				download(
+					ui,
+					client,
+					working_path,
+					&source,
+					destination.as_deref(),
+					options,
+				)
+				.await?
+			}
 		}
 		Ok(CommandResult::default())
 	}
 }
 
-/// Upload a local file, or a local directory and everything below it, into a remote directory.
-/// `symlinks` says what to do with the symlinks inside a directory; `source` itself is followed.
+/// What `upload` does with a file the drive already holds one of the same name for, from its
+/// `--skip-existing` and `--update` flags, which clap keeps from being given together.
+fn existing_remote_policy(skip_existing: bool, update: bool) -> ExistingRemoteFile {
+	if skip_existing {
+		ExistingRemoteFile::Keep
+	} else if update {
+		ExistingRemoteFile::ReplaceIfChanged
+	} else {
+		ExistingRemoteFile::Replace
+	}
+}
+
+/// Upload a local file, or a local directory and everything below it, into a remote directory, as
+/// `options` say; `source` itself is followed when it is a symlink.
 pub(crate) async fn upload(
 	ui: &mut UI,
 	client: &mut LazyClient,
 	working_path: &RemotePath,
 	source_str: &str,
 	destination_str: Option<&str>,
-	symlinks: SymlinkPolicy,
+	options: DirUploadOptions,
 ) -> Result<()> {
 	// Made absolute without resolving symlinks, so an uploaded link keeps its own name.
 	let source = std::path::absolute(source_str)
@@ -211,7 +264,7 @@ pub(crate) async fn upload(
 				target.name.as_ref(),
 				&target_path,
 				&parent_dir,
-				symlinks,
+				options,
 			),
 		)
 		.await?
@@ -225,6 +278,7 @@ pub(crate) async fn upload(
 				&source,
 				target.name.as_ref(),
 				&parent_dir,
+				options.existing,
 			),
 		)
 		.await?
@@ -364,13 +418,15 @@ fn upload_name(source: &Path) -> Result<String> {
 		.ok_or_else(|| UI::failure(&format!("Cannot upload {}", source.display())))
 }
 
-/// Download a remote file, or a remote directory and everything below it, to a local path.
+/// Download a remote file, or a remote directory and everything below it, to a local path, as
+/// `options` say.
 pub(crate) async fn download(
 	ui: &mut UI,
 	client: &mut LazyClient,
 	working_path: &RemotePath,
 	source_str: &str,
 	destination_str: Option<&str>,
+	options: DirDownloadOptions,
 ) -> Result<()> {
 	let destination_str = destination_str.unwrap_or(".");
 	let into = destination_str.ends_with(std::path::is_separator);
@@ -422,7 +478,7 @@ pub(crate) async fn download(
 			run_cancellable(
 				ui,
 				&progress,
-				download_file(&client, &progress, file.as_ref(), &target),
+				download_file(&client, &progress, file.as_ref(), &target, options.existing),
 			)
 			.await?
 		}
@@ -431,7 +487,7 @@ pub(crate) async fn download(
 			run_cancellable(
 				ui,
 				&progress,
-				download_directory(&client, &progress, dir, &target),
+				download_directory(&client, &progress, dir, &target, options),
 			)
 			.await?
 		}
@@ -440,7 +496,7 @@ pub(crate) async fn download(
 			run_cancellable(
 				ui,
 				&progress,
-				download_directory(&client, &progress, root, &target),
+				download_directory(&client, &progress, root, &target, options),
 			)
 			.await?
 		}
@@ -578,6 +634,7 @@ fn finish(
 ) -> Result<()> {
 	let kind = progress.kind;
 	let (files, bytes) = progress.done();
+	let skipped = progress.skipped();
 	let failures = progress.take_failures();
 	let skipped_symlinks = progress.take_skipped_symlinks();
 	if ui.json {
@@ -585,6 +642,7 @@ fn finish(
 			destination,
 			files,
 			bytes,
+			skipped,
 			&failures,
 			&skipped_symlinks,
 		))?;
@@ -601,7 +659,7 @@ fn finish(
 				failures.len() - MAX_PRINTED_ERRORS
 			));
 		}
-		let summary = transfer_summary(files, bytes, progress.started.elapsed());
+		let summary = transfer_summary(files, bytes, skipped, progress.started.elapsed());
 		if failures.is_empty() {
 			ui.print_success(&format!("{} {}: {}", kind.past(), subject, summary));
 		} else if !ui.is_quiet() {
@@ -624,6 +682,7 @@ fn result_json(
 	destination: &str,
 	files: u64,
 	bytes: u64,
+	skipped: u64,
 	failures: &[TransferFailure],
 	skipped_symlinks: &[String],
 ) -> serde_json::Value {
@@ -631,6 +690,7 @@ fn result_json(
 		"destination": destination,
 		"files": files,
 		"bytes": bytes,
+		"skipped": skipped,
 		"skipped_symlinks": skipped_symlinks,
 		"failed": failures
 			.iter()
@@ -639,21 +699,31 @@ fn result_json(
 	})
 }
 
+/// Upload the file `source` as `name` into `destination_dir`, unless `existing` keeps a file of
+/// that name already there.
 async fn upload_file(
 	client: &Client,
 	progress: &TransferProgress,
 	source: &Path,
 	name: &str,
 	destination_dir: &DirType<'_, Normal>,
+	existing: ExistingRemoteFile,
 ) -> Result<()> {
 	let mut builder = FileBuilderOptionalName::new(destination_dir.uuid());
 	builder
 		.name(name)
 		.map_err(|e| UI::failure(&format!("Cannot upload as {:?}: {}", name, e)))?;
-	let size = std::fs::metadata(source)
-		.with_context(|| format!("Failed to read {}", source.display()))?
-		.len();
+	let metadata = std::fs::metadata(source)
+		.with_context(|| format!("Failed to read {}", source.display()))?;
+	let size = metadata.len();
 	progress.start_single_item(size);
+	if existing != ExistingRemoteFile::Replace
+		&& let Some(remote) = same_named_file(client, destination_dir, name).await?
+		&& !existing.replaces(&metadata, &remote)
+	{
+		progress.skip([source.display().to_string()], size);
+		return Ok(());
+	}
 	client
 		.upload_file_from_path_with_builder(
 			builder,
@@ -666,6 +736,24 @@ async fn upload_file(
 	Ok(())
 }
 
+/// The file in `dir` the server takes for one named `name`: it compares names by their lowercase
+/// form, as a directory upload does too.
+async fn same_named_file(
+	client: &Client,
+	dir: &DirType<'_, Normal>,
+	name: &str,
+) -> Result<Option<RemoteFile>> {
+	let (_, files) = client
+		.list_dir(dir, None::<&fn(u64, Option<u64>)>)
+		.await
+		.context("Failed to list remote directory")?;
+	let name = name.to_lowercase();
+	Ok(files.into_iter().find(|file| {
+		file.name()
+			.is_some_and(|other| other.to_lowercase() == name)
+	}))
+}
+
 /// Upload the directory `source` as `name` into `destination_dir`, which makes it the remote
 /// directory at `target_path`.
 async fn upload_directory(
@@ -675,7 +763,7 @@ async fn upload_directory(
 	name: &str,
 	target_path: &RemotePath,
 	destination_dir: &DirType<'_, Normal>,
-	symlinks: SymlinkPolicy,
+	options: DirUploadOptions,
 ) -> Result<()> {
 	// `upload_dir_recursively` uploads the *contents* of `source` into an already existing remote
 	// directory, so create (or reuse) the destination's `name` subdirectory first. This also
@@ -696,22 +784,29 @@ async fn upload_directory(
 			source.to_path_buf(),
 			progress,
 			target.as_ref(),
-			DirUploadOptions {
-				symlinks,
-				existing: ExistingRemoteFile::Replace,
-			},
+			options,
 		)
 		.await
 		.context("Failed to upload directory")
 }
 
+/// Download `source` to `target`, unless `existing` keeps a local file already there.
 async fn download_file(
 	client: &Client,
 	progress: &TransferProgress,
 	source: &RemoteFile,
 	target: &Path,
+	existing: ExistingLocalFile,
 ) -> Result<()> {
 	progress.start_single_item(source.size());
+	match existing {
+		// Whatever is at the path, even a dangling symlink, is kept.
+		ExistingLocalFile::Keep if std::fs::symlink_metadata(target).is_ok() => {
+			progress.skip([target.display().to_string()], source.size());
+			return Ok(());
+		}
+		ExistingLocalFile::Keep | ExistingLocalFile::ReplaceUnlessSame => {}
+	}
 	client
 		.download_file_to_path_unless_same_hash(source, target, Some(progress.byte_callback()))
 		.await
@@ -725,6 +820,7 @@ async fn download_directory(
 	progress: &TransferProgress,
 	source: DirType<'static, Normal>,
 	target: &Path,
+	options: DirDownloadOptions,
 ) -> Result<()> {
 	let target = target
 		.to_str()
@@ -736,9 +832,16 @@ async fn download_directory(
 		})?
 		.to_string();
 	progress.start_scan();
-	Normal::download_dir_recursively(client.clone(), target, progress, source, ())
-		.await
-		.context("Failed to download directory")
+	Normal::download_dir_recursively_with_options(
+		client.clone(),
+		target,
+		progress,
+		source,
+		(),
+		options,
+	)
+	.await
+	.context("Failed to download directory")
 }
 
 // progress reporting
@@ -814,6 +917,8 @@ struct ProgressState {
 	total_bytes: u64,
 	done_files: u64,
 	done_bytes: u64,
+	/// The files left out for what was already at their target, which are not in the totals.
+	skipped_files: u64,
 	/// `(when, done_bytes)`, oldest first, reaching back just past [`SPEED_WINDOW`].
 	speed_samples: VecDeque<(Instant, u64)>,
 	last_render: Option<Instant>,
@@ -978,17 +1083,21 @@ fn files_and_bytes(files: u64, bytes: u64) -> String {
 	)
 }
 
-/// What a transfer moved and how fast, on average.
-fn transfer_summary(files: u64, bytes: u64, elapsed: Duration) -> String {
-	let summary = format!(
+/// What a transfer moved and how fast, on average, and how many files it left out for what was
+/// already at their target.
+fn transfer_summary(files: u64, bytes: u64, skipped: u64, elapsed: Duration) -> String {
+	let mut summary = format!(
 		"{} in {}",
 		files_and_bytes(files, bytes),
 		format_elapsed(elapsed)
 	);
-	match bytes_per_second(bytes, elapsed) {
-		Some(speed) => format!("{} ({}/s)", summary, ui::format_size(speed)),
-		None => summary,
+	if let Some(speed) = bytes_per_second(bytes, elapsed) {
+		summary.push_str(&format!(" ({}/s)", ui::format_size(speed)));
 	}
+	if skipped > 0 {
+		summary.push_str(&format!(", {} skipped", skipped));
+	}
+	summary
 }
 
 /// Draws a single, redrawn-in-place progress line for one upload or download, and with `-v` lists
@@ -1107,6 +1216,26 @@ impl TransferProgress {
 		(state.done_files, state.done_bytes)
 	}
 
+	/// The files left out so far for what was already at their target.
+	fn skipped(&self) -> u64 {
+		self.state.lock().unwrap().skipped_files
+	}
+
+	/// Note the files at `paths`, `bytes` long together, as left out for what was already at their
+	/// target: they leave the totals, and `-v` lists them.
+	fn skip(&self, paths: impl IntoIterator<Item = String>, bytes: u64) {
+		let paths = paths.into_iter().collect::<Vec<_>>();
+		let files = u64::try_from(paths.len()).unwrap_or(u64::MAX);
+		let mut state = self.state.lock().unwrap();
+		state.skipped_files = state.skipped_files.saturating_add(files);
+		state.total_files = state.total_files.saturating_sub(files);
+		state.total_bytes = state.total_bytes.saturating_sub(bytes);
+		if self.list_files {
+			self.print_above(&mut state, skipped_lines(paths));
+		}
+		self.render(&mut state, false);
+	}
+
 	fn push_failures(&self, failures: impl IntoIterator<Item = TransferFailure>) {
 		self.failures.lock().unwrap().extend(failures);
 	}
@@ -1219,6 +1348,13 @@ impl DirUploadCallback for TransferProgress {
 		}));
 	}
 
+	fn on_upload_skipped(&self, skipped_files: Vec<PathBuf>, skipped_bytes: u64) {
+		self.skip(
+			skipped_files.iter().map(|path| path.display().to_string()),
+			skipped_bytes,
+		);
+	}
+
 	fn on_scan_skipped_symlinks(&self, paths: Vec<PathBuf>) {
 		let paths = paths
 			.iter()
@@ -1230,6 +1366,11 @@ impl DirUploadCallback for TransferProgress {
 		}
 		state.skipped_symlinks.extend(paths);
 	}
+}
+
+/// The `-v` lines for the files a transfer left out for what was already at their target.
+fn skipped_lines(paths: Vec<String>) -> impl Iterator<Item = String> {
+	paths.into_iter().map(|path| format!("Skipped {}", path))
 }
 
 /// The `-v` lines for the symlinks a directory upload skipped.
@@ -1278,6 +1419,13 @@ impl DirDownloadCallback<Normal> for TransferProgress {
 		self.advance_locked(&mut state, files, downloaded_bytes);
 	}
 
+	fn on_download_skipped(&self, skipped_files: Vec<(RemoteFile, String)>) {
+		let bytes = skipped_files
+			.iter()
+			.fold(0u64, |bytes, (file, _)| bytes.saturating_add(file.size()));
+		self.skip(skipped_files.into_iter().map(|(_, path)| path), bytes);
+	}
+
 	fn on_download_errors(&self, errors: Vec<(Error, String, NonRootItemType<'static, Normal>)>) {
 		self.push_failures(errors.into_iter().map(|(e, path, _)| TransferFailure {
 			path: Some(path),
@@ -1296,13 +1444,16 @@ mod tests {
 	use filen_types::fs::{ParentUuid, Uuid};
 	use serde_json::json;
 
-	use filen_sdk_rs::{fs::name::ValidatedName, io::DirUploadCallback as _};
+	use filen_sdk_rs::{
+		fs::name::ValidatedName,
+		io::{DirUploadCallback as _, ExistingRemoteFile},
+	};
 
 	use super::{
 		DownloadSource, Existing, ProgressState, SPEED_WINDOW, TransferFailure, TransferKind,
-		TransferProgress, UploadTarget, canceled_message, download_target, format_duration,
-		local_existing, progress_line, resolve_download_target, resolve_upload_target, result_json,
-		skipped_symlinks_line, transfer_summary,
+		TransferProgress, UploadTarget, canceled_message, download_target, existing_remote_policy,
+		format_duration, local_existing, progress_line, resolve_download_target,
+		resolve_upload_target, result_json, skipped_symlinks_line, transfer_summary,
 	};
 	use crate::util::RemotePath;
 
@@ -1449,7 +1600,7 @@ mod tests {
 	#[test]
 	fn the_summary_gives_the_average_speed() {
 		assert_eq!(
-			transfer_summary(3, 2 * MIB, Duration::from_secs(4)),
+			transfer_summary(3, 2 * MIB, 0, Duration::from_secs(4)),
 			"3 files, 2 MiB in 4.0s (512 KiB/s)"
 		);
 	}
@@ -1457,8 +1608,44 @@ mod tests {
 	#[test]
 	fn the_summary_of_an_instant_transfer_has_no_speed() {
 		assert_eq!(
-			transfer_summary(1, 100, Duration::ZERO),
+			transfer_summary(1, 100, 0, Duration::ZERO),
 			"1 file, 100 B in 0.0s"
+		);
+	}
+
+	#[test]
+	fn the_summary_counts_the_skipped_files() {
+		assert_eq!(
+			transfer_summary(1, MIB, 2, Duration::from_secs(1)),
+			"1 file, 1 MiB in 1.0s (1 MiB/s), 2 skipped"
+		);
+	}
+
+	#[test]
+	fn skipping_takes_the_files_out_of_the_totals() {
+		let progress = quiet_progress();
+		progress.start_single_item(MIB);
+		progress.skip(["a.txt".to_owned()], MIB);
+		let state = progress.state.lock().unwrap();
+		assert_eq!(
+			(state.total_files, state.total_bytes, state.skipped_files),
+			(0, 0, 1)
+		);
+	}
+
+	#[test]
+	fn the_existing_file_flags_pick_the_policy() {
+		assert_eq!(
+			existing_remote_policy(false, false),
+			ExistingRemoteFile::Replace
+		);
+		assert_eq!(
+			existing_remote_policy(true, false),
+			ExistingRemoteFile::Keep
+		);
+		assert_eq!(
+			existing_remote_policy(false, true),
+			ExistingRemoteFile::ReplaceIfChanged
 		);
 	}
 
@@ -1503,11 +1690,12 @@ mod tests {
 			},
 		];
 		assert_eq!(
-			result_json("/dir", 4, 1000, &failures, &["/local/link".to_owned()]),
+			result_json("/dir", 4, 1000, 2, &failures, &["/local/link".to_owned()]),
 			json!({
 				"destination": "/dir",
 				"files": 4,
 				"bytes": 1000,
+				"skipped": 2,
 				"skipped_symlinks": ["/local/link"],
 				"failed": [
 					{ "path": "/local/a.txt", "error": "Permission denied" },
