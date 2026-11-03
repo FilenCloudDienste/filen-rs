@@ -93,8 +93,16 @@ pub(crate) struct CliArgs {
 	#[arg(short, long, global = true)]
 	quiet: bool,
 
-	/// Config directory (overrides system default)
-	#[arg(long, global = true)]
+	/// Config directory, created if missing (overrides system default; FILEN_CLI_DATA_DIR also
+	/// sets it)
+	// clap reads one variable per option; `FILEN_CLI_DATA_DIR`, the old CLI's, is read in
+	// `chosen_config_dir`.
+	#[arg(
+		long,
+		visible_alias = "data-dir",
+		env = CONFIG_DIR_ENV,
+		global = true
+	)]
 	config_dir: Option<PathBuf>,
 
 	/// Use this profile: its own login, cache and logs, in a directory of the config directory
@@ -206,6 +214,36 @@ pub(crate) struct CliConfig {
 	/// The config dir in use: the active profile's, or the one without a profile.
 	pub(crate) config_dir: PathBuf,
 	pub(crate) profiles: auth::Profiles,
+}
+
+/// The environment variable that sets the config directory, like `--config-dir`.
+const CONFIG_DIR_ENV: &str = "FILEN_CLI_CONFIG_DIR";
+
+/// The old CLI's environment variable for the config directory, read when neither `--config-dir`
+/// nor [`CONFIG_DIR_ENV`] is set.
+const DATA_DIR_ENV: &str = "FILEN_CLI_DATA_DIR";
+
+/// The config directory the user chose: `arg`, which `--config-dir`, `--data-dir` or
+/// [`CONFIG_DIR_ENV`] set, or else `data_dir_env`, the value of [`DATA_DIR_ENV`]. `None` for the
+/// default directory. An empty value counts as unset.
+fn chosen_config_dir(arg: Option<PathBuf>, data_dir_env: Option<OsString>) -> Option<PathBuf> {
+	arg.filter(|dir| !dir.as_os_str().is_empty()).or_else(|| {
+		data_dir_env
+			.filter(|dir| !dir.is_empty())
+			.map(PathBuf::from)
+	})
+}
+
+/// Creates the config directory the user chose, if it is missing, and returns it. A usage error
+/// if it cannot be created, as when the path names a file.
+fn create_explicit_config_dir(dir: PathBuf) -> Result<PathBuf> {
+	match fs::create_dir_all(&dir) {
+		Ok(()) => Ok(dir),
+		Err(e) => Err(ui::UI::usage_failure(&format!(
+			"Failed to create the config directory {}: {e}",
+			dir.display()
+		))),
+	}
 }
 
 /// How large the log files grow and how long they are kept: a file is moved aside past 10 MiB,
@@ -369,16 +407,14 @@ async fn inner_main(ui: &mut ui::UI, arenas_limited: bool) -> Result<Finished> {
 		.args;
 	interrupt::install().context("Failed to set up Ctrl-C")?;
 
-	let is_dev = cfg!(debug_assertions);
-	let base_config_dir = match cli_args.config_dir {
-		Some(ref dir) => {
-			if !dir.exists() {
-				return Err(ui::UI::usage_failure("Config dir does not exist"));
-			}
-			dir.clone()
-		}
+	// A clone, as `CommandOptions::of` borrows the whole of `cli_args` below.
+	let explicit_config_dir =
+		chosen_config_dir(cli_args.config_dir.clone(), std::env::var_os(DATA_DIR_ENV));
+	let base_config_dir = match explicit_config_dir {
+		Some(dir) => create_explicit_config_dir(dir)?,
 		None => {
-			let dir = default_config_dir(is_dev).context("Failed to get config dir")?;
+			let dir =
+				default_config_dir(cfg!(debug_assertions)).context("Failed to get config dir")?;
 			fs::create_dir_all(&dir).context("Failed to create config dir")?;
 			dir
 		}
@@ -1344,6 +1380,77 @@ mod tests {
 			panic!("parsed an option for the start of the CLI");
 		};
 		assert_eq!(options, ["--config-dir", "--skip-update"]);
+	}
+
+	#[test]
+	fn a_repl_line_giving_the_data_dir_alias_is_rejected() {
+		let Err(ReplLineError::StartupOptions(options)) = parse_repl_line("ls --data-dir /tmp")
+		else {
+			panic!("parsed --data-dir on a REPL line");
+		};
+		assert_eq!(options, ["--config-dir"]);
+	}
+
+	#[test]
+	fn data_dir_is_an_alias_of_config_dir() {
+		let cli_args = parse_args(["filen", "--data-dir", "/some/dir", "ls"])
+			.unwrap()
+			.args;
+		assert_eq!(cli_args.config_dir, Some(PathBuf::from("/some/dir")));
+	}
+
+	#[test]
+	fn the_config_dir_option_wins_over_the_old_data_dir_variable() {
+		assert_eq!(
+			chosen_config_dir(Some("/flag".into()), Some("/env".into())),
+			Some(PathBuf::from("/flag"))
+		);
+	}
+
+	#[test]
+	fn the_old_data_dir_variable_sets_the_config_dir_without_the_option() {
+		assert_eq!(
+			chosen_config_dir(None, Some("/env".into())),
+			Some(PathBuf::from("/env"))
+		);
+	}
+
+	#[test]
+	fn without_option_or_variable_the_config_dir_is_the_default() {
+		assert_eq!(chosen_config_dir(None, None), None);
+	}
+
+	#[test]
+	fn an_empty_config_dir_counts_as_unset() {
+		assert_eq!(
+			chosen_config_dir(Some(PathBuf::new()), Some("/env".into())),
+			Some(PathBuf::from("/env"))
+		);
+		assert_eq!(chosen_config_dir(None, Some(OsString::new())), None);
+	}
+
+	#[test]
+	fn a_missing_explicit_config_dir_is_created() {
+		let parent = tempfile::tempdir().unwrap();
+		let dir = parent.path().join("a").join("b");
+		assert_eq!(create_explicit_config_dir(dir.clone()).unwrap(), dir);
+		assert!(dir.is_dir());
+	}
+
+	#[test]
+	fn an_explicit_config_dir_that_is_a_file_is_a_usage_error() {
+		let parent = tempfile::tempdir().unwrap();
+		let file = parent.path().join("file");
+		fs::write(&file, "").unwrap();
+		let e = create_explicit_config_dir(file.clone()).unwrap_err();
+		assert_eq!(error::exit_code(&e), error::EXIT_USAGE);
+		assert!(
+			e.to_string().starts_with(&format!(
+				"Failed to create the config directory {}: ",
+				file.display()
+			)),
+			"{e}"
+		);
 	}
 
 	#[test]

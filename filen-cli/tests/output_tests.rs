@@ -48,11 +48,29 @@ fn help_for_an_unknown_topic_fails() {
 }
 
 #[test]
-fn a_config_dir_that_does_not_exist_is_a_usage_error() {
+fn a_config_dir_that_does_not_exist_is_created() {
 	let parent = TempDir::new().unwrap();
+	let config_dir = parent.path().join("missing/config");
 	let output = Command::new(assert_cmd::cargo::cargo_bin!())
 		.arg("--config-dir")
-		.arg(parent.path().join("missing"))
+		.arg(&config_dir)
+		.args(["--skip-update", "--help"])
+		.output()
+		.unwrap();
+
+	let stderr = String::from_utf8(output.stderr).unwrap();
+	assert_eq!(output.status.code(), Some(0), "{stderr}");
+	assert!(config_dir.is_dir());
+}
+
+#[test]
+fn a_config_dir_that_cannot_be_created_is_a_usage_error() {
+	let parent = TempDir::new().unwrap();
+	let file = parent.path().join("file");
+	std::fs::write(&file, "").unwrap();
+	let output = Command::new(assert_cmd::cargo::cargo_bin!())
+		.arg("--config-dir")
+		.arg(&file)
 		.args(["--skip-update", "--help"])
 		.output()
 		.unwrap();
@@ -60,7 +78,10 @@ fn a_config_dir_that_does_not_exist_is_a_usage_error() {
 	assert_eq!(output.status.code(), Some(2));
 	assert_eq!(String::from_utf8(output.stdout).unwrap(), "");
 	let stderr = String::from_utf8(output.stderr).unwrap();
-	assert!(stderr.contains("Config dir does not exist"), "{stderr}");
+	assert!(
+		stderr.contains("Failed to create the config directory"),
+		"{stderr}"
+	);
 }
 
 #[test]
