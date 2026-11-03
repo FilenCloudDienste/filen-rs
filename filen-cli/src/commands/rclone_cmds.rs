@@ -106,9 +106,13 @@ pub(crate) enum RcloneCommands {
 		#[arg(long)]
 		user: Option<String>,
 		/// Password for authentication to the server (default: random, printed when the server starts).
-		/// On S3 servers, this is the Secret Access Key.
-		#[arg(long)]
-		password: Option<String>,
+		/// On S3 servers, this is the Secret Access Key. Other users on this computer can see it on
+		/// the command line: prefer the environment variable or --password-file.
+		#[arg(long, env = "FILEN_CLI_SERVE_PASSWORD", hide_env_values = true)]
+		password: Option<ServePassword>,
+		/// File to read the password from, instead of --password (one trailing newline is ignored)
+		#[arg(long, value_name = "PATH", conflicts_with = "password")]
+		password_file: Option<PathBuf>,
 		/// The server is read-only
 		#[arg(long)]
 		read_only: bool,
@@ -157,6 +161,22 @@ pub(crate) enum RcloneCommands {
 		)]
 		_args: Vec<String>,
 	},
+}
+
+/// The password `serve` is given, which its `Debug` leaves out.
+#[derive(Clone)]
+pub(crate) struct ServePassword(String);
+
+impl From<String> for ServePassword {
+	fn from(password: String) -> Self {
+		Self(password)
+	}
+}
+
+impl fmt::Debug for ServePassword {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		f.write_str("ServePassword(<redacted>)")
+	}
 }
 
 /// The type of server `serve` runs.
@@ -222,11 +242,13 @@ impl RcloneCommands {
 				address,
 				user,
 				password,
+				password_file,
 				read_only,
 				cache_size,
 				cert,
 				key,
 			} => {
+				let password = serve_password(password, password_file.as_deref()).await?;
 				start_server(
 					config,
 					ui,
@@ -720,6 +742,35 @@ fn parse_address(address: &str) -> Result<(String, u16)> {
 	Ok((host.to_owned(), port))
 }
 
+/// The password `serve` was given: `--password` or its environment variable, or the contents of
+/// `--password-file` without one trailing newline.
+async fn serve_password(
+	password: Option<ServePassword>,
+	password_file: Option<&Path>,
+) -> Result<Option<String>> {
+	let Some(path) = password_file else {
+		return Ok(password.map(|ServePassword(password)| password));
+	};
+	let contents = tokio::fs::read_to_string(path).await.map_err(|e| {
+		UI::failure(&format!(
+			"Failed to read the password file {}: {e}",
+			path.display()
+		))
+	})?;
+	let password = contents
+		.strip_suffix('\n')
+		.map_or(contents.as_str(), |line| {
+			line.strip_suffix('\r').unwrap_or(line)
+		});
+	if password.is_empty() {
+		return Err(UI::usage_failure(&format!(
+			"The password file {} is empty",
+			path.display()
+		)));
+	}
+	Ok(Some(password.to_owned()))
+}
+
 /// The credentials a server takes: the given ones, or random ones when neither is given.
 fn serve_auth(
 	protocol: ServeProtocol,
@@ -763,10 +814,13 @@ pub(crate) fn parse_size(size: &str) -> Result<u64, String> {
 
 #[cfg(test)]
 mod tests {
-	use std::collections::HashSet;
+	use std::{collections::HashSet, ffi::OsStr};
+
+	use clap::CommandFactory as _;
 
 	use super::*;
 	use crate::{
+		CliArgs,
 		commands::Commands,
 		error::{exit_code, find_cli_error},
 		parse_args,
@@ -1117,6 +1171,135 @@ mod tests {
 		);
 
 		assert_eq!(printed.lines_or_empty(), "");
+	}
+
+	/// The `--password` and `--password-file` of `filen serve webdav <args>`.
+	fn parsed_password_args(args: &[&str]) -> (Option<ServePassword>, Option<PathBuf>) {
+		let args = [&["filen", "serve", "webdav"], args].concat();
+		let RcloneCommands::Serve {
+			password,
+			password_file,
+			..
+		} = parsed_command(&args)
+		else {
+			panic!("{args:?} parsed as another command");
+		};
+		(password, password_file)
+	}
+
+	#[test]
+	fn the_serve_password_can_come_from_the_environment_and_is_not_shown_in_the_help() {
+		let command = CliArgs::command();
+		let serve = command.find_subcommand("serve").unwrap();
+		let password = serve
+			.get_arguments()
+			.find(|arg| arg.get_id() == "password")
+			.unwrap();
+
+		assert_eq!(
+			password.get_env(),
+			Some(OsStr::new("FILEN_CLI_SERVE_PASSWORD"))
+		);
+		assert!(password.is_hide_env_values_set());
+	}
+
+	#[test]
+	fn the_serve_password_is_not_debug_printed() {
+		let (password, _) = parsed_password_args(&["--user", "me", "--password", "hunter2"]);
+
+		assert_eq!(format!("{password:?}"), "Some(ServePassword(<redacted>))");
+	}
+
+	#[test]
+	fn the_password_and_the_password_file_conflict() {
+		let args = [
+			"filen",
+			"serve",
+			"webdav",
+			"--password",
+			"p",
+			"--password-file",
+			"p.txt",
+		];
+
+		let Err(err) = parse_args(args) else {
+			panic!("parsed both --password and --password-file");
+		};
+
+		assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+		assert_eq!(err.exit_code(), 2);
+	}
+
+	#[tokio::test]
+	async fn the_password_file_is_read_without_its_trailing_newline() {
+		let file = tempfile::NamedTempFile::new().unwrap();
+		std::fs::write(file.path(), "hunter2\n").unwrap();
+		let path = file.path().to_str().unwrap();
+		let (password, password_file) = parsed_password_args(&["--password-file", path]);
+
+		let password = serve_password(password, password_file.as_deref()).await;
+
+		assert_eq!(password.unwrap().as_deref(), Some("hunter2"));
+	}
+
+	#[tokio::test]
+	async fn only_one_trailing_newline_of_the_password_file_is_ignored() {
+		let file = tempfile::NamedTempFile::new().unwrap();
+		std::fs::write(file.path(), " hunter2 \r\n\n").unwrap();
+
+		let password = serve_password(None, Some(file.path())).await;
+
+		assert_eq!(password.unwrap().as_deref(), Some(" hunter2 \r\n"));
+	}
+
+	#[tokio::test]
+	async fn a_windows_line_ending_after_the_password_is_ignored() {
+		let file = tempfile::NamedTempFile::new().unwrap();
+		std::fs::write(file.path(), "hunter2\r\n").unwrap();
+
+		let password = serve_password(None, Some(file.path())).await;
+
+		assert_eq!(password.unwrap().as_deref(), Some("hunter2"));
+	}
+
+	#[tokio::test]
+	async fn an_empty_password_file_is_a_usage_error() {
+		let file = tempfile::NamedTempFile::new().unwrap();
+		std::fs::write(file.path(), "\n").unwrap();
+
+		let err = serve_password(None, Some(file.path())).await.unwrap_err();
+
+		assert_eq!(exit_code(&err), 2);
+		assert_eq!(
+			format!("{err:#}"),
+			format!("The password file {} is empty", file.path().display())
+		);
+	}
+
+	#[tokio::test]
+	async fn a_missing_password_file_is_a_failure() {
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().join("missing.txt");
+
+		let err = serve_password(None, Some(&path)).await.unwrap_err();
+
+		assert_eq!(exit_code(&err), 1);
+		assert!(
+			format!("{err:#}").starts_with(&format!(
+				"Failed to read the password file {}: ",
+				path.display()
+			)),
+			"{err:#}"
+		);
+	}
+
+	#[tokio::test]
+	async fn the_password_is_used_without_a_password_file() {
+		let (password, password_file) = parsed_password_args(&["--password", "hunter2"]);
+
+		let password = serve_password(password, password_file.as_deref()).await;
+
+		assert_eq!(password.unwrap().as_deref(), Some("hunter2"));
 	}
 
 	#[test]

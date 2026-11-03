@@ -81,6 +81,7 @@ impl Cli {
 			.env_remove("FILEN_CLI_EMAIL")
 			.env_remove("FILEN_CLI_PASSWORD")
 			.env_remove("FILEN_CLI_2FA_CODE")
+			.env_remove("FILEN_CLI_SERVE_PASSWORD")
 			.arg("--config-dir")
 			.arg(config_dir())
 			.arg("--auth-config-path")
@@ -314,4 +315,27 @@ async fn a_mount_on_a_directory_that_is_not_empty_fails() {
 	};
 	assert_eq!(status.code(), Some(1), "{stderr}");
 	assert!(stderr.contains(expected), "{stderr}");
+}
+
+#[shared_test_runtime]
+async fn a_server_takes_its_password_from_a_file() {
+	let dir = TempDir::new().unwrap();
+	let password_file = dir.child("password.txt");
+	password_file.write_str("from-the-file\n").unwrap();
+
+	let (mut cli, started, _) = serve_webdav(&[
+		"--user",
+		"me",
+		"--password-file",
+		password_file.path().to_str().unwrap(),
+	])
+	.await;
+
+	assert_eq!(started.user, "me");
+	assert_eq!(started.password, "from-the-file");
+	assert_eq!(started.propfind_root(true).await, StatusCode::MULTI_STATUS);
+
+	cli.interrupt();
+	let (status, stderr) = cli.exit().await;
+	assert_eq!(status.code(), Some(0), "{stderr}");
 }
