@@ -139,6 +139,9 @@ pub(crate) enum Commands {
 		// todo: better command docs!
 		#[arg(short = 'p', long = "pair")]
 		pairs: Vec<String>,
+		/// Only run a single sync pass and exit.
+		#[arg(long)]
+		once: bool,
 		/// Disables the delete guard (applied only on the first sync pass).
 		#[arg(long)]
 		approve_mass_deletions: bool,
@@ -363,6 +366,7 @@ pub(crate) async fn execute_command(
 		}
 		Commands::Sync {
 			pairs,
+			once,
 			approve_mass_deletions: allow_deletions,
 			keep_local,
 			keep_remote,
@@ -387,12 +391,14 @@ pub(crate) async fn execute_command(
 					filen_sdk_rs::sync_engine::ConflictResolution::KeepBoth,
 				);
 			}
+			let client = client.get(ui).await?;
 			sync_cmd::sync(
 				config,
 				ui,
-				client,
+				client.clone(),
 				working_path,
 				&pairs,
+				once,
 				allow_deletions,
 				conflict_resolutions,
 			)

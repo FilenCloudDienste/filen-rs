@@ -5,31 +5,34 @@ use std::{
 
 use anyhow::{Context, Result};
 use console::style;
-use filen_sdk_rs::sync_engine::{
-	ConflictResolution, SyncEngine, SyncEvent, TransferDirection, UnsyncablePath, UnsyncableReason,
+use filen_sdk_rs::{
+	auth::Client,
+	sync_engine::{
+		ConflictResolution, SyncEngine, SyncEvent, TransferDirection, UnsyncablePath,
+		UnsyncableReason,
+	},
 };
-use tokio::sync::mpsc;
+use tokio::{select, sync::mpsc};
 
 use crate::{
-	CliConfig, auth::LazyClient, commands::sync_cmd::sync_pairs::format_sync_pair, ui::UI,
-	util::RemotePath,
+	CliConfig, commands::sync_cmd::sync_pairs::format_sync_pair, ui::UI, util::RemotePath,
 };
 
 mod sync_pairs;
 
 // todo: better command documentation
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn sync(
 	config: &CliConfig,
 	ui: &mut UI,
-	client: &mut LazyClient,
+	client: Arc<Client>,
 	working_path: &RemotePath,
 	pair_definitions: &Vec<String>,
+	once: bool,
 	approve_mass_deletions: bool,
 	conflict_resolutions: HashMap<String, ConflictResolution>,
 ) -> Result<()> {
-	let client = client.get(ui).await?;
-
 	// init sync engine
 	let db_path = config.config_dir.join("sync-engine.db");
 	let engine = Arc::new(
@@ -56,161 +59,170 @@ pub(crate) async fn sync(
 	} else {
 		pair_definitions
 	};
-	sync_pairs::register_sync_pairs(&engine, client, working_path, pair_definitions)
+	sync_pairs::register_sync_pairs(&engine, &client, working_path, pair_definitions)
 		.await
 		.context("Failed to add sync pairs")?;
 
-	// start engine and send events
-	let (events_tx, mut events_rx) = mpsc::unbounded_channel();
 	let pairs = engine
 		.list_pairs()
 		.await
 		.context("Failed to list sync pairs")?;
-	let watch_handles = pairs.iter().map(async |pair| {
-		// todo: tmp
-		engine
-			.set_delete_guard(
-				pair.id,
-				filen_sdk_rs::sync_engine::DeleteGuard::new(0, 0.000001)?,
-			)
-			.await?;
+
+	let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+
+	// start syncing
+	let watch_handles = futures::future::join_all(pairs.iter().map(async |pair| {
 		let pair = pair.clone();
-		let pair_friendly_name = format_sync_pair(client, &pair).await?;
+		let pair_friendly_name = format_sync_pair(&client, &pair).await?;
 		let events_tx = events_tx.clone();
-		let watch = Arc::clone(&engine)
-			.watch_observed(
-				pair.id,
-				Box::new(move |event| {
+		if once {
+			engine
+				.sync_once_observed(pair.id, &mut move |event| {
 					let _ = events_tx.send((pair.id, event));
-				}),
-			)
-			.await
-			.with_context(|| format!("Failed to watch sync pair {}", pair_friendly_name))?;
-		Ok::<_, anyhow::Error>(watch)
-	});
-	// a pair whose watch could not be started is skipped, and its error dropped
-	let watch_handles = futures::future::join_all(watch_handles)
-		.await
-		.into_iter()
-		.flatten()
-		.collect::<Vec<_>>();
+				})
+				.await
+				.with_context(|| format!("Failed to watch sync pair {}", pair_friendly_name))?;
+			// todo: print report
+			Ok::<_, anyhow::Error>(None)
+		} else {
+			let watch_handle = engine
+				.clone()
+				.watch_observed(
+					pair.id,
+					Box::new(move |event| {
+						let _ = events_tx.send((pair.id, event));
+					}),
+				)
+				.await
+				.with_context(|| format!("Failed to watch sync pair {}", pair_friendly_name))?;
+			Ok(Some(watch_handle))
+		}
+	}))
+	.await
+	.into_iter()
+	.filter_map(Result::transpose)
+	.collect::<Result<Vec<_>>>()?;
+	let stop_handles = futures::future::join_all(watch_handles.into_iter().map(|h| h.stop())); // won't be called until awaited
 
-	// receive events and print them, until Ctrl-C
-	let ctrl_c = tokio::signal::ctrl_c();
-	tokio::pin!(ctrl_c);
 	let mut pairs_that_have_had_passes = HashSet::new();
+	let mut ctrlc = crate::CTRLC_TX.subscribe();
+
 	loop {
-		let (pair_id, event) = tokio::select! {
-			event = events_rx.recv() => match event {
-				Some(event) => event,
-				None => break,
-			},
-			result = &mut ctrl_c => {
-				result.context("Failed to listen for Ctrl-C")?;
+		select! {
+			_ = ctrlc.recv() => {
+				ui.print_muted("Stopping...");
+				stop_handles.await;
+				ui.print_muted("Stopped.");
+				events_rx.close();
 				break;
-			}
-		};
-		let pair = pairs.iter().find(|p| p.id == pair_id).with_context(|| {
-			format!("Received an event for unknown sync pair with id {pair_id}")
-		})?;
-		let pair_friendly_name = format_sync_pair(client, pair).await?;
-		let print_event = |msg: &str| {
-			println!(
-				"{} {}: {}",
-				style(format!(
-					"[{}]",
-					chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
-				))
-				.dim(),
-				style(format!("[{}]", pair_friendly_name)).bold(),
-				msg,
-			);
-		};
-		print_event(&format_sync_event(&event));
-		let print_needs_attention = |msg: &str| {
-			print_event(&format!(
-				"{} {}",
-				style("[NEEDS ATTENTION]").yellow().bold(),
-				msg
-			))
-		};
-		let print_action_taken =
-			|msg: &str| print_event(&format!("{} {}", style("[APPROVED]").green().bold(), msg));
+			},
+			event = events_rx.recv() => {
+				let Some((pair_id, event)) = event else { break };
+				// receive and print events
 
-		// remember whether (and check if) this pair is on its first pass
-		// this way, mass deletion approvals and conflict resolutions are only applied
-		// on the first pass, where we can be sure they were intentional
-		if let SyncEvent::PassCompleted { .. } | SyncEvent::PassFailed { .. } = event {
-			pairs_that_have_had_passes.insert(pair_id);
-		}
-		let is_first_pass = !pairs_that_have_had_passes.contains(&pair_id);
-
-		// approve deletions
-		if let SyncEvent::DeletionsHeld {
-			ref count,
-			ref pass_token,
-			..
-		} = event
-		{
-			if is_first_pass && approve_mass_deletions {
-				engine.approve_deletions(pair_id, pass_token).await;
-				print_action_taken(&format!("Approved {} deletions", count));
-			} else {
-				print_needs_attention(&format!(
-					"Held back {} deletions. If you wish to execute them, re-run the command with --approve-mass-deletions",
-					count
-				));
-			}
-		}
-
-		// paths the engine leaves alone, which no other event names
-		if let SyncEvent::PassCompleted { ref report } = event {
-			for notice in unsyncable_notices(&report.unsyncable) {
-				print_needs_attention(&notice);
-			}
-		}
-
-		// resolve conflicts
-		if let SyncEvent::Conflict { ref rel_path } = event {
-			if is_first_pass
-				&& let Some((_, resolution)) = conflict_resolutions
-					.iter()
-					.find(|(path, _)| path.starts_with(rel_path))
-			{
-				let trashed_path = engine
-					.resolve_conflict(pair_id, rel_path, *resolution)
-					.await
-					.with_context(|| {
-						format!(
-							"Failed to resolve conflict for {rel_path} in sync pair {}",
-							pair_friendly_name
-						)
-					})?;
-				print_action_taken(&format!(
-					"Conflict resolved for {rel_path}, {}",
-					match resolution {
-						ConflictResolution::KeepLocal => "kept local version",
-						ConflictResolution::KeepRemote => "kept remote version",
-						ConflictResolution::KeepBoth => "kept both versions",
-					}
-				));
-				if let Some(trashed_path) = trashed_path {
-					print_action_taken(&format!(
-						"Conflict resolved for {rel_path}, moved aside to {}",
-						trashed_path.display()
+				let pair = pairs.iter().find(|p| p.id == pair_id).with_context(|| {
+					format!("Received an event for unknown sync pair with id {pair_id}")
+				})?;
+				let pair_friendly_name = format_sync_pair(&client, pair).await?;
+				let mut print_event = |msg: &str| {
+					ui.print(&format!(
+						"{} {}: {}",
+						style(format!(
+							"[{}]",
+							chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
+						))
+						.dim(),
+						style(format!("[{}]", pair_friendly_name)).bold(),
+						msg,
 					));
+				};
+				print_event(&format_sync_event(&event));
+				let needs_attention_tag = style("[NEEDS ATTENTION]").yellow().bold();
+				let approved_tag = style("[APPROVED]").green().bold();
+
+				// remember whether (and check if) this pair is on its first pass
+				// this way, mass deletion approvals and conflict resolutions are only applied
+				// on the first pass, where we can be sure they were intentional
+				if let SyncEvent::PassCompleted { .. } | SyncEvent::PassFailed { .. } = event {
+					pairs_that_have_had_passes.insert(pair_id);
 				}
-			} else {
-				print_needs_attention(&format!(
-					"Conflict detected. To resolve it, re-run the command with --keep-local/--keep-remote/--keep-both \"{}\"",
-					rel_path,
-				));
+				let is_first_pass = !pairs_that_have_had_passes.contains(&pair_id);
+
+				// if --once is set, stop after all have completed
+				if once && pairs_that_have_had_passes.len() == pairs.len() {
+					ui.print_success("All pairs synced.");
+					break;
+				}
+
+				// approve deletions
+				if let SyncEvent::DeletionsHeld {
+					ref count,
+					ref pass_token,
+					..
+				} = event
+				{
+					if is_first_pass && approve_mass_deletions {
+						engine.approve_deletions(pair_id, pass_token).await;
+						print_event(&format!("{} Approved {} deletions", approved_tag, count));
+					} else {
+						print_event(&format!(
+							"{} Held back {} deletions. If you wish to execute them, re-run the command with --approve-mass-deletions",
+							needs_attention_tag, count
+						));
+					}
+				}
+
+				// paths the engine leaves alone, which no other event names
+				if let SyncEvent::PassCompleted { ref report } = event {
+					for notice in unsyncable_notices(&report.unsyncable) {
+						print_event(&format!("{} {}", needs_attention_tag, notice));
+					}
+				}
+
+				// resolve conflicts
+				if let SyncEvent::Conflict { ref rel_path } = event {
+					if is_first_pass
+						&& let Some((_, resolution)) = conflict_resolutions
+							.iter()
+							.find(|(path, _)| path.starts_with(rel_path))
+					{
+						let trashed_path = engine
+							.resolve_conflict(pair_id, rel_path, *resolution)
+							.await
+							.with_context(|| {
+								format!(
+									"Failed to resolve conflict for {rel_path} in sync pair {}",
+									pair_friendly_name
+								)
+							})?;
+						print_event(&format!(
+							"{} Conflict resolved for {rel_path}, {}",
+							approved_tag,
+							match resolution {
+								ConflictResolution::KeepLocal => "kept local version",
+								ConflictResolution::KeepRemote => "kept remote version",
+								ConflictResolution::KeepBoth => "kept both versions",
+							}
+						));
+						if let Some(trashed_path) = trashed_path {
+							print_event(&format!(
+								"{} Conflict resolved for {rel_path}, moved aside to {}",
+								approved_tag,
+								trashed_path.display()
+							));
+						}
+					} else {
+						print_event(&format!(
+							"{} Conflict detected. To resolve it, re-run the command with --keep-local/--keep-remote/--keep-both \"{}\"",
+							needs_attention_tag,
+							rel_path,
+						));
+					}
+				}
 			}
 		}
 	}
 
-	// waits for each pair's pass in flight, so it finishes and releases the drive lock
-	futures::future::join_all(watch_handles.into_iter().map(|watch| watch.stop())).await;
 	Ok(())
 }
 
