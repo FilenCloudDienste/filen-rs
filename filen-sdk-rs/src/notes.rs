@@ -227,6 +227,16 @@ impl Note {
 		self.preview.as_deref()
 	}
 
+	/// When the note was created.
+	pub fn created(&self) -> DateTime<Utc> {
+		self.created_timestamp
+	}
+
+	/// When the note was last edited, as of the last time it was listed or written.
+	pub fn edited(&self) -> DateTime<Utc> {
+		self.edited_timestamp
+	}
+
 	pub fn tags(&self) -> &[NoteTag] {
 		&self.tags
 	}
