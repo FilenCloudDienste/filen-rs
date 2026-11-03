@@ -177,3 +177,148 @@ async fn an_unsupported_proxy_is_refused_without_connecting() {
 		assert!(err.to_string().contains("only http"), "{proxy}: {err}");
 	}
 }
+
+/// A verifier that answers `verify_server_cert` once `release` delivers, or fails after 5 s, and
+/// counts the calls.
+#[derive(Debug)]
+struct GatedVerifier {
+	release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+	calls: std::sync::atomic::AtomicUsize,
+}
+
+impl GatedVerifier {
+	fn new() -> (Self, std::sync::mpsc::Sender<()>) {
+		let (release, gate) = std::sync::mpsc::channel();
+		let verifier = Self {
+			release: std::sync::Mutex::new(gate),
+			calls: std::sync::atomic::AtomicUsize::new(0),
+		};
+		(verifier, release)
+	}
+
+	fn calls(&self) -> usize {
+		self.calls.load(std::sync::atomic::Ordering::SeqCst)
+	}
+}
+
+impl ServerCertVerifier for GatedVerifier {
+	fn verify_server_cert(
+		&self,
+		end_entity: &CertificateDer<'_>,
+		_: &[CertificateDer<'_>],
+		server_name: &ServerName<'_>,
+		_: &[u8],
+		_: UnixTime,
+	) -> Result<ServerCertVerified, rustls::Error> {
+		self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+		assert_eq!(end_entity.as_ref(), [1, 2, 3]);
+		assert_eq!(server_name.to_str(), "filen.io");
+		self.release
+			.lock()
+			.unwrap()
+			.recv_timeout(Duration::from_secs(5))
+			.map(|()| ServerCertVerified::assertion())
+			.map_err(|_| rustls::Error::General("the check was never released".into()))
+	}
+
+	fn verify_tls12_signature(
+		&self,
+		_: &[u8],
+		_: &CertificateDer<'_>,
+		_: &DigitallySignedStruct,
+	) -> Result<HandshakeSignatureValid, rustls::Error> {
+		unreachable!()
+	}
+
+	fn verify_tls13_signature(
+		&self,
+		_: &[u8],
+		_: &CertificateDer<'_>,
+		_: &DigitallySignedStruct,
+	) -> Result<HandshakeSignatureValid, rustls::Error> {
+		unreachable!()
+	}
+
+	fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+		vec![SignatureScheme::ED25519]
+	}
+
+	fn requires_raw_public_keys(&self) -> bool {
+		true
+	}
+}
+
+fn verify(verifier: &OffloadingVerifier<GatedVerifier>) -> Result<(), rustls::Error> {
+	verifier
+		.verify_server_cert(
+			&CertificateDer::from(vec![1, 2, 3]),
+			&[],
+			&ServerName::try_from("filen.io").unwrap(),
+			&[],
+			UnixTime::now(),
+		)
+		.map(|_| ())
+}
+
+#[test]
+fn the_offloading_verifier_delegates() {
+	let (inner, release) = GatedVerifier::new();
+	let verifier = OffloadingVerifier(inner);
+	assert_eq!(
+		verifier.supported_verify_schemes(),
+		vec![SignatureScheme::ED25519]
+	);
+	assert!(verifier.requires_raw_public_keys());
+	assert!(verifier.root_hint_subjects().is_none());
+
+	// Outside a runtime the check runs inline.
+	release.send(()).unwrap();
+	verify(&verifier).unwrap();
+
+	// So it does on a current-thread runtime, where `block_in_place` would panic.
+	release.send(()).unwrap();
+	tokio::runtime::Builder::new_current_thread()
+		.build()
+		.unwrap()
+		.block_on(async { verify(&verifier) })
+		.unwrap();
+
+	// A failed check is passed on.
+	assert!(verify(&verifier).is_err());
+	assert_eq!(verifier.0.calls(), 3);
+}
+
+#[test]
+fn a_blocked_check_does_not_stall_the_runtime() {
+	// One worker: a check blocking it inline would starve the task that releases the check.
+	let runtime = tokio::runtime::Builder::new_multi_thread()
+		.worker_threads(1)
+		.build()
+		.unwrap();
+	let (inner, release) = GatedVerifier::new();
+	let verifier = Arc::new(OffloadingVerifier(inner));
+	runtime.block_on(async move {
+		let check = tokio::spawn({
+			let verifier = verifier.clone();
+			async move { verify(&verifier) }
+		});
+		// Lets the check start and block the worker first.
+		while verifier.0.calls() == 0 {
+			tokio::task::yield_now().await;
+		}
+		tokio::spawn(async move { release.send(()).unwrap() })
+			.await
+			.unwrap();
+		check
+			.await
+			.unwrap()
+			.expect("the check must be released while it blocks");
+	});
+}
+
+#[test]
+fn platform_tls_offloads_the_check() {
+	if let Some(config) = platform_tls_config() {
+		assert!(format!("{config:?}").contains("OffloadingVerifier"));
+	}
+}

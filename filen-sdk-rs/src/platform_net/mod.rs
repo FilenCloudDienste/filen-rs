@@ -14,8 +14,13 @@ use hyper_util::client::{
 	legacy::connect::{HttpConnector, proxy::Tunnel},
 	proxy::matcher::{Intercept, Matcher},
 };
-use rustls::crypto::CryptoProvider;
-use rustls_platform_verifier::BuilderVerifierExt;
+use rustls::{
+	DigitallySignedStruct, DistinguishedName, SignatureScheme,
+	client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
+	crypto::CryptoProvider,
+	pki_types::{CertificateDer, ServerName, UnixTime},
+};
+use rustls_platform_verifier::Verifier;
 use tokio::net::TcpStream;
 use tokio_tungstenite::{
 	Connector, MaybeTlsStream, WebSocketStream, tungstenite::client::IntoClientRequest,
@@ -39,7 +44,12 @@ pub(crate) fn platform_tls_config() -> Option<rustls::ClientConfig> {
 		.unwrap_or_else(|| Arc::new(rustls::crypto::ring::default_provider()));
 	let built = rustls::ClientConfig::builder_with_provider(provider)
 		.with_safe_default_protocol_versions()
-		.and_then(|builder| builder.with_platform_verifier());
+		.and_then(|builder| {
+			let verifier = Verifier::new(builder.crypto_provider().clone())?;
+			Ok(builder
+				.dangerous()
+				.with_custom_certificate_verifier(Arc::new(OffloadingVerifier(verifier))))
+		});
 	match built {
 		Ok(builder) => {
 			let mut config = builder.with_no_client_auth();
@@ -52,6 +62,65 @@ pub(crate) fn platform_tls_config() -> Option<rustls::ClientConfig> {
 			);
 			None
 		}
+	}
+}
+
+/// Runs the certificate check off the async runtime's workers. The OS's check is a blocking
+/// call (`SecTrustEvaluateWithError` on macOS, `CertGetCertificateChain` on Windows) that may
+/// fetch OCSP/CRL responses, for up to 10 s on Windows and with no limit on macOS, and rustls
+/// makes it from inside the TLS stream's poll. On a multi-thread runtime `block_in_place` hands
+/// the worker's other tasks to another thread for that time; elsewhere (no runtime, or a
+/// current-thread one, where it would panic) the check runs inline, as before.
+#[derive(Debug)]
+struct OffloadingVerifier<V>(V);
+
+impl<V: ServerCertVerifier> ServerCertVerifier for OffloadingVerifier<V> {
+	fn verify_server_cert(
+		&self,
+		end_entity: &CertificateDer<'_>,
+		intermediates: &[CertificateDer<'_>],
+		server_name: &ServerName<'_>,
+		ocsp_response: &[u8],
+		now: UnixTime,
+	) -> Result<ServerCertVerified, rustls::Error> {
+		let verify = || {
+			self.0
+				.verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)
+		};
+		match tokio::runtime::Handle::try_current().map(|handle| handle.runtime_flavor()) {
+			Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(verify),
+			_ => verify(),
+		}
+	}
+
+	fn verify_tls12_signature(
+		&self,
+		message: &[u8],
+		cert: &CertificateDer<'_>,
+		dss: &DigitallySignedStruct,
+	) -> Result<HandshakeSignatureValid, rustls::Error> {
+		self.0.verify_tls12_signature(message, cert, dss)
+	}
+
+	fn verify_tls13_signature(
+		&self,
+		message: &[u8],
+		cert: &CertificateDer<'_>,
+		dss: &DigitallySignedStruct,
+	) -> Result<HandshakeSignatureValid, rustls::Error> {
+		self.0.verify_tls13_signature(message, cert, dss)
+	}
+
+	fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+		self.0.supported_verify_schemes()
+	}
+
+	fn requires_raw_public_keys(&self) -> bool {
+		self.0.requires_raw_public_keys()
+	}
+
+	fn root_hint_subjects(&self) -> Option<&[DistinguishedName]> {
+		self.0.root_hint_subjects()
 	}
 }
 
