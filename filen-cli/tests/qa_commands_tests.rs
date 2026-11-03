@@ -1,6 +1,39 @@
-//! Commands no other test runs: `export-api-key`, `list-recents` and `view-html-docs`.
+//! Commands no other test runs (`export-api-key`, `list-recents`, `view-html-docs`), and paths
+//! with spaces in them from the command line and from piped REPL commands.
 //!
 //! `export-auth-config` is covered in `auth_tests`, and `logout` in `output_tests`.
+
+use std::{
+	io::Write as _,
+	process::{Command, Output, Stdio},
+};
+
+/// Runs the CLI on `script` piped into it, with a fresh config directory and none of the
+/// credentials of whoever runs the test.
+fn run_script(args: &[&str], script: &str) -> Output {
+	let config_dir = assert_fs::TempDir::new().unwrap();
+	let mut cli = Command::new(assert_cmd::cargo::cargo_bin!())
+		.env("FILEN_CLI_TESTING_DISABLE_KEYRING", "1")
+		.env("FILEN_CLI_TESTING_DISABLE_AUTODETECTED_AUTH_CONFIG", "1")
+		.env_remove("FILEN_CLI_EMAIL")
+		.env_remove("FILEN_CLI_PASSWORD")
+		.env_remove("FILEN_CLI_2FA_CODE")
+		.arg("--config-dir")
+		.arg(config_dir.path())
+		.arg("--skip-update")
+		.args(args)
+		.stdin(Stdio::piped())
+		.stdout(Stdio::piped())
+		.stderr(Stdio::piped())
+		.spawn()
+		.unwrap();
+	cli.stdin
+		.take()
+		.unwrap()
+		.write_all(script.as_bytes())
+		.unwrap();
+	cli.wait_with_output().unwrap()
+}
 
 /// Needs no account.
 mod offline {
@@ -104,8 +137,11 @@ mod live {
 	use std::time::{Duration, Instant};
 
 	use filen_macros::shared_test_runtime;
-	use filen_sdk_rs::fs::HasName as _;
+	use filen_sdk_rs::fs::{HasName as _, HasUUID as _, categories::NonRootFileType};
+	use rand::TryRngCore as _;
 	use test_utils::authenticated_cli_with_args;
+
+	use super::run_script;
 
 	/// How long the server may take to list a new upload in the recents.
 	const RECENTS_DEADLINE: Duration = Duration::from_secs(120);
@@ -181,6 +217,102 @@ mod live {
 				.any(|item| item["path"].as_str() == Some(path.as_str())
 					&& item["type"].as_str() == Some("file")),
 			"{recents:?}"
+		);
+	}
+
+	/// `upload`, `download` and `mv` with spaces in the local and the remote paths, passed as one
+	/// argument each, as a shell passes a quoted path.
+	#[shared_test_runtime]
+	async fn transfers_and_mv_take_paths_with_spaces() {
+		let resources = test_utils::RESOURCES.get_resources().await;
+		let client = &resources.client;
+		let test_dir = &resources.dir;
+		let test_dir_name = test_dir.name().unwrap();
+		client.create_dir(&test_dir.into(), "a b").await.unwrap();
+		let local = assert_fs::TempDir::new().unwrap();
+		let source_dir = local.path().join("local source");
+		let download_dir = local.path().join("local download");
+		std::fs::create_dir(&source_dir).unwrap();
+		std::fs::create_dir(&download_dir).unwrap();
+		let mut contents = vec![0u8; 4096];
+		rand::rng().try_fill_bytes(&mut contents).unwrap();
+		let source = source_dir.join("x y.txt");
+		std::fs::write(&source, &contents).unwrap();
+		let remote_dir = format!("{test_dir_name}/a b");
+
+		authenticated_cli_with_args!("upload", source.to_str().unwrap(), &remote_dir).success();
+		authenticated_cli_with_args!(
+			"download",
+			&format!("{remote_dir}/x y.txt"),
+			download_dir.to_str().unwrap()
+		)
+		.success();
+		assert_eq!(
+			std::fs::read(download_dir.join("x y.txt")).unwrap(),
+			contents
+		);
+
+		authenticated_cli_with_args!(
+			"mv",
+			&format!("{remote_dir}/x y.txt"),
+			&format!("{remote_dir}/z w.txt")
+		)
+		.success();
+		assert!(matches!(
+			client
+				.find_item_at_path(&format!("{remote_dir}/z w.txt"))
+				.await
+				.unwrap(),
+			Some(NonRootFileType::File(_))
+		));
+		assert!(
+			client
+				.find_item_at_path(&format!("{remote_dir}/x y.txt"))
+				.await
+				.unwrap()
+				.is_none()
+		);
+	}
+
+	/// `cd` and `mv` read quoted paths with spaces in commands piped into the CLI, in either kind
+	/// of quotes.
+	#[shared_test_runtime]
+	async fn piped_commands_take_quoted_paths_with_spaces() {
+		let resources = test_utils::RESOURCES.get_resources().await;
+		let client = &resources.client;
+		let test_dir = &resources.dir;
+		let dir = client
+			.create_dir(&test_dir.into(), "dir with spaces")
+			.await
+			.unwrap();
+		let file = client.make_file_builder("x y.txt", dir.uuid()).unwrap();
+		client.upload_file(file, b"content").await.unwrap();
+		let remote_dir = format!("/{}/dir with spaces", test_dir.name().unwrap());
+		let (_auth_config_dir, auth_config) = test_utils::cli::prepare_cli_auth_config().await;
+
+		let output = run_script(
+			&["--auth-config-path", auth_config.to_str().unwrap()],
+			&format!("cd \"{remote_dir}\"\nls\nmv 'x y.txt' \"z w.txt\"\n"),
+		);
+
+		let stdout = String::from_utf8_lossy(&output.stdout);
+		let stderr = String::from_utf8_lossy(&output.stderr);
+		assert_eq!(output.status.code(), Some(0), "{stdout}\n{stderr}");
+		// `ls` ran in the directory `cd` changed to
+		assert!(stdout.contains("x y.txt"), "{stdout}");
+		assert!(matches!(
+			client
+				.find_item_at_path(&format!("{remote_dir}/z w.txt"))
+				.await
+				.unwrap(),
+			Some(NonRootFileType::File(_))
+		));
+		assert!(
+			client
+				.find_item_at_path(&format!("{remote_dir}/x y.txt"))
+				.await
+				.unwrap()
+				.is_none()
 		);
 	}
 }
