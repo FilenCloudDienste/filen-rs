@@ -285,7 +285,7 @@ async fn edit_or_delete_link<I: LinkableItem>(
 			Ok(())
 		}
 		Some(PublicLinkOperation::Edit) => {
-			let Some(settings) = prompt_link_settings(ui)? else {
+			let Some(settings) = prompt_link_settings(ui, I::current_settings(&link))? else {
 				return Ok(());
 			};
 			I::apply_settings(&mut link, settings);
@@ -338,7 +338,7 @@ fn new_link_settings(ui: &mut UI, path: &str) -> Result<Option<LinkSettings>> {
 	ui.ensure_can_prompt(EXPIRATION_PROMPT).with_context(|| {
 		format!("No public link for {path}, and creating one asks for its settings")
 	})?;
-	prompt_link_settings(ui)
+	prompt_link_settings(ui, NEW_LINK_SETTINGS)
 }
 
 async fn save_link<I: LinkableItem>(
@@ -404,6 +404,8 @@ impl LinkableItem for RemoteFile {
 	fn apply_settings(link: &mut FilePublicLink, settings: LinkSettings) {
 		link.set_expiration(settings.expiration);
 		match settings.password {
+			// a password the server reports is resent as its hash, so keeping it needs no call
+			PasswordChange::Keep => {}
 			PasswordChange::Clear => link.clear_password(),
 			PasswordChange::Set(password) => link.set_password(password),
 		}
@@ -447,6 +449,8 @@ impl LinkableItem for RemoteDirectory {
 	fn apply_settings(link: &mut DirPublicLinkRW, settings: LinkSettings) {
 		link.set_expiration(settings.expiration);
 		match settings.password {
+			// a password the server reports is resent as its hash, so keeping it needs no call
+			PasswordChange::Keep => {}
 			PasswordChange::Clear => link.clear_password(),
 			PasswordChange::Set(password) => link.set_password(password),
 		}
@@ -497,13 +501,20 @@ fn expiration_label(expiration: PublicLinkExpiration) -> &'static str {
 	}
 }
 
-/// A link's settings, as the link table shows them.
+/// A link's settings, as the link table shows them and the prompts start from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CurrentLinkSettings {
 	expiration: PublicLinkExpiration,
 	has_password: bool,
 	downloadable: bool,
 }
+
+/// The settings a new link is created with, which the SDK gives file and directory links alike.
+const NEW_LINK_SETTINGS: CurrentLinkSettings = CurrentLinkSettings {
+	expiration: PublicLinkExpiration::Never,
+	has_password: false,
+	downloadable: true,
+};
 
 /// The settings chosen in the prompts, to apply to a link.
 #[derive(Debug, PartialEq, Eq)]
@@ -516,41 +527,65 @@ struct LinkSettings {
 /// What the password prompt's answer does to the link's password.
 #[derive(Debug, PartialEq, Eq)]
 enum PasswordChange {
+	Keep,
 	Clear,
 	Set(String),
 }
 
+/// The password prompt for a link with a password, which an empty answer keeps.
+const CHANGE_PASSWORD_PROMPT: &str = "Password (empty keeps the current one, '-' removes it):";
+
+/// The password prompt for a link without a password, which an empty answer leaves without one.
+const NEW_PASSWORD_PROMPT: &str = "Password (leave empty for no password):";
+
 impl PasswordChange {
-	fn from_answer(answer: String) -> Self {
-		if answer.is_empty() {
-			PasswordChange::Clear
-		} else {
-			PasswordChange::Set(answer)
+	/// The change the answer to the password prompt asks for. An empty answer keeps the link's
+	/// password, or its lack of one, and `-` removes a password.
+	fn from_answer(answer: String, has_password: bool) -> Self {
+		match answer.as_str() {
+			"" => PasswordChange::Keep,
+			"-" if has_password => PasswordChange::Clear,
+			_ => PasswordChange::Set(answer),
 		}
 	}
 }
 
-/// Asks for a link's settings, or `None` when a prompt was cancelled.
-fn prompt_link_settings(ui: &mut UI) -> Result<Option<LinkSettings>> {
+/// Asks for a link's settings, starting from `current`, or `None` when a prompt was cancelled.
+fn prompt_link_settings(ui: &mut UI, current: CurrentLinkSettings) -> Result<Option<LinkSettings>> {
 	let expiration_choices =
 		EXPIRATIONS.map(|expiration| (expiration_label(expiration), expiration));
-	let Some(expiration) = ui.prompt_choice(
-		EXPIRATION_PROMPT,
-		&expiration_choices,
-		PublicLinkExpiration::Never,
-	)?
+	let Some(expiration) =
+		ui.prompt_choice(EXPIRATION_PROMPT, &expiration_choices, current.expiration)?
 	else {
 		return Ok(None);
 	};
-	let password =
-		PasswordChange::from_answer(ui.prompt("Password (leave empty for no password):")?);
-	// a setting, which --yes does not choose
-	let downloadable = ui.prompt_yes_no("Enable download?", false)?;
+	let password_prompt = if current.has_password {
+		CHANGE_PASSWORD_PROMPT
+	} else {
+		NEW_PASSWORD_PROMPT
+	};
+	let password = PasswordChange::from_answer(ui.prompt(password_prompt)?, current.has_password);
+	let downloadable = prompt_downloadable(ui, current.downloadable)?;
 	Ok(Some(LinkSettings {
 		expiration,
 		password,
 		downloadable,
 	}))
+}
+
+/// The question whether the link's item can be downloaded.
+const DOWNLOAD_PROMPT: &str = "Enable download?";
+
+/// Asks whether the link's item can be downloaded, for a link that is downloadable or not as
+/// `downloadable` says. `--yes` answers yes, as it answers every yes/no question, and says so on
+/// stderr when that turns downloads on for a link that had them off: nothing else the command
+/// prints shows that the link now gives its item away.
+fn prompt_downloadable(ui: &mut UI, downloadable: bool) -> Result<bool> {
+	let answer = ui.prompt_confirm(DOWNLOAD_PROMPT, downloadable)?;
+	if answer && !downloadable && ui.assumes_yes() {
+		ui.print_muted_to_stderr(&format!("{DOWNLOAD_PROMPT} Yes (--yes)"));
+	}
+	Ok(answer)
 }
 
 /// Prints the item's name, then its link's settings and URL.
@@ -762,6 +797,46 @@ mod tests {
 	}
 
 	#[test]
+	fn an_empty_password_answer_keeps_an_existing_password() {
+		assert_eq!(
+			PasswordChange::from_answer(String::new(), true),
+			PasswordChange::Keep
+		);
+	}
+
+	#[test]
+	fn an_empty_password_answer_leaves_a_link_without_a_password() {
+		assert_eq!(
+			PasswordChange::from_answer(String::new(), false),
+			PasswordChange::Keep
+		);
+	}
+
+	#[test]
+	fn a_dash_removes_an_existing_password() {
+		assert_eq!(
+			PasswordChange::from_answer("-".to_owned(), true),
+			PasswordChange::Clear
+		);
+	}
+
+	#[test]
+	fn a_dash_is_the_password_of_a_link_without_one() {
+		assert_eq!(
+			PasswordChange::from_answer("-".to_owned(), false),
+			PasswordChange::Set("-".to_owned())
+		);
+	}
+
+	#[test]
+	fn any_other_password_answer_sets_that_password() {
+		assert_eq!(
+			PasswordChange::from_answer("hunter2".to_owned(), true),
+			PasswordChange::Set("hunter2".to_owned())
+		);
+	}
+
+	#[test]
 	fn a_link_has_a_password_the_server_reports() {
 		let hash = LinkHashedPassword(Cow::Borrowed("0123456789abcdef"));
 		assert!(has_password(&PasswordState::Hashed(hash)));
@@ -798,6 +873,29 @@ mod tests {
 		let mut ui = printed.ui();
 		ui.disable_prompts();
 		assert_eq!(prompt_link_operation(&mut ui).unwrap(), None);
+		assert_eq!(printed.lines_or_empty(), "");
+	}
+
+	#[test]
+	fn yes_turning_downloads_on_says_so() {
+		let printed = Printed::default();
+		let mut ui = printed.ui();
+		ui.disable_prompts();
+		ui.set_assume_yes(true);
+		assert!(prompt_downloadable(&mut ui, false).unwrap());
+		assert_eq!(
+			console::strip_ansi_codes(&printed.lines()),
+			"Enable download? Yes (--yes)"
+		);
+	}
+
+	#[test]
+	fn yes_keeping_downloads_on_prints_nothing() {
+		let printed = Printed::default();
+		let mut ui = printed.ui();
+		ui.disable_prompts();
+		ui.set_assume_yes(true);
+		assert!(prompt_downloadable(&mut ui, true).unwrap());
 		assert_eq!(printed.lines_or_empty(), "");
 	}
 

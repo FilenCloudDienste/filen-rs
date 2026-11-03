@@ -15,8 +15,13 @@
 //! A command asks at the terminal for what it needs and was not given, such as a password or a
 //! confirmation. When stdin is not a terminal, as with `filen rm -p file < list` or commands piped
 //! in, it asks at the controlling terminal instead (`/dev/tty`, or the console on Windows), as git
-//! and ssh do. `--yes` answers confirmations without asking, and `--no-input` never asks. A question that cannot be asked, with `--no-input` or without any terminal, fails the
-//! command with exit code 2, naming the option that answers it instead where there is one.
+//! and ssh do. `--yes` answers every yes/no question with yes without asking, from confirmations
+//! such as `rm -p`'s to "Enable download?", "Keep me logged in?" and the offer of an update, but
+//! not what `sync` asks about deletions it held back (see `help sync-deletions-and-conflicts`).
+//! Questions that ask for a value, such as a password or a choice from a list, still need a
+//! terminal or the option that gives it. `--no-input` never asks. A question that cannot be asked,
+//! with `--no-input` or without any terminal, fails the command with exit code 2, naming the option
+//! that answers it instead where there is one.
 //!
 //! Options can go before or after the command (`filen --json ls` or `filen ls --json`),
 //! except for `--password` and `--two-factor-code`, which go before it. After `filen rclone`,
@@ -193,7 +198,7 @@ pub(crate) struct CliArgs {
 	#[arg(long, global = true)]
 	json: bool,
 
-	/// Answer yes to every confirmation prompt, such as `rm -p`'s
+	/// Answer yes to every yes/no question, such as `rm -p`'s confirmation
 	#[arg(short, long, global = true)]
 	yes: bool,
 

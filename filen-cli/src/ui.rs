@@ -296,6 +296,11 @@ impl UI {
 		self.assume_yes = assume_yes;
 	}
 
+	/// Whether `--yes` answers every confirmation, for a command that confirms in its own way.
+	pub(crate) fn assumes_yes(&self) -> bool {
+		self.assume_yes
+	}
+
 	pub(crate) fn is_quiet(&self) -> bool {
 		self.quiet
 	}
@@ -742,9 +747,9 @@ impl UI {
 		)))
 	}
 
-	/// Ask the user to confirm what the command is about to do. `--yes` answers yes without
-	/// asking; without it, the confirmation fails when it cannot be asked
-	/// ([`UI::ensure_can_prompt`]), saying to pass `--yes`.
+	/// Ask the user a yes/no question, such as a confirmation of what the command is about to do.
+	/// `--yes` answers yes without asking, whatever the question; without it, the question fails
+	/// when it cannot be asked ([`UI::ensure_can_prompt`]), saying to pass `--yes`.
 	pub(crate) fn prompt_confirm(&mut self, msg: &str, default: bool) -> Result<bool> {
 		info!("[PROMPT] prompt_confirm with message: {}", msg);
 		self.ensure_can_confirm(msg)?;
@@ -763,14 +768,6 @@ impl UI {
 			return Ok(());
 		}
 		self.ensure_prompt_input(msg, " Pass --yes to answer yes.")
-	}
-
-	/// Ask the user a yes/no question that is not a confirmation, such as a setting to choose,
-	/// which `--yes` does not answer.
-	pub(crate) fn prompt_yes_no(&mut self, msg: &str, default: bool) -> Result<bool> {
-		info!("[PROMPT] prompt_yes_no with message: {}", msg);
-		self.ensure_can_prompt(msg)?;
-		self.ask_yes_no(msg, default)
 	}
 
 	fn ask_yes_no(&mut self, msg: &str, default: bool) -> Result<bool> {
@@ -1833,15 +1830,11 @@ mod tests {
 	}
 
 	#[test]
-	fn yes_does_not_answer_a_question_that_is_not_a_confirmation() {
+	fn yes_answers_a_question_about_a_setting_too() {
 		let mut ui = Printed::default().ui();
 		ui.set_assume_yes(true);
 
-		let err = ui.prompt_yes_no("Enable download?", false).unwrap_err();
-		assert_eq!(
-			err.to_string(),
-			"Cannot ask \"Enable download?\": stdin is not a terminal."
-		);
+		assert!(ui.prompt_confirm("Enable download?", false).unwrap());
 	}
 
 	#[test]
