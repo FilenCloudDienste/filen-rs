@@ -30,7 +30,8 @@
 //! and `!/.filenignore`: every dot file and dot directory is left out of the sync, but the
 //! `.filenignore` itself. A leading `~` in a local path is the home directory, and a
 //! relative one is relative to the file's directory. The TypeScript CLI's `disableLocalTrash` key
-//! is read but only gives a warning, since the local trash cannot be turned off.
+//! is read but only gives a warning, since the local trash cannot be turned off. Any other key is
+//! an error.
 //!
 //! Before a sync pair is synced, the rules of its sync pairs file that the `.filenignore`
 //! at its local root lacks are added to the end of that file, which is created if there is none.

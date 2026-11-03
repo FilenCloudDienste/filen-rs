@@ -545,14 +545,15 @@ fn sync_pair_entries(content: &str) -> serde_yaml::Result<Vec<SyncPairEntry>> {
 
 /// A sync pairs file that lists its sync pairs under `syncPairs`.
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SyncPairsFile {
 	sync_pairs: Vec<SyncPairEntry>,
 }
 
-/// A sync pair in a sync pairs file.
+/// A sync pair in a sync pairs file. A key it does not know is an error rather than ignored: a
+/// misspelt key would otherwise leave the pair syncing in a way the file does not say.
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SyncPairEntry {
 	local: String,
 	remote: String,
@@ -1379,6 +1380,28 @@ mod tests {
 			error.to_string(),
 			format!(
 				"Failed to parse sync pairs file {}: syncPairs[0]: duplicate field `mode` at line 2 column 5",
+				path.display()
+			)
+		);
+	}
+
+	/// A key the file format does not have, misspelt or not, is reported rather than ignored.
+	#[test]
+	fn a_sync_pair_with_an_unknown_key_is_a_failure() {
+		let (_dir, path) = sync_pairs_file(
+			"pairs.yaml",
+			"syncPairs:\n  - local: /l\n    remote: /r\n    mdoe: cloudBackup\n",
+		);
+
+		let error = read_sync_pairs_file(&path).unwrap_err();
+
+		assert_eq!(exit_code(&error), 1);
+		assert_eq!(
+			error.to_string(),
+			format!(
+				"Failed to parse sync pairs file {}: syncPairs[0]: unknown field `mdoe`, expected \
+				 one of `local`, `remote`, `mode`, `syncMode`, `alias`, `ignore`, \
+				 `excludeDotFiles`, `disableLocalTrash` at line 4 column 5",
 				path.display()
 			)
 		);
