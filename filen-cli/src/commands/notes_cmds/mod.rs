@@ -5,7 +5,7 @@
 //! `uuid`, `title` (`null` when it cannot be decrypted), `type`, `trashed`, `archived`, `pinned`,
 //! `favorited`, `created` and `edited`.
 //!
-//! The commands that work on one note (`note-cat`, `note-rm`) take its exact title or
+//! The commands that work on one note (`note-cat`, `note-edit`, `note-rm`) take its exact title or
 //! its UUID. When several notes have that title, they fail and list their UUIDs, so that you can
 //! pass the one you mean.
 //!
@@ -15,7 +15,7 @@
 //! `note-new [title]` creates a note, titled with the current time when no title is given. `--type`
 //! sets its type (`text`, the default, `md`, `code`, `rich` or `checklist`). Its content is read
 //! from `--content-file <file>` (`-` for stdin), or from stdin when stdin is not a terminal; a
-//! checklist's content is a Markdown task list, as `note-cat` prints it. It prints the new note's
+//! checklist's content is a Markdown task list, as `note-edit` takes it. It prints the new note's
 //! UUID (with `--json`, the note as `notes --json` shows it).
 //!
 //! `note-rm <note>` moves a note to the trash. `--permanent` deletes it for good instead, after
@@ -23,6 +23,7 @@
 
 mod checklist;
 mod content;
+mod edit;
 mod export;
 
 use std::{
@@ -72,6 +73,15 @@ pub(crate) enum NotesCommands {
 		#[arg(long, value_name = "FILE", add = ArgValueCompleter::new(PathCompleter::file()))]
 		content_file: Option<PathBuf>,
 	},
+	/// Edit a note's content in an editor ($VISUAL, $EDITOR or vi)
+	NoteEdit {
+		/// The note's exact title, or its UUID
+		note: String,
+		/// Replace the content with this file's, or with stdin's for "-", instead of opening an
+		/// editor
+		#[arg(long, value_name = "FILE", add = ArgValueCompleter::new(PathCompleter::file()))]
+		content_file: Option<PathBuf>,
+	},
 	/// Move a note to the trash, or delete it permanently
 	NoteRm {
 		/// The note's exact title, or its UUID
@@ -102,6 +112,8 @@ pub(crate) const DOCS: &[DocElement] = &[
 	DocElement::CommandHelp("notes"),
 	DocElement::CommandHelp("note-cat"),
 	DocElement::CommandHelp("note-new"),
+	DocElement::DocFragment("notes-edit"),
+	DocElement::CommandHelp("note-edit"),
 	DocElement::CommandHelp("note-rm"),
 	DocElement::DocFragment("notes-export"),
 	DocElement::CommandHelp("export-notes"),
@@ -118,6 +130,9 @@ impl NotesCommands {
 				note_type,
 				content_file,
 			} => new_note(ui, client, title, note_type.into(), content_file.as_deref()).await?,
+			Self::NoteEdit { note, content_file } => {
+				edit::edit_note(ui, client, &note, content_file.as_deref()).await?
+			}
 			Self::NoteRm { note, permanent } => remove_note(ui, client, &note, permanent).await?,
 			Self::ExportNotes { path } => export::export_notes(ui, client, path.as_deref()).await?,
 		}
