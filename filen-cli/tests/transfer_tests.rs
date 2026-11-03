@@ -145,3 +145,27 @@ async fn downloading_to_a_new_path_in_a_missing_directory_renames_the_file() {
 
 	assert_eq!(std::fs::read(&target).unwrap(), b"contents");
 }
+
+#[shared_test_runtime]
+async fn uploading_a_directory_verbosely_lists_its_files() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let test_dir_name = resources.dir.name().unwrap();
+
+	let local = tempfile::tempdir().unwrap();
+	let source = local.path().join("listed");
+	std::fs::create_dir_all(source.join("nested")).unwrap();
+	std::fs::write(source.join("nested").join("a.txt"), b"contents").unwrap();
+
+	// The test harness always passes -v.
+	let output =
+		authenticated_cli_with_args!("upload", source.to_str().unwrap(), test_dir_name).success();
+
+	let stdout = String::from_utf8_lossy(&output.get_output().stdout);
+	assert!(
+		stdout
+			.lines()
+			.any(|line| line == format!("/{test_dir_name}/listed/nested/a.txt")),
+		"{stdout}"
+	);
+	assert!(stdout.contains("1 file, 8 B in "), "{stdout}");
+}

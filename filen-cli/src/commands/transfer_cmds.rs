@@ -16,7 +16,7 @@
 
 use std::{
 	borrow::Cow,
-	collections::VecDeque,
+	collections::{HashMap, VecDeque},
 	path::{Path, PathBuf},
 	pin::pin,
 	sync::{Arc, Mutex},
@@ -31,7 +31,7 @@ use filen_sdk_rs::{
 	Error, ErrorKind,
 	auth::Client,
 	fs::{
-		HasName as _, HasUUID as _,
+		HasName as _, HasParent as _, HasUUID as _,
 		categories::{DirType, NonRootFileType, NonRootItemType, Normal},
 		file::{FileBuilderOptionalName, traits::HasFileInfo as _},
 		name::ValidatedName,
@@ -42,6 +42,7 @@ use filen_sdk_rs::{
 	},
 	util::MaybeSendCallback,
 };
+use filen_types::fs::{ParentUuid, Uuid};
 use tokio::select;
 
 use crate::{
@@ -158,6 +159,7 @@ pub(crate) async fn upload(
 				&progress,
 				&source,
 				target.name.as_ref(),
+				&target_path,
 				&parent_dir,
 			),
 		)
@@ -569,11 +571,14 @@ async fn upload_file(
 	Ok(())
 }
 
+/// Upload the directory `source` as `name` into `destination_dir`, which makes it the remote
+/// directory at `target_path`.
 async fn upload_directory(
 	client: &Arc<Client>,
 	progress: &TransferProgress,
 	source: &Path,
 	name: &str,
+	target_path: &RemotePath,
 	destination_dir: &DirType<'_, Normal>,
 ) -> Result<()> {
 	// `upload_dir_recursively` uploads the *contents* of `source` into an already existing remote
@@ -587,6 +592,7 @@ async fn upload_directory(
 	let DirType::Dir(target) = target else {
 		return Err(UI::failure(&format!("Cannot upload into: {}", name)));
 	};
+	progress.start_upload_listing(target.uuid(), target_path);
 	progress.start_scan();
 	client
 		.clone()
@@ -692,6 +698,9 @@ struct ProgressState {
 	last_render: Option<Instant>,
 	/// Whether there is a progress line on screen that still needs erasing.
 	line_shown: bool,
+	/// The remote path of each directory a listed upload created, by uuid, to list each uploaded
+	/// file under its path. Empty when files are not listed.
+	upload_dir_paths: HashMap<Uuid, RemotePath>,
 }
 
 impl ProgressState {
@@ -734,6 +743,41 @@ impl ProgressState {
 			self.done_bytes.saturating_sub(bytes_then),
 			now.saturating_duration_since(since),
 		)
+	}
+
+	/// Note the directories an upload created, whose parent was noted before, under their paths.
+	/// A directory is reported no later than the files and directories inside it.
+	fn note_upload_dirs<'a>(
+		&mut self,
+		dirs: impl IntoIterator<Item = (Uuid, &'a ParentUuid, Option<&'a str>)>,
+	) {
+		for (uuid, parent, name) in dirs {
+			if let ParentUuid::Uuid(parent) = parent
+				&& let Some(name) = name
+				&& let Some(parent_path) = self.upload_dir_paths.get(parent)
+			{
+				let path = parent_path.navigate(name);
+				self.upload_dir_paths.insert(uuid, path);
+			}
+		}
+	}
+
+	/// The remote path of an uploaded file, as far as it is known: its name alone when its parent
+	/// was not noted, and its uuid when its name could not be decrypted.
+	fn uploaded_file_path(&self, uuid: Uuid, parent: &ParentUuid, name: Option<&str>) -> String {
+		let Some(name) = name else {
+			return uuid.to_string();
+		};
+		match parent {
+			ParentUuid::Uuid(parent) => match self.upload_dir_paths.get(parent) {
+				Some(parent_path) => parent_path.navigate(name).to_string(),
+				None => name.to_owned(),
+			},
+			ParentUuid::Trash(_)
+			| ParentUuid::Recents
+			| ParentUuid::Favorites
+			| ParentUuid::Links => name.to_owned(),
+		}
 	}
 }
 
@@ -824,7 +868,8 @@ fn transfer_summary(files: u64, bytes: u64, elapsed: Duration) -> String {
 	}
 }
 
-/// Draws a single, redrawn-in-place progress line for one upload or download.
+/// Draws a single, redrawn-in-place progress line for one upload or download, and with `-v` lists
+/// each file a directory transfer moved above it.
 ///
 /// The SDK delivers its progress callbacks from worker threads, so this cannot go through [`UI`]
 /// (which is `&mut`-borrowed by the command) and instead writes to the terminal itself.
@@ -834,6 +879,9 @@ pub(crate) struct TransferProgress {
 	/// Whether the progress line may be drawn at all: never in quiet or JSON mode, and never when
 	/// stdout is redirected, where the redraws would end up in the captured output.
 	enabled: bool,
+	/// Whether to print each file a directory transfer moved, as `-v` asks, unless the output is
+	/// JSON.
+	list_files: bool,
 	started: Instant,
 	state: Mutex<ProgressState>,
 	errors: Mutex<Vec<String>>,
@@ -847,6 +895,7 @@ impl TransferProgress {
 			kind,
 			term,
 			enabled,
+			list_files: ui.is_verbose() && !ui.json,
 			started: Instant::now(),
 			state: Mutex::new(ProgressState::default()),
 			errors: Mutex::new(Vec::new()),
@@ -874,6 +923,17 @@ impl TransferProgress {
 		state.done_files = state.total_files;
 		state.done_bytes = state.total_bytes;
 		self.render(&mut state, true);
+	}
+
+	/// List the files an upload puts into the remote directory `uuid` under `path`.
+	fn start_upload_listing(&self, uuid: Uuid, path: &RemotePath) {
+		if self.list_files {
+			self.state
+				.lock()
+				.unwrap()
+				.upload_dir_paths
+				.insert(uuid, path.clone());
+		}
 	}
 
 	fn start_scan(&self) {
@@ -908,10 +968,14 @@ impl TransferProgress {
 
 	fn advance(&self, files: u64, bytes: u64) {
 		let mut state = self.state.lock().unwrap();
+		self.advance_locked(&mut state, files, bytes);
+	}
+
+	fn advance_locked(&self, state: &mut ProgressState, files: u64, bytes: u64) {
 		state.done_files = state.done_files.saturating_add(files);
 		state.done_bytes = state.done_bytes.saturating_add(bytes);
 		state.sample_speed(Instant::now());
-		self.render(&mut state, false);
+		self.render(state, false);
 	}
 
 	/// The files and bytes transferred so far.
@@ -928,9 +992,27 @@ impl TransferProgress {
 		std::mem::take(&mut self.errors.lock().unwrap())
 	}
 
+	/// Print `lines` above the progress line, erasing it first so that neither tears the other.
+	fn print_above(&self, state: &mut ProgressState, lines: impl IntoIterator<Item = String>) {
+		let mut lines = lines.into_iter().peekable();
+		if lines.peek().is_none() {
+			return;
+		}
+		self.clear_locked(state);
+		for line in lines {
+			// With nowhere left to report a failed write, it is dropped, as in `UI::print`.
+			let _ = self.term.write_line(&line);
+		}
+		self.render(state, true);
+	}
+
 	/// Erase the progress line so the command's own output starts on a clean row.
 	fn clear(&self) {
 		let mut state = self.state.lock().unwrap();
+		self.clear_locked(&mut state);
+	}
+
+	fn clear_locked(&self, state: &mut ProgressState) {
 		if state.line_shown {
 			let _ = self.term.clear_line();
 			let _ = self.term.flush();
@@ -974,11 +1056,24 @@ impl DirUploadCallback for TransferProgress {
 
 	fn on_upload_update(
 		&self,
-		_uploaded_dirs: Vec<RemoteDirectory>,
+		uploaded_dirs: Vec<RemoteDirectory>,
 		uploaded_files: Vec<RemoteFile>,
 		uploaded_bytes: u64,
 	) {
-		self.advance(uploaded_files.len() as u64, uploaded_bytes);
+		let mut state = self.state.lock().unwrap();
+		if self.list_files {
+			state.note_upload_dirs(
+				uploaded_dirs
+					.iter()
+					.map(|dir| (dir.uuid(), dir.parent(), dir.name())),
+			);
+			let paths = uploaded_files
+				.iter()
+				.map(|file| state.uploaded_file_path(file.uuid(), file.parent(), file.name()))
+				.collect::<Vec<_>>();
+			self.print_above(&mut state, paths);
+		}
+		self.advance_locked(&mut state, uploaded_files.len() as u64, uploaded_bytes);
 	}
 
 	fn on_upload_errors(&self, errors: Vec<(PathBuf, Error)>) {
@@ -1011,7 +1106,15 @@ impl DirDownloadCallback<Normal> for TransferProgress {
 		downloaded_files: Vec<(RemoteFile, String)>,
 		downloaded_bytes: u64,
 	) {
-		self.advance(downloaded_files.len() as u64, downloaded_bytes);
+		let mut state = self.state.lock().unwrap();
+		let files = downloaded_files.len() as u64;
+		if self.list_files {
+			self.print_above(
+				&mut state,
+				downloaded_files.into_iter().map(|(_, path)| path),
+			);
+		}
+		self.advance_locked(&mut state, files, downloaded_bytes);
 	}
 
 	fn on_download_errors(&self, errors: Vec<(Error, String, NonRootItemType<'static, Normal>)>) {
@@ -1025,6 +1128,8 @@ mod tests {
 		path::Path,
 		time::{Duration, Instant},
 	};
+
+	use filen_types::fs::{ParentUuid, Uuid};
 
 	use filen_sdk_rs::fs::name::ValidatedName;
 
@@ -1183,6 +1288,34 @@ mod tests {
 		assert_eq!(
 			canceled_message(TransferKind::Download, 2, MIB),
 			"Downloaded 2 files, 1 MiB before canceling"
+		);
+	}
+
+	#[test]
+	fn an_uploaded_file_is_listed_under_its_directorys_path() {
+		let root = Uuid::from_u128(1);
+		let nested = Uuid::from_u128(2);
+		let mut state = ProgressState::default();
+		state
+			.upload_dir_paths
+			.insert(root, RemotePath::new("/backups/notes"));
+		state.note_upload_dirs([(nested, &ParentUuid::Uuid(root), Some("nested"))]);
+		assert_eq!(
+			state.uploaded_file_path(Uuid::from_u128(3), &ParentUuid::Uuid(nested), Some("a.txt")),
+			"/backups/notes/nested/a.txt"
+		);
+	}
+
+	#[test]
+	fn an_uploaded_file_in_an_unknown_directory_is_listed_by_name() {
+		let state = ProgressState::default();
+		assert_eq!(
+			state.uploaded_file_path(
+				Uuid::from_u128(3),
+				&ParentUuid::Uuid(Uuid::from_u128(9)),
+				Some("a.txt")
+			),
+			"a.txt"
 		);
 	}
 

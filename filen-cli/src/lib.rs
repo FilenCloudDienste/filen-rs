@@ -565,6 +565,7 @@ async fn inner_main(ui: &mut ui::UI, arenas_limited: bool) -> Result<Finished> {
 		cli_args.make_output_environment_agnostic_for_replay_testing,
 	);
 	ui.set_assume_yes(command_options.assume_yes);
+	ui.set_verbose(command_options.verbose > 0);
 	for warning in &log_files_warnings {
 		ui.print_warning(warning);
 	}
@@ -902,6 +903,7 @@ impl CommandOptions {
 	fn apply(self, ui: &mut ui::UI, console_log_level: &ConsoleLogLevel) {
 		ui.set_quiet_and_json(self.quiet, self.json);
 		ui.set_assume_yes(self.assume_yes);
+		ui.set_verbose(self.verbose > 0);
 		console_log_level.set(self.log_level());
 	}
 }

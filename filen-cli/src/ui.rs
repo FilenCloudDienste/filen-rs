@@ -217,6 +217,8 @@ pub(crate) struct UI {
 	stdout_is_terminal: bool,
 	/// Whether to output machine-readable JSON where applicable
 	pub(crate) json: bool,
+	/// Whether `-v` asks for more detail, such as each file a transfer moved.
+	verbose: bool,
 	/// Whether to answer yes to every confirmation, as `--yes` asks.
 	assume_yes: bool,
 	prompt_input: PromptInput,
@@ -249,6 +251,7 @@ impl UI {
 			err: Box::new(err),
 			stdout_is_terminal: false,
 			json: false,
+			verbose: false,
 			assume_yes: false,
 			prompt_input: PromptInput::NotATerminal,
 			disable_suggestions: false,
@@ -290,6 +293,16 @@ impl UI {
 
 	pub(crate) fn is_quiet(&self) -> bool {
 		self.quiet
+	}
+
+	/// Sets `-v`, which a REPL line can turn on for its command.
+	pub(crate) fn set_verbose(&mut self, verbose: bool) {
+		self.verbose = verbose;
+	}
+
+	/// Whether `-v` was given and `--quiet`, which overrides it, was not.
+	pub(crate) fn is_verbose(&self) -> bool {
+		self.verbose && !self.quiet
 	}
 
 	/// Whether a person reads the output: stdout is a terminal and the output is not JSON.
