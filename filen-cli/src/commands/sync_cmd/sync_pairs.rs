@@ -276,7 +276,33 @@ fn parse_sync_pair_definition(pair: &str) -> Result<ParsedPair> {
 		},
 		None => (rest, SyncMode::TwoWay),
 	};
-	Ok((PathBuf::from(local), mode, remote.to_owned()))
+	Ok((
+		expand_home(local, dirs::home_dir().as_deref()),
+		mode,
+		remote.to_owned(),
+	))
+}
+
+/// `local` with a leading `~` (alone, or followed by a path separator) replaced by `home`, as a
+/// shell would: the REPL and a sync pairs file get no shell to do it. `~user` is left as it is,
+/// and so is every path when the home directory is unknown.
+fn expand_home(local: &str, home: Option<&Path>) -> PathBuf {
+	let Some(home) = home else {
+		return PathBuf::from(local);
+	};
+	match local.strip_prefix('~') {
+		Some("") => home.to_path_buf(),
+		Some(rest) if rest.starts_with(std::path::is_separator) => {
+			home.join(rest.trim_start_matches(std::path::is_separator))
+		}
+		_ => PathBuf::from(local),
+	}
+}
+
+/// The local root `local` of a pair in a sync pairs file in `base`: a leading `~` expanded to
+/// `home`, then a relative path resolved against `base`.
+fn local_path_in_file(local: &str, base: &Path, home: Option<&Path>) -> PathBuf {
+	base.join(expand_home(local, home))
 }
 
 /// Whether `token`, the part of a sync pair between its last two colons, is meant as a mode: a
@@ -348,6 +374,7 @@ fn read_sync_pairs_file(path: &Path) -> Result<Vec<ParsedPair>> {
 		)));
 	}
 	let base = path.parent().unwrap_or(Path::new(""));
+	let home = dirs::home_dir();
 	file.sync_pairs
 		.into_iter()
 		.map(|entry| {
@@ -361,7 +388,11 @@ fn read_sync_pairs_file(path: &Path) -> Result<Vec<ParsedPair>> {
 					))
 				})?,
 			};
-			Ok((base.join(entry.local), mode, entry.remote))
+			Ok((
+				local_path_in_file(&entry.local, base, home.as_deref()),
+				mode,
+				entry.remote,
+			))
 		})
 		.collect()
 }
@@ -373,10 +404,13 @@ struct SyncPairsFile {
 	sync_pairs: Vec<SyncPairEntry>,
 }
 
+/// A sync pair in a sync pairs file.
 #[derive(Deserialize)]
 struct SyncPairEntry {
-	local: PathBuf,
+	local: String,
 	remote: String,
+	/// `syncMode` is the key the TypeScript CLI's syncPairs.json gives it by.
+	#[serde(alias = "syncMode")]
 	mode: Option<String>,
 }
 
@@ -483,8 +517,9 @@ mod tests {
 	use filen_sdk_rs::sync_engine::{DeleteGuard, PairOverlap, PairRecord, SyncMode};
 
 	use super::{
-		fallback_label, overlap_message, parse_sync_mode_str, parse_sync_pair_definition,
-		parse_sync_pairs, read_sync_pairs_file, records_of, sync_mode_str,
+		expand_home, fallback_label, local_path_in_file, overlap_message, parse_sync_mode_str,
+		parse_sync_pair_definition, parse_sync_pairs, read_sync_pairs_file, records_of,
+		sync_mode_str,
 	};
 	use crate::{
 		error::{CliError, exit_code, find_cli_error},
@@ -756,6 +791,67 @@ mod tests {
 	}
 
 	#[test]
+	fn a_leading_tilde_is_the_home_directory() {
+		let home = Path::new("/home/me");
+
+		assert_eq!(expand_home("~", Some(home)), PathBuf::from("/home/me"));
+		assert_eq!(
+			expand_home("~/docs/notes", Some(home)),
+			PathBuf::from("/home/me/docs/notes")
+		);
+	}
+
+	#[cfg(windows)]
+	#[test]
+	fn a_leading_tilde_before_a_backslash_is_the_home_directory() {
+		assert_eq!(
+			expand_home(r"~\docs", Some(Path::new(r"C:\Users\me"))),
+			PathBuf::from(r"C:\Users\me\docs")
+		);
+	}
+
+	/// `~user` is another user's home, which the CLI does not look up, and `~` inside a name is
+	/// part of it.
+	#[test]
+	fn a_tilde_that_is_not_a_home_directory_is_kept() {
+		let home = Some(Path::new("/home/me"));
+
+		assert_eq!(
+			expand_home("~other/docs", home),
+			PathBuf::from("~other/docs")
+		);
+		assert_eq!(expand_home("docs/~/x", home), PathBuf::from("docs/~/x"));
+		assert_eq!(expand_home("~/docs", None), PathBuf::from("~/docs"));
+	}
+
+	/// The home directory is expanded before a relative path is resolved against the file's
+	/// directory, which would otherwise read `~` as a directory in it.
+	#[test]
+	fn a_tilde_in_a_sync_pairs_file_is_the_home_directory() {
+		let base = Path::new("/etc/filen");
+		let home = Some(Path::new("/home/me"));
+
+		assert_eq!(
+			local_path_in_file("~/docs", base, home),
+			PathBuf::from("/home/me/docs")
+		);
+		assert_eq!(
+			local_path_in_file("docs", base, home),
+			PathBuf::from("/etc/filen/docs")
+		);
+	}
+
+	#[test]
+	fn an_inline_pair_expands_a_leading_tilde() {
+		let home = dirs::home_dir().unwrap();
+
+		assert_eq!(
+			parse_sync_pair_definition("~/docs:/docs").unwrap(),
+			(home.join("docs"), SyncMode::TwoWay, "/docs".to_owned())
+		);
+	}
+
+	#[test]
 	fn a_pair_without_a_mode_syncs_two_way() {
 		assert_eq!(
 			parse_sync_pair_definition("/home/me/docs:/docs").unwrap(),
@@ -853,6 +949,40 @@ mod tests {
 					"photos".to_owned()
 				),
 			]
+		);
+	}
+
+	/// The TypeScript CLI's key for the mode names it too, rather than being passed over for a
+	/// two-way sync.
+	#[test]
+	fn a_sync_pairs_file_can_give_the_mode_as_sync_mode() {
+		let (_dir, path) = sync_pairs_file(
+			"pairs.yaml",
+			"syncPairs:\n  - local: /l\n    remote: /r\n    syncMode: cloudBackup\n",
+		);
+
+		assert_eq!(
+			read_sync_pairs_file(&path).unwrap(),
+			[(PathBuf::from("/l"), SyncMode::RemoteBackup, "/r".to_owned())]
+		);
+	}
+
+	#[test]
+	fn a_sync_pair_with_both_mode_and_sync_mode_is_a_failure() {
+		let (_dir, path) = sync_pairs_file(
+			"pairs.yaml",
+			"syncPairs:\n  - local: /l\n    remote: /r\n    mode: twoWay\n    syncMode: cloudBackup\n",
+		);
+
+		let error = read_sync_pairs_file(&path).unwrap_err();
+
+		assert_eq!(exit_code(&error), 1);
+		assert_eq!(
+			error.to_string(),
+			format!(
+				"Failed to parse sync pairs file {}: syncPairs[0]: duplicate field `mode` at line 2 column 5",
+				path.display()
+			)
 		);
 	}
 
