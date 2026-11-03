@@ -614,6 +614,51 @@ async fn trash_delete_deletes_a_trashed_item_named_by_its_uuid() {
 	client.delete_file_permanently(first).await.unwrap();
 }
 
+#[shared_test_runtime]
+async fn trash_restore_restores_the_trashed_item_it_names() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let _trash_lock = lock_trash(client).await;
+	let test_dir = format!("/{}", resources.dir.name().unwrap());
+	let name = format!("{}.txt", resources.dir.name().unwrap());
+	let file = trashed_file(client, &resources.dir, "a", &name).await;
+
+	authenticated_cli_with_args!("trash-restore", &name)
+		.success()
+		.stdout(predicates::str::contains(format!("Restored file: {name}")));
+
+	assert!(!is_in_trash(client, &file).await);
+	let Some(NonRootFileType::File(restored)) = client
+		.find_item_at_path(&format!("{test_dir}/a/{name}"))
+		.await
+		.unwrap()
+	else {
+		panic!("Expected the restored file at {test_dir}/a/{name}");
+	};
+	assert_eq!(restored.uuid(), file.uuid());
+}
+
+#[shared_test_runtime]
+async fn trash_restore_refuses_a_name_several_trashed_items_share() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let _trash_lock = lock_trash(client).await;
+	let name = format!("{}.txt", resources.dir.name().unwrap());
+	let first = trashed_file(client, &resources.dir, "a", &name).await;
+	let second = trashed_file(client, &resources.dir, "b", &name).await;
+
+	authenticated_cli_with_args!("trash-restore", &name)
+		.failure()
+		.stderr(predicates::str::contains(format!(
+			"2 trashed items are named {name}, so name one by its UUID"
+		)));
+
+	assert!(is_in_trash(client, &first).await);
+	assert!(is_in_trash(client, &second).await);
+	client.delete_file_permanently(first).await.unwrap();
+	client.delete_file_permanently(second).await.unwrap();
+}
+
 #[test]
 fn trash_delete_of_a_named_item_without_yes_asks_for_it_before_logging_in() {
 	let config_dir = assert_fs::TempDir::new().unwrap();

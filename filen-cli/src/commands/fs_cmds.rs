@@ -148,8 +148,12 @@ pub(crate) enum FsCommands {
 	ListRecents,
 	/// List trashed items
 	ListTrash,
-	/// Restore a trashed item interactively
-	TrashRestore,
+	/// Restore a trashed item
+	TrashRestore {
+		/// The trashed item's name, or its UUID when several trashed items share the name
+		/// (default: pick one interactively)
+		item: Option<String>,
+	},
 	/// Permanently delete a trashed item, asking first unless --yes is given
 	TrashDelete {
 		/// The trashed item's name, or its UUID when several trashed items share the name
@@ -253,7 +257,12 @@ impl FsCommands {
 			}
 			Self::ListRecents => list_recents(ui, client).await?,
 			Self::ListTrash => list_trash(ui, client).await?,
-			Self::TrashRestore => select_trash_item(ui, client, TrashAction::Restore).await?,
+			Self::TrashRestore { item: None } => {
+				select_trash_item(ui, client, TrashAction::Restore).await?;
+			}
+			Self::TrashRestore { item: Some(item) } => {
+				restore_named_trash_item(ui, client, &item).await?;
+			}
 			Self::TrashDelete { item: None } => {
 				select_trash_item(ui, client, TrashAction::Delete).await?;
 			}
@@ -1808,6 +1817,18 @@ pub(crate) async fn select_trash_item(
 			delete_trash_item_permanently(ui, client, &name, item).await
 		}
 	}
+}
+
+/// Restores the trashed item that `wanted` names (see [`pick_trash_item`]).
+async fn restore_named_trash_item(
+	ui: &mut UI,
+	client: &mut LazyClient,
+	wanted: &str,
+) -> Result<()> {
+	let client = client.get(ui).await?;
+	let items = list_trash_items(client).await?;
+	let (name, item) = pick_trash_item(items, wanted, TrashItem::uuid_string)?;
+	restore_trash_item(ui, client, &name, item).await
 }
 
 /// Permanently deletes the trashed item that `wanted` names (see [`pick_trash_item`]), asking
