@@ -1,4 +1,4 @@
-//! Tests of `statfs` and `account`. The live ones only read the account: none of them
+//! Tests of `statfs`, `account` and `events`. The live ones only read the account: none of them
 //! changes a setting or deletes anything.
 
 use std::process::{Command, Stdio};
@@ -97,6 +97,19 @@ async fn account_as_json_has_the_settings_the_sdk_reports() {
 			!stdout_of(&assert).contains(two_factor_key.as_str()),
 			"{json}"
 		);
+	}
+}
+
+#[shared_test_runtime]
+async fn events_as_json_are_an_array_of_typed_events() {
+	let assert = authenticated_cli_with_args!("events", "--json", "--limit", "5").success();
+	let json = json_of(&assert);
+	let events = json.as_array().unwrap_or_else(|| panic!("{json}"));
+	assert!(events.len() <= 5, "{json}");
+	for event in events {
+		assert!(event["type"].is_string(), "{event}");
+		assert!(event["timestamp"].is_string(), "{event}");
+		assert!(event["id"].is_u64(), "{event}");
 	}
 }
 

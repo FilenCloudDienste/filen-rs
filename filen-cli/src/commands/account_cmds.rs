@@ -11,11 +11,21 @@
 //! `account delete-versions` permanently deletes the old versions of every file. In a terminal it
 //! asks you to type `delete all versions` to confirm; `--yes` confirms it without asking. Without
 //! a terminal and without `--yes` it refuses, before logging in.
+//!
+//! `events` lists your account's activity log, newest first: logins, uploads, moves, shares and
+//! other changes, one per line with its time (UTC), its type and the item or address it concerns.
+//! `--filter <type>` asks the server for one type of event, and `--limit <n>` prints only the
+//! newest `n`. With `--json`, the events are printed as an array.
+
+use std::num::NonZeroUsize;
 
 use anyhow::{Context as _, Result};
 use chrono::{DateTime, Utc};
 use clap::{Subcommand, ValueEnum};
-use filen_sdk_rs::user::UserInfo;
+use filen_sdk_rs::user::{
+	UserInfo,
+	events::{DecryptedUserEvent, DecryptedUserEventKind as Kind},
+};
 use filen_types::api::v3::user::account::UserAccountPlan;
 use serde_json::json;
 
@@ -35,6 +45,15 @@ pub(crate) enum AccountCommands {
 	Account {
 		#[command(subcommand)]
 		command: Option<AccountSubcommand>,
+	},
+	/// List your account's activity log, newest first
+	Events {
+		/// Only list events of this type, as the server names them (default: all)
+		#[arg(long)]
+		filter: Option<String>,
+		/// Only list the newest events, at most this many
+		#[arg(long, value_name = "N")]
+		limit: Option<NonZeroUsize>,
 	},
 }
 
@@ -77,6 +96,7 @@ pub(crate) const DOCS: &[DocElement] = &[
 	DocElement::DocFragment("account-overview"),
 	DocElement::CommandHelp("account"),
 	DocElement::CommandHelp("statfs"),
+	DocElement::CommandHelp("events"),
 ];
 
 impl AccountCommands {
@@ -104,6 +124,9 @@ impl AccountCommands {
 				}
 				AccountSubcommand::DeleteVersions => delete_all_versions(ui, client).await?,
 			},
+			Self::Events { filter, limit } => {
+				print_events(ui, client, filter.as_deref(), limit).await?;
+			}
 		}
 		Ok(CommandResult::default())
 	}
@@ -313,8 +336,170 @@ async fn delete_all_versions(ui: &mut UI, client: &mut LazyClient) -> Result<()>
 	Ok(())
 }
 
+// events
+
+/// What an event concerns, in a few words: the item's name, or the address a login came from.
+/// `None` when the event says nothing more than its type, or its item's name cannot be decrypted.
+fn event_summary(kind: &Kind) -> Option<String> {
+	match kind {
+		Kind::FileUploaded(info)
+		| Kind::FileVersioned(info)
+		| Kind::FileRestored(info)
+		| Kind::VersionedFileRestored(info)
+		| Kind::FileMoved(info)
+		| Kind::FileTrash(info)
+		| Kind::FileRm(info)
+		| Kind::DeleteFilePermanently(info) => info.metadata.name().map(str::to_owned),
+		Kind::FileRenamed(info) | Kind::FileMetadataChanged(info) => {
+			renamed(info.old_metadata.name(), info.metadata.name())
+		}
+		Kind::FileShared(info) => info
+			.metadata
+			.name()
+			.map(|name| format!("{name} with {}", info.receiver_email)),
+		Kind::FileLinkEdited(info) => info.metadata.name().map(str::to_owned),
+		Kind::FolderTrash(info)
+		| Kind::FolderMoved(info)
+		| Kind::SubFolderCreated(info)
+		| Kind::BaseFolderCreated(info)
+		| Kind::FolderRestored(info)
+		| Kind::DeleteFolderPermanently(info) => info.name.name().map(str::to_owned),
+		Kind::FolderRenamed(info) | Kind::FolderMetadataChanged(info) => {
+			renamed(info.old_name.name(), info.name.name())
+		}
+		Kind::FolderShared(info) => info
+			.name
+			.name()
+			.map(|name| format!("{name} with {}", info.receiver_email)),
+		Kind::FolderColorChanged(info) => info.name.name().map(str::to_owned),
+		Kind::Login(info)
+		| Kind::FailedLogin(info)
+		| Kind::PasswordChanged(info)
+		| Kind::TwoFaEnabled(info)
+		| Kind::TwoFaDisabled(info)
+		| Kind::RequestAccountDeletion(info)
+		| Kind::TrashEmptied(info)
+		| Kind::DeleteAll(info)
+		| Kind::DeleteVersioned(info)
+		| Kind::DeleteUnfinished(info) => Some(format!("from {}", info.ip)),
+		// the code is left out: it may still be redeemable
+		Kind::CodeRedeemed(info) => Some(format!("from {}", info.ip)),
+		Kind::EmailChanged(info) => Some(format!("to {}", info.email)),
+		Kind::EmailChangeAttempt(info) => {
+			Some(format!("from {} to {}", info.old_email, info.new_email))
+		}
+		Kind::RemovedSharedInItems(info) => Some(format!(
+			"{} shared by {}",
+			items(info.count),
+			info.sharer_email
+		)),
+		Kind::RemovedSharedOutItems(info) => Some(format!(
+			"{} shared with {}",
+			items(info.count),
+			info.receiver_email
+		)),
+		Kind::FolderLinkEdited(_) => None,
+		Kind::ItemFavorite(info) => {
+			let action = if info.value {
+				"favorited"
+			} else {
+				"unfavorited"
+			};
+			Some(match info.metadata.name() {
+				Some(name) => format!("{name} {action}"),
+				None => action.to_owned(),
+			})
+		}
+	}
+}
+
+fn renamed(old: Option<&str>, new: Option<&str>) -> Option<String> {
+	match (old, new) {
+		(Some(old), Some(new)) if old != new => Some(format!("{old} -> {new}")),
+		(_, Some(new)) => Some(new.to_owned()),
+		(Some(old), None) => Some(old.to_owned()),
+		(None, None) => None,
+	}
+}
+
+fn items(count: u64) -> String {
+	let noun = if count == 1 { "item" } else { "items" };
+	format!("{count} {noun}")
+}
+
+fn event_line(event: &DecryptedUserEvent) -> String {
+	let mut line = format!(
+		"{}  {}",
+		ui::format_date(&event.timestamp),
+		event.event_type()
+	);
+	if let Some(summary) = event_summary(&event.kind) {
+		line.push_str("  ");
+		line.push_str(&summary);
+	}
+	line
+}
+
+fn event_json(event: &DecryptedUserEvent) -> serde_json::Value {
+	json!({
+		"id": event.id,
+		"timestamp": event.timestamp,
+		"uuid": event.uuid,
+		"type": event.event_type(),
+		"summary": event_summary(&event.kind),
+	})
+}
+
+async fn print_events(
+	ui: &mut UI,
+	client: &mut LazyClient,
+	filter: Option<&str>,
+	limit: Option<NonZeroUsize>,
+) -> Result<()> {
+	let client = client.get(ui).await?;
+	let results = client
+		.get_user_events(filter, None)
+		.await
+		.context("Failed to get account events")?;
+	let mut events = Vec::with_capacity(results.len());
+	let mut unreadable = 0usize;
+	for result in results {
+		match result {
+			Ok(event) => events.push(event),
+			Err(e) => {
+				log::warn!("Skipped an event that could not be read: {e}");
+				unreadable += 1;
+			}
+		}
+	}
+	if let Some(limit) = limit {
+		events.truncate(limit.get());
+	}
+	if unreadable > 0 {
+		ui.print_warning(&format!(
+			"Skipped {unreadable} {} that could not be read",
+			if unreadable == 1 { "event" } else { "events" }
+		));
+	}
+	if ui.json {
+		ui.print_json(serde_json::Value::Array(
+			events.iter().map(event_json).collect(),
+		))?;
+	} else if events.is_empty() {
+		ui.print_muted("No events");
+	} else {
+		for event in &events {
+			ui.print(&event_line(event));
+		}
+	}
+	Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+	use filen_sdk_rs::{fs::dir::meta::DirectoryMeta, user::events::UserEventFolderPairInfo};
+	use filen_types::fs::Uuid;
+
 	use super::*;
 	use crate::{commands::Commands, error::CliError, parse_args, ui::test_support::Printed};
 
@@ -359,6 +544,19 @@ mod tests {
 		assert_eq!(
 			parse_error(&["account", "versioning", "maybe"]),
 			clap::error::ErrorKind::InvalidValue
+		);
+	}
+
+	#[test]
+	fn events_limit_must_be_positive() {
+		assert!(matches!(
+			parsed(&["events", "--filter", "login", "--limit", "3", "--json"]),
+			AccountCommands::Events { filter: Some(filter), limit: Some(limit) }
+				if filter == "login" && limit.get() == 3
+		));
+		assert_eq!(
+			parse_error(&["events", "--limit", "0"]),
+			clap::error::ErrorKind::ValueValidation
 		);
 	}
 
@@ -464,5 +662,73 @@ mod tests {
 	fn a_terminal_can_confirm_deleting_versions() {
 		let ui = Printed::default().prompting_ui();
 		ensure_can_confirm_deleting_versions(&ui).unwrap();
+	}
+
+	fn folder_meta(name: &str) -> DirectoryMeta<'static> {
+		DirectoryMeta::DecryptedUTF8(format!("not json: {name}").into())
+	}
+
+	#[test]
+	fn a_rename_shows_the_old_and_new_name() {
+		assert_eq!(
+			renamed(Some("a.txt"), Some("b.txt")).as_deref(),
+			Some("a.txt -> b.txt")
+		);
+		assert_eq!(renamed(Some("a"), Some("a")).as_deref(), Some("a"));
+		assert_eq!(renamed(None, Some("b")).as_deref(), Some("b"));
+		assert_eq!(renamed(Some("a"), None).as_deref(), Some("a"));
+		assert_eq!(renamed(None, None), None);
+	}
+
+	#[test]
+	fn an_event_line_has_the_time_type_and_summary() {
+		let event = DecryptedUserEvent {
+			id: 7,
+			timestamp: at(1_700_000_000),
+			uuid: Uuid::from_u128(1),
+			kind: Kind::RemovedSharedOutItems(
+				filen_sdk_rs::user::events::UserEventRemovedSharedOutItemsInfo {
+					ip: "192.0.2.1".to_owned(),
+					user_agent: "agent".to_owned(),
+					count: 2,
+					receiver_email: "friend@example.com".to_owned(),
+				},
+			),
+		};
+		assert_eq!(
+			event_line(&event),
+			"2023-11-14 22:13:20 (UTC)  removedSharedOutItems  2 items shared with friend@example.com"
+		);
+		assert_eq!(
+			event_json(&event),
+			json!({
+				"id": 7,
+				"timestamp": "2023-11-14T22:13:20Z",
+				"uuid": "00000000-0000-0000-0000-000000000001",
+				"type": "removedSharedOutItems",
+				"summary": "2 items shared with friend@example.com",
+			})
+		);
+	}
+
+	#[test]
+	fn an_event_whose_names_cannot_be_decrypted_has_no_summary() {
+		let event = DecryptedUserEvent {
+			id: 8,
+			timestamp: at(1_700_000_000),
+			uuid: Uuid::from_u128(2),
+			kind: Kind::FolderRenamed(UserEventFolderPairInfo {
+				ip: "192.0.2.1".to_owned(),
+				user_agent: "agent".to_owned(),
+				name: folder_meta("new"),
+				old_name: folder_meta("old"),
+				uuid: None,
+			}),
+		};
+		assert_eq!(
+			event_line(&event),
+			"2023-11-14 22:13:20 (UTC)  folderRenamed"
+		);
+		assert_eq!(event_json(&event)["summary"], serde_json::Value::Null);
 	}
 }
