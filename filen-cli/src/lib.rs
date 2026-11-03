@@ -6,6 +6,8 @@
 //!
 //! Invoke the Filen CLI with no command specified to enter interactive mode (REPL).
 //! There, you can specify absolute paths (starting with "/") or relative paths (supports "." and "..").
+//! The REPL keeps the lines you enter in `repl_history` in the config directory, except those that
+//! give a password or another secret, and those that pass arguments on to rclone.
 //!
 //! Without a terminal on stdin, it runs the commands piped into it instead, one per line,
 //! and exits with the code of the last one that failed.
@@ -59,6 +61,7 @@ mod error;
 mod interrupt;
 mod log_files;
 mod memory;
+mod repl_history;
 mod ts_leftovers;
 mod ui;
 mod updater;
@@ -611,6 +614,7 @@ async fn inner_main(ui: &mut ui::UI, arenas_limited: bool) -> Result<Finished> {
 		}
 		Ok(last_failure.map_or(Finished::Success, Finished::ScriptLineFailed))
 	} else {
+		ui.load_repl_history(repl_history::history_path(&config.config_dir));
 		ui.print_banner();
 
 		client.get(ui).await?;
@@ -864,6 +868,11 @@ const REPL_LINE_OPTIONS: &[&str] = &["help", "quiet", "json", "verbose", "yes"];
 
 /// Parses a REPL line as the arguments the CLI would be invoked with.
 fn parse_repl_line(line: &str) -> Result<CliArgs, ReplLineError> {
+	parse_repl_line_matches(line).map(|parsed| parsed.args)
+}
+
+/// [`parse_repl_line`], with what clap parsed the line from.
+fn parse_repl_line_matches(line: &str) -> Result<ParsedArgs, ReplLineError> {
 	let mut args = shlex::split(line.trim()).ok_or(ReplLineError::Quoting)?;
 	args.insert(0, String::from("filen"));
 	let ParsedArgs { args, matches } = parse_args(args).map_err(ReplLineError::Arguments)?;
@@ -876,7 +885,7 @@ fn parse_repl_line(line: &str) -> Result<CliArgs, ReplLineError> {
 	if !startup_options.is_empty() {
 		return Err(ReplLineError::StartupOptions(startup_options));
 	}
-	Ok(args)
+	Ok(ParsedArgs { args, matches })
 }
 
 /// A parsed command line.

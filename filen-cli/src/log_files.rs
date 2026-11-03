@@ -33,7 +33,7 @@ const PRIVATE_FILE_MODE: u32 = 0o600;
 const PRIVATE_DIR_MODE: u32 = 0o700;
 
 /// Options that create a file with [`PRIVATE_FILE_MODE`] on unix.
-fn private_file_options() -> OpenOptions {
+pub(crate) fn private_file_options() -> OpenOptions {
 	let mut options = OpenOptions::new();
 	#[cfg(unix)]
 	options.mode(PRIVATE_FILE_MODE);
@@ -43,7 +43,7 @@ fn private_file_options() -> OpenOptions {
 /// Opens `path` with `options`, then sets [`PRIVATE_FILE_MODE`] on it on unix: the mode in
 /// `options` applies only to a file the open creates, and a log file that already exists may have
 /// been created with the default mode by an older CLI.
-fn open_private(options: &OpenOptions, path: &Path) -> io::Result<File> {
+pub(crate) fn open_private(options: &OpenOptions, path: &Path) -> io::Result<File> {
 	let file = options.open(path)?;
 	#[cfg(unix)]
 	file.set_permissions(Permissions::from_mode(PRIVATE_FILE_MODE))?;

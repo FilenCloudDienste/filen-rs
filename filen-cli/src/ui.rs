@@ -1,6 +1,7 @@
 use std::{
 	fs,
 	io::{self, IsTerminal, Write},
+	path::PathBuf,
 	sync::{
 		Arc, Mutex, PoisonError,
 		atomic::{AtomicUsize, Ordering},
@@ -25,6 +26,7 @@ use crate::{
 	completion::async_completions_available,
 	error::{CliError, find_cli_error},
 	interrupt,
+	repl_history::ReplHistory,
 	util::RemotePath,
 };
 
@@ -158,7 +160,7 @@ fn has_controlling_terminal() -> bool {
 #[allow(clippy::struct_excessive_bools)]
 pub(crate) struct UI {
 	quiet: bool,
-	history: Vec<String>,
+	history: ReplHistory,
 	override_terminal_width: Option<usize>,
 	/// Where printed lines go: stdout, except in the tests.
 	out: Box<dyn Write + Send + Sync>,
@@ -194,7 +196,7 @@ impl UI {
 	) -> Self {
 		UI {
 			quiet: false,
-			history: Vec::new(),
+			history: ReplHistory::default(),
 			override_terminal_width: None,
 			out: Box::new(out),
 			err: Box::new(err),
@@ -227,6 +229,11 @@ impl UI {
 	/// confirmation unless [`UI::set_assume_yes`] answers it.
 	pub(crate) fn disable_prompts(&mut self) {
 		self.prompt_input = PromptInput::NoInputFlag;
+	}
+
+	/// Loads the REPL's history from `path`, and saves the lines entered from now on to it.
+	pub(crate) fn load_repl_history(&mut self, path: PathBuf) {
+		self.history = ReplHistory::load(path);
 	}
 
 	/// Sets `--yes`, which a REPL line can turn on for its command.
@@ -501,17 +508,15 @@ impl UI {
 				typed: typed.clone(),
 			})
 			.with_history(TypedHistory {
-				history: SimpleHistory::new(self.history.clone()),
+				// a copy, as inquire owns the history it is given
+				history: SimpleHistory::new(self.history.entries().to_vec()),
 				typed: typed.clone(),
 			})
 			.prompt_skippable()
 		{
 			Ok(Some(answer)) => {
 				log_repl_line(&answer);
-				if self.history.first().map(|s| s != &answer).unwrap_or(true) {
-					// avoid duplicate entries in history
-					self.history.insert(0, answer.clone());
-				}
+				self.history.add(&answer);
 				Ok(ReplPrompt::Line(answer))
 			}
 			// Ctrl-D, which inquire cannot tell apart from Esc
