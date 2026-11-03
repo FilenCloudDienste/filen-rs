@@ -295,11 +295,23 @@ async fn handle_latest_release(
 
 // util
 
+/// Downloads `url`, failing on a response that is not a success: its body is an error page, not
+/// the file.
 async fn download_file(url: &str) -> Result<Vec<u8>> {
 	let response = reqwest::get(url)
 		.await
 		.with_context(|| format!("Failed to download file from {}", url))?;
-	Ok(response.bytes().await?.into())
+	let status = response.status();
+	if !status.is_success() {
+		let body = response.text().await.unwrap_or_default();
+		let body = body.chars().take(300).collect::<String>();
+		anyhow::bail!("Downloading {url} returned {status}: {body}");
+	}
+	Ok(response
+		.bytes()
+		.await
+		.with_context(|| format!("Failed to download file from {}", url))?
+		.into())
 }
 
 /// Prefix of the temporary file an update is written to before it is moved into place.
@@ -543,7 +555,7 @@ impl GitHubApiClient {
 
 #[cfg(test)]
 mod tests {
-	use std::cell::Cell;
+	use std::{cell::Cell, io::Read, net::TcpListener};
 
 	use super::*;
 	use crate::ui::test_support::Printed;
@@ -939,6 +951,41 @@ mod tests {
 
 		assert_eq!(printed.lines_or_empty(), "");
 		assert_eq!(written_stamp(config_dir.path()), None);
+	}
+
+	/// Serves one HTTP request on a local port with `response`, and returns its URL.
+	fn serve_once(response: &'static str) -> String {
+		let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+		let address = listener.local_addr().unwrap();
+		std::thread::spawn(move || {
+			let (mut stream, _) = listener.accept().unwrap();
+			let mut request = [0; 1024];
+			let _ = stream.read(&mut request).unwrap();
+			stream.write_all(response.as_bytes()).unwrap();
+		});
+		format!("http://{address}/asset")
+	}
+
+	#[tokio::test]
+	async fn a_download_answered_with_an_error_status_fails() {
+		let url = serve_once(
+			"HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nConnection: close\r\n\r\nNot Found",
+		);
+
+		let error = download_file(&url).await.unwrap_err();
+
+		assert_eq!(
+			error.to_string(),
+			format!("Downloading {url} returned 404 Not Found: Not Found")
+		);
+	}
+
+	#[tokio::test]
+	async fn a_successful_download_returns_the_body() {
+		let url =
+			serve_once("HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\nbinary");
+
+		assert_eq!(download_file(&url).await.unwrap(), b"binary");
 	}
 
 	/// Lists the names of the files in `dir`, sorted.
