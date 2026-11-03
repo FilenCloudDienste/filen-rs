@@ -43,7 +43,7 @@ use filen_sdk_rs::{
 			CopyRequest, CopyUpdate, ItemCounts, ItemSource, ItemSourceDir, JobControl, PlanTotals,
 			PlannedTopLevelItem, ScanProgress, SkipReason,
 		},
-		dir::meta::DirectoryMetaChanges,
+		dir::{meta::DirectoryMetaChanges, traits::HasRemoteDirInfo as _},
 		file::{
 			FileBuilderOptionalName, client_impl::FileReaderSharedClientExt as _,
 			meta::FileMetaChanges, read::FileReader, traits::HasFileInfo as _,
@@ -52,7 +52,7 @@ use filen_sdk_rs::{
 	},
 	io::{RemoteDirectory, RemoteFile, client_impl::IoSharedClientExt as _},
 };
-use filen_types::{fs::Uuid, traits::CowHelpers as _};
+use filen_types::{api::v3::dir::color::DirColor, fs::Uuid, traits::CowHelpers as _};
 use futures::{
 	AsyncBufReadExt as _, AsyncRead, AsyncReadExt as _, SinkExt as _, TryStreamExt as _,
 	channel::mpsc, executor,
@@ -78,8 +78,8 @@ pub(crate) enum FsCommands {
 		/// Directory to list files in, or a file to show (default: the current working directory)
 		#[arg(add = FilenCompleter::file_or_directory())]
 		directory: Option<String>,
-		/// Use a long listing format: sizes, modification dates (creation dates of directories)
-		/// and (*) after favorited items
+		/// Use a long listing format: sizes, modification dates (creation dates of directories),
+		/// [color] after colored directories and (*) after favorited items
 		#[arg(short = 'l', long)]
 		long: bool,
 	},
@@ -224,12 +224,21 @@ pub(crate) enum FsCommands {
 		#[arg(add = FilenCompleter::file_or_directory())]
 		file_or_directory: String,
 	},
+	/// Set the color of a directory
+	Color {
+		/// Directory to color
+		#[arg(add = FilenCompleter::directory())]
+		directory: String,
+		/// The color: default, blue, green, purple, red, gray, or a hex color like #85bcff
+		#[arg(value_parser = parse_dir_color)]
+		color: DirColor<'static>,
+	},
 	/// List recently accessed items
 	ListRecents,
 	/// List trashed items
 	ListTrash {
-		/// Use a long listing format: sizes, modification dates (creation dates of directories)
-		/// and (*) after favorited items
+		/// Use a long listing format: sizes, modification dates (creation dates of directories),
+		/// [color] after colored directories and (*) after favorited items
 		#[arg(short = 'l', long)]
 		long: bool,
 	},
@@ -282,6 +291,7 @@ pub(crate) const ORGANIZING_DOCS: &[DocElement] = &[
 	DocElement::CommandHelp("list-favorites"),
 	DocElement::CommandHelp("favorite"),
 	DocElement::CommandHelp("unfavorite"),
+	DocElement::CommandHelp("color"),
 	DocElement::CommandHelp("list-recents"),
 	DocElement::CommandHelp("list-trash"),
 	DocElement::CommandHelp("trash-restore"),
@@ -379,6 +389,10 @@ impl FsCommands {
 			Self::Unfavorite { file_or_directory } => {
 				set_file_or_directory_favorite(ui, client, working_path, &file_or_directory, false)
 					.await?;
+			}
+			Self::Color { directory, color } => {
+				let path = working_path.navigate(&directory);
+				set_directory_color(ui, client, &path, color).await?;
 			}
 			Self::ListRecents => list_recents(ui, client).await?,
 			Self::ListTrash { long } => list_trash(ui, client, long).await?,
@@ -519,6 +533,8 @@ struct ListedItem {
 	modified: Option<DateTime<Utc>>,
 	created: Option<DateTime<Utc>>,
 	favorited: bool,
+	/// The directory's color; files have none.
+	color: Option<DirColor<'static>>,
 	uuid: Uuid,
 }
 
@@ -532,6 +548,7 @@ impl ListedItem {
 			modified: None,
 			created: dir.created(),
 			favorited: dir.favorited(),
+			color: Some(dir.color().into_owned_cow()),
 			uuid: dir.uuid(),
 		}
 	}
@@ -545,6 +562,7 @@ impl ListedItem {
 			modified: file.last_modified(),
 			created: file.created(),
 			favorited: file.favorited(),
+			color: None,
 			uuid: file.uuid(),
 		}
 	}
@@ -575,6 +593,9 @@ impl ListedItem {
 		}
 		object.insert("created".to_owned(), json!(self.created));
 		object.insert("favorited".to_owned(), json!(self.favorited));
+		if let Some(color) = &self.color {
+			object.insert("color".to_owned(), json!(color.as_ref()));
+		}
 		object.insert("uuid".to_owned(), json!(self.uuid));
 		serde_json::Value::Object(object)
 	}
@@ -650,7 +671,8 @@ fn cmp_numbers(a: &str, b: &str) -> Ordering {
 }
 
 /// Prints one item per line: a right-aligned size column (directories have none), the date
-/// column, the label, and `(*)` after a favorited item.
+/// column, the label, the color of a directory that has one in brackets, and `(*)` after a
+/// favorited item.
 fn print_long_listing(ui: &mut UI, items: &[ListedItem], by: ListedBy) {
 	let rows = items
 		.iter()
@@ -676,12 +698,17 @@ fn print_long_listing(ui: &mut UI, items: &[ListedItem], by: ListedBy) {
 			ListedKind::Directory => style(size).dim().to_string(),
 			ListedKind::File => size,
 		};
+		let color = match &item.color {
+			None | Some(DirColor::Default) => String::new(),
+			Some(color) => format!(" [{}]", color.as_ref()),
+		};
 		let favorite = if item.favorited { " (*)" } else { "" };
 		ui.print(&format!(
-			"{}  {}  {}{}",
+			"{}  {}  {}{}{}",
 			size,
 			style(date).dim(),
 			label,
+			color,
 			favorite
 		));
 	}
@@ -1104,6 +1131,7 @@ pub(crate) async fn print_file_or_directory_info(
 					"files": size_info.files,
 					"directories": size_info.dirs,
 					"created": dir.created(),
+					"color": dir.color().as_ref(),
 					"uuid": dir.uuid(),
 				}))?;
 			} else {
@@ -1124,6 +1152,7 @@ pub(crate) async fn print_file_or_directory_info(
 							.map(|d| ui::format_date(&d))
 							.unwrap_or("-".to_string()),
 					),
+					("Color", dir.color().as_ref()),
 					("UUID", &dir_uuid),
 				]);
 			}
@@ -2555,6 +2584,75 @@ fn clashing_name<'a>(existing: impl IntoIterator<Item = &'a str>, name: &str) ->
 		.find(|existing| existing.to_lowercase() == name)
 }
 
+/// The named directory colors, as the apps offer them.
+const NAMED_DIR_COLORS: [DirColor<'static>; 6] = [
+	DirColor::Default,
+	DirColor::Blue,
+	DirColor::Green,
+	DirColor::Purple,
+	DirColor::Red,
+	DirColor::Gray,
+];
+
+/// Parses a directory color as the apps set one: a named color, or a custom one as `#` and six
+/// hex digits, which is all the web app's color picker writes and shows.
+fn parse_dir_color(color: &str) -> Result<DirColor<'static>, String> {
+	if let Some(named) = NAMED_DIR_COLORS
+		.iter()
+		.find(|named| named.as_ref() == color)
+	{
+		return Ok(named.clone());
+	}
+	let is_hex = color
+		.strip_prefix('#')
+		.is_some_and(|hex| hex.len() == 6 && hex.bytes().all(|b| b.is_ascii_hexdigit()));
+	if is_hex {
+		return Ok(DirColor::Custom(Cow::Owned(color.to_owned())));
+	}
+	Err(format!(
+		"use one of {}, or a hex color like #85bcff",
+		NAMED_DIR_COLORS
+			.iter()
+			.map(AsRef::as_ref)
+			.collect::<Vec<&str>>()
+			.join(", ")
+	))
+}
+
+/// Sets the color of the directory at `path`.
+async fn set_directory_color(
+	ui: &mut UI,
+	client: &mut LazyClient,
+	path: &RemotePath,
+	color: DirColor<'static>,
+) -> Result<()> {
+	let client = client.get(ui).await?;
+	let mut dir = match client
+		.find_item_at_path(&path.0)
+		.await
+		.context("Failed to find directory")?
+	{
+		Some(NonRootFileType::Dir(dir)) => dir.into_owned(),
+		Some(NonRootFileType::Root(_)) => {
+			return Err(UI::failure("Cannot set the color of the root directory"));
+		}
+		Some(NonRootFileType::File(_)) => {
+			return Err(UI::failure(&format!("Not a directory: {}", path)));
+		}
+		None => return Err(UI::failure(&format!("No such directory: {}", path))),
+	};
+	client
+		.set_dir_color(&mut dir, color)
+		.await
+		.context("Failed to set directory color")?;
+	ui.print_success(&format!(
+		"Set the color of {} to {}",
+		path,
+		dir.color().as_ref()
+	));
+	Ok(())
+}
+
 pub(crate) async fn set_file_or_directory_favorite(
 	ui: &mut UI,
 	client: &mut LazyClient,
@@ -3646,6 +3744,7 @@ mod tests {
 			modified: None,
 			created: None,
 			favorited: false,
+			color: None,
 			uuid: Uuid::from_u128(uuid),
 		}
 	}
@@ -3932,6 +4031,7 @@ mod tests {
 			modified: None,
 			created: None,
 			favorited: false,
+			color: Some(DirColor::Default),
 			uuid: Uuid::from_u128(uuid),
 		}
 	}
@@ -3945,6 +4045,7 @@ mod tests {
 			modified: None,
 			created: None,
 			favorited: false,
+			color: None,
 			uuid: Uuid::from_u128(uuid),
 		}
 	}
@@ -4017,6 +4118,77 @@ mod tests {
 	}
 
 	#[test]
+	fn a_long_listing_shows_the_color_of_a_colored_directory() {
+		let items = vec![
+			ListedItem {
+				color: Some(DirColor::Red),
+				favorited: true,
+				..listed_dir("docs", 1)
+			},
+			ListedItem {
+				color: Some(DirColor::Custom(Cow::Borrowed("#85bcff"))),
+				..listed_dir("more", 2)
+			},
+			listed_dir("plain", 3),
+		];
+
+		assert_eq!(
+			printed_listing(items, ListedBy::Name, true, false),
+			"-  -  docs [red] (*)\n-  -  more [#85bcff]\n-  -  plain"
+		);
+	}
+
+	#[test]
+	fn a_json_listing_gives_a_directorys_color() {
+		let items = vec![ListedItem {
+			color: Some(DirColor::Custom(Cow::Borrowed("#85bcff"))),
+			..listed_dir("docs", 1)
+		}];
+
+		let printed: serde_json::Value =
+			serde_json::from_str(&printed_listing(items, ListedBy::Name, false, true)).unwrap();
+
+		assert_eq!(printed[0]["color"], "#85bcff");
+	}
+
+	#[test]
+	fn a_directory_color_is_a_named_color() {
+		for (name, color) in [
+			("default", DirColor::Default),
+			("blue", DirColor::Blue),
+			("green", DirColor::Green),
+			("purple", DirColor::Purple),
+			("red", DirColor::Red),
+			("gray", DirColor::Gray),
+		] {
+			assert_eq!(parse_dir_color(name), Ok(color));
+		}
+	}
+
+	#[test]
+	fn a_directory_color_is_a_hex_color_of_six_digits() {
+		assert_eq!(
+			parse_dir_color("#85bcFF"),
+			Ok(DirColor::Custom(Cow::Borrowed("#85bcFF")))
+		);
+	}
+
+	#[test]
+	fn other_directory_colors_are_refused_with_the_valid_ones() {
+		for color in ["Red", "pink", "#85bcf", "#85bcffa", "85bcff", "#85bcfg", ""] {
+			assert_eq!(
+				parse_dir_color(color),
+				Err(
+					"use one of default, blue, green, purple, red, gray, or a hex color like \
+				     #85bcff"
+						.to_owned()
+				),
+				"{color}"
+			);
+		}
+	}
+
+	#[test]
 	fn a_json_listing_prints_an_object_per_item() {
 		let items = vec![
 			ListedItem {
@@ -4039,6 +4211,7 @@ mod tests {
 					"type": "directory",
 					"created": null,
 					"favorited": false,
+					"color": "default",
 					"uuid": "00000000-0000-0000-0000-000000000002",
 				},
 				{
@@ -4076,6 +4249,7 @@ mod tests {
 					"type": "directory",
 					"created": null,
 					"favorited": false,
+					"color": "default",
 					"uuid": "00000000-0000-0000-0000-000000000001",
 				},
 				{
@@ -4084,6 +4258,7 @@ mod tests {
 					"type": "directory",
 					"created": null,
 					"favorited": false,
+					"color": "default",
 					"uuid": "00000000-0000-0000-0000-000000000002",
 				},
 			])

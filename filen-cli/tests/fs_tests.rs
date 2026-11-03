@@ -959,6 +959,7 @@ async fn ls_json_prints_an_object_per_item_directories_first() {
 				"type": "directory",
 				"created": dir.created(),
 				"favorited": false,
+				"color": "default",
 				"uuid": dir.uuid().to_string(),
 			},
 			{
@@ -1701,4 +1702,47 @@ fn versions_delete_without_yes_asks_for_it_before_logging_in() {
 			.contains("Cannot ask \"Permanently delete a version of /a.txt?\""),
 		"{output:?}"
 	);
+}
+
+#[shared_test_runtime]
+async fn color_sets_a_directorys_color_which_stat_and_ls_show() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = format!("/{}", resources.dir.name().unwrap());
+	let dir = client
+		.create_dir(&(&resources.dir).into(), "docs")
+		.await
+		.unwrap();
+	let path = format!("{test_dir}/docs");
+
+	authenticated_cli_with_args!("color", &path, "red")
+		.success()
+		.stdout(format!("✔ Set the color of {path} to red\n"));
+	let stat = printed_json(&authenticated_cli_with_args!("stat", &path, "--json").success());
+	assert_eq!(stat["color"], "red");
+	authenticated_cli_with_args!("stat", &path)
+		.success()
+		.stdout(predicates::str::contains(" Color red\n"));
+
+	authenticated_cli_with_args!("color", &path, "#85bcff").success();
+	let listing = printed_json(&authenticated_cli_with_args!("ls", &test_dir, "--json").success());
+	assert_eq!(
+		listed(&listing, &dir.uuid().to_string())["color"],
+		"#85bcff"
+	);
+	let assert = authenticated_cli_with_args!("ls", "-l", &test_dir).success();
+	let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+	assert!(stdout.trim_end().ends_with("  docs [#85bcff]"), "{stdout}");
+}
+
+#[shared_test_runtime]
+async fn color_refuses_a_color_the_apps_cannot_show() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let test_dir = format!("/{}", resources.dir.name().unwrap());
+
+	authenticated_cli_with_args!("color", &test_dir, "pink")
+		.code(2)
+		.stderr(predicates::str::contains(
+			"use one of default, blue, green, purple, red, gray, or a hex color like #85bcff",
+		));
 }
