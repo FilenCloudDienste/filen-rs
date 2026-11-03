@@ -6,10 +6,19 @@
 //! existing directory or ends in `/`, keeping its name: `upload ./notes /backups` creates
 //! `/backups/notes`, and `download /backups/notes .` creates `./notes`. Any other destination is
 //! the transferred item's new path: `upload ./notes.txt /backups/old.txt` uploads it as `old.txt`,
-//! and `download /backups/notes ./old-notes` creates `./old-notes`. Transferring a file to the path
-//! of an existing file replaces it (in the drive, with a new version of it). Missing directories
-//! on the way to the destination are created. Downloading `/` writes the whole drive's contents
-//! into the destination.
+//! and `download /backups/notes ./old-notes` creates `./old-notes`. Missing directories on the way
+//! to the destination are created, in the drive and locally. Downloading `/` writes the whole
+//! drive's contents into the destination.
+//!
+//! Uploading a file where the drive already holds a file of the same name replaces it: the upload
+//! becomes the current file, and the one it replaced is kept as an earlier version when file
+//! versioning is enabled for your account. Uploading a directory onto an existing one adds its
+//! contents to it, replacing same-named files the same way. A downloaded file replaces a local
+//! file at its path, except when the local file already has the same contents, which is then left
+//! as it is. In a directory download, a local file of the same size is also left as it is when
+//! the drive holds no hash of the file's contents and the local file is not older. Uploads keep
+//! each file's modification and creation times, and downloads set the modification time on the
+//! local file (and the creation time on macOS and Windows).
 //!
 //! An uploaded symlink is uploaded under its own name with the contents it points to. Inside an
 //! uploaded directory, symlinks are followed the same way; with `--no-follow-symlinks` they are
@@ -18,13 +27,17 @@
 //!
 //! While a transfer runs, its progress line shows the current speed and the time left, and the
 //! result ends with the number of files and bytes transferred, the time taken and the average
-//! speed. With `-v`, each file of a directory transfer is listed as it completes.
+//! speed. With `-v`, each file of a directory transfer is listed as it completes. The global
+//! flags `--concurrency`, `--upload-bandwidth-kbps` and `--download-bandwidth-kbps` limit the
+//! concurrent connections and cap the upload and download bandwidth, in kilobytes per second.
 //!
-//! When a single item inside a directory transfer fails, the rest of the transfer still completes
-//! and the failures are listed at the end. With `--json`, the result is printed as one object
-//! instead: `{"destination": ..., "files": ..., "bytes": ..., "skipped_symlinks": [...], "failed":
-//! [{"path": ..., "error": ...}]}`, where `path` is `null` for a failure not about a single item.
-//! Press Ctrl+C to cancel a running transfer; what was transferred by then is reported on stderr.
+//! When a single item inside a directory transfer fails, the rest of the transfer still completes,
+//! the failures are listed at the end, and the command exits with a nonzero status. With
+//! `--json`, the result is printed as one object instead: `{"destination": ..., "files": ...,
+//! "bytes": ..., "skipped_symlinks": [...], "failed": [{"path": ..., "error": ...}]}`, where
+//! `path` is `null` for a failure not about a single item. Press Ctrl+C to cancel a running
+//! transfer: what was transferred by then is reported on stderr and the command exits with status
+//! 130, where the TypeScript CLI printed "Aborted".
 
 use std::{
 	borrow::Cow,
