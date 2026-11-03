@@ -51,6 +51,70 @@ async fn sync_once_brings_both_sides_across_and_exits_0() {
 	);
 }
 
+/// With `--json`, every line is a JSON object, the upload's among them, and the pass's summary
+/// counts the bytes it moved.
+#[shared_test_runtime]
+async fn sync_once_with_json_prints_an_object_for_each_event() {
+	// Not `get_resources_with_lock`, for the reason the first test gives.
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let test_dir_name = resources.dir.name().unwrap();
+	let local = assert_fs::TempDir::new().unwrap();
+	std::fs::write(local.path().join("from_local.txt"), "from the local side").unwrap();
+	let config_dir = assert_fs::TempDir::new().unwrap();
+	let pair = format!("{}:{test_dir_name}", local.path().to_str().unwrap());
+
+	let output = sync_once(config_dir.path(), &pair, &["--json"]).await;
+
+	assert_success(&output);
+	let objects = String::from_utf8_lossy(&output.stdout)
+		.lines()
+		.map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+		.collect::<Vec<_>>();
+	let named = |event: &str| {
+		objects
+			.iter()
+			.filter(|object| object["event"] == event)
+			.collect::<Vec<_>>()
+	};
+	assert_eq!(
+		named("uploaded")
+			.iter()
+			.map(|object| &object["path"])
+			.collect::<Vec<_>>(),
+		["from_local.txt"],
+		"{}",
+		describe(&output)
+	);
+	let completed = named("pass_completed");
+	assert_eq!(completed.len(), 1, "{}", describe(&output));
+	assert_eq!(completed[0]["uploaded"], 1);
+	assert_eq!(completed[0]["uploaded_bytes"], "from the local side".len());
+}
+
+/// With `--quiet`, a pass that leaves nothing to attend to prints only its summary.
+#[shared_test_runtime]
+async fn sync_once_with_quiet_prints_only_the_pass_summary() {
+	// Not `get_resources_with_lock`, for the reason the first test gives.
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let test_dir_name = resources.dir.name().unwrap();
+	let local = assert_fs::TempDir::new().unwrap();
+	std::fs::write(local.path().join("from_local.txt"), "from the local side").unwrap();
+	let config_dir = assert_fs::TempDir::new().unwrap();
+	let pair = format!("{}:{test_dir_name}", local.path().to_str().unwrap());
+
+	let output = sync_once(config_dir.path(), &pair, &["--quiet"]).await;
+
+	assert_success(&output);
+	let stdout = String::from_utf8_lossy(&output.stdout);
+	let lines = stdout.lines().collect::<Vec<_>>();
+	assert_eq!(lines.len(), 1, "{}", describe(&output));
+	assert!(
+		lines[0].contains("Sync pass completed: 1 uploaded"),
+		"{}",
+		describe(&output)
+	);
+}
+
 #[shared_test_runtime]
 async fn sync_once_with_a_conflict_left_open_exits_1() {
 	// Not `get_resources_with_lock`, for the reason the test above gives.
