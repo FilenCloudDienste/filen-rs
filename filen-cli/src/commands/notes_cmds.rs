@@ -1,5 +1,6 @@
 use std::{
 	collections::HashSet,
+	io,
 	path::{Path, PathBuf},
 	sync::Arc,
 };
@@ -15,8 +16,16 @@ use crate::{CommandResult, auth::LazyClient, commands::CommandContext, docs::Doc
 #[derive(Debug, Subcommand)]
 pub(crate) enum NotesCommands {
 	/// Export all notes to a local directory
+	///
+	/// A directory that doesn't exist yet is created, and the notes are exported into it, as they
+	/// are into an empty directory. A directory that already holds something gets a new
+	/// `filen-notes-export-<timestamp>` subdirectory for them. Rich text notes are exported as
+	/// HTML, checklists as Markdown, and trashed and archived notes go into `trash` and `archive`
+	/// subdirectories.
 	ExportNotes {
-		/// Local directory to export the notes to (default: the current local directory)
+		/// Local directory to export the notes to (default: the current local directory). Used
+		/// directly when it is missing or empty, otherwise the notes go into a new timestamped
+		/// subdirectory of it
 		#[arg(add = ArgValueCompleter::new(PathCompleter::dir()))]
 		path: Option<String>,
 	},
@@ -132,11 +141,23 @@ async fn export_note(client: &Client, mut note: Note, path: PathBuf) -> Result<(
 }
 
 /// Decides which directory the notes are exported to, without creating anything:
-/// [`create_export_root`] does that once there are notes to export.
+/// [`create_export_root`] does that once there are notes to export. A missing or empty directory
+/// is used as it is, and one that already holds something gets a fresh
+/// `filen-notes-export-<timestamp>` subdirectory, so that no existing file is overwritten.
 fn choose_export_root(path_str: &str) -> Result<PathBuf> {
 	let path = PathBuf::from(path_str);
-	if path.exists() && !path.is_dir() {
+	let metadata = match std::fs::metadata(&path) {
+		Ok(metadata) => metadata,
+		Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(path),
+		Err(e) => return Err(UI::failure(&format!("Failed to read {path_str}: {e}"))),
+	};
+	if !metadata.is_dir() {
 		return Err(UI::failure(&format!("Not a directory: {path_str}")));
+	}
+	let mut entries = std::fs::read_dir(&path)
+		.map_err(|e| UI::failure(&format!("Failed to read directory {path_str}: {e}")))?;
+	if entries.next().is_none() {
+		return Ok(path);
 	}
 
 	let timestamp = chrono::Local::now().format("%Y-%m-%d-%H-%M-%S");
@@ -362,13 +383,31 @@ mod tests {
 	}
 
 	#[test]
-	fn export_root_is_always_a_fresh_timestamped_directory() {
+	fn a_missing_export_directory_is_exported_into_directly() {
 		let parent = assert_fs::TempDir::new().unwrap();
+		let missing = parent.path().join("missing").join("nested");
 
-		// an existing directory is accepted whether or not it already holds something
-		std::fs::write(parent.path().join("some file"), "").unwrap();
-		let root = choose_export_root(parent.path().to_str().unwrap()).unwrap();
-		assert_eq!(root.parent(), Some(parent.path()));
+		let root = choose_export_root(missing.to_str().unwrap()).unwrap();
+		assert_eq!(root, missing);
+		create_export_root(&root).unwrap();
+		assert!(root.is_dir());
+	}
+
+	#[test]
+	fn an_empty_export_directory_is_exported_into_directly() {
+		let dir = assert_fs::TempDir::new().unwrap();
+
+		let root = choose_export_root(dir.path().to_str().unwrap()).unwrap();
+		assert_eq!(root, dir.path());
+	}
+
+	#[test]
+	fn a_non_empty_export_directory_gets_a_timestamped_subdirectory() {
+		let dir = assert_fs::TempDir::new().unwrap();
+		std::fs::write(dir.path().join("some file"), "").unwrap();
+
+		let root = choose_export_root(dir.path().to_str().unwrap()).unwrap();
+		assert_eq!(root.parent(), Some(dir.path()));
 		assert!(
 			root.file_name()
 				.unwrap()
@@ -377,25 +416,28 @@ mod tests {
 		);
 		create_export_root(&root).unwrap();
 		assert!(std::fs::read_dir(&root).unwrap().next().is_none());
+	}
 
-		// a directory that doesn't exist yet is created along the way
-		let missing = parent.path().join("missing").join("nested");
-		let root = choose_export_root(missing.to_str().unwrap()).unwrap();
-		assert_eq!(root.parent(), Some(missing.as_path()));
-		create_export_root(&root).unwrap();
-		assert!(root.is_dir());
+	#[test]
+	fn an_export_path_that_is_a_file_is_rejected() {
+		let dir = assert_fs::TempDir::new().unwrap();
+		let file = dir.path().join("some file");
+		std::fs::write(&file, "").unwrap();
 
-		// but a path that exists and isn't a directory is rejected
-		let file = parent.path().join("some file");
-		assert!(choose_export_root(file.to_str().unwrap()).is_err());
+		let err = choose_export_root(file.to_str().unwrap()).unwrap_err();
+		assert_eq!(
+			err.to_string(),
+			format!("Not a directory: {}", file.display())
+		);
 	}
 
 	#[test]
 	fn choosing_the_export_root_creates_nothing() {
 		let parent = assert_fs::TempDir::new().unwrap();
+		std::fs::write(parent.path().join("some file"), "").unwrap();
 
 		choose_export_root(parent.path().to_str().unwrap()).unwrap();
-		assert!(std::fs::read_dir(parent.path()).unwrap().next().is_none());
+		assert_eq!(std::fs::read_dir(parent.path()).unwrap().count(), 1);
 
 		let missing = parent.path().join("missing").join("nested");
 		choose_export_root(missing.to_str().unwrap()).unwrap();

@@ -256,15 +256,19 @@ async fn cmd_export_notes() {
 		notes.push(note);
 	}
 
-	// the export always creates a fresh timestamped directory inside the given one
+	// a directory that already holds something gets a fresh timestamped directory for the export
 	let parent_dir = assert_fs::TempDir::new().unwrap();
+	let existing_file = parent_dir.path().join("existing.txt");
+	std::fs::write(&existing_file, "kept").unwrap();
 	authenticated_cli_with_args!("export-notes", parent_dir.path().to_str().unwrap())
 		.success()
 		.stdout(predicates::str::contains("Exported"));
+	assert_eq!(std::fs::read_to_string(&existing_file).unwrap(), "kept");
 
 	let mut created = std::fs::read_dir(parent_dir.path())
 		.unwrap()
 		.map(|entry| entry.unwrap().path())
+		.filter(|path| *path != existing_file)
 		.collect::<Vec<_>>();
 	assert_eq!(created.len(), 1, "expected exactly one export directory");
 	let export_dir = created.pop().unwrap();
