@@ -24,8 +24,13 @@
 //! a link password from the environment: to keep one out of the history, enter it at the prompt.
 
 use crate::{
-	CommandResult, auth::LazyClient, commands::CommandContext, completion::FilenCompleter,
-	docs::DocElement, ui::UI, util::RemotePath,
+	CommandResult,
+	auth::LazyClient,
+	commands::{CommandContext, fs_cmds::full_path},
+	completion::FilenCompleter,
+	docs::DocElement,
+	ui::UI,
+	util::RemotePath,
 };
 use anyhow::{Context as _, Result};
 use clap::{Args, Subcommand, ValueEnum};
@@ -347,22 +352,12 @@ async fn listed_file_link(client: &Client, file: &RemoteFile) -> Result<ListedPu
 	})
 }
 
-/// The item's absolute path, without the trailing slash `get_item_path` puts on directories.
-pub(crate) async fn resolve_item_path(
-	client: &Client,
-	item: &NonRootItemType<'_, Normal>,
-) -> Result<String, Error> {
-	let (path, _) = client.get_item_path(item).await?;
-	Ok(format!("/{}", path.trim_end_matches('/')))
-}
-
-/// [`resolve_item_path`], falling back to the uuid, as the other listings do, so that one
-/// unresolvable item doesn't fail the whole listing.
+/// [`full_path`], falling back to the uuid, as the other listings do, so that one unresolvable
+/// item doesn't fail the whole listing.
 async fn item_path(client: &Client, item: &NonRootItemType<'_, Normal>) -> String {
-	resolve_item_path(client, item).await.unwrap_or_else(|e| {
-		log::warn!("Failed to resolve path of item {}: {}", item.uuid(), e);
-		item.uuid().to_string()
-	})
+	full_path(client, item)
+		.await
+		.unwrap_or_else(|| item.uuid().to_string())
 }
 
 /// Prints the linked items, expected sorted by path: a path and URL column, directories in blue,

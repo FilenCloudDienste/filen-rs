@@ -79,7 +79,7 @@ use chrono::{DateTime, Utc};
 use clap::Subcommand;
 use console::{Term, style};
 use filen_sdk_rs::{
-	ErrorKind,
+	Error, ErrorKind,
 	auth::Client,
 	consts::CHUNK_SIZE_U64,
 	fs::{
@@ -3292,16 +3292,25 @@ async fn list_with_full_paths(
 	Ok(items)
 }
 
-/// The item's absolute path, with the trailing slash `get_item_path` puts on directories
-/// stripped (directories are already distinguished by color), or `None` if it cannot be resolved.
-async fn full_path(client: &Client, item: &NonRootItemType<'_, Normal>) -> Option<String> {
-	match client.get_item_path(item).await {
-		Ok((path, _)) => Some(format!("/{}", path.trim_end_matches('/'))),
-		Err(e) => {
-			log::warn!("Failed to resolve path of item {}: {}", item.uuid(), e);
-			None
-		}
-	}
+/// The item's absolute path, without the trailing slash `get_item_path` puts on directories
+/// (listings already distinguish directories by color).
+pub(crate) async fn resolve_item_path(
+	client: &Client,
+	item: &NonRootItemType<'_, Normal>,
+) -> Result<String, Error> {
+	let (path, _) = client.get_item_path(item).await?;
+	Ok(format!("/{}", path.trim_end_matches('/')))
+}
+
+/// [`resolve_item_path`], or `None` if it cannot be resolved, which is logged.
+pub(crate) async fn full_path(
+	client: &Client,
+	item: &NonRootItemType<'_, Normal>,
+) -> Option<String> {
+	resolve_item_path(client, item)
+		.await
+		.inspect_err(|e| log::warn!("Failed to resolve path of item {}: {}", item.uuid(), e))
+		.ok()
 }
 
 pub(crate) async fn list_trash(ui: &mut UI, client: &mut LazyClient, long: bool) -> Result<()> {

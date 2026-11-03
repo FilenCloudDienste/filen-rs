@@ -53,7 +53,7 @@ use crate::{
 	commands::{
 		CommandContext,
 		contacts_cmds::find_entry,
-		public_links_cmds::resolve_item_path,
+		fs_cmds::resolve_item_path,
 		transfer_cmds::{
 			TransferKind, TransferProgress, download_directory, download_file, finish,
 			run_cancellable,
