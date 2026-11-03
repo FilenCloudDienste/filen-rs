@@ -37,6 +37,12 @@
 //! where an include pattern matches it. A file named as the item to transfer is transferred
 //! whatever the patterns say.
 //!
+//! Like `cp`, both commands take several items at once, followed by a destination that is then
+//! always a directory, created when missing: `upload a.txt b.txt ./photos /backups` uploads all
+//! three into `/backups`. An item that fails is listed at the end while the others are still
+//! transferred, and the result adds them all up. A shell expands a wildcard such as `*.jpg` into
+//! such a list of items; the Windows command prompt does not, and remote paths take no wildcards.
+//!
 //! An uploaded symlink is uploaded under its own name with the contents it points to. Inside an
 //! uploaded directory, symlinks are followed the same way; with `--no-follow-symlinks` they are
 //! skipped instead (neither the link nor what it points to is uploaded): listed with `-v`, counted
@@ -111,11 +117,12 @@ pub(crate) enum TransferCommands {
 		/// Local file or directory to upload
 		#[arg(add = ArgValueCompleter::new(PathCompleter::any()))]
 		source: String,
-		/// Directory in the Filen drive to upload into, or the uploaded item's new path when it is
+		/// More local files or directories to upload, followed by the destination: the directory in
+		/// the Filen drive to upload into, or, after a single item, that item's new path when it is
 		/// not an existing directory and does not end in "/"; missing directories are created
 		/// (default: the current working directory)
-		#[arg(add = FilenCompleter::file_or_directory())]
-		destination: Option<String>,
+		#[arg(value_name = "PATH", add = FilenCompleter::file_or_directory())]
+		paths: Vec<String>,
 		/// Skip the symlinks inside an uploaded directory instead of uploading what they point to
 		/// (counted in the result, listed with -v)
 		#[arg(long)]
@@ -136,11 +143,12 @@ pub(crate) enum TransferCommands {
 		/// File or directory to download ("/" for the entire Filen drive)
 		#[arg(add = FilenCompleter::file_or_directory())]
 		source: String,
-		/// Local directory to download into, or the downloaded item's new path when it is not an
+		/// More files or directories to download, followed by the destination: the local directory
+		/// to download into, or, after a single item, that item's new path when it is not an
 		/// existing directory and does not end in a path separator; missing directories are
 		/// created (default: the current local directory)
-		#[arg(add = ArgValueCompleter::new(PathCompleter::any()))]
-		destination: Option<String>,
+		#[arg(value_name = "PATH", add = ArgValueCompleter::new(PathCompleter::any()))]
+		paths: Vec<String>,
 		/// Never replace a local file: skip each file whose local path is taken (listed with -v)
 		#[arg(long)]
 		no_clobber: bool,
@@ -201,7 +209,7 @@ impl TransferCommands {
 		match self {
 			Self::Upload {
 				source,
-				destination,
+				paths,
 				no_follow_symlinks,
 				skip_existing,
 				update,
@@ -216,11 +224,12 @@ impl TransferCommands {
 					existing: existing_remote_policy(skip_existing, update),
 					filter: filter.transfer_filter()?,
 				};
+				let (sources, destination) = sources_and_destination(source, paths);
 				upload(
 					ui,
 					client,
 					working_path,
-					&source,
+					&sources,
 					destination.as_deref(),
 					options,
 				)
@@ -228,7 +237,7 @@ impl TransferCommands {
 			}
 			Self::Download {
 				source,
-				destination,
+				paths,
 				no_clobber,
 				filter,
 			} => {
@@ -240,11 +249,12 @@ impl TransferCommands {
 					},
 					filter: filter.transfer_filter()?,
 				};
+				let (sources, destination) = sources_and_destination(source, paths);
 				download(
 					ui,
 					client,
 					working_path,
-					&source,
+					&sources,
 					destination.as_deref(),
 					options,
 				)
@@ -267,69 +277,181 @@ fn existing_remote_policy(skip_existing: bool, update: bool) -> ExistingRemoteFi
 	}
 }
 
-/// Upload a local file, or a local directory and everything below it, into a remote directory, as
-/// `options` say; `source` itself is followed when it is a symlink.
+/// The items a transfer takes and its destination, from the paths after the first item: as with
+/// `cp`, the last of two or more paths is the destination.
+fn sources_and_destination(
+	source: String,
+	mut paths: Vec<String>,
+) -> (Vec<String>, Option<String>) {
+	let destination = paths.pop();
+	let mut sources = Vec::with_capacity(paths.len() + 1);
+	sources.push(source);
+	sources.extend(paths);
+	(sources, destination)
+}
+
+/// Whether `error` ends the whole command rather than only the transfer of the item it came from.
+fn ends_the_command(error: &anyhow::Error) -> bool {
+	matches!(
+		error.downcast_ref::<CliError>(),
+		Some(CliError::Interrupted | CliError::StdoutClosed)
+	)
+}
+
+/// The failure of one of several items, named as given.
+fn source_failure(source: &str, error: &anyhow::Error) -> TransferFailure {
+	TransferFailure {
+		path: Some(source.to_owned()),
+		error: format!("{:#}", error),
+	}
+}
+
+/// A local item to upload.
+struct LocalSource {
+	/// Made absolute without resolving symlinks, so an uploaded link keeps its own name.
+	path: PathBuf,
+	is_dir: bool,
+	name: String,
+}
+
+impl LocalSource {
+	fn read(source_str: &str) -> Result<Self> {
+		let path = std::path::absolute(source_str).map_err(|_| {
+			UI::failure(&format!("No such local file or directory: {}", source_str))
+		})?;
+		std::fs::symlink_metadata(&path).map_err(|_| {
+			UI::failure(&format!("No such local file or directory: {}", source_str))
+		})?;
+		let is_dir = std::fs::metadata(&path)
+			.map_err(|e| UI::failure(&format!("Cannot read {}: {}", path.display(), e)))?
+			.is_dir();
+		let name = upload_name(&path)?;
+		Ok(Self { path, is_dir, name })
+	}
+}
+
+/// Upload local files, or local directories and everything below them, into a remote directory,
+/// as `options` say; each source itself is followed when it is a symlink. Several sources go into
+/// `destination_str` as a directory, and one that fails is reported among the failures while the
+/// others are still uploaded.
 pub(crate) async fn upload(
 	ui: &mut UI,
 	client: &mut LazyClient,
 	working_path: &RemotePath,
-	source_str: &str,
+	sources: &[String],
 	destination_str: Option<&str>,
 	options: DirUploadOptions,
 ) -> Result<()> {
-	// Made absolute without resolving symlinks, so an uploaded link keeps its own name.
-	let source = std::path::absolute(source_str)
-		.map_err(|_| UI::failure(&format!("No such local file or directory: {}", source_str)))?;
-	std::fs::symlink_metadata(&source)
-		.map_err(|_| UI::failure(&format!("No such local file or directory: {}", source_str)))?;
-	let is_dir = std::fs::metadata(&source)
-		.map_err(|e| UI::failure(&format!("Cannot read {}: {}", source.display(), e)))?
-		.is_dir();
-	let name = upload_name(&source)?;
+	let several = sources.len() > 1;
+	// A single source that cannot be read fails before anything is asked of the drive.
+	let mut locals = Vec::with_capacity(sources.len());
+	for source in sources {
+		match LocalSource::read(source) {
+			Err(e) if !several => return Err(e),
+			local => locals.push((source, local)),
+		}
+	}
 
 	// Without a destination, upload into the working directory.
-	let into = destination_str.is_none_or(|destination| destination.ends_with('/'));
+	let into = several || destination_str.is_none_or(|destination| destination.ends_with('/'));
 	let destination_path = working_path.navigate(destination_str.unwrap_or(""));
 	let client = client.get(ui).await?.clone();
-	let destination = find_remote(&client, &destination_path).await?;
+	if several && let RemoteItem::File = find_remote(&client, &destination_path).await? {
+		return Err(UI::failure(&format!(
+			"Not a directory: {}",
+			destination_path
+		)));
+	}
+
+	let progress = TransferProgress::new(TransferKind::Upload, ui);
+	let mut uploaded = None;
+	for (source, local) in locals {
+		let result = match local {
+			Ok(local) => {
+				upload_source(
+					ui,
+					&client,
+					&progress,
+					local,
+					&destination_path,
+					into,
+					&options,
+				)
+				.await
+			}
+			Err(e) => Err(e),
+		};
+		match result {
+			Ok(done) => uploaded = Some(done),
+			Err(e) if several && !ends_the_command(&e) => {
+				progress.push_failures([source_failure(source, &e)]);
+			}
+			Err(e) => return Err(e),
+		}
+	}
+
+	let (subject, destination) = if several {
+		(
+			format!("{} items to {}", sources.len(), destination_path),
+			destination_path.to_string(),
+		)
+	} else {
+		let (source, target) = uploaded
+			.expect("a single upload that did not fail has a target (should be impossible)");
+		(format!("{} to {}", source, target), target)
+	};
+	finish(ui, &progress, &subject, &destination)
+}
+
+/// Upload `local` to `destination_path`, inside it when `into` says so, returning the source and
+/// the remote path it was uploaded to.
+async fn upload_source(
+	ui: &mut UI,
+	client: &Arc<Client>,
+	progress: &TransferProgress,
+	local: LocalSource,
+	destination_path: &RemotePath,
+	into: bool,
+	options: &DirUploadOptions,
+) -> Result<(String, String)> {
+	let destination = find_remote(client, destination_path).await?;
 	let target = resolve_upload_target(
-		&destination_path,
+		destination_path,
 		into,
 		destination.existing(),
-		&name,
-		is_dir,
+		&local.name,
+		local.is_dir,
 	)?;
 	let parent_dir = match destination {
-		RemoteItem::Dir(dir) if target.parent == destination_path => dir,
-		_ => find_or_create_remote_dir(&client, &target.parent).await?,
+		RemoteItem::Dir(dir) if &target.parent == destination_path => dir,
+		_ => find_or_create_remote_dir(client, &target.parent).await?,
 	};
 
 	let target_path = target.parent.navigate(target.name.as_ref());
 
-	let progress = TransferProgress::new(TransferKind::Upload, ui);
-	let transferred = if is_dir {
+	let transferred = if local.is_dir {
 		run_cancellable(
 			ui,
-			&progress,
+			progress,
 			upload_directory(
-				&client,
-				&progress,
-				&source,
+				client,
+				progress,
+				&local.path,
 				target.name.as_ref(),
 				&target_path,
 				&parent_dir,
-				options,
+				options.clone(),
 			),
 		)
 		.await?
 	} else {
 		run_cancellable(
 			ui,
-			&progress,
+			progress,
 			upload_file(
-				&client,
-				&progress,
-				&source,
+				client,
+				progress,
+				&local.path,
 				target.name.as_ref(),
 				&parent_dir,
 				options.existing,
@@ -338,14 +460,7 @@ pub(crate) async fn upload(
 		.await?
 	};
 	transferred.context("Failed to upload")?;
-
-	let destination = target_path.to_string();
-	finish(
-		ui,
-		&progress,
-		&format!("{} to {}", source.display(), destination),
-		&destination,
-	)
+	Ok((local.path.display().to_string(), target_path.to_string()))
 }
 
 /// What a transfer's destination path names.
@@ -472,27 +587,85 @@ fn upload_name(source: &Path) -> Result<String> {
 		.ok_or_else(|| UI::failure(&format!("Cannot upload {}", source.display())))
 }
 
-/// Download a remote file, or a remote directory and everything below it, to a local path, as
-/// `options` say.
+/// Where a download goes.
+struct DownloadDestination<'a> {
+	path: &'a Path,
+	/// Whether the item goes inside `path` under its own name, as with a trailing separator.
+	into: bool,
+	/// What `path` named before the download.
+	existing: Existing,
+}
+
+/// Download remote files, or remote directories and everything below them, to a local path, as
+/// `options` say. Several sources go into `destination_str` as a directory, and one that fails is
+/// reported among the failures while the others are still downloaded.
 pub(crate) async fn download(
 	ui: &mut UI,
 	client: &mut LazyClient,
 	working_path: &RemotePath,
-	source_str: &str,
+	sources: &[String],
 	destination_str: Option<&str>,
 	options: DirDownloadOptions,
 ) -> Result<()> {
+	let several = sources.len() > 1;
 	let destination_str = destination_str.unwrap_or(".");
-	let into = destination_str.ends_with(std::path::is_separator);
+	let into = several || destination_str.ends_with(std::path::is_separator);
 	let existing = local_existing(Path::new(destination_str))?;
-	let destination = match existing {
+	if several && existing == Existing::File {
+		return Err(UI::failure(&format!(
+			"Not a directory: {}",
+			destination_str
+		)));
+	}
+	let destination_path = match existing {
 		Existing::Dir | Existing::File => std::fs::canonicalize(destination_str),
 		Existing::Nothing => std::path::absolute(destination_str),
 	}
 	.map_err(|e| UI::failure(&format!("Cannot read {}: {}", destination_str, e)))?;
+	let destination = DownloadDestination {
+		path: &destination_path,
+		into,
+		existing,
+	};
 
-	let source_path = working_path.navigate(source_str);
 	let client = client.get(ui).await?.clone();
+	let progress = TransferProgress::new(TransferKind::Download, ui);
+	let mut downloaded = None;
+	for source in sources {
+		let source_path = working_path.navigate(source);
+		match download_source(ui, &client, &progress, &source_path, &destination, &options).await {
+			Ok(target) => downloaded = Some((source_path, target)),
+			Err(e) if several && !ends_the_command(&e) => {
+				progress.push_failures([source_failure(source, &e)]);
+			}
+			Err(e) => return Err(e),
+		}
+	}
+
+	let (subject, destination) = if several {
+		let destination = destination_path.display().to_string();
+		(
+			format!("{} items to {}", sources.len(), destination),
+			destination,
+		)
+	} else {
+		let (source_path, target) = downloaded
+			.expect("a single download that did not fail has a target (should be impossible)");
+		(format!("{} to {}", source_path, target), target)
+	};
+	finish(ui, &progress, &subject, &destination)
+}
+
+/// Download the item at `source_path` to `destination`, returning the local path it was
+/// downloaded to.
+async fn download_source(
+	ui: &mut UI,
+	client: &Arc<Client>,
+	progress: &TransferProgress,
+	source_path: &RemotePath,
+	destination: &DownloadDestination<'_>,
+	options: &DirDownloadOptions,
+) -> Result<String> {
 	let Some(item) = client
 		.find_item_at_path(&source_path.0)
 		.await
@@ -512,7 +685,13 @@ pub(crate) async fn download(
 		}
 		NonRootFileType::Root(_) => DownloadSource::Root,
 	};
-	let target = resolve_download_target(&destination, into, existing, source, &source_path)?;
+	let target = resolve_download_target(
+		destination.path,
+		destination.into,
+		destination.existing,
+		source,
+		source_path,
+	)?;
 	// A directory download creates its own target directory and any missing ones above it.
 	if let DownloadSource::File(_) = source
 		&& let Some(parent) = target.parent()
@@ -526,13 +705,12 @@ pub(crate) async fn download(
 		})?;
 	}
 
-	let progress = TransferProgress::new(TransferKind::Download, ui);
 	let transferred = match &item {
 		NonRootFileType::File(file) => {
 			run_cancellable(
 				ui,
-				&progress,
-				download_file(&client, &progress, file.as_ref(), &target, options.existing),
+				progress,
+				download_file(client, progress, file.as_ref(), &target, options.existing),
 			)
 			.await?
 		}
@@ -540,8 +718,8 @@ pub(crate) async fn download(
 			let dir = DirType::Dir(Cow::Owned(dir.as_ref().clone()));
 			run_cancellable(
 				ui,
-				&progress,
-				download_directory(&client, &progress, dir, &target, options),
+				progress,
+				download_directory(client, progress, dir, &target, options.clone()),
 			)
 			.await?
 		}
@@ -549,21 +727,14 @@ pub(crate) async fn download(
 			let root = DirType::Root(Cow::Owned(root.as_ref().clone()));
 			run_cancellable(
 				ui,
-				&progress,
-				download_directory(&client, &progress, root, &target, options),
+				progress,
+				download_directory(client, progress, root, &target, options.clone()),
 			)
 			.await?
 		}
 	};
 	transferred.context("Failed to download")?;
-
-	let destination = target.display().to_string();
-	finish(
-		ui,
-		&progress,
-		&format!("{} to {}", source_path, destination),
-		&destination,
-	)
+	Ok(target.display().to_string())
 }
 
 /// What a local path names, following symlinks.
@@ -973,6 +1144,9 @@ struct ProgressState {
 	done_bytes: u64,
 	/// The files left out for what was already at their target, which are not in the totals.
 	skipped_files: u64,
+	/// The counters as the item being transferred found them, which its own counts add to: a
+	/// transfer of several items adds them all up.
+	item_base: ItemBase,
 	/// `(when, done_bytes)`, oldest first, reaching back just past [`SPEED_WINDOW`].
 	speed_samples: VecDeque<(Instant, u64)>,
 	last_render: Option<Instant>,
@@ -985,7 +1159,32 @@ struct ProgressState {
 	skipped_symlinks: Vec<String>,
 }
 
+/// The counters at the start of one of a transfer's items.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ItemBase {
+	total_files: u64,
+	total_bytes: u64,
+	done_files: u64,
+	done_bytes: u64,
+}
+
 impl ProgressState {
+	/// Start counting a new item on top of what the items before it counted.
+	fn start_item(&mut self) {
+		self.item_base = ItemBase {
+			total_files: self.total_files,
+			total_bytes: self.total_bytes,
+			done_files: self.done_files,
+			done_bytes: self.done_bytes,
+		};
+	}
+
+	/// The item's own totals so far, on top of the earlier items'.
+	fn set_item_totals(&mut self, files: u64, bytes: u64) {
+		self.total_files = self.item_base.total_files.saturating_add(files);
+		self.total_bytes = self.item_base.total_bytes.saturating_add(bytes);
+	}
+
 	/// Note `done_bytes` at `now` for the speed, at most once per [`RENDER_INTERVAL`], and drop the
 	/// samples the window no longer needs.
 	fn sample_speed(&mut self, now: Instant) {
@@ -1196,8 +1395,8 @@ impl TransferProgress {
 	/// Begin a single-file transfer of known size — there is no scan phase for those.
 	fn start_single_item(&self, size: u64) {
 		let mut state = self.state.lock().unwrap();
-		state.total_files = 1;
-		state.total_bytes = size;
+		state.start_item();
+		state.set_item_totals(1, size);
 		state.sample_speed(Instant::now());
 		self.render(&mut state, true);
 	}
@@ -1206,8 +1405,11 @@ impl TransferProgress {
 	/// few byte deltas, so set the counters outright instead of adding to them.
 	fn complete_single_item(&self) {
 		let mut state = self.state.lock().unwrap();
-		state.done_files = state.total_files;
-		state.done_bytes = state.total_bytes;
+		let base = state.item_base;
+		state.done_files = base.done_files.saturating_add(1);
+		state.done_bytes = base
+			.done_bytes
+			.saturating_add(state.total_bytes.saturating_sub(base.total_bytes));
 		self.render(&mut state, true);
 	}
 
@@ -1224,22 +1426,21 @@ impl TransferProgress {
 
 	fn start_scan(&self) {
 		let mut state = self.state.lock().unwrap();
+		state.start_item();
 		state.scanning = true;
 		self.render(&mut state, true);
 	}
 
 	fn report_scan(&self, known_files: u64, known_bytes: u64) {
 		let mut state = self.state.lock().unwrap();
-		state.total_files = known_files;
-		state.total_bytes = known_bytes;
+		state.set_item_totals(known_files, known_bytes);
 		self.render(&mut state, false);
 	}
 
 	fn finish_scan(&self, total_files: u64, total_bytes: u64) {
 		let mut state = self.state.lock().unwrap();
 		state.scanning = false;
-		state.total_files = total_files;
-		state.total_bytes = total_bytes;
+		state.set_item_totals(total_files, total_bytes);
 		state.sample_speed(Instant::now());
 		self.render(&mut state, true);
 	}
@@ -1506,11 +1707,11 @@ mod tests {
 	use super::{
 		DownloadSource, Existing, FilterArgs, ProgressState, SPEED_WINDOW, TransferFailure,
 		TransferKind, TransferProgress, UploadTarget, canceled_message, download_target,
-		existing_remote_policy, format_duration, local_existing, progress_line,
+		ends_the_command, existing_remote_policy, format_duration, local_existing, progress_line,
 		resolve_download_target, resolve_upload_target, result_json, skipped_symlinks_line,
-		transfer_summary,
+		source_failure, sources_and_destination, transfer_summary,
 	};
-	use crate::{error::CliError, util::RemotePath};
+	use crate::{error::CliError, ui::UI, util::RemotePath};
 
 	const MIB: u64 = 1024 * 1024;
 
@@ -1720,6 +1921,65 @@ mod tests {
 		assert_eq!(
 			error.downcast_ref::<CliError>().map(CliError::exit_code),
 			Some(2)
+		);
+	}
+
+	#[test]
+	fn a_single_path_is_the_source_alone() {
+		assert_eq!(
+			sources_and_destination("a".to_owned(), Vec::new()),
+			(vec!["a".to_owned()], None)
+		);
+	}
+
+	#[test]
+	fn the_last_of_several_paths_is_the_destination() {
+		assert_eq!(
+			sources_and_destination("a".to_owned(), vec!["b".to_owned()]),
+			(vec!["a".to_owned()], Some("b".to_owned()))
+		);
+		assert_eq!(
+			sources_and_destination("a".to_owned(), vec!["b".to_owned(), "c".to_owned()]),
+			(vec!["a".to_owned(), "b".to_owned()], Some("c".to_owned()))
+		);
+	}
+
+	#[test]
+	fn the_counts_of_several_items_add_up() {
+		let progress = quiet_progress();
+		progress.start_single_item(100);
+		progress.complete_single_item();
+		progress.start_single_item(50);
+		progress.complete_single_item();
+		progress.start_scan();
+		progress.finish_scan(3, 300);
+		let state = progress.state.lock().unwrap();
+		assert_eq!(
+			(
+				state.total_files,
+				state.total_bytes,
+				state.done_files,
+				state.done_bytes
+			),
+			(5, 450, 2, 150)
+		);
+	}
+
+	#[test]
+	fn an_interrupt_ends_the_command_but_an_items_failure_does_not() {
+		assert!(ends_the_command(&CliError::Interrupted.into()));
+		assert!(!ends_the_command(&UI::failure("No such file")));
+	}
+
+	#[test]
+	fn the_failure_of_one_of_several_items_is_named_as_given() {
+		let error = UI::failure("No such file or directory: /x").context("Failed to download");
+		assert_eq!(
+			source_failure("x", &error),
+			TransferFailure {
+				path: Some("x".to_owned()),
+				error: "Failed to download: No such file or directory: /x".to_owned(),
+			}
 		);
 	}
 
