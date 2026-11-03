@@ -6,7 +6,8 @@
 //! existing directory or ends in `/`, keeping its name: `upload ./notes /backups` creates
 //! `/backups/notes`, and `download /backups/notes .` creates `./notes`. Any other destination is
 //! the transferred item's new path: `upload ./notes.txt /backups/old.txt` uploads it as `old.txt`.
-//! Uploading a file to the path of an existing file replaces it with a new version.
+//! Uploading a file to the path of an existing file replaces it with a new version. Missing
+//! directories on the way to an upload's destination are created.
 //! Downloading `/` writes the whole drive's contents into the destination.
 //!
 //! When a single item inside a directory transfer fails, the rest of the transfer still completes
@@ -60,8 +61,8 @@ pub(crate) enum TransferCommands {
 		#[arg(add = ArgValueCompleter::new(PathCompleter::any()))]
 		source: String,
 		/// Directory in the Filen drive to upload into, or the uploaded item's new path when it is
-		/// not an existing directory and does not end in "/" (default: the current working
-		/// directory)
+		/// not an existing directory and does not end in "/"; missing directories are created
+		/// (default: the current working directory)
 		#[arg(add = FilenCompleter::file_or_directory())]
 		destination: Option<String>,
 	},
@@ -137,18 +138,7 @@ pub(crate) async fn upload(
 	)?;
 	let parent_dir = match destination {
 		RemoteItem::Dir(dir) if target.parent == destination_path => dir,
-		_ => match find_remote(&client, &target.parent).await? {
-			RemoteItem::Dir(dir) => dir,
-			RemoteItem::File => {
-				return Err(UI::failure(&format!("Not a directory: {}", target.parent)));
-			}
-			RemoteItem::Nothing => {
-				return Err(UI::failure(&format!(
-					"No such directory: {}",
-					target.parent
-				)));
-			}
-		},
+		_ => find_or_create_remote_dir(&client, &target.parent).await?,
 	};
 
 	let progress = TransferProgress::new(TransferKind::Upload, ui);
@@ -231,6 +221,24 @@ async fn find_remote<'a>(client: &'a Client, path: &RemotePath) -> Result<Remote
 	}
 }
 
+/// The directory at `path`, created along with any missing directories above it, like `mkdir -p`.
+///
+/// No drive lock spans this, the lookup of the destination before it and the upload after it, so
+/// they are not atomic: the checks only turn the usual mistakes into clear failures early, and the
+/// server still decides on the upload itself.
+async fn find_or_create_remote_dir<'a>(
+	client: &'a Client,
+	path: &RemotePath,
+) -> Result<DirType<'a, Normal>> {
+	client.find_or_create_dir(&path.0).await.map_err(|e| {
+		if e.kind() == ErrorKind::InvalidType {
+			UI::failure(&format!("Path contains a file in between: {}", path))
+		} else {
+			anyhow::Error::from(e).context("Failed to create remote directory")
+		}
+	})
+}
+
 /// Where an upload goes: under `name` in the remote directory `parent`.
 #[derive(Debug, PartialEq, Eq)]
 struct UploadTarget {
@@ -250,8 +258,8 @@ impl UploadTarget {
 
 /// Where uploading the item named `source_name` to `destination` puts it. An existing directory,
 /// or a destination given as one (`into`, from a trailing "/"), takes the item under its own name;
-/// any other destination is the item's new path. A file may replace an existing file, which
-/// becomes a new version of it, but a directory may not.
+/// any other destination is the item's new path. The target's parent may not exist yet. A file may
+/// replace an existing file, which becomes a new version of it, but a directory may not.
 fn resolve_upload_target(
 	destination: &RemotePath,
 	into: bool,
@@ -273,9 +281,7 @@ fn resolve_upload_target(
 			destination
 		))),
 		Existing::File => new_path(),
-		Existing::Nothing if into => {
-			Err(UI::failure(&format!("No such directory: {}", destination)))
-		}
+		Existing::Nothing if into => UploadTarget::new(destination.clone(), source_name),
 		Existing::Nothing => new_path(),
 	}
 }
@@ -896,18 +902,17 @@ mod tests {
 	}
 
 	#[test]
-	fn an_upload_into_a_missing_directory_is_refused() {
+	fn an_upload_into_a_missing_directory_goes_inside_it() {
 		assert_eq!(
 			resolve_upload_target(
-				&RemotePath::new("/x"),
+				&RemotePath::new("/x/y"),
 				true,
 				Existing::Nothing,
 				"a.txt",
 				false
 			)
-			.unwrap_err()
-			.to_string(),
-			"No such directory: /x"
+			.unwrap(),
+			upload_target("/x/y", "a.txt")
 		);
 	}
 
