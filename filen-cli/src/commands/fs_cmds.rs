@@ -61,6 +61,8 @@ pub(crate) enum FsCommands {
 		#[arg(add = FilenCompleter::directory())]
 		directory: String,
 	},
+	/// Print the working directory
+	Pwd,
 	/// List files in a directory
 	Ls {
 		/// Directory to list files in, or a file to show (default: the current working directory)
@@ -204,6 +206,7 @@ pub(crate) enum FsCommands {
 /// The commands that open the docs' "Accessing Files" section, before `search`.
 pub(crate) const BROWSING_DOCS: &[DocElement] = &[
 	DocElement::CommandHelp("cd"),
+	DocElement::CommandHelp("pwd"),
 	DocElement::CommandHelp("ls"),
 	DocElement::CommandHelp("cat"),
 	DocElement::CommandHelp("head"),
@@ -245,6 +248,7 @@ impl FsCommands {
 					..Default::default()
 				});
 			}
+			Self::Pwd => print_working_path(ui, working_path)?,
 			Self::Ls { directory, long } => {
 				list_directory(ui, client, working_path, directory, long).await?;
 			}
@@ -330,6 +334,16 @@ pub(crate) async fn cd(
 			_ => Err(UI::failure(&format!("Not a directory: {}", directory.0))),
 		},
 		None => Err(UI::failure(&format!("No such directory: {}", directory.0))),
+	}
+}
+
+/// Prints the working directory: the REPL's, or the one `--working-path` gives.
+fn print_working_path(ui: &mut UI, working_path: &RemotePath) -> Result<()> {
+	if ui.json {
+		ui.print_json(json!({ "path": working_path.0 }))
+	} else {
+		ui.print(&working_path.0);
+		Ok(())
 	}
 }
 
@@ -3688,5 +3702,23 @@ mod tests {
 	#[test]
 	fn a_directory_returned_under_a_name_differing_in_case_existed() {
 		assert_eq!(existing_directory_name(Some("docs"), "Docs"), Some("Docs"));
+	}
+
+	#[test]
+	fn pwd_prints_the_working_path() {
+		let printed = Printed::default();
+		print_working_path(&mut printed.ui(), &RemotePath::new("/a/b")).unwrap();
+
+		assert_eq!(printed.lines(), "/a/b");
+	}
+
+	#[test]
+	fn pwd_json_prints_the_working_path_as_an_object() {
+		let printed = Printed::default();
+		let mut ui = printed.ui();
+		ui.set_quiet_and_json(false, true);
+		print_working_path(&mut ui, &RemotePath::new("/a/b")).unwrap();
+
+		assert_eq!(printed.lines(), "{\n  \"path\": \"/a/b\"\n}");
 	}
 }

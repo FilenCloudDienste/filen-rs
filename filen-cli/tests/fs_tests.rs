@@ -1248,3 +1248,21 @@ async fn touch_creates_an_empty_file() {
 
 	assert_eq!(content_at(client, &path).await, b"");
 }
+
+#[test]
+fn pwd_prints_the_working_path_without_logging_in() {
+	let output = run_logged_out_without_a_terminal(&["pwd"]);
+
+	assert_eq!(output.status.code(), Some(0));
+	assert_eq!(String::from_utf8(output.stdout).unwrap(), "/\n");
+}
+
+#[shared_test_runtime]
+async fn pwd_prints_the_working_path_it_is_given() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let test_dir = format!("/{}", resources.dir.name().unwrap());
+
+	authenticated_cli_with_args!("--working-path", &test_dir, "pwd")
+		.success()
+		.stdout(format!("{test_dir}\n"));
+}
