@@ -778,9 +778,9 @@ pub(crate) async fn move_file_or_directory(
 		}
 		None => None,
 	};
-	let (destination_dir, new_name, new_path) = match destination_dir {
+	let (new_name, new_path, destination_dir_path) = match &destination_dir {
 		// the destination is an existing directory, so move the source into it as-is
-		Some(destination_dir) => {
+		Some(_) => {
 			let new_path = destination_path.navigate(&source_filename);
 			if new_path == source_path {
 				return Err(UI::failure(&format!(
@@ -788,19 +788,7 @@ pub(crate) async fn move_file_or_directory(
 					source_path.0, destination_path.0
 				)));
 			}
-			// check that the destination doesn't already exist
-			if client
-				.find_item_at_path(&new_path.0)
-				.await
-				.context("Failed to check destination")?
-				.is_some()
-			{
-				return Err(UI::failure(&format!(
-					"Destination already exists: {}",
-					new_path.0
-				)));
-			}
-			(destination_dir, source_filename.clone(), new_path)
+			(source_filename.clone(), new_path, destination_path.clone())
 		}
 		// the destination doesn't exist, so it names the source's new path
 		None => {
@@ -808,28 +796,10 @@ pub(crate) async fn move_file_or_directory(
 			let Some(new_name) = destination_path.basename() else {
 				return Err(UI::failure("Cannot move onto the root directory"));
 			};
-			let parent_path = destination_path.parent();
-			let destination_dir = match client
-				.find_item_at_path(&parent_path.0)
-				.await
-				.context("Failed to find destination parent directory")?
-			{
-				Some(NonRootFileType::Dir(dir)) => DirType::Dir(dir),
-				Some(NonRootFileType::Root(root)) => DirType::Root(root),
-				Some(NonRootFileType::File(_)) => {
-					return Err(UI::failure(&format!("Not a directory: {}", parent_path.0)));
-				}
-				None => {
-					return Err(UI::failure(&format!(
-						"No such destination directory: {}",
-						parent_path.0
-					)));
-				}
-			};
 			(
-				destination_dir,
 				new_name.to_string(),
 				destination_path.clone(),
+				destination_path.parent(),
 			)
 		}
 	};
@@ -838,6 +808,51 @@ pub(crate) async fn move_file_or_directory(
 		return Err(UI::failure(&format!(
 			"Cannot move {} into itself: {}",
 			source_path.0, new_path.0
+		)));
+	}
+
+	let destination_dir = match destination_dir {
+		Some(destination_dir) => destination_dir,
+		None => match client
+			.find_item_at_path(&destination_dir_path.0)
+			.await
+			.context("Failed to find destination directory")?
+		{
+			Some(NonRootFileType::Dir(dir)) => DirType::Dir(dir),
+			Some(NonRootFileType::Root(root)) => DirType::Root(root),
+			Some(NonRootFileType::File(_)) => {
+				return Err(UI::failure(&format!(
+					"Not a directory: {}",
+					destination_dir_path.0
+				)));
+			}
+			None => {
+				return Err(UI::failure(&format!(
+					"No such destination directory: {}",
+					destination_dir_path.0
+				)));
+			}
+		},
+	};
+
+	// The server treats names that differ only in case as the same, so the destination
+	// directory is listed to compare them case-insensitively. The moved item does not clash with
+	// itself, so renaming it to a name that differs from its own only in case works.
+	let (existing_dirs, existing_files) = client
+		.list_dir::<_, Normal>(&destination_dir, None::<&fn(u64, Option<u64>)>)
+		.await
+		.context("Failed to list destination directory")?;
+	let source_uuid = source.uuid();
+	let existing_names = existing_dirs
+		.iter()
+		.map(|dir| (dir.uuid(), dir.name()))
+		.chain(existing_files.iter().map(|file| (file.uuid(), file.name())))
+		.filter(|(uuid, _)| *uuid != source_uuid)
+		.filter_map(|(_, name)| name);
+	if let Some(existing_name) = clashing_name(existing_names, &new_name) {
+		return Err(UI::failure(&format!(
+			"Destination already exists: {}",
+			destination_dir_path.navigate(existing_name)
 		)));
 	}
 

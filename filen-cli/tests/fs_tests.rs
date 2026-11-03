@@ -160,3 +160,60 @@ async fn cp_refuses_a_directory_whose_name_exists_in_the_destination() {
 			.is_none()
 	);
 }
+
+#[shared_test_runtime]
+async fn mv_refuses_a_destination_whose_name_differs_only_in_case() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = format!("/{}", resources.dir.name().unwrap());
+	test_utils::create_remote_file_structure_outline(
+		client,
+		resources.dir.clone(),
+		&["a.txt", "dest/A.TXT"],
+	)
+	.await
+	.unwrap();
+
+	authenticated_cli_with_args!(
+		"mv",
+		&format!("{test_dir}/a.txt"),
+		&format!("{test_dir}/dest")
+	)
+	.failure()
+	.stderr(predicates::str::contains(format!(
+		"Destination already exists: {test_dir}/dest/A.TXT"
+	)));
+
+	assert!(matches!(
+		client
+			.find_item_at_path(&format!("{test_dir}/a.txt"))
+			.await
+			.unwrap(),
+		Some(NonRootFileType::File(_))
+	));
+}
+
+#[shared_test_runtime]
+async fn mv_renames_an_item_to_a_name_differing_only_in_case() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = format!("/{}", resources.dir.name().unwrap());
+	test_utils::create_remote_file_structure_outline(client, resources.dir.clone(), &["a.txt"])
+		.await
+		.unwrap();
+
+	authenticated_cli_with_args!(
+		"mv",
+		&format!("{test_dir}/a.txt"),
+		&format!("{test_dir}/A.txt")
+	)
+	.success();
+
+	assert!(matches!(
+		client
+			.find_item_at_path(&format!("{test_dir}/A.txt"))
+			.await
+			.unwrap(),
+		Some(NonRootFileType::File(_))
+	));
+}
