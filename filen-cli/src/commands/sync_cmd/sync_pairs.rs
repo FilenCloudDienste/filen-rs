@@ -265,7 +265,9 @@ fn parse_sync_pair_definition(pair: &str) -> Result<ParsedPair> {
 			// `C:dir`, a path on the drive C:, is no mode
 			None if is_mode_token(token) && !is_drive_letter(local) => {
 				return Err(UI::usage_failure(&format!(
-					"Invalid sync mode \"{token}\" in the sync pair \"{pair}\": expected one of {}",
+					"Invalid sync mode \"{token}\" in the sync pair \"{pair}\": expected one of {}. \
+					 The remote path is what follows the last \":\", so a remote path with \":\" in \
+					 it can only be given in a sync pairs file.",
 					sync_mode_names()
 				)));
 			}
@@ -617,7 +619,9 @@ mod tests {
 			error.to_string(),
 			"Invalid sync mode \"twoway\" in the sync pair \"/home/me/docs:twoway:/docs\": \
 			 expected one of twoWay, tw, localToRemote, localToCloud, ltc, remoteToLocal, \
-			 cloudToLocal, ctl, localBackup, lb, remoteBackup, cloudBackup, cb"
+			 cloudToLocal, ctl, localBackup, lb, remoteBackup, cloudBackup, cb. The remote path is \
+			 what follows the last \":\", so a remote path with \":\" in it can only be given in a \
+			 sync pairs file."
 		);
 	}
 
