@@ -879,7 +879,8 @@ impl UI {
 				Styles::plain()
 			})
 			.help_template("{usage}\n{about}")
-			.render_help();
+			// the long help's `{about}` is the whole description, not only its first paragraph
+			.render_long_help();
 		format!(
 			"{}{}",
 			//style("◊").green().bold().bright(),

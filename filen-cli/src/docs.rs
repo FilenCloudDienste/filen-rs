@@ -305,8 +305,9 @@ fn format_markdown_section(section: &ParsedDocSection) -> String {
 }
 
 fn format_markdown_command_help(cmd: &mut clap::Command) -> String {
-	let render_help_text_template = |template: &'static str| {
-		cmd.clone()
+	let render_help_text_template = |template: &'static str, long: bool| {
+		let mut cmd = cmd
+			.clone()
 			.styles(if console::colors_enabled() {
 				Styles::styled()
 					.literal(anstyle::Style::new())
@@ -315,13 +316,25 @@ fn format_markdown_command_help(cmd: &mut clap::Command) -> String {
 			} else {
 				Styles::plain()
 			})
-			.help_template(template)
-			.render_help()
-			.to_string()
+			.help_template(template);
+		match long {
+			true => cmd.render_long_help(),
+			false => cmd.render_help(),
+		}
+		.to_string()
 	};
-	let usage = render_help_text_template("{usage}");
-	let about = render_help_text_template("{about}");
-	let args = render_help_text_template("{positionals}\n{options}")
+	let usage = render_help_text_template("{usage}", false);
+	// the long help's `{about}` is the whole description, not only its first paragraph
+	let about = render_help_text_template("{about}", true)
+		.trim()
+		.lines()
+		.map(|line| match line.trim_end() {
+			"" => ">".to_owned(),
+			line => format!("> {line}"),
+		})
+		.collect::<Vec<_>>()
+		.join("\n");
+	let args = render_help_text_template("{positionals}\n{options}", false)
 		.lines()
 		.filter(|l| !l.contains("--help")) // filter out help flag line that is erraneously included by clap
 		.map(|l| {
@@ -343,12 +356,7 @@ fn format_markdown_command_help(cmd: &mut clap::Command) -> String {
 			}
 		})
 		.collect::<Vec<_>>();
-	format!(
-		"> `{}`  \n> {}{}",
-		usage.trim(),
-		about.trim(),
-		args.join("")
-	)
+	format!("> `{}`  \n{}{}", usage.trim(), about, args.join(""))
 }
 
 // in-app docs
@@ -653,6 +661,31 @@ mod tests {
 				"{id}"
 			);
 		}
+	}
+
+	/// The command `name`, as the help shows it.
+	fn command(name: &str) -> clap::Command {
+		CliArgs::command().find_subcommand(name).unwrap().clone()
+	}
+
+	#[test]
+	fn a_commands_help_shows_its_whole_description() {
+		let help = UI::format_command_help(&mut command("set-sync-mode"));
+		assert!(
+			help.contains("Change the mode of a sync pair, from its next pass on\n\nBy default, "),
+			"{help}"
+		);
+	}
+
+	#[test]
+	fn a_commands_markdown_help_quotes_its_whole_description() {
+		let help = format_markdown_command_help(&mut command("set-sync-mode"));
+		assert!(
+			help.contains(
+				"> Change the mode of a sync pair, from its next pass on\n>\n> By default, "
+			),
+			"{help}"
+		);
 	}
 
 	#[test]
