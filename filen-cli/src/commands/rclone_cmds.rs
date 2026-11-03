@@ -6,6 +6,7 @@
 
 use std::{
 	fmt,
+	net::{Ipv4Addr, Ipv6Addr},
 	path::{Path, PathBuf},
 };
 
@@ -206,6 +207,7 @@ pub(crate) async fn start_server(
 	client: &mut LazyClient,
 	args: ServeArgs,
 ) -> Result<()> {
+	check_serve_args(args.protocol, args.read_only)?;
 	let name = display_name(args.protocol);
 	let (host, port) = match &args.address {
 		Some(address) => parse_address(address)?,
@@ -525,16 +527,36 @@ fn default_port(protocol: ServeProtocol) -> u16 {
 	}
 }
 
-/// The host and port of `address`, `<host>:<port>` with an IPv6 host in brackets. The daemon
-/// refuses a host that is not an IP address or `localhost`, such as the empty one of `:<port>`.
+/// The options of a `serve` that the daemon would refuse whatever the address and credentials, so
+/// that they are refused before logging in: a restic server writes to the drive without the cache,
+/// so it cannot be read-only.
+fn check_serve_args(protocol: ServeProtocol, read_only: bool) -> Result<()> {
+	if protocol == ServeProtocol::Restic && read_only {
+		return Err(UI::usage_failure("A restic server cannot be read-only"));
+	}
+	Ok(())
+}
+
+/// The host and port of `address`, `<ip>:<port>` with an IPv6 address in brackets, or
+/// `localhost:<port>`: the hosts the daemon listens on. Any other host, such as the empty one of
+/// `:<port>`, is refused.
 fn parse_address(address: &str) -> Result<(String, u16)> {
-	let invalid = || UI::usage_failure(&format!("Invalid address {address}: expected <ip>:<port>"));
+	let invalid = || {
+		UI::usage_failure(&format!(
+			"Invalid address {address}: expected <ip>:<port> (an IPv6 address in brackets) or localhost:<port>"
+		))
+	};
 	let (host, port) = address.rsplit_once(':').ok_or_else(invalid)?;
 	let port = port.parse().map_err(|_| invalid())?;
-	let host = host
+	let host = match host
 		.strip_prefix('[')
 		.and_then(|host| host.strip_suffix(']'))
-		.unwrap_or(host);
+	{
+		Some(v6) if v6.parse::<Ipv6Addr>().is_ok() => v6,
+		Some(_) => return Err(invalid()),
+		None if host == "localhost" || host.parse::<Ipv4Addr>().is_ok() => host,
+		None => return Err(invalid()),
+	};
 	Ok((host.to_owned(), port))
 }
 
@@ -705,9 +727,41 @@ mod tests {
 			("127.0.0.1".to_owned(), 8080)
 		);
 		assert_eq!(parse_address("[::1]:80").unwrap(), ("::1".to_owned(), 80));
-		assert_eq!(parse_address(":80").unwrap(), (String::new(), 80));
+		assert_eq!(
+			parse_address("localhost:80").unwrap(),
+			("localhost".to_owned(), 80)
+		);
 		assert!(parse_address("127.0.0.1").is_err());
 		assert!(parse_address("127.0.0.1:port").is_err());
+	}
+
+	#[test]
+	fn an_address_without_an_ip_is_a_usage_error() {
+		for address in [
+			":80",
+			"example.com:80",
+			"[localhost]:80",
+			"::1:80",
+			"[127.0.0.1]:80",
+		] {
+			let err = parse_address(address).unwrap_err();
+
+			assert_eq!(exit_code(&err), 2, "{address}");
+		}
+		assert_eq!(
+			format!("{:#}", parse_address(":80").unwrap_err()),
+			"Invalid address :80: expected <ip>:<port> (an IPv6 address in brackets) or localhost:<port>"
+		);
+	}
+
+	#[test]
+	fn a_read_only_restic_server_is_a_usage_error() {
+		let err = check_serve_args(ServeProtocol::Restic, true).unwrap_err();
+
+		assert_eq!(exit_code(&err), 2);
+		assert_eq!(format!("{err:#}"), "A restic server cannot be read-only");
+		assert!(check_serve_args(ServeProtocol::Restic, false).is_ok());
+		assert!(check_serve_args(ServeProtocol::Webdav, true).is_ok());
 	}
 
 	#[test]
