@@ -89,6 +89,7 @@ use std::{
 	borrow::Cow,
 	collections::{HashMap, HashSet},
 	path::Path,
+	pin,
 	sync::Arc,
 	time::{Duration, Instant},
 };
@@ -98,7 +99,7 @@ use clap::Subcommand;
 use console::style;
 use filen_sdk_rs::sync_engine::{
 	BaselineInUse, ConflictResolution, ConflictResolved, PairId, PairRecord, SyncEngine, SyncEvent,
-	UnsyncablePath, UnsyncableReason,
+	UnsyncablePath, UnsyncableReason, WatchHandle,
 };
 use log::{info, warn};
 use tokio::sync::mpsc;
@@ -366,9 +367,20 @@ async fn sync_continuously(
 	});
 	last_passes.stopping();
 	// waits for each pair's pass in flight, so it finishes and releases the drive lock
-	futures::future::join_all(watch_handles.into_iter().map(|watch| watch.stop())).await;
-	// what the passes in flight did since, which decides what they left; the flags settle nothing
-	// more, as the sync has stopped
+	let stopped = futures::future::join_all(watch_handles.into_iter().map(WatchHandle::stop));
+	let mut stopped = pin::pin!(stopped);
+	// What the passes in flight do meanwhile, as it happens, which decides what they left. The
+	// flags settle nothing more, as the sync is stopping.
+	loop {
+		tokio::select! {
+			_ = &mut stopped => break,
+			Some((pair_id, event)) = events_rx.recv() => {
+				last_passes.note(pair_id, &event);
+				let _ = log.print(ui, pair_id, &event);
+			}
+		}
+	}
+	// what the last of them sent just before it ended
 	while let Ok((pair_id, event)) = events_rx.try_recv() {
 		last_passes.note(pair_id, &event);
 		let _ = log.print(ui, pair_id, &event);
