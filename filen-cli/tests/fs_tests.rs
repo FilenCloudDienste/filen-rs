@@ -1072,3 +1072,130 @@ async fn cat_json_of_a_binary_file_fails() {
 			"Not UTF-8 text: {path}. Use cat without --json for binary content"
 		)));
 }
+
+#[shared_test_runtime]
+async fn write_writes_its_arguments_joined_by_spaces() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = format!("/{}", resources.dir.name().unwrap());
+	let path = format!("{test_dir}/a.txt");
+
+	authenticated_cli_with_args!("write", &path, "hello", "world")
+		.success()
+		.stdout(predicates::str::contains(format!("Wrote to {path}")));
+	assert_eq!(content_at(client, &path).await, b"hello world");
+
+	authenticated_cli_with_args!("write", &path, "replaced").success();
+	assert_eq!(content_at(client, &path).await, b"replaced");
+}
+
+#[shared_test_runtime]
+async fn write_without_content_arguments_writes_what_stdin_reads() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = format!("/{}", resources.dir.name().unwrap());
+	let path = format!("{test_dir}/a.bin");
+	let content = (0..=255u8).cycle().take(300_000).collect::<Vec<u8>>();
+
+	let (_auth_config_dir, auth_config) = test_utils::cli::prepare_cli_auth_config().await;
+	cargo_bin_cmd!("filen-cli")
+		.args([
+			"--auth-config-path",
+			auth_config.to_str().unwrap(),
+			"--skip-update",
+			"write",
+			&path,
+		])
+		.write_stdin(content.clone())
+		.assert()
+		.success();
+
+	assert!(
+		content_at(client, &path).await == content,
+		"the written bytes differ"
+	);
+}
+
+#[shared_test_runtime]
+async fn write_into_a_missing_directory_fails() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let test_dir = format!("/{}", resources.dir.name().unwrap());
+
+	authenticated_cli_with_args!("write", &format!("{test_dir}/missing/a.txt"), "x")
+		.failure()
+		.stderr(predicates::str::contains(format!(
+			"No such directory: {test_dir}/missing"
+		)));
+}
+
+#[shared_test_runtime]
+async fn write_to_a_directory_fails() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = format!("/{}", resources.dir.name().unwrap());
+	test_utils::create_remote_file_structure_outline(client, resources.dir.clone(), &["Dir/"])
+		.await
+		.unwrap();
+
+	authenticated_cli_with_args!("touch", &format!("{test_dir}/dir"))
+		.failure()
+		.stderr(predicates::str::contains(format!(
+			"Not a file: {test_dir}/Dir"
+		)));
+	authenticated_cli_with_args!("write", &format!("{test_dir}/Dir"), "x")
+		.failure()
+		.stderr(predicates::str::contains(format!(
+			"Not a file: {test_dir}/Dir"
+		)));
+}
+
+#[shared_test_runtime]
+async fn touch_on_an_existing_file_keeps_its_content_and_sets_its_modification_date() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = format!("/{}", resources.dir.name().unwrap());
+	let modified = Utc.with_ymd_and_hms(2020, 1, 2, 3, 4, 5).unwrap();
+	let builder = client
+		.make_file_builder("a.txt", resources.dir.uuid())
+		.unwrap()
+		.modified(modified);
+	let file = client.upload_file(builder, b"content").await.unwrap();
+	let before_touch = Utc::now() - chrono::Duration::minutes(5);
+
+	// a name differing only in case names the same file, as the server compares names
+	authenticated_cli_with_args!("touch", &format!("{test_dir}/A.TXT"))
+		.success()
+		.stdout(predicates::str::contains(format!(
+			"Updated the modification date of {test_dir}/a.txt"
+		)));
+
+	let Some(NonRootFileType::File(touched)) = client
+		.find_item_at_path(&format!("{test_dir}/a.txt"))
+		.await
+		.unwrap()
+	else {
+		panic!("Expected a file");
+	};
+	assert_eq!(touched.uuid(), file.uuid());
+	assert!(touched.last_modified().unwrap() > before_touch);
+	assert_eq!(
+		content_at(client, &format!("{test_dir}/a.txt")).await,
+		b"content"
+	);
+}
+
+#[shared_test_runtime]
+async fn touch_creates_an_empty_file() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = format!("/{}", resources.dir.name().unwrap());
+	let path = format!("{test_dir}/new.txt");
+
+	authenticated_cli_with_args!("touch", &path)
+		.success()
+		.stdout(predicates::str::contains(format!(
+			"Created empty file: {path}"
+		)));
+
+	assert_eq!(content_at(client, &path).await, b"");
+}

@@ -1,10 +1,12 @@
 use std::{
 	borrow::Cow,
 	cmp::Ordering,
+	io::{self, IsTerminal as _, Read as _},
 	iter::Peekable,
 	pin::pin,
 	str::Chars,
 	sync::{Arc, Mutex, MutexGuard, PoisonError},
+	thread,
 };
 
 use crate::{
@@ -44,7 +46,10 @@ use filen_sdk_rs::{
 	io::{RemoteDirectory, RemoteFile},
 };
 use filen_types::{fs::Uuid, traits::CowHelpers as _};
-use futures::{AsyncBufReadExt as _, AsyncReadExt as _};
+use futures::{
+	AsyncBufReadExt as _, AsyncRead, AsyncReadExt as _, SinkExt as _, TryStreamExt as _,
+	channel::mpsc, executor,
+};
 use serde_json::json;
 use tokio::select;
 
@@ -115,6 +120,21 @@ pub(crate) enum FsCommands {
 		/// move to trash)
 		#[arg(short, long)]
 		permanent: bool,
+	},
+	/// Write text to a file, creating it or replacing its content
+	Write {
+		/// File to write to
+		#[arg(add = FilenCompleter::file())]
+		file: String,
+		/// Text to write, its words joined by spaces (default: what stdin reads when it is not a
+		/// terminal, otherwise nothing)
+		content: Vec<String>,
+	},
+	/// Create an empty file, or set the modification date of an existing one to now
+	Touch {
+		/// File to create or touch
+		#[arg(add = FilenCompleter::file())]
+		file: String,
 	},
 	/// Move and/or rename a file or directory
 	Mv {
@@ -195,6 +215,8 @@ pub(crate) const BROWSING_DOCS: &[DocElement] = &[
 pub(crate) const ORGANIZING_DOCS: &[DocElement] = &[
 	DocElement::CommandHelp("mkdir"),
 	DocElement::CommandHelp("rm"),
+	DocElement::CommandHelp("write"),
+	DocElement::CommandHelp("touch"),
 	DocElement::CommandHelp("mv"),
 	DocElement::CommandHelp("cp"),
 	DocElement::CommandHelp("list-favorites"),
@@ -251,6 +273,10 @@ impl FsCommands {
 				delete_file_or_directory(ui, client, working_path, &file_or_directory, permanent)
 					.await?;
 			}
+			Self::Write { file, content } => {
+				write_file(ui, client, working_path, &file, &content).await?;
+			}
+			Self::Touch { file } => touch_file(ui, client, working_path, &file).await?,
 			Self::Mv {
 				source,
 				destination,
@@ -1179,6 +1205,171 @@ pub(crate) async fn delete_file_or_directory(
 		}
 	}
 	Ok(())
+}
+
+/// Where a file written to a path goes.
+struct FileToWrite<'a> {
+	parent: DirType<'a, Normal>,
+	/// The name of the file there already, as it differs from the path's only in case if at all,
+	/// or else the path's name.
+	name: String,
+	/// The path, with [`FileToWrite::name`].
+	path: RemotePath,
+	/// The file there already, which writing replaces.
+	existing: Option<RemoteFile>,
+}
+
+/// Finds where a file written to `path` goes: its parent directory must exist, and nothing there
+/// may be a directory whose name is the file's but for case. Names are compared ignoring case, as
+/// the server does: uploading a file whose name a file there has but for case replaces that file.
+async fn find_file_to_write<'a>(client: &'a Client, path: &RemotePath) -> Result<FileToWrite<'a>> {
+	let Some(name) = path.basename() else {
+		return Err(UI::failure(&format!("Not a file: {}", path)));
+	};
+	let parent_path = path.parent();
+	let parent = match client
+		.find_item_at_path(&parent_path.0)
+		.await
+		.context("Failed to find parent directory")?
+	{
+		Some(NonRootFileType::Dir(dir)) => DirType::Dir(dir),
+		Some(NonRootFileType::Root(root)) => DirType::Root(root),
+		Some(NonRootFileType::File(_)) => {
+			return Err(UI::failure(&format!("Not a directory: {}", parent_path)));
+		}
+		None => {
+			return Err(UI::failure(&format!("No such directory: {}", parent_path)));
+		}
+	};
+	let (dirs, mut files) = client
+		.list_dir::<_, Normal>(&parent, None::<&fn(u64, Option<u64>)>)
+		.await
+		.context("Failed to list parent directory")?;
+	if let Some(dir_name) = clashing_name(dirs.iter().filter_map(|dir| dir.name()), name) {
+		return Err(UI::failure(&format!(
+			"Not a file: {}",
+			parent_path.navigate(dir_name)
+		)));
+	}
+	// the file of that very name, should several differ only in case
+	let lowercase_name = name.to_lowercase();
+	let existing = files
+		.iter()
+		.position(|file| file.name() == Some(name))
+		.or_else(|| {
+			files.iter().position(|file| {
+				file.name()
+					.is_some_and(|n| n.to_lowercase() == lowercase_name)
+			})
+		})
+		.map(|index| files.swap_remove(index));
+	let name = existing
+		.as_ref()
+		.and_then(|file| file.name())
+		.unwrap_or(name)
+		.to_owned();
+	Ok(FileToWrite {
+		parent,
+		path: parent_path.navigate(&name),
+		name,
+		existing,
+	})
+}
+
+/// Writes `content`, its words joined by spaces, to a file, creating it or replacing its content.
+/// Without words, writes what stdin reads when it is not a terminal (streamed, not held in
+/// memory), and otherwise nothing. Replacing a file's content keeps the old content as a previous
+/// version if the account keeps versions.
+pub(crate) async fn write_file(
+	ui: &mut UI,
+	client: &mut LazyClient,
+	working_path: &RemotePath,
+	file_str: &str,
+	content: &[String],
+) -> Result<()> {
+	let path = working_path.navigate(file_str);
+	let client = client.get(ui).await?;
+	let target = find_file_to_write(client, &path).await?;
+	let builder = client
+		.make_file_builder(&target.name, target.parent.uuid())
+		.map_err(|e| UI::failure(&format!("Invalid file name: {}", e)))?;
+	if content.is_empty() && !io::stdin().is_terminal() {
+		client
+			.upload_file_from_reader(builder, &mut stdin_reader(), None, None)
+			.await
+	} else {
+		client
+			.upload_file(builder, content.join(" ").as_bytes())
+			.await
+	}
+	.context("Failed to write file")?;
+	ui.print_success(&format!("Wrote to {}", target.path));
+	Ok(())
+}
+
+/// Creates an empty file, or sets the modification date of an existing one to now and leaves its
+/// content as it is.
+pub(crate) async fn touch_file(
+	ui: &mut UI,
+	client: &mut LazyClient,
+	working_path: &RemotePath,
+	file_str: &str,
+) -> Result<()> {
+	let path = working_path.navigate(file_str);
+	let client = client.get(ui).await?;
+	let target = find_file_to_write(client, &path).await?;
+	match target.existing {
+		Some(mut file) => {
+			client
+				.update_file_metadata(
+					&mut file,
+					FileMetaChanges::default().last_modified(Utc::now()),
+				)
+				.await
+				.context("Failed to update the modification date")?;
+			ui.print_success(&format!("Updated the modification date of {}", target.path));
+		}
+		None => {
+			let builder = client
+				.make_file_builder(&target.name, target.parent.uuid())
+				.map_err(|e| UI::failure(&format!("Invalid file name: {}", e)))?;
+			client
+				.upload_file(builder, &[])
+				.await
+				.context("Failed to create file")?;
+			ui.print_success(&format!("Created empty file: {}", target.path));
+		}
+	}
+	Ok(())
+}
+
+/// Bytes read from stdin. A thread reads them, as std reads stdin blocking, and passes them on
+/// through a channel short enough that it reads no faster than they are taken.
+fn stdin_reader() -> impl AsyncRead + Unpin {
+	const READ_SIZE: usize = 64 * 1024;
+	let (mut sender, receiver) = mpsc::channel::<io::Result<Vec<u8>>>(4);
+	thread::spawn(move || {
+		let mut stdin = io::stdin().lock();
+		loop {
+			let mut buf = vec![0; READ_SIZE];
+			let read = match stdin.read(&mut buf) {
+				Ok(0) => return,
+				Ok(read) => Ok(read),
+				Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+				Err(e) => Err(e),
+			};
+			let done = read.is_err();
+			let sent = executor::block_on(sender.send(read.map(|read| {
+				buf.truncate(read);
+				buf
+			})));
+			// a closed channel: the upload has ended
+			if done || sent.is_err() {
+				return;
+			}
+		}
+	});
+	receiver.into_async_read()
 }
 
 /// Moves and/or renames a file or directory, following the semantics of the Unix `mv`:
