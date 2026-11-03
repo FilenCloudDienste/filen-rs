@@ -2,6 +2,8 @@
 //! The updater checks for new releases from https://github.com/FilenCloudDienste/filen-cli-releases
 //! when the CLI is run (unless skipped in the 5mins since the last check, or through the `--skip-update` flag).
 //! The executable will be replaced in place, with the filename updated if it contains the version number.
+//! In the Docker image, a newer release is only announced, with the image to pull; the CLI never
+//! replaces itself there, not even with `--always-update`.
 //! Update notices and announcements are printed to stderr, and only when stdout is a terminal and neither `--json` nor `--quiet` is given.
 //! A failed update check (for example when offline) is printed as a warning to stderr and does not stop the command.
 
@@ -23,6 +25,9 @@ use tokio::fs;
 use crate::ui::UI;
 
 const BUILD_TARGET: &str = env!("BUILD_TARGET"); // injected in build.rs
+
+/// The Docker image the CLI is published as, tagged with each release's version.
+const DOCKER_IMAGE: &str = "filen/cli";
 
 /// How long after a check the next one is skipped, in seconds.
 const LAST_CHECK_VALIDITY_SECS: i64 = 5 * 60;
@@ -75,8 +80,11 @@ pub(crate) async fn check_for_updates(
 	run_update_check(
 		ui,
 		&version,
-		automatically_update,
-		is_repl,
+		UpdateContext {
+			automatically_update,
+			is_repl,
+			in_container: cfg!(feature = "is_docker"),
+		},
 		last_checked_config.as_ref(),
 		async || {
 			tokio::join!(
@@ -98,8 +106,7 @@ pub(crate) async fn check_for_updates(
 async fn run_update_check(
 	ui: &mut UI,
 	version: &str,
-	automatically_update: bool,
-	is_repl: bool,
+	context: UpdateContext,
 	last_checked_config: Option<&LastCheckedConfig>,
 	fetch: impl AsyncFnOnce() -> (Result<GitHubRelease>, Result<Vec<Announcement>>),
 	confirm: impl FnOnce(&mut UI, &str) -> Result<bool>,
@@ -119,15 +126,7 @@ async fn run_update_check(
 			};
 			let updated = match latest_release {
 				Ok(latest_release) => {
-					handle_latest_release(
-						ui,
-						running,
-						&latest_release,
-						automatically_update,
-						is_repl,
-						confirm,
-					)
-					.await
+					handle_latest_release(ui, running, &latest_release, context, confirm).await
 				}
 				Err(e) => Err(e),
 			};
@@ -163,6 +162,17 @@ struct RunningVersion<'a> {
 	version: &'a str,
 }
 
+/// How the CLI runs, which decides what it does about a newer release.
+#[derive(Debug, Clone, Copy)]
+struct UpdateContext {
+	/// `--always-update`: install a newer release without asking.
+	automatically_update: bool,
+	/// Whether the REPL is starting, the only place an update is offered.
+	is_repl: bool,
+	/// Whether the CLI runs in its Docker image, which it must not replace itself in.
+	in_container: bool,
+}
+
 /// What to do about the latest release.
 #[derive(Debug, PartialEq, Eq)]
 enum ReleaseAction {
@@ -170,6 +180,8 @@ enum ReleaseAction {
 	Nothing,
 	/// Tell the user to update from the REPL, outside of which the CLI does not update.
 	Announce,
+	/// Tell the user to pull the release's Docker image, in which the CLI does not update itself.
+	AnnounceImage,
 	/// Ask the user whether to install it.
 	Offer,
 	/// Install it without asking, for `--always-update`.
@@ -178,15 +190,20 @@ enum ReleaseAction {
 
 /// Chooses what to do about the `latest` release when running `current`. Only a release of
 /// higher semver precedence is offered or installed, never an older one (a GitHub release
-/// marked latest by mistake, or a newer local build).
+/// marked latest by mistake, or a newer local build). In a container it is only announced.
 fn release_action(
 	current: &semver::Version,
 	latest: &semver::Version,
-	automatically_update: bool,
-	is_repl: bool,
+	UpdateContext {
+		automatically_update,
+		is_repl,
+		in_container,
+	}: UpdateContext,
 ) -> ReleaseAction {
 	if latest.cmp_precedence(current).is_le() {
 		ReleaseAction::Nothing
+	} else if in_container {
+		ReleaseAction::AnnounceImage
 	} else if automatically_update {
 		ReleaseAction::Install
 	} else if is_repl {
@@ -203,8 +220,7 @@ async fn handle_latest_release(
 	ui: &mut UI,
 	RunningVersion { current, version }: RunningVersion<'_>,
 	latest_release: &GitHubRelease,
-	automatically_update: bool,
-	is_repl: bool,
+	context: UpdateContext,
 	confirm: impl FnOnce(&mut UI, &str) -> Result<bool>,
 ) -> Result<()> {
 	let latest_tag = latest_release.tag_name.trim_start_matches('v');
@@ -216,13 +232,20 @@ async fn handle_latest_release(
 			version, latest_tag
 		));
 	};
-	match release_action(current, &latest, automatically_update, is_repl) {
+	match release_action(current, &latest, context) {
 		ReleaseAction::Nothing => {
 			log::info!("Up to date: v{version} (latest release: v{latest_tag})");
 			return Ok(());
 		}
 		ReleaseAction::Announce => {
 			announce(ui);
+			return Ok(());
+		}
+		ReleaseAction::AnnounceImage => {
+			ui.print_announcement(&format!(
+				"Update available: v{version} -> v{latest_tag}. Pull the new image: docker pull \
+				 {DOCKER_IMAGE}:{latest_tag}"
+			));
 			return Ok(());
 		}
 		ReleaseAction::Install => {
@@ -717,8 +740,7 @@ mod tests {
 		run_update_check(
 			&mut ui,
 			"0.2.9",
-			false,
-			false,
+			started(false, false),
 			Some(&LastCheckedConfig::new(config_dir.path())),
 			async || {
 				(
@@ -747,8 +769,7 @@ mod tests {
 			run_update_check(
 				&mut ui,
 				"0.2.9",
-				false,
-				false,
+				started(false, false),
 				None,
 				async || {
 					(
@@ -773,8 +794,7 @@ mod tests {
 		run_update_check(
 			&mut ui,
 			"0.2.9",
-			false,
-			false,
+			started(false, false),
 			Some(&LastCheckedConfig::new(config_dir.path())),
 			async || {
 				(
@@ -803,8 +823,7 @@ mod tests {
 		run_update_check(
 			&mut ui,
 			"0.2.9",
-			true,
-			false,
+			started(true, false),
 			Some(&LastCheckedConfig::new(config_dir.path())),
 			async || (Ok(release("v0.3.0")), Ok(Vec::new())),
 			not_asked,
@@ -836,8 +855,7 @@ mod tests {
 		run_update_check(
 			&mut ui,
 			"0.2.9",
-			false,
-			true,
+			started(false, true),
 			Some(&LastCheckedConfig::new(config_dir.path())),
 			async || (Ok(release("v0.3.0")), Ok(Vec::new())),
 			|_, question| {
@@ -864,8 +882,7 @@ mod tests {
 		run_update_check(
 			&mut ui,
 			"0.2.9",
-			false,
-			true,
+			started(false, true),
 			Some(&LastCheckedConfig::new(config_dir.path())),
 			async || (Ok(release("v0.3.0")), Ok(Vec::new())),
 			|_, _| Err(UI::failure("Canceled")),
@@ -888,8 +905,7 @@ mod tests {
 		run_update_check(
 			&mut ui,
 			"0.2.9",
-			false,
-			true,
+			started(false, true),
 			None,
 			async || (Ok(release("v0.3.0")), Ok(Vec::new())),
 			not_asked,
@@ -912,8 +928,7 @@ mod tests {
 		run_update_check(
 			&mut ui,
 			"dev",
-			false,
-			false,
+			started(false, false),
 			Some(&LastCheckedConfig::new(config_dir.path())),
 			async || -> (Result<GitHubRelease>, Result<Vec<Announcement>>) {
 				panic!("fetched with a running version that is not semver")
@@ -930,6 +945,75 @@ mod tests {
 		assert!(written_stamp(config_dir.path()).is_some());
 	}
 
+	/// How the CLI runs outside a container.
+	fn started(automatically_update: bool, is_repl: bool) -> UpdateContext {
+		UpdateContext {
+			automatically_update,
+			is_repl,
+			in_container: false,
+		}
+	}
+
+	#[test]
+	fn a_newer_release_is_only_announced_in_a_container() {
+		for (automatically_update, is_repl) in [(false, false), (false, true), (true, false)] {
+			assert_eq!(
+				release_action(
+					&version("0.2.9"),
+					&version("0.3.0"),
+					UpdateContext {
+						automatically_update,
+						is_repl,
+						in_container: true,
+					}
+				),
+				ReleaseAction::AnnounceImage
+			);
+		}
+	}
+
+	#[test]
+	fn the_running_release_is_not_announced_in_a_container() {
+		assert_eq!(
+			release_action(
+				&version("0.2.9"),
+				&version("0.2.9"),
+				UpdateContext {
+					automatically_update: true,
+					is_repl: true,
+					in_container: true,
+				}
+			),
+			ReleaseAction::Nothing
+		);
+	}
+
+	#[tokio::test]
+	async fn a_container_is_told_which_image_to_pull() {
+		let printed = Printed::default();
+		let mut ui = printed.terminal_ui();
+
+		run_update_check(
+			&mut ui,
+			"0.2.9",
+			UpdateContext {
+				automatically_update: true,
+				is_repl: true,
+				in_container: true,
+			},
+			None,
+			async || (Ok(release("v0.3.0")), Ok(Vec::new())),
+			not_asked,
+		)
+		.await;
+
+		assert_eq!(
+			console::strip_ansi_codes(&printed.lines()),
+			"[i] Update available: v0.2.9 -> v0.3.0. Pull the new image: docker pull \
+			 filen/cli:0.3.0"
+		);
+	}
+
 	fn version(version: &str) -> semver::Version {
 		semver::Version::parse(version).unwrap()
 	}
@@ -937,7 +1021,7 @@ mod tests {
 	#[test]
 	fn a_newer_release_is_announced_outside_the_repl() {
 		assert_eq!(
-			release_action(&version("0.2.9"), &version("0.2.10"), false, false),
+			release_action(&version("0.2.9"), &version("0.2.10"), started(false, false)),
 			ReleaseAction::Announce
 		);
 	}
@@ -945,7 +1029,7 @@ mod tests {
 	#[test]
 	fn a_newer_release_is_offered_in_the_repl() {
 		assert_eq!(
-			release_action(&version("0.2.9"), &version("0.3.0"), false, true),
+			release_action(&version("0.2.9"), &version("0.3.0"), started(false, true)),
 			ReleaseAction::Offer
 		);
 	}
@@ -953,7 +1037,7 @@ mod tests {
 	#[test]
 	fn a_newer_release_is_installed_with_always_update() {
 		assert_eq!(
-			release_action(&version("0.2.9"), &version("1.0.0"), true, false),
+			release_action(&version("0.2.9"), &version("1.0.0"), started(true, false)),
 			ReleaseAction::Install
 		);
 	}
@@ -961,7 +1045,7 @@ mod tests {
 	#[test]
 	fn the_running_release_is_left_alone() {
 		assert_eq!(
-			release_action(&version("0.2.9"), &version("0.2.9"), true, true),
+			release_action(&version("0.2.9"), &version("0.2.9"), started(true, true)),
 			ReleaseAction::Nothing
 		);
 	}
@@ -973,8 +1057,7 @@ mod tests {
 				release_action(
 					&version("0.2.10"),
 					&version("0.2.9"),
-					automatically_update,
-					is_repl
+					started(automatically_update, is_repl)
 				),
 				ReleaseAction::Nothing
 			);
@@ -984,7 +1067,11 @@ mod tests {
 	#[test]
 	fn a_release_is_newer_than_a_prerelease_of_it() {
 		assert_eq!(
-			release_action(&version("0.3.0-beta.1"), &version("0.3.0"), true, false),
+			release_action(
+				&version("0.3.0-beta.1"),
+				&version("0.3.0"),
+				started(true, false)
+			),
 			ReleaseAction::Install
 		);
 	}
@@ -992,7 +1079,11 @@ mod tests {
 	#[test]
 	fn build_metadata_does_not_make_a_release_newer() {
 		assert_eq!(
-			release_action(&version("0.2.9"), &version("0.2.9+build.2"), true, false),
+			release_action(
+				&version("0.2.9"),
+				&version("0.2.9+build.2"),
+				started(true, false)
+			),
 			ReleaseAction::Nothing
 		);
 	}
@@ -1005,8 +1096,7 @@ mod tests {
 		run_update_check(
 			&mut ui,
 			"0.2.10",
-			false,
-			false,
+			started(false, false),
 			None,
 			async || (Ok(release("v0.2.9")), Ok(Vec::new())),
 			not_asked,
@@ -1024,8 +1114,7 @@ mod tests {
 		run_update_check(
 			&mut ui,
 			"0.2.9",
-			true,
-			false,
+			started(true, false),
 			None,
 			async || (Ok(release("nightly")), Ok(Vec::new())),
 			not_asked,
@@ -1048,8 +1137,7 @@ mod tests {
 		run_update_check(
 			&mut ui,
 			"0.2.9",
-			false,
-			false,
+			started(false, false),
 			None,
 			async || (Ok(release("v0.2.9")), Ok(Vec::new())),
 			not_asked,
