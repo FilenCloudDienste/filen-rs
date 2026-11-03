@@ -17,7 +17,7 @@ use crate::{
 	CliArgs,
 	commands::{
 		account_cmds, auth_cmds, contacts_cmds, fs_cmds, misc_cmds, notes_cmds, public_links_cmds,
-		rclone_cmds, search_cmd, shell_cmds, sync_cmd, transfer_cmds,
+		rclone_cmds, search_cmd, shares_cmds, shell_cmds, sync_cmd, transfer_cmds,
 	},
 	interrupt,
 	ui::UI,
@@ -116,7 +116,7 @@ const DOC_OUTLINE: &[DocSection] = &[
 	DocSection {
 		id: "sharing",
 		title: "Sharing",
-		parts: &[contacts_cmds::DOCS],
+		parts: &[contacts_cmds::DOCS, shares_cmds::DOCS],
 	},
 	DocSection {
 		id: "notes",

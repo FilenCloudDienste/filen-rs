@@ -16,6 +16,7 @@ pub(crate) mod notes_cmds;
 pub(crate) mod public_links_cmds;
 pub(crate) mod rclone_cmds;
 pub(crate) mod search_cmd;
+pub(crate) mod shares_cmds;
 pub(crate) mod shell_cmds;
 pub(crate) mod sync_cmd;
 pub(crate) mod transfer_cmds;
@@ -46,6 +47,8 @@ pub(crate) enum Commands {
 	Account(account_cmds::AccountCommands),
 	#[command(flatten)]
 	Contacts(contacts_cmds::ContactsCommands),
+	#[command(flatten)]
+	Shares(shares_cmds::SharesCommands),
 }
 
 impl Commands {
@@ -95,5 +98,6 @@ pub(crate) async fn execute_command(
 		Commands::Shell(command) => command.execute(ctx).await,
 		Commands::Account(command) => command.execute(ctx).await,
 		Commands::Contacts(command) => command.execute(ctx).await,
+		Commands::Shares(command) => command.execute(ctx).await,
 	}
 }
