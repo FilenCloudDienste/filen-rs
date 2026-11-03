@@ -66,13 +66,14 @@ pub(crate) enum FsCommands {
 		#[arg(short = 'l', long)]
 		long: bool,
 	},
-	/// Print the contents of a file as the bytes it holds
+	/// Print the contents of a file as the bytes it holds (with --json: {"text": ...}, for UTF-8
+	/// text only)
 	Cat {
 		/// File to print
 		#[arg(add = FilenCompleter::file())]
 		file: String,
 	},
-	/// Print the first lines of a file as the bytes they hold
+	/// Print the first lines of a file as the bytes they hold (with --json: {"text": ...})
 	Head {
 		/// File to print
 		#[arg(add = FilenCompleter::file())]
@@ -81,7 +82,7 @@ pub(crate) enum FsCommands {
 		#[arg(short = 'n', long, default_value_t = 10)]
 		lines: usize,
 	},
-	/// Print the last lines of a file as the bytes they hold
+	/// Print the last lines of a file as the bytes they hold (with --json: {"text": ...})
 	Tail {
 		/// File to print
 		#[arg(add = FilenCompleter::file())]
@@ -642,9 +643,20 @@ fn confirm_printing_file(ui: &mut UI, size: u64) -> Result<bool> {
 	)
 }
 
+impl PrintFileLines {
+	fn command(&self) -> &'static str {
+		match self {
+			Self::Full => "cat",
+			Self::Head(_) => "head",
+			Self::Tail(_) => "tail",
+		}
+	}
+}
+
 /// Prints a file's content, or its first or last lines, as the bytes it holds, with no newline
 /// added: streamed to stdout as they download, but for the last lines, which are printed once it
-/// is found where they start.
+/// is found where they start. With `--json`, the printed part is collected
+/// and printed as `{"text": ...}`, which only UTF-8 text can be.
 pub(crate) async fn print_file(
 	ui: &mut UI,
 	client: &mut LazyClient,
@@ -668,15 +680,20 @@ pub(crate) async fn print_file(
 	if !confirm_printing_file(ui, file.size())? {
 		return Ok(());
 	}
+	let mut out = if ui.json {
+		PrintedContent::Json(Vec::new())
+	} else {
+		PrintedContent::Stdout
+	};
 	match lines {
 		PrintFileLines::Full => {
-			print_from_reader(ui, client.get_file_reader(&*file), None).await?;
+			print_from_reader(ui, &mut out, client.get_file_reader(&*file), None).await?;
 		}
 		// nothing to download
 		PrintFileLines::Head(0) | PrintFileLines::Tail(0) => {}
 		PrintFileLines::Head(n) => {
 			let head = Some(HeadLines::new(n));
-			print_from_reader(ui, client.get_file_reader(&*file), head).await?;
+			print_from_reader(ui, &mut out, client.get_file_reader(&*file), head).await?;
 		}
 		PrintFileLines::Tail(n) => {
 			let remote_file: &RemoteFile = &file;
@@ -692,23 +709,53 @@ pub(crate) async fn print_file(
 			match last_lines(file.size(), n, CHUNK_SIZE_U64, TAIL_HELD_MAX, read_block).await? {
 				LastLines::Read(blocks) => {
 					for block in blocks {
-						ui.write_stdout_bytes(&block)?;
+						out.write(ui, &block)?;
 					}
 				}
 				LastLines::From(start) => {
 					let reader = client.get_file_reader_for_range(&*file, start, file.size());
-					print_from_reader(ui, reader, None).await?;
+					print_from_reader(ui, &mut out, reader, None).await?;
 				}
 			}
 		}
 	}
+	if let PrintedContent::Json(content) = out {
+		let text = String::from_utf8(content).map_err(|_| {
+			UI::failure(&format!(
+				"Not UTF-8 text: {file_str}. Use {} without --json for binary content",
+				lines.command()
+			))
+		})?;
+		ui.print_json(json!({ "text": text }))?;
+	}
 	Ok(())
+}
+
+/// Where [`print_file`] puts the content it prints.
+enum PrintedContent {
+	/// Straight to stdout.
+	Stdout,
+	/// Collected, to be printed as JSON.
+	Json(Vec<u8>),
+}
+
+impl PrintedContent {
+	fn write(&mut self, ui: &mut UI, bytes: &[u8]) -> Result<()> {
+		match self {
+			Self::Stdout => ui.write_stdout_bytes(bytes),
+			Self::Json(content) => {
+				content.extend_from_slice(bytes);
+				Ok(())
+			}
+		}
+	}
 }
 
 /// Prints what `reader` reads, up to the end of the lines `head` takes if it is given. The reader
 /// is dropped once those are printed, which stops the rest of the file from downloading.
 async fn print_from_reader(
 	ui: &mut UI,
+	out: &mut PrintedContent,
 	mut reader: FileReader<'_>,
 	mut head: Option<HeadLines>,
 ) -> Result<()> {
@@ -722,7 +769,7 @@ async fn print_from_reader(
 			Some(head) => head.cut(chunk),
 			None => (chunk, false),
 		};
-		ui.write_stdout_bytes(printed)?;
+		out.write(ui, printed)?;
 		if done {
 			return Ok(());
 		}

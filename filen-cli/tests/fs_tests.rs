@@ -1036,3 +1036,39 @@ async fn head_and_tail_of_a_file_of_several_chunks_print_lines_across_chunks() {
 			== [long_line.as_slice(), b"last\n"].concat()
 	);
 }
+
+#[shared_test_runtime]
+async fn cat_and_head_json_print_the_text() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = format!("/{}", resources.dir.name().unwrap());
+	upload(client, &resources.dir, "a.txt", "héllo\nworld".as_bytes()).await;
+	let path = format!("{test_dir}/a.txt");
+
+	let assert = authenticated_cli_with_args!("cat", &path, "--json").success();
+	assert_eq!(
+		printed_json(&assert),
+		serde_json::json!({ "text": "héllo\nworld" })
+	);
+	let assert = authenticated_cli_with_args!("head", "-n", "1", &path, "--json").success();
+	assert_eq!(
+		printed_json(&assert),
+		serde_json::json!({ "text": "héllo\n" })
+	);
+}
+
+#[shared_test_runtime]
+async fn cat_json_of_a_binary_file_fails() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = format!("/{}", resources.dir.name().unwrap());
+	upload(client, &resources.dir, "a.bin", b"\x00\xff\xfe").await;
+	let path = format!("{test_dir}/a.bin");
+
+	authenticated_cli_with_args!("cat", &path, "--json")
+		.failure()
+		.stdout("")
+		.stderr(predicates::str::contains(format!(
+			"Not UTF-8 text: {path}. Use cat without --json for binary content"
+		)));
+}
