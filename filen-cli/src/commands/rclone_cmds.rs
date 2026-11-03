@@ -14,6 +14,11 @@
 //! filen rclone serve webdav filen:Photos --addr 127.0.0.1:8080 --user me --pass secret
 //! ```
 //!
+//! Everything after `rclone` goes to Rclone as it is: `filen rclone -v ls filen:` runs `rclone -v
+//! ls filen:`, and `filen rclone --help` shows Rclone's help. The CLI's own options go before
+//! `rclone` (`filen -v rclone ls filen:`), except `--rclone-binary <path>`, which goes right after
+//! it.
+//!
 //! A mount or server run this way lacks two things `mount` and `serve` do: when it stops, nothing
 //! gives the uploads still in its cache up to 30 seconds to finish, and nothing checks that the
 //! server refuses requests without credentials, so give it `--user` and `--pass` (or the protocol's
@@ -67,7 +72,7 @@ use filen_sdk_rs::{
 	rclone::{
 		FuseProvider, MountInfo, MountOptions, RcloneBinary, RcloneDaemon, RcloneDaemonConfig,
 		RcloneExit, RcloneRefusal, RcloneStats, ServeAuth, ServeOptions, ServeProtocol, ServeTls,
-		StopOptions, VfsTuning, available_drive_letters, run_rclone,
+		StopOptions, VfsTuning, available_drive_letters, clear_cache, run_rclone,
 	},
 };
 use serde_json::{Value, json};
@@ -91,12 +96,16 @@ use crate::{
 pub(crate) enum RcloneCommands {
 	/// Execute an Rclone command using the managed installation
 	Rclone {
+		#[command(flatten)]
+		binary: RcloneBinaryArg,
 		/// The command to execute. Your Filen drive is available as the "filen" remote.
 		#[arg(trailing_var_arg = true, allow_hyphen_values = true)]
 		cmd: Vec<String>,
 	},
 	/// Mount Filen as a network drive
 	Mount {
+		#[command(flatten)]
+		binary: RcloneBinaryArg,
 		/// Where to mount the network drive: an empty directory (default: /tmp/filen), or on Windows a drive letter (default: X)
 		mount_point: Option<String>,
 		/// The maximum cache size (e.g. "500Mi", "10Gi") (default: 32Gi)
@@ -111,6 +120,8 @@ pub(crate) enum RcloneCommands {
 	},
 	/// Runs a WebDAV, S3, FTP, SFTP, HTTP, restic or NFS server exposing your Filen drive
 	Serve {
+		#[command(flatten)]
+		binary: RcloneBinaryArg,
 		/// The type of server to run
 		server: ServerType,
 		/// IP and port for the server (`<ip>:<port>`; `0.0.0.0:<port>` for every network interface) (default: 127.0.0.1 and a port per type)
@@ -144,6 +155,13 @@ pub(crate) enum RcloneCommands {
 		#[arg(long)]
 		key: Option<String>,
 	},
+	/// Shows the version and path of the Rclone that mount, serve and rclone run
+	RcloneInfo {
+		#[command(flatten)]
+		binary: RcloneBinaryArg,
+	},
+	/// Deletes the files Rclone cached for mount and serve (refused while one runs, or while files are waiting to be uploaded)
+	ClearRcloneCache,
 	/// Exports your user API key (for use with non-managed Rclone)
 	ExportApiKey,
 	/// Replaced by `serve webdav`
@@ -179,6 +197,14 @@ pub(crate) enum RcloneCommands {
 		)]
 		_args: Vec<String>,
 	},
+}
+
+/// The Rclone binary a command runs: the managed one, unless the user gives their own.
+#[derive(Debug, clap::Args)]
+pub(crate) struct RcloneBinaryArg {
+	/// Run this Rclone binary instead of the managed one (mount and serve need Rclone 1.74.3 or later)
+	#[arg(long, value_name = "PATH")]
+	rclone_binary: Option<PathBuf>,
 }
 
 /// The password `serve` is given, which its `Debug` leaves out.
@@ -235,6 +261,8 @@ pub(crate) const DOCS: &[DocElement] = &[
 	DocElement::DocFragment("managed-rclone"),
 	DocElement::CommandHelp("rclone"),
 	DocElement::DocFragment("rclone-passthrough"),
+	DocElement::CommandHelp("rclone-info"),
+	DocElement::CommandHelp("clear-rclone-cache"),
 	DocElement::CommandHelp("mount"),
 	DocElement::DocFragment("mount-prerequisites"),
 	DocElement::CommandHelp("serve"),
@@ -249,8 +277,11 @@ impl RcloneCommands {
 			config, ui, client, ..
 		} = ctx;
 		match self {
-			Self::Rclone { cmd } => execute_rclone(config, ui, client, cmd).await?,
+			Self::Rclone { binary, cmd } => {
+				execute_rclone(config, ui, client, &binary, cmd).await?;
+			}
 			Self::Mount {
+				binary,
 				mount_point,
 				cache_size,
 				read_only,
@@ -260,6 +291,7 @@ impl RcloneCommands {
 					config,
 					ui,
 					client,
+					&binary,
 					MountArgs {
 						mount_point,
 						cache_size,
@@ -270,6 +302,7 @@ impl RcloneCommands {
 				.await?;
 			}
 			Self::Serve {
+				binary,
 				server,
 				address,
 				user,
@@ -286,6 +319,7 @@ impl RcloneCommands {
 					config,
 					ui,
 					client,
+					&binary,
 					ServeArgs {
 						protocol: server.into(),
 						address,
@@ -300,6 +334,8 @@ impl RcloneCommands {
 				)
 				.await?;
 			}
+			Self::RcloneInfo { binary } => rclone_info(config, ui, &binary).await?,
+			Self::ClearRcloneCache => clear_rclone_cache(config, ui).await?,
 			Self::ExportApiKey => {
 				let client = client.get(ui).await?.to_stringified();
 				if ui.json {
@@ -385,6 +421,7 @@ pub(crate) async fn mount(
 	config: &CliConfig,
 	ui: &mut UI,
 	client: &mut LazyClient,
+	binary: &RcloneBinaryArg,
 	args: MountArgs,
 ) -> Result<()> {
 	let client = client.get(ui).await?;
@@ -393,7 +430,7 @@ pub(crate) async fn mount(
 		Some(mount_point) => mount_point,
 		None => default_mount_point().await?,
 	};
-	let (daemon, ctrl_c) = start_daemon(config, ui, client, args.cache_size).await?;
+	let (daemon, ctrl_c) = start_daemon(config, ui, client, binary, args.cache_size).await?;
 	let mounted = daemon
 		.daemon
 		.mount(MountOptions {
@@ -423,6 +460,7 @@ pub(crate) async fn start_server(
 	config: &CliConfig,
 	ui: &mut UI,
 	client: &mut LazyClient,
+	binary: &RcloneBinaryArg,
 	args: ServeArgs,
 ) -> Result<()> {
 	check_serve_args(args.protocol, args.read_only)?;
@@ -445,7 +483,7 @@ pub(crate) async fn start_server(
 	let scheme = if tls.is_some() { "https" } else { "http" };
 	let client = client.get(ui).await?;
 	let root = drive_dir(client, args.root.as_deref()).await?;
-	let (daemon, ctrl_c) = start_daemon(config, ui, client, args.cache_size).await?;
+	let (daemon, ctrl_c) = start_daemon(config, ui, client, binary, args.cache_size).await?;
 	let serve = daemon
 		.daemon
 		.start_serve(ServeOptions {
@@ -605,9 +643,10 @@ pub(crate) async fn execute_rclone(
 	config: &CliConfig,
 	ui: &mut UI,
 	client: &mut LazyClient,
+	binary: &RcloneBinaryArg,
 	cmd: Vec<String>,
 ) -> Result<()> {
-	let binary = prepare_binary(config, ui).await;
+	let binary = prepare_binary(config, ui, binary).await;
 	let client = client.get(ui).await?;
 	let exit_code = run_rclone(client, &binary, &cmd)
 		.await
@@ -621,20 +660,92 @@ pub(crate) async fn execute_rclone(
 	Ok(())
 }
 
+/// Prints the version and path of the Rclone binary `binary` names, downloading the managed one
+/// first if it is not there yet.
+async fn rclone_info(config: &CliConfig, ui: &mut UI, binary: &RcloneBinaryArg) -> Result<()> {
+	let binary = prepare_binary(config, ui, binary).await;
+	let path = binary
+		.resolve()
+		.await
+		.map_err(|e| rclone_error(e, "Failed to find Rclone"))?;
+	let version = binary
+		.version()
+		.await
+		.map_err(|e| rclone_error(e, "Failed to read Rclone's version"))?;
+	let managed = matches!(binary, RcloneBinary::Managed { .. });
+	if ui.json {
+		ui.print_json(rclone_info_json(&version, &path, managed))?;
+	} else {
+		ui.print_key_value_table(&[
+			("Version:", version.as_str()),
+			("Path:", &path.display().to_string()),
+			("Managed:", if managed { "yes" } else { "no" }),
+		]);
+	}
+	Ok(())
+}
+
+/// What `rclone-info --json` prints.
+fn rclone_info_json(version: &str, path: &Path, managed: bool) -> Value {
+	json!({
+		"version": version,
+		"path": path.display().to_string(),
+		"managed": managed,
+	})
+}
+
+/// Deletes the cached files of every cache `mount` and `serve` use, refused while one runs or while
+/// a cache holds files not uploaded yet. Stops at the first cache it cannot clear.
+async fn clear_rclone_cache(config: &CliConfig, ui: &mut UI) -> Result<()> {
+	let dir = rclone_dir(config);
+	let state_dir = state_dir(&dir);
+	for cache in 0..CACHES {
+		let cache_dir = cache_dir(&dir, cache);
+		clear_cache(&state_dir, &cache_dir).await.map_err(|e| {
+			rclone_error(
+				e,
+				format!("Failed to clear the Rclone cache {}", cache_dir.display()),
+			)
+		})?;
+	}
+	ui.print_success("Cleared the Rclone cache");
+	Ok(())
+}
+
 fn rclone_dir(config: &CliConfig) -> PathBuf {
 	config.config_dir.join("rclone")
 }
 
-/// The managed rclone, once the `rclone.conf` with the account's keys that earlier versions wrote
-/// is removed; says so when it is about to be downloaded.
-async fn prepare_binary(config: &CliConfig, ui: &mut UI) -> RcloneBinary {
+/// The daemons' state directory in `dir`, which every mount and server shares.
+fn state_dir(dir: &Path) -> PathBuf {
+	dir.join("daemon")
+}
+
+/// The Rclone binary `binary` names, or else the managed one, once the `rclone.conf` with the
+/// account's keys that earlier versions wrote is removed; says so when the managed one is about
+/// to be downloaded.
+async fn prepare_binary(config: &CliConfig, ui: &mut UI, binary: &RcloneBinaryArg) -> RcloneBinary {
 	let dir = rclone_dir(config);
 	remove_old_config(&dir).await;
-	let binary = RcloneBinary::Managed { dir };
-	if !binary.is_installed().await {
+	let binary = rclone_binary(dir, binary);
+	// A given binary is never downloaded: a missing one fails when it is run.
+	if matches!(binary, RcloneBinary::Managed { .. }) && !binary.is_installed().await {
 		print_notice(ui, "Downloading managed Rclone...");
 	}
 	binary
+}
+
+/// The binary at `--rclone-binary`, which the SDK does not check against a checksum, or the managed
+/// one in `dir`.
+fn rclone_binary(dir: PathBuf, binary: &RcloneBinaryArg) -> RcloneBinary {
+	match &binary.rclone_binary {
+		// One copy, for the binary the SDK owns.
+		Some(path) => RcloneBinary::Bundled {
+			path: path.clone(),
+			sha256: None,
+		},
+		None => RcloneBinary::Managed { dir },
+	}
 }
 
 async fn remove_old_config(dir: &Path) {
@@ -664,10 +775,11 @@ async fn start_daemon(
 	config: &CliConfig,
 	ui: &mut UI,
 	client: &Client,
+	binary: &RcloneBinaryArg,
 	cache_size: Option<u64>,
 ) -> Result<(Daemon, interrupt::Owning)> {
 	// a Ctrl-C while the managed rclone downloads still cancels the command
-	let binary = prepare_binary(config, ui).await;
+	let binary = prepare_binary(config, ui, binary).await;
 	let ctrl_c = interrupt::own();
 	let dir = rclone_dir(config);
 	let defaults = VfsTuning::default();
@@ -678,7 +790,7 @@ async fn start_daemon(
 			RcloneDaemonConfig {
 				// One copy per attempt; it is a path.
 				binary: binary.clone(),
-				state_dir: dir.join("daemon"),
+				state_dir: state_dir(&dir),
 				// One copy per attempt; it is a path, kept for the warning on stopping.
 				cache_dir: cache_dir.clone(),
 				log_file: None,
@@ -732,10 +844,8 @@ fn rclone_error(
 	} else {
 		format!("{refusal} ({})", about.join("; "))
 	};
-	if refusal == RcloneRefusal::FuseMissing
-		&& let Some(install) = fuse_install_hint()
-	{
-		message = format!("{message}; {install}");
+	if let Some(hint) = refusal_hint(&refusal) {
+		message = format!("{message}; {hint}");
 	}
 	let err = if refusal.kind() == ErrorKind::InvalidState {
 		UI::usage_failure(&message)
@@ -743,6 +853,33 @@ fn rclone_error(
 		UI::failure(&message)
 	};
 	err.context(context)
+}
+
+/// What the user can do about `refusal`, where the CLI knows.
+fn refusal_hint(refusal: &RcloneRefusal) -> Option<&'static str> {
+	match refusal {
+		RcloneRefusal::FuseMissing => fuse_install_hint(),
+		RcloneRefusal::CacheInUse => Some("stop every running `mount` and `serve` first"),
+		RcloneRefusal::UploadsPending { .. } => {
+			Some("run `mount` or `serve` to let them upload first")
+		}
+		RcloneRefusal::BinaryMissing
+		| RcloneRefusal::BinaryChecksum
+		| RcloneRefusal::UnsupportedVersion { .. }
+		| RcloneRefusal::WatchdogUnavailable
+		| RcloneRefusal::MountPointInUse
+		| RcloneRefusal::MountPointNotEmpty
+		| RcloneRefusal::MountPointInvalid
+		| RcloneRefusal::DriveLetterInUse
+		| RcloneRefusal::PortInUse { .. }
+		| RcloneRefusal::AddressNotLocal
+		| RcloneRefusal::ImplicitAddress
+		| RcloneRefusal::AuthRequired
+		| RcloneRefusal::InvalidCredentials
+		| RcloneRefusal::UnauthenticatedOffLoopback
+		| RcloneRefusal::UnsupportedProtocol
+		| RcloneRefusal::TlsUnsupported => None,
+	}
 }
 
 /// How to install the mount backend on this platform, for when there is none. macOS has no such
@@ -1156,6 +1293,162 @@ mod tests {
 		assert_eq!(root_dir("Photos/../Documents"), "Documents");
 		assert_eq!(root_dir("../../Photos"), "Photos");
 		assert_eq!(root_dir("/"), "");
+	}
+
+	/// The `--rclone-binary` of `args`.
+	fn parsed_rclone_binary(args: &[&str]) -> Option<PathBuf> {
+		let binary = match parsed_command(args) {
+			RcloneCommands::Rclone { binary, .. }
+			| RcloneCommands::Mount { binary, .. }
+			| RcloneCommands::Serve { binary, .. }
+			| RcloneCommands::RcloneInfo { binary } => binary,
+			command => panic!("{args:?} parsed as {command:?}"),
+		};
+		binary.rclone_binary
+	}
+
+	#[test]
+	fn mount_serve_rclone_and_rclone_info_take_an_rclone_binary() {
+		let given = Some(PathBuf::from("/opt/rclone"));
+
+		assert_eq!(
+			parsed_rclone_binary(&["filen", "mount", "--rclone-binary", "/opt/rclone"]),
+			given
+		);
+		assert_eq!(
+			parsed_rclone_binary(&["filen", "serve", "webdav", "--rclone-binary", "/opt/rclone"]),
+			given
+		);
+		assert_eq!(
+			parsed_rclone_binary(&["filen", "rclone-info", "--rclone-binary", "/opt/rclone"]),
+			given
+		);
+		assert_eq!(
+			parsed_rclone_binary(&["filen", "rclone", "--rclone-binary", "/opt/rclone", "ls"]),
+			given
+		);
+		assert_eq!(parsed_rclone_binary(&["filen", "mount"]), None);
+	}
+
+	#[test]
+	fn an_rclone_binary_after_the_rclone_command_goes_to_rclone() {
+		let RcloneCommands::Rclone { binary, cmd } =
+			parsed_command(&["filen", "rclone", "ls", "--rclone-binary", "/opt/rclone"])
+		else {
+			panic!("parsed as another command");
+		};
+
+		assert_eq!(binary.rclone_binary, None);
+		assert_eq!(cmd, ["ls", "--rclone-binary", "/opt/rclone"]);
+	}
+
+	#[test]
+	fn a_given_rclone_binary_is_run_without_a_checksum() {
+		let dir = PathBuf::from("/home/user/.config/filen-cli/rclone");
+		let given = RcloneBinaryArg {
+			rclone_binary: Some(PathBuf::from("/opt/rclone")),
+		};
+		let none = RcloneBinaryArg {
+			rclone_binary: None,
+		};
+
+		assert_eq!(
+			rclone_binary(dir.clone(), &given),
+			RcloneBinary::Bundled {
+				path: PathBuf::from("/opt/rclone"),
+				sha256: None
+			}
+		);
+		assert_eq!(
+			rclone_binary(dir.clone(), &none),
+			RcloneBinary::Managed { dir }
+		);
+	}
+
+	#[test]
+	fn rclone_info_json_names_the_version_path_and_whether_it_is_managed() {
+		assert_eq!(
+			rclone_info_json("v1.74.4", Path::new("/opt/rclone"), false),
+			json!({"version": "v1.74.4", "path": "/opt/rclone", "managed": false})
+		);
+	}
+
+	#[test]
+	fn a_cache_in_use_says_to_stop_the_mounts_and_servers() {
+		let err = rclone_error(
+			RcloneRefusal::CacheInUse.into(),
+			"Failed to clear the Rclone cache",
+		);
+
+		assert_eq!(exit_code(&err), 1);
+		assert_eq!(
+			format!("{err:#}"),
+			"Failed to clear the Rclone cache: an rclone daemon uses the cache; stop every running `mount` and `serve` first"
+		);
+	}
+
+	#[test]
+	fn pending_uploads_say_how_to_let_them_upload() {
+		let err = rclone_error(
+			RcloneRefusal::UploadsPending { count: 2 }.into(),
+			"Failed to clear the Rclone cache",
+		);
+
+		assert_eq!(exit_code(&err), 1);
+		assert_eq!(
+			format!("{err:#}"),
+			"Failed to clear the Rclone cache: 2 files in the cache are not uploaded yet; run `mount` or `serve` to let them upload first"
+		);
+	}
+
+	#[tokio::test]
+	async fn clearing_the_rclone_cache_deletes_every_caches_files() {
+		let config_dir = tempfile::tempdir().unwrap();
+		let config = CliConfig {
+			config_dir: config_dir.path().to_path_buf(),
+		};
+		let dir = rclone_dir(&config);
+		let cached = [
+			cache_dir(&dir, 0).join("vfs/Filen/photo.jpg"),
+			cache_dir(&dir, 7).join("vfs/Filen/photo.jpg"),
+		];
+		for file in &cached {
+			std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+			std::fs::write(file, b"cached").unwrap();
+		}
+		let printed = Printed::default();
+		let mut ui = printed.ui();
+
+		clear_rclone_cache(&config, &mut ui).await.unwrap();
+
+		assert!(cached.iter().all(|file| !file.exists()), "{cached:?}");
+		assert_eq!(printed.lines(), "✔ Cleared the Rclone cache");
+	}
+
+	#[tokio::test]
+	async fn a_cache_with_files_not_uploaded_is_kept() {
+		let config_dir = tempfile::tempdir().unwrap();
+		let config = CliConfig {
+			config_dir: config_dir.path().to_path_buf(),
+		};
+		let cache = cache_dir(&rclone_dir(&config), 1);
+		let meta = cache.join("vfsMeta/Filen/photo.jpg");
+		std::fs::create_dir_all(meta.parent().unwrap()).unwrap();
+		std::fs::write(&meta, br#"{"Dirty": true}"#).unwrap();
+		let printed = Printed::default();
+		let mut ui = printed.ui();
+
+		let err = clear_rclone_cache(&config, &mut ui).await.unwrap_err();
+
+		assert_eq!(exit_code(&err), 1);
+		assert_eq!(
+			format!("{err:#}"),
+			format!(
+				"Failed to clear the Rclone cache {}: 1 files in the cache are not uploaded yet; run `mount` or `serve` to let them upload first",
+				cache.display()
+			)
+		);
+		assert!(meta.exists());
 	}
 
 	#[test]

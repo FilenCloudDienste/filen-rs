@@ -17,7 +17,8 @@
 //! command with exit code 2, naming the option that answers it instead where there is one.
 //!
 //! Options can go before or after the command (`filen --json ls` or `filen ls --json`),
-//! except for `--password` and `--two-factor-code`, which go before it.
+//! except for `--password` and `--two-factor-code`, which go before it. After `filen rclone`,
+//! everything goes to Rclone as it is, so the CLI's options go before `rclone`.
 //! In the REPL, a line can add `--json`, `--quiet`, `-v` or `--yes` for its own command.
 
 use std::{
@@ -826,12 +827,14 @@ struct ParsedArgs {
 /// `-h`/`--help` after a command asks for that command's help, which [`CliArgs::help`] then
 /// names, and leaves [`CliArgs::command`] empty. It does so even when the rest of the command
 /// is incomplete, as `filen cat --help` is without a file, as clap's own help flag would.
+/// Everything after the `rclone` command goes to Rclone, `--help` included
+/// ([`pass_on_rclone_args`]).
 fn parse_args<I, T>(args: I) -> Result<ParsedArgs, clap::Error>
 where
 	I: IntoIterator<Item = T>,
 	T: Into<OsString> + Clone,
 {
-	let args = args.into_iter().collect::<Vec<T>>();
+	let args = pass_on_rclone_args(args.into_iter().map(Into::into).collect());
 	// Without validation, so that the help is found on an incomplete command.
 	if let Ok(mut matches) = CliArgs::command()
 		.ignore_errors(true)
@@ -851,6 +854,105 @@ where
 		args: from_matches(&matches)?,
 		matches,
 	})
+}
+
+/// The name of the command that passes its arguments on to Rclone.
+const RCLONE_COMMAND: &str = "rclone";
+
+/// `args` (the program name first), with `--` put after the `rclone` command and its own options
+/// (`--rclone-binary`), so that clap passes everything after them on to Rclone as it is: `-v` and
+/// `--help` there are Rclone's, not the CLI's. The CLI's options go before `rclone`. Any other
+/// command line is returned as it is.
+fn pass_on_rclone_args(mut args: Vec<OsString>) -> Vec<OsString> {
+	let mut cli = CliArgs::command();
+	// sets the number of values each option takes, which clap leaves unset until it parses
+	cli.build();
+	let cli_options = cli.get_arguments().collect::<Vec<_>>();
+	let Some(command_at) = command_position(&cli_options, &args) else {
+		return args;
+	};
+	let Some(rclone) = args
+		.get(command_at)
+		.and_then(|command| command.to_str())
+		.and_then(|command| cli.find_subcommand(command))
+		.filter(|command| command.get_name() == RCLONE_COMMAND)
+	else {
+		return args;
+	};
+	// the CLI's options, which the subcommand has too, are not taken after `rclone`
+	let own_options = rclone
+		.get_arguments()
+		.filter(|arg| !arg.is_global_set())
+		.collect::<Vec<_>>();
+	let mut rclone_args_at = command_at.saturating_add(1);
+	while let Some(len) = args
+		.get(rclone_args_at..)
+		.and_then(|rest| option_len(&own_options, rest))
+	{
+		rclone_args_at = rclone_args_at.saturating_add(len);
+	}
+	args.insert(rclone_args_at.min(args.len()), OsString::from("--"));
+	args
+}
+
+/// Where the command is in `args` (the program name first): the first argument that is neither
+/// one of the `options` nor the value of one. `None` if there is none, or if `--` comes first.
+fn command_position(options: &[&clap::Arg], args: &[OsString]) -> Option<usize> {
+	let mut at = 1usize;
+	loop {
+		let rest = args.get(at..).filter(|rest| !rest.is_empty())?;
+		if rest.first().is_some_and(|arg| arg == "--") {
+			return None;
+		}
+		match option_len(options, rest) {
+			Some(len) => at = at.saturating_add(len),
+			None => return Some(at),
+		}
+	}
+}
+
+/// How many arguments at the start of `args` the first one takes, if it is one of `options` (or
+/// several short ones together, as in `-vq`): one, or two with a value that follows it.
+fn option_len(options: &[&clap::Arg], args: &[OsString]) -> Option<usize> {
+	let arg = args.first()?.to_str()?;
+	// a value that follows the option, rather than another option
+	let next_is_value = args
+		.get(1)
+		.and_then(|next| next.to_str())
+		.is_some_and(|next| !next.starts_with('-'));
+	let len = |option: &clap::Arg| {
+		let values = option.get_num_args().unwrap_or_default();
+		if values.takes_values() && (values.min_values() > 0 || next_is_value) {
+			2
+		} else {
+			1
+		}
+	};
+	if let Some(long) = arg.strip_prefix("--") {
+		let (name, value) = match long.split_once('=') {
+			Some((name, _)) => (name, true),
+			None => (long, false),
+		};
+		let option = options.iter().find(|option| {
+			option.get_long() == Some(name)
+				|| option
+					.get_all_aliases()
+					.is_some_and(|aliases| aliases.contains(&name))
+		})?;
+		return Some(if value { 1 } else { len(option) });
+	}
+	let shorts = arg.strip_prefix('-').filter(|shorts| !shorts.is_empty())?;
+	for (at, short) in shorts.char_indices() {
+		let option = options
+			.iter()
+			.find(|option| option.get_short() == Some(short))?;
+		if option.get_num_args().unwrap_or_default().takes_values() {
+			// the value is the rest of the argument, as in `-eme@x.io`, or the next one
+			let attached = shorts.len() > at.saturating_add(short.len_utf8());
+			return Some(if attached { 1 } else { len(option) });
+		}
+	}
+	Some(1)
 }
 
 /// The [`CliArgs`] in `matches`, with an error formatted as clap formats one it parses.
@@ -1043,15 +1145,32 @@ mod tests {
 			.unwrap()
 			.args;
 		assert!(cli_args.help.is_none());
-		let Some(Commands::Rclone(RcloneCommands::Rclone { cmd })) = cli_args.command else {
+		let Some(Commands::Rclone(RcloneCommands::Rclone { cmd, .. })) = cli_args.command else {
 			panic!("parsed {:?}", cli_args.command);
 		};
 		assert_eq!(cmd, ["ls", "--help"]);
 	}
 
+	/// The Rclone command `filen rclone ...` runs, from `args`.
+	fn rclone_command(args: &[&str]) -> (CliArgs, Vec<String>) {
+		let mut cli_args = parse_args(args.iter().copied()).unwrap().args;
+		let Some(Commands::Rclone(RcloneCommands::Rclone { cmd, .. })) = cli_args.command.take()
+		else {
+			panic!("parsed {:?}", cli_args.command);
+		};
+		(cli_args, cmd)
+	}
+
 	#[test]
-	fn help_before_an_rclone_command_is_the_clis() {
-		let cli_args = parse_args(["filen", "rclone", "--help"]).unwrap().args;
+	fn help_right_after_rclone_goes_to_rclone() {
+		let (cli_args, cmd) = rclone_command(&["filen", "rclone", "--help"]);
+		assert!(cli_args.help.is_none());
+		assert_eq!(cmd, ["--help"]);
+	}
+
+	#[test]
+	fn help_before_rclone_is_the_clis() {
+		let cli_args = parse_args(["filen", "--help", "rclone"]).unwrap().args;
 		assert_eq!(cli_args.help.as_deref(), Some("rclone"));
 	}
 
@@ -1092,20 +1211,91 @@ mod tests {
 	}
 
 	#[test]
-	fn an_option_before_the_rclone_command_is_the_clis() {
-		let cli_args = parse_args(["filen", "rclone", "-v", "ls"]).unwrap().args;
+	fn an_option_right_after_rclone_goes_to_rclone() {
+		let (cli_args, cmd) = rclone_command(&["filen", "rclone", "-v", "ls"]);
+		assert_eq!(cli_args.verbose, 0);
+		assert_eq!(cmd, ["-v", "ls"]);
+	}
+
+	#[test]
+	fn an_option_before_rclone_is_the_clis() {
+		let (cli_args, cmd) = rclone_command(&["filen", "-v", "--json", "rclone", "ls", "--json"]);
 		assert_eq!(cli_args.verbose, 1);
-		let Some(Commands::Rclone(RcloneCommands::Rclone { cmd })) = cli_args.command else {
+		assert!(cli_args.json);
+		assert_eq!(cmd, ["ls", "--json"]);
+	}
+
+	#[test]
+	fn the_value_of_an_option_before_rclone_is_not_taken_for_the_command() {
+		let (cli_args, cmd) = rclone_command(&[
+			"filen",
+			"--config-dir",
+			"rclone",
+			"--log-file",
+			"rclone",
+			"--profile=work",
+			"-qe",
+			"a@x.io",
+			"rclone",
+			"-v",
+		]);
+		assert_eq!(cli_args.config_dir, Some(PathBuf::from("rclone")));
+		assert_eq!(cli_args.log_file, Some(PathBuf::from("rclone")));
+		assert_eq!(cli_args.email.as_deref(), Some("a@x.io"));
+		assert!(cli_args.quiet);
+		assert_eq!(cmd, ["-v"]);
+	}
+
+	#[test]
+	fn a_value_attached_to_a_short_option_before_rclone_is_not_taken_for_the_command() {
+		let (cli_args, cmd) = rclone_command(&["filen", "-ea@x.io", "rclone", "ls"]);
+		assert_eq!(cli_args.email.as_deref(), Some("a@x.io"));
+		assert_eq!(cmd, ["ls"]);
+	}
+
+	#[test]
+	fn a_double_dash_after_rclone_goes_to_rclone() {
+		let (_, cmd) = rclone_command(&["filen", "rclone", "--", "ls"]);
+		assert_eq!(cmd, ["--", "ls"]);
+	}
+
+	#[test]
+	fn rclone_without_arguments_runs_rclone_without_any() {
+		let (_, cmd) = rclone_command(&["filen", "rclone"]);
+		assert_eq!(cmd, Vec::<String>::new());
+	}
+
+	#[test]
+	fn rclone_as_an_argument_of_another_command_is_not_split() {
+		let cli_args = parse_args(["filen", "ls", "rclone", "-v"]).unwrap().args;
+		assert_eq!(cli_args.verbose, 1);
+		let Some(Commands::Fs(FsCommands::Ls { directory, .. })) = cli_args.command else {
 			panic!("parsed {:?}", cli_args.command);
 		};
-		assert_eq!(cmd, ["ls"]);
+		assert_eq!(directory.as_deref(), Some("rclone"));
+	}
+
+	#[test]
+	fn a_repl_line_passes_everything_after_rclone_on() {
+		let Some(Commands::Rclone(RcloneCommands::Rclone { cmd, .. })) =
+			parse_repl_line("rclone -v --help ls").unwrap().command
+		else {
+			panic!("parsed no rclone command");
+		};
+		assert_eq!(cmd, ["-v", "--help", "ls"]);
+	}
+
+	#[test]
+	fn a_repl_line_giving_an_option_before_rclone_applies_it() {
+		let line_args = parse_repl_line("-v rclone ls").unwrap();
+		assert_eq!(line_args.verbose, 1);
 	}
 
 	#[test]
 	fn an_option_inside_an_rclone_command_goes_to_rclone() {
 		let cli_args = parse_args(["filen", "rclone", "ls", "-v"]).unwrap().args;
 		assert_eq!(cli_args.verbose, 0);
-		let Some(Commands::Rclone(RcloneCommands::Rclone { cmd })) = cli_args.command else {
+		let Some(Commands::Rclone(RcloneCommands::Rclone { cmd, .. })) = cli_args.command else {
 			panic!("parsed {:?}", cli_args.command);
 		};
 		assert_eq!(cmd, ["ls", "-v"]);
