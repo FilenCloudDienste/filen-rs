@@ -10,6 +10,16 @@
 //! `--keep-both` settle them in the first pass; with `--once`, one more pass then applies what was
 //! settled before the command exits.
 //!
+//! What the flags leave is asked about at the terminal once the pass that found it has ended, when
+//! stdin, stdout and stderr are terminals, without `--json` and without `--no-input`: whether to
+//! apply a held batch of deletions, listing up to 20 of them, and which version of a conflicting
+//! file to keep, or neither for now. A batch or a conflict is asked about once while it lasts. The
+//! approval only lives in this `filen sync`, so there is no command to give it later. `--yes` does
+//! not answer these questions. While a question is open, `sync` keeps syncing and prints what
+//! happened once it is answered; Ctrl-C at the question answers "not now", and a further Ctrl-C
+//! stops the sync. With `--once`, the questions come after the passes, and one more pass applies
+//! what the answers settled.
+//!
 //! `sync --once` exits with 0 when the last pass of every sync pair completed and left nothing
 //! undone: no errors, no held deletions, no conflicts and no paused sync pair. Otherwise it exits
 //! with 1, after naming each sync pair and what it left. `sync` without `--once` exits with 0 when
@@ -121,6 +131,7 @@ mod ignore_file;
 mod json_events;
 mod once;
 mod outcome;
+mod questions;
 mod status_line;
 mod sync_pairs;
 mod transfers;
@@ -128,6 +139,7 @@ mod watch_status;
 
 use conflict_resolutions::ConflictResolutions;
 use failures::Failures;
+use questions::Questions;
 use status_line::{StatusLine, Throttle};
 use sync_pairs::SyncDirs;
 use transfers::Transfers;
@@ -274,12 +286,14 @@ async fn sync(
 	)?;
 	// once, before the passes start: labelling an event must not ask the server for anything
 	let labels = sync_pairs::pair_labels(client, &pairs).await;
-	let log = EventLog::new(&labels, settle, Output::of(ui));
+	let can_ask = questions::can_ask(ui);
+	let mut log = EventLog::new(&labels, settle, Output::of(ui));
+	log.asks = can_ask;
 	log.print_banners(ui, &pairs, once);
 	if once {
-		once::sync_once(ui, &engine, &pairs, log, settle).await
+		once::sync_once(ui, &engine, &pairs, log, settle, Questions::new(can_ask)).await
 	} else {
-		continuous::sync_continuously(ui, engine, &pairs, log).await
+		continuous::sync_continuously(ui, engine, &pairs, log, Questions::new(can_ask)).await
 	}
 }
 
@@ -297,6 +311,9 @@ struct EventLog<'a> {
 	transfers: Transfers,
 	/// The failures printed, so that one that comes back on every pass is printed once.
 	failures: Failures,
+	/// Whether what a pass leaves for a person to settle is asked about at the terminal once the
+	/// pass has ended ([`questions`]), rather than left to the flags of a later run.
+	asks: bool,
 	output: Output,
 }
 
@@ -392,6 +409,7 @@ impl<'a> EventLog<'a> {
 			passed: HashSet::new(),
 			transfers: Transfers::default(),
 			failures: Failures::default(),
+			asks: false,
 			output,
 		}
 	}
@@ -491,13 +509,16 @@ impl<'a> EventLog<'a> {
 						pass_token,
 					});
 				}
-				self.print_needs_attention(
-					ui,
-					pair,
-					&format!(
+				let message = if self.asks {
+					format!(
+						"Held back {count} deletions. You are asked whether to apply them once the pass has ended"
+					)
+				} else {
+					format!(
 						"Held back {count} deletions. If you wish to execute them, re-run the command with --approve-mass-deletions"
-					),
-				);
+					)
+				};
+				self.print_needs_attention(ui, pair, &message);
 			}
 			// paths the engine leaves alone, which no other event names
 			SyncEvent::PassCompleted { report } => {
@@ -514,13 +535,16 @@ impl<'a> EventLog<'a> {
 						resolution,
 					});
 				}
-				self.print_needs_attention(
-					ui,
-					pair,
-					&format!(
+				let message = if self.asks {
+					format!(
+						"Conflict detected at {rel_path}. You are asked which version to keep once the pass has ended"
+					)
+				} else {
+					format!(
 						"Conflict detected. To resolve it, re-run the command with --keep-local/--keep-remote/--keep-both \"{rel_path}\""
-					),
-				);
+					)
+				};
+				self.print_needs_attention(ui, pair, &message);
 			}
 			// every other event says all there is to say in its line
 			_ => {}
@@ -610,6 +634,14 @@ impl<'a> EventLog<'a> {
 			};
 			self.print_line(ui, pair, kind, &notice.text);
 		}
+	}
+
+	/// Prints `msg`, a line of the sync's own rather than a pair's, dimmed.
+	fn print_note(&mut self, ui: &mut UI, msg: &str) {
+		info!("{msg}");
+		self.clear_status();
+		ui.print_muted(msg);
+		self.redraw_status();
 	}
 
 	/// Prints a failure that is not an event's, such as a conflict that could not be resolved.
@@ -1091,6 +1123,54 @@ mod tests {
 			]
 		);
 		assert_eq!(err, ["[L]: Failed to sync b: denied"]);
+	}
+
+	/// When the sync can ask at the terminal, what needs attention says that it will.
+	#[test]
+	fn what_needs_attention_says_it_is_asked_about_when_it_can_be() {
+		let out = Printed::default();
+		let mut ui = Printed::split_ui(&out, &Printed::default());
+		let labels = HashMap::from([(1, "L".to_string())]);
+		let settle = Settle {
+			approve_mass_deletions: false,
+			conflict_resolutions: ConflictResolutions::new(vec![], vec![], vec![]).unwrap(),
+		};
+		let mut log = EventLog::new(
+			&labels,
+			&settle,
+			Output::Text {
+				quiet: true,
+				status: None,
+			},
+		);
+		log.asks = true;
+
+		for event in [
+			SyncEvent::Conflict {
+				rel_path: "c".to_string(),
+			},
+			SyncEvent::DeletionsHeld {
+				count: 3,
+				reason: "first sync".to_string(),
+				pass_token: "t".to_string(),
+			},
+		] {
+			let _ = log.print(&mut ui, 1, &event);
+		}
+
+		let lines = console::strip_ansi_codes(&out.lines())
+			.lines()
+			.map(|line| line.split_once("] ").unwrap().1.to_owned())
+			.collect::<Vec<_>>();
+		assert_eq!(
+			lines,
+			[
+				"[L]: [NEEDS ATTENTION] Conflict detected at c. You are asked which version to keep \
+				 once the pass has ended",
+				"[L]: [NEEDS ATTENTION] Held back 3 deletions. You are asked whether to apply them \
+				 once the pass has ended",
+			]
+		);
 	}
 
 	#[test]

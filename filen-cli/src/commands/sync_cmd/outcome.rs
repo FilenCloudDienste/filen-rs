@@ -10,31 +10,65 @@ use filen_sdk_rs::sync_engine::{PairId, SyncEvent, SyncReport};
 /// What `report`'s pass left undone, each as a short phrase; empty when it left nothing.
 /// `resolved` are the conflicts it found that were resolved since, which the next pass applies.
 pub(super) fn pass_problems(report: &SyncReport, resolved: &HashSet<String>) -> Vec<String> {
-	if report.paused {
-		return vec!["paused".to_owned()];
+	PassLeft::of(report, resolved).problems()
+}
+
+/// What a completed pass left undone.
+struct PassLeft {
+	paused: bool,
+	refused: Option<String>,
+	/// The paths of the conflicts it found that have not been resolved since.
+	conflicts: HashSet<String>,
+	held: usize,
+	errors: usize,
+	interrupted: usize,
+}
+
+impl PassLeft {
+	fn of(report: &SyncReport, resolved: &HashSet<String>) -> Self {
+		Self {
+			paused: report.paused,
+			refused: report.refused.as_ref().map(ToString::to_string),
+			conflicts: report
+				.conflict_paths()
+				.filter(|rel_path| !resolved.contains(*rel_path))
+				.map(str::to_owned)
+				.collect(),
+			held: report.held_deletions(),
+			errors: report.errors.len(),
+			interrupted: report.interrupted,
+		}
 	}
-	let mut problems = Vec::new();
-	if let Some(reason) = &report.refused {
-		problems.push(format!("refused: {reason}"));
+
+	/// Each thing left undone, as a short phrase.
+	fn problems(&self) -> Vec<String> {
+		if self.paused {
+			return vec!["paused".to_owned()];
+		}
+		let mut problems = Vec::new();
+		if let Some(reason) = &self.refused {
+			problems.push(format!("refused: {reason}"));
+		}
+		if !self.conflicts.is_empty() {
+			problems.push(format!("{} conflict(s)", self.conflicts.len()));
+		}
+		if self.held > 0 {
+			problems.push(format!("{} held deletion(s)", self.held));
+		}
+		if self.errors > 0 {
+			problems.push(format!("{} error(s)", self.errors));
+		}
+		if self.interrupted > 0 {
+			problems.push(format!("{} action(s) not carried out", self.interrupted));
+		}
+		problems
 	}
-	let conflicts = report
-		.conflict_paths()
-		.filter(|rel_path| !resolved.contains(*rel_path))
-		.count();
-	if conflicts > 0 {
-		problems.push(format!("{conflicts} conflict(s)"));
-	}
-	let held = report.held_deletions();
-	if held > 0 {
-		problems.push(format!("{held} held deletion(s)"));
-	}
-	if !report.errors.is_empty() {
-		problems.push(format!("{} error(s)", report.errors.len()));
-	}
-	if report.interrupted > 0 {
-		problems.push(format!("{} action(s) not carried out", report.interrupted));
-	}
-	problems
+}
+
+/// How the last pass of a pair ended.
+enum LastPass {
+	Completed(PassLeft),
+	Failed,
 }
 
 /// The problem of a pair whose last pass failed outright.
@@ -61,7 +95,7 @@ pub(super) fn problems_summary(pairs: &[(Cow<'_, str>, Vec<String>)]) -> Option<
 /// What the last pass of each watched pair left undone, as its events tell.
 #[derive(Default)]
 pub(super) struct LastPasses {
-	problems: HashMap<PairId, Vec<String>>,
+	last: HashMap<PairId, LastPass>,
 	/// The conflicts of each pair resolved during the pass in flight.
 	resolved: HashMap<PairId, HashSet<String>>,
 	/// The pairs whose pass in flight waits for the cache to finish listing the remote folder.
@@ -83,7 +117,8 @@ impl LastPasses {
 			SyncEvent::PassCompleted { report } => {
 				self.awaiting_remote.remove(&pair);
 				let resolved = self.resolved.remove(&pair).unwrap_or_default();
-				self.problems.insert(pair, pass_problems(report, &resolved));
+				self.last
+					.insert(pair, LastPass::Completed(PassLeft::of(report, &resolved)));
 			}
 			SyncEvent::PassFailed { .. } => {
 				let awaited_remote = self.awaiting_remote.remove(&pair);
@@ -93,7 +128,7 @@ impl LastPasses {
 				if self.stopping && awaited_remote {
 					return;
 				}
-				self.problems.insert(pair, failed_pass_problems());
+				self.last.insert(pair, LastPass::Failed);
 			}
 			// every other event is part of a pass that has not ended
 			_ => {}
@@ -113,9 +148,21 @@ impl LastPasses {
 			.insert(rel_path.to_owned());
 	}
 
+	/// Notes that the conflict at `rel_path` of `pair`, which its last pass found, was resolved
+	/// after that pass had ended.
+	pub(super) fn resolved_since(&mut self, pair: PairId, rel_path: &str) {
+		if let Some(LastPass::Completed(left)) = self.last.get_mut(&pair) {
+			left.conflicts.remove(rel_path);
+		}
+	}
+
 	/// What the last pass of `pair` left undone; nothing when no pass of it has ended.
 	pub(super) fn take(&mut self, pair: PairId) -> Vec<String> {
-		self.problems.remove(&pair).unwrap_or_default()
+		match self.last.remove(&pair) {
+			Some(LastPass::Completed(left)) => left.problems(),
+			Some(LastPass::Failed) => failed_pass_problems(),
+			None => Vec::new(),
+		}
 	}
 }
 
@@ -233,6 +280,17 @@ mod tests {
 		passes.note(1, &SyncEvent::PassCompleted { report });
 
 		assert!(passes.take(1).is_empty());
+	}
+
+	#[test]
+	fn a_conflict_resolved_after_the_pass_that_found_it_is_no_problem() {
+		let mut passes = LastPasses::default();
+		let mut report = SyncReport::default();
+		report.conflicts = vec![conflict("a.txt"), conflict("b.txt")];
+		passes.note(1, &SyncEvent::PassCompleted { report });
+		passes.resolved_since(1, "a.txt");
+
+		assert_eq!(passes.take(1), ["1 conflict(s)"]);
 	}
 
 	fn failed() -> SyncEvent {
