@@ -12047,3 +12047,30 @@ async fn an_action_that_never_ran_keeps_its_streak_in_a_pass_that_went_on() {
 	drop(engine);
 	std::fs::remove_file(&path).ok();
 }
+
+/// Only a pass after one that found the local disk full measures the local volume before its
+/// downloads: a pair's first pass relies on the filesystem's own refusal, a pass that found room
+/// again stops the measuring, and the record goes with its pair.
+#[tokio::test]
+async fn only_a_pass_after_a_full_local_disk_measures_the_volume() {
+	let dir = tempfile::tempdir().unwrap();
+	let root = dir.path().join("root");
+	std::fs::create_dir(&root).unwrap();
+	let engine = SyncEngine::open(Arc::new(offline_client()), dir.path().join("baseline.db"))
+		.await
+		.unwrap();
+	let pair = engine
+		.add_pair(root, Uuid::from_u128(1), SyncMode::TwoWay)
+		.await
+		.unwrap();
+
+	assert!(engine.free_space_check(pair).await.is_none());
+	engine.note_local_full(pair, true).await;
+	assert!(engine.free_space_check(pair).await.is_some());
+	engine.note_local_full(pair, false).await;
+	assert!(engine.free_space_check(pair).await.is_none());
+
+	engine.note_local_full(pair, true).await;
+	engine.remove_pair(pair).await.unwrap();
+	assert!(engine.local_full.lock().await.is_empty());
+}

@@ -1763,6 +1763,12 @@ pub struct SyncEngine {
 	/// a day. In memory only: the first pass after the engine opens always prunes, which costs one
 	/// listing of the bin's top level. Bounded by the pair count; an entry goes with its pair.
 	bin_pruned: Mutex<HashMap<PairId, NaiveDate>>,
+	/// The pairs whose last pass to apply anything found the local disk full, so the next one
+	/// measures the local volume before its first download rather than starting the held downloads
+	/// into it again (see [`ApplyContext::free_space`]). In memory only: a pass after a restart
+	/// tries its downloads, as any first attempt does. Bounded by the pair count; an entry goes with
+	/// its pair.
+	local_full: Mutex<HashSet<PairId>>,
 	/// The pairs whose filen-sync trash this engine has finished looking for (see
 	/// [`migrate_legacy_trash`](SyncEngine::migrate_legacy_trash)), or found already synced, so the
 	/// tree is walked for it at most once per pair and engine: a pair whose first pass is refused
@@ -3379,6 +3385,7 @@ impl SyncEngine {
 			changes: Mutex::new(HashMap::new()),
 			carried: Mutex::new(HashMap::new()),
 			bin_pruned: Mutex::new(HashMap::new()),
+			local_full: Mutex::new(HashSet::new()),
 			legacy_trash_looked: Mutex::new(HashMap::new()),
 			user_ignore_changed: tokio::sync::watch::channel(0).0,
 			stages: AtomicU64::new(0),
@@ -5713,6 +5720,7 @@ impl SyncEngine {
 		self.changes.lock().await.remove(&pair);
 		self.carried.lock().await.remove(&pair);
 		self.bin_pruned.lock().await.remove(&pair);
+		self.local_full.lock().await.remove(&pair);
 		self.legacy_trash_looked.lock().await.remove(&pair);
 		// The pair's connection goes with the pair. Last, so nothing above can reopen it, and the
 		// file handle closes as soon as the cascade above lets this function's own handle go.
@@ -6654,6 +6662,27 @@ impl SyncEngine {
 		);
 	}
 
+	/// How `pair`'s next apply reads the local volume's free space before its first download: with
+	/// [`apply::free_space`] when its last pass found the local disk full, and not at all otherwise —
+	/// a first attempt relies on the filesystem's own refusal.
+	async fn free_space_check(&self, pair: PairId) -> Option<apply::FreeSpace> {
+		self.local_full
+			.lock()
+			.await
+			.contains(&pair)
+			.then_some(apply::free_space as apply::FreeSpace)
+	}
+
+	/// Record whether `pair`'s pass found the local disk full (see [`local_full`](Self::local_full)).
+	async fn note_local_full(&self, pair: PairId, found_full: bool) {
+		let mut local_full = self.local_full.lock().await;
+		if found_full {
+			local_full.insert(pair);
+		} else {
+			local_full.remove(&pair);
+		}
+	}
+
 	/// Prune `pair`'s local bin under `local_root` as of `today` (see [`bin::prune_bin`]), unless it
 	/// was already pruned on `today`. Returns what the prune did, or `None` when it did not run.
 	///
@@ -7386,8 +7415,10 @@ impl SyncEngine {
 			lock_budget: self.lock_budget,
 			bin_day: Utc::now().date_naive(),
 			streaked: &streaked,
+			free_space: self.free_space_check(pair).await,
 		};
-		apply::apply(ctx, plan, &mut report, observer).await;
+		let local_full = apply::apply(ctx, plan, &mut report, observer).await;
+		self.note_local_full(pair, local_full).await;
 		// The pass let go of its hold of the drive lock; what it looked up during it goes too.
 		self.client.forget_ended_hold_targets();
 		self.note_path_outcomes(pair, ends, &mut report).await;

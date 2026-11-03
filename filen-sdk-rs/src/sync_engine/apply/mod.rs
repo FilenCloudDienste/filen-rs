@@ -73,7 +73,7 @@ use crate::{
 		bulk::create_dirs::{CreatedDir, NewDir, NewDirParent},
 		categories::{DirType, Normal},
 		dir::meta::DirectoryMetaChanges,
-		file::{FileBuilderOptionalName, meta::FileMetaChanges},
+		file::{FileBuilderOptionalName, meta::FileMetaChanges, traits::HasFileInfo},
 		name::ValidatedName,
 	},
 	io::{
@@ -84,6 +84,8 @@ use crate::{
 	util::{MaybeArc, MaybeSendCallback},
 };
 use reach::Reach;
+use room::LocalRoom;
+pub(super) use room::{FreeSpace, free_space};
 use tokio::{sync::mpsc::UnboundedSender, time::Instant};
 
 /// Outcome of one apply pass.
@@ -219,6 +221,11 @@ pub struct SyncReport {
 	/// moves and deletions, baseline adoptions) still run. [`interrupted`](Self::interrupted) does
 	/// not count the held actions: the next pass re-plans them. A watch treats such a pass as a
 	/// failed one and backs off before the next.
+	///
+	/// The pass after one that found the local disk full reads the local volume's free space
+	/// before its first download, and holds each download that no longer fits in what is left
+	/// rather than starting it into the disk again; it halts on a full local disk just the same.
+	/// A first attempt reads nothing: the filesystem's refusal is what finds the disk full.
 	pub halted: Option<HaltReason>,
 	/// Why this pass read both sides WHOLE rather than only what changed since the last one, or
 	/// `None` when its changelists described every change (see [`FullPassReason`]).
@@ -351,6 +358,10 @@ pub(super) struct ApplyContext<'a> {
 	/// The paths of the pass's actions whose success ends a failure streak (the engine's
 	/// `endable_streaks`): which of them landed is recorded in [`SyncReport::landed`].
 	pub(super) streaked: &'a HashSet<&'a str>,
+	/// How the local volume's free space is read before the first download, on a retry after a
+	/// pass that found the local disk full; `None` on a first attempt, which measures nothing (see
+	/// [`LocalRoom`]).
+	pub(super) free_space: Option<FreeSpace>,
 }
 
 impl ApplyContext<'_> {
@@ -880,9 +891,39 @@ fn millis_to_dt(millis: i64) -> DateTime<Utc> {
 /// transfers in flight and skips everything left, counting them in [`SyncReport::interrupted`]. A
 /// transfer that got as far as FINISHING is never dropped between its network op and the row that
 /// records it (see [`apply_transfer`]), so the two always agree.
+///
+/// Returns whether the pass found the local disk full — a download the disk refused, or one the
+/// volume was measured too short for ([`LocalRoom`]) — which is what makes the next pass measure
+/// it before its first download ([`ApplyContext::free_space`]).
 pub(super) async fn apply(
 	ctx: ApplyContext<'_>,
 	plan: StagedPlan,
+	report: &mut SyncReport,
+	observer: &mut (dyn FnMut(SyncEvent) + Send),
+) -> bool {
+	// The sides found full so far: each holds back the transfers that write to it.
+	let full = FullSides::default();
+	let mut room = Room {
+		local: LocalRoom::new(ctx.free_space),
+		short: false,
+	};
+	apply_plan(ctx, plan, &full, &mut room, report, observer).await;
+	room.short || full.local.load(Ordering::Relaxed)
+}
+
+/// The local volume's room for the pass's downloads, and whether a download was held for want of
+/// it.
+struct Room {
+	local: LocalRoom,
+	short: bool,
+}
+
+/// [`apply`], with the sides found full and the local room it reads back once the pass is done.
+async fn apply_plan(
+	ctx: ApplyContext<'_>,
+	plan: StagedPlan,
+	full: &FullSides,
+	room: &mut Room,
 	report: &mut SyncReport,
 	observer: &mut (dyn FnMut(SyncEvent) + Send),
 ) {
@@ -894,12 +935,10 @@ pub(super) async fn apply(
 	let mut lease = Lease::Unheld;
 
 	let mut failed = FailedDirMoves::default();
-	// The sides found full so far: each holds back the transfers that write to it.
-	let full = FullSides::default();
 	// Whether the servers answered while each action that failed on them ran.
 	let reach = Reach::new(ctx.client);
 	let findings = Findings {
-		full: &full,
+		full,
 		reach: &reach,
 	};
 	// Creates and moves first, in order (a run of remote directory creates a chunk at a time): they
@@ -915,7 +954,7 @@ pub(super) async fn apply(
 		if !ctx.gate.wait_to_start().await {
 			return note_interrupted(report, total - applied, observer);
 		}
-		if !failed.skips(action, report, observer) && !holds_serial(&full, &mut failed, action) {
+		if !failed.skips(action, report, observer) && !holds_serial(full, &mut failed, action) {
 			match lease.prepare(&ctx, action, releasable).await {
 				Some(Ok(())) => {}
 				Some(Err(error)) => {
@@ -962,7 +1001,7 @@ pub(super) async fn apply(
 				let chunk_ctx = ChunkContext {
 					ctx: &ctx,
 					hold,
-					full: &full,
+					full,
 					reach: &reach,
 					since: reach.mark(),
 				};
@@ -1047,10 +1086,14 @@ pub(super) async fn apply(
 						applied += 1;
 						// A read of the stage: nothing was sent.
 						let verdict = Verdict::of(pass_halt(&error));
-						note_action_failed(&entry.action, &error, verdict, &full, report, observer);
+						note_action_failed(&entry.action, &error, verdict, full, report, observer);
 						continue;
 					}
 				};
+				if !fits(&ctx, room, &entry, &target, report).await {
+					applied += 1;
+					continue;
+				}
 				lease.note_start(&entry.action);
 				remote_in_flight += usize::from(mutates_remote(&entry.action));
 				in_flight.push(run_transfer(&ctx, &reach, entry, target, &progress));
@@ -1083,10 +1126,14 @@ pub(super) async fn apply(
 						applied += 1;
 						// A read of the stage: nothing was sent.
 						let verdict = Verdict::of(pass_halt(&error));
-						note_action_failed(&entry.action, &error, verdict, &full, report, observer);
+						note_action_failed(&entry.action, &error, verdict, full, report, observer);
 						continue;
 					}
 				};
+				if !fits(&ctx, room, &entry, &target, report).await {
+					applied += 1;
+					continue;
+				}
 				match lease.prepare(&ctx, &entry.action, releasable).await {
 					Some(Ok(())) => {}
 					Some(Err(error)) => {
@@ -1140,7 +1187,7 @@ pub(super) async fn apply(
 				}
 				Err(Failed { error, verdict }) => {
 					applied += 1;
-					note_action_failed(&action, &error, verdict, &full, report, observer);
+					note_action_failed(&action, &error, verdict, full, report, observer);
 				}
 			}
 		}
@@ -1157,7 +1204,7 @@ pub(super) async fn apply(
 		if !ctx.gate.wait_to_start().await {
 			return note_interrupted(report, total - applied, observer);
 		}
-		if !failed.skips(action, report, observer) && !holds_serial(&full, &mut failed, action) {
+		if !failed.skips(action, report, observer) && !holds_serial(full, &mut failed, action) {
 			match lease.prepare(&ctx, action, releasable).await {
 				Some(Ok(())) => {}
 				Some(Err(error)) => {
@@ -1201,6 +1248,37 @@ pub(super) async fn apply(
 		applied += 1;
 	}
 	note_interrupted(report, total - applied, observer);
+}
+
+/// Whether the transfer `entry` may start for the room the local volume has (see [`LocalRoom`]): an
+/// upload always, a download only while its bytes fit in what is left. One that does not fit is held
+/// as a download the full disk refused would have been — it records nothing, the pass halts on a
+/// full local disk and the next pass re-plans it — and the transfers after it go on, so a smaller
+/// one that still fits lands.
+async fn fits(
+	ctx: &ApplyContext<'_>,
+	room: &mut Room,
+	entry: &PlannedEntry,
+	target: &TransferTarget,
+	report: &mut SyncReport,
+) -> bool {
+	let PassStart::Download { remote, .. } = &entry.start else {
+		return true;
+	};
+	let size = remote.as_deref().map_or_else(
+		|| target.file.as_ref().map_or(0, HasFileInfo::size),
+		|node| node.size,
+	);
+	if room.local.admits(ctx.local_root, size).await {
+		return true;
+	}
+	tracing::debug!(
+		"apply: {} held, the local volume has no room left for its {size} bytes",
+		entry.action.describe()
+	);
+	room.short = true;
+	note_halted(report, HaltReason::LocalStorageFull);
+	false
 }
 
 /// The next transfer of `plan` to start, past the ones under a directory whose move failed this
@@ -3029,12 +3107,18 @@ fn note_failure(
 			.transient_failures
 			.push((rel_path.to_string(), error.to_string()));
 	}
+	note_halted(report, reason);
+	Some(reason)
+}
+
+/// Halt the pass on `reason` (see [`SyncReport::halted`]), if nothing did yet, with one line saying
+/// so per condition.
+fn note_halted(report: &mut SyncReport, reason: HaltReason) {
 	let line = reason.held_line();
 	if !report.errors.contains(&line) {
 		report.errors.push(line);
 	}
 	report.halted.get_or_insert(reason);
-	Some(reason)
 }
 
 /// Record an upload that buried a concurrent edit: it counts as an upload, and the conflict it made
@@ -4503,6 +4587,7 @@ fn internal_owned(message: String) -> crate::Error {
 }
 
 mod reach;
+mod room;
 
 /// A plan the tests stage for the apply without screening it, and entries with nothing read.
 #[cfg(test)]

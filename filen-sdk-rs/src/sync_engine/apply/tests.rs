@@ -1930,6 +1930,7 @@ impl Borrowed {
 			lock_budget: LockBudget::default(),
 			bin_day: day(),
 			streaked: &self.streaked,
+			free_space: None,
 		}
 	}
 }
@@ -3966,4 +3967,149 @@ async fn a_transfer_taken_for_its_servers_outage_holds_the_other_servers_work_to
 	assert_eq!(failures(&events), 1);
 	assert_eq!(report.remotely_trashed, 0);
 	assert_eq!(report.interrupted, 0);
+}
+
+/// What one [`apply`] of a download per `(name, size)` in `files`, then a local deletion of
+/// `old.txt`, left behind on a client whose servers cannot be reached, measuring the local volume
+/// with `free_space`. Returns the report, the events and whether the pass found the local disk full.
+async fn pass_with_room(
+	free_space: Option<FreeSpace>,
+	files: &[(&str, u64)],
+) -> (SyncReport, Vec<SyncEvent>, bool) {
+	let cache_dir = tempfile::tempdir().unwrap();
+	let cache = cache_dir.path().join("cache.db");
+	let root = Uuid::from_u128(u128::MAX);
+	let borrowed = Borrowed::with_client(unauth::test_support::offline_client());
+	let file_uuid = |n: usize| Uuid::from_u128(u128::try_from(n).unwrap() + 1);
+	let mut state = CacheState::new_on_path(&cache, root);
+	state
+		.upsert_files(files.iter().enumerate().map(|(n, (name, size))| {
+			let mut file = cacheable_file(file_uuid(n), root, name);
+			file.size = *size;
+			file.chunks_size = *size;
+			file
+		}))
+		.unwrap();
+	std::fs::write(borrowed.local.path().join("old.txt"), b"old").unwrap();
+	let (_dir, stage) = Stage::in_temp_dir();
+	let mut writer = PlanWriter::new(stage).unwrap();
+	for (n, (name, _)) in files.iter().enumerate() {
+		writer
+			.push(&PlannedEntry::bare(SyncAction::DownloadFile {
+				rel_path: (*name).to_string(),
+				remote_uuid: file_uuid(n),
+			}))
+			.unwrap();
+	}
+	writer
+		.push(&PlannedEntry::bare(delete_local("old.txt", NodeKind::File)))
+		.unwrap();
+	let mut report = SyncReport::default();
+	let mut events = Vec::new();
+	let local_full = apply(
+		ApplyContext {
+			free_space,
+			..borrowed.ctx(root, Some(cache))
+		},
+		writer.finish().unwrap(),
+		&mut report,
+		&mut |event| events.push(event),
+	)
+	.await;
+	assert_eq!(
+		report.locally_deleted, 1,
+		"the local deletion runs either way"
+	);
+	assert!(!borrowed.local.path().join("old.txt").exists());
+	(report, events, local_full)
+}
+
+/// A retry after a full local disk that measures too little room starts no download: each is held
+/// as the disk's own refusal would hold it — no failure, no streak — and the pass stays halted on a
+/// full local disk, so a watch backs off again. The local deletion after them still runs.
+#[tokio::test(start_paused = true)]
+async fn a_retry_with_too_little_room_starts_no_download_and_stays_halted() {
+	let (report, events, local_full) =
+		pass_with_room(Some(|_| Ok(6)), &[("a.bin", 7), ("b.bin", 7)]).await;
+
+	assert!(local_full);
+	assert_eq!(report.halted, Some(HaltReason::LocalStorageFull));
+	assert_eq!(
+		report.errors,
+		[HaltReason::LocalStorageFull.held_line()],
+		"nothing was sent, so nothing else failed"
+	);
+	assert!(report.failed_paths.is_empty(), "{:?}", report.failed_paths);
+	assert!(report.transient_failures.is_empty());
+	assert_eq!(failures(&events), 0);
+	assert_eq!(report.downloaded, 0);
+	assert_eq!(report.interrupted, 0);
+	assert_eq!(
+		report.pass_failure().map(|(_, kind)| kind),
+		Some(ErrorKind::IO)
+	);
+}
+
+/// The downloads of a pass run concurrently, so they draw from one measurement together: of two
+/// that each fit but not both, the first starts and the second is held.
+#[tokio::test(start_paused = true)]
+async fn concurrent_downloads_draw_from_one_measurement_together() {
+	let (report, _, local_full) =
+		pass_with_room(Some(|_| Ok(10)), &[("a.bin", 7), ("b.bin", 7)]).await;
+
+	assert!(local_full);
+	assert_eq!(report.halted, Some(HaltReason::LocalStorageFull));
+	assert_eq!(
+		paths_of(&report.transient_failures),
+		["a.bin"],
+		"only the download that fit was started, and the offline client failed it"
+	);
+}
+
+/// Once the volume has room again, the retry starts its downloads: here they get as far as the
+/// network, which the offline client fails, and nothing says the disk is full.
+#[tokio::test(start_paused = true)]
+async fn a_retry_with_room_starts_its_downloads() {
+	let (report, _, local_full) =
+		pass_with_room(Some(|_| Ok(14)), &[("a.bin", 7), ("b.bin", 7)]).await;
+
+	assert!(!local_full);
+	assert_eq!(report.halted, Some(HaltReason::RemoteUnavailable));
+	let mut started = paths_of(&report.transient_failures);
+	started.sort_unstable();
+	assert_eq!(started, ["a.bin", "b.bin"]);
+}
+
+/// A measurement that fails leaves the retry starting its downloads, as it did before there was
+/// one.
+#[tokio::test(start_paused = true)]
+async fn a_failed_measurement_starts_the_downloads() {
+	let (report, _, local_full) = pass_with_room(
+		Some(|_| Err(std::io::ErrorKind::PermissionDenied.into())),
+		&[("a.bin", 7)],
+	)
+	.await;
+
+	assert!(!local_full);
+	assert_eq!(report.halted, Some(HaltReason::RemoteUnavailable));
+	assert_eq!(paths_of(&report.transient_failures), ["a.bin"]);
+}
+
+/// A first attempt measures nothing: every download starts, however little room there is, and it
+/// is the filesystem that says when the disk is full.
+#[tokio::test(start_paused = true)]
+async fn a_first_attempt_measures_nothing() {
+	let (report, _, local_full) = pass_with_room(None, &[("a.bin", 7)]).await;
+
+	assert!(!local_full);
+	assert_eq!(report.halted, Some(HaltReason::RemoteUnavailable));
+	assert_eq!(paths_of(&report.transient_failures), ["a.bin"]);
+}
+
+/// The volume holding a real directory has a size to read.
+#[test]
+fn the_free_space_of_a_real_volume_is_read() {
+	let dir = tempfile::tempdir().unwrap();
+	free_space(dir.path()).unwrap();
+	assert!(free_space(&dir.path().join("missing")).is_err());
 }

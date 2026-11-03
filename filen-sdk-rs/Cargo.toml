@@ -53,6 +53,8 @@ sync-engine = [
 	"dep:ignore",
 	"dep:same-file",
 	"dep:dunce",
+	"dep:nix",
+	"dep:sysinfo",
 ]
 # rclone run as a child process (network drive mounts and `rclone serve`), from a binary the app
 # ships. Native-only (the module is cfg'd off on wasm).
@@ -369,7 +371,8 @@ ignore = { version = "0.4.25", optional = true }
 dunce = { version = "1.0.5", optional = true }
 # rclone (`rclone`): a free port for its RC API and the free disk space its default cache size is
 # taken from; for the managed installation (`rclone-managed`), the pinned release's checksums and
-# the release zip it extracts.
+# the release zip it extracts. `sysinfo` is also the sync engine's (`sync-engine`) read of a local
+# volume's free space on Windows (`GetDiskFreeSpaceExW`), which `std` has no safe call for.
 hex-literal = { version = "1.1.0", optional = true }
 port_check = { version = "0.3.0", optional = true }
 sysinfo = { version = "0.37.2", optional = true }
@@ -420,9 +423,11 @@ hyper-util = { version = "0.1.17", default-features = false, features = [
 windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }
 
 [target.'cfg(unix)'.dependencies]
-# `getrusage` without `unsafe`, for the sync engine probe's peak resident set (`bench-internals`).
+# Without `unsafe`: `getrusage`, for the sync engine probe's peak resident set
+# (`bench-internals`), and `statvfs`, for the sync engine's read of a local volume's free space.
 # 0.31 is the version `ctrlc` already locks, so it adds no package.
 nix = { version = "0.31.3", default-features = false, features = [
+	"fs",
 	"resource",
 ], optional = true }
 
