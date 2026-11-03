@@ -586,6 +586,7 @@ fn format_sync_event(event: &SyncEvent) -> String {
 			reason,
 			pass_token: _,
 		} => format!("Held back {count} deletion(s): {reason}"),
+		// A transfer runs alongside others and reports its event once it has landed.
 		SyncEvent::Uploading { rel_path } => format!("Uploaded {rel_path}"),
 		SyncEvent::Downloading { rel_path } => format!("Downloaded {rel_path}"),
 		SyncEvent::Progress {
@@ -601,16 +602,18 @@ fn format_sync_event(event: &SyncEvent) -> String {
 			let percent = (bytes * 100).checked_div(*total).unwrap_or(100);
 			format!("{verb} {rel_path}: {percent}% ({bytes}/{total} bytes)")
 		}
+		// The other actions report their event before they run, so an `ActionFailed` can follow; the
+		// pass's summary counts what was done.
 		SyncEvent::CreatingRemoteDir { rel_path } => {
-			format!("Created remote directory {rel_path}")
+			format!("Creating remote directory {rel_path}")
 		}
 		SyncEvent::CreatingLocalDir { rel_path } => {
-			format!("Created local directory {rel_path}")
+			format!("Creating local directory {rel_path}")
 		}
-		SyncEvent::TrashingRemote { rel_path } => format!("Trashed remote {rel_path}"),
-		SyncEvent::DeletingLocal { rel_path } => format!("Deleted local {rel_path}"),
-		SyncEvent::MovingRemote { from, to } => format!("Moved remote {from} -> {to}"),
-		SyncEvent::MovingLocal { from, to } => format!("Moved local {from} -> {to}"),
+		SyncEvent::TrashingRemote { rel_path } => format!("Trashing remote {rel_path}"),
+		SyncEvent::DeletingLocal { rel_path } => format!("Deleting local {rel_path}"),
+		SyncEvent::MovingRemote { from, to } => format!("Moving remote {from} -> {to}"),
+		SyncEvent::MovingLocal { from, to } => format!("Moving local {from} -> {to}"),
 		SyncEvent::Quarantined { rel_path, bin_path } => format!(
 			"Moved the local copy of {rel_path} aside to {}",
 			bin_path.display()
@@ -660,7 +663,9 @@ mod tests {
 
 	use filen_sdk_rs::{Error, ErrorKind, sync_engine::BaselineInUse};
 
-	use super::{SyncCommands, given_pairs, open_failure, unsyncable_notices};
+	use super::{
+		SyncCommands, SyncEvent, format_sync_event, given_pairs, open_failure, unsyncable_notices,
+	};
 	use crate::{commands::Commands, parse_repl_line};
 
 	/// The pairs the REPL line `line`, a `sync` command, gives.
@@ -755,6 +760,56 @@ mod tests {
 			open_failure(&error, db_path),
 			"Another `filen sync` (or another program using /config/sync-engine.db) is running; \
 			 only one can use the sync database at a time"
+		);
+	}
+
+	/// The engine reports a transfer once it has landed.
+	#[test]
+	fn a_transfer_is_named_once_it_is_done() {
+		assert_eq!(
+			format_sync_event(&SyncEvent::Uploading {
+				rel_path: "a.txt".to_string()
+			}),
+			"Uploaded a.txt"
+		);
+		assert_eq!(
+			format_sync_event(&SyncEvent::Downloading {
+				rel_path: "b.txt".to_string()
+			}),
+			"Downloaded b.txt"
+		);
+	}
+
+	/// The engine reports any other action before it runs it, so the line does not claim it is done.
+	#[test]
+	fn any_other_action_is_named_as_it_starts() {
+		let path = || "d".to_string();
+		let lines = [
+			SyncEvent::CreatingRemoteDir { rel_path: path() },
+			SyncEvent::CreatingLocalDir { rel_path: path() },
+			SyncEvent::TrashingRemote { rel_path: path() },
+			SyncEvent::DeletingLocal { rel_path: path() },
+			SyncEvent::MovingRemote {
+				from: path(),
+				to: "e".to_string(),
+			},
+			SyncEvent::MovingLocal {
+				from: path(),
+				to: "e".to_string(),
+			},
+		]
+		.map(|event| format_sync_event(&event));
+
+		assert_eq!(
+			lines,
+			[
+				"Creating remote directory d",
+				"Creating local directory d",
+				"Trashing remote d",
+				"Deleting local d",
+				"Moving remote d -> e",
+				"Moving local d -> e",
+			]
 		);
 	}
 
