@@ -69,8 +69,23 @@ async fn completes_commands_and_remote_paths() {
 
 	// completions that have spaces in them
 	test_completer("ls a", &["ls \"a dir with spaces\""]);
-	// todo: should also be able to do this:
-	//test_completer("cat \"a dir with spaces/file\"", &["cat \"a dir with spaces/file_in_dir_with_spaces.txt\""]);
+	test_completer(
+		"cat \"a dir with spaces/file\"",
+		&["cat \"a dir with spaces/file_in_dir_with_spaces.txt\""],
+	);
+	test_completer(
+		"cat \"a dir with spaces\"/f",
+		&["cat \"a dir with spaces/file_in_dir_with_spaces.txt\""],
+	);
+	// a quote that is still open
+	test_completer(
+		"cat \"a dir with spaces/f",
+		&["cat \"a dir with spaces/file_in_dir_with_spaces.txt\""],
+	);
+	test_completer(
+		"cat a\\ dir\\ with\\ spaces/f",
+		&["cat \"a dir with spaces/file_in_dir_with_spaces.txt\""],
+	);
 
 	// handle relative path parts like "." and ".."
 	test_completer("ls .", &[]);
