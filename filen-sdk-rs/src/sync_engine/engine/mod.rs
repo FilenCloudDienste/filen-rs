@@ -2738,9 +2738,10 @@ impl Prepared {
 	/// one the scan found, but those the remote already holds at that very path. The remote holding
 	/// a name is proof it is no obstacle there — a legacy client wrote it, and this device's file
 	/// system held it, or the scan would not have found it — so such a path syncs like any other
-	/// rather than freezing both ways. What still cannot happen is the SDK writing the name anew,
-	/// which only a content edit of a file asks for: that upload fails on the validator, as a
-	/// failure of its own path.
+	/// rather than freezing both ways. A content edit of such a file uploads a new version of it
+	/// under its exact current name, which the upload leaves unvalidated (see
+	/// [`ValidatedName::held_by_remote`](crate::fs::name::ValidatedName::held_by_remote)); what
+	/// still never happens is the SDK writing such a name anew.
 	///
 	/// The scan records a rejected name under another as well, so one under a name the remote holds
 	/// is refused on its own; under a refused one it is refused twice, which blocks nothing more.

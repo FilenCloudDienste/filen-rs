@@ -216,6 +216,14 @@ impl FileBuilderOptionalName {
 		Ok(self)
 	}
 
+	/// Upload as a new version of the remote file that holds `name`, under that exact name and
+	/// without validating it (see [`ValidatedName::held_by_remote`]).
+	#[cfg(feature = "sync-engine")]
+	pub(crate) fn name_held_by_remote(&mut self, name: &str) -> &mut Self {
+		self.name = Some(ValidatedName::held_by_remote(name));
+		self
+	}
+
 	pub fn mime(&mut self, mime: String) -> &mut Self {
 		self.mime = Some(mime);
 		self

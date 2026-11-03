@@ -168,6 +168,18 @@ impl<'de> Deserialize<'de> for ValidatedName {
 	}
 }
 
+impl ValidatedName {
+	/// `name` exactly as the remote already holds it, unchecked: for a new version of an existing
+	/// remote item under its current name, which a legacy client wrote and this validator may
+	/// refuse (`a:b`, a trailing dot). The server holds the name already, so writing it again
+	/// adds nothing it does not have. Never for a name the remote does not hold at that item: a new
+	/// name is always validated.
+	#[cfg(feature = "sync-engine")]
+	pub(crate) fn held_by_remote(name: &str) -> Self {
+		Self(name.to_owned())
+	}
+}
+
 impl AsRef<str> for ValidatedName {
 	fn as_ref(&self) -> &str {
 		&self.0

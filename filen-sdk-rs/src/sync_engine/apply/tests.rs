@@ -1934,6 +1934,53 @@ impl Borrowed {
 	}
 }
 
+/// An edit of a file whose name the SDK's validator refuses, which the remote holds under that very
+/// name, uploads a new version under it: here it gets past the name to the network, which the
+/// offline client fails. The same name where the remote holds no file is a new name, still
+/// refused before anything is sent.
+#[tokio::test]
+async fn an_edit_uploads_under_a_rejected_name_only_the_remote_holds() {
+	let borrowed = Borrowed::new();
+	let root = Uuid::from_u128(1);
+	let ctx = borrowed.ctx(root, None);
+	for name in ["a:b", "trailing."] {
+		std::fs::write(borrowed.local.path().join(name), b"new").unwrap();
+		let upload = |remote: Option<RemoteNode>| PlannedEntry {
+			action: upload(name),
+			start: PassStart::Upload {
+				local: Some(Box::new(local_node(name, 1_000, None))),
+				remote: remote.map(Box::new),
+				base: None,
+				parent_uuid: Some(root),
+			},
+		};
+		let transfer = async |entry: PlannedEntry| {
+			let (progress, _events) = tokio::sync::mpsc::unbounded_channel();
+			apply_transfer(
+				&ctx,
+				&entry,
+				TransferTarget {
+					file: None,
+					parent: Some(root),
+				},
+				&progress,
+				&mut None,
+			)
+			.await
+		};
+
+		let Err(edit) = transfer(upload(Some(remote_node(name, None)))).await else {
+			panic!("the offline client uploaded {name:?}");
+		};
+		assert_ne!(edit.kind(), ErrorKind::InvalidName, "{name:?}: {edit}");
+
+		let Err(new) = transfer(upload(None)).await else {
+			panic!("the offline client uploaded {name:?}");
+		};
+		assert_eq!(new.kind(), ErrorKind::InvalidName, "{name:?}: {new}");
+	}
+}
+
 /// A page turn reads the cache DB the pass took at its start, and never waits on the client's
 /// cache slot: a flush holds that until the cache worker exits, which can wait on the request
 /// permits of the transfers in flight, and only the loop turning the page polls those.

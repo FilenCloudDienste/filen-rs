@@ -3431,10 +3431,6 @@ async fn apply_transfer(
 			let parent = target
 				.parent
 				.ok_or_else(|| internal("remote parent dir for upload is missing"))?;
-			if let Some(existing) = target.file {
-				respell_remote(ctx, rel_path, existing).await?;
-			}
-			let path = local_path(ctx.local_root, rel_path);
 			// The remote keeps the file's own times, as filen-sync wrote them: an EXIF date would
 			// become the remote lastModified (a naive one read as UTC), skew what a pull writes
 			// back, and hide an edit that kept the date from devices that pull on a newer
@@ -3442,6 +3438,23 @@ async fn apply_transfer(
 			// override off EXIF could fill nothing either, and its parse is skipped altogether.
 			let mut builder = FileBuilderOptionalName::new(parent);
 			builder.no_exif();
+			// A name the SDK's validator refuses syncs only where the remote already holds it
+			// (see `refused_names`): this upload then writes a new version of that file under its
+			// exact current name, unvalidated, which the server holds already. Respelling it would
+			// write the name anew, so its spelling is kept instead. A new file under such a name
+			// is never planned, and would fail on the validator here.
+			let name = parent_and_name(rel_path).1;
+			if remote
+				.as_deref()
+				.is_some_and(|node| node.kind == NodeKind::File)
+				&& ValidatedName::try_from(name).is_err()
+			{
+				let held = target.file.as_ref().and_then(|existing| existing.name());
+				builder.name_held_by_remote(held.unwrap_or(name));
+			} else if let Some(existing) = target.file {
+				respell_remote(ctx, rel_path, existing).await?;
+			}
+			let path = local_path(ctx.local_root, rel_path);
 			let Some(upload) = ctx
 				.gate
 				.guard(ctx.client.upload_file_from_path_with_builder(
