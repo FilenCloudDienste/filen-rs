@@ -15,7 +15,10 @@ use std::{
 	sync::{LazyLock, Mutex, PoisonError},
 };
 
-use tokio::sync::broadcast::{self, error::RecvError};
+use tokio::sync::broadcast::{
+	self,
+	error::{RecvError, TryRecvError},
+};
 
 use crate::{error::CliError, ui::UI};
 
@@ -229,6 +232,16 @@ impl Owning {
 			Err(RecvError::Closed) => std::future::pending().await,
 		}
 	}
+
+	/// Whether Ctrl-C was pressed since the last call, without waiting: for a command that blocks
+	/// a thread, as the docs server does, and looks between its waits.
+	pub(crate) fn was_pressed(&mut self) -> bool {
+		match self.presses.try_recv() {
+			Ok(_) | Err(TryRecvError::Lagged(_)) => true,
+			// `PRESSES` is static, so its sender is never dropped.
+			Err(TryRecvError::Empty | TryRecvError::Closed) => false,
+		}
+	}
 }
 
 impl Owning {
@@ -375,6 +388,23 @@ mod tests {
 
 		let err = command.await.unwrap_err();
 		assert_eq!(crate::error::exit_code(&err), EXIT_INTERRUPTED);
+		assert_eq!(*lock_state(), state(0, 0));
+	}
+
+	#[tokio::test]
+	async fn a_command_that_handles_ctrl_c_can_look_for_it_without_waiting() {
+		let _handler = HANDLER.lock().await;
+		let catching = catch();
+		let mut ctrl_c = own();
+		assert!(!ctrl_c.was_pressed());
+
+		on_ctrl_c();
+
+		assert!(ctrl_c.was_pressed());
+		// each Ctrl-C is seen once
+		assert!(!ctrl_c.was_pressed());
+		drop(ctrl_c);
+		drop(catching);
 		assert_eq!(*lock_state(), state(0, 0));
 	}
 

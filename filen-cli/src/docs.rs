@@ -6,12 +6,12 @@
 //! The doc fragments are doc comments in the source code marked with
 //! `[cli-doc] <fragment-id>`, right next to the code they document.
 
-use std::{collections::HashSet, path::PathBuf, str::FromStr, sync::LazyLock};
+use std::{collections::HashSet, path::PathBuf, str::FromStr, sync::LazyLock, time::Duration};
 
 use anyhow::{Context, Result};
 use clap::{CommandFactory, builder::Styles};
 use filen_macros::extract_cli_doc_fragments;
-use tiny_http::{Header, Response};
+use tiny_http::{Header, Request, Response};
 
 use crate::{
 	CliArgs,
@@ -19,6 +19,7 @@ use crate::{
 		auth_cmds, fs_cmds, misc_cmds, notes_cmds, public_links_cmds, rclone_cmds, search_cmd,
 		sync_cmd, transfer_cmds,
 	},
+	interrupt,
 	ui::UI,
 };
 
@@ -426,6 +427,9 @@ pub(crate) fn print_in_app_docs(
 
 // markdown docs rendered to HTML and served in-app
 
+/// How long the docs server waits for a request before it looks for Ctrl-C again.
+const DOCS_SERVER_POLL: Duration = Duration::from_millis(200);
+
 pub(crate) fn serve_markdown_docs_as_html(ui: &mut UI) -> Result<()> {
 	let parsed_doc_outline = PARSED_DOC_OUTLINE
 		.as_ref()
@@ -437,75 +441,100 @@ pub(crate) fn serve_markdown_docs_as_html(ui: &mut UI) -> Result<()> {
 	let server = tiny_http::Server::http(format!("localhost:{}", server_port))
 		.map_err(|e| anyhow::anyhow!("Failed to start docs HTTP server: {}", e))?;
 
+	// Ctrl-C stops the server: the command blocks its thread while it serves, so nothing could
+	// cancel it, and it looks for Ctrl-C between requests instead
+	let mut ctrl_c = interrupt::own();
 	ui.print_success(&format!(
-		"Serving documentation at http://localhost:{}",
+		"Serving documentation at http://localhost:{} (press Ctrl-C to stop)",
 		server_port
 	));
 	if let Err(e) = open::that(format!("http://localhost:{}", server_port)) {
 		log::warn!("Failed to open docs URL in browser automatically: {}", e);
 	}
 
-	for request in server.incoming_requests() {
-		let Some(section) = parsed_doc_outline.iter().find(|section| {
-			(request.url() == format!("/{}", section.id))
-				|| (request.url() == "/" && section.id == MAIN_SECTION)
-		}) else {
-			request
-				.respond(Response::from_string("Section not found"))
-				.context("Failed to respond to docs HTTP request")?;
-			continue;
-		};
+	serve_until(
+		&server,
+		|| ctrl_c.was_pressed(),
+		|request| respond_with_section(parsed_doc_outline, request),
+	)
+}
 
-		// customize main section with title and table of contents
-		let section = {
-			let mut section = section.clone();
-			if section.id == MAIN_SECTION {
-				section.title = format!("Filen CLI v{}", env!("CARGO_PKG_VERSION"));
-				section.elements.push(ParsedDocElement::Heading1 {
-					text: "More help topics".to_string(),
-				});
-				section.elements.push(ParsedDocElement::DocFragment {
-					text: parsed_doc_outline
-						.iter()
-						.filter_map(|section| {
-							if section.id != MAIN_SECTION {
-								Some(format!("- [{}](/{})", section.title, section.id))
-							} else {
-								None
-							}
-						})
-						.collect::<Vec<String>>()
-						.join("\n"),
-				});
-			}
-			section
-		};
-
-		let markdown = format_markdown_section(&section);
-		let html = comrak::markdown_to_html(
-			&markdown,
-			&comrak::Options {
-				extension: comrak::options::Extension::builder().autolink(true).build(),
-				render: comrak::options::Render::builder().build(),
-				parse: comrak::options::Parse::builder().build(),
-			},
-		);
-		let html = format!("{}<body>{}</body>", HTML_STYLE, html);
-		let html = html.replace("🠊", "&#129034;");
-
-		// note: Of course, it's actually not the most efficient way to generate HTML based on the intermediate markdown,
-		// and we could probably save some binary size and make it look better by generating HTML directly from the doc
-		// fragments, but for now, this is just easier to implement and maintain, and good enough.
-
-		request
-			.respond(
-				Response::from_string(html)
-					.with_header(Header::from_str("Content-Type: text/html").unwrap()),
-			)
-			.context("Failed to respond to docs HTTP request")?;
+/// Answers the requests to `server` with `respond` until `stopped` says to stop, which it is asked
+/// at least every [`DOCS_SERVER_POLL`].
+fn serve_until(
+	server: &tiny_http::Server,
+	mut stopped: impl FnMut() -> bool,
+	mut respond: impl FnMut(Request) -> Result<()>,
+) -> Result<()> {
+	while !stopped() {
+		if let Some(request) = server
+			.recv_timeout(DOCS_SERVER_POLL)
+			.context("Failed to receive a docs HTTP request")?
+		{
+			respond(request)?;
+		}
 	}
-
 	Ok(())
+}
+
+/// Answers `request` with the doc section its path names, rendered as HTML.
+fn respond_with_section(parsed_doc_outline: &[ParsedDocSection], request: Request) -> Result<()> {
+	let Some(section) = parsed_doc_outline.iter().find(|section| {
+		(request.url() == format!("/{}", section.id))
+			|| (request.url() == "/" && section.id == MAIN_SECTION)
+	}) else {
+		return request
+			.respond(Response::from_string("Section not found"))
+			.context("Failed to respond to docs HTTP request");
+	};
+
+	// customize main section with title and table of contents
+	let section = {
+		let mut section = section.clone();
+		if section.id == MAIN_SECTION {
+			section.title = format!("Filen CLI v{}", env!("CARGO_PKG_VERSION"));
+			section.elements.push(ParsedDocElement::Heading1 {
+				text: "More help topics".to_string(),
+			});
+			section.elements.push(ParsedDocElement::DocFragment {
+				text: parsed_doc_outline
+					.iter()
+					.filter_map(|section| {
+						if section.id != MAIN_SECTION {
+							Some(format!("- [{}](/{})", section.title, section.id))
+						} else {
+							None
+						}
+					})
+					.collect::<Vec<String>>()
+					.join("\n"),
+			});
+		}
+		section
+	};
+
+	let markdown = format_markdown_section(&section);
+	let html = comrak::markdown_to_html(
+		&markdown,
+		&comrak::Options {
+			extension: comrak::options::Extension::builder().autolink(true).build(),
+			render: comrak::options::Render::builder().build(),
+			parse: comrak::options::Parse::builder().build(),
+		},
+	);
+	let html = format!("{}<body>{}</body>", HTML_STYLE, html);
+	let html = html.replace("🠊", "&#129034;");
+
+	// note: Of course, it's actually not the most efficient way to generate HTML based on the intermediate markdown,
+	// and we could probably save some binary size and make it look better by generating HTML directly from the doc
+	// fragments, but for now, this is just easier to implement and maintain, and good enough.
+
+	request
+		.respond(
+			Response::from_string(html)
+				.with_header(Header::from_str("Content-Type: text/html").unwrap()),
+		)
+		.context("Failed to respond to docs HTTP request")
 }
 
 // AI-generated docs styles, might change later
@@ -566,7 +595,66 @@ a:hover{text-decoration:underline}
 
 #[cfg(test)]
 mod tests {
-	use super::PARSED_DOC_OUTLINE;
+	use std::{
+		cell::RefCell,
+		io::{Read as _, Write as _},
+		net::TcpStream,
+		thread,
+	};
+
+	use super::*;
+
+	/// A docs server on a free port of the loopback interface, and its address.
+	fn local_server() -> (tiny_http::Server, std::net::SocketAddr) {
+		let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+		let address = server.server_addr().to_ip().unwrap();
+		(server, address)
+	}
+
+	#[test]
+	fn the_docs_server_stops_when_asked_to_with_no_request() {
+		let (server, _) = local_server();
+		let mut asked = 0;
+		serve_until(
+			&server,
+			|| {
+				asked += 1;
+				asked > 2
+			},
+			|_| panic!("no request was sent"),
+		)
+		.unwrap();
+		assert_eq!(asked, 3);
+	}
+
+	#[test]
+	fn the_docs_server_answers_requests_until_it_is_stopped() {
+		let (server, address) = local_server();
+		let client = thread::spawn(move || {
+			let mut stream = TcpStream::connect(address).unwrap();
+			stream
+				.write_all(b"GET /some-section HTTP/1.0\r\n\r\n")
+				.unwrap();
+			let mut response = String::new();
+			stream.read_to_string(&mut response).unwrap();
+			response
+		});
+		// read by one closure and written by the other
+		let answered = RefCell::new(Vec::new());
+		serve_until(
+			&server,
+			|| !answered.borrow().is_empty(),
+			|request| {
+				answered.borrow_mut().push(request.url().to_owned());
+				request
+					.respond(Response::from_string("served"))
+					.context("respond")
+			},
+		)
+		.unwrap();
+		assert_eq!(answered.into_inner(), ["/some-section"]);
+		assert!(client.join().unwrap().ends_with("served"));
+	}
 
 	#[test]
 	fn doc_outline_documents_every_command_and_fragment_once() {
