@@ -131,13 +131,15 @@ impl SyncCommands {
 						keep_both,
 					)?,
 				};
+				// before logging in, so that a bad definition fails at once
+				let parsed = sync_pairs::parse_sync_pairs(&config.config_dir, &pairs)?;
 				let client = client.get(ui).await?;
 				sync(
 					config,
 					ui,
 					client.clone(),
 					working_path,
-					&pairs,
+					parsed,
 					once,
 					&settle,
 				)
@@ -159,27 +161,12 @@ async fn sync(
 	ui: &mut UI,
 	client: Arc<Client>,
 	working_path: &RemotePath,
-	pair_definitions: &Vec<String>,
+	parsed: Vec<sync_pairs::ParsedPair>,
 	once: bool,
 	settle: &Settle,
 ) -> Result<()> {
-	let default_pair_definitions = vec![
-		config
-			.config_dir
-			.join("syncPairs.yaml")
-			.to_str()
-			.context("Failed to construct default syncPairs.yaml path")?
-			.to_string(),
-	];
-	let pair_definitions = if pair_definitions.is_empty() {
-		// if there are no args, put default {config_dir}/syncPairs.yaml
-		&default_pair_definitions
-	} else {
-		pair_definitions
-	};
 	// before the engine is opened, so that a bad definition leaves its database as it was
-	let pair_definitions =
-		sync_pairs::resolve_sync_pairs(&client, working_path, pair_definitions).await?;
+	let pair_definitions = sync_pairs::resolve_sync_pairs(&client, working_path, parsed).await?;
 
 	// init sync engine
 	let db_path = config.config_dir.join("sync-engine.db");

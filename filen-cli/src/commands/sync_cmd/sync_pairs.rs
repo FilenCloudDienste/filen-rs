@@ -28,18 +28,21 @@ pub(crate) struct PairDefinition {
 	remote_root: Uuid,
 }
 
+/// A sync pair as its definition gives it: its local root, its mode and its remote path, which
+/// may be relative.
+pub(crate) type ParsedPair = (PathBuf, SyncMode, String);
+
 /// The pairs `pair_definitions` define, each of which is either `<local>:<remote>` (two-way),
-/// `<local>:<mode>:<remote>`, or the path to a syncPairs.yaml file, with each remote root found.
-/// Relative remote paths are resolved against `working_path`, relative local paths in a file
+/// `<local>:<mode>:<remote>`, or the path to a syncPairs.yaml file. Without definitions, the pairs
+/// of the default sync pairs file in `config_dir`. Relative local paths in a file are resolved
 /// against the file's directory.
-///
-/// Every definition is read and every remote root found before any pair is registered, so a bad
-/// definition fails the run before anything is stored.
-pub(crate) async fn resolve_sync_pairs(
-	client: &Client,
-	working_path: &RemotePath,
+pub(crate) fn parse_sync_pairs(
+	config_dir: &Path,
 	pair_definitions: &[String],
-) -> Result<Vec<PairDefinition>> {
+) -> Result<Vec<ParsedPair>> {
+	if pair_definitions.is_empty() {
+		return read_default_sync_pairs(config_dir);
+	}
 	let mut parsed = Vec::new();
 	for pair in pair_definitions {
 		let path = Path::new(pair);
@@ -51,6 +54,19 @@ pub(crate) async fn resolve_sync_pairs(
 			parsed.push(parse_sync_pair_definition(pair)?);
 		}
 	}
+	Ok(parsed)
+}
+
+/// The pairs `parsed` holds, with each remote root found. Relative remote paths are resolved
+/// against `working_path`.
+///
+/// Every remote root is found before any pair is registered, so a bad definition fails the run
+/// before anything is stored.
+pub(crate) async fn resolve_sync_pairs(
+	client: &Client,
+	working_path: &RemotePath,
+	parsed: Vec<ParsedPair>,
+) -> Result<Vec<PairDefinition>> {
 	let mut pairs = Vec::with_capacity(parsed.len());
 	for (local, mode, remote) in parsed {
 		let remote_path = working_path.navigate(&remote);
@@ -236,26 +252,99 @@ pub(crate) fn records_of(
 }
 
 /// Parses `<local>:<remote>` or `<local>:<mode>:<remote>`.
-fn parse_sync_pair_definition(pair: &str) -> Result<(PathBuf, SyncMode, String)> {
+fn parse_sync_pair_definition(pair: &str) -> Result<ParsedPair> {
 	// (the split is taken from the right, so a local path with a colon in it (a Windows drive letter) stays whole)
 	let (rest, remote) = pair.rsplit_once(':').ok_or_else(|| {
-		UI::failure(&format!(
+		UI::usage_failure(&format!(
 			"Invalid sync pair \"{pair}\": expected <local>:<remote>, <local>:<mode>:<remote> or the path to a sync pairs file"
 		))
 	})?;
 	let (local, mode) = match rest.rsplit_once(':') {
-		Some((local, mode)) if let Some(mode) = parse_sync_mode_str(mode) => (local, mode),
-		_ => (rest, SyncMode::TwoWay),
+		Some((local, token)) => match parse_sync_mode_str(token) {
+			Some(mode) => (local, mode),
+			// `C:dir`, a path on the drive C:, is no mode
+			None if is_mode_token(token) && !is_drive_letter(local) => {
+				return Err(UI::usage_failure(&format!(
+					"Invalid sync mode \"{token}\" in the sync pair \"{pair}\": expected one of {}",
+					sync_mode_names()
+				)));
+			}
+			// a colon in the local path, as in `C:\dir`
+			None => (rest, SyncMode::TwoWay),
+		},
+		None => (rest, SyncMode::TwoWay),
 	};
 	Ok((PathBuf::from(local), mode, remote.to_owned()))
 }
 
+/// Whether `token`, the part of a sync pair between its last two colons, is meant as a mode: a
+/// word, which a path with a separator in it is not.
+fn is_mode_token(token: &str) -> bool {
+	!token.is_empty() && token.chars().all(|c| c.is_ascii_alphabetic())
+}
+
+/// Whether `s` is a drive letter, as the `C` of `C:dir` is.
+fn is_drive_letter(s: &str) -> bool {
+	let mut chars = s.chars();
+	matches!((chars.next(), chars.next()), (Some(letter), None) if letter.is_ascii_alphabetic())
+}
+
+/// The sync pairs files in the config directory that `sync` reads when it is given no pairs, in
+/// the order it looks for them. It reads the first that exists.
+const DEFAULT_SYNC_PAIRS_FILES: &[&str] = &["syncPairs.yaml"];
+
+/// The pairs of the first of [`DEFAULT_SYNC_PAIRS_FILES`] that exists in `config_dir`.
+fn read_default_sync_pairs(config_dir: &Path) -> Result<Vec<ParsedPair>> {
+	let candidates = DEFAULT_SYNC_PAIRS_FILES
+		.iter()
+		.map(|name| config_dir.join(name))
+		.collect::<Vec<_>>();
+	match candidates.iter().find(|path| path.is_file()) {
+		Some(path) => read_sync_pairs_file(path),
+		None => Err(UI::usage_failure(&no_sync_pairs_message(&candidates))),
+	}
+}
+
+/// Why `sync` without pairs cannot run when none of the default sync pairs files, `candidates`,
+/// exists, and how to give it pairs.
+fn no_sync_pairs_message(candidates: &[PathBuf]) -> String {
+	let paths = candidates
+		.iter()
+		.map(|path| path.display().to_string())
+		.collect::<Vec<_>>()
+		.join(" or ");
+	format!(
+		"No sync pairs given, and there is no sync pairs file at {paths}.\n\
+		 Give each sync pair as <local>:<remote> or <local>:<mode>:<remote>, as in \
+		 `filen sync --pair /home/me/docs:/docs`, or the path to a sync pairs file, \
+		 or create that file like this:\n\
+		 syncPairs:\n  \
+		 - local: /home/me/docs\n    \
+		 remote: /docs\n    \
+		 mode: twoWay"
+	)
+}
+
 /// Reads a syncPairs.yaml file and returns the list of sync pairs it defines, with local paths resolved relative to the file's directory.
-fn read_sync_pairs_file(path: &Path) -> Result<Vec<(PathBuf, SyncMode, String)>> {
-	let content = std::fs::read_to_string(path)
-		.with_context(|| format!("Failed to read sync pairs file {}", path.display()))?;
-	let file: SyncPairsFile = serde_yaml::from_str(&content)
-		.with_context(|| format!("Failed to parse sync pairs file {}", path.display()))?;
+fn read_sync_pairs_file(path: &Path) -> Result<Vec<ParsedPair>> {
+	let content = std::fs::read_to_string(path).map_err(|e| {
+		UI::failure(&format!(
+			"Failed to read sync pairs file {}: {e}",
+			path.display()
+		))
+	})?;
+	let file: SyncPairsFile = serde_yaml::from_str(&content).map_err(|e| {
+		UI::failure(&format!(
+			"Failed to parse sync pairs file {}: {e}",
+			path.display()
+		))
+	})?;
+	if file.sync_pairs.is_empty() {
+		return Err(UI::failure(&format!(
+			"The sync pairs file {} defines no sync pairs",
+			path.display()
+		)));
+	}
 	let base = path.parent().unwrap_or(Path::new(""));
 	file.sync_pairs
 		.into_iter()
@@ -264,8 +353,9 @@ fn read_sync_pairs_file(path: &Path) -> Result<Vec<(PathBuf, SyncMode, String)>>
 				None => SyncMode::TwoWay,
 				Some(mode) => parse_sync_mode_str(mode).ok_or_else(|| {
 					UI::failure(&format!(
-						"Invalid sync mode \"{mode}\" in {}",
-						path.display()
+						"Invalid sync mode \"{mode}\" in {}: expected one of {}",
+						path.display(),
+						sync_mode_names()
 					))
 				})?,
 			};
@@ -288,16 +378,31 @@ struct SyncPairEntry {
 	mode: Option<String>,
 }
 
-/// Accepts the SDK's mode names in camelCase, and the "cloud" names the TypeScript CLI used.
+/// Every mode with the names it is given by: the SDK's name in camelCase first, then the "cloud"
+/// name the TypeScript CLI used.
+const SYNC_MODE_NAMES: &[(SyncMode, &[&str])] = &[
+	(SyncMode::TwoWay, &["twoWay"]),
+	(SyncMode::LocalToRemote, &["localToRemote", "localToCloud"]),
+	(SyncMode::RemoteToLocal, &["remoteToLocal", "cloudToLocal"]),
+	(SyncMode::LocalBackup, &["localBackup"]),
+	(SyncMode::RemoteBackup, &["remoteBackup", "cloudBackup"]),
+];
+
+/// The mode `mode` names, by any of its [`SYNC_MODE_NAMES`].
 fn parse_sync_mode_str(mode: &str) -> Option<SyncMode> {
-	Some(match mode {
-		"twoWay" => SyncMode::TwoWay,
-		"localToRemote" | "localToCloud" => SyncMode::LocalToRemote,
-		"remoteToLocal" | "cloudToLocal" => SyncMode::RemoteToLocal,
-		"localBackup" => SyncMode::LocalBackup,
-		"remoteBackup" | "cloudBackup" => SyncMode::RemoteBackup,
-		_ => return None,
-	})
+	SYNC_MODE_NAMES
+		.iter()
+		.find(|(_, names)| names.contains(&mode))
+		.map(|(mode, _)| *mode)
+}
+
+/// Every name of [`SYNC_MODE_NAMES`], for messages.
+fn sync_mode_names() -> String {
+	SYNC_MODE_NAMES
+		.iter()
+		.flat_map(|(_, names)| names.iter().copied())
+		.collect::<Vec<_>>()
+		.join(", ")
 }
 
 /// The name of `mode` as [`parse_sync_mode_str`] accepts it.
@@ -362,14 +467,18 @@ fn label(pair: &PairRecord, remote: &(impl Display + ?Sized)) -> String {
 
 #[cfg(test)]
 mod tests {
-	use filen_sdk_rs::sync_engine::{DeleteGuard, PairRecord, SyncMode};
+	use std::path::{Path, PathBuf};
 
-	use std::path::Path;
+	use filen_sdk_rs::sync_engine::{DeleteGuard, PairOverlap, PairRecord, SyncMode};
 
-	use filen_sdk_rs::sync_engine::PairOverlap;
-
-	use super::{fallback_label, overlap_message, records_of};
-	use crate::util::RemotePath;
+	use super::{
+		fallback_label, overlap_message, parse_sync_pair_definition, parse_sync_pairs,
+		read_sync_pairs_file, records_of,
+	};
+	use crate::{
+		error::{CliError, exit_code, find_cli_error},
+		util::RemotePath,
+	};
 
 	fn record(id: i64) -> PairRecord {
 		PairRecord {
@@ -438,5 +547,177 @@ mod tests {
 		let error = records_of(vec![record(1)], &[1, 2]).unwrap_err();
 
 		assert_eq!(error.to_string(), "Sync pair 2 is not registered");
+	}
+
+	/// Without pairs and without a sync pairs file, there is nothing to sync, and the message says
+	/// where the file goes and what it holds.
+	#[test]
+	fn no_pairs_and_no_sync_pairs_file_is_a_usage_error() {
+		let config_dir = tempfile::tempdir().unwrap();
+
+		let error = parse_sync_pairs(config_dir.path(), &[]).unwrap_err();
+
+		assert_eq!(exit_code(&error), 2);
+		let message = error.to_string();
+		let path = config_dir.path().join("syncPairs.yaml");
+		assert!(
+			message.starts_with(&format!(
+				"No sync pairs given, and there is no sync pairs file at {}.\n",
+				path.display()
+			)),
+			"{message}"
+		);
+		assert!(
+			message.ends_with(
+				"syncPairs:\n  - local: /home/me/docs\n    remote: /docs\n    mode: twoWay"
+			),
+			"{message}"
+		);
+	}
+
+	/// Without pairs, the pairs of the sync pairs file in the config dir.
+	#[test]
+	fn no_pairs_reads_the_sync_pairs_file_in_the_config_dir() {
+		let config_dir = tempfile::tempdir().unwrap();
+		std::fs::write(
+			config_dir.path().join("syncPairs.yaml"),
+			"syncPairs:\n  - local: docs\n    remote: /docs\n",
+		)
+		.unwrap();
+
+		let pairs = parse_sync_pairs(config_dir.path(), &[]).unwrap();
+
+		assert_eq!(
+			pairs,
+			[(
+				config_dir.path().join("docs"),
+				SyncMode::TwoWay,
+				"/docs".to_owned()
+			)]
+		);
+	}
+
+	/// A word between the local path and the remote path that names no mode is reported, rather
+	/// than taken as part of the local path.
+	#[test]
+	fn an_unknown_mode_is_a_usage_error() {
+		let error = parse_sync_pair_definition("/home/me/docs:twoway:/docs").unwrap_err();
+
+		assert_eq!(exit_code(&error), 2);
+		assert_eq!(
+			error.to_string(),
+			"Invalid sync mode \"twoway\" in the sync pair \"/home/me/docs:twoway:/docs\": \
+			 expected one of twoWay, localToRemote, localToCloud, remoteToLocal, cloudToLocal, \
+			 localBackup, remoteBackup, cloudBackup"
+		);
+	}
+
+	#[test]
+	fn a_local_path_on_a_windows_drive_keeps_its_drive_letter() {
+		assert_eq!(
+			parse_sync_pair_definition(r"C:\Users\me:/docs").unwrap(),
+			(
+				PathBuf::from(r"C:\Users\me"),
+				SyncMode::TwoWay,
+				"/docs".to_owned()
+			)
+		);
+	}
+
+	#[test]
+	fn a_local_path_on_a_windows_drive_can_have_a_mode() {
+		assert_eq!(
+			parse_sync_pair_definition(r"C:\Users\me:localBackup:/docs").unwrap(),
+			(
+				PathBuf::from(r"C:\Users\me"),
+				SyncMode::LocalBackup,
+				"/docs".to_owned()
+			)
+		);
+	}
+
+	/// `C:docs` is the directory `docs` in the current directory of the drive C:, not a mode.
+	#[test]
+	fn a_drive_relative_local_path_is_no_mode() {
+		assert_eq!(
+			parse_sync_pair_definition("C:docs:/docs").unwrap(),
+			(
+				PathBuf::from("C:docs"),
+				SyncMode::TwoWay,
+				"/docs".to_owned()
+			)
+		);
+	}
+
+	#[test]
+	fn a_pair_without_a_colon_is_a_usage_error() {
+		let error = parse_sync_pair_definition("/home/me/docs").unwrap_err();
+
+		assert_eq!(exit_code(&error), 2);
+		assert_eq!(
+			error.to_string(),
+			"Invalid sync pair \"/home/me/docs\": expected <local>:<remote>, \
+			 <local>:<mode>:<remote> or the path to a sync pairs file"
+		);
+	}
+
+	/// The sync pairs file at `name` in a new directory, which holds `content`.
+	fn sync_pairs_file(name: &str, content: &str) -> (tempfile::TempDir, PathBuf) {
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().join(name);
+		std::fs::write(&path, content).unwrap();
+		(dir, path)
+	}
+
+	/// A sync pairs file that is not YAML of its shape is the user's to fix, not a bug.
+	#[test]
+	fn a_sync_pairs_file_without_a_remote_is_a_failure() {
+		let (_dir, path) = sync_pairs_file("pairs.yaml", "syncPairs:\n  - local: /home/me/docs\n");
+
+		let error = read_sync_pairs_file(&path).unwrap_err();
+
+		assert!(matches!(find_cli_error(&error), Some(CliError::Failure(_))));
+		let message = error.to_string();
+		assert!(
+			message.starts_with(&format!(
+				"Failed to parse sync pairs file {}: syncPairs[0]: missing field `remote`",
+				path.display()
+			)),
+			"{message}"
+		);
+	}
+
+	#[test]
+	fn a_sync_pairs_file_that_cannot_be_read_is_a_failure() {
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().join("missing.yaml");
+
+		let error = read_sync_pairs_file(&path).unwrap_err();
+
+		assert!(matches!(find_cli_error(&error), Some(CliError::Failure(_))));
+		assert!(
+			error.to_string().starts_with(&format!(
+				"Failed to read sync pairs file {}: ",
+				path.display()
+			)),
+			"{error}"
+		);
+	}
+
+	/// A file without pairs syncs nothing, which is not what whoever wrote it meant.
+	#[test]
+	fn a_sync_pairs_file_without_pairs_is_a_failure() {
+		let (_dir, path) = sync_pairs_file("pairs.yaml", "syncPairs: []\n");
+
+		let error = read_sync_pairs_file(&path).unwrap_err();
+
+		assert!(matches!(find_cli_error(&error), Some(CliError::Failure(_))));
+		assert_eq!(
+			error.to_string(),
+			format!(
+				"The sync pairs file {} defines no sync pairs",
+				path.display()
+			)
+		);
 	}
 }
