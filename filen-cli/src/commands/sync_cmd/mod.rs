@@ -113,9 +113,12 @@ use std::{
 use anyhow::{Context, Result};
 use clap::Subcommand;
 use console::style;
-use filen_sdk_rs::sync_engine::{
-	BaselineInUse, ConflictResolution, ConflictResolved, PairId, PairRecord, SyncEngine, SyncEvent,
-	UnsyncablePath, UnsyncableReason, WatchStatus,
+use filen_sdk_rs::{
+	auth::Client,
+	sync_engine::{
+		BaselineInUse, ConflictResolution, ConflictResolved, PairId, PairRecord, SyncEngine,
+		SyncEvent, UnsyncablePath, UnsyncableReason, WatchStatus,
+	},
 };
 use log::info;
 
@@ -265,13 +268,7 @@ async fn sync(
 	let pair_definitions =
 		sync_pairs::resolve_sync_pairs(ui, client, working_path, &sync_dirs, parsed).await?;
 
-	// init sync engine
-	let db_path = config.config_dir.join("sync-engine.db");
-	let engine = Arc::new(
-		SyncEngine::open(client.clone(), db_path.clone())
-			.await
-			.map_err(|e| UI::failure(&open_failure(&e, &db_path)))?,
-	);
+	let engine = Arc::new(open_engine(config, client).await?);
 	let pair_ids = sync_pairs::register_sync_pairs(ui, &engine, client, &pair_definitions)
 		.await
 		.context("Failed to add sync pairs")?;
@@ -727,6 +724,15 @@ fn resolve_failure_message(rel_path: &str, label: Cow<'_, str>, e: &filen_sdk_rs
 
 fn paused_message(label: Cow<'_, str>) -> String {
 	format!("The sync pair {label} is paused, so it is not synced")
+}
+
+/// Opens the sync engine on its database in the config directory, which only one engine can hold
+/// at a time: a failure says so when another holds it.
+async fn open_engine(config: &CliConfig, client: &Arc<Client>) -> Result<SyncEngine> {
+	let db_path = config.config_dir.join("sync-engine.db");
+	SyncEngine::open(Arc::clone(client), db_path.clone())
+		.await
+		.map_err(|e| UI::failure(&open_failure(&e, &db_path)))
 }
 
 /// Why the sync engine's database at `db_path` could not be opened, as `error` says.
