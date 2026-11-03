@@ -3,6 +3,52 @@
 //! It is automatically downloaded and configured (authenticated) when you run the commands like `rclone`, `mount`, etc.
 //! Your credentials are only passed to it in memory, never written to disk. `serve` listens on 127.0.0.1 unless told otherwise,
 //! and prints random credentials when you do not give any.
+//!
+//! [cli-doc] rclone-passthrough
+//! `filen rclone` runs any Rclone command, with your drive as the `filen` remote, so it covers what
+//! `mount` and `serve` have no option for: more parallel transfers (`--transfers`), serving or
+//! mounting a directory instead of the whole drive, or any other Rclone flag. For example:
+//!
+//! ```sh
+//! filen rclone copy ./photos filen:Photos --transfers 16
+//! filen rclone serve webdav filen:Photos --addr 127.0.0.1:8080 --user me --pass secret
+//! ```
+//!
+//! A mount or server run this way lacks two things `mount` and `serve` do: when it stops, nothing
+//! gives the uploads still in its cache up to 30 seconds to finish, and nothing checks that the
+//! server refuses requests without credentials, so give it `--user` and `--pass` (or the protocol's
+//! equivalent) yourself.
+//!
+//! [cli-doc] mount-prerequisites
+//! `mount` mounts the drive on `/tmp/filen` (created if it does not exist), or on Windows on the
+//! drive letter X, or the last free one when X is taken. A mount point you give must be an empty
+//! directory. Mounting needs:
+//! - on Linux, FUSE 3 from your distribution (e.g. `apt install fuse3` or `dnf install fuse3`):
+//!   `fusermount3` on the `PATH` (or in /usr/bin or /bin) and /dev/fuse;
+//! - on Windows, [WinFsp](https://winfsp.dev/rel/);
+//! - on macOS, nothing: the drive is mounted through Rclone's NFS mount and listed as
+//!   `localhost:/Filen`. When [macFUSE](https://macfuse.github.io) is installed, it is used
+//!   instead.
+//!
+//! [cli-doc] serve-s3-clients
+//! S3 clients connect to `http://127.0.0.1:1800` by default (`https://` with `--cert`), with the
+//! Access Key ID and Secret Access Key `serve` prints (or the `--user` and `--password` given), and
+//! must use path-style addressing: the bucket in the path, not in the host name. Any region is
+//! accepted, e.g. `us-east-1`. Each directory in the root of your drive is a bucket; files directly
+//! in the root are not listed.
+//!
+//! [cli-doc] serve-https
+//! `serve --cert <file> --key <file>` serves WebDAV, S3, HTTP and restic over HTTPS, with a
+//! certificate and private key in PEM format. To make a self-signed certificate for this computer
+//! with OpenSSL, valid for a year:
+//!
+//! ```sh
+//! openssl req -x509 -newkey rsa:4096 -nodes -days 365 -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" -keyout key.pem -out cert.pem
+//! filen serve webdav --cert cert.pem --key key.pem
+//! ```
+//!
+//! Clients reject a self-signed certificate until you tell them to trust it (for example by
+//! adding `cert.pem` to the system's trusted certificates).
 
 use std::{
 	fmt,
@@ -66,7 +112,7 @@ pub(crate) enum RcloneCommands {
 		/// The maximum cache size (e.g. "500Mi", "10Gi") (default: 32Gi)
 		#[arg(long, value_parser = parse_size)]
 		cache_size: Option<u64>,
-		/// TLS certificate (PEM) to serve HTTPS with (WebDAV, S3, HTTP and restic; requires --key)
+		/// TLS certificate (PEM) to serve HTTPS with (WebDAV, S3, HTTP and restic; requires --key; `filen help managed-rclone` shows how to make a self-signed one)
 		#[arg(long)]
 		cert: Option<String>,
 		/// TLS private key (PEM) for --cert
@@ -147,8 +193,12 @@ impl From<ServerType> for ServeProtocol {
 pub(crate) const DOCS: &[DocElement] = &[
 	DocElement::DocFragment("managed-rclone"),
 	DocElement::CommandHelp("rclone"),
+	DocElement::DocFragment("rclone-passthrough"),
 	DocElement::CommandHelp("mount"),
+	DocElement::DocFragment("mount-prerequisites"),
 	DocElement::CommandHelp("serve"),
+	DocElement::DocFragment("serve-s3-clients"),
+	DocElement::DocFragment("serve-https"),
 	DocElement::CommandHelp("export-api-key"),
 ];
 
