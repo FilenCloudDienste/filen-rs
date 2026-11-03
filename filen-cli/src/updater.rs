@@ -30,6 +30,10 @@ const BUILD_TARGET: &str = env!("BUILD_TARGET"); // injected in build.rs
 /// The Docker image the CLI is published as, tagged with each release's version.
 const DOCKER_IMAGE: &str = "filen/cli";
 
+/// The file the announcements are published in, one per line.
+const ANNOUNCEMENTS_URL: &str =
+	"https://raw.githubusercontent.com/FilenCloudDienste/filen-cli-releases/main/announcements";
+
 /// How long after a check the next one is skipped, in seconds.
 const LAST_CHECK_VALIDITY_SECS: i64 = 5 * 60;
 
@@ -674,28 +678,44 @@ impl GitHubApiClient {
 	}
 
 	async fn get_announcements(&self) -> Result<Vec<Announcement>> {
-		Ok(self
+		self.get_announcements_from(ANNOUNCEMENTS_URL).await
+	}
+
+	async fn get_announcements_from(&self, url: &str) -> Result<Vec<Announcement>> {
+		let response = self
 			.client
-			.get(
-				"https://raw.githubusercontent.com/FilenCloudDienste/filen-cli-releases/main/announcements",
-			)
+			.get(url)
 			.header("User-Agent", "filen-cli")
 			.send()
 			.await
-			.context("Failed to send request to GitHub API to fetch announcements")?
+			.context("Failed to send request to GitHub API to fetch announcements")?;
+		let status = response.status();
+		if !status.is_success() {
+			// the body is an error page, not announcements
+			let body = response.text().await.unwrap_or_default();
+			let body = body.chars().take(300).collect::<String>();
+			anyhow::bail!("Fetching announcements returned {status}: {body}");
+		}
+		let text = response
 			.text()
 			.await
-			.context("Failed to read announcements response text")?
-			.lines()
-			.filter_map(|l| {
-				let (version_req, message) = l.split_once(": ")?;
-				Some(Announcement {
-					version_range: VersionReq::parse(version_req).ok()?,
-					message: message.to_string(),
-				})
-			})
-			.collect::<Vec<Announcement>>())
+			.context("Failed to read announcements response text")?;
+		Ok(parse_announcements(&text))
 	}
+}
+
+/// Parses the announcements file: one `<version range>: <message>` per line. A line that is not
+/// one is skipped.
+fn parse_announcements(text: &str) -> Vec<Announcement> {
+	text.lines()
+		.filter_map(|line| {
+			let (version_req, message) = line.split_once(": ")?;
+			Some(Announcement {
+				version_range: VersionReq::parse(version_req).ok()?,
+				message: message.to_string(),
+			})
+		})
+		.collect()
 }
 
 #[cfg(test)]
@@ -1313,6 +1333,55 @@ mod tests {
 			serve_once("HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\nbinary");
 
 		assert_eq!(download_file(&url).await.unwrap(), b"binary");
+	}
+
+	#[tokio::test]
+	async fn an_announcements_fetch_answered_with_an_error_status_fails() {
+		let url = serve_once(
+			"HTTP/1.1 404 Not Found\r\nContent-Length: 14\r\nConnection: close\r\n\r\n404: Not Found",
+		);
+
+		let error = GitHubApiClient::new()
+			.get_announcements_from(&url)
+			.await
+			.unwrap_err();
+
+		assert_eq!(
+			error.to_string(),
+			"Fetching announcements returned 404 Not Found: 404: Not Found"
+		);
+	}
+
+	#[test]
+	fn announcements_are_parsed_one_per_line() {
+		let announcements =
+			parse_announcements(">=0.2.0, <0.3.0: Please update: a bug was fixed\n*: Hello\n");
+
+		let parsed = announcements
+			.iter()
+			.map(|a| (a.version_range.to_string(), a.message.as_str()))
+			.collect::<Vec<_>>();
+		assert_eq!(
+			parsed,
+			[
+				(
+					">=0.2.0, <0.3.0".to_owned(),
+					"Please update: a bug was fixed"
+				),
+				("*".to_owned(), "Hello"),
+			]
+		);
+	}
+
+	#[test]
+	fn announcement_lines_without_a_version_range_are_skipped() {
+		let announcements =
+			parse_announcements("no separator\nnot a range: message\n\n=0.2.9: For 0.2.9\n");
+
+		assert_eq!(announcements.len(), 1);
+		assert_eq!(announcements[0].message, "For 0.2.9");
+		assert!(announcements[0].version_range.matches(&version("0.2.9")));
+		assert!(!announcements[0].version_range.matches(&version("0.2.10")));
 	}
 
 	/// An asset of `size` bytes with `digest`.
