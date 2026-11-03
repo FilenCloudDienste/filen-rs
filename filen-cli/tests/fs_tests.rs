@@ -1543,3 +1543,65 @@ async fn search_with_a_limit_below_the_matches_warns_how_many_it_shows() {
 		"stderr:\n{stderr}"
 	);
 }
+
+#[shared_test_runtime]
+async fn search_prints_the_full_path_of_each_item_it_finds() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = format!("/{}", resources.dir.name().unwrap());
+	test_utils::create_remote_file_structure_outline(
+		client,
+		resources.dir.clone(),
+		&["Needle/", "sub/a-needle.txt", "other.txt"],
+	)
+	.await
+	.unwrap();
+
+	search_in(&test_dir, &["needle"])
+		.await
+		.success()
+		.stdout(format!("{test_dir}/Needle\n{test_dir}/sub/a-needle.txt\n"));
+}
+
+#[shared_test_runtime]
+async fn search_json_gives_each_items_path_type_size_and_uuid() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = format!("/{}", resources.dir.name().unwrap());
+	let file = upload(client, &resources.dir, "needle.txt", b"content").await;
+
+	let assert = search_in(&test_dir, &["--json", "needle"]).await.success();
+
+	assert_eq!(
+		printed_json(&assert),
+		serde_json::json!({
+			"results": [{
+				"path": format!("{test_dir}/needle.txt"),
+				"type": "file",
+				"size": 7,
+				"uuid": file.uuid().to_string(),
+			}],
+			"total": 1,
+			"complete": true,
+		})
+	);
+}
+
+#[shared_test_runtime]
+async fn search_of_type_dir_leaves_files_out() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = format!("/{}", resources.dir.name().unwrap());
+	test_utils::create_remote_file_structure_outline(
+		client,
+		resources.dir.clone(),
+		&["needle-dir/", "needle.txt"],
+	)
+	.await
+	.unwrap();
+
+	search_in(&test_dir, &["needle", "--type", "dir"])
+		.await
+		.success()
+		.stdout(format!("{test_dir}/needle-dir\n"));
+}

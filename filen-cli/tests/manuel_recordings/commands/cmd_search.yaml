@@ -20,7 +20,8 @@
 # > Search in /{{ $MANUEL_REMOTE_CWD }}: asdf.txt                                            #
 # Navigating to parent directory: /{{ $MANUEL_REMOTE_CWD }}                                  #
 # ({{ $MANUEL_EMAIL }}) /{{ $MANUEL_REMOTE_CWD }} search some                                #
-# some_dir  some_other_dir                                                                   #
+# /{{ $MANUEL_REMOTE_CWD }}/some_dir                                                         #
+# /{{ $MANUEL_REMOTE_CWD }}/some_other_dir                                                   #
 # ({{ $MANUEL_EMAIL }}) /{{ $MANUEL_REMOTE_CWD }} exit                                       #
 # (manuel)                                                                                   #
 #                                                                                            #
@@ -513,7 +514,7 @@ recording_items:
 - !Output "\e[?25l\e[60D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m search some \e[K\r\e[59C\e[?25h"
 - !Input
   - 13
-- !Output "\e[?25l\e[59D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m \e[38;5;14msearch some\e[39m\e[K\r\n\e[?25h\e[?25h\e[?2004lsome_dir  some_other_dir\r\n\e[?2004h\e[?25l\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m  \r\e[48C\e[?25h"
+- !Output "\e[?25l\e[59D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m \e[38;5;14msearch some\e[39m\e[K\r\n\e[?25h\e[?25h\e[?2004l/\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m/some_dir\r\n/\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m/some_other_dir\r\n\e[?2004h\e[?25l\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m  \r\e[48C\e[?25h"
 - !Input
   - 101
 - !Input

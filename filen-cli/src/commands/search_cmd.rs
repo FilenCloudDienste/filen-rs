@@ -9,9 +9,12 @@ use crate::{
 	util::RemotePath,
 };
 use anyhow::{Context, Result, anyhow};
-use clap::Subcommand;
+use clap::{Subcommand, ValueEnum};
 use filen_sdk_rs::{
-	cache::{CacheMessage, ResyncProgress, SearchConfig, SearchSnapshot},
+	cache::{
+		CacheMessage, ResyncProgress, SearchConfig, SearchHit, SearchItemType, SearchResult,
+		SearchSnapshot,
+	},
 	fs::HasUUID as _,
 };
 use filen_types::fs::Uuid;
@@ -23,6 +26,9 @@ pub(crate) enum SearchCommands {
 	/// Search for a file or directory interactively, or specify a query
 	Search {
 		query: Option<String>,
+		/// Only list files, or only directories
+		#[arg(long = "type", value_name = "TYPE")]
+		item_type: Option<ItemKind>,
 		/// Print at most this many results
 		#[arg(long, default_value_t = DEFAULT_LIMIT, requires = "query")]
 		limit: NonZeroUsize,
@@ -43,14 +49,24 @@ impl SearchCommands {
 		match self {
 			Self::Search {
 				query: Some(query),
+				item_type,
 				limit,
 			} => {
-				search_cmd_non_interactive(ui, client, working_path, &query, limit).await?;
+				let config = SearchConfig::new()
+					.with_name(query)
+					.with_item_type(search_item_type(item_type));
+				search_cmd_non_interactive(ui, client, working_path, config, limit).await?;
 				Ok(CommandResult::default())
 			}
-			Self::Search { query: None, .. } => Ok(search_cmd(ui, client, working_path)
-				.await?
-				.unwrap_or_default()),
+			Self::Search {
+				query: None,
+				item_type,
+				..
+			} => Ok(
+				search_cmd(ui, client, working_path, search_item_type(item_type))
+					.await?
+					.unwrap_or_default(),
+			),
 		}
 	}
 }
@@ -59,6 +75,7 @@ pub(crate) async fn search_cmd(
 	ui: &mut UI,
 	client: &mut LazyClient,
 	working_path: &RemotePath,
+	item_type: SearchItemType,
 ) -> Result<Option<CommandResult>> {
 	let client = client.get(ui).await?;
 	let working_dir_uuid = client
@@ -80,7 +97,10 @@ pub(crate) async fn search_cmd(
 	};
 	let search = client
 		.clone()
-		.create_search(working_dir_uuid, SearchConfig::new())
+		.create_search(
+			working_dir_uuid,
+			SearchConfig::new().with_item_type(item_type),
+		)
 		.await
 		.context("Failed to create search")?;
 	let callback = Box::new(move |snapshot: SearchSnapshot| {
@@ -120,7 +140,9 @@ pub(crate) async fn search_cmd(
 		tokio::select! {
 			set_search_query_rx = set_search_query_rx.recv() => {
 				if let Some(query) = set_search_query_rx {
-					search.set_config(SearchConfig::new().with_name(query)).await?;
+					search
+							.set_config(SearchConfig::new().with_name(query).with_item_type(item_type))
+							.await?;
 				}
 			}
 			results_rx = results_rx.recv() => {
@@ -221,7 +243,7 @@ pub(crate) async fn search_cmd_non_interactive(
 	ui: &mut UI,
 	lazy_client: &mut LazyClient,
 	working_path: &RemotePath,
-	query: &str,
+	config: SearchConfig,
 	limit: NonZeroUsize,
 ) -> Result<()> {
 	// An owned handle, so that the cache's status channel can be borrowed from the lazy client
@@ -239,7 +261,7 @@ pub(crate) async fn search_cmd_non_interactive(
 		.ok_or(anyhow::anyhow!("Working directory not found"))?
 		.uuid();
 	let search = client
-		.create_search(working_dir_uuid, SearchConfig::new().with_name(query))
+		.create_search(working_dir_uuid, config)
 		.await
 		.context("Failed to create search")?;
 
@@ -256,27 +278,12 @@ pub(crate) async fn search_cmd_non_interactive(
 		.await
 		.context("Failed to get search results")?;
 
-	let results = snapshot
+	let found = snapshot
 		.results
 		.iter()
-		.map(|hit| hit.full_path())
+		.map(|hit| FoundItem::new(working_path, hit))
 		.collect::<Vec<_>>();
-	if ui.json {
-		ui.print_json(json!({
-			"results": results,
-		}))?;
-	} else {
-		ui.print_grid(
-			results
-				.iter()
-				.map(|r| r.as_str())
-				.collect::<Vec<_>>()
-				.as_slice(),
-		)
-	};
-	for warning in search_warnings(synced, results.len(), snapshot.total) {
-		ui.print_warning(&warning);
-	}
+	print_found_items(ui, &found, snapshot.total, synced)?;
 
 	Ok(())
 }
@@ -287,6 +294,102 @@ const RESYNC_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How many results a search prints unless `--limit` says otherwise.
 const DEFAULT_LIMIT: NonZeroUsize = NonZeroUsize::new(100_000).expect("is not zero");
+
+/// Which kind of item `search --type` lists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum ItemKind {
+	File,
+	#[value(alias = "directory")]
+	Dir,
+}
+
+/// What a search with `--type item_type` (or without it) matches.
+fn search_item_type(item_type: Option<ItemKind>) -> SearchItemType {
+	match item_type {
+		None => SearchItemType::All,
+		Some(ItemKind::File) => SearchItemType::File,
+		Some(ItemKind::Dir) => SearchItemType::Dir,
+	}
+}
+
+/// A search result as a search prints it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FoundItem {
+	/// The full path, which other commands take as it is.
+	path: String,
+	kind: FoundKind,
+	uuid: Uuid,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FoundKind {
+	Directory,
+	File { size: u64 },
+}
+
+impl FoundItem {
+	/// `hit` of a search in `working_path`.
+	fn new(working_path: &RemotePath, hit: &SearchHit) -> Self {
+		let relative = hit.full_path();
+		let path = if working_path.is_root() {
+			format!("/{relative}")
+		} else {
+			format!("{working_path}/{relative}")
+		};
+		let kind = match &hit.result {
+			SearchResult::Dir(_) => FoundKind::Directory,
+			SearchResult::File(file) => FoundKind::File { size: file.size },
+		};
+		Self {
+			path,
+			kind,
+			uuid: hit.result.uuid(),
+		}
+	}
+
+	/// The item's object in `--json` output. Its keys are named as `stat` and `ls --json` name
+	/// them.
+	fn to_json(&self) -> serde_json::Value {
+		match self.kind {
+			FoundKind::Directory => json!({
+				"path": self.path,
+				"type": "directory",
+				"uuid": self.uuid,
+			}),
+			FoundKind::File { size } => json!({
+				"path": self.path,
+				"type": "file",
+				"size": size,
+				"uuid": self.uuid,
+			}),
+		}
+	}
+}
+
+/// Prints `found`, one path per line or as `{"results", "total", "complete"}` with `--json`,
+/// then warns on stderr when they are fewer than the `total` matches or the resync did not
+/// finish.
+fn print_found_items(ui: &mut UI, found: &[FoundItem], total: usize, resync: Resync) -> Result<()> {
+	if ui.json {
+		ui.print_json(json!({
+			"results": found.iter().map(FoundItem::to_json).collect::<Vec<_>>(),
+			"total": total,
+			"complete": resync == Resync::Converged,
+		}))?;
+	} else if found.is_empty() {
+		if !ui.is_quiet() {
+			ui.print_muted_to_stderr("No items match");
+		}
+	} else {
+		for item in found {
+			ui.print(&item.path);
+		}
+	}
+	for warning in search_warnings(resync, found.len(), total) {
+		ui.print_warning(&warning);
+	}
+	Ok(())
+}
 
 /// Whether the cache finished syncing the searched directory before the search printed it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -357,6 +460,7 @@ mod tests {
 	use tokio::sync::mpsc::unbounded_channel;
 
 	use super::*;
+	use crate::ui::test_support::Printed;
 
 	const ROOT: Uuid = Uuid::from_u128(1);
 	const OTHER_ROOT: Uuid = Uuid::from_u128(2);
@@ -492,5 +596,121 @@ mod tests {
 				.kind(),
 			clap::error::ErrorKind::MissingRequiredArgument
 		);
+	}
+
+	fn found(path: &str, kind: FoundKind, uuid: u128) -> FoundItem {
+		FoundItem {
+			path: path.to_owned(),
+			kind,
+			uuid: Uuid::from_u128(uuid),
+		}
+	}
+
+	fn printed_results(
+		found: &[FoundItem],
+		total: usize,
+		resync: Resync,
+		json: bool,
+	) -> (String, String) {
+		let (out, err) = (Printed::default(), Printed::default());
+		let mut ui = Printed::split_ui(&out, &err);
+		ui.json = json;
+		print_found_items(&mut ui, found, total, resync).unwrap();
+		(
+			out.lines_or_empty(),
+			console::strip_ansi_codes(&err.lines_or_empty()).into_owned(),
+		)
+	}
+
+	#[test]
+	fn results_print_one_full_path_per_line() {
+		let results = [
+			found("/dir/needle", FoundKind::Directory, 1),
+			found("/dir/sub/needle.txt", FoundKind::File { size: 7 }, 2),
+		];
+
+		assert_eq!(
+			printed_results(&results, 2, Resync::Converged, false),
+			("/dir/needle\n/dir/sub/needle.txt".to_owned(), String::new())
+		);
+	}
+
+	#[test]
+	fn no_results_say_so_on_stderr() {
+		assert_eq!(
+			printed_results(&[], 0, Resync::Converged, false),
+			(String::new(), "No items match".to_owned())
+		);
+	}
+
+	#[test]
+	fn json_results_give_each_items_path_type_size_and_uuid() {
+		let results = [
+			found("/needle", FoundKind::Directory, 1),
+			found("/needle.txt", FoundKind::File { size: 7 }, 2),
+		];
+
+		let (out, err) = printed_results(&results, 3, Resync::Unfinished, true);
+
+		assert_eq!(
+			serde_json::from_str::<serde_json::Value>(&out).unwrap(),
+			json!({
+				"results": [
+					{
+						"path": "/needle",
+						"type": "directory",
+						"uuid": "00000000-0000-0000-0000-000000000001",
+					},
+					{
+						"path": "/needle.txt",
+						"type": "file",
+						"size": 7,
+						"uuid": "00000000-0000-0000-0000-000000000002",
+					},
+				],
+				"total": 3,
+				"complete": false,
+			})
+		);
+		assert_eq!(
+			err,
+			"⚠ The search index did not finish syncing within 30 seconds, so results may be \
+			 incomplete\n⚠ Showing 2 of 3 results. Use --limit to show more"
+		);
+	}
+
+	#[test]
+	fn no_json_results_are_an_empty_list() {
+		let (out, err) = printed_results(&[], 0, Resync::Converged, true);
+
+		assert_eq!(
+			serde_json::from_str::<serde_json::Value>(&out).unwrap(),
+			json!({ "results": [], "total": 0, "complete": true })
+		);
+		assert_eq!(err, "");
+	}
+
+	#[test]
+	fn the_type_filter_takes_file_dir_and_directory() {
+		for (arg, expected) in [
+			("file", SearchItemType::File),
+			("dir", SearchItemType::Dir),
+			("directory", SearchItemType::Dir),
+		] {
+			let Args {
+				command: SearchCommands::Search { item_type, .. },
+			} = Args::try_parse_from(["filen", "search", "a", "--type", arg]).unwrap();
+
+			assert_eq!(search_item_type(item_type), expected, "--type {arg}");
+		}
+	}
+
+	#[test]
+	fn no_type_filter_matches_every_item() {
+		let Args {
+			command: SearchCommands::Search { item_type, .. },
+		} = Args::try_parse_from(["filen", "search", "a"]).unwrap();
+
+		assert_eq!(search_item_type(item_type), SearchItemType::All);
 	}
 }
