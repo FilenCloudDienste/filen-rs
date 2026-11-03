@@ -654,5 +654,3 @@ mod tests {
 		}
 	}
 }
-
-// todo: see if we can use this same autocompletion logic for shell completion as well?

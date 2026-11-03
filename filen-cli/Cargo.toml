@@ -9,7 +9,9 @@ metadata.workspaces = { independent = true }
 
 [dependencies]
 anyhow = "1.0.98"
-clap = { version = "4.5.53", features = ["derive", "env"] }
+# "string": the completion script is generated from a copy of the command without its hidden
+# options, which takes the names from the original as owned strings
+clap = { version = "4.5.53", features = ["derive", "env", "string"] }
 filen-sdk-rs = { path = "../filen-sdk-rs", features = [
 	"cache",
 	"sync-engine",

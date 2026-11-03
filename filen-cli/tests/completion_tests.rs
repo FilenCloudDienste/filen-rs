@@ -39,7 +39,7 @@ async fn completes_commands_and_remote_paths() {
 	.unwrap();
 
 	// complete commands
-	test_completer("c", &["cat", "cd", "cp"]);
+	test_completer("c", &["cat", "cd", "completions", "cp"]);
 
 	// basic completion of files and directories
 	test_completer("ls d", &["ls dir1", "ls dir2"]);
