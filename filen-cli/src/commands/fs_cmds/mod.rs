@@ -1,3 +1,49 @@
+//! [cli-doc] cloud-paths
+//! Commands name the files and directories in your Filen drive by their paths. A path that starts
+//! with `/` starts at the root of the drive; any other path starts at the working directory: the
+//! one `cd` went to in the REPL, or the one `--working-path` gives (`/` by default). `.` is the
+//! directory a path is at and `..` its parent, so `cd ..` goes up one directory, and the root is
+//! its own parent. Doubled and trailing slashes change nothing, but on the destination of `mv`
+//! and `cp`: `mv a.txt docs/` moves `a.txt` into the existing directory `docs`, and fails if there
+//! is none, where `mv a.txt docs` would rename `a.txt` to `docs`.
+//!
+//! Quote a name that holds spaces, in your shell and in the REPL alike: `cat "my notes.txt"`.
+//!
+//! `uuid:<UUID>` names the item with that UUID wherever it is, as `stat` and `ls -l --json` show
+//! it: `stat uuid:<UUID>`. It is the only way to name an item whose name cannot be decrypted,
+//! which listings show by its UUID in place of its name. An item in the trash is named this way
+//! in `trash-restore` and `trash-delete` only. Write a name that starts with `uuid:` as
+//! `./uuid:...`.
+//!
+//! `rm`, `mv`, `cp`, `cat`, `favorite` and `unfavorite` take several items, and a glob in the last
+//! segment of a path: `*` matches any run of characters, `?` any one character and `[...]` one of
+//! the characters in the brackets (`[a-z]` for a range, `[!...]` for one not in them). Names are
+//! matched case-sensitively, and a name that starts with `.` only by a glob that does too. A glob
+//! that matches nothing is an error, and an item whose name is exactly the glob is that item. Quote
+//! globs so that your shell does not match them against your local files: `rm '/photos/*.tmp'`.
+//! With several sources, the destination of `mv` and `cp` must be an existing directory. A command
+//! given several items goes on past one it fails for, says why, and exits with code 1 at the end.
+//!
+//! With `--json`, commands print JSON whose keys are the same everywhere. Sizes are in bytes,
+//! dates are RFC 3339 strings in UTC, and a date an item lacks is `null`:
+//! - `stat` prints a file as `{"name", "type": "file", "size", "modified", "created", "uuid"}`, a
+//!   directory as `{"name", "type": "directory", "size", "files", "directories", "created",
+//!   "color", "uuid"}`, and the drive (`stat /`) as `{"type": "drive", "usedStorage",
+//!   "totalStorage", "files", "directories"}`. The old CLI's `mtimeMs` is now `modified`.
+//! - `ls`, `ls -R`, `tree`, `list-trash`, `list-favorites` and `list-recents` print an array with
+//!   an object per item: `{"name", "type", "created", "favorited", "uuid"}`, plus `"size"` and
+//!   `"modified"` for a file and `"color"` for a directory. `ls -R` and `tree` add `"path"`, the
+//!   path below the listed directory, and the listings of items from many directories
+//!   (`list-favorites`, `list-recents`) the absolute `"path"`, which is `null` when it cannot be
+//!   found out. An empty listing is `[]`.
+//! - `list-public-links` prints an array with an object per link instead: `{"path", "type",
+//!   "uuid", "linkUuid", "expiresAt", "url"}`, where `"expiresAt"` is `null` for a link that never
+//!   expires.
+//! - `search` prints `{"results": [{"path", "type", "size", "uuid"}], "total", "complete"}`.
+//! - `du` prints `{"path", "size", "items": [{"name", "type", "size"}]}`, `versions` an array of
+//!   `{"uuid", "timestamp", "size", "current"}`, `cat`, `head` and `tail` `{"text"}`, `pwd`
+//!   `{"path"}`, and `view` and `drive` `{"url"}`.
+
 use std::{
 	borrow::Cow,
 	cmp::Ordering,
@@ -291,8 +337,10 @@ pub(crate) enum FsCommands {
 	EmptyTrash,
 }
 
-/// The commands that open the docs' "Accessing Files" section, before `search`.
+/// How paths name items, and the commands that open the docs' "Accessing Files" section, before
+/// `search`.
 pub(crate) const BROWSING_DOCS: &[DocElement] = &[
+	DocElement::DocFragment("cloud-paths"),
 	DocElement::CommandHelp("cd"),
 	DocElement::CommandHelp("pwd"),
 	DocElement::CommandHelp("ls"),
