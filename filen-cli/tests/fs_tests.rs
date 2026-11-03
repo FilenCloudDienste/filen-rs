@@ -1609,6 +1609,38 @@ async fn search_of_type_dir_leaves_files_out() {
 		.stdout(format!("{test_dir}/needle-dir\n"));
 }
 
+/// A command that took the drive lock releases it before the CLI exits, so a search right after
+/// it does not wait for the lock to expire on the server, which takes longer than a search waits.
+#[shared_test_runtime]
+async fn search_right_after_a_command_that_took_the_drive_lock_is_complete() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let test_dir = format!("/{}", resources.dir.name().unwrap());
+	authenticated_cli_with_args!("mkdir", &format!("{test_dir}/needle")).success();
+	let Some(NonRootFileType::Dir(created)) = resources
+		.client
+		.find_item_at_path(&format!("{test_dir}/needle"))
+		.await
+		.unwrap()
+	else {
+		panic!("Expected a directory");
+	};
+
+	let assert = search_in(&test_dir, &["--json", "needle"]).await.success();
+
+	assert_eq!(
+		printed_json(&assert),
+		serde_json::json!({
+			"results": [{
+				"path": format!("{test_dir}/needle"),
+				"type": "directory",
+				"uuid": created.uuid().to_string(),
+			}],
+			"total": 1,
+			"complete": true,
+		})
+	);
+}
+
 /// The printed `versions --json` of the file at `path`.
 async fn versions_of(path: &str) -> serde_json::Value {
 	printed_json(&authenticated_cli_with_args!("versions", path, "--json").success())

@@ -664,82 +664,113 @@ async fn inner_main(ui: &mut ui::UI, arenas_limited: bool) -> Result<Finished> {
 		client_config_args,
 	);
 
-	if let Some(command) = cli_args.command {
-		let working_path =
-			initial_working_path(ui, &mut client, cli_args.working_path.as_deref()).await?;
-		let _ = execute_cancellable(&config, ui, &mut client, &working_path, command).await?;
-		Ok(Finished::Success)
-	} else if script {
-		ui.set_commands_on_stdin();
-		let mut working_path =
-			initial_working_path(ui, &mut client, cli_args.working_path.as_deref()).await?;
-		let mut lines = Lines {
-			config: &config,
-			client: &mut client,
-			command_options,
-			console_log_level: &console_log_level,
-		};
-		let mut last_failure = None;
-		let mut line = String::new();
-		loop {
-			line.clear();
-			if io::stdin()
-				.read_line(&mut line)
-				.context("Failed to read the commands from stdin")?
-				== 0
-			{
-				break;
-			}
-			match lines.run(ui, &mut working_path, &line).await {
-				LineOutcome::Done => {}
-				// Ctrl-C stops the commands piped in, not just the one it cancelled.
-				LineOutcome::Failed(code @ interrupt::EXIT_INTERRUPTED) => {
-					last_failure = Some(code);
+	// The commands' locks are released from tasks that the runtime cancels once the CLI returns
+	// from here or exits, so it waits for those releases, however the commands ended.
+	let finished = async {
+		if let Some(command) = cli_args.command {
+			let working_path =
+				initial_working_path(ui, &mut client, cli_args.working_path.as_deref()).await?;
+			let _ = execute_cancellable(&config, ui, &mut client, &working_path, command).await?;
+			Ok(Finished::Success)
+		} else if script {
+			ui.set_commands_on_stdin();
+			let mut working_path =
+				initial_working_path(ui, &mut client, cli_args.working_path.as_deref()).await?;
+			let mut lines = Lines {
+				config: &config,
+				client: &mut client,
+				command_options,
+				console_log_level: &console_log_level,
+			};
+			let mut last_failure = None;
+			let mut line = String::new();
+			loop {
+				line.clear();
+				if io::stdin()
+					.read_line(&mut line)
+					.context("Failed to read the commands from stdin")?
+					== 0
+				{
 					break;
 				}
-				LineOutcome::Failed(code) => last_failure = Some(code),
-				LineOutcome::Exit => break,
+				match lines.run(ui, &mut working_path, &line).await {
+					LineOutcome::Done => {}
+					// Ctrl-C stops the commands piped in, not just the one it cancelled.
+					LineOutcome::Failed(code @ interrupt::EXIT_INTERRUPTED) => {
+						last_failure = Some(code);
+						break;
+					}
+					LineOutcome::Failed(code) => last_failure = Some(code),
+					LineOutcome::Exit => break,
+				}
+				if interrupt::stdout_closed() {
+					break;
+				}
 			}
-			if interrupt::stdout_closed() {
-				break;
-			}
-		}
-		Ok(last_failure.map_or(Finished::Success, Finished::ScriptLineFailed))
-	} else {
-		ui.load_repl_history(repl_history::history_path(&config.config_dir));
-		ui.set_commands_on_stdin();
-		ui.print_banner();
+			Ok(last_failure.map_or(Finished::Success, Finished::ScriptLineFailed))
+		} else {
+			ui.load_repl_history(repl_history::history_path(&config.config_dir));
+			ui.set_commands_on_stdin();
+			ui.print_banner();
 
-		client.get(ui).await?;
-		// authenticate, so the username is shown in the prompt.
-		// this essentially defeats the purpose of LazyClient, but:
-		// it does make a difference so non-authenticated commands (e.g. logout) can still be run ..
-		// .. without authentication when called directly (no REPL)
+			client.get(ui).await?;
+			// authenticate, so the username is shown in the prompt.
+			// this essentially defeats the purpose of LazyClient, but:
+			// it does make a difference so non-authenticated commands (e.g. logout) can still be run ..
+			// .. without authentication when called directly (no REPL)
 
-		let mut working_path =
-			initial_working_path(ui, &mut client, cli_args.working_path.as_deref()).await?;
+			let mut working_path =
+				initial_working_path(ui, &mut client, cli_args.working_path.as_deref()).await?;
 
-		let mut lines = Lines {
-			config: &config,
-			client: &mut client,
-			command_options,
-			console_log_level: &console_log_level,
-		};
-		loop {
-			let line = match ui.prompt_repl(lines.client.get_arc().unwrap(), &working_path)? {
-				ReplPrompt::Line(line) => line,
-				ReplPrompt::Cleared => continue,
-				ReplPrompt::Exit => break,
+			let mut lines = Lines {
+				config: &config,
+				client: &mut client,
+				command_options,
+				console_log_level: &console_log_level,
 			};
-			match lines.run(ui, &mut working_path, &line).await {
-				LineOutcome::Done | LineOutcome::Failed(_) => {}
-				LineOutcome::Exit => break,
+			loop {
+				let line = match ui.prompt_repl(lines.client.get_arc().unwrap(), &working_path)? {
+					ReplPrompt::Line(line) => line,
+					ReplPrompt::Cleared => continue,
+					ReplPrompt::Exit => break,
+				};
+				match lines.run(ui, &mut working_path, &line).await {
+					LineOutcome::Done | LineOutcome::Failed(_) => {}
+					LineOutcome::Exit => break,
+				}
+				if interrupt::stdout_closed() {
+					break;
+				}
 			}
-			if interrupt::stdout_closed() {
-				break;
-			}
+			Ok(Finished::Success)
 		}
-		Ok(Finished::Success)
+	}
+	.await;
+	if let Some(client) = client.get_arc() {
+		wait_for_lock_releases(&client).await;
+	}
+	finished
+}
+
+/// How long the CLI waits for the server to answer the releases of the locks its commands took
+/// before it exits: one round trip each, normally. Past it, the server expires the locks on its
+/// own within a minute.
+const LOCK_RELEASES_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Waits until the server has answered the releases of `client`'s locks, for at most
+/// [`LOCK_RELEASES_TIMEOUT`]. Without the wait, a lock the CLI held stays held on the server for
+/// up to a minute after it exits, and the next command that needs it, from this CLI or any other
+/// client, waits that long.
+async fn wait_for_lock_releases(client: &Client) {
+	if tokio::time::timeout(LOCK_RELEASES_TIMEOUT, client.wait_for_lock_releases())
+		.await
+		.is_err()
+	{
+		warn!(
+			"The server did not confirm the release of a lock within {} seconds; it releases the \
+			 lock on its own within a minute",
+			LOCK_RELEASES_TIMEOUT.as_secs()
+		);
 	}
 }
 
