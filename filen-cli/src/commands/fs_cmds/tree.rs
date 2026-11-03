@@ -16,11 +16,13 @@ use filen_sdk_rs::{
 };
 use serde_json::json;
 
-use super::{ListedBy, ListedItem, ListedKind, StderrProgress, listing_order, print_long_listing};
+use super::{
+	ItemOperand, ListedBy, ListedItem, ListedKind, StderrProgress, listing_order,
+	print_long_listing, resolve_item,
+};
 use crate::{
 	auth::LazyClient,
 	ui::{self, UI},
-	util::RemotePath,
 };
 
 /// At most this many items that could not be listed are named; a broken tree can have many.
@@ -32,16 +34,11 @@ enum ListedPath<'a> {
 	File(Cow<'a, RemoteFile>),
 }
 
-async fn find_listed_path<'a>(client: &'a Client, path: &RemotePath) -> Result<ListedPath<'a>> {
-	match client
-		.find_item_at_path(&path.0)
-		.await
-		.context("Failed to find file or directory")?
-	{
-		Some(NonRootFileType::Dir(dir)) => Ok(ListedPath::Dir(DirType::Dir(dir))),
-		Some(NonRootFileType::Root(root)) => Ok(ListedPath::Dir(DirType::Root(root))),
-		Some(NonRootFileType::File(file)) => Ok(ListedPath::File(file)),
-		None => Err(UI::failure(&format!("No such file or directory: {}", path))),
+async fn find_listed_path<'a>(client: &'a Client, path: &ItemOperand) -> Result<ListedPath<'a>> {
+	match resolve_item(client, path, "file or directory").await? {
+		NonRootFileType::Dir(dir) => Ok(ListedPath::Dir(DirType::Dir(dir))),
+		NonRootFileType::Root(root) => Ok(ListedPath::Dir(DirType::Root(root))),
+		NonRootFileType::File(file) => Ok(ListedPath::File(file)),
 	}
 }
 
@@ -194,7 +191,7 @@ fn styled_label(item: &ListedItem, label: &str) -> String {
 pub(super) async fn list_directory_recursively(
 	ui: &mut UI,
 	client: &mut LazyClient,
-	path: &RemotePath,
+	path: &ItemOperand,
 	long: bool,
 ) -> Result<()> {
 	let client = client.get(ui).await?;
@@ -237,7 +234,7 @@ fn print_recursive_listing(ui: &mut UI, items: &[ListedItem], long: bool) -> Res
 pub(super) async fn print_tree(
 	ui: &mut UI,
 	client: &mut LazyClient,
-	path: &RemotePath,
+	path: &ItemOperand,
 ) -> Result<()> {
 	let client = client.get(ui).await?;
 	let ListedPath::Dir(dir) = find_listed_path(client, path).await? else {
@@ -250,7 +247,7 @@ pub(super) async fn print_tree(
 		let items = in_order(items, lines.into_iter().map(|(index, _)| index));
 		return print_recursive_listing(ui, &items, false);
 	}
-	for line in tree_text(&path.0, &items, &lines) {
+	for line in tree_text(&path.to_string(), &items, &lines) {
 		ui.print(&line);
 	}
 	Ok(())
@@ -337,7 +334,7 @@ impl DiskUsage {
 pub(super) async fn print_disk_usage(
 	ui: &mut UI,
 	client: &mut LazyClient,
-	path: &RemotePath,
+	path: &ItemOperand,
 	summary: bool,
 ) -> Result<()> {
 	let client = client.get(ui).await?;
@@ -357,7 +354,7 @@ pub(super) async fn print_disk_usage(
 	};
 	if ui.json {
 		let mut object = serde_json::Map::new();
-		object.insert("path".to_owned(), json!(path.0));
+		object.insert("path".to_owned(), json!(path.to_string()));
 		object.insert("size".to_owned(), json!(usage.total));
 		if !summary {
 			let top = usage
@@ -373,7 +370,7 @@ pub(super) async fn print_disk_usage(
 		return ui.print_json(serde_json::Value::Object(object));
 	}
 	let shown = if summary { &[][..] } else { &usage.top[..] };
-	for line in disk_usage_text(&path.0, &items, shown, usage.total) {
+	for line in disk_usage_text(&path.to_string(), &items, shown, usage.total) {
 		ui.print(&line);
 	}
 	Ok(())

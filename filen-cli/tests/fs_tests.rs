@@ -1830,3 +1830,141 @@ async fn du_sums_the_sizes_of_the_files_below_each_item() {
 		})
 	);
 }
+
+#[shared_test_runtime]
+async fn commands_find_files_and_directories_named_by_uuid() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = format!("/{}", resources.dir.name().unwrap());
+	let dir = client
+		.create_dir(&(&resources.dir).into(), "docs")
+		.await
+		.unwrap();
+	let file = upload(client, &dir, "a.txt", b"content").await;
+	let dir_operand = format!("uuid:{}", dir.uuid());
+	let file_operand = format!("uuid:{}", file.uuid());
+
+	authenticated_cli_with_args!("cat", &file_operand)
+		.success()
+		.stdout("content");
+	authenticated_cli_with_args!("ls", &dir_operand)
+		.success()
+		.stdout("a.txt\n");
+	authenticated_cli_with_args!("cat", &dir_operand)
+		.failure()
+		.stderr(predicates::str::contains(format!(
+			"Not a file: {dir_operand}"
+		)));
+	// the working path is the directory's path
+	authenticated_cli_with_args!("--working-path", &dir_operand, "pwd")
+		.success()
+		.stdout(format!("{test_dir}/docs\n"));
+	authenticated_cli_with_args!("rm", &file_operand)
+		.success()
+		.stdout(predicates::str::contains(format!(
+			"Trashed file: {file_operand}"
+		)));
+	assert!(
+		client
+			.find_item_at_path(&format!("{test_dir}/docs/a.txt"))
+			.await
+			.unwrap()
+			.is_none()
+	);
+}
+
+#[shared_test_runtime]
+async fn mv_moves_an_item_named_by_uuid_into_a_directory_named_by_uuid() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = format!("/{}", resources.dir.name().unwrap());
+	let dir = client
+		.create_dir(&(&resources.dir).into(), "docs")
+		.await
+		.unwrap();
+	let file = upload(client, &resources.dir, "a.txt", b"content").await;
+
+	authenticated_cli_with_args!(
+		"mv",
+		&format!("uuid:{}", file.uuid()),
+		&format!("uuid:{}", dir.uuid())
+	)
+	.success()
+	.stdout(predicates::str::contains(format!(
+		"Moved {test_dir}/a.txt to {test_dir}/docs/a.txt"
+	)));
+
+	assert_eq!(
+		content_at(client, &format!("{test_dir}/docs/a.txt")).await,
+		b"content"
+	);
+}
+
+#[shared_test_runtime]
+async fn a_uuid_no_item_has_is_not_found() {
+	let uuid = "00000000-0000-4000-8000-0000000f5c33";
+
+	authenticated_cli_with_args!("stat", &format!("uuid:{uuid}"))
+		.failure()
+		.stderr(predicates::str::contains(format!(
+			"No item with UUID {uuid}"
+		)));
+}
+
+#[shared_test_runtime]
+async fn a_trashed_item_named_by_uuid_is_not_in_the_drive() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let _trash_lock = lock_trash(client).await;
+	let file = trashed_file(client, &resources.dir, "a", "a.txt").await;
+	let operand = format!("uuid:{}", file.uuid());
+
+	authenticated_cli_with_args!("stat", &operand)
+		.failure()
+		.stderr(predicates::str::contains(format!(
+			"{operand} is in the trash: restore it with trash-restore {operand}"
+		)));
+
+	client.delete_file_permanently(file).await.unwrap();
+}
+
+#[shared_test_runtime]
+async fn items_in_a_trashed_directory_named_by_uuid_are_not_in_the_drive() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let _trash_lock = lock_trash(client).await;
+	let mut trashed = client
+		.create_dir(&(&resources.dir).into(), "trashed")
+		.await
+		.unwrap();
+	let sub = client.create_dir(&(&trashed).into(), "sub").await.unwrap();
+	let file = upload(client, &sub, "a.txt", b"in the trash").await;
+	client.trash_dir(&mut trashed).await.unwrap();
+
+	// the server reports the items in a trashed directory as trashed themselves, at any depth
+	for (command, uuid) in [("ls", sub.uuid()), ("cat", file.uuid())] {
+		let operand = format!("uuid:{uuid}");
+		authenticated_cli_with_args!(command, &operand)
+			.failure()
+			.stderr(predicates::str::contains(format!(
+				"{operand} is in the trash: restore it with trash-restore {operand}"
+			)));
+	}
+
+	client.delete_dir_permanently(trashed).await.unwrap();
+}
+
+#[shared_test_runtime]
+async fn an_earlier_version_named_by_uuid_is_not_in_the_drive() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let first = upload(client, &resources.dir, "a.txt", b"first").await;
+	upload(client, &resources.dir, "a.txt", b"second").await;
+	let operand = format!("uuid:{}", first.uuid());
+
+	authenticated_cli_with_args!("cat", &operand)
+		.failure()
+		.stderr(predicates::str::contains(format!(
+			"{operand} is an earlier version of a file, which `versions` lists"
+		)));
+}

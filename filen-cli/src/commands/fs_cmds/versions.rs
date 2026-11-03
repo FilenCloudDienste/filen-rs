@@ -8,11 +8,10 @@ use filen_sdk_rs::fs::{HasUUID as _, file::FileVersion};
 use filen_types::fs::Uuid;
 use serde_json::json;
 
-use super::find_file;
+use super::{ItemOperand, find_file};
 use crate::{
 	auth::LazyClient,
 	ui::{self, UI},
-	util::RemotePath,
 };
 
 /// What `versions` does with the file's versions.
@@ -67,11 +66,11 @@ impl ListedVersion {
 	}
 }
 
-/// Lists the versions of the file at `path`, newest first, or restores or deletes one of them.
+/// Lists the versions of the file `path` names, newest first, or restores or deletes one of them.
 pub(super) async fn file_versions(
 	ui: &mut UI,
 	client: &mut LazyClient,
-	path: &RemotePath,
+	path: &ItemOperand,
 	action: VersionsAction,
 ) -> Result<()> {
 	if let VersionsAction::Delete(_) = action {
@@ -150,7 +149,7 @@ pub(super) async fn file_versions(
 fn take_version<T>(
 	versions: &mut Vec<(ListedVersion, T)>,
 	uuid: Uuid,
-	path: &RemotePath,
+	path: &ItemOperand,
 ) -> Result<(ListedVersion, T)> {
 	let index = versions
 		.iter()
@@ -188,7 +187,7 @@ fn print_versions(ui: &mut UI, versions: &[ListedVersion]) -> Result<()> {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::{commands::fs_cmds::FsCommands, ui::test_support::Printed};
+	use crate::{commands::fs_cmds::FsCommands, ui::test_support::Printed, util::RemotePath};
 	use chrono::TimeZone as _;
 	use clap::Parser;
 
@@ -251,7 +250,7 @@ mod tests {
 			take_version(
 				&mut versions,
 				Uuid::from_u128(2),
-				&RemotePath::new("/a.txt")
+				&ItemOperand::Path(RemotePath::new("/a.txt"))
 			)
 			.unwrap(),
 			(version(2, 8, 7, false), "two")
@@ -265,7 +264,7 @@ mod tests {
 			take_version(
 				&mut versions,
 				Uuid::from_u128(3),
-				&RemotePath::new("/a.txt")
+				&ItemOperand::Path(RemotePath::new("/a.txt"))
 			)
 			.unwrap_err()
 			.to_string(),

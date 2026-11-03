@@ -61,8 +61,11 @@ use serde_json::json;
 use tempfile::{NamedTempFile, TempDir};
 use tokio::select;
 
+mod operand;
 mod tree;
 mod versions;
+
+use operand::{ItemOperand, operand_path, path_of, resolve_item};
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum FsCommands {
@@ -351,18 +354,19 @@ impl FsCommands {
 				long,
 				recursive: true,
 			} => {
-				let path = working_path.navigate(directory.as_deref().unwrap_or(""));
+				let path = ItemOperand::parse(working_path, directory.as_deref().unwrap_or(""))?;
 				tree::list_directory_recursively(ui, client, &path, long).await?;
 			}
 			Self::Tree { directory } => {
-				let path = working_path.navigate(directory.as_deref().unwrap_or(""));
+				let path = ItemOperand::parse(working_path, directory.as_deref().unwrap_or(""))?;
 				tree::print_tree(ui, client, &path).await?;
 			}
 			Self::Du {
 				file_or_directory,
 				summarize,
 			} => {
-				let path = working_path.navigate(file_or_directory.as_deref().unwrap_or(""));
+				let path =
+					ItemOperand::parse(working_path, file_or_directory.as_deref().unwrap_or(""))?;
 				tree::print_disk_usage(ui, client, &path, summarize).await?;
 			}
 			Self::Cat { file } => {
@@ -383,11 +387,13 @@ impl FsCommands {
 				file_or_directory,
 				no_open,
 			} => {
-				let path = working_path.navigate(file_or_directory.as_deref().unwrap_or(""));
+				let path =
+					ItemOperand::parse(working_path, file_or_directory.as_deref().unwrap_or(""))?;
 				view_in_web_drive(ui, client, &path, !no_open).await?;
 			}
 			Self::Drive { no_open } => {
-				view_in_web_drive(ui, client, &RemotePath::new("/"), !no_open).await?;
+				let root = ItemOperand::Path(RemotePath::new("/"));
+				view_in_web_drive(ui, client, &root, !no_open).await?;
 			}
 			Self::Mkdir {
 				directory,
@@ -423,7 +429,7 @@ impl FsCommands {
 				restore,
 				delete,
 			} => {
-				let path = working_path.navigate(&file);
+				let path = ItemOperand::parse(working_path, &file)?;
 				let action = versions::VersionsAction::of(restore, delete);
 				versions::file_versions(ui, client, &path, action).await?;
 			}
@@ -437,7 +443,7 @@ impl FsCommands {
 					.await?;
 			}
 			Self::Color { directory, color } => {
-				let path = working_path.navigate(&directory);
+				let path = ItemOperand::parse(working_path, &directory)?;
 				set_directory_color(ui, client, &path, color).await?;
 			}
 			Self::ListRecents => list_recents(ui, client).await?,
@@ -460,18 +466,13 @@ pub(crate) async fn cd(
 	working_path: &RemotePath,
 	directory: &str,
 ) -> Result<RemotePath> {
+	let operand = ItemOperand::parse(working_path, directory)?;
 	let client = client.get(ui).await?;
-	let directory = working_path.navigate(directory);
-	match client
-		.find_item_at_path(&directory.0)
-		.await
-		.context("Failed to find directory")?
-	{
-		Some(dir) => match dir {
-			NonRootFileType::Dir(_) | NonRootFileType::Root(_) => Ok(directory),
-			_ => Err(UI::failure(&format!("Not a directory: {}", directory.0))),
-		},
-		None => Err(UI::failure(&format!("No such directory: {}", directory.0))),
+	match resolve_item(client, &operand, "directory").await? {
+		dir @ (NonRootFileType::Dir(_) | NonRootFileType::Root(_)) => {
+			path_of(client, &operand, &dir).await
+		}
+		NonRootFileType::File(_) => Err(UI::failure(&format!("Not a directory: {}", operand))),
 	}
 }
 
@@ -492,18 +493,9 @@ pub(crate) async fn list_directory(
 	directory: Option<String>,
 	long: bool,
 ) -> Result<()> {
-	let directory_str = working_path.navigate(directory.as_deref().unwrap_or("")).0;
+	let operand = ItemOperand::parse(working_path, directory.as_deref().unwrap_or(""))?;
 	let client = client.get(ui).await?;
-	let Some(directory) = client
-		.find_item_at_path(&directory_str)
-		.await
-		.context("Failed to find parent directory")?
-	else {
-		return Err(UI::failure(&format!(
-			"No such file or directory: {}",
-			directory_str
-		)));
-	};
+	let directory = resolve_item(client, &operand, "file or directory").await?;
 	let directory: DirType<'_, Normal> = match directory {
 		NonRootFileType::Dir(dir) => DirType::Dir(dir),
 		NonRootFileType::Root(root) => DirType::Root(root),
@@ -855,9 +847,9 @@ pub(crate) async fn print_file(
 	file_str: &str,
 	lines: PrintFileLines,
 ) -> Result<()> {
-	let file_str = working_path.navigate(file_str);
+	let operand = ItemOperand::parse(working_path, file_str)?;
 	let client = client.get(ui).await?;
-	let file = find_file(client, &file_str).await?;
+	let file = find_file(client, &operand).await?;
 	if !confirm_printing_file(ui, file.size())? {
 		return Ok(());
 	}
@@ -903,7 +895,7 @@ pub(crate) async fn print_file(
 	if let PrintedContent::Json(content) = out {
 		let text = String::from_utf8(content).map_err(|_| {
 			UI::failure(&format!(
-				"Not UTF-8 text: {file_str}. Use {} without --json for binary content",
+				"Not UTF-8 text: {operand}. Use {} without --json for binary content",
 				lines.command()
 			))
 		})?;
@@ -1111,19 +1103,9 @@ pub(crate) async fn print_file_or_directory_info(
 	working_path: &RemotePath,
 	file_or_directory_str: &str,
 ) -> Result<()> {
-	let file_or_directory_str = working_path.navigate(file_or_directory_str).0;
+	let operand = ItemOperand::parse(working_path, file_or_directory_str)?;
 	let client = client.get(ui).await?;
-	let Some(item) = client
-		.find_item_at_path(&file_or_directory_str)
-		.await
-		.context("Failed to find item")?
-	else {
-		return Err(UI::failure(&format!(
-			"No such file or directory: {}",
-			file_or_directory_str
-		)));
-	};
-	match item {
+	match resolve_item(client, &operand, "file or directory").await? {
 		NonRootFileType::File(file) => {
 			if ui.json {
 				ui.print_json(json!({
@@ -1233,16 +1215,11 @@ pub(crate) async fn print_file_or_directory_info(
 	Ok(())
 }
 
-/// Finds the file at `path`.
-async fn find_file<'a>(client: &'a Client, path: &RemotePath) -> Result<Cow<'a, RemoteFile>> {
-	match client
-		.find_item_at_path(&path.0)
-		.await
-		.context("Failed to find file")?
-	{
-		Some(NonRootFileType::File(file)) => Ok(file),
-		Some(_) => Err(UI::failure(&format!("Not a file: {}", path))),
-		None => Err(UI::failure(&format!("No such file: {}", path))),
+/// Finds the file `operand` names.
+async fn find_file<'a>(client: &'a Client, operand: &ItemOperand) -> Result<Cow<'a, RemoteFile>> {
+	match resolve_item(client, operand, "file").await? {
+		NonRootFileType::File(file) => Ok(file),
+		_ => Err(UI::failure(&format!("Not a file: {}", operand))),
 	}
 }
 
@@ -1298,7 +1275,7 @@ pub(crate) async fn open_file(
 	working_path: &RemotePath,
 	file_str: &str,
 ) -> Result<()> {
-	let path = working_path.navigate(file_str);
+	let path = ItemOperand::parse(working_path, file_str)?;
 	let client = client.get(ui).await?;
 	let file = find_file(client, &path).await?;
 	let local = LocalCopy::download(client, &file).await?.keep();
@@ -1409,14 +1386,21 @@ pub(crate) async fn edit_file(
 	working_path: &RemotePath,
 	file_str: &str,
 ) -> Result<()> {
-	let path = working_path.navigate(file_str);
+	let operand = ItemOperand::parse(working_path, file_str)?;
 	let editor = editor_command(env_var("VISUAL")?.as_deref(), env_var("EDITOR")?.as_deref())?;
 	// before logging in and downloading, so that a script fails at once
 	if editor.is_none() {
 		ui.ensure_can_prompt(DONE_EDITING_PROMPT)?;
 	}
 	let client = client.get(ui).await?;
-	let file = find_file(client, &path).await?;
+	let file = find_file(client, &operand).await?;
+	// the upload looks the file up again by its path, where a new version of it would be
+	let path = path_of(
+		client,
+		&operand,
+		&NonRootFileType::File(Cow::Borrowed(&*file)),
+	)
+	.await?;
 	let downloaded = RemoteVersion::of(&file);
 	let created = file.created();
 	let copy = LocalCopy::download(client, &file).await?;
@@ -1611,10 +1595,11 @@ fn web_drive_url(chain: impl IntoIterator<Item = Uuid>) -> String {
 pub(crate) async fn view_in_web_drive(
 	ui: &mut UI,
 	client: &mut LazyClient,
-	path: &RemotePath,
+	operand: &ItemOperand,
 	open_browser: bool,
 ) -> Result<()> {
 	let client = client.get(ui).await?;
+	let path = &operand_path(client, operand, "file or directory").await?;
 	let no_such_item = || UI::failure(&format!("No such file or directory: {}", path));
 	let (dirs, item) = match client.get_items_in_path(&path.0).await {
 		Ok(found) => found,
@@ -1649,8 +1634,9 @@ pub(crate) async fn create_directory(
 	directory_str: &str,
 	recursive: bool,
 ) -> Result<()> {
-	let directory_str = working_path.navigate(directory_str);
+	let operand = ItemOperand::parse(working_path, directory_str)?;
 	let client = client.get(ui).await?;
+	let directory_str = operand_path(client, &operand, "directory").await?;
 	// like `mkdir -p`, an existing directory is no failure
 	match client.find_item_at_path(&directory_str.0).await {
 		Ok(Some(NonRootFileType::Dir(_) | NonRootFileType::Root(_))) => {
@@ -1739,23 +1725,14 @@ pub(crate) async fn delete_file_or_directory(
 	file_or_directory_str: &str,
 	permanent: bool,
 ) -> Result<()> {
-	let file_or_directory_str = working_path.navigate(file_or_directory_str).0;
-	let confirmation = format!("Permanently delete {}?", file_or_directory_str);
+	let operand = ItemOperand::parse(working_path, file_or_directory_str)?;
+	let confirmation = format!("Permanently delete {}?", operand);
 	// before logging in and looking the item up, so that a script missing --yes fails at once
 	if permanent {
 		ui.ensure_can_confirm(&confirmation)?;
 	}
 	let client = client.get(ui).await?;
-	let Some(item) = client
-		.find_item_at_path(&file_or_directory_str)
-		.await
-		.context("Failed to find file or directory")?
-	else {
-		return Err(UI::failure(&format!(
-			"No such file or directory: {}",
-			file_or_directory_str
-		)));
-	};
+	let item = resolve_item(client, &operand, "file or directory").await?;
 	if permanent && !ui.prompt_confirm(&confirmation, false)? {
 		return Ok(());
 	}
@@ -1766,16 +1743,13 @@ pub(crate) async fn delete_file_or_directory(
 					.delete_file_permanently(file.into_owned())
 					.await
 					.context("Failed to permanently delete file")?;
-				ui.print_success(&format!(
-					"Permanently deleted file: {}",
-					file_or_directory_str
-				));
+				ui.print_success(&format!("Permanently deleted file: {}", operand));
 			} else {
 				client
 					.trash_file(file.to_mut())
 					.await
 					.context("Failed to trash file")?;
-				ui.print_success(&format!("Trashed file: {}", file_or_directory_str));
+				ui.print_success(&format!("Trashed file: {}", operand));
 			}
 		}
 		NonRootFileType::Dir(mut dir) => {
@@ -1784,16 +1758,13 @@ pub(crate) async fn delete_file_or_directory(
 					.delete_dir_permanently(dir.into_owned())
 					.await
 					.context("Failed to permanently delete directory")?;
-				ui.print_success(&format!(
-					"Permanently deleted directory: {}",
-					file_or_directory_str
-				));
+				ui.print_success(&format!("Permanently deleted directory: {}", operand));
 			} else {
 				client
 					.trash_dir(dir.to_mut())
 					.await
 					.context("Failed to trash directory")?;
-				ui.print_success(&format!("Trashed directory: {}", file_or_directory_str));
+				ui.print_success(&format!("Trashed directory: {}", operand));
 			}
 		}
 		NonRootFileType::Root(_) => {
@@ -1883,8 +1854,9 @@ pub(crate) async fn write_file(
 	file_str: &str,
 	content: &[String],
 ) -> Result<()> {
-	let path = working_path.navigate(file_str);
+	let operand = ItemOperand::parse(working_path, file_str)?;
 	let client = client.get(ui).await?;
+	let path = operand_path(client, &operand, "file").await?;
 	let target = find_file_to_write(client, &path).await?;
 	let builder = client
 		.make_file_builder(&target.name, target.parent.uuid())
@@ -1911,8 +1883,9 @@ pub(crate) async fn touch_file(
 	working_path: &RemotePath,
 	file_str: &str,
 ) -> Result<()> {
-	let path = working_path.navigate(file_str);
+	let operand = ItemOperand::parse(working_path, file_str)?;
 	let client = client.get(ui).await?;
+	let path = operand_path(client, &operand, "file").await?;
 	let target = find_file_to_write(client, &path).await?;
 	match target.existing {
 		Some(mut file) => {
@@ -1980,24 +1953,18 @@ pub(crate) async fn move_file_or_directory(
 	source_str: &str,
 	destination_str: &str,
 ) -> Result<()> {
-	let source_path = working_path.navigate(source_str);
+	let source_operand = ItemOperand::parse(working_path, source_str)?;
 	let client = client.get(ui).await?;
-	let Some(source) = client
-		.find_item_at_path(&source_path.0)
-		.await
-		.context("Failed to find source file or directory")?
-	else {
-		return Err(UI::failure(&format!(
-			"No such source file or directory: {}",
-			source_path.0
-		)));
-	};
+	let source = resolve_item(client, &source_operand, "source file or directory").await?;
 	let source_filename = match &source {
 		NonRootFileType::File(file) => file.name(),
 		NonRootFileType::Dir(dir) => dir.name(),
 		NonRootFileType::Root(_) => return Err(UI::failure("Cannot move root directory")),
 	}
 	.context("Failed to decrypt source name")?;
+	let source_path = path_of(client, &source_operand, &source).await?;
+	let (destination_path, must_be_a_directory) =
+		destination_path(client, working_path, destination_str).await?;
 	let Destination {
 		dir: destination_dir,
 		name: new_name,
@@ -2010,8 +1977,8 @@ pub(crate) async fn move_file_or_directory(
 			name: source_filename,
 			uuid: source.uuid(),
 		},
-		working_path,
-		destination_str,
+		&destination_path,
+		must_be_a_directory,
 	)
 	.await?;
 
@@ -2211,7 +2178,24 @@ fn is_inside(path: &RemotePath, ancestor: &RemotePath) -> bool {
 		.is_some_and(|rest| rest.starts_with('/'))
 }
 
-/// Resolves the raw `destination_str` of a `mv` or `cp` into the directory the source ends up
+/// The destination path a `mv` or `cp` was given as `destination_str`, and whether it must be an
+/// existing directory, as one written with a trailing '/' or named by its UUID must.
+async fn destination_path(
+	client: &Client,
+	working_path: &RemotePath,
+	destination_str: &str,
+) -> Result<(RemotePath, bool)> {
+	match ItemOperand::parse(working_path, destination_str)? {
+		// before navigating, which drops the trailing '/'
+		ItemOperand::Path(path) => Ok((path, names_a_directory(destination_str))),
+		operand => Ok((
+			operand_path(client, &operand, "destination directory").await?,
+			true,
+		)),
+	}
+}
+
+/// Resolves the `destination_path` of a `mv` or `cp` into the directory the source ends up
 /// in and the name it ends up under (see [`target_of`]), and refuses a name the server would take
 /// as one already there: it compares names case-insensitively. Moving an item to a name that
 /// differs from its own only in case renames it.
@@ -2224,12 +2208,9 @@ async fn resolve_destination<'a>(
 	client: &'a Client,
 	placement: Placement,
 	source: &Source<'_>,
-	working_path: &RemotePath,
-	destination_str: &str,
+	destination_path: &RemotePath,
+	must_be_a_directory: bool,
 ) -> Result<Destination<'a>> {
-	// before navigating, which drops the trailing '/'
-	let must_be_a_directory = names_a_directory(destination_str);
-	let destination_path = working_path.navigate(destination_str);
 	let found_item = client
 		.find_item_at_path(&destination_path.0)
 		.await
@@ -2242,7 +2223,7 @@ async fn resolve_destination<'a>(
 	let target = target_of(
 		placement,
 		source,
-		&destination_path,
+		destination_path,
 		found,
 		must_be_a_directory,
 	)?;
@@ -2308,24 +2289,18 @@ pub(crate) async fn copy_file_or_directory(
 	source_str: &str,
 	destination_str: &str,
 ) -> Result<()> {
-	let source_path = working_path.navigate(source_str);
+	let source_operand = ItemOperand::parse(working_path, source_str)?;
 	let client = client.get(ui).await?;
-	let Some(source) = client
-		.find_item_at_path(&source_path.0)
-		.await
-		.context("Failed to find source file or directory")?
-	else {
-		return Err(UI::failure(&format!(
-			"No such source file or directory: {}",
-			source_path.0
-		)));
-	};
+	let source = resolve_item(client, &source_operand, "source file or directory").await?;
 	let source_name = match &source {
 		NonRootFileType::File(file) => file.name(),
 		NonRootFileType::Dir(dir) => dir.name(),
 		NonRootFileType::Root(_) => return Err(UI::failure("Cannot copy root directory")),
 	}
 	.context("Failed to decrypt source name")?;
+	let source_path = path_of(client, &source_operand, &source).await?;
+	let (destination_path, must_be_a_directory) =
+		destination_path(client, working_path, destination_str).await?;
 	let destination = resolve_destination(
 		client,
 		Placement::Copy,
@@ -2334,8 +2309,8 @@ pub(crate) async fn copy_file_or_directory(
 			name: source_name,
 			uuid: source.uuid(),
 		},
-		working_path,
-		destination_str,
+		&destination_path,
+		must_be_a_directory,
 	)
 	.await?;
 	// the source's own name is left to the copy, which also copies a name today's rules reject
@@ -2671,23 +2646,18 @@ fn parse_dir_color(color: &str) -> Result<DirColor<'static>, String> {
 async fn set_directory_color(
 	ui: &mut UI,
 	client: &mut LazyClient,
-	path: &RemotePath,
+	path: &ItemOperand,
 	color: DirColor<'static>,
 ) -> Result<()> {
 	let client = client.get(ui).await?;
-	let mut dir = match client
-		.find_item_at_path(&path.0)
-		.await
-		.context("Failed to find directory")?
-	{
-		Some(NonRootFileType::Dir(dir)) => dir.into_owned(),
-		Some(NonRootFileType::Root(_)) => {
+	let mut dir = match resolve_item(client, path, "directory").await? {
+		NonRootFileType::Dir(dir) => dir.into_owned(),
+		NonRootFileType::Root(_) => {
 			return Err(UI::failure("Cannot set the color of the root directory"));
 		}
-		Some(NonRootFileType::File(_)) => {
+		NonRootFileType::File(_) => {
 			return Err(UI::failure(&format!("Not a directory: {}", path)));
 		}
-		None => return Err(UI::failure(&format!("No such directory: {}", path))),
 	};
 	client
 		.set_dir_color(&mut dir, color)
@@ -2708,19 +2678,9 @@ pub(crate) async fn set_file_or_directory_favorite(
 	file_or_directory_str: &str,
 	favorite: bool,
 ) -> Result<()> {
-	let file_or_directory_str = working_path.navigate(file_or_directory_str).0;
+	let operand = ItemOperand::parse(working_path, file_or_directory_str)?;
 	let client = client.get(ui).await?;
-	let Some(file_or_directory) = client
-		.find_item_at_path(&file_or_directory_str)
-		.await
-		.context("Failed to find file or directory")?
-	else {
-		return Err(UI::failure(&format!(
-			"No such file or directory: {}",
-			file_or_directory_str
-		)));
-	};
-	match file_or_directory {
+	match resolve_item(client, &operand, "file or directory").await? {
 		NonRootFileType::File(mut file) => {
 			client
 				.set_file_favorite(file.to_mut(), favorite)
@@ -2729,7 +2689,7 @@ pub(crate) async fn set_file_or_directory_favorite(
 			ui.print_success(&format!(
 				"{} file: {}",
 				if favorite { "Favorited" } else { "Unfavorited" },
-				file_or_directory_str
+				operand
 			));
 		}
 		NonRootFileType::Dir(mut dir) => {
@@ -2740,7 +2700,7 @@ pub(crate) async fn set_file_or_directory_favorite(
 			ui.print_success(&format!(
 				"{} directory: {}",
 				if favorite { "Favorited" } else { "Unfavorited" },
-				file_or_directory_str
+				operand
 			));
 		}
 		NonRootFileType::Root(_) => {
