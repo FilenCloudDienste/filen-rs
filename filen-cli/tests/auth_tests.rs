@@ -783,3 +783,43 @@ fn a_corrupt_auth_config_given_with_the_flag_fails_saying_to_export_a_new_one() 
 // Saving a login in the keyring, splitting it into chunks and deleting the stale chunks of a
 // longer login are unit-tested against an in-memory store in `util.rs`, since these tests must
 // not touch the keyring of whoever runs them.
+
+#[test]
+fn a_profile_gets_its_config_dir_on_first_use_and_is_listed() {
+	let working_dir = assert_fs::TempDir::new().unwrap();
+	let config_dir = assert_fs::TempDir::new().unwrap();
+	cli_without_stored_credentials(working_dir.path(), config_dir.path())
+		.args(["--profile", "work", "profiles"])
+		.assert()
+		.success()
+		.stdout("* work\n");
+	// the profile's logs are in its own config dir
+	assert!(
+		config_dir
+			.path()
+			.join("profiles")
+			.join("work")
+			.join("logs")
+			.is_dir()
+	);
+	cli_without_stored_credentials(working_dir.path(), config_dir.path())
+		.env("FILEN_CLI_PROFILE", "home")
+		.args(["profiles"])
+		.assert()
+		.success()
+		.stdout("* home\n  work\n");
+}
+
+#[test]
+fn a_profile_name_that_is_a_path_is_refused() {
+	let working_dir = assert_fs::TempDir::new().unwrap();
+	let config_dir = assert_fs::TempDir::new().unwrap();
+	cli_without_stored_credentials(working_dir.path(), config_dir.path())
+		.args(["--profile", "../work", "profiles"])
+		.assert()
+		.code(2)
+		.stderr(predicates::str::contains(
+			"a profile name may only contain letters, digits, `-` and `_`",
+		));
+	assert!(!config_dir.path().join("profiles").exists());
+}

@@ -42,6 +42,8 @@ pub(crate) enum AuthCommands {
 	},
 	/// Print your master keys, which decrypt all your files, after confirming it (--yes answers)
 	ExportMasterKeys,
+	/// List the profiles (see --profile), marking the one in use
+	Profiles,
 }
 
 #[derive(Debug, Subcommand)]
@@ -72,6 +74,8 @@ pub(crate) const DOCS: &[DocElement] = &[
 	DocElement::CommandHelp("change-password"),
 	DocElement::CommandHelp("change-email"),
 	DocElement::CommandHelp("export-master-keys"),
+	DocElement::DocFragment("profile-option"),
+	DocElement::CommandHelp("profiles"),
 ];
 
 impl AuthCommands {
@@ -114,6 +118,7 @@ impl AuthCommands {
 			Self::ChangePassword => auth::change_password(config, ui, client).await?,
 			Self::ChangeEmail { new_email } => auth::change_email(ui, client, &new_email).await?,
 			Self::ExportMasterKeys => auth::export_master_keys(ui, client).await?,
+			Self::Profiles => auth::print_profiles(ui, &config.profiles)?,
 		}
 		Ok(CommandResult::default())
 	}

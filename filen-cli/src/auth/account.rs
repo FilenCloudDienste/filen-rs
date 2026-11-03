@@ -805,6 +805,7 @@ mod tests {
 		LazyClient::new(
 			CliConfig {
 				config_dir: std::env::temp_dir(),
+				profiles: crate::auth::Profiles::new(&std::env::temp_dir(), None),
 			},
 			None,
 			None,
@@ -836,6 +837,7 @@ mod tests {
 		let printed = Printed::default();
 		let config = CliConfig {
 			config_dir: std::env::temp_dir(),
+			profiles: crate::auth::Profiles::new(&std::env::temp_dir(), None),
 		};
 		let mut client = client_never_logged_in();
 

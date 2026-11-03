@@ -96,6 +96,11 @@ pub(crate) struct CliArgs {
 	#[arg(long, global = true)]
 	config_dir: Option<PathBuf>,
 
+	/// Use this profile: its own login, cache and logs, in a directory of the config directory
+	/// (letters, digits, `-` and `_`)
+	#[arg(long, global = true, env = "FILEN_CLI_PROFILE", value_name = "NAME")]
+	profile: Option<auth::ProfileName>,
+
 	/// Append the log to this file instead of writing it to the config directory
 	#[arg(long, global = true, value_name = "PATH")]
 	log_file: Option<PathBuf>,
@@ -197,7 +202,9 @@ pub(crate) struct CliArgs {
 
 #[derive(Clone)]
 pub(crate) struct CliConfig {
+	/// The config dir in use: the active profile's, or the one without a profile.
 	pub(crate) config_dir: PathBuf,
+	pub(crate) profiles: auth::Profiles,
 }
 
 /// How large the log files grow and how long they are kept: a file is moved aside past 10 MiB,
@@ -362,20 +369,24 @@ async fn inner_main(ui: &mut ui::UI, arenas_limited: bool) -> Result<Finished> {
 	interrupt::install().context("Failed to set up Ctrl-C")?;
 
 	let is_dev = cfg!(debug_assertions);
+	let base_config_dir = match cli_args.config_dir {
+		Some(ref dir) => {
+			if !dir.exists() {
+				return Err(ui::UI::usage_failure("Config dir does not exist"));
+			}
+			dir.clone()
+		}
+		None => {
+			let dir = default_config_dir(is_dev).context("Failed to get config dir")?;
+			fs::create_dir_all(&dir).context("Failed to create config dir")?;
+			dir
+		}
+	};
+	// a copy of the short name: the arguments are borrowed whole further down
+	let profiles = auth::Profiles::new(&base_config_dir, cli_args.profile.clone());
 	let config = CliConfig {
-		config_dir: match cli_args.config_dir {
-			Some(ref dir) => {
-				if !dir.exists() {
-					return Err(ui::UI::usage_failure("Config dir does not exist"));
-				}
-				dir.clone()
-			}
-			None => {
-				let dir = default_config_dir(is_dev).context("Failed to get config dir")?;
-				fs::create_dir_all(&dir).context("Failed to create config dir")?;
-				dir
-			}
-		},
+		config_dir: profiles.config_dir(&base_config_dir)?,
+		profiles,
 	};
 
 	// setup logging

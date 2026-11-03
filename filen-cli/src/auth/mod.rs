@@ -34,6 +34,7 @@
 
 mod account;
 mod old_cli;
+mod profile;
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -55,6 +56,7 @@ use filen_sdk_rs::{
 pub(crate) use self::account::{
 	change_email, change_password, disable_two_factor, enable_two_factor, export_master_keys,
 };
+pub(crate) use self::profile::{ProfileName, Profiles, print_profiles};
 use crate::{
 	CliConfig, ClientConfigArgs, build_client_config, default_config_dir, deserialize_auth_config,
 	serialize_auth_config,
@@ -1560,6 +1562,7 @@ mod tests {
 		let dir = assert_fs::TempDir::new().unwrap();
 		let config = CliConfig {
 			config_dir: dir.path().to_path_buf(),
+			profiles: Profiles::new(dir.path(), None),
 		};
 		(dir, config)
 	}
@@ -2583,6 +2586,7 @@ mod tests {
 		let missing = config_dir.path().join("missing.txt");
 		let config = CliConfig {
 			config_dir: config_dir.path().to_path_buf(),
+			profiles: Profiles::new(config_dir.path(), None),
 		};
 
 		let Err(err) = authenticate_from_auth_config(
