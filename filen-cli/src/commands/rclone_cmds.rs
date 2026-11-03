@@ -54,25 +54,35 @@ use std::{
 	fmt,
 	net::{Ipv4Addr, Ipv6Addr},
 	path::{Path, PathBuf},
+	time::Duration,
 };
 
 use anyhow::{Context as _, Result, anyhow};
 use clap::{Subcommand, ValueEnum};
+use console::{Term, style};
 use filen_sdk_rs::{
 	ErrorKind,
 	auth::Client,
 	rclone::{
 		FuseProvider, MountInfo, MountOptions, RcloneBinary, RcloneDaemon, RcloneDaemonConfig,
-		RcloneExit, RcloneRefusal, ServeAuth, ServeOptions, ServeProtocol, ServeTls, StopOptions,
-		VfsTuning, available_drive_letters, run_rclone,
+		RcloneExit, RcloneRefusal, RcloneStats, ServeAuth, ServeOptions, ServeProtocol, ServeTls,
+		StopOptions, VfsTuning, available_drive_letters, run_rclone,
 	},
 };
 use serde_json::{Value, json};
-use tokio::select;
+use tokio::{
+	select,
+	time::{Interval, MissedTickBehavior, interval},
+};
 
 use crate::{
-	CliConfig, CommandResult, auth::LazyClient, commands::CommandContext, docs::DocElement,
-	error::CliError, interrupt, ui::UI,
+	CliConfig, CommandResult,
+	auth::LazyClient,
+	commands::CommandContext,
+	docs::DocElement,
+	error::CliError,
+	interrupt,
+	ui::{self, UI},
 };
 
 #[derive(Debug, Subcommand)]
@@ -314,6 +324,9 @@ const STOP: StopOptions = StopOptions {
 	drain_timeout_ms: Some(30_000),
 	grace_ms: 10_000,
 };
+
+/// How often the status line of a running mount or server is redrawn.
+const STATUS_INTERVAL: Duration = Duration::from_secs(2);
 
 /// How many mounts and servers may run at once, each on a cache of its own: two Rclones on one
 /// cache would corrupt it.
@@ -705,19 +718,32 @@ async fn wait_and_stop(
 		cache,
 		cache_dir,
 	} = daemon;
-	select! {
-		() = ctrl_c.pressed() => {}
-		exit = daemon.exited() => {
-			return Err(anyhow!(match exit {
-				RcloneExit::Crashed { code: Some(code), .. } => {
-					format!("Rclone exited with code {code} (use --verbose for more info)")
-				}
-				RcloneExit::Crashed { code: None, .. } | RcloneExit::Stopped => {
-					"Rclone exited unexpectedly (use --verbose for more info)".to_owned()
-				}
-			}));
+	let mut status = StatusLine::new(ui);
+	let mut ticks = interval(STATUS_INTERVAL);
+	ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
+	loop {
+		select! {
+			biased;
+			() = ctrl_c.pressed() => break,
+			exit = daemon.exited() => {
+				status.clear();
+				return Err(anyhow!(match exit {
+					RcloneExit::Crashed { code: Some(code), .. } => {
+						format!("Rclone exited with code {code} (use --verbose for more info)")
+					}
+					RcloneExit::Crashed { code: None, .. } | RcloneExit::Stopped => {
+						"Rclone exited unexpectedly (use --verbose for more info)".to_owned()
+					}
+				}));
+			}
+			stats = next_stats(&mut ticks, daemon), if status.enabled => match stats {
+				Ok(stats) => status.show(&status_text(&stats)),
+				// The line keeps what it last showed; the mount or server is not affected.
+				Err(e) => log::warn!("Failed to read Rclone's stats: {e}"),
+			},
 		}
 	}
+	status.clear();
 	print_notice(
 		ui,
 		&format!("{stopping}, letting uploads finish for up to 30 seconds..."),
@@ -732,6 +758,80 @@ async fn wait_and_stop(
 		));
 	}
 	Ok(())
+}
+
+/// Rclone's stats at the next tick of `ticks`. Dropping it, when Ctrl-C is pressed or Rclone
+/// exits first, abandons the request.
+async fn next_stats(
+	ticks: &mut Interval,
+	daemon: &RcloneDaemon,
+) -> Result<RcloneStats, filen_sdk_rs::Error> {
+	ticks.tick().await;
+	daemon.stats().await
+}
+
+/// The line a running mount or server redraws on stderr with what its cache is doing, shown only
+/// to a person at a terminal, as an announcement is: not with `--quiet` or `--json`, nor when
+/// stdout or stderr is redirected.
+struct StatusLine {
+	term: Term,
+	enabled: bool,
+	/// Whether the line is on the screen, to be cleared before anything else is printed.
+	shown: bool,
+}
+
+impl StatusLine {
+	fn new(ui: &UI) -> Self {
+		let term = Term::stderr();
+		let enabled = status_line_wanted(ui, term.is_term());
+		Self {
+			term,
+			enabled,
+			shown: false,
+		}
+	}
+
+	/// Redraws the line with `text`, cut to the terminal's width: a line that wrapped onto a
+	/// second row would not be cleared.
+	fn show(&mut self, text: &str) {
+		let line = ui::truncate_to_width(text, usize::from(self.term.size().1));
+		// A failed write to the terminal leaves the line as it was; there is nowhere to report it.
+		let _ = self.term.clear_line();
+		let _ = self.term.write_str(&style(line).dim().to_string());
+		let _ = self.term.flush();
+		self.shown = true;
+	}
+
+	fn clear(&mut self) {
+		if self.shown {
+			let _ = self.term.clear_line();
+			let _ = self.term.flush();
+			self.shown = false;
+		}
+	}
+}
+
+/// Whether the status line is drawn, with stderr a terminal or not.
+fn status_line_wanted(ui: &UI, stderr_is_terminal: bool) -> bool {
+	stderr_is_terminal && ui.output_is_read_by_a_person() && !ui.is_quiet()
+}
+
+/// The status line's text: the files being uploaded and waiting in the cache, the cache's size on
+/// disk, and the files whose upload failed or a full disk, when there are any.
+fn status_text(stats: &RcloneStats) -> String {
+	let mut text = format!(
+		"Uploading {}, queued {}, cache {}",
+		stats.uploads_in_progress,
+		stats.uploads_queued,
+		ui::format_size(stats.cache_bytes_used)
+	);
+	if stats.errored_files > 0 {
+		text.push_str(&format!(", {} failed (retrying)", stats.errored_files));
+	}
+	if stats.out_of_space {
+		text.push_str(", cache disk full");
+	}
+	text
 }
 
 /// The warning that `pending` uploads were left in the `cache`th cache, at `cache_dir`, saying when
@@ -1498,6 +1598,65 @@ mod tests {
 			out.lines()
 		);
 		assert_eq!(err.lines_or_empty(), "");
+	}
+
+	/// Stats with `uploading` files being uploaded, `queued` waiting and `cache_bytes` in the cache.
+	fn stats(uploading: u32, queued: u32, cache_bytes: u64) -> RcloneStats {
+		RcloneStats {
+			uploads_in_progress: uploading,
+			uploads_queued: queued,
+			errored_files: 0,
+			cache_bytes_used: cache_bytes,
+			out_of_space: false,
+			transfers: Vec::new(),
+			mounts: Vec::new(),
+			serves: Vec::new(),
+		}
+	}
+
+	#[test]
+	fn the_status_line_shows_uploads_and_the_cache_size() {
+		assert_eq!(
+			status_text(&stats(2, 5, 1_288_490_189)),
+			"Uploading 2, queued 5, cache 1.20 GiB"
+		);
+	}
+
+	#[test]
+	fn the_status_line_shows_failed_uploads_and_a_full_disk() {
+		let stats = RcloneStats {
+			errored_files: 3,
+			out_of_space: true,
+			..stats(0, 0, 0)
+		};
+
+		assert_eq!(
+			status_text(&stats),
+			"Uploading 0, queued 0, cache 0 B, 3 failed (retrying), cache disk full"
+		);
+	}
+
+	#[test]
+	fn the_status_line_is_drawn_for_a_person_at_a_terminal() {
+		let printed = Printed::default();
+		let ui = printed.terminal_ui();
+
+		assert!(status_line_wanted(&ui, true));
+		assert!(!status_line_wanted(&ui, false));
+	}
+
+	#[test]
+	fn the_status_line_is_not_drawn_when_quiet_or_json_or_stdout_is_redirected() {
+		let printed = Printed::default();
+		let mut quiet = printed.terminal_ui();
+		quiet.initialize(true, false, None, true, false);
+		let mut json = printed.terminal_ui();
+		json.initialize(false, true, None, true, false);
+		let redirected = printed.ui();
+
+		assert!(!status_line_wanted(&quiet, true));
+		assert!(!status_line_wanted(&json, true));
+		assert!(!status_line_wanted(&redirected, true));
 	}
 
 	#[test]
