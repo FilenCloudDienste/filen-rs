@@ -128,6 +128,11 @@ const DOC_OUTLINE: &[DocSection] = &[
 		title: "Managed Rclone",
 		parts: &[rclone_cmds::DOCS],
 	},
+	DocSection {
+		id: "migration",
+		title: "Migrating from the TypeScript CLI",
+		parts: &[&[DocElement::DocFragment("ts-migration")]],
+	},
 ];
 
 const MAIN_SECTION: &str = "usage";
@@ -738,6 +743,22 @@ mod tests {
 		.unwrap();
 		assert_eq!(answered.into_inner(), ["/some-section"]);
 		assert!(client.join().unwrap().ends_with("served"));
+	}
+
+	#[test]
+	fn the_migration_guide_is_a_section_of_its_own() {
+		let outline = PARSED_DOC_OUTLINE.as_ref().unwrap();
+		let section = outline.iter().find(|s| s.id == "migration").unwrap();
+		assert_eq!(section.title, "Migrating from the TypeScript CLI");
+		let markdown = format_markdown_section(section);
+		assert!(
+			markdown.starts_with("# Migrating from the TypeScript CLI\n\n"),
+			"{markdown}"
+		);
+		assert!(
+			markdown.contains("- `webdav` is `serve webdav`, and `s3` is `serve s3`."),
+			"{markdown}"
+		);
 	}
 
 	#[test]

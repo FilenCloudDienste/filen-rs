@@ -1,5 +1,74 @@
 //! Files the older, TypeScript Filen CLI left in its config directory. Users who switch are told
 //! once what they are and what to do about them.
+//!
+//! [cli-doc] ts-migration
+//! This CLI replaces the older Filen CLI, written in TypeScript (the `@filen/cli` npm package and
+//! its binaries). Most commands kept their names; this is what changed.
+//!
+//! What carries over by itself:
+//! - your login: the older CLI's saved login is imported the first time you log in (see
+//!   `help auth`), and `FILEN_EMAIL`, `FILEN_PASSWORD` and `FILEN_2FA_CODE` still work (the
+//!   `FILEN_CLI_*` variables come first)
+//! - your sync pairs: without `syncPairs.yaml`, `sync` reads the older CLI's `syncPairs.json`
+//!   from the config directory, or from `~/.filen-cli`, and takes over the sync state it kept for
+//!   a pair the first time it syncs that pair
+//! - the config directory: the default is the same, and `--data-dir` and `FILEN_CLI_DATA_DIR`
+//!   still set it (`--config-dir` and `FILEN_CLI_CONFIG_DIR` are the new names); `~/.filen-cli` is
+//!   no longer used as the config directory
+//!
+//! The first run that finds the older CLI's files says once which of them you can delete.
+//!
+//! Options:
+//! - `--root <path>` is `--working-path <path>`
+//! - `--force-update` is `--force-update-check`, and `--auto-update` is `--always-update`;
+//!   `--skip-update` and `install` are unchanged, and there is no canary channel (`canary`)
+//! - `--log-file <file>` still appends the log to a file; without it, the CLI writes its logs to
+//!   the config directory (see `help log-files`)
+//! - options can go after the command too (`filen ls --json`)
+//!
+//! Commands:
+//! - `trash` (`trash list`) is `list-trash`; `trash restore` is `trash-restore`, `trash delete` is
+//!   `trash-delete`, and `trash empty` is `empty-trash`
+//! - `links` (`link list`) is `list-public-links`, and `public-link <path>` creates or edits a link
+//! - `rm --no-trash` is `rm -p` (`--permanent`)
+//! - `statfs` still shows the storage used and left, now with more rows, and `stat /` shows the
+//!   drive's totals
+//! - the aliases `list`, `more`, `delete`, `stats`, `move`, `rename`, `copy`, `reveal`,
+//!   `navigate`, `quit` and `q` are gone: use `ls`, `cat`, `rm`, `stat`, `mv`, `cp`, `view`, `cd`
+//!   and `exit`
+//!
+//! Syncing:
+//! - `sync` runs continuously until Ctrl-C, where the older CLI synced once without
+//!   `--continuous`: pass `--once` for a single pass (`--continuous` is accepted and does nothing)
+//! - sync pairs are given as before (`<local>:<remote>`, `<local>:<mode>:<remote>` with the same
+//!   modes and short forms, an alias, or a sync pairs file), and `-p`/`--pair` gives one too;
+//!   sync pairs files keep the older keys (`syncMode`, `alias`, `ignore`, `excludeDotFiles`)
+//! - local files that a sync replaces or deletes go to `.filen-sync-trash` in the local directory
+//!   for 30 days instead of `.filen.trash.local`; the local trash cannot be turned off, so
+//!   `--disable-local-trash` is gone and `disableLocalTrash` only gives a warning
+//! - the delete guard holds back mass deletions, and conflicts are reported instead of the newer
+//!   file winning (see `help sync-deletions-and-conflicts`)
+//!
+//! Servers and mounting (through the managed Rclone, see `help managed-rclone`):
+//! - `webdav` is `serve webdav`, and `s3` is `serve s3`. They listen on 127.0.0.1 (port 1900 for
+//!   WebDAV, 1800 for S3) instead of 0.0.0.0 on port 80 or 443: `--addr 0.0.0.0:1900` (or
+//!   `--host 0.0.0.0`) listens on every network interface
+//! - `--w-user` and `--w-password` are `--user` and `--password`; `--s3-access-key-id` and
+//!   `--s3-secret-access-key` are `--user` and `--password` too. Without them, random credentials
+//!   are printed when the server starts
+//! - `--w-hostname`/`--w-port` and `--s3-hostname`/`--s3-port` are `--addr <ip>:<port>`
+//! - `--w-https` and `--s3-https` are `--self-signed`, or `--cert` and `--key` for your own
+//!   certificate
+//! - `mount` is unchanged, and on macOS needs no macFUSE
+//!
+//! What is gone, and why:
+//! - `webdav-proxy`: the multi-user proxy mode was removed; run `serve webdav` for each account
+//! - digest authentication (`--w-auth-scheme digest`): Rclone serves basic authentication only;
+//!   use HTTPS (`--self-signed`) so that the password is not sent in the clear
+//! - `--w-threads` and `--s3-threads`: Rclone serves requests concurrently already
+//! - the `.filen-cli-credentials` file: the CLI does not read plaintext credentials; keep the
+//!   login in the system keyring, or export an auth config with `filen export-auth-config`
+//! - chats: the CLI does not handle chats; use the Filen apps
 
 use std::{
 	fs,
