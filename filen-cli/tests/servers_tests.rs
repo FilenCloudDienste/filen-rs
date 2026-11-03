@@ -18,6 +18,7 @@ use filen_macros::shared_test_runtime;
 use filen_sdk_rs::rclone::{FuseStatus, fuse_status};
 use regex::Regex;
 use reqwest::{Method, StatusCode};
+use serde_json::Value;
 use test_utils::cli::prepare_cli_auth_config;
 use tokio::{
 	io::{AsyncBufReadExt, AsyncReadExt, BufReader, Lines},
@@ -131,6 +132,38 @@ impl Cli {
 				panic!("the CLI exited ({status}) without printing {needed:?}; stderr: {stderr}");
 			}
 		}
+	}
+
+	/// The JSON object printed first on stdout, pretty-printed over several lines.
+	async fn json_object(&mut self) -> Value {
+		let opening = self.line_containing("{").await;
+		assert_eq!(opening, "{", "the JSON does not start on a line of its own");
+		let mut json = opening;
+		loop {
+			let line = timeout(START, self.stdout.next_line())
+				.await
+				.unwrap_or_else(|_| panic!("the CLI did not finish its JSON within {START:?}"))
+				.unwrap()
+				.unwrap_or_else(|| panic!("stdout ended inside the JSON: {json}"));
+			let end = line == "}";
+			json.push_str(&line);
+			if end {
+				return serde_json::from_str(&json).unwrap();
+			}
+		}
+	}
+
+	/// What is left on stdout until the CLI closes it.
+	async fn rest_of_stdout(&mut self) -> Vec<String> {
+		let mut lines = Vec::new();
+		while let Some(line) = timeout(EXIT, self.stdout.next_line())
+			.await
+			.expect("stdout closes when the CLI exits")
+			.unwrap()
+		{
+			lines.push(line);
+		}
+		lines
 	}
 
 	/// Presses Ctrl-C.
@@ -315,6 +348,31 @@ async fn a_mount_on_a_directory_that_is_not_empty_fails() {
 	};
 	assert_eq!(status.code(), Some(1), "{stderr}");
 	assert!(stderr.contains(expected), "{stderr}");
+}
+
+#[shared_test_runtime]
+async fn a_server_prints_its_address_and_credentials_as_json_under_json() {
+	let port = free_port();
+	let address = format!("127.0.0.1:{port}");
+	let mut cli = Cli::spawn(&["serve", "webdav", "--addr", &address, "--json"]).await;
+
+	let json = cli.json_object().await;
+	assert_eq!(json["protocol"], "webdav");
+	assert_eq!(json["address"], address.as_str());
+	assert_eq!(json["url"], format!("http://{address}").as_str());
+	let started = Started {
+		url: json["url"].as_str().unwrap().to_owned(),
+		user: json["user"].as_str().unwrap().to_owned(),
+		password: json["password"].as_str().unwrap().to_owned(),
+	};
+	assert_eq!(started.propfind_root(true).await, StatusCode::MULTI_STATUS);
+
+	cli.interrupt();
+	// The notices about stopping go to stderr: stdout holds the JSON alone.
+	assert_eq!(cli.rest_of_stdout().await, Vec::<String>::new());
+	let (status, stderr) = cli.exit().await;
+	assert_eq!(status.code(), Some(0), "{stderr}");
+	assert!(stderr.contains("Stopping WebDAV server"), "{stderr}");
 }
 
 #[shared_test_runtime]

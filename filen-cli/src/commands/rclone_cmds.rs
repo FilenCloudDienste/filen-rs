@@ -62,12 +62,12 @@ use filen_sdk_rs::{
 	ErrorKind,
 	auth::Client,
 	rclone::{
-		MountOptions, RcloneBinary, RcloneDaemon, RcloneDaemonConfig, RcloneExit, RcloneRefusal,
-		ServeAuth, ServeOptions, ServeProtocol, ServeTls, StopOptions, VfsTuning,
-		available_drive_letters, run_rclone,
+		FuseProvider, MountInfo, MountOptions, RcloneBinary, RcloneDaemon, RcloneDaemonConfig,
+		RcloneExit, RcloneRefusal, ServeAuth, ServeOptions, ServeProtocol, ServeTls, StopOptions,
+		VfsTuning, available_drive_letters, run_rclone,
 	},
 };
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::select;
 
 use crate::{
@@ -359,10 +359,14 @@ pub(crate) async fn mount(
 				"Failed to mount network drive (use --verbose for more info)",
 			)
 		})?;
-	ui.print_success(&format!(
-		"Mounted network drive at {} (press Ctrl-C to unmount and exit)",
-		mounted.mount_point
-	));
+	if ui.json {
+		ui.print_json(mount_json(&mounted))?;
+	} else {
+		ui.print_success(&format!(
+			"Mounted network drive at {} (press Ctrl-C to unmount and exit)",
+			mounted.mount_point
+		));
+	}
 	wait_and_stop(ui, &daemon, ctrl_c, "Unmounting network drive").await
 }
 
@@ -405,30 +409,109 @@ pub(crate) async fn start_server(
 		})
 		.await
 		.map_err(|e| rclone_error(e, format!("Failed to start {name} server")))?;
-	let address = match args.protocol {
+	let url = match args.protocol {
 		ServeProtocol::Webdav | ServeProtocol::S3 | ServeProtocol::Http | ServeProtocol::Restic => {
-			format!("{scheme}://{}", serve.addr)
+			Some(format!("{scheme}://{}", serve.addr))
 		}
-		ServeProtocol::Ftp | ServeProtocol::Sftp | ServeProtocol::Nfs => serve.addr,
+		ServeProtocol::Ftp | ServeProtocol::Sftp | ServeProtocol::Nfs => None,
 	};
-	let credentials = match auth {
+	if ui.json {
+		ui.print_json(serve_json(
+			args.protocol,
+			&serve.addr,
+			url.as_deref(),
+			&auth,
+		))?;
+	} else {
+		let address = url.as_deref().unwrap_or(&serve.addr);
+		let credentials = match auth {
+			ServeAuth::Basic { user, password } => {
+				format!("with username \"{user}\" and password \"{password}\"")
+			}
+			ServeAuth::S3 {
+				access_key_id,
+				secret_access_key,
+			} => format!(
+				"with Access Key ID \"{access_key_id}\" and Secret Access Key \"{secret_access_key}\""
+			),
+			ServeAuth::Unauthenticated => "without authentication".to_owned(),
+		};
+		print_started(
+			ui,
+			&format!("Started {name} server on {address} {credentials} (press Ctrl-C to stop)"),
+			credentials_generated,
+		);
+	}
+	wait_and_stop(ui, &daemon, ctrl_c, &format!("Stopping {name} server")).await
+}
+
+/// What `mount --json` prints once the drive is mounted.
+fn mount_json(mounted: &MountInfo) -> Value {
+	json!({
+		"mountPoint": mounted.mount_point,
+		"provider": provider_name(mounted.provider),
+	})
+}
+
+/// The name of a mount backend in `mount --json`'s output.
+fn provider_name(provider: FuseProvider) -> &'static str {
+	match provider {
+		FuseProvider::MacFuse => "macfuse",
+		FuseProvider::NfsMount => "nfsmount",
+		FuseProvider::WinFsp => "winfsp",
+		FuseProvider::Fuse3 => "fuse3",
+	}
+}
+
+/// What `serve --json` prints once the server listens on `addr` (`host:port`): the server type as
+/// `serve` takes it, the address, the URL of a server spoken to over HTTP, and the credentials,
+/// given or generated, in the protocol's terms.
+fn serve_json(protocol: ServeProtocol, addr: &str, url: Option<&str>, auth: &ServeAuth) -> Value {
+	let mut started = json!({
+		"protocol": protocol_name(protocol),
+		"address": addr,
+	});
+	if let Some(url) = url {
+		started["url"] = json!(url);
+	}
+	match auth {
 		ServeAuth::Basic { user, password } => {
-			format!("with username \"{user}\" and password \"{password}\"")
+			started["user"] = json!(user);
+			started["password"] = json!(password);
 		}
 		ServeAuth::S3 {
 			access_key_id,
 			secret_access_key,
-		} => format!(
-			"with Access Key ID \"{access_key_id}\" and Secret Access Key \"{secret_access_key}\""
-		),
-		ServeAuth::Unauthenticated => "without authentication".to_owned(),
-	};
-	print_started(
-		ui,
-		&format!("Started {name} server on {address} {credentials} (press Ctrl-C to stop)"),
-		credentials_generated,
-	);
-	wait_and_stop(ui, &daemon, ctrl_c, &format!("Stopping {name} server")).await
+		} => {
+			started["accessKeyId"] = json!(access_key_id);
+			started["secretAccessKey"] = json!(secret_access_key);
+		}
+		ServeAuth::Unauthenticated => {}
+	}
+	started
+}
+
+/// The name `serve` takes the server type by.
+fn protocol_name(protocol: ServeProtocol) -> &'static str {
+	match protocol {
+		ServeProtocol::Webdav => "webdav",
+		ServeProtocol::S3 => "s3",
+		ServeProtocol::Ftp => "ftp",
+		ServeProtocol::Sftp => "sftp",
+		ServeProtocol::Http => "http",
+		ServeProtocol::Restic => "restic",
+		ServeProtocol::Nfs => "nfs",
+	}
+}
+
+/// Prints a notice about the managed Rclone, a mount or a server: on stdout, or on stderr under
+/// `--json`, so that stdout holds the JSON alone.
+fn print_notice(ui: &mut UI, msg: &str) {
+	if ui.json {
+		ui.print_muted_to_stderr(msg);
+	} else {
+		ui.print_muted(msg);
+	}
 }
 
 /// Prints that the server started, with its credentials. Even `--quiet` prints it when the
@@ -473,7 +556,7 @@ async fn prepare_binary(config: &CliConfig, ui: &mut UI) -> RcloneBinary {
 	remove_old_config(&dir).await;
 	let binary = RcloneBinary::Managed { dir };
 	if !binary.is_installed().await {
-		ui.print_muted("Downloading managed Rclone...");
+		print_notice(ui, "Downloading managed Rclone...");
 	}
 	binary
 }
@@ -635,9 +718,10 @@ async fn wait_and_stop(
 			}));
 		}
 	}
-	ui.print_muted(&format!(
-		"{stopping}, letting uploads finish for up to 30 seconds..."
-	));
+	print_notice(
+		ui,
+		&format!("{stopping}, letting uploads finish for up to 30 seconds..."),
+	);
 	let _stopping = ctrl_c.into_stopping(ui);
 	let report = daemon.stop(STOP).await.context("Failed to stop Rclone")?;
 	if report.pending_uploads > 0 {
@@ -1300,6 +1384,120 @@ mod tests {
 		let password = serve_password(password, password_file.as_deref()).await;
 
 		assert_eq!(password.unwrap().as_deref(), Some("hunter2"));
+	}
+
+	#[test]
+	fn mount_json_names_the_mount_point_and_the_backend() {
+		let mounted = MountInfo {
+			mount_point: "/tmp/filen".to_owned(),
+			provider: FuseProvider::Fuse3,
+		};
+
+		assert_eq!(
+			mount_json(&mounted),
+			json!({"mountPoint": "/tmp/filen", "provider": "fuse3"})
+		);
+	}
+
+	#[test]
+	fn serve_json_of_a_webdav_server_has_its_url_and_credentials() {
+		let auth = ServeAuth::Basic {
+			user: "filen-1a2b3c4d".to_owned(),
+			password: "secret".to_owned(),
+		};
+
+		assert_eq!(
+			serve_json(
+				ServeProtocol::Webdav,
+				"127.0.0.1:1900",
+				Some("http://127.0.0.1:1900"),
+				&auth
+			),
+			json!({
+				"protocol": "webdav",
+				"address": "127.0.0.1:1900",
+				"url": "http://127.0.0.1:1900",
+				"user": "filen-1a2b3c4d",
+				"password": "secret",
+			})
+		);
+	}
+
+	#[test]
+	fn serve_json_of_an_s3_server_has_its_access_key() {
+		let auth = ServeAuth::S3 {
+			access_key_id: "AKID".to_owned(),
+			secret_access_key: "SAK".to_owned(),
+		};
+
+		assert_eq!(
+			serve_json(
+				ServeProtocol::S3,
+				"127.0.0.1:1800",
+				Some("https://127.0.0.1:1800"),
+				&auth
+			),
+			json!({
+				"protocol": "s3",
+				"address": "127.0.0.1:1800",
+				"url": "https://127.0.0.1:1800",
+				"accessKeyId": "AKID",
+				"secretAccessKey": "SAK",
+			})
+		);
+	}
+
+	#[test]
+	fn serve_json_of_an_nfs_server_has_no_url_or_credentials() {
+		assert_eq!(
+			serve_json(
+				ServeProtocol::Nfs,
+				"127.0.0.1:2049",
+				None,
+				&ServeAuth::Unauthenticated
+			),
+			json!({"protocol": "nfs", "address": "127.0.0.1:2049"})
+		);
+	}
+
+	#[test]
+	fn serve_json_names_the_server_type_as_serve_takes_it() {
+		for server in ServerType::value_variants() {
+			let value = server.to_possible_value().unwrap();
+
+			assert_eq!(protocol_name((*server).into()), value.get_name());
+		}
+	}
+
+	#[test]
+	fn notices_go_to_stderr_under_json() {
+		let (out, err) = (Printed::default(), Printed::default());
+		let mut ui = Printed::split_ui(&out, &err);
+		ui.initialize(false, true, None, true, false);
+
+		print_notice(&mut ui, "Stopping WebDAV server");
+
+		assert_eq!(out.lines_or_empty(), "");
+		assert!(
+			err.lines().contains("Stopping WebDAV server"),
+			"{}",
+			err.lines()
+		);
+	}
+
+	#[test]
+	fn notices_go_to_stdout_without_json() {
+		let (out, err) = (Printed::default(), Printed::default());
+		let mut ui = Printed::split_ui(&out, &err);
+
+		print_notice(&mut ui, "Stopping WebDAV server");
+
+		assert!(
+			out.lines().contains("Stopping WebDAV server"),
+			"{}",
+			out.lines()
+		);
+		assert_eq!(err.lines_or_empty(), "");
 	}
 
 	#[test]
