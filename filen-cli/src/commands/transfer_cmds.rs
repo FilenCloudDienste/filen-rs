@@ -11,11 +11,15 @@
 //! on the way to the destination are created. Downloading `/` writes the whole drive's contents
 //! into the destination.
 //!
+//! While a transfer runs, its progress line shows the current speed and the time left, and the
+//! result ends with the number of files and bytes transferred, the time taken and the average
+//! speed. With `-v`, each file of a directory transfer is listed as it completes.
+//!
 //! When a single item inside a directory transfer fails, the rest of the transfer still completes
 //! and the failures are listed at the end. With `--json`, the result is printed as one object
 //! instead: `{"destination": ..., "files": ..., "bytes": ..., "failed": [{"path": ..., "error":
 //! ...}]}`, where `path` is `null` for a failure not about a single item. Press Ctrl+C to cancel a
-//! running transfer.
+//! running transfer; what was transferred by then is reported on stderr.
 
 use std::{
 	borrow::Cow,
