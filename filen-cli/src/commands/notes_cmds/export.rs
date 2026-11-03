@@ -21,9 +21,8 @@ use std::{
 
 use anyhow::{Context as _, Result};
 use filen_sdk_rs::{auth::Client, notes::Note};
-use filen_types::api::v3::notes::NoteType;
 
-use super::checklist::checklist_html_to_markdown;
+use super::content::{file_extension, readable_content};
 use crate::{auth::LazyClient, ui::UI};
 
 const ILLEGAL_FILE_NAME_CHARS: &[char] = &['<', '>', ':', '"', '/', '\\', '|', '?', '*'];
@@ -111,12 +110,9 @@ async fn export_note(client: &Client, mut note: Note, path: PathBuf) -> Result<(
 		.await
 		.with_context(|| format!("Failed to fetch {note_str}"))?
 		.ok_or_else(|| UI::failure(&format!("Failed to decrypt {note_str}")))?;
-	let content = match note.note_type() {
-		NoteType::Checklist => checklist_html_to_markdown(&content),
-		_ => content,
-	};
+	let content = readable_content(note.note_type(), &content);
 
-	std::fs::write(&path, content)
+	std::fs::write(&path, content.as_bytes())
 		.with_context(|| format!("Failed to write {} to {}", note_str, path.display()))
 }
 
@@ -171,13 +167,12 @@ fn target_path(export_root: &Path, note: &Note, used_paths: &mut HashSet<PathBuf
 		_ => format!("note-{}", note.uuid()),
 	};
 
-	let extension = match note.note_type() {
-		NoteType::Rich => "html",
-		NoteType::Md | NoteType::Checklist => "md",
-		NoteType::Text | NoteType::Code => "txt",
-	};
-
-	unique_path(&directory, &file_name, extension, used_paths)
+	unique_path(
+		&directory,
+		&file_name,
+		file_extension(note.note_type()),
+		used_paths,
+	)
 }
 
 /// Returns `<directory>/<file_name>.<extension>`, appending `-1`, `-2`, ... to the file name
