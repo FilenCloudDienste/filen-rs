@@ -86,3 +86,77 @@ async fn mkdir_recursive_creates_a_path_with_a_trailing_slash() {
 		Some(NonRootFileType::Dir(_))
 	));
 }
+
+#[shared_test_runtime]
+async fn cp_refuses_a_file_whose_name_exists_in_the_destination() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = format!("/{}", resources.dir.name().unwrap());
+	test_utils::create_remote_file_structure_outline(
+		client,
+		resources.dir.clone(),
+		&["a.txt", "dest/A.TXT"],
+	)
+	.await
+	.unwrap();
+	let Some(NonRootFileType::File(existing)) = client
+		.find_item_at_path(&format!("{test_dir}/dest/A.TXT"))
+		.await
+		.unwrap()
+	else {
+		panic!("Expected a file");
+	};
+	let existing_uuid = existing.uuid;
+
+	authenticated_cli_with_args!(
+		"cp",
+		&format!("{test_dir}/a.txt"),
+		&format!("{test_dir}/dest")
+	)
+	.failure()
+	.stderr(predicates::str::contains(format!(
+		"Destination already exists: {test_dir}/dest/A.TXT"
+	)));
+
+	// an upload under the same name would have replaced the file with a new uuid
+	let Some(NonRootFileType::File(current)) = client
+		.find_item_at_path(&format!("{test_dir}/dest/A.TXT"))
+		.await
+		.unwrap()
+	else {
+		panic!("Expected a file");
+	};
+	assert_eq!(current.uuid, existing_uuid);
+}
+
+#[shared_test_runtime]
+async fn cp_refuses_a_directory_whose_name_exists_in_the_destination() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = format!("/{}", resources.dir.name().unwrap());
+	test_utils::create_remote_file_structure_outline(
+		client,
+		resources.dir.clone(),
+		&["src/inner.txt", "dest/src/"],
+	)
+	.await
+	.unwrap();
+
+	authenticated_cli_with_args!(
+		"cp",
+		&format!("{test_dir}/src"),
+		&format!("{test_dir}/dest")
+	)
+	.failure()
+	.stderr(predicates::str::contains(format!(
+		"Destination already exists: {test_dir}/dest/src"
+	)));
+
+	assert!(
+		client
+			.find_item_at_path(&format!("{test_dir}/dest/src/inner.txt"))
+			.await
+			.unwrap()
+			.is_none()
+	);
+}

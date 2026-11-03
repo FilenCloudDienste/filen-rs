@@ -935,6 +935,28 @@ pub(crate) async fn copy_file_or_directory(
 			)));
 		}
 	};
+	// A same-name upload would replace the existing file (as a new version) and creating a
+	// same-name directory returns the existing one, so the copy would merge into it.
+	let source_name = match &source_file_or_directory {
+		NonRootFileType::File(file) => file.name(),
+		NonRootFileType::Dir(dir) => dir.name(),
+		NonRootFileType::Root(_) => return Err(UI::failure("Cannot copy root directory")),
+	}
+	.context("Failed to decrypt source name")?;
+	let (existing_dirs, existing_files) = client
+		.list_dir::<_, Normal>(&destination_dir, None::<&fn(u64, Option<u64>)>)
+		.await
+		.context("Failed to list destination directory")?;
+	let existing_names = existing_dirs
+		.iter()
+		.filter_map(|dir| dir.name())
+		.chain(existing_files.iter().filter_map(|file| file.name()));
+	if let Some(existing_name) = clashing_name(existing_names, source_name) {
+		return Err(UI::failure(&format!(
+			"Destination already exists: {}",
+			destination_str.navigate(existing_name)
+		)));
+	}
 	match source_file_or_directory {
 		NonRootFileType::File(file) => {
 			copy_file(client, file.as_ref(), &destination_dir).await?;
@@ -951,6 +973,15 @@ pub(crate) async fn copy_file_or_directory(
 		source_str.0, destination_str.0
 	));
 	Ok(())
+}
+
+/// The name among `existing` that the server treats as the same as `name`: it compares names
+/// case-insensitively.
+fn clashing_name<'a>(existing: impl IntoIterator<Item = &'a str>, name: &str) -> Option<&'a str> {
+	let name = name.to_lowercase();
+	existing
+		.into_iter()
+		.find(|existing| existing.to_lowercase() == name)
 }
 
 pub(crate) async fn copy_file(
@@ -1300,6 +1331,26 @@ mod tests {
 		assert!(!names_a_directory("/a/b"));
 		assert!(!names_a_directory("dir/."));
 		assert!(!names_a_directory(""));
+	}
+
+	#[test]
+	fn a_name_clashes_with_the_same_name() {
+		assert_eq!(
+			clashing_name(["other.txt", "a.txt"], "a.txt"),
+			Some("a.txt")
+		);
+	}
+
+	#[test]
+	fn a_name_clashes_with_a_name_differing_only_in_case() {
+		assert_eq!(clashing_name(["Notes", "b"], "notes"), Some("Notes"));
+		assert_eq!(clashing_name(["ÄRGER.md"], "ärger.md"), Some("ÄRGER.md"));
+	}
+
+	#[test]
+	fn a_name_does_not_clash_with_different_names() {
+		assert_eq!(clashing_name(["a.txt.bak", "b.txt"], "a.txt"), None);
+		assert_eq!(clashing_name([], "a.txt"), None);
 	}
 
 	#[test]
