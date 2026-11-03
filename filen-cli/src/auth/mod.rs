@@ -15,9 +15,15 @@
 //!
 //!   (on Linux/macOS, an auth config in a default location must not be accessible
 //!   to other users: restrict it with `chmod 600`)
-//! - if none of these is set, you will be prompted for credentials,
+//! - if none of these is set, credentials saved by the old Filen CLI are imported,
+//!   with the option to save them in the system keychain
+//!   (its `.filen-cli-auth-config` in the current working directory or its data directory,
+//!   and, with the default `--config-dir`, the login it kept; the old CLI's files are left as they are)
+//! - otherwise, you will be prompted for credentials,
 //!   with the option to save them securely in the system keychain
 //!   (a `--config-dir` other than the default keeps a login of its own there)
+
+mod old_cli;
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -39,7 +45,7 @@ use crate::{
 	CliConfig, ClientConfigArgs, build_client_config, default_config_dir, deserialize_auth_config,
 	serialize_auth_config,
 	ui::UI,
-	util::{KeyringChunkStore, LongKeyringEntry},
+	util::{ChunkStore as _, KeyringChunkStore, LongKeyringEntry},
 };
 
 /// A lazily authenticated client.
@@ -178,14 +184,21 @@ pub(crate) async fn authenticate_and_get_password(
 		match authenticate_from_keyring(config, ui, client_config_args).await {
 			Ok(Some(client)) => {
 				log::info!("Authenticated from keyring");
-				Ok(client)
+				return Ok(client);
 			}
-			Ok(None) => authenticate_from_prompt(config, ui, client_config_args).await,
-			Err(e) => {
-				log::warn!("Failed to authenticate from keyring: {:?}", e);
-				authenticate_from_prompt(config, ui, client_config_args).await
-			}
+			Ok(None) => {}
+			Err(e) => log::warn!("Failed to authenticate from keyring: {:?}", e),
 		}
+		if let Some((client, path)) =
+			authenticate_from_old_cli(config, ui, client_config_args).await?
+		{
+			log::info!(
+				"Authenticated from credentials of the old CLI at {}",
+				path.display()
+			);
+			return Ok(client);
+		}
+		authenticate_from_prompt(config, ui, client_config_args).await
 	}
 }
 
@@ -531,7 +544,7 @@ impl KeyringLocation {
 	/// The location of the credentials used with `config`'s config dir in this build.
 	fn of(config: &CliConfig) -> Self {
 		let is_dev = cfg!(debug_assertions);
-		let default_dir = default_config_dir(is_dev).map(|dir| canonical_or_given(&dir));
+		let default_dir = canonical_default_config_dir(is_dev);
 		Self::for_config_dir(
 			is_dev,
 			&canonical_or_given(&config.config_dir),
@@ -561,6 +574,16 @@ impl KeyringLocation {
 	fn store(&self) -> KeyringChunkStore {
 		KeyringChunkStore::new(self.service)
 	}
+}
+
+/// The config dir used without `--config-dir` in this build, resolved as [`canonical_or_given`].
+fn canonical_default_config_dir(is_dev: bool) -> Option<PathBuf> {
+	default_config_dir(is_dev).map(|dir| canonical_or_given(&dir))
+}
+
+/// Whether `config` uses the config dir used without `--config-dir`.
+fn is_default_config_dir(config: &CliConfig, is_dev: bool) -> bool {
+	canonical_default_config_dir(is_dev) == Some(canonical_or_given(&config.config_dir))
 }
 
 /// `path` with symlinks and relative components resolved, so that one directory always names one
@@ -706,32 +729,138 @@ async fn authenticate_from_prompt(
 		client_config_args,
 	)
 	.await?;
+	offer_to_keep_logged_in(config, ui, &client)?;
+	Ok(client)
+}
 
-	// optionally, save credentials
-	if ui.prompt_confirm("Keep me logged in?", true)? {
-		let sdk_config = serialize_auth_config(&client)?;
-		let location = KeyringLocation::of(config);
-		match LongKeyringEntry::new(&location.store(), &location.entry_name).write(&sdk_config) {
-			Ok(_) => {
-				ui.print_success("Saved credentials");
-			}
-			Err(_) => {
-				ui.print_failure("Failed to save credentials in keyring");
-				// a choice of where to keep the credentials, which --yes does not make
-				if ui.prompt_yes_no(
-					&format!(
-						"Instead, export an auth config to {}?",
-						config.config_dir.join(AUTH_CONFIG_FILENAME).display()
-					),
-					false,
-				)? {
-					export_auth_config(&client, &config.config_dir)
-						.context("Failed to export auth config")?;
-				}
+const KEEP_LOGGED_IN_PROMPT: &str = "Keep me logged in?";
+
+/// Offer to save the login of `client` in the keyring, or, if that fails, in an auth config file.
+fn offer_to_keep_logged_in(config: &CliConfig, ui: &mut UI, client: &Client) -> Result<()> {
+	if !ui.prompt_confirm(KEEP_LOGGED_IN_PROMPT, true)? {
+		return Ok(());
+	}
+	let sdk_config = serialize_auth_config(client)?;
+	let location = KeyringLocation::of(config);
+	match LongKeyringEntry::new(&location.store(), &location.entry_name).write(&sdk_config) {
+		Ok(_) => {
+			ui.print_success("Saved credentials");
+		}
+		Err(_) => {
+			ui.print_failure("Failed to save credentials in keyring");
+			// a choice of where to keep the credentials, which --yes does not make
+			if ui.prompt_yes_no(
+				&format!(
+					"Instead, export an auth config to {}?",
+					config.config_dir.join(AUTH_CONFIG_FILENAME).display()
+				),
+				false,
+			)? {
+				export_auth_config(client, &config.config_dir)
+					.context("Failed to export auth config")?;
 			}
 		}
 	}
+	Ok(())
+}
 
+/// Authenticate with credentials the old Filen CLI saved, the first of them that can be imported,
+/// offering to keep the login in the keyring. Its files are left as they are, for the old CLI.
+/// Its data directory, with the login it kept, is only looked at with the default config dir,
+/// since another config dir keeps a login of its own.
+async fn authenticate_from_old_cli(
+	config: &CliConfig,
+	ui: &mut UI,
+	client_config_args: &ClientConfigArgs,
+) -> Result<Option<(Client, PathBuf)>> {
+	if std::env::var("FILEN_CLI_TESTING_DISABLE_AUTODETECTED_AUTH_CONFIG") == Ok("1".to_string()) {
+		return Ok(None);
+	}
+	let is_dev = cfg!(debug_assertions);
+	let data_dir = is_default_config_dir(config, is_dev)
+		.then(|| {
+			let home_install_dir = dirs::home_dir()
+				.map(|home| home.join(".filen-cli"))
+				.filter(|dir| dir.exists());
+			old_cli::data_dir(
+				is_dev,
+				dirs::config_dir().as_deref(),
+				home_install_dir.as_deref(),
+			)
+		})
+		.flatten();
+	let working_dir = std::env::current_dir()
+		.inspect_err(|e| {
+			log::warn!(
+				"Failed to get current working directory, so not checking there for credentials of the old CLI: {:?}",
+				e
+			)
+		})
+		.ok();
+	let saved = old_cli::find(working_dir.as_deref(), data_dir.as_deref());
+	import_old_cli_login(config, ui, saved, client_config_args, |name| {
+		if keyring_disabled_for_testing() {
+			return Ok(None);
+		}
+		KeyringChunkStore::new(old_cli::KEYCHAIN_SERVICE).get(name)
+	})
+	.await
+}
+
+/// [`authenticate_from_old_cli`] with the `saved` logins, and `keychain` looking up a key the old
+/// CLI kept in the keychain.
+async fn import_old_cli_login(
+	config: &CliConfig,
+	ui: &mut UI,
+	saved: Vec<old_cli::SavedLogin>,
+	client_config_args: &ClientConfigArgs,
+	keychain: impl Fn(&str) -> Result<Option<String>>,
+) -> Result<Option<(Client, PathBuf)>> {
+	let key_name = old_cli::keychain_key_name(cfg!(debug_assertions));
+	for saved in saved {
+		match restore_old_cli_login(&saved, client_config_args, || keychain(key_name)).await {
+			Ok(client) => {
+				ui.print_muted_to_stderr(&format!(
+					"Logged in as {} with the credentials saved by the old Filen CLI at {}",
+					client.email(),
+					saved.path.display()
+				));
+				// without a terminal or --yes, the login is used once and imported again next time
+				if !keyring_disabled_for_testing()
+					&& ui.ensure_can_confirm(KEEP_LOGGED_IN_PROMPT).is_ok()
+				{
+					offer_to_keep_logged_in(config, ui, &client)?;
+				}
+				return Ok(Some((client, saved.path)));
+			}
+			Err(e) => {
+				log::warn!(
+					"Failed to import the credentials of the old CLI at {}: {:#}",
+					saved.path.display(),
+					e
+				);
+				ui.print_warning(&format!(
+					"Found credentials saved by the old Filen CLI at {} that could not be \
+					 imported; please log in again",
+					saved.path.display()
+				));
+			}
+		}
+	}
+	Ok(None)
+}
+
+/// The client of the login the old CLI saved in `saved`, once the server accepted it.
+async fn restore_old_cli_login(
+	saved: &old_cli::SavedLogin,
+	client_config_args: &ClientConfigArgs,
+	key: impl FnOnce() -> Result<Option<String>>,
+) -> Result<Client> {
+	let stringified = saved.read(key)?;
+	let client = UnauthClient::from_config(build_client_config(client_config_args))?
+		.from_stringified(stringified)
+		.context("Failed to create client from SDK config")?;
+	check_login_accepted(&client).await?;
 	Ok(client)
 }
 
@@ -1487,6 +1616,38 @@ mod tests {
 		)
 		.await
 		.unwrap();
+	}
+
+	#[tokio::test]
+	async fn credentials_of_the_old_cli_that_cannot_be_imported_are_skipped_with_a_hint() {
+		let (_dir, config) = config_in_temp_dir();
+		let working_dir = assert_fs::TempDir::new().unwrap();
+		let path = working_dir.path().join(".filen-cli-auth-config");
+		std::fs::write(&path, CORRUPT_AUTH_CONFIG).unwrap();
+		let out = Printed::default();
+		let err = Printed::default();
+
+		let found = import_old_cli_login(
+			&config,
+			&mut Printed::split_ui(&out, &err),
+			old_cli::find(Some(working_dir.path()), None),
+			&ClientConfigArgs::default(),
+			|_| panic!("an auth config needs no key"),
+		)
+		.await
+		.unwrap();
+
+		assert!(found.is_none());
+		assert_eq!(out.lines_or_empty(), "");
+		assert_eq!(
+			console::strip_ansi_codes(&err.lines()),
+			format!(
+				"⚠ Found credentials saved by the old Filen CLI at {} that could not be imported; \
+				 please log in again",
+				path.display()
+			)
+		);
+		assert!(path.exists());
 	}
 
 	#[test]

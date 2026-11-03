@@ -302,6 +302,31 @@ async fn an_autodetected_auth_config_with_a_revoked_api_key_falls_back_to_loggin
 		.stderr(predicates::str::contains("Not logged in"));
 }
 
+#[cfg(unix)]
+#[shared_test_runtime]
+async fn an_auth_config_of_the_old_cli_in_the_working_dir_is_imported_and_kept() {
+	let client = test_utils::RESOURCES.client().await;
+	let working_dir = assert_fs::TempDir::new().unwrap();
+	// as the CLI names it, from the working directory the OS resolved (/private/var on macOS)
+	let path = working_dir
+		.path()
+		.canonicalize()
+		.unwrap()
+		.join(".filen-cli-auth-config");
+	// as the old CLI exported it: its SDK config as base64 JSON
+	let contents = BASE64.encode(serde_json::to_string(&client.to_sdk_config()).unwrap());
+	std::fs::write(&path, &contents).unwrap();
+	std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+	stat_with_autodetected_auth_config(working_dir.path())
+		.success()
+		.stderr(predicates::str::contains(format!(
+			"Logged in as {} with the credentials saved by the old Filen CLI at {}",
+			client.email(),
+			path.display()
+		)));
+	assert_eq!(std::fs::read_to_string(&path).unwrap(), contents);
+}
+
 // notes:
 // keyring authentication is hard to test here, so ignore it for now
 
