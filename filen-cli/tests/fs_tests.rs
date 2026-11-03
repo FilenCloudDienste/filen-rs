@@ -1496,3 +1496,50 @@ async fn edit_of_a_file_changed_meanwhile_keeps_the_changes_locally() {
 	assert_eq!(kept[0].file_name().unwrap(), "a.txt");
 	assert_eq!(std::fs::read(&kept[0]).unwrap(), b"original\nmine\n");
 }
+
+/// Runs `search` with `args` in `test_dir`, with a config directory of its own, so that its
+/// cache starts empty and the search waits for a resync of the test directory.
+async fn search_in(test_dir: &str, args: &[&str]) -> assert_cmd::assert::Assert {
+	let config_dir = assert_fs::TempDir::new().unwrap();
+	let mut cli_args = vec![
+		"--config-dir",
+		config_dir.path().to_str().unwrap(),
+		"--working-path",
+		test_dir,
+		"search",
+	];
+	cli_args.extend_from_slice(args);
+	run_authenticated_cli_with_args(&mut cargo_bin_cmd!("filen-cli"), &cli_args).await
+}
+
+#[shared_test_runtime]
+async fn search_with_a_limit_below_the_matches_warns_how_many_it_shows() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = format!("/{}", resources.dir.name().unwrap());
+	test_utils::create_remote_file_structure_outline(
+		client,
+		resources.dir.clone(),
+		&["needle-a.txt", "sub/needle-b.txt", "other.txt"],
+	)
+	.await
+	.unwrap();
+
+	let assert = search_in(&test_dir, &["needle", "--limit", "1"])
+		.await
+		.success();
+
+	let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+	assert_eq!(stdout.lines().count(), 1, "stdout:\n{stdout}");
+	let stderr =
+		console::strip_ansi_codes(&String::from_utf8(assert.get_output().stderr.clone()).unwrap())
+			.into_owned();
+	assert!(
+		stderr.contains("Showing 1 of 2 results. Use --limit to show more"),
+		"stderr:\n{stderr}"
+	);
+	assert!(
+		!stderr.contains("did not finish syncing"),
+		"stderr:\n{stderr}"
+	);
+}

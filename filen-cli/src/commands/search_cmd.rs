@@ -1,4 +1,5 @@
 use std::{
+	num::NonZeroUsize,
 	sync::{Arc, Mutex},
 	time::Duration,
 };
@@ -13,12 +14,19 @@ use filen_sdk_rs::{
 	cache::{CacheMessage, ResyncProgress, SearchConfig, SearchSnapshot},
 	fs::HasUUID as _,
 };
+use filen_types::fs::Uuid;
 use serde_json::json;
+use tokio::{sync::mpsc::UnboundedReceiver, time::Instant};
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum SearchCommands {
 	/// Search for a file or directory interactively, or specify a query
-	Search { query: Option<String> },
+	Search {
+		query: Option<String>,
+		/// Print at most this many results
+		#[arg(long, default_value_t = DEFAULT_LIMIT, requires = "query")]
+		limit: NonZeroUsize,
+	},
 }
 
 /// The docs' "Accessing Files" section places `search` between browsing and organizing files.
@@ -33,18 +41,19 @@ impl SearchCommands {
 			..
 		} = ctx;
 		match self {
-			Self::Search { query: Some(query) } => {
-				search_cmd_non_interactive(ui, client, working_path, &query).await?;
+			Self::Search {
+				query: Some(query),
+				limit,
+			} => {
+				search_cmd_non_interactive(ui, client, working_path, &query, limit).await?;
 				Ok(CommandResult::default())
 			}
-			Self::Search { query: None } => Ok(search_cmd(ui, client, working_path)
+			Self::Search { query: None, .. } => Ok(search_cmd(ui, client, working_path)
 				.await?
 				.unwrap_or_default()),
 		}
 	}
 }
-
-// todo: allow non-interactive search
 
 pub(crate) async fn search_cmd(
 	ui: &mut UI,
@@ -210,12 +219,18 @@ impl inquire::Autocomplete for SearchAutocomplete {
 
 pub(crate) async fn search_cmd_non_interactive(
 	ui: &mut UI,
-	client: &mut LazyClient,
+	lazy_client: &mut LazyClient,
 	working_path: &RemotePath,
 	query: &str,
+	limit: NonZeroUsize,
 ) -> Result<()> {
-	let lazy_client = client;
-	let client = lazy_client.get(ui).await?;
+	// An owned handle, so that the cache's status channel can be borrowed from the lazy client
+	let client = Arc::clone(lazy_client.get(ui).await?);
+	let cache_status = lazy_client
+		.get_cache_callback_rx()
+		.ok_or(anyhow::anyhow!("Failed to get cache callback receiver"))?;
+	// What an earlier command left in the channel is about other resyncs.
+	while cache_status.try_recv().is_ok() {}
 
 	let working_dir_uuid = client
 		.find_item_at_path(&working_path.0)
@@ -224,80 +239,31 @@ pub(crate) async fn search_cmd_non_interactive(
 		.ok_or(anyhow::anyhow!("Working directory not found"))?
 		.uuid();
 	let search = client
-		.clone()
 		.create_search(working_dir_uuid, SearchConfig::new().with_name(query))
 		.await
 		.context("Failed to create search")?;
-	let results = Arc::new(Mutex::new(Vec::new()));
-	let results_ = results.clone();
-	let cache_callback_rx = lazy_client
-		.get_cache_callback_rx()
-		.ok_or(anyhow::anyhow!("Failed to get cache callback receiver"))?;
 
-	let (initial_snapshot, _search_window_handle) = search
-		.get_range(
-			0..100_000,
-			Box::new(move |snapshot| {
-				let mut results = match results_.lock() {
-					Ok(results) => results,
-					Err(e) => {
-						log::warn!("Failed to lock search results mutex: {}", e);
-						return;
-					}
-				};
-				if snapshot.total > 100_000 {
-					log::warn!(
-						"Search results truncated to 100,000 items, total results: {}",
-						snapshot.total
-					);
-				}
-				results.clear();
-				results.extend(snapshot.results.iter().map(|r| r.full_path()));
-			}),
-		)
+	let synced = wait_for_resync(
+		cache_status,
+		search.root_uuid(),
+		Instant::now() + RESYNC_TIMEOUT,
+	)
+	.await;
+	// Queried after the resync, so the snapshot holds everything it committed. The window
+	// stays open until the results are printed.
+	let (snapshot, _window) = search
+		.get_range(0..limit.get(), Box::new(|_| {}))
 		.await
 		.context("Failed to get search results")?;
-	// the initial snapshot is not delivered through the callback
-	results
-		.lock()
-		.map_err(|e| anyhow!("Failed to lock search results mutex: {}", e))?
-		.extend(initial_snapshot.results.iter().map(|r| r.full_path()));
 
-	let start_time = std::time::Instant::now();
-	loop {
-		match cache_callback_rx.try_recv() {
-			Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
-				tokio::time::sleep(Duration::from_millis(1)).await;
-				if start_time.elapsed() > Duration::from_secs(30) {
-					return Err(anyhow!(
-						"Cache resync did not finish within 30 seconds, search results may be incomplete"
-					));
-				}
-			}
-			Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-				return Err(anyhow::anyhow!("Cache callback channel disconnected"));
-			}
-			Ok(msg) => {
-				if let CacheMessage::ResyncProgress(progress) = msg
-					&& let ResyncProgress::Finished { converged } = progress
-				{
-					if !converged {
-						return Err(anyhow!(
-							"Cache resync did not converge, search results may be incomplete"
-						));
-					}
-					break;
-				}
-			}
-		}
-	}
-	tokio::time::sleep(Duration::from_millis(10)).await; // wait a bit for the last search results to arrive, not sure if global cache state callback or get_range callback is called first
-	let results = results
-		.lock()
-		.map_err(|e| anyhow!("Failed to lock search results mutex: {}", e))?;
+	let results = snapshot
+		.results
+		.iter()
+		.map(|hit| hit.full_path())
+		.collect::<Vec<_>>();
 	if ui.json {
 		ui.print_json(json!({
-			"results": results.clone(),
+			"results": results,
 		}))?;
 	} else {
 		ui.print_grid(
@@ -308,6 +274,223 @@ pub(crate) async fn search_cmd_non_interactive(
 				.as_slice(),
 		)
 	};
+	for warning in search_warnings(synced, results.len(), snapshot.total) {
+		ui.print_warning(&warning);
+	}
 
 	Ok(())
+}
+
+/// How long a search waits for the cache to sync the searched directory before it prints what
+/// the cache holds.
+const RESYNC_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How many results a search prints unless `--limit` says otherwise.
+const DEFAULT_LIMIT: NonZeroUsize = NonZeroUsize::new(100_000).expect("is not zero");
+
+/// Whether the cache finished syncing the searched directory before the search printed it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Resync {
+	Converged,
+	Unfinished,
+}
+
+/// Waits until the cache reports a resync of `root` that converged, or until `deadline`. A
+/// resync that did not converge (another device held the drive lock, say) is retried by the
+/// cache, so the wait goes on for the retry.
+///
+/// A root that is already an active sync root of the cache, or lies below one, is registered
+/// without a resync, so no progress arrives and the wait runs to `deadline`, then reports the
+/// results as possibly incomplete although they are not: the cache does not say that a
+/// registration needed no resync. A one-off search is the only registration in its process, but
+/// in the REPL one an earlier command left, if still active, has this effect. Ctrl-C cancels the
+/// wait, as it cancels every command ([`crate::interrupt::cancellable`]).
+async fn wait_for_resync(
+	cache_status: &mut UnboundedReceiver<CacheMessage>,
+	root: Uuid,
+	deadline: Instant,
+) -> Resync {
+	let mut syncing_root = false;
+	loop {
+		match tokio::time::timeout_at(deadline, cache_status.recv()).await {
+			Err(_elapsed) => return Resync::Unfinished,
+			Ok(None) => {
+				log::warn!("The cache's status channel closed during a search");
+				return Resync::Unfinished;
+			}
+			Ok(Some(CacheMessage::ResyncProgress(ResyncProgress::Started { roots }))) => {
+				syncing_root = roots.contains(&root);
+			}
+			Ok(Some(CacheMessage::ResyncProgress(ResyncProgress::Finished { converged }))) => {
+				if syncing_root && converged {
+					return Resync::Converged;
+				}
+				syncing_root = false;
+			}
+			// listing progress, errors (which the cache retries) and deleted roots
+			Ok(Some(message)) => log::debug!("Cache status during a search: {message:?}"),
+		}
+	}
+}
+
+/// What a search says on stderr about the results it printed: `shown` of `total` matches.
+fn search_warnings(resync: Resync, shown: usize, total: usize) -> Vec<String> {
+	let mut warnings = Vec::new();
+	if resync == Resync::Unfinished {
+		warnings.push(format!(
+			"The search index did not finish syncing within {} seconds, so results may be \
+			 incomplete",
+			RESYNC_TIMEOUT.as_secs()
+		));
+	}
+	if total > shown {
+		warnings.push(format!(
+			"Showing {shown} of {total} results. Use --limit to show more"
+		));
+	}
+	warnings
+}
+
+#[cfg(test)]
+mod tests {
+	use clap::Parser;
+	use tokio::sync::mpsc::unbounded_channel;
+
+	use super::*;
+
+	const ROOT: Uuid = Uuid::from_u128(1);
+	const OTHER_ROOT: Uuid = Uuid::from_u128(2);
+
+	fn started(roots: &[Uuid]) -> CacheMessage {
+		CacheMessage::ResyncProgress(ResyncProgress::Started {
+			roots: roots.to_vec(),
+		})
+	}
+
+	fn finished(converged: bool) -> CacheMessage {
+		CacheMessage::ResyncProgress(ResyncProgress::Finished { converged })
+	}
+
+	/// What [`wait_for_resync`] makes of `messages` with a deadline that has passed, so it
+	/// returns once it has read them all.
+	async fn resync_after(messages: Vec<CacheMessage>) -> Resync {
+		let (sender, mut receiver) = unbounded_channel();
+		for message in messages {
+			sender.send(message).unwrap();
+		}
+		wait_for_resync(&mut receiver, ROOT, Instant::now()).await
+	}
+
+	#[tokio::test]
+	async fn a_converged_resync_of_the_searched_directory_ends_the_wait() {
+		assert_eq!(
+			resync_after(vec![started(&[OTHER_ROOT, ROOT]), finished(true)]).await,
+			Resync::Converged
+		);
+	}
+
+	#[tokio::test]
+	async fn a_resync_of_other_directories_does_not_end_the_wait() {
+		assert_eq!(
+			resync_after(vec![started(&[OTHER_ROOT]), finished(true)]).await,
+			Resync::Unfinished
+		);
+	}
+
+	#[tokio::test]
+	async fn a_resync_that_did_not_converge_is_waited_out_for_its_retry() {
+		assert_eq!(
+			resync_after(vec![
+				started(&[ROOT]),
+				finished(false),
+				started(&[ROOT]),
+				finished(true)
+			])
+			.await,
+			Resync::Converged
+		);
+	}
+
+	#[tokio::test]
+	async fn a_resync_that_did_not_converge_leaves_the_results_unfinished() {
+		assert_eq!(
+			resync_after(vec![started(&[ROOT]), finished(false)]).await,
+			Resync::Unfinished
+		);
+	}
+
+	#[tokio::test]
+	async fn a_resync_finishing_without_its_start_is_not_the_searched_directorys() {
+		assert_eq!(resync_after(vec![finished(true)]).await, Resync::Unfinished);
+	}
+
+	#[tokio::test]
+	async fn a_closed_status_channel_leaves_the_results_unfinished() {
+		let (sender, mut receiver) = unbounded_channel();
+		drop(sender);
+		let far_away = Instant::now() + Duration::from_secs(3600);
+
+		assert_eq!(
+			wait_for_resync(&mut receiver, ROOT, far_away).await,
+			Resync::Unfinished
+		);
+	}
+
+	#[test]
+	fn all_results_of_a_converged_resync_need_no_warning() {
+		assert_eq!(
+			search_warnings(Resync::Converged, 3, 3),
+			Vec::<String>::new()
+		);
+	}
+
+	#[test]
+	fn more_results_than_the_limit_are_warned_about() {
+		assert_eq!(
+			search_warnings(Resync::Converged, 3, 4),
+			["Showing 3 of 4 results. Use --limit to show more"]
+		);
+	}
+
+	#[test]
+	fn an_unfinished_resync_is_warned_about() {
+		assert_eq!(
+			search_warnings(Resync::Unfinished, 1, 2),
+			[
+				"The search index did not finish syncing within 30 seconds, so results may be \
+				 incomplete",
+				"Showing 1 of 2 results. Use --limit to show more"
+			]
+		);
+	}
+
+	#[derive(Debug, Parser)]
+	struct Args {
+		#[command(subcommand)]
+		command: SearchCommands,
+	}
+
+	#[test]
+	fn the_limit_defaults_to_a_hundred_thousand_results() {
+		let Args {
+			command: SearchCommands::Search { limit, .. },
+		} = Args::try_parse_from(["filen", "search", "a"]).unwrap();
+
+		assert_eq!(limit.get(), 100_000);
+	}
+
+	#[test]
+	fn a_limit_of_zero_is_refused() {
+		assert!(Args::try_parse_from(["filen", "search", "a", "--limit", "0"]).is_err());
+	}
+
+	#[test]
+	fn a_limit_without_a_query_is_refused() {
+		assert_eq!(
+			Args::try_parse_from(["filen", "search", "--limit", "5"])
+				.unwrap_err()
+				.kind(),
+			clap::error::ErrorKind::MissingRequiredArgument
+		);
+	}
 }
