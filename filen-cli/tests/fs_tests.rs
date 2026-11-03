@@ -1014,3 +1014,25 @@ async fn head_and_tail_print_whole_lines_as_they_are() {
 	);
 	assert_eq!(printed_bytes(&["tail", "-n", "0", &path]).await, b"");
 }
+
+#[shared_test_runtime]
+async fn head_and_tail_of_a_file_of_several_chunks_print_lines_across_chunks() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = format!("/{}", resources.dir.name().unwrap());
+	// the long line spans the boundary of the first two chunks
+	let long_line = [vec![b'x'; CHUNK_SIZE + 10], b"\n".to_vec()].concat();
+	let content = [b"first\n".to_vec(), long_line.clone(), b"last\n".to_vec()].concat();
+	upload(client, &resources.dir, "a.txt", &content).await;
+	let path = format!("{test_dir}/a.txt");
+
+	assert_eq!(printed_bytes(&["head", "-n", "1", &path]).await, b"first\n");
+	assert!(
+		printed_bytes(&["head", "-n", "2", &path]).await
+			== [b"first\n".as_slice(), &long_line].concat()
+	);
+	assert!(
+		printed_bytes(&["tail", "-n", "2", &path]).await
+			== [long_line.as_slice(), b"last\n"].concat()
+	);
+}

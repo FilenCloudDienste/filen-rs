@@ -25,6 +25,7 @@ use console::{Term, style};
 use filen_sdk_rs::{
 	ErrorKind,
 	auth::Client,
+	consts::CHUNK_SIZE_U64,
 	fs::{
 		HasName as _, HasParent as _, HasRemoteInfo as _, HasUUID,
 		categories::{DirType, NonRootFileType, NonRootItemType, Normal, fs::CategoryFS},
@@ -34,12 +35,16 @@ use filen_sdk_rs::{
 			PlannedTopLevelItem, ScanProgress, SkipReason,
 		},
 		dir::meta::DirectoryMetaChanges,
-		file::{meta::FileMetaChanges, traits::HasFileInfo as _},
+		file::{
+			client_impl::FileReaderSharedClientExt as _, meta::FileMetaChanges, read::FileReader,
+			traits::HasFileInfo as _,
+		},
 		name::ValidatedName,
 	},
-	io::{RemoteDirectory, RemoteFile, client_impl::IoSharedClientExt},
+	io::{RemoteDirectory, RemoteFile},
 };
 use filen_types::{fs::Uuid, traits::CowHelpers as _};
+use futures::{AsyncBufReadExt as _, AsyncReadExt as _};
 use serde_json::json;
 use tokio::select;
 
@@ -638,7 +643,8 @@ fn confirm_printing_file(ui: &mut UI, size: u64) -> Result<bool> {
 }
 
 /// Prints a file's content, or its first or last lines, as the bytes it holds, with no newline
-/// added.
+/// added: streamed to stdout as they download, but for the last lines, which are printed once it
+/// is found where they start.
 pub(crate) async fn print_file(
 	ui: &mut UI,
 	client: &mut LazyClient,
@@ -662,22 +668,66 @@ pub(crate) async fn print_file(
 	if !confirm_printing_file(ui, file.size())? {
 		return Ok(());
 	}
-	let content = client.download_file(file.as_ref()).await?;
-	let printed = match lines {
-		PrintFileLines::Full => content.as_slice(),
-		PrintFileLines::Head(n) => HeadLines::new(n).cut(&content).0,
-		PrintFileLines::Tail(n) => {
-			let file_size =
-				u64::try_from(content.len()).expect("a usize fits in a u64 (should be impossible)");
-			let start = TailLines::new(n, file_size).scan(0, &content).unwrap_or(0);
-			let start = usize::try_from(start).expect(
-				"an offset into the content held in memory fits in a usize (should be impossible)",
-			);
-			content.get(start..).unwrap_or_default()
+	match lines {
+		PrintFileLines::Full => {
+			print_from_reader(ui, client.get_file_reader(&*file), None).await?;
 		}
-	};
-	ui.write_stdout_bytes(printed)?;
+		// nothing to download
+		PrintFileLines::Head(0) | PrintFileLines::Tail(0) => {}
+		PrintFileLines::Head(n) => {
+			let head = Some(HeadLines::new(n));
+			print_from_reader(ui, client.get_file_reader(&*file), head).await?;
+		}
+		PrintFileLines::Tail(n) => {
+			let remote_file: &RemoteFile = &file;
+			let read_block = move |start, end| async move {
+				let mut block = Vec::new();
+				client
+					.get_file_reader_for_range(remote_file, start, end)
+					.read_to_end(&mut block)
+					.await
+					.context("Failed to download file")?;
+				Ok(block)
+			};
+			match last_lines(file.size(), n, CHUNK_SIZE_U64, TAIL_HELD_MAX, read_block).await? {
+				LastLines::Read(blocks) => {
+					for block in blocks {
+						ui.write_stdout_bytes(&block)?;
+					}
+				}
+				LastLines::From(start) => {
+					let reader = client.get_file_reader_for_range(&*file, start, file.size());
+					print_from_reader(ui, reader, None).await?;
+				}
+			}
+		}
+	}
 	Ok(())
+}
+
+/// Prints what `reader` reads, up to the end of the lines `head` takes if it is given. The reader
+/// is dropped once those are printed, which stops the rest of the file from downloading.
+async fn print_from_reader(
+	ui: &mut UI,
+	mut reader: FileReader<'_>,
+	mut head: Option<HeadLines>,
+) -> Result<()> {
+	loop {
+		let chunk = reader.fill_buf().await.context("Failed to download file")?;
+		if chunk.is_empty() {
+			return Ok(());
+		}
+		let read = chunk.len();
+		let (printed, done) = match &mut head {
+			Some(head) => head.cut(chunk),
+			None => (chunk, false),
+		};
+		ui.write_stdout_bytes(printed)?;
+		if done {
+			return Ok(());
+		}
+		reader.consume_unpin(read);
+	}
 }
 
 /// Cuts the first lines out of a file read front to back, a chunk at a time. A line ends after
@@ -751,6 +801,79 @@ impl TailLines {
 			line_start -= 1;
 		}
 		None
+	}
+}
+
+/// How many bytes of a file's last lines `tail` keeps from finding where they start, to print
+/// them without downloading them again.
+const TAIL_HELD_MAX: u64 = 16 * CHUNK_SIZE_U64;
+
+/// The last lines of a file, as [`last_lines`] finds them.
+#[derive(Debug, PartialEq, Eq)]
+enum LastLines {
+	/// The bytes they hold, in blocks from front to back, as read while finding where they start.
+	Read(Vec<Vec<u8>>),
+	/// The offset they start at, to download them from: they hold more bytes than were kept.
+	From(u64),
+}
+
+/// The last `lines` lines of a file of `file_size` bytes. Reads the file back to front in blocks
+/// of `block_size` bytes aligned to its start (`read_block(start, end)` reads one), so that only
+/// the blocks holding those lines are read, and each of them once: the blocks are kept to print,
+/// up to `held_max` bytes of the lines.
+async fn last_lines<F, Fut>(
+	file_size: u64,
+	lines: usize,
+	block_size: u64,
+	held_max: u64,
+	mut read_block: F,
+) -> Result<LastLines>
+where
+	F: FnMut(u64, u64) -> Fut,
+	Fut: Future<Output = Result<Vec<u8>>>,
+{
+	let mut tail = TailLines::new(lines, file_size);
+	// the blocks read, back to front, until they hold more than `held_max` bytes
+	let mut held = Some(Vec::new());
+	let mut held_len = 0_u64;
+	let mut end = file_size;
+	while end > 0 {
+		let start = (end - 1) / block_size * block_size;
+		let mut block = read_block(start, end).await?;
+		let line_start = tail.scan(start, &block);
+		if let Some(line_start) = line_start {
+			// the lines start inside this block, after the `\n` that ends the line before them
+			let before = usize::try_from(line_start.saturating_sub(start)).expect(
+				"an offset into a block held in memory fits in a usize (should be impossible)",
+			);
+			block.drain(..before.min(block.len()));
+		}
+		held_len = held_len.saturating_add(
+			u64::try_from(block.len()).expect("a usize fits in a u64 (should be impossible)"),
+		);
+		if held_len > held_max {
+			held = None;
+		} else if let Some(held) = &mut held
+			&& !block.is_empty()
+		{
+			held.push(block);
+		}
+		if let Some(line_start) = line_start {
+			return Ok(last_lines_from(held, line_start));
+		}
+		end = start;
+	}
+	Ok(last_lines_from(held, 0))
+}
+
+/// The last lines starting at `start`, from the blocks `held` back to front if they were kept.
+fn last_lines_from(held: Option<Vec<Vec<u8>>>, start: u64) -> LastLines {
+	match held {
+		Some(mut blocks) => {
+			blocks.reverse();
+			LastLines::Read(blocks)
+		}
+		None => LastLines::From(start),
 	}
 }
 
@@ -2264,23 +2387,39 @@ mod tests {
 		(printed, chunks.len())
 	}
 
-	/// What `tail -n lines` prints of `file`, scanned back to front in blocks of `block_size`
-	/// bytes aligned to its start, as the chunks of a file are, and how many blocks it scanned.
-	fn tail_of(file: &[u8], block_size: usize, lines: usize) -> (Vec<u8>, usize) {
-		let mut tail = TailLines::new(lines, file.len() as u64);
-		let mut end = file.len();
-		let mut scanned = 0;
-		let mut start_of_lines = 0;
-		while end > 0 {
-			let start = (end - 1) / block_size * block_size;
-			scanned += 1;
-			if let Some(line_start) = tail.scan(start as u64, &file[start..end]) {
-				start_of_lines = usize::try_from(line_start).unwrap();
-				break;
-			}
-			end = start;
-		}
-		(file[start_of_lines..].to_vec(), scanned)
+	/// What [`last_lines`] finds of `file` with `held_max`, read back to front in blocks of
+	/// `block_size` bytes, and which blocks (by their start) it read.
+	fn last_lines_of(
+		file: &[u8],
+		block_size: u64,
+		held_max: u64,
+		lines: usize,
+	) -> (LastLines, Vec<u64>) {
+		let reads = std::cell::RefCell::new(Vec::new());
+		let found = futures::executor::block_on(last_lines(
+			file.len() as u64,
+			lines,
+			block_size,
+			held_max,
+			|start, end| {
+				reads.borrow_mut().push(start);
+				let block =
+					file[usize::try_from(start).unwrap()..usize::try_from(end).unwrap()].to_vec();
+				async move { Ok(block) }
+			},
+		))
+		.unwrap();
+		(found, reads.into_inner())
+	}
+
+	/// What `tail -n lines` prints of `file`, read back to front in blocks of `block_size` bytes
+	/// aligned to its start, as the chunks of a file are, and how many blocks it read.
+	fn tail_of(file: &[u8], block_size: u64, lines: usize) -> (Vec<u8>, usize) {
+		let (found, reads) = last_lines_of(file, block_size, u64::MAX, lines);
+		let LastLines::Read(blocks) = found else {
+			panic!("kept no blocks: {found:?}");
+		};
+		(blocks.concat(), reads.len())
 	}
 
 	#[test]
@@ -2371,6 +2510,28 @@ mod tests {
 	#[test]
 	fn tail_of_a_last_line_longer_than_a_block_scans_back_to_its_start() {
 		assert_eq!(tail_of(b"a\nbbbbbbbbb", 4, 1), (b"bbbbbbbbb".to_vec(), 3));
+	}
+
+	#[test]
+	fn tail_reads_each_block_once() {
+		let (_, reads) = last_lines_of(b"zzzzaaa\nbbbbb\nccc\n", 4, u64::MAX, 2);
+		assert_eq!(reads, vec![16, 12, 8, 4]);
+	}
+
+	#[test]
+	fn tail_keeps_lines_that_fill_exactly_the_bytes_it_may_hold() {
+		assert_eq!(
+			last_lines_of(b"zzzzaaa\nbbbbb\nccc\n", 4, 10, 2).0,
+			LastLines::Read(vec![b"bbbb".to_vec(), b"b\ncc".to_vec(), b"c\n".to_vec()]),
+		);
+	}
+
+	#[test]
+	fn tail_of_lines_holding_more_bytes_than_it_may_hold_gives_where_they_start() {
+		assert_eq!(
+			last_lines_of(b"zzzzaaa\nbbbbb\nccc\n", 4, 9, 2).0,
+			LastLines::From(8),
+		);
 	}
 
 	#[test]
