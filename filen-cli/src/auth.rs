@@ -192,7 +192,7 @@ async fn login_and_optionally_prompt_two_factor_code(
 ) -> Result<Client> {
 	let unauth_client = UnauthClient::from_config(build_client_config(client_config_args))?;
 
-	match unauth_client
+	let e = match unauth_client
 		.login(
 			email.to_owned(),
 			password,
@@ -200,24 +200,60 @@ async fn login_and_optionally_prompt_two_factor_code(
 		)
 		.await
 	{
-		Ok(client) => Ok(client),
-		Err(e) if e.kind() == ErrorKind::Enter2fa => {
-			let two_factor_code = ui.prompt_password("Two-factor authentication code: ")?;
-			match unauth_client
-				.login(email.to_owned(), password, two_factor_code.trim())
-				.await
-			{
-				Ok(client) => Ok(client),
-				Err(e) if e.kind() == ErrorKind::Wrong2fa => {
-					Err(UI::failure("Two-factor authentication code wrong"))
-				}
-				Err(e) => Err(anyhow!(e)).context("Failed to log in (with 2fa)"),
-			}
-		}
-		Err(e) if e.kind() == ErrorKind::EmailOrPasswordWrong => {
-			Err(UI::failure("Email or password wrong"))
-		}
-		Err(e) => Err(anyhow!(e)).context("Failed to log in"),
+		Ok(client) => return Ok(client),
+		Err(e) => e,
+	};
+	let can_prompt = ui.ensure_can_prompt(TWO_FACTOR_CODE_PROMPT).is_ok();
+	match two_factor_prompt_after(e.kind(), can_prompt) {
+		Some(TwoFactorPrompt::Required) => {}
+		Some(TwoFactorPrompt::WrongCode) => ui.print_warning(WRONG_TWO_FACTOR_CODE),
+		None => return Err(login_failure(e, "Failed to log in")),
+	}
+	let two_factor_code = ui.prompt_password(TWO_FACTOR_CODE_PROMPT)?;
+	unauth_client
+		.login(email.to_owned(), password, two_factor_code.trim())
+		.await
+		.map_err(|e| login_failure(e, "Failed to log in (with 2fa)"))
+}
+
+const TWO_FACTOR_CODE_PROMPT: &str = "Two-factor authentication code: ";
+const WRONG_TWO_FACTOR_CODE: &str = "Two-factor authentication code wrong";
+
+/// Why the user is asked for a two-factor code.
+#[derive(Debug, PartialEq, Eq)]
+enum TwoFactorPrompt {
+	/// The account needs one, and none was given.
+	Required,
+	/// The one given with the flag or in the environment was wrong.
+	WrongCode,
+}
+
+/// Whether to ask for a two-factor code after the first login attempt failed with `kind`. A wrong
+/// code given up front is asked for again only if a prompt `can_prompt`: a script fails instead.
+fn two_factor_prompt_after(kind: ErrorKind, can_prompt: bool) -> Option<TwoFactorPrompt> {
+	match kind {
+		ErrorKind::Enter2fa => Some(TwoFactorPrompt::Required),
+		ErrorKind::Wrong2fa if can_prompt => Some(TwoFactorPrompt::WrongCode),
+		_ => None,
+	}
+}
+
+/// The error for a login that failed with `e`: the failure the user can fix by giving other
+/// credentials, or `e` with `context` if it is unexpected.
+fn login_failure(e: filen_sdk_rs::Error, context: &'static str) -> anyhow::Error {
+	match login_failure_message(e.kind()) {
+		Some(message) => UI::failure(message),
+		None => anyhow!(e).context(context),
+	}
+}
+
+/// The message for a login that failed with `kind` because of the credentials given, or `None` if
+/// it failed for another reason.
+fn login_failure_message(kind: ErrorKind) -> Option<&'static str> {
+	match kind {
+		ErrorKind::Enter2fa | ErrorKind::Wrong2fa => Some(WRONG_TWO_FACTOR_CODE),
+		ErrorKind::EmailOrPasswordWrong => Some("Email or password wrong"),
+		_ => None,
 	}
 }
 
@@ -978,6 +1014,51 @@ mod tests {
 				entry_name: "sdk-config".to_owned(),
 			}
 		);
+	}
+
+	#[test]
+	fn a_missing_two_factor_code_is_asked_for() {
+		for can_prompt in [true, false] {
+			assert_eq!(
+				two_factor_prompt_after(ErrorKind::Enter2fa, can_prompt),
+				Some(TwoFactorPrompt::Required)
+			);
+		}
+	}
+
+	#[test]
+	fn a_wrong_two_factor_code_is_asked_for_again_at_a_terminal() {
+		assert_eq!(
+			two_factor_prompt_after(ErrorKind::Wrong2fa, true),
+			Some(TwoFactorPrompt::WrongCode)
+		);
+	}
+
+	#[test]
+	fn a_wrong_two_factor_code_without_a_terminal_fails_saying_it_was_wrong() {
+		assert_eq!(two_factor_prompt_after(ErrorKind::Wrong2fa, false), None);
+		assert_eq!(
+			login_failure_message(ErrorKind::Wrong2fa),
+			Some("Two-factor authentication code wrong")
+		);
+	}
+
+	#[test]
+	fn a_wrong_password_is_not_asked_for_a_two_factor_code() {
+		assert_eq!(
+			two_factor_prompt_after(ErrorKind::EmailOrPasswordWrong, true),
+			None
+		);
+		assert_eq!(
+			login_failure_message(ErrorKind::EmailOrPasswordWrong),
+			Some("Email or password wrong")
+		);
+	}
+
+	#[test]
+	fn an_unexpected_login_error_keeps_its_cause() {
+		assert_eq!(two_factor_prompt_after(ErrorKind::Server, true), None);
+		assert_eq!(login_failure_message(ErrorKind::Server), None);
 	}
 
 	#[test]
