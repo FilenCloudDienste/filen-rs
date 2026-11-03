@@ -8,8 +8,8 @@
 //!
 //! The read hands its rows over in no order (see `SnapshotSink`), so no path can be known while it
 //! runs. Each row is copied as it comes into `remote_raw` — uuid, parent, whether it is a directory,
-//! the NFC name, and a file's lineage, hash, size and stamp — inside the cache's one read
-//! transaction, which ends when the copy does.
+//! the NFC name and, where the remote spells it otherwise, that spelling, and a file's lineage,
+//! hash, size and stamp — inside the cache's one read transaction, which ends when the copy does.
 //!
 //! Placing walks `remote_raw` down from the root, a directory's children a page at a time off an
 //! index on the parent built once the copy is done, and writes each item it places into `remote`
@@ -24,8 +24,8 @@
 //!
 //! # What the walk places, and what it leaves
 //!
-//! The walk places exactly what `ViewBuilder` places, at exactly its paths: an item with a safe name
-//! whose parent's chain to the root is a chain of placeable directories at most
+//! The walk places exactly what `ViewBuilder` places, at exactly its paths: an item with a placeable
+//! name whose parent's chain to the root is a chain of placeable directories at most
 //! `MAX_REMOTE_DEPTH` deep, none of them undecodable. It descends into every such directory, the
 //! engine's own quarantine directory and a path the cache lists twice included, since the items
 //! under those resolve all the same, and places each item as the builder does: nothing in the
@@ -58,8 +58,8 @@ use super::{
 	super::{
 		baseline::NodeKind,
 		plan::{
-			MAX_REMOTE_DEPTH, RemoteNode, RemoteView, SkippedRemote, ViewBuilder, is_reserved_path,
-			is_safe_name, join_path,
+			MAX_REMOTE_DEPTH, RemoteNode, RemoteView, SkippedRemote, ViewBuilder,
+			is_placeable_name, is_reserved_path, join_path,
 		},
 		scan::PairRoot,
 		side::Side,
@@ -79,7 +79,8 @@ CREATE TABLE remote_raw (
 	lineage BLOB,
 	hash BLOB,
 	size INTEGER NOT NULL,
-	modified INTEGER NOT NULL
+	modified INTEGER NOT NULL,
+	spelling TEXT
 );
 CREATE TABLE remote (
 	path TEXT NOT NULL UNIQUE,
@@ -94,16 +95,16 @@ CREATE INDEX remote_dirs ON remote (path) WHERE kind = 1;
 ";
 
 const RAW_INSERT: &str =
-	"INSERT INTO remote_raw (uuid, parent, dir, name, lineage, hash, size, modified)
-	 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)";
+	"INSERT INTO remote_raw (uuid, parent, dir, name, lineage, hash, size, modified, spelling)
+	 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)";
 /// Built once the copy is done: a directory's children are read off it, by rowid within a parent.
 const RAW_BY_PARENT: &str = "CREATE INDEX remote_raw_parent ON remote_raw (parent)";
 /// Up to `?3` children of the directory `?1` after the rowid `?2`, in rowid order.
-const CHILDREN: &str = "SELECT rowid, uuid, parent, dir, name, lineage, hash, size, modified
-	 FROM remote_raw WHERE parent = ?1 AND rowid > ?2 ORDER BY rowid LIMIT ?3";
+const CHILDREN: &str = "SELECT rowid, uuid, parent, dir, name, lineage, hash, size, modified,
+	 spelling FROM remote_raw WHERE parent = ?1 AND rowid > ?2 ORDER BY rowid LIMIT ?3";
 /// Every row, for the rows the walk did not place.
-const EVERY_RAW: &str = "SELECT rowid, uuid, parent, dir, name, lineage, hash, size, modified
-	 FROM remote_raw ORDER BY rowid";
+const EVERY_RAW: &str = "SELECT rowid, uuid, parent, dir, name, lineage, hash, size, modified,
+	 spelling FROM remote_raw ORDER BY rowid";
 /// Built only where something is left to replay: its chains are climbed by uuid.
 const RAW_BY_UUID: &str = "CREATE INDEX remote_raw_uuid ON remote_raw (uuid)";
 const RAW_DIR: &str = "SELECT name, parent FROM remote_raw WHERE uuid = ?1 AND dir = 1";
@@ -238,6 +239,9 @@ fn write_node(
 struct Raw {
 	rowid: i64,
 	dir: bool,
+	/// The item's NFC name is `item.name`; this is the name as the remote spells it, where that is
+	/// not NFC already.
+	spelling: Option<String>,
 	item: RemoteItem,
 }
 
@@ -245,6 +249,7 @@ fn raw_of(row: &Row<'_>) -> rusqlite::Result<Raw> {
 	Ok(Raw {
 		rowid: row.get(0)?,
 		dir: row.get(3)?,
+		spelling: row.get(9)?,
 		item: RemoteItem {
 			uuid: row.get(1)?,
 			parent: row.get(2)?,
@@ -324,6 +329,8 @@ impl RemoteSink {
 			reached: 0,
 			placed: 0,
 			held: BTreeSet::new(),
+			spellings: HashMap::new(),
+			twins: BTreeSet::new(),
 			pair_root,
 		};
 		walk.run(root)?;
@@ -333,6 +340,7 @@ impl RemoteSink {
 			reached,
 			placed,
 			held,
+			twins,
 			..
 		} = walk;
 		let stage = batch.finish()?;
@@ -345,7 +353,7 @@ impl RemoteSink {
 		stage.conn.execute_batch(PLACED)?;
 		Ok(RemoteView {
 			nodes: Side::Staged(StagedSide::new(stage, placed, REMOTE, paging)),
-			collisions: BTreeSet::new(),
+			collisions: twins,
 			held_paths: held,
 			skipped,
 			ignored: BTreeMap::new(),
@@ -366,17 +374,22 @@ impl SnapshotSink for RemoteSink {
 		// What the view keeps of a directory decided here, once, as `ViewBuilder` decides it: no
 		// lineage, hash or size, whatever a directory's row is merely expected to leave empty.
 		let file = !is_dir;
+		let name = item.name.nfc().collect::<String>();
+		// The remote's own spelling, kept only where it is not the NFC name: it is what tells two
+		// spellings of one name apart from a cache mid-transition (see `Walk::place`).
+		let spelling = (name != item.name).then_some(&item.name);
 		let copied = self.batch.row(|conn| {
 			conn.prepare_cached(RAW_INSERT)?
 				.execute(params![
 					item.uuid,
 					item.parent,
 					is_dir,
-					item.name.nfc().collect::<String>(),
+					name,
 					item.stable_uuid.filter(|_| file),
 					hash_bytes(item.hash.as_ref().filter(|_| file)),
 					if file { item.size } else { 0 },
 					item.modified_millis,
+					spelling,
 				])
 				.map(drop)
 		});
@@ -401,6 +414,11 @@ struct Walk<'u> {
 	placed: usize,
 	/// The paths two items resolved to, which neither is placed at.
 	held: BTreeSet<String>,
+	/// The remote spelling of the first item placed at each path whose name is not NFC, by path, as
+	/// `ViewBuilder` keeps it.
+	spellings: HashMap<String, String>,
+	/// Held paths two differently spelled names resolved to, as `ViewBuilder` records them.
+	twins: BTreeSet<String>,
 	/// Whether the walk is under the drive root, whose account data directory it never places (see
 	/// `plan::is_reserved_path`).
 	pair_root: PairRoot,
@@ -416,9 +434,9 @@ impl Walk<'_> {
 				open.pop();
 				continue;
 			};
-			// Left unmarked, for the replay to record: an unsafe name is never placed, and nothing
-			// under it is.
-			if !is_safe_name(&child.item.name) {
+			// Left unmarked, for the replay to record: an unplaceable name is never placed, and
+			// nothing under it is.
+			if !is_placeable_name(&child.item.name) {
 				continue;
 			}
 			let path = join_path(&dir.path, &child.item.name);
@@ -428,7 +446,7 @@ impl Walk<'_> {
 			if self.visited.set(child.rowid) {
 				self.reached += 1;
 			}
-			let path = self.place(path, child.dir, &child.item)?;
+			let path = self.place(path, child.dir, &child.item, child.spelling)?;
 			// A chain through this directory resolves for what is under it while it is at most the
 			// deepest a chain may run; past that, its children are left to the replay. Never into the
 			// root's own row (see the module docs): with that, and the cache's uuids unique, no
@@ -444,10 +462,21 @@ impl Walk<'_> {
 		Ok(())
 	}
 
-	/// Place `item` at `path` as `ViewBuilder::insert` does, handing the path back.
-	fn place(&mut self, path: String, dir: bool, item: &RemoteItem) -> rusqlite::Result<String> {
+	/// Place `item` at `path` as `ViewBuilder::insert` does, handing the path back. `spelling` is
+	/// the item's name as the remote spells it, where that is not its NFC `item.name`.
+	fn place(
+		&mut self,
+		path: String,
+		dir: bool,
+		item: &RemoteItem,
+		spelling: Option<String>,
+	) -> rusqlite::Result<String> {
 		// The engine's reserved paths come before every rule, and a path held back stays held.
-		if is_reserved_path(&path, self.pair_root) || self.held.contains(&path) {
+		if is_reserved_path(&path, self.pair_root) {
+			return Ok(path);
+		}
+		if self.held.contains(&path) {
+			self.note_spelling(&path, spelling);
 			return Ok(path);
 		}
 		let node = RemoteNode {
@@ -474,16 +503,32 @@ impl Walk<'_> {
 		})?;
 		if placed {
 			self.placed += 1;
+			if let Some(spelling) = spelling {
+				self.spellings.insert(node.rel_path.clone(), spelling);
+			}
 		} else {
-			// Byte-identical names under one parent: the cache mid-transition, as the builder says.
+			// Two items at one path: the cache mid-transition, or two spellings of one name, as the
+			// builder tells them apart.
 			tracing::debug!(
-				"remote view: holding {:?} — the cache is mid-transition, listing two items under that exact name",
+				"remote view: holding {:?} — the cache is listing two items under that name",
 				node.rel_path
 			);
 			self.placed -= 1;
 			self.held.insert(node.rel_path.clone());
+			self.note_spelling(&node.rel_path, spelling);
 		}
 		Ok(node.rel_path)
+	}
+
+	/// `ViewBuilder::note_spelling`: an item spelled `spelling` (`None`: its NFC name) arrived at
+	/// the held `path`, which is a collision where it is spelled unlike the first item placed there.
+	fn note_spelling(&mut self, path: &str, spelling: Option<String>) {
+		if self.spellings.get(path) != spelling.as_ref() && !self.twins.contains(path) {
+			tracing::debug!(
+				"remote view: {path:?} is two items, whose names differ in Unicode form only"
+			);
+			self.twins.insert(path.to_owned());
+		}
 	}
 }
 

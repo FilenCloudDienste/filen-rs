@@ -7,7 +7,9 @@
 //! fast path misses at its own path may take the hash of the row it left (see [`scan_subtree`]).
 //!
 //! Paths are NFC-normalized (macOS hands back NFD) and `/`-joined so they key 1:1 against the
-//! NFC-normalized remote snapshot and the baseline. Two entries whose keys fold together (see
+//! NFC-normalized remote snapshot and the baseline. A key is a name's identity, not its spelling:
+//! the engine reaches the entry a key names through `names::on_disk`, which finds the spelling the
+//! file system holds it by. Two entries whose keys fold together (see
 //! [`collision_key`]) are a collision: the first takes the name, the other is left out of the
 //! nodes, and both are recorded in [`LocalScan::collisions`], which the engine leaves alone on both
 //! sides rather than map one of them onto the other. The scan reports whether it completed: a
@@ -68,6 +70,7 @@ use super::{
 		FILENIGNORE, IgnoreDecision, IgnoreParseError, IgnoreRules, IgnoreSource,
 		MAX_RULE_FILE_BYTES, Origin, rule_file_dir, rule_file_text,
 	},
+	names::{self, Leaf},
 	plan::RemoteView,
 	rows::{Baseline, Cursor},
 	side::{NodesAt, Side},
@@ -1420,7 +1423,7 @@ fn scan_local_watched<S: ScanSink>(
 	let start_path = if start.is_empty() {
 		root.to_path_buf()
 	} else {
-		root.join(start)
+		names::on_disk(root, start, Leaf::Existing)
 	};
 	let start_depth = if start.is_empty() {
 		0
@@ -1836,7 +1839,7 @@ pub(crate) fn scan_subtree(
 	moved_hash: &mut dyn FnMut(&str, u64, i64) -> Option<Blake3Hash>,
 	stop: &dyn Fn(usize) -> bool,
 ) -> Option<(LocalScan, IgnoreRules)> {
-	let start_path = root.path.join(start);
+	let start_path = names::on_disk(root.path, start, Leaf::Existing);
 	let mut listed = 0usize;
 	let mut cut = false;
 	let Ok(walked) = scan_local_watched(

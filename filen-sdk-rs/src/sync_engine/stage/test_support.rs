@@ -1,6 +1,9 @@
 //! What the tests stage a pass's sides with, and the oracle a staged remote view is held to.
 
-use std::{collections::BTreeMap, num::NonZeroUsize};
+use std::{
+	collections::{BTreeMap, BTreeSet},
+	num::NonZeroUsize,
+};
 
 use uuid::Uuid;
 
@@ -119,7 +122,14 @@ pub(in super::super) fn assert_views_alike(at: &str, resident: &RemoteView, stag
 		staged_nodes.len(),
 		"{at}: the staged view counts what it holds"
 	);
-	if !resident.has_collisions() {
+	// A view as placed has not resolved its case twins yet, so both sides hold the same nodes; its
+	// collisions are the Unicode-form twins placing held, if any.
+	let unresolved = resident_nodes
+		.keys()
+		.map(|path| collision_key(path))
+		.collect::<BTreeSet<_>>()
+		.len() < resident_nodes.len();
+	if !resident.has_collisions() || unresolved {
 		assert_eq!(staged_nodes, resident_nodes, "{at}: nodes");
 		return;
 	}

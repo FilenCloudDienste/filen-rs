@@ -31,6 +31,7 @@ use filen_types::{
 };
 use futures::{StreamExt, future::join_all, stream::FuturesUnordered};
 use reqwest::StatusCode;
+use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
 
 use super::{
@@ -44,6 +45,7 @@ use super::{
 	events::{SyncEvent, TransferDirection},
 	guard::GuardReason,
 	ignore::IgnoredPath,
+	names::{self, Leaf},
 	outcome::{
 		HaltReason, PlannedAction, PlannedConflict, PlannedNodeKind, RefuseReason, UnsyncablePath,
 	},
@@ -67,7 +69,7 @@ use crate::{
 	cache::{SearchResult, hydrate_cached_items_at},
 	connect::ParentTargets,
 	fs::{
-		HasUUID,
+		HasName, HasUUID,
 		bulk::create_dirs::{CreatedDir, NewDir, NewDirParent},
 		categories::{DirType, Normal},
 		dir::meta::DirectoryMetaChanges,
@@ -589,6 +591,52 @@ impl PassStart {
 	}
 }
 
+/// The remote file an upload to `rel_path` versions, when its name might be spelled otherwise on
+/// the remote: the server dedups an upload onto the file it replaces by a hash of the lowercased
+/// name, which does not normalize, so an upload under the NFC key beside a file another client
+/// named in NFD would make a second file instead of a version (see [`respell_remote`]). Only a
+/// non-ASCII name can be spelled two ways, so an ASCII one wants nothing read.
+fn respelling_candidate(rel_path: &str, remote: Option<&RemoteNode>) -> Option<Uuid> {
+	remote
+		.filter(|node| node.kind == NodeKind::File && !parent_and_name(rel_path).1.is_ascii())
+		.map(|node| node.remote_uuid)
+}
+
+/// Rename `existing`, the remote file an upload to `rel_path` is about to version, to the key's own
+/// spelling when the remote spells it in another Unicode form, so the upload's name hash matches it
+/// and the server versions it rather than making a second file beside it (see
+/// [`respelling_candidate`]). The name reads the same either way; only its bytes change, and one
+/// request is spent only where they differ. A file no longer at that name is left as it is.
+async fn respell_remote(
+	ctx: &ApplyContext<'_>,
+	rel_path: &str,
+	mut existing: RemoteFile,
+) -> Result<(), crate::Error> {
+	let name = parent_and_name(rel_path).1;
+	if !existing
+		.name()
+		.is_some_and(|spelled| hashes_apart(spelled, name))
+	{
+		return Ok(());
+	}
+	tracing::debug!(
+		"apply: renaming the remote file at {rel_path:?} to the NFC spelling of its name, so the upload versions it"
+	);
+	let changes = FileMetaChanges::default()
+		.name(name)
+		.map_err(crate::Error::from)?;
+	ctx.client
+		.update_file_metadata(&mut existing, changes)
+		.await
+}
+
+/// Whether the remote name `spelled` is the NFC `name` in another Unicode form that the server's
+/// name hash tells apart from it: the hash lowercases, so a difference in case alone is the same
+/// name to it.
+fn hashes_apart(spelled: &str, name: &str) -> bool {
+	spelled.nfc().eq(name.chars()) && spelled.to_lowercase() != name.to_lowercase()
+}
+
 /// The uuid of `node`, when it is a directory.
 fn dir_uuid(node: Option<&RemoteNode>) -> Option<Uuid> {
 	node.filter(|node| node.kind == NodeKind::Dir)
@@ -601,10 +649,18 @@ fn unpaired() -> crate::Error {
 	internal("an entry's pass-start inputs are not its action's (should be impossible)")
 }
 
+/// Where the local entry the key `rel_path` names sits under `root`: under the spelling the file
+/// system holds it by, which on Linux and Windows need not be the NFC key (see [`names::on_disk`]).
+/// For an entry that exists; a write target is [`local_target`]'s.
 pub(super) fn local_path(root: &Path, rel_path: &str) -> PathBuf {
-	rel_path
-		.split('/')
-		.fold(root.to_path_buf(), |p, c| p.join(c))
+	names::on_disk(root, rel_path, Leaf::Existing)
+}
+
+/// [`local_path`] for a path about to be written: every directory on the way under the spelling
+/// the file system holds it by, so a write lands IN a directory spelled otherwise rather than in a
+/// new twin of it, and the entry itself under its own spelling when it is already there.
+fn local_target(root: &Path, rel_path: &str) -> PathBuf {
+	names::on_disk(root, rel_path, Leaf::Target)
 }
 
 /// Resolve a local WRITE target under `root`, confined to the sync root. Rejects a `rel_path` with
@@ -628,7 +684,7 @@ fn confined_local_target(
 			"refusing an unsafe relative path: {rel_path:?}"
 		)));
 	}
-	let target = local_path(root, rel_path);
+	let target = local_target(root, rel_path);
 	let root_canon = std::fs::canonicalize(root).map_err(io_err)?;
 	// The target itself may not exist yet; canonicalize the deepest existing ancestor (which
 	// resolves any symlink in the chain) and require it to stay under the root.
@@ -1742,12 +1798,18 @@ impl PagedPlan {
 				file: self.file(*remote_uuid),
 				..TransferTarget::default()
 			},
-			(SyncAction::UploadFile { rel_path }, PassStart::Upload { parent_uuid, .. }) => {
-				TransferTarget {
-					parent: self.parent_of(rel_path, *parent_uuid)?,
-					..TransferTarget::default()
-				}
-			}
+			(
+				SyncAction::UploadFile { rel_path },
+				PassStart::Upload {
+					parent_uuid,
+					remote,
+					..
+				},
+			) => TransferTarget {
+				file: respelling_candidate(rel_path, remote.as_deref())
+					.and_then(|uuid| self.file(uuid)),
+				parent: self.parent_of(rel_path, *parent_uuid)?,
+			},
 			_ => TransferTarget::default(),
 		})
 	}
@@ -1838,6 +1900,11 @@ impl Wanted {
 					},
 					PassStart::MoveRemoteDir { remote, .. },
 				) => wanted.dirs.extend(dir_uuid(remote.as_deref())),
+				(SyncAction::UploadFile { rel_path }, PassStart::Upload { remote, .. }) => {
+					wanted
+						.files
+						.extend(respelling_candidate(rel_path, remote.as_deref()));
+				}
 				_ => {}
 			}
 		}
@@ -3326,6 +3393,9 @@ async fn apply_transfer(
 			let parent = target
 				.parent
 				.ok_or_else(|| internal("remote parent dir for upload is missing"))?;
+			if let Some(existing) = target.file {
+				respell_remote(ctx, rel_path, existing).await?;
+			}
 			let path = local_path(ctx.local_root, rel_path);
 			// The remote keeps the file's own times, as filen-sync wrote them: an EXIF date would
 			// become the remote lastModified (a naive one read as UTC), skew what a pull writes
@@ -3823,7 +3893,7 @@ async fn stash_local_target(
 	base: Option<&BaselineEntry>,
 	bin_day: NaiveDate,
 ) -> Result<Option<PathBuf>, crate::Error> {
-	let path = local_path(local_root, rel_path);
+	let path = local_target(local_root, rel_path);
 	let base = base.cloned();
 	let unsynced =
 		tokio::task::spawn_blocking(move || local_holds_unsynced_content(&path, base.as_ref()))
@@ -4340,7 +4410,7 @@ async fn stash_move_target(
 	report: &mut SyncReport,
 	observer: &mut (dyn FnMut(SyncEvent) + Send),
 ) -> Result<(), crate::Error> {
-	if !has_own_directory_entry(&local_path(local_root, to_path)) {
+	if !has_own_directory_entry(&local_target(local_root, to_path)) {
 		return Ok(());
 	}
 	// The rename that follows always lands, so nothing here is ever put back.

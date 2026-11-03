@@ -43,6 +43,7 @@ use super::{
 		RuleCandidates, load_remote_rules, parse_user_ignore, rule_file_dir, rule_file_paths,
 	},
 	legacy::{self, LegacyImport},
+	names::{self, Leaf},
 	observe::{self, LocalObservation, LocalObservations},
 	outcome::{
 		PlanOutcome, PlannedAction, PlannedConflict, PlannedNodeKind, RefuseReason, UnsyncablePath,
@@ -2723,13 +2724,26 @@ impl Prepared {
 		Ok(planned)
 	}
 
+	/// The local names the SDK will not write to the remote, with the validator's message: every
+	/// one the scan found, but those the remote already holds at that very path. The remote holding
+	/// a name is proof it is no obstacle there — a legacy client wrote it, and this device's file
+	/// system held it, or the scan would not have found it — so such a path syncs like any other
+	/// rather than freezing both ways. What still cannot happen is the SDK writing the name anew,
+	/// which only a content edit of a file asks for: that upload fails on the validator, as a
+	/// failure of its own path.
+	fn refused_names(&self) -> impl Iterator<Item = (&String, &String)> {
+		let remote = self.remote_view.nodes.of(&self.baseline);
+		self.facts
+			.invalid_names
+			.iter()
+			.filter(move |(rel_path, _)| !remote.holds(rel_path))
+	}
+
 	/// Every path this pass will not act on, and why — reported identically by the dry run and by
 	/// the pass itself, so a caller sees the same list either way.
 	fn unsyncable(&self) -> Vec<UnsyncablePath> {
 		let names = self
-			.facts
-			.invalid_names
-			.iter()
+			.refused_names()
 			.map(|(rel_path, detail)| UnsyncablePath {
 				rel_path: rel_path.clone(),
 				reason: UnsyncableReason::InvalidName {
@@ -2801,7 +2815,7 @@ impl Prepared {
 	fn blocked_paths(&self) -> BTreeSet<String> {
 		self.failures
 			.keys()
-			.chain(self.facts.invalid_names.keys())
+			.chain(self.refused_names().map(|(rel_path, _)| rel_path))
 			.chain(self.facts.aliased_dirs.keys())
 			.chain(&self.local_scan.collisions)
 			.chain(&self.remote_view.collisions)
@@ -4447,7 +4461,7 @@ impl SyncEngine {
 			// remote copy: a stat, and a listing where one is found. A file on disk the scan cannot read
 			// is still the scan's to block, so the remote copy is not read over it.
 			|dir| {
-				scan::rule_file_metadata(&local_root.join(dir))
+				scan::rule_file_metadata(&names::on_disk(local_root, dir, Leaf::Existing))
 					.map_or(true, |found| found.is_some())
 			},
 			|dir| baseline.contains_key(&Origin::File { dir }.to_string()),

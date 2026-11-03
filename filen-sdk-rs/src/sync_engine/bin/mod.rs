@@ -30,6 +30,7 @@ use chrono::{Days, NaiveDate};
 
 use super::{
 	apply::{io_err, local_path},
+	names,
 	scan::{PairRoot, QUARANTINE_DIR, is_account_data, is_legacy_trash},
 };
 
@@ -101,7 +102,8 @@ pub(super) fn quarantine_local(
 	// Only a bin this call creates is known to hold nothing but buckets; one that already exists
 	// without the marker may be laid out as before (see [`DATED_MARKER`]).
 	let new_bin = matches!(bin.symlink_metadata(), Err(e) if e.kind() == io::ErrorKind::NotFound);
-	let dest = unique_quarantine_dest(local_path(&bucket_dir(root, day), rel_path));
+	// Filed under the key's own spelling: the bucket is the engine's, and nothing else is in it.
+	let dest = unique_quarantine_dest(names::joined(&bucket_dir(root, day), rel_path));
 	if let Some(parent) = dest.parent() {
 		fs::create_dir_all(parent).map_err(io_err)?;
 	}

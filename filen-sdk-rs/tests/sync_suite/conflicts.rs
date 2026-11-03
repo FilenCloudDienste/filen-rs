@@ -2127,24 +2127,91 @@ async fn conflict_10_case_only_collision() {
 	sc.cleanup();
 }
 
-#[ignore = "blocked: needs a name-normalizing local FS guarantee (NFC<->NFD equivalence on \
-macOS/HFS) AND a way to create two normalization-variant names on the remote that the server keeps \
-distinct — the public client API normalizes/dedups names, so the precondition cannot be staged. \
-TODO: name-hash-bypass seam + normalizing-FS fixture."]
+/// CONFLICT-11 — the remote holds the NFC and the NFD spelling of one name, as two items: the
+/// server's name dedup does not normalize, so two clients spelling a name differently make two.
+/// Both key to one local path, so neither is merged into the other or materialized: the path is
+/// reported once as a remote name collision, and a re-run does the same. Staged as directories (the
+/// name seam exists for directories only); needs `-F malformed`.
+#[cfg(feature = "malformed")]
 #[shared_test_runtime]
 async fn conflict_11_unicode_normalization_collision() {
-	// plan: create NFC "café.txt"("NFC") and NFD "café.txt"("NFD") on remote; sync to a normalizing
-	// local FS; assert not merged, collision surfaced/both forms preserved, re-run stable.
+	let sc = single_client(SyncMode::TwoWay).await;
+	stage_named_dirs(&sc, &["caf\u{e9}", "cafe\u{301}"]).await;
+
+	let reported = vec![filen_sdk_rs::sync_engine::UnsyncablePath {
+		rel_path: "caf\u{e9}".to_owned(),
+		reason: filen_sdk_rs::sync_engine::UnsyncableReason::RemoteNameCollision,
+	}];
+	for round in 0..2 {
+		let report = sc.sync().await;
+		assert_eq!(report.refused, None, "round {round}: {report:?}");
+		assert!(report.errors.is_empty(), "round {round}: {report:?}");
+		assert_eq!(report.unsyncable, reported, "round {round}: {report:?}");
+		assert_eq!(report.local_dirs_created, 0, "round {round}: {report:?}");
+		assert_eq!(report.remote_dirs_created, 0, "round {round}: {report:?}");
+		assert_eq!(report.remotely_trashed, 0, "round {round}: {report:?}");
+	}
+	assert!(
+		walk_tree(&sc.local).is_empty(),
+		"neither spelling materialized"
+	);
+	let (dirs, _files) = sc
+		.cache
+		.client
+		.list_dir(
+			&DirType::<Normal>::Dir(Cow::Borrowed(&sc.resources.dir)),
+			None::<&fn(u64, Option<u64>)>,
+		)
+		.await
+		.unwrap();
+	assert_eq!(dirs.len(), 2, "both remote spellings are intact");
+	sc.cleanup();
 }
 
-#[ignore = "blocked: needs to create remote items whose names contain locally-illegal chars (e.g. \
-\"a:b.txt\") that sanitize to a shared local path. make_file_builder rejects/normalizes such names \
-via the public API, so the colliding precondition cannot be staged without a name-validation bypass \
-seam. TODO: malformed-name remote-setup helper."]
+/// CONFLICT-12 — a remote name a device cannot hold (`a:b`) beside the name an rclone-style
+/// encoding would turn it into (`a：b`, a fullwidth colon). The engine never sanitizes, so the two
+/// never meet on one local path: Linux and macOS pull both under their own names, Windows pulls
+/// `a：b` and reports `a:b` as not storable on this device, never writing it. A re-run does the
+/// same and nothing more. Staged as directories; needs `-F malformed`.
+#[cfg(feature = "malformed")]
 #[shared_test_runtime]
 async fn conflict_12_sanitization_collision_onto_one_local_path() {
-	// plan: create two remote items sanitizing to the same local path with different content; sync;
-	// assert both preserved (one disambiguated) or collision held; deterministic re-run.
+	let sc = single_client(SyncMode::TwoWay).await;
+	stage_named_dirs(&sc, &["a:b", "a\u{ff1a}b"]).await;
+
+	let (pulled, reported): (Vec<&str>, Vec<filen_sdk_rs::sync_engine::UnsyncablePath>) =
+		if cfg!(windows) {
+			(
+				vec!["a\u{ff1a}b"],
+				vec![filen_sdk_rs::sync_engine::UnsyncablePath {
+					rel_path: "a:b".to_owned(),
+					reason: filen_sdk_rs::sync_engine::UnsyncableReason::RemoteNameNotStorable {
+						name: "a:b".to_owned(),
+						detail: "Windows does not allow the character ':' in a name".to_owned(),
+					},
+				}],
+			)
+		} else {
+			(vec!["a:b", "a\u{ff1a}b"], Vec::new())
+		};
+	for round in 0..2 {
+		let report = sc.sync().await;
+		assert!(report.errors.is_empty(), "round {round}: {report:?}");
+		assert_eq!(report.unsyncable, reported, "round {round}: {report:?}");
+		let created = if round == 0 { pulled.len() } else { 0 };
+		assert_eq!(
+			report.local_dirs_created, created,
+			"round {round}: {report:?}"
+		);
+		assert_eq!(report.remote_dirs_created, 0, "round {round}: {report:?}");
+		assert_eq!(report.remotely_trashed, 0, "round {round}: {report:?}");
+	}
+	assert_eq!(
+		walk_tree(&sc.local).into_keys().collect::<Vec<_>>(),
+		pulled,
+		"each name the device holds materialized under its own name"
+	);
+	sc.cleanup();
 }
 
 /// CONFLICT-16 — resolving a held conflict KEEP-LOCAL pushes the local copy on the next pass.

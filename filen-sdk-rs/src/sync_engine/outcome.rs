@@ -184,6 +184,11 @@ pub enum UnsyncableReason {
 	/// name, a forbidden character, an over-long name). No upload or remote create at this path can
 	/// ever succeed, so the path and its subtree are skipped rather than retried forever. `detail`
 	/// is the SDK name validator's own message.
+	///
+	/// A name the remote already holds at that very path (a legacy client wrote it, and the local
+	/// file system held it) is not one of these: the path syncs like any other. Only a content edit
+	/// of such a file cannot go up, since the SDK never writes a name its validator rejects; that
+	/// upload fails as a failure of its own path.
 	InvalidName { detail: String },
 	/// Every attempt to apply this path failed, `attempts` times in a row. The engine stopped
 	/// planning it so one broken path cannot stall (or spam) every pass; the count is cleared by a
@@ -204,6 +209,14 @@ pub enum UnsyncableReason {
 	/// [`RemoteUndecodable`](Self::RemoteUndecodable): a synced path whose item was renamed to such a
 	/// name is left alone on both sides rather than read as deleted. `name` is the remote name.
 	RemoteInvalidName { name: String },
+	/// This device's file system cannot hold the remote name under its exact spelling: on Windows a
+	/// trailing dot or space (which Win32 strips, so the item would land under another name), a
+	/// character Windows forbids, or a device name such as `CON` or `NUL.txt`; anywhere, a name
+	/// longer than the file system holds. Handled like [`RemoteInvalidName`](Self::RemoteInvalidName):
+	/// it is never downloaded, and a synced path whose item was renamed to such a name keeps its local
+	/// copy and is left alone on both sides, so the remote item is never moved or trashed because of
+	/// it. Renaming it on the remote resolves it. `name` is the remote name, `detail` says why.
+	RemoteNameNotStorable { name: String, detail: String },
 	/// The remote item's parent chain never reaches the sync root: its parent is missing from the
 	/// listing, or the chain loops. Handled like [`RemoteUndecodable`](Self::RemoteUndecodable); for
 	/// an item that was never synced, `rel_path` is its bare name, since it has no path.
@@ -247,6 +260,12 @@ impl fmt::Display for UnsyncableReason {
 			}
 			Self::RemoteInvalidName { name } => {
 				write!(f, "the remote name {name:?} is not a usable local name")
+			}
+			Self::RemoteNameNotStorable { name, detail } => {
+				write!(
+					f,
+					"the remote name {name:?} cannot be stored on this device: {detail}"
+				)
 			}
 			Self::RemoteBrokenParent => {
 				f.write_str("the remote item's parent chain does not lead back to the sync root")

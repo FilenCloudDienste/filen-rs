@@ -36,7 +36,7 @@ use super::{
 	baseline::{NodeKind, SyncedPaths},
 	changes::{FullPassReason, RemoteChange, RemoteDeltaEntry, SUBTREE_CAP, past_cap},
 	ignore::rule_file_dir,
-	plan::{self, RemoteNode, is_reserved_path, is_safe_name, join_path},
+	plan::{self, RemoteNode, is_placeable_name, is_reserved_path, join_path},
 	rows::Baseline,
 	scan::PairRoot,
 	side::{Nodes, NodesAt, Side},
@@ -371,12 +371,12 @@ impl RemoteObservation {
 		name: &str,
 		mut node: RemoteNode,
 	) -> Result<(), FullPassReason> {
-		if !is_safe_name(name) {
-			// No local path can hold that name. A whole-tree read records such an item as
-			// unsyncable (`RemoteView::skipped`), which is what keeps its absence from `nodes` from
-			// reading as a deletion — and a `skipped` record is the one thing a derivation cannot
-			// produce, since it is a statement about the whole remote. An item the view never held
-			// is simply not syncable yet and needs nothing.
+		if !is_placeable_name(name) {
+			// No local path can hold that name, or none on this device. A whole-tree read records
+			// such an item as unsyncable (`RemoteView::skipped`), which is what keeps its absence
+			// from `nodes` from reading as a deletion — and a `skipped` record is the one thing a
+			// derivation cannot produce, since it is a statement about the whole remote. An item
+			// the view never held is simply not syncable yet and needs nothing.
 			return if self.path_of(baseline, uuid).is_some() {
 				Err(FullPassReason::RemoteUnplaceable)
 			} else {
@@ -404,6 +404,14 @@ impl RemoteObservation {
 			// Two byte-identical names under one parent cannot both exist on the server, so what
 			// the cache is showing is a transition. Withhold that one path for this pass, exactly
 			// as the view withholds it, and let the pass run.
+			//
+			// Unless the names can differ in Unicode form: the NFC and NFD spellings of one name
+			// both resolve here and are two items for good, a collision the pass reports. Neither
+			// the delta nor the view keeps the remote's spelling, so a whole read tells the two
+			// apart; an ASCII name has only the one spelling.
+			if !name.is_ascii() {
+				return Err(FullPassReason::RemoteUnplaceable);
+			}
 			self.hold(baseline, &path);
 			return self.vacate_unplaced(baseline, uuid);
 		}
@@ -620,7 +628,7 @@ fn ancestor_path(root: Uuid, chain: &[RemoteItem], target: Uuid) -> Option<Strin
 	while at != root {
 		let item = by_uuid.get(&at)?;
 		let name = item.name.nfc().collect::<String>();
-		if !is_safe_name(&name) {
+		if !is_placeable_name(&name) {
 			return None;
 		}
 		parts.push(name);

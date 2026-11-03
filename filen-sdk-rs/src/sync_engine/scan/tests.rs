@@ -2302,6 +2302,41 @@ fn a_subtree_walk_keys_against_the_root_and_starts_at_its_own_directory() {
 	fs::remove_dir_all(&root).ok();
 }
 
+/// A subtree walk starts at the directory its NFC key names however the file system spells it, and
+/// keys what it finds in NFC, as a whole walk keys it.
+#[test]
+fn a_subtree_walk_starts_at_an_nfd_directory_from_its_nfc_key() {
+	let root = temp_root();
+	fs::create_dir(root.join("cafe\u{301}")).unwrap();
+	fs::write(
+		root.join("cafe\u{301}").join("re\u{301}sume\u{301}.txt"),
+		b"r",
+	)
+	.unwrap();
+
+	let (scan, _) = scan_subtree(
+		ScanRoot {
+			path: &root,
+			pair_root: PairRoot::Directory,
+		},
+		"caf\u{e9}",
+		&Baseline::default(),
+		IgnoreRules::default(),
+		&RuleFiles::Read,
+		&mut |_, _, _| None,
+		&|_| false,
+	)
+	.expect("a walk nothing stops");
+
+	assert!(scan.complete, "{:?}", scan.errors);
+	assert_eq!(
+		sorted_paths(&scan),
+		vec!["caf\u{e9}", "caf\u{e9}/r\u{e9}sum\u{e9}.txt"]
+	);
+
+	fs::remove_dir_all(&root).ok();
+}
+
 /// A subtree walk whose start is removed once the walk has opened it finds every entry it lists
 /// gone and the start gone after it. That start is a directory below the root that changed under
 /// the walk, as any other is: the scan is partial and nothing is reported.

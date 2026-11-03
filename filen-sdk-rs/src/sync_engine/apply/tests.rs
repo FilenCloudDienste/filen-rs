@@ -943,6 +943,52 @@ fn confine_allows_paths_under_the_root() {
 	std::fs::remove_dir_all(&root).ok();
 }
 
+/// A download into a directory another program named in NFD lands inside that directory, as the
+/// confined target says, rather than in an NFC twin of it.
+#[test]
+fn confine_targets_the_directory_as_the_file_system_spells_it() {
+	let root = temp_dir();
+	std::fs::create_dir(root.join("cafe\u{301}")).unwrap();
+	let target = confined_local_target(&root, PairRoot::Directory, "caf\u{e9}/new.txt")
+		.expect("in-root path allowed");
+	std::fs::write(&target, b"x").unwrap();
+	assert_eq!(
+		std::fs::read_dir(&root).unwrap().count(),
+		1,
+		"no second directory beside the NFD one"
+	);
+	std::fs::remove_dir_all(&root).ok();
+}
+
+/// An edit's upload reads a respelling only where the name is not ASCII and the path holds a remote
+/// FILE to version.
+#[test]
+fn only_a_non_ascii_files_upload_reads_the_remote_spelling() {
+	let file = remote_node("caf\u{e9}.txt", None);
+	assert_eq!(
+		respelling_candidate("d/caf\u{e9}.txt", Some(&file)),
+		Some(file.remote_uuid)
+	);
+	assert_eq!(respelling_candidate("d/cafe.txt", Some(&file)), None);
+	assert_eq!(respelling_candidate("d/caf\u{e9}.txt", None), None);
+	let dir = RemoteNode {
+		kind: NodeKind::Dir,
+		..file
+	};
+	assert_eq!(respelling_candidate("caf\u{e9}.txt", Some(&dir)), None);
+}
+
+/// The remote file is renamed before an upload only where the server's name hash tells its
+/// spelling apart from the key: another Unicode form, not another case, and not another name.
+#[test]
+fn a_respelling_is_needed_only_for_another_unicode_form() {
+	assert!(hashes_apart("cafe\u{301}.txt", "caf\u{e9}.txt"));
+	assert!(hashes_apart("CAFE\u{301}.txt", "CAF\u{c9}.txt"));
+	assert!(!hashes_apart("caf\u{e9}.txt", "caf\u{e9}.txt"));
+	assert!(!hashes_apart("Caf\u{e9}.txt", "caf\u{e9}.txt"));
+	assert!(!hashes_apart("cafe\u{301}.txt", "other.txt"));
+}
+
 #[test]
 fn confine_rejects_lexical_traversal() {
 	let root = temp_dir();

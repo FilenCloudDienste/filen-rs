@@ -383,6 +383,30 @@ fn a_present_file_keeps_the_nanoseconds_its_millisecond_mtime_drops() {
 	fs::remove_dir_all(&root).ok();
 }
 
+/// A file another program named in NFD, under a directory named so too, is observed PRESENT from
+/// its NFC key, the key the changelist hands over: on a file system that tells the two forms apart
+/// the key alone names nothing, and reading it as gone would delete its remote copy.
+#[test]
+fn an_nfd_named_file_is_observed_present_from_its_nfc_key() {
+	let root = temp_root();
+	fs::create_dir(root.join("cafe\u{301}")).unwrap();
+	fs::write(
+		root.join("cafe\u{301}").join("re\u{301}sume\u{301}.txt"),
+		b"hello",
+	)
+	.unwrap();
+	let key = "caf\u{e9}/r\u{e9}sum\u{e9}.txt";
+
+	let out = observe_with(&root, &Baseline::default(), &[key]);
+
+	let LocalObservation::File { node, .. } = &out.observed[key] else {
+		panic!("{:?}", out.observed);
+	};
+	assert_eq!(node.size, 5);
+
+	fs::remove_dir_all(&root).ok();
+}
+
 /// A present file carries the whole-tree walk's own fast-path: unchanged `(size, mtime)` reuses
 /// the baseline's hash instead of re-reading the file.
 #[test]

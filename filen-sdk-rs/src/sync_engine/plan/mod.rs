@@ -23,6 +23,7 @@ use super::{
 	changes::FullPassReason,
 	events::SyncEvent,
 	ignore::{IgnoreDecision, IgnoreLevel, IgnoreRules},
+	names,
 	outcome::{UnsyncablePath, UnsyncableReason},
 	rows::Baseline,
 	scan::{
@@ -250,6 +251,27 @@ pub(super) fn is_safe_name(name: &str) -> bool {
 		&& !name.contains('\0')
 }
 
+/// Whether the view places an item named `name` (NFC): a name that is safe as a local path
+/// component ([`is_safe_name`]) and that this device's file system holds under that exact spelling
+/// ([`names::device_rejection`]). Allocates nothing; [`unplaceable_name`] says why not.
+pub(super) fn is_placeable_name(name: &str) -> bool {
+	is_safe_name(name) && names::device_rejection(name).is_none()
+}
+
+/// Why the view does not place an item named `name` (NFC), or `None` when it does (see
+/// [`is_placeable_name`]).
+fn unplaceable_name(name: &str) -> Option<UnsyncableReason> {
+	if !is_safe_name(name) {
+		return Some(UnsyncableReason::RemoteInvalidName {
+			name: name.to_owned(),
+		});
+	}
+	names::device_rejection(name).map(|rejection| UnsyncableReason::RemoteNameNotStorable {
+		name: name.to_owned(),
+		detail: rejection.to_string(),
+	})
+}
+
 /// Why [`resolve_parent`] could not place a directory under the sync root.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Unresolved {
@@ -264,8 +286,8 @@ enum Unresolved {
 
 /// Resolve the `/`-joined, NFC-normalized path of the directory `parent` by walking the dir index
 /// up to `root` (`""` for the root itself). Fails when the chain passes a directory the view leaves
-/// out — one whose name is not a safe path component, so a traversal name like `..` never enters
-/// the plan, or one listed in `undecodable_dirs` — or never reaches `root`.
+/// out — one whose name is not placeable ([`is_placeable_name`]), so a traversal name like `..`
+/// never enters the plan, or one listed in `undecodable_dirs` — or never reaches `root`.
 fn resolve_parent(
 	parent: Uuid,
 	root: Uuid,
@@ -290,7 +312,7 @@ fn resolve_parent(
 				None => Unresolved::BrokenParent,
 			});
 		};
-		if !is_safe_name(name) {
+		if !is_placeable_name(name) {
 			return Err(Unresolved::UnderSkipped(current));
 		}
 		parts.push(name);
@@ -335,7 +357,10 @@ pub(crate) struct RemoteView {
 	/// case-insensitive path but NOT the same byte-identical one. All but the first of a group
 	/// leave `nodes`; the engine leaves every path here alone on both sides (see
 	/// `engine::Collisions`), so a twin's absence from `nodes` is not a deletion, until the user
-	/// renames one of them. A [held](Self::held_paths) path a twin folds onto is one of them.
+	/// renames one of them. A [held](Self::held_paths) path a twin folds onto is one of them, and so
+	/// is a held path two items resolved to whose names differ in Unicode form only: the NFC and NFD
+	/// spellings of one name, which the server keeps apart since its dedup does not normalize. Like
+	/// any held path, such a one stays whatever the rules say.
 	pub(crate) collisions: BTreeSet<String>,
 	/// Paths two byte-identically named remote items resolved to. The server never allows that —
 	/// its dedup is on the lowercased name hash — so it can only be a cache mid-transition: a
@@ -442,6 +467,13 @@ pub(crate) struct ViewBuilder {
 	/// baseline to derive from and every placement has to know what it displaced.
 	nodes: HashMap<String, RemoteNode>,
 	held_paths: BTreeSet<String>,
+	/// The remote name of the first item placed at each path whose name is not NFC already, kept
+	/// once the path is held too: what tells a later item at a path that is another SPELLING of the
+	/// name from a cache mid-transition (see [`note_spelling`](Self::note_spelling)). Empty unless a
+	/// client wrote non-NFC names.
+	spellings: HashMap<String, String>,
+	/// Held paths two differently spelled names resolved to: a lasting collision, not a transition.
+	twins: BTreeSet<String>,
 	skipped: Skipped,
 	/// Items whose ancestry the index could not answer for when they arrived (see the type doc).
 	deferred: Vec<(bool, RemoteItem)>,
@@ -463,6 +495,8 @@ impl ViewBuilder {
 			undecodable_dirs: HashSet::new(),
 			nodes: HashMap::with_capacity(items),
 			held_paths: BTreeSet::new(),
+			spellings: HashMap::new(),
+			twins: BTreeSet::new(),
 			skipped: Skipped::new(pair_root),
 			deferred: Vec::new(),
 		}
@@ -487,6 +521,8 @@ impl ViewBuilder {
 			undecodable_dirs: HashSet::new(),
 			nodes: HashMap::new(),
 			held_paths: BTreeSet::new(),
+			spellings: HashMap::new(),
+			twins: BTreeSet::new(),
 			skipped: Skipped::new(pair_root),
 			deferred: items,
 		};
@@ -501,6 +537,7 @@ impl ViewBuilder {
 		let view = self.finish();
 		assert!(
 			view.held_paths.is_empty()
+				&& view.collisions.is_empty()
 				&& matches!(&view.nodes, Side::Whole(nodes) if nodes.is_empty()),
 			"an item the staged walk left resolved to a path (should be impossible)"
 		);
@@ -542,16 +579,19 @@ impl ViewBuilder {
 			&self.dir_index,
 			&self.undecodable_dirs,
 		) {
-			Ok(parent_path) if is_safe_name(&name) => {
-				self.insert(join_path(&parent_path, &name), is_dir, item, stable_uuid);
-				return;
-			}
-			Ok(parent_path) => SkippedRemote {
-				remote_uuid: item.uuid,
-				stable_uuid,
-				rel_path: join_path(&parent_path, &name),
-				path_is_dir: is_dir,
-				reason: UnsyncableReason::RemoteInvalidName { name },
+			Ok(parent_path) => match unplaceable_name(&name) {
+				None => {
+					let rel_path = join_path(&parent_path, &name);
+					self.insert(rel_path, is_dir, item, stable_uuid, &name);
+					return;
+				}
+				Some(reason) => SkippedRemote {
+					remote_uuid: item.uuid,
+					stable_uuid,
+					rel_path: join_path(&parent_path, &name),
+					path_is_dir: is_dir,
+					reason,
+				},
 			},
 			Err(_) if defer => {
 				self.deferred.push((is_dir, item.clone()));
@@ -573,13 +613,14 @@ impl ViewBuilder {
 	}
 
 	/// The node at `rel_path`, unless the path is the engine's own quarantine directory or a
-	/// second item has already claimed it.
+	/// second item has already claimed it. `name` is the item's NFC name, the last of `rel_path`.
 	fn insert(
 		&mut self,
 		rel_path: String,
 		is_dir: bool,
 		item: &RemoteItem,
 		stable_uuid: Option<StableUuid>,
+		name: &str,
 	) {
 		// The engine's reserved paths come before every rule, and are never reported as ignored.
 		if is_reserved_path(&rel_path, self.pair_root) {
@@ -590,6 +631,7 @@ impl ViewBuilder {
 		// successor has been applied and the predecessor's trash has not. Withhold that one path
 		// for this pass rather than refusing the whole one; the next snapshot has one of them.
 		if self.held_paths.contains(&rel_path) {
+			self.note_spelling(rel_path, name, &item.name);
 			return;
 		}
 		let node = RemoteNode {
@@ -606,11 +648,29 @@ impl ViewBuilder {
 			modified_millis: item.modified_millis,
 		};
 		if self.nodes.insert(rel_path.clone(), node).is_some() {
-			tracing::debug!(
-				"remote view: holding {rel_path:?} — the cache is mid-transition, listing two items under that exact name"
-			);
 			self.nodes.remove(&rel_path);
-			self.held_paths.insert(rel_path);
+			tracing::debug!(
+				"remote view: holding {rel_path:?} — the cache is listing two items under that name"
+			);
+			self.held_paths.insert(rel_path.clone());
+			self.note_spelling(rel_path, name, &item.name);
+		} else if item.name != name {
+			self.spellings.insert(rel_path, item.name.clone());
+		}
+	}
+
+	/// Note that an item spelled `spelled` (NFC: `name`) arrived at the held `rel_path`. Two
+	/// spellings of one name are two items the server keeps apart for good — its dedup does not
+	/// normalize — so a path any two arrivals spell differently is a collision, reported and left
+	/// alone until one is renamed, rather than a transition the next snapshot clears. Asked of every
+	/// arrival against the first one's spelling, so the answer does not depend on their order.
+	fn note_spelling(&mut self, rel_path: String, name: &str, spelled: &str) {
+		let first = self.spellings.get(&rel_path).map_or(name, String::as_str);
+		if first != spelled && !self.twins.contains(&rel_path) {
+			tracing::debug!(
+				"remote view: {rel_path:?} is two items, whose names differ in Unicode form only"
+			);
+			self.twins.insert(rel_path);
 		}
 	}
 
@@ -646,7 +706,7 @@ impl ViewBuilder {
 		}
 		RemoteView {
 			nodes: self.nodes.into(),
-			collisions: BTreeSet::new(),
+			collisions: self.twins,
 			held_paths: self.held_paths,
 			skipped: self.skipped.finish(),
 			ignored: BTreeMap::new(),
@@ -884,9 +944,9 @@ impl RemoteView {
 				.is_some()
 		};
 		self.skipped.retain(|skip| match &skip.reason {
-			UnsyncableReason::RemoteUndecodable | UnsyncableReason::RemoteInvalidName { .. } => {
-				!is_hidden(&skip.rel_path, skip.path_is_dir)
-			}
+			UnsyncableReason::RemoteUndecodable
+			| UnsyncableReason::RemoteInvalidName { .. }
+			| UnsyncableReason::RemoteNameNotStorable { .. } => !is_hidden(&skip.rel_path, skip.path_is_dir),
 			UnsyncableReason::InvalidName { .. }
 			| UnsyncableReason::RepeatedFailure { .. }
 			| UnsyncableReason::RemoteBrokenParent

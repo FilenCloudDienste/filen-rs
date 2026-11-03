@@ -376,6 +376,28 @@ fn a_rename_onto_an_occupied_path_withholds_that_path() {
 	assert_eq!(listed(&out.touched), vec!["a.txt", "b.txt"]);
 }
 
+/// A rename onto a non-ASCII name another item holds may be the second Unicode spelling of that
+/// name, which the server keeps as a second item for good: neither the delta nor the view keeps the
+/// remote's spelling, so the pass reads the remote whole, where the two are told apart.
+#[test]
+fn a_rename_onto_an_occupied_non_ascii_path_asks_for_a_whole_read() {
+	let held = Uuid::from_u128(41);
+	let mover = Uuid::from_u128(42);
+	let (baseline, nodes) = derived([file_node("caf\u{e9}.txt", held), file_node("b.txt", mover)]);
+	let events = [cache_event(
+		Some(1),
+		CacheEventType::File(FileEvent::MetadataChanged {
+			uuid: mover,
+			meta: meta("cafe\u{301}.txt"),
+		}),
+	)];
+
+	match observed_with(&baseline, nodes, &delta(&events), &[], &mut no_ancestry()) {
+		RemoteObserved::Full(reason) => assert_eq!(reason, FullPassReason::RemoteUnplaceable),
+		RemoteObserved::Applied(out) => panic!("the path was held instead: {:?}", out.held_paths),
+	}
+}
+
 /// The server re-mints a file's uuid on every content edit, so a new uuid landing on a path a
 /// file of the SAME lineage holds is a new version of it rather than a second item: it
 /// replaces, and nothing is withheld.

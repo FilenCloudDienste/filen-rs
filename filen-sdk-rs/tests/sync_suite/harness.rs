@@ -279,6 +279,39 @@ pub async fn stage_case_colliding_dirs(
 	(upper_dir, lower_dir)
 }
 
+/// Stage a directory per name in `names` under the single client's remote root, each spelled
+/// exactly as given — names no conforming client writes included: their metadata is encrypted with
+/// the client's own crypter, so each decodes to its name, and its name hash is the one a client
+/// spelling it so would send, so the server keeps two spellings of one name apart as it would for
+/// two clients. Waits for the cache to hold all of them, and returns their uuids in order.
+#[cfg(feature = "malformed")]
+pub async fn stage_named_dirs(sc: &SingleClient, names: &[&str]) -> Vec<Uuid> {
+	use filen_sdk_rs::crypto::shared::MetaCrypter;
+
+	let client = &sc.resources.client;
+	let root = filen_sdk_rs::fs::categories::DirType::<filen_sdk_rs::fs::categories::Normal>::Dir(
+		std::borrow::Cow::Borrowed(&sc.resources.dir),
+	);
+	let mut uuids = Vec::with_capacity(names.len());
+	for name in names {
+		let json = serde_json::json!({ "name": name }).to_string();
+		let meta = client.crypter().encrypt_meta(&json).await;
+		uuids.push(
+			client
+				.create_malformed_dir(&root, name, &meta.0)
+				.await
+				.unwrap(),
+		);
+	}
+	for (name, uuid) in names.iter().zip(&uuids) {
+		assert!(
+			poll_for_item(sc.cache.db_path(), *uuid, CACHE_CONVERGE_TIMEOUT).await,
+			"the cache never observed {name:?}"
+		);
+	}
+	uuids
+}
+
 /// Whether `report` holds back `names` — the top-level directories [`stage_case_colliding_dirs`]
 /// made — as a remote name collision, and nothing for any other reason: the twins and the files
 /// under them, which fold together too.

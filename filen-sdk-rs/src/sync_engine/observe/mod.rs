@@ -69,6 +69,7 @@ use super::{
 	baseline::{BaselineEntry, BaselineState, NodeKind},
 	changes::{FullPassReason, SUBTREE_CAP, past_cap},
 	ignore::{FILENIGNORE, IgnoreDecision, IgnoreRules, rule_file_dir},
+	names::{self, Leaf},
 	plan::{ancestors, is_under, subtree_bounds},
 	rows::Baseline,
 	scan::{
@@ -396,7 +397,7 @@ impl<'a> Origins<'a> {
 			.copied()
 			.filter(|path| !path.is_empty())
 			.partition(|path| {
-				std::fs::metadata(root.join(path))
+				std::fs::metadata(names::on_disk(root, path, Leaf::Existing))
 					.is_err_and(|error| error.kind() == ErrorKind::NotFound)
 					&& rows.get(path).is_some_and(|row| {
 						row.kind == NodeKind::Dir && row.state == BaselineState::Synced
@@ -515,7 +516,7 @@ pub(super) fn observe_local(
 		let path_buf = if path.is_empty() {
 			root.to_path_buf()
 		} else {
-			root.join(path)
+			names::on_disk(root, path, Leaf::Existing)
 		};
 		// Follows symlinks, so an entry is classified by its target — the walk classifies it the
 		// same way.
@@ -757,7 +758,7 @@ fn walk_ancestors<'p>(
 		if walked.contains(ancestor) {
 			continue;
 		}
-		let dir_path = root.join(ancestor);
+		let dir_path = names::on_disk(root, ancestor, Leaf::Existing);
 		match std::fs::metadata(&dir_path) {
 			Ok(metadata) if metadata.is_dir() => {}
 			// Something that is not a directory standing where one has to be does prove nothing is
@@ -860,7 +861,7 @@ fn read_siblings(root: &Path, dir: &str, out: &mut LocalObservations) -> Option<
 	let dir_path = if dir.is_empty() {
 		root.to_path_buf()
 	} else {
-		root.join(dir)
+		names::on_disk(root, dir, Leaf::Existing)
 	};
 	let entries = match std::fs::read_dir(&dir_path) {
 		Ok(entries) => entries,

@@ -4220,6 +4220,174 @@ fn undecodable_items_are_recorded_under_their_parent_when_they_belong_to_the_roo
 	assert_eq!(view.skipped[0].stable_uuid, Some(lineage));
 }
 
+/// A remote name longer than any file system holds is left out of the view on every host and
+/// reported as not storable here, never as unsafe; what is under such a directory shares its record.
+#[test]
+fn a_name_no_file_system_holds_is_reported_as_not_storable_here() {
+	let root = Uuid::new_v4();
+	let long = "a".repeat(256);
+	let too_long = remote_dir(&long, root);
+	let under = cacheable_file(too_long.uuid, "x.txt");
+	let fits = remote_dir(&"a".repeat(255), root);
+	let view = build_remote_view(
+		root,
+		PairRoot::Directory,
+		&[too_long.clone(), fits],
+		std::slice::from_ref(&under),
+		&[],
+		None,
+	);
+	assert_eq!(
+		view.nodes.whole().paths().collect::<Vec<_>>(),
+		vec!["a".repeat(255)]
+	);
+	let reason = UnsyncableReason::RemoteNameNotStorable {
+		name: long.clone(),
+		detail: "the name is 256 long, more than the 255 this device's file system holds"
+			.to_string(),
+	};
+	for uuid in [too_long.uuid, under.uuid] {
+		let record = view
+			.skipped
+			.iter()
+			.find(|s| s.remote_uuid == uuid)
+			.unwrap_or_else(|| panic!("{uuid} not recorded: {:?}", view.skipped));
+		assert_eq!(
+			(record.rel_path.as_str(), &record.reason),
+			(long.as_str(), &reason)
+		);
+	}
+}
+
+/// A synced file the remote renamed to a name this device cannot hold is unknown, not absent:
+/// neither its local copy nor its remote item is deleted or moved because of it.
+#[test]
+fn a_synced_file_renamed_to_a_name_this_device_cannot_hold_is_unknown_not_absent() {
+	let root = Uuid::new_v4();
+	let long = format!("{}.txt", "b".repeat(252));
+	let renamed = RemoteItem {
+		name: long.clone(),
+		..cacheable_file(root, "doc.txt")
+	};
+	let view = build_remote_view(
+		root,
+		PairRoot::Directory,
+		&[],
+		std::slice::from_ref(&renamed),
+		&[],
+		None,
+	);
+	assert!(view.nodes.whole().is_empty());
+	let baseline = HashMap::from([(
+		"doc.txt".to_string(),
+		base_file("doc.txt", renamed.uuid, [1; 32]),
+	)]);
+	let rows = tree(&baseline);
+	let (unknown, never_synced) =
+		unknown_remote_paths(&synced_for(&rows, &view.skipped), &view.skipped);
+	assert!(never_synced.is_empty(), "{never_synced:?}");
+	assert_eq!(
+		unknown.keys().collect::<Vec<_>>(),
+		vec!["doc.txt"],
+		"the synced path is held back, not read as a deletion"
+	);
+	assert!(matches!(
+		unknown.get("doc.txt"),
+		Some(UnsyncableReason::RemoteNameNotStorable { name, .. }) if *name == long
+	));
+}
+
+/// On Windows a name Win32 would rewrite or refuse is left out of the view: a trailing dot or space
+/// (which would land `foo.` on top of `foo`), a forbidden character, a device name with an
+/// extension. `foo` itself syncs.
+#[cfg(windows)]
+#[test]
+fn windows_leaves_out_names_win32_would_rewrite() {
+	let root = Uuid::new_v4();
+	let plain = cacheable_file(root, "foo");
+	let dotted = cacheable_file(root, "foo.");
+	let spaced = cacheable_file(root, "foo ");
+	let colon = cacheable_file(root, "a:b");
+	let device = cacheable_file(root, "NUL.txt");
+	let view = build_remote_view(
+		root,
+		PairRoot::Directory,
+		&[],
+		&[plain, dotted, spaced, colon, device],
+		&[],
+		None,
+	);
+	assert_eq!(view.nodes.whole().paths().collect::<Vec<_>>(), vec!["foo"]);
+	let mut reported: Vec<&str> = view
+		.skipped
+		.iter()
+		.filter(|s| matches!(s.reason, UnsyncableReason::RemoteNameNotStorable { .. }))
+		.map(|s| s.rel_path.as_str())
+		.collect();
+	reported.sort_unstable();
+	assert_eq!(reported, vec!["NUL.txt", "a:b", "foo ", "foo."]);
+}
+
+/// Off Windows the same names are ones the file system holds, so they are placed and pulled, the
+/// SDK's name validator notwithstanding: the remote already holds them.
+#[cfg(not(windows))]
+#[test]
+fn off_windows_names_the_file_system_holds_are_placed() {
+	let root = Uuid::new_v4();
+	let names = ["NUL.txt", "a:b", "foo", "foo ", "foo."];
+	let files: Vec<RemoteItem> = names
+		.iter()
+		.map(|name| cacheable_file(root, name))
+		.collect();
+	let view = build_remote_view(root, PairRoot::Directory, &[], &files, &[], None);
+	let mut placed: Vec<String> = view.nodes.whole().paths().map(Cow::into_owned).collect();
+	placed.sort_unstable();
+	assert_eq!(placed, names);
+	assert!(view.skipped.is_empty(), "{:?}", view.skipped);
+}
+
+/// The NFC and NFD spellings of one name are two items the server keeps apart for good: the path
+/// they share is held and reported as a collision, not withheld silently as a cache transition.
+#[test]
+fn two_unicode_spellings_of_one_name_are_a_collision() {
+	let root = Uuid::new_v4();
+	let nfc = cacheable_file(root, "caf\u{e9}.txt");
+	let nfd = cacheable_file(root, "cafe\u{301}.txt");
+	for order in [[&nfc, &nfd], [&nfd, &nfc]] {
+		let files: Vec<RemoteItem> = order.into_iter().cloned().collect();
+		let view = build_remote_view(root, PairRoot::Directory, &[], &files, &[], None);
+		let path = "caf\u{e9}.txt".to_string();
+		assert_eq!(view.collisions, BTreeSet::from([path.clone()]));
+		assert_eq!(view.held_paths, BTreeSet::from([path]));
+		assert!(view.nodes.whole().is_empty());
+	}
+}
+
+/// Two items under one NFD spelling are the cache mid-transition, as two under one NFC spelling
+/// are: held for the pass, no collision.
+#[test]
+fn two_items_under_one_nfd_spelling_are_held_not_a_collision() {
+	let root = Uuid::new_v4();
+	let predecessor = cacheable_file(root, "cafe\u{301}.txt");
+	let successor = RemoteItem {
+		uuid: Uuid::new_v4(),
+		..predecessor.clone()
+	};
+	let view = build_remote_view(
+		root,
+		PairRoot::Directory,
+		&[],
+		&[predecessor, successor],
+		&[],
+		None,
+	);
+	assert!(view.collisions.is_empty(), "{:?}", view.collisions);
+	assert_eq!(
+		view.held_paths,
+		BTreeSet::from(["caf\u{e9}.txt".to_string()])
+	);
+}
+
 /// A synced item moved under a directory the view skips is still found, by its own uuid: its
 /// synced path is unknown, not absent, however deep under the skipped directory it sits. A synced
 /// directory's descendants add no line of their own, and the strangers under one skipped

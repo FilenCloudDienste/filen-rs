@@ -33,6 +33,29 @@ fn a_binned_file_lands_under_its_days_bucket_at_its_original_path() {
 	assert!(!root.path().join("docs").join("a.txt").exists());
 }
 
+/// A file another program named in NFD, under a directory named so too, is binned from its NFC key:
+/// on a file system that tells the two forms apart the key alone names nothing. It lands in the bin
+/// under the key's spelling.
+#[test]
+fn an_nfd_named_file_is_binned_from_its_nfc_key() {
+	let root = root();
+	let dir = root.path().join("cafe\u{301}");
+	fs::create_dir(&dir).unwrap();
+	fs::write(dir.join("re\u{301}sume\u{301}.txt"), b"bytes").unwrap();
+
+	let binned = quarantine_local(root.path(), "caf\u{e9}/r\u{e9}sum\u{e9}.txt", day()).unwrap();
+
+	let expected = root
+		.path()
+		.join(".filen-sync-trash")
+		.join("2026-10-26")
+		.join("caf\u{e9}")
+		.join("r\u{e9}sum\u{e9}.txt");
+	assert_eq!(binned, Some(expected.clone()));
+	assert_eq!(fs::read(&expected).unwrap(), b"bytes");
+	assert_eq!(fs::read_dir(&dir).unwrap().count(), 0, "the source is gone");
+}
+
 #[test]
 fn a_bucket_name_pads_month_and_day_to_two_digits() {
 	let root = root();

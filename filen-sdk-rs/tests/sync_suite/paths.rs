@@ -20,9 +20,10 @@
 //! hostile FILE name needs a full encrypted file metadata (key included) the suite cannot build.
 //! The one exception is a DIRECTORY: `create_malformed_dir` given metadata encrypted with the
 //! client's own crypter surfaces as a decodable directory with any name at all, which is how
-//! PATH-19 stages `.` and `..` (under `-F malformed`). There is no seam for the rest, so PATH-01..05,
-//! 08, 09, 13, 14, 21, 24, 25 and the review-added traversal/illegal-char/sanitization-collision/
-//! watch-self-write cases are written as `#[ignore]` stubs that record their plan. They must NOT be
+//! PATH-19 stages `.` and `..`, and PATH-08 and PATH-09 device and trailing-dot names (under
+//! `-F malformed`, see `stage_named_dirs`). There is no seam for the rest, so PATH-01..05, 13, 14,
+//! 21, 24, 25 and the review-added traversal/illegal-char/sanitization-collision/watch-self-write
+//! cases are written as `#[ignore]` stubs that record their plan. They must NOT be
 //! faked: with no injection seam, a "passing" run would assert nothing about hostile-name handling.
 //!
 //! What the current harness genuinely supports — and what is implemented below — is every PATH case
@@ -832,21 +833,102 @@ async fn path_04_embedded_separators_resolve_deterministically() {}
 #[shared_test_runtime]
 async fn path_05_nul_and_control_chars_in_remote_name() {}
 
-/// PATH-08 — OS-reserved device names (CON/PRN/AUX/NUL/COM1/LPT1, "con.txt") from the remote.
-/// Plan: remote files with those names; r2l. Verify: Windows sanitizes/skips-with-warning (never
-/// opens a device, sanitized content byte-exact); POSIX creates verbatim with "X"; no whole-dir
-/// failure; idempotent. (Also Windows-host-only for the device-open behavior.)
-#[ignore = "blocked: needs hostile-remote-name injection seam (Client rejects reserved names) + Windows host — see module docs"]
-#[shared_test_runtime]
-async fn path_08_os_reserved_device_names() {}
+/// Two r2l passes over remote directories named `names`, staged as no conforming client names them
+/// (see `stage_named_dirs`), beside a valid `ok.txt`. Each pass reports exactly `refused` (every one
+/// of them as not storable on this device, with its `detail`) and pulls nothing else in a second
+/// pass, and the local root ends up holding `ok.txt` and a directory per name not refused, each under
+/// its own name.
+#[cfg(feature = "malformed")]
+async fn pull_named_dirs(names: &[&str], refused: &[(&str, &str)]) {
+	let sc = single_client(SyncMode::RemoteToLocal).await;
+	stage_named_dirs(&sc, names).await;
+	let ok = upload_root(&sc, "ok.txt", b"ok").await;
+	assert!(
+		poll_for_item(sc.cache.db_path(), ok.uuid(), CACHE_CONVERGE_TIMEOUT).await,
+		"cache never observed ok.txt"
+	);
 
-/// PATH-09 — names differing only by trailing space or trailing dot (`file`, `file `, `file.`).
-/// Plan: three sibling remote files with distinct contents A/B/C; two r2l passes. Verify: trimming
-/// FS (Windows) surfaces the collision (no silent clobber); POSIX keeps all three distinct
-/// byte-exact; idempotent; baseline records on-disk names (no rename loop).
-#[ignore = "blocked: needs hostile-remote-name injection seam (Client rejects trailing dot/space) — see module docs"]
+	let mut reported: Vec<UnsyncablePath> = refused
+		.iter()
+		.map(|(name, detail)| UnsyncablePath {
+			rel_path: (*name).to_owned(),
+			reason: UnsyncableReason::RemoteNameNotStorable {
+				name: (*name).to_owned(),
+				detail: (*detail).to_owned(),
+			},
+		})
+		.collect();
+	reported.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+	let pulled: Vec<&str> = names
+		.iter()
+		.copied()
+		.filter(|name| !refused.iter().any(|(refused, _)| refused == name))
+		.collect();
+	for pass in 1..=2 {
+		let report = sc.sync().await;
+		assert!(report.errors.is_empty(), "pass {pass}: {report:?}");
+		assert_eq!(report.unsyncable, reported, "pass {pass}: {report:?}");
+		let created = if pass == 1 { pulled.len() } else { 0 };
+		assert_eq!(
+			report.local_dirs_created, created,
+			"pass {pass}: {report:?}"
+		);
+		assert_eq!(
+			report.downloaded,
+			usize::from(pass == 1),
+			"pass {pass}: {report:?}"
+		);
+	}
+	let mut expected: Vec<String> = pulled.iter().map(|name| (*name).to_owned()).collect();
+	expected.push("ok.txt".to_owned());
+	expected.sort_unstable();
+	assert_eq!(
+		walk_tree(&sc.local).into_keys().collect::<Vec<_>>(),
+		expected,
+		"each name the device holds materialized under its own name, and nothing else"
+	);
+	sc.cleanup();
+}
+
+/// PATH-08 — OS-reserved device names from the remote (staged as directories: the injection seam
+/// exists for directories only). Windows leaves every one of them alone and reports it as not
+/// storable on this device, never opening a device; Linux and macOS create each verbatim, with no
+/// report of a name the SDK would not write itself, since the remote already holds it. Idempotent.
+#[cfg(feature = "malformed")]
 #[shared_test_runtime]
-async fn path_09_trailing_space_or_dot_names() {}
+async fn path_08_os_reserved_device_names() {
+	const DEVICE: &str = "Windows reserves the name for a device";
+	let names = ["CON", "COM1", "aux", "nul.txt"];
+	let refused: &[(&str, &str)] = if cfg!(windows) {
+		&[
+			("CON", DEVICE),
+			("COM1", DEVICE),
+			("aux", DEVICE),
+			("nul.txt", DEVICE),
+		]
+	} else {
+		&[]
+	};
+	pull_named_dirs(&names, refused).await;
+}
+
+/// PATH-09 — names differing only by a trailing space or dot (`file`, `file `, `file.`), staged as
+/// directories. Windows, which strips the trailing character, pulls `file` alone and reports the
+/// other two as not storable rather than landing them on top of it; Linux and macOS keep all three
+/// apart under their own names. Idempotent: the second pass renames and pulls nothing.
+#[cfg(feature = "malformed")]
+#[shared_test_runtime]
+async fn path_09_trailing_space_or_dot_names() {
+	const TRAILING: &str =
+		"Windows drops a trailing dot or space, so the item would be stored under another name";
+	let names = ["file", "file ", "file."];
+	let refused: &[(&str, &str)] = if cfg!(windows) {
+		&[("file ", TRAILING), ("file.", TRAILING)]
+	} else {
+		&[]
+	};
+	pull_named_dirs(&names, refused).await;
+}
 
 /// PATH-11 — two remote sibling directories differing only in case (`Data`/`DATA`, staged past the
 /// server's case-insensitive dedup) cannot both map onto one local path, so a remote->local pass

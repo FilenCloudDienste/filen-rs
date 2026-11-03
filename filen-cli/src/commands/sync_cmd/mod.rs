@@ -236,6 +236,9 @@ fn unsyncable_notices(unsyncable: &[UnsyncablePath]) -> Vec<String> {
 				UnsyncableReason::LocalNameCollision | UnsyncableReason::RemoteNameCollision => {
 					". Rename one of them to sync both"
 				}
+				UnsyncableReason::RemoteNameNotStorable { .. } => {
+					". Rename it in the cloud to sync it"
+				}
 				UnsyncableReason::InvalidName { .. }
 				| UnsyncableReason::RepeatedFailure { .. }
 				| UnsyncableReason::RemoteUndecodable

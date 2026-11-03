@@ -42,6 +42,8 @@ mod js_impl;
 // The import of the last synced state of a filen-sync pair this engine replaces.
 mod legacy;
 mod mode;
+// Which remote names this device can hold, and how its file system spells a local key.
+mod names;
 // The local half of a change-scoped pass: re-observe the paths the changelist names.
 mod observe;
 mod outcome;

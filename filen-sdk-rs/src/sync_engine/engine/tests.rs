@@ -2227,6 +2227,113 @@ fn a_local_move_carries_rejected_names_and_aliases() {
 	);
 }
 
+/// A local name the SDK's validator refuses, at a path the remote already holds under that very
+/// name (a legacy client wrote it, and this file system held it), is no reason to freeze the path:
+/// a remote edit is pulled, and nothing is reported.
+#[test]
+fn a_rejected_local_name_the_remote_holds_still_pulls() {
+	let uuid = Uuid::new_v4();
+	let (old, new) = (Blake3Hash::from([1; 32]), Blake3Hash::from([2; 32]));
+	let baseline = HashMap::from([("a:b".to_string(), file_row("a:b", uuid, old))]);
+	let edited = Uuid::new_v4();
+	let remote = view(
+		vec![RemoteNode {
+			stable_uuid: Some(StableUuid::new_for_test(uuid)),
+			..remote_file("a:b", edited, new, 4)
+		}],
+		Vec::new(),
+		&[],
+	);
+	let mut prep = prepared(
+		SyncMode::TwoWay,
+		baseline,
+		vec![local_file("a:b", old)],
+		remote,
+		HashMap::new(),
+	);
+	prep.facts
+		.invalid_names
+		.insert("a:b".to_string(), "forbidden ':'".to_string());
+	let (actions, unsyncable) = run_prepared(prep);
+	assert_eq!(
+		actions,
+		vec![SyncAction::DownloadFile {
+			rel_path: "a:b".to_string(),
+			remote_uuid: edited,
+		}]
+	);
+	assert_eq!(unsyncable, []);
+}
+
+/// The same name where the remote holds nothing is still one the SDK will not write: reported, and
+/// nothing is pushed.
+#[test]
+fn a_rejected_local_name_the_remote_lacks_is_reported_and_not_pushed() {
+	let mut prep = prepared(
+		SyncMode::TwoWay,
+		HashMap::new(),
+		vec![local_file("a:b", Blake3Hash::from([1; 32]))],
+		view(Vec::new(), Vec::new(), &[]),
+		HashMap::new(),
+	);
+	prep.facts
+		.invalid_names
+		.insert("a:b".to_string(), "forbidden ':'".to_string());
+	let (actions, unsyncable) = run_prepared(prep);
+	assert_eq!(actions, []);
+	assert_eq!(
+		unsyncable,
+		vec![UnsyncablePath {
+			rel_path: "a:b".to_string(),
+			reason: UnsyncableReason::InvalidName {
+				detail: "forbidden ':'".to_string(),
+			},
+		}]
+	);
+}
+
+/// The NFC and NFD spellings of one remote name are reported as a collision at the path they share,
+/// and nothing is planned there on either side: not the local copy's upload, not its deletion.
+#[test]
+fn two_unicode_spellings_of_one_remote_name_are_reported_and_left_alone() {
+	let root = Uuid::new_v4();
+	let item = |name: &str| {
+		let uuid = Uuid::new_v4();
+		crate::cache::RemoteItem {
+			uuid,
+			parent: root,
+			name: name.to_string(),
+			stable_uuid: Some(StableUuid::new_for_test(uuid)),
+			hash: Some(Blake3Hash::from([2; 32])),
+			size: 4,
+			modified_millis: 0,
+		}
+	};
+	let view = plan::build_remote_view(
+		root,
+		PairRoot::Directory,
+		&[],
+		&[item("caf\u{e9}.txt"), item("cafe\u{301}.txt")],
+		&[],
+		None,
+	);
+	let (actions, unsyncable) = folded_pass(
+		SyncMode::TwoWay,
+		HashMap::new(),
+		vec![local_file("caf\u{e9}.txt", Blake3Hash::from([1; 32]))],
+		view,
+		HashMap::new(),
+	);
+	assert_eq!(actions, []);
+	assert_eq!(
+		unsyncable,
+		vec![UnsyncablePath {
+			rel_path: "caf\u{e9}.txt".to_string(),
+			reason: UnsyncableReason::RemoteNameCollision,
+		}]
+	);
+}
+
 /// A local rename folded into a remote move carries the report of a never-synced remote item
 /// under the directory to the new path.
 #[test]
