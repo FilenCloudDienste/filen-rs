@@ -328,8 +328,9 @@ fn is_drive_letter(s: &str) -> bool {
 }
 
 /// The sync pairs files in the config directory that `sync` reads when it is given no pairs, in
-/// the order it looks for them. It reads the first that exists.
-const DEFAULT_SYNC_PAIRS_FILES: &[&str] = &["syncPairs.yaml"];
+/// the order it looks for them. It reads the first that exists. syncPairs.json is where the
+/// TypeScript CLI kept its sync pairs, in the same directory.
+const DEFAULT_SYNC_PAIRS_FILES: &[&str] = &["syncPairs.yaml", "syncPairs.json"];
 
 /// The pairs of the first of [`DEFAULT_SYNC_PAIRS_FILES`] that exists in `config_dir`.
 fn read_default_sync_pairs(config_dir: &Path) -> Result<Vec<ParsedPair>> {
@@ -363,7 +364,9 @@ fn no_sync_pairs_message(candidates: &[PathBuf]) -> String {
 	)
 }
 
-/// Reads a syncPairs.yaml file and returns the list of sync pairs it defines, with local paths resolved relative to the file's directory.
+/// Reads a sync pairs file and returns the list of sync pairs it defines, with local paths resolved
+/// relative to the file's directory. The file is YAML, which JSON also is, of one of the shapes
+/// [`sync_pair_entries`] reads.
 fn read_sync_pairs_file(path: &Path) -> Result<Vec<ParsedPair>> {
 	let content = std::fs::read_to_string(path).map_err(|e| {
 		UI::failure(&format!(
@@ -371,13 +374,13 @@ fn read_sync_pairs_file(path: &Path) -> Result<Vec<ParsedPair>> {
 			path.display()
 		))
 	})?;
-	let file: SyncPairsFile = serde_yaml::from_str(&content).map_err(|e| {
+	let entries = sync_pair_entries(&content).map_err(|e| {
 		UI::failure(&format!(
 			"Failed to parse sync pairs file {}: {e}",
 			path.display()
 		))
 	})?;
-	if file.sync_pairs.is_empty() {
+	if entries.is_empty() {
 		return Err(UI::failure(&format!(
 			"The sync pairs file {} defines no sync pairs",
 			path.display()
@@ -385,7 +388,7 @@ fn read_sync_pairs_file(path: &Path) -> Result<Vec<ParsedPair>> {
 	}
 	let base = path.parent().unwrap_or(Path::new(""));
 	let home = dirs::home_dir();
-	file.sync_pairs
+	entries
 		.into_iter()
 		.map(|entry| {
 			let mode = match entry.mode.as_deref() {
@@ -407,7 +410,21 @@ fn read_sync_pairs_file(path: &Path) -> Result<Vec<ParsedPair>> {
 		.collect()
 }
 
-/// syncPairs.yaml file format
+/// The sync pairs `content`, a sync pairs file, defines: a map whose `syncPairs` key lists them, a
+/// list of them, or a single one, the last two as the TypeScript CLI's syncPairs.json gave them.
+fn sync_pair_entries(content: &str) -> serde_yaml::Result<Vec<SyncPairEntry>> {
+	// The shape is read first, then the content again as that shape, which keeps the place of an
+	// error in it, such as `syncPairs[0]:`, in the error.
+	match serde_yaml::from_str(content)? {
+		serde_yaml::Value::Sequence(_) => serde_yaml::from_str(content),
+		serde_yaml::Value::Mapping(map) if map.contains_key("syncPairs") => {
+			serde_yaml::from_str::<SyncPairsFile>(content).map(|file| file.sync_pairs)
+		}
+		_ => serde_yaml::from_str::<SyncPairEntry>(content).map(|entry| vec![entry]),
+	}
+}
+
+/// A sync pairs file that lists its sync pairs under `syncPairs`.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SyncPairsFile {
@@ -623,11 +640,11 @@ mod tests {
 
 		assert_eq!(exit_code(&error), 2);
 		let message = error.to_string();
-		let path = config_dir.path().join("syncPairs.yaml");
 		assert!(
 			message.starts_with(&format!(
-				"No sync pairs given, and there is no sync pairs file at {}.\n",
-				path.display()
+				"No sync pairs given, and there is no sync pairs file at {} or {}.\n",
+				config_dir.path().join("syncPairs.yaml").display(),
+				config_dir.path().join("syncPairs.json").display()
 			)),
 			"{message}"
 		);
@@ -658,6 +675,96 @@ mod tests {
 				SyncMode::TwoWay,
 				"/docs"
 			)]
+		);
+	}
+
+	/// The TypeScript CLI's sync pairs file, where `sync` without pairs finds it when there is no
+	/// syncPairs.yaml.
+	#[test]
+	fn no_pairs_reads_the_typescript_clis_sync_pairs_file_without_a_yaml_one() {
+		let config_dir = tempfile::tempdir().unwrap();
+		std::fs::write(
+			config_dir.path().join("syncPairs.json"),
+			r#"[{"local": "/l", "remote": "/r", "syncMode": "localBackup"}]"#,
+		)
+		.unwrap();
+
+		assert_eq!(
+			parse_sync_pairs(config_dir.path(), &[]).unwrap(),
+			[pair("/l", SyncMode::LocalBackup, "/r")]
+		);
+	}
+
+	#[test]
+	fn a_syncpairs_yaml_is_read_before_a_syncpairs_json() {
+		let config_dir = tempfile::tempdir().unwrap();
+		std::fs::write(
+			config_dir.path().join("syncPairs.yaml"),
+			"syncPairs:\n  - local: /yaml\n    remote: /r\n",
+		)
+		.unwrap();
+		std::fs::write(
+			config_dir.path().join("syncPairs.json"),
+			r#"[{"local": "/json", "remote": "/r"}]"#,
+		)
+		.unwrap();
+
+		assert_eq!(
+			parse_sync_pairs(config_dir.path(), &[]).unwrap(),
+			[pair("/yaml", SyncMode::TwoWay, "/r")]
+		);
+	}
+
+	/// A list of pairs at the top, as the TypeScript CLI wrote its syncPairs.json, indented with
+	/// tabs as JSON may be.
+	#[test]
+	fn a_sync_pairs_file_can_be_a_json_list() {
+		let (_dir, path) = sync_pairs_file(
+			"syncPairs.json",
+			"[\n\t{\n\t\t\"local\": \"/a\",\n\t\t\"remote\": \"/r/a\",\n\t\t\"syncMode\": \"cloudBackup\"\n\t},\n\
+			 \t{\"local\": \"/b\", \"remote\": \"/r/b\"}\n]\n",
+		);
+
+		assert_eq!(
+			read_sync_pairs_file(&path).unwrap(),
+			[
+				pair("/a", SyncMode::RemoteBackup, "/r/a"),
+				pair("/b", SyncMode::TwoWay, "/r/b"),
+			]
+		);
+	}
+
+	/// The TypeScript CLI also read a single pair, not in a list.
+	#[test]
+	fn a_sync_pairs_file_can_be_a_single_pair() {
+		let (_dir, path) = sync_pairs_file(
+			"syncPairs.json",
+			r#"{"local": "/l", "remote": "/r", "syncMode": "cloudToLocal"}"#,
+		);
+
+		assert_eq!(
+			read_sync_pairs_file(&path).unwrap(),
+			[pair("/l", SyncMode::RemoteToLocal, "/r")]
+		);
+	}
+
+	/// An error in a list names the pair it is in.
+	#[test]
+	fn a_json_list_with_a_pair_without_a_remote_is_a_failure() {
+		let (_dir, path) = sync_pairs_file(
+			"syncPairs.json",
+			r#"[{"local": "/l", "remote": "/r"}, {"local": "/l"}]"#,
+		);
+
+		let error = read_sync_pairs_file(&path).unwrap_err();
+
+		assert_eq!(exit_code(&error), 1);
+		assert!(
+			error.to_string().starts_with(&format!(
+				"Failed to parse sync pairs file {}: .[1]: missing field `remote`",
+				path.display()
+			)),
+			"{error}"
 		);
 	}
 

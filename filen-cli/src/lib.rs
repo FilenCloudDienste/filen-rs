@@ -231,7 +231,8 @@ pub(crate) struct CliArgs {
 ///   credentials; `filen export-auth-config` writes one to the current directory instead
 /// - `filen-sdk-rs-cache`: the cache of the drive's metadata that `sync` keeps
 /// - `sync-engine.db`: the state of each sync pair `sync` has run
-/// - `syncPairs.yaml`: the sync pairs `sync` runs when it is given none (you write it)
+/// - `syncPairs.yaml`, or `syncPairs.json` as the older CLI wrote it: the sync pairs `sync` runs
+///   when it is given none (you write it)
 /// - `rclone/`: the managed rclone, and the state and the file cache of the rclone that `mount`
 ///   and `serve` run
 /// - `repl_history`: the lines entered in the REPL

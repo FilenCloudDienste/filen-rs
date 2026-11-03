@@ -66,8 +66,8 @@ pub(crate) enum SyncCommands {
 		/// Pair of local and remote directories to sync.
 		/// Format: `<local>:<remote>` (two-way) or `<local>:<mode>:<remote>`, where `<mode>` is one of `twoWay` (or `tw`), `localToRemote` (or `localToCloud`, `ltc`), `remoteToLocal` (or `cloudToLocal`, `ctl`), `localBackup` (or `lb`), `remoteBackup` (or `cloudBackup`, `cb`).
 		/// The remote path is what follows the last `:`, so a remote path with a `:` in it can only be given in a sync pairs file.
-		/// Alternatively, specify a syncPairs.yaml.
-		/// If none are specified, the default syncPairs.yaml under the config dir is included.
+		/// Alternatively, the path to a sync pairs file: YAML, or JSON as the TypeScript CLI's syncPairs.json.
+		/// If none are given, the pairs of syncPairs.yaml in the config dir, or else of syncPairs.json there.
 		#[arg(value_name = "PAIR")]
 		pairs: Vec<String>,
 		/// A sync pair, as a PAIR argument gives it.
