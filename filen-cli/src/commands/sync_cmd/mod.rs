@@ -162,40 +162,61 @@ pub(crate) async fn sync(
 	let (events_tx, mut events_rx) = mpsc::unbounded_channel();
 
 	// start syncing
-	let watch_handles = futures::future::join_all(pairs.iter().map(async |pair| {
-		let pair_id = pair.id;
-		let events_tx = events_tx.clone();
-		if once {
-			engine
-				.sync_once_observed(pair_id, &mut move |event| {
-					let _ = events_tx.send((pair_id, event));
-				})
-				.await
-				.with_context(|| {
-					format!("Failed to watch sync pair {}", label_of(&labels, pair_id))
-				})?;
-			// todo: print report
-			Ok::<_, anyhow::Error>(None)
-		} else {
-			let watch_handle = engine
-				.clone()
-				.watch_observed(
-					pair_id,
-					Box::new(move |event| {
+	let watches =
+		futures::future::join_all(pairs.iter().filter(|pair| !pair.paused).map(async |pair| {
+			let pair_id = pair.id;
+			let events_tx = events_tx.clone();
+			let watch = if once {
+				engine
+					.sync_once_observed(pair_id, &mut move |event| {
 						let _ = events_tx.send((pair_id, event));
-					}),
-				)
-				.await
-				.with_context(|| {
-					format!("Failed to watch sync pair {}", label_of(&labels, pair_id))
-				})?;
-			Ok(Some(watch_handle))
+					})
+					.await
+					// todo: print report
+					.map(|_| None)
+			} else {
+				engine
+					.clone()
+					.watch_observed(
+						pair_id,
+						Box::new(move |event| {
+							let _ = events_tx.send((pair_id, event));
+						}),
+					)
+					.await
+					.map(Some)
+			};
+			(pair_id, watch)
+		}))
+		.await;
+	// each pair that is not synced, named on its own line now and counted in the exit status
+	let mut not_started = Vec::new();
+	// the engine refuses to watch a paused pair, which is no failure of the watch
+	for pair in pairs.iter().filter(|pair| pair.paused) {
+		let label = label_of(&labels, pair.id);
+		ui.print_failure(&format!(
+			"The sync pair {label} is paused, so it is not synced"
+		));
+		not_started.push(label);
+	}
+	let mut started = 0;
+	let mut watch_handles = Vec::new();
+	for (pair_id, watch) in watches {
+		match watch {
+			Ok(watch) => {
+				started += 1;
+				watch_handles.extend(watch);
+			}
+			Err(e) => {
+				let label = label_of(&labels, pair_id);
+				ui.print_failure(&format!("Failed to watch the sync pair {label}: {e}"));
+				not_started.push(label);
+			}
 		}
-	}))
-	.await
-	.into_iter()
-	.filter_map(Result::transpose)
-	.collect::<Result<Vec<_>>>()?;
+	}
+	if started == 0 {
+		return Err(UI::failure("None of the sync pairs could be synced"));
+	}
 	let stop_handles = futures::future::join_all(watch_handles.into_iter().map(|h| h.stop())); // won't be called until awaited
 
 	let mut pairs_that_have_had_passes = HashSet::new();
@@ -233,7 +254,7 @@ pub(crate) async fn sync(
 				let is_first_pass = !pairs_that_have_had_passes.contains(&pair_id);
 
 				// if --once is set, stop after all have completed
-				if once && pairs_that_have_had_passes.len() == pairs.len() {
+				if once && pairs_that_have_had_passes.len() == started {
 					ui.print_success("All pairs synced.");
 					break false;
 				}
@@ -317,6 +338,12 @@ pub(crate) async fn sync(
 	stop_handles.await;
 	if stopped_by_ctrl_c {
 		ui.print_muted("Stopped.");
+	}
+	if !not_started.is_empty() {
+		return Err(UI::failure(&format!(
+			"Not every sync pair was synced: {}",
+			not_started.join(", ")
+		)));
 	}
 	Ok(())
 }
