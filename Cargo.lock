@@ -3459,7 +3459,7 @@ dependencies = [
 [[package]]
 name = "inquire"
 version = "0.9.4"
-source = "git+https://github.com/JupiterPi/inquire.git?branch=async-autocomplete#d8810e58076f7726fc7a30249f6ee0debe7ad4ce"
+source = "git+https://github.com/JupiterPi/inquire.git?rev=d8810e58076f7726fc7a30249f6ee0debe7ad4ce#d8810e58076f7726fc7a30249f6ee0debe7ad4ce"
 dependencies = [
  "bitflags 2.13.1",
  "crossterm",
@@ -4004,7 +4004,7 @@ dependencies = [
 [[package]]
 name = "manuel"
 version = "0.1.0"
-source = "git+https://github.com/JupiterPi/manuel#cf09d23fabdd7ef64567b751210292b2bf7b16da"
+source = "git+https://github.com/JupiterPi/manuel?rev=cf09d23fabdd7ef64567b751210292b2bf7b16da#cf09d23fabdd7ef64567b751210292b2bf7b16da"
 dependencies = [
  "ansi-to-tui",
  "anyhow",
