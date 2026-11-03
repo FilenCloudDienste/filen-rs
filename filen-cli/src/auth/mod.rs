@@ -366,9 +366,7 @@ async fn authenticate_from_auth_config(
 	let candidates = if let Some(path) = path_arg {
 		// a path given explicitly must be used, never skipped for another account's credentials
 		vec![(PathBuf::from(path), AuthConfigLocation::Given)]
-	} else if std::env::var("FILEN_CLI_TESTING_DISABLE_AUTODETECTED_AUTH_CONFIG")
-		== Ok("1".to_string())
-	{
+	} else if testing_switch_is_on(TESTING_DISABLE_AUTODETECTED_AUTH_CONFIG) {
 		return Ok(None);
 	} else {
 		get_auth_config_default_locations(config)
@@ -595,10 +593,30 @@ fn canonical_or_given(path: &Path) -> PathBuf {
 	})
 }
 
+// The CLI's tests set these environment variables to `1`, so that a test run never reads or
+// deletes the credentials of whoever runs it. Each one only turns a source of stored credentials
+// off: someone who sets one outside the tests is at worst asked to log in, so they are harmless in
+// a release build, and stay in it rather than behind a cfg the tests' binary would need too.
+
+/// Turns the system keyring off for reading: no login is read from it or deleted from it at
+/// logout, no key of the old CLI is read from it, and an imported login of the old CLI is not
+/// offered to be kept in it.
+const TESTING_DISABLE_KEYRING: &str = "FILEN_CLI_TESTING_DISABLE_KEYRING";
+/// Turns off the auth config files in the default locations and the credentials the old CLI
+/// saved. An auth config given with `--auth-config-path` is still used, and logout still offers to
+/// delete the files in the default locations.
+const TESTING_DISABLE_AUTODETECTED_AUTH_CONFIG: &str =
+	"FILEN_CLI_TESTING_DISABLE_AUTODETECTED_AUTH_CONFIG";
+
+/// Whether the tests set the switch `name` (see [`TESTING_DISABLE_KEYRING`]).
+fn testing_switch_is_on(name: &str) -> bool {
+	std::env::var(name).is_ok_and(|value| value == "1")
+}
+
 /// Whether the tests turned the keyring off, so that they neither read nor delete the
 /// credentials of whoever runs them.
 fn keyring_disabled_for_testing() -> bool {
-	std::env::var("FILEN_CLI_TESTING_DISABLE_KEYRING") == Ok("1".to_string())
+	testing_switch_is_on(TESTING_DISABLE_KEYRING)
 }
 
 /// Authenticate using SDK config stored in the keyring.
@@ -773,7 +791,7 @@ async fn authenticate_from_old_cli(
 	ui: &mut UI,
 	client_config_args: &ClientConfigArgs,
 ) -> Result<Option<(Client, PathBuf)>> {
-	if std::env::var("FILEN_CLI_TESTING_DISABLE_AUTODETECTED_AUTH_CONFIG") == Ok("1".to_string()) {
+	if testing_switch_is_on(TESTING_DISABLE_AUTODETECTED_AUTH_CONFIG) {
 		return Ok(None);
 	}
 	let is_dev = cfg!(debug_assertions);
