@@ -456,7 +456,7 @@ async fn import_legacy_state(
 		.import_legacy_state(pair, state_dir.to_path_buf())
 		.await
 	{
-		Ok(LegacyImport { imported, skipped }) => ui.print(&format!(
+		Ok(LegacyImport { imported, skipped }) => ui.print_success(&format!(
 			"Imported the TypeScript CLI's sync state of the sync pair {} <> {remote_path}: \
 			 {imported} synced file(s), {skipped} unreadable line(s) skipped",
 			local.display()

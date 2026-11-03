@@ -104,12 +104,16 @@ fn print(ui: &mut UI, log: &mut EventLog<'_>, pair: PairId, message: Message) {
 	match message {
 		// what the flags settle of it, the pass settles once it has ended
 		Message::Event(event) => {
-			let _ = log.print(pair, &event);
+			let _ = log.print(ui, pair, &event);
 		}
-		Message::Approved(line) => log.print_approved(pair, &line),
-		Message::Paused => ui.print_failure(&paused_message(log.label(pair))),
+		Message::Approved(line) => log.print_approved(ui, pair, &line),
+		Message::Paused => {
+			let message = paused_message(log.label(pair));
+			log.print_failure(ui, &message);
+		}
 		Message::ResolveFailed { rel_path, error } => {
-			ui.print_failure(&resolve_failure_message(&rel_path, log.label(pair), &error))
+			let message = resolve_failure_message(&rel_path, log.label(pair), &error);
+			log.print_failure(ui, &message);
 		}
 	}
 }

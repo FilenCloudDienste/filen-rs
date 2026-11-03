@@ -18,6 +18,11 @@
 //! and a second Ctrl+C, which quits without waiting for the passes in flight, exits either with
 //! 130. An invalid command line exits with 2.
 //!
+//! `sync` says which sync pairs it starts on, then prints a line for each thing a pass does, with
+//! the time and the sync pair; failures go to stderr. With `--quiet`, it prints only failures, what
+//! needs attention or was settled, and what each pass did. Every line also goes to the log files
+//! (unless `--no-log-file` is given), so a sync nobody watches leaves a record.
+//!
 //! Sync pairs stay registered in the sync database under the config directory after the run that
 //! set them up. A run that cannot set up one of its sync pairs registers none of them. Only one
 //! `filen sync` can use that database at a time.
@@ -69,7 +74,6 @@
 use std::{
 	borrow::Cow,
 	collections::{HashMap, HashSet},
-	io,
 	path::Path,
 	sync::Arc,
 };
@@ -81,16 +85,12 @@ use filen_sdk_rs::sync_engine::{
 	BaselineInUse, ConflictResolution, ConflictResolved, PairId, PairRecord, SyncEngine, SyncEvent,
 	TransferDirection, UnsyncablePath, UnsyncableReason,
 };
+use log::info;
 use tokio::sync::mpsc;
 
 use crate::{
-	CliConfig, CommandResult,
-	auth::LazyClient,
-	commands::CommandContext,
-	docs::DocElement,
-	interrupt,
-	ui::{UI, write_stdout_line},
-	util::RemotePath,
+	CliConfig, CommandResult, auth::LazyClient, commands::CommandContext, docs::DocElement,
+	interrupt, ui::UI, util::RemotePath,
 };
 
 mod conflict_resolutions;
@@ -245,7 +245,8 @@ async fn sync(
 	)?;
 	// once, before the passes start: labelling an event must not ask the server for anything
 	let labels = sync_pairs::pair_labels(client, &pairs).await;
-	let log = EventLog::new(&labels, settle);
+	let log = EventLog::new(&labels, settle, Output::of(ui));
+	log.print_banners(ui, &pairs, once);
 	if once {
 		once::sync_once(ui, &engine, &pairs, log, settle).await
 	} else {
@@ -313,11 +314,11 @@ async fn sync_continuously(
 			() = ctrl_c.pressed() => break true,
 		};
 		last_passes.note(pair_id, &event);
-		match log.print(pair_id, &event) {
+		match log.print(ui, pair_id, &event) {
 			None => {}
 			Some(Settlement::ApproveDeletions { count, pass_token }) => {
 				engine.approve_deletions(pair_id, pass_token).await;
-				log.print_approved(pair_id, &approved_deletions_line(count));
+				log.print_approved(ui, pair_id, &approved_deletions_line(count));
 			}
 			Some(Settlement::ResolveConflict {
 				rel_path,
@@ -326,11 +327,12 @@ async fn sync_continuously(
 				Ok(resolved) => {
 					last_passes.resolved(pair_id, rel_path);
 					for line in resolved_conflict_lines(rel_path, resolution, resolved) {
-						log.print_approved(pair_id, &line);
+						log.print_approved(ui, pair_id, &line);
 					}
 				}
 				Err(e) => {
-					ui.print_failure(&resolve_failure_message(rel_path, log.label(pair_id), &e))
+					let message = resolve_failure_message(rel_path, log.label(pair_id), &e);
+					log.print_failure(ui, &message);
 				}
 			},
 		}
@@ -347,7 +349,7 @@ async fn sync_continuously(
 	// more, as the sync has stopped
 	while let Ok((pair_id, event)) = events_rx.try_recv() {
 		last_passes.note(pair_id, &event);
-		let _ = log.print(pair_id, &event);
+		let _ = log.print(ui, pair_id, &event);
 	}
 
 	if !stopped_by_ctrl_c {
@@ -371,12 +373,73 @@ async fn sync_continuously(
 }
 
 /// Prints the events of a run's pairs, and says which of them the flags settle.
+///
+/// Every line it prints is also logged, so that an unattended sync leaves a record in the log
+/// files. Unlike most printed output, which can hold secrets, a sync's lines hold only paths.
 struct EventLog<'a> {
 	labels: &'a HashMap<PairId, String>,
 	settle: &'a Settle,
 	/// The pairs that have finished a pass. Mass deletion approvals and conflict resolutions are
 	/// only applied on a pair's first pass, where we can be sure they were intentional.
 	passed: HashSet<PairId>,
+	output: Output,
+}
+
+/// How the events are shown.
+enum Output {
+	/// A line for each event. With `quiet`, only the lines that must be read: failures, what
+	/// needs attention or was settled, and what each pass did.
+	Text { quiet: bool },
+}
+
+impl Output {
+	/// The output `ui`'s flags ask for.
+	fn of(ui: &UI) -> Self {
+		Self::Text {
+			quiet: ui.is_quiet(),
+		}
+	}
+}
+
+/// Where the line of an event goes.
+#[derive(Debug, PartialEq)]
+enum LineKind {
+	/// To stdout, unless `--quiet` leaves it out.
+	Detail,
+	/// To stdout, even with `--quiet`.
+	Kept,
+	/// To stderr.
+	Failure,
+}
+
+/// What a line of an event is to a reader.
+fn line_kind(event: &SyncEvent) -> LineKind {
+	match event {
+		SyncEvent::Refused { .. }
+		| SyncEvent::ActionFailed { .. }
+		| SyncEvent::PassFailed { .. } => LineKind::Failure,
+		// a copy moved aside is named nowhere else
+		SyncEvent::PassCompleted { .. }
+		| SyncEvent::Interrupted { .. }
+		| SyncEvent::Quarantined { .. } => LineKind::Kept,
+		// what needs attention of a conflict or a held deletion has a line of its own
+		SyncEvent::PassStarted { .. }
+		| SyncEvent::Planned { .. }
+		| SyncEvent::Conflict { .. }
+		| SyncEvent::DeletionsHeld { .. }
+		| SyncEvent::Uploading { .. }
+		| SyncEvent::Downloading { .. }
+		| SyncEvent::Progress { .. }
+		| SyncEvent::CreatingRemoteDir { .. }
+		| SyncEvent::CreatingLocalDir { .. }
+		| SyncEvent::TrashingRemote { .. }
+		| SyncEvent::DeletingLocal { .. }
+		| SyncEvent::MovingRemote { .. }
+		| SyncEvent::MovingLocal { .. }
+		| SyncEvent::AdoptedBaseline { .. }
+		| SyncEvent::AwaitingRemote
+		| SyncEvent::Scanning { .. } => LineKind::Detail,
+	}
 }
 
 /// What the flags settle of what a pass found.
@@ -392,11 +455,12 @@ enum Settlement<'e> {
 }
 
 impl<'a> EventLog<'a> {
-	fn new(labels: &'a HashMap<PairId, String>, settle: &'a Settle) -> Self {
+	fn new(labels: &'a HashMap<PairId, String>, settle: &'a Settle, output: Output) -> Self {
 		Self {
 			labels,
 			settle,
 			passed: HashSet::new(),
+			output,
 		}
 	}
 
@@ -409,10 +473,34 @@ impl<'a> EventLog<'a> {
 		}
 	}
 
+	/// Says which pairs the sync starts on, and how long it runs.
+	fn print_banners(&self, ui: &mut UI, pairs: &[PairRecord], once: bool) {
+		// a paused pair is said to be paused instead
+		for pair in pairs.iter().filter(|pair| !pair.paused) {
+			self.print_banner(ui, pair.id, once);
+		}
+	}
+
+	/// Says that the sync starts on `pair`, and how long it runs. Not with `--quiet`.
+	fn print_banner(&self, ui: &mut UI, pair: PairId, once: bool) {
+		let until = if once { "once" } else { "Ctrl-C to stop" };
+		let banner = format!("Syncing {} ({until})", self.label(pair));
+		info!("{banner}");
+		let Output::Text { quiet } = self.output;
+		if !quiet {
+			ui.print(&banner);
+		}
+	}
+
 	/// Prints `event` of `pair`, with what needs the user's attention, and returns what the flags
 	/// settle of it, which the caller carries out.
-	fn print<'e>(&mut self, pair: PairId, event: &'e SyncEvent) -> Option<Settlement<'e>> {
-		self.print_line(pair, &format_sync_event(event));
+	fn print<'e>(
+		&mut self,
+		ui: &mut UI,
+		pair: PairId,
+		event: &'e SyncEvent,
+	) -> Option<Settlement<'e>> {
+		self.print_line(ui, pair, line_kind(event), &format_sync_event(event));
 		if let SyncEvent::PassCompleted { .. } | SyncEvent::PassFailed { .. } = event {
 			self.passed.insert(pair);
 		}
@@ -428,6 +516,7 @@ impl<'a> EventLog<'a> {
 					});
 				}
 				self.print_needs_attention(
+					ui,
 					pair,
 					&format!(
 						"Held back {count} deletions. If you wish to execute them, re-run the command with --approve-mass-deletions"
@@ -437,7 +526,7 @@ impl<'a> EventLog<'a> {
 			// paths the engine leaves alone, which no other event names
 			SyncEvent::PassCompleted { report } => {
 				for notice in unsyncable_notices(&report.unsyncable) {
-					self.print_needs_attention(pair, &notice);
+					self.print_needs_attention(ui, pair, &notice);
 				}
 			}
 			SyncEvent::Conflict { rel_path } => {
@@ -450,6 +539,7 @@ impl<'a> EventLog<'a> {
 					});
 				}
 				self.print_needs_attention(
+					ui,
 					pair,
 					&format!(
 						"Conflict detected. To resolve it, re-run the command with --keep-local/--keep-remote/--keep-both \"{rel_path}\""
@@ -462,34 +552,52 @@ impl<'a> EventLog<'a> {
 		None
 	}
 
-	fn print_line(&self, pair: PairId, msg: &str) {
-		write_stdout_line(
-			&mut io::stdout().lock(),
-			&format!(
-				"{} {}: {}",
-				style(format!(
-					"[{}]",
-					chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
-				))
-				.dim(),
-				style(format!("[{}]", self.label(pair))).bold(),
-				msg,
-			),
+	/// Logs `msg`, a line of `pair` of the given kind, and prints it with the time and the pair's
+	/// label, where its kind says.
+	fn print_line(&mut self, ui: &mut UI, pair: PairId, kind: LineKind, msg: &str) {
+		let label = self.label(pair);
+		info!("[{label}] {}", console::strip_ansi_codes(msg));
+		let Output::Text { quiet } = self.output;
+		if quiet && kind == LineKind::Detail {
+			return;
+		}
+		let line = format!(
+			"{} {}: {}",
+			style(format!(
+				"[{}]",
+				chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
+			))
+			.dim(),
+			style(format!("[{label}]")).bold(),
+			msg,
 		);
+		match kind {
+			LineKind::Detail | LineKind::Kept => ui.print(&line),
+			LineKind::Failure => ui.print_to_stderr(&line),
+		}
 	}
 
-	fn print_needs_attention(&self, pair: PairId, msg: &str) {
+	fn print_needs_attention(&mut self, ui: &mut UI, pair: PairId, msg: &str) {
 		self.print_line(
+			ui,
 			pair,
+			LineKind::Kept,
 			&format!("{} {}", style("[NEEDS ATTENTION]").yellow().bold(), msg),
 		);
 	}
 
-	fn print_approved(&self, pair: PairId, msg: &str) {
+	fn print_approved(&mut self, ui: &mut UI, pair: PairId, msg: &str) {
 		self.print_line(
+			ui,
 			pair,
+			LineKind::Kept,
 			&format!("{} {}", style("[APPROVED]").green().bold(), msg),
 		);
+	}
+
+	/// Prints a failure that is not an event's, such as a conflict that could not be resolved.
+	fn print_failure(&mut self, ui: &mut UI, msg: &str) {
+		ui.print_failure(msg);
 	}
 }
 
@@ -657,15 +765,18 @@ fn format_sync_event(event: &SyncEvent) -> String {
 
 #[cfg(test)]
 mod tests {
-	use filen_sdk_rs::sync_engine::{UnsyncablePath, UnsyncableReason};
+	use std::{collections::HashMap, path::Path};
 
-	use std::path::Path;
-
-	use filen_sdk_rs::{Error, ErrorKind, sync_engine::BaselineInUse};
+	use filen_sdk_rs::{
+		Error, ErrorKind,
+		sync_engine::{BaselineInUse, SyncMode, SyncReport, UnsyncablePath, UnsyncableReason},
+	};
 
 	use super::{
-		SyncCommands, SyncEvent, format_sync_event, given_pairs, open_failure, unsyncable_notices,
+		ConflictResolutions, EventLog, Output, Settle, SyncCommands, SyncEvent, format_sync_event,
+		given_pairs, open_failure, unsyncable_notices,
 	};
+	use crate::ui::test_support::Printed;
 	use crate::{commands::Commands, parse_repl_line};
 
 	/// The pairs the REPL line `line`, a `sync` command, gives.
@@ -811,6 +922,109 @@ mod tests {
 				"Moving local d -> e",
 			]
 		);
+	}
+
+	/// Each line `events` of pair 1, labelled `L`, print to stdout and to stderr with `output`,
+	/// from the label on.
+	fn printed(output: Output, events: &[SyncEvent]) -> (Vec<String>, Vec<String>) {
+		let out = Printed::default();
+		let err = Printed::default();
+		let mut ui = Printed::split_ui(&out, &err);
+		let labels = HashMap::from([(1, "L".to_string())]);
+		let settle = Settle {
+			approve_mass_deletions: false,
+			conflict_resolutions: ConflictResolutions::new(vec![], vec![], vec![]).unwrap(),
+		};
+		let mut log = EventLog::new(&labels, &settle, output);
+		for event in events {
+			let _ = log.print(&mut ui, 1, event);
+		}
+		let lines = |printed: &Printed| {
+			console::strip_ansi_codes(&printed.lines_or_empty())
+				.lines()
+				// after the time
+				.map(|line| line.split_once("] ").unwrap().1.to_owned())
+				.collect()
+		};
+		(lines(&out), lines(&err))
+	}
+
+	/// A pass that uploaded a file, failed another and held back a conflict.
+	fn a_pass() -> Vec<SyncEvent> {
+		vec![
+			SyncEvent::PassStarted {
+				mode: SyncMode::TwoWay,
+			},
+			SyncEvent::Conflict {
+				rel_path: "c".to_string(),
+			},
+			SyncEvent::Uploading {
+				rel_path: "a".to_string(),
+			},
+			SyncEvent::ActionFailed {
+				rel_path: "b".to_string(),
+				error: "denied".to_string(),
+			},
+			SyncEvent::PassCompleted {
+				report: SyncReport::default(),
+			},
+		]
+	}
+
+	#[test]
+	fn every_event_has_a_line_and_failures_go_to_stderr() {
+		let (out, err) = printed(Output::Text { quiet: false }, &a_pass());
+
+		assert_eq!(
+			out,
+			[
+				"[L]: Sync pass started",
+				"[L]: Conflict: c changed on both sides, left untouched",
+				"[L]: [NEEDS ATTENTION] Conflict detected. To resolve it, re-run the command with \
+				 --keep-local/--keep-remote/--keep-both \"c\"",
+				"[L]: Uploaded a",
+				"[L]: Sync pass completed: 0 uploaded, 0 downloaded, 0 remote / 0 local dir(s) \
+				 created, 0 trashed remotely, 0 deleted locally, 0 moved remotely, 0 moved locally, \
+				 0 conflict(s), 0 error(s)",
+			]
+		);
+		assert_eq!(err, ["[L]: Failed to sync b: denied"]);
+	}
+
+	#[test]
+	fn quiet_keeps_what_needs_attention_failures_and_the_pass_summary() {
+		let (out, err) = printed(Output::Text { quiet: true }, &a_pass());
+
+		assert_eq!(
+			out,
+			[
+				"[L]: [NEEDS ATTENTION] Conflict detected. To resolve it, re-run the command with \
+				 --keep-local/--keep-remote/--keep-both \"c\"",
+				"[L]: Sync pass completed: 0 uploaded, 0 downloaded, 0 remote / 0 local dir(s) \
+				 created, 0 trashed remotely, 0 deleted locally, 0 moved remotely, 0 moved locally, \
+				 0 conflict(s), 0 error(s)",
+			]
+		);
+		assert_eq!(err, ["[L]: Failed to sync b: denied"]);
+	}
+
+	#[test]
+	fn a_banner_names_each_pair_and_how_long_it_syncs() {
+		let out = Printed::default();
+		let mut ui = Printed::split_ui(&out, &Printed::default());
+		let labels = HashMap::from([(1, "L".to_string())]);
+		let settle = Settle {
+			approve_mass_deletions: false,
+			conflict_resolutions: ConflictResolutions::new(vec![], vec![], vec![]).unwrap(),
+		};
+		let log = EventLog::new(&labels, &settle, Output::Text { quiet: false });
+
+		log.print_banner(&mut ui, 1, true);
+		log.print_banner(&mut ui, 1, false);
+		let quiet = EventLog::new(&labels, &settle, Output::Text { quiet: true });
+		quiet.print_banner(&mut ui, 1, false);
+
+		assert_eq!(out.lines(), "Syncing L (once)\nSyncing L (Ctrl-C to stop)");
 	}
 
 	#[test]
