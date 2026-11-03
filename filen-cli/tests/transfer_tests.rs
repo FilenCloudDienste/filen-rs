@@ -577,3 +577,226 @@ async fn uploading_without_following_symlinks_lists_them_in_the_json_result() {
 	);
 	assert_eq!(result["files"], 1);
 }
+
+/// The uuid of the file at `rel_path` below the test directory.
+async fn file_uuid_at(client: &Client, test_dir_name: &str, rel_path: &str) -> Uuid {
+	remote_file_uuid(client, &format!("{test_dir_name}/{rel_path}")).await
+}
+
+#[shared_test_runtime]
+async fn uploading_with_skip_existing_keeps_same_named_files_whatever_their_case() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir_name = resources.dir.name().unwrap();
+
+	let first = tempfile::tempdir().unwrap();
+	std::fs::create_dir(first.path().join("up")).unwrap();
+	std::fs::write(first.path().join("up").join("Notes.TXT"), b"first").unwrap();
+	authenticated_cli_with_args!(
+		"upload",
+		first.path().join("up").to_str().unwrap(),
+		test_dir_name
+	)
+	.success();
+	let kept = file_uuid_at(client, test_dir_name, "up/Notes.TXT").await;
+
+	let second = tempfile::tempdir().unwrap();
+	std::fs::create_dir(second.path().join("up")).unwrap();
+	std::fs::write(
+		second.path().join("up").join("notes.txt"),
+		b"second version",
+	)
+	.unwrap();
+	std::fs::write(second.path().join("up").join("new.txt"), b"new").unwrap();
+	let output = authenticated_cli_with_args!(
+		"upload",
+		"--skip-existing",
+		second.path().join("up").to_str().unwrap(),
+		test_dir_name
+	)
+	.success();
+
+	assert_eq!(
+		file_uuid_at(client, test_dir_name, "up/Notes.TXT").await,
+		kept
+	);
+	assert!(matches!(
+		client
+			.find_item_at_path(&format!("{test_dir_name}/up/new.txt"))
+			.await
+			.unwrap(),
+		Some(NonRootFileType::File(_))
+	));
+	let stdout = String::from_utf8_lossy(&output.get_output().stdout);
+	assert!(stdout.contains("1 file, 3 B in "), "{stdout}");
+	assert!(stdout.contains(", 1 skipped"), "{stdout}");
+}
+
+#[shared_test_runtime]
+async fn uploading_with_update_replaces_only_the_changed_files() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir_name = resources.dir.name().unwrap();
+
+	let local = tempfile::tempdir().unwrap();
+	let source = local.path().join("up");
+	std::fs::create_dir(&source).unwrap();
+	std::fs::write(source.join("same.txt"), b"same").unwrap();
+	std::fs::write(source.join("changed.txt"), b"before").unwrap();
+	authenticated_cli_with_args!("upload", source.to_str().unwrap(), test_dir_name).success();
+	let same = file_uuid_at(client, test_dir_name, "up/same.txt").await;
+	let changed = file_uuid_at(client, test_dir_name, "up/changed.txt").await;
+
+	std::fs::write(source.join("changed.txt"), b"after, longer").unwrap();
+	authenticated_cli_with_args!(
+		"upload",
+		"--update",
+		source.to_str().unwrap(),
+		test_dir_name
+	)
+	.success();
+
+	assert_eq!(
+		file_uuid_at(client, test_dir_name, "up/same.txt").await,
+		same
+	);
+	assert_ne!(
+		file_uuid_at(client, test_dir_name, "up/changed.txt").await,
+		changed
+	);
+}
+
+#[shared_test_runtime]
+async fn downloading_with_no_clobber_keeps_every_local_file() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let test_dir_name = resources.dir.name().unwrap();
+
+	let local = tempfile::tempdir().unwrap();
+	let source = local.path().join("down");
+	std::fs::create_dir(&source).unwrap();
+	std::fs::write(source.join("a.txt"), b"remote a").unwrap();
+	std::fs::write(source.join("b.txt"), b"remote b").unwrap();
+	authenticated_cli_with_args!("upload", source.to_str().unwrap(), test_dir_name).success();
+
+	let target = tempfile::tempdir().unwrap();
+	std::fs::create_dir(target.path().join("down")).unwrap();
+	std::fs::write(target.path().join("down").join("a.txt"), b"local").unwrap();
+	authenticated_cli_with_args!(
+		"download",
+		"--no-clobber",
+		&format!("{test_dir_name}/down"),
+		target.path().to_str().unwrap()
+	)
+	.success();
+
+	assert_eq!(
+		std::fs::read(target.path().join("down").join("a.txt")).unwrap(),
+		b"local"
+	);
+	assert_eq!(
+		std::fs::read(target.path().join("down").join("b.txt")).unwrap(),
+		b"remote b"
+	);
+}
+
+#[shared_test_runtime]
+async fn uploading_with_include_and_exclude_takes_only_the_matching_files() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir_name = resources.dir.name().unwrap();
+
+	let local = tempfile::tempdir().unwrap();
+	let source = local.path().join("filtered");
+	std::fs::create_dir_all(source.join("keep")).unwrap();
+	std::fs::create_dir_all(source.join("skip")).unwrap();
+	std::fs::create_dir_all(source.join("empty")).unwrap();
+	std::fs::write(source.join("keep").join("a.JPG"), b"a").unwrap();
+	std::fs::write(source.join("keep").join("b.txt"), b"b").unwrap();
+	std::fs::write(source.join("skip").join("c.jpg"), b"c").unwrap();
+	std::fs::write(source.join("top.txt"), b"top").unwrap();
+
+	authenticated_cli_with_args!(
+		"upload",
+		"--include",
+		"*.jpg",
+		"--exclude",
+		"skip/",
+		source.to_str().unwrap(),
+		test_dir_name
+	)
+	.success();
+
+	let found = |rel_path: &'static str| async move {
+		client
+			.find_item_at_path(&format!("{test_dir_name}/filtered/{rel_path}"))
+			.await
+			.unwrap()
+			.is_some()
+	};
+	assert!(found("keep/a.JPG").await);
+	for left_out in ["keep/b.txt", "skip", "empty", "top.txt"] {
+		assert!(!found(left_out).await, "{left_out} was uploaded");
+	}
+}
+
+#[shared_test_runtime]
+async fn uploading_several_items_goes_on_past_one_that_fails() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir_name = resources.dir.name().unwrap();
+
+	let local = tempfile::tempdir().unwrap();
+	std::fs::write(local.path().join("a.txt"), b"a").unwrap();
+	std::fs::write(local.path().join("b.txt"), b"b").unwrap();
+
+	let output = authenticated_cli_with_args!(
+		"upload",
+		local.path().join("a.txt").to_str().unwrap(),
+		local.path().join("missing.txt").to_str().unwrap(),
+		local.path().join("b.txt").to_str().unwrap(),
+		&format!("{test_dir_name}/several")
+	)
+	.failure();
+
+	for name in ["a.txt", "b.txt"] {
+		assert!(matches!(
+			client
+				.find_item_at_path(&format!("{test_dir_name}/several/{name}"))
+				.await
+				.unwrap(),
+			Some(NonRootFileType::File(_))
+		));
+	}
+	let stderr = String::from_utf8_lossy(&output.get_output().stderr);
+	assert!(stderr.contains("missing.txt"), "{stderr}");
+	assert!(stderr.contains("1 item(s) failed to upload"), "{stderr}");
+}
+
+#[shared_test_runtime]
+async fn downloading_several_items_puts_them_into_the_destination_directory() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let test_dir_name = resources.dir.name().unwrap();
+
+	let local = tempfile::tempdir().unwrap();
+	std::fs::write(local.path().join("a.txt"), b"a").unwrap();
+	std::fs::write(local.path().join("b.txt"), b"b").unwrap();
+	authenticated_cli_with_args!(
+		"upload",
+		local.path().join("a.txt").to_str().unwrap(),
+		local.path().join("b.txt").to_str().unwrap(),
+		test_dir_name
+	)
+	.success();
+
+	let target = local.path().join("into").join("here");
+	authenticated_cli_with_args!(
+		"download",
+		&format!("{test_dir_name}/a.txt"),
+		&format!("{test_dir_name}/b.txt"),
+		target.to_str().unwrap()
+	)
+	.success();
+
+	assert_eq!(std::fs::read(target.join("a.txt")).unwrap(), b"a");
+	assert_eq!(std::fs::read(target.join("b.txt")).unwrap(), b"b");
+}
