@@ -43,6 +43,13 @@
 //! transferred, and the result adds them all up. A shell expands a wildcard such as `*.jpg` into
 //! such a list of items; the Windows command prompt does not, and remote paths take no wildcards.
 //!
+//! With `-` in place of the local path, `upload` reads stdin and `download` writes stdout, as in
+//! `tar -cz notes | filen upload - /backups/notes.tar.gz` and
+//! `filen download /backups/notes.tar.gz - | tar -xz`. The upload's destination then has to name
+//! the remote file, and only a single file can be downloaded to stdout, which carries nothing but
+//! the file: there is no progress line, and the result goes to stderr. `-` works only for a single
+//! command, not in the REPL or among commands piped into the CLI, where stdin carries the commands.
+//!
 //! An uploaded symlink is uploaded under its own name with the contents it points to. Inside an
 //! uploaded directory, symlinks are followed the same way; with `--no-follow-symlinks` they are
 //! skipped instead (neither the link nor what it points to is uploaded): listed with `-v`, counted
@@ -67,8 +74,9 @@ use std::{
 	collections::{HashMap, VecDeque},
 	fmt,
 	path::{Path, PathBuf},
-	pin::pin,
+	pin::{Pin, pin},
 	sync::{Arc, Mutex},
+	task::{Context, Poll, ready},
 	time::{Duration, Instant},
 };
 
@@ -96,7 +104,10 @@ use filen_sdk_rs::{
 };
 use filen_types::fs::{ParentUuid, Uuid};
 use serde_json::json;
-use tokio::select;
+use tokio::{
+	io::{AsyncRead as _, AsyncWrite as _, ReadBuf},
+	select,
+};
 
 use crate::{
 	CommandResult,
@@ -114,7 +125,8 @@ use crate::{
 pub(crate) enum TransferCommands {
 	/// Upload a local file or directory (recursively) to the Filen drive
 	Upload {
-		/// Local file or directory to upload
+		/// Local file or directory to upload, or "-" to upload stdin as the file the destination
+		/// names
 		#[arg(add = ArgValueCompleter::new(PathCompleter::any()))]
 		source: String,
 		/// More local files or directories to upload, followed by the destination: the directory in
@@ -146,7 +158,7 @@ pub(crate) enum TransferCommands {
 		/// More files or directories to download, followed by the destination: the local directory
 		/// to download into, or, after a single item, that item's new path when it is not an
 		/// existing directory and does not end in a path separator; missing directories are
-		/// created (default: the current local directory)
+		/// created (default: the current local directory); "-" writes a single file to stdout
 		#[arg(value_name = "PATH", add = ArgValueCompleter::new(PathCompleter::any()))]
 		paths: Vec<String>,
 		/// Never replace a local file: skip each file whose local path is taken (listed with -v)
@@ -343,6 +355,15 @@ pub(crate) async fn upload(
 	options: DirUploadOptions,
 ) -> Result<()> {
 	let several = sources.len() > 1;
+	if sources.iter().any(|source| source == STDIO) {
+		ensure_stdio_is_free(ui)?;
+		if several {
+			return Err(UI::usage_failure(
+				"Cannot upload stdin (\"-\") together with other items",
+			));
+		}
+		return upload_stdin(ui, client, working_path, destination_str, options.existing).await;
+	}
 	// A single source that cannot be read fails before anything is asked of the drive.
 	let mut locals = Vec::with_capacity(sources.len());
 	for source in sources {
@@ -461,6 +482,253 @@ async fn upload_source(
 	};
 	transferred.context("Failed to upload")?;
 	Ok((local.path.display().to_string(), target_path.to_string()))
+}
+
+/// The path standing for stdin as an upload's source and for stdout as a download's destination.
+const STDIO: &str = "-";
+
+/// Refuses [`STDIO`] where stdin carries the CLI's commands, in the REPL and for commands piped
+/// into it: an upload would read the next commands as the file, and a download would write the
+/// file among the commands' output.
+fn ensure_stdio_is_free(ui: &UI) -> Result<()> {
+	if ui.commands_on_stdin() {
+		return Err(UI::usage_failure(
+			"\"-\" (stdin or stdout) only works in a single command, such as `filen upload - \
+			 /notes/today.txt`, not in the REPL or in commands piped into the CLI",
+		));
+	}
+	Ok(())
+}
+
+/// Upload what is read from stdin as the remote file at `destination_str`, replacing a file there
+/// unless `existing` keeps it.
+async fn upload_stdin(
+	ui: &mut UI,
+	client: &mut LazyClient,
+	working_path: &RemotePath,
+	destination_str: Option<&str>,
+	existing: ExistingRemoteFile,
+) -> Result<()> {
+	let destination_str = stdin_destination(destination_str)?;
+	match existing {
+		ExistingRemoteFile::Replace | ExistingRemoteFile::Keep => {}
+		ExistingRemoteFile::ReplaceIfChanged => {
+			return Err(UI::usage_failure(
+				"--update cannot compare stdin with the drive's file: use --skip-existing",
+			));
+		}
+	}
+	let destination_path = working_path.navigate(destination_str);
+	let client = client.get(ui).await?.clone();
+	let destination = find_remote(&client, &destination_path).await?;
+	let target = stdin_upload_target(&destination_path, destination.existing())?;
+	let parent_dir = match destination {
+		RemoteItem::Dir(dir) => dir,
+		RemoteItem::File | RemoteItem::Nothing => {
+			find_or_create_remote_dir(&client, &target.parent).await?
+		}
+	};
+	let target_path = target.parent.navigate(target.name.as_ref());
+
+	let progress = TransferProgress::new(TransferKind::Upload, ui);
+	run_cancellable(
+		ui,
+		&progress,
+		upload_reader(
+			&client,
+			&progress,
+			target.name.as_ref(),
+			&parent_dir,
+			existing,
+		),
+	)
+	.await?
+	.context("Failed to upload")?;
+	let destination = target_path.to_string();
+	finish(
+		ui,
+		&progress,
+		&format!("stdin to {}", destination),
+		&destination,
+	)
+}
+
+/// The remote path given for an upload from stdin, which has to name the file to upload as.
+fn stdin_destination(destination_str: Option<&str>) -> Result<&str> {
+	match destination_str {
+		Some(destination) if !destination.ends_with('/') => Ok(destination),
+		_ => Err(UI::usage_failure(
+			"Uploading stdin (\"-\") needs the remote file's path, such as /notes/today.txt",
+		)),
+	}
+}
+
+/// Where an upload from stdin to `destination` goes: `destination` is the file's path, which may
+/// replace an existing file but not a directory.
+fn stdin_upload_target(destination: &RemotePath, existing: Existing) -> Result<UploadTarget> {
+	match existing {
+		Existing::Dir => Err(UI::failure(&format!(
+			"Cannot upload stdin as the directory {}: give the file's path",
+			destination
+		))),
+		Existing::File | Existing::Nothing => {
+			resolve_upload_target(destination, false, existing, "", false)
+		}
+	}
+}
+
+/// Upload stdin as `name` into `destination_dir`, unless `existing` keeps a file of that name
+/// already there.
+async fn upload_reader(
+	client: &Client,
+	progress: &TransferProgress,
+	name: &str,
+	destination_dir: &DirType<'_, Normal>,
+	existing: ExistingRemoteFile,
+) -> Result<()> {
+	let builder = client
+		.make_file_builder(name, destination_dir.uuid())
+		.map_err(|e| UI::failure(&format!("Cannot upload as {:?}: {}", name, e)))?;
+	progress.start_single_item(0);
+	if existing == ExistingRemoteFile::Keep
+		&& same_named_file(client, destination_dir, name)
+			.await?
+			.is_some()
+	{
+		progress.skip([STDIO.to_owned()], 0);
+		return Ok(());
+	}
+	let mut stdin = StdinReader(tokio::io::stdin());
+	let file = client
+		.upload_file_from_reader(builder, &mut stdin, Some(progress.byte_callback()), None)
+		.await
+		.context("Failed to upload file")?;
+	progress.complete_single_item_of(file.size());
+	Ok(())
+}
+
+/// Download the remote file at `source_str` to stdout. Nothing else is written there: the result
+/// goes to stderr, and there is no progress line.
+async fn download_to_stdout(
+	ui: &mut UI,
+	client: &mut LazyClient,
+	working_path: &RemotePath,
+	source_str: &str,
+) -> Result<()> {
+	if ui.json {
+		return Err(UI::usage_failure(
+			"--json cannot be used when downloading to stdout (\"-\")",
+		));
+	}
+	let source_path = working_path.navigate(source_str);
+	let client = client.get(ui).await?.clone();
+	let file = match client
+		.find_item_at_path(&source_path.0)
+		.await
+		.context("Failed to find file or directory")?
+	{
+		Some(NonRootFileType::File(file)) => file,
+		Some(NonRootFileType::Dir(_) | NonRootFileType::Root(_)) => {
+			return Err(UI::failure(&format!(
+				"Cannot download the directory {} to stdout",
+				source_path
+			)));
+		}
+		None => {
+			return Err(UI::failure(&format!(
+				"No such file or directory: {}",
+				source_path
+			)));
+		}
+	};
+
+	let progress = TransferProgress::new(TransferKind::Download, ui).without_progress_line();
+	let streaming = interrupt::stream_data();
+	let downloaded = run_cancellable(ui, &progress, async {
+		progress.start_single_item(file.size());
+		let mut stdout = StdoutWriter(tokio::io::stdout());
+		client
+			.download_file_to_writer(file.as_ref(), &mut stdout, Some(progress.byte_callback()))
+			.await?;
+		progress.complete_single_item();
+		Ok(())
+	})
+	.await?;
+	drop(streaming);
+	if let Err(e) = downloaded {
+		// What was cut short is of no use to a reader that closed stdout.
+		if interrupt::stdout_closed() {
+			return Err(CliError::StdoutClosed.into());
+		}
+		return Err(e.context("Failed to download"));
+	}
+	if !ui.is_quiet() {
+		let (files, bytes) = progress.done();
+		let summary = transfer_summary(files, bytes, 0, progress.started.elapsed());
+		ui.print_muted_to_stderr(&format!(
+			"Downloaded {} to stdout: {}",
+			source_path, summary
+		));
+	}
+	Ok(())
+}
+
+/// Stdin, as the reader an upload takes.
+///
+/// Tokio reads stdin on a blocking thread, and a read waiting for input cannot be cancelled. That
+/// does not hold up a canceled upload: Ctrl+C ends the CLI with `process::exit`, which does not
+/// wait for the runtime's threads, and stdin is only read for a single command, never in the REPL.
+struct StdinReader(tokio::io::Stdin);
+
+impl futures::AsyncRead for StdinReader {
+	fn poll_read(
+		self: Pin<&mut Self>,
+		cx: &mut Context<'_>,
+		buf: &mut [u8],
+	) -> Poll<std::io::Result<usize>> {
+		let mut read = ReadBuf::new(buf);
+		ready!(Pin::new(&mut self.get_mut().0).poll_read(cx, &mut read))?;
+		Poll::Ready(Ok(read.filled().len()))
+	}
+}
+
+/// Stdout, as the writer a download takes. A reader that closed stdout ends the command, as it
+/// does for printed output ([`ui::write_stdout_line`]).
+struct StdoutWriter(tokio::io::Stdout);
+
+impl StdoutWriter {
+	fn note<T>(result: std::io::Result<T>) -> std::io::Result<T> {
+		if let Err(e) = &result
+			&& e.kind() == std::io::ErrorKind::BrokenPipe
+		{
+			interrupt::close_stdout();
+		}
+		result
+	}
+}
+
+impl futures::AsyncWrite for StdoutWriter {
+	fn poll_write(
+		self: Pin<&mut Self>,
+		cx: &mut Context<'_>,
+		buf: &[u8],
+	) -> Poll<std::io::Result<usize>> {
+		Pin::new(&mut self.get_mut().0)
+			.poll_write(cx, buf)
+			.map(Self::note)
+	}
+
+	fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+		Pin::new(&mut self.get_mut().0)
+			.poll_flush(cx)
+			.map(Self::note)
+	}
+
+	fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+		Pin::new(&mut self.get_mut().0)
+			.poll_shutdown(cx)
+			.map(Self::note)
+	}
 }
 
 /// What a transfer's destination path names.
@@ -608,6 +876,15 @@ pub(crate) async fn download(
 	options: DirDownloadOptions,
 ) -> Result<()> {
 	let several = sources.len() > 1;
+	if destination_str == Some(STDIO) {
+		ensure_stdio_is_free(ui)?;
+		let [source] = sources else {
+			return Err(UI::usage_failure(
+				"Only a single file can be downloaded to stdout (\"-\")",
+			));
+		};
+		return download_to_stdout(ui, client, working_path, source).await;
+	}
 	let destination_str = destination_str.unwrap_or(".");
 	let into = several || destination_str.ends_with(std::path::is_separator);
 	let existing = local_existing(Path::new(destination_str))?;
@@ -830,6 +1107,8 @@ async fn run_cancellable<T>(
 	progress.clear();
 	match outcome {
 		Some(result) => Ok(result),
+		// Nobody reads a report on what a closed stdout cut short.
+		None if interrupt::stdout_closed() => Err(CliError::StdoutClosed.into()),
 		None => {
 			let (files, bytes) = progress.done();
 			ui.print_muted_to_stderr(&canceled_message(progress.kind, files, bytes));
@@ -1413,6 +1692,18 @@ impl TransferProgress {
 		self.render(&mut state, true);
 	}
 
+	/// Mark the single file whose size was not known up front as fully transferred, at `size`.
+	fn complete_single_item_of(&self, size: u64) {
+		self.state.lock().unwrap().set_item_totals(1, size);
+		self.complete_single_item();
+	}
+
+	/// The progress without its line, for a transfer whose output stdout carries.
+	fn without_progress_line(mut self) -> Self {
+		self.enabled = false;
+		self
+	}
+
 	/// List the files an upload puts into the remote directory `uuid` under `path`.
 	fn start_upload_listing(&self, uuid: Uuid, path: &RemotePath) {
 		if self.list_files {
@@ -1707,11 +1998,16 @@ mod tests {
 	use super::{
 		DownloadSource, Existing, FilterArgs, ProgressState, SPEED_WINDOW, TransferFailure,
 		TransferKind, TransferProgress, UploadTarget, canceled_message, download_target,
-		ends_the_command, existing_remote_policy, format_duration, local_existing, progress_line,
-		resolve_download_target, resolve_upload_target, result_json, skipped_symlinks_line,
-		source_failure, sources_and_destination, transfer_summary,
+		ends_the_command, ensure_stdio_is_free, existing_remote_policy, format_duration,
+		local_existing, progress_line, resolve_download_target, resolve_upload_target, result_json,
+		skipped_symlinks_line, source_failure, sources_and_destination, stdin_destination,
+		stdin_upload_target, transfer_summary,
 	};
-	use crate::{error::CliError, ui::UI, util::RemotePath};
+	use crate::{
+		error::CliError,
+		ui::{UI, test_support::Printed},
+		util::RemotePath,
+	};
 
 	const MIB: u64 = 1024 * 1024;
 
@@ -2028,6 +2324,22 @@ mod tests {
 	}
 
 	#[test]
+	fn stdin_and_stdout_are_refused_where_they_carry_the_commands() {
+		let mut ui = Printed::default().ui();
+		ui.set_commands_on_stdin();
+		assert_eq!(
+			ensure_stdio_is_free(&ui).unwrap_err().to_string(),
+			"\"-\" (stdin or stdout) only works in a single command, such as `filen upload - \
+			 /notes/today.txt`, not in the REPL or in commands piped into the CLI"
+		);
+	}
+
+	#[test]
+	fn stdin_and_stdout_are_free_for_a_single_command() {
+		assert!(ensure_stdio_is_free(&Printed::default().ui()).is_ok());
+	}
+
+	#[test]
 	fn the_json_result_lists_the_failures() {
 		let failures = [
 			TransferFailure {
@@ -2228,6 +2540,40 @@ mod tests {
 			)
 			.unwrap(),
 			upload_target("/x/y", "a.txt")
+		);
+	}
+
+	#[test]
+	fn an_upload_from_stdin_needs_a_file_path() {
+		assert_eq!(
+			stdin_destination(Some("notes/today.txt")).unwrap(),
+			"notes/today.txt"
+		);
+		for destination in [None, Some("notes/")] {
+			let error = stdin_destination(destination).unwrap_err();
+			assert_eq!(
+				error.downcast_ref::<CliError>().map(CliError::exit_code),
+				Some(2)
+			);
+		}
+	}
+
+	#[test]
+	fn an_upload_from_stdin_goes_to_its_path() {
+		for existing in [Existing::Nothing, Existing::File] {
+			assert_eq!(
+				stdin_upload_target(&RemotePath::new("/x/today.txt"), existing).unwrap(),
+				upload_target("/x", "today.txt")
+			);
+		}
+	}
+
+	#[test]
+	fn an_upload_from_stdin_onto_a_directory_is_refused() {
+		let error = stdin_upload_target(&RemotePath::new("/x/notes"), Existing::Dir).unwrap_err();
+		assert_eq!(
+			error.to_string(),
+			"Cannot upload stdin as the directory /x/notes: give the file's path"
 		);
 	}
 

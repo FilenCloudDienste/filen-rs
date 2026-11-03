@@ -7,7 +7,7 @@ use std::{
 use filen_macros::shared_test_runtime;
 use filen_sdk_rs::{
 	auth::Client,
-	fs::{HasName, HasUUID as _, categories::NonRootFileType},
+	fs::{HasName, HasUUID as _, categories::NonRootFileType, file::traits::HasFileInfo as _},
 };
 use filen_types::fs::Uuid;
 use test_utils::authenticated_cli_with_args;
@@ -799,4 +799,175 @@ async fn downloading_several_items_puts_them_into_the_destination_directory() {
 
 	assert_eq!(std::fs::read(target.join("a.txt")).unwrap(), b"a");
 	assert_eq!(std::fs::read(target.join("b.txt")).unwrap(), b"b");
+}
+
+#[shared_test_runtime]
+async fn a_file_piped_in_through_stdin_comes_back_out_through_stdout() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let test_dir_name = resources.dir.name().unwrap();
+	// Past a chunk, so the pipe is read and written in several parts.
+	let contents = (0..1024 * 1024 + 512 * 1024 + 7)
+		.map(|i: u32| u8::try_from(i % 251).unwrap())
+		.collect::<Vec<_>>();
+	let remote = format!("{test_dir_name}/piped/in.bin");
+
+	let (_auth_dir, auth_config) = test_utils::cli::prepare_cli_auth_config().await;
+	assert_cmd::Command::new(assert_cmd::cargo::cargo_bin!("filen-cli"))
+		.arg("--auth-config-path")
+		.arg(auth_config.path())
+		.args(["upload", "-", &remote])
+		.write_stdin(contents.clone())
+		.assert()
+		.success();
+
+	let output = assert_cmd::Command::new(assert_cmd::cargo::cargo_bin!("filen-cli"))
+		.arg("--auth-config-path")
+		.arg(auth_config.path())
+		.args(["download", &remote, "-"])
+		.assert()
+		.success();
+	let output = output.get_output();
+	assert!(
+		output.stdout == contents,
+		"stdout differs from what was piped in"
+	);
+	let stderr = String::from_utf8_lossy(&output.stderr);
+	assert!(stderr.contains("to stdout"), "{stderr}");
+}
+
+#[test]
+fn uploading_piped_stdin_without_a_login_fails_instead_of_prompting() {
+	// The login prompt cannot read stdin, which carries the file.
+	let config_dir = tempfile::tempdir().unwrap();
+	let output = assert_cmd::Command::new(env!("CARGO_BIN_EXE_filen-cli"))
+		.env("FILEN_CLI_TESTING_DISABLE_KEYRING", "1")
+		.env("FILEN_CLI_TESTING_DISABLE_AUTODETECTED_AUTH_CONFIG", "1")
+		.env_remove("FILEN_CLI_EMAIL")
+		.env_remove("FILEN_CLI_PASSWORD")
+		.env_remove("FILEN_CLI_2FA_CODE")
+		.arg("--config-dir")
+		.arg(config_dir.path())
+		.args(["--skip-update", "upload", "-", "/today.txt"])
+		.write_stdin("the file's contents")
+		.output()
+		.unwrap();
+
+	assert_eq!(output.status.code(), Some(2));
+	let stderr = String::from_utf8_lossy(&output.stderr);
+	assert!(
+		stderr.contains("Cannot ask \"Email:\": stdin is not a terminal."),
+		"{stderr}"
+	);
+}
+
+#[test]
+fn uploading_stdin_among_commands_piped_into_the_cli_is_refused() {
+	// Needs no account: the refusal comes before any login.
+	let config_dir = tempfile::tempdir().unwrap();
+	let output = assert_cmd::Command::new(env!("CARGO_BIN_EXE_filen-cli"))
+		.env("FILEN_CLI_TESTING_DISABLE_KEYRING", "1")
+		.env("FILEN_CLI_TESTING_DISABLE_AUTODETECTED_AUTH_CONFIG", "1")
+		.env_remove("FILEN_CLI_EMAIL")
+		.env_remove("FILEN_CLI_PASSWORD")
+		.env_remove("FILEN_CLI_2FA_CODE")
+		.arg("--config-dir")
+		.arg(config_dir.path())
+		.arg("--skip-update")
+		.write_stdin("upload - /today.txt\nthe next command, not the file\n")
+		.output()
+		.unwrap();
+
+	assert_eq!(output.status.code(), Some(2));
+	let stderr = String::from_utf8_lossy(&output.stderr);
+	assert!(
+		stderr.contains("\"-\" (stdin or stdout) only works in a single command"),
+		"{stderr}"
+	);
+}
+
+#[shared_test_runtime]
+async fn uploading_empty_stdin_creates_an_empty_file() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir_name = resources.dir.name().unwrap();
+	let remote = format!("{test_dir_name}/empty-stdin.txt");
+
+	let (_auth_dir, auth_config) = test_utils::cli::prepare_cli_auth_config().await;
+	assert_cmd::Command::new(assert_cmd::cargo::cargo_bin!("filen-cli"))
+		.arg("--auth-config-path")
+		.arg(auth_config.path())
+		.args(["upload", "-", &remote])
+		.write_stdin(Vec::new())
+		.assert()
+		.success();
+
+	let Some(NonRootFileType::File(file)) = client.find_item_at_path(&remote).await.unwrap() else {
+		panic!("no file at {remote}");
+	};
+	assert_eq!(file.size(), 0);
+}
+
+#[shared_test_runtime]
+async fn uploading_stdin_with_skip_existing_keeps_the_existing_file() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir_name = resources.dir.name().unwrap();
+	let builder = client
+		.make_file_builder("kept-from-stdin.txt", resources.dir.uuid())
+		.unwrap();
+	let existing = client.upload_file(builder, b"old").await.unwrap();
+	let remote = format!("{test_dir_name}/kept-from-stdin.txt");
+
+	let (_auth_dir, auth_config) = test_utils::cli::prepare_cli_auth_config().await;
+	let output = assert_cmd::Command::new(assert_cmd::cargo::cargo_bin!("filen-cli"))
+		.arg("--auth-config-path")
+		.arg(auth_config.path())
+		.args(["upload", "--skip-existing", "-", &remote])
+		.write_stdin("new")
+		.assert()
+		.success();
+
+	let stdout = String::from_utf8_lossy(&output.get_output().stdout);
+	assert!(stdout.contains("1 skipped"), "{stdout}");
+	assert_eq!(remote_file_uuid(client, &remote).await, existing.uuid());
+}
+
+#[shared_test_runtime]
+async fn a_download_to_stdout_fails_once_stdout_is_closed() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir_name = resources.dir.name().unwrap();
+	// Far more than a pipe holds, so the download is still writing when the reader goes.
+	let builder = client
+		.make_file_builder("closed.bin", resources.dir.uuid())
+		.unwrap();
+	client
+		.upload_file(builder, &vec![7u8; 4 * 1024 * 1024])
+		.await
+		.unwrap();
+
+	let (_auth_dir, auth_config) = test_utils::cli::prepare_cli_auth_config().await;
+	let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_filen-cli"))
+		.arg("--auth-config-path")
+		.arg(auth_config.path())
+		.args(["download", &format!("{test_dir_name}/closed.bin"), "-"])
+		.stdin(Stdio::null())
+		.stdout(Stdio::piped())
+		.stderr(Stdio::piped())
+		.spawn()
+		.unwrap();
+	let mut stdout = child.stdout.take().unwrap();
+	let mut first = [0u8; 10];
+	std::io::Read::read_exact(&mut stdout, &mut first).unwrap();
+	drop(stdout);
+	let output = child.wait_with_output().unwrap();
+
+	assert_eq!(first, [7u8; 10]);
+	let stderr = String::from_utf8_lossy(&output.stderr);
+	assert_eq!(output.status.code(), Some(1), "{stderr}");
+	assert!(
+		console::strip_ansi_codes(&stderr)
+			.ends_with("✘ Stdout was closed before the whole file was written to it\n"),
+		"{stderr}"
+	);
 }

@@ -442,8 +442,12 @@ async fn async_main(arenas_limited: bool) {
 	let finished = inner_main(&mut ui, arenas_limited).await;
 	// whatever the command made of being cut short, nobody reads what is left to print
 	if interrupt::stdout_closed() {
+		let code = interrupt::closed_stdout_exit_code();
+		if code != 0 {
+			ui.print_failure("Stdout was closed before the whole file was written to it");
+		}
 		info!("Exiting, as stdout was closed");
-		std::process::exit(0);
+		std::process::exit(code);
 	}
 	// translate errors to non-zero exit code
 	match finished {
@@ -652,6 +656,7 @@ async fn inner_main(ui: &mut ui::UI, arenas_limited: bool) -> Result<Finished> {
 		let _ = execute_cancellable(&config, ui, &mut client, &working_path, command).await?;
 		Ok(Finished::Success)
 	} else if script {
+		ui.set_commands_on_stdin();
 		let mut working_path =
 			initial_working_path(ui, &mut client, cli_args.working_path.as_deref()).await?;
 		let mut lines = Lines {
@@ -688,6 +693,7 @@ async fn inner_main(ui: &mut ui::UI, arenas_limited: bool) -> Result<Finished> {
 		Ok(last_failure.map_or(Finished::Success, Finished::ScriptLineFailed))
 	} else {
 		ui.load_repl_history(repl_history::history_path(&config.config_dir));
+		ui.set_commands_on_stdin();
 		ui.print_banner();
 
 		client.get(ui).await?;

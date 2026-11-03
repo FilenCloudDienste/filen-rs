@@ -3,7 +3,9 @@
 //! - `0` when the command succeeded,
 //! - `1` when it failed, with the error printed to stderr,
 //! - `2` when the command line was invalid, such as an unknown command or flags that do not go together,
-//! - `0` too when stdout was closed first, as `head` closes it once it has its lines,
+//! - `0` too when stdout was closed first, as `head` closes it once it has its lines, except
+//!   while the command was writing a file's content to stdout (`download <file> -`), where the
+//!   reader did not get all of it: `1`,
 //! - `130` when Ctrl-C cancelled the command or quit the CLI,
 //! - the exit code of Rclone when `filen rclone ...` failed in Rclone.
 
@@ -11,7 +13,7 @@ use std::{error::Error, fmt};
 
 use inquire::InquireError;
 
-use crate::interrupt::EXIT_INTERRUPTED;
+use crate::interrupt::{self, EXIT_INTERRUPTED};
 
 /// An error the CLI reports to the user as it is, with the exit code it maps to. Any other error
 /// in a command's result is unexpected: it is reported as a possible bug and exits with code 1.
@@ -31,8 +33,8 @@ pub(crate) enum CliError {
 	ChildExit(i32),
 	/// Ctrl-C cancelled the command; exit code [`EXIT_INTERRUPTED`].
 	Interrupted,
-	/// A closed stdout cancelled the command; exit code 0. Nothing reads what the CLI would print
-	/// about it.
+	/// A closed stdout cancelled the command; exit code [`interrupt::closed_stdout_exit_code`]. Nothing
+	/// reads what the CLI would print about it.
 	StdoutClosed,
 }
 
@@ -48,7 +50,7 @@ impl CliError {
 			CliError::Usage(_) => EXIT_USAGE,
 			CliError::ChildExit(code) => *code,
 			CliError::Interrupted => EXIT_INTERRUPTED,
-			CliError::StdoutClosed => 0,
+			CliError::StdoutClosed => interrupt::closed_stdout_exit_code(),
 		}
 	}
 }

@@ -8,7 +8,9 @@
 //!
 //! A closed stdout ([`close_stdout`]), as `head` closes it once it has read its lines, ends the
 //! CLI the same way, once: the running command is cancelled, or stopped as Ctrl-C stops it, and
-//! the CLI exits with 0, as the reader has what it wanted.
+//! the CLI exits with [`closed_stdout_exit_code`]: 0, as the reader has what it wanted, or 1 when
+//! a file's content was being written to stdout ([`stream_data`]), which the reader did not get
+//! all of.
 
 use std::{
 	process,
@@ -20,7 +22,10 @@ use tokio::sync::broadcast::{
 	error::{RecvError, TryRecvError},
 };
 
-use crate::{error::CliError, ui::UI};
+use crate::{
+	error::{CliError, EXIT_FAILURE},
+	ui::UI,
+};
 
 /// The exit code of the CLI when Ctrl-C quit it or cancelled its command, the one a shell
 /// reports for a process that SIGINT ended.
@@ -36,6 +41,8 @@ static STATE: Mutex<State> = Mutex::new(State {
 	stopping: 0,
 	cancelling: false,
 	stdout_closed: false,
+	streaming_data: 0,
+	data_cut_short: false,
 });
 
 /// Installs the Ctrl-C handler. Called once, when the CLI starts.
@@ -54,10 +61,35 @@ pub(crate) fn close_stdout() {
 	act(lock_state().close_stdout());
 }
 
-/// Whether stdout was closed ([`close_stdout`]), so the CLI exits with 0 and runs no further
-/// command.
+/// Whether stdout was closed ([`close_stdout`]), so the CLI exits with [`closed_stdout_exit_code`]
+/// and runs no further command.
 pub(crate) fn stdout_closed() -> bool {
 	lock_state().stdout_closed
+}
+
+/// The exit code of the CLI once stdout was closed: 1 if it closed while a file's content was
+/// being written to it ([`stream_data`]), else 0.
+pub(crate) fn closed_stdout_exit_code() -> i32 {
+	lock_state().closed_stdout_exit_code()
+}
+
+/// Held while a command writes a file's content to stdout: see [`stream_data`].
+pub(crate) struct DataStream;
+
+/// Has a closed stdout fail the CLI ([`closed_stdout_exit_code`]) until the returned
+/// [`DataStream`] is dropped, as the content of a file being written to stdout, unlike printed
+/// lines, is cut short when its reader goes.
+pub(crate) fn stream_data() -> DataStream {
+	let mut state = lock_state();
+	state.streaming_data = state.streaming_data.saturating_add(1);
+	DataStream
+}
+
+impl Drop for DataStream {
+	fn drop(&mut self) {
+		let mut state = lock_state();
+		state.streaming_data = state.streaming_data.saturating_sub(1);
+	}
 }
 
 fn act(action: Action) {
@@ -99,6 +131,10 @@ struct State {
 	cancelling: bool,
 	/// Whether stdout was closed.
 	stdout_closed: bool,
+	/// How many commands are writing a file's content to stdout.
+	streaming_data: usize,
+	/// Whether stdout was closed while a file's content was being written to it.
+	data_cut_short: bool,
 }
 
 /// What a Ctrl-C does.
@@ -130,10 +166,18 @@ impl State {
 			return Action::Nothing;
 		}
 		self.stdout_closed = true;
+		self.data_cut_short = self.streaming_data > 0;
 		if self.catching == 0 {
-			return Action::Quit(0);
+			return Action::Quit(self.closed_stdout_exit_code());
 		}
 		self.end_running_command()
+	}
+
+	fn closed_stdout_exit_code(&self) -> i32 {
+		match self.data_cut_short {
+			true => EXIT_FAILURE,
+			false => 0,
+		}
 	}
 
 	/// Cancels the running command, or has it stop if it handles Ctrl-C itself.
@@ -288,6 +332,8 @@ mod tests {
 			stopping: 0,
 			cancelling: false,
 			stdout_closed: false,
+			streaming_data: 0,
+			data_cut_short: false,
 		}
 	}
 
@@ -340,6 +386,31 @@ mod tests {
 		let mut state = state(0, 0);
 		assert_eq!(state.close_stdout(), Action::Quit(0));
 		assert!(state.stdout_closed);
+		assert_eq!(state.closed_stdout_exit_code(), 0);
+	}
+
+	#[test]
+	fn a_closed_stdout_cutting_a_files_content_short_exits_with_1() {
+		let mut state = state(1, 0);
+		state.streaming_data = 1;
+		assert_eq!(state.close_stdout(), Action::Send(Press { owned: false }));
+		assert_eq!(state.closed_stdout_exit_code(), 1);
+	}
+
+	#[test]
+	fn a_closed_stdout_after_a_files_content_was_written_exits_with_0() {
+		let mut state = state(1, 0);
+		state.close_stdout();
+		assert_eq!(state.closed_stdout_exit_code(), 0);
+	}
+
+	#[tokio::test]
+	async fn a_file_content_stream_counts_while_it_is_held() {
+		let _handler = HANDLER.lock().await;
+		let stream = stream_data();
+		assert_eq!(lock_state().streaming_data, 1);
+		drop(stream);
+		assert_eq!(*lock_state(), state(0, 0));
 	}
 
 	#[test]

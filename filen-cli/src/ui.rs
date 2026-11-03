@@ -225,6 +225,9 @@ pub(crate) struct UI {
 	disable_suggestions: bool,
 	/// Whether to redact things that depend on the runtime environment, like: paths, ...
 	make_output_environment_agnostic_for_replay_testing: bool,
+	/// Whether stdin carries the commands the CLI runs, as in the REPL and for commands piped
+	/// into it.
+	commands_on_stdin: bool,
 }
 
 impl UI {
@@ -256,6 +259,7 @@ impl UI {
 			prompt_input: PromptInput::NotATerminal,
 			disable_suggestions: false,
 			make_output_environment_agnostic_for_replay_testing: false,
+			commands_on_stdin: false,
 		}
 	}
 
@@ -298,6 +302,18 @@ impl UI {
 	/// Sets `-v`, which a REPL line can turn on for its command.
 	pub(crate) fn set_verbose(&mut self, verbose: bool) {
 		self.verbose = verbose;
+	}
+
+	/// Notes that stdin carries the commands the CLI runs, as in the REPL and for commands piped
+	/// into it.
+	pub(crate) fn set_commands_on_stdin(&mut self) {
+		self.commands_on_stdin = true;
+	}
+
+	/// Whether stdin carries the commands the CLI runs, so that a command can neither read stdin
+	/// nor write a file's contents to stdout among the other commands' output.
+	pub(crate) fn commands_on_stdin(&self) -> bool {
+		self.commands_on_stdin
 	}
 
 	/// Whether `-v` was given and `--quiet`, which overrides it, was not.
