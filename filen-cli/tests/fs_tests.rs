@@ -5,10 +5,16 @@ use std::{
 	time::{Duration, Instant},
 };
 
+use chrono::{TimeZone as _, Utc};
 use filen_macros::shared_test_runtime;
 use filen_sdk_rs::{
 	auth::Client,
-	fs::{HasName, HasUUID, categories::NonRootFileType, dir::RemoteDirectory, file::RemoteFile},
+	fs::{
+		HasName, HasUUID,
+		categories::NonRootFileType,
+		dir::RemoteDirectory,
+		file::{RemoteFile, traits::HasFileInfo as _},
+	},
 	io::client_impl::IoSharedClientExt,
 	sync::lock::ResourceLock,
 };
@@ -637,6 +643,16 @@ fn printed_json(assert: &assert_cmd::assert::Assert) -> serde_json::Value {
 	serde_json::from_slice(&assert.get_output().stdout).unwrap()
 }
 
+/// The printed JSON listing's object for the item with `uuid`.
+fn listed<'a>(listing: &'a serde_json::Value, uuid: &str) -> &'a serde_json::Value {
+	listing
+		.as_array()
+		.unwrap()
+		.iter()
+		.find(|item| item["uuid"] == uuid)
+		.unwrap_or_else(|| panic!("No item {uuid} in {listing}"))
+}
+
 #[shared_test_runtime]
 async fn ls_a_file_prints_that_file() {
 	let resources = test_utils::RESOURCES.get_resources().await;
@@ -656,4 +672,99 @@ async fn ls_a_file_prints_that_file() {
 	assert_eq!(listing[0]["type"], "file");
 	assert_eq!(listing[0]["size"], 7);
 	assert_eq!(listing[0]["uuid"], file.uuid().to_string());
+}
+
+#[shared_test_runtime]
+async fn ls_long_shows_the_modified_date_and_marks_favorites() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = format!("/{}", resources.dir.name().unwrap());
+	let modified = Utc.with_ymd_and_hms(2024, 3, 9, 10, 20, 30).unwrap();
+	let builder = client
+		.make_file_builder("a.txt", resources.dir.uuid())
+		.unwrap()
+		.modified(modified);
+	let mut file = client.upload_file(builder, b"content").await.unwrap();
+	client.set_file_favorite(&mut file, true).await.unwrap();
+	upload(client, &resources.dir, "b.txt", b"content").await;
+
+	let assert = authenticated_cli_with_args!("ls", "-l", &test_dir).success();
+	let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+	let lines = stdout.lines().collect::<Vec<&str>>();
+	assert_eq!(lines.len(), 2, "{stdout}");
+	assert_eq!(lines[0], "7 B  2024-03-09 10:20:30 (UTC)  a.txt (*)");
+	assert!(lines[1].starts_with("7 B  20"), "{stdout}");
+	assert!(lines[1].ends_with("  b.txt"), "{stdout}");
+}
+
+#[shared_test_runtime]
+async fn ls_json_prints_an_object_per_item_directories_first() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = format!("/{}", resources.dir.name().unwrap());
+	let file = upload(client, &resources.dir, "a.txt", b"content").await;
+	let dir = client
+		.create_dir(&(&resources.dir).into(), "docs")
+		.await
+		.unwrap();
+
+	let assert = authenticated_cli_with_args!("ls", &test_dir, "--json").success();
+	let listing = printed_json(&assert);
+
+	assert_eq!(
+		listing,
+		serde_json::json!([
+			{
+				"name": "docs",
+				"type": "directory",
+				"created": dir.created(),
+				"favorited": false,
+				"uuid": dir.uuid().to_string(),
+			},
+			{
+				"name": "a.txt",
+				"type": "file",
+				"size": 7,
+				"modified": file.last_modified(),
+				"created": file.created(),
+				"favorited": false,
+				"uuid": file.uuid().to_string(),
+			},
+		])
+	);
+}
+
+#[shared_test_runtime]
+async fn list_favorites_json_gives_each_items_path() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = format!("/{}", resources.dir.name().unwrap());
+	let mut file = upload(client, &resources.dir, "a.txt", b"content").await;
+	client.set_file_favorite(&mut file, true).await.unwrap();
+
+	let assert = authenticated_cli_with_args!("list-favorites", "--json").success();
+	// the favorites are the whole account's, so the test looks at its own file only
+	client.set_file_favorite(&mut file, false).await.unwrap();
+	let listing = printed_json(&assert);
+	let item = listed(&listing, &file.uuid().to_string());
+	assert_eq!(item["name"], "a.txt");
+	assert_eq!(item["path"], format!("{test_dir}/a.txt"));
+	assert_eq!(item["type"], "file");
+	assert_eq!(item["favorited"], true);
+}
+
+#[shared_test_runtime]
+async fn list_recents_json_gives_each_items_path() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = format!("/{}", resources.dir.name().unwrap());
+	let file = upload(client, &resources.dir, "a.txt", b"content").await;
+
+	let assert = authenticated_cli_with_args!("list-recents", "--json").success();
+	let listing = printed_json(&assert);
+	let item = listed(&listing, &file.uuid().to_string());
+	assert_eq!(item["name"], "a.txt");
+	assert_eq!(item["path"], format!("{test_dir}/a.txt"));
+	assert_eq!(item["type"], "file");
+	assert_eq!(item["size"], 7);
 }
