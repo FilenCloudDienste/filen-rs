@@ -22,7 +22,9 @@ pub use crate::fs::{
 	file::{AnonymousRemoteFile, RemoteFile, traits::HasFileInfo},
 };
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-pub use dir_download::{CategoryDirDownloadExtPub, DirDownloadCallback};
+pub use dir_download::{
+	CategoryDirDownloadExtPub, DirDownloadCallback, DirDownloadOptions, ExistingLocalFile,
+};
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 pub use dir_upload::{DirUploadCallback, DirUploadOptions, ExistingRemoteFile, SymlinkPolicy};
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]

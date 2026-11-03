@@ -674,6 +674,18 @@ pub(crate) enum KeepLocalWhen {
 	/// would otherwise leave the old bytes in place. The sync engine and
 	/// [`IoSharedClientExt::download_file_to_path_unless_same_hash`] are those callers.
 	SameHash,
+	/// It exists, whatever it holds.
+	Always,
+}
+
+/// What a download onto a path did with the file there.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LocalWrite {
+	/// Wrote the remote file's contents there.
+	Written,
+	/// Left the local file as it was, as [`KeepLocalWhen`] allows.
+	Kept,
 }
 
 /// Whether the file at `path` has to be (re)downloaded to hold `size` bytes hashing to `hash`,
@@ -691,6 +703,10 @@ fn needs_download(
 		Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(true),
 		Err(e) => return Err(e),
 	};
+	match keep {
+		KeepLocalWhen::Always => return Ok(false),
+		KeepLocalWhen::SameHashOrNotOlder | KeepLocalWhen::SameHash => {}
+	}
 	let meta = file.metadata()?;
 	if FilenMetaExt::size(&meta) != size {
 		return Ok(true);
@@ -704,6 +720,7 @@ fn needs_download(
 		}
 		(None, KeepLocalWhen::SameHashOrNotOlder) => Ok(FilenMetaExt::modified(&meta) < mtime),
 		(None, KeepLocalWhen::SameHash) => Ok(true),
+		(None, KeepLocalWhen::Always) => Ok(false),
 	}
 }
 
@@ -715,7 +732,7 @@ pub(crate) async fn inner_download_to_path_with_hash_check<SC>(
 	path: CanonicalPath,
 	callback: Option<MaybeSendCallback<'_, u64>>,
 	keep: KeepLocalWhen,
-) -> (Result<(), Error>, CanonicalPath)
+) -> (Result<LocalWrite, Error>, CanonicalPath)
 where
 	SC: SharedClient,
 {
@@ -736,9 +753,9 @@ where
 
 	if need_download {
 		let res = inner_download_file_to_path(unauth_client, remote_file, &path, callback).await;
-		(res, path)
+		(res.map(|()| LocalWrite::Written), path)
 	} else {
-		(Ok(()), path)
+		(Ok(LocalWrite::Kept), path)
 	}
 }
 
@@ -768,7 +785,7 @@ where
 		keep,
 	)
 	.await;
-	res
+	res.map(|_| ())
 }
 
 /// A reader over bytes `start..end` of `file`, and the throttled progress it reports to
@@ -1383,6 +1400,34 @@ mod needs_download_tests {
 		let (_dir, path) = newer_local_file();
 		let hash = Blake3Hash::from(blake3::hash(b"other bytes"));
 		assert!(check(&path, Some(hash), KeepLocalWhen::SameHashOrNotOlder));
+	}
+
+	#[test]
+	fn any_local_file_is_kept_when_it_is_always_kept() {
+		let (_dir, path) = newer_local_file();
+		assert!(!check(&path, None, KeepLocalWhen::Always));
+		let other_hash = Blake3Hash::from(blake3::hash(b"other bytes"));
+		assert!(!check(&path, Some(other_hash), KeepLocalWhen::Always));
+		assert!(
+			!needs_download(
+				&path,
+				len() + 1,
+				Some(other_hash),
+				remote_stamp(),
+				KeepLocalWhen::Always
+			)
+			.unwrap()
+		);
+	}
+
+	#[test]
+	fn a_missing_local_file_is_downloaded_even_when_local_files_are_always_kept() {
+		let dir = tempfile::tempdir().unwrap();
+		assert!(check(
+			&dir.path().join("missing"),
+			None,
+			KeepLocalWhen::Always
+		));
 	}
 
 	#[test]

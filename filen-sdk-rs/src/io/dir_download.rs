@@ -13,7 +13,7 @@ use crate::{
 	io::{
 		CanonicalPath,
 		abort_on_drop::AbortOnDropHandle,
-		client_impl::{KeepLocalWhen, inner_download_to_path_with_hash_check},
+		client_impl::{KeepLocalWhen, LocalWrite, inner_download_to_path_with_hash_check},
 		fs_tree::build_fs_tree_from_remote_iterator,
 		meta_ext::DirTimesExt,
 	},
@@ -21,7 +21,11 @@ use crate::{
 
 use super::fs_tree::Entry;
 
-type EntryResult<Cat: Category> = (Result<(), Error>, String, NonRootItemType<'static, Cat>);
+type EntryResult<Cat: Category> = (
+	Result<LocalWrite, Error>,
+	String,
+	NonRootItemType<'static, Cat>,
+);
 
 /// Callback trait for folder download operations
 ///
@@ -49,6 +53,41 @@ where
 	);
 	/// Called when errors occur during the download process
 	fn on_download_errors(&self, errors: Vec<(Error, String, NonRootItemType<'static, Cat>)>);
+	/// Called periodically with the files the download left out because [`ExistingLocalFile`]
+	/// kept the local file at their path, with those paths. By default they are reported to
+	/// [`on_download_update`](Self::on_download_update) as downloaded, with no bytes.
+	fn on_download_skipped(&self, skipped_files: Vec<(Cat::File, String)>) {
+		self.on_download_update(Vec::new(), skipped_files, 0);
+	}
+}
+
+/// What a directory download does with a local file already at the path of a file it downloads.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ExistingLocalFile {
+	/// Replace it, unless it already holds the remote file: its blake3 hash matches the one the
+	/// remote file declares or, for a remote file declaring none, it has the same size and was not
+	/// modified before the remote file.
+	#[default]
+	ReplaceUnlessSame,
+	/// Leave it as it is, whatever it holds.
+	Keep,
+}
+
+impl ExistingLocalFile {
+	fn keep_local_when(self) -> KeepLocalWhen {
+		match self {
+			Self::ReplaceUnlessSame => KeepLocalWhen::SameHashOrNotOlder,
+			Self::Keep => KeepLocalWhen::Always,
+		}
+	}
+}
+
+/// How a directory download treats the local directory. The default replaces local files unless
+/// they already hold the remote file.
+#[derive(Clone, Debug, Default)]
+pub struct DirDownloadOptions {
+	/// What to do with a local file already at the path of a file the download writes.
+	pub existing: ExistingLocalFile,
 }
 
 pub(crate) trait CategoryDirDownloadExt: CategoryFSExt {
@@ -57,8 +96,9 @@ pub(crate) trait CategoryDirDownloadExt: CategoryFSExt {
 		remote_file: Self::File,
 		path: CanonicalPath,
 		downloaded_bytes: &AtomicU64,
-	) -> impl Future<Output = (Result<(), Error>, CanonicalPath, Self::File)> + Send {
-		async {
+		keep: KeepLocalWhen,
+	) -> impl Future<Output = (Result<LocalWrite, Error>, CanonicalPath, Self::File)> + Send {
+		async move {
 			let (res, path) = inner_download_to_path_with_hash_check(
 				client,
 				&remote_file,
@@ -66,7 +106,7 @@ pub(crate) trait CategoryDirDownloadExt: CategoryFSExt {
 				Some(Arc::new(|bytes| {
 					downloaded_bytes.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
 				})),
-				KeepLocalWhen::SameHashOrNotOlder,
+				keep,
 			)
 			.await;
 
@@ -162,7 +202,7 @@ pub(crate) trait CategoryDirDownloadExt: CategoryFSExt {
 						}
 						if entry_complete_sender
 							.blocking_send((
-								Ok(()),
+								Ok(LocalWrite::Written),
 								path.into_string(),
 								NonRootItemType::<Self>::Dir(Cow::Owned(dir)),
 							))
@@ -192,12 +232,9 @@ pub(crate) trait CategoryDirDownloadExt: CategoryFSExt {
 			Self::File,
 			CanonicalPath,
 		)>,
-		entry_complete_sender: tokio::sync::mpsc::Sender<(
-			Result<(), Error>,
-			String,
-			NonRootItemType<'static, Self>,
-		)>,
+		entry_complete_sender: tokio::sync::mpsc::Sender<EntryResult<Self>>,
 		downloaded_bytes: Arc<AtomicU64>,
+		keep: KeepLocalWhen,
 	) -> tokio::task::JoinHandle<()> {
 		tokio::task::spawn(async move {
 			let semaphore = Arc::new(tokio::sync::Semaphore::new(
@@ -216,6 +253,7 @@ pub(crate) trait CategoryDirDownloadExt: CategoryFSExt {
 						remote_file,
 						path.clone(),
 						&downloaded_bytes,
+						keep,
 					)
 					.await;
 
@@ -235,12 +273,22 @@ pub(crate) trait CategoryDirDownloadExt: CategoryFSExt {
 
 	async fn download_fs_tree_from_target_into_path(
 		client: Arc<Self::Client>,
-		error_callback: &mut impl FnMut(Vec<(Error, String, NonRootItemType<'static, Self>)>),
-		progress_callback: &mut impl FnMut(Vec<(Self::Dir, String)>, Vec<(Self::File, String)>, u64),
+		callbacks: DownloadCallbacks<
+			'_,
+			impl FnMut(Vec<(Error, String, NonRootItemType<'static, Self>)>),
+			impl FnMut(Vec<(Self::Dir, String)>, Vec<(Self::File, String)>, u64),
+			impl FnMut(Vec<(Self::File, String)>),
+		>,
 		path: String,
 		tree: super::fs_tree::FSTree<Self::Dir, Self::File>,
 		target_folder: DirType<'static, Self>,
+		existing: ExistingLocalFile,
 	) -> Result<(), Error> {
+		let DownloadCallbacks {
+			errors: error_callback,
+			progress: progress_callback,
+			skipped: skipped_callback,
+		} = callbacks;
 		let (entry_complete_sender, mut entry_complete_receiver) =
 			tokio::sync::mpsc::channel::<EntryResult<Self>>(16);
 
@@ -273,10 +321,12 @@ pub(crate) trait CategoryDirDownloadExt: CategoryFSExt {
 			file_download_request_receiver,
 			entry_complete_sender,
 			Arc::clone(&downloaded_bytes),
+			existing.keep_local_when(),
 		));
 
 		let mut completed_files = Vec::new();
 		let mut completed_dirs = Vec::new();
+		let mut skipped_files = Vec::new();
 		let mut errors = Vec::new();
 
 		loop {
@@ -285,6 +335,9 @@ pub(crate) trait CategoryDirDownloadExt: CategoryFSExt {
 					let bytes = downloaded_bytes.swap(0, std::sync::atomic::Ordering::Relaxed);
 					if !errors.is_empty() {
 						error_callback(std::mem::take(&mut errors));
+					}
+					if !skipped_files.is_empty() {
+						skipped_callback(std::mem::take(&mut skipped_files));
 					}
 					if completed_dirs.is_empty() && completed_files.is_empty() && bytes == 0 {
 						continue;
@@ -301,13 +354,16 @@ pub(crate) trait CategoryDirDownloadExt: CategoryFSExt {
 						None => break,
 					};
 					match res {
-						Ok(()) => {
-							match obj {
-								NonRootItemType::<Self>::Dir(dir) => {
+						Ok(write) => {
+							match (obj, write) {
+								(NonRootItemType::<Self>::Dir(dir), _) => {
 									completed_dirs.push((dir.into_owned(), path));
 								}
-								NonRootItemType::<Self>::File(file) => {
+								(NonRootItemType::<Self>::File(file), LocalWrite::Written) => {
 									completed_files.push((file.into_owned(), path));
+								}
+								(NonRootItemType::<Self>::File(file), LocalWrite::Kept) => {
+									skipped_files.push((file.into_owned(), path));
 								}
 							}
 						}
@@ -326,6 +382,9 @@ pub(crate) trait CategoryDirDownloadExt: CategoryFSExt {
 		if !errors.is_empty() {
 			error_callback(std::mem::take(&mut errors));
 		}
+		if !skipped_files.is_empty() {
+			skipped_callback(std::mem::take(&mut skipped_files));
+		}
 		let bytes = downloaded_bytes.swap(0, std::sync::atomic::Ordering::Relaxed);
 		if !completed_dirs.is_empty() || !completed_files.is_empty() || bytes != 0 {
 			progress_callback(
@@ -341,8 +400,21 @@ pub(crate) trait CategoryDirDownloadExt: CategoryFSExt {
 
 impl<T> CategoryDirDownloadExt for T where T: CategoryFSExt {}
 
+/// Where a directory download reports what it did.
+pub(crate) struct DownloadCallbacks<'a, E, P, S> {
+	/// The entries that failed.
+	pub(crate) errors: &'a mut E,
+	/// The directories created and files written, and the bytes written since the last call.
+	pub(crate) progress: &'a mut P,
+	/// The files left out for the local file kept at their path.
+	pub(crate) skipped: &'a mut S,
+}
+
 #[allow(private_bounds)]
 pub trait CategoryDirDownloadExtPub: CategoryDirDownloadExt {
+	/// Downloads `target` and everything below it into the local directory `dir_path`, as
+	/// [`Self::download_dir_recursively_with_options`] does with the default
+	/// [`DirDownloadOptions`].
 	fn download_dir_recursively<C>(
 		client: Arc<Self::Client>,
 		dir_path: String,
@@ -353,7 +425,32 @@ pub trait CategoryDirDownloadExtPub: CategoryDirDownloadExt {
 	where
 		C: DirDownloadCallback<Self> + ?Sized,
 	{
+		Self::download_dir_recursively_with_options(
+			client,
+			dir_path,
+			callback,
+			target,
+			context,
+			DirDownloadOptions::default(),
+		)
+	}
+
+	/// Downloads `target` and everything below it into the local directory `dir_path`, as
+	/// `options` say.
+	fn download_dir_recursively_with_options<C>(
+		client: Arc<Self::Client>,
+		dir_path: String,
+		callback: impl Deref<Target = C>,
+		target: DirType<'static, Self>,
+		context: Self::ListDirContext<'_>,
+		options: DirDownloadOptions,
+	) -> impl std::future::Future<Output = Result<(), Error>>
+	where
+		C: DirDownloadCallback<Self> + ?Sized,
+	{
 		use tracing::Instrument as _;
+
+		let DirDownloadOptions { existing } = options;
 
 		let span = tracing::info_span!("download_dir_recursively", dir_path = %dir_path);
 		async move {
@@ -387,15 +484,21 @@ pub trait CategoryDirDownloadExtPub: CategoryDirDownloadExt {
 
 			Self::download_fs_tree_from_target_into_path(
 				client,
-				&mut |errors| {
-					callback_ref.on_download_errors(errors);
-				},
-				&mut |downloaded_dirs, downloaded_files, bytes| {
-					callback_ref.on_download_update(downloaded_dirs, downloaded_files, bytes);
+				DownloadCallbacks {
+					errors: &mut |errors| {
+						callback_ref.on_download_errors(errors);
+					},
+					progress: &mut |downloaded_dirs, downloaded_files, bytes| {
+						callback_ref.on_download_update(downloaded_dirs, downloaded_files, bytes);
+					},
+					skipped: &mut |skipped_files| {
+						callback_ref.on_download_skipped(skipped_files);
+					},
 				},
 				dir_path,
 				tree,
 				target,
+				existing,
 			)
 			.await
 		}
@@ -413,7 +516,7 @@ mod tests {
 	use filen_types::fs::{ParentUuid, StableUuid};
 	use uuid::Uuid;
 
-	use super::CategoryDirDownloadExt;
+	use super::{CategoryDirDownloadExt, DownloadCallbacks, ExistingLocalFile};
 	use crate::{
 		auth::test_support::offline_client,
 		crypto::{file::FileKey, shared::CreateRandom, v3::EncryptionKey},
@@ -482,11 +585,14 @@ mod tests {
 			let files = (1..=FILES).map(|n| file_in(ROOT, n)).collect();
 			let tree = tree_of_files(ROOT, files);
 
-			let (mut on_errors, mut on_progress) = (|_| {}, |_, _, _| {});
+			let (mut on_errors, mut on_progress, mut on_skipped) = (|_| {}, |_, _, _| {}, |_| {});
 			let mut download = Box::pin(Normal::download_fs_tree_from_target_into_path(
 				Arc::new(offline_client()),
-				&mut on_errors,
-				&mut on_progress,
+				DownloadCallbacks {
+					errors: &mut on_errors,
+					progress: &mut on_progress,
+					skipped: &mut on_skipped,
+				},
 				local
 					.path()
 					.join("root")
@@ -495,6 +601,7 @@ mod tests {
 					.expect("a UTF-8 temp dir"),
 				tree,
 				DirType::Dir(Cow::Owned(root)),
+				ExistingLocalFile::ReplaceUnlessSame,
 			));
 			// The first poll starts the walker and the downloads; nothing can finish.
 			assert!(futures::poll!(download.as_mut()).is_pending());
