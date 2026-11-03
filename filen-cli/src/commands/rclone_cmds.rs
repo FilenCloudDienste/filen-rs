@@ -57,7 +57,7 @@
 
 use std::{
 	fmt,
-	net::{Ipv4Addr, Ipv6Addr},
+	net::{IpAddr, Ipv4Addr, Ipv6Addr},
 	path::{Path, PathBuf},
 	time::Duration,
 };
@@ -118,15 +118,19 @@ pub(crate) enum RcloneCommands {
 		#[arg(long, value_name = "PATH")]
 		root: Option<String>,
 	},
-	/// Runs a WebDAV, S3, FTP, SFTP, HTTP, restic or NFS server exposing your Filen drive
+	/// Runs WebDAV, S3, FTP, SFTP, HTTP, restic or NFS servers exposing your Filen drive
 	Serve {
 		#[command(flatten)]
 		binary: RcloneBinaryArg,
-		/// The type of server to run
-		server: ServerType,
-		/// IP and port for the server (`<ip>:<port>`; `0.0.0.0:<port>` for every network interface) (default: 127.0.0.1 and a port per type)
-		#[arg(long = "addr")]
+		/// The types of server to run: one, or several on one Rclone, each on its default port
+		#[arg(required = true, num_args = 1..)]
+		servers: Vec<ServerType>,
+		/// IP and port for the server (`<ip>:<port>`; `0.0.0.0:<port>` for every network interface), with a single server type only (default: 127.0.0.1 and a port per type)
+		#[arg(long = "addr", conflicts_with = "host")]
 		address: Option<String>,
+		/// IP address every server listens on, each on its default port (`0.0.0.0` for every network interface) (default: 127.0.0.1)
+		#[arg(long)]
+		host: Option<String>,
 		/// Username for authentication to the server (default: random, printed when the server starts).
 		/// On S3 servers, this is the Access Key ID. NFS servers have no authentication and listen on 127.0.0.1 only.
 		#[arg(long)]
@@ -154,6 +158,12 @@ pub(crate) enum RcloneCommands {
 		/// TLS private key (PEM) for --cert
 		#[arg(long)]
 		key: Option<String>,
+		/// Also mount the drive, on the same Rclone and cache as the servers (read-only with --read-only, of --root only with --root)
+		#[arg(long)]
+		mount: bool,
+		/// Where --mount mounts the drive: an empty directory (default: /tmp/filen), or on Windows a drive letter (default: X)
+		#[arg(long, value_name = "PATH", requires = "mount")]
+		mount_point: Option<String>,
 	},
 	/// Shows the version and path of the Rclone that mount, serve and rclone run
 	RcloneInfo {
@@ -303,8 +313,9 @@ impl RcloneCommands {
 			}
 			Self::Serve {
 				binary,
-				server,
+				servers,
 				address,
+				host,
 				user,
 				password,
 				password_file,
@@ -313,6 +324,8 @@ impl RcloneCommands {
 				cache_size,
 				cert,
 				key,
+				mount,
+				mount_point,
 			} => {
 				let password = serve_password(password, password_file.as_deref()).await?;
 				start_server(
@@ -321,8 +334,9 @@ impl RcloneCommands {
 					client,
 					&binary,
 					ServeArgs {
-						protocol: server.into(),
+						protocols: serve_protocols(&servers),
 						address,
+						host,
 						user,
 						password,
 						read_only,
@@ -330,6 +344,10 @@ impl RcloneCommands {
 						cache_size,
 						cert,
 						key,
+						mount: mount.then_some(match mount_point {
+							Some(mount_point) => MountPoint::At(mount_point),
+							None => MountPoint::Default,
+						}),
 					},
 				)
 				.await?;
@@ -394,9 +412,14 @@ const CACHES: u32 = 8;
 
 /// What `serve` serves.
 pub(crate) struct ServeArgs {
-	pub(crate) protocol: ServeProtocol,
-	/// `host:port`; 127.0.0.1 and the protocol's default port without it.
+	/// The servers' types, each once, in the order given.
+	pub(crate) protocols: Vec<ServeProtocol>,
+	/// `host:port` of the one server; `host` (or 127.0.0.1) and the protocol's default port
+	/// without it.
 	pub(crate) address: Option<String>,
+	/// The IP address, or `localhost`, every server listens on, each on its default port;
+	/// 127.0.0.1 without it.
+	pub(crate) host: Option<String>,
 	pub(crate) user: Option<String>,
 	pub(crate) password: Option<String>,
 	pub(crate) read_only: bool,
@@ -405,6 +428,39 @@ pub(crate) struct ServeArgs {
 	pub(crate) cache_size: Option<u64>,
 	pub(crate) cert: Option<String>,
 	pub(crate) key: Option<String>,
+	/// Where the drive is also mounted, on the servers' Rclone; not mounted without one.
+	pub(crate) mount: Option<MountPoint>,
+}
+
+/// Where `serve --mount` mounts the drive.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum MountPoint {
+	/// Where `mount` mounts it without a mount point.
+	Default,
+	At(String),
+}
+
+/// One server `serve` starts.
+#[derive(Debug, PartialEq, Eq)]
+struct Server {
+	protocol: ServeProtocol,
+	host: String,
+	port: u16,
+	auth: ServeAuth,
+	/// Whether `auth` was generated, so that it is printed even with `--quiet`.
+	credentials_generated: bool,
+	tls: Option<ServeTls>,
+}
+
+/// A server that `serve` started.
+struct StartedServer {
+	protocol: ServeProtocol,
+	/// Where it listens, as `host:port`.
+	addr: String,
+	/// The URL of a server spoken to over HTTP.
+	url: Option<String>,
+	auth: ServeAuth,
+	credentials_generated: bool,
 }
 
 /// What `mount` mounts.
@@ -463,75 +519,249 @@ pub(crate) async fn start_server(
 	binary: &RcloneBinaryArg,
 	args: ServeArgs,
 ) -> Result<()> {
-	check_serve_args(args.protocol, args.read_only)?;
-	let name = display_name(args.protocol);
-	let (host, port) = match &args.address {
-		Some(address) => parse_address(address)?,
-		None => ("127.0.0.1".to_owned(), default_port(args.protocol)),
+	let servers = plan_servers(&args)?;
+	let client = client.get(ui).await?;
+	let root = drive_dir(client, args.root.as_deref()).await?;
+	let mount_point = match args.mount {
+		None => None,
+		Some(MountPoint::Default) => Some(default_mount_point().await?),
+		Some(MountPoint::At(mount_point)) => Some(mount_point),
 	};
-	let credentials_given = args.user.is_some() || args.password.is_some();
-	let auth = serve_auth(args.protocol, args.user, args.password)?;
-	let credentials_generated = !credentials_given && auth != ServeAuth::Unauthenticated;
-	let tls = match (args.cert, args.key) {
+	let (daemon, ctrl_c) = start_daemon(config, ui, client, binary, args.cache_size).await?;
+	let started = start_servers_and_mount(
+		&daemon.daemon,
+		servers,
+		mount_point,
+		args.read_only,
+		root.as_deref(),
+	)
+	.await;
+	let (started, mounted) = match started {
+		Ok(started) => started,
+		Err(e) => {
+			// A Ctrl-C now cancels the command, stopping Rclone at once.
+			drop(ctrl_c);
+			stop_after_failure(&daemon.daemon).await;
+			return Err(e);
+		}
+	};
+	let alone = started.len() == 1 && mounted.is_none();
+	if ui.json {
+		let mut printed: Vec<Value> = started.iter().map(started_json).collect();
+		if let Some(mounted) = &mounted {
+			printed.push(mount_json(mounted));
+		}
+		if alone && let Some(server) = printed.pop() {
+			ui.print_json(server)?;
+		} else {
+			ui.print_json(Value::Array(printed))?;
+		}
+	} else {
+		for server in &started {
+			let line = started_line(server);
+			let line = if alone {
+				format!("{line} (press Ctrl-C to stop)")
+			} else {
+				line
+			};
+			print_started(ui, &line, server.credentials_generated);
+		}
+		if let Some(mounted) = &mounted {
+			ui.print_success(&format!("Mounted network drive at {}", mounted.mount_point));
+		}
+		if !alone {
+			print_notice(ui, "Press Ctrl-C to stop");
+		}
+	}
+	let names = started
+		.iter()
+		.map(|server| display_name(server.protocol))
+		.collect::<Vec<_>>();
+	wait_and_stop(
+		ui,
+		&daemon,
+		ctrl_c,
+		&stopping_notice(&names, mounted.is_some()),
+	)
+	.await
+}
+
+/// The servers `args` describe, refused before logging in when the options do not fit them: an
+/// `--addr` with several types, a read-only restic server, or credentials or a certificate given
+/// halfway.
+fn plan_servers(args: &ServeArgs) -> Result<Vec<Server>> {
+	let several = args.protocols.len() > 1;
+	if several && args.address.is_some() {
+		return Err(UI::usage_failure(
+			"--addr takes a single server type; give several servers an IP address with --host instead, and each listens on its default port",
+		));
+	}
+	let tls = match (&args.cert, &args.key) {
 		(Some(cert_path), Some(key_path)) => Some(ServeTls {
-			cert_path,
-			key_path,
+			// Owned copies, one per server that takes them.
+			cert_path: cert_path.clone(),
+			key_path: key_path.clone(),
 		}),
 		(None, None) => None,
 		_ => return Err(UI::usage_failure("Give both --cert and --key, or neither")),
 	};
-	let scheme = if tls.is_some() { "https" } else { "http" };
-	let client = client.get(ui).await?;
-	let root = drive_dir(client, args.root.as_deref()).await?;
-	let (daemon, ctrl_c) = start_daemon(config, ui, client, binary, args.cache_size).await?;
-	let serve = daemon
-		.daemon
-		.start_serve(ServeOptions {
-			protocol: args.protocol,
+	let host = args.host.as_deref().map(parse_host).transpose()?;
+	let credentials_given = args.user.is_some() || args.password.is_some();
+	let mut servers = Vec::with_capacity(args.protocols.len());
+	for &protocol in &args.protocols {
+		check_serve_args(protocol, args.read_only)?;
+		let (host, port) = match (&args.address, &host) {
+			(Some(address), _) => parse_address(address)?,
+			// One copy per server.
+			(None, Some(host)) => (host.clone(), default_port(protocol)),
+			(None, None) => ("127.0.0.1".to_owned(), default_port(protocol)),
+		};
+		// Several servers share the credentials given, but for NFS, which takes none.
+		let auth = if several && protocol == ServeProtocol::Nfs {
+			ServeAuth::Unauthenticated
+		} else {
+			// Each server takes its own copy of the credentials given.
+			serve_auth(protocol, args.user.clone(), args.password.clone())?
+		};
+		let credentials_generated = !credentials_given && auth != ServeAuth::Unauthenticated;
+		// With several servers, the certificate is for those that serve HTTPS; with one, the
+		// server refuses it when it cannot.
+		let tls = if several && !serves_tls(protocol) {
+			None
+		} else {
+			tls.clone()
+		};
+		servers.push(Server {
+			protocol,
 			host,
 			port,
-			// One copy for the server, one to print.
-			auth: auth.clone(),
+			auth,
+			credentials_generated,
 			tls,
-			read_only: args.read_only,
-			root,
+		});
+	}
+	Ok(servers)
+}
+
+/// Starts `servers`, and then the mount at `mount_point` if there is one, on `daemon`, all of
+/// them read-only with `read_only` and of the directory `root` with one. Fails at the first that
+/// does not start, leaving the others running.
+async fn start_servers_and_mount(
+	daemon: &RcloneDaemon,
+	servers: Vec<Server>,
+	mount_point: Option<String>,
+	read_only: bool,
+	root: Option<&str>,
+) -> Result<(Vec<StartedServer>, Option<MountInfo>)> {
+	let mut started = Vec::with_capacity(servers.len());
+	for server in servers {
+		let scheme = if server.tls.is_some() {
+			"https"
+		} else {
+			"http"
+		};
+		let name = display_name(server.protocol);
+		let info = daemon
+			.start_serve(ServeOptions {
+				protocol: server.protocol,
+				host: server.host,
+				port: server.port,
+				// One copy for the server, one to print.
+				auth: server.auth.clone(),
+				tls: server.tls,
+				read_only,
+				root: root.map(str::to_owned),
+			})
+			.await
+			.map_err(|e| rclone_error(e, format!("Failed to start {name} server")))?;
+		let url = match server.protocol {
+			ServeProtocol::Webdav
+			| ServeProtocol::S3
+			| ServeProtocol::Http
+			| ServeProtocol::Restic => Some(format!("{scheme}://{}", info.addr)),
+			ServeProtocol::Ftp | ServeProtocol::Sftp | ServeProtocol::Nfs => None,
+		};
+		started.push(StartedServer {
+			protocol: server.protocol,
+			addr: info.addr,
+			url,
+			auth: server.auth,
+			credentials_generated: server.credentials_generated,
+		});
+	}
+	let Some(mount_point) = mount_point else {
+		return Ok((started, None));
+	};
+	let mounted = daemon
+		.mount(MountOptions {
+			mount_point,
+			read_only,
+			root: root.map(str::to_owned),
 		})
 		.await
-		.map_err(|e| rclone_error(e, format!("Failed to start {name} server")))?;
-	let url = match args.protocol {
-		ServeProtocol::Webdav | ServeProtocol::S3 | ServeProtocol::Http | ServeProtocol::Restic => {
-			Some(format!("{scheme}://{}", serve.addr))
-		}
-		ServeProtocol::Ftp | ServeProtocol::Sftp | ServeProtocol::Nfs => None,
-	};
-	if ui.json {
-		ui.print_json(serve_json(
-			args.protocol,
-			&serve.addr,
-			url.as_deref(),
-			&auth,
-		))?;
-	} else {
-		let address = url.as_deref().unwrap_or(&serve.addr);
-		let credentials = match auth {
-			ServeAuth::Basic { user, password } => {
-				format!("with username \"{user}\" and password \"{password}\"")
-			}
-			ServeAuth::S3 {
-				access_key_id,
-				secret_access_key,
-			} => format!(
-				"with Access Key ID \"{access_key_id}\" and Secret Access Key \"{secret_access_key}\""
-			),
-			ServeAuth::Unauthenticated => "without authentication".to_owned(),
-		};
-		print_started(
-			ui,
-			&format!("Started {name} server on {address} {credentials} (press Ctrl-C to stop)"),
-			credentials_generated,
-		);
+		.map_err(|e| {
+			rclone_error(
+				e,
+				"Failed to mount network drive (use --verbose for more info)",
+			)
+		})?;
+	Ok((started, Some(mounted)))
+}
+
+/// Stops `daemon` after a server or the mount failed to start, letting what the others uploaded
+/// meanwhile finish.
+async fn stop_after_failure(daemon: &RcloneDaemon) {
+	match daemon.stop(STOP).await {
+		Ok(report) if report.pending_uploads > 0 => log::warn!(
+			"{} uploads did not finish while Rclone stopped",
+			report.pending_uploads
+		),
+		Ok(_) => {}
+		Err(e) => log::warn!("Failed to stop Rclone: {e}"),
 	}
-	wait_and_stop(ui, &daemon, ctrl_c, &format!("Stopping {name} server")).await
+}
+
+/// What a started server's line says: its type, address and credentials.
+fn started_line(server: &StartedServer) -> String {
+	let name = display_name(server.protocol);
+	let address = server.url.as_deref().unwrap_or(&server.addr);
+	let credentials = match &server.auth {
+		ServeAuth::Basic { user, password } => {
+			format!("with username \"{user}\" and password \"{password}\"")
+		}
+		ServeAuth::S3 {
+			access_key_id,
+			secret_access_key,
+		} => format!(
+			"with Access Key ID \"{access_key_id}\" and Secret Access Key \"{secret_access_key}\""
+		),
+		ServeAuth::Unauthenticated => "without authentication".to_owned(),
+	};
+	format!("Started {name} server on {address} {credentials}")
+}
+
+/// What `serve --json` prints for a started server.
+fn started_json(server: &StartedServer) -> Value {
+	serve_json(
+		server.protocol,
+		&server.addr,
+		server.url.as_deref(),
+		&server.auth,
+	)
+}
+
+/// What `serve` says when it stops the servers named `names` and, with `mounted`, the mount.
+fn stopping_notice(names: &[&str], mounted: bool) -> String {
+	let servers = match names {
+		[] => String::new(),
+		[name] => format!("{name} server"),
+		[first @ .., last] => format!("{} and {last} servers", first.join(", ")),
+	};
+	if mounted {
+		format!("Stopping {servers} and unmounting the network drive")
+	} else {
+		format!("Stopping {servers}")
+	}
 }
 
 /// The directory `root` names, by its path from the drive's root, once it is known to be one: the
@@ -1093,6 +1323,43 @@ fn default_port(protocol: ServeProtocol) -> u16 {
 	}
 }
 
+/// The protocols of the server types `serve` was given, each once, in the order given.
+fn serve_protocols(servers: &[ServerType]) -> Vec<ServeProtocol> {
+	let mut protocols = Vec::with_capacity(servers.len());
+	for &server in servers {
+		let protocol = ServeProtocol::from(server);
+		if !protocols.contains(&protocol) {
+			protocols.push(protocol);
+		}
+	}
+	protocols
+}
+
+/// Whether a server of `protocol` serves HTTPS with `--cert`.
+fn serves_tls(protocol: ServeProtocol) -> bool {
+	match protocol {
+		ServeProtocol::Webdav | ServeProtocol::S3 | ServeProtocol::Http | ServeProtocol::Restic => {
+			true
+		}
+		ServeProtocol::Ftp | ServeProtocol::Sftp | ServeProtocol::Nfs => false,
+	}
+}
+
+/// The host `--host` names: an IP address (an IPv6 one with or without brackets), or `localhost`.
+fn parse_host(host: &str) -> Result<String> {
+	let ip = host
+		.strip_prefix('[')
+		.and_then(|host| host.strip_suffix(']'))
+		.unwrap_or(host);
+	if ip == "localhost" || ip.parse::<IpAddr>().is_ok() {
+		Ok(ip.to_owned())
+	} else {
+		Err(UI::usage_failure(&format!(
+			"Invalid host {host}: expected an IP address or localhost"
+		)))
+	}
+}
+
 /// The options of a `serve` that the daemon would refuse whatever the address and credentials, so
 /// that they are refused before logging in: a restic server writes to the drive without the cache,
 /// so it cannot be read-only.
@@ -1214,10 +1481,13 @@ mod tests {
 	/// The protocol of `filen serve <server_type>`.
 	fn parsed_protocol(server_type: &str) -> Result<ServeProtocol, clap::Error> {
 		let args = parse_args(["filen", "serve", server_type])?.args;
-		let Some(Commands::Rclone(RcloneCommands::Serve { server, .. })) = args.command else {
+		let Some(Commands::Rclone(RcloneCommands::Serve { servers, .. })) = args.command else {
 			panic!("`serve {server_type}` parsed as another command");
 		};
-		Ok(server.into())
+		let [server] = servers.as_slice() else {
+			panic!("`serve {server_type}` parsed as {servers:?}");
+		};
+		Ok((*server).into())
 	}
 
 	#[test]
@@ -1449,6 +1719,348 @@ mod tests {
 			)
 		);
 		assert!(meta.exists());
+	}
+
+	#[test]
+	fn serve_takes_several_server_types_each_once() {
+		let RcloneCommands::Serve { servers, .. } =
+			parsed_command(&["filen", "serve", "webdav", "s3", "webdav", "--read-only"])
+		else {
+			panic!("parsed as another command");
+		};
+
+		assert_eq!(
+			serve_protocols(&servers),
+			[ServeProtocol::Webdav, ServeProtocol::S3]
+		);
+	}
+
+	#[test]
+	fn serve_without_a_server_type_is_a_usage_error() {
+		let Err(err) = parse_args(["filen", "serve"]) else {
+			panic!("parsed serve without a server type");
+		};
+
+		assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+		assert_eq!(err.exit_code(), 2);
+	}
+
+	#[test]
+	fn the_address_and_the_host_conflict() {
+		let args = [
+			"filen",
+			"serve",
+			"webdav",
+			"--addr",
+			"127.0.0.1:8080",
+			"--host",
+			"0.0.0.0",
+		];
+
+		let Err(err) = parse_args(args) else {
+			panic!("parsed both --addr and --host");
+		};
+
+		assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+	}
+
+	#[test]
+	fn a_mount_point_needs_mount() {
+		let Err(err) = parse_args(["filen", "serve", "webdav", "--mount-point", "/mnt/filen"])
+		else {
+			panic!("parsed --mount-point without --mount");
+		};
+
+		assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+	}
+
+	#[test]
+	fn serve_mounts_where_it_is_told_or_by_default() {
+		let mount = |args: &[&str]| {
+			let RcloneCommands::Serve {
+				mount, mount_point, ..
+			} = parsed_command(args)
+			else {
+				panic!("{args:?} parsed as another command");
+			};
+			(mount, mount_point)
+		};
+
+		assert_eq!(mount(&["filen", "serve", "webdav"]), (false, None));
+		assert_eq!(
+			mount(&["filen", "serve", "webdav", "--mount"]),
+			(true, None)
+		);
+		assert_eq!(
+			mount(&[
+				"filen",
+				"serve",
+				"webdav",
+				"--mount",
+				"--mount-point",
+				"/mnt/filen"
+			]),
+			(true, Some("/mnt/filen".to_owned()))
+		);
+	}
+
+	/// What `serve` gets for `protocols` without any option.
+	fn serve_args(protocols: &[ServeProtocol]) -> ServeArgs {
+		ServeArgs {
+			protocols: protocols.to_vec(),
+			address: None,
+			host: None,
+			user: None,
+			password: None,
+			read_only: false,
+			root: None,
+			cache_size: None,
+			cert: None,
+			key: None,
+			mount: None,
+		}
+	}
+
+	/// Where each of `servers` listens.
+	fn addresses(servers: &[Server]) -> Vec<(ServeProtocol, &str, u16)> {
+		servers
+			.iter()
+			.map(|server| (server.protocol, server.host.as_str(), server.port))
+			.collect()
+	}
+
+	#[test]
+	fn several_servers_listen_on_their_default_ports() {
+		let servers =
+			plan_servers(&serve_args(&[ServeProtocol::Webdav, ServeProtocol::S3])).unwrap();
+
+		assert_eq!(
+			addresses(&servers),
+			[
+				(ServeProtocol::Webdav, "127.0.0.1", 1900),
+				(ServeProtocol::S3, "127.0.0.1", 1800),
+			]
+		);
+	}
+
+	#[test]
+	fn several_servers_listen_on_the_host_given() {
+		let args = ServeArgs {
+			host: Some("[::1]".to_owned()),
+			..serve_args(&[ServeProtocol::Ftp, ServeProtocol::Http])
+		};
+
+		let servers = plan_servers(&args).unwrap();
+
+		assert_eq!(
+			addresses(&servers),
+			[
+				(ServeProtocol::Ftp, "::1", 2121),
+				(ServeProtocol::Http, "::1", 1700),
+			]
+		);
+	}
+
+	#[test]
+	fn an_address_with_several_servers_is_a_usage_error() {
+		let args = ServeArgs {
+			address: Some("127.0.0.1:8080".to_owned()),
+			..serve_args(&[ServeProtocol::Webdav, ServeProtocol::S3])
+		};
+
+		let err = plan_servers(&args).unwrap_err();
+
+		assert_eq!(exit_code(&err), 2);
+		assert_eq!(
+			format!("{err:#}"),
+			"--addr takes a single server type; give several servers an IP address with --host instead, and each listens on its default port"
+		);
+	}
+
+	#[test]
+	fn one_server_listens_on_the_address_given() {
+		let args = ServeArgs {
+			address: Some("127.0.0.1:8080".to_owned()),
+			..serve_args(&[ServeProtocol::Webdav])
+		};
+
+		let servers = plan_servers(&args).unwrap();
+
+		assert_eq!(
+			addresses(&servers),
+			[(ServeProtocol::Webdav, "127.0.0.1", 8080)]
+		);
+	}
+
+	#[test]
+	fn an_invalid_host_is_a_usage_error() {
+		let args = ServeArgs {
+			host: Some("example.com".to_owned()),
+			..serve_args(&[ServeProtocol::Webdav, ServeProtocol::S3])
+		};
+
+		let err = plan_servers(&args).unwrap_err();
+
+		assert_eq!(exit_code(&err), 2);
+		assert_eq!(
+			format!("{err:#}"),
+			"Invalid host example.com: expected an IP address or localhost"
+		);
+	}
+
+	#[test]
+	fn hosts_are_ip_addresses_or_localhost() {
+		assert_eq!(parse_host("0.0.0.0").unwrap(), "0.0.0.0");
+		assert_eq!(parse_host("::").unwrap(), "::");
+		assert_eq!(parse_host("[::1]").unwrap(), "::1");
+		assert_eq!(parse_host("localhost").unwrap(), "localhost");
+		assert!(parse_host("").is_err());
+		assert!(parse_host("127.0.0.1:80").is_err());
+	}
+
+	#[test]
+	fn several_servers_get_credentials_of_their_own() {
+		let servers = plan_servers(&serve_args(&[
+			ServeProtocol::Webdav,
+			ServeProtocol::Ftp,
+			ServeProtocol::S3,
+			ServeProtocol::Nfs,
+		]))
+		.unwrap();
+
+		let [webdav, ftp, s3, nfs] = servers.as_slice() else {
+			panic!("planned {servers:?}");
+		};
+		assert!(matches!(webdav.auth, ServeAuth::Basic { .. }));
+		assert_ne!(webdav.auth, ftp.auth);
+		assert!(matches!(s3.auth, ServeAuth::S3 { .. }));
+		assert_eq!(nfs.auth, ServeAuth::Unauthenticated);
+		assert!(webdav.credentials_generated && ftp.credentials_generated);
+		assert!(s3.credentials_generated && !nfs.credentials_generated);
+	}
+
+	#[test]
+	fn the_credentials_given_are_every_servers_but_nfs() {
+		let args = ServeArgs {
+			user: Some("me".to_owned()),
+			password: Some("secret".to_owned()),
+			..serve_args(&[ServeProtocol::Webdav, ServeProtocol::Nfs])
+		};
+
+		let servers = plan_servers(&args).unwrap();
+
+		assert_eq!(
+			servers
+				.iter()
+				.map(|server| &server.auth)
+				.collect::<Vec<_>>(),
+			[
+				&ServeAuth::Basic {
+					user: "me".to_owned(),
+					password: "secret".to_owned()
+				},
+				&ServeAuth::Unauthenticated,
+			]
+		);
+		assert!(servers.iter().all(|server| !server.credentials_generated));
+	}
+
+	#[test]
+	fn credentials_given_to_nfs_alone_are_a_usage_error() {
+		let args = ServeArgs {
+			user: Some("me".to_owned()),
+			password: Some("secret".to_owned()),
+			..serve_args(&[ServeProtocol::Nfs])
+		};
+
+		let err = plan_servers(&args).unwrap_err();
+
+		assert_eq!(exit_code(&err), 2);
+		assert_eq!(format!("{err:#}"), "NFS servers take no credentials");
+	}
+
+	#[test]
+	fn with_several_servers_only_those_serving_https_get_the_certificate() {
+		let args = ServeArgs {
+			cert: Some("cert.pem".to_owned()),
+			key: Some("key.pem".to_owned()),
+			..serve_args(&[ServeProtocol::Webdav, ServeProtocol::Ftp])
+		};
+
+		let servers = plan_servers(&args).unwrap();
+
+		let tls = ServeTls {
+			cert_path: "cert.pem".to_owned(),
+			key_path: "key.pem".to_owned(),
+		};
+		assert_eq!(
+			servers
+				.iter()
+				.map(|server| server.tls.as_ref())
+				.collect::<Vec<_>>(),
+			[Some(&tls), None]
+		);
+	}
+
+	#[test]
+	fn one_server_gets_the_certificate_even_if_it_cannot_serve_https() {
+		let args = ServeArgs {
+			cert: Some("cert.pem".to_owned()),
+			key: Some("key.pem".to_owned()),
+			..serve_args(&[ServeProtocol::Ftp])
+		};
+
+		let servers = plan_servers(&args).unwrap();
+
+		assert!(servers[0].tls.is_some());
+	}
+
+	#[test]
+	fn a_read_only_restic_server_among_several_is_a_usage_error() {
+		let args = ServeArgs {
+			read_only: true,
+			..serve_args(&[ServeProtocol::Webdav, ServeProtocol::Restic])
+		};
+
+		let err = plan_servers(&args).unwrap_err();
+
+		assert_eq!(exit_code(&err), 2);
+		assert_eq!(format!("{err:#}"), "A restic server cannot be read-only");
+	}
+
+	#[test]
+	fn the_stopping_notice_names_the_servers_and_the_mount() {
+		assert_eq!(
+			stopping_notice(&["WebDAV"], false),
+			"Stopping WebDAV server"
+		);
+		assert_eq!(
+			stopping_notice(&["WebDAV", "S3", "FTP"], false),
+			"Stopping WebDAV, S3 and FTP servers"
+		);
+		assert_eq!(
+			stopping_notice(&["WebDAV"], true),
+			"Stopping WebDAV server and unmounting the network drive"
+		);
+	}
+
+	#[test]
+	fn a_started_server_line_names_its_address_and_credentials() {
+		let server = StartedServer {
+			protocol: ServeProtocol::Ftp,
+			addr: "127.0.0.1:2121".to_owned(),
+			url: None,
+			auth: ServeAuth::Basic {
+				user: "me".to_owned(),
+				password: "secret".to_owned(),
+			},
+			credentials_generated: false,
+		};
+
+		assert_eq!(
+			started_line(&server),
+			"Started FTP server on 127.0.0.1:2121 with username \"me\" and password \"secret\""
+		);
 	}
 
 	#[test]

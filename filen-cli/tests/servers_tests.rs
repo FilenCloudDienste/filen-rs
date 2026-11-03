@@ -169,6 +169,25 @@ impl Cli {
 		}
 	}
 
+	/// The JSON array printed first on stdout, pretty-printed over several lines.
+	async fn json_array(&mut self) -> Value {
+		let opening = self.line_containing("[").await;
+		assert_eq!(opening, "[", "the JSON does not start on a line of its own");
+		let mut json = opening;
+		loop {
+			let line = timeout(START, self.stdout.next_line())
+				.await
+				.unwrap_or_else(|_| panic!("the CLI did not finish its JSON within {START:?}"))
+				.unwrap()
+				.unwrap_or_else(|| panic!("stdout ended inside the JSON: {json}"));
+			let end = line == "]";
+			json.push_str(&line);
+			if end {
+				return serde_json::from_str(&json).unwrap();
+			}
+		}
+	}
+
 	/// What is left on stdout until the CLI closes it.
 	async fn rest_of_stdout(&mut self) -> Vec<String> {
 		let mut lines = Vec::new();
@@ -474,4 +493,98 @@ async fn a_server_with_a_root_that_does_not_exist_fails() {
 		stderr.contains(&format!("No such directory: {root}")),
 		"{stderr}"
 	);
+}
+
+/// The credentials and URL of a server in `serve --json`'s output.
+fn started_from_json(server: &Value) -> Started {
+	let field = |key: &str| {
+		server[key]
+			.as_str()
+			.unwrap_or_else(|| panic!("no {key} in {server}"))
+			.to_owned()
+	};
+	Started {
+		url: field("url"),
+		user: field("user"),
+		password: field("password"),
+	}
+}
+
+// On the default ports of WebDAV and HTTP, which no other test here uses: several servers take no
+// --addr.
+#[shared_test_runtime]
+async fn several_servers_run_on_one_command() {
+	let mut cli = Cli::spawn(&["serve", "webdav", "http", "--json"]).await;
+
+	let json = cli.json_array().await;
+	let servers = json.as_array().unwrap();
+	assert_eq!(servers.len(), 2, "{json}");
+	assert_eq!(servers[0]["protocol"], "webdav");
+	assert_eq!(servers[0]["address"], "127.0.0.1:1900");
+	assert_eq!(servers[1]["protocol"], "http");
+	assert_eq!(servers[1]["address"], "127.0.0.1:1700");
+	let webdav = started_from_json(&servers[0]);
+	let http = started_from_json(&servers[1]);
+	assert_ne!(webdav.password, http.password);
+	assert_eq!(webdav.propfind_root(true).await, StatusCode::MULTI_STATUS);
+	assert_eq!(http.get("").await.0, StatusCode::OK);
+
+	cli.interrupt();
+	let (status, stderr) = cli.exit().await;
+	assert_eq!(status.code(), Some(0), "{stderr}");
+	assert!(
+		stderr.contains("Stopping WebDAV and HTTP servers"),
+		"{stderr}"
+	);
+}
+
+// On the default ports of FTP and restic, which no other test here uses.
+#[shared_test_runtime]
+async fn servers_that_started_are_stopped_when_a_later_one_fails() {
+	let taken = TcpListener::bind("127.0.0.1:1600").unwrap();
+
+	let mut cli = Cli::spawn(&["serve", "ftp", "restic"]).await;
+	let (status, stderr) = cli.exit().await;
+
+	assert_eq!(status.code(), Some(1), "{stderr}");
+	assert!(
+		stderr.contains("Failed to start restic server: port 1600 is in use"),
+		"{stderr}"
+	);
+	// The FTP server that started first is gone with the CLI's Rclone.
+	assert!(TcpListener::bind("127.0.0.1:2121").is_ok());
+	drop(taken);
+}
+
+// On the default port of SFTP, which no other test here uses.
+#[shared_test_runtime]
+async fn a_mount_that_fails_after_its_servers_started_stops_them() {
+	let mount_point = TempDir::new().unwrap();
+	mount_point
+		.child("file.txt")
+		.write_str("in the way")
+		.unwrap();
+
+	let mut cli = Cli::spawn(&[
+		"serve",
+		"sftp",
+		"--mount",
+		"--mount-point",
+		mount_point.path().to_str().unwrap(),
+	])
+	.await;
+	let (status, stderr) = cli.exit().await;
+
+	// FUSE is looked for before the mount point: without it, the mount fails for that.
+	let expected = match fuse_status().await {
+		FuseStatus::Ready { .. } => {
+			"Failed to mount network drive (use --verbose for more info): the mount point is not empty"
+		}
+		FuseStatus::Missing { .. } => {
+			"Failed to mount network drive (use --verbose for more info): no FUSE is installed"
+		}
+	};
+	assert_eq!(status.code(), Some(1), "{stderr}");
+	assert!(stderr.contains(expected), "{stderr}");
+	assert!(TcpListener::bind("127.0.0.1:2022").is_ok());
 }
