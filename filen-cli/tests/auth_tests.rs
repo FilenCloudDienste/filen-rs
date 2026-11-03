@@ -397,12 +397,6 @@ async fn an_auth_config_of_the_old_cli_in_the_working_dir_is_imported_and_kept()
 	assert_eq!(std::fs::read_to_string(&path).unwrap(), contents);
 }
 
-// notes:
-// keyring authentication is hard to test here, so ignore it for now
-
-// todo: test prompting for 2fa code (need another test account with 2fa enabled for that?)
-// -> I think there isn't currently one in CI, so do that later
-
 /// The CLI in an empty working dir with `config_dir`, and with no credentials but those a test
 /// gives it: no keyring, no autodetected auth config, none of the credential variables.
 fn cli_without_stored_credentials(
@@ -503,3 +497,160 @@ async fn a_two_factor_code_is_made_from_the_secret_in_the_environment() {
 	})
 	.await;
 }
+
+#[shared_test_runtime]
+#[ignore = "toggles 2FA on the shared account"]
+async fn a_wrong_two_factor_code_given_with_the_flag_fails_without_asking_again() {
+	let (email, password) = get_testing_credentials();
+	let working_dir = assert_fs::TempDir::new().unwrap();
+	let config_dir = assert_fs::TempDir::new().unwrap();
+	with_two_factor_enabled(|secret, _| {
+		// the code of an hour ago, which the server no longer accepts
+		let wrong_code = secret
+			.make_totp_code(chrono::Utc::now() - chrono::Duration::hours(1))
+			.unwrap();
+		cli_without_stored_credentials(working_dir.path(), config_dir.path())
+			.args([
+				"--email",
+				&email,
+				"--password",
+				&password,
+				"--two-factor-code",
+				&wrong_code,
+				"--no-input",
+				"stat",
+				"/",
+			])
+			.assert()
+			.code(1)
+			.stdout("")
+			.stderr(predicates::str::contains(
+				"Two-factor authentication code wrong",
+			))
+			.stderr(predicates::str::contains("Cannot ask").not());
+	})
+	.await;
+}
+
+#[test]
+fn authenticate_from_the_credential_variables() {
+	let (email, password) = get_testing_credentials();
+	let working_dir = assert_fs::TempDir::new().unwrap();
+	let config_dir = assert_fs::TempDir::new().unwrap();
+	cli_without_stored_credentials(working_dir.path(), config_dir.path())
+		.env("FILEN_CLI_EMAIL", &email)
+		.env("FILEN_CLI_PASSWORD", &password)
+		.args(["-v", "stat", "/"])
+		.assert()
+		.success()
+		.stderr(predicates::str::contains(
+			"Authenticated from CLI arguments",
+		));
+}
+
+#[shared_test_runtime]
+async fn the_arguments_win_over_an_auth_config_in_the_config_dir() {
+	let client = test_utils::RESOURCES.client().await;
+	let (email, password) = get_testing_credentials();
+	let working_dir = assert_fs::TempDir::new().unwrap();
+	let config_dir = assert_fs::TempDir::new().unwrap();
+	let auth_config = config_dir.path().join("filen-cli-auth-config.txt");
+	std::fs::write(
+		&auth_config,
+		filen_cli::serialize_auth_config(&client).unwrap(),
+	)
+	.unwrap();
+	#[cfg(unix)]
+	std::fs::set_permissions(&auth_config, std::fs::Permissions::from_mode(0o600)).unwrap();
+	cli_without_stored_credentials(working_dir.path(), config_dir.path())
+		// so that the auth config in the config dir would be used without the arguments
+		.env_remove("FILEN_CLI_TESTING_DISABLE_AUTODETECTED_AUTH_CONFIG")
+		.args([
+			"--email",
+			&email,
+			"--password",
+			&password,
+			"-v",
+			"stat",
+			"/",
+		])
+		.assert()
+		.success()
+		.stderr(predicates::str::contains(
+			"Authenticated from CLI arguments",
+		))
+		.stderr(predicates::str::contains("Authenticated from auth config file").not());
+}
+
+/// An auth config file in `config_dir`, with contents that are never read.
+fn auth_config_in(config_dir: &std::path::Path) -> std::path::PathBuf {
+	let auth_config = config_dir.join("filen-cli-auth-config.txt");
+	std::fs::write(&auth_config, "filen_cli_auth_config_1:").unwrap();
+	auth_config
+}
+
+#[test]
+fn logout_without_a_terminal_fails_asking_for_yes() {
+	let working_dir = assert_fs::TempDir::new().unwrap();
+	let config_dir = assert_fs::TempDir::new().unwrap();
+	let auth_config = auth_config_in(config_dir.path());
+	cli_without_stored_credentials(working_dir.path(), config_dir.path())
+		.arg("logout")
+		.assert()
+		.code(2)
+		.stderr(predicates::str::contains(format!(
+			"Cannot ask \"Delete auth config file at {}?\": stdin is not a terminal. \
+			 Pass --yes to answer yes.",
+			auth_config.display()
+		)));
+	assert!(auth_config.exists());
+}
+
+#[test]
+fn logout_with_yes_deletes_the_auth_config_in_the_config_dir() {
+	let working_dir = assert_fs::TempDir::new().unwrap();
+	let config_dir = assert_fs::TempDir::new().unwrap();
+	let auth_config = auth_config_in(config_dir.path());
+	cli_without_stored_credentials(working_dir.path(), config_dir.path())
+		.args(["logout", "--yes"])
+		.assert()
+		.success()
+		.stdout(predicates::str::contains(format!(
+			"Deleted auth config file at {}",
+			auth_config.display()
+		)));
+	assert!(!auth_config.exists());
+}
+
+#[test]
+fn a_corrupt_auth_config_given_with_the_flag_fails_saying_to_export_a_new_one() {
+	let working_dir = assert_fs::TempDir::new().unwrap();
+	let config_dir = assert_fs::TempDir::new().unwrap();
+	let auth_config = config_dir.path().join("corrupt-auth-config.txt");
+	std::fs::write(&auth_config, "not an auth config").unwrap();
+	#[cfg(unix)]
+	std::fs::set_permissions(&auth_config, std::fs::Permissions::from_mode(0o600)).unwrap();
+	cli_without_stored_credentials(working_dir.path(), config_dir.path())
+		.args([
+			"--auth-config-path",
+			auth_config.to_str().unwrap(),
+			"stat",
+			"/",
+		])
+		.assert()
+		.code(1)
+		.stdout("")
+		.stderr(predicates::str::contains(format!(
+			"The auth config file {} cannot be used (",
+			auth_config.display()
+		)))
+		.stderr(predicates::str::contains(
+			"export a new one with `filen export-auth-config`",
+		))
+		// the prompt, which a given auth config never falls back to
+		.stderr(predicates::str::contains("Not logged in").not());
+}
+
+// Saving a login in the keyring, splitting it into chunks and deleting the stale chunks of a
+// longer login are unit-tested against an in-memory store in `util.rs`, since these tests must
+// not touch the keyring of whoever runs them.
