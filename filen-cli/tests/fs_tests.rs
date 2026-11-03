@@ -631,3 +631,29 @@ fn trash_delete_of_a_named_item_without_yes_asks_for_it_before_logging_in() {
 		 answer yes.\n"
 	);
 }
+
+/// What the CLI printed on stdout, parsed as JSON.
+fn printed_json(assert: &assert_cmd::assert::Assert) -> serde_json::Value {
+	serde_json::from_slice(&assert.get_output().stdout).unwrap()
+}
+
+#[shared_test_runtime]
+async fn ls_a_file_prints_that_file() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = format!("/{}", resources.dir.name().unwrap());
+	let file = upload(client, &resources.dir, "a.txt", b"content").await;
+
+	authenticated_cli_with_args!("ls", &format!("{test_dir}/a.txt"))
+		.success()
+		.stdout("a.txt\n");
+
+	let assert =
+		authenticated_cli_with_args!("ls", &format!("{test_dir}/a.txt"), "--json").success();
+	let listing = printed_json(&assert);
+	assert_eq!(listing.as_array().unwrap().len(), 1, "{listing}");
+	assert_eq!(listing[0]["name"], "a.txt");
+	assert_eq!(listing[0]["type"], "file");
+	assert_eq!(listing[0]["size"], 7);
+	assert_eq!(listing[0]["uuid"], file.uuid().to_string());
+}

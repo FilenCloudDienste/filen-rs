@@ -50,7 +50,8 @@ async fn completes_commands_and_remote_paths() {
 
 	// differentiate between files and directories
 	test_completer("cat some", &["cat some_file.txt", "cat some_dir"]); // directories should also be suggested for cat, because they might contain files that the user wants to cat
-	test_completer("ls some", &["ls some_dir"]); // ls only accepts directories
+	test_completer("ls some", &["ls some_dir", "ls some_file.txt"]); // ls also shows a single file
+	test_completer("cd some", &["cd some_dir"]); // cd only accepts directories
 
 	// completion in subdirectories
 	test_completer("cat dir1/f", &["cat dir1/file_in_dir1.txt"]);
@@ -95,6 +96,7 @@ async fn completes_commands_and_remote_paths() {
 			"ls ./dir1",
 			"ls ./dir2",
 			"ls ./some_dir",
+			"ls ./some_file.txt",
 			"ls \"./a dir with spaces\"",
 		],
 	);

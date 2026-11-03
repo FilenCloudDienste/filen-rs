@@ -53,8 +53,8 @@ pub(crate) enum FsCommands {
 	},
 	/// List files in a directory
 	Ls {
-		/// Directory to list files in (default: the current working directory)
-		#[arg(add = FilenCompleter::directory())]
+		/// Directory to list files in, or a file to show (default: the current working directory)
+		#[arg(add = FilenCompleter::file_or_directory())]
 		directory: Option<String>,
 		/// Use a long listing format: sizes, modification dates (creation dates of directories)
 		/// and (*) after favorited items
@@ -300,14 +300,18 @@ pub(crate) async fn list_directory(
 		.context("Failed to find parent directory")?
 	else {
 		return Err(UI::failure(&format!(
-			"No such directory: {}",
+			"No such file or directory: {}",
 			directory_str
 		)));
 	};
 	let directory: DirType<'_, Normal> = match directory {
 		NonRootFileType::Dir(dir) => DirType::Dir(dir),
 		NonRootFileType::Root(root) => DirType::Root(root),
-		_ => return Err(UI::failure(&format!("Not a directory: {}", directory_str))),
+		NonRootFileType::File(file) => {
+			// like `ls` on a local file: that one file, the way a listing shows it
+			let item = ListedItem::of_file(&file);
+			return print_listing(ui, &[item], ListedBy::Name, "", long);
+		}
 	};
 	list_directory_by_dir(ui, client, &directory, None, long).await
 }
