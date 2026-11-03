@@ -483,8 +483,8 @@ mod tests {
 	use filen_sdk_rs::sync_engine::{DeleteGuard, PairOverlap, PairRecord, SyncMode};
 
 	use super::{
-		fallback_label, overlap_message, parse_sync_pair_definition, parse_sync_pairs,
-		read_sync_pairs_file, records_of,
+		fallback_label, overlap_message, parse_sync_mode_str, parse_sync_pair_definition,
+		parse_sync_pairs, read_sync_pairs_file, records_of, sync_mode_str,
 	};
 	use crate::{
 		error::{CliError, exit_code, find_cli_error},
@@ -750,6 +750,128 @@ mod tests {
 			error.to_string(),
 			format!(
 				"The sync pairs file {} defines no sync pairs",
+				path.display()
+			)
+		);
+	}
+
+	#[test]
+	fn a_pair_without_a_mode_syncs_two_way() {
+		assert_eq!(
+			parse_sync_pair_definition("/home/me/docs:/docs").unwrap(),
+			(
+				PathBuf::from("/home/me/docs"),
+				SyncMode::TwoWay,
+				"/docs".to_owned()
+			)
+		);
+	}
+
+	/// The SDK's names of the modes, and the TypeScript CLI's "cloud" names.
+	#[test]
+	fn every_mode_name_names_its_mode() {
+		let modes = [
+			"twoWay",
+			"localToRemote",
+			"localToCloud",
+			"remoteToLocal",
+			"cloudToLocal",
+			"localBackup",
+			"remoteBackup",
+			"cloudBackup",
+		]
+		.map(|name| {
+			parse_sync_pair_definition(&format!("/l:{name}:/r"))
+				.unwrap()
+				.1
+		});
+
+		assert_eq!(
+			modes,
+			[
+				SyncMode::TwoWay,
+				SyncMode::LocalToRemote,
+				SyncMode::LocalToRemote,
+				SyncMode::RemoteToLocal,
+				SyncMode::RemoteToLocal,
+				SyncMode::LocalBackup,
+				SyncMode::RemoteBackup,
+				SyncMode::RemoteBackup,
+			]
+		);
+	}
+
+	/// The name a pair is labelled with names its mode again.
+	#[test]
+	fn the_name_of_each_mode_parses_back_to_it() {
+		let modes = [
+			SyncMode::TwoWay,
+			SyncMode::LocalToRemote,
+			SyncMode::RemoteToLocal,
+			SyncMode::LocalBackup,
+			SyncMode::RemoteBackup,
+		];
+
+		assert_eq!(
+			modes.map(|mode| parse_sync_mode_str(sync_mode_str(mode))),
+			modes.map(Some)
+		);
+	}
+
+	#[test]
+	fn mode_names_are_case_sensitive() {
+		assert_eq!(parse_sync_mode_str("TwoWay"), None);
+		assert_eq!(parse_sync_mode_str("TW"), None);
+		assert_eq!(parse_sync_mode_str(""), None);
+	}
+
+	/// A relative local path in a sync pairs file is relative to the file's directory, and a pair
+	/// without a mode syncs two-way.
+	#[test]
+	fn a_sync_pairs_file_resolves_relative_local_paths_against_its_directory() {
+		let (dir, path) = sync_pairs_file(
+			"pairs.yaml",
+			"syncPairs:\n\
+			 \x20 - local: docs\n\
+			 \x20   remote: /docs\n\
+			 \x20 - local: ../photos\n\
+			 \x20   remote: photos\n\
+			 \x20   mode: lb\n",
+		);
+
+		assert_eq!(
+			read_sync_pairs_file(&path).unwrap(),
+			[
+				(
+					dir.path().join("docs"),
+					SyncMode::TwoWay,
+					"/docs".to_owned()
+				),
+				(
+					dir.path().join("../photos"),
+					SyncMode::LocalBackup,
+					"photos".to_owned()
+				),
+			]
+		);
+	}
+
+	#[test]
+	fn a_sync_pairs_file_with_an_unknown_mode_is_a_failure() {
+		let (_dir, path) = sync_pairs_file(
+			"pairs.yaml",
+			"syncPairs:\n  - local: /l\n    remote: /r\n    mode: both\n",
+		);
+
+		let error = read_sync_pairs_file(&path).unwrap_err();
+
+		assert_eq!(exit_code(&error), 1);
+		assert_eq!(
+			error.to_string(),
+			format!(
+				"Invalid sync mode \"both\" in {}: expected one of twoWay, tw, localToRemote, \
+				 localToCloud, ltc, remoteToLocal, cloudToLocal, ctl, localBackup, lb, \
+				 remoteBackup, cloudBackup, cb",
 				path.display()
 			)
 		);

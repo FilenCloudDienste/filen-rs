@@ -119,6 +119,43 @@ async fn sync_with_a_pair_that_cannot_be_set_up_registers_none() {
 	assert_eq!(engine.list_pairs().await.unwrap(), []);
 }
 
+/// A paused pair is not synced, which `sync` says; with no other pair to watch, it fails rather
+/// than waiting for Ctrl-C with nothing to sync.
+#[shared_test_runtime]
+async fn sync_with_only_a_paused_pair_says_so_and_exits_1() {
+	// Not `get_resources_with_lock`, for the reason the first test gives.
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let test_dir_name = resources.dir.name().unwrap();
+	let local = assert_fs::TempDir::new().unwrap();
+	let config_dir = assert_fs::TempDir::new().unwrap();
+	let pair = format!("{}:{test_dir_name}", local.path().to_str().unwrap());
+	assert_success(&sync_once(config_dir.path(), &pair, &[]).await);
+	let engine = SyncEngine::open(
+		Arc::clone(&resources.client),
+		config_dir.path().join("sync-engine.db"),
+	)
+	.await
+	.unwrap();
+	let pairs = engine.list_pairs().await.unwrap();
+	let [registered] = pairs.as_slice() else {
+		panic!("expected the one pair the CLI registered, got {pairs:?}");
+	};
+	engine.pause_pair(registered.id).await.unwrap();
+	// releases the database's lock for the CLI
+	drop(engine);
+
+	let output = sync(config_dir.path(), &["--pair", &pair]).await;
+
+	assert_eq!(output.status.code(), Some(1), "{}", describe(&output));
+	let stderr = String::from_utf8_lossy(&output.stderr);
+	assert!(
+		stderr.contains("is paused, so it is not synced")
+			&& stderr.contains("None of the sync pairs could be synced"),
+		"{}",
+		describe(&output)
+	);
+}
+
 /// A pair whose first `sync --once` agreed on `fight.txt`, which has since been changed on both
 /// sides, with the local root and the config dir that holds its database.
 async fn diverged_pair(
@@ -146,6 +183,11 @@ async fn diverged_pair(
 
 /// Runs `sync --once --pair <pair> <args>` with `config_dir`.
 async fn sync_once(config_dir: &Path, pair: &str, args: &[&str]) -> Output {
+	sync(config_dir, &[&["--once", "--pair", pair], args].concat()).await
+}
+
+/// Runs `sync <args>` with `config_dir`.
+async fn sync(config_dir: &Path, args: &[&str]) -> Output {
 	let (_auth_config_dir, auth_config) = test_utils::cli::prepare_cli_auth_config().await;
 	Command::new(env!("CARGO_BIN_EXE_filen-cli"))
 		.args([
@@ -155,9 +197,6 @@ async fn sync_once(config_dir: &Path, pair: &str, args: &[&str]) -> Output {
 			config_dir.to_str().unwrap(),
 			"--skip-update",
 			"sync",
-			"--once",
-			"--pair",
-			pair,
 		])
 		.args(args)
 		.output()
