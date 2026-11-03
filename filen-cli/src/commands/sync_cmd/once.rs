@@ -1,6 +1,7 @@
 //! `sync --once`: one pass for each pair, then exit.
 
 use std::{
+	collections::HashSet,
 	future, pin,
 	sync::atomic::{AtomicBool, Ordering},
 };
@@ -10,8 +11,9 @@ use filen_sdk_rs::sync_engine::{PairId, PairRecord, SyncEngine, SyncEvent, SyncR
 use tokio::sync::mpsc;
 
 use super::{
-	EventLog, Settle, approved_deletions_line, paused_message, resolve_failure_message,
-	resolved_conflict_lines,
+	EventLog, Settle, approved_deletions_line,
+	outcome::{failed_pass_problems, pass_problems, problems_summary},
+	paused_message, resolve_failure_message, resolved_conflict_lines,
 };
 use crate::{error::CliError, interrupt, ui::UI};
 
@@ -56,9 +58,9 @@ pub(super) async fn sync_once(
 	drop(messages_tx);
 	let mut passes = pin::pin!(passes);
 	let mut _stopping = None;
-	loop {
+	let reports = loop {
 		tokio::select! {
-			_ = &mut passes => break,
+			reports = &mut passes => break reports,
 			Some((pair, message)) = messages_rx.recv() => print(ui, &mut log, pair, message),
 			() = async {
 				match ctrl_c.as_mut() {
@@ -73,7 +75,7 @@ pub(super) async fn sync_once(
 				_stopping = ctrl_c.take().map(|ctrl_c| ctrl_c.into_stopping(ui));
 			}
 		}
-	}
+	};
 	// what the passes sent after the last message the loop printed
 	while let Some((pair, message)) = messages_rx.recv().await {
 		print(ui, &mut log, pair, message);
@@ -81,7 +83,21 @@ pub(super) async fn sync_once(
 	if stopping.load(Ordering::Relaxed) {
 		return Err(CliError::Interrupted.into());
 	}
-	Ok(())
+	let outcomes = pairs
+		.iter()
+		.zip(reports)
+		.map(|(pair, report)| {
+			let problems = match report {
+				Some(report) => pass_problems(&report, &HashSet::new()),
+				None => failed_pass_problems(),
+			};
+			(log.label(pair.id), problems)
+		})
+		.collect::<Vec<_>>();
+	match problems_summary(&outcomes) {
+		Some(summary) => Err(UI::failure(&summary)),
+		None => Ok(()),
+	}
 }
 
 fn print(ui: &mut UI, log: &mut EventLog<'_>, pair: PairId, message: Message) {

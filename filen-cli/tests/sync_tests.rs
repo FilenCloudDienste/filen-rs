@@ -47,6 +47,70 @@ async fn sync_once_brings_both_sides_across_and_exits_0() {
 	);
 }
 
+#[shared_test_runtime]
+async fn sync_once_with_a_conflict_left_open_exits_1() {
+	// Not `get_resources_with_lock`, for the reason the test above gives.
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let (local, config_dir, pair) = diverged_pair(&resources).await;
+
+	let output = sync_once(config_dir.path(), &pair, &[]).await;
+
+	assert_eq!(output.status.code(), Some(1), "{}", describe(&output));
+	let stderr = String::from_utf8_lossy(&output.stderr);
+	assert!(
+		stderr.contains("Sync finished with problems in") && stderr.contains("(1 conflict(s))"),
+		"{}",
+		describe(&output)
+	);
+	// a conflict is left alone
+	assert_eq!(
+		std::fs::read_to_string(local.path().join("fight.txt")).unwrap(),
+		"the local edit"
+	);
+}
+
+/// The resolution a flag gives is applied by one more pass before the command exits.
+#[shared_test_runtime]
+async fn sync_once_applies_a_conflict_resolution_before_it_exits() {
+	// Not `get_resources_with_lock`, for the reason the first test gives.
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let test_dir_name = resources.dir.name().unwrap();
+	let (_local, config_dir, pair) = diverged_pair(&resources).await;
+
+	let output = sync_once(config_dir.path(), &pair, &["--keep-local", "fight.txt"]).await;
+
+	assert_success(&output);
+	assert_eq!(
+		remote_content(&resources.client, &format!("{test_dir_name}/fight.txt")).await,
+		b"the local edit"
+	);
+}
+
+/// A pair whose first `sync --once` agreed on `fight.txt`, which has since been changed on both
+/// sides, with the local root and the config dir that holds its database.
+async fn diverged_pair(
+	resources: &test_utils::TestResources,
+) -> (assert_fs::TempDir, assert_fs::TempDir, String) {
+	let client = &resources.client;
+	let test_dir_name = resources.dir.name().unwrap();
+	let local = assert_fs::TempDir::new().unwrap();
+	let config_dir = assert_fs::TempDir::new().unwrap();
+	let pair = format!("{}:{test_dir_name}", local.path().to_str().unwrap());
+
+	std::fs::write(local.path().join("fight.txt"), "the agreed content").unwrap();
+	assert_success(&sync_once(config_dir.path(), &pair, &[]).await);
+
+	std::fs::write(local.path().join("fight.txt"), "the local edit").unwrap();
+	let file = client
+		.make_file_builder("fight.txt", resources.dir.uuid)
+		.unwrap();
+	client
+		.upload_file(file, b"the remote edit, which is longer")
+		.await
+		.unwrap();
+	(local, config_dir, pair)
+}
+
 /// Runs `sync --once --pair <pair> <args>` with `config_dir`.
 async fn sync_once(config_dir: &Path, pair: &str, args: &[&str]) -> Output {
 	let (_auth_config_dir, auth_config) = test_utils::cli::prepare_cli_auth_config().await;

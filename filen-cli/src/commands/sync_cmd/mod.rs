@@ -10,6 +10,14 @@
 //! `--keep-both` settle them in the first pass; with `--once`, one more pass then applies what was
 //! settled before the command exits.
 //!
+//! `sync --once` exits with 0 when the last pass of every sync pair completed and left nothing
+//! undone: no errors, no held deletions, no conflicts and no paused sync pair. Otherwise it exits
+//! with 1, after naming each sync pair and what it left. `sync` without `--once` exits with 0 when
+//! Ctrl+C stops it and the last pass of every sync pair left nothing undone, and with 1 when a sync
+//! pair could not be synced or its last pass left something. Ctrl+C exits `sync --once` with 130,
+//! and a second Ctrl+C, which quits without waiting for the passes in flight, exits either with
+//! 130. An invalid command line exits with 2.
+//!
 //! Sync pairs stay registered in the sync database under the config directory after the run that
 //! set them up. Only one `filen sync` can use that database at a time.
 
@@ -44,9 +52,11 @@ use crate::{
 
 mod conflict_resolutions;
 mod once;
+mod outcome;
 mod sync_pairs;
 
 use conflict_resolutions::ConflictResolutions;
+use outcome::{LastPasses, problems_summary};
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum SyncCommands {
@@ -224,12 +234,14 @@ async fn sync_continuously(
 		(pair_id, watch)
 	});
 	let watches = futures::future::join_all(watches).await;
+	// the senders are the watches' now, so the channel closes once every watch has ended
+	drop(events_tx);
 	// each pair that is not synced, named on its own line now and counted in the exit status
-	let mut not_started = Vec::new();
+	let mut not_started = HashMap::new();
 	// the engine refuses to watch a paused pair, which is no failure of the watch
 	for pair in pairs.iter().filter(|pair| pair.paused) {
 		ui.print_failure(&paused_message(log.label(pair.id)));
-		not_started.push(log.label(pair.id));
+		not_started.insert(pair.id, "paused");
 	}
 	let mut watch_handles = Vec::new();
 	for (pair_id, watch) in watches {
@@ -238,7 +250,7 @@ async fn sync_continuously(
 			Err(e) => {
 				let label = log.label(pair_id);
 				ui.print_failure(&format!("Failed to watch the sync pair {label}: {e}"));
-				not_started.push(label);
+				not_started.insert(pair_id, "not synced");
 			}
 		}
 	}
@@ -247,6 +259,7 @@ async fn sync_continuously(
 	}
 
 	// receive events and print them, until Ctrl-C
+	let mut last_passes = LastPasses::default();
 	let stopped_by_ctrl_c = loop {
 		let (pair_id, event) = tokio::select! {
 			event = events_rx.recv() => match event {
@@ -255,6 +268,7 @@ async fn sync_continuously(
 			},
 			() = ctrl_c.pressed() => break true,
 		};
+		last_passes.note(pair_id, &event);
 		match log.print(pair_id, &event) {
 			None => {}
 			Some(Settlement::ApproveDeletions { count, pass_token }) => {
@@ -266,6 +280,7 @@ async fn sync_continuously(
 				resolution,
 			}) => match engine.resolve_conflict(pair_id, rel_path, resolution).await {
 				Ok(resolved) => {
+					last_passes.resolved(pair_id, rel_path);
 					for line in resolved_conflict_lines(rel_path, resolution, resolved) {
 						log.print_approved(pair_id, &line);
 					}
@@ -281,18 +296,34 @@ async fn sync_continuously(
 		ui.print_muted_to_stderr("Stopping the sync, letting the passes in flight finish...");
 		ctrl_c.into_stopping(ui)
 	});
+	last_passes.stopping();
 	// waits for each pair's pass in flight, so it finishes and releases the drive lock
 	futures::future::join_all(watch_handles.into_iter().map(|watch| watch.stop())).await;
-	if stopped_by_ctrl_c {
-		ui.print_muted("Stopped.");
+	// what the passes in flight did since, which decides what they left; the flags settle nothing
+	// more, as the sync has stopped
+	while let Ok((pair_id, event)) = events_rx.try_recv() {
+		last_passes.note(pair_id, &event);
+		let _ = log.print(pair_id, &event);
 	}
-	if !not_started.is_empty() {
-		return Err(UI::failure(&format!(
-			"Not every sync pair was synced: {}",
-			not_started.join(", ")
-		)));
+
+	if !stopped_by_ctrl_c {
+		return Err(UI::failure("Every watch of the sync pairs ended"));
 	}
-	Ok(())
+	ui.print_muted("Stopped.");
+	let outcomes = pairs
+		.iter()
+		.map(|pair| {
+			let problems = match not_started.get(&pair.id) {
+				Some(problem) => vec![(*problem).to_owned()],
+				None => last_passes.take(pair.id),
+			};
+			(log.label(pair.id), problems)
+		})
+		.collect::<Vec<_>>();
+	match problems_summary(&outcomes) {
+		Some(summary) => Err(UI::failure(&summary)),
+		None => Ok(()),
+	}
 }
 
 /// Prints the events of a run's pairs, and says which of them the flags settle.
