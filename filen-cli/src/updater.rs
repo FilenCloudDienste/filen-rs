@@ -13,7 +13,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::{
 	fmt,
 	io::{self, Write},
-	path::Path,
+	path::{Path, PathBuf},
 };
 
 use anyhow::{Context, Result};
@@ -284,16 +284,39 @@ async fn handle_latest_release(
 			}
 		}
 	}
-	let asset = latest_release
-		.assets
-		.iter()
-		.find(|asset| asset.name.contains(BUILD_TARGET))
-		.ok_or_else(|| {
-			anyhow::anyhow!(
-				"No suitable release asset found for target: {}",
-				BUILD_TARGET
-			)
-		})?;
+	let installed = install_release(version, latest_release, latest_tag).await?;
+	match installed {
+		InstalledRelease::Renamed(path) => {
+			ui.print_muted_to_stderr(&format!("Downloaded update to {}", path.display()));
+		}
+		InstalledRelease::Replaced => ui.print_muted_to_stderr(
+			"Update installed successfully. It will take effect the next time you run the application.",
+		),
+	}
+	Ok(())
+}
+
+/// Where a release was installed.
+#[derive(Debug)]
+enum InstalledRelease {
+	/// At this path, which is the running binary's with the release's version in place of the
+	/// running one; the running binary was deleted.
+	Renamed(PathBuf),
+	/// Over the running binary.
+	Replaced,
+}
+
+/// Downloads the asset of `release` built for this target, checks it against what the release
+/// lists, and installs it in place of the running binary: under a new name when the running
+/// binary's name carries `running_version`, the release's `release_version` (without the leading
+/// `v`) in its place, or else over the running binary. Whether the release is newer is the
+/// caller's business.
+async fn install_release(
+	running_version: &str,
+	release: &GitHubRelease,
+	release_version: &str,
+) -> Result<InstalledRelease> {
+	let asset = select_asset(&release.assets, BUILD_TARGET)?;
 	let current_executable = std::env::current_exe().context("Failed to get current executable")?;
 	let current_executable_name = current_executable
 		.file_name()
@@ -309,9 +332,9 @@ async fn handle_latest_release(
 		.to_path_buf();
 	let content = download_file(&asset.browser_download_url).await?;
 	verify_download(asset, &content)?;
-	if current_executable_name.contains(version) {
-		let update_path =
-			current_executable.with_file_name(current_executable_name.replace(version, latest_tag));
+	if current_executable_name.contains(running_version) {
+		let update_path = current_executable
+			.with_file_name(current_executable_name.replace(running_version, release_version));
 		// writing, syncing and renaming a multi-MB binary blocks, so keep it off the
 		// runtime's workers
 		let update_path = tokio::task::spawn_blocking(move || {
@@ -321,7 +344,7 @@ async fn handle_latest_release(
 			.map(|()| update_path)
 		})
 		.await??;
-		ui.print_muted_to_stderr(&format!("Downloaded update to {}", update_path.display()));
+		Ok(InstalledRelease::Renamed(update_path))
 	} else {
 		tokio::task::spawn_blocking(move || {
 			install_replacing_update(&executable_dir, &content, |staged| {
@@ -329,11 +352,19 @@ async fn handle_latest_release(
 			})
 		})
 		.await??;
-		ui.print_muted_to_stderr(
-			"Update installed successfully. It will take effect the next time you run the application.",
-		);
+		Ok(InstalledRelease::Replaced)
 	}
-	Ok(())
+}
+
+/// The asset of a release built for `target`, whose name carries it.
+fn select_asset<'a>(
+	assets: &'a [GitHubReleaseAsset],
+	target: &str,
+) -> Result<&'a GitHubReleaseAsset> {
+	assets
+		.iter()
+		.find(|asset| asset.name.contains(target))
+		.ok_or_else(|| anyhow::anyhow!("No suitable release asset found for target: {target}"))
 }
 
 // util
@@ -1382,6 +1413,41 @@ mod tests {
 		assert_eq!(announcements[0].message, "For 0.2.9");
 		assert!(announcements[0].version_range.matches(&version("0.2.9")));
 		assert!(!announcements[0].version_range.matches(&version("0.2.10")));
+	}
+
+	/// An asset named `name`, with no size or digest.
+	fn named_asset(name: &str) -> GitHubReleaseAsset {
+		GitHubReleaseAsset {
+			name: name.to_owned(),
+			browser_download_url: format!("https://example.com/{name}"),
+			digest: None,
+			size: None,
+		}
+	}
+
+	#[test]
+	fn the_asset_built_for_the_target_is_selected() {
+		let assets = [
+			named_asset("filen-cli-v0.3.0-x86_64-pc-windows-msvc.exe"),
+			named_asset("filen-cli-v0.3.0-aarch64-apple-darwin"),
+			named_asset("filen-cli-v0.3.0-x86_64-unknown-linux-gnu"),
+		];
+
+		let asset = select_asset(&assets, "aarch64-apple-darwin").unwrap();
+
+		assert_eq!(asset.name, "filen-cli-v0.3.0-aarch64-apple-darwin");
+	}
+
+	#[test]
+	fn a_release_without_an_asset_for_the_target_is_an_error() {
+		let assets = [named_asset("filen-cli-v0.3.0-x86_64-unknown-linux-gnu")];
+
+		let error = select_asset(&assets, "aarch64-apple-darwin").unwrap_err();
+
+		assert_eq!(
+			error.to_string(),
+			"No suitable release asset found for target: aarch64-apple-darwin"
+		);
 	}
 
 	/// An asset of `size` bytes with `digest`.
