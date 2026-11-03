@@ -554,6 +554,9 @@ pub async fn await_not_event<F, T>(
 
 #[cfg(feature = "cli")]
 pub mod cli {
+	#[cfg(unix)]
+	use std::os::unix::fs::PermissionsExt;
+
 	use crate::RESOURCES;
 	use assert_fs::prelude::{FileWriteStr, PathChild};
 
@@ -588,6 +591,11 @@ pub mod cli {
 		let auth_config_file = temp_dir.child("filen-cli-auth-config");
 		auth_config_file
 			.write_str(&filen_cli::serialize_auth_config(&client).unwrap())
+			.unwrap();
+		// owner-only, as the CLI exports it, so that the CLI does not warn about other users
+		// being able to read it
+		#[cfg(unix)]
+		std::fs::set_permissions(&auth_config_file, std::fs::Permissions::from_mode(0o600))
 			.unwrap();
 		(temp_dir, auth_config_file)
 	}

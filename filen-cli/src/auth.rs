@@ -10,9 +10,14 @@
 //!   - `./filen-cli-auth-config.txt` (current working directory)
 //!   - Linux/macOS: `$HOME/.filen-cli/filen-cli-auth-config.txt`
 //!   - Windows: `%appdata%\filen-cli\filen-cli-auth-config.txt`
+//!
+//!   (on Linux/macOS, an auth config in a default location must not be accessible
+//!   to other users: restrict it with `chmod 600`)
 //! - if none of these is set, you will be prompted for credentials,
 //!   with the option to save them securely in the system keychain
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::{
 	path::{Path, PathBuf},
 	sync::Arc,
@@ -151,7 +156,7 @@ pub(crate) async fn authenticate_and_get_password(
 		log::info!("Authenticated from CLI arguments");
 		Ok(client)
 	} else if let Some((client, export_path)) =
-		authenticate_from_auth_config(config, auth_config_path_arg, client_config_args)?
+		authenticate_from_auth_config(config, ui, auth_config_path_arg, client_config_args)?
 	{
 		log::info!(
 			"Authenticated from auth config file {}",
@@ -251,55 +256,128 @@ fn cli_credentials<'a>(
 /// - `{config_dir}/filen-cli-auth-config.txt`
 fn authenticate_from_auth_config(
 	config: &CliConfig,
+	ui: &mut UI,
 	path_arg: Option<&str>,
 	client_config_args: &ClientConfigArgs,
 ) -> Result<Option<(Client, PathBuf)>> {
-	let path = if let Some(path) = path_arg {
+	let (path, location) = if let Some(path) = path_arg {
 		// a path given explicitly must be used, never skipped for another account's credentials
-		PathBuf::from(path)
+		(PathBuf::from(path), AuthConfigLocation::Given)
 	} else if std::env::var("FILEN_CLI_TESTING_DISABLE_AUTODETECTED_AUTH_CONFIG")
 		== Ok("1".to_string())
 	{
 		return Ok(None);
-	} else if let Some(path) = get_auth_config_default_locations(config).into_iter().next() {
-		path
+	} else if let Some(found) = get_auth_config_default_locations(config).into_iter().next() {
+		found
 	} else {
 		return Ok(None);
 	};
+	check_auth_config_access(ui, &path, location)?;
 	let sdk_config = read_auth_config(&path)?;
-	Ok(Some((
-		deserialize_auth_config(&sdk_config, client_config_args)?,
-		path,
-	)))
+	let client = deserialize_auth_config(&sdk_config, client_config_args)?;
+	if location == AuthConfigLocation::WorkingDir {
+		// a file in whatever directory the CLI was started in is easy to overlook
+		ui.print_muted_to_stderr(&format!(
+			"Logged in as {} from the auth config file {}",
+			client.email(),
+			path.display()
+		));
+	}
+	Ok(Some((client, path)))
+}
+
+/// Where an auth config file was found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AuthConfigLocation {
+	/// Given with `--auth-config-path`
+	Given,
+	/// `./filen-cli-auth-config.txt`, in the current working directory
+	WorkingDir,
+	/// `{config_dir}/filen-cli-auth-config.txt`
+	ConfigDir,
+}
+
+/// Refuse an autodetected auth config file that users other than its owner can access, and warn
+/// about a given one: a file given explicitly is often mounted from elsewhere (a Docker secret is
+/// readable by everyone by default), where the CLI cannot be the one to decide.
+fn check_auth_config_access(ui: &mut UI, path: &Path, location: AuthConfigLocation) -> Result<()> {
+	let open_to_others =
+		is_open_to_other_users(path).map_err(|e| auth_config_read_failure(path, &e))?;
+	if !open_to_others {
+		return Ok(());
+	}
+	let problem = format!(
+		"Other users can access the auth config file {}, which holds your account's keys: \
+		 restrict it with `chmod 600 {}`",
+		path.display(),
+		path.display()
+	);
+	match location {
+		AuthConfigLocation::Given => {
+			ui.print_warning(&problem);
+			Ok(())
+		}
+		AuthConfigLocation::WorkingDir | AuthConfigLocation::ConfigDir => {
+			Err(UI::failure(&problem))
+		}
+	}
+}
+
+/// Whether the permissions of the file at `path` let users other than its owner access it.
+#[cfg(unix)]
+fn is_open_to_other_users(path: &Path) -> std::io::Result<bool> {
+	Ok(std::fs::metadata(path)?.permissions().mode() & 0o077 != 0)
+}
+
+/// Whether the permissions of the file at `path` let users other than its owner access it. Not
+/// checked outside Unix, where the file's ACL decides.
+#[cfg(not(unix))]
+fn is_open_to_other_users(_path: &Path) -> std::io::Result<bool> {
+	Ok(false)
 }
 
 /// Read the auth config file at `path`.
 fn read_auth_config(path: &Path) -> Result<String> {
-	std::fs::read_to_string(path).map_err(|e| {
-		if e.kind() == std::io::ErrorKind::NotFound {
-			UI::failure(&format!("Auth config file not found: {}", path.display()))
-		} else {
-			UI::failure(&format!(
-				"Failed to read auth config file {}: {}",
-				path.display(),
-				e
-			))
-		}
-	})
+	std::fs::read_to_string(path).map_err(|e| auth_config_read_failure(path, &e))
 }
 
-/// Get the default locations for auth config files: inside the current working directory, and the config directory.
-pub(crate) fn get_auth_config_default_locations(config: &CliConfig) -> Vec<PathBuf> {
+/// The failure for an auth config file at `path` that could not be read.
+fn auth_config_read_failure(path: &Path, e: &std::io::Error) -> anyhow::Error {
+	if e.kind() == std::io::ErrorKind::NotFound {
+		UI::failure(&format!("Auth config file not found: {}", path.display()))
+	} else {
+		UI::failure(&format!(
+			"Failed to read auth config file {}: {}",
+			path.display(),
+			e
+		))
+	}
+}
+
+/// Get the default locations for auth config files that exist: inside the current working
+/// directory, and the config directory, in the order they are used in.
+pub(crate) fn get_auth_config_default_locations(
+	config: &CliConfig,
+) -> Vec<(PathBuf, AuthConfigLocation)> {
 	let mut locations = Vec::new();
 	match std::env::current_dir() {
-		Ok(current_dir) => locations.push(current_dir.join(AUTH_CONFIG_FILENAME)),
+		Ok(current_dir) => locations.push((
+			current_dir.join(AUTH_CONFIG_FILENAME),
+			AuthConfigLocation::WorkingDir,
+		)),
 		Err(e) => log::warn!(
 			"Failed to get current working directory, so not checking there for an auth config file: {:?}",
 			e
 		),
 	}
-	locations.push(config.config_dir.join(AUTH_CONFIG_FILENAME));
-	locations.into_iter().filter(|path| path.exists()).collect()
+	locations.push((
+		config.config_dir.join(AUTH_CONFIG_FILENAME),
+		AuthConfigLocation::ConfigDir,
+	));
+	locations
+		.into_iter()
+		.filter(|(path, _)| path.exists())
+		.collect()
 }
 
 const KEYRING_SDK_CONFIG_NAME: &str = "sdk-config";
@@ -432,7 +510,7 @@ pub(crate) fn logout(config: &CliConfig, ui: &mut UI) -> Result<bool> {
 			}
 		}
 	}
-	for path in get_auth_config_default_locations(config) {
+	for (path, _) in get_auth_config_default_locations(config) {
 		if path.exists() {
 			found_any_credentials = true;
 			if ui.prompt_confirm(
@@ -457,7 +535,86 @@ pub(crate) fn logout(config: &CliConfig, ui: &mut UI) -> Result<bool> {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::error::exit_code;
+	use crate::{error::exit_code, ui::test_support::Printed};
+
+	/// An auth config file in a fresh directory, with the permissions `mode`.
+	#[cfg(unix)]
+	fn auth_config_with_mode(mode: u32) -> (assert_fs::TempDir, PathBuf) {
+		let dir = assert_fs::TempDir::new().unwrap();
+		let path = dir.path().join(AUTH_CONFIG_FILENAME);
+		std::fs::write(&path, "secret-config").unwrap();
+		std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+		(dir, path)
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn a_file_readable_by_the_group_and_others_is_open_to_other_users() {
+		let (_dir, path) = auth_config_with_mode(0o644);
+		assert!(is_open_to_other_users(&path).unwrap());
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn a_file_only_its_owner_can_access_is_not_open_to_other_users() {
+		let (_dir, path) = auth_config_with_mode(0o600);
+		assert!(!is_open_to_other_users(&path).unwrap());
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn an_autodetected_auth_config_open_to_other_users_is_refused() {
+		let (_dir, path) = auth_config_with_mode(0o644);
+		for location in [
+			AuthConfigLocation::WorkingDir,
+			AuthConfigLocation::ConfigDir,
+		] {
+			let printed = Printed::default();
+			let mut ui = printed.ui();
+			let err = check_auth_config_access(&mut ui, &path, location).unwrap_err();
+			assert_eq!(
+				format!("{err:#}"),
+				format!(
+					"Other users can access the auth config file {}, which holds your account's \
+					 keys: restrict it with `chmod 600 {}`",
+					path.display(),
+					path.display()
+				)
+			);
+			assert_eq!(exit_code(&err), 1);
+			assert_eq!(printed.lines_or_empty(), "");
+		}
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn a_given_auth_config_open_to_other_users_is_used_with_a_warning() {
+		let (_dir, path) = auth_config_with_mode(0o644);
+		let out = Printed::default();
+		let err = Printed::default();
+		let mut ui = Printed::split_ui(&out, &err);
+		check_auth_config_access(&mut ui, &path, AuthConfigLocation::Given).unwrap();
+		assert_eq!(out.lines_or_empty(), "");
+		assert_eq!(
+			console::strip_ansi_codes(&err.lines()),
+			format!(
+				"⚠ Other users can access the auth config file {}, which holds your account's \
+				 keys: restrict it with `chmod 600 {}`",
+				path.display(),
+				path.display()
+			)
+		);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn an_autodetected_auth_config_only_its_owner_can_access_is_used_silently() {
+		let (_dir, path) = auth_config_with_mode(0o600);
+		let printed = Printed::default();
+		let mut ui = printed.ui();
+		check_auth_config_access(&mut ui, &path, AuthConfigLocation::WorkingDir).unwrap();
+		assert_eq!(printed.lines_or_empty(), "");
+	}
 
 	#[test]
 	fn no_credentials_in_the_arguments_are_none() {
@@ -512,6 +669,7 @@ mod tests {
 
 		let Err(err) = authenticate_from_auth_config(
 			&config,
+			&mut Printed::default().ui(),
 			Some(missing.to_str().unwrap()),
 			&ClientConfigArgs::default(),
 		) else {
