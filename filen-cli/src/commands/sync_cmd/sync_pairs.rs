@@ -1,5 +1,7 @@
 use std::{
 	borrow::Cow,
+	collections::HashMap,
+	fmt::Display,
 	path::{Path, PathBuf},
 };
 
@@ -183,8 +185,30 @@ fn sync_mode_str(mode: SyncMode) -> &'static str {
 	}
 }
 
+/// The label of each of `pairs`, by id, for the lines the sync prints: `<local> <(mode)> <remote
+/// path>`, read from the server once, before the sync starts. A pair whose remote path cannot be
+/// read is named by its remote root's uuid instead, and a warning is logged.
+pub(crate) async fn pair_labels(client: &Client, pairs: &[PairRecord]) -> HashMap<PairId, String> {
+	futures::future::join_all(pairs.iter().map(async |pair| {
+		let label = match format_sync_pair(client, pair).await {
+			Ok(label) => label,
+			Err(e) => {
+				log::warn!(
+					"Failed to read the remote path of sync pair {}, naming it by its uuid: {e:#}",
+					pair.id
+				);
+				fallback_label(pair)
+			}
+		};
+		(pair.id, label)
+	}))
+	.await
+	.into_iter()
+	.collect()
+}
+
 /// A pair as `<local> <(mode)> <remote path>`, for messages.
-pub(crate) async fn format_sync_pair(client: &Client, pair: &PairRecord) -> Result<String> {
+async fn format_sync_pair(client: &Client, pair: &PairRecord) -> Result<String> {
 	let remote_dir = client
 		.get_dir(pair.remote_root)
 		.await
@@ -193,20 +217,28 @@ pub(crate) async fn format_sync_pair(client: &Client, pair: &PairRecord) -> Resu
 		.get_item_path(&NonRootItemType::Dir(Cow::Owned(remote_dir)))
 		.await
 		.context("Failed to get the remote path of a sync pair")?;
-	Ok(format!(
-		"{} <({})> {}",
+	// a directory's path ends with `/`
+	Ok(label(pair, remote_path.trim_end_matches('/')))
+}
+
+/// A pair as `<local> <(mode)> <remote root uuid>`, for when its remote path cannot be read.
+fn fallback_label(pair: &PairRecord) -> String {
+	label(pair, &pair.remote_root)
+}
+
+fn label(pair: &PairRecord, remote: &(impl Display + ?Sized)) -> String {
+	format!(
+		"{} <({})> {remote}",
 		pair.local_root,
-		sync_mode_str(pair.mode),
-		// a directory's path ends with `/`
-		remote_path.trim_end_matches('/')
-	))
+		sync_mode_str(pair.mode)
+	)
 }
 
 #[cfg(test)]
 mod tests {
 	use filen_sdk_rs::sync_engine::{DeleteGuard, PairRecord, SyncMode};
 
-	use super::records_of;
+	use super::{fallback_label, records_of};
 
 	fn record(id: i64) -> PairRecord {
 		PairRecord {
@@ -232,6 +264,21 @@ mod tests {
 			.collect::<Vec<_>>();
 
 		assert_eq!(ids, [4, 2]);
+	}
+
+	/// A pair whose remote path cannot be read is still named, by its remote root's uuid.
+	#[test]
+	fn a_pair_without_a_remote_path_is_named_by_its_remote_uuid() {
+		let pair = PairRecord {
+			remote_root: "00000000-0000-0000-0000-000000001234".parse().unwrap(),
+			mode: SyncMode::LocalBackup,
+			..record(7)
+		};
+
+		assert_eq!(
+			fallback_label(&pair),
+			"/local/7 <(localBackup)> 00000000-0000-0000-0000-000000001234"
+		);
 	}
 
 	#[test]

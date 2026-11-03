@@ -1,4 +1,8 @@
-use std::{collections::HashSet, sync::Arc};
+use std::{
+	borrow::Cow,
+	collections::{HashMap, HashSet},
+	sync::Arc,
+};
 
 use anyhow::{Context, Result};
 use clap::Subcommand;
@@ -6,18 +10,14 @@ use console::style;
 use filen_sdk_rs::{
 	auth::Client,
 	sync_engine::{
-		ConflictResolution, SyncEngine, SyncEvent, TransferDirection, UnsyncablePath,
+		ConflictResolution, PairId, SyncEngine, SyncEvent, TransferDirection, UnsyncablePath,
 		UnsyncableReason,
 	},
 };
 use tokio::{select, sync::mpsc};
 
 use crate::{
-	CliConfig, CommandResult,
-	commands::{CommandContext, sync_cmd::sync_pairs::format_sync_pair},
-	docs::DocElement,
-	interrupt,
-	ui::UI,
+	CliConfig, CommandResult, commands::CommandContext, docs::DocElement, interrupt, ui::UI,
 	util::RemotePath,
 };
 
@@ -140,9 +140,10 @@ pub(crate) async fn sync(
 	} else {
 		pair_definitions
 	};
-	let pair_ids = sync_pairs::register_sync_pairs(&engine, &client, working_path, pair_definitions)
-		.await
-		.context("Failed to add sync pairs")?;
+	let pair_ids =
+		sync_pairs::register_sync_pairs(&engine, &client, working_path, pair_definitions)
+			.await
+			.context("Failed to add sync pairs")?;
 
 	// only this run's pairs: the database also holds every pair earlier runs registered
 	let pairs = sync_pairs::records_of(
@@ -152,6 +153,8 @@ pub(crate) async fn sync(
 			.context("Failed to list sync pairs")?,
 		&pair_ids,
 	)?;
+	// once, before the watches start: labelling an event must not ask the server for anything
+	let labels = sync_pairs::pair_labels(&client, &pairs).await;
 	// before the watches start, so that Ctrl-C stops every watch that started rather than
 	// dropping them
 	let mut ctrl_c = interrupt::own();
@@ -160,29 +163,32 @@ pub(crate) async fn sync(
 
 	// start syncing
 	let watch_handles = futures::future::join_all(pairs.iter().map(async |pair| {
-		let pair = pair.clone();
-		let pair_friendly_name = format_sync_pair(&client, &pair).await?;
+		let pair_id = pair.id;
 		let events_tx = events_tx.clone();
 		if once {
 			engine
-				.sync_once_observed(pair.id, &mut move |event| {
-					let _ = events_tx.send((pair.id, event));
+				.sync_once_observed(pair_id, &mut move |event| {
+					let _ = events_tx.send((pair_id, event));
 				})
 				.await
-				.with_context(|| format!("Failed to watch sync pair {}", pair_friendly_name))?;
+				.with_context(|| {
+					format!("Failed to watch sync pair {}", label_of(&labels, pair_id))
+				})?;
 			// todo: print report
 			Ok::<_, anyhow::Error>(None)
 		} else {
 			let watch_handle = engine
 				.clone()
 				.watch_observed(
-					pair.id,
+					pair_id,
 					Box::new(move |event| {
-						let _ = events_tx.send((pair.id, event));
+						let _ = events_tx.send((pair_id, event));
 					}),
 				)
 				.await
-				.with_context(|| format!("Failed to watch sync pair {}", pair_friendly_name))?;
+				.with_context(|| {
+					format!("Failed to watch sync pair {}", label_of(&labels, pair_id))
+				})?;
 			Ok(Some(watch_handle))
 		}
 	}))
@@ -201,10 +207,7 @@ pub(crate) async fn sync(
 				let Some((pair_id, event)) = event else { break false };
 				// receive and print events
 
-				let pair = pairs.iter().find(|p| p.id == pair_id).with_context(|| {
-					format!("Received an event for unknown sync pair with id {pair_id}")
-				})?;
-				let pair_friendly_name = format_sync_pair(&client, pair).await?;
+				let pair_friendly_name = label_of(&labels, pair_id);
 				let mut print_event = |msg: &str| {
 					ui.print(&format!(
 						"{} {}: {}",
@@ -316,6 +319,15 @@ pub(crate) async fn sync(
 		ui.print_muted("Stopped.");
 	}
 	Ok(())
+}
+
+/// The label [`sync_pairs::pair_labels`] gave `pair`. Every pair of the run has one; should an
+/// event name another, it is named by its id rather than ending the sync.
+fn label_of(labels: &HashMap<PairId, String>, pair: PairId) -> Cow<'_, str> {
+	match labels.get(&pair) {
+		Some(label) => Cow::Borrowed(label),
+		None => Cow::Owned(format!("sync pair {pair}")),
+	}
 }
 
 /// One line for each path the pass left alone and why, so files that go unsynced, a name
