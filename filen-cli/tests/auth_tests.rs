@@ -2,7 +2,9 @@
 use std::os::unix::fs::PermissionsExt;
 
 use assert_cmd::cargo::cargo_bin_cmd;
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use filen_macros::shared_test_runtime;
+use filen_sdk_rs::auth::Client;
 use predicates::prelude::PredicateBooleanExt as _;
 use test_utils::authenticated_cli_with_args;
 
@@ -191,6 +193,73 @@ async fn logging_in_from_an_auth_config_in_the_working_dir_names_the_account_and
 			client.email(),
 			path.display()
 		)));
+}
+
+/// An auth config of `client`'s login with an API key the server does not know, as one revoked
+/// since it was exported.
+fn auth_config_with_revoked_api_key(client: &Client) -> String {
+	let mut stringified = client.to_stringified();
+	stringified.api_key = "0".repeat(64);
+	format!(
+		"filen_cli_auth_config_1:{}",
+		BASE64.encode(serde_json::to_string(&stringified).unwrap())
+	)
+}
+
+#[shared_test_runtime]
+async fn a_given_auth_config_with_a_revoked_api_key_fails_saying_to_export_a_new_one() {
+	let client = test_utils::RESOURCES.client().await;
+	let config_dir = assert_fs::TempDir::new().unwrap();
+	let path = config_dir.path().join("revoked-auth-config.txt");
+	std::fs::write(&path, auth_config_with_revoked_api_key(&client)).unwrap();
+	#[cfg(unix)]
+	std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+	cargo_bin_cmd!()
+		.env("FILEN_CLI_TESTING_DISABLE_KEYRING", "1")
+		.env_remove("FILEN_CLI_EMAIL")
+		.env_remove("FILEN_CLI_PASSWORD")
+		.env_remove("FILEN_CLI_2FA_CODE")
+		.args([
+			"--skip-update",
+			"--config-dir",
+			config_dir.path().to_str().unwrap(),
+			"--auth-config-path",
+			path.to_str().unwrap(),
+			"stat",
+			"/",
+		])
+		.assert()
+		.code(1)
+		.stdout("")
+		.stderr(predicates::str::contains(format!(
+			"The auth config file {} cannot be used (the server no longer accepts this login): \
+			 export a new one with `filen export-auth-config`",
+			path.display()
+		)));
+}
+
+#[cfg(unix)]
+#[shared_test_runtime]
+async fn an_autodetected_auth_config_with_a_revoked_api_key_falls_back_to_logging_in() {
+	let client = test_utils::RESOURCES.client().await;
+	let working_dir = assert_fs::TempDir::new().unwrap();
+	// as the CLI names it, from the working directory the OS resolved (/private/var on macOS)
+	let path = working_dir
+		.path()
+		.canonicalize()
+		.unwrap()
+		.join("filen-cli-auth-config.txt");
+	std::fs::write(&path, auth_config_with_revoked_api_key(&client)).unwrap();
+	std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+	stat_with_autodetected_auth_config(working_dir.path())
+		.code(2)
+		.stdout("")
+		.stderr(predicates::str::contains(format!(
+			"The auth config file {} cannot be used (the server no longer accepts this login)",
+			path.display()
+		)))
+		// the prompt it fell back to, which cannot be asked without a terminal
+		.stderr(predicates::str::contains("Not logged in"));
 }
 
 // notes:

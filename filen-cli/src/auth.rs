@@ -22,12 +22,14 @@ use std::os::unix::fs::PermissionsExt;
 use std::{
 	path::{Path, PathBuf},
 	sync::Arc,
+	time::Duration,
 };
 
 use anyhow::{Context, Result, anyhow};
 use filen_sdk_rs::{
 	ErrorKind,
 	auth::{Client, unauth::UnauthClient},
+	fs::HasUUID as _,
 };
 
 use crate::{
@@ -159,7 +161,7 @@ pub(crate) async fn authenticate_and_get_password(
 		log::info!("Authenticated from CLI arguments");
 		Ok(client)
 	} else if let Some((client, export_path)) =
-		authenticate_from_auth_config(config, ui, auth_config_path_arg, client_config_args)?
+		authenticate_from_auth_config(config, ui, auth_config_path_arg, client_config_args).await?
 	{
 		log::info!(
 			"Authenticated from auth config file {}",
@@ -167,7 +169,7 @@ pub(crate) async fn authenticate_and_get_password(
 		);
 		Ok(client)
 	} else {
-		match authenticate_from_keyring(config, client_config_args).await {
+		match authenticate_from_keyring(config, ui, client_config_args).await {
 			Ok(Some(client)) => {
 				log::info!("Authenticated from keyring");
 				Ok(client)
@@ -257,27 +259,74 @@ fn cli_credentials<'a>(
 /// Checks the path provided via CLI argument (if any), or default locations: (! referenced in module docs)
 /// - `./filen-cli-auth-config.txt` (current working directory)
 /// - `{config_dir}/filen-cli-auth-config.txt`
-fn authenticate_from_auth_config(
+///
+/// A given auth config that is corrupt or whose login the server no longer accepts fails, so that
+/// a script never stops at a prompt; an autodetected one is skipped with a warning, and the next
+/// one is tried.
+async fn authenticate_from_auth_config(
 	config: &CliConfig,
 	ui: &mut UI,
 	path_arg: Option<&str>,
 	client_config_args: &ClientConfigArgs,
 ) -> Result<Option<(Client, PathBuf)>> {
-	let (path, location) = if let Some(path) = path_arg {
+	let candidates = if let Some(path) = path_arg {
 		// a path given explicitly must be used, never skipped for another account's credentials
-		(PathBuf::from(path), AuthConfigLocation::Given)
+		vec![(PathBuf::from(path), AuthConfigLocation::Given)]
 	} else if std::env::var("FILEN_CLI_TESTING_DISABLE_AUTODETECTED_AUTH_CONFIG")
 		== Ok("1".to_string())
 	{
 		return Ok(None);
-	} else if let Some(found) = get_auth_config_default_locations(config).into_iter().next() {
-		found
 	} else {
-		return Ok(None);
+		get_auth_config_default_locations(config)
 	};
-	check_auth_config_access(ui, &path, location)?;
-	let sdk_config = read_auth_config(&path)?;
-	let client = deserialize_auth_config(&sdk_config, client_config_args)?;
+	authenticate_from_auth_configs(ui, candidates, client_config_args).await
+}
+
+/// [`authenticate_from_auth_config`] with the auth config files `candidates`, in the order they
+/// are tried in.
+async fn authenticate_from_auth_configs(
+	ui: &mut UI,
+	candidates: Vec<(PathBuf, AuthConfigLocation)>,
+	client_config_args: &ClientConfigArgs,
+) -> Result<Option<(Client, PathBuf)>> {
+	for (path, location) in candidates {
+		if let Some(client) =
+			authenticate_from_auth_config_file(ui, &path, location, client_config_args).await?
+		{
+			return Ok(Some((client, path)));
+		}
+	}
+	Ok(None)
+}
+
+/// [`authenticate_from_auth_config`] with the auth config file at `path`, or `None` if it was
+/// autodetected and cannot be used.
+async fn authenticate_from_auth_config_file(
+	ui: &mut UI,
+	path: &Path,
+	location: AuthConfigLocation,
+	client_config_args: &ClientConfigArgs,
+) -> Result<Option<Client>> {
+	check_auth_config_access(ui, path, location)?;
+	let sdk_config = read_auth_config(path)?;
+	let client = match restore_login(&sdk_config, client_config_args).await {
+		Ok(client) => client,
+		Err(e) => {
+			let problem = format!(
+				"The auth config file {} cannot be used ({:#}): export a new one with \
+				 `filen export-auth-config`",
+				path.display(),
+				e
+			);
+			return match location {
+				AuthConfigLocation::Given => Err(UI::failure(&problem)),
+				AuthConfigLocation::WorkingDir | AuthConfigLocation::ConfigDir => {
+					ui.print_warning(&problem);
+					Ok(None)
+				}
+			};
+		}
+	};
 	if location == AuthConfigLocation::WorkingDir {
 		// a file in whatever directory the CLI was started in is easy to overlook
 		ui.print_muted_to_stderr(&format!(
@@ -286,7 +335,7 @@ fn authenticate_from_auth_config(
 			path.display()
 		));
 	}
-	Ok(Some((client, path)))
+	Ok(Some(client))
 }
 
 /// Where an auth config file was found.
@@ -451,22 +500,110 @@ fn keyring_disabled_for_testing() -> bool {
 /// Authenticate using SDK config stored in the keyring.
 async fn authenticate_from_keyring(
 	config: &CliConfig,
+	ui: &mut UI,
 	client_config_args: &ClientConfigArgs,
 ) -> Result<Option<Client>> {
 	if keyring_disabled_for_testing() {
 		return Ok(None);
 	}
 	let location = KeyringLocation::of(config);
-	let sdk_config = LongKeyringEntry::new(&location.store(), &location.entry_name)
+	authenticate_from_keyring_entry(
+		&LongKeyringEntry::new(&location.store(), &location.entry_name),
+		ui,
+		client_config_args,
+	)
+	.await
+}
+
+/// [`authenticate_from_keyring`] with the SDK config in `entry`. Credentials that are corrupt, or
+/// whose login the server no longer accepts, are deleted with a warning, so that the user logs in
+/// again, whether or not they keep the new login.
+async fn authenticate_from_keyring_entry(
+	entry: &LongKeyringEntry<'_>,
+	ui: &mut UI,
+	client_config_args: &ClientConfigArgs,
+) -> Result<Option<Client>> {
+	let sdk_config = entry
 		.read()
 		.context("Failed to read SDK config from keyring")?;
 	let Some(sdk_config) = sdk_config else {
 		return Ok(None);
 	};
-	Ok(Some(deserialize_auth_config(
-		&sdk_config,
-		client_config_args,
-	)?))
+	match restore_login(&sdk_config, client_config_args).await {
+		Ok(client) => Ok(Some(client)),
+		Err(e) => {
+			log::warn!(
+				"The credentials saved in the keyring cannot be used: {:#}",
+				e
+			);
+			// so that the warning is not repeated on every run until a new login is kept
+			if let Err(e) = entry.delete() {
+				log::warn!(
+					"Failed to delete the credentials saved in the keyring: {:#}",
+					e
+				);
+			}
+			ui.print_warning("Saved credentials are no longer valid, please log in again");
+			Ok(None)
+		}
+	}
+}
+
+/// The client of the stored credentials `sdk_config`, once the server accepted them.
+async fn restore_login(sdk_config: &str, client_config_args: &ClientConfigArgs) -> Result<Client> {
+	let client = deserialize_auth_config(sdk_config, client_config_args)?;
+	check_login_accepted(&client).await?;
+	Ok(client)
+}
+
+/// The name looked up by [`check_login_accepted`]. Whether a directory of this name exists does not
+/// matter.
+const LOGIN_CHECK_DIR_NAME: &str = "filen-cli-login-check";
+
+/// Fails if the server rejects the API key of `client`, which was built from stored credentials
+/// without asking the server: the key may have been revoked since, by a password change or a
+/// logout elsewhere. Any other error, such as being offline, lets the login go on, so that an
+/// unreachable server never makes the user log in again.
+async fn check_login_accepted(client: &Client) -> Result<()> {
+	login_check_outcome(
+		// the cheapest authenticated request: one name hash lookup, no listing, nothing to decrypt
+		client.find_dir_uuid(client.root().uuid(), LOGIN_CHECK_DIR_NAME),
+		LOGIN_CHECK_TIMEOUT,
+	)
+	.await
+}
+
+/// How long [`check_login_accepted`] waits for the server. The SDK retries a request that cannot
+/// connect and waits minutes for a slow answer, which would hold up every command while offline.
+const LOGIN_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// [`check_login_accepted`] with the request `check`, which is given up on after `timeout` like
+/// any other error that is not a rejected API key.
+async fn login_check_outcome<T>(
+	check: impl Future<Output = std::result::Result<T, filen_sdk_rs::Error>>,
+	timeout: Duration,
+) -> Result<()> {
+	match tokio::time::timeout(timeout, check).await {
+		Ok(Ok(_)) => Ok(()),
+		Ok(Err(e)) if e.kind() == ErrorKind::Unauthenticated => {
+			Err(anyhow!("the server no longer accepts this login"))
+		}
+		Ok(Err(e)) => {
+			log::warn!(
+				"Failed to check the stored credentials with the server, using them anyway: {:?}",
+				e
+			);
+			Ok(())
+		}
+		Err(_) => {
+			log::warn!(
+				"The server did not answer the check of the stored credentials within {} s, \
+				 using them anyway",
+				timeout.as_secs()
+			);
+			Ok(())
+		}
+	}
 }
 
 /// Authenticate using credentials provided interactively.
@@ -884,8 +1021,8 @@ mod tests {
 		assert_eq!(credentials.two_factor_code, Some("123456"));
 	}
 
-	#[test]
-	fn a_missing_auth_config_path_fails_instead_of_falling_back() {
+	#[tokio::test]
+	async fn a_missing_auth_config_path_fails_instead_of_falling_back() {
 		let config_dir = assert_fs::TempDir::new().unwrap();
 		// the autodetected file, which must not be read in its place
 		std::fs::write(config_dir.path().join(AUTH_CONFIG_FILENAME), "not a config").unwrap();
@@ -899,7 +1036,9 @@ mod tests {
 			&mut Printed::default().ui(),
 			Some(missing.to_str().unwrap()),
 			&ClientConfigArgs::default(),
-		) else {
+		)
+		.await
+		else {
 			panic!("a missing auth config path must fail");
 		};
 
@@ -908,6 +1047,201 @@ mod tests {
 			format!("Auth config file not found: {}", missing.display())
 		);
 		assert_eq!(exit_code(&err), 1);
+	}
+
+	/// What the auth config files of these tests hold: no auth config at all.
+	const CORRUPT_AUTH_CONFIG: &str = "not a config";
+
+	#[tokio::test]
+	async fn a_corrupt_given_auth_config_fails_saying_to_export_a_new_one() {
+		let (_dir, config) = config_in_temp_dir();
+		let path = config.config_dir.join("given.txt");
+		std::fs::write(&path, CORRUPT_AUTH_CONFIG).unwrap();
+		#[cfg(unix)]
+		std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+		let Err(err) = authenticate_from_auth_config(
+			&config,
+			&mut Printed::default().ui(),
+			Some(path.to_str().unwrap()),
+			&ClientConfigArgs::default(),
+		)
+		.await
+		else {
+			panic!("a corrupt given auth config must fail");
+		};
+
+		assert_eq!(
+			format!("{err:#}"),
+			format!(
+				"The auth config file {} cannot be used (Invalid auth config format (missing or \
+				 invalid prefix)): export a new one with `filen export-auth-config`",
+				path.display()
+			)
+		);
+		assert_eq!(exit_code(&err), 1);
+	}
+
+	#[tokio::test]
+	async fn a_corrupt_auth_config_in_the_config_dir_is_skipped_with_a_warning() {
+		let (_dir, config) = config_in_temp_dir();
+		let path = config.config_dir.join(AUTH_CONFIG_FILENAME);
+		std::fs::write(&path, CORRUPT_AUTH_CONFIG).unwrap();
+		#[cfg(unix)]
+		std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+		let out = Printed::default();
+		let err = Printed::default();
+
+		let found = authenticate_from_auth_config(
+			&config,
+			&mut Printed::split_ui(&out, &err),
+			None,
+			&ClientConfigArgs::default(),
+		)
+		.await
+		.unwrap();
+
+		assert!(found.is_none());
+		assert_eq!(out.lines_or_empty(), "");
+		assert_eq!(
+			console::strip_ansi_codes(&err.lines()),
+			format!(
+				"⚠ The auth config file {} cannot be used (Invalid auth config format (missing or \
+				 invalid prefix)): export a new one with `filen export-auth-config`",
+				path.display()
+			)
+		);
+	}
+
+	#[tokio::test]
+	async fn an_unusable_auth_config_in_the_working_dir_falls_back_to_the_one_in_the_config_dir() {
+		let (_dir, config) = config_in_temp_dir();
+		let working_dir = assert_fs::TempDir::new().unwrap();
+		let candidates = [
+			(working_dir.path(), AuthConfigLocation::WorkingDir),
+			(config.config_dir.as_path(), AuthConfigLocation::ConfigDir),
+		]
+		.map(|(dir, location)| {
+			let path = dir.join(AUTH_CONFIG_FILENAME);
+			std::fs::write(&path, CORRUPT_AUTH_CONFIG).unwrap();
+			#[cfg(unix)]
+			std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+			(path, location)
+		});
+		let warning = |path: &Path| {
+			format!(
+				"⚠ The auth config file {} cannot be used (Invalid auth config format (missing or \
+				 invalid prefix)): export a new one with `filen export-auth-config`",
+				path.display()
+			)
+		};
+		let expected = format!(
+			"{}\n{}",
+			warning(&candidates[0].0),
+			warning(&candidates[1].0)
+		);
+		let out = Printed::default();
+		let err = Printed::default();
+
+		let found = authenticate_from_auth_configs(
+			&mut Printed::split_ui(&out, &err),
+			candidates.to_vec(),
+			&ClientConfigArgs::default(),
+		)
+		.await
+		.unwrap();
+
+		assert!(found.is_none());
+		assert_eq!(out.lines_or_empty(), "");
+		assert_eq!(console::strip_ansi_codes(&err.lines()), expected);
+	}
+
+	#[tokio::test]
+	async fn corrupt_credentials_in_the_keyring_are_deleted_with_a_warning() {
+		let store = MemoryChunkStore::default();
+		let entry = LongKeyringEntry::new(&store, "sdk-config");
+		entry.write(CORRUPT_AUTH_CONFIG).unwrap();
+		let out = Printed::default();
+		let err = Printed::default();
+
+		let found = authenticate_from_keyring_entry(
+			&entry,
+			&mut Printed::split_ui(&out, &err),
+			&ClientConfigArgs::default(),
+		)
+		.await
+		.unwrap();
+
+		assert!(found.is_none());
+		assert_eq!(entry.read().unwrap(), None);
+		assert_eq!(store.keys(), Vec::<String>::new());
+		assert_eq!(out.lines_or_empty(), "");
+		assert_eq!(
+			console::strip_ansi_codes(&err.lines()),
+			"⚠ Saved credentials are no longer valid, please log in again"
+		);
+	}
+
+	#[tokio::test]
+	async fn an_empty_keyring_has_no_credentials() {
+		let store = MemoryChunkStore::default();
+		let printed = Printed::default();
+
+		let found = authenticate_from_keyring_entry(
+			&LongKeyringEntry::new(&store, "sdk-config"),
+			&mut printed.ui(),
+			&ClientConfigArgs::default(),
+		)
+		.await
+		.unwrap();
+
+		assert!(found.is_none());
+		assert_eq!(printed.lines_or_empty(), "");
+	}
+
+	/// The error the server answers a request with an API key it no longer accepts with.
+	fn unauthenticated() -> filen_sdk_rs::Error {
+		filen_sdk_rs::Error::custom(ErrorKind::Unauthenticated, "api key not found")
+	}
+
+	#[tokio::test]
+	async fn a_login_whose_api_key_the_server_rejects_fails_the_check() {
+		let err = login_check_outcome(
+			async { Err::<(), _>(unauthenticated()) },
+			LOGIN_CHECK_TIMEOUT,
+		)
+		.await
+		.unwrap_err();
+
+		assert_eq!(
+			format!("{err:#}"),
+			"the server no longer accepts this login"
+		);
+	}
+
+	#[tokio::test]
+	async fn a_login_the_server_could_not_check_is_kept() {
+		let check = async {
+			Err::<(), _>(filen_sdk_rs::Error::custom(
+				ErrorKind::Server,
+				"connection refused",
+			))
+		};
+
+		login_check_outcome(check, LOGIN_CHECK_TIMEOUT)
+			.await
+			.unwrap();
+	}
+
+	#[tokio::test]
+	async fn a_login_the_server_does_not_answer_the_check_of_in_time_is_kept() {
+		// a request that never ends, as one retrying while offline does not for minutes
+		login_check_outcome(
+			std::future::pending::<std::result::Result<(), filen_sdk_rs::Error>>(),
+			Duration::from_millis(10),
+		)
+		.await
+		.unwrap();
 	}
 
 	#[test]
