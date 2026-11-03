@@ -179,6 +179,7 @@ async fn uploading_with_json_prints_the_result_as_json() {
 			"destination": format!("/{test_dir_name}/a.txt"),
 			"files": 1,
 			"bytes": 8,
+			"resumed_bytes": 0,
 			"skipped": 0,
 			"skipped_symlinks": [],
 			"failed": [],
@@ -970,4 +971,42 @@ async fn a_download_to_stdout_fails_once_stdout_is_closed() {
 			.ends_with("✘ Stdout was closed before the whole file was written to it\n"),
 		"{stderr}"
 	);
+}
+
+#[shared_test_runtime]
+async fn downloading_with_resume_continues_from_what_an_earlier_download_left() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir_name = resources.dir.name().unwrap();
+	let contents = (0..1024 * 1024 + 512 * 1024 + 7)
+		.map(|i: u32| u8::try_from(i % 251).unwrap())
+		.collect::<Vec<_>>();
+	let builder = client
+		.make_file_builder("resumed.bin", resources.dir.uuid())
+		.unwrap();
+	let file = client.upload_file(builder, &contents).await.unwrap();
+
+	let local = tempfile::tempdir().unwrap();
+	// What a download that did not finish keeps with --resume.
+	let partial = local.path().join(format!("{}.filendl", file.uuid()));
+	// Past the first chunk, which the download then does not download again.
+	std::fs::write(&partial, &contents[..1124 * 1024]).unwrap();
+	let target = local.path().join("resumed.bin");
+
+	let output = authenticated_cli_with_args!(
+		"download",
+		"--resume",
+		&format!("{test_dir_name}/resumed.bin"),
+		target.to_str().unwrap()
+	)
+	.success();
+
+	let stdout = String::from_utf8_lossy(&output.get_output().stdout);
+	assert!(stdout.contains("(1 MiB resumed)"), "{stdout}");
+
+	assert!(
+		std::fs::read(&target).unwrap() == contents,
+		"the resumed file differs"
+	);
+	assert!(!partial.exists(), "the partial file was left behind");
 }

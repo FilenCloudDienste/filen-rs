@@ -27,6 +27,16 @@
 //! with `-v`, and so are the files a directory download leaves as they are for already holding
 //! the same contents.
 //!
+//! With `--resume`, a download that does not finish, for an error or for Ctrl+C, keeps what it
+//! wrote of the file it was writing, beside the file's path in a temp file named after the
+//! remote file (ending in `.filendl`), and the next `download --resume` of that file continues
+//! from there instead of starting over. A file that was changed in the drive since is a new
+//! version, which starts over. A continued file is checked against the hash of its contents that
+//! the drive holds, when it holds one; when they differ, the kept part is removed and the
+//! download fails, to start over next time. The bytes a download did not have to download again
+//! count as transferred, and the result names them as resumed and leaves them out of the speed.
+//! Without `--resume`, an unfinished file is removed. Uploads cannot be resumed.
+//!
 //! With `--include` and `--exclude`, a directory transfer takes only some of the items inside the
 //! directory. Both take a gitignore-style pattern, can be given several times, and match the path
 //! of an item relative to the transferred directory, case-insensitively: `*.jpg` matches every
@@ -64,10 +74,10 @@
 //! When a single item inside a directory transfer fails, the rest of the transfer still completes,
 //! the failures are listed at the end, and the command exits with a nonzero status. With
 //! `--json`, the result is printed as one object instead: `{"destination": ..., "files": ...,
-//! "bytes": ..., "skipped": ..., "skipped_symlinks": [...], "failed": [{"path": ...,
-//! "error": ...}]}`, where `path` is `null` for a failure not about a single item. Press Ctrl+C
-//! to cancel a running transfer: what was transferred by then is reported on stderr and the
-//! command exits with status 130, where the TypeScript CLI printed "Aborted".
+//! "bytes": ..., "resumed_bytes": ..., "skipped": ..., "skipped_symlinks": [...], "failed":
+//! [{"path": ..., "error": ...}]}`, where `path` is `null` for a failure not about a single item.
+//! Press Ctrl+C to cancel a running transfer: what was transferred by then is reported on stderr
+//! and the command exits with status 130, where the TypeScript CLI printed "Aborted".
 
 use std::{
 	borrow::Cow,
@@ -90,7 +100,10 @@ use filen_sdk_rs::{
 	fs::{
 		HasName as _, HasParent as _, HasUUID as _,
 		categories::{DirType, NonRootFileType, NonRootItemType, Normal},
-		file::{FileBuilderOptionalName, traits::HasFileInfo as _},
+		file::{
+			FileBuilderOptionalName,
+			traits::{File, HasFileInfo as _},
+		},
 		name::ValidatedName,
 	},
 	io::{
@@ -164,6 +177,10 @@ pub(crate) enum TransferCommands {
 		/// Never replace a local file: skip each file whose local path is taken (listed with -v)
 		#[arg(long)]
 		no_clobber: bool,
+		/// Keep what was downloaded of a file when the download does not finish, and continue from
+		/// there when the file is downloaded again with --resume
+		#[arg(long)]
+		resume: bool,
 		#[command(flatten)]
 		filter: FilterArgs,
 	},
@@ -251,6 +268,7 @@ impl TransferCommands {
 				source,
 				paths,
 				no_clobber,
+				resume,
 				filter,
 			} => {
 				let options = DirDownloadOptions {
@@ -260,7 +278,7 @@ impl TransferCommands {
 						ExistingLocalFile::ReplaceUnlessSame
 					},
 					filter: filter.transfer_filter()?,
-					partial: PartialDownload::Discard,
+					partial: partial_download(resume),
 				};
 				let (sources, destination) = sources_and_destination(source, paths);
 				download(
@@ -287,6 +305,15 @@ fn existing_remote_policy(skip_existing: bool, update: bool) -> ExistingRemoteFi
 		ExistingRemoteFile::ReplaceIfChanged
 	} else {
 		ExistingRemoteFile::Replace
+	}
+}
+
+/// What a download does with what it wrote of a file it did not finish, from its `--resume` flag.
+fn partial_download(resume: bool) -> PartialDownload {
+	if resume {
+		PartialDownload::Resume
+	} else {
+		PartialDownload::Discard
 	}
 }
 
@@ -664,8 +691,7 @@ async fn download_to_stdout(
 		return Err(e.context("Failed to download"));
 	}
 	if !ui.is_quiet() {
-		let (files, bytes) = progress.done();
-		let summary = transfer_summary(files, bytes, 0, progress.started.elapsed());
+		let summary = transfer_summary(&progress.tally(), progress.started.elapsed());
 		ui.print_muted_to_stderr(&format!(
 			"Downloaded {} to stdout: {}",
 			source_path, summary
@@ -988,7 +1014,7 @@ async fn download_source(
 			run_cancellable(
 				ui,
 				progress,
-				download_file(client, progress, file.as_ref(), &target, options.existing),
+				download_file(client, progress, file.as_ref(), &target, options),
 			)
 			.await?
 		}
@@ -1138,16 +1164,13 @@ fn finish(
 	destination: &str,
 ) -> Result<()> {
 	let kind = progress.kind;
-	let (files, bytes) = progress.done();
-	let skipped = progress.skipped();
+	let tally = progress.tally();
 	let failures = progress.take_failures();
 	let skipped_symlinks = progress.take_skipped_symlinks();
 	if ui.json {
 		ui.print_json(result_json(
 			destination,
-			files,
-			bytes,
-			skipped,
+			&tally,
 			&failures,
 			&skipped_symlinks,
 		))?;
@@ -1164,7 +1187,7 @@ fn finish(
 				failures.len() - MAX_PRINTED_ERRORS
 			));
 		}
-		let summary = transfer_summary(files, bytes, skipped, progress.started.elapsed());
+		let summary = transfer_summary(&tally, progress.started.elapsed());
 		if failures.is_empty() {
 			ui.print_success(&format!("{} {}: {}", kind.past(), subject, summary));
 		} else if !ui.is_quiet() {
@@ -1185,17 +1208,16 @@ fn finish(
 /// The `--json` result of a transfer to `destination`.
 fn result_json(
 	destination: &str,
-	files: u64,
-	bytes: u64,
-	skipped: u64,
+	tally: &Tally,
 	failures: &[TransferFailure],
 	skipped_symlinks: &[String],
 ) -> serde_json::Value {
 	json!({
 		"destination": destination,
-		"files": files,
-		"bytes": bytes,
-		"skipped": skipped,
+		"files": tally.files,
+		"bytes": tally.bytes,
+		"resumed_bytes": tally.resumed_bytes,
+		"skipped": tally.skipped,
 		"skipped_symlinks": skipped_symlinks,
 		"failed": failures
 			.iter()
@@ -1295,16 +1317,16 @@ async fn upload_directory(
 		.context("Failed to upload directory")
 }
 
-/// Download `source` to `target`, unless `existing` keeps a local file already there.
+/// Download `source` to `target`, unless `options` keep a local file already there.
 async fn download_file(
 	client: &Client,
 	progress: &TransferProgress,
-	source: &RemoteFile,
+	source: &dyn File,
 	target: &Path,
-	existing: ExistingLocalFile,
+	options: &DirDownloadOptions,
 ) -> Result<()> {
 	progress.start_single_item(source.size());
-	match existing {
+	match options.existing {
 		// Whatever is at the path, even a dangling symlink, is kept.
 		ExistingLocalFile::Keep if std::fs::symlink_metadata(target).is_ok() => {
 			progress.skip([target.display().to_string()], source.size());
@@ -1312,10 +1334,25 @@ async fn download_file(
 		}
 		ExistingLocalFile::Keep | ExistingLocalFile::ReplaceUnlessSame => {}
 	}
-	client
-		.download_file_to_path_unless_same_hash(source, target, Some(progress.byte_callback()))
-		.await
-		.context("Failed to download file")?;
+	let callback = Some(progress.byte_callback());
+	match options.partial {
+		PartialDownload::Discard => {
+			client
+				.download_file_to_path_unless_same_hash(source, target, callback)
+				.await
+		}
+		PartialDownload::Resume => {
+			client
+				.download_file_to_path_resuming(
+					source,
+					target,
+					callback,
+					Some(progress.resumed_callback()),
+				)
+				.await
+		}
+	}
+	.context("Failed to download file")?;
 	progress.complete_single_item();
 	Ok(())
 }
@@ -1422,6 +1459,9 @@ struct ProgressState {
 	total_bytes: u64,
 	done_files: u64,
 	done_bytes: u64,
+	/// The bytes of `done_bytes` that earlier downloads had left, which resumed downloads continue
+	/// from.
+	resumed_bytes: u64,
 	/// The files left out for what was already at their target, which are not in the totals.
 	skipped_files: u64,
 	/// The counters as the item being transferred found them, which its own counts add to: a
@@ -1495,6 +1535,16 @@ impl ProgressState {
 			self.sample_speed(now);
 		}
 		noted
+	}
+
+	/// Count `bytes` an earlier download had left as done. They were not moved now, so the speed
+	/// samples are raised by them too, which keeps them out of the speed.
+	fn resume(&mut self, bytes: u64) {
+		self.done_bytes = self.done_bytes.saturating_add(bytes);
+		self.resumed_bytes = self.resumed_bytes.saturating_add(bytes);
+		for (_, done_then) in &mut self.speed_samples {
+			*done_then = done_then.saturating_add(bytes);
+		}
 	}
 
 	/// The current speed in bytes per second, or `None` while the samples span no time yet.
@@ -1616,19 +1666,38 @@ fn files_and_bytes(files: u64, bytes: u64) -> String {
 	)
 }
 
+/// What a transfer moved and left out, at its end.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Tally {
+	/// The files transferred.
+	files: u64,
+	/// Their bytes, those an earlier download had left included.
+	bytes: u64,
+	/// The bytes of `bytes` that earlier downloads had left, which resumed downloads continued
+	/// from instead of downloading them again.
+	resumed_bytes: u64,
+	/// The files left out for what was already at their target.
+	skipped: u64,
+}
+
 /// What a transfer moved and how fast, on average, and how many files it left out for what was
-/// already at their target.
-fn transfer_summary(files: u64, bytes: u64, skipped: u64, elapsed: Duration) -> String {
-	let mut summary = format!(
-		"{} in {}",
-		files_and_bytes(files, bytes),
-		format_elapsed(elapsed)
-	);
-	if let Some(speed) = bytes_per_second(bytes, elapsed) {
+/// already at their target. The speed counts only the bytes moved in `elapsed`, not those an
+/// earlier download had left.
+fn transfer_summary(tally: &Tally, elapsed: Duration) -> String {
+	let mut summary = files_and_bytes(tally.files, tally.bytes);
+	if tally.resumed_bytes > 0 {
+		summary.push_str(&format!(
+			" ({} resumed)",
+			ui::format_size(tally.resumed_bytes)
+		));
+	}
+	summary.push_str(&format!(" in {}", format_elapsed(elapsed)));
+	if let Some(speed) = bytes_per_second(tally.bytes.saturating_sub(tally.resumed_bytes), elapsed)
+	{
 		summary.push_str(&format!(" ({}/s)", ui::format_size(speed)));
 	}
-	if skipped > 0 {
-		summary.push_str(&format!(", {} skipped", skipped));
+	if tally.skipped > 0 {
+		summary.push_str(&format!(", {} skipped", tally.skipped));
 	}
 	summary
 }
@@ -1763,9 +1832,28 @@ impl TransferProgress {
 		(state.done_files, state.done_bytes)
 	}
 
-	/// The files left out so far for what was already at their target.
-	fn skipped(&self) -> u64 {
-		self.state.lock().unwrap().skipped_files
+	/// What the transfer moved and left out so far.
+	fn tally(&self) -> Tally {
+		let state = self.state.lock().unwrap();
+		Tally {
+			files: state.done_files,
+			bytes: state.done_bytes,
+			resumed_bytes: state.resumed_bytes,
+			skipped: state.skipped_files,
+		}
+	}
+
+	/// A callback for the bytes of a file an earlier download had left, which this one continues
+	/// from.
+	fn resumed_callback(&self) -> MaybeSendCallback<'_, u64> {
+		Arc::new(|bytes| self.resume(bytes))
+	}
+
+	/// Count `bytes` an earlier download had left as done, without them adding to the speed.
+	fn resume(&self, bytes: u64) {
+		let mut state = self.state.lock().unwrap();
+		state.resume(bytes);
+		self.render(&mut state, false);
 	}
 
 	/// Note the files at `paths`, `bytes` long together, as left out for what was already at their
@@ -1973,6 +2061,10 @@ impl DirDownloadCallback<Normal> for TransferProgress {
 		self.skip(skipped_files.into_iter().map(|(_, path)| path), bytes);
 	}
 
+	fn on_download_resumed(&self, resumed_bytes: u64) {
+		self.resume(resumed_bytes);
+	}
+
 	fn on_download_errors(&self, errors: Vec<(Error, String, NonRootItemType<'static, Normal>)>) {
 		self.push_failures(errors.into_iter().map(|(e, path, _)| TransferFailure {
 			path: Some(path),
@@ -1993,16 +2085,16 @@ mod tests {
 
 	use filen_sdk_rs::{
 		fs::name::ValidatedName,
-		io::{DirUploadCallback as _, ExistingRemoteFile},
+		io::{DirUploadCallback as _, ExistingRemoteFile, PartialDownload},
 	};
 
 	use super::{
-		DownloadSource, Existing, FilterArgs, ProgressState, SPEED_WINDOW, TransferFailure,
+		DownloadSource, Existing, FilterArgs, ProgressState, SPEED_WINDOW, Tally, TransferFailure,
 		TransferKind, TransferProgress, UploadTarget, canceled_message, download_target,
 		ends_the_command, ensure_stdio_is_free, existing_remote_policy, format_duration,
-		local_existing, progress_line, resolve_download_target, resolve_upload_target, result_json,
-		skipped_symlinks_line, source_failure, sources_and_destination, stdin_destination,
-		stdin_upload_target, transfer_summary,
+		local_existing, partial_download, progress_line, resolve_download_target,
+		resolve_upload_target, result_json, skipped_symlinks_line, source_failure,
+		sources_and_destination, stdin_destination, stdin_upload_target, transfer_summary,
 	};
 	use crate::{
 		error::CliError,
@@ -2153,7 +2245,14 @@ mod tests {
 	#[test]
 	fn the_summary_gives_the_average_speed() {
 		assert_eq!(
-			transfer_summary(3, 2 * MIB, 0, Duration::from_secs(4)),
+			transfer_summary(
+				&Tally {
+					files: 3,
+					bytes: 2 * MIB,
+					..Tally::default()
+				},
+				Duration::from_secs(4)
+			),
 			"3 files, 2 MiB in 4.0s (512 KiB/s)"
 		);
 	}
@@ -2161,7 +2260,14 @@ mod tests {
 	#[test]
 	fn the_summary_of_an_instant_transfer_has_no_speed() {
 		assert_eq!(
-			transfer_summary(1, 100, 0, Duration::ZERO),
+			transfer_summary(
+				&Tally {
+					files: 1,
+					bytes: 100,
+					..Tally::default()
+				},
+				Duration::ZERO
+			),
 			"1 file, 100 B in 0.0s"
 		);
 	}
@@ -2169,8 +2275,57 @@ mod tests {
 	#[test]
 	fn the_summary_counts_the_skipped_files() {
 		assert_eq!(
-			transfer_summary(1, MIB, 2, Duration::from_secs(1)),
+			transfer_summary(
+				&Tally {
+					files: 1,
+					bytes: MIB,
+					skipped: 2,
+					..Tally::default()
+				},
+				Duration::from_secs(1)
+			),
 			"1 file, 1 MiB in 1.0s (1 MiB/s), 2 skipped"
+		);
+	}
+
+	#[test]
+	fn the_summary_names_the_resumed_bytes_and_leaves_them_out_of_the_speed() {
+		assert_eq!(
+			transfer_summary(
+				&Tally {
+					files: 1,
+					bytes: 10 * MIB,
+					resumed_bytes: 8 * MIB,
+					skipped: 0,
+				},
+				Duration::from_secs(2)
+			),
+			"1 file, 10 MiB (8 MiB resumed) in 2.0s (1 MiB/s)"
+		);
+	}
+
+	#[test]
+	fn a_resumed_download_counts_its_earlier_bytes_as_done_but_not_in_the_speed() {
+		let progress = quiet_progress();
+		progress.start_single_item(10 * MIB);
+		progress.resume(8 * MIB);
+		{
+			let mut state = progress.state.lock().unwrap();
+			let (started, _) = *state.speed_samples.front().unwrap();
+			let now = started + Duration::from_secs(1);
+			state.done_bytes += MIB;
+			state.sample_speed(now);
+			assert_eq!(state.speed(now), Some(MIB));
+		}
+		progress.complete_single_item();
+		assert_eq!(
+			progress.tally(),
+			Tally {
+				files: 1,
+				bytes: 10 * MIB,
+				resumed_bytes: 8 * MIB,
+				skipped: 0,
+			}
 		);
 	}
 
@@ -2353,11 +2508,22 @@ mod tests {
 			},
 		];
 		assert_eq!(
-			result_json("/dir", 4, 1000, 2, &failures, &["/local/link".to_owned()]),
+			result_json(
+				"/dir",
+				&Tally {
+					files: 4,
+					bytes: 1000,
+					resumed_bytes: 400,
+					skipped: 2,
+				},
+				&failures,
+				&["/local/link".to_owned()]
+			),
 			json!({
 				"destination": "/dir",
 				"files": 4,
 				"bytes": 1000,
+				"resumed_bytes": 400,
 				"skipped": 2,
 				"skipped_symlinks": ["/local/link"],
 				"failed": [
@@ -2542,6 +2708,12 @@ mod tests {
 			.unwrap(),
 			upload_target("/x/y", "a.txt")
 		);
+	}
+
+	#[test]
+	fn the_resume_flag_keeps_unfinished_files() {
+		assert_eq!(partial_download(true), PartialDownload::Resume);
+		assert_eq!(partial_download(false), PartialDownload::Discard);
 	}
 
 	#[test]
