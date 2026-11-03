@@ -403,17 +403,37 @@ fn rclone_error(
 		Ok(refusal) => refusal,
 		Err(e) => return anyhow::Error::from(e).context(context),
 	};
-	let message = if about.is_empty() {
+	let mut message = if about.is_empty() {
 		refusal.to_string()
 	} else {
 		format!("{refusal} ({})", about.join("; "))
 	};
+	if refusal == RcloneRefusal::FuseMissing
+		&& let Some(install) = fuse_install_hint()
+	{
+		message = format!("{message}; {install}");
+	}
 	let err = if refusal.kind() == ErrorKind::InvalidState {
 		UI::usage_failure(&message)
 	} else {
 		UI::failure(&message)
 	};
 	err.context(context)
+}
+
+/// How to install the mount backend on this platform, for when there is none. macOS has no such
+/// hint: without macFUSE it mounts through Rclone's NFS mount, so a mount there is never refused
+/// for want of FUSE.
+fn fuse_install_hint() -> Option<&'static str> {
+	if cfg!(target_os = "linux") {
+		Some(
+			"install FUSE 3 (e.g. `apt install fuse3` or `dnf install fuse3`) and make sure /dev/fuse exists",
+		)
+	} else if cfg!(windows) {
+		Some("install WinFsp from https://winfsp.dev/rel/")
+	} else {
+		None
+	}
 }
 
 /// The `cache`th cache directory in `dir`: `cache`, then `cache-2`, `cache-3` and so on.
@@ -726,6 +746,24 @@ mod tests {
 			format!("{err:#}"),
 			"Failed to mount network drive: the mount point is not a usable directory or drive letter (/tmp/filen: not a directory)"
 		);
+	}
+
+	#[test]
+	fn a_missing_fuse_says_how_to_install_it() {
+		let err = rclone_error(
+			RcloneRefusal::FuseMissing.into(),
+			"Failed to mount network drive",
+		);
+
+		assert_eq!(exit_code(&err), 1);
+		let expected = if cfg!(target_os = "linux") {
+			"Failed to mount network drive: no FUSE is installed; install FUSE 3 (e.g. `apt install fuse3` or `dnf install fuse3`) and make sure /dev/fuse exists"
+		} else if cfg!(windows) {
+			"Failed to mount network drive: no FUSE is installed; install WinFsp from https://winfsp.dev/rel/"
+		} else {
+			"Failed to mount network drive: no FUSE is installed"
+		};
+		assert_eq!(format!("{err:#}"), expected);
 	}
 
 	#[test]
