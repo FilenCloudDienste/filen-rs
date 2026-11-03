@@ -117,7 +117,7 @@ use filen_sdk_rs::{
 	auth::Client,
 	sync_engine::{
 		BaselineInUse, ConflictResolution, ConflictResolved, PairId, PairRecord, SyncEngine,
-		SyncEvent, UnsyncablePath, UnsyncableReason, WatchStatus,
+		SyncEvent, SyncMode, UnsyncablePath, UnsyncableReason, WatchStatus,
 	},
 };
 use log::info;
@@ -197,6 +197,22 @@ pub(crate) enum SyncCommands {
 		#[arg(help = PAIR_HELP)]
 		pair: String,
 	},
+	/// Change the mode of a sync pair, from its next pass on
+	///
+	/// By default, what the destination still holds of what the source no longer has is kept: the
+	/// switch deletes nothing, and in a one-way mode those copies stay on the destination. A switch
+	/// from a backup mode to one that deletes would otherwise delete them.
+	SetSyncMode {
+		#[arg(help = PAIR_HELP)]
+		pair: String,
+		/// The new mode: `twoWay` (or `tw`), `localToRemote` (or `localToCloud`, `ltc`), `remoteToLocal` (or `cloudToLocal`, `ctl`), `localBackup` (or `lb`), `remoteBackup` (or `cloudBackup`, `cb`)
+		#[arg(value_parser = sync_pairs::parse_sync_mode_arg)]
+		mode: SyncMode,
+		/// Let the next pass delete, on the destination, what the source no longer has, as the new mode says.
+		/// The delete guard still holds a large batch of deletions back for approval.
+		#[arg(long)]
+		propagate_deletions: bool,
+	},
 }
 
 /// The help of the PAIR argument of the commands that manage a registered sync pair.
@@ -209,6 +225,7 @@ pub(crate) const DOCS: &[DocElement] = &[
 	DocElement::DocFragment("sync-pairs"),
 	DocElement::CommandHelp("list-sync-pairs"),
 	DocElement::CommandHelp("remove-sync-pair"),
+	DocElement::CommandHelp("set-sync-mode"),
 ];
 
 impl SyncCommands {
@@ -245,6 +262,13 @@ impl SyncCommands {
 			Self::ListSyncPairs => manage::list_sync_pairs(config, ui, client).await?,
 			Self::RemoveSyncPair { pair } => {
 				manage::remove_sync_pair(config, ui, client, &pair).await?;
+			}
+			Self::SetSyncMode {
+				pair,
+				mode,
+				propagate_deletions,
+			} => {
+				manage::set_sync_mode(config, ui, client, &pair, mode, propagate_deletions).await?;
 			}
 		}
 		Ok(CommandResult::default())
@@ -904,6 +928,36 @@ mod tests {
 			})) => given_pairs(pairs, pair_options),
 			other => panic!("expected a sync command, got {other:?}"),
 		}
+	}
+
+	/// The command of the REPL line `line`.
+	fn command_of(line: &str) -> SyncCommands {
+		match parse_repl_line(line).unwrap().command {
+			Some(Commands::Sync(command)) => command,
+			other => panic!("expected a sync command, got {other:?}"),
+		}
+	}
+
+	#[test]
+	fn set_sync_mode_takes_any_name_of_a_mode_and_deletes_nothing_by_default() {
+		let SyncCommands::SetSyncMode {
+			pair,
+			mode,
+			propagate_deletions,
+		} = command_of("set-sync-mode docs lb")
+		else {
+			panic!("expected set-sync-mode");
+		};
+
+		assert_eq!(
+			(pair.as_str(), mode, propagate_deletions),
+			("docs", SyncMode::LocalBackup, false)
+		);
+	}
+
+	#[test]
+	fn set_sync_mode_with_an_unknown_mode_is_a_usage_error() {
+		assert!(parse_repl_line("set-sync-mode docs mirror").is_err());
 	}
 
 	#[test]

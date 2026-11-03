@@ -423,8 +423,8 @@ async fn add_sync_pairs(
 						overlap_message(local, remote_path, overlap, &other)
 					}
 					None => match registered_mode(engine, local, *remote_root).await {
-						Some(registered) if registered != *mode => {
-							mode_mismatch_message(local, remote_path, *mode, registered)
+						Some((pair, registered)) if registered != *mode => {
+							mode_mismatch_message(local, remote_path, *mode, pair, registered)
 						}
 						_ => format!(
 							"Failed to set up the sync pair {} <> {remote_path}: {e}",
@@ -513,8 +513,12 @@ async fn import_legacy_state(
 	}
 }
 
-/// The mode of the registered pair of `local` and `remote_root`, if there is one.
-async fn registered_mode(engine: &SyncEngine, local: &Path, remote_root: Uuid) -> Option<SyncMode> {
+/// The id and mode of the registered pair of `local` and `remote_root`, if there is one.
+async fn registered_mode(
+	engine: &SyncEngine,
+	local: &Path,
+	remote_root: Uuid,
+) -> Option<(PairId, SyncMode)> {
 	let pairs = match engine.list_pairs().await {
 		Ok(pairs) => pairs,
 		Err(e) => {
@@ -529,21 +533,22 @@ async fn registered_mode(engine: &SyncEngine, local: &Path, remote_root: Uuid) -
 			pair.remote_root == remote_root
 				&& pair_address::resolved(Path::new(&pair.local_root)) == local
 		})
-		.map(|pair| pair.mode)
+		.map(|pair| (pair.id, pair.mode))
 }
 
-/// Why the pair `local` <> `remote` cannot be set up in `mode`: it is registered in the mode
-/// `registered`.
+/// Why the pair `local` <> `remote` cannot be set up in `mode`: it is registered as `pair`, in
+/// the mode `registered`.
 fn mode_mismatch_message(
 	local: &Path,
 	remote: &RemotePath,
 	mode: SyncMode,
+	pair: PairId,
 	registered: SyncMode,
 ) -> String {
 	let (mode, registered) = (sync_mode_str(mode), sync_mode_str(registered));
 	format!(
 		"Cannot set up the sync pair {} <> {remote} as {mode}: it is registered as {registered}. \
-		 Give its mode as {registered}.",
+		 Give its mode as {registered}, or switch it with `filen set-sync-mode {pair} {mode}`.",
 		local.display()
 	)
 }
@@ -954,6 +959,11 @@ fn parse_sync_mode_str(mode: &str) -> Option<SyncMode> {
 		.map(|(mode, _)| *mode)
 }
 
+/// The mode a command line argument names, for clap, which shows the error as a usage error.
+pub(super) fn parse_sync_mode_arg(mode: &str) -> Result<SyncMode, String> {
+	parse_sync_mode_str(mode).ok_or_else(|| format!("expected one of {}", sync_mode_names()))
+}
+
 /// Every name of [`SYNC_MODE_NAMES`], for messages.
 fn sync_mode_names() -> String {
 	SYNC_MODE_NAMES
@@ -1150,10 +1160,12 @@ mod tests {
 				Path::new("/home/me/docs"),
 				&RemotePath::new("/docs"),
 				SyncMode::TwoWay,
+				3,
 				SyncMode::LocalBackup,
 			),
 			"Cannot set up the sync pair /home/me/docs <> /docs as twoWay: it is registered as \
-			 localBackup. Give its mode as localBackup."
+			 localBackup. Give its mode as localBackup, or switch it with `filen set-sync-mode 3 \
+			 twoWay`."
 		);
 	}
 

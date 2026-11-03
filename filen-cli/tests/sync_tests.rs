@@ -435,6 +435,43 @@ async fn sync_once_imports_the_typescript_clis_state_of_a_new_pair() {
 	);
 }
 
+/// A two-way pair switched to `localBackup` keeps on the remote what is deleted locally, and
+/// `list-sync-pairs` shows its new mode.
+#[shared_test_runtime]
+async fn set_sync_mode_switches_a_registered_pair_from_its_next_pass() {
+	// Not `get_resources_with_lock`, for the reason the first test gives.
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let test_dir_name = resources.dir.name().unwrap();
+	let local = assert_fs::TempDir::new().unwrap();
+	std::fs::write(local.path().join("kept.txt"), "backed up").unwrap();
+	let config_dir = assert_fs::TempDir::new().unwrap();
+	let local_root = local.path().to_str().unwrap();
+	let pair = format!("{local_root}:{test_dir_name}");
+	assert_success(&sync_once(config_dir.path(), &pair, &[]).await);
+
+	let output = filen(config_dir.path(), &["set-sync-mode", local_root, "lb"]).await;
+
+	assert_success(&output);
+	let listed = filen(config_dir.path(), &["list-sync-pairs", "--json"]).await;
+	assert_success(&listed);
+	let listed = serde_json::from_slice::<serde_json::Value>(&listed.stdout).unwrap();
+	assert_eq!(listed[0]["mode"], "localBackup", "{listed}");
+	assert_eq!(listed[0]["remote"], test_dir_name, "{listed}");
+	std::fs::remove_file(local.path().join("kept.txt")).unwrap();
+	// in its new mode, which `sync` must be given it in from now on
+	let output = sync_once(
+		config_dir.path(),
+		&format!("{local_root}:lb:{test_dir_name}"),
+		&[],
+	)
+	.await;
+	assert_success(&output);
+	assert_eq!(
+		remote_content(&resources.client, &format!("{test_dir_name}/kept.txt")).await,
+		b"backed up"
+	);
+}
+
 /// A pair given in another mode than the one it is registered in is refused, with the mode it has.
 #[shared_test_runtime]
 async fn sync_with_a_pair_in_another_mode_than_registered_names_its_mode() {
@@ -499,6 +536,11 @@ async fn sync_once(config_dir: &Path, pair: &str, args: &[&str]) -> Output {
 	sync(config_dir, &[&["--once", "--pair", pair], args].concat()).await
 }
 
+/// Runs `sync <args>` with `config_dir`.
+async fn sync(config_dir: &Path, args: &[&str]) -> Output {
+	filen(config_dir, &[&["sync"], args].concat()).await
+}
+
 /// Taken by every CLI run of these tests: shared by a run that ends on its own, held alone by a
 /// sync that watches until a deadline ([`sync_until`]).
 ///
@@ -509,8 +551,8 @@ async fn sync_once(config_dir: &Path, pair: &str, args: &[&str]) -> Output {
 /// only with what the test process itself does on the drive.
 static CLI_RUNS: RwLock<()> = RwLock::const_new(());
 
-/// Runs `sync <args>` with `config_dir`.
-async fn sync(config_dir: &Path, args: &[&str]) -> Output {
+/// Runs the CLI with `args` and `config_dir`.
+async fn filen(config_dir: &Path, args: &[&str]) -> Output {
 	let _runs = CLI_RUNS.read().await;
 	let (_auth_config_dir, auth_config) = test_utils::cli::prepare_cli_auth_config().await;
 	Command::new(env!("CARGO_BIN_EXE_filen-cli"))
@@ -520,7 +562,6 @@ async fn sync(config_dir: &Path, args: &[&str]) -> Output {
 			"--config-dir",
 			config_dir.to_str().unwrap(),
 			"--skip-update",
-			"sync",
 		])
 		.args(args)
 		.output()

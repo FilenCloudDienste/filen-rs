@@ -3,13 +3,18 @@
 //! manage them. They name a sync pair by the id `list-sync-pairs` prints, by its alias in the
 //! default sync pairs file, or by its local directory. They open the same database as `sync`, so
 //! they cannot run while a `filen sync` is running: stop it first.
+//!
+//! A sync pair whose mode `set-sync-mode` changed must be given to `sync` in its new mode from then
+//! on, in a sync pairs file too: `sync` refuses a sync pair given in another mode than the one it is
+//! registered in, and says which one that is.
 
-use std::sync::Arc;
+use std::{fmt::Display, iter, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
 use filen_sdk_rs::{
+	ErrorKind,
 	auth::Client,
-	sync_engine::{PairRecord, SyncEngine},
+	sync_engine::{Backlog, PairRecord, SyncEngine, SyncMode},
 };
 use serde_json::json;
 
@@ -138,12 +143,151 @@ pub(super) async fn remove_sync_pair(
 	Ok(())
 }
 
+/// `set-sync-mode`: switches the pair `given` names to `mode` from its next pass on. With
+/// `propagate_deletions`, and once the user confirms it, the next pass deletes on the destination
+/// what the source no longer has, as `mode` says; without it, the destination keeps it.
+pub(super) async fn set_sync_mode(
+	config: &CliConfig,
+	ui: &mut UI,
+	client: &mut LazyClient,
+	given: &str,
+	mode: SyncMode,
+	propagate_deletions: bool,
+) -> Result<()> {
+	let mode_name = sync_pairs::sync_mode_str(mode);
+	if propagate_deletions {
+		// before logging in, so that a script learns at once that it needs `--yes`
+		ui.ensure_can_confirm(&format!(
+			"Switch the sync pair {given} to {mode_name} and propagate deletions?"
+		))?;
+	}
+	let managing = Managing::open(config, ui, client).await?;
+	let (pair, label) = managing.find(config, given).await?;
+	if pair.mode == mode {
+		ui.print(&format!(
+			"The sync pair {label} already syncs as {mode_name}"
+		));
+		return Ok(());
+	}
+	let backlog = if propagate_deletions {
+		if !ui.prompt_confirm(&propagate_deletions_question(&label, mode_name), false)? {
+			return Ok(());
+		}
+		Backlog::Propagate
+	} else {
+		Backlog::AdoptDestination
+	};
+	awaiting_listing(
+		async || {
+			managing
+				.engine
+				.reconfigure_pair(pair.id, mode, backlog)
+				.await
+		},
+		|| ui.print_muted(WAITING_FOR_LISTING),
+	)
+	.await
+	.map_err(|e| UI::failure(&switch_failure_message(&label, mode_name, &e)))?;
+	ui.print_success(&format!(
+		"The sync pair {label} syncs as {mode_name} from its next pass"
+	));
+	Ok(())
+}
+
+/// What `set-sync-mode --propagate-deletions` asks before it switches the pair labelled `label`
+/// to the mode named `mode_name`.
+fn propagate_deletions_question(label: &str, mode_name: &str) -> String {
+	format!(
+		"Switch the sync pair {label} to {mode_name}? Its next pass then deletes on the \
+		 destination what the source no longer has, as {mode_name} does; the delete guard still \
+		 holds a large batch of deletions back for approval."
+	)
+}
+
+/// Why the pair labelled `label` was not switched to the mode named `mode_name`: `error`.
+fn switch_failure_message(label: &str, mode_name: &str, error: &impl Display) -> String {
+	format!(
+		"Failed to switch the sync pair {label} to {mode_name}, so its mode is left as it was: \
+		 {error}"
+	)
+}
+
+/// What is printed while a call waits for the cache to finish listing a pair's remote folder.
+pub(super) const WAITING_FOR_LISTING: &str = "Waiting for the remote folder to finish indexing...";
+
+/// How long [`awaiting_listing`] waits for the cache to finish listing, as long as a pass waits.
+const LISTING_WAIT: Duration = Duration::from_secs(15 * 60);
+
+/// How long [`awaiting_listing`] waits before it calls again the first time, and at most.
+const LISTING_POLL: (Duration, Duration) = (Duration::from_millis(500), Duration::from_secs(5));
+
+/// The waits between [`awaiting_listing`]'s calls: doubling from the first to the longest, until
+/// they add up to [`LISTING_WAIT`].
+fn listing_delays() -> impl Iterator<Item = Duration> {
+	let (first, longest) = LISTING_POLL;
+	iter::successors(Some(first), move |delay| Some((*delay * 2).min(longest))).scan(
+		Duration::ZERO,
+		|waited, delay| {
+			(*waited < LISTING_WAIT).then(|| {
+				*waited += delay;
+				delay
+			})
+		},
+	)
+}
+
+/// Makes `call`, which needs the cache to have finished listing a pair's remote folder, and fails
+/// with [`ErrorKind::StaleState`] at once while it has not, as the cache does after it starts. It
+/// is called again after a growing wait ([`listing_delays`]), and `waiting` is called before the
+/// first wait.
+pub(super) async fn awaiting_listing<T>(
+	mut call: impl AsyncFnMut() -> Result<T, filen_sdk_rs::Error>,
+	waiting: impl FnOnce(),
+) -> Result<T, filen_sdk_rs::Error> {
+	let mut delays = listing_delays();
+	let mut waiting = Some(waiting);
+	loop {
+		match call().await {
+			Err(e) if e.kind() == ErrorKind::StaleState => {
+				let Some(delay) = delays.next() else {
+					return Err(e);
+				};
+				if let Some(waiting) = waiting.take() {
+					waiting();
+				}
+				tokio::time::sleep(delay).await;
+			}
+			result => return result,
+		}
+	}
+}
+
 #[cfg(test)]
 mod tests {
+	use std::time::Duration;
+
 	use filen_sdk_rs::sync_engine::{DeleteGuard, PairRecord, SyncMode};
 	use filen_types::fs::Uuid;
 
-	use super::pair_line;
+	use super::{
+		LISTING_WAIT, listing_delays, pair_line, propagate_deletions_question,
+		switch_failure_message,
+	};
+
+	#[test]
+	fn the_waits_for_the_listing_double_up_to_five_seconds_for_fifteen_minutes() {
+		let delays = listing_delays().collect::<Vec<_>>();
+
+		assert_eq!(
+			delays[..6],
+			[500, 1000, 2000, 4000, 5000, 5000].map(Duration::from_millis)
+		);
+		let total = delays.iter().sum::<Duration>();
+		assert!(
+			total >= LISTING_WAIT && total < LISTING_WAIT + Duration::from_secs(5),
+			"{total:?}"
+		);
+	}
 
 	fn record(paused: bool, first_pass_completed: bool) -> PairRecord {
 		PairRecord {
@@ -167,6 +311,24 @@ mod tests {
 		assert_eq!(
 			pair_line(&record(true, false), "L"),
 			"3: L (paused) (no pass completed yet)"
+		);
+	}
+
+	#[test]
+	fn propagating_deletions_asks_in_one_line() {
+		assert_eq!(
+			propagate_deletions_question("L", "localToRemote"),
+			"Switch the sync pair L to localToRemote? Its next pass then deletes on the destination \
+			 what the source no longer has, as localToRemote does; the delete guard still holds a \
+			 large batch of deletions back for approval."
+		);
+	}
+
+	#[test]
+	fn a_failed_switch_says_the_mode_is_left_in_one_line() {
+		assert_eq!(
+			switch_failure_message("L", "localBackup", &"offline"),
+			"Failed to switch the sync pair L to localBackup, so its mode is left as it was: offline"
 		);
 	}
 }
