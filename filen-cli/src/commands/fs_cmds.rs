@@ -1084,14 +1084,44 @@ pub(crate) async fn create_directory(
 	recursive: bool,
 ) -> Result<()> {
 	let directory_str = working_path.navigate(directory_str);
-	let parent_str = directory_str.navigate("..");
 	let client = client.get(ui).await?;
-	if parent_str.0 == directory_str.0 {
-		return Err(UI::failure("Cannot create root directory"));
+	// like `mkdir -p`, an existing directory is no failure
+	match client.find_item_at_path(&directory_str.0).await {
+		Ok(Some(NonRootFileType::Dir(_) | NonRootFileType::Root(_))) => {
+			print_directory_exists(ui, &directory_str);
+			return Ok(());
+		}
+		Ok(Some(NonRootFileType::File(_))) => {
+			return Err(UI::failure(&format!("Not a directory: {}", directory_str)));
+		}
+		Ok(None) => {}
+		// a file on the way, which creating the directory reports
+		Err(e) if e.kind() == ErrorKind::InvalidType => {}
+		Err(e) => return Err(e).context("Failed to find directory"),
 	}
-	let _ = create_directory_(client, &directory_str, recursive).await?;
-	ui.print_success(&format!("Directory created: {}", directory_str));
+	let created = create_directory_(client, &directory_str, recursive).await?;
+	match created
+		.name()
+		.and_then(|name| existing_directory_name(directory_str.basename(), name))
+	{
+		Some(existing) => print_directory_exists(ui, &directory_str.parent().navigate(existing)),
+		None => ui.print_success(&format!("Directory created: {}", directory_str)),
+	}
 	Ok(())
+}
+
+fn print_directory_exists(ui: &mut UI, directory: &RemotePath) {
+	if !ui.is_quiet() {
+		ui.print_muted(&format!("Directory already exists: {}", directory));
+	}
+}
+
+/// The name of the directory that creating one named `requested` returned, if that is an existing
+/// directory: the server takes a name that differs only in case from one in the same directory as
+/// that directory's, and returns that directory rather than creating one. Looking the path up
+/// first finds only a directory of exactly the requested name.
+fn existing_directory_name<'a>(requested: Option<&str>, returned: &'a str) -> Option<&'a str> {
+	(requested != Some(returned)).then_some(returned)
 }
 
 pub(crate) async fn create_directory_(
@@ -3648,5 +3678,15 @@ mod tests {
 			printed_listing(items, ListedBy::Path, false, false),
 			"/a/b.txt\n00000000-0000-0000-0000-000000000002"
 		);
+	}
+
+	#[test]
+	fn a_directory_returned_under_the_requested_name_was_created() {
+		assert_eq!(existing_directory_name(Some("docs"), "docs"), None);
+	}
+
+	#[test]
+	fn a_directory_returned_under_a_name_differing_in_case_existed() {
+		assert_eq!(existing_directory_name(Some("docs"), "Docs"), Some("Docs"));
 	}
 }

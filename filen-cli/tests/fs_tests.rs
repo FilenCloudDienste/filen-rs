@@ -127,6 +127,55 @@ async fn mkdir_recursive_creates_a_path_with_a_trailing_slash() {
 }
 
 #[shared_test_runtime]
+async fn mkdir_of_an_existing_directory_says_it_exists() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let test_dir = format!("/{}", resources.dir.name().unwrap());
+
+	authenticated_cli_with_args!("mkdir", &format!("{test_dir}/x"))
+		.success()
+		.stdout(predicates::str::contains(format!(
+			"Directory created: {test_dir}/x"
+		)));
+	authenticated_cli_with_args!("mkdir", &format!("{test_dir}/x"))
+		.success()
+		.stdout(predicates::str::contains(format!(
+			"Directory already exists: {test_dir}/x"
+		)));
+}
+
+#[shared_test_runtime]
+async fn mkdir_of_a_name_differing_only_in_case_says_which_directory_exists() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = format!("/{}", resources.dir.name().unwrap());
+	test_utils::create_remote_file_structure_outline(client, resources.dir.clone(), &["Docs/"])
+		.await
+		.unwrap();
+
+	authenticated_cli_with_args!("mkdir", &format!("{test_dir}/docs"))
+		.success()
+		.stdout(predicates::str::contains(format!(
+			"Directory already exists: {test_dir}/Docs"
+		)));
+}
+
+#[shared_test_runtime]
+async fn mkdir_of_a_file_fails() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = format!("/{}", resources.dir.name().unwrap());
+	test_utils::create_remote_file_structure_outline(client, resources.dir.clone(), &["a.txt"])
+		.await
+		.unwrap();
+
+	authenticated_cli_with_args!("mkdir", &format!("{test_dir}/a.txt"))
+		.failure()
+		.stderr(predicates::str::contains(format!(
+			"Not a directory: {test_dir}/a.txt"
+		)));
+}
+
+#[shared_test_runtime]
 async fn cp_refuses_a_file_whose_name_exists_in_the_destination() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = &resources.client;
