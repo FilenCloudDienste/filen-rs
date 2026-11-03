@@ -39,7 +39,27 @@ async fn completes_commands_and_remote_paths() {
 	.unwrap();
 
 	// complete commands
-	test_completer("c", &["cat", "cd", "completions", "cp"]);
+	test_completer(
+		"c",
+		&[
+			"cat",
+			"cd",
+			"change-email",
+			"change-password",
+			"clear-rclone-cache",
+			"color",
+			"completions",
+			"contact-accept",
+			"contact-block",
+			"contact-cancel",
+			"contact-deny",
+			"contact-remove",
+			"contact-request",
+			"contact-unblock",
+			"contacts",
+			"cp",
+		],
+	);
 
 	// basic completion of files and directories
 	test_completer("ls d", &["ls dir1", "ls dir2"]);

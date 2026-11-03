@@ -9,6 +9,7 @@ use crate::{CliConfig, CommandResult, auth::LazyClient, ui::UI, util::RemotePath
 
 pub(crate) mod account_cmds;
 pub(crate) mod auth_cmds;
+pub(crate) mod contacts_cmds;
 pub(crate) mod fs_cmds;
 pub(crate) mod misc_cmds;
 pub(crate) mod notes_cmds;
@@ -43,6 +44,8 @@ pub(crate) enum Commands {
 	Shell(shell_cmds::ShellCommands),
 	#[command(flatten)]
 	Account(account_cmds::AccountCommands),
+	#[command(flatten)]
+	Contacts(contacts_cmds::ContactsCommands),
 }
 
 impl Commands {
@@ -91,5 +94,6 @@ pub(crate) async fn execute_command(
 		Commands::Rclone(command) => command.execute(ctx).await,
 		Commands::Shell(command) => command.execute(ctx).await,
 		Commands::Account(command) => command.execute(ctx).await,
+		Commands::Contacts(command) => command.execute(ctx).await,
 	}
 }

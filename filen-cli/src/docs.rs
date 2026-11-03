@@ -16,8 +16,8 @@ use tiny_http::{Header, Request, Response};
 use crate::{
 	CliArgs,
 	commands::{
-		account_cmds, auth_cmds, fs_cmds, misc_cmds, notes_cmds, public_links_cmds, rclone_cmds,
-		search_cmd, shell_cmds, sync_cmd, transfer_cmds,
+		account_cmds, auth_cmds, contacts_cmds, fs_cmds, misc_cmds, notes_cmds, public_links_cmds,
+		rclone_cmds, search_cmd, shell_cmds, sync_cmd, transfer_cmds,
 	},
 	interrupt,
 	ui::UI,
@@ -112,6 +112,11 @@ const DOC_OUTLINE: &[DocSection] = &[
 		id: "transfer-files",
 		title: "Transferring Files",
 		parts: &[transfer_cmds::DOCS, sync_cmd::DOCS],
+	},
+	DocSection {
+		id: "sharing",
+		title: "Sharing",
+		parts: &[contacts_cmds::DOCS],
 	},
 	DocSection {
 		id: "notes",
