@@ -455,14 +455,17 @@ fn name_or_uuid(name: Option<&str>, uuid: Uuid) -> String {
 	name.map(str::to_string).unwrap_or_else(|| uuid.to_string())
 }
 
-/// Sorts a listing the way it is printed: directories first, each group by label in
-/// [`natural_cmp`] order.
+/// Sorts a listing the way it is printed (see [`listing_order`]).
 fn sort_listing(items: &mut [ListedItem], by: ListedBy) {
-	items.sort_by(|a, b| {
-		a.kind
-			.cmp(&b.kind)
-			.then_with(|| natural_cmp(&a.label(by), &b.label(by)))
-	});
+	items.sort_by(|a, b| listing_order(a, b, by));
+}
+
+/// The order listings are printed in: directories first, each group by label in
+/// [`natural_cmp`] order.
+fn listing_order(a: &ListedItem, b: &ListedItem, by: ListedBy) -> Ordering {
+	a.kind
+		.cmp(&b.kind)
+		.then_with(|| natural_cmp(&a.label(by), &b.label(by)))
 }
 
 /// Orders names the way a person reads them: ignoring case, and with each run of digits compared
@@ -1705,11 +1708,12 @@ async fn full_path(client: &Client, item: &NonRootItemType<'_, Normal>) -> Optio
 
 pub(crate) async fn list_trash(ui: &mut UI, client: &mut LazyClient) -> Result<()> {
 	let client = client.get(ui).await?;
-	let (dirs, files) = client
-		.list_trash(None::<&fn(u64, Option<u64>)>)
-		.await
-		.context("Failed to list trash")?;
-	print_items_after_list(ui, dirs, files, Some("Trash"), false)
+	let items = list_trash_items(client)
+		.await?
+		.into_iter()
+		.map(|entry| entry.listed)
+		.collect::<Vec<ListedItem>>();
+	print_listing(ui, &items, ListedBy::Name, "Trash is empty", false)
 }
 
 pub(crate) enum TrashAction {
@@ -1722,46 +1726,31 @@ pub(crate) enum TrashItem {
 	File(RemoteFile),
 }
 
-impl TrashItem {
-	pub(crate) fn uuid_string(&self) -> String {
-		match self {
-			TrashItem::Dir(dir) => dir.uuid().to_string(),
-			TrashItem::File(file) => file.uuid().to_string(),
-		}
-	}
+/// A trashed item, with what a listing shows of it.
+struct TrashEntry {
+	listed: ListedItem,
+	item: TrashItem,
 }
 
-/// The items in the trash with the names they are shown under (their UUID when the name cannot
-/// be decrypted): directories first, each group sorted by name, like `ls` prints them.
-async fn list_trash_items(client: &Client) -> Result<Vec<(String, TrashItem)>> {
+/// The items in the trash, in the order `list-trash` prints them.
+async fn list_trash_items(client: &Client) -> Result<Vec<TrashEntry>> {
 	let (dirs, files) = client
 		.list_trash(None::<&fn(u64, Option<u64>)>)
 		.await
 		.context("Failed to list trash")?;
-	let mut items = dirs
+	let mut entries = dirs
 		.into_iter()
-		.map(|dir| {
-			let name = dir
-				.name()
-				.map(str::to_string)
-				.unwrap_or_else(|| dir.uuid().to_string());
-			(name, TrashItem::Dir(dir))
+		.map(|dir| TrashEntry {
+			listed: ListedItem::of_dir(&dir),
+			item: TrashItem::Dir(dir),
 		})
-		.collect::<Vec<(String, TrashItem)>>();
-	items.sort_by(|(a, _), (b, _)| natural_cmp(a, b));
-	let mut file_items = files
-		.into_iter()
-		.map(|file| {
-			let name = file
-				.name()
-				.map(str::to_string)
-				.unwrap_or_else(|| file.uuid().to_string());
-			(name, TrashItem::File(file))
-		})
-		.collect::<Vec<(String, TrashItem)>>();
-	file_items.sort_by(|(a, _), (b, _)| natural_cmp(a, b));
-	items.append(&mut file_items);
-	Ok(items)
+		.chain(files.into_iter().map(|file| TrashEntry {
+			listed: ListedItem::of_file(&file),
+			item: TrashItem::File(file),
+		}))
+		.collect::<Vec<TrashEntry>>();
+	entries.sort_by(|a, b| listing_order(&a.listed, &b.listed, ListedBy::Name));
+	Ok(entries)
 }
 
 /// Lists the trash and lets the user pick one item to restore or permanently delete.
@@ -1778,23 +1767,28 @@ pub(crate) async fn select_trash_item(
 	// the selection, not even --yes
 	ui.ensure_can_prompt(select_message)?;
 	let client = client.get(ui).await?;
-	let mut items = list_trash_items(client).await?;
-	if items.is_empty() {
+	let mut entries = list_trash_items(client).await?;
+	if entries.is_empty() {
 		ui.print_muted("Trash is empty");
 		return Ok(());
 	}
 
 	// mark directories with a trailing slash, and disambiguate items that share a name by
 	// their UUID, so every option maps back to exactly one item
-	let options = items
+	let options = entries
 		.iter()
-		.map(|(name, item)| {
-			let mut label = match item {
-				TrashItem::Dir(_) => format!("{}/", name),
-				TrashItem::File(_) => name.clone(),
+		.map(|entry| {
+			let name = &entry.listed.name;
+			let mut label = match entry.listed.kind {
+				ListedKind::Directory => format!("{}/", name),
+				ListedKind::File => name.clone(),
 			};
-			if items.iter().filter(|(other, _)| other == name).count() > 1 {
-				label.push_str(&format!(" ({})", item.uuid_string()));
+			if entries
+				.iter()
+				.filter(|other| other.listed.name == *name)
+				.count() > 1
+			{
+				label.push_str(&format!(" ({})", entry.listed.uuid));
 			}
 			label
 		})
@@ -1806,15 +1800,15 @@ pub(crate) async fn select_trash_item(
 		.iter()
 		.position(|option| *option == selection)
 		.context("Failed to resolve selected item")?;
-	let (name, item) = items.remove(index);
+	let entry = entries.remove(index);
 
 	match action {
-		TrashAction::Restore => restore_trash_item(ui, client, &name, item).await,
+		TrashAction::Restore => restore_trash_item(ui, client, entry).await,
 		TrashAction::Delete => {
-			if !ui.prompt_confirm(&format!("Permanently delete {}?", name), false)? {
+			if !ui.prompt_confirm(&format!("Permanently delete {}?", entry.listed.name), false)? {
 				return Ok(());
 			}
-			delete_trash_item_permanently(ui, client, &name, item).await
+			delete_trash_item_permanently(ui, client, entry).await
 		}
 	}
 }
@@ -1826,9 +1820,8 @@ async fn restore_named_trash_item(
 	wanted: &str,
 ) -> Result<()> {
 	let client = client.get(ui).await?;
-	let items = list_trash_items(client).await?;
-	let (name, item) = pick_trash_item(items, wanted, TrashItem::uuid_string)?;
-	restore_trash_item(ui, client, &name, item).await
+	let entry = take_named_trash_entry(list_trash_items(client).await?, wanted)?;
+	restore_trash_item(ui, client, entry).await
 }
 
 /// Permanently deletes the trashed item that `wanted` names (see [`pick_trash_item`]), asking
@@ -1838,26 +1831,24 @@ async fn delete_trash_item(ui: &mut UI, client: &mut LazyClient, wanted: &str) -
 	// before logging in and listing the trash, so that a script missing --yes fails at once
 	ui.ensure_can_confirm(&confirmation)?;
 	let client = client.get(ui).await?;
-	let items = list_trash_items(client).await?;
-	let (name, item) = pick_trash_item(items, wanted, TrashItem::uuid_string)?;
-	if !ui.prompt_confirm(&format!("Permanently delete {}?", name), false)? {
+	let entry = take_named_trash_entry(list_trash_items(client).await?, wanted)?;
+	if !ui.prompt_confirm(&format!("Permanently delete {}?", entry.listed.name), false)? {
 		return Ok(());
 	}
-	delete_trash_item_permanently(ui, client, &name, item).await
+	delete_trash_item_permanently(ui, client, entry).await
 }
 
-/// The one item among the trash's `items` (name and item) that `wanted` names: the item of that
+/// The index of the one item among the trash's `items` that `wanted` names: the item of that
 /// name, or else the item with that UUID. Trashed items can share a name, as they come from
 /// different directories; those are only told apart by their UUIDs, which the failure lists.
-fn pick_trash_item<T>(
-	items: Vec<(String, T)>,
+fn pick_trash_item<'a>(
+	items: impl Iterator<Item = &'a ListedItem> + Clone,
 	wanted: &str,
-	uuid_of: impl Fn(&T) -> String,
-) -> Result<(String, T)> {
+) -> Result<usize> {
 	let named = items
-		.iter()
-		.filter(|(name, _)| name == wanted)
-		.map(|(_, item)| uuid_of(item))
+		.clone()
+		.filter(|item| item.name == wanted)
+		.map(|item| item.uuid.to_string())
 		.collect::<Vec<String>>();
 	if named.len() > 1 {
 		return Err(UI::failure(&format!(
@@ -1867,21 +1858,26 @@ fn pick_trash_item<T>(
 			named.join(", ")
 		)));
 	}
+	let mut items = items.enumerate();
 	let found = if named.is_empty() {
-		items.into_iter().find(|(_, item)| uuid_of(item) == wanted)
+		items.find(|(_, item)| item.uuid.to_string() == wanted)
 	} else {
-		items.into_iter().find(|(name, _)| name == wanted)
+		items.find(|(_, item)| item.name == wanted)
 	};
-	found.ok_or_else(|| UI::failure(&format!("No such item in the trash: {}", wanted)))
+	found
+		.map(|(index, _)| index)
+		.ok_or_else(|| UI::failure(&format!("No such item in the trash: {}", wanted)))
 }
 
-async fn restore_trash_item(
-	ui: &mut UI,
-	client: &Client,
-	name: &str,
-	item: TrashItem,
-) -> Result<()> {
-	match item {
+/// The entry of `entries` that `wanted` names (see [`pick_trash_item`]).
+fn take_named_trash_entry(mut entries: Vec<TrashEntry>, wanted: &str) -> Result<TrashEntry> {
+	let index = pick_trash_item(entries.iter().map(|entry| &entry.listed), wanted)?;
+	Ok(entries.swap_remove(index))
+}
+
+async fn restore_trash_item(ui: &mut UI, client: &Client, entry: TrashEntry) -> Result<()> {
+	let name = &entry.listed.name;
+	match entry.item {
 		TrashItem::Dir(mut dir) => {
 			client
 				.restore_dir(&mut dir)
@@ -1903,10 +1899,10 @@ async fn restore_trash_item(
 async fn delete_trash_item_permanently(
 	ui: &mut UI,
 	client: &Client,
-	name: &str,
-	item: TrashItem,
+	entry: TrashEntry,
 ) -> Result<()> {
-	match item {
+	let name = &entry.listed.name;
+	match entry.item {
 		TrashItem::Dir(dir) => {
 			client
 				.delete_dir_permanently(dir)
@@ -2308,44 +2304,51 @@ mod tests {
 		assert!(!CopyProgress::new(&Printed::default().ui()).enabled);
 	}
 
-	fn trash() -> Vec<(String, u128)> {
-		vec![
-			("a.txt".to_owned(), 1),
-			("shared".to_owned(), 2),
-			("shared".to_owned(), 3),
-		]
+	/// A trashed file named `name` with the UUID `uuid`.
+	fn trashed(name: &str, uuid: u128) -> ListedItem {
+		ListedItem {
+			kind: ListedKind::File,
+			name: name.to_owned(),
+			path: None,
+			size: Some(7),
+			modified: None,
+			created: None,
+			favorited: false,
+			uuid: Uuid::from_u128(uuid),
+		}
 	}
 
-	fn uuid_of(item: &u128) -> String {
-		Uuid::from_u128(*item).to_string()
+	fn trash() -> Vec<ListedItem> {
+		vec![
+			trashed("a.txt", 1),
+			trashed("shared", 2),
+			trashed("shared", 3),
+		]
 	}
 
 	#[test]
 	fn a_trashed_item_is_picked_by_its_name() {
-		assert_eq!(
-			pick_trash_item(trash(), "a.txt", uuid_of).unwrap(),
-			("a.txt".to_owned(), 1)
-		);
+		assert_eq!(pick_trash_item(trash().iter(), "a.txt").unwrap(), 0);
 	}
 
 	#[test]
 	fn a_trashed_item_sharing_its_name_is_picked_by_its_uuid() {
 		assert_eq!(
-			pick_trash_item(trash(), &uuid_of(&3), uuid_of).unwrap(),
-			("shared".to_owned(), 3)
+			pick_trash_item(trash().iter(), &Uuid::from_u128(3).to_string()).unwrap(),
+			2
 		);
 	}
 
 	#[test]
 	fn a_name_several_trashed_items_share_is_refused_listing_their_uuids() {
 		assert_eq!(
-			pick_trash_item(trash(), "shared", uuid_of)
+			pick_trash_item(trash().iter(), "shared")
 				.unwrap_err()
 				.to_string(),
 			format!(
 				"2 trashed items are named shared, so name one by its UUID: {}, {}",
-				uuid_of(&2),
-				uuid_of(&3)
+				Uuid::from_u128(2),
+				Uuid::from_u128(3)
 			)
 		);
 	}
@@ -2353,7 +2356,7 @@ mod tests {
 	#[test]
 	fn a_name_no_trashed_item_has_is_refused() {
 		assert_eq!(
-			pick_trash_item(trash(), "A.TXT", uuid_of)
+			pick_trash_item(trash().iter(), "A.TXT")
 				.unwrap_err()
 				.to_string(),
 			"No such item in the trash: A.TXT"
