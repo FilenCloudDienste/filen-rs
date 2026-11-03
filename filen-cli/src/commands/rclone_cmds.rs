@@ -11,7 +11,7 @@ use std::{
 };
 
 use anyhow::{Context as _, Result, anyhow};
-use clap::Subcommand;
+use clap::{Subcommand, ValueEnum};
 use filen_sdk_rs::{
 	ErrorKind,
 	auth::Client,
@@ -47,8 +47,8 @@ pub(crate) enum RcloneCommands {
 	},
 	/// Runs a WebDAV, S3, FTP, SFTP, HTTP, restic or NFS server exposing your Filen drive
 	Serve {
-		/// The type of server to run: webdav, s3, ftp, sftp, http, restic, nfs
-		server: String,
+		/// The type of server to run
+		server: ServerType,
 		/// IP and port for the server (`<ip>:<port>`; `0.0.0.0:<port>` for every network interface) (default: 127.0.0.1 and a port per type)
 		#[arg(long = "addr")]
 		address: Option<String>,
@@ -75,6 +75,39 @@ pub(crate) enum RcloneCommands {
 	},
 	/// Exports your user API key (for use with non-managed Rclone)
 	ExportApiKey,
+}
+
+/// The type of server `serve` runs.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub(crate) enum ServerType {
+	/// WebDAV (default address 127.0.0.1:1900)
+	Webdav,
+	/// S3 (default address 127.0.0.1:1800)
+	S3,
+	/// FTP (default address 127.0.0.1:2121)
+	Ftp,
+	/// SFTP (default address 127.0.0.1:2022)
+	Sftp,
+	/// HTTP, viewable in a web browser (default address 127.0.0.1:1700)
+	Http,
+	/// restic's REST server (default address 127.0.0.1:1600)
+	Restic,
+	/// NFS, without authentication (default address 127.0.0.1:2049)
+	Nfs,
+}
+
+impl From<ServerType> for ServeProtocol {
+	fn from(server: ServerType) -> Self {
+		match server {
+			ServerType::Webdav => Self::Webdav,
+			ServerType::S3 => Self::S3,
+			ServerType::Ftp => Self::Ftp,
+			ServerType::Sftp => Self::Sftp,
+			ServerType::Http => Self::Http,
+			ServerType::Restic => Self::Restic,
+			ServerType::Nfs => Self::Nfs,
+		}
+	}
 }
 
 /// The docs' "Managed Rclone" section.
@@ -107,13 +140,12 @@ impl RcloneCommands {
 				cert,
 				key,
 			} => {
-				let protocol = parse_protocol(&server)?;
 				start_server(
 					config,
 					ui,
 					client,
 					ServeArgs {
-						protocol,
+						protocol: server.into(),
 						address,
 						user,
 						password,
@@ -519,24 +551,6 @@ async fn default_mount_point() -> Result<String> {
 	Ok(mount_point.to_owned())
 }
 
-/// The protocol `name` names, as `serve` takes it.
-pub(crate) fn parse_protocol(name: &str) -> Result<ServeProtocol> {
-	Ok(match name {
-		"webdav" => ServeProtocol::Webdav,
-		"s3" => ServeProtocol::S3,
-		"ftp" => ServeProtocol::Ftp,
-		"sftp" => ServeProtocol::Sftp,
-		"http" => ServeProtocol::Http,
-		"restic" => ServeProtocol::Restic,
-		"nfs" => ServeProtocol::Nfs,
-		_ => {
-			return Err(UI::failure(&format!(
-				"Unsupported server type: {name}. Supported types are: webdav, s3, ftp, sftp, http, restic, nfs"
-			)));
-		}
-	})
-}
-
 fn display_name(protocol: ServeProtocol) -> &'static str {
 	match protocol {
 		ServeProtocol::Webdav => "WebDAV",
@@ -638,11 +652,68 @@ pub(crate) fn parse_size(size: &str) -> Result<u64, String> {
 
 #[cfg(test)]
 mod tests {
+	use std::collections::HashSet;
+
 	use super::*;
 	use crate::{
+		commands::Commands,
 		error::{exit_code, find_cli_error},
+		parse_args,
 		ui::test_support::Printed,
 	};
+
+	/// The protocol of `filen serve <server_type>`.
+	fn parsed_protocol(server_type: &str) -> Result<ServeProtocol, clap::Error> {
+		let args = parse_args(["filen", "serve", server_type])?.args;
+		let Some(Commands::Rclone(RcloneCommands::Serve { server, .. })) = args.command else {
+			panic!("`serve {server_type}` parsed as another command");
+		};
+		Ok(server.into())
+	}
+
+	#[test]
+	fn serve_takes_the_server_type_by_name() {
+		assert_eq!(parsed_protocol("webdav").unwrap(), ServeProtocol::Webdav);
+		assert_eq!(parsed_protocol("s3").unwrap(), ServeProtocol::S3);
+		assert_eq!(parsed_protocol("ftp").unwrap(), ServeProtocol::Ftp);
+		assert_eq!(parsed_protocol("sftp").unwrap(), ServeProtocol::Sftp);
+		assert_eq!(parsed_protocol("http").unwrap(), ServeProtocol::Http);
+		assert_eq!(parsed_protocol("restic").unwrap(), ServeProtocol::Restic);
+		assert_eq!(parsed_protocol("nfs").unwrap(), ServeProtocol::Nfs);
+	}
+
+	#[test]
+	fn an_unknown_server_type_is_a_usage_error() {
+		let err = parsed_protocol("gopher").unwrap_err();
+
+		assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue);
+		assert_eq!(err.exit_code(), 2);
+	}
+
+	#[test]
+	fn every_server_type_has_a_port_of_its_own() {
+		let ports = ServerType::value_variants()
+			.iter()
+			.map(|server| default_port((*server).into()))
+			.collect::<HashSet<u16>>();
+
+		assert_eq!(ports.len(), ServerType::value_variants().len());
+	}
+
+	#[test]
+	fn the_help_names_each_server_types_default_address() {
+		for server in ServerType::value_variants() {
+			let value = server.to_possible_value().unwrap();
+			let help = value.get_help().unwrap().to_string();
+			let port = default_port((*server).into());
+
+			assert!(
+				help.ends_with(&format!("(default address 127.0.0.1:{port})")),
+				"{}: {help}",
+				value.get_name()
+			);
+		}
+	}
 
 	#[test]
 	fn sizes_parse_with_binary_suffixes() {
