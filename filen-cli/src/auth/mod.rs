@@ -236,6 +236,33 @@ async fn login_and_optionally_prompt_two_factor_code(
 	two_factor_code: Option<&str>,
 	client_config_args: &ClientConfigArgs,
 ) -> Result<Client> {
+	try_login(ui, email, password, two_factor_code, client_config_args)
+		.await?
+		.map_err(RefusedLogin::into_error)
+}
+
+/// A login the server refused.
+struct RefusedLogin {
+	error: filen_sdk_rs::Error,
+	/// What was being done, for an unexpected `error`.
+	context: &'static str,
+}
+
+impl RefusedLogin {
+	fn into_error(self) -> anyhow::Error {
+		login_failure(self.error, self.context)
+	}
+}
+
+/// [`login_and_optionally_prompt_two_factor_code`], with a login the server refused as the inner
+/// error, so that the caller can tell it apart from a prompt that failed or was canceled.
+async fn try_login(
+	ui: &mut UI,
+	email: &str,
+	password: &str,
+	two_factor_code: Option<&str>,
+	client_config_args: &ClientConfigArgs,
+) -> Result<std::result::Result<Client, RefusedLogin>> {
 	let unauth_client = UnauthClient::from_config(build_client_config(client_config_args))?;
 
 	let e = match unauth_client
@@ -246,20 +273,28 @@ async fn login_and_optionally_prompt_two_factor_code(
 		)
 		.await
 	{
-		Ok(client) => return Ok(client),
+		Ok(client) => return Ok(Ok(client)),
 		Err(e) => e,
 	};
 	let can_prompt = ui.ensure_can_prompt(TWO_FACTOR_CODE_PROMPT).is_ok();
 	match two_factor_prompt_after(e.kind(), can_prompt) {
 		Some(TwoFactorPrompt::Required) => {}
 		Some(TwoFactorPrompt::WrongCode) => ui.print_warning(WRONG_TWO_FACTOR_CODE),
-		None => return Err(login_failure(e, "Failed to log in")),
+		None => {
+			return Ok(Err(RefusedLogin {
+				error: e,
+				context: "Failed to log in",
+			}));
+		}
 	}
 	let two_factor_code = ui.prompt_password(TWO_FACTOR_CODE_PROMPT)?;
-	unauth_client
+	Ok(unauth_client
 		.login(email.to_owned(), password, two_factor_code.trim())
 		.await
-		.map_err(|e| login_failure(e, "Failed to log in (with 2fa)"))
+		.map_err(|error| RefusedLogin {
+			error,
+			context: "Failed to log in (with 2fa)",
+		}))
 }
 
 const TWO_FACTOR_CODE_PROMPT: &str = "Two-factor authentication code: ";
@@ -763,19 +798,56 @@ async fn authenticate_from_prompt(
 ) -> Result<Client> {
 	ui.ensure_can_prompt("Email:")
 		.context("Not logged in: log in with --email and --password, or with --auth-config-path")?;
-	let email = ui.prompt("Email:")?;
-	let password = ui.prompt_password("Password: ")?;
-	let client = login_and_optionally_prompt_two_factor_code(
+	let client = login_at_prompt(
 		ui,
-		email.trim(),
-		// as typed: a password can start or end with a space, as one given with --password can
-		&password,
-		None,
-		client_config_args,
+		|ui| Ok((ui.prompt("Email:")?, ui.prompt_password("Password: ")?)),
+		async |ui, email, password| {
+			// the password as typed: it can start or end with a space, as one given with
+			// --password can
+			try_login(ui, email.trim(), password, None, client_config_args).await
+		},
 	)
 	.await?;
 	offer_to_keep_logged_in(config, ui, &client)?;
 	Ok(client)
+}
+
+/// Log in with the email and password `ask` asks for, by `login`, asking again after a login
+/// refused as [`prompted_login_retry`] allows.
+async fn login_at_prompt<T>(
+	ui: &mut UI,
+	mut ask: impl FnMut(&mut UI) -> Result<(String, String)>,
+	mut login: impl AsyncFnMut(&mut UI, &str, &str) -> Result<std::result::Result<T, RefusedLogin>>,
+) -> Result<T> {
+	let mut attempt = 1;
+	loop {
+		let (email, password) = ask(ui)?;
+		let refused = match login(ui, &email, &password).await? {
+			Ok(client) => return Ok(client),
+			Err(refused) => refused,
+		};
+		match prompted_login_retry(refused.error.kind(), attempt) {
+			Some(message) => {
+				ui.print_warning(&format!("{message}, please try again"));
+				attempt += 1;
+			}
+			None => return Err(refused.into_error()),
+		}
+	}
+}
+
+/// How often the user may type their credentials at the prompt. (! referenced in module docs)
+const PROMPTED_LOGIN_ATTEMPTS: u32 = 3;
+
+/// The warning to try again with, if the prompted login `attempt` (counting from 1) failed with
+/// `kind` and the user has attempts left: only credentials typed wrong are asked for again, any
+/// other failure ends the login. Credentials given in the arguments, the environment or a file are
+/// never asked for again, so that a script fails at once.
+fn prompted_login_retry(kind: ErrorKind, attempt: u32) -> Option<&'static str> {
+	if attempt >= PROMPTED_LOGIN_ATTEMPTS {
+		return None;
+	}
+	login_failure_message(kind)
 }
 
 const KEEP_LOGGED_IN_PROMPT: &str = "Keep me logged in?";
@@ -1676,6 +1748,139 @@ mod tests {
 	fn an_unexpected_login_error_keeps_its_cause() {
 		assert_eq!(two_factor_prompt_after(ErrorKind::Server, true), None);
 		assert_eq!(login_failure_message(ErrorKind::Server), None);
+	}
+
+	#[test]
+	fn a_wrong_password_at_the_prompt_is_asked_for_again() {
+		assert_eq!(
+			prompted_login_retry(ErrorKind::EmailOrPasswordWrong, 1),
+			Some("Email or password wrong")
+		);
+		assert_eq!(
+			prompted_login_retry(ErrorKind::EmailOrPasswordWrong, 2),
+			Some("Email or password wrong")
+		);
+	}
+
+	#[test]
+	fn a_wrong_prompted_two_factor_code_is_asked_for_again() {
+		assert_eq!(
+			prompted_login_retry(ErrorKind::Wrong2fa, 1),
+			Some("Two-factor authentication code wrong")
+		);
+	}
+
+	#[test]
+	fn the_third_wrong_password_at_the_prompt_fails() {
+		assert_eq!(
+			prompted_login_retry(ErrorKind::EmailOrPasswordWrong, 3),
+			None
+		);
+	}
+
+	#[test]
+	fn an_unexpected_failure_at_the_prompt_is_not_retried() {
+		assert_eq!(prompted_login_retry(ErrorKind::Server, 1), None);
+	}
+
+	/// A login refused for `kind`, as [`try_login`] returns it.
+	fn refused(kind: ErrorKind) -> std::result::Result<&'static str, RefusedLogin> {
+		Err(RefusedLogin {
+			error: filen_sdk_rs::Error::custom(kind, "refused"),
+			context: "Failed to log in",
+		})
+	}
+
+	/// [`login_at_prompt`] with logins answered by `answers` in turn, with what was printed, and the
+	/// passwords typed for the logins.
+	async fn login_at_prompt_answered(
+		answers: Vec<std::result::Result<&'static str, RefusedLogin>>,
+	) -> (Result<&'static str>, String, Vec<String>) {
+		let printed = Printed::default();
+		let mut answers = answers.into_iter();
+		let mut typed = 0;
+		let mut passwords = Vec::new();
+
+		let result = login_at_prompt(
+			&mut printed.ui(),
+			|_| {
+				typed += 1;
+				Ok((" user@example.com ".to_owned(), format!("password {typed}")))
+			},
+			async |_, email, password| {
+				assert_eq!(email, " user@example.com ");
+				passwords.push(password.to_owned());
+				Ok(answers.next().expect("no more logins than answers"))
+			},
+		)
+		.await;
+
+		(result, printed.lines_or_empty(), passwords)
+	}
+
+	#[tokio::test]
+	async fn a_login_refused_at_the_prompt_is_asked_for_again_and_can_succeed() {
+		let (result, printed, passwords) = login_at_prompt_answered(vec![
+			refused(ErrorKind::EmailOrPasswordWrong),
+			Ok("the client"),
+		])
+		.await;
+
+		assert_eq!(result.unwrap(), "the client");
+		assert_eq!(passwords, ["password 1", "password 2"]);
+		assert_eq!(
+			console::strip_ansi_codes(&printed),
+			"⚠ Email or password wrong, please try again"
+		);
+	}
+
+	#[tokio::test]
+	async fn the_third_login_refused_at_the_prompt_fails() {
+		let (result, printed, passwords) = login_at_prompt_answered(vec![
+			refused(ErrorKind::EmailOrPasswordWrong),
+			refused(ErrorKind::Wrong2fa),
+			refused(ErrorKind::EmailOrPasswordWrong),
+		])
+		.await;
+
+		let err = result.unwrap_err();
+		assert_eq!(format!("{err:#}"), "Email or password wrong");
+		assert_eq!(exit_code(&err), 1);
+		assert_eq!(passwords, ["password 1", "password 2", "password 3"]);
+		assert_eq!(
+			console::strip_ansi_codes(&printed),
+			"⚠ Email or password wrong, please try again\n\
+			 ⚠ Two-factor authentication code wrong, please try again"
+		);
+	}
+
+	#[tokio::test]
+	async fn a_login_failing_at_the_prompt_for_another_reason_is_not_asked_for_again() {
+		let (result, printed, passwords) =
+			login_at_prompt_answered(vec![refused(ErrorKind::Server)]).await;
+
+		assert_eq!(
+			format!("{:#}", result.unwrap_err()),
+			"Failed to log in: Error of kind Server: context: refused"
+		);
+		assert_eq!(passwords, ["password 1"]);
+		assert_eq!(printed, "");
+	}
+
+	#[tokio::test]
+	async fn a_prompt_canceled_while_logging_in_ends_the_login() {
+		let printed = Printed::default();
+
+		let err = login_at_prompt::<()>(
+			&mut printed.ui(),
+			|_| Err(UI::failure("Canceled")),
+			async |_, _, _| panic!("nothing to log in with"),
+		)
+		.await
+		.unwrap_err();
+
+		assert_eq!(format!("{err:#}"), "Canceled");
+		assert_eq!(printed.lines_or_empty(), "");
 	}
 
 	/// An environment without any variables.
