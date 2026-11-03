@@ -64,7 +64,7 @@ pub(crate) enum SyncCommands {
 	/// Sync one or more sync pairs, continuously until Ctrl-C or once with --once
 	Sync {
 		/// Pair of local and remote directories to sync.
-		/// Format: `<local>:<remote>` or `<local>:<mode>:<remote>`, where `<mode>` is one of `twoWay`, `localBackup`, `remoteBackup`, `localToRemote`, `remoteToLocal`.
+		/// Format: `<local>:<remote>` (two-way) or `<local>:<mode>:<remote>`, where `<mode>` is one of `twoWay` (or `tw`), `localToRemote` (or `localToCloud`, `ltc`), `remoteToLocal` (or `cloudToLocal`, `ctl`), `localBackup` (or `lb`), `remoteBackup` (or `cloudBackup`, `cb`).
 		/// Alternatively, specify a syncPairs.yaml.
 		/// If none are specified, the default syncPairs.yaml under the config dir is included.
 		// todo: better command docs!

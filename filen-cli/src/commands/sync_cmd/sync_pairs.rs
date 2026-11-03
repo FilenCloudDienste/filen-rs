@@ -379,13 +379,22 @@ struct SyncPairEntry {
 }
 
 /// Every mode with the names it is given by: the SDK's name in camelCase first, then the "cloud"
-/// name the TypeScript CLI used.
+/// name and the short token the TypeScript CLI used.
 const SYNC_MODE_NAMES: &[(SyncMode, &[&str])] = &[
-	(SyncMode::TwoWay, &["twoWay"]),
-	(SyncMode::LocalToRemote, &["localToRemote", "localToCloud"]),
-	(SyncMode::RemoteToLocal, &["remoteToLocal", "cloudToLocal"]),
-	(SyncMode::LocalBackup, &["localBackup"]),
-	(SyncMode::RemoteBackup, &["remoteBackup", "cloudBackup"]),
+	(SyncMode::TwoWay, &["twoWay", "tw"]),
+	(
+		SyncMode::LocalToRemote,
+		&["localToRemote", "localToCloud", "ltc"],
+	),
+	(
+		SyncMode::RemoteToLocal,
+		&["remoteToLocal", "cloudToLocal", "ctl"],
+	),
+	(SyncMode::LocalBackup, &["localBackup", "lb"]),
+	(
+		SyncMode::RemoteBackup,
+		&["remoteBackup", "cloudBackup", "cb"],
+	),
 ];
 
 /// The mode `mode` names, by any of its [`SYNC_MODE_NAMES`].
@@ -607,8 +616,8 @@ mod tests {
 		assert_eq!(
 			error.to_string(),
 			"Invalid sync mode \"twoway\" in the sync pair \"/home/me/docs:twoway:/docs\": \
-			 expected one of twoWay, localToRemote, localToCloud, remoteToLocal, cloudToLocal, \
-			 localBackup, remoteBackup, cloudBackup"
+			 expected one of twoWay, tw, localToRemote, localToCloud, ltc, remoteToLocal, \
+			 cloudToLocal, ctl, localBackup, lb, remoteBackup, cloudBackup, cb"
 		);
 	}
 
@@ -658,6 +667,27 @@ mod tests {
 			error.to_string(),
 			"Invalid sync pair \"/home/me/docs\": expected <local>:<remote>, \
 			 <local>:<mode>:<remote> or the path to a sync pairs file"
+		);
+	}
+
+	/// The short tokens of the TypeScript CLI name the modes their long names do.
+	#[test]
+	fn a_short_mode_token_names_its_mode() {
+		let modes = ["tw", "ltc", "ctl", "lb", "cb"].map(|token| {
+			parse_sync_pair_definition(&format!("/l:{token}:/r"))
+				.unwrap()
+				.1
+		});
+
+		assert_eq!(
+			modes,
+			[
+				SyncMode::TwoWay,
+				SyncMode::LocalToRemote,
+				SyncMode::RemoteToLocal,
+				SyncMode::LocalBackup,
+				SyncMode::RemoteBackup,
+			]
 		);
 	}
 
