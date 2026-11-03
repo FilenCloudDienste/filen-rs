@@ -79,7 +79,7 @@ impl LazyClient {
 				let client = authenticate_and_get_password(
 					config,
 					ui,
-					email_arg.to_owned(),
+					email_arg.as_deref(),
 					password_arg.as_deref(),
 					two_factor_code_arg.as_deref(),
 					auth_config_path_arg.as_deref(),
@@ -133,21 +133,21 @@ impl LazyClient {
 pub(crate) async fn authenticate_and_get_password(
 	config: &CliConfig,
 	ui: &mut UI,
-	email_arg: Option<String>,
+	email_arg: Option<&str>,
 	password_arg: Option<&str>,
 	two_factor_code_arg: Option<&str>,
 	auth_config_path_arg: Option<&str>,
 	client_config_args: &ClientConfigArgs,
 ) -> Result<Client> {
-	if let Some(client) = authenticate_from_cli_args(
-		ui,
-		email_arg,
-		password_arg,
-		two_factor_code_arg,
-		client_config_args,
-	)
-	.await?
-	{
+	if let Some(credentials) = cli_credentials(email_arg, password_arg, two_factor_code_arg)? {
+		let client = login_and_optionally_prompt_two_factor_code(
+			ui,
+			credentials.email,
+			credentials.password,
+			credentials.two_factor_code,
+			client_config_args,
+		)
+		.await?;
 		log::info!("Authenticated from CLI arguments");
 		Ok(client)
 	} else if let Some((client, export_path)) =
@@ -175,7 +175,7 @@ pub(crate) async fn authenticate_and_get_password(
 
 async fn login_and_optionally_prompt_two_factor_code(
 	ui: &mut UI,
-	email: String,
+	email: &str,
 	password: &str,
 	two_factor_code: Option<&str>,
 	client_config_args: &ClientConfigArgs,
@@ -183,14 +183,18 @@ async fn login_and_optionally_prompt_two_factor_code(
 	let unauth_client = UnauthClient::from_config(build_client_config(client_config_args))?;
 
 	match unauth_client
-		.login(email.clone(), password, two_factor_code.unwrap_or("XXXXXX"))
+		.login(
+			email.to_owned(),
+			password,
+			two_factor_code.unwrap_or("XXXXXX"),
+		)
 		.await
 	{
 		Ok(client) => Ok(client),
 		Err(e) if e.kind() == ErrorKind::Enter2fa => {
 			let two_factor_code = ui.prompt_password("Two-factor authentication code: ")?;
 			match unauth_client
-				.login(email, password, two_factor_code.trim())
+				.login(email.to_owned(), password, two_factor_code.trim())
 				.await
 			{
 				Ok(client) => Ok(client),
@@ -207,26 +211,38 @@ async fn login_and_optionally_prompt_two_factor_code(
 	}
 }
 
-/// Authenticate using credentials provided in the CLI arguments.
-async fn authenticate_from_cli_args(
-	ui: &mut UI,
-	email_arg: Option<String>,
-	password_arg: Option<&str>,
-	two_factor_code_arg: Option<&str>,
-	client_config_args: &ClientConfigArgs,
-) -> Result<Option<Client>> {
-	if email_arg.is_none() && password_arg.is_none() && two_factor_code_arg.is_none() {
-		return Ok(None);
+/// Credentials given in the CLI arguments.
+struct CliCredentials<'a> {
+	email: &'a str,
+	password: &'a str,
+	two_factor_code: Option<&'a str>,
+}
+
+/// The credentials to log in with from the CLI arguments, if an email or a password was given.
+/// A two-factor code alone, usually a `FILEN_CLI_2FA_CODE` left in the environment, is ignored,
+/// so that it does not keep the login from going on through an auth config or the keyring.
+fn cli_credentials<'a>(
+	email_arg: Option<&'a str>,
+	password_arg: Option<&'a str>,
+	two_factor_code_arg: Option<&'a str>,
+) -> Result<Option<CliCredentials<'a>>> {
+	match (email_arg, password_arg) {
+		(Some(email), Some(password)) => Ok(Some(CliCredentials {
+			email,
+			password,
+			two_factor_code: two_factor_code_arg,
+		})),
+		(Some(_), None) => Err(UI::failure("Password is required")),
+		(None, Some(_)) => Err(UI::failure("Email is required")),
+		(None, None) => {
+			if two_factor_code_arg.is_some() {
+				log::info!(
+					"Ignoring the two-factor code, which is only used with an email and a password"
+				);
+			}
+			Ok(None)
+		}
 	}
-	let client = login_and_optionally_prompt_two_factor_code(
-		ui,
-		email_arg.context("Email is required")?,
-		password_arg.context("Password is required")?,
-		two_factor_code_arg,
-		client_config_args,
-	)
-	.await?;
-	Ok(Some(client))
 }
 
 /// Authenticate using SDK config stored in a file ("auth config") exported from the CLI.
@@ -325,7 +341,7 @@ async fn authenticate_from_prompt(
 	let password = ui.prompt_password("Password: ")?;
 	let client = login_and_optionally_prompt_two_factor_code(
 		ui,
-		email.trim().to_string(),
+		email.trim(),
 		// as typed: a password can start or end with a space, as one given with --password can
 		&password,
 		None,
@@ -442,6 +458,47 @@ pub(crate) fn logout(config: &CliConfig, ui: &mut UI) -> Result<bool> {
 mod tests {
 	use super::*;
 	use crate::error::exit_code;
+
+	#[test]
+	fn no_credentials_in_the_arguments_are_none() {
+		assert!(cli_credentials(None, None, None).unwrap().is_none());
+	}
+
+	#[test]
+	fn a_two_factor_code_alone_is_ignored() {
+		assert!(
+			cli_credentials(None, None, Some("123456"))
+				.unwrap()
+				.is_none()
+		);
+	}
+
+	#[test]
+	fn an_email_without_a_password_fails() {
+		let Err(err) = cli_credentials(Some("a@example.com"), None, None) else {
+			panic!("an email without a password must fail");
+		};
+		assert_eq!(format!("{err:#}"), "Password is required");
+		assert_eq!(exit_code(&err), 1);
+	}
+
+	#[test]
+	fn a_password_without_an_email_fails() {
+		let Err(err) = cli_credentials(None, Some("secret"), Some("123456")) else {
+			panic!("a password without an email must fail");
+		};
+		assert_eq!(format!("{err:#}"), "Email is required");
+	}
+
+	#[test]
+	fn an_email_and_a_password_are_the_credentials() {
+		let credentials = cli_credentials(Some("a@example.com"), Some("secret"), Some("123456"))
+			.unwrap()
+			.unwrap();
+		assert_eq!(credentials.email, "a@example.com");
+		assert_eq!(credentials.password, "secret");
+		assert_eq!(credentials.two_factor_code, Some("123456"));
+	}
 
 	#[test]
 	fn a_missing_auth_config_path_fails_instead_of_falling_back() {

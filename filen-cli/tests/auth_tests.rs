@@ -104,6 +104,28 @@ fn a_missing_auth_config_path_fails_without_prompting() {
 		.stderr(predicates::str::contains("Not logged in").not());
 }
 
+#[shared_test_runtime]
+async fn a_lone_two_factor_code_does_not_keep_the_auth_config_from_being_used() {
+	let (_auth_config_dir, auth_config) = test_utils::cli::prepare_cli_auth_config().await;
+	cargo_bin_cmd!()
+		.env("FILEN_CLI_TESTING_DISABLE_KEYRING", "1")
+		.env_remove("FILEN_CLI_EMAIL")
+		.env_remove("FILEN_CLI_PASSWORD")
+		.env("FILEN_CLI_2FA_CODE", "123456")
+		.args([
+			"--auth-config-path",
+			auth_config.to_str().unwrap(),
+			"-v",
+			"stat",
+			"/",
+		])
+		.assert()
+		.success()
+		.stderr(predicates::str::contains(
+			"Authenticated from auth config file",
+		));
+}
+
 // notes:
 // keyring authentication is hard to test here, so ignore it for now
 
