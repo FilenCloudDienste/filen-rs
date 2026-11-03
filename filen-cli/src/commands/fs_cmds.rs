@@ -1,4 +1,8 @@
-use std::{borrow::Cow, sync::Arc};
+use std::{
+	borrow::Cow,
+	pin::pin,
+	sync::{Arc, Mutex, MutexGuard, PoisonError},
+};
 
 use crate::{
 	CommandResult,
@@ -6,12 +10,14 @@ use crate::{
 	commands::CommandContext,
 	completion::FilenCompleter,
 	docs::DocElement,
+	error::CliError,
+	interrupt,
 	ui::{self, UI},
 	util::RemotePath,
 };
 use anyhow::{Context as _, Result};
 use clap::Subcommand;
-use console::style;
+use console::{Term, style};
 use filen_sdk_rs::{
 	ErrorKind,
 	auth::Client,
@@ -19,8 +25,9 @@ use filen_sdk_rs::{
 		HasName as _, HasParent as _, HasUUID,
 		categories::{DirType, NonRootFileType, NonRootItemType, Normal, fs::CategoryFS},
 		copy::{
-			CopiedTopLevel, CopyCallback, CopyConfig, CopyFailed, CopyReport, CopyRequest,
-			CopyUpdate, ItemSource, ItemSourceDir, JobControl, PlannedTopLevelItem, SkipReason,
+			CopiedTopLevel, CopyCallback, CopyConfig, CopyFailed, CopyPhase, CopyReport,
+			CopyRequest, CopyUpdate, ItemCounts, ItemSource, ItemSourceDir, JobControl, PlanTotals,
+			PlannedTopLevelItem, ScanProgress, SkipReason,
 		},
 		dir::meta::DirectoryMetaChanges,
 		file::{meta::FileMetaChanges, traits::HasFileInfo as _},
@@ -30,6 +37,7 @@ use filen_sdk_rs::{
 };
 use filen_types::{fs::Uuid, traits::CowHelpers as _};
 use serde_json::json;
+use tokio::select;
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum FsCommands {
@@ -1110,19 +1118,46 @@ pub(crate) async fn copy_file_or_directory(
 	let config = CopyConfig {
 		max_bytes: free_storage(client).await,
 	};
-	let result = Arc::clone(client)
-		.copy_items_to(
-			vec![CopyRequest {
-				source,
-				destination: destination.dir.into_owned_cow(),
-				name,
-			}],
-			config,
-			NoCopyProgress,
-			JobControl::default(),
-		)
-		.await;
+	let request = CopyRequest {
+		source,
+		destination: destination.dir.into_owned_cow(),
+		name,
+	};
+	let result = run_copy(ui, client, request, config).await;
 	finish_copy(ui, &source_path, &destination_dir_path, result)
+}
+
+/// Runs a copy, drawing its progress, until it ends or Ctrl-C cancels it. A cancelled copy stops
+/// what it is doing and reports what it copied, rather than being dropped with half a tree
+/// written and nothing said about it; a second Ctrl-C quits without waiting for that.
+async fn run_copy(
+	ui: &mut UI,
+	client: &Arc<Client>,
+	request: CopyRequest,
+	config: CopyConfig,
+) -> Result<CopyReport, CopyFailed> {
+	let progress = Arc::new(CopyProgress::new(ui));
+	let (control, controller) = JobControl::new();
+	let mut ctrl_c = interrupt::own();
+	let copy =
+		Arc::clone(client).copy_items_to(vec![request], config, Arc::clone(&progress), control);
+	let mut copy = pin!(copy);
+	let ended = select! {
+		result = &mut copy => Some(result),
+		() = ctrl_c.pressed() => None,
+	};
+	let result = match ended {
+		Some(result) => result,
+		None => {
+			controller.cancel();
+			// before saying anything, so that no progress line is drawn over it
+			progress.end();
+			let _stopping = ctrl_c.into_stopping(ui);
+			copy.await
+		}
+	};
+	progress.end();
+	result
 }
 
 /// Storage left on the account, for the copy to check that it fits before it writes anything.
@@ -1172,6 +1207,9 @@ fn finish_copy(
 					copied_amount(&failed.report),
 					copy_path
 				));
+			}
+			if failed.error.kind() == ErrorKind::Cancelled {
+				return Err(CliError::Interrupted.into());
 			}
 			if failed.error.kind() == ErrorKind::MaxStorageReached {
 				return Err(UI::failure(&format!(
@@ -1236,15 +1274,113 @@ fn copied_amount(report: &CopyReport) -> String {
 	)
 }
 
-/// A copy's progress, which is not shown.
-struct NoCopyProgress;
+/// Draws a copy's progress on one line of stderr, redrawn in place: first the listing of the
+/// source and the destination, then the bytes copied. The copy calls it from its own tasks, so it
+/// writes to the terminal itself instead of through [`UI`], which the command holds.
+struct CopyProgress {
+	term: Term,
+	/// Only for a person at a terminal: not with `--quiet` or `--json`, and not when stdout or
+	/// stderr is redirected, where the redraws would end up in the captured output.
+	enabled: bool,
+	line: Mutex<ProgressLine>,
+}
 
-impl CopyCallback for NoCopyProgress {
+/// Where the progress line stands.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProgressLine {
+	NotShown,
+	Shown,
+	/// The command prints its own output from now on, so the line is never drawn again.
+	Ended,
+}
+
+impl CopyProgress {
+	fn new(ui: &UI) -> Self {
+		let term = Term::stderr();
+		let enabled = ui.output_is_read_by_a_person() && !ui.is_quiet() && term.is_term();
+		Self {
+			term,
+			enabled,
+			line: Mutex::new(ProgressLine::NotShown),
+		}
+	}
+
+	fn lock_line(&self) -> MutexGuard<'_, ProgressLine> {
+		// the line state is a plain value, which a panicking holder cannot leave half-written
+		self.line.lock().unwrap_or_else(PoisonError::into_inner)
+	}
+
+	/// Erases the progress line, and draws no other one, so that a REPL prompt or the command's
+	/// own output starts on a clean row.
+	fn end(&self) {
+		let mut line = self.lock_line();
+		if *line == ProgressLine::Shown {
+			let _ = self.term.clear_line();
+			let _ = self.term.flush();
+		}
+		*line = ProgressLine::Ended;
+	}
+
+	fn draw(&self, text: &str) {
+		let mut line = self.lock_line();
+		if *line == ProgressLine::Ended {
+			return;
+		}
+		let text = ui::truncate_to_width(text, usize::from(self.term.size().1));
+		let _ = self.term.clear_line();
+		let _ = self.term.write_str(&style(text).dim().to_string());
+		let _ = self.term.flush();
+		*line = ProgressLine::Shown;
+	}
+}
+
+impl CopyCallback for CopyProgress {
 	fn on_top_level_planned(&self, _items: Vec<PlannedTopLevelItem>) {}
 
 	fn on_top_level_created(&self, _item: CopiedTopLevel) {}
 
-	fn on_update(&self, _update: CopyUpdate) {}
+	fn on_update(&self, update: CopyUpdate) {
+		if !self.enabled {
+			return;
+		}
+		if let Some(text) =
+			progress_text(update.phase, &update.scan, &update.totals, &update.counts)
+		{
+			self.draw(&text);
+		}
+	}
+}
+
+/// The progress line for a copy in `phase`, if one is shown in it.
+fn progress_text(
+	phase: CopyPhase,
+	scan: &ScanProgress,
+	totals: &PlanTotals,
+	counts: &ItemCounts,
+) -> Option<String> {
+	match phase {
+		CopyPhase::Scanning => Some(format!(
+			"Scanning... {}/{} directories listed",
+			scan.sources_done, scan.sources_total
+		)),
+		CopyPhase::CreatingDirectories | CopyPhase::CopyingFiles | CopyPhase::Finishing => {
+			Some(if totals.bytes == 0 {
+				format!("Copying {}/{} files", counts.files_done, totals.files)
+			} else {
+				let percent =
+					(u128::from(counts.bytes_done) * 100 / u128::from(totals.bytes)).min(100);
+				format!(
+					"Copying {} / {} ({}%) - {}/{} files",
+					ui::format_size(counts.bytes_done),
+					ui::format_size(totals.bytes),
+					percent,
+					counts.files_done,
+					totals.files
+				)
+			})
+		}
+		CopyPhase::Done | CopyPhase::Cancelled | CopyPhase::Failed => None,
+	}
 }
 
 /// The name among `existing` that the server treats as the same as `name`: it compares names
@@ -1522,7 +1658,7 @@ pub(crate) async fn empty_trash(ui: &mut UI, client: &mut LazyClient) -> Result<
 mod tests {
 	use super::*;
 	use crate::ui::test_support::Printed;
-	use filen_sdk_rs::fs::copy::{ItemCounts, PlanTotals, SkippedEntry};
+	use filen_sdk_rs::fs::copy::SkippedEntry;
 
 	#[test]
 	fn a_destination_ending_in_a_slash_names_a_directory() {
@@ -1743,6 +1879,118 @@ mod tests {
 			"✘ Skipped f9: cannot be decrypted"
 		);
 		assert_eq!(lines[MAX_PRINTED_COPY_PROBLEMS], "✘ ... and 2 more");
+	}
+
+	#[test]
+	fn the_progress_of_a_scan_counts_the_directories_listed() {
+		let scan = ScanProgress {
+			sources_done: 2,
+			sources_total: 5,
+			..ScanProgress::default()
+		};
+
+		assert_eq!(
+			progress_text(
+				CopyPhase::Scanning,
+				&scan,
+				&PlanTotals::default(),
+				&ItemCounts::default()
+			)
+			.unwrap(),
+			"Scanning... 2/5 directories listed"
+		);
+	}
+
+	#[test]
+	fn the_progress_of_a_copy_counts_bytes_and_files() {
+		let totals = PlanTotals {
+			dirs: 0,
+			files: 4,
+			bytes: 4 * 1024,
+		};
+		let counts = ItemCounts {
+			files_done: 1,
+			bytes_done: 1024,
+			..ItemCounts::default()
+		};
+
+		assert_eq!(
+			progress_text(
+				CopyPhase::CopyingFiles,
+				&ScanProgress::default(),
+				&totals,
+				&counts
+			)
+			.unwrap(),
+			"Copying 1 KiB / 4 KiB (25%) - 1/4 files"
+		);
+	}
+
+	#[test]
+	fn the_progress_of_a_copy_of_empty_files_counts_files() {
+		let totals = PlanTotals {
+			dirs: 1,
+			files: 3,
+			bytes: 0,
+		};
+		let counts = ItemCounts {
+			files_done: 2,
+			..ItemCounts::default()
+		};
+
+		assert_eq!(
+			progress_text(
+				CopyPhase::CopyingFiles,
+				&ScanProgress::default(),
+				&totals,
+				&counts
+			)
+			.unwrap(),
+			"Copying 2/3 files"
+		);
+	}
+
+	#[test]
+	fn the_progress_percentage_does_not_overflow_and_stops_at_100() {
+		let totals = PlanTotals {
+			dirs: 0,
+			files: 1,
+			bytes: u64::MAX - 1,
+		};
+		let counts = ItemCounts {
+			files_done: 1,
+			bytes_done: u64::MAX,
+			..ItemCounts::default()
+		};
+
+		let text = progress_text(
+			CopyPhase::Finishing,
+			&ScanProgress::default(),
+			&totals,
+			&counts,
+		)
+		.unwrap();
+		assert!(text.contains("(100%)"), "{text}");
+	}
+
+	#[test]
+	fn an_ended_copy_shows_no_progress() {
+		for phase in [CopyPhase::Done, CopyPhase::Cancelled, CopyPhase::Failed] {
+			assert_eq!(
+				progress_text(
+					phase,
+					&ScanProgress::default(),
+					&PlanTotals::default(),
+					&ItemCounts::default()
+				),
+				None
+			);
+		}
+	}
+
+	#[test]
+	fn no_progress_is_drawn_when_stdout_is_not_a_terminal() {
+		assert!(!CopyProgress::new(&Printed::default().ui()).enabled);
 	}
 
 	#[test]

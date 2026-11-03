@@ -1,3 +1,9 @@
+#[cfg(unix)]
+use std::{
+	process::{Command, Stdio},
+	time::{Duration, Instant},
+};
+
 use filen_macros::shared_test_runtime;
 use filen_sdk_rs::{
 	auth::Client,
@@ -437,5 +443,73 @@ async fn cp_refuses_to_copy_a_directory_into_itself() {
 			.await
 			.unwrap()
 			.is_none()
+	);
+}
+
+/// Unix only: the CLI is interrupted the way a user interrupts it, with SIGINT.
+#[cfg(unix)]
+#[shared_test_runtime]
+async fn cp_interrupted_by_ctrl_c_stops_and_says_what_it_copied() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = format!("/{}", resources.dir.name().unwrap());
+	test_utils::create_remote_file_structure_outline(client, resources.dir.clone(), &["src/"])
+		.await
+		.unwrap();
+	let Some(NonRootFileType::Dir(src)) = client
+		.find_item_at_path(&format!("{test_dir}/src"))
+		.await
+		.unwrap()
+	else {
+		panic!("Expected a directory");
+	};
+	// enough that the copy is still running when its directory shows up
+	let content = (0..=255u8)
+		.cycle()
+		.take(4 * 1024 * 1024)
+		.collect::<Vec<u8>>();
+	for i in 0..8 {
+		upload(client, &src, &format!("{i}.bin"), &content).await;
+	}
+
+	let (_auth_config_dir, auth_config) = test_utils::cli::prepare_cli_auth_config().await;
+	let mut cli = Command::new(env!("CARGO_BIN_EXE_filen-cli"))
+		.args([
+			"--auth-config-path",
+			auth_config.to_str().unwrap(),
+			"--skip-update",
+			"cp",
+			&format!("{test_dir}/src"),
+			&format!("{test_dir}/copy"),
+		])
+		.stdout(Stdio::piped())
+		.stderr(Stdio::piped())
+		.spawn()
+		.unwrap();
+	let deadline = Instant::now() + Duration::from_secs(120);
+	while client
+		.find_item_at_path(&format!("{test_dir}/copy"))
+		.await
+		.unwrap()
+		.is_none()
+	{
+		assert!(
+			Instant::now() < deadline && cli.try_wait().unwrap().is_none(),
+			"the copy never started"
+		);
+		tokio::time::sleep(Duration::from_millis(100)).await;
+	}
+	let interrupted = Command::new("kill")
+		.args(["-INT", &cli.id().to_string()])
+		.status()
+		.unwrap();
+	assert!(interrupted.success());
+	let output = cli.wait_with_output().unwrap();
+	let stderr = String::from_utf8_lossy(&output.stderr);
+
+	assert_eq!(output.status.code(), Some(130), "stderr:\n{stderr}");
+	assert!(
+		stderr.contains("Copied only ") && stderr.contains(&format!("to {test_dir}/copy")),
+		"stderr:\n{stderr}"
 	);
 }
