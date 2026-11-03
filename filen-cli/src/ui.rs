@@ -1,4 +1,5 @@
 use std::{
+	fmt::Display,
 	fs,
 	io::{self, IsTerminal, Write},
 	path::PathBuf,
@@ -805,10 +806,49 @@ impl UI {
 			options,
 		)
 		.prompt();
+		Self::handle_select_result(result)
+	}
+
+	/// Prompt the user to choose one of `options`, shown by their labels, with the cursor starting
+	/// on `default` (or on the first option when `default` is not one of them).
+	/// Returns None if the user cancels the prompt (Ctrl+C or Esc)
+	pub(crate) fn prompt_choice<T: Copy + PartialEq>(
+		&mut self,
+		msg: &str,
+		options: &[(&str, T)],
+		default: T,
+	) -> Result<Option<T>> {
+		let labels = options.iter().map(|(label, _)| *label).collect::<Vec<_>>();
+		info!(
+			"[PROMPT] prompt_choice with message: {} and options: {:?}",
+			msg, labels
+		);
+		self.ensure_can_prompt(msg)?;
+		let starting_cursor = options
+			.iter()
+			.position(|(_, value)| *value == default)
+			.unwrap_or(0);
+		let result = inquire::Select::new(
+			&self.redact_for_replay_testing(msg.trim().to_string()),
+			labels,
+		)
+		.with_starting_cursor(starting_cursor)
+		.raw_prompt();
+		Ok(Self::handle_select_result(result)?.map(|choice| {
+			options
+				.get(choice.index)
+				.expect(
+					"inquire answers with the index of one of the options (should be impossible)",
+				)
+				.1
+		}))
+	}
+
+	fn handle_select_result<T: Display>(result: Result<T, InquireError>) -> Result<Option<T>> {
 		match result {
 			Ok(answer) => {
 				info!("[PROMPT] answer: {}", answer);
-				Ok(Some(answer.to_string()))
+				Ok(Some(answer))
 			}
 			Err(InquireError::OperationCanceled) | Err(InquireError::OperationInterrupted) => {
 				info!("[PROMPT] canceled");
@@ -1814,6 +1854,8 @@ mod tests {
 			ui.prompt("Email:").unwrap_err(),
 			ui.prompt_password("Password: ").unwrap_err(),
 			ui.prompt_select("Expires after:", vec!["Never".to_owned()])
+				.unwrap_err(),
+			ui.prompt_choice("Expires after:", &[("Never", 0)], 0)
 				.unwrap_err(),
 		] {
 			assert!(

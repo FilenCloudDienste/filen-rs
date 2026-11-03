@@ -16,10 +16,10 @@
 # ({{ $MANUEL_EMAIL }}) /{{ $MANUEL_REMOTE_CWD }} ls                                  #
 # some_dir  asdf.txt                                                                  #
 # ({{ $MANUEL_EMAIL }}) /{{ $MANUEL_REMOTE_CWD }} public-link some_dir                #
-# Creating a new public link for the directory...                                     #
 # > Expires after: 1 day                                                              #
 # > Password (leave empty for no password): asdf                                      #
 # > Enable download? Yes                                                              #
+# Creating a new public link for the directory...                                     #
 # ✔ Public link saved.                                                                #
 # URL [omit]                                                                          #
 # ({{ $MANUEL_EMAIL }}) /{{ $MANUEL_REMOTE_CWD }} public-link some_dir                #
@@ -53,9 +53,9 @@
 # > This is an existing public link. Delete                                           #
 # ✔ Public link deleted.                                                              #
 # ({{ $MANUEL_EMAIL }}) /{{ $MANUEL_REMOTE_CWD }} public-link asdf.txt                #
-# Creating a new public link for the file...                                          #
 # > Expires after: 1 hour                                                             #
 # > Password (leave empty for no password): asdf                                      #
+# Creating a new public link for the file...                                          #
 # ✔ Public link saved.                                                                #
 # URL [omit]                                                                          #
 # ({{ $MANUEL_EMAIL }}) /{{ $MANUEL_REMOTE_CWD }} public-link asdf.txt                #
@@ -78,9 +78,9 @@
 # > This is an existing public link. Delete                                           #
 # ✔ Public link deleted.                                                              #
 # ({{ $MANUEL_EMAIL }}) /{{ $MANUEL_REMOTE_CWD }} public-link asdf.txt                #
-# Creating a new public link for the file...                                          #
 # > Expires after: Never                                                              #
 # > Password (leave empty for no password):                                           #
+# Creating a new public link for the file...                                          #
 # ✔ Public link saved.                                                                #
 # URL [omit]                                                                          #
 # ({{ $MANUEL_EMAIL }}) /{{ $MANUEL_REMOTE_CWD }} public-link asdf.txt                #
@@ -92,10 +92,10 @@
 # > This is an existing public link. Delete                                           #
 # ✔ Public link deleted.                                                              #
 # ({{ $MANUEL_EMAIL }}) /{{ $MANUEL_REMOTE_CWD }} public-link some_dir                #
-# Creating a new public link for the directory...                                     #
 # > Expires after: Never                                                              #
 # > Password (leave empty for no password):                                           #
 # > Enable download? No                                                               #
+# Creating a new public link for the directory...                                     #
 # ✔ Public link saved.                                                                #
 # URL [omit]                                                                          #
 # ({{ $MANUEL_EMAIL }}) /{{ $MANUEL_REMOTE_CWD }} public-link some_dir                #
@@ -443,7 +443,7 @@ recording_items:
 - !Output "\e[?25l\e[69D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m public-link some_dir \e[K\r\e[68C\e[?25h"
 - !Input
   - 13
-- !Output "\e[?25l\e[68D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m \e[38;5;14mpublic-link some_dir\e[39m\e[K\r\n\e[?25h\e[?25h\e[?2004lCreating a new public link for the directory...\r\n\e[?2004h\e[?25l\e[38;5;10m?\e[39m Expires after:  \r\n\e[38;5;14m>\e[39m \e[38;5;14mNever\e[39m\r\n\e[38;5;14m \e[39m 1 hour\r\n\e[38;5;14m \e[39m 6 hours\r\n\e[38;5;14m \e[39m 1 day\r\n\e[38;5;14m \e[39m 3 days\r\n\e[38;5;14m \e[39m 1 week\r\nv 2 weeks\r\n\e[38;5;14m[\e[39m\e[38;5;14m↑↓ to move, enter to select, type to filter\e[39m\e[38;5;14m]\e[39m\r\e[8A\e[17C\e[?25h"
+- !Output "\e[?25l\e[68D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m \e[38;5;14mpublic-link some_dir\e[39m\e[K\r\n\e[?25h\e[?25h\e[?2004l\e[?2004h\e[?25l\e[38;5;10m?\e[39m Expires after:  \r\n\e[38;5;14m>\e[39m \e[38;5;14mNever\e[39m\r\n\e[38;5;14m \e[39m 1 hour\r\n\e[38;5;14m \e[39m 6 hours\r\n\e[38;5;14m \e[39m 1 day\r\n\e[38;5;14m \e[39m 3 days\r\n\e[38;5;14m \e[39m 1 week\r\nv 2 weeks\r\n\e[38;5;14m[\e[39m\e[38;5;14m↑↓ to move, enter to select, type to filter\e[39m\e[38;5;14m]\e[39m\r\e[8A\e[17C\e[?25h"
 - !Input
   - 27
   - 91
@@ -482,7 +482,7 @@ recording_items:
 - !Output "\e[?25l\e[25D\e[38;5;10m?\e[39m Enable download? (y/N) y \e[K\r\e[26C\e[?25h"
 - !Input
   - 13
-- !Output "\e[?25l\e[26D\e[38;5;10m>\e[39m Enable download? \e[38;5;14mYes\e[39m\e[K\r\n\e[?25h\e[?25h\e[?2004l\e[32m✔\e[0m Public link saved.\r\n\e[2mURL\e[0m [omit]\r\n\e[?2004h\e[?25l\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m  \r\e[48C\e[?25h"
+- !Output "\e[?25l\e[26D\e[38;5;10m>\e[39m Enable download? \e[38;5;14mYes\e[39m\e[K\r\n\e[?25h\e[?25h\e[?2004lCreating a new public link for the directory...\r\n\e[32m✔\e[0m Public link saved.\r\n\e[2mURL\e[0m [omit]\r\n\e[?2004h\e[?25l\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m  \r\e[48C\e[?25h"
 - !Input
   - 27
   - 91
@@ -564,7 +564,7 @@ recording_items:
 - !Output "\e[?25l\e[61D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m public-link asdf.txt \e[K\r\e[68C\e[?25h"
 - !Input
   - 13
-- !Output "\e[?25l\e[68D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m \e[38;5;14mpublic-link asdf.txt\e[39m\e[K\r\n\e[?25h\e[?25h\e[?2004lCreating a new public link for the file...\r\n\e[?2004h\e[?25l\e[38;5;10m?\e[39m Expires after:  \r\n\e[38;5;14m>\e[39m \e[38;5;14mNever\e[39m\r\n\e[38;5;14m \e[39m 1 hour\r\n\e[38;5;14m \e[39m 6 hours\r\n\e[38;5;14m \e[39m 1 day\r\n\e[38;5;14m \e[39m 3 days\r\n\e[38;5;14m \e[39m 1 week\r\nv 2 weeks\r\n\e[38;5;14m[\e[39m\e[38;5;14m↑↓ to move, enter to select, type to filter\e[39m\e[38;5;14m]\e[39m\r\e[8A\e[17C\e[?25h"
+- !Output "\e[?25l\e[68D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m \e[38;5;14mpublic-link asdf.txt\e[39m\e[K\r\n\e[?25h\e[?25h\e[?2004l\e[?2004h\e[?25l\e[38;5;10m?\e[39m Expires after:  \r\n\e[38;5;14m>\e[39m \e[38;5;14mNever\e[39m\r\n\e[38;5;14m \e[39m 1 hour\r\n\e[38;5;14m \e[39m 6 hours\r\n\e[38;5;14m \e[39m 1 day\r\n\e[38;5;14m \e[39m 3 days\r\n\e[38;5;14m \e[39m 1 week\r\nv 2 weeks\r\n\e[38;5;14m[\e[39m\e[38;5;14m↑↓ to move, enter to select, type to filter\e[39m\e[38;5;14m]\e[39m\r\e[8A\e[17C\e[?25h"
 - !Input
   - 27
   - 91
@@ -587,7 +587,7 @@ recording_items:
 - !Output "\e[?25l\e[45D\e[38;5;10m?\e[39m Password (leave empty for no password): asdf \e[K\r\e[46C\e[?25h"
 - !Input
   - 13
-- !Output "\e[?25l\e[46D\e[38;5;10m>\e[39m Password (leave empty for no password): \e[38;5;14masdf\e[39m\e[K\r\n\e[?25h\e[?25h\e[?2004l\e[32m✔\e[0m Public link saved.\r\n\e[2mURL\e[0m [omit]\r\n\e[?2004h\e[?25l\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m  \r\e[48C\e[?25h"
+- !Output "\e[?25l\e[46D\e[38;5;10m>\e[39m Password (leave empty for no password): \e[38;5;14masdf\e[39m\e[K\r\n\e[?25h\e[?25h\e[?2004lCreating a new public link for the file...\r\n\e[32m✔\e[0m Public link saved.\r\n\e[2mURL\e[0m [omit]\r\n\e[?2004h\e[?25l\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m  \r\e[48C\e[?25h"
 - !Input
   - 27
   - 91
@@ -650,13 +650,13 @@ recording_items:
 - !Output "\e[?25l\e[48D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m public-link asdf.txt \e[K\r\e[68C\e[?25h"
 - !Input
   - 13
-- !Output "\e[?25l\e[68D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m \e[38;5;14mpublic-link asdf.txt\e[39m\e[K\r\n\e[?25h\e[?25h\e[?2004lCreating a new public link for the file...\r\n\e[?2004h\e[?25l\e[38;5;10m?\e[39m Expires after:  \r\n\e[38;5;14m>\e[39m \e[38;5;14mNever\e[39m\r\n\e[38;5;14m \e[39m 1 hour\r\n\e[38;5;14m \e[39m 6 hours\r\n\e[38;5;14m \e[39m 1 day\r\n\e[38;5;14m \e[39m 3 days\r\n\e[38;5;14m \e[39m 1 week\r\nv 2 weeks\r\n\e[38;5;14m[\e[39m\e[38;5;14m↑↓ to move, enter to select, type to filter\e[39m\e[38;5;14m]\e[39m\r\e[8A\e[17C\e[?25h"
+- !Output "\e[?25l\e[68D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m \e[38;5;14mpublic-link asdf.txt\e[39m\e[K\r\n\e[?25h\e[?25h\e[?2004l\e[?2004h\e[?25l\e[38;5;10m?\e[39m Expires after:  \r\n\e[38;5;14m>\e[39m \e[38;5;14mNever\e[39m\r\n\e[38;5;14m \e[39m 1 hour\r\n\e[38;5;14m \e[39m 6 hours\r\n\e[38;5;14m \e[39m 1 day\r\n\e[38;5;14m \e[39m 3 days\r\n\e[38;5;14m \e[39m 1 week\r\nv 2 weeks\r\n\e[38;5;14m[\e[39m\e[38;5;14m↑↓ to move, enter to select, type to filter\e[39m\e[38;5;14m]\e[39m\r\e[8A\e[17C\e[?25h"
 - !Input
   - 13
 - !Output "\e[?25l\e[17D\e[38;5;10m>\e[39m Expires after: \e[38;5;14mNever\e[39m\e[K\r\n\e[2K\r\n\e[2K\r\n\e[2K\r\n\e[2K\r\n\e[2K\r\n\e[2K\r\n\e[2K\r\n\e[2K\r\n\e[?25h\e[8A\e[?25h\e[?2004l\e[?2004h\e[?25l\e[38;5;10m?\e[39m Password (leave empty for no password):  \r\e[42C\e[?25h"
 - !Input
   - 13
-- !Output "\e[?25l\e[42D\e[38;5;10m>\e[39m Password (leave empty for no password): \e[K\r\n\e[?25h\e[?25h\e[?2004l\e[32m✔\e[0m Public link saved.\r\n\e[2mURL\e[0m [omit]\r\n\e[?2004h\e[?25l\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m  \r\e[48C\e[?25h"
+- !Output "\e[?25l\e[42D\e[38;5;10m>\e[39m Password (leave empty for no password): \e[K\r\n\e[?25h\e[?25h\e[?2004lCreating a new public link for the file...\r\n\e[32m✔\e[0m Public link saved.\r\n\e[2mURL\e[0m [omit]\r\n\e[?2004h\e[?25l\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m  \r\e[48C\e[?25h"
 - !Input
   - 27
   - 91
@@ -685,7 +685,7 @@ recording_items:
 - !Output "\e[?25l\e[68D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m public-link some_dir \e[K\r\e[68C\e[?25h"
 - !Input
   - 13
-- !Output "\e[?25l\e[68D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m \e[38;5;14mpublic-link some_dir\e[39m\e[K\r\n\e[?25h\e[?25h\e[?2004lCreating a new public link for the directory...\r\n\e[?2004h\e[?25l\e[38;5;10m?\e[39m Expires after:  \r\n\e[38;5;14m>\e[39m \e[38;5;14mNever\e[39m\r\n\e[38;5;14m \e[39m 1 hour\r\n\e[38;5;14m \e[39m 6 hours\r\n\e[38;5;14m \e[39m 1 day\r\n\e[38;5;14m \e[39m 3 days\r\n\e[38;5;14m \e[39m 1 week\r\nv 2 weeks\r\n\e[38;5;14m[\e[39m\e[38;5;14m↑↓ to move, enter to select, type to filter\e[39m\e[38;5;14m]\e[39m\r\e[8A\e[17C\e[?25h"
+- !Output "\e[?25l\e[68D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m \e[38;5;14mpublic-link some_dir\e[39m\e[K\r\n\e[?25h\e[?25h\e[?2004l\e[?2004h\e[?25l\e[38;5;10m?\e[39m Expires after:  \r\n\e[38;5;14m>\e[39m \e[38;5;14mNever\e[39m\r\n\e[38;5;14m \e[39m 1 hour\r\n\e[38;5;14m \e[39m 6 hours\r\n\e[38;5;14m \e[39m 1 day\r\n\e[38;5;14m \e[39m 3 days\r\n\e[38;5;14m \e[39m 1 week\r\nv 2 weeks\r\n\e[38;5;14m[\e[39m\e[38;5;14m↑↓ to move, enter to select, type to filter\e[39m\e[38;5;14m]\e[39m\r\e[8A\e[17C\e[?25h"
 - !Input
   - 13
 - !Output "\e[?25l\e[17D\e[38;5;10m>\e[39m Expires after: \e[38;5;14mNever\e[39m\e[K\r\n\e[2K\r\n\e[2K\r\n\e[2K\r\n\e[2K\r\n\e[2K\r\n\e[2K\r\n\e[2K\r\n\e[2K\r\n\e[?25h\e[8A\e[?25h\e[?2004l\e[?2004h\e[?25l\e[38;5;10m?\e[39m Password (leave empty for no password):  \r\e[42C\e[?25h"
@@ -694,7 +694,7 @@ recording_items:
 - !Output "\e[?25l\e[42D\e[38;5;10m>\e[39m Password (leave empty for no password): \e[K\r\n\e[?25h\e[?25h\e[?2004l\e[?2004h\e[?25l\e[38;5;10m?\e[39m Enable download? (y/N)  \r\e[25C\e[?25h"
 - !Input
   - 13
-- !Output "\e[?25l\e[25D\e[38;5;10m>\e[39m Enable download? \e[38;5;14mNo\e[39m\e[K\r\n\e[?25h\e[?25h\e[?2004l\e[32m✔\e[0m Public link saved.\r\n\e[2mURL\e[0m [omit]\r\n\e[?2004h\e[?25l\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m  \r\e[48C\e[?25h"
+- !Output "\e[?25l\e[25D\e[38;5;10m>\e[39m Enable download? \e[38;5;14mNo\e[39m\e[K\r\n\e[?25h\e[?25h\e[?2004lCreating a new public link for the directory...\r\n\e[32m✔\e[0m Public link saved.\r\n\e[2mURL\e[0m [omit]\r\n\e[?2004h\e[?25l\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m  \r\e[48C\e[?25h"
 - !Input
   - 27
   - 91
