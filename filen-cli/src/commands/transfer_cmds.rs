@@ -1390,7 +1390,7 @@ fn download_target(destination: &Path, name: &str) -> Option<PathBuf> {
 /// Await `transfer` until it completes or the user hits Ctrl+C, erasing the progress line either
 /// way. Cancelling drops the transfer future, which is how the SDK aborts the workers it spawned,
 /// and reports on stderr what had been transferred by then.
-async fn run_cancellable<T>(
+pub(crate) async fn run_cancellable<T>(
 	ui: &mut UI,
 	progress: &TransferProgress,
 	transfer: impl Future<Output = Result<T>>,
@@ -1431,7 +1431,7 @@ fn canceled_message(kind: TransferKind, files: u64, bytes: u64) -> String {
 /// the progress callbacks followed by the success message or a summary of what did transfer.
 /// Directory transfers return `Ok` even when individual items failed, so without this the command
 /// would claim success while items were missing.
-fn finish(
+pub(crate) fn finish(
 	ui: &mut UI,
 	progress: &TransferProgress,
 	subject: &str,
@@ -1592,7 +1592,7 @@ async fn upload_directory(
 }
 
 /// Download `source` to `target`, unless `options` keep a local file already there.
-async fn download_file<C>(
+pub(crate) async fn download_file<C>(
 	client: &C,
 	progress: &TransferProgress,
 	source: &dyn File,
@@ -1635,7 +1635,7 @@ where
 }
 
 /// Download the directory `source`, of the category `Cat` listed with `context`, to `target`.
-async fn download_directory<Cat>(
+pub(crate) async fn download_directory<Cat>(
 	client: Arc<Cat::Client>,
 	progress: &TransferProgress,
 	source: DirType<'static, Cat>,

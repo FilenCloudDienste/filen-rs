@@ -16,21 +16,32 @@
 //! someone shared with you from what is shared with you (after asking to confirm, which `--yes`
 //! answers); only they can share it again.
 //!
-//! With `--json`, the listings are printed as arrays. Downloading from what is shared with you is
-//! not possible with the CLI yet.
+//! `download-shared <path> [destination]` downloads a file or directory (recursively) from what
+//! is shared with you into a local directory, keeping its name, as `download` does for your own
+//! drive. The path is one `shared-with-me` takes, and so is `--from`. An item whose name is not a
+//! plain file name (one holding a `/`, or `..`) is not downloaded, and inside a directory it is
+//! skipped with what is below it.
+//!
+//! With `--json`, the listings are printed as arrays.
 
-use std::borrow::Cow;
+use std::{
+	borrow::Cow,
+	path::{Path, PathBuf},
+	sync::Arc,
+};
 
 use anyhow::{Context as _, Result};
 use clap::Subcommand;
+use clap_complete::engine::{ArgValueCompleter, PathCompleter};
 use filen_sdk_rs::{
 	auth::Client,
 	connect::fs::{SharedDirectory, SharedRootFile, SharingRole},
 	fs::{
 		HasName as _, HasUUID as _,
 		categories::{DirType, NonRootFileType, NonRootItemType, Normal, RootItemType, Shared},
+		file::traits::File,
 	},
-	io::{AnonymousRemoteFile, HasFileInfo as _},
+	io::{AnonymousRemoteFile, DirDownloadOptions, HasFileInfo as _, is_safe_descendant},
 };
 use filen_types::fs::Uuid;
 use futures::{StreamExt as _, stream};
@@ -39,7 +50,15 @@ use serde_json::json;
 use crate::{
 	CommandResult,
 	auth::LazyClient,
-	commands::{CommandContext, contacts_cmds::find_entry, public_links_cmds::resolve_item_path},
+	commands::{
+		CommandContext,
+		contacts_cmds::find_entry,
+		public_links_cmds::resolve_item_path,
+		transfer_cmds::{
+			TransferKind, TransferProgress, download_directory, download_file, finish,
+			run_cancellable,
+		},
+	},
 	completion::FilenCompleter,
 	docs::DocElement,
 	ui::{self, UI},
@@ -87,6 +106,18 @@ pub(crate) enum SharesCommands {
 		#[arg(long, value_name = "EMAIL")]
 		from: Option<String>,
 	},
+	/// Download a file or directory (recursively) from what others shared with you into a local
+	/// directory
+	DownloadShared {
+		/// A path in what is shared with you, starting with a shared item's name
+		source: String,
+		/// Local destination directory (default: the current local directory)
+		#[arg(add = ArgValueCompleter::new(PathCompleter::dir()))]
+		destination: Option<String>,
+		/// Pick the shared item shared by this account, when several have the path's first name
+		#[arg(long, value_name = "EMAIL")]
+		from: Option<String>,
+	},
 }
 
 /// The share commands' docs, placed in the "Sharing" section.
@@ -97,6 +128,7 @@ pub(crate) const DOCS: &[DocElement] = &[
 	DocElement::CommandHelp("unshare"),
 	DocElement::CommandHelp("shared-with-me"),
 	DocElement::CommandHelp("leave-share"),
+	DocElement::CommandHelp("download-shared"),
 ];
 
 impl SharesCommands {
@@ -122,6 +154,14 @@ impl SharesCommands {
 			}
 			Self::LeaveShare { name, from } => {
 				leave_share(ui, client, &name, from.as_deref()).await?;
+			}
+			Self::DownloadShared {
+				source,
+				destination,
+				from,
+			} => {
+				download_shared(ui, client, &source, destination.as_deref(), from.as_deref())
+					.await?;
 			}
 		}
 		Ok(CommandResult::default())
@@ -501,6 +541,9 @@ fn entry_json(
 /// What a shared-with-me path leads to.
 enum SharedTarget {
 	Dir(DirType<'static, Shared>),
+	/// A file that is itself a shared item.
+	RootFile(SharedRootFile),
+	/// A file inside a shared directory.
 	File(AnonymousRemoteFile),
 }
 
@@ -541,24 +584,19 @@ async fn descend(
 	Ok(SharedTarget::Dir(dir))
 }
 
-async fn print_shared_with_me(
-	ui: &mut UI,
-	client: &mut LazyClient,
-	path: Option<&str>,
+/// Finds what the path `first/rest..` leads to in what is shared with this account, and the role
+/// it is shared under.
+async fn resolve_shared(
+	client: &Client,
+	shares: InShares,
+	first: &str,
+	rest: &[&str],
 	from: Option<&str>,
-) -> Result<()> {
-	let segments = path.map(shared_path_segments).unwrap_or_default();
-	let client = client.get(ui).await?;
-	let shares = InShares::list(client).await?;
-	let Some((first, rest)) = segments.split_first() else {
-		return print_in_share_roots(ui, &shares);
-	};
+) -> Result<(SharedTarget, SharingRole)> {
 	let root = shares.find(first, from)?;
 	let role = sharer_of(&root).clone();
 	let target = match root {
-		RootItemType::File(file) if rest.is_empty() => {
-			return print_shared_root_file(ui, &file);
-		}
+		RootItemType::File(file) if rest.is_empty() => SharedTarget::RootFile(file.into_owned()),
 		RootItemType::File(_) => {
 			return Err(UI::failure(&format!("{first} is a file, not a directory")));
 		}
@@ -572,7 +610,24 @@ async fn print_shared_with_me(
 			.await?
 		}
 	};
+	Ok((target, role))
+}
+
+async fn print_shared_with_me(
+	ui: &mut UI,
+	client: &mut LazyClient,
+	path: Option<&str>,
+	from: Option<&str>,
+) -> Result<()> {
+	let segments = path.map(shared_path_segments).unwrap_or_default();
+	let client = client.get(ui).await?;
+	let shares = InShares::list(client).await?;
+	let Some((first, rest)) = segments.split_first() else {
+		return print_in_share_roots(ui, &shares);
+	};
+	let (target, role) = resolve_shared(client, shares, first, rest, from).await?;
 	match target {
+		SharedTarget::RootFile(file) => print_shared_root_file(ui, &file),
 		SharedTarget::File(file) => print_shared_file(ui, &file, role.email()),
 		SharedTarget::Dir(dir) => {
 			let (dirs, files) = client
@@ -679,6 +734,124 @@ fn print_shared_root_file(ui: &mut UI, file: &SharedRootFile) -> Result<()> {
 
 fn print_shared_file(ui: &mut UI, file: &AnonymousRemoteFile, sharer: &str) -> Result<()> {
 	print_file_table(ui, file.uuid(), file.name(), file.size(), sharer)
+}
+
+// download from a share
+
+/// The local path a shared item named `name` is downloaded to inside `destination`. A name that is
+/// not one plain path component would land outside it, so it is refused, not cleaned up.
+fn download_target(destination: &Path, name: Option<&str>, source: &str) -> Result<PathBuf> {
+	match name {
+		Some(name) if is_safe_descendant(name) => Ok(destination.join(name)),
+		Some(name) => Err(UI::failure(&format!(
+			"Cannot download {source}: its name {name:?} is not a plain file name"
+		))),
+		None => Err(UI::failure(&format!(
+			"Cannot download {source}: its name could not be decrypted"
+		))),
+	}
+}
+
+fn shared_dir_name<'a>(dir: &'a DirType<'_, Shared>) -> Option<&'a str> {
+	match dir {
+		DirType::Root(root) => root.name(),
+		DirType::Dir(dir) => dir.name(),
+	}
+}
+
+/// The path `download-shared` downloads, split into the shared item's name and the names below it.
+fn split_download_source(source: &str) -> Result<(&str, Vec<&str>)> {
+	let mut segments = shared_path_segments(source).into_iter();
+	let first = segments.next().ok_or_else(|| {
+		UI::usage_failure(
+			"download-shared takes a path in what is shared with you, starting with a shared \
+			 item's name, as shared-with-me lists it",
+		)
+	})?;
+	Ok((first, segments.collect()))
+}
+
+async fn download_shared(
+	ui: &mut UI,
+	client: &mut LazyClient,
+	source: &str,
+	destination: Option<&str>,
+	from: Option<&str>,
+) -> Result<()> {
+	let (first, rest) = split_download_source(source)?;
+	let destination = destination.unwrap_or(".");
+	let destination = std::fs::canonicalize(destination)
+		.map_err(|_| UI::failure(&format!("No such local directory: {destination}")))?;
+	if !destination.is_dir() {
+		return Err(UI::failure(&format!(
+			"Not a directory: {}",
+			destination.display()
+		)));
+	}
+	// the path as it is shown, without the empty segments a leading or doubled `/` leaves
+	let source = [first]
+		.iter()
+		.chain(&rest)
+		.copied()
+		.collect::<Vec<_>>()
+		.join("/");
+	let client = client.get(ui).await?;
+	let shares = InShares::list(client).await?;
+	let (target, role) = resolve_shared(client, shares, first, &rest, from).await?;
+	let progress = TransferProgress::new(TransferKind::Download, ui);
+	let options = DirDownloadOptions::default();
+	let target = match target {
+		SharedTarget::RootFile(file) => {
+			download_shared_file(ui, client, &progress, &file, &destination, &source).await?
+		}
+		SharedTarget::File(file) => {
+			download_shared_file(ui, client, &progress, &file, &destination, &source).await?
+		}
+		SharedTarget::Dir(dir) => {
+			let path = download_target(&destination, shared_dir_name(&dir), &source)?;
+			run_cancellable(
+				ui,
+				&progress,
+				download_directory::<Shared>(
+					Arc::clone(client),
+					&progress,
+					dir,
+					&path,
+					&role,
+					options,
+				),
+			)
+			.await??;
+			path
+		}
+	};
+	let target = target.display().to_string();
+	finish(ui, &progress, &format!("{source} to {target}"), &target)
+}
+
+/// Downloads the shared `file` into `destination` under its own name, returning its local path.
+async fn download_shared_file(
+	ui: &mut UI,
+	client: &Client,
+	progress: &TransferProgress,
+	file: &dyn File,
+	destination: &Path,
+	source: &str,
+) -> Result<PathBuf> {
+	let path = download_target(destination, file.name(), source)?;
+	run_cancellable(
+		ui,
+		progress,
+		download_file(
+			client,
+			progress,
+			file,
+			&path,
+			&DirDownloadOptions::default(),
+		),
+	)
+	.await??;
+	Ok(path)
 }
 
 // leave a share
@@ -892,6 +1065,50 @@ mod tests {
 		check_leave_share(&ui, "/").unwrap_err();
 	}
 
+	#[test]
+	fn a_download_lands_inside_the_destination_under_the_item_name() {
+		let destination = Path::new("/tmp/downloads");
+		assert_eq!(
+			download_target(destination, Some("a.txt"), "Photos/a.txt").unwrap(),
+			Path::new("/tmp/downloads/a.txt")
+		);
+		assert_eq!(
+			download_target(destination, Some("..x"), "Photos/..x").unwrap(),
+			Path::new("/tmp/downloads/..x")
+		);
+	}
+
+	#[test]
+	fn a_download_refuses_a_name_that_is_not_one_plain_component() {
+		let destination = Path::new("/tmp/downloads");
+		for name in ["..", ".", "", "a/b", "/etc/passwd", "../a.txt"] {
+			let err = download_target(destination, Some(name), "Photos").unwrap_err();
+			assert_eq!(exit_code(&err), 1, "{name:?}");
+			assert_eq!(
+				err.to_string(),
+				format!("Cannot download Photos: its name {name:?} is not a plain file name")
+			);
+		}
+		let err = download_target(destination, None, "Photos").unwrap_err();
+		assert_eq!(
+			err.to_string(),
+			"Cannot download Photos: its name could not be decrypted"
+		);
+	}
+
+	#[test]
+	fn download_shared_needs_a_shared_item_name() {
+		assert_eq!(
+			split_download_source("/Photos//2024/a.txt").unwrap(),
+			("Photos", vec!["2024", "a.txt"])
+		);
+		assert_eq!(split_download_source("Photos").unwrap(), ("Photos", vec![]));
+		for source in ["", "/", "//"] {
+			let err = split_download_source(source).unwrap_err();
+			assert_eq!(exit_code(&err), 2, "{source:?}");
+		}
+	}
+
 	fn parsed(args: &[&str]) -> Result<SharesCommands, clap::error::ErrorKind> {
 		let command = std::iter::once("filen").chain(args.iter().copied());
 		match parse_args(command).map_err(|e| e.kind())?.args.command {
@@ -937,6 +1154,19 @@ mod tests {
 			parsed(&["shared-with-me", "Photos/2024", "--from", BOB]),
 			Ok(SharesCommands::SharedWithMe { path: Some(path), from: Some(from) })
 				if path == "Photos/2024" && from == BOB
+		));
+		assert!(matches!(
+			parsed(&["download-shared", "Photos/a.txt"]),
+			Ok(SharesCommands::DownloadShared { source, destination: None, from: None })
+				if source == "Photos/a.txt"
+		));
+		assert!(matches!(
+			parsed(&["download-shared", "Photos", "out", "--from", BOB]),
+			Ok(SharesCommands::DownloadShared {
+				source,
+				destination: Some(destination),
+				from: Some(from),
+			}) if source == "Photos" && destination == "out" && from == BOB
 		));
 		assert!(matches!(
 			parsed(&["leave-share", "Photos", "--yes"]),

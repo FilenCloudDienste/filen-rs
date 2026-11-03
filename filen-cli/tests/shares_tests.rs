@@ -256,6 +256,62 @@ async fn share_list_and_unshare_a_file_and_a_directory() {
 			)
 			.code(1);
 
+			// the share account downloads the directory, a file in it and a shared file
+			let downloads = assert_fs::TempDir::new().unwrap();
+			let destination = downloads.to_str().unwrap();
+			let from = client.email();
+			let downloaded = share_account_cli(
+				&share_client,
+				&["download-shared", &dir_name, destination, "--from", from],
+			)
+			.success();
+			assert!(
+				stdout_of(&downloaded).contains(&format!("Downloaded {dir_name} to")),
+				"{}",
+				stdout_of(&downloaded)
+			);
+			assert_eq!(
+				std::fs::read_to_string(downloads.path().join(&dir_name).join("inner.txt"))
+					.unwrap(),
+				"shared"
+			);
+			let single = assert_fs::TempDir::new().unwrap();
+			share_account_cli(
+				&share_client,
+				&[
+					"download-shared",
+					&inner_shared_path,
+					single.to_str().unwrap(),
+					"--from",
+					from,
+				],
+			)
+			.success();
+			assert_eq!(
+				std::fs::read_to_string(single.path().join("inner.txt")).unwrap(),
+				"shared"
+			);
+			share_account_cli(
+				&share_client,
+				&["download-shared", &file_name, destination, "--from", from],
+			)
+			.success();
+			assert_eq!(
+				std::fs::read_to_string(downloads.path().join(&file_name)).unwrap(),
+				"shared"
+			);
+			share_account_cli(
+				&share_client,
+				&[
+					"download-shared",
+					&missing_shared_path,
+					destination,
+					"--from",
+					from,
+				],
+			)
+			.code(1);
+
 			// unsharing with the receiver named, then with everyone
 			authenticated_cli_with_args!("unshare", &file_path, &share_email)
 				.success()
