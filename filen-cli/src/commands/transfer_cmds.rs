@@ -12,11 +12,15 @@
 //! into the destination.
 //!
 //! When a single item inside a directory transfer fails, the rest of the transfer still completes
-//! and the failures are listed at the end. Press Ctrl+C to cancel a running transfer.
+//! and the failures are listed at the end. With `--json`, the result is printed as one object
+//! instead: `{"destination": ..., "files": ..., "bytes": ..., "failed": [{"path": ..., "error":
+//! ...}]}`, where `path` is `null` for a failure not about a single item. Press Ctrl+C to cancel a
+//! running transfer.
 
 use std::{
 	borrow::Cow,
 	collections::{HashMap, VecDeque},
+	fmt,
 	path::{Path, PathBuf},
 	pin::pin,
 	sync::{Arc, Mutex},
@@ -43,6 +47,7 @@ use filen_sdk_rs::{
 	util::MaybeSendCallback,
 };
 use filen_types::fs::{ParentUuid, Uuid};
+use serde_json::json;
 use tokio::select;
 
 use crate::{
@@ -180,10 +185,12 @@ pub(crate) async fn upload(
 	};
 	transferred.context("Failed to upload")?;
 
+	let destination = target_path.to_string();
 	finish(
 		ui,
 		&progress,
-		&format!("{} to {}", source.display(), target_path),
+		&format!("{} to {}", source.display(), destination),
+		&destination,
 	)
 }
 
@@ -394,10 +401,12 @@ pub(crate) async fn download(
 	};
 	transferred.context("Failed to download")?;
 
+	let destination = target.display().to_string();
 	finish(
 		ui,
 		&progress,
-		&format!("{} to {}", source_path, target.display()),
+		&format!("{} to {}", source_path, destination),
+		&destination,
 	)
 }
 
@@ -511,37 +520,65 @@ fn canceled_message(kind: TransferKind, files: u64, bytes: u64) -> String {
 	)
 }
 
-/// Print the per-item failures the SDK reported through the progress callbacks, then either the
-/// success message or a summary of what did transfer. Directory transfers return `Ok` even when
-/// individual items failed, so without this the command would claim success while items were
-/// missing.
-fn finish(ui: &mut UI, progress: &TransferProgress, subject: &str) -> Result<()> {
+/// Report the transfer's result: in JSON, or as the per-item failures the SDK reported through
+/// the progress callbacks followed by the success message or a summary of what did transfer.
+/// Directory transfers return `Ok` even when individual items failed, so without this the command
+/// would claim success while items were missing.
+fn finish(
+	ui: &mut UI,
+	progress: &TransferProgress,
+	subject: &str,
+	destination: &str,
+) -> Result<()> {
 	let kind = progress.kind;
 	let (files, bytes) = progress.done();
-	let errors = progress.take_errors();
-	for error in errors.iter().take(MAX_PRINTED_ERRORS) {
-		ui.print_failure(error);
-	}
-	if errors.len() > MAX_PRINTED_ERRORS {
-		ui.print_failure(&format!(
-			"... and {} more",
-			errors.len() - MAX_PRINTED_ERRORS
-		));
-	}
-	let summary = transfer_summary(files, bytes, progress.started.elapsed());
-	if errors.is_empty() {
-		ui.print_success(&format!("{} {}: {}", kind.past(), subject, summary));
-		Ok(())
+	let failures = progress.take_failures();
+	if ui.json {
+		ui.print_json(result_json(destination, files, bytes, &failures))?;
 	} else {
-		if !ui.is_quiet() {
+		for failure in failures.iter().take(MAX_PRINTED_ERRORS) {
+			ui.print_failure(&failure.to_string());
+		}
+		if failures.len() > MAX_PRINTED_ERRORS {
+			ui.print_failure(&format!(
+				"... and {} more",
+				failures.len() - MAX_PRINTED_ERRORS
+			));
+		}
+		let summary = transfer_summary(files, bytes, progress.started.elapsed());
+		if failures.is_empty() {
+			ui.print_success(&format!("{} {}: {}", kind.past(), subject, summary));
+		} else if !ui.is_quiet() {
 			ui.print_muted(&format!("{} {}", kind.past(), summary));
 		}
+	}
+	if failures.is_empty() {
+		Ok(())
+	} else {
 		Err(UI::failure(&format!(
 			"{} item(s) failed to {}",
-			errors.len(),
+			failures.len(),
 			kind.action()
 		)))
 	}
+}
+
+/// The `--json` result of a transfer to `destination`.
+fn result_json(
+	destination: &str,
+	files: u64,
+	bytes: u64,
+	failures: &[TransferFailure],
+) -> serde_json::Value {
+	json!({
+		"destination": destination,
+		"files": files,
+		"bytes": bytes,
+		"failed": failures
+			.iter()
+			.map(|failure| json!({ "path": failure.path, "error": failure.error }))
+			.collect::<Vec<_>>(),
+	})
 }
 
 async fn upload_file(
@@ -681,6 +718,23 @@ impl TransferKind {
 		match self {
 			Self::Upload => "upload",
 			Self::Download => "download",
+		}
+	}
+}
+
+/// An item of a transfer that failed.
+#[derive(Debug, PartialEq, Eq)]
+struct TransferFailure {
+	/// The item's path, unless the failure is not about a single item (such as a failed listing).
+	path: Option<String>,
+	error: String,
+}
+
+impl fmt::Display for TransferFailure {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		match &self.path {
+			Some(path) => write!(f, "{}: {}", path, self.error),
+			None => f.write_str(&self.error),
 		}
 	}
 }
@@ -884,7 +938,7 @@ pub(crate) struct TransferProgress {
 	list_files: bool,
 	started: Instant,
 	state: Mutex<ProgressState>,
-	errors: Mutex<Vec<String>>,
+	failures: Mutex<Vec<TransferFailure>>,
 }
 
 impl TransferProgress {
@@ -898,7 +952,7 @@ impl TransferProgress {
 			list_files: ui.is_verbose() && !ui.json,
 			started: Instant::now(),
 			state: Mutex::new(ProgressState::default()),
-			errors: Mutex::new(Vec::new()),
+			failures: Mutex::new(Vec::new()),
 		}
 	}
 
@@ -984,12 +1038,12 @@ impl TransferProgress {
 		(state.done_files, state.done_bytes)
 	}
 
-	fn push_errors(&self, errors: impl IntoIterator<Item = String>) {
-		self.errors.lock().unwrap().extend(errors);
+	fn push_failures(&self, failures: impl IntoIterator<Item = TransferFailure>) {
+		self.failures.lock().unwrap().extend(failures);
 	}
 
-	fn take_errors(&self) -> Vec<String> {
-		std::mem::take(&mut self.errors.lock().unwrap())
+	fn take_failures(&self) -> Vec<TransferFailure> {
+		std::mem::take(&mut self.failures.lock().unwrap())
 	}
 
 	/// Print `lines` above the progress line, erasing it first so that neither tears the other.
@@ -1041,13 +1095,21 @@ impl TransferProgress {
 	}
 }
 
+/// A failure the SDK reports without the item it is about.
+fn scan_failures(errors: Vec<Error>) -> impl Iterator<Item = TransferFailure> {
+	errors.into_iter().map(|e| TransferFailure {
+		path: None,
+		error: e.to_string(),
+	})
+}
+
 impl DirUploadCallback for TransferProgress {
 	fn on_scan_progress(&self, _known_dirs: u64, known_files: u64, known_bytes: u64) {
 		self.report_scan(known_files, known_bytes);
 	}
 
 	fn on_scan_errors(&self, errors: Vec<Error>) {
-		self.push_errors(errors.iter().map(|e| e.to_string()));
+		self.push_failures(scan_failures(errors));
 	}
 
 	fn on_scan_complete(&self, _total_dirs: u64, total_files: u64, total_bytes: u64) {
@@ -1077,11 +1139,10 @@ impl DirUploadCallback for TransferProgress {
 	}
 
 	fn on_upload_errors(&self, errors: Vec<(PathBuf, Error)>) {
-		self.push_errors(
-			errors
-				.iter()
-				.map(|(path, e)| format!("{}: {}", path.display(), e)),
-		);
+		self.push_failures(errors.into_iter().map(|(path, e)| TransferFailure {
+			path: Some(path.display().to_string()),
+			error: e.to_string(),
+		}));
 	}
 }
 
@@ -1093,7 +1154,7 @@ impl DirDownloadCallback<Normal> for TransferProgress {
 	}
 
 	fn on_scan_errors(&self, errors: Vec<Error>) {
-		self.push_errors(errors.iter().map(|e| e.to_string()));
+		self.push_failures(scan_failures(errors));
 	}
 
 	fn on_scan_complete(&self, _total_dirs: u64, total_files: u64, total_bytes: u64) {
@@ -1118,7 +1179,10 @@ impl DirDownloadCallback<Normal> for TransferProgress {
 	}
 
 	fn on_download_errors(&self, errors: Vec<(Error, String, NonRootItemType<'static, Normal>)>) {
-		self.push_errors(errors.iter().map(|(e, path, _)| format!("{}: {}", path, e)));
+		self.push_failures(errors.into_iter().map(|(e, path, _)| TransferFailure {
+			path: Some(path),
+			error: e.to_string(),
+		}));
 	}
 }
 
@@ -1130,13 +1194,15 @@ mod tests {
 	};
 
 	use filen_types::fs::{ParentUuid, Uuid};
+	use serde_json::json;
 
 	use filen_sdk_rs::fs::name::ValidatedName;
 
 	use super::{
-		DownloadSource, Existing, ProgressState, SPEED_WINDOW, TransferKind, UploadTarget,
-		canceled_message, download_target, format_duration, local_existing, progress_line,
-		resolve_download_target, resolve_upload_target, transfer_summary,
+		DownloadSource, Existing, ProgressState, SPEED_WINDOW, TransferFailure, TransferKind,
+		UploadTarget, canceled_message, download_target, format_duration, local_existing,
+		progress_line, resolve_download_target, resolve_upload_target, result_json,
+		transfer_summary,
 	};
 	use crate::util::RemotePath;
 
@@ -1289,6 +1355,41 @@ mod tests {
 			canceled_message(TransferKind::Download, 2, MIB),
 			"Downloaded 2 files, 1 MiB before canceling"
 		);
+	}
+
+	#[test]
+	fn the_json_result_lists_the_failures() {
+		let failures = [
+			TransferFailure {
+				path: Some("/local/a.txt".to_owned()),
+				error: "Permission denied".to_owned(),
+			},
+			TransferFailure {
+				path: None,
+				error: "Listing failed".to_owned(),
+			},
+		];
+		assert_eq!(
+			result_json("/dir", 4, 1000, &failures),
+			json!({
+				"destination": "/dir",
+				"files": 4,
+				"bytes": 1000,
+				"failed": [
+					{ "path": "/local/a.txt", "error": "Permission denied" },
+					{ "path": null, "error": "Listing failed" },
+				],
+			})
+		);
+	}
+
+	#[test]
+	fn a_failure_is_shown_with_its_path() {
+		let failure = TransferFailure {
+			path: Some("a.txt".to_owned()),
+			error: "Permission denied".to_owned(),
+		};
+		assert_eq!(failure.to_string(), "a.txt: Permission denied");
 	}
 
 	#[test]

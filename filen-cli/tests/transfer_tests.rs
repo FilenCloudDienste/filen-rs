@@ -147,6 +147,34 @@ async fn downloading_to_a_new_path_in_a_missing_directory_renames_the_file() {
 }
 
 #[shared_test_runtime]
+async fn uploading_with_json_prints_the_result_as_json() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let test_dir_name = resources.dir.name().unwrap();
+
+	let local = tempfile::tempdir().unwrap();
+	std::fs::write(local.path().join("a.txt"), b"contents").unwrap();
+
+	let output = authenticated_cli_with_args!(
+		"upload",
+		"--json",
+		local.path().join("a.txt").to_str().unwrap(),
+		test_dir_name
+	)
+	.success();
+
+	let result: serde_json::Value = serde_json::from_slice(&output.get_output().stdout).unwrap();
+	assert_eq!(
+		result,
+		serde_json::json!({
+			"destination": format!("/{test_dir_name}/a.txt"),
+			"files": 1,
+			"bytes": 8,
+			"failed": [],
+		})
+	);
+}
+
+#[shared_test_runtime]
 async fn uploading_a_directory_verbosely_lists_its_files() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let test_dir_name = resources.dir.name().unwrap();
