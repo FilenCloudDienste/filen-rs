@@ -29,18 +29,20 @@ pub(crate) struct PairDefinition {
 }
 
 /// A sync pair as its definition gives it.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ParsedPair {
 	local: PathBuf,
 	mode: SyncMode,
 	/// The remote path, which may be relative.
 	remote: String,
+	/// The name a sync pairs file gives the pair by, which `sync <alias>` selects it with.
+	alias: Option<String>,
 }
 
 /// The pairs `pair_definitions` define, each of which is either `<local>:<remote>` (two-way),
-/// `<local>:<mode>:<remote>`, or the path to a syncPairs.yaml file. Without definitions, the pairs
-/// of the default sync pairs file in `config_dir`. Relative local paths in a file are resolved
-/// against the file's directory.
+/// `<local>:<mode>:<remote>`, the path to a sync pairs file, or the alias of a pair in the default
+/// sync pairs file in `config_dir`. Without definitions, the pairs of that default file. Relative
+/// local paths in a file are resolved against the file's directory.
 pub(crate) fn parse_sync_pairs(
 	config_dir: &Path,
 	pair_definitions: &[String],
@@ -49,17 +51,53 @@ pub(crate) fn parse_sync_pairs(
 		return read_default_sync_pairs(config_dir);
 	}
 	let mut parsed = Vec::new();
+	// the pairs of the default file, read for the first alias given
+	let mut aliased = None;
 	for pair in pair_definitions {
 		let path = Path::new(pair);
 		if path.is_file() {
-			// if it is a file, read it as a syncPairs.yaml file
 			parsed.extend(read_sync_pairs_file(path)?);
+		} else if is_alias(pair) {
+			let aliased = match &mut aliased {
+				Some(aliased) => aliased,
+				None => aliased.insert(read_aliased_pairs(config_dir, pair)?),
+			};
+			parsed.push(pair_by_alias(aliased, pair)?);
 		} else {
-			// otherwise, parse the sync pair definition
 			parsed.push(parse_sync_pair_definition(pair)?);
 		}
 	}
 	Ok(parsed)
+}
+
+/// Whether `definition`, which names no file, is meant as an alias: a word, without the `:` of
+/// a sync pair or the separator of a path.
+fn is_alias(definition: &str) -> bool {
+	!definition.is_empty()
+		&& !definition.contains(':')
+		&& !definition.contains(std::path::is_separator)
+}
+
+/// The pairs of the default sync pairs file in `config_dir`, to look `alias` up among.
+fn read_aliased_pairs(config_dir: &Path, alias: &str) -> Result<Vec<ParsedPair>> {
+	let candidates = default_sync_pairs_files(config_dir);
+	match candidates.iter().find(|path| path.is_file()) {
+		Some(path) => read_sync_pairs_file(path),
+		None => Err(UI::usage_failure(&format!(
+			"Unknown sync pair alias: {alias}. There is no sync pairs file at {} to look it up in.",
+			display_paths(&candidates)
+		))),
+	}
+}
+
+/// The pair of `pairs`, those of the default sync pairs file, that `alias` names.
+fn pair_by_alias(pairs: &[ParsedPair], alias: &str) -> Result<ParsedPair> {
+	pairs
+		.iter()
+		.find(|pair| pair.alias.as_deref() == Some(alias))
+		// cloned, not taken: the same alias may be given twice
+		.cloned()
+		.ok_or_else(|| UI::usage_failure(&format!("Unknown sync pair alias: {alias}")))
 }
 
 /// The pairs `parsed` holds, with each remote root found. Relative remote paths are resolved
@@ -77,6 +115,8 @@ pub(crate) async fn resolve_sync_pairs(
 		local,
 		mode,
 		remote,
+		// it selected the pair, and is done with
+		alias: _,
 	} in parsed
 	{
 		let remote_path = working_path.navigate(&remote);
@@ -290,6 +330,7 @@ fn parse_sync_pair_definition(pair: &str) -> Result<ParsedPair> {
 		local: expand_home(local, dirs::home_dir().as_deref()),
 		mode,
 		remote: remote.to_owned(),
+		alias: None,
 	})
 }
 
@@ -332,12 +373,26 @@ fn is_drive_letter(s: &str) -> bool {
 /// TypeScript CLI kept its sync pairs, in the same directory.
 const DEFAULT_SYNC_PAIRS_FILES: &[&str] = &["syncPairs.yaml", "syncPairs.json"];
 
-/// The pairs of the first of [`DEFAULT_SYNC_PAIRS_FILES`] that exists in `config_dir`.
-fn read_default_sync_pairs(config_dir: &Path) -> Result<Vec<ParsedPair>> {
-	let candidates = DEFAULT_SYNC_PAIRS_FILES
+/// The paths of [`DEFAULT_SYNC_PAIRS_FILES`] in `config_dir`.
+fn default_sync_pairs_files(config_dir: &Path) -> Vec<PathBuf> {
+	DEFAULT_SYNC_PAIRS_FILES
 		.iter()
 		.map(|name| config_dir.join(name))
-		.collect::<Vec<_>>();
+		.collect()
+}
+
+/// `paths` for a message, as `a or b`.
+fn display_paths(paths: &[PathBuf]) -> String {
+	paths
+		.iter()
+		.map(|path| path.display().to_string())
+		.collect::<Vec<_>>()
+		.join(" or ")
+}
+
+/// The pairs of the first of [`DEFAULT_SYNC_PAIRS_FILES`] that exists in `config_dir`.
+fn read_default_sync_pairs(config_dir: &Path) -> Result<Vec<ParsedPair>> {
+	let candidates = default_sync_pairs_files(config_dir);
 	match candidates.iter().find(|path| path.is_file()) {
 		Some(path) => read_sync_pairs_file(path),
 		None => Err(UI::usage_failure(&no_sync_pairs_message(&candidates))),
@@ -347,20 +402,16 @@ fn read_default_sync_pairs(config_dir: &Path) -> Result<Vec<ParsedPair>> {
 /// Why `sync` without pairs cannot run when none of the default sync pairs files, `candidates`,
 /// exists, and how to give it pairs.
 fn no_sync_pairs_message(candidates: &[PathBuf]) -> String {
-	let paths = candidates
-		.iter()
-		.map(|path| path.display().to_string())
-		.collect::<Vec<_>>()
-		.join(" or ");
 	format!(
-		"No sync pairs given, and there is no sync pairs file at {paths}.\n\
+		"No sync pairs given, and there is no sync pairs file at {}.\n\
 		 Give each sync pair as <local>:<remote> or <local>:<mode>:<remote>, as in \
 		 `filen sync /home/me/docs:/docs`, or the path to a sync pairs file, \
 		 or create that file like this:\n\
 		 syncPairs:\n  \
 		 - local: /home/me/docs\n    \
 		 remote: /docs\n    \
-		 mode: twoWay"
+		 mode: twoWay",
+		display_paths(candidates)
 	)
 }
 
@@ -386,6 +437,17 @@ fn read_sync_pairs_file(path: &Path) -> Result<Vec<ParsedPair>> {
 			path.display()
 		)));
 	}
+	let mut aliases = HashSet::new();
+	if let Some(alias) = entries
+		.iter()
+		.filter_map(|entry| entry.alias.as_deref())
+		.find(|alias| !aliases.insert(*alias))
+	{
+		return Err(UI::failure(&format!(
+			"The sync pairs file {} gives the alias \"{alias}\" to more than one sync pair",
+			path.display()
+		)));
+	}
 	let base = path.parent().unwrap_or(Path::new(""));
 	let home = dirs::home_dir();
 	entries
@@ -405,6 +467,7 @@ fn read_sync_pairs_file(path: &Path) -> Result<Vec<ParsedPair>> {
 				local: local_path_in_file(&entry.local, base, home.as_deref()),
 				mode,
 				remote: entry.remote,
+				alias: entry.alias,
 			})
 		})
 		.collect()
@@ -439,6 +502,8 @@ struct SyncPairEntry {
 	/// `syncMode` is the key the TypeScript CLI's syncPairs.json gives it by.
 	#[serde(alias = "syncMode")]
 	mode: Option<String>,
+	/// The name `sync <alias>` selects the pair by, in the default sync pairs file.
+	alias: Option<String>,
 }
 
 /// Every mode with the names it is given by: the SDK's name in camelCase first, then the "cloud"
@@ -558,6 +623,7 @@ mod tests {
 			local: local.into(),
 			mode,
 			remote: remote.to_owned(),
+			alias: None,
 		}
 	}
 
@@ -765,6 +831,98 @@ mod tests {
 				path.display()
 			)),
 			"{error}"
+		);
+	}
+
+	/// The default sync pairs file in a new config dir, which holds `content`.
+	fn config_dir_with(name: &str, content: &str) -> tempfile::TempDir {
+		let config_dir = tempfile::tempdir().unwrap();
+		std::fs::write(config_dir.path().join(name), content).unwrap();
+		config_dir
+	}
+
+	#[test]
+	fn an_alias_selects_its_pair_from_the_default_sync_pairs_file() {
+		let config_dir = config_dir_with(
+			"syncPairs.json",
+			r#"[{"local": "/a", "remote": "/r/a", "alias": "docs"},
+			    {"local": "/b", "remote": "/r/b", "alias": "photos", "syncMode": "lb"}]"#,
+		);
+
+		let pairs = parse_sync_pairs(config_dir.path(), &["photos".to_owned()]).unwrap();
+
+		assert_eq!(
+			pairs,
+			[ParsedPair {
+				alias: Some("photos".to_owned()),
+				..pair("/b", SyncMode::LocalBackup, "/r/b")
+			}]
+		);
+	}
+
+	#[test]
+	fn an_unknown_alias_is_a_usage_error() {
+		let config_dir = config_dir_with(
+			"syncPairs.yaml",
+			"syncPairs:\n  - local: /a\n    remote: /r\n    alias: docs\n",
+		);
+
+		let error = parse_sync_pairs(config_dir.path(), &["photos".to_owned()]).unwrap_err();
+
+		assert_eq!(exit_code(&error), 2);
+		assert_eq!(error.to_string(), "Unknown sync pair alias: photos");
+	}
+
+	#[test]
+	fn an_alias_without_a_default_sync_pairs_file_is_a_usage_error() {
+		let config_dir = tempfile::tempdir().unwrap();
+
+		let error = parse_sync_pairs(config_dir.path(), &["photos".to_owned()]).unwrap_err();
+
+		assert_eq!(exit_code(&error), 2);
+		assert_eq!(
+			error.to_string(),
+			format!(
+				"Unknown sync pair alias: photos. There is no sync pairs file at {} or {} to look \
+				 it up in.",
+				config_dir.path().join("syncPairs.yaml").display(),
+				config_dir.path().join("syncPairs.json").display()
+			)
+		);
+	}
+
+	/// A path without a colon is no alias, but a sync pair missing its remote path.
+	#[test]
+	fn a_path_without_a_colon_is_not_taken_for_an_alias() {
+		let config_dir = tempfile::tempdir().unwrap();
+
+		let error = parse_sync_pairs(config_dir.path(), &["/home/me/docs".to_owned()]).unwrap_err();
+
+		assert!(
+			error
+				.to_string()
+				.starts_with("Invalid sync pair \"/home/me/docs\""),
+			"{error}"
+		);
+	}
+
+	#[test]
+	fn a_sync_pairs_file_that_gives_an_alias_twice_is_a_failure() {
+		let (_dir, path) = sync_pairs_file(
+			"syncPairs.json",
+			r#"[{"local": "/a", "remote": "/r/a", "alias": "docs"},
+			    {"local": "/b", "remote": "/r/b", "alias": "docs"}]"#,
+		);
+
+		let error = read_sync_pairs_file(&path).unwrap_err();
+
+		assert_eq!(exit_code(&error), 1);
+		assert_eq!(
+			error.to_string(),
+			format!(
+				"The sync pairs file {} gives the alias \"docs\" to more than one sync pair",
+				path.display()
+			)
 		);
 	}
 
