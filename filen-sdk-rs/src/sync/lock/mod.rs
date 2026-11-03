@@ -90,6 +90,59 @@ fn lock_url() -> String {
 	gateway_url(api::v3::user::lock::ENDPOINT)
 }
 
+/// How long a shutdown waits for the lock releases still in flight
+/// ([`Client::settle_lock_releases`]): long enough for a round trip on a slow network, short
+/// enough that a dead one does not hold the shutdown up. A release left unsent costs the
+/// account's other devices the rest of the lease, up to [`LOCK_SERVER_TTL`].
+// Reached by what shuts down a cache worker or a sync engine.
+#[cfg(any(
+	feature = "cache",
+	all(test, not(all(target_family = "wasm", target_os = "unknown")))
+))]
+pub(crate) const LOCK_RELEASE_SETTLE_BOUND: Duration = Duration::from_secs(5);
+
+/// A client's lock requests that may leave a lease behind and are not answered yet: releases,
+/// and acquisitions whose grant is released by their own task (see `request_acquire`). They run
+/// detached, so this count is what lets a shutdown wait for them before the process exits.
+#[derive(Debug)]
+pub(crate) struct PendingReleases(tokio::sync::watch::Sender<usize>);
+
+impl Default for PendingReleases {
+	fn default() -> Self {
+		Self(tokio::sync::watch::Sender::new(0))
+	}
+}
+
+impl PendingReleases {
+	/// Counts one request until the returned guard drops: with the request's task, whether it
+	/// was answered, failed or cancelled with its runtime, so a wait never outlives the task.
+	fn track(&self) -> PendingRelease {
+		self.0.send_modify(|pending| *pending += 1);
+		PendingRelease(self.0.clone())
+	}
+
+	/// Waits until no request is pending, for at most `bound`. `false` if some still were.
+	#[cfg(any(
+		feature = "cache",
+		all(test, not(all(target_family = "wasm", target_os = "unknown")))
+	))]
+	pub(crate) async fn settle(&self, bound: Duration) -> bool {
+		let mut pending = self.0.subscribe();
+		timeout(bound, pending.wait_for(|pending| *pending == 0).map(drop))
+			.await
+			.is_ok()
+	}
+}
+
+/// One request counted in [`PendingReleases`] while it lives.
+struct PendingRelease(tokio::sync::watch::Sender<usize>);
+
+impl Drop for PendingRelease {
+	fn drop(&mut self) {
+		self.0.send_modify(|pending| *pending -= 1);
+	}
+}
+
 /// Represents a lock on a resource, which can be acquired using the [`Client::acquire_lock`] method.
 /// The lock is released when the [`ResourceLock`] is dropped; its clones share the lock, which
 /// is released once the last of them is dropped.
@@ -110,7 +163,9 @@ fn lock_url() -> String {
 /// The release request is spawned onto the ambient tokio runtime at drop time when one exists,
 /// falling back to the runtime the lock was acquired on; if neither is available (or the
 /// fallback runtime has shut down), the release is skipped and the server expires the lock on
-/// its own after ~60 seconds.
+/// its own after ~60 seconds. Closing the sync engine waits for the releases still in flight,
+/// for a few seconds at most, so a host that exits right after does not cut them
+/// off.
 #[derive(Debug, Clone)]
 pub struct ResourceLock {
 	lease: Arc<SharedLease>,
@@ -367,9 +422,13 @@ impl SharedLease {
 		let client = self.client.clone();
 		let uuid = self.uuid;
 		let resource = self.resource.clone();
+		let pending = client.pending_lock_releases.track();
 		// Spawning on a handle whose runtime has shut down does not panic: the task is
 		// cancelled without being polled and the server expires the lock on its own.
-		handle.spawn(async move { release(&client, &lock_url(), uuid, &resource).await });
+		handle.spawn(async move {
+			release(&client, &lock_url(), uuid, &resource).await;
+			drop(pending);
+		});
 	}
 
 	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
@@ -377,12 +436,14 @@ impl SharedLease {
 		let client = self.client.clone();
 		let uuid = self.uuid;
 		let resource = self.resource.clone();
+		let pending = client.pending_lock_releases.track();
 		// `runtime::spawn_local` (unlike raw `wasm_bindgen_futures::spawn_local`) holds the
 		// spawning SDK worker open until the future completes, so a worker whose other tasks
 		// finish cannot close mid-request and silently skip the release. On the main thread it
 		// degrades to a plain `spawn_local`.
 		crate::runtime::spawn_local(async move {
 			release(&client, &lock_url(), uuid, &resource).await;
+			drop(pending);
 		});
 	}
 }
@@ -620,12 +681,15 @@ async fn request_acquire(
 	resource: Arc<str>,
 ) -> Result<bool, Error> {
 	let (answer, answered) = tokio::sync::oneshot::channel();
+	// Counted for its whole round trip: a grant can still arrive for a caller that is gone.
+	let pending = client.pending_lock_releases.track();
 	// Detached, not cancelled: the task must outlive a caller that stopped waiting.
 	drop(crate::runtime::spawn_task_maybe_send(async move {
 		let acquired = send_acquire(&client, &url, body).await;
 		if let Err(Ok(true)) = answer.send(acquired) {
 			release(&client, &url, uuid, &resource).await;
 		}
+		drop(pending);
 	}));
 	answered.await.unwrap_or_else(|_| {
 		Err(Error::custom(
@@ -805,6 +869,19 @@ impl Client {
 		});
 		keep_lock_alive(&lease);
 		Ok(Arc::new(ResourceLock { lease }))
+	}
+
+	/// Waits, for at most `bound`, until the lock requests this client sent from tasks of their
+	/// own are answered: the releases of the leases it let go, and acquisitions whose grant would
+	/// be released. A shutdown calls this before the process may exit, which would otherwise cut
+	/// them off and leave a lease that blocks every other device on the account until it lapses.
+	#[cfg(feature = "cache")]
+	pub(crate) async fn settle_lock_releases(&self, bound: Duration) {
+		if !self.client().pending_lock_releases.settle(bound).await {
+			tracing::warn!(
+				"lock requests still unanswered after {bound:?}; the server expires their leases on its own"
+			);
+		}
 	}
 
 	pub async fn acquire_lock_with_default(

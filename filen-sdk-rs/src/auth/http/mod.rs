@@ -29,6 +29,7 @@ use crate::{
 		unauth::UnauthClient,
 	},
 	consts::{FULL_CHUNK_BYTES, gateway_url},
+	sync::lock::PendingReleases,
 	thumbnail::{MAX_THUMBNAIL_SOURCE_BYTES, REMOTE_SOURCE_RESIDENT_BYTES},
 	util::{MaybeSend, MaybeSendSync},
 };
@@ -855,6 +856,9 @@ pub struct AuthClient {
 	/// This client's open batch windows: per logged-in client, so one window never mixes two
 	/// clients' API keys.
 	batcher: Batcher,
+	/// The lock requests whose lease nobody holds any more and not yet answered: what a shutdown
+	/// waits for before the process may exit (see `Client::settle_lock_releases`).
+	pub(crate) pending_lock_releases: PendingReleases,
 }
 
 impl std::fmt::Debug for AuthClient {
@@ -1147,6 +1151,7 @@ impl AuthClient {
 			unauthed,
 			api_key,
 			batcher: Batcher::default(),
+			pending_lock_releases: PendingReleases::default(),
 		}
 	}
 

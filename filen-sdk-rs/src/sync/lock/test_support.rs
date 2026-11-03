@@ -20,10 +20,19 @@ fn offline_client() -> Arc<AuthClient> {
 
 /// A valid lock whose release, when dropped, goes to `handle` (or the ambient runtime).
 pub(crate) fn test_lock(handle: Option<tokio::runtime::Handle>) -> ResourceLock {
+	test_lock_on(offline_client(), handle)
+}
+
+/// A valid lock held by `client`, whose release, when dropped, goes to `handle` (or the ambient
+/// runtime).
+pub(crate) fn test_lock_on(
+	client: Arc<AuthClient>,
+	handle: Option<tokio::runtime::Handle>,
+) -> ResourceLock {
 	ResourceLock {
 		lease: Arc::new(SharedLease {
 			uuid: Uuid::new_v4(),
-			client: offline_client(),
+			client,
 			resource: "test-resource".to_string(),
 			valid: tokio::sync::watch::Sender::new(true),
 			confirmed: tokio::sync::watch::Sender::new(Confirmed::now()),

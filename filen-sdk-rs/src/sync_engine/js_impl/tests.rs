@@ -19,8 +19,14 @@ use crate::{
 	Error, ErrorKind,
 	auth::{
 		Client,
+		http::{
+			ClientConfig,
+			test_support::{GATEWAY_CONNECT, read_head},
+		},
 		test_support::{offline_client, offline_client_with_root},
+		unauth::test_support::client_via_proxy,
 	},
+	sync::lock::test_support::test_lock_on,
 	sync_engine::{
 		Backlog, BaselineInUse, ConflictResolution, DeleteGuard, GuardReason, LegacyImport,
 		LocalScanProgress, PauseMode, PlanOutcome, PlannedAction, PlannedActionKind,
@@ -352,6 +358,40 @@ async fn a_second_close_returns_only_once_the_first_is_done() {
 	core.free_slot(pair_key, |slot| matches!(slot, PairSlot::SyncingOnce));
 	first.await.unwrap().unwrap();
 	second.await.unwrap().unwrap();
+}
+
+/// A host exits as soon as close returns, so close sends the release of the drive lock a pass
+/// let go before it returns: here the proxy the client goes through sees the release's
+/// connection, and nothing is left in flight once close is done.
+#[tokio::test]
+async fn a_close_returns_once_the_release_of_a_lock_let_go_is_sent() {
+	let scene = Scene::new();
+	let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+	let client = client_via_proxy(ClientConfig::default(), proxy.local_addr().unwrap());
+	let core = scene.open(client).await.unwrap();
+	let (seen, mut connects) = unbounded_channel();
+	// Every attempt of the release is refused once seen, so the release fails on its own.
+	let _proxy = tokio::spawn(async move {
+		loop {
+			let (mut socket, _) = proxy.accept().await.unwrap();
+			let _ = seen.send(read_head(&mut socket).await);
+		}
+	});
+	drop(test_lock_on(core.client.arc_client(), None));
+
+	Arc::clone(&core).close().await.unwrap();
+	assert!(
+		connects.try_recv().unwrap().starts_with(GATEWAY_CONNECT),
+		"the release was sent"
+	);
+	assert!(
+		core.client
+			.client()
+			.pending_lock_releases
+			.settle(Duration::ZERO)
+			.await,
+		"the release was answered"
+	);
 }
 
 /// The live state of one engine, delivering into a channel the test reads.

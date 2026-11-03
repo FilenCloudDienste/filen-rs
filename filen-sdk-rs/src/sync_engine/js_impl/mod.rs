@@ -64,6 +64,7 @@ use crate::{
 	auth::Client,
 	fs::HasUUID,
 	runtime::{do_on_commander, spawn, spawned},
+	sync::lock::LOCK_RELEASE_SETTLE_BOUND,
 	sync_engine::{
 		Backlog, BaselineInUse, ConflictResolution, DeleteGuard, IgnoredPath, LegacyImport, PairId,
 		PauseMode, PauseOptions, PlanOutcome, PlannedAction, PlannedConflict, SyncEngine,
@@ -387,6 +388,8 @@ pub(super) struct SyncEngineCore {
 	host: u64,
 	/// Where [`Drop`] hands the shutdown: the last handle may go on the JS thread.
 	runtime: tokio::runtime::Handle,
+	/// The engine's client, whose lock releases [`close`](Self::close) waits for.
+	client: Arc<Client>,
 }
 
 impl SyncEngineCore {
@@ -424,7 +427,7 @@ impl SyncEngineCore {
 			Err(_) => return Err(baseline_in_use(db_path)),
 		};
 		// A failed open drops the claim, and with it the entry.
-		let engine = SyncEngine::open(client, db_path).await?;
+		let engine = SyncEngine::open(Arc::clone(&client), db_path).await?;
 		let listener: ListenerSlot = Arc::new(Mutex::new(listener));
 		let deliveries = spawn_delivery(Arc::clone(&listener));
 		// Its own copy: the claim keeps one to remove the entry by.
@@ -447,6 +450,7 @@ impl SyncEngineCore {
 			account,
 			host,
 			runtime: tokio::runtime::Handle::current(),
+			client,
 		});
 		lock(&OPEN_ENGINES).insert(key, Arc::downgrade(&core));
 		Ok(core)
@@ -499,6 +503,11 @@ impl SyncEngineCore {
 	/// A close that finds the engine already taken waits for the same activities to end, so it
 	/// returns no earlier than the first; only the first, which holds the engine, cuts passes
 	/// loose. Running the loop twice is safe: [`begin_stop`] hands each watch to one caller.
+	///
+	/// Last, it waits for the releases of the locks they let go, at most
+	/// [`LOCK_RELEASE_SETTLE_BOUND`]: they run detached, and a host that exits once this returns
+	/// would cut them off and leave the account's drive lock held for every other device until
+	/// its lease lapses.
 	async fn close(self: Arc<Self>) -> Result<(), Error> {
 		let open = lock(&self.engine).take();
 		loop {
@@ -543,6 +552,9 @@ impl SyncEngineCore {
 			}
 		}
 		drop(open);
+		self.client
+			.settle_lock_releases(LOCK_RELEASE_SETTLE_BOUND)
+			.await;
 		Ok(())
 	}
 

@@ -19,6 +19,7 @@ use crate::{
 	fs::HasUUID,
 	io::{RemoteDirectory, RemoteFile},
 	socket::ListenerHandle,
+	sync::lock::LOCK_RELEASE_SETTLE_BOUND,
 };
 use filen_types::fs::StableUuid;
 use tokio::sync::mpsc::UnboundedSender;
@@ -582,6 +583,8 @@ async fn spawn_cache_worker(
 	// `add_event_listener` below. The worker loop is async, so the resync listings are awaited in
 	// place on the host runtime — no captured runtime handle, no `block_on`.
 	let worker_client = client.clone();
+	// For the worker's exit, which waits for its lock releases.
+	let lock_client = client.clone();
 	crate::runtime::spawn_async(move || async move {
 		// Declared first so it drops LAST — the exit signal fires only after `CacheState` (and its
 		// SQLite connection) is gone, on every exit path including a native panic's unwind.
@@ -627,6 +630,10 @@ async fn spawn_cache_worker(
 		};
 
 		state.run().await;
+		// A resync's drive lock is let go on this runtime, whose end would cancel its release.
+		lock_client
+			.settle_lock_releases(LOCK_RELEASE_SETTLE_BOUND)
+			.await;
 	});
 	slot.finished = Some(finished_receiver);
 

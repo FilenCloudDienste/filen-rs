@@ -1,6 +1,14 @@
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-use super::test_support::test_lock;
+use tokio::net::TcpListener;
+
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+use super::test_support::{test_lock, test_lock_on};
 use super::*;
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+use crate::auth::http::{
+	ClientConfig,
+	test_support::{GATEWAY_CONNECT, client_via_proxy, read_head},
+};
 
 /// The caller-chosen ceiling is what bounds how late a contended acquisition's NEXT poll is —
 /// the sync engine picks a short one so a pass that misses another client's release is back
@@ -1025,4 +1033,51 @@ async fn acquire_server_error_after_an_answer_is_returned() {
 	.unwrap_err();
 	assert_eq!(err.kind(), ErrorKind::Server);
 	assert_eq!(begin.elapsed(), Duration::ZERO);
+}
+
+/// A release that cannot get through holds a shutdown up for the bound only: here the proxy
+/// takes the release's connection and never answers it, as a network that drops every packet.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+#[tokio::test(start_paused = true)]
+async fn settling_lock_releases_gives_up_after_the_bound_on_a_dead_network() {
+	let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+	let client = Arc::new(client_via_proxy(
+		ClientConfig::default(),
+		proxy.local_addr().unwrap(),
+	));
+	drop(test_lock_on(Arc::clone(&client), None));
+	let (mut release, _) = proxy.accept().await.unwrap();
+	assert!(read_head(&mut release).await.starts_with(GATEWAY_CONNECT));
+
+	let begin = Instant::now();
+	assert!(
+		!client
+			.pending_lock_releases
+			.settle(LOCK_RELEASE_SETTLE_BOUND)
+			.await
+	);
+	assert_eq!(begin.elapsed(), LOCK_RELEASE_SETTLE_BOUND);
+	drop(release);
+}
+
+/// A release cancelled with the runtime it was queued on no longer counts: a settle never waits
+/// for a task that cannot run.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+#[test]
+fn a_release_cancelled_with_its_runtime_is_not_waited_for() {
+	let undriven = tokio::runtime::Builder::new_current_thread()
+		.enable_all()
+		.build()
+		.unwrap();
+	let lock = undriven.block_on(async { test_lock(tokio::runtime::Handle::try_current().ok()) });
+	let client = Arc::clone(&lock.lease.client);
+	drop(lock);
+	let settler = tokio::runtime::Builder::new_current_thread()
+		.enable_all()
+		.build()
+		.unwrap();
+	let settled = || settler.block_on(client.pending_lock_releases.settle(Duration::ZERO));
+	assert!(!settled(), "the queued release is pending");
+	drop(undriven);
+	assert!(settled());
 }
