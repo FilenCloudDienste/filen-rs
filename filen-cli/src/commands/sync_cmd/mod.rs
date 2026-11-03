@@ -21,6 +21,22 @@
 //! Sync pairs stay registered in the sync database under the config directory after the run that
 //! set them up. A run that cannot set up one of its sync pairs registers none of them. Only one
 //! `filen sync` can use that database at a time.
+//!
+//! A sync pairs file is YAML, or JSON as the TypeScript CLI's syncPairs.json was, that lists sync
+//! pairs under `syncPairs` or is a list of them. Each has a `local` and a `remote` path, and may
+//! have a `mode` (or `syncMode`; `twoWay` if not given), an `alias`, by which `filen sync <alias>`
+//! selects the pair of the default sync pairs file, and `ignore`, a list of ignore rules in
+//! `.filenignore` (gitignore) syntax. A leading `~` in a local path is the home directory, and a
+//! relative one is relative to the file's directory.
+//!
+//! Before a sync pair is synced, the `ignore` rules of its sync pairs file that the `.filenignore`
+//! at its local root lacks are added to the end of that file, which is created if there is none.
+//! No line is ever removed: a rule taken out of the sync pairs file stays in `.filenignore` until
+//! you remove it there. A mode that uploads (`twoWay`, `localToRemote`, `localBackup`) syncs that
+//! `.filenignore` like any other file, so the rules apply on the remote side too; in a mode that
+//! only downloads (`remoteToLocal`, `remoteBackup`), a `.filenignore` at the local root that was
+//! never synced stays local and applies on top of the remote's. There is no `--ignore` flag:
+//! ignore rules belong to a sync pair, in its `.filenignore` or its sync pairs file.
 
 use std::{
 	borrow::Cow,
@@ -52,6 +68,7 @@ use crate::{
 };
 
 mod conflict_resolutions;
+mod ignore_file;
 mod once;
 mod outcome;
 mod sync_pairs;

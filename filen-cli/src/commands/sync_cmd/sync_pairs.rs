@@ -18,14 +18,17 @@ use filen_sdk_rs::{
 use filen_types::fs::Uuid;
 use serde::Deserialize;
 
+use super::ignore_file;
 use crate::{ui::UI, util::RemotePath};
 
-/// A sync pair to register: its local root, its mode and the remote directory it syncs with.
+/// A sync pair to register: its local root, its mode, the remote directory it syncs with and the
+/// ignore rules to add to its root's `.filenignore`.
 pub(crate) struct PairDefinition {
 	local: PathBuf,
 	mode: SyncMode,
 	remote_path: RemotePath,
 	remote_root: Uuid,
+	ignore: Vec<String>,
 }
 
 /// A sync pair as its definition gives it.
@@ -37,6 +40,8 @@ pub(crate) struct ParsedPair {
 	remote: String,
 	/// The name a sync pairs file gives the pair by, which `sync <alias>` selects it with.
 	alias: Option<String>,
+	/// The ignore rules to add to the `.filenignore` at the local root.
+	ignore: Vec<String>,
 }
 
 /// The pairs `pair_definitions` define, each of which is either `<local>:<remote>` (two-way),
@@ -117,6 +122,7 @@ pub(crate) async fn resolve_sync_pairs(
 		remote,
 		// it selected the pair, and is done with
 		alias: _,
+		ignore,
 	} in parsed
 	{
 		let remote_path = working_path.navigate(&remote);
@@ -145,6 +151,7 @@ pub(crate) async fn resolve_sync_pairs(
 			mode,
 			remote_path,
 			remote_root,
+			ignore,
 		});
 	}
 	Ok(pairs)
@@ -192,6 +199,7 @@ async fn add_sync_pairs(
 		mode,
 		remote_path,
 		remote_root,
+		ignore,
 	} in pairs
 	{
 		// the engine takes the path, which the messages below still name
@@ -215,6 +223,14 @@ async fn add_sync_pairs(
 		if !pair_ids.contains(&pair) {
 			pair_ids.push(pair);
 		}
+		// After the engine took the pair, which checked that its root is a directory, and before its
+		// first pass: the pair is not synced without its rules.
+		ignore_file::add_rules(local, ignore).with_context(|| {
+			format!(
+				"Failed to set up the sync pair {} <> {remote_path}",
+				local.display()
+			)
+		})?;
 		// Set on every run, not only when the pair is new: earlier versions stored a guard that
 		// held every deletion, and a pair they registered keeps it until it is overwritten.
 		engine
@@ -331,6 +347,7 @@ fn parse_sync_pair_definition(pair: &str) -> Result<ParsedPair> {
 		mode,
 		remote: remote.to_owned(),
 		alias: None,
+		ignore: Vec::new(),
 	})
 }
 
@@ -468,6 +485,7 @@ fn read_sync_pairs_file(path: &Path) -> Result<Vec<ParsedPair>> {
 				mode,
 				remote: entry.remote,
 				alias: entry.alias,
+				ignore: entry.ignore,
 			})
 		})
 		.collect()
@@ -504,6 +522,9 @@ struct SyncPairEntry {
 	mode: Option<String>,
 	/// The name `sync <alias>` selects the pair by, in the default sync pairs file.
 	alias: Option<String>,
+	/// Ignore rules, in `.filenignore` syntax, for the `.filenignore` at the local root.
+	#[serde(default)]
+	ignore: Vec<String>,
 }
 
 /// Every mode with the names it is given by: the SDK's name in camelCase first, then the "cloud"
@@ -624,6 +645,7 @@ mod tests {
 			mode,
 			remote: remote.to_owned(),
 			alias: None,
+			ignore: Vec::new(),
 		}
 	}
 
@@ -903,6 +925,22 @@ mod tests {
 				.to_string()
 				.starts_with("Invalid sync pair \"/home/me/docs\""),
 			"{error}"
+		);
+	}
+
+	#[test]
+	fn a_sync_pair_takes_its_ignore_rules_from_the_file() {
+		let (_dir, path) = sync_pairs_file(
+			"syncPairs.json",
+			r#"[{"local": "/l", "remote": "/r", "ignore": ["*.log", "build/"]}]"#,
+		);
+
+		assert_eq!(
+			read_sync_pairs_file(&path).unwrap(),
+			[ParsedPair {
+				ignore: vec!["*.log".to_owned(), "build/".to_owned()],
+				..pair("/l", SyncMode::TwoWay, "/r")
+			}]
 		);
 	}
 
