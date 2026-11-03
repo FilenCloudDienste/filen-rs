@@ -1901,6 +1901,60 @@ async fn mv_moves_an_item_named_by_uuid_into_a_directory_named_by_uuid() {
 }
 
 #[shared_test_runtime]
+async fn write_touch_and_mkdir_take_items_named_by_uuid() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = format!("/{}", resources.dir.name().unwrap());
+	let dir = client
+		.create_dir(&(&resources.dir).into(), "docs")
+		.await
+		.unwrap();
+	let file = upload(client, &dir, "a.txt", b"content").await;
+	let dir_operand = format!("uuid:{}", dir.uuid());
+	let file_operand = format!("uuid:{}", file.uuid());
+
+	authenticated_cli_with_args!("write", &file_operand, "new", "content")
+		.success()
+		.stdout(predicates::str::contains(format!(
+			"Wrote to {test_dir}/docs/a.txt"
+		)));
+	assert_eq!(
+		content_at(client, &format!("{test_dir}/docs/a.txt")).await,
+		b"new content"
+	);
+	// writing made a new version, which has a UUID of its own
+	let current = format!(
+		"uuid:{}",
+		client
+			.find_item_at_path(&format!("{test_dir}/docs/a.txt"))
+			.await
+			.unwrap()
+			.unwrap()
+			.uuid()
+	);
+	authenticated_cli_with_args!("touch", &current)
+		.success()
+		.stdout(predicates::str::contains(format!(
+			"Updated the modification date of {test_dir}/docs/a.txt"
+		)));
+	authenticated_cli_with_args!("write", &dir_operand, "x")
+		.failure()
+		.stderr(predicates::str::contains(format!(
+			"Not a file: {dir_operand}"
+		)));
+	authenticated_cli_with_args!("mkdir", &dir_operand)
+		.success()
+		.stdout(predicates::str::contains(format!(
+			"Directory already exists: {test_dir}/docs"
+		)));
+	authenticated_cli_with_args!("mkdir", &current)
+		.failure()
+		.stderr(predicates::str::contains(format!(
+			"Not a directory: {test_dir}/docs/a.txt"
+		)));
+}
+
+#[shared_test_runtime]
 async fn a_uuid_no_item_has_is_not_found() {
 	let uuid = "00000000-0000-4000-8000-0000000f5c33";
 

@@ -6,6 +6,7 @@ use std::{borrow::Cow, collections::HashSet, fmt};
 
 use anyhow::{Context as _, Result};
 use filen_sdk_rs::{
+	ErrorKind,
 	auth::Client,
 	fs::{
 		HasName as _, HasParent as _, HasUUID as _,
@@ -42,6 +43,14 @@ impl ItemOperand {
 				.map(Self::Uuid)
 				.map_err(|_| UI::failure(&format!("Not a UUID: {}", uuid))),
 			None => Ok(Self::Path(working_path.navigate(operand))),
+		}
+	}
+
+	/// The path the operand names, if it is a path.
+	pub(crate) fn path(&self) -> Option<&RemotePath> {
+		match self {
+			Self::Path(path) => Some(path),
+			Self::Uuid(_) => None,
 		}
 	}
 
@@ -131,16 +140,47 @@ async fn find_item_by_uuid(
 }
 
 /// The path of `item`, which `operand` names: the operand's own path, or, for a UUID, the path
-/// the item is at, which only an item whose name and whose directories' names can be decrypted
-/// has.
+/// the item is at. Only an item whose name and whose directories' names can be decrypted has one.
 pub(crate) async fn path_of(
 	client: &Client,
 	operand: &ItemOperand,
 	item: &NonRootFileType<'_, Normal>,
 ) -> Result<RemotePath> {
+	find_path_of(client, operand, item)
+		.await?
+		.ok_or_else(|| no_path(operand))
+}
+
+/// How messages show `item`, which `operand` names: by its path, or, for an item named by its
+/// UUID that has none (see [`path_of`]), by the operand.
+pub(crate) async fn shown_as(
+	client: &Client,
+	operand: &ItemOperand,
+	item: &NonRootFileType<'_, Normal>,
+) -> Result<ItemOperand> {
+	Ok(match find_path_of(client, operand, item).await? {
+		Some(path) => ItemOperand::Path(path),
+		None => operand.clone(),
+	})
+}
+
+/// The failure of a command that needs the path of the item `operand` names, which has none.
+fn no_path(operand: &ItemOperand) -> anyhow::Error {
+	UI::failure(&format!(
+		"{} has no path, as its name or the name of a directory above it cannot be decrypted",
+		operand
+	))
+}
+
+/// The path of `item` (see [`path_of`]), or `None` if it has none.
+async fn find_path_of(
+	client: &Client,
+	operand: &ItemOperand,
+	item: &NonRootFileType<'_, Normal>,
+) -> Result<Option<RemotePath>> {
 	let item = match (operand, item) {
-		(ItemOperand::Path(path), _) => return Ok(path.clone()),
-		(ItemOperand::Uuid(_), NonRootFileType::Root(_)) => return Ok(RemotePath::new("/")),
+		(ItemOperand::Path(path), _) => return Ok(Some(path.clone())),
+		(ItemOperand::Uuid(_), NonRootFileType::Root(_)) => return Ok(Some(RemotePath::new("/"))),
 		(ItemOperand::Uuid(_), NonRootFileType::Dir(dir)) => {
 			NonRootItemType::Dir(Cow::Borrowed(dir.as_ref()))
 		}
@@ -148,11 +188,21 @@ pub(crate) async fn path_of(
 			NonRootItemType::File(Cow::Borrowed(file.as_ref()))
 		}
 	};
-	let (path, _) = client
-		.get_item_path(&item)
-		.await
-		.with_context(|| format!("Failed to find the path of {}", operand))?;
-	Ok(RemotePath::new(&path))
+	found_path(client.get_item_path(&item).await.map(|(path, _)| path))
+		.with_context(|| format!("Failed to find the path of {}", operand))
+}
+
+/// The path the server's path lookup found, or `None` if the item has none: the lookup fails
+/// with [`ErrorKind::MetadataWasNotDecrypted`] for an item whose name, or the name of a directory
+/// above it, cannot be decrypted.
+fn found_path(
+	found: Result<String, filen_sdk_rs::Error>,
+) -> Result<Option<RemotePath>, filen_sdk_rs::Error> {
+	match found {
+		Ok(path) => Ok(Some(RemotePath::new(&path))),
+		Err(e) if e.kind() == ErrorKind::MetadataWasNotDecrypted => Ok(None),
+		Err(e) => Err(e),
+	}
 }
 
 /// The path `operand` names: its own, or that of the item with its UUID, which must exist.
@@ -497,6 +547,34 @@ mod tests {
 
 	fn uuid() -> Uuid {
 		Uuid::from_u128(0x0123_4567_89ab_cdef_0123_4567_89ab_cdef)
+	}
+
+	#[test]
+	fn a_found_path_is_the_items_path() {
+		assert_eq!(
+			found_path(Ok("a/b.txt".to_owned())).unwrap(),
+			Some(RemotePath::new("/a/b.txt"))
+		);
+	}
+
+	#[test]
+	fn an_item_whose_path_cannot_be_decrypted_has_no_path() {
+		let found = found_path(Err(filen_sdk_rs::Error::custom(
+			ErrorKind::MetadataWasNotDecrypted,
+			"cannot decrypt",
+		)));
+
+		assert_eq!(found.unwrap(), None);
+	}
+
+	#[test]
+	fn any_other_failure_to_find_a_path_is_a_failure() {
+		let found = found_path(Err(filen_sdk_rs::Error::custom(
+			ErrorKind::Server,
+			"unavailable",
+		)));
+
+		assert_eq!(found.unwrap_err().kind(), ErrorKind::Server);
 	}
 
 	#[test]

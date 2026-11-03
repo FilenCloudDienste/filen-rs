@@ -11,7 +11,10 @@
 //!
 //! `uuid:<UUID>` names the item with that UUID wherever it is, as `stat` and `ls -l --json` show
 //! it: `stat uuid:<UUID>`. It is the only way to name an item whose name cannot be decrypted,
-//! which listings show by its UUID in place of its name. An item in the trash is named this way
+//! which listings show by its UUID in place of its name, and of an item below such a directory,
+//! which no path leads to. Messages show an item without a path by its UUID. `cd`, `edit`,
+//! `view` and the destination of `mv` and `cp` need a path, and refuse such an item; `mv`, `cp`,
+//! `write` and `touch` need the name of the item itself. An item in the trash is named this way
 //! in `trash-restore` and `trash-delete` only. Write a name that starts with `uuid:` as
 //! `./uuid:...`.
 //!
@@ -99,7 +102,11 @@ use filen_sdk_rs::{
 	},
 	io::{RemoteDirectory, RemoteFile, client_impl::IoSharedClientExt as _},
 };
-use filen_types::{api::v3::dir::color::DirColor, fs::Uuid, traits::CowHelpers as _};
+use filen_types::{
+	api::v3::dir::color::DirColor,
+	fs::{ParentUuid, Uuid},
+	traits::CowHelpers as _,
+};
 use futures::{
 	AsyncBufReadExt as _, AsyncRead, AsyncReadExt as _, SinkExt as _, TryStreamExt as _,
 	channel::mpsc, executor,
@@ -114,6 +121,7 @@ mod versions;
 
 use operand::{
 	Given, GivenItem, ItemOperand, expand_all, operand_path, parse_operands, path_of, resolve_item,
+	shown_as,
 };
 
 #[derive(Debug, Subcommand)]
@@ -1744,7 +1752,23 @@ pub(crate) async fn create_directory(
 ) -> Result<()> {
 	let operand = ItemOperand::parse(working_path, directory_str)?;
 	let client = client.get(ui).await?;
-	let directory_str = operand_path(client, &operand, "directory").await?;
+	let directory_str = match operand {
+		ItemOperand::Path(path) => path,
+		// an item named by its UUID exists, so all there is to do is say what it is
+		ItemOperand::Uuid(_) => {
+			let item = resolve_item(client, &operand, "directory").await?;
+			let shown = shown_as(client, &operand, &item).await?;
+			return match item {
+				NonRootFileType::Dir(_) | NonRootFileType::Root(_) => {
+					print_directory_exists(ui, &shown);
+					Ok(())
+				}
+				NonRootFileType::File(_) => {
+					Err(UI::failure(&format!("Not a directory: {}", shown)))
+				}
+			};
+		}
+	};
 	// like `mkdir -p`, an existing directory is no failure
 	match client.find_item_at_path(&directory_str.0).await {
 		Ok(Some(NonRootFileType::Dir(_) | NonRootFileType::Root(_))) => {
@@ -1770,7 +1794,7 @@ pub(crate) async fn create_directory(
 	Ok(())
 }
 
-fn print_directory_exists(ui: &mut UI, directory: &RemotePath) {
+fn print_directory_exists(ui: &mut UI, directory: &impl fmt::Display) {
 	if !ui.is_quiet() {
 		ui.print_muted(&format!("Directory already exists: {}", directory));
 	}
@@ -1911,22 +1935,61 @@ async fn delete_item(
 	Ok(())
 }
 
-/// Where a file written to a path goes.
-struct FileToWrite<'a> {
-	parent: DirType<'a, Normal>,
+/// Where a file written to an operand goes.
+struct FileToWrite {
+	/// The UUID of the directory it goes into.
+	parent: Uuid,
 	/// The name of the file there already, as it differs from the path's only in case if at all,
 	/// or else the path's name.
 	name: String,
-	/// The path, with [`FileToWrite::name`].
-	path: RemotePath,
+	/// How messages show the file: by its path, with [`FileToWrite::name`], or by its UUID if it
+	/// has no path.
+	shown: ItemOperand,
 	/// The file there already, which writing replaces.
 	existing: Option<RemoteFile>,
+}
+
+/// Finds where a file written to `operand` goes: see [`find_file_to_write_at`] for a path. A UUID
+/// names an existing file, which is replaced under its own name in its own directory, so it is
+/// found by its UUID even where no path leads to it.
+async fn find_file_to_write(client: &Client, operand: &ItemOperand) -> Result<FileToWrite> {
+	if let ItemOperand::Path(path) = operand {
+		return find_file_to_write_at(client, path).await;
+	}
+	let file = match resolve_item(client, operand, "file").await? {
+		NonRootFileType::File(file) => file.into_owned(),
+		NonRootFileType::Dir(_) | NonRootFileType::Root(_) => {
+			return Err(UI::failure(&format!("Not a file: {}", operand)));
+		}
+	};
+	let Some(name) = file.name().map(str::to_owned) else {
+		return Err(UI::failure(&format!(
+			"Cannot write to {}, as its name cannot be decrypted",
+			operand
+		)));
+	};
+	// a file that is neither trashed nor an earlier version is in a directory
+	let ParentUuid::Uuid(parent) = *file.parent() else {
+		return Err(UI::failure(&format!("No directory holds {}", operand)));
+	};
+	let shown = shown_as(
+		client,
+		operand,
+		&NonRootFileType::File(Cow::Borrowed(&file)),
+	)
+	.await?;
+	Ok(FileToWrite {
+		parent,
+		name,
+		shown,
+		existing: Some(file),
+	})
 }
 
 /// Finds where a file written to `path` goes: its parent directory must exist, and nothing there
 /// may be a directory whose name is the file's but for case. Names are compared ignoring case, as
 /// the server does: uploading a file whose name a file there has but for case replaces that file.
-async fn find_file_to_write<'a>(client: &'a Client, path: &RemotePath) -> Result<FileToWrite<'a>> {
+async fn find_file_to_write_at(client: &Client, path: &RemotePath) -> Result<FileToWrite> {
 	let Some(name) = path.basename() else {
 		return Err(UI::failure(&format!("Not a file: {}", path)));
 	};
@@ -1973,8 +2036,8 @@ async fn find_file_to_write<'a>(client: &'a Client, path: &RemotePath) -> Result
 		.unwrap_or(name)
 		.to_owned();
 	Ok(FileToWrite {
-		parent,
-		path: parent_path.navigate(&name),
+		parent: parent.uuid(),
+		shown: ItemOperand::Path(parent_path.navigate(&name)),
 		name,
 		existing,
 	})
@@ -1993,10 +2056,9 @@ pub(crate) async fn write_file(
 ) -> Result<()> {
 	let operand = ItemOperand::parse(working_path, file_str)?;
 	let client = client.get(ui).await?;
-	let path = operand_path(client, &operand, "file").await?;
-	let target = find_file_to_write(client, &path).await?;
+	let target = find_file_to_write(client, &operand).await?;
 	let builder = client
-		.make_file_builder(&target.name, target.parent.uuid())
+		.make_file_builder(&target.name, target.parent)
 		.map_err(|e| UI::failure(&format!("Invalid file name: {}", e)))?;
 	if content.is_empty() && !io::stdin().is_terminal() {
 		client
@@ -2008,7 +2070,7 @@ pub(crate) async fn write_file(
 			.await
 	}
 	.context("Failed to write file")?;
-	ui.print_success(&format!("Wrote to {}", target.path));
+	ui.print_success(&format!("Wrote to {}", target.shown));
 	Ok(())
 }
 
@@ -2022,8 +2084,7 @@ pub(crate) async fn touch_file(
 ) -> Result<()> {
 	let operand = ItemOperand::parse(working_path, file_str)?;
 	let client = client.get(ui).await?;
-	let path = operand_path(client, &operand, "file").await?;
-	let target = find_file_to_write(client, &path).await?;
+	let target = find_file_to_write(client, &operand).await?;
 	match target.existing {
 		Some(mut file) => {
 			client
@@ -2033,17 +2094,20 @@ pub(crate) async fn touch_file(
 				)
 				.await
 				.context("Failed to update the modification date")?;
-			ui.print_success(&format!("Updated the modification date of {}", target.path));
+			ui.print_success(&format!(
+				"Updated the modification date of {}",
+				target.shown
+			));
 		}
 		None => {
 			let builder = client
-				.make_file_builder(&target.name, target.parent.uuid())
+				.make_file_builder(&target.name, target.parent)
 				.map_err(|e| UI::failure(&format!("Invalid file name: {}", e)))?;
 			client
 				.upload_file(builder, &[])
 				.await
 				.context("Failed to create file")?;
-			ui.print_success(&format!("Created empty file: {}", target.path));
+			ui.print_success(&format!("Created empty file: {}", target.shown));
 		}
 	}
 	Ok(())
@@ -2123,7 +2187,7 @@ async fn move_item(
 		NonRootFileType::Root(_) => return Err(UI::failure("Cannot move root directory")),
 	}
 	.context("Failed to decrypt source name")?;
-	let source_path = path_of(client, &source_operand, &source).await?;
+	let source_shown = shown_as(client, &source_operand, &source).await?;
 	let Destination {
 		dir: destination_dir,
 		name: new_name,
@@ -2132,7 +2196,7 @@ async fn move_item(
 		client,
 		Placement::Move,
 		&Source {
-			path: &source_path,
+			path: source_shown.path(),
 			name: source_filename,
 			uuid: source.uuid(),
 		},
@@ -2184,7 +2248,7 @@ async fn move_item(
 		}
 		NonRootFileType::Root(_) => return Err(UI::failure("Cannot move root directory")),
 	}
-	ui.print_success(&format!("Moved {} to {}", source_path.0, new_path.0));
+	ui.print_success(&format!("Moved {} to {}", source_shown, new_path));
 	Ok(())
 }
 
@@ -2212,7 +2276,8 @@ impl Placement {
 
 /// The item a `mv` or `cp` puts somewhere.
 struct Source<'a> {
-	path: &'a RemotePath,
+	/// Its path, which an item named by its UUID lacks when a name above it cannot be decrypted.
+	path: Option<&'a RemotePath>,
 	name: &'a str,
 	uuid: Uuid,
 }
@@ -2311,18 +2376,23 @@ fn target_of(
 			}
 		}
 	};
-	if placement == Placement::Move && target.path() == source.path {
+	// A source without a path lies below a directory whose name cannot be decrypted, so no path
+	// leads to it or into it: it is neither at nor above the destination, which has a path.
+	let Some(source_path) = source.path else {
+		return Ok(target);
+	};
+	if placement == Placement::Move && target.path() == source_path {
 		return Err(UI::failure(&format!(
 			"{} is already in {}",
-			source.path,
+			source_path,
 			target.dir()
 		)));
 	}
-	if is_inside(target.path(), source.path) {
+	if is_inside(target.path(), source_path) {
 		return Err(UI::failure(&format!(
 			"Cannot {} {} into itself: {}",
 			placement.verb(),
-			source.path,
+			source_path,
 			target.path()
 		)));
 	}
@@ -2517,12 +2587,12 @@ async fn copy_item(
 		NonRootFileType::Root(_) => return Err(UI::failure("Cannot copy root directory")),
 	}
 	.context("Failed to decrypt source name")?;
-	let source_path = path_of(client, &source_operand, &source).await?;
+	let source_shown = shown_as(client, &source_operand, &source).await?;
 	let destination = resolve_destination(
 		client,
 		Placement::Copy,
 		&Source {
-			path: &source_path,
+			path: source_shown.path(),
 			name: source_name,
 			uuid: source.uuid(),
 		},
@@ -2553,7 +2623,7 @@ async fn copy_item(
 		name,
 	};
 	let result = run_copy(ui, client, request, config).await;
-	finish_copy(ui, &source_path, &destination_dir_path, result)
+	finish_copy(ui, &source_shown, &destination_dir_path, result)
 }
 
 /// Runs a copy, drawing its progress, until it ends or Ctrl-C cancels it. A cancelled copy stops
@@ -2613,7 +2683,7 @@ const MAX_PRINTED_COPY_PROBLEMS: usize = 10;
 /// success while items were missing.
 fn finish_copy(
 	ui: &mut UI,
-	source_path: &RemotePath,
+	source: &ItemOperand,
 	destination_dir_path: &RemotePath,
 	result: Result<CopyReport, CopyFailed>,
 ) -> Result<()> {
@@ -2643,7 +2713,7 @@ fn finish_copy(
 			if failed.error.kind() == ErrorKind::MaxStorageReached {
 				return Err(UI::failure(&format!(
 					"Not enough storage left: copying {} needs {}",
-					source_path,
+					source,
 					ui::format_size(failed.report.totals.bytes)
 				)));
 			}
@@ -2656,11 +2726,11 @@ fn finish_copy(
 	}
 	match copy_path {
 		Some(copy_path) => {
-			ui.print_success(&format!("Copied {} to {}", source_path, copy_path));
+			ui.print_success(&format!("Copied {} to {}", source, copy_path));
 			Ok(())
 		}
 		// a copy that failed at its top-level item reports that as a failure
-		None => Err(UI::failure(&format!("Failed to copy {}", source_path))),
+		None => Err(UI::failure(&format!("Failed to copy {}", source))),
 	}
 }
 
@@ -3660,10 +3730,49 @@ mod tests {
 
 	fn source(path: &RemotePath) -> Source<'_> {
 		Source {
-			path,
+			path: Some(path),
 			name: path.basename().unwrap(),
 			uuid: Uuid::from_u128(1),
 		}
+	}
+
+	#[test]
+	fn a_source_without_a_path_goes_where_the_destination_says() {
+		let source = Source {
+			path: None,
+			name: "x.txt",
+			uuid: Uuid::from_u128(1),
+		};
+
+		assert_eq!(
+			target_of(
+				Placement::Move,
+				&source,
+				&RemotePath::new("/b"),
+				Found::Directory,
+				false
+			)
+			.unwrap(),
+			Target::Into {
+				dir: RemotePath::new("/b"),
+				path: RemotePath::new("/b/x.txt"),
+			}
+		);
+		assert_eq!(
+			target_of(
+				Placement::Copy,
+				&source,
+				&RemotePath::new("/b/y.txt"),
+				Found::Nothing,
+				false
+			)
+			.unwrap(),
+			Target::At {
+				parent: RemotePath::new("/b"),
+				name: "y.txt".to_owned(),
+				path: RemotePath::new("/b/y.txt"),
+			}
+		);
 	}
 
 	fn target(
