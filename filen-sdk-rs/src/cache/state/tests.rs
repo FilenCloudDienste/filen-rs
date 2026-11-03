@@ -245,7 +245,7 @@ async fn queued_catch_ups_are_answered_by_one_gap_check() {
 		let failure = answer
 			.try_recv()
 			.expect("every request is answered")
-			.expect("the server was not reached");
+			.expect_err("the server was not reached");
 		assert_eq!(failure.kind(), ErrorKind::Reqwest, "{failure}");
 		assert!(
 			failure
@@ -259,6 +259,145 @@ async fn queued_catch_ups_are_answered_by_one_gap_check() {
 		GapCheck::AwaitingSubscription,
 		"a catch-up leaves the subscription's own check owed"
 	);
+}
+
+/// A gap-check that could not read the remote drive id fails the catch-up even when the cache
+/// keeps no failure for it: here the socket connects while the read is in flight, so `reach`
+/// drops the transport failure as one the connection resolved — and so it does an API error,
+/// which is the server answering. A catch-up answered from `reach` alone would have told the pass
+/// it was current.
+#[cfg(feature = "sync-engine")]
+#[tokio::test]
+async fn a_catch_up_whose_gap_check_failed_fails_though_reach_keeps_nothing() {
+	use std::sync::atomic::Ordering;
+
+	let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+	let client = crate::auth::unauth::test_support::client_via_proxy(
+		crate::auth::http::ClientConfig::default(),
+		listener.local_addr().unwrap(),
+	);
+	let connections = Arc::clone(client.unauthed().state().socket_connections());
+	let proxy = tokio::spawn(async move {
+		loop {
+			let (stream, _) = listener.accept().await.unwrap();
+			// The socket connects while the request is in flight; the request then fails.
+			connections.fetch_add(1, Ordering::SeqCst);
+			drop(stream);
+		}
+	});
+	let (mut state, _producer) = CacheState::new_in_memory_with_producer();
+	state.set_test_resync_client(Arc::new(client));
+
+	let (ack, mut answer) = tokio::sync::oneshot::channel();
+	state.catch_up(ack).await;
+	proxy.abort();
+
+	assert!(
+		state.reach.unreachable().is_none(),
+		"reach keeps no failure the socket's connection resolved"
+	);
+	let failure = answer
+		.try_recv()
+		.expect("the request is answered")
+		.expect_err("the gap-check did not read the remote drive id");
+	assert!(
+		failure
+			.to_string()
+			.contains(filen_types::api::v3::message_ids::ENDPOINT),
+		"the gap-check's read of the remote drive id: {failure}"
+	);
+	assert!(
+		state.caught_up_at.is_none(),
+		"a failed catch-up answers none after it"
+	);
+}
+
+/// A catch-up that reached the server answers every catch-up after it for [`CATCH_UP_REUSE`],
+/// with nothing read: N pairs' safety nets asking on their own clocks cost one gap-check, and at
+/// most one relist of every root, per window. After the window, or with a hole flagged since, a
+/// catch-up reads the server again.
+#[tokio::test(start_paused = true)]
+async fn a_catch_up_answers_those_after_it_for_a_window() {
+	let (mut state, _producer) = CacheState::new_in_memory_with_producer();
+	// No client: the gap-check reads nothing and the catch-up succeeds.
+	let (ack, mut answer) = tokio::sync::oneshot::channel();
+	state.catch_up(ack).await;
+	answer.try_recv().unwrap().unwrap();
+	assert!(
+		state.caught_up_at.is_some(),
+		"a catch-up that worked is kept"
+	);
+
+	// From here any read fails at once: a catch-up that succeeds read nothing.
+	state.set_test_resync_client(Arc::new(offline_client()));
+	for _ in 0..5 {
+		tokio::time::advance(CATCH_UP_REUSE / 10).await;
+		let (ack, mut answer) = tokio::sync::oneshot::channel();
+		state.catch_up(ack).await;
+		answer
+			.try_recv()
+			.expect("the request is answered")
+			.expect("answered by the catch-up before it, with nothing read");
+	}
+
+	tokio::time::advance(CATCH_UP_REUSE / 2).await;
+	let (ack, mut answer) = tokio::sync::oneshot::channel();
+	state.catch_up(ack).await;
+	let failure = answer
+		.try_recv()
+		.unwrap()
+		.expect_err("past the window the catch-up reads the server");
+	assert_eq!(failure.kind(), ErrorKind::Reqwest, "{failure}");
+
+	state.caught_up_at = Some(TimerInstant::now());
+	state.mark_needs_resync().unwrap();
+	let (ack, mut answer) = tokio::sync::oneshot::channel();
+	state.catch_up(ack).await;
+	answer
+		.try_recv()
+		.unwrap()
+		.expect_err("a hole flagged since is read for, inside the window too");
+}
+
+/// The run loop runs the gap-check a disconnect owes at its top once the socket subscribes again:
+/// a `ResyncSignal` then a `Connected` reach the worker, and it reads the remote drive id (here
+/// failing against an offline client, which `reach` then records).
+#[tokio::test]
+async fn run_gap_checks_at_the_subscription_after_a_disconnect() {
+	let (mut state, producer) = CacheState::new_in_memory_with_producer();
+	state.set_test_resync_client(Arc::new(offline_client()));
+	state.gap_check = GapCheck::Done;
+	let reach = Arc::clone(&state.reach);
+	let worker = tokio::spawn(state.run());
+
+	for event in [
+		CacheEventMaybeDecrypted::ResyncSignal,
+		CacheEventMaybeDecrypted::Connected,
+	] {
+		producer
+			.events
+			.try_send(CacheThreadEvent::Socket(event))
+			.unwrap();
+	}
+	let failure = tokio::time::timeout(Duration::from_secs(30), async {
+		loop {
+			if let Some(failure) = reach.unreachable() {
+				return failure;
+			}
+			tokio::time::sleep(Duration::from_millis(10)).await;
+		}
+	})
+	.await
+	.expect("the run loop never ran the gap-check");
+	assert!(
+		failure
+			.to_string()
+			.contains(filen_types::api::v3::message_ids::ENDPOINT),
+		"the gap-check's read of the remote drive id: {failure}"
+	);
+
+	drop(producer);
+	worker.await.unwrap();
 }
 
 /// A catch-up whose asker has gone is dropped unanswered, and the worker carries on.
@@ -2660,13 +2799,17 @@ async fn a_gap_check_that_gets_no_answer_records_the_server_unreachable() {
 	let (mut state, _producer) = CacheState::new_in_memory_with_producer();
 	state.set_test_resync_client(Arc::new(offline_client()));
 
-	state.run_gap_check().await;
+	let read = state
+		.run_gap_check()
+		.await
+		.expect_err("the remote drive id was not read");
 
 	let failure = state
 		.reach
 		.unreachable()
 		.expect("the server was not reached");
 	assert_eq!(failure.kind(), ErrorKind::Reqwest, "{failure}");
+	assert!(Arc::ptr_eq(&read, &failure), "the same failure: {read}");
 }
 
 /// A socket connection outdates a standing failure, and a request sent before the connection that

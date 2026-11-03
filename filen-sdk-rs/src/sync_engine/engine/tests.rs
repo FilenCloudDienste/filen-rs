@@ -11126,88 +11126,93 @@ async fn a_pair_whose_cache_socket_is_down(
 /// safety-net pass once the socket is back.
 #[tokio::test]
 async fn a_safety_net_pass_has_a_disconnected_cache_catch_up_and_finds_the_cloud_change() {
-	let dir = tempfile::tempdir().unwrap();
-	let (engine, pair, cache, reach, mut catch_ups, _registered) =
-		a_pair_whose_cache_socket_is_down(dir.path()).await;
+	// Bounded, so a pass whose catch-up is never answered fails here instead of hanging.
+	tokio::time::timeout(Duration::from_secs(60), async move {
+		let dir = tempfile::tempdir().unwrap();
+		let (engine, pair, cache, reach, mut catch_ups, _registered) =
+			a_pair_whose_cache_socket_is_down(dir.path()).await;
 
-	let first = engine.sync_once(pair).await.unwrap();
-	assert_ne!(
-		first.full_pass,
-		Some(FullPassReason::RemoteEventsDegraded),
-		"a first pass reads whole for its own reason"
-	);
-	assert!(catch_ups.try_recv().is_err(), "and asks the cache nothing");
+		let first = engine.sync_once(pair).await.unwrap();
+		assert_ne!(
+			first.full_pass,
+			Some(FullPassReason::RemoteEventsDegraded),
+			"a first pass reads whole for its own reason"
+		);
+		assert!(catch_ups.try_recv().is_err(), "and asks the cache nothing");
 
-	// A file uploaded from elsewhere while the socket is down: only a relist shows it.
-	let remote_root = Uuid::from_u128(1);
-	let cloud = Uuid::from_u128(3);
-	let relisted = tokio::spawn(async move {
-		let ack = catch_ups
-			.recv()
-			.await
-			.expect("the pass asks the cache to catch up");
-		// What the relist commits: the file, and the root converged again.
-		let mut state = CacheState::new_on_path(&cache, Uuid::from_u128(1));
-		state
-			.upsert_files([&cacheable_file(cloud, remote_root, "cloud.txt")].into_iter())
+		// A file uploaded from elsewhere while the socket is down: only a relist shows it.
+		let remote_root = Uuid::from_u128(1);
+		let cloud = Uuid::from_u128(3);
+		let relisted = tokio::spawn(async move {
+			let ack = catch_ups
+				.recv()
+				.await
+				.expect("the pass asks the cache to catch up");
+			// What the relist commits: the file, and the root converged again.
+			let mut state = CacheState::new_on_path(&cache, Uuid::from_u128(1));
+			state
+				.upsert_files([&cacheable_file(cloud, remote_root, "cloud.txt")].into_iter())
+				.unwrap();
+			state.add_converged_roots(&[remote_root]).unwrap();
+			ack.send(Ok(())).unwrap();
+			catch_ups
+		});
+		// The same file here: its size and modification time, which is what a pass matches a file the
+		// remote holds no hash for by.
+		let local = dir.path().join("local").join("cloud.txt");
+		std::fs::write(&local, b"7 bytes").unwrap();
+		std::fs::File::options()
+			.write(true)
+			.open(&local)
+			.unwrap()
+			.set_times(
+				std::fs::FileTimes::new()
+					.set_modified(std::time::UNIX_EPOCH + Duration::from_millis(1_234)),
+			)
 			.unwrap();
-		state.add_converged_roots(&[remote_root]).unwrap();
-		ack.send(None).unwrap();
-		catch_ups
-	});
-	// The same file here: its size and modification time, which is what a pass matches a file the
-	// remote holds no hash for by.
-	let local = dir.path().join("local").join("cloud.txt");
-	std::fs::write(&local, b"7 bytes").unwrap();
-	std::fs::File::options()
-		.write(true)
-		.open(&local)
-		.unwrap()
-		.set_times(
-			std::fs::FileTimes::new()
-				.set_modified(std::time::UNIX_EPOCH + Duration::from_millis(1_234)),
-		)
-		.unwrap();
-	engine
-		.force_full_pass(pair, FullPassReason::SafetyNet)
-		.await;
-	let caught_up = engine.sync_once(pair).await.unwrap();
-	let mut catch_ups = relisted.await.unwrap();
-	assert_eq!(
-		caught_up.full_pass,
-		Some(FullPassReason::RemoteEventsDegraded),
-		"the pass says nothing announced the remote it read"
-	);
-	assert_eq!(caught_up.uploaded, 0, "{caught_up:?}");
-	let store = engine.pair_store(pair).await.unwrap();
-	let baseline = locked(&store).baseline(pair).unwrap();
-	assert_eq!(
-		baseline.get("cloud.txt").and_then(|row| row.remote_uuid),
-		Some(cloud),
-		"the pass found the cloud change"
-	);
+		engine
+			.force_full_pass(pair, FullPassReason::SafetyNet)
+			.await;
+		let caught_up = engine.sync_once(pair).await.unwrap();
+		let mut catch_ups = relisted.await.unwrap();
+		assert_eq!(
+			caught_up.full_pass,
+			Some(FullPassReason::RemoteEventsDegraded),
+			"the pass says nothing announced the remote it read"
+		);
+		assert_eq!(caught_up.uploaded, 0, "{caught_up:?}");
+		let store = engine.pair_store(pair).await.unwrap();
+		let baseline = locked(&store).baseline(pair).unwrap();
+		assert_eq!(
+			baseline.get("cloud.txt").and_then(|row| row.remote_uuid),
+			Some(cloud),
+			"the pass found the cloud change"
+		);
 
-	let other = engine.sync_once(pair).await.unwrap();
-	assert!(other.full_pass.is_some(), "this pass reads whole too");
-	assert_ne!(other.full_pass, Some(FullPassReason::RemoteEventsDegraded));
-	assert!(
-		catch_ups.try_recv().is_err(),
-		"a whole pass for another reason asks nothing"
-	);
+		let other = engine.sync_once(pair).await.unwrap();
+		assert!(other.full_pass.is_some(), "this pass reads whole too");
+		assert_ne!(other.full_pass, Some(FullPassReason::RemoteEventsDegraded));
+		assert!(
+			catch_ups.try_recv().is_err(),
+			"a whole pass for another reason asks nothing"
+		);
 
-	reach.set_live(true);
-	engine
-		.force_full_pass(pair, FullPassReason::SafetyNet)
-		.await;
-	let connected = engine.sync_once(pair).await.unwrap();
-	assert_ne!(
-		connected.full_pass,
-		Some(FullPassReason::RemoteEventsDegraded)
-	);
-	assert!(
-		catch_ups.try_recv().is_err(),
-		"with the socket connected the cache is current and nothing is asked"
-	);
+		reach.set_live(true);
+		engine
+			.force_full_pass(pair, FullPassReason::SafetyNet)
+			.await;
+		let connected = engine.sync_once(pair).await.unwrap();
+		assert_ne!(
+			connected.full_pass,
+			Some(FullPassReason::RemoteEventsDegraded)
+		);
+		assert!(
+			catch_ups.try_recv().is_err(),
+			"with the socket connected the cache is current and nothing is asked"
+		);
+	})
+	.await
+	.expect("the passes ended");
 }
 
 /// A requested pass ("sync now") does the same, and a catch-up that cannot reach the server fails
@@ -11225,7 +11230,7 @@ async fn a_requested_pass_whose_catch_up_cannot_reach_the_server_fails_offline()
 			.recv()
 			.await
 			.expect("the pass asks the cache to catch up");
-		ack.send(Some(Arc::new(Error::custom(
+		ack.send(Err(Arc::new(Error::custom(
 			ErrorKind::Reqwest,
 			"error sending request",
 		))))
@@ -11246,6 +11251,122 @@ async fn a_requested_pass_whose_catch_up_cannot_reach_the_server_fails_offline()
 		"the next pass asks the cache again"
 	);
 	assert!(catch_ups.try_recv().is_err());
+}
+
+/// A catch-up the cache answered with the server's own failure — an API error, not a transport
+/// one — fails the pass with it, never a pass planned against the stale cache, and not as offline;
+/// the next pass asks again.
+#[tokio::test]
+async fn a_catch_up_the_server_answered_with_an_error_fails_the_pass() {
+	let dir = tempfile::tempdir().unwrap();
+	let (engine, pair, _cache, _reach, mut catch_ups, _registered) =
+		a_pair_whose_cache_socket_is_down(dir.path()).await;
+	engine.sync_once(pair).await.unwrap();
+
+	let answering = tokio::spawn(async move {
+		let ack = catch_ups
+			.recv()
+			.await
+			.expect("the pass asks the cache to catch up");
+		ack.send(Err(Arc::new(Error::from(
+			filen_types::error::ResponseError::ApiError {
+				message: None,
+				code: Some("internal_error".to_string()),
+			},
+		))))
+		.unwrap();
+	});
+	engine
+		.force_full_pass(pair, FullPassReason::SafetyNet)
+		.await;
+	let failed = engine
+		.sync_once(pair)
+		.await
+		.expect_err("the remote could not be brought up to date");
+	answering.await.unwrap();
+	assert_ne!(failed.kind(), ErrorKind::Reqwest, "{failed}");
+	assert!(
+		failed.to_string().contains("could not catch up"),
+		"{failed}"
+	);
+	assert!(
+		engine
+			.pair_changes(pair)
+			.await
+			.take()
+			.wants_current_remote(),
+		"the next pass asks the cache again"
+	);
+}
+
+/// A stop or a close cuts loose a pass whose cache is still catching up — a socket a firewall
+/// blocks while another device holds the drive lock the relist waits for — and a pause ends it as
+/// a pass cancelled while reading: neither waits for the cache's answer.
+#[tokio::test(start_paused = true)]
+async fn a_pass_waiting_for_a_catch_up_ends_at_a_stop_or_a_pause() {
+	let dir = tempfile::tempdir().unwrap();
+	let (engine, pair, _cache, _reach, mut catch_ups, _registered) =
+		a_pair_whose_cache_socket_is_down(dir.path()).await;
+	let engine = Arc::new(engine);
+	engine.sync_once(pair).await.unwrap();
+	let pass = |engine: &Arc<SyncEngine>| {
+		let engine = Arc::clone(engine);
+		tokio::spawn(async move {
+			engine
+				.force_full_pass(pair, FullPassReason::SafetyNet)
+				.await;
+			engine.sync_once(pair).await
+		})
+	};
+
+	let mut stopped = pass(&engine);
+	let _unanswered = catch_ups
+		.recv()
+		.await
+		.expect("the pass asks the cache to catch up");
+	engine.cut_loose_pass(pair).await;
+	let failed = ended(&mut stopped)
+		.await
+		.expect("the stop never reached the pass waiting for the catch-up")
+		.expect_err("a pass cut loose plans nothing");
+	assert_eq!(failed.kind(), ErrorKind::StaleState, "{failed}");
+
+	let mut paused = pass(&engine);
+	let _unanswered = catch_ups
+		.recv()
+		.await
+		.expect("the pass asks the cache to catch up");
+	engine.pause_pair(pair).await.unwrap();
+	let report = ended(&mut paused)
+		.await
+		.expect("the pause never reached the pass waiting for the catch-up")
+		.expect("a pause is not a failure");
+	assert!(report.paused, "{report:?}");
+}
+
+/// A catch-up the cache never answers — a request that hangs — fails the pass once
+/// [`CONVERGENCE_WAIT`] runs out, as a view that never converged, rather than holding it forever.
+#[tokio::test(start_paused = true)]
+async fn a_catch_up_the_cache_never_answers_fails_the_pass_in_time() {
+	let dir = tempfile::tempdir().unwrap();
+	let (engine, pair, _cache, _reach, mut catch_ups, _registered) =
+		a_pair_whose_cache_socket_is_down(dir.path()).await;
+	engine.sync_once(pair).await.unwrap();
+
+	engine
+		.force_full_pass(pair, FullPassReason::SafetyNet)
+		.await;
+	let started = tokio::time::Instant::now();
+	let failed = tokio::time::timeout(CONVERGENCE_WAIT * 2, engine.sync_once(pair))
+		.await
+		.expect("the pass waited on past its bound")
+		.expect_err("a catch-up never answered plans nothing");
+	assert_eq!(failed.kind(), ErrorKind::StaleState, "{failed}");
+	assert!(started.elapsed() >= CONVERGENCE_WAIT);
+	assert!(
+		catch_ups.try_recv().is_ok(),
+		"the pass asked, and nobody answered"
+	);
 }
 
 /// The cache ending a subscription is dropping its callback, and that is what the subscription

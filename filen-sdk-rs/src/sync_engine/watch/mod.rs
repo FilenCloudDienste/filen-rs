@@ -244,9 +244,11 @@ pub struct WatchStatus {
 	/// the subscription: it holds the first refusal, and is cleared once a later attempt, made
 	/// after a pass that succeeds, gets the subscription. Set too while the cache's socket is not
 	/// connected (a firewall or proxy that blocks it, a server outage, a reconnect under way), and
-	/// cleared as soon as it connects again. Either way remote changes are then picked up by the
-	/// safety-net pass and by [`request_pass`](super::SyncEngine::request_pass), which have the
-	/// cache catch up with the server first.
+	/// cleared as soon as it connects again; a socket still making its first connect as the watch
+	/// subscribes gets a few seconds to do so first, so a launch does not flash it. Either way
+	/// remote changes are then picked up by the safety-net pass and by
+	/// [`request_pass`](super::SyncEngine::request_pass), which have the cache catch up with the
+	/// server first.
 	pub remote_events_degraded: Option<String>,
 }
 
@@ -881,18 +883,27 @@ impl<H: RemoteLiveness> RemoteDoorbell<H> {
 /// Why [`WatchStatus::remote_events_degraded`] is set while the cache's socket is not connected.
 const SOCKET_NOT_CONNECTED: &str = "the cache's socket to the server is not connected, so no remote change is announced; remote changes sync on the safety net and on requested passes";
 
+/// How long a cache socket that is not connected as a watch subscribes has to connect before the
+/// status says so: its first connect is usually still under way then, at every launch, and a socket
+/// that connects within this never shows as down.
+const SOCKET_CONNECT_GRACE: Duration = Duration::from_secs(15);
+
 /// Keep `status` saying whether the cache serving the watch's subscription hears remote changes as
 /// they happen, from its socket listener's liveness `live`, until the cache drops the sender or the
 /// doorbell that spawned this aborts it. Each change is published as it happens, so a socket that
-/// stays down shows at once and one that comes back clears it, with no pass in between.
+/// stays down shows at once and one that comes back clears it, with no pass in between; a socket
+/// not yet connected at the start shows as down only once [`SOCKET_CONNECT_GRACE`] passes without
+/// it connecting.
 async fn publish_remote_liveness(
 	pair: PairId,
 	mut live: tokio::sync::watch::Receiver<bool>,
 	status: tokio::sync::watch::Sender<WatchStatus>,
 ) {
-	// The first reading is usually a socket still connecting as the watch starts: logged quietly,
-	// where a socket that drops later is worth a warning.
-	let mut first = true;
+	if !*live.borrow_and_update()
+		&& let Ok(Err(_)) = tokio::time::timeout(SOCKET_CONNECT_GRACE, live.changed()).await
+	{
+		return;
+	}
 	loop {
 		let connected = *live.borrow_and_update();
 		status.send_if_modified(|status| {
@@ -900,15 +911,14 @@ async fn publish_remote_liveness(
 			if status.remote_events_degraded == degraded {
 				return false;
 			}
-			match (connected, first) {
-				(true, _) => tracing::info!("sync pair {pair}: the cache's socket is connected"),
-				(false, true) => tracing::debug!("sync pair {pair}: {SOCKET_NOT_CONNECTED}"),
-				(false, false) => tracing::warn!("sync pair {pair}: {SOCKET_NOT_CONNECTED}"),
+			if connected {
+				tracing::info!("sync pair {pair}: the cache's socket is connected");
+			} else {
+				tracing::warn!("sync pair {pair}: {SOCKET_NOT_CONNECTED}");
 			}
 			status.remote_events_degraded = degraded;
 			true
 		});
-		first = false;
 		if live.changed().await.is_err() {
 			return;
 		}

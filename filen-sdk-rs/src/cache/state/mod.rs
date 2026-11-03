@@ -120,6 +120,11 @@ const RESYNC_LOCK_PATIENT_ATTEMPTS: usize = 60;
 /// After a patient acquisition still times out (or any listing failure), the worker waits this
 /// long before re-attempting — so even a quiet account with no further events re-tries.
 const RESYNC_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+/// How long a catch-up that reached the server answers every later one (see
+/// [`CacheState::catch_up`]): the sync engine's default safety-net interval, so each pair's
+/// safety net still reads a remote at most one interval old while N pairs sharing this cache cost
+/// one gap-check, and at most one relist of every root, per interval instead of N of each.
+const CATCH_UP_REUSE: Duration = Duration::from_secs(300);
 /// How long the drive must stay quiet about the sync roots a socket write left short (see
 /// [`ShortRoots`]) before the worker lists them again. For a moment after it answers a restore the
 /// server lists the restored dir without what was in it (measured at well under a second), and a
@@ -264,6 +269,8 @@ pub(crate) struct CacheState {
 	/// `None` once every sender is gone (the arm disables itself, like `read_tasks`) and in
 	/// unit-test construction.
 	catch_ups: Option<UnboundedReceiver<CatchUpAck>>,
+	/// When the latest catch-up that reached the server ran (see [`CATCH_UP_REUSE`]).
+	caught_up_at: Option<TimerInstant>,
 	/// Whether this worker's latest attempt to converge its roots could reach the server, shared
 	/// with the socket callback and with the worker's shared handle state, which a sync pass reads
 	/// it through.
@@ -286,10 +293,10 @@ pub(crate) enum GapCheck {
 }
 
 /// The answer to a request to catch up with the server now (`RemoteEvents::catch_up`): sent once
-/// the worker has run its gap-check, and the resync that check found due, for it. Carries the
-/// transport failure that left the cache unable to reach the server, if one stands (see
-/// [`ResyncReach::unreachable`]).
-pub(crate) type CatchUpAck = tokio::sync::oneshot::Sender<Option<Arc<crate::Error>>>;
+/// the worker has run its gap-check, and the resync that check found due, for it. `Err` when the
+/// gap-check could not read the remote drive id, with that failure, or when a transport failure
+/// left the cache unable to reach the server since (see [`ResyncReach::unreachable`]).
+pub(crate) type CatchUpAck = tokio::sync::oneshot::Sender<Result<(), Arc<crate::Error>>>;
 
 #[cfg(test)]
 impl CacheState {
@@ -320,6 +327,7 @@ impl CacheState {
 			read_tasks: None,
 			gap_check: GapCheck::AwaitingSubscription,
 			catch_ups: None,
+			caught_up_at: None,
 			reach: Arc::default(),
 		};
 		state.init_db().unwrap();
@@ -360,6 +368,7 @@ impl CacheState {
 			read_tasks: None,
 			gap_check: GapCheck::AwaitingSubscription,
 			catch_ups: None,
+			caught_up_at: None,
 			reach: Arc::default(),
 		};
 		state.init_db().unwrap();
@@ -398,6 +407,7 @@ impl CacheState {
 			read_tasks: None,
 			gap_check: GapCheck::AwaitingSubscription,
 			catch_ups: None,
+			caught_up_at: None,
 			reach: Arc::default(),
 		};
 		state.init_db().unwrap();
@@ -694,6 +704,7 @@ impl CacheState {
 			read_tasks: Some(read_task_receiver),
 			gap_check: GapCheck::AwaitingSubscription,
 			catch_ups: Some(catch_up_receiver),
+			caught_up_at: None,
 		};
 		let reach = cache_state.reach.clone();
 
@@ -761,7 +772,8 @@ impl CacheState {
 			// drain saw the signal — `run_resync`'s lock-wait drains events too.
 			if self.gap_check == GapCheck::Due {
 				self.gap_check = GapCheck::Done;
-				self.run_gap_check().await;
+				// A failure is logged and recorded on `reach` by the check itself.
+				let _ = self.run_gap_check().await;
 			}
 			// `biased` checks arms top-down: control (shutdown) first, then search read tasks
 			// (quick SELECTs — prioritized over events so a sustained event flood can never
@@ -2662,13 +2674,16 @@ impl CacheState {
 	/// pass that asks the cache to catch up while its socket is not live
 	/// ([`catch_up`](Self::catch_up)). Each is a *suspicion* of a gap, not a certain hole, so it
 	/// must never force a resync when nothing changed (that is the difference from `needs_resync`,
-	/// which is reserved for observed holes). Falls back to the durable-flag-only check if there is no client (unit tests) or the
-	/// remote read fails (the live socket will still surface any later hole, and the next boot's
-	/// gap-check is the backstop).
-	async fn run_gap_check(&mut self) {
+	/// which is reserved for observed holes). Falls back to the durable-flag-only check if there is
+	/// no client (unit tests) or the remote read fails (the live socket will still surface any later
+	/// hole, and the next boot's gap-check is the backstop).
+	///
+	/// `Err` is the failure to read the remote drive id, whatever its kind, for a caller that must
+	/// not take the check as run.
+	async fn run_gap_check(&mut self) -> Result<(), Arc<crate::Error>> {
 		let Some(deps) = self.resync.clone() else {
 			self.maybe_run_resync().await;
-			return;
+			return Ok(());
 		};
 		let since = self.reach.mark();
 		let remote = match deps.client.get_last_event_ids().await {
@@ -2681,9 +2696,10 @@ impl CacheState {
 					"gap-check: could not read the remote drive id ({e}); falling back to the \
 					 durable resync flag"
 				);
-				self.reach.failed(since, e);
+				let e = Arc::new(e);
+				self.reach.failed(since, Arc::clone(&e));
 				self.maybe_run_resync().await;
-				return;
+				return Err(e);
 			}
 		};
 		match self.should_resync_for_remote(remote) {
@@ -2706,6 +2722,7 @@ impl CacheState {
 				self.run_resync_surfacing_errors().await;
 			}
 		}
+		Ok(())
 	}
 
 	/// Answer `first` and every other request to catch up already queued behind it with ONE
@@ -2715,8 +2732,14 @@ impl CacheState {
 	/// drive did meanwhile (see `RemoteEvents::catch_up`). Several pairs' passes asking at once
 	/// cost one read of the drive id, and a relist only when the drive moved.
 	///
-	/// Each request is answered with the transport failure that left the cache unable to reach the
-	/// server, while one stands; a request whose asker has gone is dropped unanswered.
+	/// A catch-up that reached the server less than [`CATCH_UP_REUSE`] ago answers the requests
+	/// instead, with nothing read, unless a hole is durably flagged since (a relist that did not
+	/// converge flags one): one relist serves every pair this worker serves for that long, where
+	/// each pair's safety net asking on its own clock would relist every root once per pair.
+	///
+	/// Each request is answered with the failure to read the remote drive id, or else the transport
+	/// failure that left the cache unable to reach the server, while one stands; a request whose
+	/// asker has gone is dropped unanswered.
 	async fn catch_up(&mut self, first: CatchUpAck) {
 		let mut acks = vec![first];
 		if let Some(catch_ups) = &mut self.catch_ups {
@@ -2724,15 +2747,37 @@ impl CacheState {
 				acks.push(ack);
 			}
 		}
-		tracing::debug!(
-			"catch-up: {} request(s) for the remote as it stands now",
-			acks.len()
-		);
-		self.run_gap_check().await;
-		let unreachable = self.reach.unreachable();
+		let outcome = if let Some(ago) = self.recent_catch_up() {
+			tracing::debug!(
+				"catch-up: {} request(s) answered by the catch-up of {ago:?} ago",
+				acks.len()
+			);
+			Ok(())
+		} else {
+			tracing::debug!(
+				"catch-up: {} request(s) for the remote as it stands now",
+				acks.len()
+			);
+			let outcome = match self.run_gap_check().await {
+				Ok(()) => self.reach.unreachable().map_or(Ok(()), Err),
+				Err(e) => Err(e),
+			};
+			if outcome.is_ok() {
+				self.caught_up_at = Some(TimerInstant::now());
+			}
+			outcome
+		};
 		for ack in acks {
-			let _ = ack.send(unreachable.clone());
+			let _ = ack.send(outcome.clone());
 		}
+	}
+
+	/// How long ago the latest catch-up that reached the server ran, while it still answers for
+	/// the remote (see [`catch_up`](Self::catch_up)).
+	fn recent_catch_up(&self) -> Option<Duration> {
+		let ago = TimerInstant::now().duration_since(self.caught_up_at?);
+		// A flag that cannot be read counts as set: a needless gap-check beats a missed hole.
+		(ago < CATCH_UP_REUSE && !self.needs_resync().unwrap_or(true)).then_some(ago)
 	}
 
 	/// The write-locked resync: list every sync root's subtree under the drive lock, read the

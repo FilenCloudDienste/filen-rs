@@ -3507,7 +3507,9 @@ impl SyncEngine {
 	/// Have the cache serving `pair` catch up with the server (see [`RemoteEvents::catch_up`]),
 	/// for a pass about to read the remote whole while nothing announces its changes. Fails with
 	/// the transport failure, as a pass that could not reach the server, when the cache could not
-	/// reach it.
+	/// reach it; with the cache's own failure, its kind kept, when the server answered with one;
+	/// and as a view that did not converge ([`ErrorKind::StaleState`]) when the cache has not
+	/// answered within [`CONVERGENCE_WAIT`], as the wait for the view after it would.
 	async fn catch_up_remote(
 		&self,
 		pair: PairId,
@@ -3517,9 +3519,20 @@ impl SyncEngine {
 		tracing::info!(
 			"sync pair {pair}: the cache's socket is not connected, so no remote change is announced; asking the cache to catch up with the server before this pass reads the remote"
 		);
-		match events.catch_up().await? {
-			None => Ok(()),
-			Some(failure) => Err(remote_unreachable(pair, remote_root, failure)),
+		match tokio::time::timeout(CONVERGENCE_WAIT, events.catch_up()).await {
+			Ok(Ok(())) => Ok(()),
+			Ok(Err(failure)) if failure.kind() == ErrorKind::Reqwest => {
+				Err(remote_unreachable(pair, remote_root, failure))
+			}
+			Ok(Err(failure)) => Err(Error::custom_with_source(
+				failure.kind(),
+				failure,
+				Some(format!(
+					"sync pair {pair}: the cache could not catch up with the server for the \
+					 remote folder {remote_root}"
+				)),
+			)),
+			Err(_) => Err(remote_not_converged(pair, remote_root)),
 		}
 	}
 
@@ -6919,14 +6932,15 @@ impl SyncEngine {
 			.map_err(|e| Err(db_error(e, "loading the sync pair")))?
 			.ok_or_else(|| Err(Error::custom(ErrorKind::InvalidState, "unknown sync pair")))?
 			.remote_root;
-		let given_up = async {
-			tokio::select! {
-				() = changes.waiting_stopped() => {}
-				() = gate.halted() => {}
-			}
-		};
+		// Created before the catch-up starts, so a stop that lands while the cache catches up ends
+		// that as well as the wait for the view after it.
+		let mut given_up = std::pin::pin!(wait_given_up(changes, gate));
 		let caught_up = async {
-			self.catch_up_remote(pair, remote_root, events).await?;
+			tokio::select! {
+				biased;
+				() = given_up.as_mut() => return Err(remote_not_converged(pair, remote_root)),
+				caught_up = self.catch_up_remote(pair, remote_root, events) => caught_up?,
+			}
 			self.await_remote_view(pair, Some(observer), given_up).await
 		};
 		match gate.guard(caught_up).await {
@@ -6960,12 +6974,7 @@ impl SyncEngine {
 		// nothing in flight for a resume to carry on with, and parked behind it the pass would hold
 		// its caller for up to the whole wait. So does a watch being stopped or the engine being
 		// closed (`cut_loose_pass`), which leave nobody to wait for.
-		let given_up = async {
-			tokio::select! {
-				() = changes.waiting_stopped() => {}
-				() = gate.halted() => {}
-			}
-		};
+		let given_up = wait_given_up(&changes, &gate);
 		let Some(converged) = gate
 			.guard(self.await_remote_view(pair, Some(&mut *observer), given_up))
 			.await
@@ -6983,6 +6992,12 @@ impl SyncEngine {
 		// in the snapshot this pass is about to read (a harmless duplicate) or not yet, and this
 		// pass has it. What arrives from here on belongs to the next pass (see `changes`).
 		let mut scope = changes.take();
+		// What reading both sides costs this pair — measured over the read and nothing else, since
+		// the watch's safety net scales its interval by it (see `SyncReport::read_cost`). The
+		// migration's walk is housekeeping that runs once, and is taken back out. A catch-up below
+		// counts: it is this pair's share of reading the remote while nothing announces it, and
+		// counting it stretches the net that asks for it.
+		let read_started = Instant::now();
 		// A safety-net or requested pass reads the remote whole to find what no announcement
 		// carried. While the cache's socket is not live NOTHING is announced, and the cache holds
 		// the remote only as of its last listing, so such a pass first has the cache catch up with
@@ -7000,10 +7015,6 @@ impl SyncEngine {
 			}
 		};
 		let (dirty_local, dirty_remote) = scope.sizes();
-		// What reading both sides costs this pair — measured over the read and nothing else, since
-		// the watch's safety net scales its interval by it (see `SyncReport::read_cost`). The
-		// migration's walk is housekeeping that runs once, and is taken back out.
-		let read_started = Instant::now();
 		// A clone for the migration's blocking thread: two channel handles.
 		let migrating = gate.clone();
 		// What a whole read's walk has got through, reported while the read runs: a first pass
@@ -8416,6 +8427,23 @@ where
 		biased;
 		answer = waiting => answer,
 		() = give_up => Ok(None),
+	}
+}
+
+/// What ends a pass's wait on the cache early (see [`SyncEngine::await_remote_view`]): the watch
+/// being stopped or the engine closed (`changes`' [`stop_waiting`](PairChanges::stop_waiting)), or
+/// the pair halted (see [`PassGate::halted`]). Listens for the stop from the moment this is CALLED,
+/// not from its first poll, so a stop rung before the wait it ends is polled is not lost.
+fn wait_given_up<'a>(
+	changes: &'a PairChanges,
+	gate: &'a PassGate,
+) -> impl Future<Output = ()> + 'a {
+	let stopped = changes.waiting_stopped();
+	async move {
+		tokio::select! {
+			() = stopped => {}
+			() = gate.halted() => {}
+		}
 	}
 }
 

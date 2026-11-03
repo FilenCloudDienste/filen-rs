@@ -14,10 +14,10 @@ use tokio::sync::Notify;
 use super::{
 	BASE_BACKOFF, Backoff, DEBOUNCE, FullPassReason, MAX_BACKOFF, MAX_DEBOUNCE_BURST,
 	MAX_SAFETY_NET, PairChanges, PairRoot, RemoteDoorbell, RemoteLiveness, SAFETY_NET,
-	SAFETY_NET_DUTY, SOCKET_NOT_CONNECTED, Stop, SyncReport, WatchConfig, WatchState, WatchStatus,
-	backoff, local_event_handler, net_due, net_interval, owes_a_pass, pass_outcome, publish_pass,
-	reached_no_server, read_both_sides_whole, start_local_watcher, triggers_pass,
-	wait_for_next_pass, wait_while_paused,
+	SAFETY_NET_DUTY, SOCKET_CONNECT_GRACE, SOCKET_NOT_CONNECTED, Stop, SyncReport, WatchConfig,
+	WatchState, WatchStatus, backoff, local_event_handler, net_due, net_interval, owes_a_pass,
+	pass_outcome, publish_pass, reached_no_server, read_both_sides_whole, start_local_watcher,
+	triggers_pass, wait_for_next_pass, wait_while_paused,
 };
 use crate::{
 	Error, ErrorKind,
@@ -1528,9 +1528,10 @@ impl RemoteLiveness for Liveness {
 
 /// Once subscribed, the status says whether the cache's socket is connected, as it changes and
 /// with no pass in between: degraded while it is down — from the start, for a socket a firewall
-/// never lets connect — clear once it connects, degraded again when it drops. A refusal before the
-/// subscription is replaced by what the socket says.
-#[tokio::test]
+/// never lets connect, once its first connect has had [`SOCKET_CONNECT_GRACE`] — clear once it
+/// connects, degraded again when it drops. A refusal before the subscription is replaced by what
+/// the socket says.
+#[tokio::test(start_paused = true)]
 async fn the_status_says_while_the_caches_socket_is_not_connected() {
 	let (status, mut health) = tokio::sync::watch::channel(WatchStatus::default());
 	let mut remote = RemoteDoorbell::<Liveness>::new(1, Arc::new(Notify::new()));
@@ -1557,10 +1558,18 @@ async fn the_status_says_while_the_caches_socket_is_not_connected() {
 	let degraded = |health: &tokio::sync::watch::Receiver<WatchStatus>| {
 		health.borrow().remote_events_degraded.clone()
 	};
+	tokio::time::sleep(SOCKET_CONNECT_GRACE / 2).await;
+	assert_eq!(
+		degraded(&health),
+		None,
+		"a socket still making its first connect is not reported down"
+	);
+	let waited = tokio::time::Instant::now();
 	health
 		.wait_for(|status| status.remote_events_degraded.as_deref() == Some(SOCKET_NOT_CONNECTED))
 		.await
 		.unwrap();
+	assert!(waited.elapsed() >= SOCKET_CONNECT_GRACE / 2);
 
 	socket.send_replace(true);
 	health
@@ -1581,4 +1590,28 @@ async fn the_status_says_while_the_caches_socket_is_not_connected() {
 	socket.send_replace(true);
 	tokio::task::yield_now().await;
 	assert_eq!(degraded(&health).as_deref(), Some(SOCKET_NOT_CONNECTED));
+}
+
+/// A socket that connects within [`SOCKET_CONNECT_GRACE`] of the watch subscribing — every launch
+/// on a working network — never shows as down.
+#[tokio::test(start_paused = true)]
+async fn a_socket_that_connects_within_the_grace_never_shows_as_down() {
+	let (status, mut health) = tokio::sync::watch::channel(WatchStatus::default());
+	let mut remote = RemoteDoorbell::<Liveness>::new(1, Arc::new(Notify::new()));
+	let (socket, live) = tokio::sync::watch::channel(false);
+	remote
+		.subscribe(
+			|_| std::future::ready(Ok::<_, Error>(Liveness(live))),
+			&status,
+		)
+		.await;
+	health.mark_unchanged();
+	tokio::time::sleep(SOCKET_CONNECT_GRACE / 2).await;
+	socket.send_replace(true);
+	tokio::time::sleep(SOCKET_CONNECT_GRACE * 2).await;
+	assert!(
+		!health.has_changed().unwrap(),
+		"the status never said the socket was down"
+	);
+	assert_eq!(health.borrow().remote_events_degraded, None);
 }

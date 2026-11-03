@@ -228,7 +228,8 @@ pub struct SyncReport {
 	/// makes the trigger table observable from the outside while it is still being built.
 	pub full_pass: Option<FullPassReason>,
 	/// How long this pass spent READING: the baseline, the local scan, the remote snapshot and the
-	/// view. Zero on a pass that never got that far.
+	/// view, and the cache's catch-up with the server for a pass that had it catch up first (see
+	/// [`FullPassReason::RemoteEventsDegraded`]). Zero on a pass that never got that far.
 	///
 	/// This — and not the pass's wall time — is what a watch's safety net scales its interval by
 	/// (see [`WatchConfig::safety_net`](super::WatchConfig::safety_net)). What the net trades

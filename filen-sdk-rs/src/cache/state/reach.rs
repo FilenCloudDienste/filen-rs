@@ -121,12 +121,13 @@ impl ResyncReach {
 
 	/// A request sent at `since` failed with `error`. A transport failure is recorded unless the
 	/// socket has connected since; any other failure is the server answering.
-	pub(crate) fn failed(&self, since: ReachMark, error: Error) {
+	pub(crate) fn failed(&self, since: ReachMark, error: impl Into<Arc<Error>>) {
+		let error = error.into();
 		let mut failure = self.failure();
 		if error.kind() != ErrorKind::Reqwest {
 			*failure = None;
 		} else if self.connections() == since.0 {
-			*failure = Some((Arc::new(error), since.0));
+			*failure = Some((error, since.0));
 		}
 	}
 

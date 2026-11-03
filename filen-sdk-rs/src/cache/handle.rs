@@ -781,22 +781,25 @@ impl RemoteEvents {
 
 	/// Bring the worker up to date with the server now: it reads the remote drive id and relists
 	/// its roots if the drive moved since what it holds (the gap-check its socket runs after every
-	/// reconnect), coalescing requests that arrive together. Resolves once that has run: `Ok(None)`
-	/// when the server was reached, `Ok(Some(failure))` with the transport failure when it could not
-	/// be, and `Err` when the worker has exited.
+	/// reconnect), coalescing requests that arrive together, and answering from a catch-up that
+	/// reached the server moments ago. Resolves once that has run: `Ok` when the server was
+	/// reached, and `Err` with the failure when it could not be (a transport failure is
+	/// [`ErrorKind::Reqwest`]) or the worker has exited ([`ErrorKind::Internal`]). Unbounded: the
+	/// worker answers between its other work, a relist under a contended drive lock included, so a
+	/// caller bounds the wait.
 	///
 	/// A relist that has not converged when this returns (the drive lock is contended) is still
 	/// pending; the root reads as not converged until it lands.
-	pub(crate) async fn catch_up(&self) -> Result<Option<Arc<Error>>, Error> {
+	pub(crate) async fn catch_up(&self) -> Result<(), Arc<Error>> {
 		let worker_gone = || {
-			Error::custom(
+			Arc::new(Error::custom(
 				ErrorKind::Internal,
 				"the cache worker exited before it caught up with the server",
-			)
+			))
 		};
 		let (ack, answer) = tokio::sync::oneshot::channel();
 		self.catch_up.send(ack).map_err(|_| worker_gone())?;
-		answer.await.map_err(|_| worker_gone())
+		answer.await.map_err(|_| worker_gone())?
 	}
 }
 
