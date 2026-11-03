@@ -11,7 +11,7 @@ use crate::auth::{http::AuthClient, unauth::test_support::offline_unauthed};
 
 /// A client whose every request fails to connect without leaving the machine: a release or
 /// refresh a test sets off must never reach the gateway.
-fn offline_client() -> Arc<AuthClient> {
+pub(crate) fn offline_client() -> Arc<AuthClient> {
 	Arc::new(AuthClient::from_unauthed(
 		offline_unauthed(),
 		Arc::new(RwLock::new(APIKey(Cow::Borrowed("")))),

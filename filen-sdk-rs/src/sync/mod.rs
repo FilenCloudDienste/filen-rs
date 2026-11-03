@@ -129,6 +129,20 @@ impl Client {
 			.await
 	}
 
+	/// Resolves once the server has answered every release of this client's locks sent so far,
+	/// or the release was given up on (one failing in transport is sent again while its lease
+	/// could still stand). Releases sent while it waits are waited for too, and so is every
+	/// lock request whose caller stopped waiting for it, until its answer arrives and a grant
+	/// nobody took any more is released.
+	///
+	/// Dropping the last handle of a lock sends its release from a spawned task, which a runtime
+	/// shutting down cancels. The server then holds the lock until its lease runs out, about a
+	/// minute later, and every other client that needs it waits that long. A process that exits
+	/// once its work is done awaits this first, after dropping its locks.
+	pub async fn wait_for_lock_releases(&self) {
+		self.client().pending_lock_releases.settled().await;
+	}
+
 	pub async fn lock_notes(&self) -> Result<Arc<lock::ResourceLock>, Error> {
 		self.lock_resource(&self.notes_lock, "notes-write").await
 	}

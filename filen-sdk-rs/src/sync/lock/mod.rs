@@ -103,7 +103,8 @@ pub(crate) const LOCK_RELEASE_SETTLE_BOUND: Duration = Duration::from_secs(5);
 
 /// A client's lock requests that may leave a lease behind and are not answered yet: releases,
 /// and acquisitions whose grant is released by their own task (see `request_acquire`). They run
-/// detached, so this count is what lets a shutdown wait for them before the process exits.
+/// detached, so this count is what lets a shutdown wait for them before the process exits
+/// ([`Client::settle_lock_releases`], [`Client::wait_for_lock_releases`]).
 #[derive(Debug)]
 pub(crate) struct PendingReleases(tokio::sync::watch::Sender<usize>);
 
@@ -127,10 +128,13 @@ impl PendingReleases {
 		all(test, not(all(target_family = "wasm", target_os = "unknown")))
 	))]
 	pub(crate) async fn settle(&self, bound: Duration) -> bool {
-		let mut pending = self.0.subscribe();
-		timeout(bound, pending.wait_for(|pending| *pending == 0).map(drop))
-			.await
-			.is_ok()
+		timeout(bound, self.settled()).await.is_ok()
+	}
+
+	/// Resolves once no request is pending, at once when none is.
+	pub(crate) async fn settled(&self) {
+		// The sender is a field of `self`, so the channel cannot close while this waits.
+		let _ = self.0.subscribe().wait_for(|pending| *pending == 0).await;
 	}
 }
 
@@ -164,8 +168,9 @@ impl Drop for PendingRelease {
 /// falling back to the runtime the lock was acquired on; if neither is available (or the
 /// fallback runtime has shut down), the release is skipped and the server expires the lock on
 /// its own after ~60 seconds. A release failing in transport is sent again while the lease could
-/// still stand. Closing the sync engine waits for the releases still in flight, retries
-/// included, for a few seconds at most, so a host that exits right after does not cut them off.
+/// still stand. A runtime that shuts down cancels a release it has not sent yet in the same way,
+/// so closing the sync engine waits for the releases still in flight, retries included, for a few
+/// seconds at most, and a process awaits [`Client::wait_for_lock_releases`] before it exits.
 #[derive(Debug, Clone)]
 pub struct ResourceLock {
 	lease: Arc<SharedLease>,
@@ -771,7 +776,9 @@ fn keep_lock_alive(lease: &Arc<SharedLease>) {
 /// resource for every client until it expires. Whoever sees the answer decides what happens to it:
 /// the caller, if it is still waiting, and otherwise the task, which releases what was granted.
 /// Only the task can do that safely — a release sent the moment the caller gave up can reach the
-/// server before the grant does, and then releases nothing.
+/// server before the grant does, and then releases nothing. The task counts in the client's
+/// [`PendingReleases`] until it handed the answer over or released the grant, so a process that
+/// exits after its caller gave up still waits for that release.
 async fn request_acquire(
 	client: Arc<AuthClient>,
 	url: Arc<str>,

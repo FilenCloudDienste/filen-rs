@@ -2,7 +2,7 @@
 use tokio::net::TcpListener;
 
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-use super::test_support::{test_lock, test_lock_on};
+use super::test_support::{offline_client, test_lock, test_lock_on};
 use super::*;
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 use crate::auth::http::{
@@ -177,6 +177,85 @@ fn a_lock_declared_lost_sends_a_release_once() {
 	assert_eq!(rt.metrics().num_alive_tasks(), 1);
 	lock.lease.mark_lost();
 	assert_eq!(rt.metrics().num_alive_tasks(), 1, "a loss is released once");
+}
+
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+#[test]
+fn no_release_is_waited_for_while_the_lock_is_held() {
+	let rt = tokio::runtime::Builder::new_current_thread()
+		.enable_all()
+		.build()
+		.unwrap();
+	let lock = rt.block_on(async { test_lock(tokio::runtime::Handle::try_current().ok()) });
+
+	assert!(
+		lock.lease
+			.client
+			.pending_lock_releases
+			.settled()
+			.now_or_never()
+			.is_some()
+	);
+}
+
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+#[test]
+fn the_release_of_a_dropped_lock_is_waited_for_until_it_is_answered() {
+	// paused, so the retries of the release, which fails offline, take no real time
+	let rt = tokio::runtime::Builder::new_current_thread()
+		.enable_all()
+		.start_paused(true)
+		.build()
+		.unwrap();
+	let lock = rt.block_on(async { test_lock(tokio::runtime::Handle::try_current().ok()) });
+	let client = Arc::clone(&lock.lease.client);
+	let _guard = rt.enter();
+	std::mem::drop(lock);
+
+	assert!(
+		client
+			.pending_lock_releases
+			.settled()
+			.now_or_never()
+			.is_none(),
+		"the release is not sent until the runtime runs it"
+	);
+	rt.block_on(client.pending_lock_releases.settled());
+	assert_eq!(rt.metrics().num_alive_tasks(), 0);
+}
+
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+#[test]
+fn a_lock_request_its_caller_stopped_waiting_for_is_waited_for_until_it_ends() {
+	// paused, so the retries of the request, which fails offline, take no real time
+	let rt = tokio::runtime::Builder::new_current_thread()
+		.enable_all()
+		.start_paused(true)
+		.build()
+		.unwrap();
+	let client = offline_client();
+	let mut request = Box::pin(request_acquire(
+		Arc::clone(&client),
+		lock_url().into(),
+		Bytes::new(),
+		Uuid::from_u128(1),
+		"test-resource".into(),
+	));
+	rt.block_on(async {
+		assert!(futures::poll!(&mut request).is_pending());
+	});
+	std::mem::drop(request);
+
+	assert!(
+		client
+			.pending_lock_releases
+			.settled()
+			.now_or_never()
+			.is_none(),
+		"a grant nobody waits for any more would have to be released"
+	);
+	rt.block_on(client.pending_lock_releases.settled());
+	assert_eq!(rt.metrics().num_alive_tasks(), 0);
 }
 
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
