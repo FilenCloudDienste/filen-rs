@@ -405,10 +405,15 @@ impl UI {
 		}
 	}
 
-	/// Print a grid of strings (like an ls command's output)
+	/// Print a grid of strings (like an ls command's output), or one per line when stdout is not
+	/// a terminal and no width is set, so that a program reading it gets one item per line
 	pub(crate) fn print_grid(&mut self, items: &[&str]) {
 		if items.is_empty() {
 			self.print("");
+			return;
+		}
+		if self.override_terminal_width.is_none() && !self.stdout_is_terminal {
+			self.print(&items.join("\n"));
 			return;
 		}
 		let terminal_width = self.get_terminal_width().unwrap_or(10);
@@ -1187,6 +1192,31 @@ mod tests {
 		// no color
 		console::set_colors_enabled(false);
 		insta::assert_snapshot!(printed(100));
+	}
+
+	#[test]
+	fn a_grid_prints_one_item_per_line_when_stdout_is_not_a_terminal() {
+		let printed = Printed::default();
+		printed.ui().print_grid(&["a", "b", "c"]);
+		assert_eq!(printed.lines(), "a\nb\nc");
+	}
+
+	#[test]
+	fn a_grid_fills_a_set_width_when_stdout_is_not_a_terminal() {
+		let printed = Printed::default();
+		let mut ui = printed.ui();
+		ui.initialize(false, false, Some(80), true, false);
+		ui.print_grid(&["a", "b", "c"]);
+		assert_eq!(printed.lines(), "a  b  c");
+	}
+
+	#[test]
+	fn a_grid_fills_a_set_width_on_a_terminal() {
+		let printed = Printed::default();
+		let mut ui = printed.terminal_ui();
+		ui.initialize(false, false, Some(80), true, false);
+		ui.print_grid(&["a", "b", "c"]);
+		assert_eq!(printed.lines(), "a  b  c");
 	}
 
 	#[test]
