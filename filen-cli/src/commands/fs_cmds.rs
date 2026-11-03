@@ -1634,7 +1634,9 @@ pub(crate) async fn list_recents(ui: &mut UI, client: &mut LazyClient) -> Result
 		.list_recents(None::<&fn(u64, Option<u64>)>)
 		.await
 		.context("Failed to list recents")?;
-	print_items_with_full_paths(ui, client, dirs, files, "No recent items").await
+	// in the order the server lists them, which sorting by path would lose
+	let items = list_with_full_paths(client, &dirs, &files).await?;
+	print_listing(ui, &items, ListedBy::Path, "No recent items", false)
 }
 
 /// Prints a listing whose items don't share a parent, so a bare name wouldn't identify them:
