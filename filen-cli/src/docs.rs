@@ -539,10 +539,10 @@ fn respond_with_section(parsed_doc_outline: &[ParsedDocSection], request: Reques
 
 // AI-generated docs styles, might change later
 // since this is not very critical, it's okay for now that it's not checked at compile time etc
+// It loads nothing from elsewhere: a page served from this machine makes no outside request, so
+// Inter and JetBrains Mono are used only where they are installed, with the system fonts next.
 const HTML_STYLE: &str = "
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap');
-
 :root{
 	--bg:#0b0f13; /* very dark */
 	--panel:#0f1418;
@@ -609,6 +609,13 @@ mod tests {
 		let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
 		let address = server.server_addr().to_ip().unwrap();
 		(server, address)
+	}
+
+	#[test]
+	fn the_html_docs_load_nothing_from_elsewhere() {
+		for external in ["http://", "https://", "@import", "url("] {
+			assert!(!HTML_STYLE.contains(external), "{external}");
+		}
 	}
 
 	#[test]
