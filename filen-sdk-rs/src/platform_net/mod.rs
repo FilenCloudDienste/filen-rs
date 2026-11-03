@@ -18,12 +18,13 @@ use hyper_util::client::{
 	proxy::matcher::{Intercept, Matcher},
 };
 use rustls::{
-	DigitallySignedStruct, DistinguishedName, SignatureScheme,
+	CertificateError, DigitallySignedStruct, DistinguishedName, OtherError, SignatureScheme,
 	client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
 	crypto::CryptoProvider,
 	pki_types::{CertificateDer, ServerName, UnixTime},
 };
 use rustls_platform_verifier::Verifier;
+use sha2::{Digest, Sha256};
 use tokio::net::TcpStream;
 use tokio_tungstenite::{
 	Connector, MaybeTlsStream, WebSocketStream, tungstenite::client::IntoClientRequest,
@@ -51,7 +52,9 @@ pub(crate) fn platform_tls_config() -> Option<rustls::ClientConfig> {
 			let verifier = Verifier::new(builder.crypto_provider().clone())?;
 			Ok(builder
 				.dangerous()
-				.with_custom_certificate_verifier(Arc::new(OffloadingVerifier(verifier))))
+				.with_custom_certificate_verifier(Arc::new(DistrustingVerifier::new(
+					OffloadingVerifier(verifier),
+				))))
 		});
 	match built {
 		Ok(builder) => {
@@ -65,6 +68,156 @@ pub(crate) fn platform_tls_config() -> Option<rustls::ClientConfig> {
 			);
 			None
 		}
+	}
+}
+
+/// SHA-256 of each public key rustls-webpki 0.103.16 distrusts (`DISTRUSTED_SPKIS` in its
+/// `src/verify_cert.rs`, the files under `src/data/distrusted/`): the SubjectPublicKeyInfo
+/// contents, without the SEQUENCE's tag and length, of the eMudhra intermediates under emSign
+/// ECC Root CA - G3, which their cross-signs under Sectigo's AAA Certificate Services share. The
+/// crate keeps the list to itself; `the_distrust_list_mirrors_rustls_webpki` fails until a bump
+/// that changes it is mirrored here.
+const DISTRUSTED_SPKI_SHA256: [[u8; 32]; 8] = [
+	// EMDVTLSCAG3B
+	hex32("2d5f988ee3ceaf696845a34299ca3e05816429cdb5de92427889533175f97b95"),
+	// EMDVTLSCAG3C
+	hex32("616e9a92539c40f454813f7fb8ae4a6db719498495215774f02d8b8b5a615d36"),
+	// EMEVTLSCAG3B
+	hex32("bdf5ab18303069ebc3e3ddbb0fc0613693acef01b2fb7be1a0624aab60fbff0d"),
+	// EMEVTLSCAG3C
+	hex32("b941c7577b918f7b9a9374aff3b02d8eda92545c86adb5b5268d1e121fe58ce2"),
+	// EMOVTLSCAG3B
+	hex32("7f09de2d155cc9fbc2dc4585f2c134ea3fc04ea9d9b3e31fa2d6bf9fdc0a02a2"),
+	// EMOVTLSCAG3C
+	hex32("6fc13706463e00b2cd2ae357f86de2441e59d501e322c7a02a531a9871e450f6"),
+	// EMOVCSCAG3B
+	hex32("e8263cea915a92109a29fb497105dceeeb58fa099c2552c4082aff1e1a9a33b2"),
+	// EMOVCSCAG3C
+	hex32("09f75d128061fcdc6d31d8317ce3fe0aea4dab2c66777ce548858dd23f763ce7"),
+];
+
+/// 64 hex digits as 32 bytes, at compile time.
+const fn hex32(hex: &str) -> [u8; 32] {
+	const fn digit(c: u8) -> u8 {
+		match c {
+			b'0'..=b'9' => c - b'0',
+			b'a'..=b'f' => c - b'a' + 10,
+			_ => panic!("not a lowercase hex digit"),
+		}
+	}
+	let hex = hex.as_bytes();
+	assert!(hex.len() == 64, "not 32 bytes of hex");
+	let mut bytes = [0u8; 32];
+	let mut i = 0;
+	while i < 32 {
+		bytes[i] = (digit(hex[2 * i]) << 4) | digit(hex[2 * i + 1]);
+		i += 1;
+	}
+	bytes
+}
+
+/// The OS's verifier, with rustls-webpki's distrust of compromised CA keys on top: on macOS and
+/// Windows the platform verifier hands the whole check to the OS, which accepts such a key while
+/// its own blocklist lacks it (an OS whose root and disallowed-certificate updates are off). A
+/// chain the OS accepts is rejected when any certificate it presents (the end entity and the
+/// intermediates) has a public key on [`DISTRUSTED_SPKI_SHA256`], with the error a rustls-webpki
+/// rejection gives, so it reads as a certificate problem rather than as offline. The OS checks
+/// first, so a chain it refuses fails as it did; the keys of a chain it accepts are hashed once
+/// per handshake, and nothing is checked per request.
+#[derive(Debug)]
+struct DistrustingVerifier<V> {
+	inner: V,
+	/// [`DISTRUSTED_SPKI_SHA256`], or a test's own.
+	distrusted: &'static [[u8; 32]],
+}
+
+impl<V> DistrustingVerifier<V> {
+	fn new(inner: V) -> Self {
+		Self {
+			inner,
+			distrusted: &DISTRUSTED_SPKI_SHA256,
+		}
+	}
+
+	/// Whether `cert`'s public key is distrusted. A certificate that cannot be parsed has none:
+	/// the OS accepted the chain, and only the keys are checked here.
+	fn distrusts(&self, cert: &CertificateDer<'_>) -> bool {
+		let Ok(parsed) = webpki::EndEntityCert::try_from(cert) else {
+			return false;
+		};
+		let spki = parsed.subject_public_key_info();
+		let digest: [u8; 32] = Sha256::digest(sequence_contents(spki.as_ref())).into();
+		self.distrusted.contains(&digest)
+	}
+}
+
+impl<V: ServerCertVerifier> ServerCertVerifier for DistrustingVerifier<V> {
+	fn verify_server_cert(
+		&self,
+		end_entity: &CertificateDer<'_>,
+		intermediates: &[CertificateDer<'_>],
+		server_name: &ServerName<'_>,
+		ocsp_response: &[u8],
+		now: UnixTime,
+	) -> Result<ServerCertVerified, rustls::Error> {
+		let verified = self.inner.verify_server_cert(
+			end_entity,
+			intermediates,
+			server_name,
+			ocsp_response,
+			now,
+		)?;
+		if std::iter::once(end_entity)
+			.chain(intermediates)
+			.any(|cert| self.distrusts(cert))
+		{
+			return Err(rustls::Error::InvalidCertificate(CertificateError::Other(
+				OtherError(Arc::new(webpki::Error::CertDistrusted)),
+			)));
+		}
+		Ok(verified)
+	}
+
+	fn verify_tls12_signature(
+		&self,
+		message: &[u8],
+		cert: &CertificateDer<'_>,
+		dss: &DigitallySignedStruct,
+	) -> Result<HandshakeSignatureValid, rustls::Error> {
+		self.inner.verify_tls12_signature(message, cert, dss)
+	}
+
+	fn verify_tls13_signature(
+		&self,
+		message: &[u8],
+		cert: &CertificateDer<'_>,
+		dss: &DigitallySignedStruct,
+	) -> Result<HandshakeSignatureValid, rustls::Error> {
+		self.inner.verify_tls13_signature(message, cert, dss)
+	}
+
+	fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+		self.inner.supported_verify_schemes()
+	}
+
+	fn requires_raw_public_keys(&self) -> bool {
+		self.inner.requires_raw_public_keys()
+	}
+
+	fn root_hint_subjects(&self) -> Option<&[DistinguishedName]> {
+		self.inner.root_hint_subjects()
+	}
+}
+
+/// The contents of the DER SEQUENCE `der`, without its tag and length (a short form, or a long
+/// one of one or two bytes, which covers every public key): what rustls-webpki keeps of a
+/// SubjectPublicKeyInfo, and so what its distrust list holds.
+fn sequence_contents(der: &[u8]) -> &[u8] {
+	match der {
+		[0x30, 0x00..=0x7f, contents @ ..]
+		| [0x30, 0x81, _, contents @ ..]
+		| [0x30, 0x82, _, _, contents @ ..] => contents,
+		_ => der,
 	}
 }
 

@@ -493,3 +493,269 @@ fn platform_tls_offloads_the_check() {
 		assert!(format!("{config:?}").contains("OffloadingVerifier"));
 	}
 }
+
+/// DER `contents` under `tag`.
+fn tlv(tag: u8, contents: &[u8]) -> Vec<u8> {
+	let mut der = vec![tag];
+	match u16::try_from(contents.len()).unwrap() {
+		len @ 0..0x80 => der.push(u8::try_from(len).unwrap()),
+		len @ 0x80..0x100 => der.extend([0x81, u8::try_from(len).unwrap()]),
+		len => {
+			der.push(0x82);
+			der.extend(len.to_be_bytes());
+		}
+	}
+	der.extend(contents);
+	der
+}
+
+/// A certificate as rustls-webpki parses one, with SubjectPublicKeyInfo contents `spki` and
+/// nothing else in it checked: a verifier stands in for the OS, so no signature is made.
+fn cert_with_key(spki: &[u8]) -> CertificateDer<'static> {
+	// ecdsa-with-SHA384
+	let algorithm = tlv(
+		0x30,
+		&tlv(0x06, &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x03]),
+	);
+	let tbs = [
+		tlv(0xa0, &tlv(0x02, &[2])),
+		tlv(0x02, &[1]),
+		algorithm.clone(),
+		tlv(0x30, &[]),
+		tlv(0x30, &[]),
+		tlv(0x30, &[]),
+		tlv(0x30, spki),
+	]
+	.concat();
+	CertificateDer::from(tlv(
+		0x30,
+		&[tlv(0x30, &tbs), algorithm, tlv(0x03, &[0])].concat(),
+	))
+}
+
+/// A verifier that stands in for the OS: it answers every check with `accept` and counts the
+/// certificate checks.
+#[derive(Debug)]
+struct StandIn {
+	accept: bool,
+	checks: std::sync::atomic::AtomicUsize,
+}
+
+impl StandIn {
+	fn new(accept: bool) -> Self {
+		Self {
+			accept,
+			checks: std::sync::atomic::AtomicUsize::new(0),
+		}
+	}
+
+	fn answer<T>(&self, ok: T) -> Result<T, rustls::Error> {
+		if self.accept {
+			Ok(ok)
+		} else {
+			Err(rustls::Error::InvalidCertificate(
+				CertificateError::UnknownIssuer,
+			))
+		}
+	}
+}
+
+impl ServerCertVerifier for StandIn {
+	fn verify_server_cert(
+		&self,
+		_: &CertificateDer<'_>,
+		_: &[CertificateDer<'_>],
+		_: &ServerName<'_>,
+		_: &[u8],
+		_: UnixTime,
+	) -> Result<ServerCertVerified, rustls::Error> {
+		self.checks
+			.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+		self.answer(ServerCertVerified::assertion())
+	}
+
+	fn verify_tls12_signature(
+		&self,
+		_: &[u8],
+		_: &CertificateDer<'_>,
+		_: &DigitallySignedStruct,
+	) -> Result<HandshakeSignatureValid, rustls::Error> {
+		self.answer(HandshakeSignatureValid::assertion())
+	}
+
+	fn verify_tls13_signature(
+		&self,
+		_: &[u8],
+		_: &CertificateDer<'_>,
+		_: &DigitallySignedStruct,
+	) -> Result<HandshakeSignatureValid, rustls::Error> {
+		self.answer(HandshakeSignatureValid::assertion())
+	}
+
+	fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+		vec![SignatureScheme::ECDSA_NISTP384_SHA384]
+	}
+
+	fn requires_raw_public_keys(&self) -> bool {
+		true
+	}
+}
+
+fn check(
+	verifier: &impl ServerCertVerifier,
+	end_entity: &CertificateDer<'_>,
+	intermediates: &[CertificateDer<'_>],
+) -> Result<(), rustls::Error> {
+	verifier
+		.verify_server_cert(
+			end_entity,
+			intermediates,
+			&ServerName::try_from("gateway.filen.io").unwrap(),
+			&[],
+			UnixTime::now(),
+		)
+		.map(drop)
+}
+
+/// The error a rustls-webpki distrust rejection gives.
+fn is_distrust(error: &rustls::Error) -> bool {
+	matches!(
+		error,
+		rustls::Error::InvalidCertificate(CertificateError::Other(OtherError(e)))
+			if e.downcast_ref::<webpki::Error>() == Some(&webpki::Error::CertDistrusted)
+	)
+}
+
+/// SHA-256 of the SubjectPublicKeyInfo contents `spki`, as the distrust list holds a key.
+fn key_digest(spki: &[u8]) -> [u8; 32] {
+	Sha256::digest(spki).into()
+}
+
+const TRUSTED_KEY: &[u8] = b"\x30\x00\x03\x02\x00\x01";
+const DISTRUSTED_KEY: &[u8] = b"\x30\x00\x03\x02\x00\x02";
+
+/// A chain the OS accepts is refused when the end entity or an intermediate carries a distrusted
+/// key, with rustls-webpki's own distrust error, and passes without one.
+#[test]
+fn a_distrusted_key_in_the_chain_is_refused_though_the_os_accepts_it() {
+	let distrusted: &'static [[u8; 32]] = Box::leak(Box::new([key_digest(DISTRUSTED_KEY)]));
+	let verifier = DistrustingVerifier {
+		inner: StandIn::new(true),
+		distrusted,
+	};
+	let (trusted, bad) = (cert_with_key(TRUSTED_KEY), cert_with_key(DISTRUSTED_KEY));
+
+	check(&verifier, &trusted, std::slice::from_ref(&trusted))
+		.expect("a chain of trusted keys passes");
+	for (end_entity, intermediates) in [
+		(&bad, vec![trusted.clone()]),
+		(&trusted, vec![trusted.clone(), bad.clone()]),
+	] {
+		let refused = check(&verifier, end_entity, &intermediates).unwrap_err();
+		assert!(is_distrust(&refused), "{refused:?}");
+	}
+	assert_eq!(
+		verifier
+			.inner
+			.checks
+			.load(std::sync::atomic::Ordering::SeqCst),
+		3,
+		"the OS checks every chain first"
+	);
+
+	// A chain the OS refuses fails as the OS says.
+	let refusing = DistrustingVerifier {
+		inner: StandIn::new(false),
+		distrusted,
+	};
+	assert_eq!(
+		check(&refusing, &bad, &[]).unwrap_err(),
+		rustls::Error::InvalidCertificate(CertificateError::UnknownIssuer)
+	);
+}
+
+/// Everything but the chain check is the OS's verifier's answer, unchanged.
+#[test]
+fn the_distrusting_verifier_delegates_signature_checks() {
+	use rustls::internal::msgs::codec::{Codec, Reader};
+
+	// ECDSA_NISTP384_SHA384 (0x0503) over a 3-byte signature: rustls builds one only by decoding.
+	let dss = DigitallySignedStruct::read(&mut Reader::init(&[5, 3, 0, 3, 1, 2, 3])).unwrap();
+	let cert = cert_with_key(DISTRUSTED_KEY);
+	for accept in [true, false] {
+		let verifier = DistrustingVerifier::new(StandIn::new(accept));
+		assert_eq!(
+			verifier
+				.verify_tls12_signature(b"message", &cert, &dss)
+				.is_ok(),
+			accept
+		);
+		assert_eq!(
+			verifier
+				.verify_tls13_signature(b"message", &cert, &dss)
+				.is_ok(),
+			accept
+		);
+		assert_eq!(
+			verifier.supported_verify_schemes(),
+			[SignatureScheme::ECDSA_NISTP384_SHA384]
+		);
+		assert!(verifier.requires_raw_public_keys());
+		assert!(verifier.root_hint_subjects().is_none());
+	}
+}
+
+/// The distrust list is rustls-webpki's: the keys its `DISTRUSTED_SPKIS` names, read from its
+/// source as this build resolved it, hash to exactly [`DISTRUSTED_SPKI_SHA256`], so a bump that
+/// changes them fails here until the list follows. A chain carrying one of them is refused.
+#[test]
+fn the_distrust_list_mirrors_rustls_webpki() {
+	let metadata = std::process::Command::new(env!("CARGO"))
+		.args(["metadata", "--format-version", "1", "--offline"])
+		.current_dir(env!("CARGO_MANIFEST_DIR"))
+		.output()
+		.expect("cargo metadata runs");
+	assert!(metadata.status.success(), "{metadata:?}");
+	let metadata: serde_json::Value = serde_json::from_slice(&metadata.stdout).unwrap();
+	let mut lists = Vec::new();
+	for package in metadata["packages"].as_array().unwrap() {
+		if package["name"] != "rustls-webpki" {
+			continue;
+		}
+		let manifest = std::path::Path::new(package["manifest_path"].as_str().unwrap());
+		let src = manifest.parent().unwrap().join("src");
+		let source = std::fs::read_to_string(src.join("verify_cert.rs")).unwrap();
+		// Older majors have no list.
+		let Some((_, list)) = source.split_once("DISTRUSTED_SPKIS: &[&[u8]] = &[") else {
+			continue;
+		};
+		let (list, _) = list.split_once("];").unwrap();
+		let keys: Vec<Vec<u8>> = list
+			.split("include_bytes!(\"")
+			.skip(1)
+			.map(|entry| std::fs::read(src.join(entry.split_once('"').unwrap().0)).unwrap())
+			.collect();
+		lists.push((package["version"].to_string(), keys));
+	}
+	assert!(!lists.is_empty(), "no rustls-webpki with a distrust list");
+	for (version, keys) in lists {
+		let mut upstream: Vec<[u8; 32]> = keys.iter().map(|key| key_digest(key)).collect();
+		upstream.sort_unstable();
+		let mut ours = DISTRUSTED_SPKI_SHA256.to_vec();
+		ours.sort_unstable();
+		assert_eq!(upstream, ours, "rustls-webpki {version}");
+
+		let verifier = DistrustingVerifier::new(StandIn::new(true));
+		for key in &keys {
+			let refused = check(&verifier, &cert_with_key(key), &[]).unwrap_err();
+			assert!(is_distrust(&refused), "{refused:?}");
+		}
+	}
+}
+
+#[test]
+fn platform_tls_checks_the_distrusted_keys() {
+	if let Some(config) = platform_tls_config() {
+		assert!(format!("{config:?}").contains("DistrustingVerifier"));
+	}
+}

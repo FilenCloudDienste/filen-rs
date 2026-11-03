@@ -2255,6 +2255,7 @@ dependencies = [
  "rustls 0.23.32",
  "rustls-connector",
  "rustls-platform-verifier",
+ "rustls-webpki 0.103.16",
  "ruzstd",
  "same-file",
  "scraper",

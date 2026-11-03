@@ -401,6 +401,12 @@ rustls = { version = "0.23.32", default-features = false, features = [
 	"tls12",
 ] }
 rustls-platform-verifier = "0.7.1"
+# Its certificate parser, for the distrusted keys the platform verifier is checked against
+# (`platform_net::DISTRUSTED_SPKI_SHA256`); rustls already builds it.
+rustls-webpki = { version = "0.103.16", default-features = false, features = [
+	"alloc",
+	"std",
+] }
 # The proxy settings reqwest resolves (`Matcher::from_system`), its CONNECT tunnel and SOCKS5
 # connector, for the websocket, which reqwest does not carry.
 hyper-util = { version = "0.1.17", default-features = false, features = [
