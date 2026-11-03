@@ -46,6 +46,37 @@ fn authenticate_from_cli_args() {
 		));
 }
 
+#[test]
+fn authenticate_from_the_variables_of_the_old_cli() {
+	let (email, password) = get_testing_credentials();
+	let config_dir = assert_fs::TempDir::new().unwrap();
+	cargo_bin_cmd!()
+		.env("FILEN_CLI_TESTING_DISABLE_KEYRING", "1")
+		.env("FILEN_CLI_TESTING_DISABLE_AUTODETECTED_AUTH_CONFIG", "1")
+		.env_remove("FILEN_CLI_EMAIL")
+		.env_remove("FILEN_CLI_PASSWORD")
+		.env_remove("FILEN_CLI_2FA_CODE")
+		.env("FILEN_EMAIL", &email)
+		.env("FILEN_PASSWORD", &password)
+		.env_remove("FILEN_2FA_CODE")
+		.args([
+			"--skip-update",
+			"--config-dir",
+			config_dir.path().to_str().unwrap(),
+			"-v",
+			"stat",
+			"/",
+		])
+		.assert()
+		.success()
+		.stderr(predicates::str::contains(
+			"Using the credentials from FILEN_EMAIL and FILEN_PASSWORD",
+		))
+		.stderr(predicates::str::contains(
+			"Authenticated from CLI arguments",
+		));
+}
+
 #[shared_test_runtime]
 async fn export_and_authenticate_from_auth_config() {
 	let workdir = assert_fs::TempDir::new().unwrap();
@@ -89,6 +120,9 @@ fn a_missing_auth_config_path_fails_without_prompting() {
 		.env_remove("FILEN_CLI_EMAIL")
 		.env_remove("FILEN_CLI_PASSWORD")
 		.env_remove("FILEN_CLI_2FA_CODE")
+		.env_remove("FILEN_EMAIL")
+		.env_remove("FILEN_PASSWORD")
+		.env_remove("FILEN_2FA_CODE")
 		.args([
 			"--skip-update",
 			"--config-dir",
@@ -142,6 +176,9 @@ fn stat_with_autodetected_auth_config(working_dir: &std::path::Path) -> assert_c
 		.env_remove("FILEN_CLI_EMAIL")
 		.env_remove("FILEN_CLI_PASSWORD")
 		.env_remove("FILEN_CLI_2FA_CODE")
+		.env_remove("FILEN_EMAIL")
+		.env_remove("FILEN_PASSWORD")
+		.env_remove("FILEN_2FA_CODE")
 		.args([
 			"--skip-update",
 			"--config-dir",
@@ -219,6 +256,9 @@ async fn a_given_auth_config_with_a_revoked_api_key_fails_saying_to_export_a_new
 		.env_remove("FILEN_CLI_EMAIL")
 		.env_remove("FILEN_CLI_PASSWORD")
 		.env_remove("FILEN_CLI_2FA_CODE")
+		.env_remove("FILEN_EMAIL")
+		.env_remove("FILEN_PASSWORD")
+		.env_remove("FILEN_2FA_CODE")
 		.args([
 			"--skip-update",
 			"--config-dir",

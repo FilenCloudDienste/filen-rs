@@ -2,7 +2,9 @@
 //! There are multiple ways to authenticate:
 //! - set the CLI arguments `--email` (or environment variable `FILEN_CLI_EMAIL`)
 //!   and `--password` (`FILEN_CLI_PASSWORD`), optionally `--two-factor-code` (`FILEN_CLI_2FA_CODE`)
-//!   (when the two-factor code is omitted and required, you will be prompted for it)
+//!   (when the two-factor code is omitted and required, you will be prompted for it;
+//!   when none of these is set, the variables `FILEN_EMAIL`, `FILEN_PASSWORD` and `FILEN_2FA_CODE`
+//!   of the old Filen CLI are used)
 //! - specify an auth config via the `--auth-config-path` flag
 //!   (exported via `filen export-auth-config`),
 //!   or put an auth config in one of the default locations:
@@ -20,6 +22,7 @@
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::{
+	borrow::Cow,
 	path::{Path, PathBuf},
 	sync::Arc,
 	time::Duration,
@@ -149,12 +152,15 @@ pub(crate) async fn authenticate_and_get_password(
 	auth_config_path_arg: Option<&str>,
 	client_config_args: &ClientConfigArgs,
 ) -> Result<Client> {
-	if let Some(credentials) = cli_credentials(email_arg, password_arg, two_factor_code_arg)? {
+	if let Some(credentials) =
+		cli_credentials(email_arg, password_arg, two_factor_code_arg, |name| {
+			std::env::var(name).ok()
+		})? {
 		let client = login_and_optionally_prompt_two_factor_code(
 			ui,
-			credentials.email,
-			credentials.password,
-			credentials.two_factor_code,
+			&credentials.email,
+			&credentials.password,
+			credentials.two_factor_code.as_deref(),
 			client_config_args,
 		)
 		.await?;
@@ -257,30 +263,69 @@ fn login_failure_message(kind: ErrorKind) -> Option<&'static str> {
 	}
 }
 
-/// Credentials given in the CLI arguments.
+/// Credentials given in the CLI arguments, borrowed from them, or in the legacy environment
+/// variables, read from there.
 struct CliCredentials<'a> {
-	email: &'a str,
-	password: &'a str,
-	two_factor_code: Option<&'a str>,
+	email: Cow<'a, str>,
+	password: Cow<'a, str>,
+	two_factor_code: Option<Cow<'a, str>>,
 }
 
-/// The credentials to log in with from the CLI arguments, if an email or a password was given.
+/// The variables the old Filen CLI read credentials from. (! referenced in module docs)
+const LEGACY_EMAIL_VAR: &str = "FILEN_EMAIL";
+const LEGACY_PASSWORD_VAR: &str = "FILEN_PASSWORD";
+const LEGACY_TWO_FACTOR_CODE_VAR: &str = "FILEN_2FA_CODE";
+
+/// The credentials to log in with from the CLI arguments, if an email or a password was given, or
+/// else from the variables of the old Filen CLI, which `env` looks up.
 /// A two-factor code alone, usually a `FILEN_CLI_2FA_CODE` left in the environment, is ignored,
 /// so that it does not keep the login from going on through an auth config or the keyring.
 fn cli_credentials<'a>(
 	email_arg: Option<&'a str>,
 	password_arg: Option<&'a str>,
 	two_factor_code_arg: Option<&'a str>,
+	env: impl Fn(&str) -> Option<String>,
 ) -> Result<Option<CliCredentials<'a>>> {
 	match (email_arg, password_arg) {
 		(Some(email), Some(password)) => Ok(Some(CliCredentials {
-			email,
-			password,
-			two_factor_code: two_factor_code_arg,
+			email: Cow::Borrowed(email),
+			password: Cow::Borrowed(password),
+			two_factor_code: two_factor_code_arg.map(Cow::Borrowed),
 		})),
 		(Some(_), None) => Err(UI::failure("Password is required")),
 		(None, Some(_)) => Err(UI::failure("Email is required")),
-		(None, None) => {
+		(None, None) => legacy_env_credentials(two_factor_code_arg, env),
+	}
+}
+
+/// The credentials in the variables of the old Filen CLI, which `env` looks up, if `FILEN_EMAIL`
+/// is set. As there, `FILEN_PASSWORD` alone is ignored. A two-factor code from the arguments
+/// wins over `FILEN_2FA_CODE`.
+fn legacy_env_credentials<'a>(
+	two_factor_code_arg: Option<&'a str>,
+	env: impl Fn(&str) -> Option<String>,
+) -> Result<Option<CliCredentials<'a>>> {
+	let var = |name: &str| env(name).filter(|value| !value.is_empty());
+	match (var(LEGACY_EMAIL_VAR), var(LEGACY_PASSWORD_VAR)) {
+		(Some(email), Some(password)) => {
+			log::info!("Using the credentials from {LEGACY_EMAIL_VAR} and {LEGACY_PASSWORD_VAR}");
+			Ok(Some(CliCredentials {
+				email: Cow::Owned(email),
+				password: Cow::Owned(password),
+				two_factor_code: two_factor_code_arg
+					.map(Cow::Borrowed)
+					.or_else(|| var(LEGACY_TWO_FACTOR_CODE_VAR).map(Cow::Owned)),
+			}))
+		}
+		(Some(_), None) => Err(UI::failure(&format!(
+			"{LEGACY_PASSWORD_VAR} is required with {LEGACY_EMAIL_VAR}"
+		))),
+		(None, password) => {
+			if password.is_some() {
+				log::info!(
+					"Ignoring {LEGACY_PASSWORD_VAR}, which is only used with {LEGACY_EMAIL_VAR}"
+				);
+			}
 			if two_factor_code_arg.is_some() {
 				log::info!(
 					"Ignoring the two-factor code, which is only used with an email and a password"
@@ -1061,23 +1106,137 @@ mod tests {
 		assert_eq!(login_failure_message(ErrorKind::Server), None);
 	}
 
+	/// An environment without any variables.
+	fn no_env(_: &str) -> Option<String> {
+		None
+	}
+
+	/// An environment with only `vars`.
+	fn env_with<'a>(vars: &'a [(&str, &str)]) -> impl Fn(&str) -> Option<String> + 'a {
+		|name| {
+			vars.iter()
+				.find(|(var, _)| *var == name)
+				.map(|(_, value)| (*value).to_owned())
+		}
+	}
+
 	#[test]
 	fn no_credentials_in_the_arguments_are_none() {
-		assert!(cli_credentials(None, None, None).unwrap().is_none());
+		assert!(cli_credentials(None, None, None, no_env).unwrap().is_none());
 	}
 
 	#[test]
 	fn a_two_factor_code_alone_is_ignored() {
 		assert!(
-			cli_credentials(None, None, Some("123456"))
+			cli_credentials(None, None, Some("123456"), no_env)
 				.unwrap()
 				.is_none()
 		);
 	}
 
 	#[test]
+	fn the_variables_of_the_old_cli_are_the_credentials_without_arguments() {
+		let credentials = cli_credentials(
+			None,
+			None,
+			None,
+			env_with(&[
+				("FILEN_EMAIL", "old@example.com"),
+				("FILEN_PASSWORD", "old-secret"),
+				("FILEN_2FA_CODE", "654321"),
+			]),
+		)
+		.unwrap()
+		.unwrap();
+		assert_eq!(credentials.email, "old@example.com");
+		assert_eq!(credentials.password, "old-secret");
+		assert_eq!(credentials.two_factor_code.as_deref(), Some("654321"));
+	}
+
+	#[test]
+	fn the_arguments_win_over_the_variables_of_the_old_cli() {
+		let credentials = cli_credentials(
+			Some("a@example.com"),
+			Some("secret"),
+			None,
+			env_with(&[
+				("FILEN_EMAIL", "old@example.com"),
+				("FILEN_PASSWORD", "old-secret"),
+				("FILEN_2FA_CODE", "654321"),
+			]),
+		)
+		.unwrap()
+		.unwrap();
+		assert_eq!(credentials.email, "a@example.com");
+		assert_eq!(credentials.password, "secret");
+		assert_eq!(credentials.two_factor_code, None);
+	}
+
+	#[test]
+	fn a_two_factor_code_argument_wins_over_the_one_of_the_old_cli() {
+		let credentials = cli_credentials(
+			None,
+			None,
+			Some("123456"),
+			env_with(&[
+				("FILEN_EMAIL", "old@example.com"),
+				("FILEN_PASSWORD", "old-secret"),
+				("FILEN_2FA_CODE", "654321"),
+			]),
+		)
+		.unwrap()
+		.unwrap();
+		assert_eq!(credentials.two_factor_code.as_deref(), Some("123456"));
+	}
+
+	#[test]
+	fn an_old_cli_email_without_a_password_fails() {
+		let Err(err) = cli_credentials(
+			None,
+			None,
+			None,
+			env_with(&[("FILEN_EMAIL", "old@example.com")]),
+		) else {
+			panic!("FILEN_EMAIL without FILEN_PASSWORD must fail");
+		};
+		assert_eq!(
+			format!("{err:#}"),
+			"FILEN_PASSWORD is required with FILEN_EMAIL"
+		);
+		assert_eq!(exit_code(&err), 1);
+	}
+
+	#[test]
+	fn an_old_cli_password_alone_is_ignored() {
+		assert!(
+			cli_credentials(
+				None,
+				None,
+				None,
+				env_with(&[("FILEN_PASSWORD", "old-secret")])
+			)
+			.unwrap()
+			.is_none()
+		);
+	}
+
+	#[test]
+	fn empty_variables_of_the_old_cli_are_unset() {
+		assert!(
+			cli_credentials(
+				None,
+				None,
+				None,
+				env_with(&[("FILEN_EMAIL", ""), ("FILEN_PASSWORD", "")])
+			)
+			.unwrap()
+			.is_none()
+		);
+	}
+
+	#[test]
 	fn an_email_without_a_password_fails() {
-		let Err(err) = cli_credentials(Some("a@example.com"), None, None) else {
+		let Err(err) = cli_credentials(Some("a@example.com"), None, None, no_env) else {
 			panic!("an email without a password must fail");
 		};
 		assert_eq!(format!("{err:#}"), "Password is required");
@@ -1086,7 +1245,7 @@ mod tests {
 
 	#[test]
 	fn a_password_without_an_email_fails() {
-		let Err(err) = cli_credentials(None, Some("secret"), Some("123456")) else {
+		let Err(err) = cli_credentials(None, Some("secret"), Some("123456"), no_env) else {
 			panic!("a password without an email must fail");
 		};
 		assert_eq!(format!("{err:#}"), "Email is required");
@@ -1094,12 +1253,17 @@ mod tests {
 
 	#[test]
 	fn an_email_and_a_password_are_the_credentials() {
-		let credentials = cli_credentials(Some("a@example.com"), Some("secret"), Some("123456"))
-			.unwrap()
-			.unwrap();
+		let credentials = cli_credentials(
+			Some("a@example.com"),
+			Some("secret"),
+			Some("123456"),
+			no_env,
+		)
+		.unwrap()
+		.unwrap();
 		assert_eq!(credentials.email, "a@example.com");
 		assert_eq!(credentials.password, "secret");
-		assert_eq!(credentials.two_factor_code, Some("123456"));
+		assert_eq!(credentials.two_factor_code.as_deref(), Some("123456"));
 	}
 
 	#[tokio::test]
