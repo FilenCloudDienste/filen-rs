@@ -49,7 +49,7 @@ pub(super) async fn sync_continuously(
 	let mut not_started = HashMap::new();
 	// the engine refuses to watch a paused pair, which is no failure of the watch
 	for pair in pairs.iter().filter(|pair| pair.paused) {
-		ui.print_failure(&paused_message(log.label(pair.id)));
+		ui.print_failure(&paused_message(pair.id, log.label(pair.id)));
 		not_started.insert(pair.id, "paused");
 	}
 	let mut watch_handles = Vec::new();

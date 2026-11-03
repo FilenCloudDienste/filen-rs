@@ -341,6 +341,50 @@ pub(super) async fn retry_sync(
 	Ok(())
 }
 
+/// `pause-sync-pair` (with `pause`) and `resume-sync-pair`: pauses or resumes the pair `given`
+/// names.
+/// The flag is kept in the sync database, so `sync` leaves a paused pair alone until it is resumed.
+pub(super) async fn pause_sync_pair(
+	config: &CliConfig,
+	ui: &mut UI,
+	client: &mut LazyClient,
+	given: &str,
+	pause: bool,
+) -> Result<()> {
+	let managing = Managing::open(config, ui, client).await?;
+	let (pair, label) = managing.find(config, given).await?;
+	if pair.paused == pause {
+		let state = if pause {
+			"already paused"
+		} else {
+			"not paused"
+		};
+		ui.print(&format!("The sync pair {label} is {state}"));
+		return Ok(());
+	}
+	if pause {
+		managing
+			.engine
+			.pause_pair(pair.id)
+			.await
+			.with_context(|| format!("Failed to pause the sync pair {label}"))?;
+		ui.print_success(&format!(
+			"Paused the sync pair {label}. `filen sync` leaves it alone until `filen \
+			 resume-sync-pair {}`.",
+			pair.id
+		));
+	} else {
+		managing
+			.engine
+			.resume_pair(pair.id)
+			.await
+			.with_context(|| format!("Failed to resume the sync pair {label}"))?;
+		ui.print_success(&format!("Resumed the sync pair {label}"));
+		ui.print_muted(NEXT_PASS_NOTE);
+	}
+	Ok(())
+}
+
 /// What a command whose change the next pass applies says last.
 const NEXT_PASS_NOTE: &str = "`filen sync` runs that pass.";
 

@@ -285,7 +285,7 @@ fn print(ui: &mut UI, log: &mut EventLog<'_>, pair: PairId, message: Message) {
 		}
 		Message::Approved(line) => log.print_approved(ui, pair, &line),
 		Message::Paused => {
-			let message = paused_message(log.label(pair));
+			let message = paused_message(pair, log.label(pair));
 			log.print_failure(ui, &message);
 		}
 		Message::ResolveFailed { rel_path, error } => {

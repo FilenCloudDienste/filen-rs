@@ -549,6 +549,46 @@ async fn a_listed_conflict_is_resolved_by_resolve_sync_conflict() {
 	);
 }
 
+/// A pair `pause-sync-pair` paused is not synced, which `sync` says with how to resume it, and
+/// `resume-sync-pair` lets `sync` sync it again.
+#[shared_test_runtime]
+async fn a_paused_pair_is_left_alone_until_it_is_resumed() {
+	// Not `get_resources_with_lock`, for the reason the first test gives.
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let test_dir_name = resources.dir.name().unwrap();
+	let local = assert_fs::TempDir::new().unwrap();
+	let config_dir = assert_fs::TempDir::new().unwrap();
+	let local_root = local.path().to_str().unwrap();
+	let pair = format!("{local_root}:{test_dir_name}");
+	assert_success(&sync_once(config_dir.path(), &pair, &[]).await);
+
+	assert_success(&filen(config_dir.path(), &["pause-sync-pair", local_root]).await);
+	std::fs::write(local.path().join("later.txt"), "after the pause").unwrap();
+	let paused = sync_once(config_dir.path(), &pair, &[]).await;
+
+	assert_eq!(paused.status.code(), Some(1), "{}", describe(&paused));
+	assert!(
+		String::from_utf8_lossy(&paused.stderr)
+			.contains("is paused, so it is not synced. Resume it with `filen resume-sync-pair 1`."),
+		"{}",
+		describe(&paused)
+	);
+	assert!(
+		resources
+			.client
+			.find_item_at_path(&format!("{test_dir_name}/later.txt"))
+			.await
+			.unwrap()
+			.is_none()
+	);
+	assert_success(&filen(config_dir.path(), &["resume-sync-pair", "1"]).await);
+	assert_success(&sync_once(config_dir.path(), &pair, &[]).await);
+	assert_eq!(
+		remote_content(&resources.client, &format!("{test_dir_name}/later.txt")).await,
+		b"after the pause"
+	);
+}
+
 /// A pair whose first `sync --once` agreed on `fight.txt`, which has since been changed on both
 /// sides, with the local root and the config dir that holds its database.
 async fn diverged_pair(

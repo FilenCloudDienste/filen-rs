@@ -242,6 +242,16 @@ pub(crate) enum SyncCommands {
 		/// Only this path, relative to the root of the sync pair
 		path: Option<String>,
 	},
+	/// Pause a sync pair: `sync` leaves it alone until it is resumed
+	PauseSyncPair {
+		#[arg(help = PAIR_HELP)]
+		pair: String,
+	},
+	/// Resume a paused sync pair; its next pass catches up on what changed meanwhile
+	ResumeSyncPair {
+		#[arg(help = PAIR_HELP)]
+		pair: String,
+	},
 }
 
 /// The help of the PAIR argument of the commands that manage a registered sync pair.
@@ -258,6 +268,8 @@ pub(crate) const DOCS: &[DocElement] = &[
 	DocElement::CommandHelp("list-sync-conflicts"),
 	DocElement::CommandHelp("resolve-sync-conflict"),
 	DocElement::CommandHelp("retry-sync"),
+	DocElement::CommandHelp("pause-sync-pair"),
+	DocElement::CommandHelp("resume-sync-pair"),
 ];
 
 impl SyncCommands {
@@ -324,6 +336,12 @@ impl SyncCommands {
 			}
 			Self::RetrySync { pair, path } => {
 				manage::retry_sync(config, ui, client, &pair, path.as_deref()).await?;
+			}
+			Self::PauseSyncPair { pair } => {
+				manage::pause_sync_pair(config, ui, client, &pair, true).await?;
+			}
+			Self::ResumeSyncPair { pair } => {
+				manage::pause_sync_pair(config, ui, client, &pair, false).await?;
 			}
 		}
 		Ok(CommandResult::default())
@@ -816,8 +834,11 @@ fn resolve_failure_message(rel_path: &str, label: Cow<'_, str>, e: &filen_sdk_rs
 	format!("Failed to resolve the conflict for {rel_path} in the sync pair {label}: {e}")
 }
 
-fn paused_message(label: Cow<'_, str>) -> String {
-	format!("The sync pair {label} is paused, so it is not synced")
+fn paused_message(pair: PairId, label: Cow<'_, str>) -> String {
+	format!(
+		"The sync pair {label} is paused, so it is not synced. Resume it with `filen \
+		 resume-sync-pair {pair}`."
+	)
 }
 
 /// The directories `sync` reads sync pairs files from, for the config directory of `config`.
@@ -953,6 +974,7 @@ fn format_sync_event(event: &SyncEvent) -> Option<String> {
 #[cfg(test)]
 mod tests {
 	use std::{
+		borrow::Cow,
 		collections::HashMap,
 		path::Path,
 		time::{Duration, Instant},
@@ -969,7 +991,7 @@ mod tests {
 
 	use super::{
 		ConflictResolutions, EventLog, Output, Settle, SyncCommands, SyncEvent, format_sync_event,
-		given_pairs, open_failure, unsyncable_notices,
+		given_pairs, open_failure, paused_message, unsyncable_notices,
 	};
 	use crate::{commands::Commands, parse_repl_line, ui::test_support::Printed};
 
@@ -1515,6 +1537,15 @@ mod tests {
 		quiet.print_banner(&mut ui, 1, false);
 
 		assert_eq!(out.lines(), "Syncing L (once)\nSyncing L (Ctrl-C to stop)");
+	}
+
+	#[test]
+	fn a_paused_pair_says_how_to_resume_it() {
+		assert_eq!(
+			paused_message(4, Cow::Borrowed("L")),
+			"The sync pair L is paused, so it is not synced. Resume it with `filen \
+			 resume-sync-pair 4`."
+		);
 	}
 
 	#[test]
