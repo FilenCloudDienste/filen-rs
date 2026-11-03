@@ -403,6 +403,29 @@ impl ListedItem {
 		}
 	}
 
+	/// The item as `--json` prints it, with the keys `stat` uses, plus its path in a listing by
+	/// path (`null` when it could not be resolved).
+	fn to_json(&self, by: ListedBy) -> serde_json::Value {
+		let mut object = serde_json::Map::new();
+		object.insert("name".to_owned(), json!(self.name));
+		if by == ListedBy::Path {
+			object.insert("path".to_owned(), json!(self.path));
+		}
+		let kind = match self.kind {
+			ListedKind::Directory => "directory",
+			ListedKind::File => "file",
+		};
+		object.insert("type".to_owned(), json!(kind));
+		if self.kind == ListedKind::File {
+			object.insert("size".to_owned(), json!(self.size));
+			object.insert("modified".to_owned(), json!(self.modified));
+		}
+		object.insert("created".to_owned(), json!(self.created));
+		object.insert("favorited".to_owned(), json!(self.favorited));
+		object.insert("uuid".to_owned(), json!(self.uuid));
+		serde_json::Value::Object(object)
+	}
+
 	/// The date `ls -l` shows: when a file was last modified, when a directory was created.
 	fn date(&self) -> Option<DateTime<Utc>> {
 		match self.kind {
@@ -472,17 +495,9 @@ fn print_listing(
 	long: bool,
 ) -> Result<()> {
 	if ui.json {
-		let labels_of = |kind: ListedKind| {
-			items
-				.iter()
-				.filter(|item| item.kind == kind)
-				.map(|item| item.label(by).into_owned())
-				.collect::<Vec<String>>()
-		};
-		ui.print_json(json!({
-			"directories": labels_of(ListedKind::Directory),
-			"files": labels_of(ListedKind::File),
-		}))?;
+		ui.print_json(serde_json::Value::Array(
+			items.iter().map(|item| item.to_json(by)).collect(),
+		))?;
 		return Ok(());
 	}
 	if items.is_empty() {
@@ -2390,6 +2405,88 @@ mod tests {
 		assert_eq!(
 			printed_listing(items, ListedBy::Name, true, false),
 			"  -  -  docs (*)\n5 B  -  a.txt (*)\n5 B  -  b.txt"
+		);
+	}
+
+	#[test]
+	fn a_json_listing_prints_an_object_per_item() {
+		let items = vec![
+			ListedItem {
+				modified: Some(date(2024, 3, 9)),
+				created: Some(date(2020, 1, 1)),
+				favorited: true,
+				..listed_file("a.txt", 5, 1)
+			},
+			listed_dir("docs", 2),
+		];
+
+		let printed: serde_json::Value =
+			serde_json::from_str(&printed_listing(items, ListedBy::Name, false, true)).unwrap();
+
+		assert_eq!(
+			printed,
+			json!([
+				{
+					"name": "docs",
+					"type": "directory",
+					"created": null,
+					"favorited": false,
+					"uuid": "00000000-0000-0000-0000-000000000002",
+				},
+				{
+					"name": "a.txt",
+					"type": "file",
+					"size": 5,
+					"modified": "2024-03-09T10:20:30Z",
+					"created": "2020-01-01T10:20:30Z",
+					"favorited": true,
+					"uuid": "00000000-0000-0000-0000-000000000001",
+				},
+			])
+		);
+	}
+
+	#[test]
+	fn a_json_listing_by_path_gives_each_items_path() {
+		let items = vec![
+			ListedItem {
+				path: Some("/a/docs".to_owned()),
+				..listed_dir("docs", 1)
+			},
+			listed_dir("lost", 2),
+		];
+
+		let printed: serde_json::Value =
+			serde_json::from_str(&printed_listing(items, ListedBy::Path, false, true)).unwrap();
+
+		assert_eq!(
+			printed,
+			json!([
+				{
+					"name": "docs",
+					"path": "/a/docs",
+					"type": "directory",
+					"created": null,
+					"favorited": false,
+					"uuid": "00000000-0000-0000-0000-000000000001",
+				},
+				{
+					"name": "lost",
+					"path": null,
+					"type": "directory",
+					"created": null,
+					"favorited": false,
+					"uuid": "00000000-0000-0000-0000-000000000002",
+				},
+			])
+		);
+	}
+
+	#[test]
+	fn an_empty_json_listing_is_an_empty_array() {
+		assert_eq!(
+			printed_listing(Vec::new(), ListedBy::Name, false, true),
+			"[]"
 		);
 	}
 
