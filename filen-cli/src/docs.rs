@@ -70,6 +70,10 @@ const USAGE_INTRO_DOCS: &[DocElement] = &[
 	DocElement::GlobalOptions,
 	DocElement::Heading1("Updates"),
 	DocElement::DocFragment("updates"),
+	DocElement::Heading1("Config directory"),
+	DocElement::DocFragment("config-dir"),
+	DocElement::Heading1("Log files"),
+	DocElement::DocFragment("log-files"),
 	DocElement::Heading1("Exit codes"),
 	DocElement::DocFragment("exit-codes"),
 	DocElement::Heading1("Commands"),
@@ -611,6 +615,23 @@ mod tests {
 		let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
 		let address = server.server_addr().to_ip().unwrap();
 		(server, address)
+	}
+
+	#[test]
+	fn the_usage_section_documents_the_config_directory_and_the_log_files() {
+		let outline = PARSED_DOC_OUTLINE.as_ref().unwrap();
+		let usage = outline.iter().find(|s| s.id == MAIN_SECTION).unwrap();
+		let fragments = get_cli_doc_fragments();
+		for id in ["config-dir", "log-files", "updates"] {
+			let fragment = fragments.iter().find(|f| f.id == id).unwrap();
+			assert!(
+				usage.elements.iter().any(|element| matches!(
+					element,
+					ParsedDocElement::DocFragment { text } if *text == fragment.content
+				)),
+				"{id}"
+			);
+		}
 	}
 
 	#[test]

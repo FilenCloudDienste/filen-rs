@@ -213,6 +213,35 @@ pub(crate) struct CliArgs {
 	working_path: Option<String>,
 }
 
+/// [cli-doc] config-dir
+/// The CLI keeps its files in a config directory. By default, that is `filen-cli` in the
+/// platform's config directory:
+/// - Linux: `$XDG_CONFIG_HOME/filen-cli`, or `~/.config/filen-cli`
+/// - macOS: `~/Library/Application Support/filen-cli`
+/// - Windows: `%APPDATA%\filen-cli`
+///
+/// `--config-dir <dir>` uses another directory, and so does its alias `--data-dir`, the
+/// environment variable `FILEN_CLI_CONFIG_DIR`, or else `FILEN_CLI_DATA_DIR`. The directory is
+/// created if it is missing. `filen version` prints the one in use.
+///
+/// It holds:
+/// - `logs/`: the log files (see `help log-files`)
+/// - `filen-cli-auth-config.txt`: an auth config, which logging in reads (see `help auth`). The
+///   CLI writes one there when you choose to after the system keyring could not keep your
+///   credentials; `filen export-auth-config` writes one to the current directory instead
+/// - `filen-sdk-rs-cache`: the cache of the drive's metadata that `sync` keeps
+/// - `sync-engine.db`: the state of each sync pair `sync` has run
+/// - `syncPairs.yaml`: the sync pairs `sync` runs when it is given none (you write it)
+/// - `rclone/`: the managed rclone, and the state and the file cache of the rclone that `mount`
+///   and `serve` run
+/// - `repl_history`: the lines entered in the REPL
+/// - `last_update_check`: the time of the last update check (see `help updates`)
+/// - `ts_migration_hint_shown`: present once the CLI has pointed out the older CLI's files
+/// - `profiles/`: a config directory of its own for each profile `--profile` named (see
+///   `help profile-option`), used instead of this one while that profile is
+///
+/// Credentials you choose to keep when logging in are stored in the system keyring, not in the
+/// config directory.
 #[derive(Clone)]
 pub(crate) struct CliConfig {
 	/// The config dir in use: the active profile's, or the one without a profile.
@@ -261,7 +290,24 @@ const LOG_LIMITS: LogLimits = LogLimits {
 /// The level of the lines written to the log files.
 const LOG_FILES_LEVEL: LevelFilter = LevelFilter::Debug;
 
-/// The log the CLI writes besides what it prints.
+/// [cli-doc] log-files
+/// The CLI writes a log of what it does besides what it prints, at debug level, whatever `-v`
+/// or `--quiet` is given. By default, it goes to `logs/` in the config directory (see
+/// `help config-dir`):
+/// - `latest.log` holds the latest run, emptied when the CLI starts
+/// - `<date>.log` holds every run of that day
+/// - a file larger than 10 MiB is moved aside to `<name>.old` (`.old1`, `.old2`, ...) and started
+///   anew
+/// - the files are deleted once they were last written more than 3 days ago, and the oldest
+///   first while together they hold more than 100 MiB
+///
+/// `--log-file <path>` appends the log to that file instead, which the CLI never moves, empties or
+/// deletes. `--no-log-file` writes no log. `-v`, `-vv` and `-vvv` also print the log to stderr,
+/// at info, debug and trace level.
+///
+/// What the CLI prints is not logged, except failures and announcements. Prompts are logged with
+/// the answers to yes/no questions and selections, but not text answers or passwords; a REPL line
+/// is logged as its command name only.
 struct OpenedLog {
 	// An `Arc` because ftail builds each channel from a `'static` `Fn`, which can only hand out
 	// clones of it.
