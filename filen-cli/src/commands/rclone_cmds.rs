@@ -4,11 +4,15 @@
 //! Your credentials are only passed to it in memory, never written to disk. `serve` listens on 127.0.0.1 unless told otherwise,
 //! and prints random credentials when you do not give any.
 
-use std::path::{Path, PathBuf};
+use std::{
+	fmt,
+	path::{Path, PathBuf},
+};
 
 use anyhow::{Context as _, Result, anyhow};
 use clap::Subcommand;
 use filen_sdk_rs::{
+	ErrorKind,
 	auth::Client,
 	rclone::{
 		MountOptions, RcloneBinary, RcloneDaemon, RcloneDaemonConfig, RcloneExit, RcloneRefusal,
@@ -183,7 +187,12 @@ pub(crate) async fn mount(
 			read_only: false,
 		})
 		.await
-		.context("Failed to mount network drive (use --verbose for more info)")?;
+		.map_err(|e| {
+			rclone_error(
+				e,
+				"Failed to mount network drive (use --verbose for more info)",
+			)
+		})?;
 	ui.print_success(&format!(
 		"Mounted network drive at {} (press Ctrl-C to unmount and exit)",
 		mounted.mount_point
@@ -226,7 +235,7 @@ pub(crate) async fn start_server(
 			read_only: args.read_only,
 		})
 		.await
-		.with_context(|| format!("Failed to start {name} server"))?;
+		.map_err(|e| rclone_error(e, format!("Failed to start {name} server")))?;
 	let address = match args.protocol {
 		ServeProtocol::Webdav | ServeProtocol::S3 | ServeProtocol::Http | ServeProtocol::Restic => {
 			format!("{scheme}://{}", serve.addr)
@@ -353,14 +362,41 @@ async fn start_daemon(
 				log::info!("Cache {cache} is in use by another mount or server");
 			}
 			Err(e) => {
-				return Err(anyhow::Error::from(e)
-					.context("Failed to start Rclone (use --verbose for more info)"));
+				return Err(rclone_error(
+					e,
+					"Failed to start Rclone (use --verbose for more info)",
+				));
 			}
 		}
 	}
 	Err(UI::failure(&format!(
 		"{CACHES} mounts and servers are running already; stop one first"
 	)))
+}
+
+/// `e` wrapped in `context`. A refusal is reported as it is, with the context the SDK gave it
+/// (the path or address it was about): as an invalid command line when the daemon does not run the
+/// options it was given, and as a failure when something on this machine is in the way. Any other
+/// error stays unexpected.
+fn rclone_error(
+	e: filen_sdk_rs::Error,
+	context: impl fmt::Display + Send + Sync + 'static,
+) -> anyhow::Error {
+	let (refusal, about) = match e.downcast::<RcloneRefusal>() {
+		Ok(refusal) => refusal,
+		Err(e) => return anyhow::Error::from(e).context(context),
+	};
+	let message = if about.is_empty() {
+		refusal.to_string()
+	} else {
+		format!("{refusal} ({})", about.join("; "))
+	};
+	let err = if refusal.kind() == ErrorKind::InvalidState {
+		UI::usage_failure(&message)
+	} else {
+		UI::failure(&message)
+	};
+	err.context(context)
 }
 
 /// The `cache`th cache directory in `dir`: `cache`, then `cache-2`, `cache-3` and so on.
@@ -546,6 +582,7 @@ pub(crate) fn parse_size(size: &str) -> Result<u64, String> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::error::{exit_code, find_cli_error};
 
 	#[test]
 	fn sizes_parse_with_binary_suffixes() {
@@ -592,6 +629,73 @@ mod tests {
 				cache.display()
 			)
 		);
+	}
+
+	#[test]
+	fn a_port_in_use_is_a_failure() {
+		let err = rclone_error(
+			RcloneRefusal::PortInUse { port: 1900 }.into(),
+			"Failed to start WebDAV server",
+		);
+
+		assert_eq!(exit_code(&err), 1);
+		assert_eq!(
+			format!("{err:#}"),
+			"Failed to start WebDAV server: port 1900 is in use"
+		);
+	}
+
+	#[test]
+	fn a_mount_point_that_is_not_empty_is_a_failure() {
+		let err = rclone_error(
+			RcloneRefusal::MountPointNotEmpty.into(),
+			"Failed to mount network drive (use --verbose for more info)",
+		);
+
+		assert_eq!(exit_code(&err), 1);
+		assert_eq!(
+			format!("{err:#}"),
+			"Failed to mount network drive (use --verbose for more info): the mount point is not empty"
+		);
+	}
+
+	#[test]
+	fn an_address_the_daemon_does_not_listen_on_is_a_usage_error() {
+		let err = rclone_error(
+			RcloneRefusal::ImplicitAddress.into(),
+			"Failed to start WebDAV server",
+		);
+
+		assert_eq!(exit_code(&err), 2);
+		assert_eq!(
+			format!("{err:#}"),
+			"Failed to start WebDAV server: the address must name an IP address or localhost and a port"
+		);
+	}
+
+	#[test]
+	fn a_refusal_keeps_what_it_was_about() {
+		let err = rclone_error(
+			filen_sdk_rs::Error::from(RcloneRefusal::MountPointInvalid)
+				.with_context("/tmp/filen: not a directory"),
+			"Failed to mount network drive",
+		);
+
+		assert_eq!(exit_code(&err), 1);
+		assert_eq!(
+			format!("{err:#}"),
+			"Failed to mount network drive: the mount point is not a usable directory or drive letter (/tmp/filen: not a directory)"
+		);
+	}
+
+	#[test]
+	fn an_error_that_is_not_a_refusal_stays_unexpected() {
+		let err = rclone_error(
+			filen_sdk_rs::Error::custom(ErrorKind::IO, "rc request failed"),
+			"Failed to start Rclone",
+		);
+
+		assert!(find_cli_error(&err).is_none());
 	}
 
 	#[test]
