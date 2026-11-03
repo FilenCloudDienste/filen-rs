@@ -54,6 +54,14 @@
 //! of them goes to stderr; failures that are not an event's still go to stderr as text. `--json`
 //! takes precedence over `--quiet`: every event is printed.
 //!
+//! With `--dry-run`, `sync` prints what a pass of each sync pair would do: what it would transfer,
+//! create, move or delete, the deletions the delete guard would hold back and why, the conflicts it
+//! would leave and the paths it cannot sync. It syncs nothing, but sets the sync pairs up as `sync`
+//! does: they are registered, and the ignore rules of their sync pairs file are added to their
+//! `.filenignore`. It does not create a local or remote directory that does not exist. A paused
+//! sync pair is not planned, as `sync` runs no pass of it: it says on stderr that the pair is
+//! paused instead. With `--json`, it prints one `plan` object per sync pair it plans.
+//!
 //! Sync pairs stay registered in the sync database under the config directory after the run that
 //! set them up. A run that cannot set up one of its sync pairs registers none of them. Only one
 //! `filen sync` can use that database at a time.
@@ -129,6 +137,7 @@ use crate::{
 
 mod conflict_resolutions;
 mod continuous;
+mod dry_run;
 mod failures;
 mod ignore_file;
 mod json_events;
@@ -171,6 +180,10 @@ pub(crate) enum SyncCommands {
 		/// Kept for compatibility with the TypeScript CLI.
 		#[arg(long, conflicts_with = "once")]
 		continuous: bool,
+		/// Print what a pass of each sync pair would do, and sync nothing.
+		/// The sync pairs are registered as without it.
+		#[arg(long, conflicts_with_all = ["once", "continuous", "approve_mass_deletions", "keep_local", "keep_remote", "keep_both"])]
+		dry_run: bool,
 		/// Disables the delete guard (applied only on the first sync pass).
 		#[arg(long)]
 		approve_mass_deletions: bool,
@@ -287,6 +300,7 @@ impl SyncCommands {
 				once,
 				// the default, which `--once` turns off
 				continuous: _,
+				dry_run,
 				approve_mass_deletions,
 				keep_local,
 				keep_remote,
@@ -301,7 +315,14 @@ impl SyncCommands {
 					)?,
 				};
 				let pairs = given_pairs(pairs, pair_options);
-				sync(config, ui, client, working_path, &pairs, once, &settle).await?;
+				let passes = if dry_run {
+					Passes::DryRun
+				} else if once {
+					Passes::Once
+				} else {
+					Passes::Continuous
+				};
+				sync(config, ui, client, working_path, &pairs, passes, &settle).await?;
 			}
 			Self::ListSyncPairs => manage::list_sync_pairs(config, ui, client).await?,
 			Self::RemoveSyncPair { pair } => {
@@ -353,6 +374,17 @@ fn given_pairs(pairs: Vec<String>, pair_options: Vec<String>) -> Vec<String> {
 	pairs.into_iter().chain(pair_options).collect()
 }
 
+/// How long `sync` runs.
+#[derive(Clone, Copy, PartialEq)]
+enum Passes {
+	/// Until Ctrl-C.
+	Continuous,
+	/// One pass of each pair (`--once`).
+	Once,
+	/// No pass: what a pass of each pair would do (`--dry-run`).
+	DryRun,
+}
+
 /// What the flags settle of what the first pass of each pair finds.
 struct Settle {
 	approve_mass_deletions: bool,
@@ -365,7 +397,7 @@ async fn sync(
 	client: &mut LazyClient,
 	working_path: &RemotePath,
 	pair_definitions: &[String],
-	once: bool,
+	passes: Passes,
 	settle: &Settle,
 ) -> Result<()> {
 	// before logging in, so that a bad definition fails at once
@@ -377,8 +409,15 @@ async fn sync(
 	let client = client.get(ui).await?;
 
 	// before the engine is opened, so that a bad definition leaves its database as it was
-	let pair_definitions =
-		sync_pairs::resolve_sync_pairs(ui, client, working_path, &sync_dirs, parsed).await?;
+	let pair_definitions = sync_pairs::resolve_sync_pairs(
+		ui,
+		client,
+		working_path,
+		&sync_dirs,
+		parsed,
+		passes != Passes::DryRun,
+	)
+	.await?;
 
 	let engine = Arc::new(open_engine(config, client).await?);
 	let pair_ids = sync_pairs::register_sync_pairs(ui, &engine, client, &pair_definitions)
@@ -395,6 +434,10 @@ async fn sync(
 	)?;
 	// once, before the passes start: labelling an event must not ask the server for anything
 	let labels = sync_pairs::pair_labels(client, &pairs).await;
+	if passes == Passes::DryRun {
+		return dry_run::print_plans(ui, &engine, &pairs, &labels).await;
+	}
+	let once = passes == Passes::Once;
 	let can_ask = questions::can_ask(ui);
 	let mut log = EventLog::new(&labels, settle, Output::of(ui));
 	log.asks = can_ask;
@@ -1050,6 +1093,25 @@ mod tests {
 		));
 		assert!(parse_repl_line("resolve-sync-conflict 2 a.txt").is_err());
 		assert!(parse_repl_line("resolve-sync-conflict 2 a.txt --keep-local --keep-both").is_err());
+	}
+
+	#[test]
+	fn a_dry_run_runs_no_pass_so_takes_no_flag_about_passes() {
+		assert!(matches!(
+			command_of("sync /a:/b --dry-run"),
+			SyncCommands::Sync { dry_run: true, .. }
+		));
+		for flags in [
+			"--once",
+			"--continuous",
+			"--approve-mass-deletions",
+			"--keep-local a",
+		] {
+			assert!(
+				parse_repl_line(&format!("sync /a:/b --dry-run {flags}")).is_err(),
+				"{flags}"
+			);
+		}
 	}
 
 	#[test]

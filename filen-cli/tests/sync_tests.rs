@@ -581,11 +581,55 @@ async fn a_paused_pair_is_left_alone_until_it_is_resumed() {
 			.unwrap()
 			.is_none()
 	);
+	// nor does a dry run plan a pass that `sync` would not run
+	let dry_run = sync(config_dir.path(), &["--dry-run", &pair]).await;
+	assert_success(&dry_run);
+	assert!(
+		String::from_utf8_lossy(&dry_run.stderr).contains("is paused, so it is not synced"),
+		"{}",
+		describe(&dry_run)
+	);
+	assert!(
+		!String::from_utf8_lossy(&dry_run.stdout).contains("would:"),
+		"{}",
+		describe(&dry_run)
+	);
 	assert_success(&filen(config_dir.path(), &["resume-sync-pair", "1"]).await);
 	assert_success(&sync_once(config_dir.path(), &pair, &[]).await);
 	assert_eq!(
 		remote_content(&resources.client, &format!("{test_dir_name}/later.txt")).await,
 		b"after the pause"
+	);
+}
+
+/// `sync --dry-run` prints the upload a pass would make, and makes none.
+#[shared_test_runtime]
+async fn sync_dry_run_prints_the_planned_upload_and_transfers_nothing() {
+	// Not `get_resources_with_lock`, for the reason the first test gives.
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let test_dir_name = resources.dir.name().unwrap();
+	let local = assert_fs::TempDir::new().unwrap();
+	std::fs::write(local.path().join("planned.txt"), "not yet").unwrap();
+	let config_dir = assert_fs::TempDir::new().unwrap();
+	let pair = format!("{}:{test_dir_name}", local.path().to_str().unwrap());
+
+	let output = sync(config_dir.path(), &["--dry-run", &pair]).await;
+
+	assert_success(&output);
+	assert!(
+		String::from_utf8_lossy(&output.stdout).contains("  upload planned.txt (7 B)"),
+		"{}",
+		describe(&output)
+	);
+	assert!(
+		resources
+			.client
+			.find_item_at_path(&format!("{test_dir_name}/planned.txt"))
+			.await
+			.unwrap()
+			.is_none(),
+		"{}",
+		describe(&output)
 	);
 }
 

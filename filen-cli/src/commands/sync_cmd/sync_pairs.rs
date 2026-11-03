@@ -153,13 +153,15 @@ fn pair_by_alias(pairs: &[ParsedPair], alias: &str) -> Result<ParsedPair> {
 ///
 /// Every root is looked up, and every missing one asked about, before any is created, and all of
 /// them before any pair is registered, so a bad definition or a "no" fails the run before anything
-/// is created or stored. A root that several pairs share is asked about and created once.
+/// is created or stored. A root that several pairs share is asked about and created once. Without
+/// `creates_roots`, as in a dry run, a missing root fails the run instead.
 pub(crate) async fn resolve_sync_pairs(
 	ui: &mut UI,
 	client: &Client,
 	working_path: &RemotePath,
 	dirs: &SyncDirs<'_>,
 	parsed: Vec<ParsedPair>,
+	creates_roots: bool,
 ) -> Result<Vec<PairDefinition>> {
 	let mut found = Vec::with_capacity(parsed.len());
 	// each remote root once, however many pairs share it
@@ -175,6 +177,19 @@ pub(crate) async fn resolve_sync_pairs(
 			}
 		};
 		let local_exists = local_root_exists(&pair.local)?;
+		if !creates_roots {
+			if !local_exists {
+				return Err(UI::failure(&format!(
+					"Local directory {} does not exist, and a dry run creates nothing",
+					pair.local.display()
+				)));
+			}
+			if remote_root.is_none() {
+				return Err(UI::failure(&format!(
+					"Remote directory {remote_path} does not exist, and a dry run creates nothing"
+				)));
+			}
+		}
 		found.push((pair, remote_path, remote_root, local_exists));
 	}
 	let (missing_locals, missing_remotes) = missing_roots(&found);

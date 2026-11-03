@@ -251,7 +251,7 @@ pub(super) async fn list_sync_conflicts(
 }
 
 /// The line `list-sync-conflicts` prints for `conflict`.
-fn conflict_line(conflict: &PlannedConflict) -> String {
+pub(super) fn conflict_line(conflict: &PlannedConflict) -> String {
 	let side = |kind: Option<PlannedNodeKind>| kind.map_or("deleted", node_name);
 	format!(
 		"{}: local {}, remote {}",
@@ -262,7 +262,7 @@ fn conflict_line(conflict: &PlannedConflict) -> String {
 }
 
 /// `conflict` for `--json`: its path and what each side holds, `null` for a side that deleted it.
-fn conflict_object(conflict: &PlannedConflict) -> Value {
+pub(super) fn conflict_object(conflict: &PlannedConflict) -> Value {
 	json!({
 		"path": conflict.rel_path,
 		"local": conflict.local.map(node_name),
@@ -271,7 +271,7 @@ fn conflict_object(conflict: &PlannedConflict) -> Value {
 }
 
 /// How the output names an item of kind `node`.
-fn node_name(node: PlannedNodeKind) -> &'static str {
+pub(super) fn node_name(node: PlannedNodeKind) -> &'static str {
 	match node {
 		PlannedNodeKind::File => "file",
 		PlannedNodeKind::Dir => "directory",
