@@ -1,4 +1,12 @@
 //! [cli-doc] account-credentials
+//! `2fa enable` turns on two-factor authentication: it prints a secret (and an `otpauth://` URL with
+//! it) to add to your authenticator app, asks for a code from the app (or takes it with `--code`),
+//! and prints the recovery key, which logs you in without a code: store it somewhere safe.
+//! With `--json`, the secret and the recovery key are printed as `{"secret", "recoveryKey"}`, and
+//! the secret is shown on stderr before the code is asked for. `2fa disable` turns it off again,
+//! with a code or the recovery key. Both ask to confirm, which `--yes` does. The login the CLI
+//! keeps stays valid.
+//!
 //! `change-password` asks for your current password and the new one (twice), and changes it.
 //! The login the CLI keeps is updated with it: the system keychain's, or the auth config file you
 //! logged in with. A password given with `--password` or the environment has to be updated where
@@ -20,11 +28,117 @@ use filen_sdk_rs::ErrorKind;
 use filen_types::error::ResponseError;
 use serde_json::json;
 
+use filen_sdk_rs::auth::TwoFASecret;
+
 use super::{
-	KeptLogin, KeyringLocation, LazyClient, get_auth_config_default_locations,
-	keyring_disabled_for_testing, write_private_file,
+	KeptLogin, KeyringLocation, LazyClient, TWO_FACTOR_CODE_PROMPT,
+	get_auth_config_default_locations, keyring_disabled_for_testing, write_private_file,
 };
 use crate::{CliConfig, serialize_auth_config, ui::UI, util::LongKeyringEntry};
+
+const ENABLE_TWO_FACTOR_PROMPT: &str = "Enable two-factor authentication? Logging in will then \
+	also need a code from your authenticator app";
+const NEW_TWO_FACTOR_CODE_PROMPT: &str = "Code from your authenticator app: ";
+
+/// Enable two-factor authentication, after the user confirmed it: print the secret for an
+/// authenticator app, enable it with the app's current code, `code_arg` or asked for, and print the
+/// recovery key. The login the CLI keeps stays valid: enabling it leaves the API key as it is.
+pub(crate) async fn enable_two_factor(
+	ui: &mut UI,
+	client: &mut LazyClient,
+	code_arg: Option<&str>,
+) -> Result<()> {
+	// before logging in, so that a script learns at once what it has to pass
+	ui.ensure_can_confirm(ENABLE_TWO_FACTOR_PROMPT)?;
+	if code_arg.is_none() {
+		ui.ensure_can_prompt(NEW_TWO_FACTOR_CODE_PROMPT)?;
+	}
+	if !ui.prompt_confirm(ENABLE_TWO_FACTOR_PROMPT, true)? {
+		ui.print_muted("Two-factor authentication not enabled");
+		return Ok(());
+	}
+	let client = client.get(ui).await?;
+	let secret = client
+		.generate_2fa_secret()
+		.await
+		.map_err(|e| match e.kind() {
+			ErrorKind::InvalidState => UI::failure("Two-factor authentication is already enabled"),
+			_ => account_failure(e, "Failed to get a two-factor authentication secret"),
+		})?;
+	print_two_factor_secret(ui, &secret);
+	let code = match code_arg {
+		Some(code) => code.to_owned(),
+		None => ui.prompt(NEW_TWO_FACTOR_CODE_PROMPT)?,
+	};
+	let recovery_key = client
+		.enable_2fa(code.trim())
+		.await
+		.map_err(|e| account_failure(e, "Failed to enable two-factor authentication"))?;
+	print_two_factor_enabled(ui, secret.secret(), &recovery_key)
+}
+
+/// Print `secret` for the user to add to an authenticator app: on stdout, or on stderr with
+/// `--json`, whose output comes once two-factor authentication is enabled.
+fn print_two_factor_secret(ui: &mut UI, secret: &TwoFASecret) {
+	let lines = [
+		"Add this secret to your authenticator app, or open the URL with it:".to_owned(),
+		format!("Secret: {}", secret.secret()),
+		format!("URL: {}", secret.url()),
+	];
+	for line in &lines {
+		if ui.json {
+			ui.print_to_stderr(line);
+		} else {
+			ui.print(line);
+		}
+	}
+}
+
+/// Say that two-factor authentication with `secret` is enabled, and print its `recovery_key` with
+/// a warning, or `{"secret": ..., "recoveryKey": ...}` with `--json`.
+fn print_two_factor_enabled(ui: &mut UI, secret: &str, recovery_key: &str) -> Result<()> {
+	if ui.json {
+		return ui.print_json(json!({ "secret": secret, "recoveryKey": recovery_key }));
+	}
+	ui.print_success("Enabled two-factor authentication");
+	ui.print(&format!("Recovery key: {recovery_key}"));
+	ui.print_warning(
+		"Store the recovery key somewhere safe: it logs you in without a code if you lose your \
+		 authenticator app",
+	);
+	Ok(())
+}
+
+const DISABLE_TWO_FACTOR_PROMPT: &str = "Disable two-factor authentication? Logging in will then \
+	need only your email and password";
+
+/// Disable two-factor authentication, after the user confirmed it, with a current code or the
+/// recovery key, `code_arg` or asked for.
+pub(crate) async fn disable_two_factor(
+	ui: &mut UI,
+	client: &mut LazyClient,
+	code_arg: Option<&str>,
+) -> Result<()> {
+	ui.ensure_can_confirm(DISABLE_TWO_FACTOR_PROMPT)?;
+	if code_arg.is_none() {
+		ui.ensure_can_prompt(TWO_FACTOR_CODE_PROMPT)?;
+	}
+	if !ui.prompt_confirm(DISABLE_TWO_FACTOR_PROMPT, false)? {
+		ui.print_muted("Two-factor authentication not disabled");
+		return Ok(());
+	}
+	let client = client.get(ui).await?;
+	let code = match code_arg {
+		Some(code) => code.to_owned(),
+		None => ui.prompt_password(TWO_FACTOR_CODE_PROMPT)?,
+	};
+	client
+		.disable_2fa(code.trim())
+		.await
+		.map_err(|e| account_failure(e, "Failed to disable two-factor authentication"))?;
+	ui.print_success("Disabled two-factor authentication");
+	Ok(())
+}
 
 const CURRENT_PASSWORD_PROMPT: &str = "Current password: ";
 const NEW_PASSWORD_PROMPT: &str = "New password: ";
@@ -283,6 +397,136 @@ mod tests {
 		ui::test_support::Printed,
 		util::{ChunkStore as _, test_support::MemoryChunkStore},
 	};
+
+	#[test]
+	fn the_two_factor_secret_is_printed_with_its_url() {
+		let printed = Printed::default();
+		let secret = TwoFASecret::new("JBSWY3DPEHPK3PXP".to_owned(), "user@example.com");
+
+		print_two_factor_secret(&mut printed.ui(), &secret);
+
+		assert_eq!(
+			printed.lines(),
+			"Add this secret to your authenticator app, or open the URL with it:\n\
+			 Secret: JBSWY3DPEHPK3PXP\n\
+			 URL: otpauth://totp/Filen:user%40example.com?secret=JBSWY3DPEHPK3PXP&issuer=Filen&\
+			 digits=6&period=30"
+		);
+	}
+
+	#[test]
+	fn with_json_the_two_factor_secret_is_shown_on_stderr() {
+		let out = Printed::default();
+		let err = Printed::default();
+		let mut ui = Printed::split_ui(&out, &err);
+		ui.set_quiet_and_json(false, true);
+		let secret = TwoFASecret::new("JBSWY3DPEHPK3PXP".to_owned(), "user@example.com");
+
+		print_two_factor_secret(&mut ui, &secret);
+
+		assert_eq!(out.lines_or_empty(), "");
+		assert!(err.lines().contains("Secret: JBSWY3DPEHPK3PXP"));
+	}
+
+	#[test]
+	fn the_recovery_key_is_printed_with_a_warning() {
+		let printed = Printed::default();
+
+		print_two_factor_enabled(&mut printed.ui(), "JBSWY3DPEHPK3PXP", "the recovery key")
+			.unwrap();
+
+		assert_eq!(
+			console::strip_ansi_codes(&printed.lines()),
+			"✔ Enabled two-factor authentication\n\
+			 Recovery key: the recovery key\n\
+			 ⚠ Store the recovery key somewhere safe: it logs you in without a code if you lose \
+			 your authenticator app"
+		);
+	}
+
+	#[test]
+	fn with_json_the_secret_and_the_recovery_key_are_printed_as_an_object() {
+		let printed = Printed::default();
+		let mut ui = printed.ui();
+		ui.set_quiet_and_json(false, true);
+
+		print_two_factor_enabled(&mut ui, "JBSWY3DPEHPK3PXP", "the recovery key").unwrap();
+
+		assert_eq!(
+			printed.lines(),
+			"{\n  \"recoveryKey\": \"the recovery key\",\n  \"secret\": \"JBSWY3DPEHPK3PXP\"\n}"
+		);
+	}
+
+	#[tokio::test]
+	async fn enabling_two_factor_without_a_terminal_or_yes_fails_before_logging_in() {
+		let printed = Printed::default();
+		let mut client = client_never_logged_in();
+
+		let err = enable_two_factor(&mut printed.ui(), &mut client, Some("123456"))
+			.await
+			.unwrap_err();
+
+		assert_eq!(exit_code(&err), 2);
+		assert!(
+			format!("{err:#}").ends_with("stdin is not a terminal. Pass --yes to answer yes."),
+			"{err:#}"
+		);
+		assert!(client.get_arc().is_none());
+	}
+
+	#[tokio::test]
+	async fn enabling_two_factor_with_yes_but_without_a_code_or_a_terminal_fails_before_logging_in()
+	{
+		let printed = Printed::default();
+		let mut ui = printed.ui();
+		ui.set_assume_yes(true);
+		let mut client = client_never_logged_in();
+
+		let err = enable_two_factor(&mut ui, &mut client, None)
+			.await
+			.unwrap_err();
+
+		assert_eq!(
+			format!("{err:#}"),
+			"Cannot ask \"Code from your authenticator app:\": stdin is not a terminal."
+		);
+		assert_eq!(exit_code(&err), 2);
+		assert!(client.get_arc().is_none());
+	}
+
+	#[tokio::test]
+	async fn disabling_two_factor_with_yes_but_without_a_code_or_a_terminal_fails_before_logging_in()
+	 {
+		let printed = Printed::default();
+		let mut ui = printed.ui();
+		ui.set_assume_yes(true);
+		let mut client = client_never_logged_in();
+
+		let err = disable_two_factor(&mut ui, &mut client, None)
+			.await
+			.unwrap_err();
+
+		assert_eq!(
+			format!("{err:#}"),
+			"Cannot ask \"Two-factor authentication code or recovery key:\": stdin is not a \
+			 terminal."
+		);
+		assert!(client.get_arc().is_none());
+	}
+
+	#[tokio::test]
+	async fn disabling_two_factor_without_a_terminal_or_yes_fails_before_logging_in() {
+		let printed = Printed::default();
+		let mut client = client_never_logged_in();
+
+		let err = disable_two_factor(&mut printed.ui(), &mut client, Some("123456"))
+			.await
+			.unwrap_err();
+
+		assert_eq!(exit_code(&err), 2);
+		assert!(client.get_arc().is_none());
+	}
 
 	#[test]
 	fn a_new_password_typed_the_same_twice_is_taken() {

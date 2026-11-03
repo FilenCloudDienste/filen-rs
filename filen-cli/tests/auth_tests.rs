@@ -561,6 +561,106 @@ async fn the_recovery_key_is_taken_as_a_two_factor_code() {
 	.await;
 }
 
+/// Runs the CLI with `args`, logged in with the auth config at `auth_config`.
+fn cli_with_auth_config(
+	working_dir: &std::path::Path,
+	config_dir: &std::path::Path,
+	auth_config: &std::path::Path,
+	args: &[&str],
+) -> assert_cmd::assert::Assert {
+	cli_without_stored_credentials(working_dir, config_dir)
+		.args([
+			"--auth-config-path",
+			auth_config.to_str().unwrap(),
+			"--no-input",
+		])
+		.args(args)
+		.assert()
+}
+
+#[shared_test_runtime]
+#[ignore = "toggles 2FA on the shared account"]
+async fn two_factor_authentication_is_enabled_and_disabled_with_the_cli() {
+	let client = test_utils::RESOURCES.client().await;
+	let working_dir = assert_fs::TempDir::new().unwrap();
+	let config_dir = assert_fs::TempDir::new().unwrap();
+	let auth_config = config_dir.path().join("auth-config.txt");
+	std::fs::write(
+		&auth_config,
+		filen_cli::serialize_auth_config(&client).unwrap(),
+	)
+	.unwrap();
+	#[cfg(unix)]
+	std::fs::set_permissions(&auth_config, std::fs::Permissions::from_mode(0o600)).unwrap();
+	// the secret the server keeps until 2FA is enabled, which the CLI gets too
+	let secret = client.generate_2fa_secret().await.unwrap();
+
+	// the CLI takes the auth lock itself, so the test must not hold it
+	let mut enabled = None;
+	for _ in 0..5 {
+		let code = secret.make_totp_code(chrono::Utc::now()).unwrap();
+		let assert = cli_with_auth_config(
+			working_dir.path(),
+			config_dir.path(),
+			&auth_config,
+			&["--yes", "--json", "2fa", "enable", "--code", &code],
+		);
+		let output = assert.get_output();
+		if output.status.success() {
+			enabled = Some(output.clone());
+			break;
+		}
+		eprintln!(
+			"Failed to enable 2FA, retrying: {}",
+			String::from_utf8_lossy(&output.stderr)
+		);
+		tokio::time::sleep(Duration::from_secs(10)).await;
+	}
+	let Some(enabled) = enabled else {
+		// in case a run enabled 2FA and failed after it, without printing the recovery key
+		if client.generate_2fa_secret().await.is_err() {
+			disable_two_factor(&client, &secret, "").await;
+		}
+		panic!("the CLI could not enable 2FA");
+	};
+	let printed: serde_json::Value = serde_json::from_slice(&enabled.stdout).unwrap();
+	let recovery_key = printed["recoveryKey"].as_str().unwrap().to_owned();
+
+	let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+		assert_eq!(printed["secret"].as_str(), Some(secret.secret()));
+		assert!(!recovery_key.is_empty());
+		assert!(
+			String::from_utf8_lossy(&enabled.stderr)
+				.contains(&format!("Secret: {}", secret.secret()))
+		);
+		// the kept login stays valid
+		cli_with_auth_config(
+			working_dir.path(),
+			config_dir.path(),
+			&auth_config,
+			&["stat", "/"],
+		)
+		.success();
+		cli_with_auth_config(
+			working_dir.path(),
+			config_dir.path(),
+			&auth_config,
+			&["--yes", "2fa", "disable", "--code", &recovery_key],
+		)
+		.success()
+		.stdout(predicates::str::contains(
+			"Disabled two-factor authentication",
+		));
+	}));
+	// 2FA stays off for the other tests, also when the CLI did not disable it
+	if client.generate_2fa_secret().await.is_err() {
+		disable_two_factor(&client, &secret, &recovery_key).await;
+	}
+	if let Err(panic) = result {
+		std::panic::resume_unwind(panic);
+	}
+}
+
 #[test]
 fn authenticate_from_the_credential_variables() {
 	let (email, password) = get_testing_credentials();

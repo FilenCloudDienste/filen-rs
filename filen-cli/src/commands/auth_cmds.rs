@@ -26,6 +26,12 @@ pub(crate) enum AuthCommands {
 	/// Delete saved credentials, including the --auth-config-path file, and exit, asking before
 	/// each (--yes deletes them all); then offer to delete the local cache
 	Logout,
+	/// Enable or disable two-factor authentication
+	#[command(name = "2fa")]
+	TwoFactor {
+		#[command(subcommand)]
+		command: TwoFactorCommand,
+	},
 	/// Change your password, and update the kept login (asks for the current and the new password)
 	ChangePassword,
 	/// Request to change your email, which Filen asks you to confirm by email (asks for your
@@ -38,6 +44,23 @@ pub(crate) enum AuthCommands {
 	ExportMasterKeys,
 }
 
+#[derive(Debug, Subcommand)]
+pub(crate) enum TwoFactorCommand {
+	/// Enable two-factor authentication: print the secret for your authenticator app, ask for a
+	/// code from it and print the recovery key (asks to confirm, which --yes answers)
+	Enable {
+		/// A current code from your authenticator app, instead of asking for it
+		#[arg(long)]
+		code: Option<String>,
+	},
+	/// Disable two-factor authentication (asks to confirm, which --yes answers)
+	Disable {
+		/// A current code or the recovery key, instead of asking for it
+		#[arg(long)]
+		code: Option<String>,
+	},
+}
+
 /// The authentication section of the docs.
 pub(crate) const DOCS: &[DocElement] = &[
 	DocElement::DocFragment("auth-methods"),
@@ -45,6 +68,7 @@ pub(crate) const DOCS: &[DocElement] = &[
 	DocElement::CommandHelp("export-auth-config"),
 	DocElement::CommandHelp("logout"),
 	DocElement::DocFragment("account-credentials"),
+	DocElement::CommandHelp("2fa"),
 	DocElement::CommandHelp("change-password"),
 	DocElement::CommandHelp("change-email"),
 	DocElement::CommandHelp("export-master-keys"),
@@ -79,6 +103,14 @@ impl AuthCommands {
 					});
 				}
 			}
+			Self::TwoFactor { command } => match command {
+				TwoFactorCommand::Enable { code } => {
+					auth::enable_two_factor(ui, client, code.as_deref()).await?;
+				}
+				TwoFactorCommand::Disable { code } => {
+					auth::disable_two_factor(ui, client, code.as_deref()).await?;
+				}
+			},
 			Self::ChangePassword => auth::change_password(config, ui, client).await?,
 			Self::ChangeEmail { new_email } => auth::change_email(ui, client, &new_email).await?,
 			Self::ExportMasterKeys => auth::export_master_keys(ui, client).await?,

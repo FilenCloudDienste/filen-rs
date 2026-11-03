@@ -52,7 +52,9 @@ use filen_sdk_rs::{
 	fs::HasUUID as _,
 };
 
-pub(crate) use self::account::{change_email, change_password, export_master_keys};
+pub(crate) use self::account::{
+	change_email, change_password, disable_two_factor, enable_two_factor, export_master_keys,
+};
 use crate::{
 	CliConfig, ClientConfigArgs, build_client_config, default_config_dir, deserialize_auth_config,
 	serialize_auth_config,
