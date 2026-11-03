@@ -1,14 +1,37 @@
 //! [cli-doc] updates
-//! The updater checks for new releases from https://github.com/FilenCloudDienste/filen-cli-releases
-//! when the CLI is run (unless skipped in the 5mins since the last check, or through the `--skip-update` flag).
-//! The executable will be replaced in place, with the filename updated if it contains the version number.
-//! In the Docker image, a newer release is only announced, with the image to pull; the CLI never
-//! replaces itself there, not even with `--always-update`.
-//! The release notes of the new release are shown before it is offered or installed.
-//! `filen install <latest|vX.Y.Z>` installs a given release, also an older one or the running one again, after confirming (`--yes` confirms).
-//! Update notices, release notes and announcements are printed to stderr, and only when stdout is a terminal and neither `--json` nor `--quiet` is given.
-//! A failed update check (for example when offline) is printed as a warning to stderr and does not stop the command.
-//! An update installed as the REPL starts restarts the CLI on the new release. One installed with `--always-update` before a command takes effect the next time the CLI runs: the command runs on the release it started with.
+//! The CLI checks for a new release at https://github.com/FilenCloudDienste/filen-cli-releases
+//! when it starts, at most once every 5 minutes: `last_update_check` in the config directory keeps
+//! the time of the last check. `--skip-update` skips the check, and `--force-update-check` checks
+//! even if the last check was less recent. `filen version` and `filen install` never check.
+//! The check follows the release marked latest there; there is no canary or beta channel.
+//!
+//! What happens to a newer release depends on how the CLI runs:
+//! - In the REPL, it is offered: its release notes are shown and you are asked whether to install
+//!   it (`--yes` answers yes). If you do, the CLI installs it and restarts on it. If you decline, it
+//!   is offered again after the next check.
+//! - With a command, or with commands piped in, it is only announced, saying to update from the
+//!   REPL.
+//! - `--always-update` checks even if the last check was less recent, and installs a newer release
+//!   without asking, also with a command. The command still runs on the release the CLI started
+//!   with, and the new one is used from the next run on. In the REPL, the CLI restarts on it.
+//! - In the Docker image, the CLI never replaces itself, not even with `--always-update`: a newer
+//!   release is announced with the image to pull (`docker pull filen/cli:<version>`).
+//!
+//! An update replaces the executable in place. If the executable's file name contains its version,
+//! the new release is saved under a name with the new version instead, and the old executable is
+//! deleted. The download is checked against the size its release lists.
+//!
+//! `filen install latest` installs the latest release, and `filen install vX.Y.Z` a given one, also
+//! an older one (to go back to it) or the running one again, after showing its release notes and
+//! asking to confirm (`--yes` confirms). It does not work in the Docker image, where you pull the
+//! image of the release instead. After going back to an older release, the REPL offers the latest
+//! one again with each check: pass `--skip-update` to keep running the older one without the offer.
+//!
+//! Announcements for the running version, published with the releases, are shown with each check.
+//! Update notices, release notes and announcements are printed to stderr, and only when stdout is a
+//! terminal and neither `--json` nor `--quiet` is given. A failed update check (for example when
+//! offline) does not stop the command: it is printed as a warning to stderr, except with `--json`
+//! or `--quiet`, and written to the log.
 
 #[cfg(unix)]
 use std::os::unix::{fs::PermissionsExt, process::ExitStatusExt};
