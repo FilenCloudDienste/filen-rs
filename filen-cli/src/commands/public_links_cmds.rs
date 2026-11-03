@@ -274,7 +274,7 @@ async fn edit_or_delete_link<I: LinkableItem>(
 	item: &I,
 	mut link: I::Link,
 ) -> Result<()> {
-	item.print_link(ui, &link);
+	print_link_table(ui, item, &link);
 	match prompt_link_operation(ui)? {
 		None | Some(PublicLinkOperation::Cancel) => Ok(()),
 		Some(PublicLinkOperation::Delete) => {
@@ -285,8 +285,7 @@ async fn edit_or_delete_link<I: LinkableItem>(
 			Ok(())
 		}
 		Some(PublicLinkOperation::Edit) => {
-			let Some(settings) = prompt_link_settings(ui, I::KIND, I::current_settings(&link))?
-			else {
+			let Some(settings) = prompt_link_settings(ui)? else {
 				return Ok(());
 			};
 			I::apply_settings(&mut link, settings);
@@ -317,7 +316,7 @@ async fn create_link<I: LinkableItem>(
 	item: &I,
 	path: &str,
 ) -> Result<()> {
-	let Some(settings) = new_link_settings::<I>(ui, path)? else {
+	let Some(settings) = new_link_settings(ui, path)? else {
 		return Ok(());
 	};
 	ui.print(&format!(
@@ -335,11 +334,11 @@ async fn create_link<I: LinkableItem>(
 /// The settings for a new link for the item at `path`, or `None` when a prompt was cancelled.
 /// Without a terminal to ask on it fails with a usage error, as a command that looks like it only
 /// shows the link must not make the item public unasked.
-fn new_link_settings<I: LinkableItem>(ui: &mut UI, path: &str) -> Result<Option<LinkSettings>> {
+fn new_link_settings(ui: &mut UI, path: &str) -> Result<Option<LinkSettings>> {
 	ui.ensure_can_prompt(EXPIRATION_PROMPT).with_context(|| {
 		format!("No public link for {path}, and creating one asks for its settings")
 	})?;
-	prompt_link_settings(ui, I::KIND, NEW_LINK_SETTINGS)
+	prompt_link_settings(ui)
 }
 
 async fn save_link<I: LinkableItem>(
@@ -357,7 +356,7 @@ async fn save_link<I: LinkableItem>(
 }
 
 /// A file or directory, as `public-link` shows, creates, edits and deletes its public link.
-trait LinkableItem {
+trait LinkableItem: HasName {
 	type Link;
 	const KIND: PublicLinkKind;
 
@@ -366,7 +365,6 @@ trait LinkableItem {
 	async fn update_link(&self, client: &Client, link: &Self::Link) -> Result<(), Error>;
 	async fn remove_link(&self, client: &Client, link: Self::Link) -> Result<(), Error>;
 	fn link_url(&self, link: &Self::Link) -> Option<String>;
-	fn print_link(&self, ui: &mut UI, link: &Self::Link);
 	fn current_settings(link: &Self::Link) -> CurrentLinkSettings;
 	fn apply_settings(link: &mut Self::Link, settings: LinkSettings);
 }
@@ -395,10 +393,6 @@ impl LinkableItem for RemoteFile {
 		file_public_link_url(self, link)
 	}
 
-	fn print_link(&self, ui: &mut UI, link: &FilePublicLink) {
-		print_file_public_link(ui, self, link);
-	}
-
 	fn current_settings(link: &FilePublicLink) -> CurrentLinkSettings {
 		CurrentLinkSettings {
 			expiration: link.expiration(),
@@ -413,6 +407,7 @@ impl LinkableItem for RemoteFile {
 			PasswordChange::Clear => link.clear_password(),
 			PasswordChange::Set(password) => link.set_password(password),
 		}
+		link.set_downloadable(settings.downloadable);
 	}
 }
 
@@ -439,10 +434,6 @@ impl LinkableItem for RemoteDirectory {
 
 	fn link_url(&self, link: &DirPublicLinkRW) -> Option<String> {
 		dir_public_link_url(link)
-	}
-
-	fn print_link(&self, ui: &mut UI, link: &DirPublicLinkRW) {
-		print_dir_public_link(ui, self, link);
 	}
 
 	fn current_settings(link: &DirPublicLinkRW) -> CurrentLinkSettings {
@@ -506,20 +497,13 @@ fn expiration_label(expiration: PublicLinkExpiration) -> &'static str {
 	}
 }
 
-/// A link's settings, which the prompts start from.
+/// A link's settings, as the link table shows them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CurrentLinkSettings {
 	expiration: PublicLinkExpiration,
 	has_password: bool,
 	downloadable: bool,
 }
-
-/// The settings a new link is created with, which the SDK gives file and directory links alike.
-const NEW_LINK_SETTINGS: CurrentLinkSettings = CurrentLinkSettings {
-	expiration: PublicLinkExpiration::Never,
-	has_password: false,
-	downloadable: true,
-};
 
 /// The settings chosen in the prompts, to apply to a link.
 #[derive(Debug, PartialEq, Eq)]
@@ -546,12 +530,8 @@ impl PasswordChange {
 	}
 }
 
-/// Asks for a link's settings, starting from `current`, or `None` when a prompt was cancelled.
-fn prompt_link_settings(
-	ui: &mut UI,
-	kind: PublicLinkKind,
-	current: CurrentLinkSettings,
-) -> Result<Option<LinkSettings>> {
+/// Asks for a link's settings, or `None` when a prompt was cancelled.
+fn prompt_link_settings(ui: &mut UI) -> Result<Option<LinkSettings>> {
 	let expiration_choices =
 		EXPIRATIONS.map(|expiration| (expiration_label(expiration), expiration));
 	let Some(expiration) = ui.prompt_choice(
@@ -564,11 +544,8 @@ fn prompt_link_settings(
 	};
 	let password =
 		PasswordChange::from_answer(ui.prompt("Password (leave empty for no password):")?);
-	let downloadable = match kind {
-		// a setting, which --yes does not choose
-		PublicLinkKind::Directory => ui.prompt_yes_no("Enable download?", false)?,
-		PublicLinkKind::File => current.downloadable,
-	};
+	// a setting, which --yes does not choose
+	let downloadable = ui.prompt_yes_no("Enable download?", false)?;
 	Ok(Some(LinkSettings {
 		expiration,
 		password,
@@ -576,13 +553,16 @@ fn prompt_link_settings(
 	}))
 }
 
-fn print_file_public_link(ui: &mut UI, file: &RemoteFile, link: &FilePublicLink) {
-	let url = file_public_link_url(file, link);
+/// Prints the item's name, then its link's settings and URL.
+fn print_link_table<I: LinkableItem>(ui: &mut UI, item: &I, link: &I::Link) {
+	let settings = I::current_settings(link);
+	let url = item.link_url(link);
 	let url = url_or_unavailable(ui, url.as_deref());
 	ui.print_key_value_table(&[
-		("File", file.name().unwrap_or_default()),
-		("Expiration", expiration_label(link.expiration())),
-		("Password", yes_no(has_password(link.password()))),
+		(I::KIND.label(), item.name().unwrap_or_default()),
+		("Expiration", expiration_label(settings.expiration)),
+		("Password", yes_no(settings.has_password)),
+		("Download Enabled", yes_no(settings.downloadable)),
 		("URL", url),
 	]);
 }
@@ -600,18 +580,6 @@ fn yes_no(value: bool) -> &'static str {
 	if value { "Yes" } else { "No" }
 }
 
-fn print_dir_public_link(ui: &mut UI, dir: &RemoteDirectory, link: &DirPublicLinkRW) {
-	let url = dir_public_link_url(link);
-	let url = url_or_unavailable(ui, url.as_deref());
-	ui.print_key_value_table(&[
-		("Directory", dir.name().unwrap_or_default()),
-		("Expiration", expiration_label(link.expiration())),
-		("Password", yes_no(has_password(link.password()))),
-		("Download Enabled", yes_no(link.download_enabled())),
-		("URL", url),
-	]);
-}
-
 /// What a public link opens in the web app.
 enum PublicLinkKind {
 	File,
@@ -624,6 +592,14 @@ impl PublicLinkKind {
 		match self {
 			PublicLinkKind::File => "d",
 			PublicLinkKind::Directory => "f",
+		}
+	}
+
+	/// The item type as the link table labels the item's name.
+	fn label(&self) -> &'static str {
+		match self {
+			PublicLinkKind::File => "File",
+			PublicLinkKind::Directory => "Directory",
 		}
 	}
 
@@ -806,7 +782,7 @@ mod tests {
 		let printed = Printed::default();
 		let mut ui = printed.ui();
 		ui.disable_prompts();
-		let err = new_link_settings::<RemoteFile>(&mut ui, "/a.txt").unwrap_err();
+		let err = new_link_settings(&mut ui, "/a.txt").unwrap_err();
 		assert_eq!(exit_code(&err), 2);
 		assert_eq!(
 			format!("{err:#}"),
