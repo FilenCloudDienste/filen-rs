@@ -16,7 +16,9 @@
 
 use std::{
 	borrow::Cow,
+	collections::VecDeque,
 	path::{Path, PathBuf},
+	pin::pin,
 	sync::{Arc, Mutex},
 	time::{Duration, Instant},
 };
@@ -144,6 +146,8 @@ pub(crate) async fn upload(
 		_ => find_or_create_remote_dir(&client, &target.parent).await?,
 	};
 
+	let target_path = target.parent.navigate(target.name.as_ref());
+
 	let progress = TransferProgress::new(TransferKind::Upload, ui);
 	let transferred = if is_dir {
 		run_cancellable(
@@ -175,12 +179,7 @@ pub(crate) async fn upload(
 	finish(
 		ui,
 		&progress,
-		"upload",
-		&format!(
-			"Uploaded {} to {}",
-			source.display(),
-			target.parent.navigate(target.name.as_ref())
-		),
+		&format!("{} to {}", source.display(), target_path),
 	)
 }
 
@@ -391,8 +390,7 @@ pub(crate) async fn download(
 	finish(
 		ui,
 		&progress,
-		"download",
-		&format!("Downloaded {} to {}", source_path, target.display()),
+		&format!("{} to {}", source_path, target.display()),
 	)
 }
 
@@ -475,23 +473,26 @@ async fn run_cancellable<T>(
 	transfer: impl Future<Output = Result<T>>,
 ) -> Result<Result<T>> {
 	let mut ctrl_c = interrupt::own();
-	let outcome = select! {
-		() = ctrl_c.pressed() => None,
-		result = transfer => Some(result),
+	let mut idle_redraws = tokio::time::interval(IDLE_REDRAW_INTERVAL);
+	let mut transfer = pin!(transfer);
+	let outcome = loop {
+		select! {
+			() = ctrl_c.pressed() => break None,
+			result = &mut transfer => break Some(result),
+			_ = idle_redraws.tick() => progress.redraw_idle(),
+		}
 	};
 	progress.clear();
 	outcome.ok_or_else(|| CliError::Interrupted.into())
 }
 
 /// Print the per-item failures the SDK reported through the progress callbacks, then either the
-/// success message or a summary failure. Directory transfers return `Ok` even when individual
-/// items failed, so without this the command would claim success while items were missing.
-fn finish(
-	ui: &mut UI,
-	progress: &TransferProgress,
-	action: &str,
-	success_message: &str,
-) -> Result<()> {
+/// success message or a summary of what did transfer. Directory transfers return `Ok` even when
+/// individual items failed, so without this the command would claim success while items were
+/// missing.
+fn finish(ui: &mut UI, progress: &TransferProgress, subject: &str) -> Result<()> {
+	let kind = progress.kind;
+	let (files, bytes) = progress.done();
 	let errors = progress.take_errors();
 	for error in errors.iter().take(MAX_PRINTED_ERRORS) {
 		ui.print_failure(error);
@@ -502,14 +503,18 @@ fn finish(
 			errors.len() - MAX_PRINTED_ERRORS
 		));
 	}
+	let summary = transfer_summary(files, bytes, progress.started.elapsed());
 	if errors.is_empty() {
-		ui.print_success(success_message);
+		ui.print_success(&format!("{} {}: {}", kind.past(), subject, summary));
 		Ok(())
 	} else {
+		if !ui.is_quiet() {
+			ui.print_muted(&format!("{} {}", kind.past(), summary));
+		}
 		Err(UI::failure(&format!(
 			"{} item(s) failed to {}",
 			errors.len(),
-			action
+			kind.action()
 		)))
 	}
 }
@@ -614,6 +619,14 @@ const MAX_PRINTED_ERRORS: usize = 10;
 /// both of those changing.
 const RENDER_INTERVAL: Duration = Duration::from_millis(100);
 
+/// How far back the speed in the progress line looks, so that it follows the current rate rather
+/// than the whole transfer's average.
+const SPEED_WINDOW: Duration = Duration::from_secs(5);
+
+/// How often the progress line is redrawn while nothing moves, which no callback reports, so that
+/// the speed of a stalled transfer falls.
+const IDLE_REDRAW_INTERVAL: Duration = Duration::from_secs(1);
+
 #[derive(Clone, Copy)]
 pub(crate) enum TransferKind {
 	Upload,
@@ -627,6 +640,20 @@ impl TransferKind {
 			Self::Download => "Downloading",
 		}
 	}
+
+	fn past(self) -> &'static str {
+		match self {
+			Self::Upload => "Uploaded",
+			Self::Download => "Downloaded",
+		}
+	}
+
+	fn action(self) -> &'static str {
+		match self {
+			Self::Upload => "upload",
+			Self::Download => "download",
+		}
+	}
 }
 
 #[derive(Default)]
@@ -637,9 +664,141 @@ struct ProgressState {
 	total_bytes: u64,
 	done_files: u64,
 	done_bytes: u64,
+	/// `(when, done_bytes)`, oldest first, reaching back just past [`SPEED_WINDOW`].
+	speed_samples: VecDeque<(Instant, u64)>,
 	last_render: Option<Instant>,
 	/// Whether there is a progress line on screen that still needs erasing.
 	line_shown: bool,
+}
+
+impl ProgressState {
+	/// Note `done_bytes` at `now` for the speed, at most once per [`RENDER_INTERVAL`], and drop the
+	/// samples the window no longer needs.
+	fn sample_speed(&mut self, now: Instant) {
+		if self
+			.speed_samples
+			.back()
+			.is_some_and(|&(at, _)| now.saturating_duration_since(at) < RENDER_INTERVAL)
+		{
+			return;
+		}
+		self.speed_samples.push_back((now, self.done_bytes));
+		// Keep the newest sample from before the window, so that the speed spans all of it.
+		while self
+			.speed_samples
+			.get(1)
+			.is_some_and(|&(at, _)| now.saturating_duration_since(at) >= SPEED_WINDOW)
+		{
+			self.speed_samples.pop_front();
+		}
+	}
+
+	/// Note that `now` has come, whether or not anything moved, so that a stalled transfer's speed
+	/// falls to zero once [`SPEED_WINDOW`] has passed. Nothing is noted while scanning, where no
+	/// bytes move yet, or before the speed is first sampled. Returns whether it was noted.
+	fn note_time(&mut self, now: Instant) -> bool {
+		let noted = !self.scanning && !self.speed_samples.is_empty();
+		if noted {
+			self.sample_speed(now);
+		}
+		noted
+	}
+
+	/// The current speed in bytes per second, or `None` while the samples span no time yet.
+	fn speed(&self, now: Instant) -> Option<u64> {
+		let &(since, bytes_then) = self.speed_samples.front()?;
+		bytes_per_second(
+			self.done_bytes.saturating_sub(bytes_then),
+			now.saturating_duration_since(since),
+		)
+	}
+}
+
+/// `bytes` per second over `elapsed`, or `None` when it is under a millisecond.
+fn bytes_per_second(bytes: u64, elapsed: Duration) -> Option<u64> {
+	let millis = elapsed.as_millis();
+	(millis > 0).then(|| u64::try_from(u128::from(bytes) * 1000 / millis).unwrap_or(u64::MAX))
+}
+
+/// The progress line for `state` at `now`.
+fn progress_line(kind: TransferKind, state: &ProgressState, now: Instant) -> String {
+	if state.scanning {
+		return format!(
+			"Scanning... {} in {} files",
+			ui::format_size(state.total_bytes),
+			state.total_files
+		);
+	}
+	if state.total_bytes == 0 {
+		return format!(
+			"{} {}/{} files",
+			kind.verb(),
+			state.done_files,
+			state.total_files
+		);
+	}
+	let percent = u128::from(state.done_bytes) * 100 / u128::from(state.total_bytes);
+	let mut line = format!(
+		"{} {} / {} ({}%) - {}/{} files",
+		kind.verb(),
+		ui::format_size(state.done_bytes),
+		ui::format_size(state.total_bytes),
+		percent.min(100),
+		state.done_files,
+		state.total_files
+	);
+	if let Some(speed) = state.speed(now) {
+		line.push_str(&format!(" - {}/s", ui::format_size(speed)));
+		// A stalled transfer has no end in sight.
+		if speed > 0 {
+			let remaining = state.total_bytes.saturating_sub(state.done_bytes);
+			line.push_str(&format!(
+				", {} left",
+				format_duration(remaining.div_ceil(speed))
+			));
+		}
+	}
+	line
+}
+
+/// `secs` as the two largest of hours, minutes and seconds.
+fn format_duration(secs: u64) -> String {
+	match secs {
+		0..60 => format!("{}s", secs),
+		60..3600 => format!("{}m {:02}s", secs / 60, secs % 60),
+		_ => format!("{}h {:02}m", secs / 3600, secs % 3600 / 60),
+	}
+}
+
+/// A transfer's elapsed time: to a tenth of a second under a minute.
+fn format_elapsed(elapsed: Duration) -> String {
+	if elapsed < Duration::from_secs(60) {
+		format!("{:.1}s", elapsed.as_secs_f64())
+	} else {
+		format_duration(elapsed.as_secs())
+	}
+}
+
+fn files_and_bytes(files: u64, bytes: u64) -> String {
+	format!(
+		"{} {}, {}",
+		files,
+		if files == 1 { "file" } else { "files" },
+		ui::format_size(bytes)
+	)
+}
+
+/// What a transfer moved and how fast, on average.
+fn transfer_summary(files: u64, bytes: u64, elapsed: Duration) -> String {
+	let summary = format!(
+		"{} in {}",
+		files_and_bytes(files, bytes),
+		format_elapsed(elapsed)
+	);
+	match bytes_per_second(bytes, elapsed) {
+		Some(speed) => format!("{} ({}/s)", summary, ui::format_size(speed)),
+		None => summary,
+	}
 }
 
 /// Draws a single, redrawn-in-place progress line for one upload or download.
@@ -652,6 +811,7 @@ pub(crate) struct TransferProgress {
 	/// Whether the progress line may be drawn at all: never in quiet or JSON mode, and never when
 	/// stdout is redirected, where the redraws would end up in the captured output.
 	enabled: bool,
+	started: Instant,
 	state: Mutex<ProgressState>,
 	errors: Mutex<Vec<String>>,
 }
@@ -664,6 +824,7 @@ impl TransferProgress {
 			kind,
 			term,
 			enabled,
+			started: Instant::now(),
 			state: Mutex::new(ProgressState::default()),
 			errors: Mutex::new(Vec::new()),
 		}
@@ -679,6 +840,7 @@ impl TransferProgress {
 		let mut state = self.state.lock().unwrap();
 		state.total_files = 1;
 		state.total_bytes = size;
+		state.sample_speed(Instant::now());
 		self.render(&mut state, true);
 	}
 
@@ -709,14 +871,30 @@ impl TransferProgress {
 		state.scanning = false;
 		state.total_files = total_files;
 		state.total_bytes = total_bytes;
+		state.sample_speed(Instant::now());
 		self.render(&mut state, true);
+	}
+
+	/// Redraw the line for the time passed, as callbacks redraw it only when something moved.
+	fn redraw_idle(&self) {
+		let mut state = self.state.lock().unwrap();
+		if state.note_time(Instant::now()) {
+			self.render(&mut state, false);
+		}
 	}
 
 	fn advance(&self, files: u64, bytes: u64) {
 		let mut state = self.state.lock().unwrap();
-		state.done_files += files;
-		state.done_bytes += bytes;
+		state.done_files = state.done_files.saturating_add(files);
+		state.done_bytes = state.done_bytes.saturating_add(bytes);
+		state.sample_speed(Instant::now());
 		self.render(&mut state, false);
+	}
+
+	/// The files and bytes transferred so far.
+	fn done(&self) -> (u64, u64) {
+		let state = self.state.lock().unwrap();
+		(state.done_files, state.done_bytes)
 	}
 
 	fn push_errors(&self, errors: impl IntoIterator<Item = String>) {
@@ -749,30 +927,7 @@ impl TransferProgress {
 			return;
 		}
 		state.last_render = Some(now);
-		let line = if state.scanning {
-			format!(
-				"Scanning... {} in {} files",
-				ui::format_size(state.total_bytes),
-				state.total_files
-			)
-		} else if state.total_bytes > 0 {
-			format!(
-				"{} {} / {} ({}%) - {}/{} files",
-				self.kind.verb(),
-				ui::format_size(state.done_bytes),
-				ui::format_size(state.total_bytes),
-				(state.done_bytes * 100 / state.total_bytes).min(100),
-				state.done_files,
-				state.total_files
-			)
-		} else {
-			format!(
-				"{} {}/{} files",
-				self.kind.verb(),
-				state.done_files,
-				state.total_files
-			)
-		};
+		let line = progress_line(self.kind, state, now);
 		let line = ui::truncate_to_width(&line, self.term.size().1 as usize);
 		let _ = self.term.clear_line();
 		let _ = self.term.write_str(&style(line).dim().to_string());
@@ -843,15 +998,162 @@ impl DirDownloadCallback<Normal> for TransferProgress {
 
 #[cfg(test)]
 mod tests {
-	use std::path::Path;
+	use std::{
+		path::Path,
+		time::{Duration, Instant},
+	};
 
 	use filen_sdk_rs::fs::name::ValidatedName;
 
 	use super::{
-		DownloadSource, Existing, UploadTarget, download_target, local_existing,
-		resolve_download_target, resolve_upload_target,
+		DownloadSource, Existing, ProgressState, SPEED_WINDOW, TransferKind, UploadTarget,
+		download_target, format_duration, local_existing, progress_line, resolve_download_target,
+		resolve_upload_target, transfer_summary,
 	};
 	use crate::util::RemotePath;
+
+	const MIB: u64 = 1024 * 1024;
+
+	/// Halfway through a 1 MiB upload, with the given speed samples.
+	fn halfway(samples: &[(Instant, u64)]) -> ProgressState {
+		ProgressState {
+			total_files: 1,
+			total_bytes: MIB,
+			done_bytes: MIB / 2,
+			speed_samples: samples.iter().copied().collect(),
+			..ProgressState::default()
+		}
+	}
+
+	#[test]
+	fn the_progress_line_shows_the_speed_and_the_time_left() {
+		let start = Instant::now();
+		let state = halfway(&[(start, 0)]);
+		assert_eq!(
+			progress_line(TransferKind::Upload, &state, start + Duration::from_secs(2)),
+			"Uploading 512 KiB / 1 MiB (50%) - 0/1 files - 256 KiB/s, 2s left"
+		);
+	}
+
+	#[test]
+	fn the_progress_line_has_no_speed_before_any_time_has_passed() {
+		let start = Instant::now();
+		let state = halfway(&[(start, 0)]);
+		assert_eq!(
+			progress_line(TransferKind::Download, &state, start),
+			"Downloading 512 KiB / 1 MiB (50%) - 0/1 files"
+		);
+	}
+
+	#[test]
+	fn a_stalled_transfer_shows_no_time_left() {
+		let start = Instant::now();
+		let state = halfway(&[(start, MIB / 2), (start + SPEED_WINDOW, MIB / 2)]);
+		assert_eq!(
+			progress_line(
+				TransferKind::Upload,
+				&state,
+				start + SPEED_WINDOW + Duration::from_secs(1)
+			),
+			"Uploading 512 KiB / 1 MiB (50%) - 0/1 files - 0 B/s"
+		);
+	}
+
+	#[test]
+	fn a_transfer_of_empty_files_counts_files_only() {
+		let start = Instant::now();
+		let state = ProgressState {
+			total_files: 3,
+			done_files: 1,
+			speed_samples: [(start, 0)].into_iter().collect(),
+			..ProgressState::default()
+		};
+		assert_eq!(
+			progress_line(TransferKind::Upload, &state, start + Duration::from_secs(1)),
+			"Uploading 1/3 files"
+		);
+	}
+
+	#[test]
+	fn the_speed_window_keeps_one_sample_from_before_it() {
+		let start = Instant::now();
+		let mut state = ProgressState::default();
+		for second in 0..=10 {
+			state.done_bytes = second * 100;
+			state.sample_speed(start + Duration::from_secs(second));
+		}
+		let first = state.speed_samples.front().unwrap();
+		assert_eq!(first.0, start + Duration::from_secs(5));
+		assert_eq!(state.speed(start + Duration::from_secs(10)), Some(100));
+	}
+
+	#[test]
+	fn the_time_passing_while_stalled_brings_the_speed_down_to_zero() {
+		let start = Instant::now();
+		let mut state = ProgressState::default();
+		state.sample_speed(start);
+		state.done_bytes = 500;
+		state.sample_speed(start + Duration::from_secs(1));
+		for second in 2..=7 {
+			assert!(state.note_time(start + Duration::from_secs(second)));
+		}
+		assert_eq!(state.speed(start + Duration::from_secs(7)), Some(0));
+	}
+
+	#[test]
+	fn no_time_is_noted_while_scanning() {
+		let start = Instant::now();
+		let mut state = ProgressState {
+			scanning: true,
+			speed_samples: [(start, 0)].into_iter().collect(),
+			..ProgressState::default()
+		};
+		assert!(!state.note_time(start + Duration::from_secs(1)));
+		assert_eq!(state.speed_samples.len(), 1);
+	}
+
+	#[test]
+	fn no_time_is_noted_before_the_speed_is_first_sampled() {
+		let mut state = ProgressState::default();
+		assert!(!state.note_time(Instant::now()));
+		assert!(state.speed_samples.is_empty());
+	}
+
+	#[test]
+	fn progress_after_a_gap_unnoted_by_time_averages_over_the_gap() {
+		let start = Instant::now();
+		let mut state = ProgressState::default();
+		state.sample_speed(start);
+		state.done_bytes = 100;
+		state.sample_speed(start + Duration::from_secs(1));
+		state.done_bytes = 1100;
+		state.sample_speed(start + Duration::from_secs(11));
+		assert_eq!(state.speed(start + Duration::from_secs(11)), Some(100));
+	}
+
+	#[test]
+	fn durations_show_their_two_largest_units() {
+		assert_eq!(format_duration(0), "0s");
+		assert_eq!(format_duration(59), "59s");
+		assert_eq!(format_duration(61), "1m 01s");
+		assert_eq!(format_duration(3600 + 120 + 5), "1h 02m");
+	}
+
+	#[test]
+	fn the_summary_gives_the_average_speed() {
+		assert_eq!(
+			transfer_summary(3, 2 * MIB, Duration::from_secs(4)),
+			"3 files, 2 MiB in 4.0s (512 KiB/s)"
+		);
+	}
+
+	#[test]
+	fn the_summary_of_an_instant_transfer_has_no_speed() {
+		assert_eq!(
+			transfer_summary(1, 100, Duration::ZERO),
+			"1 file, 100 B in 0.0s"
+		);
+	}
 
 	fn upload_target(parent: &str, name: &str) -> UploadTarget {
 		UploadTarget {
