@@ -89,10 +89,11 @@ impl FilenCompleter {
 						.map(|c| c.get_value().to_str())
 					&& let Some(arg_type) = FilenArgType::try_parse_completion_output(completion)
 				{
+					// replaces the placeholder: an argument keeps one extension of each type
 					arg.add(ArgValueCompleter::new(Self(
 						arg_type,
 						Some(context.clone()),
-					))) // todo: is it right to just add it in addition to the placeholder completer?
+					)))
 				} else {
 					arg
 				}
@@ -251,19 +252,20 @@ impl FilenCompleter {
 				}
 				let path_before_basename = working_path.navigate(input_before_basename);
 
-				let parent: DirType<'_, Normal> =
-					match client // todo: can we infer Normal?
-						.find_item_at_path(&path_before_basename.0)
-						.await
-						.context("Failed to find parent dir")?
-					{
-						Some(NonRootFileType::Dir(dir)) => DirType::Dir(dir),
-						Some(NonRootFileType::Root(root)) => DirType::Root(root),
-						Some(_) => return Err(anyhow!("Parent is not a directory")),
-						None => return Err(anyhow!("Parent directory not found")),
-					};
+				// `list_dir` is generic over the category, which the variants alone do not name
+				let parent: DirType<'_, Normal> = match client
+					.find_item_at_path(&path_before_basename.0)
+					.await
+					.context("Failed to find parent dir")?
+				{
+					Some(NonRootFileType::Dir(dir)) => DirType::Dir(dir),
+					Some(NonRootFileType::Root(root)) => DirType::Root(root),
+					Some(_) => return Err(anyhow!("Parent is not a directory")),
+					None => return Err(anyhow!("Parent directory not found")),
+				};
 				let (dirs, files) = client
-					.list_dir(&parent, None::<&fn(u64, Option<u64>)>) // todo: ?
+					// a completion shows no progress
+					.list_dir(&parent, None::<&fn(u64, Option<u64>)>)
 					.await
 					.context("Failed to list parent directory")?;
 				let mut candidates = Vec::new();
