@@ -1,3 +1,18 @@
+//! [cli-doc] search-queries
+//! `search <query>` prints every file and directory under the working directory (or
+//! `--working-path`), at any depth, whose name contains the query, ignoring case. Names and the
+//! query are compared in Unicode NFC, and spaces around the query are ignored. It prints one full
+//! path per line, directories first, or with `--json`
+//! `{"results": [{"path", "type", "size", "uuid"}], "total", "complete"}`, where only files have a
+//! `size`.
+//!
+//! The search reads a local cache of your drive, which it brings up to date first. If that takes
+//! longer than 30 seconds, it prints what the cache holds and warns that the results may be
+//! incomplete (`"complete": false` with `--json`).
+//!
+//! Without a query, `search` is interactive in a terminal: results appear as you type, and
+//! choosing one goes to that directory, or to the directory of that file.
+
 use std::{
 	num::NonZeroUsize,
 	sync::{Arc, Mutex},
@@ -23,8 +38,10 @@ use tokio::{sync::mpsc::UnboundedReceiver, time::Instant};
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum SearchCommands {
-	/// Search for a file or directory interactively, or specify a query
+	/// Search for files and directories by name
 	Search {
+		/// Part of the names to look for, matched ignoring case (without it, search
+		/// interactively)
 		query: Option<String>,
 		/// Only list files, or only directories
 		#[arg(long = "type", value_name = "TYPE")]
@@ -36,7 +53,10 @@ pub(crate) enum SearchCommands {
 }
 
 /// The docs' "Accessing Files" section places `search` between browsing and organizing files.
-pub(crate) const DOCS: &[DocElement] = &[DocElement::CommandHelp("search")];
+pub(crate) const DOCS: &[DocElement] = &[
+	DocElement::DocFragment("search-queries"),
+	DocElement::CommandHelp("search"),
+];
 
 impl SearchCommands {
 	pub(super) async fn execute(self, ctx: CommandContext<'_>) -> Result<CommandResult> {
