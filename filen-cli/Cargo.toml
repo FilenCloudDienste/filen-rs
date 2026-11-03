@@ -78,6 +78,8 @@ inquire = { git = "https://github.com/JupiterPi/inquire.git", branch = "async-au
 console = "0.16.4"
 ctrlc = "3.5.2"
 futures = "0.3.34"
+# The uuid (v5) the TypeScript CLI named a sync pair's state directory by
+sha1 = "0.10.6"
 
 [dev-dependencies]
 test-utils = { path = "../test-utils", features = ["cli"] }

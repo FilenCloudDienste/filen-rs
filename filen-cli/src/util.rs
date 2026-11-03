@@ -1,4 +1,6 @@
 use anyhow::{Context, Result, anyhow};
+use filen_types::fs::Uuid;
+use sha1::{Digest, Sha1};
 use std::fmt::Display;
 
 /// Represents a path to a remote file or directory.
@@ -193,6 +195,25 @@ fn split_on_char_boundaries(value: &str, max_len: usize) -> Vec<&str> {
 	parts
 }
 
+/// The version-5 (SHA-1, name-based) uuid of `name` in `namespace`, as RFC 9562 defines it and the
+/// `uuid` npm package's `v5` computes it. The TypeScript CLI named each filen-sync pair, and with
+/// it the pair's state directory, by the one of `"<local>:<remote>"` in the nil namespace, `local`
+/// and `remote` as the user wrote them.
+pub fn uuid_v5(namespace: Uuid, name: &str) -> Uuid {
+	let digest = Sha1::new()
+		.chain_update(namespace.as_bytes())
+		.chain_update(name.as_bytes())
+		.finalize();
+	let mut bytes = *digest
+		.first_chunk::<16>()
+		.expect("a SHA-1 digest is 20 bytes (should be impossible)");
+	// RFC 9562 section 5.5: the version (5) in the high nibble of byte 6, the variant (0b10) in the
+	// top two bits of byte 8
+	bytes[6] = (bytes[6] & 0x0f) | 0x50;
+	bytes[8] = (bytes[8] & 0x3f) | 0x80;
+	Uuid::from_bytes(bytes)
+}
+
 #[cfg(test)]
 pub(crate) mod test_support {
 	use std::{cell::RefCell, collections::HashMap};
@@ -353,5 +374,29 @@ mod tests {
 		assert_eq!(RemotePath::new("a/../b/").0, "/b");
 		assert_eq!(RemotePath::new("").0, "/");
 		assert_eq!(RemotePath::new("/x//y/.").0, "/x/y");
+	}
+
+	/// RFC 9562's own example (appendix A.4), the DNS namespace and `www.example.com`.
+	#[test]
+	fn a_v5_uuid_matches_the_rfc_example() {
+		let dns = Uuid::from_u128(0x6ba7b810_9dad_11d1_80b4_00c04fd430c8);
+		assert_eq!(
+			uuid_v5(dns, "www.example.com").to_string(),
+			"2ed6657d-e927-568b-95e1-2665a8aea6a2"
+		);
+	}
+
+	/// The TypeScript CLI's pair names in the nil namespace; the expected uuids are what Python's
+	/// `uuid.uuid5(uuid.UUID(int=0), name)` gives.
+	#[test]
+	fn a_v5_uuid_in_the_nil_namespace_names_a_typescript_cli_pair() {
+		assert_eq!(
+			uuid_v5(Uuid::nil(), "/home/me/docs:/docs").to_string(),
+			"6296c54b-2f1e-5c29-b6d4-224b6d6e99b3"
+		);
+		assert_eq!(
+			uuid_v5(Uuid::nil(), "~/Documents:/Backups/Documents").to_string(),
+			"dad62423-e0c8-5cda-923f-8c26137401e3"
+		);
 	}
 }

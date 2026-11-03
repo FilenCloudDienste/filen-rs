@@ -9,27 +9,36 @@ use std::{
 
 use anyhow::{Context, Result};
 use filen_sdk_rs::{
+	ErrorKind,
 	auth::Client,
 	fs::{
 		HasUUID as _,
 		categories::{NonRootFileType, NonRootItemType},
 	},
-	sync_engine::{DeleteGuard, PairId, PairOverlap, PairRecord, SyncEngine, SyncMode},
+	sync_engine::{
+		DeleteGuard, LegacyImport, PairId, PairOverlap, PairRecord, SyncEngine, SyncMode,
+	},
 };
 use filen_types::fs::Uuid;
 use serde::Deserialize;
 
 use super::ignore_file::{self, EXCLUDE_DOT_FILES_RULES};
-use crate::{ui::UI, util::RemotePath};
+use crate::{
+	ui::UI,
+	util::{RemotePath, uuid_v5},
+};
 
-/// A sync pair to register: its local root, its mode, the remote directory it syncs with and the
-/// ignore rules to add to its root's `.filenignore`.
+/// A sync pair to register: its local root, its mode, the remote directory it syncs with, the
+/// ignore rules to add to its root's `.filenignore` and where the TypeScript CLI kept its state.
 pub(crate) struct PairDefinition {
 	local: PathBuf,
 	mode: SyncMode,
 	remote_path: RemotePath,
 	remote_root: Uuid,
 	ignore: Vec<String>,
+	/// The filen-sync state directory the TypeScript CLI kept for the pair (see
+	/// [`legacy_state_dir`]), which may not exist.
+	legacy_state_dir: PathBuf,
 }
 
 /// A sync pair as its definition gives it.
@@ -46,6 +55,9 @@ pub(crate) struct ParsedPair {
 	/// Whether a sync pairs file asks for the local trash to be turned off, which the CLI cannot do
 	/// and warns about (see [`local_trash_warnings`]).
 	disable_local_trash: bool,
+	/// The pair as the TypeScript CLI named it, `<local>:<remote>` with both as the definition
+	/// writes them, before `~` is expanded or a relative path resolved.
+	typescript_name: String,
 }
 
 /// The pairs `pair_definitions` define, each of which is either `<local>:<remote>` (two-way),
@@ -137,6 +149,7 @@ pub(crate) async fn resolve_sync_pairs(
 	ui: &mut UI,
 	client: &Client,
 	working_path: &RemotePath,
+	dirs: &SyncDirs<'_>,
 	parsed: Vec<ParsedPair>,
 ) -> Result<Vec<PairDefinition>> {
 	let mut found = Vec::with_capacity(parsed.len());
@@ -182,6 +195,7 @@ pub(crate) async fn resolve_sync_pairs(
 			ignore,
 			// warned about before logging in
 			disable_local_trash: _,
+			typescript_name,
 		},
 		remote_path,
 		remote_root,
@@ -202,6 +216,7 @@ pub(crate) async fn resolve_sync_pairs(
 			remote_path,
 			remote_root,
 			ignore,
+			legacy_state_dir: legacy_state_dir(dirs.typescript_data_dir(), &typescript_name),
 		});
 	}
 	Ok(pairs)
@@ -324,20 +339,25 @@ async fn create_remote_root(
 /// engine refuses fails the run, and the pairs this call added before it are removed again, so a
 /// failed run registers nothing; the pairs earlier runs registered stay as they were.
 pub(crate) async fn register_sync_pairs(
+	ui: &mut UI,
 	engine: &SyncEngine,
 	client: &Client,
 	pairs: &[PairDefinition],
 ) -> Result<Vec<PairId>> {
+	// each pair earlier runs registered, and whether it has finished its first pass
 	let earlier = engine
 		.list_pairs()
 		.await
 		.context("Failed to list sync pairs")?
 		.into_iter()
-		.map(|pair| pair.id)
-		.collect::<HashSet<_>>();
+		.map(|pair| (pair.id, pair.first_pass_completed))
+		.collect::<HashMap<_, _>>();
 	let mut pair_ids = Vec::new();
-	if let Err(e) = add_sync_pairs(engine, client, pairs, &mut pair_ids).await {
-		for pair in pair_ids.into_iter().filter(|pair| !earlier.contains(pair)) {
+	if let Err(e) = add_sync_pairs(ui, engine, client, pairs, &earlier, &mut pair_ids).await {
+		for pair in pair_ids
+			.into_iter()
+			.filter(|pair| !earlier.contains_key(pair))
+		{
 			if let Err(remove) = engine.remove_pair(pair).await {
 				log::warn!("Failed to remove the sync pair {pair} after the run failed: {remove}");
 			}
@@ -348,11 +368,14 @@ pub(crate) async fn register_sync_pairs(
 }
 
 /// Adds each of `pairs` to `engine`, pushing the id of each onto `pair_ids` as soon as the engine
-/// has it, so that a failure leaves there every pair added so far.
+/// has it, so that a failure leaves there every pair added so far. `earlier` holds the pairs
+/// earlier runs registered, each with whether it has finished its first pass.
 async fn add_sync_pairs(
+	ui: &mut UI,
 	engine: &SyncEngine,
 	client: &Client,
 	pairs: &[PairDefinition],
+	earlier: &HashMap<PairId, bool>,
 	pair_ids: &mut Vec<PairId>,
 ) -> Result<()> {
 	for PairDefinition {
@@ -361,6 +384,7 @@ async fn add_sync_pairs(
 		remote_path,
 		remote_root,
 		ignore,
+		legacy_state_dir,
 	} in pairs
 	{
 		// the engine takes the path, which the messages below still name
@@ -381,7 +405,8 @@ async fn add_sync_pairs(
 			}
 		};
 		// the same pair given twice is registered (and watched) once
-		if !pair_ids.contains(&pair) {
+		let given_before = pair_ids.contains(&pair);
+		if !given_before {
 			pair_ids.push(pair);
 		}
 		// After the engine took the pair, which checked that its root is a directory, and before its
@@ -403,8 +428,55 @@ async fn add_sync_pairs(
 					local.display()
 				)
 			})?;
+		let first_pass_completed = earlier.get(&pair).copied().unwrap_or(false);
+		if !given_before && !first_pass_completed && legacy_state_dir.is_dir() {
+			import_legacy_state(ui, engine, pair, local, remote_path, legacy_state_dir).await;
+		}
 	}
 	Ok(())
+}
+
+/// Imports into `pair`, which has not finished a pass, the state the TypeScript CLI kept for it in
+/// `state_dir`, so that its first pass knows what that CLI last synced. A failed import is reported
+/// and the pair starts without it, as a new pair would.
+///
+/// The state directory is left in place, so a pair removed and set up again later imports it again,
+/// however old it is by then. Its first pass then weighs a stale record against both sides, and
+/// the delete guard, which holds back the deletions of a pair's first pass, is what keeps a stale
+/// record from deleting anything.
+async fn import_legacy_state(
+	ui: &mut UI,
+	engine: &SyncEngine,
+	pair: PairId,
+	local: &Path,
+	remote_path: &RemotePath,
+	state_dir: &Path,
+) {
+	match engine
+		.import_legacy_state(pair, state_dir.to_path_buf())
+		.await
+	{
+		Ok(LegacyImport { imported, skipped }) => ui.print(&format!(
+			"Imported the TypeScript CLI's sync state of the sync pair {} <> {remote_path}: \
+			 {imported} synced file(s), {skipped} unreadable line(s) skipped",
+			local.display()
+		)),
+		// The pair has rows of its own, from an earlier run whose first pass did not finish, which
+		// are the better record. (The engine's other refusals, of an unknown pair or one being
+		// removed, cannot be for a pair this run has just added.)
+		Err(e) if e.kind() == ErrorKind::InvalidState => {
+			log::info!(
+				"Not importing the TypeScript CLI's sync state of the sync pair {pair} from {}: {e}",
+				state_dir.display()
+			);
+		}
+		Err(e) => ui.print_warning(&format!(
+			"Failed to import the TypeScript CLI's sync state of the sync pair {} <> {remote_path} \
+			 from {}, so its first pass starts without it: {e}",
+			local.display(),
+			state_dir.display()
+		)),
+	}
 }
 
 /// The registered pair `overlap` names.
@@ -510,6 +582,7 @@ fn parse_sync_pair_definition(pair: &str) -> Result<ParsedPair> {
 		alias: None,
 		ignore: Vec::new(),
 		disable_local_trash: false,
+		typescript_name: format!("{local}:{remote}"),
 	})
 }
 
@@ -584,6 +657,25 @@ impl<'a> SyncDirs<'a> {
 			typescript_home_dir,
 		}
 	}
+
+	/// The directory the TypeScript CLI kept its data in: `~/.filen-cli` if it used that, else the
+	/// config directory, which it shared.
+	fn typescript_data_dir(&self) -> &Path {
+		self.typescript_home_dir
+			.as_deref()
+			.unwrap_or(self.config_dir)
+	}
+}
+
+/// The filen-sync state directory the TypeScript CLI, whose data directory was `data_dir`, kept
+/// for the pair it named `typescript_name` (see [`ParsedPair::typescript_name`]):
+/// `<data_dir>/sync/state/v2/<uuid>`, the uuid that of the name in the nil namespace.
+fn legacy_state_dir(data_dir: &Path, typescript_name: &str) -> PathBuf {
+	data_dir
+		.join("sync")
+		.join("state")
+		.join("v2")
+		.join(uuid_v5(Uuid::nil(), typescript_name).to_string())
 }
 
 /// The data directory the TypeScript CLI used in the home directory `home`: `~/.filen-cli`, and
@@ -695,6 +787,7 @@ fn read_sync_pairs_file(path: &Path) -> Result<Vec<ParsedPair>> {
 				})?,
 			};
 			Ok(ParsedPair {
+				typescript_name: format!("{}:{}", entry.local, entry.remote),
 				local: local_path_in_file(&entry.local, base, home.as_deref()),
 				mode,
 				remote: entry.remote,
@@ -869,10 +962,10 @@ mod tests {
 	use filen_types::fs::Uuid;
 
 	use super::{
-		ParsedPair, SyncDirs, create_local_root, expand_home, fallback_label, local_path_in_file,
-		local_root_exists, local_trash_warnings, missing_roots, overlap_message,
-		parse_sync_mode_str, parse_sync_pair_definition, parse_sync_pairs, read_sync_pairs_file,
-		records_of, sync_mode_str, typescript_home_dir,
+		ParsedPair, SyncDirs, create_local_root, expand_home, fallback_label, legacy_state_dir,
+		local_path_in_file, local_root_exists, local_trash_warnings, missing_roots,
+		overlap_message, parse_sync_mode_str, parse_sync_pair_definition, parse_sync_pairs,
+		read_sync_pairs_file, records_of, sync_mode_str, typescript_home_dir,
 	};
 	use crate::{
 		error::{CliError, exit_code, find_cli_error},
@@ -885,9 +978,12 @@ mod tests {
 		SyncDirs::new(config_dir, false, None)
 	}
 
+	/// The pair `local` <> `remote` in `mode`, as a definition that gives `local` as it is defines it.
 	fn pair(local: impl Into<PathBuf>, mode: SyncMode, remote: &str) -> ParsedPair {
+		let local = local.into();
 		ParsedPair {
-			local: local.into(),
+			typescript_name: format!("{}:{remote}", local.display()),
+			local,
 			mode,
 			remote: remote.to_owned(),
 			alias: None,
@@ -955,6 +1051,49 @@ mod tests {
 			"Cannot set up the sync pair /home/me/docs <> /docs: its local folder is inside the \
 			 local folder of the sync pair /home/me <(twoWay)> /backup, and sync pairs may not \
 			 overlap. A sync pair stays registered after the run that set it up."
+		);
+	}
+
+	/// The TypeScript CLI named a pair by its definition, a mode left out, and its state directory
+	/// by the v5 uuid of that name.
+	#[test]
+	fn the_state_directory_of_a_typescript_cli_pair_is_named_by_its_uuid() {
+		let parsed = parse_sync_pair_definition("/home/me/docs:localBackup:/docs").unwrap();
+
+		assert_eq!(parsed.typescript_name, "/home/me/docs:/docs");
+		assert_eq!(
+			legacy_state_dir(Path::new("/config"), &parsed.typescript_name),
+			Path::new("/config/sync/state/v2/6296c54b-2f1e-5c29-b6d4-224b6d6e99b3")
+		);
+	}
+
+	/// The name keeps a `~` as written, which the TypeScript CLI expanded only after naming the
+	/// pair.
+	#[test]
+	fn a_typescript_cli_pair_is_named_before_its_tilde_is_expanded() {
+		let parsed = parse_sync_pair_definition("~/Documents:/Backups/Documents").unwrap();
+
+		assert_eq!(
+			legacy_state_dir(Path::new("/config"), &parsed.typescript_name),
+			Path::new("/config/sync/state/v2/dad62423-e0c8-5cda-923f-8c26137401e3")
+		);
+	}
+
+	/// The state of the TypeScript CLI that kept its data in `~/.filen-cli` is found there, and
+	/// otherwise in the config directory.
+	#[test]
+	fn the_typescript_clis_state_is_in_its_data_directory() {
+		let config_dir = tempfile::tempdir().unwrap();
+		let home = tempfile::tempdir().unwrap();
+
+		assert_eq!(
+			SyncDirs::new(config_dir.path(), true, Some(home.path())).typescript_data_dir(),
+			config_dir.path()
+		);
+		std::fs::create_dir_all(typescript_home_dir(home.path())).unwrap();
+		assert_eq!(
+			SyncDirs::new(config_dir.path(), true, Some(home.path())).typescript_data_dir(),
+			typescript_home_dir(home.path())
 		);
 	}
 
@@ -1074,11 +1213,10 @@ mod tests {
 
 		assert_eq!(
 			pairs,
-			[pair(
-				config_dir.path().join("docs"),
-				SyncMode::TwoWay,
-				"/docs"
-			)]
+			[ParsedPair {
+				typescript_name: "docs:/docs".to_owned(),
+				..pair(config_dir.path().join("docs"), SyncMode::TwoWay, "/docs")
+			}]
 		);
 	}
 
@@ -1585,7 +1723,10 @@ mod tests {
 
 		assert_eq!(
 			parse_sync_pair_definition("~/docs:/docs").unwrap(),
-			pair(home.join("docs"), SyncMode::TwoWay, "/docs")
+			ParsedPair {
+				typescript_name: "~/docs:/docs".to_owned(),
+				..pair(home.join("docs"), SyncMode::TwoWay, "/docs")
+			}
 		);
 	}
 
@@ -1672,12 +1813,18 @@ mod tests {
 		assert_eq!(
 			read_sync_pairs_file(&path).unwrap(),
 			[
-				pair(dir.path().join("docs"), SyncMode::TwoWay, "/docs"),
-				pair(
-					dir.path().join("../photos"),
-					SyncMode::LocalBackup,
-					"photos"
-				),
+				ParsedPair {
+					typescript_name: "docs:/docs".to_owned(),
+					..pair(dir.path().join("docs"), SyncMode::TwoWay, "/docs")
+				},
+				ParsedPair {
+					typescript_name: "../photos:photos".to_owned(),
+					..pair(
+						dir.path().join("../photos"),
+						SyncMode::LocalBackup,
+						"photos"
+					)
+				},
 			]
 		);
 	}

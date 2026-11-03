@@ -20,7 +20,7 @@ enum LeftoverKind {
 	SavedLogin,
 	/// Its plaintext credentials file, which this CLI does not read.
 	Credentials,
-	/// Sync pairs or their sync state.
+	/// Sync pairs or their sync state, which `sync` reads (see `commands::sync_cmd`).
 	Sync,
 	/// The update check's state.
 	UpdateCache,
@@ -98,16 +98,26 @@ fn hint(leftovers: &[Leftover]) -> String {
 	}
 	if has(LeftoverKind::Sync) {
 		hint.push_str(
-			"Its sync pairs do not carry over: define them again in syncPairs.yaml (see `filen \
-			 help sync`).\n",
+			"`sync` reads its syncPairs.json while the config directory has no syncPairs.yaml, \
+			 and takes over the sync state it kept for a pair the first time it syncs that pair \
+			 (see `filen help sync`).\n",
 		);
 	}
-	hint.push_str(match has(LeftoverKind::SavedLogin) {
-		true => {
-			"You can delete these files once this CLI is logged in. This hint is not shown again."
-		}
-		false => "You can delete these files. This hint is not shown again.",
-	});
+	let mut until = Vec::new();
+	if has(LeftoverKind::SavedLogin) {
+		until.push("the saved login once this CLI is logged in");
+	}
+	if has(LeftoverKind::Sync) {
+		until.push("the sync files once your pairs are in syncPairs.yaml and have synced");
+	}
+	match until.is_empty() {
+		true => hint.push_str("You can delete these files."),
+		false => hint.push_str(&format!(
+			"You can delete these files, {}.",
+			until.join(", and ")
+		)),
+	}
+	hint.push_str(" This hint is not shown again.");
 	hint
 }
 
@@ -234,9 +244,11 @@ mod tests {
 		assert_eq!(
 			hint(&leftovers),
 			"Found files of the older Filen CLI:\n  /c/.filen-cli-credentials\n  /c/sync\nIts saved login does not carry over: log in \
-			 again, and run `filen export-auth-config` to save an auth config for scripts.\nIts \
-			 sync pairs do not carry over: define them again in syncPairs.yaml (see `filen help \
-			 sync`).\nYou can delete these files. This hint is not shown again."
+			 again, and run `filen export-auth-config` to save an auth config for scripts.\n`sync` \
+			 reads its syncPairs.json while the config directory has no syncPairs.yaml, and takes \
+			 over the sync state it kept for a pair the first time it syncs that pair (see `filen \
+			 help sync`).\nYou can delete these files, the sync files once your pairs are in \
+			 syncPairs.yaml and have synced. This hint is not shown again."
 		);
 	}
 
@@ -251,8 +263,8 @@ mod tests {
 			"Found files of the older Filen CLI:\n  /c/.filen-cli-keep-me-logged-in\nLogging in \
 			 without a login of this CLI tries to import its saved login. If it asks for your \
 			 credentials instead, log in again, and run `filen export-auth-config` to save an auth \
-			 config for scripts.\nYou can delete these files once this CLI is logged in. This hint \
-			 is not shown again."
+			 config for scripts.\nYou can delete these files, the saved login once this CLI is \
+			 logged in. This hint is not shown again."
 		);
 	}
 

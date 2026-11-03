@@ -67,6 +67,8 @@ mod ui;
 mod updater;
 mod util;
 
+pub use util::uuid_v5;
+
 #[derive(Debug, Parser)]
 #[clap(
 	name = "Filen CLI",

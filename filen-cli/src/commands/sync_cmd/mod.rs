@@ -45,6 +45,13 @@
 //! where the TypeScript CLI kept its sync pairs when its install script had set it up; with
 //! `--config-dir`, it does not look in the home directory.
 //!
+//! A sync pair the TypeScript CLI synced keeps what that CLI last synced: when `sync` sets up a
+//! sync pair that has not finished a pass yet, it imports the state the TypeScript CLI kept for the
+//! same `<local>:<remote>`, written as that CLI was given it, from `sync/state/v2` in that CLI's data
+//! directory (the config directory, or `~/.filen-cli`), and says how many synced files it took
+//! over. The first pass then takes a file that neither side has changed since for synced, instead
+//! of weighing both copies as new.
+//!
 //! Before a sync pair is synced, the rules of its sync pairs file that the `.filenignore`
 //! at its local root lacks are added to the end of that file, which is created if there is none.
 //! No line is ever removed: a rule taken out of the sync pairs file stays in `.filenignore` until
@@ -214,7 +221,8 @@ async fn sync(
 	let client = client.get(ui).await?;
 
 	// before the engine is opened, so that a bad definition leaves its database as it was
-	let pair_definitions = sync_pairs::resolve_sync_pairs(ui, client, working_path, parsed).await?;
+	let pair_definitions =
+		sync_pairs::resolve_sync_pairs(ui, client, working_path, &sync_dirs, parsed).await?;
 
 	// init sync engine
 	let db_path = config.config_dir.join("sync-engine.db");
@@ -223,7 +231,7 @@ async fn sync(
 			.await
 			.map_err(|e| UI::failure(&open_failure(&e, &db_path)))?,
 	);
-	let pair_ids = sync_pairs::register_sync_pairs(&engine, client, &pair_definitions)
+	let pair_ids = sync_pairs::register_sync_pairs(ui, &engine, client, &pair_definitions)
 		.await
 		.context("Failed to add sync pairs")?;
 

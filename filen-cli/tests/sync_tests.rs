@@ -6,6 +6,7 @@ use std::{
 	sync::Arc,
 };
 
+use filen_cli::uuid_v5;
 use filen_macros::shared_test_runtime;
 use filen_sdk_rs::{
 	auth::Client,
@@ -13,6 +14,7 @@ use filen_sdk_rs::{
 	io::client_impl::IoSharedClientExt as _,
 	sync_engine::SyncEngine,
 };
+use filen_types::fs::Uuid;
 
 #[shared_test_runtime]
 async fn sync_once_brings_both_sides_across_and_exits_0() {
@@ -293,6 +295,50 @@ async fn sync_once_without_yes_or_a_terminal_leaves_a_missing_remote_directory_a
 			.await
 			.unwrap()
 			.is_none()
+	);
+}
+
+/// The state the TypeScript CLI kept for a pair, under the uuid of the pair as it was given, is
+/// imported when `sync` sets the pair up.
+#[shared_test_runtime]
+async fn sync_once_imports_the_typescript_clis_state_of_a_new_pair() {
+	// Not `get_resources_with_lock`, for the reason the first test gives.
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let test_dir_name = resources.dir.name().unwrap();
+	let local = assert_fs::TempDir::new().unwrap();
+	let config_dir = assert_fs::TempDir::new().unwrap();
+	let pair = format!("{}:{test_dir_name}", local.path().to_str().unwrap());
+	// one file both trees list at the same size, as filen-sync wrote them
+	let state_dir = config_dir
+		.path()
+		.join("sync/state/v2")
+		.join(uuid_v5(Uuid::nil(), &pair).to_string());
+	std::fs::create_dir_all(&state_dir).unwrap();
+	std::fs::write(
+		state_dir.join("previousLocalTree"),
+		r#"{"prop":"/a.txt","data":{"lastModified":1700000000123,"type":"file","path":"/a.txt","size":5,"creation":1600000000000,"inode":42}}"#,
+	)
+	.unwrap();
+	std::fs::write(
+		state_dir.join("previousRemoteTree"),
+		format!(
+			r#"{{"prop":"/a.txt","data":{{"type":"file","uuid":"{}","name":"a.txt","size":5,"path":"/a.txt"}}}}"#,
+			Uuid::from_u128(1)
+		),
+	)
+	.unwrap();
+
+	let output = sync_once(config_dir.path(), &pair, &[]).await;
+
+	assert_success(&output);
+	assert!(
+		String::from_utf8_lossy(&output.stdout).contains(&format!(
+			"Imported the TypeScript CLI's sync state of the sync pair {} <> /{test_dir_name}: 1 \
+			 synced file(s), 0 unreadable line(s) skipped",
+			local.path().display()
+		)),
+		"{}",
+		describe(&output)
 	);
 }
 
