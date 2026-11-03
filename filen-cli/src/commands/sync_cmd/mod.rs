@@ -100,7 +100,7 @@ use filen_sdk_rs::sync_engine::{
 	BaselineInUse, ConflictResolution, ConflictResolved, PairId, PairRecord, SyncEngine, SyncEvent,
 	UnsyncablePath, UnsyncableReason,
 };
-use log::info;
+use log::{info, warn};
 use tokio::sync::mpsc;
 
 use crate::{
@@ -349,6 +349,7 @@ async fn sync_continuously(
 					for line in resolved_conflict_lines(rel_path, resolution, resolved) {
 						log.print_approved(ui, pair_id, &line);
 					}
+					apply_soon(ui, &mut log, &engine, pair_id).await;
 				}
 				Err(e) => {
 					let message = resolve_failure_message(rel_path, log.label(pair_id), &e);
@@ -393,6 +394,20 @@ async fn sync_continuously(
 		None => Ok(()),
 	}
 }
+
+/// Has the watch of `pair` run a pass soon, which applies a conflict resolution. A resolution only
+/// takes effect on the pair's next pass, and nothing else wakes a watch for it, so without this it
+/// would wait for the next change or the periodic full pass, minutes away.
+async fn apply_soon(ui: &mut UI, log: &mut EventLog<'_>, engine: &SyncEngine, pair: PairId) {
+	if let Err(e) = engine.request_pass(pair).await {
+		warn!("Could not ask the watch of sync pair {pair} for a pass: {e}");
+		log.print_line(ui, pair, LineKind::Kept, APPLIED_LATER_LINE);
+	}
+}
+
+/// What a continuous sync says when it could not have a watch apply a resolution at once.
+const APPLIED_LATER_LINE: &str = "The resolution is applied by the next pass, which the next \
+	change or the periodic full pass starts";
 
 /// Prints the events of a run's pairs, and says which of them the flags settle.
 ///

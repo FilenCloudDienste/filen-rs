@@ -1,9 +1,10 @@
-//! `sync --once`, run as a user runs it, against the test account.
+//! `sync`, run as a user runs it, against the test account.
 
 use std::{
 	path::Path,
-	process::{Command, Output},
+	process::{Command, Output, Stdio},
 	sync::Arc,
+	time::{Duration, Instant},
 };
 
 use filen_cli::uuid_v5;
@@ -15,6 +16,7 @@ use filen_sdk_rs::{
 	sync_engine::SyncEngine,
 };
 use filen_types::fs::Uuid;
+use tokio::sync::RwLock;
 
 #[shared_test_runtime]
 async fn sync_once_brings_both_sides_across_and_exits_0() {
@@ -151,6 +153,33 @@ async fn sync_once_applies_a_conflict_resolution_before_it_exits() {
 	assert_eq!(
 		remote_content(&resources.client, &format!("{test_dir_name}/fight.txt")).await,
 		b"the local edit"
+	);
+}
+
+/// The resolution a flag gives is applied while the watch runs, by a pass it runs for it, rather
+/// than by the periodic full pass five minutes later.
+#[cfg(unix)]
+#[shared_test_runtime]
+async fn sync_applies_a_conflict_resolution_while_it_watches() {
+	// Not `get_resources_with_lock`, for the reason the first test gives.
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let remote_path = format!("{}/fight.txt", resources.dir.name().unwrap());
+	let (_local, config_dir, pair) = diverged_pair(&resources).await;
+
+	let output = sync_until(
+		config_dir.path(),
+		&["--pair", &pair, "--keep-local", "fight.txt"],
+		Duration::from_secs(120),
+		async || remote_content(client, &remote_path).await == b"the local edit",
+	)
+	.await;
+
+	let stdout = String::from_utf8_lossy(&output.stdout);
+	assert!(
+		stdout.contains("Conflict resolved for fight.txt, kept local version"),
+		"{}",
+		describe(&output)
 	);
 }
 
@@ -436,8 +465,19 @@ async fn sync_once(config_dir: &Path, pair: &str, args: &[&str]) -> Output {
 	sync(config_dir, &[&["--once", "--pair", pair], args].concat()).await
 }
 
+/// Taken by every CLI run of these tests: shared by a run that ends on its own, held alone by a
+/// sync that watches until a deadline ([`sync_until`]).
+///
+/// Every run needs the account's drive lock for its passes, and the server hands it to whichever
+/// poll reaches it first after a release. With the tests running at once, a watching sync's pass
+/// polls every 5 s against about ten other runs of these tests, and lost every poll for two
+/// minutes, past the deadline its test gives it. Holding this alone, the watching sync competes
+/// only with what the test process itself does on the drive.
+static CLI_RUNS: RwLock<()> = RwLock::const_new(());
+
 /// Runs `sync <args>` with `config_dir`.
 async fn sync(config_dir: &Path, args: &[&str]) -> Output {
+	let _runs = CLI_RUNS.read().await;
 	let (_auth_config_dir, auth_config) = test_utils::cli::prepare_cli_auth_config().await;
 	Command::new(env!("CARGO_BIN_EXE_filen-cli"))
 		.args([
@@ -451,6 +491,56 @@ async fn sync(config_dir: &Path, args: &[&str]) -> Output {
 		.args(args)
 		.output()
 		.unwrap()
+}
+
+/// Runs `sync <args>` with `config_dir` until `done` holds, polled every 2 s for at most `within`,
+/// then stops it with Ctrl-C, so that it finishes its pass and releases the drive lock instead of
+/// leaving it to expire on the shared test account. Fails unless it exits with 0. No other CLI run
+/// of these tests runs meanwhile (see [`CLI_RUNS`]), and `within` starts once the others ended.
+#[cfg(unix)]
+async fn sync_until(
+	config_dir: &Path,
+	args: &[&str],
+	within: Duration,
+	mut done: impl AsyncFnMut() -> bool,
+) -> Output {
+	let _runs = CLI_RUNS.write().await;
+	let (_auth_config_dir, auth_config) = test_utils::cli::prepare_cli_auth_config().await;
+	let mut cli = Command::new(env!("CARGO_BIN_EXE_filen-cli"))
+		.args([
+			"--auth-config-path",
+			auth_config.to_str().unwrap(),
+			"--config-dir",
+			config_dir.to_str().unwrap(),
+			"--skip-update",
+			"sync",
+		])
+		.args(args)
+		.stdout(Stdio::piped())
+		.stderr(Stdio::piped())
+		.spawn()
+		.unwrap();
+
+	let deadline = Instant::now() + within;
+	while !done().await {
+		if Instant::now() >= deadline || cli.try_wait().unwrap().is_some() {
+			let _ = cli.kill();
+			panic!(
+				"sync did not get there in time\n{}",
+				describe(&cli.wait_with_output().unwrap())
+			);
+		}
+		tokio::time::sleep(Duration::from_secs(2)).await;
+	}
+
+	let interrupted = Command::new("kill")
+		.args(["-INT", &cli.id().to_string()])
+		.status()
+		.unwrap();
+	assert!(interrupted.success());
+	let output = cli.wait_with_output().unwrap();
+	assert_success(&output);
+	output
 }
 
 fn assert_success(output: &Output) {
