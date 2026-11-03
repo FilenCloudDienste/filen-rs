@@ -1,32 +1,88 @@
 //! [cli-doc] sync-modes
-//! `sync` keeps local directories in sync with directories in your Filen drive. By default it keeps
-//! syncing until you press Ctrl+C: a change on either side is synced shortly after it is made, and
-//! the passes in flight finish before the command ends. With `--once`, it runs one sync pass for
-//! each sync pair and exits when they are done; Ctrl+C then stops it once the passes in flight
-//! have finished.
+//! `sync` keeps local directories in sync with directories in your Filen drive. Each sync pair is a
+//! local directory, a remote directory and a mode, which says which way changes go and whether
+//! deletions do:
 //!
-//! Mass deletions held back by the delete guard, and conflicts (a file changed on both sides), are
-//! printed as needing attention. `--approve-mass-deletions` and `--keep-local`, `--keep-remote` or
-//! `--keep-both` settle them in the first pass; with `--once`, one more pass then applies what was
-//! settled before the command exits.
+//! - `twoWay` (or `tw`), the default: what changes on either side is changed on the other,
+//!   deletions included. A file changed on both sides since the last pass is a conflict, which the
+//!   passes leave alone until it is resolved.
+//! - `localToRemote` (or `localToCloud`, `ltc`): the remote directory mirrors the local one. What is
+//!   created, changed, moved or deleted locally is done on the remote, and what only the remote has
+//!   is deleted there. Nothing is downloaded.
+//! - `remoteToLocal` (or `cloudToLocal`, `ctl`): the local directory mirrors the remote one, the
+//!   other way round. Nothing is uploaded.
+//! - `localBackup` (or `lb`): as `localToRemote`, but nothing is ever deleted on the remote: a file
+//!   deleted locally stays on the remote.
+//! - `remoteBackup` (or `cloudBackup`, `cb`): as `remoteToLocal`, but nothing is ever deleted
+//!   locally.
 //!
-//! What the flags leave is asked about at the terminal once the pass that found it has ended, when
-//! stdin, stdout and stderr are terminals, without `--json` and without `--no-input`: whether to
-//! apply a held batch of deletions, listing up to 20 of them, and which version of a conflicting
-//! file to keep, or neither for now. A batch or a conflict is asked about once while it lasts. The
-//! approval only lives in this `filen sync`, so there is no command to give it later. `--yes` does
-//! not answer these questions. While a question is open, `sync` keeps syncing and prints what
-//! happened once it is answered; Ctrl-C at the question answers "not now", and a further Ctrl-C
-//! stops the sync. With `--once`, the questions come after the passes, and one more pass applies
-//! what the answers settled.
+//! Mode names are case-sensitive. A remote file or directory that a sync deletes goes to the trash
+//! of your Filen drive; a local one goes to the sync pair's `.filen-sync-trash` (see below).
 //!
-//! `sync --once` exits with 0 when the last pass of every sync pair completed and left nothing
-//! undone: no errors, no held deletions, no conflicts and no paused sync pair. Otherwise it exits
-//! with 1, after naming each sync pair and what it left. `sync` without `--once` exits with 0 when
-//! Ctrl+C stops it and the last pass of every sync pair left nothing undone, and with 1 when a sync
-//! pair could not be synced or its last pass left something. Ctrl+C exits `sync --once` with 130,
-//! and a second Ctrl+C, which quits without waiting for the passes in flight, exits either with
-//! 130. An invalid command line exits with 2.
+//! A sync pair is given as `<local>:<remote>` (two-way) or `<local>:<mode>:<remote>`, as an
+//! argument or with `--pair`, or as a sync pairs file. The remote path is what follows the last
+//! `:`, so a remote path with a `:` in it can only be given in a sync pairs file. `sync` without
+//! sync pairs syncs the sync pairs of the default sync pairs file (see below); it does not sync the
+//! sync pairs earlier runs set up and the sync database still holds, unless they are given again.
+//!
+//! [cli-doc] sync-pairs-file
+//! A sync pairs file is YAML, or JSON as the TypeScript CLI's syncPairs.json was. It lists sync
+//! pairs under `syncPairs`, or is a list of them, or is a single sync pair:
+//!
+//! ```yaml
+//! syncPairs:
+//!   - local: ~/Documents
+//!     remote: /Documents
+//!     mode: twoWay
+//!     alias: docs
+//!     ignore:
+//!       - "*.tmp"
+//!       - build/
+//!     excludeDotFiles: true
+//!   - local: photos
+//!     remote: /Backups/Photos
+//!     syncMode: localBackup
+//! ```
+//!
+//! Each sync pair has:
+//!
+//! - `local`: the local directory. A leading `~` is the home directory, and a relative path is
+//!   relative to the file's directory.
+//! - `remote`: the remote directory, which may contain a `:`.
+//! - `mode`, or `syncMode` as the TypeScript CLI called it: a mode name or its short form, `twoWay`
+//!   if not given. Giving both is an error.
+//! - `alias`, optional: a name by which `filen sync <alias>` selects the sync pair of the default
+//!   sync pairs file, and by which the commands that manage sync pairs name it.
+//! - `ignore`, optional: a list of ignore rules, in `.filenignore` syntax, which are added to the
+//!   `.filenignore` at the local root (see below).
+//! - `excludeDotFiles: true`, optional: stands for the rules `.*` and `!/.filenignore`, so every
+//!   dot file and dot directory is left out of the sync, but the `.filenignore` itself.
+//! - `disableLocalTrash`, the TypeScript CLI's key, is read but only gives a warning, since the
+//!   local trash cannot be turned off.
+//!
+//! Any other key is an error.
+//!
+//! `sync` without sync pairs reads syncPairs.yaml in the config directory, or else syncPairs.json
+//! there. With the default config directory, it then falls back to `~/.filen-cli/syncPairs.json`,
+//! where the TypeScript CLI kept its sync pairs when its install script had set it up; with
+//! `--config-dir`, it does not look in the home directory. That file is also where an alias is
+//! looked up.
+//!
+//! [cli-doc] sync-running
+//! By default, `sync` keeps syncing until you press Ctrl+C: a change on either side is synced
+//! shortly after it is made, and a full pass runs every few minutes as well. `--continuous` says
+//! the same and is accepted for the TypeScript CLI's sake. With `--once`, it runs one sync pass for
+//! each sync pair and exits when they are done.
+//!
+//! The first Ctrl+C stops the sync once the passes in flight have finished. A second Ctrl+C quits
+//! at once, without waiting for them, and exits with 130.
+//!
+//! When the local or the remote directory of a sync pair does not exist, `sync` asks whether to
+//! create it, and creates it with any missing directory above it; `--yes` answers yes. Without a
+//! terminal to ask at and without `--yes`, the command fails instead. A local path that is a file
+//! is an error. `sync` looks up every sync pair's directories, and asks about each missing one
+//! once, before it creates any. A sync pair the sync database then refuses, such as one that
+//! overlaps another, leaves behind the directories created for it.
 //!
 //! `sync` says which sync pairs it starts on, then prints a line for each thing a pass does, with
 //! the time and the sync pair; failures go to stderr. A path that fails the same way again on a
@@ -62,39 +118,64 @@
 //! sync pair is not planned, as `sync` runs no pass of it: it says on stderr that the pair is
 //! paused instead. With `--json`, it prints one `plan` object per sync pair it plans.
 //!
-//! Sync pairs stay registered in the sync database under the config directory after the run that
-//! set them up. A run that cannot set up one of its sync pairs registers none of them. Only one
-//! `filen sync` can use that database at a time.
+//! `sync --once` exits with 0 when the last pass of every sync pair completed and left nothing
+//! undone: no errors, no held deletions, no conflicts and no paused sync pair. Otherwise it exits
+//! with 1, after naming each sync pair and what it left. `sync` without `--once` exits with 0 when
+//! Ctrl+C stops it and the last pass of every sync pair left nothing undone, and with 1 when a sync
+//! pair could not be synced or its last pass left something. Ctrl+C exits `sync --once` with 130,
+//! and a second Ctrl+C, which quits without waiting for the passes in flight, exits either with
+//! 130. An invalid command line, such as an unknown mode, exits with 2.
 //!
-//! When the local or the remote directory of a sync pair does not exist, `sync` asks whether to
-//! create it, and creates it with any missing directory above it; `--yes` answers yes. Without a
-//! terminal to ask at and without `--yes`, the command fails instead. A local path that is a file
-//! is an error. `sync` looks up every sync pair's directories, and asks about each missing one
-//! once, before it creates any. A sync pair the sync database then refuses, such as one that
-//! overlaps another, leaves behind the directories created for it.
+//! [cli-doc] sync-deletions-and-conflicts
+//! Before a pass deletes anything, the delete guard looks at what it would delete, and holds every
+//! deletion of the pass back when:
 //!
-//! A sync pairs file is YAML, or JSON as the TypeScript CLI's syncPairs.json was, that lists sync
-//! pairs under `syncPairs` or is a list of them. Each has a `local` and a `remote` path, and may
-//! have a `mode` (or `syncMode`; `twoWay` if not given), an `alias`, by which `filen sync <alias>`
-//! selects the pair of the default sync pairs file, `ignore`, a list of ignore rules in
-//! `.filenignore` (gitignore) syntax, and `excludeDotFiles: true`, which stands for the rules `.*`
-//! and `!/.filenignore`: every dot file and dot directory is left out of the sync, but the
-//! `.filenignore` itself. A leading `~` in a local path is the home directory, and a
-//! relative one is relative to the file's directory. The TypeScript CLI's `disableLocalTrash` key
-//! is read but only gives a warning, since the local trash cannot be turned off. Any other key is
-//! an error.
+//! - the local scan did not complete, as when a directory could not be read,
+//! - the sync pair has not completed a pass yet, or tracks nothing yet, so that a first sync cannot
+//!   wipe a destination that already holds files,
+//! - the remote directory is listed as empty while the sync pair still tracks files in it, and the
+//!   pass would delete more than one of them,
+//! - or the pass would delete more than 10 items and more than half of the items the sync pair
+//!   tracks.
 //!
-//! `sync` without sync pairs reads syncPairs.yaml in the config directory, or else syncPairs.json
-//! there. With the default config directory, it then falls back to `~/.filen-cli/syncPairs.json`,
-//! where the TypeScript CLI kept its sync pairs when its install script had set it up; with
-//! `--config-dir`, it does not look in the home directory.
+//! The rest of the pass still runs. The held deletions are printed as needing attention, and wait
+//! until they are approved; a missing mount or a fault on the server can look like a mass deletion,
+//! so check before approving.
 //!
-//! A sync pair the TypeScript CLI synced keeps what that CLI last synced: when `sync` sets up a
-//! sync pair that has not finished a pass yet, it imports the state the TypeScript CLI kept for the
-//! same `<local>:<remote>`, written as that CLI was given it, from `sync/state/v2` in that CLI's data
-//! directory (the config directory, or `~/.filen-cli`), and says how many synced files it took
-//! over. The first pass then takes a file that neither side has changed since for synced, instead
-//! of weighing both copies as new.
+//! A conflict is a path changed on both sides since the last pass. The passes leave it alone until
+//! it is resolved: by keeping the local version, which is uploaded, the remote version, which is
+//! downloaded, or both, the local one being renamed aside to `<name>.old.<ext>` and synced as a file
+//! of its own.
+//!
+//! `--approve-mass-deletions` approves the deletions the delete guard holds back, and
+//! `--keep-local`, `--keep-remote` and `--keep-both` resolve conflicts. A `--keep-*` path is
+//! relative to the root of a sync pair, and covers the conflicts at that path and under it as a
+//! directory: `dir` covers `dir/f`, while `a.txt` does not cover `a.txt.bak`. Where two paths cover
+//! a conflict, the longer one decides, and `.` covers the whole sync pair. These flags apply to
+//! every sync pair of the run, and only to what the first pass of each sync pair finds; with
+//! `--once`, one more pass then applies what was settled before the command exits. What a later
+//! pass holds back or finds in conflict is printed as needing attention, or asked about.
+//!
+//! What the flags leave is asked about at the terminal once the pass that found it has ended, when
+//! stdout and stderr are terminals, there is a terminal to answer at (stdin, or the controlling
+//! terminal), without `--json` and without `--no-input`: whether to
+//! apply a held batch of deletions, listing up to 20 of them, and which version of a conflicting
+//! file to keep, or neither for now. A batch or a conflict is asked about once while it lasts, and
+//! what the flags settle is not asked about. The approval of deletions only lives in this
+//! `filen sync`, so there is no command to give it later; a conflict can also be resolved later with
+//! `resolve-sync-conflict`. `--yes` does not answer these questions. While a question is open,
+//! `sync` keeps syncing and prints what happened once it is answered; Ctrl-C at the question
+//! answers "not now", and a further Ctrl-C stops the sync. With `--once`, the questions come after
+//! the passes, and one more pass applies what the answers settled.
+//!
+//! A local file or directory that a sync deletes, or replaces with the remote's version, is not
+//! destroyed but moved into `.filen-sync-trash` at the sync pair's local root, under the day it was
+//! moved (`.filen-sync-trash/YYYY-MM-DD/<path>`), and deleted from there after 30 days. That
+//! folder is never synced. The trash is always on, and there is no flag to turn it off.
+//!
+//! [cli-doc] sync-ignore
+//! A `.filenignore` file in any directory of a sync pair lists, in gitignore syntax, the files and
+//! directories under it that are not synced.
 //!
 //! Before a sync pair is synced, the rules of its sync pairs file that the `.filenignore`
 //! at its local root lacks are added to the end of that file, which is created if there is none.
@@ -105,10 +186,19 @@
 //! never synced stays local and applies on top of the remote's. There is no `--ignore` flag:
 //! ignore rules belong to a sync pair, in its `.filenignore` or its sync pairs file.
 //!
-//! A local file or directory that a sync deletes, or replaces with the remote's version, is not
-//! destroyed but moved into `.filen-sync-trash` at the sync pair's local root, under the day it was
-//! moved (`.filen-sync-trash/YYYY-MM-DD/<path>`), and deleted from there after 30 days. That
-//! folder is never synced. The trash is always on, and there is no flag to turn it off.
+//! [cli-doc] sync-database
+//! What each sync pair last synced is kept in the sync database, `sync-engine.db` in the config
+//! directory. Sync pairs stay registered there after the run that set them up, so the next run
+//! of the same sync pair only syncs what changed meanwhile. A run that cannot set up one of its
+//! sync pairs registers none of them. Only one `filen sync`, or one of the commands that manage sync
+//! pairs, can use that database at a time.
+//!
+//! A sync pair the TypeScript CLI synced keeps what that CLI last synced: when `sync` sets up a
+//! sync pair that has not finished a pass yet, it imports the state the TypeScript CLI kept for the
+//! same `<local>:<remote>`, written as that CLI was given it, from `sync/state/v2` in that CLI's data
+//! directory (the config directory, or `~/.filen-cli`), and says how many synced files it took
+//! over. The first pass then takes a file that neither side has changed since for synced, instead
+//! of weighing both copies as new.
 
 use std::{
 	borrow::Cow,
@@ -184,22 +274,20 @@ pub(crate) enum SyncCommands {
 		/// The sync pairs are registered as without it.
 		#[arg(long, conflicts_with_all = ["once", "continuous", "approve_mass_deletions", "keep_local", "keep_remote", "keep_both"])]
 		dry_run: bool,
-		/// Disables the delete guard (applied only on the first sync pass).
+		/// Approve the deletions the delete guard holds back.
+		/// Applies to every sync pair, in its first sync pass only.
 		#[arg(long)]
 		approve_mass_deletions: bool,
 		/// When a conflict occurs at the given path or under it, keep the local side.
-		/// The path is relative to the root of each sync pair.
-		/// Applied only on the first sync pass.
+		/// The path is relative to the root of each sync pair, and applies to every sync pair, in its first sync pass only.
 		#[arg(long, value_name = "RELATIVE_PATH")]
 		keep_local: Vec<String>,
 		/// When a conflict occurs at the given path or under it, keep the remote side.
-		/// The path is relative to the root of each sync pair.
-		/// Applied only on the first sync pass.
+		/// The path is relative to the root of each sync pair, and applies to every sync pair, in its first sync pass only.
 		#[arg(long, value_name = "RELATIVE_PATH")]
 		keep_remote: Vec<String>,
 		/// When a conflict occurs at the given path or under it, keep both sides.
-		/// The path is relative to the root of each sync pair.
-		/// Applied only on the first sync pass.
+		/// The path is relative to the root of each sync pair, and applies to every sync pair, in its first sync pass only.
 		#[arg(long, value_name = "RELATIVE_PATH")]
 		keep_both: Vec<String>,
 	},
@@ -272,8 +360,20 @@ const PAIR_HELP: &str = "The sync pair: its id, as list-sync-pairs prints it, it
 
 /// The commands that close the docs' "Transferring Files" section.
 pub(crate) const DOCS: &[DocElement] = &[
+	DocElement::Heading1("Syncing"),
 	DocElement::DocFragment("sync-modes"),
 	DocElement::CommandHelp("sync"),
+	DocElement::Heading1("Sync pairs files"),
+	DocElement::DocFragment("sync-pairs-file"),
+	DocElement::Heading1("Running a sync"),
+	DocElement::DocFragment("sync-running"),
+	DocElement::Heading1("Deletions, conflicts and the local trash"),
+	DocElement::DocFragment("sync-deletions-and-conflicts"),
+	DocElement::Heading1("Ignoring files"),
+	DocElement::DocFragment("sync-ignore"),
+	DocElement::Heading1("The sync database"),
+	DocElement::DocFragment("sync-database"),
+	DocElement::Heading1("Managing sync pairs"),
 	DocElement::DocFragment("sync-pairs"),
 	DocElement::CommandHelp("list-sync-pairs"),
 	DocElement::CommandHelp("remove-sync-pair"),
