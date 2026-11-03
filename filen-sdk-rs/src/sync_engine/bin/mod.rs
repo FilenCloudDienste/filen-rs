@@ -184,7 +184,9 @@ impl Binned {
 	/// The directories above the path are created as they would be for the download.
 	pub(super) fn take_back(&self, rel_path: &str, size: u64, hash: &Blake3Hash) -> bool {
 		let Some(binned) = self.buckets.iter().find_map(|bucket| {
-			let binned = local_path(bucket, rel_path);
+			// Filed under the key's own spelling (see [`quarantine_local`]), so nothing is looked up:
+			// most buckets hold no copy, and a lookup's miss would list their directories.
+			let binned = names::joined(bucket, rel_path);
 			let meta = binned.symlink_metadata().ok()?;
 			(meta.is_file()
 				&& meta.len() == size

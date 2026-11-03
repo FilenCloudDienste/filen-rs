@@ -960,6 +960,55 @@ fn confine_targets_the_directory_as_the_file_system_spells_it() {
 	std::fs::remove_dir_all(&root).ok();
 }
 
+/// A keep-both resolution keeps a local copy another program spelled in neither Unicode form (one
+/// accent composed, one not) aside rather than taking it for gone: the copy is found as the scan
+/// found it, and lands under the key's spelling of its `.old` name, inside the directory as the
+/// file system spells it.
+#[test]
+fn keeping_both_moves_a_copy_spelled_in_neither_form_aside() {
+	let root = temp_dir();
+	let dir = root.join("cafe\u{301}");
+	std::fs::create_dir(&dir).unwrap();
+	std::fs::write(dir.join("r\u{e9}sume\u{301}.txt"), b"mine").unwrap();
+
+	let kept = rename_aside(&root, PairRoot::Directory, "caf\u{e9}/r\u{e9}sum\u{e9}.txt")
+		.expect("kept aside");
+
+	assert_eq!(kept.as_deref(), Some("caf\u{e9}/r\u{e9}sum\u{e9}.old.txt"));
+	let names: Vec<String> = std::fs::read_dir(&dir)
+		.unwrap()
+		.map(|entry| entry.unwrap().file_name().into_string().unwrap())
+		.collect();
+	assert_eq!(names.len(), 1, "moved, not copied: {names:?}");
+	assert_eq!(
+		std::fs::read(dir.join("r\u{e9}sum\u{e9}.old.txt")).unwrap(),
+		b"mine"
+	);
+	assert_eq!(
+		std::fs::read_dir(&root).unwrap().count(),
+		1,
+		"no NFC twin of the directory"
+	);
+	std::fs::remove_dir_all(&root).ok();
+}
+
+/// A name with no room left for `.old` is refused before anything moves: the losing copy stays
+/// where it is, and the conflict stays held, rather than the copy being renamed to a name this
+/// device cannot hold.
+#[test]
+fn keeping_both_refuses_an_aside_name_this_device_cannot_hold() {
+	let root = temp_dir();
+	let name = format!("{}.txt", "a".repeat(250));
+	std::fs::write(root.join(&name), b"mine").unwrap();
+
+	let error = rename_aside(&root, PairRoot::Directory, &name).expect_err("no room for .old");
+
+	assert_eq!(error.kind(), crate::ErrorKind::InvalidName, "{error}");
+	assert_eq!(std::fs::read(root.join(&name)).unwrap(), b"mine");
+	assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+	std::fs::remove_dir_all(&root).ok();
+}
+
 /// An edit's upload reads a respelling only where the name has another Unicode form and the path
 /// holds a remote FILE to version.
 #[test]

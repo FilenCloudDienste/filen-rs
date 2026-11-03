@@ -679,6 +679,28 @@ pub(super) fn confined_local_target(
 	pair_root: PairRoot,
 	rel_path: &str,
 ) -> Result<PathBuf, crate::Error> {
+	confined_local_path(root, pair_root, rel_path, Leaf::Target)
+}
+
+/// [`confined_local_target`] for an entry that exists and is about to be moved, found as
+/// [`local_path`] finds it: under whatever spelling its directory holds it by, listing the
+/// directory where neither Unicode form names it.
+fn confined_local_entry(
+	root: &Path,
+	pair_root: PairRoot,
+	rel_path: &str,
+) -> Result<PathBuf, crate::Error> {
+	confined_local_path(root, pair_root, rel_path, Leaf::Existing)
+}
+
+/// [`confined_local_target`] and [`confined_local_entry`]: `leaf` says how the last component is
+/// looked up (see [`Leaf`]).
+fn confined_local_path(
+	root: &Path,
+	pair_root: PairRoot,
+	rel_path: &str,
+	leaf: Leaf,
+) -> Result<PathBuf, crate::Error> {
 	if rel_path
 		.split('/')
 		.any(|c| c.is_empty() || c == "." || c == "..")
@@ -687,7 +709,7 @@ pub(super) fn confined_local_target(
 			"refusing an unsafe relative path: {rel_path:?}"
 		)));
 	}
-	let target = local_target(root, rel_path);
+	let target = names::on_disk(root, rel_path, leaf);
 	let root_canon = std::fs::canonicalize(root).map_err(io_err)?;
 	// The target itself may not exist yet; canonicalize the deepest existing ancestor (which
 	// resolves any symlink in the chain) and require it to stay under the root.
@@ -753,7 +775,7 @@ pub(super) fn rename_aside(
 	pair_root: PairRoot,
 	rel_path: &str,
 ) -> Result<Option<String>, crate::Error> {
-	let source = confined_local_target(root, pair_root, rel_path)?;
+	let source = confined_local_entry(root, pair_root, rel_path)?;
 	if source.symlink_metadata().is_err() {
 		return Ok(None);
 	}
@@ -765,6 +787,10 @@ pub(super) fn rename_aside(
 /// A free `<stem>.old.<ext>` name beside `rel_path` (`<stem>.old.N.<ext>` when that is taken), with
 /// its confined local path. What [`rename_aside`] moves the losing copy to, and where a keep-both
 /// resolution of a buried version downloads it.
+///
+/// Fails, touching nothing, when this device's file system cannot hold the name
+/// ([`names::device_rejection`]): a name near the length limit has no room for `.old`, and a
+/// copy written under it would fail, or land under another name, after the losing copy was moved.
 pub(super) fn aside_target(
 	root: &Path,
 	pair_root: PairRoot,
@@ -785,6 +811,14 @@ pub(super) fn aside_target(
 			Some(ext) => format!("{stem}.old{ordinal}.{ext}"),
 			None => format!("{stem}.old{ordinal}"),
 		};
+		if let Some(rejection) = names::device_rejection(&candidate) {
+			return Err(crate::Error::custom(
+				crate::ErrorKind::InvalidName,
+				format!(
+					"cannot keep the local copy of {rel_path:?} aside as {candidate:?}: {rejection}"
+				),
+			));
+		}
 		let rel = if parent.is_empty() {
 			candidate
 		} else {

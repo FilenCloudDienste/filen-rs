@@ -842,6 +842,35 @@ fn a_binned_copy_with_the_recorded_content_is_taken_back_from_the_newest_bucket(
 	);
 }
 
+/// A copy taken back into a directory another program named in NFD lands inside that directory, as
+/// the download it replaces would, not in an NFC twin of it; the bin holds it under the key's own
+/// spelling.
+#[test]
+fn a_binned_copy_is_taken_back_into_the_directory_as_the_file_system_spells_it() {
+	let root = root();
+	dated_bin(root.path());
+	let dir = root.path().join("cafe\u{301}");
+	fs::create_dir(&dir).unwrap();
+	let bucket = super::bucket_dir(root.path(), day());
+	fs::create_dir_all(bucket.join("caf\u{e9}")).unwrap();
+	fs::write(bucket.join("caf\u{e9}/r\u{e9}sum\u{e9}.txt"), b"SAME").unwrap();
+	let bin = Binned::open(root.path(), PairRoot::Directory).expect("a bin filed by day");
+
+	assert!(bin.take_back("caf\u{e9}/r\u{e9}sum\u{e9}.txt", 4, &hash_of(b"SAME")));
+
+	let names: Vec<_> = fs::read_dir(root.path())
+		.unwrap()
+		.map(|entry| entry.unwrap().file_name())
+		.filter(|name| name != QUARANTINE_DIR)
+		.collect();
+	assert_eq!(
+		names.len(),
+		1,
+		"no second directory beside the NFD one: {names:?}"
+	);
+	assert_eq!(fs::read(dir.join("r\u{e9}sum\u{e9}.txt")).unwrap(), b"SAME");
+}
+
 /// A binned copy whose size or content is not the recorded one stays in the bin, and so does one
 /// whose path the tree holds something at again: taking it back must never replace that.
 #[test]

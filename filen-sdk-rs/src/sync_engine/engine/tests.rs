@@ -5052,6 +5052,68 @@ fn restoring_takes_a_matching_copy_back_out_of_the_bin() {
 	);
 }
 
+/// A restoration never puts an item back under a name this device cannot hold: a locally deleted
+/// file whose remote item has since taken such a name is left alone with its path, as every pass
+/// leaves it, and a never-synced remote item named so is not pulled in with the directory it sits
+/// in. Only what the view placed is restored.
+#[test]
+fn restoring_never_writes_a_name_this_device_cannot_hold() {
+	let (rows, remote) = synced_tree(hash(1), 4);
+	let renamed = "t".repeat(300);
+	let unstorable = |rel_path: String, n: u128| plan::SkippedRemote {
+		remote_uuid: Uuid::from_u128(n),
+		stable_uuid: Some(StableUuid::new_for_test(Uuid::from_u128(n))),
+		reason: UnsyncableReason::RemoteNameNotStorable {
+			name: rel_path.rsplit('/').next().unwrap_or_default().to_string(),
+			detail: "too long".to_string(),
+		},
+		rel_path,
+		path_is_dir: false,
+	};
+	let mut prep = prepared(
+		SyncMode::TwoWay,
+		rows,
+		vec![local_file("keep.txt", hash(1))],
+		view(
+			remote
+				.into_iter()
+				.filter(|node| node.rel_path != "top.txt")
+				.collect(),
+			vec![
+				unstorable(renamed.clone(), 5),
+				unstorable(format!("d/{}", "n".repeat(300)), 7),
+			],
+			&[],
+		),
+		HashMap::new(),
+	);
+	assert!(prep.facts.unknown_remote.contains_key("top.txt"));
+	let (_dir, mut screened) = screened_holding_all(&mut prep);
+	let root = tempfile::tempdir().unwrap();
+
+	let restored = screened
+		.restore(&prep.baseline, root.path(), PairRoot::Directory)
+		.unwrap();
+
+	assert_eq!(restored.actions, 4, "{restored:?}");
+	let actions = read(&screened, Rows::Safe);
+	assert_eq!(
+		actions,
+		[
+			create_local_dir("d"),
+			download("d/a.txt", 3),
+			create_local_dir("d/sub"),
+			download("d/sub/b.txt", 4),
+		]
+	);
+	assert!(
+		actions
+			.iter()
+			.all(|action| action.rel_path().split('/').all(plan::is_placeable_name)),
+		"{actions:?}"
+	);
+}
+
 /// A held type flip cannot be put back without renaming one of the two items: the restoration
 /// keeps it held, with everything held under its path, as an unfinished restoration's batch under a
 /// token of its own, and restores the rest of the batch. The next pass, which plans the flip alone
