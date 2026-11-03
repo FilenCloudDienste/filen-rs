@@ -1,15 +1,19 @@
 use anyhow::{Context as _, Result};
 use clap::Subcommand;
+use serde_json::json;
 
 use crate::{
 	CommandResult,
 	auth::{self, LogoutOutcome, export_auth_config},
 	commands::CommandContext,
 	docs::DocElement,
+	ui::UI,
 };
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum AuthCommands {
+	/// Print the email of the account you are logged in as
+	Whoami,
 	/// Export an auth config (to be used with --auth-config-path option)
 	ExportAuthConfig,
 	/// Delete saved credentials and exit, asking before each (--yes deletes them all)
@@ -19,6 +23,7 @@ pub(crate) enum AuthCommands {
 /// The authentication section of the docs.
 pub(crate) const DOCS: &[DocElement] = &[
 	DocElement::DocFragment("auth-methods"),
+	DocElement::CommandHelp("whoami"),
 	DocElement::CommandHelp("export-auth-config"),
 	DocElement::CommandHelp("logout"),
 ];
@@ -29,6 +34,10 @@ impl AuthCommands {
 			config, ui, client, ..
 		} = ctx;
 		match self {
+			Self::Whoami => {
+				let client = client.get(ui).await?;
+				print_whoami(ui, client.email())?;
+			}
 			Self::ExportAuthConfig => {
 				let client = client.get(ui).await?;
 				let export_path = export_auth_config(
@@ -51,5 +60,37 @@ impl AuthCommands {
 			}
 		}
 		Ok(CommandResult::default())
+	}
+}
+
+/// Prints `email`, the account logged in, or `{"email": ...}` with `--json`.
+fn print_whoami(ui: &mut UI, email: &str) -> Result<()> {
+	if ui.json {
+		ui.print_json(json!({ "email": email }))
+	} else {
+		ui.print(email);
+		Ok(())
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::ui::test_support::Printed;
+
+	#[test]
+	fn whoami_prints_the_email() {
+		let printed = Printed::default();
+		print_whoami(&mut printed.ui(), "user@example.com").unwrap();
+		assert_eq!(printed.lines(), "user@example.com");
+	}
+
+	#[test]
+	fn whoami_with_json_prints_an_object_with_the_email() {
+		let printed = Printed::default();
+		let mut ui = printed.ui();
+		ui.set_quiet_and_json(false, true);
+		print_whoami(&mut ui, "user@example.com").unwrap();
+		assert_eq!(printed.lines(), "{\n  \"email\": \"user@example.com\"\n}");
 	}
 }

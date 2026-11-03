@@ -111,6 +111,22 @@ async fn export_and_authenticate_from_auth_config() {
 		));
 }
 
+#[shared_test_runtime]
+async fn whoami_prints_the_email_of_the_account() {
+	let (email, _) = get_testing_credentials();
+	authenticated_cli_with_args!("whoami")
+		.success()
+		.stdout(format!("{email}\n"));
+}
+
+#[shared_test_runtime]
+async fn whoami_with_json_prints_the_email_of_the_account() {
+	let (email, _) = get_testing_credentials();
+	authenticated_cli_with_args!("whoami", "--json")
+		.success()
+		.stdout(format!("{{\n  \"email\": \"{email}\"\n}}\n"));
+}
+
 #[test]
 fn a_missing_auth_config_path_fails_without_prompting() {
 	let config_dir = assert_fs::TempDir::new().unwrap();
