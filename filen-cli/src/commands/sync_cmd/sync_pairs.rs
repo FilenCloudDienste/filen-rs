@@ -28,9 +28,14 @@ pub(crate) struct PairDefinition {
 	remote_root: Uuid,
 }
 
-/// A sync pair as its definition gives it: its local root, its mode and its remote path, which
-/// may be relative.
-pub(crate) type ParsedPair = (PathBuf, SyncMode, String);
+/// A sync pair as its definition gives it.
+#[derive(Debug, PartialEq)]
+pub(crate) struct ParsedPair {
+	local: PathBuf,
+	mode: SyncMode,
+	/// The remote path, which may be relative.
+	remote: String,
+}
 
 /// The pairs `pair_definitions` define, each of which is either `<local>:<remote>` (two-way),
 /// `<local>:<mode>:<remote>`, or the path to a syncPairs.yaml file. Without definitions, the pairs
@@ -68,7 +73,12 @@ pub(crate) async fn resolve_sync_pairs(
 	parsed: Vec<ParsedPair>,
 ) -> Result<Vec<PairDefinition>> {
 	let mut pairs = Vec::with_capacity(parsed.len());
-	for (local, mode, remote) in parsed {
+	for ParsedPair {
+		local,
+		mode,
+		remote,
+	} in parsed
+	{
 		let remote_path = working_path.navigate(&remote);
 		let remote_root = match client
 			.find_item_at_path(&remote_path.0)
@@ -276,11 +286,11 @@ fn parse_sync_pair_definition(pair: &str) -> Result<ParsedPair> {
 		},
 		None => (rest, SyncMode::TwoWay),
 	};
-	Ok((
-		expand_home(local, dirs::home_dir().as_deref()),
+	Ok(ParsedPair {
+		local: expand_home(local, dirs::home_dir().as_deref()),
 		mode,
-		remote.to_owned(),
-	))
+		remote: remote.to_owned(),
+	})
 }
 
 /// `local` with a leading `~` (alone, or followed by a path separator) replaced by `home`, as a
@@ -388,11 +398,11 @@ fn read_sync_pairs_file(path: &Path) -> Result<Vec<ParsedPair>> {
 					))
 				})?,
 			};
-			Ok((
-				local_path_in_file(&entry.local, base, home.as_deref()),
+			Ok(ParsedPair {
+				local: local_path_in_file(&entry.local, base, home.as_deref()),
 				mode,
-				entry.remote,
-			))
+				remote: entry.remote,
+			})
 		})
 		.collect()
 }
@@ -517,14 +527,22 @@ mod tests {
 	use filen_sdk_rs::sync_engine::{DeleteGuard, PairOverlap, PairRecord, SyncMode};
 
 	use super::{
-		expand_home, fallback_label, local_path_in_file, overlap_message, parse_sync_mode_str,
-		parse_sync_pair_definition, parse_sync_pairs, read_sync_pairs_file, records_of,
-		sync_mode_str,
+		ParsedPair, expand_home, fallback_label, local_path_in_file, overlap_message,
+		parse_sync_mode_str, parse_sync_pair_definition, parse_sync_pairs, read_sync_pairs_file,
+		records_of, sync_mode_str,
 	};
 	use crate::{
 		error::{CliError, exit_code, find_cli_error},
 		util::RemotePath,
 	};
+
+	fn pair(local: impl Into<PathBuf>, mode: SyncMode, remote: &str) -> ParsedPair {
+		ParsedPair {
+			local: local.into(),
+			mode,
+			remote: remote.to_owned(),
+		}
+	}
 
 	fn record(id: i64) -> PairRecord {
 		PairRecord {
@@ -635,10 +653,10 @@ mod tests {
 
 		assert_eq!(
 			pairs,
-			[(
+			[pair(
 				config_dir.path().join("docs"),
 				SyncMode::TwoWay,
-				"/docs".to_owned()
+				"/docs"
 			)]
 		);
 	}
@@ -664,11 +682,7 @@ mod tests {
 	fn a_local_path_on_a_windows_drive_keeps_its_drive_letter() {
 		assert_eq!(
 			parse_sync_pair_definition(r"C:\Users\me:/docs").unwrap(),
-			(
-				PathBuf::from(r"C:\Users\me"),
-				SyncMode::TwoWay,
-				"/docs".to_owned()
-			)
+			pair(PathBuf::from(r"C:\Users\me"), SyncMode::TwoWay, "/docs")
 		);
 	}
 
@@ -676,10 +690,10 @@ mod tests {
 	fn a_local_path_on_a_windows_drive_can_have_a_mode() {
 		assert_eq!(
 			parse_sync_pair_definition(r"C:\Users\me:localBackup:/docs").unwrap(),
-			(
+			pair(
 				PathBuf::from(r"C:\Users\me"),
 				SyncMode::LocalBackup,
-				"/docs".to_owned()
+				"/docs"
 			)
 		);
 	}
@@ -689,11 +703,7 @@ mod tests {
 	fn a_drive_relative_local_path_is_no_mode() {
 		assert_eq!(
 			parse_sync_pair_definition("C:docs:/docs").unwrap(),
-			(
-				PathBuf::from("C:docs"),
-				SyncMode::TwoWay,
-				"/docs".to_owned()
-			)
+			pair(PathBuf::from("C:docs"), SyncMode::TwoWay, "/docs")
 		);
 	}
 
@@ -715,7 +725,7 @@ mod tests {
 		let modes = ["tw", "ltc", "ctl", "lb", "cb"].map(|token| {
 			parse_sync_pair_definition(&format!("/l:{token}:/r"))
 				.unwrap()
-				.1
+				.mode
 		});
 
 		assert_eq!(
@@ -847,7 +857,7 @@ mod tests {
 
 		assert_eq!(
 			parse_sync_pair_definition("~/docs:/docs").unwrap(),
-			(home.join("docs"), SyncMode::TwoWay, "/docs".to_owned())
+			pair(home.join("docs"), SyncMode::TwoWay, "/docs")
 		);
 	}
 
@@ -855,11 +865,7 @@ mod tests {
 	fn a_pair_without_a_mode_syncs_two_way() {
 		assert_eq!(
 			parse_sync_pair_definition("/home/me/docs:/docs").unwrap(),
-			(
-				PathBuf::from("/home/me/docs"),
-				SyncMode::TwoWay,
-				"/docs".to_owned()
-			)
+			pair(PathBuf::from("/home/me/docs"), SyncMode::TwoWay, "/docs")
 		);
 	}
 
@@ -879,7 +885,7 @@ mod tests {
 		.map(|name| {
 			parse_sync_pair_definition(&format!("/l:{name}:/r"))
 				.unwrap()
-				.1
+				.mode
 		});
 
 		assert_eq!(
@@ -938,15 +944,11 @@ mod tests {
 		assert_eq!(
 			read_sync_pairs_file(&path).unwrap(),
 			[
-				(
-					dir.path().join("docs"),
-					SyncMode::TwoWay,
-					"/docs".to_owned()
-				),
-				(
+				pair(dir.path().join("docs"), SyncMode::TwoWay, "/docs"),
+				pair(
 					dir.path().join("../photos"),
 					SyncMode::LocalBackup,
-					"photos".to_owned()
+					"photos"
 				),
 			]
 		);
@@ -963,7 +965,7 @@ mod tests {
 
 		assert_eq!(
 			read_sync_pairs_file(&path).unwrap(),
-			[(PathBuf::from("/l"), SyncMode::RemoteBackup, "/r".to_owned())]
+			[pair(PathBuf::from("/l"), SyncMode::RemoteBackup, "/r")]
 		);
 	}
 
