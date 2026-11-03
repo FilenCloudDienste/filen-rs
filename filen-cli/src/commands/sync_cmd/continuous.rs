@@ -4,7 +4,8 @@ use std::{collections::HashMap, pin, sync::Arc};
 
 use anyhow::Result;
 use filen_sdk_rs::sync_engine::{
-	ConflictResolution, PairId, PairRecord, SyncEngine, SyncEvent, WatchHandle, WatchStatus,
+	ConflictResolution, PairId, PairRecord, SyncEngine, SyncEvent, WatchConfig, WatchHandle,
+	WatchStatus,
 };
 use log::warn;
 use tokio::sync::{mpsc, watch};
@@ -18,12 +19,13 @@ use super::{
 };
 use crate::{interrupt, memory, ui::UI};
 
-/// Watches each of `pairs` until Ctrl-C, printing what their passes do, and asks about what they
+/// Watches each of `pairs` on `timings` until Ctrl-C, printing what their passes do, and asks about what they
 /// leave for a person to settle when someone can answer ([`questions`]).
 pub(super) async fn sync_continuously(
 	ui: &mut UI,
 	engine: Arc<SyncEngine>,
 	pairs: &[PairRecord],
+	timings: WatchConfig,
 	log: EventLog<'_>,
 	questions: Questions<(PairId, Update)>,
 ) -> Result<()> {
@@ -35,8 +37,9 @@ pub(super) async fn sync_continuously(
 		let pair_id = pair.id;
 		let events_tx = events_tx.clone();
 		let watch = Arc::clone(&engine)
-			.watch_observed(
+			.watch_with(
 				pair_id,
+				timings,
 				Box::new(move |event| {
 					let _ = events_tx.send((pair_id, Update::Event(event)));
 				}),

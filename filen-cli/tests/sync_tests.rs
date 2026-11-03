@@ -873,6 +873,63 @@ async fn sync_watches_only_the_pairs_it_is_given() {
 	);
 }
 
+/// A continuous sync takes the watch timings, and still syncs a change made while it watches. It
+/// cannot tell the timings from the defaults, which would sync the change as well:
+/// `a_continuous_sync_watches_on_the_timings_given` checks that they reach the watches.
+#[cfg(unix)]
+#[shared_test_runtime]
+async fn sync_with_watch_timings_syncs_a_change_made_while_it_watches() {
+	// Not `get_resources_with_lock`, for the reason the first test gives.
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir_name = resources.dir.name().unwrap();
+	let local = assert_fs::TempDir::new().unwrap();
+	let config_dir = assert_fs::TempDir::new().unwrap();
+	let pair = format!("{}:{test_dir_name}", local.path().to_str().unwrap());
+	std::fs::write(local.path().join("first.txt"), "first").unwrap();
+	let first_path = format!("{test_dir_name}/first.txt");
+	let second_path = format!("{test_dir_name}/second.txt");
+	let mut wrote_second = false;
+
+	let output = sync_until(
+		config_dir.path(),
+		&[&pair, "--debounce-ms", "100", "--safety-net-secs", "5"],
+		Duration::from_secs(120),
+		async || {
+			if !wrote_second {
+				if client
+					.find_item_at_path(&first_path)
+					.await
+					.unwrap()
+					.is_some()
+				{
+					std::fs::write(local.path().join("second.txt"), "second").unwrap();
+					wrote_second = true;
+				}
+				return false;
+			}
+			client
+				.find_item_at_path(&second_path)
+				.await
+				.unwrap()
+				.is_some()
+		},
+	)
+	.await;
+
+	let stdout = String::from_utf8_lossy(&output.stdout);
+	assert!(
+		stdout.contains("Uploaded first.txt"),
+		"{}",
+		describe(&output)
+	);
+	assert!(
+		stdout.contains("Uploaded second.txt"),
+		"{}",
+		describe(&output)
+	);
+}
+
 /// A `localToRemote` pair uploads what is new locally, downloads nothing, and trashes on the remote
 /// what only the remote has.
 #[shared_test_runtime]

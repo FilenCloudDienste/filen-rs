@@ -74,6 +74,12 @@
 //! the same and is accepted for the TypeScript CLI's sake. With `--once`, it runs one sync pass for
 //! each sync pair and exits when they are done.
 //!
+//! A continuous sync waits until a burst of changes has gone quiet for 800 milliseconds before a
+//! pass syncs it; `--debounce-ms` sets that wait. It also runs a full pass at least every 300
+//! seconds, whatever has changed, to catch a change it was not told about; `--safety-net-secs`
+//! sets that time. A sync pair whose full pass takes long waits longer between them: up to 6
+//! hours, or the time given if that is longer. The safety net must be longer than the debounce.
+//!
 //! The first Ctrl+C stops the sync once the passes in flight have finished. A second Ctrl+C quits
 //! at once, without waiting for them, and exits with 130.
 //!
@@ -215,14 +221,14 @@ use filen_sdk_rs::{
 	auth::Client,
 	sync_engine::{
 		BaselineInUse, ConflictResolution, ConflictResolved, PairId, PairRecord, SyncEngine,
-		SyncEvent, SyncMode, UnsyncablePath, UnsyncableReason, WatchStatus,
+		SyncEvent, SyncMode, UnsyncablePath, UnsyncableReason, WatchConfig, WatchStatus,
 	},
 };
 use log::info;
 
 use crate::{
-	CliConfig, CommandResult, auth::LazyClient, commands::CommandContext, docs::DocElement, ui::UI,
-	util::RemotePath,
+	CliConfig, CommandResult, auth::LazyClient, commands::CommandContext, docs::DocElement,
+	error::CliError, ui::UI, util::RemotePath,
 };
 
 mod conflict_resolutions;
@@ -240,6 +246,7 @@ mod status_line;
 mod sync_pairs;
 mod transfers;
 mod watch_status;
+mod watch_timings;
 
 use conflict_resolutions::ConflictResolutions;
 use failures::Failures;
@@ -272,8 +279,16 @@ pub(crate) enum SyncCommands {
 		continuous: bool,
 		/// Print what a pass of each sync pair would do, and sync nothing.
 		/// The sync pairs are registered as without it.
-		#[arg(long, conflicts_with_all = ["once", "continuous", "approve_mass_deletions", "keep_local", "keep_remote", "keep_both"])]
+		#[arg(long, conflicts_with_all = ["once", "continuous", "approve_mass_deletions", "keep_local", "keep_remote", "keep_both", "debounce_ms", "safety_net_secs"])]
 		dry_run: bool,
+		/// How long, in milliseconds, a burst of changes must go quiet before a pass syncs it (1 to 60000; 800 by default).
+		/// Applies to a continuous sync only.
+		#[arg(long, value_name = "MS", value_parser = watch_timings::parse_debounce_ms, conflicts_with = "once")]
+		debounce_ms: Option<Duration>,
+		/// The fewest seconds between the full passes a continuous sync runs whatever has changed (1 to 86400; 300 by default).
+		/// A sync pair whose full pass takes long waits longer. Applies to a continuous sync only.
+		#[arg(long, value_name = "SECS", value_parser = watch_timings::parse_safety_net_secs, conflicts_with = "once")]
+		safety_net_secs: Option<Duration>,
 		/// Approve the deletions the delete guard holds back.
 		/// Applies to every sync pair, in its first sync pass only.
 		#[arg(long)]
@@ -401,6 +416,8 @@ impl SyncCommands {
 				// the default, which `--once` turns off
 				continuous: _,
 				dry_run,
+				debounce_ms,
+				safety_net_secs,
 				approve_mass_deletions,
 				keep_local,
 				keep_remote,
@@ -415,13 +432,7 @@ impl SyncCommands {
 					)?,
 				};
 				let pairs = given_pairs(pairs, pair_options);
-				let passes = if dry_run {
-					Passes::DryRun
-				} else if once {
-					Passes::Once
-				} else {
-					Passes::Continuous
-				};
+				let passes = passes_of(dry_run, once, debounce_ms, safety_net_secs)?;
 				sync(config, ui, client, working_path, &pairs, passes, &settle).await?;
 			}
 			Self::ListSyncPairs => manage::list_sync_pairs(config, ui, client).await?,
@@ -477,12 +488,28 @@ fn given_pairs(pairs: Vec<String>, pair_options: Vec<String>) -> Vec<String> {
 /// How long `sync` runs.
 #[derive(Clone, Copy, PartialEq)]
 enum Passes {
-	/// Until Ctrl-C.
-	Continuous,
+	/// Until Ctrl-C, on these timings.
+	Continuous(WatchConfig),
 	/// One pass of each pair (`--once`).
 	Once,
 	/// No pass: what a pass of each pair would do (`--dry-run`).
 	DryRun,
+}
+
+/// How long `sync` runs, as `--dry-run`, `--once` and the watch timings given say.
+fn passes_of(
+	dry_run: bool,
+	once: bool,
+	debounce: Option<Duration>,
+	safety_net: Option<Duration>,
+) -> Result<Passes, CliError> {
+	Ok(if dry_run {
+		Passes::DryRun
+	} else if once {
+		Passes::Once
+	} else {
+		Passes::Continuous(watch_timings::watch_config(debounce, safety_net)?)
+	})
 }
 
 /// What the flags settle of what the first pass of each pair finds.
@@ -534,18 +561,22 @@ async fn sync(
 	)?;
 	// once, before the passes start: labelling an event must not ask the server for anything
 	let labels = sync_pairs::pair_labels(client, &pairs).await;
-	if passes == Passes::DryRun {
-		return dry_run::print_plans(ui, &engine, &pairs, &labels).await;
-	}
-	let once = passes == Passes::Once;
+	// the watch timings, or none for a single pass
+	let timings = match passes {
+		Passes::DryRun => return dry_run::print_plans(ui, &engine, &pairs, &labels).await,
+		Passes::Once => None,
+		Passes::Continuous(timings) => Some(timings),
+	};
 	let can_ask = questions::can_ask(ui);
 	let mut log = EventLog::new(&labels, settle, Output::of(ui));
 	log.asks = can_ask;
-	log.print_banners(ui, &pairs, once);
-	if once {
-		once::sync_once(ui, &engine, &pairs, log, settle, Questions::new(can_ask)).await
-	} else {
-		continuous::sync_continuously(ui, engine, &pairs, log, Questions::new(can_ask)).await
+	log.print_banners(ui, &pairs, timings.is_none());
+	match timings {
+		None => once::sync_once(ui, &engine, &pairs, log, settle, Questions::new(can_ask)).await,
+		Some(timings) => {
+			let questions = Questions::new(can_ask);
+			continuous::sync_continuously(ui, engine, &pairs, timings, log, questions).await
+		}
 	}
 }
 
@@ -1133,8 +1164,9 @@ mod tests {
 	use serde_json::{Value, json};
 
 	use super::{
-		ConflictResolutions, EventLog, Output, Settle, SyncCommands, SyncEvent, format_sync_event,
-		given_pairs, open_failure, paused_message, unsyncable_notices,
+		ConflictResolutions, EventLog, Output, Passes, Settle, SyncCommands, SyncEvent,
+		WatchConfig, format_sync_event, given_pairs, open_failure, passes_of, paused_message,
+		unsyncable_notices,
 	};
 	use crate::{commands::Commands, parse_repl_line, ui::test_support::Printed};
 
@@ -1206,12 +1238,85 @@ mod tests {
 			"--continuous",
 			"--approve-mass-deletions",
 			"--keep-local a",
+			"--debounce-ms 100",
+			"--safety-net-secs 60",
 		] {
 			assert!(
 				parse_repl_line(&format!("sync /a:/b --dry-run {flags}")).is_err(),
 				"{flags}"
 			);
 		}
+	}
+
+	#[test]
+	fn the_watch_timings_are_given_in_milliseconds_and_seconds() {
+		let SyncCommands::Sync {
+			debounce_ms,
+			safety_net_secs,
+			..
+		} = command_of("sync /a:/b --debounce-ms 250 --safety-net-secs 60")
+		else {
+			panic!("expected sync");
+		};
+		assert_eq!(debounce_ms, Some(Duration::from_millis(250)));
+		assert_eq!(safety_net_secs, Some(Duration::from_secs(60)));
+		let SyncCommands::Sync {
+			debounce_ms,
+			safety_net_secs,
+			..
+		} = command_of("sync /a:/b")
+		else {
+			panic!("expected sync");
+		};
+		assert_eq!((debounce_ms, safety_net_secs), (None, None));
+	}
+
+	/// The watch timings given reach the watches, which `sync_continuously` hands them to.
+	#[test]
+	fn a_continuous_sync_watches_on_the_timings_given() {
+		let SyncCommands::Sync {
+			dry_run,
+			once,
+			debounce_ms,
+			safety_net_secs,
+			..
+		} = command_of("sync /a:/b --debounce-ms 250 --safety-net-secs 60")
+		else {
+			panic!("expected sync");
+		};
+
+		assert!(
+			passes_of(dry_run, once, debounce_ms, safety_net_secs).unwrap()
+				== Passes::Continuous(WatchConfig {
+					debounce: Duration::from_millis(250),
+					safety_net: Duration::from_secs(60),
+				})
+		);
+		assert!(
+			passes_of(false, false, None, None).unwrap()
+				== Passes::Continuous(WatchConfig::default())
+		);
+		assert!(passes_of(false, true, None, None).unwrap() == Passes::Once);
+		assert!(passes_of(true, false, None, None).unwrap() == Passes::DryRun);
+	}
+
+	#[test]
+	fn the_watch_timings_take_only_numbers_in_range_and_only_without_once() {
+		for flags in [
+			"--debounce-ms 0",
+			"--debounce-ms 600001",
+			"--safety-net-secs 0",
+			"--safety-net-secs 86401",
+			"--safety-net-secs 1m",
+			"--once --debounce-ms 100",
+			"--once --safety-net-secs 60",
+		] {
+			assert!(
+				parse_repl_line(&format!("sync /a:/b {flags}")).is_err(),
+				"{flags}"
+			);
+		}
+		assert!(parse_repl_line("sync /a:/b --continuous --debounce-ms 100").is_ok());
 	}
 
 	#[test]
