@@ -237,7 +237,7 @@ impl
 		WasmPingTask,
 	> for WasmSocket
 {
-	async fn build_request() -> Result<String, Error> {
+	async fn build_request(_client: &crate::auth::http::AuthClient) -> Result<String, Error> {
 		Ok(format!(
 			"{}{}",
 			WEBSOCKET_URL_CORE,

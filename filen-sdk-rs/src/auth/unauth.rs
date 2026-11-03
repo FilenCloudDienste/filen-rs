@@ -47,16 +47,22 @@ use super::{v1, v2, v3};
 pub struct UnauthClient {
 	pub(crate) state: SharedClientState,
 	pub(crate) reqwest_client: reqwest::Client,
+	/// How the websocket connects: the same TLS configuration as `reqwest_client`, and the
+	/// system's proxy.
+	#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+	pub(crate) socket_transport: Arc<crate::platform_net::SocketTransport>,
 	#[cfg(feature = "http-provider")]
 	pub(crate) http_provider: Arc<Mutex<Weak<HttpProviderHandle>>>,
 }
 
 impl UnauthClient {
 	pub fn from_config(client_config: ClientConfig) -> Result<Self, Error> {
-		let reqwest_client = client_config.build_reqwest_client()?;
+		let http = client_config.build_http()?;
 		let state = SharedClientState::new(client_config)?;
 		Ok(Self {
-			reqwest_client,
+			reqwest_client: http.reqwest,
+			#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+			socket_transport: http.socket_transport,
 			state,
 			#[cfg(feature = "http-provider")]
 			http_provider: Arc::new(Mutex::new(Weak::new())),

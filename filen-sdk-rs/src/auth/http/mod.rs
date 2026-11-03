@@ -247,10 +247,12 @@ impl ClientConfig {
 	}
 
 	/// Build the [`reqwest::Client`] backing every request, applying the connect/read timeouts.
+	/// On the desktop targets it also builds the websocket's transport, which shares the
+	/// client's TLS configuration (see [`crate::platform_net`]).
 	///
 	/// On wasm the timeouts are ignored — reqwest's fetch-based client exposes no
 	/// connect/read-timeout knobs; the browser governs those instead.
-	pub(crate) fn build_reqwest_client(&self) -> Result<reqwest::Client, Error> {
+	pub(crate) fn build_http(&self) -> Result<HttpClients, Error> {
 		#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 		{
 			let mut builder = reqwest::Client::builder();
@@ -260,14 +262,48 @@ impl ClientConfig {
 			if let Some(read_timeout) = self.read_timeout {
 				builder = builder.read_timeout(read_timeout);
 			}
-			builder.build().map_err(Error::from)
+			#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+			let (builder, socket_transport) = {
+				let tls = crate::platform_net::platform_tls_config();
+				let builder = match &tls {
+					Some(tls) => builder.use_preconfigured_tls(tls.clone()),
+					None => builder,
+				};
+				(
+					builder,
+					Arc::new(crate::platform_net::SocketTransport::new(
+						tls,
+						self.connect_timeout,
+					)),
+				)
+			};
+			Ok(HttpClients {
+				reqwest: builder.build().map_err(Error::from)?,
+				#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+				socket_transport,
+			})
 		}
 		#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 		{
 			let _ = (self.connect_timeout, self.read_timeout);
-			Ok(reqwest::Client::new())
+			Ok(HttpClients {
+				reqwest: reqwest::Client::new(),
+			})
 		}
 	}
+
+	/// The [`reqwest::Client`] [`build_http`](Self::build_http) builds.
+	#[cfg(test)]
+	pub(crate) fn build_reqwest_client(&self) -> Result<reqwest::Client, Error> {
+		self.build_http().map(|http| http.reqwest)
+	}
+}
+
+/// What [`ClientConfig::build_http`] builds once per client.
+pub(crate) struct HttpClients {
+	pub(crate) reqwest: reqwest::Client,
+	#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+	pub(crate) socket_transport: Arc<crate::platform_net::SocketTransport>,
 }
 
 impl Default for ClientConfig {

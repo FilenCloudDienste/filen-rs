@@ -515,7 +515,7 @@ where
 				};
 				handle_request(request, listeners);
 			}
-			result = connect_and_build_socket(&api_key, listeners) => {
+			result = connect_and_build_socket(&config.client, &api_key, listeners) => {
 				match result {
 					Ok((streams, interval)) => {
 						config.ping_interval = interval;
@@ -628,6 +628,7 @@ fn handle_request(request: SocketRequest, listeners: &mut impl ListenerManagerEx
 }
 
 async fn connect_and_build_socket<UW, US, UR, RV, W, S, R, T, PT>(
+	client: &AuthClient,
 	api_key: &str,
 	listeners: &mut DisconnectedListenerManager,
 ) -> Result<(W, Duration), Error>
@@ -646,7 +647,7 @@ where
 	// are otherwise unbounded, so a dead peer would park the task forever.
 	let setup = async {
 		tracing::debug!("Connecting to WebSocket server...");
-		let request = W::build_request().await?;
+		let request = W::build_request(client).await?;
 
 		tracing::debug!("WebSocket request built, connecting...");
 

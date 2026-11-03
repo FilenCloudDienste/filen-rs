@@ -384,6 +384,29 @@ zip = { version = "8.6.0", default-features = false, features = [
 	"zstd",
 ], optional = true }
 
+# Desktop targets only: TLS checks the server's certificate the way the OS does (its trust
+# store, enterprise roots, revocation) instead of the bundled webpki roots, and requests and the
+# websocket go through the system's proxy (environment variables, plus the macOS and Windows
+# settings). iOS, Android and wasm keep the webpki roots and connect directly.
+[target.'cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))'.dependencies]
+reqwest = { version = "0.12.22", default-features = false, features = [
+	"system-proxy",
+] }
+rustls = { version = "0.23.32", default-features = false, features = [
+	"ring",
+	"std",
+	"tls12",
+] }
+rustls-platform-verifier = "0.7.1"
+# The proxy settings reqwest resolves (`Matcher::from_system`) and its CONNECT tunnel, for the
+# websocket, which reqwest does not carry.
+hyper-util = { version = "0.1.17", default-features = false, features = [
+	"client-legacy",
+	"client-proxy",
+	"client-proxy-system",
+	"tokio",
+] }
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }
 

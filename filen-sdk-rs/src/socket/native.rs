@@ -8,7 +8,7 @@ use tokio::net::TcpStream;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use tungstenite::{Message, Utf8Bytes};
 
-use crate::{Error, ErrorKind};
+use crate::{Error, ErrorKind, auth::http::AuthClient};
 
 use super::{
 	consts::{PING_MESSAGE, WEBSOCKET_URL_CORE},
@@ -192,6 +192,13 @@ impl UnauthedSocket<UnauthedNativeSender, UnauthedNativeReceiver, Utf8Bytes>
 	}
 }
 
+/// What [`NativeSocket::connect`] opens: the URL and, on the desktop targets, how to reach it.
+pub(super) struct NativeRequest {
+	url: String,
+	#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+	transport: std::sync::Arc<crate::platform_net::SocketTransport>,
+}
+
 pub(super) struct NativeSocket {
 	write: SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>,
 	read: SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>,
@@ -199,7 +206,7 @@ pub(super) struct NativeSocket {
 
 impl
 	Socket<
-		String,
+		NativeRequest,
 		UnauthedNativeSocket,
 		NativeSender,
 		NativeReceiver,
@@ -209,15 +216,23 @@ impl
 		NativePingTask,
 	> for NativeSocket
 {
-	async fn build_request() -> Result<String, Error> {
-		Ok(format!(
-			"{}{}",
-			WEBSOCKET_URL_CORE,
-			chrono::Utc::now().timestamp_millis()
-		))
+	#[cfg_attr(
+		not(any(target_os = "windows", target_os = "macos", target_os = "linux")),
+		allow(unused_variables)
+	)]
+	async fn build_request(client: &AuthClient) -> Result<NativeRequest, Error> {
+		Ok(NativeRequest {
+			url: format!(
+				"{}{}",
+				WEBSOCKET_URL_CORE,
+				chrono::Utc::now().timestamp_millis()
+			),
+			#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+			transport: client.unauthed.socket_transport.clone(),
+		})
 	}
 
-	async fn connect(request: String) -> Result<UnauthedNativeSocket, Error> {
+	async fn connect(request: NativeRequest) -> Result<UnauthedNativeSocket, Error> {
 		// Bounded buffers: tungstenite's defaults (64 MiB message, 16 MiB frame) are sized for
 		// servers, and a socket event is a few KiB of JSON — while one consumer of this socket
 		// is an iOS file-provider extension living under a ~20 MB jetsam limit, where a single
@@ -228,8 +243,13 @@ impl
 		let config = tungstenite::protocol::WebSocketConfig::default()
 			.max_frame_size(Some(4 << 20))
 			.max_message_size(Some(4 << 20));
+		// The desktop targets verify with the OS and go through its proxy; the others keep
+		// tungstenite's webpki roots and connect directly.
+		#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+		let ws_stream = request.transport.connect(&request.url, config).await?;
+		#[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
 		let (ws_stream, _) =
-			tokio_tungstenite::connect_async_with_config(request, Some(config), false)
+			tokio_tungstenite::connect_async_with_config(request.url, Some(config), false)
 				.await
 				.map_err(|e| {
 					Error::custom(

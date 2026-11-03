@@ -281,7 +281,7 @@ mod pipeline {
 			FakeNoopPingTask,
 		> for FakeSocket
 	{
-		async fn build_request() -> Result<(), Error> {
+		async fn build_request(_client: &AuthClient) -> Result<(), Error> {
 			Ok(())
 		}
 
@@ -642,7 +642,7 @@ mod pipeline {
 				FakeReceiver,
 				(),
 				FakeNoopPingTask,
-			>("key", &mut listeners),
+			>(&test_config().client, "key", &mut listeners),
 		)
 		.await
 		.expect("a hung handshake must time out on its own");

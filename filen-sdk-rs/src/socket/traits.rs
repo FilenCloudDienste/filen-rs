@@ -2,7 +2,7 @@ use std::{borrow::Cow, ops::Deref, time::Duration};
 
 use stable_deref_trait::StableDeref;
 
-use crate::{Error, socket::events::DecryptedSocketEvent};
+use crate::{Error, auth::http::AuthClient, socket::events::DecryptedSocketEvent};
 
 pub type EventListenerCallback = Box<dyn Fn(&DecryptedSocketEvent<'_>) + Send + 'static>;
 
@@ -56,7 +56,7 @@ where
 	U: UnauthedSocket<US, UR, RV>,
 	PT: PingTask<S>,
 {
-	async fn build_request() -> Result<T, Error>;
+	async fn build_request(client: &AuthClient) -> Result<T, Error>;
 
 	async fn connect(request: T) -> Result<U, Error>;
 
