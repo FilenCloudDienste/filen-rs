@@ -132,8 +132,10 @@ mod continuous;
 mod failures;
 mod ignore_file;
 mod json_events;
+mod manage;
 mod once;
 mod outcome;
+mod pair_address;
 mod questions;
 mod status_line;
 mod sync_pairs;
@@ -188,12 +190,25 @@ pub(crate) enum SyncCommands {
 		#[arg(long, value_name = "RELATIVE_PATH")]
 		keep_both: Vec<String>,
 	},
+	/// List the registered sync pairs
+	ListSyncPairs,
+	/// Remove a sync pair from the sync database; its files stay as they are on both sides
+	RemoveSyncPair {
+		#[arg(help = PAIR_HELP)]
+		pair: String,
+	},
 }
+
+/// The help of the PAIR argument of the commands that manage a registered sync pair.
+const PAIR_HELP: &str = "The sync pair: its id, as list-sync-pairs prints it, its alias in the default sync pairs file, or its local directory";
 
 /// The commands that close the docs' "Transferring Files" section.
 pub(crate) const DOCS: &[DocElement] = &[
 	DocElement::DocFragment("sync-modes"),
 	DocElement::CommandHelp("sync"),
+	DocElement::DocFragment("sync-pairs"),
+	DocElement::CommandHelp("list-sync-pairs"),
+	DocElement::CommandHelp("remove-sync-pair"),
 ];
 
 impl SyncCommands {
@@ -227,6 +242,10 @@ impl SyncCommands {
 				let pairs = given_pairs(pairs, pair_options);
 				sync(config, ui, client, working_path, &pairs, once, &settle).await?;
 			}
+			Self::ListSyncPairs => manage::list_sync_pairs(config, ui, client).await?,
+			Self::RemoveSyncPair { pair } => {
+				manage::remove_sync_pair(config, ui, client, &pair).await?;
+			}
 		}
 		Ok(CommandResult::default())
 	}
@@ -253,11 +272,7 @@ async fn sync(
 	settle: &Settle,
 ) -> Result<()> {
 	// before logging in, so that a bad definition fails at once
-	let sync_dirs = SyncDirs::new(
-		&config.config_dir,
-		config.config_dir_is_default,
-		dirs::home_dir().as_deref(),
-	);
+	let sync_dirs = sync_dirs(config);
 	let parsed = sync_pairs::parse_sync_pairs(&sync_dirs, pair_definitions)?;
 	for warning in sync_pairs::local_trash_warnings(&parsed) {
 		ui.print_warning(&warning);
@@ -724,6 +739,15 @@ fn resolve_failure_message(rel_path: &str, label: Cow<'_, str>, e: &filen_sdk_rs
 
 fn paused_message(label: Cow<'_, str>) -> String {
 	format!("The sync pair {label} is paused, so it is not synced")
+}
+
+/// The directories `sync` reads sync pairs files from, for the config directory of `config`.
+fn sync_dirs(config: &CliConfig) -> SyncDirs<'_> {
+	SyncDirs::new(
+		&config.config_dir,
+		config.config_dir_is_default,
+		dirs::home_dir().as_deref(),
+	)
 }
 
 /// Opens the sync engine on its database in the config directory, which only one engine can hold

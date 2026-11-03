@@ -1,0 +1,172 @@
+//! [cli-doc] sync-pairs
+//! The sync pairs `sync` has set up stay registered in the sync database, and these commands
+//! manage them. They name a sync pair by the id `list-sync-pairs` prints, by its alias in the
+//! default sync pairs file, or by its local directory. They open the same database as `sync`, so
+//! they cannot run while a `filen sync` is running: stop it first.
+
+use std::sync::Arc;
+
+use anyhow::{Context, Result};
+use filen_sdk_rs::{
+	auth::Client,
+	sync_engine::{PairRecord, SyncEngine},
+};
+use serde_json::json;
+
+use super::{open_engine, pair_address, sync_dirs, sync_pairs};
+use crate::{CliConfig, auth::LazyClient, ui::UI};
+
+/// A sync engine opened for a command that manages its pairs, logged in.
+struct Managing<'c> {
+	client: &'c Arc<Client>,
+	engine: SyncEngine,
+}
+
+impl<'c> Managing<'c> {
+	async fn open(config: &CliConfig, ui: &mut UI, client: &'c mut LazyClient) -> Result<Self> {
+		let client = client.get(ui).await?;
+		let engine = open_engine(config, client).await?;
+		Ok(Self { client, engine })
+	}
+
+	async fn pairs(&self) -> Result<Vec<PairRecord>> {
+		self.engine
+			.list_pairs()
+			.await
+			.context("Failed to list the sync pairs")
+	}
+
+	/// The registered pair `given` names (see [`pair_address::find_pair`]), with its label.
+	async fn find(&self, config: &CliConfig, given: &str) -> Result<(PairRecord, String)> {
+		let pair = pair_address::find_pair(self.pairs().await?, given, &sync_dirs(config))?;
+		let label = self.label(&pair).await;
+		Ok((pair, label))
+	}
+
+	async fn label(&self, pair: &PairRecord) -> String {
+		sync_pairs::pair_labels(self.client, std::slice::from_ref(pair))
+			.await
+			.remove(&pair.id)
+			.unwrap_or_else(|| format!("sync pair {}", pair.id))
+	}
+}
+
+/// `list-sync-pairs`: each registered pair with its id, whether it is paused, and whether it has
+/// completed a first pass.
+pub(super) async fn list_sync_pairs(
+	config: &CliConfig,
+	ui: &mut UI,
+	client: &mut LazyClient,
+) -> Result<()> {
+	let managing = Managing::open(config, ui, client).await?;
+	let pairs = managing.pairs().await?;
+	if ui.json {
+		let mut remote_paths = sync_pairs::remote_paths(managing.client, &pairs).await;
+		let pairs = pairs
+			.iter()
+			.map(|pair| {
+				json!({
+					"id": pair.id,
+					"local": pair.local_root,
+					"remote": remote_paths.remove(&pair.id).flatten(),
+					"remote_uuid": pair.remote_root,
+					"mode": sync_pairs::sync_mode_str(pair.mode),
+					"paused": pair.paused,
+					"first_pass_completed": pair.first_pass_completed,
+				})
+			})
+			.collect::<Vec<_>>();
+		return ui.print_json(json!(pairs));
+	}
+	if pairs.is_empty() {
+		ui.print_muted(
+			"No sync pairs are registered. `filen sync` registers the sync pairs it syncs.",
+		);
+		return Ok(());
+	}
+	let mut labels = sync_pairs::pair_labels(managing.client, &pairs).await;
+	for pair in &pairs {
+		let label = labels
+			.remove(&pair.id)
+			.unwrap_or_else(|| format!("sync pair {}", pair.id));
+		ui.print(&pair_line(pair, &label));
+	}
+	Ok(())
+}
+
+/// The line `list-sync-pairs` prints for `pair`, labelled `label`.
+fn pair_line(pair: &PairRecord, label: &str) -> String {
+	let mut line = format!("{}: {label}", pair.id);
+	if pair.paused {
+		line.push_str(" (paused)");
+	}
+	if !pair.first_pass_completed {
+		line.push_str(" (no pass completed yet)");
+	}
+	line
+}
+
+/// `remove-sync-pair`: forgets the pair `given` names, once the user confirms it. No file is
+/// touched on either side.
+pub(super) async fn remove_sync_pair(
+	config: &CliConfig,
+	ui: &mut UI,
+	client: &mut LazyClient,
+	given: &str,
+) -> Result<()> {
+	// before logging in, so that a script learns at once that it needs `--yes`
+	ui.ensure_can_confirm(&format!("Remove the sync pair {given}?"))?;
+	let managing = Managing::open(config, ui, client).await?;
+	let (pair, label) = managing.find(config, given).await?;
+	if !ui.prompt_confirm(
+		&format!(
+			"Remove the sync pair {label}? Its files stay as they are on both sides, and are no \
+			 longer synced."
+		),
+		false,
+	)? {
+		return Ok(());
+	}
+	managing
+		.engine
+		.remove_pair(pair.id)
+		.await
+		.with_context(|| format!("Failed to remove the sync pair {label}"))?;
+	ui.print_success(&format!(
+		"Removed the sync pair {label}. No file was deleted."
+	));
+	Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+	use filen_sdk_rs::sync_engine::{DeleteGuard, PairRecord, SyncMode};
+	use filen_types::fs::Uuid;
+
+	use super::pair_line;
+
+	fn record(paused: bool, first_pass_completed: bool) -> PairRecord {
+		PairRecord {
+			id: 3,
+			local_root: "/home/me/docs".to_string(),
+			remote_root: Uuid::from_u128(1),
+			mode: SyncMode::TwoWay,
+			delete_guard: DeleteGuard::default(),
+			paused,
+			first_pass_completed,
+		}
+	}
+
+	#[test]
+	fn a_pair_is_listed_by_its_id_and_label() {
+		assert_eq!(pair_line(&record(false, true), "L"), "3: L");
+	}
+
+	#[test]
+	fn a_listed_pair_says_whether_it_is_paused_and_has_completed_a_pass() {
+		assert_eq!(
+			pair_line(&record(true, false), "L"),
+			"3: L (paused) (no pass completed yet)"
+		);
+	}
+}

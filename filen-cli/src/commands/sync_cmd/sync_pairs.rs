@@ -2,8 +2,8 @@ use std::{
 	borrow::Cow,
 	collections::{HashMap, HashSet},
 	fmt::Display,
-	fs, io,
-	path::{self, Path, PathBuf},
+	io,
+	path::{Path, PathBuf},
 	slice,
 };
 
@@ -22,7 +22,10 @@ use filen_sdk_rs::{
 use filen_types::fs::Uuid;
 use serde::Deserialize;
 
-use super::ignore_file::{self, EXCLUDE_DOT_FILES_RULES};
+use super::{
+	ignore_file::{self, EXCLUDE_DOT_FILES_RULES},
+	pair_address,
+};
 use crate::{
 	ui::UI,
 	util::{RemotePath, uuid_v5},
@@ -110,7 +113,7 @@ pub(crate) fn local_trash_warnings(parsed: &[ParsedPair]) -> Vec<String> {
 
 /// Whether `definition`, which names no file, is meant as an alias: a word, without the `:` of
 /// a sync pair or the separator of a path.
-fn is_alias(definition: &str) -> bool {
+pub(super) fn is_alias(definition: &str) -> bool {
 	!definition.is_empty()
 		&& !definition.contains(':')
 		&& !definition.contains(std::path::is_separator)
@@ -126,6 +129,12 @@ fn read_aliased_pairs(dirs: &SyncDirs<'_>, alias: &str) -> Result<Vec<ParsedPair
 			display_paths(&candidates)
 		))),
 	}
+}
+
+/// The local directory of the pair `alias` names in the default sync pairs file in `dirs`.
+pub(super) fn aliased_local(dirs: &SyncDirs<'_>, alias: &str) -> Result<PathBuf> {
+	let pairs = read_aliased_pairs(dirs, alias)?;
+	Ok(pair_by_alias(&pairs, alias)?.local)
 }
 
 /// The pair of `pairs`, those of the default sync pairs file, that `alias` names.
@@ -513,21 +522,14 @@ async fn registered_mode(engine: &SyncEngine, local: &Path, remote_root: Uuid) -
 			return None;
 		}
 	};
-	let local = resolved(local);
+	let local = pair_address::resolved(local);
 	pairs
 		.into_iter()
 		.find(|pair| {
-			pair.remote_root == remote_root && resolved(Path::new(&pair.local_root)) == local
+			pair.remote_root == remote_root
+				&& pair_address::resolved(Path::new(&pair.local_root)) == local
 		})
 		.map(|pair| pair.mode)
-}
-
-/// `path` as the operating system resolves it, or, when it cannot (it no longer exists), made
-/// absolute against the working directory.
-fn resolved(path: &Path) -> PathBuf {
-	fs::canonicalize(path)
-		.or_else(|_| path::absolute(path))
-		.unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// Why the pair `local` <> `remote` cannot be set up in `mode`: it is registered in the mode
@@ -976,26 +978,45 @@ pub(super) fn sync_mode_str(mode: SyncMode) -> &'static str {
 /// path>`, read from the server once, before the sync starts. A pair whose remote path cannot be
 /// read is named by its remote root's uuid instead, and a warning is logged.
 pub(crate) async fn pair_labels(client: &Client, pairs: &[PairRecord]) -> HashMap<PairId, String> {
+	let mut remote_paths = remote_paths(client, pairs).await;
+	pairs
+		.iter()
+		.map(|pair| {
+			let label = match remote_paths.remove(&pair.id).flatten() {
+				Some(remote_path) => label(pair, &remote_path),
+				None => fallback_label(pair),
+			};
+			(pair.id, label)
+		})
+		.collect()
+}
+
+/// The remote path of each of `pairs`, by id, read from the server, without the `/` a directory's
+/// path ends with. `None` for a pair whose remote path cannot be read, which logs a warning.
+pub(super) async fn remote_paths(
+	client: &Client,
+	pairs: &[PairRecord],
+) -> HashMap<PairId, Option<String>> {
 	futures::future::join_all(pairs.iter().map(async |pair| {
-		let label = match format_sync_pair(client, pair).await {
-			Ok(label) => label,
+		let remote_path = match remote_path(client, pair).await {
+			Ok(remote_path) => Some(remote_path),
 			Err(e) => {
 				log::warn!(
 					"Failed to read the remote path of sync pair {}, naming it by its uuid: {e:#}",
 					pair.id
 				);
-				fallback_label(pair)
+				None
 			}
 		};
-		(pair.id, label)
+		(pair.id, remote_path)
 	}))
 	.await
 	.into_iter()
 	.collect()
 }
 
-/// A pair as `<local> <(mode)> <remote path>`, for messages.
-async fn format_sync_pair(client: &Client, pair: &PairRecord) -> Result<String> {
+/// The path of `pair`'s remote directory, without the `/` a directory's path ends with.
+async fn remote_path(client: &Client, pair: &PairRecord) -> Result<String> {
 	let remote_dir = client
 		.get_dir(pair.remote_root)
 		.await
@@ -1004,8 +1025,7 @@ async fn format_sync_pair(client: &Client, pair: &PairRecord) -> Result<String> 
 		.get_item_path(&NonRootItemType::Dir(Cow::Owned(remote_dir)))
 		.await
 		.context("Failed to get the remote path of a sync pair")?;
-	// a directory's path ends with `/`
-	Ok(label(pair, remote_path.trim_end_matches('/')))
+	Ok(remote_path.trim_end_matches('/').to_owned())
 }
 
 /// A pair as `<local> <(mode)> <remote root uuid>`, for when its remote path cannot be read.
