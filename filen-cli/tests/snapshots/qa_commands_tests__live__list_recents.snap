@@ -1,0 +1,16 @@
+---
+source: filen-cli/tests/qa_commands_tests.rs
+expression: "redact(&listed, test_dir_name)"
+---
+[
+  {
+    "created": "<time>",
+    "favorited": false,
+    "modified": "<time>",
+    "name": "recents_snapshot.txt",
+    "path": "/<dir>/recents_snapshot.txt",
+    "size": 7,
+    "type": "file",
+    "uuid": "<uuid>"
+  }
+]

@@ -1,0 +1,10 @@
+---
+source: filen-cli/tests/qa_commands_tests.rs
+expression: "redact(&String::from_utf8_lossy(&assert.get_output().stdout), test_dir_name)"
+---
+    Name stat_snapshot.txt
+    Type File
+    Size <size>
+Modified <time>
+ Created <time>
+    UUID <uuid>

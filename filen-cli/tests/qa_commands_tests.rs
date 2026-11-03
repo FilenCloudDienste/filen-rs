@@ -1,5 +1,7 @@
-//! Commands no other test runs (`export-api-key`, `list-recents`, `view-html-docs`), and paths
-//! with spaces in them from the command line and from piped REPL commands.
+//! Commands no other test runs (`export-api-key`, `list-recents`, `view-html-docs`), paths with
+//! spaces in them from the command line and from piped REPL commands, and snapshots of what
+//! `stat` prints and of the `--json` listings of `list-trash` and `list-recents`, with what
+//! differs between runs redacted.
 //!
 //! `export-auth-config` is covered in `auth_tests`, and `logout` in `output_tests`.
 
@@ -139,12 +141,62 @@ mod live {
 	use filen_macros::shared_test_runtime;
 	use filen_sdk_rs::fs::{HasName as _, HasUUID as _, categories::NonRootFileType};
 	use rand::TryRngCore as _;
+	use regex::Regex;
 	use test_utils::authenticated_cli_with_args;
 
 	use super::run_script;
 
 	/// How long the server may take to list a new upload in the recents.
 	const RECENTS_DEADLINE: Duration = Duration::from_secs(120);
+
+	/// Replaces what changes between runs in `output`: the test directory's name, UUIDs,
+	/// timestamps (as printed and as in JSON), sizes and counts. Color codes are stripped first.
+	fn redact(output: &str, test_dir_name: &str) -> String {
+		let ansi = Regex::new(r"\x1b\[[0-9;]*m").unwrap();
+		let uuid =
+			Regex::new(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}").unwrap();
+		let time = Regex::new(
+			r"\d{4}-\d{2}-\d{2}( \d{2}:\d{2}:\d{2} \(UTC\)|T\d{2}:\d{2}:\d{2}(\.\d+)?Z)",
+		)
+		.unwrap();
+		let size = Regex::new(r"\d+(\.\d+)? (B|KiB|MiB|GiB|TiB)\b").unwrap();
+		let count = Regex::new(r"(?m) \d+$").unwrap();
+
+		let output = ansi.replace_all(output, "");
+		let output = output.replace(test_dir_name, "<dir>");
+		let output = uuid.replace_all(&output, "<uuid>");
+		let output = time.replace_all(&output, "<time>");
+		let output = size.replace_all(&output, "<size>");
+		count.replace_all(&output, " <count>").into_owned()
+	}
+
+	/// A `--json` listing of account-wide items, an array of item objects, cut down to this
+	/// test's items: those with a string field that contains `marker`. Each item is kept as
+	/// printed, so the snapshot still shows the listing's shape.
+	fn json_listing_containing(stdout: &[u8], marker: &str) -> String {
+		let listing = json_listing(stdout);
+		let items = listing
+			.into_iter()
+			.filter(|item| {
+				item.as_object().is_some_and(|fields| {
+					fields
+						.values()
+						.any(|value| value.as_str().is_some_and(|value| value.contains(marker)))
+				})
+			})
+			.collect::<Vec<_>>();
+		serde_json::to_string_pretty(&items).unwrap()
+	}
+
+	/// The items of a `--json` listing.
+	fn json_listing(stdout: &[u8]) -> Vec<serde_json::Value> {
+		serde_json::from_slice(stdout).unwrap_or_else(|e| {
+			panic!(
+				"not a JSON array of items ({e}):\n{}",
+				String::from_utf8_lossy(stdout)
+			)
+		})
+	}
 
 	/// Polls `list-recents` until it lists `path`, and returns its stdout then.
 	async fn list_recents_until_listed(path: &str) -> Vec<u8> {
@@ -314,5 +366,105 @@ mod live {
 				.unwrap()
 				.is_none()
 		);
+	}
+
+	#[shared_test_runtime]
+	async fn stat_of_a_file_snapshot() {
+		let resources = test_utils::RESOURCES.get_resources().await;
+		let client = &resources.client;
+		let test_dir = &resources.dir;
+		let test_dir_name = test_dir.name().unwrap();
+		let file = client
+			.make_file_builder("stat_snapshot.txt", test_dir.uuid)
+			.unwrap();
+		client.upload_file(file, &[7u8; 1024]).await.unwrap();
+
+		let assert =
+			authenticated_cli_with_args!("stat", &format!("{test_dir_name}/stat_snapshot.txt"))
+				.success();
+
+		insta::assert_snapshot!(
+			"stat_file",
+			redact(
+				&String::from_utf8_lossy(&assert.get_output().stdout),
+				test_dir_name
+			)
+		);
+	}
+
+	#[shared_test_runtime]
+	async fn stat_of_a_directory_snapshot() {
+		let resources = test_utils::RESOURCES.get_resources().await;
+		let client = &resources.client;
+		let test_dir = &resources.dir;
+		let test_dir_name = test_dir.name().unwrap();
+		client
+			.create_dir(&test_dir.into(), "stat_snapshot_dir")
+			.await
+			.unwrap();
+
+		let assert =
+			authenticated_cli_with_args!("stat", &format!("{test_dir_name}/stat_snapshot_dir"))
+				.success();
+
+		insta::assert_snapshot!(
+			"stat_directory",
+			redact(
+				&String::from_utf8_lossy(&assert.get_output().stdout),
+				test_dir_name
+			)
+		);
+	}
+
+	#[shared_test_runtime]
+	async fn list_trash_snapshot() {
+		let resources = test_utils::RESOURCES.get_resources().await;
+		let client = &resources.client;
+		let test_dir = &resources.dir;
+		// so that no other test empties the trash between trashing the file and listing it
+		let _trash_lock = client
+			.acquire_lock_with_default(test_utils::locks::TRASH)
+			.await
+			.unwrap();
+		// The trash lists bare names and holds every test's items, so the test directory's UUID
+		// in the names tells this test's items apart.
+		let marker = test_dir.uuid().to_string();
+		let file = client
+			.make_file_builder(&format!("trashed_{marker}.txt"), test_dir.uuid)
+			.unwrap();
+		let mut file = client.upload_file(file, b"content").await.unwrap();
+		client.trash_file(&mut file).await.unwrap();
+		let mut dir = client
+			.create_dir(&test_dir.into(), &format!("trashed_dir_{marker}"))
+			.await
+			.unwrap();
+		client.trash_dir(&mut dir).await.unwrap();
+
+		let assert = authenticated_cli_with_args!("list-trash", "--json").success();
+		let listed = json_listing_containing(&assert.get_output().stdout, &marker);
+		client.delete_file_permanently(file).await.unwrap();
+		client.delete_dir_permanently(dir).await.unwrap();
+
+		insta::assert_snapshot!("list_trash", redact(&listed, test_dir.name().unwrap()));
+	}
+
+	#[shared_test_runtime]
+	async fn list_recents_snapshot() {
+		let resources = test_utils::RESOURCES.get_resources().await;
+		let client = &resources.client;
+		let test_dir = &resources.dir;
+		let test_dir_name = test_dir.name().unwrap();
+		let file = client
+			.make_file_builder("recents_snapshot.txt", test_dir.uuid)
+			.unwrap();
+		client.upload_file(file, b"content").await.unwrap();
+
+		let path = format!("/{test_dir_name}/recents_snapshot.txt");
+		list_recents_until_listed(&path).await;
+
+		let assert = authenticated_cli_with_args!("list-recents", "--json").success();
+		// only the uploaded file's path: the test directory itself may be listed or not
+		let listed = json_listing_containing(&assert.get_output().stdout, &path);
+		insta::assert_snapshot!("list_recents", redact(&listed, test_dir_name));
 	}
 }

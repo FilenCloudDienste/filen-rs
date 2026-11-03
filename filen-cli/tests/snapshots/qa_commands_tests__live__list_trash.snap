@@ -1,0 +1,23 @@
+---
+source: filen-cli/tests/qa_commands_tests.rs
+expression: "redact(&listed, test_dir.name().unwrap())"
+---
+[
+  {
+    "color": "default",
+    "created": "<time>",
+    "favorited": false,
+    "name": "trashed_dir_<uuid>",
+    "type": "directory",
+    "uuid": "<uuid>"
+  },
+  {
+    "created": "<time>",
+    "favorited": false,
+    "modified": "<time>",
+    "name": "trashed_<uuid>.txt",
+    "size": 7,
+    "type": "file",
+    "uuid": "<uuid>"
+  }
+]

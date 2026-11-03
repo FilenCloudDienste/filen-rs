@@ -1,0 +1,12 @@
+---
+source: filen-cli/tests/qa_commands_tests.rs
+expression: "redact(&String::from_utf8_lossy(&assert.get_output().stdout), test_dir_name)"
+---
+       Name stat_snapshot_dir
+       Type Directory
+       Size <size>
+      Files <count>
+Directories <count>
+    Created <time>
+      Color default
+       UUID <uuid>
