@@ -488,14 +488,7 @@ async fn inner_main(ui: &mut ui::UI, arenas_limited: bool) -> Result<Finished> {
 		.await;
 	}
 
-	let client_config_args = ClientConfigArgs {
-		concurrency: cli_args.concurrency,
-		requests_per_sec: cli_args.requests_per_sec,
-		upload_bandwidth_kbps: cli_args.upload_bandwidth_kbps,
-		download_bandwidth_kbps: cli_args.download_bandwidth_kbps,
-		memory_budget_bytes: cli_args.memory_budget_bytes,
-		connect_timeout_secs: cli_args.connect_timeout_secs,
-	};
+	let client_config_args = ClientConfigArgs::from(&cli_args);
 
 	let mut client = auth::LazyClient::new(
 		config.clone(),
@@ -986,7 +979,7 @@ const AUTH_CONFIG_PREFIX: &str = "filen_cli_auth_config_1:";
 /// Raw CLI-provided overrides for [`ClientConfig`]. Kept separate from `ClientConfig` itself
 /// (which isn't `Clone`) so it can be cheaply threaded through the several auth code paths and
 /// used to build a fresh `ClientConfig` at whichever one actually ends up authenticating.
-#[derive(Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ClientConfigArgs {
 	pub concurrency: Option<usize>,
 	pub requests_per_sec: Option<NonZeroU32>,
@@ -996,6 +989,19 @@ pub struct ClientConfigArgs {
 	/// `Some(0)` disables the connect timeout; `Some(n)` (n > 0) sets it to `n` seconds; `None`
 	/// leaves the SDK default in place.
 	pub connect_timeout_secs: Option<u64>,
+}
+
+impl From<&CliArgs> for ClientConfigArgs {
+	fn from(args: &CliArgs) -> Self {
+		Self {
+			concurrency: args.concurrency,
+			requests_per_sec: args.requests_per_sec,
+			upload_bandwidth_kbps: args.upload_bandwidth_kbps,
+			download_bandwidth_kbps: args.download_bandwidth_kbps,
+			memory_budget_bytes: args.memory_budget_bytes,
+			connect_timeout_secs: args.connect_timeout_secs,
+		}
+	}
 }
 
 pub fn build_client_config(args: &ClientConfigArgs) -> ClientConfig {
@@ -1448,5 +1454,57 @@ mod tests {
 			assert!(arg.get_env().is_some(), "{id} is read from the environment");
 			assert!(arg.is_hide_env_values_set(), "{id}'s value is hidden");
 		}
+	}
+
+	/// What every client tuning flag set to a distinct value parses into.
+	const ALL_CLIENT_CONFIG_ARGS: ClientConfigArgs = ClientConfigArgs {
+		concurrency: Some(4),
+		requests_per_sec: NonZeroU32::new(5),
+		upload_bandwidth_kbps: NonZeroU32::new(6),
+		download_bandwidth_kbps: NonZeroU32::new(7),
+		memory_budget_bytes: Some(8),
+		connect_timeout_secs: Some(9),
+	};
+
+	/// Every client tuning flag, each set to its value in [`ALL_CLIENT_CONFIG_ARGS`].
+	const CLIENT_CONFIG_FLAGS: [&str; 12] = [
+		"--concurrency",
+		"4",
+		"--requests-per-sec",
+		"5",
+		"--upload-bandwidth-kbps",
+		"6",
+		"--download-bandwidth-kbps",
+		"7",
+		"--memory-budget-bytes",
+		"8",
+		"--connect-timeout-secs",
+		"9",
+	];
+
+	#[test]
+	fn the_client_tuning_flags_before_the_command_fill_the_client_config_args() {
+		let args = ["filen"]
+			.into_iter()
+			.chain(CLIENT_CONFIG_FLAGS)
+			.chain(["ls"]);
+		let cli_args = parse_args(args).unwrap().args;
+		assert_eq!(ClientConfigArgs::from(&cli_args), ALL_CLIENT_CONFIG_ARGS);
+	}
+
+	#[test]
+	fn the_client_tuning_flags_after_the_command_fill_the_client_config_args() {
+		let args = ["filen", "ls"].into_iter().chain(CLIENT_CONFIG_FLAGS);
+		let cli_args = parse_args(args).unwrap().args;
+		assert_eq!(ClientConfigArgs::from(&cli_args), ALL_CLIENT_CONFIG_ARGS);
+	}
+
+	#[test]
+	fn without_client_tuning_flags_the_client_config_args_keep_the_sdk_defaults() {
+		let cli_args = parse_args(["filen", "ls"]).unwrap().args;
+		assert_eq!(
+			ClientConfigArgs::from(&cli_args),
+			ClientConfigArgs::default()
+		);
 	}
 }
