@@ -90,6 +90,9 @@ pub(crate) enum RcloneCommands {
 		/// The maximum cache size (e.g. "500Mi", "10Gi") (default: 32Gi)
 		#[arg(long, value_parser = parse_size)]
 		cache_size: Option<u64>,
+		/// Mount the drive read-only
+		#[arg(long)]
+		read_only: bool,
 	},
 	/// Runs a WebDAV, S3, FTP, SFTP, HTTP, restic or NFS server exposing your Filen drive
 	Serve {
@@ -212,7 +215,8 @@ impl RcloneCommands {
 			Self::Mount {
 				mount_point,
 				cache_size,
-			} => mount(config, ui, client, mount_point, cache_size).await?,
+				read_only,
+			} => mount(config, ui, client, mount_point, cache_size, read_only).await?,
 			Self::Serve {
 				server,
 				address,
@@ -312,6 +316,7 @@ pub(crate) async fn mount(
 	client: &mut LazyClient,
 	mount_point: Option<String>,
 	cache_size: Option<u64>,
+	read_only: bool,
 ) -> Result<()> {
 	let client = client.get(ui).await?;
 	let mount_point = match mount_point {
@@ -323,7 +328,7 @@ pub(crate) async fn mount(
 		.daemon
 		.mount(MountOptions {
 			mount_point,
-			read_only: false,
+			read_only,
 		})
 		.await
 		.map_err(|e| {
@@ -802,6 +807,24 @@ mod tests {
 			panic!("{args:?} parsed as another command");
 		};
 		command
+	}
+
+	#[test]
+	fn mount_is_read_write_unless_asked_to_be_read_only() {
+		assert!(matches!(
+			parsed_command(&["filen", "mount"]),
+			RcloneCommands::Mount {
+				read_only: false,
+				..
+			}
+		));
+		assert!(matches!(
+			parsed_command(&["filen", "mount", "/mnt/filen", "--read-only"]),
+			RcloneCommands::Mount {
+				read_only: true,
+				..
+			}
+		));
 	}
 
 	#[test]
