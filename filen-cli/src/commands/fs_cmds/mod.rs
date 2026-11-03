@@ -3,6 +3,7 @@ use std::{
 	cmp::Ordering,
 	env::{self, VarError},
 	ffi::OsStr,
+	fmt,
 	fs::{self, File},
 	io::{self, BufRead as _, BufReader, IsTerminal as _, Read as _},
 	iter::Peekable,
@@ -65,7 +66,9 @@ mod operand;
 mod tree;
 mod versions;
 
-use operand::{ItemOperand, operand_path, path_of, resolve_item};
+use operand::{
+	Given, GivenItem, ItemOperand, expand_all, operand_path, parse_operands, path_of, resolve_item,
+};
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum FsCommands {
@@ -107,12 +110,12 @@ pub(crate) enum FsCommands {
 		#[arg(short = 's', long)]
 		summarize: bool,
 	},
-	/// Print the contents of a file as the bytes it holds (with --json: {"text": ...}, for UTF-8
-	/// text only)
+	/// Print the contents of files as the bytes they hold, one after the other (with --json:
+	/// {"text": ...}, for UTF-8 text only)
 	Cat {
-		/// File to print
-		#[arg(add = FilenCompleter::file())]
-		file: String,
+		/// Files to print, or globs such as '*.txt' (quoted)
+		#[arg(add = FilenCompleter::file(), required = true)]
+		files: Vec<String>,
 	},
 	/// Print the first lines of a file as the bytes they hold (with --json: {"text": ...})
 	Head {
@@ -177,13 +180,13 @@ pub(crate) enum FsCommands {
 		#[arg(short, long)]
 		recursive: bool,
 	},
-	/// Remove a file or directory
+	/// Remove files or directories
 	Rm {
-		/// File or directory to remove
-		#[arg(add = FilenCompleter::file_or_directory())]
-		file_or_directory: String,
-		/// Permanently delete the file or directory, asking first unless --yes is given (default:
-		/// move to trash)
+		/// Files or directories to remove, or globs such as '*.txt' (quoted)
+		#[arg(add = FilenCompleter::file_or_directory(), required = true)]
+		files_or_directories: Vec<String>,
+		/// Permanently delete the files or directories, asking first unless --yes is given
+		/// (default: move to trash)
 		#[arg(short, long)]
 		permanent: bool,
 	},
@@ -202,23 +205,23 @@ pub(crate) enum FsCommands {
 		#[arg(add = FilenCompleter::file())]
 		file: String,
 	},
-	/// Move and/or rename a file or directory
+	/// Move and/or rename files or directories
 	Mv {
-		/// Source file or directory
-		#[arg(add = FilenCompleter::file_or_directory())]
-		source: String,
-		/// Destination: an existing directory to move the source into,
-		/// or the new path of the source (to move and/or rename it)
+		/// Files or directories to move, or globs such as '*.txt' (quoted)
+		#[arg(add = FilenCompleter::file_or_directory(), required = true)]
+		sources: Vec<String>,
+		/// Destination: an existing directory to move the sources into,
+		/// or, for one source, its new path (to move and/or rename it)
 		#[arg(add = FilenCompleter::file_or_directory())]
 		destination: String,
 	},
-	/// Copy a file or directory
+	/// Copy files or directories
 	Cp {
-		/// Source file or directory
-		#[arg(add = FilenCompleter::file_or_directory())]
-		source: String,
-		/// Destination: an existing directory to copy the source into,
-		/// or the path of the copy (to copy it under a new name)
+		/// Files or directories to copy, or globs such as '*.txt' (quoted)
+		#[arg(add = FilenCompleter::file_or_directory(), required = true)]
+		sources: Vec<String>,
+		/// Destination: an existing directory to copy the sources into,
+		/// or, for one source, the path of the copy (to copy it under a new name)
 		#[arg(add = FilenCompleter::file_or_directory())]
 		destination: String,
 	},
@@ -236,17 +239,17 @@ pub(crate) enum FsCommands {
 	},
 	/// List favorited items
 	ListFavorites,
-	/// Favorite a file or directory
+	/// Favorite files or directories
 	Favorite {
-		/// File or directory to favorite
-		#[arg(add = FilenCompleter::file_or_directory())]
-		file_or_directory: String,
+		/// Files or directories to favorite, or globs such as '*.txt' (quoted)
+		#[arg(add = FilenCompleter::file_or_directory(), required = true)]
+		files_or_directories: Vec<String>,
 	},
-	/// Unfavorite a file or directory
+	/// Unfavorite files or directories
 	Unfavorite {
-		/// File or directory to unfavorite
-		#[arg(add = FilenCompleter::file_or_directory())]
-		file_or_directory: String,
+		/// Files or directories to unfavorite, or globs such as '*.txt' (quoted)
+		#[arg(add = FilenCompleter::file_or_directory(), required = true)]
+		files_or_directories: Vec<String>,
 	},
 	/// Set the color of a directory
 	Color {
@@ -369,9 +372,7 @@ impl FsCommands {
 					ItemOperand::parse(working_path, file_or_directory.as_deref().unwrap_or(""))?;
 				tree::print_disk_usage(ui, client, &path, summarize).await?;
 			}
-			Self::Cat { file } => {
-				print_file(ui, client, working_path, &file, PrintFileLines::Full).await?;
-			}
+			Self::Cat { files } => print_files(ui, client, working_path, &files).await?,
 			Self::Head { file, lines } => {
 				print_file(ui, client, working_path, &file, PrintFileLines::Head(lines)).await?;
 			}
@@ -402,27 +403,33 @@ impl FsCommands {
 				create_directory(ui, client, working_path, &directory, recursive).await?;
 			}
 			Self::Rm {
-				file_or_directory,
+				files_or_directories,
 				permanent,
 			} => {
-				delete_file_or_directory(ui, client, working_path, &file_or_directory, permanent)
-					.await?;
+				delete_files_or_directories(
+					ui,
+					client,
+					working_path,
+					&files_or_directories,
+					permanent,
+				)
+				.await?;
 			}
 			Self::Write { file, content } => {
 				write_file(ui, client, working_path, &file, &content).await?;
 			}
 			Self::Touch { file } => touch_file(ui, client, working_path, &file).await?,
 			Self::Mv {
-				source,
+				sources,
 				destination,
 			} => {
-				move_file_or_directory(ui, client, working_path, &source, &destination).await?;
+				move_files_or_directories(ui, client, working_path, &sources, &destination).await?;
 			}
 			Self::Cp {
-				source,
+				sources,
 				destination,
 			} => {
-				copy_file_or_directory(ui, client, working_path, &source, &destination).await?;
+				copy_files_or_directories(ui, client, working_path, &sources, &destination).await?;
 			}
 			Self::Versions {
 				file,
@@ -434,13 +441,15 @@ impl FsCommands {
 				versions::file_versions(ui, client, &path, action).await?;
 			}
 			Self::ListFavorites => list_favorites(ui, client).await?,
-			Self::Favorite { file_or_directory } => {
-				set_file_or_directory_favorite(ui, client, working_path, &file_or_directory, true)
-					.await?;
+			Self::Favorite {
+				files_or_directories,
+			} => {
+				set_favorites(ui, client, working_path, &files_or_directories, true).await?;
 			}
-			Self::Unfavorite { file_or_directory } => {
-				set_file_or_directory_favorite(ui, client, working_path, &file_or_directory, false)
-					.await?;
+			Self::Unfavorite {
+				files_or_directories,
+			} => {
+				set_favorites(ui, client, working_path, &files_or_directories, false).await?;
 			}
 			Self::Color { directory, color } => {
 				let path = ItemOperand::parse(working_path, &directory)?;
@@ -801,7 +810,6 @@ pub(crate) async fn list_directory_by_dir(
 }
 
 pub(crate) enum PrintFileLines {
-	Full,
 	Head(usize),
 	Tail(usize),
 }
@@ -829,17 +837,62 @@ fn confirm_printing_file(ui: &mut UI, size: u64) -> Result<bool> {
 impl PrintFileLines {
 	fn command(&self) -> &'static str {
 		match self {
-			Self::Full => "cat",
 			Self::Head(_) => "head",
 			Self::Tail(_) => "tail",
 		}
 	}
 }
 
-/// Prints a file's content, or its first or last lines, as the bytes it holds, with no newline
-/// added: streamed to stdout as they download, but for the last lines, which are printed once it
-/// is found where they start. With `--json`, the printed part is collected
-/// and printed as `{"text": ...}`, which only UTF-8 text can be.
+/// Prints the contents of the files `operands` name one after the other, as `cat` does: each as
+/// the bytes it holds, streamed to stdout as it downloads, with nothing added. With `--json`, it
+/// is collected and printed as `{"text": ...}`, which only UTF-8 text can be. Several files larger
+/// together than a terminal prints without asking are asked about once.
+pub(crate) async fn print_files(
+	ui: &mut UI,
+	client: &mut LazyClient,
+	working_path: &RemotePath,
+	operands: &[String],
+) -> Result<()> {
+	let operands = parse_operands(working_path, operands)?;
+	let client = client.get(ui).await?;
+	let Given {
+		items,
+		mut failures,
+	} = expand_all(ui, client, operands, "file").await?;
+	let mut files = Vec::with_capacity(items.len());
+	for GivenItem { operand, item } in items {
+		match item {
+			NonRootFileType::File(file) => files.push((operand, file)),
+			NonRootFileType::Dir(_) | NonRootFileType::Root(_) => {
+				failures.record(ui, Err(UI::failure(&format!("Not a file: {}", operand))))?
+			}
+		}
+	}
+	if files.is_empty() {
+		return failures.finish("printed");
+	}
+	let size = files
+		.iter()
+		.fold(0u64, |size, (_, file)| size.saturating_add(file.size()));
+	if !confirm_printing_file(ui, size)? {
+		return failures.finish("printed");
+	}
+	let mut out = PrintedContent::of(ui);
+	for (_, file) in &files {
+		print_from_reader(ui, &mut out, client.get_file_reader(&**file), None).await?;
+	}
+	let printed = match files.as_slice() {
+		[(operand, _)] => operand.to_string(),
+		_ => "the files given".to_owned(),
+	};
+	out.finish(ui, &printed, "cat")?;
+	failures.finish("printed")
+}
+
+/// Prints a file's first or last lines as the bytes they hold, with no newline added: the first
+/// streamed to stdout as they download, the last once it is found where they start. With
+/// `--json`, the printed part is collected and printed as `{"text": ...}`, which only UTF-8 text
+/// can be.
 pub(crate) async fn print_file(
 	ui: &mut UI,
 	client: &mut LazyClient,
@@ -853,15 +906,8 @@ pub(crate) async fn print_file(
 	if !confirm_printing_file(ui, file.size())? {
 		return Ok(());
 	}
-	let mut out = if ui.json {
-		PrintedContent::Json(Vec::new())
-	} else {
-		PrintedContent::Stdout
-	};
+	let mut out = PrintedContent::of(ui);
 	match lines {
-		PrintFileLines::Full => {
-			print_from_reader(ui, &mut out, client.get_file_reader(&*file), None).await?;
-		}
 		// nothing to download
 		PrintFileLines::Head(0) | PrintFileLines::Tail(0) => {}
 		PrintFileLines::Head(n) => {
@@ -892,19 +938,10 @@ pub(crate) async fn print_file(
 			}
 		}
 	}
-	if let PrintedContent::Json(content) = out {
-		let text = String::from_utf8(content).map_err(|_| {
-			UI::failure(&format!(
-				"Not UTF-8 text: {operand}. Use {} without --json for binary content",
-				lines.command()
-			))
-		})?;
-		ui.print_json(json!({ "text": text }))?;
-	}
-	Ok(())
+	out.finish(ui, &operand.to_string(), lines.command())
 }
 
-/// Where [`print_file`] puts the content it prints.
+/// Where [`print_files`] and [`print_file`] put the content they print.
 enum PrintedContent {
 	/// Straight to stdout.
 	Stdout,
@@ -913,6 +950,29 @@ enum PrintedContent {
 }
 
 impl PrintedContent {
+	/// Straight to stdout, or with `--json` collected.
+	fn of(ui: &UI) -> Self {
+		if ui.json {
+			Self::Json(Vec::new())
+		} else {
+			Self::Stdout
+		}
+	}
+
+	/// Prints what was collected as `{"text": ...}`: `printed` (what `command` printed), which
+	/// only UTF-8 text can be.
+	fn finish(self, ui: &mut UI, printed: &str, command: &str) -> Result<()> {
+		let Self::Json(content) = self else {
+			return Ok(());
+		};
+		let text = String::from_utf8(content).map_err(|_| {
+			UI::failure(&format!(
+				"Not UTF-8 text: {printed}. Use {command} without --json for binary content"
+			))
+		})?;
+		ui.print_json(json!({ "text": text }))
+	}
+
 	fn write(&mut self, ui: &mut UI, bytes: &[u8]) -> Result<()> {
 		match self {
 			Self::Stdout => ui.write_stdout_bytes(bytes),
@@ -1718,24 +1778,53 @@ pub(crate) async fn create_directory_(
 		.context("Failed to create directory")
 }
 
-pub(crate) async fn delete_file_or_directory(
+/// Trashes, or permanently deletes, the items `operands` name. Permanently deleting asks once,
+/// about all of them.
+pub(crate) async fn delete_files_or_directories(
 	ui: &mut UI,
 	client: &mut LazyClient,
 	working_path: &RemotePath,
-	file_or_directory_str: &str,
+	operands: &[String],
 	permanent: bool,
 ) -> Result<()> {
-	let operand = ItemOperand::parse(working_path, file_or_directory_str)?;
-	let confirmation = format!("Permanently delete {}?", operand);
-	// before logging in and looking the item up, so that a script missing --yes fails at once
+	let operands = parse_operands(working_path, operands)?;
+	// before logging in and looking the items up, so that a script missing --yes fails at once
 	if permanent {
-		ui.ensure_can_confirm(&confirmation)?;
+		ui.ensure_can_confirm(&deletion_confirmation(&operands))?;
 	}
 	let client = client.get(ui).await?;
-	let item = resolve_item(client, &operand, "file or directory").await?;
-	if permanent && !ui.prompt_confirm(&confirmation, false)? {
-		return Ok(());
+	let Given {
+		items,
+		mut failures,
+	} = expand_all(ui, client, operands, "file or directory").await?;
+	let done = if permanent {
+		"permanently deleted"
+	} else {
+		"trashed"
+	};
+	if permanent && !items.is_empty() {
+		let named = items
+			.iter()
+			.map(|given| &given.operand)
+			.collect::<Vec<&ItemOperand>>();
+		if !ui.prompt_confirm(&deletion_confirmation(&named), false)? {
+			return failures.finish(done);
+		}
 	}
+	for given in items {
+		let deleted = delete_item(ui, client, given, permanent).await;
+		failures.record(ui, deleted)?;
+	}
+	failures.finish(done)
+}
+
+/// Trashes, or permanently deletes, one item.
+async fn delete_item(
+	ui: &mut UI,
+	client: &Client,
+	GivenItem { operand, item }: GivenItem<'_>,
+	permanent: bool,
+) -> Result<()> {
 	match item {
 		NonRootFileType::File(mut file) => {
 			if permanent {
@@ -1941,21 +2030,45 @@ fn stdin_reader() -> impl AsyncRead + Unpin {
 	receiver.into_async_read()
 }
 
-/// Moves and/or renames a file or directory, following the semantics of the Unix `mv`:
-/// if the destination is an existing directory, the source is moved into it under its
+/// Moves and/or renames files or directories, following the semantics of the Unix `mv`:
+/// if the destination is an existing directory, each source is moved into it under its
 /// current name; otherwise the destination names the source's new path, so the source is
 /// moved to that path's parent directory and renamed to that path's base name. A destination
-/// ending in '/' must be an existing directory.
-pub(crate) async fn move_file_or_directory(
+/// ending in '/', or given for several sources, must be an existing directory.
+pub(crate) async fn move_files_or_directories(
 	ui: &mut UI,
 	client: &mut LazyClient,
 	working_path: &RemotePath,
-	source_str: &str,
+	sources: &[String],
 	destination_str: &str,
 ) -> Result<()> {
-	let source_operand = ItemOperand::parse(working_path, source_str)?;
+	let sources = parse_operands(working_path, sources)?;
 	let client = client.get(ui).await?;
-	let source = resolve_item(client, &source_operand, "source file or directory").await?;
+	let Given {
+		items,
+		mut failures,
+	} = expand_all(ui, client, sources, "source file or directory").await?;
+	if items.is_empty() {
+		return failures.finish("moved");
+	}
+	let destination =
+		destination_path(client, working_path, destination_str, failures.given()).await?;
+	for source in items {
+		let moved = move_item(ui, client, source, &destination).await;
+		failures.record(ui, moved)?;
+	}
+	failures.finish("moved")
+}
+
+async fn move_item(
+	ui: &mut UI,
+	client: &Client,
+	GivenItem {
+		operand: source_operand,
+		item: source,
+	}: GivenItem<'_>,
+	destination: &DestinationPath,
+) -> Result<()> {
 	let source_filename = match &source {
 		NonRootFileType::File(file) => file.name(),
 		NonRootFileType::Dir(dir) => dir.name(),
@@ -1963,8 +2076,6 @@ pub(crate) async fn move_file_or_directory(
 	}
 	.context("Failed to decrypt source name")?;
 	let source_path = path_of(client, &source_operand, &source).await?;
-	let (destination_path, must_be_a_directory) =
-		destination_path(client, working_path, destination_str).await?;
 	let Destination {
 		dir: destination_dir,
 		name: new_name,
@@ -1977,8 +2088,7 @@ pub(crate) async fn move_file_or_directory(
 			name: source_filename,
 			uuid: source.uuid(),
 		},
-		&destination_path,
-		must_be_a_directory,
+		destination,
 	)
 	.await?;
 
@@ -2178,21 +2288,55 @@ fn is_inside(path: &RemotePath, ancestor: &RemotePath) -> bool {
 		.is_some_and(|rest| rest.starts_with('/'))
 }
 
-/// The destination path a `mv` or `cp` was given as `destination_str`, and whether it must be an
-/// existing directory, as one written with a trailing '/' or named by its UUID must.
+/// The destination a `mv` or `cp` was given.
+struct DestinationPath {
+	path: RemotePath,
+	/// The destination must be an existing directory to put the sources into, as one written with
+	/// a trailing '/', named by its UUID or given for several sources must.
+	must_be_a_directory: bool,
+}
+
+/// The destination a `mv` or `cp` of `sources` items was given as `destination_str`. For several
+/// sources, it is checked to be an existing directory before any is moved or copied.
 async fn destination_path(
 	client: &Client,
 	working_path: &RemotePath,
 	destination_str: &str,
-) -> Result<(RemotePath, bool)> {
-	match ItemOperand::parse(working_path, destination_str)? {
+	sources: usize,
+) -> Result<DestinationPath> {
+	let destination = match ItemOperand::parse(working_path, destination_str)? {
 		// before navigating, which drops the trailing '/'
-		ItemOperand::Path(path) => Ok((path, names_a_directory(destination_str))),
-		operand => Ok((
-			operand_path(client, &operand, "destination directory").await?,
-			true,
-		)),
+		ItemOperand::Path(path) => DestinationPath {
+			path,
+			must_be_a_directory: names_a_directory(destination_str) || sources > 1,
+		},
+		operand => DestinationPath {
+			path: operand_path(client, &operand, "destination directory").await?,
+			must_be_a_directory: true,
+		},
+	};
+	if sources > 1 {
+		match client
+			.find_item_at_path(&destination.path.0)
+			.await
+			.context("Failed to find destination")?
+		{
+			Some(NonRootFileType::Dir(_) | NonRootFileType::Root(_)) => {}
+			Some(NonRootFileType::File(_)) => {
+				return Err(UI::failure(&format!(
+					"Not a directory: {}",
+					destination.path
+				)));
+			}
+			None => {
+				return Err(UI::failure(&format!(
+					"No such destination directory: {}",
+					destination.path
+				)));
+			}
+		}
 	}
+	Ok(destination)
 }
 
 /// Resolves the `destination_path` of a `mv` or `cp` into the directory the source ends up
@@ -2208,8 +2352,10 @@ async fn resolve_destination<'a>(
 	client: &'a Client,
 	placement: Placement,
 	source: &Source<'_>,
-	destination_path: &RemotePath,
-	must_be_a_directory: bool,
+	DestinationPath {
+		path: destination_path,
+		must_be_a_directory,
+	}: &DestinationPath,
 ) -> Result<Destination<'a>> {
 	let found_item = client
 		.find_item_at_path(&destination_path.0)
@@ -2225,7 +2371,7 @@ async fn resolve_destination<'a>(
 		source,
 		destination_path,
 		found,
-		must_be_a_directory,
+		*must_be_a_directory,
 	)?;
 	let dir = match found_item {
 		// an existing directory at the destination takes the source (`Target::Into`), so it is
@@ -2278,20 +2424,45 @@ async fn resolve_destination<'a>(
 	Ok(Destination { dir, name, path })
 }
 
-/// Copies a file or directory, following the semantics of the Unix `cp`: if the destination is
-/// an existing directory, the copy is put into it under the source's name; otherwise the
+/// Copies files or directories, following the semantics of the Unix `cp`: if the destination is
+/// an existing directory, each copy is put into it under its source's name; otherwise the
 /// destination names the copy's path, so the copy is put into that path's parent directory under
-/// that path's base name. A destination ending in '/' must be an existing directory.
-pub(crate) async fn copy_file_or_directory(
+/// that path's base name. A destination ending in '/', or given for several sources, must be an
+/// existing directory. Each source is copied by a copy job of its own, one after the other.
+pub(crate) async fn copy_files_or_directories(
 	ui: &mut UI,
 	client: &mut LazyClient,
 	working_path: &RemotePath,
-	source_str: &str,
+	sources: &[String],
 	destination_str: &str,
 ) -> Result<()> {
-	let source_operand = ItemOperand::parse(working_path, source_str)?;
+	let sources = parse_operands(working_path, sources)?;
 	let client = client.get(ui).await?;
-	let source = resolve_item(client, &source_operand, "source file or directory").await?;
+	let Given {
+		items,
+		mut failures,
+	} = expand_all(ui, client, sources, "source file or directory").await?;
+	if items.is_empty() {
+		return failures.finish("copied");
+	}
+	let destination =
+		destination_path(client, working_path, destination_str, failures.given()).await?;
+	for source in items {
+		let copied = copy_item(ui, client, source, &destination).await;
+		failures.record(ui, copied)?;
+	}
+	failures.finish("copied")
+}
+
+async fn copy_item(
+	ui: &mut UI,
+	client: &Arc<Client>,
+	GivenItem {
+		operand: source_operand,
+		item: source,
+	}: GivenItem<'_>,
+	destination: &DestinationPath,
+) -> Result<()> {
 	let source_name = match &source {
 		NonRootFileType::File(file) => file.name(),
 		NonRootFileType::Dir(dir) => dir.name(),
@@ -2299,8 +2470,6 @@ pub(crate) async fn copy_file_or_directory(
 	}
 	.context("Failed to decrypt source name")?;
 	let source_path = path_of(client, &source_operand, &source).await?;
-	let (destination_path, must_be_a_directory) =
-		destination_path(client, working_path, destination_str).await?;
 	let destination = resolve_destination(
 		client,
 		Placement::Copy,
@@ -2309,8 +2478,7 @@ pub(crate) async fn copy_file_or_directory(
 			name: source_name,
 			uuid: source.uuid(),
 		},
-		&destination_path,
-		must_be_a_directory,
+		destination,
 	)
 	.await?;
 	// the source's own name is left to the copy, which also copies a name today's rules reject
@@ -2671,16 +2839,34 @@ async fn set_directory_color(
 	Ok(())
 }
 
-pub(crate) async fn set_file_or_directory_favorite(
+/// Favorites, or unfavorites, the items `operands` name.
+pub(crate) async fn set_favorites(
 	ui: &mut UI,
 	client: &mut LazyClient,
 	working_path: &RemotePath,
-	file_or_directory_str: &str,
+	operands: &[String],
 	favorite: bool,
 ) -> Result<()> {
-	let operand = ItemOperand::parse(working_path, file_or_directory_str)?;
+	let operands = parse_operands(working_path, operands)?;
 	let client = client.get(ui).await?;
-	match resolve_item(client, &operand, "file or directory").await? {
+	let Given {
+		items,
+		mut failures,
+	} = expand_all(ui, client, operands, "file or directory").await?;
+	for given in items {
+		let set = set_favorite(ui, client, given, favorite).await;
+		failures.record(ui, set)?;
+	}
+	failures.finish(if favorite { "favorited" } else { "unfavorited" })
+}
+
+async fn set_favorite(
+	ui: &mut UI,
+	client: &Client,
+	GivenItem { operand, item }: GivenItem<'_>,
+	favorite: bool,
+) -> Result<()> {
+	match item {
 		NonRootFileType::File(mut file) => {
 			client
 				.set_file_favorite(file.to_mut(), favorite)
@@ -2961,7 +3147,7 @@ async fn delete_trash_items(
 			return select_trash_item(ui, client, TrashAction::Delete).await;
 		}
 		TrashSelection::All => "Permanently delete all trashed items?".to_owned(),
-		TrashSelection::Named(operands) => trash_deletion_confirmation(operands),
+		TrashSelection::Named(operands) => deletion_confirmation(operands),
 	};
 	// before logging in and listing the trash, so that a script missing --yes fails at once
 	ui.ensure_can_confirm(&confirmation)?;
@@ -2975,16 +3161,16 @@ async fn delete_trash_items(
 		.iter()
 		.map(|entry| entry.listed.name.as_str())
 		.collect::<Vec<&str>>();
-	if !ui.prompt_confirm(&trash_deletion_confirmation(&names), false)? {
+	if !ui.prompt_confirm(&deletion_confirmation(&names), false)? {
 		return Ok(());
 	}
 	act_on_trash_entries(ui, client, entries, TrashAction::Delete).await
 }
 
-/// What deleting the trashed items `names` asks first.
-fn trash_deletion_confirmation(names: &[impl AsRef<str>]) -> String {
+/// What permanently deleting the items `names` asks first.
+fn deletion_confirmation(names: &[impl fmt::Display]) -> String {
 	match names {
-		[name] => format!("Permanently delete {}?", name.as_ref()),
+		[name] => format!("Permanently delete {}?", name),
 		_ => format!("Permanently delete {}?", count_of_items(names.len())),
 	}
 }
@@ -3878,7 +4064,7 @@ mod tests {
 	#[test]
 	fn deleting_one_trashed_item_asks_about_it_by_name() {
 		assert_eq!(
-			trash_deletion_confirmation(&["a.txt"]),
+			deletion_confirmation(&["a.txt"]),
 			"Permanently delete a.txt?"
 		);
 	}
@@ -3886,9 +4072,79 @@ mod tests {
 	#[test]
 	fn deleting_several_trashed_items_asks_about_them_by_count() {
 		assert_eq!(
-			trash_deletion_confirmation(&["a.txt", "b.txt"]),
+			deletion_confirmation(&["a.txt", "b.txt"]),
 			"Permanently delete 2 items?"
 		);
+	}
+
+	#[test]
+	fn permanently_deleting_items_named_by_uuid_asks_about_them_as_given() {
+		let uuid = ItemOperand::Uuid(Uuid::from_u128(1));
+		assert_eq!(
+			deletion_confirmation(&[&uuid]),
+			"Permanently delete uuid:00000000-0000-0000-0000-000000000001?"
+		);
+		assert_eq!(
+			deletion_confirmation(&[&uuid, &ItemOperand::Path(RemotePath::new("/a"))]),
+			"Permanently delete 2 items?"
+		);
+	}
+
+	#[derive(Debug, clap::Parser)]
+	struct Args {
+		#[command(subcommand)]
+		command: FsCommands,
+	}
+
+	fn parsed(args: &[&str]) -> Result<FsCommands, clap::error::ErrorKind> {
+		<Args as clap::Parser>::try_parse_from(["filen"].iter().chain(args))
+			.map(|args| args.command)
+			.map_err(|e| e.kind())
+	}
+
+	#[test]
+	fn mv_and_cp_take_several_sources_then_the_destination() {
+		let Ok(FsCommands::Mv {
+			sources,
+			destination,
+		}) = parsed(&["mv", "a", "*.txt", "dir"])
+		else {
+			panic!("mv did not parse");
+		};
+		assert_eq!(sources, ["a", "*.txt"]);
+		assert_eq!(destination, "dir");
+		let Ok(FsCommands::Cp {
+			sources,
+			destination,
+		}) = parsed(&["cp", "a", "b"])
+		else {
+			panic!("cp did not parse");
+		};
+		assert_eq!(sources, ["a"]);
+		assert_eq!(destination, "b");
+		assert_eq!(
+			parsed(&["mv", "a"]).unwrap_err(),
+			clap::error::ErrorKind::MissingRequiredArgument
+		);
+	}
+
+	#[test]
+	fn rm_cat_and_favorite_take_one_or_more_items() {
+		let Ok(FsCommands::Rm {
+			files_or_directories,
+			permanent: true,
+		}) = parsed(&["rm", "-p", "a", "b"])
+		else {
+			panic!("rm did not parse");
+		};
+		assert_eq!(files_or_directories, ["a", "b"]);
+		for command in ["rm", "cat", "favorite", "unfavorite"] {
+			assert_eq!(
+				parsed(&[command]).unwrap_err(),
+				clap::error::ErrorKind::MissingRequiredArgument,
+				"{command}"
+			);
+		}
 	}
 
 	#[test]

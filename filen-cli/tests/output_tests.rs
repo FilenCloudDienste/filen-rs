@@ -136,7 +136,7 @@ fn help_after_a_command_prints_that_commands_help() {
 		let stderr = String::from_utf8(output.stderr).unwrap();
 		assert_eq!(output.status.code(), Some(0), "{stderr}");
 		let stdout = String::from_utf8(output.stdout).unwrap();
-		assert!(stdout.contains("Print the contents of a file"), "{stdout}");
+		assert!(stdout.contains("Print the contents of files"), "{stdout}");
 	}
 }
 
@@ -259,7 +259,7 @@ fn no_input_without_a_command_runs_the_commands_piped_in() {
 	let stderr = String::from_utf8(output.stderr).unwrap();
 	assert_eq!(output.status.code(), Some(0), "{stderr}");
 	let stdout = String::from_utf8(output.stdout).unwrap();
-	assert!(stdout.contains("Print the contents of a file"), "{stdout}");
+	assert!(stdout.contains("Print the contents of files"), "{stdout}");
 }
 
 /// Runs the CLI with `args` and without a command on a fresh config directory, with `script`
@@ -297,7 +297,7 @@ fn commands_piped_in_run_one_after_another() {
 	assert_eq!(output.status.code(), Some(0), "{stderr}");
 	let stdout = String::from_utf8(output.stdout).unwrap();
 	let ls = stdout.find("List files in a directory").unwrap();
-	let cat = stdout.find("Print the contents of a file").unwrap();
+	let cat = stdout.find("Print the contents of files").unwrap();
 	assert!(ls < cat, "{stdout}");
 	// no banner and no login: the commands did not need one
 	assert!(!stdout.contains("Filen CLI v"), "{stdout}");
@@ -317,7 +317,7 @@ fn commands_piped_in_go_on_after_a_failure_and_exit_with_its_code() {
 
 	assert_eq!(output.status.code(), Some(2));
 	let stdout = String::from_utf8(output.stdout).unwrap();
-	assert!(stdout.contains("Print the contents of a file"), "{stdout}");
+	assert!(stdout.contains("Print the contents of files"), "{stdout}");
 	let stderr = String::from_utf8(output.stderr).unwrap();
 	assert!(stderr.contains("unknowncommand"), "{stderr}");
 }

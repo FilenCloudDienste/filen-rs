@@ -12,7 +12,7 @@ use filen_sdk_rs::consts::CHUNK_SIZE;
 use filen_sdk_rs::{
 	auth::Client,
 	fs::{
-		HasName, HasUUID,
+		HasName, HasRemoteInfo as _, HasUUID,
 		categories::NonRootFileType,
 		dir::RemoteDirectory,
 		file::{RemoteFile, traits::HasFileInfo as _},
@@ -1967,4 +1967,255 @@ async fn an_earlier_version_named_by_uuid_is_not_in_the_drive() {
 		.stderr(predicates::str::contains(format!(
 			"{operand} is an earlier version of a file, which `versions` lists"
 		)));
+}
+
+/// Whether there is an item at `path`.
+async fn exists(client: &Client, path: &str) -> bool {
+	client.find_item_at_path(path).await.unwrap().is_some()
+}
+
+#[shared_test_runtime]
+async fn rm_deletes_every_item_it_is_given_and_every_item_a_glob_matches() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = format!("/{}", resources.dir.name().unwrap());
+	test_utils::create_remote_file_structure_outline(
+		client,
+		resources.dir.clone(),
+		&["a.txt", "b.txt", "c.md", "d.md", "docs/"],
+	)
+	.await
+	.unwrap();
+
+	authenticated_cli_with_args!(
+		"rm",
+		"-p",
+		"--yes",
+		&format!("{test_dir}/*.txt"),
+		&format!("{test_dir}/c.md"),
+		&format!("{test_dir}/docs")
+	)
+	.success()
+	.stdout(format!(
+		"✔ Permanently deleted file: {test_dir}/a.txt\n✔ Permanently deleted file: \
+		 {test_dir}/b.txt\n✔ Permanently deleted file: {test_dir}/c.md\n✔ Permanently deleted \
+		 directory: {test_dir}/docs\n"
+	));
+
+	for gone in ["a.txt", "b.txt", "c.md", "docs"] {
+		assert!(
+			!exists(client, &format!("{test_dir}/{gone}")).await,
+			"{gone}"
+		);
+	}
+	assert!(exists(client, &format!("{test_dir}/d.md")).await);
+}
+
+#[shared_test_runtime]
+async fn rm_goes_on_past_an_item_it_cannot_find_and_fails_at_the_end() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = format!("/{}", resources.dir.name().unwrap());
+	test_utils::create_remote_file_structure_outline(client, resources.dir.clone(), &["a.txt"])
+		.await
+		.unwrap();
+
+	let assert = authenticated_cli_with_args!(
+		"rm",
+		"-p",
+		"--yes",
+		&format!("{test_dir}/missing.txt"),
+		&format!("{test_dir}/*.zip"),
+		&format!("{test_dir}/a.txt")
+	)
+	.failure();
+
+	assert_eq!(assert.get_output().status.code(), Some(1));
+	let stderr =
+		console::strip_ansi_codes(&String::from_utf8(assert.get_output().stderr.clone()).unwrap())
+			.into_owned();
+	// in the order the CLI met them, among its log lines
+	let failures = stderr
+		.lines()
+		.filter(|line| line.starts_with('✘'))
+		.collect::<Vec<&str>>();
+	assert_eq!(
+		failures,
+		[
+			format!("✘ No such file or directory: {test_dir}/missing.txt"),
+			format!("✘ No file or directory matches {test_dir}/*.zip"),
+			"✘ 2 of 3 items could not be permanently deleted".to_owned(),
+		],
+		"{stderr}"
+	);
+	assert!(!exists(client, &format!("{test_dir}/a.txt")).await);
+}
+
+#[shared_test_runtime]
+async fn an_item_named_like_a_glob_is_taken_as_it_is() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = format!("/{}", resources.dir.name().unwrap());
+	// the glob a[1].txt matches a1.txt too, and names can hold no '*' or '?'
+	upload(client, &resources.dir, "a[1].txt", b"literal").await;
+	upload(client, &resources.dir, "a1.txt", b"matched").await;
+
+	authenticated_cli_with_args!("cat", &format!("{test_dir}/a[1].txt"))
+		.success()
+		.stdout("literal");
+	authenticated_cli_with_args!("cat", &format!("{test_dir}/a?.txt"))
+		.success()
+		.stdout("matched");
+}
+
+#[shared_test_runtime]
+async fn cat_prints_several_files_one_after_the_other() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = format!("/{}", resources.dir.name().unwrap());
+	upload(client, &resources.dir, "b.txt", b"second\n").await;
+	upload(client, &resources.dir, "a.txt", b"first\n").await;
+
+	authenticated_cli_with_args!(
+		"cat",
+		&format!("{test_dir}/b.txt"),
+		&format!("{test_dir}/a.txt")
+	)
+	.success()
+	.stdout("second\nfirst\n");
+	// a glob's files in the order a listing has them
+	authenticated_cli_with_args!("cat", &format!("{test_dir}/*.txt"))
+		.success()
+		.stdout("first\nsecond\n");
+	let assert =
+		authenticated_cli_with_args!("cat", &format!("{test_dir}/*.txt"), "--json").success();
+	assert_eq!(
+		printed_json(&assert),
+		serde_json::json!({ "text": "first\nsecond\n" })
+	);
+}
+
+#[shared_test_runtime]
+async fn mv_moves_several_sources_into_a_directory() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = format!("/{}", resources.dir.name().unwrap());
+	test_utils::create_remote_file_structure_outline(
+		client,
+		resources.dir.clone(),
+		&["a.txt", "b.txt", "c.md", "docs/"],
+	)
+	.await
+	.unwrap();
+
+	authenticated_cli_with_args!(
+		"mv",
+		&format!("{test_dir}/*.txt"),
+		&format!("{test_dir}/c.md"),
+		&format!("{test_dir}/docs")
+	)
+	.success();
+
+	for moved in ["a.txt", "b.txt", "c.md"] {
+		assert!(
+			exists(client, &format!("{test_dir}/docs/{moved}")).await,
+			"{moved}"
+		);
+		assert!(
+			!exists(client, &format!("{test_dir}/{moved}")).await,
+			"{moved}"
+		);
+	}
+}
+
+#[shared_test_runtime]
+async fn mv_of_several_sources_to_a_missing_directory_moves_nothing() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = format!("/{}", resources.dir.name().unwrap());
+	test_utils::create_remote_file_structure_outline(
+		client,
+		resources.dir.clone(),
+		&["a.txt", "b.txt"],
+	)
+	.await
+	.unwrap();
+
+	authenticated_cli_with_args!(
+		"mv",
+		&format!("{test_dir}/a.txt"),
+		&format!("{test_dir}/b.txt"),
+		&format!("{test_dir}/c")
+	)
+	.failure()
+	.stderr(predicates::str::contains(format!(
+		"No such destination directory: {test_dir}/c"
+	)));
+
+	assert!(exists(client, &format!("{test_dir}/a.txt")).await);
+	assert!(exists(client, &format!("{test_dir}/b.txt")).await);
+	assert!(!exists(client, &format!("{test_dir}/c")).await);
+}
+
+#[shared_test_runtime]
+async fn cp_copies_every_file_a_glob_matches_into_a_directory() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = format!("/{}", resources.dir.name().unwrap());
+	let dest = client
+		.create_dir(&(&resources.dir).into(), "dest")
+		.await
+		.unwrap();
+	upload(client, &resources.dir, "a.txt", b"a").await;
+	upload(client, &resources.dir, "b.txt", b"b").await;
+	upload(client, &resources.dir, "c.md", b"c").await;
+
+	authenticated_cli_with_args!(
+		"cp",
+		&format!("{test_dir}/*.txt"),
+		&format!("{test_dir}/dest")
+	)
+	.success();
+
+	assert_eq!(
+		content_at(client, &format!("{test_dir}/dest/a.txt")).await,
+		b"a"
+	);
+	assert_eq!(
+		content_at(client, &format!("{test_dir}/dest/b.txt")).await,
+		b"b"
+	);
+	let (_, files) = client
+		.list_dir(&(&dest).into(), None::<&fn(u64, Option<u64>)>)
+		.await
+		.unwrap();
+	assert_eq!(files.len(), 2);
+	assert!(exists(client, &format!("{test_dir}/a.txt")).await);
+}
+
+#[shared_test_runtime]
+async fn favorite_favorites_every_item_it_is_given() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = format!("/{}", resources.dir.name().unwrap());
+	let a = upload(client, &resources.dir, "a.txt", b"a").await;
+	let b = upload(client, &resources.dir, "b.txt", b"b").await;
+
+	authenticated_cli_with_args!("favorite", &format!("{test_dir}/*.txt"))
+		.success()
+		.stdout(format!(
+			"✔ Favorited file: {test_dir}/a.txt\n✔ Favorited file: {test_dir}/b.txt\n"
+		));
+	let favorited = |uuid| async move { client.get_file(uuid).await.unwrap().favorited() };
+	assert!(favorited(a.uuid()).await);
+	assert!(favorited(b.uuid()).await);
+
+	authenticated_cli_with_args!(
+		"unfavorite",
+		&format!("{test_dir}/a.txt"),
+		&format!("{test_dir}/b.txt")
+	)
+	.success();
+	assert!(!favorited(a.uuid()).await);
+	assert!(!favorited(b.uuid()).await);
 }
