@@ -19,6 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `serve restic` and `serve nfs` (NFS has no authentication and listens on 127.0.0.1 only)
 - `serve --cert` and `--key` to serve WebDAV, S3, HTTP and restic over HTTPS
 - simple `sync` command
+- `upload` expands wildcards such as `*.jpg` in its local paths, as a Unix shell does, on Windows and in the REPL and piped commands
 
 ### Removed
 

@@ -64,6 +64,7 @@ mod completion;
 mod docs;
 mod error;
 mod interrupt;
+mod local_glob;
 mod log_files;
 mod memory;
 mod repl_history;

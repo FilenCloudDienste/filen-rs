@@ -10,6 +10,14 @@
 //! to the destination are created, in the drive and locally. Downloading `/` writes the whole
 //! drive's contents into the destination.
 //!
+//! `upload` takes several local items, as in `upload *.jpg /photos`. Where no shell expands a
+//! wildcard, on Windows, whose shells pass it on as it is, and in the REPL and commands piped into
+//! the CLI on every platform, `upload` expands `*`, `?` and `[...]` in its local paths itself the
+//! way a Unix shell does: each matches within one level of directories, and a name starting with
+//! `.` only when the pattern does too (case-insensitively on Windows). A path that names an
+//! existing item is uploaded as it is, even when it holds a `[`, and a path that matches nothing is
+//! uploaded as it was given.
+//!
 //! Uploading a file where the drive already holds a file of the same name replaces it: the upload
 //! becomes the current file, and the one it replaced is kept as an earlier version when file
 //! versioning is enabled for your account. Uploading a directory onto an existing one adds its
@@ -139,6 +147,7 @@ use crate::{
 	docs::DocElement,
 	error::CliError,
 	interrupt,
+	local_glob::{self, Case},
 	ui::{self, UI},
 	util::RemotePath,
 };
@@ -273,6 +282,7 @@ impl TransferCommands {
 					filter: filter.transfer_filter()?,
 				};
 				let (sources, destination) = sources_and_destination(source, paths);
+				let sources = expand_source_wildcards(ui, sources)?;
 				upload(
 					ui,
 					client,
@@ -531,6 +541,16 @@ async fn upload_source(
 	};
 	transferred.context("Failed to upload")?;
 	Ok((local.path.display().to_string(), target_path.to_string()))
+}
+
+/// `sources` with their wildcards expanded where no shell has done it: on Windows, whose shells
+/// pass them on as they are, and in the REPL and commands piped into the CLI, which no shell reads.
+fn expand_source_wildcards(ui: &UI, sources: Vec<String>) -> Result<Vec<String>> {
+	if cfg!(windows) || ui.commands_on_stdin() {
+		local_glob::expand_all(sources, Case::of_platform())
+	} else {
+		Ok(sources)
+	}
 }
 
 /// The path standing for stdin as an upload's source and for stdout as a download's destination.
@@ -2352,7 +2372,8 @@ impl<Cat: Category> DirDownloadCallback<Cat> for TransferProgress {
 #[cfg(test)]
 mod tests {
 	use std::{
-		path::{Path, PathBuf},
+		fs,
+		path::{MAIN_SEPARATOR, Path, PathBuf},
 		time::{Duration, Instant},
 	};
 
@@ -2368,10 +2389,10 @@ mod tests {
 		DownloadSource, Existing, FilterArgs, LinkKind, ProgressState, PublicLink, SPEED_WINDOW,
 		Tally, TransferFailure, TransferKind, TransferProgress, UploadTarget, canceled_message,
 		decode_hex_key, download_target, ends_the_command, ensure_stdio_is_free,
-		existing_remote_policy, format_duration, local_existing, partial_download, progress_line,
-		resolve_download_target, resolve_upload_target, result_json, skipped_symlinks_line,
-		source_failure, sources_and_destination, stdin_destination, stdin_upload_target,
-		transfer_summary,
+		existing_remote_policy, expand_source_wildcards, format_duration, local_existing,
+		partial_download, progress_line, resolve_download_target, resolve_upload_target,
+		result_json, skipped_symlinks_line, source_failure, sources_and_destination,
+		stdin_destination, stdin_upload_target, transfer_summary,
 	};
 	use crate::{
 		error::CliError,
@@ -2764,6 +2785,31 @@ mod tests {
 			ensure_stdio_is_free(&ui).unwrap_err().to_string(),
 			"\"-\" (stdin or stdout) only works in a single command, such as `filen upload - \
 			 /notes/today.txt`, not in the REPL or in commands piped into the CLI"
+		);
+	}
+
+	#[test]
+	fn source_wildcards_are_expanded_where_stdin_carries_the_commands() {
+		let dir = tempfile::tempdir().unwrap();
+		fs::write(dir.path().join("a.jpg"), b"").unwrap();
+		let root = dir.path().to_str().unwrap();
+		let mut ui = Printed::default().ui();
+		ui.set_commands_on_stdin();
+		assert_eq!(
+			expand_source_wildcards(&ui, vec![format!("{root}{MAIN_SEPARATOR}*.jpg")]).unwrap(),
+			[format!("{root}{MAIN_SEPARATOR}a.jpg")]
+		);
+	}
+
+	#[cfg(not(windows))]
+	#[test]
+	fn source_wildcards_are_left_to_the_shell_for_a_single_command() {
+		let dir = tempfile::tempdir().unwrap();
+		fs::write(dir.path().join("a.jpg"), b"").unwrap();
+		let pattern = format!("{}/*.jpg", dir.path().to_str().unwrap());
+		assert_eq!(
+			expand_source_wildcards(&Printed::default().ui(), vec![pattern.clone()]).unwrap(),
+			[pattern]
 		);
 	}
 
