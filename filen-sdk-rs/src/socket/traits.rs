@@ -60,6 +60,12 @@ where
 
 	async fn connect(request: T) -> Result<U, Error>;
 
+	/// Whether `request` connects through a proxy, whose failures are retried with a growing
+	/// pause (see `ProxyBackoff`).
+	fn proxied(_request: &T) -> bool {
+		false
+	}
+
 	fn from_unauthed_parts(unauthed_sender: US, unauthed_receiver: UR) -> Self;
 
 	fn split_into_receiver_and_ping_task(self, ping_interval: Duration) -> (R, PT);

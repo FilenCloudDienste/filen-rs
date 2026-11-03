@@ -11,7 +11,10 @@ use std::{
 
 use http::Uri;
 use hyper_util::client::{
-	legacy::connect::{HttpConnector, proxy::Tunnel},
+	legacy::connect::{
+		HttpConnector,
+		proxy::{SocksV5, Tunnel},
+	},
 	proxy::matcher::{Intercept, Matcher},
 };
 use rustls::{
@@ -159,17 +162,33 @@ impl SocketTransport {
 		transport
 	}
 
-	/// Opens the websocket at `url` (`wss://`), through the system's proxy unless it exempts the
-	/// host. Unbounded itself: the caller's deadline covers the whole setup.
+	/// How a connection to the websocket at `url` (`wss://`) goes: through the system's proxy
+	/// unless it exempts the host, or directly.
+	pub(crate) fn route(&self, url: &str) -> Result<SocketRoute, Error> {
+		let request = url.into_client_request().map_err(ws_error)?;
+		let target = proxy_target(request.uri())?;
+		let proxy = self.proxy_for(&target);
+		Ok(SocketRoute {
+			request,
+			target,
+			proxy,
+		})
+	}
+
+	/// Opens the websocket `route` leads to. Unbounded itself: the caller's deadline covers the
+	/// whole setup.
 	pub(crate) async fn connect(
 		&self,
-		url: &str,
+		route: SocketRoute,
 		config: tungstenite::protocol::WebSocketConfig,
 	) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>, Error> {
-		let request = url.into_client_request().map_err(ws_error)?;
+		let SocketRoute {
+			request,
+			target,
+			proxy,
+		} = route;
 		let connector = self.tls.clone().map(Connector::Rustls);
-		let target = proxy_target(request.uri())?;
-		let (stream, _) = match self.proxy_for(&target) {
+		let (stream, _) = match proxy {
 			None => tokio_tungstenite::connect_async_tls_with_config(
 				request,
 				Some(config),
@@ -179,7 +198,7 @@ impl SocketTransport {
 			.await
 			.map_err(ws_error)?,
 			Some(proxy) => {
-				let tunnel = self.tunnel(proxy, target).await?;
+				let tunnel = self.through(proxy, target).await?;
 				tokio_tungstenite::client_async_tls_with_config(
 					request,
 					tunnel,
@@ -201,23 +220,56 @@ impl SocketTransport {
 			.intercept(target)
 	}
 
+	/// A connection to `target` through `proxy`: an HTTP proxy's CONNECT tunnel, or a SOCKS5
+	/// one, which resolves the host itself for `socks5h` and is handed an address resolved here
+	/// for `socks5`, as reqwest does for its requests.
+	async fn through(&self, proxy: Intercept, target: Uri) -> Result<TcpStream, Error> {
+		match proxy.uri().scheme_str() {
+			Some("http") => self.tunnel(proxy, target).await,
+			Some("socks5") => self.socks5(proxy, resolved(target).await?).await,
+			Some("socks5h") => self.socks5(proxy, target).await,
+			// A TLS connection to the proxy would put TLS inside TLS, and SOCKS4 is left out as
+			// reqwest's own requests do not need it either: neither is supported, and the socket
+			// is not sent around the proxy.
+			scheme => Err(Error::custom(
+				ErrorKind::Server,
+				format!(
+					"the websocket cannot use a {} proxy, only http, socks5 and socks5h",
+					scheme.unwrap_or("schemeless")
+				),
+			)),
+		}
+	}
+
+	/// The connector a proxy is reached with: any scheme, as a SOCKS proxy's URL is not `http`.
+	fn proxy_connector(&self) -> HttpConnector {
+		let mut connector = HttpConnector::new();
+		connector.enforce_http(false);
+		connector.set_connect_timeout(self.connect_timeout);
+		connector
+	}
+
+	/// A connection to `target` through the SOCKS5 proxy `proxy`, with the proxy URL's
+	/// credentials when it carries them.
+	async fn socks5(&self, proxy: Intercept, target: Uri) -> Result<TcpStream, Error> {
+		let mut socks = SocksV5::new(proxy.uri().clone(), self.proxy_connector());
+		if let Some((user, password)) = proxy.raw_auth() {
+			socks = socks.with_auth(user.to_owned(), password.to_owned());
+		}
+		let io = socks.oneshot(target).await.map_err(|e| {
+			Error::custom_with_source(
+				ErrorKind::Server,
+				e,
+				Some("failed to connect to the websocket through the SOCKS5 proxy"),
+			)
+		})?;
+		Ok(io.into_inner())
+	}
+
 	/// A connection to `target` through an HTTP proxy's CONNECT tunnel, with the proxy's
 	/// credentials when its URL carries them.
 	async fn tunnel(&self, proxy: Intercept, target: Uri) -> Result<TcpStream, Error> {
-		// reqwest is built without SOCKS, and a TLS connection to the proxy would put TLS
-		// inside TLS: neither is supported, and the socket is not sent around the proxy.
-		if proxy.uri().scheme_str() != Some("http") {
-			return Err(Error::custom(
-				ErrorKind::Server,
-				format!(
-					"the websocket cannot use a {} proxy, only http",
-					proxy.uri().scheme_str().unwrap_or("schemeless")
-				),
-			));
-		}
-		let mut connector = HttpConnector::new();
-		connector.set_connect_timeout(self.connect_timeout);
-		let mut tunnel = Tunnel::new(proxy.uri().clone(), connector);
+		let mut tunnel = Tunnel::new(proxy.uri().clone(), self.proxy_connector());
 		if let Some(auth) = proxy.basic_auth() {
 			tunnel = tunnel.with_auth(auth.clone());
 		}
@@ -230,6 +282,51 @@ impl SocketTransport {
 		})?;
 		Ok(io.into_inner())
 	}
+}
+
+/// Where [`SocketTransport::connect`] opens the websocket: its request, and the proxy it goes
+/// through, if any.
+pub(crate) struct SocketRoute {
+	request: tungstenite::handshake::client::Request,
+	/// The websocket's `https` origin, which a proxy connects to.
+	target: Uri,
+	proxy: Option<Intercept>,
+}
+
+impl SocketRoute {
+	/// Whether the connection goes through a proxy.
+	pub(crate) fn proxied(&self) -> bool {
+		self.proxy.is_some()
+	}
+}
+
+/// `target` with its host resolved here, for a `socks5` proxy, which is handed an address. An
+/// IPv4 address first: the SOCKS5 connector reads an IPv6 literal in a URI, which keeps its
+/// brackets, as a host name. With only IPv6 addresses, the name is handed on for the proxy to
+/// resolve, as `socks5h` does.
+async fn resolved(target: Uri) -> Result<Uri, Error> {
+	let host = target
+		.host()
+		.ok_or_else(|| Error::custom(ErrorKind::InvalidState, "the websocket URL has no host"))?;
+	let port = target.port_u16().unwrap_or(443);
+	let addresses = tokio::net::lookup_host((host, port)).await.map_err(|e| {
+		Error::custom_with_source(
+			ErrorKind::Server,
+			e,
+			Some("failed to resolve the websocket's host for the SOCKS5 proxy"),
+		)
+	})?;
+	let Some(address) = addresses.into_iter().find(std::net::SocketAddr::is_ipv4) else {
+		return Ok(target);
+	};
+	Uri::builder()
+		.scheme("https")
+		.authority(address.to_string())
+		.path_and_query("/")
+		.build()
+		.map_err(|e| {
+			Error::custom_with_source(ErrorKind::InvalidState, e, Some("invalid websocket URL"))
+		})
 }
 
 /// The `https` URI a proxy is chosen for (the proxy settings know `http` and `https`, not

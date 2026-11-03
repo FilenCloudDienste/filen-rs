@@ -16,7 +16,7 @@ use crate::{
 use super::{
 	consts::{
 		CONNECT_TIMEOUT, MESSAGE_CONNECT_PAYLOAD, MESSAGE_EVENT_PAYLOAD, PING_INTERVAL,
-		RECONNECT_DELAY,
+		PROXY_RECONNECT_MAX, RECONNECT_DELAY,
 	},
 	events::DecryptedSocketEvent,
 	listener_manager::{ConnectedListenerManager, DisconnectedListenerManager, ListenerManagerExt},
@@ -301,6 +301,47 @@ pub(super) struct WebSocketConfig {
 	pub(super) reconnect_delay: Duration,
 	pub(super) ping_interval: Duration,
 	pub(super) user_id: u64,
+	/// The pause before the next attempt after one through a proxy failed.
+	pub(super) proxy_backoff: ProxyBackoff,
+}
+
+/// The pause between attempts to connect through a proxy that fail: `RECONNECT_DELAY` at
+/// first, doubled after each failure up to [`PROXY_RECONNECT_MAX`], and back to the start once
+/// a connection is made. A proxy that does not carry the socket (one that refuses websockets, or
+/// a SOCKS or CONNECT request) refuses every attempt, and the sync engine catches up over HTTP
+/// meanwhile, so retrying each second only loads the proxy. A direct connection keeps
+/// `RECONNECT_DELAY`, so the socket is back moments after the network is.
+#[derive(Debug)]
+pub(super) struct ProxyBackoff {
+	next: Duration,
+}
+
+impl Default for ProxyBackoff {
+	fn default() -> Self {
+		Self {
+			next: RECONNECT_DELAY,
+		}
+	}
+}
+
+impl ProxyBackoff {
+	/// The pause before the attempt after one that failed, growing for the one after that.
+	pub(super) fn failed(&mut self) -> Duration {
+		let pause = self.next;
+		self.next = self.next.saturating_mul(2).min(PROXY_RECONNECT_MAX);
+		pause
+	}
+
+	/// A connection was made: the next failure pauses for `RECONNECT_DELAY` again.
+	pub(super) fn reset(&mut self) {
+		*self = Self::default();
+	}
+}
+
+/// Why a connection setup failed, and whether it went through a proxy.
+struct SetupFailure {
+	error: Error,
+	proxied: bool,
 }
 
 fn spawn_websocket_thread(
@@ -316,6 +357,7 @@ fn spawn_websocket_thread(
 		reconnect_delay: RECONNECT_DELAY,
 		ping_interval: PING_INTERVAL,
 		user_id,
+		proxy_backoff: ProxyBackoff::default(),
 	};
 
 	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
@@ -519,15 +561,27 @@ where
 				match result {
 					Ok((streams, interval)) => {
 						config.ping_interval = interval;
+						config.proxy_backoff.reset();
 						return Some(streams);
 					}
-					Err(e) if matches!(e.kind(), ErrorKind::Unauthenticated) => {
-						tracing::error!("WebSocket authentication failed: {}, not retrying", e);
+					Err(SetupFailure { error, .. })
+						if matches!(error.kind(), ErrorKind::Unauthenticated) =>
+					{
+						tracing::error!("WebSocket authentication failed: {}, not retrying", error);
 						return None;
 					}
-					Err(e) => {
-						tracing::warn!("Error initializing WebSocket connection: {}, retrying...", e);
-						sleep(config.reconnect_delay).await;
+					Err(SetupFailure { error, proxied }) => {
+						let pause = if proxied {
+							config.proxy_backoff.failed()
+						} else {
+							config.reconnect_delay
+						};
+						tracing::warn!(
+							"Error initializing WebSocket connection: {}, retrying in {:?}...",
+							error,
+							pause
+						);
+						sleep(pause).await;
 					}
 				}
 			}
@@ -631,7 +685,7 @@ async fn connect_and_build_socket<UW, US, UR, RV, W, S, R, T, PT>(
 	client: &AuthClient,
 	api_key: &str,
 	listeners: &mut DisconnectedListenerManager,
-) -> Result<(W, Duration), Error>
+) -> Result<(W, Duration), SetupFailure>
 where
 	UW: UnauthedSocket<US, UR, RV>,
 	US: UnauthedSender<AuthedType = S>,
@@ -643,11 +697,14 @@ where
 	<RV::Output as Deref>::Target: AsRef<str>,
 	PT: PingTask<S>,
 {
+	// Set once the request is built, so a setup that fails after it says how it went.
+	let mut proxied = false;
 	// One deadline over the whole setup: connect_async and every handshake read
 	// are otherwise unbounded, so a dead peer would park the task forever.
 	let setup = async {
 		tracing::debug!("Connecting to WebSocket server...");
 		let request = W::build_request(client).await?;
+		proxied = W::proxied(&request);
 
 		tracing::debug!("WebSocket request built, connecting...");
 
@@ -656,12 +713,13 @@ where
 
 		perform_handshake(unauthed_ws, listeners, api_key).await
 	};
-	timeout(CONNECT_TIMEOUT, setup).await.map_err(|_| {
-		Error::custom(
+	let result = timeout(CONNECT_TIMEOUT, setup).await.unwrap_or_else(|_| {
+		Err(Error::custom(
 			ErrorKind::Server,
 			"timed out establishing websocket connection",
-		)
-	})?
+		))
+	});
+	result.map_err(|error| SetupFailure { error, proxied })
 }
 
 // `skip_all` is load-bearing here: `api_key` must never be recorded as a span field. `err` logs

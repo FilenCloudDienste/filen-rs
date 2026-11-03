@@ -154,6 +154,10 @@ mod pipeline {
 		connections: VecDeque<FakeConnection>,
 		connect_count: usize,
 		sent: Vec<String>,
+		/// Whether every connection goes through a proxy.
+		proxied: bool,
+		/// When each connection was attempted.
+		attempts: Vec<Instant>,
 	}
 
 	thread_local! {
@@ -167,6 +171,23 @@ mod pipeline {
 				..Default::default()
 			}
 		});
+	}
+
+	/// Like [`prime`], with every connection going through a proxy when `proxied`.
+	fn prime_routed(connections: Vec<FakeConnection>, proxied: bool) {
+		prime(connections);
+		STATE.with(|s| s.borrow_mut().proxied = proxied);
+	}
+
+	/// The pauses between the connection attempts so far.
+	fn pauses() -> Vec<Duration> {
+		STATE.with(|s| {
+			s.borrow()
+				.attempts
+				.windows(2)
+				.map(|pair| pair[1] - pair[0])
+				.collect()
+		})
 	}
 
 	fn connect_count() -> usize {
@@ -285,10 +306,15 @@ mod pipeline {
 			Ok(())
 		}
 
+		fn proxied(_request: &()) -> bool {
+			STATE.with(|s| s.borrow().proxied)
+		}
+
 		async fn connect(_request: ()) -> Result<FakeUnauthedSocket, Error> {
 			let conn = STATE.with(|s| {
 				let mut s = s.borrow_mut();
 				s.connect_count += 1;
+				s.attempts.push(Instant::now());
 				s.connections.pop_front()
 			});
 			match conn {
@@ -366,6 +392,7 @@ mod pipeline {
 			reconnect_delay: RECONNECT_DELAY,
 			ping_interval: PING_INTERVAL,
 			user_id: 0,
+			proxy_backoff: ProxyBackoff::default(),
 		}
 	}
 
@@ -422,6 +449,61 @@ mod pipeline {
 	}
 
 	// ----- tests -----
+
+	/// Connecting through a proxy that keeps failing pauses longer after each failure, and a
+	/// connection made resets the pause: here four failures, a session the server closes at
+	/// once, two failures, and a session that stays. A direct connection retries each second.
+	#[tokio::test(start_paused = true)]
+	async fn failures_through_a_proxy_back_off_and_a_connection_resets_the_pause() {
+		let failed = || FakeConnection::new(vec![ServerAction::Close]);
+		for (proxied, expected) in [
+			(true, [1, 2, 4, 8, 1, 1, 2]),
+			(false, [1, 1, 1, 1, 1, 1, 1]),
+		] {
+			let (request_sender, request_receiver) = tokio::sync::mpsc::channel(16);
+			let final_sender = request_sender.clone();
+			prime_routed(
+				vec![
+					failed(),
+					failed(),
+					failed(),
+					failed(),
+					FakeConnection::new(handshake_then(vec![ServerAction::Close])),
+					failed(),
+					failed(),
+					FakeConnection::new(handshake_then(vec![ServerAction::Hang]))
+						.with_on_connect(move || drop(final_sender)),
+				],
+				proxied,
+			);
+			let (_events, _id_receiver, _canceller) = add_recording_listener(&request_sender).await;
+			drop(request_sender);
+
+			run_async_websocket_task::<FakeSocket, _, _, _, _, _, _, _, _>(
+				test_config(),
+				request_receiver,
+				Arc::new(NoopCrypter),
+				test_private_key(),
+			)
+			.await;
+
+			assert_eq!(
+				pauses(),
+				expected.map(Duration::from_secs),
+				"proxied: {proxied}"
+			);
+		}
+	}
+
+	/// The pause doubles up to its ceiling and stays there until a connection resets it.
+	#[test]
+	fn the_proxy_pause_doubles_to_its_ceiling() {
+		let mut backoff = ProxyBackoff::default();
+		let pauses: Vec<u64> = (0..9).map(|_| backoff.failed().as_secs()).collect();
+		assert_eq!(pauses, [1, 2, 4, 8, 16, 32, 60, 60, 60]);
+		backoff.reset();
+		assert_eq!(backoff.failed(), RECONNECT_DELAY);
+	}
 
 	#[tokio::test(start_paused = true)]
 	async fn transport_error_triggers_reconnect_with_broadcasts() {
@@ -649,7 +731,7 @@ mod pipeline {
 
 		let err = match result {
 			Ok(_) => panic!("the hung handshake must fail"),
-			Err(e) => e,
+			Err(failure) => failure.error,
 		};
 		assert!(
 			!matches!(err.kind(), ErrorKind::Unauthenticated),
