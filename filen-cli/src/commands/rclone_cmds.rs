@@ -75,6 +75,39 @@ pub(crate) enum RcloneCommands {
 	},
 	/// Exports your user API key (for use with non-managed Rclone)
 	ExportApiKey,
+	/// Replaced by `serve webdav`
+	#[command(hide = true)]
+	Webdav {
+		/// The options the command took, which are ignored
+		#[arg(
+			trailing_var_arg = true,
+			allow_hyphen_values = true,
+			value_name = "ARGS"
+		)]
+		_args: Vec<String>,
+	},
+	/// Replaced by `serve s3`
+	#[command(hide = true)]
+	S3 {
+		/// The options the command took, which are ignored
+		#[arg(
+			trailing_var_arg = true,
+			allow_hyphen_values = true,
+			value_name = "ARGS"
+		)]
+		_args: Vec<String>,
+	},
+	/// No longer available
+	#[command(hide = true)]
+	WebdavProxy {
+		/// The options the command took, which are ignored
+		#[arg(
+			trailing_var_arg = true,
+			allow_hyphen_values = true,
+			value_name = "ARGS"
+		)]
+		_args: Vec<String>,
+	},
 }
 
 /// The type of server `serve` runs.
@@ -172,9 +205,32 @@ impl RcloneCommands {
 					)]);
 				}
 			}
+			Self::Webdav { .. } => return Err(moved_to_serve(ServerType::Webdav)),
+			Self::S3 { .. } => return Err(moved_to_serve(ServerType::S3)),
+			Self::WebdavProxy { .. } => return Err(webdav_proxy_removed()),
 		}
 		Ok(CommandResult::default())
 	}
+}
+
+/// The usage error of `webdav-proxy`, which nothing replaced.
+fn webdav_proxy_removed() -> anyhow::Error {
+	UI::usage_failure(
+		"`filen webdav-proxy` is no longer available: the multi-user proxy mode was removed. Run `filen serve webdav` for each account instead",
+	)
+}
+
+/// The usage error of a command that `filen serve <server>` replaced, whose defaults differ from
+/// the command's.
+fn moved_to_serve(server: ServerType) -> anyhow::Error {
+	let name = server
+		.to_possible_value()
+		.expect("no server type is skipped (should be impossible)");
+	let name = name.get_name();
+	let port = default_port(server.into());
+	UI::usage_failure(&format!(
+		"`filen {name}` was replaced by `filen serve {name}`, which listens on 127.0.0.1:{port} by default instead of 0.0.0.0:80; add `--addr 0.0.0.0:{port}` to listen on every network interface"
+	))
 }
 
 /// How long uploads waiting in the cache may finish when the CLI stops a drive or server.
@@ -688,6 +744,72 @@ mod tests {
 
 		assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue);
 		assert_eq!(err.exit_code(), 2);
+	}
+
+	/// The command `args` parse into.
+	fn parsed_command(args: &[&str]) -> RcloneCommands {
+		let Some(Commands::Rclone(command)) = parse_args(args).unwrap().args.command else {
+			panic!("{args:?} parsed as another command");
+		};
+		command
+	}
+
+	#[test]
+	fn the_replaced_server_commands_take_their_old_options() {
+		assert!(matches!(
+			parsed_command(&[
+				"filen",
+				"webdav",
+				"--w-user",
+				"u",
+				"--w-password",
+				"p",
+				"--w-port",
+				"80"
+			]),
+			RcloneCommands::Webdav { .. }
+		));
+		assert!(matches!(
+			parsed_command(&["filen", "s3", "--s3-access-key-id", "k", "--s3-https"]),
+			RcloneCommands::S3 { .. }
+		));
+		assert!(matches!(
+			parsed_command(&["filen", "webdav-proxy", "--w-port", "80"]),
+			RcloneCommands::WebdavProxy { .. }
+		));
+	}
+
+	#[test]
+	fn the_webdav_command_names_its_replacement_and_new_default_address() {
+		let err = moved_to_serve(ServerType::Webdav);
+
+		assert_eq!(exit_code(&err), 2);
+		assert_eq!(
+			format!("{err:#}"),
+			"`filen webdav` was replaced by `filen serve webdav`, which listens on 127.0.0.1:1900 by default instead of 0.0.0.0:80; add `--addr 0.0.0.0:1900` to listen on every network interface"
+		);
+	}
+
+	#[test]
+	fn the_s3_command_names_its_replacement_and_new_default_address() {
+		let err = moved_to_serve(ServerType::S3);
+
+		assert_eq!(exit_code(&err), 2);
+		assert_eq!(
+			format!("{err:#}"),
+			"`filen s3` was replaced by `filen serve s3`, which listens on 127.0.0.1:1800 by default instead of 0.0.0.0:80; add `--addr 0.0.0.0:1800` to listen on every network interface"
+		);
+	}
+
+	#[test]
+	fn the_webdav_proxy_command_says_it_is_no_longer_available() {
+		let err = webdav_proxy_removed();
+
+		assert_eq!(exit_code(&err), 2);
+		assert_eq!(
+			format!("{err:#}"),
+			"`filen webdav-proxy` is no longer available: the multi-user proxy mode was removed. Run `filen serve webdav` for each account instead"
+		);
 	}
 
 	#[test]

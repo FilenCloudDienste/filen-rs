@@ -191,8 +191,10 @@ static PARSED_DOC_OUTLINE: LazyLock<Result<Vec<ParsedDocSection>>> = LazyLock::n
 			unused_doc_fragments
 		));
 	}
+	// hidden commands only say what replaced them, so they have no docs
 	let unused_commands = commands
 		.get_subcommands()
+		.filter(|cmd| !cmd.is_hide_set())
 		.map(|cmd| cmd.get_name().to_string())
 		.filter(|name| !used_commands.contains(name))
 		.collect::<Vec<String>>();
