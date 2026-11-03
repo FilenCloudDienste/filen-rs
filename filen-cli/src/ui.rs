@@ -18,13 +18,14 @@ use inquire::{
 	ui::{RenderConfig, Styled},
 };
 use log::{LevelFilter, error, info, warn};
+use serde::Serialize;
 use tiny_gradient::{GradientStr, RGB};
 use unicode_width::{UnicodeWidthChar as _, UnicodeWidthStr};
 
 use crate::{
 	CliArgs,
 	completion::async_completions_available,
-	error::{CliError, find_cli_error},
+	error::{self, CliError, find_cli_error},
 	interrupt,
 	repl_history::ReplHistory,
 	util::RemotePath,
@@ -113,6 +114,52 @@ impl log::Log for CustomLogger {
 	}
 
 	fn flush(&self) {}
+}
+
+/// Where to report a bug.
+const BUG_REPORT_URL: &str = "https://github.com/FilenCloudDienste/filen-rs/issues";
+const TERMINAL_INPUT_FAILURE: &str = "Failed to read input from terminal. Please ensure that the terminal supports interactive input.";
+const DOCKER_TERMINAL_INPUT_HINT: &str = "It seems you are running the CLI in a Docker container. Make sure to run the container with the -it flags to enable interactive input.";
+
+/// [cli-doc] json-output
+/// With `--json`, the CLI prints for programs to read:
+/// - A command's result goes to stdout as JSON with camelCase keys, such as
+///   `{"directories": [...], "files": [...]}` for `filen ls --json`.
+/// - A failure goes to stderr as one line of JSON instead of text:
+///   `{"error":{"message":"...","kind":"failure","exitCode":1}}`. `kind` is `failure` (the command
+///   could not do what was asked), `usage` (the command line was invalid), `interrupted`
+///   (Ctrl-C), `terminal_input` (a prompt could not be shown or answered) or `unexpected`
+///   (possibly a bug, with a `reportUrl` to report it at). `exitCode` is the code the CLI exits
+///   with, or in the REPL the code the command would have exited with.
+/// - Nothing is printed when Rclone fails, as it prints its own error, or when stdout was closed.
+/// - Warnings stay text on stderr; announcements and release notes are left out.
+///
+/// A command line the CLI cannot parse is reported as text, as are failures to set up the config
+/// directory or the log file before the command runs.
+#[derive(Debug, Serialize)]
+struct JsonFailure {
+	error: JsonError,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct JsonError {
+	message: String,
+	kind: FailureKind,
+	exit_code: i32,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	report_url: Option<&'static str>,
+}
+
+/// What kind of failure the CLI reports, as `--json` names it.
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum FailureKind {
+	Failure,
+	Usage,
+	Interrupted,
+	TerminalInput,
+	Unexpected,
 }
 
 /// Where the answers to the CLI's prompts come from.
@@ -381,27 +428,66 @@ impl UI {
 	/// Print an error or failure message
 	/// User-friendly failures created with `UI::failure` will be printed as-is, along with any
 	/// context they were wrapped in, other errors will be printed with a generic message and a
-	/// link to report bugs.
+	/// link to report bugs. With `--json`, it is one [`JsonFailure`] line instead.
 	pub(crate) fn print_failure_or_error(&mut self, err: &anyhow::Error) {
 		error!("{:#}", err);
-		match find_cli_error(err) {
-			Some(CliError::Failure(_) | CliError::Usage(_) | CliError::Interrupted) => {
-				self.print_failure(&format!("{:#}", err))
-			}
-			Some(CliError::TerminalInput(_)) => {
-				self.print_failure("Failed to read input from terminal. Please ensure that the terminal supports interactive input.");
-				if cfg!(feature = "is_docker") {
-					self.print_failure("It seems you are running the CLI in a Docker container. Make sure to run the container with the -it flags to enable interactive input.");
-				}
-			}
+		let kind = match find_cli_error(err) {
+			Some(CliError::Failure(_)) => FailureKind::Failure,
+			Some(CliError::Usage(_)) => FailureKind::Usage,
+			Some(CliError::Interrupted) => FailureKind::Interrupted,
+			Some(CliError::TerminalInput(_)) => FailureKind::TerminalInput,
 			// the child process reported its own error, and nobody reads the output that was cut
 			// short
-			Some(CliError::ChildExit(_) | CliError::StdoutClosed) => {}
-			None => {
+			Some(CliError::ChildExit(_) | CliError::StdoutClosed) => return,
+			None => FailureKind::Unexpected,
+		};
+		if self.json {
+			self.print_json_failure(err, kind);
+			return;
+		}
+		match kind {
+			FailureKind::Failure | FailureKind::Usage | FailureKind::Interrupted => {
+				self.print_failure(&format!("{:#}", err))
+			}
+			FailureKind::TerminalInput => {
+				self.print_failure(TERMINAL_INPUT_FAILURE);
+				if cfg!(feature = "is_docker") {
+					self.print_failure(DOCKER_TERMINAL_INPUT_HINT);
+				}
+			}
+			FailureKind::Unexpected => {
 				self.print_failure(&format!("An unexpected error occurred: {}", err));
-				self.print_failure("If you believe this is a bug, please report it at https://github.com/FilenCloudDienste/filen-rs/issues");
+				self.print_failure(&format!(
+					"If you believe this is a bug, please report it at {BUG_REPORT_URL}"
+				));
 			}
 		}
+	}
+
+	/// Prints `err`, a failure of `kind`, as one line of JSON to stderr.
+	fn print_json_failure(&mut self, err: &anyhow::Error, kind: FailureKind) {
+		let message = match kind {
+			FailureKind::TerminalInput if cfg!(feature = "is_docker") => {
+				format!("{TERMINAL_INPUT_FAILURE} {DOCKER_TERMINAL_INPUT_HINT}")
+			}
+			FailureKind::TerminalInput => TERMINAL_INPUT_FAILURE.to_owned(),
+			FailureKind::Failure
+			| FailureKind::Usage
+			| FailureKind::Interrupted
+			| FailureKind::Unexpected => format!("{err:#}"),
+		};
+		let failure = JsonFailure {
+			error: JsonError {
+				message,
+				kind,
+				exit_code: error::exit_code(err),
+				report_url: matches!(kind, FailureKind::Unexpected).then_some(BUG_REPORT_URL),
+			},
+		};
+		// a struct of strings and numbers always serializes
+		let line = serde_json::to_string(&failure)
+			.expect("a failure serializes to JSON (should be impossible)");
+		self.print_to_stderr(&line);
 	}
 
 	pub(crate) fn print_muted(&mut self, msg: &str) {
@@ -475,7 +561,8 @@ impl UI {
 		}
 	}
 
-	pub(crate) fn print_json(&mut self, value: serde_json::Value) -> Result<()> {
+	/// Prints `value`, a command's result, as JSON to stdout.
+	pub(crate) fn print_json(&mut self, value: impl Serialize) -> Result<()> {
 		self.print(&serde_json::to_string_pretty(&value).context("Failed to serialize JSON")?);
 		Ok(())
 	}
@@ -1367,6 +1454,156 @@ mod tests {
 			"✘ An unexpected error occurred: connection reset\n\
 			 ✘ If you believe this is a bug, please report it at https://github.com/FilenCloudDienste/filen-rs/issues"
 		);
+	}
+
+	/// What `print_failure_or_error` prints for `err` to stdout and to stderr, with or without
+	/// `--json`.
+	fn printed_failure(err: &anyhow::Error, json: bool) -> (String, String) {
+		let out = Printed::default();
+		let err_out = Printed::default();
+		let mut ui = Printed::split_ui(&out, &err_out);
+		ui.json = json;
+		ui.print_failure_or_error(err);
+		(
+			out.lines_or_empty(),
+			console::strip_ansi_codes(&err_out.lines_or_empty()).into_owned(),
+		)
+	}
+
+	/// The JSON `print_failure_or_error` prints for `err` with `--json`, read back.
+	fn json_failure(err: &anyhow::Error) -> serde_json::Value {
+		let (out, err) = printed_failure(err, true);
+		assert_eq!(out, "");
+		assert_eq!(err.lines().count(), 1, "{err}");
+		serde_json::from_str(&err).unwrap()
+	}
+
+	#[test]
+	fn a_failure_with_json_is_an_error_object_on_stderr() {
+		let err = Err::<(), _>(UI::failure("No such file: /a"))
+			.context("Failed to copy")
+			.unwrap_err();
+
+		assert_eq!(
+			json_failure(&err),
+			serde_json::json!({"error": {
+				"message": "Failed to copy: No such file: /a",
+				"kind": "failure",
+				"exitCode": 1,
+			}})
+		);
+	}
+
+	#[test]
+	fn a_usage_failure_with_json_exits_with_2() {
+		let err = UI::usage_failure("Give both --user and --password, or neither");
+
+		assert_eq!(
+			json_failure(&err),
+			serde_json::json!({"error": {
+				"message": "Give both --user and --password, or neither",
+				"kind": "usage",
+				"exitCode": 2,
+			}})
+		);
+	}
+
+	#[test]
+	fn an_interrupted_command_with_json_exits_with_130() {
+		let err = anyhow::Error::from(CliError::Interrupted).context("Failed to download");
+
+		assert_eq!(
+			json_failure(&err),
+			serde_json::json!({"error": {
+				"message": "Failed to download: Canceled",
+				"kind": "interrupted",
+				"exitCode": 130,
+			}})
+		);
+	}
+
+	#[test]
+	fn a_terminal_input_failure_with_json_explains_itself() {
+		let err = anyhow::Error::from(CliError::TerminalInput(InquireError::NotTTY));
+
+		let failure = json_failure(&err);
+
+		assert_eq!(failure["error"]["kind"], "terminal_input");
+		assert_eq!(failure["error"]["exitCode"], 1);
+		assert!(
+			failure["error"]["message"]
+				.as_str()
+				.unwrap()
+				.starts_with(TERMINAL_INPUT_FAILURE),
+			"{failure}"
+		);
+		assert!(failure["error"].get("reportUrl").is_none(), "{failure}");
+	}
+
+	#[test]
+	fn an_unexpected_error_with_json_has_the_report_link_apart() {
+		let err = anyhow::anyhow!("connection reset").context("Failed to list");
+
+		assert_eq!(
+			json_failure(&err),
+			serde_json::json!({"error": {
+				"message": "Failed to list: connection reset",
+				"kind": "unexpected",
+				"exitCode": 1,
+				"reportUrl": "https://github.com/FilenCloudDienste/filen-rs/issues",
+			}})
+		);
+	}
+
+	#[test]
+	fn a_child_exit_and_a_closed_stdout_print_nothing_with_or_without_json() {
+		for json in [false, true] {
+			for err in [CliError::ChildExit(3), CliError::StdoutClosed] {
+				assert_eq!(
+					printed_failure(&anyhow::Error::from(err), json),
+					(String::new(), String::new()),
+					"{json}"
+				);
+			}
+		}
+	}
+
+	#[test]
+	fn failures_without_json_stay_text() {
+		assert_eq!(
+			printed_failure(&UI::usage_failure("Invalid flag"), false),
+			(String::new(), "✘ Invalid flag".to_owned())
+		);
+		assert_eq!(
+			printed_failure(&anyhow::Error::from(CliError::Interrupted), false),
+			(String::new(), "✘ Canceled".to_owned())
+		);
+		let (out, err) = printed_failure(
+			&anyhow::Error::from(CliError::TerminalInput(InquireError::NotTTY)),
+			false,
+		);
+		assert_eq!(out, "");
+		assert!(
+			err.starts_with(&format!("✘ {TERMINAL_INPUT_FAILURE}")),
+			"{err}"
+		);
+	}
+
+	#[test]
+	fn a_result_prints_as_json_on_stdout() {
+		#[derive(Serialize)]
+		#[serde(rename_all = "camelCase")]
+		struct Moved {
+			from_path: &'static str,
+		}
+		let out = Printed::default();
+		let err = Printed::default();
+		let mut ui = Printed::split_ui(&out, &err);
+
+		ui.print_json(Moved { from_path: "/a" }).unwrap();
+
+		assert_eq!(out.lines(), "{\n  \"fromPath\": \"/a\"\n}");
+		assert_eq!(err.lines_or_empty(), "");
 	}
 
 	#[test]

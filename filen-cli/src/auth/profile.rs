@@ -159,7 +159,7 @@ pub(crate) fn print_profiles(ui: &mut UI, profiles: &Profiles) -> Result<()> {
 			names
 				.iter()
 				.map(|name| json!({ "name": name.as_str(), "active": is_active(name) }))
-				.collect(),
+				.collect::<Vec<_>>(),
 		);
 	}
 	if names.is_empty() {

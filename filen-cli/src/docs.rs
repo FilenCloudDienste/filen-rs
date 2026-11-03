@@ -68,6 +68,8 @@ const USAGE_INTRO_DOCS: &[DocElement] = &[
 	DocElement::DocFragment("main-usage"),
 	DocElement::Heading1("Options"),
 	DocElement::GlobalOptions,
+	DocElement::Heading1("JSON output"),
+	DocElement::DocFragment("json-output"),
 	DocElement::Heading1("Updates"),
 	DocElement::DocFragment("updates"),
 	DocElement::Heading1("Config directory"),
@@ -622,7 +624,7 @@ mod tests {
 		let outline = PARSED_DOC_OUTLINE.as_ref().unwrap();
 		let usage = outline.iter().find(|s| s.id == MAIN_SECTION).unwrap();
 		let fragments = get_cli_doc_fragments();
-		for id in ["config-dir", "log-files", "updates"] {
+		for id in ["config-dir", "log-files", "updates", "json-output"] {
 			let fragment = fragments.iter().find(|f| f.id == id).unwrap();
 			assert!(
 				usage.elements.iter().any(|element| matches!(

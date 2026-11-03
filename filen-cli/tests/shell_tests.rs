@@ -110,3 +110,17 @@ fn a_relative_config_dir_stays_put_after_lcd() {
 	assert_eq!(version["configDir"], config_dir.to_string_lossy().as_ref());
 	assert!(!working_dir.path().join("sub/cfg").exists());
 }
+
+#[test]
+fn a_failure_with_json_is_one_error_line_on_stderr() {
+	let working_dir = TempDir::new().unwrap();
+
+	let output = run_in(&working_dir, &["--json", "lcd", "/"], "");
+
+	assert_eq!(output.status.code(), Some(2));
+	assert_eq!(String::from_utf8(output.stdout).unwrap(), "");
+	let stderr = String::from_utf8(output.stderr).unwrap();
+	let failure: serde_json::Value = serde_json::from_str(&stderr).unwrap();
+	assert_eq!(failure["error"]["kind"], "usage", "{stderr}");
+	assert_eq!(failure["error"]["exitCode"], 2, "{stderr}");
+}
