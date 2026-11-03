@@ -660,6 +660,74 @@ async fn trash_restore_refuses_a_name_several_trashed_items_share() {
 }
 
 #[shared_test_runtime]
+async fn trash_restore_restores_every_trashed_item_it_names() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let _trash_lock = lock_trash(client).await;
+	let first_name = format!("{}-1.txt", resources.dir.name().unwrap());
+	let second_name = format!("{}-2.txt", resources.dir.name().unwrap());
+	let first = trashed_file(client, &resources.dir, "a", &first_name).await;
+	let second = trashed_file(client, &resources.dir, "b", &second_name).await;
+
+	authenticated_cli_with_args!(
+		"trash-restore",
+		&first_name,
+		&format!("uuid:{}", second.uuid())
+	)
+	.success()
+	.stdout(format!(
+		"✔ Restored file: {first_name}\n✔ Restored file: {second_name}\n"
+	));
+
+	assert!(!is_in_trash(client, &first).await);
+	assert!(!is_in_trash(client, &second).await);
+}
+
+#[shared_test_runtime]
+async fn trash_delete_deletes_every_trashed_item_it_names_with_yes() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let _trash_lock = lock_trash(client).await;
+	let name = format!("{}.txt", resources.dir.name().unwrap());
+	let first = trashed_file(client, &resources.dir, "a", &name).await;
+	let second = trashed_file(client, &resources.dir, "b", &name).await;
+
+	authenticated_cli_with_args!(
+		"trash-delete",
+		&first.uuid().to_string(),
+		&format!("uuid:{}", second.uuid()),
+		"--yes"
+	)
+	.success()
+	.stdout(format!(
+		"✔ Permanently deleted file: {name}\n✔ Permanently deleted file: {name}\n"
+	));
+
+	assert!(!is_in_trash(client, &first).await);
+	assert!(!is_in_trash(client, &second).await);
+}
+
+#[shared_test_runtime]
+async fn trash_delete_changes_nothing_when_one_item_it_names_is_not_in_the_trash() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let _trash_lock = lock_trash(client).await;
+	let name = format!("{}.txt", resources.dir.name().unwrap());
+	let missing = format!("{}-missing.txt", resources.dir.name().unwrap());
+	let file = trashed_file(client, &resources.dir, "a", &name).await;
+
+	authenticated_cli_with_args!("trash-delete", &name, &missing, "--yes")
+		.failure()
+		.stdout("")
+		.stderr(predicates::str::ends_with(format!(
+			"✘ No such item in the trash: {missing}\n"
+		)));
+
+	assert!(is_in_trash(client, &file).await);
+	client.delete_file_permanently(file).await.unwrap();
+}
+
+#[shared_test_runtime]
 async fn list_trash_long_shows_the_size_and_modified_date() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = &resources.client;
@@ -714,6 +782,37 @@ fn trash_delete_of_a_named_item_without_yes_asks_for_it_before_logging_in() {
 		"✘ Cannot ask \"Permanently delete a.txt?\": stdin is not a terminal. Pass --yes to \
 		 answer yes.\n"
 	);
+}
+
+#[test]
+fn trash_delete_of_several_items_without_yes_asks_for_it_before_logging_in() {
+	let output = run_logged_out_without_a_terminal(&["trash-delete", "a.txt", "b.txt"]);
+
+	assert_eq!(output.status.code(), Some(2));
+	assert_eq!(
+		console::strip_ansi_codes(&String::from_utf8(output.stderr).unwrap()),
+		"✘ Cannot ask \"Permanently delete 2 items?\": stdin is not a terminal. Pass --yes to \
+		 answer yes.\n"
+	);
+}
+
+#[test]
+fn trash_delete_all_without_yes_asks_for_it_before_logging_in() {
+	let output = run_logged_out_without_a_terminal(&["trash-delete", "--all"]);
+
+	assert_eq!(output.status.code(), Some(2));
+	assert_eq!(
+		console::strip_ansi_codes(&String::from_utf8(output.stderr).unwrap()),
+		"✘ Cannot ask \"Permanently delete all trashed items?\": stdin is not a terminal. Pass \
+		 --yes to answer yes.\n"
+	);
+}
+
+#[test]
+fn trash_restore_refuses_all_together_with_named_items() {
+	let output = run_logged_out_without_a_terminal(&["trash-restore", "--all", "a.txt"]);
+
+	assert_eq!(output.status.code(), Some(2));
 }
 
 #[test]
