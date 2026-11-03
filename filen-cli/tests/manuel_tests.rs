@@ -1,3 +1,5 @@
+// Linux only: the recordings print the default config directory, which is `~/.config` on Linux
+// and `~/Library/Application Support` on macOS. Windows has no bash for manuel to drive.
 #[cfg(target_os = "linux")]
 #[filen_macros::shared_test_runtime]
 // std::env::set_var is unsafe since edition 2024.

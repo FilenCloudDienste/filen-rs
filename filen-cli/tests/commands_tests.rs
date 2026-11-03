@@ -1,14 +1,12 @@
-#[cfg(unix)]
 use std::{
 	path::Path,
-	process::{Command, Stdio},
+	process::{Child, Command, Stdio},
 	sync::Arc,
 	time::{Duration, Instant},
 };
 
 use filen_macros::shared_test_runtime;
 use filen_sdk_rs::fs::{HasName, categories::NonRootFileType};
-#[cfg(unix)]
 use filen_sdk_rs::{
 	auth::Client,
 	sync_engine::{DeleteGuard, SyncEngine},
@@ -334,7 +332,6 @@ async fn cmd_export_notes() {
 	}
 }
 
-#[cfg(unix)]
 #[shared_test_runtime]
 async fn cmd_sync() {
 	// Not `get_resources_with_lock`: the CLI's sync engine takes the drive lock for every pass, and
@@ -373,7 +370,6 @@ async fn cmd_sync() {
 /// A pair an earlier version of the CLI registered kept the delete guard it stored, which held
 /// every deletion of a pair with fewer than a million items. Running the pair again puts it back on
 /// the default guard.
-#[cfg(unix)]
 #[shared_test_runtime]
 async fn cmd_sync_puts_a_registered_pair_back_on_the_default_delete_guard() {
 	// Not `get_resources_with_lock`, for the reason `cmd_sync` gives.
@@ -427,10 +423,6 @@ async fn cmd_sync_puts_a_registered_pair_back_on_the_default_delete_guard() {
 
 /// Runs `sync --pair <pair>` with `config_dir` until `synced` holds, then stops it and returns its
 /// stdout.
-///
-/// Unix only: the CLI is stopped the way a user stops it, with SIGINT, so the engine finishes its
-/// pass and releases the drive lock instead of leaving it to expire on the shared test account.
-#[cfg(unix)]
 async fn sync_until(
 	config_dir: &Path,
 	pair: &str,
@@ -467,6 +459,14 @@ async fn sync_until(
 		tokio::time::sleep(Duration::from_secs(2)).await;
 	}
 
+	stop_sync(cli)
+}
+
+/// Stops the CLI the way a user stops it, with SIGINT, so the engine finishes its pass and releases
+/// the drive lock instead of leaving it to expire on the shared test account, and checks that it
+/// exits cleanly.
+#[cfg(unix)]
+fn stop_sync(cli: Child) -> String {
 	let interrupted = Command::new("kill")
 		.args(["-INT", &cli.id().to_string()])
 		.status()
@@ -481,7 +481,17 @@ async fn sync_until(
 	stdout
 }
 
-#[cfg(unix)]
+/// Terminates the CLI once it has converged: sending it a Ctrl-C from here would need the console
+/// API. The engine's drive lock is then left to its lease (about 60 seconds), which the next sync
+/// waits out, and whether the CLI exits cleanly goes unchecked on Windows. `sync --once` replaces
+/// this once the CLI has it.
+#[cfg(windows)]
+fn stop_sync(mut cli: Child) -> String {
+	cli.kill().unwrap();
+	let output = cli.wait_with_output().unwrap();
+	String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
 async fn is_remote_file(client: &Client, path: &str) -> bool {
 	matches!(
 		client.find_item_at_path(path).await.unwrap(),
