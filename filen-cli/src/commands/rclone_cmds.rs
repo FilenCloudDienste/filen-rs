@@ -355,6 +355,9 @@ impl RcloneCommands {
 			Self::RcloneInfo { binary } => rclone_info(config, ui, &binary).await?,
 			Self::ClearRcloneCache => clear_rclone_cache(config, ui).await?,
 			Self::ExportApiKey => {
+				if !crate::auth::confirm_api_key_print(ui)? {
+					return Ok(CommandResult::default());
+				}
 				let client = client.get(ui).await?.to_stringified();
 				if ui.json {
 					ui.print_json(json!({

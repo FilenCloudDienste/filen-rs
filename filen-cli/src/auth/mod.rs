@@ -1118,6 +1118,34 @@ fn confirm_export(ui: &mut UI, path: &Path) -> Result<bool> {
 	Ok(true)
 }
 
+const API_KEY_PRINT_PROMPT: &str =
+	"This prints your API key, which gives full access to your account. Proceed?";
+
+/// Asks a person who reads the output to confirm printing the account's API key, before logging in.
+/// Returns whether to print it, and says so if not.
+pub(crate) fn confirm_api_key_print(ui: &mut UI) -> Result<bool> {
+	if confirm_secret_print(ui, API_KEY_PRINT_PROMPT)? {
+		return Ok(true);
+	}
+	ui.print_muted("API key not printed");
+	Ok(false)
+}
+
+/// Asks the user to confirm printing a secret with `msg`, which `--yes` answers, if a person reads
+/// the output and can be asked. Output to a pipe or a file, JSON, or a script without a terminal
+/// was asked for on purpose, and gets the secret without a prompt that would fail it.
+fn confirm_secret_print(ui: &mut UI, msg: &str) -> Result<bool> {
+	if !secret_print_needs_confirmation(ui, msg) {
+		return Ok(true);
+	}
+	ui.prompt_confirm(msg, false)
+}
+
+/// Whether printing a secret is confirmed first with `msg`, see [`confirm_secret_print`].
+fn secret_print_needs_confirmation(ui: &UI, msg: &str) -> bool {
+	ui.output_is_read_by_a_person() && ui.ensure_can_confirm(msg).is_ok()
+}
+
 /// What [`logout`] did.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum LogoutOutcome {
@@ -2063,6 +2091,38 @@ mod tests {
 		let printed = console::strip_ansi_codes(&printed.lines()).into_owned();
 		assert!(printed.starts_with("⚠ The system keyring is not used in the Docker image\n"));
 		assert!(printed.ends_with(&format!("✔ Saved credentials to {}", path.display())));
+	}
+
+	#[test]
+	fn a_secret_printed_to_a_terminal_is_confirmed_first() {
+		let printed = Printed::default();
+		let mut ui = printed.terminal_ui();
+		ui.set_assume_yes(true);
+		assert!(secret_print_needs_confirmation(&ui, API_KEY_PRINT_PROMPT));
+		assert!(confirm_api_key_print(&mut ui).unwrap());
+		assert_eq!(printed.lines_or_empty(), "");
+	}
+
+	#[test]
+	fn a_secret_printed_into_a_pipe_is_not_confirmed() {
+		let mut ui = Printed::default().prompting_ui();
+		assert!(!secret_print_needs_confirmation(&ui, API_KEY_PRINT_PROMPT));
+		assert!(confirm_api_key_print(&mut ui).unwrap());
+	}
+
+	#[test]
+	fn a_secret_printed_as_json_is_not_confirmed() {
+		let mut ui = Printed::default().terminal_ui();
+		ui.set_assume_yes(true);
+		ui.set_quiet_and_json(false, true);
+		assert!(!secret_print_needs_confirmation(&ui, API_KEY_PRINT_PROMPT));
+	}
+
+	#[test]
+	fn a_secret_printed_without_a_way_to_confirm_is_not_confirmed() {
+		let mut ui = Printed::default().terminal_ui();
+		assert!(!secret_print_needs_confirmation(&ui, API_KEY_PRINT_PROMPT));
+		assert!(confirm_api_key_print(&mut ui).unwrap());
 	}
 
 	/// An environment without any variables.
