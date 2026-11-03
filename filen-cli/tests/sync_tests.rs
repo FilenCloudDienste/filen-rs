@@ -156,6 +156,57 @@ async fn sync_with_only_a_paused_pair_says_so_and_exits_1() {
 	);
 }
 
+/// A pair of a sync pairs file with `excludeDotFiles` keeps its dot files local, through the
+/// `.filenignore` the CLI writes into its local root, which a two-way pair syncs.
+#[shared_test_runtime]
+async fn sync_once_with_exclude_dot_files_keeps_dot_files_local() {
+	// Not `get_resources_with_lock`, for the reason the first test gives.
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir_name = resources.dir.name().unwrap();
+	let local = assert_fs::TempDir::new().unwrap();
+	std::fs::write(local.path().join(".secret"), "stays here").unwrap();
+	std::fs::write(local.path().join("visible.txt"), "goes up").unwrap();
+	let config_dir = assert_fs::TempDir::new().unwrap();
+	let pairs_file = config_dir.path().join("pairs.json");
+	std::fs::write(
+		&pairs_file,
+		serde_json::json!([{
+			"local": local.path(),
+			"remote": test_dir_name,
+			"syncMode": "twoWay",
+			"excludeDotFiles": true,
+		}])
+		.to_string(),
+	)
+	.unwrap();
+
+	let output = sync(config_dir.path(), &["--once", pairs_file.to_str().unwrap()]).await;
+
+	assert_success(&output);
+	assert_eq!(
+		std::fs::read_to_string(local.path().join(".filenignore")).unwrap(),
+		".*\n!/.filenignore\n"
+	);
+	assert_eq!(
+		remote_content(client, &format!("{test_dir_name}/visible.txt")).await,
+		b"goes up"
+	);
+	assert_eq!(
+		remote_content(client, &format!("{test_dir_name}/.filenignore")).await,
+		b".*\n!/.filenignore\n"
+	);
+	assert!(
+		client
+			.find_item_at_path(&format!("{test_dir_name}/.secret"))
+			.await
+			.unwrap()
+			.is_none(),
+		"{}",
+		describe(&output)
+	);
+}
+
 /// A pair whose first `sync --once` agreed on `fight.txt`, which has since been changed on both
 /// sides, with the local root and the config dir that holds its database.
 async fn diverged_pair(

@@ -15,6 +15,10 @@ use crate::ui::UI;
 /// The name of the rule file the sync engine reads in each directory.
 const FILENIGNORE: &str = ".filenignore";
 
+/// The rules `excludeDotFiles` stands for: every dot file and dot directory, but the root's rule
+/// file itself, which a pair that uploads then syncs like the rest.
+pub(super) const EXCLUDE_DOT_FILES_RULES: &[&str] = &[".*", "!/.filenignore"];
+
 /// Adds each line of `rules` that the `.filenignore` at `root` does not hold yet to its end,
 /// creating the file if there is none. Lines already there are left as they are, so adding the
 /// same rules again changes nothing, and a rule that is no longer given is not removed.
@@ -111,7 +115,7 @@ fn write_replacing(
 mod tests {
 	use std::{fs, path::Path};
 
-	use super::{add_rules, merged_rules};
+	use super::{EXCLUDE_DOT_FILES_RULES, add_rules, merged_rules};
 
 	fn rules(lines: &[&str]) -> Vec<String> {
 		lines.iter().map(|line| (*line).to_owned()).collect()
@@ -175,6 +179,20 @@ mod tests {
 			"*.log\nbuild/\n"
 		);
 		assert_eq!(names(root.path()), [".filenignore"]);
+	}
+
+	/// The rules of `excludeDotFiles`, written on every run of the pair, are in the file once.
+	#[test]
+	fn the_dot_file_rules_are_written_once() {
+		let root = tempfile::tempdir().unwrap();
+
+		add_rules(root.path(), &rules(EXCLUDE_DOT_FILES_RULES)).unwrap();
+		add_rules(root.path(), &rules(EXCLUDE_DOT_FILES_RULES)).unwrap();
+
+		assert_eq!(
+			fs::read_to_string(root.path().join(".filenignore")).unwrap(),
+			".*\n!/.filenignore\n"
+		);
 	}
 
 	/// The engine does not read such a file, and rewriting it could lose what the user meant.

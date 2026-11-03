@@ -25,11 +25,13 @@
 //! A sync pairs file is YAML, or JSON as the TypeScript CLI's syncPairs.json was, that lists sync
 //! pairs under `syncPairs` or is a list of them. Each has a `local` and a `remote` path, and may
 //! have a `mode` (or `syncMode`; `twoWay` if not given), an `alias`, by which `filen sync <alias>`
-//! selects the pair of the default sync pairs file, and `ignore`, a list of ignore rules in
-//! `.filenignore` (gitignore) syntax. A leading `~` in a local path is the home directory, and a
+//! selects the pair of the default sync pairs file, `ignore`, a list of ignore rules in
+//! `.filenignore` (gitignore) syntax, and `excludeDotFiles: true`, which stands for the rules `.*`
+//! and `!/.filenignore`: every dot file and dot directory is left out of the sync, but the
+//! `.filenignore` itself. A leading `~` in a local path is the home directory, and a
 //! relative one is relative to the file's directory.
 //!
-//! Before a sync pair is synced, the `ignore` rules of its sync pairs file that the `.filenignore`
+//! Before a sync pair is synced, the rules of its sync pairs file that the `.filenignore`
 //! at its local root lacks are added to the end of that file, which is created if there is none.
 //! No line is ever removed: a rule taken out of the sync pairs file stays in `.filenignore` until
 //! you remove it there. A mode that uploads (`twoWay`, `localToRemote`, `localBackup`) syncs that

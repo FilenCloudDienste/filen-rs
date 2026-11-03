@@ -18,7 +18,7 @@ use filen_sdk_rs::{
 use filen_types::fs::Uuid;
 use serde::Deserialize;
 
-use super::ignore_file;
+use super::ignore_file::{self, EXCLUDE_DOT_FILES_RULES};
 use crate::{ui::UI, util::RemotePath};
 
 /// A sync pair to register: its local root, its mode, the remote directory it syncs with and the
@@ -485,9 +485,23 @@ fn read_sync_pairs_file(path: &Path) -> Result<Vec<ParsedPair>> {
 				mode,
 				remote: entry.remote,
 				alias: entry.alias,
-				ignore: entry.ignore,
+				ignore: entry_ignore_rules(entry.exclude_dot_files, entry.ignore),
 			})
 		})
+		.collect()
+}
+
+/// The ignore rules of a pair whose `ignore` key gives `ignore`: those, after the rules
+/// [`EXCLUDE_DOT_FILES_RULES`] if `exclude_dot_files`, so that an `ignore` rule can re-include a
+/// dot file.
+fn entry_ignore_rules(exclude_dot_files: bool, ignore: Vec<String>) -> Vec<String> {
+	if !exclude_dot_files {
+		return ignore;
+	}
+	EXCLUDE_DOT_FILES_RULES
+		.iter()
+		.map(|rule| (*rule).to_owned())
+		.chain(ignore)
 		.collect()
 }
 
@@ -514,6 +528,7 @@ struct SyncPairsFile {
 
 /// A sync pair in a sync pairs file.
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct SyncPairEntry {
 	local: String,
 	remote: String,
@@ -525,6 +540,9 @@ struct SyncPairEntry {
 	/// Ignore rules, in `.filenignore` syntax, for the `.filenignore` at the local root.
 	#[serde(default)]
 	ignore: Vec<String>,
+	/// Whether to leave out every dot file and dot directory, through [`EXCLUDE_DOT_FILES_RULES`].
+	#[serde(default)]
+	exclude_dot_files: bool,
 }
 
 /// Every mode with the names it is given by: the SDK's name in camelCase first, then the "cloud"
@@ -941,6 +959,32 @@ mod tests {
 				ignore: vec!["*.log".to_owned(), "build/".to_owned()],
 				..pair("/l", SyncMode::TwoWay, "/r")
 			}]
+		);
+	}
+
+	/// `excludeDotFiles` is two rules for the `.filenignore`, before the pair's own, which can
+	/// then re-include a dot file.
+	#[test]
+	fn exclude_dot_files_adds_the_rules_that_leave_out_dot_files() {
+		let (_dir, path) = sync_pairs_file(
+			"syncPairs.json",
+			r#"[{"local": "/l", "remote": "/r", "excludeDotFiles": true, "ignore": ["!.config"]},
+			    {"local": "/m", "remote": "/r", "excludeDotFiles": false}]"#,
+		);
+
+		assert_eq!(
+			read_sync_pairs_file(&path).unwrap(),
+			[
+				ParsedPair {
+					ignore: vec![
+						".*".to_owned(),
+						"!/.filenignore".to_owned(),
+						"!.config".to_owned()
+					],
+					..pair("/l", SyncMode::TwoWay, "/r")
+				},
+				pair("/m", SyncMode::TwoWay, "/r"),
+			]
 		);
 	}
 
