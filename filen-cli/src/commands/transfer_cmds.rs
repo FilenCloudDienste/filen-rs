@@ -107,15 +107,15 @@ pub(crate) async fn upload(
 	source_str: &str,
 	destination_str: Option<&str>,
 ) -> Result<()> {
-	// Canonicalizing both checks that the source exists and gives it a real file name, which
-	// paths like "." or "some/dir/.." don't have.
-	let source = std::fs::canonicalize(source_str)
+	// Made absolute without resolving symlinks, so an uploaded link keeps its own name.
+	let source = std::path::absolute(source_str)
 		.map_err(|_| UI::failure(&format!("No such local file or directory: {}", source_str)))?;
-	let name = source
-		.file_name()
-		.and_then(|name| name.to_str())
-		.ok_or_else(|| UI::failure(&format!("Cannot upload {}", source.display())))?
-		.to_string();
+	std::fs::symlink_metadata(&source)
+		.map_err(|_| UI::failure(&format!("No such local file or directory: {}", source_str)))?;
+	let is_dir = std::fs::metadata(&source)
+		.map_err(|e| UI::failure(&format!("Cannot read {}: {}", source.display(), e)))?
+		.is_dir();
+	let name = upload_name(&source)?;
 
 	let destination_path = working_path.navigate(destination_str.unwrap_or(""));
 	let client = client.get(ui).await?.clone();
@@ -137,7 +137,7 @@ pub(crate) async fn upload(
 	}?;
 
 	let progress = TransferProgress::new(TransferKind::Upload, ui);
-	let transferred = if source.is_dir() {
+	let transferred = if is_dir {
 		run_cancellable(
 			&progress,
 			upload_directory(&client, &progress, &source, &name, &destination_dir),
@@ -162,6 +162,25 @@ pub(crate) async fn upload(
 			destination_path.navigate(&name)
 		),
 	)
+}
+
+/// The name an upload of `source` takes: its last component as given, so a symlink keeps its own
+/// name instead of its target's. A path that ends without a name ("." or "some/dir/..") takes the
+/// name of the directory it resolves to.
+fn upload_name(source: &Path) -> Result<String> {
+	let name = match source.file_name() {
+		Some(name) => Cow::Borrowed(name),
+		None => Cow::Owned(
+			std::fs::canonicalize(source)
+				.with_context(|| format!("Failed to resolve {}", source.display()))?
+				.file_name()
+				.ok_or_else(|| UI::failure(&format!("Cannot upload {}", source.display())))?
+				.to_os_string(),
+		),
+	};
+	name.to_str()
+		.map(str::to_owned)
+		.ok_or_else(|| UI::failure(&format!("Cannot upload {}", source.display())))
 }
 
 /// Download a remote file, or a remote directory and everything below it, into a local directory.
@@ -650,5 +669,41 @@ mod tests {
 	#[test]
 	fn a_name_holding_a_separator_is_refused() {
 		assert_eq!(download_target(Path::new("/dest"), "a/b"), None);
+	}
+}
+
+#[cfg(all(test, unix))]
+mod upload_name_tests {
+	use std::os::unix::fs::symlink;
+
+	use super::upload_name;
+
+	#[test]
+	fn a_symlinked_file_keeps_the_links_name() {
+		let dir = tempfile::tempdir().unwrap();
+		std::fs::write(dir.path().join("target.txt"), b"data").unwrap();
+		symlink(dir.path().join("target.txt"), dir.path().join("link.txt")).unwrap();
+		assert_eq!(
+			upload_name(&dir.path().join("link.txt")).unwrap(),
+			"link.txt"
+		);
+	}
+
+	#[test]
+	fn a_symlinked_directory_keeps_the_links_name() {
+		let dir = tempfile::tempdir().unwrap();
+		std::fs::create_dir(dir.path().join("target")).unwrap();
+		symlink(dir.path().join("target"), dir.path().join("link")).unwrap();
+		assert_eq!(upload_name(&dir.path().join("link")).unwrap(), "link");
+	}
+
+	#[test]
+	fn a_path_ending_in_a_parent_reference_takes_the_resolved_directorys_name() {
+		let dir = tempfile::tempdir().unwrap();
+		std::fs::create_dir_all(dir.path().join("outer").join("inner")).unwrap();
+		assert_eq!(
+			upload_name(&dir.path().join("outer").join("inner").join("..")).unwrap(),
+			"outer"
+		);
 	}
 }
