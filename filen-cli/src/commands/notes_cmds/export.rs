@@ -20,52 +20,15 @@ use std::{
 };
 
 use anyhow::{Context as _, Result};
-use clap::Subcommand;
-use clap_complete::engine::{ArgValueCompleter, PathCompleter};
 use filen_sdk_rs::{auth::Client, notes::Note};
 use filen_types::api::v3::notes::NoteType;
 
-use crate::{CommandResult, auth::LazyClient, commands::CommandContext, docs::DocElement, ui::UI};
-
-#[derive(Debug, Subcommand)]
-pub(crate) enum NotesCommands {
-	/// Export all notes to a local directory
-	///
-	/// A directory that doesn't exist yet is created, and the notes are exported into it, as they
-	/// are into an empty directory. A directory that already holds something gets a new
-	/// `filen-notes-export-<timestamp>` subdirectory for them. Rich text notes are exported as
-	/// HTML, checklists as Markdown, and trashed and archived notes go into `trash` and `archive`
-	/// subdirectories.
-	ExportNotes {
-		/// Local directory to export the notes to (default: the current local directory). Used
-		/// directly when it is missing or empty, otherwise the notes go into a new timestamped
-		/// subdirectory of it
-		#[arg(add = ArgValueCompleter::new(PathCompleter::dir()))]
-		path: Option<String>,
-	},
-}
-
-/// The docs' "Notes" section.
-pub(crate) const DOCS: &[DocElement] = &[
-	DocElement::DocFragment("notes-export"),
-	DocElement::CommandHelp("export-notes"),
-];
-
-impl NotesCommands {
-	pub(super) async fn execute(self, ctx: CommandContext<'_>) -> Result<CommandResult> {
-		let CommandContext { ui, client, .. } = ctx;
-		match self {
-			Self::ExportNotes { path } => export_notes(ui, client, path.as_deref()).await?,
-		}
-		Ok(CommandResult::default())
-	}
-}
-
-use checklist_parser::checklist_html_to_markdown;
+use super::checklist::checklist_html_to_markdown;
+use crate::{auth::LazyClient, ui::UI};
 
 const ILLEGAL_FILE_NAME_CHARS: &[char] = &['<', '>', ':', '"', '/', '\\', '|', '?', '*'];
 
-pub(crate) async fn export_notes(
+pub(super) async fn export_notes(
 	ui: &mut UI,
 	client: &mut LazyClient,
 	export_root: Option<&str>,
@@ -207,6 +170,7 @@ fn target_path(export_root: &Path, note: &Note, used_paths: &mut HashSet<PathBuf
 		// least identifies the note.
 		_ => format!("note-{}", note.uuid()),
 	};
+
 	let extension = match note.note_type() {
 		NoteType::Rich => "html",
 		NoteType::Md | NoteType::Checklist => "md",
@@ -243,144 +207,6 @@ fn sanitize_file_name(file_name: &str) -> String {
 		.replace(ILLEGAL_FILE_NAME_CHARS, "_")
 		.trim()
 		.to_string()
-}
-
-mod checklist_parser {
-	/// Converts a checklist note's HTML to markdown task list items.
-	///
-	/// Checklist notes are stored as a series of `<ul data-checked="true|false">` blocks, each
-	/// holding one or more `<li>` items, e.g.
-	/// `<ul data-checked="false"><li>Item</li></ul><ul data-checked="true"><li>Done</li></ul>`.
-	/// Anything that doesn't match that shape is ignored rather than producing garbage.
-	pub(super) fn checklist_html_to_markdown(html: &str) -> String {
-		let mut items: Vec<String> = Vec::new();
-		let mut rest = html;
-
-		while let Some((_, after_tag_name)) = rest.split_once("<ul") {
-			let Some((attributes, body_start)) = after_tag_name.split_once('>') else {
-				break;
-			};
-			let checked =
-				attribute_value(attributes, "data-checked").is_some_and(|value| value == "true");
-
-			// A missing closing tag means the rest of the input is the list body.
-			let (body, remainder) = body_start.split_once("</ul>").unwrap_or((body_start, ""));
-
-			for text in list_item_texts(body) {
-				items.push(format!("- [{}] {}", if checked { "x" } else { " " }, text));
-			}
-			rest = remainder;
-		}
-
-		items.join("\n")
-	}
-
-	/// Reads the value of a double- or single-quoted attribute out of a tag's attribute list.
-	fn attribute_value<'a>(attributes: &'a str, name: &str) -> Option<&'a str> {
-		let (_, rest) = attributes.split_once(name)?;
-		let rest = rest.trim_start().strip_prefix('=')?.trim_start();
-		let mut value = rest.chars();
-		let quote = value.next().filter(|c| matches!(c, '"' | '\''))?;
-		value.as_str().split_once(quote).map(|(value, _)| value)
-	}
-
-	/// Yields the text of every `<li>` in `body`, with nested inline tags stripped and entities
-	/// decoded — the equivalent of cheerio's `$(li).text().trim()`.
-	fn list_item_texts(body: &str) -> Vec<String> {
-		let mut texts = Vec::new();
-		let mut rest = body;
-
-		while let Some((_, after_tag_name)) = rest.split_once("<li") {
-			let Some((_, content_start)) = after_tag_name.split_once('>') else {
-				break;
-			};
-			let (content, remainder) = content_start
-				.split_once("</li>")
-				.unwrap_or((content_start, ""));
-			texts.push(decode_entities(&strip_tags(content)).trim().to_string());
-			rest = remainder;
-		}
-
-		texts
-	}
-
-	fn strip_tags(html: &str) -> String {
-		let mut result = String::with_capacity(html.len());
-		let mut in_tag = false;
-		for c in html.chars() {
-			match c {
-				'<' => in_tag = true,
-				'>' => in_tag = false,
-				_ if !in_tag => result.push(c),
-				_ => {}
-			}
-		}
-		result
-	}
-
-	fn decode_entities(text: &str) -> String {
-		// `&amp;` is decoded last so that e.g. `&amp;lt;` stays the literal text "&lt;".
-		text.replace("&nbsp;", " ")
-			.replace("&lt;", "<")
-			.replace("&gt;", ">")
-			.replace("&quot;", "\"")
-			.replace("&#39;", "'")
-			.replace("&apos;", "'")
-			.replace("&amp;", "&")
-	}
-
-	#[cfg(test)]
-	mod tests {
-		use super::*;
-
-		#[test]
-		fn convert_checklist() {
-			let html = "<ul data-checked=\"false\"><li>Item 1</li><li>Item 2</li></ul>\
-			<ul data-checked=\"true\"><li>Checked item</li></ul>\
-			<ul data-checked=\"false\"><li>other</li></ul>";
-			assert_eq!(
-				checklist_html_to_markdown(html),
-				"- [ ] Item 1\n- [ ] Item 2\n- [x] Checked item\n- [ ] other"
-			);
-		}
-
-		#[test]
-		fn convert_checklist_edge_cases() {
-			assert_eq!(checklist_html_to_markdown(""), "");
-			assert_eq!(checklist_html_to_markdown("<p>not a checklist</p>"), "");
-			// nested inline formatting is flattened, entities are decoded
-			assert_eq!(
-				checklist_html_to_markdown(
-					"<ul data-checked=\"true\"><li> <strong>bold</strong> &amp; <em>italic</em> </li></ul>"
-				),
-				"- [x] bold & italic"
-			);
-			// a missing data-checked attribute means unchecked
-			assert_eq!(
-				checklist_html_to_markdown("<ul><li>Item</li></ul>"),
-				"- [ ] Item"
-			);
-			// single quotes are accepted too
-			assert_eq!(
-				checklist_html_to_markdown("<ul data-checked='true'><li>Item</li></ul>"),
-				"- [x] Item"
-			);
-			// unterminated markup doesn't panic or loop forever
-			assert_eq!(
-				checklist_html_to_markdown("<ul data-checked=\"true\"><li>Item"),
-				"- [x] Item"
-			);
-			assert_eq!(checklist_html_to_markdown("<ul"), "");
-		}
-
-		#[test]
-		fn decode_entity_sequences() {
-			assert_eq!(decode_entities("a &amp; b"), "a & b");
-			assert_eq!(decode_entities("&lt;tag&gt;"), "<tag>");
-			// a double-escaped entity stays literal
-			assert_eq!(decode_entities("&amp;lt;"), "&lt;");
-		}
-	}
 }
 
 #[cfg(test)]
