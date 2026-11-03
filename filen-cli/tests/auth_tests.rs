@@ -1,10 +1,11 @@
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+use std::{panic::AssertUnwindSafe, time::Duration};
 
 use assert_cmd::cargo::cargo_bin_cmd;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use filen_macros::shared_test_runtime;
-use filen_sdk_rs::auth::Client;
+use filen_sdk_rs::auth::{Client, TwoFASecret};
 use predicates::prelude::PredicateBooleanExt as _;
 use test_utils::authenticated_cli_with_args;
 
@@ -401,3 +402,104 @@ async fn an_auth_config_of_the_old_cli_in_the_working_dir_is_imported_and_kept()
 
 // todo: test prompting for 2fa code (need another test account with 2fa enabled for that?)
 // -> I think there isn't currently one in CI, so do that later
+
+/// The CLI in an empty working dir with `config_dir`, and with no credentials but those a test
+/// gives it: no keyring, no autodetected auth config, none of the credential variables.
+fn cli_without_stored_credentials(
+	working_dir: &std::path::Path,
+	config_dir: &std::path::Path,
+) -> assert_cmd::Command {
+	let mut cmd = cargo_bin_cmd!();
+	cmd.current_dir(working_dir)
+		.env("FILEN_CLI_TESTING_DISABLE_KEYRING", "1")
+		.env("FILEN_CLI_TESTING_DISABLE_AUTODETECTED_AUTH_CONFIG", "1")
+		.env_remove("FILEN_CLI_EMAIL")
+		.env_remove("FILEN_CLI_PASSWORD")
+		.env_remove("FILEN_CLI_2FA_CODE")
+		.env_remove("FILEN_CLI_2FA_SECRET")
+		.env_remove("FILEN_EMAIL")
+		.env_remove("FILEN_PASSWORD")
+		.env_remove("FILEN_2FA_CODE")
+		.args([
+			"--skip-update",
+			"--config-dir",
+			config_dir.to_str().unwrap(),
+		]);
+	cmd
+}
+
+/// Enables 2FA on the test account, retrying while the server refuses the code, and returns the
+/// recovery key.
+async fn enable_two_factor(client: &Client, secret: &TwoFASecret) -> String {
+	for _ in 0..10 {
+		match client
+			.enable_2fa(&secret.make_totp_code(chrono::Utc::now()).unwrap())
+			.await
+		{
+			Ok(recovery_key) => return recovery_key,
+			Err(e) => {
+				eprintln!("Failed to enable 2FA, retrying: {e}");
+				tokio::time::sleep(Duration::from_secs(5)).await;
+			}
+		}
+	}
+	panic!("Failed to enable 2FA after 10 attempts");
+}
+
+/// Disables 2FA on the test account with the recovery key, or, if a login with that key turned
+/// 2FA off or replaced the key, checks that it is off or disables it with a code of `secret`.
+async fn disable_two_factor(client: &Client, secret: &TwoFASecret, recovery_key: &str) {
+	let Err(e) = client.disable_2fa(recovery_key).await else {
+		return;
+	};
+	eprintln!("Failed to disable 2FA with the recovery key: {e}");
+	// only succeeds while 2FA is off
+	if client.generate_2fa_secret().await.is_ok() {
+		return;
+	}
+	client
+		.disable_2fa(&secret.make_totp_code(chrono::Utc::now()).unwrap())
+		.await
+		.expect("2FA could not be disabled: disable it on the test account by hand");
+}
+
+/// Runs `run` with the 2FA secret and the recovery key while 2FA is enabled on the test account,
+/// and disables it again afterwards, also when `run` panicked: while 2FA is on, every other login
+/// to the shared account fails.
+async fn with_two_factor_enabled(run: impl FnOnce(&TwoFASecret, &str)) {
+	let client = test_utils::RESOURCES.client().await;
+	let _lock = client.lock_auth().await.unwrap();
+	let secret = client.generate_2fa_secret().await.unwrap();
+	let recovery_key = enable_two_factor(&client, &secret).await;
+	let result = std::panic::catch_unwind(AssertUnwindSafe(|| run(&secret, &recovery_key)));
+	disable_two_factor(&client, &secret, &recovery_key).await;
+	if let Err(panic) = result {
+		std::panic::resume_unwind(panic);
+	}
+}
+
+#[shared_test_runtime]
+#[ignore = "toggles 2FA on the shared account"]
+async fn a_two_factor_code_is_made_from_the_secret_in_the_environment() {
+	let (email, password) = get_testing_credentials();
+	let working_dir = assert_fs::TempDir::new().unwrap();
+	let config_dir = assert_fs::TempDir::new().unwrap();
+	with_two_factor_enabled(|secret, _| {
+		// twice, as a script would: the server takes each code once, and enabling 2FA used one,
+		// so each run may find its first code used and have to wait for the next one
+		for _ in 0..2 {
+			cli_without_stored_credentials(working_dir.path(), config_dir.path())
+				.env("FILEN_CLI_EMAIL", &email)
+				.env("FILEN_CLI_PASSWORD", &password)
+				.env("FILEN_CLI_2FA_SECRET", secret.secret())
+				.args(["--no-input", "-v", "stat", "/"])
+				.assert()
+				.success()
+				.stderr(predicates::str::contains(
+					"Logging in with a two-factor code made from FILEN_CLI_2FA_SECRET",
+				))
+				.stderr(predicates::str::contains(secret.secret()).not());
+		}
+	})
+	.await;
+}

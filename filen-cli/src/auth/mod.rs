@@ -5,6 +5,12 @@
 //!    (when none of these is set, the variables `FILEN_EMAIL`, `FILEN_PASSWORD` and
 //!    `FILEN_2FA_CODE` of the old Filen CLI are used; when a two-factor code is required
 //!    and not given, you are prompted for it)
+//!
+//!    To log in to an account with two-factor authentication without anyone to type a code,
+//!    set `FILEN_CLI_2FA_SECRET` to its TOTP secret (the key your authenticator app was set up with):
+//!    the CLI then makes the code itself. Keep in mind that anyone who can read the CLI's
+//!    environment then has your second factor too, which defeats two-factor authentication
+//!    on that machine.
 //! 2. an auth config file, exported with `filen export-auth-config`: the one given with
 //!    `--auth-config-path`, or else `./filen-cli-auth-config.txt` (in the current working
 //!    directory), then `filen-cli-auth-config.txt` in the config dir
@@ -38,9 +44,10 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow};
+use chrono::{DateTime, Utc};
 use filen_sdk_rs::{
 	ErrorKind,
-	auth::{Client, unauth::UnauthClient},
+	auth::{Client, TwoFASecret, unauth::UnauthClient},
 	fs::HasUUID as _,
 };
 
@@ -279,6 +286,11 @@ async fn try_login(
 		Ok(client) => return Ok(Ok(client)),
 		Err(e) => e,
 	};
+	if e.kind() == ErrorKind::Enter2fa
+		&& let Some(secret) = totp_secret_from(|name| std::env::var(name).ok())
+	{
+		return login_with_totp_secret(ui, &unauth_client, email, password, &secret).await;
+	}
 	let can_prompt = ui.ensure_can_prompt(TWO_FACTOR_CODE_PROMPT).is_ok();
 	match two_factor_prompt_after(e.kind(), can_prompt) {
 		Some(TwoFactorPrompt::Required) => {}
@@ -298,6 +310,118 @@ async fn try_login(
 			error,
 			context: "Failed to log in (with 2fa)",
 		}))
+}
+
+/// The variable holding the TOTP secret two-factor codes are made from, for logins without anyone
+/// to type a code. Not a CLI argument, so that it never shows in the help or in a process list.
+/// (! referenced in module docs)
+const TOTP_SECRET_VAR: &str = "FILEN_CLI_2FA_SECRET";
+
+/// The TOTP secret in [`TOTP_SECRET_VAR`], which `env` looks up, if it is set and not empty.
+fn totp_secret_from(env: impl Fn(&str) -> Option<String>) -> Option<String> {
+	env(TOTP_SECRET_VAR).filter(|secret| !secret.is_empty())
+}
+
+/// The two-factor code that the TOTP `secret` gives at `now`. `email` only names the account in
+/// the secret's URL, which is not used.
+fn totp_code(secret: &str, email: &str, now: DateTime<Utc>) -> Result<String> {
+	// the SDK takes the secret by value
+	TwoFASecret::new(secret.to_owned(), email)
+		.make_totp_code(now)
+		.map_err(|e| {
+			// the error names neither the secret nor a code
+			UI::failure(&format!(
+				"{TOTP_SECRET_VAR} is not a valid two-factor authentication secret ({e})"
+			))
+		})
+}
+
+/// Log in with a code made from the TOTP `secret`, for an account that asked for a two-factor code.
+///
+/// The server takes each code once, so a code is wrong if an earlier login used it, such as the
+/// previous run of a script within the same 30 second step, and it is also wrong if it was made
+/// just before its step ended. Either way the next step's code is new: a wrong code is retried
+/// once with it, waiting for that step to begin if it has not yet.
+async fn login_with_totp_secret(
+	ui: &mut UI,
+	unauth_client: &UnauthClient,
+	email: &str,
+	password: &str,
+	secret: &str,
+) -> Result<std::result::Result<Client, RefusedLogin>> {
+	// neither the secret nor the codes made from it are logged
+	log::info!("Logging in with a two-factor code made from {TOTP_SECRET_VAR}");
+	let mut code = totp_code(secret, email, Utc::now())?;
+	for attempt in 1..=TOTP_LOGIN_ATTEMPTS {
+		match unauth_client.login(email.to_owned(), password, &code).await {
+			Ok(client) => return Ok(Ok(client)),
+			Err(error) if error.kind() == ErrorKind::Wrong2fa => {}
+			Err(error) => {
+				return Ok(Err(RefusedLogin {
+					error,
+					context: "Failed to log in (with a code from the two-factor secret)",
+				}));
+			}
+		}
+		if attempt == TOTP_LOGIN_ATTEMPTS {
+			break;
+		}
+		code = match next_totp_code(secret, email, &code, Utc::now())? {
+			NextTotpCode::Now(next_code) => next_code,
+			NextTotpCode::After(wait) => {
+				ui.print_muted_to_stderr(&format!(
+					"Waiting {} s for the next two-factor code",
+					wait.as_secs()
+				));
+				tokio::time::sleep(wait).await;
+				totp_code(secret, email, Utc::now())?
+			}
+		};
+		log::info!("Retrying with the two-factor code of the next step");
+	}
+	// a failure, not a refused login: typing the email and password again would not help
+	Err(UI::failure(&format!(
+		"{WRONG_TWO_FACTOR_CODE}: check the secret in {TOTP_SECRET_VAR} and the system clock"
+	)))
+}
+
+/// The code to retry a login with after the server refused `code`, made from the TOTP `secret`.
+#[derive(Debug, PartialEq, Eq)]
+enum NextTotpCode {
+	/// The code of the step at the time, which differs from the refused one.
+	Now(String),
+	/// The refused code is the one of the step at the time: the next step begins after this long.
+	After(Duration),
+}
+
+/// What to retry a login with after the server refused `code`, made from the TOTP `secret`, at
+/// `now`.
+fn next_totp_code(
+	secret: &str,
+	email: &str,
+	code: &str,
+	now: DateTime<Utc>,
+) -> Result<NextTotpCode> {
+	let next_code = totp_code(secret, email, now)?;
+	Ok(if next_code == code {
+		NextTotpCode::After(time_until_next_totp_step(now))
+	} else {
+		NextTotpCode::Now(next_code)
+	})
+}
+
+/// How many codes made from the TOTP secret a login tries.
+const TOTP_LOGIN_ATTEMPTS: u32 = 2;
+
+/// How long a TOTP code of Filen is valid.
+const TOTP_STEP_SECS: i64 = 30;
+
+/// The time from `now` until the next TOTP step begins, at least a second and at most a step.
+fn time_until_next_totp_step(now: DateTime<Utc>) -> Duration {
+	// from the start of the second, which `timestamp` rounds down to, so never too short
+	Duration::from_secs(
+		(TOTP_STEP_SECS - now.timestamp().rem_euclid(TOTP_STEP_SECS)).unsigned_abs(),
+	)
 }
 
 const TWO_FACTOR_CODE_PROMPT: &str = "Two-factor authentication code: ";
@@ -1964,6 +2088,105 @@ mod tests {
 
 		assert_eq!(format!("{err:#}"), "Canceled");
 		assert_eq!(printed.lines_or_empty(), "");
+	}
+
+	/// The SHA-1 seed of the RFC 6238 test vectors, `12345678901234567890`, in base32.
+	const RFC_6238_SECRET: &str = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
+
+	fn at(timestamp: i64) -> DateTime<Utc> {
+		DateTime::from_timestamp(timestamp, 0).expect("a timestamp in range")
+	}
+
+	#[test]
+	fn the_two_factor_secret_gives_the_code_of_the_time() {
+		// the last six digits of the RFC 6238 test vectors
+		for (timestamp, code) in [
+			(59, "287082"),
+			(1111111109, "081804"),
+			(1234567890, "005924"),
+		] {
+			assert_eq!(
+				totp_code(RFC_6238_SECRET, "user@example.com", at(timestamp)).unwrap(),
+				code
+			);
+		}
+	}
+
+	#[test]
+	fn a_code_from_the_two_factor_secret_changes_only_with_the_next_step() {
+		let code =
+			|timestamp| totp_code(RFC_6238_SECRET, "user@example.com", at(timestamp)).unwrap();
+		assert_eq!(code(30), code(59));
+		assert_ne!(code(59), code(60));
+	}
+
+	#[test]
+	fn the_wait_for_the_next_code_ends_when_its_step_begins() {
+		assert_eq!(time_until_next_totp_step(at(30)), Duration::from_secs(30));
+		assert_eq!(time_until_next_totp_step(at(31)), Duration::from_secs(29));
+		assert_eq!(time_until_next_totp_step(at(59)), Duration::from_secs(1));
+		let late_in_the_last_second = DateTime::from_timestamp(59, 999_000_000).unwrap();
+		assert_eq!(
+			time_until_next_totp_step(late_in_the_last_second),
+			Duration::from_secs(1)
+		);
+	}
+
+	#[test]
+	fn a_refused_code_of_the_current_step_waits_for_the_next_step() {
+		assert_eq!(
+			next_totp_code(RFC_6238_SECRET, "user@example.com", "287082", at(59)).unwrap(),
+			NextTotpCode::After(Duration::from_secs(1))
+		);
+		assert_eq!(
+			next_totp_code(RFC_6238_SECRET, "user@example.com", "287082", at(30)).unwrap(),
+			NextTotpCode::After(Duration::from_secs(30))
+		);
+	}
+
+	#[test]
+	fn a_refused_code_of_an_earlier_step_is_retried_with_the_current_one_at_once() {
+		assert_eq!(
+			next_totp_code(
+				RFC_6238_SECRET,
+				"user@example.com",
+				"287082",
+				at(1111111109)
+			)
+			.unwrap(),
+			NextTotpCode::Now("081804".to_owned())
+		);
+	}
+
+	#[test]
+	fn an_invalid_two_factor_secret_fails_without_naming_it() {
+		let secret = "not base32!";
+		let error = totp_code(secret, "user@example.com", at(59)).unwrap_err();
+		let message = format!("{error:#}");
+		assert!(
+			message.starts_with(
+				"FILEN_CLI_2FA_SECRET is not a valid two-factor authentication secret"
+			),
+			"{message}"
+		);
+		assert!(!message.contains(secret), "{message}");
+	}
+
+	#[test]
+	fn the_two_factor_secret_is_read_from_its_variable() {
+		assert_eq!(
+			totp_secret_from(env_with(&[("FILEN_CLI_2FA_SECRET", RFC_6238_SECRET)])).as_deref(),
+			Some(RFC_6238_SECRET)
+		);
+	}
+
+	#[test]
+	fn an_empty_or_unset_two_factor_secret_is_none() {
+		assert_eq!(totp_secret_from(no_env), None);
+		assert_eq!(
+			totp_secret_from(env_with(&[("FILEN_CLI_2FA_SECRET", "")])),
+			None
+		);
 	}
 
 	/// A keyring that fails every access, as one without a keyring service does.
