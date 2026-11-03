@@ -318,7 +318,7 @@ fn no_sync_pairs_message(candidates: &[PathBuf]) -> String {
 	format!(
 		"No sync pairs given, and there is no sync pairs file at {paths}.\n\
 		 Give each sync pair as <local>:<remote> or <local>:<mode>:<remote>, as in \
-		 `filen sync --pair /home/me/docs:/docs`, or the path to a sync pairs file, \
+		 `filen sync /home/me/docs:/docs`, or the path to a sync pairs file, \
 		 or create that file like this:\n\
 		 syncPairs:\n  \
 		 - local: /home/me/docs\n    \

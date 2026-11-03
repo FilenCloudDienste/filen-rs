@@ -68,9 +68,11 @@ pub(crate) enum SyncCommands {
 		/// The remote path is what follows the last `:`, so a remote path with a `:` in it can only be given in a sync pairs file.
 		/// Alternatively, specify a syncPairs.yaml.
 		/// If none are specified, the default syncPairs.yaml under the config dir is included.
-		// todo: better command docs!
-		#[arg(short = 'p', long = "pair")]
+		#[arg(value_name = "PAIR")]
 		pairs: Vec<String>,
+		/// A sync pair, as a PAIR argument gives it.
+		#[arg(short = 'p', long = "pair", value_name = "PAIR")]
+		pair_options: Vec<String>,
 		/// Run one sync pass for each sync pair, then exit.
 		#[arg(long)]
 		once: bool,
@@ -116,6 +118,7 @@ impl SyncCommands {
 		match self {
 			Self::Sync {
 				pairs,
+				pair_options,
 				once,
 				// the default, which `--once` turns off
 				continuous: _,
@@ -132,6 +135,7 @@ impl SyncCommands {
 						keep_both,
 					)?,
 				};
+				let pairs = given_pairs(pairs, pair_options);
 				// before logging in, so that a bad definition fails at once
 				let parsed = sync_pairs::parse_sync_pairs(&config.config_dir, &pairs)?;
 				let client = client.get(ui).await?;
@@ -149,6 +153,11 @@ impl SyncCommands {
 		}
 		Ok(CommandResult::default())
 	}
+}
+
+/// The sync pairs given as arguments, then those given with `--pair`.
+fn given_pairs(pairs: Vec<String>, pair_options: Vec<String>) -> Vec<String> {
+	pairs.into_iter().chain(pair_options).collect()
 }
 
 /// What the flags settle of what the first pass of each pair finds.
@@ -605,7 +614,36 @@ mod tests {
 
 	use filen_sdk_rs::{Error, ErrorKind, sync_engine::BaselineInUse};
 
-	use super::{open_failure, unsyncable_notices};
+	use super::{SyncCommands, given_pairs, open_failure, unsyncable_notices};
+	use crate::{commands::Commands, parse_repl_line};
+
+	/// The pairs the REPL line `line`, a `sync` command, gives.
+	fn pairs_of(line: &str) -> Vec<String> {
+		match parse_repl_line(line).unwrap().command {
+			Some(Commands::Sync(SyncCommands::Sync {
+				pairs,
+				pair_options,
+				..
+			})) => given_pairs(pairs, pair_options),
+			other => panic!("expected a sync command, got {other:?}"),
+		}
+	}
+
+	#[test]
+	fn a_sync_pair_can_be_an_argument() {
+		assert_eq!(
+			pairs_of("sync /home/me/docs:/docs"),
+			["/home/me/docs:/docs"]
+		);
+	}
+
+	#[test]
+	fn sync_pairs_given_as_arguments_and_with_pair_are_all_synced() {
+		assert_eq!(
+			pairs_of("sync /a:/b --pair /c:lb:/d /e:/f"),
+			["/a:/b", "/e:/f", "/c:lb:/d"]
+		);
+	}
 
 	/// A pass that held case twins back completes with no errors, so the twins are named on their
 	/// own lines, with what resolves them.
