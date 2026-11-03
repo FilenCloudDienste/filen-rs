@@ -852,33 +852,83 @@ fn prompted_login_retry(kind: ErrorKind, attempt: u32) -> Option<&'static str> {
 
 const KEEP_LOGGED_IN_PROMPT: &str = "Keep me logged in?";
 
-/// Offer to save the login of `client` in the keyring, or, if that fails, in an auth config file.
+/// Offer to save the login of `client` in the keyring, or, where that is not possible, in an auth
+/// config file. The answer defaults to yes, unlike in the old Filen CLI, since the login is kept
+/// in the system keyring, not in a file.
 fn offer_to_keep_logged_in(config: &CliConfig, ui: &mut UI, client: &Client) -> Result<()> {
 	if !ui.prompt_confirm(KEEP_LOGGED_IN_PROMPT, true)? {
 		return Ok(());
 	}
 	let sdk_config = serialize_auth_config(client)?;
 	let location = KeyringLocation::of(config);
-	match LongKeyringEntry::new(&location.store(), &location.entry_name).write(&sdk_config) {
-		Ok(_) => {
+	let store = location.store();
+	// a container has no keyring service to keep a login in
+	let keyring_entry =
+		(!cfg!(feature = "is_docker")).then(|| LongKeyringEntry::new(&store, &location.entry_name));
+	keep_login(
+		&config.config_dir,
+		ui,
+		&sdk_config,
+		keyring_entry.as_ref(),
+		confirm_auth_config,
+	)
+}
+
+/// Asks whether to save the login in an auth config file with `msg`, which `--yes` answers.
+fn confirm_auth_config(ui: &mut UI, msg: &str) -> Result<bool> {
+	ui.prompt_confirm(msg, false)
+}
+
+/// Save the login `sdk_config` in `keyring_entry`, or, without one or if that fails, explain the
+/// other ways to stay logged in and offer, through `ask`, to save it in an auth config file in
+/// `config_dir`.
+fn keep_login(
+	config_dir: &Path,
+	ui: &mut UI,
+	sdk_config: &str,
+	keyring_entry: Option<&LongKeyringEntry<'_>>,
+	ask: impl FnOnce(&mut UI, &str) -> Result<bool>,
+) -> Result<()> {
+	let problem = match keyring_entry.map(|entry| entry.write(sdk_config)) {
+		Some(Ok(())) => {
 			ui.print_success("Saved credentials");
+			return Ok(());
 		}
-		Err(_) => {
-			ui.print_failure("Failed to save credentials in keyring");
-			// a choice of where to keep the credentials, which --yes does not make
-			if ui.prompt_yes_no(
-				&format!(
-					"Instead, export an auth config to {}?",
-					config.config_dir.join(AUTH_CONFIG_FILENAME).display()
-				),
-				false,
-			)? {
-				export_auth_config(client, &config.config_dir.join(AUTH_CONFIG_FILENAME))
-					.context("Failed to export auth config")?;
-			}
+		Some(Err(e)) => {
+			log::warn!("Failed to save the credentials in the keyring: {:#}", e);
+			"Failed to save the credentials in the system keyring"
 		}
+		None => "The system keyring is not used in the Docker image",
+	};
+	ui.print_warning(problem);
+	ui.print_to_stderr(&keep_login_without_keyring_hint(config_dir));
+	if !ask(
+		ui,
+		&format!(
+			"Save an unencrypted auth config file in {} instead?",
+			config_dir.display()
+		),
+	)? {
+		return Ok(());
 	}
+	let path = config_dir.join(AUTH_CONFIG_FILENAME);
+	write_private_file(&path, sdk_config)
+		.with_context(|| format!("Failed to write auth config to file {}", path.display()))?;
+	ui.print_success(&format!("Saved credentials to {}", path.display()));
 	Ok(())
+}
+
+/// The ways to stay logged in without the system keyring, with the config dir `config_dir`.
+fn keep_login_without_keyring_hint(config_dir: &Path) -> String {
+	format!(
+		"To stay logged in without it, either:\n\
+		 - save an auth config file in {}, which only you can read, but which holds your \
+		 credentials unencrypted\n\
+		 - pass --email and --password (or set FILEN_CLI_EMAIL and FILEN_CLI_PASSWORD) on each run\n\
+		 - export an auth config with `filen export-auth-config` and pass --auth-config-path on \
+		 each run",
+		config_dir.display()
+	)
 }
 
 /// Authenticate with credentials the old Filen CLI saved, the first of them that can be imported,
@@ -1287,7 +1337,9 @@ fn delete_sqlite_database(path: &Path) -> Result<()> {
 mod tests {
 	use super::*;
 	use crate::{
-		error::exit_code, ui::test_support::Printed, util::test_support::MemoryChunkStore,
+		error::exit_code,
+		ui::test_support::Printed,
+		util::{ChunkStore, test_support::MemoryChunkStore},
 	};
 
 	/// A config in a fresh config dir.
@@ -1881,6 +1933,136 @@ mod tests {
 
 		assert_eq!(format!("{err:#}"), "Canceled");
 		assert_eq!(printed.lines_or_empty(), "");
+	}
+
+	/// A keyring that fails every access, as one without a keyring service does.
+	struct UnavailableChunkStore;
+
+	impl ChunkStore for UnavailableChunkStore {
+		fn get(&self, _key: &str) -> Result<Option<String>> {
+			Err(anyhow!("no keyring service"))
+		}
+
+		fn set(&self, _key: &str, _value: &str) -> Result<()> {
+			Err(anyhow!("no keyring service"))
+		}
+
+		fn delete(&self, _key: &str) -> Result<bool> {
+			Err(anyhow!("no keyring service"))
+		}
+	}
+
+	#[test]
+	fn a_kept_login_is_saved_in_the_keyring() {
+		let (dir, _config) = config_in_temp_dir();
+		let store = MemoryChunkStore::default();
+		let entry = LongKeyringEntry::new(&store, "sdk-config");
+		let printed = Printed::default();
+
+		keep_login(
+			dir.path(),
+			&mut printed.ui(),
+			"the sdk config",
+			Some(&entry),
+			|_, _| panic!("a login saved in the keyring needs no other place"),
+		)
+		.unwrap();
+
+		assert_eq!(entry.read().unwrap().as_deref(), Some("the sdk config"));
+		assert!(!dir.path().join(AUTH_CONFIG_FILENAME).exists());
+		assert_eq!(
+			console::strip_ansi_codes(&printed.lines()),
+			"✔ Saved credentials"
+		);
+	}
+
+	#[test]
+	fn without_a_keyring_the_options_are_explained_and_an_auth_config_is_offered() {
+		let (dir, _config) = config_in_temp_dir();
+		let store = UnavailableChunkStore;
+		let entry = LongKeyringEntry::new(&store, "sdk-config");
+		let printed = Printed::default();
+		let mut asked = None;
+
+		keep_login(
+			dir.path(),
+			&mut printed.ui(),
+			"the sdk config",
+			Some(&entry),
+			|_, msg| {
+				asked = Some(msg.to_owned());
+				Ok(false)
+			},
+		)
+		.unwrap();
+
+		assert_eq!(
+			asked,
+			Some(format!(
+				"Save an unencrypted auth config file in {} instead?",
+				dir.path().display()
+			))
+		);
+		assert!(!dir.path().join(AUTH_CONFIG_FILENAME).exists());
+		assert_eq!(
+			console::strip_ansi_codes(&printed.lines()),
+			format!(
+				"⚠ Failed to save the credentials in the system keyring\n\
+				 To stay logged in without it, either:\n\
+				 - save an auth config file in {}, which only you can read, but which holds your \
+				 credentials unencrypted\n\
+				 - pass --email and --password (or set FILEN_CLI_EMAIL and FILEN_CLI_PASSWORD) on \
+				 each run\n\
+				 - export an auth config with `filen export-auth-config` and pass \
+				 --auth-config-path on each run",
+				dir.path().display()
+			)
+		);
+	}
+
+	#[test]
+	fn yes_accepts_the_offer_of_an_auth_config_without_a_terminal() {
+		let (dir, _config) = config_in_temp_dir();
+		let mut ui = Printed::default().ui();
+		ui.set_assume_yes(true);
+
+		keep_login(
+			dir.path(),
+			&mut ui,
+			"the sdk config",
+			None,
+			confirm_auth_config,
+		)
+		.unwrap();
+
+		let path = dir.path().join(AUTH_CONFIG_FILENAME);
+		assert_eq!(std::fs::read_to_string(&path).unwrap(), "the sdk config");
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn without_the_keyring_an_accepted_offer_saves_an_owner_only_auth_config() {
+		let (dir, _config) = config_in_temp_dir();
+		let printed = Printed::default();
+
+		keep_login(
+			dir.path(),
+			&mut printed.ui(),
+			"the sdk config",
+			None,
+			|_, _| Ok(true),
+		)
+		.unwrap();
+
+		let path = dir.path().join(AUTH_CONFIG_FILENAME);
+		assert_eq!(std::fs::read_to_string(&path).unwrap(), "the sdk config");
+		assert_eq!(
+			std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+			0o600
+		);
+		let printed = console::strip_ansi_codes(&printed.lines()).into_owned();
+		assert!(printed.starts_with("⚠ The system keyring is not used in the Docker image\n"));
+		assert!(printed.ends_with(&format!("✔ Saved credentials to {}", path.display())));
 	}
 
 	/// An environment without any variables.
