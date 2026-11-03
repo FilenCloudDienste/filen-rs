@@ -5,10 +5,11 @@
 //! Like `cp`, both commands place the transferred item *inside* the destination when it is an
 //! existing directory or ends in `/`, keeping its name: `upload ./notes /backups` creates
 //! `/backups/notes`, and `download /backups/notes .` creates `./notes`. Any other destination is
-//! the transferred item's new path: `upload ./notes.txt /backups/old.txt` uploads it as `old.txt`.
-//! Uploading a file to the path of an existing file replaces it with a new version. Missing
-//! directories on the way to an upload's destination are created.
-//! Downloading `/` writes the whole drive's contents into the destination.
+//! the transferred item's new path: `upload ./notes.txt /backups/old.txt` uploads it as `old.txt`,
+//! and `download /backups/notes ./old-notes` creates `./old-notes`. Transferring a file to the path
+//! of an existing file replaces it (in the drive, with a new version of it). Missing directories
+//! on the way to the destination are created. Downloading `/` writes the whole drive's contents
+//! into the destination.
 //!
 //! When a single item inside a directory transfer fails, the rest of the transfer still completes
 //! and the failures are listed at the end. Press Ctrl+C to cancel a running transfer.
@@ -66,13 +67,15 @@ pub(crate) enum TransferCommands {
 		#[arg(add = FilenCompleter::file_or_directory())]
 		destination: Option<String>,
 	},
-	/// Download a file or directory (recursively) from the Filen drive into a local directory
+	/// Download a file or directory (recursively) from the Filen drive
 	Download {
 		/// File or directory to download ("/" for the entire Filen drive)
 		#[arg(add = FilenCompleter::file_or_directory())]
 		source: String,
-		/// Local destination directory (default: the current local directory)
-		#[arg(add = ArgValueCompleter::new(PathCompleter::dir()))]
+		/// Local directory to download into, or the downloaded item's new path when it is not an
+		/// existing directory and does not end in a path separator; missing directories are
+		/// created (default: the current local directory)
+		#[arg(add = ArgValueCompleter::new(PathCompleter::any()))]
 		destination: Option<String>,
 	},
 }
@@ -305,7 +308,7 @@ fn upload_name(source: &Path) -> Result<String> {
 		.ok_or_else(|| UI::failure(&format!("Cannot upload {}", source.display())))
 }
 
-/// Download a remote file, or a remote directory and everything below it, into a local directory.
+/// Download a remote file, or a remote directory and everything below it, to a local path.
 pub(crate) async fn download(
 	ui: &mut UI,
 	client: &mut LazyClient,
@@ -314,14 +317,13 @@ pub(crate) async fn download(
 	destination_str: Option<&str>,
 ) -> Result<()> {
 	let destination_str = destination_str.unwrap_or(".");
-	let destination = std::fs::canonicalize(destination_str)
-		.map_err(|_| UI::failure(&format!("No such local directory: {}", destination_str)))?;
-	if !destination.is_dir() {
-		return Err(UI::failure(&format!(
-			"Not a directory: {}",
-			destination.display()
-		)));
+	let into = destination_str.ends_with(std::path::is_separator);
+	let existing = local_existing(Path::new(destination_str))?;
+	let destination = match existing {
+		Existing::Dir | Existing::File => std::fs::canonicalize(destination_str),
+		Existing::Nothing => std::path::absolute(destination_str),
 	}
+	.map_err(|e| UI::failure(&format!("Cannot read {}: {}", destination_str, e)))?;
 
 	let source_path = working_path.navigate(source_str);
 	let client = client.get(ui).await?.clone();
@@ -335,21 +337,28 @@ pub(crate) async fn download(
 			source_path
 		)));
 	};
-	let name = match &item {
-		NonRootFileType::File(file) => Some(file.name().context("Failed to decrypt file name")?),
-		NonRootFileType::Dir(dir) => Some(dir.name().context("Failed to decrypt directory name")?),
-		// The drive root has no name of its own, so its contents go straight into the destination.
-		NonRootFileType::Root(_) => None,
+	let source = match &item {
+		NonRootFileType::File(file) => {
+			DownloadSource::File(file.name().context("Failed to decrypt file name")?)
+		}
+		NonRootFileType::Dir(dir) => {
+			DownloadSource::Dir(dir.name().context("Failed to decrypt directory name")?)
+		}
+		NonRootFileType::Root(_) => DownloadSource::Root,
 	};
-	let target = match name {
-		Some(name) => download_target(&destination, name).ok_or_else(|| {
+	let target = resolve_download_target(&destination, into, existing, source, &source_path)?;
+	// A directory download creates its own target directory and any missing ones above it.
+	if let DownloadSource::File(_) = source
+		&& let Some(parent) = target.parent()
+	{
+		std::fs::create_dir_all(parent).map_err(|e| {
 			UI::failure(&format!(
-				"Cannot download {}: its name {:?} is not a plain file name",
-				source_path, name
+				"Cannot create directory {}: {}",
+				parent.display(),
+				e
 			))
-		})?,
-		None => destination.clone(),
-	};
+		})?;
+	}
 
 	let progress = TransferProgress::new(TransferKind::Download, ui);
 	let transferred = match &item {
@@ -385,6 +394,70 @@ pub(crate) async fn download(
 		"download",
 		&format!("Downloaded {} to {}", source_path, target.display()),
 	)
+}
+
+/// What a local path names, following symlinks.
+fn local_existing(path: &Path) -> Result<Existing> {
+	match std::fs::metadata(path) {
+		Ok(metadata) if metadata.is_dir() => Ok(Existing::Dir),
+		Ok(_) => Ok(Existing::File),
+		Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Existing::Nothing),
+		Err(e) => Err(UI::failure(&format!(
+			"Cannot read {}: {}",
+			path.display(),
+			e
+		))),
+	}
+}
+
+/// The item a download is of, with its name.
+#[derive(Clone, Copy)]
+enum DownloadSource<'a> {
+	File(&'a str),
+	Dir(&'a str),
+	/// The drive root, which has no name of its own.
+	Root,
+}
+
+/// Where downloading `source` (found at `source_path`) to `destination` puts it. An existing
+/// directory, or a destination given as one (`into`, from a trailing separator), takes the item
+/// under its own name, and the drive root's contents go straight into it; any other destination
+/// is the item's new path. A file may replace an existing file, but a directory may not. The
+/// target's parent may not exist yet.
+fn resolve_download_target(
+	destination: &Path,
+	into: bool,
+	existing: Existing,
+	source: DownloadSource<'_>,
+	source_path: &RemotePath,
+) -> Result<PathBuf> {
+	let inside = || match source {
+		DownloadSource::File(name) | DownloadSource::Dir(name) => {
+			download_target(destination, name).ok_or_else(|| {
+				UI::failure(&format!(
+					"Cannot download {}: its name {:?} is not a plain file name",
+					source_path, name
+				))
+			})
+		}
+		DownloadSource::Root => Ok(destination.to_path_buf()),
+	};
+	match existing {
+		Existing::Dir => inside(),
+		Existing::File if into => Err(UI::failure(&format!(
+			"Not a directory: {}",
+			destination.display()
+		))),
+		Existing::File => match source {
+			DownloadSource::File(_) => Ok(destination.to_path_buf()),
+			DownloadSource::Dir(_) | DownloadSource::Root => Err(UI::failure(&format!(
+				"Cannot download a directory onto the file {}",
+				destination.display()
+			))),
+		},
+		Existing::Nothing if into => inside(),
+		Existing::Nothing => Ok(destination.to_path_buf()),
+	}
 }
 
 /// Where an item named `name` is downloaded to inside `destination`, or `None` when the name is not
@@ -774,7 +847,10 @@ mod tests {
 
 	use filen_sdk_rs::fs::name::ValidatedName;
 
-	use super::{Existing, UploadTarget, download_target, resolve_upload_target};
+	use super::{
+		DownloadSource, Existing, UploadTarget, download_target, local_existing,
+		resolve_download_target, resolve_upload_target,
+	};
 	use crate::util::RemotePath;
 
 	fn upload_target(parent: &str, name: &str) -> UploadTarget {
@@ -913,6 +989,132 @@ mod tests {
 			)
 			.unwrap(),
 			upload_target("/x/y", "a.txt")
+		);
+	}
+
+	fn download_target_of(
+		destination: &str,
+		into: bool,
+		existing: Existing,
+		source: DownloadSource<'_>,
+	) -> Result<std::path::PathBuf, String> {
+		resolve_download_target(
+			Path::new(destination),
+			into,
+			existing,
+			source,
+			&RemotePath::new("/remote/item"),
+		)
+		.map_err(|e| e.to_string())
+	}
+
+	#[test]
+	fn a_download_to_an_existing_directory_goes_inside_it() {
+		assert_eq!(
+			download_target_of("/dest", false, Existing::Dir, DownloadSource::File("a.txt")),
+			Ok(Path::new("/dest/a.txt").to_path_buf())
+		);
+	}
+
+	#[test]
+	fn a_download_to_a_new_path_takes_its_name() {
+		assert_eq!(
+			download_target_of(
+				"/dest/renamed.txt",
+				false,
+				Existing::Nothing,
+				DownloadSource::File("a.txt")
+			),
+			Ok(Path::new("/dest/renamed.txt").to_path_buf())
+		);
+		assert_eq!(
+			download_target_of(
+				"/dest/new",
+				false,
+				Existing::Nothing,
+				DownloadSource::Dir("a")
+			),
+			Ok(Path::new("/dest/new").to_path_buf())
+		);
+	}
+
+	#[test]
+	fn a_download_into_a_missing_directory_goes_inside_it() {
+		assert_eq!(
+			download_target_of("/dest/", true, Existing::Nothing, DownloadSource::Dir("a")),
+			Ok(Path::new("/dest/a").to_path_buf())
+		);
+	}
+
+	#[test]
+	fn the_drive_root_is_downloaded_into_a_missing_directory() {
+		assert_eq!(
+			download_target_of("/dest", false, Existing::Nothing, DownloadSource::Root),
+			Ok(Path::new("/dest").to_path_buf())
+		);
+	}
+
+	#[test]
+	fn a_file_download_onto_an_existing_file_replaces_it() {
+		assert_eq!(
+			download_target_of(
+				"/dest/old.txt",
+				false,
+				Existing::File,
+				DownloadSource::File("a.txt")
+			),
+			Ok(Path::new("/dest/old.txt").to_path_buf())
+		);
+	}
+
+	#[test]
+	fn a_directory_download_onto_an_existing_file_is_refused() {
+		assert_eq!(
+			download_target_of(
+				"/dest/old.txt",
+				false,
+				Existing::File,
+				DownloadSource::Dir("a")
+			),
+			Err("Cannot download a directory onto the file /dest/old.txt".to_owned())
+		);
+	}
+
+	#[test]
+	fn a_download_into_a_file_given_as_a_directory_is_refused() {
+		assert_eq!(
+			download_target_of(
+				"/dest/old.txt/",
+				true,
+				Existing::File,
+				DownloadSource::File("a.txt")
+			),
+			Err("Not a directory: /dest/old.txt/".to_owned())
+		);
+	}
+
+	#[test]
+	fn an_unsafe_name_is_refused_when_the_download_goes_inside_the_destination() {
+		assert_eq!(
+			download_target_of("/dest", false, Existing::Dir, DownloadSource::File("..")),
+			Err(
+				"Cannot download /remote/item: its name \"..\" is not a plain file name".to_owned()
+			)
+		);
+	}
+
+	#[test]
+	fn a_local_path_is_looked_up_as_a_directory_a_file_or_nothing() {
+		let dir = tempfile::tempdir().unwrap();
+		std::fs::write(dir.path().join("a.txt"), b"data").unwrap();
+		assert_eq!(local_existing(dir.path()).unwrap(), Existing::Dir);
+		assert_eq!(
+			local_existing(&dir.path().join("a.txt")).unwrap(),
+			Existing::File
+		);
+		assert_eq!(
+			local_existing(&dir.path().join("missing")).unwrap(),
+			Existing::Nothing
 		);
 	}
 

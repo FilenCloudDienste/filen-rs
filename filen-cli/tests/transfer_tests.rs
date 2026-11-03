@@ -120,3 +120,28 @@ async fn uploading_into_a_missing_directory_creates_it() {
 		Some(NonRootFileType::File(_))
 	));
 }
+
+#[shared_test_runtime]
+async fn downloading_to_a_new_path_in_a_missing_directory_renames_the_file() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let test_dir_name = resources.dir.name().unwrap();
+
+	let local = tempfile::tempdir().unwrap();
+	std::fs::write(local.path().join("a.txt"), b"contents").unwrap();
+	authenticated_cli_with_args!(
+		"upload",
+		local.path().join("a.txt").to_str().unwrap(),
+		test_dir_name
+	)
+	.success();
+
+	let target = local.path().join("missing").join("renamed.txt");
+	authenticated_cli_with_args!(
+		"download",
+		&format!("{test_dir_name}/a.txt"),
+		target.to_str().unwrap()
+	)
+	.success();
+
+	assert_eq!(std::fs::read(&target).unwrap(), b"contents");
+}
