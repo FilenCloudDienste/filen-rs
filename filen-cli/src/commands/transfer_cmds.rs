@@ -2,9 +2,12 @@
 //! Files and directories are transferred between your computer and your Filen drive with
 //! `upload` and `download`. Directories are always transferred recursively.
 //!
-//! Both commands place the transferred item *inside* the destination directory, keeping its name
-//! (like `cp`): `upload ./notes /backups` creates `/backups/notes`, and `download /backups/notes .`
-//! creates `./notes`. Downloading `/` writes the whole drive's contents into the destination.
+//! Like `cp`, both commands place the transferred item *inside* the destination when it is an
+//! existing directory or ends in `/`, keeping its name: `upload ./notes /backups` creates
+//! `/backups/notes`, and `download /backups/notes .` creates `./notes`. Any other destination is
+//! the transferred item's new path: `upload ./notes.txt /backups/old.txt` uploads it as `old.txt`.
+//! Uploading a file to the path of an existing file replaces it with a new version.
+//! Downloading `/` writes the whole drive's contents into the destination.
 //!
 //! When a single item inside a directory transfer fails, the rest of the transfer still completes
 //! and the failures are listed at the end. Press Ctrl+C to cancel a running transfer.
@@ -21,12 +24,13 @@ use clap::Subcommand;
 use clap_complete::engine::{ArgValueCompleter, PathCompleter};
 use console::{Term, style};
 use filen_sdk_rs::{
-	Error,
+	Error, ErrorKind,
 	auth::Client,
 	fs::{
-		HasName as _,
+		HasName as _, HasUUID as _,
 		categories::{DirType, NonRootFileType, NonRootItemType, Normal},
-		file::traits::HasFileInfo as _,
+		file::{FileBuilderOptionalName, traits::HasFileInfo as _},
+		name::ValidatedName,
 	},
 	io::{
 		CategoryDirDownloadExtPub as _, DirDownloadCallback, DirUploadCallback, RemoteDirectory,
@@ -50,13 +54,15 @@ use crate::{
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum TransferCommands {
-	/// Upload a local file or directory (recursively) into a directory in the Filen drive
+	/// Upload a local file or directory (recursively) to the Filen drive
 	Upload {
 		/// Local file or directory to upload
 		#[arg(add = ArgValueCompleter::new(PathCompleter::any()))]
 		source: String,
-		/// Destination directory in the Filen drive (default: the current working directory)
-		#[arg(add = FilenCompleter::directory())]
+		/// Directory in the Filen drive to upload into, or the uploaded item's new path when it is
+		/// not an existing directory and does not end in "/" (default: the current working
+		/// directory)
+		#[arg(add = FilenCompleter::file_or_directory())]
 		destination: Option<String>,
 	},
 	/// Download a file or directory (recursively) from the Filen drive into a local directory
@@ -117,36 +123,57 @@ pub(crate) async fn upload(
 		.is_dir();
 	let name = upload_name(&source)?;
 
+	// Without a destination, upload into the working directory.
+	let into = destination_str.is_none_or(|destination| destination.ends_with('/'));
 	let destination_path = working_path.navigate(destination_str.unwrap_or(""));
 	let client = client.get(ui).await?.clone();
-	let destination_dir = match client
-		.find_item_at_path(&destination_path.0)
-		.await
-		.context("Failed to find directory")?
-	{
-		Some(NonRootFileType::Dir(dir)) => Ok(DirType::Dir(dir)),
-		Some(NonRootFileType::Root(root)) => Ok(DirType::Root(root)),
-		Some(_) => Err(UI::failure(&format!(
-			"Not a directory: {}",
-			destination_path
-		))),
-		None => Err(UI::failure(&format!(
-			"No such directory: {}",
-			destination_path
-		))),
-	}?;
+	let destination = find_remote(&client, &destination_path).await?;
+	let target = resolve_upload_target(
+		&destination_path,
+		into,
+		destination.existing(),
+		&name,
+		is_dir,
+	)?;
+	let parent_dir = match destination {
+		RemoteItem::Dir(dir) if target.parent == destination_path => dir,
+		_ => match find_remote(&client, &target.parent).await? {
+			RemoteItem::Dir(dir) => dir,
+			RemoteItem::File => {
+				return Err(UI::failure(&format!("Not a directory: {}", target.parent)));
+			}
+			RemoteItem::Nothing => {
+				return Err(UI::failure(&format!(
+					"No such directory: {}",
+					target.parent
+				)));
+			}
+		},
+	};
 
 	let progress = TransferProgress::new(TransferKind::Upload, ui);
 	let transferred = if is_dir {
 		run_cancellable(
 			&progress,
-			upload_directory(&client, &progress, &source, &name, &destination_dir),
+			upload_directory(
+				&client,
+				&progress,
+				&source,
+				target.name.as_ref(),
+				&parent_dir,
+			),
 		)
 		.await?
 	} else {
 		run_cancellable(
 			&progress,
-			upload_file(&client, &progress, &source, &destination_dir),
+			upload_file(
+				&client,
+				&progress,
+				&source,
+				target.name.as_ref(),
+				&parent_dir,
+			),
 		)
 		.await?
 	};
@@ -159,9 +186,98 @@ pub(crate) async fn upload(
 		&format!(
 			"Uploaded {} to {}",
 			source.display(),
-			destination_path.navigate(&name)
+			target.parent.navigate(target.name.as_ref())
 		),
 	)
+}
+
+/// What a transfer's destination path names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Existing {
+	Dir,
+	File,
+	Nothing,
+}
+
+/// A remote path looked up with [`find_remote`], keeping the directory it names.
+enum RemoteItem<'a> {
+	Dir(DirType<'a, Normal>),
+	File,
+	Nothing,
+}
+
+impl RemoteItem<'_> {
+	fn existing(&self) -> Existing {
+		match self {
+			Self::Dir(_) => Existing::Dir,
+			Self::File => Existing::File,
+			Self::Nothing => Existing::Nothing,
+		}
+	}
+}
+
+/// Look up what `path` names in the drive.
+async fn find_remote<'a>(client: &'a Client, path: &RemotePath) -> Result<RemoteItem<'a>> {
+	match client.find_item_at_path(&path.0).await {
+		Ok(Some(NonRootFileType::Dir(dir))) => Ok(RemoteItem::Dir(DirType::Dir(dir))),
+		Ok(Some(NonRootFileType::Root(root))) => Ok(RemoteItem::Dir(DirType::Root(root))),
+		Ok(Some(NonRootFileType::File(_))) => Ok(RemoteItem::File),
+		Ok(None) => Ok(RemoteItem::Nothing),
+		Err(e) if e.kind() == ErrorKind::InvalidType => Err(UI::failure(&format!(
+			"Path contains a file in between: {}",
+			path
+		))),
+		Err(e) => Err(e).context("Failed to find file or directory"),
+	}
+}
+
+/// Where an upload goes: under `name` in the remote directory `parent`.
+#[derive(Debug, PartialEq, Eq)]
+struct UploadTarget {
+	parent: RemotePath,
+	name: ValidatedName,
+}
+
+impl UploadTarget {
+	/// `name` under `parent`, refused before anything is uploaded when the drive does not take it
+	/// as a name, whether for a file or a directory.
+	fn new(parent: RemotePath, name: &str) -> Result<Self> {
+		let name = ValidatedName::try_from(name)
+			.map_err(|e| UI::failure(&format!("Cannot upload as {:?}: {}", name, e)))?;
+		Ok(Self { parent, name })
+	}
+}
+
+/// Where uploading the item named `source_name` to `destination` puts it. An existing directory,
+/// or a destination given as one (`into`, from a trailing "/"), takes the item under its own name;
+/// any other destination is the item's new path. A file may replace an existing file, which
+/// becomes a new version of it, but a directory may not.
+fn resolve_upload_target(
+	destination: &RemotePath,
+	into: bool,
+	existing: Existing,
+	source_name: &str,
+	source_is_dir: bool,
+) -> Result<UploadTarget> {
+	let new_path = || {
+		let name = destination
+			.basename()
+			.ok_or_else(|| UI::failure(&format!("Cannot upload to {}", destination)))?;
+		UploadTarget::new(destination.parent(), name)
+	};
+	match existing {
+		Existing::Dir => UploadTarget::new(destination.clone(), source_name),
+		Existing::File if into => Err(UI::failure(&format!("Not a directory: {}", destination))),
+		Existing::File if source_is_dir => Err(UI::failure(&format!(
+			"Cannot upload a directory onto the file {}",
+			destination
+		))),
+		Existing::File => new_path(),
+		Existing::Nothing if into => {
+			Err(UI::failure(&format!("No such directory: {}", destination)))
+		}
+		Existing::Nothing => new_path(),
+	}
 }
 
 /// The name an upload of `source` takes: its last component as given, so a symlink keeps its own
@@ -323,15 +439,20 @@ async fn upload_file(
 	client: &Client,
 	progress: &TransferProgress,
 	source: &Path,
+	name: &str,
 	destination_dir: &DirType<'_, Normal>,
 ) -> Result<()> {
+	let mut builder = FileBuilderOptionalName::new(destination_dir.uuid());
+	builder
+		.name(name)
+		.map_err(|e| UI::failure(&format!("Cannot upload as {:?}: {}", name, e)))?;
 	let size = std::fs::metadata(source)
 		.with_context(|| format!("Failed to read {}", source.display()))?
 		.len();
 	progress.start_single_item(size);
 	client
-		.upload_file_from_path(
-			destination_dir,
+		.upload_file_from_path_with_builder(
+			builder,
 			source.to_path_buf(),
 			Some(progress.byte_callback()),
 		)
@@ -645,7 +766,150 @@ impl DirDownloadCallback<Normal> for TransferProgress {
 mod tests {
 	use std::path::Path;
 
-	use super::download_target;
+	use filen_sdk_rs::fs::name::ValidatedName;
+
+	use super::{Existing, UploadTarget, download_target, resolve_upload_target};
+	use crate::util::RemotePath;
+
+	fn upload_target(parent: &str, name: &str) -> UploadTarget {
+		UploadTarget {
+			parent: RemotePath::new(parent),
+			name: ValidatedName::try_from(name).unwrap(),
+		}
+	}
+
+	#[test]
+	fn an_upload_to_an_existing_directory_goes_inside_it() {
+		assert_eq!(
+			resolve_upload_target(
+				&RemotePath::new("/dir"),
+				false,
+				Existing::Dir,
+				"a.txt",
+				false
+			)
+			.unwrap(),
+			upload_target("/dir", "a.txt")
+		);
+	}
+
+	#[test]
+	fn an_upload_to_the_root_goes_inside_it() {
+		assert_eq!(
+			resolve_upload_target(&RemotePath::new("/"), true, Existing::Dir, "dir", true).unwrap(),
+			upload_target("/", "dir")
+		);
+	}
+
+	#[test]
+	fn an_upload_to_a_new_path_takes_its_name() {
+		assert_eq!(
+			resolve_upload_target(
+				&RemotePath::new("/dir/new.txt"),
+				false,
+				Existing::Nothing,
+				"a.txt",
+				false
+			)
+			.unwrap(),
+			upload_target("/dir", "new.txt")
+		);
+	}
+
+	#[test]
+	fn a_directory_upload_to_a_new_path_takes_its_name() {
+		assert_eq!(
+			resolve_upload_target(
+				&RemotePath::new("/dir/new"),
+				false,
+				Existing::Nothing,
+				"a",
+				true
+			)
+			.unwrap(),
+			upload_target("/dir", "new")
+		);
+	}
+
+	#[test]
+	fn a_file_upload_onto_an_existing_file_replaces_it() {
+		assert_eq!(
+			resolve_upload_target(
+				&RemotePath::new("/dir/old.txt"),
+				false,
+				Existing::File,
+				"a.txt",
+				false
+			)
+			.unwrap(),
+			upload_target("/dir", "old.txt")
+		);
+	}
+
+	#[test]
+	fn a_directory_upload_onto_an_existing_file_is_refused() {
+		assert_eq!(
+			resolve_upload_target(
+				&RemotePath::new("/dir/old.txt"),
+				false,
+				Existing::File,
+				"a",
+				true
+			)
+			.unwrap_err()
+			.to_string(),
+			"Cannot upload a directory onto the file /dir/old.txt"
+		);
+	}
+
+	#[test]
+	fn a_directory_upload_to_a_name_the_drive_does_not_take_is_refused() {
+		assert_eq!(
+			resolve_upload_target(
+				&RemotePath::new("/x/bad:name"),
+				false,
+				Existing::Nothing,
+				"d",
+				true
+			)
+			.unwrap_err()
+			.to_string(),
+			"Cannot upload as \"bad:name\": invalid filename \"bad:name\": filename contains \
+			 forbidden character ':' at position 3"
+		);
+	}
+
+	#[test]
+	fn an_upload_into_a_file_given_as_a_directory_is_refused() {
+		assert_eq!(
+			resolve_upload_target(
+				&RemotePath::new("/dir/old.txt"),
+				true,
+				Existing::File,
+				"a.txt",
+				false
+			)
+			.unwrap_err()
+			.to_string(),
+			"Not a directory: /dir/old.txt"
+		);
+	}
+
+	#[test]
+	fn an_upload_into_a_missing_directory_is_refused() {
+		assert_eq!(
+			resolve_upload_target(
+				&RemotePath::new("/x"),
+				true,
+				Existing::Nothing,
+				"a.txt",
+				false
+			)
+			.unwrap_err()
+			.to_string(),
+			"No such directory: /x"
+		);
+	}
 
 	#[test]
 	fn a_plain_name_is_downloaded_into_the_destination() {

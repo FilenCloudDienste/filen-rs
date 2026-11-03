@@ -61,3 +61,37 @@ async fn uploading_a_symlinked_file_keeps_the_links_name() {
 			.is_none()
 	);
 }
+
+#[shared_test_runtime]
+async fn uploading_to_a_new_file_path_renames_the_file() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir_name = resources.dir.name().unwrap();
+
+	let local = tempfile::tempdir().unwrap();
+	std::fs::create_dir(local.path().join("a")).unwrap();
+	std::fs::write(local.path().join("a").join("b.txt"), b"contents").unwrap();
+	authenticated_cli_with_args!("mkdir", &format!("{test_dir_name}/dir")).success();
+
+	authenticated_cli_with_args!(
+		"upload",
+		local.path().join("a").join("b.txt").to_str().unwrap(),
+		&format!("{test_dir_name}/dir/new.txt")
+	)
+	.success();
+
+	assert!(matches!(
+		client
+			.find_item_at_path(&format!("{test_dir_name}/dir/new.txt"))
+			.await
+			.unwrap(),
+		Some(NonRootFileType::File(_))
+	));
+	assert!(
+		client
+			.find_item_at_path(&format!("{test_dir_name}/dir/b.txt"))
+			.await
+			.unwrap()
+			.is_none()
+	);
+}
