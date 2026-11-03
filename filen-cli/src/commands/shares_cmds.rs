@@ -6,7 +6,7 @@
 //!
 //! `shared-by-me` lists what you shared, by its path in your drive, each with whom it is shared.
 //! `unshare <path> [email]` stops sharing a file or directory with that contact, or with everyone
-//! it is shared with when no email is given.
+//! it is shared with when no email is given (after asking to confirm, which `--yes` answers).
 //!
 //! `shared-with-me` lists what others shared with you, each with who shared it. Given a path, it
 //! lists the directory at that path instead, or shows the file there: the path starts with the
@@ -79,7 +79,8 @@ pub(crate) enum SharesCommands {
 	},
 	/// List what you shared, and with whom
 	SharedByMe,
-	/// Stop sharing a file or directory
+	/// Stop sharing a file or directory (without an email, with everyone, after asking to
+	/// confirm, which --yes answers)
 	Unshare {
 		/// File or directory to stop sharing
 		#[arg(add = FilenCompleter::file_or_directory())]
@@ -373,12 +374,28 @@ async fn print_shared_by_me(ui: &mut UI, client: &mut LazyClient) -> Result<()> 
 	Ok(())
 }
 
+/// The confirmation asked before `unshare` without an email stops sharing `path` with everyone.
+fn unshare_all_question(path: &RemotePath) -> String {
+	format!("Stop sharing {path} with everyone it is shared with?")
+}
+
+/// Fails unless unsharing `path` can be confirmed, by `--yes` or at a terminal, when there is a
+/// confirmation to ask: without an email, which unshares it with everyone. Runs before logging
+/// in, so that a script learns it needs `--yes` before anything is looked up.
+fn check_unshare(ui: &UI, path: &RemotePath, email: Option<&str>) -> Result<()> {
+	match email {
+		Some(_) => Ok(()),
+		None => ui.ensure_can_confirm(&unshare_all_question(path)),
+	}
+}
+
 async fn unshare(
 	ui: &mut UI,
 	client: &mut LazyClient,
 	path: &RemotePath,
 	email: Option<&str>,
 ) -> Result<()> {
+	check_unshare(ui, path, email)?;
 	let client = client.get(ui).await?;
 	let uuid = match find_item(client, path).await? {
 		NonRootFileType::Dir(dir) => dir.uuid(),
@@ -396,6 +413,9 @@ async fn unshare(
 			Some(email) => format!("{path} is not shared with {}", email.trim()),
 			None => format!("{path} is not shared"),
 		}));
+	}
+	if email.is_none() && !ui.prompt_confirm(&unshare_all_question(path), false)? {
+		return Ok(());
 	}
 	for share in to_remove {
 		client
@@ -1046,6 +1066,27 @@ mod tests {
 				"receivers": [ALICE],
 			})
 		);
+	}
+
+	#[test]
+	fn unshare_without_an_email_needs_a_confirmation() {
+		let mut ui = Printed::default().ui();
+		let path = RemotePath::new("/docs");
+		let err = check_unshare(&ui, &path, None).unwrap_err();
+		assert_eq!(exit_code(&err), 2);
+		assert_eq!(
+			err.to_string(),
+			"Cannot ask \"Stop sharing /docs with everyone it is shared with?\": stdin is not a \
+			 terminal. Pass --yes to answer yes."
+		);
+		ui.set_assume_yes(true);
+		check_unshare(&ui, &path, None).unwrap();
+	}
+
+	#[test]
+	fn unshare_with_an_email_needs_no_confirmation() {
+		let ui = Printed::default().ui();
+		check_unshare(&ui, &RemotePath::new("/docs"), Some(ALICE)).unwrap();
 	}
 
 	#[test]

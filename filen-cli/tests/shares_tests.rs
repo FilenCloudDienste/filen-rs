@@ -318,9 +318,18 @@ async fn share_list_and_unshare_a_file_and_a_directory() {
 				.stdout(predicates::str::contains(format!(
 					"Stopped sharing {file_path} with {share_email}"
 				)));
-			authenticated_cli_with_args!("unshare", &dir_path).success();
+			// with everyone only after a confirmation, which --yes answers
+			let refused = authenticated_cli_with_args!("unshare", &dir_path).code(2);
+			assert!(
+				stderr_of(&refused).contains("Pass --yes to answer yes."),
+				"{}",
+				stderr_of(&refused)
+			);
+			let (dirs, _) = out_shares_of(client, &[dir.uuid()]).await;
+			assert_eq!(dirs.len(), 1);
+			authenticated_cli_with_args!("unshare", &dir_path, "--yes").success();
 			wait_until_unshared(client, &share_client, &[file.uuid(), dir.uuid()]).await;
-			let not_shared = authenticated_cli_with_args!("unshare", &file_path).code(1);
+			let not_shared = authenticated_cli_with_args!("unshare", &file_path, "--yes").code(1);
 			assert!(
 				stderr_of(&not_shared).contains(&format!("{file_path} is not shared")),
 				"{}",
