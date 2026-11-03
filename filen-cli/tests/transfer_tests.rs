@@ -7,7 +7,11 @@ use std::{
 use filen_macros::shared_test_runtime;
 use filen_sdk_rs::{
 	auth::Client,
-	fs::{HasName, HasUUID as _, categories::NonRootFileType, file::traits::HasFileInfo as _},
+	connect::DirPublicLinkRW,
+	fs::{
+		HasName, HasUUID as _, categories::NonRootFileType, dir::RemoteDirectory,
+		file::traits::HasFileInfo as _,
+	},
 };
 use filen_types::fs::Uuid;
 use test_utils::authenticated_cli_with_args;
@@ -1009,4 +1013,146 @@ async fn downloading_with_resume_continues_from_what_an_earlier_download_left() 
 		"the resumed file differs"
 	);
 	assert!(!partial.exists(), "the partial file was left behind");
+}
+
+/// The URL the web app gives a public link: its route, uuid and hex-encoded key.
+fn public_link_url(route: &str, uuid: impl std::fmt::Display, key: &str) -> String {
+	let key = key
+		.bytes()
+		.map(|byte| format!("{byte:02x}"))
+		.collect::<String>();
+	format!("https://app.filen.io/#/{route}/{uuid}%23{key}")
+}
+
+#[shared_test_runtime]
+async fn downloading_a_file_link_downloads_the_file_it_shares() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let builder = client
+		.make_file_builder("linked.txt", resources.dir.uuid())
+		.unwrap();
+	let file = client
+		.upload_file(builder, b"linked contents")
+		.await
+		.unwrap();
+	let link = client.public_link_file(&file).await.unwrap();
+	let url = public_link_url("d", link.uuid(), file.key().unwrap().to_str().as_ref());
+
+	let local = tempfile::tempdir().unwrap();
+	authenticated_cli_with_args!("download", &url, local.path().to_str().unwrap()).success();
+
+	assert_eq!(
+		std::fs::read(local.path().join("linked.txt")).unwrap(),
+		b"linked contents"
+	);
+}
+
+/// A directory with a file inside, uploaded into the test directory, and a public link to it.
+async fn linked_directory(
+	client: &Client,
+	test_dir_name: &str,
+) -> (RemoteDirectory, DirPublicLinkRW) {
+	let local = tempfile::tempdir().unwrap();
+	let source = local.path().join("linked");
+	std::fs::create_dir_all(source.join("inner")).unwrap();
+	std::fs::write(source.join("inner").join("a.txt"), b"inside").unwrap();
+	authenticated_cli_with_args!("upload", source.to_str().unwrap(), test_dir_name).success();
+	let Some(NonRootFileType::Dir(dir)) = client
+		.find_item_at_path(&format!("{test_dir_name}/linked"))
+		.await
+		.unwrap()
+	else {
+		panic!("the uploaded directory is missing");
+	};
+	let dir = dir.into_owned();
+	let link = client
+		.public_link_dir::<fn(u64, Option<u64>)>(&dir, None)
+		.await
+		.unwrap();
+	(dir, link)
+}
+
+#[shared_test_runtime]
+async fn downloading_a_directory_link_downloads_everything_inside() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir_name = resources.dir.name().unwrap();
+	let (_dir, link) = linked_directory(client, test_dir_name).await;
+	let url = public_link_url("f", link.uuid(), &link.key_string().unwrap());
+
+	let local = tempfile::tempdir().unwrap();
+	authenticated_cli_with_args!("download", &url, local.path().to_str().unwrap()).success();
+
+	assert_eq!(
+		std::fs::read(local.path().join("linked").join("inner").join("a.txt")).unwrap(),
+		b"inside"
+	);
+}
+
+#[shared_test_runtime]
+async fn downloading_a_password_protected_directory_link_takes_its_password() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir_name = resources.dir.name().unwrap();
+	let (dir, mut link) = linked_directory(client, test_dir_name).await;
+	link.set_password("hunter2".to_owned());
+	client.update_dir_link(&dir, &link).await.unwrap();
+	let url = public_link_url("f", link.uuid(), &link.key_string().unwrap());
+
+	let local = tempfile::tempdir().unwrap();
+	authenticated_cli_with_args!(
+		"download",
+		&url,
+		local.path().to_str().unwrap(),
+		"--link-password",
+		"hunter2"
+	)
+	.success();
+
+	assert_eq!(
+		std::fs::read(local.path().join("linked").join("inner").join("a.txt")).unwrap(),
+		b"inside"
+	);
+}
+
+#[shared_test_runtime]
+async fn downloading_a_link_needs_no_login() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let builder = client
+		.make_file_builder("linked-anonymously.txt", resources.dir.uuid())
+		.unwrap();
+	let file = client
+		.upload_file(builder, b"linked contents")
+		.await
+		.unwrap();
+	let link = client.public_link_file(&file).await.unwrap();
+	let url = public_link_url("d", link.uuid(), file.key().unwrap().to_str().as_ref());
+
+	// No credentials anywhere, and no prompt for them: a login would fail the command.
+	let config_dir = tempfile::tempdir().unwrap();
+	let local = tempfile::tempdir().unwrap();
+	let output = std::process::Command::new(env!("CARGO_BIN_EXE_filen-cli"))
+		.env("FILEN_CLI_TESTING_DISABLE_KEYRING", "1")
+		.env("FILEN_CLI_TESTING_DISABLE_AUTODETECTED_AUTH_CONFIG", "1")
+		.env_remove("FILEN_CLI_EMAIL")
+		.env_remove("FILEN_CLI_PASSWORD")
+		.env_remove("FILEN_CLI_2FA_CODE")
+		.arg("--config-dir")
+		.arg(config_dir.path())
+		.args(["--skip-update", "--no-input", "download", &url])
+		.arg(local.path())
+		.stdin(Stdio::null())
+		.output()
+		.unwrap();
+
+	assert!(
+		output.status.success(),
+		"{}",
+		String::from_utf8_lossy(&output.stderr)
+	);
+	assert_eq!(
+		std::fs::read(local.path().join("linked-anonymously.txt")).unwrap(),
+		b"linked contents"
+	);
 }

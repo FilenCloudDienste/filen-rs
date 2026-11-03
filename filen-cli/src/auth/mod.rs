@@ -217,6 +217,19 @@ impl LazyClient {
 		}
 	}
 
+	/// A client for what needs no account, such as a public link: the logged-in client's when
+	/// there is one, or else one built from the client flags, without logging in.
+	pub(crate) fn unauthenticated(&self) -> Result<UnauthClient> {
+		match self {
+			Self::Authenticated { client, .. } => Ok(client.get_unauthed()),
+			Self::Unauthenticated {
+				client_config_args, ..
+			} => Ok(UnauthClient::from_config(build_client_config(
+				client_config_args,
+			))?),
+		}
+	}
+
 	pub(crate) fn get_cache_callback_rx(
 		&mut self,
 	) -> Option<&mut tokio::sync::mpsc::UnboundedReceiver<filen_sdk_rs::cache::CacheMessage>> {

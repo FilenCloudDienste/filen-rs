@@ -53,6 +53,12 @@
 //! transferred, and the result adds them all up. A shell expands a wildcard such as `*.jpg` into
 //! such a list of items; the Windows command prompt does not, and remote paths take no wildcards.
 //!
+//! `download` also takes the URL of a public link, as the web app or `public-link` gives it, to
+//! download the file or directory it shares, even from another account:
+//! `download 'https://app.filen.io/#/f/<uuid>%23<key>' ./shared`. Downloading only links needs no
+//! login. A password-protected link takes its password from `--link-password` or the
+//! `FILEN_CLI_LINK_PASSWORD` environment variable, or asks for it.
+//!
 //! With `-` in place of the local path, `upload` reads stdin and `download` writes stdout, as in
 //! `tar -cz notes | filen upload - /backups/notes.tar.gz` and
 //! `filen download /backups/notes.tar.gz - | tar -xz`. The upload's destination then has to name
@@ -96,10 +102,13 @@ use clap_complete::engine::{ArgValueCompleter, PathCompleter};
 use console::{Term, style};
 use filen_sdk_rs::{
 	Error, ErrorKind,
-	auth::Client,
+	auth::{Client, unauth::UnauthClient},
+	connect::PublicLinkSharedClientExt as _,
 	fs::{
 		HasName as _, HasParent as _, HasUUID as _,
-		categories::{DirType, NonRootFileType, NonRootItemType, Normal},
+		categories::{
+			Category, DirType, Linked, NonRootFileType, NonRootItemType, Normal, fs::CategoryFS,
+		},
 		file::{
 			FileBuilderOptionalName,
 			traits::{File, HasFileInfo as _},
@@ -107,10 +116,10 @@ use filen_sdk_rs::{
 		name::ValidatedName,
 	},
 	io::{
-		CategoryDirDownloadExtPub as _, DirDownloadCallback, DirDownloadOptions, DirUploadCallback,
+		CategoryDirDownloadExtPub, DirDownloadCallback, DirDownloadOptions, DirUploadCallback,
 		DirUploadOptions, ExistingLocalFile, ExistingRemoteFile, PartialDownload, PathMatcher,
-		RemoteDirectory, RemoteFile, SymlinkPolicy, TransferFilter,
-		client_impl::IoSharedClientExt as _, is_safe_descendant,
+		RemoteDirectory, RemoteFile, SymlinkPolicy, TransferFilter, client_impl::IoSharedClientExt,
+		is_safe_descendant,
 	},
 	sync_engine::PathPatterns,
 	util::MaybeSendCallback,
@@ -165,7 +174,8 @@ pub(crate) enum TransferCommands {
 	},
 	/// Download a file or directory (recursively) from the Filen drive
 	Download {
-		/// File or directory to download ("/" for the entire Filen drive)
+		/// File or directory to download ("/" for the entire Filen drive), or the URL of a public link
+		/// to download the file or directory it shares
 		#[arg(add = FilenCompleter::file_or_directory())]
 		source: String,
 		/// More files or directories to download, followed by the destination: the local directory
@@ -181,6 +191,15 @@ pub(crate) enum TransferCommands {
 		/// there when the file is downloaded again with --resume
 		#[arg(long)]
 		resume: bool,
+		/// The password of a password-protected public link to download (asked for when needed
+		/// and not given)
+		#[arg(
+			long,
+			value_name = "PASSWORD",
+			env = "FILEN_CLI_LINK_PASSWORD",
+			hide_env_values = true
+		)]
+		link_password: Option<String>,
 		#[command(flatten)]
 		filter: FilterArgs,
 	},
@@ -269,6 +288,7 @@ impl TransferCommands {
 				paths,
 				no_clobber,
 				resume,
+				link_password,
 				filter,
 			} => {
 				let options = DirDownloadOptions {
@@ -288,6 +308,7 @@ impl TransferCommands {
 					&sources,
 					destination.as_deref(),
 					options,
+					link_password.as_deref(),
 				)
 				.await?
 			}
@@ -901,8 +922,14 @@ pub(crate) async fn download(
 	sources: &[String],
 	destination_str: Option<&str>,
 	options: DirDownloadOptions,
+	link_password: Option<&str>,
 ) -> Result<()> {
 	let several = sources.len() > 1;
+	// A malformed link fails before anything is downloaded.
+	let links = sources
+		.iter()
+		.map(|source| PublicLink::parse(source))
+		.collect::<Result<Vec<_>>>()?;
 	if destination_str == Some(STDIO) {
 		ensure_stdio_is_free(ui)?;
 		let [source] = sources else {
@@ -910,6 +937,11 @@ pub(crate) async fn download(
 				"Only a single file can be downloaded to stdout (\"-\")",
 			));
 		};
+		if links.iter().any(Option::is_some) {
+			return Err(UI::usage_failure(
+				"A public link cannot be downloaded to stdout (\"-\")",
+			));
+		}
 		return download_to_stdout(ui, client, working_path, source).await;
 	}
 	let destination_str = destination_str.unwrap_or(".");
@@ -932,13 +964,45 @@ pub(crate) async fn download(
 		existing,
 	};
 
-	let client = client.get(ui).await?.clone();
+	// Public links need no account, so only drive paths log in.
+	let drive_client = if links.iter().any(Option::is_none) {
+		Some(client.get(ui).await?.clone())
+	} else {
+		None
+	};
+	let link_client = if links.iter().any(Option::is_some) {
+		Some(Arc::new(client.unauthenticated()?))
+	} else {
+		None
+	};
 	let progress = TransferProgress::new(TransferKind::Download, ui);
 	let mut downloaded = None;
-	for source in sources {
-		let source_path = working_path.navigate(source);
-		match download_source(ui, &client, &progress, &source_path, &destination, &options).await {
-			Ok(target) => downloaded = Some((source_path, target)),
+	for (source, link) in sources.iter().zip(links) {
+		let result = match link {
+			Some(link) => {
+				let client = link_client
+					.as_ref()
+					.expect("a link among the sources has a client (should be impossible)");
+				let access = LinkAccess {
+					link: &link,
+					password: link_password,
+				};
+				download_link(ui, client, &progress, access, &destination, &options)
+					.await
+					.map(|target| (link.to_string(), target))
+			}
+			None => {
+				let client = drive_client
+					.as_ref()
+					.expect("a drive path among the sources logged in (should be impossible)");
+				let source_path = working_path.navigate(source);
+				download_source(ui, client, &progress, &source_path, &destination, &options)
+					.await
+					.map(|target| (source_path.to_string(), target))
+			}
+		};
+		match result {
+			Ok(done) => downloaded = Some(done),
 			Err(e) if several && !ends_the_command(&e) => {
 				progress.push_failures([source_failure(source, &e)]);
 			}
@@ -953,9 +1017,9 @@ pub(crate) async fn download(
 			destination,
 		)
 	} else {
-		let (source_path, target) = downloaded
+		let (source, target) = downloaded
 			.expect("a single download that did not fail has a target (should be impossible)");
-		(format!("{} to {}", source_path, target), target)
+		(format!("{} to {}", source, target), target)
 	};
 	finish(ui, &progress, &subject, &destination)
 }
@@ -997,16 +1061,8 @@ async fn download_source(
 		source_path,
 	)?;
 	// A directory download creates its own target directory and any missing ones above it.
-	if let DownloadSource::File(_) = source
-		&& let Some(parent) = target.parent()
-	{
-		std::fs::create_dir_all(parent).map_err(|e| {
-			UI::failure(&format!(
-				"Cannot create directory {}: {}",
-				parent.display(),
-				e
-			))
-		})?;
+	if let DownloadSource::File(_) = source {
+		create_parent_dir(&target)?;
 	}
 
 	let transferred = match &item {
@@ -1014,7 +1070,7 @@ async fn download_source(
 			run_cancellable(
 				ui,
 				progress,
-				download_file(client, progress, file.as_ref(), &target, options),
+				download_file(&**client, progress, file.as_ref(), &target, options),
 			)
 			.await?
 		}
@@ -1023,7 +1079,14 @@ async fn download_source(
 			run_cancellable(
 				ui,
 				progress,
-				download_directory(client, progress, dir, &target, options.clone()),
+				download_directory::<Normal>(
+					client.clone(),
+					progress,
+					dir,
+					&target,
+					(),
+					options.clone(),
+				),
 			)
 			.await?
 		}
@@ -1032,12 +1095,223 @@ async fn download_source(
 			run_cancellable(
 				ui,
 				progress,
-				download_directory(client, progress, root, &target, options.clone()),
+				download_directory::<Normal>(
+					client.clone(),
+					progress,
+					root,
+					&target,
+					(),
+					options.clone(),
+				),
 			)
 			.await?
 		}
 	};
 	transferred.context("Failed to download")?;
+	Ok(target.display().to_string())
+}
+
+/// Create the missing local directories above `target`.
+fn create_parent_dir(target: &Path) -> Result<()> {
+	let Some(parent) = target.parent() else {
+		return Ok(());
+	};
+	std::fs::create_dir_all(parent).map_err(|e| {
+		UI::failure(&format!(
+			"Cannot create directory {}: {}",
+			parent.display(),
+			e
+		))
+	})
+}
+
+/// Which kind of item a public link shares.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LinkKind {
+	File,
+	Dir,
+}
+
+/// A public link, from the URL the web app gives it.
+#[derive(Debug, PartialEq, Eq)]
+struct PublicLink {
+	kind: LinkKind,
+	uuid: Uuid,
+	/// The key that decrypts the shared item, which the URL carries after `#`.
+	key: String,
+}
+
+impl PublicLink {
+	/// The link `source` is the URL of, `None` when it is not a URL, or a usage error when it is a
+	/// URL but not of a public link. The web app's URLs read
+	/// `https://app.filen.io/#/d/<uuid>%23<key>` for a file and `.../#/f/<uuid>%23<key>` for a
+	/// directory, the key hex-encoded; the older `https://drive.filen.io/d/<uuid>#<key>` form, with
+	/// the key as it is, is read too.
+	fn parse(source: &str) -> Result<Option<Self>> {
+		let Some(rest) = source
+			.strip_prefix("https://")
+			.or_else(|| source.strip_prefix("http://"))
+		else {
+			return Ok(None);
+		};
+		let not_a_link = || {
+			UI::usage_failure(&format!(
+				"Not the URL of a public link: {}",
+				source.split(['#', '%']).next().unwrap_or(source)
+			))
+		};
+		let path = rest.split_once('/').map_or("", |(_host, path)| path);
+		let path = path.strip_prefix("#/").unwrap_or(path);
+		let (kind, path) = if let Some(path) = path.strip_prefix("d/") {
+			(LinkKind::File, path)
+		} else if let Some(path) = path.strip_prefix("f/") {
+			(LinkKind::Dir, path)
+		} else {
+			return Err(not_a_link());
+		};
+		let (uuid, key) = path
+			.split_once("%23")
+			.or_else(|| path.split_once('#'))
+			.ok_or_else(not_a_link)?;
+		let uuid = uuid.parse::<Uuid>().map_err(|_| not_a_link())?;
+		if key.is_empty() {
+			return Err(not_a_link());
+		}
+		Ok(Some(Self {
+			kind,
+			uuid,
+			key: decode_hex_key(key).unwrap_or_else(|| key.to_owned()),
+		}))
+	}
+}
+
+/// A link is shown without its key, which gives access to what it shares.
+impl fmt::Display for PublicLink {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		write!(f, "public link {}", self.uuid)
+	}
+}
+
+/// The key a link URL carries hex-encoded, as the web app writes it, or `None` when `key` is not
+/// such a key and is taken as it is. Every key is printable ASCII (letters, digits and a few
+/// marks such as `_`), which the bytes of a raw key that happens to be hex (a v3 key) practically
+/// never decode to.
+fn decode_hex_key(key: &str) -> Option<String> {
+	if !key.len().is_multiple_of(2) {
+		return None;
+	}
+	let bytes = (0..key.len())
+		.step_by(2)
+		.map(|at| {
+			key.get(at..at + 2)
+				.and_then(|byte| u8::from_str_radix(byte, 16).ok())
+		})
+		.collect::<Option<Vec<u8>>>()?;
+	let decoded = String::from_utf8(bytes).ok()?;
+	(!decoded.is_empty() && decoded.chars().all(|c| c.is_ascii_graphic())).then_some(decoded)
+}
+
+/// A public link to download, and the password it was given.
+#[derive(Clone, Copy)]
+struct LinkAccess<'a> {
+	link: &'a PublicLink,
+	password: Option<&'a str>,
+}
+
+/// Opening `link` failed with `error`, which could be for a missing or wrong password.
+fn link_failure(link: &PublicLink, error: &Error) -> anyhow::Error {
+	UI::failure(&format!(
+		"Cannot open the {} (if it has a password, give it with --link-password): {}",
+		link, error
+	))
+}
+
+/// The name of what `link` shares could not be decrypted with the key its URL carries.
+fn undecryptable_link(link: &PublicLink) -> anyhow::Error {
+	UI::failure(&format!(
+		"Cannot decrypt what the {} shares: the key in its URL is not the link's",
+		link
+	))
+}
+
+/// Download the file or directory the public link in `access` shares to `destination`, returning
+/// the local path it was downloaded to.
+async fn download_link(
+	ui: &mut UI,
+	client: &Arc<UnauthClient>,
+	progress: &TransferProgress,
+	access: LinkAccess<'_>,
+	destination: &DownloadDestination<'_>,
+	options: &DirDownloadOptions,
+) -> Result<String> {
+	let LinkAccess { link, password } = access;
+	let target = match link.kind {
+		LinkKind::File => {
+			let file = client
+				.get_linked_file(link.uuid, &link.key, password)
+				.await
+				.map_err(|e| link_failure(link, &e))?;
+			if !file.downloadable() {
+				return Err(UI::failure(&format!(
+					"The {} does not allow downloads",
+					link
+				)));
+			}
+			let name = file.name().ok_or_else(|| undecryptable_link(link))?;
+			let target = resolve_download_target(
+				destination.path,
+				destination.into,
+				destination.existing,
+				DownloadSource::File(name),
+				link,
+			)?;
+			create_parent_dir(&target)?;
+			run_cancellable(
+				ui,
+				progress,
+				download_file(&**client, progress, &file, &target, options),
+			)
+			.await?
+			.context("Failed to download")?;
+			target
+		}
+		LinkKind::Dir => {
+			let mut info = client
+				.get_dir_public_link_info(link.uuid, &link.key)
+				.await
+				.map_err(|e| link_failure(link, &e))?;
+			if info.has_password {
+				let password = match password {
+					Some(password) => password.to_owned(),
+					None => ui.prompt_password(&format!("Password of the {}: ", link))?,
+				};
+				info.link.set_password(password);
+			}
+			let name = info.root.name().ok_or_else(|| undecryptable_link(link))?;
+			let target = resolve_download_target(
+				destination.path,
+				destination.into,
+				destination.existing,
+				DownloadSource::Dir(name),
+				link,
+			)?;
+			run_cancellable(
+				ui,
+				progress,
+				download_directory::<Linked>(
+					Arc::clone(client),
+					progress,
+					DirType::Root(Cow::Owned(info.root)),
+					&target,
+					Cow::Owned(info.link),
+					options.clone(),
+				),
+			)
+			.await?
+			.context("Failed to download")?;
+			target
+		}
+	};
 	Ok(target.display().to_string())
 }
 
@@ -1074,7 +1348,7 @@ fn resolve_download_target(
 	into: bool,
 	existing: Existing,
 	source: DownloadSource<'_>,
-	source_path: &RemotePath,
+	source_path: &dyn fmt::Display,
 ) -> Result<PathBuf> {
 	let inside = || match source {
 		DownloadSource::File(name) | DownloadSource::Dir(name) => {
@@ -1318,13 +1592,16 @@ async fn upload_directory(
 }
 
 /// Download `source` to `target`, unless `options` keep a local file already there.
-async fn download_file(
-	client: &Client,
+async fn download_file<C>(
+	client: &C,
 	progress: &TransferProgress,
 	source: &dyn File,
 	target: &Path,
 	options: &DirDownloadOptions,
-) -> Result<()> {
+) -> Result<()>
+where
+	C: for<'a> IoSharedClientExt<'a>,
+{
 	progress.start_single_item(source.size());
 	match options.existing {
 		// Whatever is at the path, even a dangling symlink, is kept.
@@ -1357,13 +1634,19 @@ async fn download_file(
 	Ok(())
 }
 
-async fn download_directory(
-	client: &Arc<Client>,
+/// Download the directory `source`, of the category `Cat` listed with `context`, to `target`.
+async fn download_directory<Cat>(
+	client: Arc<Cat::Client>,
 	progress: &TransferProgress,
-	source: DirType<'static, Normal>,
+	source: DirType<'static, Cat>,
 	target: &Path,
+	context: Cat::ListDirContext<'_>,
 	options: DirDownloadOptions,
-) -> Result<()> {
+) -> Result<()>
+where
+	Cat: CategoryFS + CategoryDirDownloadExtPub,
+	TransferProgress: DirDownloadCallback<Cat>,
+{
 	let target = target
 		.to_str()
 		.ok_or_else(|| {
@@ -1374,16 +1657,9 @@ async fn download_directory(
 		})?
 		.to_string();
 	progress.start_scan();
-	Normal::download_dir_recursively_with_options(
-		client.clone(),
-		target,
-		progress,
-		source,
-		(),
-		options,
-	)
-	.await
-	.context("Failed to download directory")
+	Cat::download_dir_recursively_with_options(client, target, progress, source, context, options)
+		.await
+		.context("Failed to download directory")
 }
 
 // progress reporting
@@ -2022,7 +2298,7 @@ fn skipped_symlinks_line(count: usize) -> String {
 	)
 }
 
-impl DirDownloadCallback<Normal> for TransferProgress {
+impl<Cat: Category> DirDownloadCallback<Cat> for TransferProgress {
 	fn on_query_download_progress(&self, _known_bytes: u64, _total_bytes: Option<u64>) {}
 
 	fn on_scan_progress(&self, _known_dirs: u64, known_files: u64, known_bytes: u64) {
@@ -2039,8 +2315,8 @@ impl DirDownloadCallback<Normal> for TransferProgress {
 
 	fn on_download_update(
 		&self,
-		_downloaded_dirs: Vec<(RemoteDirectory, String)>,
-		downloaded_files: Vec<(RemoteFile, String)>,
+		_downloaded_dirs: Vec<(Cat::Dir, String)>,
+		downloaded_files: Vec<(Cat::File, String)>,
 		downloaded_bytes: u64,
 	) {
 		let mut state = self.state.lock().unwrap();
@@ -2054,7 +2330,7 @@ impl DirDownloadCallback<Normal> for TransferProgress {
 		self.advance_locked(&mut state, files, downloaded_bytes);
 	}
 
-	fn on_download_skipped(&self, skipped_files: Vec<(RemoteFile, String)>) {
+	fn on_download_skipped(&self, skipped_files: Vec<(Cat::File, String)>) {
 		let bytes = skipped_files
 			.iter()
 			.fold(0u64, |bytes, (file, _)| bytes.saturating_add(file.size()));
@@ -2065,7 +2341,7 @@ impl DirDownloadCallback<Normal> for TransferProgress {
 		self.resume(resumed_bytes);
 	}
 
-	fn on_download_errors(&self, errors: Vec<(Error, String, NonRootItemType<'static, Normal>)>) {
+	fn on_download_errors(&self, errors: Vec<(Error, String, NonRootItemType<'static, Cat>)>) {
 		self.push_failures(errors.into_iter().map(|(e, path, _)| TransferFailure {
 			path: Some(path),
 			error: e.to_string(),
@@ -2089,12 +2365,13 @@ mod tests {
 	};
 
 	use super::{
-		DownloadSource, Existing, FilterArgs, ProgressState, SPEED_WINDOW, Tally, TransferFailure,
-		TransferKind, TransferProgress, UploadTarget, canceled_message, download_target,
-		ends_the_command, ensure_stdio_is_free, existing_remote_policy, format_duration,
-		local_existing, partial_download, progress_line, resolve_download_target,
-		resolve_upload_target, result_json, skipped_symlinks_line, source_failure,
-		sources_and_destination, stdin_destination, stdin_upload_target, transfer_summary,
+		DownloadSource, Existing, FilterArgs, LinkKind, ProgressState, PublicLink, SPEED_WINDOW,
+		Tally, TransferFailure, TransferKind, TransferProgress, UploadTarget, canceled_message,
+		decode_hex_key, download_target, ends_the_command, ensure_stdio_is_free,
+		existing_remote_policy, format_duration, local_existing, partial_download, progress_line,
+		resolve_download_target, resolve_upload_target, result_json, skipped_symlinks_line,
+		source_failure, sources_and_destination, stdin_destination, stdin_upload_target,
+		transfer_summary,
 	};
 	use crate::{
 		error::CliError,
@@ -2707,6 +2984,94 @@ mod tests {
 			)
 			.unwrap(),
 			upload_target("/x/y", "a.txt")
+		);
+	}
+
+	const LINK_UUID: &str = "0f8fad5b-d9cb-469f-a165-70867728950e";
+
+	fn link(kind: LinkKind, key: &str) -> Option<PublicLink> {
+		Some(PublicLink {
+			kind,
+			uuid: LINK_UUID.parse().unwrap(),
+			key: key.to_owned(),
+		})
+	}
+
+	#[test]
+	fn a_file_link_from_the_web_app_gives_its_hex_decoded_key() {
+		assert_eq!(
+			PublicLink::parse(&format!(
+				"https://app.filen.io/#/d/{LINK_UUID}%2361626358595a3039"
+			))
+			.unwrap(),
+			link(LinkKind::File, "abcXYZ09")
+		);
+	}
+
+	#[test]
+	fn a_key_holding_marks_is_hex_decoded() {
+		assert_eq!(decode_hex_key("5f5a67-2d").as_deref(), None, "not hex");
+		assert_eq!(decode_hex_key("5f5a672d").as_deref(), Some("_Zg-"));
+	}
+
+	#[test]
+	fn a_directory_link_from_the_web_app_is_read() {
+		assert_eq!(
+			PublicLink::parse(&format!("https://app.filen.io/#/f/{LINK_UUID}%236b6579")).unwrap(),
+			link(LinkKind::Dir, "key")
+		);
+	}
+
+	#[test]
+	fn an_older_link_with_a_raw_key_is_read() {
+		assert_eq!(
+			PublicLink::parse(&format!("https://drive.filen.io/f/{LINK_UUID}#abcXYZ09")).unwrap(),
+			link(LinkKind::Dir, "abcXYZ09")
+		);
+	}
+
+	#[test]
+	fn a_raw_hex_key_that_decodes_to_no_key_is_taken_as_it_is() {
+		let key = "00ff".repeat(16);
+		assert_eq!(decode_hex_key(&key), None);
+		assert_eq!(
+			PublicLink::parse(&format!("https://app.filen.io/#/d/{LINK_UUID}%23{key}")).unwrap(),
+			link(LinkKind::File, &key)
+		);
+	}
+
+	#[test]
+	fn a_path_is_not_a_link() {
+		assert_eq!(PublicLink::parse("/photos/https.jpg").unwrap(), None);
+	}
+
+	#[test]
+	fn a_url_that_is_not_a_link_is_a_usage_error_naming_it_without_its_key() {
+		for url in [
+			"https://app.filen.io/#/drive".to_owned(),
+			"https://app.filen.io/#/d/not-a-uuid%23abc".to_owned(),
+			format!("https://app.filen.io/#/d/{LINK_UUID}"),
+			format!("https://app.filen.io/#/d/{LINK_UUID}%23"),
+		] {
+			let error = PublicLink::parse(&url).unwrap_err();
+			assert_eq!(
+				error.downcast_ref::<CliError>().map(CliError::exit_code),
+				Some(2),
+				"{url}"
+			);
+		}
+		let error = PublicLink::parse("https://app.filen.io/#/x/1%23secret").unwrap_err();
+		assert_eq!(
+			error.to_string(),
+			"Not the URL of a public link: https://app.filen.io/"
+		);
+	}
+
+	#[test]
+	fn a_link_is_shown_without_its_key() {
+		assert_eq!(
+			link(LinkKind::File, "secret").unwrap().to_string(),
+			format!("public link {LINK_UUID}")
 		);
 	}
 
