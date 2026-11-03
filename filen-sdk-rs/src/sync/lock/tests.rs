@@ -1081,3 +1081,251 @@ fn a_release_cancelled_with_its_runtime_is_not_waited_for() {
 	drop(undriven);
 	assert!(settled());
 }
+
+/// When a lease scripted for a release test was last confirmed: now, on the paused clock.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+fn lease_confirmed_now() -> impl Fn() -> Duration {
+	let confirmed = Confirmed::now();
+	move || confirmed.age()
+}
+
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+#[tokio::test(start_paused = true)]
+async fn a_release_failing_in_transport_is_sent_again() {
+	let asked = std::cell::Cell::new(0);
+	let begin = Instant::now();
+	release_loop(
+		scripted_answers(
+			&asked,
+			[
+				(Duration::ZERO, Err(ErrorKind::Reqwest)),
+				(Duration::ZERO, Ok(true)),
+			],
+		),
+		lease_confirmed_now(),
+		"drive-write",
+	)
+	.await;
+	assert_eq!(asked.get(), 2);
+	assert_eq!(begin.elapsed(), RELEASE_RETRY_FIRST);
+}
+
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+#[tokio::test(start_paused = true)]
+async fn a_release_retries_with_a_growing_pause() {
+	let asked = std::cell::Cell::new(0);
+	let failure = (Duration::ZERO, Err(ErrorKind::Reqwest));
+	let begin = Instant::now();
+	release_loop(
+		scripted_answers(
+			&asked,
+			[
+				failure,
+				failure,
+				failure,
+				failure,
+				failure,
+				failure,
+				(Duration::ZERO, Ok(true)),
+			],
+		),
+		lease_confirmed_now(),
+		"drive-write",
+	)
+	.await;
+	assert_eq!(asked.get(), 7);
+	// 0.25 + 0.5 + 1 + 2 + 4 + 4: capped at the ceiling
+	assert_eq!(
+		begin.elapsed(),
+		Duration::from_millis(250 + 500 + 1000 + 2000) + RELEASE_RETRY_MAX * 2
+	);
+}
+
+/// Answered by the server, a release is never sent again: `released: false` means the lease
+/// was not held, or not by this uuid, and asking again gets the same answer.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+#[tokio::test(start_paused = true)]
+async fn a_release_the_server_answered_is_not_sent_again() {
+	for answer in [Ok(true), Ok(false), Err(ErrorKind::Server)] {
+		let asked = std::cell::Cell::new(0);
+		release_loop(
+			scripted_answers(&asked, [(Duration::ZERO, answer)]),
+			lease_confirmed_now(),
+			"drive-write",
+		)
+		.await;
+		assert_eq!(asked.get(), 1, "{answer:?} is final");
+	}
+}
+
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+#[tokio::test(start_paused = true)]
+async fn release_retries_stop_once_the_lease_has_expired() {
+	let asked = std::cell::Cell::new(0);
+	let begin = Instant::now();
+	let sent = std::cell::RefCell::new(Vec::new());
+	let mut failing = counted_refresh(&asked, Duration::ZERO, Err(ErrorKind::Reqwest));
+	release_loop(
+		|| {
+			sent.borrow_mut().push(begin.elapsed());
+			failing()
+		},
+		lease_confirmed_now(),
+		"drive-write",
+	)
+	.await;
+	let sent = sent.into_inner();
+	assert!(sent.len() > 2, "retried while the lease could stand");
+	assert!(
+		sent.iter().all(|at| *at < LOCK_SERVER_TTL),
+		"no retry starts past the lease: {sent:?}"
+	);
+	assert!(begin.elapsed() < LOCK_SERVER_TTL);
+}
+
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+#[tokio::test(start_paused = true)]
+async fn a_release_retry_in_flight_is_cut_off_when_the_lease_expires() {
+	let asked = std::cell::Cell::new(0);
+	let begin = Instant::now();
+	release_loop(
+		scripted_answers(
+			&asked,
+			[
+				(Duration::ZERO, Err(ErrorKind::Reqwest)),
+				(LOCK_SERVER_TTL * 10, Ok(true)),
+			],
+		),
+		lease_confirmed_now(),
+		"drive-write",
+	)
+	.await;
+	assert_eq!(asked.get(), 2);
+	assert_eq!(begin.elapsed(), LOCK_SERVER_TTL);
+}
+
+/// A lock taken for lost past its lease still sends its release once, in case the clocks
+/// overstate the age, but never retries it.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+#[tokio::test(start_paused = true)]
+async fn a_release_past_the_lease_is_sent_once() {
+	let asked = std::cell::Cell::new(0);
+	let lapsed = confirmed_ago(LOCK_SERVER_TTL);
+	release_loop(
+		counted_refresh(&asked, Duration::ZERO, Err(ErrorKind::Reqwest)),
+		move || lapsed.age(),
+		"drive-write",
+	)
+	.await;
+	assert_eq!(asked.get(), 1);
+}
+
+/// A refresh the keep-alive records while the release retries extends the retries: the bound is
+/// read from the lease's newest confirmation, not the one at the drop.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+#[tokio::test(start_paused = true)]
+async fn release_retries_follow_the_newest_confirmation() {
+	let confirmed = tokio::sync::watch::Sender::new(Confirmed::now());
+	let begin = Instant::now();
+	let mut last_sent = Duration::ZERO;
+	let mut refreshed_at = None;
+	release_loop(
+		|| {
+			last_sent = begin.elapsed();
+			if refreshed_at.is_none() && last_sent >= Duration::from_secs(10) {
+				// a refresh sent before the drop, answered just now
+				confirmed.send_replace(Confirmed::now());
+				refreshed_at = Some(last_sent);
+			}
+			futures::future::ready(Err(Error::custom(ErrorKind::Reqwest, "scripted release")))
+		},
+		|| confirmed.borrow().age(),
+		"drive-write",
+	)
+	.await;
+	let refreshed_at = refreshed_at.expect("retried for 10 s");
+	assert!(last_sent > LOCK_SERVER_TTL, "retried past the drop's bound");
+	assert!(last_sent < refreshed_at + LOCK_SERVER_TTL);
+}
+
+/// A shutdown waits for a release that is being retried, as the retries stay counted: until it
+/// is answered, or for the shutdown's bound while it keeps failing.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+#[tokio::test(start_paused = true)]
+async fn a_shutdown_waits_for_a_retrying_release_within_its_bound() {
+	let failure = (Duration::ZERO, Err(ErrorKind::Reqwest));
+	for (script, settled, waited) in [
+		(
+			vec![failure, failure, (Duration::ZERO, Ok(true))],
+			true,
+			Duration::from_millis(250 + 500),
+		),
+		(
+			std::iter::repeat_n(failure, 64).collect(),
+			false,
+			LOCK_RELEASE_SETTLE_BOUND,
+		),
+	] {
+		let pending = PendingReleases::default();
+		let asked = std::cell::Cell::new(0);
+		let guard = pending.track();
+		let ((), (outcome, elapsed)) = tokio::join!(
+			async {
+				release_loop(
+					scripted_answers(&asked, script),
+					lease_confirmed_now(),
+					"drive-write",
+				)
+				.await;
+				drop(guard);
+			},
+			async {
+				let begin = Instant::now();
+				let outcome = pending.settle(LOCK_RELEASE_SETTLE_BOUND).await;
+				(outcome, begin.elapsed())
+			},
+		);
+		assert_eq!(outcome, settled);
+		assert_eq!(elapsed, waited);
+		assert!(asked.get() > 1, "the release was retried");
+	}
+}
+
+/// A retry resends the released lease's own uuid, so it can never free a lease the client
+/// acquired since: here the first release reached the server but its answer was lost, and the
+/// client took the lock again under a new uuid before the retry went out.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+#[tokio::test(start_paused = true)]
+async fn a_release_retry_never_frees_a_newer_lease() {
+	let (old, newer) = (Uuid::new_v4(), Uuid::new_v4());
+	let holder = std::cell::Cell::new(Some(old));
+	let body = release_body(old, "drive-write").unwrap();
+	let mut released = Vec::new();
+	release_loop(
+		|| {
+			let request: api::v3::user::lock::Request =
+				serde_json::from_slice(&body).expect("a lock request");
+			assert!(matches!(request.r#type, LockType::Release));
+			assert_eq!(request.resource, "drive-write");
+			released.push(request.uuid);
+			// the server releases only what this uuid holds
+			let freed = holder.get() == Some(request.uuid);
+			if freed {
+				holder.set(None);
+			}
+			let answer = if released.len() == 1 {
+				// the release landed, its answer was lost; the client acquires again
+				holder.set(Some(newer));
+				Err(Error::custom(ErrorKind::Reqwest, "answer lost"))
+			} else {
+				Ok(freed)
+			};
+			futures::future::ready(answer)
+		},
+		lease_confirmed_now(),
+		"drive-write",
+	)
+	.await;
+	assert_eq!(released, [old, old], "every attempt carries the old uuid");
+	assert_eq!(holder.get(), Some(newer), "the newer lease is still held");
+}

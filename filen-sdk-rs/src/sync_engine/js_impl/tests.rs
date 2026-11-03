@@ -360,17 +360,17 @@ async fn a_second_close_returns_only_once_the_first_is_done() {
 	second.await.unwrap().unwrap();
 }
 
-/// A host exits as soon as close returns, so close sends the release of the drive lock a pass
-/// let go before it returns: here the proxy the client goes through sees the release's
-/// connection, and nothing is left in flight once close is done.
-#[tokio::test]
-async fn a_close_returns_once_the_release_of_a_lock_let_go_is_sent() {
+/// A host exits as soon as close returns, so close waits for the release of the drive lock a
+/// pass let go, retries included, for its bound at most: here the proxy the client goes through
+/// refuses every attempt of the release, which is sent again until close gives up on it.
+#[tokio::test(start_paused = true)]
+async fn a_close_waits_for_the_retried_release_of_a_lock_let_go_within_its_bound() {
 	let scene = Scene::new();
 	let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
 	let client = client_via_proxy(ClientConfig::default(), proxy.local_addr().unwrap());
 	let core = scene.open(client).await.unwrap();
 	let (seen, mut connects) = unbounded_channel();
-	// Every attempt of the release is refused once seen, so the release fails on its own.
+	// Every attempt of the release is refused once seen, so each fails in transport.
 	let _proxy = tokio::spawn(async move {
 		loop {
 			let (mut socket, _) = proxy.accept().await.unwrap();
@@ -378,19 +378,27 @@ async fn a_close_returns_once_the_release_of_a_lock_let_go_is_sent() {
 		}
 	});
 	drop(test_lock_on(core.client.arc_client(), None));
+	for attempt in ["sent", "sent again"] {
+		assert!(
+			connects.recv().await.unwrap().starts_with(GATEWAY_CONNECT),
+			"the release was {attempt}"
+		);
+	}
 
+	let begin = tokio::time::Instant::now();
 	Arc::clone(&core).close().await.unwrap();
-	assert!(
-		connects.try_recv().unwrap().starts_with(GATEWAY_CONNECT),
-		"the release was sent"
+	assert_eq!(
+		begin.elapsed(),
+		crate::sync::lock::LOCK_RELEASE_SETTLE_BOUND
 	);
 	assert!(
-		core.client
+		!core
+			.client
 			.client()
 			.pending_lock_releases
 			.settle(Duration::ZERO)
 			.await,
-		"the release was answered"
+		"the release is still retried while its lease could stand"
 	);
 }
 

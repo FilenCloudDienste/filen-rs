@@ -163,9 +163,9 @@ impl Drop for PendingRelease {
 /// The release request is spawned onto the ambient tokio runtime at drop time when one exists,
 /// falling back to the runtime the lock was acquired on; if neither is available (or the
 /// fallback runtime has shut down), the release is skipped and the server expires the lock on
-/// its own after ~60 seconds. Closing the sync engine waits for the releases still in flight,
-/// for a few seconds at most, so a host that exits right after does not cut them
-/// off.
+/// its own after ~60 seconds. A release failing in transport is sent again while the lease could
+/// still stand. Closing the sync engine waits for the releases still in flight, retries
+/// included, for a few seconds at most, so a host that exits right after does not cut them off.
 #[derive(Debug, Clone)]
 pub struct ResourceLock {
 	lease: Arc<SharedLease>,
@@ -419,32 +419,36 @@ impl SharedLease {
 			);
 			return;
 		};
-		let client = self.client.clone();
-		let uuid = self.uuid;
-		let resource = self.resource.clone();
-		let pending = client.pending_lock_releases.track();
 		// Spawning on a handle whose runtime has shut down does not panic: the task is
 		// cancelled without being polled and the server expires the lock on its own.
-		handle.spawn(async move {
-			release(&client, &lock_url(), uuid, &resource).await;
-			drop(pending);
-		});
+		handle.spawn(self.release_task());
 	}
 
 	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 	fn spawn_release(&self) {
-		let client = self.client.clone();
-		let uuid = self.uuid;
-		let resource = self.resource.clone();
-		let pending = client.pending_lock_releases.track();
 		// `runtime::spawn_local` (unlike raw `wasm_bindgen_futures::spawn_local`) holds the
 		// spawning SDK worker open until the future completes, so a worker whose other tasks
 		// finish cannot close mid-request and silently skip the release. On the main thread it
 		// degrades to a plain `spawn_local`.
-		crate::runtime::spawn_local(async move {
-			release(&client, &lock_url(), uuid, &resource).await;
+		crate::runtime::spawn_local(self.release_task());
+	}
+
+	/// The release of this lease, counted in the client's [`PendingReleases`] from now until it
+	/// is answered or given up on (see [`release`]). It reads the lease's confirmations as they
+	/// come, so a refresh the keep-alive records after the drop still extends the retries.
+	fn release_task(&self) -> impl Future<Output = ()> + MaybeSend + 'static {
+		let client = self.client.clone();
+		let uuid = self.uuid;
+		let resource = self.resource.clone();
+		let confirmed = self.confirmed.clone();
+		let pending = client.pending_lock_releases.track();
+		async move {
+			release(&client, &lock_url(), uuid, &resource, || {
+				confirmed.borrow().age()
+			})
+			.await;
 			drop(pending);
-		});
+		}
 	}
 }
 
@@ -482,29 +486,124 @@ async fn send_refresh(
 	result
 }
 
-/// Releases the lock `uuid` on `resource`, sent to `url`. The server only releases it while
-/// `uuid` holds it.
-async fn release(client: &AuthClient, url: &str, uuid: Uuid, resource: &str) {
-	match api::v3::user::lock::post(
-		client,
-		url,
+/// The serialized Release of the lock `uuid` on `resource`. The server only releases a lease
+/// `uuid` holds, and every lease is acquired under a uuid of its own, so this body can never
+/// free a later lease of the same client, however late it arrives.
+fn release_body(uuid: Uuid, resource: &str) -> Result<Bytes, Error> {
+	Ok(Bytes::from_owner(serde_json::to_vec(
 		&api::v3::user::lock::Request {
 			uuid,
 			r#type: LockType::Release,
 			resource: Cow::Borrowed(resource),
 		},
-	)
-	.await
-	{
-		Ok(response) => {
-			debug!("Released lock {resource}: {uuid}");
-			if !response.released {
-				tracing::warn!("Failed to release lock {resource}");
-			}
-		}
+	)?))
+}
+
+/// One Release round-trip with the serialized request `body`, sent to `url`: the server's
+/// `released` flag.
+async fn send_release(client: &AuthClient, url: &str, body: Bytes) -> Result<bool, Error> {
+	client
+		.post_raw_bytes_auth_lock::<api::v3::user::lock::Response>(
+			body,
+			url,
+			api::v3::user::lock::ENDPOINT.into(),
+		)
+		.await
+		.map(|response| response.released)
+}
+
+/// Releases the lock `uuid` on `resource`, sent to `url`, retrying a release that fails in
+/// transport while the lease could still stand (see [`release_loop`]). `lease_age` is the time
+/// since the server last confirmed the lease.
+async fn release(
+	client: &AuthClient,
+	url: &str,
+	uuid: Uuid,
+	resource: &str,
+	lease_age: impl Fn() -> Duration,
+) {
+	let body = match release_body(uuid, resource) {
+		Ok(body) => body,
 		Err(e) => {
 			tracing::warn!("Failed to release lock {resource}: {e}");
+			return;
 		}
+	};
+	// refcount bump: every attempt resends the same Release body
+	release_loop(
+		|| send_release(client, url, body.clone()),
+		lease_age,
+		resource,
+	)
+	.await;
+}
+
+/// The first pause before a failed release is sent again; each further one doubles, up to
+/// [`RELEASE_RETRY_MAX`].
+const RELEASE_RETRY_FIRST: Duration = Duration::from_millis(250);
+/// The longest pause between two attempts of a release.
+const RELEASE_RETRY_MAX: Duration = Duration::from_secs(4);
+
+/// Sends a release with `send` (one round trip, resolving to the server's `released` flag)
+/// until the server answers it.
+///
+/// A release failing in transport ([`ErrorKind::Reqwest`]: no response, a timeout, an HTTP
+/// error status once the retry layer gave up on it) leaves the lease on the server, refusing
+/// every other client on the account until it expires, so it is sent again after a pause
+/// growing from [`RELEASE_RETRY_FIRST`] to [`RELEASE_RETRY_MAX`]. Only while the lease could
+/// stand: `lease_age` is the time since the server last confirmed it, and once it reaches
+/// [`LOCK_SERVER_TTL`] the server has expired the lease on its own, so no retry starts and one
+/// in flight is cut off. The first attempt is sent whatever the age, as a lock taken for lost
+/// releases its lease in case the clocks overstate the age.
+///
+/// An answer ends it, `released: false` included (the lease was not held, or not by this
+/// uuid), as does any other error: sending it again would be answered the same.
+///
+/// Generic over the round trip so the schedule is unit-testable on a paused clock.
+async fn release_loop<F, Fut>(mut send: F, lease_age: impl Fn() -> Duration, resource: &str)
+where
+	F: FnMut() -> Fut,
+	Fut: Future<Output = Result<bool, Error>>,
+{
+	let mut pause = RELEASE_RETRY_FIRST;
+	let mut answer = send().await;
+	loop {
+		match answer {
+			Ok(true) => {
+				debug!("Released lock {resource}");
+				return;
+			}
+			Ok(false) => {
+				tracing::warn!("Server held no lease to release for lock {resource}");
+				return;
+			}
+			Err(e) if e.kind() == ErrorKind::Reqwest => {
+				// a retry starting past the lease would find it expired
+				if LOCK_SERVER_TTL.saturating_sub(lease_age()) <= pause {
+					tracing::warn!(
+						"Failed to release lock {resource}, the server expires its lease on its own: {e}"
+					);
+					return;
+				}
+				tracing::warn!("Failed to release lock {resource}, retrying in {pause:?}: {e}");
+			}
+			Err(e) => {
+				tracing::warn!("Failed to release lock {resource}: {e}");
+				return;
+			}
+		}
+		sleep(pause).await;
+		pause = min(pause * 2, RELEASE_RETRY_MAX);
+		let remaining = LOCK_SERVER_TTL.saturating_sub(lease_age());
+		answer = match timeout(remaining, send()).await {
+			Ok(answer) => answer,
+			Err(_) => {
+				tracing::warn!(
+					"Release of lock {resource} unanswered within its lease, the server expires it on its own"
+				);
+				return;
+			}
+		};
 	}
 }
 
@@ -685,9 +784,11 @@ async fn request_acquire(
 	let pending = client.pending_lock_releases.track();
 	// Detached, not cancelled: the task must outlive a caller that stopped waiting.
 	drop(crate::runtime::spawn_task_maybe_send(async move {
+		// a lease granted to this request runs from no earlier than its send
+		let sent = Confirmed::now();
 		let acquired = send_acquire(&client, &url, body).await;
 		if let Err(Ok(true)) = answer.send(acquired) {
-			release(&client, &url, uuid, &resource).await;
+			release(&client, &url, uuid, &resource, || sent.age()).await;
 		}
 		drop(pending);
 	}));
