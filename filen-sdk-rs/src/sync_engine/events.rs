@@ -63,9 +63,12 @@ pub enum SyncEvent {
 		reason: String,
 		pass_token: String,
 	},
-	/// Uploading a local file to the remote.
+	/// A local file was uploaded to the remote. File transfers run concurrently and report this
+	/// once the upload has landed, after its [`Progress`](Self::Progress); one that fails reports
+	/// [`ActionFailed`](Self::ActionFailed) instead.
 	Uploading { rel_path: String },
-	/// Downloading a remote file into the local tree.
+	/// A remote file was downloaded into the local tree, reported as
+	/// [`Uploading`](Self::Uploading) is: once the download has landed.
 	Downloading { rel_path: String },
 	/// Bytes moved so far by the upload or download of `rel_path`. File transfers run concurrently
 	/// and report their [`Uploading`](Self::Uploading) / [`Downloading`](Self::Downloading) event

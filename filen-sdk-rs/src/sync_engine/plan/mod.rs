@@ -195,7 +195,8 @@ impl SyncAction {
 	}
 
 	/// The "in progress" [`SyncEvent`] for this action, emitted by the apply layer just before it
-	/// executes the action.
+	/// executes the action, except for a file transfer, which the concurrent transfer path reports
+	/// once it has landed.
 	pub(super) fn to_event(&self) -> SyncEvent {
 		match self {
 			Self::UploadFile { rel_path } => SyncEvent::Uploading {
