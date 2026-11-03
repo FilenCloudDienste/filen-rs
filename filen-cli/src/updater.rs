@@ -29,7 +29,11 @@ use tokio::fs;
 
 use crate::{interrupt, ui::UI};
 
-const BUILD_TARGET: &str = env!("BUILD_TARGET"); // injected in build.rs
+/// The target the CLI was built for, which names its release asset.
+pub(crate) const BUILD_TARGET: &str = env!("BUILD_TARGET"); // injected in build.rs
+
+/// Whether this is the CLI of the Docker image.
+pub(crate) const IN_DOCKER_IMAGE: bool = cfg!(feature = "is_docker");
 
 /// The Docker image the CLI is published as, tagged with each release's version.
 const DOCKER_IMAGE: &str = "filen/cli";
@@ -92,7 +96,7 @@ pub(crate) async fn check_for_updates(
 		UpdateContext {
 			automatically_update,
 			is_repl,
-			in_container: cfg!(feature = "is_docker"),
+			in_container: IN_DOCKER_IMAGE,
 		},
 		last_checked_config.as_ref(),
 		async || {
@@ -417,7 +421,7 @@ pub(crate) async fn install(ui: &mut UI, request: &ReleaseRequest) -> Result<()>
 		ui,
 		&env.version,
 		request,
-		cfg!(feature = "is_docker"),
+		IN_DOCKER_IMAGE,
 		async |request| github_api.get_release(request).await,
 		|ui, question| ui.prompt_confirm(question, false),
 	)

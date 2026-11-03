@@ -634,3 +634,43 @@ fn install_of_something_that_is_not_a_version_is_a_usage_error() {
 
 	assert_eq!(server.requests(), Vec::<String>::new());
 }
+
+#[test]
+fn version_runs_without_an_account_or_an_update_check() {
+	let server = MockServer::start(Releases::default());
+	let installation = Installation::new("filen-cli");
+
+	let output = installation
+		.cli(&server.url, "0.0.0-test")
+		.args(["version", "--json"])
+		.assert()
+		.success()
+		.get_output()
+		.stdout
+		.clone();
+
+	let printed: serde_json::Value = serde_json::from_slice(&output).unwrap();
+	assert_eq!(printed["version"], env!("CARGO_PKG_VERSION"));
+	assert_eq!(printed["target"], TARGET);
+	assert_eq!(
+		printed["configDir"],
+		installation.config_dir.path().to_str().unwrap()
+	);
+	assert_eq!(server.requests(), Vec::<String>::new());
+}
+
+#[test]
+fn the_log_names_the_environment() {
+	let server = MockServer::start(Releases::default());
+	let installation = Installation::new("filen-cli");
+
+	installation
+		.cli(&server.url, "0.0.0-test")
+		.args(["-v", "version"])
+		.assert()
+		.success()
+		.stderr(contains(format!(
+			"Target: {TARGET}, config directory: {}, Docker image: no",
+			installation.config_dir.path().display()
+		)));
+}

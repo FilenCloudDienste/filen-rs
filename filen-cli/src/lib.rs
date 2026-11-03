@@ -42,6 +42,7 @@ use crate::{
 	commands::{
 		Commands, execute_command,
 		fs_cmds::{self, FsCommands},
+		shell_cmds,
 	},
 	docs::{generate_markdown_docs, print_in_app_docs},
 	log_files::{ChosenLogFile, LogFiles, LogLimits},
@@ -439,6 +440,10 @@ async fn inner_main(ui: &mut ui::UI, arenas_limited: bool) -> Result<Finished> {
 		info!("Filen CLI (version omitted for replay testing)")
 	} else {
 		info!("Filen CLI v{}", env!("CARGO_PKG_VERSION"));
+	}
+	// the config directory differs from run to run, which no recording could match
+	if !cli_args.make_output_environment_agnostic_for_replay_testing {
+		info!("{}", shell_cmds::environment_summary(&config.config_dir));
 	}
 	if !arenas_limited {
 		warn!("glibc did not take the malloc arena cap, so freed memory may stay with the process");
