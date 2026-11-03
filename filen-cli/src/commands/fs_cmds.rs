@@ -314,88 +314,152 @@ pub(crate) fn print_items_after_list(
 	directory_label: Option<&str>,
 	long: bool,
 ) -> Result<()> {
-	let mut directories = dirs
+	let mut items = dirs
 		.iter()
-		.map(|f| {
-			f.name()
-				.map(str::to_string)
-				.unwrap_or_else(|| f.uuid().to_string())
-		})
-		.collect::<Vec<String>>();
-	directories.sort();
-	let mut files = files
-		.iter()
-		.map(|f| {
-			(
-				f.name()
-					.map(str::to_string)
-					.unwrap_or_else(|| f.uuid().to_string()),
-				f.size(),
-			)
-		})
-		.collect::<Vec<(String, u64)>>();
-	files.sort_by(|(a, _), (b, _)| a.cmp(b));
-	print_item_names(
+		.map(ListedItem::of_dir)
+		.chain(files.iter().map(ListedItem::of_file))
+		.collect::<Vec<ListedItem>>();
+	sort_listing(&mut items, ListedBy::Name);
+	print_listing(
 		ui,
-		directories,
-		files,
+		&items,
+		ListedBy::Name,
 		&format!("{} is empty", directory_label.unwrap_or("Directory")),
 		long,
 	)
 }
 
-/// Prints an already resolved listing: directory names (or paths) first, then file names (or
-/// paths) with their sizes. Both are expected to be sorted the way they should be printed.
-fn print_item_names(
+/// Whether an item is a directory or a file. Listings print directories first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ListedKind {
+	Directory,
+	File,
+}
+
+/// What a listing shows to identify its items.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ListedBy {
+	/// The items share a parent, so their names identify them.
+	Name,
+	/// The items don't share a parent, so only their absolute paths identify them.
+	Path,
+}
+
+/// One item of a listing, with everything `ls` and the `list-*` commands print of it.
+#[derive(Debug, Clone, PartialEq)]
+struct ListedItem {
+	kind: ListedKind,
+	/// The item's name, or its UUID when the name cannot be decrypted.
+	name: String,
+	/// The item's absolute path, in a listing by path, or `None` when it could not be resolved
+	/// (or the listing is by name).
+	path: Option<String>,
+	/// The file's size in bytes; directories have none.
+	size: Option<u64>,
+	uuid: Uuid,
+}
+
+impl ListedItem {
+	fn of_dir(dir: &RemoteDirectory) -> Self {
+		Self {
+			kind: ListedKind::Directory,
+			name: name_or_uuid(dir.name(), dir.uuid()),
+			path: None,
+			size: None,
+			uuid: dir.uuid(),
+		}
+	}
+
+	fn of_file(file: &RemoteFile) -> Self {
+		Self {
+			kind: ListedKind::File,
+			name: name_or_uuid(file.name(), file.uuid()),
+			path: None,
+			size: Some(file.size()),
+			uuid: file.uuid(),
+		}
+	}
+
+	/// What the listing prints for the item: its name, or in a listing by path its path, falling
+	/// back to its UUID like an undecryptable name does, so that one unresolvable item doesn't drop
+	/// the rest of the listing.
+	fn label(&self, by: ListedBy) -> Cow<'_, str> {
+		match (by, &self.path) {
+			(ListedBy::Name, _) => Cow::Borrowed(&self.name),
+			(ListedBy::Path, Some(path)) => Cow::Borrowed(path),
+			(ListedBy::Path, None) => Cow::Owned(self.uuid.to_string()),
+		}
+	}
+}
+
+fn name_or_uuid(name: Option<&str>, uuid: Uuid) -> String {
+	name.map(str::to_string).unwrap_or_else(|| uuid.to_string())
+}
+
+/// Sorts a listing the way it is printed: directories first, each group by label.
+fn sort_listing(items: &mut [ListedItem], by: ListedBy) {
+	items.sort_by(|a, b| {
+		a.kind
+			.cmp(&b.kind)
+			.then_with(|| a.label(by).cmp(&b.label(by)))
+	});
+}
+
+/// Prints a listing, in the order of `items`.
+fn print_listing(
 	ui: &mut UI,
-	directories: Vec<String>,
-	files: Vec<(String, u64)>,
+	items: &[ListedItem],
+	by: ListedBy,
 	empty_message: &str,
 	long: bool,
 ) -> Result<()> {
-	let file_names = files
-		.iter()
-		.map(|(name, _)| name.clone())
-		.collect::<Vec<String>>();
 	if ui.json {
+		let labels_of = |kind: ListedKind| {
+			items
+				.iter()
+				.filter(|item| item.kind == kind)
+				.map(|item| item.label(by).into_owned())
+				.collect::<Vec<String>>()
+		};
 		ui.print_json(json!({
-			"directories": directories,
-			"files": file_names,
+			"directories": labels_of(ListedKind::Directory),
+			"files": labels_of(ListedKind::File),
 		}))?;
 		return Ok(());
 	}
-	if directories.is_empty() && files.is_empty() {
+	if items.is_empty() {
 		ui.print_muted(empty_message);
 		return Ok(());
 	}
 	if long {
 		// one item per line, with a right-aligned size column (directories have no size)
-		let sizes = files
+		let sizes = items
 			.iter()
-			.map(|(_, size)| ui::format_size(*size))
+			.map(|item| item.size.map_or_else(|| "-".to_string(), ui::format_size))
 			.collect::<Vec<String>>();
 		let size_width = sizes.iter().map(|s| s.len()).max().unwrap_or(0).max(1);
-		for name in &directories {
+		for (item, size) in items.iter().zip(sizes.iter()) {
 			// pad before styling, so the ANSI codes don't count towards the column width
-			let size = format!("{:>size_width$}", "-");
-			ui.print(&format!("{}  {}", style(size).dim(), style(name).blue()));
-		}
-		for ((name, _), size) in files.iter().zip(sizes.iter()) {
-			ui.print(&format!("{:>size_width$}  {}", size, name));
+			let size = format!("{:>size_width$}", size);
+			let line = match item.kind {
+				ListedKind::Directory => {
+					format!("{}  {}", style(size).dim(), style(item.label(by)).blue())
+				}
+				ListedKind::File => format!("{}  {}", size, item.label(by)),
+			};
+			ui.print(&line);
 		}
 		return Ok(());
 	}
 	// print directory names in blue
-	let directories = directories
+	let labels = items
 		.iter()
-		.map(|s| style(s).blue().to_string())
+		.map(|item| match item.kind {
+			ListedKind::Directory => style(item.label(by)).blue().to_string(),
+			ListedKind::File => item.label(by).into_owned(),
+		})
 		.collect::<Vec<String>>();
-	let all_items = directories
-		.iter()
-		.chain(file_names.iter())
-		.map(|s| s.as_ref())
-		.collect::<Vec<&str>>();
-	ui.print_grid(&all_items);
+	ui.print_grid(&labels.iter().map(String::as_str).collect::<Vec<&str>>());
 	Ok(())
 }
 
@@ -1477,37 +1541,44 @@ pub(crate) async fn print_items_with_full_paths(
 	files: Vec<RemoteFile>,
 	empty_message: &str,
 ) -> Result<()> {
+	let mut items = list_with_full_paths(client, &dirs, &files).await?;
+	sort_listing(&mut items, ListedBy::Path);
+	print_listing(ui, &items, ListedBy::Path, empty_message, false)
+}
+
+/// The listing of `dirs` and `files`, in that order, each with its absolute path.
+async fn list_with_full_paths(
+	client: &Client,
+	dirs: &[RemoteDirectory],
+	files: &[RemoteFile],
+) -> Result<Vec<ListedItem>> {
 	// resolving a path walks up the tree, and `get_item_path` takes the drive lock for each
 	// walk — holding one here means those all share it instead of re-acquiring it per item
 	let _lock = client.lock_drive().await.context("Failed to lock drive")?;
-	let mut directories = Vec::with_capacity(dirs.len());
-	for dir in &dirs {
-		directories.push(full_path(client, &NonRootItemType::Dir(Cow::Borrowed(dir))).await);
+	let mut items = Vec::with_capacity(dirs.len() + files.len());
+	for dir in dirs {
+		items.push(ListedItem {
+			path: full_path(client, &NonRootItemType::Dir(Cow::Borrowed(dir))).await,
+			..ListedItem::of_dir(dir)
+		});
 	}
-	directories.sort();
-	let mut files = {
-		let mut resolved = Vec::with_capacity(files.len());
-		for file in &files {
-			resolved.push((
-				full_path(client, &NonRootItemType::File(Cow::Borrowed(file))).await,
-				file.size(),
-			));
-		}
-		resolved
-	};
-	files.sort_by(|(a, _), (b, _)| a.cmp(b));
-	print_item_names(ui, directories, files, empty_message, false)
+	for file in files {
+		items.push(ListedItem {
+			path: full_path(client, &NonRootItemType::File(Cow::Borrowed(file))).await,
+			..ListedItem::of_file(file)
+		});
+	}
+	Ok(items)
 }
 
 /// The item's absolute path, with the trailing slash `get_item_path` puts on directories
-/// stripped (directories are already distinguished by color). Falls back to the UUID, like the
-/// name-only listings do, so one unresolvable item doesn't drop the rest of the listing.
-async fn full_path(client: &Client, item: &NonRootItemType<'_, Normal>) -> String {
+/// stripped (directories are already distinguished by color), or `None` if it cannot be resolved.
+async fn full_path(client: &Client, item: &NonRootItemType<'_, Normal>) -> Option<String> {
 	match client.get_item_path(item).await {
-		Ok((path, _)) => format!("/{}", path.trim_end_matches('/')),
+		Ok((path, _)) => Some(format!("/{}", path.trim_end_matches('/'))),
 		Err(e) => {
 			log::warn!("Failed to resolve path of item {}: {}", item.uuid(), e);
-			item.uuid().to_string()
+			None
 		}
 	}
 }
@@ -2180,5 +2251,73 @@ mod tests {
 		ui.json = true;
 
 		assert!(confirm_printing_file(&mut ui, 1024 * 1024).unwrap());
+	}
+
+	fn listed_dir(name: &str, uuid: u128) -> ListedItem {
+		ListedItem {
+			kind: ListedKind::Directory,
+			name: name.to_owned(),
+			path: None,
+			size: None,
+			uuid: Uuid::from_u128(uuid),
+		}
+	}
+
+	fn listed_file(name: &str, size: u64, uuid: u128) -> ListedItem {
+		ListedItem {
+			kind: ListedKind::File,
+			name: name.to_owned(),
+			path: None,
+			size: Some(size),
+			uuid: Uuid::from_u128(uuid),
+		}
+	}
+
+	/// What `print_listing` prints for `items`, sorted first, without colors.
+	fn printed_listing(mut items: Vec<ListedItem>, by: ListedBy, long: bool, json: bool) -> String {
+		let printed = Printed::default();
+		let mut ui = printed.ui();
+		ui.json = json;
+		sort_listing(&mut items, by);
+		print_listing(&mut ui, &items, by, "Directory is empty", long).unwrap();
+		console::strip_ansi_codes(&printed.lines()).into_owned()
+	}
+
+	#[test]
+	fn a_long_listing_prints_directories_first_with_a_size_column() {
+		let items = vec![
+			listed_file("b.txt", 2048, 1),
+			listed_dir("docs", 2),
+			listed_file("a.txt", 5, 3),
+		];
+
+		assert_eq!(
+			printed_listing(items, ListedBy::Name, true, false),
+			"    -  docs\n  5 B  a.txt\n2 KiB  b.txt"
+		);
+	}
+
+	#[test]
+	fn an_empty_listing_says_so() {
+		assert_eq!(
+			printed_listing(Vec::new(), ListedBy::Name, true, false),
+			"Directory is empty"
+		);
+	}
+
+	#[test]
+	fn a_listing_by_path_falls_back_to_the_uuid_of_an_unresolved_item() {
+		let items = vec![
+			ListedItem {
+				path: Some("/a/b.txt".to_owned()),
+				..listed_file("b.txt", 1, 1)
+			},
+			listed_file("c.txt", 1, 2),
+		];
+
+		assert_eq!(
+			printed_listing(items, ListedBy::Path, false, false),
+			"/a/b.txt\n00000000-0000-0000-0000-000000000002"
+		);
 	}
 }
