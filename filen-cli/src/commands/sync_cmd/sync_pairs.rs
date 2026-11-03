@@ -1,6 +1,6 @@
 use std::{
 	borrow::Cow,
-	collections::HashMap,
+	collections::{HashMap, HashSet},
 	fmt::Display,
 	path::{Path, PathBuf},
 	slice,
@@ -87,14 +87,40 @@ pub(crate) async fn resolve_sync_pairs(
 /// Adds each of `pairs` to `engine`, or finds it there from an earlier run.
 ///
 /// Returns the ids of the pairs registered, each once, in the order they were given. A pair the
-/// engine refuses fails the run, but the pairs registered before it stay registered, as every
-/// pair does after the run that set it up.
+/// engine refuses fails the run, and the pairs this call added before it are removed again, so a
+/// failed run registers nothing; the pairs earlier runs registered stay as they were.
 pub(crate) async fn register_sync_pairs(
 	engine: &SyncEngine,
 	client: &Client,
 	pairs: &[PairDefinition],
 ) -> Result<Vec<PairId>> {
+	let earlier = engine
+		.list_pairs()
+		.await
+		.context("Failed to list sync pairs")?
+		.into_iter()
+		.map(|pair| pair.id)
+		.collect::<HashSet<_>>();
 	let mut pair_ids = Vec::new();
+	if let Err(e) = add_sync_pairs(engine, client, pairs, &mut pair_ids).await {
+		for pair in pair_ids.into_iter().filter(|pair| !earlier.contains(pair)) {
+			if let Err(remove) = engine.remove_pair(pair).await {
+				log::warn!("Failed to remove the sync pair {pair} after the run failed: {remove}");
+			}
+		}
+		return Err(e);
+	}
+	Ok(pair_ids)
+}
+
+/// Adds each of `pairs` to `engine`, pushing the id of each onto `pair_ids` as soon as the engine
+/// has it, so that a failure leaves there every pair added so far.
+async fn add_sync_pairs(
+	engine: &SyncEngine,
+	client: &Client,
+	pairs: &[PairDefinition],
+	pair_ids: &mut Vec<PairId>,
+) -> Result<()> {
 	for PairDefinition {
 		local,
 		mode,
@@ -119,6 +145,10 @@ pub(crate) async fn register_sync_pairs(
 				return Err(UI::failure(&message));
 			}
 		};
+		// the same pair given twice is registered (and watched) once
+		if !pair_ids.contains(&pair) {
+			pair_ids.push(pair);
+		}
 		// Set on every run, not only when the pair is new: earlier versions stored a guard that
 		// held every deletion, and a pair they registered keeps it until it is overwritten.
 		engine
@@ -130,12 +160,8 @@ pub(crate) async fn register_sync_pairs(
 					local.display()
 				)
 			})?;
-		// the same pair given twice is registered (and watched) once
-		if !pair_ids.contains(&pair) {
-			pair_ids.push(pair);
-		}
 	}
-	Ok(pair_ids)
+	Ok(())
 }
 
 /// The registered pair `overlap` names.

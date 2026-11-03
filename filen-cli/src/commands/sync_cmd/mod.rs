@@ -19,7 +19,8 @@
 //! 130. An invalid command line exits with 2.
 //!
 //! Sync pairs stay registered in the sync database under the config directory after the run that
-//! set them up. Only one `filen sync` can use that database at a time.
+//! set them up. A run that cannot set up one of its sync pairs registers none of them. Only one
+//! `filen sync` can use that database at a time.
 
 use std::{
 	borrow::Cow,

@@ -3,6 +3,7 @@
 use std::{
 	path::Path,
 	process::{Command, Output},
+	sync::Arc,
 };
 
 use filen_macros::shared_test_runtime;
@@ -10,6 +11,7 @@ use filen_sdk_rs::{
 	auth::Client,
 	fs::{HasName, categories::NonRootFileType},
 	io::client_impl::IoSharedClientExt as _,
+	sync_engine::SyncEngine,
 };
 
 #[shared_test_runtime]
@@ -84,6 +86,37 @@ async fn sync_once_applies_a_conflict_resolution_before_it_exits() {
 		remote_content(&resources.client, &format!("{test_dir_name}/fight.txt")).await,
 		b"the local edit"
 	);
+}
+
+/// A run that cannot set up its second pair, which syncs the same remote directory as its first,
+/// leaves neither registered.
+#[shared_test_runtime]
+async fn sync_with_a_pair_that_cannot_be_set_up_registers_none() {
+	// Not `get_resources_with_lock`, for the reason the first test gives.
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let test_dir_name = resources.dir.name().unwrap();
+	let first_local = assert_fs::TempDir::new().unwrap();
+	let second_local = assert_fs::TempDir::new().unwrap();
+	let config_dir = assert_fs::TempDir::new().unwrap();
+	let first = format!("{}:{test_dir_name}", first_local.path().to_str().unwrap());
+	let second = format!("{}:{test_dir_name}", second_local.path().to_str().unwrap());
+
+	let output = sync_once(config_dir.path(), &first, &["--pair", &second]).await;
+
+	assert_eq!(output.status.code(), Some(1), "{}", describe(&output));
+	assert!(
+		String::from_utf8_lossy(&output.stderr)
+			.contains("its remote folder is already synced by the sync pair"),
+		"{}",
+		describe(&output)
+	);
+	let engine = SyncEngine::open(
+		Arc::clone(&resources.client),
+		config_dir.path().join("sync-engine.db"),
+	)
+	.await
+	.unwrap();
+	assert_eq!(engine.list_pairs().await.unwrap(), []);
 }
 
 /// A pair whose first `sync --once` agreed on `fight.txt`, which has since been changed on both
