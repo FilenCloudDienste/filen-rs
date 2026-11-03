@@ -11,6 +11,7 @@
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::{
+	borrow::Cow,
 	fmt,
 	io::{self, Write},
 	path::{Path, PathBuf},
@@ -29,6 +30,10 @@ const BUILD_TARGET: &str = env!("BUILD_TARGET"); // injected in build.rs
 
 /// The Docker image the CLI is published as, tagged with each release's version.
 const DOCKER_IMAGE: &str = "filen/cli";
+
+/// The releases, as GitHub's API lists them.
+const RELEASES_URL: &str =
+	"https://api.github.com/repos/FilenCloudDienste/filen-cli-releases/releases";
 
 /// The file the announcements are published in, one per line.
 const ANNOUNCEMENTS_URL: &str =
@@ -59,12 +64,8 @@ pub(crate) async fn check_for_updates(
 	config_dir: &Path,
 	is_repl: bool,
 ) {
-	let (is_testing, version) = match std::env::var("FILEN_CLI_TESTING_MOCK_VERSION") {
-		Ok(val) if val != "off" => (true, val),
-		_ => (false, env!("CARGO_PKG_VERSION").to_string()),
-	};
-
-	if cfg!(debug_assertions) && !is_testing {
+	let env = UpdaterEnv::from_env();
+	if env.is_untested_debug_build() {
 		log::info!("Skipping update check in debug build");
 		return;
 	}
@@ -81,10 +82,10 @@ pub(crate) async fn check_for_updates(
 		Some(last_checked_config)
 	};
 
-	let github_api = GitHubApiClient::new();
+	let github_api = env.api();
 	run_update_check(
 		ui,
-		&version,
+		&env.version,
 		UpdateContext {
 			automatically_update,
 			is_repl,
@@ -101,6 +102,55 @@ pub(crate) async fn check_for_updates(
 		|ui, question| ui.prompt_yes_no(question, true),
 	)
 	.await;
+}
+
+/// Where the updater finds the releases, and the version it takes the CLI to be.
+struct UpdaterEnv {
+	/// The running version, or the one `FILEN_CLI_TESTING_MOCK_VERSION` gives.
+	version: String,
+	/// Whether `FILEN_CLI_TESTING_MOCK_VERSION` is set (to anything but `off`), as the tests set it
+	/// to run the updater in a debug build against releases they serve themselves.
+	is_testing: bool,
+	/// [`RELEASES_URL`], or `FILEN_CLI_TESTING_RELEASES_URL` under test.
+	releases_url: Cow<'static, str>,
+	/// [`ANNOUNCEMENTS_URL`], or `FILEN_CLI_TESTING_ANNOUNCEMENTS_URL` under test.
+	announcements_url: Cow<'static, str>,
+}
+
+impl UpdaterEnv {
+	fn from_env() -> Self {
+		match std::env::var("FILEN_CLI_TESTING_MOCK_VERSION") {
+			Ok(version) if version != "off" => Self {
+				version,
+				is_testing: true,
+				releases_url: testing_url("FILEN_CLI_TESTING_RELEASES_URL", RELEASES_URL),
+				announcements_url: testing_url(
+					"FILEN_CLI_TESTING_ANNOUNCEMENTS_URL",
+					ANNOUNCEMENTS_URL,
+				),
+			},
+			_ => Self {
+				version: env!("CARGO_PKG_VERSION").to_owned(),
+				is_testing: false,
+				releases_url: Cow::Borrowed(RELEASES_URL),
+				announcements_url: Cow::Borrowed(ANNOUNCEMENTS_URL),
+			},
+		}
+	}
+
+	/// Whether this is a debug build that no test runs, which does not update.
+	fn is_untested_debug_build(&self) -> bool {
+		cfg!(debug_assertions) && !self.is_testing
+	}
+
+	fn api(&self) -> GitHubApiClient<'_> {
+		GitHubApiClient::new(&self.releases_url, &self.announcements_url)
+	}
+}
+
+/// The URL the environment variable `name` gives, or else `default`.
+fn testing_url(name: &str, default: &'static str) -> Cow<'static, str> {
+	std::env::var(name).map_or(Cow::Borrowed(default), Cow::Owned)
 }
 
 /// Shows the announcements and handles the latest release that `fetch` returns, printing a
@@ -650,23 +700,32 @@ struct Announcement {
 	message: String,
 }
 
-struct GitHubApiClient {
+struct GitHubApiClient<'a> {
 	client: reqwest::Client,
+	/// Where the releases are listed, [`RELEASES_URL`] outside the tests.
+	releases_url: &'a str,
+	/// Where the announcements are, [`ANNOUNCEMENTS_URL`] outside the tests.
+	announcements_url: &'a str,
 }
 
-impl GitHubApiClient {
-	fn new() -> Self {
+impl<'a> GitHubApiClient<'a> {
+	fn new(releases_url: &'a str, announcements_url: &'a str) -> Self {
 		Self {
 			client: reqwest::Client::new(),
+			releases_url,
+			announcements_url,
 		}
 	}
 
-	async fn send_releases_request(&self, token: Option<&str>) -> Result<reqwest::Response> {
+	/// Requests `path` under the releases URL.
+	async fn send_releases_request(
+		&self,
+		path: &str,
+		token: Option<&str>,
+	) -> Result<reqwest::Response> {
 		let mut request = self
 			.client
-			.get(
-				"https://api.github.com/repos/FilenCloudDienste/filen-cli-releases/releases/latest",
-			)
+			.get(format!("{}/{path}", self.releases_url))
 			.header("User-Agent", "filen-cli");
 		if let Some(token) = token {
 			request = request.bearer_auth(token);
@@ -683,15 +742,20 @@ impl GitHubApiClient {
 		// body-decode failure below. A token (CI passes the workflow's GITHUB_TOKEN)
 		// lifts the limit. Scoped to this api.github.com request on purpose — the
 		// announcements fetch goes to a different host and needs no auth.
-		let token = std::env::var("GITHUB_TOKEN").ok().filter(|t| !t.is_empty());
-		let mut response = self.send_releases_request(token.as_deref()).await?;
+		// The token is GitHub's: a test serving the releases itself never gets it.
+		let token = std::env::var("GITHUB_TOKEN")
+			.ok()
+			.filter(|t| !t.is_empty() && self.releases_url == RELEASES_URL);
+		let mut response = self
+			.send_releases_request("latest", token.as_deref())
+			.await?;
 		// A token must never fail harder than no token: GITHUB_TOKEN is an installation
 		// token scoped to the calling repository, and reads of ANOTHER (public) repo's
 		// releases are expected to work but can be rejected as "Resource not accessible
 		// by integration". On an auth-shaped rejection, retry unauthenticated — worst
 		// case that retry hits the plain IP rate limit and we report that instead.
 		if token.is_some() && matches!(response.status().as_u16(), 401 | 403) {
-			response = self.send_releases_request(None).await?;
+			response = self.send_releases_request("latest", None).await?;
 		}
 		let status = response.status();
 		if !status.is_success() {
@@ -709,13 +773,9 @@ impl GitHubApiClient {
 	}
 
 	async fn get_announcements(&self) -> Result<Vec<Announcement>> {
-		self.get_announcements_from(ANNOUNCEMENTS_URL).await
-	}
-
-	async fn get_announcements_from(&self, url: &str) -> Result<Vec<Announcement>> {
 		let response = self
 			.client
-			.get(url)
+			.get(self.announcements_url)
 			.header("User-Agent", "filen-cli")
 			.send()
 			.await
@@ -1372,8 +1432,8 @@ mod tests {
 			"HTTP/1.1 404 Not Found\r\nContent-Length: 14\r\nConnection: close\r\n\r\n404: Not Found",
 		);
 
-		let error = GitHubApiClient::new()
-			.get_announcements_from(&url)
+		let error = GitHubApiClient::new(RELEASES_URL, &url)
+			.get_announcements()
 			.await
 			.unwrap_err();
 
