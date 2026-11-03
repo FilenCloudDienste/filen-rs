@@ -213,11 +213,11 @@ pub enum FullPassReason {
 	/// specific is.
 	///
 	/// Whole, because three of the holds want evidence only a whole-tree read supplies: an
-	/// incomplete scan, an unconverged remote, or a remote that listed nothing at all. The other
-	/// two — a volume threshold, a first sync against a populated destination — want something
-	/// else: the approval a caller gives names ONE exact batch by its token, so the pass that
-	/// offers that batch again has to reproduce it exactly, and the absences it was built from were
-	/// observations the holding pass consumed. Reading everything is the only way to reproduce
+	/// incomplete scan, an unconverged remote, or a remote that listed nothing at all. The others
+	/// — a volume threshold, a first sync against a populated destination, an unfinished
+	/// restoration — want something else: the approval a caller gives names ONE exact batch by its
+	/// token, so the pass that offers that batch again has to reproduce it exactly, and the
+	/// absences it was built from were observations the holding pass consumed. Reading everything is the only way to reproduce
 	/// them, which is also why a held batch's paths are not carried over as owed
 	/// (`facts::carry_over`): the whole read already looks at them.
 	DeletionHold,

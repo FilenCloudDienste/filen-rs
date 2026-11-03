@@ -81,6 +81,18 @@ const INSERT: &str = "INSERT INTO screen (pos, op, kind, path, from_path, remote
 /// deep, and a path is far shallower than this.
 const LEAD_ROOM: i64 = 1 << 20;
 
+/// The statements [`Screen::set_aside_flips`] runs per flip, and [`Screen::restore_held`] undoes:
+/// the held rows AT its path, and the held rows UNDER it. Two seeking statements rather than one
+/// with an `OR`, each a seek of `screen_path`: `/` is 0x2F and `0` is 0x30, and TEXT compares
+/// bytewise, so `?1 || '/' < path < ?1 || '0'` is precisely "under `?1`". `held = 2` is outside
+/// every [`Rows`] but [`Rows::All`].
+const SET_ASIDE_AT: &str = "UPDATE screen SET held = 2 WHERE path = ?1 AND held = 1";
+const SET_ASIDE_UNDER: &str =
+	"UPDATE screen SET held = 2 WHERE path > ?1 || '/' AND path < ?1 || '0' AND held = 1";
+const HOLD_AGAIN_AT: &str = "UPDATE screen SET held = 1 WHERE path = ?1 AND held = 2";
+const HOLD_AGAIN_UNDER: &str =
+	"UPDATE screen SET held = 1 WHERE path > ?1 || '/' AND path < ?1 || '0' AND held = 2";
+
 /// How many actions a sweep reads a statement.
 const SWEEP_PAGE: i64 = 1024;
 
@@ -421,29 +433,49 @@ impl Screen {
 			.execute("UPDATE screen SET held = 0 WHERE held = 1", [])
 	}
 
+	/// Set every held type flip aside from the held batch, for a restoration (see
+	/// `SyncEngine::restore_deletions`): a flip cannot be undone, since the other side holds a new
+	/// item of the other kind at the path and putting the old one back would mean renaming one of
+	/// them. Its deletion, its create and every held deletion under its path leave [`Rows::Held`]
+	/// until [`restore_held`](Self::restore_held) puts them back, still held. Says which paths it
+	/// set aside and how many actions.
+	///
+	/// Driven by the flips, which are few: each is a seek of the path index [`hold`](Self::hold)
+	/// made, which a plan with a create has. A plan with no held create is asked once and left.
+	pub(in super::super) fn set_aside_flips(&mut self) -> rusqlite::Result<(Vec<String>, usize)> {
+		let flips: Vec<String> = self
+			.stage
+			.conn
+			.prepare(&format!(
+				"SELECT path FROM screen WHERE held = 1 AND op IN {CREATES} ORDER BY path"
+			))?
+			.query_map([], |row| row.get(0))?
+			.collect::<rusqlite::Result<_>>()?;
+		if flips.is_empty() {
+			return Ok((flips, 0));
+		}
+		let aside = self.stage.conn.transaction()?;
+		aside.execute_batch("CREATE INDEX IF NOT EXISTS screen_path ON screen (path)")?;
+		let mut count = 0;
+		for path in &flips {
+			for statement in [SET_ASIDE_AT, SET_ASIDE_UNDER] {
+				count += aside.prepare_cached(statement)?.execute([path])?;
+			}
+		}
+		aside.commit()?;
+		Ok((flips, count))
+	}
+
 	/// Turn the held batch into its undoing: a restoration of the held batch (see
 	/// `SyncEngine::restore_deletions`). Each held deletion becomes the write that puts the deleted
 	/// side back from the other side's copy — a local deletion's remote item is downloaded (a
 	/// directory created) again, a remote deletion's local item uploaded (created) again — and
-	/// runs after the rest of the plan, parents before children. Says how many actions it
-	/// restores, and how many it takes out of the plan.
-	///
-	/// A held type flip cannot be undone that way: the other side holds a new item of the other
-	/// kind at the path, and putting the old one back would mean renaming one of them. The flip —
-	/// its deletion, its create, and every held deletion under its path — is taken out of the plan
-	/// instead, unapplied, for the next pass to hold again on its own.
-	pub(in super::super) fn restore_held(&mut self) -> rusqlite::Result<(usize, usize)> {
+	/// runs after the rest of the plan, parents before children. Then what
+	/// [`set_aside_flips`](Self::set_aside_flips) set aside at `flips` is held again, unchanged.
+	/// Says how many actions it restores.
+	pub(in super::super) fn restore_held(&mut self, flips: &[String]) -> rusqlite::Result<usize> {
 		let (dir, file) = (NodeKind::Dir.as_i64(), NodeKind::File.as_i64());
 		let restore = self.stage.conn.transaction()?;
-		// Only a type flip holds a create.
-		let dropped = restore.execute(
-			&format!(
-				"DELETE FROM screen WHERE held = 1 AND EXISTS (SELECT 1 FROM screen AS flip
-				  WHERE flip.held = 1 AND flip.op IN {CREATES} AND (screen.path = flip.path
-				   OR (screen.path >= flip.path || '/' AND screen.path < flip.path || '0')))"
-			),
-			[],
-		)?;
 		// After everything else, by path: a directory sorts before what is under it. New positions
 		// all lie past the old ones, so no move lands on a row still to move.
 		restore.execute(
@@ -469,8 +501,13 @@ impl Screen {
 			),
 			[],
 		)?;
+		for path in flips {
+			for statement in [HOLD_AGAIN_AT, HOLD_AGAIN_UNDER] {
+				restore.prepare_cached(statement)?.execute([path])?;
+			}
+		}
 		restore.commit()?;
-		Ok((restored, dropped))
+		Ok(restored)
 	}
 
 	/// Hand `visit` every held action in the order of the held batch's token lines: the local
@@ -882,5 +919,117 @@ mod tests {
 		] {
 			assert_eq!(past_subtree(path, "a"), past, "{path:?}");
 		}
+	}
+
+	/// A restoration sets aside each held type flip with what is held under its path — and nothing
+	/// that only shares its name's prefix — restores the rest, and holds the flips again. Each
+	/// flip's rows are found by a seek of the path index, never a walk of the plan per held row; a
+	/// plan with no held create sets nothing aside.
+	#[test]
+	fn a_restoration_sets_aside_the_flips_by_seeking_their_paths() {
+		let (_dir, mut plain) =
+			screened(&[trash("a", NodeKind::File), delete("b", NodeKind::File)]);
+		plain.hold().unwrap();
+		assert_eq!(plain.set_aside_flips().unwrap(), (Vec::new(), 0));
+		assert_eq!(plain.restore_held(&[]).unwrap(), 2);
+		assert_eq!(plain.count(Rows::Held).unwrap(), 0);
+
+		let actions = vec![
+			trash("d", NodeKind::Dir),
+			trash("d/a", NodeKind::File),
+			trash("d/sub", NodeKind::Dir),
+			trash("d/sub/b", NodeKind::File),
+			SyncAction::UploadFile {
+				rel_path: "d".to_string(),
+			},
+			trash("d-x", NodeKind::File),
+			trash("d.bak", NodeKind::File),
+			trash("d0", NodeKind::File),
+			delete("e", NodeKind::File),
+		];
+		let (_dir, mut screen) = screened(&actions);
+		screen.hold().unwrap();
+		assert_eq!(
+			screen.set_aside_flips().unwrap(),
+			(vec!["d".to_string()], 5)
+		);
+		for statement in [
+			SET_ASIDE_AT,
+			SET_ASIDE_UNDER,
+			HOLD_AGAIN_AT,
+			HOLD_AGAIN_UNDER,
+		] {
+			let plan: Vec<String> = screen
+				.stage
+				.conn
+				.prepare(&format!("EXPLAIN QUERY PLAN {statement}"))
+				.unwrap()
+				.query_map(["d"], |row| row.get("detail"))
+				.unwrap()
+				.collect::<rusqlite::Result<_>>()
+				.unwrap();
+			assert!(
+				plan.iter()
+					.all(|step| step.contains("USING INDEX screen_path")),
+				"{statement}: {plan:?}"
+			);
+		}
+		assert_eq!(screen.restore_held(&["d".to_string()]).unwrap(), 4);
+		let mut held: Vec<String> = screen
+			.read(Rows::Held)
+			.unwrap()
+			.iter()
+			.map(|action| action.rel_path().to_owned())
+			.collect();
+		held.sort();
+		assert_eq!(held, ["d", "d", "d/a", "d/sub", "d/sub/b"]);
+		let restored: Vec<String> = screen
+			.read(Rows::Safe)
+			.unwrap()
+			.iter()
+			.map(|action| action.rel_path().to_owned())
+			.collect();
+		assert_eq!(restored, ["d-x", "d.bak", "d0", "e"]);
+	}
+
+	/// A restoration of a large batch with many flips in it costs a seek per flip and a few sweeps
+	/// of the plan, never a walk of the plan per held row: here 101 000 held actions, 1 000 flips
+	/// with 20 deletions under each among them, restored well inside a debug build's budget,
+	/// holding no more than the flips' paths.
+	#[test]
+	fn a_large_restoration_is_a_seek_per_flip() {
+		const PLAIN: usize = 79_000;
+		const FLIPS: usize = 1_000;
+		const UNDER: usize = 20;
+		let mut actions = Vec::with_capacity(PLAIN + FLIPS * (UNDER + 2));
+		actions.extend((0..PLAIN).map(|i| trash(&format!("p/{i:06}"), NodeKind::File)));
+		for f in 0..FLIPS {
+			let flip = format!("f/{f:04}");
+			actions.push(trash(&flip, NodeKind::Dir));
+			actions.extend((0..UNDER).map(|i| trash(&format!("{flip}/{i:02}"), NodeKind::File)));
+			actions.push(SyncAction::UploadFile { rel_path: flip });
+		}
+		let (_dir, mut screen) = screened(&actions);
+		drop(actions);
+		screen.hold().unwrap();
+
+		let started = std::time::Instant::now();
+		let ((restored, kept), peak) = crate::alloc_meter::peak_bytes(|| {
+			let (flips, kept) = screen.set_aside_flips().unwrap();
+			assert_eq!(flips.len(), FLIPS);
+			(screen.restore_held(&flips).unwrap(), kept)
+		});
+		let elapsed = started.elapsed();
+		assert_eq!(restored, PLAIN);
+		assert_eq!(kept, FLIPS * (UNDER + 2));
+		assert_eq!(screen.count(Rows::Held).unwrap(), FLIPS * (UNDER + 2));
+		assert!(
+			elapsed < std::time::Duration::from_secs(10),
+			"restoring {PLAIN} deletions around {FLIPS} flips took {elapsed:?}"
+		);
+		assert!(
+			peak < 1024 * 1024,
+			"restoring {PLAIN} deletions around {FLIPS} flips held {peak} bytes at once"
+		);
 	}
 }

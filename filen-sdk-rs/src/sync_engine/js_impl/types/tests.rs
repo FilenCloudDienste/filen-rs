@@ -199,6 +199,10 @@ fn guard_reasons_map_with_their_counts() {
 				limit: 10,
 			},
 		),
+		(
+			GuardReason::RestoreUnfinished { deletions: 4 },
+			SyncGuardReason::RestoreUnfinished { deletions: 4 },
+		),
 	];
 	for (reason, expected) in cases {
 		assert_eq!(SyncGuardReason::from(reason), expected);

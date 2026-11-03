@@ -82,6 +82,8 @@ pub enum SyncGuardReason {
 	RemoteEmptied { deletions: u64 },
 	/// More deletions than the pair's [`DeleteGuardState`] allows.
 	ExceededThreshold { deletions: u64, limit: u64 },
+	/// A restoration the caller chose has not landed whole yet, so every deletion is held.
+	RestoreUnfinished { deletions: u64 },
 }
 
 impl From<GuardReason> for SyncGuardReason {
@@ -100,6 +102,9 @@ impl From<GuardReason> for SyncGuardReason {
 			GuardReason::ExceededThreshold { deletions, limit } => Self::ExceededThreshold {
 				deletions: deletions as u64,
 				limit: limit as u64,
+			},
+			GuardReason::RestoreUnfinished { deletions } => Self::RestoreUnfinished {
+				deletions: deletions as u64,
 			},
 		}
 	}

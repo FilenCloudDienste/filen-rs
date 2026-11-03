@@ -2603,3 +2603,41 @@ fn an_open_simplifies_the_verbatim_roots_an_older_build_stored() {
 		std::fs::remove_file(format!("{}{suffix}", path.display())).ok();
 	}
 }
+
+/// A DB written before `unfinished_restores` existed gains the table on its next open, without a
+/// schema bump; a restoration recorded in it reads back after a reopen, a second record of it is
+/// one row, and removing the pair drops its row.
+#[test]
+fn unfinished_restores_reach_a_db_written_before_them_and_survive_a_reopen() {
+	let path = temp_db_path("restores");
+	let pair = {
+		let store = BaselineStore::open(&path).unwrap();
+		let (pair, _) = store
+			.create_pair("/root", Uuid::new_v4(), SyncMode::TwoWay)
+			.unwrap();
+		// As an older build left it.
+		store
+			.conn
+			.execute_batch("DROP TABLE unfinished_restores")
+			.unwrap();
+		pair
+	};
+
+	let store = BaselineStore::open(&path).unwrap();
+	assert_eq!(store.unfinished_restores().unwrap(), Vec::<PairId>::new());
+	store.set_restore_unfinished(pair, true).unwrap();
+	store.set_restore_unfinished(pair, true).unwrap();
+	drop(store);
+
+	let store = BaselineStore::open(&path).unwrap();
+	assert_eq!(store.unfinished_restores().unwrap(), [pair]);
+	store.set_restore_unfinished(pair, false).unwrap();
+	assert_eq!(store.unfinished_restores().unwrap(), Vec::<PairId>::new());
+	store.set_restore_unfinished(pair, true).unwrap();
+	store.delete_pair(pair).unwrap();
+	assert_eq!(store.unfinished_restores().unwrap(), Vec::<PairId>::new());
+	drop(store);
+	for suffix in ["", "-wal", "-shm"] {
+		std::fs::remove_file(format!("{}{suffix}", path.display())).ok();
+	}
+}

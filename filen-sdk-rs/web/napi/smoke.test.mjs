@@ -318,7 +318,14 @@ describe("exports", () => {
 		)
 		assert.deepEqual(
 			{ ...sdk.SyncGuardReason_Tags },
-			tags(["ScanIncomplete", "FirstSyncWithDeletions", "RemoteUnconverged", "RemoteEmptied", "ExceededThreshold"])
+			tags([
+				"ScanIncomplete",
+				"FirstSyncWithDeletions",
+				"RemoteUnconverged",
+				"RemoteEmptied",
+				"ExceededThreshold",
+				"RestoreUnfinished"
+			])
 		)
 		assert.deepEqual(
 			{ ...SyncRefusal_Tags },

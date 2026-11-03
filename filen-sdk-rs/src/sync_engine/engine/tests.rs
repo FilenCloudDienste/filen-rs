@@ -559,6 +559,7 @@ fn a_synced_path_whose_remote_item_left_the_view_is_blocked_not_deleted() {
 		remote: guard::RemoteEvidence::Listed,
 		first_sync: false,
 		tracked: 1,
+		restore_unfinished: false,
 	};
 	assert!(
 		guard::test_support::screen(reconciled.actions.clone(), healthy, DeleteGuard::default())
@@ -834,6 +835,7 @@ fn the_staged_screen_is_the_resident_one_over_generated_plans() {
 			remote: guard::RemoteEvidence::Listed,
 			first_sync: false,
 			tracked: 100,
+			restore_unfinished: false,
 		};
 		let guard = DeleteGuard::unlimited();
 		let context = format!("seed {seed}: {dir_moves:?} then {actions:?}");
@@ -3219,6 +3221,7 @@ fn adopting_the_destination_is_refused_on_evidence_a_pass_would_not_act_on() {
 		remote: guard::RemoteEvidence::Listed,
 		first_sync: false,
 		tracked: 5,
+		restore_unfinished: false,
 	};
 	assert_eq!(adoption_refusal(None, &healthy), None);
 
@@ -4924,7 +4927,7 @@ fn restoring_local_deletions_downloads_them_again() {
 		Restored {
 			from_bin: 0,
 			actions: 5,
-			unrestorable: 0,
+			kept_held: 0,
 		}
 	);
 	assert_eq!(
@@ -5031,7 +5034,7 @@ fn restoring_takes_a_matching_copy_back_out_of_the_bin() {
 		Restored {
 			from_bin: 1,
 			actions: 4,
-			unrestorable: 0,
+			kept_held: 0,
 		}
 	);
 	assert_eq!(std::fs::read(root.path().join("d/a.txt")).unwrap(), bytes);
@@ -5050,27 +5053,24 @@ fn restoring_takes_a_matching_copy_back_out_of_the_bin() {
 }
 
 /// A held type flip cannot be put back without renaming one of the two items: the restoration
-/// leaves it unapplied, counted as dropped so the next pass reads whole and holds it again, and
-/// restores the rest of the batch.
+/// keeps it held, with everything held under its path, as an unfinished restoration's batch under a
+/// token of its own, and restores the rest of the batch. The next pass, which plans the flip alone
+/// — far under the volume limit — holds it again under the same token rather than applying it.
 #[test]
-fn restoring_leaves_a_type_flip_for_the_next_pass() {
+fn restoring_keeps_a_type_flip_held_through_the_next_pass() {
 	let (rows, remote) = synced_tree(hash(1), 4);
-	// `top.txt` is a directory locally now; the rest of the tree is gone locally.
+	// The directory `d` is a file locally now; `top.txt` is gone locally. `d-x` sorts between `d`
+	// and `d/`, under no flip.
 	let mut prep = prepared(
 		SyncMode::TwoWay,
-		rows,
-		vec![local_file("keep.txt", hash(1)), local_dir("top.txt")],
-		view(remote, Vec::new(), &[]),
+		rows.clone(),
+		vec![local_file("keep.txt", hash(1)), local_file("d", hash(2))],
+		view(remote.clone(), Vec::new(), &[]),
 		HashMap::new(),
 	);
 	let (_dir, mut screened) = screened_holding_all(&mut prep);
 	let held = read(&screened, Rows::Held);
-	assert!(
-		held.contains(&SyncAction::CreateRemoteDir {
-			rel_path: "top.txt".to_string()
-		}),
-		"{held:?}"
-	);
+	assert!(held.contains(&upload("d")), "{held:?}");
 
 	let root = tempfile::tempdir().unwrap();
 	let restored = screened
@@ -5081,20 +5081,307 @@ fn restoring_leaves_a_type_flip_for_the_next_pass() {
 		restored,
 		Restored {
 			from_bin: 0,
-			actions: 4,
-			unrestorable: 2,
+			actions: 1,
+			kept_held: 5,
 		}
 	);
-	assert_eq!(screened.dropped, 2);
+	assert_eq!(screened.dropped, 0, "nothing is dropped");
+	assert_eq!(read(&screened, Rows::Safe), [download("top.txt", 5)]);
+	let mut kept = read(&screened, Rows::Held);
+	kept.sort_by(|a, b| a.rel_path().cmp(b.rel_path()));
+	let kept: Vec<_> = kept.iter().map(|action| action.rel_path()).collect();
+	assert_eq!(kept, ["d", "d", "d/a.txt", "d/sub", "d/sub/b.txt"]);
 	assert_eq!(
-		read(&screened, Rows::All),
-		[
-			create_local_dir("d"),
-			download("d/a.txt", 3),
-			create_local_dir("d/sub"),
-			download("d/sub/b.txt", 4),
-		]
+		screened.reason,
+		Some(GuardReason::RestoreUnfinished { deletions: 4 })
 	);
+	let token = screened
+		.pass_token
+		.clone()
+		.expect("the flip is a held batch");
+
+	// The next pass: `top.txt` landed, the flip is all it plans, and the pair's guard is the
+	// default one, whose limit four deletions are well under.
+	let mut next = prepared(
+		SyncMode::TwoWay,
+		rows,
+		vec![
+			local_file("keep.txt", hash(1)),
+			local_file("d", hash(2)),
+			local_file("top.txt", hash(1)),
+		],
+		view(remote, Vec::new(), &[]),
+		HashMap::new(),
+	);
+	next.record.delete_guard = DeleteGuard::default();
+	let mut state = screen_state(&next);
+	let (_free, stage) = Stage::in_temp_dir();
+	let unheld = reconcile_and_screen(&next, state, || Ok(stage)).unwrap();
+	assert_eq!(
+		unheld.reason, None,
+		"without the restoration it would apply"
+	);
+
+	state.restore_unfinished = true;
+	let (_held, stage) = Stage::in_temp_dir();
+	let held = reconcile_and_screen(&next, state, || Ok(stage)).unwrap();
+	assert_eq!(
+		held.reason,
+		Some(GuardReason::RestoreUnfinished { deletions: 4 })
+	);
+	assert_eq!(held.count(Rows::Held).unwrap(), 5);
+	assert_eq!(held.count(Rows::Safe).unwrap(), 0);
+	assert_eq!(
+		held.pass_token.as_deref(),
+		Some(token.as_str()),
+		"the same batch, so the caller's next decision names it"
+	);
+	assert_eq!(restore_refusal(held.reason.as_ref(), &state), None);
+
+	// Still the same token on a pass the flip would otherwise hold for another reason: the
+	// pair's first sync, or a volume past its limit.
+	next.record.delete_guard = DeleteGuard::new(0, 0.0).unwrap();
+	state.first_sync = true;
+	let (_other, stage) = Stage::in_temp_dir();
+	let other = reconcile_and_screen(&next, state, || Ok(stage)).unwrap();
+	assert_eq!(
+		other.reason,
+		Some(GuardReason::RestoreUnfinished { deletions: 4 })
+	);
+	assert_eq!(other.pass_token.as_deref(), Some(token.as_str()));
+}
+
+/// A restoration that does not land whole — here, none of its transfers did — leaves its paths
+/// planned as deletions again on the next pass, usually far under the volume limit. Under the
+/// pair's unfinished restoration they are held, on either side, rather than trashed in the cloud
+/// or moved into the local bin.
+#[test]
+fn an_unfinished_restoration_holds_what_it_did_not_put_back() {
+	let (rows, remote) = synced_tree(hash(1), 4);
+	// Deleted locally, restored, the downloads failed: the next pass plans the trashes again.
+	let locally = prepared(
+		SyncMode::TwoWay,
+		rows.clone(),
+		vec![
+			local_file("keep.txt", hash(1)),
+			local_dir("d"),
+			local_dir("d/sub"),
+			local_file("d/sub/b.txt", hash(1)),
+		],
+		view(remote.clone(), Vec::new(), &[]),
+		HashMap::new(),
+	);
+	// Deleted in the cloud, restored, the uploads failed: the next pass plans local deletions.
+	let local = ["d", "d/sub"]
+		.map(local_dir)
+		.into_iter()
+		.chain(
+			["d/a.txt", "d/sub/b.txt", "top.txt", "keep.txt"].map(|path| local_file(path, hash(1))),
+		)
+		.collect();
+	let kept = remote
+		.into_iter()
+		.filter(|node| node.rel_path != "d/a.txt" && node.rel_path != "top.txt")
+		.collect();
+	let remotely = prepared(
+		SyncMode::TwoWay,
+		rows,
+		local,
+		view(kept, Vec::new(), &[]),
+		HashMap::new(),
+	);
+	for mut prep in [locally, remotely] {
+		prep.record.delete_guard = DeleteGuard::default();
+		let mut state = screen_state(&prep);
+		let (_free, stage) = Stage::in_temp_dir();
+		let free = reconcile_and_screen(&prep, state, || Ok(stage)).unwrap();
+		assert_eq!(free.reason, None, "two deletions are under the floor");
+		assert_eq!(free.count(Rows::Deletes).unwrap(), 2);
+
+		state.restore_unfinished = true;
+		let (_held, stage) = Stage::in_temp_dir();
+		let held = reconcile_and_screen(&prep, state, || Ok(stage)).unwrap();
+		assert_eq!(
+			held.reason,
+			Some(GuardReason::RestoreUnfinished { deletions: 2 })
+		);
+		assert_eq!(held.count(Rows::Held).unwrap(), 2);
+		assert!(
+			read(&held, Rows::Safe)
+				.iter()
+				.all(|action| !action.is_delete()),
+			"nothing is deleted"
+		);
+		assert!(
+			held.pass_token.is_some(),
+			"a batch to restore or approve again"
+		);
+	}
+}
+
+/// What ends an unfinished restoration: a pass that read both sides whole on trusted evidence, ran
+/// to its end with nothing failed, and planned no deletion. A failed transfer, a pass cut short or
+/// paused, a change-scoped read, untrustworthy evidence and a held batch each leave it standing.
+#[test]
+fn a_restoration_lands_only_on_a_whole_clean_pass_that_deletes_nothing() {
+	let (rows, remote) = synced_tree(hash(1), 4);
+	let mut prep = prepared(
+		SyncMode::TwoWay,
+		rows,
+		Vec::new(),
+		view(remote, Vec::new(), &[]),
+		HashMap::new(),
+	);
+	let state = screen_state(&prep);
+	let clean = SyncReport {
+		full_pass: Some(FullPassReason::DeletionHold),
+		..SyncReport::default()
+	};
+	assert!(restore_landed(&prep, &state, &clean));
+
+	for (label, report) in [
+		(
+			"a failed download",
+			SyncReport {
+				failed_paths: vec![("top.txt".to_string(), "404".to_string())],
+				..clean.clone()
+			},
+		),
+		(
+			"a pass cut short",
+			SyncReport {
+				interrupted: 3,
+				..clean.clone()
+			},
+		),
+		(
+			"a paused pass",
+			SyncReport {
+				paused: true,
+				..clean.clone()
+			},
+		),
+		(
+			"a full side",
+			SyncReport {
+				halted: Some(crate::sync_engine::HaltReason::LocalStorageFull),
+				..clean.clone()
+			},
+		),
+		(
+			"a held batch",
+			SyncReport {
+				guard: Some(GuardReason::RestoreUnfinished { deletions: 1 }),
+				..clean.clone()
+			},
+		),
+	] {
+		assert!(!restore_landed(&prep, &state, &report), "{label}");
+	}
+	let unread = guard::ScreenState {
+		scan_complete: false,
+		..state
+	};
+	assert!(
+		!restore_landed(&prep, &unread, &clean),
+		"an incomplete scan"
+	);
+	prep.read = PassRead::Scoped(BTreeSet::new());
+	assert!(
+		!restore_landed(&prep, &state, &clean),
+		"a change-scoped read"
+	);
+}
+
+/// A restoration is carried out only for a batch whose deletions are real, read on evidence absence
+/// can be trusted on; a batch held for an incomplete scan or an untrustworthy remote view may be
+/// deletions that never happened, and stays held with the reason said.
+#[test]
+fn a_restoration_is_refused_for_a_batch_that_may_be_phantom() {
+	let healthy = guard::ScreenState {
+		scan_complete: true,
+		remote: guard::RemoteEvidence::Listed,
+		first_sync: false,
+		tracked: 5,
+		restore_unfinished: false,
+	};
+	for reason in [
+		GuardReason::ExceededThreshold {
+			deletions: 40,
+			limit: 10,
+		},
+		GuardReason::FirstSyncWithDeletions { deletions: 2 },
+		GuardReason::RestoreUnfinished { deletions: 1 },
+	] {
+		assert_eq!(restore_refusal(Some(&reason), &healthy), None, "{reason:?}");
+		// A first sync is held before the remote view is weighed, so its batch can stand on a view
+		// that has not converged.
+		let unconverged = guard::ScreenState {
+			remote: guard::RemoteEvidence::Unconverged,
+			..healthy
+		};
+		assert_eq!(
+			restore_refusal(Some(&reason), &unconverged).as_deref(),
+			Some("the remote view has never converged"),
+			"{reason:?}"
+		);
+	}
+	for reason in [
+		GuardReason::ScanIncomplete,
+		GuardReason::RemoteUnconverged { deletions: 3 },
+		GuardReason::RemoteEmptied { deletions: 3 },
+	] {
+		assert_eq!(
+			restore_refusal(Some(&reason), &healthy),
+			Some(reason.to_string())
+		);
+	}
+	assert!(restore_refusal(None, &healthy).is_some());
+}
+
+/// An unfinished restoration is persisted with the pair: an engine opened on the same baseline
+/// still holds the pair's deletions, a write only happens on a change, and removing the pair
+/// ends it.
+#[tokio::test]
+async fn an_unfinished_restoration_survives_a_restart() {
+	let path = std::env::temp_dir().join(format!("filen_sync_restoring_{}.db", Uuid::new_v4()));
+	let engine = SyncEngine::open(Arc::new(offline_client()), path.clone())
+		.await
+		.unwrap();
+	let (pair, _) = locked(&engine.control)
+		.create_pair("/root", Uuid::new_v4(), SyncMode::TwoWay)
+		.unwrap();
+	engine.note_restoring(pair, true).await.unwrap();
+	engine.note_restoring(pair, true).await.unwrap();
+	drop(engine);
+
+	let engine = SyncEngine::open(Arc::new(offline_client()), path.clone())
+		.await
+		.unwrap();
+	assert!(
+		engine.restoring.lock().await.contains(&pair),
+		"read back at open"
+	);
+	engine.note_restoring(pair, false).await.unwrap();
+	assert!(
+		locked(&engine.control)
+			.unfinished_restores()
+			.unwrap()
+			.is_empty()
+	);
+
+	engine.note_restoring(pair, true).await.unwrap();
+	engine.remove_pair(pair).await.unwrap();
+	assert!(!engine.restoring.lock().await.contains(&pair));
+	assert!(
+		locked(&engine.control)
+			.unfinished_restores()
+			.unwrap()
+			.is_empty()
+	);
+
+	drop(engine);
+	std::fs::remove_file(&path).ok();
 }
 
 /// A requested pass is due, whole, and announced on the request signal the pair's watch waits

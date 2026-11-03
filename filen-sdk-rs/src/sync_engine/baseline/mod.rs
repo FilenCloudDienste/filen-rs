@@ -250,10 +250,17 @@ CREATE TABLE IF NOT EXISTS legacy_synced (
 /// `rel_path` as well so that a pass's "is every row under this directory synced" is one seek per
 /// unsynced state bounded to the directory's range, rather than a visit of every unsynced row of
 /// the pair (see [`rows`](super::rows)).
+///
+/// `unfinished_restores` names each pair a restoration of held deletions has not landed whole for
+/// yet (see [`GuardReason::RestoreUnfinished`](super::GuardReason::RestoreUnfinished)). A table of
+/// its own changes no existing row's meaning either; an older build just never reads it.
 const ADDITIVE_SCHEMA: &str = "
 CREATE INDEX IF NOT EXISTS baseline_state ON baseline (pair_id, state, rel_path);
 CREATE INDEX IF NOT EXISTS baseline_remote_uuid ON baseline (pair_id, remote_uuid);
 CREATE INDEX IF NOT EXISTS baseline_remote_stable_uuid ON baseline (pair_id, remote_stable_uuid);
+CREATE TABLE IF NOT EXISTS unfinished_restores (
+	pair_id INTEGER PRIMARY KEY REFERENCES sync_pairs (id) ON DELETE CASCADE
+);
 ";
 
 /// The columns [`BaselineStore::row_to_entry`] reads, named once so the statements that hand back
@@ -1608,6 +1615,36 @@ impl BaselineStore {
 			.prepare("SELECT id FROM sync_pairs WHERE paused != 0")?
 			.query_map([], |row| row.get(0))?
 			.collect()
+	}
+
+	/// Every pair a restoration of held deletions has not landed whole for (see
+	/// [`GuardReason::RestoreUnfinished`](super::GuardReason::RestoreUnfinished)). Read once when
+	/// the engine opens, then tracked in memory.
+	pub(crate) fn unfinished_restores(&self) -> rusqlite::Result<Vec<PairId>> {
+		self.conn
+			.prepare("SELECT pair_id FROM unfinished_restores")?
+			.query_map([], |row| row.get(0))?
+			.collect()
+	}
+
+	/// Record whether a restoration of `pair`'s held deletions is still to land.
+	pub(crate) fn set_restore_unfinished(
+		&self,
+		id: PairId,
+		unfinished: bool,
+	) -> rusqlite::Result<()> {
+		if unfinished {
+			self.conn.execute(
+				"INSERT OR IGNORE INTO unfinished_restores (pair_id) VALUES (?1)",
+				params![id],
+			)?;
+		} else {
+			self.conn.execute(
+				"DELETE FROM unfinished_restores WHERE pair_id = ?1",
+				params![id],
+			)?;
+		}
+		Ok(())
 	}
 
 	/// Record that a pass of `pair` has completed cleanly (see

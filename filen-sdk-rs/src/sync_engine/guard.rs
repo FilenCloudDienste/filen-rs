@@ -137,6 +137,15 @@ pub enum GuardReason {
 	/// The deletion count exceeded the configured limit for the tracked-item count (see
 	/// [`DeleteGuard`]).
 	ExceededThreshold { deletions: usize, limit: usize },
+	/// The caller chose to restore a held batch
+	/// ([`restore_deletions`](super::SyncEngine::restore_deletions)) and the restoration has not
+	/// landed whole yet: a transfer of it failed, the pass stopped part of the way, or a type flip
+	/// in it could not be put back. Until it lands, every deletion the pair plans is held, however
+	/// few, so what the caller asked to keep is never deleted under the volume limit; the caller
+	/// restores or approves the batch again. On trustworthy evidence it names the hold ahead of a
+	/// first sync and the volume limit, so the batch keeps one token from pass to pass; on an
+	/// incomplete scan or an untrustworthy remote view, that reason names it instead.
+	RestoreUnfinished { deletions: usize },
 }
 
 impl fmt::Display for GuardReason {
@@ -160,6 +169,10 @@ impl fmt::Display for GuardReason {
 			Self::ExceededThreshold { deletions, limit } => {
 				write!(f, "{deletions} deletion(s) exceed the limit of {limit}")
 			}
+			Self::RestoreUnfinished { deletions } => write!(
+				f,
+				"a restoration of held deletions has not finished, so {deletions} deletion(s) are held"
+			),
 		}
 	}
 }
@@ -190,6 +203,9 @@ pub(crate) struct ScreenState {
 	pub(crate) first_sync: bool,
 	/// How many items the pair's baseline currently tracks (the ratio denominator).
 	pub(crate) tracked: usize,
+	/// A restoration the caller chose has not landed whole yet (see
+	/// [`GuardReason::RestoreUnfinished`]).
+	pub(crate) restore_unfinished: bool,
 }
 
 impl ScreenState {
@@ -210,8 +226,9 @@ impl ScreenState {
 
 /// Why the guard holds the deletions of a pass that deletes `deletions` items, if it does: when
 /// the pass's state is not trustworthy enough to act on them (incomplete scan, first sync against a
-/// non-empty destination, un-converged or wholly empty remote) or their volume exceeds the guard's
-/// limit. `None` lets everything through, and so does a pass that deletes nothing.
+/// non-empty destination, un-converged or wholly empty remote), their volume exceeds the guard's
+/// limit, or a restoration of the pair has not landed yet. `None` lets everything through, and so
+/// does a pass that deletes nothing.
 ///
 /// What a reason holds is every deletion of the pass and every create at a path one of them
 /// empties: a delete whose path is also (re)created this pass is half of a type flip, the create is
@@ -228,6 +245,10 @@ pub(crate) fn reason_for(
 	}
 	if !state.scan_complete {
 		Some(GuardReason::ScanIncomplete)
+	} else if state.restore_unfinished && state.remote == RemoteEvidence::Listed {
+		// Ahead of the first sync and the volume limit, so the batch a restoring pass keeps held
+		// (its type flips) is named the same way by the passes after it, whatever its volume.
+		Some(GuardReason::RestoreUnfinished { deletions })
 	} else if state.first_sync {
 		Some(GuardReason::FirstSyncWithDeletions { deletions })
 	} else if state.remote == RemoteEvidence::Unconverged {
@@ -236,7 +257,14 @@ pub(crate) fn reason_for(
 		Some(GuardReason::RemoteEmptied { deletions })
 	} else {
 		let limit = guard.limit(state.tracked);
-		(deletions > limit).then_some(GuardReason::ExceededThreshold { deletions, limit })
+		if deletions > limit {
+			Some(GuardReason::ExceededThreshold { deletions, limit })
+		} else {
+			// A wholly empty remote view's single deletion, which nothing above holds.
+			state
+				.restore_unfinished
+				.then_some(GuardReason::RestoreUnfinished { deletions })
+		}
 	}
 }
 
@@ -324,6 +352,7 @@ mod tests {
 			remote: RemoteEvidence::Listed,
 			first_sync: false,
 			tracked,
+			restore_unfinished: false,
 		}
 	}
 
@@ -465,6 +494,72 @@ mod tests {
 			})
 		);
 		assert_eq!(decision.held.len(), 20, "the whole wipe is held");
+	}
+
+	#[test]
+	fn an_unfinished_restoration_holds_even_a_single_deletion() {
+		// What the caller asked to keep and the restoring pass did not land plans as a deletion
+		// again, usually far under the limit: it is held, not applied.
+		let actions = vec![del("left"), upload("other")];
+		let state = ScreenState {
+			restore_unfinished: true,
+			..established(1000)
+		};
+		let decision = screen(actions, state, DeleteGuard::unlimited());
+		assert_eq!(
+			decision.reason,
+			Some(GuardReason::RestoreUnfinished { deletions: 1 })
+		);
+		assert_eq!(decision.safe, vec![upload("other")]);
+		assert_eq!(decision.held, vec![del("left")]);
+
+		// On trustworthy evidence it names the hold ahead of the volume limit and a first sync, so
+		// a batch keeps its token whatever its volume; a pass that deletes nothing holds nothing.
+		let wide: Vec<_> = (0..30).map(|i| del(&format!("d{i}"))).collect();
+		let small = ScreenState {
+			tracked: 20,
+			first_sync: true,
+			..state
+		};
+		assert_eq!(
+			screen(wide, small, DeleteGuard::default()).reason,
+			Some(GuardReason::RestoreUnfinished { deletions: 30 })
+		);
+		assert!(
+			screen(vec![upload("x")], state, DeleteGuard::default())
+				.reason
+				.is_none()
+		);
+		// Untrustworthy evidence is named by its own reason.
+		let unread = ScreenState {
+			scan_complete: false,
+			..state
+		};
+		assert_eq!(
+			screen(vec![del("x")], unread, DeleteGuard::default()).reason,
+			Some(GuardReason::ScanIncomplete)
+		);
+		let unconverged = ScreenState {
+			remote: RemoteEvidence::Unconverged,
+			..state
+		};
+		assert_eq!(
+			screen(vec![del("x")], unconverged, DeleteGuard::default()).reason,
+			Some(GuardReason::RemoteUnconverged { deletions: 1 })
+		);
+		let emptied = ScreenState {
+			remote: RemoteEvidence::Emptied,
+			..state
+		};
+		assert_eq!(
+			screen(vec![del("x"), del("y")], emptied, DeleteGuard::default()).reason,
+			Some(GuardReason::RemoteEmptied { deletions: 2 })
+		);
+		assert_eq!(
+			screen(vec![del("x")], emptied, DeleteGuard::default()).reason,
+			Some(GuardReason::RestoreUnfinished { deletions: 1 }),
+			"the single deletion an empty view releases is still held"
+		);
 	}
 
 	#[test]

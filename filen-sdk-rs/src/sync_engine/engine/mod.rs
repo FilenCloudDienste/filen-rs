@@ -1712,6 +1712,10 @@ pub struct SyncEngine {
 	/// what to do with it. The next pass whose held batch hashes to that token applies or restores
 	/// it; any other batch is held again.
 	approvals: Mutex<HashMap<PairId, (String, HeldBatch)>>,
+	/// The pairs a restoration of held deletions has not landed whole for (see
+	/// [`GuardReason::RestoreUnfinished`]): persisted, read once at open, and changed only when a
+	/// restoration starts or ends.
+	restoring: Mutex<HashSet<PairId>>,
 	/// Serializes [`add_pair`](SyncEngine::add_pair): its overlap check reads the registry and then
 	/// inserts into it, with an `await` in between, so two concurrent registrations would otherwise
 	/// both find the roots free and both commit — the exact overlap the check exists to refuse.
@@ -3344,6 +3348,11 @@ impl SyncEngine {
 				)
 			})
 			.collect();
+		let restoring = store
+			.unfinished_restores()
+			.map_err(|e| db_error(e, "loading unfinished restorations"))?
+			.into_iter()
+			.collect();
 		let engine = Self {
 			client,
 			db_path,
@@ -3354,6 +3363,7 @@ impl SyncEngine {
 			observed: Arc::new(Observations::default()),
 			roots: Mutex::new(HashMap::new()),
 			approvals: Mutex::new(HashMap::new()),
+			restoring: Mutex::new(restoring),
 			registrations: Mutex::new(()),
 			paused: Mutex::new(paused),
 			removals: Mutex::new(HashMap::new()),
@@ -5472,7 +5482,8 @@ impl SyncEngine {
 		let prep = self
 			.prepare(pair, None, Seeding::Preview, &Arc::default())
 			.await?;
-		let state = screen_state(&prep);
+		let mut state = screen_state(&prep);
+		state.restore_unfinished = self.restoring.lock().await.contains(&pair);
 		let at = self.stage_at(pair);
 		// On a blocking thread, as a pass screens its plan: the reconcile, the screening and the
 		// lists all read and write the plan's stage.
@@ -5614,6 +5625,8 @@ impl SyncEngine {
 		// cancel after the delete would leave a completed action racing the cascade.
 		self.cancel_pass_in_flight(pair).await;
 		self.approvals.lock().await.remove(&pair);
+		// Its row goes with the pair's (`ON DELETE CASCADE`).
+		self.restoring.lock().await.remove(&pair);
 		// Dropping the handle unsubscribes the pair's cache notifications.
 		self.roots.lock().await.remove(&pair);
 		// The pair's journal rows go with it (`ON DELETE CASCADE`); drop the in-memory copies too,
@@ -6016,6 +6029,9 @@ impl SyncEngine {
 	/// pair is woken for it, so the approved batch is applied within the watch's debounce rather
 	/// than at its next change or safety-net pass. Without a watch, the next
 	/// [`sync_once`](Self::sync_once) is that pass.
+	///
+	/// An approval also ends an unfinished restoration of the pair
+	/// ([`GuardReason::RestoreUnfinished`]): what that restoration left is in the batch approved.
 	pub async fn approve_deletions(&self, pair: PairId, pass_token: &str) {
 		self.decide_held(pair, pass_token, HeldBatch::Apply).await;
 	}
@@ -6027,22 +6043,35 @@ impl SyncEngine {
 	/// bin holds a copy with the remote's exact content, moved back out of the bin instead, with no
 	/// transfer — and one deleted in the cloud is uploaded again from the local copy; a directory is
 	/// created again on that side. Both sides then match, so the hold clears: the pass that
-	/// restores reports no held batch, and the passes after it are no longer made whole by it.
+	/// restores reports no held batch (but a type flip, below), and once the restoration has landed
+	/// the passes after it are no longer held or made whole by it.
 	///
 	/// It has the approval's shape: one-shot, for the batch that token names only, and applied by
 	/// the pair's next pass, which it makes due and whole and wakes a watch for. A token that names
 	/// no batch the next pass holds — a stale one — restores nothing; that pass holds its batch
 	/// again under its own token. A restoration and an approval for the same pair replace each
-	/// other: the later call is the one the next pass acts on. In memory only, as an approval is.
+	/// other: the later call is the one the next pass acts on. The decision itself is in memory
+	/// only, as an approval is.
+	///
+	/// Only a batch whose deletions are real is restored: one held past the volume limit, a first
+	/// sync's, or what an earlier restoration left, on a pass whose local scan is complete and
+	/// whose remote view has converged and lists something. A batch held for an incomplete scan or
+	/// an untrustworthy remote view may be deletions that never happened, and restoring them would
+	/// write a whole subtree into an unmounted volume's mount point, or a new version over every
+	/// remote file; that pass holds it again and says why in its report's errors.
+	///
+	/// Once the restoring pass starts putting items back, the pair's restoration is recorded in the
+	/// baseline until a pass shows it landed: one that read both sides whole, ran to its end with
+	/// nothing failed and planned no deletion. Until then every deletion the pair plans is held,
+	/// however few, as [`GuardReason::RestoreUnfinished`] — so what a cancelled, paused, crashed or
+	/// failing restoration did not get to put back is never deleted under the volume limit, nor
+	/// is anything else deleted, until the caller restores or approves that batch.
 	///
 	/// A held type flip — an item replaced by one of the other kind — is not restored: putting the
-	/// old item back would mean renaming the new one. That pass leaves it, and everything held under
-	/// its path, unapplied, and the next pass holds it again on its own.
-	///
-	/// Safe to repeat and to interrupt: the restoring pass runs the uploads, downloads and
-	/// directory creates any pass runs, each recorded as it lands, and a pass that stops part of the
-	/// way leaves what it restored as synced and the rest still deleted, which the next pass holds
-	/// again as a smaller batch to restore or approve.
+	/// old item back would mean renaming the new one. It stays held, with everything held under
+	/// its path: the restoring pass reports it as an unfinished restoration's batch under a token of
+	/// its own, which the passes after it hold again until the caller approves it (or restores it,
+	/// which holds it again).
 	pub async fn restore_deletions(&self, pair: PairId, pass_token: &str) {
 		self.decide_held(pair, pass_token, HeldBatch::Restore).await;
 	}
@@ -6439,6 +6468,46 @@ impl SyncEngine {
 				.map_err(|e| db_error(e, "recording the pair's first completed pass"))
 		};
 		if let Err(error) = recorded.await {
+			tracing::warn!("sync pair {pair}: {error}");
+			report.errors.push(error.to_string());
+		}
+	}
+
+	/// Record whether a restoration of `pair`'s held deletions is still to land (see
+	/// [`GuardReason::RestoreUnfinished`]): persisted first, so the record in memory never says
+	/// more than the file does. Writes only on a change.
+	async fn note_restoring(&self, pair: PairId, unfinished: bool) -> Result<(), Error> {
+		let mut restoring = self.restoring.lock().await;
+		if restoring.contains(&pair) == unfinished {
+			return Ok(());
+		}
+		off_store(&self.control, move |store| {
+			store.set_restore_unfinished(pair, unfinished)
+		})
+		.await?
+		.map_err(|e| db_error(e, "recording a restoration of held deletions"))?;
+		if unfinished {
+			restoring.insert(pair);
+		} else {
+			restoring.remove(&pair);
+		}
+		Ok(())
+	}
+
+	/// End `pair`'s unfinished restoration once a pass shows it landed (see
+	/// [`restore_landed`]). A failure to record that is reported; the restoration stands, so the
+	/// next pass holds what it deletes again, which is the safe side.
+	async fn note_restore_landed(
+		&self,
+		pair: PairId,
+		prep: &Prepared,
+		state: &guard::ScreenState,
+		report: &mut SyncReport,
+	) {
+		if !self.restoring.lock().await.contains(&pair) || !restore_landed(prep, state, report) {
+			return;
+		}
+		if let Err(error) = self.note_restoring(pair, false).await {
 			tracing::warn!("sync pair {pair}: {error}");
 			report.errors.push(error.to_string());
 		}
@@ -6941,7 +7010,8 @@ impl SyncEngine {
 		// files of their own, though none old enough to be taken for a leftover.
 		remove_stale_downloads(pair, mem::take(&mut prep.local_scan.stale_downloads)).await;
 
-		let state = screen_state(&prep);
+		let mut state = screen_state(&prep);
+		state.restore_unfinished = self.restoring.lock().await.contains(&pair);
 		let at = self.stage_at(pair);
 		// Every read and write of the plan's stage from here to the apply scales with the plan, so
 		// each runs on a blocking thread, handed what it reads and handing it back.
@@ -6972,23 +7042,44 @@ impl SyncEngine {
 						"sync_once[pair {pair}]: approval {token} matched — applying {released} \
 						 held deletion(s)"
 					);
+					// What a restoration left is in the batch the caller just approved.
+					if let Err(error) = self.note_restoring(pair, false).await {
+						tracing::warn!("sync pair {pair}: {error}");
+						report.errors.push(error.to_string());
+					}
 				}
 				HeldBatch::Restore => {
-					let bin = (
-						PathBuf::from(&prep.record.local_root),
-						self.pair_root(prep.record.remote_root),
-					);
-					let restored;
-					(prep, screened, restored) =
-						off_runtime("restoring the held batch", move || {
-							let restored = screened.restore(&prep.baseline, &bin.0, bin.1);
-							(prep, screened, restored)
-						})
-						.await?;
-					let restored = restored?;
-					tracing::debug!(
-						"sync_once[pair {pair}]: restoration {token} matched — {restored:?}"
-					);
+					if let Some(refusal) = restore_refusal(screened.reason.as_ref(), &state) {
+						tracing::warn!(
+							"sync_once[pair {pair}]: restoration {token} not carried out — {refusal}"
+						);
+						report.errors.push(format!(
+							"the held deletions were not restored, since {refusal}; they stay held"
+						));
+					// Recorded before anything is put back, so a pass that does not land all of it —
+					// cut short, crashed, a transfer failed — leaves the rest held, not deleted.
+					} else if let Err(error) = self.note_restoring(pair, true).await {
+						tracing::warn!("sync pair {pair}: {error}");
+						report.errors.push(format!(
+							"the held deletions were not restored, since {error}; they stay held"
+						));
+					} else {
+						let bin = (
+							PathBuf::from(&prep.record.local_root),
+							self.pair_root(prep.record.remote_root),
+						);
+						let restored;
+						(prep, screened, restored) =
+							off_runtime("restoring the held batch", move || {
+								let restored = screened.restore(&prep.baseline, &bin.0, bin.1);
+								(prep, screened, restored)
+							})
+							.await?;
+						let restored = restored?;
+						tracing::debug!(
+							"sync_once[pair {pair}]: restoration {token} matched — {restored:?}"
+						);
+					}
 				}
 			}
 		}
@@ -7128,6 +7219,8 @@ impl SyncEngine {
 			);
 			self.untrack_ignored(pair, &prep, &mut report).await;
 			self.note_first_pass(pair, &prep, &state, &mut report).await;
+			self.note_restore_landed(pair, &prep, &state, &mut report)
+				.await;
 			observer(SyncEvent::PassCompleted {
 				report: report.clone(),
 			});
@@ -7191,6 +7284,8 @@ impl SyncEngine {
 		// After the apply, which carries rows along with the directory moves the roots were re-keyed by.
 		self.untrack_ignored(pair, &prep, &mut report).await;
 		self.note_first_pass(pair, &prep, &state, &mut report).await;
+		self.note_restore_landed(pair, &prep, &state, &mut report)
+			.await;
 		tracing::debug!(
 			"sync_once[pair {pair}]: done — {} uploaded, {} downloaded, {} remote dir(s), {} local dir(s), {} trashed, {} locally deleted, {} moved remote, {} moved local, {} conflict(s), {} held, {} deferred, {} interrupted, {} error(s)",
 			report.uploaded,
@@ -7363,8 +7458,8 @@ struct Restored {
 	from_bin: usize,
 	/// Actions that put an item back, which the pass runs.
 	actions: usize,
-	/// Actions of a held type flip, which the pass leaves unapplied.
-	unrestorable: usize,
+	/// Actions of a held type flip, and those held under its path, which stay held.
+	kept_held: usize,
 }
 
 /// A reconciled, guard-screened pass.
@@ -7413,36 +7508,53 @@ impl Screened {
 	/// `local_root`) holds with its recorded content (`rows`) is taken back out of it there and
 	/// then, and the rest of the batch becomes the transfers and creates that put each item back
 	/// ([`Screen::restore_held`]).
+	///
+	/// A held type flip cannot be undone ([`Screen::set_aside_flips`]): it stays held, with
+	/// everything held under its path, as an unfinished restoration's batch
+	/// ([`GuardReason::RestoreUnfinished`]) under a token of its own, which the next pass holds
+	/// again whatever its volume.
 	fn restore(
 		&mut self,
 		rows: &Baseline,
 		local_root: &Path,
 		pair_root: PairRoot,
 	) -> Result<Restored, Error> {
+		let failed = |e| db_error(e, "restoring the held batch");
 		let mut restored = Restored::default();
-		if let Some(plan) = &mut self.plan {
-			if let Some(bin) = bin::Binned::open(local_root, pair_root) {
-				restored.from_bin = plan
-					.retain(Rows::Held, |action| match action {
-						SyncAction::TrashRemote {
-							rel_path,
-							kind: NodeKind::File,
-							..
-						} => !rows.get(rel_path).is_some_and(|row| {
-							matches!((row.size, &row.content_hash), (Some(size), Some(hash))
-								if bin.take_back(rel_path, size, hash))
-						}),
-						_ => true,
-					})
-					.map_err(|e| db_error(e, "restoring the held batch"))?;
-			}
-			(restored.actions, restored.unrestorable) = plan
-				.restore_held()
-				.map_err(|e| db_error(e, "restoring the held batch"))?;
-		}
-		self.dropped += restored.unrestorable;
 		self.reason = None;
 		self.pass_token = None;
+		let Some(plan) = &mut self.plan else {
+			return Ok(restored);
+		};
+		let flips;
+		(flips, restored.kept_held) = plan.set_aside_flips().map_err(failed)?;
+		if let Some(bin) = bin::Binned::open(local_root, pair_root) {
+			restored.from_bin = plan
+				.retain(Rows::Held, |action| match action {
+					SyncAction::TrashRemote {
+						rel_path,
+						kind: NodeKind::File,
+						..
+					} => !rows.get(rel_path).is_some_and(|row| {
+						matches!((row.size, &row.content_hash), (Some(size), Some(hash))
+							if bin.take_back(rel_path, size, hash))
+					}),
+					_ => true,
+				})
+				.map_err(failed)?;
+		}
+		restored.actions = plan.restore_held(&flips).map_err(failed)?;
+		if restored.kept_held > 0 {
+			// Every deletion the guard counted was held, so the ones left are the flips'.
+			let reason = GuardReason::RestoreUnfinished {
+				deletions: plan.count(Rows::Deletes).map_err(failed)?,
+			};
+			let mut token = BatchToken::new(&reason);
+			plan.each_held_by_line(|action| token.line(action))
+				.map_err(failed)?;
+			self.reason = Some(reason);
+			self.pass_token = Some(token.finish());
+		}
 		Ok(restored)
 	}
 
@@ -7992,6 +8104,7 @@ fn token_kind(reason: &GuardReason) -> &'static str {
 		GuardReason::RemoteUnconverged { .. } => "remote-unconverged",
 		GuardReason::RemoteEmptied { .. } => "remote-emptied",
 		GuardReason::ExceededThreshold { .. } => "over-limit",
+		GuardReason::RestoreUnfinished { .. } => "restore-unfinished",
 	}
 }
 
@@ -8027,6 +8140,8 @@ fn screen_state(prep: &Prepared) -> guard::ScreenState {
 		// The rows as the pass found them, not as its seeding left them (see
 		// `Prepared::tracked_at_start`).
 		tracked: prep.tracked_at_start,
+		// The engine's to say (`SyncEngine::restoring`), not the read's.
+		restore_unfinished: false,
 	}
 }
 
@@ -8058,6 +8173,45 @@ fn completes_first_pass(prep: &Prepared, state: &guard::ScreenState, report: &Sy
 		&& !report.paused
 		&& report.interrupted == 0
 		&& report.pass_failure().is_none()
+		&& !prep.read.is_scoped()
+		&& state.absence_trusted()
+		&& report.guard.is_none()
+}
+
+/// Why a restoration of the batch held for `reason` must not be carried out on a pass whose state
+/// is `state`, if it must not. Decided purely so the rule is unit-testable.
+///
+/// A restoration writes back, from the other side, everything the batch deletes, so it is only
+/// for a batch whose deletions are real: a volume past the limit, a first sync's destination items
+/// the source lacks, or what an earlier restoration left, each read from evidence absence can be
+/// trusted on. An incomplete scan's batch may be phantoms — an unmounted nested volume, an
+/// unreadable subtree — and restoring would write the remote subtree into the bare mount point;
+/// an unconverged or wholly empty remote view's batch is most likely still there, and restoring
+/// would upload a new version over every remote file. Those stay held until the evidence returns.
+fn restore_refusal(reason: Option<&GuardReason>, state: &guard::ScreenState) -> Option<String> {
+	match reason {
+		Some(
+			GuardReason::ExceededThreshold { .. }
+			| GuardReason::FirstSyncWithDeletions { .. }
+			| GuardReason::RestoreUnfinished { .. },
+		) => adoption_refusal(None, state),
+		Some(reason) => Some(reason.to_string()),
+		None => Some("the pass holds no batch".to_string()),
+	}
+}
+
+/// Whether a pass that got as far as `report` shows the pair's unfinished restoration landed:
+/// it read both sides whole on evidence absence can be trusted on, ran to its end with nothing it
+/// planned failed or left undone, and holds no batch — under an unfinished restoration every
+/// deletion is held, so a pass that holds none has nothing of the restored batch left deleted (the
+/// restoring pass itself has turned all of it into the writes it just ran). Decided purely so the
+/// rule is unit-testable.
+fn restore_landed(prep: &Prepared, state: &guard::ScreenState, report: &SyncReport) -> bool {
+	report.refused.is_none()
+		&& !report.paused
+		&& report.interrupted == 0
+		&& report.pass_failure().is_none()
+		&& report.failed_paths.is_empty()
 		&& !prep.read.is_scoped()
 		&& state.absence_trusted()
 		&& report.guard.is_none()
