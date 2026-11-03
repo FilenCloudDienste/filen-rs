@@ -365,6 +365,7 @@ trait LinkableItem: HasName {
 	async fn update_link(&self, client: &Client, link: &Self::Link) -> Result<(), Error>;
 	async fn remove_link(&self, client: &Client, link: Self::Link) -> Result<(), Error>;
 	fn link_url(&self, link: &Self::Link) -> Option<String>;
+	fn link_uuid(link: &Self::Link) -> String;
 	fn current_settings(link: &Self::Link) -> CurrentLinkSettings;
 	fn apply_settings(link: &mut Self::Link, settings: LinkSettings);
 }
@@ -391,6 +392,10 @@ impl LinkableItem for RemoteFile {
 
 	fn link_url(&self, link: &FilePublicLink) -> Option<String> {
 		file_public_link_url(self, link)
+	}
+
+	fn link_uuid(link: &FilePublicLink) -> String {
+		link.uuid().to_string()
 	}
 
 	fn current_settings(link: &FilePublicLink) -> CurrentLinkSettings {
@@ -436,6 +441,10 @@ impl LinkableItem for RemoteDirectory {
 
 	fn link_url(&self, link: &DirPublicLinkRW) -> Option<String> {
 		dir_public_link_url(link)
+	}
+
+	fn link_uuid(link: &DirPublicLinkRW) -> String {
+		link.uuid().to_string()
 	}
 
 	fn current_settings(link: &DirPublicLinkRW) -> CurrentLinkSettings {
@@ -590,14 +599,38 @@ fn prompt_downloadable(ui: &mut UI, downloadable: bool) -> Result<bool> {
 
 /// Prints the item's name, then its link's settings and URL.
 fn print_link_table<I: LinkableItem>(ui: &mut UI, item: &I, link: &I::Link) {
-	let settings = I::current_settings(link);
-	let url = item.link_url(link);
-	let url = url_or_unavailable(ui, url.as_deref());
+	print_link_rows(
+		ui,
+		&LinkTable {
+			kind: I::KIND,
+			name: item.name().unwrap_or_default(),
+			settings: I::current_settings(link),
+			link_uuid: &I::link_uuid(link),
+			url: item.link_url(link).as_deref(),
+		},
+	);
+}
+
+/// What the link table shows about a link.
+struct LinkTable<'a> {
+	kind: PublicLinkKind,
+	name: &'a str,
+	settings: CurrentLinkSettings,
+	link_uuid: &'a str,
+	/// `None` when the key in the link could not be decrypted.
+	url: Option<&'a str>,
+}
+
+/// Prints the link table. The link's uuid and URL are omitted while replay testing, since they
+/// differ on every run.
+fn print_link_rows(ui: &mut UI, table: &LinkTable<'_>) {
+	let url = url_or_unavailable(ui, table.url);
 	ui.print_key_value_table(&[
-		(I::KIND.label(), item.name().unwrap_or_default()),
-		("Expiration", expiration_label(settings.expiration)),
-		("Password", yes_no(settings.has_password)),
-		("Download Enabled", yes_no(settings.downloadable)),
+		(table.kind.label(), table.name),
+		("Expiration", expiration_label(table.settings.expiration)),
+		("Password", yes_no(table.settings.has_password)),
+		("Download Enabled", yes_no(table.settings.downloadable)),
+		("Link UUID", ui.omit_for_replay_testing(table.link_uuid)),
 		("URL", url),
 	]);
 }
@@ -833,6 +866,38 @@ mod tests {
 		assert_eq!(
 			PasswordChange::from_answer("hunter2".to_owned(), true),
 			PasswordChange::Set("hunter2".to_owned())
+		);
+	}
+
+	#[test]
+	fn the_link_table_shows_the_settings_uuid_and_url_of_a_link() {
+		let printed = Printed::default();
+		let mut ui = printed.ui();
+		print_link_rows(
+			&mut ui,
+			&LinkTable {
+				kind: PublicLinkKind::File,
+				name: "report.pdf",
+				settings: CurrentLinkSettings {
+					expiration: PublicLinkExpiration::OneWeek,
+					has_password: true,
+					downloadable: false,
+				},
+				link_uuid: LINK_UUID,
+				url: Some("https://file"),
+			},
+		);
+		assert_eq!(
+			console::strip_ansi_codes(&printed.lines()),
+			[
+				"            File report.pdf",
+				"      Expiration 1 week",
+				"        Password Yes",
+				"Download Enabled No",
+				"       Link UUID 0f8fad5b-d9cb-469f-a165-70867728950e",
+				"             URL https://file",
+			]
+			.join("\n")
 		);
 	}
 
