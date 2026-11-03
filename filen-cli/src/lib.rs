@@ -59,6 +59,7 @@ mod error;
 mod interrupt;
 mod log_files;
 mod memory;
+mod ts_leftovers;
 mod ui;
 mod updater;
 mod util;
@@ -410,6 +411,7 @@ async fn inner_main(ui: &mut ui::UI, arenas_limited: bool) -> Result<Finished> {
 	// A clone, as `CommandOptions::of` borrows the whole of `cli_args` below.
 	let explicit_config_dir =
 		chosen_config_dir(cli_args.config_dir.clone(), std::env::var_os(DATA_DIR_ENV));
+	let config_dir_is_default = explicit_config_dir.is_none();
 	let base_config_dir = match explicit_config_dir {
 		Some(dir) => create_explicit_config_dir(dir)?,
 		None => {
@@ -509,6 +511,18 @@ async fn inner_main(ui: &mut ui::UI, arenas_limited: bool) -> Result<Finished> {
 	if let Some(help_topic) = cli_args.help {
 		return print_in_app_docs(ui, help_topic_or_general(help_topic))
 			.map(|()| Finished::Success);
+	}
+
+	// the user's own leftovers would show up in the recordings
+	if !cli_args.make_output_environment_agnostic_for_replay_testing {
+		// the config dir without a profile, which the older CLI shared, so that the hint is
+		// shown once and not once per profile
+		ts_leftovers::hint_once(
+			ui,
+			&base_config_dir,
+			config_dir_is_default,
+			io::stderr().is_terminal(),
+		);
 	}
 
 	// a single command has no working directory to change
