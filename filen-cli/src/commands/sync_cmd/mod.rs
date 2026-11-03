@@ -1,6 +1,7 @@
 use std::{
 	borrow::Cow,
 	collections::{HashMap, HashSet},
+	path::Path,
 	sync::Arc,
 };
 
@@ -10,8 +11,8 @@ use console::style;
 use filen_sdk_rs::{
 	auth::Client,
 	sync_engine::{
-		ConflictResolution, PairId, SyncEngine, SyncEvent, TransferDirection, UnsyncablePath,
-		UnsyncableReason,
+		BaselineInUse, ConflictResolution, PairId, SyncEngine, SyncEvent, TransferDirection,
+		UnsyncablePath, UnsyncableReason,
 	},
 };
 use tokio::{select, sync::mpsc};
@@ -137,14 +138,9 @@ pub(crate) async fn sync(
 	let engine = Arc::new(
 		SyncEngine::open(client.clone(), db_path.clone())
 			.await
-			.map_err(|e| {
-				UI::failure(&format!(
-					"Failed to open the sync engine at {}: {e}",
-					db_path.display()
-				))
-			})?,
+			.map_err(|e| UI::failure(&open_failure(&e, &db_path)))?,
 	);
-	let pair_ids = sync_pairs::register_sync_pairs(&engine, &pair_definitions)
+	let pair_ids = sync_pairs::register_sync_pairs(&engine, &client, &pair_definitions)
 		.await
 		.context("Failed to add sync pairs")?;
 
@@ -351,6 +347,22 @@ pub(crate) async fn sync(
 	Ok(())
 }
 
+/// Why the sync engine's database at `db_path` could not be opened, as `error` says.
+fn open_failure(error: &filen_sdk_rs::Error, db_path: &Path) -> String {
+	if error.downcast_ref::<BaselineInUse>().is_some() {
+		format!(
+			"Another `filen sync` (or another program using {}) is running; only one can use the \
+			 sync database at a time",
+			db_path.display()
+		)
+	} else {
+		format!(
+			"Failed to open the sync engine at {}: {error}",
+			db_path.display()
+		)
+	}
+}
+
 /// The label [`sync_pairs::pair_labels`] gave `pair`. Every pair of the run has one; should an
 /// event name another, it is named by its id rather than ending the sync.
 fn label_of(labels: &HashMap<PairId, String>, pair: PairId) -> Cow<'_, str> {
@@ -468,7 +480,11 @@ fn format_sync_event(event: &SyncEvent) -> String {
 mod tests {
 	use filen_sdk_rs::sync_engine::{UnsyncablePath, UnsyncableReason};
 
-	use super::unsyncable_notices;
+	use std::path::Path;
+
+	use filen_sdk_rs::{Error, ErrorKind, sync_engine::BaselineInUse};
+
+	use super::{open_failure, unsyncable_notices};
 
 	/// A pass that held case twins back completes with no errors, so the twins are named on their
 	/// own lines, with what resolves them.
@@ -515,6 +531,25 @@ mod tests {
 		assert_eq!(
 			unsyncable_notices(&unsyncable),
 			["Cannot sync nul: the remote would reject this name: reserved"]
+		);
+	}
+
+	/// A second sync on the same database is told what holds it, not shown the engine's error.
+	#[test]
+	fn a_database_another_sync_holds_says_so() {
+		let db_path = Path::new("/config/sync-engine.db");
+		let error = Error::custom_with_source(
+			ErrorKind::IO,
+			BaselineInUse {
+				path: db_path.to_path_buf(),
+			},
+			None::<&str>,
+		);
+
+		assert_eq!(
+			open_failure(&error, db_path),
+			"Another `filen sync` (or another program using /config/sync-engine.db) is running; \
+			 only one can use the sync database at a time"
 		);
 	}
 

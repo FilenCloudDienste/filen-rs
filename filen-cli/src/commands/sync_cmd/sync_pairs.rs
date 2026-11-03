@@ -3,6 +3,7 @@ use std::{
 	collections::HashMap,
 	fmt::Display,
 	path::{Path, PathBuf},
+	slice,
 };
 
 use anyhow::{Context, Result};
@@ -12,7 +13,7 @@ use filen_sdk_rs::{
 		HasUUID as _,
 		categories::{NonRootFileType, NonRootItemType},
 	},
-	sync_engine::{DeleteGuard, PairId, PairRecord, SyncEngine, SyncMode},
+	sync_engine::{DeleteGuard, PairId, PairOverlap, PairRecord, SyncEngine, SyncMode},
 };
 use filen_types::fs::Uuid;
 use serde::Deserialize;
@@ -90,6 +91,7 @@ pub(crate) async fn resolve_sync_pairs(
 /// pair does after the run that set it up.
 pub(crate) async fn register_sync_pairs(
 	engine: &SyncEngine,
+	client: &Client,
 	pairs: &[PairDefinition],
 ) -> Result<Vec<PairId>> {
 	let mut pair_ids = Vec::new();
@@ -100,16 +102,23 @@ pub(crate) async fn register_sync_pairs(
 		remote_root,
 	} in pairs
 	{
-		// the engine takes the path, which the message below still names
-		let pair = engine
-			.add_pair(local.clone(), *remote_root, *mode)
-			.await
-			.map_err(|e| {
-				UI::failure(&format!(
-					"Failed to set up the sync pair {} <> {remote_path}: {e}",
-					local.display()
-				))
-			})?;
+		// the engine takes the path, which the messages below still name
+		let pair = match engine.add_pair(local.clone(), *remote_root, *mode).await {
+			Ok(pair) => pair,
+			Err(e) => {
+				let message = match e.downcast_ref::<PairOverlap>() {
+					Some(overlap) => {
+						let other = other_pair_label(engine, client, overlap_pair(overlap)).await;
+						overlap_message(local, remote_path, overlap, &other)
+					}
+					None => format!(
+						"Failed to set up the sync pair {} <> {remote_path}: {e}",
+						local.display()
+					),
+				};
+				return Err(UI::failure(&message));
+			}
+		};
 		// Set on every run, not only when the pair is new: earlier versions stored a guard that
 		// held every deletion, and a pair they registered keeps it until it is overwritten.
 		engine
@@ -127,6 +136,59 @@ pub(crate) async fn register_sync_pairs(
 		}
 	}
 	Ok(pair_ids)
+}
+
+/// The registered pair `overlap` names.
+fn overlap_pair(overlap: &PairOverlap) -> PairId {
+	match overlap {
+		PairOverlap::LocalRootInUse { pair, .. }
+		| PairOverlap::LocalRootNested { pair, .. }
+		| PairOverlap::LocalRootContains { pair, .. }
+		| PairOverlap::RemoteRootInUse { pair, .. }
+		| PairOverlap::RemoteRootNested { pair, .. }
+		| PairOverlap::RemoteRootContains { pair, .. } => *pair,
+	}
+}
+
+/// The label of the registered pair `pair`, or its id should it not be found.
+async fn other_pair_label(engine: &SyncEngine, client: &Client, pair: PairId) -> String {
+	let record = match engine.list_pairs().await {
+		Ok(pairs) => pairs.into_iter().find(|record| record.id == pair),
+		Err(e) => {
+			log::warn!("Failed to list the sync pairs: {e}");
+			None
+		}
+	};
+	match record {
+		Some(record) => pair_labels(client, slice::from_ref(&record))
+			.await
+			.remove(&pair)
+			.unwrap_or_else(|| fallback_label(&record)),
+		None => format!("with the id {pair}"),
+	}
+}
+
+/// Why the pair `local` <> `remote` cannot be registered, as `overlap` says, naming the
+/// registered pair `other` it overlaps.
+fn overlap_message(
+	local: &Path,
+	remote: &RemotePath,
+	overlap: &PairOverlap,
+	other: &str,
+) -> String {
+	let relation = match overlap {
+		PairOverlap::LocalRootInUse { .. } => "its local folder is already synced by",
+		PairOverlap::LocalRootNested { .. } => "its local folder is inside the local folder of",
+		PairOverlap::LocalRootContains { .. } => "its local folder contains the local folder of",
+		PairOverlap::RemoteRootInUse { .. } => "its remote folder is already synced by",
+		PairOverlap::RemoteRootNested { .. } => "its remote folder is inside the remote folder of",
+		PairOverlap::RemoteRootContains { .. } => "its remote folder contains the remote folder of",
+	};
+	format!(
+		"Cannot set up the sync pair {} <> {remote}: {relation} the sync pair {other}, and sync \
+		 pairs may not overlap. A sync pair stays registered after the run that set it up.",
+		local.display()
+	)
 }
 
 /// The records of the pairs `pair_ids` names, in that order, out of every pair `registered`
@@ -276,7 +338,12 @@ fn label(pair: &PairRecord, remote: &(impl Display + ?Sized)) -> String {
 mod tests {
 	use filen_sdk_rs::sync_engine::{DeleteGuard, PairRecord, SyncMode};
 
-	use super::{fallback_label, records_of};
+	use std::path::Path;
+
+	use filen_sdk_rs::sync_engine::PairOverlap;
+
+	use super::{fallback_label, overlap_message, records_of};
+	use crate::util::RemotePath;
 
 	fn record(id: i64) -> PairRecord {
 		PairRecord {
@@ -316,6 +383,27 @@ mod tests {
 		assert_eq!(
 			fallback_label(&pair),
 			"/local/7 <(localBackup)> 00000000-0000-0000-0000-000000001234"
+		);
+	}
+
+	/// A pair that overlaps a registered one names both, and what the overlap is.
+	#[test]
+	fn an_overlapping_pair_names_both_pairs() {
+		let overlap = PairOverlap::LocalRootNested {
+			pair: 3,
+			existing: "/home/me".to_string(),
+		};
+
+		assert_eq!(
+			overlap_message(
+				Path::new("/home/me/docs"),
+				&RemotePath::new("/docs"),
+				&overlap,
+				"/home/me <(twoWay)> /backup",
+			),
+			"Cannot set up the sync pair /home/me/docs <> /docs: its local folder is inside the \
+			 local folder of the sync pair /home/me <(twoWay)> /backup, and sync pairs may not \
+			 overlap. A sync pair stays registered after the run that set it up."
 		);
 	}
 
