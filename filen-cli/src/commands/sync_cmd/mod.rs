@@ -286,36 +286,37 @@ pub(crate) async fn sync(
 				// resolve conflicts
 				if let SyncEvent::Conflict { ref rel_path } = event {
 					if is_first_pass && let Some(resolution) = conflict_resolutions.for_path(rel_path) {
-						let resolved = engine
-							.resolve_conflict(pair_id, rel_path, resolution)
-							.await
-							.with_context(|| {
-								format!(
-									"Failed to resolve conflict for {rel_path} in sync pair {}",
-									pair_friendly_name
-								)
-							})?;
-						print_event(&format!(
-							"{} Conflict resolved for {rel_path}, {}",
-							approved_tag,
-							match resolution {
-								ConflictResolution::KeepLocal => "kept local version",
-								ConflictResolution::KeepRemote => "kept remote version",
-								ConflictResolution::KeepBoth => "kept both versions",
+						match engine.resolve_conflict(pair_id, rel_path, resolution).await {
+							Ok(resolved) => {
+								print_event(&format!(
+									"{} Conflict resolved for {rel_path}, {}",
+									approved_tag,
+									match resolution {
+										ConflictResolution::KeepLocal => "kept local version",
+										ConflictResolution::KeepRemote => "kept remote version",
+										ConflictResolution::KeepBoth => "kept both versions",
+									}
+								));
+								if let Some(kept_as) = resolved.kept_as {
+									print_event(&format!(
+										"{} Conflict resolved for {rel_path}, local copy kept as {kept_as}",
+										approved_tag
+									));
+								}
+								if let Some(trashed_path) = resolved.quarantined {
+									print_event(&format!(
+										"{} Conflict resolved for {rel_path}, moved aside to {}",
+										approved_tag,
+										trashed_path.display()
+									));
+								}
 							}
-						));
-						if let Some(kept_as) = resolved.kept_as {
-							print_event(&format!(
-								"{} Conflict resolved for {rel_path}, local copy kept as {kept_as}",
-								approved_tag
-							));
-						}
-						if let Some(trashed_path) = resolved.quarantined {
-							print_event(&format!(
-								"{} Conflict resolved for {rel_path}, moved aside to {}",
-								approved_tag,
-								trashed_path.display()
-							));
+							// Reported, and the sync carries on: returning the error would end the sync
+							// without stopping its watches.
+							Err(e) => ui.print_failure(&format!(
+								"Failed to resolve the conflict for {rel_path} in the sync pair \
+								 {pair_friendly_name}: {e}"
+							)),
 						}
 					} else {
 						print_event(&format!(
