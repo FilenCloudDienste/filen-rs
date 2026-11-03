@@ -19,11 +19,12 @@
 //! 130. An invalid command line exits with 2.
 //!
 //! `sync` says which sync pairs it starts on, then prints a line for each thing a pass does, with
-//! the time and the sync pair; failures go to stderr. With `--quiet`, it prints only failures, what
-//! needs attention or was settled, and what each pass did. Every line also goes to the log files
-//! (unless `--no-log-file` is given), so a sync nobody watches leaves a record. When stderr is a
-//! terminal, a line at its bottom shows what the running transfers have moved, redrawn in place;
-//! `--quiet` leaves it out.
+//! the time and the sync pair; failures go to stderr. A path that fails the same way again on a
+//! later pass is not named again: that pass's summary counts it. With `--quiet`, it prints only
+//! failures, what needs attention or was settled, and what each pass did. Every line also goes to
+//! the log files (unless `--no-log-file` is given), so a sync nobody watches leaves a record. When
+//! stderr is a terminal, a line at its bottom shows what the running transfers have moved, redrawn
+//! in place; `--quiet` leaves it out.
 //!
 //! With `--json`, `sync` prints one JSON object per line for each event instead, such as
 //! `{"pair":1,"label":"...","event":"uploaded","path":"a.txt"}`. A transfer's `progress` comes at
@@ -110,6 +111,7 @@ use crate::{
 };
 
 mod conflict_resolutions;
+mod failures;
 mod ignore_file;
 mod json_events;
 mod once;
@@ -119,6 +121,7 @@ mod sync_pairs;
 mod transfers;
 
 use conflict_resolutions::ConflictResolutions;
+use failures::Failures;
 use outcome::{LastPasses, problems_summary};
 use status_line::{StatusLine, Throttle};
 use sync_pairs::SyncDirs;
@@ -433,6 +436,8 @@ struct EventLog<'a> {
 	passed: HashSet<PairId>,
 	/// What the running transfers have moved, for the status line.
 	transfers: Transfers,
+	/// The failures printed, so that one that comes back on every pass is printed once.
+	failures: Failures,
 	output: Output,
 }
 
@@ -527,6 +532,7 @@ impl<'a> EventLog<'a> {
 			settle,
 			passed: HashSet::new(),
 			transfers: Transfers::default(),
+			failures: Failures::default(),
 			output,
 		}
 	}
@@ -596,8 +602,19 @@ impl<'a> EventLog<'a> {
 				));
 			}
 		}
+		let repeat = self.failures.is_repeat(pair, event);
 		match format_sync_event(event) {
-			Some(line) => self.print_line(ui, pair, line_kind(event), &line),
+			// in the log files, which keep every pass, but not printed again
+			Some(line) if repeat => info!("[{label}] {}", console::strip_ansi_codes(&line)),
+			Some(line) => {
+				let line = match (event, self.failures.repeated(pair)) {
+					(SyncEvent::PassCompleted { .. }, repeated @ 1..) => {
+						with_repeated_failures(&line, repeated)
+					}
+					_ => line,
+				};
+				self.print_line(ui, pair, line_kind(event), &line);
+			}
 			// a transfer's progress shows on the status line
 			None => self.tick(now),
 		}
@@ -746,6 +763,11 @@ impl<'a> EventLog<'a> {
 			status.clear();
 		}
 	}
+}
+
+/// `summary`, a pass's, saying that `repeated` of its failures were left out.
+fn with_repeated_failures(summary: &str, repeated: usize) -> String {
+	format!("{summary} ({repeated} not printed again, as an earlier pass failed the same way)")
 }
 
 fn approved_deletions_line(count: usize) -> String {
@@ -1137,6 +1159,47 @@ mod tests {
 				"[L]: Sync pass completed: 0 uploaded, 0 downloaded, 0 remote / 0 local dir(s) \
 				 created, 0 trashed remotely, 0 deleted locally, 0 moved remotely, 0 moved locally, \
 				 0 conflict(s), 0 error(s)",
+			]
+		);
+		assert_eq!(err, ["[L]: Failed to sync b: denied"]);
+	}
+
+	/// A path that fails the same way on the next pass is not named again, but counted.
+	#[test]
+	fn a_failure_that_comes_back_is_printed_once_and_counted() {
+		let failed = || SyncEvent::ActionFailed {
+			rel_path: "b".to_string(),
+			error: "denied".to_string(),
+		};
+		let pass = || {
+			[
+				SyncEvent::PassStarted {
+					mode: SyncMode::TwoWay,
+				},
+				failed(),
+				SyncEvent::PassCompleted {
+					report: SyncReport::default(),
+				},
+			]
+		};
+		let (out, err) = printed(
+			Output::Text {
+				quiet: false,
+				status: None,
+			},
+			&[pass(), pass()].concat(),
+		);
+
+		let summary = "[L]: Sync pass completed: 0 uploaded, 0 downloaded, 0 remote / 0 local dir(s) \
+			 created, 0 trashed remotely, 0 deleted locally, 0 moved remotely, 0 moved locally, 0 \
+			 conflict(s), 0 error(s)";
+		assert_eq!(
+			out,
+			[
+				"[L]: Sync pass started".to_owned(),
+				summary.to_owned(),
+				"[L]: Sync pass started".to_owned(),
+				format!("{summary} (1 not printed again, as an earlier pass failed the same way)"),
 			]
 		);
 		assert_eq!(err, ["[L]: Failed to sync b: denied"]);
