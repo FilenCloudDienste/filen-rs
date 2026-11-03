@@ -4,9 +4,9 @@
 //! it, and what you later add to it is shared too. Someone who is not a contact yet needs a
 //! contact request first (`contact-request <email>`).
 //!
-//! `shared-by-me` lists what you shared, each with whom it is shared. `unshare <path> [email]`
-//! stops sharing a file or directory with that contact, or with everyone it is shared with when no
-//! email is given.
+//! `shared-by-me` lists what you shared, by its path in your drive, each with whom it is shared.
+//! `unshare <path> [email]` stops sharing a file or directory with that contact, or with everyone
+//! it is shared with when no email is given.
 //!
 //! `shared-with-me` lists what others shared with you, each with who shared it. Given a path, it
 //! lists the directory at that path instead, or shows the file there: the path starts with the
@@ -28,17 +28,18 @@ use filen_sdk_rs::{
 	connect::fs::{SharedDirectory, SharedRootFile, SharingRole},
 	fs::{
 		HasName as _, HasUUID as _,
-		categories::{DirType, NonRootFileType, Normal, RootItemType, Shared},
+		categories::{DirType, NonRootFileType, NonRootItemType, Normal, RootItemType, Shared},
 	},
 	io::{AnonymousRemoteFile, HasFileInfo as _},
 };
 use filen_types::fs::Uuid;
+use futures::{StreamExt as _, stream};
 use serde_json::json;
 
 use crate::{
 	CommandResult,
 	auth::LazyClient,
-	commands::{CommandContext, contacts_cmds::find_entry},
+	commands::{CommandContext, contacts_cmds::find_entry, public_links_cmds::resolve_item_path},
 	completion::FilenCompleter,
 	docs::DocElement,
 	ui::{self, UI},
@@ -234,38 +235,99 @@ fn group_by_item(shares: &[OutShare]) -> Vec<SharedItem<'_>> {
 	items
 }
 
-fn shared_item_line(item: &SharedItem<'_>) -> String {
-	let slash = if item.is_dir { "/" } else { "" };
+/// How many shared items `shared-by-me` resolves the drive path of at once.
+const PATH_CONCURRENCY: usize = 8;
+
+/// A shared item with its path in this account's drive.
+struct ListedSharedItem<'a> {
+	item: SharedItem<'a>,
+	/// The absolute path, or `None` when it could not be resolved.
+	path: Option<String>,
+}
+
+impl ListedSharedItem<'_> {
+	/// How the plain listing names the item: its path, with a slash after a directory's, or its
+	/// name (its uuid when the name could not be decrypted) when the path could not be resolved.
+	fn shown_name(&self) -> String {
+		match &self.path {
+			Some(path) if self.item.is_dir => format!("{path}/"),
+			Some(path) => path.clone(),
+			None => display_name(self.item.name, self.item.uuid),
+		}
+	}
+}
+
+/// The absolute drive path of the item this account shared, or `None` when the item or its path
+/// could not be fetched, so that one unresolvable item does not fail the whole listing. The shared
+/// item carries no parent, so the drive's own copy is fetched first.
+async fn drive_path(client: &Client, item: &SharedItem<'_>) -> Option<String> {
+	let fetched = if item.is_dir {
+		client
+			.get_dir(item.uuid)
+			.await
+			.map(|dir| NonRootItemType::Dir(Cow::Owned(dir)))
+	} else {
+		client
+			.get_file(item.uuid)
+			.await
+			.map(|file| NonRootItemType::File(Cow::Owned(file)))
+	};
+	let path = match fetched {
+		Ok(fetched) => resolve_item_path(client, &fetched).await,
+		Err(e) => Err(e),
+	};
+	path.inspect_err(|e| log::warn!("Failed to resolve path of shared item {}: {}", item.uuid, e))
+		.ok()
+}
+
+fn shared_item_line(listed: &ListedSharedItem<'_>) -> String {
 	format!(
-		"{}{slash}  shared with {}",
-		display_name(item.name, item.uuid),
-		item.receivers.join(", ")
+		"{}  shared with {}",
+		listed.shown_name(),
+		listed.item.receivers.join(", ")
 	)
+}
+
+fn shared_item_json(listed: &ListedSharedItem<'_>) -> serde_json::Value {
+	let item = &listed.item;
+	json!({
+		"uuid": item.uuid.to_string(),
+		"name": item.name,
+		"path": listed.path,
+		"type": if item.is_dir { "dir" } else { "file" },
+		"receivers": item.receivers,
+	})
 }
 
 async fn print_shared_by_me(ui: &mut UI, client: &mut LazyClient) -> Result<()> {
 	let client = client.get(ui).await?;
 	let shares = list_out_shares(client).await?;
 	let items = group_by_item(&shares);
+	let mut listed = if items.is_empty() {
+		Vec::new()
+	} else {
+		// resolving a path walks up the tree under the drive lock, which `get_item_path` takes for
+		// each walk, so the listing waits for a lock another client holds either way; holding one
+		// here keeps it between walks instead of releasing and re-acquiring it
+		let _lock = client.lock_drive().await.context("Failed to lock drive")?;
+		stream::iter(items.into_iter().map(|item| async move {
+			let path = drive_path(client, &item).await;
+			ListedSharedItem { item, path }
+		}))
+		.buffered(PATH_CONCURRENCY)
+		.collect::<Vec<_>>()
+		.await
+	};
+	listed.sort_by_cached_key(ListedSharedItem::shown_name);
 	if ui.json {
 		return ui.print_json(serde_json::Value::Array(
-			items
-				.iter()
-				.map(|item| {
-					json!({
-						"uuid": item.uuid.to_string(),
-						"name": item.name,
-						"type": if item.is_dir { "dir" } else { "file" },
-						"receivers": item.receivers,
-					})
-				})
-				.collect(),
+			listed.iter().map(shared_item_json).collect(),
 		));
 	}
-	if items.is_empty() {
+	if listed.is_empty() {
 		ui.print_muted("You have not shared anything");
 	}
-	for item in &items {
+	for item in &listed {
 		ui.print(&shared_item_line(item));
 	}
 	Ok(())
@@ -737,17 +799,79 @@ mod tests {
 		assert_eq!(display_name(Some("a"), uuid), "a");
 	}
 
+	fn listed_photos() -> ListedSharedItem<'static> {
+		ListedSharedItem {
+			item: SharedItem {
+				uuid: Uuid::from_u128(1),
+				name: Some("Photos"),
+				is_dir: true,
+				receivers: vec![ALICE, BOB],
+			},
+			path: Some("/media/Photos".to_owned()),
+		}
+	}
+
+	fn unresolved(name: Option<&'static str>, is_dir: bool) -> ListedSharedItem<'static> {
+		ListedSharedItem {
+			item: SharedItem {
+				uuid: Uuid::from_u128(2),
+				name,
+				is_dir,
+				receivers: vec![ALICE],
+			},
+			path: None,
+		}
+	}
+
 	#[test]
-	fn a_shared_by_me_line_names_every_receiver() {
-		let item = SharedItem {
-			uuid: Uuid::from_u128(1),
-			name: Some("Photos"),
-			is_dir: true,
-			receivers: vec![ALICE, BOB],
-		};
+	fn a_shared_by_me_line_shows_the_drive_path_and_every_receiver() {
 		assert_eq!(
-			shared_item_line(&item),
-			"Photos/  shared with alice@example.com, bob@example.com"
+			shared_item_line(&listed_photos()),
+			"/media/Photos/  shared with alice@example.com, bob@example.com"
+		);
+	}
+
+	#[test]
+	fn shared_by_me_json_has_the_name_and_the_drive_path() {
+		assert_eq!(
+			shared_item_json(&listed_photos()),
+			json!({
+				"uuid": Uuid::from_u128(1).to_string(),
+				"name": "Photos",
+				"path": "/media/Photos",
+				"type": "dir",
+				"receivers": [ALICE, BOB],
+			})
+		);
+	}
+
+	#[test]
+	fn a_shared_by_me_line_without_a_path_shows_the_name() {
+		assert_eq!(
+			shared_item_line(&unresolved(Some("Photos"), true)),
+			"Photos  shared with alice@example.com"
+		);
+	}
+
+	#[test]
+	fn a_shared_by_me_line_without_a_path_or_name_shows_the_uuid() {
+		assert_eq!(
+			shared_item_line(&unresolved(None, true)),
+			format!("{}  shared with alice@example.com", Uuid::from_u128(2))
+		);
+	}
+
+	#[test]
+	fn shared_by_me_json_has_a_null_path_when_it_could_not_be_resolved() {
+		assert_eq!(
+			shared_item_json(&unresolved(Some("notes.txt"), false)),
+			json!({
+				"uuid": Uuid::from_u128(2).to_string(),
+				"name": "notes.txt",
+				"path": null,
+				"type": "file",
+				"receivers": [ALICE],
+			})
 		);
 	}
 

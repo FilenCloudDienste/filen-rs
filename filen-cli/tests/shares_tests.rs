@@ -196,13 +196,15 @@ async fn share_list_and_unshare_a_file_and_a_directory() {
 			let by_me = json_of(&authenticated_cli_with_args!("shared-by-me", "--json").success());
 			let listed_file = listed(&by_me, file.uuid()).expect("the shared file is listed");
 			assert_eq!(listed_file["name"], file_name);
+			assert_eq!(listed_file["path"], file_path);
 			assert_eq!(listed_file["type"], "file");
 			assert_eq!(listed_file["receivers"], serde_json::json!([share_email]));
 			let listed_dir = listed(&by_me, dir.uuid()).expect("the shared directory is listed");
 			assert_eq!(listed_dir["type"], "dir");
+			assert_eq!(listed_dir["path"], dir_path);
 			let plain = stdout_of(&authenticated_cli_with_args!("shared-by-me").success());
 			assert!(
-				plain.contains(&format!("{dir_name}/  shared with {share_email}")),
+				plain.contains(&format!("{dir_path}/  shared with {share_email}")),
 				"{plain}"
 			);
 
