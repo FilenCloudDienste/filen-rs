@@ -88,6 +88,43 @@ const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// [`ClientConfig::with_read_timeout`] (or `None` to disable) if your largest listings are slower.
 const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// How long a connection may sit idle before TCP probes whether its peer is still there. A
+/// request waiting on a slow server is idle too, but the server's kernel answers the probes
+/// however long the server takes to respond, so only a peer that is gone (a firewall dropping
+/// the packets instead of resetting, a NAT that forgot the mapping, a dead Wi-Fi) fails them.
+/// Without probes such a request waits out the whole read timeout.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+const TCP_KEEPALIVE_IDLE: Duration = Duration::from_secs(10);
+/// The pause between two unanswered keepalive probes.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
+/// How many unanswered probes close the connection. Windows always sends ten and lets nobody
+/// change it.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+const TCP_KEEPALIVE_RETRIES: u32 = 3;
+/// How long sent data may go unacknowledged before Linux and Android close the connection: what
+/// catches a peer that vanished mid-upload, where keepalive probes never start because the
+/// connection is not idle.
+#[cfg(any(target_os = "android", target_os = "linux"))]
+const TCP_USER_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a pooled connection is kept unused. Well below the idle timeouts servers and NATs
+/// commonly apply, so a request rarely goes out on a connection the other side already dropped,
+/// and an idle connection sends only a couple of probes before it is closed.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The longest a dead peer goes unnoticed on an idle connection: the wait before the first
+/// probe, then one interval per unanswered probe.
+#[cfg(all(test, not(all(target_family = "wasm", target_os = "unknown"))))]
+fn dead_peer_detection() -> Duration {
+	let probes = if cfg!(target_os = "windows") {
+		10
+	} else {
+		TCP_KEEPALIVE_RETRIES
+	};
+	TCP_KEEPALIVE_IDLE + TCP_KEEPALIVE_INTERVAL * probes
+}
+
 /// Default batch window ([`ClientConfig::with_batch_window`]). The first call of a burst goes out
 /// at once, so a lone call pays nothing for it; only the calls joining a window wait, up to about
 /// 6 ms with a 1 ms timer.
@@ -247,16 +284,26 @@ impl ClientConfig {
 		self
 	}
 
-	/// Build the [`reqwest::Client`] backing every request, applying the connect/read timeouts.
+	/// Build the [`reqwest::Client`] backing every request, applying the connect/read timeouts
+	/// and the dead-peer detection (TCP keepalive, see [`TCP_KEEPALIVE_IDLE`]), which leaves the
+	/// read timeout to slow servers alone.
 	/// On the desktop targets it also builds the websocket's transport, which shares the
 	/// client's TLS configuration (see [`crate::platform_net`]).
 	///
-	/// On wasm the timeouts are ignored — reqwest's fetch-based client exposes no
-	/// connect/read-timeout knobs; the browser governs those instead.
+	/// On wasm the timeouts and the keepalive are not set — reqwest's fetch-based client exposes
+	/// no socket knobs; the browser governs those instead.
 	pub(crate) fn build_http(&self) -> Result<HttpClients, Error> {
 		#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 		{
-			let mut builder = reqwest::Client::builder();
+			let mut builder = reqwest::Client::builder()
+				.tcp_keepalive(TCP_KEEPALIVE_IDLE)
+				.tcp_keepalive_interval(TCP_KEEPALIVE_INTERVAL)
+				.tcp_keepalive_retries(TCP_KEEPALIVE_RETRIES)
+				.pool_idle_timeout(POOL_IDLE_TIMEOUT);
+			#[cfg(any(target_os = "android", target_os = "linux"))]
+			{
+				builder = builder.tcp_user_timeout(TCP_USER_TIMEOUT);
+			}
 			if let Some(connect_timeout) = self.connect_timeout {
 				builder = builder.connect_timeout(connect_timeout);
 			}

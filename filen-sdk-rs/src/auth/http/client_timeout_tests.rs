@@ -27,6 +27,15 @@ fn default_config_enables_both_timeouts_and_builds() {
 		.expect("the default-configured client must build");
 }
 
+/// A peer that vanished from a pooled connection is noticed within tens of seconds on every
+/// platform, Windows' fixed ten probes included, long before the read timeout would end the
+/// request; the read timeout itself stays as long as the slowest listings need.
+#[test]
+fn a_dead_peer_is_detected_long_before_the_read_timeout() {
+	assert!(super::dead_peer_detection() <= Duration::from_secs(60));
+	assert_eq!(DEFAULT_READ_TIMEOUT, Duration::from_secs(300));
+}
+
 /// A connected-but-silent host — the residual hang the 404/retry fixes could not cover, since
 /// there is no HTTP status to classify — is aborted by the read timeout instead of hanging.
 #[tokio::test]
