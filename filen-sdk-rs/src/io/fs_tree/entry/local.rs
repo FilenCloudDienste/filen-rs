@@ -127,12 +127,118 @@ mod compare_strategy_tests {
 
 #[cfg(all(test, unix))]
 mod tests {
-	use std::{process::Command, sync::atomic::AtomicBool};
+	use std::{
+		os::unix::fs::symlink,
+		path::{Path, PathBuf},
+		process::Command,
+		sync::atomic::AtomicBool,
+	};
 
 	use crate::{
-		ErrorKind,
-		io::fs_tree::{WalkError, build_fs_tree_from_walkdir_iterator},
+		Error, ErrorKind,
+		io::{
+			SymlinkPolicy,
+			fs_tree::{WalkError, build_fs_tree_from_walkdir_iterator},
+		},
 	};
+
+	/// What walking `root` under `symlinks` found: the names in the tree (sorted), the stats, the
+	/// errors and the skipped symlinks.
+	struct Walked {
+		names: Vec<String>,
+		stats: (u64, u64, u64),
+		errors: Vec<Error>,
+		skipped: Vec<PathBuf>,
+	}
+
+	fn walk(root: &Path, symlinks: SymlinkPolicy) -> Walked {
+		let mut errors = Vec::new();
+		let mut skipped = Vec::new();
+		let (tree, stats) = build_fs_tree_from_walkdir_iterator(
+			root,
+			symlinks,
+			&mut |errs| errors.extend(errs),
+			&mut |_, _, _| {},
+			&mut |path| skipped.push(path),
+			&AtomicBool::new(false),
+		)
+		.expect("the walk should succeed");
+		let mut names = tree
+			.dfs_iter()
+			.map(|(entry, _)| tree.get_name(entry).to_owned())
+			.collect::<Vec<_>>();
+		names.sort();
+		skipped.sort();
+		Walked {
+			names,
+			stats: stats.snapshot(),
+			errors,
+			skipped,
+		}
+	}
+
+	/// A directory holding `a.txt` (1 byte), `d/inner.txt` (2 bytes), and the symlinks
+	/// `link-file` -> `a.txt` and `link-dir` -> `d`.
+	fn tree_with_symlinks() -> tempfile::TempDir {
+		let dir = tempfile::tempdir().unwrap();
+		std::fs::write(dir.path().join("a.txt"), b"a").unwrap();
+		std::fs::create_dir(dir.path().join("d")).unwrap();
+		std::fs::write(dir.path().join("d").join("inner.txt"), b"in").unwrap();
+		symlink(dir.path().join("a.txt"), dir.path().join("link-file")).unwrap();
+		symlink(dir.path().join("d"), dir.path().join("link-dir")).unwrap();
+		dir
+	}
+
+	#[test]
+	fn a_followed_walk_takes_in_what_symlinks_point_to() {
+		let dir = tree_with_symlinks();
+		let walked = walk(dir.path(), SymlinkPolicy::Follow);
+		assert_eq!(
+			walked.names,
+			[
+				"a.txt",
+				"d",
+				"inner.txt",
+				"inner.txt",
+				"link-dir",
+				"link-file"
+			]
+		);
+		assert_eq!(walked.stats, (2, 4, 6));
+		assert!(walked.errors.is_empty(), "{:?}", walked.errors);
+		assert!(walked.skipped.is_empty());
+	}
+
+	#[test]
+	fn a_walk_skipping_symlinks_leaves_them_out_without_errors() {
+		let dir = tree_with_symlinks();
+		let walked = walk(dir.path(), SymlinkPolicy::Skip);
+		assert_eq!(walked.names, ["a.txt", "d", "inner.txt"]);
+		assert_eq!(walked.stats, (1, 2, 3));
+		assert!(walked.errors.is_empty(), "{:?}", walked.errors);
+		assert_eq!(
+			walked.skipped,
+			[dir.path().join("link-dir"), dir.path().join("link-file")]
+		);
+	}
+
+	#[test]
+	fn a_walk_skipping_symlinks_skips_a_dangling_one() {
+		let dir = tempfile::tempdir().unwrap();
+		symlink(dir.path().join("missing"), dir.path().join("dangling")).unwrap();
+		let walked = walk(dir.path(), SymlinkPolicy::Skip);
+		assert!(walked.names.is_empty());
+		assert!(walked.errors.is_empty(), "{:?}", walked.errors);
+		assert_eq!(walked.skipped, [dir.path().join("dangling")]);
+	}
+
+	#[test]
+	fn a_walk_skipping_symlinks_still_follows_a_symlinked_root() {
+		let dir = tree_with_symlinks();
+		let walked = walk(&dir.path().join("link-dir"), SymlinkPolicy::Skip);
+		assert_eq!(walked.names, ["inner.txt"]);
+		assert!(walked.skipped.is_empty());
+	}
 
 	#[test]
 	fn walk_reports_special_files_and_continues() {
@@ -148,8 +254,10 @@ mod tests {
 		let mut errors = Vec::new();
 		let (tree, stats) = build_fs_tree_from_walkdir_iterator(
 			dir.path(),
+			SymlinkPolicy::Follow,
 			&mut |errs| errors.extend(errs),
 			&mut |_, _, _| {},
+			&mut |path| panic!("no symlink is skipped when following: {}", path.display()),
 			&AtomicBool::new(false),
 		)
 		.expect("walk should survive special files");

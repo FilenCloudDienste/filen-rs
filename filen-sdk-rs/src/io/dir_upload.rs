@@ -47,6 +47,21 @@ pub trait DirUploadCallback: Send + Sync {
 		uploaded_bytes: u64,
 	);
 	fn on_upload_errors(&self, errors: Vec<(PathBuf, Error)>);
+	/// The symlinks the scan left out under [`SymlinkPolicy::Skip`], by their local paths. Called
+	/// once, before [`on_scan_complete`](Self::on_scan_complete), when there were any.
+	fn on_scan_skipped_symlinks(&self, paths: Vec<PathBuf>) {
+		let _ = paths;
+	}
+}
+
+/// What a directory upload does with the symlinks inside the directory. The directory itself is
+/// followed when it is a symlink.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SymlinkPolicy {
+	/// Upload what a link points to under the link's name, as if it were there.
+	Follow,
+	/// Leave links out, uploading neither them nor what they point to.
+	Skip,
 }
 
 // todo, accept &impl HasUuidContents instead of RemoteDirectory for target_folder

@@ -151,8 +151,10 @@ impl Client {
 		.await
 	}
 
+	/// Uploads the contents of the local directory `dir_path` into `target`, following the
+	/// symlinks inside it, as [`Self::upload_dir_recursively_with_symlinks`] does with
+	/// [`SymlinkPolicy::Follow`](super::SymlinkPolicy::Follow).
 	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-	#[tracing::instrument(name = "upload_dir_recursively", skip_all, fields(dir_path = %dir_path.display()))]
 	pub async fn upload_dir_recursively<C>(
 		self: Arc<Self>,
 		dir_path: PathBuf,
@@ -162,7 +164,31 @@ impl Client {
 	where
 		C: super::dir_upload::DirUploadCallback + ?Sized,
 	{
+		self.upload_dir_recursively_with_symlinks(
+			dir_path,
+			callback,
+			target,
+			super::SymlinkPolicy::Follow,
+		)
+		.await
+	}
+
+	/// Uploads the contents of the local directory `dir_path` into `target`, doing with the
+	/// symlinks inside it what `symlinks` says. `dir_path` itself is followed when it is a symlink.
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	#[tracing::instrument(name = "upload_dir_recursively", skip_all, fields(dir_path = %dir_path.display()))]
+	pub async fn upload_dir_recursively_with_symlinks<C>(
+		self: Arc<Self>,
+		dir_path: PathBuf,
+		callback: impl Deref<Target = C>,
+		target: &crate::fs::dir::RemoteDirectory,
+		symlinks: super::SymlinkPolicy,
+	) -> Result<(), Error>
+	where
+		C: super::dir_upload::DirUploadCallback + ?Sized,
+	{
 		let ref_callback = callback.deref();
+		let mut skipped_symlinks = Vec::new();
 
 		// A send fails only once this future has been dropped, which also sets the flag the scan
 		// stops on, so nobody is left waiting for the lost event.
@@ -170,11 +196,15 @@ impl Client {
 			move |events, cancelled| {
 				super::fs_tree::build_fs_tree_from_walkdir_iterator(
 					&dir_path,
+					symlinks,
 					&mut |errors| {
 						let _ = events.send(ScanEvent::Errors(errors));
 					},
 					&mut |dirs, files, bytes| {
 						let _ = events.send(ScanEvent::Progress { dirs, files, bytes });
+					},
+					&mut |path| {
+						let _ = events.send(ScanEvent::SkippedSymlink(path));
 					},
 					cancelled,
 				)
@@ -185,10 +215,14 @@ impl Client {
 					ref_callback.on_scan_progress(dirs, files, bytes);
 				}
 				ScanEvent::Errors(errors) => ref_callback.on_scan_errors(errors),
+				ScanEvent::SkippedSymlink(path) => skipped_symlinks.push(path),
 			},
 		)
 		.await?;
 
+		if !skipped_symlinks.is_empty() {
+			ref_callback.on_scan_skipped_symlinks(skipped_symlinks);
+		}
 		let (dirs, files, bytes) = stats.snapshot();
 		ref_callback.on_scan_complete(dirs, files, bytes);
 
@@ -359,8 +393,14 @@ impl Client {
 /// What a local scan running on a blocking thread reports back to the task awaiting it.
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 enum ScanEvent {
-	Progress { dirs: u64, files: u64, bytes: u64 },
+	Progress {
+		dirs: u64,
+		files: u64,
+		bytes: u64,
+	},
 	Errors(Vec<Error>),
+	/// A symlink the scan left out, by its local path.
+	SkippedSymlink(PathBuf),
 }
 
 /// Runs `scan` on a blocking thread and hands each event it sends to `on_event` on the awaiting
@@ -1414,6 +1454,7 @@ mod scan_off_task_tests {
 				seen.push(match event {
 					ScanEvent::Progress { dirs, files, bytes } => format!("{dirs}/{files}/{bytes}"),
 					ScanEvent::Errors(errors) => format!("{} error(s)", errors.len()),
+					ScanEvent::SkippedSymlink(path) => format!("skipped {}", path.display()),
 				});
 			},
 		)
