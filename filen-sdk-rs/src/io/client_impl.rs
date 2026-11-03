@@ -5,6 +5,7 @@ use std::{
 	io::{Read, Write},
 	ops::Deref,
 	path::{Path, PathBuf},
+	sync::atomic::AtomicBool,
 };
 
 use filen_types::crypto::Blake3Hash;
@@ -33,6 +34,7 @@ use crate::{
 		file::{FileBuilderOptionalName, chunk::Chunk},
 	},
 	io::{CanonicalPath, FilenMetaExt, meta_ext::FileTimesExt},
+	util::AtomicDropCanceller,
 };
 
 const IO_BUFFER_SIZE: usize = 1024 * 64; // 64 KiB
@@ -160,21 +162,32 @@ impl Client {
 	where
 		C: super::dir_upload::DirUploadCallback + ?Sized,
 	{
-		use crate::util::AtomicDropCanceller;
-
-		let drop_canceller = AtomicDropCanceller::default();
 		let ref_callback = callback.deref();
 
-		let (tree, stats) = super::fs_tree::build_fs_tree_from_walkdir_iterator(
-			&dir_path,
-			&mut |errors| {
-				ref_callback.on_scan_errors(errors);
+		// A send fails only once this future has been dropped, which also sets the flag the scan
+		// stops on, so nobody is left waiting for the lost event.
+		let (dir_path, tree, stats) = scan_off_task(
+			move |events, cancelled| {
+				super::fs_tree::build_fs_tree_from_walkdir_iterator(
+					&dir_path,
+					&mut |errors| {
+						let _ = events.send(ScanEvent::Errors(errors));
+					},
+					&mut |dirs, files, bytes| {
+						let _ = events.send(ScanEvent::Progress { dirs, files, bytes });
+					},
+					cancelled,
+				)
+				.map(|(tree, stats)| (dir_path, tree, stats))
 			},
-			&mut |dirs, files, bytes| {
-				ref_callback.on_scan_progress(dirs, files, bytes);
+			|event| match event {
+				ScanEvent::Progress { dirs, files, bytes } => {
+					ref_callback.on_scan_progress(dirs, files, bytes);
+				}
+				ScanEvent::Errors(errors) => ref_callback.on_scan_errors(errors),
 			},
-			drop_canceller.cancelled(),
-		)?;
+		)
+		.await?;
 
 		let (dirs, files, bytes) = stats.snapshot();
 		ref_callback.on_scan_complete(dirs, files, bytes);
@@ -341,6 +354,38 @@ impl Client {
 			.expect("a closed writer holds the uploaded file (should be impossible)");
 		Ok((uploaded, file))
 	}
+}
+
+/// What a local scan running on a blocking thread reports back to the task awaiting it.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+enum ScanEvent {
+	Progress { dirs: u64, files: u64, bytes: u64 },
+	Errors(Vec<Error>),
+}
+
+/// Runs `scan` on a blocking thread and hands each event it sends to `on_event` on the awaiting
+/// task, so that task stays free to notice a cancellation while a large tree is walked. Dropping
+/// the returned future sets the flag `scan` is given; a scan that checks it stops instead of
+/// walking on with nobody waiting for the result.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+async fn scan_off_task<T>(
+	scan: impl FnOnce(&tokio::sync::mpsc::UnboundedSender<ScanEvent>, &AtomicBool) -> Result<T, Error>
+	+ Send
+	+ 'static,
+	mut on_event: impl FnMut(ScanEvent),
+) -> Result<T, Error>
+where
+	T: Send + 'static,
+{
+	let drop_canceller = AtomicDropCanceller::default();
+	let cancelled = Arc::clone(drop_canceller.cancelled());
+	let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
+	let scan = tokio::task::spawn_blocking(move || scan(&events, &cancelled));
+	// The channel closes when `scan` returns and drops its sender.
+	while let Some(event) = received.recv().await {
+		on_event(event);
+	}
+	scan.await.map_err(std::io::Error::from)?
 }
 
 /// Reads `file`'s declared `size` bytes straight into `writer`'s chunks, one blocking task per
@@ -1307,5 +1352,85 @@ mod needs_download_tests {
 			None,
 			KeepLocalWhen::SameHashOrNotOlder
 		));
+	}
+}
+
+#[cfg(all(test, not(all(target_family = "wasm", target_os = "unknown"))))]
+mod scan_off_task_tests {
+	use std::{
+		sync::{atomic::Ordering, mpsc},
+		time::Duration,
+	};
+
+	use super::{ScanEvent, scan_off_task};
+	use crate::{Error, ErrorKind};
+
+	#[tokio::test]
+	async fn dropping_the_scan_future_stops_the_blocking_scan() {
+		let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+		let (stopped_tx, stopped_rx) = mpsc::channel();
+		let mut scan = Box::pin(scan_off_task(
+			move |_events, cancelled| {
+				started_tx.send(()).unwrap();
+				while !cancelled.load(Ordering::Relaxed) {
+					std::thread::yield_now();
+				}
+				stopped_tx.send(()).unwrap();
+				Err::<(), _>(Error::custom(ErrorKind::Cancelled, "cancelled"))
+			},
+			|_| {},
+		));
+		tokio::select! {
+			_ = &mut scan => panic!("the scan cannot finish before it is cancelled"),
+			started = started_rx => started.unwrap(),
+		}
+		drop(scan);
+		stopped_rx
+			.recv_timeout(Duration::from_secs(30))
+			.expect("the blocking scan kept running after its future was dropped");
+	}
+
+	#[tokio::test]
+	async fn the_scans_events_reach_the_awaiting_task_in_order() {
+		let mut seen = Vec::new();
+		let result = scan_off_task(
+			|events, _cancelled| {
+				events
+					.send(ScanEvent::Progress {
+						dirs: 1,
+						files: 2,
+						bytes: 3,
+					})
+					.unwrap();
+				events
+					.send(ScanEvent::Errors(vec![Error::custom(
+						ErrorKind::IO,
+						"unreadable",
+					)]))
+					.unwrap();
+				Ok(7)
+			},
+			|event| {
+				seen.push(match event {
+					ScanEvent::Progress { dirs, files, bytes } => format!("{dirs}/{files}/{bytes}"),
+					ScanEvent::Errors(errors) => format!("{} error(s)", errors.len()),
+				});
+			},
+		)
+		.await
+		.unwrap();
+		assert_eq!(result, 7);
+		assert_eq!(seen, ["1/2/3", "1 error(s)"]);
+	}
+
+	#[tokio::test]
+	async fn a_scan_error_is_returned() {
+		let err = scan_off_task(
+			|_events, _cancelled| Err::<(), _>(Error::custom(ErrorKind::IO, "unreadable root")),
+			|_| {},
+		)
+		.await
+		.unwrap_err();
+		assert_eq!(err.kind(), ErrorKind::IO);
 	}
 }
