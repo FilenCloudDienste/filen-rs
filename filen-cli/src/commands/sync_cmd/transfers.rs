@@ -1,7 +1,7 @@
-//! The file transfers of each pair's pass, as its events tell them: what is running, for the status
-//! line.
+//! The file transfers of each pair's pass, as its events tell them: what is running and how many
+//! bytes the pass has moved, for the status line and the JSON output.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, mem};
 
 use filen_sdk_rs::sync_engine::{PairId, SyncEvent, TransferDirection};
 
@@ -12,6 +12,12 @@ pub(super) struct Transfers(HashMap<PairId, PassTransfers>);
 impl Transfers {
 	pub(super) fn note(&mut self, pair: PairId, event: &SyncEvent) {
 		self.0.entry(pair).or_default().note(event);
+	}
+
+	/// The bytes the transfers of `pair`'s current or last pass going `direction` have moved,
+	/// finished or not.
+	pub(super) fn moved(&self, pair: PairId, direction: TransferDirection) -> u64 {
+		self.0.get(&pair).map_or(0, |pass| pass.moved(direction))
 	}
 
 	/// What the transfers going `direction` that are running now have moved, over every pair.
@@ -53,6 +59,7 @@ impl PassTransfers {
 				self.upload.in_flight.remove(rel_path);
 				self.download.in_flight.remove(rel_path);
 			}
+			// what the pass moved stays for its summary
 			SyncEvent::Interrupted { .. }
 			| SyncEvent::PassCompleted { .. }
 			| SyncEvent::PassFailed { .. } => {
@@ -83,6 +90,13 @@ impl PassTransfers {
 		}
 	}
 
+	fn moved(&self, direction: TransferDirection) -> u64 {
+		match direction {
+			TransferDirection::Upload => self.upload.moved,
+			TransferDirection::Download => self.download.moved,
+		}
+	}
+
 	fn running(&self, direction: TransferDirection) -> Running {
 		let direction = match direction {
 			TransferDirection::Upload => &self.upload,
@@ -105,16 +119,21 @@ impl PassTransfers {
 struct Direction {
 	/// The bytes each running transfer has moved, and the size of its file, by path.
 	in_flight: HashMap<String, (u64, u64)>,
+	/// The bytes the pass's transfers have moved, finished or not.
+	moved: u64,
 }
 
 impl Direction {
 	fn progress(&mut self, rel_path: &str, bytes: u64, total: u64) {
-		match self.in_flight.get_mut(rel_path) {
-			Some(transfer) => *transfer = (bytes, total),
+		let previous = match self.in_flight.get_mut(rel_path) {
+			Some(transfer) => mem::replace(transfer, (bytes, total)).0,
 			None => {
 				self.in_flight.insert(rel_path.to_owned(), (bytes, total));
+				0
 			}
-		}
+		};
+		// a transfer's bytes never go down, but the sum must not wrap on whatever it is told
+		self.moved = self.moved.saturating_add(bytes.saturating_sub(previous));
 	}
 }
 
@@ -140,7 +159,7 @@ impl Running {
 
 #[cfg(test)]
 mod tests {
-	use filen_sdk_rs::sync_engine::{SyncEvent, SyncReport, TransferDirection};
+	use filen_sdk_rs::sync_engine::{SyncEvent, SyncMode, SyncReport, TransferDirection};
 
 	use super::{Running, Transfers};
 
@@ -172,10 +191,11 @@ mod tests {
 			transfers.running(TransferDirection::Download),
 			Running::default()
 		);
+		assert_eq!(transfers.moved(1, TransferDirection::Upload), 40);
 	}
 
 	#[test]
-	fn a_finished_transfer_stops_running() {
+	fn a_finished_transfer_stops_running_and_stays_counted_for_the_pass() {
 		let mut transfers = Transfers::default();
 		transfers.note(1, &progress("a", TransferDirection::Download, 100));
 		transfers.note(
@@ -189,6 +209,7 @@ mod tests {
 			transfers.running(TransferDirection::Download),
 			Running::default()
 		);
+		assert_eq!(transfers.moved(1, TransferDirection::Download), 100);
 	}
 
 	#[test]
@@ -207,10 +228,11 @@ mod tests {
 			transfers.running(TransferDirection::Upload),
 			Running::default()
 		);
+		assert_eq!(transfers.moved(1, TransferDirection::Upload), 30);
 	}
 
 	#[test]
-	fn a_completed_pass_has_nothing_running() {
+	fn a_completed_pass_keeps_its_bytes_until_the_next_one_starts() {
 		let mut transfers = Transfers::default();
 		transfers.note(1, &progress("a", TransferDirection::Upload, 30));
 		transfers.note(
@@ -219,10 +241,27 @@ mod tests {
 				report: SyncReport::default(),
 			},
 		);
-
 		assert_eq!(
 			transfers.running(TransferDirection::Upload),
 			Running::default()
 		);
+		assert_eq!(transfers.moved(1, TransferDirection::Upload), 30);
+
+		transfers.note(
+			1,
+			&SyncEvent::PassStarted {
+				mode: SyncMode::TwoWay,
+			},
+		);
+		assert_eq!(transfers.moved(1, TransferDirection::Upload), 0);
+	}
+
+	#[test]
+	fn the_bytes_moved_saturate_rather_than_wrap() {
+		let mut transfers = Transfers::default();
+		transfers.note(1, &progress("a", TransferDirection::Upload, u64::MAX));
+		transfers.note(1, &progress("b", TransferDirection::Upload, 1));
+
+		assert_eq!(transfers.moved(1, TransferDirection::Upload), u64::MAX);
 	}
 }

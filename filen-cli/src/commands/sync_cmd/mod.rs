@@ -25,6 +25,18 @@
 //! terminal, a line at its bottom shows what the running transfers have moved, redrawn in place;
 //! `--quiet` leaves it out.
 //!
+//! With `--json`, `sync` prints one JSON object per line for each event instead, such as
+//! `{"pair":1,"label":"...","event":"uploaded","path":"a.txt"}`. A transfer's `progress` comes at
+//! most once a second for each sync pair, with the bytes the pass has moved each way so far
+//! (`pass_uploaded_bytes`, `pass_downloaded_bytes`), and `pass_completed` carries the pass's counts,
+//! its conflicts, errors and unsyncable paths, and the bytes it moved. `uploaded` and `downloaded`
+//! come once a file has landed; the other actions (`creating_remote_dir`, `trashing_remote`,
+//! `deleting_local`, `moving_remote` and so on) as they start. What the flags settle is an
+//! `approved` object with a `message`. There is no banner and no status line. A failed action, a
+//! failed pass and a refused pass are their objects on stdout, like every other event, and nothing
+//! of them goes to stderr; failures that are not an event's still go to stderr as text. `--json`
+//! takes precedence over `--quiet`: every event is printed.
+//!
 //! Sync pairs stay registered in the sync database under the config directory after the run that
 //! set them up. A run that cannot set up one of its sync pairs registers none of them. Only one
 //! `filen sync` can use that database at a time.
@@ -78,7 +90,7 @@ use std::{
 	collections::{HashMap, HashSet},
 	path::Path,
 	sync::Arc,
-	time::Instant,
+	time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
@@ -98,6 +110,7 @@ use crate::{
 
 mod conflict_resolutions;
 mod ignore_file;
+mod json_events;
 mod once;
 mod outcome;
 mod status_line;
@@ -106,7 +119,7 @@ mod transfers;
 
 use conflict_resolutions::ConflictResolutions;
 use outcome::{LastPasses, problems_summary};
-use status_line::StatusLine;
+use status_line::{StatusLine, Throttle};
 use sync_pairs::SyncDirs;
 use transfers::Transfers;
 
@@ -364,7 +377,7 @@ async fn sync_continuously(
 	if !stopped_by_ctrl_c {
 		return Err(UI::failure("Every watch of the sync pairs ended"));
 	}
-	ui.print_muted("Stopped.");
+	ui.print_muted_notice("Stopped.");
 	let outcomes = pairs
 		.iter()
 		.map(|pair| {
@@ -396,6 +409,9 @@ struct EventLog<'a> {
 	output: Output,
 }
 
+/// How often `--json` prints a transfer's progress at most, for each pair.
+const JSON_PROGRESS_INTERVAL: Duration = Duration::from_secs(1);
+
 /// How the events are shown.
 enum Output {
 	/// A line for each event. With `quiet`, only the lines that must be read: failures, what
@@ -405,17 +421,21 @@ enum Output {
 		quiet: bool,
 		status: Option<StatusLine>,
 	},
+	/// A JSON object on a line of its own for each event, and for each pair a transfer's progress
+	/// as often as its `progress` throttle lets through.
+	Json { progress: HashMap<PairId, Throttle> },
 }
 
 impl Output {
 	/// The output `ui`'s flags ask for.
 	fn of(ui: &UI) -> Self {
+		if ui.json {
+			return Self::Json {
+				progress: HashMap::new(),
+			};
+		}
 		let quiet = ui.is_quiet();
-		let status = if quiet || ui.json {
-			None
-		} else {
-			StatusLine::on_stderr()
-		};
+		let status = if quiet { None } else { StatusLine::on_stderr() };
 		Self::Text { quiet, status }
 	}
 }
@@ -506,8 +526,7 @@ impl<'a> EventLog<'a> {
 		let until = if once { "once" } else { "Ctrl-C to stop" };
 		let banner = format!("Syncing {} ({until})", self.label(pair));
 		info!("{banner}");
-		let Output::Text { quiet, .. } = &self.output;
-		if !quiet {
+		if let Output::Text { quiet: false, .. } = self.output {
 			ui.print(&banner);
 		}
 	}
@@ -520,11 +539,40 @@ impl<'a> EventLog<'a> {
 		pair: PairId,
 		event: &'e SyncEvent,
 	) -> Option<Settlement<'e>> {
+		self.print_at(ui, pair, event, Instant::now())
+	}
+
+	/// [`EventLog::print`], at `now`.
+	fn print_at<'e>(
+		&mut self,
+		ui: &mut UI,
+		pair: PairId,
+		event: &'e SyncEvent,
+		now: Instant,
+	) -> Option<Settlement<'e>> {
 		self.transfers.note(pair, event);
+		let label = self.label(pair);
+		if let Output::Json { progress } = &mut self.output {
+			let due = match event {
+				SyncEvent::Progress { .. } => progress
+					.entry(pair)
+					.or_insert_with(|| Throttle::new(JSON_PROGRESS_INTERVAL))
+					.due(now),
+				_ => true,
+			};
+			if due {
+				ui.print(&json_events::event_line(
+					pair,
+					&label,
+					event,
+					&self.transfers,
+				));
+			}
+		}
 		match format_sync_event(event) {
 			Some(line) => self.print_line(ui, pair, line_kind(event), &line),
 			// a transfer's progress shows on the status line
-			None => self.tick(Instant::now()),
+			None => self.tick(now),
 		}
 		if let SyncEvent::PassCompleted { .. } | SyncEvent::PassFailed { .. } = event {
 			self.passed.insert(pair);
@@ -582,7 +630,10 @@ impl<'a> EventLog<'a> {
 	fn print_line(&mut self, ui: &mut UI, pair: PairId, kind: LineKind, msg: &str) {
 		let label = self.label(pair);
 		info!("[{label}] {}", console::strip_ansi_codes(msg));
-		let Output::Text { quiet, status } = &mut self.output;
+		// with `--json`, the event's object was printed instead
+		let Output::Text { quiet, status } = &mut self.output else {
+			return;
+		};
 		if *quiet && kind == LineKind::Detail {
 			return;
 		}
@@ -618,6 +669,9 @@ impl<'a> EventLog<'a> {
 	}
 
 	fn print_approved(&mut self, ui: &mut UI, pair: PairId, msg: &str) {
+		if let Output::Json { .. } = self.output {
+			ui.print(&json_events::approved_line(pair, &self.label(pair), msg));
+		}
 		self.print_line(
 			ui,
 			pair,
@@ -820,7 +874,11 @@ fn format_sync_event(event: &SyncEvent) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-	use std::{collections::HashMap, path::Path};
+	use std::{
+		collections::HashMap,
+		path::Path,
+		time::{Duration, Instant},
+	};
 
 	use filen_sdk_rs::{
 		Error, ErrorKind,
@@ -829,13 +887,13 @@ mod tests {
 			UnsyncableReason,
 		},
 	};
+	use serde_json::{Value, json};
 
 	use super::{
 		ConflictResolutions, EventLog, Output, Settle, SyncCommands, SyncEvent, format_sync_event,
 		given_pairs, open_failure, unsyncable_notices,
 	};
-	use crate::ui::test_support::Printed;
-	use crate::{commands::Commands, parse_repl_line};
+	use crate::{commands::Commands, parse_repl_line, ui::test_support::Printed};
 
 	/// The pairs the REPL line `line`, a `sync` command, gives.
 	fn pairs_of(line: &str) -> Vec<String> {
@@ -1078,6 +1136,121 @@ mod tests {
 			]
 		);
 		assert_eq!(err, ["[L]: Failed to sync b: denied"]);
+	}
+
+	/// With `--json`, each event is a line of JSON, a transfer's progress at most once a second for
+	/// each pair, and what needs attention is left to the events' objects.
+	#[test]
+	fn json_prints_an_object_for_each_event_and_throttles_progress() {
+		let out = Printed::default();
+		let err = Printed::default();
+		let mut ui = Printed::split_ui(&out, &err);
+		let labels = HashMap::from([(1, "L".to_string())]);
+		let settle = Settle {
+			approve_mass_deletions: false,
+			conflict_resolutions: ConflictResolutions::new(vec![], vec![], vec![]).unwrap(),
+		};
+		let mut log = EventLog::new(
+			&labels,
+			&settle,
+			Output::Json {
+				progress: HashMap::new(),
+			},
+		);
+		let progress = |bytes| SyncEvent::Progress {
+			rel_path: "a".to_string(),
+			direction: TransferDirection::Upload,
+			bytes,
+			total: 10,
+		};
+		let start = Instant::now();
+		for (event, at) in [
+			(
+				SyncEvent::Conflict {
+					rel_path: "c".to_string(),
+				},
+				0,
+			),
+			(progress(1), 0),
+			(progress(2), 999),
+			(progress(3), 1000),
+		] {
+			let _ = log.print_at(&mut ui, 1, &event, start + Duration::from_millis(at));
+		}
+		log.print_approved(&mut ui, 1, "Approved 3 deletions");
+
+		let lines = out
+			.lines()
+			.lines()
+			.map(|line| serde_json::from_str::<Value>(line).unwrap())
+			.collect::<Vec<_>>();
+		let progress = |bytes: u64| {
+			json!({
+				"pair": 1, "label": "L", "event": "progress", "path": "a", "direction": "upload",
+				"bytes": bytes, "total": 10, "pass_uploaded_bytes": bytes, "pass_downloaded_bytes": 0,
+			})
+		};
+		assert_eq!(
+			lines,
+			[
+				json!({"pair": 1, "label": "L", "event": "conflict", "path": "c"}),
+				progress(1),
+				progress(3),
+				json!({
+					"pair": 1, "label": "L", "event": "approved",
+					"message": "Approved 3 deletions",
+				}),
+			]
+		);
+		assert_eq!(err.lines_or_empty(), "");
+	}
+
+	/// With `--json`, a failure that is an event is its object on stdout, and stderr stays empty.
+	#[test]
+	fn json_prints_failed_actions_and_passes_as_objects_on_stdout() {
+		let out = Printed::default();
+		let err = Printed::default();
+		let mut ui = Printed::split_ui(&out, &err);
+		let labels = HashMap::from([(1, "L".to_string())]);
+		let settle = Settle {
+			approve_mass_deletions: false,
+			conflict_resolutions: ConflictResolutions::new(vec![], vec![], vec![]).unwrap(),
+		};
+		let mut log = EventLog::new(
+			&labels,
+			&settle,
+			Output::Json {
+				progress: HashMap::new(),
+			},
+		);
+		for event in [
+			SyncEvent::ActionFailed {
+				rel_path: "b".to_string(),
+				error: "denied".to_string(),
+			},
+			SyncEvent::PassFailed {
+				error: "offline".to_string(),
+				kind: ErrorKind::IO,
+			},
+		] {
+			let _ = log.print(&mut ui, 1, &event);
+		}
+
+		let events = out
+			.lines()
+			.lines()
+			.map(|line| serde_json::from_str::<Value>(line).unwrap()["event"].clone())
+			.collect::<Vec<_>>();
+		assert_eq!(events, [json!("action_failed"), json!("pass_failed")]);
+		assert_eq!(err.lines_or_empty(), "");
+	}
+
+	#[test]
+	fn json_takes_precedence_over_quiet() {
+		let mut ui = Printed::default().ui();
+		ui.set_quiet_and_json(true, true);
+
+		assert!(matches!(Output::of(&ui), Output::Json { .. }));
 	}
 
 	/// Without a terminal for the status line, a transfer's progress is not printed.

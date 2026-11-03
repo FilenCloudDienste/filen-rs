@@ -299,7 +299,10 @@ fn create_local_root(ui: &mut UI, local: &Path) -> Result<()> {
 			local.display()
 		))
 	})?;
-	ui.print_success(&format!("Created the local directory {}", local.display()));
+	print_set_up(
+		ui,
+		&format!("Created the local directory {}", local.display()),
+	);
 	Ok(())
 }
 
@@ -329,8 +332,22 @@ async fn create_remote_root(
 		.find_or_create_dir(&remote_path.0)
 		.await
 		.with_context(|| format!("Failed to create the remote directory {remote_path}"))?;
-	ui.print_success(&format!("Created the remote directory {remote_path}"));
+	print_set_up(ui, &format!("Created the remote directory {remote_path}"));
 	Ok(dir.uuid())
+}
+
+/// Prints `msg`, which says what setting the pairs up did: as a success, which `--quiet` leaves
+/// out, and with `--json` on stderr, so that stdout holds only the JSON lines.
+fn print_set_up(ui: &mut UI, msg: &str) {
+	log::info!("{msg}");
+	if ui.is_quiet() {
+		return;
+	}
+	if ui.json {
+		ui.print_muted_to_stderr(msg);
+	} else {
+		ui.print_success(msg);
+	}
 }
 
 /// Adds each of `pairs` to `engine`, or finds it there from an earlier run.
@@ -456,11 +473,14 @@ async fn import_legacy_state(
 		.import_legacy_state(pair, state_dir.to_path_buf())
 		.await
 	{
-		Ok(LegacyImport { imported, skipped }) => ui.print_success(&format!(
-			"Imported the TypeScript CLI's sync state of the sync pair {} <> {remote_path}: \
-			 {imported} synced file(s), {skipped} unreadable line(s) skipped",
-			local.display()
-		)),
+		Ok(LegacyImport { imported, skipped }) => print_set_up(
+			ui,
+			&format!(
+				"Imported the TypeScript CLI's sync state of the sync pair {} <> {remote_path}: \
+				 {imported} synced file(s), {skipped} unreadable line(s) skipped",
+				local.display()
+			),
+		),
 		// The pair has rows of its own, from an earlier run whose first pass did not finish, which
 		// are the better record. (The engine's other refusals, of an unknown pair or one being
 		// removed, cannot be for a pair this run has just added.)
@@ -895,7 +915,7 @@ fn sync_mode_names() -> String {
 }
 
 /// The name of `mode` as [`parse_sync_mode_str`] accepts it.
-fn sync_mode_str(mode: SyncMode) -> &'static str {
+pub(super) fn sync_mode_str(mode: SyncMode) -> &'static str {
 	match mode {
 		SyncMode::TwoWay => "twoWay",
 		SyncMode::LocalToRemote => "localToRemote",
@@ -965,11 +985,11 @@ mod tests {
 		ParsedPair, SyncDirs, create_local_root, expand_home, fallback_label, legacy_state_dir,
 		local_path_in_file, local_root_exists, local_trash_warnings, missing_roots,
 		overlap_message, parse_sync_mode_str, parse_sync_pair_definition, parse_sync_pairs,
-		read_sync_pairs_file, records_of, sync_mode_str, typescript_home_dir,
+		print_set_up, read_sync_pairs_file, records_of, sync_mode_str, typescript_home_dir,
 	};
 	use crate::{
 		error::{CliError, exit_code, find_cli_error},
-		ui::UI,
+		ui::{UI, test_support::Printed},
 		util::RemotePath,
 	};
 
@@ -1131,6 +1151,37 @@ mod tests {
 		create_local_root(&mut ui, &local).unwrap();
 
 		assert!(local.is_dir());
+	}
+
+	/// With `--json`, stdout holds only JSON lines, so what setting up did goes to stderr.
+	#[test]
+	fn what_setting_up_did_goes_to_stderr_with_json() {
+		let (out, err) = (Printed::default(), Printed::default());
+		let mut ui = Printed::split_ui(&out, &err);
+		ui.set_quiet_and_json(false, true);
+
+		print_set_up(&mut ui, "Created the remote directory /a");
+
+		assert_eq!(out.lines_or_empty(), "");
+		assert!(
+			err.lines().contains("Created the remote directory /a"),
+			"{}",
+			err.lines()
+		);
+	}
+
+	#[test]
+	fn quiet_leaves_out_what_setting_up_did() {
+		for json in [false, true] {
+			let (out, err) = (Printed::default(), Printed::default());
+			let mut ui = Printed::split_ui(&out, &err);
+			ui.set_quiet_and_json(true, json);
+
+			print_set_up(&mut ui, "Created the remote directory /a");
+
+			assert_eq!(out.lines_or_empty(), "");
+			assert_eq!(err.lines_or_empty(), "");
+		}
 	}
 
 	/// Two pairs sharing a missing root are asked about it, and create it, once.
