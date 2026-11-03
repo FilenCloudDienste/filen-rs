@@ -187,7 +187,7 @@ impl Client {
 	where
 		C: super::dir_upload::DirUploadCallback + ?Sized,
 	{
-		let super::DirUploadOptions { symlinks } = options;
+		let super::DirUploadOptions { symlinks, existing } = options;
 		let ref_callback = callback.deref();
 		let mut skipped_symlinks = Vec::new();
 
@@ -227,7 +227,7 @@ impl Client {
 		let (dirs, files, bytes) = stats.snapshot();
 		ref_callback.on_scan_complete(dirs, files, bytes);
 
-		self.upload_fs_tree_from_path_into_target(callback, dir_path, &tree, target)
+		self.upload_fs_tree_from_path_into_target(callback, dir_path, &tree, target, existing)
 			.await
 	}
 

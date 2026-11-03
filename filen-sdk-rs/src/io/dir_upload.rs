@@ -1,5 +1,5 @@
 use std::{
-	collections::VecDeque,
+	collections::{HashMap, VecDeque},
 	ops::Deref,
 	path::{Path, PathBuf},
 	sync::{
@@ -8,7 +8,8 @@ use std::{
 	},
 };
 
-use filen_types::fs::Uuid;
+use chrono::{DateTime, Utc};
+use filen_types::fs::{ParentUuid, Uuid};
 
 use crate::{
 	Error, ErrorKind,
@@ -16,9 +17,10 @@ use crate::{
 	consts::{CALLBACK_INTERVAL, MAX_SMALL_PARALLEL_REQUESTS},
 	error::ResultExt,
 	fs::{
-		HasUUID,
+		HasName, HasRemoteInfo, HasUUID,
+		categories::normal::list_parent_uuid,
 		dir::RemoteDirectory,
-		file::{FileBuilderOptionalName, RemoteFile},
+		file::{FileBuilderOptionalName, RemoteFile, traits::HasFileInfo},
 	},
 	io::{
 		FilenMetaExt,
@@ -52,6 +54,12 @@ pub trait DirUploadCallback: Send + Sync {
 	fn on_scan_skipped_symlinks(&self, paths: Vec<PathBuf>) {
 		let _ = paths;
 	}
+	/// The files the upload left out because the remote directory already holds a file of the same
+	/// name that [`ExistingRemoteFile`] keeps, by their local paths, with their total size in bytes.
+	/// Called along with [`on_upload_update`](Self::on_upload_update).
+	fn on_upload_skipped(&self, skipped_files: Vec<PathBuf>, skipped_bytes: u64) {
+		let _ = (skipped_files, skipped_bytes);
+	}
 }
 
 /// What a directory upload does with the symlinks inside the directory. The directory itself is
@@ -65,11 +73,82 @@ pub enum SymlinkPolicy {
 	Skip,
 }
 
-/// How a directory upload walks the local directory. The default follows symlinks.
+/// What a directory upload does with a local file when the remote directory it goes into already
+/// holds a file of the same name. Names are compared case-insensitively, as the server compares
+/// them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ExistingRemoteFile {
+	/// Upload it: it becomes the current file at that name, and the server keeps the one it
+	/// replaces as an earlier version when versioning is enabled for the account.
+	#[default]
+	Replace,
+	/// Leave the remote file as it is and the local file out.
+	Keep,
+	/// Upload it, as [`Replace`](Self::Replace) does, only when its size differs from the remote
+	/// file's or it was modified after the remote file's modification time; otherwise leave it out,
+	/// as [`Keep`](Self::Keep) does.
+	ReplaceIfChanged,
+}
+
+impl ExistingRemoteFile {
+	/// Whether the local file with metadata `local` is uploaded over `remote`, the remote file of
+	/// the same name.
+	pub fn replaces(self, local: &std::fs::Metadata, remote: &RemoteFile) -> bool {
+		self.replaces_stamped(FileStamp::of_local(local), FileStamp::of_remote(remote))
+	}
+
+	fn replaces_stamped(self, local: FileStamp, remote: FileStamp) -> bool {
+		match self {
+			Self::Replace => true,
+			Self::Keep => false,
+			Self::ReplaceIfChanged => local.size != remote.size || local.modified > remote.modified,
+		}
+	}
+}
+
+/// What [`ExistingRemoteFile::ReplaceIfChanged`] compares of a file.
+#[derive(Clone, Copy, Debug)]
+struct FileStamp {
+	size: u64,
+	/// To the millisecond, as an upload records it.
+	modified: DateTime<Utc>,
+}
+
+impl FileStamp {
+	fn of_local(metadata: &std::fs::Metadata) -> Self {
+		Self {
+			size: FilenMetaExt::size(metadata),
+			modified: FilenMetaExt::modified(metadata),
+		}
+	}
+
+	/// A remote file without a recorded modification time counts as modified when it was uploaded.
+	fn of_remote(file: &RemoteFile) -> Self {
+		Self {
+			size: HasFileInfo::size(file),
+			modified: HasFileInfo::last_modified(file).unwrap_or_else(|| file.timestamp()),
+		}
+	}
+}
+
+/// How a directory upload walks the local directory and treats the remote one. The default
+/// follows symlinks and replaces same-named remote files.
 #[derive(Clone, Debug, Default)]
 pub struct DirUploadOptions {
 	/// What to do with the symlinks inside the directory.
 	pub symlinks: SymlinkPolicy,
+	/// What to do with a file the remote directory already holds a file of the same name as.
+	pub existing: ExistingRemoteFile,
+}
+
+/// The files of a remote directory a [`ExistingRemoteFile`] other than `Replace` looks at, by
+/// [`name_key`].
+type ExistingFiles = HashMap<String, Box<RemoteFile>>;
+
+/// The key two names the server takes for the same name share: it compares names by a hash of
+/// their lowercase form.
+fn name_key(name: &str) -> String {
+	name.to_lowercase()
 }
 
 // todo, accept &impl HasUuidContents instead of RemoteDirectory for target_folder
@@ -84,6 +163,7 @@ impl Client {
 			super::fs_tree::ExtraLocalFileData,
 		>,
 		target_folder: &RemoteDirectory,
+		existing: ExistingRemoteFile,
 	) -> Result<(), Error>
 	where
 		C: DirUploadCallback + ?Sized,
@@ -103,20 +183,19 @@ impl Client {
 		let (entry_to_upload_sender, entry_to_upload_receiver) =
 			tokio::sync::mpsc::channel::<EntryToUploadInfo>(64);
 
-		let mut uploaded_dirs = Vec::new();
-		let mut uploaded_files = Vec::new();
+		let mut pending = PendingCallbacks::default();
 		let uploaded_bytes = Arc::new(AtomicU64::new(0));
-		let mut upload_errors = Vec::new();
 
 		let mut update_interval = tokio::time::interval(CALLBACK_INTERVAL);
 		update_interval.reset();
 
 		let mut unsent_children = VecDeque::new();
 
+		let root_files = self.existing_files(target_folder.uuid(), existing).await?;
 		dir_upload_result_sender
 			.send(DirUploadResult(
 				// have to clone here
-				Ok((target_folder.clone(), tree.root_children())),
+				Ok((target_folder.clone(), tree.root_children(), root_files)),
 				path,
 			))
 			.await
@@ -133,19 +212,14 @@ impl Client {
 			file_upload_result_sender,
 			entry_to_upload_receiver,
 			uploaded_bytes.clone(),
+			existing,
 		));
 
 		loop {
 			tokio::select! {
 				biased;
 				_ = update_interval.tick() => {
-					send_callbacks(
-						&mut uploaded_dirs,
-						&mut uploaded_files,
-						&uploaded_bytes,
-						&mut upload_errors,
-						&callback,
-					);
+					pending.send(&uploaded_bytes, &callback);
 					drain_unsent_entries(&entry_to_upload_sender, &mut unsent_children, &mut in_flight)?;
 					if in_flight == 0 && unsent_children.is_empty() {
 						break;
@@ -153,12 +227,16 @@ impl Client {
 				},
 				Some(result) = file_upload_result_receiver.recv() => {
 					in_flight -= 1;
-					match result.0 {
-						Ok(file) => {
-							uploaded_files.push(file);
+					match result {
+						FileUploadResult(Ok(FileUploaded::Uploaded(file)), _) => {
+							pending.files.push(*file);
 						},
-						Err((error, path)) => {
-							upload_errors.push((path, error));
+						FileUploadResult(Ok(FileUploaded::Kept { bytes }), path) => {
+							pending.skipped.push(path);
+							pending.skipped_bytes = pending.skipped_bytes.saturating_add(bytes);
+						},
+						FileUploadResult(Err(error), path) => {
+							pending.errors.push((path, error));
 						}
 					}
 					drain_unsent_entries(&entry_to_upload_sender, &mut unsent_children, &mut in_flight)?;
@@ -169,10 +247,10 @@ impl Client {
 				Some(result) = dir_upload_result_receiver.recv() => {
 					in_flight -= 1;
 					match result {
-						DirUploadResult(Ok((dir, children_info)), path) => {
+						DirUploadResult(Ok((dir, children_info, mut existing_files)), path) => {
 							let new_children = tree.list_children(children_info);
 							let parent_uuid = dir.uuid();
-							uploaded_dirs.push(dir);
+							pending.dirs.push(dir);
 							for child in new_children {
 								let entry_info = EntryToUploadInfo {
 									entry: match child {
@@ -180,9 +258,13 @@ impl Client {
 											path.join(tree.get_name(dir)).to_path_buf(),
 											dir.children_info(),
 										),
-										Entry::File(file) => EntryToUpload::File(
-											path.join(tree.get_name(file)).to_path_buf(),
-										),
+										Entry::File(file) => {
+											let name = tree.get_name(file);
+											EntryToUpload::File(
+												path.join(name),
+												existing_files.remove(&name_key(name)),
+											)
+										}
 									},
 									parent: parent_uuid,
 								};
@@ -195,7 +277,7 @@ impl Client {
 							}
 						}
 						DirUploadResult(Err(error), path) => {
-							upload_errors.push((path, error));
+							pending.errors.push((path, error));
 						}
 					}
 					drain_unsent_entries(&entry_to_upload_sender, &mut unsent_children, &mut in_flight)?;
@@ -207,13 +289,7 @@ impl Client {
 		}
 		std::mem::drop(entry_to_upload_sender);
 		task.join().await.expect("upload task manager panicked");
-		send_callbacks(
-			&mut uploaded_dirs,
-			&mut uploaded_files,
-			&uploaded_bytes,
-			&mut upload_errors,
-			&callback,
-		);
+		pending.send(&uploaded_bytes, &callback);
 		Ok(())
 	}
 
@@ -223,6 +299,7 @@ impl Client {
 		file_upload_sender: tokio::sync::mpsc::Sender<FileUploadResult>,
 		mut entry_to_upload_receiver: tokio::sync::mpsc::Receiver<EntryToUploadInfo>,
 		bytes_progress_counter: Arc<AtomicU64>,
+		existing: ExistingRemoteFile,
 	) -> tokio::task::JoinHandle<()> {
 		let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_SMALL_PARALLEL_REQUESTS));
 		tokio::task::spawn(async move {
@@ -238,20 +315,19 @@ impl Client {
 					};
 					let client = self.clone();
 					match entry_info.entry {
-						EntryToUpload::File(path) => {
+						EntryToUpload::File(path, remote) => {
 							let file_sender = file_upload_sender.clone();
 							let bytes_counter = bytes_progress_counter.clone();
 							join_set.spawn(async move {
 								let result = client
-									.upload_child_file_from_path(
+									.upload_child_file_unless_kept(
 										&path,
 										&entry_info.parent,
+										remote.as_deref().map(|remote| (remote, existing)),
 										bytes_counter,
 									)
 									.await;
-								let _ = file_sender
-									.send(FileUploadResult(result.map_err(|e| (e, path))))
-									.await;
+								let _ = file_sender.send(FileUploadResult(result, path)).await;
 								std::mem::drop(permit);
 							});
 						}
@@ -259,11 +335,15 @@ impl Client {
 							let dir_sender = dir_upload_sender.clone();
 							join_set.spawn(async move {
 								let result = client
-									.upload_child_dir_from_path(&path, &entry_info.parent)
+									.upload_child_dir_listing_files(
+										&path,
+										&entry_info.parent,
+										existing,
+									)
 									.await;
 								let _ = dir_sender
 									.send(DirUploadResult(
-										result.map(|dir| (dir, children_info)),
+										result.map(|(dir, files)| (dir, children_info, files)),
 										path,
 									))
 									.await;
@@ -277,12 +357,29 @@ impl Client {
 		})
 	}
 
-	async fn upload_child_file_from_path(
+	/// Uploads the local file at `path` into `parent`, unless `existing` names the remote file of
+	/// the same name there and the policy that keeps it.
+	async fn upload_child_file_unless_kept(
 		&self,
 		path: &Path,
 		parent: &Uuid,
+		existing: Option<(&RemoteFile, ExistingRemoteFile)>,
 		uploaded_bytes: Arc<AtomicU64>,
-	) -> Result<RemoteFile, Error> {
+	) -> Result<FileUploaded, Error> {
+		if let Some((remote, policy)) = existing {
+			let metadata = tokio::fs::metadata(path).await.map_err(|e| {
+				Error::custom_with_source(
+					ErrorKind::IO,
+					e,
+					Some(format!("getting metadata for file {:?}", path)),
+				)
+			})?;
+			if !policy.replaces(&metadata, remote) {
+				return Ok(FileUploaded::Kept {
+					bytes: FilenMetaExt::size(&metadata),
+				});
+			}
+		}
 		self.upload_file_from_path_with_builder(
 			FileBuilderOptionalName::new(*parent),
 			path.to_owned(),
@@ -292,7 +389,43 @@ impl Client {
 		)
 		.await
 		.context("uploading file from path")
-		.map(|(file, _)| file)
+		.map(|(file, _)| FileUploaded::Uploaded(Box::new(file)))
+	}
+
+	/// Creates the directory at `path` in `parent`, or takes the one already there, and lists the
+	/// files in it that `existing` looks at.
+	async fn upload_child_dir_listing_files(
+		&self,
+		path: &Path,
+		parent: &Uuid,
+		existing: ExistingRemoteFile,
+	) -> Result<(RemoteDirectory, ExistingFiles), Error> {
+		let dir = self.upload_child_dir_from_path(path, parent).await?;
+		let files = self.existing_files(dir.uuid(), existing).await?;
+		Ok((dir, files))
+	}
+
+	/// The files in the remote directory `dir` that `existing` looks at: none for
+	/// [`ExistingRemoteFile::Replace`], which needs no listing. A file whose name cannot be
+	/// decrypted is left out, as no local name can be told to match it.
+	async fn existing_files(
+		&self,
+		dir: Uuid,
+		existing: ExistingRemoteFile,
+	) -> Result<ExistingFiles, Error> {
+		match existing {
+			ExistingRemoteFile::Replace => Ok(ExistingFiles::new()),
+			ExistingRemoteFile::Keep | ExistingRemoteFile::ReplaceIfChanged => {
+				let (_, files) =
+					list_parent_uuid(self, ParentUuid::Uuid(dir), None::<&fn(u64, Option<u64>)>)
+						.await
+						.context("listing the files already in a directory during folder upload")?;
+				Ok(files
+					.into_iter()
+					.filter_map(|file| Some((name_key(file.name()?), Box::new(file))))
+					.collect())
+			}
+		}
 	}
 
 	async fn upload_child_dir_from_path(
@@ -362,38 +495,119 @@ fn drain_unsent_entries(
 	Ok(())
 }
 
-fn send_callbacks<C>(
-	uploaded_dirs: &mut Vec<RemoteDirectory>,
-	uploaded_files: &mut Vec<RemoteFile>,
-	uploaded_bytes: &Arc<AtomicU64>,
-	upload_errors: &mut Vec<(PathBuf, Error)>,
-	callback: &impl Deref<Target = C>,
-) where
-	C: DirUploadCallback + ?Sized,
-{
-	let callback = callback.deref();
-	let bytes = uploaded_bytes.swap(0, Ordering::Relaxed);
-	if !uploaded_dirs.is_empty() || !uploaded_files.is_empty() || bytes > 0 {
-		callback.on_upload_update(
-			std::mem::take(uploaded_dirs),
-			std::mem::take(uploaded_files),
-			bytes,
-		);
-	}
+/// What the upload has to report at the next callback.
+#[derive(Default)]
+struct PendingCallbacks {
+	dirs: Vec<RemoteDirectory>,
+	files: Vec<RemoteFile>,
+	errors: Vec<(PathBuf, Error)>,
+	skipped: Vec<PathBuf>,
+	skipped_bytes: u64,
+}
 
-	if !upload_errors.is_empty() {
-		callback.on_upload_errors(std::mem::take(upload_errors));
+impl PendingCallbacks {
+	fn send<C>(&mut self, uploaded_bytes: &Arc<AtomicU64>, callback: &impl Deref<Target = C>)
+	where
+		C: DirUploadCallback + ?Sized,
+	{
+		let callback = callback.deref();
+		let bytes = uploaded_bytes.swap(0, Ordering::Relaxed);
+		if !self.dirs.is_empty() || !self.files.is_empty() || bytes > 0 {
+			callback.on_upload_update(
+				std::mem::take(&mut self.dirs),
+				std::mem::take(&mut self.files),
+				bytes,
+			);
+		}
+		if !self.skipped.is_empty() {
+			callback.on_upload_skipped(
+				std::mem::take(&mut self.skipped),
+				std::mem::take(&mut self.skipped_bytes),
+			);
+		}
+		if !self.errors.is_empty() {
+			callback.on_upload_errors(std::mem::take(&mut self.errors));
+		}
 	}
 }
 
-struct DirUploadResult(Result<(RemoteDirectory, DirChildrenInfo), Error>, PathBuf);
-struct FileUploadResult(Result<RemoteFile, (Error, PathBuf)>);
+struct DirUploadResult(
+	Result<(RemoteDirectory, DirChildrenInfo, ExistingFiles), Error>,
+	PathBuf,
+);
+struct FileUploadResult(Result<FileUploaded, Error>, PathBuf);
+
+/// What became of a file the upload got to.
+enum FileUploaded {
+	Uploaded(Box<RemoteFile>),
+	/// Left out for the remote file of the same name, `bytes` long locally.
+	Kept {
+		bytes: u64,
+	},
+}
 
 struct EntryToUploadInfo {
 	entry: EntryToUpload,
 	parent: Uuid,
 }
 enum EntryToUpload {
-	File(PathBuf),
+	/// A file, with the remote file of the same name already in its directory, when the upload's
+	/// [`ExistingRemoteFile`] looks at those.
+	File(PathBuf, Option<Box<RemoteFile>>),
 	Dir(PathBuf, DirChildrenInfo),
+}
+
+#[cfg(test)]
+mod tests {
+	use chrono::{DateTime, Duration, Utc};
+
+	use super::{ExistingRemoteFile, FileStamp, name_key};
+
+	fn stamp(size: u64, modified: DateTime<Utc>) -> FileStamp {
+		FileStamp { size, modified }
+	}
+
+	fn remote() -> FileStamp {
+		stamp(100, DateTime::<Utc>::UNIX_EPOCH + Duration::days(1000))
+	}
+
+	#[test]
+	fn replace_uploads_over_any_remote_file() {
+		assert!(ExistingRemoteFile::Replace.replaces_stamped(remote(), remote()));
+	}
+
+	#[test]
+	fn keep_leaves_any_remote_file_alone() {
+		let changed = stamp(5, remote().modified + Duration::days(1));
+		assert!(!ExistingRemoteFile::Keep.replaces_stamped(changed, remote()));
+	}
+
+	#[test]
+	fn an_unchanged_file_is_left_out_when_replacing_only_changed_ones() {
+		assert!(!ExistingRemoteFile::ReplaceIfChanged.replaces_stamped(remote(), remote()));
+	}
+
+	#[test]
+	fn an_older_file_of_the_same_size_is_left_out_when_replacing_only_changed_ones() {
+		let older = stamp(100, remote().modified - Duration::milliseconds(1));
+		assert!(!ExistingRemoteFile::ReplaceIfChanged.replaces_stamped(older, remote()));
+	}
+
+	#[test]
+	fn a_newer_file_replaces_the_remote_one_when_replacing_only_changed_ones() {
+		let newer = stamp(100, remote().modified + Duration::milliseconds(1));
+		assert!(ExistingRemoteFile::ReplaceIfChanged.replaces_stamped(newer, remote()));
+	}
+
+	#[test]
+	fn a_file_of_another_size_replaces_the_remote_one_when_replacing_only_changed_ones() {
+		let resized = stamp(101, remote().modified - Duration::days(1));
+		assert!(ExistingRemoteFile::ReplaceIfChanged.replaces_stamped(resized, remote()));
+	}
+
+	#[test]
+	fn names_differing_in_case_share_a_key() {
+		assert_eq!(name_key("Photo.JPG"), name_key("photo.jpg"));
+		assert_eq!(name_key("Ärger.txt"), "ärger.txt");
+	}
 }
