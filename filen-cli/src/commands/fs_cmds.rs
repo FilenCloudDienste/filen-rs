@@ -1,6 +1,9 @@
 use std::{
 	borrow::Cow,
+	cmp::Ordering,
+	iter::Peekable,
 	pin::pin,
+	str::Chars,
 	sync::{Arc, Mutex, MutexGuard, PoisonError},
 };
 
@@ -439,13 +442,58 @@ fn name_or_uuid(name: Option<&str>, uuid: Uuid) -> String {
 	name.map(str::to_string).unwrap_or_else(|| uuid.to_string())
 }
 
-/// Sorts a listing the way it is printed: directories first, each group by label.
+/// Sorts a listing the way it is printed: directories first, each group by label in
+/// [`natural_cmp`] order.
 fn sort_listing(items: &mut [ListedItem], by: ListedBy) {
 	items.sort_by(|a, b| {
 		a.kind
 			.cmp(&b.kind)
-			.then_with(|| a.label(by).cmp(&b.label(by)))
+			.then_with(|| natural_cmp(&a.label(by), &b.label(by)))
 	});
+}
+
+/// Orders names the way a person reads them: ignoring case, and with each run of digits compared
+/// as a number, so that `file2` comes before `file10`. Names equal in that order (`readme` and
+/// `README`, `file02` and `file2`) are ordered by their characters, so that the order is total
+/// and the same every time.
+fn natural_cmp(a: &str, b: &str) -> Ordering {
+	natural_cmp_folded(a, b).then_with(|| a.cmp(b))
+}
+
+fn natural_cmp_folded(a: &str, b: &str) -> Ordering {
+	let mut a = a.chars().peekable();
+	let mut b = b.chars().peekable();
+	loop {
+		let (Some(&a_char), Some(&b_char)) = (a.peek(), b.peek()) else {
+			return a.peek().is_some().cmp(&b.peek().is_some());
+		};
+		let order = if a_char.is_ascii_digit() && b_char.is_ascii_digit() {
+			cmp_numbers(&take_digits(&mut a), &take_digits(&mut b))
+		} else {
+			a.next();
+			b.next();
+			a_char.to_lowercase().cmp(b_char.to_lowercase())
+		};
+		if order != Ordering::Equal {
+			return order;
+		}
+	}
+}
+
+/// Takes the run of ASCII digits `chars` starts with.
+fn take_digits(chars: &mut Peekable<Chars<'_>>) -> String {
+	let mut digits = String::new();
+	while let Some(digit) = chars.next_if(char::is_ascii_digit) {
+		digits.push(digit);
+	}
+	digits
+}
+
+/// Compares two runs of ASCII digits by the numbers they write, however long they are.
+fn cmp_numbers(a: &str, b: &str) -> Ordering {
+	let a = a.trim_start_matches('0');
+	let b = b.trim_start_matches('0');
+	a.len().cmp(&b.len()).then_with(|| a.cmp(b))
 }
 
 /// Prints one item per line: a right-aligned size column (directories have none), the date
@@ -1685,7 +1733,7 @@ async fn list_trash_items(client: &Client) -> Result<Vec<(String, TrashItem)>> {
 			(name, TrashItem::Dir(dir))
 		})
 		.collect::<Vec<(String, TrashItem)>>();
-	items.sort_by(|(a, _), (b, _)| a.cmp(b));
+	items.sort_by(|(a, _), (b, _)| natural_cmp(a, b));
 	let mut file_items = files
 		.into_iter()
 		.map(|file| {
@@ -1696,7 +1744,7 @@ async fn list_trash_items(client: &Client) -> Result<Vec<(String, TrashItem)>> {
 			(name, TrashItem::File(file))
 		})
 		.collect::<Vec<(String, TrashItem)>>();
-	file_items.sort_by(|(a, _), (b, _)| a.cmp(b));
+	file_items.sort_by(|(a, _), (b, _)| natural_cmp(a, b));
 	items.append(&mut file_items);
 	Ok(items)
 }
@@ -2487,6 +2535,55 @@ mod tests {
 		assert_eq!(
 			printed_listing(Vec::new(), ListedBy::Name, false, true),
 			"[]"
+		);
+	}
+
+	#[test]
+	fn numbers_in_names_are_ordered_by_value() {
+		assert_eq!(natural_cmp("file2", "file10"), Ordering::Less);
+		assert_eq!(natural_cmp("file10", "file2"), Ordering::Greater);
+		assert_eq!(natural_cmp("2024-9.txt", "2024-10.txt"), Ordering::Less);
+		assert_eq!(
+			natural_cmp("v99999999999999999999999", "v100000000000000000000000"),
+			Ordering::Less
+		);
+	}
+
+	#[test]
+	fn names_are_ordered_ignoring_case() {
+		assert_eq!(natural_cmp("a", "B"), Ordering::Less);
+		assert_eq!(natural_cmp("B", "a"), Ordering::Greater);
+		assert_eq!(natural_cmp("Ä", "b"), Ordering::Greater);
+	}
+
+	#[test]
+	fn names_equal_ignoring_case_and_zeros_are_ordered_by_their_characters() {
+		assert_eq!(natural_cmp("README", "readme"), Ordering::Less);
+		assert_eq!(natural_cmp("readme", "README"), Ordering::Greater);
+		assert_eq!(natural_cmp("file02", "file2"), Ordering::Less);
+		assert_eq!(natural_cmp("same", "same"), Ordering::Equal);
+	}
+
+	#[test]
+	fn a_name_comes_before_the_longer_names_it_starts() {
+		assert_eq!(natural_cmp("file", "file1"), Ordering::Less);
+		assert_eq!(natural_cmp("file1", "file1a"), Ordering::Less);
+		assert_eq!(natural_cmp("", "a"), Ordering::Less);
+	}
+
+	#[test]
+	fn a_listing_is_sorted_naturally_with_directories_first() {
+		let items = vec![
+			listed_file("file10.txt", 1, 1),
+			listed_file("File2.txt", 1, 2),
+			listed_dir("b", 3),
+			listed_file("a.txt", 1, 4),
+			listed_dir("A", 5),
+		];
+
+		assert_eq!(
+			printed_listing(items, ListedBy::Name, false, false),
+			"A\nb\na.txt\nFile2.txt\nfile10.txt"
 		);
 	}
 
