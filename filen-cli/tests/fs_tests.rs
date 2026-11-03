@@ -1,3 +1,4 @@
+use std::sync::Arc;
 #[cfg(unix)]
 use std::{
 	process::{Command, Stdio},
@@ -7,15 +8,21 @@ use std::{
 use filen_macros::shared_test_runtime;
 use filen_sdk_rs::{
 	auth::Client,
-	fs::{HasName, HasUUID, categories::NonRootFileType, dir::RemoteDirectory},
+	fs::{HasName, HasUUID, categories::NonRootFileType, dir::RemoteDirectory, file::RemoteFile},
 	io::client_impl::IoSharedClientExt,
+	sync::lock::ResourceLock,
 };
 use test_utils::authenticated_cli_with_args;
 
 /// Uploads `content` as `name` into `parent`.
-async fn upload(client: &Client, parent: &RemoteDirectory, name: &str, content: &[u8]) {
+async fn upload(
+	client: &Client,
+	parent: &RemoteDirectory,
+	name: &str,
+	content: &[u8],
+) -> RemoteFile {
 	let builder = client.make_file_builder(name, parent.uuid()).unwrap();
-	client.upload_file(builder, content).await.unwrap();
+	client.upload_file(builder, content).await.unwrap()
 }
 
 /// The content of the file at `path`.
@@ -511,5 +518,116 @@ async fn cp_interrupted_by_ctrl_c_stops_and_says_what_it_copied() {
 	assert!(
 		stderr.contains("Copied only ") && stderr.contains(&format!("to {test_dir}/copy")),
 		"stderr:\n{stderr}"
+	);
+}
+
+/// Uploads a file named `name` into a new directory `dir` of the test directory, and trashes it.
+async fn trashed_file(
+	client: &Client,
+	test_dir: &RemoteDirectory,
+	dir: &str,
+	name: &str,
+) -> RemoteFile {
+	let dir = client.create_dir(&test_dir.into(), dir).await.unwrap();
+	let mut file = upload(client, &dir, name, b"trashed").await;
+	client.trash_file(&mut file).await.unwrap();
+	file
+}
+
+/// Holds the trash lock while the test touches the trash: the trash is the whole account's, and
+/// other tests on the account empty it.
+async fn lock_trash(client: &Client) -> Arc<ResourceLock> {
+	client
+		.acquire_lock_with_default(test_utils::locks::TRASH)
+		.await
+		.unwrap()
+}
+
+async fn is_in_trash(client: &Client, file: &RemoteFile) -> bool {
+	let (_, files) = client
+		.list_trash(None::<&fn(u64, Option<u64>)>)
+		.await
+		.unwrap();
+	files.iter().any(|trashed| trashed.uuid() == file.uuid())
+}
+
+#[shared_test_runtime]
+async fn trash_delete_deletes_the_trashed_item_it_names() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let _trash_lock = lock_trash(client).await;
+	// the trash is the whole account's, so the name is this test's own
+	let name = format!("{}.txt", resources.dir.name().unwrap());
+	let file = trashed_file(client, &resources.dir, "a", &name).await;
+
+	authenticated_cli_with_args!("trash-delete", &name, "--yes")
+		.success()
+		.stdout(predicates::str::contains(format!(
+			"Permanently deleted file: {name}"
+		)));
+
+	assert!(!is_in_trash(client, &file).await);
+}
+
+#[shared_test_runtime]
+async fn trash_delete_refuses_a_name_several_trashed_items_share() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let _trash_lock = lock_trash(client).await;
+	let name = format!("{}.txt", resources.dir.name().unwrap());
+	let first = trashed_file(client, &resources.dir, "a", &name).await;
+	let second = trashed_file(client, &resources.dir, "b", &name).await;
+
+	authenticated_cli_with_args!("trash-delete", &name, "--yes")
+		.failure()
+		.stderr(predicates::str::contains(format!(
+			"2 trashed items are named {name}, so name one by its UUID"
+		)))
+		.stderr(predicates::str::contains(first.uuid().to_string()))
+		.stderr(predicates::str::contains(second.uuid().to_string()));
+
+	assert!(is_in_trash(client, &first).await);
+	assert!(is_in_trash(client, &second).await);
+	client.delete_file_permanently(first).await.unwrap();
+	client.delete_file_permanently(second).await.unwrap();
+}
+
+#[shared_test_runtime]
+async fn trash_delete_deletes_a_trashed_item_named_by_its_uuid() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let _trash_lock = lock_trash(client).await;
+	let name = format!("{}.txt", resources.dir.name().unwrap());
+	let first = trashed_file(client, &resources.dir, "a", &name).await;
+	let second = trashed_file(client, &resources.dir, "b", &name).await;
+
+	authenticated_cli_with_args!("trash-delete", &second.uuid().to_string(), "--yes").success();
+
+	assert!(is_in_trash(client, &first).await);
+	assert!(!is_in_trash(client, &second).await);
+	client.delete_file_permanently(first).await.unwrap();
+}
+
+#[test]
+fn trash_delete_of_a_named_item_without_yes_asks_for_it_before_logging_in() {
+	let config_dir = assert_fs::TempDir::new().unwrap();
+	let output = std::process::Command::new(env!("CARGO_BIN_EXE_filen-cli"))
+		.env("FILEN_CLI_TESTING_DISABLE_KEYRING", "1")
+		.env("FILEN_CLI_TESTING_DISABLE_AUTODETECTED_AUTH_CONFIG", "1")
+		.env_remove("FILEN_CLI_EMAIL")
+		.env_remove("FILEN_CLI_PASSWORD")
+		.env_remove("FILEN_CLI_2FA_CODE")
+		.arg("--config-dir")
+		.arg(config_dir.path())
+		.args(["--skip-update", "trash-delete", "a.txt"])
+		.stdin(std::process::Stdio::null())
+		.output()
+		.unwrap();
+
+	assert_eq!(output.status.code(), Some(2));
+	assert_eq!(
+		console::strip_ansi_codes(&String::from_utf8(output.stderr).unwrap()),
+		"✘ Cannot ask \"Permanently delete a.txt?\": stdin is not a terminal. Pass --yes to \
+		 answer yes.\n"
 	);
 }

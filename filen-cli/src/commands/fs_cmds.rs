@@ -145,8 +145,12 @@ pub(crate) enum FsCommands {
 	ListTrash,
 	/// Restore a trashed item interactively
 	TrashRestore,
-	/// Permanently delete a trashed item interactively (--yes skips the last confirmation)
-	TrashDelete,
+	/// Permanently delete a trashed item, asking first unless --yes is given
+	TrashDelete {
+		/// The trashed item's name, or its UUID when several trashed items share the name
+		/// (default: pick one interactively)
+		item: Option<String>,
+	},
 	/// Permanently delete all trashed items
 	EmptyTrash,
 }
@@ -245,7 +249,10 @@ impl FsCommands {
 			Self::ListRecents => list_recents(ui, client).await?,
 			Self::ListTrash => list_trash(ui, client).await?,
 			Self::TrashRestore => select_trash_item(ui, client, TrashAction::Restore).await?,
-			Self::TrashDelete => select_trash_item(ui, client, TrashAction::Delete).await?,
+			Self::TrashDelete { item: None } => {
+				select_trash_item(ui, client, TrashAction::Delete).await?;
+			}
+			Self::TrashDelete { item: Some(item) } => delete_trash_item(ui, client, &item).await?,
 			Self::EmptyTrash => empty_trash(ui, client).await?,
 		}
 		Ok(CommandResult::default())
@@ -1533,26 +1540,13 @@ impl TrashItem {
 	}
 }
 
-/// Lists the trash and lets the user pick one item to restore or permanently delete.
-pub(crate) async fn select_trash_item(
-	ui: &mut UI,
-	client: &mut LazyClient,
-	action: TrashAction,
-) -> Result<()> {
-	let select_message = match action {
-		TrashAction::Restore => "Select an item to restore",
-		TrashAction::Delete => "Select an item to permanently delete",
-	};
-	// before logging in and listing the trash, so that a script fails at once: nothing answers
-	// the selection, not even --yes
-	ui.ensure_can_prompt(select_message)?;
-	let client = client.get(ui).await?;
+/// The items in the trash with the names they are shown under (their UUID when the name cannot
+/// be decrypted): directories first, each group sorted by name, like `ls` prints them.
+async fn list_trash_items(client: &Client) -> Result<Vec<(String, TrashItem)>> {
 	let (dirs, files) = client
 		.list_trash(None::<&fn(u64, Option<u64>)>)
 		.await
 		.context("Failed to list trash")?;
-
-	// directories first, each group sorted by name, like `ls` prints them
 	let mut items = dirs
 		.into_iter()
 		.map(|dir| {
@@ -1576,6 +1570,24 @@ pub(crate) async fn select_trash_item(
 		.collect::<Vec<(String, TrashItem)>>();
 	file_items.sort_by(|(a, _), (b, _)| a.cmp(b));
 	items.append(&mut file_items);
+	Ok(items)
+}
+
+/// Lists the trash and lets the user pick one item to restore or permanently delete.
+pub(crate) async fn select_trash_item(
+	ui: &mut UI,
+	client: &mut LazyClient,
+	action: TrashAction,
+) -> Result<()> {
+	let select_message = match action {
+		TrashAction::Restore => "Select an item to restore",
+		TrashAction::Delete => "Select an item to permanently delete",
+	};
+	// before logging in and listing the trash, so that a script fails at once: nothing answers
+	// the selection, not even --yes
+	ui.ensure_can_prompt(select_message)?;
+	let client = client.get(ui).await?;
+	let mut items = list_trash_items(client).await?;
 	if items.is_empty() {
 		ui.print_muted("Trash is empty");
 		return Ok(());
@@ -1606,42 +1618,105 @@ pub(crate) async fn select_trash_item(
 	let (name, item) = items.remove(index);
 
 	match action {
-		TrashAction::Restore => match item {
-			TrashItem::Dir(mut dir) => {
-				client
-					.restore_dir(&mut dir)
-					.await
-					.context("Failed to restore directory")?;
-				ui.print_success(&format!("Restored directory: {}", name));
-			}
-			TrashItem::File(mut file) => {
-				client
-					.restore_file(&mut file)
-					.await
-					.context("Failed to restore file")?;
-				ui.print_success(&format!("Restored file: {}", name));
-			}
-		},
+		TrashAction::Restore => restore_trash_item(ui, client, &name, item).await,
 		TrashAction::Delete => {
 			if !ui.prompt_confirm(&format!("Permanently delete {}?", name), false)? {
 				return Ok(());
 			}
-			match item {
-				TrashItem::Dir(dir) => {
-					client
-						.delete_dir_permanently(dir)
-						.await
-						.context("Failed to permanently delete directory")?;
-					ui.print_success(&format!("Permanently deleted directory: {}", name));
-				}
-				TrashItem::File(file) => {
-					client
-						.delete_file_permanently(file)
-						.await
-						.context("Failed to permanently delete file")?;
-					ui.print_success(&format!("Permanently deleted file: {}", name));
-				}
-			}
+			delete_trash_item_permanently(ui, client, &name, item).await
+		}
+	}
+}
+
+/// Permanently deletes the trashed item that `wanted` names (see [`pick_trash_item`]), asking
+/// first unless --yes is given.
+async fn delete_trash_item(ui: &mut UI, client: &mut LazyClient, wanted: &str) -> Result<()> {
+	let confirmation = format!("Permanently delete {}?", wanted);
+	// before logging in and listing the trash, so that a script missing --yes fails at once
+	ui.ensure_can_confirm(&confirmation)?;
+	let client = client.get(ui).await?;
+	let items = list_trash_items(client).await?;
+	let (name, item) = pick_trash_item(items, wanted, TrashItem::uuid_string)?;
+	if !ui.prompt_confirm(&format!("Permanently delete {}?", name), false)? {
+		return Ok(());
+	}
+	delete_trash_item_permanently(ui, client, &name, item).await
+}
+
+/// The one item among the trash's `items` (name and item) that `wanted` names: the item of that
+/// name, or else the item with that UUID. Trashed items can share a name, as they come from
+/// different directories; those are only told apart by their UUIDs, which the failure lists.
+fn pick_trash_item<T>(
+	items: Vec<(String, T)>,
+	wanted: &str,
+	uuid_of: impl Fn(&T) -> String,
+) -> Result<(String, T)> {
+	let named = items
+		.iter()
+		.filter(|(name, _)| name == wanted)
+		.map(|(_, item)| uuid_of(item))
+		.collect::<Vec<String>>();
+	if named.len() > 1 {
+		return Err(UI::failure(&format!(
+			"{} trashed items are named {}, so name one by its UUID: {}",
+			named.len(),
+			wanted,
+			named.join(", ")
+		)));
+	}
+	let found = if named.is_empty() {
+		items.into_iter().find(|(_, item)| uuid_of(item) == wanted)
+	} else {
+		items.into_iter().find(|(name, _)| name == wanted)
+	};
+	found.ok_or_else(|| UI::failure(&format!("No such item in the trash: {}", wanted)))
+}
+
+async fn restore_trash_item(
+	ui: &mut UI,
+	client: &Client,
+	name: &str,
+	item: TrashItem,
+) -> Result<()> {
+	match item {
+		TrashItem::Dir(mut dir) => {
+			client
+				.restore_dir(&mut dir)
+				.await
+				.context("Failed to restore directory")?;
+			ui.print_success(&format!("Restored directory: {}", name));
+		}
+		TrashItem::File(mut file) => {
+			client
+				.restore_file(&mut file)
+				.await
+				.context("Failed to restore file")?;
+			ui.print_success(&format!("Restored file: {}", name));
+		}
+	}
+	Ok(())
+}
+
+async fn delete_trash_item_permanently(
+	ui: &mut UI,
+	client: &Client,
+	name: &str,
+	item: TrashItem,
+) -> Result<()> {
+	match item {
+		TrashItem::Dir(dir) => {
+			client
+				.delete_dir_permanently(dir)
+				.await
+				.context("Failed to permanently delete directory")?;
+			ui.print_success(&format!("Permanently deleted directory: {}", name));
+		}
+		TrashItem::File(file) => {
+			client
+				.delete_file_permanently(file)
+				.await
+				.context("Failed to permanently delete file")?;
+			ui.print_success(&format!("Permanently deleted file: {}", name));
 		}
 	}
 	Ok(())
@@ -1991,6 +2066,58 @@ mod tests {
 	#[test]
 	fn no_progress_is_drawn_when_stdout_is_not_a_terminal() {
 		assert!(!CopyProgress::new(&Printed::default().ui()).enabled);
+	}
+
+	fn trash() -> Vec<(String, u128)> {
+		vec![
+			("a.txt".to_owned(), 1),
+			("shared".to_owned(), 2),
+			("shared".to_owned(), 3),
+		]
+	}
+
+	fn uuid_of(item: &u128) -> String {
+		Uuid::from_u128(*item).to_string()
+	}
+
+	#[test]
+	fn a_trashed_item_is_picked_by_its_name() {
+		assert_eq!(
+			pick_trash_item(trash(), "a.txt", uuid_of).unwrap(),
+			("a.txt".to_owned(), 1)
+		);
+	}
+
+	#[test]
+	fn a_trashed_item_sharing_its_name_is_picked_by_its_uuid() {
+		assert_eq!(
+			pick_trash_item(trash(), &uuid_of(&3), uuid_of).unwrap(),
+			("shared".to_owned(), 3)
+		);
+	}
+
+	#[test]
+	fn a_name_several_trashed_items_share_is_refused_listing_their_uuids() {
+		assert_eq!(
+			pick_trash_item(trash(), "shared", uuid_of)
+				.unwrap_err()
+				.to_string(),
+			format!(
+				"2 trashed items are named shared, so name one by its UUID: {}, {}",
+				uuid_of(&2),
+				uuid_of(&3)
+			)
+		);
+	}
+
+	#[test]
+	fn a_name_no_trashed_item_has_is_refused() {
+		assert_eq!(
+			pick_trash_item(trash(), "A.TXT", uuid_of)
+				.unwrap_err()
+				.to_string(),
+			"No such item in the trash: A.TXT"
+		);
 	}
 
 	#[test]
