@@ -737,6 +737,10 @@ async fn a_closed_engine_refuses_every_verb() {
 		"approve_deletions",
 		engine.approve_deletions(pair, "token".to_owned()).await,
 	);
+	assert_closed(
+		"restore_deletions",
+		engine.restore_deletions(pair, "token".to_owned()).await,
+	);
 	assert_closed("list_conflicts", engine.list_conflicts(pair, 0, 10).await);
 	assert_closed(
 		"resolve_conflict",

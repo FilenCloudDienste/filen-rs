@@ -4,8 +4,8 @@ use chrono::NaiveDate;
 use tempfile::TempDir;
 
 use super::{
-	DATED_MARKER, MigrateSummary, PruneSummary, migrate_legacy_trash, parse_bucket, prune_bin,
-	quarantine_local, retry_legacy_trash,
+	Binned, DATED_MARKER, MigrateSummary, PruneSummary, migrate_legacy_trash, parse_bucket,
+	prune_bin, quarantine_local, retry_legacy_trash,
 	test_support::{dated_bin, day},
 };
 use crate::sync_engine::scan::{ACCOUNT_DATA_DIR, LEGACY_TRASH_DIR, PairRoot, QUARANTINE_DIR};
@@ -805,4 +805,94 @@ fn a_retry_drops_a_gone_folder_and_keeps_the_ones_it_did_not_try() {
 		}
 	);
 	assert!(root.path().join(LEGACY_TRASH_DIR).is_dir());
+}
+
+/// BLAKE3 of `bytes`, as the baseline records a file's content.
+fn hash_of(bytes: &[u8]) -> filen_types::crypto::Blake3Hash {
+	filen_types::crypto::Blake3Hash::from(*blake3::hash(bytes).as_bytes())
+}
+
+/// A file binned with the content the other side holds goes back to its path from the newest
+/// bucket that holds one, creating the directories above it; the bin no longer holds it.
+#[test]
+fn a_binned_copy_with_the_recorded_content_is_taken_back_from_the_newest_bucket() {
+	let root = root();
+	dated_bin(root.path());
+	let older = NaiveDate::from_ymd_opt(2026, 10, 1).unwrap();
+	for (day, bytes) in [(older, b"SAME"), (day(), b"SAME")] {
+		let bucket = super::bucket_dir(root.path(), day);
+		fs::create_dir_all(bucket.join("d")).unwrap();
+		fs::write(bucket.join("d/a.txt"), bytes).unwrap();
+	}
+	let bin = Binned::open(root.path(), PairRoot::Directory).expect("a bin filed by day");
+
+	assert!(bin.take_back("d/a.txt", 4, &hash_of(b"SAME")));
+
+	assert_eq!(fs::read(root.path().join("d/a.txt")).unwrap(), b"SAME");
+	assert!(
+		!super::bucket_dir(root.path(), day())
+			.join("d/a.txt")
+			.exists()
+	);
+	assert!(
+		super::bucket_dir(root.path(), older)
+			.join("d/a.txt")
+			.exists(),
+		"only the newest copy is taken"
+	);
+}
+
+/// A binned copy whose size or content is not the recorded one stays in the bin, and so does one
+/// whose path the tree holds something at again: taking it back must never replace that.
+#[test]
+fn a_binned_copy_is_left_in_the_bin_unless_it_is_the_recorded_content_at_a_free_path() {
+	let root = root();
+	dated_bin(root.path());
+	let bucket = super::bucket_dir(root.path(), day());
+	fs::create_dir_all(&bucket).unwrap();
+	fs::write(bucket.join("a.txt"), b"DIFF").unwrap();
+	fs::write(bucket.join("b.txt"), b"SAME").unwrap();
+	fs::write(root.path().join("b.txt"), b"NEWER").unwrap();
+	let bin = Binned::open(root.path(), PairRoot::Directory).expect("a bin filed by day");
+
+	assert!(
+		!bin.take_back("a.txt", 4, &hash_of(b"SAME")),
+		"other content"
+	);
+	assert!(!bin.take_back("a.txt", 5, &hash_of(b"DIFF")), "other size");
+	assert!(
+		!bin.take_back("b.txt", 4, &hash_of(b"SAME")),
+		"the path is taken"
+	);
+	assert!(!bin.take_back("missing.txt", 4, &hash_of(b"SAME")));
+
+	assert!(!root.path().join("a.txt").exists());
+	assert_eq!(fs::read(root.path().join("b.txt")).unwrap(), b"NEWER");
+	assert_eq!(fs::read(bucket.join("a.txt")).unwrap(), b"DIFF");
+	assert_eq!(fs::read(bucket.join("b.txt")).unwrap(), b"SAME");
+}
+
+/// Only a bin filed by day is a place to take a file back from: in an unmarked one a top-level
+/// name that reads as a day may be the user's own folder. No bin, or no bucket, is nothing to
+/// take from.
+#[test]
+fn only_a_bin_filed_by_day_with_a_bucket_is_taken_from() {
+	let empty = root();
+	dated_bin(empty.path());
+	assert!(
+		Binned::open(empty.path(), PairRoot::Directory).is_none(),
+		"a bin with no bucket"
+	);
+	let root = root();
+	assert!(
+		Binned::open(root.path(), PairRoot::Directory).is_none(),
+		"no bin"
+	);
+	let unmarked = root.path().join(QUARANTINE_DIR).join("2026-10-26");
+	fs::create_dir_all(&unmarked).unwrap();
+	fs::write(unmarked.join("a.txt"), b"SAME").unwrap();
+	assert!(
+		Binned::open(root.path(), PairRoot::Directory).is_none(),
+		"an unmarked bin"
+	);
 }

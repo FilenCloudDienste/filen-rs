@@ -421,6 +421,58 @@ impl Screen {
 			.execute("UPDATE screen SET held = 0 WHERE held = 1", [])
 	}
 
+	/// Turn the held batch into its undoing: a restoration of the held batch (see
+	/// `SyncEngine::restore_deletions`). Each held deletion becomes the write that puts the deleted
+	/// side back from the other side's copy — a local deletion's remote item is downloaded (a
+	/// directory created) again, a remote deletion's local item uploaded (created) again — and
+	/// runs after the rest of the plan, parents before children. Says how many actions it
+	/// restores, and how many it takes out of the plan.
+	///
+	/// A held type flip cannot be undone that way: the other side holds a new item of the other
+	/// kind at the path, and putting the old one back would mean renaming one of them. The flip —
+	/// its deletion, its create, and every held deletion under its path — is taken out of the plan
+	/// instead, unapplied, for the next pass to hold again on its own.
+	pub(in super::super) fn restore_held(&mut self) -> rusqlite::Result<(usize, usize)> {
+		let (dir, file) = (NodeKind::Dir.as_i64(), NodeKind::File.as_i64());
+		let restore = self.stage.conn.transaction()?;
+		// Only a type flip holds a create.
+		let dropped = restore.execute(
+			&format!(
+				"DELETE FROM screen WHERE held = 1 AND EXISTS (SELECT 1 FROM screen AS flip
+				  WHERE flip.held = 1 AND flip.op IN {CREATES} AND (screen.path = flip.path
+				   OR (screen.path >= flip.path || '/' AND screen.path < flip.path || '0')))"
+			),
+			[],
+		)?;
+		// After everything else, by path: a directory sorts before what is under it. New positions
+		// all lie past the old ones, so no move lands on a row still to move.
+		restore.execute(
+			"UPDATE screen SET pos = moved.pos FROM (SELECT pos AS old,
+			  (SELECT MAX(pos) FROM screen) + ROW_NUMBER() OVER (ORDER BY path, pos) AS pos
+			  FROM screen WHERE held = 1) AS moved
+			 WHERE screen.pos = moved.old",
+			[],
+		)?;
+		let restored = restore.execute(
+			&format!(
+				"UPDATE screen SET
+				  op = CASE
+				   WHEN op = {OP_DELETE_LOCAL} AND kind = {dir} THEN {OP_CREATE_REMOTE_DIR}
+				   WHEN op = {OP_DELETE_LOCAL} THEN {OP_UPLOAD}
+				   WHEN kind = {dir} THEN {OP_CREATE_LOCAL_DIR}
+				   ELSE {OP_DOWNLOAD} END,
+				  remote_uuid = CASE WHEN op = {OP_TRASH_REMOTE} AND kind = {file}
+				   THEN remote_uuid END,
+				  kind = NULL,
+				  held = 0
+				 WHERE held = 1 AND op IN {DELETES}"
+			),
+			[],
+		)?;
+		restore.commit()?;
+		Ok((restored, dropped))
+	}
+
 	/// Hand `visit` every held action in the order of the held batch's token lines: the local
 	/// deletions, then the rest, then the remote deletions, each by path — `local` before `other`
 	/// before `remote`, which is how the lines sort.

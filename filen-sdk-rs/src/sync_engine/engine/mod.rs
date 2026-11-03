@@ -1708,9 +1708,10 @@ pub struct SyncEngine {
 	/// One cache sync-root registration per pair, kept alive for as long as the pair is
 	/// registered; dropping one unsubscribes it.
 	roots: Mutex<HashMap<PairId, Subscription>>,
-	/// One-shot mass-delete approvals: pair -> the batch token the caller approved. The next pass
-	/// whose held batch hashes to that token executes it; any other batch is held again.
-	approvals: Mutex<HashMap<PairId, String>>,
+	/// One-shot decisions on a held mass-delete batch: pair -> the batch token the caller named and
+	/// what to do with it. The next pass whose held batch hashes to that token applies or restores
+	/// it; any other batch is held again.
+	approvals: Mutex<HashMap<PairId, (String, HeldBatch)>>,
 	/// Serializes [`add_pair`](SyncEngine::add_pair): its overlap check reads the registry and then
 	/// inserts into it, with an `await` in between, so two concurrent registrations would otherwise
 	/// both find the roots free and both commit — the exact overlap the check exists to refuse.
@@ -6016,11 +6017,44 @@ impl SyncEngine {
 	/// than at its next change or safety-net pass. Without a watch, the next
 	/// [`sync_once`](Self::sync_once) is that pass.
 	pub async fn approve_deletions(&self, pair: PairId, pass_token: &str) {
+		self.decide_held(pair, pass_token, HeldBatch::Apply).await;
+	}
+
+	/// Undo the mass-delete batch the guard is currently holding for `pair` instead of applying it,
+	/// naming it by its `pass_token` as [`approve_deletions`](Self::approve_deletions) does: each
+	/// held deletion's item is put back on the side it was deleted from, from the other side's
+	/// copy. A file deleted locally is downloaded again — or, when the pair's `.filen-sync-trash`
+	/// bin holds a copy with the remote's exact content, moved back out of the bin instead, with no
+	/// transfer — and one deleted in the cloud is uploaded again from the local copy; a directory is
+	/// created again on that side. Both sides then match, so the hold clears: the pass that
+	/// restores reports no held batch, and the passes after it are no longer made whole by it.
+	///
+	/// It has the approval's shape: one-shot, for the batch that token names only, and applied by
+	/// the pair's next pass, which it makes due and whole and wakes a watch for. A token that names
+	/// no batch the next pass holds — a stale one — restores nothing; that pass holds its batch
+	/// again under its own token. A restoration and an approval for the same pair replace each
+	/// other: the later call is the one the next pass acts on. In memory only, as an approval is.
+	///
+	/// A held type flip — an item replaced by one of the other kind — is not restored: putting the
+	/// old item back would mean renaming the new one. That pass leaves it, and everything held under
+	/// its path, unapplied, and the next pass holds it again on its own.
+	///
+	/// Safe to repeat and to interrupt: the restoring pass runs the uploads, downloads and
+	/// directory creates any pass runs, each recorded as it lands, and a pass that stops part of the
+	/// way leaves what it restored as synced and the rest still deleted, which the next pass holds
+	/// again as a smaller batch to restore or approve.
+	pub async fn restore_deletions(&self, pair: PairId, pass_token: &str) {
+		self.decide_held(pair, pass_token, HeldBatch::Restore).await;
+	}
+
+	/// Store `decision` on the batch `pass_token` names for `pair`'s next pass, and make that pass
+	/// due and whole.
+	async fn decide_held(&self, pair: PairId, pass_token: &str, decision: HeldBatch) {
 		self.approvals
 			.lock()
 			.await
-			.insert(pair, pass_token.to_string());
-		// After the approval is stored, so the pass this wakes finds it. A pair with no changelist
+			.insert(pair, (pass_token.to_string(), decision));
+		// After the decision is stored, so the pass this wakes finds it. A pair with no changelist
 		// is gone, or has not passed yet: its next pass reads everything anyway.
 		if let Some(changes) = self.existing_pair_changes(pair).await {
 			changes.force(FullPassReason::DeletionHold);
@@ -6028,14 +6062,16 @@ impl SyncEngine {
 		}
 	}
 
-	/// Consume a pending approval for `pair` if it names exactly this batch.
-	async fn take_approval(&self, pair: PairId, pass_token: &str) -> bool {
+	/// Consume a pending decision for `pair` if it names exactly this batch.
+	async fn take_approval(&self, pair: PairId, pass_token: &str) -> Option<HeldBatch> {
 		let mut approvals = self.approvals.lock().await;
-		if approvals.get(&pair).is_some_and(|held| held == pass_token) {
-			approvals.remove(&pair);
-			true
-		} else {
-			false
+		match approvals.get(&pair) {
+			Some((held, decision)) if held == pass_token => {
+				let decision = *decision;
+				approvals.remove(&pair);
+				Some(decision)
+			}
+			_ => None,
 		}
 	}
 
@@ -6916,23 +6952,45 @@ impl SyncEngine {
 		})
 		.await?;
 		let mut screened = screened?;
-		// A one-shot approval releases the held batch it names — and only that batch.
+		// A one-shot approval releases the held batch it names — and only that batch; a one-shot
+		// restoration undoes it instead.
 		if let Some(token) = screened.pass_token.clone()
-			&& self.take_approval(pair, &token).await
+			&& let Some(decision) = self.take_approval(pair, &token).await
 		{
-			let released;
-			(screened, released) = off_runtime("releasing the approved batch", move || {
-				let released = screened.approve();
-				(screened, released)
-			})
-			.await?;
-			// Unwrapped before the log: tracing evaluates an event's arguments only when it is
-			// enabled.
-			let released = released?;
-			tracing::debug!(
-				"sync_once[pair {pair}]: approval {token} matched — applying {released} held \
-				 deletion(s)"
-			);
+			match decision {
+				HeldBatch::Apply => {
+					let released;
+					(screened, released) = off_runtime("releasing the approved batch", move || {
+						let released = screened.approve();
+						(screened, released)
+					})
+					.await?;
+					// Unwrapped before the log: tracing evaluates an event's arguments only when it
+					// is enabled.
+					let released = released?;
+					tracing::debug!(
+						"sync_once[pair {pair}]: approval {token} matched — applying {released} \
+						 held deletion(s)"
+					);
+				}
+				HeldBatch::Restore => {
+					let bin = (
+						PathBuf::from(&prep.record.local_root),
+						self.pair_root(prep.record.remote_root),
+					);
+					let restored;
+					(prep, screened, restored) =
+						off_runtime("restoring the held batch", move || {
+							let restored = screened.restore(&prep.baseline, &bin.0, bin.1);
+							(prep, screened, restored)
+						})
+						.await?;
+					let restored = restored?;
+					tracing::debug!(
+						"sync_once[pair {pair}]: restoration {token} matched — {restored:?}"
+					);
+				}
+			}
 		}
 		report.conflicts = mem::take(&mut screened.conflicts);
 		// `held` can also carry the create half of a held type flip; `held_deletions()` counts only
@@ -7288,6 +7346,27 @@ fn adoption_refusal(refused: Option<RefuseReason>, state: &guard::ScreenState) -
 	)
 }
 
+/// What a caller decided about a held mass-delete batch (see
+/// [`SyncEngine::approve_deletions`] and [`SyncEngine::restore_deletions`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeldBatch {
+	/// Apply the held deletions.
+	Apply,
+	/// Put back what they deleted.
+	Restore,
+}
+
+/// What [`Screened::restore`] did with a held batch.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Restored {
+	/// Locally deleted files taken back out of the pair's bin, which leave the plan.
+	from_bin: usize,
+	/// Actions that put an item back, which the pass runs.
+	actions: usize,
+	/// Actions of a held type flip, which the pass leaves unapplied.
+	unrestorable: usize,
+}
+
 /// A reconciled, guard-screened pass.
 struct Screened {
 	/// Paths surfaced as two-way conflicts (held, never applied).
@@ -7327,6 +7406,44 @@ impl Screened {
 		self.reason = None;
 		self.pass_token = None;
 		Ok(released)
+	}
+
+	/// Undo the held batch, which a restoration names (see
+	/// [`SyncEngine::restore_deletions`]): a locally deleted file the pair's bin (under
+	/// `local_root`) holds with its recorded content (`rows`) is taken back out of it there and
+	/// then, and the rest of the batch becomes the transfers and creates that put each item back
+	/// ([`Screen::restore_held`]).
+	fn restore(
+		&mut self,
+		rows: &Baseline,
+		local_root: &Path,
+		pair_root: PairRoot,
+	) -> Result<Restored, Error> {
+		let mut restored = Restored::default();
+		if let Some(plan) = &mut self.plan {
+			if let Some(bin) = bin::Binned::open(local_root, pair_root) {
+				restored.from_bin = plan
+					.retain(Rows::Held, |action| match action {
+						SyncAction::TrashRemote {
+							rel_path,
+							kind: NodeKind::File,
+							..
+						} => !rows.get(rel_path).is_some_and(|row| {
+							matches!((row.size, &row.content_hash), (Some(size), Some(hash))
+								if bin.take_back(rel_path, size, hash))
+						}),
+						_ => true,
+					})
+					.map_err(|e| db_error(e, "restoring the held batch"))?;
+			}
+			(restored.actions, restored.unrestorable) = plan
+				.restore_held()
+				.map_err(|e| db_error(e, "restoring the held batch"))?;
+		}
+		self.dropped += restored.unrestorable;
+		self.reason = None;
+		self.pass_token = None;
+		Ok(restored)
 	}
 
 	/// Fold every deletion a directory deletion of the same side carries out anyway into that

@@ -1058,6 +1058,7 @@ async fn every_control_verb_is_refused_once_the_engine_is_closed() {
 		refusal_message(core.cancel_paused_actions(pair).await),
 		refusal_message(core.resume_pair(pair).await),
 		refusal_message(core.approve_deletions(pair, "token").await),
+		refusal_message(core.restore_deletions(pair, "token").await),
 		refusal_message(core.list_conflicts(pair, 0, 10).await),
 		refusal_message(
 			core.resolve_conflict(pair, "a", ConflictResolution::KeepLocal)

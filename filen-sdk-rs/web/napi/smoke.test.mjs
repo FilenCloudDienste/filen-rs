@@ -362,6 +362,7 @@ describe("exports", () => {
 			"removePair",
 			"requestPass",
 			"resolveConflict",
+			"restoreDeletions",
 			"resumePair",
 			"retryAll",
 			"retryPath",

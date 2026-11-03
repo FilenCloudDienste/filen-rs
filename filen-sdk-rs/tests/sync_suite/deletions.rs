@@ -8,7 +8,9 @@ use filen_sdk_rs::fs::{
 	dir::RemoteDirectory,
 	file::RemoteFile,
 };
-use filen_sdk_rs::sync_engine::{DeleteGuard, GuardReason, SyncEngine, SyncEvent, SyncMode};
+use filen_sdk_rs::sync_engine::{
+	DeleteGuard, FullPassReason, GuardReason, SyncEngine, SyncEvent, SyncMode,
+};
 use filen_types::fs::ParentUuid;
 use uuid::Uuid;
 
@@ -2010,5 +2012,134 @@ async fn delete_bin_a_first_pass_bins_filen_syncs_trash() {
 		"sub/keep.txt was not uploaded"
 	);
 
+	sc.cleanup();
+}
+
+// ============================================================================
+// DELETE-R — restoring a held batch instead of approving it
+// ============================================================================
+
+const TOTAL_R: usize = 6;
+const DELETE_R: usize = 3;
+
+/// A pair holding every batch of more than two deletions, over [`TOTAL_R`] synced files `fN.txt`.
+async fn held_pair(mode: SyncMode) -> SingleClient {
+	let sc = single_client(mode).await;
+	for i in 0..TOTAL_R {
+		write_file(&sc.local, &format!("f{i}.txt"), format!("c{i}").as_bytes());
+	}
+	let r1 = sc.sync().await;
+	assert_eq!(r1.uploaded, TOTAL_R, "{r1:?}");
+	sc.engine
+		.set_delete_guard(sc.pair, DeleteGuard::new(2, 0.0).unwrap())
+		.await
+		.unwrap();
+	sc
+}
+
+/// Restoring a held batch of LOCAL deletions downloads the deleted files again: nothing is
+/// trashed in the cloud, both sides match, and the hold is gone from the pass after.
+#[shared_test_runtime]
+async fn delete_r1_restoring_local_deletions_downloads_them_again() {
+	let sc = held_pair(SyncMode::TwoWay).await;
+	for i in 0..DELETE_R {
+		std::fs::remove_file(sc.local.join(format!("f{i}.txt"))).unwrap();
+	}
+	let r2 = sc.sync().await;
+	assert_eq!(r2.held_deletions(), DELETE_R, "{r2:?}");
+	let token = r2.deletion_token.clone().expect("a held batch has a token");
+
+	sc.engine.restore_deletions(sc.pair, &token).await;
+	let r3 = sc.sync().await;
+	assert!(r3.errors.is_empty(), "{r3:?}");
+	assert_eq!(
+		r3.downloaded, DELETE_R,
+		"the deleted files come back: {r3:?}"
+	);
+	assert_eq!(r3.remotely_trashed, 0, "nothing trashed: {r3:?}");
+	assert_eq!(r3.held_deletions(), 0, "{r3:?}");
+	assert_eq!(r3.deletion_token, None, "{r3:?}");
+	for i in 0..TOTAL_R {
+		assert!(
+			read_eq(&sc.local, &format!("f{i}.txt"), format!("c{i}").as_bytes()),
+			"f{i}.txt not restored"
+		);
+	}
+	let (_d, files) = list_root(&sc).await;
+	assert_eq!(files.len(), TOTAL_R, "the cloud kept every file");
+
+	let r4 = sc.sync().await;
+	assert_eq!(r4.held_deletions(), 0, "{r4:?}");
+	assert_ne!(
+		r4.full_pass,
+		Some(FullPassReason::DeletionHold),
+		"the pass after is no longer made whole by the hold: {r4:?}"
+	);
+	sc.cleanup();
+}
+
+/// Restoring a held batch of CLOUD deletions uploads the local copies again: nothing is deleted
+/// locally, and the pass after has nothing to do.
+#[shared_test_runtime]
+async fn delete_r2_restoring_cloud_deletions_uploads_them_again() {
+	let sc = held_pair(SyncMode::TwoWay).await;
+	let (_d, files) = list_root(&sc).await;
+	for i in 0..DELETE_R {
+		let mut file = find_file(&files, &format!("f{i}.txt"))
+			.expect("synced")
+			.clone();
+		sc.resources.client.trash_file(&mut file).await.unwrap();
+		cache_drops(&sc, file.uuid()).await;
+	}
+	let r2 = sc.sync().await;
+	assert_eq!(r2.held_deletions(), DELETE_R, "{r2:?}");
+	assert_eq!(r2.locally_deleted, 0, "{r2:?}");
+	let token = r2.deletion_token.clone().expect("a held batch has a token");
+
+	sc.engine.restore_deletions(sc.pair, &token).await;
+	let r3 = sc.sync().await;
+	assert!(r3.errors.is_empty(), "{r3:?}");
+	assert_eq!(
+		r3.uploaded, DELETE_R,
+		"the deleted files go back up: {r3:?}"
+	);
+	assert_eq!(r3.locally_deleted, 0, "nothing deleted locally: {r3:?}");
+	assert_eq!(r3.held_deletions(), 0, "{r3:?}");
+	let (_d, files) = list_root(&sc).await;
+	assert_eq!(files.len(), TOTAL_R, "{files:?}");
+	for i in 0..TOTAL_R {
+		assert!(read_eq(
+			&sc.local,
+			&format!("f{i}.txt"),
+			format!("c{i}").as_bytes()
+		));
+	}
+	sc.cleanup();
+}
+
+/// A restoration naming a batch the pass does not hold restores nothing: the pass holds its own
+/// batch again under the same token, and that token still restores it.
+#[shared_test_runtime]
+async fn delete_r3_a_stale_token_restores_nothing() {
+	let sc = held_pair(SyncMode::TwoWay).await;
+	for i in 0..DELETE_R {
+		std::fs::remove_file(sc.local.join(format!("f{i}.txt"))).unwrap();
+	}
+	let r2 = sc.sync().await;
+	let token = r2.deletion_token.clone().expect("a held batch has a token");
+
+	sc.engine
+		.restore_deletions(sc.pair, "0123456789abcdef")
+		.await;
+	let r3 = sc.sync().await;
+	assert_eq!(r3.downloaded, 0, "{r3:?}");
+	assert_eq!(r3.remotely_trashed, 0, "{r3:?}");
+	assert_eq!(r3.held_deletions(), DELETE_R, "{r3:?}");
+	assert_eq!(r3.deletion_token.as_deref(), Some(token.as_str()), "{r3:?}");
+
+	sc.engine.restore_deletions(sc.pair, &token).await;
+	let r4 = sc.sync().await;
+	assert_eq!(r4.downloaded, DELETE_R, "{r4:?}");
+	assert_eq!(r4.held_deletions(), 0, "{r4:?}");
 	sc.cleanup();
 }

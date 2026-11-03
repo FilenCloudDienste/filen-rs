@@ -28,10 +28,12 @@ use std::{
 
 use chrono::{Days, NaiveDate};
 
+use filen_types::crypto::Blake3Hash;
+
 use super::{
-	apply::{io_err, local_path},
+	apply::{confined_local_target, io_err, local_path},
 	names,
-	scan::{PairRoot, QUARANTINE_DIR, is_account_data, is_legacy_trash},
+	scan::{PairRoot, QUARANTINE_DIR, hash_file, is_account_data, is_legacy_trash},
 };
 
 #[cfg(test)]
@@ -137,6 +139,78 @@ fn unique_quarantine_dest(base: PathBuf) -> PathBuf {
 		}
 	}
 	base
+}
+
+/// The pair's bin as a place to take a file back out of instead of downloading it again (see
+/// [`take_back`](Self::take_back)): its day buckets, newest first.
+pub(super) struct Binned {
+	root: PathBuf,
+	pair_root: PairRoot,
+	buckets: Vec<PathBuf>,
+}
+
+impl Binned {
+	/// The bin under `root`, or `None` when there is none filed by day (see [`DATED_MARKER`]), or
+	/// it holds no bucket, or it cannot be listed. Lists the bin's top level once.
+	pub(super) fn open(root: &Path, pair_root: PairRoot) -> Option<Self> {
+		let bin = root.join(QUARANTINE_DIR);
+		if !bin.symlink_metadata().ok()?.is_dir()
+			|| bin.join(DATED_MARKER).symlink_metadata().is_err()
+		{
+			return None;
+		}
+		let mut days: Vec<NaiveDate> = fs::read_dir(&bin)
+			.ok()?
+			.filter_map(|entry| parse_bucket(&entry.ok()?.file_name()))
+			.collect();
+		if days.is_empty() {
+			return None;
+		}
+		days.sort_unstable_by(|a, b| b.cmp(a));
+		Some(Self {
+			root: root.to_path_buf(),
+			pair_root,
+			buckets: days.into_iter().map(|day| bucket_dir(root, day)).collect(),
+		})
+	}
+
+	/// Put a file the bin holds at `rel_path` back at `rel_path` in the tree, when it is exactly
+	/// `size` bytes hashing to `hash` — the copy the other side holds — and nothing is at
+	/// `rel_path` now. The newest bucket holding such a file gives it up. Says whether it did.
+	///
+	/// The file is linked into place, which never replaces what may have appeared at the path
+	/// since it was looked at, and only then unlinked from the bin; a file system without hard
+	/// links, or anything else that fails, leaves both where they were, to be downloaded instead.
+	/// The directories above the path are created as they would be for the download.
+	pub(super) fn take_back(&self, rel_path: &str, size: u64, hash: &Blake3Hash) -> bool {
+		let Some(binned) = self.buckets.iter().find_map(|bucket| {
+			let binned = local_path(bucket, rel_path);
+			let meta = binned.symlink_metadata().ok()?;
+			(meta.is_file()
+				&& meta.len() == size
+				&& hash_file(&binned).is_ok_and(|binned| binned == *hash))
+			.then_some(binned)
+		}) else {
+			return false;
+		};
+		let taken = confined_local_target(&self.root, self.pair_root, rel_path)
+			.map_err(|e| io::Error::other(e.to_string()))
+			.and_then(|target| {
+				if let Some(parent) = target.parent() {
+					fs::create_dir_all(parent)?;
+				}
+				fs::hard_link(&binned, &target)
+			});
+		if let Err(e) = taken {
+			tracing::debug!("cannot take {binned:?} back out of the sync bin to {rel_path:?}: {e}");
+			return false;
+		}
+		if let Err(e) = fs::remove_file(&binned) {
+			// Back in the tree all the same; the bin keeps a spare copy until it is pruned.
+			tracing::debug!("cannot remove {binned:?} from the sync bin once taken back: {e}");
+		}
+		true
+	}
 }
 
 /// How many days a bucket is kept: one more than this many days old (by the UTC calendar) and it

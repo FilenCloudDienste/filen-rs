@@ -833,6 +833,15 @@ impl SyncEngineCore {
 		Ok(())
 	}
 
+	async fn restore_deletions(&self, pair_id: u64, pass_token: &str) -> Result<(), Error> {
+		let pair = pair_id_in(pair_id)?;
+		self.engine()?
+			.engine
+			.restore_deletions(pair, pass_token)
+			.await;
+		Ok(())
+	}
+
 	async fn list_conflicts(
 		&self,
 		pair_id: u64,
@@ -1281,6 +1290,18 @@ impl JsSyncEngine {
 	pub async fn approve_deletions(&self, pair_id: u64, pass_token: String) -> Result<(), Error> {
 		detached(Arc::clone(&self.core), move |core| async move {
 			core.approve_deletions(pair_id, &pass_token).await
+		})
+		.await
+	}
+
+	/// Let the next pass put back what the deletions the guard held under `pass_token` deleted,
+	/// from the other side's copy (or the pair's bin), instead of applying them; both sides then
+	/// match and the hold clears. A held type flip is left for the pass after to hold again. In
+	/// memory only: lost when the process ends.
+	#[napi_export]
+	pub async fn restore_deletions(&self, pair_id: u64, pass_token: String) -> Result<(), Error> {
+		detached(Arc::clone(&self.core), move |core| async move {
+			core.restore_deletions(pair_id, &pass_token).await
 		})
 		.await
 	}

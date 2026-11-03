@@ -674,7 +674,7 @@ fn local_target(root: &Path, rel_path: &str) -> PathBuf {
 /// rejected too, and so is one that resolves into the account's data directory in a pair
 /// `pair_root` says is rooted at the drive. Reads/quarantine moves are unaffected; only writes are
 /// confined.
-fn confined_local_target(
+pub(super) fn confined_local_target(
 	root: &Path,
 	pair_root: PairRoot,
 	rel_path: &str,

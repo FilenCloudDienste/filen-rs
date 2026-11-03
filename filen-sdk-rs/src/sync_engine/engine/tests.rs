@@ -4787,13 +4787,314 @@ async fn an_approval_makes_the_next_pass_due_and_wakes_the_watch() {
 		Some(FullPassReason::DeletionHold),
 		"and reads whole, the only read that reproduces the batch"
 	);
-	assert!(
+	assert_eq!(
 		engine.take_approval(pair, "0123456789abcdef").await,
+		Some(HeldBatch::Apply),
 		"the approval itself is stored for that pass"
 	);
 
 	drop(engine);
 	std::fs::remove_file(&path).ok();
+}
+
+/// A restoration has the approval's shape: stored for the next pass, which it makes due and
+/// whole and wakes the watch for. It acts only on the batch its token names — a stale token is
+/// never taken for the batch the pass holds — and a later approval or restoration of the pair
+/// replaces it.
+#[tokio::test]
+async fn a_restoration_names_one_batch_and_wakes_the_watch() {
+	let path = std::env::temp_dir().join(format!("filen_sync_restore_{}.db", Uuid::new_v4()));
+	let engine = SyncEngine::open(Arc::new(offline_client()), path.clone())
+		.await
+		.unwrap();
+	let (pair, _) = locked(&engine.control)
+		.create_pair("/root", Uuid::new_v4(), SyncMode::TwoWay)
+		.unwrap();
+	let changes = engine.pair_changes(pair).await;
+	changes.cover_local();
+	changes.note_deletion_hold();
+	let doorbell = changes.doorbell();
+	assert!(changes.is_idle(), "a hold alone wakes nothing");
+
+	engine.restore_deletions(pair, "stale").await;
+	assert!(
+		doorbell.notified().now_or_never().is_some(),
+		"the restoration must wake the pair's watch"
+	);
+	assert_eq!(
+		changes.take().full_pass_reason(10),
+		Some(FullPassReason::DeletionHold),
+		"and reads whole, the only read that reproduces the batch"
+	);
+	assert_eq!(
+		engine.take_approval(pair, "current").await,
+		None,
+		"a stale token restores nothing the pass holds now"
+	);
+
+	engine.approve_deletions(pair, "current").await;
+	engine.restore_deletions(pair, "current").await;
+	assert_eq!(
+		engine.take_approval(pair, "current").await,
+		Some(HeldBatch::Restore),
+		"the later decision on the batch is the one the pass acts on"
+	);
+	assert_eq!(
+		engine.take_approval(pair, "current").await,
+		None,
+		"and it is one-shot"
+	);
+
+	drop(engine);
+	std::fs::remove_file(&path).ok();
+}
+
+/// `prep` reconciled and screened as a pass screens it, under a guard that holds every deletion.
+fn screened_holding_all(prep: &mut Prepared) -> (tempfile::TempDir, Screened) {
+	prep.record.delete_guard = DeleteGuard::new(0, 0.0).unwrap();
+	let (dir, stage) = Stage::in_temp_dir();
+	let screened = reconcile_and_screen(prep, screen_state(prep), || Ok(stage)).unwrap();
+	assert!(screened.pass_token.is_some(), "the batch is held");
+	(dir, screened)
+}
+
+/// The rows of a tree synced on both sides: `d/`, `d/a.txt`, `d/sub/`, `d/sub/b.txt` and
+/// `top.txt`, each file `size` bytes hashing to `hash`, plus `keep.txt`, which neither side
+/// deletes.
+fn synced_tree(hash: Blake3Hash, size: u64) -> (HashMap<String, BaselineEntry>, Vec<RemoteNode>) {
+	let dirs = [("d", 1), ("d/sub", 2)];
+	let files = [
+		("d/a.txt", 3),
+		("d/sub/b.txt", 4),
+		("top.txt", 5),
+		("keep.txt", 6),
+	];
+	let mut rows = HashMap::new();
+	let mut remote = Vec::new();
+	for (path, n) in dirs {
+		rows.insert(path.to_string(), dir_row(path, Uuid::from_u128(n)));
+		remote.push(remote_dir(path, Uuid::from_u128(n)));
+	}
+	for (path, n) in files {
+		rows.insert(
+			path.to_string(),
+			synced_file(path, Uuid::from_u128(n), hash, size),
+		);
+		remote.push(remote_file(path, Uuid::from_u128(n), hash, size));
+	}
+	(rows, remote)
+}
+
+fn download(rel_path: &str, n: u128) -> SyncAction {
+	SyncAction::DownloadFile {
+		rel_path: rel_path.to_string(),
+		remote_uuid: Uuid::from_u128(n),
+	}
+}
+
+fn create_local_dir(rel_path: &str) -> SyncAction {
+	SyncAction::CreateLocalDir {
+		rel_path: rel_path.to_string(),
+	}
+}
+
+/// Restoring a held batch of LOCAL deletions downloads each deleted file again and creates each
+/// deleted directory again, parents before what is under them, and clears the hold: the pass
+/// reports no held batch and its next pass is not made whole by one.
+#[test]
+fn restoring_local_deletions_downloads_them_again() {
+	let (rows, remote) = synced_tree(hash(1), 4);
+	let mut prep = prepared(
+		SyncMode::TwoWay,
+		rows,
+		vec![local_file("keep.txt", hash(1))],
+		view(remote, Vec::new(), &[]),
+		HashMap::new(),
+	);
+	let (_dir, mut screened) = screened_holding_all(&mut prep);
+	assert_eq!(screened.count(Rows::Held).unwrap(), 5);
+
+	let root = tempfile::tempdir().unwrap();
+	let restored = screened
+		.restore(&prep.baseline, root.path(), PairRoot::Directory)
+		.unwrap();
+
+	assert_eq!(
+		restored,
+		Restored {
+			from_bin: 0,
+			actions: 5,
+			unrestorable: 0,
+		}
+	);
+	assert_eq!(
+		(screened.reason.clone(), screened.pass_token.clone()),
+		(None, None)
+	);
+	assert_eq!(screened.count(Rows::Held).unwrap(), 0);
+	screened.fold_subsumed().unwrap();
+	assert_eq!(
+		read(&screened, Rows::Safe),
+		[
+			create_local_dir("d"),
+			download("d/a.txt", 3),
+			create_local_dir("d/sub"),
+			download("d/sub/b.txt", 4),
+			download("top.txt", 5),
+		]
+	);
+	let report = SyncReport {
+		full_pass: Some(FullPassReason::DeletionHold),
+		guard: screened.reason.clone(),
+		..SyncReport::default()
+	};
+	assert_eq!(next_pass_scope(&report), None, "the hold is cleared");
+}
+
+/// Restoring a held batch of CLOUD deletions uploads each deleted file again from the local copy
+/// and creates each deleted directory again, parents first.
+#[test]
+fn restoring_cloud_deletions_uploads_them_again() {
+	let (rows, remote) = synced_tree(hash(1), 4);
+	let local = ["d", "d/sub"]
+		.map(local_dir)
+		.into_iter()
+		.chain(
+			["d/a.txt", "d/sub/b.txt", "top.txt", "keep.txt"].map(|path| local_file(path, hash(1))),
+		)
+		.collect();
+	let kept = remote
+		.into_iter()
+		.filter(|node| node.rel_path == "keep.txt")
+		.collect();
+	let mut prep = prepared(
+		SyncMode::TwoWay,
+		rows,
+		local,
+		view(kept, Vec::new(), &[]),
+		HashMap::new(),
+	);
+	let (_dir, mut screened) = screened_holding_all(&mut prep);
+
+	let root = tempfile::tempdir().unwrap();
+	let restored = screened
+		.restore(&prep.baseline, root.path(), PairRoot::Directory)
+		.unwrap();
+
+	assert_eq!(restored.actions, 5, "{restored:?}");
+	assert_eq!(screened.pass_token, None);
+	assert_eq!(
+		read(&screened, Rows::Safe),
+		[
+			SyncAction::CreateRemoteDir {
+				rel_path: "d".to_string()
+			},
+			upload("d/a.txt"),
+			SyncAction::CreateRemoteDir {
+				rel_path: "d/sub".to_string()
+			},
+			upload("d/sub/b.txt"),
+			upload("top.txt"),
+		]
+	);
+}
+
+/// A locally deleted file the pair's bin holds with the content the remote has is moved back out
+/// of the bin rather than downloaded again; one whose binned copy differs is downloaded, and the
+/// bin keeps that copy.
+#[test]
+fn restoring_takes_a_matching_copy_back_out_of_the_bin() {
+	let bytes = b"SAME";
+	let synced = Blake3Hash::from(*blake3::hash(bytes).as_bytes());
+	let (rows, remote) = synced_tree(synced, 4);
+	let mut prep = prepared(
+		SyncMode::TwoWay,
+		rows,
+		vec![local_file("keep.txt", synced)],
+		view(remote, Vec::new(), &[]),
+		HashMap::new(),
+	);
+	let (_dir, mut screened) = screened_holding_all(&mut prep);
+	let root = tempfile::tempdir().unwrap();
+	dated_bin(root.path());
+	let binned = bucket(root.path(), day());
+	std::fs::create_dir_all(binned.join("d/sub")).unwrap();
+	std::fs::write(binned.join("d/a.txt"), bytes).unwrap();
+	std::fs::write(binned.join("d/sub/b.txt"), b"DIFF").unwrap();
+
+	let restored = screened
+		.restore(&prep.baseline, root.path(), PairRoot::Directory)
+		.unwrap();
+
+	assert_eq!(
+		restored,
+		Restored {
+			from_bin: 1,
+			actions: 4,
+			unrestorable: 0,
+		}
+	);
+	assert_eq!(std::fs::read(root.path().join("d/a.txt")).unwrap(), bytes);
+	assert!(!binned.join("d/a.txt").exists(), "taken out of the bin");
+	assert_eq!(std::fs::read(binned.join("d/sub/b.txt")).unwrap(), b"DIFF");
+	assert!(!root.path().join("d/sub/b.txt").exists());
+	assert_eq!(
+		read(&screened, Rows::Safe),
+		[
+			create_local_dir("d"),
+			create_local_dir("d/sub"),
+			download("d/sub/b.txt", 4),
+			download("top.txt", 5),
+		]
+	);
+}
+
+/// A held type flip cannot be put back without renaming one of the two items: the restoration
+/// leaves it unapplied, counted as dropped so the next pass reads whole and holds it again, and
+/// restores the rest of the batch.
+#[test]
+fn restoring_leaves_a_type_flip_for_the_next_pass() {
+	let (rows, remote) = synced_tree(hash(1), 4);
+	// `top.txt` is a directory locally now; the rest of the tree is gone locally.
+	let mut prep = prepared(
+		SyncMode::TwoWay,
+		rows,
+		vec![local_file("keep.txt", hash(1)), local_dir("top.txt")],
+		view(remote, Vec::new(), &[]),
+		HashMap::new(),
+	);
+	let (_dir, mut screened) = screened_holding_all(&mut prep);
+	let held = read(&screened, Rows::Held);
+	assert!(
+		held.contains(&SyncAction::CreateRemoteDir {
+			rel_path: "top.txt".to_string()
+		}),
+		"{held:?}"
+	);
+
+	let root = tempfile::tempdir().unwrap();
+	let restored = screened
+		.restore(&prep.baseline, root.path(), PairRoot::Directory)
+		.unwrap();
+
+	assert_eq!(
+		restored,
+		Restored {
+			from_bin: 0,
+			actions: 4,
+			unrestorable: 2,
+		}
+	);
+	assert_eq!(screened.dropped, 2);
+	assert_eq!(
+		read(&screened, Rows::All),
+		[
+			create_local_dir("d"),
+			download("d/a.txt", 3),
+			create_local_dir("d/sub"),
+			download("d/sub/b.txt", 4),
+		]
+	);
 }
 
 /// A requested pass is due, whole, and announced on the request signal the pair's watch waits
