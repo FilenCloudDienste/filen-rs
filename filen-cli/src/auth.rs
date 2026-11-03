@@ -31,7 +31,9 @@ use filen_sdk_rs::{
 
 use crate::{
 	CliConfig, ClientConfigArgs, build_client_config, deserialize_auth_config,
-	serialize_auth_config, ui::UI, util::LongKeyringEntry,
+	serialize_auth_config,
+	ui::UI,
+	util::{KeyringChunkStore, LongKeyringEntry},
 };
 
 /// A lazily authenticated client.
@@ -395,7 +397,7 @@ async fn authenticate_from_keyring(
 	if keyring_disabled_for_testing() {
 		return Ok(None);
 	}
-	let sdk_config = LongKeyringEntry::new(KEYRING_SDK_CONFIG_NAME)
+	let sdk_config = LongKeyringEntry::new(&KeyringChunkStore, KEYRING_SDK_CONFIG_NAME)
 		.read()
 		.context("Failed to read SDK config from keyring")?;
 	let Some(sdk_config) = sdk_config else {
@@ -430,7 +432,8 @@ async fn authenticate_from_prompt(
 	// optionally, save credentials
 	if ui.prompt_confirm("Keep me logged in?", true)? {
 		let sdk_config = serialize_auth_config(&client)?;
-		match LongKeyringEntry::new(KEYRING_SDK_CONFIG_NAME).write(&sdk_config) {
+		match LongKeyringEntry::new(&KeyringChunkStore, KEYRING_SDK_CONFIG_NAME).write(&sdk_config)
+		{
 			Ok(_) => {
 				ui.print_success("Saved credentials");
 			}
@@ -496,11 +499,12 @@ pub(crate) fn export_auth_config(client: &Client, parent_dir: &Path) -> Result<P
 pub(crate) fn logout(config: &CliConfig, ui: &mut UI) -> Result<bool> {
 	let mut found_any_credentials = false;
 	if !keyring_disabled_for_testing()
-		&& let Ok(Some(_)) = LongKeyringEntry::new(KEYRING_SDK_CONFIG_NAME).read()
+		&& let Ok(Some(_)) =
+			LongKeyringEntry::new(&KeyringChunkStore, KEYRING_SDK_CONFIG_NAME).read()
 	{
 		found_any_credentials = true;
 		if ui.prompt_confirm("Delete credentials stored in system keyring?", false)? {
-			let deleted = LongKeyringEntry::new(KEYRING_SDK_CONFIG_NAME)
+			let deleted = LongKeyringEntry::new(&KeyringChunkStore, KEYRING_SDK_CONFIG_NAME)
 				.delete()
 				.context("Failed to delete SDK config from keyring")?;
 			if deleted {

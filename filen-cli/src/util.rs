@@ -67,78 +67,217 @@ impl Display for RemotePath {
 
 const KEYRING_SERVICE_NAME: &str = "filen-cli-rs";
 
-/// Provides an interface for reading and writing keyring entries that exceed the character limit.
-/// It splits the entry up into multiple entries with a numerical suffix.
-pub(crate) struct LongKeyringEntry {
-	pub(crate) name: String,
+/// The most bytes one keyring entry holds of a [`LongKeyringEntry`]'s value.
+const KEYRING_CHUNK_LEN: usize = 1000;
+
+/// A store of named string values, which [`LongKeyringEntry`] splits a long value across.
+pub(crate) trait ChunkStore {
+	/// The value stored under `key`, or `None` if there is none.
+	fn get(&self, key: &str) -> Result<Option<String>>;
+	/// Store `value` under `key`, replacing any value stored there.
+	fn set(&self, key: &str, value: &str) -> Result<()>;
+	/// Delete the value stored under `key`. Returns false if there was none.
+	fn delete(&self, key: &str) -> Result<bool>;
 }
 
-impl LongKeyringEntry {
-	pub(crate) fn new(name: &str) -> Self {
-		LongKeyringEntry {
-			name: name.to_string(),
+/// The system keyring, with each value an entry of the CLI's service.
+pub(crate) struct KeyringChunkStore;
+
+impl KeyringChunkStore {
+	fn entry(key: &str) -> Result<keyring::Entry> {
+		keyring::Entry::new(KEYRING_SERVICE_NAME, key).context("Failed to create keyring entry")
+	}
+}
+
+impl ChunkStore for KeyringChunkStore {
+	fn get(&self, key: &str) -> Result<Option<String>> {
+		match Self::entry(key)?.get_password() {
+			Ok(value) => Ok(Some(value)),
+			Err(keyring::Error::NoEntry) => Ok(None),
+			Err(e) => Err(anyhow!(e)).context("Failed to read keyring entry"),
 		}
+	}
+
+	fn set(&self, key: &str, value: &str) -> Result<()> {
+		Self::entry(key)?
+			.set_password(value)
+			.context("Failed to save chunk to keyring")
+	}
+
+	fn delete(&self, key: &str) -> Result<bool> {
+		match Self::entry(key)?.delete_credential() {
+			Ok(()) => Ok(true),
+			Err(keyring::Error::NoEntry) => Ok(false),
+			Err(e) => Err(anyhow!(e)).context("Failed to delete keyring entry"),
+		}
+	}
+}
+
+/// Provides an interface for reading and writing keyring entries that exceed the character limit.
+/// It splits the entry up into multiple entries with a numerical suffix.
+pub(crate) struct LongKeyringEntry<'a> {
+	store: &'a dyn ChunkStore,
+	name: &'a str,
+}
+
+impl<'a> LongKeyringEntry<'a> {
+	pub(crate) fn new(store: &'a dyn ChunkStore, name: &'a str) -> Self {
+		LongKeyringEntry { store, name }
+	}
+
+	fn chunk_key(&self, i: usize) -> String {
+		format!("{}_{}", self.name, i)
 	}
 
 	pub(crate) fn read(&self) -> Result<Option<String>> {
-		let mut result = String::new();
-		let mut i = 0;
-		loop {
-			let entry = keyring::Entry::new(KEYRING_SERVICE_NAME, &format!("{}_{}", self.name, i))
-				.context("Failed to create keyring entry for reading")?;
-			match entry.get_password() {
-				Ok(chunk) => {
-					result.push_str(&chunk);
-				}
-				Err(keyring::Error::NoEntry) => break,
-				Err(e) => return Err(anyhow!("Failed to read keyring entry: {}", e)),
-			}
-			i += 1;
+		let mut result = None::<String>;
+		for i in 0.. {
+			let Some(chunk) = self.store.get(&self.chunk_key(i))? else {
+				break;
+			};
+			result.get_or_insert_default().push_str(&chunk);
 		}
-		if i > 0 { Ok(Some(result)) } else { Ok(None) }
+		Ok(result)
 	}
 
-	pub(crate) fn write(&self, str: &str) -> Result<()> {
-		let chunks = str
-			.as_bytes()
-			.chunks(1000) // todo: larger limit possible?
-			.map(str::from_utf8)
-			.collect::<Result<Vec<&str>, _>>()
-			.unwrap();
-		for (i, chunk) in chunks.into_iter().enumerate() {
-			keyring::Entry::new(KEYRING_SERVICE_NAME, &format!("{}_{}", self.name, i))
-				.context("Failed to create keyring entry for writing")?
-				.set_password(chunk)
-				.context("Failed to save chunk to keyring")?;
+	/// Store `value`, and delete the chunks a longer value written before left behind, which
+	/// [`LongKeyringEntry::read`] would otherwise append to it.
+	pub(crate) fn write(&self, value: &str) -> Result<()> {
+		let chunks = split_on_char_boundaries(value, KEYRING_CHUNK_LEN);
+		for (i, chunk) in chunks.iter().enumerate() {
+			self.store.set(&self.chunk_key(i), chunk)?;
 		}
+		self.delete_from(chunks.len())?;
 		Ok(())
 	}
 
 	/// Returns true if the entry was deleted, false if it didn't exist.
 	pub(crate) fn delete(&self) -> Result<bool> {
-		let mut i = 0;
-		loop {
-			let entry = keyring::Entry::new(KEYRING_SERVICE_NAME, &format!("{}_{}", self.name, i))
-				.context("Failed to create keyring entry for deletion")?;
-			match entry.delete_credential() {
-				Ok(_) => {}
-				Err(keyring::Error::NoEntry) => {
-					if i == 0 {
-						return Ok(false);
-					}
-					break;
-				}
-				Err(e) => return Err(anyhow!("Failed to delete keyring entry: {}", e)),
+		self.delete_from(0)
+	}
+
+	/// Delete the chunks from the `first`th on, up to the first one missing. Returns whether there
+	/// was one to delete.
+	fn delete_from(&self, first: usize) -> Result<bool> {
+		let mut deleted_any = false;
+		for i in first.. {
+			if !self.store.delete(&self.chunk_key(i))? {
+				break;
 			}
-			i += 1;
+			deleted_any = true;
 		}
-		Ok(true)
+		Ok(deleted_any)
+	}
+}
+
+/// `value` split into consecutive parts of at most `max_len` bytes each, or of one character
+/// where a character is longer, so that no part splits a character.
+fn split_on_char_boundaries(value: &str, max_len: usize) -> Vec<&str> {
+	let mut parts = Vec::new();
+	let mut rest = value;
+	while !rest.is_empty() {
+		let end = match rest.floor_char_boundary(max_len) {
+			// a character longer than max_len: take it whole, so that the loop makes progress
+			0 => rest.ceil_char_boundary(1),
+			end => end,
+		};
+		let (part, tail) = rest.split_at(end);
+		parts.push(part);
+		rest = tail;
+	}
+	parts
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+	use std::{cell::RefCell, collections::HashMap};
+
+	use super::*;
+
+	/// A [`ChunkStore`] in memory, in place of the system keyring.
+	#[derive(Default)]
+	pub(crate) struct MemoryChunkStore(RefCell<HashMap<String, String>>);
+
+	impl MemoryChunkStore {
+		/// The keys stored, sorted.
+		pub(crate) fn keys(&self) -> Vec<String> {
+			let mut keys = self.0.borrow().keys().cloned().collect::<Vec<_>>();
+			keys.sort();
+			keys
+		}
+	}
+
+	impl ChunkStore for MemoryChunkStore {
+		fn get(&self, key: &str) -> Result<Option<String>> {
+			Ok(self.0.borrow().get(key).cloned())
+		}
+
+		fn set(&self, key: &str, value: &str) -> Result<()> {
+			self.0.borrow_mut().insert(key.to_owned(), value.to_owned());
+			Ok(())
+		}
+
+		fn delete(&self, key: &str) -> Result<bool> {
+			Ok(self.0.borrow_mut().remove(key).is_some())
+		}
 	}
 }
 
 #[cfg(test)]
 mod tests {
-	use super::*;
+	use super::{test_support::MemoryChunkStore, *};
+
+	#[test]
+	fn a_shorter_value_replaces_a_longer_one_and_its_extra_chunks() {
+		let store = MemoryChunkStore::default();
+		let entry = LongKeyringEntry::new(&store, "sdk-config");
+		let long = "a".repeat(2 * KEYRING_CHUNK_LEN + 1);
+		entry.write(&long).unwrap();
+		assert_eq!(
+			store.keys(),
+			["sdk-config_0", "sdk-config_1", "sdk-config_2"]
+		);
+
+		entry.write("short").unwrap();
+
+		assert_eq!(entry.read().unwrap().as_deref(), Some("short"));
+		assert_eq!(store.keys(), ["sdk-config_0"]);
+	}
+
+	#[test]
+	fn a_value_over_several_chunks_reads_back_whole() {
+		let store = MemoryChunkStore::default();
+		let entry = LongKeyringEntry::new(&store, "sdk-config");
+		let value = "abc".repeat(KEYRING_CHUNK_LEN);
+		entry.write(&value).unwrap();
+		assert_eq!(entry.read().unwrap(), Some(value));
+	}
+
+	#[test]
+	fn an_entry_never_written_reads_as_none() {
+		let store = MemoryChunkStore::default();
+		assert_eq!(
+			LongKeyringEntry::new(&store, "sdk-config").read().unwrap(),
+			None
+		);
+	}
+
+	#[test]
+	fn deleting_an_entry_deletes_all_its_chunks() {
+		let store = MemoryChunkStore::default();
+		let entry = LongKeyringEntry::new(&store, "sdk-config");
+		entry.write(&"a".repeat(2 * KEYRING_CHUNK_LEN)).unwrap();
+		assert!(entry.delete().unwrap());
+		assert!(store.keys().is_empty());
+		assert!(!entry.delete().unwrap());
+	}
+
+	#[test]
+	fn values_are_split_without_splitting_a_character() {
+		assert_eq!(split_on_char_boundaries("aééb", 3), ["aé", "éb"]);
+		assert_eq!(split_on_char_boundaries("€a", 2), ["€", "a"]);
+		assert!(split_on_char_boundaries("", 3).is_empty());
+	}
 
 	#[test]
 	fn remote_path() {
