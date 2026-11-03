@@ -1303,3 +1303,196 @@ async fn view_json_prints_the_web_drive_url_of_a_files_directory() {
 		})
 	);
 }
+
+/// An executable shell script at `path` with `body` after its shebang line.
+#[cfg(unix)]
+fn write_script(path: &std::path::Path, body: &str) {
+	use std::os::unix::fs::PermissionsExt as _;
+	std::fs::write(path, format!("#!/bin/sh\n{body}\n")).unwrap();
+	std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// `edit` of `file`, with `editor` as `$EDITOR`, the temporary files in `tmp_dir`, and `markers`
+/// as `$MARKERS` for the editor.
+#[cfg(unix)]
+async fn spawn_edit(
+	file: &str,
+	editor: &std::path::Path,
+	tmp_dir: &std::path::Path,
+	markers: &std::path::Path,
+) -> (assert_fs::TempDir, std::process::Child) {
+	let (auth_config_dir, auth_config) = test_utils::cli::prepare_cli_auth_config().await;
+	let cli = Command::new(env!("CARGO_BIN_EXE_filen-cli"))
+		.args([
+			"--auth-config-path",
+			auth_config.to_str().unwrap(),
+			"--skip-update",
+			"edit",
+			file,
+		])
+		.env("EDITOR", editor)
+		.env_remove("VISUAL")
+		.env("TMPDIR", tmp_dir)
+		.env("MARKERS", markers)
+		.stdin(Stdio::null())
+		.stdout(Stdio::piped())
+		.stderr(Stdio::piped())
+		.spawn()
+		.unwrap();
+	(auth_config_dir, cli)
+}
+
+/// The paths of the files under `dir`, at any depth.
+#[cfg(unix)]
+fn files_under(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+	let mut files = Vec::new();
+	for entry in std::fs::read_dir(dir).unwrap() {
+		let path = entry.unwrap().path();
+		if path.is_dir() {
+			files.extend(files_under(&path));
+		} else {
+			files.push(path);
+		}
+	}
+	files
+}
+
+#[cfg(unix)]
+#[shared_test_runtime]
+async fn edit_uploads_what_the_editor_changed_and_leaves_no_temporary_files() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = format!("/{}", resources.dir.name().unwrap());
+	upload(client, &resources.dir, "a.txt", b"original\n").await;
+	let local = assert_fs::TempDir::new().unwrap();
+	let editor = local.path().join("editor.sh");
+	write_script(&editor, "printf 'appended\\n' >> \"$1\"");
+	let tmp_dir = local.path().join("tmp");
+	std::fs::create_dir(&tmp_dir).unwrap();
+
+	let (_auth, cli) = spawn_edit(
+		&format!("{test_dir}/a.txt"),
+		&editor,
+		&tmp_dir,
+		local.path(),
+	)
+	.await;
+	let output = cli.wait_with_output().unwrap();
+	let stdout = String::from_utf8_lossy(&output.stdout);
+
+	assert!(
+		output.status.success(),
+		"stderr:\n{}",
+		String::from_utf8_lossy(&output.stderr)
+	);
+	assert!(
+		stdout.contains(&format!("Uploaded your changes to {test_dir}/a.txt")),
+		"stdout:\n{stdout}"
+	);
+	assert_eq!(
+		content_at(client, &format!("{test_dir}/a.txt")).await,
+		b"original\nappended\n"
+	);
+	assert_eq!(files_under(&tmp_dir), Vec::<std::path::PathBuf>::new());
+}
+
+#[cfg(unix)]
+#[shared_test_runtime]
+async fn edit_without_changes_uploads_nothing() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = format!("/{}", resources.dir.name().unwrap());
+	let file = upload(client, &resources.dir, "a.txt", b"original\n").await;
+	let local = assert_fs::TempDir::new().unwrap();
+	let editor = local.path().join("editor.sh");
+	write_script(&editor, "true");
+	let tmp_dir = local.path().join("tmp");
+	std::fs::create_dir(&tmp_dir).unwrap();
+
+	let (_auth, cli) = spawn_edit(
+		&format!("{test_dir}/a.txt"),
+		&editor,
+		&tmp_dir,
+		local.path(),
+	)
+	.await;
+	let output = cli.wait_with_output().unwrap();
+	let stdout = String::from_utf8_lossy(&output.stdout);
+
+	assert!(
+		output.status.success(),
+		"stderr:\n{}",
+		String::from_utf8_lossy(&output.stderr)
+	);
+	assert!(
+		stdout.contains(&format!("No changes to {test_dir}/a.txt")),
+		"stdout:\n{stdout}"
+	);
+	let Some(NonRootFileType::File(current)) = client
+		.find_item_at_path(&format!("{test_dir}/a.txt"))
+		.await
+		.unwrap()
+	else {
+		panic!("Expected a file");
+	};
+	assert_eq!(current.uuid(), file.uuid());
+	assert_eq!(files_under(&tmp_dir), Vec::<std::path::PathBuf>::new());
+}
+
+#[cfg(unix)]
+#[shared_test_runtime]
+async fn edit_of_a_file_changed_meanwhile_keeps_the_changes_locally() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = format!("/{}", resources.dir.name().unwrap());
+	upload(client, &resources.dir, "a.txt", b"original\n").await;
+	let local = assert_fs::TempDir::new().unwrap();
+	let editor = local.path().join("editor.sh");
+	// edits, then waits (at most 2 minutes) until the test changed the file in the drive
+	write_script(
+		&editor,
+		"printf 'mine\\n' >> \"$1\"\n\
+		 touch \"$MARKERS/started\"\n\
+		 i=0\n\
+		 while [ ! -f \"$MARKERS/go\" ] && [ $i -lt 1200 ]; do sleep 0.1; i=$((i+1)); done",
+	);
+	let tmp_dir = local.path().join("tmp");
+	std::fs::create_dir(&tmp_dir).unwrap();
+
+	let (_auth, mut cli) = spawn_edit(
+		&format!("{test_dir}/a.txt"),
+		&editor,
+		&tmp_dir,
+		local.path(),
+	)
+	.await;
+	let deadline = Instant::now() + Duration::from_secs(120);
+	while !local.path().join("started").exists() {
+		assert!(
+			Instant::now() < deadline && cli.try_wait().unwrap().is_none(),
+			"the editor never started"
+		);
+		tokio::time::sleep(Duration::from_millis(100)).await;
+	}
+	upload(client, &resources.dir, "a.txt", b"theirs\n").await;
+	std::fs::write(local.path().join("go"), b"").unwrap();
+	let output = cli.wait_with_output().unwrap();
+	let stderr = String::from_utf8_lossy(&output.stderr);
+
+	assert_eq!(output.status.code(), Some(1), "stderr:\n{stderr}");
+	assert!(
+		stderr.contains("Your changes were not uploaded and are kept at ")
+			&& stderr.contains(&format!(
+				"{test_dir}/a.txt changed in the drive while you edited it"
+			)),
+		"stderr:\n{stderr}"
+	);
+	assert_eq!(
+		content_at(client, &format!("{test_dir}/a.txt")).await,
+		b"theirs\n"
+	);
+	let kept = files_under(&tmp_dir);
+	assert_eq!(kept.len(), 1, "{kept:?}");
+	assert_eq!(kept[0].file_name().unwrap(), "a.txt");
+	assert_eq!(std::fs::read(&kept[0]).unwrap(), b"original\nmine\n");
+}

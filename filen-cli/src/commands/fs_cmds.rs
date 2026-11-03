@@ -1,8 +1,12 @@
 use std::{
 	borrow::Cow,
 	cmp::Ordering,
-	io::{self, IsTerminal as _, Read as _},
+	env::{self, VarError},
+	ffi::OsStr,
+	fs::{self, File},
+	io::{self, BufRead as _, BufReader, IsTerminal as _, Read as _},
 	iter::Peekable,
+	path::{Path, PathBuf},
 	pin::pin,
 	str::Chars,
 	sync::{Arc, Mutex, MutexGuard, PoisonError},
@@ -15,7 +19,7 @@ use crate::{
 	commands::CommandContext,
 	completion::FilenCompleter,
 	docs::DocElement,
-	error::CliError,
+	error::{CliError, find_cli_error},
 	interrupt,
 	ui::{self, UI},
 	util::RemotePath,
@@ -41,12 +45,12 @@ use filen_sdk_rs::{
 		},
 		dir::meta::DirectoryMetaChanges,
 		file::{
-			client_impl::FileReaderSharedClientExt as _, meta::FileMetaChanges, read::FileReader,
-			traits::HasFileInfo as _,
+			FileBuilderOptionalName, client_impl::FileReaderSharedClientExt as _,
+			meta::FileMetaChanges, read::FileReader, traits::HasFileInfo as _,
 		},
 		name::ValidatedName,
 	},
-	io::{RemoteDirectory, RemoteFile},
+	io::{RemoteDirectory, RemoteFile, client_impl::IoSharedClientExt as _},
 };
 use filen_types::{fs::Uuid, traits::CowHelpers as _};
 use futures::{
@@ -54,6 +58,7 @@ use futures::{
 	channel::mpsc, executor,
 };
 use serde_json::json;
+use tempfile::{NamedTempFile, TempDir};
 use tokio::select;
 
 #[derive(Debug, Subcommand)]
@@ -106,6 +111,20 @@ pub(crate) enum FsCommands {
 		/// File or directory to show information about ("/" for the Filen drive)
 		#[arg(add = FilenCompleter::file_or_directory())]
 		file_or_directory: String,
+	},
+	/// Open a file in the app your system opens its type with, from a local copy that is kept
+	Open {
+		/// File to open
+		#[arg(add = FilenCompleter::file())]
+		file: String,
+	},
+	/// Edit a local copy of a file in $VISUAL, $EDITOR or the app your system opens its type with,
+	/// then upload your changes as a new version (kept locally instead if the file changed
+	/// meanwhile)
+	Edit {
+		/// File to edit
+		#[arg(add = FilenCompleter::file())]
+		file: String,
 	},
 	/// Print the web drive's URL of a directory, or of a file's directory, and open it in the
 	/// browser
@@ -231,6 +250,8 @@ pub(crate) const BROWSING_DOCS: &[DocElement] = &[
 	DocElement::CommandHelp("head"),
 	DocElement::CommandHelp("tail"),
 	DocElement::CommandHelp("stat"),
+	DocElement::CommandHelp("open"),
+	DocElement::CommandHelp("edit"),
 	DocElement::CommandHelp("view"),
 	DocElement::CommandHelp("drive"),
 ];
@@ -285,6 +306,8 @@ impl FsCommands {
 			Self::Stat { file_or_directory } => {
 				print_file_or_directory_info(ui, client, working_path, &file_or_directory).await?;
 			}
+			Self::Open { file } => open_file(ui, client, working_path, &file).await?,
+			Self::Edit { file } => edit_file(ui, client, working_path, &file).await?,
 			Self::View {
 				file_or_directory,
 				no_open,
@@ -735,19 +758,9 @@ pub(crate) async fn print_file(
 	file_str: &str,
 	lines: PrintFileLines,
 ) -> Result<()> {
-	let file_str = working_path.navigate(file_str).0;
+	let file_str = working_path.navigate(file_str);
 	let client = client.get(ui).await?;
-	let Some(file) = client
-		.find_item_at_path(&file_str)
-		.await
-		.context("Failed to find cat file")?
-	else {
-		return Err(UI::failure(&format!("No such file: {}", file_str)));
-	};
-	let file = match file {
-		NonRootFileType::File(file) => file,
-		_ => return Err(UI::failure(&format!("Not a file: {}", file_str))),
-	};
+	let file = find_file(client, &file_str).await?;
 	if !confirm_printing_file(ui, file.size())? {
 		return Ok(());
 	}
@@ -1118,6 +1131,362 @@ pub(crate) async fn print_file_or_directory_info(
 			}
 		}
 	}
+	Ok(())
+}
+
+/// Finds the file at `path`.
+async fn find_file<'a>(client: &'a Client, path: &RemotePath) -> Result<Cow<'a, RemoteFile>> {
+	match client
+		.find_item_at_path(&path.0)
+		.await
+		.context("Failed to find file")?
+	{
+		Some(NonRootFileType::File(file)) => Ok(file),
+		Some(_) => Err(UI::failure(&format!("Not a file: {}", path))),
+		None => Err(UI::failure(&format!("No such file: {}", path))),
+	}
+}
+
+/// A file downloaded into a fresh temporary directory under the remote file's name, so that the
+/// app opening it goes by the right extension. The directory is deleted when this is dropped,
+/// unless it is kept.
+struct LocalCopy {
+	dir: TempDir,
+	/// The file's name in the directory.
+	name: String,
+}
+
+impl LocalCopy {
+	async fn download(client: &Client, file: &RemoteFile) -> Result<Self> {
+		let dir = tempfile::Builder::new()
+			.prefix("filen-cli-")
+			.tempdir()
+			.context("Failed to create a temporary directory")?;
+		let copy = Self {
+			dir,
+			name: local_file_name(file.name(), file.uuid()),
+		};
+		client
+			.download_file_to_path(file, &copy.path(), None)
+			.await
+			.context("Failed to download file")?;
+		Ok(copy)
+	}
+
+	fn path(&self) -> PathBuf {
+		self.dir.path().join(&self.name)
+	}
+
+	/// Keeps the directory rather than deleting it, and returns the file's path in it.
+	fn keep(self) -> PathBuf {
+		self.dir.keep().join(self.name)
+	}
+}
+
+/// The name a local copy of a file gets: the file's, unless it is not one name of a file on this
+/// system (`..`, or a name holding a path separator) or cannot be decrypted, in which case the
+/// file's UUID. The name comes from the drive, so it must not lead out of the directory.
+fn local_file_name(name: Option<&str>, uuid: Uuid) -> String {
+	name.filter(|name| Path::new(name).file_name() == Some(OsStr::new(name)))
+		.map_or_else(|| uuid.to_string(), str::to_owned)
+}
+
+/// Opens a file in the app the system opens its type with, from a local copy. The copy is kept,
+/// as the app reads it after the command has ended.
+pub(crate) async fn open_file(
+	ui: &mut UI,
+	client: &mut LazyClient,
+	working_path: &RemotePath,
+	file_str: &str,
+) -> Result<()> {
+	let path = working_path.navigate(file_str);
+	let client = client.get(ui).await?;
+	let file = find_file(client, &path).await?;
+	let local = LocalCopy::download(client, &file).await?.keep();
+	open::that_detached(&local)
+		.map_err(|e| UI::failure(&format!("Failed to open {}: {e}", local.display())))?;
+	ui.print_success(&format!(
+		"Opened {} (a local copy at {})",
+		path,
+		local.display()
+	));
+	Ok(())
+}
+
+/// What `edit` asks when it opened the file in the app for its type, which may not wait until
+/// the file is edited.
+const DONE_EDITING_PROMPT: &str = "Press enter when done editing";
+
+/// The editor `edit` runs: the program, the arguments before the file's path.
+#[derive(Debug, PartialEq, Eq)]
+struct EditorCommand {
+	program: String,
+	args: Vec<String>,
+}
+
+/// The editor that `$VISUAL`, or else `$EDITOR`, names, split into words as a shell would split
+/// them. Empty variables count as unset.
+fn editor_command(visual: Option<&str>, editor: Option<&str>) -> Result<Option<EditorCommand>> {
+	let Some((variable, command)) = [("VISUAL", visual), ("EDITOR", editor)]
+		.into_iter()
+		.find_map(|(variable, value)| {
+			value
+				.filter(|value| !value.trim().is_empty())
+				.map(|value| (variable, value))
+		})
+	else {
+		return Ok(None);
+	};
+	let mut words = shlex::split(command)
+		.ok_or_else(|| UI::failure(&format!("Cannot split ${variable} into words: {command}")))?
+		.into_iter();
+	let program = words
+		.next()
+		.ok_or_else(|| UI::failure(&format!("${variable} names no program: {command}")))?;
+	Ok(Some(EditorCommand {
+		program,
+		args: words.collect(),
+	}))
+}
+
+/// The value of the environment variable `name`, if it is set.
+fn env_var(name: &str) -> Result<Option<String>> {
+	match env::var(name) {
+		Ok(value) => Ok(Some(value)),
+		Err(VarError::NotPresent) => Ok(None),
+		Err(VarError::NotUnicode(_)) => Err(UI::failure(&format!("${name} is not valid UTF-8"))),
+	}
+}
+
+/// The file as it was downloaded to be edited, to tell whether it changed in the drive meanwhile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RemoteVersion {
+	uuid: Uuid,
+	size: u64,
+	modified: Option<DateTime<Utc>>,
+}
+
+impl RemoteVersion {
+	fn of(file: &RemoteFile) -> Self {
+		Self {
+			uuid: file.uuid(),
+			size: file.size(),
+			modified: file.last_modified(),
+		}
+	}
+}
+
+/// Whether an edit may be uploaded as a new version of the file it was made to.
+#[derive(Debug, PartialEq, Eq)]
+enum EditUpload {
+	/// The file is in the drive as it was downloaded: upload into this parent directory.
+	Upload { parent: Uuid },
+	/// No file is at the path any more.
+	Gone,
+	/// Another file is at the path, such as a new version of it, or the file itself changed.
+	Changed,
+}
+
+/// Whether an edit of the file downloaded as `downloaded` may be uploaded, given the file at its
+/// path now and that file's parent directory: only over the very same file, unchanged, so that
+/// uploading replaces nothing the user has not seen.
+fn edit_upload(downloaded: RemoteVersion, current: Option<(Uuid, RemoteVersion)>) -> EditUpload {
+	match current {
+		None => EditUpload::Gone,
+		Some((parent, current)) if current == downloaded => EditUpload::Upload { parent },
+		Some(_) => EditUpload::Changed,
+	}
+}
+
+/// Edits a file locally, from a copy downloaded into a temporary directory, and uploads the
+/// changes as a new version of it, under its name in its directory. The copy is opened in
+/// `$VISUAL` or `$EDITOR`, waiting for it to exit, or else in the app the system opens its type
+/// with, waiting for the user to press enter. Nothing is uploaded when the content did not
+/// change, nor when the file changed in the drive meanwhile: then, as after any failure once the
+/// content changed, the copy is kept and its path printed.
+pub(crate) async fn edit_file(
+	ui: &mut UI,
+	client: &mut LazyClient,
+	working_path: &RemotePath,
+	file_str: &str,
+) -> Result<()> {
+	let path = working_path.navigate(file_str);
+	let editor = editor_command(env_var("VISUAL")?.as_deref(), env_var("EDITOR")?.as_deref())?;
+	// before logging in and downloading, so that a script fails at once
+	if editor.is_none() {
+		ui.ensure_can_prompt(DONE_EDITING_PROMPT)?;
+	}
+	let client = client.get(ui).await?;
+	let file = find_file(client, &path).await?;
+	let downloaded = RemoteVersion::of(&file);
+	let created = file.created();
+	let copy = LocalCopy::download(client, &file).await?;
+	let local = copy.path();
+	let original = copy_of(&local).await?;
+	// Ctrl-C does not cancel the command from here on, which would delete the edited copy. A
+	// terminal editor takes Ctrl-C as a key.
+	let _editing = interrupt::own();
+	let edited = async {
+		edit_locally(ui, editor.as_ref(), &local).await?;
+		if same_file_content(original.path(), &local).await? {
+			return Ok(false);
+		}
+		// only a Ctrl-C from now on stops the upload, not one pressed in the editor
+		let mut ctrl_c = interrupt::own();
+		select! {
+			uploaded = upload_edit(client, &path, downloaded, created, &local) => uploaded?,
+			() = ctrl_c.pressed() => return Err(CliError::Interrupted.into()),
+		}
+		Ok(true)
+	}
+	.await;
+	match edited {
+		Ok(true) => ui.print_success(&format!("Uploaded your changes to {}", path)),
+		Ok(false) => ui.print_success(&format!("No changes to {}", path)),
+		Err(e) => {
+			// whatever failed, the changes are not lost
+			if matches!(same_file_content(original.path(), &local).await, Ok(true)) {
+				return Err(e);
+			}
+			return Err(kept_changes(e, &copy.keep()));
+		}
+	}
+	Ok(())
+}
+
+/// `e`, saying that the changes were not uploaded and are kept at `kept`. An error the CLI does
+/// not report as it is becomes a failure, so that its cause is printed too.
+fn kept_changes(e: anyhow::Error, kept: &Path) -> anyhow::Error {
+	let message = format!(
+		"Your changes were not uploaded and are kept at {}",
+		kept.display()
+	);
+	if find_cli_error(&e).is_some() {
+		e.context(message)
+	} else {
+		e.context(CliError::Failure(message))
+	}
+}
+
+/// Lets the user edit the file at `local`: in `editor`, until it exits, or else in the app the
+/// system opens its type with, until the user says they are done.
+async fn edit_locally(ui: &mut UI, editor: Option<&EditorCommand>, local: &Path) -> Result<()> {
+	match editor {
+		Some(editor) => {
+			let status = tokio::process::Command::new(&editor.program)
+				.args(&editor.args)
+				.arg(local)
+				.status()
+				.await
+				.map_err(|e| UI::failure(&format!("Failed to run {}: {e}", editor.program)))?;
+			if !status.success() {
+				return Err(UI::failure(&format!(
+					"{} exited with {}",
+					editor.program, status
+				)));
+			}
+		}
+		None => {
+			let opened = local.to_path_buf();
+			tokio::task::spawn_blocking(move || open::that(opened))
+				.await
+				.context("Failed to open file")?
+				.map_err(|e| UI::failure(&format!("Failed to open {}: {e}", local.display())))?;
+			ui.prompt(DONE_EDITING_PROMPT)?;
+		}
+	}
+	Ok(())
+}
+
+/// A temporary copy of the file at `path`, deleted when it is dropped.
+async fn copy_of(path: &Path) -> Result<NamedTempFile> {
+	let path = path.to_path_buf();
+	tokio::task::spawn_blocking(move || {
+		let copy = NamedTempFile::new()?;
+		fs::copy(&path, copy.path())?;
+		Ok::<_, io::Error>(copy)
+	})
+	.await
+	.context("Failed to copy the downloaded file")?
+	.context("Failed to copy the downloaded file")
+}
+
+/// Whether the files at `a` and `b` hold the same bytes.
+async fn same_file_content(a: &Path, b: &Path) -> Result<bool> {
+	let (a, b) = (a.to_path_buf(), b.to_path_buf());
+	tokio::task::spawn_blocking(move || same_content(File::open(a)?, File::open(b)?))
+		.await
+		.context("Failed to compare the edited file with the downloaded one")?
+		.context("Failed to compare the edited file with the downloaded one")
+}
+
+/// Whether `a` and `b` read the same bytes.
+fn same_content(a: impl io::Read, b: impl io::Read) -> io::Result<bool> {
+	let (mut a, mut b) = (BufReader::new(a), BufReader::new(b));
+	loop {
+		let a_buf = a.fill_buf()?;
+		let b_buf = b.fill_buf()?;
+		let len = a_buf.len().min(b_buf.len());
+		if len == 0 {
+			return Ok(a_buf.is_empty() && b_buf.is_empty());
+		}
+		if a_buf.get(..len) != b_buf.get(..len) {
+			return Ok(false);
+		}
+		a.consume(len);
+		b.consume(len);
+	}
+}
+
+/// Uploads the edited file at `local` as a new version of the file at `path`, if that is still the
+/// file downloaded as `downloaded`. The check and the upload hold the drive lock, so that nothing
+/// changes the file in between.
+async fn upload_edit(
+	client: &Client,
+	path: &RemotePath,
+	downloaded: RemoteVersion,
+	created: Option<DateTime<Utc>>,
+	local: &Path,
+) -> Result<()> {
+	let Some(name) = path.basename() else {
+		return Err(UI::failure(&format!("Not a file: {}", path)));
+	};
+	let _lock = client.lock_drive().await.context("Failed to lock drive")?;
+	let current = match client.get_items_in_path(&path.0).await {
+		Ok((dirs, ObjectOrRemainingPath::Object(NonRootFileType::File(file)))) => dirs
+			.last()
+			.map(|parent| (parent.uuid(), RemoteVersion::of(&file))),
+		Ok(_) => None,
+		// a file is where a directory on the path was
+		Err((e, _, _)) if e.kind() == ErrorKind::InvalidType => None,
+		Err((e, _, _)) => return Err(e).context("Failed to find file"),
+	};
+	let parent = match edit_upload(downloaded, current) {
+		EditUpload::Upload { parent } => parent,
+		EditUpload::Gone => {
+			return Err(UI::failure(&format!(
+				"{} was moved or deleted while you edited it",
+				path
+			)));
+		}
+		EditUpload::Changed => {
+			return Err(UI::failure(&format!(
+				"{} changed in the drive while you edited it",
+				path
+			)));
+		}
+	};
+	let mut builder = FileBuilderOptionalName::new(parent);
+	builder
+		.name(name)
+		.map_err(|e| UI::failure(&format!("Invalid file name: {}", e)))?;
+	if let Some(created) = created {
+		builder.created(created);
+	}
+	client
+		.upload_file_from_path_with_builder(builder, local.to_path_buf(), None)
+		.await
+		.context("Failed to upload your changes")?;
 	Ok(())
 }
 
@@ -3820,6 +4189,165 @@ mod tests {
 			web_drive_url([Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(3)]),
 			"https://app.filen.io/#/drive/00000000-0000-0000-0000-000000000001/\
 			 00000000-0000-0000-0000-000000000002/00000000-0000-0000-0000-000000000003"
+		);
+	}
+
+	fn version(uuid: u128, size: u64, modified: i64) -> RemoteVersion {
+		RemoteVersion {
+			uuid: Uuid::from_u128(uuid),
+			size,
+			modified: Utc.timestamp_opt(modified, 0).single(),
+		}
+	}
+
+	#[test]
+	fn an_edit_of_the_unchanged_file_is_uploaded_into_its_directory() {
+		assert_eq!(
+			edit_upload(
+				version(1, 7, 100),
+				Some((Uuid::from_u128(9), version(1, 7, 100)))
+			),
+			EditUpload::Upload {
+				parent: Uuid::from_u128(9)
+			}
+		);
+	}
+
+	#[test]
+	fn an_edit_of_a_file_replaced_by_another_is_not_uploaded() {
+		assert_eq!(
+			edit_upload(
+				version(1, 7, 100),
+				Some((Uuid::from_u128(9), version(2, 7, 100)))
+			),
+			EditUpload::Changed
+		);
+	}
+
+	#[test]
+	fn an_edit_of_a_file_whose_size_changed_is_not_uploaded() {
+		assert_eq!(
+			edit_upload(
+				version(1, 7, 100),
+				Some((Uuid::from_u128(9), version(1, 8, 100)))
+			),
+			EditUpload::Changed
+		);
+	}
+
+	#[test]
+	fn an_edit_of_a_file_modified_meanwhile_is_not_uploaded() {
+		assert_eq!(
+			edit_upload(
+				version(1, 7, 100),
+				Some((Uuid::from_u128(9), version(1, 7, 101)))
+			),
+			EditUpload::Changed
+		);
+	}
+
+	#[test]
+	fn an_edit_of_a_file_no_longer_at_its_path_is_not_uploaded() {
+		assert_eq!(edit_upload(version(1, 7, 100), None), EditUpload::Gone);
+	}
+
+	#[test]
+	fn the_same_bytes_are_the_same_content() {
+		assert!(same_content(&b"abc"[..], &b"abc"[..]).unwrap());
+		assert!(same_content(&b""[..], &b""[..]).unwrap());
+	}
+
+	#[test]
+	fn bytes_differing_in_one_byte_are_not_the_same_content() {
+		assert!(!same_content(&b"abc"[..], &b"abd"[..]).unwrap());
+	}
+
+	#[test]
+	fn bytes_one_longer_than_the_other_are_not_the_same_content() {
+		assert!(!same_content(&b"abc"[..], &b"abcd"[..]).unwrap());
+		assert!(!same_content(&b"abcd"[..], &b"abc"[..]).unwrap());
+	}
+
+	#[test]
+	fn content_longer_than_one_buffer_is_compared_to_its_end() {
+		let a = vec![7u8; 100_000];
+		let mut b = a.clone();
+
+		assert!(same_content(&a[..], &b[..]).unwrap());
+		*b.last_mut().unwrap() = 8;
+		assert!(!same_content(&a[..], &b[..]).unwrap());
+	}
+
+	#[test]
+	fn visual_names_the_editor_before_editor() {
+		assert_eq!(
+			editor_command(Some("code --wait"), Some("vi")).unwrap(),
+			Some(EditorCommand {
+				program: "code".to_owned(),
+				args: vec!["--wait".to_owned()],
+			})
+		);
+	}
+
+	#[test]
+	fn editor_names_the_editor_without_visual() {
+		assert_eq!(
+			editor_command(Some(" "), Some("vi")).unwrap(),
+			Some(EditorCommand {
+				program: "vi".to_owned(),
+				args: Vec::new(),
+			})
+		);
+	}
+
+	#[test]
+	fn an_editor_command_is_split_into_words_as_a_shell_splits_it() {
+		assert_eq!(
+			editor_command(None, Some("'/opt/my editor/bin' -n \"a b\"")).unwrap(),
+			Some(EditorCommand {
+				program: "/opt/my editor/bin".to_owned(),
+				args: vec!["-n".to_owned(), "a b".to_owned()],
+			})
+		);
+	}
+
+	#[test]
+	fn no_editor_is_named_without_visual_and_editor() {
+		assert_eq!(editor_command(None, Some("")).unwrap(), None);
+	}
+
+	#[test]
+	fn an_editor_command_with_an_unclosed_quote_fails() {
+		assert_eq!(
+			editor_command(None, Some("vi 'a")).unwrap_err().to_string(),
+			"Cannot split $EDITOR into words: vi 'a"
+		);
+	}
+
+	#[test]
+	fn a_local_copy_keeps_the_files_name() {
+		assert_eq!(
+			local_file_name(Some("notes.md"), Uuid::from_u128(1)),
+			"notes.md"
+		);
+	}
+
+	#[test]
+	fn a_local_copy_of_a_file_whose_name_leads_elsewhere_is_named_by_its_uuid() {
+		for name in ["..", ".", "a/b", ""] {
+			assert_eq!(
+				local_file_name(Some(name), Uuid::from_u128(1)),
+				"00000000-0000-0000-0000-000000000001",
+				"{name}"
+			);
+		}
+	}
+
+	#[test]
+	fn a_local_copy_of_a_file_whose_name_is_not_decrypted_is_named_by_its_uuid() {
+		assert_eq!(
+			local_file_name(None, Uuid::from_u128(1)),
+			"00000000-0000-0000-0000-000000000001"
 		);
 	}
 }
