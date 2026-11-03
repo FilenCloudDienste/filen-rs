@@ -4,7 +4,8 @@
 //! The executable will be replaced in place, with the filename updated if it contains the version number.
 //! In the Docker image, a newer release is only announced, with the image to pull; the CLI never
 //! replaces itself there, not even with `--always-update`.
-//! Update notices and announcements are printed to stderr, and only when stdout is a terminal and neither `--json` nor `--quiet` is given.
+//! The release notes of the new release are shown before it is offered or installed.
+//! Update notices, release notes and announcements are printed to stderr, and only when stdout is a terminal and neither `--json` nor `--quiet` is given.
 //! A failed update check (for example when offline) is printed as a warning to stderr and does not stop the command.
 
 #[cfg(unix)]
@@ -226,6 +227,16 @@ async fn handle_latest_release(
 	let latest_tag = latest_release.tag_name.trim_start_matches('v');
 	let latest = semver::Version::parse(latest_tag)
 		.with_context(|| format!("Failed to parse the latest release's version {latest_tag}"))?;
+	let show_release_notes = |ui: &mut UI| {
+		if let Some(notes) = latest_release
+			.body
+			.as_deref()
+			.map(str::trim)
+			.filter(|notes| !notes.is_empty())
+		{
+			ui.print_muted_notice(&format!("Release notes for v{latest_tag}:\n{notes}"));
+		}
+	};
 	let announce = |ui: &mut UI| {
 		ui.print_announcement(&format!(
 			"Please update from v{} to v{} by invoking the CLI with no command specified (REPL).",
@@ -249,6 +260,7 @@ async fn handle_latest_release(
 			return Ok(());
 		}
 		ReleaseAction::Install => {
+			show_release_notes(ui);
 			ui.print_muted_to_stderr(&format!(
 				"Automatically updating from v{} to v{}...",
 				version, latest_tag
@@ -260,6 +272,7 @@ async fn handle_latest_release(
 				announce(ui);
 				return Ok(());
 			}
+			show_release_notes(ui);
 			if !confirm(ui, &question).context("Failed to read confirmation")? {
 				// the CLI carries on with this version, and asks again after the next check
 				log::info!("Update to v{latest_tag} declined");
@@ -581,6 +594,8 @@ fn is_check_due(last_checked: Option<i64>, now: i64) -> bool {
 struct GitHubRelease {
 	prerelease: bool,
 	tag_name: String,
+	/// The release notes, in Markdown.
+	body: Option<String>,
 	assets: Vec<GitHubReleaseAsset>,
 }
 
@@ -695,7 +710,16 @@ mod tests {
 		GitHubRelease {
 			prerelease: false,
 			tag_name: tag.to_owned(),
+			body: None,
 			assets: Vec::new(),
+		}
+	}
+
+	/// A release tagged `tag` with `notes` and no assets.
+	fn release_with_notes(tag: &str, notes: &str) -> GitHubRelease {
+		GitHubRelease {
+			body: Some(notes.to_owned()),
+			..release(tag)
 		}
 	}
 
@@ -1012,6 +1036,114 @@ mod tests {
 			"[i] Update available: v0.2.9 -> v0.3.0. Pull the new image: docker pull \
 			 filen/cli:0.3.0"
 		);
+	}
+
+	#[tokio::test]
+	async fn the_release_notes_are_shown_before_the_update_is_offered() {
+		let printed = Printed::default();
+		let mut ui = printed.prompting_terminal_ui();
+		let printed_before_asking = Cell::new(None);
+
+		run_update_check(
+			&mut ui,
+			"0.2.9",
+			started(false, true),
+			None,
+			async || {
+				(
+					Ok(release_with_notes("v0.3.0", "## Fixes\n- fewer bugs\n")),
+					Ok(Vec::new()),
+				)
+			},
+			|_, _| {
+				printed_before_asking.set(Some(
+					console::strip_ansi_codes(&printed.lines()).into_owned(),
+				));
+				Ok(false)
+			},
+		)
+		.await;
+
+		assert_eq!(
+			printed_before_asking.into_inner().as_deref(),
+			Some("Release notes for v0.3.0:\n## Fixes\n- fewer bugs")
+		);
+	}
+
+	#[tokio::test]
+	async fn the_release_notes_are_shown_before_an_automatic_update() {
+		let printed = Printed::default();
+		let mut ui = printed.terminal_ui();
+
+		run_update_check(
+			&mut ui,
+			"0.2.9",
+			started(true, false),
+			None,
+			async || (Ok(release_with_notes("v0.3.0", "Fixes")), Ok(Vec::new())),
+			not_asked,
+		)
+		.await;
+
+		assert_eq!(
+			console::strip_ansi_codes(&printed.lines()),
+			format!(
+				"Release notes for v0.3.0:\nFixes\nAutomatically updating from v0.2.9 to \
+				 v0.3.0...\n⚠ Update check failed: No suitable release asset found for target: \
+				 {BUILD_TARGET}"
+			)
+		);
+	}
+
+	#[tokio::test]
+	async fn the_release_notes_are_not_shown_when_no_person_reads_the_output() {
+		let printed = Printed::default();
+		let mut ui = printed.ui();
+
+		run_update_check(
+			&mut ui,
+			"0.2.9",
+			started(true, false),
+			None,
+			async || (Ok(release_with_notes("v0.3.0", "Fixes")), Ok(Vec::new())),
+			not_asked,
+		)
+		.await;
+
+		assert_eq!(
+			console::strip_ansi_codes(&printed.lines()),
+			format!(
+				"Automatically updating from v0.2.9 to v0.3.0...\n⚠ Update check failed: No \
+				 suitable release asset found for target: {BUILD_TARGET}"
+			)
+		);
+	}
+
+	#[tokio::test]
+	async fn empty_release_notes_are_not_shown() {
+		let printed = Printed::default();
+		let mut ui = printed.prompting_terminal_ui();
+
+		run_update_check(
+			&mut ui,
+			"0.2.9",
+			started(false, true),
+			None,
+			async || (Ok(release_with_notes("v0.3.0", " \n")), Ok(Vec::new())),
+			|_, _| Ok(false),
+		)
+		.await;
+
+		assert_eq!(printed.lines_or_empty(), "");
+	}
+
+	#[test]
+	fn a_release_without_notes_deserializes() {
+		let release: GitHubRelease = serde_json::from_str(
+			r#"{"prerelease": false, "tag_name": "v0.3.0", "body": null, "assets": []}"#,
+		)
+		.unwrap();
+		assert_eq!(release.body, None);
 	}
 
 	fn version(version: &str) -> semver::Version {

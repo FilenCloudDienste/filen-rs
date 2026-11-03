@@ -322,6 +322,16 @@ impl UI {
 		));
 	}
 
+	/// Print a muted notice about the CLI itself, such as an update's release notes, to stderr. Like
+	/// an announcement, it is only shown to a person at a terminal: not with `--json` or `--quiet`,
+	/// nor when stdout is piped or redirected.
+	pub(crate) fn print_muted_notice(&mut self, msg: &str) {
+		if self.quiet || self.json || !self.stdout_is_terminal {
+			return;
+		}
+		self.print_muted_to_stderr(msg);
+	}
+
 	/// Print a message with a success icon
 	pub(crate) fn print_success(&mut self, msg: &str) {
 		if !self.quiet {
@@ -1006,6 +1016,13 @@ pub(crate) mod test_support {
 		/// [`Printed::ui`], as if stdout were a terminal.
 		pub(crate) fn terminal_ui(&self) -> UI {
 			let mut ui = self.ui();
+			ui.stdout_is_terminal = true;
+			ui
+		}
+
+		/// [`Printed::ui`], as if stdin and stdout were a terminal.
+		pub(crate) fn prompting_terminal_ui(&self) -> UI {
+			let mut ui = self.prompting_ui();
 			ui.stdout_is_terminal = true;
 			ui
 		}
