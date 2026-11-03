@@ -8,15 +8,18 @@
 //! `filen install <latest|vX.Y.Z>` installs a given release, also an older one or the running one again, after confirming (`--yes` confirms).
 //! Update notices, release notes and announcements are printed to stderr, and only when stdout is a terminal and neither `--json` nor `--quiet` is given.
 //! A failed update check (for example when offline) is printed as a warning to stderr and does not stop the command.
+//! An update installed as the REPL starts restarts the CLI on the new release. One installed with `--always-update` before a command takes effect the next time the CLI runs: the command runs on the release it started with.
 
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::{fs::PermissionsExt, process::ExitStatusExt};
 use std::{
 	borrow::Cow,
 	cmp::Ordering,
+	ffi::OsString,
 	fmt,
 	io::{self, Write},
 	path::{Path, PathBuf},
+	process::ExitStatus,
 	str::FromStr,
 };
 
@@ -27,7 +30,7 @@ use sha2::{Digest, Sha256};
 use tempfile::TempPath;
 use tokio::fs;
 
-use crate::{interrupt, ui::UI};
+use crate::{error, interrupt, ui::UI};
 
 /// The target the CLI was built for, which names its release asset.
 pub(crate) const BUILD_TARGET: &str = env!("BUILD_TARGET"); // injected in build.rs
@@ -90,7 +93,7 @@ pub(crate) async fn check_for_updates(
 	};
 
 	let github_api = env.api();
-	run_update_check(
+	let Some(update) = run_update_check(
 		ui,
 		&env.version,
 		UpdateContext {
@@ -105,10 +108,24 @@ pub(crate) async fn check_for_updates(
 				github_api.get_announcements(),
 			)
 		},
-		// installing an update is not what --yes confirms
-		|ui, question| ui.prompt_yes_no(question, true),
+		confirm_update,
 	)
-	.await;
+	.await
+	else {
+		return;
+	};
+	if is_repl {
+		std::process::exit(restart(ui, &update).await);
+	}
+	// the command runs on in this process, on the release it started with
+	match update.installed {
+		InstalledRelease::Renamed(path) => {
+			ui.print_muted_to_stderr(&format!("Downloaded update to {}", path.display()));
+		}
+		InstalledRelease::Replaced(_) => ui.print_muted_to_stderr(
+			"Update installed successfully. It will take effect the next time you run the application.",
+		),
+	}
 }
 
 /// Where the updater finds the releases, and the version it takes the CLI to be.
@@ -160,11 +177,16 @@ fn testing_url(name: &str, default: &'static str) -> Cow<'static, str> {
 	std::env::var(name).map_or(Cow::Borrowed(default), Cow::Owned)
 }
 
+/// Asks whether to install the update the REPL offers with `question`, which `--yes` answers.
+fn confirm_update(ui: &mut UI, question: &str) -> Result<bool> {
+	ui.prompt_confirm(question, true)
+}
+
 /// Shows the announcements and handles the latest release that `fetch` returns, printing a
 /// warning for each part that fails, then writes the time of the check to
 /// `last_checked_config`, whether the check succeeded or not. A running `version` that is not a
 /// semver version fails the whole check, before anything is fetched. `confirm` asks whether to
-/// install the update the REPL offers, [`UI::prompt_yes_no`] outside the tests.
+/// install the update the REPL offers, [`confirm_update`] outside the tests.
 async fn run_update_check(
 	ui: &mut UI,
 	version: &str,
@@ -172,7 +194,8 @@ async fn run_update_check(
 	last_checked_config: Option<&LastCheckedConfig>,
 	fetch: impl AsyncFnOnce() -> (Result<GitHubRelease>, Result<Vec<Announcement>>),
 	confirm: impl FnOnce(&mut UI, &str) -> Result<bool>,
-) {
+) -> Option<InstalledUpdate> {
+	let mut installed = None;
 	match semver::Version::parse(version) {
 		Ok(current) => {
 			let (latest_release, announcements) = fetch().await;
@@ -192,8 +215,9 @@ async fn run_update_check(
 				}
 				Err(e) => Err(e),
 			};
-			if let Err(e) = updated {
-				ui.print_side_warning(&format!("Update check failed: {e:#}"));
+			match updated {
+				Ok(update) => installed = update,
+				Err(e) => ui.print_side_warning(&format!("Update check failed: {e:#}")),
 			}
 		}
 		Err(e) => ui.print_side_warning(&format!(
@@ -206,6 +230,7 @@ async fn run_update_check(
 	{
 		log::warn!("{e:#}");
 	}
+	installed
 }
 
 /// Shows the announcements targeted at `version`.
@@ -284,7 +309,7 @@ async fn handle_latest_release(
 	latest_release: &GitHubRelease,
 	context: UpdateContext,
 	confirm: impl FnOnce(&mut UI, &str) -> Result<bool>,
-) -> Result<()> {
+) -> Result<Option<InstalledUpdate>> {
 	let latest_tag = latest_release.tag_name.trim_start_matches('v');
 	let latest = semver::Version::parse(latest_tag)
 		.with_context(|| format!("Failed to parse the latest release's version {latest_tag}"))?;
@@ -297,18 +322,18 @@ async fn handle_latest_release(
 	match release_action(current, &latest, context) {
 		ReleaseAction::Nothing => {
 			log::info!("Up to date: v{version} (latest release: v{latest_tag})");
-			return Ok(());
+			return Ok(None);
 		}
 		ReleaseAction::Announce => {
 			announce(ui);
-			return Ok(());
+			return Ok(None);
 		}
 		ReleaseAction::AnnounceImage => {
 			ui.print_announcement(&format!(
 				"Update available: v{version} -> v{latest_tag}. Pull the new image: docker pull \
 				 {DOCKER_IMAGE}:{latest_tag}"
 			));
-			return Ok(());
+			return Ok(None);
 		}
 		ReleaseAction::Install => {
 			show_release_notes(ui, latest_release, latest_tag);
@@ -319,28 +344,90 @@ async fn handle_latest_release(
 		}
 		ReleaseAction::Offer => {
 			let question = format!("Update now from v{} to v{}", version, latest_tag);
-			if ui.ensure_can_prompt(&question).is_err() {
+			if ui.ensure_can_confirm(&question).is_err() {
 				announce(ui);
-				return Ok(());
+				return Ok(None);
 			}
 			show_release_notes(ui, latest_release, latest_tag);
 			if !confirm(ui, &question).context("Failed to read confirmation")? {
 				// the CLI carries on with this version, and asks again after the next check
 				log::info!("Update to v{latest_tag} declined");
-				return Ok(());
+				return Ok(None);
 			}
 		}
 	}
 	let installed = install_release(version, latest_release, latest_tag).await?;
-	match installed {
-		InstalledRelease::Renamed(path) => {
-			ui.print_muted_to_stderr(&format!("Downloaded update to {}", path.display()));
+	Ok(Some(InstalledUpdate {
+		version: latest_tag.to_owned(),
+		installed,
+	}))
+}
+
+/// A release the update check installed.
+#[derive(Debug)]
+struct InstalledUpdate {
+	/// Its version, without the leading `v`.
+	version: String,
+	installed: InstalledRelease,
+}
+
+/// Runs the CLI again from `update`, which the update check installed as the REPL started, with
+/// the arguments this process was started with and `--skip-update`, so that the REPL runs the new
+/// release rather than this process's old code. Returns the exit code to exit with: the new
+/// process's, or 0 when it could not be started, after saying to restart the CLI.
+async fn restart(ui: &mut UI, update: &InstalledUpdate) -> i32 {
+	let executable = update.installed.executable();
+	ui.print_muted_to_stderr(&format!(
+		"Updated to v{}, restarting the CLI...",
+		update.version
+	));
+	// Ctrl-C reaches the new process too, which handles it; this one only waits for it to end.
+	let _waiting = (interrupt::catch(), interrupt::own());
+	let status = tokio::process::Command::new(executable)
+		.args(restart_args(std::env::args_os()))
+		.status()
+		.await;
+	restart_exit_code(ui, update, status)
+}
+
+/// The exit code to exit with after restarting the CLI from `update`, which ended with `status`:
+/// its own, or 0 when it could not be started, after saying to restart the CLI.
+fn restart_exit_code(ui: &mut UI, update: &InstalledUpdate, status: io::Result<ExitStatus>) -> i32 {
+	match status {
+		Ok(status) => exit_code_of(status),
+		Err(e) => {
+			ui.print_warning(&format!(
+				"Failed to start {}: {e}",
+				update.installed.executable().display()
+			));
+			ui.print_to_stderr(&format!("Restart the CLI to use v{}", update.version));
+			0
 		}
-		InstalledRelease::Replaced => ui.print_muted_to_stderr(
-			"Update installed successfully. It will take effect the next time you run the application.",
-		),
 	}
-	Ok(())
+}
+
+/// The arguments to restart the CLI with: `args`, those it was started with, without the program,
+/// and with `--skip-update`, so that the restarted CLI does not check again.
+fn restart_args(args: impl IntoIterator<Item = OsString>) -> Vec<OsString> {
+	let mut args = args.into_iter().skip(1).collect::<Vec<_>>();
+	if !args.iter().any(|arg| arg == "--skip-update") {
+		// first, where no command's arguments can be
+		args.insert(0, OsString::from("--skip-update"));
+	}
+	args
+}
+
+/// The exit code to pass on for a process that ended with `status`: its own, or for one a signal
+/// ended, the code a shell reports, 128 plus the signal.
+fn exit_code_of(status: ExitStatus) -> i32 {
+	if let Some(code) = status.code() {
+		return code;
+	}
+	#[cfg(unix)]
+	if let Some(signal) = status.signal() {
+		return signal.saturating_add(128);
+	}
+	error::EXIT_FAILURE
 }
 
 /// Shows the notes of `release`, of `version` (without the leading `v`), if it has any.
@@ -434,7 +521,7 @@ pub(crate) async fn install(ui: &mut UI, request: &ReleaseRequest) -> Result<()>
 		InstalledRelease::Renamed(path) => {
 			ui.print_success(&format!("Installed v{version} to {}", path.display()));
 		}
-		InstalledRelease::Replaced => ui.print_success(&format!(
+		InstalledRelease::Replaced(_) => ui.print_success(&format!(
 			"Installed v{version}. It takes effect the next time you run the CLI."
 		)),
 	}
@@ -489,8 +576,17 @@ enum InstalledRelease {
 	/// At this path, which is the running binary's with the release's version in place of the
 	/// running one; the running binary was deleted.
 	Renamed(PathBuf),
-	/// Over the running binary.
-	Replaced,
+	/// Over the running binary, which is at this path.
+	Replaced(PathBuf),
+}
+
+impl InstalledRelease {
+	/// The installed binary.
+	fn executable(&self) -> &Path {
+		match self {
+			Self::Renamed(path) | Self::Replaced(path) => path,
+		}
+	}
 }
 
 /// Downloads the asset of `release` built for this target, checks it against what the release
@@ -543,7 +639,7 @@ async fn install_release(
 			})
 		})
 		.await??;
-		Ok(InstalledRelease::Replaced)
+		Ok(InstalledRelease::Replaced(current_executable))
 	}
 }
 
@@ -1194,6 +1290,63 @@ mod tests {
 			"⚠ Update check failed: Failed to read confirmation: Canceled"
 		);
 		assert!(written_stamp(config_dir.path()).is_some());
+	}
+
+	#[tokio::test]
+	async fn yes_accepts_an_update_offer_without_a_terminal() {
+		let printed = Printed::default();
+		let mut ui = printed.ui();
+		ui.disable_prompts();
+		ui.set_assume_yes(true);
+
+		run_update_check(
+			&mut ui,
+			"0.2.9",
+			started(false, true),
+			None,
+			async || (Ok(release("v0.3.0")), Ok(Vec::new())),
+			confirm_update,
+		)
+		.await;
+
+		// accepted: the install starts, and finds no asset in a release that has none
+		let printed = console::strip_ansi_codes(&printed.lines()).into_owned();
+		assert!(
+			printed.starts_with("⚠ Update check failed: No suitable release asset found"),
+			"{printed}"
+		);
+	}
+
+	#[tokio::test]
+	async fn yes_still_shows_the_release_notes_before_installing() {
+		let printed = Printed::default();
+		let mut ui = printed.terminal_ui();
+		ui.disable_prompts();
+		ui.set_assume_yes(true);
+
+		run_update_check(
+			&mut ui,
+			"0.2.9",
+			started(false, true),
+			None,
+			async || {
+				(
+					Ok(release_with_notes("v0.3.0", "## Fixes\n- fewer bugs\n")),
+					Ok(Vec::new()),
+				)
+			},
+			confirm_update,
+		)
+		.await;
+
+		let printed = console::strip_ansi_codes(&printed.lines()).into_owned();
+		assert!(
+			printed.starts_with(
+				"Release notes for v0.3.0:\n## Fixes\n- fewer bugs\n⚠ Update check failed: No \
+				 suitable release asset found"
+			),
+			"{printed}"
+		);
 	}
 
 	#[tokio::test]
@@ -1852,6 +2005,88 @@ mod tests {
 			error.to_string(),
 			"No suitable release asset found for target: aarch64-apple-darwin"
 		);
+	}
+
+	#[test]
+	fn the_cli_restarts_with_its_arguments_and_without_checking_again() {
+		let args = ["filen", "--config-dir", "/tmp/config", "--always-update"].map(OsString::from);
+
+		assert_eq!(
+			restart_args(args),
+			[
+				"--skip-update",
+				"--config-dir",
+				"/tmp/config",
+				"--always-update"
+			]
+		);
+	}
+
+	#[test]
+	fn skip_update_is_not_given_twice_on_a_restart() {
+		let args = ["filen", "-v", "--skip-update"].map(OsString::from);
+
+		assert_eq!(restart_args(args), ["-v", "--skip-update"]);
+	}
+
+	fn update_to(executable: &str) -> InstalledUpdate {
+		InstalledUpdate {
+			version: "0.3.0".to_owned(),
+			installed: InstalledRelease::Replaced(PathBuf::from(executable)),
+		}
+	}
+
+	#[test]
+	fn a_restart_that_cannot_start_says_to_restart_and_exits_with_0() {
+		let printed = Printed::default();
+
+		let code = restart_exit_code(
+			&mut printed.ui(),
+			&update_to("/missing/filen-cli"),
+			Err(io::Error::from(io::ErrorKind::NotFound)),
+		);
+
+		assert_eq!(code, 0);
+		assert_eq!(
+			console::strip_ansi_codes(&printed.lines()),
+			"⚠ Failed to start /missing/filen-cli: entity not found\nRestart the CLI to use v0.3.0"
+		);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn a_restarted_cli_passes_on_its_exit_code() {
+		let printed = Printed::default();
+
+		let code = restart_exit_code(
+			&mut printed.ui(),
+			&update_to("filen-cli"),
+			Ok(ExitStatus::from_raw(3 << 8)),
+		);
+
+		assert_eq!(code, 3);
+		assert_eq!(printed.lines_or_empty(), "");
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn a_restarted_cli_ended_by_a_signal_exits_as_a_shell_reports_it() {
+		// SIGINT
+		assert_eq!(exit_code_of(ExitStatus::from_raw(2)), 130);
+	}
+
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn the_restarted_cli_runs_with_the_restart_arguments() {
+		let status = tokio::process::Command::new("/bin/sh")
+			.arg("-c")
+			.arg(r#"[ "$0" = --skip-update ] && [ "$1" = -v ] && exit 7"#)
+			.args(restart_args(["filen", "-v"].map(OsString::from)))
+			.status()
+			.await
+			.unwrap();
+
+		assert_eq!(exit_code_of(status), 7);
 	}
 
 	/// An asset of `size` bytes with `digest`.
