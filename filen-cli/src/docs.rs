@@ -17,7 +17,7 @@ use crate::{
 	CliArgs,
 	commands::{
 		auth_cmds, fs_cmds, misc_cmds, notes_cmds, public_links_cmds, rclone_cmds, search_cmd,
-		sync_cmd, transfer_cmds,
+		shell_cmds, sync_cmd, transfer_cmds,
 	},
 	interrupt,
 	ui::UI,
@@ -80,7 +80,7 @@ const DOC_OUTLINE: &[DocSection] = &[
 	DocSection {
 		id: "usage",
 		title: "Usage",
-		parts: &[USAGE_INTRO_DOCS, misc_cmds::DOCS],
+		parts: &[USAGE_INTRO_DOCS, misc_cmds::DOCS, shell_cmds::DOCS],
 	},
 	DocSection {
 		id: "auth",

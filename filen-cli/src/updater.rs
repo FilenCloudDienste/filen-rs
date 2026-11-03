@@ -5,6 +5,7 @@
 //! In the Docker image, a newer release is only announced, with the image to pull; the CLI never
 //! replaces itself there, not even with `--always-update`.
 //! The release notes of the new release are shown before it is offered or installed.
+//! `filen install <latest|vX.Y.Z>` installs a given release, also an older one or the running one again, after confirming (`--yes` confirms).
 //! Update notices, release notes and announcements are printed to stderr, and only when stdout is a terminal and neither `--json` nor `--quiet` is given.
 //! A failed update check (for example when offline) is printed as a warning to stderr and does not stop the command.
 
@@ -12,9 +13,11 @@
 use std::os::unix::fs::PermissionsExt;
 use std::{
 	borrow::Cow,
+	cmp::Ordering,
 	fmt,
 	io::{self, Write},
 	path::{Path, PathBuf},
+	str::FromStr,
 };
 
 use anyhow::{Context, Result};
@@ -24,7 +27,7 @@ use sha2::{Digest, Sha256};
 use tempfile::TempPath;
 use tokio::fs;
 
-use crate::ui::UI;
+use crate::{interrupt, ui::UI};
 
 const BUILD_TARGET: &str = env!("BUILD_TARGET"); // injected in build.rs
 
@@ -281,16 +284,6 @@ async fn handle_latest_release(
 	let latest_tag = latest_release.tag_name.trim_start_matches('v');
 	let latest = semver::Version::parse(latest_tag)
 		.with_context(|| format!("Failed to parse the latest release's version {latest_tag}"))?;
-	let show_release_notes = |ui: &mut UI| {
-		if let Some(notes) = latest_release
-			.body
-			.as_deref()
-			.map(str::trim)
-			.filter(|notes| !notes.is_empty())
-		{
-			ui.print_muted_notice(&format!("Release notes for v{latest_tag}:\n{notes}"));
-		}
-	};
 	let announce = |ui: &mut UI| {
 		ui.print_announcement(&format!(
 			"Please update from v{} to v{} by invoking the CLI with no command specified (REPL).",
@@ -314,7 +307,7 @@ async fn handle_latest_release(
 			return Ok(());
 		}
 		ReleaseAction::Install => {
-			show_release_notes(ui);
+			show_release_notes(ui, latest_release, latest_tag);
 			ui.print_muted_to_stderr(&format!(
 				"Automatically updating from v{} to v{}...",
 				version, latest_tag
@@ -326,7 +319,7 @@ async fn handle_latest_release(
 				announce(ui);
 				return Ok(());
 			}
-			show_release_notes(ui);
+			show_release_notes(ui, latest_release, latest_tag);
 			if !confirm(ui, &question).context("Failed to read confirmation")? {
 				// the CLI carries on with this version, and asks again after the next check
 				log::info!("Update to v{latest_tag} declined");
@@ -346,6 +339,146 @@ async fn handle_latest_release(
 	Ok(())
 }
 
+/// Shows the notes of `release`, of `version` (without the leading `v`), if it has any.
+fn show_release_notes(ui: &mut UI, release: &GitHubRelease, version: &str) {
+	if let Some(notes) = release
+		.body
+		.as_deref()
+		.map(str::trim)
+		.filter(|notes| !notes.is_empty())
+	{
+		ui.print_muted_notice(&format!("Release notes for v{version}:\n{notes}"));
+	}
+}
+
+/// The release `filen install` installs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ReleaseRequest {
+	/// The latest release.
+	Latest,
+	/// The release of this version.
+	Version(semver::Version),
+}
+
+impl FromStr for ReleaseRequest {
+	type Err = InvalidReleaseRequest;
+
+	/// Parses `latest`, or a version with or without a leading `v`.
+	fn from_str(s: &str) -> Result<Self, Self::Err> {
+		if s == "latest" {
+			return Ok(Self::Latest);
+		}
+		semver::Version::parse(s.strip_prefix('v').unwrap_or(s))
+			.map(Self::Version)
+			.map_err(InvalidReleaseRequest)
+	}
+}
+
+impl fmt::Display for ReleaseRequest {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		match self {
+			Self::Latest => f.write_str("the latest release"),
+			Self::Version(version) => write!(f, "v{version}"),
+		}
+	}
+}
+
+/// Why an argument names no release: it is neither `latest` nor a version.
+#[derive(Debug)]
+pub(crate) struct InvalidReleaseRequest(semver::Error);
+
+impl fmt::Display for InvalidReleaseRequest {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		write!(
+			f,
+			"expected \"latest\" or a version such as v0.2.9 ({})",
+			self.0
+		)
+	}
+}
+
+impl std::error::Error for InvalidReleaseRequest {
+	fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+		Some(&self.0)
+	}
+}
+
+/// Installs the release `request` names in place of the running binary, for `filen install`: also
+/// an older one, or the running one again, which the update check never does. Asks to confirm
+/// first, which `--yes` answers. Refuses in the Docker image, where another image is pulled
+/// instead, and in a debug build that no test runs.
+pub(crate) async fn install(ui: &mut UI, request: &ReleaseRequest) -> Result<()> {
+	let env = UpdaterEnv::from_env();
+	if env.is_untested_debug_build() {
+		return Err(UI::failure("A development build does not install releases"));
+	}
+	let github_api = env.api();
+	let Some(release) = confirm_install(
+		ui,
+		&env.version,
+		request,
+		cfg!(feature = "is_docker"),
+		async |request| github_api.get_release(request).await,
+		|ui, question| ui.prompt_confirm(question, false),
+	)
+	.await?
+	else {
+		return Ok(());
+	};
+	let version = release.tag_name.trim_start_matches('v');
+	match install_release(&env.version, &release, version).await? {
+		InstalledRelease::Renamed(path) => {
+			ui.print_success(&format!("Installed v{version} to {}", path.display()));
+		}
+		InstalledRelease::Replaced => ui.print_success(&format!(
+			"Installed v{version}. It takes effect the next time you run the CLI."
+		)),
+	}
+	Ok(())
+}
+
+/// Fetches the release `request` names and asks with `confirm` whether to install it in place of
+/// the running `running_version`, after its release notes. Returns it if the answer is yes. In a
+/// container it fails before fetching anything, and so it does when nobody could confirm.
+async fn confirm_install(
+	ui: &mut UI,
+	running_version: &str,
+	request: &ReleaseRequest,
+	in_container: bool,
+	fetch: impl AsyncFnOnce(&ReleaseRequest) -> Result<GitHubRelease>,
+	confirm: impl FnOnce(&mut UI, &str) -> Result<bool>,
+) -> Result<Option<GitHubRelease>> {
+	if in_container {
+		let tag = match request {
+			ReleaseRequest::Latest => "<version>".to_owned(),
+			ReleaseRequest::Version(version) => version.to_string(),
+		};
+		return Err(UI::failure(&format!(
+			"The CLI does not install releases in its Docker image. Pull the release's image \
+			 instead: docker pull {DOCKER_IMAGE}:{tag}"
+		)));
+	}
+	let current = semver::Version::parse(running_version)
+		.with_context(|| format!("Failed to parse the running version {running_version}"))?;
+	// before fetching, so that a script learns it needs --yes without waiting for GitHub
+	ui.ensure_can_confirm(&format!("Install {request}"))?;
+	let release = fetch(request).await?;
+	let version = release.tag_name.trim_start_matches('v');
+	let parsed = semver::Version::parse(version)
+		.with_context(|| format!("Failed to parse the release's version {version}"))?;
+	let question = match parsed.cmp_precedence(&current) {
+		Ordering::Greater => format!("Update from v{running_version} to v{version}"),
+		Ordering::Equal => format!("Reinstall v{version}"),
+		Ordering::Less => format!("Downgrade from v{running_version} to v{version}"),
+	};
+	show_release_notes(ui, &release, version);
+	if !confirm(ui, &question)? {
+		log::info!("Install of v{version} declined");
+		return Ok(None);
+	}
+	Ok(Some(release))
+}
+
 /// Where a release was installed.
 #[derive(Debug)]
 enum InstalledRelease {
@@ -359,7 +492,7 @@ enum InstalledRelease {
 /// Downloads the asset of `release` built for this target, checks it against what the release
 /// lists, and installs it in place of the running binary: under a new name when the running
 /// binary's name carries `running_version`, the release's `release_version` (without the leading
-/// `v`) in its place, or else over the running binary. Whether the release is newer is the
+/// `v`) in its place, or else, and for the running release, over the running binary. Whether the release is newer is the
 /// caller's business.
 async fn install_release(
 	running_version: &str,
@@ -382,9 +515,13 @@ async fn install_release(
 		.to_path_buf();
 	let content = download_file(&asset.browser_download_url).await?;
 	verify_download(asset, &content)?;
-	if current_executable_name.contains(running_version) {
-		let update_path = current_executable
-			.with_file_name(current_executable_name.replace(running_version, release_version));
+	// Ctrl-C waits until the binary is in place: quitting while it is written could leave the
+	// staged file behind, or both binaries.
+	let _installing = (interrupt::catch(), interrupt::own());
+	let renamed = current_executable_name.replace(running_version, release_version);
+	// reinstalling the running release keeps its name, so it goes over the running binary
+	if renamed != current_executable_name {
+		let update_path = current_executable.with_file_name(renamed);
 		// writing, syncing and renaming a multi-MB binary blocks, so keep it off the
 		// runtime's workers
 		let update_path = tokio::task::spawn_blocking(move || {
@@ -736,7 +873,8 @@ impl<'a> GitHubApiClient<'a> {
 			.context("Failed to send request to GitHub API for releases")
 	}
 
-	async fn get_latest_release(&self) -> Result<GitHubRelease> {
+	/// Requests `path` under the releases URL, with `GITHUB_TOKEN` when it is set.
+	async fn request_releases(&self, path: &str) -> Result<reqwest::Response> {
 		// Unauthenticated api.github.com allows 60 requests/hour per IP, which shared CI
 		// runner IPs exhaust; the resulting rate-limit JSON used to surface as an opaque
 		// body-decode failure below. A token (CI passes the workflow's GITHUB_TOKEN)
@@ -746,30 +884,36 @@ impl<'a> GitHubApiClient<'a> {
 		let token = std::env::var("GITHUB_TOKEN")
 			.ok()
 			.filter(|t| !t.is_empty() && self.releases_url == RELEASES_URL);
-		let mut response = self
-			.send_releases_request("latest", token.as_deref())
-			.await?;
+		let mut response = self.send_releases_request(path, token.as_deref()).await?;
 		// A token must never fail harder than no token: GITHUB_TOKEN is an installation
 		// token scoped to the calling repository, and reads of ANOTHER (public) repo's
 		// releases are expected to work but can be rejected as "Resource not accessible
 		// by integration". On an auth-shaped rejection, retry unauthenticated — worst
 		// case that retry hits the plain IP rate limit and we report that instead.
 		if token.is_some() && matches!(response.status().as_u16(), 401 | 403) {
-			response = self.send_releases_request("latest", None).await?;
+			response = self.send_releases_request(path, None).await?;
 		}
-		let status = response.status();
-		if !status.is_success() {
-			// Read the body for the error: GitHub explains itself there (rate limits
-			// most importantly), and decoding a non-2xx body as a release produced
-			// undiagnosable "error decoding response body" failures.
-			let body = response.text().await.unwrap_or_default();
-			let body = body.chars().take(300).collect::<String>();
-			anyhow::bail!("GitHub API returned {status} for releases: {body}");
+		Ok(response)
+	}
+
+	async fn get_latest_release(&self) -> Result<GitHubRelease> {
+		parse_release_response(self.request_releases("latest").await?).await
+	}
+
+	/// The release of `version`, or a failure saying there is none.
+	async fn get_tagged_release(&self, version: &semver::Version) -> Result<GitHubRelease> {
+		let response = self.request_releases(&format!("tags/v{version}")).await?;
+		if response.status() == reqwest::StatusCode::NOT_FOUND {
+			return Err(UI::failure(&format!("There is no release v{version}")));
 		}
-		response
-			.json::<GitHubRelease>()
-			.await
-			.map_err(|e| anyhow::anyhow!("Failed to parse GitHub releases response: {}", e))
+		parse_release_response(response).await
+	}
+
+	async fn get_release(&self, request: &ReleaseRequest) -> Result<GitHubRelease> {
+		match request {
+			ReleaseRequest::Latest => self.get_latest_release().await,
+			ReleaseRequest::Version(version) => self.get_tagged_release(version).await,
+		}
 	}
 
 	async fn get_announcements(&self) -> Result<Vec<Announcement>> {
@@ -793,6 +937,23 @@ impl<'a> GitHubApiClient<'a> {
 			.context("Failed to read announcements response text")?;
 		Ok(parse_announcements(&text))
 	}
+}
+
+/// The release in a response of the releases API, or the error it answered with.
+async fn parse_release_response(response: reqwest::Response) -> Result<GitHubRelease> {
+	let status = response.status();
+	if !status.is_success() {
+		// Read the body for the error: GitHub explains itself there (rate limits
+		// most importantly), and decoding a non-2xx body as a release produced
+		// undiagnosable "error decoding response body" failures.
+		let body = response.text().await.unwrap_or_default();
+		let body = body.chars().take(300).collect::<String>();
+		anyhow::bail!("GitHub API returned {status} for releases: {body}");
+	}
+	response
+		.json::<GitHubRelease>()
+		.await
+		.map_err(|e| anyhow::anyhow!("Failed to parse GitHub releases response: {}", e))
 }
 
 /// Parses the announcements file: one `<version range>: <message>` per line. A line that is not
@@ -1259,6 +1420,185 @@ mod tests {
 
 	fn version(version: &str) -> semver::Version {
 		semver::Version::parse(version).unwrap()
+	}
+
+	#[test]
+	fn latest_requests_the_latest_release() {
+		assert_eq!(
+			"latest".parse::<ReleaseRequest>().unwrap(),
+			ReleaseRequest::Latest
+		);
+	}
+
+	#[test]
+	fn a_version_requests_its_release_with_or_without_a_leading_v() {
+		for argument in ["v0.2.9", "0.2.9"] {
+			assert_eq!(
+				argument.parse::<ReleaseRequest>().unwrap(),
+				ReleaseRequest::Version(version("0.2.9")),
+				"{argument}"
+			);
+		}
+	}
+
+	#[test]
+	fn an_argument_that_is_no_version_requests_no_release() {
+		for argument in ["", "v", "banana", "v0.2", "V0.2.9", "Latest"] {
+			assert!(argument.parse::<ReleaseRequest>().is_err(), "{argument}");
+		}
+		assert_eq!(
+			"v0.2".parse::<ReleaseRequest>().unwrap_err().to_string(),
+			"expected \"latest\" or a version such as v0.2.9 (unexpected end of input while \
+			 parsing minor version number)"
+		);
+	}
+
+	/// What `confirm_install` returned for installing `tag` in place of `running`, and the
+	/// question it asked, answered with `answer`.
+	async fn confirm_install_of(
+		ui: &mut UI,
+		running: &str,
+		tag: &str,
+		answer: bool,
+	) -> (Result<Option<GitHubRelease>>, Option<String>) {
+		let asked = Cell::new(None);
+		let release = confirm_install(
+			ui,
+			running,
+			&ReleaseRequest::Version(version(tag.trim_start_matches('v'))),
+			false,
+			async |_| Ok(release_with_notes(tag, "Fixes")),
+			|_, question| {
+				asked.set(Some(question.to_owned()));
+				Ok(answer)
+			},
+		)
+		.await;
+		(release, asked.into_inner())
+	}
+
+	#[tokio::test]
+	async fn install_asks_whether_to_update_reinstall_or_downgrade() {
+		for (running, tag, question) in [
+			("0.2.9", "v0.3.0", "Update from v0.2.9 to v0.3.0"),
+			("0.2.9", "v0.2.9", "Reinstall v0.2.9"),
+			("0.3.0", "v0.2.9", "Downgrade from v0.3.0 to v0.2.9"),
+		] {
+			let printed = Printed::default();
+			let (release, asked) =
+				confirm_install_of(&mut printed.prompting_ui(), running, tag, true).await;
+			assert_eq!(release.unwrap().unwrap().tag_name, tag);
+			assert_eq!(asked.as_deref(), Some(question));
+		}
+	}
+
+	#[tokio::test]
+	async fn a_declined_install_installs_nothing() {
+		let printed = Printed::default();
+		let (release, asked) =
+			confirm_install_of(&mut printed.prompting_ui(), "0.3.0", "v0.2.9", false).await;
+		assert!(release.unwrap().is_none());
+		assert!(asked.is_some());
+		assert_eq!(printed.lines_or_empty(), "");
+	}
+
+	#[tokio::test]
+	async fn install_shows_the_release_notes_before_asking() {
+		let printed = Printed::default();
+		let mut ui = printed.prompting_terminal_ui();
+		let printed_before_asking = Cell::new(None);
+
+		confirm_install(
+			&mut ui,
+			"0.2.9",
+			&ReleaseRequest::Latest,
+			false,
+			async |_| Ok(release_with_notes("v0.3.0", "Fixes")),
+			|_, _| {
+				printed_before_asking.set(Some(
+					console::strip_ansi_codes(&printed.lines()).into_owned(),
+				));
+				Ok(false)
+			},
+		)
+		.await
+		.unwrap();
+
+		assert_eq!(
+			printed_before_asking.into_inner().as_deref(),
+			Some("Release notes for v0.3.0:\nFixes")
+		);
+	}
+
+	#[tokio::test]
+	async fn install_that_nobody_could_confirm_fails_before_fetching() {
+		let printed = Printed::default();
+		let error = confirm_install(
+			&mut printed.ui(),
+			"0.2.9",
+			&ReleaseRequest::Version(version("0.2.8")),
+			false,
+			async |_| -> Result<GitHubRelease> { panic!("fetched a release nobody can confirm") },
+			not_asked,
+		)
+		.await
+		.unwrap_err();
+
+		assert_eq!(
+			error.to_string(),
+			"Cannot ask \"Install v0.2.8\": stdin is not a terminal. Pass --yes to answer yes."
+		);
+		assert_eq!(crate::error::exit_code(&error), crate::error::EXIT_USAGE);
+	}
+
+	#[tokio::test]
+	async fn install_with_yes_does_not_ask() {
+		let printed = Printed::default();
+		let mut ui = printed.ui();
+		ui.set_assume_yes(true);
+
+		let release = confirm_install(
+			&mut ui,
+			"0.2.9",
+			&ReleaseRequest::Latest,
+			false,
+			async |_| Ok(release("v0.3.0")),
+			|ui, question| ui.prompt_confirm(question, false),
+		)
+		.await
+		.unwrap();
+
+		assert_eq!(release.unwrap().tag_name, "v0.3.0");
+	}
+
+	#[tokio::test]
+	async fn install_in_a_container_says_which_image_to_pull_instead() {
+		for (request, message) in [
+			(
+				ReleaseRequest::Version(version("0.2.8")),
+				"The CLI does not install releases in its Docker image. Pull the release's image \
+				 instead: docker pull filen/cli:0.2.8",
+			),
+			(
+				ReleaseRequest::Latest,
+				"The CLI does not install releases in its Docker image. Pull the release's image \
+				 instead: docker pull filen/cli:<version>",
+			),
+		] {
+			let printed = Printed::default();
+			let error = confirm_install(
+				&mut printed.prompting_ui(),
+				"0.2.9",
+				&request,
+				true,
+				async |_| -> Result<GitHubRelease> { panic!("fetched a release in a container") },
+				not_asked,
+			)
+			.await
+			.unwrap_err();
+
+			assert_eq!(error.to_string(), message);
+		}
 	}
 
 	#[test]

@@ -14,6 +14,7 @@ pub(crate) mod notes_cmds;
 pub(crate) mod public_links_cmds;
 pub(crate) mod rclone_cmds;
 pub(crate) mod search_cmd;
+pub(crate) mod shell_cmds;
 pub(crate) mod sync_cmd;
 pub(crate) mod transfer_cmds;
 
@@ -37,6 +38,19 @@ pub(crate) enum Commands {
 	Auth(auth_cmds::AuthCommands),
 	#[command(flatten)]
 	Rclone(rclone_cmds::RcloneCommands),
+	#[command(flatten)]
+	Shell(shell_cmds::ShellCommands),
+}
+
+impl Commands {
+	/// Whether the update check when the CLI starts is skipped for this command.
+	pub(crate) fn skips_update_check(&self) -> bool {
+		match self {
+			Commands::Shell(command) => command.skips_update_check(),
+			// every other command runs after the check
+			_ => false,
+		}
+	}
 }
 // (!) every command needs to be in its module's doc outline parts (`DOCS`), which
 // `docs::DOC_OUTLINE` places into the doc sections
@@ -72,5 +86,6 @@ pub(crate) async fn execute_command(
 		Commands::PublicLinks(command) => command.execute(ctx).await,
 		Commands::Auth(command) => command.execute(ctx).await,
 		Commands::Rclone(command) => command.execute(ctx).await,
+		Commands::Shell(command) => command.execute(ctx).await,
 	}
 }

@@ -488,7 +488,12 @@ async fn inner_main(ui: &mut ui::UI, arenas_limited: bool) -> Result<Finished> {
 		));
 	}
 
-	if !cli_args.skip_update {
+	if !cli_args.skip_update
+		&& !cli_args
+			.command
+			.as_ref()
+			.is_some_and(Commands::skips_update_check)
+	{
 		check_for_updates(
 			ui,
 			cli_args.force_update_check || cli_args.always_update,

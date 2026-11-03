@@ -518,3 +518,119 @@ fn an_asset_with_a_malformed_digest_is_not_installed() {
 		installation.original
 	);
 }
+
+#[test]
+fn install_downgrades_to_an_older_release() {
+	let server = MockServer::start(Releases::default());
+	let installation = Installation::new("filen-cli");
+
+	installation
+		.cli(&server.url, "2.0.0")
+		.args(["install", "v0.1.0", "--yes"])
+		.assert()
+		.success()
+		.stdout(contains("Installed v0.1.0."));
+
+	assert_eq!(fs::read(&installation.executable).unwrap(), asset("v0.1.0"));
+	// no update check runs before it
+	assert_eq!(
+		server.requests(),
+		["/releases/tags/v0.1.0", "/download/v0.1.0"]
+	);
+}
+
+#[test]
+fn install_renames_a_binary_with_a_version_in_its_name() {
+	let server = MockServer::start(Releases::default());
+	let installation = Installation::new(&format!("filen-cli-v1.0.0-{TARGET}"));
+
+	installation
+		.cli(&server.url, "1.0.0")
+		.args(["install", "0.1.0", "--yes"])
+		.assert()
+		.success()
+		.stdout(contains("Installed v0.1.0 to"));
+
+	let installed = installation
+		.bin_dir
+		.path()
+		.join(format!("filen-cli-v0.1.0-{TARGET}{EXE_SUFFIX}"));
+	assert_eq!(fs::read(installed).unwrap(), asset("v0.1.0"));
+	// Windows deletes the running binary only once it exits, in the background
+	#[cfg(unix)]
+	assert_eq!(
+		installation.bin_dir_files(),
+		[format!("filen-cli-v0.1.0-{TARGET}")]
+	);
+}
+
+#[test]
+fn install_reinstalls_the_running_release_over_a_binary_with_its_version_in_its_name() {
+	let server = MockServer::start(Releases::default());
+	let name = format!("filen-cli-v1.0.0-{TARGET}{EXE_SUFFIX}");
+	let installation = Installation::new(&format!("filen-cli-v1.0.0-{TARGET}"));
+
+	installation
+		.cli(&server.url, "1.0.0")
+		.args(["install", "latest", "--yes"])
+		.assert()
+		.success()
+		.stdout(contains("Installed v1.0.0."));
+
+	assert_eq!(fs::read(&installation.executable).unwrap(), asset("v1.0.0"));
+	assert_eq!(installation.bin_dir_files(), [name]);
+}
+
+#[test]
+fn install_of_a_release_that_does_not_exist_fails() {
+	let server = MockServer::start(Releases::default());
+	let installation = Installation::new("filen-cli");
+
+	installation
+		.cli(&server.url, "1.0.0")
+		.args(["install", "v7.7.7", "--yes"])
+		.assert()
+		.code(1)
+		.stderr(contains("There is no release v7.7.7"));
+
+	assert_eq!(
+		fs::read(&installation.executable).unwrap(),
+		installation.original
+	);
+}
+
+#[test]
+fn install_without_a_terminal_needs_yes() {
+	let server = MockServer::start(Releases::default());
+	let installation = Installation::new("filen-cli");
+
+	installation
+		.cli(&server.url, "1.0.0")
+		.args(["install", "v0.1.0"])
+		.assert()
+		.code(2)
+		.stderr(contains(
+			"Cannot ask \"Install v0.1.0\": stdin is not a terminal. Pass --yes to answer yes.",
+		));
+
+	assert_eq!(server.requests(), Vec::<String>::new());
+	assert_eq!(
+		fs::read(&installation.executable).unwrap(),
+		installation.original
+	);
+}
+
+#[test]
+fn install_of_something_that_is_not_a_version_is_a_usage_error() {
+	let server = MockServer::start(Releases::default());
+	let installation = Installation::new("filen-cli");
+
+	installation
+		.cli(&server.url, "1.0.0")
+		.args(["install", "banana", "--yes"])
+		.assert()
+		.code(2)
+		.stderr(contains("invalid value 'banana'"));
+
+	assert_eq!(server.requests(), Vec::<String>::new());
+}
