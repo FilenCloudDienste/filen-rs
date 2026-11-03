@@ -80,26 +80,17 @@ fn authenticate_from_the_variables_of_the_old_cli() {
 #[shared_test_runtime]
 async fn export_and_authenticate_from_auth_config() {
 	let workdir = assert_fs::TempDir::new().unwrap();
-	authenticated_cli_with_args!("export-auth-config")
+	let path = workdir.path().join("exported-auth-config.txt");
+	authenticated_cli_with_args!("export-auth-config", path.to_str().unwrap(), "--yes")
 		.success()
-		.stdout(predicates::str::contains("Exported auth config"));
-	tokio::fs::copy(
-		"filen-cli-auth-config.txt",
-		workdir.path().join("filen-cli-auth-config.txt"),
-	)
-	.await
-	.unwrap();
-	tokio::fs::remove_file("filen-cli-auth-config.txt")
-		.await
-		.unwrap();
+		.stdout(predicates::str::contains(format!(
+			"Exported auth config to {}",
+			path.display()
+		)));
 	cargo_bin_cmd!()
 		.args([
 			"--auth-config-path",
-			workdir
-				.path()
-				.join("filen-cli-auth-config.txt")
-				.to_str()
-				.unwrap(),
+			path.to_str().unwrap(),
 			"-v",
 			"stat",
 			"/",
@@ -109,6 +100,35 @@ async fn export_and_authenticate_from_auth_config() {
 		.stderr(predicates::str::contains(
 			"Authenticated from auth config file",
 		));
+}
+
+#[test]
+fn exporting_an_auth_config_without_yes_fails_before_logging_in() {
+	let config_dir = assert_fs::TempDir::new().unwrap();
+	let path = config_dir.path().join("exported-auth-config.txt");
+	cargo_bin_cmd!()
+		.env("FILEN_CLI_TESTING_DISABLE_KEYRING", "1")
+		.env("FILEN_CLI_TESTING_DISABLE_AUTODETECTED_AUTH_CONFIG", "1")
+		.env_remove("FILEN_CLI_EMAIL")
+		.env_remove("FILEN_CLI_PASSWORD")
+		.env_remove("FILEN_CLI_2FA_CODE")
+		.env_remove("FILEN_EMAIL")
+		.env_remove("FILEN_PASSWORD")
+		.env_remove("FILEN_2FA_CODE")
+		.args([
+			"--skip-update",
+			"--config-dir",
+			config_dir.path().to_str().unwrap(),
+			"export-auth-config",
+			path.to_str().unwrap(),
+		])
+		.assert()
+		.code(2)
+		.stdout("")
+		.stderr(predicates::str::contains("Pass --yes to answer yes."))
+		// the login prompt, which comes after the confirmation
+		.stderr(predicates::str::contains("Not logged in").not());
+	assert!(!path.exists());
 }
 
 #[shared_test_runtime]

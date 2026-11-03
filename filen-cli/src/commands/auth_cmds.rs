@@ -1,10 +1,12 @@
-use anyhow::{Context as _, Result};
+use std::path::PathBuf;
+
+use anyhow::Result;
 use clap::Subcommand;
 use serde_json::json;
 
 use crate::{
 	CommandResult,
-	auth::{self, LogoutOutcome, export_auth_config},
+	auth::{self, LogoutOutcome},
 	commands::CommandContext,
 	docs::DocElement,
 	ui::UI,
@@ -14,8 +16,13 @@ use crate::{
 pub(crate) enum AuthCommands {
 	/// Print the email of the account you are logged in as
 	Whoami,
-	/// Export an auth config (to be used with --auth-config-path option)
-	ExportAuthConfig,
+	/// Export an auth config (to be used with --auth-config-path option), after confirming the
+	/// risk (--yes answers)
+	ExportAuthConfig {
+		/// The file to write, or a directory to write filen-cli-auth-config.txt into
+		/// (defaults to the current working directory)
+		path: Option<PathBuf>,
+	},
 	/// Delete saved credentials and exit, asking before each (--yes deletes them all)
 	Logout,
 }
@@ -38,16 +45,15 @@ impl AuthCommands {
 				let client = client.get(ui).await?;
 				print_whoami(ui, client.email())?;
 			}
-			Self::ExportAuthConfig => {
-				let client = client.get(ui).await?;
-				let export_path = export_auth_config(
-					client,
-					&std::env::current_dir().context("Failed to get current working directory")?,
-				)?;
-				ui.print_success(&format!(
-					"Exported auth config to {}",
-					export_path.display()
-				));
+			Self::ExportAuthConfig { path } => {
+				if let Some(export_path) =
+					auth::export_auth_config_command(client, ui, path.as_deref()).await?
+				{
+					ui.print_success(&format!(
+						"Exported auth config to {}",
+						export_path.display()
+					));
+				}
 			}
 			Self::Logout => {
 				// stay in the REPL when every deletion was declined

@@ -774,7 +774,7 @@ fn offer_to_keep_logged_in(config: &CliConfig, ui: &mut UI, client: &Client) -> 
 				),
 				false,
 			)? {
-				export_auth_config(client, &config.config_dir)
+				export_auth_config(client, &config.config_dir.join(AUTH_CONFIG_FILENAME))
 					.context("Failed to export auth config")?;
 			}
 		}
@@ -908,15 +908,65 @@ fn write_private_file(path: &Path, contents: &str) -> std::io::Result<()> {
 	file.write_all(contents.as_bytes())
 }
 
-/// Export an auth config to `{parent_dir}/filen-cli-auth-config.txt`.
-pub(crate) fn export_auth_config(client: &Client, parent_dir: &Path) -> Result<PathBuf> {
-	let path = parent_dir.join(AUTH_CONFIG_FILENAME);
+/// Export an auth config of `client`'s login to the file `path`.
+fn export_auth_config(client: &Client, path: &Path) -> Result<()> {
 	let sdk_config = serialize_auth_config(client)?;
-	write_private_file(&path, &sdk_config).context(format!(
-		"Failed to write auth config to file {}",
-		path.display()
-	))?;
-	Ok(path)
+	write_private_file(path, &sdk_config)
+		.with_context(|| format!("Failed to write auth config to file {}", path.display()))
+}
+
+const EXPORT_RISK_PROMPT: &str = "The auth config holds your full, unencrypted credentials: \
+	anyone who can read the file can access your account. Export?";
+
+/// Export an auth config to `path_arg`, a file or a directory to write
+/// `filen-cli-auth-config.txt` into, or to that file in the working directory without one, after
+/// the user confirmed the risk and, if the file exists, overwriting it. Returns the file written,
+/// or `None` if the user declined.
+pub(crate) async fn export_auth_config_command(
+	client: &mut LazyClient,
+	ui: &mut UI,
+	path_arg: Option<&Path>,
+) -> Result<Option<PathBuf>> {
+	// before logging in, so that a script learns it needs --yes before anything else happens
+	ui.ensure_can_confirm(EXPORT_RISK_PROMPT)?;
+	let path = auth_config_export_path(path_arg, || {
+		std::env::current_dir().context("Failed to get current working directory")
+	})?;
+	if !confirm_export(ui, &path)? {
+		ui.print_muted("Auth config not exported");
+		return Ok(None);
+	}
+	let client = client.get(ui).await?;
+	export_auth_config(client, &path)?;
+	Ok(Some(path))
+}
+
+/// The file `export-auth-config` writes to: `path_arg`, or `filen-cli-auth-config.txt` in it if it
+/// is a directory, or in the `working_dir` without one.
+fn auth_config_export_path(
+	path_arg: Option<&Path>,
+	working_dir: impl FnOnce() -> Result<PathBuf>,
+) -> Result<PathBuf> {
+	Ok(match path_arg {
+		None => working_dir()?.join(AUTH_CONFIG_FILENAME),
+		Some(path) if path.is_dir() => path.join(AUTH_CONFIG_FILENAME),
+		Some(path) => path.to_path_buf(),
+	})
+}
+
+/// Asks the user to confirm exporting the credentials to `path`, and overwriting it if it exists.
+/// `--yes` answers both.
+fn confirm_export(ui: &mut UI, path: &Path) -> Result<bool> {
+	if !ui.prompt_confirm(EXPORT_RISK_PROMPT, false)? {
+		return Ok(false);
+	}
+	if path.exists() {
+		return ui.prompt_confirm(
+			&format!("{} already exists. Overwrite it?", path.display()),
+			false,
+		);
+	}
+	Ok(true)
 }
 
 /// What [`logout`] did.
@@ -1666,6 +1716,56 @@ mod tests {
 			)
 		);
 		assert!(path.exists());
+	}
+
+	#[test]
+	fn without_a_path_the_auth_config_is_exported_to_the_working_dir() {
+		let path = auth_config_export_path(None, || Ok(PathBuf::from("/work"))).unwrap();
+		assert_eq!(path, Path::new("/work/filen-cli-auth-config.txt"));
+	}
+
+	#[test]
+	fn a_directory_path_gets_the_auth_config_file_inside_it() {
+		let dir = assert_fs::TempDir::new().unwrap();
+		let path =
+			auth_config_export_path(Some(dir.path()), || panic!("a path was given")).unwrap();
+		assert_eq!(path, dir.path().join("filen-cli-auth-config.txt"));
+	}
+
+	#[test]
+	fn a_file_path_is_the_file_the_auth_config_is_exported_to() {
+		let dir = assert_fs::TempDir::new().unwrap();
+		let file = dir.path().join("my-auth-config.txt");
+		let path = auth_config_export_path(Some(&file), || panic!("a path was given")).unwrap();
+		assert_eq!(path, file);
+	}
+
+	#[test]
+	fn exporting_without_a_terminal_or_yes_fails_asking_for_yes() {
+		let dir = assert_fs::TempDir::new().unwrap();
+		let err = confirm_export(
+			&mut Printed::default().ui(),
+			&dir.path().join(AUTH_CONFIG_FILENAME),
+		)
+		.unwrap_err();
+		assert_eq!(
+			format!("{err:#}"),
+			format!(
+				"Cannot ask \"{EXPORT_RISK_PROMPT}\": stdin is not a terminal. Pass --yes to answer \
+				 yes."
+			)
+		);
+		assert_eq!(exit_code(&err), 2);
+	}
+
+	#[test]
+	fn yes_confirms_exporting_over_an_existing_file() {
+		let dir = assert_fs::TempDir::new().unwrap();
+		let path = dir.path().join(AUTH_CONFIG_FILENAME);
+		std::fs::write(&path, "old").unwrap();
+		let mut ui = Printed::default().ui();
+		ui.set_assume_yes(true);
+		assert!(confirm_export(&mut ui, &path).unwrap());
 	}
 
 	#[test]
