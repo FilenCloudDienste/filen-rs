@@ -120,7 +120,7 @@ pub(crate) struct CliArgs {
 	#[arg(short, long, env = "FILEN_CLI_PASSWORD", hide_env_values = true)]
 	password: Option<String>,
 
-	/// Filen account two-factor code (optional, requires --email and --password)
+	/// Filen account two-factor code or recovery key (optional, requires --email and --password)
 	#[arg(short, long, env = "FILEN_CLI_2FA_CODE", hide_env_values = true)]
 	two_factor_code: Option<String>,
 

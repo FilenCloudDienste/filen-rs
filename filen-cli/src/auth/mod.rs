@@ -4,7 +4,7 @@
 //!    or the environment variables `FILEN_CLI_EMAIL`, `FILEN_CLI_PASSWORD` and `FILEN_CLI_2FA_CODE`
 //!    (when none of these is set, the variables `FILEN_EMAIL`, `FILEN_PASSWORD` and
 //!    `FILEN_2FA_CODE` of the old Filen CLI are used; when a two-factor code is required
-//!    and not given, you are prompted for it)
+//!    and not given, you are prompted for it; the recovery key is accepted as the code too)
 //!
 //!    To log in to an account with two-factor authentication without anyone to type a code,
 //!    set `FILEN_CLI_2FA_SECRET` to its TOTP secret (the key your authenticator app was set up with):
@@ -424,7 +424,8 @@ fn time_until_next_totp_step(now: DateTime<Utc>) -> Duration {
 	)
 }
 
-const TWO_FACTOR_CODE_PROMPT: &str = "Two-factor authentication code: ";
+/// The prompt for a two-factor code, which the recovery key can stand in for.
+const TWO_FACTOR_CODE_PROMPT: &str = "Two-factor authentication code or recovery key: ";
 const WRONG_TWO_FACTOR_CODE: &str = "Two-factor authentication code wrong";
 
 /// Why the user is asked for a two-factor code.

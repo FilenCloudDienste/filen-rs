@@ -532,6 +532,35 @@ async fn a_wrong_two_factor_code_given_with_the_flag_fails_without_asking_again(
 	.await;
 }
 
+#[shared_test_runtime]
+#[ignore = "toggles 2FA on the shared account"]
+async fn the_recovery_key_is_taken_as_a_two_factor_code() {
+	let (email, password) = get_testing_credentials();
+	let working_dir = assert_fs::TempDir::new().unwrap();
+	let config_dir = assert_fs::TempDir::new().unwrap();
+	with_two_factor_enabled(|_, recovery_key| {
+		cli_without_stored_credentials(working_dir.path(), config_dir.path())
+			.args([
+				"--email",
+				&email,
+				"--password",
+				&password,
+				"--two-factor-code",
+				recovery_key,
+				"--no-input",
+				"-v",
+				"stat",
+				"/",
+			])
+			.assert()
+			.success()
+			.stderr(predicates::str::contains(
+				"Authenticated from CLI arguments",
+			));
+	})
+	.await;
+}
+
 #[test]
 fn authenticate_from_the_credential_variables() {
 	let (email, password) = get_testing_credentials();
