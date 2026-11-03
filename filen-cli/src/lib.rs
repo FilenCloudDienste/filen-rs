@@ -104,17 +104,23 @@ pub(crate) struct CliArgs {
 	no_log_file: bool,
 
 	/// Filen account email (requires --password)
-	#[arg(short, long, env = "FILEN_CLI_EMAIL", global = true)]
+	#[arg(
+		short,
+		long,
+		env = "FILEN_CLI_EMAIL",
+		hide_env_values = true,
+		global = true
+	)]
 	email: Option<String>,
 
 	// The password and the two-factor code go before the command, unlike the other options: `-p`
 	// after it is `rm -p` or `sync -p`, and `--password` is `serve --password`.
 	/// Filen account password (requires --email)
-	#[arg(short, long, env = "FILEN_CLI_PASSWORD")]
+	#[arg(short, long, env = "FILEN_CLI_PASSWORD", hide_env_values = true)]
 	password: Option<String>,
 
 	/// Filen account two-factor code (optional, requires --email and --password)
-	#[arg(short, long, env = "FILEN_CLI_2FA_CODE")]
+	#[arg(short, long, env = "FILEN_CLI_2FA_CODE", hide_env_values = true)]
 	two_factor_code: Option<String>,
 
 	/// Path to auth config file (exported via `filen export-auth-config`)
@@ -1236,5 +1242,18 @@ mod tests {
 	fn a_repl_line_with_a_quoted_argument_is_parsed() {
 		let cli_args = parse_repl_line("ls 'my dir'").unwrap();
 		assert!(format!("{:?}", cli_args.command).contains("\"my dir\""));
+	}
+
+	#[test]
+	fn the_help_never_prints_the_credentials_from_the_environment() {
+		let command = CliArgs::command();
+		for id in ["email", "password", "two_factor_code"] {
+			let arg = command
+				.get_arguments()
+				.find(|arg| arg.get_id() == id)
+				.unwrap();
+			assert!(arg.get_env().is_some(), "{id} is read from the environment");
+			assert!(arg.is_hide_env_values_set(), "{id}'s value is hidden");
+		}
 	}
 }
