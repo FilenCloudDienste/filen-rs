@@ -1237,3 +1237,10 @@ fn files_named_conf(dir: &Path) -> Vec<PathBuf> {
 		.filter(|path| path.extension().is_some_and(|ext| ext == "conf"))
 		.collect()
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_binary_reports_its_version() {
+	let version = binary().version().await.unwrap();
+
+	assert!(version.starts_with("v1."), "{version}");
+}

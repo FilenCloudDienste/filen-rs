@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use sha2::{Digest as _, Sha256};
 
-use super::{MIN_RCLONE, RcloneBinary, parse_version};
+use super::{MIN_RCLONE, RcloneBinary, parse_version, reported_version};
 use crate::{ErrorKind, rclone::RcloneRefusal};
 
 fn bundled(path: PathBuf, sha256: Option<[u8; 32]>) -> RcloneBinary {
@@ -110,4 +110,37 @@ fn version_floor_compares_component_wise() {
 	assert!(parse_version("v1.74.3").unwrap() >= MIN_RCLONE);
 	assert!(parse_version("v1.100.0").unwrap() >= MIN_RCLONE);
 	assert!(parse_version("v0.99.99").unwrap() < MIN_RCLONE);
+}
+
+#[test]
+fn the_reported_version_is_read_from_the_first_line() {
+	let output = "rclone v1.74.4\n- os/version: darwin 26.0 (64 bit)\n- go/version: go1.25.4\n";
+
+	assert_eq!(reported_version(output).as_deref(), Some("v1.74.4"));
+	assert_eq!(
+		reported_version("rclone v1.75.0-beta.8836.abcdef\n").as_deref(),
+		Some("v1.75.0-beta.8836.abcdef")
+	);
+}
+
+#[test]
+fn output_without_a_version_reports_none() {
+	assert_eq!(reported_version(""), None);
+	assert_eq!(reported_version("usage: rclone [flags]\n"), None);
+	assert_eq!(reported_version("rclone version\n"), None);
+}
+
+#[tokio::test]
+async fn the_version_of_a_missing_binary_is_refused() {
+	let dir = tempfile::tempdir().unwrap();
+
+	let error = bundled(dir.path().join("rclone"), None)
+		.version()
+		.await
+		.unwrap_err();
+
+	assert_eq!(
+		error.downcast_ref::<RcloneRefusal>(),
+		Some(&RcloneRefusal::BinaryMissing)
+	);
 }

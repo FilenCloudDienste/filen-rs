@@ -1,14 +1,24 @@
 //! Which rclone binary runs: one the app ships, or (`rclone-managed`) a pinned release downloaded
 //! into a directory.
 
-use std::{io, path::PathBuf};
+use std::{io, path::PathBuf, process::Stdio, time::Duration};
 
 use sha2::{Digest as _, Sha256};
+use tokio::process::Command;
 
-use crate::{Error, ErrorKind, error::ResultExt as _, rclone::RcloneRefusal};
+#[cfg(windows)]
+use crate::rclone::system::CREATE_NO_WINDOW;
+use crate::{
+	Error, ErrorKind,
+	error::ResultExt as _,
+	rclone::{RcloneRefusal, system::spawn_rclone},
+};
 
 #[cfg(feature = "rclone-managed")]
 pub(crate) mod managed;
+
+/// How long `rclone version` may take to answer.
+const VERSION_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Where the rclone binary comes from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,6 +48,58 @@ impl RcloneBinary {
 			Self::Managed { dir } => managed::ensure(dir, true).await,
 		}
 	}
+
+	/// The version the binary reports, such as `v1.74.4`, once it is resolved as
+	/// [`RcloneBinary::resolve`] resolves it. It is not checked against the oldest version the
+	/// daemon runs, which [`crate::rclone::RcloneDaemon::start`] refuses with
+	/// [`RcloneRefusal::UnsupportedVersion`]. Fails when `rclone version` fails, takes longer than
+	/// 30 s, or prints no version.
+	pub async fn version(&self) -> Result<String, Error> {
+		let path = self.resolve().await?;
+		let mut command = Command::new(&path);
+		command
+			// An in-memory config: the user's own is neither read nor created.
+			.args(["--config", "", "version"])
+			.stdin(Stdio::null())
+			.stdout(Stdio::piped())
+			.stderr(Stdio::null())
+			.kill_on_drop(true);
+		#[cfg(windows)]
+		command.creation_flags(CREATE_NO_WINDOW);
+		let run = async {
+			spawn_rclone(&mut command)
+				.await
+				.context("failed to start rclone version")?
+				.wait_with_output()
+				.await
+				.context("failed to wait for rclone version")
+		};
+		let output = tokio::time::timeout(VERSION_TIMEOUT, run)
+			.await
+			.map_err(|_| {
+				Error::custom(
+					ErrorKind::IO,
+					format!("rclone version did not answer within {VERSION_TIMEOUT:?}"),
+				)
+			})??;
+		if !output.status.success() {
+			return Err(Error::custom(
+				ErrorKind::IO,
+				format!("rclone version failed: {}", output.status),
+			));
+		}
+		reported_version(&String::from_utf8_lossy(&output.stdout))
+			.ok_or_else(|| Error::custom(ErrorKind::IO, "rclone version printed no version"))
+	}
+}
+
+/// The version `rclone version` prints on its first line, `rclone v1.74.4`, as `v1.74.4`, if it
+/// is one [`parse_version`] reads.
+fn reported_version(output: &str) -> Option<String> {
+	let line = output.lines().next()?.trim();
+	let version = line.strip_prefix("rclone ")?;
+	parse_version(version)?;
+	Some(version.to_owned())
 }
 
 #[cfg(feature = "rclone-managed")]
