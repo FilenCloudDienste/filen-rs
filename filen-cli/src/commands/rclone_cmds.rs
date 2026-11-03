@@ -11,9 +11,9 @@ use clap::Subcommand;
 use filen_sdk_rs::{
 	auth::Client,
 	rclone::{
-		MountOptions, RcloneBinary, RcloneDaemon, RcloneDaemonConfig, RcloneExit, ServeAuth,
-		ServeOptions, ServeProtocol, ServeTls, StopOptions, VfsTuning, available_drive_letters,
-		run_rclone,
+		MountOptions, RcloneBinary, RcloneDaemon, RcloneDaemonConfig, RcloneExit, RcloneRefusal,
+		ServeAuth, ServeOptions, ServeProtocol, ServeTls, StopOptions, VfsTuning,
+		available_drive_letters, run_rclone,
 	},
 };
 use serde_json::json;
@@ -146,6 +146,10 @@ const STOP: StopOptions = StopOptions {
 	grace_ms: 10_000,
 };
 
+/// How many mounts and servers may run at once, each on a cache of its own: two Rclones on one
+/// cache would corrupt it.
+const CACHES: u32 = 8;
+
 /// What `serve` serves.
 pub(crate) struct ServeArgs {
 	pub(crate) protocol: ServeProtocol,
@@ -173,6 +177,7 @@ pub(crate) async fn mount(
 	};
 	let (daemon, ctrl_c) = start_daemon(config, ui, client, cache_size).await?;
 	let mounted = daemon
+		.daemon
 		.mount(MountOptions {
 			mount_point,
 			read_only: false,
@@ -210,6 +215,7 @@ pub(crate) async fn start_server(
 	let client = client.get(ui).await?;
 	let (daemon, ctrl_c) = start_daemon(config, ui, client, args.cache_size).await?;
 	let serve = daemon
+		.daemon
 		.start_serve(ServeOptions {
 			protocol: args.protocol,
 			host,
@@ -290,47 +296,94 @@ async fn remove_old_config(dir: &Path) {
 	}
 }
 
-/// Starts the daemon, and has Ctrl-C stop it from then on: a Ctrl-C while it starts, or while the
-/// command mounts or serves through it, waits in the returned [`interrupt::Owning`] for
-/// [`wait_and_stop`], which stops the daemon cleanly, rather than dropping it.
+/// A running daemon, and which cache it uses.
+struct Daemon {
+	daemon: RcloneDaemon,
+	/// 0 for the cache every mount or server uses when it runs alone, 1 and up for those it uses
+	/// while others run.
+	cache: u32,
+	/// The cache's directory.
+	cache_dir: PathBuf,
+}
+
+/// Starts the daemon on the first cache no other mount or server uses, and has Ctrl-C stop it from
+/// then on: a Ctrl-C while it starts, or while the command mounts or serves through it, waits in
+/// the returned [`interrupt::Owning`] for [`wait_and_stop`], which stops the daemon cleanly, rather
+/// than dropping it.
 async fn start_daemon(
 	config: &CliConfig,
 	ui: &mut UI,
 	client: &Client,
 	cache_size: Option<u64>,
-) -> Result<(RcloneDaemon, interrupt::Owning)> {
+) -> Result<(Daemon, interrupt::Owning)> {
 	// a Ctrl-C while the managed rclone downloads still cancels the command
 	let binary = prepare_binary(config, ui).await;
 	let ctrl_c = interrupt::own();
 	let dir = rclone_dir(config);
 	let defaults = VfsTuning::default();
-	let daemon = RcloneDaemon::start(
-		client,
-		RcloneDaemonConfig {
-			binary,
-			state_dir: dir.join("daemon"),
-			cache_dir: dir.join("cache"),
-			log_file: None,
-			user_agent: format!("filen-cli/{}", env!("CARGO_PKG_VERSION")),
-			vfs: VfsTuning {
-				cache_max_size: cache_size.unwrap_or(defaults.cache_max_size),
-				..defaults
+	for cache in 0..CACHES {
+		let cache_dir = cache_dir(&dir, cache);
+		let started = RcloneDaemon::start(
+			client,
+			RcloneDaemonConfig {
+				// One copy per attempt; it is a path.
+				binary: binary.clone(),
+				state_dir: dir.join("daemon"),
+				// One copy per attempt; it is a path, kept for the warning on stopping.
+				cache_dir: cache_dir.clone(),
+				log_file: None,
+				user_agent: format!("filen-cli/{}", env!("CARGO_PKG_VERSION")),
+				vfs: VfsTuning {
+					cache_max_size: cache_size.unwrap_or(defaults.cache_max_size),
+					..defaults
+				},
 			},
-		},
-	)
-	.await
-	.context("Failed to start Rclone (use --verbose for more info)")?;
-	Ok((daemon, ctrl_c))
+		)
+		.await;
+		match started {
+			Ok(daemon) => {
+				let daemon = Daemon {
+					daemon,
+					cache,
+					cache_dir,
+				};
+				return Ok((daemon, ctrl_c));
+			}
+			Err(e) if e.downcast_ref::<RcloneRefusal>() == Some(&RcloneRefusal::CacheInUse) => {
+				log::info!("Cache {cache} is in use by another mount or server");
+			}
+			Err(e) => {
+				return Err(anyhow::Error::from(e)
+					.context("Failed to start Rclone (use --verbose for more info)"));
+			}
+		}
+	}
+	Err(UI::failure(&format!(
+		"{CACHES} mounts and servers are running already; stop one first"
+	)))
+}
+
+/// The `cache`th cache directory in `dir`: `cache`, then `cache-2`, `cache-3` and so on.
+fn cache_dir(dir: &Path, cache: u32) -> PathBuf {
+	match cache {
+		0 => dir.join("cache"),
+		n => dir.join(format!("cache-{}", n.saturating_add(1))),
+	}
 }
 
 /// Waits for Ctrl-C, then stops the daemon, letting uploads finish for a while unless Ctrl-C is
 /// pressed again; fails if rclone exits first.
 async fn wait_and_stop(
 	ui: &mut UI,
-	daemon: &RcloneDaemon,
+	daemon: &Daemon,
 	mut ctrl_c: interrupt::Owning,
 	stopping: &str,
 ) -> Result<()> {
+	let Daemon {
+		daemon,
+		cache,
+		cache_dir,
+	} = daemon;
 	select! {
 		() = ctrl_c.pressed() => {}
 		exit = daemon.exited() => {
@@ -350,12 +403,29 @@ async fn wait_and_stop(
 	let _stopping = ctrl_c.into_stopping(ui);
 	let report = daemon.stop(STOP).await.context("Failed to stop Rclone")?;
 	if report.pending_uploads > 0 {
-		ui.print_warning(&format!(
-			"{} uploads did not finish; they continue the next time you run `mount` or `serve`",
-			report.pending_uploads
+		ui.print_warning(&pending_uploads_warning(
+			report.pending_uploads,
+			*cache,
+			cache_dir,
 		));
 	}
 	Ok(())
+}
+
+/// The warning that `pending` uploads were left in the `cache`th cache, at `cache_dir`, saying when
+/// they continue: when a mount or server next uses that cache, which it picks only while every
+/// cache before it is in use.
+fn pending_uploads_warning(pending: u32, cache: u32, cache_dir: &Path) -> String {
+	if cache == 0 {
+		format!(
+			"{pending} uploads did not finish; they continue the next time you run `mount` or `serve`"
+		)
+	} else {
+		format!(
+			"{pending} uploads did not finish in {}; they continue the next time `mount` or `serve` starts while every cache before it is in use",
+			cache_dir.display()
+		)
+	}
 }
 
 /// `/tmp/filen` (created if missing), or on Windows the drive letter X, or the last free one.
@@ -487,6 +557,41 @@ mod tests {
 		assert!(parse_size("ten").is_err());
 		assert!(parse_size("10X").is_err());
 		assert!(parse_size("20000000T").is_err());
+	}
+
+	#[test]
+	fn concurrent_daemons_get_caches_of_their_own() {
+		let dir = Path::new("/home/user/.config/filen-cli/rclone");
+
+		assert_eq!(cache_dir(dir, 0), dir.join("cache"));
+		assert_eq!(cache_dir(dir, 1), dir.join("cache-2"));
+		assert_eq!(cache_dir(dir, 7), dir.join("cache-8"));
+	}
+
+	#[test]
+	fn uploads_left_in_the_main_cache_continue_on_the_next_start() {
+		let dir = Path::new("/home/user/.config/filen-cli/rclone");
+
+		assert_eq!(
+			pending_uploads_warning(3, 0, &cache_dir(dir, 0)),
+			"3 uploads did not finish; they continue the next time you run `mount` or `serve`"
+		);
+	}
+
+	#[test]
+	fn uploads_left_in_another_cache_continue_when_that_cache_is_used_again() {
+		let dir = Path::new("/home/user/.config/filen-cli/rclone");
+
+		// Joined as the platform joins paths.
+		let cache = dir.join("cache-3");
+
+		assert_eq!(
+			pending_uploads_warning(3, 2, &cache),
+			format!(
+				"3 uploads did not finish in {}; they continue the next time `mount` or `serve` starts while every cache before it is in use",
+				cache.display()
+			)
+		);
 	}
 
 	#[test]
