@@ -152,8 +152,8 @@ impl Client {
 	}
 
 	/// Uploads the contents of the local directory `dir_path` into `target`, following the
-	/// symlinks inside it, as [`Self::upload_dir_recursively_with_symlinks`] does with
-	/// [`SymlinkPolicy::Follow`](super::SymlinkPolicy::Follow).
+	/// symlinks inside it, as [`Self::upload_dir_recursively_with_options`] does with the default
+	/// [`DirUploadOptions`](super::DirUploadOptions).
 	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 	pub async fn upload_dir_recursively<C>(
 		self: Arc<Self>,
@@ -164,29 +164,30 @@ impl Client {
 	where
 		C: super::dir_upload::DirUploadCallback + ?Sized,
 	{
-		self.upload_dir_recursively_with_symlinks(
+		self.upload_dir_recursively_with_options(
 			dir_path,
 			callback,
 			target,
-			super::SymlinkPolicy::Follow,
+			super::DirUploadOptions::default(),
 		)
 		.await
 	}
 
-	/// Uploads the contents of the local directory `dir_path` into `target`, doing with the
-	/// symlinks inside it what `symlinks` says. `dir_path` itself is followed when it is a symlink.
+	/// Uploads the contents of the local directory `dir_path` into `target`, as `options` say.
+	/// `dir_path` itself is followed when it is a symlink.
 	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 	#[tracing::instrument(name = "upload_dir_recursively", skip_all, fields(dir_path = %dir_path.display()))]
-	pub async fn upload_dir_recursively_with_symlinks<C>(
+	pub async fn upload_dir_recursively_with_options<C>(
 		self: Arc<Self>,
 		dir_path: PathBuf,
 		callback: impl Deref<Target = C>,
 		target: &crate::fs::dir::RemoteDirectory,
-		symlinks: super::SymlinkPolicy,
+		options: super::DirUploadOptions,
 	) -> Result<(), Error>
 	where
 		C: super::dir_upload::DirUploadCallback + ?Sized,
 	{
+		let super::DirUploadOptions { symlinks } = options;
 		let ref_callback = callback.deref();
 		let mut skipped_symlinks = Vec::new();
 

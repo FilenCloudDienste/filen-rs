@@ -63,8 +63,9 @@ use filen_sdk_rs::{
 		name::ValidatedName,
 	},
 	io::{
-		CategoryDirDownloadExtPub as _, DirDownloadCallback, DirUploadCallback, RemoteDirectory,
-		RemoteFile, SymlinkPolicy, client_impl::IoSharedClientExt as _, is_safe_descendant,
+		CategoryDirDownloadExtPub as _, DirDownloadCallback, DirUploadCallback, DirUploadOptions,
+		RemoteDirectory, RemoteFile, SymlinkPolicy, client_impl::IoSharedClientExt as _,
+		is_safe_descendant,
 	},
 	util::MaybeSendCallback,
 };
@@ -691,11 +692,11 @@ async fn upload_directory(
 	progress.start_scan();
 	client
 		.clone()
-		.upload_dir_recursively_with_symlinks(
+		.upload_dir_recursively_with_options(
 			source.to_path_buf(),
 			progress,
 			target.as_ref(),
-			symlinks,
+			DirUploadOptions { symlinks },
 		)
 		.await
 		.context("Failed to upload directory")

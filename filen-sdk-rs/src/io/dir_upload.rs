@@ -56,12 +56,20 @@ pub trait DirUploadCallback: Send + Sync {
 
 /// What a directory upload does with the symlinks inside the directory. The directory itself is
 /// followed when it is a symlink.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SymlinkPolicy {
 	/// Upload what a link points to under the link's name, as if it were there.
+	#[default]
 	Follow,
 	/// Leave links out, uploading neither them nor what they point to.
 	Skip,
+}
+
+/// How a directory upload walks the local directory. The default follows symlinks.
+#[derive(Clone, Debug, Default)]
+pub struct DirUploadOptions {
+	/// What to do with the symlinks inside the directory.
+	pub symlinks: SymlinkPolicy,
 }
 
 // todo, accept &impl HasUuidContents instead of RemoteDirectory for target_folder
