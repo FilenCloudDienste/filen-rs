@@ -914,10 +914,10 @@ pub fn build_client_config(args: &ClientConfigArgs) -> ClientConfig {
 	}
 	config
 }
-// todo: verify this really does work
 
 pub fn serialize_auth_config(client: &Client) -> Result<String> {
-	let sdk_config = serde_json::to_string(&client.to_stringified()).unwrap();
+	let sdk_config = serde_json::to_string(&client.to_stringified())
+		.context("Failed to serialize auth config")?;
 	let sdk_config = format!("{}{}", AUTH_CONFIG_PREFIX, base64.encode(sdk_config));
 	Ok(sdk_config)
 }
