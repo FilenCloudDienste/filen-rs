@@ -131,6 +131,39 @@ fn exporting_an_auth_config_without_yes_fails_before_logging_in() {
 	assert!(!path.exists());
 }
 
+#[test]
+fn logout_with_yes_deletes_the_given_auth_config_and_the_cache() {
+	let config_dir = assert_fs::TempDir::new().unwrap();
+	let elsewhere = assert_fs::TempDir::new().unwrap();
+	let auth_config = elsewhere.path().join("my-auth-config.txt");
+	std::fs::write(&auth_config, "filen_cli_auth_config_1:").unwrap();
+	let cache = config_dir.path().join("filen-sdk-rs-cache");
+	std::fs::write(&cache, "cache").unwrap();
+	cargo_bin_cmd!()
+		.env("FILEN_CLI_TESTING_DISABLE_KEYRING", "1")
+		.args([
+			"--skip-update",
+			"--config-dir",
+			config_dir.path().to_str().unwrap(),
+			"--auth-config-path",
+			auth_config.to_str().unwrap(),
+			"logout",
+			"--yes",
+		])
+		.assert()
+		.success()
+		.stdout(predicates::str::contains(format!(
+			"Deleted auth config file at {}",
+			auth_config.display()
+		)))
+		.stdout(predicates::str::contains(format!(
+			"Deleted the local cache at {}",
+			cache.display()
+		)));
+	assert!(!auth_config.exists());
+	assert!(!cache.exists());
+}
+
 #[shared_test_runtime]
 async fn whoami_prints_the_email_of_the_account() {
 	let (email, _) = get_testing_credentials();

@@ -62,6 +62,8 @@ pub(crate) enum LazyClient {
 	Authenticated {
 		client: Arc<Client>,
 		cache_callback_rx: tokio::sync::mpsc::UnboundedReceiver<filen_sdk_rs::cache::CacheMessage>,
+		/// Kept for logout, which offers to delete the file.
+		auth_config_path_arg: Option<String>,
 	},
 }
 
@@ -107,7 +109,7 @@ impl LazyClient {
 				.await?;
 				let (cache_callback_tx, cache_callback_rx) = tokio::sync::mpsc::unbounded_channel();
 				client
-					.configure_cache(config.config_dir.join("filen-sdk-rs-cache"), move |msgs| {
+					.configure_cache(config.config_dir.join(CACHE_FILE_NAME), move |msgs| {
 						for msg in msgs {
 							cache_callback_tx.send(msg).unwrap_or_else(|e| {
 								log::warn!("Failed to send cache callback message: {:?}", e);
@@ -116,15 +118,40 @@ impl LazyClient {
 					})
 					.await
 					.context("Failed to configure cache")?;
+				let auth_config_path_arg = auth_config_path_arg.take();
 				*self = Self::Authenticated {
 					client: Arc::new(client),
 					cache_callback_rx,
+					auth_config_path_arg,
 				};
 				let Self::Authenticated { client, .. } = self else {
 					unreachable!();
 				};
 				Ok(client)
 			}
+		}
+	}
+
+	/// The auth config file given with `--auth-config-path`, if any.
+	fn auth_config_path_arg(&self) -> Option<&Path> {
+		match self {
+			Self::Unauthenticated {
+				auth_config_path_arg,
+				..
+			}
+			| Self::Authenticated {
+				auth_config_path_arg,
+				..
+			} => auth_config_path_arg.as_deref().map(Path::new),
+		}
+	}
+
+	/// Whether this process may have the local cache open.
+	fn cache_access(&self) -> CacheAccess {
+		match self {
+			Self::Unauthenticated { .. } => CacheAccess::Unused,
+			// the cache was configured, and is opened by the first command that uses it
+			Self::Authenticated { .. } => CacheAccess::ConfiguredHere,
 		}
 	}
 
@@ -980,29 +1007,82 @@ pub(crate) enum LogoutOutcome {
 	Deleted,
 }
 
-/// Log out by deleting stored credentials from the keyring and auth config files, prompting the
-/// user to confirm each (`--yes` confirms them all).
-pub(crate) fn logout(config: &CliConfig, ui: &mut UI) -> Result<LogoutOutcome> {
+/// The local cache of the drive's file listings, in the config dir: an SQLite database.
+const CACHE_FILE_NAME: &str = "filen-sdk-rs-cache";
+
+/// Whether this process may have the local cache open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CacheAccess {
+	/// It never logged in, so it never opened the cache.
+	Unused,
+	/// It logged in and configured the cache, which may be open.
+	ConfiguredHere,
+}
+
+/// The stored credentials [`logout`] offers to delete, besides the auth config files in the default
+/// locations.
+struct StoredCredentials<'a> {
+	/// The keyring entry, unless the tests turned the keyring off.
+	keyring_entry: Option<&'a LongKeyringEntry<'a>>,
+	/// The auth config file given with `--auth-config-path`.
+	given_auth_config: Option<&'a Path>,
+}
+
+/// Log out by deleting stored credentials from the keyring and auth config files, those in the
+/// default locations and the one given with `--auth-config-path`, prompting the user to confirm
+/// each (`--yes` confirms them all). Then offers to delete the local cache. The sync databases are
+/// left alone: they hold the state of every sync pair, which deleting them would reset.
+pub(crate) fn logout(
+	config: &CliConfig,
+	ui: &mut UI,
+	client: &LazyClient,
+) -> Result<LogoutOutcome> {
 	let keyring_location = KeyringLocation::of(config);
 	let keyring_store = keyring_location.store();
 	let keyring_entry = (!keyring_disabled_for_testing())
 		.then(|| LongKeyringEntry::new(&keyring_store, &keyring_location.entry_name));
-	logout_from(config, ui, keyring_entry.as_ref(), |ui, msg| {
-		ui.prompt_confirm(msg, false)
-	})
+	logout_from(
+		config,
+		ui,
+		StoredCredentials {
+			keyring_entry: keyring_entry.as_ref(),
+			given_auth_config: client.auth_config_path_arg(),
+		},
+		client.cache_access(),
+		|ui, msg| ui.prompt_confirm(msg, false),
+	)
 }
 
-/// [`logout`] from `keyring_entry`, if any, and the auth config files, asking `confirm` before
-/// each deletion.
+/// [`logout`] from the `stored` credentials and the auth config files in the default locations,
+/// then from the local cache, which `cache` tells if this process may have open, asking `confirm`
+/// before each deletion.
 fn logout_from(
 	config: &CliConfig,
 	ui: &mut UI,
-	keyring_entry: Option<&LongKeyringEntry>,
+	stored: StoredCredentials<'_>,
+	cache: CacheAccess,
 	mut confirm: impl FnMut(&mut UI, &str) -> Result<bool>,
+) -> Result<LogoutOutcome> {
+	let outcome = delete_credentials(config, ui, &stored, &mut confirm)?;
+	offer_to_delete_cache(
+		ui,
+		&config.config_dir.join(CACHE_FILE_NAME),
+		cache,
+		&mut confirm,
+	)?;
+	Ok(outcome)
+}
+
+/// The credentials part of [`logout_from`].
+fn delete_credentials(
+	config: &CliConfig,
+	ui: &mut UI,
+	stored: &StoredCredentials<'_>,
+	confirm: &mut impl FnMut(&mut UI, &str) -> Result<bool>,
 ) -> Result<LogoutOutcome> {
 	let mut found_any_credentials = false;
 	let mut deleted_any_credentials = false;
-	if let Some(keyring_entry) = keyring_entry
+	if let Some(keyring_entry) = stored.keyring_entry
 		&& let Ok(Some(_)) = keyring_entry.read()
 	{
 		found_any_credentials = true;
@@ -1018,7 +1098,7 @@ fn logout_from(
 			}
 		}
 	}
-	for (path, _) in get_auth_config_default_locations(config) {
+	for path in auth_config_files(stored.given_auth_config, config) {
 		if path.exists() {
 			found_any_credentials = true;
 			if confirm(
@@ -1042,6 +1122,93 @@ fn logout_from(
 		ui.print_muted("No credentials found in system keyring or auth config default locations");
 		Ok(LogoutOutcome::NothingFound)
 	}
+}
+
+/// The auth config files that exist: `given`, then those in the default locations, each once.
+fn auth_config_files(given: Option<&Path>, config: &CliConfig) -> Vec<PathBuf> {
+	let mut files = Vec::new();
+	if let Some(given) = given {
+		if given.exists() {
+			files.push(given.to_path_buf());
+		} else {
+			log::info!(
+				"The auth config file {} does not exist, so there is nothing to delete",
+				given.display()
+			);
+		}
+	}
+	for (path, _) in get_auth_config_default_locations(config) {
+		if !files.iter().any(|file| is_same_file(file, &path)) {
+			files.push(path);
+		}
+	}
+	files
+}
+
+/// Whether `a` and `b` name the same existing file.
+fn is_same_file(a: &Path, b: &Path) -> bool {
+	match (a.canonicalize(), b.canonicalize()) {
+		(Ok(a), Ok(b)) => a == b,
+		_ => false,
+	}
+}
+
+/// Offer to delete the local cache at `cache_path`, unless this process may have it open (`cache`):
+/// an open database must not be deleted under the process using it. Without a terminal and `--yes`,
+/// the cache is left with a note rather than failing the logout, since it holds no credentials.
+fn offer_to_delete_cache(
+	ui: &mut UI,
+	cache_path: &Path,
+	cache: CacheAccess,
+	confirm: &mut impl FnMut(&mut UI, &str) -> Result<bool>,
+) -> Result<()> {
+	if !cache_path.exists() {
+		return Ok(());
+	}
+	match cache {
+		CacheAccess::ConfiguredHere => {
+			ui.print_muted(&format!(
+				"The local cache of your drive at {} is in use; delete it after exiting to remove it",
+				cache_path.display()
+			));
+		}
+		CacheAccess::Unused => {
+			let question = format!(
+				"Also delete the local cache of your drive at {}?",
+				cache_path.display()
+			);
+			if ui.ensure_can_confirm(&question).is_err() {
+				ui.print_muted(&format!(
+					"Kept the local cache of your drive at {} (pass --yes to delete it too)",
+					cache_path.display()
+				));
+			} else if confirm(ui, &question)? {
+				delete_sqlite_database(cache_path)?;
+				ui.print_success(&format!(
+					"Deleted the local cache at {}",
+					cache_path.display()
+				));
+			}
+		}
+	}
+	Ok(())
+}
+
+/// Delete the SQLite database at `path` with the journal files SQLite keeps beside it.
+fn delete_sqlite_database(path: &Path) -> Result<()> {
+	for suffix in ["", "-wal", "-shm", "-journal"] {
+		let mut file = path.as_os_str().to_owned();
+		file.push(suffix);
+		let file = PathBuf::from(file);
+		match std::fs::remove_file(&file) {
+			Ok(()) => {}
+			Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+			Err(e) => {
+				return Err(e).with_context(|| format!("Failed to delete {}", file.display()));
+			}
+		}
+	}
+	Ok(())
 }
 
 #[cfg(test)]
@@ -1068,8 +1235,14 @@ mod tests {
 		entry.write("credentials").unwrap();
 		let printed = Printed::default();
 
-		let outcome =
-			logout_from(&config, &mut printed.ui(), Some(&entry), |_, _| Ok(false)).unwrap();
+		let outcome = logout_from(
+			&config,
+			&mut printed.ui(),
+			keyring_only(Some(&entry)),
+			CacheAccess::Unused,
+			|_, _| Ok(false),
+		)
+		.unwrap();
 
 		assert_eq!(outcome, LogoutOutcome::NothingDeleted);
 		assert_eq!(entry.read().unwrap().as_deref(), Some("credentials"));
@@ -1085,9 +1258,13 @@ mod tests {
 		let path = config.config_dir.join(AUTH_CONFIG_FILENAME);
 		std::fs::write(&path, "secret-config").unwrap();
 
-		let outcome = logout_from(&config, &mut Printed::default().ui(), None, |_, _| {
-			Ok(false)
-		})
+		let outcome = logout_from(
+			&config,
+			&mut Printed::default().ui(),
+			keyring_only(None),
+			CacheAccess::Unused,
+			|_, _| Ok(false),
+		)
 		.unwrap();
 
 		assert_eq!(outcome, LogoutOutcome::NothingDeleted);
@@ -1105,9 +1282,13 @@ mod tests {
 		let mut ui = Printed::default().ui();
 		ui.set_assume_yes(true);
 
-		let outcome = logout_from(&config, &mut ui, Some(&entry), |ui, msg| {
-			ui.prompt_confirm(msg, false)
-		})
+		let outcome = logout_from(
+			&config,
+			&mut ui,
+			keyring_only(Some(&entry)),
+			CacheAccess::Unused,
+			|ui, msg| ui.prompt_confirm(msg, false),
+		)
 		.unwrap();
 
 		assert_eq!(outcome, LogoutOutcome::Deleted);
@@ -1124,12 +1305,206 @@ mod tests {
 		let outcome = logout_from(
 			&config,
 			&mut Printed::default().ui(),
-			Some(&entry),
+			keyring_only(Some(&entry)),
+			CacheAccess::Unused,
 			|_, _| panic!("nothing to confirm"),
 		)
 		.unwrap();
 
 		assert_eq!(outcome, LogoutOutcome::NothingFound);
+	}
+
+	/// The stored credentials of a run without `--auth-config-path`.
+	fn keyring_only<'a>(keyring_entry: Option<&'a LongKeyringEntry<'a>>) -> StoredCredentials<'a> {
+		StoredCredentials {
+			keyring_entry,
+			given_auth_config: None,
+		}
+	}
+
+	#[test]
+	fn logout_deletes_the_auth_config_given_with_the_flag() {
+		let (_dir, config) = config_in_temp_dir();
+		let elsewhere = assert_fs::TempDir::new().unwrap();
+		let given = elsewhere.path().join("my-auth-config.txt");
+		std::fs::write(&given, "secret-config").unwrap();
+		let mut asked = Vec::new();
+
+		let outcome = logout_from(
+			&config,
+			&mut Printed::default().ui(),
+			StoredCredentials {
+				keyring_entry: None,
+				given_auth_config: Some(&given),
+			},
+			CacheAccess::Unused,
+			|_, msg| {
+				asked.push(msg.to_owned());
+				Ok(true)
+			},
+		)
+		.unwrap();
+
+		assert_eq!(outcome, LogoutOutcome::Deleted);
+		assert_eq!(
+			asked,
+			[format!("Delete auth config file at {}?", given.display())]
+		);
+		assert!(!given.exists());
+	}
+
+	#[test]
+	fn an_auth_config_given_and_in_a_default_location_is_offered_once() {
+		let (_dir, config) = config_in_temp_dir();
+		let path = config.config_dir.join(AUTH_CONFIG_FILENAME);
+		std::fs::write(&path, "secret-config").unwrap();
+		let mut asked = 0;
+
+		logout_from(
+			&config,
+			&mut Printed::default().ui(),
+			StoredCredentials {
+				keyring_entry: None,
+				given_auth_config: Some(&path),
+			},
+			CacheAccess::Unused,
+			|_, _| {
+				asked += 1;
+				Ok(false)
+			},
+		)
+		.unwrap();
+
+		assert_eq!(asked, 1);
+	}
+
+	#[test]
+	fn a_missing_auth_config_given_with_the_flag_is_not_offered() {
+		let (_dir, config) = config_in_temp_dir();
+		let missing = config.config_dir.join("missing.txt");
+
+		let outcome = logout_from(
+			&config,
+			&mut Printed::default().ui(),
+			StoredCredentials {
+				keyring_entry: None,
+				given_auth_config: Some(&missing),
+			},
+			CacheAccess::Unused,
+			|_, _| panic!("nothing to confirm"),
+		)
+		.unwrap();
+
+		assert_eq!(outcome, LogoutOutcome::NothingFound);
+	}
+
+	/// A cache database with its write-ahead log in `config`'s config dir.
+	fn cache_in(config: &CliConfig) -> (PathBuf, PathBuf) {
+		let cache = config.config_dir.join(CACHE_FILE_NAME);
+		let wal = config.config_dir.join("filen-sdk-rs-cache-wal");
+		std::fs::write(&cache, "cache").unwrap();
+		std::fs::write(&wal, "wal").unwrap();
+		(cache, wal)
+	}
+
+	#[test]
+	fn confirming_deletes_the_cache_with_its_journal_files() {
+		let (_dir, config) = config_in_temp_dir();
+		let (cache, wal) = cache_in(&config);
+
+		let outcome = logout_from(
+			&config,
+			&mut Printed::default().prompting_ui(),
+			keyring_only(None),
+			CacheAccess::Unused,
+			|_, msg| {
+				assert_eq!(
+					msg,
+					format!(
+						"Also delete the local cache of your drive at {}?",
+						cache.display()
+					)
+				);
+				Ok(true)
+			},
+		)
+		.unwrap();
+
+		// the cache holds no credentials
+		assert_eq!(outcome, LogoutOutcome::NothingFound);
+		assert!(!cache.exists());
+		assert!(!wal.exists());
+	}
+
+	#[test]
+	fn declining_keeps_the_cache() {
+		let (_dir, config) = config_in_temp_dir();
+		let (cache, wal) = cache_in(&config);
+
+		logout_from(
+			&config,
+			&mut Printed::default().prompting_ui(),
+			keyring_only(None),
+			CacheAccess::Unused,
+			|_, _| Ok(false),
+		)
+		.unwrap();
+
+		assert!(cache.exists());
+		assert!(wal.exists());
+	}
+
+	#[test]
+	fn without_a_terminal_or_yes_the_cache_is_kept_without_failing() {
+		let (_dir, config) = config_in_temp_dir();
+		let (cache, _wal) = cache_in(&config);
+		let printed = Printed::default();
+
+		let outcome = logout_from(
+			&config,
+			&mut printed.ui(),
+			keyring_only(None),
+			CacheAccess::Unused,
+			|_, _| panic!("a confirmation nobody can answer must not be asked"),
+		)
+		.unwrap();
+
+		assert_eq!(outcome, LogoutOutcome::NothingFound);
+		assert!(cache.exists());
+		assert_eq!(
+			console::strip_ansi_codes(&printed.lines()),
+			format!(
+				"No credentials found in system keyring or auth config default locations\nKept the \
+				 local cache of your drive at {} (pass --yes to delete it too)",
+				cache.display()
+			)
+		);
+	}
+
+	#[test]
+	fn a_cache_this_process_configured_is_not_offered_for_deletion() {
+		let (_dir, config) = config_in_temp_dir();
+		let (cache, _wal) = cache_in(&config);
+		let printed = Printed::default();
+
+		logout_from(
+			&config,
+			&mut printed.ui(),
+			keyring_only(None),
+			CacheAccess::ConfiguredHere,
+			|_, _| panic!("an open cache must not be offered for deletion"),
+		)
+		.unwrap();
+
+		assert!(cache.exists());
+		assert_eq!(
+			console::strip_ansi_codes(&printed.lines()),
+			format!(
+				"No credentials found in system keyring or auth config default locations\nThe local \
+				 cache of your drive at {} is in use; delete it after exiting to remove it",
+				cache.display()
+			)
+		);
 	}
 
 	/// An auth config file in a fresh directory, with the permissions `mode`.

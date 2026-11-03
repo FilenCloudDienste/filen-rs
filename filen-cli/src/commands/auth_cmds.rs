@@ -23,7 +23,8 @@ pub(crate) enum AuthCommands {
 		/// (defaults to the current working directory)
 		path: Option<PathBuf>,
 	},
-	/// Delete saved credentials and exit, asking before each (--yes deletes them all)
+	/// Delete saved credentials, including the --auth-config-path file, and exit, asking before
+	/// each (--yes deletes them all); then offer to delete the local cache
 	Logout,
 }
 
@@ -57,7 +58,7 @@ impl AuthCommands {
 			}
 			Self::Logout => {
 				// stay in the REPL when every deletion was declined
-				if auth::logout(config, ui)? == LogoutOutcome::Deleted {
+				if auth::logout(config, ui, client)? == LogoutOutcome::Deleted {
 					return Ok(CommandResult {
 						exit: true,
 						..Default::default()
