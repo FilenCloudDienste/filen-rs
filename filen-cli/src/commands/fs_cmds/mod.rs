@@ -2328,7 +2328,7 @@ async fn run_copy(
 	request: CopyRequest,
 	config: CopyConfig,
 ) -> Result<CopyReport, CopyFailed> {
-	let progress = Arc::new(CopyProgress::new(ui));
+	let progress = Arc::new(StderrProgress::new(ui));
 	let (control, controller) = JobControl::new();
 	let mut ctrl_c = interrupt::own();
 	let copy =
@@ -2466,10 +2466,11 @@ fn copied_amount(report: &CopyReport) -> String {
 	)
 }
 
-/// Draws a copy's progress on one line of stderr, redrawn in place: first the listing of the
-/// source and the destination, then the bytes copied. The copy calls it from its own tasks, so it
-/// writes to the terminal itself instead of through [`UI`], which the command holds.
-struct CopyProgress {
+/// Draws a long-running command's progress on one line of stderr, redrawn in place, such as a
+/// copy's listing of the source and the destination and then the bytes it copied. The work calls
+/// it from its own tasks or callbacks, so it writes to the terminal itself instead of through
+/// [`UI`], which the command holds.
+struct StderrProgress {
 	term: Term,
 	/// Only for a person at a terminal: not with `--quiet` or `--json`, and not when stdout or
 	/// stderr is redirected, where the redraws would end up in the captured output.
@@ -2486,7 +2487,7 @@ enum ProgressLine {
 	Ended,
 }
 
-impl CopyProgress {
+impl StderrProgress {
 	fn new(ui: &UI) -> Self {
 		let term = Term::stderr();
 		let enabled = ui.output_is_read_by_a_person() && !ui.is_quiet() && term.is_term();
@@ -2513,7 +2514,11 @@ impl CopyProgress {
 		*line = ProgressLine::Ended;
 	}
 
+	/// Draws `text` over the line drawn before, if the progress is shown at all.
 	fn draw(&self, text: &str) {
+		if !self.enabled {
+			return;
+		}
 		let mut line = self.lock_line();
 		if *line == ProgressLine::Ended {
 			return;
@@ -2526,15 +2531,12 @@ impl CopyProgress {
 	}
 }
 
-impl CopyCallback for CopyProgress {
+impl CopyCallback for StderrProgress {
 	fn on_top_level_planned(&self, _items: Vec<PlannedTopLevelItem>) {}
 
 	fn on_top_level_created(&self, _item: CopiedTopLevel) {}
 
 	fn on_update(&self, update: CopyUpdate) {
-		if !self.enabled {
-			return;
-		}
 		if let Some(text) =
 			progress_text(update.phase, &update.scan, &update.totals, &update.counts)
 		{
@@ -3731,7 +3733,7 @@ mod tests {
 
 	#[test]
 	fn no_progress_is_drawn_when_stdout_is_not_a_terminal() {
-		assert!(!CopyProgress::new(&Printed::default().ui()).enabled);
+		assert!(!StderrProgress::new(&Printed::default().ui()).enabled);
 	}
 
 	/// A trashed file named `name` with the UUID `uuid`.
