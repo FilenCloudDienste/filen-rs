@@ -380,6 +380,22 @@ impl UI {
 		write_stdout_line(&mut self.out, &msg);
 	}
 
+	/// Writes `bytes` to stdout as they are, with no newline added, as a file's content is printed.
+	/// Like [`UI::print`], it is not logged. A closed stdout ends the running command as it does for
+	/// [`UI::print`] ([`write_stdout_line`]), and fails with [`CliError::StdoutClosed`] so that the
+	/// caller stops writing at once.
+	pub(crate) fn write_stdout_bytes(&mut self, bytes: &[u8]) -> Result<()> {
+		// Flushed now: stdout buffers up to the next newline, which binary content may not have.
+		match self.out.write_all(bytes).and_then(|()| self.out.flush()) {
+			Ok(()) => Ok(()),
+			Err(e) if e.kind() == io::ErrorKind::BrokenPipe => {
+				interrupt::close_stdout();
+				Err(CliError::StdoutClosed.into())
+			}
+			Err(e) => Err(anyhow::Error::new(e).context("Failed to write to stdout")),
+		}
+	}
+
 	/// Prints a line to stderr, which is for failures, warnings and notices, so that they stay out
 	/// of output piped into another program. It is not logged, like [`UI::print`].
 	pub(crate) fn print_to_stderr(&mut self, msg: &str) {
@@ -1158,6 +1174,12 @@ pub(crate) mod test_support {
 			let bytes = self.0.lock().unwrap();
 			let text = str::from_utf8(&bytes).unwrap();
 			text.strip_suffix('\n').unwrap().to_owned()
+		}
+
+		/// The printed bytes, exactly as they were written.
+		pub(crate) fn bytes(&self) -> Vec<u8> {
+			// copied out, as the UI may still write into the buffer
+			self.0.lock().unwrap().clone()
 		}
 
 		/// [`Printed::lines`], or an empty string if nothing was printed.

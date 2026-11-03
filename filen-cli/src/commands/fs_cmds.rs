@@ -61,13 +61,13 @@ pub(crate) enum FsCommands {
 		#[arg(short = 'l', long)]
 		long: bool,
 	},
-	/// Print the contents of a file
+	/// Print the contents of a file as the bytes it holds
 	Cat {
 		/// File to print
 		#[arg(add = FilenCompleter::file())]
 		file: String,
 	},
-	/// Print the first lines of a file
+	/// Print the first lines of a file as the bytes they hold
 	Head {
 		/// File to print
 		#[arg(add = FilenCompleter::file())]
@@ -76,7 +76,7 @@ pub(crate) enum FsCommands {
 		#[arg(short = 'n', long, default_value_t = 10)]
 		lines: usize,
 	},
-	/// Print the last lines of a file
+	/// Print the last lines of a file as the bytes they hold
 	Tail {
 		/// File to print
 		#[arg(add = FilenCompleter::file())]
@@ -637,6 +637,8 @@ fn confirm_printing_file(ui: &mut UI, size: u64) -> Result<bool> {
 	)
 }
 
+/// Prints a file's content, or its first or last lines, as the bytes it holds, with no newline
+/// added.
 pub(crate) async fn print_file(
 	ui: &mut UI,
 	client: &mut LazyClient,
@@ -657,25 +659,99 @@ pub(crate) async fn print_file(
 		NonRootFileType::File(file) => file,
 		_ => return Err(UI::failure(&format!("Not a file: {}", file_str))),
 	};
-	if confirm_printing_file(ui, file.size())? {
-		let content = client.download_file(file.as_ref()).await?;
-		let content = String::from_utf8_lossy(&content);
-		let content = match lines {
-			PrintFileLines::Full => content.to_string(),
-			PrintFileLines::Head(n) => content.lines().take(n).collect::<Vec<&str>>().join("\n"),
-			PrintFileLines::Tail(n) => content
-				.lines()
-				.rev()
-				.take(n)
-				.collect::<Vec<&str>>()
-				.into_iter()
-				.rev()
-				.collect::<Vec<&str>>()
-				.join("\n"),
-		};
-		ui.print(&content);
+	if !confirm_printing_file(ui, file.size())? {
+		return Ok(());
 	}
+	let content = client.download_file(file.as_ref()).await?;
+	let printed = match lines {
+		PrintFileLines::Full => content.as_slice(),
+		PrintFileLines::Head(n) => HeadLines::new(n).cut(&content).0,
+		PrintFileLines::Tail(n) => {
+			let file_size =
+				u64::try_from(content.len()).expect("a usize fits in a u64 (should be impossible)");
+			let start = TailLines::new(n, file_size).scan(0, &content).unwrap_or(0);
+			let start = usize::try_from(start).expect(
+				"an offset into the content held in memory fits in a usize (should be impossible)",
+			);
+			content.get(start..).unwrap_or_default()
+		}
+	};
+	ui.write_stdout_bytes(printed)?;
 	Ok(())
+}
+
+/// Cuts the first lines out of a file read front to back, a chunk at a time. A line ends after
+/// its `\n` (so a `\r\n` line keeps its `\r`); a last line without one is printed as it is.
+#[derive(Debug)]
+struct HeadLines {
+	/// How many lines are still to be printed.
+	remaining: usize,
+}
+
+impl HeadLines {
+	fn new(lines: usize) -> Self {
+		Self { remaining: lines }
+	}
+
+	/// The part of `chunk`, the file's next bytes, to print, and whether it ends the lines asked
+	/// for, so that no more of the file is needed.
+	fn cut<'a>(&mut self, chunk: &'a [u8]) -> (&'a [u8], bool) {
+		if self.remaining == 0 {
+			return (&[], true);
+		}
+		let mut end = 0;
+		for line in chunk.split_inclusive(|&byte| byte == b'\n') {
+			end += line.len();
+			if line.ends_with(b"\n") {
+				self.remaining -= 1;
+				if self.remaining == 0 {
+					return (chunk.split_at(end).0, true);
+				}
+			}
+		}
+		(chunk, false)
+	}
+}
+
+/// Finds where the last lines of a file start, from blocks of it read back to front. The `\n`
+/// that ends the file ends its last line rather than starting an empty one, as in `tail`.
+#[derive(Debug)]
+struct TailLines {
+	/// How many line starts are still to be found.
+	remaining: usize,
+	file_size: u64,
+}
+
+impl TailLines {
+	fn new(lines: usize, file_size: u64) -> Self {
+		Self {
+			remaining: lines,
+			file_size,
+		}
+	}
+
+	/// Scans `block`, the file's bytes from offset `block_start` up to the block scanned before,
+	/// and returns the offset the last lines start at if it is in this block. If no block has it,
+	/// they start at the file's start.
+	fn scan(&mut self, block_start: u64, block: &[u8]) -> Option<u64> {
+		if self.remaining == 0 {
+			return Some(self.file_size);
+		}
+		let block_len =
+			u64::try_from(block.len()).expect("a usize fits in a u64 (should be impossible)");
+		// the offset after the byte looked at
+		let mut line_start = block_start + block_len;
+		for &byte in block.iter().rev() {
+			if byte == b'\n' && line_start != self.file_size {
+				self.remaining -= 1;
+				if self.remaining == 0 {
+					return Some(line_start);
+				}
+			}
+			line_start -= 1;
+		}
+		None
+	}
 }
 
 pub(crate) async fn print_file_or_directory_info(
@@ -2173,6 +2249,139 @@ mod tests {
 	use crate::ui::test_support::Printed;
 	use chrono::TimeZone as _;
 	use filen_sdk_rs::fs::copy::SkippedEntry;
+
+	/// What `head -n lines` prints of a file read in `chunks`, and how many chunks it read.
+	fn head_of(chunks: &[&[u8]], lines: usize) -> (Vec<u8>, usize) {
+		let mut head = HeadLines::new(lines);
+		let mut printed = Vec::new();
+		for (read, chunk) in chunks.iter().enumerate() {
+			let (part, done) = head.cut(chunk);
+			printed.extend_from_slice(part);
+			if done {
+				return (printed, read + 1);
+			}
+		}
+		(printed, chunks.len())
+	}
+
+	/// What `tail -n lines` prints of `file`, scanned back to front in blocks of `block_size`
+	/// bytes aligned to its start, as the chunks of a file are, and how many blocks it scanned.
+	fn tail_of(file: &[u8], block_size: usize, lines: usize) -> (Vec<u8>, usize) {
+		let mut tail = TailLines::new(lines, file.len() as u64);
+		let mut end = file.len();
+		let mut scanned = 0;
+		let mut start_of_lines = 0;
+		while end > 0 {
+			let start = (end - 1) / block_size * block_size;
+			scanned += 1;
+			if let Some(line_start) = tail.scan(start as u64, &file[start..end]) {
+				start_of_lines = usize::try_from(line_start).unwrap();
+				break;
+			}
+			end = start;
+		}
+		(file[start_of_lines..].to_vec(), scanned)
+	}
+
+	#[test]
+	fn head_prints_the_first_lines_with_their_newlines() {
+		assert_eq!(head_of(&[b"a\nb\nc\n"], 2), (b"a\nb\n".to_vec(), 1));
+	}
+
+	#[test]
+	fn head_prints_a_last_line_without_a_newline_as_it_is() {
+		assert_eq!(head_of(&[b"a\nb"], 2), (b"a\nb".to_vec(), 1));
+	}
+
+	#[test]
+	fn head_keeps_the_carriage_returns_of_crlf_lines() {
+		assert_eq!(
+			head_of(&[b"a\r\nb\r\nc\r\n"], 2),
+			(b"a\r\nb\r\n".to_vec(), 1)
+		);
+	}
+
+	#[test]
+	fn head_of_more_lines_than_the_file_has_prints_the_whole_file() {
+		assert_eq!(head_of(&[b"a\n", b"b\n"], 10), (b"a\nb\n".to_vec(), 2));
+	}
+
+	#[test]
+	fn head_of_an_empty_file_prints_nothing() {
+		assert_eq!(head_of(&[], 3), (Vec::new(), 0));
+	}
+
+	#[test]
+	fn head_of_zero_lines_prints_nothing() {
+		assert_eq!(head_of(&[b"a\n"], 0), (Vec::new(), 1));
+	}
+
+	#[test]
+	fn head_joins_a_line_split_across_chunks_and_reads_no_further_chunk() {
+		assert_eq!(
+			head_of(&[b"ab", b"c\nde", b"f\ng", b"h\n"], 2),
+			(b"abc\ndef\n".to_vec(), 3)
+		);
+	}
+
+	#[test]
+	fn tail_prints_the_last_lines_with_their_newlines() {
+		assert_eq!(tail_of(b"a\nb\nc\n", 64, 2), (b"b\nc\n".to_vec(), 1));
+	}
+
+	#[test]
+	fn tail_prints_a_last_line_without_a_newline_as_it_is() {
+		assert_eq!(tail_of(b"a\nb\nc", 64, 2), (b"b\nc".to_vec(), 1));
+	}
+
+	#[test]
+	fn tail_keeps_the_carriage_returns_of_crlf_lines() {
+		assert_eq!(tail_of(b"a\r\nb\r\nc\r\n", 64, 1), (b"c\r\n".to_vec(), 1));
+	}
+
+	#[test]
+	fn tail_of_more_lines_than_the_file_has_prints_the_whole_file() {
+		assert_eq!(tail_of(b"a\nb\n", 64, 10), (b"a\nb\n".to_vec(), 1));
+	}
+
+	#[test]
+	fn tail_of_an_empty_file_prints_nothing() {
+		assert_eq!(tail_of(b"", 64, 3), (Vec::new(), 0));
+	}
+
+	#[test]
+	fn tail_of_zero_lines_prints_nothing() {
+		assert_eq!(tail_of(b"a\nb\n", 64, 0), (Vec::new(), 1));
+	}
+
+	#[test]
+	fn tail_counts_empty_lines() {
+		assert_eq!(tail_of(b"a\n\n\n", 64, 2), (b"\n\n".to_vec(), 1));
+	}
+
+	#[test]
+	fn tail_finds_a_line_split_across_blocks_and_scans_no_block_before_it() {
+		// blocks: "zzzz" "aaa\n" "bbbb" "b\ncc" "c\n"
+		assert_eq!(
+			tail_of(b"zzzzaaa\nbbbbb\nccc\n", 4, 2),
+			(b"bbbbb\nccc\n".to_vec(), 4)
+		);
+	}
+
+	#[test]
+	fn tail_of_a_last_line_longer_than_a_block_scans_back_to_its_start() {
+		assert_eq!(tail_of(b"a\nbbbbbbbbb", 4, 1), (b"bbbbbbbbb".to_vec(), 3));
+	}
+
+	#[test]
+	fn file_content_is_written_to_stdout_as_it_is() {
+		let printed = Printed::default();
+		let mut ui = printed.ui();
+
+		ui.write_stdout_bytes(b"\x00\xff no newline").unwrap();
+
+		assert_eq!(printed.bytes(), b"\x00\xff no newline");
+	}
 
 	#[test]
 	fn a_destination_ending_in_a_slash_names_a_directory() {

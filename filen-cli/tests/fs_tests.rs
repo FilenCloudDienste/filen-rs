@@ -5,8 +5,10 @@ use std::{
 	time::{Duration, Instant},
 };
 
+use assert_cmd::cargo::cargo_bin_cmd;
 use chrono::{TimeZone as _, Utc};
 use filen_macros::shared_test_runtime;
+use filen_sdk_rs::consts::CHUNK_SIZE;
 use filen_sdk_rs::{
 	auth::Client,
 	fs::{
@@ -18,7 +20,7 @@ use filen_sdk_rs::{
 	io::client_impl::IoSharedClientExt,
 	sync::lock::ResourceLock,
 };
-use test_utils::authenticated_cli_with_args;
+use test_utils::{authenticated_cli_with_args, cli::run_authenticated_cli_with_args};
 
 /// Uploads `content` as `name` into `parent`.
 async fn upload(
@@ -956,4 +958,59 @@ async fn list_recents_json_gives_each_items_path() {
 	assert_eq!(item["path"], format!("{test_dir}/a.txt"));
 	assert_eq!(item["type"], "file");
 	assert_eq!(item["size"], 7);
+}
+
+/// What `args` printed on stdout, as bytes.
+async fn printed_bytes(args: &[&str]) -> Vec<u8> {
+	run_authenticated_cli_with_args(&mut cargo_bin_cmd!("filen-cli"), args)
+		.await
+		.success()
+		.get_output()
+		.stdout
+		.clone()
+}
+
+#[shared_test_runtime]
+async fn cat_prints_a_binary_file_byte_for_byte() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = format!("/{}", resources.dir.name().unwrap());
+	// more than two chunks, with every byte value and no newline at the end
+	let content = (0..=255u8)
+		.cycle()
+		.take(2 * CHUNK_SIZE + 1000)
+		.collect::<Vec<u8>>();
+	upload(client, &resources.dir, "a.bin", &content).await;
+
+	let printed = printed_bytes(&["cat", &format!("{test_dir}/a.bin")]).await;
+
+	assert_eq!(printed.len(), content.len());
+	assert!(
+		printed == content,
+		"the printed bytes differ from the file's"
+	);
+}
+
+#[shared_test_runtime]
+async fn head_and_tail_print_whole_lines_as_they_are() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = format!("/{}", resources.dir.name().unwrap());
+	upload(client, &resources.dir, "a.txt", b"one\ntwo\r\nthree").await;
+	let path = format!("{test_dir}/a.txt");
+
+	assert_eq!(
+		printed_bytes(&["head", "-n", "2", &path]).await,
+		b"one\ntwo\r\n"
+	);
+	assert_eq!(
+		printed_bytes(&["head", "-n", "5", &path]).await,
+		b"one\ntwo\r\nthree"
+	);
+	assert_eq!(printed_bytes(&["tail", "-n", "1", &path]).await, b"three");
+	assert_eq!(
+		printed_bytes(&["tail", "-n", "2", &path]).await,
+		b"two\r\nthree"
+	);
+	assert_eq!(printed_bytes(&["tail", "-n", "0", &path]).await, b"");
 }

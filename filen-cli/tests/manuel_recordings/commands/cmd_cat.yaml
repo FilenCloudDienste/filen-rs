@@ -8,7 +8,6 @@
 # ({{ $MANUEL_EMAIL }}) /{{ $MANUEL_REMOTE_CWD }} upload asdf.txt .                          #
 # ({{ $MANUEL_EMAIL }}) /{{ $MANUEL_REMOTE_CWD }} cat asdf.txt                               #
 # This is a basic local file for testing.                                                    #
-#                                                                                            #
 # ({{ $MANUEL_EMAIL }}) /{{ $MANUEL_REMOTE_CWD }} exit                                       #
 # (manuel)                                                                                   #
 #                                                                                            #
@@ -251,7 +250,7 @@ recording_items:
 - !Output "\e[?25l\e[61D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m cat asdf.txt \e[K\r\e[60C\e[?25h"
 - !Input
   - 13
-- !Output "\e[?25l\e[60D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m \e[38;5;14mcat asdf.txt\e[39m\e[K\r\n\e[?25h\e[?25h\e[?2004lThis is a basic local file for testing.\r\n\r\n\e[?2004h\e[?25l\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m  \r\e[48C\e[?25h"
+- !Output "\e[?25l\e[60D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m \e[38;5;14mcat asdf.txt\e[39m\e[K\r\n\e[?25h\e[?25h\e[?2004lThis is a basic local file for testing.\r\n\e[?2004h\e[?25l\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m  \r\e[48C\e[?25h"
 - !Input
   - 101
 - !Input
