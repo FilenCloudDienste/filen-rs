@@ -44,7 +44,9 @@ pub(crate) async fn export_notes(
 	client: &mut LazyClient,
 	export_root: Option<&str>,
 ) -> Result<()> {
-	let export_dir = resolve_export_root(export_root.unwrap_or("."))?;
+	// a bad path fails before logging in, but nothing is created until there is something to
+	// export
+	let export_dir = choose_export_root(export_root.unwrap_or("."))?;
 
 	let client = client.get(ui).await?;
 	let notes = client.list_notes().await.context("Failed to list notes")?;
@@ -53,6 +55,7 @@ pub(crate) async fn export_notes(
 		return Ok(());
 	}
 	let total = notes.len();
+	create_export_root(&export_dir)?;
 
 	// Assign every note its target path up front, sequentially, so that the disambiguating
 	// suffixes for duplicate titles don't depend on the order the fetches happen to finish in.
@@ -128,21 +131,25 @@ async fn export_note(client: &Client, mut note: Note, path: PathBuf) -> Result<(
 		.with_context(|| format!("Failed to write {} to {}", note_str, path.display()))
 }
 
-fn resolve_export_root(path_str: &str) -> Result<PathBuf> {
+/// Decides which directory the notes are exported to, without creating anything:
+/// [`create_export_root`] does that once there are notes to export.
+fn choose_export_root(path_str: &str) -> Result<PathBuf> {
 	let path = PathBuf::from(path_str);
 	if path.exists() && !path.is_dir() {
 		return Err(UI::failure(&format!("Not a directory: {path_str}")));
 	}
 
 	let timestamp = chrono::Local::now().format("%Y-%m-%d-%H-%M-%S");
-	let export_root = path.join(format!("filen-notes-export-{timestamp}"));
-	std::fs::create_dir_all(&export_root).map_err(|e| {
+	Ok(path.join(format!("filen-notes-export-{timestamp}")))
+}
+
+fn create_export_root(export_root: &Path) -> Result<()> {
+	std::fs::create_dir_all(export_root).map_err(|e| {
 		UI::failure(&format!(
 			"Failed to create directory {}: {e}",
 			export_root.display()
 		))
-	})?;
-	Ok(export_root)
+	})
 }
 
 /// Picks a unique path for a note, inserting it into `used_paths`.
@@ -360,7 +367,7 @@ mod tests {
 
 		// an existing directory is accepted whether or not it already holds something
 		std::fs::write(parent.path().join("some file"), "").unwrap();
-		let root = resolve_export_root(parent.path().to_str().unwrap()).unwrap();
+		let root = choose_export_root(parent.path().to_str().unwrap()).unwrap();
 		assert_eq!(root.parent(), Some(parent.path()));
 		assert!(
 			root.file_name()
@@ -368,17 +375,31 @@ mod tests {
 				.to_string_lossy()
 				.starts_with("filen-notes-export-")
 		);
+		create_export_root(&root).unwrap();
 		assert!(std::fs::read_dir(&root).unwrap().next().is_none());
 
 		// a directory that doesn't exist yet is created along the way
 		let missing = parent.path().join("missing").join("nested");
-		let root = resolve_export_root(missing.to_str().unwrap()).unwrap();
+		let root = choose_export_root(missing.to_str().unwrap()).unwrap();
 		assert_eq!(root.parent(), Some(missing.as_path()));
+		create_export_root(&root).unwrap();
 		assert!(root.is_dir());
 
 		// but a path that exists and isn't a directory is rejected
 		let file = parent.path().join("some file");
-		assert!(resolve_export_root(file.to_str().unwrap()).is_err());
+		assert!(choose_export_root(file.to_str().unwrap()).is_err());
+	}
+
+	#[test]
+	fn choosing_the_export_root_creates_nothing() {
+		let parent = assert_fs::TempDir::new().unwrap();
+
+		choose_export_root(parent.path().to_str().unwrap()).unwrap();
+		assert!(std::fs::read_dir(parent.path()).unwrap().next().is_none());
+
+		let missing = parent.path().join("missing").join("nested");
+		choose_export_root(missing.to_str().unwrap()).unwrap();
+		assert!(!parent.path().join("missing").exists());
 	}
 
 	#[test]
