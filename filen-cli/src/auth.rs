@@ -554,22 +554,49 @@ pub(crate) fn export_auth_config(client: &Client, parent_dir: &Path) -> Result<P
 	Ok(path)
 }
 
+/// What [`logout`] did.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum LogoutOutcome {
+	/// There were no stored credentials.
+	NothingFound,
+	/// Every deletion was declined.
+	NothingDeleted,
+	/// At least some stored credentials were deleted.
+	Deleted,
+}
+
 /// Log out by deleting stored credentials from the keyring and auth config files, prompting the
 /// user to confirm each (`--yes` confirms them all).
-pub(crate) fn logout(config: &CliConfig, ui: &mut UI) -> Result<bool> {
-	let mut found_any_credentials = false;
+pub(crate) fn logout(config: &CliConfig, ui: &mut UI) -> Result<LogoutOutcome> {
 	let keyring_location = KeyringLocation::of(config);
 	let keyring_store = keyring_location.store();
-	let keyring_entry = LongKeyringEntry::new(&keyring_store, &keyring_location.entry_name);
-	if !keyring_disabled_for_testing()
+	let keyring_entry = (!keyring_disabled_for_testing())
+		.then(|| LongKeyringEntry::new(&keyring_store, &keyring_location.entry_name));
+	logout_from(config, ui, keyring_entry.as_ref(), |ui, msg| {
+		ui.prompt_confirm(msg, false)
+	})
+}
+
+/// [`logout`] from `keyring_entry`, if any, and the auth config files, asking `confirm` before
+/// each deletion.
+fn logout_from(
+	config: &CliConfig,
+	ui: &mut UI,
+	keyring_entry: Option<&LongKeyringEntry>,
+	mut confirm: impl FnMut(&mut UI, &str) -> Result<bool>,
+) -> Result<LogoutOutcome> {
+	let mut found_any_credentials = false;
+	let mut deleted_any_credentials = false;
+	if let Some(keyring_entry) = keyring_entry
 		&& let Ok(Some(_)) = keyring_entry.read()
 	{
 		found_any_credentials = true;
-		if ui.prompt_confirm("Delete credentials stored in system keyring?", false)? {
+		if confirm(ui, "Delete credentials stored in system keyring?")? {
 			let deleted = keyring_entry
 				.delete()
 				.context("Failed to delete SDK config from keyring")?;
 			if deleted {
+				deleted_any_credentials = true;
 				ui.print_success("Credentials deleted from keyring");
 			} else {
 				ui.print_failure("No credentials found in keyring");
@@ -579,29 +606,116 @@ pub(crate) fn logout(config: &CliConfig, ui: &mut UI) -> Result<bool> {
 	for (path, _) in get_auth_config_default_locations(config) {
 		if path.exists() {
 			found_any_credentials = true;
-			if ui.prompt_confirm(
+			if confirm(
+				ui,
 				&format!("Delete auth config file at {}?", path.display()),
-				false,
 			)? {
 				std::fs::remove_file(&path).with_context(|| {
 					format!("Failed to delete auth config file at {}", path.display())
 				})?;
+				deleted_any_credentials = true;
 				ui.print_success(&format!("Deleted auth config file at {}", path.display()));
 			}
 		}
 	}
-	if found_any_credentials {
-		Ok(true)
+	if deleted_any_credentials {
+		Ok(LogoutOutcome::Deleted)
+	} else if found_any_credentials {
+		ui.print_muted("Nothing deleted");
+		Ok(LogoutOutcome::NothingDeleted)
 	} else {
 		ui.print_muted("No credentials found in system keyring or auth config default locations");
-		Ok(false)
+		Ok(LogoutOutcome::NothingFound)
 	}
 }
 
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::{error::exit_code, ui::test_support::Printed};
+	use crate::{
+		error::exit_code, ui::test_support::Printed, util::test_support::MemoryChunkStore,
+	};
+
+	/// A config in a fresh config dir.
+	fn config_in_temp_dir() -> (assert_fs::TempDir, CliConfig) {
+		let dir = assert_fs::TempDir::new().unwrap();
+		let config = CliConfig {
+			config_dir: dir.path().to_path_buf(),
+		};
+		(dir, config)
+	}
+
+	#[test]
+	fn declining_to_delete_the_keyring_login_deletes_nothing() {
+		let (_dir, config) = config_in_temp_dir();
+		let store = MemoryChunkStore::default();
+		let entry = LongKeyringEntry::new(&store, "sdk-config");
+		entry.write("credentials").unwrap();
+		let printed = Printed::default();
+
+		let outcome =
+			logout_from(&config, &mut printed.ui(), Some(&entry), |_, _| Ok(false)).unwrap();
+
+		assert_eq!(outcome, LogoutOutcome::NothingDeleted);
+		assert_eq!(entry.read().unwrap().as_deref(), Some("credentials"));
+		assert_eq!(
+			console::strip_ansi_codes(&printed.lines()),
+			"Nothing deleted"
+		);
+	}
+
+	#[test]
+	fn declining_to_delete_an_auth_config_deletes_nothing() {
+		let (_dir, config) = config_in_temp_dir();
+		let path = config.config_dir.join(AUTH_CONFIG_FILENAME);
+		std::fs::write(&path, "secret-config").unwrap();
+
+		let outcome = logout_from(&config, &mut Printed::default().ui(), None, |_, _| {
+			Ok(false)
+		})
+		.unwrap();
+
+		assert_eq!(outcome, LogoutOutcome::NothingDeleted);
+		assert!(path.exists());
+	}
+
+	#[test]
+	fn confirming_deletes_the_keyring_login_and_the_auth_config() {
+		let (_dir, config) = config_in_temp_dir();
+		let path = config.config_dir.join(AUTH_CONFIG_FILENAME);
+		std::fs::write(&path, "secret-config").unwrap();
+		let store = MemoryChunkStore::default();
+		let entry = LongKeyringEntry::new(&store, "sdk-config");
+		entry.write("credentials").unwrap();
+		let mut ui = Printed::default().ui();
+		ui.set_assume_yes(true);
+
+		let outcome = logout_from(&config, &mut ui, Some(&entry), |ui, msg| {
+			ui.prompt_confirm(msg, false)
+		})
+		.unwrap();
+
+		assert_eq!(outcome, LogoutOutcome::Deleted);
+		assert!(store.keys().is_empty());
+		assert!(!path.exists());
+	}
+
+	#[test]
+	fn logging_out_without_stored_credentials_finds_nothing() {
+		let (_dir, config) = config_in_temp_dir();
+		let store = MemoryChunkStore::default();
+		let entry = LongKeyringEntry::new(&store, "sdk-config");
+
+		let outcome = logout_from(
+			&config,
+			&mut Printed::default().ui(),
+			Some(&entry),
+			|_, _| panic!("nothing to confirm"),
+		)
+		.unwrap();
+
+		assert_eq!(outcome, LogoutOutcome::NothingFound);
+	}
 
 	/// An auth config file in a fresh directory, with the permissions `mode`.
 	#[cfg(unix)]

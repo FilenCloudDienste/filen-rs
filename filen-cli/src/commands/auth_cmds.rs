@@ -3,7 +3,7 @@ use clap::Subcommand;
 
 use crate::{
 	CommandResult,
-	auth::{self, export_auth_config},
+	auth::{self, LogoutOutcome, export_auth_config},
 	commands::CommandContext,
 	docs::DocElement,
 };
@@ -41,7 +41,8 @@ impl AuthCommands {
 				));
 			}
 			Self::Logout => {
-				if auth::logout(config, ui)? {
+				// stay in the REPL when every deletion was declined
+				if auth::logout(config, ui)? == LogoutOutcome::Deleted {
 					return Ok(CommandResult {
 						exit: true,
 						..Default::default()
