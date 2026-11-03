@@ -30,7 +30,10 @@ use filen_sdk_rs::{
 	consts::CHUNK_SIZE_U64,
 	fs::{
 		HasName as _, HasParent as _, HasRemoteInfo as _, HasUUID,
-		categories::{DirType, NonRootFileType, NonRootItemType, Normal, fs::CategoryFS},
+		categories::{
+			DirType, NonRootFileType, NonRootItemType, Normal,
+			fs::{CategoryFS, ObjectOrRemainingPath},
+		},
 		copy::{
 			CopiedTopLevel, CopyCallback, CopyConfig, CopyFailed, CopyPhase, CopyReport,
 			CopyRequest, CopyUpdate, ItemCounts, ItemSource, ItemSourceDir, JobControl, PlanTotals,
@@ -103,6 +106,22 @@ pub(crate) enum FsCommands {
 		/// File or directory to show information about ("/" for the Filen drive)
 		#[arg(add = FilenCompleter::file_or_directory())]
 		file_or_directory: String,
+	},
+	/// Print the web drive's URL of a directory, or of a file's directory, and open it in the
+	/// browser
+	View {
+		/// File or directory to view (default: the current working directory)
+		#[arg(add = FilenCompleter::file_or_directory())]
+		file_or_directory: Option<String>,
+		/// Only print the URL
+		#[arg(long)]
+		no_open: bool,
+	},
+	/// Print the web drive's URL and open it in the browser
+	Drive {
+		/// Only print the URL
+		#[arg(long)]
+		no_open: bool,
 	},
 	/// Create a new directory
 	Mkdir {
@@ -212,6 +231,8 @@ pub(crate) const BROWSING_DOCS: &[DocElement] = &[
 	DocElement::CommandHelp("head"),
 	DocElement::CommandHelp("tail"),
 	DocElement::CommandHelp("stat"),
+	DocElement::CommandHelp("view"),
+	DocElement::CommandHelp("drive"),
 ];
 
 /// The commands of the docs' "Accessing Files" section after `search`.
@@ -263,6 +284,16 @@ impl FsCommands {
 			}
 			Self::Stat { file_or_directory } => {
 				print_file_or_directory_info(ui, client, working_path, &file_or_directory).await?;
+			}
+			Self::View {
+				file_or_directory,
+				no_open,
+			} => {
+				let path = working_path.navigate(file_or_directory.as_deref().unwrap_or(""));
+				view_in_web_drive(ui, client, &path, !no_open).await?;
+			}
+			Self::Drive { no_open } => {
+				view_in_web_drive(ui, client, &RemotePath::new("/"), !no_open).await?;
 			}
 			Self::Mkdir {
 				directory,
@@ -1086,6 +1117,59 @@ pub(crate) async fn print_file_or_directory_info(
 				]);
 			}
 		}
+	}
+	Ok(())
+}
+
+/// The web drive's URL of the root directory's parent: a directory's URL adds the directories
+/// from the root directory down to it.
+const WEB_DRIVE_URL: &str = "https://app.filen.io/#/drive";
+
+/// The web drive's URL of the directory the UUIDs `chain` lead to, from the root directory
+/// down: filen-web routes `#/drive/` by that chain.
+fn web_drive_url(chain: impl IntoIterator<Item = Uuid>) -> String {
+	chain
+		.into_iter()
+		.fold(WEB_DRIVE_URL.to_owned(), |mut url, uuid| {
+			url.push('/');
+			url.push_str(&uuid.to_string());
+			url
+		})
+}
+
+/// Prints the web drive's URL of a directory, or of a file's directory, and opens it in the
+/// browser if `open_browser`. A browser that fails to open is only warned about: the URL is
+/// printed.
+pub(crate) async fn view_in_web_drive(
+	ui: &mut UI,
+	client: &mut LazyClient,
+	path: &RemotePath,
+	open_browser: bool,
+) -> Result<()> {
+	let client = client.get(ui).await?;
+	let no_such_item = || UI::failure(&format!("No such file or directory: {}", path));
+	let (dirs, item) = match client.get_items_in_path(&path.0).await {
+		Ok(found) => found,
+		// a file is where a directory on the path was
+		Err((e, _, _)) if e.kind() == ErrorKind::InvalidType => return Err(no_such_item()),
+		Err((e, _, _)) => return Err(e).context("Failed to find file or directory"),
+	};
+	let mut chain = dirs.iter().map(|dir| dir.uuid()).collect::<Vec<_>>();
+	match item {
+		ObjectOrRemainingPath::RemainingPath(_) => return Err(no_such_item()),
+		// a file is shown in its directory, the last of `dirs`
+		ObjectOrRemainingPath::Object(NonRootFileType::File(_)) => {}
+		ObjectOrRemainingPath::Object(NonRootFileType::Dir(dir)) => chain.push(dir.uuid()),
+		ObjectOrRemainingPath::Object(NonRootFileType::Root(root)) => chain.push(root.uuid()),
+	}
+	let url = web_drive_url(chain);
+	if ui.json {
+		ui.print_json(json!({ "url": url }))?;
+	} else {
+		ui.print(&url);
+	}
+	if open_browser && let Err(e) = open::that_detached(&url) {
+		ui.print_warning(&format!("Failed to open the browser: {}", e));
 	}
 	Ok(())
 }
@@ -3720,5 +3804,22 @@ mod tests {
 		print_working_path(&mut ui, &RemotePath::new("/a/b")).unwrap();
 
 		assert_eq!(printed.lines(), "{\n  \"path\": \"/a/b\"\n}");
+	}
+
+	#[test]
+	fn the_web_drive_url_of_the_root_directory_has_its_uuid() {
+		assert_eq!(
+			web_drive_url([Uuid::from_u128(1)]),
+			"https://app.filen.io/#/drive/00000000-0000-0000-0000-000000000001"
+		);
+	}
+
+	#[test]
+	fn the_web_drive_url_of_a_directory_has_the_uuids_from_the_root_down() {
+		assert_eq!(
+			web_drive_url([Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(3)]),
+			"https://app.filen.io/#/drive/00000000-0000-0000-0000-000000000001/\
+			 00000000-0000-0000-0000-000000000002/00000000-0000-0000-0000-000000000003"
+		);
 	}
 }

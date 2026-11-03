@@ -1266,3 +1266,40 @@ async fn pwd_prints_the_working_path_it_is_given() {
 		.success()
 		.stdout(format!("{test_dir}\n"));
 }
+
+#[shared_test_runtime]
+async fn view_json_prints_the_web_drive_url_of_a_files_directory() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = format!("/{}", resources.dir.name().unwrap());
+	test_utils::create_remote_file_structure_outline(client, resources.dir.clone(), &["sub/a.txt"])
+		.await
+		.unwrap();
+	let Some(NonRootFileType::Dir(sub)) = client
+		.find_item_at_path(&format!("{test_dir}/sub"))
+		.await
+		.unwrap()
+	else {
+		panic!("Expected a directory");
+	};
+
+	let assert = authenticated_cli_with_args!(
+		"--json",
+		"view",
+		"--no-open",
+		&format!("{test_dir}/sub/a.txt")
+	)
+	.success();
+
+	assert_eq!(
+		printed_json(&assert),
+		serde_json::json!({
+			"url": format!(
+				"https://app.filen.io/#/drive/{}/{}/{}",
+				client.root().uuid(),
+				resources.dir.uuid(),
+				sub.uuid()
+			)
+		})
+	);
+}
