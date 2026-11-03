@@ -2219,3 +2219,139 @@ async fn favorite_favorites_every_item_it_is_given() {
 	assert!(!favorited(a.uuid()).await);
 	assert!(!favorited(b.uuid()).await);
 }
+
+#[shared_test_runtime]
+async fn list_favorites_prints_the_path_of_each_favorited_item() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = format!("/{}", resources.dir.name().unwrap());
+	let mut file = upload(client, &resources.dir, "a.txt", b"content").await;
+	client.set_file_favorite(&mut file, true).await.unwrap();
+
+	let assert = authenticated_cli_with_args!("list-favorites").success();
+	// the favorites are the whole account's, so the test looks at its own file only
+	client.set_file_favorite(&mut file, false).await.unwrap();
+	let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+	assert!(
+		stdout
+			.lines()
+			.any(|line| line == format!("{test_dir}/a.txt")),
+		"{stdout}"
+	);
+}
+
+#[shared_test_runtime]
+async fn list_recents_prints_the_path_of_each_recent_item() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = format!("/{}", resources.dir.name().unwrap());
+	upload(client, &resources.dir, "a.txt", b"content").await;
+
+	let assert = authenticated_cli_with_args!("list-recents").success();
+	let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+	assert!(
+		stdout
+			.lines()
+			.any(|line| line == format!("{test_dir}/a.txt")),
+		"{stdout}"
+	);
+}
+
+#[shared_test_runtime]
+async fn stat_json_prints_a_files_and_a_directorys_keys() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = format!("/{}", resources.dir.name().unwrap());
+	let dir = client
+		.create_dir(&(&resources.dir).into(), "docs")
+		.await
+		.unwrap();
+	let file = upload(client, &dir, "a.txt", b"content").await;
+
+	let assert =
+		authenticated_cli_with_args!("stat", &format!("{test_dir}/docs/a.txt"), "--json").success();
+	assert_eq!(
+		printed_json(&assert),
+		serde_json::json!({
+			"name": "a.txt",
+			"type": "file",
+			"size": 7,
+			"modified": file.last_modified(),
+			"created": file.created(),
+			"uuid": file.uuid().to_string(),
+		})
+	);
+	let assert =
+		authenticated_cli_with_args!("stat", &format!("{test_dir}/docs"), "--json").success();
+	let stat = printed_json(&assert);
+	let mut keys = stat
+		.as_object()
+		.unwrap()
+		.keys()
+		.map(String::as_str)
+		.collect::<Vec<&str>>();
+	keys.sort_unstable();
+	assert_eq!(
+		keys,
+		[
+			"color",
+			"created",
+			"directories",
+			"files",
+			"name",
+			"size",
+			"type",
+			"uuid"
+		]
+	);
+	assert_eq!(stat["name"], "docs");
+	assert_eq!(stat["type"], "directory");
+	assert_eq!(stat["color"], "default");
+	assert_eq!(stat["uuid"], dir.uuid().to_string());
+}
+
+#[shared_test_runtime]
+async fn mv_refuses_to_move_a_directory_into_itself() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = format!("/{}", resources.dir.name().unwrap());
+	test_utils::create_remote_file_structure_outline(
+		client,
+		resources.dir.clone(),
+		&["docs/", "docs/sub/"],
+	)
+	.await
+	.unwrap();
+
+	authenticated_cli_with_args!(
+		"mv",
+		&format!("{test_dir}/docs"),
+		&format!("{test_dir}/docs/sub")
+	)
+	.failure()
+	.stderr(predicates::str::contains(format!(
+		"Cannot move {test_dir}/docs into itself: {test_dir}/docs/sub/docs"
+	)));
+
+	assert!(exists(client, &format!("{test_dir}/docs/sub")).await);
+	assert!(!exists(client, &format!("{test_dir}/docs/sub/docs")).await);
+}
+
+#[shared_test_runtime]
+async fn rm_cp_and_mv_refuse_the_root_directory() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let test_dir = format!("/{}", resources.dir.name().unwrap());
+
+	authenticated_cli_with_args!("rm", "/")
+		.failure()
+		.stderr(predicates::str::contains("Cannot delete root directory"));
+	authenticated_cli_with_args!("rm", "-p", "--yes", "/")
+		.failure()
+		.stderr(predicates::str::contains("Cannot delete root directory"));
+	authenticated_cli_with_args!("cp", "/", &test_dir)
+		.failure()
+		.stderr(predicates::str::contains("Cannot copy root directory"));
+	authenticated_cli_with_args!("mv", "/", &test_dir)
+		.failure()
+		.stderr(predicates::str::contains("Cannot move root directory"));
+}
