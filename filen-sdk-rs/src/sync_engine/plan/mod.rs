@@ -467,11 +467,14 @@ pub(crate) struct ViewBuilder {
 	/// baseline to derive from and every placement has to know what it displaced.
 	nodes: HashMap<String, RemoteNode>,
 	held_paths: BTreeSet<String>,
-	/// The remote name of the first item placed at each path whose name is not NFC already, kept
-	/// once the path is held too: what tells a later item at a path that is another SPELLING of the
-	/// name from a cache mid-transition (see [`note_spelling`](Self::note_spelling)). Empty unless a
-	/// client wrote non-NFC names.
-	spellings: HashMap<String, String>,
+	/// The remote name of each placed item whose name is not NFC already, by uuid: what tells an
+	/// item arriving on its path that is another SPELLING of the name from a cache mid-transition
+	/// (see [`note_spelling`](Self::note_spelling)). Empty unless a client wrote non-NFC names, and
+	/// only ever filled where the builder places items, which a pass leaves to the staged walk (see
+	/// `stage::remote`, which looks the spelling up only when two items meet).
+	spellings: HashMap<Uuid, String>,
+	/// The spelling of the first item at each held path, `None` where it is NFC.
+	held_spellings: HashMap<String, Option<String>>,
 	/// Held paths two differently spelled names resolved to: a lasting collision, not a transition.
 	twins: BTreeSet<String>,
 	skipped: Skipped,
@@ -496,6 +499,7 @@ impl ViewBuilder {
 			nodes: HashMap::with_capacity(items),
 			held_paths: BTreeSet::new(),
 			spellings: HashMap::new(),
+			held_spellings: HashMap::new(),
 			twins: BTreeSet::new(),
 			skipped: Skipped::new(pair_root),
 			deferred: Vec::new(),
@@ -522,6 +526,7 @@ impl ViewBuilder {
 			nodes: HashMap::new(),
 			held_paths: BTreeSet::new(),
 			spellings: HashMap::new(),
+			held_spellings: HashMap::new(),
 			twins: BTreeSet::new(),
 			skipped: Skipped::new(pair_root),
 			deferred: items,
@@ -647,15 +652,17 @@ impl ViewBuilder {
 			size: if is_dir { 0 } else { item.size },
 			modified_millis: item.modified_millis,
 		};
-		if self.nodes.insert(rel_path.clone(), node).is_some() {
+		if let Some(occupant) = self.nodes.insert(rel_path.clone(), node) {
 			self.nodes.remove(&rel_path);
 			tracing::debug!(
 				"remote view: holding {rel_path:?} — the cache is listing two items under that name"
 			);
 			self.held_paths.insert(rel_path.clone());
+			let first = self.spellings.remove(&occupant.remote_uuid);
+			self.held_spellings.insert(rel_path.clone(), first);
 			self.note_spelling(rel_path, name, &item.name);
 		} else if item.name != name {
-			self.spellings.insert(rel_path, item.name.clone());
+			self.spellings.insert(item.uuid, item.name.clone());
 		}
 	}
 
@@ -665,7 +672,11 @@ impl ViewBuilder {
 	/// alone until one is renamed, rather than a transition the next snapshot clears. Asked of every
 	/// arrival against the first one's spelling, so the answer does not depend on their order.
 	fn note_spelling(&mut self, rel_path: String, name: &str, spelled: &str) {
-		let first = self.spellings.get(&rel_path).map_or(name, String::as_str);
+		let first = self
+			.held_spellings
+			.get(&rel_path)
+			.and_then(Option::as_deref)
+			.unwrap_or(name);
 		if first != spelled && !self.twins.contains(&rel_path) {
 			tracing::debug!(
 				"remote view: {rel_path:?} is two items, whose names differ in Unicode form only"

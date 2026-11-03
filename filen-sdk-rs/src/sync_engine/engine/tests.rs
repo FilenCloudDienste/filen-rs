@@ -2292,6 +2292,75 @@ fn a_rejected_local_name_the_remote_lacks_is_reported_and_not_pushed() {
 	);
 }
 
+/// A rejected name under a directory the remote holds by its own rejected name is still one the SDK
+/// will not write: the directory syncs, and what is under it is reported and never pushed.
+#[test]
+fn a_rejected_name_under_one_the_remote_holds_is_still_refused() {
+	let dir = Uuid::new_v4();
+	let mut prep = prepared(
+		SyncMode::TwoWay,
+		HashMap::from([("a:b".to_string(), dir_row("a:b", dir))]),
+		vec![
+			local_dir("a:b"),
+			local_file("a:b/c:d", Blake3Hash::from([1; 32])),
+			local_dir("a:b/x?y"),
+			local_file("a:b/x?y/z.txt", Blake3Hash::from([2; 32])),
+		],
+		view(vec![remote_dir("a:b", dir)], Vec::new(), &[]),
+		HashMap::new(),
+	);
+	for rel_path in ["a:b", "a:b/c:d", "a:b/x?y"] {
+		prep.facts
+			.invalid_names
+			.insert(rel_path.to_string(), format!("rejected {rel_path}"));
+	}
+	let (actions, unsyncable) = run_prepared(prep);
+	assert_eq!(actions, []);
+	assert_eq!(
+		unsyncable,
+		["a:b/c:d", "a:b/x?y"]
+			.map(|rel_path| UnsyncablePath {
+				rel_path: rel_path.to_string(),
+				reason: UnsyncableReason::InvalidName {
+					detail: format!("rejected {rel_path}"),
+				},
+			})
+			.to_vec()
+	);
+}
+
+/// A rejected name under another the remote lacks is blocked with it, and only the top one is
+/// reported.
+#[test]
+fn a_rejected_name_under_a_refused_one_is_reported_once() {
+	let mut prep = prepared(
+		SyncMode::TwoWay,
+		HashMap::new(),
+		vec![
+			local_dir("a:b"),
+			local_file("a:b/c:d", Blake3Hash::from([1; 32])),
+		],
+		view(Vec::new(), Vec::new(), &[]),
+		HashMap::new(),
+	);
+	for rel_path in ["a:b", "a:b/c:d"] {
+		prep.facts
+			.invalid_names
+			.insert(rel_path.to_string(), "forbidden ':'".to_string());
+	}
+	let (actions, unsyncable) = run_prepared(prep);
+	assert_eq!(actions, []);
+	assert_eq!(
+		unsyncable,
+		vec![UnsyncablePath {
+			rel_path: "a:b".to_string(),
+			reason: UnsyncableReason::InvalidName {
+				detail: "forbidden ':'".to_string(),
+			},
+		}]
+	);
+}
+
 /// The NFC and NFD spellings of one remote name are reported as a collision at the path they share,
 /// and nothing is planned there on either side: not the local copy's upload, not its deletion.
 #[test]

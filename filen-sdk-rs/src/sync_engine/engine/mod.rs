@@ -2731,6 +2731,9 @@ impl Prepared {
 	/// rather than freezing both ways. What still cannot happen is the SDK writing the name anew,
 	/// which only a content edit of a file asks for: that upload fails on the validator, as a
 	/// failure of its own path.
+	///
+	/// The scan records a rejected name under another as well, so one under a name the remote holds
+	/// is refused on its own; under a refused one it is refused twice, which blocks nothing more.
 	fn refused_names(&self) -> impl Iterator<Item = (&String, &String)> {
 		let remote = self.remote_view.nodes.of(&self.baseline);
 		self.facts
@@ -2739,11 +2742,24 @@ impl Prepared {
 			.filter(move |(rel_path, _)| !remote.holds(rel_path))
 	}
 
+	/// [`refused_names`](Self::refused_names) as reported: the top-most of each refused subtree,
+	/// once, as the subtree is blocked from there.
+	fn reported_names(&self) -> impl Iterator<Item = (&String, &String)> {
+		let refused: Vec<(&String, &String)> = self.refused_names().collect();
+		let paths: BTreeSet<&str> = refused
+			.iter()
+			.map(|(rel_path, _)| rel_path.as_str())
+			.collect();
+		refused.into_iter().filter(move |(rel_path, _)| {
+			!plan::ancestors(rel_path).any(|ancestor| paths.contains(ancestor))
+		})
+	}
+
 	/// Every path this pass will not act on, and why — reported identically by the dry run and by
 	/// the pass itself, so a caller sees the same list either way.
 	fn unsyncable(&self) -> Vec<UnsyncablePath> {
 		let names = self
-			.refused_names()
+			.reported_names()
 			.map(|(rel_path, detail)| UnsyncablePath {
 				rel_path: rel_path.clone(),
 				reason: UnsyncableReason::InvalidName {

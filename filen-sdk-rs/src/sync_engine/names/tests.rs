@@ -72,6 +72,10 @@ fn windows_reserves_device_names_with_and_without_an_extension() {
 		"NULL.txt",
 		"COM\u{b4}",
 		"con_.txt",
+		"CONOUT$$",
+		"\u{e9}CON",
+		"\u{ff23}\u{ff2f}\u{ff2e}",
+		"CO\u{e9}",
 	] {
 		assert_eq!(windows_rejection(name), None, "{name:?}");
 	}
@@ -205,4 +209,82 @@ fn a_missing_path_keeps_its_keys_spelling() {
 		respelled(dir.path(), &key, Leaf::Existing),
 		joined(dir.path(), &key)
 	);
+}
+
+#[test]
+fn only_a_name_with_a_decomposable_character_has_another_form() {
+	assert!(has_other_form(NFC));
+	assert!(has_other_form("\u{c5}ngstr\u{f6}m"));
+	for name in [
+		"cafe",
+		"\u{6771}\u{4eac}",
+		"\u{43f}\u{440}\u{438}\u{432}\u{435}\u{442}",
+		"\u{3a9}",
+		"",
+	] {
+		assert!(!has_other_form(name), "{name:?}");
+	}
+}
+
+/// A listing keeps only the entries whose name is not NFC: an NFC entry is found by its key's own
+/// `lstat`, and two spellings of one key name neither.
+#[test]
+fn a_kept_listing_holds_only_the_names_spelled_otherwise() {
+	let dir = tempfile::tempdir().unwrap();
+	fs::write(dir.path().join("plain.txt"), b"x").unwrap();
+	fs::write(dir.path().join(NFC), b"x").unwrap();
+	fs::write(dir.path().join(format!("{NFD}.txt")), b"x").unwrap();
+	let listed = list_respelled(dir.path());
+	assert_eq!(
+		listed,
+		HashMap::from([(format!("{NFC}.txt"), Some(format!("{NFD}.txt")))])
+	);
+}
+
+/// Paths an observation asks about that are gone list their directory once between them, however
+/// many there are, and a mixed spelling is still found through that one listing.
+#[test]
+fn gone_paths_list_their_directory_once() {
+	let mixed = "\u{e9}e\u{301}";
+	let key: String = mixed.nfc().collect();
+	let dir = tempfile::tempdir().unwrap();
+	fs::create_dir(dir.path().join("d")).unwrap();
+	fs::write(dir.path().join("d").join(mixed), b"mixed").unwrap();
+	let mut listings = Listings::default();
+	for gone in ["\u{e9}1", "\u{e9}2", "\u{e9}3"] {
+		let rel_path = format!("d/{gone}");
+		assert_eq!(
+			respelled_missing(dir.path(), &rel_path, Leaf::Existing, Some(&mut listings)),
+			joined(dir.path(), &rel_path)
+		);
+	}
+	assert_eq!(listings.dirs.len(), 1);
+	let found = respelled_missing(
+		dir.path(),
+		&format!("d/{key}"),
+		Leaf::Existing,
+		Some(&mut listings),
+	);
+	assert_eq!(fs::read(&found).unwrap(), b"mixed");
+	assert_eq!(listings.dirs.len(), 1);
+}
+
+/// `stat_on_disk` answers for a path as `stat` does, through the spelling on disk: an entry spelled
+/// otherwise is found and stat'ed, and a gone one reads `NotFound` at its key's spelling.
+#[test]
+fn stat_on_disk_reads_the_entry_under_its_spelling() {
+	let dir = tempfile::tempdir().unwrap();
+	fs::create_dir(dir.path().join(NFD)).unwrap();
+	fs::write(dir.path().join(NFD).join("f.txt"), b"abc").unwrap();
+	let mut listings = Listings::default();
+	let (path, stat) = stat_on_disk(dir.path(), &format!("{NFC}/f.txt"), &mut listings);
+	assert_eq!(stat.unwrap().len(), 3);
+	assert_eq!(fs::read(&path).unwrap(), b"abc");
+	let gone = format!("{NFC}/g\u{e9}.txt");
+	let (path, stat) = stat_on_disk(dir.path(), &gone, &mut listings);
+	assert_eq!(stat.unwrap_err().kind(), ErrorKind::NotFound);
+	#[cfg(not(target_vendor = "apple"))]
+	assert_eq!(path, dir.path().join(NFD).join("g\u{e9}.txt"));
+	#[cfg(target_vendor = "apple")]
+	assert_eq!(path, joined(dir.path(), &gone));
 }

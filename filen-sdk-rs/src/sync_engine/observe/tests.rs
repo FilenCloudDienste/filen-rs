@@ -466,6 +466,7 @@ fn an_ancestor_replaced_by_a_file_leaves_the_observation_incomplete_and_unreport
 		&mut IgnoreRules::default(),
 		&RuleFiles::Read,
 		&mut walked,
+		&mut names::Listings::default(),
 		&mut out,
 	);
 

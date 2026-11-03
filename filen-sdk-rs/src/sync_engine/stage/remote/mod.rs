@@ -89,7 +89,8 @@ CREATE TABLE remote (
 	lineage BLOB,
 	hash BLOB,
 	size INTEGER NOT NULL,
-	modified INTEGER NOT NULL
+	modified INTEGER NOT NULL,
+	spelling TEXT
 );
 CREATE INDEX remote_dirs ON remote (path) WHERE kind = 1;
 ";
@@ -105,6 +106,14 @@ const CHILDREN: &str = "SELECT rowid, uuid, parent, dir, name, lineage, hash, si
 /// Every row, for the rows the walk did not place.
 const EVERY_RAW: &str = "SELECT rowid, uuid, parent, dir, name, lineage, hash, size, modified,
 	 spelling FROM remote_raw ORDER BY rowid";
+/// [`REMOTE`]'s insert as the walk places a node: with the remote's spelling of its name, where
+/// that is not NFC, which nothing but [`OCCUPANT_SPELLING`] reads.
+const WALK_INSERT: &str =
+	"INSERT INTO remote (path, kind, uuid, lineage, hash, size, modified, spelling)
+	 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) ON CONFLICT DO NOTHING";
+/// How the remote spells the name of the node at `?1`, where that is not NFC: asked only when a
+/// second item arrives at the path.
+const OCCUPANT_SPELLING: &str = "SELECT spelling FROM remote WHERE path = ?1";
 /// Built only where something is left to replay: its chains are climbed by uuid.
 const RAW_BY_UUID: &str = "CREATE INDEX remote_raw_uuid ON remote_raw (uuid)";
 const RAW_DIR: &str = "SELECT name, parent FROM remote_raw WHERE uuid = ?1 AND dir = 1";
@@ -329,7 +338,7 @@ impl RemoteSink {
 			reached: 0,
 			placed: 0,
 			held: BTreeSet::new(),
-			spellings: HashMap::new(),
+			held_spellings: HashMap::new(),
 			twins: BTreeSet::new(),
 			pair_root,
 		};
@@ -414,9 +423,10 @@ struct Walk<'u> {
 	placed: usize,
 	/// The paths two items resolved to, which neither is placed at.
 	held: BTreeSet<String>,
-	/// The remote spelling of the first item placed at each path whose name is not NFC, by path, as
-	/// `ViewBuilder` keeps it.
-	spellings: HashMap<String, String>,
+	/// The remote spelling of the first item at each held path, `None` where it is NFC, as
+	/// `ViewBuilder` keeps it. Read off `remote_raw` when the second item arrives, so nothing is
+	/// kept for a path no two items meet at.
+	held_spellings: HashMap<String, Option<String>>,
 	/// Held paths two differently spelled names resolved to, as `ViewBuilder` records them.
 	twins: BTreeSet<String>,
 	/// Whether the walk is under the drive root, whose account data directory it never places (see
@@ -489,13 +499,24 @@ impl Walk<'_> {
 			modified_millis: item.modified_millis,
 		};
 		let mut placed = false;
+		let mut first = None;
 		self.batch.row(|conn| {
-			placed = write_node(
-				&mut *conn.prepare_cached(REMOTE_SQL.insert)?,
+			placed = conn.prepare_cached(WALK_INSERT)?.execute(params![
 				&node.rel_path,
-				&node,
-			)? == 1;
+				node.kind.as_i64(),
+				node.remote_uuid,
+				node.stable_uuid,
+				hash_bytes(node.content_hash.as_ref()),
+				node.size,
+				node.modified_millis,
+				spelling,
+			])? == 1;
 			if !placed {
+				first = conn
+					.prepare_cached(OCCUPANT_SPELLING)?
+					.query_row([&node.rel_path], |row| row.get(0))
+					.optional()?
+					.flatten();
 				conn.prepare_cached(REMOTE_SQL.forget)?
 					.execute([&node.rel_path])?;
 			}
@@ -503,9 +524,6 @@ impl Walk<'_> {
 		})?;
 		if placed {
 			self.placed += 1;
-			if let Some(spelling) = spelling {
-				self.spellings.insert(node.rel_path.clone(), spelling);
-			}
 		} else {
 			// Two items at one path: the cache mid-transition, or two spellings of one name, as the
 			// builder tells them apart.
@@ -515,6 +533,7 @@ impl Walk<'_> {
 			);
 			self.placed -= 1;
 			self.held.insert(node.rel_path.clone());
+			self.held_spellings.insert(node.rel_path.clone(), first);
 			self.note_spelling(&node.rel_path, spelling);
 		}
 		Ok(node.rel_path)
@@ -523,7 +542,8 @@ impl Walk<'_> {
 	/// `ViewBuilder::note_spelling`: an item spelled `spelling` (`None`: its NFC name) arrived at
 	/// the held `path`, which is a collision where it is spelled unlike the first item placed there.
 	fn note_spelling(&mut self, path: &str, spelling: Option<String>) {
-		if self.spellings.get(path) != spelling.as_ref() && !self.twins.contains(path) {
+		let first = self.held_spellings.get(path).and_then(Option::as_ref);
+		if first != spelling.as_ref() && !self.twins.contains(path) {
 			tracing::debug!(
 				"remote view: {path:?} is two items, whose names differ in Unicode form only"
 			);

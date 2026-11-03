@@ -455,7 +455,7 @@ fn a_link_named_like_a_download_temp_file_is_not_stale() {
 }
 
 #[test]
-fn a_name_the_remote_would_reject_is_reported_once_but_still_observed() {
+fn a_name_the_remote_would_reject_is_recorded_but_still_observed() {
 	let root = temp_root();
 	fs::write(root.join("keep.txt"), b"x").unwrap();
 	// A leading space is refused by the SDK's own name validator, so no upload of either can
@@ -464,6 +464,7 @@ fn a_name_the_remote_would_reject_is_reported_once_but_still_observed() {
 	fs::write(root.join(" notes.txt"), b"rejected").unwrap();
 	fs::create_dir(root.join(" bad")).unwrap();
 	fs::write(root.join(" bad").join("inner.txt"), b"child").unwrap();
+	fs::write(root.join(" bad").join(" nested.txt"), b"nested").unwrap();
 	fs::create_dir_all(root.join(" bad").join("deeper")).unwrap();
 	fs::write(root.join(" bad").join("deeper").join("x.txt"), b"deep").unwrap();
 
@@ -481,6 +482,7 @@ fn a_name_the_remote_would_reject_is_reported_once_but_still_observed() {
 		paths,
 		vec![
 			" bad",
+			" bad/ nested.txt",
 			" bad/deeper",
 			" bad/deeper/x.txt",
 			" bad/inner.txt",
@@ -502,8 +504,8 @@ fn a_name_the_remote_would_reject_is_reported_once_but_still_observed() {
 	let reported: Vec<_> = scan.invalid_names.keys().cloned().collect();
 	assert_eq!(
 		reported,
-		vec![" bad", " notes.txt"],
-		"each rejected name is reported ONCE, not once per descendant"
+		vec![" bad", " bad/ nested.txt", " notes.txt"],
+		"each rejected name is recorded, one under another too, and no valid name under one"
 	);
 	assert!(
 		scan.invalid_names[" bad"].contains("start with a space"),
@@ -2851,7 +2853,8 @@ fn a_walk_reading_entries_on_workers_finds_what_one_reading_them_inline_finds() 
 	assert!(!inline.complete);
 	assert_eq!(
 		inline.invalid_names.keys().collect::<Vec<_>>(),
-		vec!["bad.", "rej."]
+		vec!["bad.", "rej.", "rej./sub/bad."],
+		"a rejected name under another is recorded too"
 	);
 	assert_eq!(
 		inline.aliased_dirs.keys().cloned().collect::<Vec<_>>(),

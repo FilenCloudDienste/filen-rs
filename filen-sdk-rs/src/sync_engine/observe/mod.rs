@@ -193,6 +193,10 @@ struct Renames<'a> {
 	/// The dirty paths a walk may have come from ([`Origins::of`]): found when the first walk asks, and
 	/// kept for the pass.
 	origins: Option<Origins<'a>>,
+	/// The directory listings this observation took to find a dirty path spelled otherwise on disk
+	/// (see [`names::stat_on_disk`]), shared by the pairing and the loop: each directory is listed
+	/// at most once, however many of its entries went.
+	listings: names::Listings,
 }
 
 /// The dirty paths below the pair root, split by whether a walk may be paired with them.
@@ -294,9 +298,9 @@ impl<'a> Renames<'a> {
 			return Source::Refused;
 		}
 		let baseline = self.baseline;
-		let origins = self
-			.origins
-			.get_or_insert_with(|| Origins::of(self.root, baseline, self.dirty));
+		let origins = self.origins.get_or_insert_with(|| {
+			Origins::of(self.root, baseline, self.dirty, &mut self.listings)
+		});
 		// Not `to` itself, and not a path nested in `to` or `to` nested in it: a directory the walk
 		// is inside of or has under it rather than where it came from — a consistent baseline and a
 		// settled disk hold neither, and a pairing across one would splice the wrong paths together.
@@ -390,14 +394,20 @@ impl<'a> Origins<'a> {
 	/// two ends are usually siblings, and a cursor asked about both reads their directory's range for
 	/// the second — up to a page of rows, to learn that the end still on disk is no candidate, which
 	/// the `stat` says for nothing.
-	fn of(root: &Path, baseline: &Baseline, dirty: &BTreeSet<&'a str>) -> Self {
+	fn of(
+		root: &Path,
+		baseline: &Baseline,
+		dirty: &BTreeSet<&'a str>,
+		listings: &mut names::Listings,
+	) -> Self {
 		let mut rows = baseline.cursor();
 		let (gone, others) = dirty
 			.iter()
 			.copied()
 			.filter(|path| !path.is_empty())
 			.partition(|path| {
-				std::fs::metadata(names::on_disk(root, path, Leaf::Existing))
+				names::stat_on_disk(root, path, listings)
+					.1
 					.is_err_and(|error| error.kind() == ErrorKind::NotFound)
 					&& rows.get(path).is_some_and(|row| {
 						row.kind == NodeKind::Dir && row.state == BaselineState::Synced
@@ -490,12 +500,21 @@ pub(super) fn observe_local(
 		baseline,
 		dirty: &dirty,
 		origins: None,
+		listings: names::Listings::default(),
 	};
 	for &path in &dirty {
 		if covered(&out.observed, path) {
 			continue;
 		}
-		match walk_ancestors(root, path, &mut rules, rule_files, &mut walked, &mut out) {
+		match walk_ancestors(
+			root,
+			path,
+			&mut rules,
+			rule_files,
+			&mut walked,
+			&mut renames.listings,
+			&mut out,
+		) {
 			Ancestors::Walked => {}
 			Ancestors::Gone(at) => {
 				within_cap(baseline, &dirty, at)?;
@@ -513,14 +532,13 @@ pub(super) fn observe_local(
 			Ancestors::Unreadable => continue,
 		}
 
-		let path_buf = if path.is_empty() {
-			root.to_path_buf()
-		} else {
-			names::on_disk(root, path, Leaf::Existing)
-		};
 		// Follows symlinks, so an entry is classified by its target — the walk classifies it the
 		// same way.
-		let stat = std::fs::metadata(&path_buf);
+		let (path_buf, stat) = if path.is_empty() {
+			(root.to_path_buf(), std::fs::metadata(root))
+		} else {
+			names::stat_on_disk(root, path, &mut renames.listings)
+		};
 		// A path that is gone says nothing about which kind it was, and the rules can hide a
 		// directory where they would not hide a file of the same name. The row it had is the best
 		// answer there is; a path with no row and nothing on disk is hidden either way or neither.
@@ -752,14 +770,15 @@ fn walk_ancestors<'p>(
 	rules: &mut IgnoreRules,
 	rule_files: &RuleFiles,
 	walked: &mut BTreeSet<String>,
+	listings: &mut names::Listings,
 	out: &mut LocalObservations,
 ) -> Ancestors<'p> {
 	for ancestor in ancestors(path) {
 		if walked.contains(ancestor) {
 			continue;
 		}
-		let dir_path = names::on_disk(root, ancestor, Leaf::Existing);
-		match std::fs::metadata(&dir_path) {
+		let (dir_path, stat) = names::stat_on_disk(root, ancestor, listings);
+		match stat {
 			Ok(metadata) if metadata.is_dir() => {}
 			// Something that is not a directory standing where one has to be does prove nothing is
 			// under it — but the ancestor itself is PRESENT, so there is no path here to call

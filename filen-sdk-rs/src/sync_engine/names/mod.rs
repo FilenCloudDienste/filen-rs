@@ -10,11 +10,14 @@
 
 use std::{
 	borrow::Cow,
+	collections::HashMap,
 	fmt,
+	fs::Metadata,
+	io::{self, ErrorKind},
 	path::{Path, PathBuf},
 };
 
-use unicode_normalization::UnicodeNormalization;
+use unicode_normalization::{UnicodeNormalization, is_nfc, is_nfd};
 
 /// The longest name, in bytes, every file system the engine writes to on Linux and macOS holds
 /// (`NAME_MAX`). Windows counts UTF-16 code units instead (see [`WINDOWS_MAX_UNITS`]).
@@ -85,14 +88,19 @@ fn posix_rejection(name: &str) -> Option<DeviceRejection> {
 }
 
 /// [`device_rejection`] on Windows: the length, the forbidden characters, a trailing dot or space,
-/// and the device names. Compiled on every host, so its rules are tested everywhere.
+/// and the device names. Compiled on every host, so its rules are tested everywhere. Allocates
+/// nothing: the view asks it of every name it places, and of every directory above one.
 fn windows_rejection(name: &str) -> Option<DeviceRejection> {
-	let units = name.encode_utf16().count();
-	if units > WINDOWS_MAX_UNITS {
-		return Some(DeviceRejection::TooLong {
-			len: units,
-			max: WINDOWS_MAX_UNITS,
-		});
+	// A UTF-16 unit never takes fewer than one UTF-8 byte, so only a name past the limit in bytes
+	// is counted.
+	if name.len() > WINDOWS_MAX_UNITS {
+		let units = name.encode_utf16().count();
+		if units > WINDOWS_MAX_UNITS {
+			return Some(DeviceRejection::TooLong {
+				len: units,
+				max: WINDOWS_MAX_UNITS,
+			});
+		}
 	}
 	if let Some(ch) = name
 		.chars()
@@ -106,6 +114,14 @@ fn windows_rejection(name: &str) -> Option<DeviceRejection> {
 	is_windows_device(name).then_some(DeviceRejection::ReservedName)
 }
 
+/// The names Win32 opens a device for, besides `COM` and `LPT` with a digit.
+const WINDOWS_DEVICES: [&str; 6] = ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"];
+
+/// The digits that make `COM` and `LPT` a device name: 0 to 9 and the superscripts 1 to 3.
+const WINDOWS_PORT_DIGITS: [&str; 13] = [
+	"0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "\u{B9}", "\u{B2}", "\u{B3}",
+];
+
 /// Whether Win32 opens a device for `name`: its part before the first dot, trailing spaces dropped,
 /// is a device name in any case. `CON.txt` and `nul.tar.gz` are devices too, unlike what the name
 /// validator checks; Windows 11 stopped reserving some of these with an extension, and refusing them
@@ -115,24 +131,28 @@ fn is_windows_device(name: &str) -> bool {
 		.split_once('.')
 		.map_or(name, |(stem, _)| stem)
 		.trim_end_matches(' ');
-	let upper = stem.to_ascii_uppercase();
-	match upper.as_str() {
-		"CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$" => true,
-		_ => {
-			let mut chars = upper.chars();
-			let prefix: String = chars.by_ref().take(3).collect();
-			let suffix = chars.as_str();
-			matches!(prefix.as_str(), "COM" | "LPT")
-				&& matches!(
-					suffix,
-					"0" | "1"
-						| "2" | "3" | "4" | "5"
-						| "6" | "7" | "8" | "9"
-						| "\u{B9}" | "\u{B2}"
-						| "\u{B3}"
-				)
-		}
+	// Three to seven bytes: `CON` to `CONOUT$`, and `COM` with a two-byte superscript digit.
+	if !(3..=7).contains(&stem.len()) {
+		return false;
 	}
+	if WINDOWS_DEVICES
+		.iter()
+		.any(|device| stem.eq_ignore_ascii_case(device))
+	{
+		return true;
+	}
+	// `split_at_checked` refuses a cut inside a character, which no ASCII prefix ends in.
+	stem.split_at_checked(3).is_some_and(|(prefix, digit)| {
+		(prefix.eq_ignore_ascii_case("COM") || prefix.eq_ignore_ascii_case("LPT"))
+			&& WINDOWS_PORT_DIGITS.contains(&digit)
+	})
+}
+
+/// Whether the NFC `name` reads the same in another Unicode form: it holds a character with a
+/// canonical decomposition, so its NFD spelling is other bytes. Most names in a script without
+/// accents (CJK, Cyrillic) have no such character, and their NFC and NFD forms are one.
+pub(super) fn has_other_form(name: &str) -> bool {
+	!name.is_ascii() && !is_nfd(name)
 }
 
 /// What [`on_disk`] may do to find a path's last component.
@@ -161,15 +181,85 @@ pub(super) fn joined(root: &Path, rel_path: &str) -> PathBuf {
 ///
 /// Costs nothing on macOS and iOS, whose file systems resolve either Unicode form, nor for an ASCII
 /// path, which has one spelling. Elsewhere a path found as spelled costs one `lstat`; only a miss
-/// looks for another spelling, component by component: the NFC and NFD forms first, then (see
-/// [`Leaf`]) the directory listing, for a spelling neither form is. Two entries of one directory
-/// that normalize alike are a collision the engine never acts on, so a listing that finds more than
-/// one keeps the key's own spelling.
+/// looks for another spelling: under the parent as spelled where that is there, else component by
+/// component, the NFC and NFD forms first, then (see [`Leaf`]) the directory listing, for a
+/// spelling neither form is. Two entries of one directory that normalize alike are a collision the
+/// engine never acts on, so a listing that finds more than one keeps the key's own spelling.
 pub(super) fn on_disk(root: &Path, rel_path: &str, leaf: Leaf) -> PathBuf {
 	if cfg!(target_vendor = "apple") || rel_path.is_ascii() {
 		return joined(root, rel_path);
 	}
 	respelled(root, rel_path, leaf)
+}
+
+/// [`on_disk`] for an entry an observation reads, which may well be gone (a deletion, the old end
+/// of a rename), with what `stat` (following symlinks) says of it.
+///
+/// A path found as spelled costs that one `stat`. A miss is looked up as [`on_disk`] looks up an
+/// existing entry, but a directory is listed at most once per `listings`, however many gone paths
+/// under it are asked about: K deletions from a directory of N entries cost one listing, not K.
+pub(super) fn stat_on_disk(
+	root: &Path,
+	rel_path: &str,
+	listings: &mut Listings,
+) -> (PathBuf, io::Result<Metadata>) {
+	let plain = joined(root, rel_path);
+	let stat = std::fs::metadata(&plain);
+	if cfg!(target_vendor = "apple")
+		|| rel_path.is_ascii()
+		|| !stat
+			.as_ref()
+			.is_err_and(|error| error.kind() == ErrorKind::NotFound)
+	{
+		return (plain, stat);
+	}
+	let found = respelled_missing(root, rel_path, Leaf::Existing, Some(listings));
+	if found == plain {
+		return (plain, stat);
+	}
+	let stat = std::fs::metadata(&found);
+	(found, stat)
+}
+
+/// The directory listings [`stat_on_disk`] took, kept for the observation that asked: by directory,
+/// each entry whose name is not NFC by its NFC key, `None` where two of them share one. An NFC
+/// entry is found by its key's own `lstat`, so a directory of those keeps nothing.
+#[derive(Debug, Default)]
+pub(super) struct Listings {
+	dirs: HashMap<PathBuf, HashMap<String, Option<String>>>,
+}
+
+impl Listings {
+	/// How `dir`'s listing spells `component`, listing it on the first question.
+	fn spelling(&mut self, dir: &Path, component: &str) -> Option<String> {
+		if !self.dirs.contains_key(dir) {
+			self.dirs.insert(dir.to_path_buf(), list_respelled(dir));
+		}
+		self.dirs.get(dir)?.get(component)?.clone()
+	}
+}
+
+/// `dir`'s entries whose name is not NFC, by their NFC key (see [`Listings`]). A directory that
+/// cannot be listed holds none: the same answer an uncached lookup gives it.
+fn list_respelled(dir: &Path) -> HashMap<String, Option<String>> {
+	let mut spelled = HashMap::new();
+	let Ok(entries) = std::fs::read_dir(dir) else {
+		return spelled;
+	};
+	for entry in entries.flatten() {
+		let name = entry.file_name();
+		let Some(name) = name.to_str() else {
+			continue;
+		};
+		if name.is_ascii() || is_nfc(name) {
+			continue;
+		}
+		spelled
+			.entry(name.nfc().collect::<String>())
+			.and_modify(|found: &mut Option<String>| *found = None)
+			.or_insert_with(|| Some(name.to_owned()));
+	}
+	spelled
 }
 
 /// [`on_disk`] past its shortcuts, on every host: the tests run it on macOS too.
@@ -178,11 +268,36 @@ fn respelled(root: &Path, rel_path: &str, leaf: Leaf) -> PathBuf {
 	if exists(&plain) {
 		return plain;
 	}
+	respelled_missing(root, rel_path, leaf, None)
+}
+
+/// [`respelled`] once `rel_path` is known not to be there as spelled. The parent as spelled is
+/// tried first, which is where nearly every entry sits: only the last component is then looked
+/// for. `listings`, where given, keeps the listings taken (see [`Listings`]).
+fn respelled_missing(
+	root: &Path,
+	rel_path: &str,
+	leaf: Leaf,
+	mut listings: Option<&mut Listings>,
+) -> PathBuf {
+	let list_leaf = leaf == Leaf::Existing;
+	if let Some((parent, name)) = rel_path.rsplit_once('/') {
+		let dir = joined(root, parent);
+		if exists(&dir) {
+			let spelling = other_spelling_in(&dir, name, list_leaf, listings);
+			return dir.join(spelling.as_deref().unwrap_or(name));
+		}
+	}
 	let mut path = root.to_path_buf();
 	let mut components = rel_path.split('/').peekable();
 	while let Some(component) = components.next() {
-		let list = leaf == Leaf::Existing || components.peek().is_some();
-		match spelling_in(&path, component, list) {
+		let list = list_leaf || components.peek().is_some();
+		let spelling = if exists(&path.join(component)) {
+			Some(Cow::Borrowed(component))
+		} else {
+			other_spelling_in(&path, component, list, listings.as_deref_mut()).map(Cow::Owned)
+		};
+		match spelling {
 			Some(spelling) => path.push(&*spelling),
 			None => {
 				path.push(component);
@@ -196,11 +311,15 @@ fn respelled(root: &Path, rel_path: &str, leaf: Leaf) -> PathBuf {
 	path
 }
 
-/// How `dir` spells the entry whose key is `component`, or `None` when it holds none.
-fn spelling_in<'c>(dir: &Path, component: &'c str, list: bool) -> Option<Cow<'c, str>> {
-	if exists(&dir.join(component)) {
-		return Some(Cow::Borrowed(component));
-	}
+/// How `dir` spells the entry whose key is `component`, when it holds it under another spelling
+/// than the key's own (which the caller found missing): the NFD form, then, where `list` allows,
+/// the directory listing, through `listings` where given.
+fn other_spelling_in(
+	dir: &Path,
+	component: &str,
+	list: bool,
+	listings: Option<&mut Listings>,
+) -> Option<String> {
 	// An ASCII key is NFC and NFD alike, and [`on_disk`] never asks about an ASCII path: a component
 	// of one under a non-ASCII directory has no other spelling worth a listing.
 	if component.is_ascii() {
@@ -208,10 +327,13 @@ fn spelling_in<'c>(dir: &Path, component: &'c str, list: bool) -> Option<Cow<'c,
 	}
 	let nfd: String = component.nfd().collect();
 	if nfd != component && exists(&dir.join(&nfd)) {
-		return Some(Cow::Owned(nfd));
+		return Some(nfd);
 	}
 	if !list {
 		return None;
+	}
+	if let Some(listings) = listings {
+		return listings.spelling(dir, component);
 	}
 	let entries = std::fs::read_dir(dir).ok()?;
 	let mut found = None;
@@ -227,7 +349,7 @@ fn spelling_in<'c>(dir: &Path, component: &'c str, list: bool) -> Option<Cow<'c,
 			found = Some(name.to_owned());
 		}
 	}
-	found.map(Cow::Owned)
+	found
 }
 
 fn exists(path: &Path) -> bool {

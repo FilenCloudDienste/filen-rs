@@ -595,10 +595,13 @@ impl PassStart {
 /// the remote: the server dedups an upload onto the file it replaces by a hash of the lowercased
 /// name, which does not normalize, so an upload under the NFC key beside a file another client
 /// named in NFD would make a second file instead of a version (see [`respell_remote`]). Only a
-/// non-ASCII name can be spelled two ways, so an ASCII one wants nothing read.
+/// name with another Unicode form can be spelled two ways ([`names::has_other_form`]), so any
+/// other wants nothing read.
 fn respelling_candidate(rel_path: &str, remote: Option<&RemoteNode>) -> Option<Uuid> {
 	remote
-		.filter(|node| node.kind == NodeKind::File && !parent_and_name(rel_path).1.is_ascii())
+		.filter(|node| {
+			node.kind == NodeKind::File && names::has_other_form(parent_and_name(rel_path).1)
+		})
 		.map(|node| node.remote_uuid)
 }
 

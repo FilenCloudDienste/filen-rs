@@ -960,16 +960,21 @@ fn confine_targets_the_directory_as_the_file_system_spells_it() {
 	std::fs::remove_dir_all(&root).ok();
 }
 
-/// An edit's upload reads a respelling only where the name is not ASCII and the path holds a remote
-/// FILE to version.
+/// An edit's upload reads a respelling only where the name has another Unicode form and the path
+/// holds a remote FILE to version.
 #[test]
-fn only_a_non_ascii_files_upload_reads_the_remote_spelling() {
+fn only_a_respellable_files_upload_reads_the_remote_spelling() {
 	let file = remote_node("caf\u{e9}.txt", None);
 	assert_eq!(
 		respelling_candidate("d/caf\u{e9}.txt", Some(&file)),
 		Some(file.remote_uuid)
 	);
 	assert_eq!(respelling_candidate("d/cafe.txt", Some(&file)), None);
+	// Not ASCII, but with one spelling only: nothing to read.
+	assert_eq!(
+		respelling_candidate("d/\u{6771}\u{4eac}.txt", Some(&file)),
+		None
+	);
 	assert_eq!(respelling_candidate("d/caf\u{e9}.txt", None), None);
 	let dir = RemoteNode {
 		kind: NodeKind::Dir,

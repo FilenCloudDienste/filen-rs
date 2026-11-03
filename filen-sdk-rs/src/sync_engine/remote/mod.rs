@@ -36,6 +36,7 @@ use super::{
 	baseline::{NodeKind, SyncedPaths},
 	changes::{FullPassReason, RemoteChange, RemoteDeltaEntry, SUBTREE_CAP, past_cap},
 	ignore::rule_file_dir,
+	names,
 	plan::{self, RemoteNode, is_placeable_name, is_reserved_path, join_path},
 	rows::Baseline,
 	scan::PairRoot,
@@ -267,7 +268,14 @@ impl RemoteObservation {
 			RemoteChange::Upsert(item) => {
 				let parent = self.parent_path(root, baseline, item, ancestry)?;
 				let name = item.name.nfc().collect::<String>();
-				self.place(baseline, item.uuid, &parent, &name, node_of(item))
+				self.place(
+					baseline,
+					item.uuid,
+					&parent,
+					&name,
+					&item.name,
+					node_of(item),
+				)
 			}
 			RemoteChange::Renamed {
 				uuid,
@@ -280,8 +288,8 @@ impl RemoteObservation {
 					node.size = content.size;
 					node.modified_millis = content.modified_millis;
 				}
-				let name = name.nfc().collect::<String>();
-				self.place(baseline, *uuid, &parent, &name, node)
+				let nfc = name.nfc().collect::<String>();
+				self.place(baseline, *uuid, &parent, &nfc, name, node)
 			}
 			RemoteChange::Gone(gone) => {
 				let uuid = gone.uuid();
@@ -362,13 +370,15 @@ impl RemoteObservation {
 		Ok((parent, node_of(item)))
 	}
 
-	/// Put the item at `parent`/`name`, vacating wherever it was.
+	/// Put the item at `parent`/`name`, vacating wherever it was. `spelled` is the name as the
+	/// remote spells it, of which `name` is the NFC form.
 	fn place(
 		&mut self,
 		baseline: &Baseline,
 		uuid: Uuid,
 		parent: &str,
 		name: &str,
+		spelled: &str,
 		mut node: RemoteNode,
 	) -> Result<(), FullPassReason> {
 		if !is_placeable_name(name) {
@@ -406,10 +416,11 @@ impl RemoteObservation {
 			// as the view withholds it, and let the pass run.
 			//
 			// Unless the names can differ in Unicode form: the NFC and NFD spellings of one name
-			// both resolve here and are two items for good, a collision the pass reports. Neither
-			// the delta nor the view keeps the remote's spelling, so a whole read tells the two
-			// apart; an ASCII name has only the one spelling.
-			if !name.is_ascii() {
+			// both resolve here and are two items for good, a collision the pass reports. The view
+			// does not keep the occupant's spelling, so a whole read tells the two apart. Only an
+			// arrival spelled otherwise than NFC, or a name with another form at all, can be such a
+			// twin; any other name has the one spelling, and the path is held as before.
+			if spelled != name || names::has_other_form(name) {
 				return Err(FullPassReason::RemoteUnplaceable);
 			}
 			self.hold(baseline, &path);

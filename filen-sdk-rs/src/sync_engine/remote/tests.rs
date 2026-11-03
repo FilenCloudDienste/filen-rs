@@ -379,6 +379,53 @@ fn a_rename_onto_an_occupied_path_withholds_that_path() {
 /// A rename onto a non-ASCII name another item holds may be the second Unicode spelling of that
 /// name, which the server keeps as a second item for good: neither the delta nor the view keeps the
 /// remote's spelling, so the pass reads the remote whole, where the two are told apart.
+/// A name with one Unicode spelling only (no character in it decomposes) cannot have such a twin:
+/// an arrival on it is a transition, and the path is held as an ASCII one is, with no whole read.
+#[test]
+fn a_rename_onto_an_occupied_name_of_one_spelling_withholds_that_path() {
+	let held = Uuid::from_u128(41);
+	let mover = Uuid::from_u128(42);
+	let name = "\u{6771}\u{4eac}.txt";
+	let (baseline, nodes) = derived([
+		file_node(name, held),
+		file_node("b.txt", mover),
+		file_node("c.txt", Uuid::from_u128(43)),
+	]);
+	let events = [cache_event(
+		Some(1),
+		CacheEventType::File(FileEvent::MetadataChanged {
+			uuid: mover,
+			meta: meta(name),
+		}),
+	)];
+
+	match observed_with(&baseline, nodes, &delta(&events), &[], &mut no_ancestry()) {
+		RemoteObserved::Applied(out) => assert_eq!(listed(&out.held_paths), vec![name]),
+		RemoteObserved::Full(reason) => panic!("a whole read was asked for: {reason:?}"),
+	}
+}
+
+/// An NFC arrival on a name that has another form may still meet its NFD twin already in the view,
+/// whose spelling the view does not keep: that asks for a whole read too.
+#[test]
+fn an_nfc_rename_onto_an_occupied_respellable_path_asks_for_a_whole_read() {
+	let held = Uuid::from_u128(41);
+	let mover = Uuid::from_u128(42);
+	let (baseline, nodes) = derived([file_node("caf\u{e9}.txt", held), file_node("b.txt", mover)]);
+	let events = [cache_event(
+		Some(1),
+		CacheEventType::File(FileEvent::MetadataChanged {
+			uuid: mover,
+			meta: meta("caf\u{e9}.txt"),
+		}),
+	)];
+
+	match observed_with(&baseline, nodes, &delta(&events), &[], &mut no_ancestry()) {
+		RemoteObserved::Full(reason) => assert_eq!(reason, FullPassReason::RemoteUnplaceable),
+		RemoteObserved::Applied(out) => panic!("the path was held instead: {:?}", out.held_paths),
+	}
+}
+
 #[test]
 fn a_rename_onto_an_occupied_non_ascii_path_asks_for_a_whole_read() {
 	let held = Uuid::from_u128(41);

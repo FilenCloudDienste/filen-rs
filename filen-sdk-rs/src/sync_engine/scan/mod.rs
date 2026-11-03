@@ -347,9 +347,11 @@ pub(crate) struct LocalScan {
 	/// are incomplete with no path to name.
 	pub(crate) gaps: ScanGaps,
 	pub(crate) errors: Vec<ScanError>,
-	/// Paths whose NAME the remote would reject, mapped to the validator's own message. Reported
-	/// once at the TOP of a rejected subtree; the engine screens every action for such a path and
-	/// its descendants out of the plan.
+	/// Paths whose NAME the remote would reject, mapped to the validator's own message: every one,
+	/// a rejected name under another included. The engine screens every action for such a path and
+	/// its descendants out of the plan, but not where the remote already holds that very path, and
+	/// reports only the top-most it screens; a rejected name under one the remote holds is screened
+	/// on its own.
 	///
 	/// The nodes themselves stay in `nodes`: this map says "nothing can be pushed here", not "this
 	/// is not on disk". Omitting them would make a rename of a synced item into a rejected name
@@ -509,19 +511,6 @@ fn alias_target(
 pub(super) fn name_rejection(rel_path: &str) -> Option<String> {
 	let name = rel_path.rsplit('/').next()?;
 	ValidatedName::try_from(name).err().map(|e| e.to_string())
-}
-
-/// Whether some ANCESTOR of `rel_path` was already rejected, in which case this entry is part of a
-/// subtree that is already reported and must be skipped silently.
-fn under_invalid_name(invalid: &BTreeMap<String, String>, rel_path: &str) -> bool {
-	let mut path = rel_path;
-	while let Some((parent, _)) = path.rsplit_once('/') {
-		path = parent;
-		if invalid.contains_key(path) {
-			return true;
-		}
-	}
-	false
 }
 
 /// NFC-normalize a relative path's components (case preserved) and `/`-join them. `None` if any
@@ -1247,16 +1236,15 @@ impl<S: ScanSink> Window<'_, S> {
 			}
 		};
 
-		// A name the remote would reject can never be pushed: report it once, at the top of the
-		// subtree, and let the engine screen the whole subtree out of the plan rather than failing
-		// an upload every pass. The node itself is still recorded — the scan reports what is on
+		// A name the remote would reject can never be pushed: record it, and let the engine screen
+		// its subtree out of the plan rather than failing an upload every pass. One under another
+		// rejected name is recorded too: the engine lets a name the remote already holds sync, and
+		// what is under it is screened on its own. The node itself is still recorded — the scan reports what is on
 		// disk, and an entry that exists but is omitted here reads downstream as a local DELETION,
 		// so renaming a synced item into a rejected name would trash its remote copy. The scan also
 		// still COMPLETED: this is a fully observed item that cannot be synced, not evidence the
 		// walk missed anything, so `complete` stays true and the delete guard is unaffected.
-		if !under_invalid_name(&self.invalid_names, &rel_path)
-			&& let Some(reason) = name_rejection(&rel_path)
-		{
+		if let Some(reason) = name_rejection(&rel_path) {
 			self.invalid_names.insert(rel_path.clone(), reason);
 		}
 
