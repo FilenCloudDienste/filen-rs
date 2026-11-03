@@ -1,6 +1,22 @@
+//! [cli-doc] sync-modes
+//! `sync` keeps local directories in sync with directories in your Filen drive. By default it keeps
+//! syncing until you press Ctrl+C: a change on either side is synced shortly after it is made, and
+//! the passes in flight finish before the command ends. With `--once`, it runs one sync pass for
+//! each sync pair and exits when they are done; Ctrl+C then stops it once the passes in flight
+//! have finished.
+//!
+//! Mass deletions held back by the delete guard, and conflicts (a file changed on both sides), are
+//! printed as needing attention. `--approve-mass-deletions` and `--keep-local`, `--keep-remote` or
+//! `--keep-both` settle them in the first pass; with `--once`, one more pass then applies what was
+//! settled before the command exits.
+//!
+//! Sync pairs stay registered in the sync database under the config directory after the run that
+//! set them up. Only one `filen sync` can use that database at a time.
+
 use std::{
 	borrow::Cow,
 	collections::{HashMap, HashSet},
+	io,
 	path::Path,
 	sync::Arc,
 };
@@ -11,25 +27,30 @@ use console::style;
 use filen_sdk_rs::{
 	auth::Client,
 	sync_engine::{
-		BaselineInUse, ConflictResolution, PairId, SyncEngine, SyncEvent, TransferDirection,
-		UnsyncablePath, UnsyncableReason,
+		BaselineInUse, ConflictResolution, ConflictResolved, PairId, PairRecord, SyncEngine,
+		SyncEvent, TransferDirection, UnsyncablePath, UnsyncableReason,
 	},
 };
-use tokio::{select, sync::mpsc};
+use tokio::sync::mpsc;
 
 use crate::{
-	CliConfig, CommandResult, commands::CommandContext, docs::DocElement, interrupt, ui::UI,
+	CliConfig, CommandResult,
+	commands::CommandContext,
+	docs::DocElement,
+	interrupt,
+	ui::{UI, write_stdout_line},
 	util::RemotePath,
 };
 
 mod conflict_resolutions;
+mod once;
 mod sync_pairs;
 
 use conflict_resolutions::ConflictResolutions;
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum SyncCommands {
-	/// Continuously sync one or more sync pairs
+	/// Sync one or more sync pairs, continuously until Ctrl-C or once with --once
 	Sync {
 		/// Pair of local and remote directories to sync.
 		/// Format: `<local>:<remote>` or `<local>:<mode>:<remote>`, where `<mode>` is one of `twoWay`, `localBackup`, `remoteBackup`, `localToRemote`, `remoteToLocal`.
@@ -38,9 +59,13 @@ pub(crate) enum SyncCommands {
 		// todo: better command docs!
 		#[arg(short = 'p', long = "pair")]
 		pairs: Vec<String>,
-		/// Only run a single sync pass and exit.
+		/// Run one sync pass for each sync pair, then exit.
 		#[arg(long)]
 		once: bool,
+		/// Keep syncing until Ctrl-C, which is what `sync` does without --once.
+		/// Kept for compatibility with the TypeScript CLI.
+		#[arg(long, conflicts_with = "once")]
+		continuous: bool,
 		/// Disables the delete guard (applied only on the first sync pass).
 		#[arg(long)]
 		approve_mass_deletions: bool,
@@ -63,7 +88,10 @@ pub(crate) enum SyncCommands {
 }
 
 /// The commands that close the docs' "Transferring Files" section.
-pub(crate) const DOCS: &[DocElement] = &[DocElement::CommandHelp("sync")];
+pub(crate) const DOCS: &[DocElement] = &[
+	DocElement::DocFragment("sync-modes"),
+	DocElement::CommandHelp("sync"),
+];
 
 impl SyncCommands {
 	pub(super) async fn execute(self, ctx: CommandContext<'_>) -> Result<CommandResult> {
@@ -77,13 +105,21 @@ impl SyncCommands {
 			Self::Sync {
 				pairs,
 				once,
+				// the default, which `--once` turns off
+				continuous: _,
 				approve_mass_deletions,
 				keep_local,
 				keep_remote,
 				keep_both,
 			} => {
-				let conflict_resolutions =
-					ConflictResolutions::new(keep_local, keep_remote, keep_both)?;
+				let settle = Settle {
+					approve_mass_deletions,
+					conflict_resolutions: ConflictResolutions::new(
+						keep_local,
+						keep_remote,
+						keep_both,
+					)?,
+				};
 				let client = client.get(ui).await?;
 				sync(
 					config,
@@ -92,8 +128,7 @@ impl SyncCommands {
 					working_path,
 					&pairs,
 					once,
-					approve_mass_deletions,
-					conflict_resolutions,
+					&settle,
 				)
 				.await?;
 			}
@@ -102,18 +137,20 @@ impl SyncCommands {
 	}
 }
 
-// todo: better command documentation
+/// What the flags settle of what the first pass of each pair finds.
+struct Settle {
+	approve_mass_deletions: bool,
+	conflict_resolutions: ConflictResolutions,
+}
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn sync(
+async fn sync(
 	config: &CliConfig,
 	ui: &mut UI,
 	client: Arc<Client>,
 	working_path: &RemotePath,
 	pair_definitions: &Vec<String>,
 	once: bool,
-	approve_mass_deletions: bool,
-	conflict_resolutions: ConflictResolutions,
+	settle: &Settle,
 ) -> Result<()> {
 	let default_pair_definitions = vec![
 		config
@@ -152,181 +189,91 @@ pub(crate) async fn sync(
 			.context("Failed to list sync pairs")?,
 		&pair_ids,
 	)?;
-	// once, before the watches start: labelling an event must not ask the server for anything
+	// once, before the passes start: labelling an event must not ask the server for anything
 	let labels = sync_pairs::pair_labels(&client, &pairs).await;
+	let log = EventLog::new(&labels, settle);
+	if once {
+		once::sync_once(ui, &engine, &pairs, log, settle).await
+	} else {
+		sync_continuously(ui, engine, &pairs, log).await
+	}
+}
+
+/// Watches each of `pairs` until Ctrl-C, printing what their passes do.
+async fn sync_continuously(
+	ui: &mut UI,
+	engine: Arc<SyncEngine>,
+	pairs: &[PairRecord],
+	mut log: EventLog<'_>,
+) -> Result<()> {
+	let (events_tx, mut events_rx) = mpsc::unbounded_channel();
 	// before the watches start, so that Ctrl-C stops every watch that started rather than
 	// dropping them
 	let mut ctrl_c = interrupt::own();
-
-	let (events_tx, mut events_rx) = mpsc::unbounded_channel();
-
-	// start syncing
-	let watches =
-		futures::future::join_all(pairs.iter().filter(|pair| !pair.paused).map(async |pair| {
-			let pair_id = pair.id;
-			let events_tx = events_tx.clone();
-			let watch = if once {
-				engine
-					.sync_once_observed(pair_id, &mut move |event| {
-						let _ = events_tx.send((pair_id, event));
-					})
-					.await
-					// todo: print report
-					.map(|_| None)
-			} else {
-				engine
-					.clone()
-					.watch_observed(
-						pair_id,
-						Box::new(move |event| {
-							let _ = events_tx.send((pair_id, event));
-						}),
-					)
-					.await
-					.map(Some)
-			};
-			(pair_id, watch)
-		}))
-		.await;
+	let watches = pairs.iter().filter(|pair| !pair.paused).map(async |pair| {
+		let pair_id = pair.id;
+		let events_tx = events_tx.clone();
+		let watch = Arc::clone(&engine)
+			.watch_observed(
+				pair_id,
+				Box::new(move |event| {
+					let _ = events_tx.send((pair_id, event));
+				}),
+			)
+			.await;
+		(pair_id, watch)
+	});
+	let watches = futures::future::join_all(watches).await;
 	// each pair that is not synced, named on its own line now and counted in the exit status
 	let mut not_started = Vec::new();
 	// the engine refuses to watch a paused pair, which is no failure of the watch
 	for pair in pairs.iter().filter(|pair| pair.paused) {
-		let label = label_of(&labels, pair.id);
-		ui.print_failure(&format!(
-			"The sync pair {label} is paused, so it is not synced"
-		));
-		not_started.push(label);
+		ui.print_failure(&paused_message(log.label(pair.id)));
+		not_started.push(log.label(pair.id));
 	}
-	let mut started = 0;
 	let mut watch_handles = Vec::new();
 	for (pair_id, watch) in watches {
 		match watch {
-			Ok(watch) => {
-				started += 1;
-				watch_handles.extend(watch);
-			}
+			Ok(watch) => watch_handles.push(watch),
 			Err(e) => {
-				let label = label_of(&labels, pair_id);
+				let label = log.label(pair_id);
 				ui.print_failure(&format!("Failed to watch the sync pair {label}: {e}"));
 				not_started.push(label);
 			}
 		}
 	}
-	if started == 0 {
+	if watch_handles.is_empty() {
 		return Err(UI::failure("None of the sync pairs could be synced"));
 	}
-	let stop_handles = futures::future::join_all(watch_handles.into_iter().map(|h| h.stop())); // won't be called until awaited
 
-	let mut pairs_that_have_had_passes = HashSet::new();
-
+	// receive events and print them, until Ctrl-C
 	let stopped_by_ctrl_c = loop {
-		select! {
+		let (pair_id, event) = tokio::select! {
+			event = events_rx.recv() => match event {
+				Some(event) => event,
+				None => break false,
+			},
 			() = ctrl_c.pressed() => break true,
-			event = events_rx.recv() => {
-				let Some((pair_id, event)) = event else { break false };
-				// receive and print events
-
-				let pair_friendly_name = label_of(&labels, pair_id);
-				let mut print_event = |msg: &str| {
-					ui.print(&format!(
-						"{} {}: {}",
-						style(format!(
-							"[{}]",
-							chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
-						))
-						.dim(),
-						style(format!("[{}]", pair_friendly_name)).bold(),
-						msg,
-					));
-				};
-				print_event(&format_sync_event(&event));
-				let needs_attention_tag = style("[NEEDS ATTENTION]").yellow().bold();
-				let approved_tag = style("[APPROVED]").green().bold();
-
-				// remember whether (and check if) this pair is on its first pass
-				// this way, mass deletion approvals and conflict resolutions are only applied
-				// on the first pass, where we can be sure they were intentional
-				if let SyncEvent::PassCompleted { .. } | SyncEvent::PassFailed { .. } = event {
-					pairs_that_have_had_passes.insert(pair_id);
-				}
-				let is_first_pass = !pairs_that_have_had_passes.contains(&pair_id);
-
-				// if --once is set, stop after all have completed
-				if once && pairs_that_have_had_passes.len() == started {
-					ui.print_success("All pairs synced.");
-					break false;
-				}
-
-				// approve deletions
-				if let SyncEvent::DeletionsHeld {
-					ref count,
-					ref pass_token,
-					..
-				} = event
-				{
-					if is_first_pass && approve_mass_deletions {
-						engine.approve_deletions(pair_id, pass_token).await;
-						print_event(&format!("{} Approved {} deletions", approved_tag, count));
-					} else {
-						print_event(&format!(
-							"{} Held back {} deletions. If you wish to execute them, re-run the command with --approve-mass-deletions",
-							needs_attention_tag, count
-						));
-					}
-				}
-
-				// paths the engine leaves alone, which no other event names
-				if let SyncEvent::PassCompleted { ref report } = event {
-					for notice in unsyncable_notices(&report.unsyncable) {
-						print_event(&format!("{} {}", needs_attention_tag, notice));
-					}
-				}
-
-				// resolve conflicts
-				if let SyncEvent::Conflict { ref rel_path } = event {
-					if is_first_pass && let Some(resolution) = conflict_resolutions.for_path(rel_path) {
-						match engine.resolve_conflict(pair_id, rel_path, resolution).await {
-							Ok(resolved) => {
-								print_event(&format!(
-									"{} Conflict resolved for {rel_path}, {}",
-									approved_tag,
-									match resolution {
-										ConflictResolution::KeepLocal => "kept local version",
-										ConflictResolution::KeepRemote => "kept remote version",
-										ConflictResolution::KeepBoth => "kept both versions",
-									}
-								));
-								if let Some(kept_as) = resolved.kept_as {
-									print_event(&format!(
-										"{} Conflict resolved for {rel_path}, local copy kept as {kept_as}",
-										approved_tag
-									));
-								}
-								if let Some(trashed_path) = resolved.quarantined {
-									print_event(&format!(
-										"{} Conflict resolved for {rel_path}, moved aside to {}",
-										approved_tag,
-										trashed_path.display()
-									));
-								}
-							}
-							// Reported, and the sync carries on: returning the error would end the sync
-							// without stopping its watches.
-							Err(e) => ui.print_failure(&format!(
-								"Failed to resolve the conflict for {rel_path} in the sync pair \
-								 {pair_friendly_name}: {e}"
-							)),
-						}
-					} else {
-						print_event(&format!(
-							"{} Conflict detected. To resolve it, re-run the command with --keep-local/--keep-remote/--keep-both \"{}\"",
-							needs_attention_tag,
-							rel_path,
-						));
-					}
-				}
+		};
+		match log.print(pair_id, &event) {
+			None => {}
+			Some(Settlement::ApproveDeletions { count, pass_token }) => {
+				engine.approve_deletions(pair_id, pass_token).await;
+				log.print_approved(pair_id, &approved_deletions_line(count));
 			}
+			Some(Settlement::ResolveConflict {
+				rel_path,
+				resolution,
+			}) => match engine.resolve_conflict(pair_id, rel_path, resolution).await {
+				Ok(resolved) => {
+					for line in resolved_conflict_lines(rel_path, resolution, resolved) {
+						log.print_approved(pair_id, &line);
+					}
+				}
+				Err(e) => {
+					ui.print_failure(&resolve_failure_message(rel_path, log.label(pair_id), &e))
+				}
+			},
 		}
 	};
 
@@ -335,7 +282,7 @@ pub(crate) async fn sync(
 		ctrl_c.into_stopping(ui)
 	});
 	// waits for each pair's pass in flight, so it finishes and releases the drive lock
-	stop_handles.await;
+	futures::future::join_all(watch_handles.into_iter().map(|watch| watch.stop())).await;
 	if stopped_by_ctrl_c {
 		ui.print_muted("Stopped.");
 	}
@@ -346,6 +293,168 @@ pub(crate) async fn sync(
 		)));
 	}
 	Ok(())
+}
+
+/// Prints the events of a run's pairs, and says which of them the flags settle.
+struct EventLog<'a> {
+	labels: &'a HashMap<PairId, String>,
+	settle: &'a Settle,
+	/// The pairs that have finished a pass. Mass deletion approvals and conflict resolutions are
+	/// only applied on a pair's first pass, where we can be sure they were intentional.
+	passed: HashSet<PairId>,
+}
+
+/// What the flags settle of what a pass found.
+enum Settlement<'e> {
+	ApproveDeletions {
+		count: usize,
+		pass_token: &'e str,
+	},
+	ResolveConflict {
+		rel_path: &'e str,
+		resolution: ConflictResolution,
+	},
+}
+
+impl<'a> EventLog<'a> {
+	fn new(labels: &'a HashMap<PairId, String>, settle: &'a Settle) -> Self {
+		Self {
+			labels,
+			settle,
+			passed: HashSet::new(),
+		}
+	}
+
+	/// The label [`sync_pairs::pair_labels`] gave `pair`. Every pair of the run has one; should
+	/// an event name another, it is named by its id rather than ending the sync.
+	fn label(&self, pair: PairId) -> Cow<'a, str> {
+		match self.labels.get(&pair) {
+			Some(label) => Cow::Borrowed(label),
+			None => Cow::Owned(format!("sync pair {pair}")),
+		}
+	}
+
+	/// Prints `event` of `pair`, with what needs the user's attention, and returns what the flags
+	/// settle of it, which the caller carries out.
+	fn print<'e>(&mut self, pair: PairId, event: &'e SyncEvent) -> Option<Settlement<'e>> {
+		self.print_line(pair, &format_sync_event(event));
+		if let SyncEvent::PassCompleted { .. } | SyncEvent::PassFailed { .. } = event {
+			self.passed.insert(pair);
+		}
+		let is_first_pass = !self.passed.contains(&pair);
+		match event {
+			SyncEvent::DeletionsHeld {
+				count, pass_token, ..
+			} => {
+				if is_first_pass && self.settle.approve_mass_deletions {
+					return Some(Settlement::ApproveDeletions {
+						count: *count,
+						pass_token,
+					});
+				}
+				self.print_needs_attention(
+					pair,
+					&format!(
+						"Held back {count} deletions. If you wish to execute them, re-run the command with --approve-mass-deletions"
+					),
+				);
+			}
+			// paths the engine leaves alone, which no other event names
+			SyncEvent::PassCompleted { report } => {
+				for notice in unsyncable_notices(&report.unsyncable) {
+					self.print_needs_attention(pair, &notice);
+				}
+			}
+			SyncEvent::Conflict { rel_path } => {
+				if is_first_pass
+					&& let Some(resolution) = self.settle.conflict_resolutions.for_path(rel_path)
+				{
+					return Some(Settlement::ResolveConflict {
+						rel_path,
+						resolution,
+					});
+				}
+				self.print_needs_attention(
+					pair,
+					&format!(
+						"Conflict detected. To resolve it, re-run the command with --keep-local/--keep-remote/--keep-both \"{rel_path}\""
+					),
+				);
+			}
+			// every other event says all there is to say in its line
+			_ => {}
+		}
+		None
+	}
+
+	fn print_line(&self, pair: PairId, msg: &str) {
+		write_stdout_line(
+			&mut io::stdout().lock(),
+			&format!(
+				"{} {}: {}",
+				style(format!(
+					"[{}]",
+					chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
+				))
+				.dim(),
+				style(format!("[{}]", self.label(pair))).bold(),
+				msg,
+			),
+		);
+	}
+
+	fn print_needs_attention(&self, pair: PairId, msg: &str) {
+		self.print_line(
+			pair,
+			&format!("{} {}", style("[NEEDS ATTENTION]").yellow().bold(), msg),
+		);
+	}
+
+	fn print_approved(&self, pair: PairId, msg: &str) {
+		self.print_line(
+			pair,
+			&format!("{} {}", style("[APPROVED]").green().bold(), msg),
+		);
+	}
+}
+
+fn approved_deletions_line(count: usize) -> String {
+	format!("Approved {count} deletions")
+}
+
+/// What resolving the conflict at `rel_path` with `resolution` did, `resolved` saying where the
+/// losing local copy went, if anywhere: kept beside the winner, or moved aside into the trash.
+fn resolved_conflict_lines(
+	rel_path: &str,
+	resolution: ConflictResolution,
+	resolved: ConflictResolved,
+) -> Vec<String> {
+	let kept = match resolution {
+		ConflictResolution::KeepLocal => "kept local version",
+		ConflictResolution::KeepRemote => "kept remote version",
+		ConflictResolution::KeepBoth => "kept both versions",
+	};
+	let mut lines = vec![format!("Conflict resolved for {rel_path}, {kept}")];
+	if let Some(kept_as) = resolved.kept_as {
+		lines.push(format!(
+			"Conflict resolved for {rel_path}, local copy kept as {kept_as}"
+		));
+	}
+	if let Some(quarantined) = resolved.quarantined {
+		lines.push(format!(
+			"Conflict resolved for {rel_path}, moved aside to {}",
+			quarantined.display()
+		));
+	}
+	lines
+}
+
+fn resolve_failure_message(rel_path: &str, label: Cow<'_, str>, e: &filen_sdk_rs::Error) -> String {
+	format!("Failed to resolve the conflict for {rel_path} in the sync pair {label}: {e}")
+}
+
+fn paused_message(label: Cow<'_, str>) -> String {
+	format!("The sync pair {label} is paused, so it is not synced")
 }
 
 /// Why the sync engine's database at `db_path` could not be opened, as `error` says.
@@ -361,15 +470,6 @@ fn open_failure(error: &filen_sdk_rs::Error, db_path: &Path) -> String {
 			"Failed to open the sync engine at {}: {error}",
 			db_path.display()
 		)
-	}
-}
-
-/// The label [`sync_pairs::pair_labels`] gave `pair`. Every pair of the run has one; should an
-/// event name another, it is named by its id rather than ending the sync.
-fn label_of(labels: &HashMap<PairId, String>, pair: PairId) -> Cow<'_, str> {
-	match labels.get(&pair) {
-		Some(label) => Cow::Borrowed(label),
-		None => Cow::Owned(format!("sync pair {pair}")),
 	}
 }
 
