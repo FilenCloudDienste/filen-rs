@@ -7,7 +7,7 @@ use std::{
 
 use anyhow::{Context as _, Result};
 use clap::{
-	Arg, Command, CommandFactory as _, Subcommand, ValueHint,
+	Arg, Command, CommandFactory as _, Id, Subcommand, ValueHint,
 	builder::{Resettable, Str},
 };
 use clap_complete::Shell;
@@ -147,11 +147,15 @@ fn completion_script(shell: Shell) -> Result<String> {
 /// `command` without its hidden options and subcommands, recursively, except `-h`/`--help`.
 /// clap_complete's static generators complete every option, hidden or not, and clap has no way to
 /// take an option out of a command, so this builds a copy with what the generators read: the names,
-/// visible aliases and descriptions, the completed options (their conflicts included) and the help
-/// and version settings.
-/// The copy has no argument groups: the derived ones only list their struct's fields, and a group
-/// that names a left-out option would not build.
+/// visible aliases and descriptions, the completed options (their conflicts included), the groups
+/// of only completed options, which those conflicts may name, and the help and version settings.
+/// A group that names a left-out option is left out too, as it would not build.
 fn without_hidden(command: &Command) -> Command {
+	let completed = command
+		.get_arguments()
+		.filter(|arg| is_completed(arg))
+		.collect::<Vec<_>>();
+	let is_kept = |id: &Id| completed.iter().any(|arg| arg.get_id() == id);
 	Command::new(command.get_name().to_owned())
 		.visible_aliases(command.get_visible_aliases().map(str::to_owned))
 		.about(Resettable::from(command.get_about().cloned()))
@@ -164,10 +168,11 @@ fn without_hidden(command: &Command) -> Command {
 		.disable_version_flag(command.is_disable_version_flag_set())
 		.disable_help_subcommand(command.is_disable_help_subcommand_set())
 		.allow_external_subcommands(command.is_allow_external_subcommands_set())
-		.args(
+		.args(completed.iter().map(|arg| (*arg).clone()))
+		.groups(
 			command
-				.get_arguments()
-				.filter(|arg| is_completed(arg))
+				.get_groups()
+				.filter(|group| group.get_args().all(is_kept))
 				.cloned(),
 		)
 		.subcommands(
@@ -295,6 +300,8 @@ pub(crate) fn environment_summary(config_dir: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
+	use clap::ArgGroup;
+
 	use super::*;
 	use crate::ui::test_support::Printed;
 
@@ -408,6 +415,32 @@ mod tests {
 				assert!(script.contains(shown), "{shell}: {shown}");
 			}
 		}
+	}
+
+	#[test]
+	fn an_option_conflicting_with_a_group_is_completed() {
+		let command = Command::new("filen").subcommand(
+			Command::new("public-link")
+				.arg(Arg::new("show").long("show").conflicts_with("settings"))
+				.arg(Arg::new("expires").long("expires"))
+				.arg(Arg::new("secret").long("secret").hide(true))
+				.group(ArgGroup::new("settings").args(["expires"]))
+				.group(ArgGroup::new("with-hidden").args(["expires", "secret"])),
+		);
+
+		let copy = without_hidden(&command);
+		copy.clone().debug_assert();
+
+		let Some(public_link) = copy.find_subcommand("public-link") else {
+			panic!("public-link was left out");
+		};
+		assert_eq!(
+			public_link
+				.get_groups()
+				.map(|group| group.get_id().as_str())
+				.collect::<Vec<_>>(),
+			["settings"]
+		);
 	}
 
 	#[test]
