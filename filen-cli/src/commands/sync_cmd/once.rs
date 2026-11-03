@@ -15,7 +15,7 @@ use super::{
 	outcome::{failed_pass_problems, pass_problems, problems_summary},
 	paused_message, resolve_failure_message, resolved_conflict_lines,
 };
-use crate::{error::CliError, interrupt, ui::UI};
+use crate::{error::CliError, interrupt, memory, ui::UI};
 
 /// What a pair's pass sends to be printed, in the order it happened.
 enum Message {
@@ -135,7 +135,9 @@ async fn pass_pair(
 		let _ = messages.send((pair, message));
 	};
 	let mut observer = |event: SyncEvent| send(Message::Event(Box::new(event)));
-	let report = engine.sync_once_observed(pair, &mut observer).await.ok()?;
+	let report = engine.sync_once_observed(pair, &mut observer).await;
+	tokio::task::spawn_blocking(memory::release_free_memory);
+	let report = report.ok()?;
 	if report.paused {
 		send(Message::Paused);
 		return Some(report);
@@ -145,7 +147,9 @@ async fn pass_pair(
 	{
 		return Some(report);
 	}
-	engine.sync_once_observed(pair, &mut observer).await.ok()
+	let report = engine.sync_once_observed(pair, &mut observer).await;
+	tokio::task::spawn_blocking(memory::release_free_memory);
+	report.ok()
 }
 
 /// Settles what the flags settle of what `report`'s pass found: approves its held deletions and

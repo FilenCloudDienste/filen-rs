@@ -14,7 +14,7 @@ use super::{
 	outcome::{LastPasses, problems_summary},
 	paused_message, resolve_failure_message, resolved_conflict_lines,
 };
-use crate::{interrupt, ui::UI};
+use crate::{interrupt, memory, ui::UI};
 
 /// Watches each of `pairs` until Ctrl-C, printing what their passes do.
 pub(super) async fn sync_continuously(
@@ -171,6 +171,8 @@ fn forward_status(
 			if status.changed().await.is_err() {
 				return;
 			}
+			// The watch publishes its status once a pass has returned and dropped what it held.
+			tokio::task::spawn_blocking(memory::release_free_memory);
 			current = status.borrow_and_update().clone();
 		}
 	});
