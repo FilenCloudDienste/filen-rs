@@ -1,7 +1,8 @@
 //! [cli-doc] public-links
-//! `public-link <path>` shows the public link of a file or directory: its settings and its URL,
-//! the address to share. `list-public-links` lists the path and URL of every linked item (with
-//! `--json`, also each link's `linkUuid`).
+//! `public-link <path>` shows the public link of a file or directory: its settings, when it
+//! expires (UTC) if it does, and its URL, the address to share. `list-public-links` lists the path,
+//! expiry (UTC, or "never") and URL of every linked item (with `--json`, also each link's
+//! `linkUuid`, and its expiry as `expiresAt`, `null` for a link that never expires).
 //!
 //! In a terminal, `public-link` offers to edit or delete an existing link, and asks for a new
 //! link's settings: when it expires, a password, and whether the item can be downloaded. The link
@@ -29,10 +30,11 @@ use crate::{
 	commands::{CommandContext, fs_cmds::full_path},
 	completion::FilenCompleter,
 	docs::DocElement,
-	ui::UI,
+	ui::{UI, format_date},
 	util::RemotePath,
 };
 use anyhow::{Context as _, Result};
+use chrono::{DateTime, SecondsFormat, Utc};
 use clap::{Args, Subcommand, ValueEnum};
 use console::style;
 use filen_sdk_rs::{
@@ -271,6 +273,13 @@ const LINK_URL_UNAVAILABLE: &str = "unavailable (the key could not be decrypted)
 /// Shown in place of a public link's URL when the link was deleted while it was being listed.
 const LINK_REMOVED: &str = "none (the link was removed while listing)";
 
+/// Shown in `list-public-links`' expiry column for a link that never expires.
+const NEVER_EXPIRES: &str = "never";
+
+/// Shown in `list-public-links`' expiry column for a link that was deleted while it was being
+/// listed.
+const NO_EXPIRY: &str = "-";
+
 /// How many items `list-public-links` resolves (path and link status) at once.
 const LINK_STATUS_CONCURRENCY: usize = 8;
 
@@ -286,6 +295,8 @@ struct ListedPublicLink {
 
 struct ListedLinkStatus {
 	link_uuid: String,
+	/// When the link expires, `None` for a link that never expires.
+	expires_at: Option<DateTime<Utc>>,
 	/// `None` when the key in the link could not be decrypted.
 	url: Option<String>,
 }
@@ -330,6 +341,7 @@ async fn listed_dir_link(client: &Client, dir: &RemoteDirectory) -> Result<Liste
 		item_uuid: dir.uuid().to_string(),
 		link: link.map(|link| ListedLinkStatus {
 			link_uuid: link.uuid().to_string(),
+			expires_at: link.expires_at(),
 			url: dir_public_link_url(&link),
 		}),
 	})
@@ -347,6 +359,7 @@ async fn listed_file_link(client: &Client, file: &RemoteFile) -> Result<ListedPu
 		item_uuid: file.uuid().to_string(),
 		link: link.map(|link| ListedLinkStatus {
 			link_uuid: link.uuid().to_string(),
+			expires_at: link.expires_at(),
 			url: file_public_link_url(file, &link),
 		}),
 	})
@@ -360,15 +373,23 @@ async fn item_path(client: &Client, item: &NonRootItemType<'_, Normal>) -> Strin
 		.unwrap_or_else(|| item.uuid().to_string())
 }
 
-/// Prints the linked items, expected sorted by path: a path and URL column, directories in blue,
-/// or with `--json` one array of `{path, type, uuid, linkUuid, url}` objects, where `linkUuid` and
-/// `url` are `null` for a link that is gone and `url` is `null` when its key could not be
-/// decrypted.
+/// Prints the linked items, expected sorted by path: a path, expiry (UTC) and URL column,
+/// directories in blue, or with `--json` one array of `{path, type, uuid, linkUuid, expiresAt,
+/// url}` objects, where `expiresAt` is an RFC 3339 date in UTC, `null` for a link that never
+/// expires, `linkUuid`, `expiresAt` and `url` are `null` for a link that is gone, and `url` is
+/// `null` when its key could not be decrypted. The link's uuid, its expiry and its URL are omitted
+/// while replay testing, since they differ on every run.
 fn print_public_links(ui: &mut UI, links: &[ListedPublicLink]) -> Result<()> {
 	if ui.json {
 		let json = links
 			.iter()
 			.map(|link| {
+				// the form `json!` gives every other date the listings print
+				let expires_at = link
+					.link
+					.as_ref()
+					.and_then(|status| status.expires_at)
+					.map(|date| date.to_rfc3339_opts(SecondsFormat::AutoSi, true));
 				json!({
 					"path": link.path,
 					"type": link.kind.noun(),
@@ -377,6 +398,9 @@ fn print_public_links(ui: &mut UI, links: &[ListedPublicLink]) -> Result<()> {
 						.link
 						.as_ref()
 						.map(|status| ui.omit_for_replay_testing(&status.link_uuid)),
+					"expiresAt": expires_at
+						.as_deref()
+						.map(|date| ui.omit_for_replay_testing(date)),
 					"url": link
 						.link
 						.as_ref()
@@ -391,12 +415,33 @@ fn print_public_links(ui: &mut UI, links: &[ListedPublicLink]) -> Result<()> {
 		ui.print_muted("No public links yet.");
 		return Ok(());
 	}
+	let expiries = links
+		.iter()
+		.map(|link| {
+			link.link
+				.as_ref()
+				.map_or(Cow::Borrowed(NO_EXPIRY), |status| {
+					status
+						.expires_at
+						.as_ref()
+						.map_or(Cow::Borrowed(NEVER_EXPIRES), |date| {
+							let date = format_date(date);
+							Cow::Owned(ui.omit_for_replay_testing(&date).to_owned())
+						})
+				})
+		})
+		.collect::<Vec<_>>();
 	let path_width = links
 		.iter()
 		.map(|link| link.path.width())
 		.max()
 		.unwrap_or(0);
-	for link in links {
+	let expiry_width = expiries
+		.iter()
+		.map(|expiry| expiry.width())
+		.max()
+		.unwrap_or(0);
+	for (link, expiry) in links.iter().zip(&expiries) {
 		// pad before styling, so the ANSI codes don't count towards the column width
 		let padding = " ".repeat(path_width.saturating_sub(link.path.width()));
 		let path = style(link.path.as_str());
@@ -407,7 +452,7 @@ fn print_public_links(ui: &mut UI, links: &[ListedPublicLink]) -> Result<()> {
 		let url = link.link.as_ref().map_or(LINK_REMOVED, |status| {
 			url_or_unavailable(ui, status.url.as_deref())
 		});
-		ui.print(&format!("{path}{padding}  {url}"));
+		ui.print(&format!("{path}{padding}  {expiry:<expiry_width$}  {url}"));
 	}
 	Ok(())
 }
@@ -624,6 +669,7 @@ trait LinkableItem: HasName {
 	async fn remove_link(&self, client: &Client, link: Self::Link) -> Result<(), Error>;
 	fn link_url(&self, link: &Self::Link) -> Option<String>;
 	fn link_uuid(link: &Self::Link) -> String;
+	fn expires_at(link: &Self::Link) -> Option<DateTime<Utc>>;
 	fn current_settings(link: &Self::Link) -> CurrentLinkSettings;
 	fn apply_settings(link: &mut Self::Link, settings: LinkSettings);
 }
@@ -654,6 +700,10 @@ impl LinkableItem for RemoteFile {
 
 	fn link_uuid(link: &FilePublicLink) -> String {
 		link.uuid().to_string()
+	}
+
+	fn expires_at(link: &FilePublicLink) -> Option<DateTime<Utc>> {
+		link.expires_at()
 	}
 
 	fn current_settings(link: &FilePublicLink) -> CurrentLinkSettings {
@@ -703,6 +753,10 @@ impl LinkableItem for RemoteDirectory {
 
 	fn link_uuid(link: &DirPublicLinkRW) -> String {
 		link.uuid().to_string()
+	}
+
+	fn expires_at(link: &DirPublicLinkRW) -> Option<DateTime<Utc>> {
+		link.expires_at()
 	}
 
 	fn current_settings(link: &DirPublicLinkRW) -> CurrentLinkSettings {
@@ -863,6 +917,7 @@ fn print_link_table<I: LinkableItem>(ui: &mut UI, item: &I, link: &I::Link) {
 			kind: I::KIND,
 			name: item.name().unwrap_or_default(),
 			settings: I::current_settings(link),
+			expires_at: I::expires_at(link),
 			link_uuid: &I::link_uuid(link),
 			url: item.link_url(link).as_deref(),
 		},
@@ -874,23 +929,32 @@ struct LinkTable<'a> {
 	kind: PublicLinkKind,
 	name: &'a str,
 	settings: CurrentLinkSettings,
+	/// When the link expires, `None` for a link that never expires.
+	expires_at: Option<DateTime<Utc>>,
 	link_uuid: &'a str,
 	/// `None` when the key in the link could not be decrypted.
 	url: Option<&'a str>,
 }
 
-/// Prints the link table. The link's uuid and URL are omitted while replay testing, since they
-/// differ on every run.
+/// Prints the link table, with when the link expires (UTC) for one that does. The expiry, the
+/// link's uuid and its URL are omitted while replay testing, since they differ on every run.
 fn print_link_rows(ui: &mut UI, table: &LinkTable<'_>) {
 	let url = url_or_unavailable(ui, table.url);
-	ui.print_key_value_table(&[
+	let expires_at = table.expires_at.as_ref().map(format_date);
+	let mut rows = vec![
 		(table.kind.label(), table.name),
 		("Expiration", expiration_label(table.settings.expiration)),
+	];
+	if let Some(expires_at) = &expires_at {
+		rows.push(("Expires At", ui.omit_for_replay_testing(expires_at)));
+	}
+	rows.extend([
 		("Password", yes_no(table.settings.has_password)),
 		("Download Enabled", yes_no(table.settings.downloadable)),
 		("Link UUID", ui.omit_for_replay_testing(table.link_uuid)),
 		("URL", url),
 	]);
+	ui.print_key_value_table(&rows);
 }
 
 /// Whether a link has a password, from the server's hash or one set in this session.
@@ -978,6 +1042,7 @@ fn print_public_link_url(ui: &mut UI, url: Option<&str>) {
 mod tests {
 	use std::borrow::Cow;
 
+	use chrono::TimeZone as _;
 	use filen_types::crypto::LinkHashedPassword;
 
 	use super::*;
@@ -1144,7 +1209,16 @@ mod tests {
 	fn status(url: Option<&str>) -> Option<ListedLinkStatus> {
 		Some(ListedLinkStatus {
 			link_uuid: LINK_UUID.to_owned(),
+			expires_at: None,
 			url: url.map(str::to_owned),
+		})
+	}
+
+	/// The status of a link that expires at 2026-03-09 10:20:30 UTC.
+	fn expiring_status(url: &str) -> Option<ListedLinkStatus> {
+		Some(ListedLinkStatus {
+			expires_at: Some(Utc.with_ymd_and_hms(2026, 3, 9, 10, 20, 30).unwrap()),
+			..status(Some(url)).unwrap()
 		})
 	}
 
@@ -1152,6 +1226,14 @@ mod tests {
 		let printed = Printed::default();
 		let mut ui = printed.ui();
 		ui.json = json;
+		print_public_links(&mut ui, links).unwrap();
+		console::strip_ansi_codes(&printed.lines()).into_owned()
+	}
+
+	fn printed_links_while_replay_testing(json: bool, links: &[ListedPublicLink]) -> String {
+		let printed = Printed::default();
+		let mut ui = printed.ui();
+		ui.initialize(false, json, None, true, true);
 		print_public_links(&mut ui, links).unwrap();
 		console::strip_ansi_codes(&printed.lines()).into_owned()
 	}
@@ -1167,7 +1249,7 @@ mod tests {
 	}
 
 	#[test]
-	fn listed_links_print_their_path_and_url_in_aligned_columns() {
+	fn listed_links_print_their_path_expiry_and_url_in_aligned_columns() {
 		let links = [
 			listed(
 				"/docs",
@@ -1184,11 +1266,79 @@ mod tests {
 		];
 		assert_eq!(
 			printed_links(false, &links),
-			"/docs             https://dir\n\
-			 /docs/report.pdf  https://file\n\
-			 /gone.txt         none (the link was removed while listing)\n\
-			 /locked           unavailable (the key could not be decrypted)"
+			"/docs             never  https://dir\n\
+			 /docs/report.pdf  never  https://file\n\
+			 /gone.txt         -      none (the link was removed while listing)\n\
+			 /locked           never  unavailable (the key could not be decrypted)"
 		);
+	}
+
+	#[test]
+	fn a_listed_link_that_expires_prints_when_in_utc() {
+		let links = [
+			listed(
+				"/docs",
+				PublicLinkKind::Directory,
+				status(Some("https://dir")),
+			),
+			listed("/gone.txt", PublicLinkKind::File, None),
+			listed(
+				"/report.pdf",
+				PublicLinkKind::File,
+				expiring_status("https://file"),
+			),
+		];
+		assert_eq!(
+			printed_links(false, &links),
+			"/docs        never                      https://dir\n\
+			 /gone.txt    -                          none (the link was removed while listing)\n\
+			 /report.pdf  2026-03-09 10:20:30 (UTC)  https://file"
+		);
+	}
+
+	#[test]
+	fn listed_links_omit_the_expiry_while_replay_testing_but_not_never() {
+		let links = [
+			listed(
+				"/docs",
+				PublicLinkKind::Directory,
+				status(Some("https://dir")),
+			),
+			listed(
+				"/report.pdf",
+				PublicLinkKind::File,
+				expiring_status("https://file"),
+			),
+		];
+		assert_eq!(
+			printed_links_while_replay_testing(false, &links),
+			"/docs        never   [omit]\n\
+			 /report.pdf  [omit]  [omit]"
+		);
+	}
+
+	#[test]
+	fn a_listed_link_that_expires_has_an_rfc_3339_expiry_in_json() {
+		let links = [listed(
+			"/report.pdf",
+			PublicLinkKind::File,
+			expiring_status("https://file"),
+		)];
+		let printed: serde_json::Value =
+			serde_json::from_str(&printed_links(true, &links)).unwrap();
+		assert_eq!(printed[0]["expiresAt"], "2026-03-09T10:20:30Z");
+	}
+
+	#[test]
+	fn listed_links_as_json_omit_the_expiry_while_replay_testing() {
+		let links = [listed(
+			"/report.pdf",
+			PublicLinkKind::File,
+			expiring_status("https://file"),
+		)];
+		let printed: serde_json::Value =
+			serde_json::from_str(&printed_links_while_replay_testing(true, &links)).unwrap();
+		assert_eq!(printed[0]["expiresAt"], "[omit]");
 	}
 
 	#[test]
@@ -1212,6 +1362,7 @@ mod tests {
 					"type": "directory",
 					"uuid": "00000000-0000-0000-0000-000000000001",
 					"linkUuid": LINK_UUID,
+					"expiresAt": null,
 					"url": "https://dir",
 				},
 				{
@@ -1219,6 +1370,7 @@ mod tests {
 					"type": "file",
 					"uuid": "00000000-0000-0000-0000-000000000001",
 					"linkUuid": null,
+					"expiresAt": null,
 					"url": null,
 				},
 				{
@@ -1226,6 +1378,7 @@ mod tests {
 					"type": "directory",
 					"uuid": "00000000-0000-0000-0000-000000000001",
 					"linkUuid": LINK_UUID,
+					"expiresAt": null,
 					"url": null,
 				},
 			])
@@ -1286,6 +1439,7 @@ mod tests {
 					has_password: true,
 					downloadable: false,
 				},
+				expires_at: None,
 				link_uuid: LINK_UUID,
 				url: Some("https://file"),
 			},
@@ -1299,6 +1453,40 @@ mod tests {
 				"Download Enabled No",
 				"       Link UUID 0f8fad5b-d9cb-469f-a165-70867728950e",
 				"             URL https://file",
+			]
+			.join("\n")
+		);
+	}
+
+	#[test]
+	fn the_link_table_shows_when_a_link_expires_in_utc() {
+		let printed = Printed::default();
+		let mut ui = printed.ui();
+		print_link_rows(
+			&mut ui,
+			&LinkTable {
+				kind: PublicLinkKind::Directory,
+				name: "docs",
+				settings: CurrentLinkSettings {
+					expiration: PublicLinkExpiration::OneDay,
+					has_password: false,
+					downloadable: true,
+				},
+				expires_at: DateTime::from_timestamp(1_700_000_000, 0),
+				link_uuid: LINK_UUID,
+				url: Some("https://dir"),
+			},
+		);
+		assert_eq!(
+			console::strip_ansi_codes(&printed.lines()),
+			[
+				"       Directory docs",
+				"      Expiration 1 day",
+				"      Expires At 2023-11-14 22:13:20 (UTC)",
+				"        Password No",
+				"Download Enabled Yes",
+				"       Link UUID 0f8fad5b-d9cb-469f-a165-70867728950e",
+				"             URL https://dir",
 			]
 			.join("\n")
 		);

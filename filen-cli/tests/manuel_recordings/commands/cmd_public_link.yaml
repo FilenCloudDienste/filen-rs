@@ -25,6 +25,7 @@
 # ({{ $MANUEL_EMAIL }}) /{{ $MANUEL_REMOTE_CWD }} public-link some_dir                #
 #        Directory some_dir                                                           #
 #       Expiration 1 day                                                              #
+#       Expires At [omit]                                                             #
 #         Password Yes                                                                #
 # Download Enabled Yes                                                                #
 #        Link UUID [omit]                                                             #
@@ -39,6 +40,7 @@
 # ({{ $MANUEL_EMAIL }}) /{{ $MANUEL_REMOTE_CWD }} public-link some_dir                #
 #        Directory some_dir                                                           #
 #       Expiration 1 day                                                              #
+#       Expires At [omit]                                                             #
 #         Password No                                                                 #
 # Download Enabled No                                                                 #
 #        Link UUID [omit]                                                             #
@@ -48,6 +50,7 @@
 # ({{ $MANUEL_EMAIL }}) /{{ $MANUEL_REMOTE_CWD }} public-link some_dir                #
 #        Directory some_dir                                                           #
 #       Expiration 1 day                                                              #
+#       Expires At [omit]                                                             #
 #         Password No                                                                 #
 # Download Enabled No                                                                 #
 #        Link UUID [omit]                                                             #
@@ -65,6 +68,7 @@
 # ({{ $MANUEL_EMAIL }}) /{{ $MANUEL_REMOTE_CWD }} public-link asdf.txt                #
 #             File asdf.txt                                                           #
 #       Expiration 1 hour                                                             #
+#       Expires At [omit]                                                             #
 #         Password Yes                                                                #
 # Download Enabled Yes                                                                #
 #        Link UUID [omit]                                                             #
@@ -79,6 +83,7 @@
 # ({{ $MANUEL_EMAIL }}) /{{ $MANUEL_REMOTE_CWD }} public-link asdf.txt                #
 #             File asdf.txt                                                           #
 #       Expiration 1 hour                                                             #
+#       Expires At [omit]                                                             #
 #         Password Yes                                                                #
 # Download Enabled Yes                                                                #
 #        Link UUID [omit]                                                             #
@@ -503,7 +508,7 @@ recording_items:
 - !Output "\e[?25l\e[48D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m public-link some_dir \e[K\r\e[68C\e[?25h"
 - !Input
   - 13
-- !Output "\e[?25l\e[68D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m \e[38;5;14mpublic-link some_dir\e[39m\e[K\r\n\e[?25h\e[?25h\e[?2004l\e[2m       Directory\e[0m some_dir\r\n\e[2m      Expiration\e[0m 1 day\r\n\e[2m        Password\e[0m Yes\r\n\e[2mDownload Enabled\e[0m Yes\r\n\e[2m       Link UUID\e[0m [omit]\r\n\e[2m             URL\e[0m [omit]\r\n\r\n\e[?2004h\e[?25l\e[38;5;10m?\e[39m This is an existing public link.  \r\n\e[38;5;14m>\e[39m \e[38;5;14mCancel\e[39m\r\n\e[38;5;14m \e[39m Edit\r\n\e[38;5;14m \e[39m Delete\r\n\e[38;5;14m[\e[39m\e[38;5;14m↑↓ to move, enter to select, type to filter\e[39m\e[38;5;14m]\e[39m\r\e[4A\e[35C\e[?25h"
+- !Output "\e[?25l\e[68D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m \e[38;5;14mpublic-link some_dir\e[39m\e[K\r\n\e[?25h\e[?25h\e[?2004l\e[2m       Directory\e[0m some_dir\r\n\e[2m      Expiration\e[0m 1 day\r\n\e[2m      Expires At\e[0m [omit]\r\n\e[2m        Password\e[0m Yes\r\n\e[2mDownload Enabled\e[0m Yes\r\n\e[2m       Link UUID\e[0m [omit]\r\n\e[2m             URL\e[0m [omit]\r\n\r\n\e[?2004h\e[?25l\e[38;5;10m?\e[39m This is an existing public link.  \r\n\e[38;5;14m>\e[39m \e[38;5;14mCancel\e[39m\r\n\e[38;5;14m \e[39m Edit\r\n\e[38;5;14m \e[39m Delete\r\n\e[38;5;14m[\e[39m\e[38;5;14m↑↓ to move, enter to select, type to filter\e[39m\e[38;5;14m]\e[39m\r\e[4A\e[35C\e[?25h"
 - !Input
   - 27
   - 91
@@ -534,7 +539,7 @@ recording_items:
 - !Output "\e[?25l\e[48D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m public-link some_dir \e[K\r\e[68C\e[?25h"
 - !Input
   - 13
-- !Output "\e[?25l\e[68D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m \e[38;5;14mpublic-link some_dir\e[39m\e[K\r\n\e[?25h\e[?25h\e[?2004l\e[2m       Directory\e[0m some_dir\r\n\e[2m      Expiration\e[0m 1 day\r\n\e[2m        Password\e[0m No\r\n\e[2mDownload Enabled\e[0m No\r\n\e[2m       Link UUID\e[0m [omit]\r\n\e[2m             URL\e[0m [omit]\r\n\r\n\e[?2004h\e[?25l\e[38;5;10m?\e[39m This is an existing public link.  \r\n\e[38;5;14m>\e[39m \e[38;5;14mCancel\e[39m\r\n\e[38;5;14m \e[39m Edit\r\n\e[38;5;14m \e[39m Delete\r\n\e[38;5;14m[\e[39m\e[38;5;14m↑↓ to move, enter to select, type to filter\e[39m\e[38;5;14m]\e[39m\r\e[4A\e[35C\e[?25h"
+- !Output "\e[?25l\e[68D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m \e[38;5;14mpublic-link some_dir\e[39m\e[K\r\n\e[?25h\e[?25h\e[?2004l\e[2m       Directory\e[0m some_dir\r\n\e[2m      Expiration\e[0m 1 day\r\n\e[2m      Expires At\e[0m [omit]\r\n\e[2m        Password\e[0m No\r\n\e[2mDownload Enabled\e[0m No\r\n\e[2m       Link UUID\e[0m [omit]\r\n\e[2m             URL\e[0m [omit]\r\n\r\n\e[?2004h\e[?25l\e[38;5;10m?\e[39m This is an existing public link.  \r\n\e[38;5;14m>\e[39m \e[38;5;14mCancel\e[39m\r\n\e[38;5;14m \e[39m Edit\r\n\e[38;5;14m \e[39m Delete\r\n\e[38;5;14m[\e[39m\e[38;5;14m↑↓ to move, enter to select, type to filter\e[39m\e[38;5;14m]\e[39m\r\e[4A\e[35C\e[?25h"
 - !Input
   - 13
 - !Output "\e[?25l\e[35D\e[38;5;10m>\e[39m This is an existing public link. \e[38;5;14mCancel\e[39m\e[K\r\n\e[2K\r\n\e[2K\r\n\e[2K\r\n\e[2K\r\n\e[?25h\e[4A\e[?25h\e[?2004l\e[?2004h\e[?25l\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m  \r\e[48C\e[?25h"
@@ -545,7 +550,7 @@ recording_items:
 - !Output "\e[?25l\e[48D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m public-link some_dir \e[K\r\e[68C\e[?25h"
 - !Input
   - 13
-- !Output "\e[?25l\e[68D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m \e[38;5;14mpublic-link some_dir\e[39m\e[K\r\n\e[?25h\e[?25h\e[?2004l\e[2m       Directory\e[0m some_dir\r\n\e[2m      Expiration\e[0m 1 day\r\n\e[2m        Password\e[0m No\r\n\e[2mDownload Enabled\e[0m No\r\n\e[2m       Link UUID\e[0m [omit]\r\n\e[2m             URL\e[0m [omit]\r\n\r\n\e[?2004h\e[?25l\e[38;5;10m?\e[39m This is an existing public link.  \r\n\e[38;5;14m>\e[39m \e[38;5;14mCancel\e[39m\r\n\e[38;5;14m \e[39m Edit\r\n\e[38;5;14m \e[39m Delete\r\n\e[38;5;14m[\e[39m\e[38;5;14m↑↓ to move, enter to select, type to filter\e[39m\e[38;5;14m]\e[39m\r\e[4A\e[35C\e[?25h"
+- !Output "\e[?25l\e[68D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m \e[38;5;14mpublic-link some_dir\e[39m\e[K\r\n\e[?25h\e[?25h\e[?2004l\e[2m       Directory\e[0m some_dir\r\n\e[2m      Expiration\e[0m 1 day\r\n\e[2m      Expires At\e[0m [omit]\r\n\e[2m        Password\e[0m No\r\n\e[2mDownload Enabled\e[0m No\r\n\e[2m       Link UUID\e[0m [omit]\r\n\e[2m             URL\e[0m [omit]\r\n\r\n\e[?2004h\e[?25l\e[38;5;10m?\e[39m This is an existing public link.  \r\n\e[38;5;14m>\e[39m \e[38;5;14mCancel\e[39m\r\n\e[38;5;14m \e[39m Edit\r\n\e[38;5;14m \e[39m Delete\r\n\e[38;5;14m[\e[39m\e[38;5;14m↑↓ to move, enter to select, type to filter\e[39m\e[38;5;14m]\e[39m\r\e[4A\e[35C\e[?25h"
 - !Input
   - 27
   - 91
@@ -612,7 +617,7 @@ recording_items:
 - !Output "\e[?25l\e[48D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m public-link asdf.txt \e[K\r\e[68C\e[?25h"
 - !Input
   - 13
-- !Output "\e[?25l\e[68D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m \e[38;5;14mpublic-link asdf.txt\e[39m\e[K\r\n\e[?25h\e[?25h\e[?2004l\e[2m            File\e[0m asdf.txt\r\n\e[2m      Expiration\e[0m 1 hour\r\n\e[2m        Password\e[0m Yes\r\n\e[2mDownload Enabled\e[0m Yes\r\n\e[2m       Link UUID\e[0m [omit]\r\n\e[2m             URL\e[0m [omit]\r\n\r\n\e[?2004h\e[?25l\e[38;5;10m?\e[39m This is an existing public link.  \r\n\e[38;5;14m>\e[39m \e[38;5;14mCancel\e[39m\r\n\e[38;5;14m \e[39m Edit\r\n\e[38;5;14m \e[39m Delete\r\n\e[38;5;14m[\e[39m\e[38;5;14m↑↓ to move, enter to select, type to filter\e[39m\e[38;5;14m]\e[39m\r\e[4A\e[35C\e[?25h"
+- !Output "\e[?25l\e[68D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m \e[38;5;14mpublic-link asdf.txt\e[39m\e[K\r\n\e[?25h\e[?25h\e[?2004l\e[2m            File\e[0m asdf.txt\r\n\e[2m      Expiration\e[0m 1 hour\r\n\e[2m      Expires At\e[0m [omit]\r\n\e[2m        Password\e[0m Yes\r\n\e[2mDownload Enabled\e[0m Yes\r\n\e[2m       Link UUID\e[0m [omit]\r\n\e[2m             URL\e[0m [omit]\r\n\r\n\e[?2004h\e[?25l\e[38;5;10m?\e[39m This is an existing public link.  \r\n\e[38;5;14m>\e[39m \e[38;5;14mCancel\e[39m\r\n\e[38;5;14m \e[39m Edit\r\n\e[38;5;14m \e[39m Delete\r\n\e[38;5;14m[\e[39m\e[38;5;14m↑↓ to move, enter to select, type to filter\e[39m\e[38;5;14m]\e[39m\r\e[4A\e[35C\e[?25h"
 - !Input
   - 27
   - 91
@@ -649,7 +654,7 @@ recording_items:
 - !Output "\e[?25l\e[48D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m public-link asdf.txt \e[K\r\e[68C\e[?25h"
 - !Input
   - 13
-- !Output "\e[?25l\e[68D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m \e[38;5;14mpublic-link asdf.txt\e[39m\e[K\r\n\e[?25h\e[?25h\e[?2004l\e[2m            File\e[0m asdf.txt\r\n\e[2m      Expiration\e[0m 1 hour\r\n\e[2m        Password\e[0m Yes\r\n\e[2mDownload Enabled\e[0m Yes\r\n\e[2m       Link UUID\e[0m [omit]\r\n\e[2m             URL\e[0m [omit]\r\n\r\n\e[?2004h\e[?25l\e[38;5;10m?\e[39m This is an existing public link.  \r\n\e[38;5;14m>\e[39m \e[38;5;14mCancel\e[39m\r\n\e[38;5;14m \e[39m Edit\r\n\e[38;5;14m \e[39m Delete\r\n\e[38;5;14m[\e[39m\e[38;5;14m↑↓ to move, enter to select, type to filter\e[39m\e[38;5;14m]\e[39m\r\e[4A\e[35C\e[?25h"
+- !Output "\e[?25l\e[68D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m \e[38;5;14mpublic-link asdf.txt\e[39m\e[K\r\n\e[?25h\e[?25h\e[?2004l\e[2m            File\e[0m asdf.txt\r\n\e[2m      Expiration\e[0m 1 hour\r\n\e[2m      Expires At\e[0m [omit]\r\n\e[2m        Password\e[0m Yes\r\n\e[2mDownload Enabled\e[0m Yes\r\n\e[2m       Link UUID\e[0m [omit]\r\n\e[2m             URL\e[0m [omit]\r\n\r\n\e[?2004h\e[?25l\e[38;5;10m?\e[39m This is an existing public link.  \r\n\e[38;5;14m>\e[39m \e[38;5;14mCancel\e[39m\r\n\e[38;5;14m \e[39m Edit\r\n\e[38;5;14m \e[39m Delete\r\n\e[38;5;14m[\e[39m\e[38;5;14m↑↓ to move, enter to select, type to filter\e[39m\e[38;5;14m]\e[39m\r\e[4A\e[35C\e[?25h"
 - !Input
   - 27
   - 91

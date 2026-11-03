@@ -1,6 +1,7 @@
 //! Live tests of `public-link` and `list-public-links`. Each sets links up through the SDK, runs
 //! the CLI on them, and checks the links through the SDK again.
 
+use chrono::{DateTime, Utc};
 use filen_macros::shared_test_runtime;
 use filen_sdk_rs::{
 	auth::Client,
@@ -10,6 +11,7 @@ use filen_sdk_rs::{
 };
 use filen_types::api::v3::dir::link::PublicLinkExpiration;
 use predicates::str::contains;
+use serde_json::{Value, json};
 use test_utils::authenticated_cli_with_args;
 
 /// Where the URLs of public links start.
@@ -27,6 +29,14 @@ fn path_in(test_dir: &RemoteDirectory, name: &str) -> String {
 
 fn stdout_of(assert: &assert_cmd::assert::Assert) -> String {
 	String::from_utf8(assert.get_output().stdout.clone()).unwrap()
+}
+
+/// When a link expires, as the link table prints it, from what the SDK read back.
+fn expiry_as_printed(expires_at: Option<DateTime<Utc>>) -> String {
+	expires_at
+		.expect("a link that expires reports when")
+		.format("%Y-%m-%d %H:%M:%S (UTC)")
+		.to_string()
 }
 
 #[shared_test_runtime]
@@ -61,6 +71,7 @@ async fn public_link_show_and_a_run_without_a_terminal_change_nothing() {
 	for expected in [
 		"shown.txt".to_owned(),
 		"Expiration 3 days".to_owned(),
+		format!("Expires At {}", expiry_as_printed(file_link.expires_at())),
 		"Password Yes".to_owned(),
 		"Download Enabled No".to_owned(),
 		format!("Link UUID {}", file_link.uuid()),
@@ -75,6 +86,7 @@ async fn public_link_show_and_a_run_without_a_terminal_change_nothing() {
 	for expected in [
 		"shown-dir".to_owned(),
 		"Expiration 1 week".to_owned(),
+		format!("Expires At {}", expiry_as_printed(dir_link.expires_at())),
 		"Password No".to_owned(),
 		"Download Enabled Yes".to_owned(),
 		format!("URL {PUBLIC_LINK_BASE_URL}f/{}%23", dir_link.uuid()),
@@ -124,13 +136,19 @@ async fn public_link_show_and_a_run_without_a_terminal_change_nothing() {
 }
 
 #[shared_test_runtime]
-async fn list_public_links_shows_the_path_and_url_of_each_link() {
+async fn list_public_links_shows_the_path_expiry_and_url_of_each_link() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = &resources.client;
 	let test_dir = &resources.dir;
 
 	let file = upload_file(client, test_dir, "listed.txt").await;
-	let file_link = client.public_link_file(&file).await.unwrap();
+	let mut file_link = client.public_link_file(&file).await.unwrap();
+	file_link.set_expiration(PublicLinkExpiration::OneDay);
+	client.update_file_link(&file, &file_link).await.unwrap();
+	let file_link = client.get_file_link_status(&file).await.unwrap().unwrap();
+	let file_expiry = file_link
+		.expires_at()
+		.expect("a link that expires reports when");
 	let dir = client
 		.create_dir(&test_dir.into(), "listed-dir")
 		.await
@@ -147,17 +165,24 @@ async fn list_public_links_shows_the_path_and_url_of_each_link() {
 	let listed = authenticated_cli_with_args!("list-public-links").success();
 	let stdout = stdout_of(&listed);
 	// the account is shared with other tests, so only this test's lines are checked
-	for (path, url) in [(&file_path, &file_url), (&dir_path, &dir_url)] {
+	for (path, expiry, url) in [
+		(&file_path, expiry_as_printed(Some(file_expiry)), &file_url),
+		(&dir_path, "never".to_owned(), &dir_url),
+	] {
 		let line = stdout
 			.lines()
 			.map(|line| console::strip_ansi_codes(line).into_owned())
 			.find(|line| line.starts_with(&format!("{path} ")))
 			.unwrap_or_else(|| panic!("{path} not listed in:\n{stdout}"));
+		assert!(
+			line.contains(&format!(" {expiry} ")),
+			"{expiry} not in {line:?}"
+		);
 		assert!(line.contains(url.as_str()), "{url} not in {line:?}");
 	}
 
 	let listed = authenticated_cli_with_args!("list-public-links", "--json").success();
-	let json: serde_json::Value = serde_json::from_str(&stdout_of(&listed)).unwrap();
+	let json: Value = serde_json::from_str(&stdout_of(&listed)).unwrap();
 	let mut ours = json
 		.as_array()
 		.unwrap()
@@ -173,12 +198,13 @@ async fn list_public_links_shows_the_path_and_url_of_each_link() {
 	let [dir_entry, file_entry] = ours.as_slice() else {
 		panic!("expected this test's two links in {json:#}");
 	};
-	for (entry, path, kind, link_uuid, url) in [
+	for (entry, path, kind, link_uuid, expires_at, url) in [
 		(
 			file_entry,
 			&file_path,
 			"file",
 			file_link.uuid().to_string(),
+			json!(file_expiry),
 			&file_url,
 		),
 		(
@@ -186,12 +212,14 @@ async fn list_public_links_shows_the_path_and_url_of_each_link() {
 			&dir_path,
 			"directory",
 			dir_link.uuid().to_string(),
+			Value::Null,
 			&dir_url,
 		),
 	] {
 		assert_eq!(entry["path"], path.as_str());
 		assert_eq!(entry["type"], kind);
 		assert_eq!(entry["linkUuid"], link_uuid.as_str());
+		assert_eq!(entry["expiresAt"], expires_at);
 		assert!(
 			entry["url"].as_str().unwrap().starts_with(url.as_str()),
 			"{entry}"
