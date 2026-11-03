@@ -26,6 +26,12 @@
 //! stderr is a terminal, a line at its bottom shows what the running transfers have moved, redrawn
 //! in place; `--quiet` leaves it out.
 //!
+//! While it watches, `sync` also says when a sync pair's passes keep failing (and when they work
+//! again), and when it cannot hear about local or remote changes as they happen, which the
+//! periodic full pass then picks up instead. On Linux, a tree with more directories than
+//! `fs.inotify.max_user_watches` allows is one cause. With `--json`, each change of a watch's
+//! health is a `watch_status` object.
+//!
 //! With `--json`, `sync` prints one JSON object per line for each event instead, such as
 //! `{"pair":1,"label":"...","event":"uploaded","path":"a.txt"}`. A transfer's `progress` comes at
 //! most once a second for each sync pair, with the bytes the pass has moved each way so far
@@ -99,7 +105,7 @@ use clap::Subcommand;
 use console::style;
 use filen_sdk_rs::sync_engine::{
 	BaselineInUse, ConflictResolution, ConflictResolved, PairId, PairRecord, SyncEngine, SyncEvent,
-	UnsyncablePath, UnsyncableReason,
+	UnsyncablePath, UnsyncableReason, WatchStatus,
 };
 use log::info;
 
@@ -118,6 +124,7 @@ mod outcome;
 mod status_line;
 mod sync_pairs;
 mod transfers;
+mod watch_status;
 
 use conflict_resolutions::ConflictResolutions;
 use failures::Failures;
@@ -574,6 +581,35 @@ impl<'a> EventLog<'a> {
 			LineKind::Kept,
 			&format!("{} {}", style("[APPROVED]").green().bold(), msg),
 		);
+	}
+
+	/// Says what changed from `last` to `current`, the health of `pair`'s watch: with `--json`,
+	/// the whole status; otherwise a line for each change worth knowing about.
+	fn print_watch_status(
+		&mut self,
+		ui: &mut UI,
+		pair: PairId,
+		last: &WatchStatus,
+		current: &WatchStatus,
+	) {
+		if last == current {
+			return;
+		}
+		if let Output::Json { .. } = self.output {
+			ui.print(&json_events::watch_status_line(
+				pair,
+				&self.label(pair),
+				current,
+			));
+		}
+		for notice in watch_status::notices(last, current, cfg!(target_os = "linux")) {
+			let kind = if notice.failure {
+				LineKind::Failure
+			} else {
+				LineKind::Kept
+			};
+			self.print_line(ui, pair, kind, &notice.text);
+		}
 	}
 
 	/// Prints a failure that is not an event's, such as a conflict that could not be resolved.

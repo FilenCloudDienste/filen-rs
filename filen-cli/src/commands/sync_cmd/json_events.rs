@@ -1,6 +1,6 @@
 //! `sync --json`: one JSON object per line for each event, which a program can read as it comes.
 
-use filen_sdk_rs::sync_engine::{PairId, SyncEvent, TransferDirection};
+use filen_sdk_rs::sync_engine::{PairId, SyncEvent, TransferDirection, WatchState, WatchStatus};
 use serde_json::{Map, Value, json};
 
 use super::{sync_pairs::sync_mode_str, transfers::Transfers};
@@ -20,6 +20,29 @@ pub(super) fn event_line(
 /// A line the flags settled, as one line of JSON.
 pub(super) fn approved_line(pair: PairId, label: &str, message: &str) -> String {
 	line(pair, label, "approved", json!({ "message": message }))
+}
+
+/// The health of `pair`'s watch, as one line of JSON.
+pub(super) fn watch_status_line(pair: PairId, label: &str, status: &WatchStatus) -> String {
+	let state = match status.state {
+		WatchState::Running => "running",
+		WatchState::Paused => "paused",
+		WatchState::Stopped => "stopped",
+		WatchState::PairRemoved => "pair_removed",
+	};
+	line(
+		pair,
+		label,
+		"watch_status",
+		json!({
+			"state": state,
+			"consecutive_failures": status.consecutive_failures,
+			"last_error": status.last_error,
+			"last_error_kind": status.last_error_kind.map(|kind| format!("{kind:?}")),
+			"local_events_degraded": status.local_events_degraded,
+			"remote_events_degraded": status.remote_events_degraded,
+		}),
+	)
 }
 
 /// `{"pair":..,"label":..,"event":..}` with `fields` added.
@@ -146,12 +169,16 @@ fn event_fields(pair: PairId, event: &SyncEvent, transfers: &Transfers) -> (&'st
 
 #[cfg(test)]
 mod tests {
-	use filen_sdk_rs::sync_engine::{
-		SyncEvent, SyncMode, SyncReport, TransferDirection, UnsyncablePath, UnsyncableReason,
+	use filen_sdk_rs::{
+		ErrorKind,
+		sync_engine::{
+			SyncEvent, SyncMode, SyncReport, TransferDirection, UnsyncablePath, UnsyncableReason,
+			WatchState, WatchStatus,
+		},
 	};
 	use serde_json::{Value, json};
 
-	use super::{approved_line, event_line};
+	use super::{approved_line, event_line, watch_status_line};
 	use crate::commands::sync_cmd::transfers::Transfers;
 
 	/// The line `event_line` gives for `event` of pair 7 labelled `L`, after `transfers`.
@@ -159,6 +186,29 @@ mod tests {
 		let line = event_line(7, "L", event, transfers);
 		assert!(!line.contains('\n'), "{line}");
 		serde_json::from_str(&line).unwrap()
+	}
+
+	#[test]
+	fn a_watch_status_is_one_line_with_every_field() {
+		let status = WatchStatus {
+			consecutive_failures: 2,
+			last_error: Some("offline".to_owned()),
+			last_error_kind: Some(ErrorKind::IO),
+			state: WatchState::Running,
+			local_events_degraded: Some("too many watches".to_owned()),
+			remote_events_degraded: None,
+		};
+		let line = watch_status_line(7, "L", &status);
+
+		assert!(!line.contains('\n'), "{line}");
+		assert_eq!(
+			serde_json::from_str::<Value>(&line).unwrap(),
+			json!({
+				"pair": 7, "label": "L", "event": "watch_status", "state": "running",
+				"consecutive_failures": 2, "last_error": "offline", "last_error_kind": "IO",
+				"local_events_degraded": "too many watches", "remote_events_degraded": null,
+			})
+		);
 	}
 
 	#[test]

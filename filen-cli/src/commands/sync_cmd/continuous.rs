@@ -3,9 +3,11 @@
 use std::{collections::HashMap, pin, sync::Arc};
 
 use anyhow::Result;
-use filen_sdk_rs::sync_engine::{PairId, PairRecord, SyncEngine, SyncEvent, WatchHandle};
+use filen_sdk_rs::sync_engine::{
+	PairId, PairRecord, SyncEngine, SyncEvent, WatchHandle, WatchStatus,
+};
 use log::warn;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use super::{
 	EventLog, LineKind, Settlement, approved_deletions_line,
@@ -32,15 +34,13 @@ pub(super) async fn sync_continuously(
 			.watch_observed(
 				pair_id,
 				Box::new(move |event| {
-					let _ = events_tx.send((pair_id, event));
+					let _ = events_tx.send((pair_id, Update::Event(event)));
 				}),
 			)
 			.await;
 		(pair_id, watch)
 	});
 	let watches = futures::future::join_all(watches).await;
-	// the senders are the watches' now, so the channel closes once every watch has ended
-	drop(events_tx);
 	// each pair that is not synced, named on its own line now and counted in the exit status
 	let mut not_started = HashMap::new();
 	// the engine refuses to watch a paused pair, which is no failure of the watch
@@ -51,7 +51,10 @@ pub(super) async fn sync_continuously(
 	let mut watch_handles = Vec::new();
 	for (pair_id, watch) in watches {
 		match watch {
-			Ok(watch) => watch_handles.push(watch),
+			Ok(watch) => {
+				forward_status(pair_id, watch.status(), events_tx.clone());
+				watch_handles.push(watch);
+			}
 			Err(e) => {
 				let label = log.label(pair_id);
 				ui.print_failure(&format!("Failed to watch the sync pair {label}: {e}"));
@@ -59,6 +62,9 @@ pub(super) async fn sync_continuously(
 			}
 		}
 	}
+	// the senders are the watches' and their statuses' now, so the channel closes once every watch
+	// has ended
+	drop(events_tx);
 	if watch_handles.is_empty() {
 		return Err(UI::failure("None of the sync pairs could be synced"));
 	}
@@ -68,17 +74,18 @@ pub(super) async fn sync_continuously(
 		engine: &engine,
 		log,
 		last_passes: LastPasses::default(),
+		statuses: HashMap::new(),
 		stopping: false,
 	};
 	let stopped_by_ctrl_c = loop {
-		let (pair_id, event) = tokio::select! {
-			event = events_rx.recv() => match event {
-				Some(event) => event,
+		let (pair_id, update) = tokio::select! {
+			update = events_rx.recv() => match update {
+				Some(update) => update,
 				None => break false,
 			},
 			() = ctrl_c.pressed() => break true,
 		};
-		watching.process(ui, pair_id, &event).await;
+		watching.process(ui, pair_id, update).await;
 	};
 
 	watching.log.clear_status();
@@ -96,14 +103,14 @@ pub(super) async fn sync_continuously(
 	loop {
 		tokio::select! {
 			_ = &mut stopped => break,
-			Some((pair_id, event)) = events_rx.recv() => {
-				watching.process(ui, pair_id, &event).await;
+			Some((pair_id, update)) = events_rx.recv() => {
+				watching.process(ui, pair_id, update).await;
 			}
 		}
 	}
 	// what the last of them sent just before it ended
-	while let Ok((pair_id, event)) = events_rx.try_recv() {
-		watching.process(ui, pair_id, &event).await;
+	while let Ok((pair_id, update)) = events_rx.try_recv() {
+		watching.process(ui, pair_id, update).await;
 	}
 	let Watching {
 		mut log,
@@ -136,19 +143,66 @@ pub(super) async fn sync_continuously(
 const APPLIED_LATER_LINE: &str = "The resolution is applied by the next pass, which the next \
 	change or the periodic full pass starts";
 
+/// What a watch sends to be shown, in the order it happened.
+// Nearly every update is an event, which the engine hands over by value; boxing each of them to
+// shrink the rare status is the worse trade.
+#[allow(clippy::large_enum_variant)]
+enum Update {
+	Event(SyncEvent),
+	/// The watch's health, which it publishes after every pass.
+	Status(WatchStatus),
+}
+
+/// Sends each status of `pair`'s watch that `status` receives, starting with the one it holds, to
+/// `updates`, until the watch has ended.
+fn forward_status(
+	pair: PairId,
+	mut status: watch::Receiver<WatchStatus>,
+	updates: mpsc::UnboundedSender<(PairId, Update)>,
+) {
+	tokio::spawn(async move {
+		// The one the watch started with: it may have lost a change source before its first pass.
+		// Each is cloned out of the channel, which keeps the latest for the watch to replace.
+		let mut current = status.borrow_and_update().clone();
+		loop {
+			if updates.send((pair, Update::Status(current))).is_err() {
+				return;
+			}
+			if status.changed().await.is_err() {
+				return;
+			}
+			current = status.borrow_and_update().clone();
+		}
+	});
+}
+
 /// What the watches' events are shown and carried out with.
 struct Watching<'a, 'l> {
 	engine: &'a SyncEngine,
 	log: EventLog<'l>,
 	/// What the last pass of each pair left, for the exit status.
 	last_passes: LastPasses,
+	/// The health of each pair's watch as last shown.
+	statuses: HashMap<PairId, WatchStatus>,
 	/// Whether the sync is stopping, so that the flags settle nothing more.
 	stopping: bool,
 }
 
 impl Watching<'_, '_> {
+	/// Shows `update` of `pair`, and carries out what the flags settle of an event.
+	async fn process(&mut self, ui: &mut UI, pair: PairId, update: Update) {
+		match update {
+			Update::Event(event) => self.process_event(ui, pair, &event).await,
+			Update::Status(current) => {
+				let last = self.statuses.entry(pair).or_default();
+				self.log.print_watch_status(ui, pair, last, &current);
+				*last = current;
+			}
+		}
+	}
+
 	/// Prints `event` of `pair`, and carries out what the flags settle of it.
-	async fn process(&mut self, ui: &mut UI, pair: PairId, event: &SyncEvent) {
+	async fn process_event(&mut self, ui: &mut UI, pair: PairId, event: &SyncEvent) {
 		self.last_passes.note(pair, event);
 		let settlement = self.log.print(ui, pair, event);
 		if self.stopping {
