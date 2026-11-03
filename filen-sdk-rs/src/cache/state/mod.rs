@@ -254,29 +254,42 @@ pub(crate) struct CacheState {
 	/// via their own connection and never send here. `None` once every sender is gone (the arm
 	/// disables itself, like the engine's ping arm) and in unit-test construction.
 	read_tasks: Option<UnboundedReceiver<ReadTask>>,
-	/// Progress of the ONE startup gap-check, which is deferred until the socket subscribes (see
-	/// [`run`](Self::run)). It lives on the state — not as a `run` local — because ANY drain can
-	/// observe the releasing `Connected`, including the one inside `run_resync`'s lock-wait, which
-	/// discards its drain signal; a local there would drop the release and strand the check.
-	startup_gap_check: StartupGapCheck,
+	/// Progress of the gap-check the socket's next subscription owes: the startup one, or a
+	/// reconnect's, both deferred until the socket subscribes (see [`run`](Self::run)). It lives on
+	/// the state — not as a `run` local — because ANY drain can observe the releasing `Connected`,
+	/// including the one inside `run_resync`'s lock-wait; a local there would drop the release and
+	/// strand the check.
+	gap_check: GapCheck,
+	/// Requests to catch up with the server now (see [`CatchUpAck`]), answered between drains.
+	/// `None` once every sender is gone (the arm disables itself, like `read_tasks`) and in
+	/// unit-test construction.
+	catch_ups: Option<UnboundedReceiver<CatchUpAck>>,
 	/// Whether this worker's latest attempt to converge its roots could reach the server, shared
 	/// with the socket callback and with the worker's shared handle state, which a sync pass reads
 	/// it through.
 	reach: Arc<ResyncReach>,
 }
 
-/// The startup gap-check's three states. A gap-check is only sound once the socket is subscribed
-/// (see [`CacheState::run`]), so the boot check WAITS for that signal instead of racing it.
+/// The subscription gap-check's three states. A gap-check is only sound once the socket is
+/// subscribed (see [`CacheState::run`]), so the boot check and a reconnect's WAIT for that signal
+/// instead of racing it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum StartupGapCheck {
-	/// Boot state: waiting for the socket's first live subscription — possibly forever, if the app
-	/// started offline and never connects.
+pub(crate) enum GapCheck {
+	/// Waiting for the socket's next live subscription: the boot state, and the state a disconnect
+	/// (`ResyncSignal`) puts it back in — possibly forever, if the socket never connects. A pass
+	/// that wants the remote current meanwhile asks for it (see [`CatchUpAck`]).
 	AwaitingSubscription,
 	/// The subscription is live and the run loop owes exactly one gap-check.
 	Due,
-	/// Ran. Later `Connected`s are no-ops for it; reconnect healing is `ResyncSignal`'s job.
+	/// Ran, and the socket has stayed subscribed since. Later `Connected`s are no-ops for it.
 	Done,
 }
+
+/// The answer to a request to catch up with the server now (`RemoteEvents::catch_up`): sent once
+/// the worker has run its gap-check, and the resync that check found due, for it. Carries the
+/// transport failure that left the cache unable to reach the server, if one stands (see
+/// [`ResyncReach::unreachable`]).
+pub(crate) type CatchUpAck = tokio::sync::oneshot::Sender<Option<Arc<crate::Error>>>;
 
 #[cfg(test)]
 impl CacheState {
@@ -305,7 +318,8 @@ impl CacheState {
 			resync_retry: None,
 			short_roots: None,
 			read_tasks: None,
-			startup_gap_check: StartupGapCheck::AwaitingSubscription,
+			gap_check: GapCheck::AwaitingSubscription,
+			catch_ups: None,
 			reach: Arc::default(),
 		};
 		state.init_db().unwrap();
@@ -344,7 +358,8 @@ impl CacheState {
 			resync_retry: None,
 			short_roots: None,
 			read_tasks: None,
-			startup_gap_check: StartupGapCheck::AwaitingSubscription,
+			gap_check: GapCheck::AwaitingSubscription,
+			catch_ups: None,
 			reach: Arc::default(),
 		};
 		state.init_db().unwrap();
@@ -381,7 +396,8 @@ impl CacheState {
 			resync_retry: None,
 			short_roots: None,
 			read_tasks: None,
-			startup_gap_check: StartupGapCheck::AwaitingSubscription,
+			gap_check: GapCheck::AwaitingSubscription,
+			catch_ups: None,
 			reach: Arc::default(),
 		};
 		state.init_db().unwrap();
@@ -514,8 +530,10 @@ pub(crate) enum CacheControlMessage {
 fn make_socket_event_callback(
 	events: tokio::sync::mpsc::Sender<CacheThreadEvent>,
 	shed: Arc<AtomicBool>,
+	reach: Arc<ResyncReach>,
 ) -> impl Fn(&DecryptedSocketEvent<'_>) + Send + 'static {
 	move |event| {
+		note_liveness(&reach, event);
 		if let Some(event) = CacheEventMaybeDecrypted::from_decrypted_event(event) {
 			route_thread_event(
 				CacheThreadEvent::Socket(event.into_owned_cow()),
@@ -523,6 +541,20 @@ fn make_socket_event_callback(
 				&shed,
 			);
 		}
+	}
+}
+
+/// Record on `reach` what the socket's own `event` says about the cache's listener: live from an
+/// `authSuccess` (a connection's, or the replay a listener added while connected gets), and not
+/// live from a disconnect, a refused authentication or the listener's removal. Drive events say
+/// nothing about it.
+fn note_liveness(reach: &ResyncReach, event: &DecryptedSocketEvent<'_>) {
+	match event {
+		DecryptedSocketEvent::AuthSuccess => reach.set_live(true),
+		DecryptedSocketEvent::Reconnecting
+		| DecryptedSocketEvent::AuthFailed
+		| DecryptedSocketEvent::Unsubscribed => reach.set_live(false),
+		_ => {}
 	}
 }
 
@@ -579,6 +611,16 @@ async fn recv_read_task(read_tasks: &mut Option<UnboundedReceiver<ReadTask>>) ->
 	}
 }
 
+/// The `None` receiver case is unreachable: the select arm is guarded by `is_some()`.
+async fn recv_catch_up(
+	catch_ups: &mut Option<UnboundedReceiver<CatchUpAck>>,
+) -> Option<CatchUpAck> {
+	match catch_ups {
+		Some(receiver) => receiver.recv().await,
+		None => None,
+	}
+}
+
 /// Body of the read-task `select!` arm, shared by the three select loops (the worker `run` loop and
 /// `run_resync`'s lock-wait + listing loops). A FREE fn over the two fields it touches — not a
 /// `&mut self` method — so it composes with the listing loop, where the `island` future holds a live
@@ -606,6 +648,7 @@ type InitResult = (
 	tokio::sync::mpsc::Sender<CacheThreadEvent>,
 	UnboundedSender<ReadTask>,
 	Arc<ResyncReach>,
+	UnboundedSender<CatchUpAck>,
 );
 
 impl CacheState {
@@ -626,6 +669,7 @@ impl CacheState {
 		let (event_sender, event_receiver) = tokio::sync::mpsc::channel(EVENT_SHED_CAP);
 		let (control_sender, control_receiver) = tokio::sync::mpsc::unbounded_channel();
 		let (read_task_sender, read_task_receiver) = tokio::sync::mpsc::unbounded_channel();
+		let (catch_up_sender, catch_up_receiver) = tokio::sync::mpsc::unbounded_channel();
 		let shed = Arc::new(AtomicBool::new(false));
 
 		let mut cache_state = CacheState {
@@ -648,7 +692,8 @@ impl CacheState {
 			resync_retry: None,
 			short_roots: None,
 			read_tasks: Some(read_task_receiver),
-			startup_gap_check: StartupGapCheck::AwaitingSubscription,
+			gap_check: GapCheck::AwaitingSubscription,
+			catch_ups: Some(catch_up_receiver),
 		};
 		let reach = cache_state.reach.clone();
 
@@ -671,9 +716,10 @@ impl CacheState {
 			)
 		})?;
 
-		// The callback owns the event sender + the shed latch; a clone of `event_sender` is returned for
-		// `SyncRootHandle` to inject Manual events (list_dir_recursive) onto the same channel.
-		let callback = make_socket_event_callback(event_sender.clone(), shed);
+		// The callback owns the event sender + the shed latch, and records the listener's liveness on
+		// `reach`; a clone of `event_sender` is returned for `SyncRootHandle` to inject Manual events
+		// (list_dir_recursive) onto the same channel.
+		let callback = make_socket_event_callback(event_sender.clone(), shed, Arc::clone(&reach));
 
 		Ok((
 			cache_state,
@@ -682,6 +728,7 @@ impl CacheState {
 			event_sender,
 			read_task_sender,
 			reach,
+			catch_up_sender,
 		))
 	}
 
@@ -700,20 +747,20 @@ impl CacheState {
 		// is established has both halves. Running it here puts it CONCURRENTLY with the socket's
 		// first subscription, so a remote change landing in between falls in neither half: the check
 		// is too early to see it and the socket was not yet listening to deliver it, leaving it
-		// unhealed until some later disconnect/hole/registration happens to force a resync.
-		// (`Reconnecting` — the `ResyncSignal` that heals later windows — only fires on the
-		// DISCONNECT of an already-connected manager, so it never covers the first connect.)
+		// unhealed until some later disconnect/hole/registration happens to force a resync. A
+		// disconnect (`ResyncSignal`) defers the check of its window to the next subscription for the
+		// same reason.
 		//
 		// Starting OFFLINE simply leaves the check pending: an eager one could not have reached the
 		// network either, and now connectivity's eventual arrival TRIGGERS the catch-up instead of
 		// silently losing it.
 		self.drain_pending(None);
 		loop {
-			// Deferred startup gap-check, released by the first `Connected`. Checked at the top of
-			// the loop (not in the event arm) so it fires no matter WHICH drain saw the signal —
-			// `run_resync`'s lock-wait drains events too, and discards their drain signal.
-			if self.startup_gap_check == StartupGapCheck::Due {
-				self.startup_gap_check = StartupGapCheck::Done;
+			// Deferred gap-check, released by the subscription after the boot or a disconnect.
+			// Checked at the top of the loop (not in the event arm) so it fires no matter WHICH
+			// drain saw the signal — `run_resync`'s lock-wait drains events too.
+			if self.gap_check == GapCheck::Due {
+				self.gap_check = GapCheck::Done;
 				self.run_gap_check().await;
 			}
 			// `biased` checks arms top-down: control (shutdown) first, then search read tasks
@@ -752,16 +799,16 @@ impl CacheState {
 						self.drain_pending(None); // don't drop buffered events on disconnect
 						return;
 					};
-					let reconnected = self.drain_pending(Some(event));
-					if reconnected {
-						// A reconnect is a SUSPICION of a gap, not an observed hole: cheaply gap-check
-						// (remote drive id vs watermark) and re-list ONLY if the drive actually
-						// advanced — never force a resync on every reconnect. The gate also folds in
-						// `needs_resync`, so any hole the drain itself observed is healed here too.
-						self.run_gap_check().await;
-					} else {
-						// A drain that observed a hole/corrupt row/failed apply set needs_resync; heal it now.
-						self.maybe_run_resync().await;
+					self.drain_pending(Some(event));
+					// A drain that observed a hole/corrupt row/failed apply set needs_resync; heal it
+					// now. (A reconnect's gap-check waits for the subscription, at the loop's top.)
+					self.maybe_run_resync().await;
+				},
+				ack = recv_catch_up(&mut self.catch_ups), if self.catch_ups.is_some() => {
+					match ack {
+						Some(ack) => self.catch_up(ack).await,
+						// Every sender gone: disable the arm, as `handle_read_task` does.
+						None => self.catch_ups = None,
 					}
 				},
 				_ = resync_retry_sleep(self.resync_retry), if self.resync_retry.is_some() => {
@@ -788,8 +835,7 @@ impl CacheState {
 		event: CacheThreadEvent,
 		to_persist: &mut Vec<CacheEvent<'static>>,
 		deferred: &mut Vec<ManualEvent>,
-		reconnected: &mut bool,
-		startup_gap_check: &mut StartupGapCheck,
+		gap_check: &mut GapCheck,
 	) {
 		match event {
 			CacheThreadEvent::Socket(CacheEventMaybeDecrypted::Decrypted(cache_event)) => {
@@ -801,18 +847,18 @@ impl CacheState {
 					event: CacheEventType::NoOp,
 				});
 			}
-			// A reconnect: nothing to persist. The disconnect window may have hidden drive events
-			// the socket won't redeliver, so flag it — the caller runs a cheap gap-check. Setting a
-			// bool (not a counter) collapses a reconnect storm into one check per drain.
+			// A disconnect: nothing to persist. The window it opens may hide drive events the socket
+			// won't redeliver, so the next subscription owes a gap-check of it, read once the socket
+			// is back (see `ResyncSignal`). A state, not a counter: a reconnect storm still owes one.
 			CacheThreadEvent::Socket(CacheEventMaybeDecrypted::ResyncSignal) => {
-				*reconnected = true;
+				*gap_check = GapCheck::AwaitingSubscription;
 			}
-			// The subscription is live. Nothing to persist: it only releases the DEFERRED startup
-			// gap-check, and only the FIRST one does — a later connect (a reconnect's re-auth)
-			// leaves `Done` alone, because reconnect healing is `ResyncSignal`'s job.
+			// The subscription is live. Nothing to persist: it releases the gap-check a boot or a
+			// disconnect left waiting for it, and only that — a connect with nothing owed (a
+			// replayed `authSuccess`) leaves `Done` alone.
 			CacheThreadEvent::Socket(CacheEventMaybeDecrypted::Connected) => {
-				if *startup_gap_check == StartupGapCheck::AwaitingSubscription {
-					*startup_gap_check = StartupGapCheck::Due;
+				if *gap_check == GapCheck::AwaitingSubscription {
+					*gap_check = GapCheck::Due;
 				}
 			}
 			CacheThreadEvent::Manual(manual_event) => deferred.push(manual_event),
@@ -822,34 +868,19 @@ impl CacheState {
 	/// Persist the buffered channel into `events`, apply the durable store in order, then apply any
 	/// deferred Manual (legacy `list_dir`) events. `first` is the event that woke the select loop
 	/// (already removed from the channel), or `None` when draining on shutdown/disconnect.
-	/// Returns `true` iff a socket reconnect (`ResyncSignal`) was seen in this burst — the caller then
-	/// runs the cheap [`run_gap_check`](Self::run_gap_check). Multiple reconnects in one drain collapse
-	/// into a single `true` (one check per drain, not per event). A reconnect is NOT recorded durably:
-	/// it is a suspicion, not an observed hole, so it never touches `needs_resync`.
 	///
-	/// A `Connected` in the burst is reported OUT OF BAND, on `self.startup_gap_check`, so that it
-	/// survives the callers that discard this return value (notably `run_resync`'s lock-wait drain).
-	fn drain_pending(&mut self, first: Option<CacheThreadEvent>) -> bool {
+	/// The socket's own signals in the burst — a disconnect (`ResyncSignal`) and a subscription
+	/// (`Connected`) — are recorded on `self.gap_check`, in the order they arrived, for the run
+	/// loop's top to act on. A disconnect is NOT recorded durably: it is a suspicion, not an observed
+	/// hole, so it never touches `needs_resync`.
+	fn drain_pending(&mut self, first: Option<CacheThreadEvent>) {
 		let mut deferred = Vec::new();
 		let mut to_persist: Vec<CacheEvent<'static>> = Vec::new();
-		let mut reconnected = false;
 		if let Some(event) = first {
-			Self::classify_thread_event(
-				event,
-				&mut to_persist,
-				&mut deferred,
-				&mut reconnected,
-				&mut self.startup_gap_check,
-			);
+			Self::classify_thread_event(event, &mut to_persist, &mut deferred, &mut self.gap_check);
 		}
 		while let Ok(event) = self.event_receiver.try_recv() {
-			Self::classify_thread_event(
-				event,
-				&mut to_persist,
-				&mut deferred,
-				&mut reconnected,
-				&mut self.startup_gap_check,
-			);
+			Self::classify_thread_event(event, &mut to_persist, &mut deferred, &mut self.gap_check);
 		}
 
 		// Persist the WHOLE drained burst in ONE transaction (a single WAL commit/fsync instead of one
@@ -890,12 +921,6 @@ impl CacheState {
 				self.surface_errors(errors);
 			}
 		}
-
-		// A socket reconnect is only a SUSPICION of a disconnect-window gap — the caller runs the
-		// cheap gap-check (remote drive id vs watermark) and re-lists only if the drive advanced.
-		// It is deliberately NOT recorded in the durable `needs_resync` flag (reserved for observed
-		// holes); a crash before the check is covered by the next boot's gap-check.
-		reconnected
 	}
 
 	// TODO: distinguish a Full status channel (keep running) from a Closed one (main thread gone →
@@ -2632,11 +2657,12 @@ impl CacheState {
 
 	/// Cheap gap-check: read the remote drive id and resync ONLY if it advanced past the watermark
 	/// (or a hole is durably flagged), per [`should_resync_for_remote`](Self::should_resync_for_remote).
-	/// Run once per worker life at the socket's FIRST subscription (the deferred startup check — see
-	/// [`run`](Self::run) for why it may not run before it) and on every socket reconnect — a
-	/// reconnect is a *suspicion* of a gap, not a certain hole, so it must never force a resync when
-	/// nothing changed (that is the difference from `needs_resync`, which is reserved for observed
-	/// holes). Falls back to the durable-flag-only check if there is no client (unit tests) or the
+	/// Run at the socket's FIRST subscription (the deferred startup check — see [`run`](Self::run)
+	/// for why it may not run before it), at the subscription after every disconnect, and for a
+	/// pass that asks the cache to catch up while its socket is not live
+	/// ([`catch_up`](Self::catch_up)). Each is a *suspicion* of a gap, not a certain hole, so it
+	/// must never force a resync when nothing changed (that is the difference from `needs_resync`,
+	/// which is reserved for observed holes). Falls back to the durable-flag-only check if there is no client (unit tests) or the
 	/// remote read fails (the live socket will still surface any later hole, and the next boot's
 	/// gap-check is the backstop).
 	async fn run_gap_check(&mut self) {
@@ -2679,6 +2705,33 @@ impl CacheState {
 				self.surface_one(e);
 				self.run_resync_surfacing_errors().await;
 			}
+		}
+	}
+
+	/// Answer `first` and every other request to catch up already queued behind it with ONE
+	/// gap-check: the remote drive id read now, and the resync it finds due, so every sync root
+	/// this worker serves is as current as the server once it returns. What a sync pass that
+	/// reads the remote whole asks for while the socket is not live, as nothing announces what the
+	/// drive did meanwhile (see `RemoteEvents::catch_up`). Several pairs' passes asking at once
+	/// cost one read of the drive id, and a relist only when the drive moved.
+	///
+	/// Each request is answered with the transport failure that left the cache unable to reach the
+	/// server, while one stands; a request whose asker has gone is dropped unanswered.
+	async fn catch_up(&mut self, first: CatchUpAck) {
+		let mut acks = vec![first];
+		if let Some(catch_ups) = &mut self.catch_ups {
+			while let Ok(ack) = catch_ups.try_recv() {
+				acks.push(ack);
+			}
+		}
+		tracing::debug!(
+			"catch-up: {} request(s) for the remote as it stands now",
+			acks.len()
+		);
+		self.run_gap_check().await;
+		let unreachable = self.reach.unreachable();
+		for ack in acks {
+			let _ = ack.send(unreachable.clone());
 		}
 	}
 
@@ -2824,8 +2877,8 @@ impl CacheState {
 					event = self.event_receiver.recv() => match event {
 						// `drain_pending` also drains the rest of the channel and handles its own
 						// errors, so one recv keeps the whole backlog applied during the wait. A
-						// reconnect seen here is subsumed by the resync already in progress, so its
-						// gap-check signal is discarded.
+						// disconnect or subscription seen here is recorded on `gap_check`, for the
+						// run loop to act on after this resync.
 						Some(event) => {
 							self.drain_pending(Some(event));
 						}

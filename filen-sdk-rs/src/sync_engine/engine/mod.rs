@@ -65,8 +65,8 @@ use crate::{
 	Error, ErrorKind,
 	auth::Client,
 	cache::{
-		CacheEvent, CacheEventType, DirEvent, FileEvent, SearchResult, SyncRootCallback,
-		SyncRootHandle,
+		CacheEvent, CacheEventType, DirEvent, FileEvent, RemoteEvents, SearchResult,
+		SyncRootCallback, SyncRootHandle,
 	},
 	fs::{HasParent, HasUUID, categories::DirType},
 	io::client_impl::IoSharedClientExt,
@@ -713,8 +713,8 @@ fn event_uuids(event: &CacheEvent<'_>) -> [Option<Uuid>; 2] {
 
 /// A pair's cache subscription: the handle that keeps it, and whether the cache still holds it.
 pub(super) struct Subscription {
-	/// Kept to be dropped: that unsubscribes the pair.
-	_handle: SyncRootHandle,
+	/// Dropped to unsubscribe the pair; read for how its cache hears of remote changes.
+	handle: SyncRootHandle,
 	/// Alive for as long as the cache holds the subscription's callback, which owns the strong
 	/// end (see [`observation_callback`]). The cache drops the callback when it ends the
 	/// registration on its own — the server deleted the root, which the cache drops from its active
@@ -729,6 +729,11 @@ impl Subscription {
 	/// handle.
 	pub(super) fn live(&self) -> bool {
 		self.registered.strong_count() > 0
+	}
+
+	/// How the cache serving this subscription hears of remote changes.
+	pub(super) fn remote_events(&self) -> RemoteEvents {
+		self.handle.remote_events()
 	}
 }
 
@@ -3439,7 +3444,7 @@ impl SyncEngine {
 				self.roots.lock().await.insert(
 					pair,
 					Subscription {
-						_handle: handle,
+						handle,
 						registered: subscription,
 					},
 				);
@@ -3484,6 +3489,38 @@ impl SyncEngine {
 			.ok_or_else(|| Error::custom(ErrorKind::InvalidState, "unknown sync pair"))?
 			.remote_root;
 		self.subscribe(pair, remote_root).await
+	}
+
+	/// The cache serving `pair`'s subscription, while its socket listener is NOT live: nothing
+	/// announces what the remote does then, so the cache holds the remote only as of its last
+	/// listing. `None` while the listener is live, and for a pair without a live subscription (no
+	/// cache to ask; the pass reads the remote whole as it always does then).
+	async fn unannounced_remote(&self, pair: PairId) -> Option<RemoteEvents> {
+		let roots = self.roots.lock().await;
+		let events = roots
+			.get(&pair)
+			.filter(|subscription| subscription.live())?
+			.remote_events();
+		(!events.live()).then_some(events)
+	}
+
+	/// Have the cache serving `pair` catch up with the server (see [`RemoteEvents::catch_up`]),
+	/// for a pass about to read the remote whole while nothing announces its changes. Fails with
+	/// the transport failure, as a pass that could not reach the server, when the cache could not
+	/// reach it.
+	async fn catch_up_remote(
+		&self,
+		pair: PairId,
+		remote_root: Uuid,
+		events: RemoteEvents,
+	) -> Result<(), Error> {
+		tracing::info!(
+			"sync pair {pair}: the cache's socket is not connected, so no remote change is announced; asking the cache to catch up with the server before this pass reads the remote"
+		);
+		match events.catch_up().await? {
+			None => Ok(()),
+			Some(failure) => Err(remote_unreachable(pair, remote_root, failure)),
+		}
 	}
 
 	/// `pair`'s changelists, created on first use — shared with the pair's cache callback and, while
@@ -6244,7 +6281,9 @@ impl SyncEngine {
 	///
 	/// The pass is forced WHOLE ([`FullPassReason::Requested`]): it reads both sides in full, like
 	/// a safety-net tick, so it also finds what both changelists silently missed. On a large tree
-	/// that is the cost of a full pass, not of the changes since the last one.
+	/// that is the cost of a full pass, not of the changes since the last one. While the cache's
+	/// socket is not connected it also has the cache catch up with the server first, as a
+	/// safety-net pass does, and reports [`FullPassReason::RemoteEventsDegraded`].
 	///
 	/// Without a watch nothing runs: the request is recorded, and the next
 	/// [`sync_once`](Self::sync_once) is that whole pass. Errors if the pair is unknown, being
@@ -6852,6 +6891,55 @@ impl SyncEngine {
 		ran
 	}
 
+	/// For a pass whose `scope` wants the remote as it stands now (see
+	/// [`PassScope::wants_current_remote`]) while the cache serving `pair` hears no remote change:
+	/// have the cache catch up, record on `scope` that the pass reads a remote nothing announced
+	/// ([`FullPassReason::RemoteEventsDegraded`]), and wait again for the remote view, answering the
+	/// generation the cache now holds it at. `Ok(None)` for every other pass, which asks nothing.
+	///
+	/// `Err` is the pass's own end: cancelled (by a pause, or a watch stopped) as a read cut short
+	/// is, or failed — the cache could not reach the server, or the view it relists did not
+	/// converge — with that error.
+	async fn catch_up_for(
+		&self,
+		pair: PairId,
+		scope: &mut PassScope,
+		changes: &PairChanges,
+		gate: &PassGate,
+		observer: &mut (dyn FnMut(SyncEvent) + Send),
+	) -> Result<Option<u64>, Result<SyncReport, Error>> {
+		if !scope.wants_current_remote() {
+			return Ok(None);
+		}
+		let Some(events) = self.unannounced_remote(pair).await else {
+			return Ok(None);
+		};
+		let remote_root = locked(&self.control)
+			.pair(pair)
+			.map_err(|e| Err(db_error(e, "loading the sync pair")))?
+			.ok_or_else(|| Err(Error::custom(ErrorKind::InvalidState, "unknown sync pair")))?
+			.remote_root;
+		let given_up = async {
+			tokio::select! {
+				() = changes.waiting_stopped() => {}
+				() = gate.halted() => {}
+			}
+		};
+		let caught_up = async {
+			self.catch_up_remote(pair, remote_root, events).await?;
+			self.await_remote_view(pair, Some(observer), given_up).await
+		};
+		match gate.guard(caught_up).await {
+			None => Err(cancelled_reading(gate, pair)),
+			Some(Err(_)) if !gate.running() => Err(cancelled_reading(gate, pair)),
+			Some(Err(error)) => Err(Err(error)),
+			Some(Ok(converged)) => {
+				scope.note_remote_events_degraded();
+				Ok(Some(converged))
+			}
+		}
+	}
+
 	/// The pass [`run_pass`](Self::run_pass) found to run, from its first read on, holding `gate`
 	/// and `reading` as that does.
 	async fn run_started_pass(
@@ -6895,6 +6983,22 @@ impl SyncEngine {
 		// in the snapshot this pass is about to read (a harmless duplicate) or not yet, and this
 		// pass has it. What arrives from here on belongs to the next pass (see `changes`).
 		let mut scope = changes.take();
+		// A safety-net or requested pass reads the remote whole to find what no announcement
+		// carried. While the cache's socket is not live NOTHING is announced, and the cache holds
+		// the remote only as of its last listing, so such a pass first has the cache catch up with
+		// the server, then waits for the view that leaves it. Only these two: a change-scoped pass
+		// reads what was announced, and every pass relisting would cost a listing per change.
+		let converged = match self
+			.catch_up_for(pair, &mut scope, &changes, &gate, &mut *observer)
+			.await
+		{
+			Ok(Some(caught_up)) => caught_up,
+			Ok(None) => converged,
+			Err(ended) => {
+				changes.owe_current_remote();
+				return ended;
+			}
+		};
 		let (dirty_local, dirty_remote) = scope.sizes();
 		// What reading both sides costs this pair — measured over the read and nothing else, since
 		// the watch's safety net scales its interval by it (see `SyncReport::read_cost`). The

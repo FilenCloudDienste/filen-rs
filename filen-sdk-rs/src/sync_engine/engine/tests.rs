@@ -11035,7 +11035,7 @@ async fn a_subscription_the_cache_ended_is_asked_for_again() {
 	engine.roots.lock().await.insert(
 		pair,
 		Subscription {
-			_handle: SyncRootHandle::unregistered_for_test(remote_root),
+			handle: SyncRootHandle::unregistered_for_test(remote_root),
 			registered: Weak::new(),
 		},
 	);
@@ -11063,13 +11063,189 @@ async fn a_live_subscription_is_not_asked_for_again() {
 	engine.roots.lock().await.insert(
 		pair,
 		Subscription {
-			_handle: SyncRootHandle::unregistered_for_test(remote_root),
+			handle: SyncRootHandle::unregistered_for_test(remote_root),
 			registered: Arc::downgrade(&registered),
 		},
 	);
 
 	engine.resubscribe(pair).await.unwrap();
 	assert!(engine.roots.lock().await[&pair].live());
+}
+
+/// A pair served by a stand-in cache whose socket is NOT connected — what a firewall that blocks
+/// the socket leaves — and whose catch-ups arrive on the returned receiver. Answers the cache DB's
+/// path, the cache's socket liveness, and the registration the stand-in subscription lives by.
+async fn a_pair_whose_cache_socket_is_down(
+	dir: &Path,
+) -> (
+	SyncEngine,
+	PairId,
+	PathBuf,
+	Arc<crate::cache::ResyncReach>,
+	tokio::sync::mpsc::UnboundedReceiver<crate::cache::CatchUpAck>,
+	Arc<()>,
+) {
+	// Rooted at the drive, whose root is the client's own: a pass resolves it without a server.
+	let local = dir.join("local");
+	std::fs::create_dir(&local).unwrap();
+	let account = Uuid::from_u128(1);
+	let cache = dir.join("cache.db");
+	CacheState::new_on_path(&cache, account)
+		.add_converged_roots(&[account])
+		.unwrap();
+	let client = Arc::new(offline_client());
+	client.configure_cache(cache.clone(), |_| {}).await.unwrap();
+	let engine = SyncEngine::open(client, dir.join("sync.db")).await.unwrap();
+	let (pair, _) = locked(&engine.control)
+		.create_pair(local.to_str().unwrap(), account, SyncMode::TwoWay)
+		.unwrap();
+	let reach = Arc::new(crate::cache::ResyncReach::default());
+	let (catch_up, catch_ups) = tokio::sync::mpsc::unbounded_channel();
+	let registered = Arc::new(());
+	engine.roots.lock().await.insert(
+		pair,
+		Subscription {
+			handle: SyncRootHandle::unregistered_for_test_with(
+				account,
+				Arc::clone(&reach),
+				catch_up,
+			),
+			registered: Arc::downgrade(&registered),
+		},
+	);
+	(engine, pair, cache, reach, catch_ups, registered)
+}
+
+/// While the cache's socket is not connected nothing announces a cloud change, so the cache holds
+/// the remote as of its last listing. A safety-net pass then has the cache catch up with the server
+/// BEFORE it reads the remote — here the stand-in cache relists and finds a file uploaded from
+/// elsewhere — so the pass finds the change and says why it read the remote that way. The same file
+/// written locally meanwhile is how the test sees it without a server: against the relisted remote
+/// the two agree and the pass records them synced, where against the stale cache it would have
+/// planned an upload. A whole pass for any other reason asks nothing, and neither does a
+/// safety-net pass once the socket is back.
+#[tokio::test]
+async fn a_safety_net_pass_has_a_disconnected_cache_catch_up_and_finds_the_cloud_change() {
+	let dir = tempfile::tempdir().unwrap();
+	let (engine, pair, cache, reach, mut catch_ups, _registered) =
+		a_pair_whose_cache_socket_is_down(dir.path()).await;
+
+	let first = engine.sync_once(pair).await.unwrap();
+	assert_ne!(
+		first.full_pass,
+		Some(FullPassReason::RemoteEventsDegraded),
+		"a first pass reads whole for its own reason"
+	);
+	assert!(catch_ups.try_recv().is_err(), "and asks the cache nothing");
+
+	// A file uploaded from elsewhere while the socket is down: only a relist shows it.
+	let remote_root = Uuid::from_u128(1);
+	let cloud = Uuid::from_u128(3);
+	let relisted = tokio::spawn(async move {
+		let ack = catch_ups
+			.recv()
+			.await
+			.expect("the pass asks the cache to catch up");
+		// What the relist commits: the file, and the root converged again.
+		let mut state = CacheState::new_on_path(&cache, Uuid::from_u128(1));
+		state
+			.upsert_files([&cacheable_file(cloud, remote_root, "cloud.txt")].into_iter())
+			.unwrap();
+		state.add_converged_roots(&[remote_root]).unwrap();
+		ack.send(None).unwrap();
+		catch_ups
+	});
+	// The same file here: its size and modification time, which is what a pass matches a file the
+	// remote holds no hash for by.
+	let local = dir.path().join("local").join("cloud.txt");
+	std::fs::write(&local, b"7 bytes").unwrap();
+	std::fs::File::options()
+		.write(true)
+		.open(&local)
+		.unwrap()
+		.set_times(
+			std::fs::FileTimes::new()
+				.set_modified(std::time::UNIX_EPOCH + Duration::from_millis(1_234)),
+		)
+		.unwrap();
+	engine
+		.force_full_pass(pair, FullPassReason::SafetyNet)
+		.await;
+	let caught_up = engine.sync_once(pair).await.unwrap();
+	let mut catch_ups = relisted.await.unwrap();
+	assert_eq!(
+		caught_up.full_pass,
+		Some(FullPassReason::RemoteEventsDegraded),
+		"the pass says nothing announced the remote it read"
+	);
+	assert_eq!(caught_up.uploaded, 0, "{caught_up:?}");
+	let store = engine.pair_store(pair).await.unwrap();
+	let baseline = locked(&store).baseline(pair).unwrap();
+	assert_eq!(
+		baseline.get("cloud.txt").and_then(|row| row.remote_uuid),
+		Some(cloud),
+		"the pass found the cloud change"
+	);
+
+	let other = engine.sync_once(pair).await.unwrap();
+	assert!(other.full_pass.is_some(), "this pass reads whole too");
+	assert_ne!(other.full_pass, Some(FullPassReason::RemoteEventsDegraded));
+	assert!(
+		catch_ups.try_recv().is_err(),
+		"a whole pass for another reason asks nothing"
+	);
+
+	reach.set_live(true);
+	engine
+		.force_full_pass(pair, FullPassReason::SafetyNet)
+		.await;
+	let connected = engine.sync_once(pair).await.unwrap();
+	assert_ne!(
+		connected.full_pass,
+		Some(FullPassReason::RemoteEventsDegraded)
+	);
+	assert!(
+		catch_ups.try_recv().is_err(),
+		"with the socket connected the cache is current and nothing is asked"
+	);
+}
+
+/// A requested pass ("sync now") does the same, and a catch-up that cannot reach the server fails
+/// the pass as one that could not reach it — never a pass planned against the stale cache — and
+/// leaves the next pass owing the catch-up.
+#[tokio::test]
+async fn a_requested_pass_whose_catch_up_cannot_reach_the_server_fails_offline() {
+	let dir = tempfile::tempdir().unwrap();
+	let (engine, pair, _cache, _reach, mut catch_ups, _registered) =
+		a_pair_whose_cache_socket_is_down(dir.path()).await;
+	engine.sync_once(pair).await.unwrap();
+
+	let answering = tokio::spawn(async move {
+		let ack = catch_ups
+			.recv()
+			.await
+			.expect("the pass asks the cache to catch up");
+		ack.send(Some(Arc::new(Error::custom(
+			ErrorKind::Reqwest,
+			"error sending request",
+		))))
+		.unwrap();
+		catch_ups
+	});
+	engine.request_pass(pair).await.unwrap();
+	let failed = engine
+		.sync_once(pair)
+		.await
+		.expect_err("the remote could not be brought up to date");
+	assert_eq!(failed.kind(), ErrorKind::Reqwest, "{failed}");
+	let mut catch_ups = answering.await.unwrap();
+
+	let changes = engine.pair_changes(pair).await;
+	assert!(
+		changes.take().wants_current_remote(),
+		"the next pass asks the cache again"
+	);
+	assert!(catch_ups.try_recv().is_err());
 }
 
 /// The cache ending a subscription is dropping its callback, and that is what the subscription

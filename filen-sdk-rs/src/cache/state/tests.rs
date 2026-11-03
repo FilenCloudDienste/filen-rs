@@ -96,66 +96,179 @@ fn reconnecting_maps_to_resync_signal_auth_success_to_connected() {
 	);
 }
 
-/// Draining a reconnect signal REQUESTS the cheap gap-check (drain returns `true`) but does NOT
-/// touch the durable `needs_resync` flag — a reconnect is a suspicion, not an observed hole, so it
-/// must not force a resync. (Pins the redesign: the old code marked `needs_resync` here.)
+/// A disconnect owes a gap-check of its window, but NOT now: it waits for the next subscription,
+/// as a check read while the socket is still down misses every change that lands before the socket
+/// is back. Nor does it touch the durable `needs_resync` flag — a disconnect is a suspicion, not an
+/// observed hole, so it must not force a resync.
 #[test]
-fn reconnect_signal_requests_gap_check_without_durable_flag() {
+fn a_disconnect_owes_a_gap_check_at_the_next_subscription_without_durable_flag() {
 	let mut state = CacheState::new_in_memory();
-	assert!(!state.needs_resync().unwrap(), "starts clear");
+	state.gap_check = GapCheck::Done;
 
-	let reconnected = state.drain_pending(Some(CacheThreadEvent::Socket(
+	state.drain_pending(Some(CacheThreadEvent::Socket(
 		CacheEventMaybeDecrypted::ResyncSignal,
 	)));
 
-	assert!(
-		reconnected,
-		"draining a reconnect must request a gap-check (drain returns true)"
+	assert_eq!(
+		state.gap_check,
+		GapCheck::AwaitingSubscription,
+		"a disconnect owes a check, read once the socket subscribes again"
 	);
 	assert!(
 		!state.needs_resync().unwrap(),
-		"a reconnect is a suspicion, not an observed hole — it must NOT set the durable flag"
+		"a disconnect is a suspicion, not an observed hole — it must NOT set the durable flag"
+	);
+
+	state.drain_pending(Some(CacheThreadEvent::Socket(
+		CacheEventMaybeDecrypted::Connected,
+	)));
+	assert_eq!(
+		state.gap_check,
+		GapCheck::Due,
+		"the reconnect releases exactly one gap-check of the window"
 	);
 }
 
-/// A reconnect storm (several `ResyncSignal`s in one drain) collapses into a SINGLE gap-check
-/// request — one check per drain, not one per event — and still never flags the durable resync.
+/// A reconnect storm (several disconnects and reconnects in one drain) owes ONE gap-check, and
+/// only if the last thing in it is a subscription: a disconnect after it leaves the check waiting
+/// for the next one.
 #[test]
-fn reconnect_burst_collapses_to_one_gap_check() {
+fn a_reconnect_storm_owes_one_gap_check_after_its_last_subscription() {
 	let (mut state, producer) = CacheState::new_in_memory_with_producer();
+	state.gap_check = GapCheck::Done;
 	for _ in 0..3 {
+		for event in [
+			CacheEventMaybeDecrypted::ResyncSignal,
+			CacheEventMaybeDecrypted::Connected,
+		] {
+			producer
+				.events
+				.try_send(CacheThreadEvent::Socket(event))
+				.unwrap();
+		}
+	}
+	state.drain_pending(None);
+	assert_eq!(state.gap_check, GapCheck::Due);
+	assert!(!state.needs_resync().unwrap());
+
+	for event in [
+		CacheEventMaybeDecrypted::Connected,
+		CacheEventMaybeDecrypted::ResyncSignal,
+	] {
 		producer
 			.events
-			.try_send(CacheThreadEvent::Socket(
-				CacheEventMaybeDecrypted::ResyncSignal,
-			))
+			.try_send(CacheThreadEvent::Socket(event))
 			.unwrap();
 	}
-
-	// One drain consumes the whole burst and reports a single gap-check request.
-	let reconnected = state.drain_pending(None);
-
-	assert!(
-		reconnected,
-		"a reconnect burst requests exactly one gap-check"
-	);
-	assert!(
-		!state.needs_resync().unwrap(),
-		"a reconnect burst must not set the durable resync flag"
+	state.drain_pending(None);
+	assert_eq!(
+		state.gap_check,
+		GapCheck::AwaitingSubscription,
+		"the socket went down again: the check waits for the subscription after it"
 	);
 }
 
-/// A drain with NO reconnect signal does not request a gap-check.
+/// A drain with neither a disconnect nor a subscription owes no gap-check.
 #[test]
-fn drain_without_reconnect_requests_no_gap_check() {
+fn drain_without_reconnect_owes_no_gap_check() {
 	let mut state = CacheState::new_in_memory();
-	let reconnected = state.drain_pending(Some(CacheThreadEvent::Socket(
+	state.gap_check = GapCheck::Done;
+	state.drain_pending(Some(CacheThreadEvent::Socket(
 		CacheEventMaybeDecrypted::FrontierAdvance { id: 7 },
 	)));
+	assert_eq!(state.gap_check, GapCheck::Done);
+}
+
+/// The cache's socket callback records whether its listener is live from the socket's own events,
+/// as they arrive: live from an `authSuccess`, not live from a disconnect, a refused
+/// authentication or the listener's removal, and untouched by anything else. A cache whose socket
+/// never connects reads as not live from the start.
+#[test]
+fn the_socket_callback_records_whether_the_listener_is_live() {
+	let reach = ResyncReach::default();
+	assert!(!reach.live(), "not live before any connection");
+	let mut liveness = reach.liveness();
+
+	note_liveness(&reach, &DecryptedSocketEvent::AuthSuccess);
+	assert!(reach.live());
+	assert!(liveness.has_changed().unwrap(), "a change is heard");
+	liveness.mark_unchanged();
+
+	note_liveness(&reach, &DecryptedSocketEvent::AuthSuccess);
 	assert!(
-		!reconnected,
-		"a non-reconnect drain must not request a gap-check"
+		!liveness.has_changed().unwrap(),
+		"a replayed authSuccess wakes nobody"
 	);
+	note_liveness(
+		&reach,
+		&DecryptedSocketEvent::DriveMalformed {
+			drive_message_id: 3,
+		},
+	);
+	assert!(reach.live(), "a drive event says nothing about liveness");
+
+	for down in [
+		DecryptedSocketEvent::Reconnecting,
+		DecryptedSocketEvent::AuthFailed,
+		DecryptedSocketEvent::Unsubscribed,
+	] {
+		note_liveness(&reach, &DecryptedSocketEvent::AuthSuccess);
+		note_liveness(&reach, &down);
+		assert!(!reach.live(), "{down:?}");
+	}
+}
+
+/// Requests to catch up that queue together are answered by ONE gap-check, and each with what it
+/// found: here the server could not be reached, so every asker gets the transport failure of the
+/// read of the remote drive id — the request a catch-up sends before anything else.
+#[tokio::test(start_paused = true)]
+async fn queued_catch_ups_are_answered_by_one_gap_check() {
+	let (mut state, _producer) = CacheState::new_in_memory_with_producer();
+	state.set_test_resync_client(Arc::new(offline_client()));
+	let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+	state.catch_ups = Some(receiver);
+	let mut answers = Vec::new();
+	for _ in 0..3 {
+		let (ack, answer) = tokio::sync::oneshot::channel();
+		sender.send(ack).unwrap();
+		answers.push(answer);
+	}
+
+	let first = state.catch_ups.as_mut().unwrap().recv().await.unwrap();
+	state.catch_up(first).await;
+
+	assert!(
+		state.catch_ups.as_mut().unwrap().try_recv().is_err(),
+		"the queued requests were taken with the first"
+	);
+	for mut answer in answers {
+		let failure = answer
+			.try_recv()
+			.expect("every request is answered")
+			.expect("the server was not reached");
+		assert_eq!(failure.kind(), ErrorKind::Reqwest, "{failure}");
+		assert!(
+			failure
+				.to_string()
+				.contains(filen_types::api::v3::message_ids::ENDPOINT),
+			"the gap-check's read of the remote drive id: {failure}"
+		);
+	}
+	assert_eq!(
+		state.gap_check,
+		GapCheck::AwaitingSubscription,
+		"a catch-up leaves the subscription's own check owed"
+	);
+}
+
+/// A catch-up whose asker has gone is dropped unanswered, and the worker carries on.
+#[tokio::test]
+async fn a_catch_up_whose_asker_has_gone_is_dropped() {
+	let mut state = CacheState::new_in_memory();
+	let (ack, answer) = tokio::sync::oneshot::channel();
+	drop(answer);
+	state.catch_up(ack).await;
+	assert!(!state.needs_resync().unwrap());
 }
 
 /// The startup gap-check is DEFERRED, not run at boot: draining the persisted backlog the way
@@ -167,8 +280,8 @@ fn drain_without_reconnect_requests_no_gap_check() {
 fn startup_drain_leaves_the_gap_check_awaiting_the_subscription() {
 	let (mut state, producer) = CacheState::new_in_memory_with_producer();
 	assert_eq!(
-		state.startup_gap_check,
-		StartupGapCheck::AwaitingSubscription,
+		state.gap_check,
+		GapCheck::AwaitingSubscription,
 		"a fresh worker owes a gap-check but must not run it yet"
 	);
 
@@ -187,16 +300,12 @@ fn startup_drain_leaves_the_gap_check_awaiting_the_subscription() {
 		))
 		.unwrap();
 
-	let reconnected = state.drain_pending(None);
+	state.drain_pending(None);
 
-	assert!(
-		reconnected,
-		"a reconnect still requests its own gap-check, exactly as before"
-	);
 	assert_eq!(
-		state.startup_gap_check,
-		StartupGapCheck::AwaitingSubscription,
-		"only a live subscription may release the startup check — a reconnect signal is a \
+		state.gap_check,
+		GapCheck::AwaitingSubscription,
+		"only a live subscription may release the startup check — a disconnect signal is a \
 		 different trigger and must not stand in for one"
 	);
 }
@@ -204,7 +313,7 @@ fn startup_drain_leaves_the_gap_check_awaiting_the_subscription() {
 /// The first `Connected` releases the deferred check: the run loop then owes exactly ONE
 /// gap-check, taken with the subscription already live.
 #[test]
-fn first_connected_signal_arms_exactly_one_startup_gap_check() {
+fn first_connected_signal_arms_exactly_one_gap_check() {
 	let (mut state, producer) = CacheState::new_in_memory_with_producer();
 
 	// A burst of connects in one drain (a replayed authSuccess racing a promotion) still owes one.
@@ -217,15 +326,11 @@ fn first_connected_signal_arms_exactly_one_startup_gap_check() {
 			.unwrap();
 	}
 
-	let reconnected = state.drain_pending(None);
+	state.drain_pending(None);
 
-	assert!(
-		!reconnected,
-		"a connect is not a reconnect: it must not take the ResyncSignal path"
-	);
 	assert_eq!(
-		state.startup_gap_check,
-		StartupGapCheck::Due,
+		state.gap_check,
+		GapCheck::Due,
 		"the first subscription arms the deferred startup gap-check"
 	);
 	assert!(
@@ -234,28 +339,28 @@ fn first_connected_signal_arms_exactly_one_startup_gap_check() {
 	);
 }
 
-/// A LATER `Connected` (a reconnect's re-auth) is a no-op for the startup check: it ran once and
-/// stays `Done`. Reconnect healing is `ResyncSignal`'s job, and re-arming here would run a second,
-/// redundant startup check on every reconnect.
+/// A LATER `Connected` with no disconnect before it (a replayed `authSuccess`) is a no-op for the
+/// gap-check: it ran once and stays `Done`. Only a disconnect owes another, and re-arming here would
+/// run a redundant check on every replay.
 #[test]
-fn second_connected_signal_does_not_rearm_the_startup_gap_check() {
+fn second_connected_signal_does_not_rearm_the_gap_check() {
 	let mut state = CacheState::new_in_memory();
 
 	state.drain_pending(Some(CacheThreadEvent::Socket(
 		CacheEventMaybeDecrypted::Connected,
 	)));
-	assert_eq!(state.startup_gap_check, StartupGapCheck::Due);
+	assert_eq!(state.gap_check, GapCheck::Due);
 
 	// What the run loop does when it takes the deferred check.
-	state.startup_gap_check = StartupGapCheck::Done;
+	state.gap_check = GapCheck::Done;
 
 	state.drain_pending(Some(CacheThreadEvent::Socket(
 		CacheEventMaybeDecrypted::Connected,
 	)));
 
 	assert_eq!(
-		state.startup_gap_check,
-		StartupGapCheck::Done,
+		state.gap_check,
+		GapCheck::Done,
 		"a second subscription must not re-arm the startup check"
 	);
 }

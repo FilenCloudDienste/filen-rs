@@ -28,7 +28,7 @@ use uuid::Uuid;
 use crate::cache::{
 	CacheControlMessage, CacheError, CacheState, RootKey, SyncRootCallback,
 	search::ReadTask,
-	state::{CacheThreadEvent, ManualEvent, ResyncReach},
+	state::{CacheThreadEvent, CatchUpAck, ManualEvent, ResyncReach},
 };
 
 /// How long [`spawn_cache_worker`] waits for the new worker's init ack before presuming it dead.
@@ -164,8 +164,18 @@ pub(crate) struct CacheWorkerShared {
 	/// decrypting every drive event) for a dead worker.
 	listener_handle: std::sync::Mutex<Option<ListenerHandle>>,
 	/// Whether the worker's latest attempt to converge its roots could reach the server (see
-	/// [`Client::cache_unreachable`]).
+	/// [`Client::cache_unreachable`]), and whether its socket listener is live.
 	reach: Arc<ResyncReach>,
+	/// Asks the worker to catch up with the server now (see [`RemoteEvents::catch_up`]).
+	// Used only by the native sync engine; other builds compile it unused.
+	#[cfg_attr(
+		not(all(
+			feature = "sync-engine",
+			not(all(target_family = "wasm", target_os = "unknown"))
+		)),
+		allow(dead_code)
+	)]
+	catch_up_sender: UnboundedSender<CatchUpAck>,
 }
 
 /// Every live cache worker in this PROCESS, keyed by the DB it owns. Weak on purpose: the registry
@@ -598,7 +608,15 @@ async fn spawn_cache_worker(
 			return;
 		}
 		let state = match CacheState::new(&cache_path, root_uuid, msg_sender, worker_client) {
-			Ok((state, callback, control_sender, event_sender, read_task_sender, reach)) => {
+			Ok((
+				state,
+				callback,
+				control_sender,
+				event_sender,
+				read_task_sender,
+				reach,
+				catch_up_sender,
+			)) => {
 				if res_sender
 					.send(Ok((
 						callback,
@@ -606,6 +624,7 @@ async fn spawn_cache_worker(
 						event_sender,
 						read_task_sender,
 						reach,
+						catch_up_sender,
 					)))
 					.is_err()
 				{
@@ -655,7 +674,7 @@ async fn spawn_cache_worker(
 	// and one that got past the check exits at its failed ack send — but a straggler frozen
 	// MID-init can still briefly overlap a successor; native therefore KEEPS the exit signal
 	// (see the timeout arm) so respawns wait stragglers out.
-	let (callback, control_sender, manual_event_sender, read_task_sender, reach) =
+	let (callback, control_sender, manual_event_sender, read_task_sender, reach, catch_up_sender) =
 		match ack_timeout(CACHE_INIT_ACK_TIMEOUT, res_receiver).await {
 			Ok(Ok(Ok(parts))) => parts,
 			// `CacheState::new` failed (or the worker died before reporting); the thread is
@@ -709,6 +728,7 @@ async fn spawn_cache_worker(
 			next_registration_id: AtomicU64::new(0),
 			listener_handle: std::sync::Mutex::new(Some(listener_handle)),
 			reach,
+			catch_up_sender,
 		})),
 		Err(e) => {
 			// Listener registration failed — dropping the just-spawned worker's senders
@@ -718,6 +738,65 @@ async fn spawn_cache_worker(
 			drop(manual_event_sender);
 			Err(e)
 		}
+	}
+}
+
+/// How a cache worker hears of remote changes, for the sync passes of the roots it serves: whether
+/// its socket listener is live, and a way to bring it up to date when it is not. Holds neither the
+/// worker's control channel nor its registrations, so it keeps no worker alive.
+// Used only by the native sync engine; other builds compile it unused.
+#[cfg_attr(
+	not(all(
+		feature = "sync-engine",
+		not(all(target_family = "wasm", target_os = "unknown"))
+	)),
+	allow(dead_code)
+)]
+#[derive(Clone)]
+pub(crate) struct RemoteEvents {
+	reach: Arc<ResyncReach>,
+	catch_up: UnboundedSender<CatchUpAck>,
+}
+
+// Used only by the native sync engine; other builds compile it unused.
+#[cfg_attr(
+	not(all(
+		feature = "sync-engine",
+		not(all(target_family = "wasm", target_os = "unknown"))
+	)),
+	allow(dead_code)
+)]
+impl RemoteEvents {
+	/// Whether the worker's socket listener is live: connected, authenticated and subscribed, so
+	/// every remote change reaches the cache as it happens. While it is not, the cache is only as
+	/// current as its last listing.
+	pub(crate) fn live(&self) -> bool {
+		self.reach.live()
+	}
+
+	/// Hears every change of [`live`](Self::live).
+	pub(crate) fn liveness(&self) -> tokio::sync::watch::Receiver<bool> {
+		self.reach.liveness()
+	}
+
+	/// Bring the worker up to date with the server now: it reads the remote drive id and relists
+	/// its roots if the drive moved since what it holds (the gap-check its socket runs after every
+	/// reconnect), coalescing requests that arrive together. Resolves once that has run: `Ok(None)`
+	/// when the server was reached, `Ok(Some(failure))` with the transport failure when it could not
+	/// be, and `Err` when the worker has exited.
+	///
+	/// A relist that has not converged when this returns (the drive lock is contended) is still
+	/// pending; the root reads as not converged until it lands.
+	pub(crate) async fn catch_up(&self) -> Result<Option<Arc<Error>>, Error> {
+		let worker_gone = || {
+			Error::custom(
+				ErrorKind::Internal,
+				"the cache worker exited before it caught up with the server",
+			)
+		};
+		let (ack, answer) = tokio::sync::oneshot::channel();
+		self.catch_up.send(ack).map_err(|_| worker_gone())?;
+		answer.await.map_err(|_| worker_gone())
 	}
 }
 
@@ -753,6 +832,22 @@ impl SyncRootHandle {
 	)]
 	pub(crate) fn read_task_sender(&self) -> UnboundedSender<ReadTask> {
 		self.shared.read_task_sender.clone()
+	}
+
+	/// How the worker serving this registration hears of remote changes (see [`RemoteEvents`]).
+	// Used only by the native sync engine; other builds compile it unused.
+	#[cfg_attr(
+		not(all(
+			feature = "sync-engine",
+			not(all(target_family = "wasm", target_os = "unknown"))
+		)),
+		allow(dead_code)
+	)]
+	pub(crate) fn remote_events(&self) -> RemoteEvents {
+		RemoteEvents {
+			reach: Arc::clone(&self.shared.reach),
+			catch_up: self.shared.catch_up_sender.clone(),
+		}
 	}
 
 	/// Consume the handle, removing its registration AND — when it was the last registration for
@@ -853,6 +948,20 @@ impl SyncRootHandle {
 	/// A handle to dir root `uuid` with no worker or registration behind it, whose drop sends
 	/// nothing: for a test of a caller that holds handles, never one that uses them.
 	pub(crate) fn unregistered_for_test(uuid: Uuid) -> Self {
+		Self::unregistered_for_test_with(
+			uuid,
+			Arc::default(),
+			tokio::sync::mpsc::unbounded_channel().0,
+		)
+	}
+
+	/// Like [`unregistered_for_test`](Self::unregistered_for_test), with a worker whose socket
+	/// liveness is `reach`'s and whose catch-ups go to `catch_up_sender`.
+	pub(crate) fn unregistered_for_test_with(
+		uuid: Uuid,
+		reach: Arc<ResyncReach>,
+		catch_up_sender: UnboundedSender<CatchUpAck>,
+	) -> Self {
 		let (control_sender, _) = tokio::sync::mpsc::unbounded_channel();
 		let (manual_event_sender, _) = tokio::sync::mpsc::channel(1);
 		let (read_task_sender, _) = tokio::sync::mpsc::unbounded_channel();
@@ -867,7 +976,8 @@ impl SyncRootHandle {
 				read_task_sender,
 				next_registration_id: AtomicU64::new(0),
 				listener_handle: std::sync::Mutex::new(None),
-				reach: Arc::default(),
+				reach,
+				catch_up_sender,
 			}),
 		}
 	}
@@ -892,6 +1002,7 @@ mod tests {
 				next_registration_id: AtomicU64::new(0),
 				listener_handle: std::sync::Mutex::new(None),
 				reach: Arc::default(),
+				catch_up_sender: tokio::sync::mpsc::unbounded_channel().0,
 			})
 		}
 	}

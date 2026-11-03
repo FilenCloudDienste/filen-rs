@@ -879,6 +879,46 @@ fn a_forced_reason_goes_to_the_next_pass_to_start() {
 	);
 }
 
+/// Only the safety net and a caller's request want the remote as it stands now — the passes that
+/// have a disconnected cache catch up first — and they want it even behind an earlier reason,
+/// which `forced` keeps in their place. It goes to one pass, like the reason; a change-scoped pass
+/// and a pass whole for any other reason never want it; and a pass that took it and could not
+/// catch up hands it on.
+#[test]
+fn only_the_safety_net_and_a_request_want_the_remote_as_it_stands() {
+	let changes = sized_pair();
+	note(&changes, &create("a.txt"));
+	assert!(
+		!changes.take().wants_current_remote(),
+		"a change-scoped pass reads what was announced"
+	);
+	changes.force(R::UnappliedWork);
+	assert!(!changes.take().wants_current_remote());
+
+	for reason in [R::SafetyNet, R::Requested] {
+		changes.force(R::UnappliedWork);
+		changes.force(reason);
+		let mut scope = changes.take();
+		assert_eq!(scope.full, Some(R::UnappliedWork), "the first reason stays");
+		assert!(scope.wants_current_remote(), "{reason:?}");
+		scope.note_remote_events_degraded();
+		assert_eq!(scope.full_pass_reason(10), Some(R::RemoteEventsDegraded));
+		assert!(
+			!changes.take().wants_current_remote(),
+			"taken by the one pass"
+		);
+	}
+
+	changes.force(R::SafetyNet);
+	changes.take();
+	changes.owe_current_remote();
+	changes.force(R::InterruptedPass);
+	assert!(
+		changes.take().wants_current_remote(),
+		"handed on to the pass after one that could not catch up"
+	);
+}
+
 /// A reason recorded while a pass is already running belongs to the pass AFTER it: the running
 /// one took its lists before that demand existed and cannot have covered it. Clearing the
 /// reason when the pass ended instead dropped it — the lost-trigger hole, silent by

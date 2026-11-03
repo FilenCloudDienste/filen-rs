@@ -240,9 +240,13 @@ pub struct WatchStatus {
 	/// the coverage it lost.
 	pub local_events_degraded: Option<String>,
 	/// Why the watch hears about no REMOTE changes as they happen, or `None` while its cache
-	/// subscription is registered. Set when the cache refused the subscription; remote changes are
-	/// then picked up by the safety-net pass. Holds the first refusal, and is cleared once a later
-	/// attempt, made after a pass that succeeds, gets the subscription.
+	/// subscription is registered and the cache's socket is connected. Set when the cache refused
+	/// the subscription: it holds the first refusal, and is cleared once a later attempt, made
+	/// after a pass that succeeds, gets the subscription. Set too while the cache's socket is not
+	/// connected (a firewall or proxy that blocks it, a server outage, a reconnect under way), and
+	/// cleared as soon as it connects again. Either way remote changes are then picked up by the
+	/// safety-net pass and by [`request_pass`](super::SyncEngine::request_pass), which have the
+	/// cache catch up with the server first.
 	pub remote_events_degraded: Option<String>,
 }
 
@@ -775,18 +779,51 @@ async fn connection_after(reconnected: Option<&mut tokio::sync::watch::Receiver<
 /// changes only on the safety net for the rest of its life. A subscribed watch asks nothing again,
 /// so there is never a second registration, and the retry costs a healthy watch nothing. Generic
 /// over the handle so the retry can be driven without a cache.
+///
+/// Once granted, it also keeps the status saying whether the cache's socket is connected (see
+/// [`publish_remote_liveness`]), with a task that lives as long as the doorbell.
 struct RemoteDoorbell<H> {
 	pair: PairId,
 	dirty: Arc<Notify>,
 	handle: Option<H>,
+	/// The task that publishes the cache's socket liveness, once there is a subscription.
+	liveness: Option<tokio::task::AbortHandle>,
 }
 
-impl<H> RemoteDoorbell<H> {
+/// What a granted subscription says about whether its cache hears remote changes as they happen:
+/// a receiver of its socket listener's liveness, or `None` when it has nothing to say (a test's
+/// stand-in).
+trait RemoteLiveness {
+	fn liveness(&self) -> Option<tokio::sync::watch::Receiver<bool>>;
+}
+
+impl RemoteLiveness for SyncRootHandle {
+	fn liveness(&self) -> Option<tokio::sync::watch::Receiver<bool>> {
+		Some(self.remote_events().liveness())
+	}
+}
+
+impl RemoteLiveness for () {
+	fn liveness(&self) -> Option<tokio::sync::watch::Receiver<bool>> {
+		None
+	}
+}
+
+impl<H> Drop for RemoteDoorbell<H> {
+	fn drop(&mut self) {
+		if let Some(liveness) = &self.liveness {
+			liveness.abort();
+		}
+	}
+}
+
+impl<H: RemoteLiveness> RemoteDoorbell<H> {
 	fn new(pair: PairId, dirty: Arc<Notify>) -> Self {
 		Self {
 			pair,
 			dirty,
 			handle: None,
+			liveness: None,
 		}
 	}
 
@@ -811,8 +848,16 @@ impl<H> RemoteDoorbell<H> {
 		let pair = self.pair;
 		match subscribe(callback).await {
 			Ok(handle) => {
-				self.handle = Some(handle);
 				status.send_if_modified(|status| status.remote_events_degraded.take().is_some());
+				// From here the subscription's cache says whether remote changes are heard, and
+				// this task is the only writer of the field.
+				if let Some(live) = handle.liveness() {
+					self.liveness = Some(
+						tokio::spawn(publish_remote_liveness(pair, live, status.clone()))
+							.abort_handle(),
+					);
+				}
+				self.handle = Some(handle);
 			}
 			Err(error) => {
 				status.send_if_modified(|status| {
@@ -829,6 +874,43 @@ impl<H> RemoteDoorbell<H> {
 					true
 				});
 			}
+		}
+	}
+}
+
+/// Why [`WatchStatus::remote_events_degraded`] is set while the cache's socket is not connected.
+const SOCKET_NOT_CONNECTED: &str = "the cache's socket to the server is not connected, so no remote change is announced; remote changes sync on the safety net and on requested passes";
+
+/// Keep `status` saying whether the cache serving the watch's subscription hears remote changes as
+/// they happen, from its socket listener's liveness `live`, until the cache drops the sender or the
+/// doorbell that spawned this aborts it. Each change is published as it happens, so a socket that
+/// stays down shows at once and one that comes back clears it, with no pass in between.
+async fn publish_remote_liveness(
+	pair: PairId,
+	mut live: tokio::sync::watch::Receiver<bool>,
+	status: tokio::sync::watch::Sender<WatchStatus>,
+) {
+	// The first reading is usually a socket still connecting as the watch starts: logged quietly,
+	// where a socket that drops later is worth a warning.
+	let mut first = true;
+	loop {
+		let connected = *live.borrow_and_update();
+		status.send_if_modified(|status| {
+			let degraded = (!connected).then(|| SOCKET_NOT_CONNECTED.to_owned());
+			if status.remote_events_degraded == degraded {
+				return false;
+			}
+			match (connected, first) {
+				(true, _) => tracing::info!("sync pair {pair}: the cache's socket is connected"),
+				(false, true) => tracing::debug!("sync pair {pair}: {SOCKET_NOT_CONNECTED}"),
+				(false, false) => tracing::warn!("sync pair {pair}: {SOCKET_NOT_CONNECTED}"),
+			}
+			status.remote_events_degraded = degraded;
+			true
+		});
+		first = false;
+		if live.changed().await.is_err() {
+			return;
 		}
 	}
 }

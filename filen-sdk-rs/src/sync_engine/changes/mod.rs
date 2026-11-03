@@ -177,8 +177,13 @@ pub enum FullPassReason {
 	/// not start, could not cover the whole tree, or reported an error. Permanent, so every pass
 	/// stays full.
 	LocalEventsDegraded,
-	/// The cache refused this pair's sync-root subscription, so no remote change is announced.
-	/// Permanent, like [`LocalEventsDegraded`](Self::LocalEventsDegraded).
+	/// No remote change is announced for this pair. Either the cache refused its sync-root
+	/// subscription, which is permanent, like [`LocalEventsDegraded`](Self::LocalEventsDegraded);
+	/// or the cache's socket is not connected (a firewall or proxy that blocks it, a server outage,
+	/// a reconnect under way), so the cache is only as current as its last listing. A
+	/// [`SafetyNet`](Self::SafetyNet) or [`Requested`](Self::Requested) pass then asks the cache to
+	/// catch up with the server before it reads the remote, and reports this reason instead; passes
+	/// in between stay change-scoped, and the cache relists on its own once the socket is back.
 	RemoteEventsDegraded,
 	/// No filesystem watcher is attached to this pair, so nothing is recording what changes
 	/// locally: a pair only ever passed over by [`sync_once`](super::SyncEngine::sync_once), one
@@ -595,6 +600,13 @@ struct ChangeState {
 	/// A trigger source that no longer reports everything. Never cleared: the coverage does not
 	/// come back for the life of the watch.
 	degraded: Option<FullPassReason>,
+	/// Set with a [`SafetyNet`](FullPassReason::SafetyNet) or
+	/// [`Requested`](FullPassReason::Requested) reason, and taken with the lists like
+	/// [`forced`](Self::forced): the next pass is one that reads the remote whole AS IT STANDS, so
+	/// it has the cache catch up with the server first when the cache's socket is not live (see
+	/// [`PassScope::wants_current_remote`]). Kept apart from `forced`, which keeps only the FIRST
+	/// reason recorded and would lose a safety-net tick behind any earlier one.
+	current_remote: bool,
 	/// Whether a filesystem watcher is currently recording local changes onto this list.
 	///
 	/// False until one starts and true only while it runs, because the local list is evidence only
@@ -817,6 +829,19 @@ impl PairChanges {
 		if state.forced.is_none() {
 			state.forced = Some(reason);
 		}
+		if matches!(
+			reason,
+			FullPassReason::SafetyNet | FullPassReason::Requested
+		) {
+			state.current_remote = true;
+		}
+	}
+
+	/// Hand a [`wants_current_remote`](PassScope::wants_current_remote) back to the next pass, for
+	/// a pass that took it and could not have the cache catch up: the pass failed, so the next one
+	/// reads whole anyway (see `SyncEngine::sync_pass`), and this makes it ask again.
+	pub(super) fn owe_current_remote(&self) {
+		self.state().current_remote = true;
 	}
 
 	/// Record that the pass that just ended held deletions back, so the next pass to run reads both
@@ -874,6 +899,7 @@ impl PairChanges {
 		let owed_remote = mem::take(&mut state.owed_remote);
 		// Taken with the lists, so what is recorded from here on is the NEXT pass's (see `forced`).
 		let forced = mem::take(&mut state.forced);
+		let current_remote = mem::take(&mut state.current_remote);
 		let held = mem::take(&mut state.held).then_some(FullPassReason::DeletionHold);
 		// Most specific first: a permanently degraded source, then no watcher at all, then evidence
 		// that events were lost, then what the engine itself recorded about the previous pass, and
@@ -901,6 +927,7 @@ impl PairChanges {
 			local: paths,
 			remote: entries,
 			full,
+			current_remote,
 		}
 	}
 
@@ -926,6 +953,7 @@ pub(super) struct PassScope {
 	local: BTreeSet<String>,
 	remote: Vec<RemoteDeltaEntry>,
 	full: Option<FullPassReason>,
+	current_remote: bool,
 }
 
 impl PassScope {
@@ -938,6 +966,19 @@ impl PassScope {
 	pub(super) fn full_pass_reason(&self, baseline_items: usize) -> Option<FullPassReason> {
 		self.full
 			.or((baseline_items == 0).then_some(FullPassReason::EmptyBaseline))
+	}
+
+	/// Whether this pass reads the remote whole for a reason that wants it as it stands NOW — the
+	/// safety net or a caller's request — rather than as the cache last heard of it: while the
+	/// cache's socket is not live, such a pass has the cache catch up with the server first.
+	pub(super) fn wants_current_remote(&self) -> bool {
+		self.current_remote && self.full.is_some()
+	}
+
+	/// Record that this pass reads a remote nothing has been announcing changes for: its reason
+	/// becomes [`FullPassReason::RemoteEventsDegraded`], whatever made it whole.
+	pub(super) fn note_remote_events_degraded(&mut self) {
+		self.full = Some(FullPassReason::RemoteEventsDegraded);
 	}
 
 	/// The local paths this pass took, moved out — the input to

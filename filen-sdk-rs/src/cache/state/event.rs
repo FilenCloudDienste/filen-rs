@@ -245,17 +245,18 @@ pub(crate) enum CacheEventMaybeDecrypted<'a> {
 	FrontierAdvance {
 		id: u64,
 	},
-	/// A socket reconnect (`DecryptedSocketEvent::Reconnecting`). It carries no applied state and
-	/// is never persisted; it cues the worker to gap-check the disconnect window, because the
-	/// socket does not redeliver drive events that landed while it was down. Without this, a hole
-	/// opened during the reconnect window only heals on the next unrelated drive event or the next
-	/// worker boot.
+	/// A socket disconnect (`DecryptedSocketEvent::Reconnecting`, broadcast as a connected socket
+	/// goes down). It carries no applied state and is never persisted; it arms a gap-check of the
+	/// disconnect window for the next [`Connected`](Self::Connected), because the socket does not
+	/// redeliver drive events that landed while it was down. Read at the reconnect rather than
+	/// here, so the check covers the whole window: one read while the socket is still down misses
+	/// every change that lands after it and before the socket is back.
 	ResyncSignal,
 	/// The socket's subscription is LIVE (`DecryptedSocketEvent::AuthSuccess`): from here on, every
 	/// drive event the server emits is delivered to this listener. Carries no state and is never
-	/// persisted; it releases the worker's deferred startup gap-check (see
-	/// [`StartupGapCheck`](super::StartupGapCheck)), which must read the remote drive id strictly
-	/// AFTER the subscription exists or it races the first connect.
+	/// persisted; it releases the worker's deferred gap-check (see [`GapCheck`](super::GapCheck)),
+	/// the startup one or a reconnect's, which must read the remote drive id strictly AFTER the
+	/// subscription exists or it races the connect.
 	///
 	/// The socket broadcasts it on connect-promotion, and REPLAYS it to a listener added while
 	/// already connected — so a listener sees it exactly when it is live in a connected manager's
@@ -297,10 +298,9 @@ impl<'a> CacheEventMaybeDecrypted<'a> {
 					id: *drive_message_id,
 				})
 			}
-			// A reconnect: the socket won't redeliver drive events missed during the
-			// disconnect window, so signal the worker to gap-check proactively. Only a
-			// DISCONNECT of a connected manager fires this, so it never covers the FIRST
-			// connect — that is `Connected`'s job below.
+			// A disconnect: the socket won't redeliver drive events missed while it is down, so
+			// the worker gap-checks once it is back. Only a DISCONNECT of a connected manager
+			// fires this; the first connect's check is armed from the start.
 			DecryptedSocketEvent::Reconnecting => Some(Self::ResyncSignal),
 			// The subscription is live: releases the deferred startup gap-check.
 			DecryptedSocketEvent::AuthSuccess => Some(Self::Connected),

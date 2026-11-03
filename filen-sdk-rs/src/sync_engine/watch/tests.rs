@@ -13,11 +13,11 @@ use tokio::sync::Notify;
 
 use super::{
 	BASE_BACKOFF, Backoff, DEBOUNCE, FullPassReason, MAX_BACKOFF, MAX_DEBOUNCE_BURST,
-	MAX_SAFETY_NET, PairChanges, PairRoot, RemoteDoorbell, SAFETY_NET, SAFETY_NET_DUTY, Stop,
-	SyncReport, WatchConfig, WatchState, WatchStatus, backoff, local_event_handler, net_due,
-	net_interval, owes_a_pass, pass_outcome, publish_pass, reached_no_server,
-	read_both_sides_whole, start_local_watcher, triggers_pass, wait_for_next_pass,
-	wait_while_paused,
+	MAX_SAFETY_NET, PairChanges, PairRoot, RemoteDoorbell, RemoteLiveness, SAFETY_NET,
+	SAFETY_NET_DUTY, SOCKET_NOT_CONNECTED, Stop, SyncReport, WatchConfig, WatchState, WatchStatus,
+	backoff, local_event_handler, net_due, net_interval, owes_a_pass, pass_outcome, publish_pass,
+	reached_no_server, read_both_sides_whole, start_local_watcher, triggers_pass,
+	wait_for_next_pass, wait_while_paused,
 };
 use crate::{
 	Error, ErrorKind,
@@ -1515,4 +1515,70 @@ fn backoff_grows_then_caps_and_resets() {
 	// Capped, and never panicking on an absurd failure count.
 	assert_eq!(backoff(40), Some(MAX_BACKOFF));
 	assert_eq!(backoff(u32::MAX), Some(MAX_BACKOFF));
+}
+
+/// A stand-in subscription whose cache's socket liveness the test drives.
+struct Liveness(tokio::sync::watch::Receiver<bool>);
+
+impl RemoteLiveness for Liveness {
+	fn liveness(&self) -> Option<tokio::sync::watch::Receiver<bool>> {
+		Some(self.0.clone())
+	}
+}
+
+/// Once subscribed, the status says whether the cache's socket is connected, as it changes and
+/// with no pass in between: degraded while it is down — from the start, for a socket a firewall
+/// never lets connect — clear once it connects, degraded again when it drops. A refusal before the
+/// subscription is replaced by what the socket says.
+#[tokio::test]
+async fn the_status_says_while_the_caches_socket_is_not_connected() {
+	let (status, mut health) = tokio::sync::watch::channel(WatchStatus::default());
+	let mut remote = RemoteDoorbell::<Liveness>::new(1, Arc::new(Notify::new()));
+	remote
+		.subscribe(
+			|_| {
+				std::future::ready(Err(Error::custom(
+					ErrorKind::Reqwest,
+					"error sending request",
+				)))
+			},
+			&status,
+		)
+		.await;
+	assert!(health.borrow_and_update().remote_events_degraded.is_some());
+
+	let (socket, live) = tokio::sync::watch::channel(false);
+	remote
+		.subscribe(
+			|_| std::future::ready(Ok::<_, Error>(Liveness(live))),
+			&status,
+		)
+		.await;
+	let degraded = |health: &tokio::sync::watch::Receiver<WatchStatus>| {
+		health.borrow().remote_events_degraded.clone()
+	};
+	health
+		.wait_for(|status| status.remote_events_degraded.as_deref() == Some(SOCKET_NOT_CONNECTED))
+		.await
+		.unwrap();
+
+	socket.send_replace(true);
+	health
+		.wait_for(|status| status.remote_events_degraded.is_none())
+		.await
+		.unwrap();
+
+	socket.send_replace(false);
+	health
+		.wait_for(|status| status.remote_events_degraded.is_some())
+		.await
+		.unwrap();
+	assert_eq!(degraded(&health).as_deref(), Some(SOCKET_NOT_CONNECTED));
+
+	// The doorbell going away (the watch ending) stops the task: nothing writes the status after.
+	drop(remote);
+	tokio::task::yield_now().await;
+	socket.send_replace(true);
+	tokio::task::yield_now().await;
+	assert_eq!(degraded(&health).as_deref(), Some(SOCKET_NOT_CONNECTED));
 }
