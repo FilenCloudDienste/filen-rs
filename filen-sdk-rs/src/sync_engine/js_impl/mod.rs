@@ -507,7 +507,9 @@ impl SyncEngineCore {
 	/// Last, it waits for the releases of the locks they let go, at most
 	/// [`LOCK_RELEASE_SETTLE_BOUND`]: they run detached, and a host that exits once this returns
 	/// would cut them off and leave the account's drive lock held for every other device until
-	/// its lease lapses.
+	/// its lease lapses. Within the same bound it waits for the client's cache worker to exit when
+	/// this engine was its last user, which ends a resync listing the worker was running under the
+	/// drive lock and releases that lock; a worker another engine still uses keeps listing.
 	async fn close(self: Arc<Self>) -> Result<(), Error> {
 		let open = lock(&self.engine).take();
 		loop {
@@ -552,8 +554,15 @@ impl SyncEngineCore {
 			}
 		}
 		drop(open);
+		// One bound over both: the cache worker this engine was the last user of ends a listing
+		// it was running under the drive lock and settles that lock's release before it exits,
+		// and the releases of the locks the engine itself let go settle beside it.
+		let settled = tokio::time::Instant::now() + LOCK_RELEASE_SETTLE_BOUND;
 		self.client
-			.settle_lock_releases(LOCK_RELEASE_SETTLE_BOUND)
+			.settle_cache_worker(LOCK_RELEASE_SETTLE_BOUND)
+			.await;
+		self.client
+			.settle_lock_releases(settled.saturating_duration_since(tokio::time::Instant::now()))
 			.await;
 		Ok(())
 	}

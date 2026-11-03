@@ -271,6 +271,12 @@ pub(crate) struct CacheState {
 	catch_ups: Option<UnboundedReceiver<CatchUpRequest>>,
 	/// When the latest catch-up that reached the server ran (see [`CATCH_UP_REUSE`]).
 	caught_up_at: Option<TimerInstant>,
+	/// Set (or closed) once this worker is going away: its last handle dropped, or
+	/// [`Client::flush_cache`](crate::auth::Client::flush_cache) told it to stop (see
+	/// [`stopped`]). A resync listing under the drive lock ends at it, and lets the lock go, rather
+	/// than holding the lease for the rest of a listing nothing will use. `None` in unit-test
+	/// construction, where nothing stops the worker.
+	stop: Option<tokio::sync::watch::Receiver<bool>>,
 	/// Whether this worker's latest attempt to converge its roots could reach the server, shared
 	/// with the socket callback and with the worker's shared handle state, which a sync pass reads
 	/// it through.
@@ -354,6 +360,7 @@ impl CacheState {
 			gap_check: GapCheck::AwaitingSubscription,
 			catch_ups: None,
 			caught_up_at: None,
+			stop: None,
 			reach: Arc::default(),
 		};
 		state.init_db().unwrap();
@@ -395,6 +402,7 @@ impl CacheState {
 			gap_check: GapCheck::AwaitingSubscription,
 			catch_ups: None,
 			caught_up_at: None,
+			stop: None,
 			reach: Arc::default(),
 		};
 		state.init_db().unwrap();
@@ -434,6 +442,7 @@ impl CacheState {
 			gap_check: GapCheck::AwaitingSubscription,
 			catch_ups: None,
 			caught_up_at: None,
+			stop: None,
 			reach: Arc::default(),
 		};
 		state.init_db().unwrap();
@@ -657,6 +666,16 @@ async fn recv_catch_up(
 	}
 }
 
+/// Resolves once the worker is told to stop (see [`CacheState::stop`]): `true` sent, or the sender
+/// gone with the worker's last handle. Never without a stop channel.
+async fn stopped(stop: &mut Option<tokio::sync::watch::Receiver<bool>>) {
+	match stop {
+		// `Err` is the sender dropped, which is a stop as well.
+		Some(stop) => drop(stop.wait_for(|stop| *stop).await),
+		None => std::future::pending().await,
+	}
+}
+
 /// Body of the read-task `select!` arm, shared by the three select loops (the worker `run` loop and
 /// `run_resync`'s lock-wait + listing loops). A FREE fn over the two fields it touches — not a
 /// `&mut self` method — so it composes with the listing loop, where the `island` future holds a live
@@ -693,6 +712,7 @@ impl CacheState {
 		root_uuid: Uuid,
 		msg_sender: tokio::sync::mpsc::Sender<Vec<CacheMessage>>,
 		client: Arc<Client>,
+		stop: tokio::sync::watch::Receiver<bool>,
 	) -> Result<InitResult, crate::Error> {
 		let connection = open_sqlite(cache_path).map_err(|e| {
 			crate::Error::custom_with_source(
@@ -731,6 +751,7 @@ impl CacheState {
 			gap_check: GapCheck::AwaitingSubscription,
 			catch_ups: Some(catch_up_receiver),
 			caught_up_at: None,
+			stop: Some(stop),
 		};
 		let reach = cache_state.reach.clone();
 
@@ -796,7 +817,7 @@ impl CacheState {
 			// Deferred gap-check, released by the subscription after the boot or a disconnect.
 			// Checked at the top of the loop (not in the event arm) so it fires no matter WHICH
 			// drain saw the signal — `run_resync`'s lock-wait drains events too.
-			if self.gap_check == GapCheck::Due {
+			if self.gap_check == GapCheck::Due && !self.stopping() {
 				self.gap_check = GapCheck::Done;
 				// A failure is logged and recorded on `reach` by the check itself.
 				let _ = self.run_gap_check().await;
@@ -2805,6 +2826,14 @@ impl CacheState {
 		}
 	}
 
+	/// Whether the worker has been told to stop (see [`stop`](Self::stop)): it applies what it
+	/// holds and exits, and reads nothing more from the server on the way.
+	fn stopping(&self) -> bool {
+		self.stop
+			.as_ref()
+			.is_some_and(|stop| *stop.borrow() || stop.has_changed().is_err())
+	}
+
 	/// How long ago the latest catch-up that reached the server ran, while it still answers for
 	/// the remote (see [`catch_up`](Self::catch_up)).
 	fn recent_catch_up(&self) -> Option<Duration> {
@@ -3155,12 +3184,20 @@ impl CacheState {
 		// listing's duration. The tasks are pure SELECTs against `self.db`, which the island never
 		// touches (its DB work is in `finalize_resync`, after it returns). (Events are served the
 		// same way during the lock wait above, but NOT here — see the snapshot-consistency note.)
-		let listing: Result<_, crate::Error> = {
+		//
+		// A stop ends the listing where it stands (its requests are dropped mid-flight), so the
+		// drive lock goes now and its release, counted in the client's pending releases, is sent
+		// while the worker settles them on its way out (see `spawn_cache_worker`). Listed to the
+		// end, a worker whose app is quitting would hold the lease until the process exits, and the
+		// server for its whole TTL after. A registration change does not end it: other roots this
+		// worker serves still want the listing, and the change is applied once it lands.
+		let listing: Option<Result<_, crate::Error>> = {
 			let mut island = std::pin::pin!(island);
 			loop {
 				tokio::select! {
 					biased;
-					listing = &mut island => break listing,
+					listing = &mut island => break Some(listing),
+					() = stopped(&mut self.stop) => break None,
 					read_task = recv_read_task(&mut self.read_tasks), if self.read_tasks.is_some() => {
 						handle_read_task(read_task, &mut self.read_tasks, &self.db);
 					},
@@ -3169,6 +3206,16 @@ impl CacheState {
 		};
 		// Release the drive lock now — `finalize_resync` is local-only DB work.
 		drop(lock);
+
+		let Some(listing) = listing else {
+			tracing::debug!(
+				"resync: the worker is stopping; listing abandoned, drive lock released"
+			);
+			// Nothing is committed: the next worker on this DB resyncs. No retry timer, as the
+			// worker is on its way out.
+			self.abort_resync_unconverged(false);
+			return Ok(());
+		};
 
 		let (listing, transport) = match listing {
 			Ok(listing) => listing,

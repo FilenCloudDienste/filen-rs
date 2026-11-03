@@ -455,6 +455,95 @@ async fn run_gap_checks_at_the_subscription_after_a_disconnect() {
 	worker.await.unwrap();
 }
 
+/// A stop — the worker's last handle gone, or `flush_cache` — ends a resync listing under the drive
+/// lock where it stands and lets the lock go, so its release is sent while the worker settles its
+/// releases on the way out, instead of after a listing nothing will use: a host quitting
+/// meanwhile would leave the lease standing for its TTL. Until then the listing goes on. Here the
+/// proxy never answers the listing's read of the drive id, so only the stop ends it.
+#[cfg(feature = "sync-engine")]
+#[tokio::test]
+async fn a_stop_ends_a_listing_under_the_drive_lock_and_releases_the_lock() {
+	use crate::auth::http::{ClientConfig, test_support::GATEWAY_CONNECT};
+
+	let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+	let client = Arc::new(crate::auth::unauth::test_support::client_via_proxy(
+		ClientConfig::default(),
+		proxy.local_addr().unwrap(),
+	));
+	let (seen, mut connects) = tokio::sync::mpsc::unbounded_channel();
+	// Every request is held unanswered: the listing hangs, and the release stays pending.
+	let proxy = tokio::spawn(async move {
+		let mut held = Vec::new();
+		loop {
+			let (mut socket, _) = proxy.accept().await.unwrap();
+			let _ = seen.send(crate::auth::http::test_support::read_head(&mut socket).await);
+			held.push(socket);
+		}
+	});
+	// The drive lock the resync takes, already held in this process: the resync shares it and
+	// asks the server nothing for it.
+	let lock = Arc::new(crate::sync::lock::test_support::test_lock_on(
+		client.arc_client(),
+		None,
+	));
+	*client.drive_lock.write().await = Some(Arc::downgrade(&lock));
+	let (mut state, _producer) = CacheState::new_in_memory_with_producer();
+	state.set_test_resync_client(Arc::clone(&client));
+	let (stop, stop_receiver) = tokio::sync::watch::channel(false);
+	state.stop = Some(stop_receiver);
+	let resync = tokio::spawn(async move {
+		state.run_resync().await.unwrap();
+		state
+	});
+
+	let wait = Duration::from_secs(10);
+	let first = tokio::time::timeout(wait, connects.recv())
+		.await
+		.expect("the listing reads the drive id under the lock")
+		.unwrap();
+	assert!(first.starts_with(GATEWAY_CONNECT), "{first}");
+	// The resync now holds the only reference: dropping it releases the lease.
+	drop(lock);
+	tokio::time::sleep(Duration::from_millis(200)).await;
+	assert!(!resync.is_finished(), "the listing goes on until a stop");
+	assert!(connects.try_recv().is_err(), "and holds the lock");
+	assert!(
+		client
+			.client()
+			.pending_lock_releases
+			.settle(Duration::ZERO)
+			.await
+	);
+
+	stop.send_replace(true);
+	let state = tokio::time::timeout(wait, resync)
+		.await
+		.expect("the stop ends the listing")
+		.unwrap();
+	let release = tokio::time::timeout(
+		crate::sync::lock::LOCK_RELEASE_SETTLE_BOUND,
+		connects.recv(),
+	)
+	.await
+	.expect("the lock's release is sent within the bound")
+	.unwrap();
+	assert!(release.starts_with(GATEWAY_CONNECT), "{release}");
+	assert!(
+		!client
+			.client()
+			.pending_lock_releases
+			.settle(Duration::ZERO)
+			.await,
+		"counted in the releases the worker settles before it exits"
+	);
+	assert!(
+		state.needs_resync().unwrap(),
+		"nothing listed is committed, and the next worker resyncs"
+	);
+	assert!(state.stopping());
+	proxy.abort();
+}
+
 /// A catch-up whose asker has gone is dropped unanswered, and the worker carries on.
 #[tokio::test]
 async fn a_catch_up_whose_asker_has_gone_is_dropped() {

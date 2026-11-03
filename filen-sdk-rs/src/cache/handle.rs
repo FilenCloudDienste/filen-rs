@@ -132,9 +132,27 @@ pub(crate) struct CacheSlot {
 	/// permanently pending, so the cache is unrecoverable without a page reload (the in-memory
 	/// DB died with the worker anyway); init-time failures are bounded by the spawn ack timeout.
 	finished: Option<tokio::sync::watch::Receiver<bool>>,
+	/// The exit signal of the worker `worker` points at, spawned here or joined from another
+	/// `Client` (see [`CacheWorkerShared::exited`]): what [`Client::settle_cache_worker`] waits on
+	/// once the worker's last handle is gone.
+	// Read only by what the sync engine's bindings (and their tests) close with.
+	#[cfg_attr(
+		not(all(
+			feature = "sync-engine",
+			any(feature = "napi", feature = "uniffi", test)
+		)),
+		allow(dead_code)
+	)]
+	worker_exited: Option<tokio::sync::watch::Receiver<bool>>,
 }
 
 impl CacheSlot {
+	/// Point the slot at `shared`, the worker this client's handles use from now on.
+	fn use_worker(&mut self, shared: &Arc<CacheWorkerShared>) {
+		self.worker = Arc::downgrade(shared);
+		self.worker_exited = Some(shared.exited.clone());
+	}
+
 	/// The configured cache DB path, if [`Client::configure_cache`] has run. Stable while a
 	/// worker is live (reconfiguration is rejected then) — the search engine opens its own
 	/// READ-ONLY connection on it.
@@ -176,6 +194,14 @@ pub(crate) struct CacheWorkerShared {
 		allow(dead_code)
 	)]
 	catch_up_sender: UnboundedSender<CatchUpRequest>,
+	/// Tells the worker to stop a resync listing in progress (see `CacheState::stop`): sent by
+	/// [`Client::flush_cache`], and dropped with this shared state, so the listing ends as the
+	/// last handle goes. A worker several engines or `Client`s share keeps listing while any of
+	/// them holds a handle.
+	stop_listing: tokio::sync::watch::Sender<bool>,
+	/// Resolves to `true` once the worker has exited, its lock releases settled (see
+	/// [`CacheSlot::finished`]).
+	exited: tokio::sync::watch::Receiver<bool>,
 }
 
 /// Every live cache worker in this PROCESS, keyed by the DB it owns. Weak on purpose: the registry
@@ -482,6 +508,9 @@ impl Client {
 			// handles may outlive this flush, and they must not keep the websocket subscribed
 			// (and decrypting every drive event) for a dead worker.
 			let _ = shared.control_sender.send(CacheControlMessage::Shutdown);
+			// And end a resync listing in progress, which reads no control message until it is
+			// done, so its drive lock is released now rather than after the whole listing.
+			shared.stop_listing.send_replace(true);
 			drop(
 				shared
 					.listener_handle
@@ -498,6 +527,38 @@ impl Client {
 		// spawn a second worker onto the same DB file mid-shutdown, and a CANCELLED flush leaves
 		// the JoinHandle + exit signal in the slot for the next add/flush to reap.
 		wait_for_worker_exit(&mut slot).await;
+	}
+
+	/// Wait, for at most `bound`, for the cache worker this client's handles used to exit, once
+	/// they and every other holder are gone: a resync listing it was running under the drive lock
+	/// has ended, and its lock's release is sent or given up on (the worker settles its releases
+	/// before it exits). What a sync engine's close waits for, as the host may exit right after.
+	/// Returns at once while anything else still holds the worker (another engine on this
+	/// client, or another `Client` that joined it): its listing goes on for them.
+	#[cfg(all(
+		feature = "sync-engine",
+		any(feature = "napi", feature = "uniffi", test)
+	))]
+	pub(crate) async fn settle_cache_worker(&self, bound: Duration) {
+		let exited = {
+			let slot = self.cache_slot.lock().await;
+			if slot.worker.strong_count() > 0 {
+				return;
+			}
+			slot.worker_exited.clone()
+		};
+		let Some(mut exited) = exited else {
+			return;
+		};
+		// `Err` is a worker gone without signalling, which is gone all the same.
+		if tokio::time::timeout(bound, exited.wait_for(|exited| *exited))
+			.await
+			.is_err()
+		{
+			tracing::warn!(
+				"the cache worker did not exit within {bound:?}; a drive lock it held may stand until its lease lapses"
+			);
+		}
 	}
 
 	/// Return the live worker, or (re)spawn one from the stored config. The slot lock is held
@@ -518,7 +579,7 @@ impl Client {
 		// than spawn a second one onto the same database (see [`LIVE_WORKERS`]).
 		let key = registry_key(&config.path);
 		if let Some(shared) = join_live_worker(&key) {
-			slot.worker = Arc::downgrade(&shared);
+			slot.use_worker(&shared);
 			return Ok(shared);
 		}
 		// The previous worker (if any) is gone or on its way out — its senders are dropped or
@@ -530,7 +591,7 @@ impl Client {
 		// exit signal.)
 		wait_for_worker_exit(&mut slot).await;
 		let shared = spawn_cache_worker(client.clone(), &config, key, &mut slot).await?;
-		slot.worker = Arc::downgrade(&shared);
+		slot.use_worker(&shared);
 		register_worker(&shared);
 		Ok(shared)
 	}
@@ -579,6 +640,8 @@ async fn spawn_cache_worker(
 	let (res_sender, res_receiver) = tokio::sync::oneshot::channel();
 	let (msg_sender, mut msg_receiver) = tokio::sync::mpsc::channel(100);
 	let (finished_sender, finished_receiver) = tokio::sync::watch::channel(false);
+	let (stop_listing, stop) = tokio::sync::watch::channel(false);
+	let exited = finished_receiver.clone();
 
 	let root_uuid = client.root().uuid();
 	let cache_path = config.path.clone();
@@ -607,7 +670,7 @@ async fn spawn_cache_worker(
 			);
 			return;
 		}
-		let state = match CacheState::new(&cache_path, root_uuid, msg_sender, worker_client) {
+		let state = match CacheState::new(&cache_path, root_uuid, msg_sender, worker_client, stop) {
 			Ok((
 				state,
 				callback,
@@ -729,6 +792,8 @@ async fn spawn_cache_worker(
 			listener_handle: std::sync::Mutex::new(Some(listener_handle)),
 			reach,
 			catch_up_sender,
+			stop_listing,
+			exited,
 		})),
 		Err(e) => {
 			// Listener registration failed — dropping the just-spawned worker's senders
@@ -983,6 +1048,8 @@ impl SyncRootHandle {
 				listener_handle: std::sync::Mutex::new(None),
 				reach,
 				catch_up_sender,
+				stop_listing: tokio::sync::watch::Sender::new(false),
+				exited: tokio::sync::watch::Sender::new(false).subscribe(),
 			}),
 		}
 	}
@@ -996,6 +1063,20 @@ mod tests {
 		/// A worker handle with disconnected channels: the registry only ever stores and compares
 		/// IDENTITY, so nothing here needs a real worker behind it.
 		fn fake(db_path: PathBuf) -> Arc<Self> {
+			Self::fake_stopping(
+				db_path,
+				tokio::sync::watch::Sender::new(false),
+				tokio::sync::watch::Sender::new(false).subscribe(),
+			)
+		}
+
+		/// [`fake`](Self::fake), stopping a listing through `stop_listing` and exiting through
+		/// `exited`.
+		fn fake_stopping(
+			db_path: PathBuf,
+			stop_listing: tokio::sync::watch::Sender<bool>,
+			exited: tokio::sync::watch::Receiver<bool>,
+		) -> Arc<Self> {
 			let (control_sender, _) = tokio::sync::mpsc::unbounded_channel();
 			let (manual_event_sender, _) = tokio::sync::mpsc::channel(1);
 			let (read_task_sender, _) = tokio::sync::mpsc::unbounded_channel();
@@ -1008,8 +1089,97 @@ mod tests {
 				listener_handle: std::sync::Mutex::new(None),
 				reach: Arc::default(),
 				catch_up_sender: tokio::sync::mpsc::unbounded_channel().0,
+				stop_listing,
+				exited,
 			})
 		}
+	}
+
+	/// A worker's resync listing is told to stop only once its LAST handle goes, or the client
+	/// flushes the cache: a worker shared by several sync engines keeps listing for the others
+	/// while one of them closes.
+	#[tokio::test]
+	async fn a_listing_is_stopped_by_the_last_handle_or_a_flush() {
+		let handle = |shared: &Arc<CacheWorkerShared>| SyncRootHandle {
+			key: RootKey::Dir(Uuid::new_v4()),
+			registration_id: 0,
+			disarmed: true,
+			shared: Arc::clone(shared),
+		};
+		let (stop_listing, stop) = tokio::sync::watch::channel(false);
+		let shared = CacheWorkerShared::fake_stopping(
+			temp_db_path("stop"),
+			stop_listing,
+			tokio::sync::watch::Sender::new(false).subscribe(),
+		);
+		let (first, second) = (handle(&shared), handle(&shared));
+		drop(shared);
+		drop(first);
+		assert!(
+			matches!(stop.has_changed(), Ok(false)),
+			"another engine still holds the worker"
+		);
+		drop(second);
+		assert!(stop.has_changed().is_err(), "the last handle stops it");
+
+		let client = crate::auth::unauth::test_support::offline_client();
+		let (stop_listing, mut stop) = tokio::sync::watch::channel(false);
+		let shared = CacheWorkerShared::fake_stopping(
+			temp_db_path("flush"),
+			stop_listing,
+			tokio::sync::watch::Sender::new(false).subscribe(),
+		);
+		let _held = handle(&shared);
+		client.cache_slot.lock().await.use_worker(&shared);
+		drop(shared);
+		client.flush_cache().await;
+		assert!(
+			*stop.borrow_and_update(),
+			"a flush stops it while a handle remains"
+		);
+	}
+
+	/// A sync engine's close waits for the cache worker to exit only when nothing else holds it,
+	/// and for its bound at most.
+	#[cfg(feature = "sync-engine")]
+	#[tokio::test(start_paused = true)]
+	async fn settling_the_cache_worker_waits_only_for_one_going_away() {
+		let client = crate::auth::unauth::test_support::offline_client();
+		let bound = Duration::from_secs(5);
+		let begin = tokio::time::Instant::now();
+		client.settle_cache_worker(bound).await;
+		assert_eq!(begin.elapsed(), Duration::ZERO, "no worker");
+
+		let exit = tokio::sync::watch::Sender::new(false);
+		let shared = CacheWorkerShared::fake_stopping(
+			temp_db_path("settle"),
+			tokio::sync::watch::Sender::new(false),
+			exit.subscribe(),
+		);
+		client.cache_slot.lock().await.use_worker(&shared);
+		client.settle_cache_worker(bound).await;
+		assert_eq!(begin.elapsed(), Duration::ZERO, "another holder keeps it");
+
+		drop(shared);
+		client.settle_cache_worker(bound).await;
+		assert_eq!(
+			begin.elapsed(),
+			bound,
+			"a worker that never exits is waited for its bound"
+		);
+
+		let exiting = tokio::spawn(async move {
+			tokio::time::sleep(Duration::from_secs(1)).await;
+			exit.send_replace(true);
+		});
+		let begin = tokio::time::Instant::now();
+		client.settle_cache_worker(bound).await;
+		assert_eq!(
+			begin.elapsed(),
+			Duration::from_secs(1),
+			"and one that exits until it has"
+		);
+		exiting.await.unwrap();
 	}
 
 	/// A unique DB path under the temp dir — these tests share the one process-global registry, so
