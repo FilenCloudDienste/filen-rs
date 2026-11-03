@@ -448,6 +448,13 @@ pub(crate) fn print_in_app_docs(
 /// How long the docs server waits for a request before it looks for Ctrl-C again.
 const DOCS_SERVER_POLL: Duration = Duration::from_millis(200);
 
+/// Whether the tests turned opening a browser off, so that serving the docs in a test does not
+/// open one on the machine running it. `open` has no override of its own: on macOS it always runs
+/// `/usr/bin/open`.
+fn browser_disabled_for_testing() -> bool {
+	std::env::var("FILEN_CLI_TESTING_DISABLE_BROWSER") == Ok("1".to_string())
+}
+
 pub(crate) fn serve_markdown_docs_as_html(ui: &mut UI) -> Result<()> {
 	let parsed_doc_outline = PARSED_DOC_OUTLINE
 		.as_ref()
@@ -466,7 +473,9 @@ pub(crate) fn serve_markdown_docs_as_html(ui: &mut UI) -> Result<()> {
 		"Serving documentation at http://localhost:{} (press Ctrl-C to stop)",
 		server_port
 	));
-	if let Err(e) = open::that(format!("http://localhost:{}", server_port)) {
+	if !browser_disabled_for_testing()
+		&& let Err(e) = open::that(format!("http://localhost:{}", server_port))
+	{
 		log::warn!("Failed to open docs URL in browser automatically: {}", e);
 	}
 
