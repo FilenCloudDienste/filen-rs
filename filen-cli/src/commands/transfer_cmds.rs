@@ -343,7 +343,7 @@ async fn download_file(
 ) -> Result<()> {
 	progress.start_single_item(source.size());
 	client
-		.download_file_to_path(source, target, Some(progress.byte_callback()))
+		.download_file_to_path_unless_same_hash(source, target, Some(progress.byte_callback()))
 		.await
 		.context("Failed to download file")?;
 	progress.complete_single_item();

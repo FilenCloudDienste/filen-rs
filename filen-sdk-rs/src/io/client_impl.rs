@@ -585,8 +585,8 @@ pub(crate) enum KeepLocalWhen {
 	/// Its blake3 matches the remote's declared hash; with no declared hash it is replaced. For a
 	/// caller that records the path as holding the remote's bytes afterwards, which an mtime
 	/// cannot vouch for: a same-size remote replacement stamped no newer than the local file
-	/// would otherwise leave the old bytes in place. The sync engine is that caller.
-	#[cfg(feature = "sync-engine")]
+	/// would otherwise leave the old bytes in place. The sync engine and
+	/// [`IoSharedClientExt::download_file_to_path_unless_same_hash`] are those callers.
 	SameHash,
 }
 
@@ -617,7 +617,6 @@ fn needs_download(
 			Ok(computed_hash != expected_hash)
 		}
 		(None, KeepLocalWhen::SameHashOrNotOlder) => Ok(FilenMetaExt::modified(&meta) < mtime),
-		#[cfg(feature = "sync-engine")]
 		(None, KeepLocalWhen::SameHash) => Ok(true),
 	}
 }
@@ -745,6 +744,18 @@ pub trait IoSharedClientExt<'a>: SharedClient {
 		path: &Path,
 		callback: Option<MaybeSendCallback<'b, u64>>,
 	) -> Result<(), Error>;
+
+	/// Downloads `remote_file` to `path`, replacing the file already there unless its blake3
+	/// matches the hash `remote_file` declares. Unlike
+	/// [`download_file_to_path`](Self::download_file_to_path), a remote file that declares no hash
+	/// always replaces a local file of the same size, whatever their modification times.
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	async fn download_file_to_path_unless_same_hash<'b>(
+		&'b self,
+		remote_file: &'b dyn File,
+		path: &Path,
+		callback: Option<MaybeSendCallback<'b, u64>>,
+	) -> Result<(), Error>;
 }
 
 impl<'a, SC> IoSharedClientExt<'a> for SC
@@ -815,6 +826,16 @@ where
 			KeepLocalWhen::SameHashOrNotOlder,
 		)
 		.await
+	}
+
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	async fn download_file_to_path_unless_same_hash<'b>(
+		&'b self,
+		remote_file: &'b dyn File,
+		path: &Path,
+		callback: Option<MaybeSendCallback<'b, u64>>,
+	) -> Result<(), Error> {
+		download_to_path(self, remote_file, path, callback, KeepLocalWhen::SameHash).await
 	}
 }
 
@@ -1250,7 +1271,6 @@ mod needs_download_tests {
 		assert!(!check(&path, None, KeepLocalWhen::SameHashOrNotOlder));
 	}
 
-	#[cfg(feature = "sync-engine")]
 	#[test]
 	fn a_hashless_remote_of_the_same_size_replaces_a_newer_local_file_when_only_a_hash_may_keep_it()
 	{
@@ -1263,6 +1283,13 @@ mod needs_download_tests {
 		let (_dir, path) = newer_local_file();
 		let hash = Blake3Hash::from(blake3::hash(CONTENTS));
 		assert!(!check(&path, Some(hash), KeepLocalWhen::SameHashOrNotOlder));
+	}
+
+	#[test]
+	fn a_remote_declaring_the_local_files_hash_keeps_it_when_only_a_hash_may_keep_it() {
+		let (_dir, path) = newer_local_file();
+		let hash = Blake3Hash::from(blake3::hash(CONTENTS));
+		assert!(!check(&path, Some(hash), KeepLocalWhen::SameHash));
 	}
 
 	#[test]
