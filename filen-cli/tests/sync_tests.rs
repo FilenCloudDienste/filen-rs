@@ -11,7 +11,7 @@ use filen_cli::uuid_v5;
 use filen_macros::shared_test_runtime;
 use filen_sdk_rs::{
 	auth::Client,
-	fs::{HasName, categories::NonRootFileType},
+	fs::{HasName, HasUUID, categories::NonRootFileType},
 	io::client_impl::IoSharedClientExt as _,
 	sync_engine::SyncEngine,
 };
@@ -633,6 +633,335 @@ async fn sync_dry_run_prints_the_planned_upload_and_transfers_nothing() {
 	);
 }
 
+/// A file deleted locally is trashed on the remote by the next pass of a two-way pair.
+#[shared_test_runtime]
+async fn sync_once_trashes_on_the_remote_a_file_deleted_locally() {
+	// Not `get_resources_with_lock`, for the reason the first test gives.
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir_name = resources.dir.name().unwrap();
+	let local = assert_fs::TempDir::new().unwrap();
+	std::fs::write(local.path().join("gone.txt"), "deleted locally").unwrap();
+	std::fs::write(local.path().join("kept.txt"), "stays").unwrap();
+	let config_dir = assert_fs::TempDir::new().unwrap();
+	let pair = format!("{}:{test_dir_name}", local.path().to_str().unwrap());
+	assert_success(&sync_once(config_dir.path(), &pair, &[]).await);
+	let gone_path = format!("{test_dir_name}/gone.txt");
+	let gone_uuid = remote_file_uuid(client, &gone_path).await;
+
+	std::fs::remove_file(local.path().join("gone.txt")).unwrap();
+	let output = sync_once(config_dir.path(), &pair, &[]).await;
+
+	assert_success(&output);
+	assert!(
+		String::from_utf8_lossy(&output.stdout).contains("Trashing remote gone.txt"),
+		"{}",
+		describe(&output)
+	);
+	assert!(
+		client
+			.find_item_at_path(&gone_path)
+			.await
+			.unwrap()
+			.is_none(),
+		"{}",
+		describe(&output)
+	);
+	let (_, trashed) = client
+		.list_trash(None::<&fn(u64, Option<u64>)>)
+		.await
+		.unwrap();
+	assert!(
+		trashed.iter().any(|file| file.uuid() == gone_uuid),
+		"gone.txt is not in the trash\n{}",
+		describe(&output)
+	);
+	assert_eq!(
+		remote_content(client, &format!("{test_dir_name}/kept.txt")).await,
+		b"stays"
+	);
+}
+
+/// A pass that would delete most of what a pair tracks is held back, and exits with 1; the same
+/// pass run with `--approve-mass-deletions` applies it.
+#[shared_test_runtime]
+async fn sync_once_holds_a_mass_deletion_until_it_is_approved() {
+	// Not `get_resources_with_lock`, for the reason the first test gives.
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir_name = resources.dir.name().unwrap();
+	let local = assert_fs::TempDir::new().unwrap();
+	// more than the 10 deletions the default delete guard always allows, and more than half of
+	// the 13 files the pair tracks
+	let doomed = (0..12)
+		.map(|i| format!("doomed_{i:02}.txt"))
+		.collect::<Vec<_>>();
+	for name in &doomed {
+		std::fs::write(local.path().join(name), name).unwrap();
+	}
+	std::fs::write(local.path().join("kept.txt"), "stays").unwrap();
+	let config_dir = assert_fs::TempDir::new().unwrap();
+	let pair = format!("{}:{test_dir_name}", local.path().to_str().unwrap());
+	assert_success(&sync_once(config_dir.path(), &pair, &[]).await);
+	for name in &doomed {
+		std::fs::remove_file(local.path().join(name)).unwrap();
+	}
+
+	let held = sync_once(config_dir.path(), &pair, &[]).await;
+
+	assert_eq!(held.status.code(), Some(1), "{}", describe(&held));
+	assert!(
+		describe(&held).contains("Held back 12 deletions"),
+		"{}",
+		describe(&held)
+	);
+	assert_eq!(
+		remote_content(client, &format!("{test_dir_name}/doomed_00.txt")).await,
+		b"doomed_00.txt"
+	);
+
+	let approved = sync_once(config_dir.path(), &pair, &["--approve-mass-deletions"]).await;
+
+	assert_success(&approved);
+	for name in &doomed {
+		assert!(
+			client
+				.find_item_at_path(&format!("{test_dir_name}/{name}"))
+				.await
+				.unwrap()
+				.is_none(),
+			"{name} is still on the remote\n{}",
+			describe(&approved)
+		);
+	}
+	assert_eq!(
+		remote_content(client, &format!("{test_dir_name}/kept.txt")).await,
+		b"stays"
+	);
+}
+
+/// `--keep-remote` on a file changed on both sides downloads the remote version, and the local one
+/// it replaces goes to the local trash.
+#[shared_test_runtime]
+async fn sync_once_keeps_the_remote_version_of_a_conflict_with_keep_remote() {
+	// Not `get_resources_with_lock`, for the reason the first test gives.
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let test_dir_name = resources.dir.name().unwrap();
+	let (local, config_dir, pair) = diverged_pair(&resources).await;
+
+	let output = sync_once(config_dir.path(), &pair, &["--keep-remote", "fight.txt"]).await;
+
+	assert_success(&output);
+	assert_eq!(
+		std::fs::read_to_string(local.path().join("fight.txt")).unwrap(),
+		"the remote edit, which is longer"
+	);
+	assert_eq!(
+		remote_content(&resources.client, &format!("{test_dir_name}/fight.txt")).await,
+		b"the remote edit, which is longer"
+	);
+	assert_eq!(
+		local_trash(local.path(), "fight.txt"),
+		["the local edit"],
+		"{}",
+		describe(&output)
+	);
+}
+
+/// `--keep-remote` given a directory resolves a conflict on a file inside it.
+#[shared_test_runtime]
+async fn sync_once_keeps_the_remote_version_of_a_conflict_under_a_directory_given_to_keep_remote() {
+	// Not `get_resources_with_lock`, for the reason the first test gives.
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir_name = resources.dir.name().unwrap();
+	let local = assert_fs::TempDir::new().unwrap();
+	let config_dir = assert_fs::TempDir::new().unwrap();
+	let pair = format!("{}:{test_dir_name}", local.path().to_str().unwrap());
+	std::fs::create_dir(local.path().join("dir")).unwrap();
+	std::fs::write(local.path().join("dir/fight.txt"), "the agreed content").unwrap();
+	assert_success(&sync_once(config_dir.path(), &pair, &[]).await);
+
+	std::fs::write(local.path().join("dir/fight.txt"), "the local edit").unwrap();
+	let remote_dir = match client
+		.find_item_at_path(&format!("{test_dir_name}/dir"))
+		.await
+		.unwrap()
+	{
+		Some(NonRootFileType::Dir(dir)) => dir.uuid(),
+		other => panic!("expected a directory at {test_dir_name}/dir, got {other:?}"),
+	};
+	let file = client.make_file_builder("fight.txt", remote_dir).unwrap();
+	client
+		.upload_file(file, b"the remote edit, which is longer")
+		.await
+		.unwrap();
+
+	let output = sync_once(config_dir.path(), &pair, &["--keep-remote", "dir"]).await;
+
+	assert_success(&output);
+	assert_eq!(
+		std::fs::read_to_string(local.path().join("dir/fight.txt")).unwrap(),
+		"the remote edit, which is longer"
+	);
+	assert_eq!(
+		local_trash(local.path(), "dir/fight.txt"),
+		["the local edit"],
+		"{}",
+		describe(&output)
+	);
+}
+
+/// A pair registered by an earlier run is left alone by a run that is given another pair only.
+#[cfg(unix)]
+#[shared_test_runtime]
+async fn sync_watches_only_the_pairs_it_is_given() {
+	// Not `get_resources_with_lock`, for the reason the first test gives.
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir_name = resources.dir.name().unwrap();
+	let earlier_local = assert_fs::TempDir::new().unwrap();
+	let given_local = assert_fs::TempDir::new().unwrap();
+	let config_dir = assert_fs::TempDir::new().unwrap();
+	let earlier_root = earlier_local.path().to_str().unwrap();
+	let given_root = given_local.path().to_str().unwrap();
+	let earlier = format!("{earlier_root}:{test_dir_name}/earlier");
+	let given = format!("{given_root}:{test_dir_name}/given");
+	std::fs::write(earlier_local.path().join("first.txt"), "first run").unwrap();
+	assert_success(&sync_once(config_dir.path(), &earlier, &["--yes"]).await);
+	std::fs::write(earlier_local.path().join("later.txt"), "not synced").unwrap();
+	std::fs::write(given_local.path().join("given.txt"), "synced").unwrap();
+	let given_path = format!("{test_dir_name}/given/given.txt");
+
+	let output = sync_until(
+		config_dir.path(),
+		&["--pair", &given, "--yes"],
+		Duration::from_secs(120),
+		async || {
+			client
+				.find_item_at_path(&given_path)
+				.await
+				.unwrap()
+				.is_some()
+		},
+	)
+	.await;
+
+	// The run names each pair it starts on before it watches any, so this does not depend on how
+	// far a pass of the earlier pair would have got by the time the run was stopped.
+	let banners = String::from_utf8_lossy(&output.stdout)
+		.lines()
+		.filter(|line| line.starts_with("Syncing "))
+		.map(str::to_owned)
+		.collect::<Vec<_>>();
+	assert_eq!(banners.len(), 1, "{}", describe(&output));
+	assert!(banners[0].contains(given_root), "{}", describe(&output));
+	assert!(
+		!describe(&output).contains(earlier_root),
+		"the earlier pair was synced\n{}",
+		describe(&output)
+	);
+	// a weaker check, as it races with the stop: nothing of the earlier pair was uploaded
+	assert!(
+		client
+			.find_item_at_path(&format!("{test_dir_name}/earlier/later.txt"))
+			.await
+			.unwrap()
+			.is_none(),
+		"{}",
+		describe(&output)
+	);
+}
+
+/// A `localToRemote` pair uploads what is new locally, downloads nothing, and trashes on the remote
+/// what only the remote has.
+#[shared_test_runtime]
+async fn sync_once_local_to_remote_mirrors_the_local_side() {
+	// Not `get_resources_with_lock`, for the reason the first test gives.
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir_name = resources.dir.name().unwrap();
+	let local = assert_fs::TempDir::new().unwrap();
+	std::fs::write(local.path().join("first.txt"), "first pass").unwrap();
+	let config_dir = assert_fs::TempDir::new().unwrap();
+	let pair = format!("{}:ltc:{test_dir_name}", local.path().to_str().unwrap());
+	assert_success(&sync_once(config_dir.path(), &pair, &[]).await);
+	std::fs::write(local.path().join("second.txt"), "second pass").unwrap();
+	let file = client
+		.make_file_builder("remote_only.txt", resources.dir.uuid)
+		.unwrap();
+	client.upload_file(file, b"only remote").await.unwrap();
+
+	let output = sync_once(config_dir.path(), &pair, &[]).await;
+
+	assert_success(&output);
+	assert_eq!(
+		remote_content(client, &format!("{test_dir_name}/second.txt")).await,
+		b"second pass"
+	);
+	assert!(
+		client
+			.find_item_at_path(&format!("{test_dir_name}/remote_only.txt"))
+			.await
+			.unwrap()
+			.is_none(),
+		"{}",
+		describe(&output)
+	);
+	assert!(
+		!local.path().join("remote_only.txt").exists(),
+		"{}",
+		describe(&output)
+	);
+}
+
+/// A `remoteToLocal` pair downloads what is new on the remote, uploads nothing, and moves into the
+/// local trash what only the local side has.
+#[shared_test_runtime]
+async fn sync_once_remote_to_local_mirrors_the_remote_side() {
+	// Not `get_resources_with_lock`, for the reason the first test gives.
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir_name = resources.dir.name().unwrap();
+	let file = client
+		.make_file_builder("from_remote.txt", resources.dir.uuid)
+		.unwrap();
+	client.upload_file(file, b"from the remote").await.unwrap();
+	let local = assert_fs::TempDir::new().unwrap();
+	let config_dir = assert_fs::TempDir::new().unwrap();
+	let pair = format!("{}:ctl:{test_dir_name}", local.path().to_str().unwrap());
+	assert_success(&sync_once(config_dir.path(), &pair, &[]).await);
+	assert_eq!(
+		std::fs::read_to_string(local.path().join("from_remote.txt")).unwrap(),
+		"from the remote"
+	);
+	std::fs::write(local.path().join("local_only.txt"), "only local").unwrap();
+
+	let output = sync_once(config_dir.path(), &pair, &[]).await;
+
+	assert_success(&output);
+	assert!(
+		!local.path().join("local_only.txt").exists(),
+		"{}",
+		describe(&output)
+	);
+	assert_eq!(
+		local_trash(local.path(), "local_only.txt"),
+		["only local"],
+		"{}",
+		describe(&output)
+	);
+	assert!(
+		client
+			.find_item_at_path(&format!("{test_dir_name}/local_only.txt"))
+			.await
+			.unwrap()
+			.is_none(),
+		"{}",
+		describe(&output)
+	);
+}
+
 /// A pair whose first `sync --once` agreed on `fight.txt`, which has since been changed on both
 /// sides, with the local root and the config dir that holds its database.
 async fn diverged_pair(
@@ -763,4 +1092,24 @@ async fn remote_content(client: &Client, path: &str) -> Vec<u8> {
 		Some(NonRootFileType::File(file)) => client.download_file(file.as_ref()).await.unwrap(),
 		other => panic!("expected a file at {path}, got {other:?}"),
 	}
+}
+
+async fn remote_file_uuid(client: &Client, path: &str) -> Uuid {
+	match client.find_item_at_path(path).await.unwrap() {
+		Some(NonRootFileType::File(file)) => file.uuid(),
+		other => panic!("expected a file at {path}, got {other:?}"),
+	}
+}
+
+/// The contents of the copies of `rel_path` in the local trash of the pair rooted at `local_root`,
+/// one for each day directory that holds one.
+fn local_trash(local_root: &Path, rel_path: &str) -> Vec<String> {
+	let trash = local_root.join(".filen-sync-trash");
+	let Ok(days) = std::fs::read_dir(&trash) else {
+		return Vec::new();
+	};
+	days.map(|day| day.unwrap().path().join(rel_path))
+		.filter(|copy| copy.is_file())
+		.map(|copy| std::fs::read_to_string(copy).unwrap())
+		.collect()
 }
