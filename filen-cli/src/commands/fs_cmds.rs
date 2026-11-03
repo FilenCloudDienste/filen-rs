@@ -634,8 +634,11 @@ pub(crate) async fn create_directory_(
 			}
 		}
 	}?;
+	let Some(name) = directory.basename() else {
+		return Err(UI::failure("Cannot create root directory"));
+	};
 	client
-		.create_dir(&parent, directory.basename().unwrap())
+		.create_dir(&parent, name)
 		.await
 		.context("Failed to create directory")
 }
@@ -714,7 +717,8 @@ pub(crate) async fn delete_file_or_directory(
 /// Moves and/or renames a file or directory, following the semantics of the Unix `mv`:
 /// if the destination is an existing directory, the source is moved into it under its
 /// current name; otherwise the destination names the source's new path, so the source is
-/// moved to that path's parent directory and renamed to that path's base name.
+/// moved to that path's parent directory and renamed to that path's base name. A destination
+/// ending in '/' must be an existing directory.
 pub(crate) async fn move_file_or_directory(
 	ui: &mut UI,
 	client: &mut LazyClient,
@@ -723,6 +727,8 @@ pub(crate) async fn move_file_or_directory(
 	destination_str: &str,
 ) -> Result<()> {
 	let source_path = working_path.navigate(source_str);
+	// before navigating, which drops the trailing '/'
+	let destination_must_be_a_directory = names_a_directory(destination_str);
 	let destination_path = working_path.navigate(destination_str);
 	let client = client.get(ui).await?;
 	let Some(source) = client
@@ -752,9 +758,21 @@ pub(crate) async fn move_file_or_directory(
 	{
 		Some(NonRootFileType::Dir(dir)) => Some(DirType::Dir(dir)),
 		Some(NonRootFileType::Root(root)) => Some(DirType::Root(root)),
+		Some(NonRootFileType::File(_)) if destination_must_be_a_directory => {
+			return Err(UI::failure(&format!(
+				"Not a directory: {}",
+				destination_path.0
+			)));
+		}
 		Some(NonRootFileType::File(_)) => {
 			return Err(UI::failure(&format!(
 				"Destination already exists: {}",
+				destination_path.0
+			)));
+		}
+		None if destination_must_be_a_directory => {
+			return Err(UI::failure(&format!(
+				"No such destination directory: {}",
 				destination_path.0
 			)));
 		}
@@ -786,7 +804,10 @@ pub(crate) async fn move_file_or_directory(
 		}
 		// the destination doesn't exist, so it names the source's new path
 		None => {
-			let new_name = destination_path.basename().expect("cannot fail");
+			// only the root has no base name, and the root always exists
+			let Some(new_name) = destination_path.basename() else {
+				return Err(UI::failure("Cannot move onto the root directory"));
+			};
 			let parent_path = destination_path.parent();
 			let destination_dir = match client
 				.find_item_at_path(&parent_path.0)
@@ -866,6 +887,12 @@ pub(crate) async fn move_file_or_directory(
 	}
 	ui.print_success(&format!("Moved {} to {}", source_path.0, new_path.0));
 	Ok(())
+}
+
+/// Whether a raw `mv` destination names a directory to move into rather than a new path: it ends
+/// in '/', as in Unix `mv a dir/`.
+fn names_a_directory(destination: &str) -> bool {
+	destination.ends_with('/')
 }
 
 pub(crate) async fn copy_file_or_directory(
@@ -1259,6 +1286,21 @@ pub(crate) async fn empty_trash(ui: &mut UI, client: &mut LazyClient) -> Result<
 mod tests {
 	use super::*;
 	use crate::ui::test_support::Printed;
+
+	#[test]
+	fn a_destination_ending_in_a_slash_names_a_directory() {
+		assert!(names_a_directory("dir/"));
+		assert!(names_a_directory("/a/b/"));
+		assert!(names_a_directory("/"));
+	}
+
+	#[test]
+	fn a_destination_without_a_trailing_slash_may_name_a_new_path() {
+		assert!(!names_a_directory("dir"));
+		assert!(!names_a_directory("/a/b"));
+		assert!(!names_a_directory("dir/."));
+		assert!(!names_a_directory(""));
+	}
 
 	#[test]
 	fn a_file_up_to_the_limit_is_printed_to_a_terminal_without_asking() {
