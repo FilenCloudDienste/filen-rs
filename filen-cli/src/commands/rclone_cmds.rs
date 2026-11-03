@@ -213,7 +213,9 @@ pub(crate) async fn start_server(
 		Some(address) => parse_address(address)?,
 		None => ("127.0.0.1".to_owned(), default_port(args.protocol)),
 	};
+	let credentials_given = args.user.is_some() || args.password.is_some();
 	let auth = serve_auth(args.protocol, args.user, args.password)?;
+	let credentials_generated = !credentials_given && auth != ServeAuth::Unauthenticated;
 	let tls = match (args.cert, args.key) {
 		(Some(cert_path), Some(key_path)) => Some(ServeTls {
 			cert_path,
@@ -256,10 +258,23 @@ pub(crate) async fn start_server(
 		),
 		ServeAuth::Unauthenticated => "without authentication".to_owned(),
 	};
-	ui.print_success(&format!(
-		"Started {name} server on {address} {credentials} (press Ctrl-C to stop)"
-	));
+	print_started(
+		ui,
+		&format!("Started {name} server on {address} {credentials} (press Ctrl-C to stop)"),
+		credentials_generated,
+	);
 	wait_and_stop(ui, &daemon, ctrl_c, &format!("Stopping {name} server")).await
+}
+
+/// Prints that the server started, with its credentials. Even `--quiet` prints it when the
+/// credentials were generated, as they are printed nowhere else and the server cannot be used
+/// without them.
+fn print_started(ui: &mut UI, started: &str, credentials_generated: bool) {
+	if credentials_generated && ui.is_quiet() {
+		ui.print(started);
+	} else {
+		ui.print_success(started);
+	}
 }
 
 pub(crate) async fn execute_rclone(
@@ -604,7 +619,10 @@ pub(crate) fn parse_size(size: &str) -> Result<u64, String> {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::error::{exit_code, find_cli_error};
+	use crate::{
+		error::{exit_code, find_cli_error},
+		ui::test_support::Printed,
+	};
 
 	#[test]
 	fn sizes_parse_with_binary_suffixes() {
@@ -762,6 +780,39 @@ mod tests {
 		assert_eq!(format!("{err:#}"), "A restic server cannot be read-only");
 		assert!(check_serve_args(ServeProtocol::Restic, false).is_ok());
 		assert!(check_serve_args(ServeProtocol::Webdav, true).is_ok());
+	}
+
+	#[test]
+	fn generated_credentials_are_printed_when_quiet() {
+		let printed = Printed::default();
+		let mut ui = printed.ui();
+		ui.initialize(true, false, None, true, false);
+
+		print_started(
+			&mut ui,
+			"Started WebDAV server on http://127.0.0.1:1900 with username \"u\" and password \"p\" (press Ctrl-C to stop)",
+			true,
+		);
+
+		assert_eq!(
+			printed.lines(),
+			"Started WebDAV server on http://127.0.0.1:1900 with username \"u\" and password \"p\" (press Ctrl-C to stop)"
+		);
+	}
+
+	#[test]
+	fn given_credentials_are_not_printed_when_quiet() {
+		let printed = Printed::default();
+		let mut ui = printed.ui();
+		ui.initialize(true, false, None, true, false);
+
+		print_started(
+			&mut ui,
+			"Started WebDAV server on http://127.0.0.1:1900 with username \"u\" and password \"p\" (press Ctrl-C to stop)",
+			false,
+		);
+
+		assert_eq!(printed.lines_or_empty(), "");
 	}
 
 	#[test]
