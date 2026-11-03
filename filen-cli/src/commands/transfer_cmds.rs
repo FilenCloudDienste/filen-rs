@@ -27,6 +27,16 @@
 //! with `-v`, and so are the files a directory download leaves as they are for already holding
 //! the same contents.
 //!
+//! With `--include` and `--exclude`, a directory transfer takes only some of the items inside the
+//! directory. Both take a gitignore-style pattern, can be given several times, and match the path
+//! of an item relative to the transferred directory, case-insensitively: `*.jpg` matches every
+//! JPEG file, `photos/` every directory named `photos`, and `docs/*.md` the Markdown files
+//! directly inside `docs` at the top. With `--include`, only the files a pattern matches are
+//! transferred, along with everything inside a directory a pattern matches and the directories on
+//! the way to them; an excluded item is left out, a directory with everything inside it, even
+//! where an include pattern matches it. A file named as the item to transfer is transferred
+//! whatever the patterns say.
+//!
 //! An uploaded symlink is uploaded under its own name with the contents it points to. Inside an
 //! uploaded directory, symlinks are followed the same way; with `--no-follow-symlinks` they are
 //! skipped instead (neither the link nor what it points to is uploaded): listed with `-v`, counted
@@ -57,7 +67,7 @@ use std::{
 };
 
 use anyhow::{Context as _, Result};
-use clap::Subcommand;
+use clap::{Args, Subcommand};
 use clap_complete::engine::{ArgValueCompleter, PathCompleter};
 use console::{Term, style};
 use filen_sdk_rs::{
@@ -71,9 +81,11 @@ use filen_sdk_rs::{
 	},
 	io::{
 		CategoryDirDownloadExtPub as _, DirDownloadCallback, DirDownloadOptions, DirUploadCallback,
-		DirUploadOptions, ExistingLocalFile, ExistingRemoteFile, RemoteDirectory, RemoteFile,
-		SymlinkPolicy, TransferFilter, client_impl::IoSharedClientExt as _, is_safe_descendant,
+		DirUploadOptions, ExistingLocalFile, ExistingRemoteFile, PathMatcher, RemoteDirectory,
+		RemoteFile, SymlinkPolicy, TransferFilter, client_impl::IoSharedClientExt as _,
+		is_safe_descendant,
 	},
+	sync_engine::PathPatterns,
 	util::MaybeSendCallback,
 };
 use filen_types::fs::{ParentUuid, Uuid};
@@ -116,6 +128,8 @@ pub(crate) enum TransferCommands {
 		/// differs or it was modified since, and skip it otherwise (listed with -v)
 		#[arg(long)]
 		update: bool,
+		#[command(flatten)]
+		filter: FilterArgs,
 	},
 	/// Download a file or directory (recursively) from the Filen drive
 	Download {
@@ -130,7 +144,43 @@ pub(crate) enum TransferCommands {
 		/// Never replace a local file: skip each file whose local path is taken (listed with -v)
 		#[arg(long)]
 		no_clobber: bool,
+		#[command(flatten)]
+		filter: FilterArgs,
 	},
+}
+
+/// The flags choosing which items inside a transferred directory are transferred.
+#[derive(Debug, Args)]
+pub(crate) struct FilterArgs {
+	/// Transfer only the files inside a directory that match this gitignore-style pattern, along
+	/// with the directories on the way to them and everything inside a directory it matches
+	/// (repeatable)
+	#[arg(long, value_name = "PATTERN")]
+	include: Vec<String>,
+	/// Leave out the items inside a directory that match this gitignore-style pattern, a directory
+	/// with everything inside it, even where --include matches them (repeatable)
+	#[arg(long, value_name = "PATTERN")]
+	exclude: Vec<String>,
+}
+
+impl FilterArgs {
+	/// The filter the flags ask for, or a usage error naming a pattern that does not compile.
+	fn transfer_filter(&self) -> Result<TransferFilter> {
+		Ok(TransferFilter {
+			include: path_patterns(&self.include)?,
+			exclude: path_patterns(&self.exclude)?,
+		})
+	}
+}
+
+/// `patterns` compiled, or `None` when there are none.
+fn path_patterns(patterns: &[String]) -> Result<Option<Arc<dyn PathMatcher>>> {
+	if patterns.is_empty() {
+		return Ok(None);
+	}
+	let patterns = PathPatterns::parse(patterns.iter().map(String::as_str))
+		.map_err(|e| UI::usage_failure(&e.to_string()))?;
+	Ok(Some(Arc::new(patterns)))
 }
 
 /// The docs' "Transferring Files" section, before `sync`.
@@ -155,6 +205,7 @@ impl TransferCommands {
 				no_follow_symlinks,
 				skip_existing,
 				update,
+				filter,
 			} => {
 				let options = DirUploadOptions {
 					symlinks: if no_follow_symlinks {
@@ -163,7 +214,7 @@ impl TransferCommands {
 						SymlinkPolicy::Follow
 					},
 					existing: existing_remote_policy(skip_existing, update),
-					filter: TransferFilter::default(),
+					filter: filter.transfer_filter()?,
 				};
 				upload(
 					ui,
@@ -179,6 +230,7 @@ impl TransferCommands {
 				source,
 				destination,
 				no_clobber,
+				filter,
 			} => {
 				let options = DirDownloadOptions {
 					existing: if no_clobber {
@@ -186,7 +238,7 @@ impl TransferCommands {
 					} else {
 						ExistingLocalFile::ReplaceUnlessSame
 					},
-					filter: TransferFilter::default(),
+					filter: filter.transfer_filter()?,
 				};
 				download(
 					ui,
@@ -1452,12 +1504,13 @@ mod tests {
 	};
 
 	use super::{
-		DownloadSource, Existing, ProgressState, SPEED_WINDOW, TransferFailure, TransferKind,
-		TransferProgress, UploadTarget, canceled_message, download_target, existing_remote_policy,
-		format_duration, local_existing, progress_line, resolve_download_target,
-		resolve_upload_target, result_json, skipped_symlinks_line, transfer_summary,
+		DownloadSource, Existing, FilterArgs, ProgressState, SPEED_WINDOW, TransferFailure,
+		TransferKind, TransferProgress, UploadTarget, canceled_message, download_target,
+		existing_remote_policy, format_duration, local_existing, progress_line,
+		resolve_download_target, resolve_upload_target, result_json, skipped_symlinks_line,
+		transfer_summary,
 	};
-	use crate::util::RemotePath;
+	use crate::{error::CliError, util::RemotePath};
 
 	const MIB: u64 = 1024 * 1024;
 
@@ -1632,6 +1685,41 @@ mod tests {
 		assert_eq!(
 			(state.total_files, state.total_bytes, state.skipped_files),
 			(0, 0, 1)
+		);
+	}
+
+	fn filter_args(include: &[&str], exclude: &[&str]) -> FilterArgs {
+		FilterArgs {
+			include: include.iter().map(|p| (*p).to_owned()).collect(),
+			exclude: exclude.iter().map(|p| (*p).to_owned()).collect(),
+		}
+	}
+
+	#[test]
+	fn no_filter_flags_take_everything() {
+		let filter = filter_args(&[], &[]).transfer_filter().unwrap();
+		assert!(filter.include.is_none() && filter.exclude.is_none());
+	}
+
+	#[test]
+	fn the_filter_flags_match_gitignore_style() {
+		let filter = filter_args(&["*.jpg"], &["drafts/"])
+			.transfer_filter()
+			.unwrap();
+		let include = filter.include.unwrap();
+		let exclude = filter.exclude.unwrap();
+		assert!(include.matches("photos/a.JPG", false));
+		assert!(!include.matches("notes.txt", false));
+		assert!(exclude.matches("docs/drafts", true));
+		assert!(!exclude.matches("docs/drafts", false));
+	}
+
+	#[test]
+	fn a_pattern_that_does_not_compile_is_a_usage_error() {
+		let error = filter_args(&[], &["[z-a]"]).transfer_filter().unwrap_err();
+		assert_eq!(
+			error.downcast_ref::<CliError>().map(CliError::exit_code),
+			Some(2)
 		);
 	}
 
