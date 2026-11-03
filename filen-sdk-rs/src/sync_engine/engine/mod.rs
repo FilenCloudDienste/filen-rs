@@ -3065,6 +3065,19 @@ pub enum ConflictResolution {
 	KeepBoth,
 }
 
+/// What [`SyncEngine::resolve_conflict`] did with the copy that lost, for the caller to offer it
+/// back: at most one of the two is set.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConflictResolved {
+	/// Where in the pair's `.filen-sync-trash` bin the local copy went, when
+	/// [`KeepRemote`](ConflictResolution::KeepRemote) replaced different content.
+	pub quarantined: Option<PathBuf>,
+	/// The relative path [`KeepBoth`](ConflictResolution::KeepBoth) kept the losing copy at
+	/// (`<stem>.old.<ext>`), which the next pass uploads as a new file. `None` when there was no
+	/// local copy left to keep.
+	pub kept_as: Option<String>,
+}
+
 /// A `Synced` baseline row for `rel_path` with every side-specific field cleared — the base the
 /// resolution branches fill in with the winning side's anchor.
 fn synced_shell(rel_path: &str) -> BaselineEntry {
@@ -3922,12 +3935,14 @@ impl SyncEngine {
 	/// the remote's into the pair's `.filen-sync-trash` bin first: that edit was never uploaded, so
 	/// the download would otherwise destroy the only copy.
 	///
-	/// Returns where in the bin that copy went, so a caller can offer those bytes back without
-	/// walking `.filen-sync-trash`'s day buckets and guessing among ` (N)` siblings — the same thing
-	/// [`SyncEvent::Quarantined`](super::SyncEvent::Quarantined) does for a copy a PASS moved
-	/// aside. `None` when nothing was moved: the two sides held the same content, or the
-	/// resolution kept the local copy. [`KeepBoth`](ConflictResolution::KeepBoth) is `None` too —
-	/// the copy it renames aside stays in the tree, where the caller can already see it.
+	/// Returns where the losing copy went ([`ConflictResolved`]), so a caller can offer it back
+	/// without walking `.filen-sync-trash`'s day buckets and guessing among ` (N)` siblings, or
+	/// searching the directory for the `.old` name: the bin path a
+	/// [`KeepRemote`](ConflictResolution::KeepRemote) moved a different local copy to — the same
+	/// thing [`SyncEvent::Quarantined`](super::SyncEvent::Quarantined) does for a copy a PASS moved
+	/// aside — or the relative path a [`KeepBoth`](ConflictResolution::KeepBoth) kept it at. Both
+	/// are `None` when nothing was moved: the two sides held the same content, the resolution kept
+	/// the local copy, or a keep-both found no local copy left to keep.
 	///
 	/// A resolution never interleaves with a pass: a pass still reading the pair, or recording the
 	/// conflicts it read, is waited for, since the rows it writes would overwrite this one. A
@@ -3944,7 +3959,7 @@ impl SyncEngine {
 		pair: PairId,
 		rel_path: &str,
 		resolution: ConflictResolution,
-	) -> Result<Option<PathBuf>, Error> {
+	) -> Result<ConflictResolved, Error> {
 		// The gate (refusing an unknown pair) keeps a removal waiting for this call; the lock keeps
 		// it out of a pass's read. The retirement is read AFTER the lock, since a removal may start
 		// while this waits for it.
@@ -3978,27 +3993,28 @@ impl SyncEngine {
 		// A divergence this engine's own push created is resolved against the SERVER's version
 		// history rather than against what the remote holds now — our upload is what it holds.
 		if held.state == BaselineState::Overwritten {
-			let quarantined = self
+			let resolved = self
 				.resolve_overwritten(pair, &record, rel_path, &held, resolution)
 				.await?;
 			self.note_resolution(pair).await;
-			return Ok(quarantined);
+			return Ok(resolved);
 		}
 
 		// Where a local copy this resolution moved aside ended up, for the caller to offer back.
-		let mut quarantined = None;
+		let mut kept = ConflictResolved::default();
 		let mut winner = resolution;
 		if winner == ConflictResolution::KeepBoth {
 			// Move the losing local copy out of the way FIRST, then resolve the path itself to the
 			// remote: the moved-aside copy has no baseline row, so it uploads as a new file.
 			if held.local_kind.is_some() {
-				let moved = apply::rename_aside(
+				kept.kept_as = apply::rename_aside(
 					Path::new(&record.local_root),
 					self.pair_root(record.remote_root),
 					rel_path,
 				)?;
 				tracing::debug!(
-					"resolve_conflict[pair {pair}]: kept the local copy of {rel_path:?} aside as {moved:?}"
+					"resolve_conflict[pair {pair}]: kept the local copy of {rel_path:?} aside as {:?}",
+					kept.kept_as
 				);
 				held.local_kind = None;
 			}
@@ -4012,13 +4028,14 @@ impl SyncEngine {
 			// The losing local edit goes to the bin, as the `Overwritten` shape's does. Anchoring the
 			// row to it instead would let the next pass vouch for it and download straight over it.
 			// With the local side emptied the path resolves the way `KeepBoth` leaves it.
-			quarantined = bin::quarantine_local(
+			kept.quarantined = bin::quarantine_local(
 				Path::new(&record.local_root),
 				rel_path,
 				Utc::now().date_naive(),
 			)?;
 			tracing::debug!(
-				"resolve_conflict[pair {pair}]: quarantined the local copy of {rel_path:?} as {quarantined:?}"
+				"resolve_conflict[pair {pair}]: quarantined the local copy of {rel_path:?} as {:?}",
+				kept.quarantined
 			);
 			held.local_kind = None;
 		}
@@ -4034,7 +4051,7 @@ impl SyncEngine {
 		.await?
 		.map_err(|e| db_error(e, "resolving a conflict"))?;
 		self.note_resolution(pair).await;
-		Ok(quarantined)
+		Ok(kept)
 	}
 
 	/// Record that a resolution is waiting to be applied at a path, so the next pass reads both
@@ -4067,7 +4084,8 @@ impl SyncEngine {
 	///   clients end up holding both files instead of one of them silently losing an edit.
 	///
 	/// Returns where our own copy went in the bin — the `KeepRemote` branch, the only one that
-	/// moves one — for [`resolve_conflict`](Self::resolve_conflict) to hand on.
+	/// moves one — or where `KeepBoth` fetched the buried version to, for
+	/// [`resolve_conflict`](Self::resolve_conflict) to hand on.
 	async fn resolve_overwritten(
 		&self,
 		pair: PairId,
@@ -4075,7 +4093,7 @@ impl SyncEngine {
 		rel_path: &str,
 		held: &BaselineEntry,
 		resolution: ConflictResolution,
-	) -> Result<Option<PathBuf>, Error> {
+	) -> Result<ConflictResolved, Error> {
 		let buried_uuid = held.remote_uuid.ok_or_else(|| {
 			Error::custom(
 				ErrorKind::InvalidState,
@@ -4083,7 +4101,7 @@ impl SyncEngine {
 			)
 		})?;
 		let local_root = Path::new(&record.local_root);
-		let mut quarantined = None;
+		let mut resolved = ConflictResolved::default();
 		match resolution {
 			ConflictResolution::KeepLocal => {}
 			ConflictResolution::KeepBoth => {
@@ -4096,6 +4114,7 @@ impl SyncEngine {
 				tracing::debug!(
 					"resolve_conflict[pair {pair}]: kept the buried version of {rel_path:?} as {aside:?}"
 				);
+				resolved.kept_as = Some(aside);
 			}
 			ConflictResolution::KeepRemote => {
 				// The head by LINEAGE, never the version chain's first entry: the chain is sorted by
@@ -4129,9 +4148,11 @@ impl SyncEngine {
 				}
 				// Our own copy goes to the bin rather than under the download: the restored version
 				// is what this resolution asked for, and the bytes it replaces are not lost.
-				quarantined = bin::quarantine_local(local_root, rel_path, Utc::now().date_naive())?;
+				resolved.quarantined =
+					bin::quarantine_local(local_root, rel_path, Utc::now().date_naive())?;
 				tracing::debug!(
-					"resolve_conflict[pair {pair}]: restored the version buried at {rel_path:?} and quarantined the local copy as {quarantined:?}"
+					"resolve_conflict[pair {pair}]: restored the version buried at {rel_path:?} and quarantined the local copy as {:?}",
+					resolved.quarantined
 				);
 			}
 		}
@@ -4142,7 +4163,7 @@ impl SyncEngine {
 		off_store(&store, move |store| store.delete_entry(pair, &resolving))
 			.await?
 			.map_err(|e| db_error(e, "resolving a conflict"))?;
-		Ok(quarantined)
+		Ok(resolved)
 	}
 
 	/// The remote file objects for `uuids`, read whole out of the cache (see

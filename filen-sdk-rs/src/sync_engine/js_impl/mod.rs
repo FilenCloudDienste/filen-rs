@@ -55,8 +55,8 @@ pub use self::uniffi_impl::SyncEngineListener;
 use self::{
 	delivery::{Delivery, Listener, ListenerSlot, spawn_delivery},
 	types::{
-		SyncConflictPage, SyncPairActivity, SyncPauseOptions, SyncPlanSummary, SyncWatchConfig,
-		page, path_string,
+		SyncConflictPage, SyncConflictResolved, SyncPairActivity, SyncPauseOptions,
+		SyncPlanSummary, SyncWatchConfig, page,
 	},
 };
 use crate::{
@@ -853,14 +853,14 @@ impl SyncEngineCore {
 		pair_id: u64,
 		rel_path: &str,
 		resolution: ConflictResolution,
-	) -> Result<Option<String>, Error> {
+	) -> Result<SyncConflictResolved, Error> {
 		let pair = pair_id_in(pair_id)?;
-		let quarantined = self
+		let resolved = self
 			.engine()?
 			.engine
 			.resolve_conflict(pair, rel_path, resolution)
 			.await?;
-		Ok(quarantined.map(path_string))
+		Ok(resolved.into())
 	}
 
 	async fn retry_path(&self, pair_id: u64, rel_path: &str) -> Result<(), Error> {
@@ -1301,15 +1301,16 @@ impl JsSyncEngine {
 		.await
 	}
 
-	/// Resolve the conflict held at `rel_path`, from the next pass on. Returns where the local copy
-	/// was quarantined when `KeepRemote` replaced different content.
+	/// Resolve the conflict held at `rel_path`, from the next pass on. Returns where the copy that
+	/// lost went: the bin path when `KeepRemote` replaced different local content, or the relative
+	/// path `KeepBoth` kept the local copy at.
 	#[napi_export]
 	pub async fn resolve_conflict(
 		&self,
 		pair_id: u64,
 		rel_path: String,
 		resolution: ConflictResolution,
-	) -> Result<Option<String>, Error> {
+	) -> Result<SyncConflictResolved, Error> {
 		detached(Arc::clone(&self.core), move |core| async move {
 			core.resolve_conflict(pair_id, &rel_path, resolution).await
 		})

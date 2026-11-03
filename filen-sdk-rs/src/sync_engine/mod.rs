@@ -92,7 +92,7 @@ pub use apply::SyncReport;
 pub use baseline::{PairId, PairRecord};
 pub use changes::FullPassReason;
 pub use engine::{
-	BaselineInUse, BaselineSchemaMismatch, CONFIRM_TENURE, ConflictResolution,
+	BaselineInUse, BaselineSchemaMismatch, CONFIRM_TENURE, ConflictResolution, ConflictResolved,
 	PATH_FAILURE_RETRY_INTERVAL, PairOverlap, SyncEngine,
 };
 pub use events::{LocalScanProgress, SyncEvent, SyncObserver, TransferDirection};

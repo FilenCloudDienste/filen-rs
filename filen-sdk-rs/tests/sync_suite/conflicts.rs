@@ -16,7 +16,7 @@ use filen_sdk_rs::fs::categories::{DirType, Normal};
 use filen_sdk_rs::fs::file::RemoteFile;
 use filen_sdk_rs::fs::{HasName, HasUUID};
 use filen_sdk_rs::sync_engine::{
-	CONFIRM_TENURE, ConflictResolution, SyncEngine, SyncEvent, SyncMode,
+	CONFIRM_TENURE, ConflictResolution, ConflictResolved, SyncEngine, SyncEvent, SyncMode,
 };
 use uuid::Uuid;
 
@@ -2255,7 +2255,7 @@ async fn conflict_16_resolve_keep_local() {
 			.resolve_conflict(sc.pair, "conf.txt", ConflictResolution::KeepLocal)
 			.await
 			.expect("resolve keep-local"),
-		None,
+		ConflictResolved::default(),
 		"keep-local moves no copy into the bin"
 	);
 	let r4 = sc.sync().await;
@@ -2319,6 +2319,7 @@ async fn conflict_17_resolve_keep_remote() {
 		.resolve_conflict(sc.pair, "conf2.txt", ConflictResolution::KeepRemote)
 		.await
 		.expect("resolve keep-remote")
+		.quarantined
 		.expect("keep-remote must say where the losing local edit went");
 	assert_eq!(
 		std::fs::read(&quarantined).unwrap(),
@@ -2377,8 +2378,11 @@ async fn conflict_19_conflict_copy_naming_no_collision_or_recursion() {
 			.resolve_conflict(sc.pair, "a.txt", ConflictResolution::KeepBoth)
 			.await
 			.expect("first keep-both"),
-		None,
-		"keep-both leaves its copy in the tree, not in the bin"
+		ConflictResolved {
+			quarantined: None,
+			kept_as: Some("a.old.txt".to_string()),
+		},
+		"keep-both leaves its copy in the tree, not in the bin, and names it"
 	);
 	assert!(
 		read_eq(&sc.local, "a.old.txt", b"LOCAL-1"),
@@ -2411,8 +2415,11 @@ async fn conflict_19_conflict_copy_naming_no_collision_or_recursion() {
 			.resolve_conflict(sc.pair, "a.txt", ConflictResolution::KeepBoth)
 			.await
 			.expect("second keep-both"),
-		None,
-		"keep-both leaves its copy in the tree, not in the bin"
+		ConflictResolved {
+			quarantined: None,
+			kept_as: Some("a.old.1.txt".to_string()),
+		},
+		"keep-both leaves its copy in the tree, not in the bin, and names it"
 	);
 
 	// A DISTINCT name: the first preserved copy is untouched, the second gets its own.
@@ -2468,8 +2475,11 @@ async fn conflict_add_resolved_copy_round_trips() {
 			.resolve_conflict(sc.pair, "c.txt", ConflictResolution::KeepBoth)
 			.await
 			.expect("keep-both"),
-		None,
-		"keep-both leaves its copy in the tree, not in the bin"
+		ConflictResolved {
+			quarantined: None,
+			kept_as: Some("c.old.txt".to_string()),
+		},
+		"keep-both leaves its copy in the tree, not in the bin, and names it"
 	);
 
 	// Pass 1 after the resolution: the copy uploads once, the remote copy is pulled.
@@ -2627,7 +2637,7 @@ async fn conflict_18_conflict_persists_across_restart() {
 			.resolve_conflict(pair2, "persist.txt", ConflictResolution::KeepLocal)
 			.await
 			.expect("resolve keep-local after the restart"),
-		None,
+		ConflictResolved::default(),
 		"keep-local moves no copy into the bin"
 	);
 	let r4 = engine2.sync_once(pair2).await.unwrap();
@@ -2826,13 +2836,17 @@ async fn conflict_26_same_round_edits_surface_on_the_superseded_client() {
 			.resolve_conflict(win_pair, "race.txt", ConflictResolution::KeepBoth)
 			.await
 			.unwrap(),
-		None,
-		"keep-both leaves its copy in the tree, not in the bin"
+		ConflictResolved {
+			quarantined: None,
+			kept_as: Some("race.old.txt".to_string()),
+		},
+		"keep-both leaves its copy in the tree, not in the bin, and names it"
 	);
 	let gave_way = lose_engine
 		.resolve_conflict(lose_pair, "race.txt", ConflictResolution::KeepRemote)
 		.await
 		.unwrap()
+		.quarantined
 		.expect("the side that gave way must be told where its own copy went");
 	assert_eq!(
 		std::fs::read(&gave_way).unwrap().as_slice(),
@@ -3176,6 +3190,7 @@ async fn conflict_28_keep_remote_restores_the_buried_edit() {
 		.resolve_conflict(win_pair, "race.txt", ConflictResolution::KeepRemote)
 		.await
 		.unwrap()
+		.quarantined
 		.expect("restoring the buried version must say where our own copy went");
 	assert_eq!(
 		std::fs::read(&ours_aside).unwrap().as_slice(),

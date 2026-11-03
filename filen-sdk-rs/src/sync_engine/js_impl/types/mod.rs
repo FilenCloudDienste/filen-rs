@@ -12,11 +12,11 @@ use crate::{
 	Error, ErrorKind,
 	job::millis,
 	sync_engine::{
-		BaselineInUse, BaselineSchemaMismatch, DeleteGuard, GuardReason, HaltReason, IgnoredPath,
-		LocalScanProgress, PairId, PairOverlap, PairRecord, PauseMode, PauseOptions, PlanOutcome,
-		PlannedAction, PlannedActionKind, PlannedConflict, RefuseReason, ScanGap, ScanGapCause,
-		SyncEvent, SyncMode, SyncReport, TransferDirection, UnsyncablePath, WatchConfig,
-		WatchStatus,
+		BaselineInUse, BaselineSchemaMismatch, ConflictResolved, DeleteGuard, GuardReason,
+		HaltReason, IgnoredPath, LocalScanProgress, PairId, PairOverlap, PairRecord, PauseMode,
+		PauseOptions, PlanOutcome, PlannedAction, PlannedActionKind, PlannedConflict, RefuseReason,
+		ScanGap, ScanGapCause, SyncEvent, SyncMode, SyncReport, TransferDirection, UnsyncablePath,
+		WatchConfig, WatchStatus,
 	},
 };
 
@@ -684,6 +684,31 @@ impl From<&PlanOutcome> for SyncPlanSummary {
 			unsyncable_total: unsyncable.len() as u64,
 			ignored_total: ignored.len() as u64,
 			refused: *refused,
+		}
+	}
+}
+
+/// Where a conflict resolution put the copy that lost; at most one is set (see
+/// [`ConflictResolved`]).
+#[js_type(export, no_deser, napi)]
+pub struct SyncConflictResolved {
+	/// The bin path a `KeepRemote` moved a different local copy to.
+	pub quarantined: Option<String>,
+	/// The relative path a `KeepBoth` kept the losing copy at (`<stem>.old.<ext>`), which the next
+	/// pass uploads as a new file.
+	pub kept_as: Option<String>,
+}
+
+impl From<ConflictResolved> for SyncConflictResolved {
+	fn from(
+		ConflictResolved {
+			quarantined,
+			kept_as,
+		}: ConflictResolved,
+	) -> Self {
+		Self {
+			quarantined: quarantined.map(path_string),
+			kept_as,
 		}
 	}
 }

@@ -5014,7 +5014,7 @@ async fn a_pairs_store_hold_does_not_delay_another_pairs_control_verbs() {
 			.resolve_conflict(pair_b, "a.txt", ConflictResolution::KeepLocal)
 			.await
 			.unwrap(),
-		None,
+		ConflictResolved::default(),
 		"keeping the local side moves no copy into the bin"
 	);
 	let elapsed = started.elapsed();
@@ -6099,7 +6099,7 @@ async fn a_resolution_waits_for_the_pass_reading_the_pair() {
 	assert!(pass.await.unwrap().is_err());
 	assert_eq!(
 		resolving.await.unwrap().unwrap(),
-		None,
+		ConflictResolved::default(),
 		"keeping the local side moves no copy into the bin"
 	);
 	assert_eq!(
@@ -6134,7 +6134,7 @@ async fn a_paused_pair_is_still_resolvable() {
 			.resolve_conflict(pair, "a.txt", ConflictResolution::KeepLocal)
 			.await
 			.expect("a paused pair must stay resolvable"),
-		None
+		ConflictResolved::default()
 	);
 
 	drop(engine);
@@ -6197,6 +6197,7 @@ async fn keeping_remote_quarantines_a_local_edit_the_remote_never_had() {
 		.resolve_conflict(pair, "a.txt", ConflictResolution::KeepRemote)
 		.await
 		.unwrap()
+		.quarantined
 		.expect("the resolution has to say where it put the copy it moved aside");
 	let after = Utc::now().date_naive();
 	let in_bucket = |day| bucket(&root, day).join("a.txt");
@@ -6232,7 +6233,7 @@ async fn keeping_remote_quarantines_a_local_edit_the_remote_never_had() {
 			.resolve_conflict(pair, "b.txt", ConflictResolution::KeepRemote)
 			.await
 			.unwrap(),
-		None,
+		ConflictResolved::default(),
 		"nothing was moved aside, so there is no path to name"
 	);
 	assert!(root.join("b.txt").exists());
@@ -6243,6 +6244,70 @@ async fn keeping_remote_quarantines_a_local_edit_the_remote_never_had() {
 	drop(engine);
 	std::fs::remove_file(&path).ok();
 	std::fs::remove_dir_all(&root).ok();
+}
+
+/// Keeping both sides of an ordinary conflict renames the local copy aside and NAMES the path it
+/// kept it at, so a caller can tell the user where their copy went without searching the
+/// directory for the `.old` name; a second keep-both at the same path names the next free name.
+/// With the local copy already gone there is nothing to keep, and no path to name.
+#[tokio::test]
+async fn keeping_both_names_the_path_it_kept_the_local_copy_at() {
+	let path = std::env::temp_dir().join(format!("filen_sync_keep_both_{}.db", Uuid::new_v4()));
+	let root = tempfile::tempdir().unwrap();
+	let engine = SyncEngine::open(Arc::new(offline_client()), path.clone())
+		.await
+		.unwrap();
+	let (pair, _) = locked(&engine.control)
+		.create_pair(
+			root.path().to_str().unwrap(),
+			Uuid::new_v4(),
+			SyncMode::TwoWay,
+		)
+		.unwrap();
+	let store = engine.pair_store(pair).await.unwrap();
+	let diverged = |rel_path: &str| BaselineEntry {
+		rel_path: rel_path.to_string(),
+		remote_hash: Some(hash(4)),
+		..converged_conflict(Uuid::new_v4())
+	};
+
+	std::fs::create_dir(root.path().join("d")).unwrap();
+	std::fs::write(root.path().join("d/a.txt"), b"LOCAL").unwrap();
+	std::fs::write(root.path().join("d/a.old.txt"), b"TAKEN").unwrap();
+	locked(&store)
+		.upsert_entry(pair, &diverged("d/a.txt"))
+		.unwrap();
+	assert_eq!(
+		engine
+			.resolve_conflict(pair, "d/a.txt", ConflictResolution::KeepBoth)
+			.await
+			.unwrap(),
+		ConflictResolved {
+			quarantined: None,
+			kept_as: Some("d/a.old.1.txt".to_string()),
+		},
+		"the copy is named by its relative path, past a name already taken"
+	);
+	assert_eq!(
+		std::fs::read(root.path().join("d/a.old.1.txt")).unwrap(),
+		b"LOCAL"
+	);
+	assert!(!root.path().join("d/a.txt").exists());
+
+	// The local copy went before the resolution: nothing to keep, nothing named.
+	locked(&store)
+		.upsert_entry(pair, &diverged("gone.txt"))
+		.unwrap();
+	assert_eq!(
+		engine
+			.resolve_conflict(pair, "gone.txt", ConflictResolution::KeepBoth)
+			.await
+			.unwrap(),
+		ConflictResolved::default()
+	);
+
+	drop(engine);
+	std::fs::remove_file(&path).ok();
 }
 
 /// A pass prunes its pair's bin at most once a UTC day: the first pass of a day deletes the

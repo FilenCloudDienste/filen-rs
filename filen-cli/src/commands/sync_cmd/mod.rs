@@ -186,7 +186,7 @@ pub(crate) async fn sync(
 							.iter()
 							.find(|(path, _)| path.starts_with(rel_path))
 					{
-						let trashed_path = engine
+						let resolved = engine
 							.resolve_conflict(pair_id, rel_path, *resolution)
 							.await
 							.with_context(|| {
@@ -204,7 +204,13 @@ pub(crate) async fn sync(
 								ConflictResolution::KeepBoth => "kept both versions",
 							}
 						));
-						if let Some(trashed_path) = trashed_path {
+						if let Some(kept_as) = resolved.kept_as {
+							print_event(&format!(
+								"{} Conflict resolved for {rel_path}, local copy kept as {kept_as}",
+								approved_tag
+							));
+						}
+						if let Some(trashed_path) = resolved.quarantined {
 							print_event(&format!(
 								"{} Conflict resolved for {rel_path}, moved aside to {}",
 								approved_tag,

@@ -19,9 +19,9 @@ use filen_sdk_rs::fs::categories::{DirType, Normal};
 use filen_sdk_rs::fs::file::traits::HasFileInfo;
 use filen_sdk_rs::fs::{HasName, HasUUID};
 use filen_sdk_rs::sync_engine::{
-	ConflictResolution, IgnoreLevel, IgnoredPath, PauseMode, PauseOptions, PlannedActionKind,
-	PlannedConflict, PlannedNodeKind, SyncEngine, SyncEvent, SyncMode, SyncReport,
-	TransferDirection,
+	ConflictResolution, ConflictResolved, IgnoreLevel, IgnoredPath, PauseMode, PauseOptions,
+	PlannedActionKind, PlannedConflict, PlannedNodeKind, SyncEngine, SyncEvent, SyncMode,
+	SyncReport, TransferDirection,
 };
 use uuid::Uuid;
 
@@ -1860,7 +1860,7 @@ async fn observ_add_list_conflicts_reads_held_conflicts() {
 			.resolve_conflict(sc.pair, "held.txt", ConflictResolution::KeepLocal)
 			.await
 			.unwrap(),
-		None,
+		ConflictResolved::default(),
 		"keep-local moves no copy into the bin"
 	);
 	assert!(
