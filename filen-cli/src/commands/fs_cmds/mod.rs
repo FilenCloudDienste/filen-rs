@@ -61,6 +61,8 @@ use serde_json::json;
 use tempfile::{NamedTempFile, TempDir};
 use tokio::select;
 
+mod versions;
+
 #[derive(Debug, Subcommand)]
 pub(crate) enum FsCommands {
 	/// Change the working directory (in REPL)
@@ -196,6 +198,18 @@ pub(crate) enum FsCommands {
 		#[arg(add = FilenCompleter::file_or_directory())]
 		destination: String,
 	},
+	/// List the versions of a file, newest first, or restore or delete one of them
+	Versions {
+		/// File whose versions to list
+		#[arg(add = FilenCompleter::file())]
+		file: String,
+		/// Restore the version with this UUID, making it the file's current content
+		#[arg(long, value_name = "VERSION", conflicts_with = "delete")]
+		restore: Option<Uuid>,
+		/// Permanently delete the version with this UUID, asking first unless --yes is given
+		#[arg(long, value_name = "VERSION")]
+		delete: Option<Uuid>,
+	},
 	/// List favorited items
 	ListFavorites,
 	/// Favorite a file or directory
@@ -264,6 +278,7 @@ pub(crate) const ORGANIZING_DOCS: &[DocElement] = &[
 	DocElement::CommandHelp("touch"),
 	DocElement::CommandHelp("mv"),
 	DocElement::CommandHelp("cp"),
+	DocElement::CommandHelp("versions"),
 	DocElement::CommandHelp("list-favorites"),
 	DocElement::CommandHelp("favorite"),
 	DocElement::CommandHelp("unfavorite"),
@@ -346,6 +361,15 @@ impl FsCommands {
 				destination,
 			} => {
 				copy_file_or_directory(ui, client, working_path, &source, &destination).await?;
+			}
+			Self::Versions {
+				file,
+				restore,
+				delete,
+			} => {
+				let path = working_path.navigate(&file);
+				let action = versions::VersionsAction::of(restore, delete);
+				versions::file_versions(ui, client, &path, action).await?;
 			}
 			Self::ListFavorites => list_favorites(ui, client).await?,
 			Self::Favorite { file_or_directory } => {

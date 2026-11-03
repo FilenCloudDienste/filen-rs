@@ -1605,3 +1605,100 @@ async fn search_of_type_dir_leaves_files_out() {
 		.success()
 		.stdout(format!("{test_dir}/needle-dir\n"));
 }
+
+/// The printed `versions --json` of the file at `path`.
+async fn versions_of(path: &str) -> serde_json::Value {
+	printed_json(&authenticated_cli_with_args!("versions", path, "--json").success())
+}
+
+#[shared_test_runtime]
+async fn versions_lists_restores_and_deletes_the_versions_of_a_file() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let path = format!("/{}/a.txt", resources.dir.name().unwrap());
+	let old = upload(client, &resources.dir, "a.txt", b"old").await;
+	let new = upload(client, &resources.dir, "a.txt", b"newer").await;
+
+	let versions = versions_of(&path).await;
+	// the upload dates are the server's, so only their order is known
+	assert!(versions[0]["timestamp"].as_str() >= versions[1]["timestamp"].as_str());
+	let listed = versions
+		.as_array()
+		.unwrap()
+		.iter()
+		.map(|version| {
+			(
+				version["uuid"].clone(),
+				version["size"].clone(),
+				version["current"].clone(),
+			)
+		})
+		.collect::<Vec<_>>();
+	assert_eq!(
+		listed,
+		[
+			(new.uuid().to_string().into(), 5.into(), true.into()),
+			(old.uuid().to_string().into(), 3.into(), false.into()),
+		]
+	);
+
+	authenticated_cli_with_args!("versions", &path, "--restore", &old.uuid().to_string())
+		.success()
+		.stdout(predicates::str::contains(format!(
+			"Restored the version of {path} from "
+		)));
+	assert_eq!(content_at(client, &path).await, b"old");
+
+	let versions = versions_of(&path).await;
+	let versions = versions.as_array().unwrap();
+	assert_eq!(versions.len(), 2, "{versions:?}");
+	let current = versions
+		.iter()
+		.find(|version| version["current"] == true)
+		.unwrap();
+	let other = versions
+		.iter()
+		.find(|version| version["current"] == false)
+		.unwrap();
+	assert_eq!(current["size"], 3);
+	assert_eq!(other["size"], 5);
+
+	let current_uuid = current["uuid"].as_str().unwrap();
+	authenticated_cli_with_args!("versions", &path, "--delete", current_uuid, "--yes")
+		.failure()
+		.stderr(predicates::str::contains(format!(
+			"Cannot delete {current_uuid}, the current version of {path}"
+		)));
+	authenticated_cli_with_args!(
+		"versions",
+		&path,
+		"--delete",
+		other["uuid"].as_str().unwrap(),
+		"--yes"
+	)
+	.success()
+	.stdout(predicates::str::contains(format!(
+		"Permanently deleted the version of {path} from "
+	)));
+
+	let versions = versions_of(&path).await;
+	assert_eq!(versions.as_array().unwrap().len(), 1, "{versions}");
+	assert_eq!(versions[0]["uuid"], current_uuid);
+	assert_eq!(content_at(client, &path).await, b"old");
+}
+
+#[test]
+fn versions_delete_without_yes_asks_for_it_before_logging_in() {
+	let output = run_logged_out_without_a_terminal(&[
+		"versions",
+		"/a.txt",
+		"--delete",
+		"00000000-0000-0000-0000-000000000001",
+	]);
+	assert_eq!(output.status.code(), Some(2));
+	assert!(
+		String::from_utf8_lossy(&output.stderr)
+			.contains("Cannot ask \"Permanently delete a version of /a.txt?\""),
+		"{output:?}"
+	);
+}
