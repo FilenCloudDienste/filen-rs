@@ -28,7 +28,7 @@ use std::{
 	fs,
 	io::{self, IsTerminal as _},
 	num::NonZeroU32,
-	path::{Path, PathBuf},
+	path::{self, Path, PathBuf},
 	sync::Arc,
 	time::Duration,
 };
@@ -44,7 +44,7 @@ use crate::{
 	commands::{
 		Commands, execute_command,
 		fs_cmds::{self, FsCommands},
-		shell_cmds,
+		shell_cmds::{self, ShellCommands},
 	},
 	docs::{generate_markdown_docs, print_in_app_docs},
 	log_files::{ChosenLogFile, LogFiles, LogLimits},
@@ -267,15 +267,36 @@ fn chosen_config_dir(arg: Option<PathBuf>, data_dir_env: Option<OsString>) -> Op
 	})
 }
 
-/// Creates the config directory the user chose, if it is missing, and returns it. A usage error
-/// if it cannot be created, as when the path names a file.
+/// Creates the config directory the user chose, if it is missing, and returns it as an absolute
+/// path, so that it stays the same directory after `lcd` changes the working directory. A usage
+/// error if it cannot be created, as when the path names a file.
 fn create_explicit_config_dir(dir: PathBuf) -> Result<PathBuf> {
-	match fs::create_dir_all(&dir) {
-		Ok(()) => Ok(dir),
+	match fs::create_dir_all(&dir).and_then(|()| path::absolute(&dir)) {
+		Ok(dir) => Ok(dir),
 		Err(e) => Err(ui::UI::usage_failure(&format!(
 			"Failed to create the config directory {}: {e}",
 			dir.display()
 		))),
+	}
+}
+
+/// `path`, which `--auth-config-path` gave, as an absolute path, so that `lcd` does not change
+/// which file a later login reads. `path` as given if the working directory cannot be read or
+/// the absolute path is not UTF-8.
+fn absolute_auth_config_path(path: String) -> String {
+	match path::absolute(&path).map(|absolute| absolute.into_os_string().into_string()) {
+		Ok(Ok(absolute)) => absolute,
+		Ok(Err(absolute)) => {
+			warn!(
+				"Kept the auth config path {path} as given: its absolute path {} is not UTF-8",
+				absolute.to_string_lossy()
+			);
+			path
+		}
+		Err(e) => {
+			warn!("Failed to make the auth config path {path} absolute: {e}");
+			path
+		}
 	}
 }
 
@@ -581,6 +602,11 @@ async fn inner_main(ui: &mut ui::UI, arenas_limited: bool) -> Result<Finished> {
 			 --working-path, or run `filen` without a command to enter the REPL.",
 		));
 	}
+	if let Some(Commands::Shell(ShellCommands::Lcd { .. })) = cli_args.command {
+		return Err(ui::UI::usage_failure(
+			"`lcd` only works in the REPL. To use another local directory, run `filen` from it.",
+		));
+	}
 
 	// Without a command, the CLI runs the commands piped into it, or the REPL at a terminal.
 	let script = cli_args.command.is_none() && !io::stdin().is_terminal();
@@ -615,7 +641,7 @@ async fn inner_main(ui: &mut ui::UI, arenas_limited: bool) -> Result<Finished> {
 		cli_args.email,
 		cli_args.password,
 		cli_args.two_factor_code,
-		cli_args.auth_config_path,
+		cli_args.auth_config_path.map(absolute_auth_config_path),
 		client_config_args,
 	);
 
