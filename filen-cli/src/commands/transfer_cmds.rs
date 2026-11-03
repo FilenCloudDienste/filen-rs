@@ -30,7 +30,7 @@ use filen_sdk_rs::{
 	},
 	io::{
 		CategoryDirDownloadExtPub as _, DirDownloadCallback, DirUploadCallback, RemoteDirectory,
-		RemoteFile, client_impl::IoSharedClientExt as _,
+		RemoteFile, client_impl::IoSharedClientExt as _, is_safe_descendant,
 	},
 	util::MaybeSendCallback,
 };
@@ -194,15 +194,20 @@ pub(crate) async fn download(
 			source_path
 		)));
 	};
-	let target = match &item {
-		NonRootFileType::File(file) => {
-			destination.join(file.name().context("Failed to decrypt file name")?)
-		}
-		NonRootFileType::Dir(dir) => {
-			destination.join(dir.name().context("Failed to decrypt directory name")?)
-		}
+	let name = match &item {
+		NonRootFileType::File(file) => Some(file.name().context("Failed to decrypt file name")?),
+		NonRootFileType::Dir(dir) => Some(dir.name().context("Failed to decrypt directory name")?),
 		// The drive root has no name of its own, so its contents go straight into the destination.
-		NonRootFileType::Root(_) => destination.clone(),
+		NonRootFileType::Root(_) => None,
+	};
+	let target = match name {
+		Some(name) => download_target(&destination, name).ok_or_else(|| {
+			UI::failure(&format!(
+				"Cannot download {}: its name {:?} is not a plain file name",
+				source_path, name
+			))
+		})?,
+		None => destination.clone(),
 	};
 
 	let progress = TransferProgress::new(TransferKind::Download, ui);
@@ -239,6 +244,14 @@ pub(crate) async fn download(
 		"download",
 		&format!("Downloaded {} to {}", source_path, target.display()),
 	)
+}
+
+/// Where an item named `name` is downloaded to inside `destination`, or `None` when the name is not
+/// a single plain path component (`..`, an absolute path, one holding a separator) and joining it
+/// would leave `destination`. The name comes from the item's decrypted metadata, which the server
+/// does not validate.
+fn download_target(destination: &Path, name: &str) -> Option<PathBuf> {
+	is_safe_descendant(name).then(|| destination.join(name))
 }
 
 /// Await `transfer` until it completes or the user hits Ctrl+C, erasing the progress line either
@@ -606,5 +619,36 @@ impl DirDownloadCallback<Normal> for TransferProgress {
 
 	fn on_download_errors(&self, errors: Vec<(Error, String, NonRootItemType<'static, Normal>)>) {
 		self.push_errors(errors.iter().map(|(e, path, _)| format!("{}: {}", path, e)));
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use std::path::Path;
+
+	use super::download_target;
+
+	#[test]
+	fn a_plain_name_is_downloaded_into_the_destination() {
+		assert_eq!(
+			download_target(Path::new("/dest"), "notes.txt"),
+			Some(Path::new("/dest/notes.txt").to_path_buf())
+		);
+	}
+
+	#[test]
+	fn a_parent_reference_is_refused() {
+		assert_eq!(download_target(Path::new("/dest"), ".."), None);
+		assert_eq!(download_target(Path::new("/dest"), "../x"), None);
+	}
+
+	#[test]
+	fn an_absolute_name_is_refused() {
+		assert_eq!(download_target(Path::new("/dest"), "/etc/x"), None);
+	}
+
+	#[test]
+	fn a_name_holding_a_separator_is_refused() {
+		assert_eq!(download_target(Path::new("/dest"), "a/b"), None);
 	}
 }
