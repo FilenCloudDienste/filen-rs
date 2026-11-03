@@ -169,6 +169,7 @@ async fn uploading_with_json_prints_the_result_as_json() {
 			"destination": format!("/{test_dir_name}/a.txt"),
 			"files": 1,
 			"bytes": 8,
+			"skipped_symlinks": [],
 			"failed": [],
 		})
 	);
@@ -196,4 +197,80 @@ async fn uploading_a_directory_verbosely_lists_its_files() {
 		"{stdout}"
 	);
 	assert!(stdout.contains("1 file, 8 B in "), "{stdout}");
+}
+
+#[cfg(unix)]
+#[shared_test_runtime]
+async fn uploading_without_following_symlinks_skips_and_lists_them() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir_name = resources.dir.name().unwrap();
+
+	let local = tempfile::tempdir().unwrap();
+	let outside = local.path().join("outside");
+	std::fs::create_dir(&outside).unwrap();
+	std::fs::write(outside.join("x.txt"), b"outside").unwrap();
+	let source = local.path().join("with-links");
+	std::fs::create_dir(&source).unwrap();
+	std::fs::write(source.join("real.txt"), b"real").unwrap();
+	std::os::unix::fs::symlink(source.join("real.txt"), source.join("link.txt")).unwrap();
+	std::os::unix::fs::symlink(&outside, source.join("link-dir")).unwrap();
+
+	// The test harness always passes -v.
+	let output = authenticated_cli_with_args!(
+		"upload",
+		"--no-follow-symlinks",
+		source.to_str().unwrap(),
+		test_dir_name
+	)
+	.success();
+
+	let stdout = String::from_utf8_lossy(&output.get_output().stdout);
+	for link in ["link.txt", "link-dir"] {
+		let line = format!("Skipped symlink {}", source.join(link).display());
+		assert!(stdout.lines().any(|l| l == line), "{stdout}");
+		assert!(
+			client
+				.find_item_at_path(&format!("{test_dir_name}/with-links/{link}"))
+				.await
+				.unwrap()
+				.is_none()
+		);
+	}
+	assert!(matches!(
+		client
+			.find_item_at_path(&format!("{test_dir_name}/with-links/real.txt"))
+			.await
+			.unwrap(),
+		Some(NonRootFileType::File(_))
+	));
+}
+
+#[cfg(unix)]
+#[shared_test_runtime]
+async fn uploading_without_following_symlinks_lists_them_in_the_json_result() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let test_dir_name = resources.dir.name().unwrap();
+
+	let local = tempfile::tempdir().unwrap();
+	let source = local.path().join("json-links");
+	std::fs::create_dir(&source).unwrap();
+	std::fs::write(source.join("real.txt"), b"real").unwrap();
+	std::os::unix::fs::symlink(source.join("real.txt"), source.join("link.txt")).unwrap();
+
+	let output = authenticated_cli_with_args!(
+		"upload",
+		"--json",
+		"--no-follow-symlinks",
+		source.to_str().unwrap(),
+		test_dir_name
+	)
+	.success();
+
+	let result: serde_json::Value = serde_json::from_slice(&output.get_output().stdout).unwrap();
+	assert_eq!(
+		result["skipped_symlinks"],
+		serde_json::json!([source.join("link.txt").display().to_string()])
+	);
+	assert_eq!(result["files"], 1);
 }

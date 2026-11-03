@@ -11,15 +11,20 @@
 //! on the way to the destination are created. Downloading `/` writes the whole drive's contents
 //! into the destination.
 //!
+//! An uploaded symlink is uploaded under its own name with the contents it points to. Inside an
+//! uploaded directory, symlinks are followed the same way; with `--no-follow-symlinks` they are
+//! skipped instead (neither the link nor what it points to is uploaded): listed with `-v`, counted
+//! in the result without it, and listed in the `--json` result's `skipped_symlinks`.
+//!
 //! While a transfer runs, its progress line shows the current speed and the time left, and the
 //! result ends with the number of files and bytes transferred, the time taken and the average
 //! speed. With `-v`, each file of a directory transfer is listed as it completes.
 //!
 //! When a single item inside a directory transfer fails, the rest of the transfer still completes
 //! and the failures are listed at the end. With `--json`, the result is printed as one object
-//! instead: `{"destination": ..., "files": ..., "bytes": ..., "failed": [{"path": ..., "error":
-//! ...}]}`, where `path` is `null` for a failure not about a single item. Press Ctrl+C to cancel a
-//! running transfer; what was transferred by then is reported on stderr.
+//! instead: `{"destination": ..., "files": ..., "bytes": ..., "skipped_symlinks": [...], "failed":
+//! [{"path": ..., "error": ...}]}`, where `path` is `null` for a failure not about a single item.
+//! Press Ctrl+C to cancel a running transfer; what was transferred by then is reported on stderr.
 
 use std::{
 	borrow::Cow,
@@ -46,7 +51,7 @@ use filen_sdk_rs::{
 	},
 	io::{
 		CategoryDirDownloadExtPub as _, DirDownloadCallback, DirUploadCallback, RemoteDirectory,
-		RemoteFile, client_impl::IoSharedClientExt as _, is_safe_descendant,
+		RemoteFile, SymlinkPolicy, client_impl::IoSharedClientExt as _, is_safe_descendant,
 	},
 	util::MaybeSendCallback,
 };
@@ -78,6 +83,10 @@ pub(crate) enum TransferCommands {
 		/// (default: the current working directory)
 		#[arg(add = FilenCompleter::file_or_directory())]
 		destination: Option<String>,
+		/// Skip the symlinks inside an uploaded directory instead of uploading what they point to
+		/// (counted in the result, listed with -v)
+		#[arg(long)]
+		no_follow_symlinks: bool,
 	},
 	/// Download a file or directory (recursively) from the Filen drive
 	Download {
@@ -111,7 +120,23 @@ impl TransferCommands {
 			Self::Upload {
 				source,
 				destination,
-			} => upload(ui, client, working_path, &source, destination.as_deref()).await?,
+				no_follow_symlinks,
+			} => {
+				let symlinks = if no_follow_symlinks {
+					SymlinkPolicy::Skip
+				} else {
+					SymlinkPolicy::Follow
+				};
+				upload(
+					ui,
+					client,
+					working_path,
+					&source,
+					destination.as_deref(),
+					symlinks,
+				)
+				.await?
+			}
 			Self::Download {
 				source,
 				destination,
@@ -122,12 +147,14 @@ impl TransferCommands {
 }
 
 /// Upload a local file, or a local directory and everything below it, into a remote directory.
+/// `symlinks` says what to do with the symlinks inside a directory; `source` itself is followed.
 pub(crate) async fn upload(
 	ui: &mut UI,
 	client: &mut LazyClient,
 	working_path: &RemotePath,
 	source_str: &str,
 	destination_str: Option<&str>,
+	symlinks: SymlinkPolicy,
 ) -> Result<()> {
 	// Made absolute without resolving symlinks, so an uploaded link keeps its own name.
 	let source = std::path::absolute(source_str)
@@ -170,6 +197,7 @@ pub(crate) async fn upload(
 				target.name.as_ref(),
 				&target_path,
 				&parent_dir,
+				symlinks,
 			),
 		)
 		.await?
@@ -537,9 +565,19 @@ fn finish(
 	let kind = progress.kind;
 	let (files, bytes) = progress.done();
 	let failures = progress.take_failures();
+	let skipped_symlinks = progress.take_skipped_symlinks();
 	if ui.json {
-		ui.print_json(result_json(destination, files, bytes, &failures))?;
+		ui.print_json(result_json(
+			destination,
+			files,
+			bytes,
+			&failures,
+			&skipped_symlinks,
+		))?;
 	} else {
+		if !skipped_symlinks.is_empty() && !progress.list_files && !ui.is_quiet() {
+			ui.print_muted(&skipped_symlinks_line(skipped_symlinks.len()));
+		}
 		for failure in failures.iter().take(MAX_PRINTED_ERRORS) {
 			ui.print_failure(&failure.to_string());
 		}
@@ -573,11 +611,13 @@ fn result_json(
 	files: u64,
 	bytes: u64,
 	failures: &[TransferFailure],
+	skipped_symlinks: &[String],
 ) -> serde_json::Value {
 	json!({
 		"destination": destination,
 		"files": files,
 		"bytes": bytes,
+		"skipped_symlinks": skipped_symlinks,
 		"failed": failures
 			.iter()
 			.map(|failure| json!({ "path": failure.path, "error": failure.error }))
@@ -621,6 +661,7 @@ async fn upload_directory(
 	name: &str,
 	target_path: &RemotePath,
 	destination_dir: &DirType<'_, Normal>,
+	symlinks: SymlinkPolicy,
 ) -> Result<()> {
 	// `upload_dir_recursively` uploads the *contents* of `source` into an already existing remote
 	// directory, so create (or reuse) the destination's `name` subdirectory first. This also
@@ -637,7 +678,12 @@ async fn upload_directory(
 	progress.start_scan();
 	client
 		.clone()
-		.upload_dir_recursively(source.to_path_buf(), progress, target.as_ref())
+		.upload_dir_recursively_with_symlinks(
+			source.to_path_buf(),
+			progress,
+			target.as_ref(),
+			symlinks,
+		)
 		.await
 		.context("Failed to upload directory")
 }
@@ -759,6 +805,8 @@ struct ProgressState {
 	/// The remote path of each directory a listed upload created, by uuid, to list each uploaded
 	/// file under its path. Empty when files are not listed.
 	upload_dir_paths: HashMap<Uuid, RemotePath>,
+	/// The local paths of the symlinks a directory upload skipped.
+	skipped_symlinks: Vec<String>,
 }
 
 impl ProgressState {
@@ -1050,6 +1098,11 @@ impl TransferProgress {
 		std::mem::take(&mut self.failures.lock().unwrap())
 	}
 
+	/// The local paths of the symlinks a directory upload skipped, taken out of the progress.
+	fn take_skipped_symlinks(&self) -> Vec<String> {
+		std::mem::take(&mut self.state.lock().unwrap().skipped_symlinks)
+	}
+
 	/// Print `lines` above the progress line, erasing it first so that neither tears the other.
 	fn print_above(&self, state: &mut ProgressState, lines: impl IntoIterator<Item = String>) {
 		let mut lines = lines.into_iter().peekable();
@@ -1148,6 +1201,32 @@ impl DirUploadCallback for TransferProgress {
 			error: e.to_string(),
 		}));
 	}
+
+	fn on_scan_skipped_symlinks(&self, paths: Vec<PathBuf>) {
+		let paths = paths
+			.iter()
+			.map(|path| path.display().to_string())
+			.collect::<Vec<_>>();
+		let mut state = self.state.lock().unwrap();
+		if self.list_files {
+			self.print_above(&mut state, skipped_symlink_lines(&paths));
+		}
+		state.skipped_symlinks.extend(paths);
+	}
+}
+
+/// The `-v` lines for the symlinks a directory upload skipped.
+fn skipped_symlink_lines(paths: &[String]) -> impl Iterator<Item = String> {
+	paths.iter().map(|path| format!("Skipped symlink {}", path))
+}
+
+/// The line that counts the symlinks a directory upload skipped, where `-v` does not list them.
+fn skipped_symlinks_line(count: usize) -> String {
+	format!(
+		"Skipped {} {} (-v lists them)",
+		count,
+		if count == 1 { "symlink" } else { "symlinks" }
+	)
 }
 
 impl DirDownloadCallback<Normal> for TransferProgress {
@@ -1193,24 +1272,37 @@ impl DirDownloadCallback<Normal> for TransferProgress {
 #[cfg(test)]
 mod tests {
 	use std::{
-		path::Path,
+		path::{Path, PathBuf},
 		time::{Duration, Instant},
 	};
 
 	use filen_types::fs::{ParentUuid, Uuid};
 	use serde_json::json;
 
-	use filen_sdk_rs::fs::name::ValidatedName;
+	use filen_sdk_rs::{fs::name::ValidatedName, io::DirUploadCallback as _};
 
 	use super::{
 		DownloadSource, Existing, ProgressState, SPEED_WINDOW, TransferFailure, TransferKind,
-		UploadTarget, canceled_message, download_target, format_duration, local_existing,
-		progress_line, resolve_download_target, resolve_upload_target, result_json,
-		transfer_summary,
+		TransferProgress, UploadTarget, canceled_message, download_target, format_duration,
+		local_existing, progress_line, resolve_download_target, resolve_upload_target, result_json,
+		skipped_symlinks_line, transfer_summary,
 	};
 	use crate::util::RemotePath;
 
 	const MIB: u64 = 1024 * 1024;
+
+	/// A progress that draws and lists nothing.
+	fn quiet_progress() -> TransferProgress {
+		TransferProgress {
+			kind: TransferKind::Upload,
+			term: console::Term::stdout(),
+			enabled: false,
+			list_files: false,
+			started: Instant::now(),
+			state: std::sync::Mutex::new(ProgressState::default()),
+			failures: std::sync::Mutex::new(Vec::new()),
+		}
+	}
 
 	/// Halfway through a 1 MiB upload, with the given speed samples.
 	fn halfway(samples: &[(Instant, u64)]) -> ProgressState {
@@ -1362,6 +1454,26 @@ mod tests {
 	}
 
 	#[test]
+	fn the_skipped_symlinks_are_counted_where_they_are_not_listed() {
+		assert_eq!(
+			skipped_symlinks_line(1),
+			"Skipped 1 symlink (-v lists them)"
+		);
+		assert_eq!(
+			skipped_symlinks_line(3),
+			"Skipped 3 symlinks (-v lists them)"
+		);
+	}
+
+	#[test]
+	fn skipped_symlinks_are_kept_for_the_result_even_when_not_listed() {
+		let progress = quiet_progress();
+		progress
+			.on_scan_skipped_symlinks(vec![PathBuf::from("/local/a"), PathBuf::from("/local/b")]);
+		assert_eq!(progress.take_skipped_symlinks(), ["/local/a", "/local/b"]);
+	}
+
+	#[test]
 	fn the_json_result_lists_the_failures() {
 		let failures = [
 			TransferFailure {
@@ -1374,11 +1486,12 @@ mod tests {
 			},
 		];
 		assert_eq!(
-			result_json("/dir", 4, 1000, &failures),
+			result_json("/dir", 4, 1000, &failures, &["/local/link".to_owned()]),
 			json!({
 				"destination": "/dir",
 				"files": 4,
 				"bytes": 1000,
+				"skipped_symlinks": ["/local/link"],
 				"failed": [
 					{ "path": "/local/a.txt", "error": "Permission denied" },
 					{ "path": null, "error": "Listing failed" },
