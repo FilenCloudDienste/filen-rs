@@ -1,4 +1,4 @@
-use std::borrow::Cow;
+use std::{borrow::Cow, sync::Arc};
 
 use crate::{
 	CommandResult,
@@ -13,15 +13,21 @@ use anyhow::{Context as _, Result};
 use clap::Subcommand;
 use console::style;
 use filen_sdk_rs::{
+	ErrorKind,
 	auth::Client,
 	fs::{
 		HasName as _, HasParent as _, HasUUID,
 		categories::{DirType, NonRootFileType, NonRootItemType, Normal, fs::CategoryFS},
+		copy::{
+			CopiedTopLevel, CopyCallback, CopyConfig, CopyFailed, CopyReport, CopyRequest,
+			CopyUpdate, ItemSource, ItemSourceDir, JobControl, PlannedTopLevelItem, SkipReason,
+		},
 		dir::meta::DirectoryMetaChanges,
 		file::{meta::FileMetaChanges, traits::HasFileInfo as _},
 	},
 	io::{RemoteDirectory, RemoteFile, client_impl::IoSharedClientExt},
 };
+use filen_types::{fs::Uuid, traits::CowHelpers as _};
 use serde_json::json;
 
 #[derive(Debug, Subcommand)]
@@ -727,9 +733,6 @@ pub(crate) async fn move_file_or_directory(
 	destination_str: &str,
 ) -> Result<()> {
 	let source_path = working_path.navigate(source_str);
-	// before navigating, which drops the trailing '/'
-	let destination_must_be_a_directory = names_a_directory(destination_str);
-	let destination_path = working_path.navigate(destination_str);
 	let client = client.get(ui).await?;
 	let Some(source) = client
 		.find_item_at_path(&source_path.0)
@@ -746,115 +749,23 @@ pub(crate) async fn move_file_or_directory(
 		NonRootFileType::Dir(dir) => dir.name(),
 		NonRootFileType::Root(_) => return Err(UI::failure("Cannot move root directory")),
 	}
-	.context("Failed to decrypt source name")?
-	.to_string();
-
-	// resolve the destination into the directory the source ends up in, plus the name it
-	// ends up under
-	let destination_dir = match client
-		.find_item_at_path(&destination_path.0)
-		.await
-		.context("Failed to find destination")?
-	{
-		Some(NonRootFileType::Dir(dir)) => Some(DirType::Dir(dir)),
-		Some(NonRootFileType::Root(root)) => Some(DirType::Root(root)),
-		Some(NonRootFileType::File(_)) if destination_must_be_a_directory => {
-			return Err(UI::failure(&format!(
-				"Not a directory: {}",
-				destination_path.0
-			)));
-		}
-		Some(NonRootFileType::File(_)) => {
-			return Err(UI::failure(&format!(
-				"Destination already exists: {}",
-				destination_path.0
-			)));
-		}
-		None if destination_must_be_a_directory => {
-			return Err(UI::failure(&format!(
-				"No such destination directory: {}",
-				destination_path.0
-			)));
-		}
-		None => None,
-	};
-	let (new_name, new_path, destination_dir_path) = match &destination_dir {
-		// the destination is an existing directory, so move the source into it as-is
-		Some(_) => {
-			let new_path = destination_path.navigate(&source_filename);
-			if new_path == source_path {
-				return Err(UI::failure(&format!(
-					"{} is already in {}",
-					source_path.0, destination_path.0
-				)));
-			}
-			(source_filename.clone(), new_path, destination_path.clone())
-		}
-		// the destination doesn't exist, so it names the source's new path
-		None => {
-			// only the root has no base name, and the root always exists
-			let Some(new_name) = destination_path.basename() else {
-				return Err(UI::failure("Cannot move onto the root directory"));
-			};
-			(
-				new_name.to_string(),
-				destination_path.clone(),
-				destination_path.parent(),
-			)
-		}
-	};
-
-	if new_path.0.starts_with(&format!("{}/", source_path.0)) {
-		return Err(UI::failure(&format!(
-			"Cannot move {} into itself: {}",
-			source_path.0, new_path.0
-		)));
-	}
-
-	let destination_dir = match destination_dir {
-		Some(destination_dir) => destination_dir,
-		None => match client
-			.find_item_at_path(&destination_dir_path.0)
-			.await
-			.context("Failed to find destination directory")?
-		{
-			Some(NonRootFileType::Dir(dir)) => DirType::Dir(dir),
-			Some(NonRootFileType::Root(root)) => DirType::Root(root),
-			Some(NonRootFileType::File(_)) => {
-				return Err(UI::failure(&format!(
-					"Not a directory: {}",
-					destination_dir_path.0
-				)));
-			}
-			None => {
-				return Err(UI::failure(&format!(
-					"No such destination directory: {}",
-					destination_dir_path.0
-				)));
-			}
+	.context("Failed to decrypt source name")?;
+	let Destination {
+		dir: destination_dir,
+		name: new_name,
+		path: new_path,
+	} = resolve_destination(
+		client,
+		Placement::Move,
+		&Source {
+			path: &source_path,
+			name: source_filename,
+			uuid: source.uuid(),
 		},
-	};
-
-	// The server treats names that differ only in case as the same, so the destination
-	// directory is listed to compare them case-insensitively. The moved item does not clash with
-	// itself, so renaming it to a name that differs from its own only in case works.
-	let (existing_dirs, existing_files) = client
-		.list_dir::<_, Normal>(&destination_dir, None::<&fn(u64, Option<u64>)>)
-		.await
-		.context("Failed to list destination directory")?;
-	let source_uuid = source.uuid();
-	let existing_names = existing_dirs
-		.iter()
-		.map(|dir| (dir.uuid(), dir.name()))
-		.chain(existing_files.iter().map(|file| (file.uuid(), file.name())))
-		.filter(|(uuid, _)| *uuid != source_uuid)
-		.filter_map(|(_, name)| name);
-	if let Some(existing_name) = clashing_name(existing_names, &new_name) {
-		return Err(UI::failure(&format!(
-			"Destination already exists: {}",
-			destination_dir_path.navigate(existing_name)
-		)));
-	}
+		working_path,
+		destination_str,
+	)
+	.await?;
 
 	let needs_rename = new_name != source_filename;
 	match source {
@@ -908,6 +819,234 @@ pub(crate) async fn move_file_or_directory(
 /// in '/', as in Unix `mv a dir/`.
 fn names_a_directory(destination: &str) -> bool {
 	destination.ends_with('/')
+}
+
+/// Which command puts a source at a destination.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Placement {
+	Move,
+	Copy,
+}
+
+impl Placement {
+	fn verb(self) -> &'static str {
+		match self {
+			Self::Move => "move",
+			Self::Copy => "copy",
+		}
+	}
+}
+
+/// The item a `mv` or `cp` puts somewhere.
+struct Source<'a> {
+	path: &'a RemotePath,
+	name: &'a str,
+	uuid: Uuid,
+}
+
+/// Where a `mv` or `cp` puts its source.
+struct Destination<'a> {
+	/// The directory the source ends up in.
+	dir: DirType<'a, Normal>,
+	/// The name the source ends up under.
+	name: String,
+	/// The path the source ends up at.
+	path: RemotePath,
+}
+
+/// What a destination path names, as looked up on the drive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Found {
+	Directory,
+	File,
+	Nothing,
+}
+
+/// Where a destination puts the source, before the directory it ends up in was looked up.
+#[derive(Debug, PartialEq, Eq)]
+enum Target {
+	/// Into an existing directory at `dir`, under the source's own name.
+	Into { dir: RemotePath, path: RemotePath },
+	/// At a new path: into the directory at `parent`, under `name`.
+	At {
+		parent: RemotePath,
+		name: String,
+		path: RemotePath,
+	},
+}
+
+impl Target {
+	/// The path the source ends up at.
+	fn path(&self) -> &RemotePath {
+		match self {
+			Self::Into { path, .. } | Self::At { path, .. } => path,
+		}
+	}
+
+	/// The directory the source ends up in.
+	fn dir(&self) -> &RemotePath {
+		match self {
+			Self::Into { dir, .. } => dir,
+			Self::At { parent, .. } => parent,
+		}
+	}
+}
+
+/// Decides, as Unix `mv` and `cp` do, what `destination` means for `source`: an existing
+/// directory takes the source under its own name, and anything else is the source's new path. A
+/// destination written with a trailing '/' (`must_be_a_directory`) has to be an existing
+/// directory. Refuses to put the source inside itself, and to move it to where it already is.
+fn target_of(
+	placement: Placement,
+	source: &Source<'_>,
+	destination: &RemotePath,
+	found: Found,
+	must_be_a_directory: bool,
+) -> Result<Target> {
+	let target = match found {
+		Found::Directory => Target::Into {
+			dir: destination.clone(),
+			path: destination.navigate(source.name),
+		},
+		Found::File if must_be_a_directory => {
+			return Err(UI::failure(&format!("Not a directory: {}", destination)));
+		}
+		Found::File => {
+			return Err(UI::failure(&format!(
+				"Destination already exists: {}",
+				destination
+			)));
+		}
+		Found::Nothing if must_be_a_directory => {
+			return Err(UI::failure(&format!(
+				"No such destination directory: {}",
+				destination
+			)));
+		}
+		Found::Nothing => {
+			// only the root has no base name, and the root always exists
+			let Some(name) = destination.basename() else {
+				return Err(UI::failure(&format!(
+					"Cannot {} onto the root directory",
+					placement.verb()
+				)));
+			};
+			Target::At {
+				parent: destination.parent(),
+				name: name.to_owned(),
+				path: destination.clone(),
+			}
+		}
+	};
+	if placement == Placement::Move && target.path() == source.path {
+		return Err(UI::failure(&format!(
+			"{} is already in {}",
+			source.path,
+			target.dir()
+		)));
+	}
+	if is_inside(target.path(), source.path) {
+		return Err(UI::failure(&format!(
+			"Cannot {} {} into itself: {}",
+			placement.verb(),
+			source.path,
+			target.path()
+		)));
+	}
+	Ok(target)
+}
+
+/// Whether `path` lies below `ancestor`.
+fn is_inside(path: &RemotePath, ancestor: &RemotePath) -> bool {
+	path.0
+		.strip_prefix(&ancestor.0)
+		.is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// Resolves the raw `destination_str` of a `mv` or `cp` into the directory the source ends up
+/// in and the name it ends up under (see [`target_of`]), and refuses a name the server would take
+/// as one already there: it compares names case-insensitively. Moving an item to a name that
+/// differs from its own only in case renames it.
+///
+/// The comparison lists the whole destination directory, once per source. The server's name-hash
+/// lookups (`dir_exists`, `file_exists`) would take two requests instead, but match only the
+/// hash the uploading client sent, so they miss an item whose name hash a non-conforming client
+/// computed differently, which the listing still finds by its decrypted name.
+async fn resolve_destination<'a>(
+	client: &'a Client,
+	placement: Placement,
+	source: &Source<'_>,
+	working_path: &RemotePath,
+	destination_str: &str,
+) -> Result<Destination<'a>> {
+	// before navigating, which drops the trailing '/'
+	let must_be_a_directory = names_a_directory(destination_str);
+	let destination_path = working_path.navigate(destination_str);
+	let found_item = client
+		.find_item_at_path(&destination_path.0)
+		.await
+		.context("Failed to find destination")?;
+	let found = match &found_item {
+		Some(NonRootFileType::Dir(_) | NonRootFileType::Root(_)) => Found::Directory,
+		Some(NonRootFileType::File(_)) => Found::File,
+		None => Found::Nothing,
+	};
+	let target = target_of(
+		placement,
+		source,
+		&destination_path,
+		found,
+		must_be_a_directory,
+	)?;
+	let dir = match found_item {
+		// an existing directory at the destination takes the source (`Target::Into`), so it is
+		// not looked up again
+		Some(NonRootFileType::Dir(dir)) => DirType::Dir(dir),
+		Some(NonRootFileType::Root(root)) => DirType::Root(root),
+		// otherwise the destination is the source's new path, in its parent directory
+		Some(NonRootFileType::File(_)) | None => match client
+			.find_item_at_path(&target.dir().0)
+			.await
+			.context("Failed to find destination directory")?
+		{
+			Some(NonRootFileType::Dir(dir)) => DirType::Dir(dir),
+			Some(NonRootFileType::Root(root)) => DirType::Root(root),
+			Some(NonRootFileType::File(_)) => {
+				return Err(UI::failure(&format!("Not a directory: {}", target.dir())));
+			}
+			None => {
+				return Err(UI::failure(&format!(
+					"No such destination directory: {}",
+					target.dir()
+				)));
+			}
+		},
+	};
+	let (dir_path, name, path) = match target {
+		Target::Into { dir, path } => (dir, source.name.to_owned(), path),
+		Target::At { parent, name, path } => (parent, name, path),
+	};
+
+	// A same-name upload would replace the existing file (as a new version) and creating a
+	// same-name directory returns the existing one, so a copy would merge into it.
+	let (existing_dirs, existing_files) = client
+		.list_dir::<_, Normal>(&dir, None::<&fn(u64, Option<u64>)>)
+		.await
+		.context("Failed to list destination directory")?;
+	let existing_names = existing_dirs
+		.iter()
+		.map(|dir| (dir.uuid(), dir.name()))
+		.chain(existing_files.iter().map(|file| (file.uuid(), file.name())))
+		// a moved item does not clash with itself
+		.filter(|(uuid, _)| placement == Placement::Copy || *uuid != source.uuid)
+		.filter_map(|(_, name)| name);
+	if let Some(existing_name) = clashing_name(existing_names, &name) {
+		return Err(UI::failure(&format!(
+			"Destination already exists: {}",
+			dir_path.navigate(existing_name)
+		)));
+	}
+	Ok(Destination { dir, name, path })
 }
 
 pub(crate) async fn copy_file_or_directory(
@@ -972,22 +1111,149 @@ pub(crate) async fn copy_file_or_directory(
 			destination_str.navigate(existing_name)
 		)));
 	}
-	match source_file_or_directory {
-		NonRootFileType::File(file) => {
-			copy_file(client, file.as_ref(), &destination_dir).await?;
-		}
-		NonRootFileType::Dir(dir) => {
-			copy_dir_recursive(client, dir.as_ref(), &destination_dir).await?;
-		}
-		NonRootFileType::Root(_) => {
-			return Err(UI::failure("Cannot copy root directory"));
+	let source = match source_file_or_directory {
+		NonRootFileType::File(file) => ItemSource::File(file.into_owned().into()),
+		NonRootFileType::Dir(dir) => ItemSource::Dir(ItemSourceDir::Normal(dir.into_owned())),
+		NonRootFileType::Root(_) => return Err(UI::failure("Cannot copy root directory")),
+	};
+	let config = CopyConfig {
+		max_bytes: free_storage(client).await,
+	};
+	let result = Arc::clone(client)
+		.copy_items_to(
+			vec![CopyRequest {
+				source,
+				destination: destination_dir.into_owned_cow(),
+				name: None,
+			}],
+			config,
+			NoCopyProgress,
+			JobControl::default(),
+		)
+		.await;
+	finish_copy(ui, &source_str, &destination_str, result)
+}
+
+/// Storage left on the account, for the copy to check that it fits before it writes anything.
+/// Without it the copy still runs, and fails once the server refuses an upload.
+async fn free_storage(client: &Client) -> Option<u64> {
+	match client.get_user_info().await {
+		Ok(info) => Some(info.max_storage.saturating_sub(info.storage_used)),
+		Err(e) => {
+			log::warn!(
+				"Failed to get the storage left, copying without checking it: {}",
+				e
+			);
+			None
 		}
 	}
-	ui.print_success(&format!(
-		"Copied {} into {}",
-		source_str.0, destination_str.0
-	));
-	Ok(())
+}
+
+/// At most this many failed or skipped items are listed after a copy; a broken directory tree can
+/// produce one per file.
+const MAX_PRINTED_COPY_PROBLEMS: usize = 10;
+
+/// Prints what went wrong in a copy, then the success message, or fails if anything was not
+/// copied. A copy whose items failed still completes, so without this the command would claim
+/// success while items were missing.
+fn finish_copy(
+	ui: &mut UI,
+	source_path: &RemotePath,
+	destination_dir_path: &RemotePath,
+	result: Result<CopyReport, CopyFailed>,
+) -> Result<()> {
+	let report = match &result {
+		Ok(report) => report,
+		Err(failed) => &failed.report,
+	};
+	print_copy_problems(ui, report);
+	let copy_path = report
+		.top_level
+		.first()
+		.and_then(|copied| copied.item.name())
+		.map(|name| destination_dir_path.navigate(name));
+	let report = match result {
+		Ok(report) => report,
+		Err(failed) => {
+			if let Some(copy_path) = &copy_path {
+				ui.print_failure(&format!(
+					"Copied only {} to {}",
+					copied_amount(&failed.report),
+					copy_path
+				));
+			}
+			if failed.error.kind() == ErrorKind::MaxStorageReached {
+				return Err(UI::failure(&format!(
+					"Not enough storage left: copying {} needs {}",
+					source_path,
+					ui::format_size(failed.report.totals.bytes)
+				)));
+			}
+			return Err(filen_sdk_rs::Error::from(failed)).context("Failed to copy");
+		}
+	};
+	let failed = report.failures.len();
+	if failed > 0 {
+		return Err(UI::failure(&format!("{} item(s) failed to copy", failed)));
+	}
+	match copy_path {
+		Some(copy_path) => {
+			ui.print_success(&format!("Copied {} to {}", source_path, copy_path));
+			Ok(())
+		}
+		// a copy that failed at its top-level item reports that as a failure
+		None => Err(UI::failure(&format!("Failed to copy {}", source_path))),
+	}
+}
+
+/// Lists the items a copy could not copy and the ones it left out.
+fn print_copy_problems(ui: &mut UI, report: &CopyReport) {
+	let failures = report
+		.failures
+		.iter()
+		.map(|failure| format!("{}: {}", failure.info.source_path, failure.info.error));
+	let skipped = report.skipped.iter().map(|skipped| {
+		format!(
+			"Skipped {}: {}",
+			skipped.source_path,
+			match skipped.reason {
+				SkipReason::UndecryptableFile { .. } => "cannot be decrypted".to_owned(),
+				SkipReason::Unreachable { count } => format!("{} unreachable items", count),
+			}
+		)
+	});
+	let problems = failures.chain(skipped).collect::<Vec<String>>();
+	for problem in problems.iter().take(MAX_PRINTED_COPY_PROBLEMS) {
+		ui.print_failure(problem);
+	}
+	if problems.len() > MAX_PRINTED_COPY_PROBLEMS {
+		ui.print_failure(&format!(
+			"... and {} more",
+			problems.len() - MAX_PRINTED_COPY_PROBLEMS
+		));
+	}
+}
+
+/// How much of what it planned a copy copied, as "3 of 10 files (1 MiB of 5 MiB)".
+fn copied_amount(report: &CopyReport) -> String {
+	format!(
+		"{} of {} files ({} of {})",
+		report.counts.files_done,
+		report.totals.files,
+		ui::format_size(report.counts.bytes_done),
+		ui::format_size(report.totals.bytes)
+	)
+}
+
+/// A copy's progress, which is not shown.
+struct NoCopyProgress;
+
+impl CopyCallback for NoCopyProgress {
+	fn on_top_level_planned(&self, _items: Vec<PlannedTopLevelItem>) {}
+
+	fn on_top_level_created(&self, _item: CopiedTopLevel) {}
+
+	fn on_update(&self, _update: CopyUpdate) {}
 }
 
 /// The name among `existing` that the server treats as the same as `name`: it compares names
@@ -997,73 +1263,6 @@ fn clashing_name<'a>(existing: impl IntoIterator<Item = &'a str>, name: &str) ->
 	existing
 		.into_iter()
 		.find(|existing| existing.to_lowercase() == name)
-}
-
-pub(crate) async fn copy_file(
-	client: &Client,
-	file: &RemoteFile,
-	destination_dir: &DirType<'_, Normal>,
-) -> Result<RemoteFile> {
-	let name = file.name().context("Failed to decrypt file name")?;
-	let mut builder = client
-		.make_file_builder(name, destination_dir.uuid())
-		.context("Failed to prepare file copy")?;
-	if let Some(mime) = file.mime() {
-		builder = builder.mime(mime.to_string());
-	}
-	if let Some(created) = file.created() {
-		builder = builder.created(created);
-	}
-	if let Some(modified) = file.last_modified() {
-		builder = builder.modified(modified);
-	}
-	let data = client
-		.download_file(file)
-		.await
-		.context("Failed to download file for copying")?;
-	// todo: does this consume too much memory for large files? maybe we should stream the data
-	client
-		.upload_file(builder, &data)
-		.await
-		.context("Failed to upload copied file")
-}
-
-pub(crate) async fn copy_dir_recursive(
-	client: &Client,
-	source_dir: &RemoteDirectory,
-	destination_parent: &DirType<'_, Normal>,
-) -> Result<RemoteDirectory> {
-	let name = source_dir
-		.name()
-		.context("Failed to decrypt directory name")?;
-	let new_dir = client
-		.create_dir(destination_parent, name)
-		.await
-		.context("Failed to create destination directory for copying")?;
-	let (subdirs, files) = client
-		.list_dir::<_, Normal>(
-			&DirType::Dir(std::borrow::Cow::Borrowed(source_dir)),
-			None::<&fn(u64, Option<u64>)>,
-		)
-		.await
-		.context("Failed to list source directory for copying")?;
-	for file in &files {
-		copy_file(
-			client,
-			file,
-			&DirType::Dir(std::borrow::Cow::Borrowed(&new_dir)),
-		)
-		.await?;
-	}
-	for subdir in &subdirs {
-		Box::pin(copy_dir_recursive(
-			client,
-			subdir,
-			&DirType::Dir(std::borrow::Cow::Borrowed(&new_dir)),
-		))
-		.await?;
-	}
-	Ok(new_dir)
 }
 
 pub(crate) async fn set_file_or_directory_favorite(
@@ -1332,6 +1531,7 @@ pub(crate) async fn empty_trash(ui: &mut UI, client: &mut LazyClient) -> Result<
 mod tests {
 	use super::*;
 	use crate::ui::test_support::Printed;
+	use filen_sdk_rs::fs::copy::{ItemCounts, PlanTotals, SkippedEntry};
 
 	#[test]
 	fn a_destination_ending_in_a_slash_names_a_directory() {
@@ -1346,6 +1546,212 @@ mod tests {
 		assert!(!names_a_directory("/a/b"));
 		assert!(!names_a_directory("dir/."));
 		assert!(!names_a_directory(""));
+	}
+
+	fn source(path: &RemotePath) -> Source<'_> {
+		Source {
+			path,
+			name: path.basename().unwrap(),
+			uuid: Uuid::from_u128(1),
+		}
+	}
+
+	fn target(
+		placement: Placement,
+		source_path: &str,
+		destination: &str,
+		found: Found,
+	) -> Result<Target> {
+		let source_path = RemotePath::new(source_path);
+		target_of(
+			placement,
+			&source(&source_path),
+			&RemotePath::new(destination),
+			found,
+			names_a_directory(destination),
+		)
+	}
+
+	#[test]
+	fn an_existing_directory_takes_the_source_under_its_own_name() {
+		assert_eq!(
+			target(Placement::Copy, "/a/x.txt", "/b", Found::Directory).unwrap(),
+			Target::Into {
+				dir: RemotePath::new("/b"),
+				path: RemotePath::new("/b/x.txt"),
+			}
+		);
+	}
+
+	#[test]
+	fn a_missing_destination_is_the_new_path_of_the_source() {
+		assert_eq!(
+			target(Placement::Copy, "/a/x.txt", "/b/y.txt", Found::Nothing).unwrap(),
+			Target::At {
+				parent: RemotePath::new("/b"),
+				name: "y.txt".to_owned(),
+				path: RemotePath::new("/b/y.txt"),
+			}
+		);
+	}
+
+	#[test]
+	fn a_missing_destination_with_a_trailing_slash_is_refused() {
+		assert_eq!(
+			target(Placement::Move, "/a/x.txt", "/b/", Found::Nothing)
+				.unwrap_err()
+				.to_string(),
+			"No such destination directory: /b"
+		);
+	}
+
+	#[test]
+	fn a_file_destination_with_a_trailing_slash_is_not_a_directory() {
+		assert_eq!(
+			target(Placement::Copy, "/a/x.txt", "/b/", Found::File)
+				.unwrap_err()
+				.to_string(),
+			"Not a directory: /b"
+		);
+	}
+
+	#[test]
+	fn an_existing_file_destination_is_refused() {
+		assert_eq!(
+			target(Placement::Copy, "/a/x.txt", "/b.txt", Found::File)
+				.unwrap_err()
+				.to_string(),
+			"Destination already exists: /b.txt"
+		);
+	}
+
+	#[test]
+	fn a_move_into_the_directory_the_source_is_in_is_refused() {
+		assert_eq!(
+			target(Placement::Move, "/a/x.txt", "/a", Found::Directory)
+				.unwrap_err()
+				.to_string(),
+			"/a/x.txt is already in /a"
+		);
+	}
+
+	#[test]
+	fn a_copy_into_the_directory_the_source_is_in_is_left_to_the_name_check() {
+		assert_eq!(
+			target(Placement::Copy, "/a/x.txt", "/a", Found::Directory)
+				.unwrap()
+				.path(),
+			&RemotePath::new("/a/x.txt")
+		);
+	}
+
+	#[test]
+	fn a_directory_is_not_copied_into_itself() {
+		assert_eq!(
+			target(Placement::Copy, "/a/d", "/a/d", Found::Directory)
+				.unwrap_err()
+				.to_string(),
+			"Cannot copy /a/d into itself: /a/d/d"
+		);
+		assert_eq!(
+			target(Placement::Copy, "/a/d", "/a/d/e/f", Found::Nothing)
+				.unwrap_err()
+				.to_string(),
+			"Cannot copy /a/d into itself: /a/d/e/f"
+		);
+	}
+
+	#[test]
+	fn a_directory_is_not_moved_into_itself() {
+		assert_eq!(
+			target(Placement::Move, "/a/d", "/a/d/e", Found::Nothing)
+				.unwrap_err()
+				.to_string(),
+			"Cannot move /a/d into itself: /a/d/e"
+		);
+	}
+
+	#[test]
+	fn a_sibling_sharing_a_name_prefix_is_not_inside() {
+		assert!(!is_inside(
+			&RemotePath::new("/a/dd"),
+			&RemotePath::new("/a/d")
+		));
+		assert!(is_inside(
+			&RemotePath::new("/a/d/e"),
+			&RemotePath::new("/a/d")
+		));
+		assert!(!is_inside(
+			&RemotePath::new("/a/d"),
+			&RemotePath::new("/a/d")
+		));
+	}
+
+	#[test]
+	fn the_copied_amount_counts_files_and_bytes_against_the_plan() {
+		let report = CopyReport {
+			totals: PlanTotals {
+				dirs: 1,
+				files: 10,
+				bytes: 5 * 1024 * 1024,
+			},
+			counts: ItemCounts {
+				files_done: 3,
+				bytes_done: 1024 * 1024,
+				..ItemCounts::default()
+			},
+			..CopyReport::default()
+		};
+
+		assert_eq!(copied_amount(&report), "3 of 10 files (1 MiB of 5 MiB)");
+	}
+
+	fn skipped(source_path: &str) -> SkippedEntry {
+		SkippedEntry {
+			source_path: source_path.to_owned(),
+			bytes: 0,
+			reason: SkipReason::UndecryptableFile {
+				uuid: Uuid::from_u128(1),
+			},
+		}
+	}
+
+	#[test]
+	fn the_problems_of_a_copy_are_listed() {
+		let printed = Printed::default();
+		let mut ui = printed.ui();
+		let report = CopyReport {
+			skipped: vec![skipped("d/a"), skipped("d/b")],
+			..CopyReport::default()
+		};
+
+		print_copy_problems(&mut ui, &report);
+		assert_eq!(
+			printed.lines(),
+			"✘ Skipped d/a: cannot be decrypted\n✘ Skipped d/b: cannot be decrypted"
+		);
+	}
+
+	#[test]
+	fn the_problems_of_a_copy_past_the_limit_are_counted() {
+		let printed = Printed::default();
+		let mut ui = printed.ui();
+		let report = CopyReport {
+			skipped: (0..MAX_PRINTED_COPY_PROBLEMS + 2)
+				.map(|i| skipped(&format!("f{i}")))
+				.collect(),
+			..CopyReport::default()
+		};
+
+		print_copy_problems(&mut ui, &report);
+		let printed = printed.lines();
+		let lines = printed.lines().collect::<Vec<&str>>();
+		assert_eq!(lines.len(), MAX_PRINTED_COPY_PROBLEMS + 1);
+		assert_eq!(
+			lines[MAX_PRINTED_COPY_PROBLEMS - 1],
+			"✘ Skipped f9: cannot be decrypted"
+		);
+		assert_eq!(lines[MAX_PRINTED_COPY_PROBLEMS], "✘ ... and 2 more");
 	}
 
 	#[test]
