@@ -1,5 +1,6 @@
 use assert_cmd::cargo::cargo_bin_cmd;
 use filen_macros::shared_test_runtime;
+use predicates::prelude::PredicateBooleanExt as _;
 use test_utils::authenticated_cli_with_args;
 
 fn get_testing_credentials() -> (String, String) {
@@ -72,6 +73,35 @@ async fn export_and_authenticate_from_auth_config() {
 		.stderr(predicates::str::contains(
 			"Authenticated from auth config file",
 		));
+}
+
+#[test]
+fn a_missing_auth_config_path_fails_without_prompting() {
+	let config_dir = assert_fs::TempDir::new().unwrap();
+	let missing = config_dir.path().join("missing-auth-config.txt");
+	cargo_bin_cmd!()
+		.env("FILEN_CLI_TESTING_DISABLE_KEYRING", "1")
+		.env_remove("FILEN_CLI_EMAIL")
+		.env_remove("FILEN_CLI_PASSWORD")
+		.env_remove("FILEN_CLI_2FA_CODE")
+		.args([
+			"--skip-update",
+			"--config-dir",
+			config_dir.path().to_str().unwrap(),
+			"--auth-config-path",
+			missing.to_str().unwrap(),
+			"stat",
+			"/",
+		])
+		.assert()
+		.code(1)
+		.stdout("")
+		.stderr(predicates::str::contains(format!(
+			"Auth config file not found: {}",
+			missing.display()
+		)))
+		// the prompt it fell back to before, which fails without a terminal
+		.stderr(predicates::str::contains("Not logged in").not());
 }
 
 // notes:

@@ -238,29 +238,38 @@ fn authenticate_from_auth_config(
 	path_arg: Option<&str>,
 	client_config_args: &ClientConfigArgs,
 ) -> Result<Option<(Client, PathBuf)>> {
-	let auth_config_paths = if let Some(path) = path_arg {
-		vec![PathBuf::from(path)]
+	let path = if let Some(path) = path_arg {
+		// a path given explicitly must be used, never skipped for another account's credentials
+		PathBuf::from(path)
+	} else if std::env::var("FILEN_CLI_TESTING_DISABLE_AUTODETECTED_AUTH_CONFIG")
+		== Ok("1".to_string())
+	{
+		return Ok(None);
+	} else if let Some(path) = get_auth_config_default_locations(config).into_iter().next() {
+		path
 	} else {
-		if std::env::var("FILEN_CLI_TESTING_DISABLE_AUTODETECTED_AUTH_CONFIG")
-			!= Ok("1".to_string())
-		{
-			get_auth_config_default_locations(config)
-		} else {
-			vec![]
-		}
+		return Ok(None);
 	};
-	for path in auth_config_paths {
-		if path.exists() {
-			let sdk_config = std::fs::read_to_string(&path).with_context(|| {
-				format!("Failed to read auth config file from {}", path.display())
-			})?;
-			return Ok(Some((
-				deserialize_auth_config(&sdk_config, client_config_args)?,
-				path,
-			)));
+	let sdk_config = read_auth_config(&path)?;
+	Ok(Some((
+		deserialize_auth_config(&sdk_config, client_config_args)?,
+		path,
+	)))
+}
+
+/// Read the auth config file at `path`.
+fn read_auth_config(path: &Path) -> Result<String> {
+	std::fs::read_to_string(path).map_err(|e| {
+		if e.kind() == std::io::ErrorKind::NotFound {
+			UI::failure(&format!("Auth config file not found: {}", path.display()))
+		} else {
+			UI::failure(&format!(
+				"Failed to read auth config file {}: {}",
+				path.display(),
+				e
+			))
 		}
-	}
-	Ok(None)
+	})
 }
 
 /// Get the default locations for auth config files: inside the current working directory, and the config directory.
@@ -432,6 +441,32 @@ pub(crate) fn logout(config: &CliConfig, ui: &mut UI) -> Result<bool> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::error::exit_code;
+
+	#[test]
+	fn a_missing_auth_config_path_fails_instead_of_falling_back() {
+		let config_dir = assert_fs::TempDir::new().unwrap();
+		// the autodetected file, which must not be read in its place
+		std::fs::write(config_dir.path().join(AUTH_CONFIG_FILENAME), "not a config").unwrap();
+		let missing = config_dir.path().join("missing.txt");
+		let config = CliConfig {
+			config_dir: config_dir.path().to_path_buf(),
+		};
+
+		let Err(err) = authenticate_from_auth_config(
+			&config,
+			Some(missing.to_str().unwrap()),
+			&ClientConfigArgs::default(),
+		) else {
+			panic!("a missing auth config path must fail");
+		};
+
+		assert_eq!(
+			format!("{err:#}"),
+			format!("Auth config file not found: {}", missing.display())
+		);
+		assert_eq!(exit_code(&err), 1);
+	}
 
 	#[test]
 	fn write_private_file_writes_contents() {
