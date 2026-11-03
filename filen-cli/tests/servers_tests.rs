@@ -15,7 +15,10 @@ use std::{
 
 use assert_fs::{TempDir, prelude::*};
 use filen_macros::shared_test_runtime;
-use filen_sdk_rs::rclone::{FuseStatus, fuse_status};
+use filen_sdk_rs::{
+	fs::HasName as _,
+	rclone::{FuseStatus, fuse_status},
+};
 use regex::Regex;
 use reqwest::{Method, StatusCode};
 use serde_json::Value;
@@ -23,6 +26,7 @@ use test_utils::cli::prepare_cli_auth_config;
 use tokio::{
 	io::{AsyncBufReadExt, AsyncReadExt, BufReader, Lines},
 	process::{Child, ChildStdout, Command},
+	sync::{Semaphore, SemaphorePermit},
 	task::JoinHandle,
 	time::timeout,
 };
@@ -35,6 +39,14 @@ const EXIT: Duration = Duration::from_secs(60);
 /// Held while a CLI is spawned: on macOS a pipe is marked close-on-exec only after it is created,
 /// so a CLI another test spawned in between would inherit this test's pipes and keep them open.
 static SPAWNING: Mutex<()> = Mutex::new(());
+
+/// How many mounts and servers the CLI runs at once on one config directory, each on a cache of its
+/// own; another fails until one stops.
+const CLI_CACHES: usize = 8;
+
+/// A permit per CLI running at once, so that the tests, which share one config directory, never
+/// run more CLIs than it has caches.
+static RUNNING: Semaphore = Semaphore::const_new(CLI_CACHES);
 
 /// What a WebDAV server's start line says, with its generated credentials.
 static WEBDAV_STARTED: LazyLock<Regex> = LazyLock::new(|| {
@@ -69,11 +81,14 @@ struct Cli {
 	stderr: JoinHandle<String>,
 	/// The account's credentials, which the CLI reads when it starts.
 	_auth_config: TempDir,
+	/// Released once the CLI has exited, when the guard is dropped.
+	_running: SemaphorePermit<'static>,
 }
 
 impl Cli {
 	/// Starts `filen <args>` logged into the test account.
 	async fn spawn(args: &[&str]) -> Self {
+		let running = RUNNING.acquire().await.unwrap();
 		let (auth_config, auth_config_file) = prepare_cli_auth_config().await;
 		let mut command = Command::new(assert_cmd::cargo::cargo_bin!("filen-cli"));
 		command
@@ -109,6 +124,7 @@ impl Cli {
 			stdout,
 			stderr,
 			_auth_config: auth_config,
+			_running: running,
 		}
 	}
 
@@ -247,6 +263,17 @@ impl Started {
 			request
 		};
 		request.send().await.unwrap().status()
+	}
+
+	/// The status and body of a GET of `path` with the printed credentials.
+	async fn get(&self, path: &str) -> (StatusCode, String) {
+		let response = reqwest::Client::new()
+			.get(format!("{}/{path}", self.url))
+			.basic_auth(&self.user, Some(&self.password))
+			.send()
+			.await
+			.unwrap();
+		(response.status(), response.text().await.unwrap())
 	}
 }
 
@@ -396,4 +423,55 @@ async fn a_server_takes_its_password_from_a_file() {
 	cli.interrupt();
 	let (status, stderr) = cli.exit().await;
 	assert_eq!(status.code(), Some(0), "{stderr}");
+}
+
+#[shared_test_runtime]
+async fn a_server_with_a_root_serves_only_that_directory() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = &resources.dir;
+	let file = client
+		.make_file_builder("inside.txt", test_dir.uuid)
+		.unwrap();
+	client.upload_file(file, b"inside").await.unwrap();
+	let root = format!("/{}", test_dir.name().unwrap());
+
+	let (mut cli, started, _) = serve_webdav(&["--root", &root]).await;
+
+	assert_eq!(
+		started.get("inside.txt").await,
+		(StatusCode::OK, "inside".to_owned())
+	);
+	assert_eq!(
+		started
+			.get(&format!("{}/inside.txt", test_dir.name().unwrap()))
+			.await
+			.0,
+		StatusCode::NOT_FOUND
+	);
+	cli.interrupt();
+	let (status, stderr) = cli.exit().await;
+	assert_eq!(status.code(), Some(0), "{stderr}");
+}
+
+#[shared_test_runtime]
+async fn a_server_with_a_root_that_does_not_exist_fails() {
+	let root = format!("/filen-cli-servers-tests-missing-{}", free_port());
+
+	let mut cli = Cli::spawn(&[
+		"serve",
+		"webdav",
+		"--addr",
+		&format!("127.0.0.1:{}", free_port()),
+		"--root",
+		&root,
+	])
+	.await;
+	let (status, stderr) = cli.exit().await;
+
+	assert_eq!(status.code(), Some(1), "{stderr}");
+	assert!(
+		stderr.contains(&format!("No such directory: {root}")),
+		"{stderr}"
+	);
 }

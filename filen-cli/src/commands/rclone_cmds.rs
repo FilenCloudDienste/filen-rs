@@ -6,8 +6,8 @@
 //!
 //! [cli-doc] rclone-passthrough
 //! `filen rclone` runs any Rclone command, with your drive as the `filen` remote, so it covers what
-//! `mount` and `serve` have no option for: more parallel transfers (`--transfers`), serving or
-//! mounting a directory instead of the whole drive, or any other Rclone flag. For example:
+//! `mount` and `serve` have no option for: more parallel transfers (`--transfers`), or any other
+//! Rclone flag. For example:
 //!
 //! ```sh
 //! filen rclone copy ./photos filen:Photos --transfers 16
@@ -63,6 +63,7 @@ use console::{Term, style};
 use filen_sdk_rs::{
 	ErrorKind,
 	auth::Client,
+	fs::categories::NonRootFileType,
 	rclone::{
 		FuseProvider, MountInfo, MountOptions, RcloneBinary, RcloneDaemon, RcloneDaemonConfig,
 		RcloneExit, RcloneRefusal, RcloneStats, ServeAuth, ServeOptions, ServeProtocol, ServeTls,
@@ -83,6 +84,7 @@ use crate::{
 	error::CliError,
 	interrupt,
 	ui::{self, UI},
+	util::RemotePath,
 };
 
 #[derive(Debug, Subcommand)]
@@ -103,6 +105,9 @@ pub(crate) enum RcloneCommands {
 		/// Mount the drive read-only
 		#[arg(long)]
 		read_only: bool,
+		/// Mount only this directory, by its path from the root of your drive, not from the working directory (default: the whole drive)
+		#[arg(long, value_name = "PATH")]
+		root: Option<String>,
 	},
 	/// Runs a WebDAV, S3, FTP, SFTP, HTTP, restic or NFS server exposing your Filen drive
 	Serve {
@@ -126,6 +131,9 @@ pub(crate) enum RcloneCommands {
 		/// The server is read-only
 		#[arg(long)]
 		read_only: bool,
+		/// Serve only this directory, by its path from the root of your drive, not from the working directory (default: the whole drive)
+		#[arg(long, value_name = "PATH")]
+		root: Option<String>,
 		/// The maximum cache size (e.g. "500Mi", "10Gi") (default: 32Gi)
 		#[arg(long, value_parser = parse_size)]
 		cache_size: Option<u64>,
@@ -246,7 +254,21 @@ impl RcloneCommands {
 				mount_point,
 				cache_size,
 				read_only,
-			} => mount(config, ui, client, mount_point, cache_size, read_only).await?,
+				root,
+			} => {
+				mount(
+					config,
+					ui,
+					client,
+					MountArgs {
+						mount_point,
+						cache_size,
+						read_only,
+						root,
+					},
+				)
+				.await?;
+			}
 			Self::Serve {
 				server,
 				address,
@@ -254,6 +276,7 @@ impl RcloneCommands {
 				password,
 				password_file,
 				read_only,
+				root,
 				cache_size,
 				cert,
 				key,
@@ -269,6 +292,7 @@ impl RcloneCommands {
 						user,
 						password,
 						read_only,
+						root,
 						cache_size,
 						cert,
 						key,
@@ -340,31 +364,42 @@ pub(crate) struct ServeArgs {
 	pub(crate) user: Option<String>,
 	pub(crate) password: Option<String>,
 	pub(crate) read_only: bool,
+	/// The directory served, from the drive's root; the whole drive without one.
+	pub(crate) root: Option<String>,
 	pub(crate) cache_size: Option<u64>,
 	pub(crate) cert: Option<String>,
 	pub(crate) key: Option<String>,
+}
+
+/// What `mount` mounts.
+pub(crate) struct MountArgs {
+	/// The default mount point without one.
+	pub(crate) mount_point: Option<String>,
+	pub(crate) cache_size: Option<u64>,
+	pub(crate) read_only: bool,
+	/// The directory mounted, from the drive's root; the whole drive without one.
+	pub(crate) root: Option<String>,
 }
 
 pub(crate) async fn mount(
 	config: &CliConfig,
 	ui: &mut UI,
 	client: &mut LazyClient,
-	mount_point: Option<String>,
-	cache_size: Option<u64>,
-	read_only: bool,
+	args: MountArgs,
 ) -> Result<()> {
 	let client = client.get(ui).await?;
-	let mount_point = match mount_point {
+	let root = drive_dir(client, args.root.as_deref()).await?;
+	let mount_point = match args.mount_point {
 		Some(mount_point) => mount_point,
 		None => default_mount_point().await?,
 	};
-	let (daemon, ctrl_c) = start_daemon(config, ui, client, cache_size).await?;
+	let (daemon, ctrl_c) = start_daemon(config, ui, client, args.cache_size).await?;
 	let mounted = daemon
 		.daemon
 		.mount(MountOptions {
 			mount_point,
-			read_only,
-			root: None,
+			read_only: args.read_only,
+			root,
 		})
 		.await
 		.map_err(|e| {
@@ -409,6 +444,7 @@ pub(crate) async fn start_server(
 	};
 	let scheme = if tls.is_some() { "https" } else { "http" };
 	let client = client.get(ui).await?;
+	let root = drive_dir(client, args.root.as_deref()).await?;
 	let (daemon, ctrl_c) = start_daemon(config, ui, client, args.cache_size).await?;
 	let serve = daemon
 		.daemon
@@ -420,7 +456,7 @@ pub(crate) async fn start_server(
 			auth: auth.clone(),
 			tls,
 			read_only: args.read_only,
-			root: None,
+			root,
 		})
 		.await
 		.map_err(|e| rclone_error(e, format!("Failed to start {name} server")))?;
@@ -458,6 +494,31 @@ pub(crate) async fn start_server(
 		);
 	}
 	wait_and_stop(ui, &daemon, ctrl_c, &format!("Stopping {name} server")).await
+}
+
+/// The directory `root` names, by its path from the drive's root, once it is known to be one: the
+/// path without its leading `/`, or `None` for the drive's root itself or without a `root`.
+async fn drive_dir(client: &Client, root: Option<&str>) -> Result<Option<String>> {
+	let Some(root) = root else {
+		return Ok(None);
+	};
+	let path = RemotePath::new("/").navigate(root);
+	match client
+		.find_item_at_path(&path.0)
+		.await
+		.context("Failed to find directory")?
+	{
+		Some(NonRootFileType::Root(_)) => Ok(None),
+		Some(NonRootFileType::Dir(_)) => Ok(Some(dir_below_root(&path).to_owned())),
+		Some(_) => Err(UI::failure(&format!("Not a directory: {}", path.0))),
+		None => Err(UI::failure(&format!("No such directory: {}", path.0))),
+	}
+}
+
+/// `path` as the SDK takes a root directory: from the drive's root, without a leading or trailing
+/// `/`.
+fn dir_below_root(path: &RemotePath) -> &str {
+	path.0.trim_matches('/')
 }
 
 /// What `mount --json` prints once the drive is mounted.
@@ -1065,6 +1126,36 @@ mod tests {
 				..
 			}
 		));
+	}
+
+	#[test]
+	fn mount_and_serve_take_a_root_directory() {
+		assert!(matches!(
+			parsed_command(&["filen", "mount", "--root", "/Photos"]),
+			RcloneCommands::Mount { root: Some(root), .. } if root == "/Photos"
+		));
+		assert!(matches!(
+			parsed_command(&["filen", "serve", "webdav", "--root", "Photos/2024"]),
+			RcloneCommands::Serve { root: Some(root), .. } if root == "Photos/2024"
+		));
+		assert!(matches!(
+			parsed_command(&["filen", "serve", "webdav"]),
+			RcloneCommands::Serve { root: None, .. }
+		));
+	}
+
+	/// The directory the SDK is given for `--root <root>`.
+	fn root_dir(root: &str) -> String {
+		dir_below_root(&RemotePath::new("/").navigate(root)).to_owned()
+	}
+
+	#[test]
+	fn the_root_directory_is_resolved_from_the_drives_root() {
+		assert_eq!(root_dir("Photos/2024"), "Photos/2024");
+		assert_eq!(root_dir("/Photos/2024/"), "Photos/2024");
+		assert_eq!(root_dir("Photos/../Documents"), "Documents");
+		assert_eq!(root_dir("../../Photos"), "Photos");
+		assert_eq!(root_dir("/"), "");
 	}
 
 	#[test]
