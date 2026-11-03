@@ -313,3 +313,129 @@ async fn cp_copies_a_nested_directory_with_identical_content() {
 		binary
 	);
 }
+
+#[shared_test_runtime]
+async fn cp_copies_a_file_to_a_new_name() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = format!("/{}", resources.dir.name().unwrap());
+	test_utils::create_remote_file_structure_outline(client, resources.dir.clone(), &["dest/"])
+		.await
+		.unwrap();
+	upload(client, &resources.dir, "a.txt", b"copied under a new name").await;
+
+	authenticated_cli_with_args!(
+		"cp",
+		&format!("{test_dir}/a.txt"),
+		&format!("{test_dir}/dest/b.txt")
+	)
+	.success()
+	.stdout(predicates::str::contains(format!(
+		"Copied {test_dir}/a.txt to {test_dir}/dest/b.txt"
+	)));
+
+	assert_eq!(
+		content_at(client, &format!("{test_dir}/dest/b.txt")).await,
+		b"copied under a new name"
+	);
+	assert!(
+		client
+			.find_item_at_path(&format!("{test_dir}/dest/a.txt"))
+			.await
+			.unwrap()
+			.is_none()
+	);
+}
+
+#[shared_test_runtime]
+async fn cp_copies_a_directory_to_a_new_name_next_to_it() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = format!("/{}", resources.dir.name().unwrap());
+	test_utils::create_remote_file_structure_outline(
+		client,
+		resources.dir.clone(),
+		&["src/inner.txt"],
+	)
+	.await
+	.unwrap();
+
+	authenticated_cli_with_args!(
+		"cp",
+		&format!("{test_dir}/src"),
+		&format!("{test_dir}/copy")
+	)
+	.success();
+
+	assert!(matches!(
+		client
+			.find_item_at_path(&format!("{test_dir}/copy/inner.txt"))
+			.await
+			.unwrap(),
+		Some(NonRootFileType::File(_))
+	));
+}
+
+#[shared_test_runtime]
+async fn cp_refuses_a_new_path_whose_name_exists_in_its_directory() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = format!("/{}", resources.dir.name().unwrap());
+	test_utils::create_remote_file_structure_outline(
+		client,
+		resources.dir.clone(),
+		&["a.txt", "b.txt"],
+	)
+	.await
+	.unwrap();
+
+	authenticated_cli_with_args!(
+		"cp",
+		&format!("{test_dir}/a.txt"),
+		&format!("{test_dir}/B.TXT")
+	)
+	.failure()
+	.stderr(predicates::str::contains(format!(
+		"Destination already exists: {test_dir}/b.txt"
+	)));
+
+	assert!(
+		client
+			.find_item_at_path(&format!("{test_dir}/B.TXT"))
+			.await
+			.unwrap()
+			.is_none()
+	);
+}
+
+#[shared_test_runtime]
+async fn cp_refuses_to_copy_a_directory_into_itself() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = format!("/{}", resources.dir.name().unwrap());
+	test_utils::create_remote_file_structure_outline(
+		client,
+		resources.dir.clone(),
+		&["src/inner.txt"],
+	)
+	.await
+	.unwrap();
+
+	authenticated_cli_with_args!(
+		"cp",
+		&format!("{test_dir}/src"),
+		&format!("{test_dir}/src/copy")
+	)
+	.failure()
+	.stderr(predicates::str::contains(format!(
+		"Cannot copy {test_dir}/src into itself: {test_dir}/src/copy"
+	)));
+
+	assert!(
+		client
+			.find_item_at_path(&format!("{test_dir}/src/copy"))
+			.await
+			.unwrap()
+			.is_none()
+	);
+}

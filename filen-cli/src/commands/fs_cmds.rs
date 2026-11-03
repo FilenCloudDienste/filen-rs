@@ -24,6 +24,7 @@ use filen_sdk_rs::{
 		},
 		dir::meta::DirectoryMetaChanges,
 		file::{meta::FileMetaChanges, traits::HasFileInfo as _},
+		name::ValidatedName,
 	},
 	io::{RemoteDirectory, RemoteFile, client_impl::IoSharedClientExt},
 };
@@ -111,8 +112,9 @@ pub(crate) enum FsCommands {
 		/// Source file or directory
 		#[arg(add = FilenCompleter::file_or_directory())]
 		source: String,
-		/// Destination parent directory
-		#[arg(add = FilenCompleter::directory())]
+		/// Destination: an existing directory to copy the source into,
+		/// or the path of the copy (to copy it under a new name)
+		#[arg(add = FilenCompleter::file_or_directory())]
 		destination: String,
 	},
 	/// List favorited items
@@ -1049,6 +1051,10 @@ async fn resolve_destination<'a>(
 	Ok(Destination { dir, name, path })
 }
 
+/// Copies a file or directory, following the semantics of the Unix `cp`: if the destination is
+/// an existing directory, the copy is put into it under the source's name; otherwise the
+/// destination names the copy's path, so the copy is put into that path's parent directory under
+/// that path's base name. A destination ending in '/' must be an existing directory.
 pub(crate) async fn copy_file_or_directory(
 	ui: &mut UI,
 	client: &mut LazyClient,
@@ -1056,62 +1062,47 @@ pub(crate) async fn copy_file_or_directory(
 	source_str: &str,
 	destination_str: &str,
 ) -> Result<()> {
-	let source_str = working_path.navigate(source_str);
-	let destination_str = working_path.navigate(destination_str);
+	let source_path = working_path.navigate(source_str);
 	let client = client.get(ui).await?;
-	let Some(source_file_or_directory) = client
-		.find_item_at_path(&source_str.0)
+	let Some(source) = client
+		.find_item_at_path(&source_path.0)
 		.await
 		.context("Failed to find source file or directory")?
 	else {
 		return Err(UI::failure(&format!(
 			"No such source file or directory: {}",
-			source_str.0
+			source_path.0
 		)));
 	};
-	let Some(destination_dir) = client
-		.find_item_at_path(&destination_str.0)
-		.await
-		.context("Failed to find destination directory")?
-	else {
-		return Err(UI::failure(&format!(
-			"No such destination directory: {}",
-			destination_str.0
-		)));
-	};
-	let destination_dir = match destination_dir {
-		NonRootFileType::Dir(dir) => DirType::Dir(dir),
-		NonRootFileType::Root(root) => DirType::Root(root),
-		_ => {
-			return Err(UI::failure(&format!(
-				"Not a directory: {}",
-				destination_str.0
-			)));
-		}
-	};
-	// A same-name upload would replace the existing file (as a new version) and creating a
-	// same-name directory returns the existing one, so the copy would merge into it.
-	let source_name = match &source_file_or_directory {
+	let source_name = match &source {
 		NonRootFileType::File(file) => file.name(),
 		NonRootFileType::Dir(dir) => dir.name(),
 		NonRootFileType::Root(_) => return Err(UI::failure("Cannot copy root directory")),
 	}
 	.context("Failed to decrypt source name")?;
-	let (existing_dirs, existing_files) = client
-		.list_dir::<_, Normal>(&destination_dir, None::<&fn(u64, Option<u64>)>)
-		.await
-		.context("Failed to list destination directory")?;
-	let existing_names = existing_dirs
-		.iter()
-		.filter_map(|dir| dir.name())
-		.chain(existing_files.iter().filter_map(|file| file.name()));
-	if let Some(existing_name) = clashing_name(existing_names, source_name) {
-		return Err(UI::failure(&format!(
-			"Destination already exists: {}",
-			destination_str.navigate(existing_name)
-		)));
-	}
-	let source = match source_file_or_directory {
+	let destination = resolve_destination(
+		client,
+		Placement::Copy,
+		&Source {
+			path: &source_path,
+			name: source_name,
+			uuid: source.uuid(),
+		},
+		working_path,
+		destination_str,
+	)
+	.await?;
+	// the source's own name is left to the copy, which also copies a name today's rules reject
+	let name = if destination.name == source_name {
+		None
+	} else {
+		Some(
+			ValidatedName::try_from(destination.name.as_str())
+				.map_err(|e| UI::failure(&format!("Invalid destination name: {}", e)))?,
+		)
+	};
+	let destination_dir_path = destination.path.parent();
+	let source = match source {
 		NonRootFileType::File(file) => ItemSource::File(file.into_owned().into()),
 		NonRootFileType::Dir(dir) => ItemSource::Dir(ItemSourceDir::Normal(dir.into_owned())),
 		NonRootFileType::Root(_) => return Err(UI::failure("Cannot copy root directory")),
@@ -1123,15 +1114,15 @@ pub(crate) async fn copy_file_or_directory(
 		.copy_items_to(
 			vec![CopyRequest {
 				source,
-				destination: destination_dir.into_owned_cow(),
-				name: None,
+				destination: destination.dir.into_owned_cow(),
+				name,
 			}],
 			config,
 			NoCopyProgress,
 			JobControl::default(),
 		)
 		.await;
-	finish_copy(ui, &source_str, &destination_str, result)
+	finish_copy(ui, &source_path, &destination_dir_path, result)
 }
 
 /// Storage left on the account, for the copy to check that it fits before it writes anything.
