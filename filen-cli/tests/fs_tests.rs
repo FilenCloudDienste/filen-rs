@@ -1746,3 +1746,87 @@ async fn color_refuses_a_color_the_apps_cannot_show() {
 			"use one of default, blue, green, purple, red, gray, or a hex color like #85bcff",
 		));
 }
+
+/// Fills `parent` with a small nested tree: `a.txt`, and `docs` holding `b.txt` and `old`, which
+/// holds `file10.txt` and `file2.txt`. The files' sizes add up to 22 bytes, 15 of them in `docs`.
+async fn nested_tree(client: &Client, parent: &RemoteDirectory) {
+	let docs = client.create_dir(&parent.into(), "docs").await.unwrap();
+	let old = client.create_dir(&(&docs).into(), "old").await.unwrap();
+	upload(client, parent, "a.txt", b"content").await;
+	upload(client, &docs, "b.txt", b"bbb").await;
+	upload(client, &old, "file10.txt", b"0123456789").await;
+	upload(client, &old, "file2.txt", b"22").await;
+}
+
+#[shared_test_runtime]
+async fn ls_recursive_prints_every_path_below_the_directory() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let test_dir = format!("/{}", resources.dir.name().unwrap());
+	nested_tree(&resources.client, &resources.dir).await;
+
+	authenticated_cli_with_args!("ls", "-R", &test_dir)
+		.success()
+		.stdout("docs\ndocs/old\ndocs/old/file2.txt\ndocs/old/file10.txt\ndocs/b.txt\na.txt\n");
+
+	let listing =
+		printed_json(&authenticated_cli_with_args!("ls", "-R", &test_dir, "--json").success());
+	let paths = listing
+		.as_array()
+		.unwrap()
+		.iter()
+		.map(|item| item["path"].as_str().unwrap())
+		.collect::<Vec<&str>>();
+	assert_eq!(
+		paths,
+		[
+			"docs",
+			"docs/old",
+			"docs/old/file2.txt",
+			"docs/old/file10.txt",
+			"docs/b.txt",
+			"a.txt"
+		]
+	);
+	assert_eq!(listing[3]["name"], "file10.txt");
+	assert_eq!(listing[3]["type"], "file");
+	assert_eq!(listing[3]["size"], 10);
+}
+
+#[shared_test_runtime]
+async fn tree_draws_everything_below_the_directory() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let test_dir = format!("/{}", resources.dir.name().unwrap());
+	nested_tree(&resources.client, &resources.dir).await;
+
+	authenticated_cli_with_args!("tree", &test_dir)
+		.success()
+		.stdout(format!(
+			"{test_dir}\n├── docs\n│   ├── old\n│   │   ├── file2.txt\n│   │   └── file10.txt\n│   \
+			 └── b.txt\n└── a.txt\n\n2 directories, 4 files\n"
+		));
+}
+
+#[shared_test_runtime]
+async fn du_sums_the_sizes_of_the_files_below_each_item() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let test_dir = format!("/{}", resources.dir.name().unwrap());
+	nested_tree(&resources.client, &resources.dir).await;
+
+	authenticated_cli_with_args!("du", &test_dir)
+		.success()
+		.stdout(format!("15 B  docs\n 7 B  a.txt\n22 B  {test_dir}\n"));
+	authenticated_cli_with_args!("du", "-s", &test_dir)
+		.success()
+		.stdout(format!("22 B  {test_dir}\n"));
+	assert_eq!(
+		printed_json(&authenticated_cli_with_args!("du", &test_dir, "--json").success()),
+		serde_json::json!({
+			"path": test_dir,
+			"size": 22,
+			"items": [
+				{ "name": "docs", "type": "directory", "size": 15 },
+				{ "name": "a.txt", "type": "file", "size": 7 },
+			],
+		})
+	);
+}

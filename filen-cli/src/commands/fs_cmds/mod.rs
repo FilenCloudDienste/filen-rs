@@ -61,6 +61,7 @@ use serde_json::json;
 use tempfile::{NamedTempFile, TempDir};
 use tokio::select;
 
+mod tree;
 mod versions;
 
 #[derive(Debug, Subcommand)]
@@ -82,6 +83,26 @@ pub(crate) enum FsCommands {
 		/// [color] after colored directories and (*) after favorited items
 		#[arg(short = 'l', long)]
 		long: bool,
+		/// List everything below the directory, one path relative to it per line, each directory
+		/// followed by what it holds
+		#[arg(short = 'R', long)]
+		recursive: bool,
+	},
+	/// Draw everything below a directory as a tree (with --json: the listing of ls -R --json)
+	Tree {
+		/// Directory to draw (default: the current working directory)
+		#[arg(add = FilenCompleter::directory())]
+		directory: Option<String>,
+	},
+	/// Show the size of each item in a directory, a directory's being that of every file below
+	/// it, and the total
+	Du {
+		/// Directory or file to show the size of (default: the current working directory)
+		#[arg(add = FilenCompleter::file_or_directory())]
+		file_or_directory: Option<String>,
+		/// Show only the total
+		#[arg(short = 's', long)]
+		summarize: bool,
 	},
 	/// Print the contents of a file as the bytes it holds (with --json: {"text": ...}, for UTF-8
 	/// text only)
@@ -269,6 +290,8 @@ pub(crate) const BROWSING_DOCS: &[DocElement] = &[
 	DocElement::CommandHelp("cd"),
 	DocElement::CommandHelp("pwd"),
 	DocElement::CommandHelp("ls"),
+	DocElement::CommandHelp("tree"),
+	DocElement::CommandHelp("du"),
 	DocElement::CommandHelp("cat"),
 	DocElement::CommandHelp("head"),
 	DocElement::CommandHelp("tail"),
@@ -316,8 +339,31 @@ impl FsCommands {
 				});
 			}
 			Self::Pwd => print_working_path(ui, working_path)?,
-			Self::Ls { directory, long } => {
+			Self::Ls {
+				directory,
+				long,
+				recursive: false,
+			} => {
 				list_directory(ui, client, working_path, directory, long).await?;
+			}
+			Self::Ls {
+				directory,
+				long,
+				recursive: true,
+			} => {
+				let path = working_path.navigate(directory.as_deref().unwrap_or(""));
+				tree::list_directory_recursively(ui, client, &path, long).await?;
+			}
+			Self::Tree { directory } => {
+				let path = working_path.navigate(directory.as_deref().unwrap_or(""));
+				tree::print_tree(ui, client, &path).await?;
+			}
+			Self::Du {
+				file_or_directory,
+				summarize,
+			} => {
+				let path = working_path.navigate(file_or_directory.as_deref().unwrap_or(""));
+				tree::print_disk_usage(ui, client, &path, summarize).await?;
 			}
 			Self::Cat { file } => {
 				print_file(ui, client, working_path, &file, PrintFileLines::Full).await?;
