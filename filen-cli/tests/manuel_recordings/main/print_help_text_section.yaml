@@ -3,25 +3,97 @@
 # (manuel) filen help auth                                                                                              #
 # Authentication                                                                                                        #
 #                                                                                                                       #
-# There are multiple ways to authenticate:                                                                              #
-# - set the CLI arguments `--email` (or environment variable `FILEN_CLI_EMAIL`)                                         #
-#   and `--password` (`FILEN_CLI_PASSWORD`), optionally `--two-factor-code` (`FILEN_CLI_2FA_CODE`)                      #
-#   (when the two-factor code is omitted and required, you will be prompted for it)                                     #
-# - specify an auth config via the `--auth-config-path` flag                                                            #
-#   (exported via `filen export-auth-config`),                                                                          #
-#   or put an auth config in one of the default locations:                                                              #
-#   (unless overwritten by the `--config-dir` flag)                                                                     #
-#   - `./filen-cli-auth-config.txt` (current working directory)                                                         #
-#   - Linux/macOS: `$HOME/.filen-cli/filen-cli-auth-config.txt`                                                         #
-#   - Windows: `%appdata%\filen-cli\filen-cli-auth-config.txt`                                                          #
-# - if none of these is set, you will be prompted for credentials,                                                      #
-#   with the option to save them securely in the system keychain                                                        #
+# The CLI logs in with the first of these that it finds:                                                                #
+# 1. the CLI arguments `--email` and `--password`, optionally `--two-factor-code`,                                      #
+#    or the environment variables `FILEN_CLI_EMAIL`, `FILEN_CLI_PASSWORD` and `FILEN_CLI_2FA_CODE`                      #
+#    (when none of these is set, the variables `FILEN_EMAIL`, `FILEN_PASSWORD` and                                      #
+#    `FILEN_2FA_CODE` of the old Filen CLI are used; when a two-factor code is required                                 #
+#    and not given, you are prompted for it; the recovery key is accepted as the code too)                              #
 #                                                                                                                       #
-# ┃ export-auth-config                                                                                                  #
-# ┃ Export an auth config (to be used with --auth-config-path option)                                                   #
+#    To log in to an account with two-factor authentication without anyone to type a code,                              #
+#    set `FILEN_CLI_2FA_SECRET` to its TOTP secret (the key your authenticator app was set up with):                    #
+#    the CLI then makes the code itself. Keep in mind that anyone who can read the CLI's                                #
+#    environment then has your second factor too, which defeats two-factor authentication                               #
+#    on that machine.                                                                                                   #
+# 2. an auth config file, exported with `filen export-auth-config`: the one given with                                  #
+#    `--auth-config-path`, or else `./filen-cli-auth-config.txt` (in the current working                                #
+#    directory), then `filen-cli-auth-config.txt` in the config dir                                                     #
+#    (on Linux and macOS, an auth config found in these two places must not be accessible                               #
+#    to other users: restrict it with `chmod 600`)                                                                      #
+# 3. the login kept in the system keychain (each config dir keeps a login of its own there)                             #
+# 4. credentials saved by the old Filen CLI, which are imported                                                         #
+#    (its `.filen-cli-auth-config` in the current working directory or its data directory,                              #
+#    and, with the default config dir, the login it kept; its files are left as they are)                               #
+# 5. otherwise, you are prompted for your email and password (with three attempts)                                      #
+#                                                                                                                       #
+# After logging in by 4. or 5., you can keep the login in the system keychain,                                          #
+# or, where there is none (such as in the Docker image), in an auth config file in the config dir.                      #
+#                                                                                                                       #
+# The config dir is the one given with `--config-dir`, or by default:                                                   #
+# - Linux: `$XDG_CONFIG_HOME/filen-cli`, or `~/.config/filen-cli` without it                                            #
+# - macOS: `~/Library/Application Support/filen-cli`                                                                    #
+# - Windows: `%APPDATA%\filen-cli`                                                                                      #
+#                                                                                                                       #
+# (development builds use `filen-cli-dev` instead)                                                                      #
+#                                                                                                                       #
+# ┃ whoami                                                                                                              #
+# ┃ Print the email of the account you are logged in as                                                                 #
+#                                                                                                                       #
+# ┃ export-auth-config [PATH]                                                                                           #
+# ┃ Export an auth config (to be used with --auth-config-path option), after confirming the risk (--yes answers)        #
+# ┃ → [PATH]  The file to write, or a directory to write filen-cli-auth-config.txt into (defaults to the current workin #
+# g directory)                                                                                                          #
 #                                                                                                                       #
 # ┃ logout                                                                                                              #
-# ┃ Delete saved credentials and exit                                                                                   #
+# ┃ Delete saved credentials, including the --auth-config-path file, and exit, asking before each (--yes deletes them a #
+# ll); then offer to delete the local cache                                                                             #
+#                                                                                                                       #
+# `2fa enable` turns on two-factor authentication: it prints a secret (and an `otpauth://` URL with                     #
+# it) to add to your authenticator app, asks for a code from the app (or takes it with `--code`),                       #
+# and prints the recovery key, which logs you in without a code: store it somewhere safe.                               #
+# With `--json`, the secret and the recovery key are printed as `{"secret", "recoveryKey"}`, and                        #
+# the secret is shown on stderr before the code is asked for. `2fa disable` turns it off again,                         #
+# with a code or the recovery key. Both ask to confirm, which `--yes` does. The login the CLI                           #
+# keeps stays valid.                                                                                                    #
+#                                                                                                                       #
+# `change-password` asks for your current password and the new one (twice), and changes it.                             #
+# The login the CLI keeps is updated with it: the system keychain's, or the auth config file you                        #
+# logged in with. A password given with `--password` or the environment has to be updated where                         #
+# your scripts set it (and a login this config dir keeps as well, if it is of the same account,                         #
+# stops working: the CLI says so), and logins kept elsewhere (another config dir, another device,                       #
+# an exported auth config, the old Filen CLI's saved login) may stop working.                                           #
+#                                                                                                                       #
+# `change-email <new email>` asks for your password and requests the change: Filen sends an                             #
+# email to confirm it, and the change happens once you confirm it. Then log in again (with                              #
+# `logout`, or with the new `--email` in your scripts), so that the kept login has the new email.                       #
+#                                                                                                                       #
+# `export-master-keys` prints your master keys, which decrypt all your files, after you confirm                         #
+# it (which `--yes` does). Keep them where only you can read them.                                                      #
+#                                                                                                                       #
+# ┃ 2fa <COMMAND>                                                                                                       #
+# ┃ Enable or disable two-factor authentication                                                                         #
+#                                                                                                                       #
+# ┃ change-password                                                                                                     #
+# ┃ Change your password, and update the kept login (asks for the current and the new password)                         #
+#                                                                                                                       #
+# ┃ change-email <NEW_EMAIL>                                                                                            #
+# ┃ Request to change your email, which Filen asks you to confirm by email (asks for your password)                     #
+# ┃ → <NEW_EMAIL>  The new email                                                                                        #
+#                                                                                                                       #
+# ┃ export-master-keys                                                                                                  #
+# ┃ Print your master keys, which decrypt all your files, after confirming it (--yes answers)                           #
+#                                                                                                                       #
+# `--profile <name>` (or `FILEN_CLI_PROFILE`) uses the profile `<name>`: its own config dir,                            #
+# `profiles/<name>` in the config dir, which is created the first time it is used. A profile has                        #
+# its own login (in the system keychain or an auth config file), cache, logs and sync pairs, so                         #
+# that you can stay logged in to several accounts at once. A profile name consists of letters,                          #
+# digits, `-` and `_`.                                                                                                  #
+#                                                                                                                       #
+# `profiles` lists the profiles, marking the one in use with `*`. With `--json`, it prints them as                      #
+# an array of `{"name", "active"}`.                                                                                     #
+#                                                                                                                       #
+# ┃ profiles                                                                                                            #
+# ┃ List the profiles (see --profile), marking the one in use                                                           #
 # (manuel)                                                                                                              #
 #                                                                                                                       #
 
@@ -63,4 +135,4 @@ recording_items:
 - !Output "filen help auth\b"
 - !Input
   - 13
-- !Output "\r\n\e[?2004l\r\e[1m\e[4mAuthentication\e[0m\r\n\r\nThere are multiple ways to authenticate:\r\n- set the CLI arguments `--email` (or environment variable `FILEN_CLI_EMAIL`)\r\n  and `--password` (`FILEN_CLI_PASSWORD`), optionally `--two-factor-code` (`FILEN_CLI_2FA_CODE`)\r\n  (when the two-factor code is omitted and required, you will be prompted for it)\r\n- specify an auth config via the `--auth-config-path` flag\r\n  (exported via `filen export-auth-config`),\r\n  or put an auth config in one of the default locations:\r\n  (unless overwritten by the `--config-dir` flag)\r\n  - `./filen-cli-auth-config.txt` (current working directory)\r\n  - Linux/macOS: `$HOME/.filen-cli/filen-cli-auth-config.txt`\r\n  - Windows: `%appdata%\\filen-cli\\filen-cli-auth-config.txt`\r\n- if none of these is set, you will be prompted for credentials,\r\n  with the option to save them securely in the system keychain\r\n\r\n┃ \e[4m\e[32mexport-auth-config\e[0m\r\n┃ Export an auth config (to be used with --auth-config-path option)\r\n\r\n┃ \e[4m\e[32mlogout\e[0m\r\n┃ Delete saved credentials and exit\r\n\e[?2004h\e[1m\e[34m(manuel)\e[0m "
+- !Output "\r\n\e[?2004l\r\e[1m\e[4mAuthentication\e[0m\r\n\r\nThe CLI logs in with the first of these that it finds:\r\n1. the CLI arguments `--email` and `--password`, optionally `--two-factor-code`,\r\n   or the environment variables `FILEN_CLI_EMAIL`, `FILEN_CLI_PASSWORD` and `FILEN_CLI_2FA_CODE`\r\n   (when none of these is set, the variables `FILEN_EMAIL`, `FILEN_PASSWORD` and\r\n   `FILEN_2FA_CODE` of the old Filen CLI are used; when a two-factor code is required\r\n   and not given, you are prompted for it; the recovery key is accepted as the code too)\r\n\r\n   To log in to an account with two-factor authentication without anyone to type a code,\r\n   set `FILEN_CLI_2FA_SECRET` to its TOTP secret (the key your authenticator app was set up with):\r\n   the CLI then makes the code itself. Keep in mind that anyone who can read the CLI's\r\n   environment then has your second factor too, which defeats two-factor authentication\r\n   on that machine.\r\n2. an auth config file, exported with `filen export-auth-config`: the one given with\r\n   `--auth-config-path`, or else `./filen-cli-auth-config.txt` (in the current working\r\n   directory), then `filen-cli-auth-config.txt` in the config dir\r\n   (on Linux and macOS, an auth config found in these two places must not be accessible\r\n   to other users: restrict it with `chmod 600`)\r\n3. the login kept in the system keychain (each config dir keeps a login of its own there)\r\n4. credentials saved by the old Filen CLI, which are imported\r\n   (its `.filen-cli-auth-config` in the current working directory or its data directory,\r\n   and, with the default config dir, the login it kept; its files are left as they are)\r\n5. otherwise, you are prompted for your email and password (with three attempts)\r\n\r\nAfter logging in by 4. or 5., you can keep the login in the system keychain,\r\nor, where there is none (such as in the Docker image), in an auth config file in the config dir.\r\n\r\nThe config dir is the one given with `--config-dir`, or by default:\r\n- Linux: `$XDG_CONFIG_HOME/filen-cli`, or `~/.config/filen-cli` without it\r\n- macOS: `~/Library/Application Support/filen-cli`\r\n- Windows: `%APPDATA%\\filen-cli`\r\n\r\n(development builds use `filen-cli-dev` instead)\r\n\r\n┃ \e[4m\e[32mwhoami\e[0m\r\n┃ Print the email of the account you are logged in as\r\n\r\n┃ \e[4m\e[32mexport-auth-config\e[0m [PATH]\r\n┃ Export an auth config (to be used with --auth-config-path option), after confirming the risk (--yes answers)\r\n┃ \e[2m→\e[0m \e[32m[PATH]\e[0m  The file to write, or a directory to write filen-cli-auth-config.txt into (defaults to the current working directory)\r\n\r\n┃ \e[4m\e[32mlogout\e[0m\r\n┃ Delete saved credentials, including the --auth-config-path file, and exit, asking before each (--yes deletes them all); then offer to delete the local cache\r\n\r\n`2fa enable` turns on two-factor authentication: it prints a secret (and an `otpauth://` URL with\r\nit) to add to your authenticator app, asks for a code from the app (or takes it with `--code`),\r\nand prints the recovery key, which logs you in without a code: store it somewhere safe.\r\nWith `--json`, the secret and the recovery key are printed as `{\"secret\", \"recoveryKey\"}`, and\r\nthe secret is shown on stderr before the code is asked for. `2fa disable` turns it off again,\r\nwith a code or the recovery key. Both ask to confirm, which `--yes` does. The login the CLI\r\nkeeps stays valid.\r\n\r\n`change-password` asks for your current password and the new one (twice), and changes it.\r\nThe login the CLI keeps is updated with it: the system keychain's, or the auth config file you\r\nlogged in with. A password given with `--password` or the environment has to be updated where\r\nyour scripts set it (and a login this config dir keeps as well, if it is of the same account,\r\nstops working: the CLI says so), and logins kept elsewhere (another config dir, another device,\r\nan exported auth config, the old Filen CLI's saved login) may stop working.\r\n\r\n`change-email <new email>` asks for your password and requests the change: Filen sends an\r\nemail to confirm it, and the change happens once you confirm it. Then log in again (with\r\n`logout`, or with the new `--email` in your scripts), so that the kept login has the new email.\r\n\r\n`export-master-keys` prints your master keys, which decrypt all your files, after you confirm\r\nit (which `--yes` does). Keep them where only you can read them.\r\n\r\n┃ \e[4m\e[32m2fa\e[0m <COMMAND>\r\n┃ Enable or disable two-factor authentication\r\n\r\n┃ \e[4m\e[32mchange-password\e[0m\r\n┃ Change your password, and update the kept login (asks for the current and the new password)\r\n\r\n┃ \e[4m\e[32mchange-email\e[0m <NEW_EMAIL>\r\n┃ Request to change your email, which Filen asks you to confirm by email (asks for your password)\r\n┃ \e[2m→\e[0m \e[32m<NEW_EMAIL>\e[0m  The new email\r\n\r\n┃ \e[4m\e[32mexport-master-keys\e[0m\r\n┃ Print your master keys, which decrypt all your files, after confirming it (--yes answers)\r\n\r\n`--profile <name>` (or `FILEN_CLI_PROFILE`) uses the profile `<name>`: its own config dir,\r\n`profiles/<name>` in the config dir, which is created the first time it is used. A profile has\r\nits own login (in the system keychain or an auth config file), cache, logs and sync pairs, so\r\nthat you can stay logged in to several accounts at once. A profile name consists of letters,\r\ndigits, `-` and `_`.\r\n\r\n`profiles` lists the profiles, marking the one in use with `*`. With `--json`, it prints them as\r\nan array of `{\"name\", \"active\"}`.\r\n\r\n┃ \e[4m\e[32mprofiles\e[0m\r\n┃ List the profiles (see --profile), marking the one in use\r\n\e[?2004h\e[1m\e[34m(manuel)\e[0m "
