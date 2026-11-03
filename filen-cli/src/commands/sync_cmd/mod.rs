@@ -90,7 +90,6 @@ use std::{
 	borrow::Cow,
 	collections::{HashMap, HashSet},
 	path::Path,
-	pin,
 	sync::Arc,
 	time::{Duration, Instant},
 };
@@ -100,17 +99,17 @@ use clap::Subcommand;
 use console::style;
 use filen_sdk_rs::sync_engine::{
 	BaselineInUse, ConflictResolution, ConflictResolved, PairId, PairRecord, SyncEngine, SyncEvent,
-	UnsyncablePath, UnsyncableReason, WatchHandle,
+	UnsyncablePath, UnsyncableReason,
 };
-use log::{info, warn};
-use tokio::sync::mpsc;
+use log::info;
 
 use crate::{
-	CliConfig, CommandResult, auth::LazyClient, commands::CommandContext, docs::DocElement,
-	interrupt, ui::UI, util::RemotePath,
+	CliConfig, CommandResult, auth::LazyClient, commands::CommandContext, docs::DocElement, ui::UI,
+	util::RemotePath,
 };
 
 mod conflict_resolutions;
+mod continuous;
 mod failures;
 mod ignore_file;
 mod json_events;
@@ -122,7 +121,6 @@ mod transfers;
 
 use conflict_resolutions::ConflictResolutions;
 use failures::Failures;
-use outcome::{LastPasses, problems_summary};
 use status_line::{StatusLine, Throttle};
 use sync_pairs::SyncDirs;
 use transfers::Transfers;
@@ -274,155 +272,9 @@ async fn sync(
 	if once {
 		once::sync_once(ui, &engine, &pairs, log, settle).await
 	} else {
-		sync_continuously(ui, engine, &pairs, log).await
+		continuous::sync_continuously(ui, engine, &pairs, log).await
 	}
 }
-
-/// Watches each of `pairs` until Ctrl-C, printing what their passes do.
-async fn sync_continuously(
-	ui: &mut UI,
-	engine: Arc<SyncEngine>,
-	pairs: &[PairRecord],
-	mut log: EventLog<'_>,
-) -> Result<()> {
-	let (events_tx, mut events_rx) = mpsc::unbounded_channel();
-	// before the watches start, so that Ctrl-C stops every watch that started rather than
-	// dropping them
-	let mut ctrl_c = interrupt::own();
-	let watches = pairs.iter().filter(|pair| !pair.paused).map(async |pair| {
-		let pair_id = pair.id;
-		let events_tx = events_tx.clone();
-		let watch = Arc::clone(&engine)
-			.watch_observed(
-				pair_id,
-				Box::new(move |event| {
-					let _ = events_tx.send((pair_id, event));
-				}),
-			)
-			.await;
-		(pair_id, watch)
-	});
-	let watches = futures::future::join_all(watches).await;
-	// the senders are the watches' now, so the channel closes once every watch has ended
-	drop(events_tx);
-	// each pair that is not synced, named on its own line now and counted in the exit status
-	let mut not_started = HashMap::new();
-	// the engine refuses to watch a paused pair, which is no failure of the watch
-	for pair in pairs.iter().filter(|pair| pair.paused) {
-		ui.print_failure(&paused_message(log.label(pair.id)));
-		not_started.insert(pair.id, "paused");
-	}
-	let mut watch_handles = Vec::new();
-	for (pair_id, watch) in watches {
-		match watch {
-			Ok(watch) => watch_handles.push(watch),
-			Err(e) => {
-				let label = log.label(pair_id);
-				ui.print_failure(&format!("Failed to watch the sync pair {label}: {e}"));
-				not_started.insert(pair_id, "not synced");
-			}
-		}
-	}
-	if watch_handles.is_empty() {
-		return Err(UI::failure("None of the sync pairs could be synced"));
-	}
-
-	// receive events and print them, until Ctrl-C
-	let mut last_passes = LastPasses::default();
-	let stopped_by_ctrl_c = loop {
-		let (pair_id, event) = tokio::select! {
-			event = events_rx.recv() => match event {
-				Some(event) => event,
-				None => break false,
-			},
-			() = ctrl_c.pressed() => break true,
-		};
-		last_passes.note(pair_id, &event);
-		match log.print(ui, pair_id, &event) {
-			None => {}
-			Some(Settlement::ApproveDeletions { count, pass_token }) => {
-				engine.approve_deletions(pair_id, pass_token).await;
-				log.print_approved(ui, pair_id, &approved_deletions_line(count));
-			}
-			Some(Settlement::ResolveConflict {
-				rel_path,
-				resolution,
-			}) => match engine.resolve_conflict(pair_id, rel_path, resolution).await {
-				Ok(resolved) => {
-					last_passes.resolved(pair_id, rel_path);
-					for line in resolved_conflict_lines(rel_path, resolution, resolved) {
-						log.print_approved(ui, pair_id, &line);
-					}
-					apply_soon(ui, &mut log, &engine, pair_id).await;
-				}
-				Err(e) => {
-					let message = resolve_failure_message(rel_path, log.label(pair_id), &e);
-					log.print_failure(ui, &message);
-				}
-			},
-		}
-	};
-
-	log.clear_status();
-	let _stopping = stopped_by_ctrl_c.then(|| {
-		ui.print_muted_to_stderr("Stopping the sync, letting the passes in flight finish...");
-		ctrl_c.into_stopping(ui)
-	});
-	last_passes.stopping();
-	// waits for each pair's pass in flight, so it finishes and releases the drive lock
-	let stopped = futures::future::join_all(watch_handles.into_iter().map(WatchHandle::stop));
-	let mut stopped = pin::pin!(stopped);
-	// What the passes in flight do meanwhile, as it happens, which decides what they left. The
-	// flags settle nothing more, as the sync is stopping.
-	loop {
-		tokio::select! {
-			_ = &mut stopped => break,
-			Some((pair_id, event)) = events_rx.recv() => {
-				last_passes.note(pair_id, &event);
-				let _ = log.print(ui, pair_id, &event);
-			}
-		}
-	}
-	// what the last of them sent just before it ended
-	while let Ok((pair_id, event)) = events_rx.try_recv() {
-		last_passes.note(pair_id, &event);
-		let _ = log.print(ui, pair_id, &event);
-	}
-	log.clear_status();
-
-	if !stopped_by_ctrl_c {
-		return Err(UI::failure("Every watch of the sync pairs ended"));
-	}
-	ui.print_muted_notice("Stopped.");
-	let outcomes = pairs
-		.iter()
-		.map(|pair| {
-			let problems = match not_started.get(&pair.id) {
-				Some(problem) => vec![(*problem).to_owned()],
-				None => last_passes.take(pair.id),
-			};
-			(log.label(pair.id), problems)
-		})
-		.collect::<Vec<_>>();
-	match problems_summary(&outcomes) {
-		Some(summary) => Err(UI::failure(&summary)),
-		None => Ok(()),
-	}
-}
-
-/// Has the watch of `pair` run a pass soon, which applies a conflict resolution. A resolution only
-/// takes effect on the pair's next pass, and nothing else wakes a watch for it, so without this it
-/// would wait for the next change or the periodic full pass, minutes away.
-async fn apply_soon(ui: &mut UI, log: &mut EventLog<'_>, engine: &SyncEngine, pair: PairId) {
-	if let Err(e) = engine.request_pass(pair).await {
-		warn!("Could not ask the watch of sync pair {pair} for a pass: {e}");
-		log.print_line(ui, pair, LineKind::Kept, APPLIED_LATER_LINE);
-	}
-}
-
-/// What a continuous sync says when it could not have a watch apply a resolution at once.
-const APPLIED_LATER_LINE: &str = "The resolution is applied by the next pass, which the next \
-	change or the periodic full pass starts";
 
 /// Prints the events of a run's pairs, and says which of them the flags settle.
 ///
