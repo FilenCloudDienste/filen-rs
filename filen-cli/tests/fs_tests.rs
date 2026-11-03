@@ -659,6 +659,33 @@ async fn trash_restore_refuses_a_name_several_trashed_items_share() {
 	client.delete_file_permanently(second).await.unwrap();
 }
 
+#[shared_test_runtime]
+async fn list_trash_long_shows_the_size_and_modified_date() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let _trash_lock = lock_trash(client).await;
+	let name = format!("{}.txt", resources.dir.name().unwrap());
+	let builder = client
+		.make_file_builder(&name, resources.dir.uuid())
+		.unwrap()
+		.modified(Utc.with_ymd_and_hms(2024, 3, 9, 10, 20, 30).unwrap());
+	let mut file = client.upload_file(builder, b"content").await.unwrap();
+	client.trash_file(&mut file).await.unwrap();
+
+	let assert = authenticated_cli_with_args!("list-trash", "-l").success();
+	let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+	let line = stdout
+		.lines()
+		.find(|line| line.ends_with(&format!("  {name}")))
+		.unwrap_or_else(|| panic!("No {name} in:\n{stdout}"));
+	// the size column is as wide as the trash's widest size
+	assert_eq!(
+		line.trim_start(),
+		format!("7 B  2024-03-09 10:20:30 (UTC)  {name}")
+	);
+	client.delete_file_permanently(file).await.unwrap();
+}
+
 /// Runs the CLI with `args`, logged out and with no terminal on stdin.
 fn run_logged_out_without_a_terminal(args: &[&str]) -> std::process::Output {
 	let config_dir = assert_fs::TempDir::new().unwrap();

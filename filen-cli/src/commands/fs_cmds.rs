@@ -147,7 +147,12 @@ pub(crate) enum FsCommands {
 	/// List recently accessed items
 	ListRecents,
 	/// List trashed items
-	ListTrash,
+	ListTrash {
+		/// Use a long listing format: sizes, modification dates (creation dates of directories)
+		/// and (*) after favorited items
+		#[arg(short = 'l', long)]
+		long: bool,
+	},
 	/// Restore a trashed item
 	TrashRestore {
 		/// The trashed item's name, or its UUID when several trashed items share the name
@@ -256,7 +261,7 @@ impl FsCommands {
 					.await?;
 			}
 			Self::ListRecents => list_recents(ui, client).await?,
-			Self::ListTrash => list_trash(ui, client).await?,
+			Self::ListTrash { long } => list_trash(ui, client, long).await?,
 			Self::TrashRestore { item: None } => {
 				select_trash_item(ui, client, TrashAction::Restore).await?;
 			}
@@ -1706,14 +1711,14 @@ async fn full_path(client: &Client, item: &NonRootItemType<'_, Normal>) -> Optio
 	}
 }
 
-pub(crate) async fn list_trash(ui: &mut UI, client: &mut LazyClient) -> Result<()> {
+pub(crate) async fn list_trash(ui: &mut UI, client: &mut LazyClient, long: bool) -> Result<()> {
 	let client = client.get(ui).await?;
 	let items = list_trash_items(client)
 		.await?
 		.into_iter()
 		.map(|entry| entry.listed)
 		.collect::<Vec<ListedItem>>();
-	print_listing(ui, &items, ListedBy::Name, "Trash is empty", false)
+	print_listing(ui, &items, ListedBy::Name, "Trash is empty", long)
 }
 
 pub(crate) enum TrashAction {
@@ -1773,24 +1778,14 @@ pub(crate) async fn select_trash_item(
 		return Ok(());
 	}
 
-	// mark directories with a trailing slash, and disambiguate items that share a name by
-	// their UUID, so every option maps back to exactly one item
 	let options = entries
 		.iter()
 		.map(|entry| {
-			let name = &entry.listed.name;
-			let mut label = match entry.listed.kind {
-				ListedKind::Directory => format!("{}/", name),
-				ListedKind::File => name.clone(),
-			};
-			if entries
+			let shares_name = entries
 				.iter()
-				.filter(|other| other.listed.name == *name)
-				.count() > 1
-			{
-				label.push_str(&format!(" ({})", entry.listed.uuid));
-			}
-			label
+				.filter(|other| other.listed.name == entry.listed.name)
+				.count() > 1;
+			trash_picker_label(&entry.listed, shares_name)
 		})
 		.collect::<Vec<String>>();
 	let Some(selection) = ui.prompt_select(select_message, options.clone())? else {
@@ -1811,6 +1806,26 @@ pub(crate) async fn select_trash_item(
 			delete_trash_item_permanently(ui, client, entry).await
 		}
 	}
+}
+
+/// How the trash pickers show `item`: its name, with a trailing slash on a directory and its UUID
+/// when it `shares_name` with another trashed item, so that every option maps back to exactly one
+/// item, then its size and the date `ls -l` shows.
+fn trash_picker_label(item: &ListedItem, shares_name: bool) -> String {
+	let mut label = item.name.clone();
+	if item.kind == ListedKind::Directory {
+		label.push('/');
+	}
+	if shares_name {
+		label.push_str(&format!(" ({})", item.uuid));
+	}
+	if let Some(size) = item.size {
+		label.push_str(&format!("  {}", ui::format_size(size)));
+	}
+	if let Some(date) = item.date() {
+		label.push_str(&format!("  {}", ui::format_date(&date)));
+	}
+	label
 }
 
 /// Restores the trashed item that `wanted` names (see [`pick_trash_item`]).
@@ -2360,6 +2375,40 @@ mod tests {
 				.unwrap_err()
 				.to_string(),
 			"No such item in the trash: A.TXT"
+		);
+	}
+
+	#[test]
+	fn a_trashed_file_is_offered_with_its_size_and_modification_date() {
+		let file = ListedItem {
+			modified: Some(Utc.with_ymd_and_hms(2024, 3, 9, 10, 20, 30).unwrap()),
+			..trashed("a.txt", 1)
+		};
+		assert_eq!(
+			trash_picker_label(&file, false),
+			"a.txt  7 B  2024-03-09 10:20:30 (UTC)"
+		);
+	}
+
+	#[test]
+	fn a_trashed_directory_is_offered_with_a_slash_and_its_creation_date() {
+		let dir = ListedItem {
+			kind: ListedKind::Directory,
+			size: None,
+			created: Some(Utc.with_ymd_and_hms(2023, 1, 2, 3, 4, 5).unwrap()),
+			..trashed("docs", 1)
+		};
+		assert_eq!(
+			trash_picker_label(&dir, false),
+			"docs/  2023-01-02 03:04:05 (UTC)"
+		);
+	}
+
+	#[test]
+	fn a_trashed_item_sharing_its_name_is_offered_with_its_uuid() {
+		assert_eq!(
+			trash_picker_label(&trashed("shared", 2), true),
+			format!("shared ({})  7 B", Uuid::from_u128(2))
 		);
 	}
 
