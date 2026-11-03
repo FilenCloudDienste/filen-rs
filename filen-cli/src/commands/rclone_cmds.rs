@@ -1680,6 +1680,7 @@ mod tests {
 		let config = CliConfig {
 			config_dir: config_dir.path().to_path_buf(),
 			profiles: crate::auth::Profiles::new(config_dir.path(), None),
+			config_dir_is_default: false,
 		};
 		let dir = rclone_dir(&config);
 		let cached = [
@@ -1705,6 +1706,7 @@ mod tests {
 		let config = CliConfig {
 			config_dir: config_dir.path().to_path_buf(),
 			profiles: crate::auth::Profiles::new(config_dir.path(), None),
+			config_dir_is_default: false,
 		};
 		let cache = cache_dir(&rclone_dir(&config), 1);
 		let meta = cache.join("vfsMeta/Filen/photo.jpg");

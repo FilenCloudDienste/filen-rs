@@ -40,6 +40,11 @@
 //! is read but only gives a warning, since the local trash cannot be turned off. Any other key is
 //! an error.
 //!
+//! `sync` without sync pairs reads syncPairs.yaml in the config directory, or else syncPairs.json
+//! there. With the default config directory, it then falls back to `~/.filen-cli/syncPairs.json`,
+//! where the TypeScript CLI kept its sync pairs when its install script had set it up; with
+//! `--config-dir`, it does not look in the home directory.
+//!
 //! Before a sync pair is synced, the rules of its sync pairs file that the `.filenignore`
 //! at its local root lacks are added to the end of that file, which is created if there is none.
 //! No line is ever removed: a rule taken out of the sync pairs file stays in `.filenignore` until
@@ -65,17 +70,15 @@ use std::{
 use anyhow::{Context, Result};
 use clap::Subcommand;
 use console::style;
-use filen_sdk_rs::{
-	auth::Client,
-	sync_engine::{
-		BaselineInUse, ConflictResolution, ConflictResolved, PairId, PairRecord, SyncEngine,
-		SyncEvent, TransferDirection, UnsyncablePath, UnsyncableReason,
-	},
+use filen_sdk_rs::sync_engine::{
+	BaselineInUse, ConflictResolution, ConflictResolved, PairId, PairRecord, SyncEngine, SyncEvent,
+	TransferDirection, UnsyncablePath, UnsyncableReason,
 };
 use tokio::sync::mpsc;
 
 use crate::{
 	CliConfig, CommandResult,
+	auth::LazyClient,
 	commands::CommandContext,
 	docs::DocElement,
 	interrupt,
@@ -91,6 +94,7 @@ mod sync_pairs;
 
 use conflict_resolutions::ConflictResolutions;
 use outcome::{LastPasses, problems_summary};
+use sync_pairs::SyncDirs;
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum SyncCommands {
@@ -100,7 +104,7 @@ pub(crate) enum SyncCommands {
 		/// Format: `<local>:<remote>` (two-way) or `<local>:<mode>:<remote>`, where `<mode>` is one of `twoWay` (or `tw`), `localToRemote` (or `localToCloud`, `ltc`), `remoteToLocal` (or `cloudToLocal`, `ctl`), `localBackup` (or `lb`), `remoteBackup` (or `cloudBackup`, `cb`).
 		/// The remote path is what follows the last `:`, so a remote path with a `:` in it can only be given in a sync pairs file.
 		/// Alternatively, the path to a sync pairs file: YAML, or JSON as the TypeScript CLI's syncPairs.json.
-		/// If none are given, the pairs of syncPairs.yaml in the config dir, or else of syncPairs.json there.
+		/// If none are given, the pairs of syncPairs.yaml in the config dir, or else of syncPairs.json there, or else, with the default config dir, of the TypeScript CLI's ~/.filen-cli/syncPairs.json.
 		/// Or the alias a pair has (its `alias` key) in that default sync pairs file.
 		#[arg(value_name = "PAIR")]
 		pairs: Vec<String>,
@@ -170,13 +174,7 @@ impl SyncCommands {
 					)?,
 				};
 				let pairs = given_pairs(pairs, pair_options);
-				// before logging in, so that a bad definition fails at once
-				let parsed = sync_pairs::parse_sync_pairs(&config.config_dir, &pairs)?;
-				for warning in sync_pairs::local_trash_warnings(&parsed) {
-					ui.print_warning(&warning);
-				}
-				let client = client.get(ui).await?;
-				sync(config, ui, client, working_path, parsed, once, &settle).await?;
+				sync(config, ui, client, working_path, &pairs, once, &settle).await?;
 			}
 		}
 		Ok(CommandResult::default())
@@ -197,12 +195,24 @@ struct Settle {
 async fn sync(
 	config: &CliConfig,
 	ui: &mut UI,
-	client: &Arc<Client>,
+	client: &mut LazyClient,
 	working_path: &RemotePath,
-	parsed: Vec<sync_pairs::ParsedPair>,
+	pair_definitions: &[String],
 	once: bool,
 	settle: &Settle,
 ) -> Result<()> {
+	// before logging in, so that a bad definition fails at once
+	let sync_dirs = SyncDirs::new(
+		&config.config_dir,
+		config.config_dir_is_default,
+		dirs::home_dir().as_deref(),
+	);
+	let parsed = sync_pairs::parse_sync_pairs(&sync_dirs, pair_definitions)?;
+	for warning in sync_pairs::local_trash_warnings(&parsed) {
+		ui.print_warning(&warning);
+	}
+	let client = client.get(ui).await?;
+
 	// before the engine is opened, so that a bad definition leaves its database as it was
 	let pair_definitions = sync_pairs::resolve_sync_pairs(ui, client, working_path, parsed).await?;
 

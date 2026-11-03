@@ -248,6 +248,9 @@ pub(crate) struct CliConfig {
 	/// The config dir in use: the active profile's, or the one without a profile.
 	pub(crate) config_dir: PathBuf,
 	pub(crate) profiles: auth::Profiles,
+	/// Whether `config_dir` is the default one: no config dir was chosen with `--config-dir`, its
+	/// environment variables or `FILEN_CLI_DATA_DIR`, and no profile is in use.
+	pub(crate) config_dir_is_default: bool,
 }
 
 /// The environment variable that sets the config directory, like `--config-dir`.
@@ -500,6 +503,7 @@ async fn inner_main(ui: &mut ui::UI, arenas_limited: bool) -> Result<Finished> {
 	let profiles = auth::Profiles::new(&base_config_dir, cli_args.profile.clone());
 	let config = CliConfig {
 		config_dir: profiles.config_dir(&base_config_dir)?,
+		config_dir_is_default: config_dir_is_default && cli_args.profile.is_none(),
 		profiles,
 	};
 

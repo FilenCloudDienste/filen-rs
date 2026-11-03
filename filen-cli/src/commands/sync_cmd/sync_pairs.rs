@@ -50,14 +50,14 @@ pub(crate) struct ParsedPair {
 
 /// The pairs `pair_definitions` define, each of which is either `<local>:<remote>` (two-way),
 /// `<local>:<mode>:<remote>`, the path to a sync pairs file, or the alias of a pair in the default
-/// sync pairs file in `config_dir`. Without definitions, the pairs of that default file. Relative
+/// sync pairs file in `dirs`. Without definitions, the pairs of that default file. Relative
 /// local paths in a file are resolved against the file's directory.
 pub(crate) fn parse_sync_pairs(
-	config_dir: &Path,
+	dirs: &SyncDirs<'_>,
 	pair_definitions: &[String],
 ) -> Result<Vec<ParsedPair>> {
 	if pair_definitions.is_empty() {
-		return read_default_sync_pairs(config_dir);
+		return read_default_sync_pairs(dirs);
 	}
 	let mut parsed = Vec::new();
 	// the pairs of the default file, read for the first alias given
@@ -69,7 +69,7 @@ pub(crate) fn parse_sync_pairs(
 		} else if is_alias(pair) {
 			let aliased = match &mut aliased {
 				Some(aliased) => aliased,
-				None => aliased.insert(read_aliased_pairs(config_dir, pair)?),
+				None => aliased.insert(read_aliased_pairs(dirs, pair)?),
 			};
 			parsed.push(pair_by_alias(aliased, pair)?);
 		} else {
@@ -104,9 +104,9 @@ fn is_alias(definition: &str) -> bool {
 		&& !definition.contains(std::path::is_separator)
 }
 
-/// The pairs of the default sync pairs file in `config_dir`, to look `alias` up among.
-fn read_aliased_pairs(config_dir: &Path, alias: &str) -> Result<Vec<ParsedPair>> {
-	let candidates = default_sync_pairs_files(config_dir);
+/// The pairs of the default sync pairs file in `dirs`, to look `alias` up among.
+fn read_aliased_pairs(dirs: &SyncDirs<'_>, alias: &str) -> Result<Vec<ParsedPair>> {
+	let candidates = default_sync_pairs_files(dirs);
 	match candidates.iter().find(|path| path.is_file()) {
 		Some(path) => read_sync_pairs_file(path),
 		None => Err(UI::usage_failure(&format!(
@@ -550,13 +550,65 @@ fn is_drive_letter(s: &str) -> bool {
 /// The sync pairs files in the config directory that `sync` reads when it is given no pairs, in
 /// the order it looks for them. It reads the first that exists. syncPairs.json is where the
 /// TypeScript CLI kept its sync pairs, in the same directory.
-const DEFAULT_SYNC_PAIRS_FILES: &[&str] = &["syncPairs.yaml", "syncPairs.json"];
+const DEFAULT_SYNC_PAIRS_FILES: &[&str] = &["syncPairs.yaml", TYPESCRIPT_SYNC_PAIRS_FILE];
 
-/// The paths of [`DEFAULT_SYNC_PAIRS_FILES`] in `config_dir`.
-fn default_sync_pairs_files(config_dir: &Path) -> Vec<PathBuf> {
+/// The name of the TypeScript CLI's sync pairs file, in its data directory.
+const TYPESCRIPT_SYNC_PAIRS_FILE: &str = "syncPairs.json";
+
+/// The directories `sync` reads files from besides those it is given: the config directory, and
+/// where the TypeScript CLI kept its data, if that is not the config directory.
+pub(crate) struct SyncDirs<'a> {
+	config_dir: &'a Path,
+	/// `~/.filen-cli`, which the TypeScript CLI used instead of the default config directory when
+	/// it existed, as its install script created it. `None` when there is no such directory, and
+	/// when the config directory was given with `--config-dir`, as the TypeScript CLI's
+	/// `--data-dir` would have been: a sync run against a config directory of its own reads
+	/// nothing from the home directory.
+	typescript_home_dir: Option<PathBuf>,
+}
+
+impl<'a> SyncDirs<'a> {
+	/// The directories of a run whose config directory is `config_dir`, the default one if
+	/// `config_dir_is_default`, for the user whose home directory is `home`.
+	pub(crate) fn new(
+		config_dir: &'a Path,
+		config_dir_is_default: bool,
+		home: Option<&Path>,
+	) -> Self {
+		let typescript_home_dir = home
+			.filter(|_| config_dir_is_default)
+			.map(typescript_home_dir)
+			.filter(|dir| dir.is_dir());
+		Self {
+			config_dir,
+			typescript_home_dir,
+		}
+	}
+}
+
+/// The data directory the TypeScript CLI used in the home directory `home`: `~/.filen-cli`, and
+/// in a development build its `dev` directory, as the TypeScript CLI's own development builds kept
+/// apart from the released one.
+fn typescript_home_dir(home: &Path) -> PathBuf {
+	let dir = home.join(".filen-cli");
+	if cfg!(debug_assertions) {
+		dir.join("dev")
+	} else {
+		dir
+	}
+}
+
+/// The paths of [`DEFAULT_SYNC_PAIRS_FILES`] in the config directory, then, if the TypeScript CLI
+/// kept its data in `~/.filen-cli` (see [`SyncDirs`]), the syncPairs.json there.
+fn default_sync_pairs_files(dirs: &SyncDirs<'_>) -> Vec<PathBuf> {
 	DEFAULT_SYNC_PAIRS_FILES
 		.iter()
-		.map(|name| config_dir.join(name))
+		.map(|name| dirs.config_dir.join(name))
+		.chain(
+			dirs.typescript_home_dir
+				.as_deref()
+				.map(|dir| dir.join(TYPESCRIPT_SYNC_PAIRS_FILE)),
+		)
 		.collect()
 }
 
@@ -569,9 +621,9 @@ fn display_paths(paths: &[PathBuf]) -> String {
 		.join(" or ")
 }
 
-/// The pairs of the first of [`DEFAULT_SYNC_PAIRS_FILES`] that exists in `config_dir`.
-fn read_default_sync_pairs(config_dir: &Path) -> Result<Vec<ParsedPair>> {
-	let candidates = default_sync_pairs_files(config_dir);
+/// The pairs of the first of [`default_sync_pairs_files`] that exists.
+fn read_default_sync_pairs(dirs: &SyncDirs<'_>) -> Result<Vec<ParsedPair>> {
+	let candidates = default_sync_pairs_files(dirs);
 	match candidates.iter().find(|path| path.is_file()) {
 		Some(path) => read_sync_pairs_file(path),
 		None => Err(UI::usage_failure(&no_sync_pairs_message(&candidates))),
@@ -817,16 +869,21 @@ mod tests {
 	use filen_types::fs::Uuid;
 
 	use super::{
-		ParsedPair, create_local_root, expand_home, fallback_label, local_path_in_file,
+		ParsedPair, SyncDirs, create_local_root, expand_home, fallback_label, local_path_in_file,
 		local_root_exists, local_trash_warnings, missing_roots, overlap_message,
 		parse_sync_mode_str, parse_sync_pair_definition, parse_sync_pairs, read_sync_pairs_file,
-		records_of, sync_mode_str,
+		records_of, sync_mode_str, typescript_home_dir,
 	};
 	use crate::{
 		error::{CliError, exit_code, find_cli_error},
 		ui::UI,
 		util::RemotePath,
 	};
+
+	/// The directories of a run with `--config-dir config_dir`.
+	fn given_config_dir(config_dir: &Path) -> SyncDirs<'_> {
+		SyncDirs::new(config_dir, false, None)
+	}
 
 	fn pair(local: impl Into<PathBuf>, mode: SyncMode, remote: &str) -> ParsedPair {
 		ParsedPair {
@@ -983,7 +1040,7 @@ mod tests {
 	fn no_pairs_and_no_sync_pairs_file_is_a_usage_error() {
 		let config_dir = tempfile::tempdir().unwrap();
 
-		let error = parse_sync_pairs(config_dir.path(), &[]).unwrap_err();
+		let error = parse_sync_pairs(&given_config_dir(config_dir.path()), &[]).unwrap_err();
 
 		assert_eq!(exit_code(&error), 2);
 		let message = error.to_string();
@@ -1013,7 +1070,7 @@ mod tests {
 		)
 		.unwrap();
 
-		let pairs = parse_sync_pairs(config_dir.path(), &[]).unwrap();
+		let pairs = parse_sync_pairs(&given_config_dir(config_dir.path()), &[]).unwrap();
 
 		assert_eq!(
 			pairs,
@@ -1037,8 +1094,64 @@ mod tests {
 		.unwrap();
 
 		assert_eq!(
-			parse_sync_pairs(config_dir.path(), &[]).unwrap(),
+			parse_sync_pairs(&given_config_dir(config_dir.path()), &[]).unwrap(),
 			[pair("/l", SyncMode::LocalBackup, "/r")]
+		);
+	}
+
+	/// The TypeScript CLI's data directory in `home`, holding a syncPairs.json of `content`.
+	fn typescript_sync_pairs_in(home: &Path, content: &str) {
+		let typescript_dir = typescript_home_dir(home);
+		std::fs::create_dir_all(&typescript_dir).unwrap();
+		std::fs::write(typescript_dir.join("syncPairs.json"), content).unwrap();
+	}
+
+	/// The TypeScript CLI's install script put its data in `~/.filen-cli`, where it kept its sync
+	/// pairs; with the default config directory, a run without pairs falls back to them.
+	#[test]
+	fn no_pairs_reads_the_typescript_clis_sync_pairs_file_in_the_home_directory() {
+		let config_dir = tempfile::tempdir().unwrap();
+		let home = tempfile::tempdir().unwrap();
+		typescript_sync_pairs_in(
+			home.path(),
+			r#"[{"local": "/l", "remote": "/r", "syncMode": "cloudBackup"}]"#,
+		);
+
+		let dirs = SyncDirs::new(config_dir.path(), true, Some(home.path()));
+
+		assert_eq!(
+			parse_sync_pairs(&dirs, &[]).unwrap(),
+			[pair("/l", SyncMode::RemoteBackup, "/r")]
+		);
+	}
+
+	/// A config directory given with `--config-dir` keeps the run away from the home directory.
+	#[test]
+	fn a_config_dir_of_its_own_does_not_read_the_home_directory() {
+		let config_dir = tempfile::tempdir().unwrap();
+		let home = tempfile::tempdir().unwrap();
+		typescript_sync_pairs_in(home.path(), r#"[{"local": "/l", "remote": "/r"}]"#);
+
+		let dirs = SyncDirs::new(config_dir.path(), false, Some(home.path()));
+
+		assert_eq!(exit_code(&parse_sync_pairs(&dirs, &[]).unwrap_err()), 2);
+	}
+
+	/// The config directory's own sync pairs files come first.
+	#[test]
+	fn the_config_dirs_sync_pairs_file_is_read_before_the_home_directorys() {
+		let config_dir = config_dir_with(
+			"syncPairs.json",
+			r#"[{"local": "/config", "remote": "/r"}]"#,
+		);
+		let home = tempfile::tempdir().unwrap();
+		typescript_sync_pairs_in(home.path(), r#"[{"local": "/home", "remote": "/r"}]"#);
+
+		let dirs = SyncDirs::new(config_dir.path(), true, Some(home.path()));
+
+		assert_eq!(
+			parse_sync_pairs(&dirs, &[]).unwrap(),
+			[pair("/config", SyncMode::TwoWay, "/r")]
 		);
 	}
 
@@ -1057,7 +1170,7 @@ mod tests {
 		.unwrap();
 
 		assert_eq!(
-			parse_sync_pairs(config_dir.path(), &[]).unwrap(),
+			parse_sync_pairs(&given_config_dir(config_dir.path()), &[]).unwrap(),
 			[pair("/yaml", SyncMode::TwoWay, "/r")]
 		);
 	}
@@ -1130,7 +1243,8 @@ mod tests {
 			    {"local": "/b", "remote": "/r/b", "alias": "photos", "syncMode": "lb"}]"#,
 		);
 
-		let pairs = parse_sync_pairs(config_dir.path(), &["photos".to_owned()]).unwrap();
+		let pairs =
+			parse_sync_pairs(&given_config_dir(config_dir.path()), &["photos".to_owned()]).unwrap();
 
 		assert_eq!(
 			pairs,
@@ -1148,7 +1262,8 @@ mod tests {
 			"syncPairs:\n  - local: /a\n    remote: /r\n    alias: docs\n",
 		);
 
-		let error = parse_sync_pairs(config_dir.path(), &["photos".to_owned()]).unwrap_err();
+		let error = parse_sync_pairs(&given_config_dir(config_dir.path()), &["photos".to_owned()])
+			.unwrap_err();
 
 		assert_eq!(exit_code(&error), 2);
 		assert_eq!(error.to_string(), "Unknown sync pair alias: photos");
@@ -1158,7 +1273,8 @@ mod tests {
 	fn an_alias_without_a_default_sync_pairs_file_is_a_usage_error() {
 		let config_dir = tempfile::tempdir().unwrap();
 
-		let error = parse_sync_pairs(config_dir.path(), &["photos".to_owned()]).unwrap_err();
+		let error = parse_sync_pairs(&given_config_dir(config_dir.path()), &["photos".to_owned()])
+			.unwrap_err();
 
 		assert_eq!(exit_code(&error), 2);
 		assert_eq!(
@@ -1177,7 +1293,11 @@ mod tests {
 	fn a_path_without_a_colon_is_not_taken_for_an_alias() {
 		let config_dir = tempfile::tempdir().unwrap();
 
-		let error = parse_sync_pairs(config_dir.path(), &["/home/me/docs".to_owned()]).unwrap_err();
+		let error = parse_sync_pairs(
+			&given_config_dir(config_dir.path()),
+			&["/home/me/docs".to_owned()],
+		)
+		.unwrap_err();
 
 		assert!(
 			error

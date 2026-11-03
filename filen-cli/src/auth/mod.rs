@@ -1576,6 +1576,7 @@ mod tests {
 		let config = CliConfig {
 			config_dir: dir.path().to_path_buf(),
 			profiles: Profiles::new(dir.path(), None),
+			config_dir_is_default: false,
 		};
 		(dir, config)
 	}
@@ -2600,6 +2601,7 @@ mod tests {
 		let config = CliConfig {
 			config_dir: config_dir.path().to_path_buf(),
 			profiles: Profiles::new(config_dir.path(), None),
+			config_dir_is_default: false,
 		};
 
 		let Err(err) = authenticate_from_auth_config(
