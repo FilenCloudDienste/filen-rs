@@ -151,6 +151,7 @@ pub(crate) async fn upload(
 	let progress = TransferProgress::new(TransferKind::Upload, ui);
 	let transferred = if is_dir {
 		run_cancellable(
+			ui,
 			&progress,
 			upload_directory(
 				&client,
@@ -163,6 +164,7 @@ pub(crate) async fn upload(
 		.await?
 	} else {
 		run_cancellable(
+			ui,
 			&progress,
 			upload_file(
 				&client,
@@ -363,6 +365,7 @@ pub(crate) async fn download(
 	let transferred = match &item {
 		NonRootFileType::File(file) => {
 			run_cancellable(
+				ui,
 				&progress,
 				download_file(&client, &progress, file.as_ref(), &target),
 			)
@@ -371,6 +374,7 @@ pub(crate) async fn download(
 		NonRootFileType::Dir(dir) => {
 			let dir = DirType::Dir(Cow::Owned(dir.as_ref().clone()));
 			run_cancellable(
+				ui,
 				&progress,
 				download_directory(&client, &progress, dir, &target),
 			)
@@ -379,6 +383,7 @@ pub(crate) async fn download(
 		NonRootFileType::Root(root) => {
 			let root = DirType::Root(Cow::Owned(root.as_ref().clone()));
 			run_cancellable(
+				ui,
 				&progress,
 				download_directory(&client, &progress, root, &target),
 			)
@@ -467,8 +472,10 @@ fn download_target(destination: &Path, name: &str) -> Option<PathBuf> {
 }
 
 /// Await `transfer` until it completes or the user hits Ctrl+C, erasing the progress line either
-/// way. Cancelling drops the transfer future, which is how the SDK aborts the workers it spawned.
+/// way. Cancelling drops the transfer future, which is how the SDK aborts the workers it spawned,
+/// and reports on stderr what had been transferred by then.
 async fn run_cancellable<T>(
+	ui: &mut UI,
 	progress: &TransferProgress,
 	transfer: impl Future<Output = Result<T>>,
 ) -> Result<Result<T>> {
@@ -483,7 +490,23 @@ async fn run_cancellable<T>(
 		}
 	};
 	progress.clear();
-	outcome.ok_or_else(|| CliError::Interrupted.into())
+	match outcome {
+		Some(result) => Ok(result),
+		None => {
+			let (files, bytes) = progress.done();
+			ui.print_muted_to_stderr(&canceled_message(progress.kind, files, bytes));
+			Err(CliError::Interrupted.into())
+		}
+	}
+}
+
+/// What a canceled transfer reports before the failure itself.
+fn canceled_message(kind: TransferKind, files: u64, bytes: u64) -> String {
+	format!(
+		"{} {} before canceling",
+		kind.past(),
+		files_and_bytes(files, bytes)
+	)
 }
 
 /// Print the per-item failures the SDK reported through the progress callbacks, then either the
@@ -1007,8 +1030,8 @@ mod tests {
 
 	use super::{
 		DownloadSource, Existing, ProgressState, SPEED_WINDOW, TransferKind, UploadTarget,
-		download_target, format_duration, local_existing, progress_line, resolve_download_target,
-		resolve_upload_target, transfer_summary,
+		canceled_message, download_target, format_duration, local_existing, progress_line,
+		resolve_download_target, resolve_upload_target, transfer_summary,
 	};
 	use crate::util::RemotePath;
 
@@ -1152,6 +1175,14 @@ mod tests {
 		assert_eq!(
 			transfer_summary(1, 100, Duration::ZERO),
 			"1 file, 100 B in 0.0s"
+		);
+	}
+
+	#[test]
+	fn a_canceled_transfer_reports_what_it_had_moved() {
+		assert_eq!(
+			canceled_message(TransferKind::Download, 2, MIB),
+			"Downloaded 2 files, 1 MiB before canceling"
 		);
 	}
 
