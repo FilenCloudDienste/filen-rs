@@ -69,7 +69,7 @@ impl ConflictResolutions {
 
 /// `path` as the engine writes a relative path: `/`-separated, with no leading `./` or `/` and
 /// no trailing `/`. The pair's root itself is the empty path.
-fn normalize(path: &str) -> String {
+pub(super) fn normalize(path: &str) -> String {
 	let path = if cfg!(windows) {
 		path.replace('\\', "/")
 	} else {

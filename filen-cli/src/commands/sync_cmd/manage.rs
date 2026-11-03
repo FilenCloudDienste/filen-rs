@@ -8,17 +8,23 @@
 //! on, in a sync pairs file too: `sync` refuses a sync pair given in another mode than the one it is
 //! registered in, and says which one that is.
 
-use std::{fmt::Display, iter, sync::Arc, time::Duration};
+use std::{borrow::Cow, fmt::Display, iter, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
 use filen_sdk_rs::{
 	ErrorKind,
 	auth::Client,
-	sync_engine::{Backlog, PairRecord, SyncEngine, SyncMode},
+	sync_engine::{
+		Backlog, ConflictResolution, PairRecord, PlannedConflict, PlannedNodeKind, SyncEngine,
+		SyncMode,
+	},
 };
-use serde_json::json;
+use serde_json::{Value, json};
 
-use super::{open_engine, pair_address, sync_dirs, sync_pairs};
+use super::{
+	conflict_resolutions, open_engine, pair_address, resolve_failure_message,
+	resolved_conflict_lines, sync_dirs, sync_pairs,
+};
 use crate::{CliConfig, auth::LazyClient, ui::UI};
 
 /// A sync engine opened for a command that manages its pairs, logged in.
@@ -212,6 +218,132 @@ fn switch_failure_message(label: &str, mode_name: &str, error: &impl Display) ->
 	)
 }
 
+/// `list-sync-conflicts`: the conflicts the pair `given` names holds, from the sync database.
+pub(super) async fn list_sync_conflicts(
+	config: &CliConfig,
+	ui: &mut UI,
+	client: &mut LazyClient,
+	given: &str,
+) -> Result<()> {
+	let managing = Managing::open(config, ui, client).await?;
+	let (pair, label) = managing.find(config, given).await?;
+	let conflicts = managing
+		.engine
+		.list_conflicts(pair.id)
+		.await
+		.with_context(|| format!("Failed to list the conflicts of the sync pair {label}"))?;
+	if ui.json {
+		let conflicts = conflicts.iter().map(conflict_object).collect::<Vec<_>>();
+		return ui.print_json(json!(conflicts));
+	}
+	if conflicts.is_empty() {
+		ui.print_muted(&format!("The sync pair {label} holds no conflicts."));
+		return Ok(());
+	}
+	for conflict in &conflicts {
+		ui.print(&conflict_line(conflict));
+	}
+	ui.print_muted(&format!(
+		"Resolve one with `filen resolve-sync-conflict {} <path> --keep-local|--keep-remote|--keep-both`.",
+		pair.id
+	));
+	Ok(())
+}
+
+/// The line `list-sync-conflicts` prints for `conflict`.
+fn conflict_line(conflict: &PlannedConflict) -> String {
+	let side = |kind: Option<PlannedNodeKind>| kind.map_or("deleted", node_name);
+	format!(
+		"{}: local {}, remote {}",
+		conflict.rel_path,
+		side(conflict.local),
+		side(conflict.remote)
+	)
+}
+
+/// `conflict` for `--json`: its path and what each side holds, `null` for a side that deleted it.
+fn conflict_object(conflict: &PlannedConflict) -> Value {
+	json!({
+		"path": conflict.rel_path,
+		"local": conflict.local.map(node_name),
+		"remote": conflict.remote.map(node_name),
+	})
+}
+
+/// How the output names an item of kind `node`.
+fn node_name(node: PlannedNodeKind) -> &'static str {
+	match node {
+		PlannedNodeKind::File => "file",
+		PlannedNodeKind::Dir => "directory",
+	}
+}
+
+/// `resolve-sync-conflict`: resolves the conflict at `path` of the pair `given` names with
+/// `resolution`, which its next pass applies.
+pub(super) async fn resolve_sync_conflict(
+	config: &CliConfig,
+	ui: &mut UI,
+	client: &mut LazyClient,
+	given: &str,
+	path: &str,
+	resolution: ConflictResolution,
+) -> Result<()> {
+	let managing = Managing::open(config, ui, client).await?;
+	let (pair, label) = managing.find(config, given).await?;
+	let path = conflict_resolutions::normalize(path);
+	let resolved = managing
+		.engine
+		.resolve_conflict(pair.id, &path, resolution)
+		.await
+		.map_err(|e| UI::failure(&resolve_failure_message(&path, Cow::Borrowed(&label), &e)))?;
+	for line in resolved_conflict_lines(&path, resolution, resolved) {
+		ui.print_success(&line);
+	}
+	ui.print_muted(NEXT_PASS_NOTE);
+	Ok(())
+}
+
+/// `retry-sync`: lets the next pass of the pair `given` names try `path`, or every path, again,
+/// although it stopped trying after it failed repeatedly.
+pub(super) async fn retry_sync(
+	config: &CliConfig,
+	ui: &mut UI,
+	client: &mut LazyClient,
+	given: &str,
+	path: Option<&str>,
+) -> Result<()> {
+	let managing = Managing::open(config, ui, client).await?;
+	let (pair, label) = managing.find(config, given).await?;
+	match path {
+		Some(path) => {
+			let path = conflict_resolutions::normalize(path);
+			managing
+				.engine
+				.retry_path(pair.id, &path)
+				.await
+				.with_context(|| format!("Failed to retry {path} in the sync pair {label}"))?;
+			ui.print_success(&format!(
+				"The next pass of the sync pair {label} tries {path} again"
+			));
+		}
+		None => {
+			managing
+				.engine
+				.retry_all(pair.id)
+				.await
+				.with_context(|| format!("Failed to retry the paths of the sync pair {label}"))?;
+			ui.print_success(&format!(
+				"The next pass of the sync pair {label} tries every path that kept failing again"
+			));
+		}
+	}
+	ui.print_muted(NEXT_PASS_NOTE);
+	Ok(())
+}
+
+/// What a command whose change the next pass applies says last.
+const NEXT_PASS_NOTE: &str = "`filen sync` runs that pass.";
+
 /// What is printed while a call waits for the cache to finish listing a pair's remote folder.
 pub(super) const WAITING_FOR_LISTING: &str = "Waiting for the remote folder to finish indexing...";
 
@@ -266,13 +398,49 @@ pub(super) async fn awaiting_listing<T>(
 mod tests {
 	use std::time::Duration;
 
-	use filen_sdk_rs::sync_engine::{DeleteGuard, PairRecord, SyncMode};
+	use filen_sdk_rs::sync_engine::{
+		DeleteGuard, PairRecord, PlannedConflict, PlannedNodeKind, SyncMode,
+	};
 	use filen_types::fs::Uuid;
 
+	use serde_json::json;
+
 	use super::{
-		LISTING_WAIT, listing_delays, pair_line, propagate_deletions_question,
-		switch_failure_message,
+		LISTING_WAIT, conflict_line, conflict_object, listing_delays, pair_line,
+		propagate_deletions_question, switch_failure_message,
 	};
+
+	#[test]
+	fn a_conflict_names_what_each_side_holds() {
+		let conflict = PlannedConflict {
+			rel_path: "docs/a.txt".to_string(),
+			local: Some(PlannedNodeKind::File),
+			remote: None,
+		};
+
+		assert_eq!(
+			conflict_line(&conflict),
+			"docs/a.txt: local file, remote deleted"
+		);
+	}
+
+	#[test]
+	fn a_conflict_object_names_each_side_as_the_line_does() {
+		let conflict = PlannedConflict {
+			rel_path: "docs".to_string(),
+			local: Some(PlannedNodeKind::Dir),
+			remote: Some(PlannedNodeKind::File),
+		};
+
+		assert_eq!(
+			conflict_object(&conflict),
+			json!({"path": "docs", "local": "directory", "remote": "file"})
+		);
+		assert_eq!(
+			conflict_line(&conflict),
+			"docs: local directory, remote file"
+		);
+	}
 
 	#[test]
 	fn the_waits_for_the_listing_double_up_to_five_seconds_for_fifteen_minutes() {

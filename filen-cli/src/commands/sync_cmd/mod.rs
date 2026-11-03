@@ -111,7 +111,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use clap::Subcommand;
+use clap::{ArgGroup, Subcommand};
 use console::style;
 use filen_sdk_rs::{
 	auth::Client,
@@ -213,6 +213,35 @@ pub(crate) enum SyncCommands {
 		#[arg(long)]
 		propagate_deletions: bool,
 	},
+	/// List the conflicts a sync pair holds: paths changed on both sides, which its passes leave alone
+	ListSyncConflicts {
+		#[arg(help = PAIR_HELP)]
+		pair: String,
+	},
+	/// Resolve a conflict of a sync pair; the next pass of the sync pair applies it
+	#[command(group = ArgGroup::new("side").required(true).multiple(false))]
+	ResolveSyncConflict {
+		#[arg(help = PAIR_HELP)]
+		pair: String,
+		/// The path of the conflict, relative to the root of the sync pair, as list-sync-conflicts prints it
+		path: String,
+		/// Keep the local version, which the next pass uploads
+		#[arg(long, group = "side")]
+		keep_local: bool,
+		/// Keep the remote version, which the next pass downloads. A local version that differs is moved into the sync pair's .filen-sync-trash first
+		#[arg(long, group = "side")]
+		keep_remote: bool,
+		/// Keep both: the local version is renamed aside, to `<name>.old.<ext>`, and synced as a file of its own
+		#[arg(long, group = "side")]
+		keep_both: bool,
+	},
+	/// Let the next pass of a sync pair try again the paths it stopped trying after they failed repeatedly
+	RetrySync {
+		#[arg(help = PAIR_HELP)]
+		pair: String,
+		/// Only this path, relative to the root of the sync pair
+		path: Option<String>,
+	},
 }
 
 /// The help of the PAIR argument of the commands that manage a registered sync pair.
@@ -226,6 +255,9 @@ pub(crate) const DOCS: &[DocElement] = &[
 	DocElement::CommandHelp("list-sync-pairs"),
 	DocElement::CommandHelp("remove-sync-pair"),
 	DocElement::CommandHelp("set-sync-mode"),
+	DocElement::CommandHelp("list-sync-conflicts"),
+	DocElement::CommandHelp("resolve-sync-conflict"),
+	DocElement::CommandHelp("retry-sync"),
 ];
 
 impl SyncCommands {
@@ -269,6 +301,29 @@ impl SyncCommands {
 				propagate_deletions,
 			} => {
 				manage::set_sync_mode(config, ui, client, &pair, mode, propagate_deletions).await?;
+			}
+			Self::ListSyncConflicts { pair } => {
+				manage::list_sync_conflicts(config, ui, client, &pair).await?;
+			}
+			Self::ResolveSyncConflict {
+				pair,
+				path,
+				keep_local,
+				keep_remote,
+				keep_both: _,
+			} => {
+				// the group lets exactly one of them through
+				let resolution = if keep_local {
+					ConflictResolution::KeepLocal
+				} else if keep_remote {
+					ConflictResolution::KeepRemote
+				} else {
+					ConflictResolution::KeepBoth
+				};
+				manage::resolve_sync_conflict(config, ui, client, &pair, &path, resolution).await?;
+			}
+			Self::RetrySync { pair, path } => {
+				manage::retry_sync(config, ui, client, &pair, path.as_deref()).await?;
 			}
 		}
 		Ok(CommandResult::default())
@@ -958,6 +1013,21 @@ mod tests {
 	#[test]
 	fn set_sync_mode_with_an_unknown_mode_is_a_usage_error() {
 		assert!(parse_repl_line("set-sync-mode docs mirror").is_err());
+	}
+
+	#[test]
+	fn resolve_sync_conflict_takes_exactly_one_side() {
+		assert!(matches!(
+			command_of("resolve-sync-conflict 2 a.txt --keep-remote"),
+			SyncCommands::ResolveSyncConflict {
+				keep_local: false,
+				keep_remote: true,
+				keep_both: false,
+				..
+			}
+		));
+		assert!(parse_repl_line("resolve-sync-conflict 2 a.txt").is_err());
+		assert!(parse_repl_line("resolve-sync-conflict 2 a.txt --keep-local --keep-both").is_err());
 	}
 
 	#[test]

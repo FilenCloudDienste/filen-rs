@@ -506,6 +506,49 @@ async fn sync_with_a_pair_in_another_mode_than_registered_names_its_mode() {
 	);
 }
 
+/// A conflict a pass left is listed by `list-sync-conflicts`, and the resolution
+/// `resolve-sync-conflict` gives is applied by the next `sync`.
+#[shared_test_runtime]
+async fn a_listed_conflict_is_resolved_by_resolve_sync_conflict() {
+	// Not `get_resources_with_lock`, for the reason the first test gives.
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let test_dir_name = resources.dir.name().unwrap();
+	let (local, config_dir, pair) = diverged_pair(&resources).await;
+	let local_root = local.path().to_str().unwrap();
+	assert_eq!(
+		sync_once(config_dir.path(), &pair, &[]).await.status.code(),
+		Some(1)
+	);
+
+	let listed = filen(
+		config_dir.path(),
+		&["list-sync-conflicts", local_root, "--json"],
+	)
+	.await;
+
+	assert_success(&listed);
+	assert_eq!(
+		serde_json::from_slice::<serde_json::Value>(&listed.stdout).unwrap(),
+		serde_json::json!([{"path": "fight.txt", "local": "file", "remote": "file"}])
+	);
+	let resolved = filen(
+		config_dir.path(),
+		&[
+			"resolve-sync-conflict",
+			local_root,
+			"fight.txt",
+			"--keep-local",
+		],
+	)
+	.await;
+	assert_success(&resolved);
+	assert_success(&sync_once(config_dir.path(), &pair, &[]).await);
+	assert_eq!(
+		remote_content(&resources.client, &format!("{test_dir_name}/fight.txt")).await,
+		b"the local edit"
+	);
+}
+
 /// A pair whose first `sync --once` agreed on `fight.txt`, which has since been changed on both
 /// sides, with the local root and the config dir that holds its database.
 async fn diverged_pair(
