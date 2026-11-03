@@ -160,7 +160,7 @@ pub(crate) enum FsCommands {
 		/// (default: pick one interactively)
 		item: Option<String>,
 	},
-	/// Permanently delete all trashed items
+	/// Permanently delete all trashed items, asking first unless --yes is given
 	EmptyTrash,
 }
 
@@ -1925,11 +1925,47 @@ async fn delete_trash_item_permanently(
 	Ok(())
 }
 
+/// Permanently deletes everything in the trash, asking first unless --yes is given.
 pub(crate) async fn empty_trash(ui: &mut UI, client: &mut LazyClient) -> Result<()> {
+	// before logging in and listing the trash, so that a script missing --yes fails at once
+	ui.ensure_can_confirm("Permanently delete all trashed items?")?;
 	let client = client.get(ui).await?;
-	client.empty_trash().await?;
-	ui.print_success("Emptied trash");
+	let (dirs, files) = client
+		.list_trash(None::<&fn(u64, Option<u64>)>)
+		.await
+		.context("Failed to list trash")?;
+	let count = dirs.len().saturating_add(files.len());
+	if count == 0 {
+		ui.print_muted("Trash is empty");
+		return Ok(());
+	}
+	if !ui.prompt_confirm(&empty_trash_confirmation(count), false)? {
+		return Ok(());
+	}
+	// the server empties the trash as it is then, so an item trashed since the listing goes
+	// too, uncounted
+	client
+		.empty_trash()
+		.await
+		.context("Failed to empty trash")?;
+	ui.print_success(&format!("Emptied trash ({})", count_of_items(count)));
 	Ok(())
+}
+
+/// What `empty-trash` asks before deleting the `count` trashed items.
+fn empty_trash_confirmation(count: usize) -> String {
+	match count {
+		1 => "Permanently delete the 1 trashed item?".to_owned(),
+		_ => format!("Permanently delete all {} trashed items?", count),
+	}
+}
+
+/// `1 item`, or `N items`.
+fn count_of_items(count: usize) -> String {
+	match count {
+		1 => "1 item".to_owned(),
+		_ => format!("{} items", count),
+	}
 }
 
 #[cfg(test)]
@@ -2322,6 +2358,29 @@ mod tests {
 				.to_string(),
 			"No such item in the trash: A.TXT"
 		);
+	}
+
+	#[test]
+	fn emptying_a_trash_of_one_item_asks_about_that_item() {
+		assert_eq!(
+			empty_trash_confirmation(1),
+			"Permanently delete the 1 trashed item?"
+		);
+	}
+
+	#[test]
+	fn emptying_a_trash_of_several_items_asks_about_all_of_them() {
+		assert_eq!(
+			empty_trash_confirmation(3),
+			"Permanently delete all 3 trashed items?"
+		);
+	}
+
+	#[test]
+	fn an_item_count_is_singular_only_for_one() {
+		assert_eq!(count_of_items(0), "0 items");
+		assert_eq!(count_of_items(1), "1 item");
+		assert_eq!(count_of_items(2), "2 items");
 	}
 
 	#[test]

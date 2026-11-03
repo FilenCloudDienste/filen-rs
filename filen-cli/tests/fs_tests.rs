@@ -659,10 +659,10 @@ async fn trash_restore_refuses_a_name_several_trashed_items_share() {
 	client.delete_file_permanently(second).await.unwrap();
 }
 
-#[test]
-fn trash_delete_of_a_named_item_without_yes_asks_for_it_before_logging_in() {
+/// Runs the CLI with `args`, logged out and with no terminal on stdin.
+fn run_logged_out_without_a_terminal(args: &[&str]) -> std::process::Output {
 	let config_dir = assert_fs::TempDir::new().unwrap();
-	let output = std::process::Command::new(env!("CARGO_BIN_EXE_filen-cli"))
+	std::process::Command::new(env!("CARGO_BIN_EXE_filen-cli"))
 		.env("FILEN_CLI_TESTING_DISABLE_KEYRING", "1")
 		.env("FILEN_CLI_TESTING_DISABLE_AUTODETECTED_AUTH_CONFIG", "1")
 		.env_remove("FILEN_CLI_EMAIL")
@@ -670,16 +670,34 @@ fn trash_delete_of_a_named_item_without_yes_asks_for_it_before_logging_in() {
 		.env_remove("FILEN_CLI_2FA_CODE")
 		.arg("--config-dir")
 		.arg(config_dir.path())
-		.args(["--skip-update", "trash-delete", "a.txt"])
+		.arg("--skip-update")
+		.args(args)
 		.stdin(std::process::Stdio::null())
 		.output()
-		.unwrap();
+		.unwrap()
+}
+
+#[test]
+fn trash_delete_of_a_named_item_without_yes_asks_for_it_before_logging_in() {
+	let output = run_logged_out_without_a_terminal(&["trash-delete", "a.txt"]);
 
 	assert_eq!(output.status.code(), Some(2));
 	assert_eq!(
 		console::strip_ansi_codes(&String::from_utf8(output.stderr).unwrap()),
 		"✘ Cannot ask \"Permanently delete a.txt?\": stdin is not a terminal. Pass --yes to \
 		 answer yes.\n"
+	);
+}
+
+#[test]
+fn empty_trash_without_yes_asks_for_it_before_logging_in() {
+	let output = run_logged_out_without_a_terminal(&["empty-trash"]);
+
+	assert_eq!(output.status.code(), Some(2));
+	assert_eq!(
+		console::strip_ansi_codes(&String::from_utf8(output.stderr).unwrap()),
+		"✘ Cannot ask \"Permanently delete all trashed items?\": stdin is not a terminal. Pass \
+		 --yes to answer yes.\n"
 	);
 }
 

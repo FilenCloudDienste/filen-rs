@@ -117,10 +117,19 @@ async fn cmd_list_trash_empty_trash() {
 			"testfile_from_cli_test_list_trash.txt",
 		));
 
-	// empty-trash
-	authenticated_cli_with_args!("empty-trash")
-		.success()
-		.stdout(predicates::str::contains("Emptied trash"));
+	// empty-trash, which says how many items it deleted: at least the file trashed above, as
+	// other test binaries on the account may have trashed more
+	let emptied = authenticated_cli_with_args!("empty-trash", "--yes").success();
+	let stdout = String::from_utf8_lossy(&emptied.get_output().stdout).into_owned();
+	let count = stdout
+		.split_once("Emptied trash (")
+		.and_then(|(_, rest)| rest.split_once(' '))
+		.and_then(|(count, unit)| {
+			let count = count.parse::<usize>().ok()?;
+			let expected_unit = if count == 1 { "item)" } else { "items)" };
+			unit.starts_with(expected_unit).then_some(count)
+		});
+	assert!(count.is_some_and(|count| count >= 1), "stdout:\n{stdout}");
 
 	// Verify our own file eventually leaves the trash listing. Asserting a globally
 	// empty trash is impossible on the shared account (concurrent test binaries keep
