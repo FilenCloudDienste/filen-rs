@@ -49,6 +49,17 @@ pub(super) fn file_extension(note_type: NoteType) -> &'static str {
 	}
 }
 
+/// The type of the note a file with this extension is imported as, if any. The match ignores
+/// case.
+pub(super) fn type_for_extension(extension: &str) -> Option<NoteType> {
+	match extension.to_ascii_lowercase().as_str() {
+		"md" => Some(NoteType::Md),
+		"txt" => Some(NoteType::Text),
+		"html" => Some(NoteType::Rich),
+		_ => None,
+	}
+}
+
 /// A note's content as a person reads and writes it: a checklist as a Markdown task list, the
 /// other types as they are stored.
 pub(super) fn readable_content(note_type: NoteType, stored: &str) -> Cow<'_, str> {
@@ -107,6 +118,27 @@ fn first_line(text: &str) -> &str {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn import_extensions_map_to_note_types() {
+		assert_eq!(type_for_extension("md"), Some(NoteType::Md));
+		assert_eq!(type_for_extension("txt"), Some(NoteType::Text));
+		assert_eq!(type_for_extension("html"), Some(NoteType::Rich));
+		assert_eq!(type_for_extension("MD"), Some(NoteType::Md));
+		assert_eq!(type_for_extension("Html"), Some(NoteType::Rich));
+		assert_eq!(type_for_extension("htm"), None);
+		assert_eq!(type_for_extension("markdown"), None);
+		assert_eq!(type_for_extension("pdf"), None);
+		assert_eq!(type_for_extension(""), None);
+	}
+
+	#[test]
+	fn each_imported_type_is_exported_with_the_extension_it_is_imported_from() {
+		for extension in ["md", "txt", "html"] {
+			let note_type = type_for_extension(extension).unwrap();
+			assert_eq!(file_extension(note_type), extension);
+		}
+	}
 
 	#[test]
 	fn note_kinds_map_to_the_note_types_of_the_same_name() {

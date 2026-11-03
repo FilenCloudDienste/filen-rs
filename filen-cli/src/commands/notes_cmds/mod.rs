@@ -25,6 +25,7 @@ mod checklist;
 mod content;
 mod edit;
 mod export;
+mod import;
 
 use std::{
 	cmp::Reverse,
@@ -104,6 +105,16 @@ pub(crate) enum NotesCommands {
 		#[arg(add = ArgValueCompleter::new(PathCompleter::dir()))]
 		path: Option<String>,
 	},
+	/// Import the .md, .txt and .html files of a local directory as notes
+	ImportNotes {
+		/// Local directory to import the notes from, such as one export-notes wrote
+		#[arg(add = ArgValueCompleter::new(PathCompleter::dir()))]
+		path: PathBuf,
+		/// Also import the notes in its trash/ and archive/ subdirectories, into the trash and the
+		/// archive
+		#[arg(long)]
+		include_trashed: bool,
+	},
 }
 
 /// The docs' "Notes" section.
@@ -117,6 +128,8 @@ pub(crate) const DOCS: &[DocElement] = &[
 	DocElement::CommandHelp("note-rm"),
 	DocElement::DocFragment("notes-export"),
 	DocElement::CommandHelp("export-notes"),
+	DocElement::DocFragment("notes-import"),
+	DocElement::CommandHelp("import-notes"),
 ];
 
 impl NotesCommands {
@@ -135,6 +148,10 @@ impl NotesCommands {
 			}
 			Self::NoteRm { note, permanent } => remove_note(ui, client, &note, permanent).await?,
 			Self::ExportNotes { path } => export::export_notes(ui, client, path.as_deref()).await?,
+			Self::ImportNotes {
+				path,
+				include_trashed,
+			} => import::import_notes(ui, client, &path, include_trashed).await?,
 		}
 		Ok(CommandResult::default())
 	}
@@ -532,6 +549,21 @@ mod tests {
 		));
 		assert_eq!(
 			parsed(&["note-rm"]).err(),
+			Some(clap::error::ErrorKind::MissingRequiredArgument)
+		);
+	}
+
+	#[test]
+	fn import_notes_needs_a_directory() {
+		assert!(matches!(
+			parsed(&["import-notes", "dir", "--include-trashed"]),
+			Ok(NotesCommands::ImportNotes {
+				include_trashed: true,
+				..
+			})
+		));
+		assert_eq!(
+			parsed(&["import-notes"]).err(),
 			Some(clap::error::ErrorKind::MissingRequiredArgument)
 		);
 	}
