@@ -1,4 +1,10 @@
-use std::{borrow::Cow, sync::Arc};
+use std::{
+	borrow::Cow,
+	sync::{
+		Arc, Mutex,
+		atomic::{AtomicU64, Ordering},
+	},
+};
 
 use chrono::{SubsecRound, TimeZone, Utc};
 use filen_macros::shared_test_runtime;
@@ -6,6 +12,7 @@ use filen_macros::shared_test_runtime;
 use filen_sdk_rs::{
 	ErrorKind,
 	auth::Client,
+	consts::CHUNK_SIZE_U64,
 	error::ResultExt,
 	fs::{
 		HasName, HasParent, HasRemoteInfo, HasUUID,
@@ -2123,5 +2130,113 @@ async fn get_file_by_stable_uuid_resolves_a_trashed_head() {
 		head.parent(),
 		&filen_types::fs::ParentUuid::Trash(test_dir.uuid()),
 		"a trashed head must carry its restore target as a Trash parent"
+	);
+}
+
+/// Contents spanning two chunks, and a download path in a fresh directory beside which a resumed
+/// download keeps its temp file, named after the file's uuid.
+fn resumable_download_case(
+	file: &impl HasUUID,
+) -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+	let dir = tempfile::tempdir().unwrap();
+	let path = dir.path().join("resumed.bin");
+	let tmp = dir.path().join(format!("{}.filendl", file.uuid()));
+	(dir, path, tmp)
+}
+
+fn two_chunks_of_contents() -> Vec<u8> {
+	(0..1024 * 1024 + 512 * 1024 + 7)
+		.map(|i: u32| u8::try_from(i % 251).unwrap())
+		.collect()
+}
+
+#[shared_test_runtime]
+async fn a_resumed_download_continues_from_the_bytes_an_earlier_one_left() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let contents = two_chunks_of_contents();
+	let file = client
+		.make_file_builder("resumed.bin", resources.dir.uuid())
+		.unwrap();
+	let file = client.upload_file(file, &contents).await.unwrap();
+	assert!(
+		file.hash().is_some(),
+		"precondition: the upload declares a hash"
+	);
+
+	let (_dir, path, tmp) = resumable_download_case(&file);
+	// Ends inside the second chunk, so the download continues mid-chunk.
+	std::fs::write(&tmp, &contents[..1_200_000]).unwrap();
+
+	let downloaded = Arc::new(AtomicU64::new(0));
+	let resumed = Arc::new(Mutex::new(Vec::new()));
+	client
+		.download_file_to_path_resuming(
+			&file,
+			&path,
+			Some(Arc::new({
+				let downloaded = Arc::clone(&downloaded);
+				move |bytes| {
+					downloaded.fetch_add(bytes, Ordering::Relaxed);
+				}
+			}) as MaybeSendCallback<u64>),
+			Some(Arc::new({
+				let resumed = Arc::clone(&resumed);
+				move |bytes| resumed.lock().unwrap().push(bytes)
+			}) as MaybeSendCallback<u64>),
+		)
+		.await
+		.unwrap();
+
+	// The second chunk, which the earlier download stopped in, is downloaded whole.
+	assert_eq!(*resumed.lock().unwrap(), [CHUNK_SIZE_U64]);
+	assert_eq!(
+		downloaded.load(Ordering::Relaxed),
+		u64::try_from(contents.len()).unwrap() - CHUNK_SIZE_U64
+	);
+
+	assert!(
+		std::fs::read(&path).unwrap() == contents,
+		"the resumed file differs"
+	);
+	assert!(!tmp.exists(), "the temp file was left behind");
+}
+
+#[shared_test_runtime]
+async fn a_resumed_download_whose_start_was_changed_starts_over_next_time() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let contents = two_chunks_of_contents();
+	let file = client
+		.make_file_builder("resumed_changed.bin", resources.dir.uuid())
+		.unwrap();
+	let file = client.upload_file(file, &contents).await.unwrap();
+	assert!(
+		file.hash().is_some(),
+		"precondition: the upload declares a hash"
+	);
+
+	let (_dir, path, tmp) = resumable_download_case(&file);
+	std::fs::write(&tmp, vec![0u8; 700_000]).unwrap();
+
+	let err = client
+		.download_file_to_path_resuming(&file, &path, None, None)
+		.await
+		.unwrap_err();
+	assert_eq!(err.kind(), ErrorKind::IO);
+	assert!(
+		err.to_string().contains("does not match the file's hash"),
+		"{err}"
+	);
+	assert!(!tmp.exists(), "the mismatched temp file was kept");
+	assert!(!path.exists(), "the mismatched file was put in place");
+
+	client
+		.download_file_to_path_resuming(&file, &path, None, None)
+		.await
+		.unwrap();
+	assert!(
+		std::fs::read(&path).unwrap() == contents,
+		"the new download differs"
 	);
 }

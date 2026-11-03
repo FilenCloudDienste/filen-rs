@@ -2,7 +2,7 @@ use std::sync::Arc;
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 use std::{
 	future::poll_fn,
-	io::{Read, Write},
+	io::{Read, Seek, SeekFrom, Write},
 	ops::Deref,
 	path::{Path, PathBuf},
 	sync::atomic::AtomicBool,
@@ -28,12 +28,13 @@ use crate::{
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 use crate::{
 	ErrorKind,
+	consts::CHUNK_SIZE_U64,
 	error::ErrorExt,
 	fs::{
 		categories::{DirType, Normal},
 		file::{FileBuilderOptionalName, chunk::Chunk},
 	},
-	io::{CanonicalPath, FilenMetaExt, meta_ext::FileTimesExt},
+	io::{CanonicalPath, FilenMetaExt, PartialDownload, meta_ext::FileTimesExt},
 	util::AtomicDropCanceller,
 };
 
@@ -488,13 +489,14 @@ async fn download_into_file<SC>(
 	client: &SC,
 	remote_file: &dyn File,
 	mut file: std::fs::File,
+	start: u64,
 	callback: Option<MaybeSendCallback<'_, u64>>,
 ) -> Result<std::fs::File, Error>
 where
 	SC: SharedClient,
 {
 	let (mut reader, progress) =
-		reader_with_progress(client, remote_file, 0, remote_file.size(), callback);
+		reader_with_progress(client, remote_file, start, remote_file.size(), callback);
 	while let Some(chunk) = poll_fn(|cx| reader.poll_next_chunk(cx)).await? {
 		let (data, permit) = chunk.into_parts();
 		let (returned, data) =
@@ -554,10 +556,13 @@ fn fill_from(reader: &mut impl Read, data: &mut Vec<u8>, len: usize) -> std::io:
 /// return before the commit (network error, `FileChangedDuringSync`, task
 /// cancellation) would leave the partial file behind — inside a sync tree,
 /// where the next scan pass, which only filters the quarantine dir, would
-/// treat it as a new local file and upload the partial garbage.
+/// treat it as a new local file and upload the partial garbage. A guard from
+/// [`open_to_resume`](Self::open_to_resume) keeps it instead, for a later
+/// download to continue.
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 pub(crate) struct TmpFileGuard {
 	path: Option<PathBuf>,
+	unfinished: PartialDownload,
 }
 
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
@@ -582,7 +587,67 @@ impl TmpFileGuard {
 			.truncate(true)
 			.open(&path)
 			.await?;
-		Ok((Self { path: Some(path) }, file))
+		Ok((
+			Self {
+				path: Some(path),
+				unfinished: PartialDownload::Discard,
+			},
+			file,
+		))
+	}
+
+	/// Opens `name` in `destination`'s directory to continue writing a file of `size` bytes where
+	/// an earlier download left it, returning how many bytes it already holds. A file longer than
+	/// `size` cannot be the start of it and is emptied. The guard keeps the file when dropped
+	/// uncommitted.
+	pub(crate) async fn open_to_resume(
+		destination: &Path,
+		name: &str,
+		size: u64,
+	) -> std::io::Result<(Self, std::fs::File, u64)> {
+		let parent = destination.parent().ok_or_else(|| {
+			std::io::Error::new(
+				std::io::ErrorKind::InvalidInput,
+				"Provided path has no parent directory",
+			)
+		})?;
+		let path = parent.join(name);
+		let (path, file, held) = tokio::task::spawn_blocking(move || {
+			let mut file = std::fs::OpenOptions::new()
+				.write(true)
+				.create(true)
+				.truncate(false)
+				.open(&path)?;
+			let mut held = file.metadata()?.len();
+			if held > size {
+				file.set_len(0)?;
+				held = 0;
+			}
+			file.seek(SeekFrom::Start(held))?;
+			Ok::<_, std::io::Error>((path, file, held))
+		})
+		.await
+		.map_err(std::io::Error::from)??;
+		Ok((
+			Self {
+				path: Some(path),
+				unfinished: PartialDownload::Resume,
+			},
+			file,
+			held,
+		))
+	}
+
+	/// Where the temp file is.
+	fn path(&self) -> &Path {
+		self.path
+			.as_deref()
+			.expect("an uncommitted guard holds its path (should be impossible)")
+	}
+
+	/// Removes the temp file, whatever the guard keeps when dropped.
+	pub(crate) fn discard(mut self) {
+		self.unfinished = PartialDownload::Discard;
 	}
 
 	/// Renames the temp file onto `destination`; from then on dropping the
@@ -600,9 +665,33 @@ impl TmpFileGuard {
 impl Drop for TmpFileGuard {
 	fn drop(&mut self) {
 		if let Some(path) = self.path.take() {
-			let _ = std::fs::remove_file(path);
+			match self.unfinished {
+				PartialDownload::Discard => {
+					let _ = std::fs::remove_file(path);
+				}
+				PartialDownload::Resume => {}
+			}
 		}
 	}
+}
+
+/// Why a resumed download was refused: the file put together from the bytes an earlier download
+/// left and the rest does not hash to what the remote file declares. Its temp file is removed, so
+/// the next download starts over.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+#[derive(Debug, thiserror::Error)]
+#[error("The resumed download of {name} does not match the file's hash")]
+pub(crate) struct ResumedDownloadMismatch {
+	name: String,
+}
+
+/// Whether the file at `path` hashes to `hash`.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+fn has_hash(path: &Path, hash: Blake3Hash) -> std::io::Result<bool> {
+	let mut hasher = blake3::Hasher::new();
+	hasher.update_reader(std::fs::File::open(path)?)?;
+	let computed: Blake3Hash = hasher.finalize().into();
+	Ok(computed == hash)
 }
 
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
@@ -611,6 +700,8 @@ async fn inner_download_file_to_path<SC>(
 	remote_file: &dyn File,
 	path: &CanonicalPath,
 	callback: Option<MaybeSendCallback<'_, u64>>,
+	partial: PartialDownload,
+	on_resumed: Option<MaybeSendCallback<'_, u64>>,
 ) -> Result<(), Error>
 where
 	SC: SharedClient,
@@ -621,21 +712,52 @@ where
 		Err(e) => return Err(e.into()),
 	};
 
-	// Every path out of this function before the commit unlinks the temp file
+	// Named by the remote file's uuid: a file's contents never change under its uuid (a changed
+	// file is a new version with a new uuid), so the bytes a resumed download finds in it are the
+	// start of the same file.
+	let tmp_name = format!("{}.{}", remote_file.uuid(), super::DOWNLOAD_TMP_EXT);
+	// Unless resuming, every path out of this function before the commit unlinks the temp file
 	// rather than leak it into the sync tree.
-	let (tmp_guard, tmp_file) = TmpFileGuard::create_beside(
-		path.as_ref(),
-		&format!("{}.{}", remote_file.uuid(), super::DOWNLOAD_TMP_EXT),
-	)
-	.await?;
+	let (tmp_guard, tmp_file, held) = match partial {
+		PartialDownload::Discard => {
+			let (guard, file) = TmpFileGuard::create_beside(path.as_ref(), &tmp_name).await?;
+			(guard, file.into_std().await, 0)
+		}
+		PartialDownload::Resume => {
+			TmpFileGuard::open_to_resume(path.as_ref(), &tmp_name, remote_file.size()).await?
+		}
+	};
+	// The chunk `held` ends in is downloaded whole, so only the chunks before it are not
+	// downloaded again.
+	let not_downloaded = held - held % CHUNK_SIZE_U64;
+	if not_downloaded > 0
+		&& let Some(on_resumed) = on_resumed
+	{
+		on_resumed(not_downloaded);
+	}
 
-	let tmp_file = download_into_file(
-		unauth_client,
-		remote_file,
-		tmp_file.into_std().await,
-		callback,
-	)
-	.await?;
+	let tmp_file = download_into_file(unauth_client, remote_file, tmp_file, held, callback).await?;
+
+	// What an earlier download left could have been changed since; the declared hash vouches for
+	// the whole file. Without one, the bytes are taken as they are.
+	if held > 0
+		&& let Some(hash) = remote_file.hash()
+	{
+		let tmp_path = tmp_guard.path().to_path_buf();
+		let matches = tokio::task::spawn_blocking(move || has_hash(&tmp_path, hash))
+			.await
+			.map_err(std::io::Error::from)??;
+		if !matches {
+			tmp_guard.discard();
+			return Err(Error::custom_with_source(
+				ErrorKind::IO,
+				ResumedDownloadMismatch {
+					name: remote_file.name().unwrap_or("the file").to_owned(),
+				},
+				None::<&str>,
+			));
+		}
+	}
 
 	let file_times = FileTimesExt::get_file_times(remote_file);
 
@@ -737,6 +859,8 @@ pub(crate) async fn inner_download_to_path_with_hash_check<SC>(
 	path: CanonicalPath,
 	callback: Option<MaybeSendCallback<'_, u64>>,
 	keep: KeepLocalWhen,
+	partial: PartialDownload,
+	on_resumed: Option<MaybeSendCallback<'_, u64>>,
 ) -> (Result<LocalWrite, Error>, CanonicalPath)
 where
 	SC: SharedClient,
@@ -757,7 +881,15 @@ where
 	};
 
 	if need_download {
-		let res = inner_download_file_to_path(unauth_client, remote_file, &path, callback).await;
+		let res = inner_download_file_to_path(
+			unauth_client,
+			remote_file,
+			&path,
+			callback,
+			partial,
+			on_resumed,
+		)
+		.await;
 		(res.map(|()| LocalWrite::Written), path)
 	} else {
 		(Ok(LocalWrite::Kept), path)
@@ -776,6 +908,34 @@ pub(crate) async fn download_to_path<'b, SC>(
 where
 	SC: SharedClient,
 {
+	download_to_path_keeping(
+		client,
+		remote_file,
+		path,
+		callback,
+		keep,
+		PartialDownload::Discard,
+		None,
+	)
+	.await
+}
+
+/// [`download_to_path`], doing with what it wrote of the file as `partial` says when it does not
+/// finish, and calling `on_resumed` with the bytes it continues from without downloading them
+/// again, if any.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+async fn download_to_path_keeping<'b, SC>(
+	client: &'b SC,
+	remote_file: &'b dyn File,
+	path: &Path,
+	callback: Option<MaybeSendCallback<'b, u64>>,
+	keep: KeepLocalWhen,
+	partial: PartialDownload,
+	on_resumed: Option<MaybeSendCallback<'b, u64>>,
+) -> Result<(), Error>
+where
+	SC: SharedClient,
+{
 	let (res, _path) = inner_download_to_path_with_hash_check(
 		client,
 		remote_file,
@@ -788,6 +948,8 @@ where
 		})?,
 		callback,
 		keep,
+		partial,
+		on_resumed,
 	)
 	.await;
 	res.map(|_| ())
@@ -863,6 +1025,27 @@ pub trait IoSharedClientExt<'a>: SharedClient {
 		remote_file: &'b dyn File,
 		path: &Path,
 		callback: Option<MaybeSendCallback<'b, u64>>,
+	) -> Result<(), Error>;
+
+	/// Downloads `remote_file` to `path` as
+	/// [`download_file_to_path_unless_same_hash`](Self::download_file_to_path_unless_same_hash)
+	/// does, but continues where an earlier, unfinished call for the same file left off, and keeps
+	/// what it wrote when it does not finish, to be continued by a later call. The bytes written so
+	/// far are kept beside `path` in a temp file named after the file's uuid. A resumed file is
+	/// checked against the hash `remote_file` declares, if any, and on a mismatch the temp file is
+	/// removed and an error returned, so the next call starts over.
+	///
+	/// `on_resumed` is called once, before anything is downloaded, with how many of the bytes an
+	/// earlier call left are not downloaded again, when there are any: those in the whole chunks
+	/// before the one the earlier call stopped in, which is downloaded whole. `callback` reports
+	/// the bytes downloaded, so the two add up to the file's size.
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	async fn download_file_to_path_resuming<'b>(
+		&'b self,
+		remote_file: &'b dyn File,
+		path: &Path,
+		callback: Option<MaybeSendCallback<'b, u64>>,
+		on_resumed: Option<MaybeSendCallback<'b, u64>>,
 	) -> Result<(), Error>;
 }
 
@@ -945,6 +1128,26 @@ where
 	) -> Result<(), Error> {
 		download_to_path(self, remote_file, path, callback, KeepLocalWhen::SameHash).await
 	}
+
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	async fn download_file_to_path_resuming<'b>(
+		&'b self,
+		remote_file: &'b dyn File,
+		path: &Path,
+		callback: Option<MaybeSendCallback<'b, u64>>,
+		on_resumed: Option<MaybeSendCallback<'b, u64>>,
+	) -> Result<(), Error> {
+		download_to_path_keeping(
+			self,
+			remote_file,
+			path,
+			callback,
+			KeepLocalWhen::SameHash,
+			PartialDownload::Resume,
+			on_resumed,
+		)
+		.await
+	}
 }
 
 #[cfg(all(test, not(all(target_family = "wasm", target_os = "unknown"))))]
@@ -1017,7 +1220,9 @@ mod tmp_file_guard_tests {
 
 	use tokio::io::AsyncWriteExt;
 
-	use super::TmpFileGuard;
+	use filen_types::crypto::Blake3Hash;
+
+	use super::{TmpFileGuard, has_hash};
 
 	#[tokio::test]
 	async fn a_temp_file_beside_its_destination_is_removed_unless_committed() {
@@ -1067,6 +1272,69 @@ mod tmp_file_guard_tests {
 			.await
 			.unwrap();
 		assert_eq!(file.metadata().await.unwrap().len(), 0);
+	}
+
+	#[tokio::test]
+	async fn a_resumed_temp_file_continues_after_what_it_holds() {
+		let dir = tempfile::tempdir().unwrap();
+		let destination = dir.path().join("photo.jpg");
+		std::fs::write(dir.path().join("photo.jpg.part"), b"held").unwrap();
+		let (guard, mut file, held) =
+			TmpFileGuard::open_to_resume(&destination, "photo.jpg.part", 10)
+				.await
+				.unwrap();
+		assert_eq!(held, 4);
+		std::io::Write::write_all(&mut file, b" more").unwrap();
+		drop(file);
+		guard.commit(&destination).await.unwrap();
+		assert_eq!(std::fs::read(&destination).unwrap(), b"held more");
+	}
+
+	#[tokio::test]
+	async fn a_resumed_temp_file_longer_than_the_file_starts_over() {
+		let dir = tempfile::tempdir().unwrap();
+		let destination = dir.path().join("photo.jpg");
+		let tmp_path = dir.path().join("photo.jpg.part");
+		std::fs::write(&tmp_path, b"far too long").unwrap();
+		let (_guard, _file, held) = TmpFileGuard::open_to_resume(&destination, "photo.jpg.part", 5)
+			.await
+			.unwrap();
+		assert_eq!(held, 0);
+		assert_eq!(std::fs::metadata(&tmp_path).unwrap().len(), 0);
+	}
+
+	#[tokio::test]
+	async fn a_resumable_temp_file_is_kept_unless_discarded() {
+		let dir = tempfile::tempdir().unwrap();
+		let destination = dir.path().join("photo.jpg");
+		let tmp_path = dir.path().join("photo.jpg.part");
+		{
+			let (_guard, mut file, _) =
+				TmpFileGuard::open_to_resume(&destination, "photo.jpg.part", 10)
+					.await
+					.unwrap();
+			std::io::Write::write_all(&mut file, b"partial").unwrap();
+		}
+		assert_eq!(std::fs::read(&tmp_path).unwrap(), b"partial");
+
+		let (guard, _file, held) = TmpFileGuard::open_to_resume(&destination, "photo.jpg.part", 10)
+			.await
+			.unwrap();
+		assert_eq!(held, 7);
+		guard.discard();
+		assert!(!tmp_path.exists());
+		assert!(!destination.exists());
+	}
+
+	#[test]
+	fn a_file_has_the_hash_of_its_contents_only() {
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().join("photo.jpg");
+		std::fs::write(&path, b"contents").unwrap();
+		let hash: Blake3Hash = blake3::hash(b"contents").into();
+		let other: Blake3Hash = blake3::hash(b"other").into();
+		assert!(has_hash(&path, hash).unwrap());
+		assert!(!has_hash(&path, other).unwrap());
 	}
 
 	#[tokio::test]

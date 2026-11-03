@@ -95,9 +95,9 @@ use filen_sdk_rs::{
 	},
 	io::{
 		CategoryDirDownloadExtPub as _, DirDownloadCallback, DirDownloadOptions, DirUploadCallback,
-		DirUploadOptions, ExistingLocalFile, ExistingRemoteFile, PathMatcher, RemoteDirectory,
-		RemoteFile, SymlinkPolicy, TransferFilter, client_impl::IoSharedClientExt as _,
-		is_safe_descendant,
+		DirUploadOptions, ExistingLocalFile, ExistingRemoteFile, PartialDownload, PathMatcher,
+		RemoteDirectory, RemoteFile, SymlinkPolicy, TransferFilter,
+		client_impl::IoSharedClientExt as _, is_safe_descendant,
 	},
 	sync_engine::PathPatterns,
 	util::MaybeSendCallback,
@@ -260,6 +260,7 @@ impl TransferCommands {
 						ExistingLocalFile::ReplaceUnlessSame
 					},
 					filter: filter.transfer_filter()?,
+					partial: PartialDownload::Discard,
 				};
 				let (sources, destination) = sources_and_destination(source, paths);
 				download(

@@ -25,6 +25,7 @@ pub use crate::fs::{
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 pub use dir_download::{
 	CategoryDirDownloadExtPub, DirDownloadCallback, DirDownloadOptions, ExistingLocalFile,
+	PartialDownload,
 };
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 pub use dir_upload::{DirUploadCallback, DirUploadOptions, ExistingRemoteFile, SymlinkPolicy};

@@ -1,7 +1,10 @@
 use std::{
 	borrow::Cow,
 	ops::Deref,
-	sync::{Arc, atomic::AtomicU64},
+	sync::{
+		Arc,
+		atomic::{AtomicU64, Ordering},
+	},
 };
 
 use crate::{
@@ -59,6 +62,12 @@ where
 	fn on_download_skipped(&self, skipped_files: Vec<(Cat::File, String)>) {
 		self.on_download_update(Vec::new(), skipped_files, 0);
 	}
+	/// Called periodically, before the update that counts the files' downloaded bytes, with how
+	/// many bytes of the files being downloaded earlier downloads had left that
+	/// [`PartialDownload::Resume`] does not download again: those in the whole chunks before the
+	/// one an earlier download stopped in. [`on_download_update`](Self::on_download_update) does
+	/// not count them. Does nothing by default.
+	fn on_download_resumed(&self, _resumed_bytes: u64) {}
 }
 
 /// What a directory download does with a local file already at the path of a file it downloads.
@@ -82,14 +91,48 @@ impl ExistingLocalFile {
 	}
 }
 
+/// What a download does with the bytes of a file it wrote but did not finish, which it writes to
+/// a temp file beside the file's path (named after the file's uuid, with the extension
+/// `filendl`) before renaming it into place.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PartialDownload {
+	/// Remove them: the next download of the file starts over.
+	#[default]
+	Discard,
+	/// Keep them, and continue from where an earlier download of the same file left its temp file.
+	/// A file put together that way is checked against the hash the remote file declares, if any.
+	Resume,
+}
+
 /// How a directory download treats the local directory. The default replaces local files unless
-/// they already hold the remote file.
+/// they already hold the remote file, and removes what it wrote of a file it did not finish.
 #[derive(Clone, Debug, Default)]
 pub struct DirDownloadOptions {
 	/// What to do with a local file already at the path of a file the download writes.
 	pub existing: ExistingLocalFile,
 	/// Which items inside the remote directory to download.
 	pub filter: TransferFilter,
+	/// What to do with the bytes of a file the download did not finish.
+	pub partial: PartialDownload,
+}
+
+/// The bytes a directory download's files added up to since its last progress report.
+#[derive(Default)]
+pub(crate) struct ByteCounts {
+	/// Downloaded.
+	downloaded: AtomicU64,
+	/// Found written by earlier downloads, which [`PartialDownload::Resume`] continues from.
+	resumed: AtomicU64,
+}
+
+impl ByteCounts {
+	/// The counts since the last call, as `(downloaded, resumed)`, starting the next ones at 0.
+	fn take(&self) -> (u64, u64) {
+		(
+			self.downloaded.swap(0, Ordering::Relaxed),
+			self.resumed.swap(0, Ordering::Relaxed),
+		)
+	}
 }
 
 pub(crate) trait CategoryDirDownloadExt: CategoryFSExt {
@@ -97,8 +140,9 @@ pub(crate) trait CategoryDirDownloadExt: CategoryFSExt {
 		client: &Self::Client,
 		remote_file: Self::File,
 		path: CanonicalPath,
-		downloaded_bytes: &AtomicU64,
+		counts: &ByteCounts,
 		keep: KeepLocalWhen,
+		partial: PartialDownload,
 	) -> impl Future<Output = (Result<LocalWrite, Error>, CanonicalPath, Self::File)> + Send {
 		async move {
 			let (res, path) = inner_download_to_path_with_hash_check(
@@ -106,9 +150,13 @@ pub(crate) trait CategoryDirDownloadExt: CategoryFSExt {
 				&remote_file,
 				path,
 				Some(Arc::new(|bytes| {
-					downloaded_bytes.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+					counts.downloaded.fetch_add(bytes, Ordering::Relaxed);
 				})),
 				keep,
+				partial,
+				Some(Arc::new(|bytes| {
+					counts.resumed.fetch_add(bytes, Ordering::Relaxed);
+				})),
 			)
 			.await;
 
@@ -235,8 +283,9 @@ pub(crate) trait CategoryDirDownloadExt: CategoryFSExt {
 			CanonicalPath,
 		)>,
 		entry_complete_sender: tokio::sync::mpsc::Sender<EntryResult<Self>>,
-		downloaded_bytes: Arc<AtomicU64>,
+		counts: Arc<ByteCounts>,
 		keep: KeepLocalWhen,
+		partial: PartialDownload,
 	) -> tokio::task::JoinHandle<()> {
 		tokio::task::spawn(async move {
 			let semaphore = Arc::new(tokio::sync::Semaphore::new(
@@ -248,14 +297,15 @@ pub(crate) trait CategoryDirDownloadExt: CategoryFSExt {
 				let permit = Arc::clone(&semaphore).acquire_owned().await.unwrap();
 				let client = Arc::clone(&client);
 				let entry_complete_sender = entry_complete_sender.clone();
-				let downloaded_bytes = Arc::clone(&downloaded_bytes);
+				let counts = Arc::clone(&counts);
 				join_set.spawn(async move {
 					let (res, _, file) = Self::download_file_to_path_in_dir_download(
 						&client,
 						remote_file,
 						path.clone(),
-						&downloaded_bytes,
+						&counts,
 						keep,
+						partial,
 					)
 					.await;
 
@@ -280,16 +330,19 @@ pub(crate) trait CategoryDirDownloadExt: CategoryFSExt {
 			impl FnMut(Vec<(Error, String, NonRootItemType<'static, Self>)>),
 			impl FnMut(Vec<(Self::Dir, String)>, Vec<(Self::File, String)>, u64),
 			impl FnMut(Vec<(Self::File, String)>),
+			impl FnMut(u64),
 		>,
 		path: String,
 		tree: super::fs_tree::FSTree<Self::Dir, Self::File>,
 		target_folder: DirType<'static, Self>,
 		existing: ExistingLocalFile,
+		partial: PartialDownload,
 	) -> Result<(), Error> {
 		let DownloadCallbacks {
 			errors: error_callback,
 			progress: progress_callback,
 			skipped: skipped_callback,
+			resumed: resumed_callback,
 		} = callbacks;
 		let (entry_complete_sender, mut entry_complete_receiver) =
 			tokio::sync::mpsc::channel::<EntryResult<Self>>(16);
@@ -301,7 +354,7 @@ pub(crate) trait CategoryDirDownloadExt: CategoryFSExt {
 				client.get_unauth_client().state().max_concurrency(),
 			);
 
-		let downloaded_bytes = Arc::new(AtomicU64::new(0));
+		let counts = Arc::new(ByteCounts::default());
 
 		let dir_handle = Self::spawn_folder_maker_task(
 			tree,
@@ -322,8 +375,9 @@ pub(crate) trait CategoryDirDownloadExt: CategoryFSExt {
 			client,
 			file_download_request_receiver,
 			entry_complete_sender,
-			Arc::clone(&downloaded_bytes),
+			Arc::clone(&counts),
 			existing.keep_local_when(),
+			partial,
 		));
 
 		let mut completed_files = Vec::new();
@@ -334,7 +388,10 @@ pub(crate) trait CategoryDirDownloadExt: CategoryFSExt {
 		loop {
 			tokio::select! {
 				_ = update_interval.tick() => {
-					let bytes = downloaded_bytes.swap(0, std::sync::atomic::Ordering::Relaxed);
+					let (bytes, resumed) = counts.take();
+					if resumed != 0 {
+						resumed_callback(resumed);
+					}
 					if !errors.is_empty() {
 						error_callback(std::mem::take(&mut errors));
 					}
@@ -387,7 +444,10 @@ pub(crate) trait CategoryDirDownloadExt: CategoryFSExt {
 		if !skipped_files.is_empty() {
 			skipped_callback(std::mem::take(&mut skipped_files));
 		}
-		let bytes = downloaded_bytes.swap(0, std::sync::atomic::Ordering::Relaxed);
+		let (bytes, resumed) = counts.take();
+		if resumed != 0 {
+			resumed_callback(resumed);
+		}
 		if !completed_dirs.is_empty() || !completed_files.is_empty() || bytes != 0 {
 			progress_callback(
 				std::mem::take(&mut completed_dirs),
@@ -403,13 +463,16 @@ pub(crate) trait CategoryDirDownloadExt: CategoryFSExt {
 impl<T> CategoryDirDownloadExt for T where T: CategoryFSExt {}
 
 /// Where a directory download reports what it did.
-pub(crate) struct DownloadCallbacks<'a, E, P, S> {
+pub(crate) struct DownloadCallbacks<'a, E, P, S, R> {
 	/// The entries that failed.
 	pub(crate) errors: &'a mut E,
 	/// The directories created and files written, and the bytes written since the last call.
 	pub(crate) progress: &'a mut P,
 	/// The files left out for the local file kept at their path.
 	pub(crate) skipped: &'a mut S,
+	/// The bytes of the files earlier downloads had left, which the download continues from, since
+	/// the last call.
+	pub(crate) resumed: &'a mut R,
 }
 
 #[allow(private_bounds)]
@@ -452,7 +515,11 @@ pub trait CategoryDirDownloadExtPub: CategoryDirDownloadExt {
 	{
 		use tracing::Instrument as _;
 
-		let DirDownloadOptions { existing, filter } = options;
+		let DirDownloadOptions {
+			existing,
+			filter,
+			partial,
+		} = options;
 
 		let span = tracing::info_span!("download_dir_recursively", dir_path = %dir_path);
 		async move {
@@ -499,11 +566,15 @@ pub trait CategoryDirDownloadExtPub: CategoryDirDownloadExt {
 					skipped: &mut |skipped_files| {
 						callback_ref.on_download_skipped(skipped_files);
 					},
+					resumed: &mut |resumed_bytes| {
+						callback_ref.on_download_resumed(resumed_bytes);
+					},
 				},
 				dir_path,
 				tree,
 				target,
 				existing,
+				partial,
 			)
 			.await
 		}
@@ -521,7 +592,7 @@ mod tests {
 	use filen_types::fs::{ParentUuid, StableUuid};
 	use uuid::Uuid;
 
-	use super::{CategoryDirDownloadExt, DownloadCallbacks, ExistingLocalFile};
+	use super::{CategoryDirDownloadExt, DownloadCallbacks, ExistingLocalFile, PartialDownload};
 	use crate::{
 		auth::test_support::offline_client,
 		crypto::{file::FileKey, shared::CreateRandom, v3::EncryptionKey},
@@ -590,13 +661,15 @@ mod tests {
 			let files = (1..=FILES).map(|n| file_in(ROOT, n)).collect();
 			let tree = tree_of_files(ROOT, files);
 
-			let (mut on_errors, mut on_progress, mut on_skipped) = (|_| {}, |_, _, _| {}, |_| {});
+			let (mut on_errors, mut on_progress, mut on_skipped, mut on_resumed) =
+				(|_| {}, |_, _, _| {}, |_| {}, |_| {});
 			let mut download = Box::pin(Normal::download_fs_tree_from_target_into_path(
 				Arc::new(offline_client()),
 				DownloadCallbacks {
 					errors: &mut on_errors,
 					progress: &mut on_progress,
 					skipped: &mut on_skipped,
+					resumed: &mut on_resumed,
 				},
 				local
 					.path()
@@ -607,6 +680,7 @@ mod tests {
 				tree,
 				DirType::Dir(Cow::Owned(root)),
 				ExistingLocalFile::ReplaceUnlessSame,
+				PartialDownload::Discard,
 			));
 			// The first poll starts the walker and the downloads; nothing can finish.
 			assert!(futures::poll!(download.as_mut()).is_pending());
