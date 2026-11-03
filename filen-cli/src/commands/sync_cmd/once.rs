@@ -68,6 +68,7 @@ pub(super) async fn sync_once(
 					None => future::pending().await,
 				}
 			} => {
+				log.clear_status();
 				ui.print_muted_to_stderr(
 					"Stopping the sync, letting the passes in flight finish...",
 				);
@@ -80,6 +81,7 @@ pub(super) async fn sync_once(
 	while let Some((pair, message)) = messages_rx.recv().await {
 		print(ui, &mut log, pair, message);
 	}
+	log.clear_status();
 	if stopping.load(Ordering::Relaxed) {
 		return Err(CliError::Interrupted.into());
 	}

@@ -64,7 +64,6 @@ use std::{
 
 use anyhow::{Context as _, Result, anyhow};
 use clap::{Subcommand, ValueEnum};
-use console::{Term, style};
 use filen_sdk_rs::{
 	ErrorKind,
 	auth::Client,
@@ -88,7 +87,7 @@ use crate::{
 	docs::DocElement,
 	error::CliError,
 	interrupt,
-	ui::{self, UI},
+	ui::{self, StderrLine, UI},
 	util::RemotePath,
 };
 
@@ -1169,7 +1168,7 @@ async fn wait_and_stop(
 					}
 				}));
 			}
-			stats = next_stats(&mut ticks, daemon), if status.enabled => match stats {
+			stats = next_stats(&mut ticks, daemon), if status.enabled() => match stats {
 				Ok(stats) => status.show(&status_text(&stats)),
 				// The line keeps what it last showed; the mount or server is not affected.
 				Err(e) => log::warn!("Failed to read Rclone's stats: {e}"),
@@ -1207,39 +1206,31 @@ async fn next_stats(
 /// to a person at a terminal, as an announcement is: not with `--quiet` or `--json`, nor when
 /// stdout or stderr is redirected.
 struct StatusLine {
-	term: Term,
-	enabled: bool,
-	/// Whether the line is on the screen, to be cleared before anything else is printed.
-	shown: bool,
+	line: Option<StderrLine>,
 }
 
 impl StatusLine {
 	fn new(ui: &UI) -> Self {
-		let term = Term::stderr();
-		let enabled = status_line_wanted(ui, term.is_term());
+		let line = StderrLine::on_terminal();
+		let enabled = status_line_wanted(ui, line.is_some());
 		Self {
-			term,
-			enabled,
-			shown: false,
+			line: line.filter(|_| enabled),
 		}
 	}
 
-	/// Redraws the line with `text`, cut to the terminal's width: a line that wrapped onto a
-	/// second row would not be cleared.
+	fn enabled(&self) -> bool {
+		self.line.is_some()
+	}
+
 	fn show(&mut self, text: &str) {
-		let line = ui::truncate_to_width(text, usize::from(self.term.size().1));
-		// A failed write to the terminal leaves the line as it was; there is nowhere to report it.
-		let _ = self.term.clear_line();
-		let _ = self.term.write_str(&style(line).dim().to_string());
-		let _ = self.term.flush();
-		self.shown = true;
+		if let Some(line) = &mut self.line {
+			line.show(text);
+		}
 	}
 
 	fn clear(&mut self) {
-		if self.shown {
-			let _ = self.term.clear_line();
-			let _ = self.term.flush();
-			self.shown = false;
+		if let Some(line) = &mut self.line {
+			line.clear();
 		}
 	}
 }

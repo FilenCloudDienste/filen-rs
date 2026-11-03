@@ -10,7 +10,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use clap::{CommandFactory, builder::Styles};
-use console::{self, style};
+use console::{self, Term, style};
 use filen_sdk_rs::auth::Client;
 use inquire::{
 	Autocomplete, CustomUserError, InquireError,
@@ -1001,6 +1001,42 @@ pub(crate) fn format_date(date: &chrono::DateTime<chrono::Utc>) -> String {
 
 pub(crate) fn format_size(size: u64) -> String {
 	humansize::format_size(size, humansize::BINARY)
+}
+
+/// A dim line at the bottom of the terminal on stderr, redrawn in place, which is cleared before
+/// anything else is printed.
+pub(crate) struct StderrLine {
+	term: Term,
+	/// Whether the line is on the screen, so that it needs clearing before another line is printed.
+	shown: bool,
+}
+
+impl StderrLine {
+	/// The line, when stderr is a terminal to draw it on.
+	pub(crate) fn on_terminal() -> Option<Self> {
+		let term = Term::stderr();
+		term.is_term().then_some(Self { term, shown: false })
+	}
+
+	/// Redraws the line with `text`, cut to the terminal's width: a line that wrapped onto a
+	/// second row would not be cleared.
+	pub(crate) fn show(&mut self, text: &str) {
+		let text = truncate_to_width(text, usize::from(self.term.size().1));
+		// A failed write to the terminal leaves the line as it was; there is nowhere to report it.
+		let _ = self.term.clear_line();
+		let _ = self.term.write_str(&style(text).dim().to_string());
+		let _ = self.term.flush();
+		self.shown = true;
+	}
+
+	/// Clears the line, so that the next line printed starts on a clean row.
+	pub(crate) fn clear(&mut self) {
+		if self.shown {
+			let _ = self.term.clear_line();
+			let _ = self.term.flush();
+			self.shown = false;
+		}
+	}
 }
 
 /// Cut `line` down to `width` display columns. An over-long line would wrap onto a second row,

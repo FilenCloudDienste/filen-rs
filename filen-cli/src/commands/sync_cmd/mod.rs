@@ -21,7 +21,9 @@
 //! `sync` says which sync pairs it starts on, then prints a line for each thing a pass does, with
 //! the time and the sync pair; failures go to stderr. With `--quiet`, it prints only failures, what
 //! needs attention or was settled, and what each pass did. Every line also goes to the log files
-//! (unless `--no-log-file` is given), so a sync nobody watches leaves a record.
+//! (unless `--no-log-file` is given), so a sync nobody watches leaves a record. When stderr is a
+//! terminal, a line at its bottom shows what the running transfers have moved, redrawn in place;
+//! `--quiet` leaves it out.
 //!
 //! Sync pairs stay registered in the sync database under the config directory after the run that
 //! set them up. A run that cannot set up one of its sync pairs registers none of them. Only one
@@ -76,6 +78,7 @@ use std::{
 	collections::{HashMap, HashSet},
 	path::Path,
 	sync::Arc,
+	time::Instant,
 };
 
 use anyhow::{Context, Result};
@@ -83,7 +86,7 @@ use clap::Subcommand;
 use console::style;
 use filen_sdk_rs::sync_engine::{
 	BaselineInUse, ConflictResolution, ConflictResolved, PairId, PairRecord, SyncEngine, SyncEvent,
-	TransferDirection, UnsyncablePath, UnsyncableReason,
+	UnsyncablePath, UnsyncableReason,
 };
 use log::info;
 use tokio::sync::mpsc;
@@ -97,11 +100,15 @@ mod conflict_resolutions;
 mod ignore_file;
 mod once;
 mod outcome;
+mod status_line;
 mod sync_pairs;
+mod transfers;
 
 use conflict_resolutions::ConflictResolutions;
 use outcome::{LastPasses, problems_summary};
+use status_line::StatusLine;
 use sync_pairs::SyncDirs;
+use transfers::Transfers;
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum SyncCommands {
@@ -338,6 +345,7 @@ async fn sync_continuously(
 		}
 	};
 
+	log.clear_status();
 	let _stopping = stopped_by_ctrl_c.then(|| {
 		ui.print_muted_to_stderr("Stopping the sync, letting the passes in flight finish...");
 		ctrl_c.into_stopping(ui)
@@ -351,6 +359,7 @@ async fn sync_continuously(
 		last_passes.note(pair_id, &event);
 		let _ = log.print(ui, pair_id, &event);
 	}
+	log.clear_status();
 
 	if !stopped_by_ctrl_c {
 		return Err(UI::failure("Every watch of the sync pairs ended"));
@@ -382,22 +391,32 @@ struct EventLog<'a> {
 	/// The pairs that have finished a pass. Mass deletion approvals and conflict resolutions are
 	/// only applied on a pair's first pass, where we can be sure they were intentional.
 	passed: HashSet<PairId>,
+	/// What the running transfers have moved, for the status line.
+	transfers: Transfers,
 	output: Output,
 }
 
 /// How the events are shown.
 enum Output {
 	/// A line for each event. With `quiet`, only the lines that must be read: failures, what
-	/// needs attention or was settled, and what each pass did.
-	Text { quiet: bool },
+	/// needs attention or was settled, and what each pass did. A transfer's progress shows on the
+	/// `status` line, when there is one, rather than on a line of its own.
+	Text {
+		quiet: bool,
+		status: Option<StatusLine>,
+	},
 }
 
 impl Output {
 	/// The output `ui`'s flags ask for.
 	fn of(ui: &UI) -> Self {
-		Self::Text {
-			quiet: ui.is_quiet(),
-		}
+		let quiet = ui.is_quiet();
+		let status = if quiet || ui.json {
+			None
+		} else {
+			StatusLine::on_stderr()
+		};
+		Self::Text { quiet, status }
 	}
 }
 
@@ -460,6 +479,7 @@ impl<'a> EventLog<'a> {
 			labels,
 			settle,
 			passed: HashSet::new(),
+			transfers: Transfers::default(),
 			output,
 		}
 	}
@@ -486,7 +506,7 @@ impl<'a> EventLog<'a> {
 		let until = if once { "once" } else { "Ctrl-C to stop" };
 		let banner = format!("Syncing {} ({until})", self.label(pair));
 		info!("{banner}");
-		let Output::Text { quiet } = self.output;
+		let Output::Text { quiet, .. } = &self.output;
 		if !quiet {
 			ui.print(&banner);
 		}
@@ -500,7 +520,12 @@ impl<'a> EventLog<'a> {
 		pair: PairId,
 		event: &'e SyncEvent,
 	) -> Option<Settlement<'e>> {
-		self.print_line(ui, pair, line_kind(event), &format_sync_event(event));
+		self.transfers.note(pair, event);
+		match format_sync_event(event) {
+			Some(line) => self.print_line(ui, pair, line_kind(event), &line),
+			// a transfer's progress shows on the status line
+			None => self.tick(Instant::now()),
+		}
 		if let SyncEvent::PassCompleted { .. } | SyncEvent::PassFailed { .. } = event {
 			self.passed.insert(pair);
 		}
@@ -557,9 +582,12 @@ impl<'a> EventLog<'a> {
 	fn print_line(&mut self, ui: &mut UI, pair: PairId, kind: LineKind, msg: &str) {
 		let label = self.label(pair);
 		info!("[{label}] {}", console::strip_ansi_codes(msg));
-		let Output::Text { quiet } = self.output;
-		if quiet && kind == LineKind::Detail {
+		let Output::Text { quiet, status } = &mut self.output;
+		if *quiet && kind == LineKind::Detail {
 			return;
+		}
+		if let Some(status) = status {
+			status.clear();
 		}
 		let line = format!(
 			"{} {}: {}",
@@ -574,6 +602,9 @@ impl<'a> EventLog<'a> {
 		match kind {
 			LineKind::Detail | LineKind::Kept => ui.print(&line),
 			LineKind::Failure => ui.print_to_stderr(&line),
+		}
+		if let Some(status) = status {
+			status.draw(&self.transfers);
 		}
 	}
 
@@ -597,7 +628,42 @@ impl<'a> EventLog<'a> {
 
 	/// Prints a failure that is not an event's, such as a conflict that could not be resolved.
 	fn print_failure(&mut self, ui: &mut UI, msg: &str) {
+		self.clear_status();
 		ui.print_failure(msg);
+		self.redraw_status();
+	}
+
+	/// Redraws the status line, if there is one, as after a line printed above it.
+	fn redraw_status(&mut self) {
+		if let Output::Text {
+			status: Some(status),
+			..
+		} = &mut self.output
+		{
+			status.draw(&self.transfers);
+		}
+	}
+
+	/// Redraws the status line, if there is one, at most as often as it redraws for progress.
+	fn tick(&mut self, now: Instant) {
+		if let Output::Text {
+			status: Some(status),
+			..
+		} = &mut self.output
+		{
+			status.tick(&self.transfers, now);
+		}
+	}
+
+	/// Clears the status line, if there is one, for what is printed next.
+	fn clear_status(&mut self) {
+		if let Output::Text {
+			status: Some(status),
+			..
+		} = &mut self.output
+		{
+			status.clear();
+		}
 	}
 }
 
@@ -681,8 +747,9 @@ fn unsyncable_notices(unsyncable: &[UnsyncablePath]) -> Vec<String> {
 		.collect()
 }
 
-fn format_sync_event(event: &SyncEvent) -> String {
-	match event {
+/// The line of `event`, or `None` for a transfer's progress, which has none.
+fn format_sync_event(event: &SyncEvent) -> Option<String> {
+	Some(match event {
 		SyncEvent::PassStarted { .. } => "Sync pass started".to_string(),
 		SyncEvent::Refused { reason } => format!("Sync pass refused: {reason}"),
 		SyncEvent::Planned { actions } => format!("Planned {actions} action(s)"),
@@ -697,19 +764,7 @@ fn format_sync_event(event: &SyncEvent) -> String {
 		// A transfer runs alongside others and reports its event once it has landed.
 		SyncEvent::Uploading { rel_path } => format!("Uploaded {rel_path}"),
 		SyncEvent::Downloading { rel_path } => format!("Downloaded {rel_path}"),
-		SyncEvent::Progress {
-			rel_path,
-			direction,
-			bytes,
-			total,
-		} => {
-			let verb = match direction {
-				TransferDirection::Upload => "Uploading",
-				TransferDirection::Download => "Downloading",
-			};
-			let percent = (bytes * 100).checked_div(*total).unwrap_or(100);
-			format!("{verb} {rel_path}: {percent}% ({bytes}/{total} bytes)")
-		}
+		SyncEvent::Progress { .. } => return None,
 		// The other actions report their event before they run, so an `ActionFailed` can follow; the
 		// pass's summary counts what was done.
 		SyncEvent::CreatingRemoteDir { rel_path } => {
@@ -760,7 +815,7 @@ fn format_sync_event(event: &SyncEvent) -> String {
 			progress.bytes_hashed,
 			progress.bytes_to_hash,
 		),
-	}
+	})
 }
 
 #[cfg(test)]
@@ -769,7 +824,10 @@ mod tests {
 
 	use filen_sdk_rs::{
 		Error, ErrorKind,
-		sync_engine::{BaselineInUse, SyncMode, SyncReport, UnsyncablePath, UnsyncableReason},
+		sync_engine::{
+			BaselineInUse, SyncMode, SyncReport, TransferDirection, UnsyncablePath,
+			UnsyncableReason,
+		},
 	};
 
 	use super::{
@@ -880,14 +938,16 @@ mod tests {
 		assert_eq!(
 			format_sync_event(&SyncEvent::Uploading {
 				rel_path: "a.txt".to_string()
-			}),
-			"Uploaded a.txt"
+			})
+			.as_deref(),
+			Some("Uploaded a.txt")
 		);
 		assert_eq!(
 			format_sync_event(&SyncEvent::Downloading {
 				rel_path: "b.txt".to_string()
-			}),
-			"Downloaded b.txt"
+			})
+			.as_deref(),
+			Some("Downloaded b.txt")
 		);
 	}
 
@@ -909,7 +969,7 @@ mod tests {
 				to: "e".to_string(),
 			},
 		]
-		.map(|event| format_sync_event(&event));
+		.map(|event| format_sync_event(&event).unwrap());
 
 		assert_eq!(
 			lines,
@@ -973,7 +1033,13 @@ mod tests {
 
 	#[test]
 	fn every_event_has_a_line_and_failures_go_to_stderr() {
-		let (out, err) = printed(Output::Text { quiet: false }, &a_pass());
+		let (out, err) = printed(
+			Output::Text {
+				quiet: false,
+				status: None,
+			},
+			&a_pass(),
+		);
 
 		assert_eq!(
 			out,
@@ -993,7 +1059,13 @@ mod tests {
 
 	#[test]
 	fn quiet_keeps_what_needs_attention_failures_and_the_pass_summary() {
-		let (out, err) = printed(Output::Text { quiet: true }, &a_pass());
+		let (out, err) = printed(
+			Output::Text {
+				quiet: true,
+				status: None,
+			},
+			&a_pass(),
+		);
 
 		assert_eq!(
 			out,
@@ -1008,6 +1080,25 @@ mod tests {
 		assert_eq!(err, ["[L]: Failed to sync b: denied"]);
 	}
 
+	/// Without a terminal for the status line, a transfer's progress is not printed.
+	#[test]
+	fn progress_has_no_line() {
+		let (out, err) = printed(
+			Output::Text {
+				quiet: false,
+				status: None,
+			},
+			&[SyncEvent::Progress {
+				rel_path: "a".to_string(),
+				direction: TransferDirection::Upload,
+				bytes: 1,
+				total: 2,
+			}],
+		);
+
+		assert_eq!((out, err), (Vec::<String>::new(), Vec::<String>::new()));
+	}
+
 	#[test]
 	fn a_banner_names_each_pair_and_how_long_it_syncs() {
 		let out = Printed::default();
@@ -1017,11 +1108,25 @@ mod tests {
 			approve_mass_deletions: false,
 			conflict_resolutions: ConflictResolutions::new(vec![], vec![], vec![]).unwrap(),
 		};
-		let log = EventLog::new(&labels, &settle, Output::Text { quiet: false });
+		let log = EventLog::new(
+			&labels,
+			&settle,
+			Output::Text {
+				quiet: false,
+				status: None,
+			},
+		);
 
 		log.print_banner(&mut ui, 1, true);
 		log.print_banner(&mut ui, 1, false);
-		let quiet = EventLog::new(&labels, &settle, Output::Text { quiet: true });
+		let quiet = EventLog::new(
+			&labels,
+			&settle,
+			Output::Text {
+				quiet: true,
+				status: None,
+			},
+		);
 		quiet.print_banner(&mut ui, 1, false);
 
 		assert_eq!(out.lines(), "Syncing L (once)\nSyncing L (Ctrl-C to stop)");
