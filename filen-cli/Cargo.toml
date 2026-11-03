@@ -81,6 +81,8 @@ futures = "0.3.34"
 
 [dev-dependencies]
 test-utils = { path = "../test-utils", features = ["cli"] }
+# the tests put directories whose names cannot be decrypted on the server
+filen-sdk-rs = { path = "../filen-sdk-rs", features = ["malformed"] }
 assert_cmd = "2.1.1"
 assert_fs = "1.1.3"
 dotenv = "0.15.0"

@@ -101,7 +101,9 @@ pub(crate) async fn resolve_item<'a>(
 }
 
 /// `found`, or `None` if the server found no such file or directory.
-fn optional<T>(found: Result<T, filen_sdk_rs::Error>) -> Result<Option<T>, filen_sdk_rs::Error> {
+pub(crate) fn optional<T>(
+	found: Result<T, filen_sdk_rs::Error>,
+) -> Result<Option<T>, filen_sdk_rs::Error> {
 	// called by its path: in scope, its `context` would clash with anyhow's
 	filen_sdk_rs::error::ResultExt::optional(found)
 }
@@ -205,18 +207,51 @@ fn found_path(
 	}
 }
 
-/// The path `operand` names: its own, or that of the item with its UUID, which must exist.
-pub(crate) async fn operand_path(
+/// The UUIDs of the directories from the root directory down to the one `item` (which `operand`
+/// names) is: a directory itself, or a file's parent directory. They are found by walking up the
+/// parent directories by their UUIDs, so this works for an item without a path too.
+pub(crate) async fn directory_chain(
 	client: &Client,
 	operand: &ItemOperand,
-	what: &str,
-) -> Result<RemotePath> {
-	match operand {
-		ItemOperand::Path(path) => Ok(path.clone()),
-		ItemOperand::Uuid(_) => {
-			let item = resolve_item(client, operand, what).await?;
-			path_of(client, operand, &item).await
+	item: &NonRootFileType<'_, Normal>,
+) -> Result<Vec<Uuid>> {
+	let root = client.root().uuid();
+	let (mut chain, mut parent) = match item {
+		NonRootFileType::Root(_) => return Ok(vec![root]),
+		NonRootFileType::Dir(dir) => (vec![dir.uuid()], *dir.parent()),
+		NonRootFileType::File(file) => (Vec::new(), *file.parent()),
+	};
+	loop {
+		let uuid = match parent {
+			ParentUuid::Uuid(uuid) => uuid,
+			ParentUuid::Trash(_) => {
+				return Err(UI::failure(&format!(
+					"{} is in a directory in the trash",
+					operand
+				)));
+			}
+			ParentUuid::Recents | ParentUuid::Favorites | ParentUuid::Links => {
+				return Err(UI::failure(&format!("No directory holds {}", operand)));
+			}
+		};
+		if uuid == root {
+			chain.push(root);
+			chain.reverse();
+			return Ok(chain);
 		}
+		// the parents come from the server: a chain that loops must not walk on forever
+		if chain.contains(&uuid) {
+			return Err(UI::failure(&format!(
+				"The directories above {} form a loop at {}",
+				operand, uuid
+			)));
+		}
+		chain.push(uuid);
+		parent = *client
+			.get_dir(uuid)
+			.await
+			.with_context(|| format!("Failed to find a directory above {}", operand))?
+			.parent();
 	}
 }
 

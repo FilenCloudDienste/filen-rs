@@ -12,11 +12,11 @@
 //! `uuid:<UUID>` names the item with that UUID wherever it is, as `stat` and `ls -l --json` show
 //! it: `stat uuid:<UUID>`. It is the only way to name an item whose name cannot be decrypted,
 //! which listings show by its UUID in place of its name, and of an item below such a directory,
-//! which no path leads to. Messages show an item without a path by its UUID. `cd`, `edit`,
-//! `view` and the destination of `mv` and `cp` need a path, and refuse such an item; `mv`, `cp`,
-//! `write` and `touch` need the name of the item itself. An item in the trash is named this way
-//! in `trash-restore` and `trash-delete` only. Write a name that starts with `uuid:` as
-//! `./uuid:...`.
+//! which no path leads to. Messages show an item without a path by its UUID, and an item put in a
+//! directory without a path as `<name> in uuid:<UUID>`. Only `cd` needs a path, and refuses such
+//! a directory; `mv`, `cp`, `edit`, `write` and `touch` need the name of the item itself. An item
+//! in the trash is named this way in `trash-restore` and `trash-delete` only. Write a name that
+//! starts with `uuid:` as `./uuid:...`.
 //!
 //! `rm`, `mv`, `cp`, `cat`, `favorite` and `unfavorite` take several items, and a glob in the last
 //! segment of a path: `*` matches any run of characters, `?` any one character and `[...]` one of
@@ -120,8 +120,8 @@ mod tree;
 mod versions;
 
 use operand::{
-	Given, GivenItem, ItemOperand, expand_all, operand_path, parse_operands, path_of, resolve_item,
-	shown_as,
+	Given, GivenItem, ItemOperand, directory_chain, expand_all, optional, parse_operands, path_of,
+	resolve_item, shown_as,
 };
 
 #[derive(Debug, Subcommand)]
@@ -1510,13 +1510,7 @@ pub(crate) async fn edit_file(
 	}
 	let client = client.get(ui).await?;
 	let file = find_file(client, &operand).await?;
-	// the upload looks the file up again by its path, where a new version of it would be
-	let path = path_of(
-		client,
-		&operand,
-		&NonRootFileType::File(Cow::Borrowed(&*file)),
-	)
-	.await?;
+	let target = EditedFile::of(client, &operand, &file).await?;
 	let downloaded = RemoteVersion::of(&file);
 	let created = file.created();
 	let copy = LocalCopy::download(client, &file).await?;
@@ -1533,15 +1527,15 @@ pub(crate) async fn edit_file(
 		// only a Ctrl-C from now on stops the upload, not one pressed in the editor
 		let mut ctrl_c = interrupt::own();
 		select! {
-			uploaded = upload_edit(client, &path, downloaded, created, &local) => uploaded?,
+			uploaded = upload_edit(client, &target, downloaded, created, &local) => uploaded?,
 			() = ctrl_c.pressed() => return Err(CliError::Interrupted.into()),
 		}
 		Ok(true)
 	}
 	.await;
 	match edited {
-		Ok(true) => ui.print_success(&format!("Uploaded your changes to {}", path)),
-		Ok(false) => ui.print_success(&format!("No changes to {}", path)),
+		Ok(true) => ui.print_success(&format!("Uploaded your changes to {}", target)),
+		Ok(false) => ui.print_success(&format!("No changes to {}", target)),
 		Err(e) => {
 			// whatever failed, the changes are not lost
 			if matches!(same_file_content(original.path(), &local).await, Ok(true)) {
@@ -1637,41 +1631,128 @@ fn same_content(a: impl io::Read, b: impl io::Read) -> io::Result<bool> {
 	}
 }
 
-/// Uploads the edited file at `local` as a new version of the file at `path`, if that is still the
-/// file downloaded as `downloaded`. The check and the upload hold the drive lock, so that nothing
-/// changes the file in between.
+/// Where the file being edited is looked up again before the changes are uploaded, as a new
+/// version of whatever file is there.
+enum EditedFile {
+	/// At its path.
+	AtPath(RemotePath),
+	/// Under its name in its directory, for a file named by its UUID that has no path.
+	InDirectory {
+		parent: Uuid,
+		name: String,
+		operand: ItemOperand,
+	},
+}
+
+impl EditedFile {
+	/// Where `file`, which `operand` names, is looked up again: at its path, or, if it has none,
+	/// under its own name in its directory, which needs a name that can be decrypted.
+	async fn of(client: &Client, operand: &ItemOperand, file: &RemoteFile) -> Result<Self> {
+		let item = NonRootFileType::File(Cow::Borrowed(file));
+		let operand = match shown_as(client, operand, &item).await? {
+			ItemOperand::Path(path) => return Ok(Self::AtPath(path)),
+			operand @ ItemOperand::Uuid(_) => operand,
+		};
+		let Some(name) = file.name().map(str::to_owned) else {
+			return Err(UI::failure(&format!(
+				"Cannot edit {}, as its name cannot be decrypted",
+				operand
+			)));
+		};
+		// a file that is neither trashed nor an earlier version is in a directory
+		let ParentUuid::Uuid(parent) = *file.parent() else {
+			return Err(UI::failure(&format!("No directory holds {}", operand)));
+		};
+		Ok(Self::InDirectory {
+			parent,
+			name,
+			operand,
+		})
+	}
+
+	/// The name the file is uploaded under.
+	fn name(&self) -> Result<&str> {
+		match self {
+			Self::AtPath(path) => path
+				.basename()
+				.ok_or_else(|| UI::failure(&format!("Not a file: {}", path))),
+			Self::InDirectory { name, .. } => Ok(name),
+		}
+	}
+
+	/// The file there now and its parent directory's UUID, if there is one.
+	async fn current(&self, client: &Client) -> Result<Option<(Uuid, RemoteVersion)>> {
+		match self {
+			Self::AtPath(path) => match client.get_items_in_path(&path.0).await {
+				Ok((dirs, ObjectOrRemainingPath::Object(NonRootFileType::File(file)))) => Ok(dirs
+					.last()
+					.map(|parent| (parent.uuid(), RemoteVersion::of(&file)))),
+				Ok(_) => Ok(None),
+				// a file is where a directory on the path was
+				Err((e, _, _)) if e.kind() == ErrorKind::InvalidType => Ok(None),
+				Err((e, _, _)) => Err(e).context("Failed to find file"),
+			},
+			Self::InDirectory { parent, name, .. } => {
+				let Some(dir) = optional(client.get_dir(*parent).await)
+					.context("Failed to find the file's directory")?
+				else {
+					return Ok(None);
+				};
+				// a directory moved to the trash no longer holds the file, and the server reports
+				// every directory in a trashed one as trashed too
+				if !matches!(dir.parent(), ParentUuid::Uuid(_)) {
+					return Ok(None);
+				}
+				let (_, files) = client
+					.list_dir::<_, Normal>(
+						&DirType::Dir(Cow::Owned(dir)),
+						None::<&fn(u64, Option<u64>)>,
+					)
+					.await
+					.context("Failed to list the file's directory")?;
+				Ok(files
+					.iter()
+					.find(|file| file.name() == Some(name.as_str()))
+					.map(|file| (*parent, RemoteVersion::of(file))))
+			}
+		}
+	}
+}
+
+impl fmt::Display for EditedFile {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		match self {
+			Self::AtPath(path) => write!(f, "{}", path),
+			Self::InDirectory { operand, .. } => write!(f, "{}", operand),
+		}
+	}
+}
+
+/// Uploads the edited file at `local` as a new version of the file `target` finds, if that is
+/// still the file downloaded as `downloaded`. The check and the upload hold the drive lock, so
+/// that nothing changes the file in between.
 async fn upload_edit(
 	client: &Client,
-	path: &RemotePath,
+	target: &EditedFile,
 	downloaded: RemoteVersion,
 	created: Option<DateTime<Utc>>,
 	local: &Path,
 ) -> Result<()> {
-	let Some(name) = path.basename() else {
-		return Err(UI::failure(&format!("Not a file: {}", path)));
-	};
+	let name = target.name()?;
 	let _lock = client.lock_drive().await.context("Failed to lock drive")?;
-	let current = match client.get_items_in_path(&path.0).await {
-		Ok((dirs, ObjectOrRemainingPath::Object(NonRootFileType::File(file)))) => dirs
-			.last()
-			.map(|parent| (parent.uuid(), RemoteVersion::of(&file))),
-		Ok(_) => None,
-		// a file is where a directory on the path was
-		Err((e, _, _)) if e.kind() == ErrorKind::InvalidType => None,
-		Err((e, _, _)) => return Err(e).context("Failed to find file"),
-	};
+	let current = target.current(client).await?;
 	let parent = match edit_upload(downloaded, current) {
 		EditUpload::Upload { parent } => parent,
 		EditUpload::Gone => {
 			return Err(UI::failure(&format!(
 				"{} was moved or deleted while you edited it",
-				path
+				target
 			)));
 		}
 		EditUpload::Changed => {
 			return Err(UI::failure(&format!(
 				"{} changed in the drive while you edited it",
-				path
+				target
 			)));
 		}
 	};
@@ -1705,17 +1786,9 @@ fn web_drive_url(chain: impl IntoIterator<Item = Uuid>) -> String {
 		})
 }
 
-/// Prints the web drive's URL of a directory, or of a file's directory, and opens it in the
-/// browser if `open_browser`. A browser that fails to open is only warned about: the URL is
-/// printed.
-pub(crate) async fn view_in_web_drive(
-	ui: &mut UI,
-	client: &mut LazyClient,
-	operand: &ItemOperand,
-	open_browser: bool,
-) -> Result<()> {
-	let client = client.get(ui).await?;
-	let path = &operand_path(client, operand, "file or directory").await?;
+/// The UUIDs of the directories from the root directory down to the one at `path`, or to the
+/// directory of the file there, as the lookup of the path finds them.
+async fn directory_chain_at(client: &Client, path: &RemotePath) -> Result<Vec<Uuid>> {
 	let no_such_item = || UI::failure(&format!("No such file or directory: {}", path));
 	let (dirs, item) = match client.get_items_in_path(&path.0).await {
 		Ok(found) => found,
@@ -1731,6 +1804,28 @@ pub(crate) async fn view_in_web_drive(
 		ObjectOrRemainingPath::Object(NonRootFileType::Dir(dir)) => chain.push(dir.uuid()),
 		ObjectOrRemainingPath::Object(NonRootFileType::Root(root)) => chain.push(root.uuid()),
 	}
+	Ok(chain)
+}
+
+/// Prints the web drive's URL of a directory, or of a file's directory, and opens it in the
+/// browser if `open_browser`. A browser that fails to open is only warned about: the URL is
+/// printed.
+pub(crate) async fn view_in_web_drive(
+	ui: &mut UI,
+	client: &mut LazyClient,
+	operand: &ItemOperand,
+	open_browser: bool,
+) -> Result<()> {
+	let client = client.get(ui).await?;
+	let chain = match operand {
+		ItemOperand::Path(path) => directory_chain_at(client, path).await?,
+		// Walked up by UUID, as an item named by it may have no path: one request per directory
+		// above it, as many as finding its path would take.
+		ItemOperand::Uuid(_) => {
+			let item = resolve_item(client, operand, "file or directory").await?;
+			directory_chain(client, operand, &item).await?
+		}
+	};
 	let url = web_drive_url(chain);
 	if ui.json {
 		ui.print_json(json!({ "url": url }))?;
@@ -2179,26 +2274,27 @@ async fn move_item(
 		operand: source_operand,
 		item: source,
 	}: GivenItem<'_>,
-	destination: &DestinationPath,
+	destination: &GivenDestination,
 ) -> Result<()> {
-	let source_filename = match &source {
-		NonRootFileType::File(file) => file.name(),
-		NonRootFileType::Dir(dir) => dir.name(),
+	let (source_filename, source_parent) = match &source {
+		NonRootFileType::File(file) => (file.name(), *file.parent()),
+		NonRootFileType::Dir(dir) => (dir.name(), *dir.parent()),
 		NonRootFileType::Root(_) => return Err(UI::failure("Cannot move root directory")),
-	}
-	.context("Failed to decrypt source name")?;
+	};
+	let source_filename = source_filename.context("Failed to decrypt source name")?;
 	let source_shown = shown_as(client, &source_operand, &source).await?;
 	let Destination {
 		dir: destination_dir,
 		name: new_name,
-		path: new_path,
+		dir_shown,
 	} = resolve_destination(
 		client,
 		Placement::Move,
 		&Source {
-			path: source_shown.path(),
+			shown: &source_shown,
 			name: source_filename,
 			uuid: source.uuid(),
+			parent: source_parent,
 		},
 		destination,
 	)
@@ -2248,7 +2344,11 @@ async fn move_item(
 		}
 		NonRootFileType::Root(_) => return Err(UI::failure("Cannot move root directory")),
 	}
-	ui.print_success(&format!("Moved {} to {}", source_shown, new_path));
+	ui.print_success(&format!(
+		"Moved {} to {}",
+		source_shown,
+		dir_shown.child(&new_name)
+	));
 	Ok(())
 }
 
@@ -2276,10 +2376,18 @@ impl Placement {
 
 /// The item a `mv` or `cp` puts somewhere.
 struct Source<'a> {
-	/// Its path, which an item named by its UUID lacks when a name above it cannot be decrypted.
-	path: Option<&'a RemotePath>,
+	/// How messages show it: by its path, or, for an item named by its UUID that has none (as a
+	/// name above it cannot be decrypted), by its UUID.
+	shown: &'a ItemOperand,
 	name: &'a str,
 	uuid: Uuid,
+	parent: ParentUuid,
+}
+
+impl Source<'_> {
+	fn path(&self) -> Option<&RemotePath> {
+		self.shown.path()
+	}
 }
 
 /// Where a `mv` or `cp` puts its source.
@@ -2288,8 +2396,26 @@ struct Destination<'a> {
 	dir: DirType<'a, Normal>,
 	/// The name the source ends up under.
 	name: String,
-	/// The path the source ends up at.
-	path: RemotePath,
+	/// How messages show that directory.
+	dir_shown: ShownDirectory,
+}
+
+/// How messages show the directory a `mv` or `cp` puts its source in.
+enum ShownDirectory {
+	/// By its path.
+	Path(RemotePath),
+	/// By its UUID, for a directory that has no path.
+	Uuid(ItemOperand),
+}
+
+impl ShownDirectory {
+	/// How messages show the item named `name` in the directory.
+	fn child(&self, name: &str) -> String {
+		match self {
+			Self::Path(path) => path.navigate(name).to_string(),
+			Self::Uuid(dir) => format!("{} in {}", name, dir),
+		}
+	}
 }
 
 /// What a destination path names, as looked up on the drive.
@@ -2378,7 +2504,7 @@ fn target_of(
 	};
 	// A source without a path lies below a directory whose name cannot be decrypted, so no path
 	// leads to it or into it: it is neither at nor above the destination, which has a path.
-	let Some(source_path) = source.path else {
+	let Some(source_path) = source.path() else {
 		return Ok(target);
 	};
 	if placement == Placement::Move && target.path() == source_path {
@@ -2407,6 +2533,20 @@ fn is_inside(path: &RemotePath, ancestor: &RemotePath) -> bool {
 }
 
 /// The destination a `mv` or `cp` was given.
+enum GivenDestination {
+	/// A path, or a directory named by its UUID that has a path.
+	Path(DestinationPath),
+	/// A directory named by its UUID that has no path, as a name above it cannot be decrypted.
+	Pathless {
+		dir: RemoteDirectory,
+		/// How messages show it.
+		operand: ItemOperand,
+		/// The UUIDs of the directories from the root directory down to it, itself included.
+		chain: Vec<Uuid>,
+	},
+}
+
+/// The destination path a `mv` or `cp` was given.
 struct DestinationPath {
 	path: RemotePath,
 	/// The destination must be an existing directory to put the sources into, as one written with
@@ -2421,17 +2561,35 @@ async fn destination_path(
 	working_path: &RemotePath,
 	destination_str: &str,
 	sources: usize,
-) -> Result<DestinationPath> {
+) -> Result<GivenDestination> {
 	let destination = match ItemOperand::parse(working_path, destination_str)? {
 		// before navigating, which drops the trailing '/'
 		ItemOperand::Path(path) => DestinationPath {
 			path,
 			must_be_a_directory: names_a_directory(destination_str) || sources > 1,
 		},
-		operand => DestinationPath {
-			path: operand_path(client, &operand, "destination directory").await?,
-			must_be_a_directory: true,
-		},
+		operand => {
+			let item = resolve_item(client, &operand, "destination directory").await?;
+			match (shown_as(client, &operand, &item).await?, item) {
+				(ItemOperand::Path(path), _) => DestinationPath {
+					path,
+					must_be_a_directory: true,
+				},
+				(operand, NonRootFileType::Dir(dir)) => {
+					let item = NonRootFileType::Dir(Cow::Borrowed(dir.as_ref()));
+					let chain = directory_chain(client, &operand, &item).await?;
+					return Ok(GivenDestination::Pathless {
+						dir: dir.into_owned(),
+						operand,
+						chain,
+					});
+				}
+				(operand, NonRootFileType::File(_) | NonRootFileType::Root(_)) => {
+					// the root directory always has a path
+					return Err(UI::failure(&format!("Not a directory: {}", operand)));
+				}
+			}
+		}
 	};
 	if sources > 1 {
 		match client
@@ -2454,7 +2612,7 @@ async fn destination_path(
 			}
 		}
 	}
-	Ok(destination)
+	Ok(GivenDestination::Path(destination))
 }
 
 /// Resolves the `destination_path` of a `mv` or `cp` into the directory the source ends up
@@ -2470,11 +2628,90 @@ async fn resolve_destination<'a>(
 	client: &'a Client,
 	placement: Placement,
 	source: &Source<'_>,
+	destination: &'a GivenDestination,
+) -> Result<Destination<'a>> {
+	let (dir, dir_shown, name) = match destination {
+		GivenDestination::Path(destination) => {
+			resolve_destination_path(client, placement, source, destination).await?
+		}
+		GivenDestination::Pathless {
+			dir,
+			operand,
+			chain,
+		} => {
+			check_pathless_destination(placement, source, dir.uuid(), operand, chain)?;
+			(
+				DirType::Dir(Cow::Borrowed(dir)),
+				ShownDirectory::Uuid(operand.clone()),
+				source.name.to_owned(),
+			)
+		}
+	};
+
+	// A same-name upload would replace the existing file (as a new version) and creating a
+	// same-name directory returns the existing one, so a copy would merge into it.
+	let (existing_dirs, existing_files) = client
+		.list_dir::<_, Normal>(&dir, None::<&fn(u64, Option<u64>)>)
+		.await
+		.context("Failed to list destination directory")?;
+	let existing_names = existing_dirs
+		.iter()
+		.map(|dir| (dir.uuid(), dir.name()))
+		.chain(existing_files.iter().map(|file| (file.uuid(), file.name())))
+		// a moved item does not clash with itself
+		.filter(|(uuid, _)| placement == Placement::Copy || *uuid != source.uuid)
+		.filter_map(|(_, name)| name);
+	if let Some(existing_name) = clashing_name(existing_names, &name) {
+		return Err(UI::failure(&format!(
+			"Destination already exists: {}",
+			dir_shown.child(existing_name)
+		)));
+	}
+	Ok(Destination {
+		dir,
+		name,
+		dir_shown,
+	})
+}
+
+/// Refuses to put `source` into the directory with the UUID `dir`, shown as `shown`, which has no
+/// path, where the source would end up inside itself, or, for a move, where it already is. `chain`
+/// holds the UUIDs of the directories from the root directory down to `dir`.
+fn check_pathless_destination(
+	placement: Placement,
+	source: &Source<'_>,
+	dir: Uuid,
+	shown: &ItemOperand,
+	chain: &[Uuid],
+) -> Result<()> {
+	if chain.contains(&source.uuid) {
+		return Err(UI::failure(&format!(
+			"Cannot {} {} into itself: {}",
+			placement.verb(),
+			source.shown,
+			shown
+		)));
+	}
+	if placement == Placement::Move && source.parent == ParentUuid::Uuid(dir) {
+		return Err(UI::failure(&format!(
+			"{} is already in {}",
+			source.shown, shown
+		)));
+	}
+	Ok(())
+}
+
+/// Finds the directory a destination path puts the source in, how messages show it, and the
+/// name the source ends up under there.
+async fn resolve_destination_path<'a>(
+	client: &'a Client,
+	placement: Placement,
+	source: &Source<'_>,
 	DestinationPath {
 		path: destination_path,
 		must_be_a_directory,
 	}: &DestinationPath,
-) -> Result<Destination<'a>> {
+) -> Result<(DirType<'a, Normal>, ShownDirectory, String)> {
 	let found_item = client
 		.find_item_at_path(&destination_path.0)
 		.await
@@ -2515,31 +2752,11 @@ async fn resolve_destination<'a>(
 			}
 		},
 	};
-	let (dir_path, name, path) = match target {
-		Target::Into { dir, path } => (dir, source.name.to_owned(), path),
-		Target::At { parent, name, path } => (parent, name, path),
+	let (dir_path, name) = match target {
+		Target::Into { dir, .. } => (dir, source.name.to_owned()),
+		Target::At { parent, name, .. } => (parent, name),
 	};
-
-	// A same-name upload would replace the existing file (as a new version) and creating a
-	// same-name directory returns the existing one, so a copy would merge into it.
-	let (existing_dirs, existing_files) = client
-		.list_dir::<_, Normal>(&dir, None::<&fn(u64, Option<u64>)>)
-		.await
-		.context("Failed to list destination directory")?;
-	let existing_names = existing_dirs
-		.iter()
-		.map(|dir| (dir.uuid(), dir.name()))
-		.chain(existing_files.iter().map(|file| (file.uuid(), file.name())))
-		// a moved item does not clash with itself
-		.filter(|(uuid, _)| placement == Placement::Copy || *uuid != source.uuid)
-		.filter_map(|(_, name)| name);
-	if let Some(existing_name) = clashing_name(existing_names, &name) {
-		return Err(UI::failure(&format!(
-			"Destination already exists: {}",
-			dir_path.navigate(existing_name)
-		)));
-	}
-	Ok(Destination { dir, name, path })
+	Ok((dir, ShownDirectory::Path(dir_path), name))
 }
 
 /// Copies files or directories, following the semantics of the Unix `cp`: if the destination is
@@ -2579,22 +2796,23 @@ async fn copy_item(
 		operand: source_operand,
 		item: source,
 	}: GivenItem<'_>,
-	destination: &DestinationPath,
+	destination: &GivenDestination,
 ) -> Result<()> {
-	let source_name = match &source {
-		NonRootFileType::File(file) => file.name(),
-		NonRootFileType::Dir(dir) => dir.name(),
+	let (source_name, source_parent) = match &source {
+		NonRootFileType::File(file) => (file.name(), *file.parent()),
+		NonRootFileType::Dir(dir) => (dir.name(), *dir.parent()),
 		NonRootFileType::Root(_) => return Err(UI::failure("Cannot copy root directory")),
-	}
-	.context("Failed to decrypt source name")?;
+	};
+	let source_name = source_name.context("Failed to decrypt source name")?;
 	let source_shown = shown_as(client, &source_operand, &source).await?;
 	let destination = resolve_destination(
 		client,
 		Placement::Copy,
 		&Source {
-			path: source_shown.path(),
+			shown: &source_shown,
 			name: source_name,
 			uuid: source.uuid(),
+			parent: source_parent,
 		},
 		destination,
 	)
@@ -2608,7 +2826,6 @@ async fn copy_item(
 				.map_err(|e| UI::failure(&format!("Invalid destination name: {}", e)))?,
 		)
 	};
-	let destination_dir_path = destination.path.parent();
 	let source = match source {
 		NonRootFileType::File(file) => ItemSource::File(file.into_owned().into()),
 		NonRootFileType::Dir(dir) => ItemSource::Dir(ItemSourceDir::Normal(dir.into_owned())),
@@ -2623,7 +2840,7 @@ async fn copy_item(
 		name,
 	};
 	let result = run_copy(ui, client, request, config).await;
-	finish_copy(ui, &source_shown, &destination_dir_path, result)
+	finish_copy(ui, &source_shown, &destination.dir_shown, result)
 }
 
 /// Runs a copy, drawing its progress, until it ends or Ctrl-C cancels it. A cancelled copy stops
@@ -2684,7 +2901,7 @@ const MAX_PRINTED_COPY_PROBLEMS: usize = 10;
 fn finish_copy(
 	ui: &mut UI,
 	source: &ItemOperand,
-	destination_dir_path: &RemotePath,
+	destination_dir: &ShownDirectory,
 	result: Result<CopyReport, CopyFailed>,
 ) -> Result<()> {
 	let report = match &result {
@@ -2696,7 +2913,7 @@ fn finish_copy(
 		.top_level
 		.first()
 		.and_then(|copied| copied.item.name())
-		.map(|name| destination_dir_path.navigate(name));
+		.map(|name| destination_dir.child(name));
 	let report = match result {
 		Ok(report) => report,
 		Err(failed) => {
@@ -3728,21 +3945,22 @@ mod tests {
 		assert!(!names_a_directory(""));
 	}
 
-	fn source(path: &RemotePath) -> Source<'_> {
+	fn source(shown: &ItemOperand) -> Source<'_> {
 		Source {
-			path: Some(path),
-			name: path.basename().unwrap(),
+			shown,
+			name: shown
+				.path()
+				.and_then(RemotePath::basename)
+				.unwrap_or("x.txt"),
 			uuid: Uuid::from_u128(1),
+			parent: ParentUuid::Uuid(Uuid::from_u128(2)),
 		}
 	}
 
 	#[test]
 	fn a_source_without_a_path_goes_where_the_destination_says() {
-		let source = Source {
-			path: None,
-			name: "x.txt",
-			uuid: Uuid::from_u128(1),
-		};
+		let shown = ItemOperand::Uuid(Uuid::from_u128(1));
+		let source = source(&shown);
 
 		assert_eq!(
 			target_of(
@@ -3781,7 +3999,7 @@ mod tests {
 		destination: &str,
 		found: Found,
 	) -> Result<Target> {
-		let source_path = RemotePath::new(source_path);
+		let source_path = ItemOperand::Path(RemotePath::new(source_path));
 		target_of(
 			placement,
 			&source(&source_path),
@@ -3789,6 +4007,98 @@ mod tests {
 			found,
 			names_a_directory(destination),
 		)
+	}
+
+	/// Checks `source` (UUID 1, in directory 2) against the pathless directory 3, below the
+	/// directories `above`.
+	fn check_pathless(placement: Placement, source: &Source<'_>, above: &[u128]) -> Result<()> {
+		let chain = above
+			.iter()
+			.chain([&3])
+			.map(|&uuid| Uuid::from_u128(uuid))
+			.collect::<Vec<_>>();
+		check_pathless_destination(
+			placement,
+			source,
+			Uuid::from_u128(3),
+			&ItemOperand::Uuid(Uuid::from_u128(3)),
+			&chain,
+		)
+	}
+
+	#[test]
+	fn a_directory_without_a_path_takes_a_source_from_elsewhere() {
+		let shown = ItemOperand::Path(RemotePath::new("/a/x.txt"));
+
+		check_pathless(Placement::Move, &source(&shown), &[0, 4]).unwrap();
+		check_pathless(Placement::Copy, &source(&shown), &[0, 4]).unwrap();
+	}
+
+	#[test]
+	fn a_directory_without_a_path_below_the_source_is_refused() {
+		let shown = ItemOperand::Path(RemotePath::new("/a"));
+
+		assert_eq!(
+			check_pathless(Placement::Copy, &source(&shown), &[0, 1, 4])
+				.unwrap_err()
+				.to_string(),
+			format!("Cannot copy /a into itself: uuid:{}", Uuid::from_u128(3))
+		);
+	}
+
+	#[test]
+	fn a_source_cannot_be_moved_into_itself_without_a_path() {
+		let shown = ItemOperand::Uuid(Uuid::from_u128(3));
+		let source = Source {
+			uuid: Uuid::from_u128(3),
+			..source(&shown)
+		};
+
+		assert_eq!(
+			check_pathless(Placement::Move, &source, &[0])
+				.unwrap_err()
+				.to_string(),
+			format!(
+				"Cannot move uuid:{0} into itself: uuid:{0}",
+				Uuid::from_u128(3)
+			)
+		);
+	}
+
+	#[test]
+	fn a_source_already_in_a_directory_without_a_path_is_not_moved_there() {
+		let shown = ItemOperand::Uuid(Uuid::from_u128(1));
+		let source = Source {
+			parent: ParentUuid::Uuid(Uuid::from_u128(3)),
+			..source(&shown)
+		};
+
+		assert_eq!(
+			check_pathless(Placement::Move, &source, &[0])
+				.unwrap_err()
+				.to_string(),
+			format!(
+				"uuid:{} is already in uuid:{}",
+				Uuid::from_u128(1),
+				Uuid::from_u128(3)
+			)
+		);
+		// a copy next to its source is refused by the name it clashes with
+		check_pathless(Placement::Copy, &source, &[0]).unwrap();
+	}
+
+	#[test]
+	fn an_item_in_a_directory_without_a_path_is_shown_with_its_uuid() {
+		let dir = ShownDirectory::Uuid(ItemOperand::Uuid(Uuid::from_u128(3)));
+
+		assert_eq!(
+			dir.child("a.txt"),
+			format!("a.txt in uuid:{}", Uuid::from_u128(3))
+		);
+		assert_eq!(
+			ShownDirectory::Path(RemotePath::new("/b")).child("a.txt"),
+			"/b/a.txt"
+		);
 	}
 
 	#[test]

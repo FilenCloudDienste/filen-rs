@@ -12,14 +12,15 @@ use filen_sdk_rs::consts::CHUNK_SIZE;
 use filen_sdk_rs::{
 	auth::Client,
 	fs::{
-		HasName, HasRemoteInfo as _, HasUUID,
-		categories::NonRootFileType,
+		HasName, HasParent as _, HasRemoteInfo as _, HasUUID,
+		categories::{NonRootFileType, Normal},
 		dir::RemoteDirectory,
 		file::{RemoteFile, traits::HasFileInfo as _},
 	},
 	io::client_impl::IoSharedClientExt,
 	sync::lock::ResourceLock,
 };
+use filen_types::fs::ParentUuid;
 use test_utils::{authenticated_cli_with_args, cli::run_authenticated_cli_with_args};
 
 /// Uploads `content` as `name` into `parent`.
@@ -2408,4 +2409,223 @@ async fn rm_cp_and_mv_refuse_the_root_directory() {
 	authenticated_cli_with_args!("mv", "/", &test_dir)
 		.failure()
 		.stderr(predicates::str::contains("Cannot move root directory"));
+}
+
+/// A directory `sub` in a directory in `parent` whose name cannot be decrypted, so that no path
+/// leads to `sub` or to anything in it. Returns that directory and `sub`.
+async fn directory_without_a_path(
+	client: &Client,
+	parent: &RemoteDirectory,
+) -> (RemoteDirectory, RemoteDirectory) {
+	let hidden = client
+		.create_malformed_dir(&parent.into(), "hidden", "not metadata")
+		.await
+		.unwrap();
+	let hidden = client.get_dir(hidden).await.unwrap();
+	let sub = client.create_dir(&(&hidden).into(), "sub").await.unwrap();
+	(hidden, sub)
+}
+
+/// The names of the files in `dir`, sorted.
+async fn file_names_in(client: &Client, dir: &RemoteDirectory) -> Vec<String> {
+	let (_, files) = client
+		.list_dir::<_, Normal>(&dir.into(), None::<&fn(u64, Option<u64>)>)
+		.await
+		.unwrap();
+	let mut names = files
+		.iter()
+		.map(|file| file.name().unwrap().to_owned())
+		.collect::<Vec<_>>();
+	names.sort();
+	names
+}
+
+#[shared_test_runtime]
+async fn write_and_touch_replace_a_file_without_a_path_named_by_uuid() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let (_, sub) = directory_without_a_path(client, &resources.dir).await;
+	let file = upload(client, &sub, "a.txt", b"original").await;
+	let operand = format!("uuid:{}", file.uuid());
+
+	authenticated_cli_with_args!("write", &operand, "new", "content")
+		.success()
+		.stdout(predicates::str::contains(format!("Wrote to {operand}")));
+
+	let (_, files) = client
+		.list_dir::<_, Normal>(&(&sub).into(), None::<&fn(u64, Option<u64>)>)
+		.await
+		.unwrap();
+	let [written] = files.as_slice() else {
+		panic!("Expected one file, got {}", files.len());
+	};
+	assert_eq!(written.name(), Some("a.txt"));
+	assert_eq!(client.download_file(written).await.unwrap(), b"new content");
+	// writing made a new version, which has a UUID of its own
+	let written = format!("uuid:{}", written.uuid());
+	authenticated_cli_with_args!("touch", &written)
+		.success()
+		.stdout(predicates::str::contains(format!(
+			"Updated the modification date of {written}"
+		)));
+}
+
+#[shared_test_runtime]
+async fn a_working_path_without_a_path_is_refused() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let (_, sub) = directory_without_a_path(client, &resources.dir).await;
+	let operand = format!("uuid:{}", sub.uuid());
+
+	authenticated_cli_with_args!("ls", "--working-path", &operand)
+		.failure()
+		.stderr(predicates::str::contains(format!(
+			"{operand} has no path, as its name or the name of a directory above it cannot be \
+			 decrypted"
+		)));
+}
+
+#[shared_test_runtime]
+async fn view_of_an_item_without_a_path_gives_the_url_of_its_directory() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let (hidden, sub) = directory_without_a_path(client, &resources.dir).await;
+	let file = upload(client, &sub, "a.txt", b"content").await;
+
+	let assert = authenticated_cli_with_args!(
+		"--json",
+		"view",
+		"--no-open",
+		&format!("uuid:{}", file.uuid())
+	)
+	.success();
+
+	assert_eq!(
+		printed_json(&assert),
+		serde_json::json!({
+			"url": format!(
+				"https://app.filen.io/#/drive/{}/{}/{}/{}",
+				client.root().uuid(),
+				resources.dir.uuid(),
+				hidden.uuid(),
+				sub.uuid()
+			)
+		})
+	);
+}
+
+#[shared_test_runtime]
+async fn mv_moves_an_item_into_a_directory_without_a_path() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = format!("/{}", resources.dir.name().unwrap());
+	let (_, sub) = directory_without_a_path(client, &resources.dir).await;
+	upload(client, &resources.dir, "a.txt", b"content").await;
+
+	authenticated_cli_with_args!(
+		"mv",
+		&format!("{test_dir}/a.txt"),
+		&format!("uuid:{}", sub.uuid())
+	)
+	.success()
+	.stdout(predicates::str::contains(format!(
+		"Moved {test_dir}/a.txt to a.txt in uuid:{}",
+		sub.uuid()
+	)));
+
+	assert_eq!(file_names_in(client, &sub).await, ["a.txt"]);
+	assert!(!exists(client, &format!("{test_dir}/a.txt")).await);
+}
+
+#[shared_test_runtime]
+async fn cp_copies_an_item_into_a_directory_without_a_path() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = format!("/{}", resources.dir.name().unwrap());
+	let (_, sub) = directory_without_a_path(client, &resources.dir).await;
+	upload(client, &resources.dir, "a.txt", b"content").await;
+
+	authenticated_cli_with_args!(
+		"cp",
+		&format!("{test_dir}/a.txt"),
+		&format!("uuid:{}", sub.uuid())
+	)
+	.success()
+	.stdout(predicates::str::contains(format!(
+		"Copied {test_dir}/a.txt to a.txt in uuid:{}",
+		sub.uuid()
+	)));
+
+	assert_eq!(file_names_in(client, &sub).await, ["a.txt"]);
+	assert_eq!(
+		content_at(client, &format!("{test_dir}/a.txt")).await,
+		b"content"
+	);
+}
+
+#[shared_test_runtime]
+async fn mv_refuses_to_move_a_directory_into_a_directory_without_a_path_below_it() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let (hidden, sub) = directory_without_a_path(client, &resources.dir).await;
+	let inner = client.create_dir(&(&sub).into(), "inner").await.unwrap();
+
+	authenticated_cli_with_args!(
+		"mv",
+		&format!("uuid:{}", sub.uuid()),
+		&format!("uuid:{}", inner.uuid())
+	)
+	.failure()
+	.stderr(predicates::str::contains(format!(
+		"Cannot move uuid:{} into itself: uuid:{}",
+		sub.uuid(),
+		inner.uuid()
+	)));
+
+	assert_eq!(
+		*client.get_dir(sub.uuid()).await.unwrap().parent(),
+		ParentUuid::Uuid(hidden.uuid())
+	);
+}
+
+#[cfg(unix)]
+#[shared_test_runtime]
+async fn edit_uploads_the_changes_to_a_file_without_a_path() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let (_, sub) = directory_without_a_path(client, &resources.dir).await;
+	let file = upload(client, &sub, "a.txt", b"original\n").await;
+	let local = assert_fs::TempDir::new().unwrap();
+	let editor = local.path().join("editor.sh");
+	write_script(&editor, "printf 'appended\\n' >> \"$1\"");
+	let tmp_dir = local.path().join("tmp");
+	std::fs::create_dir(&tmp_dir).unwrap();
+	let operand = format!("uuid:{}", file.uuid());
+
+	let (_auth, cli) = spawn_edit(&operand, &editor, &tmp_dir, local.path()).await;
+	let output = cli.wait_with_output().unwrap();
+	let stdout = String::from_utf8_lossy(&output.stdout);
+
+	assert!(
+		output.status.success(),
+		"stderr:\n{}",
+		String::from_utf8_lossy(&output.stderr)
+	);
+	assert!(
+		stdout.contains(&format!("Uploaded your changes to {operand}")),
+		"stdout:\n{stdout}"
+	);
+	let (_, files) = client
+		.list_dir::<_, Normal>(&(&sub).into(), None::<&fn(u64, Option<u64>)>)
+		.await
+		.unwrap();
+	let [edited] = files.as_slice() else {
+		panic!("Expected one file, got {}", files.len());
+	};
+	assert_eq!(edited.name(), Some("a.txt"));
+	assert_eq!(
+		client.download_file(edited).await.unwrap(),
+		b"original\nappended\n"
+	);
+	assert_eq!(files_under(&tmp_dir), Vec::<std::path::PathBuf>::new());
 }
