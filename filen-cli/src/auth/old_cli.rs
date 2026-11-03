@@ -68,6 +68,7 @@ enum SavedLoginKind {
 
 /// The files of credentials the old CLI saved that exist, in the order it used them: the auth
 /// configs in `working_dir` and in `data_dir`, then the login kept in `data_dir`.
+/// (! referenced in module docs)
 pub(super) fn find(working_dir: Option<&Path>, data_dir: Option<&Path>) -> Vec<SavedLogin> {
 	[
 		working_dir.map(|dir| (dir.join(AUTH_CONFIG_FILENAME), SavedLoginKind::AuthConfig)),

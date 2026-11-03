@@ -1,27 +1,30 @@
 //! [cli-doc] auth-methods
-//! There are multiple ways to authenticate:
-//! - set the CLI arguments `--email` (or environment variable `FILEN_CLI_EMAIL`)
-//!   and `--password` (`FILEN_CLI_PASSWORD`), optionally `--two-factor-code` (`FILEN_CLI_2FA_CODE`)
-//!   (when the two-factor code is omitted and required, you will be prompted for it;
-//!   when none of these is set, the variables `FILEN_EMAIL`, `FILEN_PASSWORD` and `FILEN_2FA_CODE`
-//!   of the old Filen CLI are used)
-//! - specify an auth config via the `--auth-config-path` flag
-//!   (exported via `filen export-auth-config`),
-//!   or put an auth config in one of the default locations:
-//!   (unless overwritten by the `--config-dir` flag)
-//!   - `./filen-cli-auth-config.txt` (current working directory)
-//!   - Linux/macOS: `$HOME/.filen-cli/filen-cli-auth-config.txt`
-//!   - Windows: `%appdata%\filen-cli\filen-cli-auth-config.txt`
+//! The CLI logs in with the first of these that it finds:
+//! 1. the CLI arguments `--email` and `--password`, optionally `--two-factor-code`,
+//!    or the environment variables `FILEN_CLI_EMAIL`, `FILEN_CLI_PASSWORD` and `FILEN_CLI_2FA_CODE`
+//!    (when none of these is set, the variables `FILEN_EMAIL`, `FILEN_PASSWORD` and
+//!    `FILEN_2FA_CODE` of the old Filen CLI are used; when a two-factor code is required
+//!    and not given, you are prompted for it)
+//! 2. an auth config file, exported with `filen export-auth-config`: the one given with
+//!    `--auth-config-path`, or else `./filen-cli-auth-config.txt` (in the current working
+//!    directory), then `filen-cli-auth-config.txt` in the config dir
+//!    (on Linux and macOS, an auth config found in these two places must not be accessible
+//!    to other users: restrict it with `chmod 600`)
+//! 3. the login kept in the system keychain (each config dir keeps a login of its own there)
+//! 4. credentials saved by the old Filen CLI, which are imported
+//!    (its `.filen-cli-auth-config` in the current working directory or its data directory,
+//!    and, with the default config dir, the login it kept; its files are left as they are)
+//! 5. otherwise, you are prompted for your email and password (with three attempts)
 //!
-//!   (on Linux/macOS, an auth config in a default location must not be accessible
-//!   to other users: restrict it with `chmod 600`)
-//! - if none of these is set, credentials saved by the old Filen CLI are imported,
-//!   with the option to save them in the system keychain
-//!   (its `.filen-cli-auth-config` in the current working directory or its data directory,
-//!   and, with the default `--config-dir`, the login it kept; the old CLI's files are left as they are)
-//! - otherwise, you will be prompted for credentials,
-//!   with the option to save them securely in the system keychain
-//!   (a `--config-dir` other than the default keeps a login of its own there)
+//! After logging in by 4. or 5., you can keep the login in the system keychain,
+//! or, where there is none (such as in the Docker image), in an auth config file in the config dir.
+//!
+//! The config dir is the one given with `--config-dir`, or by default:
+//! - Linux: `$XDG_CONFIG_HOME/filen-cli`, or `~/.config/filen-cli` without it
+//! - macOS: `~/Library/Application Support/filen-cli`
+//! - Windows: `%APPDATA%\filen-cli`
+//!
+//! (development builds use `filen-cli-dev` instead)
 
 mod old_cli;
 
@@ -614,7 +617,7 @@ impl KeyringLocation {
 
 	/// The location of the credentials used with `config_dir`: the default config dir keeps the
 	/// entry the CLI always used, and any other one an entry named after it, so that a
-	/// `--config-dir` keeps its own login.
+	/// `--config-dir` keeps its own login. (! referenced in module docs)
 	fn for_config_dir(is_dev: bool, config_dir: &Path, default_config_dir: Option<&Path>) -> Self {
 		let service = match is_dev {
 			true => KEYRING_SERVICE_DEV,
@@ -881,7 +884,7 @@ fn confirm_auth_config(ui: &mut UI, msg: &str) -> Result<bool> {
 
 /// Save the login `sdk_config` in `keyring_entry`, or, without one or if that fails, explain the
 /// other ways to stay logged in and offer, through `ask`, to save it in an auth config file in
-/// `config_dir`.
+/// `config_dir`. (! referenced in module docs)
 fn keep_login(
 	config_dir: &Path,
 	ui: &mut UI,
