@@ -22,6 +22,7 @@ struct FakeFile {
 	uuid: Uuid,
 	size: u64,
 	chunks: u64,
+	hash: Option<Blake3Hash>,
 }
 
 impl FakeFile {
@@ -30,6 +31,14 @@ impl FakeFile {
 			uuid: Uuid::default(),
 			size,
 			chunks,
+			hash: None,
+		}
+	}
+
+	fn with_hash(self, hash: Blake3Hash) -> Self {
+		Self {
+			hash: Some(hash),
+			..self
 		}
 	}
 }
@@ -98,7 +107,7 @@ impl HasRemoteFileInfo for FakeFile {
 	}
 
 	fn hash(&self) -> Option<Blake3Hash> {
-		None
+		self.hash
 	}
 }
 
@@ -470,4 +479,278 @@ fn chunk_consistency_boundaries() {
 	assert!(!chunks_consistent_with_size(1, CHUNK_SIZE_U64 + 1));
 	assert!(!chunks_consistent_with_size(3, CHUNK_SIZE_U64));
 	assert!(!chunks_consistent_with_size(u64::MAX, u64::MAX));
+}
+
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+mod content_hash {
+	use std::task::{Context, Poll, Waker};
+
+	use tokio::sync::SemaphorePermit;
+
+	use super::*;
+
+	fn blake3_of(data: &[u8]) -> Blake3Hash {
+		blake3::hash(data).into()
+	}
+
+	fn kind_of(error: &std::io::Error) -> Option<ErrorKind> {
+		error
+			.get_ref()
+			.and_then(|inner| inner.downcast_ref::<Error>())
+			.map(Error::kind)
+	}
+
+	/// The bytes of a `size`-byte file, as its `chunks` hold them.
+	fn file_chunks(size: usize) -> Vec<Vec<u8>> {
+		let data: Vec<u8> = (0..size).map(|i| u8::try_from(i % 251).unwrap()).collect();
+		data.chunks(CHUNK_SIZE).map(<[u8]>::to_vec).collect()
+	}
+
+	/// A reader over `start..end` of `file` that fetches nothing, as the whole memory budget is
+	/// held, with `chunks` from the one holding `start` on queued as fetched: downloaded,
+	/// decrypted and the first placed at `start`, as a fetch leaves them.
+	fn reader_with_queued_chunks<'a>(
+		client: &'a UnauthClient,
+		file: &'a FakeFile,
+		start: u64,
+		end: u64,
+		chunks: Vec<Vec<u8>>,
+	) -> (FileReader<'a>, SemaphorePermit<'a>) {
+		let chunks: Vec<Chunk<'a>> = chunks
+			.into_iter()
+			.map(|data| {
+				let mut chunk = Chunk::try_acquire(NonZeroU32::MIN, client.state()).unwrap();
+				AsMut::<Vec<u8>>::as_mut(&mut chunk).extend(data);
+				chunk
+			})
+			.collect();
+		let budget = client.state().memory_semaphore();
+		let held = budget
+			.try_acquire_many(u32::try_from(budget.available_permits()).unwrap())
+			.unwrap();
+		let mut reader = FileReaderBuilder::new(client, file)
+			.with_start(start)
+			.with_end(end)
+			.build();
+		for (i, chunk) in chunks.into_iter().enumerate() {
+			let mut cursor = Cursor::new(chunk);
+			if i == 0 {
+				cursor.set_position(start % CHUNK_SIZE_U64);
+			}
+			reader
+				.futures
+				.push_back(Box::pin(std::future::ready(Ok::<_, Error>(cursor))));
+			reader.next_chunk_idx += 1;
+		}
+		(reader, held)
+	}
+
+	#[test]
+	fn a_whole_read_of_a_file_matching_its_hash_succeeds() {
+		let client = test_client();
+		let chunks = file_chunks(CHUNK_SIZE + 20);
+		let file = FakeFile::new(CHUNK_SIZE_U64 + 20, 2).with_hash(blake3_of(&chunks.concat()));
+		let (mut reader, _held) =
+			reader_with_queued_chunks(&client, &file, 0, file.size, chunks.clone());
+
+		let mut read = Vec::new();
+		block_on(reader.read_to_end(&mut read)).unwrap();
+
+		assert_eq!(read, chunks.concat());
+	}
+
+	#[test]
+	fn a_last_chunk_decrypting_past_the_size_is_checked_over_the_bytes_handed_out() {
+		let client = test_client();
+		let data = file_chunks(30);
+		let file = FakeFile::new(20, 1).with_hash(blake3_of(&data.concat()[..20]));
+		let (mut reader, _held) = reader_with_queued_chunks(&client, &file, 0, 20, data.clone());
+
+		let mut read = Vec::new();
+		block_on(reader.read_to_end(&mut read)).unwrap();
+
+		assert_eq!(read, data.concat()[..20]);
+	}
+
+	#[test]
+	fn a_last_chunk_decrypting_past_the_size_fails_a_hash_of_all_its_bytes() {
+		let client = test_client();
+		let data = file_chunks(30);
+		let file = FakeFile::new(20, 1).with_hash(blake3_of(&data.concat()));
+		let (mut reader, _held) = reader_with_queued_chunks(&client, &file, 0, 20, data);
+
+		let error = block_on(reader.read_to_end(&mut Vec::new())).unwrap_err();
+
+		assert_eq!(kind_of(&error), Some(ErrorKind::ContentHashMismatch));
+	}
+
+	#[test]
+	fn a_whole_read_of_a_file_not_matching_its_hash_fails() {
+		let client = test_client();
+		let file = FakeFile::new(CHUNK_SIZE_U64 + 20, 2).with_hash(blake3_of(b"other bytes"));
+		let (mut reader, _held) =
+			reader_with_queued_chunks(&client, &file, 0, file.size, file_chunks(CHUNK_SIZE + 20));
+
+		let mut read = Vec::new();
+		let error = block_on(reader.read_to_end(&mut read)).unwrap_err();
+
+		assert_eq!(kind_of(&error), Some(ErrorKind::ContentHashMismatch));
+		assert_eq!(
+			read.len(),
+			CHUNK_SIZE,
+			"no byte of the last chunk is handed out"
+		);
+	}
+
+	#[test]
+	fn a_read_after_the_mismatch_fails_with_it_again() {
+		let client = test_client();
+		let file = FakeFile::new(20, 1).with_hash(blake3_of(b"other bytes"));
+		let (mut reader, _held) =
+			reader_with_queued_chunks(&client, &file, 0, file.size, file_chunks(20));
+		let mut buf = [0u8; 32];
+
+		let first = block_on(reader.read(&mut buf)).unwrap_err();
+		let second = block_on(reader.read(&mut buf)).unwrap_err();
+
+		assert_eq!(kind_of(&first), Some(ErrorKind::ContentHashMismatch));
+		assert_eq!(kind_of(&second), Some(ErrorKind::ContentHashMismatch));
+	}
+
+	#[test]
+	fn a_chunk_polled_after_the_mismatch_fails_with_it_again() {
+		let client = test_client();
+		let file = FakeFile::new(20, 1).with_hash(blake3_of(b"other bytes"));
+		let (mut reader, _held) =
+			reader_with_queued_chunks(&client, &file, 0, file.size, file_chunks(20));
+		let mut cx = Context::from_waker(Waker::noop());
+
+		for poll in ["first", "second"] {
+			let Poll::Ready(Err(error)) = reader.poll_next_chunk(&mut cx) else {
+				panic!("the {poll} poll fails the read");
+			};
+			assert_eq!(kind_of(&error), Some(ErrorKind::ContentHashMismatch));
+		}
+	}
+
+	#[test]
+	fn the_mismatch_error_names_the_file_and_both_hashes() {
+		let client = test_client();
+		let data = file_chunks(20);
+		let expected = blake3_of(b"other bytes");
+		let file = FakeFile {
+			uuid: Uuid::from_u128(7),
+			..FakeFile::new(20, 1).with_hash(expected)
+		};
+		let (mut reader, _held) = reader_with_queued_chunks(&client, &file, 0, 20, data.clone());
+
+		let error = Error::from(block_on(reader.read_to_end(&mut Vec::new())).unwrap_err());
+
+		assert_eq!(error.kind(), ErrorKind::ContentHashMismatch);
+		let mismatch = error.downcast_ref::<ContentHashMismatchError>().unwrap();
+		assert_eq!(mismatch.uuid, Uuid::from_u128(7));
+		assert_eq!(mismatch.expected, expected);
+		assert_eq!(mismatch.actual, blake3_of(&data.concat()));
+		let message = error.to_string();
+		assert!(
+			message.contains("00000000-0000-0000-0000-000000000007"),
+			"{message}"
+		);
+		assert!(
+			message.contains(&expected.as_sized_str().to_string()),
+			"{message}"
+		);
+	}
+
+	#[test]
+	fn a_buffered_whole_read_of_a_file_not_matching_its_hash_fails() {
+		let client = test_client();
+		let file = FakeFile::new(20, 1).with_hash(blake3_of(b"other bytes"));
+		let (mut reader, _held) =
+			reader_with_queued_chunks(&client, &file, 0, file.size, file_chunks(20));
+
+		let error = block_on(reader.fill_buf()).unwrap_err();
+
+		assert_eq!(kind_of(&error), Some(ErrorKind::ContentHashMismatch));
+	}
+
+	#[test]
+	fn a_chunked_whole_read_fails_on_the_last_chunk_of_a_file_not_matching_its_hash() {
+		let client = test_client();
+		let file = FakeFile::new(CHUNK_SIZE_U64 + 20, 2).with_hash(blake3_of(b"other bytes"));
+		let (mut reader, _held) =
+			reader_with_queued_chunks(&client, &file, 0, file.size, file_chunks(CHUNK_SIZE + 20));
+		let mut cx = Context::from_waker(Waker::noop());
+
+		let Poll::Ready(Ok(Some(first))) = reader.poll_next_chunk(&mut cx) else {
+			panic!("the first chunk is handed out");
+		};
+		assert_eq!(first.as_ref().len(), CHUNK_SIZE);
+		let Poll::Ready(Err(error)) = reader.poll_next_chunk(&mut cx) else {
+			panic!("the last chunk fails the read");
+		};
+		assert_eq!(kind_of(&error), Some(ErrorKind::ContentHashMismatch));
+	}
+
+	#[test]
+	fn a_chunked_whole_read_of_a_file_matching_its_hash_ends() {
+		let client = test_client();
+		let data = file_chunks(20);
+		let file = FakeFile::new(20, 1).with_hash(blake3_of(&data.concat()));
+		let (mut reader, _held) = reader_with_queued_chunks(&client, &file, 0, 20, data);
+		let mut cx = Context::from_waker(Waker::noop());
+
+		assert!(matches!(
+			reader.poll_next_chunk(&mut cx),
+			Poll::Ready(Ok(Some(_)))
+		));
+		assert!(matches!(
+			reader.poll_next_chunk(&mut cx),
+			Poll::Ready(Ok(None))
+		));
+	}
+
+	#[test]
+	fn a_range_read_of_a_file_not_matching_its_hash_is_not_checked() {
+		let client = test_client();
+		let file = FakeFile::new(20, 1).with_hash(blake3_of(b"other bytes"));
+		let (mut reader, _held) = reader_with_queued_chunks(&client, &file, 0, 19, file_chunks(20));
+
+		let mut read = Vec::new();
+		block_on(reader.read_to_end(&mut read)).unwrap();
+
+		assert_eq!(read, file_chunks(20).concat()[..19]);
+	}
+
+	#[test]
+	fn a_whole_read_of_a_file_declaring_no_hash_is_not_checked() {
+		let client = test_client();
+		let file = FakeFile::new(20, 1);
+		let (mut reader, _held) = reader_with_queued_chunks(&client, &file, 0, 20, file_chunks(20));
+
+		let mut read = Vec::new();
+		block_on(reader.read_to_end(&mut read)).unwrap();
+
+		assert_eq!(read, file_chunks(20).concat());
+	}
+
+	#[test]
+	fn an_empty_file_declaring_the_hash_of_other_bytes_fails() {
+		let client = test_client();
+		let file = FakeFile::new(0, 0).with_hash(blake3_of(b"other bytes"));
+		let mut reader = FileReaderBuilder::new(&client, &file).build();
+
+		let error = block_on(reader.read(&mut [0u8; 8])).unwrap_err();
+
+		assert_eq!(kind_of(&error), Some(ErrorKind::ContentHashMismatch));
+	}
+
+	#[test]
+	fn an_empty_file_declaring_the_hash_of_no_bytes_reads_eof() {
+		let client = test_client();
+		let file = FakeFile::new(0, 0).with_hash(blake3_of(b""));
+		let mut reader = FileReaderBuilder::new(&client, &file).build();
+
+		assert_eq!(block_on(reader.read(&mut [0u8; 8])).unwrap(), 0);
+	}
 }

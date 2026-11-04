@@ -1,6 +1,9 @@
 use std::{borrow::Cow, sync::Arc};
 
-use filen_types::fs::ObjectType;
+use filen_types::{
+	crypto::Blake3Hash,
+	fs::{ObjectType, Uuid},
+};
 use image::ImageError;
 use thiserror::Error;
 
@@ -227,6 +230,12 @@ pub enum ErrorKind {
 	/// worked; the SDK treats both alike otherwise (see [`Self::reached_no_server`]), so a
 	/// request failing with it is not retried, and it is never sent unverified.
 	TlsVerification,
+	/// A downloaded file's content does not hash to the BLAKE3 its metadata declares: its stored
+	/// data or its metadata is not what the client that uploaded it wrote. A download of the whole
+	/// file fails with it, to memory, a writer or a path, and so does a zip download holding the
+	/// file. Only a read of the whole file is checked, and only for a file whose metadata declares
+	/// a hash.
+	ContentHashMismatch,
 }
 
 impl ErrorKind {
@@ -594,6 +603,35 @@ pub(crate) struct LockLostError {
 	pub(crate) resource: String,
 }
 impl_from!(LockLostError, ErrorKind::LockLost);
+
+/// A file's downloaded plaintext hashed to something other than the BLAKE3 its metadata declares.
+#[derive(Debug, Clone, Error)]
+#[error(
+	"The content of file {uuid} does not match its hash: expected {}, got {}",
+	.expected.as_sized_str(),
+	.actual.as_sized_str()
+)]
+pub(crate) struct ContentHashMismatchError {
+	pub(crate) uuid: Uuid,
+	pub(crate) expected: Blake3Hash,
+	pub(crate) actual: Blake3Hash,
+}
+impl_from!(ContentHashMismatchError, ErrorKind::ContentHashMismatch);
+
+impl ContentHashMismatchError {
+	/// Fails with the mismatch unless the content of file `uuid` hashed to `actual`, the hash its
+	/// metadata declares (`expected`).
+	pub(crate) fn check(uuid: Uuid, expected: Blake3Hash, actual: Blake3Hash) -> Result<(), Self> {
+		if actual == expected {
+			return Ok(());
+		}
+		Err(Self {
+			uuid,
+			expected,
+			actual,
+		})
+	}
+}
 
 #[derive(Debug, Error)]
 #[error("Invalid type: `{actual:?}`, expected: `{expected:?}`")]

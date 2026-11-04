@@ -268,6 +268,11 @@ mod client_impl {
 	}
 
 	impl Client {
+		/// Writes `items`, directories with everything below them, to `writer` as a zip archive.
+		/// A file whose bytes do not hash to the BLAKE3 its metadata declares fails it with
+		/// [`ErrorKind::ContentHashMismatch`](crate::ErrorKind::ContentHashMismatch) before its
+		/// entry is closed, leaving in `writer` the entries before it and that entry's unfinished
+		/// part, with no central directory.
 		#[allow(private_bounds)]
 		pub async fn download_items_to_zip<'a, 'ctx, Cat, T>(
 			&self,
@@ -288,6 +293,11 @@ mod client_impl {
 	}
 
 	impl UnauthClient {
+		/// Writes `items`, directories with everything below them, to `writer` as a zip archive.
+		/// A file whose bytes do not hash to the BLAKE3 its metadata declares fails it with
+		/// [`ErrorKind::ContentHashMismatch`](crate::ErrorKind::ContentHashMismatch) before its
+		/// entry is closed, leaving in `writer` the entries before it and that entry's unfinished
+		/// part, with no central directory.
 		#[allow(private_bounds)]
 		pub async fn download_items_to_zip<'a, 'ctx, Cat, T>(
 			&self,

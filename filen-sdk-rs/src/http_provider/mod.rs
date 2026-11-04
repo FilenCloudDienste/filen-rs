@@ -418,6 +418,14 @@ impl HttpProviderHandle {
 	/// its decryption key) is stored in this provider's in-process store and looked
 	/// up by the handler, so no key material rides in the URL where a media
 	/// framework or the OS could log it.
+	///
+	/// A request for the whole file (no `Range`, or one range covering every byte) is checked
+	/// against the BLAKE3 the file's metadata declares, like any download: when the content
+	/// hashes to anything else, the body ends with an
+	/// [`ErrorKind::ContentHashMismatch`](crate::ErrorKind::ContentHashMismatch) error before
+	/// its last chunk, so the client sees a truncated response rather than a complete one. A
+	/// range request is not checked, so a player that only ever asks for ranges is served
+	/// content that does not match.
 	pub fn get_file_url(&self, file: RemoteFileType<'_>) -> String {
 		let token = self
 			.tokens

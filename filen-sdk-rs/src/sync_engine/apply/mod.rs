@@ -3458,7 +3458,10 @@ async fn apply_transfer(
 			*quarantined = stashed.map(|bin| (rel_path.clone(), bin));
 			let remote = remote.as_deref();
 			// The row this writes has to carry a hash of what landed. Where the remote declares one
-			// it is that hash — the same one every later pass compares the path against. Where it
+			// it is that hash — the same one every later pass compares the path against — and it is
+			// the hash of what landed: a download whose bytes hash to anything else fails
+			// (`ContentHashMismatch`) before it puts them at the path, and a local file kept in
+			// place was kept because it hashes to it. Where it
 			// declares NONE (a client that wrote no `blake3` in the file's metadata: the common
 			// cross-device case), hashing the file just written is the only way the row gets one at
 			// all, and a row without one vouches for nothing: it cannot tell a later size- and

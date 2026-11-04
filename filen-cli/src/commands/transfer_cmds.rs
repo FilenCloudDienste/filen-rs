@@ -41,7 +41,8 @@
 //! from there instead of starting over. A file that was changed in the drive since is a new
 //! version, which starts over. A continued file is checked against the hash of its contents that
 //! the drive holds, when it holds one; when they differ, the kept part is removed and the
-//! download fails, to start over next time. The bytes a download did not have to download again
+//! download fails, to start over next time. So is a file that was not continued and differs from
+//! that hash: what it wrote is not kept. The bytes a download did not have to download again
 //! count as transferred, and the result names them as resumed and leaves them out of the speed.
 //! Without `--resume`, an unfinished file is removed. Uploads cannot be resumed.
 //!

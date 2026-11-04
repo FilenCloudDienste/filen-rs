@@ -1,8 +1,11 @@
 use std::{
 	io::{Cursor, Read},
+	mem,
 	num::NonZeroU32,
+	task::{Context, Poll},
 };
 
+use filen_types::{crypto::Blake3Hash, fs::Uuid};
 use futures::{StreamExt, stream::FuturesOrdered};
 
 use crate::{
@@ -10,12 +13,18 @@ use crate::{
 	auth::unauth::UnauthClient,
 	consts::{CHUNK_SIZE_U64, FILE_CHUNK_SIZE, FILE_CHUNK_SIZE_EXTRA},
 	crypto::shared::DataCrypter,
-	error::{Error, ErrorKind, MetadataWasNotDecryptedError},
+	error::{ContentHashMismatchError, Error, ErrorKind, MetadataWasNotDecryptedError},
 	util::{MaybeSendBoxFuture, MaybeSendCallback},
 };
 
 use super::{chunk::Chunk, traits::File};
 
+/// Reads a file's decrypted bytes, or a range of them. A read of the whole file, of a file whose
+/// metadata declares a BLAKE3 hash, fails with [`ErrorKind::ContentHashMismatch`] when its bytes
+/// hash to anything else, instead of reaching its end: with the chunk that completes the declared
+/// size, before that chunk's bytes are handed out, or, when the chunks decrypt to fewer bytes than
+/// that, on the poll after the last chunk, whose bytes have been handed out by then. A range is not
+/// checked.
 pub struct FileReader<'a> {
 	file: &'a dyn File,
 	client: &'a UnauthClient,
@@ -30,6 +39,23 @@ pub struct FileReader<'a> {
 	// download concurrently, and the ordered reader would otherwise hold completed chunks behind a
 	// slow head-of-line chunk and release them in a burst. See `push_fetch_next_chunk`.
 	progress: Option<MaybeSendCallback<'a, u64>>,
+	// Checks the plaintext against the file's declared hash, on a read of the whole file of a file
+	// declaring one: a range cannot be checked.
+	content_check: ContentCheck,
+}
+
+/// Where a reader's check of the file's content against its declared hash stands.
+enum ContentCheck {
+	/// Nothing to check: the read is a range, or the file declares no hash.
+	Unchecked,
+	/// Hashing the chunks as they are taken, until the file's size has been. Boxed, as the hasher
+	/// is about 2 KiB that the other states, and every range reader, would otherwise carry.
+	Hashing(Box<ContentVerifier>),
+	/// The content hashed to the declared hash.
+	Matched,
+	/// The content hashed to something else. Every later poll fails with it again, so a consumer
+	/// that reads on after the error never sees the read end as if it had succeeded.
+	Mismatched(ContentHashMismatchError),
 }
 
 pub struct FileReaderBuilder<'a> {
@@ -81,6 +107,12 @@ impl<'a> FileReaderBuilder<'a> {
 		let limit = self.end.unwrap_or(size).min(size);
 		let index = self.start.unwrap_or(0).min(limit);
 		let chunks_consistent = chunks_consistent_with_size(self.file.chunks(), size);
+		let content_check = (index == 0 && limit == size)
+			.then(|| ContentVerifier::new(self.file))
+			.flatten()
+			.map_or(ContentCheck::Unchecked, |verifier| {
+				ContentCheck::Hashing(Box::new(verifier))
+			});
 		let mut new = FileReader {
 			file: self.file,
 			client: self.client,
@@ -92,6 +124,7 @@ impl<'a> FileReaderBuilder<'a> {
 			allocate_chunk_future: None,
 			max_buffer_size: self.max_buffer_size.unwrap_or(size),
 			progress: self.progress,
+			content_check,
 		};
 
 		if chunks_consistent {
@@ -181,6 +214,59 @@ pub(crate) fn check_chunks_consistent(chunks: u64, size: u64) -> Result<(), Erro
 		ErrorKind::Response,
 		format!("file chunk count ({chunks}) is inconsistent with file size ({size})"),
 	))
+}
+
+/// Checks a file's plaintext, fed in order from its first byte, against the BLAKE3 hash its
+/// metadata declares.
+pub(crate) struct ContentVerifier {
+	uuid: Uuid,
+	expected: Blake3Hash,
+	hasher: blake3::Hasher,
+	hashed: u64,
+	size: u64,
+}
+
+impl ContentVerifier {
+	/// `None` for a file whose metadata declares no hash, as there is nothing to check it against.
+	pub(crate) fn new(file: &dyn File) -> Option<Self> {
+		Some(Self {
+			uuid: file.uuid(),
+			expected: file.hash()?,
+			hasher: blake3::Hasher::new(),
+			hashed: 0,
+			size: file.size(),
+		})
+	}
+
+	/// Hashes the file's next bytes, up to its declared size: a reader hands out no byte past it,
+	/// even of a chunk that decrypts to more, so the hash covers exactly the bytes handed out.
+	pub(crate) fn update(&mut self, data: &[u8]) {
+		let left = usize::try_from(self.size.saturating_sub(self.hashed)).unwrap_or(usize::MAX);
+		let data = data.get(..left).unwrap_or(data);
+		// as `FileWriter` hashes what it uploads; where there are no threads (wasm without a
+		// worker pool) rayon runs it on the current thread
+		self.hasher.update_rayon(data);
+		self.hashed = self
+			.hashed
+			.saturating_add(u64::try_from(data.len()).unwrap_or(u64::MAX));
+	}
+
+	/// Whether the file's declared size has been hashed.
+	fn covers_the_file(&self) -> bool {
+		self.hashed >= self.size
+	}
+
+	/// Fails with [`ErrorKind::ContentHashMismatch`] unless the bytes hashed, all of the file's,
+	/// hash to the declared hash.
+	pub(crate) fn finish(self) -> Result<(), Error> {
+		self.check().map_err(Error::from)
+	}
+
+	/// [`Self::finish`], with the mismatch itself as the error.
+	fn check(self) -> Result<(), ContentHashMismatchError> {
+		let actual = Blake3Hash::from(self.hasher.finalize());
+		ContentHashMismatchError::check(self.uuid, self.expected, actual)
+	}
 }
 
 /// Bytes chunk `chunk_idx` of `file` takes to download (its plaintext plus the AES tag and
@@ -395,7 +481,7 @@ impl<'a> FileReader<'a> {
 			self.allocate_chunk_future = self.allocate_next_chunk();
 		}
 		let waiting_for_memory = self.poll_read_ahead(cx);
-		match std::task::ready!(self.futures.poll_next_unpin(cx)) {
+		match std::task::ready!(self.poll_next_fetched(cx)) {
 			Some(Ok(cursor)) => {
 				// the first chunk is read from the range's start, and any chunk up to its end
 				let skip = usize::try_from(cursor.position()).unwrap_or(usize::MAX);
@@ -418,6 +504,44 @@ impl<'a> FileReader<'a> {
 	/// bytes are used.
 	pub(crate) fn recycle_chunk(&mut self, chunk: Chunk<'a>) {
 		self.push_fetch_next_chunk(chunk);
+	}
+}
+
+impl<'a> FileReader<'a> {
+	/// The next fetched chunk, in order, or `None` once none is in flight. Every consumer takes its
+	/// chunks from here, so this is where the whole-file read is checked against the file's hash:
+	/// with the chunk that completes the declared size, before any of its bytes are handed out, so
+	/// the read fails instead of reaching its end. A file that never yields its declared size (an
+	/// empty one, or one whose chunks decrypt to fewer bytes) is checked once no chunk is left to
+	/// fetch, on the poll after its last chunk, which has been handed out by then. After a mismatch
+	/// every poll fails with it.
+	fn poll_next_fetched(
+		&mut self,
+		cx: &mut Context<'_>,
+	) -> Poll<Option<Result<Cursor<Chunk<'a>>, Error>>> {
+		if let ContentCheck::Mismatched(mismatch) = &self.content_check {
+			return Poll::Ready(Some(Err(mismatch.clone().into())));
+		}
+		let fetched = std::task::ready!(self.futures.poll_next_unpin(cx));
+		let finished = match (&fetched, &mut self.content_check) {
+			(Some(Ok(cursor)), ContentCheck::Hashing(verifier)) => {
+				verifier.update(cursor.get_ref().as_ref());
+				verifier.covers_the_file()
+			}
+			(None, ContentCheck::Hashing(_)) => self.next_chunk_size().is_none(),
+			(Some(Err(_)), _)
+			| (_, ContentCheck::Unchecked | ContentCheck::Matched | ContentCheck::Mismatched(_)) => false,
+		};
+		if finished
+			&& let ContentCheck::Hashing(verifier) =
+				mem::replace(&mut self.content_check, ContentCheck::Matched)
+			&& let Err(mismatch) = verifier.check()
+		{
+			// cloned to keep failing every later poll with it, the original goes to this one
+			self.content_check = ContentCheck::Mismatched(mismatch.clone());
+			return Poll::Ready(Some(Err(mismatch.into())));
+		}
+		Poll::Ready(fetched)
 	}
 }
 
@@ -483,7 +607,7 @@ impl futures::io::AsyncBufRead for FileReader<'_> {
 			if let Some(cursor) = this.curr_chunk.take() {
 				break cursor;
 			}
-			match this.futures.poll_next_unpin(cx) {
+			match this.poll_next_fetched(cx) {
 				std::task::Poll::Ready(Some(Ok(cursor))) => {
 					if !unread(&cursor, this.index, this.limit).is_empty() {
 						break cursor;
@@ -544,7 +668,7 @@ impl futures::io::AsyncRead for FileReader<'_> {
 
 		loop {
 			// loop through futures
-			match self.futures.poll_next_unpin(cx) {
+			match self.poll_next_fetched(cx) {
 				std::task::Poll::Ready(Some(Ok(cursor))) => {
 					// we have a new chunk, make a cursor and read from it
 					self.curr_chunk = Some(cursor);

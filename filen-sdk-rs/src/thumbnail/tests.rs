@@ -441,6 +441,31 @@ fn a_seeded_first_chunk_is_cut_to_the_files_declared_size() {
 	assert_eq!(buf, [1; 8]);
 }
 
+/// The read of a one-chunk file covers the whole file, so its hash check fails it. The decode ends
+/// with that error's kind, not as a failed transfer or a settled verdict about the image.
+#[test]
+fn a_read_failing_its_hash_check_ends_the_thumbnail_with_its_kind() {
+	let source = RemoteChunkSource::with_fetcher(
+		1_024,
+		None,
+		Box::new(|_: ChunkAsk| -> std::io::Result<Vec<u8>> {
+			Err(std::io::Error::other(Error::custom(
+				ErrorKind::ContentHashMismatch,
+				"the content does not match its hash",
+			)))
+		}),
+	);
+	let error = make_thumbnail_from_source(
+		Box::new(source),
+		&ThumbSpec::new(64, 64, DEFAULT_THUMBNAIL_MEM_BUDGET),
+		ThumbnailFit::Contain,
+		None,
+		&mut Vec::new(),
+	)
+	.expect_err("nothing could be read");
+	assert_eq!(error.kind(), ErrorKind::ContentHashMismatch);
+}
+
 #[test]
 fn short_reads_at_chunk_boundaries_still_thumbnail() {
 	// A 1 KiB chunk size forces hundreds of boundary-shortened reads

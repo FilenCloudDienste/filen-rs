@@ -716,6 +716,18 @@ mod remote_chunks {
 	/// [`over_requests`](Self::over_requests)). The two-slot cache and the short
 	/// reads at chunk boundaries are shared; cancellation is NOT — only the
 	/// native bridge is ever handed a flag, see [`cancel`](Self::cancel).
+	///
+	/// The file's content is checked against the BLAKE3 its metadata declares only on a read
+	/// that covers the whole file, as every download is (see
+	/// [`ErrorKind::ContentHashMismatch`](crate::ErrorKind::ContentHashMismatch)); a range is not. Here that is a fetch of the only
+	/// chunk of a one-chunk file on native (wasm fetches the first chunk on its own, unchecked),
+	/// or a bulk stream from the first chunk that the decode reads to the file's end. So whether
+	/// a thumbnail is checked depends on the target, the file's size and how far its format makes
+	/// the decode read, and a file whose content does not match may still be thumbnailed. A
+	/// checked read that fails ends the decode with
+	/// [`ErrorKind::ContentHashMismatch`](crate::ErrorKind::ContentHashMismatch), or, from a decoder
+	/// that reports a failed read as undecodable bytes, with
+	/// [`ThumbnailOutcome::Corrupt`](super::ThumbnailOutcome::Corrupt).
 	pub struct RemoteChunkSource {
 		fetch: Box<dyn FnMut(ChunkAsk) -> std::io::Result<Vec<u8>> + Send>,
 		/// Checked before every read: cancellation surfaces as an io error,
@@ -1594,6 +1606,9 @@ mod js_impls {
 			all(target_family = "wasm", target_os = "unknown"),
 			wasm_bindgen::prelude::wasm_bindgen(js_name = "makeThumbnailInMemory")
 		)]
+		/// Thumbnails a remote file from its chunks. Its content is checked against the hash its
+		/// metadata declares only when the decode reads the whole file, which depends on the
+		/// target and the file's size and format: see [`RemoteChunkSource`](super::RemoteChunkSource).
 		pub async fn make_thumbnail_in_memory(
 			&self,
 			params: MakeThumbnailInMemoryParams,
@@ -1613,6 +1628,9 @@ mod js_impls {
 			all(target_family = "wasm", target_os = "unknown"),
 			wasm_bindgen::prelude::wasm_bindgen(js_name = "makeThumbnailInMemory")
 		)]
+		/// Thumbnails a remote file from its chunks. Its content is checked against the hash its
+		/// metadata declares only when the decode reads the whole file, which depends on the
+		/// target and the file's size and format: see [`RemoteChunkSource`](super::RemoteChunkSource).
 		pub async fn make_thumbnail_in_memory(
 			&self,
 			params: MakeThumbnailInMemoryParams,

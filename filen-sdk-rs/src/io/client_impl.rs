@@ -736,7 +736,17 @@ where
 		on_resumed(not_downloaded);
 	}
 
-	let tmp_file = download_into_file(unauth_client, remote_file, tmp_file, held, callback).await?;
+	let tmp_file =
+		match download_into_file(unauth_client, remote_file, tmp_file, held, callback).await {
+			Ok(tmp_file) => tmp_file,
+			// Nothing a later call could continue from: the bytes are what fails the check, so a
+			// resume would only find the same mismatch, under another error.
+			Err(error) if error.kind() == ErrorKind::ContentHashMismatch => {
+				tmp_guard.discard();
+				return Err(error);
+			}
+			Err(error) => return Err(error),
+		};
 
 	// What an earlier download left could have been changed since; the declared hash vouches for
 	// the whole file. Without one, the bytes are taken as they are.
@@ -1001,12 +1011,17 @@ pub trait IoSharedClientExt<'a>: SharedClient {
 	where
 		T: 'b + AsyncWrite + Unpin;
 
+	/// Downloads the whole file. Fails with [`ErrorKind::ContentHashMismatch`] when its bytes do
+	/// not hash to the BLAKE3 its metadata declares, if it declares one.
 	// this could be optimized to avoid allocations by downloading directly to the writer
 	// would need to allocate a buffer of file.size() + FILE_CHUNK_SIZE_EXTRA
 	// and download to it sequentially, decrypting in place
 	// and finally shrinking the buffer to file.size()
 	async fn download_file(&self, file: &dyn File) -> Result<Vec<u8>, Error>;
 
+	/// Downloads the whole file to `path`, through a temp file beside it that is renamed into
+	/// place only once every byte is written. A file whose bytes do not hash to the BLAKE3 its
+	/// metadata declares fails with [`ErrorKind::ContentHashMismatch`] and leaves `path` as it was.
 	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 	async fn download_file_to_path<'b>(
 		&'b self,
@@ -1033,7 +1048,8 @@ pub trait IoSharedClientExt<'a>: SharedClient {
 	/// what it wrote when it does not finish, to be continued by a later call. The bytes written so
 	/// far are kept beside `path` in a temp file named after the file's uuid. A resumed file is
 	/// checked against the hash `remote_file` declares, if any, and on a mismatch the temp file is
-	/// removed and an error returned, so the next call starts over.
+	/// removed and an error returned, so the next call starts over. So is one read whole, which
+	/// fails with [`ErrorKind::ContentHashMismatch`].
 	///
 	/// `on_resumed` is called once, before anything is downloaded, with how many of the bytes an
 	/// earlier call left are not downloaded again, when there are any: those in the whole chunks
@@ -1080,7 +1096,9 @@ where
 		let (mut reader, progress) = reader_with_progress(self, file, start, end, callback);
 		// change to BorrowedBuf when `core_io_borrowed_buf` is stabilized
 		// https://github.com/rust-lang/rust/issues/117693
-		let mut buffer = vec![0u8; copy_buffer_len(Some(end.saturating_sub(start)))];
+		// At least one byte: a read into an empty buffer returns 0 at once, without the reader
+		// reaching the end of an empty file, where it checks the file's hash.
+		let mut buffer = vec![0u8; copy_buffer_len(Some(end.saturating_sub(start))).max(1)];
 		loop {
 			let bytes_read = reader.read(&mut buffer).await?;
 			if bytes_read == 0 {
@@ -1158,6 +1176,7 @@ mod copy_buffer_tests {
 		IoSharedClientExt, copy_buffer_len, path_transfer_tests::peak_bytes_parked_on_the_budget,
 	};
 	use crate::{
+		ErrorKind,
 		auth::{http::ClientConfig, test_support::offline_client, unauth::UnauthClient},
 		consts::{CHUNK_SIZE, CHUNK_SIZE_U64},
 		fs::drive_job::test_support::stored_file,
@@ -1211,6 +1230,38 @@ mod copy_buffer_tests {
 		);
 
 		assert!(peak < 128 * 1024, "the waiting download held {peak} bytes");
+	}
+
+	#[tokio::test]
+	async fn a_download_of_an_empty_file_declaring_the_hash_of_other_bytes_fails() {
+		let client = UnauthClient::from_config(ClientConfig::default()).unwrap();
+		let file = stored_file(
+			Uuid::from_u128(1),
+			Uuid::from_u128(2),
+			"empty.bin",
+			0,
+			0,
+			Some(blake3::hash(b"other bytes").into()),
+		);
+
+		let error = client.download_file(&file).await.unwrap_err();
+
+		assert_eq!(error.kind(), ErrorKind::ContentHashMismatch);
+	}
+
+	#[tokio::test]
+	async fn a_download_of_an_empty_file_declaring_the_hash_of_no_bytes_is_empty() {
+		let client = UnauthClient::from_config(ClientConfig::default()).unwrap();
+		let file = stored_file(
+			Uuid::from_u128(1),
+			Uuid::from_u128(2),
+			"empty.bin",
+			0,
+			0,
+			Some(blake3::hash(b"").into()),
+		);
+
+		assert_eq!(client.download_file(&file).await.unwrap(), Vec::<u8>::new());
 	}
 }
 
@@ -1595,6 +1646,28 @@ mod path_transfer_tests {
 		);
 
 		assert!(peak < 64 * 1024, "the waiting download held {peak} bytes");
+	}
+
+	#[tokio::test]
+	async fn a_resumable_download_that_does_not_match_its_hash_keeps_no_temp_file() {
+		let client = UnauthClient::from_config(ClientConfig::default()).unwrap();
+		let file = stored_file(
+			Uuid::from_u128(1),
+			Uuid::from_u128(2),
+			"empty.bin",
+			0,
+			0,
+			Some(blake3::hash(b"other bytes").into()),
+		);
+		let dir = tempfile::tempdir().unwrap();
+
+		let error = client
+			.download_file_to_path_resuming(&file, &dir.path().join("empty.bin"), None, None)
+			.await
+			.unwrap_err();
+
+		assert_eq!(error.kind(), ErrorKind::ContentHashMismatch);
+		assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
 	}
 }
 

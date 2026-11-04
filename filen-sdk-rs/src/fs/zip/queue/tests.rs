@@ -4,7 +4,7 @@ use std::{
 	time::Duration,
 };
 
-use filen_types::fs::Uuid;
+use filen_types::{crypto::Blake3Hash, fs::Uuid};
 use futures::{
 	AsyncRead,
 	future::join_all,
@@ -17,7 +17,7 @@ use crate::{
 	auth::http::{ClientConfig, SharedClientState},
 	consts::FILE_CHUNK_SIZE_EXTRA,
 	fs::{
-		drive_job::test_support::{chunk_data, full_chunk, stored_file},
+		drive_job::test_support::{chunk_data, full_chunk, source_hash, stored_file},
 		file::read::chunk_plaintext_len,
 		zip::walk::DirEntry,
 	},
@@ -238,6 +238,21 @@ fn file<'a>(id: u128, name: &str, size: u64) -> Entry<'a> {
 	}
 }
 
+/// [`file`] with `hash` in its metadata.
+fn hashed_file<'a>(id: u128, name: &str, size: u64, hash: Blake3Hash) -> Entry<'a> {
+	Entry::File {
+		file: stored_file(
+			Uuid::from_u128(id),
+			Uuid::nil(),
+			name,
+			size,
+			size.div_ceil(CHUNK_SIZE_U64),
+			Some(hash),
+		),
+		path: Some(name.to_owned()),
+	}
+}
+
 fn contents(id: u128, size: u64) -> Vec<u8> {
 	(0..size.div_ceil(CHUNK_SIZE_U64))
 		.flat_map(|index| chunk_data(Uuid::from_u128(id), index, size))
@@ -364,6 +379,57 @@ async fn a_failed_download_ends_the_archive_with_its_error() {
 		.unwrap_err();
 
 	assert_eq!(error.kind(), ErrorKind::Server);
+}
+
+#[tokio::test(start_paused = true)]
+async fn files_matching_their_hashes_are_archived() {
+	let backend = FakeBackend::with_memory(16);
+	let big = 2 * CHUNK_SIZE_U64 + CHUNK_SIZE_U64 / 2;
+	let entries = vec![
+		hashed_file(1, "small", 10, source_hash(Uuid::from_u128(1), 10)),
+		hashed_file(2, "big", big, source_hash(Uuid::from_u128(2), big)),
+		hashed_file(3, "empty", 0, source_hash(Uuid::from_u128(3), 0)),
+	];
+
+	let bytes = write(&backend, entries, (10 + big, 3), &Reports::default())
+		.await
+		.unwrap();
+
+	assert_eq!(
+		read_archive(bytes),
+		[
+			("small".to_owned(), contents(1, 10)),
+			("big".to_owned(), contents(2, big)),
+			("empty".to_owned(), Vec::new()),
+		]
+	);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_file_of_one_chunk_not_matching_its_hash_ends_the_archive_with_a_mismatch() {
+	let backend = FakeBackend::with_memory(16);
+	let wrong = source_hash(Uuid::from_u128(9), 10);
+	let entries = vec![file(1, "a", 10), hashed_file(2, "b", 10, wrong)];
+
+	let error = write(&backend, entries, (20, 2), &Reports::default())
+		.await
+		.unwrap_err();
+
+	assert_eq!(error.kind(), ErrorKind::ContentHashMismatch);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_file_of_several_chunks_not_matching_its_hash_ends_the_archive_with_a_mismatch() {
+	let backend = FakeBackend::with_memory(16);
+	let big = 2 * CHUNK_SIZE_U64 + CHUNK_SIZE_U64 / 2;
+	let wrong = source_hash(Uuid::from_u128(9), big);
+	let entries = vec![hashed_file(1, "big", big, wrong)];
+
+	let error = write(&backend, entries, (big, 1), &Reports::default())
+		.await
+		.unwrap_err();
+
+	assert_eq!(error.kind(), ErrorKind::ContentHashMismatch);
 }
 
 #[tokio::test(start_paused = true)]

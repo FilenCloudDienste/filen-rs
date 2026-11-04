@@ -571,19 +571,43 @@ impl Client {
 	/// Test-only: it lets the sync engine's live tests stage a hashless remote file.
 	#[cfg(feature = "malformed")]
 	pub async fn strip_file_hash(&self, file: &mut RemoteFile) -> Result<(), Error> {
+		self.rewrite_file_hash(file, None).await
+	}
+
+	/// Rewrites `file`'s metadata with `hash` as its BLAKE3, whatever its content hashes to, so a
+	/// real upload reads like one whose stored data no longer matches its metadata. The rest of the
+	/// metadata is written back as it is, and `file` is updated to match. The file's shares and
+	/// public links are not updated.
+	///
+	/// Test-only: it lets the download tests stage a file whose content fails its hash.
+	#[cfg(feature = "malformed")]
+	pub async fn replace_file_hash(
+		&self,
+		file: &mut RemoteFile,
+		hash: Blake3Hash,
+	) -> Result<(), Error> {
+		self.rewrite_file_hash(file, Some(hash)).await
+	}
+
+	#[cfg(feature = "malformed")]
+	async fn rewrite_file_hash(
+		&self,
+		file: &mut RemoteFile,
+		hash: Option<Blake3Hash>,
+	) -> Result<(), Error> {
 		let _lock = self.lock_drive().await?;
 		let uuid = file.uuid();
 		let FileMeta::Decoded(meta) = &mut file.meta else {
 			return Err(MetadataWasNotDecryptedError.into());
 		};
 		let unchanged = FileMetaChanges::default();
-		let stripped = DecryptedFileMeta {
-			hash: None,
+		let rewritten = DecryptedFileMeta {
+			hash,
 			..meta.borrowed_with_changes(&unchanged)
 		};
-		let request = self.file_metadata_request(uuid, &stripped).await?;
+		let request = self.file_metadata_request(uuid, &rewritten).await?;
 		api::v3::file::metadata::post(self.client(), &request).await?;
-		meta.hash = None;
+		meta.hash = hash;
 		Ok(())
 	}
 

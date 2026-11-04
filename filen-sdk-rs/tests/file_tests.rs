@@ -1509,6 +1509,54 @@ async fn download_chunk_for_random_uuid_returns_file_chunk_not_found_kind() {
 	);
 }
 
+/// A file whose content no longer hashes to the BLAKE3 its metadata declares must fail every
+/// whole-file download, and a download to a path must leave the file at the path as it was and
+/// nothing beside it.
+#[cfg(feature = "malformed")]
+#[shared_test_runtime]
+async fn downloads_of_a_file_not_matching_its_hash_fail() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = &resources.dir;
+
+	let contents = b"the bytes the uploader wrote";
+	let file = client
+		.make_file_builder("hash_mismatch.txt", test_dir.uuid())
+		.unwrap();
+	let mut file = client.upload_file(file, contents).await.unwrap();
+	let wrong = blake3::hash(b"other bytes").into();
+	client.replace_file_hash(&mut file, wrong).await.unwrap();
+	// as listed from the server, so the declared hash is the one the metadata now carries
+	let file = client.get_file(file.uuid()).await.unwrap();
+	assert_eq!(file.hash(), Some(wrong));
+
+	let error = client.download_file(&file).await.unwrap_err();
+	assert_eq!(error.kind(), ErrorKind::ContentHashMismatch, "{error}");
+
+	let download_dir = tempfile::tempdir().unwrap();
+	let download_path = download_dir.path().join("hash_mismatch.txt");
+	// of another size than the file, so the download goes ahead rather than keeping it
+	let before = b"what the path held before the download";
+	std::fs::write(&download_path, before).unwrap();
+	let error = client
+		.download_file_to_path(&file, &download_path, None)
+		.await
+		.unwrap_err();
+	assert_eq!(error.kind(), ErrorKind::ContentHashMismatch, "{error}");
+	assert_eq!(std::fs::read(&download_path).unwrap(), before);
+	let left: Vec<_> = std::fs::read_dir(download_dir.path())
+		.unwrap()
+		.map(|entry| entry.unwrap().file_name())
+		.collect();
+	assert_eq!(left, ["hash_mismatch.txt"]);
+
+	// a range is not checked
+	let mut reader = client.get_file_reader_for_range(&file, 0, 3);
+	let mut head = Vec::new();
+	reader.read_to_end(&mut head).await.unwrap();
+	assert_eq!(head, contents[..3]);
+}
+
 #[cfg(feature = "malformed")]
 #[shared_test_runtime]
 async fn file_malformed_meta() {

@@ -27,7 +27,9 @@ use crate::{
 		file::{
 			chunk::Chunk,
 			enums::RemoteFileType,
-			read::{FileReader, FileReaderBuilder, fetch_first_chunk, first_chunk_size},
+			read::{
+				ContentVerifier, FileReader, FileReaderBuilder, fetch_first_chunk, first_chunk_size,
+			},
 			traits::HasFileInfo,
 		},
 	},
@@ -414,11 +416,17 @@ where
 		})?;
 		let start = self.progress.file_start();
 		let mut written = 0u64;
+		// The entry gets the file's bytes from two reads, its first chunk and the range after it,
+		// which no reader sees whole, so the file's hash is checked over what is written here.
+		let mut verifier = ContentVerifier::new(file);
 		if let Some(chunk) = first_chunk {
 			let data = chunk.as_ref();
 			// a chunk is never longer than the file, as the reader would cut it
 			let len = usize::try_from(size).map_or(data.len(), |size| size.min(data.len()));
 			for piece in data.get(..len).unwrap_or(data).chunks(MAX_WRITE) {
+				if let Some(verifier) = &mut verifier {
+					verifier.update(piece);
+				}
 				writer.write_all(piece).await?;
 				let delta = u64::try_from(piece.len()).unwrap_or(u64::MAX);
 				written = written.saturating_add(delta);
@@ -433,6 +441,9 @@ where
 		}
 		if let Some(remainder) = &mut remainder {
 			while let Some(piece) = remainder.fill_buf().await?.chunks(MAX_WRITE).next() {
+				if let Some(verifier) = &mut verifier {
+					verifier.update(piece);
+				}
 				writer.write_all(piece).await?;
 				let len = piece.len();
 				remainder.consume_unpin(len);
@@ -440,6 +451,10 @@ where
 				written = written.saturating_add(delta);
 				self.progress.file_written(start, written, size, delta);
 			}
+		}
+		// before the entry is closed, so the archive never holds a complete entry of other bytes
+		if let Some(verifier) = verifier {
+			verifier.finish()?;
 		}
 		writer
 			.close()
