@@ -67,7 +67,7 @@ pub mod js;
 pub mod notes;
 pub mod obs;
 // The OS's certificate verifier and proxy settings, on the desktop targets only.
-#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+#[cfg(platform_net)]
 pub(crate) mod platform_net;
 pub(crate) mod progress;
 // Managed rclone (network drive mounts and `rclone serve`). Native-only: it runs rclone as a child

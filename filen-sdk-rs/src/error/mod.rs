@@ -50,13 +50,13 @@ impl From<filen_types::error::ResponseError> for Error {
 // found no network: the server was reached, but the connection to it could not be verified.
 impl From<reqwest::Error> for Error {
 	fn from(e: reqwest::Error) -> Self {
-		#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+		#[cfg(platform_net)]
 		let kind = if crate::platform_net::rejected_certificate(&e) {
 			ErrorKind::TlsVerification
 		} else {
 			ErrorKind::Reqwest
 		};
-		#[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+		#[cfg(not(platform_net))]
 		let kind = ErrorKind::Reqwest;
 		Error {
 			kind,

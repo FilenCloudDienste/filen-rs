@@ -194,11 +194,11 @@ impl UnauthedSocket<UnauthedNativeSender, UnauthedNativeReceiver, Utf8Bytes>
 
 /// What [`NativeSocket::connect`] opens: the URL or, on the desktop targets, how to reach it.
 pub(super) struct NativeRequest {
-	#[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+	#[cfg(not(platform_net))]
 	url: String,
-	#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+	#[cfg(platform_net)]
 	transport: std::sync::Arc<crate::platform_net::SocketTransport>,
-	#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+	#[cfg(platform_net)]
 	route: crate::platform_net::SocketRoute,
 }
 
@@ -219,27 +219,24 @@ impl
 		NativePingTask,
 	> for NativeSocket
 {
-	#[cfg_attr(
-		not(any(target_os = "windows", target_os = "macos", target_os = "linux")),
-		allow(unused_variables)
-	)]
+	#[cfg_attr(not(platform_net), allow(unused_variables))]
 	async fn build_request(client: &AuthClient) -> Result<NativeRequest, Error> {
 		let url = format!(
 			"{}{}",
 			WEBSOCKET_URL_CORE,
 			chrono::Utc::now().timestamp_millis()
 		);
-		#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+		#[cfg(platform_net)]
 		{
 			let transport = client.unauthed.socket_transport.clone();
 			let route = transport.route(&url)?;
 			Ok(NativeRequest { transport, route })
 		}
-		#[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+		#[cfg(not(platform_net))]
 		Ok(NativeRequest { url })
 	}
 
-	#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+	#[cfg(platform_net)]
 	fn proxied(request: &NativeRequest) -> bool {
 		request.route.proxied()
 	}
@@ -257,9 +254,9 @@ impl
 			.max_message_size(Some(4 << 20));
 		// The desktop targets verify with the OS and go through its proxy; the others keep
 		// tungstenite's webpki roots and connect directly.
-		#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+		#[cfg(platform_net)]
 		let ws_stream = request.transport.connect(request.route, config).await?;
-		#[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+		#[cfg(not(platform_net))]
 		let (ws_stream, _) =
 			tokio_tungstenite::connect_async_with_config(request.url, Some(config), false)
 				.await

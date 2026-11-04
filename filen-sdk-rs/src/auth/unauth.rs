@@ -49,7 +49,7 @@ pub struct UnauthClient {
 	pub(crate) reqwest_client: reqwest::Client,
 	/// How the websocket connects: the same TLS configuration as `reqwest_client`, and the
 	/// system's proxy.
-	#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+	#[cfg(platform_net)]
 	pub(crate) socket_transport: Arc<crate::platform_net::SocketTransport>,
 	#[cfg(feature = "http-provider")]
 	pub(crate) http_provider: Arc<Mutex<Weak<HttpProviderHandle>>>,
@@ -61,7 +61,7 @@ impl UnauthClient {
 		let state = SharedClientState::new(client_config)?;
 		Ok(Self {
 			reqwest_client: http.reqwest,
-			#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+			#[cfg(platform_net)]
 			socket_transport: http.socket_transport,
 			state,
 			#[cfg(feature = "http-provider")]

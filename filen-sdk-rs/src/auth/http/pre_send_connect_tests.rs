@@ -43,7 +43,7 @@ async fn refused_connect_is_classified_as_pre_send_connect() {
 
 /// A certificate the verifier rejected is rejected again, so the attempt is not retried, and it
 /// reads as `TlsVerification`.
-#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+#[cfg(platform_net)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_rejected_certificate_is_not_retried() {
 	let port = crate::platform_net::test_support::untrusted_tls_server(1);

@@ -310,7 +310,7 @@ impl ClientConfig {
 			if let Some(read_timeout) = self.read_timeout {
 				builder = builder.read_timeout(read_timeout);
 			}
-			#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+			#[cfg(platform_net)]
 			let (builder, socket_transport) = {
 				let tls = crate::platform_net::platform_tls_config();
 				let builder = match &tls {
@@ -327,7 +327,7 @@ impl ClientConfig {
 			};
 			Ok(HttpClients {
 				reqwest: builder.build().map_err(Error::from)?,
-				#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+				#[cfg(platform_net)]
 				socket_transport,
 			})
 		}
@@ -350,7 +350,7 @@ impl ClientConfig {
 /// What [`ClientConfig::build_http`] builds once per client.
 pub(crate) struct HttpClients {
 	pub(crate) reqwest: reqwest::Client,
-	#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+	#[cfg(platform_net)]
 	pub(crate) socket_transport: Arc<crate::platform_net::SocketTransport>,
 }
 
@@ -964,7 +964,7 @@ async fn execute_request(
 			// rather than the instant re-attempt every other retryable class gets.
 			// A rejected certificate is rejected again: a retry would repeat the handshake, and
 			// the OS's check with its revocation fetches, for the same answer.
-			#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+			#[cfg(platform_net)]
 			if crate::platform_net::rejected_certificate(&e) {
 				return retry::RetryError::NoRetry(Error::from(e));
 			}
