@@ -1939,12 +1939,21 @@ impl Borrowed {
 /// name, uploads a new version under it: here it gets past the name to the network, which the
 /// offline client fails. The same name where the remote holds no file is a new name, still
 /// refused before anything is sent.
+///
+/// Each name is one this host's file system holds: Windows can hold neither `a:b` (a colon names
+/// an alternate data stream) nor a trailing dot (stripped from the path), but does hold a leading
+/// space, which the validator refuses too.
 #[tokio::test]
 async fn an_edit_uploads_under_a_rejected_name_only_the_remote_holds() {
 	let borrowed = Borrowed::new();
 	let root = Uuid::from_u128(1);
 	let ctx = borrowed.ctx(root, None);
-	for name in ["a:b", "trailing."] {
+	let names: &[&str] = if cfg!(windows) {
+		&[" leading"]
+	} else {
+		&["a:b", "trailing.", " leading"]
+	};
+	for &name in names {
 		std::fs::write(borrowed.local.path().join(name), b"new").unwrap();
 		let upload = |remote: Option<RemoteNode>| PlannedEntry {
 			action: upload(name),
