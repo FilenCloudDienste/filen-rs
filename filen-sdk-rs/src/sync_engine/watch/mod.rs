@@ -559,27 +559,10 @@ async fn run_loop(watch: WatchLoop) {
 				safety_net.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 			}
 		}
-		if error.is_none() {
+		let succeeded = error.is_none();
+		if succeeded {
 			failures = 0;
 			reconnects = None;
-			// A pass that succeeded holds the engine's own subscription to the same root (its wait
-			// for the remote view asks for it), so a watch that has none joins that registration
-			// without the cache asking the server anything.
-			remote
-				.subscribe(
-					|callback| Arc::clone(&engine.client).add_sync_root(remote_root, callback),
-					&status,
-				)
-				.await;
-			// The net measures time since the last SUCCESSFUL pass, not since the last tick: a pass
-			// that just succeeded has already done everything the net would do, so a tick that came
-			// due during it buys nothing but a no-op pass right after. A FAILED pass deliberately
-			// leaves the interval alone — its own retry timer is the backoff, and a run of failures
-			// must not push the net out indefinitely. So does a pass a pause cut short: it did not
-			// do what the net would have done either.
-			if !owed {
-				safety_net.reset();
-			}
 		} else {
 			failures = failures.saturating_add(1);
 		}
@@ -595,7 +578,23 @@ async fn run_loop(watch: WatchLoop) {
 		if offline && reconnects.is_none() {
 			reconnects = Reconnects::listen(&engine.client, pair).await;
 		}
-		publish_pass(&status, failures, error);
+		settle_pass(
+			&mut remote,
+			|callback| Arc::clone(&engine.client).add_sync_root(remote_root, callback),
+			&status,
+			failures,
+			error,
+		)
+		.await;
+		// The net measures time since the last SUCCESSFUL pass, not since the last tick: a pass
+		// that just succeeded has already done everything the net would do, so a tick that came
+		// due during it buys nothing but a no-op pass right after. A FAILED pass deliberately
+		// leaves the interval alone — its own retry timer is the backoff, and a run of failures
+		// must not push the net out indefinitely. So does a pass a pause cut short: it did not
+		// do what the net would have done either.
+		if succeeded && !owed {
+			safety_net.reset();
+		}
 		let delay = backoff(failures);
 		if let Some(delay) = delay {
 			tracing::warn!(
@@ -1168,6 +1167,32 @@ fn publish_pass(
 		status.last_error_kind = kind;
 		status.state = WatchState::Running;
 	});
+}
+
+/// Publish a finished pass's health (see [`publish_pass`]) and, after one that succeeded, ask
+/// `subscribe` for the watch's remote subscription if it has none yet.
+///
+/// A pass that succeeded holds the engine's own subscription to the same root (its wait for the
+/// remote view asks for it), so a watch that has none joins that registration without the cache
+/// asking the server anything. The pass's result goes out first: a grant clears
+/// [`WatchStatus::remote_events_degraded`] in a send of its own, and published before the result
+/// it would pair a healthy subscription with the failures that pass just ended.
+async fn settle_pass<H, F, Fut>(
+	remote: &mut RemoteDoorbell<H>,
+	subscribe: F,
+	status: &tokio::sync::watch::Sender<WatchStatus>,
+	failures: u32,
+	error: Option<(String, ErrorKind)>,
+) where
+	H: RemoteLiveness,
+	F: FnOnce(SyncRootCallback) -> Fut,
+	Fut: Future<Output = Result<H, Error>>,
+{
+	let succeeded = error.is_none();
+	publish_pass(status, failures, error);
+	if succeeded {
+		remote.subscribe(subscribe, status).await;
+	}
 }
 
 /// Start the filesystem watcher on `root`. Never fails the watch: a watcher that cannot be created

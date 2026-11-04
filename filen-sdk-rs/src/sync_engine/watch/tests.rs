@@ -16,8 +16,8 @@ use super::{
 	MAX_SAFETY_NET, PairChanges, PairRoot, RemoteDoorbell, RemoteLiveness, SAFETY_NET,
 	SAFETY_NET_DUTY, SOCKET_CONNECT_GRACE, SOCKET_NOT_CONNECTED, Stop, SyncReport, WatchConfig,
 	WatchState, WatchStatus, backoff, local_event_handler, net_due, net_interval, owes_a_pass,
-	pass_outcome, publish_pass, reached_no_server, read_both_sides_whole, start_local_watcher,
-	triggers_pass, wait_for_next_pass, wait_while_paused,
+	pass_outcome, publish_pass, reached_no_server, read_both_sides_whole, settle_pass,
+	start_local_watcher, triggers_pass, wait_for_next_pass, wait_while_paused,
 };
 use crate::{
 	Error, ErrorKind,
@@ -659,6 +659,63 @@ async fn a_subscription_refused_at_the_start_is_taken_once_the_network_is_back()
 		DEBOUNCE,
 		"a remote change wakes the loop at the debounce"
 	);
+}
+
+/// A watch whose subscription was refused at the start, after a run of failed passes: the pass
+/// that succeeds publishes its result before the grant it brings, so no published status says
+/// remote changes are heard while still carrying the failures that pass ended.
+#[tokio::test]
+async fn a_pass_that_succeeds_publishes_its_result_before_the_subscription_it_grants() {
+	let (status, health) = tokio::sync::watch::channel(WatchStatus::default());
+	let mut remote = RemoteDoorbell::<()>::new(1, Arc::new(Notify::new()));
+	remote
+		.subscribe(
+			|_| {
+				std::future::ready(Err(Error::custom(
+					ErrorKind::Reqwest,
+					"error sending request",
+				)))
+			},
+			&status,
+		)
+		.await;
+	publish_pass(
+		&status,
+		4,
+		Some(("error sending request".to_owned(), ErrorKind::Reqwest)),
+	);
+
+	// Every value published from here on. The grant is published right after the cache answers,
+	// with nothing in between on this single thread, so what it publishes is the status as the
+	// cache is asked with the refusal cleared.
+	let mut published = Vec::new();
+	settle_pass(
+		&mut remote,
+		|_| {
+			let mut granted = health.borrow().clone();
+			granted.remote_events_degraded = None;
+			published.push(granted);
+			std::future::ready(Ok::<(), Error>(()))
+		},
+		&status,
+		0,
+		None,
+	)
+	.await;
+	published.push(health.borrow().clone());
+
+	assert_eq!(published.len(), 2, "the subscription is asked for once");
+	for value in &published {
+		assert!(
+			value.remote_events_degraded.is_some()
+				|| (value.consecutive_failures == 0 && value.last_error.is_none()),
+			"a granted subscription published with the previous failure: {value:?}"
+		);
+	}
+	let last = published.last().expect("the pass's result is published");
+	assert_eq!(last.consecutive_failures, 0);
+	assert_eq!(last.last_error, None);
+	assert_eq!(last.remote_events_degraded, None);
 }
 
 /// The failures that wait for the network as well as for their backoff are exactly the ones that
