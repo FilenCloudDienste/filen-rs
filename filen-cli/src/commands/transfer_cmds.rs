@@ -2006,8 +2006,9 @@ fn transfer_summary(tally: &Tally, elapsed: Duration) -> String {
 pub(crate) struct TransferProgress {
 	kind: TransferKind,
 	term: Term,
-	/// Whether the progress line may be drawn at all: never in quiet or JSON mode, and never when
-	/// stdout is redirected, where the redraws would end up in the captured output.
+	/// Whether the progress line may be drawn at all: never in quiet or JSON mode or while replay
+	/// testing, and never when stdout is redirected, where the redraws would end up in the
+	/// captured output.
 	enabled: bool,
 	/// Whether to print each file a directory transfer moved, as `-v` asks, unless the output is
 	/// JSON.
@@ -2020,7 +2021,7 @@ pub(crate) struct TransferProgress {
 impl TransferProgress {
 	pub(crate) fn new(kind: TransferKind, ui: &UI) -> Self {
 		let term = Term::stdout();
-		let enabled = term.is_term() && !ui.is_quiet() && !ui.json;
+		let enabled = term.is_term() && ui.may_draw_progress() && !ui.json;
 		Self {
 			kind,
 			term,

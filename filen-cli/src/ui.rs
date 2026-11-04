@@ -305,6 +305,12 @@ impl UI {
 		self.quiet
 	}
 
+	/// Whether a command may draw a progress line: not with `--quiet`, and not while replay
+	/// testing, where its redraws depend on timing and no recording could match them.
+	pub(crate) fn may_draw_progress(&self) -> bool {
+		!self.quiet && !self.make_output_environment_agnostic_for_replay_testing
+	}
+
 	/// Sets `-v`, which a REPL line can turn on for its command.
 	pub(crate) fn set_verbose(&mut self, verbose: bool) {
 		self.verbose = verbose;
@@ -1272,6 +1278,16 @@ mod tests {
 	use std::{env, process::Command};
 
 	use super::{test_support::Printed, *};
+
+	#[test]
+	fn no_progress_is_drawn_with_quiet_or_while_replay_testing() {
+		let mut ui = Printed::default().ui();
+		assert!(ui.may_draw_progress());
+		ui.initialize(true, false, None, true, false);
+		assert!(!ui.may_draw_progress());
+		ui.initialize(false, false, None, true, true);
+		assert!(!ui.may_draw_progress());
+	}
 
 	/// Tests that read back what was logged. `log` takes one logger per process and other tests in
 	/// this binary install theirs (test-utils' tracing subscriber), so each of these runs alone in a

@@ -774,16 +774,21 @@ fn cmp_numbers(a: &str, b: &str) -> Ordering {
 }
 
 /// Prints one item per line: a right-aligned size column (directories have none), the date
-/// column, the label, the color of a directory that has one in brackets, and `(*)` after a
-/// favorited item.
+/// column (omitted while replay testing, since it differs on every run), the label, the color of
+/// a directory that has one in brackets, and `(*)` after a favorited item.
 fn print_long_listing(ui: &mut UI, items: &[ListedItem], by: ListedBy) {
 	let rows = items
 		.iter()
 		.map(|item| {
 			(
 				item.size.map_or_else(|| "-".to_string(), ui::format_size),
-				item.date()
-					.map_or_else(|| "-".to_string(), |date| ui::format_date(&date)),
+				item.date().map_or_else(
+					|| "-".to_string(),
+					|date| {
+						ui.omit_for_replay_testing(&ui::format_date(&date))
+							.to_owned()
+					},
+				),
 			)
 		})
 		.collect::<Vec<(String, String)>>();
@@ -2996,8 +3001,9 @@ fn copied_amount(report: &CopyReport) -> String {
 /// [`UI`], which the command holds.
 struct StderrProgress {
 	term: Term,
-	/// Only for a person at a terminal: not with `--quiet` or `--json`, and not when stdout or
-	/// stderr is redirected, where the redraws would end up in the captured output.
+	/// Only for a person at a terminal: not with `--quiet` or `--json`, not when stdout or stderr
+	/// is redirected, where the redraws would end up in the captured output, and not while replay
+	/// testing.
 	enabled: bool,
 	line: Mutex<ProgressLine>,
 }
@@ -3014,7 +3020,7 @@ enum ProgressLine {
 impl StderrProgress {
 	fn new(ui: &UI) -> Self {
 		let term = Term::stderr();
-		let enabled = ui.output_is_read_by_a_person() && !ui.is_quiet() && term.is_term();
+		let enabled = ui.output_is_read_by_a_person() && ui.may_draw_progress() && term.is_term();
 		Self {
 			term,
 			enabled,
@@ -4834,6 +4840,26 @@ mod tests {
 			"  -  2023-12-31 10:20:30 (UTC)  docs\n\
 			 5 B  2024-03-09 10:20:30 (UTC)  a.txt\n\
 			 5 B  -                          b.txt"
+		);
+	}
+
+	#[test]
+	fn a_long_listing_omits_the_dates_while_replay_testing() {
+		let items = vec![
+			ListedItem {
+				modified: Some(date(2024, 3, 9)),
+				..listed_file("a.txt", 5, 1)
+			},
+			listed_file("b.txt", 5, 2),
+		];
+		let printed = Printed::default();
+		let mut ui = printed.ui();
+		ui.initialize(false, false, None, true, true);
+		print_listing(&mut ui, &items, ListedBy::Name, "Directory is empty", true).unwrap();
+
+		assert_eq!(
+			console::strip_ansi_codes(&printed.lines()),
+			"5 B  [omit]  a.txt\n5 B  -       b.txt"
 		);
 	}
 

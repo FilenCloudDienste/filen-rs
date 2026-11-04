@@ -13,13 +13,13 @@
 # ({{ $MANUEL_EMAIL }}) /{{ $MANUEL_REMOTE_CWD }} ls                                                                          #
 # some_dir  asdf.txt  loong.txt                                                                                               #
 # ({{ $MANUEL_EMAIL }}) /{{ $MANUEL_REMOTE_CWD }} ls -l                                                                       #
-#        -  some_dir                                                                                                          #
-#     40 B  asdf.txt                                                                                                          #
-# 5.95 KiB  loong.txt                                                                                                         #
+#        -  [omit]  some_dir                                                                                                  #
+#     40 B  [omit]  asdf.txt                                                                                                  #
+# 5.95 KiB  [omit]  loong.txt                                                                                                 #
 # ({{ $MANUEL_EMAIL }}) /{{ $MANUEL_REMOTE_CWD }} ls --long                                                                   #
-#        -  some_dir                                                                                                          #
-#     40 B  asdf.txt                                                                                                          #
-# 5.95 KiB  loong.txt                                                                                                         #
+#        -  [omit]  some_dir                                                                                                  #
+#     40 B  [omit]  asdf.txt                                                                                                  #
+# 5.95 KiB  [omit]  loong.txt                                                                                                 #
 # ({{ $MANUEL_EMAIL }}) /{{ $MANUEL_REMOTE_CWD }} exit                                                                        #
 # (manuel)                                                                                                                    #
 #                                                                                                                             #
@@ -426,7 +426,7 @@ recording_items:
 - !Output "\e[?25l\e[54D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m ls -l \e[K\r\e[53C\e[?25h"
 - !Input
   - 13
-- !Output "\e[?25l\e[53D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m \e[38;5;14mls -l\e[39m\e[K\r\n\e[?25h\e[?25h\e[?2004l\e[2m       -\e[0m  \e[34msome_dir\e[0m\r\n    40 B  asdf.txt\r\n5.95 KiB  loong.txt\r\n\e[?2004h\e[?25l\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m  \r\e[48C\e[?25h"
+- !Output "\e[?25l\e[53D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m \e[38;5;14mls -l\e[39m\e[K\r\n\e[?25h\e[?25h\e[?2004l\e[2m       -\e[0m  \e[2m[omit]\e[0m  \e[34msome_dir\e[0m\r\n    40 B  \e[2m[omit]\e[0m  asdf.txt\r\n5.95 KiB  \e[2m[omit]\e[0m  loong.txt\r\n\e[?2004h\e[?25l\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m  \r\e[48C\e[?25h"
 - !Input
   - 108
 - !Input
@@ -453,7 +453,7 @@ recording_items:
 - !Output "\e[?25l\e[58D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m ls --long \e[K\r\e[57C\e[?25h"
 - !Input
   - 13
-- !Output "\e[?25l\e[57D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m \e[38;5;14mls --long\e[39m\e[K\r\n\e[?25h\e[?25h\e[?2004l\e[2m       -\e[0m  \e[34msome_dir\e[0m\r\n    40 B  asdf.txt\r\n5.95 KiB  loong.txt\r\n\e[?2004h\e[?25l\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m  \r\e[48C\e[?25h"
+- !Output "\e[?25l\e[57D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m \e[38;5;14mls --long\e[39m\e[K\r\n\e[?25h\e[?25h\e[?2004l\e[2m       -\e[0m  \e[2m[omit]\e[0m  \e[34msome_dir\e[0m\r\n    40 B  \e[2m[omit]\e[0m  asdf.txt\r\n5.95 KiB  \e[2m[omit]\e[0m  loong.txt\r\n\e[?2004h\e[?25l\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m  \r\e[48C\e[?25h"
 - !Input
   - 101
 - !Input
