@@ -962,6 +962,12 @@ async fn execute_request(
 			// Classified before `is_attempt_retryable`, which would otherwise reject it as a
 			// request-kind error: this one provably never reached the wire, and it wants a pause
 			// rather than the instant re-attempt every other retryable class gets.
+			// A rejected certificate is rejected again: a retry would repeat the handshake, and
+			// the OS's check with its revocation fetches, for the same answer.
+			#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+			if crate::platform_net::rejected_certificate(&e) {
+				return retry::RetryError::NoRetry(Error::from(e));
+			}
 			if is_pre_send_connect_failure(&e) {
 				return retry::RetryError::RetryAfterBackoff(Error::from(e));
 			}

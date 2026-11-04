@@ -2621,7 +2621,7 @@ enum ToDownload {
 /// Whether a failure is the network's — the request never got an answer — rather than the
 /// server's. Not an authentication failure, not a not-found, not a server error reply.
 fn is_unreachable(kind: ErrorKind) -> bool {
-	kind == ErrorKind::Reqwest
+	kind.reached_no_server()
 }
 
 /// The complete copy of `file`'s current version in the cache, if there is one: the file in
@@ -2714,6 +2714,8 @@ mod offline_copy_tests {
 	#[test]
 	fn only_a_transport_failure_is_unreachable() {
 		assert!(is_unreachable(ErrorKind::Reqwest));
+		// A certificate the verifier rejected never let the request reach the server either.
+		assert!(is_unreachable(ErrorKind::TlsVerification));
 		for kind in [
 			ErrorKind::Unauthenticated,
 			ErrorKind::FileNotFound,

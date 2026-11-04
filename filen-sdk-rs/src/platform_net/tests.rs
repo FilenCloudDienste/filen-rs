@@ -811,3 +811,66 @@ fn platform_tls_checks_the_distrusted_keys() {
 		assert!(format!("{config:?}").contains("DistrustingVerifier"));
 	}
 }
+
+/// A rejected certificate is found behind the `io::Error` the TLS stream wraps it in, whose
+/// `source` skips it, and only the certificate check's errors count.
+#[test]
+fn a_rejected_certificate_is_found_through_io_errors() {
+	let wrapped = |tls: rustls::Error| std::io::Error::new(std::io::ErrorKind::InvalidData, tls);
+	for tls in [
+		rustls::Error::InvalidCertificate(CertificateError::UnknownIssuer),
+		rustls::Error::InvalidCertificate(CertificateError::Other(OtherError(Arc::new(
+			webpki::Error::CertDistrusted,
+		)))),
+		rustls::Error::General("TLS verifier not initialised".into()),
+	] {
+		let io = wrapped(tls);
+		assert!(rejected_certificate(&io), "{io:?}");
+		let outer = Error::custom_with_source(ErrorKind::Internal, io, None::<&str>);
+		assert!(rejected_certificate(&outer), "{outer:?}");
+	}
+	assert!(!rejected_certificate(&wrapped(
+		rustls::Error::AlertReceived(rustls::AlertDescription::HandshakeFailure)
+	)));
+	assert!(!rejected_certificate(&std::io::Error::from(
+		std::io::ErrorKind::ConnectionReset
+	)));
+}
+
+/// A request to a server whose certificate the platform verifier rejects fails as
+/// `TlsVerification`, not as the transport's `Reqwest`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_to_an_unverified_server_is_not_offline() {
+	let port = test_support::untrusted_tls_server(1);
+	let client = ClientConfig::default().build_reqwest_client().unwrap();
+	let error = Error::from(
+		client
+			.get(format!("https://127.0.0.1:{port}/"))
+			.send()
+			.await
+			.unwrap_err(),
+	);
+	assert_eq!(error.kind(), ErrorKind::TlsVerification, "{error}");
+	assert!(error.kind().reached_no_server());
+}
+
+/// The websocket reports a rejected certificate the same way.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_websocket_to_an_unverified_server_is_not_offline() {
+	let port = test_support::untrusted_tls_server(1);
+	let transport = SocketTransport::with_proxy(
+		platform_tls_config(),
+		Matcher::builder().build(),
+		Some(Duration::from_secs(5)),
+	);
+	let route = transport
+		.route(&format!("wss://127.0.0.1:{port}/socket.io/"))
+		.unwrap();
+	let Err(error) = transport
+		.connect(route, tungstenite::protocol::WebSocketConfig::default())
+		.await
+	else {
+		panic!("an unverified server must not be reached");
+	};
+	assert_eq!(error.kind(), ErrorKind::TlsVerification, "{error}");
+}

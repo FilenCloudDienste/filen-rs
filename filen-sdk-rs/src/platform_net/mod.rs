@@ -34,6 +34,8 @@ use tower::ServiceExt;
 use crate::{Error, ErrorKind};
 
 #[cfg(test)]
+pub(crate) mod test_support;
+#[cfg(test)]
 mod tests;
 
 /// The TLS configuration both reqwest and the websocket use: the platform verifier, HTTP/1.1
@@ -498,9 +500,50 @@ fn proxy_target(ws: &Uri) -> Result<Uri, Error> {
 		})
 }
 
+/// The error a websocket connect failed with: [`ErrorKind::TlsVerification`] when the TLS
+/// handshake rejected the server's certificate, else [`ErrorKind::Server`].
 fn ws_error(e: tungstenite::Error) -> Error {
-	Error::custom(
-		ErrorKind::Server,
-		format!("failed to connect to websocket: {}", e),
+	let rejected = match &e {
+		tungstenite::Error::Tls(tungstenite::error::TlsError::Rustls(tls)) => {
+			rejects_certificate(tls)
+		}
+		other => rejected_certificate(other),
+	};
+	let kind = if rejected {
+		ErrorKind::TlsVerification
+	} else {
+		ErrorKind::Server
+	};
+	Error::custom(kind, format!("failed to connect to websocket: {}", e))
+}
+
+/// Whether `err` failed because the TLS handshake rejected the server's certificate, or the
+/// verifier could not check it ([`rejects_certificate`]). The chain is followed through each
+/// `io::Error` by the error it wraps, which its `source` skips: the TLS stream reports the
+/// handshake's error inside one.
+pub(crate) fn rejected_certificate(err: &(dyn std::error::Error + 'static)) -> bool {
+	let mut next = Some(err);
+	while let Some(e) = next {
+		if let Some(tls) = e.downcast_ref::<rustls::Error>() {
+			return rejects_certificate(tls);
+		}
+		next = match e.downcast_ref::<std::io::Error>() {
+			Some(io) => io
+				.get_ref()
+				.map(|inner| inner as &(dyn std::error::Error + 'static)),
+			None => e.source(),
+		};
+	}
+	false
+}
+
+/// Whether a client handshake's `error` is the certificate check's: a certificate the verifier
+/// rejected, or a general error, which on a client with the ring provider only the verifier
+/// gives (the OS could not run the check, the Android verifier is not initialised or its JVM
+/// side failed).
+fn rejects_certificate(error: &rustls::Error) -> bool {
+	matches!(
+		error,
+		rustls::Error::InvalidCertificate(_) | rustls::Error::General(_)
 	)
 }

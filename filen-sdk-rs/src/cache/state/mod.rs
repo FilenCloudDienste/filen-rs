@@ -184,7 +184,7 @@ struct ResyncListing {
 
 /// Keep `error` as an attempt's transport failure when it is one and the attempt has none yet.
 fn note_transport(transport: &mut Option<crate::Error>, error: crate::Error) {
-	if transport.is_none() && error.kind() == ErrorKind::Reqwest {
+	if transport.is_none() && error.kind().reached_no_server() {
 		*transport = Some(error);
 	}
 }

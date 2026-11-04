@@ -9,9 +9,9 @@ use std::sync::{
 	atomic::{AtomicU64, Ordering},
 };
 
-use crate::{Error, ErrorKind};
+use crate::Error;
 
-/// The transport failure ([`ErrorKind::Reqwest`]) the cache's latest request toward converging its
+/// The transport failure ([`crate::ErrorKind::reached_no_server`]) the cache's latest request toward converging its
 /// roots ended on, if it ended on one: the drive lock, the remote drive id read before the listing
 /// or by a gap-check, or a root's listing. Worker-wide, as the resync is: one attempt converges
 /// every registered root, so its failure holds back every root it has not converged, and a root it
@@ -124,7 +124,7 @@ impl ResyncReach {
 	pub(crate) fn failed(&self, since: ReachMark, error: impl Into<Arc<Error>>) {
 		let error = error.into();
 		let mut failure = self.failure();
-		if error.kind() != ErrorKind::Reqwest {
+		if !error.kind().reached_no_server() {
 			*failure = None;
 		} else if self.connections() == since.0 {
 			*failure = Some((error, since.0));

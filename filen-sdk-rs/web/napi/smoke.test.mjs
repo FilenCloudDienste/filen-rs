@@ -238,7 +238,8 @@ describe("exports", () => {
 				ArchivePasswordRequired: 34,
 				ArchiveWrongPassword: 35,
 				ArchiveSolidSkipExceeded: 36,
-				LockLost: 37
+				LockLost: 37,
+				TlsVerification: 38
 			}
 		)
 	})

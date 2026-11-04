@@ -3546,7 +3546,7 @@ impl SyncEngine {
 		);
 		match tokio::time::timeout(CONVERGENCE_WAIT, events.catch_up(wants)).await {
 			Ok(Ok(())) => Ok(()),
-			Ok(Err(failure)) if failure.kind() == ErrorKind::Reqwest => {
+			Ok(Err(failure)) if failure.kind().reached_no_server() => {
 				Err(remote_unreachable(pair, remote_root, failure))
 			}
 			Ok(Err(failure)) => Err(Error::custom_with_source(

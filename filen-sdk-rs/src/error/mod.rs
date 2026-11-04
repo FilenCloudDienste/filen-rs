@@ -46,7 +46,25 @@ impl From<filen_types::error::ResponseError> for Error {
 	}
 }
 
-impl_from!(reqwest::Error, ErrorKind::Reqwest);
+// A request whose TLS handshake rejected the server's certificate is told apart from one that
+// found no network: the server was reached, but the connection to it could not be verified.
+impl From<reqwest::Error> for Error {
+	fn from(e: reqwest::Error) -> Self {
+		#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+		let kind = if crate::platform_net::rejected_certificate(&e) {
+			ErrorKind::TlsVerification
+		} else {
+			ErrorKind::Reqwest
+		};
+		#[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+		let kind = ErrorKind::Reqwest;
+		Error {
+			kind,
+			inner: Some(Box::new(e)),
+			context: None,
+		}
+	}
+}
 // `MissingStableUuid` is the one foreseeable, actionable conversion failure —
 // a link- or shared-listed file fed to a drive operation — so it gets its own
 // kind callers can switch on instead of the blanket `Conversion` bucket.
@@ -202,6 +220,22 @@ pub enum ErrorKind {
 	/// the loss, and running the operation again, which takes the lock afresh, repeats no write
 	/// it made before. A job reports it for an item whose step it did not send.
 	LockLost,
+	/// The connection to the server could not be verified: the TLS handshake rejected the
+	/// server's certificate (an unknown issuer such as an intercepting proxy or a captive portal,
+	/// an expired, revoked or distrusted certificate, a name mismatch), or the platform's
+	/// certificate verifier could not run. Unlike [`Reqwest`](Self::Reqwest), the network
+	/// worked; the SDK treats both alike otherwise (see [`Self::reached_no_server`]), so a
+	/// request failing with it is not retried, and it is never sent unverified.
+	TlsVerification,
+}
+
+impl ErrorKind {
+	/// Whether an error of this kind got no answer from the server: the transport failed
+	/// ([`Reqwest`](Self::Reqwest)), or the server's certificate was not verified
+	/// ([`TlsVerification`](Self::TlsVerification)), so no request reached it.
+	pub fn reached_no_server(self) -> bool {
+		matches!(self, Self::Reqwest | Self::TlsVerification)
+	}
 }
 
 /// Custom error type for the SDK

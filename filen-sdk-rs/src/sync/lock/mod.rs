@@ -222,7 +222,7 @@ impl ResourceLock {
 	/// `Ok` once the lease is confirmed: at once while [`Self::is_valid`], otherwise after
 	/// asking the server with a refresh. A lost lease is an [`ErrorKind::LockLost`] error.
 	///
-	/// A refresh failing in transport ([`ErrorKind::Reqwest`]) says nothing about the lease, so
+	/// A refresh failing in transport ([`ErrorKind::reached_no_server`]) says nothing about the lease, so
 	/// the server is asked again, every [`LOCK_RETRY_INTERVAL`], until the lease is confirmed or
 	/// lost: no refresh confirmed while the lease could stand loses it, as for the keep-alive. A
 	/// refresh failing otherwise is returned as is, without marking the lock lost.
@@ -384,7 +384,7 @@ impl SharedLease {
 				}
 				// Failed in transport: the server may still hold the lease, so it is asked again
 				// after a pause, unless a confirmation or the loss arrives first.
-				Ok(Err(error)) if error.kind() == ErrorKind::Reqwest => {
+				Ok(Err(error)) if error.kind().reached_no_server() => {
 					let seen = *confirmations.borrow_and_update();
 					tokio::select! {
 						() = sleep(LOCK_RETRY_INTERVAL) => {}
@@ -547,7 +547,7 @@ const RELEASE_RETRY_MAX: Duration = Duration::from_secs(4);
 /// Sends a release with `send` (one round trip, resolving to the server's `released` flag)
 /// until the server answers it.
 ///
-/// A release failing in transport ([`ErrorKind::Reqwest`]: no response, a timeout, an HTTP
+/// A release failing in transport ([`ErrorKind::reached_no_server`]: no response, an unverified certificate, a timeout, an HTTP
 /// error status once the retry layer gave up on it) leaves the lease on the server, refusing
 /// every other client on the account until it expires, so it is sent again after a pause
 /// growing from [`RELEASE_RETRY_FIRST`] to [`RELEASE_RETRY_MAX`]. Only while the lease could
@@ -577,7 +577,7 @@ where
 				tracing::warn!("Server held no lease to release for lock {resource}");
 				return;
 			}
-			Err(e) if e.kind() == ErrorKind::Reqwest => {
+			Err(e) if e.kind().reached_no_server() => {
 				// a retry starting past the lease would find it expired
 				if LOCK_SERVER_TTL.saturating_sub(lease_age()) <= pause {
 					tracing::warn!(
@@ -828,7 +828,7 @@ const ACQUIRE_TRANSPORT_ERROR_LIMIT: usize = 3;
 /// `acquired` flag. Generic over it so the schedule is unit-testable against a scripted server
 /// on a paused clock.
 ///
-/// A failed request ([`ErrorKind::Reqwest`]: no response, a timeout, or an HTTP error status,
+/// A failed request ([`ErrorKind::reached_no_server`]: no response, an unverified certificate, a timeout, or an HTTP error status,
 /// 5xx/408/429 only once the retry layer gave up on them) is returned at once while no poll has
 /// been answered, so an offline caller fails fast. After an answer, up to
 /// [`ACQUIRE_TRANSPORT_ERROR_LIMIT`] of them in a row are waited out like a refusal, each using
@@ -870,7 +870,7 @@ where
 			}
 			Err(e)
 				if answered
-					&& e.kind() == ErrorKind::Reqwest
+					&& e.kind().reached_no_server()
 					&& transport_errors < ACQUIRE_TRANSPORT_ERROR_LIMIT =>
 			{
 				transport_errors += 1;

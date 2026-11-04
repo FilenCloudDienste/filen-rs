@@ -353,3 +353,19 @@ fn inner_message_is_none_when_there_is_no_inner() {
 	let err = Error::custom(ErrorKind::Server, "no inner here");
 	assert!(err.inner_message().is_none());
 }
+
+/// Both ways a request gets no answer from the server count as such, and nothing else does.
+#[test]
+fn reached_no_server_is_the_transport_and_an_unverified_certificate() {
+	assert!(ErrorKind::Reqwest.reached_no_server());
+	assert!(ErrorKind::TlsVerification.reached_no_server());
+	for kind in [
+		ErrorKind::Server,
+		ErrorKind::Unauthenticated,
+		ErrorKind::Response,
+		ErrorKind::RetryFailed,
+		ErrorKind::Cancelled,
+	] {
+		assert!(!kind.reached_no_server(), "{kind:?}");
+	}
+}

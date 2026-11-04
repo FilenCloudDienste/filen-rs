@@ -747,10 +747,10 @@ async fn wait_for_next_pass(
 
 /// Whether a pass with this failure could not reach the server: the transport's own error, a pass
 /// halted because the remote was unavailable, or a lock request that got no answer, which all
-/// carry [`ErrorKind::Reqwest`]. Such a failure's retry also waits for the network to come back
+/// carry a kind that [`ErrorKind::reached_no_server`]. Such a failure's retry also waits for the network to come back
 /// (see [`Reconnects`]); every other one waits out its backoff.
 fn reached_no_server(error: Option<&(String, ErrorKind)>) -> bool {
-	error.is_some_and(|(_, kind)| *kind == ErrorKind::Reqwest)
+	error.is_some_and(|(_, kind)| kind.reached_no_server())
 }
 
 /// The wait after a failed pass (see [`wait_for_next_pass`]).
