@@ -161,6 +161,21 @@ impl<B: DisposalBackend> Driver<B> {
 		counts.files_failed + counts.dirs_failed + counts.entries_skipped - self.left_out == 0
 	}
 
+	/// Ends the job as soon as the codec is done, when it read the archive whole, front to back
+	/// and once, and what it read is not what the archive's metadata declares: no file still
+	/// waiting is uploaded or registered, what was extracted stays, as it does when a damaged
+	/// archive ends the job, and the archive is never removed. Checked before a cancel or another
+	/// error can end the job, which would leave the mismatch untold.
+	///
+	/// An archive read only in part, or out of order (a zip or a 7z over a chunk, read from its
+	/// index), cannot be checked against its hash: its entries' own checksums are checked as they
+	/// are read instead. An archive whose metadata holds no hash is not checked either.
+	pub(super) fn stop_if_failed_its_hash(&mut self) {
+		if let Some(mismatch) = self.feed.hash_mismatch() {
+			self.stop_with(mismatch.into());
+		}
+	}
+
 	/// Removes the archive if the extraction is verified; what became of it.
 	pub(super) async fn dispose_archive(
 		&mut self,
@@ -189,17 +204,13 @@ impl<B: DisposalBackend> Driver<B> {
 		) {
 			// A streaming archive's entries carry no checksum of their own (a tar's) or share
 			// one for the whole stream: the whole archive, read front to back, has to match the
-			// hash in its metadata. A zip's or a 7z's entries were each checked as they were
-			// read.
-			let Some(read) = self.feed.read_whole() else {
+			// hash in its metadata, as [`Self::stop_if_failed_its_hash`] found it did, or the job
+			// would have failed. A zip's or a 7z's entries were each checked as they were read.
+			if self.feed.read_whole().is_none() {
 				return kept(KeptReason::Unconfirmed);
-			};
-			match self.archive.hash() {
-				Some(expected) if expected != read => return kept(KeptReason::HashMismatch),
-				None if how == SourceDisposal::DeletePermanently => {
-					return kept(KeptReason::HashUnavailable);
-				}
-				_ => {}
+			}
+			if self.archive.hash().is_none() && how == SourceDisposal::DeletePermanently {
+				return kept(KeptReason::HashUnavailable);
 			}
 		}
 		if !self.output_confirmed(counts).await {

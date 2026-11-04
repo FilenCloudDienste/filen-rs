@@ -39,6 +39,9 @@ use filen_sdk_rs::{
 	io::client_impl::IoSharedClientExt,
 };
 use filen_types::fs::Uuid;
+// Only the hash-mismatch test, which needs the `malformed` seam, reads these.
+#[cfg(feature = "malformed")]
+use {filen_sdk_rs::fs::HasParent, filen_types::fs::ParentUuid};
 
 mod drive_helpers;
 use drive_helpers::{assert_same_files, contents, data, dir_link_info, linked_file, noise, upload};
@@ -560,6 +563,135 @@ async fn sources_are_trashed_and_the_archive_deleted_once_verified() {
 	assert_eq!(
 		paths,
 		["source/big.bin", "source/notes.txt", "source/sub/empty"]
+	);
+}
+
+/// A tar whose data no longer hashes to the BLAKE3 its metadata declares fails its extraction
+/// once it is read and is not removed, and nothing the job created goes to the trash. How much it
+/// had created by then depends on the server's pace, and it may be nothing, so this does not prove
+/// that anything extracted stays; what it created, if anything, is all the destination holds besides
+/// the archive.
+#[cfg(feature = "malformed")]
+#[shared_test_runtime]
+async fn a_tar_not_matching_its_hash_fails_its_extraction_and_is_kept() {
+	let (resources, _lock) = test_utils::RESOURCES.get_resources_with_lock().await;
+	let client = resources.client.clone();
+	let test_dir = &resources.dir;
+	let source = client.create_dir(&test_dir.into(), "source").await.unwrap();
+	upload(&client, &source, "big.bin", &data(CHUNK_SIZE + 5, 3)).await;
+	upload(&client, &source, "notes.txt", b"hello archive").await;
+	let destination = client
+		.create_dir(&test_dir.into(), "mismatched")
+		.await
+		.unwrap();
+	let (mut archive, _) = compress(
+		&client,
+		CompressSources::Keep(vec![ItemSource::Dir(ItemSourceDir::Normal(source))]),
+		&destination,
+		"bundle.tar",
+		CompressFormat::Tar { compression: None },
+		None,
+	)
+	.await;
+	let wrong = blake3::hash(b"another archive").into();
+	client.replace_file_hash(&mut archive, wrong).await.unwrap();
+	// as listed from the server, so the declared hash is the one the metadata now carries
+	let archive = client.get_file(archive.uuid()).await.unwrap();
+	assert_eq!(archive.hash(), Some(wrong));
+
+	let failed = extract(
+		&client,
+		ArchiveSource::Dispose {
+			file: archive.clone(),
+			how: SourceDisposal::Trash,
+		},
+		&destination,
+		None,
+	)
+	.await
+	.unwrap_err();
+	assert_eq!(
+		failed.error.kind(),
+		ErrorKind::ContentHashMismatch,
+		"{}",
+		failed.error
+	);
+	let [disposition] = &failed.report.dispositions[..] else {
+		panic!("the archive");
+	};
+	assert!(
+		matches!(
+			disposition.outcome,
+			DisposalOutcome::Kept {
+				reason: KeptReason::Incomplete,
+				bytes_freed: 0,
+			}
+		),
+		"{:?}",
+		disposition.outcome
+	);
+	assert!(
+		!client
+			.get_file_with_info(archive.uuid())
+			.await
+			.unwrap()
+			.trash
+	);
+	// The job stops once the archive is read. How much it registered before the archive's end was
+	// read depends on the server's pace, so nothing it created, if anything, may be in the trash,
+	// and the destination holds exactly the archive and what the report lists.
+	let top_level: Vec<Uuid> = failed
+		.report
+		.top_level
+		.iter()
+		.map(|top| top.item.uuid())
+		.collect();
+	let created_under = |parent: &ParentUuid| {
+		matches!(parent, ParentUuid::Trash(from)
+			if *from == destination.uuid() || top_level.contains(from))
+	};
+	let (trashed_dirs, trashed_files) = client
+		.list_trash(None::<&fn(u64, Option<u64>)>)
+		.await
+		.unwrap();
+	assert!(
+		!trashed_dirs.iter().any(|dir| created_under(dir.parent())),
+		"nothing extracted is trashed"
+	);
+	assert!(
+		!trashed_files
+			.iter()
+			.any(|file| created_under(file.parent())),
+		"nothing extracted is trashed"
+	);
+	let (dirs, files) = client
+		.list_dir(&(&destination).into(), None::<&fn(u64, Option<u64>)>)
+		.await
+		.unwrap();
+	assert_eq!(
+		files.iter().map(|file| file.uuid()).collect::<Vec<_>>(),
+		[archive.uuid()]
+	);
+	assert_eq!(
+		dirs.iter().map(|dir| dir.uuid()).collect::<Vec<_>>(),
+		top_level
+	);
+	if top_level.is_empty() {
+		assert_eq!(failed.report.counts.files_done, 0);
+		return;
+	}
+	let folder = created_folder(&failed.report);
+	let (_, extracted) = contents(&client, &folder).await;
+	let paths = file_paths(&extracted);
+	assert!(
+		paths
+			.iter()
+			.all(|path| ["source/big.bin", "source/notes.txt"].contains(path)),
+		"{paths:?}"
+	);
+	assert_eq!(
+		u64::try_from(paths.len()).unwrap(),
+		failed.report.counts.files_done
 	);
 }
 

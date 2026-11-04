@@ -2,7 +2,10 @@
 //! file, a damaged archive, a limit; and where a failed entry is extracted again.
 
 use super::*;
-use crate::fs::archive::{format::TAR_CHECKSUM, tar_iter::TAR_BLOCK};
+use crate::{
+	error::ContentHashMismatchError,
+	fs::archive::{format::TAR_CHECKSUM, tar_iter::TAR_BLOCK},
+};
 
 #[tokio::test(start_paused = true)]
 async fn a_failed_codec_gives_back_its_own_error() {
@@ -329,6 +332,116 @@ async fn a_damaged_archive_ends_the_job_keeping_what_it_extracted() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_archive_not_matching_its_hash_ends_the_job_keeping_what_it_extracted() {
+	let big = pattern(3 * CHUNK_SIZE, 3);
+	let tar = padded(&[("first.txt", b"first"), ("second.bin", &big)]);
+	let setup = setup_in(
+		DESTINATION,
+		"bundle.tar",
+		tar.clone(),
+		Some(hash(b"another archive")),
+		hold_pad,
+	);
+	let job = start(&setup, Options::default());
+	wait_until("both files are registered", || {
+		waits_on_pad_with(&setup, &["bundle/first.txt", "bundle/second.bin"])
+	})
+	.await;
+	setup.backend.release_all();
+	let failed = job.running.await.unwrap().unwrap_err();
+
+	assert_eq!(failed.error.kind(), ErrorKind::ContentHashMismatch);
+	let mismatch = failed
+		.error
+		.downcast_ref::<ContentHashMismatchError>()
+		.unwrap();
+	assert_eq!(
+		(mismatch.uuid, mismatch.expected, mismatch.actual),
+		(ARCHIVE, hash(b"another archive"), hash(&tar))
+	);
+	// what was extracted before the archive's end was read counts as such, and stays, as a
+	// damaged archive's does
+	let counts = failed.report.counts;
+	assert_eq!(
+		(counts.dirs_created, counts.files_done, counts.bytes_done),
+		(2, 2, 5 + 3 * CHUNK_SIZE_U64)
+	);
+	assert_eq!(
+		finished(&setup),
+		BTreeMap::from([
+			("bundle/first.txt".to_owned(), (5, 1, hash(b"first"))),
+			(
+				"bundle/second.bin".to_owned(),
+				(big.len() as u64, 3, hash(&big))
+			),
+		])
+	);
+	assert!(failed.report.dispositions.is_empty());
+	let log = setup.backend.log();
+	assert!(log.trashed_dirs.is_empty());
+	assert!(log.trashed_files.is_empty());
+	drop(log);
+	assert_eq!(job.recorder.last().phase, ExtractPhase::Failed);
+	assert_released(&setup, &job.reporter, &job.recorder);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_archive_not_matching_its_hash_ends_the_job_once_read_registering_no_file_still_waiting()
+{
+	let names: Vec<String> = (0..2 * MAX_SMALL_PARALLEL_REQUESTS)
+		.map(|i| format!("e{i:03}"))
+		.collect();
+	let members: Vec<(&str, &[u8])> = names
+		.iter()
+		.map(|name| (name.as_str(), &b"x"[..]))
+		.collect();
+	let tar = tar_of(&members);
+	let setup = setup_in(
+		DESTINATION,
+		"bundle.tar",
+		tar,
+		Some(hash(b"another archive")),
+		|backend| backend.hold_named(Request::Finish, &names),
+	);
+	let options = Options::default();
+	let control = options.control.clone();
+	let job = start(&setup, options);
+	wait_until("as many registrations as run at once wait", || {
+		setup.backend.log().held_named.len() == MAX_SMALL_PARALLEL_REQUESTS
+	})
+	.await;
+	// every entry fits in what the codec may have open, so it reads the archive to its end while
+	// the registrations wait
+	wait_until("the job stops on the archive's hash", || {
+		control.is_stopping()
+	})
+	.await;
+	setup.backend.release_all();
+	let failed = job.running.await.unwrap().unwrap_err();
+
+	assert_eq!(failed.error.kind(), ErrorKind::ContentHashMismatch);
+	let expected: Vec<String> = names[..MAX_SMALL_PARALLEL_REQUESTS]
+		.iter()
+		.map(|name| format!("bundle/{name}"))
+		.collect();
+	assert_eq!(
+		finished_paths(&setup),
+		expected,
+		"only the registrations already running finish"
+	);
+	assert_eq!(
+		failed.report.counts.files_done,
+		MAX_SMALL_PARALLEL_REQUESTS as u64
+	);
+	let log = setup.backend.log();
+	assert!(log.trashed_dirs.is_empty(), "what was extracted stays");
+	assert!(log.trashed_files.is_empty(), "what was extracted stays");
+	drop(log);
+	assert_eq!(job.recorder.last().phase, ExtractPhase::Failed);
+	assert_released(&setup, &job.reporter, &job.recorder);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn damage_before_the_archives_end_leaves_no_time_to_wait_for() {
 	/// Where `second.bin`'s header starts: past `first.txt`'s header and its data block.
 	const SECOND_HEADER: usize = 2 * TAR_BLOCK;
@@ -349,6 +462,40 @@ async fn damage_before_the_archives_end_leaves_no_time_to_wait_for() {
 		(last.phase, last.eta),
 		(ExtractPhase::Failed, Some(Duration::ZERO))
 	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_damaged_archive_not_matching_its_hash_fails_as_not_matching_it() {
+	/// Where `second.txt`'s header starts: past `first.txt`'s header and its data block.
+	const SECOND_HEADER: usize = 2 * TAR_BLOCK;
+	let mut tar = tar_of(&[("first.txt", b"first"), ("second.txt", b"second")]);
+	tar[SECOND_HEADER + TAR_CHECKSUM.start] ^= 1;
+	let setup = setup_in(
+		DESTINATION,
+		"broken.tar",
+		tar.clone(),
+		Some(hash(b"another archive")),
+		|_| {},
+	);
+	let job = start(&setup, Options::default());
+	let failed = job.running.await.unwrap().unwrap_err();
+
+	// one chunk, so read whole by the time the codec fails on the damaged header
+	assert_eq!(failed.error.kind(), ErrorKind::ContentHashMismatch);
+	let mismatch = failed
+		.error
+		.downcast_ref::<ContentHashMismatchError>()
+		.unwrap();
+	assert_eq!(
+		(mismatch.uuid, mismatch.expected, mismatch.actual),
+		(ARCHIVE, hash(b"another archive"), hash(&tar))
+	);
+	let log = setup.backend.log();
+	assert!(log.trashed_dirs.is_empty(), "what was extracted stays");
+	assert!(log.trashed_files.is_empty(), "what was extracted stays");
+	drop(log);
+	assert_eq!(job.recorder.last().phase, ExtractPhase::Failed);
+	assert_released(&setup, &job.reporter, &job.recorder);
 }
 
 /// A tar of a 1000-byte file and a 1-byte one.

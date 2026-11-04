@@ -2,6 +2,7 @@
 //! be in the drive, kept when it cannot be, or when a cancel came first.
 
 use super::*;
+use crate::error::ContentHashMismatchError;
 
 /// An archive with `hash` in its metadata, placed in the fake drive in [`ARCHIVE_PARENT`].
 pub(super) fn disposable(
@@ -227,18 +228,118 @@ async fn an_archive_without_a_hash_is_still_trashed() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_archive_whose_hash_is_not_of_what_was_read_is_kept() {
-	let (setup, report) = extract_into_a_new_folder(
-		good_tar(),
-		Some(hash(b"something else")),
-		SourceDisposal::Trash,
-	)
-	.await;
+async fn an_archive_whose_hash_is_not_of_what_was_read_fails_and_is_kept() {
+	let tar = padded(&[
+		("docs/", b""),
+		("docs/a.txt", b"alpha"),
+		("top.txt", b"top"),
+	]);
+	for how in [SourceDisposal::Trash, SourceDisposal::DeletePermanently] {
+		let setup = disposable(tar.clone(), Some(hash(b"something else")), hold_pad);
+		let options = Options {
+			dispose: Some(ArchiveDisposal::Remove {
+				how,
+				parent: ARCHIVE_PARENT,
+			}),
+			..Options::default()
+		};
+		let job = start(&setup, options);
+		wait_until("both files are registered", || {
+			waits_on_pad_with(&setup, &["bundle/docs/a.txt", "bundle/top.txt"])
+		})
+		.await;
+		setup.backend.release_all();
+		let failed = job.running.await.unwrap().unwrap_err();
+
+		assert_eq!(
+			failed.error.kind(),
+			ErrorKind::ContentHashMismatch,
+			"{how:?}"
+		);
+		let mismatch = failed
+			.error
+			.downcast_ref::<ContentHashMismatchError>()
+			.unwrap();
+		assert_eq!(
+			(mismatch.uuid, mismatch.expected, mismatch.actual),
+			(ARCHIVE, hash(b"something else"), hash(&tar)),
+			"{how:?}"
+		);
+		// what was extracted stays, as a damaged archive's does
+		assert_eq!(
+			finished_paths(&setup),
+			["bundle/docs/a.txt", "bundle/top.txt"],
+			"{how:?}"
+		);
+		assert!(
+			matches!(kept(disposition(&failed.report)), KeptReason::Incomplete),
+			"{how:?}"
+		);
+		let log = setup.backend.log();
+		assert!(log.trashed_files.is_empty(), "{how:?}");
+		assert!(log.deleted_files.is_empty(), "{how:?}");
+		assert!(log.trashed_dirs.is_empty(), "{how:?}");
+		drop(log);
+		assert_eq!(job.recorder.last().phase, ExtractPhase::Failed);
+		assert_released(&setup, &job.reporter, &job.recorder);
+	}
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_zip_read_out_of_order_is_checked_by_its_entries_not_by_its_hash() {
+	// over a chunk, a zip is read from its index at the end and then its entries, never whole and
+	// in order, so its hash cannot be checked: each entry's CRC-32 is instead
+	let big = incompressible(2 * CHUNK_SIZE, 7);
+	let zip = zip_of(&[("a.bin", Some(&big)), ("b.txt", Some(b"beta"))], None);
+	let setup = disposable(zip, Some(hash(b"something else")), |_| {});
+	let options = Options {
+		dispose: Some(ArchiveDisposal::Remove {
+			how: SourceDisposal::Trash,
+			parent: ARCHIVE_PARENT,
+		}),
+		..Options::default()
+	};
+	let job = start(&setup, options);
+	let report = job.running.await.unwrap().unwrap();
+	assert_eq!(finished_paths(&setup), ["bundle/a.bin", "bundle/b.txt"]);
 	assert!(matches!(
-		kept(disposition(&report)),
-		KeptReason::HashMismatch
+		disposition(&report),
+		DisposalOutcome::Disposed { .. }
 	));
-	assert!(setup.backend.log().trashed_files.is_empty());
+	assert_eq!(setup.backend.log().trashed_files, [ARCHIVE]);
+	assert_released(&setup, &job.reporter, &job.recorder);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_zip_read_whole_and_not_matching_its_hash_fails_and_is_kept() {
+	// within a chunk, a zip is read once, front to back, so its hash is checked like a tar's
+	let zip = zip_of(&[("a.txt", Some(b"alpha")), ("b.txt", Some(b"beta"))], None);
+	let setup = disposable(zip.clone(), Some(hash(b"something else")), |_| {});
+	let options = Options {
+		dispose: Some(ArchiveDisposal::Remove {
+			how: SourceDisposal::Trash,
+			parent: ARCHIVE_PARENT,
+		}),
+		..Options::default()
+	};
+	let job = start(&setup, options);
+	let failed = job.running.await.unwrap().unwrap_err();
+	assert_eq!(failed.error.kind(), ErrorKind::ContentHashMismatch);
+	let mismatch = failed
+		.error
+		.downcast_ref::<ContentHashMismatchError>()
+		.unwrap();
+	assert_eq!(mismatch.actual, hash(&zip));
+	assert!(matches!(
+		kept(disposition(&failed.report)),
+		KeptReason::Incomplete
+	));
+	// the job stops once the zip is read, and trashes nothing it extracted by then
+	let log = setup.backend.log();
+	assert!(log.trashed_files.is_empty());
+	assert!(log.trashed_dirs.is_empty());
+	drop(log);
+	assert_released(&setup, &job.reporter, &job.recorder);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -244,6 +244,47 @@ fn finished_paths(setup: &Setup) -> Vec<String> {
 	finished(setup).into_keys().collect()
 }
 
+/// The folder [`padded`] puts its files in.
+const PAD: &str = "pad";
+
+/// A tar of `members`, then of more files in a [`PAD`] folder than the job keeps open. While
+/// [`hold_pad`] holds that folder's creation, the codec cannot read to the archive's end, so the
+/// job cannot end either; once let go, it reads on, and none of those files uploads.
+fn padded(members: &[(&str, &[u8])]) -> Vec<u8> {
+	let pad: Vec<String> = (0..=MAX_OPEN_ENTRIES)
+		.map(|i| format!("{PAD}/p{i:03}"))
+		.collect();
+	let all: Vec<(&str, &[u8])> = members
+		.iter()
+		.copied()
+		.chain(pad.iter().map(|path| (path.as_str(), &b"x"[..])))
+		.collect();
+	tar_of(&all)
+}
+
+/// Holds the creation of [`padded`]'s folder, and fails the upload of each of its files.
+fn hold_pad(backend: &mut FakeBackend) {
+	backend.hold_named(Request::Create, [PAD]);
+	for i in 0..=MAX_OPEN_ENTRIES {
+		backend
+			.fail_upload
+			.insert(format!("p{i:03}"), ErrorKind::Server);
+	}
+}
+
+/// Whether the job waits on [`padded`]'s folder, and has registered the files at `paths`.
+fn waits_on_pad_with(setup: &Setup, paths: &[&str]) -> bool {
+	let finished = finished_paths(setup);
+	paths
+		.iter()
+		.all(|path| finished.iter().any(|done| done == path))
+		&& setup
+			.backend
+			.log()
+			.held_named
+			.contains(&(Request::Create, PAD.to_owned()))
+}
+
 /// The uuid of the directory the job created as `name`.
 pub(super) fn log_dir(setup: &Setup, name: &str) -> Uuid {
 	setup

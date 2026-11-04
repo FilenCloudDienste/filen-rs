@@ -17,6 +17,7 @@ use tokio::task::JoinHandle;
 use super::*;
 use crate::{
 	consts::CHUNK_SIZE,
+	error::ContentHashMismatchError,
 	fs::{
 		HasUUID,
 		archive::{
@@ -25,11 +26,13 @@ use crate::{
 				EntryDownloadConfig, ExpansionLimit,
 				codec::{ArchiveEnd, StreamJob, Task, extract_stream},
 				list::PasswordCheck,
-				test_support::{Options, Setup, setup, stream_job, test_config},
+				test_support::{
+					ARCHIVE, DESTINATION, Options, Setup, setup, setup_in, stream_job, test_config,
+				},
 			},
 			sevenz::write::SevenZMethod,
 			test_support::{
-				archive_password, incompressible, pattern, sevenz_of, tar_of, zip_of,
+				archive_password, hash, incompressible, pattern, sevenz_of, tar_of, zip_of,
 				zip_with_passwords,
 			},
 			worker,
@@ -302,6 +305,50 @@ async fn a_plain_entry_of_a_zip_with_encrypted_ones_downloads_without_a_password
 	let report = download.running.await.unwrap().unwrap();
 	assert_eq!(download.written.data(), b"plain");
 	assert!(report.checked);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_zip_read_whole_and_not_matching_its_hash_fails_and_leaves_the_writer_unclosed() {
+	let zip = stored_zip(&[("a.txt", b"first"), ("b.txt", b"second")]);
+	assert_eq!(zip.len().div_ceil(CHUNK_SIZE), 1);
+	let setup = setup_in(
+		DESTINATION,
+		"small.zip",
+		zip.clone(),
+		Some(hash(b"another archive")),
+		|_| {},
+	);
+	let download = download(&setup, 0, EntryDownloadConfig::default());
+	let failed = download.running.await.unwrap().unwrap_err();
+
+	assert_eq!(failed.error.kind(), ErrorKind::ContentHashMismatch);
+	let mismatch = failed
+		.error
+		.downcast_ref::<ContentHashMismatchError>()
+		.unwrap();
+	assert_eq!(
+		(mismatch.uuid, mismatch.expected, mismatch.actual),
+		(ARCHIVE, hash(b"another archive"), hash(&zip))
+	);
+	assert_eq!(download.written.data(), b"first");
+	assert!(!download.written.closed());
+	assert!(!failed.report.checked);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_zip_read_whole_and_matching_its_hash_downloads() {
+	let zip = stored_zip(&[("a.txt", b"first")]);
+	let setup = setup_in(
+		DESTINATION,
+		"small.zip",
+		zip.clone(),
+		Some(hash(&zip)),
+		|_| {},
+	);
+	let download = download(&setup, 0, EntryDownloadConfig::default());
+	let report = download.running.await.unwrap().unwrap();
+	assert_eq!(download.written.data(), b"first");
+	assert!(download.written.closed() && report.checked);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

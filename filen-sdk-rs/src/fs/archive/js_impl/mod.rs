@@ -94,7 +94,8 @@ pub enum ArchiveKeptReason {
 	Incomplete,
 	/// The archive holds data after its last entry that belongs to none.
 	UnaccountedData { bytes: u64 },
-	/// What was read does not match the hash in the source's metadata.
+	/// What was read does not match the hash in the source's metadata. No job gives it any
+	/// more: such a source fails the job with `ContentHashMismatch` instead.
 	HashMismatch,
 	/// The source's metadata holds no hash to check what was read against, which a permanent
 	/// deletion requires. Never given for a zip or 7z archive: every entry's own checksum, and

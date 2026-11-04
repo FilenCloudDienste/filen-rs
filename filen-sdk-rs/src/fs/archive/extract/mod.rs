@@ -68,11 +68,14 @@ pub enum ArchiveSource {
 	/// nothing failed, skipped or unaccounted, every extracted file's data checked against a
 	/// checksum the archive carries for it, and every extracted item confirmed with the server.
 	/// A tar or a single compressed file must also have been read in full and match the hash in
-	/// its metadata (which covers a tar's own data, as it carries no checksum for it); a zip or
+	/// its metadata (which covers a tar's own data, as it carries no checksum for it; one that
+	/// does not match fails the extraction, see
+	/// [`Client::extract_archive`](crate::auth::Client::extract_archive)); a zip or
 	/// a 7z is confirmed by its entries' checksums and every entry having been extracted, with
-	/// no whole-archive hash, even for a permanent deletion. Otherwise it is kept and the report
-	/// says why: so a brotli or LZMA-alone archive, or an lz4, xz or zstd one written without
-	/// its checksum, is always kept, as
+	/// no whole-archive hash, even for a permanent deletion (one that fits in a chunk is read
+	/// whole, and fails the extraction when it does not match its hash, as a tar does).
+	/// Otherwise it is kept and the report says why: so a brotli or LZMA-alone archive, or an
+	/// lz4, xz or zstd one written without its checksum, is always kept, as
 	/// [`KeptReason::Unconfirmed`](crate::fs::archive::KeptReason::Unconfirmed).
 	Dispose {
 		/// The archive.

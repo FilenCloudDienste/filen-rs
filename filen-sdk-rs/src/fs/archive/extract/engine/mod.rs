@@ -705,6 +705,7 @@ impl<B: DisposalBackend> Driver<B> {
 				self.report.unaccounted_bytes = end.unaccounted_bytes;
 				self.report.duplicates = end.duplicates;
 				self.unchecked_entries = end.unchecked_entries;
+				self.stop_if_failed_its_hash();
 			}
 			Err(error) => {
 				// an error the driver caused (it failed a fetch, or stopped) is already the job's
@@ -712,6 +713,10 @@ impl<B: DisposalBackend> Driver<B> {
 				// The archive is damaged from here on, but what came before it is whole: the files
 				// whose data is complete still finish, and only the one being read is dropped.
 				if codec_failed(self.archive.uuid(), &error, ended) {
+					// An archive read whole that does not match its hash is not the file that was
+					// uploaded, which is what the codec's error is about too: a wrong password or a
+					// damaged entry there says nothing a caller can act on.
+					let error = self.feed.hash_mismatch().map_or(error, Error::from);
 					self.fatal.record(Arc::new(error));
 					self.held = None;
 					if let Some(ordinal) = self.current.take()

@@ -191,6 +191,17 @@ impl Client {
 	/// `control`. A failed entry does not stop the others; a damaged archive, running out of
 	/// storage or the codec dying does.
 	///
+	/// An archive read whole, once and front to back (a tar, compressed or not, a single
+	/// compressed file, or a zip or 7z that fits in a chunk), whose data does not match the
+	/// BLAKE3 hash in its metadata fails the job with
+	/// [`ErrorKind::ContentHashMismatch`](crate::ErrorKind::ContentHashMismatch) once it is
+	/// read, in place of any error its damaged data made the codec fail with. The job stops then,
+	/// extracting no file still waiting; what it extracted stays, as a damaged archive's does,
+	/// and the archive is never removed. A larger zip or 7z is read from its index, out of order
+	/// and in part, so its hash is not checked; each entry is checked against the checksum the
+	/// archive lists for it instead. Nor is an archive whose metadata holds no hash, or one a
+	/// partial extraction did not read to its end.
+	///
 	/// While paused the job holds no drive lock and no reservation from the client's memory
 	/// budget, but it keeps its archive job slot, its decoders' state (up to the client's
 	/// archive codec budget) and a chunk each of input and output, so it can go on where it
@@ -273,6 +284,13 @@ impl Client {
 	/// [`MAX_LISTED_BYTES`](super::MAX_LISTED_BYTES): see [`ListReport`].
 	/// A listing takes one of the [`ArchiveConfig::job_concurrency`] archive jobs.
 	///
+	/// An archive the listing read whole, once and front to back (a tar, compressed or not, a
+	/// single compressed file, or a zip or 7z that fits in a chunk), whose data does not match
+	/// the BLAKE3 hash in its metadata fails the listing with
+	/// [`ErrorKind::ContentHashMismatch`](crate::ErrorKind::ContentHashMismatch) once it is
+	/// read, after `callback` received its entries. A larger zip or 7z, of which only the index
+	/// is read, is not checked, nor is an archive whose metadata holds no hash.
+	///
 	/// [`ArchiveConfig::job_concurrency`]: crate::fs::archive::ArchiveConfig::job_concurrency
 	pub async fn list_archive(
 		self: Arc<Self>,
@@ -304,7 +322,11 @@ impl Client {
 	///
 	/// Data reaches `writer` as it is decoded, before the CRC-32 or authentication code at its
 	/// end is checked: on `Err`, `writer` is left unclosed, and what it holds is unverified.
-	/// `report.checked` is `false` for a 7z entry whose header lists no CRC-32.
+	/// `report.checked` is `false` for a 7z entry whose header lists no CRC-32. A zip or 7z that
+	/// fits in a chunk is read whole, and when it does not match the BLAKE3 hash in its metadata
+	/// the download fails with
+	/// [`ErrorKind::ContentHashMismatch`](crate::ErrorKind::ContentHashMismatch), `writer`
+	/// unclosed; a larger one is read in part, so its hash is not checked.
 	///
 	/// Fails before a byte is written for:
 	/// - a directory or a link, with [`ErrorKind::InvalidState`](crate::ErrorKind::InvalidState);

@@ -13,6 +13,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 use crate::{
 	Error, ErrorKind,
 	consts::{CALLBACK_INTERVAL, CHUNK_SIZE_U64, FULL_CHUNK_BYTES},
+	error::ContentHashMismatchError,
 	fs::{
 		HasUUID,
 		archive::{
@@ -24,7 +25,7 @@ use crate::{
 		file::{
 			enums::RemoteFileType,
 			read::{check_chunks_consistent, chunk_plaintext_len},
-			traits::HasFileInfo,
+			traits::{HasFileInfo, HasRemoteFileInfo},
 		},
 	},
 	job::{
@@ -399,6 +400,15 @@ impl<B: DriveBackend, T> CodecFeed<B, T> {
 		self.input.read_whole()
 	}
 
+	/// How the archive fails its hash: when the codec read it whole, front to back and once, and
+	/// what it read is not what the archive's metadata declares. `None` when it matches, or
+	/// cannot be checked: read only in part or out of order, or with no hash in its metadata.
+	pub(crate) fn hash_mismatch(&self) -> Option<ContentHashMismatchError> {
+		let archive = self.archive();
+		let (expected, actual) = (archive.hash()?, self.read_whole()?);
+		ContentHashMismatchError::check(archive.uuid(), expected, actual).err()
+	}
+
 	/// Drops every fetch and what was fetched, and the codec's ask: the job is stopping.
 	pub(crate) fn drop_all(&mut self) {
 		self.input.drop_all();
@@ -562,13 +572,24 @@ impl<'j, B: DriveBackend, S: ReadsArchive, T> ReadingDriver<'j, B, S, T> {
 		}
 	}
 
+	/// Takes the codec's result. An archive it read whole that does not match its hash fails the
+	/// job, as it fails an extraction (see [`CodecFeed::hash_mismatch`]): a listing's entries,
+	/// or an entry's data written, came from data that is not the file's.
 	fn codec_finished(&mut self, result: Result<T, Error>) {
 		match result {
-			Ok(end) => self.end = Some(end),
+			Ok(end) => {
+				self.end = Some(end);
+				if let Some(mismatch) = self.feed.hash_mismatch() {
+					self.fatal.record(Arc::new(mismatch.into()));
+				}
+			}
 			Err(error) => {
 				// an error the driver caused (it failed a fetch) is already the job's
 				let archive = self.feed.archive().uuid();
 				if codec_failed(archive, &error, self.fatal.error().is_some()) {
+					// an archive read whole that does not match its hash fails as such, whatever
+					// its codec made of the data that is not the file's
+					let error = self.feed.hash_mismatch().map_or(error, Error::from);
 					self.fatal.record(Arc::new(error));
 				}
 			}

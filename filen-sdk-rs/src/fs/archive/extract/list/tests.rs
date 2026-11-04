@@ -11,13 +11,18 @@ use super::*;
 use crate::{
 	ErrorKind,
 	consts::CHUNK_SIZE,
+	error::ContentHashMismatchError,
 	fs::{
 		HasUUID,
 		archive::{
-			extract::test_support::{ListRecorder, Listing, Setup, list, setup, test_config},
-			format::StreamCodec,
+			extract::test_support::{
+				ARCHIVE, DESTINATION, ListRecorder, Listing, Setup, list, setup, setup_in,
+				test_config,
+			},
+			format::{StreamCodec, TAR_CHECKSUM},
 			sevenz::write::SevenZMethod,
-			test_support::{gzip, incompressible, pattern, sevenz_of, tar_of, zip_of},
+			tar_iter::TAR_BLOCK,
+			test_support::{gzip, hash, incompressible, pattern, sevenz_of, tar_of, zip_of},
 			zip::{
 				read::{CENTRAL_HEADER_LEN, EOCD_LEN},
 				write::{ZipMethod, ZipWriter},
@@ -412,6 +417,79 @@ async fn a_directory_lists_no_access() {
 		listed_access("dir.zip", zip).await,
 		[("docs/".to_owned(), None)]
 	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tar_matching_its_hash_is_listed() {
+	let tar = tar_of(&[("a.txt", b"a")]);
+	let setup = setup_in(
+		DESTINATION,
+		"bundle.tar",
+		tar.clone(),
+		Some(hash(&tar)),
+		|_| {},
+	);
+	let listing = list(&setup, JobControl::default(), test_config());
+	let listed = listing.running.await.unwrap().unwrap();
+	assert_eq!(listed.totals.files, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tar_not_matching_its_hash_fails_the_listing_after_its_entries_were_handed_over() {
+	let big = pattern(2 * CHUNK_SIZE, 4);
+	let tar = tar_of(&[("a.txt", b"a"), ("big.bin", &big)]);
+	let setup = setup_in(
+		DESTINATION,
+		"bundle.tar",
+		tar.clone(),
+		Some(hash(b"another archive")),
+		|_| {},
+	);
+	let listing = list(&setup, JobControl::default(), test_config());
+	let failed = listing.running.await.unwrap().unwrap_err();
+
+	assert_eq!(failed.error.kind(), ErrorKind::ContentHashMismatch);
+	let mismatch = failed
+		.error
+		.downcast_ref::<ContentHashMismatchError>()
+		.unwrap();
+	assert_eq!(
+		(mismatch.uuid, mismatch.expected, mismatch.actual),
+		(ARCHIVE, hash(b"another archive"), hash(&tar))
+	);
+	// the whole tar was read before its hash could be checked
+	assert_eq!(failed.report.totals.files, 2);
+	assert_eq!(listing.recorder.entries.lock().unwrap().len(), 2);
+	assert_eq!(listing.recorder.last().phase, ListPhase::Failed);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_damaged_tar_not_matching_its_hash_fails_the_listing_as_not_matching_it() {
+	/// Where `b.txt`'s header starts: past `a.txt`'s header and its data block.
+	const SECOND_HEADER: usize = 2 * TAR_BLOCK;
+	let mut tar = tar_of(&[("a.txt", b"a"), ("b.txt", b"b")]);
+	tar[SECOND_HEADER + TAR_CHECKSUM.start] ^= 1;
+	let setup = setup_in(
+		DESTINATION,
+		"bundle.tar",
+		tar.clone(),
+		Some(hash(b"another archive")),
+		|_| {},
+	);
+	let listing = list(&setup, JobControl::default(), test_config());
+	let failed = listing.running.await.unwrap().unwrap_err();
+
+	// one chunk, so read whole by the time the codec fails on the damaged header
+	assert_eq!(failed.error.kind(), ErrorKind::ContentHashMismatch);
+	let mismatch = failed
+		.error
+		.downcast_ref::<ContentHashMismatchError>()
+		.unwrap();
+	assert_eq!(
+		(mismatch.uuid, mismatch.expected, mismatch.actual),
+		(ARCHIVE, hash(b"another archive"), hash(&tar))
+	);
+	assert_eq!(listing.recorder.last().phase, ListPhase::Failed);
 }
 
 #[test]
