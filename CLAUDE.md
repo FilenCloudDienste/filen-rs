@@ -140,11 +140,14 @@ Test notes:
   not after every commit: each full drive-mutating suite takes tens of minutes and holds
   the lock for all of it. After a failure, rerun the failing test alone
   (`-- --exact <path::name>`) before rerunning the suite.
-- The scheduled `test.yml` run (cron 00:00 UTC, often starting late, about 4 h) takes the
-  same `drive-write` lock. If your test account is the one CI uses, do not start a full
-  live run between 00:00 and 05:00 UTC, or check
-  `gh run list -R FilenCloudDienste/filen-rs --workflow test.yml --limit 1` first: an
-  overlapping run gets about 2x slower and fails tests that pass alone.
+- Every `test.yml` run takes the same `drive-write` lock: the scheduled one (cron 00:00 UTC,
+  often starting late, about 4 h, sometimes ending after 06:00) and any dispatched or `[test]`
+  run, which can start at any hour. Its `test-sync-engine` job holds the lock for most of its
+  two hours, and while it runs CLI commands wait minutes for the lock. If your test account
+  is the one CI uses, do not start a full live run while one is in progress: check
+  `gh run list -R FilenCloudDienste/filen-rs --workflow test.yml --status in_progress` first,
+  whatever the time. An overlapping run gets about 2x slower and fails tests that pass alone,
+  above all those that wait on the cache with a budget of their own.
 - `dir_tests::size` sleeps ~80 minutes waiting out the backend's throttled size
   recomputation, so it is `#[ignore]`d. Run it explicitly with
   `cargo test -p filen-sdk-rs --test dir_tests size -- --ignored` when you mean to exercise
