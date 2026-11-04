@@ -43,6 +43,7 @@ use crate::{
 	consts::{
 		CALLBACK_INTERVAL, CHUNK_SIZE_U64, FILE_CHUNK_SIZE_EXTRA, MAX_SMALL_PARALLEL_REQUESTS,
 	},
+	error::ContentHashMismatchError,
 	fs::{
 		HasName, HasUUID,
 		categories::{DirType, NonRootItemType, Normal},
@@ -985,13 +986,12 @@ async fn copy_file_inner<B: DriveBackend>(
 		));
 	}
 	let hash = Blake3Hash::from(hasher.finalize());
-	if let Some(expected) = source.hash()
-		&& expected != hash
-	{
-		tracing::warn!(
-			"copied file {} does not match the hash in its metadata",
-			source.uuid()
-		);
+	// A source whose data is not what its metadata declares fails as a download, before the copy
+	// is registered: the unfinalized upload is dropped like any other failed file's. An empty
+	// source is checked too, against the hash of no bytes.
+	if let Some(expected) = source.hash() {
+		ContentHashMismatchError::check(source.uuid(), expected, hash)
+			.map_err(|mismatch| FileError::Failed(CopyStage::Download, mismatch.into()))?;
 	}
 	let modified = source.last_modified().unwrap_or_else(Utc::now);
 	let completion = UploadCompletion {

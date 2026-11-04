@@ -1740,24 +1740,96 @@ async fn an_empty_directory_is_created_alone() {
 	assert_counts_add_up(&report, &recorder.last());
 }
 
+/// Asserts `report`'s only failure is `source` not matching its hash, at download, after it
+/// was read whole.
+fn assert_failed_its_hash(report: &CopyReport<()>, source: &RemoteFileType<'static>) {
+	let info = &only_failure(report).info;
+	assert_eq!(info.source_uuid, source.uuid());
+	assert_eq!(info.stage, CopyStage::Download);
+	assert_eq!(info.error.kind(), ErrorKind::ContentHashMismatch);
+	let mismatch = info
+		.error
+		.downcast_ref::<ContentHashMismatchError>()
+		.expect("the failure keeps the mismatch");
+	assert_eq!(mismatch.uuid, source.uuid());
+	assert_eq!(
+		mismatch.expected,
+		Blake3Hash::from(blake3::hash(b"another file"))
+	);
+	assert_eq!(
+		mismatch.actual,
+		source_hash(source.uuid(), source.size()),
+		"the hash of what was read"
+	);
+}
+
 #[tokio::test(start_paused = true)]
-async fn a_hash_mismatch_is_logged_and_the_copy_kept() {
+async fn a_file_not_matching_its_hash_fails_and_is_not_registered() {
 	let destination = Uuid::new_v4();
 	let source = source_file_with_wrong_hash("a.txt", CHUNK_SIZE_U64 + 3);
+	let other = source_file("b.txt", 5);
 	let backend = Arc::new(FakeBackend::new(destination));
-	let (running, _recorder, _reporter) = start(
+	let (running, recorder, reporter) = start(
+		&backend,
+		plan(
+			destination,
+			vec![
+				PlanSource::File(source.clone()),
+				PlanSource::File(other.clone()),
+			],
+		),
+		JobControl::default(),
+	);
+	let report = running.await.unwrap().unwrap();
+
+	assert_failed_its_hash(&report, &source);
+	let log = backend.log();
+	let finished: Vec<&str> = log
+		.finished
+		.values()
+		.map(|(name, _)| name.as_str())
+		.collect();
+	assert_eq!(finished, ["b.txt"], "only the other file is registered");
+	drop(log);
+	let [copied] = report.top_level.as_slice() else {
+		panic!("one copy, got {:?}", report.top_level);
+	};
+	assert_eq!(copied.source_uuid, other.uuid());
+	let counts = report.counts;
+	assert_eq!((counts.files_done, counts.files_failed), (1, 1));
+	assert_eq!(counts.bytes_failed, source.size());
+	assert!(recorder.events().iter().any(|e| matches!(
+		e,
+		CopyEvent::FileFailed(info)
+			if info.source_uuid == source.uuid() && info.stage == CopyStage::Download
+	)));
+	backend.assert_released(&reporter);
+	assert_counts_add_up(&report, &recorder.last());
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_empty_file_not_matching_its_hash_fails() {
+	let destination = Uuid::new_v4();
+	let source = source_file_with_wrong_hash("empty.txt", 0);
+	let backend = Arc::new(FakeBackend::new(destination));
+	let (running, recorder, reporter) = start(
 		&backend,
 		plan(destination, vec![PlanSource::File(source.clone())]),
 		JobControl::default(),
 	);
 	let report = running.await.unwrap().unwrap();
-	assert!(report.failures.is_empty());
-	let (_, completion) = backend.log().finished.values().next().unwrap().clone();
+
+	assert_failed_its_hash(&report, &source);
 	assert_eq!(
-		completion.hash,
-		source_hash(source.uuid(), source.size()),
-		"the copy is registered with the hash of what was read"
+		source_hash(source.uuid(), 0),
+		Blake3Hash::from(blake3::hash(b"")),
+		"checked against the hash of no bytes"
 	);
+	assert!(backend.log().fetched.is_empty(), "nothing is read");
+	assert!(backend.log().finished.is_empty(), "nothing is registered");
+	assert!(report.top_level.is_empty());
+	backend.assert_released(&reporter);
+	assert_counts_add_up(&report, &recorder.last());
 }
 
 #[tokio::test(start_paused = true)]

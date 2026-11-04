@@ -854,6 +854,65 @@ async fn a_failed_file_is_reported_with_its_parent_and_can_be_retried_there() {
 	assert_same_files(&client, &copied, [("gone.bin", &real), ("kept.txt", &kept)]).await;
 }
 
+/// A source file whose content no longer hashes to the BLAKE3 its metadata declares fails at
+/// download without stopping the copy, and no copy of it is created.
+#[cfg(feature = "malformed")]
+#[shared_test_runtime]
+async fn a_file_not_matching_its_hash_is_not_copied() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = resources.client.clone();
+	let test_dir = &resources.dir;
+	let kept = upload(&client, test_dir, "kept.txt", b"kept").await;
+	let mut mismatched = upload(
+		&client,
+		test_dir,
+		"mismatched.bin",
+		&data(CHUNK_SIZE + 5, 3),
+	)
+	.await;
+	let wrong = blake3::hash(b"other bytes").into();
+	client
+		.replace_file_hash(&mut mismatched, wrong)
+		.await
+		.unwrap();
+	// as listed from the server, so the declared hash is the one the metadata now carries
+	let mismatched = client.get_file(mismatched.uuid()).await.unwrap();
+	assert_eq!(mismatched.hash(), Some(wrong));
+	let destination = client
+		.create_dir(&test_dir.into(), "destination")
+		.await
+		.unwrap();
+
+	let report = client
+		.clone()
+		.copy_items(
+			vec![
+				ItemSource::File(kept.clone().into()),
+				ItemSource::File(mismatched.clone().into()),
+			],
+			destination.clone().into(),
+			CopyConfig::default(),
+			Arc::new(Recorder::default()),
+			JobControl::default(),
+		)
+		.await
+		.unwrap();
+	let [failure] = report.failures.as_slice() else {
+		panic!("one failure: {:?}", report.failures);
+	};
+	assert_eq!(failure.info.source_uuid, mismatched.uuid());
+	assert_eq!(failure.info.stage, CopyStage::Download);
+	assert_eq!(
+		failure.info.error.kind(),
+		ErrorKind::ContentHashMismatch,
+		"{}",
+		failure.info.error
+	);
+	assert_eq!(report.counts.files_done, 1, "the other file is copied");
+	let (_, copied) = contents(&client, &destination).await;
+	assert_same_files(&client, &copied, [("kept.txt", &kept)]).await;
+}
+
 #[shared_test_runtime]
 async fn max_bytes_is_checked_before_anything_is_written() {
 	let resources = test_utils::RESOURCES.get_resources().await;

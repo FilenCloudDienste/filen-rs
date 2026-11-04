@@ -77,7 +77,10 @@ impl Client {
 	/// The copy first lists every source directory and every destination (the scanning phase),
 	/// then creates the directories and copies the files. It reports its progress to `callback`
 	/// and can be paused, resumed and cancelled through `control` in every phase. A failed item
-	/// does not stop the others; running out of storage stops the copy.
+	/// does not stop the others; running out of storage stops the copy. A file whose data does not
+	/// match the BLAKE3 hash its metadata declares fails at
+	/// [`CopyStage::Download`](super::CopyStage::Download) with
+	/// [`ErrorKind::ContentHashMismatch`], and no copy of it is created.
 	///
 	/// Returns the report (what was created, what failed, what was skipped). A copy that ended
 	/// early fails with the report so far, and [`ErrorKind::Cancelled`] after a cancel or the
