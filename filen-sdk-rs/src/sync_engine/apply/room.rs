@@ -23,11 +23,13 @@ pub(in crate::sync_engine) fn free_space(path: &Path) -> std::io::Result<u64> {
 /// The free bytes of the volume holding `path`, from the volume whose mount point is the longest
 /// prefix of it. sysinfo reads the volume's total free bytes, not a user's quota: over a quota the
 /// retry starts its downloads and the disk refuses them, as on the first attempt. Network drives are
-/// not listed, so they fall back to starting the downloads.
+/// not listed, so they fall back to starting the downloads. A path that does not exist is an error,
+/// as `statvfs` makes it on unix, rather than the free space of whichever volume its prefix names.
 #[cfg(windows)]
 pub(in crate::sync_engine) fn free_space(path: &Path) -> std::io::Result<u64> {
 	use sysinfo::{DiskRefreshKind, Disks};
 
+	std::fs::metadata(path)?;
 	let disks = Disks::new_with_refreshed_list_specifics(DiskRefreshKind::nothing().with_storage());
 	disks
 		.list()
