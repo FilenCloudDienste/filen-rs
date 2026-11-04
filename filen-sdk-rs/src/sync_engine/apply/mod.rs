@@ -846,7 +846,7 @@ pub(super) fn aside_target(
 	)))
 }
 
-fn parent_and_name(rel_path: &str) -> (&str, &str) {
+pub(super) fn parent_and_name(rel_path: &str) -> (&str, &str) {
 	match rel_path.rsplit_once('/') {
 		Some((parent, name)) => (parent, name),
 		None => ("", rel_path),

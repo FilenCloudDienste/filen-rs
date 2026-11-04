@@ -2751,12 +2751,28 @@ impl Prepared {
 	///
 	/// The scan records a rejected name under another as well, so one under a name the remote holds
 	/// is refused on its own; under a refused one it is refused twice, which blocks nothing more.
+	///
+	/// The view is read as this pass's directory moves left it, and a move it pushes re-keys the
+	/// remote directory to the local path. A pushed move that renames the directory writes its new
+	/// name anew, which the remote holds only by this pass's plan: that name is refused, and the
+	/// move with it, leaving the remote copy where it is. A move that only re-parents keeps the name
+	/// the remote holds, and so does everything a move carries under it.
 	fn refused_names(&self) -> impl Iterator<Item = (&String, &String)> {
 		let remote = self.remote_view.nodes.of(&self.baseline);
+		let renamed: BTreeSet<&str> = self
+			.dir_moves
+			.iter()
+			.filter(|action| matches!(action, SyncAction::MoveRemote { .. }))
+			.map(SyncAction::endpoints)
+			.filter(|(from, to)| apply::parent_and_name(from).1 != apply::parent_and_name(to).1)
+			.map(|(_, to)| to)
+			.collect();
 		self.facts
 			.invalid_names
 			.iter()
-			.filter(move |(rel_path, _)| !remote.holds(rel_path))
+			.filter(move |(rel_path, _)| {
+				renamed.contains(rel_path.as_str()) || !remote.holds(rel_path)
+			})
 	}
 
 	/// [`refused_names`](Self::refused_names) as reported: the top-most of each refused subtree,

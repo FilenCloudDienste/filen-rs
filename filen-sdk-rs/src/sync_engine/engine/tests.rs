@@ -2363,6 +2363,88 @@ fn a_rejected_name_under_a_refused_one_is_reported_once() {
 	);
 }
 
+/// A synced directory renamed locally into a name the SDK's validator refuses is reported, and its
+/// remote copy stays where it is: neither moved, which would write the name anew, nor trashed. The
+/// remote view the pushed move carries to the new name is this pass's plan, not proof the remote
+/// holds it.
+#[test]
+fn a_directory_renamed_into_a_rejected_name_is_reported_and_not_moved() {
+	let docs = Docs::new();
+	let remote = view(
+		vec![
+			remote_dir("docs", docs.dir),
+			remote_file("docs/a.txt", docs.a, docs.a_hash, 4),
+			remote_file("docs/x.bin", docs.x, docs.x_hash, 4),
+		],
+		Vec::new(),
+		&[],
+	);
+	let mut prep = prepared(
+		SyncMode::TwoWay,
+		docs.baseline(),
+		docs.local("bad."),
+		remote,
+		HashMap::new(),
+	);
+	prep.facts
+		.invalid_names
+		.insert("bad.".to_string(), "trailing dot".to_string());
+	let (actions, unsyncable) = run_prepared(prep);
+	assert_eq!(actions, []);
+	assert_eq!(
+		unsyncable,
+		vec![UnsyncablePath {
+			rel_path: "bad.".to_string(),
+			reason: UnsyncableReason::InvalidName {
+				detail: "trailing dot".to_string(),
+			},
+		}]
+	);
+}
+
+/// A synced directory under a rejected name the remote holds, moved locally into another synced
+/// directory under that same name, is moved on the remote too: the move only re-parents it, and
+/// writes no name the remote does not already hold.
+#[test]
+fn a_directory_under_a_held_rejected_name_moved_without_a_rename_is_moved() {
+	let (sub, dir, file) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+	let hash = Blake3Hash::from([1; 32]);
+	let baseline = HashMap::from([
+		("sub".to_string(), dir_row("sub", sub)),
+		("a:b".to_string(), dir_row("a:b", dir)),
+		("a:b/f.txt".to_string(), file_row("a:b/f.txt", file, hash)),
+	]);
+	let remote = view(
+		vec![
+			remote_dir("sub", sub),
+			remote_dir("a:b", dir),
+			remote_file("a:b/f.txt", file, hash, 4),
+		],
+		Vec::new(),
+		&[],
+	);
+	let local = vec![
+		local_dir("sub"),
+		local_dir("sub/a:b"),
+		local_file("sub/a:b/f.txt", hash),
+	];
+	let mut prep = prepared(SyncMode::TwoWay, baseline, local, remote, HashMap::new());
+	prep.facts
+		.invalid_names
+		.insert("sub/a:b".to_string(), "forbidden ':'".to_string());
+	let (actions, unsyncable) = run_prepared(prep);
+	assert_eq!(
+		actions,
+		vec![SyncAction::MoveRemote {
+			from_path: "a:b".to_string(),
+			to_path: "sub/a:b".to_string(),
+			kind: NodeKind::Dir,
+			remote_uuid: dir,
+		}]
+	);
+	assert_eq!(unsyncable, []);
+}
+
 /// The NFC and NFD spellings of one remote name are reported as a collision at the path they share,
 /// and nothing is planned there on either side: not the local copy's upload, not its deletion.
 #[test]
