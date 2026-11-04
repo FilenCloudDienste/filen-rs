@@ -20,3 +20,4 @@
 /test-assets/sw-sdk-rs_bg.wasm
 /assets
 /node
+/Cargo.lock

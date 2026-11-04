@@ -6,12 +6,13 @@
 	"scripts": {
 		"build": "vite build -c vite.sw.config.ts",
 		"test": "npm run build && { vitest run --browser.name=chromium; chromium=$?; vitest run --browser.name=firefox && exit $chromium; }",
-		"ubrn:ios": "ubrn build ios --and-generate",
+		"ubrn:ios": "ubrn build ios --and-generate && node scripts/prepare-native-package.mjs",
 		"ubrn:android": "ubrn build android --and-generate",
 		"ubrn:android:arm": "ubrn build android --and-generate -t arm64-v8a",
 		"ubrn:android:x86": "ubrn build android --and-generate -t x86_64",
 		"ubrn:checkout": "ubrn checkout",
-		"ubrn:release": "ubrn build ios --release --and-generate && ubrn build android --release --and-generate",
+		"ubrn:release": "ubrn build ios --release --and-generate && ubrn build android --release --and-generate && node scripts/prepare-native-package.mjs",
+		"prepack": "node scripts/prepare-native-package.mjs",
 		"build:napi": "napi build --platform --manifest-path ../Cargo.toml --features napi,cache,sync-engine,rclone --output-dir node --esm",
 		"build:napi:release": "npm run build:napi -- --release",
 		"test:napi": "node --test napi/smoke.test.mjs napi/parity.test.mjs",
@@ -40,6 +41,7 @@
 		"FilenSdkRsFramework.xcframework",
 		"src",
 		"SdkRs.podspec",
+		"Cargo.lock",
 		"node/index.js",
 		"node/index.d.ts"
 	],
