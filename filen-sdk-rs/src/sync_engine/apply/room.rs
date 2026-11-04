@@ -20,9 +20,10 @@ pub(in crate::sync_engine) fn free_space(path: &Path) -> std::io::Result<u64> {
 	Ok((stat.blocks_available() as u64).saturating_mul(stat.fragment_size() as u64))
 }
 
-/// The bytes this process may still write to the volume holding `path`, from the volume whose mount
-/// point is the longest prefix of it (`GetDiskFreeSpaceExW`'s answer for that volume, which counts
-/// a disk quota on it).
+/// The free bytes of the volume holding `path`, from the volume whose mount point is the longest
+/// prefix of it. sysinfo reads the volume's total free bytes, not a user's quota: over a quota the
+/// retry starts its downloads and the disk refuses them, as on the first attempt. Network drives are
+/// not listed, so they fall back to starting the downloads.
 #[cfg(windows)]
 pub(in crate::sync_engine) fn free_space(path: &Path) -> std::io::Result<u64> {
 	use sysinfo::{DiskRefreshKind, Disks};
