@@ -47,6 +47,22 @@ pub extern "system" fn java_init(env: jni::JNIEnv, _class: jni::objects::JClass)
 	_ = VM.set(vm);
 }
 
+/// `io.filen.app.FilenProviderTls.nativeInit(context)`: hands this library's copy of the SDK's
+/// Android certificate verifier the JVM and the app's `Context`. Until it has run, every TLS
+/// handshake the Documents Provider makes fails closed (`filen_sdk_rs::platform_net::tls_status`
+/// says why). A class of its own: the app's copy of the SDK exports `FilenTls.nativeInit`.
+#[cfg(target_os = "android")]
+// JNI entry point: export_name is an unsafe attribute.
+#[allow(unsafe_code)]
+#[unsafe(export_name = "Java_io_filen_app_FilenProviderTls_nativeInit")]
+pub extern "system" fn provider_tls_native_init<'local>(
+	env: filen_sdk_rs::platform_net::android::jni::EnvUnowned<'local>,
+	_class: filen_sdk_rs::platform_net::android::jni::objects::JObject<'local>,
+	context: filen_sdk_rs::platform_net::android::jni::objects::JObject<'local>,
+) -> filen_sdk_rs::platform_net::android::jni::sys::jboolean {
+	filen_sdk_rs::platform_net::android::native_init(env, context)
+}
+
 #[cfg(any(target_os = "ios", target_os = "macos"))]
 fn build_tokio_runtime() -> Runtime {
 	Builder::new_multi_thread()
