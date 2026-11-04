@@ -26,7 +26,9 @@ no-auth() {
 export MANUEL_TMP="$(mktemp -d /tmp/filen-cli-test-XXXXXX)"
 # (will cd $MANUEL_TMP at the end of the script)
 # generate a unique remote cwd for this test run
-MANUEL_REMOTE_CWD_candidate="filen-cli-testing/manuel-$RANDOM"
+# (64 random bits: `$RANDOM`'s 15 bits soon collided with the directories earlier runs left behind)
+# (manuel_tests.rs sets MANUEL_RUN_ID, and deletes the directories named after it once the run passes)
+MANUEL_REMOTE_CWD_candidate="filen-cli-testing/manuel-${MANUEL_RUN_ID:+$MANUEL_RUN_ID-}$(od -An -N8 -tx8 /dev/urandom | tr -d ' ')"
 # (the directory is created first: the CLI refuses a --working-path that does not exist)
 set-remote-cwd() {
     filen --quiet mkdir "/$MANUEL_REMOTE_CWD_candidate" > /dev/null || return 1
