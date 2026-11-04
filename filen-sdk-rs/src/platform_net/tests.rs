@@ -708,22 +708,74 @@ fn the_distrusting_verifier_delegates_signature_checks() {
 /// The distrust list is rustls-webpki's: the keys its `DISTRUSTED_SPKIS` names, read from its
 /// source as this build resolved it, hash to exactly [`DISTRUSTED_SPKI_SHA256`], so a bump that
 /// changes them fails here until the list follows. A chain carrying one of them is refused.
+///
+/// The resolved versions come from the workspace's `Cargo.lock` and their sources from Cargo's
+/// registry checkout, which every build that compiled them has extracted: `cargo metadata` would
+/// resolve every target's dependencies and needs the network for the ones never downloaded.
 #[test]
 fn the_distrust_list_mirrors_rustls_webpki() {
-	let metadata = std::process::Command::new(env!("CARGO"))
-		.args(["metadata", "--format-version", "1", "--offline"])
-		.current_dir(env!("CARGO_MANIFEST_DIR"))
-		.output()
-		.expect("cargo metadata runs");
-	assert!(metadata.status.success(), "{metadata:?}");
-	let metadata: serde_json::Value = serde_json::from_slice(&metadata.stdout).unwrap();
+	let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+	let lock_path = manifest_dir
+		.ancestors()
+		.map(|dir| dir.join("Cargo.lock"))
+		.find(|lock| lock.is_file())
+		.expect("the workspace has a Cargo.lock");
+	let lock = std::fs::read_to_string(&lock_path).unwrap();
+	// Line by line: a Windows checkout may end them with CRLF.
+	let versions: Vec<&str> = lock
+		.split("[[package]]")
+		.filter_map(|package| {
+			let field = |key: &str| {
+				package.lines().find_map(|line| {
+					line.trim()
+						.strip_prefix(key)?
+						.strip_prefix(" = \"")?
+						.strip_suffix('"')
+				})
+			};
+			(field("name")? == "rustls-webpki" && field("source")?.starts_with("registry+"))
+				.then(|| field("version"))
+				.flatten()
+		})
+		.collect();
+	assert!(
+		!versions.is_empty(),
+		"{} locks no rustls-webpki from a registry",
+		lock_path.display()
+	);
+	let registry_src = std::env::var_os("CARGO_HOME")
+		.map(std::path::PathBuf::from)
+		.or_else(|| dirs::home_dir().map(|home| home.join(".cargo")))
+		.expect("a Cargo home")
+		.join("registry")
+		.join("src");
+	let indexes: Vec<std::path::PathBuf> = std::fs::read_dir(&registry_src)
+		.map(|entries| {
+			entries
+				.filter_map(|entry| Some(entry.ok()?.path()))
+				.collect()
+		})
+		.unwrap_or_default();
+	let sources: Vec<(&str, std::path::PathBuf)> = versions
+		.iter()
+		.filter_map(|version| {
+			indexes
+				.iter()
+				.map(|index| index.join(format!("rustls-webpki-{version}")).join("src"))
+				.find(|src| src.join("verify_cert.rs").is_file())
+				.map(|src| (*version, src))
+		})
+		.collect();
+	if sources.is_empty() {
+		// Vendored or relocated sources: nothing to compare against here.
+		eprintln!(
+			"skipped: no source of rustls-webpki {versions:?} under {}",
+			registry_src.display()
+		);
+		return;
+	}
 	let mut lists = Vec::new();
-	for package in metadata["packages"].as_array().unwrap() {
-		if package["name"] != "rustls-webpki" {
-			continue;
-		}
-		let manifest = std::path::Path::new(package["manifest_path"].as_str().unwrap());
-		let src = manifest.parent().unwrap().join("src");
+	for (version, src) in sources {
 		let source = std::fs::read_to_string(src.join("verify_cert.rs")).unwrap();
 		// Older majors have no list.
 		let Some((_, list)) = source.split_once("DISTRUSTED_SPKIS: &[&[u8]] = &[") else {
@@ -735,7 +787,7 @@ fn the_distrust_list_mirrors_rustls_webpki() {
 			.skip(1)
 			.map(|entry| std::fs::read(src.join(entry.split_once('"').unwrap().0)).unwrap())
 			.collect();
-		lists.push((package["version"].to_string(), keys));
+		lists.push((version, keys));
 	}
 	assert!(!lists.is_empty(), "no rustls-webpki with a distrust list");
 	for (version, keys) in lists {
