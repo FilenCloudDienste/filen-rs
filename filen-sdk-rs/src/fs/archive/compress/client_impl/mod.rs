@@ -89,9 +89,12 @@ impl Client {
 	/// is written, so every archive the SDK writes can be extracted by it again.
 	///
 	/// The archive only becomes visible once all of it is uploaded, so a job that ends early
-	/// leaves nothing behind. Up to [`ArchiveConfig::job_concurrency`] archive jobs run at once;
-	/// a later one waits, reporting [`CompressPhase::WaitingForWorker`]. The destination is only
-	/// listed once the job runs, so a missing or trashed one fails it then, after any such wait.
+	/// leaves nothing behind. A source whose data does not hash to the BLAKE3 its metadata
+	/// declares fails the job with [`ErrorKind::ContentHashMismatch`] once read, registering no
+	/// archive and removing no source. Up to [`ArchiveConfig::job_concurrency`] archive jobs run
+	/// at once; a later one waits, reporting [`CompressPhase::WaitingForWorker`]. The destination
+	/// is only listed once the job runs, so a missing or trashed one fails it then, after any
+	/// such wait.
 	/// It reports its progress to `callback` and can be paused, resumed and cancelled through
 	/// `control`; a job paused before it starts waits in [`CompressPhase::Scanning`], having
 	/// listed nothing, until it is resumed or cancelled. While paused the job holds no drive lock
@@ -533,7 +536,6 @@ fn compress_job<D>(
 			let source = Source {
 				file: file.source,
 				path,
-				request: file.request,
 			};
 			Ok((job, vec![source]))
 		}
@@ -581,7 +583,6 @@ fn archive_entries<D>(plan: ItemPlan<D>) -> Result<(Vec<ArchiveEntry>, Vec<Sourc
 		sources.push(Source {
 			file: file.source,
 			path,
-			request: file.request,
 		});
 	}
 	Ok((entries, sources))

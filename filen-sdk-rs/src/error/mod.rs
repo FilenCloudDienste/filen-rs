@@ -232,9 +232,9 @@ pub enum ErrorKind {
 	TlsVerification,
 	/// A downloaded file's content does not hash to the BLAKE3 its metadata declares: its stored
 	/// data or its metadata is not what the client that uploaded it wrote. A download of the whole
-	/// file fails with it, to memory, a writer or a path, and so does a zip download holding the
-	/// file. Only a read of the whole file is checked, and only for a file whose metadata declares
-	/// a hash.
+	/// file fails with it, to memory, a writer or a path, and so do a zip download holding the
+	/// file and a compression with it as a source. Only a read of the whole file is checked, and
+	/// only for a file whose metadata declares a hash.
 	ContentHashMismatch,
 }
 

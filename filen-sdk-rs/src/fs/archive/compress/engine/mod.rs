@@ -27,6 +27,7 @@ use crate::{
 	Error, ErrorKind,
 	connect::ConnectedTargets,
 	consts::{CALLBACK_INTERVAL, CHUNK_SIZE_U64},
+	error::ContentHashMismatchError,
 	fs::{
 		HasUUID,
 		archive::{
@@ -90,8 +91,6 @@ pub(crate) struct Source {
 	pub(crate) file: RemoteFileType<'static>,
 	/// Its path in the archive, for reporting.
 	pub(crate) path: String,
-	/// The top-level source (the job's request) it was listed under.
-	pub(crate) request: usize,
 }
 
 /// What [`run_compress`] needs.
@@ -151,8 +150,9 @@ pub(crate) struct DisposalSource {
 /// A top-level source, as the job works out what becomes of it.
 struct SourceRemoval {
 	target: DisposalTarget,
-	/// Why it is kept on its own account, whatever becomes of the others: a file below it that
-	/// did not match its hash, or had none to check a permanent removal against.
+	/// Why it is kept on its own account, whatever becomes of the others: a file below it had no
+	/// hash to check a permanent removal against. (One that did not match its hash failed the job
+	/// before anything is disposed of.)
 	own_reason: Option<KeptReason>,
 	nest: Nest,
 }
@@ -191,13 +191,10 @@ enum ArchiveChunk {
 struct SourceState {
 	file: Arc<RemoteFileType<'static>>,
 	path: String,
-	request: usize,
 	chunks: u64,
 	/// Chunks handed to the codec, which asks for them in order.
 	served: u64,
 	hasher: blake3::Hasher,
-	/// Its data did not match the hash in its metadata.
-	mismatched: bool,
 }
 
 impl SourceState {
@@ -206,10 +203,8 @@ impl SourceState {
 			chunks: source.file.size().div_ceil(CHUNK_SIZE_U64),
 			file: Arc::new(source.file),
 			path: source.path,
-			request: source.request,
 			served: 0,
 			hasher: blake3::Hasher::new(),
-			mismatched: false,
 		}
 	}
 }
@@ -253,8 +248,8 @@ struct Driver<B: DriveBackend> {
 	codec_done: bool,
 	max_bytes: Option<u64>,
 	stall: StallWatch,
-	/// The source files that did not match the hash in their metadata, for the report, and
-	/// how many more there were past what it lists.
+	/// The source file that did not match the hash in its metadata, which failed the job, for
+	/// the report; a job fails on its first, so it lists at most one and omits none.
 	hash_mismatches: Vec<HashMismatch>,
 	omitted_hash_mismatches: u64,
 	fatal: Fatal,
@@ -371,6 +366,9 @@ pub(crate) async fn run_compress<B: DisposalBackend>(
 	driver.next_fetch = driver.first_chunk_from(0);
 	driver.next_served = driver.next_fetch;
 	let outcome = async {
+		if driver.failed_an_empty_sources_hash() {
+			return Err(Stopped);
+		}
 		driver.compress().await?;
 		if driver.fatal.error().is_some() {
 			return Err(Stopped);
@@ -584,27 +582,12 @@ impl<B: DisposalBackend> Driver<B> {
 			.expect("the driver fetches only its sources");
 		state.hasher.update_rayon(&data);
 		state.served += 1;
-		if state.served == state.chunks
-			&& let Some(expected) = state.file.hash()
-			&& Blake3Hash::from(state.hasher.finalize()) != expected
-		{
-			tracing::warn!(
-				"source {} of an archive does not match the hash in its metadata",
-				state.file.uuid()
-			);
-			state.mismatched = true;
-			let mismatch = HashMismatch {
-				source_uuid: state.file.uuid(),
-				path: state.path.clone(),
-			};
-			keep(
-				&mut self.hash_mismatches,
-				&mut self.omitted_hash_mismatches,
-				&mismatch,
-			);
-			self.reporter
-				.event(CompressEvent::SourceHashMismatch(mismatch));
+		// a source whose data is not what its metadata declares fails the job before its last
+		// chunk reaches the codec: nothing is registered and no source is disposed of
+		if state.served == state.chunks && self.failed_its_hash(key.0) {
+			return;
 		}
+		let state = source_at(&self.sources, key.0).expect("the driver fetches only its sources");
 		let (source_uuid, size) = (state.file.uuid(), state.file.size());
 		self.reporter
 			.source_read(source_uuid, len, || CompressActiveFile {
@@ -619,6 +602,45 @@ impl<B: DisposalBackend> Driver<B> {
 				bytes_done: 0,
 			});
 		let _ = reply.send(data);
+	}
+
+	/// Fails the job when the data `source` was read as, every chunk of it hashed, is not what its
+	/// metadata declares, emitting and recording the mismatch; `true` when it did.
+	fn failed_its_hash(&mut self, source: u32) -> bool {
+		let state = source_at(&self.sources, source).expect("the driver reads only its sources");
+		let Some(expected) = state.file.hash() else {
+			return false;
+		};
+		let actual = Blake3Hash::from(state.hasher.finalize());
+		let Err(error) = ContentHashMismatchError::check(state.file.uuid(), expected, actual)
+		else {
+			return false;
+		};
+		let mismatch = HashMismatch {
+			source_uuid: error.uuid,
+			path: state.path.clone(),
+		};
+		keep(
+			&mut self.hash_mismatches,
+			&mut self.omitted_hash_mismatches,
+			&mismatch,
+		);
+		self.reporter
+			.event(CompressEvent::SourceHashMismatch(mismatch));
+		self.stop_with(error.into());
+		true
+	}
+
+	/// Fails the job on the first source with no chunks that declares the hash of other bytes
+	/// than none, as reading it would: the codec never asks for such a source, so its check
+	/// cannot wait for its last chunk, and it is made before anything is read. `true` when it did.
+	fn failed_an_empty_sources_hash(&mut self) -> bool {
+		// sources are numbered in a u32, as the codec asks for them
+		let count = u32::try_from(self.sources.len()).unwrap_or(u32::MAX);
+		(0..count).any(|source| {
+			source_at(&self.sources, source).is_some_and(|state| state.chunks == 0)
+				&& self.failed_its_hash(source)
+		})
 	}
 
 	fn on_event(&mut self, event: WorkerEvent) {
@@ -800,8 +822,8 @@ impl<B: DisposalBackend> Driver<B> {
 		let how = removal.how();
 		let nests = nesting(&enclosing(&sources));
 		// a source whose own files could not be checked is kept on its own; anything wrong
-		// with the archive keeps them all
-		let mut removals: Vec<SourceRemoval> = sources
+		// with the archive keeps them all (a file that did not match its hash failed the job)
+		let removals: Vec<SourceRemoval> = sources
 			.into_iter()
 			.zip(nests)
 			.map(|(source, nest)| SourceRemoval {
@@ -811,9 +833,6 @@ impl<B: DisposalBackend> Driver<B> {
 				nest,
 			})
 			.collect();
-		for source in self.sources.iter().filter(|source| source.mismatched) {
-			removals[source.request].own_reason = Some(KeptReason::HashMismatch);
-		}
 		let every_source_kept = removals.iter().all(|removal| removal.own_reason.is_some());
 		let archive_reason = self
 			.archive_kept(removal, archive, incomplete, every_source_kept)

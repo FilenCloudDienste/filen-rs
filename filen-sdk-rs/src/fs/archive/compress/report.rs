@@ -102,8 +102,9 @@ pub enum CompressEvent {
 	Skipped(SkippedEntry),
 	/// An item got another name in the archive.
 	Renamed(RenamedEntry),
-	/// A source's data does not match the hash in its metadata. It is in the archive as it was
-	/// read; the source itself may be damaged.
+	/// A source's data does not match the hash in its metadata: the job fails with
+	/// [`ErrorKind::ContentHashMismatch`](crate::ErrorKind::ContentHashMismatch) right after,
+	/// registering no archive and removing no source. The source itself may be damaged.
 	SourceHashMismatch(HashMismatch),
 	/// What became of a source, when the sources were to be removed.
 	SourceDisposition(SourceDisposition),
@@ -165,10 +166,11 @@ pub struct CompressReport {
 	pub needed_bytes: Option<u64>,
 	/// What became of each source, when the sources were to be removed.
 	pub dispositions: Vec<SourceDisposition>,
-	/// Source files whose data did not match the hash in their metadata: they went into the
-	/// archive as they were read (up to 1000 are listed).
+	/// The source file whose data did not match the hash in its metadata, which failed the job:
+	/// a job ends on its first, so this lists at most one.
 	pub hash_mismatches: Vec<HashMismatch>,
-	/// Mismatches past the 1000 `hash_mismatches` lists, only counted.
+	/// Mismatches past those `hash_mismatches` lists, only counted; a job ends on its first, so
+	/// this stays zero.
 	pub omitted_hash_mismatches: u64,
 }
 

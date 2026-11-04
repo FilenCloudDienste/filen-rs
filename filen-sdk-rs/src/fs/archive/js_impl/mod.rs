@@ -449,8 +449,8 @@ pub enum CompressEvent {
 	Skipped(SkippedEntry),
 	/// An item got another name in the archive.
 	Renamed(RenamedEntry),
-	/// A source's data did not match the hash in its metadata; it went into the archive as it
-	/// was read, and is kept.
+	/// A source's data did not match the hash in its metadata: the job fails with kind
+	/// `ContentHashMismatch` right after, registering no archive and removing no source.
 	SourceHashMismatch(HashMismatch),
 	/// What became of a source, when the sources were to be removed.
 	SourceDisposition(ArchiveSourceDisposition),
@@ -507,9 +507,10 @@ pub struct CompressReport {
 	pub needed_bytes: Option<u64>,
 	/// What became of the sources, when they were to be removed.
 	pub dispositions: Vec<ArchiveSourceDisposition>,
-	/// Source files whose data did not match the hash in their metadata (up to 1000).
+	/// The source file whose data did not match the hash in its metadata, which failed the job
+	/// (at most one: a job ends on its first).
 	pub hash_mismatches: Vec<HashMismatch>,
-	/// Mismatches past the 1000 `hashMismatches` lists, only counted.
+	/// Mismatches past those `hashMismatches` lists, only counted; stays zero.
 	pub omitted_hash_mismatches: u64,
 	/// Why the compress ended early: kind `Cancelled` when cancelled, or the error that stopped
 	/// it. `undefined` when it ran to the end.

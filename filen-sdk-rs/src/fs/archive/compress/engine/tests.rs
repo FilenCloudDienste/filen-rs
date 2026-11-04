@@ -309,8 +309,6 @@ fn start(setup: &Setup, run: Run) -> Job {
 			.map(|(path, file)| Source {
 				file: file.clone(),
 				path: path.clone(),
-				// the directory `docs` is the first top-level source, `top.txt` the second
-				request: usize::from(!path.starts_with("docs/")),
 			})
 			.collect(),
 		max_bytes,
@@ -439,22 +437,30 @@ async fn compresses_the_sources_into_one_new_file() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_source_that_does_not_match_its_hash_is_reported() {
+async fn a_source_that_does_not_match_its_hash_fails_the_job() {
 	let setup = setup(|backend, files| {
 		// the fake serves other bytes than the ones the metadata's hash is of
 		backend.contents.insert(files[2].uuid(), b"TOP".to_vec());
 	});
 	let job = start(&setup, Run::tar());
-	let report = job.running.await.unwrap().unwrap();
-	assert_eq!(
-		report
-			.hash_mismatches
-			.iter()
-			.map(|mismatch| mismatch.path.as_str())
-			.collect::<Vec<_>>(),
-		["top.txt"]
+	let failed = job.running.await.unwrap().unwrap_err();
+	assert_eq!(failed.error.kind(), ErrorKind::ContentHashMismatch);
+	let message = failed.error.to_string();
+	assert!(
+		message.contains(&SOURCE_UUIDS[2].to_string())
+			&& message.contains(&hash(b"top").as_sized_str().to_string())
+			&& message.contains(&hash(b"TOP").as_sized_str().to_string()),
+		"the error names the source and both hashes: {message}"
 	);
-	assert_eq!(report.omitted_hash_mismatches, 0);
+	assert_eq!(
+		failed.report.hash_mismatches,
+		[HashMismatch {
+			source_uuid: SOURCE_UUIDS[2],
+			path: "top.txt".to_owned(),
+		}]
+	);
+	assert_eq!(failed.report.omitted_hash_mismatches, 0);
+	assert!(failed.report.archive.is_none());
 	let mismatched: Vec<String> = job
 		.recorder
 		.events()
@@ -465,6 +471,12 @@ async fn a_source_that_does_not_match_its_hash_is_reported() {
 		})
 		.collect();
 	assert_eq!(mismatched, ["top.txt"]);
+	assert!(job.recorder.created.lock().unwrap().is_empty());
+	assert!(
+		setup.backend.log().finished.is_empty(),
+		"nothing registered"
+	);
+	assert_eq!(job.recorder.last().phase, CompressPhase::Failed);
 	setup.backend.assert_released(&job.reporter);
 }
 
@@ -1083,34 +1095,132 @@ async fn a_source_that_changed_is_kept_on_its_own() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn only_the_source_whose_data_differs_from_its_hash_is_kept() {
-	let setup_mismatch = setup(|backend, files| {
-		backend.contents.insert(files[2].uuid(), b"TOP".to_vec());
+async fn an_empty_source_that_declares_the_hash_of_other_bytes_fails_the_job() {
+	let mut setup = setup(|backend, files| {
+		backend.contents.insert(files[2].uuid(), Vec::new());
 	});
-	let report = compress_disposing(
-		&setup_mismatch,
-		SourceDisposal::Trash,
-		[true; 2],
-		CompressReport::default(),
-	)
-	.await;
-	// only the source the mismatching file belongs to is kept
-	let [docs, top] = &outcomes(&report)[..] else {
-		panic!("two sources");
-	};
-	assert!(matches!(docs, DisposalOutcome::Disposed { .. }), "{docs:?}");
-	assert!(
-		matches!(
-			top,
-			DisposalOutcome::Kept {
-				reason: KeptReason::HashMismatch,
-				..
-			}
-		),
-		"{top:?}"
+	// no data, but the hash of some, as a file whose size was cut to nothing declares it
+	setup.sources[2].1 = remote_file(
+		SOURCE_UUIDS[2],
+		SOURCES_PARENT,
+		"top.txt",
+		b"",
+		Some(hash(b"top")),
 	);
-	assert_eq!(setup_mismatch.backend.log().trashed_dirs.len(), 1);
-	assert!(setup_mismatch.backend.log().trashed_files.is_empty());
+	setup.contents[2] = Vec::new();
+	let Some(ArchiveEntry::File { size, .. }) = setup.entries.get_mut(3) else {
+		panic!("the setup's last entry is top.txt");
+	};
+	*size = 0;
+	let job = start(&setup, Run::tar());
+	let failed = job.running.await.unwrap().unwrap_err();
+	assert_eq!(failed.error.kind(), ErrorKind::ContentHashMismatch);
+	let message = failed.error.to_string();
+	assert!(
+		message.contains(&SOURCE_UUIDS[2].to_string())
+			&& message.contains(&hash(b"top").as_sized_str().to_string())
+			&& message.contains(&hash(b"").as_sized_str().to_string()),
+		"the error names the source and both hashes: {message}"
+	);
+	assert_eq!(
+		failed.report.hash_mismatches,
+		[HashMismatch {
+			source_uuid: SOURCE_UUIDS[2],
+			path: "top.txt".to_owned(),
+		}]
+	);
+	let mismatched: Vec<String> = job
+		.recorder
+		.events()
+		.into_iter()
+		.filter_map(|event| match event {
+			CompressEvent::SourceHashMismatch(mismatch) => Some(mismatch.path),
+			_ => None,
+		})
+		.collect();
+	assert_eq!(mismatched, ["top.txt"]);
+	assert!(failed.report.archive.is_none());
+	assert!(
+		setup.backend.log().finished.is_empty(),
+		"nothing registered"
+	);
+	assert_eq!(job.recorder.last().phase, CompressPhase::Failed);
+	setup.backend.assert_released(&job.reporter);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_empty_source_that_declares_the_hash_of_no_bytes_is_archived() {
+	let mut setup = setup(|backend, files| {
+		backend.contents.insert(files[2].uuid(), Vec::new());
+	});
+	setup.sources[2].1 = remote_file(
+		SOURCE_UUIDS[2],
+		SOURCES_PARENT,
+		"top.txt",
+		b"",
+		Some(hash(b"")),
+	);
+	setup.contents[2] = Vec::new();
+	let Some(ArchiveEntry::File { size, .. }) = setup.entries.get_mut(3) else {
+		panic!("the setup's last entry is top.txt");
+	};
+	*size = 0;
+	let job = start(&setup, Run::tar());
+	let report = job.running.await.unwrap().unwrap();
+	assert!(report.hash_mismatches.is_empty());
+	assert!(report.archive.is_some());
+	assert!(job.recorder.events().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_source_that_does_not_match_its_hash_keeps_every_source() {
+	for how in [SourceDisposal::Trash, SourceDisposal::DeletePermanently] {
+		let setup = setup(|backend, files| {
+			// as long as the real data, but other bytes, in a source of several chunks that
+			// other sources follow
+			backend
+				.contents
+				.insert(files[1].uuid(), pattern(CHUNK_SIZE + 77, 4));
+		});
+		let placed = place(&setup);
+		let disposal = (how, sources(targets(&setup, &placed), &[true; 2]));
+		let job = start(
+			&setup,
+			Run {
+				disposal: Some(disposal),
+				..Run::tar()
+			},
+		);
+		let failed = job.running.await.unwrap().unwrap_err();
+		assert_eq!(
+			failed.error.kind(),
+			ErrorKind::ContentHashMismatch,
+			"{how:?}"
+		);
+		let expected = [placed.docs, setup.sources[2].1.uuid()];
+		for dispositions in [failed.report.dispositions, told(&job.recorder)] {
+			let uuids: Vec<Uuid> = dispositions.iter().map(|d| d.uuid).collect();
+			assert_eq!(uuids, expected, "{how:?}");
+			for disposition in dispositions {
+				assert!(
+					matches!(
+						disposition.outcome,
+						DisposalOutcome::Kept {
+							reason: KeptReason::Incomplete,
+							bytes_freed: 0,
+						}
+					),
+					"{how:?}: {disposition:?}"
+				);
+			}
+		}
+		assert_nothing_removed(&setup);
+		assert!(
+			setup.backend.log().finished.is_empty(),
+			"nothing registered"
+		);
+		setup.backend.assert_released(&job.reporter);
+	}
 }
 
 /// Asserts that nothing was removed from the fake drive.
