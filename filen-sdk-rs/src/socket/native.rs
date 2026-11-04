@@ -192,7 +192,7 @@ impl UnauthedSocket<UnauthedNativeSender, UnauthedNativeReceiver, Utf8Bytes>
 	}
 }
 
-/// What [`NativeSocket::connect`] opens: the URL or, on the desktop targets, how to reach it.
+/// What [`NativeSocket::connect`] opens: the URL or, on the `platform_net` targets, how to reach it.
 pub(super) struct NativeRequest {
 	#[cfg(not(platform_net))]
 	url: String,
@@ -252,7 +252,7 @@ impl
 		let config = tungstenite::protocol::WebSocketConfig::default()
 			.max_frame_size(Some(4 << 20))
 			.max_message_size(Some(4 << 20));
-		// The desktop targets verify with the OS and go through its proxy; the others keep
+		// The `platform_net` targets verify with the OS and go through the proxy; the others keep
 		// tungstenite's webpki roots and connect directly.
 		#[cfg(platform_net)]
 		let ws_stream = request.transport.connect(request.route, config).await?;

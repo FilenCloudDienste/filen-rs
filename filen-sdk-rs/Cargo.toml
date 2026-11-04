@@ -387,16 +387,16 @@ zip = { version = "8.6.0", default-features = false, features = [
 	"zstd",
 ], optional = true }
 
-# Desktop targets only: TLS checks the server's certificate the way the OS does (its trust
-# store, enterprise roots, revocation) instead of the bundled webpki roots, and requests and the
-# websocket go through the system's proxy (environment variables, plus the macOS and Windows
-# settings), SOCKS5 included: reqwest's `socks` feature adds no crate, as it drives
-# hyper-util's SOCKS connector, which the websocket uses too. iOS, Android and wasm keep the
-# webpki roots and connect directly. The same targets as build.rs's `platform_net` cfg.
-[target.'cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))'.dependencies]
+# Desktop and mobile targets (build.rs's `platform_net` cfg; keep the two lists alike): TLS
+# checks the server's certificate the way the OS does (its trust store, enterprise and
+# user-installed roots, revocation) instead of the bundled webpki roots, with rustls-webpki's
+# distrusted keys refused on top, and the websocket shares that configuration. Requests and the
+# websocket honour proxy environment variables, SOCKS5 included: reqwest's `socks` feature adds no
+# crate, as it drives hyper-util's SOCKS connector, which the websocket uses too. wasm keeps the
+# browser's TLS.
+[target.'cfg(any(target_os = "windows", target_os = "macos", target_os = "linux", target_os = "ios", target_os = "android"))'.dependencies]
 reqwest = { version = "0.12.22", default-features = false, features = [
 	"socks",
-	"system-proxy",
 ] }
 rustls = { version = "0.23.32", default-features = false, features = [
 	"ring",
@@ -415,9 +415,22 @@ rustls-webpki = { version = "0.103.16", default-features = false, features = [
 hyper-util = { version = "0.1.17", default-features = false, features = [
 	"client-legacy",
 	"client-proxy",
-	"client-proxy-system",
 	"tokio",
 ] }
+
+# Desktop targets only: the system's proxy settings (macOS and Windows), besides the environment.
+[target.'cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))'.dependencies]
+reqwest = { version = "0.12.22", default-features = false, features = [
+	"system-proxy",
+] }
+hyper-util = { version = "0.1.17", default-features = false, features = [
+	"client-proxy-system",
+] }
+
+# Android: the platform verifier's JVM side is initialised through JNI (`platform_net::android`),
+# with the `jni` rustls-platform-verifier itself uses.
+[target.'cfg(target_os = "android")'.dependencies]
+jni = { version = "0.22", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }

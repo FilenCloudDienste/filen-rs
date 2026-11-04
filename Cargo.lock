@@ -2221,6 +2221,7 @@ dependencies = [
  "image",
  "imap",
  "itertools 0.14.0",
+ "jni 0.22.4",
  "lz4_flex",
  "lzma-rust2 0.21.0",
  "mail-parser",

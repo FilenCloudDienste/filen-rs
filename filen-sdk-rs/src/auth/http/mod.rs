@@ -287,7 +287,7 @@ impl ClientConfig {
 	/// Build the [`reqwest::Client`] backing every request, applying the connect/read timeouts
 	/// and the dead-peer detection (TCP keepalive, see [`TCP_KEEPALIVE_IDLE`]), which leaves the
 	/// read timeout to slow servers alone.
-	/// On the desktop targets it also builds the websocket's transport, which shares the
+	/// On the desktop and mobile targets (`platform_net`) it also builds the websocket's transport, which shares the
 	/// client's TLS configuration (see [`crate::platform_net`]).
 	///
 	/// On wasm the timeouts and the keepalive are not set — reqwest's fetch-based client exposes
@@ -312,7 +312,7 @@ impl ClientConfig {
 			}
 			#[cfg(platform_net)]
 			let (builder, socket_transport) = {
-				let tls = crate::platform_net::platform_tls_config();
+				let tls = crate::platform_net::client_tls()?;
 				let builder = match &tls {
 					Some(tls) => builder.use_preconfigured_tls(tls.clone()),
 					None => builder,

@@ -14,7 +14,7 @@ const SOCKET_URL: &str = "wss://socket.filen.io/socket.io/?EIO=3&transport=webso
 /// A transport whose `https` proxy is `proxy`, exempting `no_proxy`.
 fn via(proxy: &str, no_proxy: &str) -> SocketTransport {
 	SocketTransport::with_proxy(
-		platform_tls_config(),
+		platform_tls_config().ok(),
 		Matcher::builder().https(proxy).no(no_proxy).build(),
 		Some(Duration::from_secs(5)),
 	)
@@ -53,7 +53,7 @@ async fn scripted_proxy(answer: &'static str) -> (String, JoinHandle<(String, Ve
 
 #[test]
 fn platform_tls_speaks_http1() {
-	let config = platform_tls_config();
+	let config = platform_tls_config().ok();
 	// macOS and Windows always have a verifier; Linux has one when the system has CA
 	// certificates, which every CI image does.
 	#[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -67,7 +67,7 @@ fn platform_tls_speaks_http1() {
 fn reqwest_takes_the_platform_tls() {
 	// reqwest fails to build with a preconfigured TLS of a rustls version other than its own
 	// ("Unknown TLS backend"), so building proves it took ours.
-	if let Some(tls) = platform_tls_config() {
+	if let Ok(tls) = platform_tls_config() {
 		reqwest::Client::builder()
 			.use_preconfigured_tls(tls)
 			.build()
@@ -300,7 +300,7 @@ async fn requests_go_through_a_socks5h_proxy() {
 async fn a_socks5_proxy_is_handed_an_address_resolved_here() {
 	let (proxy, server) = scripted_socks5(0).await;
 	let transport = SocketTransport::with_proxy(
-		platform_tls_config(),
+		platform_tls_config().ok(),
 		Matcher::builder()
 			.https(format!("socks5://{proxy}"))
 			.build(),
@@ -489,7 +489,7 @@ fn a_blocked_check_does_not_stall_the_runtime() {
 
 #[test]
 fn platform_tls_offloads_the_check() {
-	if let Some(config) = platform_tls_config() {
+	if let Ok(config) = platform_tls_config() {
 		assert!(format!("{config:?}").contains("OffloadingVerifier"));
 	}
 }
@@ -807,7 +807,7 @@ fn the_distrust_list_mirrors_rustls_webpki() {
 
 #[test]
 fn platform_tls_checks_the_distrusted_keys() {
-	if let Some(config) = platform_tls_config() {
+	if let Ok(config) = platform_tls_config() {
 		assert!(format!("{config:?}").contains("DistrustingVerifier"));
 	}
 }
@@ -859,7 +859,7 @@ async fn a_request_to_an_unverified_server_is_not_offline() {
 async fn a_websocket_to_an_unverified_server_is_not_offline() {
 	let port = test_support::untrusted_tls_server(1);
 	let transport = SocketTransport::with_proxy(
-		platform_tls_config(),
+		platform_tls_config().ok(),
 		Matcher::builder().build(),
 		Some(Duration::from_secs(5)),
 	);
@@ -873,4 +873,86 @@ async fn a_websocket_to_an_unverified_server_is_not_offline() {
 		panic!("an unverified server must not be reached");
 	};
 	assert_eq!(error.kind(), ErrorKind::TlsVerification, "{error}");
+}
+
+/// Until the verifier is initialised every certificate check fails closed, without reaching the
+/// verifier (Android's panics then), with an error that reads as `TlsVerification`; once it is,
+/// the check is the verifier's.
+#[test]
+fn the_ready_gate_fails_closed_until_initialised() {
+	static READY: AtomicBool = AtomicBool::new(false);
+	let gate = ReadyGateVerifier::new(StandIn::new(true), &READY);
+	let cert = cert_with_key(TRUSTED_KEY);
+
+	let refused = check(&gate, &cert, &[]).unwrap_err();
+	assert_eq!(refused, rustls::Error::General(NOT_INITIALISED.to_owned()));
+	assert_eq!(gate.inner.checks.load(Ordering::SeqCst), 0);
+	let io = std::io::Error::new(std::io::ErrorKind::InvalidData, refused);
+	assert!(rejected_certificate(&io));
+
+	READY.store(true, Ordering::Release);
+	check(&gate, &cert, &[]).unwrap();
+	assert_eq!(gate.inner.checks.load(Ordering::SeqCst), 1);
+	assert_eq!(
+		gate.supported_verify_schemes(),
+		vec![SignatureScheme::ECDSA_NISTP384_SHA384]
+	);
+	assert!(gate.requires_raw_public_keys());
+}
+
+/// The stand-in for a platform verifier that could not be built refuses every certificate with
+/// the reason, which reads as `TlsVerification`, and still names the provider's schemes.
+#[test]
+fn an_unavailable_verifier_refuses_every_certificate() {
+	let provider = rustls::crypto::ring::default_provider();
+	let verifier =
+		UnavailableVerifier::new(&provider, rustls::Error::General("no trust store".into()));
+	let refused = check(&verifier, &cert_with_key(TRUSTED_KEY), &[]).unwrap_err();
+	assert!(refused.to_string().contains("no trust store"), "{refused}");
+	assert!(rejects_certificate(&refused));
+	assert_eq!(
+		verifier.supported_verify_schemes(),
+		provider
+			.signature_verification_algorithms
+			.supported_schemes()
+	);
+}
+
+/// On the host the platform verifier builds, so TLS is ready with the OS's verifier.
+#[test]
+fn tls_status_reports_the_platform_verifier() {
+	platform_tls_config().unwrap();
+	let status = tls_status();
+	assert!(status.ready, "{status:?}");
+	assert_eq!(status.backend, BACKEND);
+	assert!(status.backend.contains("rustls-platform-verifier"));
+}
+
+/// build.rs sets `platform_net` for the same targets the Cargo.toml table that brings in
+/// rustls, the platform verifier and the proxy connectors names (it cannot read the cfg), and
+/// the client built there shares the platform configuration with the websocket.
+#[test]
+fn platform_net_is_set_for_the_targets_with_its_dependencies() {
+	let dir = env!("CARGO_MANIFEST_DIR");
+	let build = std::fs::read_to_string(format!("{dir}/build.rs")).unwrap();
+	let manifest = std::fs::read_to_string(format!("{dir}/Cargo.toml")).unwrap();
+	let set_for = build
+		.lines()
+		.find(|line| line.starts_with("const PLATFORM_NET_TARGET_OSES"))
+		.expect("build.rs lists the target OSes");
+	let mut in_build: Vec<&str> = set_for.split('"').skip(1).step_by(2).collect();
+	let table = manifest
+		.lines()
+		.find(|line| line.contains("target_os = \"ios\", target_os = \"android\"))'.dependencies]"))
+		.expect("the platform_net dependency table");
+	let mut in_manifest: Vec<&str> = table
+		.split("target_os = \"")
+		.skip(1)
+		.map(|rest| rest.split('"').next().unwrap())
+		.collect();
+	in_build.sort_unstable();
+	in_manifest.sort_unstable();
+	assert_eq!(in_build, ["android", "ios", "linux", "macos", "windows"]);
+	assert_eq!(in_build, in_manifest);
+	assert!(client_tls().unwrap().is_some());
 }

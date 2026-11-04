@@ -1,11 +1,18 @@
-//! TLS and proxies on the desktop targets (Windows, macOS, Linux). Requests and the websocket
-//! check the server's certificate with the OS's verifier (`rustls-platform-verifier`: its trust
-//! store, the roots an administrator added, revocation) and go through the proxy the system is
-//! set to use, as other apps on the machine do. iOS, Android and wasm keep the bundled webpki
-//! roots and connect directly.
+//! TLS and proxies on the desktop (Windows, macOS, Linux) and mobile (iOS, Android) targets.
+//! Requests and the websocket check the server's certificate with the OS's verifier
+//! (`rustls-platform-verifier`: its trust store, the roots an administrator or the user added,
+//! revocation), with rustls-webpki's distrusted keys refused on top, and go through the proxy the
+//! environment (and on desktop the system settings) names. wasm keeps the browser's TLS.
+//!
+//! Where the platform verifier cannot be built, desktop falls back to the bundled webpki roots;
+//! mobile fails every handshake closed instead ([`UnavailableVerifier`]). Android's verifier needs
+//! the JVM first ([`android`]), and fails closed until it has it ([`ReadyGateVerifier`]).
 
 use std::{
-	sync::{Arc, OnceLock},
+	sync::{
+		Arc, Mutex, OnceLock,
+		atomic::{AtomicBool, Ordering},
+	},
 	time::Duration,
 };
 
@@ -33,6 +40,8 @@ use tower::ServiceExt;
 
 use crate::{Error, ErrorKind};
 
+#[cfg(target_os = "android")]
+pub mod android;
 #[cfg(test)]
 pub(crate) mod test_support;
 #[cfg(test)]
@@ -40,36 +49,253 @@ mod tests;
 
 /// The TLS configuration both reqwest and the websocket use: the platform verifier, HTTP/1.1
 /// over ALPN (reqwest is built without HTTP/2, and a websocket upgrade is HTTP/1.1). Built once
-/// per client. `None` when the platform verifier cannot be built, which happens only on Linux
-/// with no CA certificate in the system store: the client then keeps the bundled webpki roots,
-/// as before, rather than refuse every connection.
-pub(crate) fn platform_tls_config() -> Option<rustls::ClientConfig> {
+/// per client. An error when the platform verifier cannot be built, which on desktop happens only
+/// on Linux with no CA certificate in the system store: the client then keeps the bundled webpki
+/// roots, as before, rather than refuse every connection. On mobile it never errs for that: a
+/// verifier that refuses every certificate stands in ([`UnavailableVerifier`]), so no connection
+/// is made unverified, and [`tls_status`] tells why.
+pub(crate) fn platform_tls_config() -> Result<rustls::ClientConfig, rustls::Error> {
 	// reqwest's own choice: a process-wide default provider if the host installed one, else ring.
 	let provider = CryptoProvider::get_default()
 		.cloned()
 		.unwrap_or_else(|| Arc::new(rustls::crypto::ring::default_provider()));
-	let built = rustls::ClientConfig::builder_with_provider(provider)
-		.with_safe_default_protocol_versions()
-		.and_then(|builder| {
-			let verifier = Verifier::new(builder.crypto_provider().clone())?;
-			Ok(builder
-				.dangerous()
-				.with_custom_certificate_verifier(Arc::new(DistrustingVerifier::new(
-					OffloadingVerifier(verifier),
-				))))
-		});
-	match built {
-		Ok(builder) => {
-			let mut config = builder.with_no_client_auth();
-			config.alpn_protocols = vec![b"http/1.1".to_vec()];
-			Some(config)
+	let builder = rustls::ClientConfig::builder_with_provider(provider)
+		.with_safe_default_protocol_versions()?;
+	let provider = builder.crypto_provider().clone();
+	let verifier: Arc<dyn ServerCertVerifier> = match Verifier::new(provider.clone()) {
+		Ok(verifier) => {
+			let verifier = DistrustingVerifier::new(OffloadingVerifier(verifier));
+			#[cfg(target_os = "android")]
+			let verifier = ReadyGateVerifier::new(verifier, &android::TLS_READY);
+			VERIFIER_UNAVAILABLE.store(false, Ordering::Relaxed);
+			Arc::new(verifier)
 		}
+		Err(e) => {
+			VERIFIER_UNAVAILABLE.store(true, Ordering::Relaxed);
+			record_error(format!(
+				"the platform certificate verifier is unavailable: {e}"
+			));
+			#[cfg(not(any(target_os = "ios", target_os = "android")))]
+			return Err(e);
+			#[cfg(any(target_os = "ios", target_os = "android"))]
+			Arc::new(UnavailableVerifier::new(&provider, e))
+		}
+	};
+	let mut config = builder
+		.dangerous()
+		.with_custom_certificate_verifier(verifier)
+		.with_no_client_auth();
+	config.alpn_protocols = vec![b"http/1.1".to_vec()];
+	Ok(config)
+}
+
+/// The TLS configuration a client is built with ([`platform_tls_config`]): on desktop `None`, for
+/// reqwest's and tungstenite's bundled webpki roots, when it cannot be built; on mobile an error,
+/// so that no client connects unverified.
+pub(crate) fn client_tls() -> Result<Option<rustls::ClientConfig>, Error> {
+	match platform_tls_config() {
+		Ok(config) => Ok(Some(config)),
+		#[cfg(not(any(target_os = "ios", target_os = "android")))]
 		Err(e) => {
 			tracing::warn!(
 				"platform certificate verifier unavailable ({e}), using the bundled webpki roots"
 			);
-			None
+			Ok(None)
 		}
+		#[cfg(any(target_os = "ios", target_os = "android"))]
+		Err(e) => {
+			record_error(format!("no TLS configuration could be built: {e}"));
+			Err(Error::custom_with_source(
+				ErrorKind::TlsVerification,
+				e,
+				Some("no TLS configuration could be built"),
+			))
+		}
+	}
+}
+
+/// Whether the last [`platform_tls_config`] found the platform verifier unavailable.
+static VERIFIER_UNAVAILABLE: AtomicBool = AtomicBool::new(false);
+/// The last reason TLS could not verify connections, for [`tls_status`].
+static LAST_ERROR: Mutex<Option<String>> = Mutex::new(None);
+
+/// Logs `message` and keeps it as [`TlsStatus::last_error`].
+fn record_error(message: String) {
+	tracing::error!("{message}");
+	*LAST_ERROR.lock().unwrap_or_else(|e| e.into_inner()) = Some(message);
+}
+
+/// The certificate verifier behind this target's TLS.
+const BACKEND: &str = if cfg!(target_os = "android") {
+	"Android X509TrustManager (rustls-platform-verifier)"
+} else if cfg!(target_vendor = "apple") {
+	"Apple Security framework (rustls-platform-verifier)"
+} else if cfg!(target_os = "windows") {
+	"Windows CryptoAPI (rustls-platform-verifier)"
+} else {
+	"system CA store with rustls-webpki (rustls-platform-verifier)"
+};
+
+/// Where the SDK's TLS stands, for diagnostics ([`tls_status`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct TlsStatus {
+	/// Whether a handshake can verify the server's certificate now. False on Android until the
+	/// app has initialised the verifier (`FilenTls.nativeInit`), and on mobile when the platform
+	/// verifier could not be built, as of the last client built: every handshake then fails
+	/// with [`ErrorKind::TlsVerification`].
+	pub ready: bool,
+	/// The verifier in use: the OS's, or on desktop the bundled webpki roots it falls back to.
+	pub backend: String,
+	/// The last reason connections could not be verified (a failed initialisation, a verifier
+	/// that could not be built), if any.
+	pub last_error: Option<String>,
+}
+
+/// Where the SDK's TLS stands: whether it can verify certificates, with which verifier, and the
+/// last reason it could not. Reads two atomics and a lock nothing holds for long.
+#[cfg_attr(feature = "uniffi", uniffi::export)]
+pub fn tls_status() -> TlsStatus {
+	let unavailable = VERIFIER_UNAVAILABLE.load(Ordering::Relaxed);
+	#[cfg(target_os = "android")]
+	let initialised = android::TLS_READY.load(Ordering::Acquire);
+	#[cfg(not(target_os = "android"))]
+	let initialised = true;
+	// Desktop keeps connecting through the bundled roots when the platform verifier is missing.
+	let mobile = cfg!(any(target_os = "ios", target_os = "android"));
+	TlsStatus {
+		ready: initialised && !(mobile && unavailable),
+		backend: if unavailable && !mobile {
+			"bundled webpki roots".to_owned()
+		} else {
+			BACKEND.to_owned()
+		},
+		last_error: LAST_ERROR.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+	}
+}
+
+/// The error a handshake fails with while the Android verifier has not been initialised.
+#[cfg(any(target_os = "android", test))]
+const NOT_INITIALISED: &str = "TLS verifier not initialised";
+
+/// Fails every certificate check closed until `ready` is set (Android's platform verifier, which
+/// panics when used before its JVM side is initialised): one atomic load per handshake.
+#[cfg(any(target_os = "android", test))]
+#[derive(Debug)]
+struct ReadyGateVerifier<V> {
+	inner: V,
+	ready: &'static AtomicBool,
+}
+
+#[cfg(any(target_os = "android", test))]
+impl<V> ReadyGateVerifier<V> {
+	fn new(inner: V, ready: &'static AtomicBool) -> Self {
+		Self { inner, ready }
+	}
+}
+
+#[cfg(any(target_os = "android", test))]
+impl<V: ServerCertVerifier> ServerCertVerifier for ReadyGateVerifier<V> {
+	fn verify_server_cert(
+		&self,
+		end_entity: &CertificateDer<'_>,
+		intermediates: &[CertificateDer<'_>],
+		server_name: &ServerName<'_>,
+		ocsp_response: &[u8],
+		now: UnixTime,
+	) -> Result<ServerCertVerified, rustls::Error> {
+		if !self.ready.load(Ordering::Acquire) {
+			return Err(rustls::Error::General(NOT_INITIALISED.to_owned()));
+		}
+		self.inner
+			.verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)
+	}
+
+	fn verify_tls12_signature(
+		&self,
+		message: &[u8],
+		cert: &CertificateDer<'_>,
+		dss: &DigitallySignedStruct,
+	) -> Result<HandshakeSignatureValid, rustls::Error> {
+		self.inner.verify_tls12_signature(message, cert, dss)
+	}
+
+	fn verify_tls13_signature(
+		&self,
+		message: &[u8],
+		cert: &CertificateDer<'_>,
+		dss: &DigitallySignedStruct,
+	) -> Result<HandshakeSignatureValid, rustls::Error> {
+		self.inner.verify_tls13_signature(message, cert, dss)
+	}
+
+	fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+		self.inner.supported_verify_schemes()
+	}
+
+	fn requires_raw_public_keys(&self) -> bool {
+		self.inner.requires_raw_public_keys()
+	}
+
+	fn root_hint_subjects(&self) -> Option<&[DistinguishedName]> {
+		self.inner.root_hint_subjects()
+	}
+}
+
+/// What stands in on mobile for a platform verifier that could not be built: it refuses every
+/// certificate with the reason, so nothing connects unverified (mobile has no bundled roots to
+/// fall back to). Signatures are checked as the crypto provider does, though no handshake gets
+/// that far.
+#[cfg(any(target_os = "ios", target_os = "android", test))]
+#[derive(Debug)]
+struct UnavailableVerifier {
+	reason: String,
+	algorithms: rustls::crypto::WebPkiSupportedAlgorithms,
+}
+
+#[cfg(any(target_os = "ios", target_os = "android", test))]
+impl UnavailableVerifier {
+	fn new(provider: &CryptoProvider, error: rustls::Error) -> Self {
+		Self {
+			reason: format!("the platform certificate verifier is unavailable: {error}"),
+			algorithms: provider.signature_verification_algorithms,
+		}
+	}
+}
+
+#[cfg(any(target_os = "ios", target_os = "android", test))]
+impl ServerCertVerifier for UnavailableVerifier {
+	fn verify_server_cert(
+		&self,
+		_: &CertificateDer<'_>,
+		_: &[CertificateDer<'_>],
+		_: &ServerName<'_>,
+		_: &[u8],
+		_: UnixTime,
+	) -> Result<ServerCertVerified, rustls::Error> {
+		Err(rustls::Error::General(self.reason.clone()))
+	}
+
+	fn verify_tls12_signature(
+		&self,
+		message: &[u8],
+		cert: &CertificateDer<'_>,
+		dss: &DigitallySignedStruct,
+	) -> Result<HandshakeSignatureValid, rustls::Error> {
+		rustls::crypto::verify_tls12_signature(message, cert, dss, &self.algorithms)
+	}
+
+	fn verify_tls13_signature(
+		&self,
+		message: &[u8],
+		cert: &CertificateDer<'_>,
+		dss: &DigitallySignedStruct,
+	) -> Result<HandshakeSignatureValid, rustls::Error> {
+		rustls::crypto::verify_tls13_signature(message, cert, dss, &self.algorithms)
+	}
+
+	fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+		self.algorithms.supported_schemes()
 	}
 }
 

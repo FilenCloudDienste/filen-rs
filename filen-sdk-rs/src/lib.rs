@@ -66,9 +66,10 @@ pub(crate) mod job;
 pub mod js;
 pub mod notes;
 pub mod obs;
-// The OS's certificate verifier and proxy settings, on the desktop targets only.
+// The OS's certificate verifier and proxy settings, on the desktop and mobile targets (build.rs's
+// `platform_net`). Public for `tls_status` and Android's verifier initialisation.
 #[cfg(platform_net)]
-pub(crate) mod platform_net;
+pub mod platform_net;
 pub(crate) mod progress;
 // Managed rclone (network drive mounts and `rclone serve`). Native-only: it runs rclone as a child
 // process.
