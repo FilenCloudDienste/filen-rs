@@ -1051,7 +1051,7 @@ async fn mode_22_switch_local_backup_to_l2r_applies_the_standing_divergence() {
 		.unwrap();
 
 	// The dry run shows the standing divergence BEFORE any pass acts on it.
-	let plan = sc.engine.plan_pair(sc.pair).await.unwrap();
+	let plan = plan_settled(&sc.engine, sc.pair).await;
 	assert!(
 		plan.actions
 			.iter()
@@ -1116,7 +1116,7 @@ async fn mode_22b_switch_local_backup_to_l2r_can_adopt_the_destination_instead()
 	);
 
 	// Contrast MODE-22, where the very same dry run shows a TrashRemote for x.txt.
-	let plan = sc.engine.plan_pair(sc.pair).await.unwrap();
+	let plan = plan_settled(&sc.engine, sc.pair).await;
 	assert!(
 		plan.actions.is_empty() && plan.held.is_empty(),
 		"an adopted backlog leaves the first pass with nothing to do: {plan:?}"

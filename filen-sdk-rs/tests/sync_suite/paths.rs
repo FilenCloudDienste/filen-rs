@@ -688,7 +688,7 @@ async fn path_add_remote_invalid_local_names_reported_once_not_retried() {
 	assert!(find_dir(&dirs, "bad.").is_none(), "{dirs:?}");
 
 	// The dry run says exactly the same thing, and plans nothing for those paths.
-	let plan = sc.engine.plan_pair(sc.pair).await.unwrap();
+	let plan = plan_settled(&sc.engine, sc.pair).await;
 	assert_eq!(plan.unsyncable, r1.unsyncable, "{plan:?}");
 	assert!(
 		!plan

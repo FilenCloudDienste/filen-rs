@@ -314,7 +314,7 @@ async fn filter_plan_pair_reports_ignored() {
 	let sc = single_client(SyncMode::TwoWay).await;
 	stage_build_on_both_sides(&sc).await;
 
-	let plan = sc.engine.plan_pair(sc.pair).await.unwrap();
+	let plan = plan_settled(&sc.engine, sc.pair).await;
 	assert_eq!(
 		plan.ignored,
 		vec![by_root_file("build", "build/", false)],

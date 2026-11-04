@@ -15,7 +15,9 @@ use std::{
 };
 
 use filen_sdk_rs::fs::HasUUID;
-use filen_sdk_rs::sync_engine::{SyncEngine, SyncMode, SyncReport, WatchHandle};
+use filen_sdk_rs::sync_engine::{
+	PairId, PlanOutcome, SyncEngine, SyncMode, SyncReport, WatchHandle,
+};
 use uuid::Uuid;
 
 use crate::helpers::*;
@@ -201,6 +203,26 @@ impl SingleClient {
 
 	pub fn cleanup(&self) {
 		std::fs::remove_dir_all(&self.local).ok();
+	}
+}
+
+/// `plan_pair` once the cache holds `pair`'s remote root converged. Unlike a pass, a dry run does
+/// not wait for the cache's listing: it fails with `StaleState` at once while a resync is relisting
+/// the root (the gap-check after the socket's subscription or a reconnect, a hole), and its caller
+/// asks again. Asked again here every half second, for as long as a pass would wait on the cache.
+pub async fn plan_settled(engine: &SyncEngine, pair: PairId) -> PlanOutcome {
+	let deadline = tokio::time::Instant::now() + CACHE_CONVERGE_TIMEOUT;
+	loop {
+		match engine.plan_pair(pair).await {
+			Ok(plan) => return plan,
+			Err(e)
+				if e.kind() == filen_sdk_rs::ErrorKind::StaleState
+					&& tokio::time::Instant::now() < deadline =>
+			{
+				tokio::time::sleep(Duration::from_millis(500)).await;
+			}
+			Err(e) => panic!("plan_pair: {e:?}"),
+		}
 	}
 }
 

@@ -818,7 +818,7 @@ async fn migrate_15_a_dry_run_plans_no_upload_of_a_file_the_pass_records_as_sync
 		.add_pair(local.clone(), remote, SyncMode::LocalToRemote)
 		.await
 		.unwrap();
-	let plan = engine.plan_pair(pair).await.unwrap();
+	let plan = plan_settled(&engine, pair).await;
 	let planned: Vec<(PlannedActionKind, &str)> = plan
 		.actions
 		.iter()

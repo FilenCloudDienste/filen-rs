@@ -819,7 +819,7 @@ async fn sec11_decryption_failure_surfaced_not_silent_empty() {
 		vec!["good.txt".to_string()],
 		"nothing is written for the undecryptable item"
 	);
-	assert_eq!(engine.plan_pair(pair).await.unwrap().unsyncable, reported);
+	assert_eq!(plan_settled(&engine, pair).await.unsyncable, reported);
 
 	let r2 = engine.sync_once(pair).await.unwrap();
 	assert!(r2.errors.is_empty(), "{r2:?}");
@@ -1098,7 +1098,7 @@ async fn undecryptable_child_survives_a_remote_dir_move(tag: &str, new_parent: O
 		);
 		assert!(read_eq(&local, &format!("{moved}/a.txt"), b"sibling"));
 	}
-	assert_eq!(engine.plan_pair(pair).await.unwrap().unsyncable, reported);
+	assert_eq!(plan_settled(&engine, pair).await.unsyncable, reported);
 
 	let holder = match new_parent {
 		Some(parent) => Some(remote_dir_named(&resources, parent).await),

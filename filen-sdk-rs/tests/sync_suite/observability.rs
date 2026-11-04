@@ -1213,7 +1213,7 @@ async fn observ_14_dry_run_reports_intent_mutates_nothing() {
 		.filter_map(|f| f.name().map(str::to_string))
 		.collect();
 
-	let plan = sc.engine.plan_pair(sc.pair).await.unwrap();
+	let plan = plan_settled(&sc.engine, sc.pair).await;
 	assert!(
 		plan.refused.is_none(),
 		"the dry run must not refuse this pair"
@@ -1277,7 +1277,7 @@ async fn observ_14_dry_run_reports_intent_mutates_nothing() {
 	);
 
 	// The baseline is untouched too: re-planning yields exactly the same plan.
-	let again = sc.engine.plan_pair(sc.pair).await.unwrap();
+	let again = plan_settled(&sc.engine, sc.pair).await;
 	assert!(again.refused.is_none(), "second dry run refused");
 	assert_eq!(again.actions, actions, "the dry run advanced the baseline");
 
@@ -1371,7 +1371,7 @@ async fn observ_add_a_dry_run_beside_an_applying_pass_leaves_its_staged_plan_alo
 		live,
 		"the pass's plan is staged under its own name, and nothing else of the pass is left"
 	);
-	let plan = engine.plan_pair(pair).await.unwrap();
+	let plan = plan_settled(&engine, pair).await;
 	assert!(plan.refused.is_none(), "{plan:?}");
 	assert_eq!(
 		stages(),
@@ -1416,7 +1416,7 @@ async fn observ_add_plan_and_pass_report_the_same_ignored_paths() {
 		tracked,
 	};
 
-	let plan = sc.engine.plan_pair(sc.pair).await.unwrap();
+	let plan = plan_settled(&sc.engine, sc.pair).await;
 	assert_eq!(
 		plan.ignored,
 		vec![ignored("build", false), ignored("cache", true)],
@@ -1432,7 +1432,7 @@ async fn observ_add_plan_and_pass_report_the_same_ignored_paths() {
 	assert!(untracking.errors.is_empty(), "{untracking:?}");
 	assert_eq!(untracking.ignored, plan.ignored, "{untracking:?}");
 
-	let plan = sc.engine.plan_pair(sc.pair).await.unwrap();
+	let plan = plan_settled(&sc.engine, sc.pair).await;
 	assert_eq!(
 		plan.ignored,
 		vec![ignored("build", false), ignored("cache", false)],

@@ -470,7 +470,7 @@ async fn delete_05b_configured_threshold_decides_the_same_batch() {
 		r2.guard
 	);
 	// The dry run reports the same held batch, with the same reason.
-	let plan = sc.engine.plan_pair(sc.pair).await.unwrap();
+	let plan = plan_settled(&sc.engine, sc.pair).await;
 	assert_eq!(plan.held.len(), 3, "{plan:?}");
 	assert_eq!(plan.held_reason, r2.guard, "{plan:?}");
 
