@@ -1,10 +1,8 @@
 //! A network drive mounted by the rclone daemon from the managed rclone, against the test
 //! account.
 //!
-//! Not on macOS: GitHub's macOS runners have no macFUSE (actions/runner-images#598, #5583), and
-//! the daemon's `nfsmount` is not tried there; `rclone_daemon_tests` mount through it locally.
-
-#![cfg(not(target_os = "macos"))]
+//! On macOS without macFUSE, which GitHub's macOS runners cannot load (actions/runner-images#4731),
+//! the daemon mounts through rclone's `nfsmount` and the system's NFS client.
 
 use std::{path::PathBuf, time::Duration};
 
