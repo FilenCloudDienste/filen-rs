@@ -166,12 +166,9 @@ pub struct CompressReport {
 	pub needed_bytes: Option<u64>,
 	/// What became of each source, when the sources were to be removed.
 	pub dispositions: Vec<SourceDisposition>,
-	/// The source file whose data did not match the hash in its metadata, which failed the job:
-	/// a job ends on its first, so this lists at most one.
-	pub hash_mismatches: Vec<HashMismatch>,
-	/// Mismatches past those `hash_mismatches` lists, only counted; a job ends on its first, so
-	/// this stays zero.
-	pub omitted_hash_mismatches: u64,
+	/// The source file whose data did not match the hash in its metadata, which failed the job on
+	/// the first it found.
+	pub hash_mismatch: Option<HashMismatch>,
 }
 
 /// A source file whose data did not match the hash in its metadata.

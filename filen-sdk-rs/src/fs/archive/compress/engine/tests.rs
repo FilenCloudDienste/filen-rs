@@ -453,13 +453,12 @@ async fn a_source_that_does_not_match_its_hash_fails_the_job() {
 		"the error names the source and both hashes: {message}"
 	);
 	assert_eq!(
-		failed.report.hash_mismatches,
-		[HashMismatch {
+		failed.report.hash_mismatch,
+		Some(HashMismatch {
 			source_uuid: SOURCE_UUIDS[2],
 			path: "top.txt".to_owned(),
-		}]
+		})
 	);
-	assert_eq!(failed.report.omitted_hash_mismatches, 0);
 	assert!(failed.report.archive.is_none());
 	let mismatched: Vec<String> = job
 		.recorder
@@ -1123,11 +1122,11 @@ async fn an_empty_source_that_declares_the_hash_of_other_bytes_fails_the_job() {
 		"the error names the source and both hashes: {message}"
 	);
 	assert_eq!(
-		failed.report.hash_mismatches,
-		[HashMismatch {
+		failed.report.hash_mismatch,
+		Some(HashMismatch {
 			source_uuid: SOURCE_UUIDS[2],
 			path: "top.txt".to_owned(),
-		}]
+		})
 	);
 	let mismatched: Vec<String> = job
 		.recorder
@@ -1167,7 +1166,7 @@ async fn an_empty_source_that_declares_the_hash_of_no_bytes_is_archived() {
 	*size = 0;
 	let job = start(&setup, Run::tar());
 	let report = job.running.await.unwrap().unwrap();
-	assert!(report.hash_mismatches.is_empty());
+	assert_eq!(report.hash_mismatch, None);
 	assert!(report.archive.is_some());
 	assert!(job.recorder.events().is_empty());
 }

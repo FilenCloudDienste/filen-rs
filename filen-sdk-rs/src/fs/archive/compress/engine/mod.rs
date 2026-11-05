@@ -39,7 +39,6 @@ use crate::{
 			},
 			hash::HeadLastHasher,
 			input::{FetchedChunk, PREFETCH_CHUNKS, hold_on_slot, take_memory, whole_chunk},
-			limits::keep,
 			worker::{
 				CodecStart, StallWatch, WorkerEvent, WorkerLink, codec_failed, unexpected_event,
 				worker_died,
@@ -248,10 +247,9 @@ struct Driver<B: DriveBackend> {
 	codec_done: bool,
 	max_bytes: Option<u64>,
 	stall: StallWatch,
-	/// The source file that did not match the hash in its metadata, which failed the job, for
-	/// the report; a job fails on its first, so it lists at most one and omits none.
-	hash_mismatches: Vec<HashMismatch>,
-	omitted_hash_mismatches: u64,
+	/// The source file that did not match the hash in its metadata, which failed the job on the
+	/// first it found, for the report.
+	hash_mismatch: Option<HashMismatch>,
 	fatal: Fatal,
 }
 
@@ -358,8 +356,7 @@ pub(crate) async fn run_compress<B: DisposalBackend>(
 		codec_done: false,
 		max_bytes,
 		stall: StallWatch::default(),
-		hash_mismatches: Vec::new(),
-		omitted_hash_mismatches: 0,
+		hash_mismatch: None,
 		fatal: Fatal::default(),
 	};
 	let incomplete = !report.skipped.is_empty();
@@ -382,12 +379,10 @@ pub(crate) async fn run_compress<B: DisposalBackend>(
 		reporter,
 		fatal,
 		control,
-		hash_mismatches,
-		omitted_hash_mismatches,
+		hash_mismatch,
 		..
 	} = driver;
-	report.hash_mismatches = hash_mismatches;
-	report.omitted_hash_mismatches = omitted_hash_mismatches;
+	report.hash_mismatch = hash_mismatch;
 	match fatal.end(outcome, &control, CompressReport::NAME) {
 		(_, Ok((archive, dispositions))) => {
 			report.dispositions = dispositions;
@@ -620,11 +615,8 @@ impl<B: DisposalBackend> Driver<B> {
 			source_uuid: error.uuid,
 			path: state.path.clone(),
 		};
-		keep(
-			&mut self.hash_mismatches,
-			&mut self.omitted_hash_mismatches,
-			&mismatch,
-		);
+		// one copy for the report, the other for the event
+		self.hash_mismatch = Some(mismatch.clone());
 		self.reporter
 			.event(CompressEvent::SourceHashMismatch(mismatch));
 		self.stop_with(error.into());

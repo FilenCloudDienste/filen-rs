@@ -94,9 +94,6 @@ pub enum ArchiveKeptReason {
 	Incomplete,
 	/// The archive holds data after its last entry that belongs to none.
 	UnaccountedData { bytes: u64 },
-	/// What was read does not match the hash in the source's metadata. No job gives it any
-	/// more: such a source fails the job with `ContentHashMismatch` instead.
-	HashMismatch,
 	/// The source's metadata holds no hash to check what was read against, which a permanent
 	/// deletion requires. Never given for a zip or 7z archive: every entry's own checksum, and
 	/// every entry having been extracted, confirm those instead of a whole-archive hash.
@@ -508,11 +505,9 @@ pub struct CompressReport {
 	pub needed_bytes: Option<u64>,
 	/// What became of the sources, when they were to be removed.
 	pub dispositions: Vec<ArchiveSourceDisposition>,
-	/// The source file whose data did not match the hash in its metadata, which failed the job
-	/// (at most one: a job ends on its first).
-	pub hash_mismatches: Vec<HashMismatch>,
-	/// Mismatches past those `hashMismatches` lists, only counted; stays zero.
-	pub omitted_hash_mismatches: u64,
+	/// The source file whose data did not match the hash in its metadata, which failed the job on
+	/// the first it found.
+	pub hash_mismatch: Option<HashMismatch>,
 	/// Why the compress ended early: kind `Cancelled` when cancelled, or the error that stopped
 	/// it. `undefined` when it ran to the end.
 	pub error: Option<SdkError>,
@@ -523,7 +518,6 @@ impl From<dispose::KeptReason> for ArchiveKeptReason {
 		match reason {
 			dispose::KeptReason::Incomplete => Self::Incomplete,
 			dispose::KeptReason::UnaccountedData { bytes } => Self::UnaccountedData { bytes },
-			dispose::KeptReason::HashMismatch => Self::HashMismatch,
 			dispose::KeptReason::HashUnavailable => Self::HashUnavailable,
 			dispose::KeptReason::Changed => Self::Changed,
 			dispose::KeptReason::Unconfirmed => Self::Unconfirmed,
@@ -810,8 +804,7 @@ impl From<compress::CompressReport> for CompressReport {
 			counts: report.counts,
 			needed_bytes: report.needed_bytes,
 			dispositions: report.dispositions.into_iter().map(Into::into).collect(),
-			hash_mismatches: report.hash_mismatches,
-			omitted_hash_mismatches: report.omitted_hash_mismatches,
+			hash_mismatch: report.hash_mismatch,
 			error: None,
 		}
 	}
