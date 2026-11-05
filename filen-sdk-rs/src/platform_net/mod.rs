@@ -1,12 +1,14 @@
 //! TLS and proxies on the desktop (Windows, macOS, Linux) and mobile (iOS, Android) targets.
-//! Requests and the websocket check the server's certificate with the OS's verifier
-//! (`rustls-platform-verifier`: its trust store, the roots an administrator or the user added,
-//! revocation), with rustls-webpki's distrusted keys refused on top, and go through the proxy the
-//! environment (and on desktop the system settings) names. wasm keeps the browser's TLS.
+//! Requests and the websocket check the server's certificate with the OS's verifier (its trust
+//! store, the roots an administrator or the user added), with rustls-webpki's distrusted keys
+//! refused on top, and go through the proxy the environment (and on desktop the system settings)
+//! names. wasm keeps the browser's TLS.
 //!
-//! Where the platform verifier cannot be built, desktop falls back to the bundled webpki roots;
-//! mobile fails every handshake closed instead ([`UnavailableVerifier`]). Android's verifier needs
-//! the JVM first ([`android`]), and fails closed until it has it ([`ReadyGateVerifier`]).
+//! Desktop and iOS use `rustls-platform-verifier`, which leaves revocation to the OS. Android asks
+//! the platform trust manager directly ([`trust_manager`], [`android`]), with no online revocation
+//! check; it needs the JVM first, and fails closed until it has it ([`ReadyGateVerifier`]). Where
+//! the platform verifier cannot be built, desktop falls back to the bundled webpki roots; iOS
+//! fails every handshake closed instead ([`UnavailableVerifier`]).
 
 use std::{
 	sync::{
@@ -30,6 +32,7 @@ use rustls::{
 	crypto::CryptoProvider,
 	pki_types::{CertificateDer, ServerName, UnixTime},
 };
+#[cfg(not(target_os = "android"))]
 use rustls_platform_verifier::Verifier;
 use sha2::{Digest, Sha256};
 use tokio::net::TcpStream;
@@ -46,14 +49,16 @@ pub mod android;
 pub(crate) mod test_support;
 #[cfg(test)]
 mod tests;
+#[cfg(any(target_os = "android", test))]
+mod trust_manager;
 
 /// The TLS configuration both reqwest and the websocket use: the platform verifier, HTTP/1.1
 /// over ALPN (reqwest is built without HTTP/2, and a websocket upgrade is HTTP/1.1). Built once
 /// per client. An error when the platform verifier cannot be built, which on desktop happens only
 /// on Linux with no CA certificate in the system store: the client then keeps the bundled webpki
-/// roots, as before, rather than refuse every connection. On mobile it never errs for that: a
+/// roots, as before, rather than refuse every connection. On iOS it never errs for that: a
 /// verifier that refuses every certificate stands in ([`UnavailableVerifier`]), so no connection
-/// is made unverified, and [`tls_status`] tells why.
+/// is made unverified, and [`tls_status`] tells why. Android's verifier is always built.
 pub(crate) fn platform_tls_config() -> Result<rustls::ClientConfig, rustls::Error> {
 	// reqwest's own choice: a process-wide default provider if the host installed one, else ring.
 	let provider = CryptoProvider::get_default()
@@ -62,22 +67,29 @@ pub(crate) fn platform_tls_config() -> Result<rustls::ClientConfig, rustls::Erro
 	let builder = rustls::ClientConfig::builder_with_provider(provider)
 		.with_safe_default_protocol_versions()?;
 	let provider = builder.crypto_provider().clone();
+	// The trust manager's check is local (no revocation fetch), so it runs inline.
+	#[cfg(target_os = "android")]
+	let verifier: Arc<dyn ServerCertVerifier> = Arc::new(ReadyGateVerifier::new(
+		DistrustingVerifier::new(trust_manager::TrustManagerVerifier::new(
+			android::AndroidTrustManager,
+			&provider,
+		)),
+		&android::TLS_READY,
+	));
+	#[cfg(not(target_os = "android"))]
 	let verifier: Arc<dyn ServerCertVerifier> = match Verifier::new(provider.clone()) {
 		Ok(verifier) => {
-			let verifier = DistrustingVerifier::new(OffloadingVerifier(verifier));
-			#[cfg(target_os = "android")]
-			let verifier = ReadyGateVerifier::new(verifier, &android::TLS_READY);
 			VERIFIER_UNAVAILABLE.store(false, Ordering::Relaxed);
-			Arc::new(verifier)
+			Arc::new(DistrustingVerifier::new(OffloadingVerifier(verifier)))
 		}
 		Err(e) => {
 			VERIFIER_UNAVAILABLE.store(true, Ordering::Relaxed);
 			record_error(format!(
 				"the platform certificate verifier is unavailable: {e}"
 			));
-			#[cfg(not(any(target_os = "ios", target_os = "android")))]
+			#[cfg(not(target_os = "ios"))]
 			return Err(e);
-			#[cfg(any(target_os = "ios", target_os = "android"))]
+			#[cfg(target_os = "ios")]
 			Arc::new(UnavailableVerifier::new(&provider, e))
 		}
 	};
@@ -127,7 +139,7 @@ fn record_error(message: String) {
 
 /// The certificate verifier behind this target's TLS.
 const BACKEND: &str = if cfg!(target_os = "android") {
-	"Android X509TrustManager (rustls-platform-verifier)"
+	"Android X509TrustManager, without online revocation"
 } else if cfg!(target_vendor = "apple") {
 	"Apple Security framework (rustls-platform-verifier)"
 } else if cfg!(target_os = "windows") {
@@ -178,8 +190,8 @@ pub fn tls_status() -> TlsStatus {
 #[cfg(any(target_os = "android", test))]
 const NOT_INITIALISED: &str = "TLS verifier not initialised";
 
-/// Fails every certificate check closed until `ready` is set (Android's platform verifier, which
-/// panics when used before its JVM side is initialised): one atomic load per handshake.
+/// Fails every certificate check closed until `ready` is set (Android's trust manager, which
+/// needs the JVM first): one atomic load per handshake.
 #[cfg(any(target_os = "android", test))]
 #[derive(Debug)]
 struct ReadyGateVerifier<V> {
@@ -242,18 +254,18 @@ impl<V: ServerCertVerifier> ServerCertVerifier for ReadyGateVerifier<V> {
 	}
 }
 
-/// What stands in on mobile for a platform verifier that could not be built: it refuses every
+/// What stands in on iOS for a platform verifier that could not be built: it refuses every
 /// certificate with the reason, so nothing connects unverified (mobile has no bundled roots to
 /// fall back to). Signatures are checked as the crypto provider does, though no handshake gets
 /// that far.
-#[cfg(any(target_os = "ios", target_os = "android", test))]
+#[cfg(any(target_os = "ios", test))]
 #[derive(Debug)]
 struct UnavailableVerifier {
 	reason: String,
 	algorithms: rustls::crypto::WebPkiSupportedAlgorithms,
 }
 
-#[cfg(any(target_os = "ios", target_os = "android", test))]
+#[cfg(any(target_os = "ios", test))]
 impl UnavailableVerifier {
 	fn new(provider: &CryptoProvider, error: rustls::Error) -> Self {
 		Self {
@@ -263,7 +275,7 @@ impl UnavailableVerifier {
 	}
 }
 
-#[cfg(any(target_os = "ios", target_os = "android", test))]
+#[cfg(any(target_os = "ios", test))]
 impl ServerCertVerifier for UnavailableVerifier {
 	fn verify_server_cert(
 		&self,
@@ -344,8 +356,8 @@ const fn hex32(hex: &str) -> [u8; 32] {
 	bytes
 }
 
-/// The OS's verifier, with rustls-webpki's distrust of compromised CA keys on top: on macOS and
-/// Windows the platform verifier hands the whole check to the OS, which accepts such a key while
+/// The OS's verifier, with rustls-webpki's distrust of compromised CA keys on top: on macOS,
+/// Windows and Android the whole chain check is the OS's, which accepts such a key while
 /// its own blocklist lacks it (an OS whose root and disallowed-certificate updates are off). A
 /// chain the OS accepts is rejected when any certificate it presents (the end entity and the
 /// intermediates) has a public key on [`DISTRUSTED_SPKI_SHA256`], with the error a rustls-webpki
@@ -449,15 +461,17 @@ fn sequence_contents(der: &[u8]) -> &[u8] {
 	}
 }
 
-/// Runs the certificate check off the async runtime's workers. The OS's check is a blocking
-/// call (`SecTrustEvaluateWithError` on macOS, `CertGetCertificateChain` on Windows) that may
-/// fetch OCSP/CRL responses, for up to 10 s on Windows and with no limit on macOS, and rustls
+/// Runs the certificate check off the async runtime's workers (desktop and iOS). The OS's check
+/// is a blocking call (`SecTrustEvaluateWithError` on macOS, `CertGetCertificateChain` on
+/// Windows) that may fetch OCSP/CRL responses, for up to 10 s on Windows and with no limit on macOS, and rustls
 /// makes it from inside the TLS stream's poll. On a multi-thread runtime `block_in_place` hands
 /// the worker's other tasks to another thread for that time; elsewhere (no runtime, or a
 /// current-thread one, where it would panic) the check runs inline, as before.
+#[cfg(any(not(target_os = "android"), test))]
 #[derive(Debug)]
 struct OffloadingVerifier<V>(V);
 
+#[cfg(any(not(target_os = "android"), test))]
 impl<V: ServerCertVerifier> ServerCertVerifier for OffloadingVerifier<V> {
 	fn verify_server_cert(
 		&self,

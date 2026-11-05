@@ -876,7 +876,7 @@ async fn a_websocket_to_an_unverified_server_is_not_offline() {
 }
 
 /// Until the verifier is initialised every certificate check fails closed, without reaching the
-/// verifier (Android's panics then), with an error that reads as `TlsVerification`; once it is,
+/// verifier (Android's has no JVM then), with an error that reads as `TlsVerification`; once it is,
 /// the check is the verifier's.
 #[test]
 fn the_ready_gate_fails_closed_until_initialised() {

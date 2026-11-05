@@ -389,8 +389,8 @@ zip = { version = "8.6.0", default-features = false, features = [
 
 # Desktop and mobile targets (build.rs's `platform_net` cfg; keep the two lists alike): TLS
 # checks the server's certificate the way the OS does (its trust store, enterprise and
-# user-installed roots, revocation) instead of the bundled webpki roots, with rustls-webpki's
-# distrusted keys refused on top, and the websocket shares that configuration. Requests and the
+# user-installed roots) instead of the bundled webpki roots, with rustls-webpki's distrusted keys
+# refused on top, and the websocket shares that configuration. Requests and the
 # websocket honour proxy environment variables, SOCKS5 included: reqwest's `socks` feature adds no
 # crate, as it drives hyper-util's SOCKS connector, which the websocket uses too. wasm keeps the
 # browser's TLS.
@@ -403,7 +403,6 @@ rustls = { version = "0.23.32", default-features = false, features = [
 	"std",
 	"tls12",
 ] }
-rustls-platform-verifier = "0.7.1"
 # Its certificate parser, for the distrusted keys the platform verifier is checked against
 # (`platform_net::DISTRUSTED_SPKI_SHA256`); rustls already builds it.
 rustls-webpki = { version = "0.103.16", default-features = false, features = [
@@ -427,8 +426,13 @@ hyper-util = { version = "0.1.17", default-features = false, features = [
 	"client-proxy-system",
 ] }
 
-# Android: the platform verifier's JVM side is initialised through JNI (`platform_net::android`),
-# with the `jni` rustls-platform-verifier itself uses.
+# The OS's verifier everywhere but Android, which `platform_net::android` asks directly: the
+# crate's Android verifier adds an online revocation check that fails every handshake, or stalls
+# it, while the CA's CRL host is unreachable.
+[target.'cfg(any(target_os = "windows", target_os = "macos", target_os = "linux", target_os = "ios"))'.dependencies]
+rustls-platform-verifier = "0.7.1"
+
+# Android: the platform trust manager is called through JNI (`platform_net::android`).
 [target.'cfg(target_os = "android")'.dependencies]
 jni = { version = "0.22", default-features = false }
 
