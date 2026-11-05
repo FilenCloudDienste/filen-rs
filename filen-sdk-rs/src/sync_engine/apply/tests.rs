@@ -17,14 +17,17 @@ use crate::{
 	},
 	cache::{CacheState, hydrate_by_uuids},
 	connect::ConnectedTargets,
-	fs::bulk::create_dirs::CreateDirsError,
+	fs::{bulk::create_dirs::CreateDirsError, file::cache::CacheableFile},
 	sync::lock::test_support::{held_lock, undriven_runtime},
 	sync_engine::{
 		SyncMode,
 		baseline::BaselineStore,
 		bin::test_support::{bucket, day},
 		changes::tests::{cacheable_dir, cacheable_file},
-		scan::QUARANTINE_DIR,
+		ignore::IgnoreRules,
+		plan,
+		scan::{PairRoot, QUARANTINE_DIR, RuleFiles, ScanRoot, scan_local},
+		side::NodesAt,
 		stage::{PAGE_ROWS, PlanWriter, Stage},
 	},
 };
@@ -397,6 +400,75 @@ fn a_move_of_a_file_replaced_since_the_pass_read_it_is_left_to_the_next_pass() {
 	assert_eq!(report.errors.len(), 1, "{:?}", report.errors);
 	assert_eq!(report.failed_paths.len(), 1);
 	assert_eq!(events.len(), 1);
+}
+
+/// A download whose content did not match its hash is the file's failure: it is reported, as an
+/// event, a line and the path's own unsyncable entry in path order, and recorded apart for the
+/// engine to skip the version by — never against the path's failure streak, and never halting the
+/// pass.
+#[test]
+fn a_download_that_does_not_match_its_hash_is_recorded_apart() {
+	let bad = Uuid::from_u128(2);
+	let error: crate::Error = crate::error::ContentHashMismatchError {
+		uuid: bad,
+		expected: Blake3Hash::from([0x11; 32]),
+		actual: blake3::hash(b"").into(),
+	}
+	.into();
+	let line = error.to_string();
+	let reported = |rel_path: &str| UnsyncablePath {
+		rel_path: rel_path.to_string(),
+		reason: UnsyncableReason::InvalidName {
+			detail: "no".to_string(),
+		},
+	};
+	let mut report = SyncReport {
+		unsyncable: vec![reported("a.txt"), reported("c.txt")],
+		..SyncReport::default()
+	};
+	let mut events = Vec::new();
+	note_action_failed(
+		&SyncAction::DownloadFile {
+			rel_path: "b.txt".to_string(),
+			remote_uuid: bad,
+		},
+		&error,
+		Verdict::Own,
+		&FullSides::default(),
+		&mut report,
+		&mut |event| events.push(event),
+	);
+	assert!(matches!(
+		events.as_slice(),
+		[SyncEvent::ActionFailed { rel_path, error }] if rel_path == "b.txt" && *error == line
+	));
+	assert_eq!(report.errors, vec![format!("b.txt: {line}")]);
+	assert_eq!(
+		report.mismatched,
+		vec![MismatchedDownload {
+			rel_path: "b.txt".to_string(),
+			version: MismatchedVersion {
+				remote_uuid: bad,
+				declared_hash: Blake3Hash::from([0x11; 32]),
+			},
+			error: line.clone(),
+		}]
+	);
+	assert_eq!(
+		report.unsyncable,
+		vec![
+			reported("a.txt"),
+			UnsyncablePath {
+				rel_path: "b.txt".to_string(),
+				reason: UnsyncableReason::RemoteContentHashMismatch { last_error: line },
+			},
+			reported("c.txt"),
+		]
+	);
+	assert!(report.failed_paths.is_empty(), "{:?}", report.failed_paths);
+	assert!(report.transient_failures.is_empty());
+	assert_eq!(report.halted, None);
+	assert_eq!(report.store_failed, None);
 }
 
 /// A full side holds back only the transfers that write to it: a full account stops uploads and
@@ -2025,6 +2097,193 @@ async fn a_page_turn_reads_the_cache_while_the_client_holds_its_cache_slot() {
 	assert!(
 		plan.file(file).is_some(),
 		"the page did not hydrate the file its download fetches"
+	);
+}
+
+/// The plan of one download of `a.txt`, the file `file`, with `cache` listing it empty and declaring
+/// the hash `declared` of other bytes, so the download fails before any request is made. The
+/// directory holds its stage.
+fn download_not_matching_its_hash(
+	cache: &Path,
+	root: Uuid,
+	file: Uuid,
+	declared: Blake3Hash,
+) -> (tempfile::TempDir, StagedPlan) {
+	let mut state = CacheState::new_on_path(cache, root);
+	state
+		.upsert_files(std::iter::once(CacheableFile {
+			size: 0,
+			chunks: 0,
+			chunks_size: 0,
+			hash: Some(declared),
+			..cacheable_file(file, root, "a.txt")
+		}))
+		.unwrap();
+	let (dir, stage) = Stage::in_temp_dir();
+	let mut writer = PlanWriter::new(stage).unwrap();
+	writer
+		.push(&PlannedEntry::bare(SyncAction::DownloadFile {
+			rel_path: "a.txt".to_string(),
+			remote_uuid: file,
+		}))
+		.unwrap();
+	(dir, writer.finish().unwrap())
+}
+
+/// A download that fails on its hash cannot make the path read as a local edit, which two-way would
+/// upload over the remote file: whether the copy stayed put or was moved aside and put back, the
+/// next scan finds the content its row records. A file only touched is one the download moves
+/// aside, since its stat no longer matches the row.
+#[tokio::test]
+async fn the_copy_a_download_not_matching_its_hash_leaves_is_no_local_edit() {
+	for touched in [false, true] {
+		let cache_dir = tempfile::tempdir().unwrap();
+		let cache = cache_dir.path().join("cache.db");
+		let (root, file) = (Uuid::from_u128(1), Uuid::from_u128(2));
+		let (_dir, plan) =
+			download_not_matching_its_hash(&cache, root, file, Blake3Hash::from([0x11; 32]));
+		let borrowed = Borrowed::new();
+		let path = borrowed.local.path().join("a.txt");
+		let content = b"the synced copy";
+		std::fs::write(&path, content).unwrap();
+		let pair = locked(&borrowed.store)
+			.create_pair("/root", root, SyncMode::TwoWay)
+			.unwrap()
+			.0;
+		assert_eq!(pair, 1);
+		let row = file_entry(FileRow {
+			rel_path: "a.txt",
+			remote_uuid: Some(Uuid::from_u128(3)),
+			remote_stable_uuid: None,
+			content_hash: Some(blake3::hash(content).into()),
+			size: u64::try_from(content.len()).unwrap(),
+			local_mtime: local_mtime_of(&path),
+			remote_modified: Some(0),
+			agreed_hash: Some(blake3::hash(content).into()),
+		});
+		locked(&borrowed.store).upsert_entry(pair, &row).unwrap();
+		if touched {
+			let later = std::time::SystemTime::now() + Duration::from_secs(3_600);
+			std::fs::File::options()
+				.write(true)
+				.open(&path)
+				.unwrap()
+				.set_modified(later)
+				.unwrap();
+		}
+		let stat = local_mtime_of(&path);
+		assert_eq!(local_holds_unsynced_content(&path, Some(&row)), touched);
+
+		let mut report = SyncReport::default();
+		apply(
+			borrowed.ctx(root, Some(cache)),
+			plan,
+			&mut report,
+			&mut |_| {},
+		)
+		.await;
+
+		assert_eq!(report.mismatched.len(), 1, "touched {touched}: {report:?}");
+		assert_eq!(std::fs::read(&path).unwrap(), content);
+		assert_eq!(local_mtime_of(&path), stat, "touched {touched}");
+		let baseline = locked(&borrowed.store).baseline(pair).unwrap();
+		let (scan, _) = scan_local(
+			ScanRoot {
+				path: borrowed.local.path(),
+				pair_root: PairRoot::Directory,
+			},
+			&baseline,
+			IgnoreRules::default(),
+			RuleFiles::Read,
+		);
+		let nodes = scan.nodes.of(&baseline);
+		let local = nodes.at("a.txt").unwrap();
+		assert_eq!(local.content_hash, row.content_hash, "touched {touched}");
+		assert!(
+			!plan::holds_local_edit(Some(&local), Some(&row)),
+			"touched {touched}"
+		);
+		// An edit, by the same read, is one.
+		let edited = LocalNode {
+			content_hash: Some(blake3::hash(b"edited").into()),
+			..local.into_owned()
+		};
+		assert!(plan::holds_local_edit(Some(&edited), Some(&row)));
+	}
+}
+
+/// A download whose content does not match its hash puts back the local copy it moved aside to
+/// make room, so the path holds what it held before the pass, and nothing of it is left in the
+/// bin. An empty remote file declaring the hash of other bytes fails before any request is made.
+#[tokio::test]
+async fn a_download_that_does_not_match_its_hash_leaves_the_local_copy_in_place() {
+	let cache_dir = tempfile::tempdir().unwrap();
+	let cache = cache_dir.path().join("cache.db");
+	let (root, file) = (Uuid::from_u128(1), Uuid::from_u128(2));
+	let declared = Blake3Hash::from([0x11; 32]);
+	let (_dir, plan) = download_not_matching_its_hash(&cache, root, file, declared);
+	let borrowed = Borrowed::new();
+	// No row vouches for it, so the download moves it aside first.
+	std::fs::write(borrowed.local.path().join("a.txt"), b"never synced").unwrap();
+	let mut report = SyncReport::default();
+	let mut events = Vec::new();
+
+	apply(
+		borrowed.ctx(root, Some(cache)),
+		plan,
+		&mut report,
+		&mut |event| events.push(event),
+	)
+	.await;
+
+	let line = crate::Error::from(crate::error::ContentHashMismatchError {
+		uuid: file,
+		expected: declared,
+		actual: blake3::hash(b"").into(),
+	})
+	.to_string();
+	assert_eq!(
+		std::fs::read(borrowed.local.path().join("a.txt")).unwrap(),
+		b"never synced"
+	);
+	assert!(
+		!bucket(borrowed.local.path(), day()).join("a.txt").exists(),
+		"nothing of it stays in the bin"
+	);
+	assert!(report.quarantined.is_empty(), "{:?}", report.quarantined);
+	assert_eq!(report.downloaded, 0);
+	assert_eq!(
+		report.mismatched,
+		vec![MismatchedDownload {
+			rel_path: "a.txt".to_string(),
+			version: MismatchedVersion {
+				remote_uuid: file,
+				declared_hash: declared,
+			},
+			error: line.clone(),
+		}]
+	);
+	assert_eq!(
+		report.unsyncable,
+		vec![UnsyncablePath {
+			rel_path: "a.txt".to_string(),
+			reason: UnsyncableReason::RemoteContentHashMismatch {
+				last_error: line.clone(),
+			},
+		}]
+	);
+	assert!(report.failed_paths.is_empty(), "{:?}", report.failed_paths);
+	assert_eq!(report.halted, None);
+	assert!(
+		events.iter().any(|event| matches!(
+			event,
+			SyncEvent::ActionFailed { rel_path, error } if rel_path == "a.txt" && *error == line
+		)),
+		"{events:?}"
+	);
+	assert!(
+		locked(&borrowed.store).entry(1, "a.txt").unwrap().is_none(),
+		"no row records the path as synced"
 	);
 }
 

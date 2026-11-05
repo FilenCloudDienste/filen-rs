@@ -63,8 +63,13 @@ use super::{
 /// made one before. A version-4 file has no column for it, so every read of its pairs would fail
 /// on it.
 ///
+/// Moved to 6 when a failure streak began recording the remote version whose content did not
+/// match its hash (`path_failures.mismatched_remote_uuid` and `mismatched_declared_hash`, see
+/// [`PathFailure::mismatched`]): such a path is skipped until the remote file there changes. A
+/// version-5 file has no columns for it, so every read of its streaks would fail on it.
+///
 /// [`SyncEngine::import_legacy_state`]: super::SyncEngine::import_legacy_state
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 
 /// Schema for the baseline DB, created whole on a fresh DB. `foreign_keys`, `synchronous` and the
 /// busy timeout are applied per-connection in [`BaselineStore::init`] (they reset on every open);
@@ -74,7 +79,10 @@ const SCHEMA_VERSION: i64 = 5;
 /// announced yet (see [`PendingWrites`](super::engine::PendingWrites)), keyed by uuid like the
 /// in-memory journal it mirrors. `path_failures` counts how many times in a row applying one path
 /// has failed, what the last failure said, and when it happened (unix millis) — the time is what
-/// lets an exhausted streak expire and be retried. Both cascade with their pair.
+/// lets an exhausted streak expire and be retried — and, for a download whose content did not
+/// match its hash, which remote version that was (`mismatched_remote_uuid` and the hash its
+/// metadata declared, `mismatched_declared_hash`, both set or neither; see
+/// [`PathFailure::mismatched`]). Both cascade with their pair.
 ///
 /// `user_ignore` holds the device-wide user ignore patterns: one row at most, shared by every pair,
 /// so it cascades with nothing.
@@ -214,7 +222,10 @@ CREATE TABLE IF NOT EXISTS path_failures (
 	attempts INTEGER NOT NULL,
 	last_error TEXT NOT NULL,
 	last_failure_at INTEGER NOT NULL,
-	PRIMARY KEY (pair_id, rel_path)
+	mismatched_remote_uuid BLOB,
+	mismatched_declared_hash BLOB,
+	PRIMARY KEY (pair_id, rel_path),
+	CHECK ((mismatched_remote_uuid IS NULL) = (mismatched_declared_hash IS NULL))
 );
 
 CREATE TABLE IF NOT EXISTS user_ignore (
@@ -413,6 +424,14 @@ const MOVE_UNDER_PATH: &str = "UPDATE OR REPLACE baseline
 	  folded_path = ?5 || substr(folded_path, length(?4) + 1)
 	 WHERE pair_id = ?1 AND rel_path > ?2 || '/' AND rel_path < ?2 || '0'";
 
+const CLEAR_FAILURE: &str = "DELETE FROM path_failures WHERE pair_id = ?1 AND rel_path = ?2";
+
+/// The failure rows under a moved directory go with its rows, hash mismatch marks included: a mark
+/// left at the old path would read at the next pass as a remote file gone from there.
+const MOVE_FAILURES_UNDER_PATH: &str = "UPDATE OR REPLACE path_failures
+	 SET rel_path = ?3 || substr(rel_path, length(?2) + 1)
+	 WHERE pair_id = ?1 AND rel_path > ?2 || '/' AND rel_path < ?2 || '0'";
+
 /// Write one row with the columns [`Derived`] computes from it — the statement every write of a row
 /// goes through, on the store's connection and on the one a test builds its rows in alike.
 pub(super) fn upsert_row(
@@ -459,6 +478,23 @@ pub(crate) struct PathFailure {
 	pub(crate) last_error: String,
 	/// When the most recent one happened, in unix millis.
 	pub(crate) last_failure_at: i64,
+	/// The remote version whose download failed because its content does not hash to the BLAKE3
+	/// its metadata declares, when that is what the most recent attempt ran into. The engine plans
+	/// nothing at the path while the remote file there is still that version, however few the
+	/// attempts, and plans it again once the remote file there changes or goes, or the pair has no
+	/// need to download it (see the engine's `release_changed_mismatches`). A failure of the upload
+	/// meant to replace that version counts on, keeping this: only an upload that landed ends it.
+	pub(crate) mismatched: Option<MismatchedVersion>,
+}
+
+/// A remote file version whose content did not hash to the BLAKE3 its metadata declared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MismatchedVersion {
+	/// The file's uuid, which every upload of new content re-mints.
+	pub(crate) remote_uuid: Uuid,
+	/// The hash its metadata declared when the download was checked against it. A metadata edit
+	/// keeps the uuid and can change this, so it is part of what makes the version.
+	pub(crate) declared_hash: Blake3Hash,
 }
 
 /// Whether a baseline row describes a directory or a file.
@@ -1083,6 +1119,26 @@ pub(super) fn test_rows_connection(pair: PairId) -> Connection {
 
 fn open_error(error: rusqlite::Error) -> crate::Error {
 	super::engine::db_error(error, "opening the sync baseline DB")
+}
+
+/// The version a failure row recorded as not matching its hash, from its two columns, which the
+/// table's `CHECK` keeps both set or both empty.
+fn mismatched_version(
+	remote_uuid: Option<Uuid>,
+	declared_hash: Option<[u8; 32]>,
+) -> rusqlite::Result<Option<MismatchedVersion>> {
+	match (remote_uuid, declared_hash) {
+		(Some(remote_uuid), Some(declared_hash)) => Ok(Some(MismatchedVersion {
+			remote_uuid,
+			declared_hash: Blake3Hash::from(declared_hash),
+		})),
+		(None, None) => Ok(None),
+		(Some(remote_uuid), None) => Err(corrupt("mismatched_remote_uuid", remote_uuid)),
+		(None, Some(_)) => Err(corrupt(
+			"mismatched_declared_hash",
+			"a hash with no version",
+		)),
+	}
 }
 
 fn corrupt(what: &str, value: impl Display) -> rusqlite::Error {
@@ -1976,6 +2032,38 @@ impl BaselineStore {
 		Ok(())
 	}
 
+	/// Record that the conflict held at `rel_path` was resolved, in ONE transaction: the row the
+	/// resolution leaves there, none where `resolved` is `None`, and the end of the path's failure
+	/// row. A hash mismatch's mark is what a pass reads a row with no local content against, so one
+	/// outliving the conflict would have it skip the path the resolution just freed, and a failure
+	/// streak would hold back the resolution's own action. Neither lands without the other: a
+	/// conflict left on record for a failed write keeps its mark, which the next pass ends.
+	///
+	/// Fails loudly rather than waiting for another connection's write transaction, for the same
+	/// reason [`upsert_entry`](Self::upsert_entry) does.
+	pub(crate) fn record_resolution(
+		&self,
+		pair: PairId,
+		rel_path: &str,
+		resolved: Option<&BaselineEntry>,
+	) -> rusqlite::Result<()> {
+		record_write(
+			pair,
+			|| format!("the resolution of the conflict at {rel_path:?}"),
+			|| {
+				let tx = self.conn.unchecked_transaction()?;
+				match resolved {
+					Some(entry) => self.upsert_entry_once(pair, entry)?,
+					None => self.delete_entry_once(pair, rel_path)?,
+				}
+				self.conn
+					.prepare_cached(CLEAR_FAILURE)?
+					.execute(params![pair, rel_path])?;
+				tx.commit()
+			},
+		)
+	}
+
 	/// Delete every row at or under each of `roots`, in ONE transaction.
 	pub(crate) fn delete_subtrees(
 		&self,
@@ -2284,6 +2372,9 @@ impl BaselineStore {
 						folded_from,
 						folded_to
 					])?;
+					self.conn
+						.prepare_cached(MOVE_FAILURES_UNDER_PATH)?
+						.execute(params![pair, from, to])?;
 				}
 			}
 		}
@@ -2293,6 +2384,10 @@ impl BaselineStore {
 	/// Count one failed attempt at `rel_path`, made at `at` (unix millis), remembering what went
 	/// wrong. Consecutive: a success or a [`clear_failure`](Self::clear_failure) resets the count to
 	/// nothing.
+	///
+	/// A hash mismatch the streak recorded ([`record_mismatch`](Self::record_mismatch)) stays: a path
+	/// is planned with its mark standing only to upload over that version, and until that lands the
+	/// remote file there is still that version.
 	pub(crate) fn record_failure(
 		&self,
 		pair: PairId,
@@ -2311,11 +2406,78 @@ impl BaselineStore {
 		Ok(())
 	}
 
+	/// Record that the download of `version` to `rel_path`, attempted at `at` (unix millis),
+	/// failed because the file's content does not hash to the BLAKE3 its metadata declares: the
+	/// path is skipped from then on, for as long as the remote file there is that version (see
+	/// [`PathFailure::mismatched`]). Counted as an attempt, of a streak of its own when the last
+	/// one was another version's or another failure.
+	pub(crate) fn record_mismatch(
+		&self,
+		pair: PairId,
+		rel_path: &str,
+		version: MismatchedVersion,
+		error: &str,
+		at: i64,
+	) -> rusqlite::Result<()> {
+		self.conn.execute(
+			"INSERT INTO path_failures
+			 (pair_id, rel_path, attempts, last_error, last_failure_at, mismatched_remote_uuid,
+			  mismatched_declared_hash)
+			 VALUES (?1, ?2, 1, ?3, ?4, ?5, ?6)
+			 ON CONFLICT (pair_id, rel_path)
+			 DO UPDATE SET
+			 attempts = CASE
+			   WHEN path_failures.mismatched_remote_uuid IS excluded.mismatched_remote_uuid
+			     AND path_failures.mismatched_declared_hash IS excluded.mismatched_declared_hash
+			   THEN attempts + 1 ELSE 1 END,
+			 last_error = excluded.last_error, last_failure_at = excluded.last_failure_at,
+			 mismatched_remote_uuid = excluded.mismatched_remote_uuid,
+			 mismatched_declared_hash = excluded.mismatched_declared_hash",
+			params![
+				pair,
+				rel_path,
+				error,
+				at,
+				version.remote_uuid,
+				version.declared_hash.as_ref().as_slice()
+			],
+		)?;
+		Ok(())
+	}
+
+	/// Forget the hash mismatch each `(rel_path, version)` of `released` recorded, in ONE
+	/// transaction: the remote file at that path is no longer that version, or the pair never
+	/// downloads it. A path whose streak has since recorded anything else is left alone.
+	pub(crate) fn forget_mismatches(
+		&self,
+		pair: PairId,
+		released: &[(String, MismatchedVersion)],
+	) -> rusqlite::Result<()> {
+		let tx = self.conn.unchecked_transaction()?;
+		{
+			let mut forget = self.conn.prepare(
+				"DELETE FROM path_failures
+				 WHERE pair_id = ?1 AND rel_path = ?2 AND mismatched_remote_uuid = ?3
+				   AND mismatched_declared_hash = ?4",
+			)?;
+			for (rel_path, version) in released {
+				forget.execute(params![
+					pair,
+					rel_path,
+					version.remote_uuid,
+					version.declared_hash.as_ref().as_slice()
+				])?;
+			}
+		}
+		tx.commit()
+	}
+
 	/// Count one failed attempt at `rel_path`, made at `at` (unix millis), as
 	/// [`record_failure`](Self::record_failure) does — but only when the streak's last failure is
 	/// at least `spacing` (millis) older, or there is no streak yet. A failure inside the window
 	/// changes nothing, not even the remembered error; one dated before the last (the clock went
-	/// back) is inside it.
+	/// back) is inside it. A hash mismatch the streak recorded stays, as
+	/// [`record_failure`](Self::record_failure) keeps it.
 	pub(crate) fn record_spaced_failure(
 		&self,
 		pair: PairId,
@@ -2346,9 +2508,7 @@ impl BaselineStore {
 	pub(crate) fn clear_failures(&self, pair: PairId, rel_paths: &[&str]) -> rusqlite::Result<()> {
 		let tx = self.conn.unchecked_transaction()?;
 		{
-			let mut clear = self
-				.conn
-				.prepare("DELETE FROM path_failures WHERE pair_id = ?1 AND rel_path = ?2")?;
+			let mut clear = self.conn.prepare(CLEAR_FAILURE)?;
 			for rel_path in rel_paths {
 				clear.execute(params![pair, rel_path])?;
 			}
@@ -2363,8 +2523,9 @@ impl BaselineStore {
 	) -> rusqlite::Result<std::collections::HashMap<String, PathFailure>> {
 		self.conn
 			.prepare(
-				"SELECT rel_path, attempts, last_error, last_failure_at FROM path_failures
-				 WHERE pair_id = ?1",
+				"SELECT rel_path, attempts, last_error, last_failure_at, mismatched_remote_uuid,
+				 mismatched_declared_hash
+				 FROM path_failures WHERE pair_id = ?1",
 			)?
 			.query_map(params![pair], |row| {
 				let attempts: i64 = row.get("attempts")?;
@@ -2375,6 +2536,10 @@ impl BaselineStore {
 						attempts: u32::try_from(attempts.max(0)).unwrap_or(u32::MAX),
 						last_error: row.get("last_error")?,
 						last_failure_at: row.get("last_failure_at")?,
+						mismatched: mismatched_version(
+							row.get("mismatched_remote_uuid")?,
+							row.get::<_, Option<[u8; 32]>>("mismatched_declared_hash")?,
+						)?,
 					},
 				))
 			})?

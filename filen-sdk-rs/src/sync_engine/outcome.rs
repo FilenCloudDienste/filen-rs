@@ -241,6 +241,36 @@ pub enum UnsyncableReason {
 	/// [`LocalNameCollision`](Self::LocalNameCollision): every item of the group is left alone on
 	/// both sides until one of them is renamed.
 	RemoteNameCollision,
+	/// The remote file's content does not hash to the BLAKE3 its metadata declares — its stored
+	/// data or its metadata is not what the client that uploaded it wrote — so its download
+	/// failed. Reported from the pass whose download found it on, for as long as the remote file
+	/// at this path is that same version: the engine downloads nothing here and leaves the local
+	/// copy (if any) exactly where it is. A new version of the remote file, or its deletion or move
+	/// away, ends it and the path is planned as usual, at the first pass after the cache announces
+	/// the change. A folder above the file going to the remote trash takes the file with it, as any
+	/// deletion of it would: the skip ends, and the local copy goes to the bin with the folder.
+	///
+	/// [`SyncMode::LocalToRemote`](super::SyncMode::LocalToRemote) and
+	/// [`SyncMode::LocalBackup`](super::SyncMode::LocalBackup) never download, so they do not skip
+	/// the path: they plan it as usual, uploading over the remote file, and upload a local file that
+	/// hashes to what the version declares too, where the two sides would otherwise read as
+	/// agreeing. They do so on an account that keeps no old versions as well, which loses that
+	/// version: those modes make the local side the one that counts.
+	///
+	/// In [`SyncMode::TwoWay`](super::SyncMode::TwoWay), a local file whose content changed since the
+	/// last sync ends it too. While the account keeps old versions the upload replaces the damaged
+	/// version, which stays in the file's history. With versioning off the path is held as a conflict
+	/// for [`SyncEngine::resolve_conflict`](super::SyncEngine::resolve_conflict) instead: a mismatch
+	/// may be wrong metadata over good bytes, so that version may be another device's real edit, and
+	/// the upload would lose it for good. While the setting cannot be read neither happens: the path
+	/// stays skipped and reported here, and the next pass asks again. A local copy no pass ever synced,
+	/// a file deleted locally and a directory at the path are not such an edit and leave the skip in
+	/// place.
+	/// [`SyncEngine::retry_path`](super::SyncEngine::retry_path) ends it at once.
+	///
+	/// `last_error` is the last failure's own error: the download's, naming the version and both
+	/// hashes, unless an upload over the version has failed since.
+	RemoteContentHashMismatch { last_error: String },
 }
 
 impl fmt::Display for UnsyncableReason {
@@ -283,6 +313,11 @@ impl fmt::Display for UnsyncableReason {
 			Self::RemoteNameCollision => {
 				f.write_str("another remote item's name is the same once case is folded")
 			}
+			Self::RemoteContentHashMismatch { last_error } => write!(
+				f,
+				"the remote file's content does not match its hash, so it is skipped until it \
+				 changes: {last_error}"
+			),
 		}
 	}
 }

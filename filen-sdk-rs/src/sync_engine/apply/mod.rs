@@ -35,7 +35,10 @@ use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
 
 use super::{
-	baseline::{BaselineChange, BaselineEntry, BaselineState, NodeKind, PairId, PendingRow},
+	baseline::{
+		BaselineChange, BaselineEntry, BaselineState, MismatchedVersion, NodeKind, PairId,
+		PendingRow,
+	},
 	bin::quarantine_local,
 	changes::FullPassReason,
 	engine::{
@@ -48,6 +51,7 @@ use super::{
 	names::{self, Leaf},
 	outcome::{
 		HaltReason, PlannedAction, PlannedConflict, PlannedNodeKind, RefuseReason, UnsyncablePath,
+		UnsyncableReason,
 	},
 	pause::PassGate,
 	plan::{RemoteNode, SyncAction, is_under},
@@ -68,6 +72,7 @@ use crate::{
 	},
 	cache::{SearchResult, hydrate_cached_items_at},
 	connect::ParentTargets,
+	error::ContentHashMismatchError,
 	fs::{
 		HasName, HasUUID,
 		bulk::create_dirs::{CreatedDir, NewDir, NewDirParent},
@@ -262,6 +267,21 @@ pub struct SyncReport {
 	/// streak ([`ApplyContext::streaked`]): what the engine clears the streaks of. Only those, so a
 	/// pass of a million actions keeps a list as long as its paths with a streak, not its actions.
 	pub(super) landed: Vec<String>,
+	/// Every download this pass ran whose content did not hash to the BLAKE3 its metadata
+	/// declares: what the engine records so that the path is skipped until the remote file there
+	/// changes (see [`UnsyncableReason::RemoteContentHashMismatch`]). Not in
+	/// [`failed_paths`](Self::failed_paths): such a version is not retried at all.
+	pub(super) mismatched: Vec<MismatchedDownload>,
+}
+
+/// A download whose content did not match its hash (see [`SyncReport::mismatched`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct MismatchedDownload {
+	pub(super) rel_path: String,
+	/// The remote version the download read, with the hash it was checked against.
+	pub(super) version: MismatchedVersion,
+	/// The download's own error.
+	pub(super) error: String,
 }
 
 impl SyncReport {
@@ -1389,6 +1409,9 @@ impl Verdict {
 /// [`failed_paths`](SyncReport::failed_paths): that makes the next pass read both sides whole and
 /// re-plan the path from the newer version, and a view that keeps naming the old one still runs
 /// into the path's failure streak.
+///
+/// A download whose content did not match its hash has its event and its line, and is recorded
+/// apart (see [`note_mismatched`]).
 fn note_action_failed(
 	action: &SyncAction,
 	error: &crate::Error,
@@ -1413,9 +1436,57 @@ fn note_action_failed(
 		rel_path: action.rel_path().to_string(),
 		error: error.to_string(),
 	});
+	if let SyncAction::DownloadFile {
+		rel_path,
+		remote_uuid,
+	} = action
+		&& let Some(mismatch) = error.downcast_ref::<ContentHashMismatchError>()
+	{
+		let version = MismatchedVersion {
+			remote_uuid: *remote_uuid,
+			declared_hash: mismatch.expected,
+		};
+		note_mismatched(report, rel_path, version, error);
+		return;
+	}
 	if let Some(reason) = note_failure(report, action.rel_path(), error, verdict) {
 		full.note(reason);
 	}
+}
+
+/// Record a download of `version` to `rel_path` whose content did not hash to the BLAKE3 its
+/// metadata declares: its line, the entry the engine records it by
+/// ([`SyncReport::mismatched`]), and the path reported as
+/// [`UnsyncableReason::RemoteContentHashMismatch`] from this pass on, as every pass after it that
+/// skips the path reports it.
+///
+/// It is the file's failure, not the pass's: it halts nothing and counts against no failure
+/// streak, since retrying cannot help while the remote file is that version.
+fn note_mismatched(
+	report: &mut SyncReport,
+	rel_path: &str,
+	version: MismatchedVersion,
+	error: &crate::Error,
+) {
+	let error = error.to_string();
+	report.errors.push(format!("{rel_path}: {error}"));
+	let skipped = UnsyncablePath {
+		rel_path: rel_path.to_string(),
+		reason: UnsyncableReason::RemoteContentHashMismatch {
+			// Owned by this report entry and by the download's record below.
+			last_error: error.clone(),
+		},
+	};
+	// The pass reports its unsyncable paths in path order; this keeps it.
+	let at = report
+		.unsyncable
+		.partition_point(|reported| reported.rel_path <= skipped.rel_path);
+	report.unsyncable.insert(at, skipped);
+	report.mismatched.push(MismatchedDownload {
+		rel_path: rel_path.to_string(),
+		version,
+		error,
+	});
 }
 
 /// Whether the server refused an action because the file it names is no longer the current one:
@@ -3447,7 +3518,9 @@ async fn apply_transfer(
 				return Ok(Transfer::Interrupted);
 			};
 			// A download that FAILED leaves the same empty path behind, and the retry the next pass
-			// makes stashes the restored copy again if it is still unsynced.
+			// makes stashes the restored copy again if it is still unsynced. One whose content did
+			// not match its hash (`ContentHashMismatch`) is not retried while the remote file is that
+			// version, so the copy restored here stays at the path.
 			if let Err(error) = downloaded {
 				restore_stashed(stashed, &path);
 				return Err(error);

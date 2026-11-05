@@ -431,6 +431,7 @@ fn the_carry_over_set_names_every_released_action_and_every_streak() {
 				attempts: 3,
 				last_error: "no".to_owned(),
 				last_failure_at: 0,
+				mismatched: None,
 			},
 		),
 		(
@@ -439,6 +440,7 @@ fn the_carry_over_set_names_every_released_action_and_every_streak() {
 				attempts: 1,
 				last_error: "no".to_owned(),
 				last_failure_at: 0,
+				mismatched: None,
 			},
 		),
 	]);

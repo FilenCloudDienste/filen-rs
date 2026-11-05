@@ -1360,7 +1360,7 @@ impl JsSyncEngine {
 	}
 
 	/// Plan a path that kept failing again on the next pass, without waiting out the engine's
-	/// hourly retry.
+	/// hourly retry. It also ends the skip of a remote file whose content did not match its hash.
 	#[napi_export]
 	pub async fn retry_path(&self, pair_id: u64, rel_path: String) -> Result<(), Error> {
 		detached(Arc::clone(&self.core), move |core| async move {
@@ -1370,7 +1370,8 @@ impl JsSyncEngine {
 	}
 
 	/// Plan every path of the pair that kept failing again on the next pass, without waiting out
-	/// the engine's hourly retry.
+	/// the engine's hourly retry. It also ends the skip of every remote file whose content did not
+	/// match its hash.
 	#[napi_export]
 	pub async fn retry_all(&self, pair_id: u64) -> Result<(), Error> {
 		detached(Arc::clone(&self.core), move |core| async move {

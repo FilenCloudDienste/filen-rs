@@ -179,6 +179,63 @@ pub(super) fn observe_remote(
 	RemoteObserved::Applied(Box::new(out))
 }
 
+/// Put each of `marks`, the paths whose file did not match its hash with the version it did not
+/// match, into a derived view as the cache holds that version now, before a delta is applied to it.
+///
+/// A derived view knows only what a row records, and a file that never downloaded has no row saying
+/// so: the row is still the version before it, or there is none. The announcement that named the
+/// version went with the pass that read it, so what the path holds now is the cache's to answer.
+///
+/// The cache drops a file's row when it is trashed or replaced, and moves it with its directory. So
+/// a mark whose version the cache no longer holds at its path asks for a whole read, which says what
+/// is there instead, rather than leaving the pass to plan from a row that does not describe the
+/// file. That read ends the mark or re-keys it, so this costs one whole pass per change of that
+/// file, on top of an ancestry read per mark on every pass the mark stands.
+pub(super) fn place_marked_versions(
+	root: Uuid,
+	nodes: &mut Side<RemoteNode>,
+	marks: &[(String, Uuid)],
+	ancestry: Ancestry<'_>,
+) -> Result<(), FullPassReason> {
+	for (path, uuid) in marks {
+		let chain = read_chain(*uuid, &mut *ancestry)?;
+		let item = chain
+			.iter()
+			.find(|item| item.uuid == *uuid)
+			.ok_or(FullPassReason::RemoteUnplaceable)?;
+		if ancestor_path(root, &chain, *uuid).as_ref() != Some(path) {
+			return Err(FullPassReason::RemoteUnplaceable);
+		}
+		let mut node = node_of(item);
+		// Owned twice, as the side's key and in its node.
+		node.rel_path.clone_from(path);
+		nodes.insert(path.clone(), node);
+	}
+	Ok(())
+}
+
+/// `uuid` and its cached ancestors up to `root`, read out of the cache DB at `db`, the reader
+/// [`place_marked_versions`] is handed. One hydration per directory, walking up from the item: the
+/// account root's row has no parent to hydrate, so [`cache_ancestry`], which hydrates the whole chain
+/// in one read, cannot answer for an item under it. An item the walk does not find ends the chain,
+/// which then does not reach `root`, and so does a cached parent cycle.
+pub(super) fn cached_chain_to_root(
+	db: &Path,
+	root: Uuid,
+	uuid: Uuid,
+) -> rusqlite::Result<Vec<RemoteItem>> {
+	let mut chain: Vec<RemoteItem> = Vec::new();
+	let mut at = uuid;
+	while at != root && !chain.iter().any(|item| item.uuid == at) {
+		let Some(item) = hydrate_by_uuids(db, &[at])?.first().map(as_item) else {
+			break;
+		};
+		at = item.parent;
+		chain.push(item);
+	}
+	Ok(chain)
+}
+
 /// The cached ancestry of `uuid` read out of the cache DB at `db`, in the projection the view
 /// reads: one indexed recursive walk of `items.parent` ([`read_ancestors`]), then the payloads of
 /// the chain it named ([`hydrate_by_uuids`]).

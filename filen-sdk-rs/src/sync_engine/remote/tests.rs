@@ -776,3 +776,149 @@ fn an_item_the_cache_cannot_place_asks_for_a_full_pass() {
 		RemoteObserved::Applied(out) => panic!("{:?}", out.nodes),
 	}
 }
+
+/// The file `uuid` as the cache lists it at the pair root, under `name`.
+fn cached_file(uuid: Uuid, name: &str, hash: [u8; 32]) -> RemoteItem {
+	RemoteItem {
+		hash: Some(Blake3Hash::from(hash)),
+		..item_file(uuid, root(), name)
+	}
+}
+
+/// The version a mark names goes into a derived view at its path, over the row's older version or
+/// where no row is, and what the row records elsewhere stays as it is.
+#[test]
+fn a_marked_version_the_cache_holds_at_its_path_goes_into_the_view() {
+	let (old, bad, other) = (Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(3));
+	let (baseline, mut nodes) = derived([file_node("a.txt", old), file_node("b.txt", other)]);
+	let mut ancestry = |uuid: Uuid| {
+		assert!(
+			uuid == bad || uuid == Uuid::from_u128(4),
+			"asked about {uuid}"
+		);
+		let name = if uuid == bad { "a.txt" } else { "c.txt" };
+		Ok(vec![cached_file(uuid, name, [2; 32])])
+	};
+	place_marked_versions(
+		root(),
+		&mut nodes,
+		&[
+			("a.txt".to_string(), bad),
+			("c.txt".to_string(), Uuid::from_u128(4)),
+		],
+		&mut ancestry,
+	)
+	.unwrap();
+
+	let nodes = nodes.of(&baseline);
+	let placed = nodes.at("a.txt").unwrap();
+	assert_eq!(placed.remote_uuid, bad);
+	assert_eq!(placed.rel_path, "a.txt");
+	assert_eq!(placed.kind, NodeKind::File);
+	assert_eq!(placed.content_hash, Some(Blake3Hash::from([2; 32])));
+	assert_eq!(nodes.at("c.txt").unwrap().remote_uuid, Uuid::from_u128(4));
+	assert_eq!(nodes.at("b.txt").unwrap().remote_uuid, other);
+}
+
+/// A marked version nested in a directory is found at its path through the cached ancestry.
+#[test]
+fn a_marked_version_in_a_directory_is_placed_by_its_ancestry() {
+	let (dir, bad) = (Uuid::from_u128(5), Uuid::from_u128(2));
+	let (baseline, mut nodes) = derived([dir_node("docs", dir)]);
+	let mut ancestry = |_| {
+		Ok(vec![
+			item_dir(dir, root(), "docs"),
+			RemoteItem {
+				hash: Some(Blake3Hash::from([2; 32])),
+				..item_file(bad, dir, "a.txt")
+			},
+		])
+	};
+	place_marked_versions(
+		root(),
+		&mut nodes,
+		&[("docs/a.txt".to_string(), bad)],
+		&mut ancestry,
+	)
+	.unwrap();
+	assert_eq!(
+		nodes.of(&baseline).at("docs/a.txt").unwrap().remote_uuid,
+		bad
+	);
+}
+
+/// A version the cache no longer holds has been trashed or replaced, and one it holds elsewhere has
+/// moved: only a whole read says what the path holds now, so the pass reads whole rather than plan
+/// from the row. A cache that cannot be read says the same. This is what ends the skip of a file
+/// deleted on the remote, whose removal names a version no row records.
+#[test]
+fn a_marked_version_the_cache_does_not_hold_at_its_path_asks_for_a_whole_read() {
+	let (old, bad) = (Uuid::from_u128(1), Uuid::from_u128(2));
+	type Answer = fn() -> rusqlite::Result<Vec<RemoteItem>>;
+	let answers: [(&str, Answer); 4] = [
+		("gone", || Ok(Vec::new())),
+		("renamed", || {
+			Ok(vec![cached_file(Uuid::from_u128(2), "b.txt", [2; 32])])
+		}),
+		("out of the pair", || {
+			Ok(vec![RemoteItem {
+				parent: Uuid::from_u128(77),
+				..cached_file(Uuid::from_u128(2), "a.txt", [2; 32])
+			}])
+		}),
+		("unreadable", || Err(rusqlite::Error::QueryReturnedNoRows)),
+	];
+	for (why, answer) in answers {
+		let (_baseline, mut nodes) = derived([file_node("a.txt", old)]);
+		assert_eq!(
+			place_marked_versions(
+				root(),
+				&mut nodes,
+				&[("a.txt".to_string(), bad)],
+				&mut |_| answer(),
+			),
+			Err(FullPassReason::RemoteUnplaceable),
+			"{why}"
+		);
+	}
+}
+
+/// A new version announced to a pass lands over the marked one: the delta is applied after it, so
+/// the view holds what the file is now, and no row's older version.
+#[test]
+fn a_version_announced_after_the_marked_one_replaces_it_in_the_view() {
+	let (old, bad, fixed) = (Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(3));
+	let lineage = StableUuid::new_for_test(old);
+	let (baseline, mut nodes) = derived([file_node("a.txt", old)]);
+	place_marked_versions(
+		root(),
+		&mut nodes,
+		&[("a.txt".to_string(), bad)],
+		&mut |_| {
+			Ok(vec![RemoteItem {
+				stable_uuid: Some(lineage),
+				..cached_file(bad, "a.txt", [2; 32])
+			}])
+		},
+	)
+	.unwrap();
+	let announced = delta(&[cache_event(
+		Some(1),
+		CacheEventType::File(FileEvent::New(CacheableFile {
+			stable_uuid: lineage,
+			..cacheable_file(fixed, root(), "a.txt")
+		})),
+	)]);
+	let out = applied(observed_with(
+		&baseline,
+		nodes,
+		&announced,
+		&[],
+		&mut no_ancestry(),
+	));
+	assert_eq!(
+		out.nodes.of(&baseline).at("a.txt").unwrap().remote_uuid,
+		fixed
+	);
+	assert_eq!(listed(&out.changed), ["a.txt"]);
+}

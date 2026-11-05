@@ -54,7 +54,7 @@
 
 use std::{
 	borrow::Cow,
-	collections::{BTreeSet, VecDeque},
+	collections::{BTreeMap, BTreeSet, VecDeque},
 	num::NonZeroUsize,
 };
 
@@ -67,7 +67,10 @@ use super::{
 	super::{
 		SyncMode,
 		baseline::{BaselineEntry, NodeKind},
-		plan::{self, MoveSides, PassHolds, RemoteNode, SyncAction, Took, is_under_held_path},
+		plan::{
+			self, MarkedExit, MoveSides, PassHolds, RemoteNode, SyncAction, Took,
+			is_under_held_path,
+		},
 		rows::Baseline,
 		scan::LocalNode,
 	},
@@ -150,6 +153,7 @@ pub(in super::super) fn reconcile_windows(
 	let mut pass = Pass {
 		mode,
 		held: &holds.held_remote,
+		marked_exits: &holds.marked_exits,
 		pulls: notes && mode.pulls(),
 		pushes: notes && mode.pushes(),
 		out: Out {
@@ -343,6 +347,7 @@ struct Pass<'h> {
 	mode: SyncMode,
 	/// The paths the cache is holding, which nothing under is decided.
 	held: &'h BTreeSet<String>,
+	marked_exits: &'h BTreeMap<String, MarkedExit>,
 	/// Whether the windows note candidates for the pull half, and for the push half.
 	pulls: bool,
 	pushes: bool,
@@ -447,6 +452,7 @@ impl Pass<'_> {
 			self.mode,
 			key,
 			base,
+			self.marked_exits,
 			|| (local.map(Cow::Borrowed), remote.map(Cow::Borrowed)),
 			&mut self.actions,
 		);

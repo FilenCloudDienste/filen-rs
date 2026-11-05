@@ -11,13 +11,14 @@ use crate::{
 	alloc_meter,
 	auth::{test_support::offline_client, unauth},
 	cache::{
-		CacheError, CacheSlot, CacheState, ResyncReach, open_sqlite, open_sqlite_in_memory,
-		open_sqlite_with_flags, test_support::rewrite_behind_sqlite,
+		CacheError, CacheSlot, CacheState, RemoteItem, ResyncReach, open_sqlite,
+		open_sqlite_in_memory, open_sqlite_with_flags, test_support::rewrite_behind_sqlite,
 	},
+	fs::file::cache::CacheableFile,
 	sync::lock::MAX_SLEEP_TIME_DEFAULT,
 	sync_engine::{
 		PauseMode, PlannedActionKind,
-		apply::PassStart,
+		apply::{MismatchedDownload, PassStart},
 		baseline::{BaselineChange, LegacyItem, LegacySide, NodeKind},
 		bin::{
 			PruneSummary,
@@ -62,7 +63,12 @@ fn reconcile_and_screen_resident(prep: &Prepared, state: guard::ScreenState) -> 
 	);
 	let mut actions = prep.dir_moves.clone();
 	actions.extend(plan.actions);
-	let planned = actions.len();
+	// What a hash mismatch keeps skipping is no drop (see `Prepared::skips_for_mismatch`).
+	let planned = actions.len()
+		- actions
+			.iter()
+			.filter(|action| prep.skips_for_mismatch(action))
+			.count();
 	let collisions = prep.collisions();
 	let actions = drop_blocked(
 		actions,
@@ -246,6 +252,18 @@ fn a_passs_outcome_decides_whether_the_next_one_reads_everything() {
 		next_pass_scope(&SyncReport::default()),
 		None,
 		"a pass that ran to the end leaves the next one to its changelists"
+	);
+	assert_eq!(
+		next_pass_scope(&SyncReport {
+			mismatched: vec![MismatchedDownload {
+				rel_path: "a.txt".to_string(),
+				version: bad_version(Uuid::from_u128(2)),
+				error: "the content does not match its hash".to_string(),
+			}],
+			..SyncReport::default()
+		}),
+		None,
+		"a download that did not match its hash leaves the path to its mark, not to a whole read"
 	);
 	for reason in [
 		FullPassReason::LocalOverflow,
@@ -603,6 +621,7 @@ fn folded_pass(
 /// Fold and screen `prep` as a pass does.
 fn run_prepared(mut prep: Prepared) -> (Vec<SyncAction>, Vec<UnsyncablePath>) {
 	prep.fold_dir_moves().unwrap();
+	prep.release_changed_mismatches();
 	let screened = screened_both(&mut prep);
 	let mut actions = screened.decision.safe;
 	actions.extend(screened.decision.held);
@@ -828,6 +847,7 @@ fn the_staged_screen_is_the_resident_one_over_generated_plans() {
 		let holds = plan::PassHolds {
 			trashed,
 			held_remote: BTreeSet::new(),
+			marked_exits: BTreeMap::new(),
 		};
 		// An incomplete scan holds every deletion; a complete one under no limit holds none.
 		let state = guard::ScreenState {
@@ -1114,11 +1134,14 @@ fn prepared(
 		holds: plan::PassHolds {
 			trashed: HashSet::new(),
 			held_remote: remote_view.held_paths.clone(),
+			marked_exits: BTreeMap::new(),
 		},
 		remote_view,
 		remote_converged: true,
 		remote_emptied: false,
 		failures,
+		released_mismatches: Vec::new(),
+		edits_over_marks: Vec::new(),
 		facts: PairFacts {
 			unknown_remote,
 			never_synced_remote,
@@ -3631,7 +3654,1703 @@ fn failure(attempts: u32, last_failure_at: i64) -> PathFailure {
 		attempts,
 		last_error: "boom".to_string(),
 		last_failure_at,
+		mismatched: None,
 	}
+}
+
+/// The version a download of the file `uuid` read when its content did not match its hash: the
+/// file declaring `[2; 32]`, as every such file in these tests does.
+fn bad_version(uuid: Uuid) -> MismatchedVersion {
+	MismatchedVersion {
+		remote_uuid: uuid,
+		declared_hash: Blake3Hash::from([2; 32]),
+	}
+}
+
+/// The mark a download of the file `uuid` leaves when its content did not match its hash (see
+/// [`bad_version`]).
+fn mismatch(uuid: Uuid) -> PathFailure {
+	PathFailure {
+		attempts: 1,
+		last_error: "the content does not match its hash".to_string(),
+		last_failure_at: 0,
+		mismatched: Some(bad_version(uuid)),
+	}
+}
+
+/// A synced `a.txt` holding `[1; 32]` on both sides, whose remote file is now `remote`: the
+/// prepared pass, with `failures` as its marks.
+fn edited_remotely(
+	mode: SyncMode,
+	remote: Vec<RemoteNode>,
+	failures: HashMap<String, PathFailure>,
+) -> Prepared {
+	let (synced, hash) = (Uuid::from_u128(1), Blake3Hash::from([1; 32]));
+	prepared(
+		mode,
+		HashMap::from([("a.txt".to_string(), file_row("a.txt", synced, hash))]),
+		vec![local_file("a.txt", hash)],
+		view(remote, Vec::new(), &[]),
+		failures,
+	)
+}
+
+/// A remote file whose download did not match its hash is skipped for as long as the remote
+/// holds that version: no download, so nothing moves the local copy aside, and the pass reports
+/// the path on its own.
+#[test]
+fn a_remote_file_that_did_not_match_its_hash_is_skipped_while_it_is_that_version() {
+	let bad = Uuid::from_u128(2);
+	let remote = || vec![remote_file("a.txt", bad, Blake3Hash::from([2; 32]), 4)];
+	for mode in [SyncMode::TwoWay, SyncMode::RemoteToLocal] {
+		let (unmarked, _) = run_prepared(edited_remotely(mode, remote(), HashMap::new()));
+		assert_eq!(
+			unmarked,
+			vec![SyncAction::DownloadFile {
+				rel_path: "a.txt".to_string(),
+				remote_uuid: bad,
+			}],
+			"{mode:?}: without the mark the edit is pulled"
+		);
+
+		let mut prep = edited_remotely(
+			mode,
+			remote(),
+			HashMap::from([("a.txt".to_string(), mismatch(bad))]),
+		);
+		prep.fold_dir_moves().unwrap();
+		prep.release_changed_mismatches();
+		let screened = screened_both(&mut prep);
+		assert!(
+			screened.decision.safe.is_empty(),
+			"{mode:?}: {:?}",
+			screened.decision.safe
+		);
+		assert!(
+			screened.decision.held.is_empty(),
+			"{mode:?}: {:?}",
+			screened.decision.held
+		);
+		assert_eq!(
+			screened.dropped, 0,
+			"{mode:?}: the skipped download is owed by its mark, so it is no drop"
+		);
+		assert!(prep.released_mismatches.is_empty(), "{mode:?}");
+		assert_eq!(
+			prep.unsyncable(),
+			vec![UnsyncablePath {
+				rel_path: "a.txt".to_string(),
+				reason: UnsyncableReason::RemoteContentHashMismatch {
+					last_error: "the content does not match its hash".to_string(),
+				},
+			}],
+			"{mode:?}"
+		);
+	}
+}
+
+/// A failure streak that blocks a path still counts the action it drops, which is what tells the
+/// skip of a hash mismatch apart.
+#[test]
+fn a_blocking_failure_streak_still_counts_the_action_it_drops() {
+	let mut prep = edited_remotely(
+		SyncMode::TwoWay,
+		vec![remote_file(
+			"a.txt",
+			Uuid::from_u128(2),
+			Blake3Hash::from([2; 32]),
+			4,
+		)],
+		HashMap::from([(
+			"a.txt".to_string(),
+			failure(MAX_PATH_FAILURES, Utc::now().timestamp_millis()),
+		)]),
+	);
+	prep.fold_dir_moves().unwrap();
+	prep.release_changed_mismatches();
+	let screened = screened_both(&mut prep);
+	assert!(
+		screened.decision.safe.is_empty(),
+		"{:?}",
+		screened.decision.safe
+	);
+	assert_eq!(screened.dropped, 1);
+}
+
+/// A local file the remote one never synced with stays exactly where it is while the remote file
+/// is the version that did not match: it is neither uploaded over the remote file, nor moved aside
+/// for a download, nor held as a conflict.
+#[test]
+fn an_unsynced_local_copy_is_left_alone_while_the_remote_file_does_not_match_its_hash() {
+	let bad = Uuid::from_u128(2);
+	for mode in [
+		SyncMode::TwoWay,
+		SyncMode::RemoteToLocal,
+		SyncMode::RemoteBackup,
+	] {
+		let mut prep = prepared(
+			mode,
+			HashMap::new(),
+			vec![local_file("a.txt", Blake3Hash::from([1; 32]))],
+			view(
+				vec![remote_file("a.txt", bad, Blake3Hash::from([2; 32]), 4)],
+				Vec::new(),
+				&[],
+			),
+			HashMap::from([("a.txt".to_string(), mismatch(bad))]),
+		);
+		prep.fold_dir_moves().unwrap();
+		prep.release_changed_mismatches();
+		let screened = screened_both(&mut prep);
+		assert!(
+			screened.decision.safe.is_empty(),
+			"{mode:?}: {:?}",
+			screened.decision.safe
+		);
+		assert!(
+			screened.decision.held.is_empty(),
+			"{mode:?}: {:?}",
+			screened.decision.held
+		);
+		assert!(
+			screened.conflicts.is_empty(),
+			"{mode:?}: {:?}",
+			screened.conflicts
+		);
+	}
+}
+
+/// A new version of the remote file ends the skip: the pass plans the path as if it had never
+/// been marked, and hands the mark over to be forgotten.
+#[test]
+fn a_new_version_of_the_remote_file_ends_the_skip() {
+	let (bad, fixed) = (Uuid::from_u128(2), Uuid::from_u128(3));
+	let remote = || vec![remote_file("a.txt", fixed, Blake3Hash::from([3; 32]), 4)];
+	let (unmarked, _) = run_prepared(edited_remotely(SyncMode::TwoWay, remote(), HashMap::new()));
+	let mut prep = edited_remotely(
+		SyncMode::TwoWay,
+		remote(),
+		HashMap::from([("a.txt".to_string(), mismatch(bad))]),
+	);
+	prep.fold_dir_moves().unwrap();
+	prep.release_changed_mismatches();
+	assert_eq!(
+		prep.released_mismatches,
+		vec![("a.txt".to_string(), bad_version(bad))]
+	);
+	assert!(prep.unsyncable().is_empty());
+	let screened = screened_both(&mut prep);
+	assert_eq!(
+		screened.decision.safe,
+		vec![SyncAction::DownloadFile {
+			rel_path: "a.txt".to_string(),
+			remote_uuid: fixed,
+		}]
+	);
+	assert_eq!(screened.decision.safe, unmarked);
+}
+
+/// So does a new hash declared for the same file, as a metadata edit declares one without a new
+/// uuid: that version may well match its content.
+#[test]
+fn a_new_declared_hash_for_the_same_remote_file_ends_the_skip() {
+	let bad = Uuid::from_u128(2);
+	let remote = || vec![remote_file("a.txt", bad, Blake3Hash::from([3; 32]), 4)];
+	let (unmarked, _) = run_prepared(edited_remotely(SyncMode::TwoWay, remote(), HashMap::new()));
+	let mut prep = edited_remotely(
+		SyncMode::TwoWay,
+		remote(),
+		HashMap::from([("a.txt".to_string(), mismatch(bad))]),
+	);
+	prep.fold_dir_moves().unwrap();
+	prep.release_changed_mismatches();
+	assert_eq!(
+		prep.released_mismatches,
+		vec![("a.txt".to_string(), bad_version(bad))]
+	);
+	assert!(prep.unsyncable().is_empty());
+	let screened = screened_both(&mut prep);
+	assert_eq!(
+		screened.decision.safe,
+		vec![SyncAction::DownloadFile {
+			rel_path: "a.txt".to_string(),
+			remote_uuid: bad,
+		}]
+	);
+	assert_eq!(screened.decision.safe, unmarked);
+}
+
+/// Nothing at the path ends the skip only when the view can be believed about an absence: one
+/// that never converged or came back wholly empty, or a path it holds back or knows to be out of
+/// it, says nothing about the remote file, so the mark stands and nothing is forgotten.
+#[test]
+fn a_remote_file_missing_from_a_view_not_trusted_for_absences_keeps_its_mark() {
+	let bad = Uuid::from_u128(2);
+	for (why, path) in [
+		("unconverged", "a.txt"),
+		("emptied", "a.txt"),
+		("held", "a.txt"),
+		("unknown", "a.txt"),
+		("under a held directory", "docs/a.txt"),
+		("under an unknown directory", "docs/a.txt"),
+	] {
+		let mut prep = edited_remotely(
+			SyncMode::TwoWay,
+			Vec::new(),
+			HashMap::from([(path.to_string(), mismatch(bad))]),
+		);
+		match why {
+			"unconverged" => prep.remote_converged = false,
+			"emptied" => prep.remote_emptied = true,
+			"held" => prep.holds.held_remote = BTreeSet::from(["a.txt".to_string()]),
+			"unknown" => {
+				prep.facts.unknown_remote =
+					BTreeMap::from([("a.txt".to_string(), UnsyncableReason::RemoteUndecodable)]);
+			}
+			"under an unknown directory" => {
+				prep.facts.unknown_remote =
+					BTreeMap::from([("docs".to_string(), UnsyncableReason::RemoteUndecodable)]);
+			}
+			_ => prep.holds.held_remote = BTreeSet::from(["docs".to_string()]),
+		}
+		prep.release_changed_mismatches();
+		assert!(prep.released_mismatches.is_empty(), "{why}");
+		assert_eq!(
+			prep.failures[path].mismatched,
+			Some(bad_version(bad)),
+			"{why}"
+		);
+	}
+
+	// The same absence in a view that can be believed ends it.
+	let mut prep = edited_remotely(
+		SyncMode::TwoWay,
+		Vec::new(),
+		HashMap::from([("a.txt".to_string(), mismatch(bad))]),
+	);
+	prep.release_changed_mismatches();
+	assert_eq!(
+		prep.released_mismatches,
+		vec![("a.txt".to_string(), bad_version(bad))]
+	);
+}
+
+/// A path whose download did not match its hash this pass keeps the mark the download left, even
+/// when another action at the path landed and would end its streak (a type flip's deletion of what
+/// the download replaces), while an action that landed at any other path ends that path's streak.
+#[test]
+fn a_streak_is_not_ended_at_a_path_whose_download_did_not_match_its_hash() {
+	let bad = Uuid::from_u128(2);
+	let report = SyncReport {
+		landed: vec!["a.txt".to_string(), "b.txt".to_string(), "docs".to_string()],
+		mismatched: vec![MismatchedDownload {
+			rel_path: "a.txt".to_string(),
+			version: bad_version(bad),
+			error: "the content does not match its hash".to_string(),
+		}],
+		..SyncReport::default()
+	};
+	let ends = vec![
+		("a.txt".to_string(), "a.txt".to_string()),
+		("b.txt".to_string(), "b.txt".to_string()),
+		("docs".to_string(), "a.txt".to_string()),
+		("docs".to_string(), "docs/c.txt".to_string()),
+	];
+	assert_eq!(
+		cleared_streaks(ends, &report),
+		vec!["b.txt".to_string(), "docs/c.txt".to_string()]
+	);
+}
+
+/// So does the remote file going away, or becoming a directory: the path is planned as if it had
+/// never been marked.
+#[test]
+fn a_remote_file_that_goes_away_ends_the_skip() {
+	let bad = Uuid::from_u128(2);
+	for remote in [Vec::new(), vec![remote_dir("a.txt", bad)]] {
+		let (unmarked, _) = run_prepared(edited_remotely(
+			SyncMode::TwoWay,
+			remote.clone(),
+			HashMap::new(),
+		));
+		let (marked, unsyncable) = run_prepared(edited_remotely(
+			SyncMode::TwoWay,
+			remote.clone(),
+			HashMap::from([("a.txt".to_string(), mismatch(bad))]),
+		));
+		assert_eq!(marked, unmarked, "{remote:?}");
+		assert!(!marked.is_empty(), "{remote:?}");
+		assert!(unsyncable.is_empty(), "{remote:?}: {unsyncable:?}");
+	}
+}
+
+/// A change-scoped pass that does not decide the marked path read nothing new of it, so the mark
+/// stands, whatever its view derived there.
+#[test]
+fn a_change_scoped_pass_that_does_not_decide_the_path_keeps_its_mark() {
+	let (bad, fixed) = (Uuid::from_u128(2), Uuid::from_u128(3));
+	let mut prep = edited_remotely(
+		SyncMode::TwoWay,
+		vec![remote_file("a.txt", fixed, Blake3Hash::from([3; 32]), 4)],
+		HashMap::from([("a.txt".to_string(), mismatch(bad))]),
+	);
+	prep.read = PassRead::Scoped(BTreeSet::from(["b.txt".to_string()]));
+	prep.release_changed_mismatches();
+	assert!(prep.released_mismatches.is_empty());
+	assert_eq!(prep.failures["a.txt"].mismatched, Some(bad_version(bad)));
+
+	prep.read = PassRead::Scoped(BTreeSet::from(["a.txt".to_string()]));
+	prep.release_changed_mismatches();
+	assert_eq!(
+		prep.released_mismatches,
+		vec![("a.txt".to_string(), bad_version(bad))]
+	);
+	assert!(prep.failures.is_empty());
+}
+
+/// A mode that never downloads has no use for the mark: it lets go of it, for a real pass to
+/// forget, and plans the path exactly as it would unmarked, whether or not the local file changed
+/// and whether or not any pass ever synced it.
+#[test]
+fn an_upload_only_mode_uploads_over_a_remote_file_that_did_not_match_its_hash() {
+	let bad = Uuid::from_u128(2);
+	let remote = || vec![remote_file("a.txt", bad, Blake3Hash::from([2; 32]), 4)];
+	let synced_row = || {
+		HashMap::from([(
+			"a.txt".to_string(),
+			file_row("a.txt", Uuid::from_u128(1), Blake3Hash::from([1; 32])),
+		)])
+	};
+	for mode in [SyncMode::LocalToRemote, SyncMode::LocalBackup] {
+		for (why, rows, content) in [
+			("unchanged", synced_row(), [1; 32]),
+			("edited", synced_row(), [9; 32]),
+			("never synced", HashMap::new(), [9; 32]),
+		] {
+			let pass = |failures| {
+				prepared(
+					mode,
+					rows.clone(),
+					vec![local_file("a.txt", Blake3Hash::from(content))],
+					view(remote(), Vec::new(), &[]),
+					failures,
+				)
+			};
+			let (unmarked, _) = run_prepared(pass(HashMap::new()));
+			let mut prep = pass(HashMap::from([("a.txt".to_string(), mismatch(bad))]));
+			prep.fold_dir_moves().unwrap();
+			prep.release_changed_mismatches();
+			assert_eq!(
+				prep.released_mismatches,
+				vec![("a.txt".to_string(), bad_version(bad))],
+				"{mode:?} {why}"
+			);
+			assert!(prep.holds.marked_exits.is_empty(), "{mode:?} {why}");
+			assert!(prep.unsyncable().is_empty(), "{mode:?} {why}");
+			let screened = screened_both(&mut prep);
+			assert_eq!(
+				screened.decision.safe,
+				vec![SyncAction::UploadFile {
+					rel_path: "a.txt".to_string(),
+				}],
+				"{mode:?} {why}"
+			);
+			assert_eq!(screened.decision.safe, unmarked, "{mode:?} {why}");
+			assert_eq!(screened.dropped, 0, "{mode:?} {why}");
+		}
+	}
+}
+
+/// A synced `a.txt` holding `[1; 32]`, whose local file is now `local` and whose remote file is the
+/// version [`bad_version`] of `Uuid::from_u128(2)`: the prepared pass, with the mark `failure`.
+fn marked_pass(mode: SyncMode, local: Vec<LocalNode>, failure: PathFailure) -> Prepared {
+	let (synced, hash) = (Uuid::from_u128(1), Blake3Hash::from([1; 32]));
+	prepared(
+		mode,
+		HashMap::from([("a.txt".to_string(), file_row("a.txt", synced, hash))]),
+		local,
+		view(
+			vec![remote_file(
+				"a.txt",
+				Uuid::from_u128(2),
+				Blake3Hash::from([2; 32]),
+				4,
+			)],
+			Vec::new(),
+			&[],
+		),
+		HashMap::from([("a.txt".to_string(), failure)]),
+	)
+}
+
+/// In two-way, a local edit made since the last sync goes up over the version that did not match
+/// its hash, in the plain and the staged reconcile alike, instead of the conflict the two sides
+/// that moved would otherwise make. The path is no longer reported, and its mark stays in the store
+/// for the upload's landing to end, so nothing is handed over to be forgotten. A local file that
+/// hashes to what the version declares replaces it too.
+#[test]
+fn a_local_edit_replaces_a_remote_file_that_did_not_match_its_hash() {
+	let bad = Uuid::from_u128(2);
+	let edited = || vec![local_file("a.txt", Blake3Hash::from([9; 32]))];
+
+	let mut unmarked = marked_pass(SyncMode::TwoWay, edited(), mismatch(bad));
+	unmarked.failures.clear();
+	assert!(
+		screened_both(&mut unmarked)
+			.conflicts
+			.iter()
+			.any(|conflict| conflict.rel_path == "a.txt"),
+		"without a mark, two sides that moved are a conflict"
+	);
+
+	for local in [
+		edited(),
+		vec![local_file("a.txt", Blake3Hash::from([2; 32]))],
+	] {
+		let mut prep = marked_pass(SyncMode::TwoWay, local, mismatch(bad));
+		prep.fold_dir_moves().unwrap();
+		prep.release_changed_mismatches();
+		assert!(prep.released_mismatches.is_empty());
+		assert!(prep.holds.marked_exits.contains_key("a.txt"));
+		assert!(prep.unsyncable().is_empty());
+		let screened = screened_both(&mut prep);
+		assert_eq!(
+			screened.decision.safe,
+			vec![SyncAction::UploadFile {
+				rel_path: "a.txt".to_string(),
+			}]
+		);
+		assert!(screened.conflicts.is_empty(), "{:?}", screened.conflicts);
+		assert_eq!(screened.dropped, 0);
+	}
+}
+
+/// The change-scoped pass after the one whose download of `a.txt` (`Uuid::from_u128(2)`, declaring
+/// `[2; 32]`) did not match its hash, as `prepare_scoped` builds it: the remote side carried from
+/// `rows`, with the marked version placed in it from the cache, and the path decided.
+fn scoped_marked_pass(
+	mode: SyncMode,
+	rows: HashMap<String, BaselineEntry>,
+	local: Vec<LocalNode>,
+) -> Prepared {
+	let (bad, root) = (Uuid::from_u128(2), Uuid::from_u128(1_000));
+	let mut prep = unplaced_scoped_marked_pass(mode, rows, local);
+	let cached = RemoteItem {
+		uuid: bad,
+		parent: root,
+		name: "a.txt".to_string(),
+		stable_uuid: Some(StableUuid::new_for_test(bad)),
+		hash: Some(Blake3Hash::from([2; 32])),
+		size: 4,
+		modified_millis: 0,
+	};
+	place_marked_versions(
+		root,
+		&mut prep.remote_view.nodes,
+		&[("a.txt".to_string(), bad)],
+		&mut |_| Ok(vec![cached.clone()]),
+	)
+	.unwrap();
+	prep
+}
+
+/// [`scoped_marked_pass`] where the marked version could not be placed, so that the remote side is
+/// only what `rows` record.
+fn unplaced_scoped_marked_pass(
+	mode: SyncMode,
+	rows: HashMap<String, BaselineEntry>,
+	local: Vec<LocalNode>,
+) -> Prepared {
+	let mut prep = prepared(
+		mode,
+		rows,
+		local,
+		view(Vec::new(), Vec::new(), &[]),
+		HashMap::from([("a.txt".to_string(), mismatch(Uuid::from_u128(2)))]),
+	);
+	prep.remote_view.nodes = Side::carried();
+	prep.read = PassRead::Scoped(BTreeSet::from(["a.txt".to_string()]));
+	prep
+}
+
+/// A row for `a.txt` holding `[1; 32]`, recording version `Uuid::from_u128(1)`, with every field a
+/// change-scoped pass needs to carry it.
+fn carried_rows() -> HashMap<String, BaselineEntry> {
+	let row = BaselineEntry {
+		remote_modified: Some(0),
+		..file_row("a.txt", Uuid::from_u128(1), Blake3Hash::from([1; 32]))
+	};
+	assert!(row.carryable());
+	HashMap::from([("a.txt".to_string(), row)])
+}
+
+/// The skip a pass keeps at `a.txt`: nothing planned or dropped, nothing to forget, and the path
+/// reported.
+fn assert_stays_skipped(mut prep: Prepared, why: &str) {
+	prep.release_changed_mismatches();
+	assert!(prep.released_mismatches.is_empty(), "{why}");
+	assert!(prep.holds.marked_exits.is_empty(), "{why}");
+	assert_eq!(
+		prep.unsyncable(),
+		vec![UnsyncablePath {
+			rel_path: "a.txt".to_string(),
+			reason: UnsyncableReason::RemoteContentHashMismatch {
+				last_error: "the content does not match its hash".to_string(),
+			},
+		}],
+		"{why}"
+	);
+	let screened = reconcile_and_screen_resident(&prep, screen_state(&prep));
+	assert!(
+		screened.decision.safe.is_empty(),
+		"{why}: {:?}",
+		screened.decision.safe
+	);
+	assert!(
+		screened.decision.held.is_empty(),
+		"{why}: {:?}",
+		screened.decision.held
+	);
+	assert!(
+		screened.conflicts.is_empty(),
+		"{why}: {:?}",
+		screened.conflicts
+	);
+	assert_eq!(screened.dropped, 0, "{why}");
+}
+
+/// A change-scoped pass has no row to read a file with no synced version from, and the local copy
+/// no sync recorded is left where it is, in every mode that downloads: not moved to the bin as a
+/// file the remote deleted, nor uploaded as a new one over the damaged version.
+#[test]
+fn a_change_scoped_pass_with_no_row_leaves_an_unsynced_local_copy_alone() {
+	for mode in [
+		SyncMode::TwoWay,
+		SyncMode::RemoteToLocal,
+		SyncMode::RemoteBackup,
+	] {
+		let copy = vec![local_file("a.txt", Blake3Hash::from([9; 32]))];
+		assert_stays_skipped(
+			scoped_marked_pass(mode, HashMap::new(), copy),
+			&format!("{mode:?}"),
+		);
+	}
+}
+
+/// A change-scoped pass over a synced file whose row records the version before the marked one
+/// keeps the skip, the same as a pass that read both sides whole: no download of that older version
+/// over a local edit, and the path stays reported rather than being downloaded and marked again by
+/// each whole pass.
+#[test]
+fn a_change_scoped_pass_keeps_the_skip_of_a_file_whose_row_records_an_older_version() {
+	let unchanged = || vec![local_file("a.txt", Blake3Hash::from([1; 32]))];
+	let edited = || vec![local_file("a.txt", Blake3Hash::from([9; 32]))];
+	for mode in [
+		SyncMode::TwoWay,
+		SyncMode::RemoteToLocal,
+		SyncMode::RemoteBackup,
+	] {
+		assert_stays_skipped(
+			scoped_marked_pass(mode, carried_rows(), unchanged()),
+			&format!("{mode:?} unchanged"),
+		);
+	}
+	for mode in [SyncMode::RemoteToLocal, SyncMode::RemoteBackup] {
+		assert_stays_skipped(
+			scoped_marked_pass(mode, carried_rows(), edited()),
+			&format!("{mode:?} edited"),
+		);
+	}
+}
+
+/// A change-scoped pass and a dry run, which reads whole, decide alike: a two-way local edit goes up
+/// over the marked version, replacing that version and not the older one the row records, so the
+/// version is not read back as an interleaved edit.
+#[test]
+fn a_change_scoped_two_way_local_edit_replaces_the_marked_version() {
+	let bad = Uuid::from_u128(2);
+	let edited = || vec![local_file("a.txt", Blake3Hash::from([9; 32]))];
+	let mut prep = scoped_marked_pass(SyncMode::TwoWay, carried_rows(), edited());
+	prep.release_changed_mismatches();
+	assert!(prep.released_mismatches.is_empty());
+	assert_eq!(
+		prep.holds.marked_exits.get("a.txt"),
+		Some(&plan::MarkedExit::Upload)
+	);
+	assert!(prep.unsyncable().is_empty());
+	assert_eq!(
+		prep.remote_view
+			.nodes
+			.of(&prep.baseline)
+			.at("a.txt")
+			.map(|node| node.remote_uuid),
+		Some(bad),
+		"what the upload names as the version it replaces"
+	);
+	let screened = reconcile_and_screen_resident(&prep, screen_state(&prep));
+	assert_eq!(
+		screened.decision.safe,
+		vec![SyncAction::UploadFile {
+			rel_path: "a.txt".to_string(),
+		}]
+	);
+	assert!(screened.conflicts.is_empty(), "{:?}", screened.conflicts);
+
+	let mut dry = marked_pass(SyncMode::TwoWay, edited(), mismatch(bad));
+	dry.release_changed_mismatches();
+	assert_eq!(dry.holds.marked_exits, prep.holds.marked_exits);
+}
+
+/// A change-scoped pass of a mode that never downloads replaces a version that declares its local
+/// file, and plans anything else as usual, against the marked version and not the row's.
+#[test]
+fn a_change_scoped_upload_only_pass_weighs_the_marked_version() {
+	for mode in [SyncMode::LocalToRemote, SyncMode::LocalBackup] {
+		let mut restoring = scoped_marked_pass(
+			mode,
+			carried_rows(),
+			vec![local_file("a.txt", Blake3Hash::from([2; 32]))],
+		);
+		restoring.release_changed_mismatches();
+		assert_eq!(
+			restoring.holds.marked_exits.get("a.txt"),
+			Some(&plan::MarkedExit::Upload),
+			"{mode:?}"
+		);
+		assert!(restoring.released_mismatches.is_empty(), "{mode:?}");
+
+		let mut other = scoped_marked_pass(
+			mode,
+			carried_rows(),
+			vec![local_file("a.txt", Blake3Hash::from([9; 32]))],
+		);
+		other.release_changed_mismatches();
+		assert!(other.holds.marked_exits.is_empty(), "{mode:?}");
+		assert_eq!(
+			other.released_mismatches,
+			vec![("a.txt".to_string(), bad_version(Uuid::from_u128(2)))],
+			"{mode:?}"
+		);
+		assert_eq!(
+			reconcile_and_screen_resident(&other, screen_state(&other))
+				.decision
+				.safe,
+			vec![SyncAction::UploadFile {
+				rel_path: "a.txt".to_string(),
+			}],
+			"{mode:?}"
+		);
+	}
+}
+
+/// A carried view that could not place the marked version holds only what the row records, which
+/// says nothing about the file, in any mode: neither that it changed nor that it is gone.
+#[test]
+fn a_change_scoped_view_without_the_marked_version_keeps_its_mark() {
+	let edited = || vec![local_file("a.txt", Blake3Hash::from([9; 32]))];
+	for mode in [
+		SyncMode::TwoWay,
+		SyncMode::RemoteToLocal,
+		SyncMode::RemoteBackup,
+		SyncMode::LocalToRemote,
+		SyncMode::LocalBackup,
+	] {
+		for (why, rows) in [("row", carried_rows()), ("no row", HashMap::new())] {
+			let mut prep = unplaced_scoped_marked_pass(mode, rows, edited());
+			prep.release_changed_mismatches();
+			assert!(prep.released_mismatches.is_empty(), "{mode:?} {why}");
+			assert!(prep.holds.marked_exits.is_empty(), "{mode:?} {why}");
+			assert_eq!(
+				prep.failures["a.txt"].mismatched,
+				Some(bad_version(Uuid::from_u128(2))),
+				"{mode:?} {why}"
+			);
+			let screened = reconcile_and_screen_resident(&prep, screen_state(&prep));
+			assert!(
+				screened.decision.safe.is_empty() && screened.decision.held.is_empty(),
+				"{mode:?} {why}: {:?} {:?}",
+				screened.decision.safe,
+				screened.decision.held
+			);
+			assert!(
+				screened.conflicts.is_empty(),
+				"{mode:?} {why}: {:?}",
+				screened.conflicts
+			);
+		}
+	}
+}
+
+/// What the real change-scoped read makes of a two-file pair whose `a.txt` was marked for version
+/// `Uuid::from_u128(4)`, declaring `[2; 32]`, reaching the pass through its failure row as owed: the
+/// cache lists that version only if `cached`, the store has `a.txt`'s row of version
+/// `Uuid::from_u128(3)` only if `row`, and the local file holds `content`.
+async fn read_of_a_marked_path(
+	mode: SyncMode,
+	row: bool,
+	content: &[u8],
+	cached: bool,
+) -> Prepared {
+	let dir = tempfile::tempdir().unwrap();
+	let synced = b"synced";
+	let local = dir.path().join("local");
+	std::fs::create_dir(&local).unwrap();
+	std::fs::write(local.join("a.txt"), content).unwrap();
+	std::fs::write(local.join("keep.txt"), synced).unwrap();
+	let (account, remote_root) = (Uuid::from_u128(1), Uuid::from_u128(2));
+	let (bad, keep) = (Uuid::from_u128(4), Uuid::from_u128(5));
+	let cache = dir.path().join("cache.db");
+	let mut state = CacheState::new_on_path(&cache, account);
+	state
+		.upsert_dirs([&cacheable_dir(remote_root, account, "pair")].into_iter())
+		.unwrap();
+	let synced_hash = Blake3Hash::from(*blake3::hash(synced).as_bytes());
+	let kept = CacheableFile {
+		hash: Some(synced_hash),
+		..cacheable_file(keep, remote_root, "keep.txt")
+	};
+	state.upsert_files([&kept].into_iter()).unwrap();
+	if cached {
+		let marked = CacheableFile {
+			hash: Some(Blake3Hash::from([2; 32])),
+			..cacheable_file(bad, remote_root, "a.txt")
+		};
+		state.upsert_files([&marked].into_iter()).unwrap();
+	}
+	state.add_converged_roots(&[remote_root]).unwrap();
+	let client = Arc::new(offline_client());
+	client.configure_cache(cache, |_| {}).await.unwrap();
+	let engine = SyncEngine::open(client, dir.path().join("sync.db"))
+		.await
+		.unwrap();
+	let (pair, _) = locked(&engine.control)
+		.create_pair(local.to_str().unwrap(), remote_root, mode)
+		.unwrap();
+	let store = engine.pair_store(pair).await.unwrap();
+	{
+		let store = locked(&store);
+		let carried_row = |rel: &str, uuid| BaselineEntry {
+			remote_modified: Some(0),
+			size: Some(6),
+			..file_row(rel, uuid, synced_hash)
+		};
+		store
+			.upsert_entry(pair, &carried_row("keep.txt", keep))
+			.unwrap();
+		if row {
+			store
+				.upsert_entry(pair, &carried_row("a.txt", Uuid::from_u128(3)))
+				.unwrap();
+		}
+		store
+			.record_mismatch(
+				pair,
+				"a.txt",
+				MismatchedVersion {
+					remote_uuid: bad,
+					declared_hash: Blake3Hash::from([2; 32]),
+				},
+				"the content does not match its hash",
+				0,
+			)
+			.unwrap();
+	}
+	engine.carried.lock().await.insert(
+		pair,
+		PairCarry {
+			facts: PairFacts::default(),
+			remote_converged: true,
+			scan_complete: true,
+			scan_gaps: ScanGaps::default(),
+		},
+	);
+	let changes = engine.pair_changes(pair).await;
+	changes.note_tree_size(2);
+	changes.cover_local();
+	changes.note_owed(["a.txt"]);
+	let mut scope = changes.take();
+	let converged = engine
+		.client
+		.sync_root_converged(remote_root)
+		.await
+		.unwrap()
+		.unwrap();
+	let mut prep = engine
+		.read_pass(
+			pair,
+			Some(ScopedRead {
+				scope: &mut scope,
+				converged,
+			}),
+			Seeding::Write,
+			&Arc::new(WalkProgress::default()),
+		)
+		.await
+		.unwrap();
+	// This cache has taken no drive message, which a whole read of it reads as not converged.
+	prep.remote_converged = true;
+	prep.release_changed_mismatches();
+	prep
+}
+
+/// The real read of a change-scoped pass, from the store and a cache file: every shape of a marked
+/// path keeps its skip, with the marked version in the view and without reading both sides.
+#[tokio::test]
+async fn a_change_scoped_read_keeps_the_skip_of_a_marked_path() {
+	let synced = b"synced".as_slice();
+	for (why, mode, row) in [
+		("no row, pulling", SyncMode::RemoteToLocal, false),
+		("no row, two-way", SyncMode::TwoWay, false),
+		("row, pulling", SyncMode::RemoteToLocal, true),
+		("row, two-way", SyncMode::TwoWay, true),
+	] {
+		let prep = read_of_a_marked_path(mode, row, synced, true).await;
+		assert!(prep.read.is_scoped(), "{why}: {:?}", prep.read);
+		assert!(prep.released_mismatches.is_empty(), "{why}");
+		assert_eq!(
+			prep.remote_view
+				.nodes
+				.of(&prep.baseline)
+				.at("a.txt")
+				.map(|node| node.remote_uuid),
+			Some(Uuid::from_u128(4)),
+			"{why}"
+		);
+		assert_eq!(
+			prep.unsyncable()
+				.into_iter()
+				.map(|path| path.rel_path)
+				.collect::<Vec<_>>(),
+			["a.txt"],
+			"{why}"
+		);
+		let screened = reconcile_and_screen_resident(&prep, screen_state(&prep));
+		assert!(
+			screened.decision.safe.is_empty() && screened.decision.held.is_empty(),
+			"{why}: {:?} {:?}",
+			screened.decision.safe,
+			screened.decision.held
+		);
+		assert!(screened.conflicts.is_empty(), "{why}");
+		assert_eq!(screened.dropped, 0, "{why}");
+	}
+}
+
+/// The real read of a change-scoped pass also reaches a two-way local edit's exit, naming the marked
+/// version as what it replaces, and a pulling mode's local edit stays a skip.
+#[tokio::test]
+async fn a_change_scoped_read_reaches_the_local_edit_exit() {
+	let edited = b"edited".as_slice();
+	let prep = read_of_a_marked_path(SyncMode::TwoWay, true, edited, true).await;
+	assert!(prep.read.is_scoped());
+	assert_eq!(
+		prep.holds.marked_exits.get("a.txt"),
+		Some(&plan::MarkedExit::Upload)
+	);
+	assert_eq!(
+		prep.remote_view
+			.nodes
+			.of(&prep.baseline)
+			.at("a.txt")
+			.map(|node| node.remote_uuid),
+		Some(Uuid::from_u128(4))
+	);
+
+	let pulling = read_of_a_marked_path(SyncMode::RemoteToLocal, true, edited, true).await;
+	assert!(pulling.read.is_scoped());
+	assert!(pulling.holds.marked_exits.is_empty());
+	assert!(
+		reconcile_and_screen_resident(&pulling, screen_state(&pulling))
+			.decision
+			.safe
+			.is_empty()
+	);
+}
+
+/// A marked version the cache no longer lists was deleted or replaced, which no row or delta can say
+/// of a version nothing recorded. The pass that finds that reads both sides whole, which ends the
+/// mark and plans what is really at the path. That is every pass after the removal was announced.
+#[tokio::test]
+async fn a_marked_version_gone_from_the_cache_makes_the_pass_read_whole_and_ends_the_skip() {
+	let synced = b"synced".as_slice();
+	for (why, row) in [("row", true), ("no row", false)] {
+		let prep = read_of_a_marked_path(SyncMode::TwoWay, row, synced, false).await;
+		assert!(!prep.read.is_scoped(), "{why}");
+		assert_eq!(
+			prep.released_mismatches,
+			vec![(
+				"a.txt".to_string(),
+				MismatchedVersion {
+					remote_uuid: Uuid::from_u128(4),
+					declared_hash: Blake3Hash::from([2; 32]),
+				}
+			)],
+			"{why}"
+		);
+		assert!(prep.unsyncable().is_empty(), "{why}");
+	}
+}
+
+/// A mode that never downloads replaces a version whose declared hash is what the local file holds,
+/// where its plan would otherwise read the two sides as agreeing and leave the damaged version on
+/// the server. Its mark stays in the store until that upload lands, as a two-way edit's does.
+#[test]
+fn an_upload_only_mode_replaces_a_damaged_version_declaring_the_local_content() {
+	let bad = Uuid::from_u128(2);
+	let declared = Blake3Hash::from([2; 32]);
+	let remote = || vec![remote_file("a.txt", bad, declared, 4)];
+	let synced_row = || {
+		HashMap::from([(
+			"a.txt".to_string(),
+			file_row("a.txt", Uuid::from_u128(1), Blake3Hash::from([1; 32])),
+		)])
+	};
+	for mode in [SyncMode::LocalToRemote, SyncMode::LocalBackup] {
+		for (why, rows) in [("synced", synced_row()), ("never synced", HashMap::new())] {
+			let pass = |failures| {
+				prepared(
+					mode,
+					rows.clone(),
+					vec![local_file("a.txt", declared)],
+					view(remote(), Vec::new(), &[]),
+					failures,
+				)
+			};
+			let (unmarked, _) = run_prepared(pass(HashMap::new()));
+			assert_eq!(
+				unmarked,
+				vec![SyncAction::AdoptBaseline {
+					rel_path: "a.txt".to_string(),
+				}],
+				"{mode:?} {why}: unmarked, the two sides agree"
+			);
+
+			let mut prep = pass(HashMap::from([("a.txt".to_string(), mismatch(bad))]));
+			prep.fold_dir_moves().unwrap();
+			prep.release_changed_mismatches();
+			assert!(prep.released_mismatches.is_empty(), "{mode:?} {why}");
+			assert!(prep.unsyncable().is_empty(), "{mode:?} {why}");
+			let screened = screened_both(&mut prep);
+			assert_eq!(
+				screened.decision.safe,
+				vec![SyncAction::UploadFile {
+					rel_path: "a.txt".to_string(),
+				}],
+				"{mode:?} {why}"
+			);
+			assert_eq!(screened.dropped, 0, "{mode:?} {why}");
+		}
+	}
+}
+
+/// A two-way local edit goes up over a damaged version only while the account's own setting says it
+/// keeps old versions. With versioning off the path is held as a conflict for the user, including a
+/// local file that hashes to what the version declares, and the mark stays until that conflict is on
+/// record.
+#[test]
+fn a_two_way_local_edit_is_held_as_a_conflict_unless_the_account_keeps_old_versions() {
+	let bad = Uuid::from_u128(2);
+	for (why, keeps_old) in [("on", true), ("off", false)] {
+		for content in [[9; 32], [2; 32]] {
+			let mut prep = marked_pass(
+				SyncMode::TwoWay,
+				vec![local_file("a.txt", Blake3Hash::from(content))],
+				mismatch(bad),
+			);
+			prep.fold_dir_moves().unwrap();
+			prep.release_changed_mismatches();
+			prep.settle_marked_edits(Ok(keeps_old));
+			assert!(prep.released_mismatches.is_empty(), "{why}");
+			assert!(prep.unsyncable().is_empty(), "{why}");
+			let screened = screened_both(&mut prep);
+			if keeps_old {
+				assert_eq!(
+					screened.decision.safe,
+					vec![SyncAction::UploadFile {
+						rel_path: "a.txt".to_string(),
+					}],
+					"{why}"
+				);
+				assert!(screened.conflicts.is_empty(), "{why}");
+			} else {
+				assert!(
+					screened.decision.safe.is_empty(),
+					"{why}: {:?}",
+					screened.decision.safe
+				);
+				assert_eq!(
+					screened.conflicts,
+					vec![PlannedConflict {
+						rel_path: "a.txt".to_string(),
+						local: Some(PlannedNodeKind::File),
+						remote: Some(PlannedNodeKind::File),
+					}],
+					"{why}"
+				);
+			}
+		}
+	}
+}
+
+/// The settings read's failure, as the pass is handed it.
+fn unreadable_setting() -> Result<bool, Error> {
+	Err(Error::custom(
+		ErrorKind::Internal,
+		"the settings did not load",
+	))
+}
+
+/// A setting that could not be read decides nothing about a two-way local edit over a damaged
+/// version, a file hashing to what it declares included: no upload and no conflict. The path stays
+/// skipped with the row it had, whether or not a failure streak had reached its block, is reported
+/// as the mismatch, is owed to the next pass, and counts as no dropped action, so that pass needs no
+/// whole read for it.
+#[test]
+fn an_unreadable_versioning_setting_leaves_a_two_way_local_edit_skipped() {
+	let bad = Uuid::from_u128(2);
+	let streak = PathFailure {
+		attempts: MAX_PATH_FAILURES,
+		last_failure_at: Utc::now().timestamp_millis(),
+		..mismatch(bad)
+	};
+	for failure in [mismatch(bad), streak] {
+		for content in [[9; 32], [2; 32]] {
+			let mut prep = marked_pass(
+				SyncMode::TwoWay,
+				vec![local_file("a.txt", Blake3Hash::from(content))],
+				failure.clone(),
+			);
+			prep.fold_dir_moves().unwrap();
+			prep.release_changed_mismatches();
+			prep.settle_marked_edits(unreadable_setting());
+			assert!(prep.holds.marked_exits.is_empty());
+			assert!(prep.released_mismatches.is_empty());
+			assert_eq!(prep.failures["a.txt"], failure);
+			assert_eq!(
+				prep.unsyncable(),
+				vec![UnsyncablePath {
+					rel_path: "a.txt".to_string(),
+					reason: UnsyncableReason::RemoteContentHashMismatch {
+						last_error: failure.last_error.clone(),
+					},
+				}]
+			);
+			assert_eq!(
+				facts::carry_over([], &[], &BTreeSet::new(), &prep.failures).collect::<Vec<_>>(),
+				["a.txt"]
+			);
+			let screened = screened_both(&mut prep);
+			assert!(
+				screened.decision.safe.is_empty(),
+				"{:?}",
+				screened.decision.safe
+			);
+			assert!(
+				screened.decision.held.is_empty(),
+				"{:?}",
+				screened.decision.held
+			);
+			assert!(screened.conflicts.is_empty(), "{:?}", screened.conflicts);
+			assert_eq!(screened.dropped, 0);
+		}
+	}
+}
+
+/// The pass after a setting that could not be read asks again, and takes the exit the answer names.
+#[test]
+fn the_pass_after_an_unreadable_versioning_setting_takes_the_exit_the_setting_names() {
+	let bad = Uuid::from_u128(2);
+	let edited = || vec![local_file("a.txt", Blake3Hash::from([9; 32]))];
+	let mut unread = marked_pass(SyncMode::TwoWay, edited(), mismatch(bad));
+	unread.fold_dir_moves().unwrap();
+	unread.release_changed_mismatches();
+	unread.settle_marked_edits(unreadable_setting());
+	let row = unread.failures.remove("a.txt").unwrap();
+
+	let next_with = |keeps_old| {
+		let mut next = marked_pass(SyncMode::TwoWay, edited(), row.clone());
+		next.fold_dir_moves().unwrap();
+		next.release_changed_mismatches();
+		assert!(next.asks_whether_old_versions_are_kept());
+		next.settle_marked_edits(Ok(keeps_old));
+		assert!(next.unsyncable().is_empty());
+		next
+	};
+	let uploading = screened_both(&mut next_with(true));
+	assert_eq!(
+		uploading.decision.safe,
+		vec![SyncAction::UploadFile {
+			rel_path: "a.txt".to_string(),
+		}]
+	);
+	assert!(uploading.conflicts.is_empty());
+	let holding = screened_both(&mut next_with(false));
+	assert!(holding.decision.safe.is_empty());
+	assert_eq!(
+		holding.conflicts,
+		vec![PlannedConflict {
+			rel_path: "a.txt".to_string(),
+			local: Some(PlannedNodeKind::File),
+			remote: Some(PlannedNodeKind::File),
+		}]
+	);
+}
+
+/// Only two-way asks for the account's versioning setting: an upload-only mode was chosen to
+/// overwrite, and a pass with no edit over a damaged version makes no request.
+#[test]
+fn only_a_two_way_exit_asks_whether_the_account_keeps_old_versions() {
+	let bad = Uuid::from_u128(2);
+	let mut upload_only = marked_pass(
+		SyncMode::LocalToRemote,
+		vec![local_file("a.txt", Blake3Hash::from([2; 32]))],
+		mismatch(bad),
+	);
+	upload_only.release_changed_mismatches();
+	assert_eq!(
+		upload_only.holds.marked_exits.get("a.txt"),
+		Some(&plan::MarkedExit::Upload)
+	);
+	assert!(!upload_only.asks_whether_old_versions_are_kept());
+
+	let mut edited = marked_pass(
+		SyncMode::TwoWay,
+		vec![local_file("a.txt", Blake3Hash::from([9; 32]))],
+		mismatch(bad),
+	);
+	edited.release_changed_mismatches();
+	assert!(edited.asks_whether_old_versions_are_kept());
+
+	let mut unchanged = marked_pass(
+		SyncMode::TwoWay,
+		vec![local_file("a.txt", Blake3Hash::from([1; 32]))],
+		mismatch(bad),
+	);
+	unchanged.release_changed_mismatches();
+	assert!(!unchanged.asks_whether_old_versions_are_kept());
+}
+
+/// A conflict on record at the path ends the mark, on a whole and a change-scoped pass alike: the
+/// row now says what the path waits for, and the pass reports the conflict rather than the skip.
+#[test]
+fn a_held_conflict_ends_the_mark_at_its_path() {
+	let bad = Uuid::from_u128(2);
+	let rows = || {
+		HashMap::from([(
+			"a.txt".to_string(),
+			BaselineEntry {
+				state: BaselineState::Conflicted,
+				..carried_rows().remove("a.txt").unwrap()
+			},
+		)])
+	};
+	let edited = || vec![local_file("a.txt", Blake3Hash::from([9; 32]))];
+	let passes = [
+		prepared(
+			SyncMode::TwoWay,
+			rows(),
+			edited(),
+			view(
+				vec![remote_file("a.txt", bad, Blake3Hash::from([2; 32]), 4)],
+				Vec::new(),
+				&[],
+			),
+			HashMap::from([("a.txt".to_string(), mismatch(bad))]),
+		),
+		unplaced_scoped_marked_pass(SyncMode::TwoWay, rows(), edited()),
+	];
+	for mut prep in passes {
+		prep.release_changed_mismatches();
+		assert_eq!(
+			prep.released_mismatches,
+			vec![("a.txt".to_string(), bad_version(bad))]
+		);
+		assert!(prep.unsyncable().is_empty());
+		assert!(
+			reconcile_and_screen_resident(&prep, screen_state(&prep))
+				.conflicts
+				.iter()
+				.any(|conflict| conflict.rel_path == "a.txt")
+		);
+	}
+}
+
+/// A two-way pair holding a local edit of `a.txt` as a conflict over a remote version that did not
+/// match its hash, as the pass that decided it leaves it on an account that keeps no old versions.
+/// Nothing has run since, so the mark is still in the store beside the conflict. The pass's read and
+/// its row are run on their own, with the setting's answer handed in: this client cannot read it,
+/// and a whole pass starts a cache worker it cannot converge, so no dry run would plan after it.
+/// With the directory everything is in and the cache, which must outlive the engine's reads.
+async fn conflict_just_held_over_a_damaged_version()
+-> (tempfile::TempDir, SyncEngine, PairId, PathBuf, CacheState) {
+	let dir = tempfile::tempdir().unwrap();
+	let local = dir.path().join("local");
+	std::fs::create_dir(&local).unwrap();
+	std::fs::write(local.join("a.txt"), DAMAGED_VERSION_EDIT).unwrap();
+	let (account, remote_root) = (Uuid::from_u128(1), Uuid::from_u128(2));
+	let (synced, bad) = (Uuid::from_u128(3), Uuid::from_u128(4));
+	let cache = dir.path().join("cache.db");
+	let mut state = CacheState::new_on_path(&cache, account);
+	state
+		.upsert_dirs([&cacheable_dir(remote_root, account, "pair")].into_iter())
+		.unwrap();
+	let marked = CacheableFile {
+		hash: Some(Blake3Hash::from([2; 32])),
+		..cacheable_file(bad, remote_root, "a.txt")
+	};
+	state.upsert_files([&marked].into_iter()).unwrap();
+	state.add_converged_roots(&[remote_root]).unwrap();
+	let client = Arc::new(offline_client());
+	client.configure_cache(cache, |_| {}).await.unwrap();
+	let engine = SyncEngine::open(client, dir.path().join("sync.db"))
+		.await
+		.unwrap();
+	let (pair, _) = locked(&engine.control)
+		.create_pair(local.to_str().unwrap(), remote_root, SyncMode::TwoWay)
+		.unwrap();
+	{
+		let store = engine.pair_store(pair).await.unwrap();
+		let store = locked(&store);
+		let row = BaselineEntry {
+			remote_modified: Some(0),
+			size: Some(6),
+			..file_row(
+				"a.txt",
+				synced,
+				Blake3Hash::from(*blake3::hash(b"synced").as_bytes()),
+			)
+		};
+		store.upsert_entry(pair, &row).unwrap();
+		store
+			.record_mismatch(pair, "a.txt", bad_version(bad), "does not match", 0)
+			.unwrap();
+	}
+
+	let mut read = engine
+		.read_pass(pair, None, Seeding::Preview, &Arc::default())
+		.await
+		.unwrap();
+	read.release_changed_mismatches();
+	read.settle_marked_edits(Ok(false));
+	assert_eq!(
+		reconcile_and_screen_resident(&read, screen_state(&read))
+			.conflicts
+			.iter()
+			.map(|conflict| conflict.rel_path.as_str())
+			.collect::<Vec<_>>(),
+		["a.txt"]
+	);
+	apply::record_conflict(
+		&engine.pair_store(pair).await.unwrap(),
+		pair,
+		"a.txt",
+		read.local_scan
+			.nodes
+			.of(&read.baseline)
+			.at("a.txt")
+			.as_deref(),
+		read.remote_view
+			.nodes
+			.of(&read.baseline)
+			.at("a.txt")
+			.as_deref(),
+	)
+	.await
+	.unwrap();
+	assert_eq!(
+		marked_paths(&engine, pair).await,
+		["a.txt"],
+		"only the next pass forgets the mark"
+	);
+	(dir, engine, pair, local, state)
+}
+
+/// What the file holds in [`conflict_just_held_over_a_damaged_version`].
+const DAMAGED_VERSION_EDIT: &[u8] = b"the edit made since the last sync";
+
+/// The paths `pair`'s failure rows are at that carry a hash mismatch's mark.
+async fn marked_paths(engine: &SyncEngine, pair: PairId) -> Vec<String> {
+	let store = engine.pair_store(pair).await.unwrap();
+	let mut marked: Vec<String> = locked(&store)
+		.failures(pair)
+		.unwrap()
+		.into_iter()
+		.filter(|(_, failure)| failure.mismatched.is_some())
+		.map(|(path, _)| path)
+		.collect();
+	marked.sort_unstable();
+	marked
+}
+
+/// What a dry run of `pair` plans, by kind and path, in path order.
+async fn planned(engine: &SyncEngine, pair: PairId) -> Vec<(PlannedActionKind, String)> {
+	let outcome = engine.plan_pair(pair).await.unwrap();
+	assert_eq!(outcome.conflicts, [], "{outcome:?}");
+	let mut planned: Vec<(PlannedActionKind, String)> = outcome
+		.actions
+		.into_iter()
+		.map(|action| (action.kind, action.rel_path))
+		.collect();
+	planned.sort_by(|a, b| a.1.cmp(&b.1));
+	planned
+}
+
+/// Keeping the local side before any further pass uploads the edit. The row it writes records no
+/// local content, so the mark left in the store would read it as no edit at all and drop the upload.
+#[tokio::test]
+async fn keeping_local_right_after_the_conflict_over_a_damaged_version_uploads_the_edit() {
+	let (_dir, engine, pair, local, _cache) = conflict_just_held_over_a_damaged_version().await;
+	let resolved = engine
+		.resolve_conflict(pair, "a.txt", ConflictResolution::KeepLocal)
+		.await
+		.unwrap();
+	assert_eq!(resolved, ConflictResolved::default());
+	assert_eq!(
+		planned(&engine, pair).await,
+		[(PlannedActionKind::UploadFile, "a.txt".to_string())]
+	);
+	assert_eq!(marked_paths(&engine, pair).await, Vec::<String>::new());
+	assert_eq!(
+		std::fs::read(local.join("a.txt")).unwrap(),
+		DAMAGED_VERSION_EDIT
+	);
+}
+
+/// Keeping the remote side before any further pass moves the edit to the bin and pulls the version,
+/// whose download finds the mismatch again.
+#[tokio::test]
+async fn keeping_remote_right_after_the_conflict_over_a_damaged_version_pulls_the_version() {
+	let (_dir, engine, pair, local, _cache) = conflict_just_held_over_a_damaged_version().await;
+	let quarantined = engine
+		.resolve_conflict(pair, "a.txt", ConflictResolution::KeepRemote)
+		.await
+		.unwrap()
+		.quarantined
+		.expect("the edit goes to the bin");
+	assert_eq!(std::fs::read(quarantined).unwrap(), DAMAGED_VERSION_EDIT);
+	assert!(!local.join("a.txt").exists());
+	assert_eq!(
+		planned(&engine, pair).await,
+		[(PlannedActionKind::DownloadFile, "a.txt".to_string())]
+	);
+	assert_eq!(marked_paths(&engine, pair).await, Vec::<String>::new());
+}
+
+/// Keeping both sides before any further pass uploads the copy renamed aside and pulls the version,
+/// whose download finds the mismatch again.
+#[tokio::test]
+async fn keeping_both_right_after_the_conflict_over_a_damaged_version_uploads_the_aside_copy() {
+	let (_dir, engine, pair, local, _cache) = conflict_just_held_over_a_damaged_version().await;
+	let resolved = engine
+		.resolve_conflict(pair, "a.txt", ConflictResolution::KeepBoth)
+		.await
+		.unwrap();
+	assert_eq!(
+		resolved,
+		ConflictResolved {
+			quarantined: None,
+			kept_as: Some("a.old.txt".to_string()),
+		}
+	);
+	assert_eq!(
+		std::fs::read(local.join("a.old.txt")).unwrap(),
+		DAMAGED_VERSION_EDIT
+	);
+	assert_eq!(
+		planned(&engine, pair).await,
+		[
+			(PlannedActionKind::UploadFile, "a.old.txt".to_string()),
+			(PlannedActionKind::DownloadFile, "a.txt".to_string()),
+		]
+	);
+	assert_eq!(marked_paths(&engine, pair).await, Vec::<String>::new());
+}
+
+/// The conflict shape this engine's own upload leaves ends the mark the same way: the row goes, so
+/// nothing is left that says the path is waiting for anyone.
+#[tokio::test]
+async fn resolving_an_overwritten_row_ends_the_mark_at_its_path() {
+	let dir = tempfile::tempdir().unwrap();
+	let (engine, pair, _cache) = engine_with_a_converged_pair(dir.path()).await;
+	let store = engine.pair_store(pair).await.unwrap();
+	let bad = Uuid::from_u128(4);
+	{
+		let store = locked(&store);
+		let row = BaselineEntry {
+			state: BaselineState::Overwritten,
+			..converged_conflict(Uuid::from_u128(3))
+		};
+		store.upsert_entry(pair, &row).unwrap();
+		store
+			.record_mismatch(pair, "a.txt", bad_version(bad), "does not match", 0)
+			.unwrap();
+	}
+	engine
+		.resolve_conflict(pair, "a.txt", ConflictResolution::KeepLocal)
+		.await
+		.unwrap();
+	assert_eq!(locked(&store).entry(pair, "a.txt").unwrap(), None);
+	assert_eq!(marked_paths(&engine, pair).await, Vec::<String>::new());
+}
+
+/// A remote folder sent to the trash takes a marked file in it along: the file is gone from the
+/// view, which ends its mark, and the folder's deletion goes on as any other, into the bin.
+#[test]
+fn a_parent_folders_remote_trash_takes_a_marked_file_with_it() {
+	let (dir, bad) = (Uuid::from_u128(5), Uuid::from_u128(2));
+	let hash = Blake3Hash::from([1; 32]);
+	let mut prep = prepared(
+		SyncMode::RemoteToLocal,
+		HashMap::from([
+			("docs".to_string(), dir_row("docs", dir)),
+			(
+				"docs/a.txt".to_string(),
+				file_row("docs/a.txt", Uuid::from_u128(1), hash),
+			),
+			(
+				"keep.txt".to_string(),
+				file_row("keep.txt", Uuid::from_u128(6), hash),
+			),
+		]),
+		vec![
+			local_dir("docs"),
+			local_file("docs/a.txt", hash),
+			local_file("keep.txt", hash),
+		],
+		view(
+			vec![remote_file("keep.txt", Uuid::from_u128(6), hash, 4)],
+			Vec::new(),
+			&[],
+		),
+		HashMap::from([("docs/a.txt".to_string(), mismatch(bad))]),
+	);
+	prep.fold_dir_moves().unwrap();
+	prep.release_changed_mismatches();
+	assert_eq!(
+		prep.released_mismatches,
+		vec![("docs/a.txt".to_string(), bad_version(bad))]
+	);
+	let screened = screened_both(&mut prep);
+	assert_eq!(
+		screened.decision.safe,
+		vec![
+			SyncAction::DeleteLocal {
+				rel_path: "docs/a.txt".to_string(),
+				kind: NodeKind::File,
+			},
+			SyncAction::DeleteLocal {
+				rel_path: "docs".to_string(),
+				kind: NodeKind::Dir,
+			},
+		]
+	);
+}
+
+/// Clearing a failure row leaves the next pass nothing narrow to plan a mismatched path from, so it
+/// reads both sides whole.
+#[tokio::test]
+async fn a_retry_makes_the_next_pass_read_both_sides_whole() {
+	let dir = tempfile::tempdir().unwrap();
+	let (engine, pair, _) = engine_with_a_converged_pair(dir.path()).await;
+	let changes = engine.pair_changes(pair).await;
+	changes.cover_local();
+	changes.take();
+	assert!(!changes.full_pending());
+
+	engine.retry_path(pair, "a.txt").await.unwrap();
+	assert!(changes.full_pending());
+	changes.take();
+
+	engine.retry_all(pair).await.unwrap();
+	assert!(changes.full_pending());
+}
+
+/// What is not an edit made since the last sync leaves the skip in place in two-way, and in the
+/// modes that pull from the remote nothing is: a file only touched, a local deletion (which must
+/// not trash the remote file), a directory at the path, a row that records no content, one adopted
+/// at a mode switch, and a local file not hashed.
+#[test]
+fn what_is_no_local_edit_since_the_last_sync_stays_skipped() {
+	let bad = Uuid::from_u128(2);
+	let synced_hash = Blake3Hash::from([1; 32]);
+	let touched = LocalNode {
+		mtime_millis: 5_000,
+		..local_file("a.txt", synced_hash)
+	};
+	let unhashed = LocalNode {
+		content_hash: None,
+		..local_file("a.txt", Blake3Hash::from([9; 32]))
+	};
+	let assert_skipped = |mut prep: Prepared, why: &str| {
+		prep.fold_dir_moves().unwrap();
+		prep.release_changed_mismatches();
+		assert!(prep.released_mismatches.is_empty(), "{why}");
+		assert!(prep.holds.marked_exits.is_empty(), "{why}");
+		assert_eq!(
+			prep.failures["a.txt"].mismatched,
+			Some(bad_version(bad)),
+			"{why}"
+		);
+		assert_eq!(
+			prep.unsyncable(),
+			vec![UnsyncablePath {
+				rel_path: "a.txt".to_string(),
+				reason: UnsyncableReason::RemoteContentHashMismatch {
+					last_error: "the content does not match its hash".to_string(),
+				},
+			}],
+			"{why}"
+		);
+		let screened = screened_both(&mut prep);
+		assert!(
+			screened.decision.safe.is_empty(),
+			"{why}: {:?}",
+			screened.decision.safe
+		);
+		assert!(
+			screened.decision.held.is_empty(),
+			"{why}: {:?}",
+			screened.decision.held
+		);
+		assert!(
+			screened.conflicts.is_empty(),
+			"{why}: {:?}",
+			screened.conflicts
+		);
+		assert_eq!(screened.dropped, 0, "{why}");
+	};
+	for (why, local) in [
+		("touched", vec![touched]),
+		("deleted", Vec::new()),
+		("a directory", vec![local_dir("a.txt")]),
+		("unhashed", vec![unhashed]),
+	] {
+		assert_skipped(marked_pass(SyncMode::TwoWay, local, mismatch(bad)), why);
+	}
+	let edited = || vec![local_file("a.txt", Blake3Hash::from([9; 32]))];
+	for mode in [SyncMode::RemoteToLocal, SyncMode::RemoteBackup] {
+		assert_skipped(
+			marked_pass(mode, edited(), mismatch(bad)),
+			&format!("{mode:?}"),
+		);
+	}
+	for row in [
+		BaselineEntry {
+			content_hash: None,
+			..file_row("a.txt", Uuid::from_u128(1), synced_hash)
+		},
+		BaselineEntry {
+			state: BaselineState::Adopted,
+			..file_row("a.txt", Uuid::from_u128(1), synced_hash)
+		},
+	] {
+		let why = format!("{:?} with hash {:?}", row.state, row.content_hash);
+		assert_skipped(
+			prepared(
+				SyncMode::TwoWay,
+				HashMap::from([("a.txt".to_string(), row)]),
+				edited(),
+				view(
+					vec![remote_file("a.txt", bad, Blake3Hash::from([2; 32]), 4)],
+					Vec::new(),
+					&[],
+				),
+				HashMap::from([("a.txt".to_string(), mismatch(bad))]),
+			),
+			&why,
+		);
+	}
+}
+
+/// The upload over a damaged version is an ordinary action to the failure streaks: the mark stays
+/// until it lands, so one that failed is tried again rather than read as a conflict, and a streak of
+/// them blocks the path, reported as what it is and counted as a drop, until its interval runs out.
+#[test]
+fn failed_uploads_over_a_damaged_remote_file_are_a_failure_streak() {
+	let bad = Uuid::from_u128(2);
+	let edited = || vec![local_file("a.txt", Blake3Hash::from([9; 32]))];
+	let failed = |attempts, last_failure_at| PathFailure {
+		attempts,
+		last_error: "the upload failed".to_string(),
+		last_failure_at,
+		mismatched: Some(bad_version(bad)),
+	};
+
+	let mut retried = marked_pass(SyncMode::TwoWay, edited(), failed(2, 0));
+	retried.release_changed_mismatches();
+	assert!(retried.unsyncable().is_empty());
+	assert_eq!(
+		screened_both(&mut retried).decision.safe,
+		vec![SyncAction::UploadFile {
+			rel_path: "a.txt".to_string(),
+		}]
+	);
+
+	let mut blocked = marked_pass(
+		SyncMode::TwoWay,
+		edited(),
+		failed(MAX_PATH_FAILURES, Utc::now().timestamp_millis()),
+	);
+	blocked.release_changed_mismatches();
+	assert_eq!(
+		blocked.unsyncable(),
+		vec![UnsyncablePath {
+			rel_path: "a.txt".to_string(),
+			reason: UnsyncableReason::RepeatedFailure {
+				attempts: MAX_PATH_FAILURES,
+				last_error: "the upload failed".to_string(),
+			},
+		}]
+	);
+	let screened = screened_both(&mut blocked);
+	assert!(
+		screened.decision.safe.is_empty(),
+		"{:?}",
+		screened.decision.safe
+	);
+	assert!(screened.conflicts.is_empty(), "{:?}", screened.conflicts);
+	assert_eq!(screened.dropped, 1);
+
+	let mut expired = marked_pass(SyncMode::TwoWay, edited(), failed(MAX_PATH_FAILURES, 0));
+	expired.release_changed_mismatches();
+	assert_eq!(
+		screened_both(&mut expired).decision.safe,
+		vec![SyncAction::UploadFile {
+			rel_path: "a.txt".to_string(),
+		}]
+	);
+}
+
+/// An upload that landed ends the path's row, mark and all, and one that failed leaves it.
+#[test]
+fn the_mark_ends_with_the_upload_that_landed_over_it() {
+	let ends = || vec![("a.txt".to_string(), "a.txt".to_string())];
+	let landed = SyncReport {
+		landed: vec!["a.txt".to_string()],
+		..SyncReport::default()
+	};
+	assert_eq!(cleared_streaks(ends(), &landed), vec!["a.txt".to_string()]);
+	let failed = SyncReport {
+		failed_paths: vec![("a.txt".to_string(), "the upload failed".to_string())],
+		..SyncReport::default()
+	};
+	assert!(cleared_streaks(ends(), &failed).is_empty());
+}
+
+/// The version an upload over a damaged file meant to replace is no interleaved edit, while one
+/// that landed after the pass read the path is, which is what the upload then holds as a conflict.
+#[test]
+fn an_upload_over_a_damaged_version_accepts_it_and_reports_any_later_one() {
+	let (bad, ours, later) = (Uuid::from_u128(2), Uuid::from_u128(3), Uuid::from_u128(4));
+	let at = |seconds| chrono::DateTime::from_timestamp(seconds, 0).unwrap();
+	assert_eq!(
+		plan::interleaved_version(&[(bad, at(10)), (ours, at(20))], ours, bad),
+		None
+	);
+	assert_eq!(
+		plan::interleaved_version(&[(bad, at(10)), (later, at(15)), (ours, at(20))], ours, bad),
+		Some(later)
+	);
 }
 
 /// `a.txt` and `b.txt` uploaded, and `docs` trashed with the two files under it folded in,
@@ -5388,6 +7107,17 @@ fn a_restoration_lands_only_on_a_whole_clean_pass_that_deletes_nothing() {
 			"a failed download",
 			SyncReport {
 				failed_paths: vec![("top.txt".to_string(), "404".to_string())],
+				..clean.clone()
+			},
+		),
+		(
+			"a download that did not match its hash",
+			SyncReport {
+				mismatched: vec![MismatchedDownload {
+					rel_path: "top.txt".to_string(),
+					version: bad_version(Uuid::from_u128(1)),
+					error: "mismatch".to_string(),
+				}],
 				..clean.clone()
 			},
 		),

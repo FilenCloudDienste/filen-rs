@@ -3,9 +3,9 @@
 //! internals. Lives in the separate integration-test crate, which can only reach `pub` items.
 //!
 //! Run: `cargo test -p filen-sdk-rs --features sync-engine-live-tests --test sync_engine_blackbox_tests`
-//! (needs `.env` with TEST_EMAIL / TEST_PASSWORD). One test (`remote_case_collision_held_back`)
-//! additionally needs the `malformed` feature to construct its precondition: run the suite with
-//! `-F sync-engine-live-tests,malformed` to include it.
+//! (needs `.env` with TEST_EMAIL / TEST_PASSWORD). `remote_case_collision_held_back` and the tests
+//! of a remote file not matching its hash additionally need the `malformed` feature to construct
+//! their preconditions: run the suite with `-F sync-engine-live-tests,malformed` to include them.
 
 use std::{borrow::Cow, path::PathBuf, sync::Arc, time::Duration};
 
@@ -19,6 +19,14 @@ use filen_sdk_rs::{
 		file::meta::FileMetaChanges,
 	},
 	sync_engine::{SyncEngine, SyncMode},
+};
+// Only the hash-mismatch tests, which need the `malformed` seam, read these.
+#[cfg(feature = "malformed")]
+use filen_sdk_rs::fs::file::traits::HasRemoteFileInfo;
+#[cfg(feature = "malformed")]
+use filen_sdk_rs::sync_engine::{
+	ConflictResolution, PlannedAction, PlannedActionKind, SyncEvent, SyncReport, UnsyncablePath,
+	UnsyncableReason,
 };
 use uuid::Uuid;
 
@@ -1214,6 +1222,763 @@ async fn remote_case_collision_held_back() {
 		"neither colliding name may be created locally: {report:?}"
 	);
 
+	fx.cleanup();
+}
+
+/// The BLAKE3 the cache lists the file `uuid` with, as the lowercase hex it stores, or `None` when
+/// it lists none or no such file.
+#[cfg(feature = "malformed")]
+fn cached_hash(db: &std::path::Path, uuid: Uuid) -> Option<String> {
+	open_read_db(db)
+		.ok()?
+		.query_row(
+			"SELECT f.hash FROM items i JOIN files f ON f.id = i.id WHERE i.uuid = ?",
+			rusqlite::params![uuid],
+			|row| row.get(0),
+		)
+		.ok()
+		.flatten()
+}
+
+/// A remote file whose content does not match the hash its metadata declares is not downloaded:
+/// it is reported on its own on every pass, the local copy at its path stays as it was (put back
+/// after the download moved it aside, then never touched again), and once the file is uploaded
+/// afresh the path syncs as usual.
+#[cfg(feature = "malformed")]
+#[shared_test_runtime]
+async fn a_remote_file_not_matching_its_hash_is_skipped_until_it_changes() {
+	let fx = Fixture::new().await;
+	fx.wait_initial_converged().await;
+	let mut bad = upload_remote(&fx, "bad.txt", b"the bytes the uploader wrote").await;
+	let wrong = blake3::hash(b"other bytes");
+	fx.client
+		.replace_file_hash(&mut bad, wrong.into())
+		.await
+		.unwrap();
+	let db = fx.db_path().to_path_buf();
+	let bad_uuid: Uuid = bad.uuid();
+	assert!(
+		poll_until(CACHE_CONVERGE_TIMEOUT, || {
+			cached_hash(&db, bad_uuid).as_deref() == Some(wrong.to_hex().as_str())
+		})
+		.await,
+		"the cache never listed the file with the hash it was given"
+	);
+	// A copy no pass ever synced, so the download moves it aside first.
+	let local_copy = b"the local copy";
+	write_local(&fx.local, "bad.txt", local_copy);
+
+	let engine = fx.open_engine().await;
+	let pair = engine
+		.add_pair(fx.local.clone(), fx.remote_uuid, SyncMode::RemoteToLocal)
+		.await
+		.unwrap();
+	let skipped = |report: &SyncReport| {
+		report
+			.unsyncable
+			.iter()
+			.filter(|path| {
+				matches!(
+					path.reason,
+					UnsyncableReason::RemoteContentHashMismatch { .. }
+				)
+			})
+			.map(|path| path.rel_path.clone())
+			.collect::<Vec<_>>()
+	};
+
+	let first = engine.sync_once(pair).await.unwrap();
+	assert_eq!(first.downloaded, 0, "{first:?}");
+	assert_eq!(skipped(&first), ["bad.txt"], "{first:?}");
+	assert_eq!(first.errors.len(), 1, "{first:?}");
+	assert!(first.errors[0].starts_with("bad.txt: "), "{first:?}");
+	assert!(first.quarantined.is_empty(), "{first:?}");
+	assert_eq!(read_local(&fx.local, "bad.txt"), local_copy);
+
+	let second = engine.sync_once(pair).await.unwrap();
+	assert_eq!(second.downloaded, 0, "{second:?}");
+	assert_eq!(skipped(&second), ["bad.txt"], "{second:?}");
+	assert!(second.errors.is_empty(), "nothing is attempted: {second:?}");
+	assert!(second.quarantined.is_empty(), "{second:?}");
+	assert_eq!(read_local(&fx.local, "bad.txt"), local_copy);
+
+	// A fresh upload versions the file: a new uuid, whose content matches its hash.
+	let fixed = b"the bytes uploaded afresh";
+	let fixed_uuid: Uuid = upload_remote(&fx, "bad.txt", fixed).await.uuid();
+	let fixed_hash = blake3::hash(fixed);
+	assert!(
+		poll_until(CACHE_CONVERGE_TIMEOUT, || {
+			cached_hash(&db, fixed_uuid).as_deref() == Some(fixed_hash.to_hex().as_str())
+				&& query_cached_file(&db, fixed_uuid).map(|file| file.1)
+					== Some(i64::try_from(fixed.len()).unwrap())
+		})
+		.await,
+		"the cache never listed the new version"
+	);
+
+	let third = engine.sync_once(pair).await.unwrap();
+	assert_eq!(third.downloaded, 1, "{third:?}");
+	assert!(skipped(&third).is_empty(), "{third:?}");
+	assert_eq!(read_local(&fx.local, "bad.txt"), fixed);
+	assert_eq!(
+		third.quarantined,
+		["bad.txt"],
+		"the copy no pass synced is moved aside for the download: {third:?}"
+	);
+
+	fx.cleanup();
+}
+
+/// In two-way, a synced file's new remote version that does not match its hash is skipped while the
+/// local copy stays what the last sync left, touched or not, and a local edit then goes up over it:
+/// a dry run shows the upload and changes nothing, the real pass uploads it, keeps the damaged
+/// version in the file's history and ends the skip, and the pass after it has nothing to do.
+#[cfg(feature = "malformed")]
+#[shared_test_runtime]
+async fn a_local_edit_uploads_over_a_remote_file_not_matching_its_hash() {
+	let fx = Fixture::new().await;
+	fx.wait_initial_converged().await;
+	let _versioning_lock = fx
+		.client
+		.acquire_lock_with_default(test_utils::locks::USER_VERSIONING)
+		.await
+		.unwrap();
+	fx.client.set_versioning_enabled(true).await.unwrap();
+	let synced = b"the content both sides synced";
+	let first = upload_remote(&fx, "bad.txt", synced).await;
+	let db = fx.db_path().to_path_buf();
+	let (first_uuid, synced_hash): (Uuid, _) = (first.uuid(), blake3::hash(synced));
+	assert!(
+		poll_until(CACHE_CONVERGE_TIMEOUT, || {
+			cached_hash(&db, first_uuid).as_deref() == Some(synced_hash.to_hex().as_str())
+		})
+		.await,
+		"the cache never listed the synced file"
+	);
+	let engine = fx.open_engine().await;
+	let pair = engine
+		.add_pair(fx.local.clone(), fx.remote_uuid, SyncMode::TwoWay)
+		.await
+		.unwrap();
+	let initial = engine.sync_once(pair).await.unwrap();
+	assert_eq!(initial.downloaded, 1, "{initial:?}");
+	assert_eq!(read_local(&fx.local, "bad.txt"), synced);
+
+	let mut bad = upload_remote(&fx, "bad.txt", b"the new version").await;
+	let wrong = blake3::hash(b"other bytes");
+	fx.client
+		.replace_file_hash(&mut bad, wrong.into())
+		.await
+		.unwrap();
+	let bad_uuid: Uuid = bad.uuid();
+	assert!(
+		poll_until(CACHE_CONVERGE_TIMEOUT, || {
+			cached_hash(&db, bad_uuid).as_deref() == Some(wrong.to_hex().as_str())
+		})
+		.await,
+		"the cache never listed the new version with the hash it was given"
+	);
+	let skipped = |unsyncable: &[UnsyncablePath]| {
+		unsyncable
+			.iter()
+			.filter(|path| {
+				matches!(
+					path.reason,
+					UnsyncableReason::RemoteContentHashMismatch { .. }
+				)
+			})
+			.map(|path| path.rel_path.clone())
+			.collect::<Vec<_>>()
+	};
+
+	let found = engine.sync_once(pair).await.unwrap();
+	assert_eq!(found.downloaded, 0, "{found:?}");
+	assert_eq!(skipped(&found.unsyncable), ["bad.txt"], "{found:?}");
+	assert_eq!(read_local(&fx.local, "bad.txt"), synced);
+
+	// What the failed download left, and a touch of it, are no local edits.
+	let left = engine.sync_once(pair).await.unwrap();
+	assert_eq!((left.uploaded, left.downloaded), (0, 0), "{left:?}");
+	assert_eq!(skipped(&left.unsyncable), ["bad.txt"], "{left:?}");
+	assert!(left.errors.is_empty(), "{left:?}");
+	std::fs::File::options()
+		.write(true)
+		.open(fx.local.join("bad.txt"))
+		.unwrap()
+		.set_modified(std::time::SystemTime::now() + Duration::from_secs(3_600))
+		.unwrap();
+	let touched = engine.sync_once(pair).await.unwrap();
+	assert_eq!(
+		(touched.uploaded, touched.downloaded),
+		(0, 0),
+		"{touched:?}"
+	);
+	assert_eq!(skipped(&touched.unsyncable), ["bad.txt"], "{touched:?}");
+	assert!(touched.conflicts.is_empty(), "{touched:?}");
+
+	let edit = b"the edit made since the last sync";
+	write_local(&fx.local, "bad.txt", edit);
+
+	for _ in 0..2 {
+		let dry = engine.plan_pair(pair).await.unwrap();
+		assert!(
+			matches!(
+				dry.actions.as_slice(),
+				[PlannedAction {
+					kind: PlannedActionKind::UploadFile,
+					rel_path,
+					..
+				}] if rel_path == "bad.txt"
+			),
+			"{dry:?}"
+		);
+		assert!(dry.conflicts.is_empty(), "{dry:?}");
+		assert!(skipped(&dry.unsyncable).is_empty(), "{dry:?}");
+	}
+
+	let replaced = engine.sync_once(pair).await.unwrap();
+	assert_eq!(replaced.uploaded, 1, "{replaced:?}");
+	assert_eq!(replaced.downloaded, 0, "{replaced:?}");
+	assert!(replaced.conflicts.is_empty(), "{replaced:?}");
+	assert!(replaced.errors.is_empty(), "{replaced:?}");
+	assert!(skipped(&replaced.unsyncable).is_empty(), "{replaced:?}");
+	assert_eq!(read_local(&fx.local, "bad.txt"), edit);
+
+	let (_dirs, files) = fx.list_remote_root().await;
+	let head = find_file(&files, "bad.txt").expect("the file stays at its path");
+	let head_uuid: Uuid = head.uuid();
+	assert_ne!(head_uuid, bad_uuid);
+	assert_eq!(head.hash(), Some(blake3::hash(edit).into()));
+	let versions = fx.client.list_file_versions(head).await.unwrap();
+	assert!(
+		versions.iter().any(|version| version.uuid() == bad_uuid),
+		"the damaged version stays in the file's history"
+	);
+
+	let settled = engine.sync_once(pair).await.unwrap();
+	assert_eq!(
+		(settled.uploaded, settled.downloaded),
+		(0, 0),
+		"{settled:?}"
+	);
+	assert!(settled.conflicts.is_empty(), "{settled:?}");
+	assert!(settled.errors.is_empty(), "{settled:?}");
+	assert!(skipped(&settled.unsyncable).is_empty(), "{settled:?}");
+
+	fx.cleanup();
+}
+
+/// What [`local_edit_held_over_a_damaged_version`] leaves in the local `bad.txt`.
+#[cfg(feature = "malformed")]
+const EDIT_OVER_A_DAMAGED_VERSION: &[u8] = b"the edit made since the last sync";
+
+/// With versioning off, take a synced file's local edit over a new remote version not matching its
+/// hash to the pass that holds it as a conflict, instead of uploading it: the upload would lose
+/// that version for good. Nothing has run since that pass. The caller holds the versioning lock and
+/// turns the setting back on.
+#[cfg(feature = "malformed")]
+async fn local_edit_held_over_a_damaged_version(fx: &Fixture) -> (SyncEngine, i64) {
+	fx.wait_initial_converged().await;
+	fx.client.set_versioning_enabled(false).await.unwrap();
+	let synced = b"the content both sides synced";
+	let first = upload_remote(fx, "bad.txt", synced).await;
+	let db = fx.db_path().to_path_buf();
+	let (first_uuid, synced_hash): (Uuid, _) = (first.uuid(), blake3::hash(synced));
+	assert!(
+		poll_until(CACHE_CONVERGE_TIMEOUT, || {
+			cached_hash(&db, first_uuid).as_deref() == Some(synced_hash.to_hex().as_str())
+		})
+		.await,
+		"the cache never listed the synced file"
+	);
+	let engine = fx.open_engine().await;
+	let pair = engine
+		.add_pair(fx.local.clone(), fx.remote_uuid, SyncMode::TwoWay)
+		.await
+		.unwrap();
+	let initial = engine.sync_once(pair).await.unwrap();
+	assert_eq!(initial.downloaded, 1, "{initial:?}");
+
+	let mut bad = upload_remote(fx, "bad.txt", b"the new version").await;
+	let wrong = blake3::hash(b"other bytes");
+	fx.client
+		.replace_file_hash(&mut bad, wrong.into())
+		.await
+		.unwrap();
+	let bad_uuid: Uuid = bad.uuid();
+	assert!(
+		poll_until(CACHE_CONVERGE_TIMEOUT, || {
+			cached_hash(&db, bad_uuid).as_deref() == Some(wrong.to_hex().as_str())
+		})
+		.await,
+		"the cache never listed the new version with the hash it was given"
+	);
+	let found = engine.sync_once(pair).await.unwrap();
+	assert_eq!(
+		skipped_for_hash(&found.unsyncable),
+		["bad.txt"],
+		"{found:?}"
+	);
+
+	write_local(&fx.local, "bad.txt", EDIT_OVER_A_DAMAGED_VERSION);
+	let dry = engine.plan_pair(pair).await.unwrap();
+	assert!(dry.actions.is_empty(), "{dry:?}");
+	assert_eq!(dry.conflicts.len(), 1, "{dry:?}");
+
+	let held = engine.sync_once(pair).await.unwrap();
+	assert_eq!((held.uploaded, held.downloaded), (0, 0), "{held:?}");
+	assert_eq!(
+		held.conflicts
+			.iter()
+			.map(|conflict| conflict.rel_path.as_str())
+			.collect::<Vec<_>>(),
+		["bad.txt"],
+		"{held:?}"
+	);
+	assert_eq!(
+		read_local(&fx.local, "bad.txt"),
+		EDIT_OVER_A_DAMAGED_VERSION
+	);
+	let (_dirs, files) = fx.list_remote_root().await;
+	let head = find_file(&files, "bad.txt").expect("the file stays at its path");
+	let head_uuid: Uuid = head.uuid();
+	assert_eq!(head_uuid, bad_uuid, "nothing went up over it");
+	(engine, pair)
+}
+
+/// The conflict is what the pair reports from then on, the version stays the file's head until the
+/// user decides, and keeping the local side uploads the edit.
+#[cfg(feature = "malformed")]
+#[shared_test_runtime]
+async fn a_local_edit_over_a_damaged_version_is_a_conflict_with_versioning_off() {
+	let fx = Fixture::new().await;
+	let _versioning_lock = fx
+		.client
+		.acquire_lock_with_default(test_utils::locks::USER_VERSIONING)
+		.await
+		.unwrap();
+	let (engine, pair) = local_edit_held_over_a_damaged_version(&fx).await;
+
+	let still = engine.sync_once(pair).await.unwrap();
+	assert_eq!((still.uploaded, still.downloaded), (0, 0), "{still:?}");
+	assert_eq!(still.conflicts.len(), 1, "{still:?}");
+	assert!(skipped_for_hash(&still.unsyncable).is_empty(), "{still:?}");
+
+	engine
+		.resolve_conflict(pair, "bad.txt", ConflictResolution::KeepLocal)
+		.await
+		.unwrap();
+	let resolved = engine.sync_once(pair).await.unwrap();
+	assert_eq!(resolved.uploaded, 1, "{resolved:?}");
+	assert!(resolved.conflicts.is_empty(), "{resolved:?}");
+	let (_dirs, files) = fx.list_remote_root().await;
+	let head = find_file(&files, "bad.txt").expect("the file stays at its path");
+	assert_eq!(
+		head.hash(),
+		Some(blake3::hash(EDIT_OVER_A_DAMAGED_VERSION).into())
+	);
+
+	fx.client.set_versioning_enabled(true).await.unwrap();
+	fx.cleanup();
+}
+
+/// Keeping the local side with no pass since the one that held the conflict uploads the edit: the
+/// hash mismatch's mark does not outlive the resolution.
+#[cfg(feature = "malformed")]
+#[shared_test_runtime]
+async fn keeping_local_right_after_the_conflict_over_a_damaged_version_uploads_the_edit() {
+	let fx = Fixture::new().await;
+	let _versioning_lock = fx
+		.client
+		.acquire_lock_with_default(test_utils::locks::USER_VERSIONING)
+		.await
+		.unwrap();
+	let (engine, pair) = local_edit_held_over_a_damaged_version(&fx).await;
+
+	engine
+		.resolve_conflict(pair, "bad.txt", ConflictResolution::KeepLocal)
+		.await
+		.unwrap();
+	let resolved = engine.sync_once(pair).await.unwrap();
+	assert_eq!(resolved.uploaded, 1, "{resolved:?}");
+	assert!(resolved.conflicts.is_empty(), "{resolved:?}");
+	assert!(
+		skipped_for_hash(&resolved.unsyncable).is_empty(),
+		"{resolved:?}"
+	);
+	let (_dirs, files) = fx.list_remote_root().await;
+	let head = find_file(&files, "bad.txt").expect("the file stays at its path");
+	assert_eq!(
+		head.hash(),
+		Some(blake3::hash(EDIT_OVER_A_DAMAGED_VERSION).into())
+	);
+
+	fx.client.set_versioning_enabled(true).await.unwrap();
+	fx.cleanup();
+}
+
+/// Keeping the remote side with no pass since the one that held the conflict moves the edit to the
+/// bin and downloads the version, which finds the mismatch again and skips the path from then on.
+#[cfg(feature = "malformed")]
+#[shared_test_runtime]
+async fn keeping_remote_right_after_the_conflict_over_a_damaged_version_marks_the_version_again() {
+	let fx = Fixture::new().await;
+	let _versioning_lock = fx
+		.client
+		.acquire_lock_with_default(test_utils::locks::USER_VERSIONING)
+		.await
+		.unwrap();
+	let (engine, pair) = local_edit_held_over_a_damaged_version(&fx).await;
+
+	let quarantined = engine
+		.resolve_conflict(pair, "bad.txt", ConflictResolution::KeepRemote)
+		.await
+		.unwrap()
+		.quarantined
+		.expect("the edit goes to the bin");
+	assert_eq!(
+		std::fs::read(quarantined).unwrap(),
+		EDIT_OVER_A_DAMAGED_VERSION
+	);
+	let pulled = engine.sync_once(pair).await.unwrap();
+	assert_eq!((pulled.uploaded, pulled.downloaded), (0, 0), "{pulled:?}");
+	assert!(!local_exists(&fx.local, "bad.txt"));
+	let skipped = engine.sync_once(pair).await.unwrap();
+	assert_eq!(
+		(skipped.uploaded, skipped.downloaded),
+		(0, 0),
+		"{skipped:?}"
+	);
+	assert_eq!(
+		skipped_for_hash(&skipped.unsyncable),
+		["bad.txt"],
+		"{skipped:?}"
+	);
+
+	fx.client.set_versioning_enabled(true).await.unwrap();
+	fx.cleanup();
+}
+
+/// Keeping both sides with no pass since the one that held the conflict uploads the copy renamed
+/// aside and downloads the version, which finds the mismatch again and skips the path from then on.
+#[cfg(feature = "malformed")]
+#[shared_test_runtime]
+async fn keeping_both_right_after_the_conflict_over_a_damaged_version_uploads_the_aside_copy() {
+	let fx = Fixture::new().await;
+	let _versioning_lock = fx
+		.client
+		.acquire_lock_with_default(test_utils::locks::USER_VERSIONING)
+		.await
+		.unwrap();
+	let (engine, pair) = local_edit_held_over_a_damaged_version(&fx).await;
+
+	engine
+		.resolve_conflict(pair, "bad.txt", ConflictResolution::KeepBoth)
+		.await
+		.unwrap();
+	let pulled = engine.sync_once(pair).await.unwrap();
+	assert_eq!((pulled.uploaded, pulled.downloaded), (1, 0), "{pulled:?}");
+	assert!(!local_exists(&fx.local, "bad.txt"));
+	let (_dirs, files) = fx.list_remote_root().await;
+	let aside = find_file(&files, "bad.old.txt").expect("the copy renamed aside goes up");
+	assert_eq!(
+		aside.hash(),
+		Some(blake3::hash(EDIT_OVER_A_DAMAGED_VERSION).into())
+	);
+	let skipped = engine.sync_once(pair).await.unwrap();
+	assert_eq!(
+		skipped_for_hash(&skipped.unsyncable),
+		["bad.txt"],
+		"{skipped:?}"
+	);
+
+	fx.client.set_versioning_enabled(true).await.unwrap();
+	fx.cleanup();
+}
+
+/// The paths a pass reports as skipped for a remote file that does not match its hash.
+#[cfg(feature = "malformed")]
+fn skipped_for_hash(unsyncable: &[UnsyncablePath]) -> Vec<String> {
+	unsyncable
+		.iter()
+		.filter(|path| {
+			matches!(
+				path.reason,
+				UnsyncableReason::RemoteContentHashMismatch { .. }
+			)
+		})
+		.map(|path| path.rel_path.clone())
+		.collect()
+}
+
+/// A running watch on `pair`, and every report it completes a pass with, in order.
+#[cfg(feature = "malformed")]
+async fn watch_reporting(
+	engine: &Arc<SyncEngine>,
+	pair: i64,
+) -> (
+	filen_sdk_rs::sync_engine::WatchHandle,
+	Arc<std::sync::Mutex<Vec<SyncReport>>>,
+) {
+	let reports = Arc::new(std::sync::Mutex::new(Vec::new()));
+	let handle = engine
+		.clone()
+		.watch_observed(pair, {
+			let reports = Arc::clone(&reports);
+			Box::new(move |event| {
+				if let SyncEvent::PassCompleted { report } = event {
+					reports.lock().unwrap().push(report);
+				}
+			})
+		})
+		.await
+		.unwrap();
+	(handle, reports)
+}
+
+/// Upload `name` to the remote root declaring a hash of other content, until the cache lists it so,
+/// and wait for a pass of the watch `reports` come from to skip it.
+#[cfg(feature = "malformed")]
+async fn damaged_upload_is_skipped(
+	fx: &Fixture,
+	name: &str,
+	reports: &std::sync::Mutex<Vec<SyncReport>>,
+) -> filen_sdk_rs::fs::file::RemoteFile {
+	let mut bad = upload_remote(fx, name, b"the bytes the uploader wrote").await;
+	let wrong = blake3::hash(b"other bytes");
+	fx.client
+		.replace_file_hash(&mut bad, wrong.into())
+		.await
+		.unwrap();
+	let skipped = poll_until(CACHE_CONVERGE_TIMEOUT, || {
+		reports
+			.lock()
+			.unwrap()
+			.last()
+			.is_some_and(|report| skipped_for_hash(&report.unsyncable) == [name])
+	})
+	.await;
+	assert!(skipped, "{:?}", reports.lock().unwrap());
+	bad
+}
+
+/// Upload `name` to the remote root to wake the watch `reports` come from, and return the report of
+/// the first change-scoped pass to complete after that. The pass the upload wakes reads whole in a
+/// tree smaller than a changelist's cap, and the local change it makes wakes a narrowed one.
+#[cfg(feature = "malformed")]
+async fn pass_woken_by_a_remote_file(
+	fx: &Fixture,
+	name: &str,
+	reports: &std::sync::Mutex<Vec<SyncReport>>,
+) -> SyncReport {
+	let seen = reports.lock().unwrap().len();
+	upload_remote(fx, name, b"a file that wakes the watch").await;
+	let scoped = |reports: &[SyncReport]| {
+		reports
+			.get(seen..)
+			.into_iter()
+			.flatten()
+			.find(|report| report.full_pass.is_none())
+			.cloned()
+	};
+	assert!(
+		poll_until(CACHE_CONVERGE_TIMEOUT, || {
+			scoped(&reports.lock().unwrap()).is_some()
+		})
+		.await,
+		"no change-scoped pass followed {name}: {:?}",
+		reports.lock().unwrap()
+	);
+	scoped(&reports.lock().unwrap()).expect("just found")
+}
+
+/// On a watched pair a change-scoped pass reads the remote file's mark like any other: the unsynced
+/// local copy at the path stays where it is and the path stays reported, and a new version of the
+/// file ends the skip at the pass it wakes.
+#[cfg(feature = "malformed")]
+#[shared_test_runtime]
+async fn a_watched_pairs_change_scoped_pass_keeps_the_skip_until_the_file_changes() {
+	let fx = Fixture::new().await;
+	fx.wait_initial_converged().await;
+	// A file that downloads, so the pair has a baseline for the watch's passes to narrow from.
+	let kept = upload_remote(&fx, "keep.txt", b"a file that syncs").await;
+	wait_cache_file_in_root(&fx, kept.uuid()).await;
+	let mut bad = upload_remote(&fx, "bad.txt", b"the bytes the uploader wrote").await;
+	let wrong = blake3::hash(b"other bytes");
+	fx.client
+		.replace_file_hash(&mut bad, wrong.into())
+		.await
+		.unwrap();
+	let (db, bad_uuid): (_, Uuid) = (fx.db_path().to_path_buf(), bad.uuid());
+	assert!(
+		poll_until(CACHE_CONVERGE_TIMEOUT, || {
+			cached_hash(&db, bad_uuid).as_deref() == Some(wrong.to_hex().as_str())
+		})
+		.await,
+		"the cache never listed the file with the hash it was given"
+	);
+	let local_copy = b"the local copy";
+	write_local(&fx.local, "bad.txt", local_copy);
+	let engine = Arc::new(fx.open_engine().await);
+	let pair = engine
+		.add_pair(fx.local.clone(), fx.remote_uuid, SyncMode::RemoteToLocal)
+		.await
+		.unwrap();
+	let (handle, reports) = watch_reporting(&engine, pair).await;
+	assert!(
+		poll_until(CACHE_CONVERGE_TIMEOUT, || {
+			reports
+				.lock()
+				.unwrap()
+				.last()
+				.is_some_and(|report| skipped_for_hash(&report.unsyncable) == ["bad.txt"])
+		})
+		.await,
+		"{:?}",
+		reports.lock().unwrap()
+	);
+
+	let scoped = pass_woken_by_a_remote_file(&fx, "wake.txt", &reports).await;
+	assert_eq!(
+		skipped_for_hash(&scoped.unsyncable),
+		["bad.txt"],
+		"{scoped:?}"
+	);
+	assert!(scoped.quarantined.is_empty(), "{scoped:?}");
+	assert!(scoped.errors.is_empty(), "nothing is attempted: {scoped:?}");
+	assert_eq!(read_local(&fx.local, "bad.txt"), local_copy);
+
+	let fixed = b"the bytes uploaded afresh";
+	upload_remote(&fx, "bad.txt", fixed).await;
+	assert!(
+		poll_until(CACHE_CONVERGE_TIMEOUT, || {
+			std::fs::read(fx.local.join("bad.txt")).is_ok_and(|bytes| bytes == fixed)
+		})
+		.await,
+		"the new version never came down: {:?}",
+		reports.lock().unwrap()
+	);
+
+	drop(handle);
+	fx.cleanup();
+}
+
+/// On a watched pair a marked file's deletion on the remote ends the skip at the pass it wakes: the
+/// removal names a version no row records, and the cache no longer listing it sends that pass to
+/// read both sides whole. The local copy then goes the way of any deleted file.
+#[cfg(feature = "malformed")]
+#[shared_test_runtime]
+async fn a_watched_pairs_marked_file_deleted_on_the_remote_ends_the_skip() {
+	let fx = Fixture::new().await;
+	fx.wait_initial_converged().await;
+	let engine = Arc::new(fx.open_engine().await);
+	let pair = engine
+		.add_pair(fx.local.clone(), fx.remote_uuid, SyncMode::TwoWay)
+		.await
+		.unwrap();
+	upload_remote(&fx, "bad.txt", b"the synced content").await;
+	let (handle, reports) = watch_reporting(&engine, pair).await;
+	assert!(
+		poll_until(CACHE_CONVERGE_TIMEOUT, || {
+			std::fs::read(fx.local.join("bad.txt"))
+				.is_ok_and(|bytes| bytes == b"the synced content")
+		})
+		.await,
+		"the first version never came down"
+	);
+	let mut bad = damaged_upload_is_skipped(&fx, "bad.txt", &reports).await;
+	// A change-scoped pass in between keeps it, so that what follows is a change-scoped wake.
+	pass_woken_by_a_remote_file(&fx, "wake.txt", &reports).await;
+
+	fx.client.trash_file(&mut bad).await.unwrap();
+	assert!(
+		poll_until(CACHE_CONVERGE_TIMEOUT, || !fx
+			.local
+			.join("bad.txt")
+			.exists())
+		.await,
+		"the local copy of the deleted file stayed: {:?}",
+		reports.lock().unwrap()
+	);
+	assert!(
+		poll_until(CACHE_CONVERGE_TIMEOUT, || {
+			reports
+				.lock()
+				.unwrap()
+				.last()
+				.is_some_and(|report| skipped_for_hash(&report.unsyncable).is_empty())
+		})
+		.await,
+		"{:?}",
+		reports.lock().unwrap()
+	);
+
+	drop(handle);
+	fx.cleanup();
+}
+
+/// On a watched pair a local edit over a marked version reaches its exit from a change-scoped pass:
+/// it goes up over that version, which stays in the file's history, with no conflict.
+#[cfg(feature = "malformed")]
+#[shared_test_runtime]
+async fn a_watched_pairs_local_edit_uploads_over_a_marked_version() {
+	let fx = Fixture::new().await;
+	fx.wait_initial_converged().await;
+	let _versioning_lock = fx
+		.client
+		.acquire_lock_with_default(test_utils::locks::USER_VERSIONING)
+		.await
+		.unwrap();
+	fx.client.set_versioning_enabled(true).await.unwrap();
+	let engine = Arc::new(fx.open_engine().await);
+	let pair = engine
+		.add_pair(fx.local.clone(), fx.remote_uuid, SyncMode::TwoWay)
+		.await
+		.unwrap();
+	upload_remote(&fx, "bad.txt", b"the synced content").await;
+	let (handle, reports) = watch_reporting(&engine, pair).await;
+	assert!(
+		poll_until(CACHE_CONVERGE_TIMEOUT, || {
+			std::fs::read(fx.local.join("bad.txt"))
+				.is_ok_and(|bytes| bytes == b"the synced content")
+		})
+		.await,
+		"the first version never came down"
+	);
+	let bad = damaged_upload_is_skipped(&fx, "bad.txt", &reports).await;
+	let bad_uuid: Uuid = bad.uuid();
+	pass_woken_by_a_remote_file(&fx, "wake.txt", &reports).await;
+
+	let edit = b"the edit made since the last sync";
+	let edit_hash: filen_types::crypto::Blake3Hash = blake3::hash(edit).into();
+	write_local(&fx.local, "bad.txt", edit);
+	let mut head = None;
+	let deadline = std::time::Instant::now() + CACHE_CONVERGE_TIMEOUT;
+	while head.is_none() && std::time::Instant::now() < deadline {
+		let (_dirs, files) = fx.list_remote_root().await;
+		head = find_file(&files, "bad.txt")
+			.filter(|file| file.hash() == Some(edit_hash))
+			.cloned();
+		tokio::time::sleep(Duration::from_millis(300)).await;
+	}
+	let head =
+		head.unwrap_or_else(|| panic!("the edit never went up: {:?}", reports.lock().unwrap()));
+	let versions = fx.client.list_file_versions(&head).await.unwrap();
+	assert!(
+		versions.iter().any(|version| version.uuid() == bad_uuid),
+		"the damaged version stays in the file's history"
+	);
+	assert!(
+		reports
+			.lock()
+			.unwrap()
+			.iter()
+			.all(|report| report.conflicts.is_empty()),
+		"{:?}",
+		reports.lock().unwrap()
+	);
+
+	drop(handle);
 	fx.cleanup();
 }
 

@@ -471,6 +471,7 @@ fn path_failures_count_consecutively_and_reset_on_a_clear() {
 			attempts: 2,
 			last_error: "boom again".to_string(),
 			last_failure_at: 2_000,
+			mismatched: None,
 		},
 		"the streak counts up and keeps the LAST error and the LAST failure's time"
 	);
@@ -511,6 +512,7 @@ fn a_spaced_failure_counts_only_once_per_window() {
 		attempts,
 		last_error: last_error.to_string(),
 		last_failure_at,
+		mismatched: None,
 	};
 
 	assert_eq!(spaced("down", 10_000), streak(1, "down", 10_000));
@@ -527,6 +529,223 @@ fn a_spaced_failure_counts_only_once_per_window() {
 		.unwrap();
 	assert_eq!(spaced("down", 12_000), streak(3, "refused", 11_500));
 	assert_eq!(spaced("down", 12_500), streak(4, "down", 12_500));
+}
+
+/// The version a download whose content did not match its hash read: its uuid and the hash its
+/// metadata declared.
+fn version(uuid: u128, declared: u8) -> MismatchedVersion {
+	MismatchedVersion {
+		remote_uuid: Uuid::from_u128(uuid),
+		declared_hash: Blake3Hash::from([declared; 32]),
+	}
+}
+
+/// A resolution's row and the end of the path's failure row land together, and only the path's:
+/// a row with no local content and a mark left beside it would have the next pass skip the path.
+#[test]
+fn recording_a_resolution_writes_the_row_and_ends_the_paths_failure_row() {
+	let store = BaselineStore::open_in_memory().unwrap();
+	let (pair, _) = store
+		.create_pair("/root", Uuid::new_v4(), SyncMode::TwoWay)
+		.unwrap();
+	let bad = version(1, 1);
+	for path in ["kept.txt", "gone.txt", "other.txt"] {
+		store
+			.upsert_entry(pair, &file_entry(path, [1; 32], 1))
+			.unwrap();
+		store
+			.record_mismatch(pair, path, bad, "does not match", 1_000)
+			.unwrap();
+	}
+
+	let resolved = file_entry("kept.txt", [2; 32], 2);
+	store
+		.record_resolution(pair, "kept.txt", Some(&resolved))
+		.unwrap();
+	store.record_resolution(pair, "gone.txt", None).unwrap();
+
+	assert_eq!(store.entry(pair, "kept.txt").unwrap(), Some(resolved));
+	assert_eq!(store.entry(pair, "gone.txt").unwrap(), None);
+	assert!(store.entry(pair, "other.txt").unwrap().is_some());
+	assert_eq!(
+		store.failures(pair).unwrap().keys().collect::<Vec<_>>(),
+		["other.txt"]
+	);
+}
+
+/// A resolution that cannot write either part writes neither: the conflict stays on record with its
+/// mark beside it, which the next pass ends, so no resolved row is ever left with a mark.
+#[test]
+fn a_resolution_that_fails_either_write_leaves_the_conflict_and_its_mark() {
+	let store = BaselineStore::open_in_memory().unwrap();
+	let (pair, _) = store
+		.create_pair("/root", Uuid::new_v4(), SyncMode::TwoWay)
+		.unwrap();
+	let held = BaselineEntry {
+		state: BaselineState::Conflicted,
+		..file_entry("a.txt", [1; 32], 1)
+	};
+	store.upsert_entry(pair, &held).unwrap();
+	store
+		.record_mismatch(pair, "a.txt", version(1, 1), "does not match", 1_000)
+		.unwrap();
+	let resolved = file_entry("a.txt", [2; 32], 2);
+
+	for (trigger, what) in [
+		(
+			"CREATE TRIGGER refuse_failure BEFORE DELETE ON path_failures
+			 BEGIN SELECT RAISE(ABORT, 'failure row refused'); END;",
+			"refuse_failure",
+		),
+		(
+			"CREATE TRIGGER refuse_row BEFORE UPDATE ON baseline
+			 BEGIN SELECT RAISE(ABORT, 'row refused'); END;
+			 CREATE TRIGGER refuse_row_delete BEFORE DELETE ON baseline
+			 BEGIN SELECT RAISE(ABORT, 'row refused'); END;
+			 CREATE TRIGGER refuse_row_insert BEFORE INSERT ON baseline
+			 BEGIN SELECT RAISE(ABORT, 'row refused'); END;",
+			"refuse_row",
+		),
+	] {
+		store.conn.execute_batch(trigger).unwrap();
+		store
+			.record_resolution(pair, "a.txt", Some(&resolved))
+			.expect_err(what);
+		store
+			.record_resolution(pair, "a.txt", None)
+			.expect_err(what);
+		assert_eq!(store.entry(pair, "a.txt").unwrap().as_ref(), Some(&held));
+		assert!(store.failures(pair).unwrap()["a.txt"].mismatched.is_some());
+		store
+			.conn
+			.execute_batch(
+				"DROP TRIGGER IF EXISTS refuse_failure;
+				 DROP TRIGGER IF EXISTS refuse_row;
+				 DROP TRIGGER IF EXISTS refuse_row_delete;
+				 DROP TRIGGER IF EXISTS refuse_row_insert;",
+			)
+			.unwrap();
+	}
+}
+
+/// A download whose content did not match its hash is recorded with the version it read, and
+/// forgotten only for that version: a mark the path has since replaced is not another's to clear,
+/// and a version is its uuid and its declared hash together.
+#[test]
+fn a_hash_mismatch_is_recorded_with_its_version_and_forgotten_only_for_it() {
+	let store = BaselineStore::open_in_memory().unwrap();
+	let (pair, _) = store
+		.create_pair("/root", Uuid::new_v4(), SyncMode::TwoWay)
+		.unwrap();
+	let (bad, other, rehashed) = (version(1, 1), version(2, 1), version(1, 2));
+	store
+		.record_mismatch(pair, "a.txt", bad, "does not match", 1_000)
+		.unwrap();
+	let mark = |attempts, last_error: &str, last_failure_at, mismatched| PathFailure {
+		attempts,
+		last_error: last_error.to_string(),
+		last_failure_at,
+		mismatched,
+	};
+	assert_eq!(
+		store.failures(pair).unwrap()["a.txt"],
+		mark(1, "does not match", 1_000, Some(bad))
+	);
+
+	for not_it in [other, rehashed] {
+		store
+			.forget_mismatches(pair, &[("a.txt".to_string(), not_it)])
+			.unwrap();
+		assert_eq!(
+			store.failures(pair).unwrap()["a.txt"],
+			mark(1, "does not match", 1_000, Some(bad)),
+			"another version's mark is not this one: {not_it:?}"
+		);
+	}
+	store
+		.forget_mismatches(
+			pair,
+			&[
+				("a.txt".to_string(), bad),
+				("never-failed.txt".to_string(), bad),
+			],
+		)
+		.unwrap();
+	assert!(store.failures(pair).unwrap().is_empty());
+
+	// A mark is a failure row like any other: the pair takes it with it.
+	store
+		.record_mismatch(pair, "a.txt", bad, "does not match", 1_000)
+		.unwrap();
+	store.delete_pair(pair).unwrap();
+	assert!(store.failures(pair).unwrap().is_empty());
+}
+
+/// A hash mismatch starts a streak of its own, of one version: neither the failures before it nor
+/// another version's mismatch carries its count over. An ordinary failure at a marked path, spaced
+/// or not, is an upload over that version that failed: it counts on and the mark stays, and only
+/// ending the streak takes the mark with it.
+#[test]
+fn a_hash_mismatch_starts_a_streak_of_its_own_that_a_later_failure_counts_on() {
+	let store = BaselineStore::open_in_memory().unwrap();
+	let (pair, _) = store
+		.create_pair("/root", Uuid::new_v4(), SyncMode::TwoWay)
+		.unwrap();
+	let (bad, worse, rehashed) = (version(1, 1), version(2, 1), version(2, 2));
+	let at = |path: &str| store.failures(pair).unwrap()[path].clone();
+	let mark = |attempts, last_error: &str, last_failure_at, mismatched| PathFailure {
+		attempts,
+		last_error: last_error.to_string(),
+		last_failure_at,
+		mismatched,
+	};
+
+	store.record_failure(pair, "a.txt", "boom", 1_000).unwrap();
+	store.record_failure(pair, "a.txt", "boom", 2_000).unwrap();
+	store
+		.record_mismatch(pair, "a.txt", bad, "does not match", 3_000)
+		.unwrap();
+	assert_eq!(at("a.txt"), mark(1, "does not match", 3_000, Some(bad)));
+	store
+		.record_mismatch(pair, "a.txt", bad, "still does not match", 4_000)
+		.unwrap();
+	assert_eq!(
+		at("a.txt"),
+		mark(2, "still does not match", 4_000, Some(bad))
+	);
+	store
+		.record_mismatch(pair, "a.txt", worse, "neither does this", 5_000)
+		.unwrap();
+	assert_eq!(
+		at("a.txt"),
+		mark(1, "neither does this", 5_000, Some(worse))
+	);
+	store
+		.record_mismatch(pair, "a.txt", rehashed, "nor this", 5_500)
+		.unwrap();
+	assert_eq!(
+		at("a.txt"),
+		mark(1, "nor this", 5_500, Some(rehashed)),
+		"the same file declaring another hash is another version"
+	);
+
+	store.record_failure(pair, "a.txt", "boom", 6_000).unwrap();
+	assert_eq!(at("a.txt"), mark(2, "boom", 6_000, Some(rehashed)));
+	store.clear_failures(pair, &["a.txt"]).unwrap();
+	assert!(store.failures(pair).unwrap().is_empty());
+
+	// A spaced failure is spaced as any other, and keeps the mark too.
+	store
+		.record_mismatch(pair, "b.txt", bad, "does not match", 10_000)
+		.unwrap();
+	store
+		.record_spaced_failure(pair, "b.txt", "down", 10_001, 1_000)
+		.unwrap();
+	assert_eq!(at("b.txt"), mark(1, "does not match", 10_000, Some(bad)));
+	store
+		.record_spaced_failure(pair, "b.txt", "down", 11_000, 1_000)
+		.unwrap();
+	assert_eq!(at("b.txt"), mark(2, "down", 11_000, Some(bad)));
 }
 
 /// Clearing a pair's streaks clears every one of them and no other pair's.
@@ -1210,7 +1429,7 @@ fn the_derived_columns_are_pinned_to_the_schema_version() {
 		            SCHEMA_VERSION so a file written under the old rule is refused, then move this pin";
 	assert_eq!(
 		(SCHEMA_VERSION, char::UNICODE_VERSION),
-		(5, (17, 0, 0)),
+		(6, (17, 0, 0)),
 		"{owed}"
 	);
 	// Confirmed: this helper's rows otherwise carry a marker that is not their content.
@@ -1652,6 +1871,40 @@ fn a_subtree_move_re_keys_the_source_and_everything_under_it_only() {
 			"b/MOVED/x2/y.txt"
 		]
 	);
+}
+
+/// A directory move takes the failure rows under it along in its transaction, hash mismatch marks
+/// and plain streaks alike, overwriting what sits at the destination. Nothing outside the directory
+/// moves, and a row on the directory itself stays: an in-memory park on it ends with the rename.
+#[test]
+fn a_subtree_move_takes_the_failure_rows_under_it_along() {
+	let store = BaselineStore::open_in_memory().unwrap();
+	let (pair, _) = store
+		.create_pair("/root", Uuid::new_v4(), SyncMode::TwoWay)
+		.unwrap();
+	let bad = MismatchedVersion {
+		remote_uuid: Uuid::from_u128(2),
+		declared_hash: Blake3Hash::from([2; 32]),
+	};
+	store
+		.record_mismatch(pair, "a/x", bad, "does not match", 1_000)
+		.unwrap();
+	for path in ["a", "a/deep/y", "b/x", "a0", "z"] {
+		store.record_failure(pair, path, path, 2_000).unwrap();
+	}
+
+	store
+		.apply_changes(pair, &[BaselineChange::MoveSubtree { from: "a", to: "b" }])
+		.unwrap();
+
+	let failures = store.failures(pair).unwrap();
+	let mut paths: Vec<&str> = failures.keys().map(String::as_str).collect();
+	paths.sort_unstable();
+	assert_eq!(paths, ["a", "a0", "b/deep/y", "b/x", "z"]);
+	assert_eq!(failures["b/x"].mismatched, Some(bad));
+	assert_eq!(failures["b/x"].last_error, "does not match");
+	assert_eq!(failures["b/deep/y"].last_error, "a/deep/y");
+	assert_eq!(failures["b/deep/y"].mismatched, None);
 }
 
 /// A move onto a destination that already holds rows overwrites them, which is what the

@@ -173,6 +173,14 @@ impl Client {
 		.map(|resp| resp.avatar_url)
 	}
 
+	/// Whether the account keeps a file's old versions when it is replaced, read from the server.
+	#[cfg(feature = "sync-engine")]
+	pub(crate) async fn versioning_enabled(&self) -> Result<bool, Error> {
+		api::v3::user::settings::get(self.client())
+			.await
+			.map(|settings| settings.versioning_enabled)
+	}
+
 	pub async fn set_versioning_enabled(&self, enabled: bool) -> Result<(), Error> {
 		api::v3::user::versioning::post(
 			self.client(),

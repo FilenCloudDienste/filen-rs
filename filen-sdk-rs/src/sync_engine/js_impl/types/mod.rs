@@ -427,6 +427,7 @@ impl From<SyncReport> for SyncPassReport {
 			failed_paths: _,
 			transient_failures: _,
 			landed: _,
+			mismatched: _,
 		} = report;
 		let (conflicts, conflicts_total) = capped(conflicts);
 		let (held, held_total) = capped(held);

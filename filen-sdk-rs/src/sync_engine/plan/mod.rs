@@ -964,7 +964,8 @@ impl RemoteView {
 			| UnsyncableReason::RemoteBrokenParent
 			| UnsyncableReason::LocalAlias { .. }
 			| UnsyncableReason::LocalNameCollision
-			| UnsyncableReason::RemoteNameCollision => true,
+			| UnsyncableReason::RemoteNameCollision
+			| UnsyncableReason::RemoteContentHashMismatch { .. } => true,
 		});
 		kept
 	}
@@ -1336,6 +1337,23 @@ fn classify_local(node: Option<&LocalNode>, base: Option<&BaselineEntry>) -> Sid
 			}
 		}
 	}
+}
+
+/// Whether the local file at a path holds an edit made since the last sync: a row records what was
+/// synced there, and both hashes are known and differ. Decided by content alone, so a file only
+/// touched, or moved away and put back, is no edit. Nothing at the path, a directory, a copy no sync
+/// ever recorded, and a row that records one side's copy or a held conflict are none either.
+pub(super) fn holds_local_edit(local: Option<&LocalNode>, base: Option<&BaselineEntry>) -> bool {
+	let (Some(local), Some(base)) = (local, base) else {
+		return false;
+	};
+	base.state == BaselineState::Synced
+		&& base.kind == NodeKind::File
+		&& local.kind == NodeKind::File
+		&& matches!(
+			(local.content_hash, base.content_hash),
+			(Some(now), Some(synced)) if now != synced
+		)
 }
 
 /// Whether the remote item at a path is the SAME file the baseline row recorded there — the same
@@ -3984,7 +4002,7 @@ fn parent_path(rel_path: &str) -> &str {
 	rel_path.rsplit_once('/').map_or("", |(parent, _)| parent)
 }
 
-/// What a pass must NOT act on, beyond what the three inputs themselves say.
+/// What a pass must treat apart, beyond what the three inputs themselves say.
 #[derive(Debug, Default)]
 pub(crate) struct PassHolds {
 	/// Remote uuids this engine already sent to the trash, whose removal the cache has not applied
@@ -3994,6 +4012,22 @@ pub(crate) struct PassHolds {
 	pub(crate) trashed: HashSet<Uuid>,
 	/// Remote paths the cache is showing mid-transition (see [`RemoteView::held_paths`]).
 	pub(crate) held_remote: BTreeSet<String>,
+	/// Paths whose remote file is a version known not to match its hash and whose local file ends
+	/// the skip anyway (see `Prepared::release_changed_mismatches`), each with how it does.
+	pub(crate) marked_exits: BTreeMap<String, MarkedExit>,
+}
+
+/// How a local file leaves the skip of a remote version known not to match its hash.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MarkedExit {
+	/// The local file is uploaded over that version, whatever the remote file declares: a local
+	/// file that hashes to what the damaged version declares still has to replace it, and two sides
+	/// that moved are no conflict while the old version stays in the file's history.
+	Upload,
+	/// The path is held as a conflict for the user to decide: a mismatch may be wrong metadata over
+	/// good bytes, so the version may be another device's real edit, and this account may keep no
+	/// history to get it back from.
+	Conflict,
 }
 
 /// Which paths one [`reconcile`] decides.
@@ -4191,6 +4225,7 @@ pub(crate) fn reconcile(
 			mode,
 			key,
 			base.as_ref(),
+			&holds.marked_exits,
 			|| (local.at(key), remote.at(key)),
 			&mut actions,
 		);
@@ -4201,11 +4236,13 @@ pub(crate) fn reconcile(
 /// Decide one path from the three inputs at it, and nothing else: what [`reconcile`] plans at every
 /// path it decides that no move took, and what the windows of a whole pass's staged reconcile plan
 /// at each of theirs (see `stage::reconcile`). `nodes` reads the path's local and remote nodes, and
-/// is not asked at a path the baseline holds in conflict.
+/// is not asked at a path the baseline holds in conflict or at one of `marked_exits` (see
+/// [`MarkedExit`]).
 pub(super) fn decide_path<'n>(
 	mode: super::SyncMode,
 	key: &str,
 	base: Option<&BaselineEntry>,
+	marked_exits: &BTreeMap<String, MarkedExit>,
 	nodes: impl FnOnce() -> (Option<Cow<'n, LocalNode>>, Option<Cow<'n, RemoteNode>>),
 	actions: &mut Vec<SyncAction>,
 ) {
@@ -4218,6 +4255,28 @@ pub(super) fn decide_path<'n>(
 			rel_path: key.to_string(),
 		});
 		return;
+	}
+	match marked_exits.get(key) {
+		Some(MarkedExit::Upload) => {
+			let action = create_remote(key, NodeKind::File);
+			tracing::trace!(
+				"plan: {} — the local file replaces a remote version that does not match its hash",
+				action.describe()
+			);
+			actions.push(action);
+			return;
+		}
+		Some(MarkedExit::Conflict) => {
+			tracing::trace!(
+				"plan: {key:?} — a local edit over a remote version that does not match its hash, \
+				 which this account may keep no history of"
+			);
+			actions.push(SyncAction::Conflict {
+				rel_path: key.to_string(),
+			});
+			return;
+		}
+		None => {}
 	}
 	let (local_at, remote_at) = nodes();
 	let (local_node, remote_node) = (local_at.as_deref(), remote_at.as_deref());

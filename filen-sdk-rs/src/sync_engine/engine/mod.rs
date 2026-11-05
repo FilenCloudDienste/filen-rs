@@ -30,8 +30,8 @@ use super::{
 	Backlog, SyncEvent, SyncMode,
 	apply::{self, ApplyContext, PlannedEntry, SyncReport},
 	baseline::{
-		BaselineEntry, BaselineState, BaselineStore, NodeKind, PairId, PairRecord, PathFailure,
-		PendingRow, SyncedPaths,
+		BaselineEntry, BaselineState, BaselineStore, MismatchedVersion, NodeKind, PairId,
+		PairRecord, PathFailure, PendingRow, SyncedPaths,
 	},
 	bin,
 	changes::{DIRTY_CAP, FullPassReason, PairChanges, PassScope, RemoteDeltaEntry, past_cap},
@@ -51,7 +51,10 @@ use super::{
 	},
 	pause::{PassControl, PassGate, PauseOptions, cancel_suspension},
 	plan::{self, RemoteNode, RemoteView, SyncAction},
-	remote::{RemoteObserved, cache_ancestry, delta_uuids, observe_remote},
+	remote::{
+		RemoteObserved, cache_ancestry, cached_chain_to_root, delta_uuids, observe_remote,
+		place_marked_versions,
+	},
 	rows::Baseline,
 	scan::{
 		self, LocalScan, PairRoot, RuleFiles, ScanGaps, ScanRoot, WalkProgress,
@@ -2230,7 +2233,9 @@ struct PassInputs {
 	user_ignore: String,
 	store: SharedStore,
 	baseline: Baseline,
-	/// The failure streaks that BLOCK planning this pass (see [`streak_blocks`]).
+	/// The failure streaks that BLOCK planning this pass (see [`streak_blocks`]), and every hash
+	/// mismatch (see [`PathFailure::mismatched`]), which [`Prepared::release_changed_mismatches`]
+	/// weighs once the pass has read.
 	failures: HashMap<String, PathFailure>,
 	last_ignored: BTreeSet<String>,
 }
@@ -2489,8 +2494,18 @@ struct Prepared {
 	/// What this pass must not act on (see [`plan::PassHolds`]).
 	holds: plan::PassHolds,
 	/// The per-path failure streaks that block planning this pass (see [`streak_blocks`]). A streak
-	/// below the threshold, or one whose retry interval has run out, is not here.
+	/// below the threshold, or one whose retry interval has run out, is not here. A hash mismatch
+	/// is, whatever its attempts, unless the pass let go of it (see
+	/// [`release_changed_mismatches`](Self::release_changed_mismatches)).
 	failures: HashMap<String, PathFailure>,
+	/// The hash mismatches this pass let go of for good, each as the path and the version that did
+	/// not match: what a real pass forgets in the store (see
+	/// [`release_changed_mismatches`](Self::release_changed_mismatches)).
+	released_mismatches: Vec<(String, MismatchedVersion)>,
+	/// Each two-way local edit that left its mark for [`PassHolds::marked_exits`](plan::PassHolds::marked_exits),
+	/// with the failure row it had: what [`settle_marked_edits`](Self::settle_marked_edits) puts back
+	/// when it cannot decide the exit.
+	edits_over_marks: Vec<(String, PathFailure)>,
 	/// Everything this pass blocks, reports or withholds, keyed by path: what a whole read found,
 	/// or — on a change-scoped pass — what the last read found, pruned and re-answered wherever
 	/// this one looked (see [`PairFacts`]).
@@ -2788,6 +2803,223 @@ impl Prepared {
 		})
 	}
 
+	/// Let go of every hash mismatch whose remote file this pass found changed — another file uuid
+	/// or declared hash at the path, an item that is not a file, or nothing at all — and of every
+	/// one in a mode that never downloads ([`SyncMode::pulls`]) but the exception below, so the path
+	/// is planned as usual from here on, and hand each to
+	/// [`released_mismatches`](Self::released_mismatches) for a real pass to forget.
+	///
+	/// A mismatch whose path still holds the version that did not match stays in
+	/// [`failures`](Self::failures), so the pass plans nothing there: no download, so no stash of the
+	/// local copy, and no upload over the remote file. The one exception is a two-way pair's local
+	/// file holding an edit made since the last sync ([`plan::holds_local_edit`]): that goes into
+	/// [`PassHolds::marked_exits`](plan::PassHolds::marked_exits) and is uploaded over the version,
+	/// where the plan would otherwise read two sides that moved as a conflict, unless the account
+	/// keeps no history of the version or cannot say whether it does (see
+	/// [`settle_marked_edits`](Self::settle_marked_edits)).
+	/// Its mark stays in the store until that upload lands ([`SyncEngine::note_path_outcomes`] ends
+	/// it like any streak), because without it a failed upload would leave the next pass reading that
+	/// same conflict. Such a path whose uploads keep failing is a failure streak like any other:
+	/// blocked while [`streak_blocks`] says so, and reported as one.
+	///
+	/// A mode that never downloads uploads over the version when the local file hashes to exactly
+	/// what the version declares, the same way, where the plan would otherwise read the two sides as
+	/// agreeing and leave the damaged version there. Anything else its plan decides as usual.
+	///
+	/// A held conflict at the path ends the mark: the row now says what the path is waiting for, and
+	/// a resolution that pulls the version finds the mismatch again. A resolution landing before this
+	/// pass ran ends it itself (see [`SyncEngine::resolve_conflict`]).
+	///
+	/// Only a path this pass decides is weighed: a change-scoped pass reads nothing of any other,
+	/// so its mark stands. Every path with a failure row is owed to the next pass (see
+	/// [`facts::carry_over`]), so a change-scoped pass decides these in practice. It has the marked
+	/// version in its view (see [`place_marked_versions`]), except where it could not trust
+	/// the answer: there the view holds only what the row records, which says nothing about the
+	/// file, so the mark stands.
+	///
+	/// Nothing at the path counts as a change only when the view can be believed about an absence
+	/// (see [`trusts_remote_absence`](Self::trusts_remote_absence)), as for every deletion the
+	/// engine acts on: a view that never converged or came back empty, or an item held or out of
+	/// the view, says nothing about the file, and letting go of its mark would have the corrupt
+	/// version downloaded again as soon as the view shows it.
+	///
+	/// Run once the read is done and the directory moves are folded, which re-key both the remote
+	/// view and the marks.
+	fn release_changed_mismatches(&mut self) {
+		let mode = self.record.mode;
+		let now = Utc::now().timestamp_millis();
+		let local = self.local_scan.nodes.of(&self.baseline);
+		let remote = self.remote_view.nodes.of(&self.baseline);
+		let decided = match &self.read {
+			PassRead::Whole(_) => None,
+			PassRead::Scoped(decided) => Some(decided),
+		};
+		let released = &mut self.released_mismatches;
+		let marked_exits = &mut self.holds.marked_exits;
+		let edits_over_marks = &mut self.edits_over_marks;
+		let baseline = &self.baseline;
+		let remote_nodes = &self.remote_view.nodes;
+		let trusts_absence = |path: &str| {
+			Self::trusts_remote_absence(
+				self.remote_converged,
+				self.remote_emptied,
+				&self.holds.held_remote,
+				&self.facts.unknown_remote,
+				path,
+			)
+		};
+		self.failures.retain(|path, failure| {
+			let Some(mismatched) = failure.mismatched else {
+				return true;
+			};
+			if decided.is_some_and(|decided| !decided.contains(path)) {
+				return true;
+			}
+			let base = baseline.get(path);
+			if base.as_ref().is_some_and(|row| row.state.is_conflict()) {
+				// Owned past the retain, for the store to forget.
+				released.push((path.clone(), mismatched));
+				return false;
+			}
+			if remote_nodes.untouched(path) {
+				return true;
+			}
+			let at = remote.at(path);
+			let holds_version = at.as_deref().is_some_and(|node| {
+				node.kind == NodeKind::File
+					&& node.remote_uuid == mismatched.remote_uuid
+					&& node.content_hash == Some(mismatched.declared_hash)
+			});
+			if !mode.pulls() {
+				let restores = holds_version
+					&& local.at(path).is_some_and(|node| {
+						node.kind == NodeKind::File
+							&& node.content_hash == Some(mismatched.declared_hash)
+					});
+				if !restores {
+					// Owned past the retain, for the store to forget.
+					released.push((path.clone(), mismatched));
+					return false;
+				}
+				tracing::debug!(
+					"plan: {path:?} holds what version {} declares, whose content did not match it, \
+					 and replaces it",
+					mismatched.remote_uuid
+				);
+				// The key of a map the retain does not walk.
+				marked_exits.insert(path.clone(), plan::MarkedExit::Upload);
+				failure.mismatched = None;
+				return streak_blocks(failure, now);
+			}
+			let unchanged = holds_version || (at.is_none() && !trusts_absence(path));
+			if !unchanged {
+				tracing::debug!(
+					"plan: {path:?} is no longer version {} declaring {:?}, whose content did not \
+					 match its hash; planning it again",
+					mismatched.remote_uuid,
+					mismatched.declared_hash
+				);
+				// Owned past the retain, for the store to forget.
+				released.push((path.clone(), mismatched));
+				return false;
+			}
+			let edited = mode == SyncMode::TwoWay
+				&& at.is_some()
+				&& plan::holds_local_edit(local.at(path).as_deref(), base.as_ref());
+			if !edited {
+				return true;
+			}
+			tracing::debug!(
+				"plan: {path:?} holds a local edit, which replaces version {} whose content did \
+				 not match its hash",
+				mismatched.remote_uuid
+			);
+			// The key of a map the retain does not walk.
+			marked_exits.insert(path.clone(), plan::MarkedExit::Upload);
+			// Owned past the retain, as what the row said, for a pass that ends up not knowing
+			// whether this exit may be taken.
+			edits_over_marks.push((path.clone(), failure.clone()));
+			// A streak of failed uploads blocks the upload, as it would any other action.
+			failure.mismatched = None;
+			streak_blocks(failure, now)
+		});
+	}
+
+	/// Whether this pass goes on to ask the account if it keeps old versions. Two-way only: an
+	/// upload-only mode was chosen to overwrite the remote, so it uploads over a damaged version on
+	/// such an account too.
+	fn asks_whether_old_versions_are_kept(&self) -> bool {
+		self.record.mode == SyncMode::TwoWay && !self.holds.marked_exits.is_empty()
+	}
+
+	/// Decide each two-way local edit bound for a damaged version from `read`, the account's answer
+	/// to whether it keeps a file's old versions when one is replaced. Only the setting can say so: a
+	/// version chain of one file is what a file new on a versioning account looks like too.
+	///
+	/// With versioning on, the edit goes up as planned. With it off the path is held as a conflict:
+	/// with no history to fall back on, the upload would lose the version for good, and a mismatch
+	/// may be wrong metadata over good bytes, so that may be another device's real edit. The mark
+	/// stays until the conflict is on record, so a pass cut short decides the path again.
+	///
+	/// A setting that could not be read decides nothing. Each such path goes back to the skip it was
+	/// in, its mark as the row has it: reported as the mismatch, planned nowhere, and, like every path
+	/// with a failure row, owed to the next pass, which asks again.
+	fn settle_marked_edits(&mut self, read: Result<bool, Error>) {
+		match read {
+			Ok(true) => {}
+			Ok(false) => {
+				for exit in self.holds.marked_exits.values_mut() {
+					*exit = plan::MarkedExit::Conflict;
+				}
+			}
+			Err(error) => {
+				tracing::warn!(
+					"reading whether the account keeps old file versions failed, so {} local \
+					 edit(s) over a remote file that does not match its hash wait for the next \
+					 pass: {error}",
+					self.holds.marked_exits.len()
+				);
+				self.holds.marked_exits.clear();
+				self.failures.extend(mem::take(&mut self.edits_over_marks));
+			}
+		}
+	}
+
+	/// Whether this pass's remote view can be believed when it has nothing at `path`: it has
+	/// converged, did not come back wholly empty (see [`remote_emptied`]), and neither holds the
+	/// path back as mid-transition nor knows it to be out of the view. Taken field by field, as
+	/// [`release_changed_mismatches`](Self::release_changed_mismatches) asks it while it changes
+	/// [`failures`](Self::failures).
+	fn trusts_remote_absence(
+		converged: bool,
+		emptied: bool,
+		held: &BTreeSet<String>,
+		unknown: &BTreeMap<String, UnsyncableReason>,
+		path: &str,
+	) -> bool {
+		converged
+			&& !emptied
+			&& !plan::is_under_held_path(path, held)
+			&& !unknown.contains_key(path)
+			&& !plan::ancestors(path).any(|at| unknown.contains_key(at))
+	}
+
+	/// Whether `action` is one this pass drops only for a hash mismatch at its path that it keeps
+	/// skipping (see [`release_changed_mismatches`](Self::release_changed_mismatches)). Such a drop
+	/// consumes no evidence: the path's failure row owes it to the next pass (see
+	/// [`facts::carry_over`]), which decides it again from both sides, so it is not counted as
+	/// [`dropped`](Screened::dropped) and does not make the next pass read both sides whole. A move
+	/// is always counted: its source is another path, which nothing owes.
+	fn skips_for_mismatch(&self, action: &SyncAction) -> bool {
+		!matches!(
+			action,
+			SyncAction::MoveRemote { .. } | SyncAction::MoveLocal { .. }
+		) && self
+			.failures
+			.get(action.rel_path())
+			.is_some_and(|failure| failure.mismatched.is_some())
+	}
+
 	/// Every path this pass will not act on, and why — reported identically by the dry run and by
 	/// the pass itself, so a caller sees the same list either way.
 	fn unsyncable(&self) -> Vec<UnsyncablePath> {
@@ -2805,9 +3037,14 @@ impl Prepared {
 					.iter()
 					.map(|(rel_path, failure)| UnsyncablePath {
 						rel_path: rel_path.clone(),
-						reason: UnsyncableReason::RepeatedFailure {
-							attempts: failure.attempts,
-							last_error: failure.last_error.clone(),
+						reason: match failure.mismatched {
+							Some(_) => UnsyncableReason::RemoteContentHashMismatch {
+								last_error: failure.last_error.clone(),
+							},
+							None => UnsyncableReason::RepeatedFailure {
+								attempts: failure.attempts,
+								last_error: failure.last_error.clone(),
+							},
 						},
 					}),
 			)
@@ -2857,7 +3094,8 @@ impl Prepared {
 	}
 
 	/// Every path this pass must not plan an action for: a name the remote would reject, a local
-	/// symlink to a directory inside the root, a path whose failure streak ran out, a synced path
+	/// symlink to a directory inside the root, a path whose failure streak ran out or whose remote
+	/// file is still the version that did not match its hash, a synced path
 	/// whose remote item is out of the view, and a path of a name collision on either side, all
 	/// reported by [`unsyncable`](Self::unsyncable); and an ignored path, or one whose ignore rules
 	/// could not be read. What else a collision holds back is [`collisions`](Self::collisions)'s.
@@ -3041,6 +3279,62 @@ where
 		.collect();
 }
 
+/// The marks a change-scoped pass places in its view (see [`place_marked_versions`]), each
+/// as its path and the version that did not match. Those the view cannot be believed about are left
+/// out, as what a whole read would answer for them ends no mark either: a row held in conflict or
+/// recording one side only, and a path the last whole read held out of the view.
+fn marked_versions(
+	failures: &HashMap<String, PathFailure>,
+	baseline: &Baseline,
+	carried: &PairCarry,
+) -> Vec<(String, Uuid)> {
+	failures
+		.iter()
+		.filter_map(|(path, failure)| Some((path, failure.mismatched?.remote_uuid)))
+		.filter(|(path, _)| {
+			baseline
+				.get(path)
+				.as_ref()
+				.is_none_or(|row| row.carryable())
+				&& Prepared::trusts_remote_absence(
+					carried.remote_converged,
+					false,
+					&BTreeSet::new(),
+					&carried.facts.unknown_remote,
+					path,
+				)
+		})
+		// The path is owned by what the blocking task the marks are read on is handed.
+		.map(|(path, uuid)| (path.clone(), uuid))
+		.collect()
+}
+
+/// Forget, in `pair`'s store, the hash mismatches a pass let go of for good (see
+/// [`Prepared::release_changed_mismatches`]). A mark that could not be forgotten is let go of again
+/// by the next pass, which finds the same, so the store's answer is only reported in `report`'s
+/// errors.
+async fn forget_released_mismatches(
+	pair: PairId,
+	store: &SharedStore,
+	released: Vec<(String, MismatchedVersion)>,
+	report: &mut SyncReport,
+) {
+	if released.is_empty() {
+		return;
+	}
+	let count = released.len();
+	let forgotten = off_store(store, move |store| store.forget_mismatches(pair, &released))
+		.await
+		.and_then(|forgotten| {
+			forgotten.map_err(|e| db_error(e, "forgetting the hash mismatches of released files"))
+		});
+	if let Err(error) = forgotten {
+		report.errors.push(format!(
+			"forgetting the hash mismatch of {count} remote file(s) failed: {error}"
+		));
+	}
+}
+
 /// Whether a failure streak keeps its path out of a pass planned at `now` (unix millis): it has
 /// reached [`MAX_PATH_FAILURES`], and its last failure is younger than
 /// [`PATH_FAILURE_RETRY_INTERVAL`]. A last failure dated in the future (the clock went back) counts
@@ -3048,6 +3342,42 @@ where
 fn streak_blocks(failure: &PathFailure, now: i64) -> bool {
 	let interval = i64::try_from(PATH_FAILURE_RETRY_INTERVAL.as_millis()).unwrap_or(i64::MAX);
 	failure.attempts >= MAX_PATH_FAILURES && now.saturating_sub(failure.last_failure_at) < interval
+}
+
+/// Which of the streaks `ends` pairs with this pass's actions (see [`endable_streaks`]) the pass
+/// ended: those whose action landed ([`SyncReport::landed`]) at a path that nothing failed at this
+/// pass, other than the streak of a path whose download did not match its hash this pass.
+///
+/// Only an action that landed ends a streak. One a cancel dropped, a halt held back, or a directory
+/// create or move that failed held under it never ran, and proves nothing about its path: clearing
+/// its streak would hand a permanently broken path a fresh set of retries every time someone pauses
+/// or the remote is down. One that landed but whose record failed is a failure too, and keeps its
+/// streak. So does a path whose download this pass found not to match its hash
+/// ([`SyncReport::mismatched`]), though it is no failed path: the mark that download leaves is
+/// recorded before the streaks are cleared, so another action that landed there, such as the
+/// deletion of what the download replaces, would clear the fresh mark, and the next pass would
+/// download the same version again.
+fn cleared_streaks(ends: Vec<(String, String)>, report: &SyncReport) -> Vec<String> {
+	let landed: HashSet<&str> = report.landed.iter().map(String::as_str).collect();
+	let mismatched: HashSet<&str> = report
+		.mismatched
+		.iter()
+		.map(|download| download.rel_path.as_str())
+		.collect();
+	let failed: HashSet<&str> = report
+		.failed_paths
+		.iter()
+		.map(|(path, _)| path.as_str())
+		.chain(mismatched.iter().copied())
+		.collect();
+	ends.into_iter()
+		.filter(|(by, ended)| {
+			landed.contains(by.as_str())
+				&& !failed.contains(by.as_str())
+				&& !mismatched.contains(ended.as_str())
+		})
+		.map(|(_, ended)| ended)
+		.collect()
 }
 
 /// The failure streaks applying the screened plan `plan` can end, each as the path of the action
@@ -4030,6 +4360,11 @@ impl SyncEngine {
 	/// are `None` when nothing was moved: the two sides held the same content, the resolution kept
 	/// the local copy, or a keep-both found no local copy left to keep.
 	///
+	/// Whichever side wins, the path's failure row ends with the conflict, in the same write as the
+	/// baseline row: the resolution is a new instruction, which a failure streak or a hash mismatch
+	/// recorded before it must not hold back. A resolution that pulls a version that does not match
+	/// its hash finds the mismatch again and marks it again.
+	///
 	/// A resolution never interleaves with a pass: a pass still reading the pair, or recording the
 	/// conflicts it read, is waited for, since the rows it writes would overwrite this one. A
 	/// [`paused`](Self::pause_pair) pair stays resolvable — a pause parks a pass between actions,
@@ -4128,11 +4463,10 @@ impl SyncEngine {
 
 		let resolved = resolution_entry(rel_path, &held, winner);
 		let resolving = rel_path.to_string();
-		off_store(&store, move |store| match resolved {
-			Some(entry) => store.upsert_entry(pair, &entry),
-			// The winner's side had nothing at this path: drop the row entirely, so the other
-			// side reads as a fresh create (or as already-gone) rather than as a second conflict.
-			None => store.delete_entry(pair, &resolving),
+		// No row where the winner's side had nothing at this path: the other side then reads as a
+		// fresh create (or as already-gone) rather than as a second conflict.
+		off_store(&store, move |store| {
+			store.record_resolution(pair, &resolving, resolved.as_ref())
 		})
 		.await?
 		.map_err(|e| db_error(e, "resolving a conflict"))?;
@@ -4246,9 +4580,11 @@ impl SyncEngine {
 		// the path from what the two sides now actually hold.
 		let store = self.pair_store(pair).await?;
 		let resolving = rel_path.to_string();
-		off_store(&store, move |store| store.delete_entry(pair, &resolving))
-			.await?
-			.map_err(|e| db_error(e, "resolving a conflict"))?;
+		off_store(&store, move |store| {
+			store.record_resolution(pair, &resolving, None)
+		})
+		.await?
+		.map_err(|e| db_error(e, "resolving a conflict"))?;
 		Ok(resolved)
 	}
 
@@ -4678,7 +5014,8 @@ impl SyncEngine {
 			let mut failures = store
 				.failures(pair)
 				.map_err(|e| db_error(e, "loading the per-path failure counts"))?;
-			failures.retain(|_, failure| streak_blocks(failure, now));
+			failures
+				.retain(|_, failure| failure.mismatched.is_some() || streak_blocks(failure, now));
 			let last_ignored = store
 				.ignored_roots(pair)
 				.map_err(|e| db_error(e, "loading the recorded ignored paths"))?;
@@ -4710,7 +5047,28 @@ impl SyncEngine {
 	/// A whole read's walk counts what it lists and hashes into `progress`, for a pass to report
 	/// while it waits (see [`report_scan_progress`]); a caller that reports nothing hands in a fresh
 	/// one.
+	///
+	/// Whichever way it read, it ends by letting go of the hash mismatches whose remote file changed
+	/// (see [`Prepared::release_changed_mismatches`]).
 	async fn prepare(
+		&self,
+		pair: PairId,
+		scope: Option<ScopedRead<'_>>,
+		seeding: Seeding,
+		progress: &Arc<WalkProgress>,
+	) -> Result<Prepared, Error> {
+		let mut prepared = self.read_pass(pair, scope, seeding, progress).await?;
+		prepared.release_changed_mismatches();
+		// Asked only of a pass about to upload over a damaged version: a pair with no such edit
+		// makes no request.
+		if prepared.asks_whether_old_versions_are_kept() {
+			prepared.settle_marked_edits(self.client.versioning_enabled().await);
+		}
+		Ok(prepared)
+	}
+
+	/// The read [`prepare`](Self::prepare) makes, whole or change-scoped.
+	async fn read_pass(
 		&self,
 		pair: PairId,
 		scope: Option<ScopedRead<'_>>,
@@ -4782,12 +5140,19 @@ impl SyncEngine {
 		let root = inputs.record.remote_root;
 		let pair_root = self.pair_root(root);
 		let for_remote = inputs.baseline.clone();
-		let nodes = mem::take(&mut derived.remote);
+		let mut nodes = mem::take(&mut derived.remote);
+		let marks = marked_versions(&inputs.failures, &inputs.baseline, &carried);
+		for (path, _) in &marks {
+			// Owned by each of the two sets.
+			derived.dirty.insert(path.clone());
+			derived.decided.insert(path.clone());
+		}
 		// The delta comes back out with the observation: `observe_remote` only borrows it, and a
 		// pass cut short hands it to the next one (see `Prepared::remote_delta`).
 		let pair_store = Arc::clone(&inputs.store);
 		let (observed, delta) = tokio::task::spawn_blocking(move || {
 			let mut ancestry = |uuid| cache_ancestry(&cache_db, uuid);
+			let mut marked_chain = |uuid| cached_chain_to_root(&cache_db, root, uuid);
 			// Where the baseline records every item this delta can name, resolved off the store's
 			// `(pair_id, remote_uuid)` index in ONE hold of the pair's lock, on the blocking thread
 			// the derivation already runs on. The resident `Uuid -> row` map this replaces cost
@@ -4796,15 +5161,18 @@ impl SyncEngine {
 			let observed = locked(&pair_store)
 				.synced_paths(pair, &delta_uuids(&delta), &[])
 				.map(|placed| {
-					observe_remote(
-						root,
-						pair_root,
-						&for_remote,
-						nodes,
-						&delta,
-						placed,
-						&mut ancestry,
-					)
+					match place_marked_versions(root, &mut nodes, &marks, &mut marked_chain) {
+						Ok(()) => observe_remote(
+							root,
+							pair_root,
+							&for_remote,
+							nodes,
+							&delta,
+							placed,
+							&mut ancestry,
+						),
+						Err(reason) => RemoteObserved::Full(reason),
+					}
 				});
 			(observed, delta)
 		})
@@ -5185,6 +5553,8 @@ impl SyncEngine {
 			remote_emptied,
 			holds,
 			failures: inputs.failures,
+			released_mismatches: Vec::new(),
+			edits_over_marks: Vec::new(),
 			facts,
 			remote_blocked: remote_rules.blocked,
 			remote_rule_errors: remote_rules.errors,
@@ -5499,6 +5869,8 @@ impl SyncEngine {
 			remote_emptied,
 			holds,
 			failures,
+			released_mismatches: Vec::new(),
+			edits_over_marks: Vec::new(),
 			facts,
 			remote_blocked,
 			remote_rule_errors: remote_rules.errors,
@@ -6201,23 +6573,14 @@ impl SyncEngine {
 			.iter()
 			.map(|(path, error)| (path.as_str(), error.as_str()))
 			.collect();
-		// Only an action that landed ends a streak. One a cancel dropped, a halt held back, or a
-		// directory create or move that failed held under it never ran, and proves nothing about
-		// its path: clearing its streak would hand a permanently broken path a fresh set of retries
-		// every time someone pauses or the remote is down. One that landed but whose record failed
-		// is a failure too, and keeps its streak.
-		let landed: HashSet<&str> = report.landed.iter().map(String::as_str).collect();
-		let cleared: Vec<String> = ends
-			.into_iter()
-			.filter(|(by, _)| landed.contains(by.as_str()) && !failed.contains_key(by.as_str()))
-			.map(|(_, ended)| ended)
-			.collect();
+		let cleared = cleared_streaks(ends, report);
 		let recorded: Vec<(String, String)> = failed
 			.iter()
 			.map(|(path, error)| ((*path).to_string(), (*error).to_string()))
 			.collect();
 		// Owned for the closure that writes them, as `recorded` is.
 		let transient = report.transient_failures.clone();
+		let mismatched = report.mismatched.clone();
 		let spacing = i64::try_from(TRANSIENT_FAILURE_SPACING.as_millis()).unwrap_or(i64::MAX);
 		let store = match self.pair_store(pair).await {
 			Ok(store) => store,
@@ -6241,6 +6604,20 @@ impl SyncEngine {
 			for (path, error) in &transient {
 				if let Err(e) = store.record_spaced_failure(pair, path, error, now, spacing) {
 					problems.push(format!("{path}: recording the failure count failed: {e}"));
+				}
+			}
+			for download in &mismatched {
+				if let Err(e) = store.record_mismatch(
+					pair,
+					&download.rel_path,
+					download.version,
+					&download.error,
+					now,
+				) {
+					problems.push(format!(
+						"{}: recording that its remote content does not match its hash failed: {e}",
+						download.rel_path
+					));
 				}
 			}
 			if !cleared.is_empty() {
@@ -6268,6 +6645,11 @@ impl SyncEngine {
 	/// [`UnsyncableReason::RepeatedFailure`]). Without it the engine tries such a path once per
 	/// [`PATH_FAILURE_RETRY_INTERVAL`] on its own.
 	///
+	/// It also ends the skip of a remote file whose content did not match its hash (see
+	/// [`UnsyncableReason::RemoteContentHashMismatch`]): the next pass plans the path as usual, which
+	/// downloads that version again, and marks it again, if it is still the one there. That pass reads
+	/// both sides whole, as the change that named the version is gone.
+	///
 	/// Idempotent — a path with no failure streak is left alone rather than erroring, so a caller
 	/// can retry a whole reported list without checking each entry first. Errors only if the pair
 	/// is unknown.
@@ -6286,13 +6668,16 @@ impl SyncEngine {
 		// the runtime thread, so a caller retrying a path cannot block one.
 		off_store(&store, move |store| store.clear_failure(pair, &rel_path))
 			.await?
-			.map_err(|e| db_error(e, "clearing a path's failure count"))
+			.map_err(|e| db_error(e, "clearing a path's failure count"))?;
+		self.note_failures_cleared(pair).await;
+		Ok(())
 	}
 
 	/// [`retry_path`](Self::retry_path) for every path of `pair` with a failure streak: each is
 	/// planned again on the next pass, whatever its failure history, and every other pair's streaks
 	/// are left alone. For a pair whose paths all failed through one outage, which would otherwise
-	/// have to be retried one path at a time.
+	/// have to be retried one path at a time. It ends the skip of a remote file that did not match
+	/// its hash as `retry_path` does.
 	///
 	/// Like `retry_path`, it runs no pass itself: the next one plans the paths, and
 	/// [`request_pass`](Self::request_pass) asks for it now. Idempotent — a pair with no streak is
@@ -6310,7 +6695,16 @@ impl SyncEngine {
 		// flight may hold for as long as its baseline read takes.
 		off_store(&store, move |store| store.clear_all_failures(pair))
 			.await?
-			.map_err(|e| db_error(e, "clearing the pair's failure counts"))
+			.map_err(|e| db_error(e, "clearing the pair's failure counts"))?;
+		self.note_failures_cleared(pair).await;
+		Ok(())
+	}
+
+	/// Record that a path's failure row went, so the next pass reads both sides whole. A hash
+	/// mismatch's row is what kept its path decided, and the change that named the version went with
+	/// the pass that read it, so a pass narrowed to its changelists would find nothing to plan there.
+	async fn note_failures_cleared(&self, pair: PairId) {
+		self.force_full_pass(pair, FullPassReason::Requested).await;
 	}
 
 	/// Ask `pair`'s [`watch`](Self::watch) for a pass now — a "sync now" button — rather than at
@@ -7157,6 +7551,13 @@ impl SyncEngine {
 		});
 
 		report.unsyncable = prep.unsyncable();
+		forget_released_mismatches(
+			pair,
+			&store,
+			mem::take(&mut prep.released_mismatches),
+			&mut report,
+		)
+		.await;
 		report.ignored = prep.ignored();
 		report.errors.extend(prep.local_scan.reported_errors());
 		// Capped at the source, so this copies a hundred paths at most.
@@ -7840,7 +8241,16 @@ fn screen_plan(
 	let collisions = prep.collisions();
 	if let Some(mut blocking) = Blocking::new(&blocked, &ignored, &collisions) {
 		screen.each(Rows::Moves, |action| blocking.note(&action))?;
-		dropped += screen.retain(Rows::All, |action| blocking.keeps(action))?;
+		// What a hash mismatch keeps skipping is owed to the next pass anyway, so it is no drop.
+		let mut owed = 0;
+		let taken = screen.retain(Rows::All, |action| {
+			let keeps = blocking.keeps(action);
+			if !keeps && prep.skips_for_mismatch(action) {
+				owed += 1;
+			}
+			keeps
+		})?;
+		dropped += taken.saturating_sub(owed);
 	}
 	let blocked_rules = prep.blocked_rules();
 	let mut withholding = Withholding::new(
@@ -8020,7 +8430,8 @@ impl<'s> Blocking<'s> {
 		if self.blocks(path) {
 			tracing::debug!(
 				"reconcile: skipping {} — its path is blocked (a name the remote rejects, \
-				 {MAX_PATH_FAILURES} consecutive failures, an ignore rule, or a name collision)",
+				 {MAX_PATH_FAILURES} consecutive failures, a remote file that does not match its \
+				 hash, an ignore rule, or a name collision)",
 				action.describe()
 			);
 			return false;
@@ -8066,8 +8477,8 @@ impl<'s> Blocking<'s> {
 /// - Above a path of a name collision (`collisions`), on either side, both deletions wait: a twin
 ///   the scan or the view left out of its side is still there, and the directory is not empty.
 ///
-/// A deletion around a path blocked for any other reason (a rejected name, an alias, a park) runs as
-/// it did, into the recoverable quarantine or trash.
+/// A deletion around a path blocked for any other reason (a rejected name, an alias, a park, a remote
+/// file skipped for not matching its hash) runs as it did, into the recoverable quarantine or trash.
 ///
 /// Which paths wait is decided by the deletions alone, so every deletion is
 /// [`note`](Self::note)d before any action is asked about.
@@ -8380,6 +8791,7 @@ fn restore_landed(prep: &Prepared, state: &guard::ScreenState, report: &SyncRepo
 		&& report.interrupted == 0
 		&& report.pass_failure().is_none()
 		&& report.failed_paths.is_empty()
+		&& report.mismatched.is_empty()
 		&& !prep.read.is_scoped()
 		&& state.absence_trusted()
 		&& report.guard.is_none()

@@ -1067,7 +1067,8 @@ fn unsyncable_notices(unsyncable: &[UnsyncablePath]) -> Vec<String> {
 				| UnsyncableReason::RemoteUndecodable
 				| UnsyncableReason::RemoteInvalidName { .. }
 				| UnsyncableReason::RemoteBrokenParent
-				| UnsyncableReason::LocalAlias { .. } => "",
+				| UnsyncableReason::LocalAlias { .. }
+				| UnsyncableReason::RemoteContentHashMismatch { .. } => "",
 			};
 			format!("Cannot sync {}: {}{hint}", path.rel_path, path.reason)
 		})
