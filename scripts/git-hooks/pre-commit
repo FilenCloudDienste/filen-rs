@@ -79,9 +79,10 @@ fi
 # Default clippy config — the cheapest of the four CI clippy invocations.
 # heif-decoder is excluded because its cmake-rs build breaks incremental compiles.
 # See https://github.com/rust-lang/cmake-rs/issues/248
+# `filen-cli/cli-live-tests` builds the CLI's live test targets, which are gated on it.
 if have cargo; then
 	run "cargo clippy -- -D warnings" \
-		cargo clippy --workspace --exclude heif-decoder --all-targets -- -D warnings
+		cargo clippy --workspace --exclude heif-decoder --all-targets -F filen-cli/cli-live-tests -- -D warnings
 fi
 
 # UniFFI clippy for filen-sdk-rs (matches the mobile bindings build surface).

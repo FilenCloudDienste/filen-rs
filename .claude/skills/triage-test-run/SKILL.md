@@ -1,6 +1,6 @@
 ---
 name: triage-test-run
-description: Diagnose a red GitHub Actions run of this repo — the nightly `Tests` matrix (six native legs, test-wasm, test-2fa) or `Continuous Integration` — from a run id / URL or "why was last night red". Fetches every leg's log, parses the failures, groups them by root cause, investigates + live-confirms + adversarially refutes each cause with a fixed Sonnet/Opus workflow, and delivers a table (issue, kind, failures caused, legs, recurrence, confirmed?, suggested fix, complexity, blocks CI / owner) with per-issue details. Diagnosis only — fixes are suggested, never applied.
+description: Diagnose a red GitHub Actions run of this repo — the nightly `Tests` matrix (six native legs, test-wasm, test-2fa, test-sync-engine, six test-cli legs) or `Continuous Integration` — from a run id / URL or "why was last night red". Fetches every leg's log, parses the failures, groups them by root cause, investigates + live-confirms + adversarially refutes each cause with a fixed Sonnet/Opus workflow, and delivers a table (issue, kind, failures caused, legs, recurrence, confirmed?, suggested fix, complexity, blocks CI / owner) with per-issue details. Diagnosis only — fixes are suggested, never applied.
 ---
 
 # Triage a test run
@@ -50,7 +50,12 @@ gh run list --repo FilenCloudDienste/filen-rs --workflow test.yml --commit <sha>
 to 4 h 30 m; a run still `in_progress` has partial logs — say so and wait or triage the finished
 legs). A run id or URL from the user wins. `Tests` = 6 native legs (`test (os, V1|V2)`: three OSes ×
 two accounts, V1 and V2, plus one share account) + `test-wasm` (chromium then firefox, one after
-the other; firefox runs even when chromium fails) + `test-2fa (V1|V2)` after the matrix.
+the other; firefox runs even when chromium fails) + `test-2fa (V1|V2)` after the matrix, then
+`test-sync-engine` (Linux, V2: the cache and sync engine live binaries, one step each), then
+`test-cli (os, V2|V1)`: the CLI's live targets (`-F cli-live-tests`), which the native legs do not
+build, as six legs (three OSes × V2 and V1) that run one at a time after both the sync engine's job
+and test-wasm. A CLI failure on either account shows up there, named by OS and account (the script
+prints such a leg as `test-cli-<os>-latest-V1`), not on the matrix legs.
 `Continuous Integration` = clippy / fmt / unit tests per OS + wasm; its failures are usually step
 errors (a clippy `error:`, a rustfmt `Diff in`), which the script turns into `STEP` failure records
 and clusters like tests, so the rest of the procedure is the same.

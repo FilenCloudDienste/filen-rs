@@ -111,6 +111,69 @@ libc = "0.2.188"
 [features]
 default = []
 is_docker = []
+# Test-only: builds the test targets that log into the test account. Every one of them shares the
+# account's drive-write lock, so CI runs them in a job of their own, one after the other, instead
+# of in the concurrent test matrix, which builds without it. The other targets need no account.
+# Cargo discovers every tests/*.rs on its own and builds it without the feature unless a `[[test]]`
+# entry below says otherwise, so a new target that logs in must get an entry here. (`autotests =
+# false` would not make that the default: it would leave an unlisted file unbuilt everywhere.)
+cli-live-tests = []
+
+[[test]]
+name = "account_tests"
+required-features = ["cli-live-tests"]
+
+[[test]]
+name = "auth_tests"
+required-features = ["cli-live-tests"]
+
+[[test]]
+name = "commands_tests"
+required-features = ["cli-live-tests"]
+
+[[test]]
+name = "completion_tests"
+required-features = ["cli-live-tests"]
+
+[[test]]
+name = "fs_tests"
+required-features = ["cli-live-tests"]
+
+[[test]]
+name = "manuel_tests"
+required-features = ["cli-live-tests"]
+
+[[test]]
+name = "misc_tests"
+required-features = ["cli-live-tests"]
+
+[[test]]
+name = "notes_tests"
+required-features = ["cli-live-tests"]
+
+[[test]]
+name = "qa_commands_tests"
+required-features = ["cli-live-tests"]
+
+[[test]]
+name = "qa_output_tests"
+required-features = ["cli-live-tests"]
+
+[[test]]
+name = "servers_tests"
+required-features = ["cli-live-tests"]
+
+[[test]]
+name = "shares_tests"
+required-features = ["cli-live-tests"]
+
+[[test]]
+name = "sync_tests"
+required-features = ["cli-live-tests"]
+
+[[test]]
+name = "transfer_tests"
+required-features = ["cli-live-tests"]
 
 [lints]
 workspace = true

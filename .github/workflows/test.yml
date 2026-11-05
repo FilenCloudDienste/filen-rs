@@ -370,6 +370,105 @@ jobs:
         env:
           TEST_EMAIL: ${{ secrets['V2_TEST_ACC_EMAIL'] }}
           TEST_PASSWORD: ${{ secrets['V2_TEST_ACC_PASS'] }}
+  test-cli:
+    # The CLI's live test targets (`required-features = ["cli-live-tests"]`, which the matrix
+    # does not enable) run here, after the sync engine's job and the wasm one, so that nothing
+    # else touches the accounts: each of them takes its drive-write lock, and where three matrix
+    # legs shared an account they waited minutes for it, past the time limits some tests set.
+    # test-wasm has no `needs` and logs in to the V2 and the share account beside the matrix, so
+    # it is waited for here too. They run on both accounts, V2 and V1, as they did in the matrix.
+    # `max-parallel: 1` spans the whole matrix, so the six legs run one after the other: no V1
+    # leg runs beside a V2 one, all of them share the share account, and none overlaps the sync
+    # engine's job, whose cache tests use it too.
+    # Running every OS keeps the CLI's platform-specific paths covered: Windows has no Ctrl-C to
+    # send and expands upload wildcards itself, and `servers_tests` (unix) mount through FUSE 3
+    # on Linux and through `nfsmount` on macOS. `-p filen-cli` keeps heif-decoder out of the
+    # build, so no meson/ninja/nasm here. The offline targets run here as well, at little cost.
+    # Cargo still discovers every tests/*.rs on its own, so a new target that logs in needs its
+    # own `[[test]]` entry with the feature in filen-cli/Cargo.toml: without one it also builds
+    # and runs in the matrix legs, side by side on a shared account.
+    needs: [test, test-2fa, test-sync-engine, test-wasm]
+    if: |
+      !cancelled() && (
+        github.event_name == 'schedule' ||
+        (github.event_name == 'workflow_dispatch' && inputs.sync_stress_n == '') ||
+        contains(github.event.head_commit.message, '[test]') ||
+        contains(github.event.pull_request.title, '[test]') ||
+        contains(github.event.pull_request.body, '[test]')
+      )
+    strategy:
+      # One leg failing must not cancel the ones still queued behind it.
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        version: [V2, V1]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-02-20
+      - uses: Swatinem/rust-cache@a84bfdc502f07db5a85dd9d7a30f91a931516cc5
+        with:
+          shared-key: cargo-build-test-${{ matrix.os }}
+          prefix-key: ''
+          add-rust-environment-hash-key: 'false'
+          save-if: false
+      - name: Remove the broken fusermount3 shadow (actions/runner-images#14516)
+        if: runner.os == 'Linux'
+        run: |
+          # See the test matrix's step of the same name.
+          if [ -e /usr/local/bin/fusermount3 ]; then
+            sudo rm /usr/local/bin/fusermount3
+          fi
+      - name: Install Wild linker
+        if: runner.os == 'Linux'
+        uses: taiki-e/cache-cargo-install-action@v2
+        with:
+          tool: wild-linker@0.9.0
+        env:
+          # Env beats .cargo/config.toml: a cache-miss cargo install runs in the repo
+          # checkout, which would otherwise need Wild to build Wild.
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: cc
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -Zhigher-ranked-assumptions
+      # The test matrix's Windows Update hold, in short: see the comment there.
+      - name: Hold off Windows Update
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $au = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU'
+          $maint = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Schedule\Maintenance'
+          New-Item -Path $au -Force | Out-Null
+          New-Item -Path $maint -Force | Out-Null
+          Set-ItemProperty -Path $au -Name NoAutoUpdate -Value 1 -Type DWord
+          Set-ItemProperty -Path $au -Name AUOptions -Value 1 -Type DWord
+          Set-ItemProperty -Path $maint -Name MaintenanceDisabled -Value 1 -Type DWord
+          foreach ($svc in 'wuauserv', 'UsoSvc', 'WaaSMedicSvc') {
+            Stop-Service $svc -Force -ErrorAction SilentlyContinue
+            Set-Service $svc -StartupType Disabled -ErrorAction SilentlyContinue
+            Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\$svc" -Name Start -Value 4 -ErrorAction SilentlyContinue
+          }
+          '\Microsoft\Windows\UpdateOrchestrator\', '\Microsoft\Windows\WindowsUpdate\' | ForEach-Object {
+            Get-ScheduledTask -TaskPath $_ -ErrorAction SilentlyContinue |
+              Disable-ScheduledTask -ErrorAction SilentlyContinue | Out-Null
+          }
+          Get-Service wuauserv, UsoSvc, WaaSMedicSvc |
+            Select-Object Name, Status, StartType | Out-String -Width 120 | Write-Host
+      - name: Run the CLI's tests
+        run: cargo test -p filen-cli -F cli-live-tests --no-fail-fast
+        env:
+          TEST_EMAIL: ${{ secrets[format('{0}_TEST_ACC_EMAIL', matrix.version)] }}
+          TEST_PASSWORD: ${{ secrets[format('{0}_TEST_ACC_PASS', matrix.version)] }}
+          TEST_SHARE_EMAIL: ${{ secrets['V2_SHARE_ACC_EMAIL'] }}
+          TEST_SHARE_PASSWORD: ${{ secrets['V2_SHARE_ACC_PASS'] }}
+          # See the test matrix's `GITHUB_TOKEN`.
+          GITHUB_TOKEN: ${{ github.token }}
+          RUST_LOG: debug
   test-sync-engine-stress:
     # Opt-in scale lane: dispatch the workflow with `sync_stress_n` set and only this job runs
     # (every other job skips on a non-empty input), so nothing else contends for the account's

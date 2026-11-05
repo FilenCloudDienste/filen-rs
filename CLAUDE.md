@@ -117,6 +117,9 @@ npm --prefix filen-sdk-rs/web run test:napi:live
 # The rclone daemon against a real rclone whose remotes alias a local directory (no account):
 # FILEN_TEST_RCLONE, or -F rclone-managed,test-seams for the managed download
 FILEN_TEST_RCLONE=/path/to/rclone cargo test -p filen-sdk-rs -F rclone,test-seams --test rclone_daemon_tests
+# The CLI's tests: the targets that log into the test account are gated on `cli-live-tests`
+# (filen-cli/Cargo.toml lists them); without it only the offline ones build
+cargo test -p filen-cli -F cli-live-tests
 ```
 
 Integration tests require environment variables (can be in `.env`):
@@ -199,7 +202,7 @@ wasi-sdk. Every `heif-decoder` pass lives in pre-push.
 
 - **pre-commit** — `cargo fmt --all --check`, `cargo fmt` inside `filen-sdk-rs`, `taplo
   lint`/`fmt --check`, `sqlfluff` on staged `.sql`, then six clippy passes: workspace
-  (`--exclude heif-decoder --all-targets`), `-p filen-sdk-rs -F uniffi,http-provider`,
+  (`--exclude heif-decoder --all-targets -F filen-cli/cli-live-tests`), `-p filen-sdk-rs -F uniffi,http-provider`,
   `-p filen-sdk-rs -F sync-engine-live-tests,malformed --all-targets` and
   `-p filen-sdk-rs -F napi,cache,sync-engine,rclone --all-targets` (the same commands as ci-linux), and
   wasm32 `-F wasm-full,cache` + `--no-default-features -F service-worker` (both run from the
@@ -228,7 +231,8 @@ wasi-sdk. Every `heif-decoder` pass lives in pre-push.
   repository; cite another repository's commit as `<repo>@<sha>`.
   `fixup!`/`squash!`/`amend!` subjects pass, so the `fold-fixups` flow works.
 - **pre-push** — first refuses to push unfolded `fixup!`/`squash!`/`amend!` commits. Then
-  the heavier checks: the `heif-decoder` feature-combination clippy, `clippy --tests`, the
+  the heavier checks: the `heif-decoder` feature-combination clippy, `clippy --tests` (with
+  `-F filen-cli/cli-live-tests`, as the workspace pass in pre-commit), the
   `-p filen-sdk-rs -F uniffi,http-provider,cache,sync-engine,rclone,test-seams --all-targets`
   clippy pass (rclone's uniffi exports and `rclone_daemon_tests`, as ci-linux runs it), both wasm32 passes on the feature sets `ci-wasm` uses (`-F wasm-full,cache,heif-decoder`
   and `--no-default-features -F service-worker,heif-decoder`, i.e. what `wasm-pack.sh`
@@ -265,7 +269,11 @@ The sync engine's live tests run only nightly (or on a `[test]` commit/PR), in `
 `sync_engine_blackbox_tests` and `sync_suite`, all `-p filen-sdk-rs -F sync-engine-live-tests,malformed`,
 then the mobile binding's `sync_engine_js_tests` with `-F uniffi,sync-engine`, the engine
 binaries with `--test-threads=1`, and last the desktop addon's `test:napi:live` after a
-`build:napi`.
+`build:napi`. The CLI's live targets (`-p filen-cli -F cli-live-tests`) run after that, in
+`test-cli`, on the V2 and the V1 account and on Linux, macOS and Windows, all six legs one
+after the other (`max-parallel: 1`) once test-wasm has finished too, so none of them overlaps
+another, the sync engine's job or the wasm tests; the matrix legs, which share an account
+three at a time, build only the CLI's offline targets.
 
 The auto-formatter some editors/agents run on save does **not** match this repo's nightly
 `cargo fmt` output and will fail the pre-commit gate. Run `cargo fmt -p <crate>` before

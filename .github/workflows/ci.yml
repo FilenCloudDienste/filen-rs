@@ -64,7 +64,7 @@ jobs:
       - name: Run clippy
         run: cargo clippy -- -D warnings
       - name: Run clippy on tests
-        run: cargo clippy --tests -- -D warnings
+        run: cargo clippy --tests -F filen-cli/cli-live-tests -- -D warnings
       - name: Run clippy on tests with cache
         run: cargo clippy --tests -F cache -- -D warnings
       # The sync engine's live test binaries are `required-features = ["sync-engine-live-tests"]`
@@ -149,7 +149,7 @@ jobs:
       - name: Run clippy
         run: cargo clippy -- -D warnings
       - name: Run clippy on tests
-        run: cargo clippy --tests -- -D warnings
+        run: cargo clippy --tests -F filen-cli/cli-live-tests -- -D warnings
       - name: Run clippy on tests with cache
         run: cargo clippy --tests -F cache -- -D warnings
       - name: Run unit tests
@@ -215,7 +215,7 @@ jobs:
       - name: Run clippy
         run: cargo clippy -- -D warnings
       - name: Run clippy on tests
-        run: cargo clippy --tests -- -D warnings
+        run: cargo clippy --tests -F filen-cli/cli-live-tests -- -D warnings
       - name: Run clippy on tests with cache
         run: cargo clippy --tests -F cache -- -D warnings
       - name: Run clippy iOS
