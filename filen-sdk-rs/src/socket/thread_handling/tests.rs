@@ -392,7 +392,11 @@ mod pipeline {
 			reconnect_delay: RECONNECT_DELAY,
 			ping_interval: PING_INTERVAL,
 			user_id: 0,
-			proxy_backoff: ProxyBackoff::default(),
+			// The top of each range, so pauses are exact.
+			backoff: ReconnectBackoff {
+				jitter: || 1.0,
+				..ReconnectBackoff::default()
+			},
 		}
 	}
 
@@ -450,16 +454,14 @@ mod pipeline {
 
 	// ----- tests -----
 
-	/// Connecting through a proxy that keeps failing pauses longer after each failure, and a
-	/// connection made resets the pause: here four failures, a session the server closes at
-	/// once, two failures, and a session that stays. A direct connection retries each second.
+	/// Attempts that keep failing pause longer after each failure, through a proxy or not, and
+	/// an authenticated connection resets the pause: here four failures, a session the server
+	/// closes at once (reconnected after `RECONNECT_DELAY`), two failures, and a session that
+	/// stays.
 	#[tokio::test(start_paused = true)]
-	async fn failures_through_a_proxy_back_off_and_a_connection_resets_the_pause() {
+	async fn failures_back_off_and_a_connection_resets_the_pause() {
 		let failed = || FakeConnection::new(vec![ServerAction::Close]);
-		for (proxied, expected) in [
-			(true, [1, 2, 4, 8, 1, 1, 2]),
-			(false, [1, 1, 1, 1, 1, 1, 1]),
-		] {
+		for proxied in [true, false] {
 			let (request_sender, request_receiver) = tokio::sync::mpsc::channel(16);
 			let final_sender = request_sender.clone();
 			prime_routed(
@@ -489,20 +491,120 @@ mod pipeline {
 
 			assert_eq!(
 				pauses(),
-				expected.map(Duration::from_secs),
+				[1, 2, 4, 8, 1, 1, 2].map(Duration::from_secs),
 				"proxied: {proxied}"
 			);
 		}
 	}
 
+	/// With real jitter each pause lies in the upper half of its doubling range, so the first
+	/// retry is never later than `RECONNECT_DELAY`.
+	#[tokio::test(start_paused = true)]
+	async fn jittered_pauses_stay_in_the_upper_half_of_their_range() {
+		let (request_sender, request_receiver) = tokio::sync::mpsc::channel(16);
+		let final_sender = request_sender.clone();
+		let mut connections: Vec<_> = (0..8)
+			.map(|_| FakeConnection::new(vec![ServerAction::Close]))
+			.collect();
+		connections.push(
+			FakeConnection::new(handshake_then(vec![ServerAction::Hang]))
+				.with_on_connect(move || drop(final_sender)),
+		);
+		prime(connections);
+		let (_events, _id_receiver, _canceller) = add_recording_listener(&request_sender).await;
+		drop(request_sender);
+
+		let config = WebSocketConfig {
+			backoff: ReconnectBackoff::default(),
+			..test_config()
+		};
+		run_async_websocket_task::<FakeSocket, _, _, _, _, _, _, _, _>(
+			config,
+			request_receiver,
+			Arc::new(NoopCrypter),
+			test_private_key(),
+		)
+		.await;
+
+		let ceilings = [1, 2, 4, 8, 16, 32, 60, 60].map(Duration::from_secs);
+		let pauses = pauses();
+		assert_eq!(pauses.len(), ceilings.len());
+		for (pause, ceiling) in pauses.into_iter().zip(ceilings) {
+			assert!(
+				pause >= ceiling / 2 && pause <= ceiling,
+				"{pause:?} outside {:?}..={ceiling:?}",
+				ceiling / 2
+			);
+		}
+	}
+
+	/// A listener registered during a long pause is taken at once, not when the pause ends.
+	#[tokio::test(start_paused = true)]
+	async fn requests_are_served_during_a_pause() {
+		let (request_sender, request_receiver) = tokio::sync::mpsc::channel(16);
+		prime(vec![FakeConnection::new(vec![ServerAction::Close])]);
+		let mut config = test_config();
+		// The next failure pauses for a minute.
+		for _ in 0..6 {
+			config.backoff.failed();
+		}
+		let task = run_async_websocket_task::<FakeSocket, _, _, _, _, _, _, _, _>(
+			config,
+			request_receiver,
+			Arc::new(NoopCrypter),
+			test_private_key(),
+		);
+		let driver = async move {
+			// Let the attempt fail and the pause begin.
+			sleep(Duration::from_secs(1)).await;
+			assert_eq!(connect_count(), 1);
+
+			let begin = Instant::now();
+			let (callback, _events) = recording_listener();
+			let (id_sender, id_receiver) = tokio::sync::oneshot::channel();
+			let (_canceller, cancel_receiver) = tokio::sync::oneshot::channel();
+			request_sender
+				.send(SocketRequest::AddListenerSync {
+					callback,
+					event_types: None,
+					id_sender,
+					cancel_receiver,
+				})
+				.await
+				.unwrap();
+			id_receiver.await.unwrap().unwrap();
+			assert_eq!(begin.elapsed(), Duration::ZERO);
+			assert_eq!(connect_count(), 1, "the pause must not be cut short");
+			// Closing the channel ends the task without waiting out the pause.
+			drop(request_sender);
+		};
+		let begin = Instant::now();
+		tokio::join!(task, driver);
+		assert_eq!(begin.elapsed(), Duration::from_secs(1));
+	}
+
 	/// The pause doubles up to its ceiling and stays there until a connection resets it.
 	#[test]
-	fn the_proxy_pause_doubles_to_its_ceiling() {
-		let mut backoff = ProxyBackoff::default();
+	fn the_pause_doubles_to_its_ceiling() {
+		let mut backoff = ReconnectBackoff {
+			jitter: || 1.0,
+			..ReconnectBackoff::default()
+		};
 		let pauses: Vec<u64> = (0..9).map(|_| backoff.failed().as_secs()).collect();
 		assert_eq!(pauses, [1, 2, 4, 8, 16, 32, 60, 60, 60]);
 		backoff.reset();
 		assert_eq!(backoff.failed(), RECONNECT_DELAY);
+	}
+
+	#[test]
+	fn jitter_spans_the_upper_half() {
+		let ceiling = Duration::from_secs(60);
+		assert_eq!(jittered(ceiling, 0.0), Duration::from_secs(30));
+		assert_eq!(jittered(ceiling, 0.5), Duration::from_secs(45));
+		assert_eq!(jittered(ceiling, 1.0), ceiling);
+		assert_eq!(jittered(ceiling, -1.0), Duration::from_secs(30));
+		assert_eq!(jittered(ceiling, 2.0), ceiling);
+		assert_eq!(jittered(RECONNECT_DELAY, 0.0), Duration::from_millis(500));
 	}
 
 	#[tokio::test(start_paused = true)]

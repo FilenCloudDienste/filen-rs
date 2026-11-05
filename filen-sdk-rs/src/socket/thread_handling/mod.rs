@@ -16,7 +16,7 @@ use crate::{
 use super::{
 	consts::{
 		CONNECT_TIMEOUT, MESSAGE_CONNECT_PAYLOAD, MESSAGE_EVENT_PAYLOAD, PING_INTERVAL,
-		PROXY_RECONNECT_MAX, RECONNECT_DELAY,
+		RECONNECT_DELAY, RECONNECT_MAX,
 	},
 	events::DecryptedSocketEvent,
 	listener_manager::{ConnectedListenerManager, DisconnectedListenerManager, ListenerManagerExt},
@@ -301,41 +301,50 @@ pub(super) struct WebSocketConfig {
 	pub(super) reconnect_delay: Duration,
 	pub(super) ping_interval: Duration,
 	pub(super) user_id: u64,
-	/// The pause before the next attempt after one through a proxy failed.
-	pub(super) proxy_backoff: ProxyBackoff,
+	/// The pause before the next attempt after one failed.
+	pub(super) backoff: ReconnectBackoff,
 }
 
-/// The pause between attempts to connect through a proxy that fail: `RECONNECT_DELAY` at
-/// first, doubled after each failure up to [`PROXY_RECONNECT_MAX`], and back to the start once
-/// a connection is made. A proxy that does not carry the socket (one that refuses websockets, or
-/// a SOCKS or CONNECT request) refuses every attempt, and the sync engine catches up over HTTP
-/// meanwhile, so retrying each second only loads the proxy. A direct connection keeps
-/// `RECONNECT_DELAY`, so the socket is back moments after the network is.
+/// The pause between attempts to connect that fail, whatever failed (the network, TLS, a proxy,
+/// the handshake): about `RECONNECT_DELAY` at first, doubled after each failure up to
+/// [`RECONNECT_MAX`], and back to the start once a connection is authenticated. Each pause is
+/// drawn from its upper half, so clients that lost the server together do not return in step,
+/// and the first never exceeds `RECONNECT_DELAY`. A session that ends reconnects after
+/// `RECONNECT_DELAY`, as the backoff was reset when it began.
 #[derive(Debug)]
-pub(super) struct ProxyBackoff {
+pub(super) struct ReconnectBackoff {
 	next: Duration,
+	/// A fraction in `[0, 1]` that places a pause in the upper half of its range.
+	jitter: fn() -> f64,
 }
 
-impl Default for ProxyBackoff {
+impl Default for ReconnectBackoff {
 	fn default() -> Self {
 		Self {
 			next: RECONNECT_DELAY,
+			jitter: rand::random::<f64>,
 		}
 	}
 }
 
-impl ProxyBackoff {
+impl ReconnectBackoff {
 	/// The pause before the attempt after one that failed, growing for the one after that.
 	pub(super) fn failed(&mut self) -> Duration {
-		let pause = self.next;
-		self.next = self.next.saturating_mul(2).min(PROXY_RECONNECT_MAX);
-		pause
+		let ceiling = self.next;
+		self.next = self.next.saturating_mul(2).min(RECONNECT_MAX);
+		jittered(ceiling, (self.jitter)())
 	}
 
-	/// A connection was made: the next failure pauses for `RECONNECT_DELAY` again.
+	/// A connection was authenticated: the next failure pauses for about `RECONNECT_DELAY` again.
 	pub(super) fn reset(&mut self) {
-		*self = Self::default();
+		self.next = RECONNECT_DELAY;
 	}
+}
+
+/// A pause between half of `ceiling` and `ceiling`, placed by `fraction` (clamped to `[0, 1]`).
+fn jittered(ceiling: Duration, fraction: f64) -> Duration {
+	let half = ceiling / 2;
+	half + (ceiling - half).mul_f64(fraction.clamp(0.0, 1.0))
 }
 
 /// Why a connection setup failed, and whether it went through a proxy.
@@ -357,7 +366,7 @@ fn spawn_websocket_thread(
 		reconnect_delay: RECONNECT_DELAY,
 		ping_interval: PING_INTERVAL,
 		user_id,
-		proxy_backoff: ProxyBackoff::default(),
+		backoff: ReconnectBackoff::default(),
 	};
 
 	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
@@ -561,7 +570,7 @@ where
 				match result {
 					Ok((streams, interval)) => {
 						config.ping_interval = interval;
-						config.proxy_backoff.reset();
+						config.backoff.reset();
 						return Some(streams);
 					}
 					Err(SetupFailure { error, .. })
@@ -571,20 +580,41 @@ where
 						return None;
 					}
 					Err(SetupFailure { error, proxied }) => {
-						let pause = if proxied {
-							config.proxy_backoff.failed()
-						} else {
-							config.reconnect_delay
-						};
+						let pause = config.backoff.failed();
 						tracing::warn!(
-							"Error initializing WebSocket connection: {}, retrying in {:?}...",
+							"Error initializing WebSocket connection{}: {}, retrying in {:?}...",
+							if proxied { " through a proxy" } else { "" },
 							error,
 							pause
 						);
-						sleep(pause).await;
+						if !pause_serving_requests(pause, request_receiver, listeners).await {
+							return None;
+						}
 					}
 				}
 			}
+		}
+	}
+}
+
+/// Waits `pause` while still taking listener requests, so a registration or removal is not
+/// held up for as long as a backoff lasts. False once the request channel has closed.
+async fn pause_serving_requests(
+	pause: Duration,
+	request_receiver: &mut tokio::sync::mpsc::Receiver<SocketRequest>,
+	listeners: &mut DisconnectedListenerManager,
+) -> bool {
+	let mut deadline = std::pin::pin!(sleep(pause));
+	loop {
+		tokio::select! {
+			biased;
+			request = request_receiver.recv() => {
+				let Some(request) = request else {
+					return false;
+				};
+				handle_request(request, listeners);
+			}
+			_ = deadline.as_mut() => return true,
 		}
 	}
 }
@@ -640,7 +670,15 @@ async fn run_async_websocket_task<W, S, R, RV, US, UR, T, UW, PT>(
 		// Demote
 		disconnected_listeners = connected_listeners.into_disconnected();
 
-		sleep(config.reconnect_delay).await;
+		if !pause_serving_requests(
+			config.reconnect_delay,
+			&mut request_receiver,
+			&mut disconnected_listeners,
+		)
+		.await
+		{
+			break;
+		}
 	}
 }
 

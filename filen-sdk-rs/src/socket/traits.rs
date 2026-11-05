@@ -60,8 +60,7 @@ where
 
 	async fn connect(request: T) -> Result<U, Error>;
 
-	/// Whether `request` connects through a proxy, whose failures are retried with a growing
-	/// pause (see `ProxyBackoff`).
+	/// Whether `request` connects through a proxy, which a failure's log says.
 	fn proxied(_request: &T) -> bool {
 		false
 	}
