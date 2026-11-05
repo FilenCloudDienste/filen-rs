@@ -1834,8 +1834,9 @@ async fn scale_23_progress_events_emitted_and_bounded() {
 	assert!(report.errors.is_empty(), "{report:?}");
 	assert_eq!(report.uploaded, N, "{report:?}");
 	assert_eq!(report.remote_dirs_created, 1, "{report:?}");
+	let events = pass_events(&events);
 
-	// Lifecycle: PassStarted first, PassCompleted last.
+	// Lifecycle: PassStarted first (after any AwaitingRemote), PassCompleted last.
 	assert!(
 		matches!(events.first(), Some(SyncEvent::PassStarted { .. })),
 		"first event must be PassStarted: {:?}",

@@ -562,6 +562,7 @@ async fn observ_11_events_causal_ordering() {
 		.await
 		.unwrap();
 	assert!(report.errors.is_empty(), "{report:?}");
+	let events = pass_events(&events);
 
 	// The dir-create for dirA must precede the upload of dirA/file.txt.
 	let dir_idx = events
@@ -577,7 +578,7 @@ async fn observ_11_events_causal_ordering() {
 		"parent dir create must precede child upload: {events:?}"
 	);
 
-	// PassStarted is first; PassCompleted is last (after every per-action event).
+	// PassStarted is first (after any AwaitingRemote); PassCompleted is last (after every per-action event).
 	assert!(
 		matches!(events.first(), Some(SyncEvent::PassStarted { .. })),
 		"first event must be PassStarted: {events:?}"
@@ -1806,7 +1807,10 @@ async fn observ_add_throwing_listener_does_not_corrupt() {
 	assert!(r2.errors.is_empty(), "{r2:?}");
 	assert_eq!(r2.uploaded, 1, "{r2:?}");
 	assert!(
-		matches!(next.first(), Some(SyncEvent::PassStarted { .. })),
+		matches!(
+			pass_events(&next).first(),
+			Some(SyncEvent::PassStarted { .. })
+		),
 		"the next pass reports to the same observer again: {next:?}"
 	);
 	assert_eq!(

@@ -16,7 +16,7 @@ use std::{
 
 use filen_sdk_rs::fs::HasUUID;
 use filen_sdk_rs::sync_engine::{
-	PairId, PlanOutcome, SyncEngine, SyncMode, SyncReport, WatchHandle,
+	PairId, PlanOutcome, SyncEngine, SyncEvent, SyncMode, SyncReport, WatchHandle,
 };
 use uuid::Uuid;
 
@@ -332,6 +332,16 @@ pub async fn stage_named_dirs(sc: &SingleClient, names: &[&str]) -> Vec<Uuid> {
 		);
 	}
 	uuids
+}
+
+/// `events` without the [`SyncEvent::AwaitingRemote`] a pass sends before its `PassStarted` when
+/// the cache has not yet converged the pair's remote root, which against the live backend depends
+/// on how far the cache's listing has got.
+pub fn pass_events(events: &[SyncEvent]) -> &[SyncEvent] {
+	match events {
+		[SyncEvent::AwaitingRemote, rest @ ..] => rest,
+		_ => events,
+	}
 }
 
 /// Whether `report` holds back `names` — the top-level directories [`stage_case_colliding_dirs`]
