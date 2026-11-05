@@ -5,8 +5,8 @@
 //! names. wasm keeps the browser's TLS.
 //!
 //! Desktop and iOS use `rustls-platform-verifier`, which leaves revocation to the OS. Android asks
-//! the platform trust manager directly ([`trust_manager`], [`android`]), with no online revocation
-//! check; it needs the JVM first, and fails closed until it has it ([`ReadyGateVerifier`]). Where
+//! the platform trust manager directly ([`trust_manager`], [`android`]), over the system and
+//! user-installed CAs, with no online revocation check; it needs the JVM first, and fails closed until it has it ([`ReadyGateVerifier`]). Where
 //! the platform verifier cannot be built, desktop falls back to the bundled webpki roots; iOS
 //! fails every handshake closed instead ([`UnavailableVerifier`]).
 
@@ -139,7 +139,7 @@ fn record_error(message: String) {
 
 /// The certificate verifier behind this target's TLS.
 const BACKEND: &str = if cfg!(target_os = "android") {
-	"Android X509TrustManager, without online revocation"
+	"Android trust store (system and user CAs), without online revocation"
 } else if cfg!(target_vendor = "apple") {
 	"Apple Security framework (rustls-platform-verifier)"
 } else if cfg!(target_os = "windows") {

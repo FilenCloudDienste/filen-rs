@@ -30,9 +30,11 @@ static PLATFORM: OnceLock<Platform> = OnceLock::new();
 
 struct Platform {
 	vm: JavaVM,
-	/// `X509TrustManagerExtensions` over the default `TrustManagerFactory`'s `X509TrustManager`:
-	/// the system and user-installed roots and the app's network security config, with the
-	/// host-aware check that config's per-domain trust and pins need.
+	/// `X509TrustManagerExtensions` over a `TrustManagerFactory`'s `X509TrustManager` inited with
+	/// the `AndroidCAStore` key store: the system roots the user has not disabled and the
+	/// user-installed ones, whatever the app's network security config trusts (which for an app
+	/// targeting API 24 or later leaves out the user's). Its host-aware check runs the same chain
+	/// validation the platform's own HTTPS does, with no pins (the SDK's hosts have none).
 	trust: Global<JObject<'static>>,
 	/// `CertificateFactory.getInstance("X.509")`, which parses a DER certificate: Conscrypt's,
 	/// which keeps no state between calls.
@@ -41,35 +43,40 @@ struct Platform {
 	input_stream: Global<JClass<'static>>,
 	/// "RSA", the auth type the trust manager is told, whatever the key: Conscrypt's
 	/// `TrustManagerImpl` only refuses a null or empty one and never reads it otherwise (no key
-	/// usage is checked against it), and the platform's `RootTrustManager` and
+	/// usage is checked against it), and the default factory's `RootTrustManager` and
 	/// `NetworkSecurityTrustManager` pass it through.
 	auth_type: Global<JString<'static>>,
 }
 
 impl Platform {
 	fn new(env: &mut Env<'_>) -> jni::errors::Result<Self> {
-		let algorithm = env
+		// Conscrypt's `TrustedCertificateKeyStoreSpi` over its `TrustedCertificateStore`: the
+		// system CAs the user has not disabled and the user-installed ones.
+		let store_type = env.new_string("AndroidCAStore")?;
+		let store = env
 			.call_static_method(
-				jni_str!("javax/net/ssl/TrustManagerFactory"),
-				jni_str!("getDefaultAlgorithm"),
-				jni_sig!("()Ljava/lang/String;"),
-				&[],
-			)?
-			.l()?;
-		let factory = env
-			.call_static_method(
-				jni_str!("javax/net/ssl/TrustManagerFactory"),
+				jni_str!("java/security/KeyStore"),
 				jni_str!("getInstance"),
-				jni_sig!("(Ljava/lang/String;)Ljavax/net/ssl/TrustManagerFactory;"),
-				&[JValue::from(&algorithm)],
+				jni_sig!("(Ljava/lang/String;)Ljava/security/KeyStore;"),
+				&[JValue::from(&store_type)],
 			)?
 			.l()?;
-		// No KeyStore: the platform's own roots, as the app's network security config names them.
+		env.call_method(
+			&store,
+			jni_str!("load"),
+			jni_sig!("(Ljava/io/InputStream;[C)V"),
+			&[
+				JValue::from(&JObject::null()),
+				JValue::from(&JObject::null()),
+			],
+		)?
+		.v()?;
+		let factory = trust_manager_factory(env)?;
 		env.call_method(
 			&factory,
 			jni_str!("init"),
 			jni_sig!("(Ljava/security/KeyStore;)V"),
-			&[JValue::from(&JObject::null())],
+			&[JValue::from(&store)],
 		)?
 		.v()?;
 		let managers = env
@@ -203,6 +210,51 @@ impl Platform {
 	}
 }
 
+/// Conscrypt's own `TrustManagerFactory` (`HarmonyJSSE`'s PKIX), whose `TrustManagerImpl` reads
+/// an `AndroidCAStore` lazily from disk and which `X509TrustManagerExtensions` calls directly.
+/// The default factory (the network security config's) would load every CA in the store up
+/// front; it stands in only where Conscrypt's is missing.
+fn trust_manager_factory<'local>(env: &mut Env<'local>) -> jni::errors::Result<JObject<'local>> {
+	let algorithm = env.new_string("PKIX")?;
+	let provider = env.new_string("HarmonyJSSE")?;
+	match env
+		.call_static_method(
+			jni_str!("javax/net/ssl/TrustManagerFactory"),
+			jni_str!("getInstance"),
+			jni_sig!("(Ljava/lang/String;Ljava/lang/String;)Ljavax/net/ssl/TrustManagerFactory;"),
+			&[JValue::from(&algorithm), JValue::from(&provider)],
+		)
+		.and_then(|value| value.l())
+	{
+		Ok(factory) => return Ok(factory),
+		Err(e @ jni::errors::Error::JavaException) => {
+			let reason = match caught(env, e) {
+				Ok((name, message)) => format!("{name}: {message}"),
+				Err(refusal) => format!("{refusal:?}"),
+			};
+			tracing::warn!(
+				"Conscrypt's trust manager factory is unavailable ({reason}), using the default"
+			);
+		}
+		Err(e) => return Err(e),
+	}
+	let algorithm = env
+		.call_static_method(
+			jni_str!("javax/net/ssl/TrustManagerFactory"),
+			jni_str!("getDefaultAlgorithm"),
+			jni_sig!("()Ljava/lang/String;"),
+			&[],
+		)?
+		.l()?;
+	env.call_static_method(
+		jni_str!("javax/net/ssl/TrustManagerFactory"),
+		jni_str!("getInstance"),
+		jni_sig!("(Ljava/lang/String;)Ljavax/net/ssl/TrustManagerFactory;"),
+		&[JValue::from(&algorithm)],
+	)?
+	.l()
+}
+
 /// The class name and message of the Java exception `error` left pending, which is cleared; a
 /// [`Refusal::Failed`] for any other JNI error.
 fn caught(env: &mut Env<'_>, error: jni::errors::Error) -> Result<(String, String), Refusal> {
@@ -259,9 +311,12 @@ impl TrustManager for AndroidTrustManager {
 }
 
 /// Builds the platform trust manager the certificate checks use, in the JVM `env` belongs to.
-/// `_context` (any `Context`) is not needed: the trust manager reads the app's network security
-/// config by itself. Idempotent: a later call keeps the first one's trust manager. On failure
-/// every handshake keeps failing closed, and [`tls_status`](super::tls_status) reports the error.
+/// `_context` (any `Context`) is not needed: the trust manager reads the platform's CA store by
+/// itself. Built once: a CA the user installs later is found by the next handshake whose issuer
+/// has not been seen yet (the store is read from disk per lookup), while one removed or disabled
+/// after a handshake used it stays trusted until the process restarts. Idempotent: a later call
+/// keeps the first one's trust manager. On failure every handshake keeps failing closed, and
+/// [`tls_status`](super::tls_status) reports the error.
 pub fn android_init(env: &mut Env<'_>, _context: JObject<'_>) -> Result<(), jni::errors::Error> {
 	if PLATFORM.get().is_none() {
 		match Platform::new(env) {

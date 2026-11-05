@@ -1,5 +1,5 @@
-//! Android's certificate check: the platform trust manager judges the chain (its system and
-//! user-installed roots, the app's network security config), rustls the rest. The trust manager
+//! Android's certificate check: the platform trust manager judges the chain (against the system
+//! and user-installed roots), rustls the rest. The trust manager
 //! itself is reached through JNI ([`super::android`]); this is what does not need the JVM.
 //!
 //! The trust manager also enforces the end entity's extended key usage: Conscrypt's
@@ -81,8 +81,8 @@ impl<T> TrustManagerVerifier<T> {
 	}
 }
 
-/// The host the trust manager is told (for the app's per-domain config and pins): the name
-/// without a trailing dot, or the IP address.
+/// The host the trust manager is told (Conscrypt reads it only for pins and Certificate
+/// Transparency, not the name check): the name without a trailing dot, or the IP address.
 fn host<'a>(server_name: &'a ServerName<'_>) -> Cow<'a, str> {
 	match server_name.to_str() {
 		Cow::Borrowed(name) => Cow::Borrowed(name.strip_suffix('.').unwrap_or(name)),
