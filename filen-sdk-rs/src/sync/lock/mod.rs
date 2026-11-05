@@ -115,8 +115,8 @@ impl Default for PendingReleases {
 }
 
 impl PendingReleases {
-	/// Counts one request until the returned guard drops: with the request's task, whether it
-	/// was answered, failed or cancelled with its runtime, so a wait never outlives the task.
+	/// Counts one request until the returned guard drops: with the [`OwedRelease`] that holds it,
+	/// once the release is answered or given up on, or no longer needed.
 	fn track(&self) -> PendingRelease {
 		self.0.send_modify(|pending| *pending += 1);
 		PendingRelease(self.0.clone())
@@ -147,6 +147,137 @@ impl Drop for PendingRelease {
 	}
 }
 
+/// A release the client may still have to send for the lock `uuid` on `resource`: one being sent,
+/// or one a lock request needs should the server grant it to a caller that stopped waiting. It
+/// counts in the client's [`PendingReleases`] until [`Self::send`] got an answer or gave up (see
+/// [`release`]), or until [`Self::settle`] says none is needed.
+///
+/// A task that holds one and is cancelled before either, as a runtime shutting down cancels its
+/// tasks, drops it unsettled. The release then goes out from a thread of its own, still counted,
+/// so the server does not hold the lock until its lease runs out. On wasm, where a task is not
+/// cancelled that way (`runtime::spawn_local` holds its worker open), it is not sent and stops
+/// counting.
+///
+/// For a lock request that release is best-effort only. Its task was cancelled with the
+/// request's outcome unknown, and the Acquire may still be on its way: a release that reaches the
+/// server first releases nothing, and a grant that follows holds the resource until its lease
+/// runs out.
+struct OwedRelease(Option<ReleaseRequest>);
+
+/// The release an [`OwedRelease`] sends, and its part of the count.
+struct ReleaseRequest {
+	client: Arc<AuthClient>,
+	url: Arc<str>,
+	uuid: Uuid,
+	resource: Arc<str>,
+	confirmed: LeaseConfirmed,
+	_pending: PendingRelease,
+}
+
+/// When the server last confirmed the lease a release frees, which bounds its retries (see
+/// [`release_loop`]).
+enum LeaseConfirmed {
+	/// A held lease's confirmations, read as they come, so a refresh the keep-alive records after
+	/// the drop still extends the retries.
+	Watched(tokio::sync::watch::Sender<Confirmed>),
+	/// A lock request's grant, which runs from no earlier than the request's send, which comes
+	/// after this.
+	Sent(Confirmed),
+}
+
+impl LeaseConfirmed {
+	fn age(&self) -> Duration {
+		match self {
+			Self::Watched(confirmed) => confirmed.borrow().age(),
+			Self::Sent(sent) => sent.age(),
+		}
+	}
+}
+
+impl OwedRelease {
+	fn new(
+		client: Arc<AuthClient>,
+		url: Arc<str>,
+		uuid: Uuid,
+		resource: Arc<str>,
+		confirmed: LeaseConfirmed,
+	) -> Self {
+		let pending = client.pending_lock_releases.track();
+		Self(Some(ReleaseRequest {
+			client,
+			url,
+			uuid,
+			resource,
+			confirmed,
+			_pending: pending,
+		}))
+	}
+
+	/// Sends the release and waits for the server's answer, or until it is given up on.
+	async fn send(mut self) {
+		if let Some(request) = &self.0 {
+			request.send().await;
+		}
+		self.0 = None;
+	}
+
+	/// No release is needed after all: nothing was granted, or the caller took the grant.
+	fn settle(mut self) {
+		self.0 = None;
+	}
+}
+
+impl Drop for OwedRelease {
+	fn drop(&mut self) {
+		if let Some(request) = self.0.take() {
+			request.send_detached();
+		}
+	}
+}
+
+impl ReleaseRequest {
+	async fn send(&self) {
+		release(&self.client, &self.url, self.uuid, &self.resource, || {
+			self.confirmed.age()
+		})
+		.await;
+	}
+
+	/// Sends the release from a new thread, on a runtime of its own that ends with it.
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	fn send_detached(self) {
+		// for the warning should the thread not start, which drops `self`
+		let resource = Arc::clone(&self.resource);
+		let spawned = std::thread::Builder::new()
+			.name("lock-release".to_owned())
+			.spawn(move || {
+				match tokio::runtime::Builder::new_current_thread()
+					.enable_all()
+					.build()
+				{
+					Ok(runtime) => runtime.block_on(self.send()),
+					Err(e) => tracing::warn!(
+						"No runtime to release lock {} on, relying on server-side expiry: {e}",
+						self.resource
+					),
+				}
+			});
+		if let Err(e) = spawned {
+			tracing::warn!(
+				"No thread to release lock {resource} from, relying on server-side expiry: {e}"
+			);
+		}
+	}
+
+	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+	fn send_detached(self) {
+		tracing::warn!(
+			"The release of lock {} was cancelled, relying on server-side expiry",
+			self.resource
+		);
+	}
+}
+
 /// Represents a lock on a resource, which can be acquired using the [`Client::acquire_lock`] method.
 /// The lock is released when the [`ResourceLock`] is dropped; its clones share the lock, which
 /// is released once the last of them is dropped.
@@ -165,12 +296,12 @@ impl Drop for PendingRelease {
 /// out — another client may hold the resource from that point on.
 ///
 /// The release request is spawned onto the ambient tokio runtime at drop time when one exists,
-/// falling back to the runtime the lock was acquired on; if neither is available (or the
-/// fallback runtime has shut down), the release is skipped and the server expires the lock on
-/// its own after ~60 seconds. A release failing in transport is sent again while the lease could
-/// still stand. A runtime that shuts down cancels a release it has not sent yet in the same way,
-/// so closing the sync engine waits for the releases still in flight, retries included, for a few
-/// seconds at most, and a process awaits [`Client::wait_for_lock_releases`] before it exits.
+/// falling back to the runtime the lock was acquired on. When neither is available, or the
+/// runtime it went to shuts down before the server answered it, the release is sent from a thread
+/// of its own instead. A release failing in transport is sent again while the lease could still
+/// stand. Closing the sync engine waits for the releases still in flight, retries included, for a
+/// few seconds at most; any other process that exits does not wait for them, so it awaits
+/// [`Client::wait_for_lock_releases`] first.
 #[derive(Debug, Clone)]
 pub struct ResourceLock {
 	lease: Arc<SharedLease>,
@@ -417,43 +548,37 @@ impl SharedLease {
 		let handle = tokio::runtime::Handle::try_current()
 			.ok()
 			.or_else(|| self.handle.clone());
-		let Some(handle) = handle else {
-			tracing::warn!(
-				"No tokio runtime available to release lock {}, relying on server-side expiry",
-				self.resource
-			);
-			return;
-		};
-		// Spawning on a handle whose runtime has shut down does not panic: the task is
-		// cancelled without being polled and the server expires the lock on its own.
-		handle.spawn(self.release_task());
+		let owed = self.owed_release();
+		match handle {
+			// Spawning on a handle whose runtime has shut down does not panic: the task is
+			// cancelled without being polled, and `owed` sends the release from its own thread.
+			Some(handle) => drop(handle.spawn(owed.send())),
+			// dropped unsent, `owed` sends the release from its own thread
+			None => drop(owed),
+		}
 	}
 
 	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 	fn spawn_release(&self) {
+		let owed = self.owed_release();
 		// `runtime::spawn_local` (unlike raw `wasm_bindgen_futures::spawn_local`) holds the
 		// spawning SDK worker open until the future completes, so a worker whose other tasks
 		// finish cannot close mid-request and silently skip the release. On the main thread it
 		// degrades to a plain `spawn_local`.
-		crate::runtime::spawn_local(self.release_task());
+		crate::runtime::spawn_local(owed.send());
 	}
 
 	/// The release of this lease, counted in the client's [`PendingReleases`] from now until it
 	/// is answered or given up on (see [`release`]). It reads the lease's confirmations as they
 	/// come, so a refresh the keep-alive records after the drop still extends the retries.
-	fn release_task(&self) -> impl Future<Output = ()> + MaybeSend + 'static {
-		let client = self.client.clone();
-		let uuid = self.uuid;
-		let resource = self.resource.clone();
-		let confirmed = self.confirmed.clone();
-		let pending = client.pending_lock_releases.track();
-		async move {
-			release(&client, &lock_url(), uuid, &resource, || {
-				confirmed.borrow().age()
-			})
-			.await;
-			drop(pending);
-		}
+	fn owed_release(&self) -> OwedRelease {
+		OwedRelease::new(
+			Arc::clone(&self.client),
+			lock_url().into(),
+			self.uuid,
+			self.resource.as_str().into(),
+			LeaseConfirmed::Watched(self.confirmed.clone()),
+		)
 	}
 }
 
@@ -778,7 +903,11 @@ fn keep_lock_alive(lease: &Arc<SharedLease>) {
 /// Only the task can do that safely — a release sent the moment the caller gave up can reach the
 /// server before the grant does, and then releases nothing. The task counts in the client's
 /// [`PendingReleases`] until it handed the answer over or released the grant, so a process that
-/// exits after its caller gave up still waits for that release.
+/// exits after its caller gave up still waits for that release. A task cancelled before either
+/// sends the release from a thread of its own (see [`OwedRelease`]), as the request may have been
+/// granted; a release of a lease `uuid` does not hold is a no-op. That release is best-effort: it
+/// can reach the server before the Acquire still on its way, release nothing, and leave the grant
+/// to hold the resource until its lease runs out.
 async fn request_acquire(
 	client: Arc<AuthClient>,
 	url: Arc<str>,
@@ -787,17 +916,24 @@ async fn request_acquire(
 	resource: Arc<str>,
 ) -> Result<bool, Error> {
 	let (answer, answered) = tokio::sync::oneshot::channel();
+	// a lease granted to this request runs from no earlier than its send, which comes after this
+	let sent = Confirmed::now();
 	// Counted for its whole round trip: a grant can still arrive for a caller that is gone.
-	let pending = client.pending_lock_releases.track();
+	let owed = OwedRelease::new(
+		Arc::clone(&client),
+		Arc::clone(&url),
+		uuid,
+		resource,
+		LeaseConfirmed::Sent(sent),
+	);
 	// Detached, not cancelled: the task must outlive a caller that stopped waiting.
 	drop(crate::runtime::spawn_task_maybe_send(async move {
-		// a lease granted to this request runs from no earlier than its send
-		let sent = Confirmed::now();
 		let acquired = send_acquire(&client, &url, body).await;
-		if let Err(Ok(true)) = answer.send(acquired) {
-			release(&client, &url, uuid, &resource, || sent.age()).await;
+		match answer.send(acquired) {
+			Err(Ok(true)) => owed.send().await,
+			// the caller took the answer, a grant with it, or nothing was granted
+			Ok(()) | Err(Ok(false) | Err(_)) => owed.settle(),
 		}
-		drop(pending);
 	}));
 	answered.await.unwrap_or_else(|_| {
 		Err(Error::custom(

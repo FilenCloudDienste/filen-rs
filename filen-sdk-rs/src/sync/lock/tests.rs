@@ -2,7 +2,7 @@
 use tokio::net::TcpListener;
 
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-use super::test_support::{offline_client, test_lock, test_lock_on};
+use super::test_support::{offline_client, proxied_client, test_lock, test_lock_on};
 use super::*;
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 use crate::auth::http::{
@@ -222,6 +222,106 @@ fn the_release_of_a_dropped_lock_is_waited_for_until_it_is_answered() {
 	);
 	rt.block_on(client.pending_lock_releases.settled());
 	assert_eq!(rt.metrics().num_alive_tasks(), 0);
+}
+
+/// A runtime for a test to watch requests arrive on, and a proxy on it that `client` sends them to.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+fn proxy_and_client() -> (
+	tokio::runtime::Runtime,
+	tokio::net::TcpListener,
+	Arc<AuthClient>,
+) {
+	let observer = tokio::runtime::Builder::new_current_thread()
+		.enable_all()
+		.build()
+		.unwrap();
+	let proxy = observer
+		.block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+		.unwrap();
+	let client = proxied_client(proxy.local_addr().unwrap());
+	(observer, proxy, client)
+}
+
+/// Dates `lock`'s last confirmation a server TTL back, by the wall clock: a release of it that
+/// fails in transport is then not sent again, as the server has expired the lease on its own (see
+/// [`release_loop`]).
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+fn confirmed_a_lease_ago(lock: &ResourceLock) {
+	let ttl = chrono::TimeDelta::from_std(LOCK_SERVER_TTL).unwrap();
+	lock.lease.confirmed.send_replace(Confirmed {
+		at: Instant::now(),
+		wall: Utc::now() - ttl,
+	});
+}
+
+/// Waits for the release `client` sends through `proxy`, checks that it is waited for while it is
+/// unanswered, then fails it by closing the proxy, after which it is waited for no more: the
+/// lease it frees must be a TTL old (see [`confirmed_a_lease_ago`]), or the failed release would
+/// be sent again.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+fn assert_release_is_sent_and_waited_for(
+	observer: &tokio::runtime::Runtime,
+	proxy: tokio::net::TcpListener,
+	client: &AuthClient,
+) {
+	let (connection, _) = observer
+		.block_on(async { timeout(Duration::from_secs(30), proxy.accept()).await })
+		.expect("the release is sent")
+		.unwrap();
+	assert!(
+		client
+			.pending_lock_releases
+			.settled()
+			.now_or_never()
+			.is_none(),
+		"a release the server has not answered is waited for"
+	);
+	std::mem::drop((connection, proxy));
+	observer
+		.block_on(async {
+			timeout(
+				Duration::from_secs(30),
+				client.pending_lock_releases.settled(),
+			)
+			.await
+		})
+		.expect("a failed release is waited for no more");
+}
+
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+#[test]
+fn a_release_its_runtime_cancelled_is_sent_from_a_thread_of_its_own() {
+	let (observer, proxy, client) = proxy_and_client();
+	let rt = tokio::runtime::Builder::new_current_thread()
+		.enable_all()
+		.build()
+		.unwrap();
+	let lock = rt.block_on(async {
+		test_lock_on(
+			Arc::clone(&client),
+			tokio::runtime::Handle::try_current().ok(),
+		)
+	});
+	confirmed_a_lease_ago(&lock);
+	rt.block_on(async { std::mem::drop(lock) });
+
+	std::mem::drop(rt);
+
+	assert_release_is_sent_and_waited_for(&observer, proxy, &client);
+}
+
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+#[test]
+fn a_release_with_no_runtime_to_go_to_is_sent_from_a_thread_of_its_own() {
+	let (observer, proxy, client) = proxy_and_client();
+	let lock = test_lock_on(Arc::clone(&client), None);
+	confirmed_a_lease_ago(&lock);
+
+	std::thread::spawn(move || std::mem::drop(lock))
+		.join()
+		.unwrap();
+
+	assert_release_is_sent_and_waited_for(&observer, proxy, &client);
 }
 
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
@@ -1137,28 +1237,6 @@ async fn settling_lock_releases_gives_up_after_the_bound_on_a_dead_network() {
 	);
 	assert_eq!(begin.elapsed(), LOCK_RELEASE_SETTLE_BOUND);
 	drop(release);
-}
-
-/// A release cancelled with the runtime it was queued on no longer counts: a settle never waits
-/// for a task that cannot run.
-#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-#[test]
-fn a_release_cancelled_with_its_runtime_is_not_waited_for() {
-	let undriven = tokio::runtime::Builder::new_current_thread()
-		.enable_all()
-		.build()
-		.unwrap();
-	let lock = undriven.block_on(async { test_lock(tokio::runtime::Handle::try_current().ok()) });
-	let client = Arc::clone(&lock.lease.client);
-	drop(lock);
-	let settler = tokio::runtime::Builder::new_current_thread()
-		.enable_all()
-		.build()
-		.unwrap();
-	let settled = || settler.block_on(client.pending_lock_releases.settle(Duration::ZERO));
-	assert!(!settled(), "the queued release is pending");
-	drop(undriven);
-	assert!(settled());
 }
 
 /// When a lease scripted for a release test was last confirmed: now, on the paused clock.

@@ -1,5 +1,6 @@
 use std::{
 	borrow::Cow,
+	net::SocketAddr,
 	sync::{Arc, RwLock, atomic::AtomicU64},
 };
 
@@ -7,14 +8,30 @@ use filen_types::{auth::APIKey, fs::Uuid};
 use tokio::runtime::{Builder, Handle, Runtime};
 
 use super::{Confirmed, ResourceLock, SharedLease};
-use crate::auth::{http::AuthClient, unauth::test_support::offline_unauthed};
+use crate::auth::{
+	http::{AuthClient, ClientConfig, test_support::unauthed_via_proxy},
+	unauth::{UnauthClient, test_support::offline_unauthed},
+};
+
+/// `unauthed`, with an API key nothing checks.
+fn client_from(unauthed: UnauthClient) -> Arc<AuthClient> {
+	Arc::new(AuthClient::from_unauthed(
+		unauthed,
+		Arc::new(RwLock::new(APIKey(Cow::Borrowed("")))),
+	))
+}
 
 /// A client whose every request fails to connect without leaving the machine: a release or
 /// refresh a test sets off must never reach the gateway.
 pub(crate) fn offline_client() -> Arc<AuthClient> {
-	Arc::new(AuthClient::from_unauthed(
-		offline_unauthed(),
-		Arc::new(RwLock::new(APIKey(Cow::Borrowed("")))),
+	client_from(offline_unauthed())
+}
+
+/// A client whose every request goes to the HTTP proxy at `proxy`, where a test sees it arrive.
+pub(crate) fn proxied_client(proxy: SocketAddr) -> Arc<AuthClient> {
+	client_from(unauthed_via_proxy(
+		ClientConfig::default(),
+		&format!("http://{proxy}"),
 	))
 }
 
