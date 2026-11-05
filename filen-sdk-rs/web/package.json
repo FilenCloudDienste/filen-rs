@@ -104,14 +104,14 @@
 		"@napi-rs/cli": "~3.10.8",
 		"@types/node": "^24.19.1",
 		"@types/serviceworker": "^0.0.203",
-		"@vitest/browser": "^5.0.3",
-		"@vitest/browser-playwright": "^5.0.3",
+		"@vitest/browser": "^5.0.5",
+		"@vitest/browser-playwright": "^5.0.5",
 		"@zip.js/zip.js": "^2.23.0",
 		"playwright": "^1.63.0",
 		"prettier": "^3.9.9",
 		"typescript": "~7.0.2",
 		"vite": "^8.3.3",
-		"vitest": "^5.0.3"
+		"vitest": "^5.0.5"
 	},
 	"napi": {
 		"binaryName": "sdk-rs",
