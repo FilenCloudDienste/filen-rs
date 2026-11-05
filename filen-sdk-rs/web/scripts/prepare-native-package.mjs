@@ -1,19 +1,14 @@
 // Readies the react-native side of the package; runs after the ubrn iOS builds and before every
 // pack/publish. Idempotent.
 //
-// - Copies the workspace's Cargo.lock, which the native libraries were built with, next to
-//   package.json: the app checks the rustls-platform-verifier-android version it pins against
-//   the AAR it bundles.
-// - Declares the Security framework in ubrn's generated SdkRs.podspec: the xcframework is a
-//   static library, and its platform certificate verifier (SecTrust) needs Security linked.
+// Declares the Security framework in ubrn's generated SdkRs.podspec: the xcframework is a static
+// library, and its platform certificate verifier (SecTrust) needs Security linked.
 
-import { copyFileSync, existsSync, readFileSync, writeFileSync } from "node:fs"
+import { existsSync, readFileSync, writeFileSync } from "node:fs"
 import { dirname, join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 
 const webDir = resolve(dirname(fileURLToPath(import.meta.url)), "..")
-
-copyFileSync(join(webDir, "..", "..", "Cargo.lock"), join(webDir, "Cargo.lock"))
 
 const podspec = join(webDir, "SdkRs.podspec")
 if (existsSync(podspec)) {

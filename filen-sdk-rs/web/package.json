@@ -41,7 +41,6 @@
 		"FilenSdkRsFramework.xcframework",
 		"src",
 		"SdkRs.podspec",
-		"Cargo.lock",
 		"node/index.js",
 		"node/index.d.ts"
 	],
