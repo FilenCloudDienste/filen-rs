@@ -1,8 +1,16 @@
+use std::sync::Arc;
+
+use axum::response::Response;
 use axum_extra::headers::{Header, Range};
+use futures::StreamExt;
 
 use crate::{
 	auth::{http::ClientConfig, unauth::UnauthClient},
-	http_provider::client_impl::HttpProviderSharedClientExt,
+	fs::file::enums::RemoteFileType,
+	http_provider::{
+		client_impl::HttpProviderSharedClientExt, multiple_range_response_builder,
+		single_range_response_builder,
+	},
 };
 
 fn range_header(value: &str) -> Range {
@@ -841,4 +849,72 @@ async fn idle_timeout_reclaims_the_budget_held_by_an_abandoned_stream() {
 
 	let _ = cancel_tx.send(());
 	let _ = server.await;
+}
+
+/// What every read of [`unreadable_file`] fails with.
+const UNREADABLE_FILE_ERROR: &str =
+	"Error of kind Response: context: file chunk count (3) is inconsistent with file size (10)";
+
+/// A file of 10 bytes claiming 3 chunks, which every read fails on before any request is made.
+fn unreadable_file() -> RemoteFileType<'static> {
+	let RemoteFileType::File(mut file) = token_store_test_file("unreadable.txt") else {
+		panic!("the fixture is a file of the user's own");
+	};
+	file.to_mut().chunks = 3;
+	RemoteFileType::File(file)
+}
+
+/// The items of `response`'s body up to its end, but no more than 4.
+async fn body_items(response: Response) -> Vec<Result<Vec<u8>, String>> {
+	response
+		.into_body()
+		.into_data_stream()
+		.take(4)
+		.map(|item| item.map(|bytes| bytes.to_vec()).map_err(|e| e.to_string()))
+		.collect()
+		.await
+}
+
+#[tokio::test]
+async fn a_single_range_body_ends_with_its_read_error() {
+	let client = Arc::new(UnauthClient::from_config(ClientConfig::default()).unwrap());
+	let response = single_range_response_builder(
+		unreadable_file(),
+		(0, 10),
+		1024,
+		client,
+		Response::builder(),
+	)
+	.unwrap();
+
+	let items = body_items(response).await;
+
+	assert_eq!(items, vec![Err(UNREADABLE_FILE_ERROR.to_owned())]);
+}
+
+#[tokio::test]
+async fn a_multiple_range_body_ends_with_its_read_error() {
+	let client = Arc::new(UnauthClient::from_config(ClientConfig::default()).unwrap());
+	let response = multiple_range_response_builder(
+		unreadable_file(),
+		vec![(0, 2), (4, 6)],
+		1024,
+		client,
+		Response::builder(),
+	)
+	.unwrap();
+
+	let items = body_items(response).await;
+
+	// the first part's header, then the error, and neither the second part nor the close
+	// delimiter
+	let [Ok(header), error] = items.as_slice() else {
+		panic!("expected the first part's header and the error, got {items:?}");
+	};
+	let header = std::str::from_utf8(header).unwrap();
+	assert!(
+		header.ends_with("\r\nContent-Type: text/plain\r\nContent-Range: bytes 0-1/10\r\n\r\n"),
+		"{header:?}"
+	);
+	assert_eq!(error, &Err(UNREADABLE_FILE_ERROR.to_owned()));
 }

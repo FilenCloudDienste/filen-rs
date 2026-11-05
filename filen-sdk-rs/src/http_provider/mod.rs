@@ -573,7 +573,10 @@ fn single_range_response_builder(
 				Ok(0) => break, // EOF
 				Ok(n) => yield Ok(buf[..n].to_vec()),
 				Err(e) => {
+					// the error ends the body: the bytes after it would not line up with what came
+					// before, and a reader that failed can fail the same way on every later poll
 					yield Err(e);
+					break;
 				}
 			}
 		}
@@ -624,7 +627,10 @@ fn multiple_range_response_builder(
 					Ok(0) => break, // EOF
 					Ok(n) => yield Ok(buf[..n].to_vec()),
 					Err(e) => {
+						// the error ends the body, so no later part nor the close delimiter follows,
+						// and the client sees a truncated response instead of a complete one
 						yield Err(e);
+						return;
 					}
 				}
 			}
