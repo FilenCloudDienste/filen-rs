@@ -461,6 +461,7 @@ describe("UnauthJsClient", () => {
 		assert.equal(typeof client.fromStringified, "function")
 		assert.equal(typeof client.health, "function")
 		assert.equal(typeof JsClient.prototype.health, "function")
+		assert.equal(typeof JsClient.prototype.reconnectSocket, "function")
 	})
 
 	test("fromConfig throws a FilenSdkError the way ubrn throws it", () => {

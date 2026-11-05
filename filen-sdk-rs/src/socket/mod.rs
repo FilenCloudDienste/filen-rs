@@ -55,6 +55,18 @@ impl Client {
 			.await
 	}
 
+	/// Asks the socket to reconnect now if it is waiting out a backoff pause after failed
+	/// attempts, with the backoff reset: for an app to call when the network changes or it comes
+	/// to the foreground. Does nothing while the socket is connected or connecting, or when no
+	/// listener ever opened it. Cheap and idempotent: a lock and at most one non-blocking send,
+	/// and a burst of calls costs at most one connection attempt.
+	pub fn reconnect_socket(&self) {
+		self.socket_handle
+			.lock()
+			.unwrap_or_else(|e| e.into_inner())
+			.reconnect();
+	}
+
 	pub fn is_socket_connected(&self) -> bool {
 		self.socket_handle
 			.lock()

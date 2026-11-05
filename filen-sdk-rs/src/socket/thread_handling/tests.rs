@@ -583,6 +583,123 @@ mod pipeline {
 		assert_eq!(begin.elapsed(), Duration::from_secs(1));
 	}
 
+	/// Runs the websocket task with `connections` until `driver` drops the request sender it is
+	/// given.
+	async fn drive(
+		connections: Vec<FakeConnection>,
+		config: WebSocketConfig,
+		driver: impl AsyncFnOnce(tokio::sync::mpsc::Sender<SocketRequest>),
+	) {
+		let (request_sender, request_receiver) = tokio::sync::mpsc::channel(16);
+		prime(connections);
+		let task = run_async_websocket_task::<FakeSocket, _, _, _, _, _, _, _, _>(
+			config,
+			request_receiver,
+			Arc::new(NoopCrypter),
+			test_private_key(),
+		);
+		tokio::join!(task, driver(request_sender));
+	}
+
+	/// A reconnect request mid-pause connects at once and resets the backoff: three failures
+	/// (pauses 1, 2, then a 4 s one cut short after 1 s), then the next failure pauses 1 s.
+	#[tokio::test(start_paused = true)]
+	async fn a_reconnect_request_ends_the_pause_and_resets_the_backoff() {
+		let failed = || FakeConnection::new(vec![ServerAction::Close]);
+		let (closed_sender, closed) = tokio::sync::oneshot::channel::<()>();
+		let mut closed_sender = Some(closed_sender);
+		let connections = vec![
+			failed(),
+			failed(),
+			failed(),
+			failed(),
+			FakeConnection::new(handshake_then(vec![ServerAction::Hang]))
+				.with_on_connect(move || drop(closed_sender.take())),
+		];
+		drive(connections, test_config(), async |sender| {
+			// Attempts at 0, 1 and 3; the third pause (4 s) runs from 3 s.
+			sleep(Duration::from_secs(4)).await;
+			assert_eq!(connect_count(), 3);
+			sender.send(SocketRequest::Reconnect).await.unwrap();
+			let _ = closed.await;
+			drop(sender);
+		})
+		.await;
+		assert_eq!(pauses(), [1, 2, 1, 1].map(Duration::from_secs));
+	}
+
+	/// A burst of reconnect requests costs one attempt: the first ends the pause, the rest find
+	/// that attempt under way (here a handshake that hangs until the setup times out) and do
+	/// not restart it.
+	#[tokio::test(start_paused = true)]
+	async fn a_burst_of_reconnect_requests_makes_one_attempt() {
+		let connections = vec![
+			FakeConnection::new(vec![ServerAction::Close]),
+			FakeConnection::new(vec![ServerAction::Hang]),
+		];
+		let mut config = test_config();
+		for _ in 0..6 {
+			config.backoff.failed();
+		}
+		drive(connections, config, async |sender| {
+			// The first attempt failed; a 60 s pause is under way.
+			sleep(Duration::from_secs(1)).await;
+			assert_eq!(connect_count(), 1);
+			for _ in 0..10 {
+				sender.send(SocketRequest::Reconnect).await.unwrap();
+			}
+			sleep(Duration::from_secs(1)).await;
+			for _ in 0..10 {
+				sender.send(SocketRequest::Reconnect).await.unwrap();
+			}
+			sleep(Duration::from_secs(1)).await;
+			assert_eq!(connect_count(), 2, "one attempt for the whole burst");
+			drop(sender);
+		})
+		.await;
+		assert_eq!(connect_count(), 2);
+	}
+
+	/// While connected a reconnect request changes nothing: the session stays up and no
+	/// attempt is made.
+	#[tokio::test(start_paused = true)]
+	async fn a_reconnect_request_while_connected_is_a_no_op() {
+		let connections = vec![FakeConnection::new(handshake_then(vec![
+			ServerAction::Delayed(Duration::from_secs(5), "2".to_string()),
+			ServerAction::Hang,
+		]))];
+		drive(connections, test_config(), async |sender| {
+			sleep(Duration::from_secs(1)).await;
+			assert_eq!(connect_count(), 1);
+			for _ in 0..5 {
+				sender.send(SocketRequest::Reconnect).await.unwrap();
+			}
+			sleep(Duration::from_secs(10)).await;
+			assert_eq!(connect_count(), 1);
+			drop(sender);
+		})
+		.await;
+		assert_eq!(connect_count(), 1);
+	}
+
+	/// With no websocket task there is nothing to wake, and none is started.
+	#[test]
+	fn reconnect_without_a_task_does_nothing() {
+		let handle = WebSocketHandle::default();
+		handle.reconnect();
+		assert!(!handle.is_connected());
+
+		let (sender, receiver) = tokio::sync::mpsc::channel::<SocketRequest>(1);
+		let handle = WebSocketHandle {
+			request_sender: Some(sender.downgrade()),
+			start: WorkerStart::default(),
+		};
+		drop(receiver);
+		// A task that ended: its channel is closed, and nothing is sent.
+		handle.reconnect();
+		drop(sender);
+	}
+
 	/// The pause doubles up to its ceiling and stays there until a connection resets it.
 	#[test]
 	fn the_pause_doubles_to_its_ceiling() {

@@ -198,6 +198,25 @@ impl JsClient {
 		do_on_commander(move || async move { this.health().await }).await
 	}
 
+	/// Asks the socket to reconnect now if it is waiting out a backoff pause after failed
+	/// attempts, with the backoff reset: call it when the network changes or the app comes to
+	/// the foreground. Does nothing while the socket is connected or connecting, or before any
+	/// listener opened it, and a burst of calls costs at most one connection attempt.
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		wasm_bindgen(js_name = "reconnectSocket")
+	)]
+	#[napi_export]
+	pub async fn reconnect_socket(&self) {
+		let this = self.inner();
+		// Only a commander worker that never started fails this, and then no socket task exists.
+		let _ = do_on_commander(move || async move {
+			this.reconnect_socket();
+			Ok::<_, Error>(())
+		})
+		.await;
+	}
+
 	#[cfg_attr(
 		all(target_family = "wasm", target_os = "unknown"),
 		wasm_bindgen(js_name = "getUnauthed")

@@ -1676,7 +1676,12 @@ test("sockets", async () => {
 		/* eslint-disable @typescript-eslint/no-unused-vars */
 		using _ = await state.addEventListener(() => {}, null)
 		expect(await state.isSocketConnected()).toBe(true)
+		// Connected: a burst of reconnect requests changes nothing.
+		await Promise.all([state.reconnectSocket(), state.reconnectSocket()])
+		expect(await state.isSocketConnected()).toBe(true)
 	}
+	// No socket task: nothing to wake, and none is started.
+	await state.reconnectSocket()
 	expect(await state.isSocketConnected()).toBe(false)
 	// Re-arm the suite-wide capture freed above: without it the run is blind to
 	// exactly the kind of external mutation of testDir this suite once suffered.

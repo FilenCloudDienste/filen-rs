@@ -85,6 +85,15 @@ impl WebSocketHandle {
 		RequestSender { sender, start }
 	}
 
+	/// Asks the websocket task, if there is one, to end a backoff pause and reconnect now. One
+	/// `try_send`, never blocking: a full channel already holds requests the task serves at once
+	/// (a burst's wakes among them), and with no task there is nothing to reconnect.
+	pub(super) fn reconnect(&self) {
+		if let Some(sender) = self.live_sender() {
+			let _ = sender.try_send(SocketRequest::Reconnect);
+		}
+	}
+
 	// todo rework this because it only shows connected status not authenticated status
 	pub(super) fn is_connected(&self) -> bool {
 		self.live_sender().is_some()
@@ -187,6 +196,9 @@ pub(super) enum SocketRequest {
 		event_types: Option<Vec<Cow<'static, str>>>,
 	},
 	RemoveListener(u64),
+	/// End a backoff pause and reconnect now, with the backoff reset. A no-op while connected
+	/// or while a connection attempt is under way, so a burst costs at most one attempt.
+	Reconnect,
 }
 
 fn guarantee_send_remove_listener(sender: tokio::sync::mpsc::Sender<SocketRequest>, idx: u64) {
@@ -557,64 +569,84 @@ where
 			.0
 			.to_string();
 
-		tokio::select! {
-			biased;
-			request = request_receiver.recv() => {
-				let Some(request) = request else {
-					// request channel closed, shutting down websocket task
-					return None;
-				};
-				handle_request(request, listeners);
+		let outcome = {
+			let mut connect = std::pin::pin!(connect_and_build_socket(
+				&config.client,
+				&api_key,
+				listeners
+			));
+			loop {
+				tokio::select! {
+					biased;
+					request = request_receiver.recv() => match request {
+						// An attempt is already under way.
+						Some(SocketRequest::Reconnect) => {}
+						other => break Err(other),
+					},
+					result = connect.as_mut() => break Ok(result),
+				}
 			}
-			result = connect_and_build_socket(&config.client, &api_key, listeners) => {
-				match result {
-					Ok((streams, interval)) => {
-						config.ping_interval = interval;
-						config.backoff.reset();
-						return Some(streams);
-					}
-					Err(SetupFailure { error, .. })
-						if matches!(error.kind(), ErrorKind::Unauthenticated) =>
-					{
-						tracing::error!("WebSocket authentication failed: {}, not retrying", error);
-						return None;
-					}
-					Err(SetupFailure { error, proxied }) => {
-						let pause = config.backoff.failed();
-						tracing::warn!(
-							"Error initializing WebSocket connection{}: {}, retrying in {:?}...",
-							if proxied { " through a proxy" } else { "" },
-							error,
-							pause
-						);
-						if !pause_serving_requests(pause, request_receiver, listeners).await {
-							return None;
-						}
-					}
+		};
+		match outcome {
+			// request channel closed, shutting down websocket task
+			Err(None) => return None,
+			// A listener request: the attempt is dropped and made again with it in place.
+			Err(Some(request)) => handle_request(request, listeners),
+			Ok(Ok((streams, interval))) => {
+				config.ping_interval = interval;
+				config.backoff.reset();
+				return Some(streams);
+			}
+			Ok(Err(SetupFailure { error, .. }))
+				if matches!(error.kind(), ErrorKind::Unauthenticated) =>
+			{
+				tracing::error!("WebSocket authentication failed: {}, not retrying", error);
+				return None;
+			}
+			Ok(Err(SetupFailure { error, proxied })) => {
+				let pause = config.backoff.failed();
+				tracing::warn!(
+					"Error initializing WebSocket connection{}: {}, retrying in {:?}...",
+					if proxied { " through a proxy" } else { "" },
+					error,
+					pause
+				);
+				match pause_serving_requests(pause, request_receiver, listeners).await {
+					PauseEnd::Elapsed => {}
+					PauseEnd::Reconnect => config.backoff.reset(),
+					PauseEnd::Closed => return None,
 				}
 			}
 		}
 	}
 }
 
+/// How a pause between connection attempts ended.
+enum PauseEnd {
+	Elapsed,
+	/// The app asked to reconnect now ([`SocketRequest::Reconnect`]).
+	Reconnect,
+	/// The request channel closed: the task ends.
+	Closed,
+}
+
 /// Waits `pause` while still taking listener requests, so a registration or removal is not
-/// held up for as long as a backoff lasts. False once the request channel has closed.
+/// held up for as long as a backoff lasts. A reconnect request ends it early.
 async fn pause_serving_requests(
 	pause: Duration,
 	request_receiver: &mut tokio::sync::mpsc::Receiver<SocketRequest>,
 	listeners: &mut DisconnectedListenerManager,
-) -> bool {
+) -> PauseEnd {
 	let mut deadline = std::pin::pin!(sleep(pause));
 	loop {
 		tokio::select! {
 			biased;
-			request = request_receiver.recv() => {
-				let Some(request) = request else {
-					return false;
-				};
-				handle_request(request, listeners);
-			}
-			_ = deadline.as_mut() => return true,
+			request = request_receiver.recv() => match request {
+				None => return PauseEnd::Closed,
+				Some(SocketRequest::Reconnect) => return PauseEnd::Reconnect,
+				Some(request) => handle_request(request, listeners),
+			},
+			_ = deadline.as_mut() => return PauseEnd::Elapsed,
 		}
 	}
 }
@@ -670,7 +702,8 @@ async fn run_async_websocket_task<W, S, R, RV, US, UR, T, UW, PT>(
 		// Demote
 		disconnected_listeners = connected_listeners.into_disconnected();
 
-		if !pause_serving_requests(
+		// The backoff was reset when the session began; a reconnect request only ends this early.
+		if let PauseEnd::Closed = pause_serving_requests(
 			config.reconnect_delay,
 			&mut request_receiver,
 			&mut disconnected_listeners,
@@ -716,6 +749,8 @@ fn handle_request(request: SocketRequest, listeners: &mut impl ListenerManagerEx
 		SocketRequest::RemoveListener(idx) => {
 			listeners.remove_listener(idx);
 		}
+		// Connected: nothing to cut short, and a healthy session is never dropped for it.
+		SocketRequest::Reconnect => {}
 	}
 }
 
