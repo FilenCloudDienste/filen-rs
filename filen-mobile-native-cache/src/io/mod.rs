@@ -163,6 +163,32 @@ pub(crate) async fn update_task(
 	}
 }
 
+/// Removes a temp file unless [`disarm`](Self::disarm)ed once it has been renamed into place —
+/// the one cleanup covering every exit, including the future being dropped mid-await by a
+/// cancelled transfer or bulk batch.
+pub(crate) struct TmpFileGuard {
+	path: Option<PathBuf>,
+}
+
+impl TmpFileGuard {
+	pub(crate) fn new(path: PathBuf) -> Self {
+		Self { path: Some(path) }
+	}
+
+	pub(crate) fn disarm(mut self) {
+		self.path = None;
+	}
+}
+
+impl Drop for TmpFileGuard {
+	fn drop(&mut self) {
+		if let Some(path) = self.path.take() {
+			// Sync removal of one local file; best-effort by design.
+			let _ = std::fs::remove_file(path);
+		}
+	}
+}
+
 /// `cache_dir/<uuid>/<name>`. The name is decrypted, so whoever wrote the item (a sharer
 /// included) controls it: one that is not a single path component (`..`, `/abs`, `a/b`, empty)
 /// would escape `cache_dir` once joined, so it falls back to the uuid like an undecryptable
@@ -191,6 +217,10 @@ impl AuthCacheState {
 	) -> Result<PathBuf, io::Error> {
 		let src = self.tmp_dir.join(file.uuid().to_string());
 		let mut os_file = tokio::fs::File::create(&src).await?.compat_write();
+		// Removes the partial bytes of a failed or cancelled download, which would otherwise sit in
+		// the tmp directory for at least a day, until the stale-staging sweep. It keeps its own
+		// copy of the path, as `src` is still needed for the rename.
+		let tmp_guard = TmpFileGuard::new(src.clone());
 		let (sender, receiver) = tokio::sync::mpsc::unbounded_channel::<u64>();
 		let file_size = file.size();
 		let callback: Option<Arc<dyn Fn(u64) + Send + Sync + 'static>> =
@@ -231,6 +261,7 @@ impl AuthCacheState {
 		// owns the guard and awaiting its handle, which is why it has not been done inline here.
 		tokio::fs::create_dir_all(parent).await?;
 		tokio::fs::rename(&src, &dst).await?;
+		tmp_guard.disarm();
 		// The bytes are in the cache directory now. Recorded here rather than at the callers so
 		// that every download covers itself — the thumbnail path materialises a file too.
 		self.record_materialised(file.uuid());
@@ -1269,9 +1300,69 @@ impl FilenMobileCacheState {
 
 #[cfg(test)]
 mod tests {
+	use std::borrow::Cow;
+
+	use chrono::{DateTime, Utc};
+	use filen_sdk_rs::{
+		crypto::file::FileKey,
+		fs::file::meta::{DecryptedFileMeta, FileMeta},
+	};
+	use filen_types::{
+		auth::FileEncryptionVersion,
+		fs::{ParentUuid, StableUuid},
+	};
+
 	use super::*;
+	use crate::auth::test_support::{ROOT_A, Session, sdk_config};
 
 	const UUID: &str = "00000000-0000-0000-0000-000000000001";
+
+	/// A file of 10 bytes claiming 3 chunks: its download fails on the first read, before any
+	/// request is made, once the temp file it is staged in has been created.
+	fn undownloadable_file() -> RemoteFile {
+		let uuid = Uuid::from_bytes([0xDD; 16]);
+		let time = DateTime::<Utc>::from_timestamp_millis(1_700_000_000_000).unwrap();
+		RemoteFile::from_meta(
+			uuid,
+			StableUuid::new_for_test(uuid),
+			ParentUuid::Uuid(Uuid::from_bytes([0xAA; 16])),
+			10,
+			3,
+			"de-1",
+			"bucket",
+			time,
+			false,
+			FileMeta::Decoded(DecryptedFileMeta {
+				name: Cow::Borrowed("broken.txt"),
+				size: 10,
+				mime: Cow::Borrowed("text/plain"),
+				key: FileKey::from_str_with_version(&"a".repeat(64), FileEncryptionVersion::V3)
+					.unwrap(),
+				last_modified: time,
+				created: None,
+				hash: None,
+			}),
+		)
+	}
+
+	#[tokio::test]
+	async fn a_failed_download_leaves_no_temp_file_behind() {
+		let session = Session::start(sdk_config(1, ROOT_A, "key"));
+		let auth = session.auth();
+		let file = undownloadable_file();
+
+		let Err(e) = auth.download_file_io(&file, None).await else {
+			panic!("a file whose chunk count does not match its size downloaded");
+		};
+
+		assert_eq!(
+			e.to_string(),
+			"Failed to download file: Error of kind Response: context: file chunk count (3) is \
+			 inconsistent with file size (10)"
+		);
+		let staged = auth.tmp_dir.join(file.uuid().to_string());
+		assert!(!staged.exists(), "{} was left behind", staged.display());
+	}
 
 	#[test]
 	fn a_plain_name_is_kept_under_its_uuid_dir() {

@@ -1483,6 +1483,22 @@ mod auth_file_crypto_tests {
 
 #[cfg(test)]
 pub(crate) mod test_support {
+	use std::{
+		path::{Path, PathBuf},
+		sync::Arc,
+	};
+
+	use filen_sdk_rs::{
+		auth::Client,
+		crypto::{shared::DataCrypter, v3::EncryptionKey},
+	};
+	use filen_types::auth::{AuthVersion, FilenSDKConfig};
+
+	use super::{
+		AuthCacheState, AuthFile, AuthStatus, CacheState, UnauthCacheState, UnauthReason,
+		parse_auth_read, recheck_authenticated, sync_read_auth_plaintext, update_state,
+	};
+
 	/// Removes the DB directory when dropped so a failing assertion doesn't leak temp files.
 	pub(crate) struct TempDbDir(pub(crate) std::path::PathBuf);
 
@@ -1498,6 +1514,153 @@ pub(crate) mod test_support {
 	impl Drop for TempDbDir {
 		fn drop(&mut self) {
 			let _ = std::fs::remove_dir_all(&self.0);
+		}
+	}
+
+	/// A throwaway 512-bit PKCS#8 key: it only has to parse, and generating one per test would
+	/// need a dependency this crate does not have.
+	const TEST_PRIVATE_KEY: &str = "MIIBVAIBADANBgkqhkiG9w0BAQEFAASCAT4wggE6AgEAAkEArb1qLZWNKBX6g2xbVllG53W1vfZe8I0zjn+9o0k5yF1wgqKYs3RM3pDpaGSm9fjyhZ5dY+mahX7mFto/IeOWAQIDAQABAkAbWmzzDE6S9xLfyhl/OMMPAdtBMx6zZKevUbE7mfW886aXQmS5KMhX9xJ54ijx3MUk7rZa7RU+4YTL4i0KCPyhAiEA3savlb6LqUJ/+WbF8u9oazX54zapC0ogoKOlbfV7g8UCIQDHppZeH5iPvgWpkagpFVvnfGe1PGadhiEx0IVuErOhDQIge86j6m65I1oH0U1imX6f42Vd+P55uAJ8W4pW9+NDv5kCIAuhjt0I5jBpl5bbX3qVPfdsbfZHAItoxwJJ7ZwOBtz5AiEAmrbd5UB4b9U7JndP5nFtm65xyG5wZr6NoH5vjohrE2M=";
+	pub(crate) const ROOT_A: &str = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+	pub(crate) const ROOT_B: &str = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+
+	pub(crate) fn sdk_config(user_id: u64, root: &str, api_key: &str) -> FilenSDKConfig {
+		FilenSDKConfig {
+			email: "offline@example.invalid".to_owned(),
+			password: String::new(),
+			two_factor_code: String::new(),
+			master_keys: vec!["0".repeat(64)],
+			api_key: api_key.to_owned(),
+			public_key: String::new(),
+			private_key: TEST_PRIVATE_KEY.to_owned(),
+			auth_version: AuthVersion::V2,
+			base_folder_uuid: root.to_owned(),
+			user_id,
+			metadata_cache: false,
+			tmp_path: String::new(),
+			connect_to_socket: false,
+		}
+	}
+
+	pub(crate) fn enabled(config: FilenSDKConfig) -> Vec<u8> {
+		serde_json::to_vec(&AuthFile {
+			provider_enabled: true,
+			sdk_config: Some(config),
+			..AuthFile::default()
+		})
+		.unwrap()
+	}
+
+	// Mirrors the app-side seal (fileProvider.ts): version(0x01) ++ nonce(12) ++ ciphertext ++ tag(16).
+	fn write_sealed(path: &Path, dek: &EncryptionKey, plaintext: &[u8]) {
+		let mut data = plaintext.to_vec();
+		dek.blocking_encrypt_data(&mut data).unwrap();
+		let mut blob = vec![0x01];
+		blob.extend_from_slice(&data);
+		std::fs::write(path, blob).unwrap();
+	}
+
+	/// An authenticated state built from a sealed auth.json, the way the FFI entry points build
+	/// it, with one marker row in its cache DB.
+	pub(crate) struct Session {
+		dir: TempDbDir,
+		dek: EncryptionKey,
+		state: tokio::sync::RwLock<CacheState>,
+		coordinator: tokio::sync::Mutex<()>,
+	}
+
+	impl Session {
+		pub(crate) fn start(config: FilenSDKConfig) -> Self {
+			let dir = TempDbDir::create("filen-cache-session-refresh");
+			let dek = EncryptionKey::new([7u8; 32]);
+			let auth_file = dir.0.join("auth.json");
+			write_sealed(&auth_file, &dek, &enabled(config));
+			let mut state = CacheState {
+				status: AuthStatus::Unauthenticated(UnauthCacheState {
+					reason: UnauthReason::Disabled,
+				}),
+				auth_file: Arc::new(auth_file),
+				dek: Some(dek),
+				files_dir: dir.0.clone(),
+				db_dir: dir.0.clone(),
+				last_update: std::sync::RwLock::new(None),
+				auth_digest: None,
+				disabled_wipe_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+				working_set_listener: std::sync::Mutex::new(None),
+			};
+			let (file, digest) =
+				parse_auth_read(sync_read_auth_plaintext(&state.auth_file, Some(&dek)));
+			update_state(&mut state, file, digest);
+			let session = Session {
+				dir,
+				dek,
+				state: tokio::sync::RwLock::new(state),
+				coordinator: tokio::sync::Mutex::new(()),
+			};
+			session
+				.auth()
+				.conn()
+				.execute_batch(
+					"INSERT INTO items (uuid, stable_uuid, parent, type)
+					VALUES (x'CC000000000000000000000000000000', NULL, NULL, 1);",
+				)
+				.unwrap();
+			session
+		}
+
+		pub(crate) fn auth_path(&self) -> PathBuf {
+			self.dir.0.join("auth.json")
+		}
+
+		pub(crate) fn write_sealed(&self, plaintext: &[u8]) {
+			write_sealed(&self.auth_path(), &self.dek, plaintext);
+		}
+
+		/// What the periodic re-check spawned from `match_state` runs.
+		pub(crate) async fn recheck(&self) {
+			let current_digest = self.state.read().await.auth_digest;
+			recheck_authenticated(
+				&self.state,
+				&self.coordinator,
+				&self.auth_path(),
+				Some(&self.dek),
+				current_digest,
+			)
+			.await;
+		}
+
+		pub(crate) fn auth(&self) -> tokio::sync::RwLockReadGuard<'_, AuthCacheState> {
+			tokio::sync::RwLockReadGuard::map(self.state.try_read().unwrap(), |state| match &state
+				.status
+			{
+				AuthStatus::Authenticated(auth) => auth,
+				AuthStatus::Unauthenticated(_) => panic!("the session is not authenticated"),
+			})
+		}
+
+		pub(crate) fn client(&self) -> Arc<Client> {
+			self.auth().client.clone()
+		}
+
+		pub(crate) fn has_marker(&self) -> bool {
+			self.auth()
+				.conn()
+				.query_row(
+					"SELECT COUNT(*) FROM items WHERE uuid = x'CC000000000000000000000000000000'",
+					[],
+					|row| row.get::<_, i64>(0),
+				)
+				.unwrap() == 1
+		}
+
+		pub(crate) fn unauth_reason(&self) -> Option<&'static str> {
+			match &self.state.try_read().unwrap().status {
+				AuthStatus::Authenticated(_) => None,
+				AuthStatus::Unauthenticated(unauth) => Some(match unauth.reason {
+					UnauthReason::Disabled => "disabled",
+					UnauthReason::Unauthenticated => "unauthenticated",
+					UnauthReason::Unavailable => "unavailable",
+				}),
+			}
 		}
 	}
 }
@@ -1812,170 +1975,11 @@ mod pending_reconcile_state_tests {
 
 #[cfg(test)]
 mod session_refresh_tests {
-	use std::{
-		path::{Path, PathBuf},
-		sync::Arc,
-	};
+	use std::sync::Arc;
 
-	use filen_sdk_rs::{
-		auth::Client,
-		crypto::{shared::DataCrypter, v3::EncryptionKey},
-		fs::HasUUID,
-	};
-	use filen_types::auth::{AuthVersion, FilenSDKConfig};
+	use filen_sdk_rs::fs::HasUUID;
 
-	use super::{
-		AuthCacheState, AuthFile, AuthStatus, CacheState, UnauthCacheState, UnauthReason,
-		parse_auth_read, recheck_authenticated, sync_read_auth_plaintext, test_support::TempDbDir,
-		update_state,
-	};
-
-	/// A throwaway 512-bit PKCS#8 key: it only has to parse, and generating one per test would
-	/// need a dependency this crate does not have.
-	const TEST_PRIVATE_KEY: &str = "MIIBVAIBADANBgkqhkiG9w0BAQEFAASCAT4wggE6AgEAAkEArb1qLZWNKBX6g2xbVllG53W1vfZe8I0zjn+9o0k5yF1wgqKYs3RM3pDpaGSm9fjyhZ5dY+mahX7mFto/IeOWAQIDAQABAkAbWmzzDE6S9xLfyhl/OMMPAdtBMx6zZKevUbE7mfW886aXQmS5KMhX9xJ54ijx3MUk7rZa7RU+4YTL4i0KCPyhAiEA3savlb6LqUJ/+WbF8u9oazX54zapC0ogoKOlbfV7g8UCIQDHppZeH5iPvgWpkagpFVvnfGe1PGadhiEx0IVuErOhDQIge86j6m65I1oH0U1imX6f42Vd+P55uAJ8W4pW9+NDv5kCIAuhjt0I5jBpl5bbX3qVPfdsbfZHAItoxwJJ7ZwOBtz5AiEAmrbd5UB4b9U7JndP5nFtm65xyG5wZr6NoH5vjohrE2M=";
-	const ROOT_A: &str = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
-	const ROOT_B: &str = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
-
-	fn sdk_config(user_id: u64, root: &str, api_key: &str) -> FilenSDKConfig {
-		FilenSDKConfig {
-			email: "offline@example.invalid".to_owned(),
-			password: String::new(),
-			two_factor_code: String::new(),
-			master_keys: vec!["0".repeat(64)],
-			api_key: api_key.to_owned(),
-			public_key: String::new(),
-			private_key: TEST_PRIVATE_KEY.to_owned(),
-			auth_version: AuthVersion::V2,
-			base_folder_uuid: root.to_owned(),
-			user_id,
-			metadata_cache: false,
-			tmp_path: String::new(),
-			connect_to_socket: false,
-		}
-	}
-
-	fn enabled(config: FilenSDKConfig) -> Vec<u8> {
-		serde_json::to_vec(&AuthFile {
-			provider_enabled: true,
-			sdk_config: Some(config),
-			..AuthFile::default()
-		})
-		.unwrap()
-	}
-
-	// Mirrors the app-side seal (fileProvider.ts): version(0x01) ++ nonce(12) ++ ciphertext ++ tag(16).
-	fn write_sealed(path: &Path, dek: &EncryptionKey, plaintext: &[u8]) {
-		let mut data = plaintext.to_vec();
-		dek.blocking_encrypt_data(&mut data).unwrap();
-		let mut blob = vec![0x01];
-		blob.extend_from_slice(&data);
-		std::fs::write(path, blob).unwrap();
-	}
-
-	/// An authenticated state built from a sealed auth.json, the way the FFI entry points build
-	/// it, with one marker row in its cache DB.
-	struct Session {
-		dir: TempDbDir,
-		dek: EncryptionKey,
-		state: tokio::sync::RwLock<CacheState>,
-		coordinator: tokio::sync::Mutex<()>,
-	}
-
-	impl Session {
-		fn start(config: FilenSDKConfig) -> Self {
-			let dir = TempDbDir::create("filen-cache-session-refresh");
-			let dek = EncryptionKey::new([7u8; 32]);
-			let auth_file = dir.0.join("auth.json");
-			write_sealed(&auth_file, &dek, &enabled(config));
-			let mut state = CacheState {
-				status: AuthStatus::Unauthenticated(UnauthCacheState {
-					reason: UnauthReason::Disabled,
-				}),
-				auth_file: Arc::new(auth_file),
-				dek: Some(dek),
-				files_dir: dir.0.clone(),
-				db_dir: dir.0.clone(),
-				last_update: std::sync::RwLock::new(None),
-				auth_digest: None,
-				disabled_wipe_gate: Arc::new(tokio::sync::Semaphore::new(1)),
-				working_set_listener: std::sync::Mutex::new(None),
-			};
-			let (file, digest) =
-				parse_auth_read(sync_read_auth_plaintext(&state.auth_file, Some(&dek)));
-			update_state(&mut state, file, digest);
-			let session = Session {
-				dir,
-				dek,
-				state: tokio::sync::RwLock::new(state),
-				coordinator: tokio::sync::Mutex::new(()),
-			};
-			session
-				.auth()
-				.conn()
-				.execute_batch(
-					"INSERT INTO items (uuid, stable_uuid, parent, type)
-					VALUES (x'CC000000000000000000000000000000', NULL, NULL, 1);",
-				)
-				.unwrap();
-			session
-		}
-
-		fn auth_path(&self) -> PathBuf {
-			self.dir.0.join("auth.json")
-		}
-
-		fn write_sealed(&self, plaintext: &[u8]) {
-			write_sealed(&self.auth_path(), &self.dek, plaintext);
-		}
-
-		/// What the periodic re-check spawned from `match_state` runs.
-		async fn recheck(&self) {
-			let current_digest = self.state.read().await.auth_digest;
-			recheck_authenticated(
-				&self.state,
-				&self.coordinator,
-				&self.auth_path(),
-				Some(&self.dek),
-				current_digest,
-			)
-			.await;
-		}
-
-		fn auth(&self) -> tokio::sync::RwLockReadGuard<'_, AuthCacheState> {
-			tokio::sync::RwLockReadGuard::map(self.state.try_read().unwrap(), |state| match &state
-				.status
-			{
-				AuthStatus::Authenticated(auth) => auth,
-				AuthStatus::Unauthenticated(_) => panic!("the session is not authenticated"),
-			})
-		}
-
-		fn client(&self) -> Arc<Client> {
-			self.auth().client.clone()
-		}
-
-		fn has_marker(&self) -> bool {
-			self.auth()
-				.conn()
-				.query_row(
-					"SELECT COUNT(*) FROM items WHERE uuid = x'CC000000000000000000000000000000'",
-					[],
-					|row| row.get::<_, i64>(0),
-				)
-				.unwrap() == 1
-		}
-
-		fn unauth_reason(&self) -> Option<&'static str> {
-			match &self.state.try_read().unwrap().status {
-				AuthStatus::Authenticated(_) => None,
-				AuthStatus::Unauthenticated(unauth) => Some(match unauth.reason {
-					UnauthReason::Disabled => "disabled",
-					UnauthReason::Unauthenticated => "unauthenticated",
-					UnauthReason::Unavailable => "unavailable",
-				}),
-			}
-		}
-	}
+	use super::test_support::{ROOT_A, ROOT_B, Session, enabled, sdk_config};
 
 	#[tokio::test]
 	async fn a_new_api_key_for_the_same_account_swaps_only_the_client() {

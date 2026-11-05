@@ -20,6 +20,7 @@ use crate::{
 	CacheError,
 	auth::{AuthCacheState, CacheState, FilenMobileCacheState},
 	ffi::FfiId,
+	io::TmpFileGuard,
 	sql::{self, object::DBObject},
 };
 
@@ -32,28 +33,6 @@ use crate::{
 /// Not a `ClientConfig` knob — the SDK has no notion of a thumbnail batch. A host
 /// overrides it through `AuthFile::thumbnail_item_concurrency`.
 pub(crate) const DEFAULT_THUMBNAIL_ITEM_CONCURRENCY: usize = 4;
-
-/// Removes the temp file a thumbnail encode writes into unless [`disarm`](Self::disarm)ed
-/// after the rename into place — the one cleanup covering every exit, including the future
-/// being dropped mid-await by a cancelled bulk batch.
-struct TmpFileGuard {
-	path: Option<PathBuf>,
-}
-
-impl TmpFileGuard {
-	fn disarm(mut self) {
-		self.path = None;
-	}
-}
-
-impl Drop for TmpFileGuard {
-	fn drop(&mut self) {
-		if let Some(path) = self.path.take() {
-			// Sync removal of one small local file; best-effort by design.
-			let _ = std::fs::remove_file(path);
-		}
-	}
-}
 
 impl AuthCacheState {
 	async fn get_or_make_thumbnail(
@@ -150,9 +129,7 @@ impl AuthCacheState {
 		// AND an aborted batch (cancel() drops this future mid-await while the
 		// detached blocking closure keeps writing to the already-open, now-unlinked
 		// file, which is harmless).
-		let tmp_guard = TmpFileGuard {
-			path: Some(tmp_path.clone()),
-		};
+		let tmp_guard = TmpFileGuard::new(tmp_path.clone());
 
 		let mut tmp_file = tmp_file.into_std().await;
 
