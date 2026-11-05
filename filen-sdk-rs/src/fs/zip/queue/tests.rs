@@ -287,7 +287,7 @@ fn read_archive(bytes: Vec<u8>) -> Vec<(String, Vec<u8>)> {
 			let mut data = Vec::new();
 			// checks the entry's CRC too
 			entry.read_to_end(&mut data).unwrap();
-			(entry.name().to_owned(), data)
+			(entry.name().unwrap().into_owned(), data)
 		})
 		.collect()
 }

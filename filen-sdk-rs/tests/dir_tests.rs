@@ -805,7 +805,8 @@ async fn download_to_zip() {
 	let mut zip_file = zip_file.into_inner().into_std().await;
 	zip_file.seek(std::io::SeekFrom::Start(0)).unwrap();
 	let mut archive = ZipArchive::new(BufReader::new(zip_file)).unwrap();
-	let names = archive.file_names().collect::<Vec<_>>();
+	let names = archive.file_names().collect::<Result<Vec<_>, _>>().unwrap();
+	let names = names.iter().map(AsRef::as_ref).collect::<Vec<&str>>();
 	assert!(names.contains(&"a/"));
 	assert!(names.contains(&"a/b/"));
 	assert!(names.contains(&"file.txt"));
@@ -951,7 +952,8 @@ async fn download_linked_dir_to_zip() {
 	let mut zip_file = zip_file.into_inner().into_std().await;
 	zip_file.seek(std::io::SeekFrom::Start(0)).unwrap();
 	let mut archive = ZipArchive::new(BufReader::new(zip_file)).unwrap();
-	let names = archive.file_names().collect::<Vec<_>>();
+	let names = archive.file_names().collect::<Result<Vec<_>, _>>().unwrap();
+	let names = names.iter().map(AsRef::as_ref).collect::<Vec<&str>>();
 	assert!(
 		names.contains(&"link_file1.txt"),
 		"expected link_file1.txt in zip, got: {:?}",

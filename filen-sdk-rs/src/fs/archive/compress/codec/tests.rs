@@ -371,7 +371,7 @@ fn zip_crate_entries(archive: &[u8], password: Option<&[u8]>) -> Vec<(String, Ve
 			};
 			let mut data = Vec::new();
 			file.read_to_end(&mut data).unwrap();
-			(file.name().to_owned(), data)
+			(file.name().unwrap().into_owned(), data)
 		})
 		.collect()
 }
