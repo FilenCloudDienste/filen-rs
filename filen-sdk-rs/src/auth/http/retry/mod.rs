@@ -92,13 +92,23 @@ impl<E> RetryError<E> {
 
 #[derive(Clone)]
 pub(crate) struct RetryMapLayer {
-	inner: RetryLayer<RetryPolicy>,
+	policy: RetryPolicy,
 }
 
 impl RetryMapLayer {
 	pub(crate) fn new(policy: RetryPolicy) -> Self {
+		Self { policy }
+	}
+
+	/// This layer without retries: one attempt, its error mapped as any other's. The shared
+	/// budget is still credited for a success.
+	pub(crate) fn single_attempt(&self) -> Self {
 		Self {
-			inner: RetryLayer::new(policy),
+			policy: RetryPolicy {
+				retries_remaining: 0,
+				connect_retries_remaining: 0,
+				..self.policy.clone()
+			},
 		}
 	}
 }
@@ -108,7 +118,7 @@ impl<S> Layer<S> for RetryMapLayer {
 
 	fn layer(&self, service: S) -> Self::Service {
 		RetryMapService {
-			inner: self.inner.layer(service),
+			inner: RetryLayer::new(self.policy.clone()).layer(service),
 		}
 	}
 }

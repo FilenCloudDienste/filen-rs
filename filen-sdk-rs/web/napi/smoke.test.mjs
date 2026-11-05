@@ -459,6 +459,8 @@ describe("UnauthJsClient", () => {
 		assert.ok(client instanceof UnauthJsClient)
 		assert.equal(typeof client.login, "function")
 		assert.equal(typeof client.fromStringified, "function")
+		assert.equal(typeof client.health, "function")
+		assert.equal(typeof JsClient.prototype.health, "function")
 	})
 
 	test("fromConfig throws a FilenSdkError the way ubrn throws it", () => {
@@ -529,6 +531,14 @@ describe("UnauthJsClient", () => {
 				return true
 			}
 		)
+	})
+
+	test("health with an already aborted signal rejects with an AbortError", async () => {
+		await assert.rejects(UnauthJsClient.fromConfig({}).health({ signal: AbortSignal.abort() }), e => {
+			assert.equal(e.name, "AbortError")
+			assert.equal(FilenSdkError.hasInner(e), false)
+			return true
+		})
 	})
 
 	test("hasInner is false for values ubrn would not have thrown", () => {

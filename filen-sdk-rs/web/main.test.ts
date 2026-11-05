@@ -285,6 +285,11 @@ test("login", async () => {
 	expect(state.root().uuid).toBeDefined()
 })
 
+test("the gateway's health check resolves through the unauthed and the logged-in client", async () => {
+	await unauthClient.health()
+	await state.health()
+})
+
 test("account info", async () => {
 	const info = await state.getUserInfo()
 	expect(info.email).toBe(import.meta.env.VITE_TEST_EMAIL)

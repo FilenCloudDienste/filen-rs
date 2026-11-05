@@ -1281,6 +1281,53 @@ impl UnauthClient {
 			.await
 	}
 
+	/// The body of a GET of the gateway's `endpoint`, without the API key: retried as any other
+	/// request when `retry`, else sent once, so the result is how the request fares now.
+	pub(crate) async fn get_body(
+		&self,
+		endpoint: Cow<'static, str>,
+		retry: bool,
+	) -> Result<Vec<u8>, Error> {
+		let retry_layer = if retry {
+			self.state.retry.clone()
+		} else {
+			self.state.retry.single_attempt()
+		};
+		let url = gateway_url(&endpoint);
+
+		let builder = ServiceBuilder::new()
+			.layer(logging::LogLayer::new(endpoint)) // optional logging
+			.layer(url_parser::UrlParseLayer) // required to parse URL string to reqwest::Url
+			.layer(self.state.limits.layer(RequestClass::Control)) // the class's concurrency limits
+			.layer(retry_layer) // required to map RetryError to Error
+			.layer(self.state.rate_limiter.clone()) // optional
+			.layer(download_body::full::DownloadLayer::new()) // required to download full response body to bytes
+			.map_request(|request: Request<(), reqwest::Url>| {
+				request.into_builder_map_body(|()| "")
+			}); // required to map Request to RequestBuilder
+
+		let builder = {
+			#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+			{
+				builder.layer(self.state.download_limiter.clone()) // optional
+			}
+			#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+			{
+				builder
+			}
+		};
+
+		builder
+			.service_fn(move |request| execute_request(request, Arc::clone(&self.state.answers)))
+			.oneshot(Request {
+				method: RequestMethod::Get,
+				response_type: ResponseType::Standard,
+				url,
+				client: self.reqwest_client.clone(),
+			})
+			.await
+	}
+
 	pub(crate) fn post_large_response<Req, Res, F>(
 		&self,
 		endpoint: Cow<'static, str>,

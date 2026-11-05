@@ -107,7 +107,7 @@ async fn refused_client(answering: bool) -> (Client, Arc<std::sync::atomic::Atom
 
 /// A request to the gateway that failed transiently.
 async fn gateway_failure(client: &Client) -> crate::Error {
-	health::post(client.client()).await.unwrap_err()
+	health::get_retried(client.unauthed()).await.unwrap_err()
 }
 
 /// A gateway failure no other answer came in for is settled by asking the gateway for its health:

@@ -189,6 +189,15 @@ impl JsClient {
 		.await;
 	}
 
+	/// Whether the gateway is reachable now: one request, no retry. Rejects with the request's
+	/// error (`TlsVerification` for a rejected certificate).
+	#[cfg_attr(all(target_family = "wasm", target_os = "unknown"), wasm_bindgen)]
+	#[napi_export]
+	pub async fn health(&self) -> Result<(), Error> {
+		let this = self.inner();
+		do_on_commander(move || async move { this.health().await }).await
+	}
+
 	#[cfg_attr(
 		all(target_family = "wasm", target_os = "unknown"),
 		wasm_bindgen(js_name = "getUnauthed")
@@ -320,6 +329,15 @@ impl UnauthJsClient {
 		Ok(super::JsClient::new(
 			self.inner_ref().from_stringified(serialized)?,
 		))
+	}
+
+	/// Whether the gateway is reachable now: one request, no retry. Rejects with the request's
+	/// error (`TlsVerification` for a rejected certificate).
+	#[cfg_attr(all(target_family = "wasm", target_os = "unknown"), wasm_bindgen)]
+	#[napi_export]
+	pub async fn health(&self) -> Result<(), Error> {
+		let this = self.inner();
+		do_on_commander(move || async move { this.health().await }).await
 	}
 
 	#[cfg_attr(

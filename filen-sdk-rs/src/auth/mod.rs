@@ -362,6 +362,11 @@ impl Client {
 		&self.http_client.unauthed
 	}
 
+	/// [`UnauthClient::health`], through this client's connections.
+	pub async fn health(&self) -> Result<(), Error> {
+		self.unauthed().health().await
+	}
+
 	pub(crate) fn client(&self) -> &AuthClient {
 		&self.http_client
 	}

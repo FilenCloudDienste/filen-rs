@@ -152,7 +152,7 @@ impl<'a> Reach<'a> {
 		let sent = answers.mark();
 		// Only its answer matters, which the client notes as it arrives; a body the probe could not
 		// read, or a refusal, is still the gateway answering.
-		if timeout(PROBE_TIMEOUT, health::post(self.client.client()))
+		if timeout(PROBE_TIMEOUT, health::get_retried(self.client.unauthed()))
 			.await
 			.is_err()
 		{

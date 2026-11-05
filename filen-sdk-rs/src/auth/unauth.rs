@@ -397,6 +397,13 @@ impl UnauthClient {
 		.await
 	}
 
+	/// Whether the gateway is reachable now: one `v3/health` request through the client's TLS
+	/// and proxy settings, with no retry, so a failure is the current state, with its usual
+	/// [`ErrorKind`](crate::ErrorKind) (`TlsVerification` for a rejected certificate).
+	pub async fn health(&self) -> Result<(), Error> {
+		api::v3::health::get_once(self).await
+	}
+
 	pub async fn start_password_reset(&self, email: &str) -> Result<(), Error> {
 		api::v3::user::password::forgot::post(
 			self,
@@ -673,6 +680,92 @@ mod tests {
 		let exported = crate::auth::make_master_key_string_from_keys(123456, &keys).unwrap();
 		let master_keys_vec = master_keys_from_exportable(&exported, 123456).unwrap();
 		assert_eq!(master_keys_vec, keys);
+	}
+
+	/// A proxy that counts the requests reaching it and answers each `answer`.
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	async fn counting_proxy(
+		answer: &'static [u8],
+	) -> (
+		std::net::SocketAddr,
+		std::sync::Arc<std::sync::atomic::AtomicUsize>,
+	) {
+		use tokio::io::AsyncWriteExt;
+
+		let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let addr = listener.local_addr().unwrap();
+		let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+		let counted = std::sync::Arc::clone(&requests);
+		tokio::spawn(async move {
+			while let Ok((mut socket, _)) = listener.accept().await {
+				let counted = std::sync::Arc::clone(&counted);
+				tokio::spawn(async move {
+					let head = crate::auth::http::test_support::read_head(&mut socket).await;
+					assert!(head.starts_with("CONNECT gateway.filen.io:443"), "{head}");
+					counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+					socket.write_all(answer).await.ok();
+				});
+			}
+		});
+		(addr, requests)
+	}
+
+	/// A health check is one request: a gateway that cannot be reached fails it at once, with the
+	/// request's own error, where every other request would be retried.
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	#[tokio::test]
+	async fn the_health_check_is_one_request_without_retries() {
+		for answer in [
+			&b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n"[..],
+			b"",
+		] {
+			let (proxy, requests) = counting_proxy(answer).await;
+			let client = crate::auth::http::test_support::unauthed_via_proxy(
+				ClientConfig::default(),
+				&format!("http://{proxy}"),
+			);
+			let error = client.health().await.unwrap_err();
+			assert_eq!(error.kind(), crate::ErrorKind::Reqwest, "{error}");
+			assert_eq!(
+				requests.load(std::sync::atomic::Ordering::SeqCst),
+				1,
+				"{error}"
+			);
+		}
+	}
+
+	/// The sync engine's probe of the same endpoint is retried as any other request, so it rides
+	/// out a short connect failure; only `health` is a single attempt.
+	#[cfg(all(
+		feature = "sync-engine",
+		not(all(target_family = "wasm", target_os = "unknown"))
+	))]
+	#[tokio::test]
+	async fn the_sync_engines_health_probe_is_retried() {
+		let (proxy, requests) =
+			counting_proxy(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n").await;
+		let client = crate::auth::http::test_support::unauthed_via_proxy(
+			ClientConfig::default(),
+			&format!("http://{proxy}"),
+		);
+		let error = api::v3::health::get_retried(&client).await.unwrap_err();
+		assert_eq!(error.kind(), crate::ErrorKind::Reqwest, "{error}");
+		assert!(
+			requests.load(std::sync::atomic::Ordering::SeqCst) > 1,
+			"{error}"
+		);
+	}
+
+	/// An unreachable gateway reads as such through a logged-in client too.
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	#[tokio::test]
+	async fn a_logged_in_client_checks_the_gateways_health_the_same_way() {
+		let error = test_support::offline_client().health().await.unwrap_err();
+		assert_eq!(error.kind(), crate::ErrorKind::Reqwest, "{error}");
+		assert!(
+			error.to_string().contains(api::v3::health::ENDPOINT),
+			"{error}"
+		);
 	}
 }
 
