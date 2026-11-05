@@ -247,8 +247,9 @@ impl AuthCacheState {
 			// Over budget, unsupported, or undecodable bytes — all settled
 			// verdicts about this file, which the platform may cache. Logged
 			// apart because "we never decode this" and "this host could not
-			// afford it" call for different fixes. What reaches this arm as
-			// Err is transport/system trouble that must stay retryable.
+			// afford it" call for different fixes. An Err is not one of these:
+			// transport/system trouble must stay retryable, and a content hash
+			// mismatch is its own error.
 			Ok(
 				outcome @ (ThumbnailOutcome::Unsupported
 				| ThumbnailOutcome::OverBudget
@@ -421,6 +422,10 @@ impl FilenMobileCacheState {
 
 #[filen_macros::create_uniffi_wrapper]
 impl FilenMobileCacheState {
+	/// A thumbnail made from the remote file, when a read of it that covers the whole file does
+	/// not hash to the BLAKE3 its metadata declares, answers with
+	/// [`CacheError::ContentHashMismatch`]. Which reads cover the whole file is documented on
+	/// [`RemoteChunkSource`].
 	// not sure why this is necessary for this specific function,
 	// but otherwise it seems like the macro wasn't adding this
 	#[uniffi::method(name = "get_thumbnail")]

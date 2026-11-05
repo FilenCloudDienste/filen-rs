@@ -193,6 +193,9 @@ impl FilenMobileCacheState {
 		.await
 	}
 
+	/// Downloads the file if the cached copy is not the server's, and returns its local path. A
+	/// file whose content does not hash to the BLAKE3 its metadata declares fails with
+	/// [`CacheError::ContentHashMismatch`] and leaves the cached copy as it was.
 	pub async fn download_file_if_changed_by_path(
 		&self,
 		file_path: FfiId,
@@ -206,6 +209,9 @@ impl FilenMobileCacheState {
 		.await
 	}
 
+	/// Downloads the file if the cached copy is not the server's, and returns its local path. A
+	/// file whose content does not hash to the BLAKE3 its metadata declares fails with
+	/// [`CacheError::ContentHashMismatch`] and leaves the cached copy as it was.
 	pub async fn download_file_if_changed_by_uuid(
 		&self,
 		uuid: String,
@@ -224,7 +230,9 @@ impl FilenMobileCacheState {
 	///
 	/// Same work as [`FilenMobileCacheState::download_file_if_changed_by_path`], which returns the
 	/// path alone; a replicated provider has to answer with the item as well, and re-querying it
-	/// separately would race the download it just did.
+	/// separately would race the download it just did. A file whose content does not hash to the
+	/// BLAKE3 its metadata declares fails with [`CacheError::ContentHashMismatch`] and leaves the
+	/// cached copy as it was.
 	pub async fn download_file_if_changed_with_item(
 		&self,
 		id: FfiId,

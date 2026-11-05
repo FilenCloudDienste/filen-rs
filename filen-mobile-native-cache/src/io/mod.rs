@@ -189,6 +189,13 @@ impl Drop for TmpFileGuard {
 	}
 }
 
+/// The error a download failed with. It keeps the SDK error as its source, so that
+/// [`CacheError`](crate::error::CacheError)'s conversion from the `io::Error` it travels in still
+/// tells its kind, and reports a file whose content does not match its hash as such.
+#[derive(Debug, thiserror::Error)]
+#[error("Failed to download file: {0}")]
+pub(crate) struct DownloadError(#[from] FilenSdkError);
+
 /// `cache_dir/<uuid>/<name>`. The name is decrypted, so whoever wrote the item (a sharer
 /// included) controls it: one that is not a single path component (`..`, `/abs`, `a/b`, empty)
 /// would escape `cache_dir` once joined, so it falls back to the uuid like an undecryptable
@@ -237,7 +244,7 @@ impl AuthCacheState {
 		self.client
 			.download_file_to_writer(file, &mut os_file, callback)
 			.await
-			.map_err(|e| io::Error::other(format!("Failed to download file: {e}")))?;
+			.map_err(|e| io::Error::other(DownloadError::from(e)))?;
 		let os_file = os_file.into_inner().into_std().await;
 		let created = file.created().map(Into::into);
 		let modified = file.last_modified().map(Into::into);
@@ -1309,38 +1316,48 @@ mod tests {
 	};
 	use filen_types::{
 		auth::FileEncryptionVersion,
+		crypto::Blake3Hash,
 		fs::{ParentUuid, StableUuid},
 	};
 
 	use super::*;
-	use crate::auth::test_support::{ROOT_A, Session, sdk_config};
+	use crate::{
+		auth::test_support::{ROOT_A, Session, sdk_config},
+		error::CacheError,
+	};
 
 	const UUID: &str = "00000000-0000-0000-0000-000000000001";
 
 	/// A file of 10 bytes claiming 3 chunks: its download fails on the first read, before any
 	/// request is made, once the temp file it is staged in has been created.
 	fn undownloadable_file() -> RemoteFile {
+		file_of(10, 3, None)
+	}
+
+	/// A file with the given size, chunk count and declared hash, which no request is made for
+	/// as long as its chunk count is 0 or does not match its size.
+	fn file_of(size: u64, chunks: u64, hash: Option<Blake3Hash>) -> RemoteFile {
 		let uuid = Uuid::from_bytes([0xDD; 16]);
 		let time = DateTime::<Utc>::from_timestamp_millis(1_700_000_000_000).unwrap();
 		RemoteFile::from_meta(
 			uuid,
 			StableUuid::new_for_test(uuid),
 			ParentUuid::Uuid(Uuid::from_bytes([0xAA; 16])),
-			10,
-			3,
+			size,
+			chunks,
 			"de-1",
 			"bucket",
 			time,
 			false,
 			FileMeta::Decoded(DecryptedFileMeta {
 				name: Cow::Borrowed("broken.txt"),
-				size: 10,
+				size,
 				mime: Cow::Borrowed("text/plain"),
 				key: FileKey::from_str_with_version(&"a".repeat(64), FileEncryptionVersion::V3)
 					.unwrap(),
 				last_modified: time,
 				created: None,
-				hash: None,
+				hash,
 			}),
 		)
 	}
@@ -1362,6 +1379,42 @@ mod tests {
 		);
 		let staged = auth.tmp_dir.join(file.uuid().to_string());
 		assert!(!staged.exists(), "{} was left behind", staged.display());
+		assert!(
+			matches!(CacheError::from(e), CacheError::IO(_)),
+			"a download that failed on the transfer is not a hash mismatch"
+		);
+	}
+
+	#[tokio::test]
+	async fn a_download_not_matching_its_hash_is_its_own_error() {
+		let session = Session::start(sdk_config(1, ROOT_A, "key"));
+		let auth = session.auth();
+		// Empty, so it is read without a request, and declaring the hash of other content.
+		let file = file_of(0, 0, Some(Blake3Hash::from([0x11; 32])));
+
+		let Err(e) = auth.download_file_io(&file, None).await else {
+			panic!("a file not matching its hash downloaded");
+		};
+
+		let staged = auth.tmp_dir.join(file.uuid().to_string());
+		assert!(!staged.exists(), "{} was left behind", staged.display());
+		assert!(
+			!auth.get_cached_file_path(&file).exists(),
+			"a file not matching its hash reached the cache"
+		);
+		let CacheError::ContentHashMismatch(context) = CacheError::from(e) else {
+			panic!("a hash mismatch did not map to its own error");
+		};
+		assert_eq!(
+			context.to_string(),
+			format!(
+				"Failed to download file: Error of kind ContentHashMismatch: error: The content of \
+				 file {} does not match its hash: expected {}, got {}",
+				file.uuid(),
+				"11".repeat(32),
+				blake3::hash(b"").to_hex()
+			)
+		);
 	}
 
 	#[test]
