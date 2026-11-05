@@ -39,8 +39,10 @@ struct Platform {
 	factory: Global<JObject<'static>>,
 	certificate: Global<JClass<'static>>,
 	input_stream: Global<JClass<'static>>,
-	/// "RSA", the key exchange the trust manager is told: Android ignores it for a server's
-	/// chain, and Chromium passes this same constant.
+	/// "RSA", the auth type the trust manager is told, whatever the key: Conscrypt's
+	/// `TrustManagerImpl` only refuses a null or empty one and never reads it otherwise (no key
+	/// usage is checked against it), and the platform's `RootTrustManager` and
+	/// `NetworkSecurityTrustManager` pass it through.
 	auth_type: Global<JString<'static>>,
 }
 

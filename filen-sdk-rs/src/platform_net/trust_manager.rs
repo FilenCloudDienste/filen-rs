@@ -2,8 +2,12 @@
 //! user-installed roots, the app's network security config), rustls the rest. The trust manager
 //! itself is reached through JNI ([`super::android`]); this is what does not need the JVM.
 //!
+//! The trust manager also enforces the end entity's extended key usage: Conscrypt's
+//! `TrustManagerImpl` validates with its `ExtendedKeyUsagePKIXCertPathChecker`, which requires
+//! serverAuth (or anyExtendedKeyUsage, or a legacy SGC usage) when the extension is present.
+//!
 //! No online revocation check is made, as Chrome on Android makes none: the platform trust manager
-//! disables it (Conscrypt's `TrustManagerImpl` validates with `setRevocationEnabled(false)`),
+//! disables it (`TrustManagerImpl` validates with `setRevocationEnabled(false)`),
 //! where rustls-platform-verifier's Kotlin verifier added one that fetched the CA's CRL on the
 //! handshake's thread, without a timeout, and refused the certificate as revoked whenever that
 //! fetch failed.
