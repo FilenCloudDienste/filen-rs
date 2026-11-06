@@ -11,7 +11,7 @@ mod offline {
 		io::{Read as _, Write as _},
 		process::{Command, Stdio},
 		sync::mpsc,
-		time::Duration,
+		time::{Duration, Instant},
 	};
 
 	#[cfg(unix)]
@@ -29,7 +29,7 @@ mod offline {
 			.arg("--skip-update")
 			.stdin(Stdio::piped())
 			.stdout(Stdio::piped())
-			.stderr(Stdio::null())
+			.stderr(Stdio::piped())
 			.spawn()
 			.unwrap();
 
@@ -46,6 +46,13 @@ mod offline {
 			// keep reading, so the CLI never blocks on a full pipe
 			let _ = std::io::copy(&mut stdout, &mut std::io::sink());
 		});
+		// read as it comes, so the CLI never blocks on a full pipe either
+		let mut stderr = cli.stderr.take().unwrap();
+		let stderr = std::thread::spawn(move || {
+			let mut read = Vec::new();
+			let _ = stderr.read_to_end(&mut read);
+			String::from_utf8_lossy(&read).into_owned()
+		});
 		let printed = printed_rx.recv_timeout(Duration::from_secs(60));
 		if printed != Ok(true) {
 			let _ = cli.kill();
@@ -57,10 +64,27 @@ mod offline {
 			.status()
 			.unwrap();
 		assert!(interrupted.success());
-		let status = cli.wait().unwrap();
+		// The CLI exits within a second or two of Ctrl-C. stdin stays open while it waits, so a
+		// Ctrl-C it loses leaves it reading the next command for good.
+		let deadline = Instant::now() + Duration::from_secs(30);
+		let status = loop {
+			if let Some(status) = cli.try_wait().unwrap() {
+				break status;
+			}
+			if Instant::now() >= deadline {
+				let _ = cli.kill();
+				let _ = cli.wait();
+				panic!(
+					"the CLI did not exit within 30 s of Ctrl-C\nstderr:\n{}",
+					stderr.join().unwrap()
+				);
+			}
+			std::thread::sleep(Duration::from_millis(50));
+		};
 		drop(stdin);
+		let stderr = stderr.join().unwrap();
 
-		assert_eq!(status.code(), Some(130), "{status}");
+		assert_eq!(status.code(), Some(130), "{status}\nstderr:\n{stderr}");
 	}
 }
 
