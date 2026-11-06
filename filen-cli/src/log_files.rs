@@ -137,10 +137,14 @@ impl LogFiles {
 			if !is_log_file_name(&entry.file_name()) {
 				continue;
 			}
-			let Ok(metadata) = entry.metadata() else {
+			let path = entry.path();
+			// Not `entry.metadata()`: on Windows that is the directory listing's cached size,
+			// which lags behind for a file open for writing (latest.log and the daily file), and
+			// would under-count the total. `symlink_metadata` asks the file itself and, like
+			// `entry.metadata()`, does not follow a symlink.
+			let Ok(metadata) = fs::symlink_metadata(&path) else {
 				continue;
 			};
-			let path = entry.path();
 			let size = metadata.len();
 			if path == files.latest.path || path == files.daily.path {
 				total = total.saturating_add(size);
