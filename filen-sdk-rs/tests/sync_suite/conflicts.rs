@@ -2898,6 +2898,26 @@ async fn conflict_27_concurrent_same_name_create_surfaces_a_conflict() {
 	let tc = two_clients(SyncMode::TwoWay).await;
 	let mut conflicts = BTreeSet::new();
 
+	// One empty pass per client before the race. A pair's first pass after its cache started
+	// waits for the cache to converge the remote root, re-checking once a second, so two fresh
+	// caches can start their race passes a tick apart, and the later one then plans against a view
+	// that already holds the other's upload: a sequential create, not a race. After this pass both
+	// caches hold the root converged and both race passes read it at once. Nothing exists on either
+	// side yet, so it records no baseline row for race.txt and the race below still starts from none.
+	let (w_a, w_b) = sync_round(
+		&tc.engine_a,
+		tc.pair_a,
+		&tc.engine_b,
+		tc.pair_b,
+		Order::Concurrent,
+	)
+	.await;
+	for warm in [&w_a, &w_b] {
+		assert!(warm.errors.is_empty(), "{warm:?}");
+		assert_eq!(warm.uploaded, 0, "the empty pass uploaded: {warm:?}");
+		assert_eq!(warm.downloaded, 0, "the empty pass downloaded: {warm:?}");
+	}
+
 	// Distinct lengths, so the surviving size names which upload won the race.
 	write_file(&tc.local_a, "race.txt", b"AAA-from-a");
 	write_file(&tc.local_b, "race.txt", b"BBB-from-b-and-longer");
