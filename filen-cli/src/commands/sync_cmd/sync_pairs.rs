@@ -1105,6 +1105,16 @@ mod tests {
 		}
 	}
 
+	/// The pair `local` <> `remote` in `mode`, as a sync pairs file in `dir` defines it: `local`
+	/// resolved against `dir`, which keeps `dir`'s drive on Windows, and the TypeScript name as
+	/// the file gives it.
+	fn pair_in_file(dir: &Path, local: &str, mode: SyncMode, remote: &str) -> ParsedPair {
+		ParsedPair {
+			typescript_name: format!("{local}:{remote}"),
+			..pair(dir.join(local), mode, remote)
+		}
+	}
+
 	fn record(id: i64) -> PairRecord {
 		PairRecord {
 			id,
@@ -1394,7 +1404,12 @@ mod tests {
 
 		assert_eq!(
 			parse_sync_pairs(&given_config_dir(config_dir.path()), &[]).unwrap(),
-			[pair("/l", SyncMode::LocalBackup, "/r")]
+			[pair_in_file(
+				config_dir.path(),
+				"/l",
+				SyncMode::LocalBackup,
+				"/r"
+			)]
 		);
 	}
 
@@ -1420,7 +1435,12 @@ mod tests {
 
 		assert_eq!(
 			parse_sync_pairs(&dirs, &[]).unwrap(),
-			[pair("/l", SyncMode::RemoteBackup, "/r")]
+			[pair_in_file(
+				&typescript_home_dir(home.path()),
+				"/l",
+				SyncMode::RemoteBackup,
+				"/r"
+			)]
 		);
 	}
 
@@ -1450,7 +1470,12 @@ mod tests {
 
 		assert_eq!(
 			parse_sync_pairs(&dirs, &[]).unwrap(),
-			[pair("/config", SyncMode::TwoWay, "/r")]
+			[pair_in_file(
+				config_dir.path(),
+				"/config",
+				SyncMode::TwoWay,
+				"/r"
+			)]
 		);
 	}
 
@@ -1470,7 +1495,12 @@ mod tests {
 
 		assert_eq!(
 			parse_sync_pairs(&given_config_dir(config_dir.path()), &[]).unwrap(),
-			[pair("/yaml", SyncMode::TwoWay, "/r")]
+			[pair_in_file(
+				config_dir.path(),
+				"/yaml",
+				SyncMode::TwoWay,
+				"/r"
+			)]
 		);
 	}
 
@@ -1478,7 +1508,7 @@ mod tests {
 	/// tabs as JSON may be.
 	#[test]
 	fn a_sync_pairs_file_can_be_a_json_list() {
-		let (_dir, path) = sync_pairs_file(
+		let (dir, path) = sync_pairs_file(
 			"syncPairs.json",
 			"[\n\t{\n\t\t\"local\": \"/a\",\n\t\t\"remote\": \"/r/a\",\n\t\t\"syncMode\": \"cloudBackup\"\n\t},\n\
 			 \t{\"local\": \"/b\", \"remote\": \"/r/b\"}\n]\n",
@@ -1487,8 +1517,8 @@ mod tests {
 		assert_eq!(
 			read_sync_pairs_file(&path).unwrap(),
 			[
-				pair("/a", SyncMode::RemoteBackup, "/r/a"),
-				pair("/b", SyncMode::TwoWay, "/r/b"),
+				pair_in_file(dir.path(), "/a", SyncMode::RemoteBackup, "/r/a"),
+				pair_in_file(dir.path(), "/b", SyncMode::TwoWay, "/r/b"),
 			]
 		);
 	}
@@ -1496,14 +1526,19 @@ mod tests {
 	/// The TypeScript CLI also read a single pair, not in a list.
 	#[test]
 	fn a_sync_pairs_file_can_be_a_single_pair() {
-		let (_dir, path) = sync_pairs_file(
+		let (dir, path) = sync_pairs_file(
 			"syncPairs.json",
 			r#"{"local": "/l", "remote": "/r", "syncMode": "cloudToLocal"}"#,
 		);
 
 		assert_eq!(
 			read_sync_pairs_file(&path).unwrap(),
-			[pair("/l", SyncMode::RemoteToLocal, "/r")]
+			[pair_in_file(
+				dir.path(),
+				"/l",
+				SyncMode::RemoteToLocal,
+				"/r"
+			)]
 		);
 	}
 
@@ -1549,7 +1584,7 @@ mod tests {
 			pairs,
 			[ParsedPair {
 				alias: Some("photos".to_owned()),
-				..pair("/b", SyncMode::LocalBackup, "/r/b")
+				..pair_in_file(config_dir.path(), "/b", SyncMode::LocalBackup, "/r/b")
 			}]
 		);
 	}
@@ -1608,7 +1643,7 @@ mod tests {
 
 	#[test]
 	fn a_sync_pair_takes_its_ignore_rules_from_the_file() {
-		let (_dir, path) = sync_pairs_file(
+		let (dir, path) = sync_pairs_file(
 			"syncPairs.json",
 			r#"[{"local": "/l", "remote": "/r", "ignore": ["*.log", "build/"]}]"#,
 		);
@@ -1617,7 +1652,7 @@ mod tests {
 			read_sync_pairs_file(&path).unwrap(),
 			[ParsedPair {
 				ignore: vec!["*.log".to_owned(), "build/".to_owned()],
-				..pair("/l", SyncMode::TwoWay, "/r")
+				..pair_in_file(dir.path(), "/l", SyncMode::TwoWay, "/r")
 			}]
 		);
 	}
@@ -1626,7 +1661,7 @@ mod tests {
 	/// then re-include a dot file.
 	#[test]
 	fn exclude_dot_files_adds_the_rules_that_leave_out_dot_files() {
-		let (_dir, path) = sync_pairs_file(
+		let (dir, path) = sync_pairs_file(
 			"syncPairs.json",
 			r#"[{"local": "/l", "remote": "/r", "excludeDotFiles": true, "ignore": ["!.config"]},
 			    {"local": "/m", "remote": "/r", "excludeDotFiles": false}]"#,
@@ -1641,9 +1676,9 @@ mod tests {
 						"!/.filenignore".to_owned(),
 						"!.config".to_owned()
 					],
-					..pair("/l", SyncMode::TwoWay, "/r")
+					..pair_in_file(dir.path(), "/l", SyncMode::TwoWay, "/r")
 				},
-				pair("/m", SyncMode::TwoWay, "/r"),
+				pair_in_file(dir.path(), "/m", SyncMode::TwoWay, "/r"),
 			]
 		);
 	}
@@ -1651,19 +1686,21 @@ mod tests {
 	/// The local trash cannot be turned off, which a pair whose file asks for it is warned about.
 	#[test]
 	fn disable_local_trash_gives_a_warning() {
-		let (_dir, path) = sync_pairs_file(
+		let (dir, path) = sync_pairs_file(
 			"syncPairs.json",
 			r#"[{"local": "/l", "remote": "/r", "disableLocalTrash": true},
 			    {"local": "/m", "remote": "/r", "disableLocalTrash": false}]"#,
 		);
 		let parsed = read_sync_pairs_file(&path).unwrap();
+		let local = pair_in_file(dir.path(), "/l", SyncMode::TwoWay, "/r").local;
 
 		assert_eq!(
 			local_trash_warnings(&parsed),
 			[format!(
-				"The sync pair /l asks for disableLocalTrash, which is not supported: the local \
+				"The sync pair {} asks for disableLocalTrash, which is not supported: the local \
 				 files a sync deletes or replaces are kept in {} for 30 days.",
-				Path::new("/l").join(".filen-sync-trash").display()
+				local.display(),
+				local.join(".filen-sync-trash").display()
 			)]
 		);
 	}
@@ -1994,14 +2031,14 @@ mod tests {
 	/// two-way sync.
 	#[test]
 	fn a_sync_pairs_file_can_give_the_mode_as_sync_mode() {
-		let (_dir, path) = sync_pairs_file(
+		let (dir, path) = sync_pairs_file(
 			"pairs.yaml",
 			"syncPairs:\n  - local: /l\n    remote: /r\n    syncMode: cloudBackup\n",
 		);
 
 		assert_eq!(
 			read_sync_pairs_file(&path).unwrap(),
-			[pair(PathBuf::from("/l"), SyncMode::RemoteBackup, "/r")]
+			[pair_in_file(dir.path(), "/l", SyncMode::RemoteBackup, "/r")]
 		);
 	}
 
