@@ -13,7 +13,7 @@
 //! all of.
 
 use std::{
-	process,
+	mem, process,
 	sync::{LazyLock, Mutex, PoisonError},
 };
 
@@ -189,6 +189,14 @@ impl State {
 		Action::Send(Press { owned })
 	}
 
+	/// The error a command fails with when Ctrl-C, or a closed stdout, cancelled it.
+	fn cancelled_error(&self) -> CliError {
+		match self.stdout_closed {
+			true => CliError::StdoutClosed,
+			false => CliError::Interrupted,
+		}
+	}
+
 	fn end_catching(&mut self) {
 		self.catching = self.catching.saturating_sub(1);
 		if self.catching == 0 {
@@ -200,7 +208,12 @@ impl State {
 /// Held while a command runs that Ctrl-C cancels: see [`Catching::cancelled`].
 pub(crate) struct Catching {
 	presses: broadcast::Receiver<Press>,
+	counted: Counted,
 }
+
+/// Counts a running command as one that Ctrl-C cancels ([`State::catching`]) until it is dropped
+/// or [`ended`](Counted::end) under a lock already held.
+struct Counted;
 
 /// Lets Ctrl-C cancel the command about to run, rather than quit the CLI, until the returned
 /// [`Catching`] is dropped.
@@ -209,7 +222,10 @@ pub(crate) fn catch() -> Catching {
 	// Under the lock the handler sends under, so no Ctrl-C falls between the two.
 	let presses = PRESSES.subscribe();
 	state.catching += 1;
-	Catching { presses }
+	Catching {
+		presses,
+		counted: Counted,
+	}
 }
 
 impl Catching {
@@ -225,9 +241,45 @@ impl Catching {
 			}
 		}
 	}
+
+	/// Ends catching once the command has ended, failing as a cancelled command fails if a Ctrl-C
+	/// that cancels it was pressed while it ended, which [`Catching::cancelled`] did not get to. The
+	/// check and the end are under one lock: a Ctrl-C after the check would otherwise still find
+	/// the command running, cancel it, and be lost when the command stops counting, and the CLI
+	/// would go on as if it had not been pressed.
+	fn end(self) -> Result<(), CliError> {
+		let Catching {
+			mut presses,
+			counted,
+		} = self;
+		let mut state = lock_state();
+		let pressed = loop {
+			match presses.try_recv() {
+				Ok(Press { owned: true }) => {}
+				// As in `cancelled`: a Ctrl-C that cannot be told apart cancels the command.
+				Ok(Press { owned: false }) | Err(TryRecvError::Lagged(_)) => break true,
+				Err(TryRecvError::Empty | TryRecvError::Closed) => break false,
+			}
+		};
+		let cancelled_error = state.cancelled_error();
+		counted.end(&mut state);
+		match pressed {
+			true => Err(cancelled_error),
+			false => Ok(()),
+		}
+	}
 }
 
-impl Drop for Catching {
+impl Counted {
+	fn end(self, state: &mut State) {
+		state.end_catching();
+		// Counted is a unit struct, so forgetting it leaks nothing: it only skips the `Drop` below,
+		// which would take the lock the caller holds.
+		mem::forget(self);
+	}
+}
+
+impl Drop for Counted {
 	fn drop(&mut self) {
 		lock_state().end_catching();
 	}
@@ -235,20 +287,18 @@ impl Drop for Catching {
 
 /// Runs `command` until it ends or Ctrl-C cancels it, unless it handles Ctrl-C itself ([`own`]).
 /// Cancelling drops `command` and fails with [`CliError::Interrupted`], or
-/// [`CliError::StdoutClosed`] when a closed stdout cancelled it.
+/// [`CliError::StdoutClosed`] when a closed stdout cancelled it. A Ctrl-C pressed while `command`
+/// ends cancels it all the same: it fails as if it had been cancelled, whatever it returned.
 pub(crate) async fn cancellable<T>(
 	command: impl Future<Output = anyhow::Result<T>>,
 ) -> anyhow::Result<T> {
 	let mut catching = catch();
-	tokio::select! {
+	let result = tokio::select! {
 		result = command => result,
-		() = catching.cancelled() => Err(if stdout_closed() {
-			CliError::StdoutClosed
-		} else {
-			CliError::Interrupted
-		}
-		.into()),
-	}
+		() = catching.cancelled() => return Err(lock_state().cancelled_error().into()),
+	};
+	catching.end()?;
+	result
 }
 
 /// Held while a command handles Ctrl-C itself: see [`Owning::pressed`].
@@ -459,6 +509,37 @@ mod tests {
 
 		let err = command.await.unwrap_err();
 		assert_eq!(crate::error::exit_code(&err), EXIT_INTERRUPTED);
+		assert_eq!(*lock_state(), state(0, 0));
+	}
+
+	#[tokio::test]
+	async fn ctrl_c_while_a_command_ends_cancels_it() {
+		let _handler = HANDLER.lock().await;
+		// Ctrl-C lands once the command has done its work, before it stops catching Ctrl-C:
+		// whichever arm `select!` polls first, the command's ends it
+		let err = cancellable(async {
+			on_ctrl_c();
+			anyhow::Ok(())
+		})
+		.await
+		.unwrap_err();
+
+		assert_eq!(crate::error::exit_code(&err), EXIT_INTERRUPTED);
+		assert_eq!(*lock_state(), state(0, 0));
+	}
+
+	#[tokio::test]
+	async fn ctrl_c_handled_by_a_command_as_it_ends_does_not_cancel_it() {
+		let _handler = HANDLER.lock().await;
+		cancellable(async {
+			let ctrl_c = own();
+			on_ctrl_c();
+			drop(ctrl_c);
+			anyhow::Ok(())
+		})
+		.await
+		.unwrap();
+
 		assert_eq!(*lock_state(), state(0, 0));
 	}
 
