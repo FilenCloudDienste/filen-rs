@@ -1,4 +1,5 @@
 use std::{
+	collections::HashSet,
 	io::Cursor,
 	panic::AssertUnwindSafe,
 	sync::Arc,
@@ -780,103 +781,292 @@ async fn events_item_favorite() {
 	assert_file_meta_name(&file_unfav_event.metadata, &file_name);
 }
 
-/// Sanity-check: every event returned from a real account decrypts into a
-/// `Decoded` variant (i.e. the encryption version default we picked actually
-/// matches what the backend stored). This catches regressions where a future
-/// schema change leaves us with `FileMeta::Encrypted` or `DecryptedUTF8`. Also
-/// asserts that no events failed to parse at the wire level.
-#[shared_test_runtime]
-async fn events_all_decryptable() {
-	let client = test_utils::RESOURCES.client().await;
-	let results = client.get_user_events(None, None).await.unwrap();
-
-	// First: every event must have parsed at the wire level.
-	let parse_failures: Vec<_> = results.iter().filter_map(|r| r.as_ref().err()).collect();
-	assert!(
-		parse_failures.is_empty(),
-		"some events failed to parse: {:#?}",
-		parse_failures
-	);
-	let events: Vec<_> = results.into_iter().filter_map(Result::ok).collect();
-
-	let mut undecryptable: Vec<(Uuid, &'static str, String)> = Vec::new();
-
-	let check_file = |uuid: Uuid, kind: &'static str, meta: &FileMeta<'_>, out: &mut Vec<_>| {
+/// The item an event is about, and a description of each metadata blob on it that did not decode
+/// into its `Decoded` variant. `None` for kinds that carry no encrypted payload.
+fn event_item_and_undecoded(kind: &DecryptedUserEventKind) -> Option<(Option<Uuid>, Vec<String>)> {
+	fn file(undecoded: &mut Vec<String>, meta: &FileMeta<'_>) {
 		if !matches!(meta, FileMeta::Decoded(_)) {
-			out.push((uuid, kind, format!("{meta:?}")));
-		}
-	};
-	let check_dir = |uuid: Uuid, kind: &'static str, meta: &DirectoryMeta<'_>, out: &mut Vec<_>| {
-		if !matches!(meta, DirectoryMeta::Decoded(_)) {
-			out.push((uuid, kind, format!("{meta:?}")));
-		}
-	};
-
-	for event in &events {
-		let uuid = event.uuid;
-		match &event.kind {
-			DecryptedUserEventKind::FileUploaded(info)
-			| DecryptedUserEventKind::FileVersioned(info)
-			| DecryptedUserEventKind::FileRestored(info)
-			| DecryptedUserEventKind::VersionedFileRestored(info)
-			| DecryptedUserEventKind::FileMoved(info)
-			| DecryptedUserEventKind::FileTrash(info)
-			| DecryptedUserEventKind::FileRm(info)
-			| DecryptedUserEventKind::DeleteFilePermanently(info) => {
-				check_file(uuid, event.event_type(), &info.metadata, &mut undecryptable);
-			}
-			DecryptedUserEventKind::FileLinkEdited(info) => {
-				check_file(uuid, event.event_type(), &info.metadata, &mut undecryptable);
-			}
-			DecryptedUserEventKind::FileRenamed(info)
-			| DecryptedUserEventKind::FileMetadataChanged(info) => {
-				check_file(uuid, event.event_type(), &info.metadata, &mut undecryptable);
-				check_file(
-					uuid,
-					event.event_type(),
-					&info.old_metadata,
-					&mut undecryptable,
-				);
-			}
-			DecryptedUserEventKind::FileShared(info) => {
-				check_file(uuid, event.event_type(), &info.metadata, &mut undecryptable);
-			}
-			DecryptedUserEventKind::FolderTrash(info)
-			| DecryptedUserEventKind::FolderMoved(info)
-			| DecryptedUserEventKind::SubFolderCreated(info)
-			| DecryptedUserEventKind::BaseFolderCreated(info)
-			| DecryptedUserEventKind::FolderRestored(info)
-			| DecryptedUserEventKind::DeleteFolderPermanently(info) => {
-				check_dir(uuid, event.event_type(), &info.name, &mut undecryptable);
-			}
-			DecryptedUserEventKind::FolderColorChanged(info) => {
-				check_dir(uuid, event.event_type(), &info.name, &mut undecryptable);
-			}
-			DecryptedUserEventKind::FolderRenamed(info)
-			| DecryptedUserEventKind::FolderMetadataChanged(info) => {
-				check_dir(uuid, event.event_type(), &info.name, &mut undecryptable);
-				check_dir(uuid, event.event_type(), &info.old_name, &mut undecryptable);
-			}
-			DecryptedUserEventKind::FolderShared(info) => {
-				check_dir(uuid, event.event_type(), &info.name, &mut undecryptable);
-			}
-			DecryptedUserEventKind::ItemFavorite(info) => {
-				// item favorite metadata could be either file or folder; we
-				// at least require it to be decrypted (Decoded or DecryptedUTF8 — the latter for folders).
-				match &info.metadata {
-					FileMeta::Decoded(_) | FileMeta::DecryptedUTF8(_) => {}
-					other => undecryptable.push((uuid, "itemFavorite", format!("{other:?}"))),
-				}
-			}
-			// Variants with no encrypted payload — nothing to check.
-			_ => {}
+			undecoded.push(format!("{meta:?}"));
 		}
 	}
+	fn dir(undecoded: &mut Vec<String>, meta: &DirectoryMeta<'_>) {
+		if !matches!(meta, DirectoryMeta::Decoded(_)) {
+			undecoded.push(format!("{meta:?}"));
+		}
+	}
+	let mut undecoded = Vec::new();
+	let uuid = match kind {
+		DecryptedUserEventKind::FileUploaded(info)
+		| DecryptedUserEventKind::FileVersioned(info)
+		| DecryptedUserEventKind::FileRestored(info)
+		| DecryptedUserEventKind::VersionedFileRestored(info)
+		| DecryptedUserEventKind::FileMoved(info)
+		| DecryptedUserEventKind::FileTrash(info)
+		| DecryptedUserEventKind::FileRm(info)
+		| DecryptedUserEventKind::DeleteFilePermanently(info) => {
+			file(&mut undecoded, &info.metadata);
+			info.uuid
+		}
+		// Same body as above, but a payload type of its own.
+		DecryptedUserEventKind::FileLinkEdited(info) => {
+			file(&mut undecoded, &info.metadata);
+			info.uuid
+		}
+		DecryptedUserEventKind::FileShared(info) => {
+			file(&mut undecoded, &info.metadata);
+			info.uuid
+		}
+		DecryptedUserEventKind::FileRenamed(info)
+		| DecryptedUserEventKind::FileMetadataChanged(info) => {
+			file(&mut undecoded, &info.metadata);
+			file(&mut undecoded, &info.old_metadata);
+			info.uuid
+		}
+		DecryptedUserEventKind::FolderTrash(info)
+		| DecryptedUserEventKind::FolderMoved(info)
+		| DecryptedUserEventKind::SubFolderCreated(info)
+		| DecryptedUserEventKind::BaseFolderCreated(info)
+		| DecryptedUserEventKind::FolderRestored(info)
+		| DecryptedUserEventKind::DeleteFolderPermanently(info) => {
+			dir(&mut undecoded, &info.name);
+			info.uuid
+		}
+		// Same body as above, but payload types of their own.
+		DecryptedUserEventKind::FolderColorChanged(info) => {
+			dir(&mut undecoded, &info.name);
+			info.uuid
+		}
+		DecryptedUserEventKind::FolderShared(info) => {
+			dir(&mut undecoded, &info.name);
+			info.uuid
+		}
+		DecryptedUserEventKind::FolderRenamed(info)
+		| DecryptedUserEventKind::FolderMetadataChanged(info) => {
+			dir(&mut undecoded, &info.name);
+			dir(&mut undecoded, &info.old_name);
+			info.uuid
+		}
+		// The blob holds file metadata for a file and `{"name": ..}` for a folder, which the
+		// file decoder leaves as `DecryptedUTF8`; either way it must have decrypted.
+		DecryptedUserEventKind::ItemFavorite(info) => {
+			if !matches!(
+				info.metadata,
+				FileMeta::Decoded(_) | FileMeta::DecryptedUTF8(_)
+			) {
+				undecoded.push(format!("{:?}", info.metadata));
+			}
+			info.uuid
+		}
+		DecryptedUserEventKind::Login(_)
+		| DecryptedUserEventKind::FailedLogin(_)
+		| DecryptedUserEventKind::PasswordChanged(_)
+		| DecryptedUserEventKind::TwoFaEnabled(_)
+		| DecryptedUserEventKind::TwoFaDisabled(_)
+		| DecryptedUserEventKind::RequestAccountDeletion(_)
+		| DecryptedUserEventKind::TrashEmptied(_)
+		| DecryptedUserEventKind::DeleteAll(_)
+		| DecryptedUserEventKind::DeleteVersioned(_)
+		| DecryptedUserEventKind::DeleteUnfinished(_)
+		| DecryptedUserEventKind::CodeRedeemed(_)
+		| DecryptedUserEventKind::EmailChanged(_)
+		| DecryptedUserEventKind::EmailChangeAttempt(_)
+		| DecryptedUserEventKind::RemovedSharedInItems(_)
+		| DecryptedUserEventKind::RemovedSharedOutItems(_)
+		| DecryptedUserEventKind::FolderLinkEdited(_) => return None,
+	};
+	Some((uuid, undecoded))
+}
 
+/// Every event from `cutoff` on, paging back past the newest page (about 100 events): the other
+/// tests on the shared account can write more than a page while one test runs, which would push
+/// its earliest events off the newest page. Also asserts that every event on every page fetched
+/// parses at the wire level, whoever caused it: the encrypted fields are plain strings on the
+/// wire, so a malformed write cannot fail this, only a change in the event schema can.
+///
+/// `None` when a request fails, which is logged, as `poll_for_event` does: the caller polls again.
+async fn events_since(
+	client: &Client,
+	cutoff: chrono::DateTime<chrono::Utc>,
+) -> Option<Vec<DecryptedUserEvent>> {
+	let mut events = Vec::new();
+	let mut seen = HashSet::new();
+	let mut page_before = None;
+	loop {
+		let page = match client.get_user_events(None, page_before).await {
+			Ok(page) => page,
+			Err(e) => {
+				eprintln!("events fetch error (will retry): {e:?}");
+				return None;
+			}
+		};
+		let parse_failures: Vec<_> = page.iter().filter_map(|r| r.as_ref().err()).collect();
+		assert!(
+			parse_failures.is_empty(),
+			"some events failed to parse: {parse_failures:#?}"
+		);
+		let page: Vec<_> = page.into_iter().filter_map(Result::ok).collect();
+		let Some(oldest) = page.iter().map(|event| event.timestamp).min() else {
+			break;
+		};
+		let mut any_new = false;
+		for event in page {
+			if seen.insert(event.id) {
+				any_new = true;
+				if event.timestamp >= cutoff {
+					events.push(event);
+				}
+			}
+		}
+		if oldest < cutoff {
+			break;
+		}
+		// The page cutoff is exclusive and in whole seconds, so paging back from `oldest` would
+		// skip the events of its second that did not fit on this page. Ask again from the
+		// second after it, and step past `oldest` only once that brings nothing new; the cursor
+		// never moves forward, so this ends.
+		page_before = Some(if any_new {
+			oldest + chrono::Duration::seconds(1)
+		} else {
+			oldest
+		});
+	}
+	Some(events)
+}
+
+/// Every event this test causes on items of its own decrypts into a `Decoded` variant, i.e. the
+/// encryption version each kind is decoded with matches what the backend stored. This catches a
+/// schema change leaving us with `FileMeta::Encrypted` or `DecryptedUTF8`. The kinds that carry no
+/// version of their own (the metadata pairs, the link edit, the trash) are decoded with the
+/// default one, which is what this guards.
+///
+/// Only events matched by the uuids created here are judged: tests built with `malformed` write
+/// undecodable metadata on purpose on the same account, and their events sit on the same page.
+/// Matching by uuid rather than by decoded name means an event of ours that fails to decode is
+/// still found, and reported, instead of timing out. Each poll pages back to `since`, so other
+/// tests' traffic in between cannot push our events out of reach.
+#[shared_test_runtime]
+async fn events_all_decryptable() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let dir = &resources.dir;
+
+	// Trash lock: see the file trash-cycle test above. It is taken before `since`, and the trash
+	// cycle runs first, so waiting for the lock does not widen the window the polls page through.
+	let trash_lock = client
+		.acquire_lock_with_default(test_utils::locks::TRASH)
+		.await
+		.unwrap();
+	let since = chrono::Utc::now();
+
+	let target = client
+		.create_dir(&dir.into(), &unique_dir_name("decrypt-target"))
+		.await
+		.unwrap();
+
+	let file_name = unique_name("decrypt");
+	let file = client.make_file_builder(&file_name, dir.uuid()).unwrap();
+	let mut file = client.upload_file(file, b"decryptable").await.unwrap();
+	let mut folder = client
+		.create_dir(&dir.into(), &unique_dir_name("decrypt"))
+		.await
+		.unwrap();
+	client.trash_file(&mut file).await.unwrap();
+	client.restore_file(&mut file).await.unwrap();
+	client.trash_dir(&mut folder).await.unwrap();
+	client.restore_dir(&mut folder).await.unwrap();
+	drop(trash_lock);
+
+	client
+		.update_file_metadata(
+			&mut file,
+			FileMetaChanges::default()
+				.name(&unique_name("decrypt-renamed"))
+				.unwrap(),
+		)
+		.await
+		.unwrap();
+	client
+		.move_file(&mut file, &(&target).into())
+		.await
+		.unwrap();
+	client.set_file_favorite(&mut file, true).await.unwrap();
+	client.public_link_file(&file).await.unwrap();
+
+	client
+		.update_dir_metadata(
+			&mut folder,
+			DirectoryMetaChanges::default()
+				.name(&unique_dir_name("decrypt-renamed"))
+				.unwrap(),
+		)
+		.await
+		.unwrap();
+	client
+		.set_dir_color(&mut folder, DirColor::Blue)
+		.await
+		.unwrap();
+	client
+		.move_dir(&mut folder, &(&target).into())
+		.await
+		.unwrap();
+	client.set_dir_favorite(&mut folder, true).await.unwrap();
+
+	let expected: HashSet<(&'static str, Uuid)> = [
+		("subFolderCreated", target.uuid()),
+		("fileUploaded", file.uuid()),
+		("fileMetadataChanged", file.uuid()),
+		("fileMoved", file.uuid()),
+		("itemFavorite", file.uuid()),
+		("fileLinkEdited", file.uuid()),
+		("fileTrash", file.uuid()),
+		("fileRestored", file.uuid()),
+		("subFolderCreated", folder.uuid()),
+		("folderTrash", folder.uuid()),
+		("folderRestored", folder.uuid()),
+		("folderMetadataChanged", folder.uuid()),
+		("folderColorChanged", folder.uuid()),
+		("folderMoved", folder.uuid()),
+		("itemFavorite", folder.uuid()),
+	]
+	.into_iter()
+	.collect();
+	let ours: HashSet<Uuid> = expected.iter().map(|(_, uuid)| *uuid).collect();
+
+	let cutoff = since - EVENT_SINCE_SKEW;
+	let deadline = Instant::now() + EVENT_POLL_TIMEOUT;
+	// What the last poll whose requests all succeeded found; a failed one keeps the previous.
+	let mut found = HashSet::new();
+	let mut undecryptable = Vec::new();
+	loop {
+		if let Some(events) = events_since(client, cutoff).await {
+			found.clear();
+			undecryptable.clear();
+			for event in events {
+				let Some((Some(item), undecoded)) = event_item_and_undecoded(&event.kind) else {
+					continue;
+				};
+				if !ours.contains(&item) {
+					continue;
+				}
+				let kind = event.kind.event_type();
+				found.insert((kind, item));
+				undecryptable.extend(undecoded.into_iter().map(|meta| (event.uuid, kind, meta)));
+			}
+		}
+		if expected.is_subset(&found) || Instant::now() >= deadline {
+			break;
+		}
+		tokio::time::sleep(EVENT_POLL_INTERVAL).await;
+	}
+
+	let missing: Vec<_> = expected.difference(&found).collect();
+	assert!(
+		missing.is_empty(),
+		"events not found within {EVENT_POLL_TIMEOUT:?}: {missing:#?}"
+	);
 	assert!(
 		undecryptable.is_empty(),
-		"some event metadata failed to decode: {:#?}",
-		undecryptable
+		"some event metadata failed to decode: {undecryptable:#?}"
 	);
 }
 
