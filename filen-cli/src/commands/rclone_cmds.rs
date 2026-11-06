@@ -128,55 +128,8 @@ pub(crate) enum RcloneCommands {
 		root: Option<String>,
 	},
 	/// Runs WebDAV, S3, FTP, SFTP, HTTP, restic or NFS servers exposing your Filen drive
-	Serve {
-		#[command(flatten)]
-		binary: RcloneBinaryArg,
-		/// The types of server to run: one, or several on one Rclone, each on its default port
-		#[arg(required = true, num_args = 1..)]
-		servers: Vec<ServerType>,
-		/// IP and port for the server (`<ip>:<port>`; `0.0.0.0:<port>` for every network interface), with a single server type only (default: 127.0.0.1 and a port per type)
-		#[arg(long = "addr", conflicts_with = "host")]
-		address: Option<String>,
-		/// IP address every server listens on, each on its default port (`0.0.0.0` for every network interface) (default: 127.0.0.1)
-		#[arg(long)]
-		host: Option<String>,
-		/// Username for authentication to the server (default: random, printed when the server starts).
-		/// On S3 servers, this is the Access Key ID. NFS servers have no authentication and listen on 127.0.0.1 only.
-		#[arg(long)]
-		user: Option<String>,
-		/// Password for authentication to the server (default: random, printed when the server starts).
-		/// On S3 servers, this is the Secret Access Key. Other users on this computer can see it on
-		/// the command line: prefer the environment variable or --password-file.
-		#[arg(long, env = "FILEN_CLI_SERVE_PASSWORD", hide_env_values = true)]
-		password: Option<ServePassword>,
-		/// File to read the password from, instead of --password (one trailing newline is ignored)
-		#[arg(long, value_name = "PATH", conflicts_with = "password")]
-		password_file: Option<PathBuf>,
-		/// The server is read-only
-		#[arg(long)]
-		read_only: bool,
-		/// Serve only this directory, by its path from the root of your drive, not from the working directory (default: the whole drive)
-		#[arg(long, value_name = "PATH")]
-		root: Option<String>,
-		/// The maximum cache size (e.g. "500Mi", "10Gi") (default: 32Gi)
-		#[arg(long, value_parser = parse_size)]
-		cache_size: Option<u64>,
-		/// TLS certificate (PEM) to serve HTTPS with (WebDAV, S3, HTTP and restic; requires --key; or use --self-signed)
-		#[arg(long)]
-		cert: Option<String>,
-		/// TLS private key (PEM) for --cert
-		#[arg(long)]
-		key: Option<String>,
-		/// Serve HTTPS (WebDAV, S3, HTTP and restic) with a self-signed certificate, made once in the config directory and reused; its SHA-256 fingerprint is printed for clients to pin
-		#[arg(long, conflicts_with_all = ["cert", "key"])]
-		self_signed: bool,
-		/// Also mount the drive, on the same Rclone and cache as the servers (read-only with --read-only, of --root only with --root)
-		#[arg(long)]
-		mount: bool,
-		/// Where --mount mounts the drive: an empty directory (default: /tmp/filen), or on Windows a drive letter (default: X)
-		#[arg(long, value_name = "PATH", requires = "mount")]
-		mount_point: Option<String>,
-	},
+	// Boxed: its options make up most of the enum's size, which every other command would pay for.
+	Serve(Box<ServeCommand>),
 	/// Shows the version and path of the Rclone that mount, serve and rclone run
 	RcloneInfo {
 		#[command(flatten)]
@@ -219,6 +172,58 @@ pub(crate) enum RcloneCommands {
 		)]
 		_args: Vec<String>,
 	},
+}
+
+/// The options of `serve`.
+#[derive(Debug, clap::Args)]
+pub(crate) struct ServeCommand {
+	#[command(flatten)]
+	binary: RcloneBinaryArg,
+	/// The types of server to run: one, or several on one Rclone, each on its default port
+	#[arg(required = true, num_args = 1..)]
+	servers: Vec<ServerType>,
+	/// IP and port for the server (`<ip>:<port>`; `0.0.0.0:<port>` for every network interface), with a single server type only (default: 127.0.0.1 and a port per type)
+	#[arg(long = "addr", conflicts_with = "host")]
+	address: Option<String>,
+	/// IP address every server listens on, each on its default port (`0.0.0.0` for every network interface) (default: 127.0.0.1)
+	#[arg(long)]
+	host: Option<String>,
+	/// Username for authentication to the server (default: random, printed when the server starts).
+	/// On S3 servers, this is the Access Key ID. NFS servers have no authentication and listen on 127.0.0.1 only.
+	#[arg(long)]
+	user: Option<String>,
+	/// Password for authentication to the server (default: random, printed when the server starts).
+	/// On S3 servers, this is the Secret Access Key. Other users on this computer can see it on
+	/// the command line: prefer the environment variable or --password-file.
+	#[arg(long, env = "FILEN_CLI_SERVE_PASSWORD", hide_env_values = true)]
+	password: Option<ServePassword>,
+	/// File to read the password from, instead of --password (one trailing newline is ignored)
+	#[arg(long, value_name = "PATH", conflicts_with = "password")]
+	password_file: Option<PathBuf>,
+	/// The server is read-only
+	#[arg(long)]
+	read_only: bool,
+	/// Serve only this directory, by its path from the root of your drive, not from the working directory (default: the whole drive)
+	#[arg(long, value_name = "PATH")]
+	root: Option<String>,
+	/// The maximum cache size (e.g. "500Mi", "10Gi") (default: 32Gi)
+	#[arg(long, value_parser = parse_size)]
+	cache_size: Option<u64>,
+	/// TLS certificate (PEM) to serve HTTPS with (WebDAV, S3, HTTP and restic; requires --key; or use --self-signed)
+	#[arg(long)]
+	cert: Option<String>,
+	/// TLS private key (PEM) for --cert
+	#[arg(long)]
+	key: Option<String>,
+	/// Serve HTTPS (WebDAV, S3, HTTP and restic) with a self-signed certificate, made once in the config directory and reused; its SHA-256 fingerprint is printed for clients to pin
+	#[arg(long, conflicts_with_all = ["cert", "key"])]
+	self_signed: bool,
+	/// Also mount the drive, on the same Rclone and cache as the servers (read-only with --read-only, of --root only with --root)
+	#[arg(long)]
+	mount: bool,
+	/// Where --mount mounts the drive: an empty directory (default: /tmp/filen), or on Windows a drive letter (default: X)
+	#[arg(long, value_name = "PATH", requires = "mount")]
+	mount_point: Option<String>,
 }
 
 /// The Rclone binary a command runs: the managed one, unless the user gives their own.
@@ -323,23 +328,24 @@ impl RcloneCommands {
 				)
 				.await?;
 			}
-			Self::Serve {
-				binary,
-				servers,
-				address,
-				host,
-				user,
-				password,
-				password_file,
-				read_only,
-				root,
-				cache_size,
-				cert,
-				key,
-				self_signed,
-				mount,
-				mount_point,
-			} => {
+			Self::Serve(serve) => {
+				let ServeCommand {
+					binary,
+					servers,
+					address,
+					host,
+					user,
+					password,
+					password_file,
+					read_only,
+					root,
+					cache_size,
+					cert,
+					key,
+					self_signed,
+					mount,
+					mount_point,
+				} = *serve;
 				let password = serve_password(password, password_file.as_deref()).await?;
 				start_server(
 					config,
@@ -1555,11 +1561,11 @@ mod tests {
 	/// The protocol of `filen serve <server_type>`.
 	fn parsed_protocol(server_type: &str) -> Result<ServeProtocol, clap::Error> {
 		let args = parse_args(["filen", "serve", server_type])?.args;
-		let Some(Commands::Rclone(RcloneCommands::Serve { servers, .. })) = args.command else {
+		let Some(Commands::Rclone(RcloneCommands::Serve(serve))) = args.command else {
 			panic!("`serve {server_type}` parsed as another command");
 		};
-		let [server] = servers.as_slice() else {
-			panic!("`serve {server_type}` parsed as {servers:?}");
+		let [server] = serve.servers.as_slice() else {
+			panic!("`serve {server_type}` parsed as {:?}", serve.servers);
 		};
 		Ok((*server).into())
 	}
@@ -1617,11 +1623,11 @@ mod tests {
 		));
 		assert!(matches!(
 			parsed_command(&["filen", "serve", "webdav", "--root", "Photos/2024"]),
-			RcloneCommands::Serve { root: Some(root), .. } if root == "Photos/2024"
+			RcloneCommands::Serve(serve) if serve.root.as_deref() == Some("Photos/2024")
 		));
 		assert!(matches!(
 			parsed_command(&["filen", "serve", "webdav"]),
-			RcloneCommands::Serve { root: None, .. }
+			RcloneCommands::Serve(serve) if serve.root.is_none()
 		));
 	}
 
@@ -1644,8 +1650,8 @@ mod tests {
 		let binary = match parsed_command(args) {
 			RcloneCommands::Rclone { binary, .. }
 			| RcloneCommands::Mount { binary, .. }
-			| RcloneCommands::Serve { binary, .. }
 			| RcloneCommands::RcloneInfo { binary } => binary,
+			RcloneCommands::Serve(serve) => serve.binary,
 			command => panic!("{args:?} parsed as {command:?}"),
 		};
 		binary.rclone_binary
@@ -1801,14 +1807,14 @@ mod tests {
 
 	#[test]
 	fn serve_takes_several_server_types_each_once() {
-		let RcloneCommands::Serve { servers, .. } =
+		let RcloneCommands::Serve(serve) =
 			parsed_command(&["filen", "serve", "webdav", "s3", "webdav", "--read-only"])
 		else {
 			panic!("parsed as another command");
 		};
 
 		assert_eq!(
-			serve_protocols(&servers),
+			serve_protocols(&serve.servers),
 			[ServeProtocol::Webdav, ServeProtocol::S3]
 		);
 	}
@@ -1855,13 +1861,10 @@ mod tests {
 	#[test]
 	fn serve_mounts_where_it_is_told_or_by_default() {
 		let mount = |args: &[&str]| {
-			let RcloneCommands::Serve {
-				mount, mount_point, ..
-			} = parsed_command(args)
-			else {
+			let RcloneCommands::Serve(serve) = parsed_command(args) else {
 				panic!("{args:?} parsed as another command");
 			};
-			(mount, mount_point)
+			(serve.mount, serve.mount_point)
 		};
 
 		assert_eq!(mount(&["filen", "serve", "webdav"]), (false, None));
@@ -2552,15 +2555,10 @@ mod tests {
 	/// The `--password` and `--password-file` of `filen serve webdav <args>`.
 	fn parsed_password_args(args: &[&str]) -> (Option<ServePassword>, Option<PathBuf>) {
 		let args = [&["filen", "serve", "webdav"], args].concat();
-		let RcloneCommands::Serve {
-			password,
-			password_file,
-			..
-		} = parsed_command(&args)
-		else {
+		let RcloneCommands::Serve(serve) = parsed_command(&args) else {
 			panic!("{args:?} parsed as another command");
 		};
-		(password, password_file)
+		(serve.password, serve.password_file)
 	}
 
 	#[test]

@@ -34,9 +34,13 @@ const PRIVATE_DIR_MODE: u32 = 0o700;
 
 /// Options that create a file with [`PRIVATE_FILE_MODE`] on unix.
 pub(crate) fn private_file_options() -> OpenOptions {
-	let mut options = OpenOptions::new();
+	let options = OpenOptions::new();
 	#[cfg(unix)]
-	options.mode(PRIVATE_FILE_MODE);
+	let options = {
+		let mut options = options;
+		options.mode(PRIVATE_FILE_MODE);
+		options
+	};
 	options
 }
 

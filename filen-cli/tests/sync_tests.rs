@@ -2,8 +2,12 @@
 
 use std::{
 	path::Path,
-	process::{Command, Output, Stdio},
+	process::{Command, Output},
 	sync::Arc,
+};
+#[cfg(unix)]
+use std::{
+	process::Stdio,
 	time::{Duration, Instant},
 };
 
