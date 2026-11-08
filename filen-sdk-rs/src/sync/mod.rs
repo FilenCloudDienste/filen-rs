@@ -167,6 +167,8 @@ mod js_impl {
 
 	use filen_macros::js_type;
 
+	#[cfg(feature = "uniffi")]
+	use crate::js::spawn_ordered_dispatch;
 	use crate::{
 		Error,
 		auth::JsClient,
@@ -270,6 +272,103 @@ mod js_impl {
 				)
 				.await
 				.map(ResourceLock)
+			})
+			.await
+		}
+
+		/// See [`Client::release_locks`](crate::auth::Client::release_locks).
+		#[cfg_attr(
+			all(target_family = "wasm", target_os = "unknown"),
+			wasm_bindgen::prelude::wasm_bindgen(js_name = "releaseLocks")
+		)]
+		pub async fn release_locks(&self, locks: Vec<lock::LockId>) -> Result<(), Error> {
+			let this = self.inner();
+			do_on_commander(move || async move {
+				this.release_locks(locks).await;
+				Ok(())
+			})
+			.await
+		}
+
+		/// See [`Client::wait_for_lock_releases`](crate::auth::Client::wait_for_lock_releases).
+		#[cfg_attr(
+			all(target_family = "wasm", target_os = "unknown"),
+			wasm_bindgen::prelude::wasm_bindgen(js_name = "waitForLockReleases")
+		)]
+		pub async fn wait_for_lock_releases(&self) -> Result<(), Error> {
+			let this = self.inner();
+			do_on_commander(move || async move {
+				this.wait_for_lock_releases().await;
+				Ok(())
+			})
+			.await
+		}
+	}
+
+	/// Receives every [`LockEvent`](lock::LockEvent) of the client it is set on, in order, on
+	/// a thread of its own (see [`Client::set_lock_listener`](crate::auth::Client::set_lock_listener)).
+	#[cfg(feature = "uniffi")]
+	#[uniffi::export(with_foreign)]
+	pub trait LockEventListener: Send + Sync {
+		fn on_event(&self, event: lock::LockEvent);
+	}
+
+	#[cfg(feature = "uniffi")]
+	#[uniffi::export]
+	impl JsClient {
+		/// See [`Client::set_lock_listener`](crate::auth::Client::set_lock_listener).
+		pub async fn set_lock_listener(
+			&self,
+			listener: Arc<dyn LockEventListener>,
+		) -> Result<(), Error> {
+			let this = self.inner();
+			do_on_commander(move || async move {
+				// in order, as a lock's Settled must not overtake its Owed
+				let (sender, _) = spawn_ordered_dispatch(move |event| listener.on_event(event));
+				this.set_lock_listener(move |event| {
+					let _ = sender.send(event);
+				});
+				Ok(())
+			})
+			.await
+		}
+	}
+
+	#[filen_macros::js_exports]
+	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+	#[wasm_bindgen::prelude::wasm_bindgen(js_class = "Client")]
+	impl JsClient {
+		/// See [`Client::set_lock_listener`](crate::auth::Client::set_lock_listener). Events reach
+		/// `listener` in order, on the thread this is called on.
+		#[wasm_bindgen::prelude::wasm_bindgen(js_name = "setLockListener")]
+		pub async fn set_lock_listener(
+			&self,
+			#[wasm_bindgen(unchecked_param_type = "(event: LockEvent) => void")]
+			listener: web_sys::js_sys::Function,
+		) -> Result<(), Error> {
+			// The JS function can never leave this thread: the listener set on the client only
+			// forwards events over a channel, and this pump, which owns the function, serializes
+			// and calls it on the calling thread.
+			let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<lock::LockEvent>();
+			crate::runtime::spawn_local(async move {
+				while let Some(event) = receiver.recv().await {
+					let serializer = serde_wasm_bindgen::Serializer::new()
+						.serialize_maps_as_objects(true)
+						.serialize_large_number_types_as_bigints(true);
+					let _ = listener.call1(
+						&wasm_bindgen::JsValue::UNDEFINED,
+						&serde::Serialize::serialize(&event, &serializer)
+							.expect("failed to serialize a lock event (should be impossible)"),
+					);
+				}
+			});
+
+			let this = self.inner();
+			do_on_commander(move || async move {
+				this.set_lock_listener(move |event| {
+					let _ = sender.send(event);
+				});
+				Ok(())
 			})
 			.await
 		}

@@ -340,6 +340,7 @@ fn a_lock_request_its_caller_stopped_waiting_for_is_waited_for_until_it_ends() {
 		Bytes::new(),
 		Uuid::from_u128(1),
 		"test-resource".into(),
+		None,
 	));
 	rt.block_on(async {
 		assert!(futures::poll!(&mut request).is_pending());
@@ -1485,4 +1486,268 @@ async fn a_release_retry_never_frees_a_newer_lease() {
 	.await;
 	assert_eq!(released, [old, old], "every attempt carries the old uuid");
 	assert_eq!(holder.get(), Some(newer), "the newer lease is still held");
+}
+
+/// The events a lock listener got, in order.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+type Events = Arc<std::sync::Mutex<Vec<LockEvent>>>;
+
+/// A lock listener that keeps every event it gets in the returned list.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+fn recording_listener() -> (Events, impl Fn(LockEvent) + Send + Sync + 'static) {
+	let events = Events::default();
+	let recorded = Arc::clone(&events);
+	(events, move |event| recorded.lock().unwrap().push(event))
+}
+
+/// An offline client whose lock events are recorded.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+fn listened_client() -> (Arc<AuthClient>, Events) {
+	let client = offline_client();
+	let (events, listener) = recording_listener();
+	client.lock_listener.set(Arc::new(listener));
+	(client, events)
+}
+
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+fn lock_event(kind: LockEventKind, uuid: Uuid, resource: &str) -> LockEvent {
+	LockEvent {
+		kind,
+		lock: LockId {
+			uuid,
+			resource: resource.to_owned(),
+		},
+	}
+}
+
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+fn recorded(events: &Events) -> Vec<LockEvent> {
+	events.lock().unwrap().clone()
+}
+
+/// A runtime on a paused clock, so the retries of a release, which fails offline, take no real
+/// time.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+fn paused_runtime() -> tokio::runtime::Runtime {
+	tokio::runtime::Builder::new_current_thread()
+		.enable_all()
+		.start_paused(true)
+		.build()
+		.unwrap()
+}
+
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+#[test]
+fn no_lock_is_recorded_without_a_listener() {
+	assert!(
+		LockListenerSlot::default()
+			.record(Uuid::from_u128(1), "test-resource")
+			.is_none()
+	);
+}
+
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+#[test]
+fn a_dropped_lock_is_owed_until_its_release_settles() {
+	let (client, events) = listened_client();
+	let rt = paused_runtime();
+	let lock = rt.block_on(async {
+		test_lock_on(
+			Arc::clone(&client),
+			tokio::runtime::Handle::try_current().ok(),
+		)
+	});
+	let uuid = lock.lease.uuid;
+	let owed = lock_event(LockEventKind::Owed, uuid, "test-resource");
+	assert_eq!(recorded(&events), std::slice::from_ref(&owed));
+
+	let _guard = rt.enter();
+	std::mem::drop(lock);
+	assert_eq!(
+		recorded(&events),
+		std::slice::from_ref(&owed),
+		"owed while its release is unanswered"
+	);
+	rt.block_on(client.pending_lock_releases.settled());
+	assert_eq!(
+		recorded(&events),
+		[
+			owed,
+			lock_event(LockEventKind::Settled, uuid, "test-resource")
+		]
+	);
+}
+
+/// A lost lock sends a release at the loss and another when it is dropped: it is settled once,
+/// after both.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+#[test]
+fn a_lost_lock_is_settled_once_after_its_last_release() {
+	let (client, events) = listened_client();
+	let rt = paused_runtime();
+	let lock = rt.block_on(async {
+		test_lock_on(
+			Arc::clone(&client),
+			tokio::runtime::Handle::try_current().ok(),
+		)
+	});
+	let uuid = lock.lease.uuid;
+	let _guard = rt.enter();
+	lock.lease.mark_lost();
+	std::mem::drop(lock);
+	assert_eq!(rt.metrics().num_alive_tasks(), 2, "two releases in flight");
+
+	rt.block_on(client.pending_lock_releases.settled());
+	assert_eq!(
+		recorded(&events),
+		[
+			lock_event(LockEventKind::Owed, uuid, "test-resource"),
+			lock_event(LockEventKind::Settled, uuid, "test-resource"),
+		]
+	);
+}
+
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+#[test]
+fn a_lock_request_its_caller_stopped_waiting_for_stays_owed_until_it_ends() {
+	let (client, events) = listened_client();
+	let rt = paused_runtime();
+	let uuid = Uuid::from_u128(1);
+	let mut request = Box::pin(request_acquire(
+		Arc::clone(&client),
+		lock_url().into(),
+		Bytes::new(),
+		uuid,
+		"test-resource".into(),
+		client.lock_listener.record(uuid, "test-resource"),
+	));
+	rt.block_on(async {
+		assert!(futures::poll!(&mut request).is_pending());
+	});
+	std::mem::drop(request);
+
+	let owed = lock_event(LockEventKind::Owed, uuid, "test-resource");
+	assert_eq!(
+		recorded(&events),
+		std::slice::from_ref(&owed),
+		"a grant nobody waits for any more would have to be released"
+	);
+	rt.block_on(client.pending_lock_releases.settled());
+	assert_eq!(
+		recorded(&events),
+		[
+			owed,
+			lock_event(LockEventKind::Settled, uuid, "test-resource")
+		]
+	);
+}
+
+/// Offline, the first poll fails at once: the lock is owed from its send until its request task
+/// has handed the answer over.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+#[tokio::test(start_paused = true)]
+async fn a_failed_acquisition_reports_its_lock_owed_then_settled() {
+	let client = crate::auth::unauth::test_support::offline_client();
+	let (events, listener) = recording_listener();
+	client.set_lock_listener(listener);
+
+	client
+		.acquire_lock("test-resource", MAX_SLEEP_TIME_DEFAULT, 1)
+		.await
+		.unwrap_err();
+	client.wait_for_lock_releases().await;
+
+	let events = recorded(&events);
+	let [owed, settled] = events.as_slice() else {
+		panic!("one lock owed, then settled: {events:?}");
+	};
+	assert_eq!(
+		owed,
+		&lock_event(LockEventKind::Owed, owed.lock.uuid, "test-resource")
+	);
+	assert_eq!(
+		settled,
+		&lock_event(LockEventKind::Settled, owed.lock.uuid, "test-resource")
+	);
+}
+
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+#[test]
+fn a_listener_set_later_does_not_see_an_earlier_lock_settle() {
+	let (client, first) = listened_client();
+	let rt = paused_runtime();
+	let lock = rt.block_on(async {
+		test_lock_on(
+			Arc::clone(&client),
+			tokio::runtime::Handle::try_current().ok(),
+		)
+	});
+	let uuid = lock.lease.uuid;
+	let (second, listener) = recording_listener();
+	client.lock_listener.set(Arc::new(listener));
+
+	let _guard = rt.enter();
+	std::mem::drop(lock);
+	rt.block_on(client.pending_lock_releases.settled());
+	assert_eq!(
+		recorded(&first),
+		[
+			lock_event(LockEventKind::Owed, uuid, "test-resource"),
+			lock_event(LockEventKind::Settled, uuid, "test-resource"),
+		]
+	);
+	assert_eq!(recorded(&second), []);
+}
+
+/// Locks of an earlier run are released like a dropped lock, owed until each release is given up
+/// on: offline, once the lease could have lapsed, judged from the call (the bound itself is
+/// `release_loop`'s, tested above).
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+#[tokio::test(start_paused = true)]
+async fn released_locks_are_owed_until_their_releases_are_given_up_on() {
+	let client = crate::auth::unauth::test_support::offline_client();
+	let (events, listener) = recording_listener();
+	client.set_lock_listener(listener);
+	let (drive, notes) = (Uuid::from_u128(1), Uuid::from_u128(2));
+
+	let begin = Instant::now();
+	client
+		.release_locks([
+			LockId {
+				uuid: drive,
+				resource: "drive-write".to_owned(),
+			},
+			LockId {
+				uuid: notes,
+				resource: "notes-write".to_owned(),
+			},
+		])
+		.await;
+	let elapsed = begin.elapsed();
+	assert!(
+		elapsed >= LOCK_SERVER_TTL - RELEASE_RETRY_MAX,
+		"retried while the lease could stand: {elapsed:?}"
+	);
+	assert!(client.wait_for_lock_releases().now_or_never().is_some());
+
+	let events = recorded(&events);
+	assert_eq!(
+		events.get(..2),
+		Some(
+			[
+				lock_event(LockEventKind::Owed, drive, "drive-write"),
+				lock_event(LockEventKind::Owed, notes, "notes-write"),
+			]
+			.as_slice()
+		)
+	);
+	let mut settled = events.get(2..).unwrap_or_default().to_vec();
+	settled.sort_by_key(|event| event.lock.uuid);
+	assert_eq!(
+		settled,
+		[
+			lock_event(LockEventKind::Settled, drive, "drive-write"),
+			lock_event(LockEventKind::Settled, notes, "notes-write"),
+		]
+	);
 }

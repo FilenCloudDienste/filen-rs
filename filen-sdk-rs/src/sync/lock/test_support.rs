@@ -41,16 +41,19 @@ pub(crate) fn test_lock(handle: Option<tokio::runtime::Handle>) -> ResourceLock 
 }
 
 /// A valid lock held by `client`, whose release, when dropped, goes to `handle` (or the ambient
-/// runtime).
+/// runtime), reported to `client`'s lock listener if one is set.
 pub(crate) fn test_lock_on(
 	client: Arc<AuthClient>,
 	handle: Option<tokio::runtime::Handle>,
 ) -> ResourceLock {
+	let uuid = Uuid::new_v4();
+	let resource = "test-resource";
 	ResourceLock {
 		lease: Arc::new(SharedLease {
-			uuid: Uuid::new_v4(),
+			uuid,
+			record: client.lock_listener.record(uuid, resource),
 			client,
-			resource: "test-resource".to_string(),
+			resource: resource.to_owned(),
 			valid: tokio::sync::watch::Sender::new(true),
 			confirmed: tokio::sync::watch::Sender::new(Confirmed::now()),
 			confirming: tokio::sync::Mutex::new(None),

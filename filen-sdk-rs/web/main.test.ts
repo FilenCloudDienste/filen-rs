@@ -19,6 +19,7 @@ import init, {
 	type AnyLinkedDirWithContext,
 	type AnyFile,
 	type CacheStatusMessage,
+	type LockEvent,
 	type CacheSearchSnapshot,
 	type MakeThumbnailInMemoryResult,
 	type InMemoryThumbnail,
@@ -1576,6 +1577,27 @@ test("notes", async () => {
 	expect(history[0].content).toBe("")
 	expect(history[1].preview).toBe("This is the preview")
 	expect(history[1].content).toBe("This is the note content")
+})
+
+test("locks are reported owed until settled, and a released lock is free at once", async () => {
+	const resource = "test:lock-release"
+	const events: LockEvent[] = []
+	await state.setLockListener(event => events.push(event))
+	const held = await state.acquireLock({ resource })
+	await vi.waitFor(() => expect(events.filter(e => e.lock.resource === resource)).toHaveLength(1))
+	const [owed] = events.filter(e => e.lock.resource === resource)
+	expect(owed.kind).toBe("owed")
+
+	// as a reloaded page releases the locks the page before it held: the lease goes at once,
+	// so a single poll gets the lock again
+	await state.releaseLocks([owed.lock])
+	using _again = await state.acquireLock({ resource, attempts: 1 })
+
+	held.drop()
+	await state.waitForLockReleases()
+	await vi.waitFor(() => expect(events.filter(e => e.lock.uuid === owed.lock.uuid && e.kind === "settled")).not.toHaveLength(0))
+	// released again although the server already let it go: answered, not an error
+	await state.releaseLocks([owed.lock])
 })
 
 test("chats", async () => {

@@ -5,14 +5,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use std::{
 	borrow::Cow,
-	sync::{Arc, Weak},
+	sync::{Arc, PoisonError, RwLock, Weak},
 	time,
 };
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
+use filen_macros::js_type;
 use filen_types::{api::v3::user::lock::LockType, fs::Uuid};
-use futures::FutureExt;
+use futures::{FutureExt, future::join_all};
 use tracing::debug;
 
 // The keep-alive schedule must use the same clock as the async timers so that the
@@ -147,6 +148,105 @@ impl Drop for PendingRelease {
 	}
 }
 
+/// One lock as the server knows it: the uuid its lease is held under, which no other lock shares,
+/// and its resource. The server releases a lease only for its uuid, so a release of a lock that was
+/// released already, lapsed, or was never granted frees nothing.
+#[js_type(import, export)]
+pub struct LockId {
+	pub uuid: Uuid,
+	pub resource: String,
+}
+
+/// What became of a lock a client may owe a release for (see [`LockEvent`]).
+#[js_type(export)]
+pub enum LockEventKind {
+	/// The client may owe the lock's release: from the send of its first Acquire, while it is held,
+	/// and while its release is in flight.
+	Owed,
+	/// The client owes the lock's release no more: it was answered or given up on, or the lock was
+	/// never granted.
+	Settled,
+}
+
+/// One change to the locks a client may owe a release for, reported to the listener set with
+/// [`Client::set_lock_listener`]. Each lock is reported [`LockEventKind::Owed`] once, and
+/// [`LockEventKind::Settled`] once after that.
+#[js_type(export, no_deser)]
+pub struct LockEvent {
+	pub kind: LockEventKind,
+	pub lock: LockId,
+}
+
+/// What a client reports its locks to (see [`Client::set_lock_listener`]).
+type LockListener = Arc<dyn Fn(LockEvent) + Send + Sync>;
+
+/// A client's lock listener, if one is set.
+#[derive(Default)]
+pub(crate) struct LockListenerSlot(RwLock<Option<LockListener>>);
+
+impl LockListenerSlot {
+	fn set(&self, listener: LockListener) {
+		*self.0.write().unwrap_or_else(PoisonError::into_inner) = Some(listener);
+	}
+
+	/// The record of the lock `uuid` on `resource`, reported owed from now on, or `None`, at no
+	/// further cost, while no listener is set.
+	fn record(&self, uuid: Uuid, resource: &str) -> Option<Arc<LockRecord>> {
+		// refcount bump, so the listener is called outside the slot's lock
+		let listener = self
+			.0
+			.read()
+			.unwrap_or_else(PoisonError::into_inner)
+			.clone()?;
+		Some(LockRecord::new(
+			listener,
+			LockId {
+				uuid,
+				resource: resource.to_owned(),
+			},
+		))
+	}
+}
+
+/// A lock reported to a lock listener: owed when made, settled once its last handle drops. Its
+/// handles are held by what may still leave the lock's lease on the server: the acquisition, each
+/// of its lock requests, the held lock, and each release of it.
+struct LockRecord {
+	/// The listener that saw the lock become owed, so a listener set later does not see it settle.
+	listener: LockListener,
+	lock: LockId,
+}
+
+impl LockRecord {
+	fn new(listener: LockListener, lock: LockId) -> Arc<Self> {
+		listener(LockEvent {
+			kind: LockEventKind::Owed,
+			// the record keeps its own for the Settled event
+			lock: lock.clone(),
+		});
+		Arc::new(Self { listener, lock })
+	}
+}
+
+impl Drop for LockRecord {
+	fn drop(&mut self) {
+		let lock = LockId {
+			uuid: self.lock.uuid,
+			resource: std::mem::take(&mut self.lock.resource),
+		};
+		(self.listener)(LockEvent {
+			kind: LockEventKind::Settled,
+			lock,
+		});
+	}
+}
+
+impl std::fmt::Debug for LockRecord {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_tuple("LockRecord").field(&self.lock).finish()
+	}
+}
+
 /// A release the client may still have to send for the lock `uuid` on `resource`: one being sent,
 /// or one a lock request needs should the server grant it to a caller that stopped waiting. It
 /// counts in the client's [`PendingReleases`] until [`Self::send`] got an answer or gave up (see
@@ -172,6 +272,8 @@ struct ReleaseRequest {
 	resource: Arc<str>,
 	confirmed: LeaseConfirmed,
 	_pending: PendingRelease,
+	// keeps the lock owed until this release is answered or given up on
+	_record: Option<Arc<LockRecord>>,
 }
 
 /// When the server last confirmed the lease a release frees, which bounds its retries (see
@@ -181,7 +283,8 @@ enum LeaseConfirmed {
 	/// the drop still extends the retries.
 	Watched(tokio::sync::watch::Sender<Confirmed>),
 	/// A lock request's grant, which runs from no earlier than the request's send, which comes
-	/// after this.
+	/// after this. Also the start of a release of a lock an earlier run of the app held (see
+	/// [`Client::release_locks`]), whose lease cannot stand longer than one confirmed then.
 	Sent(Confirmed),
 }
 
@@ -201,6 +304,7 @@ impl OwedRelease {
 		uuid: Uuid,
 		resource: Arc<str>,
 		confirmed: LeaseConfirmed,
+		record: Option<Arc<LockRecord>>,
 	) -> Self {
 		let pending = client.pending_lock_releases.track();
 		Self(Some(ReleaseRequest {
@@ -210,6 +314,7 @@ impl OwedRelease {
 			resource,
 			confirmed,
 			_pending: pending,
+			_record: record,
 		}))
 	}
 
@@ -328,6 +433,8 @@ struct SharedLease {
 	// thread) — falls back to it when there is no ambient runtime to spawn it on.
 	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 	handle: Option<tokio::runtime::Handle>,
+	// The lock's report to the client's lock listener, kept until its releases took theirs.
+	record: Option<Arc<LockRecord>>,
 }
 
 impl PartialEq for ResourceLock {
@@ -578,6 +685,8 @@ impl SharedLease {
 			self.uuid,
 			self.resource.as_str().into(),
 			LeaseConfirmed::Watched(self.confirmed.clone()),
+			// refcount bump
+			self.record.clone(),
 		)
 	}
 }
@@ -914,6 +1023,7 @@ async fn request_acquire(
 	body: Bytes,
 	uuid: Uuid,
 	resource: Arc<str>,
+	record: Option<Arc<LockRecord>>,
 ) -> Result<bool, Error> {
 	let (answer, answered) = tokio::sync::oneshot::channel();
 	// a lease granted to this request runs from no earlier than its send, which comes after this
@@ -925,6 +1035,7 @@ async fn request_acquire(
 		uuid,
 		resource,
 		LeaseConfirmed::Sent(sent),
+		record,
 	);
 	// Detached, not cancelled: the task must outlive a caller that stopped waiting.
 	drop(crate::runtime::spawn_task_maybe_send(async move {
@@ -1084,6 +1195,8 @@ impl Client {
 		let url: Arc<str> = lock_url().into();
 		let shared_resource: Arc<str> = resource.as_str().into();
 		let client = self.arc_client();
+		// Owed from the first Acquire on: a request can be granted after its caller stopped waiting.
+		let record = client.lock_listener.record(uuid, &resource);
 		let acquired_at = acquire_loop(
 			|| {
 				request_acquire(
@@ -1093,6 +1206,8 @@ impl Client {
 					bytes.clone(),
 					uuid,
 					Arc::clone(&shared_resource),
+					// refcount bump
+					record.clone(),
 				)
 			},
 			&resource,
@@ -1110,6 +1225,7 @@ impl Client {
 			confirmations: AtomicU64::new(0),
 			#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 			handle: tokio::runtime::Handle::try_current().ok(),
+			record,
 		});
 		keep_lock_alive(&lease);
 		Ok(Arc::new(ResourceLock { lease }))
@@ -1126,6 +1242,50 @@ impl Client {
 				"lock requests still unanswered after {bound:?}; the server expires their leases on its own"
 			);
 		}
+	}
+
+	/// Reports to `listener` every lock this client may owe a release for: [`LockEventKind::Owed`]
+	/// from the send of its first Acquire, and [`LockEventKind::Settled`] once no request of it is
+	/// in flight, it is not held, and its releases were answered or given up on. Replaces the
+	/// listener set before, which still sees the locks it saw become owed settle.
+	///
+	/// An app whose process can end without awaiting [`Client::wait_for_lock_releases`] (a page
+	/// reload) keeps the locks owed at that point, and passes them to [`Client::release_locks`] when
+	/// it starts again: their leases would otherwise keep every client that needs them waiting for
+	/// up to a minute. Locks owed before the listener was set are not reported.
+	///
+	/// `listener` is called on whichever thread the lock's state changes on, and must not block.
+	pub fn set_lock_listener(&self, listener: impl Fn(LockEvent) + Send + Sync + 'static) {
+		self.client().lock_listener.set(Arc::new(listener));
+	}
+
+	/// Releases `locks`, which an earlier run of the app reported owed (see
+	/// [`Client::set_lock_listener`]), as a dropped lock is released: the server's answer ends a
+	/// release, `released: false` included, and one failing in transport is sent again while the
+	/// lease could still stand, judged as if confirmed when this was called. Resolves once each
+	/// release was answered or given up on; [`Client::wait_for_lock_releases`] waits for them too,
+	/// and the listener reports each lock owed until then.
+	///
+	/// A lock is never reused, only released: another copy of the app may hold it. Never pass a
+	/// lock this client still holds, which this would release under it.
+	pub async fn release_locks(&self, locks: impl IntoIterator<Item = LockId>) {
+		let client = self.arc_client();
+		let url: Arc<str> = lock_url().into();
+		// when the earlier run last confirmed them is unknown, but no earlier than now
+		let confirmed = Confirmed::now();
+		join_all(locks.into_iter().map(|LockId { uuid, resource }| {
+			let record = client.lock_listener.record(uuid, &resource);
+			OwedRelease::new(
+				Arc::clone(&client),
+				Arc::clone(&url),
+				uuid,
+				resource.into(),
+				LeaseConfirmed::Sent(confirmed),
+				record,
+			)
+			.send()
+		}))
+		.await;
 	}
 
 	pub async fn acquire_lock_with_default(
