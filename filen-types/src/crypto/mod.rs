@@ -282,12 +282,47 @@ impl From<Sha512Hash> for SizedHexString<U64> {
 
 #[cfg(test)]
 mod tests {
-	use super::Blake3Hash;
+	use super::{Blake3Hash, Sha256Hash, Sha512Hash};
 	use crate::serde::str::SizedHexString;
 	use filen_macros::rkyv_self;
 	use generic_array::ArrayLength;
 	use rkyv::rancor::Error;
+	use sha2::{Digest, Sha256, Sha512};
 	use typenum::U32;
+
+	// FIPS 180-2 appendix B.1 / C.1: the digests of "abc".
+	const SHA256_ABC: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+	const SHA512_ABC: &str = "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f";
+
+	#[test]
+	fn sha256_hash_from_digest_output_holds_the_fips_vector() {
+		let hash = Sha256Hash::from(Sha256::digest(b"abc"));
+		assert_eq!(hex::encode(<[u8; 32]>::from(hash)), SHA256_ABC);
+		assert_eq!(hex::encode(hash.as_ref()), SHA256_ABC);
+	}
+
+	#[test]
+	fn sha512_hash_digest_holds_the_fips_vector() {
+		let hash = Sha512Hash::digest(b"abc");
+		assert_eq!(hex::encode(<[u8; 64]>::from(hash)), SHA512_ABC);
+		assert_eq!(hex::encode(hash.as_ref()), SHA512_ABC);
+	}
+
+	#[test]
+	fn sha256_hash_round_trips_through_digest_output() {
+		let hash = Sha256Hash::from(Sha256::digest(b"abc"));
+		let output: digest::Output<Sha256> = hash.into();
+		assert_eq!(hex::encode(&output[..]), SHA256_ABC);
+		assert_eq!(Sha256Hash::from(output), hash);
+	}
+
+	#[test]
+	fn sha512_hash_round_trips_through_digest_output() {
+		let hash = Sha512Hash::digest(b"abc");
+		let output: digest::Output<Sha512> = hash.into();
+		assert_eq!(hex::encode(&output[..]), SHA512_ABC);
+		assert_eq!(Sha512Hash::from(output), hash);
+	}
 
 	#[test]
 	fn blake3_hash_rkyv_round_trip() {

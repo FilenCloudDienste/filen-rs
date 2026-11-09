@@ -61,3 +61,26 @@ impl From<Vec<u8>> for Base64EncodedBytes<'_> {
 		Self(Cow::Owned(bytes))
 	}
 }
+
+#[cfg(test)]
+mod tests {
+	use base64::{Engine, prelude::BASE64_STANDARD};
+
+	use super::Base64EncodedBytes;
+	use crate::crypto::Sha512Hash;
+
+	// SHA-512 of "ZmlsZW4=", the base64 text of b"filen".
+	const SHA512_OF_FILEN_BASE64: &str = "4d3fb83fc9edff346f8b4bded595d57bb8c5c85f045c6fd91403a1e318b2043938262fcac26d68704f93ed3f3c4c3353037e0d26efa9466e5e27950d6ca5dcf6";
+
+	#[test]
+	fn sha512_hash_digests_the_base64_text_not_the_raw_bytes() {
+		let hash = Base64EncodedBytes::from(&b"filen"[..])
+			.sha512_hash()
+			.unwrap();
+		assert_eq!(hex::encode(hash.as_ref()), SHA512_OF_FILEN_BASE64);
+		assert_eq!(
+			hash,
+			Sha512Hash::digest(BASE64_STANDARD.encode(b"filen").as_bytes())
+		);
+	}
+}
