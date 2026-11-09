@@ -1414,7 +1414,7 @@ async fn a_local_move_onto_an_unsynced_file_stashes_it_first() {
 }
 
 /// Clear a move's destination exactly as the `MoveLocal` arm does, and collect what the pass
-/// said while doing it.
+/// says once the rename after it has landed.
 async fn cleared_move_target(
 	root: &Path,
 	to_path: &str,
@@ -1422,12 +1422,75 @@ async fn cleared_move_target(
 ) -> (SyncReport, Vec<SyncEvent>) {
 	let mut report = SyncReport::default();
 	let mut events = Vec::new();
-	stash_move_target(root, to_path, base, day(), &mut report, &mut |event| {
-		events.push(event)
-	})
-	.await
-	.expect("clearing a move's destination");
+	let stashed = stash_move_target(root, to_path, base, day())
+		.await
+		.expect("clearing a move's destination");
+	note_quarantined(
+		&mut report,
+		&mut |event| events.push(event),
+		stashed.map(|bin| (to_path.to_string(), bin)),
+	);
 	(report, events)
+}
+
+/// A local move whose source is gone by the time it runs cannot happen, so it moves nothing aside:
+/// the unsynced file at its destination stays where it is, and the pass announces no quarantine for
+/// a move that never took place.
+#[tokio::test]
+async fn a_failed_local_move_puts_the_destination_occupant_back() {
+	let borrowed = Borrowed::new();
+	let root = Uuid::from_u128(1);
+	locked(&borrowed.store)
+		.create_pair("/local", root, SyncMode::TwoWay)
+		.unwrap();
+	// The scan saw a.txt and a free b.txt; by the time the move runs, a.txt is gone and somebody's
+	// file sits at b.txt.
+	std::fs::write(borrowed.local.path().join("b.txt"), b"never synced").unwrap();
+	let (_dir, stage) = Stage::in_temp_dir();
+	let mut writer = PlanWriter::new(stage).unwrap();
+	writer
+		.push(&PlannedEntry::bare(SyncAction::MoveLocal {
+			from_path: "a.txt".to_string(),
+			to_path: "b.txt".to_string(),
+			kind: NodeKind::File,
+		}))
+		.unwrap();
+	let mut report = SyncReport::default();
+	let mut events = Vec::new();
+
+	apply(
+		borrowed.ctx(root, None),
+		writer.finish().unwrap(),
+		&mut report,
+		&mut |event| events.push(event),
+	)
+	.await;
+
+	assert_eq!(report.moved_local, 0);
+	assert_eq!(
+		report
+			.failed_paths
+			.iter()
+			.map(|(path, _)| path.as_str())
+			.collect::<Vec<_>>(),
+		["b.txt"]
+	);
+	assert_eq!(
+		std::fs::read(borrowed.local.path().join("b.txt")).unwrap(),
+		b"never synced",
+		"the destination's occupant is where it was"
+	);
+	assert!(
+		!bucket(borrowed.local.path(), day()).join("b.txt").exists(),
+		"nothing of it is left in the bin"
+	);
+	assert!(report.quarantined.is_empty(), "{:?}", report.quarantined);
+	assert!(
+		!events
+			.iter()
+			.any(|event| matches!(event, SyncEvent::Quarantined { .. })),
+		"{events:?}"
+	);
 }
 
 /// A case-only rename resolves both ends of the move to one file on a case-insensitive

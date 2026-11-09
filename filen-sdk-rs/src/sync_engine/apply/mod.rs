@@ -3917,20 +3917,25 @@ async fn apply_one(
 			// The reconciler only plans a move onto a destination the SCAN saw free, but a pass
 			// waits on the drive lock in between and a file can land there meanwhile — and
 			// `rename` would destroy it without a trace. Same window, and same remedy, as the
-			// pre-download stash above; this one reports what it moved itself.
-			stash_move_target(
-				ctx.local_root,
-				to_path,
-				base.as_deref(),
-				ctx.bin_day,
-				report,
-				&mut *observer,
-			)
-			.await?;
+			// pre-download stash above. Everything that can fail before the rename is checked first —
+			// the source still being there above all — so a move that cannot happen moves nothing
+			// aside; a rename that fails anyway puts the occupant back, and only a move that landed
+			// announces what it moved.
+			std::fs::symlink_metadata(&from).map_err(io_err)?;
 			if let Some(parent) = to.parent() {
 				std::fs::create_dir_all(parent).map_err(io_err)?;
 			}
-			std::fs::rename(&from, &to).map_err(io_err)?;
+			let stashed =
+				stash_move_target(ctx.local_root, to_path, base.as_deref(), ctx.bin_day).await?;
+			if let Err(error) = std::fs::rename(&from, &to) {
+				restore_stashed(stashed, &to);
+				return Err(io_err(error));
+			}
+			note_quarantined(
+				report,
+				observer,
+				stashed.map(|bin| (to_path.to_string(), bin)),
+			);
 			let row = moved_file_row(
 				to_path,
 				base_from.as_deref(),
@@ -4587,9 +4592,10 @@ async fn delete_baseline(ctx: &ApplyContext<'_>, rel_path: &str) -> Result<(), c
 }
 
 /// Put a [`stash_local_target`] back where it came from, for a write that never landed after all —
-/// a download the pair's pause dropped mid-flight. Without this the path is left EMPTY: the next
-/// pass reads a baseline row with nothing on disk as a local deletion and conflicts over a
-/// deletion nobody made, for a file whose only copy sits in the quarantine bin.
+/// a download the pair's pause dropped mid-flight, a local move whose rename failed. Without this
+/// the path is left EMPTY: the next pass reads a baseline row with nothing on disk as a local
+/// deletion and conflicts over a deletion nobody made, for a file whose only copy sits in the
+/// quarantine bin.
 ///
 /// Never overwrites: something back at the path is somebody's newer write, and the stashed copy
 /// stays recoverable in the bin rather than being put on top of it. Best-effort for the same
@@ -4621,29 +4627,20 @@ fn restore_stashed(stashed: Option<PathBuf>, path: &Path) {
 /// exactly when the directory lists that name literally. `from_path` comes from the scan, so it
 /// carries the source's on-disk spelling and cannot be the name found here.
 ///
-/// An occupant it moves is announced from in HERE, through [`note_quarantined`], rather than
-/// handed back for the caller to announce: the rename this clears the way for is two statements
-/// further on, and a stash whose announcement is the caller's business is a stash the caller can
-/// stop announcing. Nothing to hand back, so there is nothing to forget.
+/// Returns where the occupant went (nothing moved: `None`), and announces nothing: the rename this
+/// clears the way for can still fail, and then the caller puts the occupant back
+/// ([`restore_stashed`]) rather than announcing a move that never happened. Only once the rename
+/// has landed does the caller report the stash, through [`note_quarantined`].
 async fn stash_move_target(
 	local_root: &Path,
 	to_path: &str,
 	base: Option<&BaselineEntry>,
 	bin_day: NaiveDate,
-	report: &mut SyncReport,
-	observer: &mut (dyn FnMut(SyncEvent) + Send),
-) -> Result<(), crate::Error> {
+) -> Result<Option<PathBuf>, crate::Error> {
 	if !has_own_directory_entry(&local_target(local_root, to_path)) {
-		return Ok(());
+		return Ok(None);
 	}
-	// The rename that follows always lands, so nothing here is ever put back.
-	let stashed = stash_local_target(local_root, to_path, base, bin_day).await?;
-	note_quarantined(
-		report,
-		observer,
-		stashed.map(|bin| (to_path.to_string(), bin)),
-	);
-	Ok(())
+	stash_local_target(local_root, to_path, base, bin_day).await
 }
 
 /// Whether `path`'s parent directory lists `path`'s file name byte for byte.
