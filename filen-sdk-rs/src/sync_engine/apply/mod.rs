@@ -4642,10 +4642,18 @@ async fn stash_move_target(
 }
 
 /// Whether `path`'s parent directory lists `path`'s file name byte for byte.
+///
+/// The parent is only listed when something already answers at `path`: an `lstat` that finds
+/// nothing means no entry of that name exists in any spelling, so the listing could not match.
+/// Any other answer, a dangling symlink or an error other than not-found included, lists as
+/// before.
 fn has_own_directory_entry(path: &Path) -> bool {
 	let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
 		return false;
 	};
+	if matches!(path.symlink_metadata(), Err(ref e) if e.kind() == std::io::ErrorKind::NotFound) {
+		return false;
+	}
 	std::fs::read_dir(parent).is_ok_and(|entries| {
 		entries
 			.flatten()
