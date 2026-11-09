@@ -8,12 +8,13 @@ use crate::ui::UI;
 /// A path is relative to the root of a sync pair, and applies to every pair of the run. It covers
 /// the conflicts at that path and under it as a directory: `dir` covers `dir/f`, while `a.txt` does
 /// not cover `a.txt.bak`. Where two paths cover a conflict (`dir` and `dir/f`), the longer one
-/// decides. `.` covers the whole pair; an empty path is refused, so an unset shell variable does not
-/// resolve every conflict to one side.
+/// decides. `.` covers the whole pair; an empty path, or any other path that names the pair's root
+/// (`/`, `./`), is refused, so an unset shell variable does not resolve every conflict to one side.
 pub(crate) struct ConflictResolutions(Vec<(String, ConflictResolution)>);
 
 impl ConflictResolutions {
-	/// Fails when a path is empty or when the same path is given to two different flags.
+	/// Fails when a path is empty or names the pair's root other than as `.`, or when the same path
+	/// is given to two different flags.
 	pub(crate) fn new(
 		keep_local: Vec<String>,
 		keep_remote: Vec<String>,
@@ -34,13 +35,15 @@ impl ConflictResolutions {
 			);
 		let mut resolutions: Vec<(String, ConflictResolution)> = Vec::new();
 		for (given_path, resolution) in given {
-			if given_path.is_empty() {
+			let path = normalize(&given_path);
+			// Only a literal "." covers the whole pair: "/", "./" or "$DIR/" with `DIR` unset also
+			// normalize to the root, and are refused like the empty path.
+			if path.is_empty() && given_path != "." {
 				return Err(UI::failure(&format!(
 					"{} was given an empty path; give \".\" to cover the whole sync pair",
 					flag_name(resolution)
 				)));
 			}
-			let path = normalize(&given_path);
 			match resolutions.iter().find(|(known, _)| *known == path) {
 				Some((_, known)) if *known == resolution => {}
 				Some((_, known)) => {
@@ -226,6 +229,23 @@ mod tests {
 			),
 			"{error}"
 		);
+	}
+
+	#[test]
+	fn a_path_that_names_the_pair_root_other_than_as_a_dot_is_an_error() {
+		// "/" is also what "$DIR/" gives with `DIR` unset.
+		for path in ["/", "./", "/.", "//"] {
+			let error = ConflictResolutions::new(vec![path.to_string()], Vec::new(), Vec::new())
+				.err()
+				.unwrap_or_else(|| panic!("{path:?} was accepted"));
+
+			assert!(
+				error.to_string().ends_with(
+					"--keep-local was given an empty path; give \".\" to cover the whole sync pair"
+				),
+				"{path:?}: {error}"
+			);
+		}
 	}
 
 	#[test]
