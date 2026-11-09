@@ -10,13 +10,15 @@ use filen_types::{
 	serde::str::SizedHexString,
 };
 use hkdf::Hkdf;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use rsa::{
 	Oaep, RsaPrivateKey, RsaPublicKey,
 	pkcs8::{DecodePrivateKey, EncodePrivateKey},
 	traits::PrivateKeyParts,
 };
-use sha2::{Sha256, Sha512};
+// rsa 0.9 takes its OAEP hash from the digest 0.10 generation, which it re-exports.
+use rsa::sha2::Sha512;
+use sha2::Sha256;
 use typenum::U32;
 
 use crate::runtime;

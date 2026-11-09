@@ -4,7 +4,10 @@ use base64::{Engine, display::Base64Display, prelude::BASE64_STANDARD};
 use serde::{Deserialize, Serialize, Serializer};
 use sha2::Digest;
 
-use crate::{crypto::Sha512Hash, traits::CowHelpers};
+use crate::{
+	crypto::{DigestWriter, Sha512Hash},
+	traits::CowHelpers,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, CowHelpers)]
 pub struct Base64EncodedBytes<'a>(Cow<'a, [u8]>);
@@ -44,9 +47,12 @@ impl Base64EncodedBytes<'_> {
 	}
 
 	pub fn sha512_hash(&self) -> Result<Sha512Hash, std::io::Error> {
-		let mut writer = base64::write::EncoderWriter::new(sha2::Sha512::new(), &BASE64_STANDARD);
+		let mut writer = base64::write::EncoderWriter::new(
+			DigestWriter::new(sha2::Sha512::new()),
+			&BASE64_STANDARD,
+		);
 		std::io::copy(&mut self.0.as_ref(), &mut writer)?;
-		Ok(writer.finish()?.finalize().into())
+		Ok(writer.finish()?.into_inner().finalize().into())
 	}
 }
 

@@ -13,7 +13,7 @@ use ctr::{
 };
 use filen_macros::js_type;
 use filen_types::error::ConversionError;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha1::Sha1;
 
 use crate::{

@@ -8,13 +8,14 @@ use std::{
 
 use base64::{Engine, prelude::BASE64_STANDARD};
 use chrono::{DateTime, Utc};
-use digest::{Digest, FixedOutput, KeyInit, Update};
+use digest::{Digest, FixedOutput, Update};
 use filen_macros::js_type;
 use filen_types::{
 	auth::{AuthVersion, FileEncryptionVersion, FilenSDKConfig, MetaEncryptionVersion},
 	crypto::{EncryptedMetaKey, EncryptedString},
 	serde::{rsa::RsaDerPublicKey, str::SizedHexString},
 };
+use hmac::KeyInit;
 use http::AuthClient;
 use rsa::{RsaPrivateKey, RsaPublicKey};
 use rsa::{pkcs1::EncodeRsaPublicKey, pkcs8::EncodePrivateKey};

@@ -11,7 +11,7 @@ use filen_types::{
 	crypto::{DerivedPassword, EncryptedMasterKeys, EncryptedString},
 	serde::str::{SizedHexString, SizedStr},
 };
-use pbkdf2::{hmac::Hmac, pbkdf2};
+use pbkdf2::pbkdf2_hmac;
 use rand::distr::Distribution;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha512};
@@ -320,7 +320,7 @@ impl TryFrom<String> for MasterKey {
 	type Error = ConversionError;
 	fn try_from(key: String) -> Result<Self, Self::Error> {
 		let mut derived_key = [0u8; 32];
-		pbkdf2::pbkdf2::<Hmac<Sha512>>(key.as_bytes(), key.as_bytes(), 1, &mut derived_key)?;
+		pbkdf2_hmac::<Sha512>(key.as_bytes(), key.as_bytes(), 1, &mut derived_key);
 
 		Ok(Self(V2Key { key, derived_key }))
 	}
@@ -395,7 +395,7 @@ pub(crate) fn hash(name: &[u8]) -> [u8; 20] {
 
 pub(crate) fn derive_password(password: &[u8], salt: &[u8]) -> Result<[u8; 64], ConversionError> {
 	let mut derived_data = [0u8; 64];
-	pbkdf2::<Hmac<Sha512>>(password, salt, 200_000, &mut derived_data)?;
+	pbkdf2_hmac::<Sha512>(password, salt, 200_000, &mut derived_data);
 	Ok(derived_data)
 }
 

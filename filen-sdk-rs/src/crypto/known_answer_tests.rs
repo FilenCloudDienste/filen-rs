@@ -19,9 +19,9 @@ use rsa::{
 	Oaep, RsaPrivateKey, RsaPublicKey,
 	pkcs1::EncodeRsaPublicKey,
 	pkcs8::{DecodePrivateKey, DecodePublicKey, EncodePrivateKey},
+	sha2::{Sha256, Sha512},
 	traits::PrivateKeyParts,
 };
-use sha2::{Sha256, Sha512};
 
 use crate::{
 	auth::v2::hash_name,

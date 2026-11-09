@@ -3,6 +3,7 @@
 
 use std::{io, path::PathBuf, process::Stdio, time::Duration};
 
+use filen_types::crypto::DigestWriter;
 use sha2::{Digest as _, Sha256};
 use tokio::process::Command;
 
@@ -131,9 +132,9 @@ async fn resolve_bundled(path: PathBuf, sha256: Option<[u8; 32]>) -> Result<Path
 		};
 		if let Some(expected) = sha256 {
 			// Streamed: the binary is tens of megabytes.
-			let mut hasher = Sha256::new();
+			let mut hasher = DigestWriter::new(Sha256::new());
 			io::copy(&mut file, &mut hasher)?;
-			if hasher.finalize().as_slice() != expected {
+			if hasher.into_inner().finalize().as_slice() != expected {
 				return Err(RcloneRefusal::BinaryChecksum.into());
 			}
 		}

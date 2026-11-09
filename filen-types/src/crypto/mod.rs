@@ -280,9 +280,38 @@ impl From<Sha512Hash> for SizedHexString<U64> {
 	}
 }
 
+/// An [`std::io::Write`] that feeds everything written to it into a hasher, so a stream can be
+/// hashed with `io::copy` (or under another writer) without being held in memory: digest 0.11
+/// hashers do not implement `io::Write` themselves. Writes never fail and consume the whole
+/// buffer.
+pub struct DigestWriter<D>(D);
+
+impl<D: digest::Update> DigestWriter<D> {
+	/// A writer over `hasher`, which may already hold earlier input.
+	pub fn new(hasher: D) -> Self {
+		Self(hasher)
+	}
+
+	/// The hasher, holding everything written so far.
+	pub fn into_inner(self) -> D {
+		self.0
+	}
+}
+
+impl<D: digest::Update> std::io::Write for DigestWriter<D> {
+	fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+		self.0.update(buf);
+		Ok(buf.len())
+	}
+
+	fn flush(&mut self) -> std::io::Result<()> {
+		Ok(())
+	}
+}
+
 #[cfg(test)]
 mod tests {
-	use super::{Blake3Hash, Sha256Hash, Sha512Hash};
+	use super::{Blake3Hash, DigestWriter, Sha256Hash, Sha512Hash};
 	use crate::serde::str::SizedHexString;
 	use filen_macros::rkyv_self;
 	use generic_array::ArrayLength;
@@ -322,6 +351,13 @@ mod tests {
 		let output: digest::Output<Sha512> = hash.into();
 		assert_eq!(hex::encode(&output[..]), SHA512_ABC);
 		assert_eq!(Sha512Hash::from(output), hash);
+	}
+
+	#[test]
+	fn digest_writer_hashes_what_is_copied_into_it() {
+		let mut writer = DigestWriter::new(Sha256::new());
+		std::io::copy(&mut &b"abc"[..], &mut writer).unwrap();
+		assert_eq!(hex::encode(writer.into_inner().finalize()), SHA256_ABC);
 	}
 
 	#[test]

@@ -9,7 +9,7 @@ license = "AGPL-3.0"
 [dependencies]
 base64 = "0.22.1"
 chrono = { version = "0.4.41", features = ["serde"] }
-digest = "0.10.7"
+digest = "0.11.3"
 hex = { package = "const-hex", version = "1.18.1", features = ["serde"] }
 rsa = "0.9.8" # update to 0.10 when it is released, as it patches a side-channel timing based attack
 rusqlite = { version = "0.39", optional = true, default-features = false, features = [
@@ -18,7 +18,7 @@ rusqlite = { version = "0.39", optional = true, default-features = false, featur
 serde = { version = "1.0.219", features = ["serde_derive"] }
 serde_json = { version = "1.0.142", features = ["raw_value"] }
 serde_repr = "0.1.20"
-sha2 = "0.10.9"
+sha2 = "0.11.0"
 thiserror = "2.0.14"
 uuid = { version = "1.18.0", features = ["serde", "v4"] }
 tsify = { version = "0.5.5", default-features = false, features = ["js"] }

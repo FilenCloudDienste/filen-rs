@@ -282,7 +282,7 @@ impl NoteOrChatKeyStruct<'_> {
 mod tests {
 	use aes_gcm::{Aes256Gcm, KeyInit, Nonce, aead::Aead};
 	use base64::{Engine, prelude::BASE64_STANDARD};
-	use hmac::Hmac;
+	use pbkdf2::pbkdf2_hmac;
 	use sha2::Sha512;
 
 	use super::*;
@@ -345,8 +345,7 @@ mod tests {
 		// encrypts `{"content":"café"}` truncated to one byte per code point,
 		// the way clients that skip UTF-8 encoding produce it
 		let mut derived_key = [0u8; 32];
-		pbkdf2::pbkdf2::<Hmac<Sha512>>(V2_KEY.as_bytes(), V2_KEY.as_bytes(), 1, &mut derived_key)
-			.unwrap();
+		pbkdf2_hmac::<Sha512>(V2_KEY.as_bytes(), V2_KEY.as_bytes(), 1, &mut derived_key);
 		let nonce = b"012345678901";
 		let plaintext = b"{\"content\":\"caf\xe9\"}";
 		let ciphertext = Aes256Gcm::new_from_slice(&derived_key)
