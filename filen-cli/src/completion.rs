@@ -7,6 +7,7 @@ use filen_sdk_rs::{
 	auth::Client,
 	fs::categories::{DirType, NonRootFileType, Normal},
 };
+use tokio::task::JoinHandle;
 
 use crate::{
 	CliArgs,
@@ -111,8 +112,8 @@ impl ValueCompleter for FilenCompleter {
 	/// The obscure way async data fetching is handled here is because clap's and inquire's APIs are not designed for async completions.
 	/// Our fork of inquire contains a workaround that still requires handling it like this on the call site.
 	/// Basically, when a completion is needed, an empty result is returned first, and a task to fetch the data is started in the background.
-	/// inquire then continually queries the completer if new results are available, and when the data fetching future has completed,
-	/// its results are saved in the dict and picked up by the next time the completer is called.
+	/// inquire then continually queries the completer if new results are available, and when the data fetching task has finished,
+	/// its results are taken from its pending JoinHandle the next time the completer is called.
 	/// By doing this, typing is not blocked by completions, but they are still available soon after.
 	fn complete(&self, input: &std::ffi::OsStr) -> Vec<clap_complete::CompletionCandidate> {
 		match self.1 {
@@ -128,81 +129,63 @@ impl ValueCompleter for FilenCompleter {
 					async_completions
 						.pending_completion_tasks
 						.retain(|key, _| key == &completion_key);
-					if let Some(completions) =
-						async_completions.fetched_completions.get(&completion_key)
+					if let Some(handle) = async_completions
+						.pending_completion_tasks
+						.get(&completion_key)
 					{
-						completions.iter().map(CompletionCandidate::new).collect()
-					} else {
-						if let Some(handle) = async_completions
-							.pending_completion_tasks
-							.get(&completion_key)
-						{
-							if handle.is_finished() || context.await_result {
-								let handle = async_completions
-									.pending_completion_tasks
-									.remove(&completion_key)
-									.unwrap();
-								match handle.await {
-									Ok(Ok(completions)) => completions
-										.into_iter()
-										.map(CompletionCandidate::new)
-										.collect(),
-									Ok(Err(e)) => {
-										log::error!("Error in completion task: {:?}", e);
-										vec![]
-									}
-									Err(e) => {
-										log::error!(
-											"Error in completion task while joining: {:?}",
-											e
-										);
-										vec![]
-									}
-								}
-							} else {
-								vec![]
-							}
+						if handle.is_finished() || context.await_result {
+							let handle = async_completions
+								.pending_completion_tasks
+								.remove(&completion_key)
+								.expect(
+									"the task was just found under the same lock (should be impossible)",
+								);
+							collect_candidates(handle).await
 						} else {
-							let arg_type = self.0.clone();
-							let context = context.clone();
-							let input = input.to_os_string();
-							let handle = runtime.spawn(async move {
-								Self::complete(
-									arg_type,
-									&context.client,
-									&context.working_path,
-									input.to_str().unwrap_or(""),
-								)
-								.await
-							});
-							if context.await_result {
-								match handle.await {
-									Ok(Ok(completions)) => completions
-										.into_iter()
-										.map(CompletionCandidate::new)
-										.collect(),
-									Ok(Err(e)) => {
-										log::error!("Error in completion task: {:?}", e);
-										vec![]
-									}
-									Err(e) => {
-										log::error!(
-											"Error in completion task while joining: {:?}",
-											e
-										);
-										vec![]
-									}
-								}
-							} else {
-								async_completions
-									.pending_completion_tasks
-									.insert(completion_key.clone(), handle);
-								vec![]
-							}
+							vec![]
+						}
+					} else {
+						let arg_type = self.0.clone();
+						let context = context.clone();
+						let input = input.to_os_string();
+						let handle = runtime.spawn(async move {
+							Self::complete(
+								arg_type,
+								&context.client,
+								&context.working_path,
+								input.to_str().unwrap_or(""),
+							)
+							.await
+						});
+						if context.await_result {
+							collect_candidates(handle).await
+						} else {
+							async_completions
+								.pending_completion_tasks
+								.insert(completion_key.clone(), handle);
+							vec![]
 						}
 					}
 				})
 			}),
+		}
+	}
+}
+
+/// Waits for a completion task and turns its result into candidates, logging a failure.
+async fn collect_candidates(handle: JoinHandle<Result<Vec<String>>>) -> Vec<CompletionCandidate> {
+	match handle.await {
+		Ok(Ok(completions)) => completions
+			.into_iter()
+			.map(CompletionCandidate::new)
+			.collect(),
+		Ok(Err(e)) => {
+			log::error!("Error in completion task: {:?}", e);
+			vec![]
+		}
+		Err(e) => {
+			log::error!("Error in completion task while joining: {:?}", e);
+			vec![]
 		}
 	}
 }
@@ -214,14 +197,12 @@ struct CompletionKey {
 }
 struct AsyncCompletions {
 	pending_completion_tasks:
-		std::collections::HashMap<CompletionKey, tokio::task::JoinHandle<Result<Vec<String>>>>,
-	fetched_completions: std::collections::HashMap<CompletionKey, Vec<String>>,
+		std::collections::HashMap<CompletionKey, JoinHandle<Result<Vec<String>>>>,
 }
 static ASYNC_COMPLETIONS: std::sync::LazyLock<tokio::sync::Mutex<AsyncCompletions>> =
 	std::sync::LazyLock::new(|| {
 		tokio::sync::Mutex::new(AsyncCompletions {
 			pending_completion_tasks: std::collections::HashMap::new(),
-			fetched_completions: std::collections::HashMap::new(),
 		})
 	});
 
