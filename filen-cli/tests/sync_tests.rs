@@ -7,7 +7,8 @@ use std::{
 };
 #[cfg(unix)]
 use std::{
-	process::Stdio,
+	process::{Child, Stdio},
+	thread,
 	time::{Duration, Instant},
 };
 
@@ -1098,7 +1099,7 @@ async fn sync_until(
 ) -> Output {
 	let _runs = CLI_RUNS.write().await;
 	let (_auth_config_dir, auth_config) = test_utils::cli::prepare_cli_auth_config().await;
-	let mut cli = Command::new(env!("CARGO_BIN_EXE_filen-cli"))
+	let cli = Command::new(env!("CARGO_BIN_EXE_filen-cli"))
 		.args([
 			"--auth-config-path",
 			auth_config.to_str().unwrap(),
@@ -1112,10 +1113,12 @@ async fn sync_until(
 		.stderr(Stdio::piped())
 		.spawn()
 		.unwrap();
+	let mut cli = WatchingCli(Some(cli));
 
 	let deadline = Instant::now() + within;
 	while !done().await {
-		if Instant::now() >= deadline || cli.try_wait().unwrap().is_some() {
+		if Instant::now() >= deadline || cli.child().try_wait().unwrap().is_some() {
+			let mut cli = cli.into_child();
 			let _ = cli.kill();
 			panic!(
 				"sync did not get there in time\n{}",
@@ -1125,6 +1128,7 @@ async fn sync_until(
 		tokio::time::sleep(Duration::from_secs(2)).await;
 	}
 
+	let cli = cli.into_child();
 	let interrupted = Command::new("kill")
 		.args(["-INT", &cli.id().to_string()])
 		.status()
@@ -1133,6 +1137,57 @@ async fn sync_until(
 	let output = cli.wait_with_output().unwrap();
 	assert_success(&output);
 	output
+}
+
+/// How long a [`WatchingCli`] dropped while unwinding waits for the CLI to stop on SIGINT before
+/// it kills it.
+#[cfg(unix)]
+const WATCHING_CLI_STOP_GRACE: Duration = Duration::from_secs(10);
+
+/// The CLI [`sync_until`] watches with, stopped when the guard is dropped, so a panicking poll
+/// does not leave it running and taking the drive lock for every pass. The `Option` is `None` only
+/// once [`WatchingCli::into_child`] has taken the child for the explicit stop.
+#[cfg(unix)]
+struct WatchingCli(Option<Child>);
+
+#[cfg(unix)]
+impl WatchingCli {
+	fn child(&mut self) -> &mut Child {
+		self.0
+			.as_mut()
+			.expect("the child is only taken by into_child, which consumes the guard")
+	}
+
+	/// Disarms the guard and hands the child over to be stopped and collected by the caller.
+	fn into_child(mut self) -> Child {
+		self.0
+			.take()
+			.expect("the child is only taken by into_child, which consumes the guard")
+	}
+}
+
+#[cfg(unix)]
+impl Drop for WatchingCli {
+	fn drop(&mut self) {
+		let Some(mut cli) = self.0.take() else {
+			return;
+		};
+		// Errors are ignored: this runs while a test unwinds, and the kill below is the fallback.
+		// SIGINT first, as the success path stops it, so it releases the drive lock on its way out.
+		let _ = Command::new("kill")
+			.args(["-INT", &cli.id().to_string()])
+			.status();
+		let deadline = Instant::now() + WATCHING_CLI_STOP_GRACE;
+		while Instant::now() < deadline {
+			match cli.try_wait() {
+				Ok(Some(_)) => return,
+				Ok(None) => thread::sleep(Duration::from_millis(100)),
+				Err(_) => break,
+			}
+		}
+		let _ = cli.kill();
+		let _ = cli.wait();
+	}
 }
 
 fn assert_success(output: &Output) {
