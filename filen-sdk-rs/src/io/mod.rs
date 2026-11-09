@@ -12,8 +12,10 @@ pub(crate) mod fs_tree;
 mod js_impl;
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 mod meta_ext;
-#[cfg(feature = "rclone")]
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 pub(crate) mod private_file;
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+mod upload_resume;
 
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 mod canonical_path;
@@ -34,6 +36,10 @@ pub use dir_upload::{DirUploadCallback, DirUploadOptions, ExistingRemoteFile, Sy
 pub use filter::{PathMatcher, TransferFilter};
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 pub use meta_ext::FilenMetaExt;
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+pub use upload_resume::{
+	FileUploadJournalStore, SealedUploadJournal, UploadJournalId, UploadJournalStore,
+};
 
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 pub(crate) use canonical_path::CanonicalPath;

@@ -1,6 +1,5 @@
 //! Files only the current user may read, and removing them.
 
-#[cfg(feature = "rclone")]
 use std::io::Write;
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
@@ -22,6 +21,19 @@ pub(crate) fn create_private_file(path: &Path) -> std::io::Result<File> {
 	Ok(file)
 }
 
+/// Writes `contents` to `temp` through [`create_private_file`], syncs it to disk and renames it
+/// onto `path`, so a reader of `path` sees either the old contents or all of the new ones.
+pub(crate) fn write_private_file_atomically(
+	temp: &Path,
+	path: &Path,
+	contents: &[u8],
+) -> std::io::Result<()> {
+	let mut file = create_private_file(temp)?;
+	file.write_all(contents)?;
+	file.sync_all()?;
+	std::fs::rename(temp, path)
+}
+
 /// Write `contents` to `path` through [`create_private_file`]. The files written with it are
 /// rclone's rc password hash and its pidfile.
 #[cfg(feature = "rclone")]
@@ -31,7 +43,6 @@ pub(crate) fn write_private_file(path: &Path, contents: &str) -> std::io::Result
 // copied from filen-cli/src/auth.rs
 
 /// Removes the file at `path`. A file that is not there is not an error.
-#[cfg(feature = "rclone")]
 pub(crate) fn remove_file_if_present(path: &Path) -> std::io::Result<()> {
 	match std::fs::remove_file(path) {
 		Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
