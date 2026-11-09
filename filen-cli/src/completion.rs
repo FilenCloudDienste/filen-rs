@@ -1,6 +1,6 @@
 use std::{borrow::Cow, ffi::OsString, iter, mem, str::FromStr, sync::Arc};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 use clap::{CommandFactory as _, builder::OsStr};
 use clap_complete::{ArgValueCompleter, CompletionCandidate, engine::ValueCompleter};
 use filen_sdk_rs::{
@@ -260,8 +260,16 @@ impl FilenCompleter {
 				{
 					Some(NonRootFileType::Dir(dir)) => DirType::Dir(dir),
 					Some(NonRootFileType::Root(root)) => DirType::Root(root),
-					Some(_) => return Err(anyhow!("Parent is not a directory")),
-					None => return Err(anyhow!("Parent directory not found")),
+					// a half-typed path routinely names a parent that does not exist (yet),
+					// which is no error: it just has no completions
+					Some(_) => {
+						log::debug!("No completions: {path_before_basename} is not a directory");
+						return Ok(vec![]);
+					}
+					None => {
+						log::debug!("No completions: {path_before_basename} does not exist");
+						return Ok(vec![]);
+					}
 				};
 				let (dirs, files) = client
 					// a completion shows no progress
@@ -285,12 +293,7 @@ impl FilenCompleter {
 				}
 				Ok(candidates
 					.iter()
-					.map(|c| {
-						input
-							.strip_suffix(basename_input)
-							.unwrap_or_default()
-							.to_string() + c
-					})
+					.map(|c| input_before_basename.to_string() + c)
 					.collect())
 			}
 			FilenArgType::HelpTopic => Ok(get_help_topics()
