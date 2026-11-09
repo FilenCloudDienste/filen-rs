@@ -18,7 +18,7 @@ use filen_sdk_rs::{
 };
 use filen_types::fs::Uuid;
 use test_utils::{
-	authenticated_cli_with_args,
+	authenticated_cli_in_config_dir, authenticated_cli_with_args,
 	cli::{exists, file_uuid, is_file, logged_out_command},
 	upload_journal::{NotifyingJournalStore, resumable_upload_contents},
 };
@@ -1001,9 +1001,8 @@ async fn uploading_with_resume_continues_what_an_earlier_upload_left() {
 	std::fs::write(&source, &contents).unwrap();
 	plant_upload_journal(client, config_dir.path(), &source, resources.dir.uuid()).await;
 
-	let output = authenticated_cli_with_args!(
-		"--config-dir",
-		config_dir.path().to_str().unwrap(),
+	let output = authenticated_cli_in_config_dir!(
+		config_dir.path();
 		"upload",
 		"--resume",
 		"--json",
@@ -1051,9 +1050,8 @@ async fn uploading_a_directory_with_resume_continues_its_unfinished_file() {
 	)
 	.await;
 
-	let output = authenticated_cli_with_args!(
-		"--config-dir",
-		config_dir.path().to_str().unwrap(),
+	let output = authenticated_cli_in_config_dir!(
+		config_dir.path();
 		"upload",
 		"--resume",
 		"--json",
@@ -1086,9 +1084,8 @@ async fn uploading_without_resume_keeps_no_record() {
 	let source = local.path().join("unrecorded.bin");
 	std::fs::write(&source, resumable_upload_contents(3)).unwrap();
 
-	authenticated_cli_with_args!(
-		"--config-dir",
-		config_dir.path().to_str().unwrap(),
+	authenticated_cli_in_config_dir!(
+		config_dir.path();
 		"upload",
 		source.to_str().unwrap(),
 		test_dir_name

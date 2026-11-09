@@ -210,13 +210,9 @@ mod live {
 		let name = format!("searched_{}.txt", test_dir.uuid);
 		let file = client.make_file_builder(&name, test_dir.uuid).unwrap();
 		client.upload_file(file, b"content").await.unwrap();
-		// its own config dir, so the search cache starts empty rather than from another run's
-		let config_dir = assert_fs::TempDir::new().unwrap();
-
+		// the CLI has its own config dir, so the search cache starts empty rather than from
+		// another run's
 		let assert = authenticated_cli_with_args!(
-			"--config-dir",
-			config_dir.path().to_str().unwrap(),
-			"--skip-update",
 			"--working-path",
 			test_dir.name().unwrap(),
 			"search",
@@ -314,17 +310,8 @@ mod live {
 			return;
 		}
 		let resources = test_utils::RESOURCES.get_resources().await;
-		let config_dir = assert_fs::TempDir::new().unwrap();
 		let remote = format!("filen:{}/does_not_exist", resources.dir.name().unwrap());
 
-		authenticated_cli_with_args!(
-			"--config-dir",
-			config_dir.path().to_str().unwrap(),
-			"--skip-update",
-			"rclone",
-			"lsf",
-			&remote
-		)
-		.code(3);
+		authenticated_cli_with_args!("rclone", "lsf", &remote).code(3);
 	}
 }

@@ -30,19 +30,30 @@ fn json_of(assert: &assert_cmd::assert::Assert) -> Value {
 	serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("{e}: {stdout}"))
 }
 
-/// Runs the CLI logged in as the share account.
+/// Runs the CLI logged in as the share account, with a config directory of its own, so its cache
+/// is never the test account's.
 fn share_account_cli(share_client: &Client, args: &[&str]) -> assert_cmd::assert::Assert {
 	let temp_dir = assert_fs::TempDir::new().unwrap();
 	let auth_config = temp_dir.child("filen-cli-auth-config");
 	auth_config
 		.write_str(&filen_cli::serialize_auth_config(share_client).unwrap())
 		.unwrap();
-	let assert = assert_cmd::cargo::cargo_bin_cmd!("filen-cli")
-		.args(["--auth-config-path", auth_config.to_str().unwrap(), "-v"])
-		.args(args)
-		.assert();
+	let config_dir = assert_fs::TempDir::new().unwrap();
+	let assert = assert_cmd::Command::from_std(test_utils::cli::logged_out_command(
+		assert_cmd::cargo::cargo_bin!(),
+		config_dir.path(),
+	))
+	.args([
+		"--skip-update",
+		"--auth-config-path",
+		auth_config.to_str().unwrap(),
+		"-v",
+	])
+	.args(args)
+	.assert();
 	// kept until the CLI has read the credentials, then deleted with them
 	drop(temp_dir);
+	drop(config_dir);
 	assert
 }
 

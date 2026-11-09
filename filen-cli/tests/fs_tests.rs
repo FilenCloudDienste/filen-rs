@@ -1445,17 +1445,10 @@ async fn edit_of_a_file_changed_meanwhile_keeps_the_changes_locally() {
 	assert_eq!(std::fs::read(&kept[0]).unwrap(), b"original\nmine\n");
 }
 
-/// Runs `search` with `args` in `test_dir`, with a config directory of its own, so that its
+/// Runs `search` with `args` in `test_dir`. The CLI has a config directory of its own, so its
 /// cache starts empty and the search waits for a resync of the test directory.
 async fn search_in(test_dir: &str, args: &[&str]) -> assert_cmd::assert::Assert {
-	let config_dir = assert_fs::TempDir::new().unwrap();
-	let mut cli_args = vec![
-		"--config-dir",
-		config_dir.path().to_str().unwrap(),
-		"--working-path",
-		test_dir,
-		"search",
-	];
+	let mut cli_args = vec!["--working-path", test_dir, "search"];
 	cli_args.extend_from_slice(args);
 	run_authenticated_cli_with_args(&mut cargo_bin_cmd!("filen-cli"), &cli_args).await
 }

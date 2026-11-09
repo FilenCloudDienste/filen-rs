@@ -29,22 +29,27 @@ async fn test_serialize_deserialize_auth_config() {
 #[test]
 fn authenticate_from_cli_args() {
 	let (email, password) = get_testing_credentials();
-	cargo_bin_cmd!()
-		.args([
-			"--email",
-			&email,
-			"--password",
-			&password,
-			"-v",
-			"stat",
-			"/",
-		])
-		// (use stat command to verify successful authentication)
-		.assert()
-		.success()
-		.stderr(predicates::str::contains(
-			"Authenticated from CLI arguments",
-		));
+	let config_dir = assert_fs::TempDir::new().unwrap();
+	assert_cmd::Command::from_std(logged_out_command(
+		assert_cmd::cargo::cargo_bin!(),
+		config_dir.path(),
+	))
+	.args([
+		"--skip-update",
+		"--email",
+		&email,
+		"--password",
+		&password,
+		"-v",
+		"stat",
+		"/",
+	])
+	// (use stat command to verify successful authentication)
+	.assert()
+	.success()
+	.stderr(predicates::str::contains(
+		"Authenticated from CLI arguments",
+	));
 }
 
 #[test]
@@ -78,19 +83,24 @@ async fn export_and_authenticate_from_auth_config() {
 			"Exported auth config to {}",
 			path.display()
 		)));
-	cargo_bin_cmd!()
-		.args([
-			"--auth-config-path",
-			path.to_str().unwrap(),
-			"-v",
-			"stat",
-			"/",
-		])
-		.assert()
-		.success()
-		.stderr(predicates::str::contains(
-			"Authenticated from auth config file",
-		));
+	let config_dir = assert_fs::TempDir::new().unwrap();
+	assert_cmd::Command::from_std(logged_out_command(
+		assert_cmd::cargo::cargo_bin!(),
+		config_dir.path(),
+	))
+	.args([
+		"--skip-update",
+		"--auth-config-path",
+		path.to_str().unwrap(),
+		"-v",
+		"stat",
+		"/",
+	])
+	.assert()
+	.success()
+	.stderr(predicates::str::contains(
+		"Authenticated from auth config file",
+	));
 }
 
 #[test]

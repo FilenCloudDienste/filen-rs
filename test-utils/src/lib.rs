@@ -653,6 +653,9 @@ pub mod cli {
 		files.iter().any(|trashed| trashed.uuid() == file.uuid())
 	}
 
+	/// Runs the CLI `bin` with `args`, logged in as the test account, with a config directory of
+	/// its own (so its cache, logs and update stamp never land in the developer's), no update
+	/// check, no keyring and no autodetected auth config.
 	pub async fn run_authenticated_cli_with_args<I, S>(
 		bin: &mut assert_cmd::Command,
 		args: I,
@@ -661,16 +664,37 @@ pub mod cli {
 		I: IntoIterator<Item = S>,
 		S: AsRef<std::ffi::OsStr>,
 	{
-		// Keep _temp_dir alive until after .assert() runs the CLI (which reads the
-		// file); dropping it deletes the temp dir and its credentials.
+		// Keep config_dir alive until after the CLI ran; dropping it deletes the directory.
+		let config_dir = assert_fs::TempDir::new().unwrap();
+		run_authenticated_cli_in_config_dir(bin, config_dir.path(), args).await
+	}
+
+	/// [`run_authenticated_cli_with_args`] with the config directory `config_dir`, for a test whose
+	/// CLI runs must share one (one run leaves what the next reads, such as an upload journal).
+	pub async fn run_authenticated_cli_in_config_dir<I, S>(
+		bin: &mut assert_cmd::Command,
+		config_dir: &Path,
+		args: I,
+	) -> assert_cmd::assert::Assert
+	where
+		I: IntoIterator<Item = S>,
+		S: AsRef<std::ffi::OsStr>,
+	{
+		// Keep _temp_dir alive until after .assert() runs the CLI (which reads the file);
+		// dropping it deletes the temp dir and its credentials.
 		let (_temp_dir, auth_config_file) = prepare_cli_auth_config().await;
-		bin.args([
-			"--auth-config-path",
-			auth_config_file.to_str().unwrap(),
-			"-v",
-		])
-		.args(args)
-		.assert()
+		bin.env("FILEN_CLI_TESTING_DISABLE_KEYRING", "1")
+			.env("FILEN_CLI_TESTING_DISABLE_AUTODETECTED_AUTH_CONFIG", "1")
+			.arg("--config-dir")
+			.arg(config_dir)
+			.args([
+				"--skip-update",
+				"--auth-config-path",
+				auth_config_file.to_str().unwrap(),
+				"-v",
+			])
+			.args(args)
+			.assert()
 	}
 
 	// Returns the TempDir guard alongside the child path: dropping the guard
@@ -697,6 +721,14 @@ pub mod cli {
 	macro_rules! authenticated_cli_with_args {
 		($($arg:expr),*) => {
 			$crate::cli::run_authenticated_cli_with_args(&mut assert_cmd::cargo::cargo_bin_cmd!("filen-cli"), &[$($arg),*]).await
+		};
+	}
+
+	/// [`authenticated_cli_with_args`] with the config directory given before the `;`.
+	#[macro_export]
+	macro_rules! authenticated_cli_in_config_dir {
+		($config_dir:expr; $($arg:expr),*) => {
+			$crate::cli::run_authenticated_cli_in_config_dir(&mut assert_cmd::cargo::cargo_bin_cmd!("filen-cli"), $config_dir, &[$($arg),*]).await
 		};
 	}
 }
