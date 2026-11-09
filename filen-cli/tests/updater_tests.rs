@@ -6,11 +6,12 @@
 //! `FILEN_CLI_TESTING_ANNOUNCEMENTS_URL`.
 
 use std::{
+	collections::HashMap,
 	env::consts::EXE_SUFFIX,
 	fs,
 	net::TcpListener,
 	path::{Path, PathBuf},
-	sync::{Arc, Mutex},
+	sync::{Arc, LazyLock, Mutex},
 	thread::{self, JoinHandle},
 };
 
@@ -64,9 +65,17 @@ impl Default for Releases {
 	}
 }
 
+/// The CLI's binary, read once for every test.
+static BINARY: LazyLock<Vec<u8>> =
+	LazyLock::new(|| fs::read(assert_cmd::cargo::cargo_bin!()).unwrap());
+
+/// The hex SHA-256 digests of the assets, by tag, computed once each.
+static ASSET_DIGESTS: LazyLock<Mutex<HashMap<String, String>>> = LazyLock::new(Mutex::default);
+
 /// The release asset of `tag`: the CLI's binary, with a trailer that tells the releases apart.
 fn asset(tag: &str) -> Vec<u8> {
-	let mut asset = fs::read(assert_cmd::cargo::cargo_bin!()).unwrap();
+	// an owned copy, since the trailer is appended to it
+	let mut asset = BINARY.clone();
 	asset.extend_from_slice(format!("\nfilen-cli-test-asset-{tag}").as_bytes());
 	asset
 }
@@ -77,6 +86,16 @@ fn sha256_hex(bytes: &[u8]) -> String {
 		.iter()
 		.map(|byte| format!("{byte:02x}"))
 		.collect()
+}
+
+/// The hex SHA-256 digest of the release asset of `tag`.
+fn asset_digest(tag: &str) -> String {
+	ASSET_DIGESTS
+		.lock()
+		.unwrap()
+		.entry(tag.to_owned())
+		.or_insert_with(|| sha256_hex(&asset(tag)))
+		.clone()
 }
 
 /// A local server answering for GitHub, until it is dropped.
@@ -145,7 +164,7 @@ fn respond(releases: Releases, url: &str, path: &str) -> (u16, Vec<u8>) {
 		let asset = asset(tag);
 		let digest = match releases.digest {
 			ListedDigest::Missing => None,
-			ListedDigest::OfAsset => Some(format!("sha256:{}", sha256_hex(&asset))),
+			ListedDigest::OfAsset => Some(format!("sha256:{}", asset_digest(tag))),
 			ListedDigest::Given(digest) => Some(digest.to_owned()),
 		};
 		let release = json!({
@@ -194,8 +213,6 @@ struct Installation {
 	bin_dir: TempDir,
 	executable: PathBuf,
 	config_dir: TempDir,
-	/// The binary as it was copied.
-	original: Vec<u8>,
 }
 
 impl Installation {
@@ -204,7 +221,6 @@ impl Installation {
 		let executable = bin_dir.path().join(format!("{name}{EXE_SUFFIX}"));
 		fs::copy(assert_cmd::cargo::cargo_bin!(), &executable).unwrap();
 		Self {
-			original: fs::read(&executable).unwrap(),
 			bin_dir,
 			executable,
 			config_dir: tempfile::tempdir().unwrap(),
@@ -228,6 +244,16 @@ impl Installation {
 	/// The names of the files next to the binary, sorted.
 	fn bin_dir_files(&self) -> Vec<String> {
 		file_names(self.bin_dir.path())
+	}
+
+	/// Asserts that the binary is still the one copied.
+	fn assert_unchanged(&self) {
+		assert!(fs::read(&self.executable).unwrap() == *BINARY);
+	}
+
+	/// Asserts that the binary, named `filen-cli`, is the only file in its directory.
+	fn assert_only_binary(&self) {
+		assert_eq!(self.bin_dir_files(), [format!("filen-cli{EXE_SUFFIX}")]);
 	}
 }
 
@@ -281,10 +307,7 @@ fn always_update_replaces_a_binary_without_a_version_in_its_name() {
 		.stderr(contains("Update installed successfully"));
 
 	assert_eq!(fs::read(&installation.executable).unwrap(), asset("v1.0.0"));
-	assert_eq!(
-		installation.bin_dir_files(),
-		[format!("filen-cli{EXE_SUFFIX}")]
-	);
+	installation.assert_only_binary();
 }
 
 #[test]
@@ -353,10 +376,7 @@ fn a_check_is_skipped_for_a_while_after_one() {
 			.count(),
 		1
 	);
-	assert_eq!(
-		fs::read(&installation.executable).unwrap(),
-		installation.original
-	);
+	installation.assert_unchanged();
 }
 
 /// A URL nothing listens on.
@@ -381,10 +401,7 @@ fn an_offline_update_check_is_a_warning() {
 		))
 		.stderr(contains("Failed to fetch announcements"));
 
-	assert_eq!(
-		fs::read(&installation.executable).unwrap(),
-		installation.original
-	);
+	installation.assert_unchanged();
 }
 
 #[test]
@@ -419,10 +436,7 @@ fn an_error_status_from_the_releases_api_is_a_warning() {
 			 {\"message\": \"Unavailable\"}",
 		));
 
-	assert_eq!(
-		fs::read(&installation.executable).unwrap(),
-		installation.original
-	);
+	installation.assert_unchanged();
 }
 
 #[test]
@@ -443,14 +457,8 @@ fn a_failed_asset_download_leaves_the_binary_alone() {
 			server.url
 		)));
 
-	assert_eq!(
-		fs::read(&installation.executable).unwrap(),
-		installation.original
-	);
-	assert_eq!(
-		installation.bin_dir_files(),
-		[format!("filen-cli{EXE_SUFFIX}")]
-	);
+	installation.assert_unchanged();
+	installation.assert_only_binary();
 }
 
 #[test]
@@ -490,17 +498,11 @@ fn an_asset_not_matching_its_digest_is_not_installed() {
 			"Update check failed: The download of filen-cli-v1.0.0-{TARGET} has the SHA-256 digest \
 			 {}, but its release lists \
 			 0000000000000000000000000000000000000000000000000000000000000000",
-			sha256_hex(&asset("v1.0.0"))
+			asset_digest("v1.0.0")
 		)));
 
-	assert_eq!(
-		fs::read(&installation.executable).unwrap(),
-		installation.original
-	);
-	assert_eq!(
-		installation.bin_dir_files(),
-		[format!("filen-cli{EXE_SUFFIX}")]
-	);
+	installation.assert_unchanged();
+	installation.assert_only_binary();
 }
 
 #[test]
@@ -521,10 +523,7 @@ fn an_asset_with_a_digest_in_another_algorithm_is_not_installed() {
 			 filen-cli-v1.0.0-{TARGET}, which cannot be checked"
 		)));
 
-	assert_eq!(
-		fs::read(&installation.executable).unwrap(),
-		installation.original
-	);
+	installation.assert_unchanged();
 }
 
 #[test]
@@ -544,10 +543,7 @@ fn an_asset_with_a_malformed_digest_is_not_installed() {
 			"Update check failed: Malformed release asset SHA-256 digest \"sha256:00\"",
 		));
 
-	assert_eq!(
-		fs::read(&installation.executable).unwrap(),
-		installation.original
-	);
+	installation.assert_unchanged();
 }
 
 #[test]
@@ -624,10 +620,7 @@ fn install_of_a_release_that_does_not_exist_fails() {
 		.code(1)
 		.stderr(contains("There is no release v7.7.7"));
 
-	assert_eq!(
-		fs::read(&installation.executable).unwrap(),
-		installation.original
-	);
+	installation.assert_unchanged();
 }
 
 #[test]
@@ -645,10 +638,7 @@ fn install_without_a_terminal_needs_yes() {
 		));
 
 	assert_eq!(server.requests(), Vec::<String>::new());
-	assert_eq!(
-		fs::read(&installation.executable).unwrap(),
-		installation.original
-	);
+	installation.assert_unchanged();
 }
 
 #[test]
