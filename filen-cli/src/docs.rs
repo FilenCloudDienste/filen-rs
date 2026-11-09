@@ -510,8 +510,9 @@ fn serve_until(
 		if let Some(request) = server
 			.recv_timeout(DOCS_SERVER_POLL)
 			.context("Failed to receive a docs HTTP request")?
+			&& let Err(e) = respond(request)
 		{
-			respond(request)?;
+			log::warn!("Failed to answer a docs request: {e:#}");
 		}
 	}
 	Ok(())
@@ -743,6 +744,43 @@ mod tests {
 		.unwrap();
 		assert_eq!(answered.into_inner(), ["/some-section"]);
 		assert!(client.join().unwrap().ends_with("served"));
+	}
+
+	#[test]
+	fn the_docs_server_keeps_serving_after_it_fails_to_answer_a_request() {
+		let (server, address) = local_server();
+		let client = thread::spawn(move || {
+			["/first", "/second"].map(|path| {
+				let mut stream = TcpStream::connect(address).unwrap();
+				stream
+					.write_all(format!("GET {path} HTTP/1.0\r\n\r\n").as_bytes())
+					.unwrap();
+				let mut response = String::new();
+				// the failed request may be closed without a response
+				let _ = stream.read_to_string(&mut response);
+				response
+			})
+		});
+		// read by one closure and written by the other
+		let answered = RefCell::new(Vec::new());
+		serve_until(
+			&server,
+			|| answered.borrow().len() == 2,
+			|request| {
+				let url = request.url().to_owned();
+				answered.borrow_mut().push(url.clone());
+				if url == "/first" {
+					anyhow::bail!("failed to answer {url}");
+				}
+				request
+					.respond(Response::from_string("served"))
+					.context("respond")
+			},
+		)
+		.unwrap();
+		assert_eq!(answered.into_inner(), ["/first", "/second"]);
+		let [_, second] = client.join().unwrap();
+		assert!(second.ends_with("served"), "{second}");
 	}
 
 	#[test]
