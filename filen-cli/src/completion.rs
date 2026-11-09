@@ -128,7 +128,15 @@ impl ValueCompleter for FilenCompleter {
 					let mut async_completions = ASYNC_COMPLETIONS.lock().await;
 					async_completions
 						.pending_completion_tasks
-						.retain(|key, _| key == &completion_key);
+						.retain(|key, handle| {
+							// dropping a JoinHandle detaches its task, so a superseded listing
+							// would keep running
+							let keep = key == &completion_key;
+							if !keep {
+								handle.abort();
+							}
+							keep
+						});
 					if let Some(handle) = async_completions
 						.pending_completion_tasks
 						.get(&completion_key)
