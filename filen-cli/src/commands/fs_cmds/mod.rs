@@ -109,8 +109,8 @@ use filen_types::{
 	traits::CowHelpers as _,
 };
 use futures::{
-	AsyncBufReadExt as _, AsyncRead, AsyncReadExt as _, SinkExt as _, TryStreamExt as _,
-	channel::mpsc, executor,
+	AsyncBufReadExt as _, AsyncRead, AsyncReadExt as _, SinkExt as _, StreamExt as _,
+	TryStreamExt as _, channel::mpsc, executor, stream,
 };
 use serde_json::json;
 use tempfile::{NamedTempFile, TempDir};
@@ -3311,20 +3311,31 @@ async fn list_with_full_paths(
 	// resolving a path walks up the tree, and `get_item_path` takes the drive lock for each
 	// walk — holding one here means those all share it instead of re-acquiring it per item
 	let _lock = client.lock_drive().await.context("Failed to lock drive")?;
-	let mut items = Vec::with_capacity(dirs.len() + files.len());
-	for dir in dirs {
-		items.push(ListedItem {
-			path: full_path(client, &NonRootItemType::Dir(Cow::Borrowed(dir))).await,
-			..ListedItem::of_dir(dir)
-		});
-	}
-	for file in files {
-		items.push(ListedItem {
-			path: full_path(client, &NonRootItemType::File(Cow::Borrowed(file))).await,
-			..ListedItem::of_file(file)
-		});
-	}
-	Ok(items)
+	let dir_items = dirs.iter().map(|dir| {
+		(
+			NonRootItemType::Dir(Cow::Borrowed(dir)),
+			ListedItem::of_dir(dir),
+		)
+	});
+	let file_items = files.iter().map(|file| {
+		(
+			NonRootItemType::File(Cow::Borrowed(file)),
+			ListedItem::of_file(file),
+		)
+	});
+	Ok(stream::iter(
+		dir_items
+			.chain(file_items)
+			.map(|(item, listed)| async move {
+				ListedItem {
+					path: full_path(client, &item).await,
+					..listed
+				}
+			}),
+	)
+	.buffered(PATH_LOOKUP_CONCURRENCY)
+	.collect()
+	.await)
 }
 
 /// The item's absolute path, without the trailing slash `get_item_path` puts on directories
@@ -3336,6 +3347,10 @@ pub(crate) async fn resolve_item_path(
 	let (path, _) = client.get_item_path(item).await?;
 	Ok(format!("/{}", path.trim_end_matches('/')))
 }
+
+/// How many item paths a listing resolves at once. Each resolution walks up the tree with its own
+/// requests, so a listing of many items waits on the server far less when several run together.
+pub(crate) const PATH_LOOKUP_CONCURRENCY: usize = 8;
 
 /// [`resolve_item_path`], or `None` if it cannot be resolved, which is logged.
 pub(crate) async fn full_path(

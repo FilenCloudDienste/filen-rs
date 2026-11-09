@@ -32,7 +32,7 @@ use crate::{
 	auth::LazyClient,
 	commands::{
 		CommandContext,
-		fs_cmds::{find_existing_item, full_path},
+		fs_cmds::{PATH_LOOKUP_CONCURRENCY, find_existing_item, full_path},
 	},
 	completion::{FilenCompleter, quote_for_command_line},
 	docs::DocElement,
@@ -286,9 +286,6 @@ const NEVER_EXPIRES: &str = "never";
 /// listed.
 const NO_EXPIRY: &str = "-";
 
-/// How many items `list-public-links` resolves (path and link status) at once.
-const LINK_STATUS_CONCURRENCY: usize = 8;
-
 /// A linked item, as `list-public-links` prints it.
 struct ListedPublicLink {
 	/// The item's absolute path, or its uuid when the path could not be resolved.
@@ -335,7 +332,7 @@ pub(crate) async fn list_public_links(ui: &mut UI, client: &mut LazyClient) -> R
 	print_public_links(ui, &links)
 }
 
-/// The links of `items`, resolved [`LINK_STATUS_CONCURRENCY`] at a time, in the order of `items`.
+/// The links of `items`, resolved [`PATH_LOOKUP_CONCURRENCY`] at a time, in the order of `items`.
 async fn listed_links<'a, I: LinkableItem + HasUUID>(
 	client: &Client,
 	items: &'a [I],
@@ -346,7 +343,7 @@ async fn listed_links<'a, I: LinkableItem + HasUUID>(
 			.iter()
 			.map(|item| listed_link(client, item, item_type(item))),
 	)
-	.buffered(LINK_STATUS_CONCURRENCY)
+	.buffered(PATH_LOOKUP_CONCURRENCY)
 	.try_collect()
 	.await
 }

@@ -50,7 +50,7 @@ use crate::{
 	commands::{
 		CommandContext,
 		contacts_cmds::find_entry,
-		fs_cmds::{find_existing_item, resolve_item_path},
+		fs_cmds::{PATH_LOOKUP_CONCURRENCY, find_existing_item, resolve_item_path},
 		transfer_cmds::{
 			DownloadPath, TransferKind, TransferProgress, download_directory, download_file,
 			finish, run_cancellable,
@@ -258,9 +258,6 @@ fn group_by_item(shares: &[OutShare]) -> Vec<SharedItem<'_>> {
 	items
 }
 
-/// How many shared items `shared-by-me` resolves the drive path of at once.
-const PATH_CONCURRENCY: usize = 8;
-
 /// A shared item with its path in this account's drive.
 struct ListedSharedItem<'a> {
 	item: SharedItem<'a>,
@@ -337,7 +334,7 @@ async fn print_shared_by_me(ui: &mut UI, client: &mut LazyClient) -> Result<()> 
 			let path = drive_path(client, &item).await;
 			ListedSharedItem { item, path }
 		}))
-		.buffered(PATH_CONCURRENCY)
+		.buffered(PATH_LOOKUP_CONCURRENCY)
 		.collect::<Vec<_>>()
 		.await
 	};
