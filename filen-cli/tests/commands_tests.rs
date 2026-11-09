@@ -1,9 +1,4 @@
-use std::{
-	path::Path,
-	process::{Child, Command, Stdio},
-	sync::Arc,
-	time::{Duration, Instant},
-};
+use std::{path::Path, process::Command, sync::Arc};
 
 use filen_macros::shared_test_runtime;
 use filen_sdk_rs::fs::{HasName, categories::NonRootFileType};
@@ -14,6 +9,7 @@ use filen_sdk_rs::{
 use filen_types::api::v3::notes::NoteType;
 use rand::TryRngCore;
 use test_utils::authenticated_cli_with_args;
+use tokio::sync::Mutex;
 
 // keep this, would need to have a way to redact uuids, timestamps and drive size from the output to make it deterministic
 #[shared_test_runtime]
@@ -356,13 +352,16 @@ async fn cmd_sync() {
 	let config_dir = assert_fs::TempDir::new().unwrap();
 	// `<local>:<remote>`, which syncs two-way
 	let pair = format!("{}:{test_dir_name}", local.path().to_str().unwrap());
-	let uploaded_path = format!("{test_dir_name}/from_local.txt");
-	let stdout = sync_until(config_dir.path(), &pair, async || {
-		let downloaded = std::fs::read_to_string(local.path().join("from_remote.txt")).ok();
-		downloaded.as_deref() == Some("from the remote side")
-			&& is_remote_file(client, &uploaded_path).await
-	})
-	.await;
+	let stdout = sync_once(config_dir.path(), &pair).await;
+	assert_eq!(
+		std::fs::read_to_string(local.path().join("from_remote.txt")).unwrap(),
+		"from the remote side",
+		"{stdout}"
+	);
+	assert!(
+		is_remote_file(client, &format!("{test_dir_name}/from_local.txt")).await,
+		"{stdout}"
+	);
 	assert!(stdout.contains("Uploaded from_local.txt"), "{stdout}");
 	assert!(stdout.contains("Downloaded from_remote.txt"), "{stdout}");
 }
@@ -382,11 +381,11 @@ async fn cmd_sync_puts_a_registered_pair_back_on_the_default_delete_guard() {
 	let pair = format!("{}:{test_dir_name}", local.path().to_str().unwrap());
 
 	std::fs::write(local.path().join("first.txt"), "first").unwrap();
-	let first_path = format!("{test_dir_name}/first.txt");
-	sync_until(config_dir.path(), &pair, async || {
-		is_remote_file(client, &first_path).await
-	})
-	.await;
+	let stdout = sync_once(config_dir.path(), &pair).await;
+	assert!(
+		is_remote_file(client, &format!("{test_dir_name}/first.txt")).await,
+		"{stdout}"
+	);
 
 	// the guard those versions stored
 	let engine = SyncEngine::open(Arc::clone(client), db_path.clone())
@@ -404,11 +403,11 @@ async fn cmd_sync_puts_a_registered_pair_back_on_the_default_delete_guard() {
 	drop(engine);
 
 	std::fs::write(local.path().join("second.txt"), "second").unwrap();
-	let second_path = format!("{test_dir_name}/second.txt");
-	sync_until(config_dir.path(), &pair, async || {
-		is_remote_file(client, &second_path).await
-	})
-	.await;
+	let stdout = sync_once(config_dir.path(), &pair).await;
+	assert!(
+		is_remote_file(client, &format!("{test_dir_name}/second.txt")).await,
+		"{stdout}"
+	);
 
 	let engine = SyncEngine::open(Arc::clone(client), db_path).await.unwrap();
 	let guards = engine
@@ -421,15 +420,17 @@ async fn cmd_sync_puts_a_registered_pair_back_on_the_default_delete_guard() {
 	assert_eq!(guards, [DeleteGuard::default()]);
 }
 
-/// Runs `sync --pair <pair>` with `config_dir` until `synced` holds, then stops it and returns its
+/// Held by every CLI sync of these tests, so that they run one at a time: each pass needs the
+/// account's drive lock, which the server hands to whichever poll reaches it first after a
+/// release, and syncs of these tests running at once would only compete for it.
+static CLI_SYNCS: Mutex<()> = Mutex::const_new(());
+
+/// Runs `sync --once --pair <pair>` with `config_dir`, checks that it exits with 0 and returns its
 /// stdout.
-async fn sync_until(
-	config_dir: &Path,
-	pair: &str,
-	mut synced: impl AsyncFnMut() -> bool,
-) -> String {
+async fn sync_once(config_dir: &Path, pair: &str) -> String {
+	let _syncs = CLI_SYNCS.lock().await;
 	let (_auth_config_dir, auth_config) = test_utils::cli::prepare_cli_auth_config().await;
-	let mut cli = Command::new(env!("CARGO_BIN_EXE_filen-cli"))
+	let output = Command::new(env!("CARGO_BIN_EXE_filen-cli"))
 		.args([
 			"--auth-config-path",
 			auth_config.to_str().unwrap(),
@@ -437,59 +438,20 @@ async fn sync_until(
 			config_dir.to_str().unwrap(),
 			"--skip-update",
 			"sync",
+			"--once",
 			"--pair",
 			pair,
 		])
-		.stdout(Stdio::piped())
-		.stderr(Stdio::piped())
-		.spawn()
+		.output()
 		.unwrap();
-
-	let deadline = Instant::now() + Duration::from_secs(300);
-	while !synced().await {
-		if Instant::now() >= deadline || cli.try_wait().unwrap().is_some() {
-			let _ = cli.kill();
-			let output = cli.wait_with_output().unwrap();
-			panic!(
-				"sync did not get there\nstdout:\n{}\nstderr:\n{}",
-				String::from_utf8_lossy(&output.stdout),
-				String::from_utf8_lossy(&output.stderr)
-			);
-		}
-		tokio::time::sleep(Duration::from_secs(2)).await;
-	}
-
-	stop_sync(cli)
-}
-
-/// Stops the CLI the way a user stops it, with SIGINT, so the engine finishes its pass and releases
-/// the drive lock instead of leaving it to expire on the shared test account, and checks that it
-/// exits cleanly.
-#[cfg(unix)]
-fn stop_sync(cli: Child) -> String {
-	let interrupted = Command::new("kill")
-		.args(["-INT", &cli.id().to_string()])
-		.status()
-		.unwrap();
-	assert!(interrupted.success());
-	let output = cli.wait_with_output().unwrap();
 	let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
 	assert!(
 		output.status.success(),
-		"the CLI did not stop cleanly:\n{stdout}"
+		"exit status: {}\nstdout:\n{stdout}\nstderr:\n{}",
+		output.status,
+		String::from_utf8_lossy(&output.stderr)
 	);
 	stdout
-}
-
-/// Terminates the CLI once it has converged: sending it a Ctrl-C from here would need the console
-/// API. The engine's drive lock is then left to its lease (about 60 seconds), which the next sync
-/// waits out, and whether the CLI exits cleanly goes unchecked on Windows. `sync --once` replaces
-/// this once the CLI has it.
-#[cfg(windows)]
-fn stop_sync(mut cli: Child) -> String {
-	cli.kill().unwrap();
-	let output = cli.wait_with_output().unwrap();
-	String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
 async fn is_remote_file(client: &Client, path: &str) -> bool {
