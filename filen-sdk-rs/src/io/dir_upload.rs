@@ -26,7 +26,9 @@ use crate::{
 		FilenMetaExt, TransferFilter,
 		abort_on_drop::AbortOnDropHandle,
 		fs_tree::{DirChildrenInfo, Entry},
+		upload_resume::UploadJournalStore,
 	},
+	util::MaybeSendCallback,
 };
 
 /// Callback trait for folder upload operations
@@ -60,6 +62,12 @@ pub trait DirUploadCallback: Send + Sync {
 	fn on_upload_skipped(&self, skipped_files: Vec<PathBuf>, skipped_bytes: u64) {
 		let _ = (skipped_files, skipped_bytes);
 	}
+	/// Called periodically, before the update that counts the files' uploaded bytes, with how many
+	/// bytes of the files being uploaded earlier uploads had sent that a
+	/// [`journal`](DirUploadOptions::journal) lets this one leave out: those of the chunks the
+	/// server acknowledged. [`on_upload_update`](Self::on_upload_update) does not count them. Does
+	/// nothing by default.
+	fn on_upload_resumed(&self, _resumed_bytes: u64) {}
 }
 
 /// What a directory upload does with the symlinks inside the directory. The directory itself is
@@ -141,6 +149,11 @@ pub struct DirUploadOptions {
 	pub existing: ExistingRemoteFile,
 	/// Which items inside the directory to upload.
 	pub filter: TransferFilter,
+	/// Where to keep the journals of the files' uploads. With a store, each file is uploaded with
+	/// [`Client::upload_file_from_path_resuming`] and continues where an earlier upload of it
+	/// into the same directory left it; without one, every file is uploaded from its start and
+	/// nothing is kept.
+	pub journal: Option<Arc<dyn UploadJournalStore>>,
 }
 
 /// The files of a remote directory a [`ExistingRemoteFile`] other than `Replace` looks at, by
@@ -166,6 +179,7 @@ impl Client {
 		>,
 		target_folder: &RemoteDirectory,
 		existing: ExistingRemoteFile,
+		journal: Option<Arc<dyn UploadJournalStore>>,
 	) -> Result<(), Error>
 	where
 		C: DirUploadCallback + ?Sized,
@@ -186,7 +200,7 @@ impl Client {
 			tokio::sync::mpsc::channel::<EntryToUploadInfo>(64);
 
 		let mut pending = PendingCallbacks::default();
-		let uploaded_bytes = Arc::new(AtomicU64::new(0));
+		let bytes = Arc::new(ByteCounters::default());
 
 		let mut update_interval = tokio::time::interval(CALLBACK_INTERVAL);
 		update_interval.reset();
@@ -213,15 +227,16 @@ impl Client {
 			dir_upload_result_sender,
 			file_upload_result_sender,
 			entry_to_upload_receiver,
-			uploaded_bytes.clone(),
+			Arc::clone(&bytes),
 			existing,
+			journal,
 		));
 
 		loop {
 			tokio::select! {
 				biased;
 				_ = update_interval.tick() => {
-					pending.send(&uploaded_bytes, &callback);
+					pending.send(&bytes, &callback);
 					drain_unsent_entries(&entry_to_upload_sender, &mut unsent_children, &mut in_flight)?;
 					if in_flight == 0 && unsent_children.is_empty() {
 						break;
@@ -291,7 +306,7 @@ impl Client {
 		}
 		std::mem::drop(entry_to_upload_sender);
 		task.join().await.expect("upload task manager panicked");
-		pending.send(&uploaded_bytes, &callback);
+		pending.send(&bytes, &callback);
 		Ok(())
 	}
 
@@ -300,8 +315,9 @@ impl Client {
 		dir_upload_sender: tokio::sync::mpsc::Sender<DirUploadResult>,
 		file_upload_sender: tokio::sync::mpsc::Sender<FileUploadResult>,
 		mut entry_to_upload_receiver: tokio::sync::mpsc::Receiver<EntryToUploadInfo>,
-		bytes_progress_counter: Arc<AtomicU64>,
+		bytes: Arc<ByteCounters>,
 		existing: ExistingRemoteFile,
+		journal: Option<Arc<dyn UploadJournalStore>>,
 	) -> tokio::task::JoinHandle<()> {
 		let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_SMALL_PARALLEL_REQUESTS));
 		tokio::task::spawn(async move {
@@ -319,14 +335,16 @@ impl Client {
 					match entry_info.entry {
 						EntryToUpload::File(path, remote) => {
 							let file_sender = file_upload_sender.clone();
-							let bytes_counter = bytes_progress_counter.clone();
+							let bytes = Arc::clone(&bytes);
+							let journal = journal.clone();
 							join_set.spawn(async move {
 								let result = client
 									.upload_child_file_unless_kept(
 										&path,
 										&entry_info.parent,
 										remote.as_deref().map(|remote| (remote, existing)),
-										bytes_counter,
+										journal.as_deref(),
+										bytes,
 									)
 									.await;
 								let _ = file_sender.send(FileUploadResult(result, path)).await;
@@ -360,13 +378,15 @@ impl Client {
 	}
 
 	/// Uploads the local file at `path` into `parent`, unless `existing` names the remote file of
-	/// the same name there and the policy that keeps it.
+	/// the same name there and the policy that keeps it. With a `journal`, the upload continues an
+	/// earlier one the journal holds.
 	async fn upload_child_file_unless_kept(
 		&self,
 		path: &Path,
 		parent: &Uuid,
 		existing: Option<(&RemoteFile, ExistingRemoteFile)>,
-		uploaded_bytes: Arc<AtomicU64>,
+		journal: Option<&dyn UploadJournalStore>,
+		bytes: Arc<ByteCounters>,
 	) -> Result<FileUploaded, Error> {
 		if let Some((remote, policy)) = existing {
 			let metadata = tokio::fs::metadata(path).await.map_err(|e| {
@@ -382,14 +402,29 @@ impl Client {
 				});
 			}
 		}
-		self.upload_file_from_path_with_builder(
-			FileBuilderOptionalName::new(*parent),
-			path.to_owned(),
-			Some(Arc::new(|bytes_downloaded| {
-				uploaded_bytes.fetch_add(bytes_downloaded, Ordering::Relaxed);
-			})),
-		)
-		.await
+		let builder = FileBuilderOptionalName::new(*parent);
+		let uploaded: MaybeSendCallback<'_, u64> = Arc::new(|sent| {
+			bytes.uploaded.fetch_add(sent, Ordering::Relaxed);
+		});
+		match journal {
+			Some(journal) => {
+				let resumed: MaybeSendCallback<'_, u64> = Arc::new(|resumed| {
+					bytes.resumed.fetch_add(resumed, Ordering::Relaxed);
+				});
+				self.upload_file_from_path_resuming(
+					builder,
+					path.to_owned(),
+					journal,
+					Some(uploaded),
+					Some(resumed),
+				)
+				.await
+			}
+			None => {
+				self.upload_file_from_path_with_builder(builder, path.to_owned(), Some(uploaded))
+					.await
+			}
+		}
 		.context("uploading file from path")
 		.map(|(file, _)| FileUploaded::Uploaded(Box::new(file)))
 	}
@@ -497,6 +532,14 @@ fn drain_unsent_entries(
 	Ok(())
 }
 
+/// The bytes the upload's files sent, and left out because earlier uploads had sent them, since
+/// the last callback.
+#[derive(Default)]
+struct ByteCounters {
+	uploaded: AtomicU64,
+	resumed: AtomicU64,
+}
+
 /// What the upload has to report at the next callback.
 #[derive(Default)]
 struct PendingCallbacks {
@@ -508,12 +551,16 @@ struct PendingCallbacks {
 }
 
 impl PendingCallbacks {
-	fn send<C>(&mut self, uploaded_bytes: &Arc<AtomicU64>, callback: &impl Deref<Target = C>)
+	fn send<C>(&mut self, counters: &ByteCounters, callback: &impl Deref<Target = C>)
 	where
 		C: DirUploadCallback + ?Sized,
 	{
 		let callback = callback.deref();
-		let bytes = uploaded_bytes.swap(0, Ordering::Relaxed);
+		let resumed = counters.resumed.swap(0, Ordering::Relaxed);
+		if resumed > 0 {
+			callback.on_upload_resumed(resumed);
+		}
+		let bytes = counters.uploaded.swap(0, Ordering::Relaxed);
 		if !self.dirs.is_empty() || !self.files.is_empty() || bytes > 0 {
 			callback.on_upload_update(
 				std::mem::take(&mut self.dirs),
@@ -561,9 +608,62 @@ enum EntryToUpload {
 
 #[cfg(test)]
 mod tests {
+	use std::{
+		path::PathBuf,
+		sync::{Mutex, atomic::Ordering},
+	};
+
 	use chrono::{DateTime, Duration, Utc};
 
-	use super::{ExistingRemoteFile, FileStamp, name_key};
+	use super::{
+		ByteCounters, DirUploadCallback, ExistingRemoteFile, FileStamp, PendingCallbacks, name_key,
+	};
+	use crate::{
+		Error,
+		fs::{dir::RemoteDirectory, file::RemoteFile},
+	};
+
+	/// What a [`PendingCallbacks::send`] reported, in order.
+	#[derive(Debug, PartialEq, Eq)]
+	enum Reported {
+		Resumed(u64),
+		Uploaded(u64),
+	}
+
+	#[derive(Default)]
+	struct RecordingCallback(Mutex<Vec<Reported>>);
+
+	impl DirUploadCallback for RecordingCallback {
+		fn on_scan_progress(&self, _: u64, _: u64, _: u64) {}
+		fn on_scan_errors(&self, _: Vec<Error>) {}
+		fn on_scan_complete(&self, _: u64, _: u64, _: u64) {}
+		fn on_upload_update(&self, _: Vec<RemoteDirectory>, _: Vec<RemoteFile>, bytes: u64) {
+			self.0.lock().unwrap().push(Reported::Uploaded(bytes));
+		}
+		fn on_upload_errors(&self, _: Vec<(PathBuf, Error)>) {}
+		fn on_upload_resumed(&self, resumed_bytes: u64) {
+			self.0
+				.lock()
+				.unwrap()
+				.push(Reported::Resumed(resumed_bytes));
+		}
+	}
+
+	#[test]
+	fn resumed_bytes_are_reported_before_the_uploaded_ones_and_only_once() {
+		let callback = RecordingCallback::default();
+		let counters = ByteCounters::default();
+		counters.resumed.fetch_add(3, Ordering::Relaxed);
+		counters.resumed.fetch_add(4, Ordering::Relaxed);
+		counters.uploaded.fetch_add(10, Ordering::Relaxed);
+		let mut pending = PendingCallbacks::default();
+		pending.send(&counters, &&callback);
+		pending.send(&counters, &&callback);
+		assert_eq!(
+			*callback.0.lock().unwrap(),
+			[Reported::Resumed(7), Reported::Uploaded(10)]
+		);
+	}
 
 	fn stamp(size: u64, modified: DateTime<Utc>) -> FileStamp {
 		FileStamp { size, modified }

@@ -281,6 +281,7 @@ impl TransferCommands {
 					},
 					existing: existing_remote_policy(skip_existing, update),
 					filter: filter.transfer_filter()?,
+					journal: None,
 				};
 				let (sources, destination) = sources_and_destination(source, paths);
 				let sources = expand_source_wildcards(ui, sources)?;
