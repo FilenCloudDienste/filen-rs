@@ -168,6 +168,17 @@ async fn cancelling_an_unknown_subscription_answers_sub_not_found() {
 	assert_eq!(err.server_code().as_deref(), Some("sub_not_found"), "{err}");
 }
 
+#[shared_test_runtime]
+async fn generating_an_unknown_invoice_answers_invoice_not_found() {
+	let client = test_utils::RESOURCES.client().await;
+	let err = client.generate_invoice(unknown_uuid()).await.unwrap_err();
+	assert_eq!(
+		err.server_code().as_deref(),
+		Some("invoice_not_found"),
+		"{err}"
+	);
+}
+
 /// With versioning enabled, uploading a file with the same name + parent should
 /// retain the previous version (not replace it). With versioning disabled, the
 /// previous upload should not produce a version entry.

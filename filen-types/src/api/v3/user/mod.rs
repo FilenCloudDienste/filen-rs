@@ -9,6 +9,7 @@ pub mod event;
 pub mod events;
 pub mod gdpr;
 pub mod info;
+pub mod invoice;
 pub mod key_pair;
 pub mod lock;
 pub mod login_alerts;

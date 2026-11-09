@@ -241,6 +241,19 @@ impl Client {
 		.await
 	}
 
+	/// Generates the PDF of the invoice `invoice_uuid` (`UserAccountSubsInvoices::id`, not
+	/// the subscription's id) and returns its bytes.
+	///
+	/// Server codes: `invoice_not_found`, `invalid_params`.
+	pub async fn generate_invoice(&self, invoice_uuid: Uuid) -> Result<Vec<u8>, Error> {
+		api::v3::user::invoice::post(
+			self.client(),
+			&api::v3::user::invoice::Request { uuid: invoice_uuid },
+		)
+		.await
+		.map(Base64EncodedBytes::into_bytes)
+	}
+
 	pub async fn get_user_events(
 		&self,
 		filter: Option<&str>,
@@ -599,6 +612,20 @@ mod js_impl {
 		pub async fn cancel_subscription(&self, uuid: UuidStr) -> Result<(), Error> {
 			let this = self.inner();
 			do_on_commander(move || async move { this.cancel_subscription(uuid.into()).await })
+				.await
+		}
+
+		/// Generates the PDF of the invoice `invoiceUuid` (`UserAccountSubsInvoices.id`, not
+		/// the subscription's id) and resolves with its bytes.
+		///
+		/// Server codes: `invoice_not_found`, `invalid_params`.
+		#[cfg_attr(
+			all(target_family = "wasm", target_os = "unknown"),
+			wasm_bindgen::prelude::wasm_bindgen(js_name = "generateInvoice")
+		)]
+		pub async fn generate_invoice(&self, invoice_uuid: UuidStr) -> Result<Vec<u8>, Error> {
+			let this = self.inner();
+			do_on_commander(move || async move { this.generate_invoice(invoice_uuid.into()).await })
 				.await
 		}
 

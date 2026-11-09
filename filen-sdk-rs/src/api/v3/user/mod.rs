@@ -9,6 +9,7 @@ pub(crate) mod event;
 pub(crate) mod events;
 pub(crate) mod gdpr;
 pub(crate) mod info;
+pub(crate) mod invoice;
 pub(crate) mod key_pair;
 pub(crate) mod lock;
 pub(crate) mod login_alerts;

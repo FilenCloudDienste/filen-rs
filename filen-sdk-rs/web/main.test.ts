@@ -338,6 +338,7 @@ test("billing calls on an id the account does not hold reject with the server's 
 		expect.fail("Expected the call to reject")
 	}
 	expect(await serverCode(state.cancelSubscription(unknown))).toBe("sub_not_found")
+	expect(await serverCode(state.generateInvoice(unknown))).toBe("invoice_not_found")
 })
 
 test("serialization", async () => {
