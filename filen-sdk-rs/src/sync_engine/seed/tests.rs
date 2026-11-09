@@ -461,6 +461,52 @@ fn a_file_whose_lineage_a_row_records_elsewhere_is_not_seeded() {
 	assert_eq!(store.entries(pair).unwrap(), [old]);
 }
 
+/// Two rowless files in one chunk, distinct remote versions of one lineage: the first is seeded and
+/// the second, which the first's row now records, is not — by a writing seeding and a preview alike.
+#[test]
+fn a_lineage_two_candidates_share_is_seeded_once() {
+	let lineage = Some(StableUuid::new_for_test(Uuid::from_u128(77)));
+	let remote = [
+		RemoteNode {
+			stable_uuid: lineage,
+			..hashless("a.bin", 1, 5, STAMP)
+		},
+		RemoteNode {
+			stable_uuid: lineage,
+			..hashless("b.bin", 2, 5, STAMP)
+		},
+	];
+	let local = [local("a.bin", 5, STAMP), local("b.bin", 5, STAMP)];
+	let expected = [seeded_row("a.bin", &local[0], &remote[0])];
+
+	let (written_store, written_pair) = store();
+	let written = seed_all(&written_store, written_pair, &local, &remote, |_| false);
+	assert_eq!(written.size_and_mtime, 1);
+	assert_eq!(written_store.entries(written_pair).unwrap(), expected);
+
+	let (store, pair) = store();
+	let preview = Preview::new(&store);
+	let baseline = store.baseline(pair).unwrap();
+	let locals: HashMap<String, LocalNode> = local
+		.iter()
+		.map(|node| (node.rel_path.clone(), node.clone()))
+		.collect();
+	let counts = seed(
+		&preview,
+		pair,
+		&baseline,
+		&locals,
+		remote
+			.iter()
+			.map(|node| (Cow::from(node.rel_path.as_str()), Cow::Borrowed(node))),
+		|_| false,
+	)
+	.unwrap();
+	assert_eq!(counts, written);
+	assert_eq!(preview.into_rows(), expected);
+	assert_eq!(store.entries(pair).unwrap(), []);
+}
+
 #[test]
 fn more_rows_than_a_chunk_are_all_written() {
 	let (store, pair) = store();

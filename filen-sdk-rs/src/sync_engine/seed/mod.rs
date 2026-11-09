@@ -42,14 +42,20 @@
 //! A file whose remote item another row already records — by its version or its whole-life id —
 //! is never seeded: that is the same file renamed on both sides, which the move detection carries
 //! as a move, and a second `Synced` row for one remote item is the one shape it and the
-//! directory-move fold must never read (see `plan::visit_move_sources`).
+//! directory-move fold must never read (see `plan::visit_move_sources`). The same holds between
+//! the files one seeding weighs: of two that share a remote version or lineage, only the first
+//! the remote view lists is seeded, wherever the chunks fall.
 //!
 //! Only a real pass writes what it seeds into the store. A dry run weighs the same evidence through
 //! the same [`seed`], over the same paths, and reads each row it would write into its own view of
 //! the rows instead ([`Seeding::Preview`]), so it plans what the pass after it would. The adoption
 //! read of a mode switch and the benchmark weigh nothing ([`Seeding::Skip`]).
 
-use std::{borrow::Cow, cell::RefCell, collections::HashMap};
+use std::{
+	borrow::Cow,
+	cell::RefCell,
+	collections::{HashMap, HashSet},
+};
 
 use filen_types::fs::StableUuid;
 use num_traits::ToPrimitive;
@@ -271,9 +277,8 @@ impl SeedStore for BaselineStore {
 ///
 /// Each chunk's rows are asked about against the store as the pass found it and against the rows
 /// kept from the chunks before it, as a real pass reads them against the store with those chunks
-/// written in. The remote view places each remote uuid at one path, but not each lineage: a remote
-/// file a later chunk holds under a lineage an earlier chunk's row records is dropped by the pass,
-/// and so here.
+/// written in. Two rows of one seeding that record the same remote item never both reach a store:
+/// [`seed`] keeps the first itself, whether or not a chunk boundary falls between them.
 pub(super) struct Preview<'a> {
 	store: &'a BaselineStore,
 	kept: RefCell<Kept>,
@@ -364,9 +369,10 @@ impl SeedStore for Preview<'_> {
 /// there, when `local` holds nothing there, or when the two nodes are no [`candidate`]. A row the
 /// evidence holds for is dropped when the store already records its remote uuid or lineage at
 /// another path (see the module docs); that is asked once a chunk, of the rows about to be
-/// written, so a pass seeding nothing asks nothing. The rows are written through the store's own
-/// statement, so nothing a pass's snapshot holds is overwritten: every path written is one that
-/// snapshot has no row at, and the pass holds the pair's gate.
+/// written, so a pass seeding nothing asks nothing. It is dropped too when a row this call kept
+/// before it records either, in its chunk or an earlier one. The rows are written through the
+/// store's own statement, so nothing a pass's snapshot holds is overwritten: every path written is
+/// one that snapshot has no row at, and the pass holds the pair's gate.
 pub(super) fn seed<'a>(
 	store: &impl SeedStore,
 	pair: PairId,
@@ -377,6 +383,7 @@ pub(super) fn seed<'a>(
 ) -> rusqlite::Result<SeedCounts> {
 	let mut counts = SeedCounts::default();
 	let mut rows: Vec<(BaselineEntry, Evidence)> = Vec::new();
+	let mut accepted = Accepted::default();
 	let any_imported = store.has_legacy_synced(pair)?;
 	for (path, remote) in candidates {
 		if skip(&path) || baseline.contains_key(&path) {
@@ -398,21 +405,50 @@ pub(super) fn seed<'a>(
 		};
 		rows.push((seeded_row(&path, &local, &remote), evidence));
 		if rows.len() == SEED_CHUNK {
-			write_unclaimed(store, pair, &mut rows, &mut counts)?;
+			write_unclaimed(store, pair, &mut rows, &mut accepted, &mut counts)?;
 		}
 	}
 	if !rows.is_empty() {
-		write_unclaimed(store, pair, &mut rows, &mut counts)?;
+		write_unclaimed(store, pair, &mut rows, &mut accepted, &mut counts)?;
 	}
 	Ok(counts)
 }
 
-/// Write the `rows` no row in the store already records the remote item of, by uuid or by lineage,
-/// counting each by its evidence, and empty `rows`.
+/// The remote items, by uuid and by lineage, that the rows one [`seed`] has kept record, so that
+/// two files sharing one are seeded once, in one chunk or across two.
+#[derive(Default)]
+struct Accepted {
+	uuids: HashSet<Uuid>,
+	lineages: HashSet<StableUuid>,
+}
+
+impl Accepted {
+	/// Whether a row kept before records `row`'s remote uuid or lineage. If none does, `row`'s are
+	/// taken, so that a later row recording either is.
+	fn claimed(&mut self, row: &BaselineEntry) -> bool {
+		if row
+			.remote_uuid
+			.is_some_and(|uuid| self.uuids.contains(&uuid))
+			|| row
+				.remote_stable_uuid
+				.is_some_and(|lineage| self.lineages.contains(&lineage))
+		{
+			return true;
+		}
+		self.uuids.extend(row.remote_uuid);
+		self.lineages.extend(row.remote_stable_uuid);
+		false
+	}
+}
+
+/// Write the `rows` no row in the store, and no row kept before in this seeding (`accepted`),
+/// records the remote item of, by uuid or by lineage, counting each by its evidence, and empty
+/// `rows`. The store wins over `accepted`, and the first of two rows in `accepted`.
 fn write_unclaimed(
 	store: &impl SeedStore,
 	pair: PairId,
 	rows: &mut Vec<(BaselineEntry, Evidence)>,
+	accepted: &mut Accepted,
 	counts: &mut SeedCounts,
 ) -> rusqlite::Result<()> {
 	let uuids: Vec<Uuid> = rows.iter().filter_map(|(row, _)| row.remote_uuid).collect();
@@ -435,6 +471,14 @@ fn write_unclaimed(
 				tracing::debug!(
 					"seed[pair {pair}]: not recording {:?} as synced: {recorded_at:?} records its \
 					 remote item",
+					row.rel_path
+				);
+				return None;
+			}
+			if accepted.claimed(&row) {
+				tracing::debug!(
+					"seed[pair {pair}]: not recording {:?} as synced: a path seeded before it records \
+					 its remote item",
 					row.rel_path
 				);
 				return None;
