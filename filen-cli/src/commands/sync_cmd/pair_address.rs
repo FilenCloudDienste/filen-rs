@@ -24,8 +24,8 @@ enum PairAddress<'a> {
 
 impl<'a> PairAddress<'a> {
 	/// How `given` names a pair: a number is an id; a word that is not the name of a file or
-	/// directory in the working directory is an alias, as `sync` takes it; anything else is the
-	/// local directory.
+	/// directory in the working directory is an alias; anything else is the local directory,
+	/// which `find_pair` still reads as an alias when it is a word that no pair syncs.
 	fn of(given: &'a str) -> Self {
 		if let Ok(id) = given.parse() {
 			return Self::Id(id);
@@ -41,9 +41,10 @@ impl<'a> PairAddress<'a> {
 
 /// The pair of `registered` that `given` names: by its id, by its alias in the default sync pairs
 /// file in `dirs`, or by its local directory, which is compared once the operating system has
-/// resolved it, as the sync engine stored it.
+/// resolved it, as the sync engine stored it. A word that names an entry of the working directory
+/// is tried as that local directory first, then as an alias.
 pub(super) fn find_pair(
-	registered: Vec<PairRecord>,
+	mut registered: Vec<PairRecord>,
 	given: &str,
 	dirs: &SyncDirs<'_>,
 ) -> Result<PairRecord> {
@@ -54,30 +55,47 @@ pub(super) fn find_pair(
 			.ok_or_else(|| UI::failure(&format!("No sync pair has the id {id}. {LIST_HINT}"))),
 		PairAddress::Alias(alias) => {
 			let local = sync_pairs::aliased_local(dirs, alias)?;
-			pair_at(registered, &local).ok_or_else(|| {
+			pair_at(&registered, &local)
+				.map(|index| registered.swap_remove(index))
+				.ok_or_else(|| {
+					UI::failure(&format!(
+						"The sync pair {alias} ({}) is not registered: `filen sync {alias}` registers it.",
+						local.display()
+					))
+				})
+		}
+		PairAddress::Local(local) => pair_at(&registered, local)
+			.or_else(|| {
+				// a word that is also the name of an entry here may still be meant as an alias;
+				// when it names no registered pair either, the error is about the directory, which
+				// is how the word was read first
+				let aliased = sync_pairs::is_alias(given)
+					.then(|| {
+						sync_pairs::aliased_local(dirs, given)
+							.inspect_err(|e| log::debug!("{given} is not a sync pair alias: {e:#}"))
+							.ok()
+					})
+					.flatten()?;
+				pair_at(&registered, &aliased)
+			})
+			.map(|index| registered.swap_remove(index))
+			.ok_or_else(|| {
 				UI::failure(&format!(
-					"The sync pair {alias} ({}) is not registered: `filen sync {alias}` registers it.",
+					"No sync pair syncs the local directory {}. {LIST_HINT}",
 					local.display()
 				))
-			})
-		}
-		PairAddress::Local(local) => pair_at(registered, local).ok_or_else(|| {
-			UI::failure(&format!(
-				"No sync pair syncs the local directory {}. {LIST_HINT}",
-				local.display()
-			))
-		}),
+			}),
 	}
 }
 
 const LIST_HINT: &str = "`filen list-sync-pairs` lists the sync pairs.";
 
-/// The pair of `registered` whose local root is the directory `local`.
-fn pair_at(registered: Vec<PairRecord>, local: &Path) -> Option<PairRecord> {
+/// The index in `registered` of the pair whose local root is the directory `local`.
+fn pair_at(registered: &[PairRecord], local: &Path) -> Option<usize> {
 	let local = resolved(local);
 	registered
-		.into_iter()
-		.find(|pair| resolved(Path::new(&pair.local_root)) == local)
+		.iter()
+		.position(|pair| resolved(Path::new(&pair.local_root)) == local)
 }
 
 /// `path` as the operating system resolves it, or, when it cannot (it no longer exists), made
@@ -123,7 +141,7 @@ mod tests {
 		);
 	}
 
-	/// A word that names an entry of the working directory is that path, as `sync` reads it.
+	/// A word that names an entry of the working directory is read as that path first.
 	#[test]
 	fn a_word_that_names_an_existing_entry_is_a_path() {
 		// the crate's directory, which `cargo test` runs in
@@ -211,6 +229,44 @@ mod tests {
 		);
 
 		assert_eq!(found.unwrap().id, 2);
+	}
+
+	/// A word that names a directory no pair syncs is looked up as an alias next.
+	#[test]
+	fn a_word_that_names_a_directory_no_pair_syncs_is_found_by_its_alias() {
+		let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+		let config = tempfile::tempdir().unwrap();
+		std::fs::write(
+			config.path().join("syncPairs.yaml"),
+			format!(
+				"syncPairs:\n  - local: {}\n    remote: /b\n    alias: src\n",
+				b.path().display()
+			),
+		)
+		.unwrap();
+		let dirs = SyncDirs::new(config.path(), false, None);
+
+		// `src` is the crate's directory, which `cargo test` runs in, and no pair syncs it
+		let found = find_pair(vec![record(1, a.path()), record(2, b.path())], "src", &dirs);
+
+		assert_eq!(found.unwrap().id, 2);
+	}
+
+	/// A word that names a directory no pair syncs, and no aliased pair either, is reported as
+	/// that directory.
+	#[test]
+	fn a_word_that_names_neither_a_paired_directory_nor_an_alias_names_the_directory() {
+		let a = tempfile::tempdir().unwrap();
+		let config = tempfile::tempdir().unwrap();
+		let dirs = SyncDirs::new(config.path(), false, None);
+
+		let error = find_pair(vec![record(1, a.path())], "src", &dirs).unwrap_err();
+
+		assert_eq!(
+			error.to_string(),
+			"No sync pair syncs the local directory src. `filen list-sync-pairs` lists the sync \
+			 pairs."
+		);
 	}
 
 	#[test]
