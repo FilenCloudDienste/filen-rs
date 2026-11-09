@@ -1017,6 +1017,24 @@ mod tests {
 		});
 		assert!(auth_info.convert_into_exportable(1).is_err());
 	}
+
+	#[test]
+	fn two_factor_codes_match_the_rfc_6238_sha1_vectors() {
+		// `12345678901234567890`, the SHA-1 seed of the RFC 6238 test vectors, in base32
+		let secret = TwoFASecret::new(
+			"GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ".to_string(),
+			"user@example.com",
+		);
+		// the last six digits of the RFC 6238 test vectors
+		for (timestamp, code) in [
+			(59, "287082"),
+			(1111111109, "081804"),
+			(1234567890, "005924"),
+		] {
+			let time = DateTime::from_timestamp(timestamp, 0).expect("a timestamp in range");
+			assert_eq!(secret.make_totp_code(time).unwrap(), code);
+		}
+	}
 }
 
 // Also compiled for the sync engine's benchmark harness (`sync_engine::bench`), which opens real

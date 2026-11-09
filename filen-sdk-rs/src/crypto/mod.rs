@@ -10,3 +10,5 @@ pub mod v3;
 
 #[cfg(test)]
 mod edge_case_tests;
+#[cfg(test)]
+mod known_answer_tests;
