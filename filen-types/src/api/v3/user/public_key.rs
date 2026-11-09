@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 
-use rsa::RsaPublicKey;
+use rsa::PublicKey;
 use serde::{Deserialize, Serialize};
 
 pub const ENDPOINT: &str = "v3/user/publicKey";
@@ -13,5 +13,5 @@ pub struct Request<'a> {
 #[serde(rename_all = "camelCase")]
 pub struct Response {
 	#[serde(with = "crate::serde::rsa::public_key_der")]
-	pub public_key: RsaPublicKey,
+	pub public_key: PublicKey,
 }

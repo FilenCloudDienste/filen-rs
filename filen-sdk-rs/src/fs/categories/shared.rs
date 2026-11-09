@@ -9,7 +9,7 @@ use filen_types::{
 };
 #[cfg(feature = "multi-threaded-crypto")]
 use rayon::iter::ParallelIterator;
-use rsa::RsaPrivateKey;
+use rsa::PrivateKey;
 
 use crate::{
 	Error, api,
@@ -287,7 +287,7 @@ fn blocking_remote_file_from_shared_out(
 
 fn blocking_remote_file_from_shared_in(
 	shared_file: SharedFileIn<'_>,
-	private_key: &RsaPrivateKey,
+	private_key: &PrivateKey,
 ) -> Result<AnonymousRemoteFile, Error> {
 	let meta = FileMeta::blocking_from_rsa_encrypted(
 		shared_file.metadata,

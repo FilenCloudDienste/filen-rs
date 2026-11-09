@@ -13,7 +13,7 @@ use filen_types::{
 	fs::Uuid,
 	traits::CowHelpers,
 };
-use rsa::RsaPrivateKey;
+use rsa::PrivateKey;
 
 use crate::{
 	crypto::shared::MetaCrypter,
@@ -181,7 +181,7 @@ impl SharedRootDirectory {
 
 	pub fn blocking_from_shared_in(
 		shared_dir: SharedRootDirIn<'_>,
-		private_key: &RsaPrivateKey,
+		private_key: &PrivateKey,
 	) -> Result<Self, Error> {
 		let sharing_role = SharingRole::Sharer(ShareInfo {
 			email: shared_dir.sharer_email.into_owned(),
@@ -365,7 +365,7 @@ impl File for SharedRootFile {}
 impl SharedRootFile {
 	pub(crate) fn blocking_from_shared_in(
 		shared_file: SharedRootFileIn<'_>,
-		private_key: &RsaPrivateKey,
+		private_key: &PrivateKey,
 	) -> Result<Self, Error> {
 		let meta = FileMeta::blocking_from_rsa_encrypted(
 			shared_file.metadata,

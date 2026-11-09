@@ -2,7 +2,7 @@ use std::{borrow::Cow, ops::Deref, sync::Arc, time::Duration};
 
 use filen_types::api::v3::socket::{HandShake, PacketType};
 use futures::{StreamExt, stream::FuturesOrdered};
-use rsa::RsaPrivateKey;
+use rsa::PrivateKey;
 use yoke::Yoke;
 
 use crate::{
@@ -368,7 +368,7 @@ struct SetupFailure {
 fn spawn_websocket_thread(
 	client: Arc<AuthClient>,
 	crypter: Arc<impl MetaCrypter + 'static>,
-	private_key: Arc<RsaPrivateKey>,
+	private_key: Arc<PrivateKey>,
 	user_id: u64,
 ) -> (tokio::sync::mpsc::Sender<SocketRequest>, WorkerStart) {
 	let (request_sender, request_receiver) = tokio::sync::mpsc::channel::<SocketRequest>(16);
@@ -413,7 +413,7 @@ async fn handle_initialized_websocket<W, S, R, RV, US, UR, T, UW, PT>(
 	request_receiver: &mut tokio::sync::mpsc::Receiver<SocketRequest>,
 	listeners: &mut ConnectedListenerManager,
 	crypter: &impl MetaCrypter,
-	private_key: &RsaPrivateKey,
+	private_key: &PrivateKey,
 ) -> bool
 where
 	W: Socket<T, UW, S, R, RV, US, UR, PT>,
@@ -655,7 +655,7 @@ async fn run_async_websocket_task<W, S, R, RV, US, UR, T, UW, PT>(
 	mut config: WebSocketConfig,
 	mut request_receiver: tokio::sync::mpsc::Receiver<SocketRequest>,
 	crypter: Arc<impl MetaCrypter + 'static>,
-	private_key: Arc<RsaPrivateKey>,
+	private_key: Arc<PrivateKey>,
 ) where
 	W: Socket<T, UW, S, R, RV, US, UR, PT>,
 	S: Sender,

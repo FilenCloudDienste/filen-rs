@@ -12,7 +12,7 @@ use filen_types::{
 };
 #[cfg(feature = "multi-threaded-crypto")]
 use rayon::iter::ParallelIterator;
-use rsa::{RsaPrivateKey, RsaPublicKey};
+use rsa::{PrivateKey, PublicKey};
 
 use crate::{
 	Error, ErrorKind, api,
@@ -384,7 +384,7 @@ pub(crate) mod crypto {
 /// being permanently unreadable (title/content lost forever).
 fn blocking_decrypt_note_key_for_user(
 	user_id: u64,
-	private_key: &RsaPrivateKey,
+	private_key: &PrivateKey,
 	crypter: &impl MetaCrypter,
 	note: &filen_types::api::v3::notes::Note<'_>,
 ) -> Result<NoteOrChatKey, Error> {
@@ -495,7 +495,7 @@ impl Client {
 		note: &mut Note,
 		contact_uuid: ContactUuid,
 		write: bool,
-		public_key: &RsaPublicKey,
+		public_key: &PublicKey,
 		note_participant_parts: NoteParticipantParts,
 	) -> Result<(), Error> {
 		let data = do_cpu_intensive(|| {
@@ -1650,7 +1650,7 @@ mod tests {
 	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 	#[tokio::test(start_paused = true)]
 	async fn add_note_participant_takes_the_lock_first() {
-		let public_key = RsaPrivateKey::new(&mut old_rng::thread_rng(), 512)
+		let public_key = PrivateKey::new(&mut rand::rng(), 1024)
 			.expect("a test key")
 			.to_public_key();
 		let contact = Contact {

@@ -8,7 +8,7 @@ use filen_types::{
 	traits::CowHelpers,
 };
 use rkyv::with::{AsOwned, Map};
-use rsa::RsaPrivateKey;
+use rsa::PrivateKey;
 use serde::{
 	Deserialize, Serialize,
 	de::{DeserializeSeed, IntoDeserializer},
@@ -136,7 +136,7 @@ impl<'a> FileMeta<'a> {
 
 	pub fn blocking_from_rsa_encrypted(
 		meta: RSAEncryptedString<'a>,
-		private_key: &RsaPrivateKey,
+		private_key: &PrivateKey,
 		file_encryption_version: FileEncryptionVersion,
 	) -> Self {
 		let Ok(decrypted) = crypto::rsa::blocking_decrypt_with_private_key(private_key, &meta)

@@ -8,7 +8,7 @@ use filen_types::{
 	crypto::{EncryptedString, rsa::EncryptedPrivateKey},
 	serde::str::SizedHexString,
 };
-use rsa::RsaPublicKey;
+use rsa::PublicKey;
 use typenum::U32;
 
 use crate::{
@@ -54,7 +54,7 @@ pub(super) async fn login(
 		AuthClient,
 		super::AuthInfo,
 		Option<EncryptedPrivateKey<'static>>,
-		Option<RsaPublicKey>,
+		Option<PublicKey>,
 	),
 	Error,
 > {

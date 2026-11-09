@@ -12,13 +12,11 @@ use filen_types::{
 use hkdf::Hkdf;
 use hmac::{Hmac, KeyInit, Mac};
 use rsa::{
-	Oaep, RsaPrivateKey, RsaPublicKey,
+	Oaep, PrivateKey, PublicKey,
 	pkcs8::{DecodePrivateKey, EncodePrivateKey},
 	traits::PrivateKeyParts,
 };
-// rsa 0.9 takes its OAEP hash from the digest 0.10 generation, which it re-exports.
-use rsa::sha2::Sha512;
-use sha2::Sha256;
+use sha2::{Sha256, Sha512};
 use typenum::U32;
 
 use crate::runtime;
@@ -41,9 +39,13 @@ impl std::fmt::Debug for HMACKey {
 }
 
 impl HMACKey {
-	pub(crate) fn new(key: &RsaPrivateKey) -> Self {
+	pub(crate) fn new(key: &PrivateKey) -> Self {
 		let mut okm = [0u8; 32];
-		let hmac = Hkdf::<Sha256>::new(None, &key.d().to_bytes_be());
+		// The private exponent's minimal big-endian bytes, with no leading zero bytes: every
+		// account's HMAC key was derived from that encoding. `BoxedUint::to_be_bytes` would pad it
+		// to the key's storage precision instead. Trimming takes time that depends on how many
+		// leading zero bytes `d` has, which says nothing about its other bytes.
+		let hmac = Hkdf::<Sha256>::new(None, &key.d().to_be_bytes_trimmed_vartime());
 		hmac.expand(INFO, okm.as_mut())
 			.expect("Failed to expand HMAC key");
 		Self(okm)
@@ -63,12 +65,12 @@ impl HMACKey {
 }
 
 pub(crate) async fn get_key_pair(
-	public_key: RsaPublicKey,
+	public_key: PublicKey,
 	private_key: &EncryptedPrivateKey<'_>,
 	meta_crypter: &impl MetaCrypter,
-) -> Result<(RsaPrivateKey, RsaPublicKey, HMACKey), ConversionError> {
+) -> Result<(PrivateKey, PublicKey, HMACKey), ConversionError> {
 	let private_key_str = meta_crypter.decrypt_meta(&private_key.0).await?;
-	let private_key = RsaPrivateKey::from_pkcs8_der(&BASE64_STANDARD.decode(&private_key_str)?)?;
+	let private_key = PrivateKey::from_pkcs8_der(&BASE64_STANDARD.decode(&private_key_str)?)?;
 
 	if *private_key.as_ref() != public_key {
 		return Err(ConversionError::InvalidKeyPair);
@@ -79,7 +81,7 @@ pub(crate) async fn get_key_pair(
 }
 
 pub(crate) async fn encrypt_private_key(
-	private_key: &RsaPrivateKey,
+	private_key: &PrivateKey,
 	meta_crypter: &impl MetaCrypter,
 ) -> Result<EncryptedPrivateKey<'static>, ConversionError> {
 	let der = private_key.to_pkcs8_der()?;
@@ -89,11 +91,11 @@ pub(crate) async fn encrypt_private_key(
 }
 
 pub(crate) fn blocking_encrypt_with_public_key(
-	public_key: &RsaPublicKey,
+	public_key: &PublicKey,
 	data: &[u8],
 ) -> Result<RSAEncryptedString<'static>, rsa::Error> {
-	let mut rng = old_rng::thread_rng();
-	let encrypted_data = public_key.encrypt(&mut rng, Oaep::new::<Sha512>(), data.as_ref())?;
+	let encrypted_data =
+		public_key.encrypt(&mut rand::rng(), Oaep::<Sha512>::new(), data.as_ref())?;
 
 	Ok(RSAEncryptedString(Cow::Owned(
 		BASE64_STANDARD.encode(encrypted_data),
@@ -101,16 +103,16 @@ pub(crate) fn blocking_encrypt_with_public_key(
 }
 
 pub fn blocking_decrypt_with_private_key(
-	private_key: &RsaPrivateKey,
+	private_key: &PrivateKey,
 	data: &RSAEncryptedString<'_>,
 ) -> Result<Vec<u8>, ConversionError> {
 	let encrypted_data = BASE64_STANDARD.decode(data.0.as_ref())?;
-	let decrypted_data = private_key.decrypt(Oaep::new::<Sha512>(), &encrypted_data)?;
+	let decrypted_data = private_key.decrypt(Oaep::<Sha512>::new(), &encrypted_data)?;
 	Ok(decrypted_data)
 }
 
 pub fn decrypt_with_private_key<'a>(
-	private_key: &'a RsaPrivateKey,
+	private_key: &'a PrivateKey,
 	data: &'a RSAEncryptedString<'a>,
 ) -> impl Future<Output = Result<Vec<u8>, ConversionError>> + Send + 'a {
 	runtime::do_cpu_intensive(|| blocking_decrypt_with_private_key(private_key, data))

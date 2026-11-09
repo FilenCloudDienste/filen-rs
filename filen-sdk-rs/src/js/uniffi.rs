@@ -1,7 +1,7 @@
 use std::{borrow::Cow, str::FromStr};
 
 use filen_types::serde::rsa::RsaDerPublicKey;
-use rsa::RsaPublicKey;
+use rsa::PublicKey;
 use tokio::sync::{
 	mpsc::{self, UnboundedSender},
 	oneshot,
@@ -14,6 +14,11 @@ uniffi::use_remote_type!(filen_types::filen_types::fs::UuidStr);
 
 #[cfg(feature = "uniffi")]
 uniffi::use_remote_type!(filen_types::uuid::Uuid);
+
+/// UniFFI names a custom type after the identifier it is declared with, and the bindings ship
+/// this one as `RsaPublicKey`, rsa's name for the key before 0.10.
+#[cfg(feature = "uniffi")]
+type RsaPublicKey = PublicKey;
 
 #[cfg(feature = "uniffi")]
 uniffi::custom_type!(RsaPublicKey, String, {

@@ -17,7 +17,7 @@ use filen_types::{
 	fs::{StableUuid, Uuid},
 	traits::CowHelpers,
 };
-use rsa::RsaPrivateKey;
+use rsa::PrivateKey;
 use stable_deref_trait::StableDeref;
 use yoke::{Yoke, Yokeable};
 
@@ -473,7 +473,7 @@ pub(crate) fn dispatch_event_type(event: &SocketEvent<'_>) -> &'static str {
 impl DecryptedSocketEvent<'_> {
 	pub(crate) async fn try_from_encrypted<T>(
 		crypter: &impl MetaCrypter,
-		private_key: &RsaPrivateKey,
+		private_key: &PrivateKey,
 		user_id: u64,
 		event: Yoke<SocketEvent<'static>, T>,
 	) -> Result<Yoke<DecryptedSocketEvent<'static>, T>, Error>
@@ -797,7 +797,7 @@ impl<'a> FolderRestore {
 pub struct ChatMessageNew(pub ChatMessage);
 impl<'a> ChatMessageNew {
 	fn try_blocking_from_rsa_encrypted(
-		private_key: &RsaPrivateKey,
+		private_key: &PrivateKey,
 		event: filen_types::api::v3::socket::ChatMessageNew<'a>,
 	) -> Result<Self, Error> {
 		let key = NoteOrChatKeyStruct::blocking_try_decrypt_rsa(private_key, &event.metadata)?;
@@ -821,7 +821,7 @@ impl<'a> ChatMessageNew {
 pub struct ChatConversationsNew(pub Chat);
 impl<'a> ChatConversationsNew {
 	fn blocking_from_rsa_encrypted(
-		private_key: &RsaPrivateKey,
+		private_key: &PrivateKey,
 		user_id: u64,
 		event: filen_types::api::v3::socket::ChatConversationsNew<'a>,
 	) -> Self {
@@ -858,7 +858,7 @@ pub struct NoteContentEdited<'a> {
 
 impl<'a> NoteContentEdited<'a> {
 	fn try_blocking_from_rsa_encrypted(
-		private_key: &RsaPrivateKey,
+		private_key: &PrivateKey,
 		event: filen_types::api::v3::socket::NoteContentEdited<'a>,
 	) -> Result<Self, Error> {
 		let note_key = NoteOrChatKeyStruct::blocking_try_decrypt_rsa(private_key, &event.metadata)?;
@@ -886,7 +886,7 @@ pub struct NoteTitleEdited<'a> {
 
 impl<'a> NoteTitleEdited<'a> {
 	fn try_blocking_from_rsa_encrypted(
-		private_key: &RsaPrivateKey,
+		private_key: &PrivateKey,
 		event: filen_types::api::v3::socket::NoteTitleEdited<'a>,
 	) -> Result<Self, Error> {
 		let note_key = NoteOrChatKeyStruct::blocking_try_decrypt_rsa(private_key, &event.metadata)
@@ -938,7 +938,7 @@ pub struct ChatMessageEdited<'a> {
 }
 impl<'a> ChatMessageEdited<'a> {
 	fn try_blocking_from_rsa_encrypted(
-		private_key: &RsaPrivateKey,
+		private_key: &PrivateKey,
 		event: filen_types::api::v3::socket::ChatMessageEdited<'a>,
 	) -> Result<Self, Error> {
 		let chat_key = NoteOrChatKeyStruct::blocking_try_decrypt_rsa(private_key, &event.metadata)?;
@@ -965,7 +965,7 @@ pub struct ChatConversationNameEdited<'a> {
 
 impl<'a> ChatConversationNameEdited<'a> {
 	fn try_blocking_from_rsa_encrypted(
-		private_key: &RsaPrivateKey,
+		private_key: &PrivateKey,
 		event: filen_types::api::v3::socket::ChatConversationNameEdited<'a>,
 	) -> Result<Self, Error> {
 		let chat_key = NoteOrChatKeyStruct::blocking_try_decrypt_rsa(private_key, &event.metadata)

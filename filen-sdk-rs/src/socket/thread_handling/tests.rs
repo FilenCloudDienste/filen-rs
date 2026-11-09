@@ -374,11 +374,11 @@ mod pipeline {
 		}
 	}
 
-	fn test_private_key() -> Arc<RsaPrivateKey> {
-		static KEY: OnceLock<Arc<RsaPrivateKey>> = OnceLock::new();
+	fn test_private_key() -> Arc<PrivateKey> {
+		static KEY: OnceLock<Arc<PrivateKey>> = OnceLock::new();
 		Arc::clone(KEY.get_or_init(|| {
 			// tiny key: never used for real crypto, only to satisfy the signature
-			Arc::new(RsaPrivateKey::new(&mut old_rng::thread_rng(), 512).unwrap())
+			Arc::new(PrivateKey::new(&mut rand::rng(), 1024).unwrap())
 		}))
 	}
 

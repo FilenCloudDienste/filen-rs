@@ -610,7 +610,7 @@ impl ConnectedTargets {
 	/// Targets with `users` shared users (ids `1..=users`) and no links.
 	#[cfg(test)]
 	pub(crate) fn with_test_users(users: u64) -> Self {
-		let key = rsa::RsaPrivateKey::new(&mut old_rng::thread_rng(), 512)
+		let key = rsa::PrivateKey::new(&mut rand::rng(), 1024)
 			.unwrap()
 			.to_public_key();
 		Self {

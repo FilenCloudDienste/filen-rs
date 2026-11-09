@@ -11,7 +11,9 @@ base64 = "0.22.1"
 chrono = { version = "0.4.41", features = ["serde"] }
 digest = "0.11.3"
 hex = { package = "const-hex", version = "1.18.1", features = ["serde"] }
-rsa = "0.9.8" # update to 0.10 when it is released, as it patches a side-channel timing based attack
+# 0.10 does its private-key arithmetic in constant time with crypto-bigint, which closes the timing
+# side channel 0.9 had through num-bigint-dig (RUSTSEC-2023-0071).
+rsa = "0.10.0"
 rusqlite = { version = "0.39", optional = true, default-features = false, features = [
 	"uuid",
 ] }

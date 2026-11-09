@@ -1,7 +1,7 @@
 use std::{borrow::Cow, str::FromStr};
 
 use filen_types::crypto::{EncryptedString, rsa::RSAEncryptedString};
-use rsa::{RsaPrivateKey, RsaPublicKey};
+use rsa::{PrivateKey, PublicKey};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -226,7 +226,7 @@ pub(crate) struct NoteOrChatKeyStruct<'a> {
 
 impl NoteOrChatKeyStruct<'_> {
 	pub(crate) fn blocking_try_decrypt_rsa(
-		rsa_key: &RsaPrivateKey,
+		rsa_key: &PrivateKey,
 		encrypted_key: &RSAEncryptedString<'_>,
 	) -> Result<NoteOrChatKey, Error> {
 		let key = crate::crypto::rsa::blocking_decrypt_with_private_key(rsa_key, encrypted_key)
@@ -240,7 +240,7 @@ impl NoteOrChatKeyStruct<'_> {
 	}
 
 	pub(crate) fn blocking_try_encrypt_rsa(
-		rsa_key: &RsaPublicKey,
+		rsa_key: &PublicKey,
 		note_key: &NoteOrChatKey,
 	) -> Result<RSAEncryptedString<'static>, Error> {
 		let key_struct = NoteOrChatKeyStruct {

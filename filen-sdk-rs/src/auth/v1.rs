@@ -4,7 +4,7 @@ use std::{
 };
 
 use filen_types::crypto::rsa::EncryptedPrivateKey;
-use rsa::RsaPublicKey;
+use rsa::PublicKey;
 
 use crate::{
 	ErrorKind, api,
@@ -24,7 +24,7 @@ pub(super) async fn login(
 		AuthClient,
 		super::AuthInfo,
 		EncryptedPrivateKey<'static>,
-		RsaPublicKey,
+		PublicKey,
 	),
 	Error,
 > {

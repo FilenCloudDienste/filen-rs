@@ -7,7 +7,7 @@ use filen_types::{
 	traits::CowHelpers,
 };
 use rkyv::with::{AsOwned, Map};
-use rsa::RsaPrivateKey;
+use rsa::PrivateKey;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -47,7 +47,7 @@ impl<'a> DirectoryMeta<'a> {
 
 	pub(crate) fn blocking_from_rsa_encrypted(
 		encrypted: RSAEncryptedString<'a>,
-		decrypter: &RsaPrivateKey,
+		decrypter: &PrivateKey,
 	) -> Self {
 		let Ok(decrypted) = crypto::rsa::blocking_decrypt_with_private_key(decrypter, &encrypted)
 		else {

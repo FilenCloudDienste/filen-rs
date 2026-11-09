@@ -11,7 +11,7 @@ use filen_types::{
 	serde::{rsa::RsaDerPublicKey, str::SizedHexString},
 	traits::CowHelpers,
 };
-use rsa::{RsaPrivateKey, RsaPublicKey, pkcs8::DecodePrivateKey};
+use rsa::{PrivateKey, PublicKey, pkcs8::DecodePrivateKey};
 
 #[cfg(any(
 	not(all(target_family = "wasm", target_os = "unknown")),
@@ -87,7 +87,7 @@ impl UnauthClient {
 			AuthInfo::V3(_) => MetaEncryptionVersion::V3,
 		};
 
-		let private_key = RsaPrivateKey::from_pkcs8_der(
+		let private_key = PrivateKey::from_pkcs8_der(
 			&BASE64_STANDARD
 				.decode(stringified.private_key)
 				.map_err(ConversionError::from)?,
@@ -108,7 +108,7 @@ impl UnauthClient {
 			auth_info: std::sync::RwLock::new(Arc::new(auth_info)),
 			file_encryption_version,
 			meta_encryption_version,
-			public_key: RsaPublicKey::from(&private_key),
+			public_key: PublicKey::from(&private_key),
 			hmac_key: HMACKey::new(&private_key),
 			private_key: Arc::new(private_key),
 			http_client,
@@ -165,9 +165,8 @@ impl UnauthClient {
 						(client, auth_info, private_key, public_key)
 					}
 					_ => {
-						let new_private_key =
-							rsa::RsaPrivateKey::new(&mut old_rng::thread_rng(), RSA_KEY_SIZE)
-								.expect("Failed to generate RSA key pair");
+						let new_private_key = rsa::PrivateKey::new(&mut rand::rng(), RSA_KEY_SIZE)
+							.expect("Failed to generate RSA key pair");
 
 						let new_public_key = new_private_key.to_public_key();
 						let encrypted_private_key =
@@ -258,7 +257,7 @@ async fn finish_login(
 	client: AuthClient,
 	auth_info: crate::auth::AuthInfo,
 	private_key: filen_types::crypto::rsa::EncryptedPrivateKey<'static>,
-	public_key: rsa::RsaPublicKey,
+	public_key: rsa::PublicKey,
 ) -> Result<Client, Error> {
 	{
 		let (private_key, public_key, hmac) =
@@ -517,7 +516,7 @@ mod service_worker_client_tests {
 
 	fn stringified() -> StringifiedClient {
 		// tiny key: never used for real crypto, only to make a client that parses
-		let key = RsaPrivateKey::new(&mut old_rng::thread_rng(), 512).expect("a test key");
+		let key = PrivateKey::new(&mut rand::rng(), 1024).expect("a test key");
 		StringifiedClient {
 			email: "worker@example.com".to_owned(),
 			user_id: 1,
@@ -804,7 +803,7 @@ pub(crate) mod test_support {
 	/// `unauthed`, logged in to an account that does not exist.
 	fn logged_in(unauthed: UnauthClient) -> Client {
 		// tiny key: never used for real crypto, only to make a client that parses
-		let key = RsaPrivateKey::new(&mut old_rng::thread_rng(), 512).expect("a test key");
+		let key = PrivateKey::new(&mut rand::rng(), 1024).expect("a test key");
 		unauthed
 			.from_stringified(StringifiedClient {
 				email: "offline@example.com".to_owned(),

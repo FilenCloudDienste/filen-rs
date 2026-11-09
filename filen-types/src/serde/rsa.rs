@@ -2,13 +2,13 @@ use std::{borrow::Cow, str::FromStr};
 
 use base64::{Engine, prelude::BASE64_STANDARD};
 use rsa::{
-	RsaPublicKey,
+	PublicKey,
 	pkcs8::{DecodePublicKey, EncodePublicKey},
 };
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone)]
-pub struct RsaDerPublicKey<'a>(pub Cow<'a, RsaPublicKey>);
+pub struct RsaDerPublicKey<'a>(pub Cow<'a, PublicKey>);
 
 impl std::fmt::Display for RsaDerPublicKey<'_> {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -25,7 +25,7 @@ impl std::str::FromStr for RsaDerPublicKey<'_> {
 
 	fn from_str(s: &str) -> Result<Self, Self::Err> {
 		let bytes = BASE64_STANDARD.decode(s)?;
-		let key = RsaPublicKey::from_public_key_der(bytes.as_ref())?;
+		let key = PublicKey::from_public_key_der(bytes.as_ref())?;
 		Ok(RsaDerPublicKey(Cow::Owned(key)))
 	}
 }
@@ -52,14 +52,14 @@ impl<'de, 'a> Deserialize<'de> for RsaDerPublicKey<'a> {
 pub mod public_key_der {
 	use super::*;
 
-	pub fn serialize<S>(value: &RsaPublicKey, serializer: S) -> Result<S::Ok, S::Error>
+	pub fn serialize<S>(value: &PublicKey, serializer: S) -> Result<S::Ok, S::Error>
 	where
 		S: serde::Serializer,
 	{
 		RsaDerPublicKey(Cow::Borrowed(value)).serialize(serializer)
 	}
 
-	pub fn deserialize<'de, D>(deserializer: D) -> Result<RsaPublicKey, D::Error>
+	pub fn deserialize<'de, D>(deserializer: D) -> Result<PublicKey, D::Error>
 	where
 		D: serde::Deserializer<'de>,
 	{
@@ -85,8 +85,8 @@ mod tests {
 	#[test]
 	fn rsa_der_public_key_parses_the_spki_modulus_and_exponent() {
 		let key = RsaDerPublicKey::from_str(SPKI_BASE64).unwrap();
-		assert_eq!(hex::encode(key.0.n().to_bytes_be()), SPKI_MODULUS_HEX);
-		assert_eq!(key.0.e().to_bytes_be(), [0x01, 0x00, 0x01]);
+		assert_eq!(hex::encode(key.0.n_bytes()), SPKI_MODULUS_HEX);
+		assert_eq!(*key.0.e_bytes(), [0x01, 0x00, 0x01]);
 	}
 
 	#[test]

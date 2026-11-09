@@ -18,7 +18,7 @@ use filen_types::{
 use futures::{StreamExt, stream::FuturesUnordered};
 #[cfg(feature = "multi-threaded-crypto")]
 use rayon::iter::ParallelIterator;
-use rsa::RsaPrivateKey;
+use rsa::PrivateKey;
 
 use crate::{
 	Error, ErrorKind, api,
@@ -218,7 +218,7 @@ impl Chat {
 
 	pub(crate) fn blocking_decrypt(
 		user_id: u64,
-		private_key: &RsaPrivateKey,
+		private_key: &PrivateKey,
 		encrypted: filen_types::api::v3::chat::conversations::ChatConversation<'_>,
 	) -> Self {
 		let (key, name, last_message, participants) = blocking_decrypt_chat_parts(
@@ -245,7 +245,7 @@ impl Chat {
 
 pub(crate) fn blocking_decrypt_chat_parts(
 	user_id: u64,
-	private_key: &RsaPrivateKey,
+	private_key: &PrivateKey,
 	participants: Vec<filen_types::api::v3::chat::conversations::ChatConversationParticipant<'_>>,
 	encrypted_name: Option<&EncryptedString<'_>>,
 	encrypted_last_messsage: Option<filen_types::api::v3::chat::messages::ChatMessageEncrypted<'_>>,
@@ -302,7 +302,7 @@ pub(crate) fn blocking_decrypt_chat_parts(
 }
 
 fn blocking_decrypt_chat_key(
-	private_key: &RsaPrivateKey,
+	private_key: &PrivateKey,
 	user_id: u64,
 	participants: &[filen_types::api::v3::chat::conversations::ChatConversationParticipant<'_>],
 ) -> Result<NoteOrChatKey, Error> {

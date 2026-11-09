@@ -16,12 +16,12 @@ use filen_types::{
 	serde::str::SizedHexString,
 };
 use rsa::{
-	Oaep, RsaPrivateKey, RsaPublicKey,
+	Oaep, PrivateKey, PublicKey,
 	pkcs1::EncodeRsaPublicKey,
 	pkcs8::{DecodePrivateKey, DecodePublicKey, EncodePrivateKey},
-	sha2::{Sha256, Sha512},
 	traits::PrivateKeyParts,
 };
+use sha2::{Sha256, Sha512};
 
 use crate::{
 	auth::v2::hash_name,
@@ -133,12 +133,12 @@ fn master_key(key: &str) -> MasterKey {
 	MasterKey::from_str(key).expect("a 32-char master key")
 }
 
-fn private_key(pkcs8_base64: &str) -> RsaPrivateKey {
-	RsaPrivateKey::from_pkcs8_der(&BASE64_STANDARD.decode(pkcs8_base64).unwrap()).unwrap()
+fn private_key(pkcs8_base64: &str) -> PrivateKey {
+	PrivateKey::from_pkcs8_der(&BASE64_STANDARD.decode(pkcs8_base64).unwrap()).unwrap()
 }
 
-fn public_key(spki_base64: &str) -> RsaPublicKey {
-	RsaPublicKey::from_public_key_der(&BASE64_STANDARD.decode(spki_base64).unwrap()).unwrap()
+fn public_key(spki_base64: &str) -> PublicKey {
+	PublicKey::from_public_key_der(&BASE64_STANDARD.decode(spki_base64).unwrap()).unwrap()
 }
 
 fn counting_bytes(len: u8) -> Vec<u8> {
@@ -340,8 +340,20 @@ fn public_keys_encode_to_their_pinned_pkcs1() {
 
 #[test]
 fn key_b_has_a_private_exponent_shorter_than_its_modulus() {
-	assert_eq!(private_key(KEY_A_PKCS8).d().to_bytes_be().len(), 256);
-	assert_eq!(private_key(KEY_B_PKCS8).d().to_bytes_be().len(), 255);
+	assert_eq!(
+		private_key(KEY_A_PKCS8)
+			.d()
+			.to_be_bytes_trimmed_vartime()
+			.len(),
+		256
+	);
+	assert_eq!(
+		private_key(KEY_B_PKCS8)
+			.d()
+			.to_be_bytes_trimmed_vartime()
+			.len(),
+		255
+	);
 }
 
 #[test]
@@ -373,13 +385,13 @@ fn a_private_key_decrypts_the_pinned_oaep_sha512_ciphertexts() {
 fn the_pinned_ciphertext_fails_with_sha256_as_label_or_mgf1_hash() {
 	let key = private_key(KEY_A_PKCS8);
 	let ciphertext = BASE64_STANDARD.decode(RSA_FILEN).unwrap();
-	assert!(key.decrypt(Oaep::new::<Sha256>(), &ciphertext).is_err());
+	assert!(key.decrypt(Oaep::<Sha256>::new(), &ciphertext).is_err());
 	assert!(
-		key.decrypt(Oaep::new_with_mgf_hash::<Sha256, Sha512>(), &ciphertext)
+		key.decrypt(Oaep::<Sha256, Sha512>::new_with_mgf_hash(), &ciphertext)
 			.is_err()
 	);
 	assert!(
-		key.decrypt(Oaep::new_with_mgf_hash::<Sha512, Sha256>(), &ciphertext)
+		key.decrypt(Oaep::<Sha512, Sha256>::new_with_mgf_hash(), &ciphertext)
 			.is_err()
 	);
 }

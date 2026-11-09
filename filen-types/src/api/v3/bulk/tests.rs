@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 
-use rsa::{BigUint, RsaPublicKey};
+use rsa::{BoxedUint, PublicKey};
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 
@@ -302,9 +302,9 @@ fn shared_request_and_answers_match_the_documented_shapes() {
 		json!({"items": [{"uuid": UUID_A}]})
 	);
 
-	let key = RsaPublicKey::new(
-		BigUint::from_bytes_be(&[0xc5; 256]),
-		BigUint::from(65_537_u32),
+	let key = PublicKey::new(
+		BoxedUint::from_be_slice(&[0xc5; 256], 2048).unwrap(),
+		BoxedUint::from(65_537_u32),
 	)
 	.unwrap();
 	let public_key = RsaDerPublicKey(Cow::Borrowed(&key)).to_string();

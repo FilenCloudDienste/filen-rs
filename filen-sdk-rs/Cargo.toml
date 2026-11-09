@@ -153,7 +153,6 @@ reqwest = { version = "0.12.24", features = [
 filen-types = { path = "../filen-types" }
 rand = "0.10.3"
 siphasher = "1"
-old_rng = { package = "rand", version = "0.8.5" } # for compatibility with rsa 0.9.8
 aes-gcm = { version = "0.11.1", default-features = false, features = [
 	"aes",
 	"alloc",
@@ -162,7 +161,7 @@ thiserror = "2.0.14"
 base64 = "0.22.1"
 pbkdf2 = { version = "0.13.0", features = ["sha2"] }
 sha2 = "0.11.0"
-rsa = { version = "0.9.8", features = ["sha2"] }
+rsa = "0.10.0"
 hkdf = "0.13.0"
 hmac = "0.13.0"
 uuid = { version = "1.18.0", default-features = false }

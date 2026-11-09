@@ -17,7 +17,7 @@ use filen_types::{
 };
 use hmac::KeyInit;
 use http::AuthClient;
-use rsa::{RsaPrivateKey, RsaPublicKey};
+use rsa::{PrivateKey, PublicKey};
 use rsa::{pkcs1::EncodeRsaPublicKey, pkcs8::EncodePrivateKey};
 use serde::Serialize;
 use typenum::U256;
@@ -259,8 +259,8 @@ pub struct Client {
 	file_encryption_version: FileEncryptionVersion,
 	meta_encryption_version: MetaEncryptionVersion,
 
-	public_key: RsaPublicKey,
-	private_key: Arc<RsaPrivateKey>,
+	public_key: PublicKey,
+	private_key: Arc<PrivateKey>,
 	pub(crate) hmac_key: HMACKey,
 
 	http_client: Arc<AuthClient>,
@@ -446,15 +446,15 @@ impl Client {
 			.clone()
 	}
 
-	pub fn private_key(&self) -> &RsaPrivateKey {
+	pub fn private_key(&self) -> &PrivateKey {
 		&self.private_key
 	}
 
-	pub fn arc_private_key(&self) -> Arc<RsaPrivateKey> {
+	pub fn arc_private_key(&self) -> Arc<PrivateKey> {
 		self.private_key.clone()
 	}
 
-	pub fn public_key(&self) -> &RsaPublicKey {
+	pub fn public_key(&self) -> &PublicKey {
 		&self.public_key
 	}
 
@@ -1043,15 +1043,16 @@ mod tests {
 #[cfg(any(test, all(feature = "sync-engine", feature = "bench-internals")))]
 pub(crate) mod test_support {
 	use base64::{Engine, prelude::BASE64_STANDARD};
-	use rsa::{RsaPrivateKey, pkcs8::EncodePrivateKey};
+	use rsa::{PrivateKey, pkcs8::EncodePrivateKey};
 
 	use super::{Client, StringifiedClient, http::ClientConfig, unauth::UnauthClient};
 
 	/// A client with no account and no network behind it, for tests and benchmarks that build
 	/// files, keys, writers or sync engines but never send a request.
 	///
-	/// 512 bits because the key only has to parse: `from_stringified` derives a public key and an
-	/// HMAC key from it, and a 2048-bit key would cost each test half a second to generate.
+	/// 1024 bits, the smallest key rsa generates, because the key only has to parse:
+	/// `from_stringified` derives a public key and an HMAC key from it, and a 2048-bit key would
+	/// cost each test half a second to generate.
 	pub(crate) fn offline_client() -> Client {
 		offline_client_with_root("00000000-0000-0000-0000-000000000000")
 	}
@@ -1059,8 +1060,8 @@ pub(crate) mod test_support {
 	/// [`offline_client`] for the account whose root folder is `root_uuid`, for a test that needs
 	/// two accounts.
 	pub(crate) fn offline_client_with_root(root_uuid: &str) -> Client {
-		let private_key = RsaPrivateKey::new(&mut old_rng::thread_rng(), 512)
-			.expect("generating a throwaway RSA key");
+		let private_key =
+			PrivateKey::new(&mut rand::rng(), 1024).expect("generating a throwaway RSA key");
 		UnauthClient::from_config(ClientConfig::default())
 			.expect("building an unauthenticated client makes no network call")
 			.from_stringified(StringifiedClient {

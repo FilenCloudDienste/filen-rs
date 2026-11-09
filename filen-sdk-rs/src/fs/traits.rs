@@ -5,7 +5,7 @@ use filen_types::{
 	crypto::{EncryptedString, rsa::RSAEncryptedString},
 	fs::{ObjectType, ParentUuid, Uuid},
 };
-use rsa::RsaPublicKey;
+use rsa::PublicKey;
 
 use crate::{crypto::shared::MetaCrypter, runtime::do_cpu_intensive};
 
@@ -61,12 +61,12 @@ pub trait HasMetaExt: Send + Sync {
 
 	fn blocking_get_rsa_encrypted_meta(
 		&self,
-		public_key: &RsaPublicKey,
+		public_key: &PublicKey,
 	) -> Option<RSAEncryptedString<'static>>;
 
 	fn get_rsa_encrypted_meta<'a>(
 		&'a self,
-		public_key: &'a RsaPublicKey,
+		public_key: &'a PublicKey,
 	) -> impl Future<Output = Option<RSAEncryptedString<'static>>> + Send + 'a {
 		do_cpu_intensive(|| self.blocking_get_rsa_encrypted_meta(public_key))
 	}
@@ -85,7 +85,7 @@ where
 
 	fn blocking_get_rsa_encrypted_meta(
 		&self,
-		public_key: &RsaPublicKey,
+		public_key: &PublicKey,
 	) -> Option<RSAEncryptedString<'static>> {
 		let meta = self.get_meta_string()?;
 		match crate::crypto::rsa::blocking_encrypt_with_public_key(public_key, meta.as_bytes()) {

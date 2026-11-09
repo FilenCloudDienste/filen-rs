@@ -7,7 +7,7 @@ use filen_types::{
 	api::v3::dir::link::info::LinkPasswordSalt,
 	fs::{Uuid, UuidStr},
 };
-use rsa::RsaPublicKey;
+use rsa::PublicKey;
 
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 use crate::auth::js_impls::UnauthJsClient;
@@ -56,7 +56,7 @@ pub struct Contact {
 		tsify(type = "string"),
 		serde(with = "filen_types::serde::rsa::public_key_der")
 	)]
-	pub public_key: RsaPublicKey,
+	pub public_key: PublicKey,
 }
 
 impl From<filen_types::api::v3::contacts::Contact<'_>> for Contact {
