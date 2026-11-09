@@ -1930,6 +1930,14 @@ pub(crate) async fn create_directory_(
 		Ok(Some(_)) => Err(UI::failure(&format!("Not a directory: {}", parent.0))),
 		Ok(None) => {
 			if recursive {
+				// check the name before creating any parent, so that a name the SDK rejects
+				// leaves nothing behind; each level checks its own, so every missing component
+				// is checked before the first is created, and existing ones never are
+				if let Some(name) = directory.basename() {
+					ValidatedName::try_from(name)
+						.map_err(Error::from)
+						.context("Failed to create directory")?;
+				}
 				Box::pin(create_directory_(client, &parent, true))
 					.await
 					.map(|d| DirType::Dir(std::borrow::Cow::Owned(d)))

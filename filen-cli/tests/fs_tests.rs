@@ -165,6 +165,23 @@ async fn mkdir_recursive_creates_a_path_with_a_trailing_slash() {
 }
 
 #[shared_test_runtime]
+async fn mkdir_recursive_with_an_invalid_name_fails_without_creating_parents() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = format!("/{}", resources.dir.name().unwrap());
+
+	authenticated_cli_with_args!("mkdir", "-r", &format!("{test_dir}/a/b/c.")).failure();
+
+	assert!(
+		client
+			.find_item_at_path(&format!("{test_dir}/a"))
+			.await
+			.unwrap()
+			.is_none()
+	);
+}
+
+#[shared_test_runtime]
 async fn mkdir_of_an_existing_directory_says_it_exists() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let test_dir = format!("/{}", resources.dir.name().unwrap());
