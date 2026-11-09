@@ -4271,7 +4271,7 @@ mod tests {
 
 		print_copy_problems(&mut ui, &report);
 		assert_eq!(
-			printed.lines(),
+			console::strip_ansi_codes(&printed.lines()),
 			"✘ Skipped d/a: cannot be decrypted\n✘ Skipped d/b: cannot be decrypted"
 		);
 	}
@@ -4288,7 +4288,7 @@ mod tests {
 		};
 
 		print_copy_problems(&mut ui, &report);
-		let printed = printed.lines();
+		let printed = console::strip_ansi_codes(&printed.lines()).into_owned();
 		let lines = printed.lines().collect::<Vec<&str>>();
 		assert_eq!(lines.len(), MAX_PRINTED_COPY_PROBLEMS + 1);
 		assert_eq!(

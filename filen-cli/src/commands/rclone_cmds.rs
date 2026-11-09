@@ -1774,7 +1774,10 @@ mod tests {
 		clear_rclone_cache(&config, &mut ui).await.unwrap();
 
 		assert!(cached.iter().all(|file| !file.exists()), "{cached:?}");
-		assert_eq!(printed.lines(), "✔ Cleared the Rclone cache");
+		assert_eq!(
+			console::strip_ansi_codes(&printed.lines()),
+			"✔ Cleared the Rclone cache"
+		);
 	}
 
 	#[tokio::test]
