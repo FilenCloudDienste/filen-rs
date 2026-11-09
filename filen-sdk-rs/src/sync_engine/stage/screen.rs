@@ -236,9 +236,9 @@ impl Screen {
 	/// Take out every action under a path the plan surfaces as a conflict (see
 	/// `plan::under_conflict`).
 	pub(super) fn suppress_conflicted(&mut self) -> rusqlite::Result<()> {
-		let mut conflicted = Vec::new();
+		let mut conflicted = HashSet::new();
 		self.each(Rows::Conflicts, |action| {
-			conflicted.push(action.rel_path().to_owned());
+			conflicted.insert(action.rel_path().to_owned());
 		})?;
 		if !conflicted.is_empty() {
 			self.retain(Rows::All, |action| {

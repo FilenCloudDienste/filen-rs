@@ -847,6 +847,30 @@ fn a_dir_move_into_a_new_parent_is_one_move() {
 	);
 }
 
+/// A conflict at `a` drops what sits strictly under it, but neither a sibling that only shares its
+/// name as a prefix nor the conflict itself.
+#[test]
+fn a_conflict_suppresses_only_strict_descendants() {
+	let conflict = SyncAction::Conflict {
+		rel_path: "a".to_string(),
+	};
+	let sibling = SyncAction::CreateLocalDir {
+		rel_path: "ab".to_string(),
+	};
+	let mut actions = vec![
+		conflict.clone(),
+		SyncAction::CreateLocalDir {
+			rel_path: "a/b".to_string(),
+		},
+		sibling.clone(),
+		SyncAction::CreateLocalDir {
+			rel_path: "a/b/c".to_string(),
+		},
+	];
+	suppress_conflicted_subtrees(&mut actions);
+	assert_eq!(actions, vec![conflict, sibling]);
+}
+
 /// A conflict held anywhere in the subtree keeps the directory where it is.
 #[test]
 fn a_dir_holding_a_conflict_is_not_moved() {

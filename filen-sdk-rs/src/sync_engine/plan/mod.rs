@@ -2751,7 +2751,7 @@ pub(super) fn moved_path(path: &str, from: &str, to: &str) -> Option<String> {
 /// that cannot be created while the conflicting file holds the name). The conflicts themselves are
 /// kept.
 fn suppress_conflicted_subtrees(actions: &mut Vec<SyncAction>) {
-	let conflicted: Vec<String> = actions
+	let conflicted: HashSet<String> = actions
 		.iter()
 		.filter_map(|a| match a {
 			SyncAction::Conflict { rel_path } => Some(rel_path.clone()),
@@ -2766,14 +2766,15 @@ fn suppress_conflicted_subtrees(actions: &mut Vec<SyncAction>) {
 
 /// Whether [`suppress_conflicted_subtrees`] drops `action` for one of `conflicted`, the paths the
 /// plan surfaces as conflicts: an end of it sits under one. A conflict itself never does.
-pub(super) fn under_conflict(action: &SyncAction, conflicted: &[String]) -> bool {
+pub(super) fn under_conflict(action: &SyncAction, conflicted: &HashSet<String>) -> bool {
 	if matches!(action, SyncAction::Conflict { .. }) {
 		return false;
 	}
 	let (from, to) = action.endpoints();
-	let held = conflicted
-		.iter()
-		.any(|c| is_under(from, c) || is_under(to, c));
+	// Strictly under: `ancestors` yields neither the path itself nor `""`, as `is_under` holds for
+	// neither, so each end costs one lookup per ancestor instead of a scan of every conflict.
+	let held = ancestors(from).any(|at| conflicted.contains(at))
+		|| ancestors(to).any(|at| conflicted.contains(at));
 	if held {
 		tracing::debug!(
 			"plan: dropping {} — it sits under a path held in conflict this pass",
