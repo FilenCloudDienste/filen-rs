@@ -73,6 +73,42 @@ async fn mv_into_a_directory_named_with_a_trailing_slash_keeps_the_source_name()
 }
 
 #[shared_test_runtime]
+async fn mv_with_an_invalid_name_into_another_directory_fails_without_moving() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = format!("/{}", resources.dir.name().unwrap());
+	test_utils::create_remote_file_structure_outline(
+		client,
+		resources.dir.clone(),
+		&["a.txt", "dest/"],
+	)
+	.await
+	.unwrap();
+
+	authenticated_cli_with_args!(
+		"mv",
+		&format!("{test_dir}/a.txt"),
+		&format!("{test_dir}/dest/b.")
+	)
+	.failure();
+
+	assert!(matches!(
+		client
+			.find_item_at_path(&format!("{test_dir}/a.txt"))
+			.await
+			.unwrap(),
+		Some(NonRootFileType::File(_))
+	));
+	assert!(
+		client
+			.find_item_at_path(&format!("{test_dir}/dest/a.txt"))
+			.await
+			.unwrap()
+			.is_none()
+	);
+}
+
+#[shared_test_runtime]
 async fn mv_to_a_missing_directory_named_with_a_trailing_slash_fails_without_renaming() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = &resources.client;

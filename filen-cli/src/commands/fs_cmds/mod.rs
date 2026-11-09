@@ -2308,6 +2308,11 @@ async fn move_item(
 	let needs_rename = new_name != source_filename;
 	match source {
 		NonRootFileType::File(file) => {
+			// built before the move so an invalid name fails without moving anything
+			let rename = needs_rename
+				.then(|| FileMetaChanges::default().name(&new_name))
+				.transpose()
+				.context("Invalid destination file name")?;
 			let mut file = file.into_owned();
 			if *file.parent() != destination_dir.uuid() {
 				client
@@ -2315,19 +2320,19 @@ async fn move_item(
 					.await
 					.context("Failed to move file")?;
 			}
-			if needs_rename {
+			if let Some(changes) = rename {
 				client
-					.update_file_metadata(
-						&mut file,
-						FileMetaChanges::default()
-							.name(&new_name)
-							.context("Invalid destination file name")?,
-					)
+					.update_file_metadata(&mut file, changes)
 					.await
 					.context("Failed to rename file")?;
 			}
 		}
 		NonRootFileType::Dir(dir) => {
+			// built before the move so an invalid name fails without moving anything
+			let rename = needs_rename
+				.then(|| DirectoryMetaChanges::default().name(&new_name))
+				.transpose()
+				.context("Invalid destination directory name")?;
 			let mut dir = dir.into_owned();
 			if *dir.parent() != destination_dir.uuid() {
 				client
@@ -2335,14 +2340,9 @@ async fn move_item(
 					.await
 					.context("Failed to move directory")?;
 			}
-			if needs_rename {
+			if let Some(changes) = rename {
 				client
-					.update_dir_metadata(
-						&mut dir,
-						DirectoryMetaChanges::default()
-							.name(&new_name)
-							.context("Invalid destination directory name")?,
-					)
+					.update_dir_metadata(&mut dir, changes)
 					.await
 					.context("Failed to rename directory")?;
 			}
