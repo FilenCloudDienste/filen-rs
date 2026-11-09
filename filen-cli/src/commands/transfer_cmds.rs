@@ -1300,6 +1300,25 @@ fn undecryptable_link(link: &PublicLink) -> anyhow::Error {
 	))
 }
 
+/// Opens what the file link in `access` shares with `open`, which takes the password to open it
+/// with: the one given, or none. When the server refuses the link opened without a password, as
+/// it does a protected one, the password `ask` gets from the user is tried once.
+async fn open_linked_file<T>(
+	access: LinkAccess<'_>,
+	mut open: impl AsyncFnMut(Option<&str>) -> Result<T, Error>,
+	ask: impl FnOnce() -> Result<String>,
+) -> Result<T> {
+	let LinkAccess { link, password } = access;
+	match open(password).await {
+		Err(e) if password.is_none() && e.kind() == ErrorKind::WrongPassword => {
+			let password = ask()?;
+			open(Some(&password)).await
+		}
+		result => result,
+	}
+	.map_err(|e| link_failure(link, &e))
+}
+
 /// Download the file or directory the public link in `access` shares to `destination`, returning
 /// the local path it was downloaded to.
 async fn download_link(
@@ -1313,10 +1332,12 @@ async fn download_link(
 	let LinkAccess { link, password } = access;
 	let target = match link.kind {
 		LinkKind::File => {
-			let file = client
-				.get_linked_file(link.uuid, &link.key, password)
-				.await
-				.map_err(|e| link_failure(link, &e))?;
+			let file = open_linked_file(
+				access,
+				async |password| client.get_linked_file(link.uuid, &link.key, password).await,
+				|| ui.prompt_password(&format!("Password of the {}: ", link)),
+			)
+			.await?;
 			if !file.downloadable() {
 				return Err(UI::failure(&format!(
 					"The {} does not allow downloads",
@@ -2445,18 +2466,20 @@ mod tests {
 	use serde_json::json;
 
 	use filen_sdk_rs::{
+		ErrorKind,
 		fs::name::ValidatedName,
 		io::{DirUploadCallback as _, ExistingRemoteFile, PartialDownload},
 	};
 
 	use super::{
-		DownloadSource, Existing, FilterArgs, LinkKind, ProgressState, PublicLink, SPEED_WINDOW,
-		Tally, TransferFailure, TransferKind, TransferProgress, UploadTarget, canceled_message,
-		decode_hex_key, download_target, ends_the_command, ensure_stdio_is_free,
+		DownloadSource, Existing, FilterArgs, LinkAccess, LinkKind, ProgressState, PublicLink,
+		SPEED_WINDOW, Tally, TransferFailure, TransferKind, TransferProgress, UploadTarget,
+		canceled_message, decode_hex_key, download_target, ends_the_command, ensure_stdio_is_free,
 		existing_remote_policy, expand_source_wildcards, format_duration, local_existing,
-		partial_download, progress_line, resolve_download_target, resolve_upload_target,
-		result_json, skipped_symlinks_line, source_failure, sources_and_destination,
-		stdin_destination, stdin_upload_target, transfer_summary, upload_journal,
+		open_linked_file, partial_download, progress_line, resolve_download_target,
+		resolve_upload_target, result_json, skipped_symlinks_line, source_failure,
+		sources_and_destination, stdin_destination, stdin_upload_target, transfer_summary,
+		upload_journal,
 	};
 	use crate::{
 		CliConfig,
@@ -3149,6 +3172,80 @@ mod tests {
 			PublicLink::parse(&format!("https://app.filen.io/#/d/{LINK_UUID}%23{key}")).unwrap(),
 			link(LinkKind::File, &key)
 		);
+	}
+
+	/// Opens a file link given `password` with a fake server that opens it only with `secret`
+	/// and refuses it otherwise with `refusal`, answering a prompt with `answer`. Returns what
+	/// opening it gave and the passwords it was tried with.
+	async fn open_fake_file_link(
+		password: Option<&str>,
+		refusal: ErrorKind,
+		answer: &str,
+	) -> (Result<&'static str, String>, Vec<Option<String>>, usize) {
+		let link = link(LinkKind::File, "key").unwrap();
+		let mut tried = Vec::new();
+		let mut asked = 0;
+		let opened = open_linked_file(
+			LinkAccess {
+				link: &link,
+				password,
+			},
+			async |password: Option<&str>| {
+				tried.push(password.map(str::to_owned));
+				match password {
+					Some("secret") => Ok("file"),
+					_ => Err(filen_sdk_rs::Error::custom(refusal, "refused")),
+				}
+			},
+			|| {
+				asked += 1;
+				Ok(answer.to_owned())
+			},
+		)
+		.await
+		.map_err(|e| format!("{e:#}"));
+		(opened, tried, asked)
+	}
+
+	#[tokio::test]
+	async fn a_protected_file_link_asks_for_its_password_and_opens_with_it() {
+		let (opened, tried, asked) =
+			open_fake_file_link(None, ErrorKind::WrongPassword, "secret").await;
+		assert_eq!(opened, Ok("file"));
+		assert_eq!(tried, [None, Some("secret".to_owned())]);
+		assert_eq!(asked, 1);
+	}
+
+	#[tokio::test]
+	async fn a_file_link_refusing_the_asked_password_fails_without_asking_again() {
+		let (opened, tried, asked) =
+			open_fake_file_link(None, ErrorKind::WrongPassword, "guess").await;
+		assert_eq!(
+			opened,
+			Err(format!(
+				"Cannot open the public link {LINK_UUID} (if it has a password, give it with \
+				 --link-password): Error of kind WrongPassword: context: refused"
+			))
+		);
+		assert_eq!(tried, [None, Some("guess".to_owned())]);
+		assert_eq!(asked, 1);
+	}
+
+	#[tokio::test]
+	async fn a_file_link_refusing_the_given_password_fails_without_asking() {
+		let (opened, tried, asked) =
+			open_fake_file_link(Some("guess"), ErrorKind::WrongPassword, "secret").await;
+		assert!(opened.is_err());
+		assert_eq!(tried, [Some("guess".to_owned())]);
+		assert_eq!(asked, 0);
+	}
+
+	#[tokio::test]
+	async fn a_file_link_failing_for_another_reason_fails_without_asking() {
+		let (opened, tried, asked) = open_fake_file_link(None, ErrorKind::Server, "secret").await;
+		assert!(opened.is_err());
+		assert_eq!(tried, [None]);
+		assert_eq!(asked, 0);
 	}
 
 	#[test]
