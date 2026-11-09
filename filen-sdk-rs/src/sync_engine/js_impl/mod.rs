@@ -188,6 +188,24 @@ struct RunningWatch {
 	status: watch::Receiver<WatchStatus>,
 }
 
+/// A slot [`reserve_guarded`](SyncEngineCore::reserve_guarded) reserved, freed when this drops
+/// while the slot still holds what `held` matches. Dropping it on the way out of a call, unwinding
+/// included, is what frees the slot: a pair left reserved by a panicked call would refuse every
+/// later one and keep [`close`](SyncEngineCore::close) polling forever. Once the call has put
+/// something else in the slot, `held` no longer matches and the drop leaves it alone.
+struct SlotGuard<'a, F: Fn(&PairSlot) -> bool> {
+	core: &'a SyncEngineCore,
+	pair: PairId,
+	held: F,
+}
+
+impl<F: Fn(&PairSlot) -> bool> Drop for SlotGuard<'_, F> {
+	fn drop(&mut self) {
+		// Takes only the slots mutex, which no await holds, and tolerates its poisoning.
+		self.core.free_slot(self.pair, &self.held);
+	}
+}
+
 impl PairSlot {
 	fn activity(&self) -> SyncPairActivity {
 		match self {
@@ -488,6 +506,26 @@ impl SyncEngineCore {
 		}
 	}
 
+	/// [`reserve`](Self::reserve) `pair`'s slot for `slot`, with a guard that frees it again while
+	/// it still holds what `held` matches, as `slot` does.
+	fn reserve_guarded<F: Fn(&PairSlot) -> bool>(
+		&self,
+		pair: PairId,
+		slot: PairSlot,
+		held: F,
+		refuses: impl FnOnce(&PairSlot) -> Error,
+	) -> Result<(Arc<OpenEngine>, SlotGuard<'_, F>), Error> {
+		let open = self.reserve(pair, slot, refuses)?;
+		Ok((
+			open,
+			SlotGuard {
+				core: self,
+				pair,
+				held,
+			},
+		))
+	}
+
 	/// Free `pair`'s slot if it still holds what `held` matches.
 	fn free_slot(&self, pair: PairId, held: impl FnOnce(&PairSlot) -> bool) {
 		let mut slots = lock(&self.slots);
@@ -696,23 +734,18 @@ impl SyncEngineCore {
 	) -> Result<JsSyncWatch, Error> {
 		let pair = pair_id_in(pair_id)?;
 		let watch_id = self.watches.fetch_add(1, Ordering::Relaxed);
-		let open = self.reserve(pair, PairSlot::Starting { watch_id }, |taken| {
-			taken.refuses_watch(pair_id)
-		})?;
-		let starting = |slot: &PairSlot| matches!(slot, PairSlot::Starting { watch_id: id } if *id == watch_id);
+		let starting = move |slot: &PairSlot| matches!(slot, PairSlot::Starting { watch_id: id } if *id == watch_id);
+		// Frees the starting slot on every way out but the one that replaces it with the watch.
+		let (open, _starting) =
+			self.reserve_guarded(pair, PairSlot::Starting { watch_id }, starting, |taken| {
+				taken.refuses_watch(pair_id)
+			})?;
 		let (loop_alive, loop_gone) = oneshot::channel();
 		let observer = self.live.observer(pair, pair_id, Some(loop_alive));
 		let config = config.map_or_else(WatchConfig::default, Into::into);
-		let handle = match Arc::clone(&open.engine)
+		let handle = Arc::clone(&open.engine)
 			.watch_with(pair, config, observer)
-			.await
-		{
-			Ok(handle) => handle,
-			Err(error) => {
-				self.free_slot(pair, starting);
-				return Err(error);
-			}
-		};
+			.await?;
 		drop(open);
 		let status = handle.status();
 		// Installed only while the engine is open: a `close` in between does not see a starting
@@ -735,7 +768,6 @@ impl SyncEngineCore {
 		};
 		if let Some(handle) = refused {
 			handle.stop().await;
-			self.free_slot(pair, starting);
 			return Err(closed());
 		}
 		tokio::spawn(pump_status(
@@ -760,12 +792,15 @@ impl SyncEngineCore {
 
 	async fn sync_once(&self, pair_id: u64) -> Result<SyncPassReport, Error> {
 		let pair = pair_id_in(pair_id)?;
-		let open = self.reserve(pair, PairSlot::SyncingOnce, |taken| {
-			taken.refuses_pass(pair_id)
-		})?;
+		let (open, syncing) = self.reserve_guarded(
+			pair,
+			PairSlot::SyncingOnce,
+			|slot| matches!(slot, PairSlot::SyncingOnce),
+			|taken| taken.refuses_pass(pair_id),
+		)?;
 		let mut observer = self.live.observer(pair, pair_id, None);
 		let report = open.engine.sync_once_observed(pair, &mut *observer).await;
-		self.free_slot(pair, |slot| matches!(slot, PairSlot::SyncingOnce));
+		drop(syncing);
 		report.map(Into::into)
 	}
 

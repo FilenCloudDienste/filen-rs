@@ -360,6 +360,40 @@ async fn a_second_close_returns_only_once_the_first_is_done() {
 	second.await.unwrap().unwrap();
 }
 
+#[tokio::test]
+async fn a_slot_is_freed_when_its_call_panics() {
+	let scene = Scene::new();
+	let (core, pair) = scene.with_pair().await;
+	let pair_key = super::pair_id_in(pair).unwrap();
+
+	let panicked = tokio::spawn({
+		let core = Arc::clone(&core);
+		async move {
+			let _reserved = core
+				.reserve_guarded(
+					pair_key,
+					PairSlot::SyncingOnce,
+					|slot| matches!(slot, PairSlot::SyncingOnce),
+					|_| panic!("the slot was free"),
+				)
+				.unwrap();
+			tokio::task::yield_now().await;
+			panic!("the engine call panicked");
+		}
+	})
+	.await;
+
+	assert!(panicked.unwrap_err().is_panic());
+	assert!(
+		lock(&core.slots).get(&pair_key).is_none(),
+		"the panicked call's slot is free"
+	);
+	core.reserve(pair_key, PairSlot::SyncingOnce, |_| {
+		panic!("the slot was left reserved")
+	})
+	.unwrap();
+}
+
 /// A host exits as soon as close returns, so close waits for the release of the drive lock a
 /// pass let go, retries included, for its bound at most: here the proxy the client goes through
 /// refuses every attempt of the release, which is sent again until close gives up on it.
