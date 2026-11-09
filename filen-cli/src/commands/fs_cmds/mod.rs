@@ -69,6 +69,7 @@ use crate::{
 	commands::CommandContext,
 	completion::FilenCompleter,
 	docs::DocElement,
+	editor_command::split_command_line,
 	error::{CliError, find_cli_error},
 	interrupt,
 	ui::{self, UI},
@@ -1421,8 +1422,9 @@ struct EditorCommand {
 	args: Vec<String>,
 }
 
-/// The editor that `$VISUAL`, or else `$EDITOR`, names, split into words as a shell would split
-/// them. Empty variables count as unset.
+/// The editor that `$VISUAL`, or else `$EDITOR`, names, split into words by
+/// [`split_command_line`]: as a shell would split them on Unix, at double quotes only on Windows.
+/// Empty variables count as unset.
 fn editor_command(visual: Option<&str>, editor: Option<&str>) -> Result<Option<EditorCommand>> {
 	let Some((variable, command)) = [("VISUAL", visual), ("EDITOR", editor)]
 		.into_iter()
@@ -1434,7 +1436,7 @@ fn editor_command(visual: Option<&str>, editor: Option<&str>) -> Result<Option<E
 	else {
 		return Ok(None);
 	};
-	let mut words = shlex::split(command)
+	let mut words = split_command_line(command)
 		.ok_or_else(|| UI::failure(&format!("Cannot split ${variable} into words: {command}")))?
 		.into_iter();
 	let program = words
@@ -5288,6 +5290,7 @@ mod tests {
 		);
 	}
 
+	#[cfg(not(windows))]
 	#[test]
 	fn an_editor_command_is_split_into_words_as_a_shell_splits_it() {
 		assert_eq!(
@@ -5304,11 +5307,30 @@ mod tests {
 		assert_eq!(editor_command(None, Some("")).unwrap(), None);
 	}
 
+	#[cfg(not(windows))]
 	#[test]
 	fn an_editor_command_with_an_unclosed_quote_fails() {
 		assert_eq!(
 			editor_command(None, Some("vi 'a")).unwrap_err().to_string(),
 			"Cannot split $EDITOR into words: vi 'a"
+		);
+	}
+
+	#[cfg(windows)]
+	#[test]
+	fn an_editor_command_keeps_the_backslashes_of_a_windows_path() {
+		assert_eq!(
+			editor_command(None, Some(r"C:\Tools\vim\vim.exe -f")).unwrap(),
+			Some(EditorCommand {
+				program: r"C:\Tools\vim\vim.exe".to_owned(),
+				args: vec!["-f".to_owned()],
+			})
+		);
+		assert_eq!(
+			editor_command(None, Some(r#"vi "a"#))
+				.unwrap_err()
+				.to_string(),
+			r#"Cannot split $EDITOR into words: vi "a"#
 		);
 	}
 

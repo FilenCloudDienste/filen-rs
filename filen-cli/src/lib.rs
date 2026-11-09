@@ -62,6 +62,7 @@ mod auth;
 mod commands;
 mod completion;
 mod docs;
+mod editor_command;
 mod error;
 mod interrupt;
 mod local_glob;
