@@ -5877,7 +5877,7 @@ fn tree(rows: &HashMap<String, BaselineEntry>) -> Baseline {
 /// on either side, a directory rename for the fold to find, and a subtree moved with its files
 /// for it to carry.
 mod scoped {
-	use rand::{Rng, SeedableRng, rngs::StdRng};
+	use rand::{RngExt, SeedableRng, rngs::StdRng};
 
 	use super::*;
 

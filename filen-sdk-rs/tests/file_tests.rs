@@ -31,7 +31,7 @@ use filen_sdk_rs::{
 };
 use filen_types::fs::Uuid;
 use futures::AsyncReadExt;
-use rand::TryRngCore;
+use rand::TryRng;
 
 async fn assert_file_upload_download_equal(name: &str, contents_len: usize) {
 	let mut contents = vec![0u8; contents_len];

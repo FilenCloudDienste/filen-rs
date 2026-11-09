@@ -1,5 +1,5 @@
 use filen_types::{crypto::Blake3Hash, fs::StableUuid};
-use rand::{Rng, SeedableRng, rngs::StdRng, seq::SliceRandom};
+use rand::{RngExt, SeedableRng, rngs::StdRng, seq::SliceRandom};
 
 use super::{
 	super::{

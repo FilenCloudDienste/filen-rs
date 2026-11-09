@@ -170,7 +170,7 @@ fn a_map_enumerates_every_path_it_holds() {
 // ------------------------------------------------------------------------------------------
 
 use filen_types::{crypto::Blake3Hash, fs::StableUuid};
-use rand::{Rng, SeedableRng, rngs::StdRng};
+use rand::{RngExt, SeedableRng, rngs::StdRng};
 use uuid::Uuid;
 
 use super::super::baseline::{BaselineState, NodeKind};

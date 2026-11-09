@@ -17,7 +17,7 @@ use filen_sdk_rs::{
 };
 use filen_types::auth::{AuthVersion, FileEncryptionVersion};
 
-use rand::TryRngCore;
+use rand::TryRng;
 
 fn get_compat_test_file(
 	client: &Client,

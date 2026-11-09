@@ -2,7 +2,7 @@ use std::{fs, time::Duration};
 
 use super::super::side::{Nodes, NodesAt, test_support::sorted_entries};
 
-use rand::{Rng, SeedableRng, rngs::StdRng};
+use rand::{RngExt, SeedableRng, rngs::StdRng};
 use uuid::Uuid;
 
 use super::*;

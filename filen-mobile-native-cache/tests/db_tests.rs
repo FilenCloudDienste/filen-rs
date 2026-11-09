@@ -22,7 +22,7 @@ use filen_sdk_rs::{
 };
 use filen_types::fs::Uuid;
 use futures::{StreamExt, future::BoxFuture, stream::FuturesUnordered};
-use rand::TryRngCore;
+use rand::TryRng;
 use test_utils::TestResources;
 
 // Mirrors the app-side auth.json encryption (fileProvider.ts) so the file-init test exercises the

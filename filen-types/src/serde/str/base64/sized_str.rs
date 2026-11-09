@@ -2,7 +2,7 @@ use std::{mem::MaybeUninit, ops::Deref};
 
 use filen_macros::rkyv_self;
 use generic_array::{ArrayLength, GenericArray};
-use rand::Rng;
+use rand::RngExt;
 use rkyv::{
 	bytecheck::CheckBytes,
 	rancor::{Fallible, ResultExt, Source},

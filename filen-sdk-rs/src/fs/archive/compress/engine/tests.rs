@@ -9,7 +9,7 @@ use std::{
 	time::Duration,
 };
 
-use rand::{Rng, SeedableRng, rngs::StdRng};
+use rand::{RngExt, SeedableRng, rngs::StdRng};
 use tokio::{
 	sync::{Semaphore, mpsc},
 	task::JoinHandle,

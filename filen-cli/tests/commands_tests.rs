@@ -7,7 +7,7 @@ use filen_sdk_rs::{
 	sync_engine::{DeleteGuard, SyncEngine},
 };
 use filen_types::api::v3::notes::NoteType;
-use rand::TryRngCore;
+use rand::TryRng;
 use test_utils::authenticated_cli_with_args;
 use tokio::sync::Mutex;
 

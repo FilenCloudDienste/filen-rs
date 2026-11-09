@@ -1,7 +1,7 @@
 use std::{borrow::Cow, collections::HashMap};
 
 use filen_types::crypto::Blake3Hash;
-use rand::{Rng, SeedableRng, rngs::StdRng};
+use rand::{RngExt, SeedableRng, rngs::StdRng};
 
 use super::{
 	super::{

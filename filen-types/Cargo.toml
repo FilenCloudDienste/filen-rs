@@ -28,7 +28,7 @@ yoke = { version = "0.8.1", features = ["derive"] }
 blake3 = "1.8.3"
 generic-array = { version = "1.4.2", features = ["alloc", "rkyv-0_8-full"] }
 typenum = "1.20.0"
-rand = "0.9.2"
+rand = "0.10.3"
 url = { version = "2.5.7", features = ["serde"] }
 rkyv = { version = "0.8.16", features = ["uuid-1"] }
 # Float-to-int conversions (ToPrimitive) without a truncating `as`, which the workspace lints deny.

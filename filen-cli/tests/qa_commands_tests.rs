@@ -140,7 +140,7 @@ mod live {
 
 	use filen_macros::shared_test_runtime;
 	use filen_sdk_rs::fs::{HasName as _, HasUUID as _, categories::NonRootFileType};
-	use rand::TryRngCore as _;
+	use rand::TryRng as _;
 	use regex::Regex;
 	use test_utils::authenticated_cli_with_args;
 

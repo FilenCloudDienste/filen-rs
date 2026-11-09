@@ -21,7 +21,7 @@ use filen_types::{
 	fs::Uuid,
 };
 use futures::FutureExt;
-use rand::Rng;
+use rand::RngExt;
 
 fn file_meta_name<'a>(meta: &'a FileMeta<'_>) -> Option<&'a str> {
 	match meta {

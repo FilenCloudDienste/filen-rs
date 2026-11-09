@@ -4,7 +4,7 @@ use std::{
 };
 
 use filen_types::{crypto::Blake3Hash, fs::StableUuid};
-use rand::{Rng, SeedableRng, rngs::StdRng};
+use rand::{RngExt, SeedableRng, rngs::StdRng};
 
 use super::*;
 use crate::{

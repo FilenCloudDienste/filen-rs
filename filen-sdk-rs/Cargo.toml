@@ -151,7 +151,7 @@ reqwest = { version = "0.12.24", features = [
 ], default-features = false }
 
 filen-types = { path = "../filen-types" }
-rand = "0.9.2"
+rand = "0.10.3"
 siphasher = "1"
 old_rng = { package = "rand", version = "0.8.5" } # for compatibility with rsa 0.9.8
 aes-gcm = { version = "0.11.1", default-features = false, features = [

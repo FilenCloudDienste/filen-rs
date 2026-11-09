@@ -12,7 +12,7 @@ use filen_types::{
 	crypto::{DerivedPassword, EncryptedString},
 	serde::str::{SizedHexString, SizedStr},
 };
-use rand::Rng;
+use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use typenum::{U32, U64, U256};

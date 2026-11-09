@@ -1,7 +1,7 @@
 use aes_gcm::{AesGcm, Nonce, aead::AeadInOut, aes::Aes256};
 use digest::consts::{U12, U16};
 use filen_types::crypto::EncryptedString;
-use rand::{Rng, rngs::ThreadRng};
+use rand::{RngExt, rngs::ThreadRng};
 
 use crate::runtime;
 

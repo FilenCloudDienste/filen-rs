@@ -768,7 +768,7 @@ fn past_subtree(path: &str, dir: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-	use rand::{Rng, SeedableRng, rngs::StdRng};
+	use rand::{RngExt, SeedableRng, rngs::StdRng};
 
 	use super::{super::super::plan::test_support, *};
 

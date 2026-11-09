@@ -20,7 +20,7 @@ use std::{
 
 use base64::{Engine as _, prelude::BASE64_URL_SAFE_NO_PAD};
 use filen_macros::js_type;
-use rand::{Rng as _, distr::Alphanumeric};
+use rand::{RngExt as _, distr::Alphanumeric};
 use serde_json::{Map, Value};
 use tokio::{
 	io::{AsyncBufRead, AsyncBufReadExt as _, AsyncWriteExt as _, BufReader},
