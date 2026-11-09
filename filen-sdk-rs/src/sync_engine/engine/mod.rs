@@ -1673,7 +1673,12 @@ where
 	T: Send + 'static,
 {
 	let store = Arc::clone(store);
-	off_runtime("a baseline store task", move || work(&locked(&store))).await
+	off_runtime("a baseline store task", move || {
+		#[cfg(test)]
+		test_support::reaching_store_lock(&store);
+		work(&locked(&store))
+	})
+	.await
 }
 
 /// [`off_store`] for `work` that returns a rusqlite result, its error named by `context` as
@@ -9079,5 +9084,7 @@ impl Drop for LocalWalk {
 	}
 }
 
+#[cfg(test)]
+mod test_support;
 #[cfg(test)]
 mod tests;

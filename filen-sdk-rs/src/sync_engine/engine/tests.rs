@@ -1,6 +1,9 @@
 use std::{
 	collections::HashSet,
-	sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+	sync::{
+		atomic::{AtomicBool, AtomicUsize, Ordering},
+		mpsc,
+	},
 };
 #[cfg(unix)]
 use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
@@ -7449,39 +7452,79 @@ async fn a_pause_racing_a_removal_leaves_no_paused_id_behind() {
 	std::fs::remove_file(&path).ok();
 }
 
-/// One pair's store, held for as long as that pair's whole-tree read holds it. Answers once the
-/// lock is actually in hand, and says so for as long as it keeps it, so a test can prove what
-/// ran DURING the hold rather than timing anything.
-fn store_held_for(
-	store: SharedStore,
-	how_long: Duration,
-) -> (
-	tokio::sync::oneshot::Receiver<()>,
-	Arc<AtomicBool>,
-	tokio::task::JoinHandle<()>,
-) {
-	let (acquired_tx, acquired_rx) = tokio::sync::oneshot::channel();
-	let holding = Arc::new(AtomicBool::new(true));
-	let task = {
-		let holding = Arc::clone(&holding);
-		tokio::task::spawn_blocking(move || {
-			let _guard = locked(&store);
-			let _ = acquired_tx.send(());
-			std::thread::sleep(how_long);
-			holding.store(false, Ordering::SeqCst);
-		})
-	};
-	(acquired_rx, holding, task)
+/// Where a test's hold on a pair's store stands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Hold {
+	/// The lock is in hand.
+	Held,
+	/// The test let go.
+	Released,
+	/// [`STUCK_AFTER`] ran out before the test let go. Only something waiting on the hold keeps a
+	/// test from letting go, and a wait on the runtime's only worker also stops the timers that
+	/// would fail the test, so the hold gives up by itself, from its own thread, and says so here.
+	TimedOut,
 }
+
+/// One pair's store, held the way that pair's whole-tree read holds it, until the test lets go or
+/// [`STUCK_AFTER`] runs out, so a test can prove what ran DURING the hold rather than timing
+/// anything, and a regression that waits on the hold fails the test instead of hanging it.
+struct StoreHold {
+	state: Arc<std::sync::Mutex<Hold>>,
+	release: mpsc::Sender<()>,
+	task: tokio::task::JoinHandle<()>,
+}
+
+impl StoreHold {
+	/// Take `store`'s lock on a blocking thread, answering once it is in hand.
+	async fn take(store: SharedStore) -> Self {
+		let (acquired_tx, acquired_rx) = tokio::sync::oneshot::channel();
+		let (release, release_rx) = mpsc::channel();
+		let state = Arc::new(std::sync::Mutex::new(Hold::Held));
+		let task = {
+			let state = Arc::clone(&state);
+			tokio::task::spawn_blocking(move || {
+				let _guard = locked(&store);
+				let _ = acquired_tx.send(());
+				// A dropped sender releases the hold too, so a failing test never leaves it wedged.
+				let ended = match release_rx.recv_timeout(STUCK_AFTER) {
+					Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => Hold::Released,
+					Err(mpsc::RecvTimeoutError::Timeout) => Hold::TimedOut,
+				};
+				// Still under the lock, so whatever was waiting on it reads the final state.
+				*state.lock().unwrap() = ended;
+			})
+		};
+		acquired_rx.await.unwrap();
+		Self {
+			state,
+			release,
+			task,
+		}
+	}
+
+	fn state(&self) -> Hold {
+		*self.state.lock().unwrap()
+	}
+
+	async fn release(self) {
+		// The hold may have timed out already, and dropped its receiver with it.
+		let _ = self.release.send(());
+		self.task.await.unwrap();
+	}
+}
+
+/// How long a step that must not wait on the held store gets before the hold gives up on it.
+/// Only a failure bound: a passing run never comes near it.
+const STUCK_AFTER: Duration = Duration::from_secs(30);
 
 /// A pass on one pair must not hold up the control verbs of another. The pass's widest step is
 /// its baseline read, which holds that pair's store for as long as the tree takes; before the
 /// split there was one store for the whole engine, so `list_pairs`, `pause_pair` and
 /// `resolve_conflict` on ANY pair queued behind it.
 ///
-/// Asserted as "they finished while the hold was still in force" rather than as a deadline: the
-/// property is that they never wait for that lock at all, and that reads the same on a busy
-/// machine as on an idle one.
+/// Pair A's store stays held until the verbs have finished, so they can only finish with the hold
+/// still in force if they never wait for that lock at all; that reads the same on a busy machine
+/// as on an idle one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn a_pairs_store_hold_does_not_delay_another_pairs_control_verbs() {
 	let (engine, pair_a, path) = engine_with_pair("store_split_control").await;
@@ -7493,73 +7536,88 @@ async fn a_pairs_store_hold_does_not_delay_another_pairs_control_verbs() {
 		.upsert_entry(pair_b, &converged_conflict(Uuid::new_v4()))
 		.unwrap();
 
-	let store_a = engine.pair_store(pair_a).await.unwrap();
-	let (acquired, holding, wedge) = store_held_for(store_a, Duration::from_millis(750));
-	acquired.await.unwrap();
+	let hold = StoreHold::take(engine.pair_store(pair_a).await.unwrap()).await;
 
-	let started = std::time::Instant::now();
 	engine.list_pairs().await.unwrap();
 	engine.pause_pair(pair_b).await.unwrap();
+	let resolved = engine
+		.resolve_conflict(pair_b, "a.txt", ConflictResolution::KeepLocal)
+		.await
+		.unwrap();
 	assert_eq!(
-		engine
-			.resolve_conflict(pair_b, "a.txt", ConflictResolution::KeepLocal)
-			.await
-			.unwrap(),
+		hold.state(),
+		Hold::Held,
+		"pair B's control verbs finished only once pair A's store hold had ended: they waited on it"
+	);
+	assert_eq!(
+		resolved,
 		ConflictResolved::default(),
 		"keeping the local side moves no copy into the bin"
 	);
-	let elapsed = started.elapsed();
-	assert!(
-		holding.load(Ordering::SeqCst),
-		"pair B's control verbs waited out pair A's store hold: they took {elapsed:?}, by \
-			 which time the hold had already been released"
-	);
 
-	wedge.await.unwrap();
+	hold.release().await;
 	drop(engine);
 	std::fs::remove_file(&path).ok();
 }
 
 /// And when a verb DOES have to wait for its own pair's store, it waits on a blocking thread:
-/// the runtime's worker keeps running other tasks meanwhile. One worker thread here, so a task
-/// that still makes progress proves the wait is not on it — which is what stops a pass's
+/// the runtime's worker keeps running other tasks meanwhile. One worker thread here, and the test
+/// body itself runs on its own `block_on` thread rather than on that worker, so the proof is a
+/// probe task spawned onto the worker once the read is at the lock: it can only run while the
+/// hold is still in force if the wait is not on the worker — which is what stops a pass's
 /// whole-tree SQLite work from stalling a runtime this engine shares with everything else.
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn a_pairs_whole_tree_store_work_waits_off_the_runtime_thread() {
 	let (engine, pair, path) = engine_with_pair("store_off_runtime").await;
+	let engine = Arc::new(engine);
 	let store = engine.pair_store(pair).await.unwrap();
-	let (acquired, holding, wedge) = store_held_for(store, Duration::from_millis(300));
-	acquired.await.unwrap();
+	let hold = StoreHold::take(Arc::clone(&store)).await;
+	let reached = test_support::next_store_lock(&store);
 
-	let ticks = Arc::new(AtomicUsize::new(0));
-	let ticking = {
-		let ticks = Arc::clone(&ticks);
-		tokio::spawn(async move {
-			loop {
-				tokio::time::sleep(Duration::from_millis(10)).await;
-				ticks.fetch_add(1, Ordering::SeqCst);
-			}
-		})
-	};
+	// This reads the pair's conflicts, so it wants the very lock the hold has.
+	let mut listing = tokio::spawn({
+		let engine = Arc::clone(&engine);
+		async move { engine.list_conflicts(pair).await }
+	});
 
-	// This reads the pair's conflicts, so it wants the very lock the wedge is holding.
-	let started = std::time::Instant::now();
-	engine.list_conflicts(pair).await.unwrap();
-	let waited = started.elapsed();
-	ticking.abort();
+	tokio::select! {
+		reached = reached => reached.expect("the seam keeps its sender until it fires"),
+		finished = &mut listing => {
+			assert_eq!(
+				hold.state(),
+				Hold::TimedOut,
+				"the read finished without taking the store lock on a blocking thread, and the \
+				 hold it should have waited on is still in force: {finished:?}"
+			);
+			panic!(
+				"the read waited for the store on the runtime's only worker: nothing else ran \
+				 until the hold gave up after {STUCK_AFTER:?}"
+			);
+		}
+	}
 
-	assert!(
-		!holding.load(Ordering::SeqCst) && waited >= Duration::from_millis(150),
-		"the read did not actually contend for the store it shares with the hold: {waited:?}"
+	// The read is at the lock. If it waits there on the only worker, this probe runs only once
+	// the hold has given up by itself, and so reads `TimedOut`.
+	let seen = tokio::spawn({
+		let state = Arc::clone(&hold.state);
+		async move { *state.lock().unwrap() }
+	})
+	.await
+	.unwrap();
+	assert_eq!(
+		seen,
+		Hold::Held,
+		"the runtime's only worker ran nothing while the read waited at the store lock: the wait is \
+		 on the worker"
 	);
 	assert!(
-		ticks.load(Ordering::SeqCst) >= 5,
-		"the runtime's only worker made almost no progress ({} ticks) while a store read \
-			 waited: the wait is on the runtime thread, not on a blocking one",
-		ticks.load(Ordering::SeqCst)
+		!listing.is_finished(),
+		"the read finished while the store lock it reached was still held"
 	);
+	assert_eq!(hold.state(), Hold::Held);
 
-	wedge.await.unwrap();
+	hold.release().await;
+	listing.await.unwrap().unwrap();
 	drop(engine);
 	std::fs::remove_file(&path).ok();
 }
