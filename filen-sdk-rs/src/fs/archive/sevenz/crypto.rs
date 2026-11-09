@@ -7,7 +7,7 @@ use std::{
 };
 
 use aes_gcm::aes::Aes256;
-use cbc::cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit, generic_array::GenericArray};
+use cbc::cipher::{BlockModeDecrypt, BlockModeEncrypt, KeyIvInit};
 use sha2::{Digest, Sha256, Sha512};
 
 use crate::fs::archive::password::ArchivePassword;
@@ -181,8 +181,7 @@ impl<R: Read> Read for AesCbcReader<R> {
 					n => filled += n,
 				}
 			}
-			self.cipher
-				.decrypt_block_mut(GenericArray::from_mut_slice(&mut self.plain));
+			self.cipher.decrypt_block((&mut self.plain).into());
 			self.plain_at = 0;
 		}
 		let n = buf.len().min(BLOCK - self.plain_at);
@@ -214,8 +213,7 @@ impl<W: Write> AesCbcWriter<W> {
 	}
 
 	fn encrypt_pending(&mut self) -> io::Result<()> {
-		self.cipher
-			.encrypt_block_mut(GenericArray::from_mut_slice(&mut self.pending));
+		self.cipher.encrypt_block((&mut self.pending).into());
 		self.inner.write_all(&self.pending)?;
 		self.pending_len = 0;
 		Ok(())

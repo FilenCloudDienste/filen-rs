@@ -4,7 +4,7 @@ use std::str::FromStr;
 use aes_gcm::aes::{self};
 use base64::{Engine, prelude::BASE64_STANDARD};
 use cbc::cipher::block_padding::Pkcs7;
-use cbc::cipher::{BlockDecryptMut, KeyIvInit};
+use cbc::cipher::{BlockModeDecrypt, KeyIvInit};
 use filen_macros::rkyv_self;
 use filen_types::crypto::{DerivedPassword, EncryptedString};
 use filen_types::serde::str::{SizedHexString, SizedStr};
@@ -62,7 +62,7 @@ fn decrypt(key: &[u8], data: &mut Vec<u8>) -> Result<(), ConversionError> {
 
 	data.copy_within(16.., 0);
 	data.truncate(data.len() - 16);
-	decryptor.decrypt_padded_mut::<Pkcs7>(data)?;
+	decryptor.decrypt_padded::<Pkcs7>(data)?;
 	let padding_len = data.last().copied().unwrap_or(0) as usize;
 	data.truncate(data.len() - padding_len);
 	Ok(())
@@ -113,7 +113,7 @@ fn decrypt_data(key: &[u8], data: &mut Vec<u8>) -> Result<(), ConversionError> {
 		decrypt(key, data)?;
 	} else {
 		let cipher = cbc::Decryptor::<aes::Aes256>::new_from_slices(key, &key[..IV_LEN])?;
-		cipher.decrypt_padded_mut::<Pkcs7>(data)?;
+		cipher.decrypt_padded::<Pkcs7>(data)?;
 		let padding_len = data.last().copied().unwrap_or(0) as usize;
 		data.truncate(data.len() - padding_len);
 	}

@@ -2,7 +2,7 @@ use std::{borrow::Cow, str::FromStr};
 
 use aes_gcm::{
 	AesGcm, Nonce,
-	aead::{Aead, AeadInPlace},
+	aead::{Aead, AeadInOut},
 	aes::Aes256,
 };
 use base64::{Engine, prelude::BASE64_STANDARD};
@@ -86,7 +86,8 @@ impl V2Key {
 	) -> Result<String, (ConversionError, Vec<u8>)> {
 		// slice as bytes: fixed offsets may not be char boundaries in hostile input
 		let meta = meta.0.as_bytes();
-		let nonce = Nonce::from_slice(&meta[3..NONCE_SIZE + 3]);
+		let nonce = <&Nonce<NonceSize>>::try_from(&meta[3..NONCE_SIZE + 3])
+			.expect("the range is NONCE_SIZE bytes");
 		out.clear();
 		if let Err(e) = BASE64_STANDARD.decode_vec(&meta[NONCE_SIZE + 3..], &mut out) {
 			return Err((e.into(), out));

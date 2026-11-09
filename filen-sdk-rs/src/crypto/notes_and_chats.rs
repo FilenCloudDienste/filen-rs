@@ -350,7 +350,7 @@ mod tests {
 		let plaintext = b"{\"content\":\"caf\xe9\"}";
 		let ciphertext = Aes256Gcm::new_from_slice(&derived_key)
 			.unwrap()
-			.encrypt(Nonce::from_slice(nonce), plaintext.as_slice())
+			.encrypt(&Nonce::from(*nonce), plaintext.as_slice())
 			.unwrap();
 		let meta = EncryptedString(Cow::Owned(format!(
 			"002{}{}",

@@ -1,4 +1,4 @@
-use cbc::cipher::block_padding::UnpadError;
+use cbc::cipher::block_padding;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -42,11 +42,11 @@ pub enum ConversionError {
 	)]
 	MissingStableUuid,
 	#[error("Unpad error")]
-	UnpadError(cbc::cipher::block_padding::UnpadError),
+	UnpadError(block_padding::Error),
 }
 
-impl From<UnpadError> for ConversionError {
-	fn from(e: UnpadError) -> Self {
+impl From<block_padding::Error> for ConversionError {
+	fn from(e: block_padding::Error) -> Self {
 		Self::UnpadError(e)
 	}
 }

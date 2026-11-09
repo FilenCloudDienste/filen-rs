@@ -2,7 +2,7 @@ use std::{borrow::Cow, fmt::Debug, str::FromStr};
 
 use aes_gcm::{
 	AesGcm, Nonce,
-	aead::{Aead, AeadInPlace},
+	aead::{Aead, AeadInOut},
 	aes::Aes256,
 };
 use base64::{Engine, prelude::BASE64_STANDARD};
@@ -93,7 +93,7 @@ impl MetaCrypter for EncryptionKey {
 	#[allow(unsafe_code)]
 	fn blocking_encrypt_meta_into(&self, meta: &str, mut out: String) -> EncryptedString<'static> {
 		let nonce: [u8; NONCE_SIZE] = rand::random();
-		let nonce = Nonce::from_slice(&nonce);
+		let nonce = Nonce::from(nonce);
 		out.clear();
 		let base64_len =
 			base64::encoded_len(meta.len() + TAG_SIZE, true).expect("meta len too long for base64");
@@ -117,7 +117,7 @@ impl MetaCrypter for EncryptionKey {
 
 		// SAFETY: This cannot fail unless we encrypt more than 64GiB of metadata at a time
 		// which we will never do we also don't have AAD which could cause issues
-		let encrypted = self.cipher().encrypt(nonce, meta.as_bytes()).unwrap();
+		let encrypted = self.cipher().encrypt(&nonce, meta.as_bytes()).unwrap();
 		BASE64_STANDARD.encode_string(encrypted, &mut out);
 		EncryptedString(Cow::Owned(out))
 	}

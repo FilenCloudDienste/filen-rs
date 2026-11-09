@@ -114,9 +114,15 @@ fn derive(password: &ArchivePassword, salt: &[u8], strength: AesStrength) -> Aes
 	let mut iv = [0u8; 16];
 	iv[0] = 1;
 	let cipher = match strength {
-		AesStrength::Aes128 => Cipher::Aes128(Ctr128LE::new(key.into(), &iv.into())),
-		AesStrength::Aes192 => Cipher::Aes192(Ctr128LE::new(key.into(), &iv.into())),
-		AesStrength::Aes256 => Cipher::Aes256(Ctr128LE::new(key.into(), &iv.into())),
+		AesStrength::Aes128 => {
+			Cipher::Aes128(Ctr128LE::new_from_slices(key, &iv).expect("key is key_len bytes"))
+		}
+		AesStrength::Aes192 => {
+			Cipher::Aes192(Ctr128LE::new_from_slices(key, &iv).expect("key is key_len bytes"))
+		}
+		AesStrength::Aes256 => {
+			Cipher::Aes256(Ctr128LE::new_from_slices(key, &iv).expect("key is key_len bytes"))
+		}
 	};
 	AesKeys {
 		cipher,

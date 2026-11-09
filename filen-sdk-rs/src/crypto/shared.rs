@@ -1,4 +1,4 @@
-use aes_gcm::{AesGcm, Nonce, aead::AeadInPlace, aes::Aes256};
+use aes_gcm::{AesGcm, Nonce, aead::AeadInOut, aes::Aes256};
 use digest::consts::{U12, U16};
 use filen_types::crypto::EncryptedString;
 use rand::{Rng, rngs::ThreadRng};
@@ -99,9 +99,9 @@ pub(crate) fn encrypt_data(
 	data: &mut Vec<u8>,
 ) -> Result<(), ConversionError> {
 	let nonce: [u8; NONCE_SIZE] = rand::random();
-	let nonce = Nonce::from_slice(&nonce);
+	let nonce = Nonce::from(nonce);
 	data.reserve_exact(NONCE_SIZE + TAG_SIZE);
-	cipher.encrypt_in_place(nonce, &[], data)?;
+	cipher.encrypt_in_place(&nonce, &[], data)?;
 	let original_len = data.len();
 	data.extend_from_within(original_len - NONCE_SIZE..);
 	data.copy_within(0..original_len - NONCE_SIZE, NONCE_SIZE);
@@ -120,9 +120,9 @@ pub(crate) fn decrypt_data(
 		));
 	}
 	let nonce: [u8; NONCE_SIZE] = data[0..NONCE_SIZE].try_into()?;
-	let nonce = Nonce::from_slice(&nonce);
+	let nonce = Nonce::from(nonce);
 	data.copy_within(NONCE_SIZE.., 0);
 	data.truncate(data.len() - NONCE_SIZE);
-	cipher.decrypt_in_place(nonce, &[], data)?;
+	cipher.decrypt_in_place(&nonce, &[], data)?;
 	Ok(())
 }
