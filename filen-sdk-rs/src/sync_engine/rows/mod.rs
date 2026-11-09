@@ -123,7 +123,7 @@ use self::snapshot::{Counts, MAX_PAGE, PAGE, Page};
 pub(super) use self::snapshot::{reads, reset_reads};
 use super::{
 	baseline::{BaselineEntry, BaselineState, NodeKind},
-	plan::ancestors,
+	plan::{ancestors, moved_path},
 	relpath::parent_path,
 	scan::collision_key,
 	stage::{Confirmed, StagedConfirmations},
@@ -421,6 +421,16 @@ impl Edits {
 fn is_at_or_under(path: &str, rel_path: &str) -> bool {
 	path.strip_prefix(rel_path)
 		.is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+}
+
+/// Re-key `row` from under `from` to the same place under `to`. Returns whether it was at or under
+/// `from`; a row that was not is left unchanged.
+fn rekey(row: &mut BaselineEntry, from: &str, to: &str) -> bool {
+	let Some(rel_path) = moved_path(&row.rel_path, from, to) else {
+		return false;
+	};
+	row.rel_path = rel_path;
+	true
 }
 
 /// What follows `rel_path` in `path` when `path` is at or under it: `""` at it, `/...` under it.
@@ -953,13 +963,7 @@ impl Baseline {
 				} else {
 					Box::new(
 						self.rows_in(depth - 1, under_to.moved_back(to, from), dirs)
-							.filter_map(move |row| {
-								let rest = at_or_under(&row.rel_path, from)?;
-								Some(BaselineEntry {
-									rel_path: format!("{to}{rest}"),
-									..row
-								})
-							}),
+							.filter_map(move |mut row| rekey(&mut row, from, to).then_some(row)),
 					)
 				};
 				merge(kept, Box::new(point.into_iter().chain(subtree)))
@@ -1063,8 +1067,7 @@ impl Baseline {
 						|| self
 							.rows_in(depth - 1, Span::under(from), false)
 							.any(|row| {
-								at_or_under(&row.rel_path, from)
-									.is_some_and(|rest| visit(&format!("{to}{rest}")))
+								moved_path(&row.rel_path, from, to).is_some_and(|p| visit(&p))
 							});
 				}
 				match at_or_under(folded, &folded_to) {
@@ -1073,8 +1076,7 @@ impl Baseline {
 					Some(rest) => {
 						let source = format!("{}{rest}", collision_key(from));
 						self.visit_folded_in(depth - 1, &source, exact, &mut |path| {
-							at_or_under(path, from)
-								.is_some_and(|rest| visit(&format!("{to}{rest}")))
+							moved_path(path, from, to).is_some_and(|p| visit(&p))
 						})
 					}
 					None => false,
@@ -1148,12 +1150,9 @@ impl Baseline {
 			}
 			Layer::Moved { from, to } => below
 				.into_iter()
-				.map(|row| match at_or_under(&row.rel_path, from) {
-					Some(rest) => BaselineEntry {
-						rel_path: format!("{to}{rest}"),
-						..row
-					},
-					None => row,
+				.map(|mut row| {
+					rekey(&mut row, from, to);
+					row
 				})
 				.collect(),
 		}
@@ -1224,10 +1223,7 @@ impl Baseline {
 				let mut out: Vec<String> = below
 					.into_iter()
 					.filter(|path| path != from)
-					.map(|path| match at_or_under(&path, from) {
-						Some(rest) => format!("{to}{rest}"),
-						None => path,
-					})
+					.map(|path| moved_path(&path, from, to).unwrap_or(path))
 					.collect();
 				// The row at `from` itself changes its NAME, and whether a row is a rule file is a
 				// question about its name: asked again of it at `to`.
@@ -1265,7 +1261,6 @@ impl Baseline {
 			Layer::Moved { from, to } => {
 				let mut out = self.unsynced_in(depth - 1, root);
 				out.retain(|path| !is_at_or_under(path, from));
-				let moved = |rest: &str| format!("{to}{rest}");
 				if root.is_empty() || at_or_under(to, root).is_some_and(|rest| !rest.is_empty()) {
 					// `to` is strictly under `root`: every moved row is.
 					if self
@@ -1277,7 +1272,7 @@ impl Baseline {
 					out.extend(
 						self.unsynced_in(depth - 1, from)
 							.iter()
-							.filter_map(|path| at_or_under(path, from).map(moved)),
+							.filter_map(|path| moved_path(path, from, to)),
 					);
 				} else if let Some(rest) = at_or_under(root, to) {
 					// `root` is `to` or under it: the moved rows under it are those under the same
@@ -1285,7 +1280,7 @@ impl Baseline {
 					out.extend(
 						self.unsynced_in(depth - 1, &format!("{from}{rest}"))
 							.iter()
-							.filter_map(|path| at_or_under(path, from).map(moved)),
+							.filter_map(|path| moved_path(path, from, to)),
 					);
 				}
 				out
@@ -1663,13 +1658,10 @@ impl Baseline {
 				..row
 			})
 			.into_iter()
-			.chain(self.subtree(from).filter_map(|row| {
-				let rest = at_or_under(&row.rel_path, from)?;
-				Some(BaselineEntry {
-					rel_path: format!("{to}{rest}"),
-					..row
-				})
-			}))
+			.chain(
+				self.subtree(from)
+					.filter_map(|mut row| rekey(&mut row, from, to).then_some(row)),
+			)
 			.collect();
 		let edits = self.edits_mut();
 		for row in &moving {
