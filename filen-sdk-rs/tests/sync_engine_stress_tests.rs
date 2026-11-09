@@ -10,7 +10,7 @@ use std::{collections::BTreeSet, path::Path, time::Duration};
 use filen_macros::shared_test_runtime;
 use filen_sdk_rs::{
 	fs::HasUUID,
-	sync_engine::{SyncEngine, SyncMode},
+	sync_engine::{ConflictResolution, PlannedConflict, SyncEngine, SyncMode},
 };
 use uuid::Uuid;
 
@@ -380,28 +380,99 @@ async fn twoway_two_clients_contend_and_converge() {
 		);
 	}
 
+	// One last concurrent pass each, so whatever the rounds left in flight has settled.
+	let (ra, rb) = tokio::join!(engine_a.sync_once(pair_a), engine_b.sync_once(pair_b));
+	for c in ra
+		.expect("final settle a")
+		.conflict_paths()
+		.chain(rb.expect("final settle b").conflict_paths())
+	{
+		all_conflicts.insert(c.to_string());
+	}
+
 	// --- conflict handling for conflict.txt ---
-	// It must still exist somewhere (never destroyed on both sides) ...
-	let exists_a = local_a.join("conflict.txt").is_file();
-	let exists_b = local_b.join("conflict.txt").is_file();
-	// A versioned/renamed survivor (e.g. "conflict (conflicted ...).txt") also counts as "present".
-	let conflict_survivor_present = exists_a
-		|| exists_b
-		|| has_conflict_named_survivor(&local_a)
-		|| has_conflict_named_survivor(&local_b);
+	// The engine holds a two-way conflict rather than picking a side, so it must have reported it.
 	assert!(
-		conflict_survivor_present,
-		"conflict.txt was destroyed on both sides — data loss"
+		all_conflicts.contains("conflict.txt"),
+		"conflict.txt was never surfaced via report.conflicts (saw {all_conflicts:?})"
 	);
 
-	// ... and it must have been SURFACED as a conflict at some point. Fallback tolerance: if the
-	// engine instead resolved the conflict by versioning (a renamed survivor on disk), accept that
-	// as a non-silent resolution rather than failing.
-	let surfaced = all_conflicts.iter().any(|c| c.contains("conflict.txt"));
+	// Whichever upload lost the race, its engine still holds the conflict (the winner may hold one
+	// too, for the edit its upload buried), and a held conflict leaves the local copy alone. The
+	// winner's copy is its own push. So each side's edit is still in place in its own tree.
+	let held =
+		|conflicts: Vec<PlannedConflict>| conflicts.iter().any(|c| c.rel_path == "conflict.txt");
+	let held_a = held(engine_a.list_conflicts(pair_a).await.unwrap());
+	let held_b = held(engine_b.list_conflicts(pair_b).await.unwrap());
 	assert!(
-		surfaced || has_conflict_named_survivor(&local_a) || has_conflict_named_survivor(&local_b),
-		"conflict.txt was neither surfaced via report.conflicts (saw {all_conflicts:?}) nor \
-		 resolved by an on-disk versioned survivor"
+		held_a || held_b,
+		"neither engine holds the conflict on conflict.txt after the contention rounds"
+	);
+	for (root, label, edit) in [
+		(&local_a, "A", b"from-A-side-diverged".as_slice()),
+		(&local_b, "B", b"from-B-side-diverged"),
+	] {
+		assert!(
+			read_eq(root, "conflict.txt", edit),
+			"{label}'s edit is no longer at conflict.txt in {label}'s own tree (it holds {:?})",
+			std::fs::read(root.join("conflict.txt"))
+				.map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+		);
+	}
+
+	// Resolve it by keeping both on one side. When both engines hold it the other takes the
+	// remote: a second keep-both would upload a conflict.old.txt of its own at the same time, a
+	// same-name create race of its own.
+	let (keep_both, take_remote) = if held_a {
+		((&engine_a, pair_a), held_b.then_some((&engine_b, pair_b)))
+	} else {
+		((&engine_b, pair_b), None)
+	};
+	let kept_as = keep_both
+		.0
+		.resolve_conflict(keep_both.1, "conflict.txt", ConflictResolution::KeepBoth)
+		.await
+		.unwrap()
+		.kept_as;
+	assert_eq!(kept_as.as_deref(), Some("conflict.old.txt"));
+	if let Some((engine, pair)) = take_remote {
+		engine
+			.resolve_conflict(pair, "conflict.txt", ConflictResolution::KeepRemote)
+			.await
+			.unwrap();
+	}
+
+	// Then the two trees converge to the same contents, both edits among them.
+	converge(
+		Peer {
+			engine: &engine_a,
+			pair: pair_a,
+		},
+		Peer {
+			engine: &engine_b,
+			pair: pair_b,
+		},
+		Order::AFirst,
+		&mut all_conflicts,
+		"contention-resolved",
+		|| trees_equal(&local_a, &local_b),
+	)
+	.await;
+	let tree_a = walk_tree(&local_a);
+	assert_tree_maps_identical(&tree_a, &walk_tree(&local_b), "local_a", "local_b");
+	for edit in [b"from-A-side-diverged".as_slice(), b"from-B-side-diverged"] {
+		assert!(
+			["conflict.txt", "conflict.old.txt"]
+				.iter()
+				.any(|name| tree_a.get(*name).is_some_and(|(_, _, bytes)| bytes == edit)),
+			"the edit {:?} is not in the converged trees",
+			String::from_utf8_lossy(edit)
+		);
+	}
+	assert!(
+		!held(engine_a.list_conflicts(pair_a).await.unwrap())
+			&& !held(engine_b.list_conflicts(pair_b).await.unwrap()),
+		"a resolved conflict is still held after the trees converged"
 	);
 
 	std::fs::remove_dir_all(&local_a).ok();
@@ -421,33 +492,6 @@ fn count_prefixed(root: &Path, prefix: &str, half: usize) -> usize {
 	(0..half)
 		.filter(|i| root.join(format!("{prefix}/{prefix}{i:04}.txt")).is_file())
 		.count()
-}
-
-/// True if there is any file under `root` whose name starts with "conflict" but is not exactly
-/// "conflict.txt" — i.e. a versioned/renamed conflict survivor the engine may have produced.
-fn has_conflict_named_survivor(root: &Path) -> bool {
-	let mut stack = vec![root.to_path_buf()];
-	while let Some(dir) = stack.pop() {
-		let rd = match std::fs::read_dir(&dir) {
-			Ok(rd) => rd,
-			Err(_) => continue,
-		};
-		for entry in rd.flatten() {
-			let ft = match entry.file_type() {
-				Ok(ft) => ft,
-				Err(_) => continue,
-			};
-			if ft.is_dir() {
-				stack.push(entry.path());
-			} else if ft.is_file() {
-				let name = entry.file_name().to_string_lossy().to_string();
-				if name.starts_with("conflict") && name != "conflict.txt" {
-					return true;
-				}
-			}
-		}
-	}
-	false
 }
 
 // ===========================================================================
