@@ -97,8 +97,9 @@ fn attribute_value<'a>(attributes: &'a str, name: &str) -> Option<&'a str> {
 	value.as_str().split_once(quote).map(|(value, _)| value)
 }
 
-/// Yields the text of every `<li>` in `body`, with nested inline tags stripped and entities
-/// decoded — the equivalent of cheerio's `$(li).text().trim()`.
+/// Yields the text of every `<li>` in `body`, with nested inline tags stripped, entities
+/// decoded and line breaks turned into spaces, so each item stays on one Markdown line.
+/// Otherwise it matches cheerio's `$(li).text().trim()`.
 fn list_item_texts(body: &str) -> Vec<String> {
 	let mut texts = Vec::new();
 	let mut rest = body;
@@ -110,7 +111,12 @@ fn list_item_texts(body: &str) -> Vec<String> {
 		let (content, remainder) = content_start
 			.split_once("</li>")
 			.unwrap_or((content_start, ""));
-		texts.push(decode_entities(&strip_tags(content)).trim().to_string());
+		// A raw line break would split the item across Markdown lines, and so into several
+		// items when the Markdown is read back; it becomes a space, a CRLF a single one.
+		let text = decode_entities(&strip_tags(content))
+			.replace("\r\n", " ")
+			.replace(['\r', '\n'], " ");
+		texts.push(text.trim().to_string());
 		rest = remainder;
 	}
 
@@ -192,6 +198,28 @@ mod tests {
 			"- [x] Item"
 		);
 		assert_eq!(checklist_html_to_markdown("<ul"), "");
+	}
+
+	#[test]
+	fn a_line_break_inside_a_checklist_item_becomes_a_space() {
+		assert_eq!(
+			checklist_html_to_markdown("<ul data-checked=\"false\"><li>a\nb</li></ul>"),
+			"- [ ] a b"
+		);
+		assert_eq!(
+			checklist_html_to_markdown("<ul data-checked=\"false\"><li>a\r\nb\rc</li></ul>"),
+			"- [ ] a b c"
+		);
+	}
+
+	#[test]
+	fn a_checklist_item_with_a_line_break_stays_one_item_through_markdown() {
+		assert_eq!(
+			markdown_to_checklist_html(&checklist_html_to_markdown(
+				"<ul data-checked=\"true\"><li>a\r\nb</li></ul>"
+			)),
+			"<ul data-checked=\"true\"><li>a b</li></ul>"
+		);
 	}
 
 	#[test]
