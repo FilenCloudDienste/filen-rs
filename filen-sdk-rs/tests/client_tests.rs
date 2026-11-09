@@ -2,6 +2,7 @@ use core::panic;
 use std::{
 	borrow::Cow,
 	collections::{HashMap, HashSet},
+	io::{self, Read, Write},
 	net::{TcpStream, ToSocketAddrs},
 	time::Duration,
 };
@@ -21,8 +22,9 @@ use filen_sdk_rs::{
 };
 use filen_types::traits::CowHelpersExt;
 use futures::{FutureExt, StreamExt, stream::FuturesUnordered};
+use imap::extensions::idle::SetReadTimeout;
 use regex::Regex;
-use rustls_connector::RustlsConnector;
+use rustls_connector::{RustlsConnector, TlsStream};
 use scraper::{Html, Selector};
 use test_utils::await_event;
 
@@ -173,6 +175,36 @@ const EMPTY_POLLS_BEFORE_RECONNECT: usize = 5;
 
 type BoxedImapSession = imap::Session<std::boxed::Box<dyn imap::ImapConnection>>;
 
+/// The TLS stream [`imap_connect_once`] hands to `imap`. `imap` implements [`SetReadTimeout`] only
+/// for the stream types of its own TLS features, so this does it for rustls-connector's stream the
+/// same way: on the `TcpStream` underneath.
+struct ImapTlsStream(TlsStream<TcpStream>);
+
+impl Read for ImapTlsStream {
+	fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+		self.0.read(buf)
+	}
+}
+
+impl Write for ImapTlsStream {
+	fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+		self.0.write(buf)
+	}
+
+	fn flush(&mut self) -> io::Result<()> {
+		self.0.flush()
+	}
+}
+
+impl SetReadTimeout for ImapTlsStream {
+	fn set_read_timeout(&mut self, timeout: Option<Duration>) -> imap::Result<()> {
+		self.0
+			.get_ref()
+			.set_read_timeout(timeout)
+			.map_err(imap::Error::Io)
+	}
+}
+
 struct ImapSession {
 	session: BoxedImapSession,
 	imap_username: String,
@@ -236,10 +268,10 @@ fn imap_connect_once(
 		tcp.set_read_timeout(Some(IMAP_IO_TIMEOUT))?;
 		tcp.set_write_timeout(Some(IMAP_IO_TIMEOUT))?;
 
-		// Mirrors the crate's own `build_tls_rustls`, which builds its root store from
-		// `load_native_certs()`: keep the trust anchors identical to `ClientBuilder::connect`.
+		// Mirrors `imap`'s `build_tls_rustls` (its `rustls-tls` feature), which builds its root
+		// store from `load_native_certs()`: the same trust anchors as `ClientBuilder::connect`.
 		let tls = RustlsConnector::new_with_native_certs()?.connect(IMAP_DOMAIN, tcp)?;
-		let connection: std::boxed::Box<dyn imap::ImapConnection> = Box::new(tls);
+		let connection: std::boxed::Box<dyn imap::ImapConnection> = Box::new(ImapTlsStream(tls));
 		let mut client = imap::Client::new(connection);
 		client.read_greeting()?;
 		let mut session = client

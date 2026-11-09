@@ -522,13 +522,15 @@ zip = { version = "9.0.5", default-features = false, features = [
 	"bzip2",
 	"aes-crypto",
 ] }
-imap = { version = "3.0.0-alpha.15", default-features = false, features = [
-	"rustls-tls",
-] }
+imap = { version = "3.0.0-alpha.15", default-features = false }
 # `imap`'s `ClientBuilder` exposes no connect/read timeout and its `connect_with` is private, so
-# `client_tests` builds the TLS connection by hand. This is the very connector `imap` enables for
-# its own `rustls-tls` feature, so it is already in Cargo.lock and costs no extra compilation.
-rustls-connector = "0.19.2"
+# `client_tests` builds the TLS connection by hand and `imap` needs no TLS feature of its own.
+# `native-certs` matches the roots `ClientBuilder` loads. No `rustls--*` provider feature: rustls
+# then picks its one compiled-in provider, the ring the SDK enables, and `rustls--ring` would add
+# a lock entry for the async `futures-rustls` this test never builds.
+rustls-connector = { version = "0.23.10", default-features = false, features = [
+	"native-certs",
+] }
 mail-parser = "0.11.1"
 reqwest = { version = "0.12.22", features = [
 	"cookies",
