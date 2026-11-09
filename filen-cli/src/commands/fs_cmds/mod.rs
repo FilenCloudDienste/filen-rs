@@ -3614,13 +3614,16 @@ pub(crate) async fn select_trash_item(
 		return Ok(());
 	}
 
+	let mut name_counts: HashMap<&str, usize> = HashMap::new();
+	for entry in &entries {
+		*name_counts.entry(entry.listed.name.as_str()).or_default() += 1;
+	}
 	let options = entries
 		.iter()
 		.map(|entry| {
-			let shares_name = entries
-				.iter()
-				.filter(|other| other.listed.name == entry.listed.name)
-				.count() > 1;
+			let shares_name = name_counts
+				.get(entry.listed.name.as_str())
+				.is_some_and(|&count| count > 1);
 			trash_picker_label(&entry.listed, shares_name)
 		})
 		.collect::<Vec<String>>();
