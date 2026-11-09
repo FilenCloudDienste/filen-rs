@@ -563,13 +563,7 @@ async fn edit_or_delete_link<I: LinkableItem>(
 	print_link_table(ui, item, &link);
 	match prompt_link_operation(ui)? {
 		None | Some(PublicLinkOperation::Cancel) => Ok(()),
-		Some(PublicLinkOperation::Delete) => {
-			item.remove_link(client, link)
-				.await
-				.context("Failed to delete public link")?;
-			ui.print_success("Public link deleted.");
-			Ok(())
-		}
+		Some(PublicLinkOperation::Delete) => delete_link(ui, client, item, link).await,
 		Some(PublicLinkOperation::Edit) => {
 			let Some(settings) = prompt_link_settings(ui, I::current_settings(&link))? else {
 				return Ok(());
