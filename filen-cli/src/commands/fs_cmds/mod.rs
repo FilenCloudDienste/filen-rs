@@ -72,7 +72,7 @@ use crate::{
 	docs::DocElement,
 	error::{CliError, find_cli_error},
 	interrupt,
-	ui::{self, UI},
+	ui::{self, UI, name_or_uuid},
 	util::RemotePath,
 };
 use anyhow::{Context as _, Result};
@@ -722,10 +722,6 @@ impl ListedItem {
 	}
 }
 
-fn name_or_uuid(name: Option<&str>, uuid: Uuid) -> String {
-	name.map(str::to_string).unwrap_or_else(|| uuid.to_string())
-}
-
 /// Sorts a listing the way it is printed (see [`listing_order`]).
 fn sort_listing(items: &mut [ListedItem], by: ListedBy) {
 	items.sort_by(|a, b| listing_order(a, b, by));
@@ -1248,9 +1244,10 @@ pub(crate) async fn print_file_or_directory_info(
 	let client = client.get(ui).await?;
 	match resolve_item(client, &operand, "file or directory").await? {
 		NonRootFileType::File(file) => {
+			let name = name_or_uuid(file.name(), file.uuid());
 			if ui.json {
 				ui.print_json(json!({
-					"name": file.name().map(str::to_string).unwrap_or_else(|| file.uuid().to_string()),
+					"name": name,
 					"type": "file",
 					"size": file.size(),
 					"modified": file.last_modified(),
@@ -1258,18 +1255,10 @@ pub(crate) async fn print_file_or_directory_info(
 					"uuid": file.uuid(),
 				}))?;
 			} else {
-				let file_uuid = file.uuid().to_string();
-				let file_name = file
-					.name()
-					.map(str::to_string)
-					.unwrap_or_else(|| file_uuid.clone());
 				ui.print_key_value_table(&[
-					("Name", &file_name),
+					("Name", &name),
 					("Type", "File"),
-					(
-						"Size",
-						&humansize::format_size(file.size(), humansize::BINARY),
-					),
+					("Size", &ui::format_size(file.size())),
 					(
 						"Modified",
 						&file
@@ -1284,7 +1273,7 @@ pub(crate) async fn print_file_or_directory_info(
 							.map(|d| ui::format_date(&d))
 							.unwrap_or("-".to_string()),
 					),
-					("UUID", &file_uuid),
+					("UUID", &file.uuid().to_string()),
 				]);
 			}
 		}
@@ -1292,9 +1281,10 @@ pub(crate) async fn print_file_or_directory_info(
 			let size_info = Normal::dir_size(&**client, &DirType::from(&*dir), ())
 				.await
 				.context("Failed to get directory size")?;
+			let name = name_or_uuid(dir.name(), dir.uuid());
 			if ui.json {
 				ui.print_json(json!({
-					"name": dir.name().map(str::to_string).unwrap_or_else(|| dir.uuid().to_string()),
+					"name": name,
 					"type": "directory",
 					"size": size_info.size,
 					"files": size_info.files,
@@ -1304,13 +1294,8 @@ pub(crate) async fn print_file_or_directory_info(
 					"uuid": dir.uuid(),
 				}))?;
 			} else {
-				let dir_uuid = dir.uuid().to_string();
-				let dir_name = dir
-					.name()
-					.map(str::to_string)
-					.unwrap_or_else(|| dir_uuid.clone());
 				ui.print_key_value_table(&[
-					("Name", &dir_name),
+					("Name", &name),
 					("Type", "Directory"),
 					("Size", &ui::format_size(size_info.size)),
 					("Files", &size_info.files.to_string()),
@@ -1322,7 +1307,7 @@ pub(crate) async fn print_file_or_directory_info(
 							.unwrap_or("-".to_string()),
 					),
 					("Color", dir.color().as_ref()),
-					("UUID", &dir_uuid),
+					("UUID", &dir.uuid().to_string()),
 				]);
 			}
 		}

@@ -58,7 +58,7 @@ use crate::{
 	},
 	completion::FilenCompleter,
 	docs::DocElement,
-	ui::{self, UI},
+	ui::{self, UI, name_or_uuid},
 	util::RemotePath,
 };
 
@@ -169,11 +169,6 @@ impl SharesCommands {
 
 fn no_progress() -> Option<&'static fn(u64, Option<u64>)> {
 	None
-}
-
-/// An item's name, or its UUID when the name could not be decrypted.
-fn display_name(name: Option<&str>, uuid: Uuid) -> String {
-	name.map_or_else(|| uuid.to_string(), str::to_owned)
 }
 
 // share and unshare
@@ -291,7 +286,7 @@ impl ListedSharedItem<'_> {
 		match &self.path {
 			Some(path) if self.item.is_dir => format!("{path}/"),
 			Some(path) => path.clone(),
-			None => display_name(self.item.name, self.item.uuid),
+			None => name_or_uuid(self.item.name, self.item.uuid),
 		}
 	}
 }
@@ -710,7 +705,7 @@ fn print_in_share_roots(ui: &mut UI, shares: &InShares, from: Option<&str>) -> R
 		ui.print_muted(&nothing_shared_message(from));
 	}
 	for item in items {
-		let name = display_name(root_name(item), item.uuid());
+		let name = name_or_uuid(root_name(item), item.uuid());
 		ui.print(&format!(
 			"{}  from {}",
 			entry_line(&name, root_size(item)),
@@ -739,11 +734,11 @@ fn print_shared_dir(
 		ui.print_muted("The directory is empty");
 	}
 	for dir in dirs {
-		ui.print(&entry_line(&display_name(dir.name(), dir.uuid()), None));
+		ui.print(&entry_line(&name_or_uuid(dir.name(), dir.uuid()), None));
 	}
 	for file in files {
 		ui.print(&entry_line(
-			&display_name(file.name(), file.uuid()),
+			&name_or_uuid(file.name(), file.uuid()),
 			Some(file.size()),
 		));
 	}
@@ -760,7 +755,7 @@ fn print_file_table(
 	if ui.json {
 		return ui.print_json(entry_json(uuid, name, Some(size), sharer));
 	}
-	let name = display_name(name, uuid);
+	let name = name_or_uuid(name, uuid);
 	let size = ui::format_size(size);
 	let uuid = uuid.to_string();
 	ui.print_key_value_table(&[
@@ -1052,13 +1047,6 @@ mod tests {
 				"sharer": ALICE,
 			})
 		);
-	}
-
-	#[test]
-	fn an_undecryptable_name_is_shown_as_the_uuid() {
-		let uuid = Uuid::from_u128(5);
-		assert_eq!(display_name(None, uuid), uuid.to_string());
-		assert_eq!(display_name(Some("a"), uuid), "a");
 	}
 
 	fn listed_photos() -> ListedSharedItem<'static> {

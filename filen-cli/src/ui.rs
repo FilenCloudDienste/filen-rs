@@ -13,6 +13,7 @@ use anyhow::{Context, Result};
 use clap::{CommandFactory, builder::Styles};
 use console::{self, Term, style};
 use filen_sdk_rs::auth::Client;
+use filen_types::fs::Uuid;
 use inquire::{
 	Autocomplete, CustomUserError, InquireError,
 	history::{History, Replacement, SimpleHistory},
@@ -1114,6 +1115,11 @@ pub(crate) fn format_size(size: u64) -> String {
 	humansize::format_size(size, humansize::BINARY)
 }
 
+/// An item's name, or its UUID when the name could not be decrypted.
+pub(crate) fn name_or_uuid(name: Option<&str>, uuid: Uuid) -> String {
+	name.map(str::to_string).unwrap_or_else(|| uuid.to_string())
+}
+
 /// A dim line at the bottom of the terminal on stderr, redrawn in place, which is cleared before
 /// anything else is printed.
 pub(crate) struct StderrLine {
@@ -1361,6 +1367,13 @@ mod tests {
 		assert!(!ui.may_draw_progress());
 		ui.initialize(false, false, None, true, true);
 		assert!(!ui.may_draw_progress());
+	}
+
+	#[test]
+	fn an_undecryptable_name_is_shown_as_the_uuid() {
+		let uuid = Uuid::from_u128(5);
+		assert_eq!(name_or_uuid(None, uuid), uuid.to_string());
+		assert_eq!(name_or_uuid(Some("a"), uuid), "a");
 	}
 
 	/// Tests that read back what was logged. `log` takes one logger per process and other tests in
