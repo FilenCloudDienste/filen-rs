@@ -23,25 +23,9 @@ use crate::helpers::*;
 // `sc.resources.client` is the shared base client and `sc.resources.dir` the remote sync-root
 // folder (matching the black-box example tests). The engine's remote view comes from `sc.cache`,
 // which converges asynchronously — so after any direct remote mutation we WAIT for the cache to
-// observe it (poll_for_item / poll_for_file_name / poll_for_item_absent / a cached-size poll)
+// observe it (`sc.cache_sees` / poll_for_file_name / `sc.cache_drops` / a cached-size poll)
 // before driving `sc.sync()`.
 // ----------------------------------------------------------------------------
-
-/// Wait until the cache observes `uuid` under the remote root, asserting on timeout.
-async fn wait_cache_has(sc: &SingleClient, uuid: Uuid) {
-	assert!(
-		poll_for_item(sc.cache.db_path(), uuid, CACHE_CONVERGE_TIMEOUT).await,
-		"cache never observed item {uuid}"
-	);
-}
-
-/// Wait until the cache no longer holds `uuid`, asserting on timeout.
-async fn wait_cache_absent(sc: &SingleClient, uuid: Uuid) {
-	assert!(
-		poll_for_item_absent(sc.cache.db_path(), uuid, CACHE_CONVERGE_TIMEOUT).await,
-		"cache never dropped item {uuid}"
-	);
-}
 
 /// Re-upload `name` with new bytes (the server versions it into a NEW uuid), then wait until the
 /// cache reflects the new uuid AND its new size — so the engine reconciles against fully-committed
@@ -49,7 +33,7 @@ async fn wait_cache_absent(sc: &SingleClient, uuid: Uuid) {
 async fn modify_remote(sc: &SingleClient, name: &str, new_data: &[u8]) -> Uuid {
 	let new_rf = sc.upload_root(name, new_data).await;
 	let new_uuid: Uuid = new_rf.uuid();
-	wait_cache_has(sc, new_uuid).await;
+	sc.cache_sees(new_uuid).await;
 	let db = sc.cache.db_path().to_path_buf();
 	let want = new_data.len() as i64;
 	assert!(
@@ -177,7 +161,7 @@ async fn mode_04_l2r_remote_only_deletion_recreated_from_local() {
 		.trash_file(&mut files0[idx])
 		.await
 		.unwrap();
-	wait_cache_absent(&sc, orig).await;
+	sc.cache_drops(orig).await;
 
 	let r2 = sc.sync().await;
 	assert!(r2.errors.is_empty(), "{r2:?}");
@@ -200,7 +184,7 @@ async fn mode_04_l2r_remote_only_deletion_recreated_from_local() {
 async fn mode_05_r2l_remote_create_pulls_down_byte_exact() {
 	let sc = single_client(SyncMode::RemoteToLocal).await;
 	let rf = sc.upload_root("doc.txt", b"HELLO").await;
-	wait_cache_has(&sc, rf.uuid()).await;
+	sc.cache_sees(rf.uuid()).await;
 
 	let report = sc.sync().await;
 	assert!(report.errors.is_empty(), "{report:?}");
@@ -221,14 +205,14 @@ async fn mode_05_r2l_remote_create_pulls_down_byte_exact() {
 async fn mode_06_r2l_mirrors_remote_deletion_locally() {
 	let sc = single_client(SyncMode::RemoteToLocal).await;
 	let mut rf = sc.upload_root("doc.txt", b"D").await;
-	wait_cache_has(&sc, rf.uuid()).await;
+	sc.cache_sees(rf.uuid()).await;
 	let r1 = sc.sync().await;
 	assert_eq!(r1.downloaded, 1, "{r1:?}");
 	assert!(read_eq(&sc.local, "doc.txt", b"D"), "download failed");
 
 	// Delete on the remote.
 	sc.resources.client.trash_file(&mut rf).await.unwrap();
-	wait_cache_absent(&sc, rf.uuid()).await;
+	sc.cache_drops(rf.uuid()).await;
 
 	let r2 = sc.sync().await;
 	assert!(r2.errors.is_empty(), "{r2:?}");
@@ -250,7 +234,7 @@ async fn mode_06_r2l_mirrors_remote_deletion_locally() {
 async fn mode_07_r2l_refuses_to_push_local_only_edit() {
 	let sc = single_client(SyncMode::RemoteToLocal).await;
 	let rf = sc.upload_root("note.txt", b"P").await;
-	wait_cache_has(&sc, rf.uuid()).await;
+	sc.cache_sees(rf.uuid()).await;
 	let r1 = sc.sync().await;
 	assert_eq!(r1.downloaded, 1, "{r1:?}");
 
@@ -277,7 +261,7 @@ async fn mode_07_r2l_refuses_to_push_local_only_edit() {
 async fn mode_add_r2l_remote_edit_pulls_down() {
 	let sc = single_client(SyncMode::RemoteToLocal).await;
 	let rf = sc.upload_root("re.txt", b"P").await;
-	wait_cache_has(&sc, rf.uuid()).await;
+	sc.cache_sees(rf.uuid()).await;
 	let r1 = sc.sync().await;
 	assert_eq!(r1.downloaded, 1, "{r1:?}");
 	assert!(read_eq(&sc.local, "re.txt", b"P"), "{r1:?}");
@@ -305,7 +289,7 @@ async fn mode_add_r2l_remote_edit_pulls_down() {
 async fn mode_08_twoway_local_up_and_remote_down_one_pass() {
 	let sc = single_client(SyncMode::TwoWay).await;
 	let rf = sc.upload_root("only.remote.txt", b"R").await;
-	wait_cache_has(&sc, rf.uuid()).await;
+	sc.cache_sees(rf.uuid()).await;
 	write_file(&sc.local, "only.local.txt", b"L");
 
 	let r1 = sc.sync().await;
@@ -345,7 +329,7 @@ async fn mode_09_twoway_divergent_edit_conflicts_nondestructively() {
 	let sc = single_client(SyncMode::TwoWay).await;
 	let base = b"BASE";
 	let rf = sc.upload_root("c.txt", base).await;
-	wait_cache_has(&sc, rf.uuid()).await;
+	sc.cache_sees(rf.uuid()).await;
 	write_file(&sc.local, "c.txt", base);
 	// Establish a shared baseline (identical content -> no conflict).
 	let r1 = sc.sync().await;
@@ -386,7 +370,7 @@ async fn mode_09_twoway_divergent_edit_conflicts_nondestructively() {
 async fn mode_10_twoway_one_sided_edit_not_a_conflict() {
 	let sc = single_client(SyncMode::TwoWay).await;
 	let rf = sc.upload_root("d.txt", b"BASE").await;
-	wait_cache_has(&sc, rf.uuid()).await;
+	sc.cache_sees(rf.uuid()).await;
 	write_file(&sc.local, "d.txt", b"BASE");
 	let r1 = sc.sync().await;
 	assert_eq!(
@@ -425,7 +409,7 @@ async fn mode_10_twoway_one_sided_edit_not_a_conflict() {
 async fn mode_11_twoway_one_sided_delete_propagates() {
 	let sc = single_client(SyncMode::TwoWay).await;
 	let rf = sc.upload_root("e.txt", b"E").await;
-	wait_cache_has(&sc, rf.uuid()).await;
+	sc.cache_sees(rf.uuid()).await;
 	write_file(&sc.local, "e.txt", b"E");
 	let r1 = sc.sync().await;
 	assert_eq!(r1.conflicts.len(), 0, "baseline pass clean: {r1:?}");
@@ -457,7 +441,7 @@ async fn mode_11_twoway_one_sided_delete_propagates() {
 async fn mode_12_twoway_delete_vs_edit_conflicts_nondestructively() {
 	let sc = single_client(SyncMode::TwoWay).await;
 	let rf = sc.upload_root("f.txt", b"BASE").await;
-	wait_cache_has(&sc, rf.uuid()).await;
+	sc.cache_sees(rf.uuid()).await;
 	write_file(&sc.local, "f.txt", b"BASE");
 	let r1 = sc.sync().await;
 	assert_eq!(r1.conflicts.len(), 0, "baseline pass clean: {r1:?}");
@@ -487,7 +471,7 @@ async fn mode_12_twoway_delete_vs_edit_conflicts_nondestructively() {
 async fn mode_add_twoway_convergent_identical_edit_not_a_conflict() {
 	let sc = single_client(SyncMode::TwoWay).await;
 	let rf = sc.upload_root("cv.txt", b"BASE").await;
-	wait_cache_has(&sc, rf.uuid()).await;
+	sc.cache_sees(rf.uuid()).await;
 	write_file(&sc.local, "cv.txt", b"BASE");
 	let r1 = sc.sync().await;
 	assert_eq!(r1.conflicts.len(), 0, "baseline pass clean: {r1:?}");
@@ -524,7 +508,7 @@ async fn mode_add_twoway_create_create_different_content_conflicts() {
 	let sc = single_client(SyncMode::TwoWay).await;
 	// No baseline entry for new.txt: distinct creates on both sides at the same path.
 	let rf = sc.upload_root("new.txt", b"REMOTE-NEW").await;
-	wait_cache_has(&sc, rf.uuid()).await;
+	sc.cache_sees(rf.uuid()).await;
 	write_file(&sc.local, "new.txt", b"LOCAL-NEW");
 
 	let r1 = sc.sync().await;
@@ -553,7 +537,7 @@ async fn mode_add_twoway_create_create_different_content_conflicts() {
 async fn mode_add_twoway_convergent_delete_clean() {
 	let sc = single_client(SyncMode::TwoWay).await;
 	let mut rf = sc.upload_root("dd.txt", b"DD").await;
-	wait_cache_has(&sc, rf.uuid()).await;
+	sc.cache_sees(rf.uuid()).await;
 	write_file(&sc.local, "dd.txt", b"DD");
 	let r1 = sc.sync().await;
 	assert_eq!(r1.conflicts.len(), 0, "baseline pass clean: {r1:?}");
@@ -561,7 +545,7 @@ async fn mode_add_twoway_convergent_delete_clean() {
 	// Delete on BOTH sides.
 	std::fs::remove_file(sc.local.join("dd.txt")).unwrap();
 	sc.resources.client.trash_file(&mut rf).await.unwrap();
-	wait_cache_absent(&sc, rf.uuid()).await;
+	sc.cache_drops(rf.uuid()).await;
 
 	let r2 = sc.sync().await;
 	assert!(r2.errors.is_empty(), "{r2:?}");
@@ -660,14 +644,14 @@ async fn mode_14_local_backup_pushes_edit() {
 async fn mode_15_remote_backup_never_mirrors_remote_deletion() {
 	let sc = single_client(SyncMode::RemoteBackup).await;
 	let mut rf = sc.upload_root("r.txt", b"R").await;
-	wait_cache_has(&sc, rf.uuid()).await;
+	sc.cache_sees(rf.uuid()).await;
 	let r1 = sc.sync().await;
 	assert_eq!(r1.downloaded, 1, "{r1:?}");
 	assert!(read_eq(&sc.local, "r.txt", b"R"), "download failed");
 
 	// Delete on remote — backup must NOT remove the local copy.
 	sc.resources.client.trash_file(&mut rf).await.unwrap();
-	wait_cache_absent(&sc, rf.uuid()).await;
+	sc.cache_drops(rf.uuid()).await;
 	let r2 = sc.sync().await;
 	assert!(r2.errors.is_empty(), "{r2:?}");
 	assert_eq!(
@@ -678,7 +662,7 @@ async fn mode_15_remote_backup_never_mirrors_remote_deletion() {
 
 	// A subsequent remote create still propagates down.
 	let rnew = sc.upload_root("rnew.txt", b"RN").await;
-	wait_cache_has(&sc, rnew.uuid()).await;
+	sc.cache_sees(rnew.uuid()).await;
 	let r3 = sc.sync().await;
 	assert!(r3.errors.is_empty(), "{r3:?}");
 	assert_eq!(r3.downloaded, 1, "create must still pull: {r3:?}");
@@ -693,7 +677,7 @@ async fn mode_15_remote_backup_never_mirrors_remote_deletion() {
 async fn mode_16_remote_backup_refuses_to_push_local_only() {
 	let sc = single_client(SyncMode::RemoteBackup).await;
 	let rf = sc.upload_root("s.txt", b"S").await;
-	wait_cache_has(&sc, rf.uuid()).await;
+	sc.cache_sees(rf.uuid()).await;
 	let r1 = sc.sync().await;
 	assert_eq!(r1.downloaded, 1, "{r1:?}");
 
@@ -747,7 +731,7 @@ async fn mode_add_local_backup_refuses_remote_edit_to_local() {
 async fn mode_add_remote_backup_pulls_remote_edit() {
 	let sc = single_client(SyncMode::RemoteBackup).await;
 	let rf = sc.upload_root("rb.txt", b"OLD").await;
-	wait_cache_has(&sc, rf.uuid()).await;
+	sc.cache_sees(rf.uuid()).await;
 	let r1 = sc.sync().await;
 	assert_eq!(r1.downloaded, 1, "{r1:?}");
 	assert!(read_eq(&sc.local, "rb.txt", b"OLD"), "{r1:?}");
@@ -816,7 +800,7 @@ async fn mode_18_first_sync_does_not_wipe_populated_destination() {
 	// local->remote: destination (remote) already holds keep-dest.txt; source has keep-src.txt.
 	let sc = single_client(SyncMode::LocalToRemote).await;
 	let dest = sc.upload_root("keep-dest.txt", b"D").await;
-	wait_cache_has(&sc, dest.uuid()).await;
+	sc.cache_sees(dest.uuid()).await;
 	write_file(&sc.local, "keep-src.txt", b"S");
 
 	let r1 = sc.sync().await;
@@ -849,7 +833,7 @@ async fn mode_19_identical_no_baseline_recognized_as_synced() {
 	// two-way: same content on both sides with no baseline -> no churn.
 	let sc = single_client(SyncMode::TwoWay).await;
 	let rf = sc.upload_root("same.txt", b"EQ").await;
-	wait_cache_has(&sc, rf.uuid()).await;
+	sc.cache_sees(rf.uuid()).await;
 	write_file(&sc.local, "same.txt", b"EQ");
 
 	let r1 = sc.sync().await;
@@ -1050,7 +1034,7 @@ async fn mode_22b_switch_local_backup_to_l2r_can_adopt_the_destination_instead()
 	// A file another client wrote straight to the destination: no baseline row anywhere, so the
 	// mirror the switch turns on reads it as an item to remove.
 	let theirs = sc.upload_root("z.txt", b"Z-FROM-ANOTHER-CLIENT").await;
-	wait_cache_has(&sc, theirs.uuid()).await;
+	sc.cache_sees(theirs.uuid()).await;
 
 	sc.engine
 		.reconfigure_pair(sc.pair, SyncMode::LocalToRemote, Backlog::AdoptDestination)
@@ -1131,7 +1115,7 @@ async fn mode_22c_adopt_destination_adopts_nothing_at_an_ignored_path() {
 	// Another client's file on the destination, hidden from this device by a user-level rule.
 	sc.engine.set_user_ignore("*.psd").await.unwrap();
 	let theirs = sc.upload_root("theirs.psd", b"Z-FROM-ANOTHER-CLIENT").await;
-	wait_cache_has(&sc, theirs.uuid()).await;
+	sc.cache_sees(theirs.uuid()).await;
 	let hidden = sc.sync().await;
 	assert!(hidden.errors.is_empty(), "{hidden:?}");
 	assert_eq!(hidden.ignored.len(), 1, "{hidden:?}");
@@ -1267,7 +1251,7 @@ async fn mode_25_twoway_idempotency_stable_across_repeated_passes() {
 	let sc = single_client(SyncMode::TwoWay).await;
 	// r.txt synced on both sides first (so a later local edit is a one-sided edit, not a create).
 	let rbase = sc.upload_root("r.txt", b"R0").await;
-	wait_cache_has(&sc, rbase.uuid()).await;
+	sc.cache_sees(rbase.uuid()).await;
 	write_file(&sc.local, "r.txt", b"R0");
 	let r0 = sc.sync().await;
 	assert_eq!(r0.conflicts.len(), 0, "baseline pass clean: {r0:?}");
@@ -1275,7 +1259,7 @@ async fn mode_25_twoway_idempotency_stable_across_repeated_passes() {
 	// A mix: create p.txt locally, create q.txt remotely, edit r.txt locally.
 	write_file(&sc.local, "p.txt", b"P");
 	let q = sc.upload_root("q.txt", b"Q").await;
-	wait_cache_has(&sc, q.uuid()).await;
+	sc.cache_sees(q.uuid()).await;
 	write_file(&sc.local, "r.txt", b"R1-edited");
 
 	let r1 = sc.sync().await;
@@ -1363,7 +1347,7 @@ async fn mode_add_twoway_directory_create_and_delete_propagate() {
 		.create_dir(&sc.root_dirtype(), "rdir")
 		.await
 		.unwrap();
-	wait_cache_has(&sc, rdir.uuid()).await;
+	sc.cache_sees(rdir.uuid()).await;
 
 	let r1 = sc.sync().await;
 	assert!(r1.errors.is_empty(), "{r1:?}");

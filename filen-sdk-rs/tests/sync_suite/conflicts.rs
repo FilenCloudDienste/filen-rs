@@ -884,10 +884,7 @@ async fn conflict_14_remote_backup_delete_not_mirrored() {
 
 	// Delete on remote; wait for the cache to drop it.
 	sc.resources.client.trash_file(&mut rf).await.unwrap();
-	assert!(
-		poll_for_item_absent(sc.cache.db_path(), rf.uuid(), CACHE_CONVERGE_TIMEOUT).await,
-		"cache never dropped the trashed file"
-	);
+	sc.cache_drops(rf.uuid()).await;
 
 	let r2 = sc.sync().await;
 	assert!(r2.errors.is_empty(), "{r2:?}");
@@ -1066,7 +1063,7 @@ async fn conflict_15d_pull_over_a_size_and_mtime_preserving_edit_quarantines_it(
 	// it is about to replace.
 	let sc = single_client(SyncMode::RemoteToLocal).await;
 	let v1 = sc.upload_root("doc.txt", b"V1V1").await;
-	wait_cache_has(&sc, v1.uuid()).await;
+	sc.cache_sees(v1.uuid()).await;
 	let r1 = sc.sync().await;
 	assert_eq!(r1.downloaded, 1, "{r1:?}");
 	assert!(read_eq(&sc.local, "doc.txt", b"V1V1"), "V1 did not land");
@@ -1089,7 +1086,7 @@ async fn conflict_15d_pull_over_a_size_and_mtime_preserving_edit_quarantines_it(
 
 	// Now the remote changes, which is what pulls over the local path.
 	let v2 = sc.upload_root("doc.txt", b"V2V2").await;
-	wait_cache_has(&sc, v2.uuid()).await;
+	sc.cache_sees(v2.uuid()).await;
 	// Observed: the report is not the only place the pass owes this path a word — a watch caller
 	// hears it as the copy is moved aside, before the download that took its place.
 	let mut events: Vec<SyncEvent> = Vec::new();
@@ -1894,22 +1891,13 @@ async fn conflict_25_watch_mode_conflict_does_not_loop() {
 // content-divergence tests above).
 // ---------------------------------------------------------------------------
 
-/// Wait until the engine's cache has observed `uuid` (its remote view is fed by the cache, not by
-/// the server directly), so the next pass reconciles against fresh truth.
-async fn wait_cache_has(sc: &SingleClient, uuid: Uuid) {
-	assert!(
-		poll_for_item(sc.cache.db_path(), uuid, CACHE_CONVERGE_TIMEOUT).await,
-		"cache never observed item {uuid}"
-	);
-}
-
 /// Wait until the cache has observed the CURRENT remote version of `name` — i.e. the version the
 /// engine itself just pushed — so a follow-up pass is not reconciled against a stale snapshot.
 async fn wait_cache_current(sc: &SingleClient, name: &str) {
 	let uuid = remote_file_uuid(sc, name)
 		.await
 		.unwrap_or_else(|| panic!("remote file {name} does not exist"));
-	wait_cache_has(sc, uuid).await;
+	sc.cache_sees(uuid).await;
 }
 
 /// The uuid of the CURRENT remote version of `name` under the SingleClient's root (ground truth).
@@ -2120,7 +2108,7 @@ async fn conflict_16_resolve_keep_local() {
 	assert_eq!(sc.sync().await.uploaded, 1);
 	write_file(&sc.local, "conf.txt", b"LLLLLLLLLL");
 	let remote_version = sc.upload_root("conf.txt", b"RRR").await;
-	wait_cache_has(&sc, remote_version.uuid()).await;
+	sc.cache_sees(remote_version.uuid()).await;
 
 	// The divergence is surfaced and HELD: no transfer, and it does not silently resolve itself.
 	let r2 = sc.sync().await;
@@ -2195,7 +2183,7 @@ async fn conflict_17_resolve_keep_remote() {
 	assert_eq!(sc.sync().await.uploaded, 1);
 	write_file(&sc.local, "conf2.txt", b"LLLLLLLLLL");
 	let remote_version = sc.upload_root("conf2.txt", b"RRR").await;
-	wait_cache_has(&sc, remote_version.uuid()).await;
+	sc.cache_sees(remote_version.uuid()).await;
 
 	let r2 = sc.sync().await;
 	assert!(r2.errors.is_empty(), "{r2:?}");
@@ -2260,7 +2248,7 @@ async fn conflict_19_conflict_copy_naming_no_collision_or_recursion() {
 	// --- first conflict, resolved keep-both -> a.old.txt ---
 	write_file(&sc.local, "a.txt", b"LOCAL-1");
 	let v1 = sc.upload_root("a.txt", b"REMOTE-1").await;
-	wait_cache_has(&sc, v1.uuid()).await;
+	sc.cache_sees(v1.uuid()).await;
 	assert!(
 		sc.sync().await.conflict_paths().any(|c| c == "a.txt"),
 		"first conflict must surface"
@@ -2297,7 +2285,7 @@ async fn conflict_19_conflict_copy_naming_no_collision_or_recursion() {
 	// --- second, independent conflict on the SAME path, resolved keep-both -> a.old.1.txt ---
 	write_file(&sc.local, "a.txt", b"LOCAL-2");
 	let v2 = sc.upload_root("a.txt", b"REMOTE-2").await;
-	wait_cache_has(&sc, v2.uuid()).await;
+	sc.cache_sees(v2.uuid()).await;
 	assert!(
 		sc.sync().await.conflict_paths().any(|c| c == "a.txt"),
 		"second conflict must surface"
@@ -2356,7 +2344,7 @@ async fn conflict_add_resolved_copy_round_trips() {
 	assert_eq!(sc.sync().await.uploaded, 1);
 	write_file(&sc.local, "c.txt", b"LOCAL-EDIT");
 	let version = sc.upload_root("c.txt", b"REMOTE-EDIT").await;
-	wait_cache_has(&sc, version.uuid()).await;
+	sc.cache_sees(version.uuid()).await;
 	assert!(
 		sc.sync().await.conflict_paths().any(|c| c == "c.txt"),
 		"conflict must surface"

@@ -45,14 +45,6 @@ async fn list_remote_root(sc: &SingleClient) -> (Vec<RemoteDirectory>, Vec<Remot
 	list_dir(&sc.cache.client, &sc.resources.dir).await
 }
 
-/// Wait until the cache observes `uuid` (the engine's remote view is the cache).
-async fn wait_cache_sees(sc: &SingleClient, uuid: Uuid) {
-	assert!(
-		poll_for_item(sc.cache.db_path(), uuid, CACHE_CONVERGE_TIMEOUT).await,
-		"cache never observed item {uuid}"
-	);
-}
-
 /// Deterministic pseudo-random bytes of length `n`, seeded by `seed` (for byte-exact size tests).
 fn prng_bytes(seed: u64, n: usize) -> Vec<u8> {
 	let mut out = Vec::with_capacity(n);
@@ -96,7 +88,7 @@ async fn basic_01_single_small_file_pull() {
 	let sc = single_client(SyncMode::RemoteToLocal).await;
 	let content = b"hello world";
 	let rf = upload_remote(&sc, "foo.txt", content).await;
-	wait_cache_sees(&sc, rf.uuid()).await;
+	sc.cache_sees(rf.uuid()).await;
 	let report = sc.sync().await;
 	assert!(report.errors.is_empty(), "errors: {report:?}");
 	assert_eq!(report.downloaded, 1, "{report:?}");
@@ -133,7 +125,7 @@ async fn basic_02_empty_file_push() {
 async fn basic_02_empty_file_pull() {
 	let sc = single_client(SyncMode::RemoteToLocal).await;
 	let rf = upload_remote(&sc, "empty.dat", b"").await;
-	wait_cache_sees(&sc, rf.uuid()).await;
+	sc.cache_sees(rf.uuid()).await;
 	let report = sc.sync().await;
 	assert!(report.errors.is_empty(), "errors: {report:?}");
 	assert_eq!(report.downloaded, 1, "{report:?}");
@@ -346,8 +338,8 @@ async fn basic_08_nonempty_destination_not_wiped_push() {
 		.create_dir(&sc.root_dirtype(), "keep")
 		.await
 		.unwrap();
-	wait_cache_sees(&sc, pre.uuid()).await;
-	wait_cache_sees(&sc, keep.uuid()).await;
+	sc.cache_sees(pre.uuid()).await;
+	sc.cache_sees(keep.uuid()).await;
 
 	// Source-side files.
 	write_file(&sc.local, "A.txt", b"aaa");
@@ -390,8 +382,8 @@ async fn basic_08_nonempty_destination_not_wiped_pull() {
 	// Source-side remote files.
 	let a = upload_remote(&sc, "A.txt", b"aaa").await;
 	let b = upload_remote(&sc, "B.txt", b"bbb").await;
-	wait_cache_sees(&sc, a.uuid()).await;
-	wait_cache_sees(&sc, b.uuid()).await;
+	sc.cache_sees(a.uuid()).await;
+	sc.cache_sees(b.uuid()).await;
 
 	let report = sc.sync().await;
 	assert!(report.errors.is_empty(), "errors: {report:?}");
@@ -1429,8 +1421,8 @@ async fn basic_add_remote_origin_pull_byte_exact() {
 	let blob = (0u8..=255).collect::<Vec<u8>>();
 	let f1 = upload_remote(&sc, "foo.txt", txt).await;
 	let f2 = upload_remote(&sc, "blob.bin", &blob).await;
-	wait_cache_sees(&sc, f1.uuid()).await;
-	wait_cache_sees(&sc, f2.uuid()).await;
+	sc.cache_sees(f1.uuid()).await;
+	sc.cache_sees(f2.uuid()).await;
 
 	let report = sc.sync().await;
 	assert!(report.errors.is_empty(), "errors: {report:?}");
@@ -1464,7 +1456,7 @@ async fn basic_add_remote_update_pulls_down_two_way() {
 	let sc = single_client(SyncMode::TwoWay).await;
 	let v1 = b"version one";
 	let rf = upload_remote(&sc, "foo.txt", v1).await;
-	wait_cache_sees(&sc, rf.uuid()).await;
+	sc.cache_sees(rf.uuid()).await;
 	let r1 = sc.sync().await;
 	assert!(r1.errors.is_empty(), "{r1:?}");
 	assert_eq!(r1.downloaded, 1, "{r1:?}");
@@ -1474,7 +1466,7 @@ async fn basic_add_remote_update_pulls_down_two_way() {
 	let v2 = b"version two is noticeably longer";
 	let new_rf = upload_remote(&sc, "foo.txt", v2).await;
 	let new_uuid: Uuid = new_rf.uuid();
-	wait_cache_sees(&sc, new_uuid).await;
+	sc.cache_sees(new_uuid).await;
 	let db = sc.cache.db_path().to_path_buf();
 	poll_until(CACHE_CONVERGE_TIMEOUT, || {
 		query_cached_file(&db, new_uuid).map(|t| t.1) == Some(v2.len() as i64)
@@ -1528,7 +1520,7 @@ async fn basic_add_recreate_after_delete_push() {
 	// upload: against a lagging cache the delete pass correctly defers instead of trashing.
 	let (_d, files1) = list_remote_root(&sc).await;
 	let uploaded = find_file(&files1, "foo.txt").expect("uploaded foo.txt missing");
-	wait_cache_sees(&sc, uploaded.uuid()).await;
+	sc.cache_sees(uploaded.uuid()).await;
 
 	// Delete and sync so the deletion is in baseline.
 	std::fs::remove_file(sc.local.join("foo.txt")).unwrap();

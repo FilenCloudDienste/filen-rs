@@ -674,18 +674,12 @@ async fn trash_proj_over_local_extra(sc: &SingleClient, extra: &str) -> SyncRepo
 	uploaded.push(proj.uuid());
 	assert!(uploaded.contains(&a_txt.uuid()));
 	for &uuid in &uploaded {
-		assert!(
-			poll_for_item(sc.cache.db_path(), uuid, CACHE_CONVERGE_TIMEOUT).await,
-			"the cache never observed the upload"
-		);
+		sc.cache_sees(uuid).await;
 	}
 	clean(&sc.sync().await);
 	sc.cache.client.trash_dir(&mut proj).await.unwrap();
 	for uuid in uploaded {
-		assert!(
-			poll_for_item_absent(sc.cache.db_path(), uuid, CACHE_CONVERGE_TIMEOUT).await,
-			"the cache never observed the trash"
-		);
+		sc.cache_drops(uuid).await;
 	}
 	let report = sc.sync().await;
 	clean(&report);
@@ -771,10 +765,7 @@ async fn filter_pull_dir_delete_keeps_ignored_children_by_its_own_rule() {
 
 	sc.cache.client.trash_dir(&mut proj).await.unwrap();
 	for uuid in [proj.uuid(), rule.uuid(), a_txt.uuid()] {
-		assert!(
-			poll_for_item_absent(sc.cache.db_path(), uuid, CACHE_CONVERGE_TIMEOUT).await,
-			"the cache never observed the trash"
-		);
+		sc.cache_drops(uuid).await;
 	}
 	for _ in 0..2 {
 		let report = sc.sync().await;
@@ -1029,19 +1020,13 @@ async fn filter_hiding_everything_is_not_an_emptied_remote() {
 	// cache list them and a pass read them before anything is trashed.
 	let mut tree = remote_tree(&sc.cache.client, &sc.resources.dir).await;
 	for file in tree.values().flatten() {
-		assert!(
-			poll_for_item(sc.cache.db_path(), file.uuid(), CACHE_CONVERGE_TIMEOUT).await,
-			"the cache never observed the upload"
-		);
+		sc.cache_sees(file.uuid()).await;
 	}
 	clean(&sc.sync().await);
 	for name in ["gone1.txt", "gone2.txt"] {
 		let mut file = tree.remove(name).flatten().expect("uploaded");
 		sc.cache.client.trash_file(&mut file).await.unwrap();
-		assert!(
-			poll_for_item_absent(sc.cache.db_path(), file.uuid(), CACHE_CONVERGE_TIMEOUT).await,
-			"the cache never observed the trash"
-		);
+		sc.cache_drops(file.uuid()).await;
 	}
 
 	write_file(&sc.local, ".filenignore", b"*\n!gone*\n");

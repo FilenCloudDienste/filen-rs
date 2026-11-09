@@ -240,10 +240,7 @@ async fn scale_a_tiny_remote_incremental_after_baseline() {
 		seeded.push(f);
 	}
 	for f in &seeded {
-		assert!(
-			poll_for_item(sc.cache.db_path(), f.uuid(), CACHE_CONVERGE_TIMEOUT).await,
-			"cache never saw seeded file"
-		);
+		sc.cache_sees(f.uuid()).await;
 	}
 	let r1 = sc.sync().await;
 	assert!(r1.errors.is_empty(), "{r1:?}");
@@ -349,9 +346,9 @@ async fn scale_04_wide_remote_dir_download_then_incremental() {
 		seeded.push(f);
 	}
 	// Wait until the cache holds the dir + all files.
-	assert!(poll_for_item(sc.cache.db_path(), dir.uuid(), CACHE_CONVERGE_TIMEOUT).await);
+	sc.cache_sees(dir.uuid()).await;
 	for f in &seeded {
-		assert!(poll_for_item(sc.cache.db_path(), f.uuid(), CACHE_CONVERGE_TIMEOUT).await);
+		sc.cache_sees(f.uuid()).await;
 	}
 
 	let r1 = sc.sync().await;
@@ -384,7 +381,7 @@ async fn scale_04_wide_remote_dir_download_then_incremental() {
 		more.push(f);
 	}
 	for f in &more {
-		assert!(poll_for_item(sc.cache.db_path(), f.uuid(), CACHE_CONVERGE_TIMEOUT).await);
+		sc.cache_sees(f.uuid()).await;
 	}
 
 	let r2 = sc.sync().await;
@@ -682,9 +679,9 @@ async fn scale_b_remote_move_batch_is_local_moves_not_redownload() {
 		.await;
 		seeded.push(f);
 	}
-	assert!(poll_for_item(sc.cache.db_path(), dir_a.uuid(), CACHE_CONVERGE_TIMEOUT).await);
+	sc.cache_sees(dir_a.uuid()).await;
 	for f in &seeded {
-		assert!(poll_for_item(sc.cache.db_path(), f.uuid(), CACHE_CONVERGE_TIMEOUT).await);
+		sc.cache_sees(f.uuid()).await;
 	}
 	let r1 = sc.sync().await;
 	assert!(r1.errors.is_empty(), "{r1:?}");
@@ -836,7 +833,7 @@ async fn scale_12_remote_delete_batch_quarantined_recoverable() {
 		);
 	}
 	for f in keep.iter().chain(drop.iter()) {
-		assert!(poll_for_item(sc.cache.db_path(), f.uuid(), CACHE_CONVERGE_TIMEOUT).await);
+		sc.cache_sees(f.uuid()).await;
 	}
 	let r1 = sc.sync().await;
 	assert!(r1.errors.is_empty(), "{r1:?}");
@@ -847,7 +844,7 @@ async fn scale_12_remote_delete_batch_quarantined_recoverable() {
 		sc.resources.client.trash_file(f).await.unwrap();
 	}
 	for f in &drop {
-		assert!(poll_for_item_absent(sc.cache.db_path(), f.uuid(), CACHE_CONVERGE_TIMEOUT).await);
+		sc.cache_drops(f.uuid()).await;
 	}
 
 	let r2 = sc.sync().await;
@@ -912,9 +909,9 @@ async fn scale_22_remote_subtree_delete_removes_local_subtree() {
 		);
 	}
 	let outside = sc.upload_root("outside.txt", b"survivor").await;
-	assert!(poll_for_item(sc.cache.db_path(), doomed.uuid(), CACHE_CONVERGE_TIMEOUT).await);
+	sc.cache_sees(doomed.uuid()).await;
 	for f in inside.iter().chain(std::iter::once(&outside)) {
-		assert!(poll_for_item(sc.cache.db_path(), f.uuid(), CACHE_CONVERGE_TIMEOUT).await);
+		sc.cache_sees(f.uuid()).await;
 	}
 	let r1 = sc.sync().await;
 	assert!(r1.errors.is_empty(), "{r1:?}");
@@ -923,7 +920,7 @@ async fn scale_22_remote_subtree_delete_removes_local_subtree() {
 	// Trash the whole subtree on the remote.
 	sc.resources.client.trash_dir(&mut doomed).await.unwrap();
 	for f in &inside {
-		assert!(poll_for_item_absent(sc.cache.db_path(), f.uuid(), CACHE_CONVERGE_TIMEOUT).await);
+		sc.cache_drops(f.uuid()).await;
 	}
 
 	let r2 = sc.sync().await;
@@ -1233,7 +1230,7 @@ async fn scale_19_first_sync_into_populated_remote_no_wipe() {
 		);
 	}
 	for f in &remote_files {
-		assert!(poll_for_item(sc.cache.db_path(), f.uuid(), CACHE_CONVERGE_TIMEOUT).await);
+		sc.cache_sees(f.uuid()).await;
 	}
 
 	let r1 = sc.sync().await;

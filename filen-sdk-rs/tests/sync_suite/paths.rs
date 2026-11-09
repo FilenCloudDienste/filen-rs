@@ -277,10 +277,7 @@ async fn path_16_quarantine_bin_not_synced() {
 
 	// Trash on remote; wait for the cache to drop it, then mirror the deletion locally.
 	sc.cache.client.trash_file(&mut rf).await.unwrap();
-	assert!(
-		poll_for_item_absent(sc.cache.db_path(), rf.uuid(), CACHE_CONVERGE_TIMEOUT).await,
-		"cache never dropped the trashed file"
-	);
+	sc.cache_drops(rf.uuid()).await;
 	let r2 = sc.sync().await;
 	assert!(r2.errors.is_empty(), "{r2:?}");
 	assert_eq!(
@@ -989,10 +986,7 @@ async fn path_19_dot_and_dotdot_literal_entries() {
 	}
 	let ok = upload_root(&sc, "ok.txt", b"ok").await;
 	for uuid in hostile.into_iter().chain([ok.uuid()]) {
-		assert!(
-			poll_for_item(sc.cache.db_path(), uuid, CACHE_CONVERGE_TIMEOUT).await,
-			"cache never observed item {uuid}"
-		);
+		sc.cache_sees(uuid).await;
 	}
 
 	let reported: Vec<UnsyncablePath> = [".", ".."]

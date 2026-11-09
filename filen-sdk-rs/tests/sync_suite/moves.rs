@@ -51,14 +51,6 @@ fn quarantined_file_count(root: &std::path::Path) -> usize {
 	count
 }
 
-/// Wait until the engine's cache view observes `uuid`.
-async fn wait_cache_has(sc: &SingleClient, uuid: Uuid) {
-	assert!(
-		poll_for_item(sc.cache.db_path(), uuid, CACHE_CONVERGE_TIMEOUT).await,
-		"cache never observed item {uuid}"
-	);
-}
-
 // ============================================================================
 // MOVE-01 — In-place file rename propagates as a rename (no re-transfer).
 // ============================================================================
@@ -206,7 +198,7 @@ async fn move03_cross_directory_move() {
 async fn move04_remote_rename_pulled_down() {
 	let sc = single_client(SyncMode::RemoteToLocal).await;
 	let mut rf = sc.upload_root("report.pdf", b"PDF-bytes-C1").await;
-	wait_cache_has(&sc, rf.uuid()).await;
+	sc.cache_sees(rf.uuid()).await;
 
 	let r1 = sc.sync().await;
 	assert!(r1.errors.is_empty(), "{r1:?}");
@@ -762,7 +754,7 @@ async fn move16_local_backup_mirrors_a_rename_as_a_move() {
 async fn move16_remote_backup_mirrors_a_rename_as_a_move() {
 	let sc = single_client(SyncMode::RemoteBackup).await;
 	let mut rf = sc.upload_root("mv.txt", b"backup-C1").await;
-	wait_cache_has(&sc, rf.uuid()).await;
+	sc.cache_sees(rf.uuid()).await;
 	let r1 = sc.sync().await;
 	assert!(r1.errors.is_empty(), "{r1:?}");
 	assert_eq!(r1.downloaded, 1, "{r1:?}");
@@ -1142,10 +1134,7 @@ async fn move24_cross_pair_move() {
 	let r1_dir = resources.client.create_dir(&root_dt, "R1").await.unwrap();
 	let r2_dir = resources.client.create_dir(&root_dt, "R2").await.unwrap();
 	for uuid in [r1_dir.uuid(), r2_dir.uuid()] {
-		assert!(
-			poll_for_item(cache.db_path(), uuid, CACHE_CONVERGE_TIMEOUT).await,
-			"cache never observed item {uuid}"
-		);
+		cache.cache_sees(uuid).await;
 	}
 
 	let engine =
@@ -1282,9 +1271,9 @@ async fn move_a1_remote_directory_rename_pulled_down() {
 		.make_file_builder("f3.txt", sub.uuid())
 		.unwrap();
 	let f3 = sc.resources.client.upload_file(f3b, b"C3").await.unwrap();
-	wait_cache_has(&sc, f1.uuid()).await;
-	wait_cache_has(&sc, f2.uuid()).await;
-	wait_cache_has(&sc, f3.uuid()).await;
+	sc.cache_sees(f1.uuid()).await;
+	sc.cache_sees(f2.uuid()).await;
+	sc.cache_sees(f3.uuid()).await;
 
 	let r1 = sc.sync().await;
 	assert!(r1.errors.is_empty(), "{r1:?}");
@@ -1708,7 +1697,7 @@ async fn move_a6_move_into_simultaneously_renamed_dir() {
 async fn move_a7_remote_move_with_edit_leaves_no_quarantine_copy() {
 	let sc = single_client(SyncMode::RemoteToLocal).await;
 	let mut rf = sc.upload_root("report.pdf", b"PDF-bytes-C1").await;
-	wait_cache_has(&sc, rf.uuid()).await;
+	sc.cache_sees(rf.uuid()).await;
 	let r1 = sc.sync().await;
 	assert!(r1.errors.is_empty(), "{r1:?}");
 	assert_eq!(r1.downloaded, 1, "{r1:?}");
@@ -1728,7 +1717,7 @@ async fn move_a7_remote_move_with_edit_leaves_no_quarantine_copy() {
 	let edited = sc
 		.upload_root("final.pdf", b"PDF-bytes-C2-and-longer")
 		.await;
-	wait_cache_has(&sc, edited.uuid()).await;
+	sc.cache_sees(edited.uuid()).await;
 	assert!(
 		poll_for_item_absent(sc.cache.db_path(), superseded, CACHE_CONVERGE_TIMEOUT).await,
 		"cache never dropped the superseded version"
@@ -1861,7 +1850,7 @@ async fn local_case_only_dir_rename(mode: SyncMode) {
 	assert_eq!(r1.uploaded, 2, "{r1:?}");
 	let original = case_tree_uuids(&sc, "Docs").await;
 	for uuid in original {
-		wait_cache_has(&sc, uuid).await;
+		sc.cache_sees(uuid).await;
 	}
 
 	rename_via_temp(&sc.local, "Docs", "docs");
@@ -1906,7 +1895,7 @@ async fn remote_case_only_dir_rename(mode: SyncMode) {
 		.unwrap();
 	let original = [docs.uuid(), a.uuid(), sub.uuid(), b.uuid()];
 	for uuid in original {
-		wait_cache_has(&sc, uuid).await;
+		sc.cache_sees(uuid).await;
 	}
 	let r1 = sc.sync().await;
 	assert!(r1.errors.is_empty(), "{r1:?}");
@@ -2052,7 +2041,7 @@ async fn local_dir_move(mode: SyncMode) {
 	let docs = find_dir(&dirs, "docs").expect("docs/ missing");
 	let original = moved_subtree_uuids(&sc, docs).await;
 	for uuid in original {
-		wait_cache_has(&sc, uuid).await;
+		sc.cache_sees(uuid).await;
 	}
 
 	move_file(&sc.local, "docs", "archive/documents");
@@ -2112,7 +2101,7 @@ async fn remote_dir_move(mode: SyncMode) {
 		.unwrap();
 	let original = [docs.uuid(), a.uuid(), sub.uuid(), b.uuid()];
 	for uuid in original.into_iter().chain([keep.uuid()]) {
-		wait_cache_has(&sc, uuid).await;
+		sc.cache_sees(uuid).await;
 	}
 	let r1 = sc.sync().await;
 	assert!(r1.errors.is_empty(), "{r1:?}");

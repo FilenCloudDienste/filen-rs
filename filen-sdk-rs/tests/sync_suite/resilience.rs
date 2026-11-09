@@ -36,14 +36,6 @@ async fn upload_root(sc: &SingleClient, name: &str, data: &[u8]) -> RemoteFile {
 	upload_to(&sc.cache.client, sc.resources.dir.uuid(), name, data).await
 }
 
-/// Wait until the cache (the engine's remote view) observes `uuid` under the root.
-async fn wait_cache_has(sc: &SingleClient, uuid: Uuid) {
-	assert!(
-		poll_for_item(sc.cache.db_path(), uuid, CACHE_CONVERGE_TIMEOUT).await,
-		"cache never observed item {uuid}"
-	);
-}
-
 /// Assert a `SyncReport` is a perfectly clean no-op (every counter zero, no conflicts/errors).
 fn assert_noop(r: &filen_sdk_rs::sync_engine::SyncReport) {
 	assert_eq!(r.uploaded, 0, "no-op expected, got upload: {r:?}");
@@ -145,8 +137,8 @@ async fn resil_12_first_run_populated_destination_local_to_remote_mirrors_source
 	// Pre-populate the remote (a "populated destination" before any baseline exists).
 	let q1 = upload_root(&sc, "q1.txt", b"remote-q1").await;
 	let common = upload_root(&sc, "common.txt", b"shared").await;
-	wait_cache_has(&sc, q1.uuid()).await;
-	wait_cache_has(&sc, common.uuid()).await;
+	sc.cache_sees(q1.uuid()).await;
+	sc.cache_sees(common.uuid()).await;
 
 	// Local-only files + the identical common file.
 	write_file(&sc.local, "p1.txt", b"local-p1");
@@ -225,8 +217,8 @@ async fn resil_12_first_run_populated_destination_remote_to_local_mirrors_source
 
 	let q1 = upload_root(&sc, "q1.txt", b"remote-q1").await;
 	let q2 = upload_root(&sc, "q2.txt", b"remote-q2").await;
-	wait_cache_has(&sc, q1.uuid()).await;
-	wait_cache_has(&sc, q2.uuid()).await;
+	sc.cache_sees(q1.uuid()).await;
+	sc.cache_sees(q2.uuid()).await;
 
 	// A pre-existing local-only file: in remote-authoritative mode this is mirrored away (correct),
 	// but its bytes must end up recoverable in the local quarantine bin (never destroyed outright).
@@ -294,8 +286,8 @@ async fn resil_12_first_run_populated_destination_two_way_union_no_conflict() {
 
 	let q1 = upload_root(&sc, "q1.txt", b"remote-q1").await;
 	let common = upload_root(&sc, "common.txt", b"shared").await;
-	wait_cache_has(&sc, q1.uuid()).await;
-	wait_cache_has(&sc, common.uuid()).await;
+	sc.cache_sees(q1.uuid()).await;
+	sc.cache_sees(common.uuid()).await;
 
 	write_file(&sc.local, "p1.txt", b"local-p1");
 	write_file(&sc.local, "common.txt", b"shared");

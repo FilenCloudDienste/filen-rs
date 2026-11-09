@@ -44,14 +44,6 @@ async fn upload_root(sc: &SingleClient, name: &str, data: &[u8]) -> RemoteFile {
 	upload_to(&sc.cache.client, sc.resources.dir.uuid(), name, data).await
 }
 
-/// Wait until the cache (the engine's remote view) observes `uuid` under the root.
-async fn wait_cache_has(sc: &SingleClient, uuid: Uuid) {
-	assert!(
-		poll_for_item(sc.cache.db_path(), uuid, CACHE_CONVERGE_TIMEOUT).await,
-		"cache never observed item {uuid}"
-	);
-}
-
 /// Assert a `SyncReport` is a perfectly clean no-op (every counter zero, no conflicts/errors). This
 /// is the observable form of self-write loop-freedom: after convergence, the engine's own writes
 /// must NOT generate any further transferring/deleting work.
@@ -116,7 +108,7 @@ async fn matrix_01_self_write_loop_free_l2r() {
 async fn matrix_02_self_write_loop_free_r2l() {
 	let sc = single_client(SyncMode::RemoteToLocal).await;
 	let rf = upload_root(&sc, "bar.txt", b"self-write-r2l").await;
-	wait_cache_has(&sc, rf.uuid()).await;
+	sc.cache_sees(rf.uuid()).await;
 
 	let r1 = sc.sync().await;
 	assert!(r1.errors.is_empty(), "{r1:?}");
@@ -238,7 +230,7 @@ async fn matrix_04_self_write_loop_free_backup_modes() {
 	// --- RemoteBackup: destination is the local tree; G pulled once. ---
 	let rb = single_client(SyncMode::RemoteBackup).await;
 	let g = upload_root(&rb, "G.txt", b"backup-pull").await;
-	wait_cache_has(&rb, g.uuid()).await;
+	rb.cache_sees(g.uuid()).await;
 	let p1 = rb.sync().await;
 	assert!(p1.errors.is_empty(), "{p1:?}");
 	assert_eq!(p1.downloaded, 1, "{p1:?}");
@@ -277,7 +269,7 @@ async fn matrix_05_first_sync_no_wipe_l2r() {
 		("R3.txt", b"r3"),
 	] {
 		let f = upload_root(&sc, name, body).await;
-		wait_cache_has(&sc, f.uuid()).await;
+		sc.cache_sees(f.uuid()).await;
 	}
 
 	let r1 = sc.sync().await;
@@ -418,7 +410,7 @@ async fn matrix_08_first_sync_no_wipe_backup_modes() {
 	// --- LocalBackup: populated remote destination + a local source-only file. ---
 	let lb = single_client(SyncMode::LocalBackup).await;
 	let surv = upload_root(&lb, "survivor.txt", b"keep-me").await;
-	wait_cache_has(&lb, surv.uuid()).await;
+	lb.cache_sees(surv.uuid()).await;
 	write_file(&lb.local, "added.txt", b"source-only");
 	let r1 = lb.sync().await;
 	assert!(r1.errors.is_empty(), "{r1:?}");
@@ -442,7 +434,7 @@ async fn matrix_08_first_sync_no_wipe_backup_modes() {
 	let rb = single_client(SyncMode::RemoteBackup).await;
 	write_file(&rb.local, "local_keep.txt", b"do-not-delete");
 	let pulled = upload_root(&rb, "pulled.txt", b"remote-source").await;
-	wait_cache_has(&rb, pulled.uuid()).await;
+	rb.cache_sees(pulled.uuid()).await;
 	let p1 = rb.sync().await;
 	assert!(p1.errors.is_empty(), "{p1:?}");
 	assert_eq!(
@@ -744,9 +736,9 @@ async fn matrix_14_remote_backup_source_delete_never_deletes_local() {
 	let mut g1 = upload_root(&sc, "G1.txt", b"body-G1.txt").await;
 	let g2 = upload_root(&sc, "G2.txt", b"body-G2.txt").await;
 	let g3 = upload_root(&sc, "G3.txt", b"body-G3.txt").await;
-	wait_cache_has(&sc, g1.uuid()).await;
-	wait_cache_has(&sc, g2.uuid()).await;
-	wait_cache_has(&sc, g3.uuid()).await;
+	sc.cache_sees(g1.uuid()).await;
+	sc.cache_sees(g2.uuid()).await;
+	sc.cache_sees(g3.uuid()).await;
 
 	let r1 = sc.sync().await;
 	assert!(r1.errors.is_empty(), "{r1:?}");
@@ -816,7 +808,7 @@ async fn matrix_15_backup_move_is_mirrored_as_a_move() {
 	// --- RemoteBackup: rename H -> H2 on the remote source. ---
 	let rb = single_client(SyncMode::RemoteBackup).await;
 	let mut h = upload_root(&rb, "H.txt", b"H-body-stable").await;
-	wait_cache_has(&rb, h.uuid()).await;
+	rb.cache_sees(h.uuid()).await;
 	let p1 = rb.sync().await;
 	assert!(p1.errors.is_empty(), "{p1:?}");
 	assert_eq!(p1.downloaded, 1, "{p1:?}");

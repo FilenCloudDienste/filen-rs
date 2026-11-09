@@ -27,6 +27,9 @@ use filen_sdk_rs::sync_engine::{
 };
 use uuid::Uuid;
 
+#[cfg(feature = "malformed")]
+use filen_sdk_rs::crypto::shared::MetaCrypter;
+
 use crate::helpers::*;
 
 /// A fresh, unique local sync-root temp directory.
@@ -213,6 +216,26 @@ pub async fn upload_to(client: &Client, parent: Uuid, name: &str, data: &[u8]) -
 	client.upload_file(builder, data).await.unwrap()
 }
 
+impl TestCache {
+	/// Wait until this cache (an engine's remote view) holds `uuid`, panicking after
+	/// [`CACHE_CONVERGE_TIMEOUT`].
+	pub async fn cache_sees(&self, uuid: Uuid) {
+		assert!(
+			poll_for_item(self.db_path(), uuid, CACHE_CONVERGE_TIMEOUT).await,
+			"cache never observed item {uuid}"
+		);
+	}
+
+	/// Wait until this cache (an engine's remote view) no longer holds `uuid`, panicking after
+	/// [`CACHE_CONVERGE_TIMEOUT`].
+	pub async fn cache_drops(&self, uuid: Uuid) {
+		assert!(
+			poll_for_item_absent(self.db_path(), uuid, CACHE_CONVERGE_TIMEOUT).await,
+			"cache never dropped item {uuid}"
+		);
+	}
+}
+
 /// A single-client sync setup: one engine on its own derived cache, a fresh local dir, and a fresh
 /// auto-cleaned remote dir already converged into the cache.
 pub struct SingleClient {
@@ -232,6 +255,16 @@ impl SingleClient {
 
 	pub fn cleanup(&self) {
 		std::fs::remove_dir_all(&self.local).ok();
+	}
+
+	/// [`TestCache::cache_sees`] on the engine's cache.
+	pub async fn cache_sees(&self, uuid: Uuid) {
+		self.cache.cache_sees(uuid).await;
+	}
+
+	/// [`TestCache::cache_drops`] on the engine's cache.
+	pub async fn cache_drops(&self, uuid: Uuid) {
+		self.cache.cache_drops(uuid).await;
 	}
 
 	/// The pair's remote root as a `DirType`, for the client's list and create calls.
@@ -358,8 +391,6 @@ pub async fn stage_case_colliding_dirs(
 /// two clients. Waits for the cache to hold all of them, and returns their uuids in order.
 #[cfg(feature = "malformed")]
 pub async fn stage_named_dirs(sc: &SingleClient, names: &[&str]) -> Vec<Uuid> {
-	use filen_sdk_rs::crypto::shared::MetaCrypter;
-
 	let client = &sc.resources.client;
 	let root = sc.root_dirtype();
 	let mut uuids = Vec::with_capacity(names.len());

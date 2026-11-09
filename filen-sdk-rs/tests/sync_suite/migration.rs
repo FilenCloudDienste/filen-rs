@@ -42,14 +42,6 @@ use crate::helpers::*;
 // Local helpers (public-API only; remote ground-truth via the cache's client).
 // ---------------------------------------------------------------------------
 
-/// Wait until `cache` (the engine's remote view) observes `uuid`.
-async fn wait_cache_has(cache: &TestCache, uuid: Uuid) {
-	assert!(
-		poll_for_item(cache.db_path(), uuid, CACHE_CONVERGE_TIMEOUT).await,
-		"cache never observed item {uuid}"
-	);
-}
-
 /// A read/write connection onto a baseline DB the engine persisted — the only way, black-box, to
 /// plant a schema version the current build does not understand (MIGRATE-04).
 fn open_read_write_db(path: &std::path::Path) -> rusqlite::Connection {
@@ -495,7 +487,7 @@ async fn migrate_07_real_change_after_reopen_is_applied() {
 		b"from the remote side",
 	)
 	.await;
-	wait_cache_has(&cache, added.uuid()).await;
+	cache.cache_sees(added.uuid()).await;
 
 	let engine2 = SyncEngine::open(cache.client.clone(), db_path)
 		.await

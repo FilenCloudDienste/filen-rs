@@ -20,22 +20,6 @@ use crate::helpers::*;
 // `sc.cache.db_path()` / `sc.cache.messages`, exactly like the existing blackbox tests.
 // ----------------------------------------------------------------------------
 
-/// Wait until the cache (the engine's remote view) has observed `uuid`.
-async fn cache_sees(sc: &SingleClient, uuid: Uuid) {
-	assert!(
-		poll_for_item(sc.cache.db_path(), uuid, CACHE_CONVERGE_TIMEOUT).await,
-		"cache never observed item {uuid}"
-	);
-}
-
-/// Wait until the cache (the engine's remote view) has dropped `uuid`.
-async fn cache_drops(sc: &SingleClient, uuid: Uuid) {
-	assert!(
-		poll_for_item_absent(sc.cache.db_path(), uuid, CACHE_CONVERGE_TIMEOUT).await,
-		"cache never dropped item {uuid}"
-	);
-}
-
 /// Recursively search the local quarantine bin for a file whose bytes equal `expected`.
 fn quarantine_has_content(local: &Path, expected: &[u8]) -> bool {
 	let bin = local.join(".filen-sync-trash");
@@ -133,8 +117,8 @@ async fn delete_02_single_remote_file_deletion_propagates() {
 	let rf = sc.upload_root("report.pdf", &payload).await;
 	let mut gone = rf;
 	let keep = sc.upload_root("keep.txt", b"keep").await;
-	cache_sees(&sc, gone.uuid()).await;
-	cache_sees(&sc, keep.uuid()).await;
+	sc.cache_sees(gone.uuid()).await;
+	sc.cache_sees(keep.uuid()).await;
 
 	let r1 = sc.sync().await;
 	assert!(r1.errors.is_empty(), "{r1:?}");
@@ -145,7 +129,7 @@ async fn delete_02_single_remote_file_deletion_propagates() {
 	);
 
 	sc.resources.client.trash_file(&mut gone).await.unwrap();
-	cache_drops(&sc, gone.uuid()).await;
+	sc.cache_drops(gone.uuid()).await;
 
 	let r2 = sc.sync().await;
 	assert!(r2.errors.is_empty(), "{r2:?}");
@@ -515,9 +499,9 @@ async fn delete_07_first_sync_empty_local_does_not_wipe_remote() {
 		.make_file_builder("w.txt", z.uuid())
 		.unwrap();
 	let w = sc.resources.client.upload_file(wb, b"W").await.unwrap();
-	cache_sees(&sc, x.uuid()).await;
-	cache_sees(&sc, y.uuid()).await;
-	cache_sees(&sc, w.uuid()).await;
+	sc.cache_sees(x.uuid()).await;
+	sc.cache_sees(y.uuid()).await;
+	sc.cache_sees(w.uuid()).await;
 
 	let r1 = sc.sync().await;
 	assert!(r1.errors.is_empty(), "{r1:?}");
@@ -579,14 +563,14 @@ async fn delete_09_mirrored_remote_delete_quarantines_local_copy() {
 	let sc = single_client(SyncMode::RemoteToLocal).await;
 	let content = b"precious-keep-dat-bytes";
 	let mut keep = sc.upload_root("keep.dat", content).await;
-	cache_sees(&sc, keep.uuid()).await;
+	sc.cache_sees(keep.uuid()).await;
 
 	let r1 = sc.sync().await;
 	assert_eq!(r1.downloaded, 1, "{r1:?}");
 	assert!(read_eq(&sc.local, "keep.dat", content));
 
 	sc.resources.client.trash_file(&mut keep).await.unwrap();
-	cache_drops(&sc, keep.uuid()).await;
+	sc.cache_drops(keep.uuid()).await;
 
 	let r2 = sc.sync().await;
 	assert!(r2.errors.is_empty(), "{r2:?}");
@@ -612,13 +596,13 @@ async fn delete_10_restore_quarantined_file_reuploads() {
 	let sc = single_client(SyncMode::TwoWay).await;
 	let content = b"restore-me-bytes";
 	let mut keep = sc.upload_root("keep.dat", content).await;
-	cache_sees(&sc, keep.uuid()).await;
+	sc.cache_sees(keep.uuid()).await;
 
 	let r1 = sc.sync().await;
 	assert_eq!(r1.downloaded, 1, "{r1:?}");
 
 	sc.resources.client.trash_file(&mut keep).await.unwrap();
-	cache_drops(&sc, keep.uuid()).await;
+	sc.cache_drops(keep.uuid()).await;
 	let r2 = sc.sync().await;
 	assert_eq!(r2.locally_deleted, 1, "{r2:?}");
 	assert!(!sc.local.join("keep.dat").exists());
@@ -733,14 +717,14 @@ async fn delete_13_remote_backup_does_not_mirror_remote_delete() {
 	let sc = single_client(SyncMode::RemoteBackup).await;
 	let content = b"snapshot-bin-bytes";
 	let mut snap = sc.upload_root("snapshot.bin", content).await;
-	cache_sees(&sc, snap.uuid()).await;
+	sc.cache_sees(snap.uuid()).await;
 
 	let r1 = sc.sync().await;
 	assert_eq!(r1.downloaded, 1, "{r1:?}");
 	assert!(read_eq(&sc.local, "snapshot.bin", content));
 
 	sc.resources.client.trash_file(&mut snap).await.unwrap();
-	cache_drops(&sc, snap.uuid()).await;
+	sc.cache_drops(snap.uuid()).await;
 
 	let r2 = sc.sync().await;
 	assert!(r2.errors.is_empty(), "{r2:?}");
@@ -1127,7 +1111,7 @@ async fn delete_22_one_way_ignores_non_authoritative_remote_delete() {
 		.expect("peer.txt missing")
 		.clone();
 	sc.resources.client.trash_file(&mut peer).await.unwrap();
-	cache_drops(&sc, peer.uuid()).await;
+	sc.cache_drops(peer.uuid()).await;
 
 	let r2 = sc.sync().await;
 	assert!(r2.errors.is_empty(), "{r2:?}");
@@ -1633,8 +1617,8 @@ async fn delete_a5_quarantine_name_collision_both_recoverable() {
 		.make_file_builder("note.txt", b_dir.uuid())
 		.unwrap();
 	let mut bf = sc.resources.client.upload_file(bb, a2).await.unwrap();
-	cache_sees(&sc, af.uuid()).await;
-	cache_sees(&sc, bf.uuid()).await;
+	sc.cache_sees(af.uuid()).await;
+	sc.cache_sees(bf.uuid()).await;
 
 	let r1 = sc.sync().await;
 	assert_eq!(r1.downloaded, 2, "{r1:?}");
@@ -1644,8 +1628,8 @@ async fn delete_a5_quarantine_name_collision_both_recoverable() {
 	// Delete BOTH on the remote -> both mirror locally and quarantine.
 	sc.resources.client.trash_file(&mut af).await.unwrap();
 	sc.resources.client.trash_file(&mut bf).await.unwrap();
-	cache_drops(&sc, af.uuid()).await;
-	cache_drops(&sc, bf.uuid()).await;
+	sc.cache_drops(af.uuid()).await;
+	sc.cache_drops(bf.uuid()).await;
 
 	let r2 = sc.sync().await;
 	assert!(r2.errors.is_empty(), "{r2:?}");
@@ -1738,8 +1722,8 @@ async fn delete_a7_first_sync_two_populated_trees_no_wipe() {
 	// Remote pre-populated.
 	let shared_remote = sc.upload_root("shared.txt", b"REMOTE-CONTENT").await;
 	let remote_only = sc.upload_root("remote_only.txt", b"ROnly").await;
-	cache_sees(&sc, shared_remote.uuid()).await;
-	cache_sees(&sc, remote_only.uuid()).await;
+	sc.cache_sees(shared_remote.uuid()).await;
+	sc.cache_sees(remote_only.uuid()).await;
 	// Local pre-populated with a divergent shared.txt + a local-only file.
 	write_file(&sc.local, "shared.txt", b"LOCAL-CONTENT-DIFFERENT");
 	write_file(&sc.local, "local_only.txt", b"LOnly");
@@ -2024,7 +2008,7 @@ async fn delete_r2_restoring_cloud_deletions_uploads_them_again() {
 			.expect("synced")
 			.clone();
 		sc.resources.client.trash_file(&mut file).await.unwrap();
-		cache_drops(&sc, file.uuid()).await;
+		sc.cache_drops(file.uuid()).await;
 	}
 	let r2 = sc.sync().await;
 	assert_eq!(r2.held_deletions(), DELETE_R, "{r2:?}");

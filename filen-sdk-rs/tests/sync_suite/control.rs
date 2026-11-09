@@ -364,7 +364,7 @@ async fn control_07_three_disjoint_pairs_no_cross_contamination() {
 	// P2 gets a pending remote create (it's the pull pair).
 	let p2b = cache.client.make_file_builder("r2.txt", r2.uuid()).unwrap();
 	let p2f = cache.client.upload_file(p2b, b"p2 remote").await.unwrap();
-	assert!(poll_for_item(cache.db_path(), p2f.uuid(), CACHE_CONVERGE_TIMEOUT).await);
+	cache.cache_sees(p2f.uuid()).await;
 
 	let local1 = fresh_local_dir("c07p1"); // local create
 	let local2 = fresh_local_dir("c07p2"); // remote create -> pull

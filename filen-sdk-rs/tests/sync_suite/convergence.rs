@@ -421,8 +421,8 @@ async fn converge_09_remote_delete_mirrors_to_local() {
 	let sc = single_client(SyncMode::TwoWay).await;
 	let keep = upload_to(&sc.cache.client, sc.remote, "keep.txt", b"keep").await;
 	let mut del = upload_to(&sc.cache.client, sc.remote, "del.txt", b"del").await;
-	assert!(poll_for_item(sc.cache.db_path(), keep.uuid(), CACHE_CONVERGE_TIMEOUT).await);
-	assert!(poll_for_item(sc.cache.db_path(), del.uuid(), CACHE_CONVERGE_TIMEOUT).await);
+	sc.cache_sees(keep.uuid()).await;
+	sc.cache_sees(del.uuid()).await;
 
 	let r0 = sc.sync().await;
 	assert_eq!(r0.downloaded, 2, "{r0:?}");
@@ -491,7 +491,7 @@ async fn converge_10_local_backup_delete_not_mirrored() {
 async fn converge_10_remote_backup_delete_not_mirrored() {
 	let sc = single_client(SyncMode::RemoteBackup).await;
 	let mut keep = upload_to(&sc.cache.client, sc.remote, "keep2.txt", b"keep me too").await;
-	assert!(poll_for_item(sc.cache.db_path(), keep.uuid(), CACHE_CONVERGE_TIMEOUT).await);
+	sc.cache_sees(keep.uuid()).await;
 
 	let r0 = sc.sync().await;
 	assert_eq!(r0.downloaded, 1, "{r0:?}");
@@ -1187,7 +1187,7 @@ async fn converge_23_first_sync_populated_dest_unions() {
 	let sc = single_client(SyncMode::TwoWay).await;
 	// Pre-existing remote file BEFORE the first pass.
 	let rb = upload_to(&sc.cache.client, sc.remote, "rb.txt", b"r").await;
-	assert!(poll_for_item(sc.cache.db_path(), rb.uuid(), CACHE_CONVERGE_TIMEOUT).await);
+	sc.cache_sees(rb.uuid()).await;
 	// Pre-existing local file.
 	write_file(&sc.local, "la.txt", b"l");
 
@@ -1236,8 +1236,8 @@ async fn converge_24_offline_gap_backlog_converges() {
 		.await
 		.unwrap();
 	let g4 = upload_to(&sc.cache.client, g3sub.uuid(), "g4.txt", b"g4").await;
-	assert!(poll_for_item(sc.cache.db_path(), g2.uuid(), CACHE_CONVERGE_TIMEOUT).await);
-	assert!(poll_for_item(sc.cache.db_path(), g4.uuid(), CACHE_CONVERGE_TIMEOUT).await);
+	sc.cache_sees(g2.uuid()).await;
+	sc.cache_sees(g4.uuid()).await;
 
 	// Resume: run passes until converged.
 	let mut passes = 0usize;
@@ -1643,7 +1643,7 @@ async fn converge_a6_local_backup_positive_convergence() {
 	write_file(&sc.local, "lbmod.txt", b"m1");
 	// Independent remote-only create (must NOT be pulled down).
 	let ro = upload_to(&sc.cache.client, sc.remote, "rb_only.txt", b"r").await;
-	assert!(poll_for_item(sc.cache.db_path(), ro.uuid(), CACHE_CONVERGE_TIMEOUT).await);
+	sc.cache_sees(ro.uuid()).await;
 
 	let r1 = sc.sync().await;
 	assert!(r1.errors.is_empty(), "{r1:?}");

@@ -250,7 +250,7 @@ async fn sec02_baseline_has_no_decrypted_content() {
 	let mut modified = SECRET_MARKER.to_vec();
 	modified.push(b'X');
 	let rf2 = upload_to(&cache.client, resources.dir.uuid(), "secret.bin", &modified).await;
-	assert!(poll_for_item(cache.db_path(), rf2.uuid(), CACHE_CONVERGE_TIMEOUT).await);
+	cache.cache_sees(rf2.uuid()).await;
 	let db = baseline_db.clone();
 	let _ = db;
 	let mut r2 = engine.sync_once(pair).await.unwrap();
@@ -310,18 +310,15 @@ async fn sec03_quarantine_has_only_recoverable_user_data() {
 		SECRET_MARKER,
 	)
 	.await;
-	assert!(poll_for_item(cache.db_path(), keep.uuid(), CACHE_CONVERGE_TIMEOUT).await);
-	assert!(poll_for_item(cache.db_path(), doomed.uuid(), CACHE_CONVERGE_TIMEOUT).await);
+	cache.cache_sees(keep.uuid()).await;
+	cache.cache_sees(doomed.uuid()).await;
 
 	let r1 = engine.sync_once(pair).await.unwrap();
 	assert_eq!(r1.downloaded, 2, "{r1:?}");
 
 	// Trash doomed.txt on the remote; the engine should quarantine its local copy.
 	cache.client.trash_file(&mut doomed).await.unwrap();
-	assert!(
-		poll_for_item_absent(cache.db_path(), doomed.uuid(), CACHE_CONVERGE_TIMEOUT).await,
-		"cache never dropped the trashed file"
-	);
+	cache.cache_drops(doomed.uuid()).await;
 	let r2 = engine.sync_once(pair).await.unwrap();
 	assert_eq!(
 		r2.locally_deleted, 1,
@@ -394,7 +391,7 @@ async fn sec04_decrypted_content_confined_to_destination() {
 		content.push(b'-');
 		content.push(b'0' + i);
 		let rf = upload_to(&cache.client, resources.dir.uuid(), &name, &content).await;
-		assert!(poll_for_item(cache.db_path(), rf.uuid(), CACHE_CONVERGE_TIMEOUT).await);
+		cache.cache_sees(rf.uuid()).await;
 		markers.push((name, content));
 	}
 
@@ -475,7 +472,7 @@ async fn sec09_created_files_use_restrictive_permissions() {
 		.await
 		.unwrap();
 	let rf = upload_to(&cache.client, sub.uuid(), "key.pem", SECRET_MARKER).await;
-	assert!(poll_for_item(cache.db_path(), rf.uuid(), CACHE_CONVERGE_TIMEOUT).await);
+	cache.cache_sees(rf.uuid()).await;
 
 	let report = engine.sync_once(pair).await.unwrap();
 	assert!(report.errors.is_empty(), "{report:?}");
@@ -643,7 +640,7 @@ async fn sec15_watch_self_write_does_not_leak_or_reupload() {
 		SECRET_MARKER,
 	)
 	.await;
-	assert!(poll_for_item(cache.db_path(), rf.uuid(), CACHE_CONVERGE_TIMEOUT).await);
+	cache.cache_sees(rf.uuid()).await;
 
 	let handle = engine.clone().watch(pair).await.unwrap();
 
@@ -976,7 +973,7 @@ async fn undecryptable_child_survives_a_remote_dir_move(tag: &str, new_parent: O
 		assert!(r1.errors.is_empty(), "{r1:?}");
 		assert_eq!(r1.uploaded, 2, "{r1:?}");
 		let docs = remote_dir_named(&resources, "docs").await;
-		assert!(poll_for_item(cache.db_path(), docs.uuid(), CACHE_CONVERGE_TIMEOUT).await);
+		cache.cache_sees(docs.uuid()).await;
 		for file in remote_dir_files(&resources, &docs).await {
 			assert!(
 				poll_for_item(cache.db_path(), file.uuid(), CACHE_CONVERGE_TIMEOUT).await,
