@@ -17,8 +17,8 @@ use filen_sdk_rs::{
 use serde_json::json;
 
 use super::{
-	ItemOperand, ListedBy, ListedItem, ListedKind, StderrProgress, listing_order,
-	print_long_listing, resolve_item,
+	ItemOperand, ListedBy, ListedItem, ListedKind, ListingLayout, StderrProgress, listing_order,
+	print_listing, resolve_item,
 };
 use crate::{
 	auth::LazyClient,
@@ -179,13 +179,6 @@ fn in_order(items: Vec<ListedItem>, order: impl IntoIterator<Item = usize>) -> V
 		.collect()
 }
 
-fn styled_label(item: &ListedItem, label: &str) -> String {
-	match item.kind {
-		ListedKind::Directory => style(label).blue().to_string(),
-		ListedKind::File => label.to_owned(),
-	}
-}
-
 /// `ls -R`: everything below the directory at `path`, one path relative to it per line, each
 /// directory followed by what it holds.
 pub(super) async fn list_directory_recursively(
@@ -199,35 +192,19 @@ pub(super) async fn list_directory_recursively(
 		ListedPath::Dir(dir) => list_recursively(ui, client, dir).await?,
 		ListedPath::File(file) => {
 			let item = ListedItem::of_file(&file);
-			return super::print_listing(ui, &[item], ListedBy::Name, "", long);
+			return print_listing(ui, &[item], ListedBy::Name, "", long, ListingLayout::Grid);
 		}
 	};
 	let tree = ListingTree::of(&items);
 	let items = in_order(items, tree.lines().into_iter().map(|(index, _)| index));
-	print_recursive_listing(ui, &items, long)
-}
-
-fn print_recursive_listing(ui: &mut UI, items: &[ListedItem], long: bool) -> Result<()> {
-	if ui.json {
-		return ui.print_json(serde_json::Value::Array(
-			items
-				.iter()
-				.map(|item| item.to_json(ListedBy::Path))
-				.collect(),
-		));
-	}
-	if items.is_empty() {
-		ui.print_muted("Directory is empty");
-		return Ok(());
-	}
-	if long {
-		print_long_listing(ui, items, ListedBy::Path);
-		return Ok(());
-	}
-	for item in items {
-		ui.print(&styled_label(item, &item.label(ListedBy::Path)));
-	}
-	Ok(())
+	print_listing(
+		ui,
+		&items,
+		ListedBy::Path,
+		"Directory is empty",
+		long,
+		ListingLayout::Lines,
+	)
 }
 
 /// `tree`: everything below the directory at `path`, drawn as a tree.
@@ -245,7 +222,14 @@ pub(super) async fn print_tree(
 	let lines = tree.lines();
 	if ui.json {
 		let items = in_order(items, lines.into_iter().map(|(index, _)| index));
-		return print_recursive_listing(ui, &items, false);
+		return print_listing(
+			ui,
+			&items,
+			ListedBy::Path,
+			"Directory is empty",
+			false,
+			ListingLayout::Lines,
+		);
 	}
 	for line in tree_text(&path.to_string(), &items, &lines) {
 		ui.print(&line);
@@ -258,7 +242,7 @@ fn tree_text(directory: &str, items: &[ListedItem], lines: &[(usize, String)]) -
 	let mut text = vec![style(directory).blue().to_string()];
 	for (index, prefix) in lines {
 		if let Some(item) = items.get(*index) {
-			text.push(format!("{}{}", prefix, styled_label(item, &item.name)));
+			text.push(format!("{}{}", prefix, item.styled(&item.name)));
 		}
 	}
 	let dirs = items
@@ -388,7 +372,7 @@ fn disk_usage_text(
 		.iter()
 		.filter_map(|&(index, size)| {
 			let item = items.get(index)?;
-			Some((ui::format_size(size), styled_label(item, &item.name)))
+			Some((ui::format_size(size), item.styled(&item.name)))
 		})
 		.chain(std::iter::once((
 			ui::format_size(total),

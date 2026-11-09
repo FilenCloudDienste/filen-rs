@@ -568,7 +568,7 @@ pub(crate) async fn list_directory(
 		NonRootFileType::File(file) => {
 			// like `ls` on a local file: that one file, the way a listing shows it
 			let item = ListedItem::of_file(&file);
-			return print_listing(ui, &[item], ListedBy::Name, "", long);
+			return print_listing(ui, &[item], ListedBy::Name, "", long, ListingLayout::Grid);
 		}
 	};
 	list_directory_by_dir(ui, client, &directory, None, long).await
@@ -593,6 +593,7 @@ pub(crate) fn print_items_after_list(
 		ListedBy::Name,
 		&format!("{} is empty", directory_label.unwrap_or("Directory")),
 		long,
+		ListingLayout::Grid,
 	)
 }
 
@@ -704,6 +705,14 @@ impl ListedItem {
 		serde_json::Value::Object(object)
 	}
 
+	/// `label` as listings print it for this item: in blue for a directory.
+	fn styled(&self, label: &str) -> String {
+		match self.kind {
+			ListedKind::Directory => style(label).blue().to_string(),
+			ListedKind::File => label.to_owned(),
+		}
+	}
+
 	/// The date `ls -l` shows: when a file was last modified, when a directory was created.
 	fn date(&self) -> Option<DateTime<Utc>> {
 		match self.kind {
@@ -799,10 +808,7 @@ fn print_long_listing(ui: &mut UI, items: &[ListedItem], by: ListedBy) {
 		// pad before styling, so the ANSI codes don't count towards the column width
 		let size = format!("{:>size_width$}", size);
 		let date = format!("{:<date_width$}", date);
-		let label = match item.kind {
-			ListedKind::Directory => style(item.label(by)).blue().to_string(),
-			ListedKind::File => item.label(by).into_owned(),
-		};
+		let label = item.styled(&item.label(by));
 		let size = match item.kind {
 			ListedKind::Directory => style(size).dim().to_string(),
 			ListedKind::File => size,
@@ -823,6 +829,15 @@ fn print_long_listing(ui: &mut UI, items: &[ListedItem], by: ListedBy) {
 	}
 }
 
+/// How a listing that is not long lays out its labels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ListingLayout {
+	/// In columns across the terminal, like `ls`.
+	Grid,
+	/// One per line, like `ls -R`.
+	Lines,
+}
+
 /// Prints a listing, in the order of `items`.
 fn print_listing(
 	ui: &mut UI,
@@ -830,6 +845,7 @@ fn print_listing(
 	by: ListedBy,
 	empty_message: &str,
 	long: bool,
+	layout: ListingLayout,
 ) -> Result<()> {
 	if ui.json {
 		ui.print_json(serde_json::Value::Array(
@@ -845,15 +861,20 @@ fn print_listing(
 		print_long_listing(ui, items, by);
 		return Ok(());
 	}
-	// print directory names in blue
-	let labels = items
-		.iter()
-		.map(|item| match item.kind {
-			ListedKind::Directory => style(item.label(by)).blue().to_string(),
-			ListedKind::File => item.label(by).into_owned(),
-		})
-		.collect::<Vec<String>>();
-	ui.print_grid(&labels.iter().map(String::as_str).collect::<Vec<&str>>());
+	match layout {
+		ListingLayout::Grid => {
+			let labels = items
+				.iter()
+				.map(|item| item.styled(&item.label(by)))
+				.collect::<Vec<String>>();
+			ui.print_grid(&labels.iter().map(String::as_str).collect::<Vec<&str>>());
+		}
+		ListingLayout::Lines => {
+			for item in items {
+				ui.print(&item.styled(&item.label(by)));
+			}
+		}
+	}
 	Ok(())
 }
 
@@ -3264,7 +3285,14 @@ pub(crate) async fn list_recents(ui: &mut UI, client: &mut LazyClient) -> Result
 		.context("Failed to list recents")?;
 	// in the order the server lists them, which sorting by path would lose
 	let items = list_with_full_paths(client, &dirs, &files).await?;
-	print_listing(ui, &items, ListedBy::Path, "No recent items", false)
+	print_listing(
+		ui,
+		&items,
+		ListedBy::Path,
+		"No recent items",
+		false,
+		ListingLayout::Grid,
+	)
 }
 
 /// Prints a listing whose items don't share a parent, so a bare name wouldn't identify them:
@@ -3278,7 +3306,14 @@ pub(crate) async fn print_items_with_full_paths(
 ) -> Result<()> {
 	let mut items = list_with_full_paths(client, &dirs, &files).await?;
 	sort_listing(&mut items, ListedBy::Path);
-	print_listing(ui, &items, ListedBy::Path, empty_message, false)
+	print_listing(
+		ui,
+		&items,
+		ListedBy::Path,
+		empty_message,
+		false,
+		ListingLayout::Grid,
+	)
 }
 
 /// The listing of `dirs` and `files`, in that order, each with its absolute path.
@@ -3334,7 +3369,14 @@ pub(crate) async fn list_trash(ui: &mut UI, client: &mut LazyClient, long: bool)
 		.into_iter()
 		.map(|entry| entry.listed)
 		.collect::<Vec<ListedItem>>();
-	print_listing(ui, &items, ListedBy::Name, "Trash is empty", long)
+	print_listing(
+		ui,
+		&items,
+		ListedBy::Name,
+		"Trash is empty",
+		long,
+		ListingLayout::Grid,
+	)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -4825,7 +4867,15 @@ mod tests {
 		let mut ui = printed.ui();
 		ui.json = json;
 		sort_listing(&mut items, by);
-		print_listing(&mut ui, &items, by, "Directory is empty", long).unwrap();
+		print_listing(
+			&mut ui,
+			&items,
+			by,
+			"Directory is empty",
+			long,
+			ListingLayout::Grid,
+		)
+		.unwrap();
 		console::strip_ansi_codes(&printed.lines()).into_owned()
 	}
 
@@ -4878,7 +4928,15 @@ mod tests {
 		let printed = Printed::default();
 		let mut ui = printed.ui();
 		ui.initialize(false, false, None, true, true);
-		print_listing(&mut ui, &items, ListedBy::Name, "Directory is empty", true).unwrap();
+		print_listing(
+			&mut ui,
+			&items,
+			ListedBy::Name,
+			"Directory is empty",
+			true,
+			ListingLayout::Grid,
+		)
+		.unwrap();
 
 		assert_eq!(
 			console::strip_ansi_codes(&printed.lines()),
