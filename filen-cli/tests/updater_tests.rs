@@ -70,6 +70,14 @@ fn asset(tag: &str) -> Vec<u8> {
 	asset
 }
 
+/// The SHA-256 digest of `bytes` in lowercase hex, as the updater prints and GitHub lists it.
+fn sha256_hex(bytes: &[u8]) -> String {
+	Sha256::digest(bytes)
+		.iter()
+		.map(|byte| format!("{byte:02x}"))
+		.collect()
+}
+
 /// A local server answering for GitHub, until it is dropped.
 struct MockServer {
 	server: Arc<Server>,
@@ -136,7 +144,7 @@ fn respond(releases: Releases, url: &str, path: &str) -> (u16, Vec<u8>) {
 		let asset = asset(tag);
 		let digest = match releases.digest {
 			ListedDigest::Missing => None,
-			ListedDigest::OfAsset => Some(format!("sha256:{:x}", Sha256::digest(&asset))),
+			ListedDigest::OfAsset => Some(format!("sha256:{}", sha256_hex(&asset))),
 			ListedDigest::Given(digest) => Some(digest.to_owned()),
 		};
 		let release = json!({
@@ -457,9 +465,9 @@ fn an_asset_not_matching_its_digest_is_not_installed() {
 		.success()
 		.stderr(contains(format!(
 			"Update check failed: The download of filen-cli-v1.0.0-{TARGET} has the SHA-256 digest \
-			 {:x}, but its release lists \
+			 {}, but its release lists \
 			 0000000000000000000000000000000000000000000000000000000000000000",
-			Sha256::digest(asset("v1.0.0"))
+			sha256_hex(&asset("v1.0.0"))
 		)));
 
 	assert_eq!(
