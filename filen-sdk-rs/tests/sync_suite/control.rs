@@ -11,6 +11,7 @@
 //! baseline-corruption seam. Every plan item that depends on one of those — and every fault-
 //! injection item (mid-pass stop, crash, corrupted baseline) — is written as an `#[ignore]` stub
 //! that records its plan, because faking it would assert nothing real.
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -18,13 +19,18 @@ use std::time::Duration;
 use filen_macros::shared_test_runtime;
 use filen_sdk_rs::auth::http::ClientConfig;
 use filen_sdk_rs::auth::unauth::UnauthClient;
+use filen_sdk_rs::cache::open_sqlite;
+use filen_sdk_rs::consts::{CHUNK_SIZE, CHUNK_SIZE_U64};
+use filen_sdk_rs::crypto::shared::MetaCrypter;
 use filen_sdk_rs::fs::categories::{DirType, Normal};
 use filen_sdk_rs::fs::file::traits::HasFileInfo;
 use filen_sdk_rs::fs::{HasName, HasParent, HasUUID};
+use filen_sdk_rs::io::client_impl::IoSharedClientExt;
 use filen_sdk_rs::sync_engine::{
 	Backlog, CONFIRM_TENURE, IgnoreLevel, IgnoredPath, PauseMode, PauseOptions, SyncEngine,
 	SyncEvent, SyncMode, TransferDirection, WatchConfig, WatchState,
 };
+use filen_types::crypto::EncryptedString;
 use filen_types::fs::ParentUuid;
 use uuid::Uuid;
 
@@ -1595,6 +1601,235 @@ async fn control_18b_suspend_parks_and_resume_finishes_the_pass() {
 		(0, 0, 0),
 		"the resumed pass left work behind: {after:?}"
 	);
+
+	std::fs::remove_dir_all(&local).ok();
+}
+
+/// The size of the file the upload journal tests interrupt: 64 chunks. Its journal is first saved
+/// after 16 acknowledged chunks (or 5 s), and the pause has to land while the rest is still being
+/// sent.
+const JOURNALED_LEN: usize = 64 * CHUNK_SIZE;
+
+/// `len` bytes that differ for every `seed`, the same for the same one.
+fn noise(len: usize, seed: u8) -> Vec<u8> {
+	let mut bytes = vec![0; len];
+	blake3::Hasher::new()
+		.update(&[seed])
+		.finalize_xof()
+		.fill(&mut bytes);
+	bytes
+}
+
+/// How many upload journals the engine's DB at `db` holds.
+fn upload_journals(db: &std::path::Path) -> i64 {
+	open_sqlite(db)
+		.unwrap()
+		.query_row("SELECT COUNT(*) FROM upload_journal", [], |row| row.get(0))
+		.unwrap()
+}
+
+/// The file uuid the one upload journal in the engine's DB at `db` uploads under, read the way
+/// the SDK reads it: decrypted with the account's metadata keys.
+async fn journaled_upload_uuid(client: &filen_sdk_rs::auth::Client, db: &std::path::Path) -> Uuid {
+	let sealed: String = open_sqlite(db)
+		.unwrap()
+		.query_row("SELECT sealed FROM upload_journal", [], |row| row.get(0))
+		.unwrap();
+	let record = client
+		.crypter()
+		.decrypt_meta(&EncryptedString(Cow::Owned(sealed)))
+		.await
+		.unwrap();
+	let record: serde_json::Value = serde_json::from_str(&record).unwrap();
+	record["uuid"].as_str().unwrap().parse().unwrap()
+}
+
+/// Wait until the engine's DB at `db` holds an upload journal.
+async fn wait_for_upload_journal(db: &std::path::Path) {
+	let deadline = std::time::Instant::now() + Duration::from_secs(180);
+	while upload_journals(db) == 0 {
+		assert!(
+			std::time::Instant::now() < deadline,
+			"the upload never saved a journal"
+		);
+		tokio::time::sleep(Duration::from_millis(20)).await;
+	}
+}
+
+/// Run a pass of a new engine on `db` that uploads `local`'s single file `name`, and cancel it once
+/// the upload saved its journal, so the journal outlives the engine. Returns the pair and the file
+/// uuid the journal uploads under.
+async fn interrupt_journaled_upload(
+	cache: &TestCache,
+	db: &std::path::Path,
+	local: &std::path::Path,
+	remote: Uuid,
+) -> (i64, Uuid) {
+	let engine = Arc::new(
+		SyncEngine::open(cache.client.clone(), db.to_path_buf())
+			.await
+			.unwrap(),
+	);
+	let pair = engine
+		.add_pair(local.to_path_buf(), remote, SyncMode::LocalToRemote)
+		.await
+		.unwrap();
+	let running = tokio::spawn({
+		let engine = Arc::clone(&engine);
+		async move { engine.sync_once(pair).await.unwrap() }
+	});
+	wait_for_upload_journal(db).await;
+	engine
+		.pause_pair_with(
+			pair,
+			PauseOptions {
+				mode: PauseMode::Cancel,
+				cancel_after: None,
+			},
+		)
+		.await
+		.unwrap();
+	let first = tokio::time::timeout(Duration::from_secs(300), running)
+		.await
+		.expect("the cancelled pass never returned")
+		.unwrap();
+	assert!(first.errors.is_empty(), "{first:?}");
+	assert_eq!(
+		(first.uploaded, first.interrupted),
+		(0, 1),
+		"the pause was supposed to cut the upload short: {first:?}"
+	);
+	assert_eq!(
+		upload_journals(db),
+		1,
+		"a cut upload must leave its journal behind"
+	);
+	(pair, journaled_upload_uuid(&cache.client, db).await)
+}
+
+/// The first `Progress` an observed pass reported for an upload of `rel_path`, in bytes.
+fn first_upload_progress(log: &EventLog, rel_path: &str) -> Option<u64> {
+	log.lock().unwrap().iter().find_map(|event| match event {
+		SyncEvent::Progress {
+			rel_path: at,
+			direction: TransferDirection::Upload,
+			bytes,
+			..
+		} if at == rel_path => Some(*bytes),
+		_ => None,
+	})
+}
+
+/// The uuid and content of the one remote file named `name` directly under the resources' root.
+async fn only_remote_file(resources: &test_utils::TestResources, name: &str) -> (Uuid, Vec<u8>) {
+	let (_dirs, files) = list_remote(resources).await;
+	let named: Vec<_> = files.iter().filter(|f| f.name() == Some(name)).collect();
+	assert_eq!(
+		named.len(),
+		1,
+		"the remote must hold exactly one {name}: {files:?}"
+	);
+	(
+		named[0].uuid(),
+		resources.client.download_file(named[0]).await.unwrap(),
+	)
+}
+
+/// CONTROL — an upload a pause cut short is continued, not started over, by the next pass of a
+/// NEW engine on the same DB: the pass reports the bytes the first one sent before it sends any,
+/// the remote ends up with the local file's exact bytes, once, and the journal is gone.
+#[shared_test_runtime]
+async fn control_an_upload_cut_by_a_pause_resumes_after_an_engine_restart() {
+	let (resources, cache, remote, local) = raw_setup("c_upload_resume").await;
+	let data = noise(JOURNALED_LEN, 1);
+	write_file(&local, "big.bin", &data);
+	let db = temp_cache_path();
+	let (pair, journaled) = interrupt_journaled_upload(&cache, &db, &local, remote).await;
+
+	let engine = SyncEngine::open(cache.client.clone(), db.clone())
+		.await
+		.unwrap();
+	let reopened = engine
+		.add_pair(local.clone(), remote, SyncMode::LocalToRemote)
+		.await
+		.unwrap();
+	assert_eq!(reopened, pair, "the same roots must find the same pair");
+	engine.resume_pair(pair).await.unwrap();
+	let log: EventLog = Arc::new(Mutex::new(Vec::new()));
+	let mut observer = recording_observer(Arc::clone(&log));
+	let report = engine
+		.sync_once_observed(pair, &mut observer)
+		.await
+		.unwrap();
+
+	assert!(report.errors.is_empty(), "{report:?}");
+	assert_eq!(report.uploaded, 1, "{report:?}");
+	let resumed = first_upload_progress(&log, "big.bin").expect("the upload reported no progress");
+	assert!(
+		resumed >= CHUNK_SIZE_U64,
+		"the upload was started over instead of continued: its first progress was {resumed} bytes"
+	);
+	let (uuid, content) = only_remote_file(&resources, "big.bin").await;
+	assert_eq!(
+		uuid, journaled,
+		"the upload was not finished under the journal's uuid"
+	);
+	assert!(
+		content == data,
+		"the remote file's bytes are not the local file's"
+	);
+	assert_eq!(
+		upload_journals(&db),
+		0,
+		"a finished upload keeps no journal"
+	);
+
+	std::fs::remove_dir_all(&local).ok();
+}
+
+/// CONTROL — a journal whose local file changed after the upload was cut short is not continued:
+/// the next pass uploads the new bytes from the start, and drops the journal.
+#[shared_test_runtime]
+async fn control_a_journal_whose_file_changed_is_dropped_and_the_file_uploaded_fresh() {
+	let (resources, cache, remote, local) = raw_setup("c_upload_changed").await;
+	write_file(&local, "big.bin", &noise(JOURNALED_LEN, 2));
+	let db = temp_cache_path();
+	let (pair, journaled) = interrupt_journaled_upload(&cache, &db, &local, remote).await;
+
+	// Other bytes of the same size, under a later mtime.
+	let path = local.join("big.bin");
+	let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+	let changed = noise(JOURNALED_LEN, 3);
+	write_file(&local, "big.bin", &changed);
+	std::fs::File::options()
+		.write(true)
+		.open(&path)
+		.unwrap()
+		.set_modified(modified + Duration::from_secs(10))
+		.unwrap();
+
+	let engine = SyncEngine::open(cache.client.clone(), db.clone())
+		.await
+		.unwrap();
+	engine
+		.add_pair(local.clone(), remote, SyncMode::LocalToRemote)
+		.await
+		.unwrap();
+	engine.resume_pair(pair).await.unwrap();
+	let report = engine.sync_once(pair).await.unwrap();
+
+	assert!(report.errors.is_empty(), "{report:?}");
+	assert_eq!(report.uploaded, 1, "{report:?}");
+	let (uuid, content) = only_remote_file(&resources, "big.bin").await;
+	assert_ne!(
+		uuid, journaled,
+		"the changed file was uploaded under the stale journal's uuid"
+	);
+	assert!(
+		content == changed,
+		"the remote file does not hold the changed bytes"
+	);
+	assert_eq!(upload_journals(&db), 0, "the stale journal was kept");
 
 	std::fs::remove_dir_all(&local).ok();
 }
