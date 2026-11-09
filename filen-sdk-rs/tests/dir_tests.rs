@@ -825,17 +825,19 @@ async fn download_to_zip() {
 			assert_eq!(buf, expected);
 			let extra_fields = file.extra_data_fields().collect::<Vec<_>>();
 			assert!(extra_fields.len() >= 2);
+			let mut saw_ntfs = false;
 			for field in &extra_fields {
 				match field {
+					// zip parses the central-directory copy of this field with the
+					// central-header rule, which gives only the modification time, so the
+					// creation time is checked through the NTFS field below.
 					ExtraField::ExtendedTimestamp(data) => {
 						if let Some(modified) = expected_file.last_modified() {
 							assert_eq!(data.mod_time().map(i64::from), Some(modified.timestamp()));
 						}
-						if let Some(created) = expected_file.created() {
-							assert_eq!(data.cr_time().map(i64::from), Some(created.timestamp()));
-						}
 					}
 					ExtraField::Ntfs(data) => {
+						saw_ntfs = true;
 						if let Some(modified) = expected_file.last_modified() {
 							assert_eq!(
 								data.mtime(),
@@ -852,6 +854,9 @@ async fn download_to_zip() {
 					#[allow(unreachable_patterns)]
 					_ => {}
 				}
+			}
+			if expected_file.created().is_some() {
+				assert!(saw_ntfs, "no NTFS extra field to carry the creation time");
 			}
 		};
 
