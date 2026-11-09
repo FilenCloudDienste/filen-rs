@@ -24,7 +24,8 @@
 //! and one the caller would have skipped is reported all the same. Here the entry is handed over,
 //! then the error follows if the caller descends, and nothing follows if it skips. A directory
 //! removed between its hand-over and its descent is a listing error here, where `walkdir` had it
-//! open already.
+//! open already. And a listing that fails part-way is an error at the directory's path here, where
+//! `walkdir`'s names no path.
 //!
 //! On Windows `walkdir` opens and keeps a handle to each directory as it descends into it, where
 //! this walk, on every platform, opens one only for a loop check, as `walkdir` does on unix. So a
@@ -136,9 +137,9 @@ impl Entry {
 /// What the walk could not read.
 #[derive(Debug)]
 pub(super) enum WalkError {
-	/// An entry, a listing or a symlink that could not be read. `path` is `None` when the failure
-	/// has no one entry to name: a listing that failed partway, or an ancestor's handle the loop
-	/// check could not open.
+	/// An entry, a listing or a symlink that could not be read: `path` is the entry, or the
+	/// directory whose listing failed, to open or part-way. It is `None` only for an ancestor's
+	/// handle the loop check could not open.
 	Io {
 		path: Option<PathBuf>,
 		source: io::Error,
@@ -169,25 +170,31 @@ enum Remaining {
 	Read(vec::IntoIter<Listing>),
 }
 
-impl Iterator for Remaining {
-	type Item = Listing;
-
-	fn next(&mut self) -> Option<Listing> {
-		match self {
-			Self::Open { stream, depth } => stream.next().map(|listed| {
-				listed
-					.map_err(|source| WalkError::Io { path: None, source })
-					.and_then(|listed| Entry::listed(&listed, *depth))
-			}),
-			Self::Read(rest) => rest.next(),
-		}
-	}
-}
-
 /// A directory the walk is inside.
 struct Dir {
 	path: PathBuf,
 	remaining: Remaining,
+}
+
+impl Iterator for Dir {
+	type Item = Listing;
+
+	/// The directory's next listed entry. A listing that fails part-way is an error at the
+	/// directory's path.
+	fn next(&mut self) -> Option<Listing> {
+		match &mut self.remaining {
+			Remaining::Open { stream, depth } => stream.next().map(|listed| {
+				listed
+					.map_err(|source| WalkError::Io {
+						// The error owns its path, and the walk keeps the directory's.
+						path: Some(self.path.clone()),
+						source,
+					})
+					.and_then(|listed| Entry::listed(&listed, *depth))
+			}),
+			Remaining::Read(rest) => rest.next(),
+		}
+	}
 }
 
 /// A directory handed over and not yet descended into.
@@ -295,7 +302,7 @@ impl Walk {
 	fn open(&mut self, dir: Unentered) {
 		if self.inside.len() - self.oldest_open == MAX_OPEN {
 			if let Some(oldest) = self.inside.get_mut(self.oldest_open) {
-				let rest = (&mut oldest.remaining).collect::<Vec<_>>();
+				let rest = oldest.by_ref().collect::<Vec<_>>();
 				oldest.remaining = Remaining::Read(rest.into_iter());
 			}
 			self.oldest_open += 1;
@@ -332,7 +339,7 @@ impl Iterator for Walk {
 			return Some(Err(err));
 		}
 		while let Some(dir) = self.inside.last_mut() {
-			match dir.remaining.next() {
+			match dir.next() {
 				None => self.leave(),
 				Some(listed) => return Some(listed.and_then(|entry| self.reach(entry))),
 			}
