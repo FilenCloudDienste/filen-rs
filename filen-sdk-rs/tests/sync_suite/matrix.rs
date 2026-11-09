@@ -300,7 +300,7 @@ async fn matrix_06_first_sync_no_wipe_r2l() {
 	// No data loss: every L file's bytes are recoverable (in place OR in quarantine), never destroyed.
 	for body in [b"local-1" as &[u8], b"local-2", b"local-3"] {
 		assert!(
-			conflict_survivor_with(&sc.local, body),
+			bytes_recoverable_anywhere(&sc.local, body),
 			"first-sync against an empty remote source destroyed local bytes {body:?}"
 		);
 	}
@@ -370,7 +370,7 @@ async fn matrix_07_first_sync_no_wipe_two_way() {
 	);
 	assert!(
 		read_eq(&tc.local_a, "overlap.txt", b"A-version")
-			|| conflict_survivor_with(&tc.local_a, b"A-version"),
+			|| bytes_recoverable_anywhere(&tc.local_a, b"A-version"),
 		"A's overlap bytes destroyed"
 	);
 
@@ -957,32 +957,4 @@ async fn matrix_21_interrupted_resume_torn_baseline_write() {
 	// losing it; final state converged exactly-once both sides; extra pass = 0 actions; a torn baseline
 	// does not cause a full re-sync/wipe/duplicates; on-disk baseline after recovery is internally
 	// consistent. Needs a seam to interrupt precisely during the baseline persist.
-}
-
-// ---------------------------------------------------------------------------
-// Shared local helper.
-// ---------------------------------------------------------------------------
-
-/// Scan `root` for any file whose bytes equal `bytes` (a conflict/quarantine survivor would carry the
-/// original content under a renamed path inside the quarantine bin).
-fn conflict_survivor_with(root: &std::path::Path, bytes: &[u8]) -> bool {
-	let mut stack = vec![root.to_path_buf()];
-	while let Some(dir) = stack.pop() {
-		let rd = match std::fs::read_dir(&dir) {
-			Ok(rd) => rd,
-			Err(_) => continue,
-		};
-		for entry in rd.flatten() {
-			let ft = match entry.file_type() {
-				Ok(ft) => ft,
-				Err(_) => continue,
-			};
-			if ft.is_dir() {
-				stack.push(entry.path());
-			} else if ft.is_file() && std::fs::read(entry.path()).is_ok_and(|b| b == bytes) {
-				return true;
-			}
-		}
-	}
-	false
 }

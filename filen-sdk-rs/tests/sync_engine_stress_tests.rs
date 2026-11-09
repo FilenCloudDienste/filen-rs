@@ -5,115 +5,17 @@
 //!   - `SYNC_STRESS_N`             (Test 1, default 10_000): item count of the round-trip tree.
 //!   - `SYNC_STRESS_CONTENTION_N`  (Test 2, default 200):    total disjoint-file count.
 
-use std::{
-	collections::{BTreeMap, BTreeSet},
-	path::{Path, PathBuf},
-	time::Duration,
-};
+use std::{collections::BTreeSet, path::Path, time::Duration};
 
 use filen_macros::shared_test_runtime;
 use filen_sdk_rs::{
 	fs::HasUUID,
-	sync_engine::{SyncEngine, SyncMode, SyncReport},
+	sync_engine::{SyncEngine, SyncMode},
 };
 use uuid::Uuid;
 
 mod helpers;
 use helpers::*;
-
-/// A fresh, unique local sync-root temp directory.
-fn fresh_local_dir(tag: &str) -> PathBuf {
-	let dir = std::env::temp_dir().join(format!("sync_stress_{tag}_{}", Uuid::new_v4()));
-	std::fs::create_dir_all(&dir).unwrap();
-	dir
-}
-
-/// One entry in a walked tree: relative path -> (is_dir, file_len, content_bytes).
-/// For directories `file_len` is 0 and `content` is empty.
-type TreeMap = BTreeMap<String, (bool, u64, Vec<u8>)>;
-
-/// Recursively walk `root`, returning a sorted map keyed by the slash-joined relative path.
-/// The root itself is not included; only its descendants.
-fn walk_tree(root: &Path) -> TreeMap {
-	let mut map = TreeMap::new();
-	walk_into(root, root, &mut map);
-	map
-}
-
-fn walk_into(root: &Path, dir: &Path, map: &mut TreeMap) {
-	let mut entries: Vec<_> = std::fs::read_dir(dir)
-		.unwrap_or_else(|e| panic!("read_dir {dir:?}: {e}"))
-		.map(|e| e.unwrap())
-		.collect();
-	entries.sort_by_key(|e| e.file_name());
-	for entry in entries {
-		let path = entry.path();
-		let rel = path
-			.strip_prefix(root)
-			.unwrap()
-			.to_string_lossy()
-			.replace('\\', "/");
-		// Skip the engine's local quarantine bin (`.filen-sync-trash`, top-level under the sync
-		// root): it holds recovery copies of items a propagated delete removed on THIS side only, so
-		// it is engine-internal state — not synced content — and the engine itself excludes it from
-		// scanning. Including it would make two genuinely-converged trees compare unequal.
-		if rel == ".filen-sync-trash" {
-			continue;
-		}
-		let ft = entry.file_type().unwrap();
-		if ft.is_dir() {
-			map.insert(rel, (true, 0, Vec::new()));
-			walk_into(root, &path, map);
-		} else if ft.is_file() {
-			let content = std::fs::read(&path).unwrap();
-			map.insert(rel, (false, content.len() as u64, content));
-		}
-		// symlinks / other: intentionally ignored (the engine should not produce them).
-	}
-}
-
-/// Assert two walked trees are byte-for-byte identical, naming the first divergence.
-fn assert_trees_identical(a: &TreeMap, b: &TreeMap, label_a: &str, label_b: &str) {
-	// Paths present in one but not the other.
-	for key in a.keys() {
-		assert!(
-			b.contains_key(key),
-			"path {key:?} present in {label_a} but missing in {label_b}"
-		);
-	}
-	for key in b.keys() {
-		assert!(
-			a.contains_key(key),
-			"path {key:?} present in {label_b} but missing in {label_a}"
-		);
-	}
-	// Same kind / length / bytes.
-	for (key, (a_dir, a_len, a_bytes)) in a {
-		let (b_dir, b_len, b_bytes) = b.get(key).unwrap();
-		assert_eq!(
-			a_dir, b_dir,
-			"path {key:?} is a dir in one tree but a file in the other ({label_a}={a_dir} {label_b}={b_dir})"
-		);
-		assert_eq!(
-			a_len, b_len,
-			"path {key:?} differs in length ({label_a}={a_len} {label_b}={b_len})"
-		);
-		assert_eq!(a_bytes, b_bytes, "path {key:?} differs in content bytes");
-	}
-	assert_eq!(
-		a.len(),
-		b.len(),
-		"tree sizes differ: {label_a}={} {label_b}={}",
-		a.len(),
-		b.len()
-	);
-}
-
-/// Deterministic content for a file at relative path `rel` — the path bytes themselves, so a
-/// pull side can be verified to have reproduced the exact same bytes.
-fn content_for(rel: &str) -> Vec<u8> {
-	rel.as_bytes().to_vec()
-}
 
 /// Build a nested tree of ~`n` small files under `root`, returning (num_files, num_dirs).
 ///
@@ -280,7 +182,7 @@ async fn roundtrip_large_tree_local_to_remote_then_remote_to_local() {
 	// --- the two local trees must be byte-for-byte identical ---
 	let tree_a = walk_tree(&local_a);
 	let tree_b = walk_tree(&local_b);
-	assert_trees_identical(&tree_a, &tree_b, "local_a", "local_b");
+	assert_tree_maps_identical(&tree_a, &tree_b, "local_a", "local_b");
 
 	std::fs::remove_dir_all(&local_a).ok();
 	std::fs::remove_dir_all(&local_b).ok();
@@ -551,110 +453,6 @@ fn has_conflict_named_survivor(root: &Path) -> bool {
 // ===========================================================================
 // Two-client NON-COLLIDING convergence — changes propagate both ways, in any sync order.
 // ===========================================================================
-
-/// The order in which the two clients' sync passes run within one round.
-#[derive(Clone, Copy, Debug)]
-enum Order {
-	AFirst,
-	BFirst,
-	Concurrent,
-}
-
-/// Write a file (creating parent dirs) under `root`.
-fn write_file(root: &Path, rel: &str, bytes: &[u8]) {
-	let path = root.join(rel);
-	std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-	std::fs::write(&path, bytes).unwrap();
-}
-
-/// True if the file at `rel` under `root` exists and its bytes equal `expected`.
-fn read_eq(root: &Path, rel: &str, expected: &[u8]) -> bool {
-	std::fs::read(root.join(rel)).is_ok_and(|b| b == expected)
-}
-
-/// Rename/move `from` -> `to` under `root` (creating the destination's parent dirs).
-fn move_file(root: &Path, from: &str, to: &str) {
-	let dst = root.join(to);
-	std::fs::create_dir_all(dst.parent().unwrap()).unwrap();
-	std::fs::rename(root.join(from), dst).unwrap();
-}
-
-/// True once the two local trees are byte-for-byte identical.
-fn trees_equal(a: &Path, b: &Path) -> bool {
-	walk_tree(a) == walk_tree(b)
-}
-
-/// Run one sync round — one pass per client, in the given order — returning both reports.
-async fn sync_round(
-	ea: &SyncEngine,
-	pa: i64,
-	eb: &SyncEngine,
-	pb: i64,
-	order: Order,
-) -> (SyncReport, SyncReport) {
-	match order {
-		Order::AFirst => {
-			let ra = ea.sync_once(pa).await.expect("engine A sync_once");
-			let rb = eb.sync_once(pb).await.expect("engine B sync_once");
-			(ra, rb)
-		}
-		Order::BFirst => {
-			let rb = eb.sync_once(pb).await.expect("engine B sync_once");
-			let ra = ea.sync_once(pa).await.expect("engine A sync_once");
-			(ra, rb)
-		}
-		Order::Concurrent => {
-			let (ra, rb) = tokio::join!(ea.sync_once(pa), eb.sync_once(pb));
-			(
-				ra.expect("engine A sync_once"),
-				rb.expect("engine B sync_once"),
-			)
-		}
-	}
-}
-
-/// One of the two clients: its engine and the pair it syncs.
-#[derive(Clone, Copy)]
-struct Peer<'a> {
-	engine: &'a SyncEngine,
-	pair: i64,
-}
-
-/// Run sync rounds in `order` until `done` holds, panicking after a bound. Every pass must be
-/// error-free; any surfaced conflict is recorded into `conflicts` (a NON-colliding scenario must
-/// surface none — the caller asserts that). A short settle between rounds lets each client's cache
-/// observe the other's just-committed remote writes before the next pass.
-async fn converge(
-	a: Peer<'_>,
-	b: Peer<'_>,
-	order: Order,
-	conflicts: &mut BTreeSet<String>,
-	label: &str,
-	done: impl Fn() -> bool,
-) {
-	const MAX_ROUNDS: usize = 20;
-	for _ in 0..MAX_ROUNDS {
-		let (ra, rb) = sync_round(a.engine, a.pair, b.engine, b.pair, order).await;
-		assert!(
-			ra.errors.is_empty(),
-			"{label}: engine A reported errors {:?}",
-			ra.errors
-		);
-		assert!(
-			rb.errors.is_empty(),
-			"{label}: engine B reported errors {:?}",
-			rb.errors
-		);
-		for c in ra.conflict_paths().chain(rb.conflict_paths()) {
-			conflicts.insert(c.to_string());
-		}
-		if done() {
-			return;
-		}
-		tokio::time::sleep(Duration::from_millis(1500)).await;
-	}
-	panic!("{label}: did not converge within {MAX_ROUNDS} rounds (order {order:?})");
-}
 
 /// A bunch of NON-COLLIDING changes (at most one client touches any given path between syncs)
 /// applied across two clients two-way-syncing the same remote dir. Each change must propagate to
@@ -989,7 +787,7 @@ async fn converge_disjoint_under(order: Order) -> TreeMap {
 		"order-independence run ({order:?}) surfaced conflicts: {conflicts:?}"
 	);
 	let tree = walk_tree(&local_a);
-	assert_trees_identical(&tree, &walk_tree(&local_b), "local_a", "local_b");
+	assert_tree_maps_identical(&tree, &walk_tree(&local_b), "local_a", "local_b");
 
 	std::fs::remove_dir_all(&local_a).ok();
 	std::fs::remove_dir_all(&local_b).ok();

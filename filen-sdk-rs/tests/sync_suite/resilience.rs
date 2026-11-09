@@ -255,7 +255,7 @@ async fn resil_12_first_run_populated_destination_remote_to_local_mirrors_source
 
 	// The mirrored-away local file's bytes must remain recoverable (quarantine, not destroyed).
 	assert!(
-		conflict_survivor_with(&sc.local, b"keep me"),
+		bytes_recoverable_anywhere(&sc.local, b"keep me"),
 		"mirrored-away local file's bytes were destroyed (not quarantined)"
 	);
 
@@ -569,10 +569,10 @@ async fn resil_25_two_way_conflict_persists_across_reruns_nondestructive() {
 
 	// Both edits must be recoverable somewhere across either tree (in place or quarantined) —
 	// neither diverged version may be silently destroyed.
-	let local_present = conflict_survivor_with(&tc.local_a, b"local-edit")
-		|| conflict_survivor_with(&tc.local_b, b"local-edit");
-	let remote_present = conflict_survivor_with(&tc.local_a, b"remote-edit")
-		|| conflict_survivor_with(&tc.local_b, b"remote-edit");
+	let local_present = bytes_recoverable_anywhere(&tc.local_a, b"local-edit")
+		|| bytes_recoverable_anywhere(&tc.local_b, b"local-edit");
+	let remote_present = bytes_recoverable_anywhere(&tc.local_a, b"remote-edit")
+		|| bytes_recoverable_anywhere(&tc.local_b, b"remote-edit");
 	assert!(
 		local_present,
 		"A's 'local-edit' bytes were destroyed — data loss"
@@ -590,30 +590,6 @@ async fn resil_25_two_way_conflict_persists_across_reruns_nondestructive() {
 	);
 
 	tc.cleanup();
-}
-
-/// Scan `root` for any file whose bytes equal `bytes` (a conflict-versioned survivor would carry the
-/// loser's content under a renamed path).
-fn conflict_survivor_with(root: &std::path::Path, bytes: &[u8]) -> bool {
-	let mut stack = vec![root.to_path_buf()];
-	while let Some(dir) = stack.pop() {
-		let rd = match std::fs::read_dir(&dir) {
-			Ok(rd) => rd,
-			Err(_) => continue,
-		};
-		for entry in rd.flatten() {
-			let ft = match entry.file_type() {
-				Ok(ft) => ft,
-				Err(_) => continue,
-			};
-			if ft.is_dir() {
-				stack.push(entry.path());
-			} else if ft.is_file() && std::fs::read(entry.path()).is_ok_and(|b| b == bytes) {
-				return true;
-			}
-		}
-	}
-	false
 }
 
 /// RESIL-(add) "source mutated between failed pass and resume" — recoverable analogue. The engine

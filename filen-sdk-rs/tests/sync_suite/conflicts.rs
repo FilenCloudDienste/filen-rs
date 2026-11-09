@@ -26,32 +26,6 @@ use crate::helpers::*;
 // documented harness + public Client API.
 // ---------------------------------------------------------------------------
 
-/// Recursively scan EVERY regular file under `root` — INCLUDING the `.filen-sync-trash`
-/// quarantine bin that `walk_tree` hides — and return true if any file's exact bytes equal
-/// `needle`. This is how we prove a diverged version was preserved recoverably (either left in
-/// place, written under a conflict-renamed name, or quarantined) rather than silently destroyed.
-fn bytes_recoverable_anywhere(root: &Path, needle: &[u8]) -> bool {
-	let mut stack = vec![root.to_path_buf()];
-	while let Some(dir) = stack.pop() {
-		let rd = match std::fs::read_dir(&dir) {
-			Ok(rd) => rd,
-			Err(_) => continue,
-		};
-		for entry in rd.flatten() {
-			let ft = match entry.file_type() {
-				Ok(ft) => ft,
-				Err(_) => continue,
-			};
-			if ft.is_dir() {
-				stack.push(entry.path());
-			} else if ft.is_file() && std::fs::read(entry.path()).is_ok_and(|b| b == needle) {
-				return true;
-			}
-		}
-	}
-	false
-}
-
 /// Count the regular files sitting in the engine's `.filen-sync-trash` quarantine bin under
 /// `root`. Zero proves a pass stashed nothing.
 fn quarantined_file_count(root: &Path) -> usize {
