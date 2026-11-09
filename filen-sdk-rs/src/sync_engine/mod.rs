@@ -71,6 +71,8 @@ mod stage;
 // reader (`rows`) is held to in the tests, and a structure the probe still sizes.
 #[cfg(any(test, feature = "bench-internals"))]
 mod tree;
+// The journals of a pair's unfinished uploads, in its baseline DB, for a later pass to continue.
+mod upload_journal;
 // The local scan's directory walk.
 mod walk;
 mod watch;

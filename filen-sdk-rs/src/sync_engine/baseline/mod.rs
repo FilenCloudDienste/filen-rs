@@ -68,8 +68,13 @@ use super::{
 /// [`PathFailure::mismatched`]): such a path is skipped until the remote file there changes. A
 /// version-5 file has no columns for it, so every read of its streaks would fail on it.
 ///
+/// Moved to 7 when a pair began keeping the journals of the uploads a pass did not finish
+/// (`upload_journal`, see [`SCHEMA`] and [`BaselineStore::upload_journal`]), so that a later pass
+/// continues them. A version-6 file has no table for it, so every upload's journal read would fail
+/// on it.
+///
 /// [`SyncEngine::import_legacy_state`]: super::SyncEngine::import_legacy_state
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 
 /// Schema for the baseline DB, created whole on a fresh DB. `foreign_keys`, `synchronous` and the
 /// busy timeout are applied per-connection in [`BaselineStore::init`] (they reset on every open);
@@ -92,6 +97,12 @@ const SCHEMA_VERSION: i64 = 6;
 /// last listed there and the size and mtime (unix millis) the local file had then. It is evidence
 /// for a path with no `baseline` row and nothing else; it cascades with its pair, and the
 /// `AUTOINCREMENT` id below means it can never attach to a later pair.
+///
+/// `upload_journal` holds the journals of the uploads a pass started and did not finish, keyed by
+/// the SDK's journal id (see [`UploadJournalId`](crate::io::UploadJournalId)): `sealed` is the
+/// journal encrypted with the account's master keys, `started_at` (unix millis) when the upload's
+/// first chunk was acknowledged, kept in plaintext so that old journals are purged without the
+/// keys. It cascades with its pair.
 ///
 /// `sync_pairs.id` is `AUTOINCREMENT` for one reason: a removed pair's id must never come back. A
 /// watch loop finishes the pass it is in when its pair is removed, and that pass goes on writing
@@ -246,6 +257,14 @@ CREATE TABLE IF NOT EXISTS legacy_synced (
 	size INTEGER NOT NULL,
 	local_mtime INTEGER NOT NULL,
 	PRIMARY KEY (pair_id, rel_path)
+) WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS upload_journal (
+	pair_id INTEGER NOT NULL REFERENCES sync_pairs (id) ON DELETE CASCADE,
+	id BLOB NOT NULL,
+	started_at INTEGER NOT NULL,
+	sealed TEXT NOT NULL,
+	PRIMARY KEY (pair_id, id)
 ) WITHOUT ROWID;
 ";
 
@@ -2553,6 +2572,61 @@ impl BaselineStore {
 			params![pair],
 		)?;
 		Ok(())
+	}
+
+	/// The journal of `pair`'s unfinished upload kept under `id`: when its first chunk was
+	/// acknowledged (unix millis) and the encrypted journal.
+	pub(crate) fn upload_journal(
+		&self,
+		pair: PairId,
+		id: &[u8; 32],
+	) -> rusqlite::Result<Option<(i64, String)>> {
+		self.conn
+			.query_row(
+				"SELECT started_at, sealed FROM upload_journal WHERE pair_id = ?1 AND id = ?2",
+				params![pair, id],
+				|row| Ok((row.get(0)?, row.get(1)?)),
+			)
+			.optional()
+	}
+
+	/// Keep the journal of `pair`'s unfinished upload under `id`, replacing the one kept there.
+	pub(crate) fn save_upload_journal(
+		&self,
+		pair: PairId,
+		id: &[u8; 32],
+		started_at_millis: i64,
+		sealed: &str,
+	) -> rusqlite::Result<()> {
+		self.conn.execute(
+			"INSERT OR REPLACE INTO upload_journal (pair_id, id, started_at, sealed)
+			 VALUES (?1, ?2, ?3, ?4)",
+			params![pair, id, started_at_millis, sealed],
+		)?;
+		Ok(())
+	}
+
+	/// Remove the journal of `pair`'s upload kept under `id`. Succeeds when there is none.
+	pub(crate) fn remove_upload_journal(
+		&self,
+		pair: PairId,
+		id: &[u8; 32],
+	) -> rusqlite::Result<()> {
+		self.conn.execute(
+			"DELETE FROM upload_journal WHERE pair_id = ?1 AND id = ?2",
+			params![pair, id],
+		)?;
+		Ok(())
+	}
+
+	/// Remove every pair's upload journals whose first chunk was acknowledged before
+	/// `older_than_millis` (unix millis), returning how many went. One acknowledged exactly then
+	/// stays.
+	pub(crate) fn purge_upload_journals(&self, older_than_millis: i64) -> rusqlite::Result<usize> {
+		self.conn.execute(
+			"DELETE FROM upload_journal WHERE started_at < ?1",
+			params![older_than_millis],
+		)
 	}
 
 	/// Retire journal rows the in-memory journal has dropped (the cache caught up, or the grace

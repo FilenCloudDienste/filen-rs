@@ -227,7 +227,108 @@ fn a_pair_has_completed_no_first_pass_until_one_is_marked() {
 #[test]
 fn a_fresh_db_is_stamped_at_the_current_schema_version() {
 	let store = BaselineStore::open_in_memory().unwrap();
-	assert_eq!(version_of(&store), SCHEMA_VERSION);
+	assert_eq!(version_of(&store), 7);
+}
+
+/// The id an upload journal is kept under in these tests.
+const JOURNAL_ID: [u8; 32] = [0x5A; 32];
+
+fn upload_journal_count(store: &BaselineStore) -> i64 {
+	store
+		.conn
+		.query_row("SELECT COUNT(*) FROM upload_journal", [], |row| row.get(0))
+		.unwrap()
+}
+
+#[test]
+fn an_upload_journal_round_trips_through_the_baseline_db() {
+	let store = BaselineStore::open_in_memory().unwrap();
+	let (pair, _) = store
+		.create_pair("/root", Uuid::new_v4(), SyncMode::TwoWay)
+		.unwrap();
+
+	store
+		.save_upload_journal(pair, &JOURNAL_ID, NOW, "sealed")
+		.unwrap();
+
+	assert_eq!(
+		store.upload_journal(pair, &JOURNAL_ID).unwrap(),
+		Some((NOW, "sealed".to_owned()))
+	);
+	assert_eq!(store.upload_journal(pair, &[0xA5; 32]).unwrap(), None);
+	store.remove_upload_journal(pair, &JOURNAL_ID).unwrap();
+	assert_eq!(store.upload_journal(pair, &JOURNAL_ID).unwrap(), None);
+	// Removing what is not there succeeds.
+	store.remove_upload_journal(pair, &JOURNAL_ID).unwrap();
+}
+
+#[test]
+fn saving_an_upload_journal_again_replaces_it() {
+	let store = BaselineStore::open_in_memory().unwrap();
+	let (pair, _) = store
+		.create_pair("/root", Uuid::new_v4(), SyncMode::TwoWay)
+		.unwrap();
+
+	store
+		.save_upload_journal(pair, &JOURNAL_ID, NOW, "first")
+		.unwrap();
+	store
+		.save_upload_journal(pair, &JOURNAL_ID, NOW + 1, "second")
+		.unwrap();
+
+	assert_eq!(
+		store.upload_journal(pair, &JOURNAL_ID).unwrap(),
+		Some((NOW + 1, "second".to_owned()))
+	);
+	assert_eq!(upload_journal_count(&store), 1);
+}
+
+#[test]
+fn removing_a_pair_removes_its_upload_journals() {
+	let store = BaselineStore::open_in_memory().unwrap();
+	let (pair, _) = store
+		.create_pair("/root", Uuid::new_v4(), SyncMode::TwoWay)
+		.unwrap();
+	let (other, _) = store
+		.create_pair("/other", Uuid::new_v4(), SyncMode::TwoWay)
+		.unwrap();
+	store
+		.save_upload_journal(pair, &JOURNAL_ID, NOW, "mine")
+		.unwrap();
+	store
+		.save_upload_journal(other, &JOURNAL_ID, NOW, "theirs")
+		.unwrap();
+
+	store.delete_pair(pair).unwrap();
+
+	assert_eq!(store.upload_journal(pair, &JOURNAL_ID).unwrap(), None);
+	assert_eq!(
+		store.upload_journal(other, &JOURNAL_ID).unwrap(),
+		Some((NOW, "theirs".to_owned()))
+	);
+}
+
+#[test]
+fn purging_keeps_a_journal_exactly_a_day_old_and_drops_an_older_one() {
+	const DAY: i64 = 24 * 60 * 60 * 1000;
+	let store = BaselineStore::open_in_memory().unwrap();
+	let (pair, _) = store
+		.create_pair("/root", Uuid::new_v4(), SyncMode::TwoWay)
+		.unwrap();
+	store
+		.save_upload_journal(pair, &[1; 32], NOW - DAY, "a day old")
+		.unwrap();
+	store
+		.save_upload_journal(pair, &[2; 32], NOW - DAY - 1, "older")
+		.unwrap();
+
+	assert_eq!(store.purge_upload_journals(NOW - DAY).unwrap(), 1);
+
+	assert_eq!(
+		store.upload_journal(pair, &[1; 32]).unwrap(),
+		Some((NOW - DAY, "a day old".to_owned()))
+	);
+	assert_eq!(store.upload_journal(pair, &[2; 32]).unwrap(), None);
 }
 
 /// Both directions of a version mismatch are refused, and the DB is left exactly as it was.
@@ -1429,7 +1530,7 @@ fn the_derived_columns_are_pinned_to_the_schema_version() {
 		            SCHEMA_VERSION so a file written under the old rule is refused, then move this pin";
 	assert_eq!(
 		(SCHEMA_VERSION, char::UNICODE_VERSION),
-		(6, (17, 0, 0)),
+		(7, (17, 0, 0)),
 		"{owed}"
 	);
 	// Confirmed: this helper's rows otherwise carry a marker that is not their content.

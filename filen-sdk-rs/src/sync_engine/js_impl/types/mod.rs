@@ -503,7 +503,8 @@ pub enum SyncEventMessage {
 	Downloading {
 		rel_path: String,
 	},
-	/// Bytes moved so far by a transfer; `bytes` can exceed `total`.
+	/// Bytes moved so far by a transfer, a resumed upload's counting what an earlier pass sent;
+	/// `bytes` can exceed `total`.
 	Progress {
 		rel_path: String,
 		direction: TransferDirection,

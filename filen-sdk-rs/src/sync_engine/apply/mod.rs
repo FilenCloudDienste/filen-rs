@@ -62,6 +62,7 @@ use super::{
 	},
 	side::{NodesAt, Side},
 	stage::{Carried, Pager, Run, Screen, Staged, StagedPlan},
+	upload_journal::PairUploadJournal,
 };
 use crate::{
 	ErrorKind,
@@ -3615,18 +3616,29 @@ async fn apply_transfer(
 				respell_remote(ctx, rel_path, existing).await?;
 			}
 			let path = local_path(ctx.local_root, rel_path);
+			// An upload the gate drops leaves its journal behind, and the next pass that uploads
+			// this path continues it, in this engine or the next one to open the DB. The SDK
+			// starts over when the local file changed in between.
+			let journal = PairUploadJournal::new(Arc::clone(ctx.store), ctx.pair);
+			let sent = progress_callback(
+				progress,
+				rel_path,
+				TransferDirection::Upload,
+				local.as_deref().map_or(0, |node| node.size),
+			);
+			// Boxed: the resuming upload's state is large, and held inline in every future that
+			// awaits a transfer it overflowed a 2 MiB test thread's stack in a debug build.
 			let Some(upload) = ctx
 				.gate
-				.guard(ctx.client.upload_file_from_path_with_builder(
+				.guard(Box::pin(ctx.client.upload_file_from_path_resuming(
 					builder,
 					path,
-					Some(progress_callback(
-						progress,
-						rel_path,
-						TransferDirection::Upload,
-						local.as_deref().map_or(0, |node| node.size),
-					)),
-				))
+					&journal,
+					Some(Arc::clone(&sent)),
+					// The bytes an earlier pass sent count toward the transfer as well, so its
+					// progress still reaches the file's size.
+					Some(sent),
+				)))
 				.await
 			else {
 				return Ok(Transfer::Interrupted);

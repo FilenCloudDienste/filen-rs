@@ -72,7 +72,7 @@ use crate::{
 		SyncRootCallback, SyncRootHandle,
 	},
 	fs::{HasParent, HasUUID, categories::DirType},
-	io::client_impl::IoSharedClientExt,
+	io::{client_impl::IoSharedClientExt, upload_resume::SERVER_RETENTION},
 };
 
 /// The ceiling on how long a remote write this engine made stays trusted over the cache snapshot.
@@ -3763,6 +3763,25 @@ impl SyncEngine {
 			);
 		}
 		restore_journal(&engine.pending, rows, now);
+		// The server may have dropped the chunks of an upload whose first one it acknowledged
+		// more than a day ago, so its journal could not be resumed any more. Not a reason to
+		// refuse the open: an old journal is only skipped by the upload that finds it.
+		let cutoff = now.saturating_sub(SERVER_RETENTION.num_milliseconds());
+		match off_store(&engine.control, move |store| {
+			store.purge_upload_journals(cutoff)
+		})
+		.await?
+		{
+			Ok(purged) => {
+				tracing::debug!("sync engine: purged {purged} expired upload journal(s)");
+			}
+			Err(error) => {
+				tracing::warn!(
+					"sync engine: the expired upload journals were not purged, tried again on the next open: {}",
+					db_error(error, "purging expired upload journals")
+				);
+			}
+		}
 		Ok(engine)
 	}
 

@@ -81,6 +81,11 @@ pub enum SyncEvent {
 	/// per 200 ms per transfer, plus a last one as the transfer's final bytes land; an empty file
 	/// moves no bytes and reports none. A transfer that fails or is cancelled can stop short of
 	/// `total`.
+	///
+	/// An upload that continues one an earlier pass, or an earlier engine on the same database,
+	/// left unfinished counts the bytes that one already sent as well: they are reported at once,
+	/// before anything is sent. When the server refuses to finish such an upload and it is sent
+	/// again from the start, the bytes sent again count again, so `bytes` can exceed `total`.
 	Progress {
 		rel_path: String,
 		/// The way the transfer goes: the same as the [`Uploading`](Self::Uploading) /
