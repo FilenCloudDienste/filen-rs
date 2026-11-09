@@ -3880,11 +3880,7 @@ impl SyncEngine {
 				None => {}
 			}
 		}
-		let remote_root = locked(&self.control)
-			.pair(pair)
-			.map_err(|e| db_error(e, "loading the sync pair"))?
-			.ok_or_else(|| Error::custom(ErrorKind::InvalidState, "unknown sync pair"))?
-			.remote_root;
+		let remote_root = self.registered_pair(pair)?.remote_root;
 		self.subscribe(pair, remote_root).await
 	}
 
@@ -4381,7 +4377,7 @@ impl SyncEngine {
 		}
 		.map_err(|e| db_error(e, "reconfiguring a sync pair"))?;
 		if changed == 0 {
-			return Err(Error::custom(ErrorKind::InvalidState, "unknown sync pair"));
+			return Err(unknown_pair());
 		}
 		tracing::debug!(
 			"sync pair {pair}: mode changed to {mode:?} from the next pass ({backlog:?}, {adopted_rows} destination item(s) adopted)"
@@ -4452,10 +4448,7 @@ impl SyncEngine {
 			return Err(being_removed(pair));
 		}
 		let store = self.pair_store(pair).await?;
-		let record = locked(&self.control)
-			.pair(pair)
-			.map_err(|e| db_error(e, "loading the sync pair"))?
-			.ok_or_else(|| Error::custom(ErrorKind::InvalidState, "unknown sync pair"))?;
+		let record = self.registered_pair(pair)?;
 		// One row by primary key — but the lock it needs is the one a directory move's subtree
 		// re-key holds on a blocking thread for as long as that subtree takes, and the reading
 		// lock is released before a pass applies, so the two do meet. Off the runtime thread, so
@@ -5011,11 +5004,7 @@ impl SyncEngine {
 		observer: Option<&mut (dyn FnMut(SyncEvent) + Send)>,
 		give_up: impl Future<Output = ()>,
 	) -> Result<u64, Error> {
-		let remote_root = locked(&self.control)
-			.pair(pair)
-			.map_err(|e| db_error(e, "loading the sync pair"))?
-			.ok_or_else(|| Error::custom(ErrorKind::InvalidState, "unknown sync pair"))?
-			.remote_root;
+		let remote_root = self.registered_pair(pair)?.remote_root;
 		let before_waiting = async {
 			self.resubscribe(pair).await?;
 			if let Some(observer) = observer {
@@ -5045,10 +5034,7 @@ impl SyncEngine {
 			// The registry row and the device-wide patterns: two point reads on the control
 			// connection, which no pass ever holds for longer than one statement.
 			let control = locked(&self.control);
-			let record = control
-				.pair(pair)
-				.map_err(|e| db_error(e, "loading the sync pair"))?
-				.ok_or_else(|| Error::custom(ErrorKind::InvalidState, "unknown sync pair"))?;
+			let record = registered_pair_in(&control, pair)?;
 			let user_ignore = control
 				.user_ignore()
 				.map_err(|e| db_error(e, "loading the user ignore patterns"))?;
@@ -6026,7 +6012,7 @@ impl SyncEngine {
 		.await?
 		.map_err(|e| db_error(e, "setting the delete guard"))?;
 		if changed == 0 {
-			return Err(Error::custom(ErrorKind::InvalidState, "unknown sync pair"));
+			return Err(unknown_pair());
 		}
 		Ok(())
 	}
@@ -6369,6 +6355,12 @@ impl SyncEngine {
 			.is_some_and(|control| control.borrow().is_paused())
 	}
 
+	/// The pair's registry row, or [`unknown_pair`] when it has none. Takes only the control
+	/// connection: a caller that needs the registry lock takes it first.
+	fn registered_pair(&self, pair: PairId) -> Result<PairRecord, Error> {
+		registered_pair_in(&locked(&self.control), pair)
+	}
+
 	/// The checkpoint a pass of `pair` parks on, cloned per pass (see the pause module). Taken at the
 	/// TOP of a pass, before either side is read, so a cancel covers the whole of it.
 	///
@@ -6379,13 +6371,7 @@ impl SyncEngine {
 	/// removal cancels it and waits for it, or the row is already gone and there is no pass to gate.
 	async fn pass_gate(&self, pair: PairId) -> Result<PassGate, Error> {
 		let _registry = self.registry.lock().await;
-		if locked(&self.control)
-			.pair(pair)
-			.map_err(|e| db_error(e, "loading the sync pair"))?
-			.is_none()
-		{
-			return Err(Error::custom(ErrorKind::InvalidState, "unknown sync pair"));
-		}
+		self.registered_pair(pair)?;
 		Ok(PassGate::new(self.control_channel(pair).await))
 	}
 
@@ -6404,13 +6390,7 @@ impl SyncEngine {
 	async fn pair_store(&self, pair: PairId) -> Result<SharedStore, Error> {
 		{
 			let _registry = self.registry.lock().await;
-			if locked(&self.control)
-				.pair(pair)
-				.map_err(|e| db_error(e, "loading the sync pair"))?
-				.is_none()
-			{
-				return Err(Error::custom(ErrorKind::InvalidState, "unknown sync pair"));
-			}
+			self.registered_pair(pair)?;
 		}
 		let mut stores = self.stores.lock().await;
 		if let Some(store) = stores.get(&pair) {
@@ -6452,13 +6432,7 @@ impl SyncEngine {
 		pair: PairId,
 	) -> Result<tokio::sync::watch::Sender<PassControl>, Error> {
 		let _registry = self.registry.lock().await;
-		if locked(&self.control)
-			.pair(pair)
-			.map_err(|e| db_error(e, "loading the sync pair"))?
-			.is_none()
-		{
-			return Err(Error::custom(ErrorKind::InvalidState, "unknown sync pair"));
-		}
+		self.registered_pair(pair)?;
 		Ok(self.control_channel(pair).await)
 	}
 
@@ -6475,10 +6449,7 @@ impl SyncEngine {
 		pair: PairId,
 	) -> Result<(PairRecord, tokio::sync::watch::Receiver<bool>), Error> {
 		let _registry = self.registry.lock().await;
-		let record = locked(&self.control)
-			.pair(pair)
-			.map_err(|e| db_error(e, "loading pair"))?
-			.ok_or_else(|| Error::custom(ErrorKind::InvalidState, "unknown sync pair"))?;
+		let record = self.registered_pair(pair)?;
 		if record.paused {
 			return Err(Error::custom(
 				ErrorKind::InvalidState,
@@ -6533,7 +6504,7 @@ impl SyncEngine {
 			.await?
 			.map_err(|e| db_error(e, "persisting a sync pair's paused flag"))?;
 		if !known {
-			return Err(Error::custom(ErrorKind::InvalidState, "unknown sync pair"));
+			return Err(unknown_pair());
 		}
 		// A removal that started since the check above still keeps the last word — `Retired` is
 		// final, and the flag just persisted goes with the row — so report it as the refusal it is.
@@ -6746,13 +6717,7 @@ impl SyncEngine {
 	/// can retry a whole reported list without checking each entry first. Errors only if the pair
 	/// is unknown.
 	pub async fn retry_path(&self, pair: PairId, rel_path: &str) -> Result<(), Error> {
-		if locked(&self.control)
-			.pair(pair)
-			.map_err(|e| db_error(e, "loading the sync pair"))?
-			.is_none()
-		{
-			return Err(Error::custom(ErrorKind::InvalidState, "unknown sync pair"));
-		}
+		self.registered_pair(pair)?;
 		let store = self.pair_store(pair).await?;
 		let rel_path = rel_path.to_string();
 		// One row, so the statement itself is microseconds — but the pair it names may be in the
@@ -6775,13 +6740,7 @@ impl SyncEngine {
 	/// [`request_pass`](Self::request_pass) asks for it now. Idempotent — a pair with no streak is
 	/// left alone rather than erroring. Errors only if the pair is unknown.
 	pub async fn retry_all(&self, pair: PairId) -> Result<(), Error> {
-		if locked(&self.control)
-			.pair(pair)
-			.map_err(|e| db_error(e, "loading the sync pair"))?
-			.is_none()
-		{
-			return Err(Error::custom(ErrorKind::InvalidState, "unknown sync pair"));
-		}
+		self.registered_pair(pair)?;
 		let store = self.pair_store(pair).await?;
 		// One statement, but behind the pair's store lock like `retry_path`'s, which a pass in
 		// flight may hold for as long as its baseline read takes.
@@ -6817,13 +6776,7 @@ impl SyncEngine {
 	/// removed, or paused — a paused watch runs nothing, so the request would wait silently for a
 	/// resume, which already forces a whole pass of its own.
 	pub async fn request_pass(&self, pair: PairId) -> Result<(), Error> {
-		if locked(&self.control)
-			.pair(pair)
-			.map_err(|e| db_error(e, "loading the sync pair"))?
-			.is_none()
-		{
-			return Err(Error::custom(ErrorKind::InvalidState, "unknown sync pair"));
-		}
+		self.registered_pair(pair)?;
 		// Read without creating the channel, as `set_control` does. A pair on its way out is not
 		// `Run` either, but telling the caller to resume it would send them to a verb that refuses.
 		let control = self
@@ -6860,13 +6813,7 @@ impl SyncEngine {
 	/// wait for a pass in flight. A conflict that pass has yet to record appears once it has.
 	/// Errors only if the pair is unknown.
 	pub async fn list_conflicts(&self, pair: PairId) -> Result<Vec<PlannedConflict>, Error> {
-		if locked(&self.control)
-			.pair(pair)
-			.map_err(|e| db_error(e, "loading the sync pair"))?
-			.is_none()
-		{
-			return Err(Error::custom(ErrorKind::InvalidState, "unknown sync pair"));
-		}
+		self.registered_pair(pair)?;
 		let store = self.pair_store(pair).await?;
 		// A seek of the `(pair_id, state)` index rather than a read of the pair's rows, and it
 		// deliberately does not wait for the pass in flight. Still off the runtime thread: the
@@ -7462,11 +7409,7 @@ impl SyncEngine {
 		let Some(events) = self.unannounced_remote(pair).await else {
 			return Ok(None);
 		};
-		let remote_root = locked(&self.control)
-			.pair(pair)
-			.map_err(|e| Err(db_error(e, "loading the sync pair")))?
-			.ok_or_else(|| Err(Error::custom(ErrorKind::InvalidState, "unknown sync pair")))?
-			.remote_root;
+		let remote_root = self.registered_pair(pair).map_err(Err)?.remote_root;
 		// Created before the catch-up starts, so a stop that lands while the cache catches up ends
 		// that as well as the wait for the view after it.
 		let mut given_up = std::pin::pin!(wait_given_up(changes, gate));
@@ -9039,6 +8982,19 @@ fn remote_unreachable(pair: PairId, remote_root: Uuid, failure: Arc<Error>) -> E
 			 folder {remote_root}"
 		)),
 	)
+}
+
+/// The refusal for a pair id the engine has no row for: never registered, or removed since.
+pub(super) fn unknown_pair() -> Error {
+	Error::custom(ErrorKind::InvalidState, "unknown sync pair")
+}
+
+/// The pair's row from `control`, or [`unknown_pair`] when it has none.
+fn registered_pair_in(control: &BaselineStore, pair: PairId) -> Result<PairRecord, Error> {
+	control
+		.pair(pair)
+		.map_err(|e| db_error(e, "loading the sync pair"))?
+		.ok_or_else(unknown_pair)
 }
 
 /// The refusal every control verb gets once [`SyncEngine::remove_pair`] has started on the pair: its

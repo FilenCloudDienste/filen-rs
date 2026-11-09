@@ -69,7 +69,7 @@ use crate::{
 		Backlog, BaselineInUse, ConflictResolution, DeleteGuard, IgnoredPath, LegacyImport, PairId,
 		PauseMode, PauseOptions, PlanOutcome, PlannedAction, PlannedConflict, SyncEngine,
 		SyncEvent, SyncMode, SyncObserver, UnsyncablePath, WatchConfig, WatchHandle, WatchState,
-		WatchStatus,
+		WatchStatus, engine::unknown_pair,
 	},
 };
 
@@ -103,7 +103,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 /// A pair id as the engine takes it. One that does not fit was never handed out.
 fn pair_id_in(pair_id: u64) -> Result<PairId, Error> {
-	i64::try_from(pair_id).map_err(|_| Error::custom(ErrorKind::InvalidState, "unknown sync pair"))
+	i64::try_from(pair_id).map_err(|_| unknown_pair())
 }
 
 fn closed() -> Error {
