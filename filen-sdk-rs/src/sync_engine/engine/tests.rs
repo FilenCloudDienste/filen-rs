@@ -2,6 +2,8 @@ use std::{
 	collections::HashSet,
 	sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
+#[cfg(unix)]
+use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
 
 use filen_types::{crypto::Blake3Hash, fs::StableUuid};
 use rand::{RngExt, SeedableRng, rngs::StdRng};
@@ -5663,6 +5665,33 @@ async fn a_verbatim_root_an_older_build_stored_is_still_overlapped() {
 		Some(PairOverlap::LocalRootContains { pair: p, .. }) if *p == pair
 	));
 	assert_eq!(engine.list_pairs().await.unwrap().len(), 1);
+}
+
+/// A local root whose name is not valid UTF-8 is refused at registration, rather than stored
+/// under a lossy spelling that names another directory.
+#[cfg(unix)]
+#[tokio::test]
+async fn add_pair_refuses_a_non_utf8_root() {
+	let dir = tempfile::tempdir().unwrap();
+	let root = dir.path().join(OsStr::from_bytes(b"bad\xff"));
+	if let Err(error) = std::fs::create_dir(&root) {
+		// APFS, for one, refuses a name that is not valid UTF-8.
+		eprintln!("skipped: this filesystem refuses a non-UTF-8 directory name: {error}");
+		return;
+	}
+	let engine = SyncEngine::open(Arc::new(offline_client()), dir.path().join("baseline.db"))
+		.await
+		.unwrap();
+
+	let refused = match engine
+		.add_pair(root, Uuid::from_u128(1), SyncMode::TwoWay)
+		.await
+	{
+		Ok(pair) => panic!("registered a non-UTF-8 root as pair {pair}"),
+		Err(error) => error,
+	};
+	assert_eq!(refused.kind(), ErrorKind::InvalidState, "{refused}");
+	assert!(engine.list_pairs().await.unwrap().is_empty());
 }
 
 /// The same relation between two REMOTE roots, decided from their ancestor chains. The chains

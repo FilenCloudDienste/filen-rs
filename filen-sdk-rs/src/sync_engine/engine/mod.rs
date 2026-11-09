@@ -4105,7 +4105,8 @@ impl SyncEngine {
 	/// `local_root` must already EXIST and be a directory; it is canonicalized before being stored,
 	/// so the pair's identity (and the write-confinement anchor) is symlink-stable. A missing or
 	/// non-directory root is rejected here rather than surfacing a pass later as an
-	/// incomplete-scan guard hold with every deletion withheld. On Windows the canonical path is
+	/// incomplete-scan guard hold with every deletion withheld. The canonical root must be valid
+	/// UTF-8, as it is stored as text. On Windows the canonical path is
 	/// stored without the verbatim prefix (`C:\x`, not `\\?\C:\x`), as `dunce` simplifies it, so
 	/// the root every caller reads back is one it can show and hand to the shell. A path the plain
 	/// form could mean another directory by (a long path, a reserved name) keeps the prefix, and so
@@ -4131,7 +4132,18 @@ impl SyncEngine {
 				format!("sync pair local root {local_root:?} is not a directory"),
 			));
 		}
-		let local = local_root.to_string_lossy().into_owned();
+		// The root is stored as text: a lossy spelling of a non-UTF-8 path would name another,
+		// usually nonexistent, directory.
+		let Some(local) = local_root.to_str() else {
+			return Err(Error::custom(
+				ErrorKind::InvalidState,
+				format!(
+					"sync pair local root {} is not valid UTF-8",
+					local_root.display()
+				),
+			));
+		};
+		let local = local.to_owned();
 		// Held across the check AND the insert: concurrent registrations must not both read a
 		// registry neither has written to yet.
 		let _registering = self.registrations.lock().await;
