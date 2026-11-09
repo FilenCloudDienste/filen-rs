@@ -75,7 +75,7 @@ use super::{
 	scan::{
 		LocalNode, LocalScan, PairRoot, RuleFiles, ScanError, ScanGapCause, ScanGaps, ScanRoot,
 		collision_key, fast_path_hash, hash_file, load_rule_file, mtime_nanos, name_rejection,
-		record, scan_subtree,
+		record, scan_subtree, stat_pair_root,
 	},
 	side::Nodes,
 };
@@ -450,8 +450,9 @@ pub(super) fn observe_local(
 	};
 	// Nothing below the root is evidence of anything unless the root is there: a removed volume, a
 	// share that dropped or a lazily unmounted tree answers `NotFound` for every path under it, and
-	// reading that as a tree of deletions is what the walk's own closing stat guards against.
-	if let Err(source) = std::fs::metadata(root) {
+	// reading that as a tree of deletions is what the walk's own closing stat guards against. A root
+	// that is no longer a directory holds none of the tree either.
+	if let Err(source) = stat_pair_root(root) {
 		out.complete = false;
 		out.gaps.unreadable("", &source);
 		record(
@@ -703,7 +704,7 @@ pub(super) fn observe_local(
 	// The root again, after the fact. A volume that went away while this ran answered `NotFound`
 	// for every path under it, and each of those answers would otherwise stand as an absence. What
 	// was observed present is still true; what was observed absent is not evidence any more.
-	if let Err(source) = std::fs::metadata(root) {
+	if let Err(source) = stat_pair_root(root) {
 		out.complete = false;
 		out.gaps.unreadable("", &source);
 		record(

@@ -158,6 +158,32 @@ fn a_missing_path_is_absent_but_a_missing_root_is_only_incomplete() {
 	fs::remove_dir_all(&root).ok();
 }
 
+/// A pair root that became a file is no more evidence than a missing one: the root itself is not
+/// observed as a file, and nothing under it as absent.
+#[test]
+fn a_pair_root_that_is_a_file_is_not_observed_as_complete() {
+	let dir = temp_root();
+	let root = dir.join("root");
+	fs::write(&root, b"x").unwrap();
+
+	let out = observe(&root, &["", "gone.txt"]);
+
+	assert!(
+		!out.complete,
+		"a root that is a file is missing evidence, not a tree of deletions"
+	);
+	assert!(out.observed.is_empty(), "{:?}", out.observed);
+	assert_eq!(out.errors.len(), 1, "{:?}", out.errors);
+	assert!(
+		matches!(&out.errors[0], ScanError::Io { rel_path, source }
+			if rel_path.is_empty() && source.kind() == ErrorKind::NotADirectory),
+		"{:?}",
+		out.errors
+	);
+
+	fs::remove_dir_all(&dir).ok();
+}
+
 /// The rules deciding a path at depth are the ones a whole-tree walk would have had in force
 /// there: every ancestor's `.filenignore`, down to the path's own directory. An ignored
 /// directory takes the entry with it, as git's own rule has it.

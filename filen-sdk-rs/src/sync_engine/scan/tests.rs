@@ -3237,6 +3237,60 @@ fn a_missing_root_is_the_gap_of_its_scan() {
 	);
 }
 
+/// What a scan of a pair root that is not a directory returns: incomplete, with the root as its
+/// one gap and its one error, so no baseline row reads as a local deletion.
+fn assert_not_a_directory_root(scan: &LocalScan) {
+	assert!(
+		!scan.complete,
+		"a root that is a file holds none of the tree: nothing it lacks was deleted"
+	);
+	assert!(scan.nodes.whole().is_empty());
+	assert_eq!(
+		sorted_gaps(scan),
+		(
+			vec![ScanGap {
+				rel_path: String::new(),
+				cause: ScanGapCause::Unreadable {
+					kind: ErrorKind::NotADirectory,
+				},
+			}],
+			1
+		)
+	);
+	assert_eq!(scan.errors.len(), 1, "{:?}", scan.errors);
+	assert!(
+		matches!(&scan.errors[0], ScanError::Io { rel_path, source }
+			if rel_path.is_empty() && source.kind() == ErrorKind::NotADirectory),
+		"{:?}",
+		scan.errors
+	);
+}
+
+#[test]
+fn a_pair_root_that_is_a_file_is_an_incomplete_scan() {
+	let dir = temp_root();
+	let root = dir.join("root");
+	fs::write(&root, b"x").unwrap();
+
+	assert_not_a_directory_root(&scan_plain(&root, &HashMap::new()));
+
+	fs::remove_dir_all(&dir).ok();
+}
+
+#[cfg(unix)]
+#[test]
+fn a_pair_root_that_is_a_file_is_an_incomplete_scan_through_a_symlink() {
+	let dir = temp_root();
+	let target = dir.join("target");
+	fs::write(&target, b"x").unwrap();
+	let root = dir.join("root");
+	std::os::unix::fs::symlink(&target, &root).unwrap();
+
+	assert_not_a_directory_root(&scan_plain(&root, &HashMap::new()));
+
+	fs::remove_dir_all(&dir).ok();
+}
+
 // macOS refuses to create a name that is not valid UTF-8.
 #[cfg(target_os = "linux")]
 #[test]

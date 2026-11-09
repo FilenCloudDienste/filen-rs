@@ -463,6 +463,17 @@ pub(super) fn record(errors: &mut Vec<ScanError>, root: &Path, error: ScanError)
 	errors.push(error);
 }
 
+/// Stat the pair root, following symlinks, as the walk does. Anything but a directory there answers
+/// `NotADirectory`: a root that became a file, or a link to one, holds none of the tree, and a walk
+/// of it lists nothing — which on its own reads as every row deleted.
+pub(super) fn stat_pair_root(root: &Path) -> std::io::Result<()> {
+	if std::fs::metadata(root)?.is_dir() {
+		Ok(())
+	} else {
+		Err(std::io::Error::from(ErrorKind::NotADirectory))
+	}
+}
+
 /// Whether a walk error is a symlink that cannot be followed: one looping back onto an ancestor, or
 /// one whose target does not resolve (dangling, or a link to itself). A symlink to a directory that
 /// merely cannot be READ is not one of these — its target exists and was not read.
@@ -1753,8 +1764,14 @@ fn scan_local_watched<S: ScanSink>(
 	// listed, and each of those was skipped just above as an entry that vanished — which on its own
 	// is indistinguishable from the tree being emptied one file at a time. One stat tells them
 	// apart: if what the walk started from is gone (a removed volume, a share that dropped, a lazily
-	// unmounted tree), nothing the walk listed is evidence that anything was deleted.
-	if let Err(source) = std::fs::metadata(&start_path) {
+	// unmounted tree), nothing the walk listed is evidence that anything was deleted. Nor is it if
+	// the pair root is no longer a directory: the walk of a file lists nothing at all.
+	let start_stat = if start.is_empty() {
+		stat_pair_root(&start_path)
+	} else {
+		std::fs::metadata(&start_path).map(drop)
+	};
+	if let Err(source) = start_stat {
 		complete = false;
 		// A subtree's start gone or replaced is a directory below the root that changed under the
 		// walk: partial, but nothing is reported. Only a missing pair root is (a removed volume). A
