@@ -123,7 +123,8 @@ impl ComponentMatcher {
 	}
 
 	/// The entries of the directory `dir` (the current directory when empty) whose names match,
-	/// sorted. A `dir` that is not a directory has none.
+	/// sorted. A `dir` that is not a directory has none, and neither has one that cannot be read
+	/// or vanished, as a shell skips them; an entry that cannot be read is skipped too.
 	fn entries_of(&self, dir: &Path) -> Result<Vec<PathBuf>> {
 		let listed = if dir.as_os_str().is_empty() {
 			Path::new(".")
@@ -133,13 +134,30 @@ impl ComponentMatcher {
 		if !fs::metadata(listed).is_ok_and(|metadata| metadata.is_dir()) {
 			return Ok(Vec::new());
 		}
-		let mut names = fs::read_dir(listed)
-			.and_then(|entries| {
-				entries
-					.map(|entry| entry.map(|entry| entry.file_name()))
-					.collect::<io::Result<Vec<OsString>>>()
+		let entries = match fs::read_dir(listed) {
+			Ok(entries) => entries,
+			Err(e)
+				if matches!(
+					e.kind(),
+					io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
+				) =>
+			{
+				log::debug!("Not expanding wildcards in {}: {e}", listed.display());
+				return Ok(Vec::new());
+			}
+			Err(e) => {
+				return Err(e).with_context(|| format!("Failed to list {}", listed.display()));
+			}
+		};
+		let mut names = entries
+			.filter_map(|entry| match entry {
+				Ok(entry) => Some(entry.file_name()),
+				Err(e) => {
+					log::debug!("Skipping an entry of {}: {e}", listed.display());
+					None
+				}
 			})
-			.with_context(|| format!("Failed to list {}", listed.display()))?;
+			.collect::<Vec<OsString>>();
 		names.retain(|name| {
 			(self.matches_hidden || !name.as_encoded_bytes().starts_with(b"."))
 				&& self.matcher.is_match(Path::new(name))
@@ -151,6 +169,8 @@ impl ComponentMatcher {
 
 #[cfg(test)]
 mod tests {
+	#[cfg(unix)]
+	use std::os::unix::fs::PermissionsExt;
 	use std::path::MAIN_SEPARATOR_STR as SEP;
 
 	use tempfile::TempDir;
@@ -226,6 +246,25 @@ mod tests {
 			expanded(&dir, "*/*.txt", Case::Sensitive),
 			["a/1.txt", "b/1.txt", "b/2.txt", "c/2.txt"]
 		);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn an_unreadable_directory_is_skipped() {
+		let dir = tree(&["a/x.txt", "b/y.txt"]);
+		let unreadable = dir.path().join("b");
+		fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).unwrap();
+		let readable = fs::read_dir(&unreadable).is_ok();
+		let result = (!readable).then(|| expanded(&dir, "*/*.txt", Case::Sensitive));
+		fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o755)).unwrap();
+		let Some(result) = result else {
+			// root reads it regardless, so there is nothing to test; said, not skipped silently
+			eprintln!(
+				"an_unreadable_directory_is_skipped: not run, this user reads a mode 000 directory"
+			);
+			return;
+		};
+		assert_eq!(result, ["a/x.txt"]);
 	}
 
 	#[test]
