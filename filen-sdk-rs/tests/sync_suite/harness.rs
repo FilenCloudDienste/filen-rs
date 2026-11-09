@@ -30,8 +30,49 @@ use uuid::Uuid;
 
 #[cfg(feature = "malformed")]
 use filen_sdk_rs::crypto::shared::MetaCrypter;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 use crate::helpers::*;
+
+/// Whether this process is refused a file whose mode grants nothing. It is not when it runs as
+/// root (or with `CAP_DAC_OVERRIDE`), and a test that relies on a chmod to deny access then has
+/// nothing to observe.
+#[cfg(unix)]
+pub fn permissions_enforced() -> bool {
+	let probe = tempfile::NamedTempFile::new().unwrap();
+	std::fs::set_permissions(probe.path(), std::fs::Permissions::from_mode(0o000)).unwrap();
+	let denied = std::fs::File::open(probe.path()).is_err();
+	std::fs::set_permissions(probe.path(), std::fs::Permissions::from_mode(0o600)).unwrap();
+	// Dropping `probe` removes the file.
+	denied
+}
+
+/// Applies a temporary mode to a path and puts the previous one back on drop, so a test that
+/// panics part-way does not leave behind a file it cannot read or a directory it cannot delete.
+#[cfg(unix)]
+pub struct ModeGuard {
+	path: PathBuf,
+	mode: u32,
+}
+
+#[cfg(unix)]
+impl ModeGuard {
+	pub fn new(path: impl Into<PathBuf>, temp_mode: u32) -> Self {
+		let path = path.into();
+		let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+		std::fs::set_permissions(&path, std::fs::Permissions::from_mode(temp_mode)).unwrap();
+		Self { path, mode }
+	}
+}
+
+#[cfg(unix)]
+impl Drop for ModeGuard {
+	fn drop(&mut self) {
+		// Best effort: a failure here must not turn a test's own panic into an abort.
+		let _ = std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(self.mode));
+	}
+}
 
 /// Where `rel` sits in the engine's local bin under `root`, whichever day's bucket holds it (the
 /// bin is filed as `.filen-sync-trash/YYYY-MM-DD/<rel>`, by the UTC day the item was binned):

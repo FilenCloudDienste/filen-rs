@@ -314,18 +314,19 @@ async fn race_10_directory_replaced_by_file() {
 #[cfg(unix)]
 #[shared_test_runtime]
 async fn race_13_unreadable_local_file_does_not_abort_pair() {
-	use std::os::unix::fs::PermissionsExt;
+	if !permissions_enforced() {
+		eprintln!(
+			"skipping race_13_unreadable_local_file_does_not_abort_pair: this process can read a mode-000 file (running as root?)"
+		);
+		return;
+	}
 
 	let sc = single_client(SyncMode::LocalToRemote).await;
 	write_file(&sc.local, "ok1.txt", b"A");
 	write_file(&sc.local, "secret.txt", b"B");
 	write_file(&sc.local, "ok2.txt", b"C");
 	// Remove all permissions from secret.txt (owner cannot open it).
-	std::fs::set_permissions(
-		sc.local.join("secret.txt"),
-		std::fs::Permissions::from_mode(0o000),
-	)
-	.unwrap();
+	let unreadable = ModeGuard::new(sc.local.join("secret.txt"), 0o000);
 
 	let r1 = sc.sync().await;
 	// The pair must not crash; the two readable files must upload regardless of the bad one.
@@ -345,11 +346,7 @@ async fn race_13_unreadable_local_file_does_not_abort_pair() {
 	);
 
 	// Restore permission; a later pass must upload it.
-	std::fs::set_permissions(
-		sc.local.join("secret.txt"),
-		std::fs::Permissions::from_mode(0o644),
-	)
-	.unwrap();
+	drop(unreadable);
 	let mut ok = false;
 	for _ in 0..6 {
 		let r = sc.sync().await;
@@ -371,7 +368,12 @@ async fn race_13_unreadable_local_file_does_not_abort_pair() {
 #[cfg(unix)]
 #[shared_test_runtime]
 async fn race_14_undeliverable_download_does_not_crash_pair() {
-	use std::os::unix::fs::PermissionsExt;
+	if !permissions_enforced() {
+		eprintln!(
+			"skipping race_14_undeliverable_download_does_not_crash_pair: this process can read a mode-000 file (running as root?)"
+		);
+		return;
+	}
 
 	let sc = single_client(SyncMode::RemoteToLocal).await;
 	let rf = upload_root(&sc, "readonly.txt", b"A-payload").await;
@@ -381,7 +383,7 @@ async fn race_14_undeliverable_download_does_not_crash_pair() {
 	);
 
 	// Make the local sync root non-writable (deny create).
-	std::fs::set_permissions(&sc.local, std::fs::Permissions::from_mode(0o500)).unwrap();
+	let read_only_root = ModeGuard::new(&sc.local, 0o500);
 
 	let r1 = sc
 		.engine
@@ -403,7 +405,7 @@ async fn race_14_undeliverable_download_does_not_crash_pair() {
 	}
 
 	// Restore write permission; a later pass must deliver the file byte-exact.
-	std::fs::set_permissions(&sc.local, std::fs::Permissions::from_mode(0o755)).unwrap();
+	drop(read_only_root);
 	let mut ok = false;
 	for _ in 0..6 {
 		let r = sc.engine.sync_once(sc.pair).await.expect("sync_once");

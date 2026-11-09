@@ -1243,7 +1243,12 @@ async fn filter_unignore_remote_to_local_holds_the_destination_deletion() {
 #[cfg(unix)]
 #[shared_test_runtime]
 async fn filter_unreadable_local_filenignore_blocks_its_directory() {
-	use std::os::unix::fs::PermissionsExt;
+	if !permissions_enforced() {
+		eprintln!(
+			"skipping filter_unreadable_local_filenignore_blocks_its_directory: this process can read a mode-000 file (running as root?)"
+		);
+		return;
+	}
 
 	let sc = single_client(SyncMode::TwoWay).await;
 	write_file(&sc.local, "gone.txt", b"deleted later");
@@ -1253,14 +1258,13 @@ async fn filter_unreadable_local_filenignore_blocks_its_directory() {
 	clean(&seed);
 	assert_eq!(seed.uploaded, 3, "{seed:?}");
 
-	let rules = sc.local.join("locked/.filenignore");
-	std::fs::set_permissions(&rules, std::fs::Permissions::from_mode(0o000)).unwrap();
+	let unreadable_rules = ModeGuard::new(sc.local.join("locked/.filenignore"), 0o000);
 	write_file(&sc.local, "locked/b.txt", b"written while blocked");
 	std::fs::remove_file(sc.local.join("locked/a.txt")).unwrap();
 	std::fs::remove_file(sc.local.join("gone.txt")).unwrap();
 
 	let blocked = sc.sync().await;
-	std::fs::set_permissions(&rules, std::fs::Permissions::from_mode(0o644)).unwrap();
+	drop(unreadable_rules);
 	assert!(blocked.refused.is_none(), "{blocked:?}");
 	assert_eq!(blocked.errors.len(), 1, "{blocked:?}");
 	assert!(
