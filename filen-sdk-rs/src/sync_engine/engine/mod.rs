@@ -1645,14 +1645,7 @@ where
 	T: Send + 'static,
 {
 	let store = Arc::clone(store);
-	tokio::task::spawn_blocking(move || work(&locked(&store)))
-		.await
-		.map_err(|e| {
-			Error::custom(
-				ErrorKind::Internal,
-				format!("a baseline store task panicked: {e}"),
-			)
-		})
+	off_runtime("a baseline store task", move || work(&locked(&store))).await
 }
 
 /// Run `work` on a blocking thread, for what a pass does to its own stages and rows whose cost
@@ -2746,15 +2739,11 @@ impl Prepared {
 			mem::replace(&mut self.local_scan.nodes, Side::carried()),
 			mem::replace(&mut self.remote_view.nodes, Side::carried()),
 		);
-		tokio::task::spawn_blocking(move || PlannedEntry::stage(screen, baseline, local, remote))
-			.await
-			.map_err(|e| {
-				Error::custom(
-					ErrorKind::Internal,
-					format!("staging the pass's plan panicked: {e}"),
-				)
-			})?
-			.map_err(|e| db_error(e, &format!("staging the pass's plan in {at}")))
+		off_runtime("staging the pass's plan", move || {
+			PlannedEntry::stage(screen, baseline, local, remote)
+		})
+		.await?
+		.map_err(|e| db_error(e, &format!("staging the pass's plan in {at}")))
 	}
 
 	/// The `rows` of the screened plan in the public [`PlannedAction`] shape, in plan order, each
@@ -3702,7 +3691,7 @@ impl SyncEngine {
 		let lock = BaselineLock::take(&db_path)?;
 		let (store, lock) = {
 			let db_path = db_path.clone();
-			tokio::task::spawn_blocking(move || {
+			off_runtime("baseline open", move || {
 				let store = BaselineStore::open(&db_path)?;
 				// Before this engine has made a stage of its own, so none found is this engine's.
 				stage::sweep(&db_path);
@@ -3710,10 +3699,7 @@ impl SyncEngine {
 				// holds the lock until its sweep is done.
 				Ok::<_, Error>((store, lock))
 			})
-			.await
-			.map_err(|e| {
-				Error::custom(ErrorKind::Internal, format!("baseline open panicked: {e}"))
-			})??
+			.await??
 		};
 		// A pair paused by an earlier session stays paused: read the flags before the store moves
 		// into the engine, so no pass can run against an empty map in the meantime. The pass that
@@ -5189,7 +5175,7 @@ impl SyncEngine {
 		// The delta comes back out with the observation: `observe_remote` only borrows it, and a
 		// pass cut short hands it to the next one (see `Prepared::remote_delta`).
 		let pair_store = Arc::clone(&inputs.store);
-		let (observed, delta) = tokio::task::spawn_blocking(move || {
+		let (observed, delta) = off_runtime("deriving the remote view", move || {
 			let mut ancestry = |uuid| cache_ancestry(&cache_db, uuid);
 			let mut marked_chain = |uuid| cached_chain_to_root(&cache_db, root, uuid);
 			// Where the baseline records every item this delta can name, resolved off the store's
@@ -5215,13 +5201,7 @@ impl SyncEngine {
 				});
 			(observed, delta)
 		})
-		.await
-		.map_err(|e| {
-			Error::custom(
-				ErrorKind::Internal,
-				format!("deriving the remote view panicked: {e}"),
-			)
-		})?;
+		.await?;
 		let observed =
 			observed.map_err(|e| db_error(e, "resolving where the delta's items are recorded"))?;
 		// The delta is what the cache announced up to the take, which came after the cache held
@@ -5323,7 +5303,7 @@ impl SyncEngine {
 		let for_local = inputs.baseline.clone();
 		let dirty = mem::take(&mut derived.dirty);
 		let pass_rules = remote_rules.rules;
-		let observed = tokio::task::spawn_blocking(move || {
+		let observed = off_runtime("re-observing the local paths", move || {
 			observe::observe_local(
 				&local_root,
 				pair_root,
@@ -5333,13 +5313,7 @@ impl SyncEngine {
 				&dirty,
 			)
 		})
-		.await
-		.map_err(|e| {
-			Error::custom(
-				ErrorKind::Internal,
-				format!("re-observing the local paths panicked: {e}"),
-			)
-		})?;
+		.await?;
 		// A dirty path with a subtree too large to narrow this pass to.
 		let (mut observations, rules) = match observed {
 			Ok(observed) => observed,
@@ -5702,15 +5676,11 @@ impl SyncEngine {
 			// Every row the pass still needs is in the view now; the objects it ACTS on are read back
 			// whole by uuid, for the handful a plan names.
 			let root = record.remote_root;
-			let mut view = tokio::task::spawn_blocking(move || copied.finish(root, pair_root))
-				.await
-				.map_err(|e| {
-					Error::custom(
-						ErrorKind::Internal,
-						format!("placing the remote snapshot panicked: {e}"),
-					)
-				})?
-				.map_err(|e| db_error(e, &format!("staging the remote snapshot in {at}")))?;
+			let mut view = off_runtime("placing the remote snapshot", move || {
+				copied.finish(root, pair_root)
+			})
+			.await?
+			.map_err(|e| db_error(e, &format!("staging the remote snapshot in {at}")))?;
 
 			// The confirmation runs against the RAW view — before this engine's own writes are
 			// folded into it. A row the snapshot confirms is one both sides demonstrably hold, which
@@ -6401,11 +6371,7 @@ impl SyncEngine {
 		// pair's own statements behind SQLite's write lock instead of behind its mutex, where the
 		// waiting is visible and bounded.
 		let path = self.db_path.clone();
-		let store = tokio::task::spawn_blocking(move || BaselineStore::open(&path))
-			.await
-			.map_err(|e| {
-				Error::custom(ErrorKind::Internal, format!("baseline open panicked: {e}"))
-			})??;
+		let store = off_runtime("baseline open", move || BaselineStore::open(&path)).await??;
 		let store = Arc::new(std::sync::Mutex::new(store));
 		stores.insert(pair, Arc::clone(&store));
 		Ok(store)
