@@ -1648,6 +1648,18 @@ where
 	off_runtime("a baseline store task", move || work(&locked(&store))).await
 }
 
+/// [`off_store`] for `work` that returns a rusqlite result, its error named by `context` as
+/// [`db_error`] names it.
+async fn off_store_db<T, F>(store: &SharedStore, context: &'static str, work: F) -> Result<T, Error>
+where
+	F: FnOnce(&BaselineStore) -> rusqlite::Result<T> + Send + 'static,
+	T: Send + 'static,
+{
+	off_store(store, work)
+		.await?
+		.map_err(|e| db_error(e, context))
+}
+
 /// Run `work` on a blocking thread, for what a pass does to its own stages and rows whose cost
 /// scales with the tree — the reconcile, the screening and the confirmation — as [`off_store`] runs
 /// the store's. `work` owns what it reads and hands back whatever the pass still needs. A panic in
@@ -3332,11 +3344,12 @@ async fn forget_released_mismatches(
 		return;
 	}
 	let count = released.len();
-	let forgotten = off_store(store, move |store| store.forget_mismatches(pair, &released))
-		.await
-		.and_then(|forgotten| {
-			forgotten.map_err(|e| db_error(e, "forgetting the hash mismatches of released files"))
-		});
+	let forgotten = off_store_db(
+		store,
+		"forgetting the hash mismatches of released files",
+		move |store| store.forget_mismatches(pair, &released),
+	)
+	.await;
 	if let Err(error) = forgotten {
 		report.errors.push(format!(
 			"forgetting the hash mismatch of {count} remote file(s) failed: {error}"
@@ -3761,11 +3774,12 @@ impl SyncEngine {
 		// An engine that went down inside the cache-lag window left the writes it had made in the
 		// journal; folding them is what stops this one from making them a second time.
 		let now = Utc::now().timestamp_millis();
-		let rows = off_store(&engine.control, move |store| {
-			store.load_pending(now, grace_millis())
-		})
-		.await?
-		.map_err(|e| db_error(e, "loading the pending-write journal"))?;
+		let rows = off_store_db(
+			&engine.control,
+			"loading the pending-write journal",
+			move |store| store.load_pending(now, grace_millis()),
+		)
+		.await?;
 		if !rows.is_empty() {
 			tracing::debug!(
 				"sync engine: restoring {} unacknowledged write(s)",
@@ -4161,11 +4175,10 @@ impl SyncEngine {
 			// network. Add-versus-add is what `registrations` above covers.
 			let _registry = self.registry.lock().await;
 			// Off the runtime thread for the reason the paused flag is (see `set_control`).
-			off_store(&self.control, move |store| {
+			off_store_db(&self.control, "registering a sync pair", move |store| {
 				store.create_pair(&local, remote_root, mode)
 			})
 			.await?
-			.map_err(|e| db_error(e, "registering a sync pair"))?
 		};
 		if stored_mode != mode {
 			return Err(Error::custom(
@@ -4359,9 +4372,11 @@ impl SyncEngine {
 		// whole tree.
 		let changed = {
 			let _registry = self.registry.lock().await;
-			off_store(&store, move |store| store.set_mode(pair, mode, &adopted)).await?
-		}
-		.map_err(|e| db_error(e, "reconfiguring a sync pair"))?;
+			off_store_db(&store, "reconfiguring a sync pair", move |store| {
+				store.set_mode(pair, mode, &adopted)
+			})
+			.await?
+		};
 		if changed == 0 {
 			return Err(unknown_pair());
 		}
@@ -4441,16 +4456,17 @@ impl SyncEngine {
 		// resolving a conflict while the same pair applies a large move waits without stalling a
 		// runtime worker.
 		let wanted = rel_path.to_string();
-		let mut held = off_store(&store, move |store| store.entry(pair, &wanted))
-			.await?
-			.map_err(|e| db_error(e, "loading the held conflict"))?
-			.filter(|entry| entry.state.is_conflict())
-			.ok_or_else(|| {
-				Error::custom(
-					ErrorKind::InvalidState,
-					format!("no conflict is being held at {rel_path:?} for this pair"),
-				)
-			})?;
+		let mut held = off_store_db(&store, "loading the held conflict", move |store| {
+			store.entry(pair, &wanted)
+		})
+		.await?
+		.filter(|entry| entry.state.is_conflict())
+		.ok_or_else(|| {
+			Error::custom(
+				ErrorKind::InvalidState,
+				format!("no conflict is being held at {rel_path:?} for this pair"),
+			)
+		})?;
 
 		// A divergence this engine's own push created is resolved against the SERVER's version
 		// history rather than against what the remote holds now — our upload is what it holds.
@@ -4506,11 +4522,10 @@ impl SyncEngine {
 		let resolving = rel_path.to_string();
 		// No row where the winner's side had nothing at this path: the other side then reads as a
 		// fresh create (or as already-gone) rather than as a second conflict.
-		off_store(&store, move |store| {
+		off_store_db(&store, "resolving a conflict", move |store| {
 			store.record_resolution(pair, &resolving, resolved.as_ref())
 		})
-		.await?
-		.map_err(|e| db_error(e, "resolving a conflict"))?;
+		.await?;
 		self.note_resolution(pair).await;
 		Ok(kept)
 	}
@@ -4621,11 +4636,10 @@ impl SyncEngine {
 		// the path from what the two sides now actually hold.
 		let store = self.pair_store(pair).await?;
 		let resolving = rel_path.to_string();
-		off_store(&store, move |store| {
+		off_store_db(&store, "resolving a conflict", move |store| {
 			store.record_resolution(pair, &resolving, None)
 		})
-		.await?
-		.map_err(|e| db_error(e, "resolving a conflict"))?;
+		.await?;
 		Ok(resolved)
 	}
 
@@ -4849,9 +4863,10 @@ impl SyncEngine {
 	/// itself; this is for the stretches where none runs.
 	async fn sweep_confirmations(&self, pair: PairId) -> Result<(), Error> {
 		let store = self.pair_store(pair).await?;
-		let baseline = off_store(&store, move |store| store.baseline(pair))
-			.await?
-			.map_err(|e| db_error(e, "loading the baseline"))?;
+		let baseline = off_store_db(&store, "loading the baseline", move |store| {
+			store.baseline(pair)
+		})
+		.await?;
 		// A pair with nothing awaiting confirmation is the steady state, and the sweep runs in the
 		// stretches where no pass does: it must not read a row to find that out. The
 		// gate `prepare` uses, and the filter every confirmation step already applies.
@@ -5831,11 +5846,12 @@ impl SyncEngine {
 		let synced = if skipped_uuids.is_empty() && skipped_lineages.is_empty() {
 			SyncedPaths::default()
 		} else {
-			off_store(&store, move |store| {
-				store.synced_paths(pair, &skipped_uuids, &skipped_lineages)
-			})
+			off_store_db(
+				&store,
+				"resolving where the skipped remote items are recorded",
+				move |store| store.synced_paths(pair, &skipped_uuids, &skipped_lineages),
+			)
 			.await?
-			.map_err(|e| db_error(e, "resolving where the skipped remote items are recorded"))?
 		};
 		facts.merge_remote_view(
 			&BTreeSet::from([String::new()]),
@@ -5976,11 +5992,10 @@ impl SyncEngine {
 		let _registry = self.registry.lock().await;
 		// Off the runtime thread for the reason the paused flag is (see `set_control`): a write
 		// waits out another connection's transaction inside SQLite, not on a lock here.
-		let changed = off_store(&self.control, move |store| {
+		let changed = off_store_db(&self.control, "setting the delete guard", move |store| {
 			store.set_delete_guard(pair, guard)
 		})
-		.await?
-		.map_err(|e| db_error(e, "setting the delete guard"))?;
+		.await?;
 		if changed == 0 {
 			return Err(unknown_pair());
 		}
@@ -6010,9 +6025,12 @@ impl SyncEngine {
 		})?;
 		// Off the runtime thread for the reason the paused flag is (see `set_control`).
 		let stored = patterns.to_owned();
-		off_store(&self.control, move |store| store.set_user_ignore(&stored))
-			.await?
-			.map_err(|e| db_error(e, "storing the user ignore patterns"))?;
+		off_store_db(
+			&self.control,
+			"storing the user ignore patterns",
+			move |store| store.set_user_ignore(&stored),
+		)
+		.await?;
 		// Only once the write has committed: a loop this wakes reads the patterns back out of the
 		// DB, so a wake-up sent any earlier could run a pass on the old ones. `send_modify` rather
 		// than `send`, which fails when the last watch has gone — nobody to wake is not an error.
@@ -6105,9 +6123,10 @@ impl SyncEngine {
 		// but the cascade under it takes every baseline, journal and failure row the pair ever had.
 		// On the control connection that cascade would be the one long hold on the lock every other
 		// pair's control verbs go through.
-		let deleted = off_store(&pair_store, move |store| store.delete_pair(pair))
-			.await
-			.and_then(|result| result.map_err(|e| db_error(e, "removing a sync pair")));
+		let deleted = off_store_db(&pair_store, "removing a sync pair", move |store| {
+			store.delete_pair(pair)
+		})
+		.await;
 		if let Err(e) = deleted {
 			// The pair is still registered, so put back the control state the removal took away: the
 			// pair keeps working as it did, paused or not. Only while it is still `Retired`, which
@@ -6466,9 +6485,12 @@ impl SyncEngine {
 		// is held across the hop, which is what still keeps a removal from landing between this
 		// write and the answer below.
 		let paused = control.is_paused();
-		let known = off_store(&self.control, move |store| store.set_paused(pair, paused))
-			.await?
-			.map_err(|e| db_error(e, "persisting a sync pair's paused flag"))?;
+		let known = off_store_db(
+			&self.control,
+			"persisting a sync pair's paused flag",
+			move |store| store.set_paused(pair, paused),
+		)
+		.await?;
 		if !known {
 			return Err(unknown_pair());
 		}
@@ -6689,9 +6711,10 @@ impl SyncEngine {
 		// One row, so the statement itself is microseconds — but the pair it names may be in the
 		// middle of a pass, whose baseline read holds this lock for as long as the tree takes. Off
 		// the runtime thread, so a caller retrying a path cannot block one.
-		off_store(&store, move |store| store.clear_failure(pair, &rel_path))
-			.await?
-			.map_err(|e| db_error(e, "clearing a path's failure count"))?;
+		off_store_db(&store, "clearing a path's failure count", move |store| {
+			store.clear_failure(pair, &rel_path)
+		})
+		.await?;
 		self.note_failures_cleared(pair).await;
 		Ok(())
 	}
@@ -6710,9 +6733,10 @@ impl SyncEngine {
 		let store = self.pair_store(pair).await?;
 		// One statement, but behind the pair's store lock like `retry_path`'s, which a pass in
 		// flight may hold for as long as its baseline read takes.
-		off_store(&store, move |store| store.clear_all_failures(pair))
-			.await?
-			.map_err(|e| db_error(e, "clearing the pair's failure counts"))?;
+		off_store_db(&store, "clearing the pair's failure counts", move |store| {
+			store.clear_all_failures(pair)
+		})
+		.await?;
 		self.note_failures_cleared(pair).await;
 		Ok(())
 	}
@@ -6785,16 +6809,19 @@ impl SyncEngine {
 		// deliberately does not wait for the pass in flight. Still off the runtime thread: the
 		// statement is cheap now, but it queues behind whatever the pass in flight is holding
 		// the pair's store mutex for.
-		Ok(off_store(&store, move |store| store.conflicts(pair))
+		Ok(
+			off_store_db(&store, "loading the held conflicts", move |store| {
+				store.conflicts(pair)
+			})
 			.await?
-			.map_err(|e| db_error(e, "loading the held conflicts"))?
 			.into_iter()
 			.map(|entry| PlannedConflict {
 				rel_path: entry.rel_path,
 				local: entry.local_kind.map(PlannedNodeKind::from),
 				remote: entry.remote_kind.map(PlannedNodeKind::from),
 			})
-			.collect())
+			.collect(),
+		)
 	}
 
 	/// Run one full sync pass: plan, screen, and apply against the remote and local tree. A
@@ -6942,9 +6969,12 @@ impl SyncEngine {
 		}
 		let recorded = async {
 			let store = self.pair_store(pair).await?;
-			off_store(&store, move |store| store.mark_first_pass_completed(pair))
-				.await?
-				.map_err(|e| db_error(e, "recording the pair's first completed pass"))
+			off_store_db(
+				&store,
+				"recording the pair's first completed pass",
+				move |store| store.mark_first_pass_completed(pair),
+			)
+			.await
 		};
 		if let Err(error) = recorded.await {
 			tracing::warn!("sync pair {pair}: {error}");
@@ -6960,11 +6990,12 @@ impl SyncEngine {
 		if restoring.contains(&pair) == unfinished {
 			return Ok(());
 		}
-		off_store(&self.control, move |store| {
-			store.set_restore_unfinished(pair, unfinished)
-		})
-		.await?
-		.map_err(|e| db_error(e, "recording a restoration of held deletions"))?;
+		off_store_db(
+			&self.control,
+			"recording a restoration of held deletions",
+			move |store| store.set_restore_unfinished(pair, unfinished),
+		)
+		.await?;
 		if unfinished {
 			restoring.insert(pair);
 		} else {
