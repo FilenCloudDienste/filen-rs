@@ -1099,7 +1099,7 @@ async fn apply_plan(
 					Err(error) => {
 						applied += 1;
 						// A read of the stage: nothing was sent.
-						let verdict = Verdict::of(pass_halt(&error));
+						let verdict = Verdict::local(&error);
 						note_action_failed(&entry.action, &error, verdict, full, report, observer);
 						continue;
 					}
@@ -1139,7 +1139,7 @@ async fn apply_plan(
 					Err(error) => {
 						applied += 1;
 						// A read of the stage: nothing was sent.
-						let verdict = Verdict::of(pass_halt(&error));
+						let verdict = Verdict::local(&error);
 						note_action_failed(&entry.action, &error, verdict, full, report, observer);
 						continue;
 					}
@@ -1367,7 +1367,7 @@ impl Failed {
 	/// local disk can make one.
 	fn local(error: crate::Error) -> Self {
 		Self {
-			verdict: Verdict::of(pass_halt(&error)),
+			verdict: Verdict::local(&error),
 			error,
 		}
 	}
@@ -1391,6 +1391,11 @@ impl Verdict {
 	/// The verdict on a failure that halts the pass on `halt`, if any, and is otherwise its path's.
 	fn of(halt: Option<HaltReason>) -> Self {
 		halt.map_or(Self::Own, Self::Halts)
+	}
+
+	/// The verdict on a failure no request was sent for (see [`Failed::local`]).
+	fn local(error: &crate::Error) -> Self {
+		Self::of(pass_halt(error))
 	}
 }
 
@@ -2554,7 +2559,7 @@ async fn compose_creates<'c>(
 			Err(error) => {
 				settled += 1;
 				// A read of the stage, or a parent the pass has none for: nothing was sent.
-				let verdict = Verdict::of(pass_halt(&error));
+				let verdict = Verdict::local(&error);
 				note_action_failed(action, &error, verdict, chunk_ctx.full, report, observer);
 			}
 		}
@@ -3007,7 +3012,7 @@ fn compose_trashes<'c>(
 			Err(error) => {
 				settled += 1;
 				// A refusal of the pass's own: nothing was sent.
-				let verdict = Verdict::of(pass_halt(&error));
+				let verdict = Verdict::local(&error);
 				note_action_failed(action, &error, verdict, full, report, observer);
 			}
 		}
@@ -3087,7 +3092,7 @@ async fn land_trashes(
 		// the trash so the next pass suppresses that.
 		if let Err(error) = commit_trash(ctx, remote_uuid, action.rel_path(), carried).await {
 			// A record of the store: nothing more was sent.
-			let verdict = Verdict::of(pass_halt(&error));
+			let verdict = Verdict::local(&error);
 			note_action_failed(action, &error, verdict, full, report, observer);
 			break;
 		}
@@ -3210,7 +3215,7 @@ fn note_overwrote(
 			 buried version could not be written ({error}), so unless the caller resolves it from \
 			 this report, the next pass reads both sides holding our bytes and adopts them"
 		);
-		note_failure(report, rel_path, &error, Verdict::of(pass_halt(&error)));
+		note_failure(report, rel_path, &error, Verdict::local(&error));
 	}
 }
 

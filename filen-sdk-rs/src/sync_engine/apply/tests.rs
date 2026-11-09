@@ -199,7 +199,7 @@ fn note_failure_unshown(
 	rel_path: &str,
 	error: &crate::Error,
 ) -> Option<HaltReason> {
-	note_failure(report, rel_path, error, Verdict::of(pass_halt(error)))
+	note_failure(report, rel_path, error, Verdict::local(error))
 }
 
 fn over_quota() -> crate::Error {
@@ -2374,7 +2374,7 @@ fn a_landing_the_stage_cannot_read_fails_the_upload_and_the_pass() {
 	note_action_failed(
 		&entry.action,
 		&error,
-		Verdict::of(pass_halt(&error)),
+		Verdict::local(&error),
 		&FullSides::default(),
 		&mut report,
 		&mut |event| events.push(event),
