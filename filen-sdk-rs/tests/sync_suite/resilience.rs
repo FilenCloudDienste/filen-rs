@@ -12,10 +12,8 @@
 //! populated destination (the canonical no-baseline-wipe bug), mass-delete safety hold, backup-mode
 //! delete suppression, two-way conflict persistence across re-runs, read-after-write convergence,
 //! baseline reuse on re-open, and quarantine recoverability.
-use std::borrow::Cow;
-
 use filen_macros::shared_test_runtime;
-use filen_sdk_rs::fs::categories::{DirType, Normal};
+use filen_sdk_rs::fs::dir::RemoteDirectory;
 use filen_sdk_rs::fs::file::RemoteFile;
 use filen_sdk_rs::fs::{HasName, HasUUID};
 use filen_sdk_rs::sync_engine::{GuardReason, SyncEngine, SyncMode, SyncReport};
@@ -28,32 +26,14 @@ use crate::helpers::*;
 // Local helpers (public-API only; remote ground-truth via the cache's client).
 // ---------------------------------------------------------------------------
 
-/// List the (dirs, files) directly under the single-client's remote root (ground truth).
-async fn list_root(
-	sc: &SingleClient,
-) -> (Vec<filen_sdk_rs::fs::dir::RemoteDirectory>, Vec<RemoteFile>) {
-	sc.cache
-		.client
-		.list_dir(
-			&DirType::<Normal>::Dir(Cow::Borrowed(&sc.resources.dir)),
-			None::<&fn(u64, Option<u64>)>,
-		)
-		.await
-		.unwrap()
+/// List the (dirs, files) directly under the remote root through the cache's client (ground truth).
+async fn list_root(sc: &SingleClient) -> (Vec<RemoteDirectory>, Vec<RemoteFile>) {
+	list_dir(&sc.cache.client, &sc.resources.dir).await
 }
 
-fn find_file<'a>(files: &'a [RemoteFile], name: &str) -> Option<&'a RemoteFile> {
-	files.iter().find(|f| f.name() == Some(name))
-}
-
-/// Upload a file with exact bytes directly to the single-client's remote root, returning it.
+/// Upload `data` as `name` directly under the remote root through the cache's client.
 async fn upload_root(sc: &SingleClient, name: &str, data: &[u8]) -> RemoteFile {
-	let builder = sc
-		.cache
-		.client
-		.make_file_builder(name, sc.resources.dir.uuid())
-		.unwrap();
-	sc.cache.client.upload_file(builder, data).await.unwrap()
+	upload_to(&sc.cache.client, sc.resources.dir.uuid(), name, data).await
 }
 
 /// Wait until the cache (the engine's remote view) observes `uuid` under the root.
@@ -487,7 +467,7 @@ async fn resil_21_baseline_reused_on_reopen_no_churn() {
 	assert_noop(&r2);
 
 	// All six files still present on the remote, byte-exact.
-	let (_dirs, files) = sc_list(&cache, &resources.dir).await;
+	let (_dirs, files) = list_dir(&cache.client, &resources.dir).await;
 	for i in 0..6 {
 		let name = format!("f{i}.txt");
 		let f = find_file(&files, &name).unwrap_or_else(|| panic!("{name} lost on remote"));
@@ -495,21 +475,6 @@ async fn resil_21_baseline_reused_on_reopen_no_churn() {
 	}
 
 	std::fs::remove_dir_all(&local).ok();
-}
-
-/// Helper for RESIL-21: list a remote dir via an arbitrary cache's client.
-async fn sc_list(
-	cache: &TestCache,
-	dir: &filen_sdk_rs::fs::dir::RemoteDirectory,
-) -> (Vec<filen_sdk_rs::fs::dir::RemoteDirectory>, Vec<RemoteFile>) {
-	cache
-		.client
-		.list_dir(
-			&DirType::<Normal>::Dir(Cow::Borrowed(dir)),
-			None::<&fn(u64, Option<u64>)>,
-		)
-		.await
-		.unwrap()
 }
 
 /// RESIL-24 — backup-mode (LocalBackup) delete suppression survives a re-run. Local deletions must

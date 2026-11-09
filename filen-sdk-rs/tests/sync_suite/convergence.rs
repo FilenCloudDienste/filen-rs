@@ -1,12 +1,11 @@
 //! Non-colliding convergence & ordering tests (`CONVERGE-*`) for the two-way sync engine.
-use std::{borrow::Cow, collections::BTreeSet, sync::Arc, time::Duration};
+use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
 use filen_macros::shared_test_runtime;
 use filen_types::fs::StableUuid;
 
 use filen_sdk_rs::fs::HasName;
 use filen_sdk_rs::fs::HasUUID;
-use filen_sdk_rs::fs::categories::{DirType, Normal};
 use filen_sdk_rs::sync::lock::ResourceLock;
 use filen_sdk_rs::sync_engine::{SyncEngine, SyncMode};
 use tracing::Instrument;
@@ -14,48 +13,6 @@ use uuid::Uuid;
 
 use crate::harness::*;
 use crate::helpers::*;
-
-/// Upload bytes to a remote dir (by uuid) via a client, returning the created file.
-async fn upload_to(
-	client: &filen_sdk_rs::auth::Client,
-	parent: Uuid,
-	name: &str,
-	data: &[u8],
-) -> filen_sdk_rs::fs::file::RemoteFile {
-	let builder = client.make_file_builder(name, parent).unwrap();
-	client.upload_file(builder, data).await.unwrap()
-}
-
-/// List the (dirs, files) directly under a remote directory via a client.
-async fn list_dir(
-	client: &filen_sdk_rs::auth::Client,
-	dir: &filen_sdk_rs::fs::dir::RemoteDirectory,
-) -> (
-	Vec<filen_sdk_rs::fs::dir::RemoteDirectory>,
-	Vec<filen_sdk_rs::fs::file::RemoteFile>,
-) {
-	client
-		.list_dir(
-			&DirType::<Normal>::Dir(Cow::Borrowed(dir)),
-			None::<&fn(u64, Option<u64>)>,
-		)
-		.await
-		.unwrap()
-}
-
-fn find_file<'a>(
-	files: &'a [filen_sdk_rs::fs::file::RemoteFile],
-	name: &str,
-) -> Option<&'a filen_sdk_rs::fs::file::RemoteFile> {
-	files.iter().find(|f| f.name() == Some(name))
-}
-
-fn find_dir<'a>(
-	dirs: &'a [filen_sdk_rs::fs::dir::RemoteDirectory],
-	name: &str,
-) -> Option<&'a filen_sdk_rs::fs::dir::RemoteDirectory> {
-	dirs.iter().find(|d| d.name() == Some(name))
-}
 
 // ============================================================================
 // CONVERGE-01 — Single local create propagates up (one-sided, local origin)
@@ -1275,10 +1232,7 @@ async fn converge_24_offline_gap_backlog_converges() {
 	let g3sub = sc
 		.cache
 		.client
-		.create_dir(
-			&DirType::<Normal>::Dir(Cow::Borrowed(&sc.resources.dir)),
-			"g3",
-		)
+		.create_dir(&sc.root_dirtype(), "g3")
 		.await
 		.unwrap();
 	let g4 = upload_to(&sc.cache.client, g3sub.uuid(), "g4.txt", b"g4").await;
@@ -1895,7 +1849,7 @@ async fn converge_a_dir_restored_between_passes_is_planned_against_whole() {
 		.acquire_lock_with_default(test_utils::locks::TRASH)
 		.await
 		.unwrap();
-	let parent = DirType::<Normal>::Dir(Cow::Borrowed(&sc.resources.dir));
+	let parent = sc.root_dirtype();
 	let mut docs = client.create_dir(&parent, "docs").await.unwrap();
 	let inside = upload_to(client, docs.uuid(), "inside.txt", b"kept").await;
 	assert!(

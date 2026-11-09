@@ -37,13 +37,7 @@ async fn remote_tree(
 	let mut tree = BTreeMap::new();
 	let mut stack = vec![(String::new(), root.clone())];
 	while let Some((prefix, dir)) = stack.pop() {
-		let (dirs, files) = client
-			.list_dir(
-				&DirType::<Normal>::Dir(Cow::Borrowed(&dir)),
-				None::<&fn(u64, Option<u64>)>,
-			)
-			.await
-			.unwrap();
+		let (dirs, files) = list_dir(client, &dir).await;
 		for file in files {
 			tree.insert(format!("{prefix}{}", file.name().unwrap()), Some(file));
 		}
@@ -73,15 +67,7 @@ async fn remote_dir_at(sc: &SingleClient, rel: &str) -> RemoteDirectory {
 	);
 	let mut dir = sc.resources.dir.clone();
 	for name in rel.split('/') {
-		let (dirs, _) = sc
-			.cache
-			.client
-			.list_dir(
-				&DirType::<Normal>::Dir(Cow::Borrowed(&dir)),
-				None::<&fn(u64, Option<u64>)>,
-			)
-			.await
-			.unwrap();
+		let (dirs, _) = list_dir(&sc.cache.client, &dir).await;
 		dir = dirs.into_iter().find(|d| d.name() == Some(name)).unwrap();
 	}
 	dir
@@ -112,8 +98,7 @@ async fn upload_remote(
 	name: &str,
 	data: &[u8],
 ) -> RemoteFile {
-	let builder = cache.client.make_file_builder(name, parent.uuid()).unwrap();
-	let file = cache.client.upload_file(builder, data).await.unwrap();
+	let file = upload_to(&cache.client, parent.uuid(), name, data).await;
 	assert!(
 		poll_for_item(cache.db_path(), file.uuid(), CACHE_CONVERGE_TIMEOUT).await,
 		"the cache never observed the remote file {name}"

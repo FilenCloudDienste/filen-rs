@@ -83,38 +83,13 @@ async fn list_remote(
 	Vec<filen_sdk_rs::fs::dir::RemoteDirectory>,
 	Vec<filen_sdk_rs::fs::file::RemoteFile>,
 ) {
-	resources
-		.client
-		.list_dir(
-			&DirType::<Normal>::Dir(std::borrow::Cow::Borrowed(&resources.dir)),
-			None::<&fn(u64, Option<u64>)>,
-		)
-		.await
-		.unwrap()
-}
-
-/// List (dirs, files) directly under an arbitrary remote dir.
-async fn list_dir(
-	client: &filen_sdk_rs::auth::Client,
-	dir: &filen_sdk_rs::fs::dir::RemoteDirectory,
-) -> (
-	Vec<filen_sdk_rs::fs::dir::RemoteDirectory>,
-	Vec<filen_sdk_rs::fs::file::RemoteFile>,
-) {
-	client
-		.list_dir(
-			&DirType::<Normal>::Dir(std::borrow::Cow::Borrowed(dir)),
-			None::<&fn(u64, Option<u64>)>,
-		)
-		.await
-		.unwrap()
+	list_dir(&resources.client, &resources.dir).await
 }
 
 /// Upload `data` as `name` directly under `parent` and wait until `cache` observes it, so a pass
 /// run afterwards reconciles against a remote view that already contains it.
 async fn seed_remote_file(cache: &TestCache, parent: Uuid, name: &str, data: &[u8]) -> Uuid {
-	let builder = cache.client.make_file_builder(name, parent).unwrap();
-	let file = cache.client.upload_file(builder, data).await.unwrap();
+	let file = upload_to(&cache.client, parent, name, data).await;
 	assert!(
 		poll_for_item(cache.db_path(), file.uuid(), CACHE_CONVERGE_TIMEOUT).await,
 		"cache never observed the seeded remote file {name}"

@@ -30,10 +30,8 @@
 //! whose names are VALID (so injectable through the conforming `Client`): case-only renames,
 //! NFC/NFD normalization equivalence, dotfiles, mixed-script/emoji round-trips, file/dir type
 //! collisions, the quarantine-bin exclusion, and local-origin quirky-but-legal names.
-use std::borrow::Cow;
-
 use filen_macros::shared_test_runtime;
-use filen_sdk_rs::fs::categories::{DirType, Normal};
+use filen_sdk_rs::fs::dir::RemoteDirectory;
 use filen_sdk_rs::fs::file::RemoteFile;
 use filen_sdk_rs::fs::file::meta::FileMetaChanges;
 use filen_sdk_rs::fs::{HasName, HasUUID};
@@ -50,54 +48,14 @@ use crate::helpers::*;
 // Local helpers (public-API only; remote ground-truth via the cache's client).
 // ---------------------------------------------------------------------------
 
-/// List the (dirs, files) directly under the single-client's remote root (ground truth).
-async fn list_root(
-	sc: &SingleClient,
-) -> (Vec<filen_sdk_rs::fs::dir::RemoteDirectory>, Vec<RemoteFile>) {
-	sc.cache
-		.client
-		.list_dir(
-			&DirType::<Normal>::Dir(Cow::Borrowed(&sc.resources.dir)),
-			None::<&fn(u64, Option<u64>)>,
-		)
-		.await
-		.unwrap()
+/// List the (dirs, files) directly under the remote root through the cache's client (ground truth).
+async fn list_root(sc: &SingleClient) -> (Vec<RemoteDirectory>, Vec<RemoteFile>) {
+	list_dir(&sc.cache.client, &sc.resources.dir).await
 }
 
-/// List the (dirs, files) directly under a remote subdir (ground truth).
-async fn list_dir(
-	sc: &SingleClient,
-	dir: &filen_sdk_rs::fs::dir::RemoteDirectory,
-) -> (Vec<filen_sdk_rs::fs::dir::RemoteDirectory>, Vec<RemoteFile>) {
-	sc.cache
-		.client
-		.list_dir(
-			&DirType::<Normal>::Dir(Cow::Borrowed(dir)),
-			None::<&fn(u64, Option<u64>)>,
-		)
-		.await
-		.unwrap()
-}
-
-fn find_file<'a>(files: &'a [RemoteFile], name: &str) -> Option<&'a RemoteFile> {
-	files.iter().find(|f| f.name() == Some(name))
-}
-
-fn find_dir<'a>(
-	dirs: &'a [filen_sdk_rs::fs::dir::RemoteDirectory],
-	name: &str,
-) -> Option<&'a filen_sdk_rs::fs::dir::RemoteDirectory> {
-	dirs.iter().find(|d| d.name() == Some(name))
-}
-
-/// Upload a file with exact bytes directly to the single-client's remote root, return the file.
+/// Upload `data` as `name` directly under the remote root through the cache's client.
 async fn upload_root(sc: &SingleClient, name: &str, data: &[u8]) -> RemoteFile {
-	let builder = sc
-		.cache
-		.client
-		.make_file_builder(name, sc.resources.dir.uuid())
-		.unwrap();
-	sc.cache.client.upload_file(builder, data).await.unwrap()
+	upload_to(&sc.cache.client, sc.resources.dir.uuid(), name, data).await
 }
 
 // ===========================================================================
@@ -265,7 +223,7 @@ async fn path_15_dotfiles_synced_as_content() {
 	assert!(find_file(&files, ".env").is_some(), "dotfile not uploaded");
 	assert!(find_file(&files, "visible.txt").is_some());
 	let hidden = find_dir(&dirs, ".hidden").expect(".hidden dir missing on remote");
-	let (_hd, hfiles) = list_dir(&sc, hidden).await;
+	let (_hd, hfiles) = list_dir(&sc.cache.client, hidden).await;
 	assert!(
 		find_file(&hfiles, "inner.txt").is_some(),
 		"dot-dir child missing"
@@ -717,7 +675,7 @@ async fn path_add_remote_invalid_local_names_reported_once_not_retried() {
 	assert!(find_file(&files, "CON.txt").is_some(), "{files:?}");
 	let fine = find_dir(&dirs, "fine").expect("fine/ missing");
 	assert!(
-		find_file(&list_dir(&sc, fine).await.1, "inner.txt").is_some(),
+		find_file(&list_dir(&sc.cache.client, fine).await.1, "inner.txt").is_some(),
 		"the previously-skipped subtree now syncs"
 	);
 
@@ -762,7 +720,7 @@ async fn path_add_rename_into_an_invalid_name_never_trashes_the_remote_copy() {
 	);
 	let docs = find_dir(&dirs, "docs").expect("the remote directory was trashed");
 	assert!(
-		find_file(&list_dir(&sc, docs).await.1, "a.txt").is_some(),
+		find_file(&list_dir(&sc.cache.client, docs).await.1, "a.txt").is_some(),
 		"the remote subtree of a locally-renamed directory must survive"
 	);
 
@@ -966,7 +924,7 @@ async fn path_11_case_colliding_remote_siblings() {
 
 	for dir in [&upper, &lower] {
 		let name = dir.name().unwrap();
-		let (_d, files) = list_dir(&sc, dir).await;
+		let (_d, files) = list_dir(&sc.cache.client, dir).await;
 		let notes = find_file(&files, "notes.txt")
 			.unwrap_or_else(|| panic!("{name}/notes.txt lost on the remote"));
 		assert_eq!(notes.size, name.len() as u64, "{name}/notes.txt changed");
@@ -1011,7 +969,7 @@ async fn path_17_control_dir_excluded_and_name_collision_safe() {}
 #[shared_test_runtime]
 async fn path_19_dot_and_dotdot_literal_entries() {
 	let sc = single_client(SyncMode::RemoteToLocal).await;
-	let root = DirType::<Normal>::Dir(Cow::Borrowed(&sc.resources.dir));
+	let root = sc.root_dirtype();
 	let mut hostile = Vec::new();
 	for name in [".", ".."] {
 		// Metadata encrypted like any client's: it DECODES, to a name no conforming client writes.

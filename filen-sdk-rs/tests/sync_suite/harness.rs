@@ -9,12 +9,19 @@
 //! its own fresh remote dir (auto-cleaned) so they stay account-size-independent.
 
 use std::{
+	borrow::Cow,
 	collections::BTreeMap,
 	path::{Path, PathBuf},
 	time::Duration,
 };
 
-use filen_sdk_rs::fs::HasUUID;
+use filen_sdk_rs::auth::Client;
+use filen_sdk_rs::fs::{
+	HasUUID,
+	categories::{DirType, Normal},
+	dir::RemoteDirectory,
+	file::RemoteFile,
+};
 use filen_sdk_rs::sync_engine::{
 	PairId, PlanOutcome, SyncEngine, SyncEvent, SyncMode, SyncReport, WatchHandle,
 };
@@ -184,6 +191,28 @@ pub fn describe_watches(sides: &[(&str, &WatchHandle, &Path)]) -> String {
 		.join("\n")
 }
 
+/// List the (dirs, files) directly under the remote directory `dir` through `client` (ground
+/// truth).
+pub async fn list_dir(
+	client: &Client,
+	dir: &RemoteDirectory,
+) -> (Vec<RemoteDirectory>, Vec<RemoteFile>) {
+	client
+		.list_dir(
+			&DirType::<Normal>::Dir(Cow::Borrowed(dir)),
+			None::<&fn(u64, Option<u64>)>,
+		)
+		.await
+		.unwrap()
+}
+
+/// Upload `data` as `name` directly under the remote directory `parent` through `client`,
+/// returning the created file.
+pub async fn upload_to(client: &Client, parent: Uuid, name: &str, data: &[u8]) -> RemoteFile {
+	let builder = client.make_file_builder(name, parent).unwrap();
+	client.upload_file(builder, data).await.unwrap()
+}
+
 /// A single-client sync setup: one engine on its own derived cache, a fresh local dir, and a fresh
 /// auto-cleaned remote dir already converged into the cache.
 pub struct SingleClient {
@@ -203,6 +232,29 @@ impl SingleClient {
 
 	pub fn cleanup(&self) {
 		std::fs::remove_dir_all(&self.local).ok();
+	}
+
+	/// The pair's remote root as a `DirType`, for the client's list and create calls.
+	pub fn root_dirtype(&self) -> DirType<'_, Normal> {
+		DirType::Dir(Cow::Borrowed(&self.resources.dir))
+	}
+
+	/// Upload `data` as `name` directly under the remote root through the resources' client (the
+	/// base client whose writes the derived cache observes).
+	pub async fn upload_root(&self, name: &str, data: &[u8]) -> RemoteFile {
+		let parent = self.resources.dir.uuid();
+		upload_to(&self.resources.client, parent, name, data).await
+	}
+
+	/// List the (dirs, files) directly under the remote root through the resources' client.
+	pub async fn list_root(&self) -> (Vec<RemoteDirectory>, Vec<RemoteFile>) {
+		list_dir(&self.resources.client, &self.resources.dir).await
+	}
+
+	/// List the (dirs, files) directly under the remote directory `dir` through the resources'
+	/// client.
+	pub async fn list_dir(&self, dir: &RemoteDirectory) -> (Vec<RemoteDirectory>, Vec<RemoteFile>) {
+		list_dir(&self.resources.client, dir).await
 	}
 }
 
@@ -264,9 +316,7 @@ pub async fn stage_case_colliding_dirs(
 	filen_sdk_rs::fs::dir::RemoteDirectory,
 ) {
 	let client = &sc.cache.client;
-	let root = filen_sdk_rs::fs::categories::DirType::<filen_sdk_rs::fs::categories::Normal>::Dir(
-		std::borrow::Cow::Borrowed(&sc.resources.dir),
-	);
+	let root = sc.root_dirtype();
 	let upper_dir = client.create_dir(&root, upper).await.unwrap();
 	let bypass = client.hash_name(&format!("{lower}-case-collision-bypass"));
 	let lower_dir = client
@@ -311,9 +361,7 @@ pub async fn stage_named_dirs(sc: &SingleClient, names: &[&str]) -> Vec<Uuid> {
 	use filen_sdk_rs::crypto::shared::MetaCrypter;
 
 	let client = &sc.resources.client;
-	let root = filen_sdk_rs::fs::categories::DirType::<filen_sdk_rs::fs::categories::Normal>::Dir(
-		std::borrow::Cow::Borrowed(&sc.resources.dir),
-	);
+	let root = sc.root_dirtype();
 	let mut uuids = Vec::with_capacity(names.len());
 	for name in names {
 		let json = serde_json::json!({ "name": name }).to_string();
@@ -399,6 +447,18 @@ impl TwoClients {
 	pub fn cleanup(&self) {
 		std::fs::remove_dir_all(&self.local_a).ok();
 		std::fs::remove_dir_all(&self.local_b).ok();
+	}
+
+	/// Upload `data` as `name` directly under the shared remote root through the resources' client
+	/// (the ground-truth writer neither stack owns).
+	pub async fn upload_root(&self, name: &str, data: &[u8]) -> RemoteFile {
+		let parent = self.resources.dir.uuid();
+		upload_to(&self.resources.client, parent, name, data).await
+	}
+
+	/// List the (dirs, files) directly under the shared remote root through the resources' client.
+	pub async fn list_root(&self) -> (Vec<RemoteDirectory>, Vec<RemoteFile>) {
+		list_dir(&self.resources.client, &self.resources.dir).await
 	}
 }
 

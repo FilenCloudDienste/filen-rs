@@ -7,7 +7,6 @@
 //! (fault injection, watcher/notification suppression, a real process restart, or scheduler
 //! introspection) it is left as an `#[ignore]`d stub describing the plan.
 use std::{
-	borrow::Cow,
 	sync::{
 		Arc, Mutex,
 		atomic::{AtomicUsize, Ordering},
@@ -18,12 +17,7 @@ use std::{
 use filen_macros::shared_test_runtime;
 use filen_sdk_rs::{
 	cache::{CacheMessage, ResyncProgress},
-	fs::{
-		HasName, HasUUID,
-		categories::{DirType, Normal},
-		dir::RemoteDirectory,
-		file::RemoteFile,
-	},
+	fs::{HasUUID, dir::RemoteDirectory, file::RemoteFile},
 	sync_engine::{
 		FullPassReason, IgnoreLevel, IgnoredPath, PauseMode, PauseOptions, SyncEngine, SyncEvent,
 		SyncMode, SyncReport, WatchConfig, WatchState,
@@ -39,36 +33,14 @@ use crate::helpers::*;
 // Local remote-setup / verification helpers (PUBLIC API only).
 // ----------------------------------------------------------------------------
 
-/// The remote sync-root `DirType` for a single-client setup.
-fn sc_root(sc: &SingleClient) -> DirType<'_, Normal> {
-	DirType::<Normal>::Dir(Cow::Borrowed(&sc.resources.dir))
-}
-
-/// Upload a file with exact bytes directly under the remote root, returning the created file.
+/// Upload `data` as `name` directly under the remote root through the cache's client.
 async fn upload_remote(sc: &SingleClient, name: &str, data: &[u8]) -> RemoteFile {
-	let builder = sc
-		.cache
-		.client
-		.make_file_builder(name, sc.resources.dir.uuid())
-		.unwrap();
-	sc.cache.client.upload_file(builder, data).await.unwrap()
+	upload_to(&sc.cache.client, sc.resources.dir.uuid(), name, data).await
 }
 
-/// List the (dirs, files) directly under the remote root (ground truth, via the client).
+/// List the (dirs, files) directly under the remote root through the cache's client (ground truth).
 async fn list_remote_root(sc: &SingleClient) -> (Vec<RemoteDirectory>, Vec<RemoteFile>) {
-	sc.cache
-		.client
-		.list_dir(&sc_root(sc), None::<&fn(u64, Option<u64>)>)
-		.await
-		.unwrap()
-}
-
-fn find_file<'a>(files: &'a [RemoteFile], name: &str) -> Option<&'a RemoteFile> {
-	files.iter().find(|f| f.name() == Some(name))
-}
-
-fn find_dir<'a>(dirs: &'a [RemoteDirectory], name: &str) -> Option<&'a RemoteDirectory> {
-	dirs.iter().find(|d| d.name() == Some(name))
+	list_dir(&sc.cache.client, &sc.resources.dir).await
 }
 
 /// How many cache convergence resyncs have STARTED so far. A resync relists a whole root under the
@@ -496,15 +468,7 @@ async fn watch_08_rename_storm_converges() {
 	while std::time::Instant::now() < deadline {
 		let (dirs, root_files) = list_remote_root(&sc).await;
 		if let Some(dir2) = find_dir(&dirs, "dir2") {
-			let (_sd, files) = sc
-				.cache
-				.client
-				.list_dir(
-					&DirType::<Normal>::Dir(Cow::Borrowed(dir2)),
-					None::<&fn(u64, Option<u64>)>,
-				)
-				.await
-				.unwrap();
+			let (_sd, files) = list_dir(&sc.cache.client, dir2).await;
 			final_count = files.len();
 			let renamed_ok =
 				(0..(N / 2)).all(|i| find_file(&files, &format!("renamed_{i:02}.txt")).is_some());

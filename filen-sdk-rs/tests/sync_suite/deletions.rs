@@ -1,13 +1,8 @@
 //! Deletions & safety guards tests (`DELETE-*`) for the two-way sync engine.
-use std::{borrow::Cow, path::Path, time::Duration};
+use std::{path::Path, time::Duration};
 
 use filen_macros::shared_test_runtime;
-use filen_sdk_rs::fs::{
-	HasName, HasParent, HasUUID,
-	categories::{DirType, Normal},
-	dir::RemoteDirectory,
-	file::RemoteFile,
-};
+use filen_sdk_rs::fs::{HasName, HasParent, HasUUID};
 use filen_sdk_rs::sync_engine::{
 	DeleteGuard, FullPassReason, GuardReason, SyncEngine, SyncEvent, SyncMode,
 };
@@ -24,53 +19,6 @@ use crate::helpers::*;
 // writes the derived `sc.cache` observes), and cache-convergence polling uses
 // `sc.cache.db_path()` / `sc.cache.messages`, exactly like the existing blackbox tests.
 // ----------------------------------------------------------------------------
-
-fn root_dirtype(sc: &SingleClient) -> DirType<'_, Normal> {
-	DirType::<Normal>::Dir(Cow::Borrowed(&sc.resources.dir))
-}
-
-async fn upload_root(sc: &SingleClient, name: &str, data: &[u8]) -> RemoteFile {
-	let builder = sc
-		.resources
-		.client
-		.make_file_builder(name, sc.resources.dir.uuid())
-		.unwrap();
-	sc.resources
-		.client
-		.upload_file(builder, data)
-		.await
-		.unwrap()
-}
-
-async fn list_root(sc: &SingleClient) -> (Vec<RemoteDirectory>, Vec<RemoteFile>) {
-	sc.resources
-		.client
-		.list_dir(&root_dirtype(sc), None::<&fn(u64, Option<u64>)>)
-		.await
-		.unwrap()
-}
-
-async fn list_dir(
-	sc: &SingleClient,
-	dir: &RemoteDirectory,
-) -> (Vec<RemoteDirectory>, Vec<RemoteFile>) {
-	sc.resources
-		.client
-		.list_dir(
-			&DirType::<Normal>::Dir(Cow::Borrowed(dir)),
-			None::<&fn(u64, Option<u64>)>,
-		)
-		.await
-		.unwrap()
-}
-
-fn find_file<'a>(files: &'a [RemoteFile], name: &str) -> Option<&'a RemoteFile> {
-	files.iter().find(|f| f.name() == Some(name))
-}
-
-fn find_dir<'a>(dirs: &'a [RemoteDirectory], name: &str) -> Option<&'a RemoteDirectory> {
-	dirs.iter().find(|d| d.name() == Some(name))
-}
 
 /// Wait until the cache (the engine's remote view) has observed `uuid`.
 async fn cache_sees(sc: &SingleClient, uuid: Uuid) {
@@ -151,7 +99,7 @@ async fn delete_01_single_local_file_deletion_propagates() {
 	assert_eq!(r1.uploaded, 2, "{r1:?}");
 
 	// Remote has note.txt with the right content.
-	let (_d, files0) = list_root(&sc).await;
+	let (_d, files0) = sc.list_root().await;
 	let note = find_file(&files0, "note.txt").expect("note.txt missing on remote");
 	assert_eq!(note.size, b"hello-1".len() as u64, "{note:?}");
 
@@ -163,7 +111,7 @@ async fn delete_01_single_local_file_deletion_propagates() {
 	assert_eq!(r2.conflicts.len(), 0, "{r2:?}");
 	assert_eq!(r2.uploaded, 0, "no re-upload of survivor: {r2:?}");
 
-	let (_d, files1) = list_root(&sc).await;
+	let (_d, files1) = sc.list_root().await;
 	assert!(
 		find_file(&files1, "note.txt").is_none(),
 		"note.txt survived"
@@ -182,9 +130,9 @@ async fn delete_01_single_local_file_deletion_propagates() {
 async fn delete_02_single_remote_file_deletion_propagates() {
 	let sc = single_client(SyncMode::RemoteToLocal).await;
 	let payload: Vec<u8> = (0u8..200).collect();
-	let rf = upload_root(&sc, "report.pdf", &payload).await;
+	let rf = sc.upload_root("report.pdf", &payload).await;
 	let mut gone = rf;
-	let keep = upload_root(&sc, "keep.txt", b"keep").await;
+	let keep = sc.upload_root("keep.txt", b"keep").await;
 	cache_sees(&sc, gone.uuid()).await;
 	cache_sees(&sc, keep.uuid()).await;
 
@@ -227,11 +175,11 @@ async fn delete_03_nonempty_directory_subtree_removed() {
 	assert!(r1.errors.is_empty(), "{r1:?}");
 	assert_eq!(r1.uploaded, 4, "{r1:?}");
 	assert_eq!(r1.remote_dirs_created, 2, "docs + docs/sub: {r1:?}");
-	let (dirs, _) = list_root(&sc).await;
+	let (dirs, _) = sc.list_root().await;
 	let docs = find_dir(&dirs, "docs").expect("docs/ missing on remote");
-	let (sub_dirs, docs_files) = list_dir(&sc, docs).await;
+	let (sub_dirs, docs_files) = sc.list_dir(docs).await;
 	let sub = find_dir(&sub_dirs, "sub").expect("docs/sub missing on remote");
-	let (_, sub_files) = list_dir(&sc, sub).await;
+	let (_, sub_files) = sc.list_dir(sub).await;
 	let under_docs: Vec<Uuid> = docs_files
 		.iter()
 		.map(HasUUID::uuid)
@@ -280,7 +228,7 @@ async fn delete_03_nonempty_directory_subtree_removed() {
 		"items under docs/ were trashed one by one: {loose:?}"
 	);
 
-	let (dirs, files) = list_root(&sc).await;
+	let (dirs, files) = sc.list_root().await;
 	assert!(find_dir(&dirs, "docs").is_none(), "docs/ survived");
 	assert!(
 		find_file(&files, "outside.txt").is_some(),
@@ -324,7 +272,7 @@ async fn delete_04_mass_delete_guard_holds_large_fraction() {
 	assert_eq!(r2.remotely_trashed, 0, "no partial deletion: {r2:?}");
 
 	// All 100 still on the remote, byte-exact.
-	let (_d, files) = list_root(&sc).await;
+	let (_d, files) = sc.list_root().await;
 	assert_eq!(
 		files.len(),
 		TOTAL,
@@ -391,7 +339,7 @@ async fn delete_05_mass_delete_guard_applies_after_confirmation() {
 	assert_eq!(r3.held_deletions(), 0, "nothing still held: {r3:?}");
 
 	// Exactly the 10 survivors remain, byte-exact.
-	let (_d, files) = list_root(&sc).await;
+	let (_d, files) = sc.list_root().await;
 	assert_eq!(files.len(), TOTAL - DELETE, "wrong survivor count");
 	for i in DELETE..TOTAL {
 		let f = find_file(&files, &format!("file{i:03}.txt")).expect("survivor vanished");
@@ -499,7 +447,7 @@ async fn delete_05b_configured_threshold_decides_the_same_batch() {
 	assert_eq!(r4.held_deletions(), 0, "{r4:?}");
 	assert!(r4.guard.is_none(), "{r4:?}");
 
-	let (_d, files) = list_root(&sc).await;
+	let (_d, files) = sc.list_root().await;
 	assert_eq!(files.len(), TOTAL - 6, "{} survivors", files.len());
 
 	sc.cleanup();
@@ -535,7 +483,7 @@ async fn delete_06_small_fraction_applies_without_confirmation() {
 	assert_eq!(r2.held_deletions(), 0, "no confirmation held: {r2:?}");
 	assert!(r2.guard.is_none(), "no guard message: {r2:?}");
 
-	let (_d, files) = list_root(&sc).await;
+	let (_d, files) = sc.list_root().await;
 	assert_eq!(files.len(), TOTAL - 3, "97 should remain: {}", files.len());
 	for i in 3..TOTAL {
 		let f = find_file(&files, &format!("file{i:03}.txt")).expect("survivor vanished");
@@ -553,12 +501,12 @@ async fn delete_06_small_fraction_applies_without_confirmation() {
 async fn delete_07_first_sync_empty_local_does_not_wipe_remote() {
 	let sc = single_client(SyncMode::LocalToRemote).await;
 	// Populate the remote BEFORE the first pass; local stays empty.
-	let x = upload_root(&sc, "x.txt", b"X").await;
-	let y = upload_root(&sc, "y.txt", b"Y").await;
+	let x = sc.upload_root("x.txt", b"X").await;
+	let y = sc.upload_root("y.txt", b"Y").await;
 	let z = sc
 		.resources
 		.client
-		.create_dir(&root_dirtype(&sc), "z")
+		.create_dir(&sc.root_dirtype(), "z")
 		.await
 		.unwrap();
 	let wb = sc
@@ -582,11 +530,11 @@ async fn delete_07_first_sync_empty_local_does_not_wipe_remote() {
 	assert_eq!(r1.held_deletions(), 4, "{r1:?}");
 
 	// Remote still fully populated, byte-exact.
-	let (dirs, files) = list_root(&sc).await;
+	let (dirs, files) = sc.list_root().await;
 	assert!(find_file(&files, "x.txt").is_some(), "x.txt wiped");
 	assert!(find_file(&files, "y.txt").is_some(), "y.txt wiped");
 	let zd = find_dir(&dirs, "z").expect("z/ wiped");
-	let (_zd, zf) = list_dir(&sc, zd).await;
+	let (_zd, zf) = sc.list_dir(zd).await;
 	let wf = find_file(&zf, "w.txt").expect("z/w.txt wiped");
 	assert_eq!(wf.size, 1, "{wf:?}");
 
@@ -630,7 +578,7 @@ async fn delete_08_first_sync_empty_remote_does_not_wipe_local() {
 async fn delete_09_mirrored_remote_delete_quarantines_local_copy() {
 	let sc = single_client(SyncMode::RemoteToLocal).await;
 	let content = b"precious-keep-dat-bytes";
-	let mut keep = upload_root(&sc, "keep.dat", content).await;
+	let mut keep = sc.upload_root("keep.dat", content).await;
 	cache_sees(&sc, keep.uuid()).await;
 
 	let r1 = sc.sync().await;
@@ -663,7 +611,7 @@ async fn delete_09_mirrored_remote_delete_quarantines_local_copy() {
 async fn delete_10_restore_quarantined_file_reuploads() {
 	let sc = single_client(SyncMode::TwoWay).await;
 	let content = b"restore-me-bytes";
-	let mut keep = upload_root(&sc, "keep.dat", content).await;
+	let mut keep = sc.upload_root("keep.dat", content).await;
 	cache_sees(&sc, keep.uuid()).await;
 
 	let r1 = sc.sync().await;
@@ -693,7 +641,7 @@ async fn delete_10_restore_quarantined_file_reuploads() {
 		"restored content lost"
 	);
 
-	let (_d, files) = list_root(&sc).await;
+	let (_d, files) = sc.list_root().await;
 	let f = find_file(&files, "keep.dat").expect("keep.dat not re-created on remote");
 	assert_eq!(f.size, content.len() as u64, "{f:?}");
 
@@ -722,7 +670,7 @@ async fn delete_11_delete_then_recreate_is_new_file() {
 	assert_eq!(r3.remotely_trashed, 0, "no leftover delete: {r3:?}");
 	assert_eq!(r3.conflicts.len(), 0, "{r3:?}");
 
-	let (_d, files) = list_root(&sc).await;
+	let (_d, files) = sc.list_root().await;
 	let f = find_file(&files, "v.txt").expect("v.txt missing");
 	assert_eq!(
 		f.size,
@@ -746,7 +694,7 @@ async fn delete_12_local_backup_does_not_mirror_local_delete() {
 	let r1 = sc.sync().await;
 	assert_eq!(r1.uploaded, 1, "{r1:?}");
 
-	let (_d, files0) = list_root(&sc).await;
+	let (_d, files0) = sc.list_root().await;
 	assert_eq!(
 		find_file(&files0, "archived.log").map(|f| f.size),
 		Some(content.len() as u64)
@@ -765,7 +713,7 @@ async fn delete_12_local_backup_does_not_mirror_local_delete() {
 		"backup must not resurrect locally: {r2:?}"
 	);
 
-	let (_d, files1) = list_root(&sc).await;
+	let (_d, files1) = sc.list_root().await;
 	let f = find_file(&files1, "archived.log").expect("backup lost the file");
 	assert_eq!(f.size, content.len() as u64, "{f:?}");
 	assert!(
@@ -784,7 +732,7 @@ async fn delete_12_local_backup_does_not_mirror_local_delete() {
 async fn delete_13_remote_backup_does_not_mirror_remote_delete() {
 	let sc = single_client(SyncMode::RemoteBackup).await;
 	let content = b"snapshot-bin-bytes";
-	let mut snap = upload_root(&sc, "snapshot.bin", content).await;
+	let mut snap = sc.upload_root("snapshot.bin", content).await;
 	cache_sees(&sc, snap.uuid()).await;
 
 	let r1 = sc.sync().await;
@@ -807,7 +755,7 @@ async fn delete_13_remote_backup_does_not_mirror_remote_delete() {
 		"local archive copy lost"
 	);
 
-	let (_d, files) = list_root(&sc).await;
+	let (_d, files) = sc.list_root().await;
 	assert!(
 		find_file(&files, "snapshot.bin").is_none(),
 		"remote should stay deleted"
@@ -961,9 +909,9 @@ async fn delete_17_partial_child_deletion_keeps_siblings_and_dir() {
 	assert_eq!(r2.remotely_trashed, 1, "exactly one delete: {r2:?}");
 	assert_eq!(r2.conflicts.len(), 0, "{r2:?}");
 
-	let (dirs, _f) = list_root(&sc).await;
+	let (dirs, _f) = sc.list_root().await;
 	let mixed = find_dir(&dirs, "mixed").expect("mixed/ removed");
-	let (_d, mfiles) = list_dir(&sc, mixed).await;
+	let (_d, mfiles) = sc.list_dir(mixed).await;
 	assert!(find_file(&mfiles, "f1.txt").is_some(), "f1 lost");
 	assert!(find_file(&mfiles, "f3.txt").is_some(), "f3 lost");
 	assert!(find_file(&mfiles, "f2.txt").is_none(), "f2 survived");
@@ -1004,7 +952,7 @@ async fn delete_18_baselined_full_delete_is_mirrored() {
 		"not the first-sync protected case: {r2:?}"
 	);
 
-	let (dirs, files) = list_root(&sc).await;
+	let (dirs, files) = sc.list_root().await;
 	assert!(files.is_empty(), "remote should be empty: {files:?}");
 	assert!(dirs.is_empty(), "{dirs:?}");
 
@@ -1054,7 +1002,7 @@ async fn delete_19_watch_single_delete_propagates_once_no_loop() {
 	let mut gone = false;
 	let deadline = std::time::Instant::now() + CACHE_CONVERGE_TIMEOUT;
 	while std::time::Instant::now() < deadline {
-		let (_d, files) = list_root(&sc).await;
+		let (_d, files) = sc.list_root().await;
 		if find_file(&files, "w.txt").is_none() {
 			gone = true;
 			break;
@@ -1066,7 +1014,7 @@ async fn delete_19_watch_single_delete_propagates_once_no_loop() {
 	// Let at least one safety-net pass run; the remote must STAY empty (the engine's own
 	// delete write must not echo into a resync loop that re-acts).
 	tokio::time::sleep(Duration::from_secs(8)).await;
-	let (_d, files) = list_root(&sc).await;
+	let (_d, files) = sc.list_root().await;
 	assert!(
 		find_file(&files, "w.txt").is_none(),
 		"w.txt resurrected by a loop"
@@ -1174,7 +1122,7 @@ async fn delete_22_one_way_ignores_non_authoritative_remote_delete() {
 	assert_eq!(r1.uploaded, 1, "{r1:?}");
 
 	// Find the uuid the engine created, then trash it remotely (the non-authoritative side).
-	let (_d, files0) = list_root(&sc).await;
+	let (_d, files0) = sc.list_root().await;
 	let mut peer = find_file(&files0, "peer.txt")
 		.expect("peer.txt missing")
 		.clone();
@@ -1197,7 +1145,7 @@ async fn delete_22_one_way_ignores_non_authoritative_remote_delete() {
 	let mut present = false;
 	let deadline = std::time::Instant::now() + CACHE_CONVERGE_TIMEOUT;
 	while std::time::Instant::now() < deadline {
-		let (_d, files) = list_root(&sc).await;
+		let (_d, files) = sc.list_root().await;
 		if find_file(&files, "peer.txt").is_some() {
 			present = true;
 			break;
@@ -1232,7 +1180,7 @@ async fn delete_23_dir_replaced_by_file_same_name() {
 	assert!(r2.errors.is_empty(), "{r2:?}");
 	assert_eq!(r2.conflicts.len(), 0, "clean local type-change: {r2:?}");
 
-	let (dirs, files) = list_root(&sc).await;
+	let (dirs, files) = sc.list_root().await;
 	assert!(find_dir(&dirs, "item").is_none(), "old item/ dir survived");
 	let f = find_file(&files, "item").expect("item file missing on remote");
 	assert_eq!(f.size, b"now-a-file".len() as u64, "{f:?}");
@@ -1272,7 +1220,7 @@ async fn delete_24_post_deletion_passes_are_stable_noops() {
 		assert_eq!(r.held_deletions(), 0, "{label}: {r:?}");
 	}
 
-	let (_d, files) = list_root(&sc).await;
+	let (_d, files) = sc.list_root().await;
 	assert_eq!(files.len(), 1, "{files:?}");
 	assert!(find_file(&files, "stay.txt").is_some());
 
@@ -1310,7 +1258,7 @@ async fn delete_25_guard_does_not_block_mass_creations() {
 	assert!(r1.guard.is_none(), "{r1:?}");
 	assert_eq!(r1.remotely_trashed, 0, "{r1:?}");
 
-	let (_d, files) = list_root(&sc).await;
+	let (_d, files) = sc.list_root().await;
 	assert_eq!(files.len(), N, "{} files on remote", files.len());
 	for i in 0..N {
 		let f = find_file(&files, &format!("c{i:03}.txt")).expect("creation missing");
@@ -1346,7 +1294,7 @@ async fn delete_26_more_topmost_trashes_than_a_chunk() {
 	let r1 = sc.sync().await;
 	assert!(r1.errors.is_empty(), "{r1:?}");
 	assert_eq!(r1.uploaded, FILES + 2 * GONE.len(), "{r1:?}");
-	let (dirs, _) = list_root(&sc).await;
+	let (dirs, _) = sc.list_root().await;
 	let keep = find_dir(&dirs, "keep").expect("keep was created").uuid();
 	let gone: Vec<Uuid> = GONE
 		.iter()
@@ -1386,14 +1334,14 @@ async fn delete_26_more_topmost_trashes_than_a_chunk() {
 	assert_eq!(r3.remotely_trashed, FILES + GONE.len(), "{r3:?}");
 	assert_eq!(r3.held_deletions(), 0, "{r3:?}");
 
-	let (dirs, files) = list_root(&sc).await;
+	let (dirs, files) = sc.list_root().await;
 	assert_eq!(
 		dirs.iter().map(|dir| dir.uuid()).collect::<Vec<_>>(),
 		[keep],
 		"only the surviving dir is left"
 	);
 	assert!(files.is_empty(), "{files:?}");
-	let (sub_dirs, sub_files) = list_dir(&sc, &dirs[0]).await;
+	let (sub_dirs, sub_files) = sc.list_dir(&dirs[0]).await;
 	assert!(
 		sub_dirs.is_empty() && sub_files.is_empty(),
 		"{sub_dirs:?} {sub_files:?}"
@@ -1449,7 +1397,7 @@ async fn delete_a1_empty_directory_removal_propagates() {
 	assert!(r1.errors.is_empty(), "{r1:?}");
 	assert_eq!(r1.remote_dirs_created, 1, "{r1:?}");
 
-	let (dirs0, _f) = list_root(&sc).await;
+	let (dirs0, _f) = sc.list_root().await;
 	assert!(
 		find_dir(&dirs0, "empty_dir").is_some(),
 		"empty_dir not created"
@@ -1464,7 +1412,7 @@ async fn delete_a1_empty_directory_removal_propagates() {
 	);
 	assert_eq!(r2.conflicts.len(), 0, "{r2:?}");
 
-	let (dirs1, files1) = list_root(&sc).await;
+	let (dirs1, files1) = sc.list_root().await;
 	assert!(
 		find_dir(&dirs1, "empty_dir").is_none(),
 		"empty_dir survived"
@@ -1553,7 +1501,7 @@ async fn delete_a3_twoway_guard_fires_on_remote_side_fraction() {
 
 	// Make the 45 deletions genuinely REMOTE-origin for A by trashing them directly on the remote
 	// (via A's cache client), rather than letting B's own guard hold B's local deletes.
-	let (_d, files) = two_clients_list_root(&tc).await;
+	let (_d, files) = tc.list_root().await;
 	let mut deleted = 0usize;
 	for i in 0..DELETE {
 		let name = format!("m{i:02}.txt");
@@ -1601,19 +1549,6 @@ async fn delete_a3_twoway_guard_fires_on_remote_side_fraction() {
 	tc.cleanup();
 }
 
-/// List the (dirs, files) directly under the shared remote root of a `TwoClients`, via the base
-/// client (ground truth).
-async fn two_clients_list_root(tc: &TwoClients) -> (Vec<RemoteDirectory>, Vec<RemoteFile>) {
-	tc.resources
-		.client
-		.list_dir(
-			&DirType::<Normal>::Dir(Cow::Borrowed(&tc.resources.dir)),
-			None::<&fn(u64, Option<u64>)>,
-		)
-		.await
-		.unwrap()
-}
-
 // ============================================================================
 // DELETE-A4 — a move/rename is NOT propagated as delete+create
 // ============================================================================
@@ -1626,7 +1561,7 @@ async fn delete_a4_move_is_not_a_deletion() {
 	let r1 = sc.sync().await;
 	assert_eq!(r1.uploaded, 1, "{r1:?}");
 
-	let (_d, files0) = list_root(&sc).await;
+	let (_d, files0) = sc.list_root().await;
 	let orig_uuid = find_file(&files0, "orig.txt").unwrap().uuid();
 
 	move_file(&sc.local, "orig.txt", "renamed.txt");
@@ -1653,7 +1588,7 @@ async fn delete_a4_move_is_not_a_deletion() {
 		"a move must not quarantine"
 	);
 
-	let (_d, files1) = list_root(&sc).await;
+	let (_d, files1) = sc.list_root().await;
 	assert!(
 		find_file(&files1, "orig.txt").is_none(),
 		"orig.txt survived"
@@ -1675,13 +1610,13 @@ async fn delete_a5_quarantine_name_collision_both_recoverable() {
 	let a_dir = sc
 		.resources
 		.client
-		.create_dir(&root_dirtype(&sc), "a")
+		.create_dir(&sc.root_dirtype(), "a")
 		.await
 		.unwrap();
 	let b_dir = sc
 		.resources
 		.client
-		.create_dir(&root_dirtype(&sc), "b")
+		.create_dir(&sc.root_dirtype(), "b")
 		.await
 		.unwrap();
 	let a1 = b"content-A1-distinct";
@@ -1775,7 +1710,7 @@ async fn delete_a6_held_deletion_does_not_block_creations() {
 		"the 2 creations + 1 modification must still upload while deletions are held: {r2:?}"
 	);
 
-	let (_d, files) = list_root(&sc).await;
+	let (_d, files) = sc.list_root().await;
 	assert!(find_file(&files, "new1.txt").is_some(), "new1 not uploaded");
 	assert!(find_file(&files, "new2.txt").is_some(), "new2 not uploaded");
 	let modf = find_file(&files, "file099.txt").expect("survivor missing");
@@ -1801,8 +1736,8 @@ async fn delete_a6_held_deletion_does_not_block_creations() {
 async fn delete_a7_first_sync_two_populated_trees_no_wipe() {
 	let sc = single_client(SyncMode::TwoWay).await;
 	// Remote pre-populated.
-	let shared_remote = upload_root(&sc, "shared.txt", b"REMOTE-CONTENT").await;
-	let remote_only = upload_root(&sc, "remote_only.txt", b"ROnly").await;
+	let shared_remote = sc.upload_root("shared.txt", b"REMOTE-CONTENT").await;
+	let remote_only = sc.upload_root("remote_only.txt", b"ROnly").await;
 	cache_sees(&sc, shared_remote.uuid()).await;
 	cache_sees(&sc, remote_only.uuid()).await;
 	// Local pre-populated with a divergent shared.txt + a local-only file.
@@ -1821,7 +1756,7 @@ async fn delete_a7_first_sync_two_populated_trees_no_wipe() {
 		read_eq(&sc.local, "local_only.txt", b"LOnly"),
 		"local_only wiped"
 	);
-	let (_d, files) = list_root(&sc).await;
+	let (_d, files) = sc.list_root().await;
 	assert!(
 		find_file(&files, "remote_only.txt").is_some(),
 		"remote_only wiped"
@@ -1902,7 +1837,7 @@ async fn delete_during_a_pass_propagates_on_the_next_one() {
 		0,
 		"the deletion was held rather than propagated: {r3:?}"
 	);
-	let (_dirs, files) = list_root(&sc).await;
+	let (_dirs, files) = sc.list_root().await;
 	assert!(
 		find_file(&files, "gone.txt").is_none(),
 		"gone.txt survived on the remote"
@@ -1992,7 +1927,7 @@ async fn delete_bin_a_first_pass_bins_filen_syncs_trash() {
 	assert!(!sc.local.join(".filen.trash.local").exists());
 	assert!(!sc.local.join("sub").join(".filen.trash.local").exists());
 
-	let (dirs, files) = list_root(&sc).await;
+	let (dirs, files) = sc.list_root().await;
 	assert!(
 		find_dir(&dirs, ".filen.trash.local").is_none(),
 		"filen-sync's trash reached the remote root"
@@ -2002,7 +1937,7 @@ async fn delete_bin_a_first_pass_bins_filen_syncs_trash() {
 		"top.txt was not uploaded"
 	);
 	let sub = find_dir(&dirs, "sub").expect("sub was not uploaded");
-	let (sub_dirs, sub_files) = list_dir(&sc, sub).await;
+	let (sub_dirs, sub_files) = sc.list_dir(sub).await;
 	assert!(
 		find_dir(&sub_dirs, ".filen.trash.local").is_none(),
 		"filen-sync's nested trash reached the remote"
@@ -2065,7 +2000,7 @@ async fn delete_r1_restoring_local_deletions_downloads_them_again() {
 			"f{i}.txt not restored"
 		);
 	}
-	let (_d, files) = list_root(&sc).await;
+	let (_d, files) = sc.list_root().await;
 	assert_eq!(files.len(), TOTAL_R, "the cloud kept every file");
 
 	let r4 = sc.sync().await;
@@ -2083,7 +2018,7 @@ async fn delete_r1_restoring_local_deletions_downloads_them_again() {
 #[shared_test_runtime]
 async fn delete_r2_restoring_cloud_deletions_uploads_them_again() {
 	let sc = held_pair(SyncMode::TwoWay).await;
-	let (_d, files) = list_root(&sc).await;
+	let (_d, files) = sc.list_root().await;
 	for i in 0..DELETE_R {
 		let mut file = find_file(&files, &format!("f{i}.txt"))
 			.expect("synced")
@@ -2105,7 +2040,7 @@ async fn delete_r2_restoring_cloud_deletions_uploads_them_again() {
 	);
 	assert_eq!(r3.locally_deleted, 0, "nothing deleted locally: {r3:?}");
 	assert_eq!(r3.held_deletions(), 0, "{r3:?}");
-	let (_d, files) = list_root(&sc).await;
+	let (_d, files) = sc.list_root().await;
 	assert_eq!(files.len(), TOTAL_R, "{files:?}");
 	for i in 0..TOTAL_R {
 		assert!(read_eq(

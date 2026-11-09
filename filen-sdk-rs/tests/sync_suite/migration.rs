@@ -12,7 +12,6 @@
 //! clean no-op, the persisted baseline is distinguished from an absent one (no first-sync wipe of a
 //! populated side), a genuine post-baseline change is still detected, move/rename identity (uuid)
 //! survives the reopen, and the reopen is idempotent and durable across multiple cold starts.
-use std::borrow::Cow;
 #[cfg(feature = "malformed")]
 use std::{
 	fs::{File, FileTimes},
@@ -26,10 +25,9 @@ use filen_macros::shared_test_runtime;
 #[cfg(feature = "malformed")]
 use filen_sdk_rs::auth::Client;
 use filen_sdk_rs::cache::open_sqlite;
-use filen_sdk_rs::fs::categories::{DirType, Normal};
-use filen_sdk_rs::fs::dir::RemoteDirectory;
+use filen_sdk_rs::fs::HasUUID;
+#[cfg(feature = "malformed")]
 use filen_sdk_rs::fs::file::RemoteFile;
-use filen_sdk_rs::fs::{HasName, HasUUID};
 #[cfg(feature = "malformed")]
 use filen_sdk_rs::sync_engine::{PlannedActionKind, PlannedTransfer};
 use filen_sdk_rs::sync_engine::{SyncEngine, SyncMode, SyncReport};
@@ -43,35 +41,6 @@ use crate::helpers::*;
 // ---------------------------------------------------------------------------
 // Local helpers (public-API only; remote ground-truth via the cache's client).
 // ---------------------------------------------------------------------------
-
-/// List the (dirs, files) directly under a remote dir via `cache`'s client (ground truth).
-async fn list_dir(
-	cache: &TestCache,
-	dir: &RemoteDirectory,
-) -> (Vec<RemoteDirectory>, Vec<RemoteFile>) {
-	cache
-		.client
-		.list_dir(
-			&DirType::<Normal>::Dir(Cow::Borrowed(dir)),
-			None::<&fn(u64, Option<u64>)>,
-		)
-		.await
-		.unwrap()
-}
-
-fn find_file<'a>(files: &'a [RemoteFile], name: &str) -> Option<&'a RemoteFile> {
-	files.iter().find(|f| f.name() == Some(name))
-}
-
-fn find_dir<'a>(dirs: &'a [RemoteDirectory], name: &str) -> Option<&'a RemoteDirectory> {
-	dirs.iter().find(|d| d.name() == Some(name))
-}
-
-/// Upload a file with exact bytes directly to a remote root, returning it.
-async fn upload_to(cache: &TestCache, parent: Uuid, name: &str, data: &[u8]) -> RemoteFile {
-	let builder = cache.client.make_file_builder(name, parent).unwrap();
-	cache.client.upload_file(builder, data).await.unwrap()
-}
 
 /// Wait until `cache` (the engine's remote view) observes `uuid`.
 async fn wait_cache_has(cache: &TestCache, uuid: Uuid) {
@@ -262,7 +231,7 @@ async fn migrate_01_reopened_baseline_first_pass_is_noop() {
 	assert_eq!(r1.uploaded, 3, "{r1:?}");
 
 	// Snapshot remote uuids + sizes (the byte-for-byte unchanged invariant).
-	let (dirs0, files0) = list_dir(&cache, &resources.dir).await;
+	let (dirs0, files0) = list_dir(&cache.client, &resources.dir).await;
 	let pre_count = files0.len();
 	let sub0 = find_dir(&dirs0, "sub").unwrap();
 	let a_uuid = find_file(&files0, "a.txt").unwrap().uuid();
@@ -280,7 +249,7 @@ async fn migrate_01_reopened_baseline_first_pass_is_noop() {
 	assert_noop(&r2);
 
 	// Remote object set + uuids + sizes unchanged; no quarantine bin appeared locally.
-	let (dirs1, files1) = list_dir(&cache, &resources.dir).await;
+	let (dirs1, files1) = list_dir(&cache.client, &resources.dir).await;
 	assert_eq!(files1.len(), pre_count, "remote file count changed: {r2:?}");
 	assert_eq!(
 		find_file(&files1, "a.txt").unwrap().uuid(),
@@ -323,7 +292,7 @@ async fn migrate_02_move_and_rename_detected_after_reopen() {
 	let r1 = engine1.sync_once(pair1).await.unwrap();
 	assert_eq!(r1.uploaded, 2, "{r1:?}");
 
-	let (_d0, files0) = list_dir(&cache, &resources.dir).await;
+	let (_d0, files0) = list_dir(&cache.client, &resources.dir).await;
 	let move_uuid = find_file(&files0, "to_move.txt").unwrap().uuid();
 	let rename_uuid = find_file(&files0, "to_rename.txt").unwrap().uuid();
 	drop(engine1);
@@ -353,7 +322,7 @@ async fn migrate_02_move_and_rename_detected_after_reopen() {
 	assert_eq!(r2.remotely_trashed, 0, "no delete+create: {r2:?}");
 
 	// uuids preserved; no duplicate remote objects.
-	let (dirs1, files1) = list_dir(&cache, &resources.dir).await;
+	let (dirs1, files1) = list_dir(&cache.client, &resources.dir).await;
 	assert!(
 		find_file(&files1, "to_move.txt").is_none(),
 		"old move name lingers"
@@ -361,7 +330,7 @@ async fn migrate_02_move_and_rename_detected_after_reopen() {
 	let renamed = find_file(&files1, "renamed.txt").expect("renamed file missing");
 	assert_eq!(renamed.uuid(), rename_uuid, "rename did not preserve uuid");
 	let moved_dir = find_dir(&dirs1, "moved").expect("moved/ dir missing");
-	let (_md, moved_files) = list_dir(&cache, moved_dir).await;
+	let (_md, moved_files) = list_dir(&cache.client, moved_dir).await;
 	let moved = find_file(&moved_files, "to_move.txt").expect("moved file missing");
 	assert_eq!(moved.uuid(), move_uuid, "move did not preserve uuid");
 
@@ -394,7 +363,7 @@ async fn migrate_03_present_baseline_is_incremental_not_first_sync() {
 		.unwrap();
 	let r1 = engine1.sync_once(pair1).await.unwrap();
 	assert_eq!(r1.uploaded, 2, "{r1:?}");
-	let (_d0, files0) = list_dir(&cache, &resources.dir).await;
+	let (_d0, files0) = list_dir(&cache.client, &resources.dir).await;
 	let pre_count = files0.len();
 	drop(engine1);
 
@@ -408,7 +377,7 @@ async fn migrate_03_present_baseline_is_incremental_not_first_sync() {
 		.unwrap();
 	let r2 = engine2.sync_once(pair2).await.unwrap();
 	assert_noop(&r2);
-	let (_d1, files1) = list_dir(&cache, &resources.dir).await;
+	let (_d1, files1) = list_dir(&cache.client, &resources.dir).await;
 	assert_eq!(
 		files1.len(),
 		pre_count,
@@ -443,7 +412,7 @@ async fn migrate_03_present_baseline_is_incremental_not_first_sync() {
 		r3.locally_deleted, 0,
 		"first-sync must not delete local: {r3:?}"
 	);
-	let (_d2, files2) = list_dir(&cache, &resources.dir).await;
+	let (_d2, files2) = list_dir(&cache.client, &resources.dir).await;
 	assert_eq!(
 		files2.len(),
 		pre_count,
@@ -519,7 +488,13 @@ async fn migrate_07_real_change_after_reopen_is_applied() {
 
 	// One genuine local edit + one genuine remote add, both before the post-reopen pass.
 	write_file(&local, "edit_me.txt", b"v2 is meaningfully longer");
-	let added = upload_to(&cache, remote, "remote_add.txt", b"from the remote side").await;
+	let added = upload_to(
+		&cache.client,
+		remote,
+		"remote_add.txt",
+		b"from the remote side",
+	)
+	.await;
 	wait_cache_has(&cache, added.uuid()).await;
 
 	let engine2 = SyncEngine::open(cache.client.clone(), db_path)
@@ -540,7 +515,7 @@ async fn migrate_07_real_change_after_reopen_is_applied() {
 	// Converged end-state: local has the remote add + the edited content; remote has the new file.
 	assert!(read_eq(&local, "remote_add.txt", b"from the remote side"));
 	assert!(read_eq(&local, "edit_me.txt", b"v2 is meaningfully longer"));
-	let (_d, files) = list_dir(&cache, &resources.dir).await;
+	let (_d, files) = list_dir(&cache.client, &resources.dir).await;
 	assert_eq!(
 		find_file(&files, "edit_me.txt").unwrap().size,
 		b"v2 is meaningfully longer".len() as u64
@@ -578,7 +553,7 @@ async fn migrate_10_baseline_durable_across_repeated_cold_starts() {
 		.await
 		.unwrap();
 	assert_eq!(engine1.sync_once(pair1).await.unwrap().uploaded, 4);
-	let (_d0, files0) = list_dir(&cache, &resources.dir).await;
+	let (_d0, files0) = list_dir(&cache.client, &resources.dir).await;
 	let count = files0.len();
 	drop(engine1);
 
@@ -592,7 +567,7 @@ async fn migrate_10_baseline_durable_across_repeated_cold_starts() {
 			.await
 			.unwrap();
 		assert_noop(&engine.sync_once(pair).await.unwrap());
-		let (_d, files) = list_dir(&cache, &resources.dir).await;
+		let (_d, files) = list_dir(&cache.client, &resources.dir).await;
 		assert_eq!(files.len(), count, "{tag}: remote entry count drifted");
 		drop(engine);
 	}
@@ -628,7 +603,7 @@ async fn migrate_04_a_foreign_schema_version_fails_closed() {
 		.await
 		.unwrap();
 	assert_eq!(engine1.sync_once(pair1).await.unwrap().uploaded, 2);
-	let (_d0, files0) = list_dir(&cache, &resources.dir).await;
+	let (_d0, files0) = list_dir(&cache.client, &resources.dir).await;
 	let pre_count = files0.len();
 	let pre_tree = walk_tree(&local);
 	drop(engine1);
@@ -660,7 +635,7 @@ async fn migrate_04_a_foreign_schema_version_fails_closed() {
 		);
 
 		// Nothing was destroyed on either side, and the baseline file was NOT re-stamped.
-		let (_d1, files1) = list_dir(&cache, &resources.dir).await;
+		let (_d1, files1) = list_dir(&cache.client, &resources.dir).await;
 		assert_eq!(files1.len(), pre_count, "remote changed after the refusal");
 		assert!(
 			find_file(&files1, "keep1.txt").is_some(),
@@ -743,7 +718,7 @@ async fn migrate_11_a_hashless_remote_matching_size_and_mtime_is_recorded_as_syn
 	assert_eq!(r3.uploaded, 1, "the local edit must be pushed: {r3:?}");
 	assert_eq!(r3.downloaded, 0, "{r3:?}");
 	assert_eq!(r3.conflicts.len(), 0, "{r3:?}");
-	let (_d, files) = list_dir(&cache, &resources.dir).await;
+	let (_d, files) = list_dir(&cache.client, &resources.dir).await;
 	let pushed = find_file(&files, "f.bin").expect("f.bin missing remotely");
 	assert_eq!(
 		pushed.size,
@@ -781,7 +756,7 @@ async fn migrate_12_a_hashless_remote_matching_size_and_mtime_is_not_reuploaded(
 	assert_seeded(&db_path, "f.bin", data, staged.uuid());
 	assert_noop(&engine.sync_once(pair).await.unwrap());
 
-	let (_d, files) = list_dir(&cache, &resources.dir).await;
+	let (_d, files) = list_dir(&cache.client, &resources.dir).await;
 	assert_eq!(files.len(), 1, "{files:?}");
 	assert_eq!(
 		find_file(&files, "f.bin")
@@ -892,7 +867,7 @@ async fn migrate_13_empty_files_are_recorded_whatever_their_mtimes_but_a_1ms_mis
 
 	// Both sides are left as they were.
 	assert!(read_eq(&local, "off.bin", data));
-	let (_d, files) = list_dir(&cache, &resources.dir).await;
+	let (_d, files) = list_dir(&cache.client, &resources.dir).await;
 	assert_eq!(
 		find_file(&files, "off.bin")
 			.expect("off.bin missing remotely")
@@ -1007,7 +982,7 @@ async fn migrate_14_imported_filen_sync_state_records_a_hashless_file_as_synced(
 		"without the import the 5 s miss must conflict: {r_ctrl:?}"
 	);
 
-	let (_d, files) = list_dir(&cache, &resources.dir).await;
+	let (_d, files) = list_dir(&cache.client, &resources.dir).await;
 	assert_eq!(files.len(), 1, "{files:?}");
 	assert_eq!(
 		find_file(&files, "f.bin")

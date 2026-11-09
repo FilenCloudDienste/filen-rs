@@ -15,7 +15,6 @@ use base64::Engine as _;
 use filen_macros::shared_test_runtime;
 use filen_sdk_rs::auth::Client;
 use filen_sdk_rs::fs::HasUUID;
-use filen_sdk_rs::fs::file::RemoteFile;
 use filen_sdk_rs::sync_engine::{SyncEngine, SyncEvent, SyncMode};
 #[cfg(feature = "malformed")]
 use filen_sdk_rs::{
@@ -23,9 +22,11 @@ use filen_sdk_rs::{
 		HasName,
 		categories::{DirType, Normal},
 		dir::{RemoteDirectory, meta::DirectoryMetaChanges},
+		file::RemoteFile,
 	},
 	sync_engine::{UnsyncablePath, UnsyncableReason},
 };
+#[cfg(feature = "malformed")]
 use filen_types::fs::Uuid;
 #[cfg(feature = "malformed")]
 use std::borrow::Cow;
@@ -144,12 +145,6 @@ fn assert_baseline_clean(baseline_db: &Path, mut check: impl FnMut(&[u8], &str) 
 	}
 }
 
-/// Upload a file with exact bytes to a remote parent, returning the created RemoteFile.
-async fn upload_remote(client: &Client, parent: Uuid, name: &str, data: &[u8]) -> RemoteFile {
-	let builder = client.make_file_builder(name, parent).unwrap();
-	client.upload_file(builder, data).await.unwrap()
-}
-
 // ============================================================================
 // SEC-01 — Baseline store contains no plaintext credentials or key material
 // ============================================================================
@@ -174,7 +169,7 @@ async fn sec01_baseline_has_no_credentials_or_key_material() {
 	// Seed local + remote files and converge.
 	write_file(&local, "a.txt", b"alpha contents");
 	write_file(&local, "dir/b.txt", b"beta contents");
-	let rf = upload_remote(
+	let rf = upload_to(
 		&cache.client,
 		resources.dir.uuid(),
 		"c.txt",
@@ -228,7 +223,7 @@ async fn sec02_baseline_has_no_decrypted_content() {
 		.unwrap();
 
 	// A remote file whose plaintext is the unique high-entropy secret marker.
-	let rf = upload_remote(
+	let rf = upload_to(
 		&cache.client,
 		resources.dir.uuid(),
 		"secret.bin",
@@ -254,7 +249,7 @@ async fn sec02_baseline_has_no_decrypted_content() {
 	// and re-scan. We verify indirectly: the marker stays absent while a re-download happens.
 	let mut modified = SECRET_MARKER.to_vec();
 	modified.push(b'X');
-	let rf2 = upload_remote(&cache.client, resources.dir.uuid(), "secret.bin", &modified).await;
+	let rf2 = upload_to(&cache.client, resources.dir.uuid(), "secret.bin", &modified).await;
 	assert!(poll_for_item(cache.db_path(), rf2.uuid(), CACHE_CONVERGE_TIMEOUT).await);
 	let db = baseline_db.clone();
 	let _ = db;
@@ -301,14 +296,14 @@ async fn sec03_quarantine_has_only_recoverable_user_data() {
 		.await
 		.unwrap();
 
-	let keep = upload_remote(
+	let keep = upload_to(
 		&cache.client,
 		resources.dir.uuid(),
 		"keep.txt",
 		b"keep me here",
 	)
 	.await;
-	let mut doomed = upload_remote(
+	let mut doomed = upload_to(
 		&cache.client,
 		resources.dir.uuid(),
 		"doomed.txt",
@@ -398,7 +393,7 @@ async fn sec04_decrypted_content_confined_to_destination() {
 		let mut content = SECRET_MARKER.to_vec();
 		content.push(b'-');
 		content.push(b'0' + i);
-		let rf = upload_remote(&cache.client, resources.dir.uuid(), &name, &content).await;
+		let rf = upload_to(&cache.client, resources.dir.uuid(), &name, &content).await;
 		assert!(poll_for_item(cache.db_path(), rf.uuid(), CACHE_CONVERGE_TIMEOUT).await);
 		markers.push((name, content));
 	}
@@ -479,7 +474,7 @@ async fn sec09_created_files_use_restrictive_permissions() {
 		)
 		.await
 		.unwrap();
-	let rf = upload_remote(&cache.client, sub.uuid(), "key.pem", SECRET_MARKER).await;
+	let rf = upload_to(&cache.client, sub.uuid(), "key.pem", SECRET_MARKER).await;
 	assert!(poll_for_item(cache.db_path(), rf.uuid(), CACHE_CONVERGE_TIMEOUT).await);
 
 	let report = engine.sync_once(pair).await.unwrap();
@@ -641,7 +636,7 @@ async fn sec15_watch_self_write_does_not_leak_or_reupload() {
 		.await
 		.unwrap();
 
-	let rf = upload_remote(
+	let rf = upload_to(
 		&cache.client,
 		resources.dir.uuid(),
 		"watched_secret.bin",
@@ -747,15 +742,7 @@ async fn sec08_auth_and_network_errors_carry_no_secret_values() {
 /// The files directly under the test's remote root, straight from the server.
 #[cfg(feature = "malformed")]
 async fn remote_root_files(resources: &test_utils::TestResources) -> Vec<RemoteFile> {
-	resources
-		.client
-		.list_dir(
-			&DirType::<Normal>::Dir(Cow::Borrowed(&resources.dir)),
-			None::<&fn(u64, Option<u64>)>,
-		)
-		.await
-		.unwrap()
-		.1
+	list_dir(&resources.client, &resources.dir).await.1
 }
 
 /// SEC-11 — a remote item the client cannot decrypt is REPORTED, not skipped while the pass claims
@@ -1133,14 +1120,8 @@ async fn remote_child_dir(
 	parent: &RemoteDirectory,
 	name: &str,
 ) -> RemoteDirectory {
-	resources
-		.client
-		.list_dir(
-			&DirType::<Normal>::Dir(Cow::Borrowed(parent)),
-			None::<&fn(u64, Option<u64>)>,
-		)
+	list_dir(&resources.client, parent)
 		.await
-		.unwrap()
 		.0
 		.into_iter()
 		.find(|dir| dir.name() == Some(name))
@@ -1153,15 +1134,7 @@ async fn remote_dir_files(
 	resources: &test_utils::TestResources,
 	dir: &RemoteDirectory,
 ) -> Vec<RemoteFile> {
-	resources
-		.client
-		.list_dir(
-			&DirType::<Normal>::Dir(Cow::Borrowed(dir)),
-			None::<&fn(u64, Option<u64>)>,
-		)
-		.await
-		.unwrap()
-		.1
+	list_dir(&resources.client, dir).await.1
 }
 
 #[ignore = "blocked: needs a prior-on-disk-format baseline fixture + a migrating engine build — see TODO"]

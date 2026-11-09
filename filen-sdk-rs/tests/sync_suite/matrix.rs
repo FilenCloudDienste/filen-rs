@@ -14,10 +14,7 @@
 //! consequence. Invariant (e) requires deterministic mid-transfer/crash interruption (a
 //! fault-injection harness that does not exist yet); those cells are `#[ignore]`-stubbed with the
 //! plan summary rather than faked.
-use std::borrow::Cow;
-
 use filen_macros::shared_test_runtime;
-use filen_sdk_rs::fs::categories::{DirType, Normal};
 use filen_sdk_rs::fs::dir::RemoteDirectory;
 use filen_sdk_rs::fs::file::RemoteFile;
 use filen_sdk_rs::fs::{HasName, HasUUID};
@@ -31,42 +28,20 @@ use crate::helpers::*;
 // Local helpers (public-API only; remote ground-truth via the cache's client).
 // ---------------------------------------------------------------------------
 
-/// List the (dirs, files) directly under the single-client's remote root (ground truth).
+/// List the (dirs, files) directly under the remote root through the cache's client (ground truth).
 async fn list_root(sc: &SingleClient) -> (Vec<RemoteDirectory>, Vec<RemoteFile>) {
-	sc.cache
-		.client
-		.list_dir(
-			&DirType::<Normal>::Dir(Cow::Borrowed(&sc.resources.dir)),
-			None::<&fn(u64, Option<u64>)>,
-		)
-		.await
-		.unwrap()
+	list_dir(&sc.cache.client, &sc.resources.dir).await
 }
 
-/// List the (dirs, files) directly under the two-client fixture's shared remote root.
+/// List the (dirs, files) directly under the two-client fixture's shared remote root through
+/// client A's cache client.
 async fn list_root_tc(tc: &TwoClients) -> (Vec<RemoteDirectory>, Vec<RemoteFile>) {
-	tc.cache_a
-		.client
-		.list_dir(
-			&DirType::<Normal>::Dir(Cow::Borrowed(&tc.resources.dir)),
-			None::<&fn(u64, Option<u64>)>,
-		)
-		.await
-		.unwrap()
+	list_dir(&tc.cache_a.client, &tc.resources.dir).await
 }
 
-fn find_file<'a>(files: &'a [RemoteFile], name: &str) -> Option<&'a RemoteFile> {
-	files.iter().find(|f| f.name() == Some(name))
-}
-
-/// Upload a file with exact bytes directly to the single-client's remote root, returning it.
+/// Upload `data` as `name` directly under the remote root through the cache's client.
 async fn upload_root(sc: &SingleClient, name: &str, data: &[u8]) -> RemoteFile {
-	let builder = sc
-		.cache
-		.client
-		.make_file_builder(name, sc.resources.dir.uuid())
-		.unwrap();
-	sc.cache.client.upload_file(builder, data).await.unwrap()
+	upload_to(&sc.cache.client, sc.resources.dir.uuid(), name, data).await
 }
 
 /// Wait until the cache (the engine's remote view) observes `uuid` under the root.
@@ -514,20 +489,6 @@ async fn restart_fixture(
 	(resources, cache, local, remote, db_path)
 }
 
-async fn list_dir_via(
-	cache: &TestCache,
-	dir: &RemoteDirectory,
-) -> (Vec<RemoteDirectory>, Vec<RemoteFile>) {
-	cache
-		.client
-		.list_dir(
-			&DirType::<Normal>::Dir(Cow::Borrowed(dir)),
-			None::<&fn(u64, Option<u64>)>,
-		)
-		.await
-		.unwrap()
-}
-
 /// MATRIX-09 — (c) baseline-persists-across-restart, l2r. Converge an l2r pair, drop the engine
 /// (baseline persisted to disk), re-open a fresh engine on the SAME baseline DB and run a pass with
 /// no intervening changes: ZERO uploads, every remote file byte-identical, report is a clean no-op.
@@ -566,7 +527,7 @@ async fn matrix_09_baseline_persists_restart_l2r() {
 	let r2 = engine2.sync_once(pair2).await.unwrap();
 	assert_noop(&r2);
 
-	let (_dirs, files) = list_dir_via(&cache, &resources.dir).await;
+	let (_dirs, files) = list_dir(&cache.client, &resources.dir).await;
 	for i in 0..5 {
 		let name = format!("f{i}.txt");
 		let f = find_file(&files, &name)

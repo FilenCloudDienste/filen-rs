@@ -19,6 +19,7 @@ use filen_sdk_rs::{
 	auth::Client,
 	crypto::file::FileKey,
 	fs::{
+		HasName,
 		dir::meta::{DecryptedDirectoryMeta, DirectoryMeta},
 		file::meta::{DecryptedFileMeta, FileMeta},
 	},
@@ -447,6 +448,16 @@ pub fn make_test_remote_dir(name: &str, parent: Uuid) -> RemoteDirectory {
 			created: Some(now),
 		}),
 	)
+}
+
+/// The file named `name` in a listing, if any.
+pub fn find_file<'a>(files: &'a [RemoteFile], name: &str) -> Option<&'a RemoteFile> {
+	files.iter().find(|f| f.name() == Some(name))
+}
+
+/// The directory named `name` in a listing, if any.
+pub fn find_dir<'a>(dirs: &'a [RemoteDirectory], name: &str) -> Option<&'a RemoteDirectory> {
+	dirs.iter().find(|d| d.name() == Some(name))
 }
 
 /// Ensure the socket is authenticated by registering a temporary listener and waiting for authSuccess.

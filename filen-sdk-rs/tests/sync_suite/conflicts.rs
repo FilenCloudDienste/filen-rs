@@ -5,14 +5,12 @@
 //! every diverged byte-stream must remain recoverable somewhere on disk or remote — never
 //! clobbered. We verify recoverability by scanning the ENTIRE local tree (including the engine's
 //! `.filen-sync-trash` quarantine bin, which `walk_tree` deliberately hides) for the exact bytes.
-use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
 use filen_macros::shared_test_runtime;
-use filen_sdk_rs::fs::categories::{DirType, Normal};
 use filen_sdk_rs::fs::file::RemoteFile;
 use filen_sdk_rs::fs::{HasName, HasUUID};
 use filen_sdk_rs::sync_engine::{
@@ -103,41 +101,6 @@ fn count_files_named_containing(root: &Path, frag: &str) -> usize {
 /// Total regular files anywhere under `root`, INCLUDING the quarantine bin.
 fn total_files(root: &Path) -> usize {
 	count_files_named_containing(root, "")
-}
-
-/// A `DirType` view of the shared remote root for `list_dir` / `create_dir` / file builders.
-fn root_dirtype(tc: &TwoClients) -> DirType<'_, Normal> {
-	DirType::<Normal>::Dir(Cow::Borrowed(&tc.resources.dir))
-}
-
-/// List the (dirs, files) directly under the shared remote root (ground truth).
-async fn list_remote_root(
-	tc: &TwoClients,
-) -> (Vec<filen_sdk_rs::fs::dir::RemoteDirectory>, Vec<RemoteFile>) {
-	tc.resources
-		.client
-		.list_dir(&root_dirtype(tc), None::<&fn(u64, Option<u64>)>)
-		.await
-		.unwrap()
-}
-
-/// Upload `data` to the remote root under `name` (versioning any same-name file in place),
-/// returning the created RemoteFile. Uses the SHARED resources client (ground-truth writer).
-async fn upload_remote(tc: &TwoClients, name: &str, data: &[u8]) -> RemoteFile {
-	let builder = tc
-		.resources
-		.client
-		.make_file_builder(name, tc.resources.dir.uuid())
-		.unwrap();
-	tc.resources
-		.client
-		.upload_file(builder, data)
-		.await
-		.unwrap()
-}
-
-fn find_file<'a>(files: &'a [RemoteFile], name: &str) -> Option<&'a RemoteFile> {
-	files.iter().find(|f| f.name() == Some(name))
 }
 
 /// Fail unless an `Order::Concurrent` round really staged a race the engine can still recognise.
@@ -342,7 +305,7 @@ async fn conflict_03_local_modify_vs_remote_delete_preserves_local_edit() {
 		|| trees_equal(&tc.local_a, &tc.local_b) && read_eq(&tc.local_b, "report.doc", b"V1"),
 	)
 	.await;
-	let (_d, rfiles) = list_remote_root(&tc).await;
+	let (_d, rfiles) = tc.list_root().await;
 	let baseline_uuid = find_file(&rfiles, "report.doc")
 		.expect("the baseline never reached the remote")
 		.uuid();
@@ -380,7 +343,7 @@ async fn conflict_03_local_modify_vs_remote_delete_preserves_local_edit() {
 		.await
 		.expect("engine B sync_once");
 	assert!(rb0.errors.is_empty(), "{rb0:?}");
-	let (_d, rfiles) = list_remote_root(&tc).await;
+	let (_d, rfiles) = tc.list_root().await;
 	assert!(
 		find_file(&rfiles, "report.doc").is_none(),
 		"B's delete never reached the remote: {rb0:?}"
@@ -441,7 +404,7 @@ async fn conflict_04_remote_modify_vs_local_delete_preserves_remote_edit() {
 		|| trees_equal(&tc.local_a, &tc.local_b) && read_eq(&tc.local_b, "budget.csv", b"V1"),
 	)
 	.await;
-	let (_d, rfiles) = list_remote_root(&tc).await;
+	let (_d, rfiles) = tc.list_root().await;
 	let baseline_uuid = find_file(&rfiles, "budget.csv")
 		.expect("the baseline never reached the remote")
 		.uuid();
@@ -477,7 +440,7 @@ async fn conflict_04_remote_modify_vs_local_delete_preserves_remote_edit() {
 		.await
 		.expect("engine B sync_once");
 	assert!(rb0.errors.is_empty(), "{rb0:?}");
-	let (_d, rfiles) = list_remote_root(&tc).await;
+	let (_d, rfiles) = tc.list_root().await;
 	let edited = find_file(&rfiles, "budget.csv").expect("B's edit never reached the remote");
 	assert_ne!(
 		edited.uuid(),
@@ -511,7 +474,7 @@ async fn conflict_04_remote_modify_vs_local_delete_preserves_remote_edit() {
 	// The remotely-edited V2 bytes must survive (on B, restored to A, or remote ground truth).
 	let v2_local = bytes_recoverable_anywhere(&tc.local_a, b"V2")
 		|| bytes_recoverable_anywhere(&tc.local_b, b"V2");
-	let (_d, rfiles) = list_remote_root(&tc).await;
+	let (_d, rfiles) = tc.list_root().await;
 	let v2_remote = find_file(&rfiles, "budget.csv").map(|f| f.size) == Some(2);
 	assert!(
 		v2_local || v2_remote,
@@ -542,7 +505,7 @@ async fn conflict_05_create_vs_create_different_content() {
 	// engines upload the same name, which the server linearizes into versions of one file.
 	let r0 = tc.engine_a.sync_once(tc.pair_a).await.unwrap();
 	assert!(r0.errors.is_empty(), "{r0:?}");
-	let (_d, rfiles) = list_remote_root(&tc).await;
+	let (_d, rfiles) = tc.list_root().await;
 	let uploaded = find_file(&rfiles, "fresh.txt").expect("A's create never reached the remote");
 	assert!(
 		poll_for_item(
@@ -876,15 +839,7 @@ async fn conflict_13_local_backup_delete_not_mirrored() {
 	);
 
 	// Remote still has it; local stays deleted.
-	let (_d, files) = sc
-		.resources
-		.client
-		.list_dir(
-			&DirType::<Normal>::Dir(Cow::Borrowed(&sc.resources.dir)),
-			None::<&fn(u64, Option<u64>)>,
-		)
-		.await
-		.unwrap();
+	let (_d, files) = sc.list_root().await;
 	assert!(
 		find_file(&files, "keep.txt").is_some(),
 		"remote lost the backup copy"
@@ -951,15 +906,7 @@ async fn conflict_14_remote_backup_delete_not_mirrored() {
 	);
 
 	// Remote stays empty (not re-uploaded).
-	let (_d, files) = sc
-		.resources
-		.client
-		.list_dir(
-			&DirType::<Normal>::Dir(Cow::Borrowed(&sc.resources.dir)),
-			None::<&fn(u64, Option<u64>)>,
-		)
-		.await
-		.unwrap();
+	let (_d, files) = sc.list_root().await;
 	assert!(
 		find_file(&files, "archive.bin").is_none(),
 		"file resurrected on remote"
@@ -986,7 +933,7 @@ async fn conflict_15a_local_to_remote_local_wins_no_conflict() {
 	// Diverge: local edits to LOCALWINS (9 bytes); remote independently edited to REM (3 bytes).
 	// Distinct lengths so the remote `size` uniquely identifies the winner.
 	write_file(&sc.local, "pin.txt", b"LOCALWINS");
-	let _ = upload_remote_single(&sc, "pin.txt", b"REM").await;
+	let _ = sc.upload_root("pin.txt", b"REM").await;
 
 	let r2 = sc.sync().await;
 	assert!(r2.errors.is_empty(), "{r2:?}");
@@ -1013,7 +960,7 @@ async fn conflict_15a_local_to_remote_local_wins_no_conflict() {
 async fn conflict_15b_remote_to_local_remote_wins_no_conflict() {
 	// RemoteToLocal: remote "REM" wins, no conflict surfaced.
 	let sc = single_client(SyncMode::RemoteToLocal).await;
-	let _base = upload_remote_single(&sc, "pin.txt", b"BASE").await;
+	let _base = sc.upload_root("pin.txt", b"BASE").await;
 	assert!(
 		poll_for_item(sc.cache.db_path(), _base.uuid(), CACHE_CONVERGE_TIMEOUT).await,
 		"cache never saw base"
@@ -1023,7 +970,7 @@ async fn conflict_15b_remote_to_local_remote_wins_no_conflict() {
 
 	// Diverge: local edited to LOC; remote re-uploaded to REM.
 	write_file(&sc.local, "pin.txt", b"LOC");
-	let rem = upload_remote_single(&sc, "pin.txt", b"REM").await;
+	let rem = sc.upload_root("pin.txt", b"REM").await;
 	let new_uuid: Uuid = rem.uuid();
 	let db = sc.cache.db_path().to_path_buf();
 	assert!(
@@ -1066,7 +1013,7 @@ async fn conflict_15c_unmodified_local_refresh_leaves_no_quarantine_copy() {
 	// file that still matches its baseline destroys nothing, so it must NOT leave a recovery copy
 	// behind — otherwise every remote edit doubles the local disk usage.
 	let sc = single_client(SyncMode::RemoteToLocal).await;
-	let v1 = upload_remote_single(&sc, "fresh.txt", b"V1").await;
+	let v1 = sc.upload_root("fresh.txt", b"V1").await;
 	assert!(
 		poll_for_item(sc.cache.db_path(), v1.uuid(), CACHE_CONVERGE_TIMEOUT).await,
 		"cache never saw V1"
@@ -1076,7 +1023,7 @@ async fn conflict_15c_unmodified_local_refresh_leaves_no_quarantine_copy() {
 	assert!(read_eq(&sc.local, "fresh.txt", b"V1"), "V1 did not land");
 
 	// Remote-only edit; the local copy is untouched since that sync.
-	let v2 = upload_remote_single(&sc, "fresh.txt", b"V222").await;
+	let v2 = sc.upload_root("fresh.txt", b"V222").await;
 	let new_uuid: Uuid = v2.uuid();
 	let db = sc.cache.db_path().to_path_buf();
 	assert!(
@@ -1118,7 +1065,7 @@ async fn conflict_15d_pull_over_a_size_and_mtime_preserving_edit_quarantines_it(
 	// thing between this edit and a silent overwrite is the pull-over decision hashing the bytes
 	// it is about to replace.
 	let sc = single_client(SyncMode::RemoteToLocal).await;
-	let v1 = upload_remote_single(&sc, "doc.txt", b"V1V1").await;
+	let v1 = sc.upload_root("doc.txt", b"V1V1").await;
 	wait_cache_has(&sc, v1.uuid()).await;
 	let r1 = sc.sync().await;
 	assert_eq!(r1.downloaded, 1, "{r1:?}");
@@ -1141,7 +1088,7 @@ async fn conflict_15d_pull_over_a_size_and_mtime_preserving_edit_quarantines_it(
 	);
 
 	// Now the remote changes, which is what pulls over the local path.
-	let v2 = upload_remote_single(&sc, "doc.txt", b"V2V2").await;
+	let v2 = sc.upload_root("doc.txt", b"V2V2").await;
 	wait_cache_has(&sc, v2.uuid()).await;
 	// Observed: the report is not the only place the pass owes this path a word — a watch caller
 	// hears it as the copy is moved aside, before the download that took its place.
@@ -1681,7 +1628,7 @@ async fn conflict_add_local_backup_content_divergence_no_conflict() {
 
 	// local LOCALWINS (9 bytes) vs remote REM (3 bytes) — distinct lengths for size discrimination.
 	write_file(&sc.local, "b.txt", b"LOCALWINS");
-	let _ = upload_remote_single(&sc, "b.txt", b"REM").await;
+	let _ = sc.upload_root("b.txt", b"REM").await;
 
 	let r2 = sc.sync().await;
 	assert!(r2.errors.is_empty(), "{r2:?}");
@@ -1947,16 +1894,6 @@ async fn conflict_25_watch_mode_conflict_does_not_loop() {
 // content-divergence tests above).
 // ---------------------------------------------------------------------------
 
-/// Upload `data` under `name` to the SingleClient's remote root (versioning in place).
-async fn upload_remote_single(sc: &SingleClient, name: &str, data: &[u8]) -> RemoteFile {
-	let b = sc
-		.resources
-		.client
-		.make_file_builder(name, sc.resources.dir.uuid())
-		.unwrap();
-	sc.resources.client.upload_file(b, data).await.unwrap()
-}
-
 /// Wait until the engine's cache has observed `uuid` (its remote view is fed by the cache, not by
 /// the server directly), so the next pass reconciles against fresh truth.
 async fn wait_cache_has(sc: &SingleClient, uuid: Uuid) {
@@ -1977,31 +1914,13 @@ async fn wait_cache_current(sc: &SingleClient, name: &str) {
 
 /// The uuid of the CURRENT remote version of `name` under the SingleClient's root (ground truth).
 async fn remote_file_uuid(sc: &SingleClient, name: &str) -> Option<Uuid> {
-	let (_d, files) = sc
-		.resources
-		.client
-		.list_dir(
-			&DirType::<Normal>::Dir(Cow::Borrowed(&sc.resources.dir)),
-			None::<&fn(u64, Option<u64>)>,
-		)
-		.await
-		.unwrap();
-	files
-		.into_iter()
-		.find(|f| f.name() == Some(name))
-		.map(|f| f.uuid())
+	let (_d, files) = sc.list_root().await;
+	find_file(&files, name).map(|f| f.uuid())
 }
 
 /// The CURRENT remote version of file `name` directly under a test resources root (ground truth).
 async fn remote_file_in(resources: &test_utils::TestResources, name: &str) -> Option<RemoteFile> {
-	let (_d, files) = resources
-		.client
-		.list_dir(
-			&DirType::<Normal>::Dir(Cow::Borrowed(&resources.dir)),
-			None::<&fn(u64, Option<u64>)>,
-		)
-		.await
-		.unwrap();
+	let (_d, files) = list_dir(&resources.client, &resources.dir).await;
 	files.into_iter().find(|f| f.name() == Some(name))
 }
 
@@ -2015,19 +1934,8 @@ async fn remote_file_size_in(resources: &test_utils::TestResources, name: &str) 
 /// native download path is not exposed as a simple `Client` method here; pick distinct-length
 /// sentinel contents so size uniquely identifies which version won.
 async fn remote_file_size(sc: &SingleClient, name: &str) -> Option<u64> {
-	let (_d, files) = sc
-		.resources
-		.client
-		.list_dir(
-			&DirType::<Normal>::Dir(Cow::Borrowed(&sc.resources.dir)),
-			None::<&fn(u64, Option<u64>)>,
-		)
-		.await
-		.unwrap();
-	files
-		.into_iter()
-		.find(|f| f.name() == Some(name))
-		.map(|f| f.size)
+	let (_d, files) = sc.list_root().await;
+	find_file(&files, name).map(|f| f.size)
 }
 
 // ===========================================================================
@@ -2083,15 +1991,7 @@ async fn conflict_10_case_only_collision() {
 	}
 	for dir in [&upper, &lower] {
 		let name = dir.name().unwrap();
-		let (_d, files) = sc
-			.cache
-			.client
-			.list_dir(
-				&DirType::<Normal>::Dir(Cow::Borrowed(dir)),
-				None::<&fn(u64, Option<u64>)>,
-			)
-			.await
-			.unwrap();
+		let (_d, files) = list_dir(&sc.cache.client, dir).await;
 		let notes = find_file(&files, "notes.txt")
 			.unwrap_or_else(|| panic!("{name}/notes.txt lost on the remote"));
 		assert_eq!(notes.size, name.len() as u64, "{name}/notes.txt changed");
@@ -2155,15 +2055,7 @@ async fn conflict_11_unicode_normalization_collision() {
 		walk_tree(&sc.local).is_empty(),
 		"neither spelling materialized"
 	);
-	let (dirs, _files) = sc
-		.cache
-		.client
-		.list_dir(
-			&DirType::<Normal>::Dir(Cow::Borrowed(&sc.resources.dir)),
-			None::<&fn(u64, Option<u64>)>,
-		)
-		.await
-		.unwrap();
+	let (dirs, _files) = list_dir(&sc.cache.client, &sc.resources.dir).await;
 	assert_eq!(dirs.len(), 2, "both remote spellings are intact");
 	sc.cleanup();
 }
@@ -2227,7 +2119,7 @@ async fn conflict_16_resolve_keep_local() {
 	write_file(&sc.local, "conf.txt", b"BASE");
 	assert_eq!(sc.sync().await.uploaded, 1);
 	write_file(&sc.local, "conf.txt", b"LLLLLLLLLL");
-	let remote_version = upload_remote_single(&sc, "conf.txt", b"RRR").await;
+	let remote_version = sc.upload_root("conf.txt", b"RRR").await;
 	wait_cache_has(&sc, remote_version.uuid()).await;
 
 	// The divergence is surfaced and HELD: no transfer, and it does not silently resolve itself.
@@ -2302,7 +2194,7 @@ async fn conflict_17_resolve_keep_remote() {
 	write_file(&sc.local, "conf2.txt", b"BASE");
 	assert_eq!(sc.sync().await.uploaded, 1);
 	write_file(&sc.local, "conf2.txt", b"LLLLLLLLLL");
-	let remote_version = upload_remote_single(&sc, "conf2.txt", b"RRR").await;
+	let remote_version = sc.upload_root("conf2.txt", b"RRR").await;
 	wait_cache_has(&sc, remote_version.uuid()).await;
 
 	let r2 = sc.sync().await;
@@ -2367,7 +2259,7 @@ async fn conflict_19_conflict_copy_naming_no_collision_or_recursion() {
 
 	// --- first conflict, resolved keep-both -> a.old.txt ---
 	write_file(&sc.local, "a.txt", b"LOCAL-1");
-	let v1 = upload_remote_single(&sc, "a.txt", b"REMOTE-1").await;
+	let v1 = sc.upload_root("a.txt", b"REMOTE-1").await;
 	wait_cache_has(&sc, v1.uuid()).await;
 	assert!(
 		sc.sync().await.conflict_paths().any(|c| c == "a.txt"),
@@ -2404,7 +2296,7 @@ async fn conflict_19_conflict_copy_naming_no_collision_or_recursion() {
 
 	// --- second, independent conflict on the SAME path, resolved keep-both -> a.old.1.txt ---
 	write_file(&sc.local, "a.txt", b"LOCAL-2");
-	let v2 = upload_remote_single(&sc, "a.txt", b"REMOTE-2").await;
+	let v2 = sc.upload_root("a.txt", b"REMOTE-2").await;
 	wait_cache_has(&sc, v2.uuid()).await;
 	assert!(
 		sc.sync().await.conflict_paths().any(|c| c == "a.txt"),
@@ -2463,7 +2355,7 @@ async fn conflict_add_resolved_copy_round_trips() {
 	write_file(&sc.local, "c.txt", b"BASE");
 	assert_eq!(sc.sync().await.uploaded, 1);
 	write_file(&sc.local, "c.txt", b"LOCAL-EDIT");
-	let version = upload_remote_single(&sc, "c.txt", b"REMOTE-EDIT").await;
+	let version = sc.upload_root("c.txt", b"REMOTE-EDIT").await;
 	wait_cache_has(&sc, version.uuid()).await;
 	assert!(
 		sc.sync().await.conflict_paths().any(|c| c == "c.txt"),
@@ -2687,7 +2579,7 @@ async fn conflict_26_same_round_edits_surface_on_the_superseded_client() {
 	// Give BOTH clients a pass that lists the shared version as the remote head. That observation
 	// is what records BASE as the content both sides hold; without it neither side has an agreed
 	// content to measure the divergence below against, and the loser would just pull.
-	let (_d, files) = list_remote_root(&tc).await;
+	let (_d, files) = tc.list_root().await;
 	let base_uuid: Uuid = find_file(&files, "race.txt")
 		.expect("race.txt missing")
 		.uuid();
@@ -2739,7 +2631,7 @@ async fn conflict_26_same_round_edits_surface_on_the_superseded_client() {
 	// a client still lists the version its own upload replaced: sampled there, the loser confirms
 	// its own push against the snapshot, and the round after it pulls the winner like an ordinary
 	// remote edit — the test would pass over an engine that never surfaced anything.
-	let (_d, files) = list_remote_root(&tc).await;
+	let (_d, files) = tc.list_root().await;
 	let head = find_file(&files, "race.txt").expect("race.txt missing after the concurrent round");
 	let head_uuid = head.uuid();
 	// Distinct-length sentinels, so the surviving size names the winner (see `remote_file_size_in`).
@@ -2869,7 +2761,7 @@ async fn conflict_26_same_round_edits_surface_on_the_superseded_client() {
 	.await;
 
 	// One file per name on the remote: keeping both added a file, it did not duplicate one.
-	let (_d, files) = list_remote_root(&tc).await;
+	let (_d, files) = tc.list_root().await;
 	for name in ["race.txt", "race.old.txt"] {
 		assert_eq!(
 			files.iter().filter(|f| f.name() == Some(name)).count(),
@@ -2946,7 +2838,7 @@ async fn conflict_27_concurrent_same_name_create_surfaces_a_conflict() {
 	// lists its own upload as the head: sampled there, the loser confirms its own push against the
 	// snapshot and then pulls the winner like an ordinary later edit — and the test would pass over
 	// an engine that never surfaced anything (see CONFLICT-26, which has the same hazard).
-	let (_d, files) = list_remote_root(&tc).await;
+	let (_d, files) = tc.list_root().await;
 	let head = find_file(&files, "race.txt").expect("race.txt missing after the concurrent round");
 	let head_uuid = head.uuid();
 	assert!(
@@ -3006,7 +2898,7 @@ async fn conflict_27_concurrent_same_name_create_surfaces_a_conflict() {
 	assert!(s0.errors.is_empty(), "{s0:?}");
 	assert_eq!(s0.uploaded, 1, "{s0:?}");
 
-	let (_d, files) = list_remote_root(&tc).await;
+	let (_d, files) = tc.list_root().await;
 	let ours: Uuid = find_file(&files, "solo.txt")
 		.expect("solo.txt never reached the remote")
 		.uuid();
@@ -3022,7 +2914,7 @@ async fn conflict_27_concurrent_same_name_create_surfaces_a_conflict() {
 		"the confirming pass must be a no-op: {s1:?}"
 	);
 
-	let edited = upload_remote(&tc, "solo.txt", b"S2-remote").await;
+	let edited = tc.upload_root("solo.txt", b"S2-remote").await;
 	let edited_uuid: Uuid = edited.uuid();
 	let db_a = tc.cache_a.db_path().to_path_buf();
 	assert!(
@@ -3094,7 +2986,7 @@ async fn conflict_28_keep_remote_restores_the_buried_edit() {
 		conflicts.is_empty(),
 		"the baseline round must be conflict-free: {conflicts:?}"
 	);
-	let (_d, files) = list_remote_root(&tc).await;
+	let (_d, files) = tc.list_root().await;
 	let base_uuid: Uuid = find_file(&files, "race.txt")
 		.expect("race.txt missing")
 		.uuid();
@@ -3141,7 +3033,7 @@ async fn conflict_28_keep_remote_restores_the_buried_edit() {
 	);
 
 	// Distinct-length sentinels, so the surviving size names the winner.
-	let (_d, files) = list_remote_root(&tc).await;
+	let (_d, files) = tc.list_root().await;
 	let head = find_file(&files, "race.txt").expect("race.txt missing after the concurrent round");
 	let head_uuid = head.uuid();
 	let b_won = head.size == b"B-EDIT-LONGER".len() as u64;
@@ -3220,7 +3112,7 @@ async fn conflict_28_keep_remote_restores_the_buried_edit() {
 
 	// Ground truth, read from the server rather than from either client's cache: the buried
 	// version is the head again, under one name.
-	let (_d, files) = list_remote_root(&tc).await;
+	let (_d, files) = tc.list_root().await;
 	let remote: Vec<_> = files
 		.iter()
 		.filter(|f| f.name() == Some("race.txt"))

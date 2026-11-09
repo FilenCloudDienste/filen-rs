@@ -10,13 +10,12 @@
 //! failures, empty-vs-missing, mass-delete guard, populated-destination first-run, special files,
 //! best-effort concurrent mutation, watch-mode coalescing & self-write suppression) is implemented
 //! and asserts ABSENCE OF DATA LOSS.
-use std::borrow::Cow;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime};
 
 use filen_macros::shared_test_runtime;
-use filen_sdk_rs::fs::categories::{DirType, Normal};
+use filen_sdk_rs::fs::dir::RemoteDirectory;
 use filen_sdk_rs::fs::file::RemoteFile;
 use filen_sdk_rs::fs::{HasName, HasUUID};
 use filen_sdk_rs::sync_engine::{SyncEngine, SyncEvent, SyncMode, SyncObserver};
@@ -31,54 +30,14 @@ use crate::helpers::*;
 // Local helpers (public-API only; remote ground-truth via the cache's client).
 // ---------------------------------------------------------------------------
 
-/// List the (dirs, files) directly under the single-client's remote root (ground truth).
-async fn list_root(
-	sc: &SingleClient,
-) -> (Vec<filen_sdk_rs::fs::dir::RemoteDirectory>, Vec<RemoteFile>) {
-	sc.cache
-		.client
-		.list_dir(
-			&DirType::<Normal>::Dir(Cow::Borrowed(&sc.resources.dir)),
-			None::<&fn(u64, Option<u64>)>,
-		)
-		.await
-		.unwrap()
+/// List the (dirs, files) directly under the remote root through the cache's client (ground truth).
+async fn list_root(sc: &SingleClient) -> (Vec<RemoteDirectory>, Vec<RemoteFile>) {
+	list_dir(&sc.cache.client, &sc.resources.dir).await
 }
 
-/// List the (dirs, files) directly under a remote subdir (ground truth).
-async fn list_dir(
-	sc: &SingleClient,
-	dir: &filen_sdk_rs::fs::dir::RemoteDirectory,
-) -> (Vec<filen_sdk_rs::fs::dir::RemoteDirectory>, Vec<RemoteFile>) {
-	sc.cache
-		.client
-		.list_dir(
-			&DirType::<Normal>::Dir(Cow::Borrowed(dir)),
-			None::<&fn(u64, Option<u64>)>,
-		)
-		.await
-		.unwrap()
-}
-
-fn find_file<'a>(files: &'a [RemoteFile], name: &str) -> Option<&'a RemoteFile> {
-	files.iter().find(|f| f.name() == Some(name))
-}
-
-fn find_dir<'a>(
-	dirs: &'a [filen_sdk_rs::fs::dir::RemoteDirectory],
-	name: &str,
-) -> Option<&'a filen_sdk_rs::fs::dir::RemoteDirectory> {
-	dirs.iter().find(|d| d.name() == Some(name))
-}
-
-/// Upload a file with exact bytes directly to the single-client's remote root.
+/// Upload `data` as `name` directly under the remote root through the cache's client.
 async fn upload_root(sc: &SingleClient, name: &str, data: &[u8]) -> RemoteFile {
-	let builder = sc
-		.cache
-		.client
-		.make_file_builder(name, sc.resources.dir.uuid())
-		.unwrap();
-	sc.cache.client.upload_file(builder, data).await.unwrap()
+	upload_to(&sc.cache.client, sc.resources.dir.uuid(), name, data).await
 }
 
 /// Force a file's mtime to a given `SystemTime` (simulate clock skew / mtime restore).
@@ -290,7 +249,7 @@ async fn race_09_file_replaced_by_directory() {
 		let node_is_file = find_file(&files, "node").is_some();
 		if node_is_dir && !node_is_file {
 			let nd = find_dir(&dirs, "node").unwrap();
-			let (_cd, cf) = list_dir(&sc, nd).await;
+			let (_cd, cf) = list_dir(&sc.cache.client, nd).await;
 			if let Some(c) = find_file(&cf, "child.txt") {
 				assert_eq!(c.size, b"B-child".len() as u64, "child content size wrong");
 				converged = true;
@@ -737,7 +696,7 @@ async fn race_23_mass_delete_guard_holds_bulk_vanish() {
 			.expect("bulk dir gone — guard failed")
 			.clone()
 	};
-	let (_cd, cf) = list_dir(&sc, &bulk_dir).await;
+	let (_cd, cf) = list_dir(&sc.cache.client, &bulk_dir).await;
 	assert_eq!(
 		cf.len(),
 		TOTAL,
@@ -825,12 +784,14 @@ async fn race_19_symlink_and_loop_do_not_hang_scan() {
 		vec!["cycle", "real"],
 		"the sibling directory is uploaded once, under its real name: {r2:?}"
 	);
-	let (cycle_dirs, cycle_files) = list_dir(&sc, find_dir(&dirs, "cycle").unwrap()).await;
+	let (cycle_dirs, cycle_files) =
+		list_dir(&sc.cache.client, find_dir(&dirs, "cycle").unwrap()).await;
 	assert!(
 		cycle_dirs.is_empty() && cycle_files.is_empty(),
 		"nothing is uploaded through the loop: {cycle_dirs:?} {cycle_files:?}"
 	);
-	let (real_dirs, real_files) = list_dir(&sc, find_dir(&dirs, "real").unwrap()).await;
+	let (real_dirs, real_files) =
+		list_dir(&sc.cache.client, find_dir(&dirs, "real").unwrap()).await;
 	assert!(real_dirs.is_empty(), "{real_dirs:?}");
 	let real_names: Vec<&str> = real_files.iter().filter_map(|f| f.name()).collect();
 	assert_eq!(real_names, vec!["in.txt"]);
@@ -1088,11 +1049,11 @@ async fn race_add_move_between_passes_converges_no_duplicate() {
 		let mut at_new = false;
 		let mut at_old = false;
 		if let Some(d2) = find_dir(&dirs, "dir2") {
-			let (_dd, df) = list_dir(&sc, d2).await;
+			let (_dd, df) = list_dir(&sc.cache.client, d2).await;
 			at_new = find_file(&df, "x.txt").is_some();
 		}
 		if let Some(d1) = find_dir(&dirs, "dir1") {
-			let (_dd, df) = list_dir(&sc, d1).await;
+			let (_dd, df) = list_dir(&sc.cache.client, d1).await;
 			at_old = find_file(&df, "x.txt").is_some();
 		}
 		if at_new && !at_old {
@@ -1153,7 +1114,7 @@ async fn race_15_sibling_mutation_during_pass_converges() {
 		conflicts_seen |= !r.conflicts.is_empty();
 		let (dirs, _f) = list_root(&sc).await;
 		if let Some(td) = find_dir(&dirs, "tree") {
-			let (_dd, tf) = list_dir(&sc, td).await;
+			let (_dd, tf) = list_dir(&sc.cache.client, td).await;
 			let has_new = find_file(&tf, "f1001.txt").is_some();
 			let removed_gone = find_file(&tf, "f0005.txt").is_none();
 			if has_new && removed_gone {

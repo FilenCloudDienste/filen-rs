@@ -44,27 +44,10 @@ const WATCH_SETTLE: Duration = Duration::from_secs(180);
 // derived `sc.cache` observes); cache-convergence polling uses `sc.cache.db_path()` / messages.
 // ----------------------------------------------------------------------------
 
-fn root_dirtype(sc: &SingleClient) -> DirType<'_, Normal> {
-	DirType::<Normal>::Dir(Cow::Borrowed(&sc.resources.dir))
-}
-
-async fn upload_root(sc: &SingleClient, name: &str, data: &[u8]) -> RemoteFile {
-	let builder = sc
-		.resources
-		.client
-		.make_file_builder(name, sc.resources.dir.uuid())
-		.unwrap();
-	sc.resources
-		.client
-		.upload_file(builder, data)
-		.await
-		.unwrap()
-}
-
 async fn create_root_dir(sc: &SingleClient, name: &str) -> RemoteDirectory {
 	sc.resources
 		.client
-		.create_dir(&root_dirtype(sc), name)
+		.create_dir(&sc.root_dirtype(), name)
 		.await
 		.unwrap()
 }
@@ -75,46 +58,7 @@ async fn upload_into(
 	name: &str,
 	data: &[u8],
 ) -> RemoteFile {
-	let builder = sc
-		.resources
-		.client
-		.make_file_builder(name, parent.uuid())
-		.unwrap();
-	sc.resources
-		.client
-		.upload_file(builder, data)
-		.await
-		.unwrap()
-}
-
-async fn list_root(sc: &SingleClient) -> (Vec<RemoteDirectory>, Vec<RemoteFile>) {
-	sc.resources
-		.client
-		.list_dir(&root_dirtype(sc), None::<&fn(u64, Option<u64>)>)
-		.await
-		.unwrap()
-}
-
-async fn list_dir(
-	sc: &SingleClient,
-	dir: &RemoteDirectory,
-) -> (Vec<RemoteDirectory>, Vec<RemoteFile>) {
-	sc.resources
-		.client
-		.list_dir(
-			&DirType::<Normal>::Dir(Cow::Borrowed(dir)),
-			None::<&fn(u64, Option<u64>)>,
-		)
-		.await
-		.unwrap()
-}
-
-fn find_file<'a>(files: &'a [RemoteFile], name: &str) -> Option<&'a RemoteFile> {
-	files.iter().find(|f| f.name() == Some(name))
-}
-
-fn find_dir<'a>(dirs: &'a [RemoteDirectory], name: &str) -> Option<&'a RemoteDirectory> {
-	dirs.iter().find(|d| d.name() == Some(name))
+	upload_to(&sc.resources.client, parent.uuid(), name, data).await
 }
 
 /// Count regular files recursively under `root` (excluding the quarantine bin).
@@ -253,9 +197,9 @@ async fn scale_02_tiny_local_incremental_after_baseline() {
 	assert_eq!(r2.remote_dirs_created, 0, "{r2:?}");
 
 	// The two changed files are byte-exact on the remote.
-	let (dirs, _) = list_root(&sc).await;
+	let (dirs, _) = sc.list_root().await;
 	let base = find_dir(&dirs, "base").expect("base dir");
-	let (_, bfiles) = list_dir(&sc, base).await;
+	let (_, bfiles) = sc.list_dir(base).await;
 	assert_eq!(
 		bfiles.len(),
 		N + 1,
@@ -290,7 +234,9 @@ async fn scale_a_tiny_remote_incremental_after_baseline() {
 	const N: usize = 12;
 	let mut seeded = Vec::new();
 	for i in 0..N {
-		let f = upload_root(&sc, &format!("r{i:02}.txt"), format!("rv0-{i}").as_bytes()).await;
+		let f = sc
+			.upload_root(&format!("r{i:02}.txt"), format!("rv0-{i}").as_bytes())
+			.await;
 		seeded.push(f);
 	}
 	for f in &seeded {
@@ -304,8 +250,10 @@ async fn scale_a_tiny_remote_incremental_after_baseline() {
 	assert_eq!(r1.downloaded, N, "{r1:?}");
 
 	// Remote: modify one (re-upload same name -> server versions to a new uuid) + add one new.
-	let new_modified = upload_root(&sc, "r00.txt", b"remote-modified-and-longer").await;
-	let brand_new = upload_root(&sc, "rnew.txt", b"brand new remote").await;
+	let new_modified = sc
+		.upload_root("r00.txt", b"remote-modified-and-longer")
+		.await;
+	let brand_new = sc.upload_root("rnew.txt", b"brand new remote").await;
 	assert!(
 		poll_for_item(
 			sc.cache.db_path(),
@@ -359,9 +307,9 @@ async fn scale_03_many_tiny_files_one_wide_dir() {
 	assert_eq!(r1.uploaded, ZEROS + ONES, "{r1:?}");
 	assert_eq!(r1.remote_dirs_created, 1, "single wide dir: {r1:?}");
 
-	let (dirs, _) = list_root(&sc).await;
+	let (dirs, _) = sc.list_root().await;
 	let wide = find_dir(&dirs, "wide").expect("wide dir");
-	let (_, wfiles) = list_dir(&sc, wide).await;
+	let (_, wfiles) = sc.list_dir(wide).await;
 	assert_eq!(
 		wfiles.len(),
 		ZEROS + ONES,
@@ -664,7 +612,7 @@ async fn scale_10_local_move_batch_is_moves_not_reupload() {
 	let r1 = sc.sync().await;
 	assert!(r1.errors.is_empty(), "{r1:?}");
 	assert_eq!(r1.uploaded, N, "{r1:?}");
-	let a_uuid = find_dir(&list_root(&sc).await.0, "A")
+	let a_uuid = find_dir(&sc.list_root().await.0, "A")
 		.expect("A dir present")
 		.uuid();
 
@@ -692,11 +640,11 @@ async fn scale_10_local_move_batch_is_moves_not_reupload() {
 	);
 
 	// Remote reflects the move: the same directory, now named B, holding every file.
-	let (dirs, _) = list_root(&sc).await;
+	let (dirs, _) = sc.list_root().await;
 	assert!(find_dir(&dirs, "A").is_none(), "A should be gone");
 	let b = find_dir(&dirs, "B").expect("B dir present");
 	assert_eq!(b.uuid(), a_uuid, "the directory keeps its uuid");
-	let (_, bfiles) = list_dir(&sc, b).await;
+	let (_, bfiles) = sc.list_dir(b).await;
 	assert_eq!(bfiles.len(), N, "all files re-parented under B");
 	for i in 0..N {
 		assert_eq!(
@@ -849,7 +797,7 @@ async fn scale_11_mass_local_delete_is_held() {
 	);
 
 	// Remote still has every file (nothing nuked, no partial delete).
-	let (_, files) = list_root(&sc).await;
+	let (_, files) = sc.list_root().await;
 	assert_eq!(
 		files.len(),
 		N,
@@ -873,12 +821,14 @@ async fn scale_12_remote_delete_batch_quarantined_recoverable() {
 	let mut keep = Vec::new();
 	let mut drop = Vec::new();
 	for i in 0..KEEP {
-		keep.push(upload_root(&sc, &format!("k{i:02}.txt"), format!("keep-{i}").as_bytes()).await);
+		keep.push(
+			sc.upload_root(&format!("k{i:02}.txt"), format!("keep-{i}").as_bytes())
+				.await,
+		);
 	}
 	for i in 0..DROP {
 		drop.push(
-			upload_root(
-				&sc,
+			sc.upload_root(
 				&format!("d{i:02}.txt"),
 				format!("drop-payload-{i}").as_bytes(),
 			)
@@ -961,7 +911,7 @@ async fn scale_22_remote_subtree_delete_removes_local_subtree() {
 			.await,
 		);
 	}
-	let outside = upload_root(&sc, "outside.txt", b"survivor").await;
+	let outside = sc.upload_root("outside.txt", b"survivor").await;
 	assert!(poll_for_item(sc.cache.db_path(), doomed.uuid(), CACHE_CONVERGE_TIMEOUT).await);
 	for f in inside.iter().chain(std::iter::once(&outside)) {
 		assert!(poll_for_item(sc.cache.db_path(), f.uuid(), CACHE_CONVERGE_TIMEOUT).await);
@@ -1096,11 +1046,11 @@ async fn scale_15_mixed_large_batch_one_pass() {
 	);
 
 	// Net remote file count: 24 + 6 new - 3 deleted = 27 (moves don't change the count).
-	let (dirs, _) = list_root(&sc).await;
+	let (dirs, _) = sc.list_root().await;
 	let base = find_dir(&dirs, "base").expect("base dir");
 	let moved = find_dir(&dirs, "moved").expect("moved dir");
-	let (_, bfiles) = list_dir(&sc, base).await;
-	let (_, mfiles) = list_dir(&sc, moved).await;
+	let (_, bfiles) = sc.list_dir(base).await;
+	let (_, mfiles) = sc.list_dir(moved).await;
 	assert_eq!(
 		bfiles.len() + mfiles.len(),
 		BASE + 6 - 3,
@@ -1174,9 +1124,9 @@ async fn scale_24_duplicate_content_files_no_aliasing() {
 		"every duplicate uploaded, none dropped: {r1:?}"
 	);
 
-	let (dirs, _) = list_root(&sc).await;
+	let (dirs, _) = sc.list_root().await;
 	let d = find_dir(&dirs, "dup").expect("dup dir");
-	let (_, files) = list_dir(&sc, d).await;
+	let (_, files) = sc.list_dir(d).await;
 	assert_eq!(
 		files.len(),
 		N,
@@ -1208,9 +1158,9 @@ async fn scale_24_duplicate_content_files_no_aliasing() {
 	);
 	assert_eq!(r2.remotely_trashed, 0, "{r2:?}");
 
-	let (dirs, _) = list_root(&sc).await;
+	let (dirs, _) = sc.list_root().await;
 	let d = find_dir(&dirs, "dup").expect("dup dir");
-	let (_, files) = list_dir(&sc, d).await;
+	let (_, files) = sc.list_dir(d).await;
 	assert_eq!(
 		find_file(&files, "f000.txt").unwrap().size,
 		b"now this one is different and longer".len() as u64
@@ -1246,12 +1196,8 @@ async fn scale_19_first_sync_into_populated_remote_no_wipe() {
 	let mut remote_files = Vec::new();
 	for i in 0..SHARED_SAME {
 		remote_files.push(
-			upload_root(
-				&sc,
-				&format!("same{i}.txt"),
-				format!("agree-{i}").as_bytes(),
-			)
-			.await,
+			sc.upload_root(&format!("same{i}.txt"), format!("agree-{i}").as_bytes())
+				.await,
 		);
 		write_file(
 			&sc.local,
@@ -1261,12 +1207,8 @@ async fn scale_19_first_sync_into_populated_remote_no_wipe() {
 	}
 	for i in 0..SHARED_DIFF {
 		remote_files.push(
-			upload_root(
-				&sc,
-				&format!("diff{i}.txt"),
-				format!("REMOTE-{i}").as_bytes(),
-			)
-			.await,
+			sc.upload_root(&format!("diff{i}.txt"), format!("REMOTE-{i}").as_bytes())
+				.await,
 		);
 		write_file(
 			&sc.local,
@@ -1276,8 +1218,7 @@ async fn scale_19_first_sync_into_populated_remote_no_wipe() {
 	}
 	for i in 0..REMOTE_ONLY {
 		remote_files.push(
-			upload_root(
-				&sc,
+			sc.upload_root(
 				&format!("ronly{i}.txt"),
 				format!("remote-only-{i}").as_bytes(),
 			)
@@ -1337,7 +1278,7 @@ async fn scale_19_first_sync_into_populated_remote_no_wipe() {
 				format!("remote-only-{i}").as_bytes(),
 			)
 		});
-		let (_, files) = list_root(&sc).await;
+		let (_, files) = sc.list_root().await;
 		let have_local =
 			(0..LOCAL_ONLY).all(|i| find_file(&files, &format!("lonly{i}.txt")).is_some());
 		if have_remote && have_local {
@@ -1394,7 +1335,7 @@ async fn scale_20_local_backup_delete_not_mirrored() {
 	);
 
 	// All remote files remain.
-	let (_, files) = list_root(&sc).await;
+	let (_, files) = sc.list_root().await;
 	assert_eq!(
 		files.len(),
 		N,
@@ -1586,24 +1527,12 @@ async fn scale_c_two_way_both_sides_disjoint_changes() {
 /// (ground truth), asserting all `n` of them exist.
 async fn remote_conflict_uuids(tc: &TwoClients, n: usize) -> Vec<Uuid> {
 	let client = &tc.resources.client;
-	let (dirs, _f) = client
-		.list_dir(
-			&DirType::<Normal>::Dir(Cow::Borrowed(&tc.resources.dir)),
-			None::<&fn(u64, Option<u64>)>,
-		)
-		.await
-		.unwrap();
+	let (dirs, _f) = list_dir(client, &tc.resources.dir).await;
 	let c_dir = dirs
 		.iter()
 		.find(|d| d.name() == Some("c"))
 		.expect("the remote c/ dir is missing");
-	let (_d, files) = client
-		.list_dir(
-			&DirType::<Normal>::Dir(Cow::Borrowed(c_dir)),
-			None::<&fn(u64, Option<u64>)>,
-		)
-		.await
-		.unwrap();
+	let (_d, files) = list_dir(client, c_dir).await;
 	(0..n)
 		.map(|i| {
 			let name = format!("c{i:02}.txt");
@@ -1776,7 +1705,7 @@ async fn scale_e_long_and_unicode_filenames() {
 	assert!(r1.errors.is_empty(), "{r1:?}");
 	assert_eq!(r1.uploaded, N, "all long-named files uploaded: {r1:?}");
 
-	let (_, files) = list_root(&sc).await;
+	let (_, files) = sc.list_root().await;
 	assert_eq!(
 		files.len(),
 		N,
@@ -1998,7 +1927,7 @@ async fn scale_16_watch_debounces_local_event_burst() {
 	);
 
 	// Byte-exact on the remote...
-	let (_dirs, files) = list_root(&sc).await;
+	let (_dirs, files) = sc.list_root().await;
 	assert_eq!(files.len(), N, "remote file count mismatch");
 	for i in 0..N {
 		let name = format!("burst{i:03}.txt");

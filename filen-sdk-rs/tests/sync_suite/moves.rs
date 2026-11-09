@@ -12,7 +12,6 @@ use filen_macros::shared_test_runtime;
 use filen_sdk_rs::fs::categories::{DirType, Normal};
 use filen_sdk_rs::fs::dir::RemoteDirectory;
 use filen_sdk_rs::fs::dir::meta::DirectoryMetaChanges;
-use filen_sdk_rs::fs::file::RemoteFile;
 use filen_sdk_rs::fs::file::meta::FileMetaChanges;
 use filen_sdk_rs::fs::{HasName, HasUUID};
 use filen_sdk_rs::sync_engine::{SyncEvent, SyncMode, SyncReport};
@@ -24,47 +23,6 @@ use crate::helpers::*;
 // ----------------------------------------------------------------------------
 // Local remote-listing / verification helpers (ground truth via the client).
 // ----------------------------------------------------------------------------
-
-/// List the (dirs, files) directly under a remote directory via a client (ground truth).
-async fn list_dir(
-	client: &filen_sdk_rs::auth::Client,
-	dir: &RemoteDirectory,
-) -> (Vec<RemoteDirectory>, Vec<RemoteFile>) {
-	client
-		.list_dir(
-			&DirType::<Normal>::Dir(Cow::Borrowed(dir)),
-			None::<&fn(u64, Option<u64>)>,
-		)
-		.await
-		.unwrap()
-}
-
-fn find_file<'a>(files: &'a [RemoteFile], name: &str) -> Option<&'a RemoteFile> {
-	files.iter().find(|f| f.name() == Some(name))
-}
-
-fn find_dir<'a>(dirs: &'a [RemoteDirectory], name: &str) -> Option<&'a RemoteDirectory> {
-	dirs.iter().find(|d| d.name() == Some(name))
-}
-
-/// A `DirType` borrowing `resources.dir` (the pair's remote root) for client scenario ops.
-fn root_dirtype(sc: &SingleClient) -> DirType<'_, Normal> {
-	DirType::<Normal>::Dir(Cow::Borrowed(&sc.resources.dir))
-}
-
-/// Upload bytes to the single-client remote root, returning the created file.
-async fn upload_root(sc: &SingleClient, name: &str, data: &[u8]) -> RemoteFile {
-	let builder = sc
-		.resources
-		.client
-		.make_file_builder(name, sc.resources.dir.uuid())
-		.unwrap();
-	sc.resources
-		.client
-		.upload_file(builder, data)
-		.await
-		.unwrap()
-}
 
 /// Every relative path in `root`'s tree, sorted (quarantine bin excluded, as `walk_tree` does) —
 /// for asserting an exact end state rather than "the bytes are recoverable somewhere".
@@ -247,7 +205,7 @@ async fn move03_cross_directory_move() {
 #[shared_test_runtime]
 async fn move04_remote_rename_pulled_down() {
 	let sc = single_client(SyncMode::RemoteToLocal).await;
-	let mut rf = upload_root(&sc, "report.pdf", b"PDF-bytes-C1").await;
+	let mut rf = sc.upload_root("report.pdf", b"PDF-bytes-C1").await;
 	wait_cache_has(&sc, rf.uuid()).await;
 
 	let r1 = sc.sync().await;
@@ -803,7 +761,7 @@ async fn move16_local_backup_mirrors_a_rename_as_a_move() {
 #[shared_test_runtime]
 async fn move16_remote_backup_mirrors_a_rename_as_a_move() {
 	let sc = single_client(SyncMode::RemoteBackup).await;
-	let mut rf = upload_root(&sc, "mv.txt", b"backup-C1").await;
+	let mut rf = sc.upload_root("mv.txt", b"backup-C1").await;
 	wait_cache_has(&sc, rf.uuid()).await;
 	let r1 = sc.sync().await;
 	assert!(r1.errors.is_empty(), "{r1:?}");
@@ -1297,7 +1255,7 @@ async fn move_a1_remote_directory_rename_pulled_down() {
 	let mut docs = sc
 		.resources
 		.client
-		.create_dir(&root_dirtype(&sc), "docs")
+		.create_dir(&sc.root_dirtype(), "docs")
 		.await
 		.unwrap();
 	let f1b = sc
@@ -1749,7 +1707,7 @@ async fn move_a6_move_into_simultaneously_renamed_dir() {
 #[shared_test_runtime]
 async fn move_a7_remote_move_with_edit_leaves_no_quarantine_copy() {
 	let sc = single_client(SyncMode::RemoteToLocal).await;
-	let mut rf = upload_root(&sc, "report.pdf", b"PDF-bytes-C1").await;
+	let mut rf = sc.upload_root("report.pdf", b"PDF-bytes-C1").await;
 	wait_cache_has(&sc, rf.uuid()).await;
 	let r1 = sc.sync().await;
 	assert!(r1.errors.is_empty(), "{r1:?}");
@@ -1767,7 +1725,9 @@ async fn move_a7_remote_move_with_edit_leaves_no_quarantine_copy() {
 		)
 		.await
 		.unwrap();
-	let edited = upload_root(&sc, "final.pdf", b"PDF-bytes-C2-and-longer").await;
+	let edited = sc
+		.upload_root("final.pdf", b"PDF-bytes-C2-and-longer")
+		.await;
 	wait_cache_has(&sc, edited.uuid()).await;
 	assert!(
 		poll_for_item_absent(sc.cache.db_path(), superseded, CACHE_CONVERGE_TIMEOUT).await,
@@ -1925,7 +1885,7 @@ async fn local_case_only_dir_rename(mode: SyncMode) {
 async fn remote_case_only_dir_rename(mode: SyncMode) {
 	let sc = single_client(mode).await;
 	let client = &sc.resources.client;
-	let mut docs = client.create_dir(&root_dirtype(&sc), "Docs").await.unwrap();
+	let mut docs = client.create_dir(&sc.root_dirtype(), "Docs").await.unwrap();
 	let a = client
 		.upload_file(
 			client.make_file_builder("a.txt", docs.uuid()).unwrap(),
@@ -2119,7 +2079,7 @@ async fn remote_dir_move(mode: SyncMode) {
 	let sc = single_client(mode).await;
 	let client = &sc.resources.client;
 	let archive = client
-		.create_dir(&root_dirtype(&sc), "archive")
+		.create_dir(&sc.root_dirtype(), "archive")
 		.await
 		.unwrap();
 	let keep = client
@@ -2131,7 +2091,7 @@ async fn remote_dir_move(mode: SyncMode) {
 		)
 		.await
 		.unwrap();
-	let mut docs = client.create_dir(&root_dirtype(&sc), "docs").await.unwrap();
+	let mut docs = client.create_dir(&sc.root_dirtype(), "docs").await.unwrap();
 	let a = client
 		.upload_file(
 			client.make_file_builder("a.txt", docs.uuid()).unwrap(),

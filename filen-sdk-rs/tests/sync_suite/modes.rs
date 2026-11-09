@@ -4,16 +4,12 @@
 //! in which direction, and — critically — what it must REFUSE to do (backup modes never delete on
 //! their destination; one-directional modes never write back to their source; two-way surfaces
 //! genuine divergence as a conflict rather than silently losing a side).
-use std::{borrow::Cow, time::Duration};
+use std::time::Duration;
 
 use filen_macros::shared_test_runtime;
 use filen_sdk_rs::sync_engine::{Backlog, GuardReason, PlannedActionKind};
 use filen_sdk_rs::{
-	fs::{
-		HasName, HasUUID,
-		categories::{DirType, Normal},
-		file::RemoteFile,
-	},
+	fs::{HasName, HasUUID},
 	sync_engine::SyncMode,
 };
 use uuid::Uuid;
@@ -30,47 +26,6 @@ use crate::helpers::*;
 // observe it (poll_for_item / poll_for_file_name / poll_for_item_absent / a cached-size poll)
 // before driving `sc.sync()`.
 // ----------------------------------------------------------------------------
-
-/// The remote sync-root as a `DirType` for client list/create calls.
-fn root_dirtype(sc: &SingleClient) -> DirType<'_, Normal> {
-	DirType::<Normal>::Dir(Cow::Borrowed(&sc.resources.dir))
-}
-
-/// Upload a file with exact bytes directly to the remote root; returns the created `RemoteFile`.
-async fn upload_remote(sc: &SingleClient, name: &str, data: &[u8]) -> RemoteFile {
-	let builder = sc
-		.resources
-		.client
-		.make_file_builder(name, sc.resources.dir.uuid())
-		.unwrap();
-	sc.resources
-		.client
-		.upload_file(builder, data)
-		.await
-		.unwrap()
-}
-
-/// List (dirs, files) directly under the remote root via the client (ground truth).
-async fn list_remote_root(
-	sc: &SingleClient,
-) -> (Vec<filen_sdk_rs::fs::dir::RemoteDirectory>, Vec<RemoteFile>) {
-	sc.resources
-		.client
-		.list_dir(&root_dirtype(sc), None::<&fn(u64, Option<u64>)>)
-		.await
-		.unwrap()
-}
-
-fn find_file<'a>(files: &'a [RemoteFile], name: &str) -> Option<&'a RemoteFile> {
-	files.iter().find(|f| f.name() == Some(name))
-}
-
-fn find_dir<'a>(
-	dirs: &'a [filen_sdk_rs::fs::dir::RemoteDirectory],
-	name: &str,
-) -> Option<&'a filen_sdk_rs::fs::dir::RemoteDirectory> {
-	dirs.iter().find(|d| d.name() == Some(name))
-}
 
 /// Wait until the cache observes `uuid` under the remote root, asserting on timeout.
 async fn wait_cache_has(sc: &SingleClient, uuid: Uuid) {
@@ -92,7 +47,7 @@ async fn wait_cache_absent(sc: &SingleClient, uuid: Uuid) {
 /// cache reflects the new uuid AND its new size — so the engine reconciles against fully-committed
 /// new content rather than a transient mid-versioning state. Returns the new uuid.
 async fn modify_remote(sc: &SingleClient, name: &str, new_data: &[u8]) -> Uuid {
-	let new_rf = upload_remote(sc, name, new_data).await;
+	let new_rf = sc.upload_root(name, new_data).await;
 	let new_uuid: Uuid = new_rf.uuid();
 	wait_cache_has(sc, new_uuid).await;
 	let db = sc.cache.db_path().to_path_buf();
@@ -148,7 +103,7 @@ async fn mode_01_l2r_local_create_pushes_up_byte_exact() {
 		"local foo.txt changed"
 	);
 	// Remote has exactly foo.txt with 3 bytes and nothing else.
-	let (_dirs, files) = list_remote_root(&sc).await;
+	let (_dirs, files) = sc.list_root().await;
 	assert_eq!(files.len(), 1, "remote should hold exactly one file");
 	assert_eq!(find_file(&files, "foo.txt").unwrap().size, 3, "{files:?}");
 
@@ -168,7 +123,7 @@ async fn mode_02_l2r_mirrors_local_deletion() {
 	assert_eq!(r2.remotely_trashed, 1, "local delete must mirror: {r2:?}");
 	assert_eq!(r2.held_deletions(), 0, "{r2:?}");
 
-	let (_dirs, files) = list_remote_root(&sc).await;
+	let (_dirs, files) = sc.list_root().await;
 	assert!(
 		find_file(&files, "foo.txt").is_none(),
 		"remote still has it"
@@ -209,7 +164,7 @@ async fn mode_04_l2r_remote_only_deletion_recreated_from_local() {
 	write_file(&sc.local, "baz.txt", b"Z");
 	let r1 = sc.sync().await;
 	assert_eq!(r1.uploaded, 1, "{r1:?}");
-	let (_d, mut files0) = list_remote_root(&sc).await;
+	let (_d, mut files0) = sc.list_root().await;
 	let idx = files0
 		.iter()
 		.position(|f| f.name() == Some("baz.txt"))
@@ -231,7 +186,7 @@ async fn mode_04_l2r_remote_only_deletion_recreated_from_local() {
 	assert_eq!(r2.locally_deleted, 0, "{r2:?}");
 	assert!(read_eq(&sc.local, "baz.txt", b"Z"), "local untouched");
 
-	let (_d, files1) = list_remote_root(&sc).await;
+	let (_d, files1) = sc.list_root().await;
 	assert_eq!(find_file(&files1, "baz.txt").unwrap().size, 1, "{files1:?}");
 
 	sc.cleanup();
@@ -244,7 +199,7 @@ async fn mode_04_l2r_remote_only_deletion_recreated_from_local() {
 #[shared_test_runtime]
 async fn mode_05_r2l_remote_create_pulls_down_byte_exact() {
 	let sc = single_client(SyncMode::RemoteToLocal).await;
-	let rf = upload_remote(&sc, "doc.txt", b"HELLO").await;
+	let rf = sc.upload_root("doc.txt", b"HELLO").await;
 	wait_cache_has(&sc, rf.uuid()).await;
 
 	let report = sc.sync().await;
@@ -256,7 +211,7 @@ async fn mode_05_r2l_remote_create_pulls_down_byte_exact() {
 
 	assert!(read_eq(&sc.local, "doc.txt", b"HELLO"), "byte mismatch");
 	// Remote still present unchanged.
-	let (_dirs, files) = list_remote_root(&sc).await;
+	let (_dirs, files) = sc.list_root().await;
 	assert_eq!(find_file(&files, "doc.txt").unwrap().size, 5, "{files:?}");
 
 	sc.cleanup();
@@ -265,7 +220,7 @@ async fn mode_05_r2l_remote_create_pulls_down_byte_exact() {
 #[shared_test_runtime]
 async fn mode_06_r2l_mirrors_remote_deletion_locally() {
 	let sc = single_client(SyncMode::RemoteToLocal).await;
-	let mut rf = upload_remote(&sc, "doc.txt", b"D").await;
+	let mut rf = sc.upload_root("doc.txt", b"D").await;
 	wait_cache_has(&sc, rf.uuid()).await;
 	let r1 = sc.sync().await;
 	assert_eq!(r1.downloaded, 1, "{r1:?}");
@@ -294,7 +249,7 @@ async fn mode_06_r2l_mirrors_remote_deletion_locally() {
 #[shared_test_runtime]
 async fn mode_07_r2l_refuses_to_push_local_only_edit() {
 	let sc = single_client(SyncMode::RemoteToLocal).await;
-	let rf = upload_remote(&sc, "note.txt", b"P").await;
+	let rf = sc.upload_root("note.txt", b"P").await;
 	wait_cache_has(&sc, rf.uuid()).await;
 	let r1 = sc.sync().await;
 	assert_eq!(r1.downloaded, 1, "{r1:?}");
@@ -308,7 +263,7 @@ async fn mode_07_r2l_refuses_to_push_local_only_edit() {
 	assert_eq!(r2.conflicts.len(), 0, "pull mode must not conflict: {r2:?}");
 
 	// Remote content unchanged ('P').
-	let (_dirs, files) = list_remote_root(&sc).await;
+	let (_dirs, files) = sc.list_root().await;
 	assert_eq!(
 		find_file(&files, "note.txt").unwrap().size,
 		1,
@@ -321,7 +276,7 @@ async fn mode_07_r2l_refuses_to_push_local_only_edit() {
 #[shared_test_runtime]
 async fn mode_add_r2l_remote_edit_pulls_down() {
 	let sc = single_client(SyncMode::RemoteToLocal).await;
-	let rf = upload_remote(&sc, "re.txt", b"P").await;
+	let rf = sc.upload_root("re.txt", b"P").await;
 	wait_cache_has(&sc, rf.uuid()).await;
 	let r1 = sc.sync().await;
 	assert_eq!(r1.downloaded, 1, "{r1:?}");
@@ -349,7 +304,7 @@ async fn mode_add_r2l_remote_edit_pulls_down() {
 #[shared_test_runtime]
 async fn mode_08_twoway_local_up_and_remote_down_one_pass() {
 	let sc = single_client(SyncMode::TwoWay).await;
-	let rf = upload_remote(&sc, "only.remote.txt", b"R").await;
+	let rf = sc.upload_root("only.remote.txt", b"R").await;
 	wait_cache_has(&sc, rf.uuid()).await;
 	write_file(&sc.local, "only.local.txt", b"L");
 
@@ -369,7 +324,7 @@ async fn mode_08_twoway_local_up_and_remote_down_one_pass() {
 		"remote->local failed"
 	);
 	assert!(read_eq(&sc.local, "only.local.txt", b"L"), "local intact");
-	let (_dirs, files) = list_remote_root(&sc).await;
+	let (_dirs, files) = sc.list_root().await;
 	assert!(
 		find_file(&files, "only.local.txt").is_some(),
 		"local->remote failed"
@@ -389,7 +344,7 @@ async fn mode_08_twoway_local_up_and_remote_down_one_pass() {
 async fn mode_09_twoway_divergent_edit_conflicts_nondestructively() {
 	let sc = single_client(SyncMode::TwoWay).await;
 	let base = b"BASE";
-	let rf = upload_remote(&sc, "c.txt", base).await;
+	let rf = sc.upload_root("c.txt", base).await;
 	wait_cache_has(&sc, rf.uuid()).await;
 	write_file(&sc.local, "c.txt", base);
 	// Establish a shared baseline (identical content -> no conflict).
@@ -418,7 +373,7 @@ async fn mode_09_twoway_divergent_edit_conflicts_nondestructively() {
 		"local clobbered"
 	);
 	// The remote edit is still present (recoverable) — nothing destroyed without a copy.
-	let (_dirs, files) = list_remote_root(&sc).await;
+	let (_dirs, files) = sc.list_root().await;
 	assert!(
 		find_file(&files, "c.txt").is_some(),
 		"remote side destroyed: {files:?}"
@@ -430,7 +385,7 @@ async fn mode_09_twoway_divergent_edit_conflicts_nondestructively() {
 #[shared_test_runtime]
 async fn mode_10_twoway_one_sided_edit_not_a_conflict() {
 	let sc = single_client(SyncMode::TwoWay).await;
-	let rf = upload_remote(&sc, "d.txt", b"BASE").await;
+	let rf = sc.upload_root("d.txt", b"BASE").await;
 	wait_cache_has(&sc, rf.uuid()).await;
 	write_file(&sc.local, "d.txt", b"BASE");
 	let r1 = sc.sync().await;
@@ -452,7 +407,7 @@ async fn mode_10_twoway_one_sided_edit_not_a_conflict() {
 	assert_eq!(r2.uploaded, 1, "local edit should push up: {r2:?}");
 	assert!(read_eq(&sc.local, "d.txt", b"NEW"), "local changed");
 
-	let (_dirs, files) = list_remote_root(&sc).await;
+	let (_dirs, files) = sc.list_root().await;
 	assert_eq!(
 		find_file(&files, "d.txt").unwrap().size,
 		3,
@@ -469,7 +424,7 @@ async fn mode_10_twoway_one_sided_edit_not_a_conflict() {
 #[shared_test_runtime]
 async fn mode_11_twoway_one_sided_delete_propagates() {
 	let sc = single_client(SyncMode::TwoWay).await;
-	let rf = upload_remote(&sc, "e.txt", b"E").await;
+	let rf = sc.upload_root("e.txt", b"E").await;
 	wait_cache_has(&sc, rf.uuid()).await;
 	write_file(&sc.local, "e.txt", b"E");
 	let r1 = sc.sync().await;
@@ -486,7 +441,7 @@ async fn mode_11_twoway_one_sided_delete_propagates() {
 	);
 	assert_eq!(r2.remotely_trashed, 1, "delete must propagate: {r2:?}");
 
-	let (_dirs, files) = list_remote_root(&sc).await;
+	let (_dirs, files) = sc.list_root().await;
 	assert!(
 		find_file(&files, "e.txt").is_none(),
 		"remote still has it: {files:?}"
@@ -501,7 +456,7 @@ async fn mode_11_twoway_one_sided_delete_propagates() {
 #[shared_test_runtime]
 async fn mode_12_twoway_delete_vs_edit_conflicts_nondestructively() {
 	let sc = single_client(SyncMode::TwoWay).await;
-	let rf = upload_remote(&sc, "f.txt", b"BASE").await;
+	let rf = sc.upload_root("f.txt", b"BASE").await;
 	wait_cache_has(&sc, rf.uuid()).await;
 	write_file(&sc.local, "f.txt", b"BASE");
 	let r1 = sc.sync().await;
@@ -519,7 +474,7 @@ async fn mode_12_twoway_delete_vs_edit_conflicts_nondestructively() {
 	);
 	// The edited remote file must NOT be silently destroyed by the local delete.
 	assert_eq!(r2.remotely_trashed, 0, "remote edit destroyed: {r2:?}");
-	let (_dirs, files) = list_remote_root(&sc).await;
+	let (_dirs, files) = sc.list_root().await;
 	assert!(
 		find_file(&files, "f.txt").is_some(),
 		"remote edit lost: {files:?}"
@@ -531,7 +486,7 @@ async fn mode_12_twoway_delete_vs_edit_conflicts_nondestructively() {
 #[shared_test_runtime]
 async fn mode_add_twoway_convergent_identical_edit_not_a_conflict() {
 	let sc = single_client(SyncMode::TwoWay).await;
-	let rf = upload_remote(&sc, "cv.txt", b"BASE").await;
+	let rf = sc.upload_root("cv.txt", b"BASE").await;
 	wait_cache_has(&sc, rf.uuid()).await;
 	write_file(&sc.local, "cv.txt", b"BASE");
 	let r1 = sc.sync().await;
@@ -552,7 +507,7 @@ async fn mode_add_twoway_convergent_identical_edit_not_a_conflict() {
 		read_eq(&sc.local, "cv.txt", b"SAME-NEW"),
 		"local content changed"
 	);
-	let (_dirs, files) = list_remote_root(&sc).await;
+	let (_dirs, files) = sc.list_root().await;
 	assert_eq!(find_file(&files, "cv.txt").unwrap().size, 8, "{files:?}");
 
 	// Baseline advanced to SAME-NEW -> second pass is a no-op.
@@ -568,7 +523,7 @@ async fn mode_add_twoway_convergent_identical_edit_not_a_conflict() {
 async fn mode_add_twoway_create_create_different_content_conflicts() {
 	let sc = single_client(SyncMode::TwoWay).await;
 	// No baseline entry for new.txt: distinct creates on both sides at the same path.
-	let rf = upload_remote(&sc, "new.txt", b"REMOTE-NEW").await;
+	let rf = sc.upload_root("new.txt", b"REMOTE-NEW").await;
 	wait_cache_has(&sc, rf.uuid()).await;
 	write_file(&sc.local, "new.txt", b"LOCAL-NEW");
 
@@ -585,7 +540,7 @@ async fn mode_add_twoway_create_create_different_content_conflicts() {
 		read_eq(&sc.local, "new.txt", b"LOCAL-NEW"),
 		"local create clobbered"
 	);
-	let (_dirs, files) = list_remote_root(&sc).await;
+	let (_dirs, files) = sc.list_root().await;
 	assert!(
 		find_file(&files, "new.txt").is_some(),
 		"remote create lost: {files:?}"
@@ -597,7 +552,7 @@ async fn mode_add_twoway_create_create_different_content_conflicts() {
 #[shared_test_runtime]
 async fn mode_add_twoway_convergent_delete_clean() {
 	let sc = single_client(SyncMode::TwoWay).await;
-	let mut rf = upload_remote(&sc, "dd.txt", b"DD").await;
+	let mut rf = sc.upload_root("dd.txt", b"DD").await;
 	wait_cache_has(&sc, rf.uuid()).await;
 	write_file(&sc.local, "dd.txt", b"DD");
 	let r1 = sc.sync().await;
@@ -619,7 +574,7 @@ async fn mode_add_twoway_convergent_delete_clean() {
 	assert_eq!(r2.uploaded, 0, "{r2:?}");
 	assert_eq!(r2.downloaded, 0, "{r2:?}");
 	assert!(!sc.local.join("dd.txt").exists(), "local resurrected");
-	let (_dirs, files) = list_remote_root(&sc).await;
+	let (_dirs, files) = sc.list_root().await;
 	assert!(
 		find_file(&files, "dd.txt").is_none(),
 		"remote resurrected: {files:?}"
@@ -653,7 +608,7 @@ async fn mode_13_local_backup_never_mirrors_local_deletion() {
 		r2.remotely_trashed, 0,
 		"backup must not trash remote: {r2:?}"
 	);
-	let (_dirs, files) = list_remote_root(&sc).await;
+	let (_dirs, files) = sc.list_root().await;
 	assert!(
 		find_file(&files, "k.txt").is_some(),
 		"remote copy was deleted: {files:?}"
@@ -665,7 +620,7 @@ async fn mode_13_local_backup_never_mirrors_local_deletion() {
 	assert!(r3.errors.is_empty(), "{r3:?}");
 	assert_eq!(r3.uploaded, 1, "create must still push: {r3:?}");
 	assert_eq!(r3.remotely_trashed, 0, "{r3:?}");
-	let (_dirs, files2) = list_remote_root(&sc).await;
+	let (_dirs, files2) = sc.list_root().await;
 	assert!(
 		find_file(&files2, "k.txt").is_some(),
 		"k.txt vanished: {files2:?}"
@@ -691,7 +646,7 @@ async fn mode_14_local_backup_pushes_edit() {
 	assert_eq!(r2.uploaded, 1, "edit must push: {r2:?}");
 	assert_eq!(r2.remotely_trashed, 0, "{r2:?}");
 	assert!(read_eq(&sc.local, "m.txt", b"UPDATED"), "local changed");
-	let (_dirs, files) = list_remote_root(&sc).await;
+	let (_dirs, files) = sc.list_root().await;
 	assert_eq!(
 		find_file(&files, "m.txt").unwrap().size,
 		7,
@@ -704,7 +659,7 @@ async fn mode_14_local_backup_pushes_edit() {
 #[shared_test_runtime]
 async fn mode_15_remote_backup_never_mirrors_remote_deletion() {
 	let sc = single_client(SyncMode::RemoteBackup).await;
-	let mut rf = upload_remote(&sc, "r.txt", b"R").await;
+	let mut rf = sc.upload_root("r.txt", b"R").await;
 	wait_cache_has(&sc, rf.uuid()).await;
 	let r1 = sc.sync().await;
 	assert_eq!(r1.downloaded, 1, "{r1:?}");
@@ -722,7 +677,7 @@ async fn mode_15_remote_backup_never_mirrors_remote_deletion() {
 	assert!(read_eq(&sc.local, "r.txt", b"R"), "local copy was deleted");
 
 	// A subsequent remote create still propagates down.
-	let rnew = upload_remote(&sc, "rnew.txt", b"RN").await;
+	let rnew = sc.upload_root("rnew.txt", b"RN").await;
 	wait_cache_has(&sc, rnew.uuid()).await;
 	let r3 = sc.sync().await;
 	assert!(r3.errors.is_empty(), "{r3:?}");
@@ -737,7 +692,7 @@ async fn mode_15_remote_backup_never_mirrors_remote_deletion() {
 #[shared_test_runtime]
 async fn mode_16_remote_backup_refuses_to_push_local_only() {
 	let sc = single_client(SyncMode::RemoteBackup).await;
-	let rf = upload_remote(&sc, "s.txt", b"S").await;
+	let rf = sc.upload_root("s.txt", b"S").await;
 	wait_cache_has(&sc, rf.uuid()).await;
 	let r1 = sc.sync().await;
 	assert_eq!(r1.downloaded, 1, "{r1:?}");
@@ -749,7 +704,7 @@ async fn mode_16_remote_backup_refuses_to_push_local_only() {
 	assert_eq!(r2.uploaded, 0, "remote-backup must never push: {r2:?}");
 	assert_eq!(r2.remotely_trashed, 0, "{r2:?}");
 
-	let (_dirs, files) = list_remote_root(&sc).await;
+	let (_dirs, files) = sc.list_root().await;
 	assert_eq!(
 		find_file(&files, "s.txt").unwrap().size,
 		1,
@@ -791,7 +746,7 @@ async fn mode_add_local_backup_refuses_remote_edit_to_local() {
 #[shared_test_runtime]
 async fn mode_add_remote_backup_pulls_remote_edit() {
 	let sc = single_client(SyncMode::RemoteBackup).await;
-	let rf = upload_remote(&sc, "rb.txt", b"OLD").await;
+	let rf = sc.upload_root("rb.txt", b"OLD").await;
 	wait_cache_has(&sc, rf.uuid()).await;
 	let r1 = sc.sync().await;
 	assert_eq!(r1.downloaded, 1, "{r1:?}");
@@ -832,18 +787,10 @@ async fn mode_17_first_sync_full_directional_copy() {
 	assert_eq!(r1.conflicts.len(), 0, "{r1:?}");
 	assert_eq!(r1.remotely_trashed, 0, "{r1:?}");
 
-	let (dirs, files) = list_remote_root(&sc).await;
+	let (dirs, files) = sc.list_root().await;
 	assert!(find_file(&files, "top.txt").is_some(), "top.txt missing");
 	let dir = find_dir(&dirs, "dir").expect("dir/ missing");
-	let (_dd, dir_files) = sc
-		.resources
-		.client
-		.list_dir(
-			&DirType::<Normal>::Dir(Cow::Borrowed(dir)),
-			None::<&fn(u64, Option<u64>)>,
-		)
-		.await
-		.unwrap();
+	let (_dd, dir_files) = list_dir(&sc.resources.client, dir).await;
 	assert_eq!(
 		find_file(&dir_files, "a.txt").unwrap().size,
 		1,
@@ -868,7 +815,7 @@ async fn mode_17_first_sync_full_directional_copy() {
 async fn mode_18_first_sync_does_not_wipe_populated_destination() {
 	// local->remote: destination (remote) already holds keep-dest.txt; source has keep-src.txt.
 	let sc = single_client(SyncMode::LocalToRemote).await;
-	let dest = upload_remote(&sc, "keep-dest.txt", b"D").await;
+	let dest = sc.upload_root("keep-dest.txt", b"D").await;
 	wait_cache_has(&sc, dest.uuid()).await;
 	write_file(&sc.local, "keep-src.txt", b"S");
 
@@ -884,7 +831,7 @@ async fn mode_18_first_sync_does_not_wipe_populated_destination() {
 	assert_eq!(r1.held_deletions(), 1, "{r1:?}");
 	assert_eq!(r1.uploaded, 1, "source file should be copied: {r1:?}");
 
-	let (_dirs, files) = list_remote_root(&sc).await;
+	let (_dirs, files) = sc.list_root().await;
 	assert!(
 		find_file(&files, "keep-dest.txt").is_some(),
 		"destination wiped: {files:?}"
@@ -901,7 +848,7 @@ async fn mode_18_first_sync_does_not_wipe_populated_destination() {
 async fn mode_19_identical_no_baseline_recognized_as_synced() {
 	// two-way: same content on both sides with no baseline -> no churn.
 	let sc = single_client(SyncMode::TwoWay).await;
-	let rf = upload_remote(&sc, "same.txt", b"EQ").await;
+	let rf = sc.upload_root("same.txt", b"EQ").await;
 	wait_cache_has(&sc, rf.uuid()).await;
 	write_file(&sc.local, "same.txt", b"EQ");
 
@@ -914,7 +861,7 @@ async fn mode_19_identical_no_baseline_recognized_as_synced() {
 	assert_eq!(r1.conflicts.len(), 0, "{r1:?}");
 
 	assert!(read_eq(&sc.local, "same.txt", b"EQ"), "local changed");
-	let (_dirs, files) = list_remote_root(&sc).await;
+	let (_dirs, files) = sc.list_root().await;
 	assert_eq!(files.len(), 1, "remote churned: {files:?}");
 	assert_eq!(find_file(&files, "same.txt").unwrap().size, 2, "{files:?}");
 
@@ -976,7 +923,7 @@ async fn mode_20_switch_twoway_to_l2r_changes_deletion_directionality() {
 		"the local copy is re-pushed instead: {r2:?}"
 	);
 
-	let (_d, files) = list_remote_root(&sc).await;
+	let (_d, files) = sc.list_root().await;
 	assert!(
 		find_file(&files, "t.txt").is_none(),
 		"t.txt still on remote"
@@ -1015,7 +962,7 @@ async fn mode_21_switch_l2r_to_local_backup_stops_mirroring_deletes() {
 		0,
 		"not held either — never planned: {r2:?}"
 	);
-	let (_d, files) = list_remote_root(&sc).await;
+	let (_d, files) = sc.list_root().await;
 	assert!(
 		find_file(&files, "w.txt").is_some(),
 		"the backup copy must survive the local delete"
@@ -1075,7 +1022,7 @@ async fn mode_22_switch_local_backup_to_l2r_applies_the_standing_divergence() {
 	std::fs::remove_file(sc.local.join("y.txt")).unwrap();
 	let r4 = sc.sync().await;
 	assert_eq!(r4.remotely_trashed, 1, "{r4:?}");
-	let (_d, files) = list_remote_root(&sc).await;
+	let (_d, files) = sc.list_root().await;
 	assert!(files.is_empty(), "both deletions landed: {files:?}");
 
 	sc.cleanup();
@@ -1102,7 +1049,7 @@ async fn mode_22b_switch_local_backup_to_l2r_can_adopt_the_destination_instead()
 
 	// A file another client wrote straight to the destination: no baseline row anywhere, so the
 	// mirror the switch turns on reads it as an item to remove.
-	let theirs = upload_remote(&sc, "z.txt", b"Z-FROM-ANOTHER-CLIENT").await;
+	let theirs = sc.upload_root("z.txt", b"Z-FROM-ANOTHER-CLIENT").await;
 	wait_cache_has(&sc, theirs.uuid()).await;
 
 	sc.engine
@@ -1138,7 +1085,7 @@ async fn mode_22b_switch_local_backup_to_l2r_can_adopt_the_destination_instead()
 		!sc.local.join("z.txt").exists(),
 		"nor for an item it adopted from the destination"
 	);
-	let (_d, files) = list_remote_root(&sc).await;
+	let (_d, files) = sc.list_root().await;
 	assert!(
 		find_file(&files, "x.txt").is_some(),
 		"the adopted backup copy must survive the switch"
@@ -1153,7 +1100,7 @@ async fn mode_22b_switch_local_backup_to_l2r_can_adopt_the_destination_instead()
 	let r4 = sc.sync().await;
 	assert!(r4.errors.is_empty(), "{r4:?}");
 	assert_eq!(r4.remotely_trashed, 1, "{r4:?}");
-	let (_d, files) = list_remote_root(&sc).await;
+	let (_d, files) = sc.list_root().await;
 	assert!(
 		find_file(&files, "x.txt").is_some(),
 		"the adopted copy must still be there"
@@ -1183,7 +1130,7 @@ async fn mode_22c_adopt_destination_adopts_nothing_at_an_ignored_path() {
 
 	// Another client's file on the destination, hidden from this device by a user-level rule.
 	sc.engine.set_user_ignore("*.psd").await.unwrap();
-	let theirs = upload_remote(&sc, "theirs.psd", b"Z-FROM-ANOTHER-CLIENT").await;
+	let theirs = sc.upload_root("theirs.psd", b"Z-FROM-ANOTHER-CLIENT").await;
 	wait_cache_has(&sc, theirs.uuid()).await;
 	let hidden = sc.sync().await;
 	assert!(hidden.errors.is_empty(), "{hidden:?}");
@@ -1214,7 +1161,7 @@ async fn mode_22c_adopt_destination_adopts_nothing_at_an_ignored_path() {
 	let approved = sc.sync().await;
 	assert!(approved.errors.is_empty(), "{approved:?}");
 	assert_eq!(approved.remotely_trashed, 1, "{approved:?}");
-	let (_d, files) = list_remote_root(&sc).await;
+	let (_d, files) = sc.list_root().await;
 	assert!(find_file(&files, "theirs.psd").is_none(), "{files:?}");
 	assert!(find_file(&files, "x.txt").is_some(), "{files:?}");
 
@@ -1266,17 +1213,9 @@ async fn mode_23_local_rename_propagates_as_move_not_delete_create() {
 	assert_eq!(r1.uploaded, 1, "{r1:?}");
 	assert_eq!(r1.remote_dirs_created, 1, "{r1:?}");
 
-	let (dirs0, _f0) = list_remote_root(&sc).await;
+	let (dirs0, _f0) = sc.list_root().await;
 	let old0 = find_dir(&dirs0, "old").unwrap();
-	let (_od, old_files) = sc
-		.resources
-		.client
-		.list_dir(
-			&DirType::<Normal>::Dir(Cow::Borrowed(old0)),
-			None::<&fn(u64, Option<u64>)>,
-		)
-		.await
-		.unwrap();
+	let (_od, old_files) = list_dir(&sc.resources.client, old0).await;
 	let orig_uuid = find_file(&old_files, "name.txt").unwrap().uuid();
 
 	// Move/rename locally (same content).
@@ -1287,17 +1226,9 @@ async fn mode_23_local_rename_propagates_as_move_not_delete_create() {
 	assert_eq!(r2.uploaded, 0, "rename must NOT re-upload bytes: {r2:?}");
 	assert_eq!(r2.conflicts.len(), 0, "{r2:?}");
 
-	let (dirs1, _f1) = list_remote_root(&sc).await;
+	let (dirs1, _f1) = sc.list_root().await;
 	let new1 = find_dir(&dirs1, "new").expect("new/ dir missing");
-	let (_nd, new_files) = sc
-		.resources
-		.client
-		.list_dir(
-			&DirType::<Normal>::Dir(Cow::Borrowed(new1)),
-			None::<&fn(u64, Option<u64>)>,
-		)
-		.await
-		.unwrap();
+	let (_nd, new_files) = list_dir(&sc.resources.client, new1).await;
 	let moved = find_file(&new_files, "name.txt").expect("moved file missing");
 	assert_eq!(
 		moved.uuid(),
@@ -1335,7 +1266,7 @@ async fn mode_24_r2l_empty_source_leaves_populated_destination_intact() {
 async fn mode_25_twoway_idempotency_stable_across_repeated_passes() {
 	let sc = single_client(SyncMode::TwoWay).await;
 	// r.txt synced on both sides first (so a later local edit is a one-sided edit, not a create).
-	let rbase = upload_remote(&sc, "r.txt", b"R0").await;
+	let rbase = sc.upload_root("r.txt", b"R0").await;
 	wait_cache_has(&sc, rbase.uuid()).await;
 	write_file(&sc.local, "r.txt", b"R0");
 	let r0 = sc.sync().await;
@@ -1343,7 +1274,7 @@ async fn mode_25_twoway_idempotency_stable_across_repeated_passes() {
 
 	// A mix: create p.txt locally, create q.txt remotely, edit r.txt locally.
 	write_file(&sc.local, "p.txt", b"P");
-	let q = upload_remote(&sc, "q.txt", b"Q").await;
+	let q = sc.upload_root("q.txt", b"Q").await;
 	wait_cache_has(&sc, q.uuid()).await;
 	write_file(&sc.local, "r.txt", b"R1-edited");
 
@@ -1356,7 +1287,7 @@ async fn mode_25_twoway_idempotency_stable_across_repeated_passes() {
 		read_eq(&sc.local, "r.txt", b"R1-edited"),
 		"local r changed unexpectedly"
 	);
-	let (_dirs, files) = list_remote_root(&sc).await;
+	let (_dirs, files) = sc.list_root().await;
 	assert!(
 		find_file(&files, "p.txt").is_some(),
 		"p not pushed: {files:?}"
@@ -1405,17 +1336,9 @@ async fn mode_add_local_backup_rename_does_not_delete_old_remote_copy() {
 		"backup must not trash on a move: {r2:?}"
 	);
 
-	let (dirs, _files) = list_remote_root(&sc).await;
+	let (dirs, _files) = sc.list_root().await;
 	let new_dir = find_dir(&dirs, "new").expect("new/ dir missing on remote");
-	let (_nd, new_files) = sc
-		.resources
-		.client
-		.list_dir(
-			&DirType::<Normal>::Dir(Cow::Borrowed(new_dir)),
-			None::<&fn(u64, Option<u64>)>,
-		)
-		.await
-		.unwrap();
+	let (_nd, new_files) = list_dir(&sc.resources.client, new_dir).await;
 	assert_eq!(
 		find_file(&new_files, "n.txt").map(|f| f.size),
 		Some(1),
@@ -1437,7 +1360,7 @@ async fn mode_add_twoway_directory_create_and_delete_propagate() {
 	let rdir = sc
 		.resources
 		.client
-		.create_dir(&root_dirtype(&sc), "rdir")
+		.create_dir(&sc.root_dirtype(), "rdir")
 		.await
 		.unwrap();
 	wait_cache_has(&sc, rdir.uuid()).await;
@@ -1446,7 +1369,7 @@ async fn mode_add_twoway_directory_create_and_delete_propagate() {
 	assert!(r1.errors.is_empty(), "{r1:?}");
 	assert_eq!(r1.conflicts.len(), 0, "{r1:?}");
 	// ldir/ propagated up; rdir/ propagated down.
-	let (dirs, _files) = list_remote_root(&sc).await;
+	let (dirs, _files) = sc.list_root().await;
 	assert!(
 		find_dir(&dirs, "ldir").is_some(),
 		"ldir not pushed: {dirs:?}"
@@ -1466,7 +1389,7 @@ async fn mode_add_twoway_directory_create_and_delete_propagate() {
 		r2.remotely_trashed >= 1,
 		"local dir deletion must mirror to remote: {r2:?}"
 	);
-	let (dirs2, _f2) = list_remote_root(&sc).await;
+	let (dirs2, _f2) = sc.list_root().await;
 	assert!(
 		find_dir(&dirs2, "ldir").is_none(),
 		"remote still has ldir: {dirs2:?}"

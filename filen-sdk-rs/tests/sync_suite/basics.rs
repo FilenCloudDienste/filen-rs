@@ -35,67 +35,14 @@ use crate::helpers::*;
 // and verify ground truth by listing the remote dir.
 // ----------------------------------------------------------------------------
 
-/// The remote sync-root `DirType` for a single-client setup.
-fn sc_root(sc: &SingleClient) -> DirType<'_, Normal> {
-	DirType::<Normal>::Dir(Cow::Borrowed(&sc.resources.dir))
-}
-
-/// Upload a file with exact bytes directly under the remote root, returning the created file.
+/// Upload `data` as `name` directly under the remote root through the cache's client.
 async fn upload_remote(sc: &SingleClient, name: &str, data: &[u8]) -> RemoteFile {
-	let builder = sc
-		.cache
-		.client
-		.make_file_builder(name, sc.resources.dir.uuid())
-		.unwrap();
-	sc.cache.client.upload_file(builder, data).await.unwrap()
+	upload_to(&sc.cache.client, sc.resources.dir.uuid(), name, data).await
 }
 
-/// List the (dirs, files) directly under the remote root (ground truth, via the client).
+/// List the (dirs, files) directly under the remote root through the cache's client (ground truth).
 async fn list_remote_root(sc: &SingleClient) -> (Vec<RemoteDirectory>, Vec<RemoteFile>) {
-	sc.cache
-		.client
-		.list_dir(&sc_root(sc), None::<&fn(u64, Option<u64>)>)
-		.await
-		.unwrap()
-}
-
-/// List the (dirs, files) directly under a remote dir, via a cache's client (ground truth) — for
-/// the tests that run their own engine rather than a [`SingleClient`].
-async fn list_dir_of(
-	cache: &TestCache,
-	dir: &RemoteDirectory,
-) -> (Vec<RemoteDirectory>, Vec<RemoteFile>) {
-	cache
-		.client
-		.list_dir(
-			&DirType::<Normal>::Dir(Cow::Borrowed(dir)),
-			None::<&fn(u64, Option<u64>)>,
-		)
-		.await
-		.unwrap()
-}
-
-/// List the (dirs, files) directly under a remote dir.
-async fn list_remote_dir(
-	sc: &SingleClient,
-	dir: &RemoteDirectory,
-) -> (Vec<RemoteDirectory>, Vec<RemoteFile>) {
-	sc.cache
-		.client
-		.list_dir(
-			&DirType::<Normal>::Dir(Cow::Borrowed(dir)),
-			None::<&fn(u64, Option<u64>)>,
-		)
-		.await
-		.unwrap()
-}
-
-fn find_file<'a>(files: &'a [RemoteFile], name: &str) -> Option<&'a RemoteFile> {
-	files.iter().find(|f| f.name() == Some(name))
-}
-
-fn find_dir<'a>(dirs: &'a [RemoteDirectory], name: &str) -> Option<&'a RemoteDirectory> {
-	dirs.iter().find(|d| d.name() == Some(name))
+	list_dir(&sc.cache.client, &sc.resources.dir).await
 }
 
 /// Wait until the cache observes `uuid` (the engine's remote view is the cache).
@@ -213,7 +160,7 @@ async fn basic_03_empty_directory_push() {
 	let (dirs, files) = list_remote_root(&sc).await;
 	assert!(files.is_empty(), "no files expected");
 	let d = find_dir(&dirs, "dir1").expect("dir1 missing on remote");
-	let (sub_dirs, sub_files) = list_remote_dir(&sc, d).await;
+	let (sub_dirs, sub_files) = list_dir(&sc.cache.client, d).await;
 	assert!(
 		sub_dirs.is_empty() && sub_files.is_empty(),
 		"dir1 should be empty"
@@ -237,17 +184,17 @@ async fn basic_04_deep_empty_tree_push() {
 	// Walk the full chain.
 	let (dirs, _files) = list_remote_root(&sc).await;
 	let a = find_dir(&dirs, "a").expect("a missing");
-	let (ad, _) = list_remote_dir(&sc, a).await;
+	let (ad, _) = list_dir(&sc.cache.client, a).await;
 	let b = find_dir(&ad, "b").expect("a/b missing");
-	let (bd, _) = list_remote_dir(&sc, b).await;
+	let (bd, _) = list_dir(&sc.cache.client, b).await;
 	let c = find_dir(&bd, "c").expect("a/b/c missing");
-	let (cd, _) = list_remote_dir(&sc, c).await;
+	let (cd, _) = list_dir(&sc.cache.client, c).await;
 	let d = find_dir(&cd, "d").expect("a/b/c/d missing");
-	let (dd, _) = list_remote_dir(&sc, d).await;
+	let (dd, _) = list_dir(&sc.cache.client, d).await;
 	let e = find_dir(&dd, "e").expect("a/b/c/d/e missing");
-	let (ed, _) = list_remote_dir(&sc, e).await;
+	let (ed, _) = list_dir(&sc.cache.client, e).await;
 	let f = find_dir(&ed, "f").expect("a/b/c/d/e/f missing");
-	let (fd, ff) = list_remote_dir(&sc, f).await;
+	let (fd, ff) = list_dir(&sc.cache.client, f).await;
 	assert!(fd.is_empty() && ff.is_empty(), "leaf f should be empty");
 	sc.cleanup();
 }
@@ -279,18 +226,18 @@ async fn basic_05_nested_files_and_dirs_push() {
 	let top = find_file(&files, "top.txt").expect("top.txt missing");
 	assert_eq!(top.size, content_for("top.txt").len() as u64);
 	let a = find_dir(&dirs, "a").expect("a missing");
-	let (a_dirs, a_files) = list_remote_dir(&sc, a).await;
+	let (a_dirs, a_files) = list_dir(&sc.cache.client, a).await;
 	assert!(
 		find_file(&a_files, "mid.txt").is_some(),
 		"a/mid.txt missing"
 	);
 	let b = find_dir(&a_dirs, "b").expect("a/b missing");
-	let (b_dirs, _) = list_remote_dir(&sc, b).await;
+	let (b_dirs, _) = list_dir(&sc.cache.client, b).await;
 	let empty = find_dir(&b_dirs, "empty").expect("a/b/empty missing");
-	let (ed, ef) = list_remote_dir(&sc, empty).await;
+	let (ed, ef) = list_dir(&sc.cache.client, empty).await;
 	assert!(ed.is_empty() && ef.is_empty(), "a/b/empty should be empty");
 	let c = find_dir(&b_dirs, "c").expect("a/b/c missing");
-	let (_, c_files) = list_remote_dir(&sc, c).await;
+	let (_, c_files) = list_dir(&sc.cache.client, c).await;
 	assert!(
 		find_file(&c_files, "leaf.txt").is_some(),
 		"a/b/c/leaf.txt missing"
@@ -396,7 +343,7 @@ async fn basic_08_nonempty_destination_not_wiped_push() {
 	let keep = sc
 		.cache
 		.client
-		.create_dir(&sc_root(&sc), "keep")
+		.create_dir(&sc.root_dirtype(), "keep")
 		.await
 		.unwrap();
 	wait_cache_sees(&sc, pre.uuid()).await;
@@ -494,9 +441,9 @@ async fn basic_09_mixed_batch_push() {
 		assert!(find_dir(&dirs, n).is_some(), "{n} missing");
 	}
 	let d1 = find_dir(&dirs, "d1").unwrap();
-	assert!(find_file(&list_remote_dir(&sc, d1).await.1, "in1.txt").is_some());
+	assert!(find_file(&list_dir(&sc.cache.client, d1).await.1, "in1.txt").is_some());
 	let d3 = find_dir(&dirs, "d3_empty").unwrap();
-	let (ed, ef) = list_remote_dir(&sc, d3).await;
+	let (ed, ef) = list_dir(&sc.cache.client, d3).await;
 	assert!(ed.is_empty() && ef.is_empty(), "d3_empty should be empty");
 	sc.cleanup();
 }
@@ -856,14 +803,14 @@ async fn basic_15b_restart_before_the_cache_catches_up_does_not_redo_writes() {
 	assert_eq!(r2.conflicts.len(), 0, "{r2:?}");
 
 	// Remote ground truth: one "sub", holding one "inner.txt" — no structural duplicate.
-	let (dirs, _files) = list_dir_of(&cache, &resources.dir).await;
+	let (dirs, _files) = list_dir(&cache.client, &resources.dir).await;
 	let subs: Vec<&RemoteDirectory> = dirs.iter().filter(|d| d.name() == Some("sub")).collect();
 	assert_eq!(
 		subs.len(),
 		1,
 		"the restart left a duplicate remote directory"
 	);
-	let (_d, inner) = list_dir_of(&cache, subs[0]).await;
+	let (_d, inner) = list_dir(&cache.client, subs[0]).await;
 	assert_eq!(
 		inner
 			.iter()
@@ -987,10 +934,10 @@ async fn basic_19_identical_content_distinct_paths_push() {
 	let (dirs, files) = list_remote_root(&sc).await;
 	let c1 = find_file(&files, "copy1.bin").expect("copy1.bin missing");
 	let sub = find_dir(&dirs, "sub").expect("sub missing");
-	let (sub_dirs, sub_files) = list_remote_dir(&sc, sub).await;
+	let (sub_dirs, sub_files) = list_dir(&sc.cache.client, sub).await;
 	let c2 = find_file(&sub_files, "copy2.bin").expect("copy2.bin missing");
 	let deep = find_dir(&sub_dirs, "deep").expect("sub/deep missing");
-	let (_, deep_files) = list_remote_dir(&sc, deep).await;
+	let (_, deep_files) = list_dir(&sc.cache.client, deep).await;
 	let c3 = find_file(&deep_files, "copy3.bin").expect("copy3.bin missing");
 	for f in [c1, c2, c3] {
 		assert_eq!(f.size, shared.len() as u64, "size mismatch on a copy");
@@ -1021,7 +968,7 @@ async fn basic_20_fanout_many_files_push() {
 
 	let (dirs, _files) = list_remote_root(&sc).await;
 	let fan = find_dir(&dirs, "fan").expect("fan dir missing");
-	let (_, fan_files) = list_remote_dir(&sc, fan).await;
+	let (_, fan_files) = list_dir(&sc.cache.client, fan).await;
 	assert_eq!(
 		fan_files.len(),
 		N,
@@ -1134,7 +1081,7 @@ async fn basic_22_dir_rename_preserves_children_push() {
 	// Capture original child uuids.
 	let (dirs0, _) = list_remote_root(&sc).await;
 	let old0 = find_dir(&dirs0, "old").expect("old missing");
-	let (_, old_files0) = list_remote_dir(&sc, old0).await;
+	let (_, old_files0) = list_dir(&sc.cache.client, old0).await;
 	let orig_uuids: Vec<_> = old_files0.iter().map(|f| f.uuid()).collect();
 	assert_eq!(orig_uuids.len(), 3);
 
@@ -1151,7 +1098,7 @@ async fn basic_22_dir_rename_preserves_children_push() {
 	let (dirs1, _) = list_remote_root(&sc).await;
 	assert!(find_dir(&dirs1, "old").is_none(), "old/ still exists");
 	let new1 = find_dir(&dirs1, "new").expect("new/ missing");
-	let (_, new_files) = list_remote_dir(&sc, new1).await;
+	let (_, new_files) = list_dir(&sc.cache.client, new1).await;
 	assert_eq!(new_files.len(), 3, "all 3 children must survive the rename");
 	for c in ["c0.txt", "c1.txt", "c2.txt"] {
 		let f = find_file(&new_files, c).expect("child missing after rename");
@@ -1237,11 +1184,11 @@ async fn basic_24_report_matches_destination_push() {
 		assert!(find_file(&files, n).is_some(), "{n} reported but missing");
 	}
 	let d1 = find_dir(&dirs, "d1").unwrap();
-	let (_, d1_files) = list_remote_dir(&sc, d1).await;
+	let (_, d1_files) = list_dir(&sc.cache.client, d1).await;
 	let med = find_file(&d1_files, "med.bin").expect("med.bin missing");
 	assert_eq!(med.size, 50_000, "med.bin size mismatch");
 	let d2 = find_dir(&dirs, "d2").unwrap();
-	let (_, d2_files) = list_remote_dir(&sc, d2).await;
+	let (_, d2_files) = list_dir(&sc.cache.client, d2).await;
 	let big = find_file(&d2_files, "big.bin").expect("big.bin missing");
 	assert_eq!(big.size, 2u64 << 20, "big.bin size mismatch");
 	sc.cleanup();

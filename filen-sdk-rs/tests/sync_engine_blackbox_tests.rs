@@ -171,18 +171,6 @@ fn local_exists(local: &std::path::Path, rel: &str) -> bool {
 	local.join(rel).exists()
 }
 
-/// Find a file by name in a listing.
-fn find_file<'a>(
-	files: &'a [filen_sdk_rs::fs::file::RemoteFile],
-	name: &str,
-) -> Option<&'a filen_sdk_rs::fs::file::RemoteFile> {
-	files.iter().find(|f| f.name() == Some(name))
-}
-
-fn find_dir<'a>(dirs: &'a [RemoteDirectory], name: &str) -> Option<&'a RemoteDirectory> {
-	dirs.iter().find(|d| d.name() == Some(name))
-}
-
 /// The byte size of a remote file (public `size` field).
 fn rsize(f: &filen_sdk_rs::fs::file::RemoteFile) -> u64 {
 	f.size
