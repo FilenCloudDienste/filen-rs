@@ -210,6 +210,17 @@ impl SingleClient {
 	pub async fn list_dir(&self, dir: &RemoteDirectory) -> (Vec<RemoteDirectory>, Vec<RemoteFile>) {
 		list_dir(&self.resources.client, dir).await
 	}
+
+	/// [`upload_root`](Self::upload_root) through the cache's client, the one the engine itself
+	/// writes with, instead of the resources' client.
+	pub async fn cache_upload_root(&self, name: &str, data: &[u8]) -> RemoteFile {
+		upload_to(&self.cache.client, self.resources.dir.uuid(), name, data).await
+	}
+
+	/// [`list_root`](Self::list_root) through the cache's client (ground truth).
+	pub async fn cache_list_root(&self) -> (Vec<RemoteDirectory>, Vec<RemoteFile>) {
+		list_dir(&self.cache.client, &self.resources.dir).await
+	}
 }
 
 /// `plan_pair` once the cache holds `pair`'s remote root converged. Unlike a pass, a dry run does

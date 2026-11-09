@@ -31,8 +31,6 @@
 //! NFC/NFD normalization equivalence, dotfiles, mixed-script/emoji round-trips, file/dir type
 //! collisions, the quarantine-bin exclusion, and local-origin quirky-but-legal names.
 use filen_macros::shared_test_runtime;
-use filen_sdk_rs::fs::dir::RemoteDirectory;
-use filen_sdk_rs::fs::file::RemoteFile;
 use filen_sdk_rs::fs::file::meta::FileMetaChanges;
 use filen_sdk_rs::fs::{HasName, HasUUID};
 use filen_sdk_rs::sync_engine::SyncMode;
@@ -43,20 +41,6 @@ use filen_sdk_rs::{crypto::shared::MetaCrypter, sync_engine::UnsyncablePath};
 
 use crate::harness::*;
 use crate::helpers::*;
-
-// ---------------------------------------------------------------------------
-// Local helpers (public-API only; remote ground-truth via the cache's client).
-// ---------------------------------------------------------------------------
-
-/// List the (dirs, files) directly under the remote root through the cache's client (ground truth).
-async fn list_root(sc: &SingleClient) -> (Vec<RemoteDirectory>, Vec<RemoteFile>) {
-	list_dir(&sc.cache.client, &sc.resources.dir).await
-}
-
-/// Upload `data` as `name` directly under the remote root through the cache's client.
-async fn upload_root(sc: &SingleClient, name: &str, data: &[u8]) -> RemoteFile {
-	upload_to(&sc.cache.client, sc.resources.dir.uuid(), name, data).await
-}
 
 // ===========================================================================
 // IMPLEMENTED — case-only rename (PATH-10)
@@ -71,7 +55,7 @@ async fn upload_root(sc: &SingleClient, name: &str, data: &[u8]) -> RemoteFile {
 async fn path_10_remote_case_only_rename_updates_local() {
 	let sc = single_client(SyncMode::RemoteToLocal).await;
 	let content = b"case-only-rename payload";
-	let mut rf = upload_root(&sc, "Report.txt", content).await;
+	let mut rf = sc.cache_upload_root("Report.txt", content).await;
 	assert!(
 		poll_for_item(sc.cache.db_path(), rf.uuid(), CACHE_CONVERGE_TIMEOUT).await,
 		"cache never observed Report.txt"
@@ -115,7 +99,7 @@ async fn path_10_remote_case_only_rename_updates_local() {
 		.expect("renamed file content must survive");
 	assert_eq!(on_disk, content, "content lost across case rename");
 	// Exactly one remote file, exactly one local file (no duplicate).
-	let (_d, files) = list_root(&sc).await;
+	let (_d, files) = sc.cache_list_root().await;
 	assert_eq!(
 		files.len(),
 		1,
@@ -144,7 +128,7 @@ async fn path_12_nfc_nfd_normalization_equivalence() {
 	let sc = single_client(SyncMode::TwoWay).await;
 	let nfc_name = "caf\u{00e9}.txt"; // é precomposed (NFC)
 	let content = b"unicode normalization payload";
-	let rf = upload_root(&sc, nfc_name, content).await;
+	let rf = sc.cache_upload_root(nfc_name, content).await;
 	assert!(
 		poll_for_item(sc.cache.db_path(), rf.uuid(), CACHE_CONVERGE_TIMEOUT).await,
 		"cache never observed the accented file"
@@ -179,7 +163,7 @@ async fn path_12_nfc_nfd_normalization_equivalence() {
 		"spurious normalization conflict: {r2:?}"
 	);
 
-	let (_d, files) = list_root(&sc).await;
+	let (_d, files) = sc.cache_list_root().await;
 	assert_eq!(
 		files.len(),
 		1,
@@ -219,7 +203,7 @@ async fn path_15_dotfiles_synced_as_content() {
 	);
 
 	// They really landed on the remote.
-	let (dirs, files) = list_root(&sc).await;
+	let (dirs, files) = sc.cache_list_root().await;
 	assert!(find_file(&files, ".env").is_some(), "dotfile not uploaded");
 	assert!(find_file(&files, "visible.txt").is_some());
 	let hidden = find_dir(&dirs, ".hidden").expect(".hidden dir missing on remote");
@@ -230,7 +214,7 @@ async fn path_15_dotfiles_synced_as_content() {
 	);
 
 	// A new remote dotfile pulls down just like any file.
-	let rf = upload_root(&sc, ".remote-only", b"R").await;
+	let rf = sc.cache_upload_root(".remote-only", b"R").await;
 	assert!(
 		poll_for_item(sc.cache.db_path(), rf.uuid(), CACHE_CONVERGE_TIMEOUT).await,
 		"cache never observed .remote-only"
@@ -265,7 +249,7 @@ async fn path_15_dotfiles_synced_as_content() {
 async fn path_16_quarantine_bin_not_synced() {
 	let sc = single_client(SyncMode::TwoWay).await;
 	let content = b"to-be-quarantined";
-	let mut rf = upload_root(&sc, "doomed.txt", content).await;
+	let mut rf = sc.cache_upload_root("doomed.txt", content).await;
 	assert!(
 		poll_for_item(sc.cache.db_path(), rf.uuid(), CACHE_CONVERGE_TIMEOUT).await,
 		"cache never observed doomed.txt"
@@ -299,7 +283,7 @@ async fn path_16_quarantine_bin_not_synced() {
 		);
 		assert_eq!(r.remote_dirs_created, 0, "{r:?}");
 	}
-	let (dirs, files) = list_root(&sc).await;
+	let (dirs, files) = sc.cache_list_root().await;
 	assert!(
 		find_dir(&dirs, ".filen-sync-trash").is_none(),
 		"quarantine dir leaked to the remote"
@@ -353,7 +337,7 @@ async fn path_18_mixed_script_and_emoji_roundtrip() {
 	assert_eq!(r1.uploaded, 3, "all three unicode names upload: {r1:?}");
 
 	// Names round-trip exactly on the remote (same code points).
-	let (_d, files) = list_root(&sc).await;
+	let (_d, files) = sc.cache_list_root().await;
 	assert_eq!(
 		files.len(),
 		3,
@@ -398,7 +382,7 @@ async fn path_20_local_case_only_rename_pushes() {
 	assert_eq!(r1.uploaded, 1, "{r1:?}");
 
 	// Capture the remote uuid so we can prove the rename preserved identity (no re-create).
-	let (_d0, files0) = list_root(&sc).await;
+	let (_d0, files0) = sc.cache_list_root().await;
 	let orig_uuid = find_file(&files0, "Photo.JPG")
 		.expect("Photo.JPG missing")
 		.uuid();
@@ -421,7 +405,7 @@ async fn path_20_local_case_only_rename_pushes() {
 
 	// Exactly one remote file, content byte-exact, identity preserved or cleanly replaced (no
 	// orphaned old name alongside the new one).
-	let (_d1, files1) = list_root(&sc).await;
+	let (_d1, files1) = sc.cache_list_root().await;
 	assert_eq!(files1.len(), 1, "rename duplicated on remote: {files1:?}");
 	let after = find_file(&files1, "photo.jpg")
 		.or_else(|| find_file(&files1, "Photo.JPG"))
@@ -455,7 +439,7 @@ async fn path_22_nfc_remote_vs_nfd_local_conflict() {
 	// Establish a shared baseline (identical bytes both sides) so the later edits are a genuine
 	// both-sides-changed conflict, not two first-time adds.
 	let base = b"shared-baseline";
-	let rf = upload_root(&sc, nfc, base).await;
+	let rf = sc.cache_upload_root(nfc, base).await;
 	assert!(
 		poll_for_item(sc.cache.db_path(), rf.uuid(), CACHE_CONVERGE_TIMEOUT).await,
 		"cache never observed the baseline file"
@@ -471,7 +455,7 @@ async fn path_22_nfc_remote_vs_nfd_local_conflict() {
 	std::fs::remove_file(sc.local.join(nfc))
 		.expect("the baseline pass must have downloaded the NFC spelling");
 	write_file(&sc.local, nfd, b"LOCAL-via-NFD");
-	let new_rf = upload_root(&sc, nfc, b"REMOTE-via-NFC-different").await;
+	let new_rf = sc.cache_upload_root(nfc, b"REMOTE-via-NFC-different").await;
 	assert!(
 		poll_for_item(sc.cache.db_path(), new_rf.uuid(), CACHE_CONVERGE_TIMEOUT).await,
 		"cache never observed the diverged remote version"
@@ -493,7 +477,7 @@ async fn path_22_nfc_remote_vs_nfd_local_conflict() {
 	let local_local = std::fs::read(sc.local.join(nfd))
 		.or_else(|_| std::fs::read(sc.local.join(nfc)))
 		.unwrap_or_default();
-	let (_d, files) = list_root(&sc).await;
+	let (_d, files) = sc.cache_list_root().await;
 	// The engine must not have materialized BOTH normalizations as two distinct converged files.
 	assert!(
 		files.len() <= 2,
@@ -569,7 +553,7 @@ async fn path_add_local_quirky_legal_names_push_safely() {
 		"a name that can never be pushed is not an error to retry: {r1:?}"
 	);
 
-	let (dirs, files) = list_root(&sc).await;
+	let (dirs, files) = sc.cache_list_root().await;
 	// Nothing escaped to a parent/sibling: only in-root entries exist, and `..weird`/`..foo` are
 	// present as literal single segments (NOT resolved as parent refs).
 	assert!(
@@ -589,7 +573,7 @@ async fn path_add_local_quirky_legal_names_push_safely() {
 	// Re-run: the legal names are already synced -> zero churn for them.
 	let r2 = sc.sync().await;
 	assert!(
-		find_file(&list_root(&sc).await.1, "..weird").is_some(),
+		find_file(&sc.cache_list_root().await.1, "..weird").is_some(),
 		"..weird disappeared on re-sync"
 	);
 	// A clean re-upload of the same legal names must not create dirs.
@@ -637,7 +621,7 @@ async fn path_add_remote_invalid_local_names_reported_once_not_retried() {
 		r1.unsyncable
 	);
 
-	let (dirs, files) = list_root(&sc).await;
+	let (dirs, files) = sc.cache_list_root().await;
 	assert!(find_file(&files, "good.txt").is_some(), "{files:?}");
 	assert!(find_file(&files, "CON").is_none(), "{files:?}");
 	assert!(find_dir(&dirs, "bad.").is_none(), "{dirs:?}");
@@ -668,7 +652,7 @@ async fn path_add_remote_invalid_local_names_reported_once_not_retried() {
 	assert_eq!(r3.uploaded, 2, "CON.txt + fine/inner.txt: {r3:?}");
 	assert_eq!(r3.remote_dirs_created, 1, "{r3:?}");
 
-	let (dirs, files) = list_root(&sc).await;
+	let (dirs, files) = sc.cache_list_root().await;
 	assert!(find_file(&files, "CON.txt").is_some(), "{files:?}");
 	let fine = find_dir(&dirs, "fine").expect("fine/ missing");
 	assert!(
@@ -710,7 +694,7 @@ async fn path_add_rename_into_an_invalid_name_never_trashes_the_remote_copy() {
 	assert_eq!(reported, vec!["CON", "bad."], "{:?}", r2.unsyncable);
 
 	// The remote is exactly as it was: nothing renamed, nothing trashed, subtree intact.
-	let (dirs, files) = list_root(&sc).await;
+	let (dirs, files) = sc.cache_list_root().await;
 	assert!(
 		find_file(&files, "report.txt").is_some(),
 		"the remote copy of a locally-renamed file must survive: {files:?}"
@@ -797,7 +781,7 @@ async fn path_05_nul_and_control_chars_in_remote_name() {}
 async fn pull_named_dirs(names: &[&str], refused: &[(&str, &str)]) {
 	let sc = single_client(SyncMode::RemoteToLocal).await;
 	stage_named_dirs(&sc, names).await;
-	let ok = upload_root(&sc, "ok.txt", b"ok").await;
+	let ok = sc.cache_upload_root("ok.txt", b"ok").await;
 	assert!(
 		poll_for_item(sc.cache.db_path(), ok.uuid(), CACHE_CONVERGE_TIMEOUT).await,
 		"cache never observed ok.txt"
@@ -984,7 +968,7 @@ async fn path_19_dot_and_dotdot_literal_entries() {
 			.unwrap();
 		hostile.push(uuid);
 	}
-	let ok = upload_root(&sc, "ok.txt", b"ok").await;
+	let ok = sc.cache_upload_root("ok.txt", b"ok").await;
 	for uuid in hostile.into_iter().chain([ok.uuid()]) {
 		sc.cache_sees(uuid).await;
 	}

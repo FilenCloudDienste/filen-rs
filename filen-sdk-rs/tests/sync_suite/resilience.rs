@@ -13,8 +13,6 @@
 //! delete suppression, two-way conflict persistence across re-runs, read-after-write convergence,
 //! baseline reuse on re-open, and quarantine recoverability.
 use filen_macros::shared_test_runtime;
-use filen_sdk_rs::fs::dir::RemoteDirectory;
-use filen_sdk_rs::fs::file::RemoteFile;
 use filen_sdk_rs::fs::{HasName, HasUUID};
 use filen_sdk_rs::sync_engine::{GuardReason, SyncEngine, SyncMode, SyncReport};
 use uuid::Uuid;
@@ -25,16 +23,6 @@ use crate::helpers::*;
 // ---------------------------------------------------------------------------
 // Local helpers (public-API only; remote ground-truth via the cache's client).
 // ---------------------------------------------------------------------------
-
-/// List the (dirs, files) directly under the remote root through the cache's client (ground truth).
-async fn list_root(sc: &SingleClient) -> (Vec<RemoteDirectory>, Vec<RemoteFile>) {
-	list_dir(&sc.cache.client, &sc.resources.dir).await
-}
-
-/// Upload `data` as `name` directly under the remote root through the cache's client.
-async fn upload_root(sc: &SingleClient, name: &str, data: &[u8]) -> RemoteFile {
-	upload_to(&sc.cache.client, sc.resources.dir.uuid(), name, data).await
-}
 
 /// A first sync holds its one destination-only deletion until it is approved: `first` held it,
 /// another pass without approval holds it again, and the pass after the approval applies it.
@@ -90,7 +78,7 @@ async fn resil_11_read_after_write_no_duplicate_no_self_delete() {
 	assert_noop(&r2);
 
 	// Exactly one w.txt on the remote, byte-exact.
-	let (_dirs, files) = list_root(&sc).await;
+	let (_dirs, files) = sc.cache_list_root().await;
 	let matching: Vec<_> = files.iter().filter(|f| f.name() == Some("w.txt")).collect();
 	assert_eq!(
 		matching.len(),
@@ -120,8 +108,8 @@ async fn resil_12_first_run_populated_destination_local_to_remote_mirrors_source
 	let sc = single_client(SyncMode::LocalToRemote).await;
 
 	// Pre-populate the remote (a "populated destination" before any baseline exists).
-	let q1 = upload_root(&sc, "q1.txt", b"remote-q1").await;
-	let common = upload_root(&sc, "common.txt", b"shared").await;
+	let q1 = sc.cache_upload_root("q1.txt", b"remote-q1").await;
+	let common = sc.cache_upload_root("common.txt", b"shared").await;
 	sc.cache_sees(q1.uuid()).await;
 	sc.cache_sees(common.uuid()).await;
 
@@ -134,7 +122,7 @@ async fn resil_12_first_run_populated_destination_local_to_remote_mirrors_source
 	assert!(r1.errors.is_empty(), "{r1:?}");
 
 	// The first sync pushes local's files and holds the mirror-delete of the remote-only q1.
-	let (_dirs, files) = list_root(&sc).await;
+	let (_dirs, files) = sc.cache_list_root().await;
 	assert!(
 		find_file(&files, "q1.txt").is_some(),
 		"q1 trashed unapproved: {files:?}"
@@ -143,7 +131,7 @@ async fn resil_12_first_run_populated_destination_local_to_remote_mirrors_source
 
 	// Remote converges to mirror local exactly: p1/p2/common present, the remote-only q1 mirrored
 	// away (local is authoritative). common.txt must NOT be duplicated.
-	let (_dirs, files) = list_root(&sc).await;
+	let (_dirs, files) = sc.cache_list_root().await;
 	assert!(
 		find_file(&files, "q1.txt").is_none(),
 		"q1 not mirrored away: {files:?}"
@@ -200,8 +188,8 @@ async fn resil_12_first_run_populated_destination_local_to_remote_mirrors_source
 async fn resil_12_first_run_populated_destination_remote_to_local_mirrors_source() {
 	let sc = single_client(SyncMode::RemoteToLocal).await;
 
-	let q1 = upload_root(&sc, "q1.txt", b"remote-q1").await;
-	let q2 = upload_root(&sc, "q2.txt", b"remote-q2").await;
+	let q1 = sc.cache_upload_root("q1.txt", b"remote-q1").await;
+	let q2 = sc.cache_upload_root("q2.txt", b"remote-q2").await;
 	sc.cache_sees(q1.uuid()).await;
 	sc.cache_sees(q2.uuid()).await;
 
@@ -219,7 +207,7 @@ async fn resil_12_first_run_populated_destination_remote_to_local_mirrors_source
 	// Source (remote) intact and pulled byte-exact.
 	assert!(read_eq(&sc.local, "q1.txt", b"remote-q1"), "q1 not pulled");
 	assert!(read_eq(&sc.local, "q2.txt", b"remote-q2"), "q2 not pulled");
-	let (_dirs, files) = list_root(&sc).await;
+	let (_dirs, files) = sc.cache_list_root().await;
 	assert!(
 		find_file(&files, "q1.txt").is_some(),
 		"q1 lost on remote: {files:?}"
@@ -269,8 +257,8 @@ async fn resil_12_first_run_populated_destination_remote_to_local_mirrors_source
 async fn resil_12_first_run_populated_destination_two_way_union_no_conflict() {
 	let sc = single_client(SyncMode::TwoWay).await;
 
-	let q1 = upload_root(&sc, "q1.txt", b"remote-q1").await;
-	let common = upload_root(&sc, "common.txt", b"shared").await;
+	let q1 = sc.cache_upload_root("q1.txt", b"remote-q1").await;
+	let common = sc.cache_upload_root("common.txt", b"shared").await;
 	sc.cache_sees(q1.uuid()).await;
 	sc.cache_sees(common.uuid()).await;
 
@@ -283,7 +271,7 @@ async fn resil_12_first_run_populated_destination_two_way_union_no_conflict() {
 	assert!(last.errors.is_empty(), "{last:?}");
 	for _ in 0..6 {
 		if read_eq(&sc.local, "q1.txt", b"remote-q1") && {
-			let (_d, files) = list_root(&sc).await;
+			let (_d, files) = sc.cache_list_root().await;
 			find_file(&files, "p1.txt").is_some()
 		} {
 			break;
@@ -316,7 +304,7 @@ async fn resil_12_first_run_populated_destination_two_way_union_no_conflict() {
 		read_eq(&sc.local, "common.txt", b"shared"),
 		"common changed local"
 	);
-	let (_dirs, files) = list_root(&sc).await;
+	let (_dirs, files) = sc.cache_list_root().await;
 	assert!(
 		find_file(&files, "p1.txt").is_some(),
 		"p1 not pushed: {files:?}"
@@ -386,7 +374,7 @@ async fn resil_17_mass_delete_hold_not_bypassed_by_rerun() {
 	);
 
 	// All files still present remotely after both passes (no silent wipe).
-	let (_dirs, files) = list_root(&sc).await;
+	let (_dirs, files) = sc.cache_list_root().await;
 	assert_eq!(
 		files.len(),
 		TOTAL,
@@ -489,7 +477,7 @@ async fn resil_24_local_backup_delete_suppression_survives_rerun() {
 	);
 
 	// All four remote files remain byte-exact; no resurrection locally of the deleted ones.
-	let (_dirs, files) = list_root(&sc).await;
+	let (_dirs, files) = sc.cache_list_root().await;
 	for name in ["g1.txt", "g2.txt", "g3.txt", "g4.txt"] {
 		let f = find_file(&files, name).unwrap_or_else(|| panic!("{name} lost on remote backup"));
 		assert_eq!(
@@ -614,7 +602,7 @@ async fn resil_add_source_mutated_between_passes_uploads_current_truth() {
 	assert_eq!(r2.uploaded, 1, "current content must re-upload: {r2:?}");
 
 	// Exactly one u.txt remotely, equal to the CURRENT local content (not the stale v1).
-	let (_dirs, files) = list_root(&sc).await;
+	let (_dirs, files) = sc.cache_list_root().await;
 	let matching: Vec<_> = files.iter().filter(|f| f.name() == Some("u.txt")).collect();
 	assert_eq!(matching.len(), 1, "u.txt duplicated: {files:?}");
 	assert_eq!(

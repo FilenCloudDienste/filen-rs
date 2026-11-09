@@ -28,20 +28,10 @@ use crate::helpers::*;
 // Local helpers (public-API only; remote ground-truth via the cache's client).
 // ---------------------------------------------------------------------------
 
-/// List the (dirs, files) directly under the remote root through the cache's client (ground truth).
-async fn list_root(sc: &SingleClient) -> (Vec<RemoteDirectory>, Vec<RemoteFile>) {
-	list_dir(&sc.cache.client, &sc.resources.dir).await
-}
-
 /// List the (dirs, files) directly under the two-client fixture's shared remote root through
 /// client A's cache client.
 async fn list_root_tc(tc: &TwoClients) -> (Vec<RemoteDirectory>, Vec<RemoteFile>) {
 	list_dir(&tc.cache_a.client, &tc.resources.dir).await
-}
-
-/// Upload `data` as `name` directly under the remote root through the cache's client.
-async fn upload_root(sc: &SingleClient, name: &str, data: &[u8]) -> RemoteFile {
-	upload_to(&sc.cache.client, sc.resources.dir.uuid(), name, data).await
 }
 
 // ===========================================================================
@@ -69,7 +59,7 @@ async fn matrix_01_self_write_loop_free_l2r() {
 	let r3 = sc.sync().await;
 	assert_noop(&r3);
 
-	let (_dirs, files) = list_root(&sc).await;
+	let (_dirs, files) = sc.cache_list_root().await;
 	let matching: Vec<_> = files
 		.iter()
 		.filter(|f| f.name() == Some("foo.txt"))
@@ -90,7 +80,7 @@ async fn matrix_01_self_write_loop_free_l2r() {
 #[shared_test_runtime]
 async fn matrix_02_self_write_loop_free_r2l() {
 	let sc = single_client(SyncMode::RemoteToLocal).await;
-	let rf = upload_root(&sc, "bar.txt", b"self-write-r2l").await;
+	let rf = sc.cache_upload_root("bar.txt", b"self-write-r2l").await;
 	sc.cache_sees(rf.uuid()).await;
 
 	let r1 = sc.sync().await;
@@ -202,7 +192,7 @@ async fn matrix_04_self_write_loop_free_backup_modes() {
 	tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
 	let r2 = lb.sync().await;
 	assert_noop(&r2);
-	let (_d, lf) = list_root(&lb).await;
+	let (_d, lf) = lb.cache_list_root().await;
 	assert_eq!(
 		lf.iter().filter(|f| f.name() == Some("F.txt")).count(),
 		1,
@@ -212,7 +202,7 @@ async fn matrix_04_self_write_loop_free_backup_modes() {
 
 	// --- RemoteBackup: destination is the local tree; G pulled once. ---
 	let rb = single_client(SyncMode::RemoteBackup).await;
-	let g = upload_root(&rb, "G.txt", b"backup-pull").await;
+	let g = rb.cache_upload_root("G.txt", b"backup-pull").await;
 	rb.cache_sees(g.uuid()).await;
 	let p1 = rb.sync().await;
 	assert!(p1.errors.is_empty(), "{p1:?}");
@@ -251,7 +241,7 @@ async fn matrix_05_first_sync_no_wipe_l2r() {
 		("R2.txt", b"r2"),
 		("R3.txt", b"r3"),
 	] {
-		let f = upload_root(&sc, name, body).await;
+		let f = sc.cache_upload_root(name, body).await;
 		sc.cache_sees(f.uuid()).await;
 	}
 
@@ -263,7 +253,7 @@ async fn matrix_05_first_sync_no_wipe_l2r() {
 		"first sync against a populated remote must not wipe it: {r1:?}"
 	);
 
-	let (_dirs, files) = list_root(&sc).await;
+	let (_dirs, files) = sc.cache_list_root().await;
 	for (name, body) in [
 		("R1.txt", b"r1" as &[u8]),
 		("R2.txt", b"r2"),
@@ -392,7 +382,7 @@ async fn matrix_07_first_sync_no_wipe_two_way() {
 async fn matrix_08_first_sync_no_wipe_backup_modes() {
 	// --- LocalBackup: populated remote destination + a local source-only file. ---
 	let lb = single_client(SyncMode::LocalBackup).await;
-	let surv = upload_root(&lb, "survivor.txt", b"keep-me").await;
+	let surv = lb.cache_upload_root("survivor.txt", b"keep-me").await;
 	lb.cache_sees(surv.uuid()).await;
 	write_file(&lb.local, "added.txt", b"source-only");
 	let r1 = lb.sync().await;
@@ -402,7 +392,7 @@ async fn matrix_08_first_sync_no_wipe_backup_modes() {
 		r1.remotely_trashed, 0,
 		"backup first sync must not trash destination: {r1:?}"
 	);
-	let (_d, lf) = list_root(&lb).await;
+	let (_d, lf) = lb.cache_list_root().await;
 	assert!(
 		find_file(&lf, "survivor.txt").is_some(),
 		"destination survivor wiped: {lf:?}"
@@ -416,7 +406,7 @@ async fn matrix_08_first_sync_no_wipe_backup_modes() {
 	// --- RemoteBackup: populated local destination + a remote source-only file. ---
 	let rb = single_client(SyncMode::RemoteBackup).await;
 	write_file(&rb.local, "local_keep.txt", b"do-not-delete");
-	let pulled = upload_root(&rb, "pulled.txt", b"remote-source").await;
+	let pulled = rb.cache_upload_root("pulled.txt", b"remote-source").await;
 	rb.cache_sees(pulled.uuid()).await;
 	let p1 = rb.sync().await;
 	assert!(p1.errors.is_empty(), "{p1:?}");
@@ -693,7 +683,7 @@ async fn matrix_13_local_backup_source_delete_never_deletes_remote() {
 		"LocalBackup must never mirror a local deletion to the remote: {r2:?}"
 	);
 
-	let (_dirs, files) = list_root(&sc).await;
+	let (_dirs, files) = sc.cache_list_root().await;
 	for name in ["F1.txt", "F2.txt", "F3.txt", "F4.txt"] {
 		let f = find_file(&files, name)
 			.unwrap_or_else(|| panic!("{name} deleted on remote backup: {files:?}"));
@@ -716,9 +706,9 @@ async fn matrix_14_remote_backup_source_delete_never_deletes_local() {
 	let sc = single_client(SyncMode::RemoteBackup).await;
 
 	// Bodies follow the `body-{name}` template the content check below asserts against.
-	let mut g1 = upload_root(&sc, "G1.txt", b"body-G1.txt").await;
-	let g2 = upload_root(&sc, "G2.txt", b"body-G2.txt").await;
-	let g3 = upload_root(&sc, "G3.txt", b"body-G3.txt").await;
+	let mut g1 = sc.cache_upload_root("G1.txt", b"body-G1.txt").await;
+	let g2 = sc.cache_upload_root("G2.txt", b"body-G2.txt").await;
+	let g3 = sc.cache_upload_root("G3.txt", b"body-G3.txt").await;
 	sc.cache_sees(g1.uuid()).await;
 	sc.cache_sees(g2.uuid()).await;
 	sc.cache_sees(g3.uuid()).await;
@@ -780,7 +770,7 @@ async fn matrix_15_backup_move_is_mirrored_as_a_move() {
 		r2.remotely_trashed, 0,
 		"a move must never delete on a backup destination: {r2:?}"
 	);
-	let (_d, lf) = list_root(&lb).await;
+	let (_d, lf) = lb.cache_list_root().await;
 	assert!(
 		find_file(&lf, "H.txt").is_none(),
 		"the moved item must not linger under its old name: {lf:?}"
@@ -790,7 +780,7 @@ async fn matrix_15_backup_move_is_mirrored_as_a_move() {
 
 	// --- RemoteBackup: rename H -> H2 on the remote source. ---
 	let rb = single_client(SyncMode::RemoteBackup).await;
-	let mut h = upload_root(&rb, "H.txt", b"H-body-stable").await;
+	let mut h = rb.cache_upload_root("H.txt", b"H-body-stable").await;
 	rb.cache_sees(h.uuid()).await;
 	let p1 = rb.sync().await;
 	assert!(p1.errors.is_empty(), "{p1:?}");
@@ -880,7 +870,7 @@ async fn matrix_16_backup_mass_delete_still_suppressed() {
 	);
 
 	// All TOTAL remote files survive.
-	let (_dirs, files) = list_root(&sc).await;
+	let (_dirs, files) = sc.cache_list_root().await;
 	assert_eq!(
 		files
 			.iter()

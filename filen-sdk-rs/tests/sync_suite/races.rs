@@ -15,8 +15,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime};
 
 use filen_macros::shared_test_runtime;
-use filen_sdk_rs::fs::dir::RemoteDirectory;
-use filen_sdk_rs::fs::file::RemoteFile;
 use filen_sdk_rs::fs::{HasName, HasUUID};
 use filen_sdk_rs::sync_engine::{SyncEngine, SyncEvent, SyncMode, SyncObserver};
 #[cfg(unix)]
@@ -29,16 +27,6 @@ use crate::helpers::*;
 // ---------------------------------------------------------------------------
 // Local helpers (public-API only; remote ground-truth via the cache's client).
 // ---------------------------------------------------------------------------
-
-/// List the (dirs, files) directly under the remote root through the cache's client (ground truth).
-async fn list_root(sc: &SingleClient) -> (Vec<RemoteDirectory>, Vec<RemoteFile>) {
-	list_dir(&sc.cache.client, &sc.resources.dir).await
-}
-
-/// Upload `data` as `name` directly under the remote root through the cache's client.
-async fn upload_root(sc: &SingleClient, name: &str, data: &[u8]) -> RemoteFile {
-	upload_to(&sc.cache.client, sc.resources.dir.uuid(), name, data).await
-}
 
 /// Force a file's mtime to a given `SystemTime` (simulate clock skew / mtime restore).
 fn set_mtime(root: &std::path::Path, rel: &str, t: SystemTime) {
@@ -73,7 +61,7 @@ async fn race_05_fast_path_same_size_mtime_advances_uploads() {
 		"equal-size content change must re-upload via mtime fast-path: {r2:?}"
 	);
 
-	let (_d, files) = list_root(&sc).await;
+	let (_d, files) = sc.cache_list_root().await;
 	assert_eq!(files.len(), 1, "still exactly one file: {}", files.len());
 	let f = find_file(&files, "same.txt").expect("same.txt missing");
 	assert_eq!(f.size, 4, "remote size still 4 bytes");
@@ -115,7 +103,7 @@ async fn race_06_fast_path_mtime_restored_to_baseline() {
 	let r3 = sc.sync().await;
 	assert!(r3.errors.is_empty(), "{r3:?}");
 
-	let (_d, files) = list_root(&sc).await;
+	let (_d, files) = sc.cache_list_root().await;
 	let sneaky = find_file(&files, "sneaky.txt").expect("sneaky.txt missing");
 	assert_eq!(
 		sneaky.size, 4,
@@ -159,7 +147,7 @@ async fn race_07_clock_skew_backdated_edit_detected() {
 		"a backdated (mtime-decreased) content change must still be detected: {r2:?}"
 	);
 
-	let (_d, files) = list_root(&sc).await;
+	let (_d, files) = sc.cache_list_root().await;
 	let f = find_file(&files, "future.txt").expect("future.txt missing");
 	assert_eq!(f.size, 4, "remote holds the 4-byte change");
 	sc.cleanup();
@@ -172,7 +160,7 @@ async fn race_07_clock_skew_backdated_edit_detected() {
 async fn race_add_remote_fast_path_same_size_change_detected() {
 	let sc = single_client(SyncMode::RemoteToLocal).await;
 	let root_uuid = sc.resources.dir.uuid();
-	let rf = upload_root(&sc, "rfast.txt", b"AAAA").await;
+	let rf = sc.cache_upload_root("rfast.txt", b"AAAA").await;
 	assert!(
 		poll_for_item(sc.cache.db_path(), rf.uuid(), CACHE_CONVERGE_TIMEOUT).await,
 		"cache never observed rfast.txt"
@@ -244,7 +232,7 @@ async fn race_09_file_replaced_by_directory() {
 	for _ in 0..6 {
 		let r = sc.sync().await;
 		assert!(r.errors.is_empty(), "type-flip pass errors: {r:?}");
-		let (dirs, files) = list_root(&sc).await;
+		let (dirs, files) = sc.cache_list_root().await;
 		let node_is_dir = find_dir(&dirs, "node").is_some();
 		let node_is_file = find_file(&files, "node").is_some();
 		if node_is_dir && !node_is_file {
@@ -283,7 +271,7 @@ async fn race_10_directory_replaced_by_file() {
 	for _ in 0..6 {
 		let r = sc.sync().await;
 		assert!(r.errors.is_empty(), "type-flip pass errors: {r:?}");
-		let (dirs, files) = list_root(&sc).await;
+		let (dirs, files) = sc.cache_list_root().await;
 		let data_is_file = find_file(&files, "data").is_some();
 		let data_is_dir = find_dir(&dirs, "data").is_some();
 		if data_is_file && !data_is_dir {
@@ -330,7 +318,7 @@ async fn race_13_unreadable_local_file_does_not_abort_pair() {
 
 	let r1 = sc.sync().await;
 	// The pair must not crash; the two readable files must upload regardless of the bad one.
-	let (_d, files) = list_root(&sc).await;
+	let (_d, files) = sc.cache_list_root().await;
 	assert!(
 		find_file(&files, "ok1.txt").is_some(),
 		"ok1.txt not uploaded: {r1:?}"
@@ -351,7 +339,7 @@ async fn race_13_unreadable_local_file_does_not_abort_pair() {
 	for _ in 0..6 {
 		let r = sc.sync().await;
 		assert!(r.errors.is_empty(), "post-restore pass errors: {r:?}");
-		let (_d, files) = list_root(&sc).await;
+		let (_d, files) = sc.cache_list_root().await;
 		if let Some(f) = find_file(&files, "secret.txt") {
 			assert_eq!(f.size, 1, "secret.txt size wrong");
 			ok = true;
@@ -376,7 +364,7 @@ async fn race_14_undeliverable_download_does_not_crash_pair() {
 	}
 
 	let sc = single_client(SyncMode::RemoteToLocal).await;
-	let rf = upload_root(&sc, "readonly.txt", b"A-payload").await;
+	let rf = sc.cache_upload_root("readonly.txt", b"A-payload").await;
 	assert!(
 		poll_for_item(sc.cache.db_path(), rf.uuid(), CACHE_CONVERGE_TIMEOUT).await,
 		"cache never observed the remote file"
@@ -582,7 +570,7 @@ async fn race_21_zero_byte_is_real_data_not_absence() {
 		"both files (incl. the empty one) upload: {r1:?}"
 	);
 
-	let (_d, files) = list_root(&sc).await;
+	let (_d, files) = sc.cache_list_root().await;
 	let empty = find_file(&files, "empty.txt").expect("empty.txt missing on remote");
 	assert_eq!(
 		empty.size, 0,
@@ -603,7 +591,7 @@ async fn race_21_zero_byte_is_real_data_not_absence() {
 		"truncation is a content change -> re-upload: {r2:?}"
 	);
 
-	let (_d2, files2) = list_root(&sc).await;
+	let (_d2, files2) = sc.cache_list_root().await;
 	let note = find_file(&files2, "note.txt").expect("note.txt must NOT be deleted");
 	assert_eq!(
 		note.size, 0,
@@ -623,7 +611,7 @@ async fn race_24_first_sync_into_populated_destination_no_wipe() {
 	let sc = single_client(SyncMode::TwoWay).await;
 
 	// Pre-existing remote-only file (placed before this pair's baseline exists).
-	let rf = upload_root(&sc, "pre.txt", b"P-remote").await;
+	let rf = sc.cache_upload_root("pre.txt", b"P-remote").await;
 	assert!(
 		poll_for_item(sc.cache.db_path(), rf.uuid(), CACHE_CONVERGE_TIMEOUT).await,
 		"cache never observed pre.txt"
@@ -646,7 +634,7 @@ async fn race_24_first_sync_into_populated_destination_no_wipe() {
 		);
 		let local_ok = read_eq(&sc.local, "pre.txt", b"P-remote")
 			&& read_eq(&sc.local, "local_pre.txt", b"Q-local");
-		let (_d, files) = list_root(&sc).await;
+		let (_d, files) = sc.cache_list_root().await;
 		let remote_ok =
 			find_file(&files, "pre.txt").is_some() && find_file(&files, "local_pre.txt").is_some();
 		if local_ok && remote_ok {
@@ -693,7 +681,7 @@ async fn race_23_mass_delete_guard_holds_bulk_vanish() {
 
 	// Remote must still hold every file (the guard kept them).
 	let bulk_dir = {
-		let (dirs, _f) = list_root(&sc).await;
+		let (dirs, _f) = sc.cache_list_root().await;
 		find_dir(&dirs, "bulk")
 			.expect("bulk dir gone — guard failed")
 			.clone()
@@ -771,7 +759,7 @@ async fn race_19_symlink_and_loop_do_not_hang_scan() {
 		"both links are reported again, and nothing else: {r2:?}"
 	);
 
-	let (dirs, files) = list_root(&sc).await;
+	let (dirs, files) = sc.cache_list_root().await;
 	let mut file_names: Vec<&str> = files.iter().filter_map(|f| f.name()).collect();
 	file_names.sort_unstable();
 	assert_eq!(file_names, vec!["link.txt", "target.txt"], "{r2:?}");
@@ -817,7 +805,7 @@ async fn race_add_hardlink_two_paths_independent_remote_files() {
 	let r1 = sc.sync().await;
 	assert!(r1.errors.is_empty(), "{r1:?}");
 	// Two distinct names exist; both must be uploaded as independent remote files.
-	let (_d, files) = list_root(&sc).await;
+	let (_d, files) = sc.cache_list_root().await;
 	assert!(
 		find_file(&files, "orig.txt").is_some(),
 		"orig.txt missing: {r1:?}"
@@ -834,7 +822,7 @@ async fn race_add_hardlink_two_paths_independent_remote_files() {
 	for _ in 0..6 {
 		let r = sc.sync().await;
 		assert!(r.errors.is_empty(), "post-edit pass errors: {r:?}");
-		let (_d, files) = list_root(&sc).await;
+		let (_d, files) = sc.cache_list_root().await;
 		let want = b"B-shared-inode-edit".len() as u64;
 		let a = find_file(&files, "orig.txt").map(|f| f.size);
 		let b = find_file(&files, "hardlink.txt").map(|f| f.size);
@@ -866,7 +854,7 @@ async fn race_22_local_backup_delete_never_wipes_remote_copy() {
 	assert_eq!(r1.uploaded, 1, "{r1:?}");
 
 	// Externally edit the remote copy to B (versions in place), AND delete it locally.
-	let _edited = upload_root(&sc, "keep.txt", b"B-remote-edit").await;
+	let _edited = sc.cache_upload_root("keep.txt", b"B-remote-edit").await;
 	std::fs::remove_file(sc.local.join("keep.txt")).unwrap();
 
 	// Several backup passes: the remote copy must NEVER be trashed nor pulled back.
@@ -885,7 +873,7 @@ async fn race_22_local_backup_delete_never_wipes_remote_copy() {
 	}
 
 	// Remote keep.txt must still exist as a coherent version (A or the externally-set B).
-	let (_d, files) = list_root(&sc).await;
+	let (_d, files) = sc.cache_list_root().await;
 	let f = find_file(&files, "keep.txt").expect("protected remote copy was wiped — data loss");
 	assert!(
 		f.size == b"A-local".len() as u64 || f.size == b"B-remote-edit".len() as u64,
@@ -930,7 +918,7 @@ async fn race_08_rapid_edits_coalesce_to_final() {
 	let mut converged = false;
 	let deadline = std::time::Instant::now() + CACHE_CONVERGE_TIMEOUT;
 	while std::time::Instant::now() < deadline {
-		let (_d, files) = list_root(&sc).await;
+		let (_d, files) = sc.cache_list_root().await;
 		if find_file(&files, "burst.txt").map(|f| f.size) == Some(final_bytes.len() as u64) {
 			converged = true;
 			break;
@@ -944,7 +932,7 @@ async fn race_08_rapid_edits_coalesce_to_final() {
 
 	// Quiesce: after settling, no further changes -> the remote stays exactly on the final content.
 	tokio::time::sleep(Duration::from_secs(3)).await;
-	let (_d, files) = list_root(&sc).await;
+	let (_d, files) = sc.cache_list_root().await;
 	let f = find_file(&files, "burst.txt").expect("burst.txt missing");
 	assert_eq!(
 		f.size,
@@ -968,7 +956,7 @@ async fn race_08_rapid_edits_coalesce_to_final() {
 async fn race_17_self_write_does_not_loop() {
 	let sc = single_client(SyncMode::RemoteToLocal).await;
 	// Seed a remote file the engine will download (its own local write).
-	let rf = upload_root(&sc, "pulled.txt", b"A-pulled").await;
+	let rf = sc.cache_upload_root("pulled.txt", b"A-pulled").await;
 	assert!(
 		poll_for_item(sc.cache.db_path(), rf.uuid(), CACHE_CONVERGE_TIMEOUT).await,
 		"cache never observed pulled.txt"
@@ -1047,7 +1035,7 @@ async fn race_add_move_between_passes_converges_no_duplicate() {
 	for _ in 0..6 {
 		let r = sc.sync().await;
 		assert!(r.errors.is_empty(), "move pass errors: {r:?}");
-		let (dirs, _f) = list_root(&sc).await;
+		let (dirs, _f) = sc.cache_list_root().await;
 		let mut at_new = false;
 		let mut at_old = false;
 		if let Some(d2) = find_dir(&dirs, "dir2") {
@@ -1114,7 +1102,7 @@ async fn race_15_sibling_mutation_during_pass_converges() {
 		let r = sc.sync().await;
 		assert!(r.errors.is_empty(), "convergence pass errors: {r:?}");
 		conflicts_seen |= !r.conflicts.is_empty();
-		let (dirs, _f) = list_root(&sc).await;
+		let (dirs, _f) = sc.cache_list_root().await;
 		if let Some(td) = find_dir(&dirs, "tree") {
 			let (_dd, tf) = list_dir(&sc.cache.client, td).await;
 			let has_new = find_file(&tf, "f1001.txt").is_some();
