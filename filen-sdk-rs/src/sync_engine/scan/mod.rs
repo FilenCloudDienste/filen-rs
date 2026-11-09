@@ -1665,6 +1665,11 @@ fn scan_local_watched<S: ScanSink>(
 				window.complete = false;
 				window.gaps.note(&lossy_path, ScanGapCause::NonUtf8Name);
 				window.push(Listed::Error(ScanError::NonUtf8Name { lossy_path }))?;
+				// Every name under it is just as unrepresentable, and the gap covers them already:
+				// listing them would report each one again.
+				if is_dir {
+					walker.skip_current_dir();
+				}
 				continue;
 			};
 

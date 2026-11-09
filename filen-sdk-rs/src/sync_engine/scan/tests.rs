@@ -3373,6 +3373,46 @@ fn a_non_utf8_name_is_a_gap_of_the_scan() {
 	fs::remove_dir_all(&root).ok();
 }
 
+#[cfg(unix)]
+#[test]
+fn a_non_utf8_directory_is_reported_once() {
+	use std::os::unix::ffi::OsStrExt;
+
+	let root = temp_root();
+	let bad = root.join(OsStr::from_bytes(b"bad\xff"));
+	if let Err(err) = fs::create_dir(&bad) {
+		// macOS refuses to create a name that is not valid UTF-8.
+		eprintln!("skipped: this file system refuses a non-UTF-8 name: {err}");
+		fs::remove_dir_all(&root).ok();
+		return;
+	}
+	fs::write(bad.join("a"), b"x").unwrap();
+	fs::write(bad.join("b"), b"x").unwrap();
+	fs::create_dir(bad.join("c")).unwrap();
+	fs::write(bad.join("c").join("d"), b"x").unwrap();
+
+	let scan = scan_plain(&root, &HashMap::new());
+
+	assert!(!scan.complete);
+	assert_eq!(scan.errors.len(), 1, "{:?}", scan.errors);
+	assert!(
+		matches!(&scan.errors[0], ScanError::NonUtf8Name { lossy_path } if lossy_path == "bad\u{fffd}"),
+		"{:?}",
+		scan.errors
+	);
+	assert_eq!(
+		sorted_gaps(&scan),
+		(
+			vec![ScanGap {
+				rel_path: "bad\u{fffd}".to_owned(),
+				cause: ScanGapCause::NonUtf8Name,
+			}],
+			1
+		)
+	);
+	fs::remove_dir_all(&root).ok();
+}
+
 /// A directory removed between the walk listing it and reading its listing changed under the walk:
 /// the scan is partial, nothing is reported as an error, and the gap names it.
 #[test]
