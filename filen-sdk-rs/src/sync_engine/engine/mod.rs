@@ -1116,6 +1116,33 @@ impl PendingWrites {
 		self.journal().writes.values().map(|write| write.seq).min()
 	}
 
+	/// [`settle`](Self::settle), and the DELETE of the rows it retired from `pair`'s store, or a
+	/// restart would fold writes the cache has demonstrably caught up to.
+	///
+	/// The retired rows are diffed around the call so `settle` itself stays a pure in-memory
+	/// operation, and the two halves — the in-memory retirement and the DELETE that records it — run
+	/// under ONE hold of the store lock with no await between them. A read runs under the pass's
+	/// cancel, and a cancel dropped between the halves would leave the retirement standing in
+	/// memory and not in the DB; keep this synchronous.
+	fn settle_and_persist(
+		&self,
+		pair: PairId,
+		store: &SharedStore,
+		observed: &HashMap<Uuid, u64>,
+		remote: &SideRef<'_, RemoteNode>,
+	) -> Result<plan::PassHolds, Error> {
+		let journal = locked(store);
+		let before = self.uuids();
+		let holds = self.settle(pair, observed, remote);
+		let retired: Vec<Uuid> = before.difference(&self.uuids()).copied().collect();
+		if !retired.is_empty() {
+			journal
+				.delete_pending(pair, &retired)
+				.map_err(|e| db_error(e, "retiring pending writes"))?;
+		}
+		Ok(holds)
+	}
+
 	/// Drop the records the cache has demonstrably caught up to and the ones past
 	/// [`PENDING_CREATE_GRACE`], and return what the reconciler still has to suppress on their
 	/// behalf. Whether a surviving create may actually correct the view is [`fold_create`]'s
@@ -5435,26 +5462,16 @@ impl SyncEngine {
 		}
 		super::step("confirm_pushes");
 
-		let mut holds = {
-			let journal = locked(&inputs.store);
-			let before = self.pending.uuids();
-			// An EMPTY map, deliberately: `settle`'s third rule retires a write whose item the
-			// SNAPSHOT shows at its path, and this pass has no snapshot. The derived view shows our
-			// own write because the baseline row records it, so reading it there would retire the
-			// record against itself (I5). The announcement rule and the grace ceiling still apply.
-			let holds = self.pending.settle(
-				pair,
-				&announced,
-				&Side::<RemoteNode>::default().of(&inputs.baseline),
-			);
-			let retired: Vec<Uuid> = before.difference(&self.pending.uuids()).copied().collect();
-			if !retired.is_empty() {
-				journal
-					.delete_pending(pair, &retired)
-					.map_err(|e| db_error(e, "retiring pending writes"))?;
-			}
-			holds
-		};
+		// An EMPTY map, deliberately: `settle`'s third rule retires a write whose item the SNAPSHOT
+		// shows at its path, and this pass has no snapshot. The derived view shows our own write
+		// because the baseline row records it, so reading it there would retire the record against
+		// itself (I5). The announcement rule and the grace ceiling still apply.
+		let mut holds = self.pending.settle_and_persist(
+			pair,
+			&inputs.store,
+			&announced,
+			&Side::<RemoteNode>::default().of(&inputs.baseline),
+		)?;
 		self.retire_superseded_creates(pair, &inputs.baseline, &view.nodes.of(&inputs.baseline))
 			.await?;
 		let folded = self.pending.fold_into(
@@ -5792,26 +5809,9 @@ impl SyncEngine {
 		// The reads that are about the remote AS IT IS come before anything is hidden: what the
 		// cache shows is evidence whatever the rules hide.
 		let remote_emptied = remote_emptied(&view.nodes.of(&baseline), &baseline);
-		// The rows `settle` retires have to leave the DB too, or a restart would fold writes the
-		// cache has demonstrably caught up to. Diffed around the call so `settle` itself stays a
-		// pure in-memory operation, and the two halves — the in-memory retirement and the DELETE
-		// that records it — run under ONE hold of the pair's store with no await between them. This
-		// read runs under the pass's cancel, and a cancel dropped between the halves would leave
-		// the retirement standing in memory and not in the DB.
-		let mut holds = {
-			let journal = locked(&store);
-			let before = self.pending.uuids();
-			let holds = self
-				.pending
-				.settle(pair, &observed, &view.nodes.of(&baseline));
-			let retired: Vec<Uuid> = before.difference(&self.pending.uuids()).copied().collect();
-			if !retired.is_empty() {
-				journal
-					.delete_pending(pair, &retired)
-					.map_err(|e| db_error(e, "retiring pending writes"))?;
-			}
-			holds
-		};
+		let mut holds =
+			self.pending
+				.settle_and_persist(pair, &store, &observed, &view.nodes.of(&baseline))?;
 		// A create whose path shows another version of the same file is the one thing the fold
 		// cannot settle on its own; ask the server before it paints over a stranger.
 		self.retire_superseded_creates(pair, &baseline, &view.nodes.of(&baseline))
