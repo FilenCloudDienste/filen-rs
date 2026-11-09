@@ -16,6 +16,7 @@
 use std::{
 	collections::{HashMap, HashSet},
 	ffi::OsStr,
+	ops::ControlFlow,
 	path::{Path, PathBuf},
 	sync::{
 		Arc, PoisonError,
@@ -960,82 +961,29 @@ async fn apply_plan(
 	// a type flip runs among them, before the create at its path, or the server rejects that create
 	// (the old item still exists).
 	while admits_more(report)
-		&& let Some(Staged {
-			entry, releasable, ..
-		}) = unless_unread(plan.next_in(&ctx, Run::Before).await, report)
+		&& let Some(staged) = unless_unread(plan.next_in(&ctx, Run::Before).await, report)
 	{
-		let action = &entry.action;
-		if !ctx.gate.wait_to_start().await {
-			return note_interrupted(report, total - applied, observer);
+		let serial = SerialRun {
+			ctx: &ctx,
+			findings,
+			run: Run::Before,
+			total,
+			applied: &mut applied,
+		};
+		if apply_serial_run(
+			serial,
+			staged,
+			&mut plan,
+			&mut failed,
+			&mut lease,
+			report,
+			observer,
+		)
+		.await
+		.is_break()
+		{
+			return;
 		}
-		if !failed.skips(action, report, observer) && !holds_serial(full, &mut failed, action) {
-			match lease.prepare(&ctx, action, releasable).await {
-				Some(Ok(())) => {}
-				Some(Err(error)) => {
-					return note_lock_failure(report, total - applied, &error, observer);
-				}
-				None => return note_interrupted(report, total - applied, observer),
-			}
-			if is_trash(action) {
-				let chunk =
-					match take_chunk(&ctx, &mut plan, &mut lease, Run::Before, entry, is_trash)
-						.await
-					{
-						Ok(chunk) => chunk,
-						Err(error) => {
-							note_unread_plan(report, &error);
-							continue;
-						}
-					};
-				applied +=
-					apply_trashes(&ctx, findings, chunk, &mut plan, &failed, report, observer)
-						.await;
-				continue;
-			}
-			if is_remote_dir_create(action) {
-				let chunk = match take_chunk(
-					&ctx,
-					&mut plan,
-					&mut lease,
-					Run::Before,
-					entry,
-					is_remote_dir_create,
-				)
-				.await
-				{
-					Ok(chunk) => chunk,
-					Err(error) => {
-						note_unread_plan(report, &error);
-						continue;
-					}
-				};
-				let hold = lease
-					.held()
-					.expect("a remote write's lease holds the lock (should be impossible)");
-				let chunk_ctx = ChunkContext {
-					ctx: &ctx,
-					hold,
-					full,
-					reach: &reach,
-					since: reach.mark(),
-				};
-				applied +=
-					apply_creates(&chunk_ctx, chunk, &mut plan, &mut failed, report, observer)
-						.await;
-				continue;
-			}
-			apply_serial(
-				&ctx,
-				&entry,
-				&mut plan,
-				&mut failed,
-				findings,
-				report,
-				observer,
-			)
-			.await;
-		}
-		applied += 1;
 	}
 
 	// The transfers under a directory whose move just failed are failed before any transfer starts,
@@ -1148,12 +1096,19 @@ async fn apply_plan(
 					applied += 1;
 					continue;
 				}
-				match lease.prepare(&ctx, &entry.action, releasable).await {
-					Some(Ok(())) => {}
-					Some(Err(error)) => {
-						return note_lock_failure(report, total - applied, &error, observer);
-					}
-					None => return note_interrupted(report, total - applied, observer),
+				if lease
+					.prepare_or_stop(
+						&ctx,
+						&entry.action,
+						releasable,
+						report,
+						total - applied,
+						observer,
+					)
+					.await
+					.is_break()
+				{
+					return;
 				}
 				remote_in_flight += usize::from(mutates_remote(&entry.action));
 				in_flight.push(run_transfer(&ctx, &reach, entry, target, &progress));
@@ -1210,58 +1165,114 @@ async fn apply_plan(
 	// The other deletions, children before parents: a local one at a time, a run of remote trashes a
 	// chunk at a time.
 	while admits_more(report)
-		&& let Some(Staged {
-			entry, releasable, ..
-		}) = unless_unread(plan.next_in(&ctx, Run::After).await, report)
+		&& let Some(staged) = unless_unread(plan.next_in(&ctx, Run::After).await, report)
 	{
-		let action = &entry.action;
-		if !ctx.gate.wait_to_start().await {
-			return note_interrupted(report, total - applied, observer);
+		let serial = SerialRun {
+			ctx: &ctx,
+			findings,
+			run: Run::After,
+			total,
+			applied: &mut applied,
+		};
+		if apply_serial_run(
+			serial,
+			staged,
+			&mut plan,
+			&mut failed,
+			&mut lease,
+			report,
+			observer,
+		)
+		.await
+		.is_break()
+		{
+			return;
 		}
-		if !failed.skips(action, report, observer) && !holds_serial(full, &mut failed, action) {
-			match lease.prepare(&ctx, action, releasable).await {
-				Some(Ok(())) => {}
-				Some(Err(error)) => {
-					return note_lock_failure(report, total - applied, &error, observer);
-				}
-				None => return note_interrupted(report, total - applied, observer),
-			}
-			if is_trash(action) {
-				let chunk = match take_chunk(
-					&ctx,
-					&mut plan,
-					&mut lease,
-					Run::After,
-					entry,
-					is_trash,
-				)
-				.await
-				{
-					Ok(chunk) => chunk,
-					Err(error) => {
-						note_unread_plan(report, &error);
-						continue;
-					}
-				};
-				applied +=
-					apply_trashes(&ctx, findings, chunk, &mut plan, &failed, report, observer)
-						.await;
-				continue;
-			}
-			apply_serial(
-				&ctx,
-				&entry,
-				&mut plan,
-				&mut failed,
-				findings,
-				report,
-				observer,
-			)
-			.await;
-		}
-		applied += 1;
 	}
 	note_interrupted(report, total - applied, observer);
+}
+
+/// What one action of a serial run ([`Run::Before`] or [`Run::After`]) reads of the pass, and the
+/// count of actions carried out that it advances (see [`apply_serial_run`]).
+struct SerialRun<'r, 'a> {
+	ctx: &'r ApplyContext<'a>,
+	findings: Findings<'r, 'a>,
+	/// The run the action was handed out from, which its chunk is taken from too.
+	run: Run,
+	/// Every action the pass staged: what the pass owes on a stop is what `applied` leaves of it.
+	total: usize,
+	/// The actions the pass has carried out so far.
+	applied: &'r mut usize,
+}
+
+/// Carry out the action `staged` of a serial run, with the rest of its chunk when it starts one: a
+/// run of remote trashes, or (before the transfers only) of remote directory creates. An action a
+/// failed or held directory move covers is passed over. `Break` means the pass stopped — cancelled,
+/// or short of the drive lock — and has recorded what it owes.
+async fn apply_serial_run(
+	SerialRun {
+		ctx,
+		findings,
+		run,
+		total,
+		applied,
+	}: SerialRun<'_, '_>,
+	Staged {
+		entry, releasable, ..
+	}: Staged,
+	plan: &mut PagedPlan,
+	failed: &mut FailedDirMoves,
+	lease: &mut Lease,
+	report: &mut SyncReport,
+	observer: &mut (dyn FnMut(SyncEvent) + Send),
+) -> ControlFlow<()> {
+	let action = &entry.action;
+	if !ctx.gate.wait_to_start().await {
+		note_interrupted(report, total - *applied, observer);
+		return ControlFlow::Break(());
+	}
+	if failed.skips(action, report, observer) || holds_serial(findings.full, failed, action) {
+		*applied += 1;
+		return ControlFlow::Continue(());
+	}
+	lease
+		.prepare_or_stop(ctx, action, releasable, report, total - *applied, observer)
+		.await?;
+	if is_trash(action) {
+		let chunk = match take_chunk(ctx, plan, lease, run, entry, is_trash).await {
+			Ok(chunk) => chunk,
+			Err(error) => {
+				note_unread_plan(report, &error);
+				return ControlFlow::Continue(());
+			}
+		};
+		*applied += apply_trashes(ctx, findings, chunk, plan, failed, report, observer).await;
+		return ControlFlow::Continue(());
+	}
+	if run == Run::Before && is_remote_dir_create(action) {
+		let chunk = match take_chunk(ctx, plan, lease, run, entry, is_remote_dir_create).await {
+			Ok(chunk) => chunk,
+			Err(error) => {
+				note_unread_plan(report, &error);
+				return ControlFlow::Continue(());
+			}
+		};
+		let hold = lease
+			.held()
+			.expect("a remote write's lease holds the lock (should be impossible)");
+		let chunk_ctx = ChunkContext {
+			ctx,
+			hold,
+			full: findings.full,
+			reach: findings.reach,
+			since: findings.reach.mark(),
+		};
+		*applied += apply_creates(&chunk_ctx, chunk, plan, failed, report, observer).await;
+		return ControlFlow::Continue(());
+	}
+	apply_serial(ctx, &entry, plan, failed, findings, report, observer).await;
+	*applied += 1;
+	ControlFlow::Continue(())
 }
 
 /// Whether the transfer `entry` may start for the room the local volume has (see [`LocalRoom`]): an
@@ -1622,6 +1633,31 @@ impl Lease {
 		}
 		self.note_start(action);
 		Some(Ok(()))
+	}
+
+	/// [`prepare`](Self::prepare), with the pass's stop recorded when it does not get the lease
+	/// ready: `remaining` actions owed to a cancel, or to a lock it could not take (see
+	/// [`note_lock_failure`]). `Break` means the pass starts nothing more.
+	async fn prepare_or_stop(
+		&mut self,
+		ctx: &ApplyContext<'_>,
+		action: &SyncAction,
+		releasable: bool,
+		report: &mut SyncReport,
+		remaining: usize,
+		observer: &mut (dyn FnMut(SyncEvent) + Send),
+	) -> ControlFlow<()> {
+		match self.prepare(ctx, action, releasable).await {
+			Some(Ok(())) => ControlFlow::Continue(()),
+			Some(Err(error)) => {
+				note_lock_failure(report, remaining, &error, observer);
+				ControlFlow::Break(())
+			}
+			None => {
+				note_interrupted(report, remaining, observer);
+				ControlFlow::Break(())
+			}
+		}
 	}
 }
 
