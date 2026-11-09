@@ -1,6 +1,8 @@
 //! The ignore rules a sync pairs file gives a pair, which the CLI writes into the `.filenignore` at
 //! the pair's local root, where the sync engine reads them like any other `.filenignore`.
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt as _;
 use std::{
 	collections::HashSet,
 	fs::{self, Permissions},
@@ -101,7 +103,8 @@ fn rule_lines(rules: &[String]) -> impl Iterator<Item = &str> {
 }
 
 /// Replaces `path`, a file in `root`, with one holding `content` and, if given, `permissions`, in
-/// one rename.
+/// one rename. Without `permissions`, the new file gets the mode any newly created file gets, as the
+/// umask allows, not the owner-only mode a temporary file is created with.
 fn write_replacing(
 	root: &Path,
 	path: &Path,
@@ -110,10 +113,15 @@ fn write_replacing(
 ) -> std::io::Result<()> {
 	// `.filendl` is the extension of the sync engine's partial downloads, which it never syncs, so
 	// not even a temporary file a crash left behind reaches the other side.
-	let mut temp = tempfile::Builder::new()
-		.prefix(".filenignore.")
-		.suffix(".filendl")
-		.tempfile_in(root)?;
+	let mut builder = tempfile::Builder::new();
+	builder.prefix(".filenignore.").suffix(".filendl");
+	// The mode is given when the file is opened, so the umask applies to it as it does to
+	// `fs::File::create`.
+	#[cfg(unix)]
+	if permissions.is_none() {
+		builder.permissions(Permissions::from_mode(0o666));
+	}
+	let mut temp = builder.tempfile_in(root)?;
 	temp.write_all(content.as_bytes())?;
 	if let Some(permissions) = permissions {
 		temp.as_file().set_permissions(permissions)?;
@@ -125,6 +133,8 @@ fn write_replacing(
 
 #[cfg(test)]
 mod tests {
+	#[cfg(unix)]
+	use std::os::unix::fs::PermissionsExt as _;
 	use std::{fs, path::Path};
 
 	use super::{EXCLUDE_DOT_FILES_RULES, add_rules, merged_rules};
@@ -155,6 +165,24 @@ mod tests {
 		);
 		// and nothing else, no temporary file
 		assert_eq!(names(root.path()), [".filenignore"]);
+	}
+
+	/// A new file gets the mode any newly created file in its place gets, not tempfile's 0600.
+	#[cfg(unix)]
+	#[test]
+	fn a_new_filenignore_gets_the_mode_of_a_newly_created_file() {
+		let root = tempfile::tempdir().unwrap();
+		let reference = tempfile::tempdir().unwrap();
+		let reference_file = reference.path().join("created");
+		fs::File::create(&reference_file).unwrap();
+
+		add_rules(root.path(), &rules(&["*.log"])).unwrap();
+
+		let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+		assert_eq!(
+			mode(&root.path().join(".filenignore")),
+			mode(&reference_file)
+		);
 	}
 
 	#[test]
