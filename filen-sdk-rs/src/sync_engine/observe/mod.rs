@@ -71,6 +71,7 @@ use super::{
 	ignore::{FILENIGNORE, IgnoreDecision, IgnoreRules, rule_file_dir},
 	names::{self, Leaf},
 	plan::{ancestors, is_under, subtree_bounds},
+	relpath::parent_path,
 	rows::Baseline,
 	scan::{
 		LocalNode, LocalScan, PairRoot, RuleFiles, ScanError, ScanGapCause, ScanGaps, ScanRoot,
@@ -871,7 +872,7 @@ fn covered(observed: &BTreeMap<String, LocalObservation>, path: &str) -> bool {
 fn insert(out: &mut LocalObservations, root: &Path, at: &str, observation: LocalObservation) {
 	// A hidden path is not reconciled at all, so nothing asks what its name would collide with.
 	if !matches!(observation, LocalObservation::Hidden(_)) && !at.is_empty() {
-		let dir = at.rsplit_once('/').map_or("", |(dir, _)| dir);
+		let dir = parent_path(at);
 		if !out.siblings.contains_key(dir)
 			&& let Some(folded) = read_siblings(root, dir, out)
 		{

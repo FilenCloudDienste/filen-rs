@@ -25,6 +25,7 @@ use super::{
 	ignore::{IgnoreDecision, IgnoreLevel, IgnoreRules},
 	names,
 	outcome::{UnsyncablePath, UnsyncableReason},
+	relpath::{leaf, parent_path},
 	rows::Baseline,
 	scan::{
 		LocalNode, PairRoot, QUARANTINE_DIR, collision_hash, collision_key, is_account_data,
@@ -4018,16 +4019,6 @@ fn parents_ready<N: NodesAt>(
 		}
 	}
 	true
-}
-
-/// The last component of a `/`-joined relative path.
-fn leaf(rel_path: &str) -> &str {
-	rel_path.rsplit_once('/').map_or(rel_path, |(_, name)| name)
-}
-
-/// The parent part of a `/`-joined relative path (`""` at the top level).
-fn parent_path(rel_path: &str) -> &str {
-	rel_path.rsplit_once('/').map_or("", |(parent, _)| parent)
 }
 
 /// What a pass must treat apart, beyond what the three inputs themselves say.

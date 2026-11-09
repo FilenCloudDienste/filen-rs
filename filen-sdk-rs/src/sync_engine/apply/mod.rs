@@ -55,6 +55,7 @@ use super::{
 	},
 	pause::PassGate,
 	plan::{RemoteNode, SyncAction, is_under},
+	relpath::{leaf, parent_path, split_parent},
 	rows::{Baseline, Cursor},
 	scan::{
 		LocalNode, PairRoot, ScanGap, collision_key, folds_onto_legacy_trash, hash_file,
@@ -514,7 +515,7 @@ where
 	}
 
 	fn parent_uuid(&mut self, path: &str) -> Option<Uuid> {
-		dir_uuid(self.remote.at(parent_and_name(path).0).as_deref())
+		dir_uuid(self.remote.at(parent_path(path)).as_deref())
 	}
 }
 
@@ -633,9 +634,7 @@ impl PassStart {
 /// other wants nothing read.
 fn respelling_candidate(rel_path: &str, remote: Option<&RemoteNode>) -> Option<Uuid> {
 	remote
-		.filter(|node| {
-			node.kind == NodeKind::File && names::has_other_form(parent_and_name(rel_path).1)
-		})
+		.filter(|node| node.kind == NodeKind::File && names::has_other_form(leaf(rel_path)))
 		.map(|node| node.remote_uuid)
 }
 
@@ -649,7 +648,7 @@ async fn respell_remote(
 	rel_path: &str,
 	mut existing: RemoteFile,
 ) -> Result<(), crate::Error> {
-	let name = parent_and_name(rel_path).1;
+	let name = leaf(rel_path);
 	if !existing
 		.name()
 		.is_some_and(|spelled| hashes_apart(spelled, name))
@@ -830,7 +829,7 @@ pub(super) fn aside_target(
 	pair_root: PairRoot,
 	rel_path: &str,
 ) -> Result<(String, PathBuf), crate::Error> {
-	let (parent, name) = parent_and_name(rel_path);
+	let (parent, name) = split_parent(rel_path);
 	let (stem, ext) = match name.rsplit_once('.') {
 		Some((stem, ext)) if !stem.is_empty() => (stem, Some(ext)),
 		_ => (name, None),
@@ -866,13 +865,6 @@ pub(super) fn aside_target(
 	Err(internal_owned(format!(
 		"no free `.old` name is available to keep the local copy of {rel_path:?} aside"
 	)))
-}
-
-pub(super) fn parent_and_name(rel_path: &str) -> (&str, &str) {
-	match rel_path.rsplit_once('/') {
-		Some((parent, name)) => (parent, name),
-		None => ("", rel_path),
-	}
 }
 
 fn millis_to_dt(millis: i64) -> DateTime<Utc> {
@@ -1954,7 +1946,7 @@ impl PagedPlan {
 		rel_path: &str,
 		listed: Option<Uuid>,
 	) -> Result<Option<Uuid>, crate::Error> {
-		let parent = match parent_and_name(rel_path).0 {
+		let parent = match parent_path(rel_path) {
 			"" => return Ok(Some(self.root)),
 			parent => parent,
 		};
@@ -2648,7 +2640,7 @@ fn compose_create<'c>(
 	else {
 		return Err(unpaired());
 	};
-	let (parent_path, name) = parent_and_name(rel_path);
+	let (parent_path, name) = split_parent(rel_path);
 	let parent = match earlier.get(parent_path) {
 		Some(&index) => NewDirParent::Earlier(index),
 		None => NewDirParent::Existing(
@@ -3605,7 +3597,7 @@ async fn apply_transfer(
 			// exact current name, unvalidated, which the server holds already. Respelling it would
 			// write the name anew, so its spelling is kept instead. A new file under such a name
 			// is never planned, and would fail on the validator here.
-			let name = parent_and_name(rel_path).1;
+			let name = leaf(rel_path);
 			if remote
 				.as_deref()
 				.is_some_and(|node| node.kind == NodeKind::File)
@@ -3856,8 +3848,8 @@ async fn apply_one(
 				"move-source file missing from the snapshot",
 			)
 			.await?;
-			let (from_parent, from_name) = parent_and_name(from_path);
-			let (to_parent, to_name) = parent_and_name(to_path);
+			let (from_parent, from_name) = split_parent(from_path);
+			let (to_parent, to_name) = split_parent(to_path);
 			if to_parent != from_parent {
 				let parent = plan
 					.parent_of(to_path, *parent_uuid)?
@@ -3977,8 +3969,8 @@ async fn apply_one(
 				"move-source dir missing from the snapshot",
 			)
 			.await?;
-			let (from_parent, from_name) = parent_and_name(from_path);
-			let (to_parent, to_name) = parent_and_name(to_path);
+			let (from_parent, from_name) = split_parent(from_path);
+			let (to_parent, to_name) = split_parent(to_path);
 			// Validated before anything moves, so a name the rename would refuse fails the action
 			// with the directory still where the baseline has it.
 			let rename = (to_name != from_name)
@@ -4038,7 +4030,7 @@ async fn apply_one(
 				// name so the new spelling is what the directory is listed under.
 				let step = to.with_file_name(format!(
 					".{}.filen-rename-{}",
-					parent_and_name(to_path).1,
+					leaf(to_path),
 					Uuid::new_v4()
 				));
 				std::fs::rename(&to, &step).map_err(io_err)?;

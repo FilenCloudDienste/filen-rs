@@ -51,6 +51,7 @@ use super::{
 	},
 	pause::{PassControl, PassGate, PauseOptions, cancel_suspension},
 	plan::{self, RemoteNode, RemoteView, SyncAction},
+	relpath::leaf,
 	remote::{
 		RemoteObserved, cache_ancestry, cached_chain_to_root, delta_uuids, observe_remote,
 		place_marked_versions,
@@ -2827,7 +2828,7 @@ impl Prepared {
 			.iter()
 			.filter(|action| matches!(action, SyncAction::MoveRemote { .. }))
 			.map(SyncAction::endpoints)
-			.filter(|(from, to)| apply::parent_and_name(from).1 != apply::parent_and_name(to).1)
+			.filter(|(from, to)| leaf(from) != leaf(to))
 			.map(|(_, to)| to)
 			.collect();
 		self.facts

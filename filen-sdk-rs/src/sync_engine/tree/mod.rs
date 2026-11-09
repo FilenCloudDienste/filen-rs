@@ -75,6 +75,7 @@ use uuid::Uuid;
 use super::{
 	baseline::{BaselineChange, BaselineEntry, BaselineState, NodeKind},
 	ignore::FILENIGNORE,
+	relpath::split_parent,
 };
 
 /// A node's index in [`Tree::nodes`]. The root is [`NodeId::ROOT`] and is never a row.
@@ -1233,9 +1234,7 @@ pub(super) struct Cursor<'a> {
 impl Cursor<'_> {
 	/// The row at `rel_path`, as [`Tree::get`] gives it.
 	pub(super) fn get(&mut self, rel_path: &str) -> Option<BaselineEntry> {
-		let (parent, name) = rel_path
-			.rsplit_once('/')
-			.map_or(("", rel_path), |(parent, name)| (parent, name));
+		let (parent, name) = split_parent(rel_path);
 		if parent != self.dir {
 			self.at = self.baseline.resolve(parent)?;
 			self.dir.clear();

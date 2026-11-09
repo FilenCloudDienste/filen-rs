@@ -48,6 +48,7 @@ use super::{
 	SyncMode,
 	baseline::NodeKind,
 	plan::{RemoteNode, RemoteView, ancestors},
+	relpath::parent_path,
 	rows::Baseline,
 	scan::collision_key,
 	side::{Nodes, NodesAt},
@@ -407,7 +408,7 @@ impl IgnoreRules {
 				pattern: FILENIGNORE,
 			});
 		}
-		let mut dir = parent(rel_path);
+		let mut dir = parent_path(rel_path);
 		loop {
 			if dir.is_empty()
 				&& let Some(source) = &self.local_root
@@ -442,7 +443,7 @@ impl IgnoreRules {
 			if dir.is_empty() {
 				break;
 			}
-			dir = parent(dir);
+			dir = parent_path(dir);
 		}
 		for (source, origin) in [
 			(self.user.as_ref(), Origin::User),
@@ -698,10 +699,6 @@ fn as_written(glob: &Glob) -> &str {
 				line.trim_end()
 			}
 		})
-}
-
-fn parent(rel_path: &str) -> &str {
-	rel_path.rsplit_once('/').map_or("", |(parent, _)| parent)
 }
 
 #[cfg(test)]

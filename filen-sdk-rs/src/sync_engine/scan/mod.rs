@@ -71,6 +71,7 @@ use super::{
 	},
 	names::{self, Leaf},
 	plan::RemoteView,
+	relpath::parent_path,
 	rows::{Baseline, Cursor},
 	side::{NodesAt, Side},
 	stage::{Paging, Stage, StageSink},
@@ -1674,7 +1675,7 @@ fn scan_local_watched<S: ScanSink>(
 			};
 
 			let blocked_rule_file = entry.file_name() == OsStr::new(FILENIGNORE) && {
-				let dir = rel_path.rsplit_once('/').map_or("", |(dir, _)| dir);
+				let dir = parent_path(&rel_path);
 				rule_files.reads(dir) && ignore_blocked.contains(dir)
 			};
 			// A walk with a `moved_hash` asks it in walk order, as each file is listed, so it stats

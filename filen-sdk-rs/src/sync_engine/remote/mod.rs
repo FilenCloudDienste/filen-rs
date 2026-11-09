@@ -38,6 +38,7 @@ use super::{
 	ignore::rule_file_dir,
 	names,
 	plan::{self, RemoteNode, is_placeable_name, is_reserved_path, join_path},
+	relpath::parent_path,
 	rows::Baseline,
 	scan::PairRoot,
 	side::{Nodes, NodesAt, Side},
@@ -415,7 +416,7 @@ impl RemoteObservation {
 				.at(&at)
 				.ok_or(FullPassReason::RemoteUnplaceable)?
 				.into_owned();
-			return Ok((dir_of(&at).to_owned(), node));
+			return Ok((parent_path(&at).to_owned(), node));
 		}
 		let chain = read_chain(uuid, ancestry)?;
 		let item = chain
@@ -672,11 +673,6 @@ fn node_of(item: &RemoteItem) -> RemoteNode {
 		size: item.size,
 		modified_millis: item.modified_millis,
 	}
-}
-
-/// The directory part of a root-relative path; `""` for a path at the pair root.
-fn dir_of(path: &str) -> &str {
-	path.rsplit_once('/').map_or("", |(dir, _)| dir)
 }
 
 fn read_chain(uuid: Uuid, ancestry: Ancestry<'_>) -> Result<Vec<RemoteItem>, FullPassReason> {

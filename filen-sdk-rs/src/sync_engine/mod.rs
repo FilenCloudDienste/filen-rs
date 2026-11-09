@@ -51,6 +51,7 @@ mod outcome;
 mod page;
 mod pause;
 mod plan;
+mod relpath;
 // The remote half: apply the announced changes to the derived remote view.
 mod remote;
 mod rows;

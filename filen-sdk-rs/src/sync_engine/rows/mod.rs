@@ -124,6 +124,7 @@ pub(super) use self::snapshot::{reads, reset_reads};
 use super::{
 	baseline::{BaselineEntry, BaselineState, NodeKind},
 	plan::ancestors,
+	relpath::parent_path,
 	scan::collision_key,
 	stage::{Confirmed, StagedConfirmations},
 };
@@ -740,7 +741,7 @@ impl Cursor<'_> {
 			}
 		}
 		self.answered = 1;
-		let dir = rel_path.rsplit_once('/').map_or("", |(dir, _)| dir);
+		let dir = parent_path(rel_path);
 		let entered = self.dir.as_deref() != Some(dir);
 		if entered {
 			// The directory being left needed its probe and nothing more, or it did not.
