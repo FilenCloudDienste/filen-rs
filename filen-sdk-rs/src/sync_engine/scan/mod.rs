@@ -475,16 +475,44 @@ pub(super) fn stat_pair_root(root: &Path) -> std::io::Result<()> {
 }
 
 /// Whether a walk error is a symlink that cannot be followed: one looping back onto an ancestor, or
-/// one whose target does not resolve (dangling, or a link to itself). A symlink to a directory that
-/// merely cannot be READ is not one of these — its target exists and was not read.
+/// one whose target does not resolve (dangling, or a link to itself). Only a target that does not
+/// resolve counts: a link whose target cannot be stat-ed for another reason (a denied directory on
+/// the way to it) leads somewhere that was not read, so it keeps the scan incomplete. A symlink to
+/// a directory that merely cannot be READ is not one of these either — its target exists and was
+/// not read.
 fn unfollowable_symlink(err: &WalkError) -> bool {
 	if matches!(err, WalkError::Loop { .. }) {
 		return true;
 	}
 	err.path().is_some_and(|path| {
 		std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink())
-			&& std::fs::metadata(path).is_err()
+			&& std::fs::metadata(path).is_err_and(|e| target_does_not_resolve(&e))
 	})
+}
+
+/// Whether following a symlink failed because its target does not exist or the link chain loops.
+fn target_does_not_resolve(e: &std::io::Error) -> bool {
+	e.kind() == ErrorKind::NotFound || is_link_loop(e)
+}
+
+/// `ErrorKind::FilesystemLoop` is unstable, so the loop is told apart by its OS error code.
+#[cfg(unix)]
+fn is_link_loop(e: &std::io::Error) -> bool {
+	// `Errno` is `repr(i32)`, so the cast does not truncate.
+	e.raw_os_error() == Some(nix::errno::Errno::ELOOP as i32)
+}
+
+#[cfg(windows)]
+fn is_link_loop(e: &std::io::Error) -> bool {
+	// `ERROR_CANT_RESOLVE_FILENAME` (winerror.h): the name could not be resolved, which is what a
+	// reparse point chain that loops answers. A literal rather than a `windows-sys` feature.
+	const ERROR_CANT_RESOLVE_FILENAME: i32 = 1921;
+	e.raw_os_error() == Some(ERROR_CANT_RESOLVE_FILENAME)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn is_link_loop(_e: &std::io::Error) -> bool {
+	false
 }
 
 /// Whether a read failed because the entry, or a directory above it, is gone or is no longer a

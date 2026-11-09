@@ -1568,6 +1568,63 @@ fn a_dangling_file_symlink_the_baseline_tracks_keeps_the_scan_complete() {
 	fs::remove_dir_all(&root).ok();
 }
 
+/// A link to a file that exists but cannot be stat-ed (a denied directory on the way) leads
+/// somewhere the scan did not read: its file row must not read as a deletion from a complete scan.
+#[cfg(unix)]
+#[test]
+fn a_symlink_to_an_unreadable_target_keeps_the_scan_incomplete() {
+	use std::os::unix::fs::{PermissionsExt, symlink};
+
+	let root = temp_root();
+	// Outside the root, so the walk never meets the denied directory except through the link.
+	let outside = temp_root();
+	let locked = outside.join("locked");
+	fs::create_dir(&locked).unwrap();
+	let target = locked.join("target.txt");
+	fs::write(&target, b"t").unwrap();
+	symlink(&target, root.join("link.txt")).unwrap();
+	fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+	let restore = || fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+	if fs::File::open(&target).is_ok() {
+		restore();
+		eprintln!("skipped: a 0o000 directory does not deny this user (running as root)");
+		fs::remove_dir_all(&root).ok();
+		fs::remove_dir_all(&outside).ok();
+		return;
+	}
+	let baseline = HashMap::from([(
+		"link.txt".to_string(),
+		BaselineEntry {
+			rel_path: "link.txt".to_string(),
+			kind: NodeKind::File,
+			remote_uuid: None,
+			content_hash: None,
+			size: Some(1),
+			local_mtime: Some(1),
+			remote_modified: None,
+			state: BaselineState::Synced,
+			local_kind: None,
+			remote_kind: None,
+			remote_hash: None,
+			remote_size: None,
+			remote_stable_uuid: None,
+			agreed_hash: None,
+		},
+	)]);
+
+	let scan = scan_plain(&root, &baseline);
+	restore();
+	assert!(
+		!scan.complete,
+		"a link whose target was not read must not read as deleted: {:?}",
+		scan.errors
+	);
+	assert_eq!(scan.reported_errors().count(), 1, "{:?}", scan.errors);
+
+	fs::remove_dir_all(&root).ok();
+	fs::remove_dir_all(&outside).ok();
+}
+
 #[cfg(unix)]
 #[test]
 fn a_dangling_symlink_the_baseline_tracks_marks_the_scan_incomplete() {
