@@ -336,6 +336,10 @@ pub struct GdprEvents {
 	pub user_agents: Vec<String>,
 }
 
+/// The user's personal information as [`Client::update_personal_info`] saves it.
+///
+/// Every save overwrites all nine fields: a `None` field is CLEARED, not left as it was. To
+/// change one field, pass every other field's current value too.
 #[derive(Debug, Default, Clone)]
 pub struct UpdatePersonalInfo<'a> {
 	pub city: Option<&'a str>,
@@ -349,6 +353,11 @@ pub struct UpdatePersonalInfo<'a> {
 	pub vat_id: Option<&'a str>,
 }
 
+/// The user's personal information as `updatePersonalInfo` saves it.
+///
+/// Every save overwrites all nine fields: an omitted field is CLEARED, not left as it was. To
+/// change one field, pass every other field's current value too. An empty string is rejected
+/// with `invalid_params`.
 #[cfg(any(feature = "uniffi", feature = "wasm-full"))]
 #[js_type(import, no_ser)]
 pub struct UserPersonalUpdateInfo {

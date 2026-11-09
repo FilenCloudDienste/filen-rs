@@ -4,10 +4,11 @@ use serde::{Deserialize, Serialize};
 
 pub const ENDPOINT: &str = "v3/user/personal/update";
 
-/// Update the user's personal information. The backend treats every field as
-/// mandatory and uses the `"__NONE__"` sentinel string to mean "leave this
-/// field unchanged"; we hide that detail with a custom serde adapter so the
-/// SDK only sees `Option<Cow<str>>` where `None` means "leave unchanged".
+/// Update the user's personal information. The backend requires every field and overwrites
+/// all nine on every call: the `"__NONE__"` sentinel string, which `None` is sent as, CLEARS
+/// its field, and an empty string is rejected with `invalid_params`. A custom serde adapter
+/// hides the sentinel, so the SDK only sees `Option<Cow<str>>` where `None` means "clear".
+/// To change one field, send every other field's current value too.
 #[derive(Deserialize, Serialize, Debug, Clone, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct Request<'a> {
