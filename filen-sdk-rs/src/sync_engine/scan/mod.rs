@@ -50,10 +50,9 @@ use std::{
 		atomic::{AtomicBool, Ordering},
 		mpsc,
 	},
-	time::{Duration, SystemTime},
+	time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use chrono::{DateTime, Utc};
 use filen_types::crypto::Blake3Hash;
 use unicode_normalization::{UnicodeNormalization, is_nfc};
 use uuid::Uuid;
@@ -993,17 +992,24 @@ fn reading(
 /// gives no mtime, or where the two readings are further apart than an `i32` of nanoseconds (an
 /// mtime past the range of either).
 pub(crate) fn mtime_nanos(metadata: &std::fs::Metadata, mtime_millis: i64) -> i32 {
-	let (Ok(modified), Some(read)) = (
-		metadata.modified(),
-		DateTime::from_timestamp_millis(mtime_millis),
-	) else {
+	metadata
+		.modified()
+		.map_or(0, |modified| nanos_past(modified, mtime_millis))
+}
+
+/// How many nanoseconds `modified` lies past `mtime_millis` milliseconds since the Unix epoch; 0
+/// where they are further apart than an `i32` of nanoseconds. Plain integer arithmetic, so an
+/// mtime outside chrono's range (which [`FilenMetaExt::modified`] reads as the epoch) gives 0
+/// instead of a panic.
+fn nanos_past(modified: SystemTime, mtime_millis: i64) -> i32 {
+	let since_epoch = match modified.duration_since(UNIX_EPOCH) {
+		Ok(after) => i128::try_from(after.as_nanos()),
+		Err(before) => i128::try_from(before.duration().as_nanos()).map(|nanos| -nanos),
+	};
+	let Ok(since_epoch) = since_epoch else {
 		return 0;
 	};
-	DateTime::<Utc>::from(modified)
-		.signed_duration_since(read)
-		.num_nanoseconds()
-		.and_then(|nanos| i32::try_from(nanos).ok())
-		.unwrap_or(0)
+	i32::try_from(since_epoch - i128::from(mtime_millis) * 1_000_000).unwrap_or(0)
 }
 
 /// `read`, or, when it is a file whose hash read failed and `stat` now finds something other than a

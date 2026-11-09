@@ -3309,3 +3309,24 @@ fn a_directory_removed_under_the_walk_is_a_gap_of_the_scan() {
 	);
 	fs::remove_dir_all(&root).ok();
 }
+
+#[test]
+fn nanos_past_is_zero_for_an_mtime_past_chronos_range() {
+	assert_eq!(
+		nanos_past(
+			UNIX_EPOCH + Duration::from_millis(1500) + Duration::from_nanos(250),
+			1500
+		),
+		250
+	);
+	assert_eq!(nanos_past(UNIX_EPOCH - Duration::from_millis(1), -1), 0);
+
+	// About 317,000 years out, past chrono's range. A Windows `SystemTime` cannot hold it.
+	let far_future = UNIX_EPOCH.checked_add(Duration::from_secs(10_000_000_000_000));
+	if cfg!(unix) {
+		assert!(far_future.is_some());
+	}
+	if let Some(far_future) = far_future {
+		assert_eq!(nanos_past(far_future, 0), 0);
+	}
+}
