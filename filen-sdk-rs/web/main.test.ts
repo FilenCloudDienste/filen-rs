@@ -296,6 +296,23 @@ test("account info", async () => {
 	expect(info.email).toBe(import.meta.env.VITE_TEST_EMAIL)
 })
 
+test("account timestamps are bigint millis, and unset ones are undefined", async () => {
+	const info = await state.getUserInfo()
+	for (const sub of info.subs) {
+		for (const timestamp of [sub.startTimestamp, sub.cancelTimestamp, sub.withdrawRequested]) {
+			if (timestamp !== undefined) {
+				expect(typeof timestamp).toBe("bigint")
+				// millis, not seconds read as millis (which would land in 1970)
+				expect(timestamp).toBeGreaterThan(1_000_000_000_000n)
+			}
+		}
+	}
+	for (const invoice of info.subsInvoices) {
+		expect(typeof invoice.timestamp).toBe("bigint")
+		expect(invoice.timestamp).toBeGreaterThan(1_000_000_000_000n)
+	}
+})
+
 test("serialization", async () => {
 	const serializedState = await state.toStringified()
 	expect(serializedState.rootUuid).toEqual(state.root().uuid)
