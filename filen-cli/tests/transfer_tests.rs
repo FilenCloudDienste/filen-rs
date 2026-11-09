@@ -1,5 +1,5 @@
 use std::{
-	path::Path,
+	path::{Path, PathBuf},
 	process::Stdio,
 	time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -9,12 +9,18 @@ use filen_sdk_rs::{
 	auth::Client,
 	connect::DirPublicLinkRW,
 	fs::{
-		HasName, HasUUID as _, categories::NonRootFileType, dir::RemoteDirectory,
-		file::traits::HasFileInfo as _,
+		HasName, HasUUID as _,
+		categories::{DirType, NonRootFileType},
+		dir::RemoteDirectory,
+		file::{FileBuilderOptionalName, traits::HasFileInfo as _},
 	},
+	io::client_impl::IoSharedClientExt as _,
 };
 use filen_types::fs::Uuid;
-use test_utils::authenticated_cli_with_args;
+use test_utils::{
+	authenticated_cli_with_args,
+	upload_journal::{NotifyingJournalStore, resumable_upload_contents},
+};
 
 #[shared_test_runtime]
 async fn uploading_a_directory_uploads_its_files() {
@@ -1013,6 +1019,174 @@ async fn downloading_with_resume_continues_from_what_an_earlier_download_left() 
 		"the resumed file differs"
 	);
 	assert!(!partial.exists(), "the partial file was left behind");
+}
+
+/// The directory in the config directory `config_dir` where `upload --resume` keeps its journals.
+fn upload_journal_dir(config_dir: &Path) -> PathBuf {
+	config_dir.join("uploads")
+}
+
+/// The journal files in `config_dir`'s `uploads/`, none when it is missing.
+fn upload_journal_files(config_dir: &Path) -> Vec<PathBuf> {
+	match std::fs::read_dir(upload_journal_dir(config_dir)) {
+		Ok(entries) => entries
+			.map(|entry| entry.unwrap().path())
+			.filter(|path| path.extension().is_some_and(|ext| ext == "filenup"))
+			.collect(),
+		Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+		Err(e) => panic!("reading the upload journals: {e}"),
+	}
+}
+
+/// Starts uploading the file at `source` into `parent` as the CLI with the config directory
+/// `config_dir` would with `--resume`, and drops the upload once its journal was first saved, as
+/// an upload interrupted there leaves it.
+async fn plant_upload_journal(client: &Client, config_dir: &Path, source: &Path, parent: Uuid) {
+	let store = NotifyingJournalStore::open(&upload_journal_dir(config_dir), false).await;
+	tokio::select! {
+		// The save is checked first, so that the upload is dropped before it sends anything more.
+		biased;
+		() = store.saved.notified() => {}
+		result = client.upload_file_from_path_resuming(
+			FileBuilderOptionalName::new(parent),
+			source.to_owned(),
+			&store,
+			None,
+			None,
+		) => panic!(
+			"the upload ended before its journal was saved: {:?}",
+			result.map(|(file, _)| file.uuid())
+		),
+	}
+	assert_eq!(upload_journal_files(config_dir).len(), 1);
+}
+
+/// Asserts that the `--json` result of an upload in `stdout` names some, but not all, of the
+/// `len` bytes of the one file a planted journal was left for as resumed.
+fn assert_partly_resumed(stdout: &[u8], len: usize) {
+	let result: serde_json::Value = serde_json::from_slice(stdout).unwrap();
+	let resumed = result["resumed_bytes"].as_u64().unwrap();
+	assert!(
+		0 < resumed && resumed < u64::try_from(len).unwrap(),
+		"{resumed} of {len} bytes resumed"
+	);
+}
+
+/// The contents of the file at `path` in the drive.
+async fn remote_contents(client: &Client, path: &str) -> Vec<u8> {
+	let Some(NonRootFileType::File(file)) = client.find_item_at_path(path).await.unwrap() else {
+		panic!("no file at {path}");
+	};
+	client.download_file(file.as_ref()).await.unwrap()
+}
+
+#[shared_test_runtime]
+async fn uploading_with_resume_continues_what_an_earlier_upload_left() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir_name = resources.dir.name().unwrap();
+	let config_dir = tempfile::tempdir().unwrap();
+	let local = tempfile::tempdir().unwrap();
+	let source = local.path().join("resumed-upload.bin");
+	let contents = resumable_upload_contents(1);
+	std::fs::write(&source, &contents).unwrap();
+	plant_upload_journal(client, config_dir.path(), &source, resources.dir.uuid()).await;
+
+	let output = authenticated_cli_with_args!(
+		"--config-dir",
+		config_dir.path().to_str().unwrap(),
+		"upload",
+		"--resume",
+		"--json",
+		source.to_str().unwrap(),
+		test_dir_name
+	)
+	.success();
+
+	assert_partly_resumed(&output.get_output().stdout, contents.len());
+	assert!(
+		remote_contents(client, &format!("{test_dir_name}/resumed-upload.bin")).await == contents,
+		"the resumed file differs"
+	);
+	assert_eq!(
+		upload_journal_files(config_dir.path()),
+		Vec::<PathBuf>::new()
+	);
+}
+
+#[shared_test_runtime]
+async fn uploading_a_directory_with_resume_continues_its_unfinished_file() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir_name = resources.dir.name().unwrap();
+	let config_dir = tempfile::tempdir().unwrap();
+	let local = tempfile::tempdir().unwrap();
+	let source = local.path().join("resumed-dir");
+	std::fs::create_dir(&source).unwrap();
+	let big = resumable_upload_contents(2);
+	std::fs::write(source.join("big.bin"), &big).unwrap();
+	std::fs::write(source.join("small.txt"), b"small contents").unwrap();
+	// The remote directory the upload creates, which the journal names as the big file's parent.
+	let DirType::Dir(remote_dir) = client
+		.find_or_create_dir_starting_at(resources.dir.clone().into(), "resumed-dir")
+		.await
+		.unwrap()
+	else {
+		panic!("the remote directory is the drive's root");
+	};
+	plant_upload_journal(
+		client,
+		config_dir.path(),
+		&source.join("big.bin"),
+		remote_dir.uuid(),
+	)
+	.await;
+
+	let output = authenticated_cli_with_args!(
+		"--config-dir",
+		config_dir.path().to_str().unwrap(),
+		"upload",
+		"--resume",
+		"--json",
+		source.to_str().unwrap(),
+		test_dir_name
+	)
+	.success();
+
+	assert_partly_resumed(&output.get_output().stdout, big.len());
+	assert!(
+		remote_contents(client, &format!("{test_dir_name}/resumed-dir/big.bin")).await == big,
+		"the resumed file differs"
+	);
+	assert_eq!(
+		remote_contents(client, &format!("{test_dir_name}/resumed-dir/small.txt")).await,
+		b"small contents"
+	);
+	assert_eq!(
+		upload_journal_files(config_dir.path()),
+		Vec::<PathBuf>::new()
+	);
+}
+
+#[shared_test_runtime]
+async fn uploading_without_resume_keeps_no_record() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let test_dir_name = resources.dir.name().unwrap();
+	let config_dir = tempfile::tempdir().unwrap();
+	let local = tempfile::tempdir().unwrap();
+	let source = local.path().join("unrecorded.bin");
+	std::fs::write(&source, resumable_upload_contents(3)).unwrap();
+
+	authenticated_cli_with_args!(
+		"--config-dir",
+		config_dir.path().to_str().unwrap(),
+		"upload",
+		source.to_str().unwrap(),
+		test_dir_name
+	)
+	.success();
+
+	assert!(!upload_journal_dir(config_dir.path()).exists());
 }
 
 /// The URL the web app gives a public link: its route, uuid and hex-encoded key.
