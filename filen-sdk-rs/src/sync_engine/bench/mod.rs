@@ -1420,9 +1420,23 @@ fn run_meta() -> (String, String, String, String) {
 			.map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned())
 			.unwrap_or_else(|| "unknown".to_owned())
 	};
+	// The whole repository counts, untracked files included (an untracked source can change the
+	// build), except the published result directory: a run's own result file lands there
+	// untracked, and counting it would stamp the next run `-dirty` and refuse it. `:(top)` keeps
+	// the pathspec repo-wide although git runs in this crate's directory; the exclusion is
+	// relative to that directory, as `published_dir` is.
 	let commit = commit_stamp(
 		&output("git", &["rev-parse", "HEAD"]),
-		&output("git", &["status", "--porcelain"]),
+		&output(
+			"git",
+			&[
+				"status",
+				"--porcelain",
+				"--",
+				":(top)",
+				":(exclude)benches/sync_engine/baseline",
+			],
+		),
 	);
 	let toolchain = output("rustc", &["--version"]);
 	let machine = format!(
