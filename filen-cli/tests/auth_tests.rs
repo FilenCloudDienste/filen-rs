@@ -134,6 +134,8 @@ fn exporting_an_auth_config_without_yes_fails_before_logging_in() {
 
 #[test]
 fn logout_with_yes_deletes_the_given_auth_config_and_the_cache() {
+	// logout also deletes ./filen-cli-auth-config.txt, so it must not run in the package directory
+	let working_dir = assert_fs::TempDir::new().unwrap();
 	let config_dir = assert_fs::TempDir::new().unwrap();
 	let elsewhere = assert_fs::TempDir::new().unwrap();
 	let auth_config = elsewhere.path().join("my-auth-config.txt");
@@ -141,6 +143,7 @@ fn logout_with_yes_deletes_the_given_auth_config_and_the_cache() {
 	let cache = config_dir.path().join("filen-sdk-rs-cache");
 	std::fs::write(&cache, "cache").unwrap();
 	cargo_bin_cmd!()
+		.current_dir(working_dir.path())
 		.env("FILEN_CLI_TESTING_DISABLE_KEYRING", "1")
 		.args([
 			"--skip-update",
