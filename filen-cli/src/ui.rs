@@ -577,43 +577,25 @@ impl UI {
 			return;
 		}
 		let terminal_width = self.get_terminal_width().unwrap_or(10);
-		let min_text_width = items.iter().map(|item| item.width()).max().unwrap_or(0);
-		if min_text_width > terminal_width {
-			// it won't fit, so just print one per line
-			self.print(&items.join("\n"));
-			return;
-		}
-		// try different column heights
-		for column_height in 1.. {
-			let columns = items.chunks(column_height).collect::<Vec<_>>();
-			let num_columns = columns.len();
-			let column_widths = columns
-				.clone()
-				.iter()
-				.map(|column| {
-					column
-						.iter()
-						.map(|item| ansi_width::ansi_width(item))
-						.max()
-						.unwrap()
-				})
-				.collect::<Vec<_>>();
-			let spacing_width = (num_columns - 1) * 2;
-			// check if it fits
-			let total_text_width = column_widths.iter().sum::<usize>();
-			if total_text_width + spacing_width <= terminal_width {
+		match grid_layout(items, terminal_width) {
+			GridLayout::OnePerLine => self.print(&items.join("\n")),
+			GridLayout::Columns {
+				column_height,
+				column_widths,
+			} => {
+				let columns = items.chunks(column_height).collect::<Vec<_>>();
 				for row in 0..column_height {
-					let items = (0..columns.len())
-						.map(|i| {
-							let cell = columns[i].get(row).unwrap_or(&"");
-							let padding =
-								" ".repeat(column_widths[i] - ansi_width::ansi_width(cell));
+					let items = columns
+						.iter()
+						.zip(&column_widths)
+						.map(|(column, column_width)| {
+							let cell = column.get(row).unwrap_or(&"");
+							let padding = " ".repeat(column_width - ansi_width::ansi_width(cell));
 							format!("{}{}", cell, padding)
 						})
 						.collect::<Vec<_>>();
 					self.print(&items.join("  "));
 				}
-				break;
 			}
 		}
 	}
@@ -942,6 +924,52 @@ impl UI {
 	pub(crate) fn format_text_heading(text: &str) -> String {
 		style(text).bold().underlined().to_string()
 	}
+}
+
+/// How [`UI::print_grid`] lays out its items.
+#[derive(Debug, PartialEq, Eq)]
+enum GridLayout {
+	/// One item per line, unpadded.
+	OnePerLine,
+	/// Consecutive runs of `column_height` items side by side, each column padded to its width
+	/// (in terminal cells) and separated by two spaces.
+	Columns {
+		column_height: usize,
+		column_widths: Vec<usize>,
+	},
+}
+
+/// Finds the fewest rows that fit `items` into `terminal_width` cells, measuring every item the
+/// way the grid pads it ([`ansi_width::ansi_width`]), or one item per line when no height fits.
+fn grid_layout(items: &[&str], terminal_width: usize) -> GridLayout {
+	let widest = items
+		.iter()
+		.map(|item| ansi_width::ansi_width(item))
+		.max()
+		.unwrap_or(0);
+	if widest > terminal_width {
+		return GridLayout::OnePerLine;
+	}
+	for column_height in 1..=items.len() {
+		let column_widths = items
+			.chunks(column_height)
+			.map(|column| {
+				column
+					.iter()
+					.map(|item| ansi_width::ansi_width(item))
+					.max()
+					.unwrap_or(0)
+			})
+			.collect::<Vec<_>>();
+		let spacing_width = (column_widths.len() - 1) * 2;
+		if column_widths.iter().sum::<usize>() + spacing_width <= terminal_width {
+			return GridLayout::Columns {
+				column_height,
+				column_widths,
+			};
+		}
+	}
+	GridLayout::OnePerLine
 }
 
 /// Writes `line` to `out`, which is stdout outside the tests. A reader that closed stdout, as
@@ -1474,6 +1502,27 @@ mod tests {
 		ui.initialize(false, false, Some(80), true, false);
 		ui.print_grid(&["a", "b", "c"]);
 		assert_eq!(printed.lines(), "a  b  c");
+	}
+
+	#[test]
+	fn a_grid_of_zwj_emoji_wider_than_the_terminal_is_laid_out_one_per_line() {
+		let family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}";
+		let name = family.repeat(14);
+		assert_eq!(
+			grid_layout(&[name.as_str(), "a"], 40),
+			GridLayout::OnePerLine
+		);
+	}
+
+	#[test]
+	fn a_grid_takes_the_fewest_rows_that_fit() {
+		assert_eq!(
+			grid_layout(&["a", "bb", "ccc", "dddd", "e"], 10),
+			GridLayout::Columns {
+				column_height: 3,
+				column_widths: vec![3, 4],
+			}
+		);
 	}
 
 	#[test]
