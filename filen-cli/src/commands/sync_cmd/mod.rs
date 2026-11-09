@@ -158,7 +158,8 @@
 //! relative to the root of a sync pair, and covers the conflicts at that path and under it as a
 //! directory: `dir` covers `dir/f`, while `a.txt` does not cover `a.txt.bak`. Where two paths cover
 //! a conflict, the longer one decides, and `.` covers the whole sync pair. These flags apply to
-//! every sync pair of the run, and only to what the first pass of each sync pair finds; with
+//! every sync pair of the run, and only to what the first pass of each sync pair finds; a pass
+//! that failed before it planned found nothing for them, so they also apply to the next one. With
 //! `--once`, one more pass then applies what was settled before the command exits. What a later
 //! pass holds back or finds in conflict is printed as needing attention, or asked about.
 //!
@@ -587,9 +588,13 @@ async fn sync(
 struct EventLog<'a> {
 	labels: &'a HashMap<PairId, String>,
 	settle: &'a Settle,
-	/// The pairs that have finished a pass. Mass deletion approvals and conflict resolutions are
-	/// only applied on a pair's first pass, where we can be sure they were intentional.
+	/// The pairs that have completed a pass. Mass deletion approvals and conflict resolutions are
+	/// only applied on a pair's first pass, where we can be sure they were intentional. A pass
+	/// that failed counts only when it got as far as its plan.
 	passed: HashSet<PairId>,
+	/// The pairs whose running pass has planned: it sent [`SyncEvent::Planned`], or what planning
+	/// finds, a conflict or deletions held back.
+	planned: HashSet<PairId>,
 	/// What the running transfers have moved, for the status line.
 	transfers: Transfers,
 	/// The failures printed, so that one that comes back on every pass is printed once.
@@ -690,6 +695,7 @@ impl<'a> EventLog<'a> {
 			labels,
 			settle,
 			passed: HashSet::new(),
+			planned: HashSet::new(),
 			transfers: Transfers::default(),
 			failures: Failures::default(),
 			asks: false,
@@ -778,8 +784,27 @@ impl<'a> EventLog<'a> {
 			// a transfer's progress shows on the status line
 			None => self.tick(now),
 		}
-		if let SyncEvent::PassCompleted { .. } | SyncEvent::PassFailed { .. } = event {
-			self.passed.insert(pair);
+		match event {
+			SyncEvent::PassStarted { .. } => {
+				self.planned.remove(&pair);
+			}
+			SyncEvent::Planned { .. }
+			| SyncEvent::Conflict { .. }
+			| SyncEvent::DeletionsHeld { .. } => {
+				self.planned.insert(pair);
+			}
+			SyncEvent::PassCompleted { .. } => {
+				self.planned.remove(&pair);
+				self.passed.insert(pair);
+			}
+			// one that failed before it planned found nothing for the flags, so they are kept for
+			// the next one
+			SyncEvent::PassFailed { .. } => {
+				if self.planned.remove(&pair) {
+					self.passed.insert(pair);
+				}
+			}
+			_ => {}
 		}
 		let is_first_pass = !self.passed.contains(&pair);
 		match event {
@@ -1165,7 +1190,7 @@ mod tests {
 	use serde_json::{Value, json};
 
 	use super::{
-		ConflictResolutions, EventLog, Output, Passes, Settle, SyncCommands, SyncEvent,
+		ConflictResolutions, EventLog, Output, Passes, Settle, Settlement, SyncCommands, SyncEvent,
 		WatchConfig, format_sync_event, given_pairs, open_failure, passes_of, paused_message,
 		unsyncable_notices,
 	};
@@ -1745,6 +1770,68 @@ mod tests {
 			.collect::<Vec<_>>();
 		assert_eq!(events, [json!("action_failed"), json!("pass_failed")]);
 		assert_eq!(err.lines_or_empty(), "");
+	}
+
+	/// Whether `--approve-mass-deletions` approves a batch held back once `before` has been
+	/// printed for the same pair.
+	fn approves_held_after(before: &[SyncEvent]) -> bool {
+		let mut ui = Printed::default().ui();
+		let labels = HashMap::from([(1, "L".to_string())]);
+		let settle = Settle {
+			approve_mass_deletions: true,
+			conflict_resolutions: ConflictResolutions::new(vec![], vec![], vec![]).unwrap(),
+		};
+		let mut log = EventLog::new(
+			&labels,
+			&settle,
+			Output::Text {
+				quiet: true,
+				status: None,
+			},
+		);
+		let held = SyncEvent::DeletionsHeld {
+			count: 3,
+			reason: "mass deletion".to_string(),
+			pass_token: "t".to_string(),
+		};
+
+		for event in before {
+			let _ = log.print(&mut ui, 1, event);
+		}
+		matches!(
+			log.print(&mut ui, 1, &held),
+			Some(Settlement::ApproveDeletions {
+				count: 3,
+				pass_token: "t",
+			})
+		)
+	}
+
+	fn pass_failed() -> SyncEvent {
+		SyncEvent::PassFailed {
+			error: "offline".to_string(),
+			kind: ErrorKind::IO,
+		}
+	}
+
+	/// A pass that failed before it planned found nothing for the flags, so the next pass still
+	/// applies them.
+	#[test]
+	fn a_pass_failed_before_planning_keeps_the_first_pass_flags() {
+		let started = SyncEvent::PassStarted {
+			mode: SyncMode::TwoWay,
+		};
+
+		assert!(approves_held_after(&[started, pass_failed()]));
+	}
+
+	/// A pass that failed once it had planned has seen what the flags settle, so a later pass
+	/// does not apply them.
+	#[test]
+	fn a_pass_failed_after_planning_ends_the_first_pass() {
+		let planned = SyncEvent::Planned { actions: 2 };
+
+		assert!(!approves_held_after(&[planned, pass_failed()]));
 	}
 
 	#[test]
