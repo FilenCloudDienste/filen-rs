@@ -190,7 +190,7 @@ pub(super) async fn set_sync_mode(
 				.reconfigure_pair(pair.id, mode, backlog)
 				.await
 		},
-		|| ui.print_muted(WAITING_FOR_LISTING),
+		ui,
 	)
 	.await
 	.map_err(|e| UI::failure(&switch_failure_message(&label, mode_name, &e)))?;
@@ -414,22 +414,24 @@ fn listing_delays() -> impl Iterator<Item = Duration> {
 
 /// Makes `call`, which needs the cache to have finished listing a pair's remote folder, and fails
 /// with [`ErrorKind::StaleState`] at once while it has not, as the cache does after it starts. It
-/// is called again after a growing wait ([`listing_delays`]), and `waiting` is called before the
-/// first wait.
+/// is called again after a growing wait ([`listing_delays`]). Before the first wait,
+/// [`WAITING_FOR_LISTING`] is printed as a notice, on stderr and not with `--json` or `--quiet`,
+/// so that it stays out of the output a program reads, as the JSON of `sync --dry-run --json`.
 pub(super) async fn awaiting_listing<T>(
 	mut call: impl AsyncFnMut() -> Result<T, filen_sdk_rs::Error>,
-	waiting: impl FnOnce(),
+	ui: &mut UI,
 ) -> Result<T, filen_sdk_rs::Error> {
 	let mut delays = listing_delays();
-	let mut waiting = Some(waiting);
+	let mut notified = false;
 	loop {
 		match call().await {
 			Err(e) if e.kind() == ErrorKind::StaleState => {
 				let Some(delay) = delays.next() else {
 					return Err(e);
 				};
-				if let Some(waiting) = waiting.take() {
-					waiting();
+				if !notified {
+					ui.print_muted_notice(WAITING_FOR_LISTING);
+					notified = true;
 				}
 				tokio::time::sleep(delay).await;
 			}
@@ -442,17 +444,61 @@ pub(super) async fn awaiting_listing<T>(
 mod tests {
 	use std::time::Duration;
 
-	use filen_sdk_rs::sync_engine::{
-		DeleteGuard, PairRecord, PlannedConflict, PlannedNodeKind, SyncMode,
+	use filen_sdk_rs::{
+		ErrorKind,
+		sync_engine::{DeleteGuard, PairRecord, PlannedConflict, PlannedNodeKind, SyncMode},
 	};
 	use filen_types::fs::Uuid;
+	use futures::FutureExt as _;
 
 	use serde_json::json;
 
 	use super::{
-		LISTING_WAIT, conflict_line, conflict_object, listing_delays, pair_line,
-		propagate_deletions_question, switch_failure_message,
+		LISTING_WAIT, WAITING_FOR_LISTING, awaiting_listing, conflict_line, conflict_object,
+		listing_delays, pair_line, propagate_deletions_question, switch_failure_message,
 	};
+	use crate::ui::test_support::Printed;
+
+	/// What stdout and stderr hold once [`awaiting_listing`] has started to wait for a listing,
+	/// at a terminal, with or without `--json`.
+	async fn printed_while_awaiting_a_listing(json: bool) -> (String, String) {
+		let out = Printed::default();
+		let err = Printed::default();
+		let mut ui = Printed::split_terminal_ui(&out, &err);
+		ui.initialize(false, json, None, true, false);
+		let waiting = awaiting_listing(
+			async || {
+				Err::<(), _>(filen_sdk_rs::Error::custom(
+					ErrorKind::StaleState,
+					"still listing",
+				))
+			},
+			&mut ui,
+		);
+		// polled once: the call fails, the notice is printed, and the wait begins, which the test
+		// does not sit through
+		assert!(waiting.now_or_never().is_none());
+		(
+			out.lines_or_empty(),
+			console::strip_ansi_codes(&err.lines_or_empty()).into_owned(),
+		)
+	}
+
+	#[tokio::test]
+	async fn the_indexing_notice_stays_out_of_json_stdout() {
+		assert_eq!(
+			printed_while_awaiting_a_listing(true).await,
+			(String::new(), String::new())
+		);
+	}
+
+	#[tokio::test]
+	async fn the_indexing_notice_goes_to_stderr() {
+		assert_eq!(
+			printed_while_awaiting_a_listing(false).await,
+			(String::new(), WAITING_FOR_LISTING.to_owned())
+		);
+	}
 
 	#[test]
 	fn a_conflict_names_what_each_side_holds() {

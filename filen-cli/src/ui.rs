@@ -1249,6 +1249,13 @@ pub(crate) mod test_support {
 			UI::with_writers(out.clone(), err.clone())
 		}
 
+		/// [`Printed::split_ui`], as if stdout were a terminal.
+		pub(crate) fn split_terminal_ui(out: &Printed, err: &Printed) -> UI {
+			let mut ui = Printed::split_ui(out, err);
+			ui.stdout_is_terminal = true;
+			ui
+		}
+
 		/// The printed lines joined by `\n`, without the one ending the last line.
 		pub(crate) fn lines(&self) -> String {
 			let bytes = self.0.lock().unwrap();

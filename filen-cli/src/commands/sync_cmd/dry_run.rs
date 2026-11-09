@@ -10,7 +10,7 @@ use filen_sdk_rs::sync_engine::{
 use serde_json::{Value, json};
 
 use super::{
-	manage::{WAITING_FOR_LISTING, awaiting_listing, conflict_line, conflict_object, node_name},
+	manage::{awaiting_listing, conflict_line, conflict_object, node_name},
 	paused_message, unsyncable_notices,
 };
 use crate::ui::{self, UI};
@@ -35,16 +35,13 @@ pub(super) async fn print_plans(
 			ui.print_failure(&paused_message(pair.id, label));
 			continue;
 		}
-		let plan = awaiting_listing(
-			async || engine.plan_pair(pair.id).await,
-			|| ui.print_muted(WAITING_FOR_LISTING),
-		)
-		.await
-		.map_err(|e| {
-			UI::failure(&format!(
-				"Failed to plan a pass of the sync pair {label}: {e}"
-			))
-		})?;
+		let plan = awaiting_listing(async || engine.plan_pair(pair.id).await, ui)
+			.await
+			.map_err(|e| {
+				UI::failure(&format!(
+					"Failed to plan a pass of the sync pair {label}: {e}"
+				))
+			})?;
 		if ui.json {
 			ui.print(&plan_object(pair.id, &label, &plan).to_string());
 		} else {
