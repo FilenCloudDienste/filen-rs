@@ -130,6 +130,42 @@ fn a_missing_ancestor_collapses_the_entry_to_that_ancestor() {
 	fs::remove_dir_all(&root).ok();
 }
 
+/// A hidden directory that is gone is hidden whether it was dirtied itself or through a child:
+/// the rules decide a gone ancestor before its absence does. With no rule hiding it, the same
+/// gone ancestor is an absence.
+#[test]
+fn a_gone_ancestor_an_ignore_rule_hides_is_hidden_not_absent() {
+	for (rules, hidden) in [("build/\n", true), ("other/\n", false)] {
+		let root = temp_root();
+		fs::write(root.join(FILENIGNORE), rules).unwrap();
+		let baseline = Baseline::from_rows(vec![
+			row("build", NodeKind::Dir),
+			row("build/x", NodeKind::File),
+		]);
+
+		let out = observe_with(&root, &baseline, &["build/x"]);
+
+		assert!(out.complete, "{:?}", out.errors);
+		assert_eq!(keys(&out), vec!["build"], "rules {rules:?}");
+		if hidden {
+			let LocalObservation::Hidden(decision) = &out.observed["build"] else {
+				panic!(
+					"a gone directory the rules hide is no deletion: {:?}",
+					out.observed
+				);
+			};
+			assert_eq!(decision.pattern, "build/");
+		} else {
+			let LocalObservation::Absent(absence) = &out.observed["build"] else {
+				panic!("{:?}", out.observed);
+			};
+			assert_eq!(absence.path(), "build");
+		}
+
+		fs::remove_dir_all(&root).ok();
+	}
+}
+
 /// The NotFound split: on a path, it is a deletion; on the pair root, it is a removed volume
 /// answering for every path under it, which is missing evidence and no deletion at all.
 #[test]

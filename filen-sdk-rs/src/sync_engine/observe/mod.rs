@@ -787,7 +787,14 @@ fn walk_ancestors<'p>(
 			// this pass has not observed at its own path. The flip is dirty in its own right when
 			// it was seen.
 			Ok(_) => return Ancestors::Unreadable,
+			// The rules decide before the absence does, as they do for a dirty path that is gone
+			// itself: a deletion under a path they hide is the untrack path's business. The
+			// ancestor held the dirty path, so it was a directory, and the rules of every directory
+			// above it are loaded by the iterations before this one.
 			Err(source) if source.kind() == ErrorKind::NotFound => {
+				if let Some(hit) = rules.decide(ancestor, true) {
+					return Ancestors::Hidden(ancestor, hit.into());
+				}
 				return Ancestors::Gone(ancestor);
 			}
 			Err(source) if source.kind() == ErrorKind::NotADirectory => {
