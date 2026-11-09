@@ -252,7 +252,7 @@ mod watch_timings;
 
 use conflict_resolutions::ConflictResolutions;
 use failures::Failures;
-use questions::Questions;
+use questions::{Decision, Question, Questions};
 use status_line::{StatusLine, Throttle};
 use sync_pairs::SyncDirs;
 use transfers::Transfers;
@@ -902,6 +902,43 @@ impl<'a> EventLog<'a> {
 			LineKind::Kept,
 			&format!("{} {}", style("[NEEDS ATTENTION]").yellow().bold(), msg),
 		);
+	}
+
+	/// Prints what `question` is about, before its prompt, and clears the status line, since the
+	/// prompt has the terminal until it is answered.
+	fn print_intro(&mut self, ui: &mut UI, question: &Question) {
+		let pair = question.pair();
+		let mut intro = question.intro().into_iter();
+		if let Some(first) = intro.next() {
+			self.print_needs_attention(ui, pair, &first);
+		}
+		for line in intro {
+			self.print_line(ui, pair, LineKind::Kept, &line);
+		}
+		self.clear_status();
+	}
+
+	/// Says that `decision` leaves its question unsettled: it was left for now, could not be asked,
+	/// or came too late. A decision that settles something prints nothing here, as the caller
+	/// carries it out and says what it did.
+	fn print_unanswered(&mut self, ui: &mut UI, decision: &Decision) {
+		match decision {
+			Decision::Left(question) => {
+				self.print_needs_attention(ui, question.pair(), &questions::left_line(question));
+			}
+			Decision::Failed { question, error } => {
+				let line = questions::failed_line(question, error);
+				self.print_line(ui, question.pair(), LineKind::Failure, &line);
+			}
+			Decision::TooLate(question) => {
+				self.print_needs_attention(
+					ui,
+					question.pair(),
+					&questions::too_late_line(question),
+				);
+			}
+			Decision::Approve(_) | Decision::Resolve { .. } => {}
+		}
 	}
 
 	fn print_approved(&mut self, ui: &mut UI, pair: PairId, msg: &str) {

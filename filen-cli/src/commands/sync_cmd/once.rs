@@ -13,10 +13,10 @@ use filen_sdk_rs::sync_engine::{PairId, PairRecord, SyncEngine, SyncEvent, SyncR
 use tokio::sync::mpsc;
 
 use super::{
-	EventLog, LineKind, Settle, approved_deletions_line,
+	EventLog, Settle, approved_deletions_line,
 	outcome::{failed_pass_problems, pass_problems, problems_summary},
 	paused_message,
-	questions::{self, Decision, Questions},
+	questions::{Decision, Questions},
 	resolve_failure_message, resolved_conflict_lines,
 };
 use crate::{
@@ -201,16 +201,8 @@ async fn ask(
 ) -> HashSet<PairId> {
 	let mut settled = HashSet::new();
 	while let Some(question) = questions.take_next() {
-		let pair = question.pair();
-		let mut intro = question.intro().into_iter();
-		if let Some(first) = intro.next() {
-			log.print_needs_attention(ui, pair, &first);
-		}
-		for line in intro {
-			log.print_line(ui, pair, LineKind::Kept, &line);
-		}
-		log.clear_status();
-		let label = log.label(pair);
+		log.print_intro(ui, &question);
+		let label = log.label(question.pair());
 		questions.open(question, &label);
 		let answered = tokio::select! {
 			answered = questions.answered() => answered,
@@ -242,19 +234,8 @@ async fn ask(
 					log.print_failure(ui, &message);
 				}
 			},
-			Decision::Left(question) => {
-				log.print_needs_attention(ui, question.pair(), &questions::left_line(&question));
-			}
-			Decision::Failed { question, error } => {
-				let line = questions::failed_line(&question, &error);
-				log.print_line(ui, question.pair(), LineKind::Failure, &line);
-			}
-			Decision::TooLate(question) => {
-				log.print_needs_attention(
-					ui,
-					question.pair(),
-					&questions::too_late_line(&question),
-				);
+			unanswered @ (Decision::Left(_) | Decision::Failed { .. } | Decision::TooLate(_)) => {
+				log.print_unanswered(ui, &unanswered);
 			}
 		}
 	}

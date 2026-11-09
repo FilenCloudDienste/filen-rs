@@ -14,7 +14,7 @@ use super::{
 	EventLog, LineKind, Settlement, approved_deletions_line,
 	outcome::{LastPasses, problems_summary},
 	paused_message,
-	questions::{self, Answered, Decision, Questions},
+	questions::{Answered, Decision, Questions},
 	resolve_failure_message, resolved_conflict_lines,
 };
 use crate::{interrupt, memory, ui::UI};
@@ -179,8 +179,8 @@ pub(super) enum Update {
 
 impl Update {
 	/// Whether this is about a single item, of which a pass reports any number, so that an open
-	/// question may leave it out past [`questions::MAX_DEFERRED_ITEMS`]. The match names every
-	/// event, so that a new one is sorted into one side or the other.
+	/// question may leave it out past [`super::questions::MAX_DEFERRED_ITEMS`]. The match names
+	/// every event, so that a new one is sorted into one side or the other.
 	///
 	/// A copy moved aside is about one item but always kept: it is the only line that says where
 	/// the copy went.
@@ -286,17 +286,8 @@ impl Watching<'_, '_> {
 		let Some(question) = self.questions.take_next() else {
 			return;
 		};
-		let pair = question.pair();
-		let mut intro = question.intro().into_iter();
-		if let Some(first) = intro.next() {
-			self.log.print_needs_attention(ui, pair, &first);
-		}
-		for line in intro {
-			self.log.print_line(ui, pair, LineKind::Kept, &line);
-		}
-		// the prompt has the terminal until it is answered
-		self.log.clear_status();
-		let label = self.log.label(pair);
+		self.log.print_intro(ui, &question);
+		let label = self.log.label(question.pair());
 		self.questions.open(question, &label);
 	}
 
@@ -324,24 +315,8 @@ impl Watching<'_, '_> {
 				self.resolve(ui, pair, &rel_path, resolution, PassState::Ended)
 					.await;
 			}
-			Decision::Left(question) => {
-				self.log.print_needs_attention(
-					ui,
-					question.pair(),
-					&questions::left_line(&question),
-				);
-			}
-			Decision::Failed { question, error } => {
-				let line = questions::failed_line(&question, &error);
-				self.log
-					.print_line(ui, question.pair(), LineKind::Failure, &line);
-			}
-			Decision::TooLate(question) => {
-				self.log.print_needs_attention(
-					ui,
-					question.pair(),
-					&questions::too_late_line(&question),
-				);
+			unanswered @ (Decision::Left(_) | Decision::Failed { .. } | Decision::TooLate(_)) => {
+				self.log.print_unanswered(ui, &unanswered);
 			}
 		}
 		for (pair, update) in deferred {
