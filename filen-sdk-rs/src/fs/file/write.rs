@@ -192,6 +192,25 @@ pub(crate) async fn complete_upload(
 	}
 }
 
+/// Registers an uploaded file with [`complete_upload`] under `drive_lock`, a lock taken before
+/// the caller finished other work, and hands on the lock it registered under.
+pub(crate) async fn register_upload_under_lock(
+	client: &Client,
+	drive_lock: Arc<ResourceLock>,
+	file: &BaseFile,
+	upload_key: &str,
+	completion: UploadCompletion,
+) -> Result<(UploadResponse, Arc<ResourceLock>), Error> {
+	// The lock may have been taken long before, as the writer waits for it together with the
+	// confirm callback, which can take long. Nothing was read under it, so a lost lease is taken
+	// again rather than the uploaded chunks thrown away.
+	let drive_lock = confirm_or_retake(&drive_lock, || client.lock_drive())
+		.await?
+		.unwrap_or(drive_lock);
+	let response = complete_upload(client, file, upload_key, completion).await?;
+	Ok((response, drive_lock))
+}
+
 /// The [`RemoteFile`] an upload produced, from the local file, the server's registration
 /// response and the upload's completion data.
 pub(crate) fn remote_file_from_upload(
@@ -636,14 +655,7 @@ impl<'a> FileWriterWaitingForDriveLockState<'a> {
 		let upload_key = self.upload_key.clone();
 		let future: MaybeSendBoxFuture<'a, Result<(UploadResponse, Arc<ResourceLock>), Error>> =
 			Box::pin(async move {
-				// The lock was waited for together with the confirm callback, which can take
-				// long. Nothing was read under it, so a lost lease is taken again rather than
-				// the uploaded chunks thrown away.
-				let drive_lock = confirm_or_retake(&drive_lock, || client.lock_drive())
-					.await?
-					.unwrap_or(drive_lock);
-				let response = complete_upload(client, &file, &upload_key, completion).await?;
-				Ok((response, drive_lock))
+				register_upload_under_lock(client, drive_lock, &file, &upload_key, completion).await
 			});
 
 		Ok(FileWriterCompletingState {
@@ -668,7 +680,7 @@ impl<'a> FileWriterWaitingForDriveLockState<'a> {
 }
 
 /// What registering an upload answers.
-type UploadResponse = filen_types::api::v3::upload::empty::Response;
+pub(crate) type UploadResponse = filen_types::api::v3::upload::empty::Response;
 
 struct FileWriterCompletingState<'a> {
 	file: Arc<BaseFile>,
