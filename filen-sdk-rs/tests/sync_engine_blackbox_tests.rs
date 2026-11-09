@@ -1338,133 +1338,129 @@ async fn a_remote_file_not_matching_its_hash_is_skipped_until_it_changes() {
 async fn a_local_edit_uploads_over_a_remote_file_not_matching_its_hash() {
 	let fx = Fixture::new().await;
 	fx.wait_initial_converged().await;
-	let _versioning_lock = fx
-		.client
-		.acquire_lock_with_default(test_utils::locks::USER_VERSIONING)
-		.await
-		.unwrap();
-	fx.client.set_versioning_enabled(true).await.unwrap();
-	let synced = b"the content both sides synced";
-	let first = upload_remote(&fx, "bad.txt", synced).await;
-	let db = fx.db_path().to_path_buf();
-	let (first_uuid, synced_hash): (Uuid, _) = (first.uuid(), blake3::hash(synced));
-	assert!(
-		poll_until(CACHE_CONVERGE_TIMEOUT, || {
-			cached_hash(&db, first_uuid).as_deref() == Some(synced_hash.to_hex().as_str())
-		})
-		.await,
-		"the cache never listed the synced file"
-	);
-	let engine = fx.open_engine().await;
-	let pair = engine
-		.add_pair(fx.local.clone(), fx.remote_uuid, SyncMode::TwoWay)
-		.await
-		.unwrap();
-	let initial = engine.sync_once(pair).await.unwrap();
-	assert_eq!(initial.downloaded, 1, "{initial:?}");
-	assert_eq!(read_local(&fx.local, "bad.txt"), synced);
-
-	let mut bad = upload_remote(&fx, "bad.txt", b"the new version").await;
-	let wrong = blake3::hash(b"other bytes");
-	fx.client
-		.replace_file_hash(&mut bad, wrong.into())
-		.await
-		.unwrap();
-	let bad_uuid: Uuid = bad.uuid();
-	assert!(
-		poll_until(CACHE_CONVERGE_TIMEOUT, || {
-			cached_hash(&db, bad_uuid).as_deref() == Some(wrong.to_hex().as_str())
-		})
-		.await,
-		"the cache never listed the new version with the hash it was given"
-	);
-	let skipped = |unsyncable: &[UnsyncablePath]| {
-		unsyncable
-			.iter()
-			.filter(|path| {
-				matches!(
-					path.reason,
-					UnsyncableReason::RemoteContentHashMismatch { .. }
-				)
-			})
-			.map(|path| path.rel_path.clone())
-			.collect::<Vec<_>>()
-	};
-
-	let found = engine.sync_once(pair).await.unwrap();
-	assert_eq!(found.downloaded, 0, "{found:?}");
-	assert_eq!(skipped(&found.unsyncable), ["bad.txt"], "{found:?}");
-	assert_eq!(read_local(&fx.local, "bad.txt"), synced);
-
-	// What the failed download left, and a touch of it, are no local edits.
-	let left = engine.sync_once(pair).await.unwrap();
-	assert_eq!((left.uploaded, left.downloaded), (0, 0), "{left:?}");
-	assert_eq!(skipped(&left.unsyncable), ["bad.txt"], "{left:?}");
-	assert!(left.errors.is_empty(), "{left:?}");
-	std::fs::File::options()
-		.write(true)
-		.open(fx.local.join("bad.txt"))
-		.unwrap()
-		.set_modified(std::time::SystemTime::now() + Duration::from_secs(3_600))
-		.unwrap();
-	let touched = engine.sync_once(pair).await.unwrap();
-	assert_eq!(
-		(touched.uploaded, touched.downloaded),
-		(0, 0),
-		"{touched:?}"
-	);
-	assert_eq!(skipped(&touched.unsyncable), ["bad.txt"], "{touched:?}");
-	assert!(touched.conflicts.is_empty(), "{touched:?}");
-
-	let edit = b"the edit made since the last sync";
-	write_local(&fx.local, "bad.txt", edit);
-
-	for _ in 0..2 {
-		let dry = engine.plan_pair(pair).await.unwrap();
+	with_versions_and_versioning(&fx.client, true, async {
+		let synced = b"the content both sides synced";
+		let first = upload_remote(&fx, "bad.txt", synced).await;
+		let db = fx.db_path().to_path_buf();
+		let (first_uuid, synced_hash): (Uuid, _) = (first.uuid(), blake3::hash(synced));
 		assert!(
-			matches!(
-				dry.actions.as_slice(),
-				[PlannedAction {
-					kind: PlannedActionKind::UploadFile,
-					rel_path,
-					..
-				}] if rel_path == "bad.txt"
-			),
-			"{dry:?}"
+			poll_until(CACHE_CONVERGE_TIMEOUT, || {
+				cached_hash(&db, first_uuid).as_deref() == Some(synced_hash.to_hex().as_str())
+			})
+			.await,
+			"the cache never listed the synced file"
 		);
-		assert!(dry.conflicts.is_empty(), "{dry:?}");
-		assert!(skipped(&dry.unsyncable).is_empty(), "{dry:?}");
-	}
+		let engine = fx.open_engine().await;
+		let pair = engine
+			.add_pair(fx.local.clone(), fx.remote_uuid, SyncMode::TwoWay)
+			.await
+			.unwrap();
+		let initial = engine.sync_once(pair).await.unwrap();
+		assert_eq!(initial.downloaded, 1, "{initial:?}");
+		assert_eq!(read_local(&fx.local, "bad.txt"), synced);
 
-	let replaced = engine.sync_once(pair).await.unwrap();
-	assert_eq!(replaced.uploaded, 1, "{replaced:?}");
-	assert_eq!(replaced.downloaded, 0, "{replaced:?}");
-	assert!(replaced.conflicts.is_empty(), "{replaced:?}");
-	assert!(replaced.errors.is_empty(), "{replaced:?}");
-	assert!(skipped(&replaced.unsyncable).is_empty(), "{replaced:?}");
-	assert_eq!(read_local(&fx.local, "bad.txt"), edit);
+		let mut bad = upload_remote(&fx, "bad.txt", b"the new version").await;
+		let wrong = blake3::hash(b"other bytes");
+		fx.client
+			.replace_file_hash(&mut bad, wrong.into())
+			.await
+			.unwrap();
+		let bad_uuid: Uuid = bad.uuid();
+		assert!(
+			poll_until(CACHE_CONVERGE_TIMEOUT, || {
+				cached_hash(&db, bad_uuid).as_deref() == Some(wrong.to_hex().as_str())
+			})
+			.await,
+			"the cache never listed the new version with the hash it was given"
+		);
+		let skipped = |unsyncable: &[UnsyncablePath]| {
+			unsyncable
+				.iter()
+				.filter(|path| {
+					matches!(
+						path.reason,
+						UnsyncableReason::RemoteContentHashMismatch { .. }
+					)
+				})
+				.map(|path| path.rel_path.clone())
+				.collect::<Vec<_>>()
+		};
 
-	let (_dirs, files) = fx.list_remote_root().await;
-	let head = find_file(&files, "bad.txt").expect("the file stays at its path");
-	let head_uuid: Uuid = head.uuid();
-	assert_ne!(head_uuid, bad_uuid);
-	assert_eq!(head.hash(), Some(blake3::hash(edit).into()));
-	let versions = fx.client.list_file_versions(head).await.unwrap();
-	assert!(
-		versions.iter().any(|version| version.uuid() == bad_uuid),
-		"the damaged version stays in the file's history"
-	);
+		let found = engine.sync_once(pair).await.unwrap();
+		assert_eq!(found.downloaded, 0, "{found:?}");
+		assert_eq!(skipped(&found.unsyncable), ["bad.txt"], "{found:?}");
+		assert_eq!(read_local(&fx.local, "bad.txt"), synced);
 
-	let settled = engine.sync_once(pair).await.unwrap();
-	assert_eq!(
-		(settled.uploaded, settled.downloaded),
-		(0, 0),
-		"{settled:?}"
-	);
-	assert!(settled.conflicts.is_empty(), "{settled:?}");
-	assert!(settled.errors.is_empty(), "{settled:?}");
-	assert!(skipped(&settled.unsyncable).is_empty(), "{settled:?}");
+		// What the failed download left, and a touch of it, are no local edits.
+		let left = engine.sync_once(pair).await.unwrap();
+		assert_eq!((left.uploaded, left.downloaded), (0, 0), "{left:?}");
+		assert_eq!(skipped(&left.unsyncable), ["bad.txt"], "{left:?}");
+		assert!(left.errors.is_empty(), "{left:?}");
+		std::fs::File::options()
+			.write(true)
+			.open(fx.local.join("bad.txt"))
+			.unwrap()
+			.set_modified(std::time::SystemTime::now() + Duration::from_secs(3_600))
+			.unwrap();
+		let touched = engine.sync_once(pair).await.unwrap();
+		assert_eq!(
+			(touched.uploaded, touched.downloaded),
+			(0, 0),
+			"{touched:?}"
+		);
+		assert_eq!(skipped(&touched.unsyncable), ["bad.txt"], "{touched:?}");
+		assert!(touched.conflicts.is_empty(), "{touched:?}");
 
+		let edit = b"the edit made since the last sync";
+		write_local(&fx.local, "bad.txt", edit);
+
+		for _ in 0..2 {
+			let dry = engine.plan_pair(pair).await.unwrap();
+			assert!(
+				matches!(
+					dry.actions.as_slice(),
+					[PlannedAction {
+						kind: PlannedActionKind::UploadFile,
+						rel_path,
+						..
+					}] if rel_path == "bad.txt"
+				),
+				"{dry:?}"
+			);
+			assert!(dry.conflicts.is_empty(), "{dry:?}");
+			assert!(skipped(&dry.unsyncable).is_empty(), "{dry:?}");
+		}
+
+		let replaced = engine.sync_once(pair).await.unwrap();
+		assert_eq!(replaced.uploaded, 1, "{replaced:?}");
+		assert_eq!(replaced.downloaded, 0, "{replaced:?}");
+		assert!(replaced.conflicts.is_empty(), "{replaced:?}");
+		assert!(replaced.errors.is_empty(), "{replaced:?}");
+		assert!(skipped(&replaced.unsyncable).is_empty(), "{replaced:?}");
+		assert_eq!(read_local(&fx.local, "bad.txt"), edit);
+
+		let (_dirs, files) = fx.list_remote_root().await;
+		let head = find_file(&files, "bad.txt").expect("the file stays at its path");
+		let head_uuid: Uuid = head.uuid();
+		assert_ne!(head_uuid, bad_uuid);
+		assert_eq!(head.hash(), Some(blake3::hash(edit).into()));
+		let versions = fx.client.list_file_versions(head).await.unwrap();
+		assert!(
+			versions.iter().any(|version| version.uuid() == bad_uuid),
+			"the damaged version stays in the file's history"
+		);
+
+		let settled = engine.sync_once(pair).await.unwrap();
+		assert_eq!(
+			(settled.uploaded, settled.downloaded),
+			(0, 0),
+			"{settled:?}"
+		);
+		assert!(settled.conflicts.is_empty(), "{settled:?}");
+		assert!(settled.errors.is_empty(), "{settled:?}");
+		assert!(skipped(&settled.unsyncable).is_empty(), "{settled:?}");
+	})
+	.await;
 	fx.cleanup();
 }
 
@@ -1474,12 +1470,11 @@ const EDIT_OVER_A_DAMAGED_VERSION: &[u8] = b"the edit made since the last sync";
 
 /// With versioning off, take a synced file's local edit over a new remote version not matching its
 /// hash to the pass that holds it as a conflict, instead of uploading it: the upload would lose
-/// that version for good. Nothing has run since that pass. The caller holds the versioning lock and
-/// turns the setting back on.
+/// that version for good. Nothing has run since that pass. The caller runs it under
+/// [`with_versioning`] with the setting off.
 #[cfg(feature = "malformed")]
 async fn local_edit_held_over_a_damaged_version(fx: &Fixture) -> (SyncEngine, i64) {
 	fx.wait_initial_converged().await;
-	fx.client.set_versioning_enabled(false).await.unwrap();
 	let synced = b"the content both sides synced";
 	let first = upload_remote(fx, "bad.txt", synced).await;
 	let db = fx.db_path().to_path_buf();
@@ -1552,33 +1547,29 @@ async fn local_edit_held_over_a_damaged_version(fx: &Fixture) -> (SyncEngine, i6
 #[shared_test_runtime]
 async fn a_local_edit_over_a_damaged_version_is_a_conflict_with_versioning_off() {
 	let fx = Fixture::new().await;
-	let _versioning_lock = fx
-		.client
-		.acquire_lock_with_default(test_utils::locks::USER_VERSIONING)
-		.await
-		.unwrap();
-	let (engine, pair) = local_edit_held_over_a_damaged_version(&fx).await;
+	with_versioning(&fx.client, false, async {
+		let (engine, pair) = local_edit_held_over_a_damaged_version(&fx).await;
 
-	let still = engine.sync_once(pair).await.unwrap();
-	assert_eq!((still.uploaded, still.downloaded), (0, 0), "{still:?}");
-	assert_eq!(still.conflicts.len(), 1, "{still:?}");
-	assert!(skipped_for_hash(&still.unsyncable).is_empty(), "{still:?}");
+		let still = engine.sync_once(pair).await.unwrap();
+		assert_eq!((still.uploaded, still.downloaded), (0, 0), "{still:?}");
+		assert_eq!(still.conflicts.len(), 1, "{still:?}");
+		assert!(skipped_for_hash(&still.unsyncable).is_empty(), "{still:?}");
 
-	engine
-		.resolve_conflict(pair, "bad.txt", ConflictResolution::KeepLocal)
-		.await
-		.unwrap();
-	let resolved = engine.sync_once(pair).await.unwrap();
-	assert_eq!(resolved.uploaded, 1, "{resolved:?}");
-	assert!(resolved.conflicts.is_empty(), "{resolved:?}");
-	let (_dirs, files) = fx.list_remote_root().await;
-	let head = find_file(&files, "bad.txt").expect("the file stays at its path");
-	assert_eq!(
-		head.hash(),
-		Some(blake3::hash(EDIT_OVER_A_DAMAGED_VERSION).into())
-	);
-
-	fx.client.set_versioning_enabled(true).await.unwrap();
+		engine
+			.resolve_conflict(pair, "bad.txt", ConflictResolution::KeepLocal)
+			.await
+			.unwrap();
+		let resolved = engine.sync_once(pair).await.unwrap();
+		assert_eq!(resolved.uploaded, 1, "{resolved:?}");
+		assert!(resolved.conflicts.is_empty(), "{resolved:?}");
+		let (_dirs, files) = fx.list_remote_root().await;
+		let head = find_file(&files, "bad.txt").expect("the file stays at its path");
+		assert_eq!(
+			head.hash(),
+			Some(blake3::hash(EDIT_OVER_A_DAMAGED_VERSION).into())
+		);
+	})
+	.await;
 	fx.cleanup();
 }
 
@@ -1588,32 +1579,28 @@ async fn a_local_edit_over_a_damaged_version_is_a_conflict_with_versioning_off()
 #[shared_test_runtime]
 async fn keeping_local_right_after_the_conflict_over_a_damaged_version_uploads_the_edit() {
 	let fx = Fixture::new().await;
-	let _versioning_lock = fx
-		.client
-		.acquire_lock_with_default(test_utils::locks::USER_VERSIONING)
-		.await
-		.unwrap();
-	let (engine, pair) = local_edit_held_over_a_damaged_version(&fx).await;
+	with_versioning(&fx.client, false, async {
+		let (engine, pair) = local_edit_held_over_a_damaged_version(&fx).await;
 
-	engine
-		.resolve_conflict(pair, "bad.txt", ConflictResolution::KeepLocal)
-		.await
-		.unwrap();
-	let resolved = engine.sync_once(pair).await.unwrap();
-	assert_eq!(resolved.uploaded, 1, "{resolved:?}");
-	assert!(resolved.conflicts.is_empty(), "{resolved:?}");
-	assert!(
-		skipped_for_hash(&resolved.unsyncable).is_empty(),
-		"{resolved:?}"
-	);
-	let (_dirs, files) = fx.list_remote_root().await;
-	let head = find_file(&files, "bad.txt").expect("the file stays at its path");
-	assert_eq!(
-		head.hash(),
-		Some(blake3::hash(EDIT_OVER_A_DAMAGED_VERSION).into())
-	);
-
-	fx.client.set_versioning_enabled(true).await.unwrap();
+		engine
+			.resolve_conflict(pair, "bad.txt", ConflictResolution::KeepLocal)
+			.await
+			.unwrap();
+		let resolved = engine.sync_once(pair).await.unwrap();
+		assert_eq!(resolved.uploaded, 1, "{resolved:?}");
+		assert!(resolved.conflicts.is_empty(), "{resolved:?}");
+		assert!(
+			skipped_for_hash(&resolved.unsyncable).is_empty(),
+			"{resolved:?}"
+		);
+		let (_dirs, files) = fx.list_remote_root().await;
+		let head = find_file(&files, "bad.txt").expect("the file stays at its path");
+		assert_eq!(
+			head.hash(),
+			Some(blake3::hash(EDIT_OVER_A_DAMAGED_VERSION).into())
+		);
+	})
+	.await;
 	fx.cleanup();
 }
 
@@ -1623,39 +1610,35 @@ async fn keeping_local_right_after_the_conflict_over_a_damaged_version_uploads_t
 #[shared_test_runtime]
 async fn keeping_remote_right_after_the_conflict_over_a_damaged_version_marks_the_version_again() {
 	let fx = Fixture::new().await;
-	let _versioning_lock = fx
-		.client
-		.acquire_lock_with_default(test_utils::locks::USER_VERSIONING)
-		.await
-		.unwrap();
-	let (engine, pair) = local_edit_held_over_a_damaged_version(&fx).await;
+	with_versioning(&fx.client, false, async {
+		let (engine, pair) = local_edit_held_over_a_damaged_version(&fx).await;
 
-	let quarantined = engine
-		.resolve_conflict(pair, "bad.txt", ConflictResolution::KeepRemote)
-		.await
-		.unwrap()
-		.quarantined
-		.expect("the edit goes to the bin");
-	assert_eq!(
-		std::fs::read(quarantined).unwrap(),
-		EDIT_OVER_A_DAMAGED_VERSION
-	);
-	let pulled = engine.sync_once(pair).await.unwrap();
-	assert_eq!((pulled.uploaded, pulled.downloaded), (0, 0), "{pulled:?}");
-	assert!(!local_exists(&fx.local, "bad.txt"));
-	let skipped = engine.sync_once(pair).await.unwrap();
-	assert_eq!(
-		(skipped.uploaded, skipped.downloaded),
-		(0, 0),
-		"{skipped:?}"
-	);
-	assert_eq!(
-		skipped_for_hash(&skipped.unsyncable),
-		["bad.txt"],
-		"{skipped:?}"
-	);
-
-	fx.client.set_versioning_enabled(true).await.unwrap();
+		let quarantined = engine
+			.resolve_conflict(pair, "bad.txt", ConflictResolution::KeepRemote)
+			.await
+			.unwrap()
+			.quarantined
+			.expect("the edit goes to the bin");
+		assert_eq!(
+			std::fs::read(quarantined).unwrap(),
+			EDIT_OVER_A_DAMAGED_VERSION
+		);
+		let pulled = engine.sync_once(pair).await.unwrap();
+		assert_eq!((pulled.uploaded, pulled.downloaded), (0, 0), "{pulled:?}");
+		assert!(!local_exists(&fx.local, "bad.txt"));
+		let skipped = engine.sync_once(pair).await.unwrap();
+		assert_eq!(
+			(skipped.uploaded, skipped.downloaded),
+			(0, 0),
+			"{skipped:?}"
+		);
+		assert_eq!(
+			skipped_for_hash(&skipped.unsyncable),
+			["bad.txt"],
+			"{skipped:?}"
+		);
+	})
+	.await;
 	fx.cleanup();
 }
 
@@ -1665,34 +1648,30 @@ async fn keeping_remote_right_after_the_conflict_over_a_damaged_version_marks_th
 #[shared_test_runtime]
 async fn keeping_both_right_after_the_conflict_over_a_damaged_version_uploads_the_aside_copy() {
 	let fx = Fixture::new().await;
-	let _versioning_lock = fx
-		.client
-		.acquire_lock_with_default(test_utils::locks::USER_VERSIONING)
-		.await
-		.unwrap();
-	let (engine, pair) = local_edit_held_over_a_damaged_version(&fx).await;
+	with_versioning(&fx.client, false, async {
+		let (engine, pair) = local_edit_held_over_a_damaged_version(&fx).await;
 
-	engine
-		.resolve_conflict(pair, "bad.txt", ConflictResolution::KeepBoth)
-		.await
-		.unwrap();
-	let pulled = engine.sync_once(pair).await.unwrap();
-	assert_eq!((pulled.uploaded, pulled.downloaded), (1, 0), "{pulled:?}");
-	assert!(!local_exists(&fx.local, "bad.txt"));
-	let (_dirs, files) = fx.list_remote_root().await;
-	let aside = find_file(&files, "bad.old.txt").expect("the copy renamed aside goes up");
-	assert_eq!(
-		aside.hash(),
-		Some(blake3::hash(EDIT_OVER_A_DAMAGED_VERSION).into())
-	);
-	let skipped = engine.sync_once(pair).await.unwrap();
-	assert_eq!(
-		skipped_for_hash(&skipped.unsyncable),
-		["bad.txt"],
-		"{skipped:?}"
-	);
-
-	fx.client.set_versioning_enabled(true).await.unwrap();
+		engine
+			.resolve_conflict(pair, "bad.txt", ConflictResolution::KeepBoth)
+			.await
+			.unwrap();
+		let pulled = engine.sync_once(pair).await.unwrap();
+		assert_eq!((pulled.uploaded, pulled.downloaded), (1, 0), "{pulled:?}");
+		assert!(!local_exists(&fx.local, "bad.txt"));
+		let (_dirs, files) = fx.list_remote_root().await;
+		let aside = find_file(&files, "bad.old.txt").expect("the copy renamed aside goes up");
+		assert_eq!(
+			aside.hash(),
+			Some(blake3::hash(EDIT_OVER_A_DAMAGED_VERSION).into())
+		);
+		let skipped = engine.sync_once(pair).await.unwrap();
+		assert_eq!(
+			skipped_for_hash(&skipped.unsyncable),
+			["bad.txt"],
+			"{skipped:?}"
+		);
+	})
+	.await;
 	fx.cleanup();
 }
 
@@ -1924,61 +1903,58 @@ async fn a_watched_pairs_marked_file_deleted_on_the_remote_ends_the_skip() {
 async fn a_watched_pairs_local_edit_uploads_over_a_marked_version() {
 	let fx = Fixture::new().await;
 	fx.wait_initial_converged().await;
-	let _versioning_lock = fx
-		.client
-		.acquire_lock_with_default(test_utils::locks::USER_VERSIONING)
-		.await
-		.unwrap();
-	fx.client.set_versioning_enabled(true).await.unwrap();
-	let engine = Arc::new(fx.open_engine().await);
-	let pair = engine
-		.add_pair(fx.local.clone(), fx.remote_uuid, SyncMode::TwoWay)
-		.await
-		.unwrap();
-	upload_remote(&fx, "bad.txt", b"the synced content").await;
-	let (handle, reports) = watch_reporting(&engine, pair).await;
-	assert!(
-		poll_until(CACHE_CONVERGE_TIMEOUT, || {
-			std::fs::read(fx.local.join("bad.txt"))
-				.is_ok_and(|bytes| bytes == b"the synced content")
-		})
-		.await,
-		"the first version never came down"
-	);
-	let bad = damaged_upload_is_skipped(&fx, "bad.txt", &reports).await;
-	let bad_uuid: Uuid = bad.uuid();
-	pass_woken_by_a_remote_file(&fx, "wake.txt", &reports).await;
+	with_versions_and_versioning(&fx.client, true, async {
+		let engine = Arc::new(fx.open_engine().await);
+		let pair = engine
+			.add_pair(fx.local.clone(), fx.remote_uuid, SyncMode::TwoWay)
+			.await
+			.unwrap();
+		upload_remote(&fx, "bad.txt", b"the synced content").await;
+		let (handle, reports) = watch_reporting(&engine, pair).await;
+		assert!(
+			poll_until(CACHE_CONVERGE_TIMEOUT, || {
+				std::fs::read(fx.local.join("bad.txt"))
+					.is_ok_and(|bytes| bytes == b"the synced content")
+			})
+			.await,
+			"the first version never came down"
+		);
+		let bad = damaged_upload_is_skipped(&fx, "bad.txt", &reports).await;
+		let bad_uuid: Uuid = bad.uuid();
+		pass_woken_by_a_remote_file(&fx, "wake.txt", &reports).await;
 
-	let edit = b"the edit made since the last sync";
-	let edit_hash: filen_types::crypto::Blake3Hash = blake3::hash(edit).into();
-	write_local(&fx.local, "bad.txt", edit);
-	let mut head = None;
-	let deadline = std::time::Instant::now() + CACHE_CONVERGE_TIMEOUT;
-	while head.is_none() && std::time::Instant::now() < deadline {
-		let (_dirs, files) = fx.list_remote_root().await;
-		head = find_file(&files, "bad.txt")
-			.filter(|file| file.hash() == Some(edit_hash))
-			.cloned();
-		tokio::time::sleep(Duration::from_millis(300)).await;
-	}
-	let head =
-		head.unwrap_or_else(|| panic!("the edit never went up: {:?}", reports.lock().unwrap()));
-	let versions = fx.client.list_file_versions(&head).await.unwrap();
-	assert!(
-		versions.iter().any(|version| version.uuid() == bad_uuid),
-		"the damaged version stays in the file's history"
-	);
-	assert!(
-		reports
-			.lock()
-			.unwrap()
-			.iter()
-			.all(|report| report.conflicts.is_empty()),
-		"{:?}",
-		reports.lock().unwrap()
-	);
+		let edit = b"the edit made since the last sync";
+		let edit_hash: filen_types::crypto::Blake3Hash = blake3::hash(edit).into();
+		write_local(&fx.local, "bad.txt", edit);
+		let mut head = None;
+		let deadline = std::time::Instant::now() + CACHE_CONVERGE_TIMEOUT;
+		while head.is_none() && std::time::Instant::now() < deadline {
+			let (_dirs, files) = fx.list_remote_root().await;
+			head = find_file(&files, "bad.txt")
+				.filter(|file| file.hash() == Some(edit_hash))
+				.cloned();
+			tokio::time::sleep(Duration::from_millis(300)).await;
+		}
+		let head =
+			head.unwrap_or_else(|| panic!("the edit never went up: {:?}", reports.lock().unwrap()));
+		let versions = fx.client.list_file_versions(&head).await.unwrap();
+		assert!(
+			versions.iter().any(|version| version.uuid() == bad_uuid),
+			"the damaged version stays in the file's history"
+		);
+		assert!(
+			reports
+				.lock()
+				.unwrap()
+				.iter()
+				.all(|report| report.conflicts.is_empty()),
+			"{:?}",
+			reports.lock().unwrap()
+		);
 
-	drop(handle);
+		drop(handle);
+	})
+	.await;
 	fx.cleanup();
 }
 

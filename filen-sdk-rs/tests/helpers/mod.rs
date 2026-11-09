@@ -4,6 +4,7 @@
 
 use std::{
 	borrow::Cow,
+	panic::{AssertUnwindSafe, resume_unwind},
 	path::{Path, PathBuf},
 	sync::{Arc, Mutex},
 	time::Duration,
@@ -31,6 +32,7 @@ use filen_types::{
 	fs::{ParentUuid, StableUuid},
 	traits::CowHelpersExt,
 };
+use futures::FutureExt;
 use rusqlite::{Connection, OpenFlags, params};
 use uuid::Uuid;
 
@@ -129,6 +131,41 @@ pub async fn poll_until(timeout: Duration, mut predicate: impl FnMut() -> bool) 
 		}
 		tokio::time::sleep(Duration::from_millis(200)).await;
 	}
+}
+
+/// Run `body` with the account's file-versioning setting at `enabled`, holding
+/// [`test_utils::locks::USER_VERSIONING`], and put the setting back to what it was afterwards, also
+/// when `body` panics: a setting left changed would change what every later test on the shared
+/// account sees. For a test that lists file versions, [`with_versions_and_versioning`].
+pub async fn with_versioning<T>(
+	client: &Client,
+	enabled: bool,
+	body: impl Future<Output = T>,
+) -> T {
+	let _versioning_lock = client
+		.acquire_lock_with_default(test_utils::locks::USER_VERSIONING)
+		.await
+		.unwrap();
+	let original = client.get_user_info().await.unwrap().versioning_enabled;
+	client.set_versioning_enabled(enabled).await.unwrap();
+	// Nothing that can fail may sit between the call above and this guard.
+	let outcome = AssertUnwindSafe(body).catch_unwind().await;
+	client.set_versioning_enabled(original).await.unwrap();
+	outcome.unwrap_or_else(|panic| resume_unwind(panic))
+}
+
+/// [`with_versioning`], also holding [`test_utils::locks::VERSIONS`] (taken first, the order every
+/// test holding both uses) for a test that reads a file's version history.
+pub async fn with_versions_and_versioning<T>(
+	client: &Client,
+	enabled: bool,
+	body: impl Future<Output = T>,
+) -> T {
+	let _versions_lock = client
+		.acquire_lock_with_default(test_utils::locks::VERSIONS)
+		.await
+		.unwrap();
+	with_versioning(client, enabled, body).await
 }
 
 /// Poll until the given UUID appears in the items table, or timeout.

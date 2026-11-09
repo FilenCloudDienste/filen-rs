@@ -3,7 +3,6 @@ use std::{borrow::Cow, collections::BTreeSet, sync::Arc, time::Duration};
 
 use filen_macros::shared_test_runtime;
 use filen_types::fs::StableUuid;
-use futures::FutureExt;
 
 use filen_sdk_rs::fs::HasName;
 use filen_sdk_rs::fs::HasUUID;
@@ -1775,49 +1774,8 @@ fn cached_stable_uuid(db_path: &std::path::Path, uuid: Uuid) -> Option<StableUui
 #[shared_test_runtime]
 async fn converge_a8_versioning_disabled_edit_keeps_one_lineage() {
 	let sc = single_client(SyncMode::TwoWay).await;
-	// The same lock order the socket / user / cache tests use for this flag on the shared account:
-	// the version-chain lock first, then the account-wide versioning flag.
-	let _version_lock = sc
-		.resources
-		.client
-		.acquire_lock_with_default("test:versions")
-		.await
-		.unwrap();
-	let _versioning_lock = sc
-		.resources
-		.client
-		.acquire_lock_with_default("test:user-versioning")
-		.await
-		.unwrap();
-	let original = sc
-		.resources
-		.client
-		.get_user_info()
-		.await
-		.unwrap()
-		.versioning_enabled;
-	sc.resources
-		.client
-		.set_versioning_enabled(false)
-		.await
-		.unwrap();
-
-	// Put the account-wide flag back whatever the body does, and back to what it WAS: a panic that
-	// left it changed would change what every later test on this shared account sees. NOTHING that
-	// can fail may sit between the call above and this guard — the read-back that checks the flag
-	// took is the body's first act for exactly that reason.
-	let outcome = std::panic::AssertUnwindSafe(versioning_disabled_body(&sc))
-		.catch_unwind()
-		.await;
-	sc.resources
-		.client
-		.set_versioning_enabled(original)
-		.await
-		.unwrap();
+	with_versions_and_versioning(&sc.resources.client, false, versioning_disabled_body(&sc)).await;
 	sc.cleanup();
-	if let Err(panic) = outcome {
-		std::panic::resume_unwind(panic);
-	}
 }
 
 async fn versioning_disabled_body(sc: &SingleClient) {
