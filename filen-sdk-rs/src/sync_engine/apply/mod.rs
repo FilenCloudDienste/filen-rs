@@ -3783,6 +3783,8 @@ fn progress_callback<'a>(
 	})
 }
 
+/// Carry out one serial action: a create, move, deletion, conflict or adoption. Transfers run only
+/// through the concurrent path in [`apply_plan`], so one that reaches here is an internal error.
 async fn apply_one(
 	ctx: &ApplyContext<'_>,
 	planned: &PlannedEntry,
@@ -3798,27 +3800,6 @@ async fn apply_one(
 			let remote_uuid = remote.as_deref().map(|n| n.remote_uuid);
 			upsert_dir_baseline(ctx, rel_path, remote_uuid, local_mtime_of(&path)).await?;
 			report.local_dirs_created += 1;
-		}
-		// Transfers normally run via the concurrent path in `apply`; these arms keep `apply_one`
-		// total and correct if a transfer is ever applied serially.
-		(SyncAction::DownloadFile { .. }, _) => {
-			// Nothing drains the progress channel on this fallback, so its `Progress` events go
-			// nowhere; what it moved aside still reaches the observer below.
-			let mut quarantined = None;
-			let outcome = apply_transfer(
-				ctx,
-				planned,
-				plan.transfer_target(planned)?,
-				&tokio::sync::mpsc::unbounded_channel().0,
-				&mut quarantined,
-			)
-			.await;
-			// Before the `?`: a landed download whose baseline row would not persist still moved a
-			// local copy into the bin, and that is the pass's last word on those bytes.
-			note_quarantined(report, observer, quarantined);
-			if matches!(outcome?, Transfer::Done) {
-				report.downloaded += 1;
-			}
 		}
 		(SyncAction::DeleteLocal { rel_path, .. }, _) => {
 			if plan.pager.shields_local(rel_path) {
@@ -3846,28 +3827,6 @@ async fn apply_one(
 				}
 			}
 			report.locally_deleted += 1;
-		}
-		(SyncAction::UploadFile { .. }, _) => {
-			let mut quarantined = None;
-			let outcome = apply_transfer(
-				ctx,
-				planned,
-				plan.transfer_target(planned)?,
-				&tokio::sync::mpsc::unbounded_channel().0,
-				&mut quarantined,
-			)
-			.await;
-			note_quarantined(report, observer, quarantined);
-			match outcome? {
-				Transfer::Done => {
-					report.uploaded += 1;
-				}
-				Transfer::Overwrote {
-					conflict,
-					unrecorded,
-				} => note_overwrote(report, action.rel_path(), *conflict, unrecorded),
-				Transfer::Interrupted => {}
-			}
 		}
 		(
 			SyncAction::MoveRemote {
@@ -4135,6 +4094,11 @@ async fn apply_one(
 			| SyncAction::AdoptBaseline { .. },
 			_,
 		) => return Err(unpaired()),
+		(SyncAction::DownloadFile { .. } | SyncAction::UploadFile { .. }, _) => {
+			return Err(internal(
+				"a transfer reached the serial apply (should be impossible)",
+			));
+		}
 	}
 	Ok(())
 }
