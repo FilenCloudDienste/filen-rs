@@ -7800,12 +7800,21 @@ impl SyncEngine {
 		// blocking threshold is filtered out of the pass, and filtering it out of the carry-over too
 		// would mean no later pass ever looks at it again and its retry never comes. A success ends
 		// such a streak as well, so the apply below reads the same set.
+		// An unreadable streak set is unknown, not empty: the pass carries no retries over and ends
+		// none, as before, but says why.
+		let unknown = |e: &dyn std::fmt::Display| {
+			tracing::warn!(
+				"sync_once[pair {pair}]: reading the failure streaks failed, carrying no retries over this pass: {e}"
+			);
+			None
+		};
 		let streaks = match self.pair_store(pair).await {
-			Ok(store) => off_store(&store, move |store| store.failures(pair))
-				.await
-				.ok()
-				.and_then(Result::ok),
-			Err(_) => None,
+			Ok(store) => match off_store(&store, move |store| store.failures(pair)).await {
+				Ok(Ok(streaks)) => Some(streaks),
+				Ok(Err(e)) => unknown(&e),
+				Err(e) => unknown(&e),
+			},
+			Err(e) => unknown(&e),
 		};
 		// Before the early return below: a pass with nothing to apply still made a plan, and still
 		// owes the next one everything that plan named. A plan that cannot be read back is the pass's
