@@ -30,7 +30,10 @@
 use crate::{
 	CommandResult,
 	auth::LazyClient,
-	commands::{CommandContext, fs_cmds::full_path},
+	commands::{
+		CommandContext,
+		fs_cmds::{find_existing_item, full_path},
+	},
 	completion::{FilenCompleter, quote_for_command_line},
 	docs::DocElement,
 	ui::{UI, format_date},
@@ -472,22 +475,15 @@ async fn public_link(
 	file_or_directory_str: &str,
 	action: PublicLinkAction,
 ) -> Result<()> {
-	let path = working_path.navigate(file_or_directory_str).0;
+	let path = working_path.navigate(file_or_directory_str);
 	if action == PublicLinkAction::Delete {
 		// before logging in, so that a script learns it needs --yes before anything is looked up
-		ui.ensure_can_confirm(&delete_confirmation(&path))?;
+		ui.ensure_can_confirm(&delete_confirmation(&path.0))?;
 	}
 	let client = client.get(ui).await?;
-	let Some(file_or_directory) = client
-		.find_item_at_path(&path)
-		.await
-		.context("Failed to find file or directory")?
-	else {
-		return Err(UI::failure(&format!("No such file or directory: {}", path)));
-	};
-	match file_or_directory {
-		NonRootFileType::File(file) => run_link_action(ui, client, &*file, &path, action).await,
-		NonRootFileType::Dir(dir) => run_link_action(ui, client, &*dir, &path, action).await,
+	match find_existing_item(client, &path).await? {
+		NonRootFileType::File(file) => run_link_action(ui, client, &*file, &path.0, action).await,
+		NonRootFileType::Dir(dir) => run_link_action(ui, client, &*dir, &path.0, action).await,
 		NonRootFileType::Root(_) => Err(UI::failure("Cannot public link the root")),
 	}
 }

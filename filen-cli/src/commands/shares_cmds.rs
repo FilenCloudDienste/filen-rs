@@ -35,7 +35,7 @@ use filen_sdk_rs::{
 	connect::fs::{SharedDirectory, SharedRootFile, SharingRole},
 	fs::{
 		HasName as _, HasUUID as _,
-		categories::{DirType, NonRootFileType, NonRootItemType, Normal, RootItemType, Shared},
+		categories::{DirType, NonRootFileType, NonRootItemType, RootItemType, Shared},
 		file::traits::File,
 	},
 	io::{AnonymousRemoteFile, DirDownloadOptions, HasFileInfo as _},
@@ -50,7 +50,7 @@ use crate::{
 	commands::{
 		CommandContext,
 		contacts_cmds::find_entry,
-		fs_cmds::resolve_item_path,
+		fs_cmds::{find_existing_item, resolve_item_path},
 		transfer_cmds::{
 			DownloadPath, TransferKind, TransferProgress, download_directory, download_file,
 			finish, run_cancellable,
@@ -186,7 +186,7 @@ async fn share(ui: &mut UI, client: &mut LazyClient, path: &RemotePath, email: &
 			email.trim()
 		))
 	})?;
-	let item = find_item(client, path).await?;
+	let item = find_existing_item(client, path).await?;
 	match item {
 		NonRootFileType::Dir(dir) => client
 			.share_dir(&dir, contact, no_progress())
@@ -200,17 +200,6 @@ async fn share(ui: &mut UI, client: &mut LazyClient, path: &RemotePath, email: &
 	}
 	ui.print_success(&format!("Shared {path} with {}", contact.email));
 	Ok(())
-}
-
-async fn find_item<'a>(
-	client: &'a Client,
-	path: &RemotePath,
-) -> Result<NonRootFileType<'a, Normal>> {
-	client
-		.find_item_at_path(&path.0)
-		.await
-		.context("Failed to find file or directory")?
-		.ok_or_else(|| UI::failure(&format!("No such file or directory: {path}")))
 }
 
 /// What this account shared: each item, with whom.
@@ -390,7 +379,7 @@ async fn unshare(
 ) -> Result<()> {
 	check_unshare(ui, path, email)?;
 	let client = client.get(ui).await?;
-	let uuid = match find_item(client, path).await? {
+	let uuid = match find_existing_item(client, path).await? {
 		NonRootFileType::Dir(dir) => dir.uuid(),
 		NonRootFileType::File(file) => file.uuid(),
 		NonRootFileType::Root(_) => return Err(UI::failure("The root is never shared")),

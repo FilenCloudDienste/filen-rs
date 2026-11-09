@@ -26,6 +26,7 @@ use crate::{
 use anyhow::{Context, Result, anyhow};
 use clap::{Subcommand, ValueEnum};
 use filen_sdk_rs::{
+	auth::Client,
 	cache::{
 		CacheMessage, ResyncProgress, SearchConfig, SearchHit, SearchItemType, SearchResult,
 		SearchSnapshot,
@@ -92,6 +93,16 @@ impl SearchCommands {
 	}
 }
 
+/// The UUID of the directory at `working_path`, which the search looks under.
+async fn find_working_dir_uuid(client: &Client, working_path: &RemotePath) -> Result<Uuid> {
+	Ok(client
+		.find_item_at_path(&working_path.0)
+		.await
+		.context("Failed to find working directory")?
+		.ok_or(anyhow::anyhow!("Working directory not found"))?
+		.uuid())
+}
+
 pub(crate) async fn search_cmd(
 	ui: &mut UI,
 	client: &mut LazyClient,
@@ -99,12 +110,7 @@ pub(crate) async fn search_cmd(
 	item_type: SearchItemType,
 ) -> Result<Option<CommandResult>> {
 	let client = client.get(ui).await?;
-	let working_dir_uuid = client
-		.find_item_at_path(&working_path.0)
-		.await
-		.context("Failed to find working directory")?
-		.ok_or(anyhow::anyhow!("Working directory not found"))?
-		.uuid();
+	let working_dir_uuid = find_working_dir_uuid(client, working_path).await?;
 
 	let (results_tx, mut results_rx) = tokio::sync::mpsc::unbounded_channel();
 	let (set_search_query_tx, mut set_search_query_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -279,12 +285,7 @@ pub(crate) async fn search_cmd_non_interactive(
 	// What an earlier command left in the channel is about other resyncs.
 	while cache_status.try_recv().is_ok() {}
 
-	let working_dir_uuid = client
-		.find_item_at_path(&working_path.0)
-		.await
-		.context("Failed to find working directory")?
-		.ok_or(anyhow::anyhow!("Working directory not found"))?
-		.uuid();
+	let working_dir_uuid = find_working_dir_uuid(&client, working_path).await?;
 	let search = client
 		.create_search(working_dir_uuid, config)
 		.await

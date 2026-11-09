@@ -100,6 +100,18 @@ pub(crate) async fn resolve_item<'a>(
 		.ok_or_else(|| operand.not_found(what))
 }
 
+/// The item at `path`, or the failure of finding no file or directory there.
+pub(crate) async fn find_existing_item<'a>(
+	client: &'a Client,
+	path: &RemotePath,
+) -> Result<NonRootFileType<'a, Normal>> {
+	client
+		.find_item_at_path(&path.0)
+		.await
+		.context("Failed to find file or directory")?
+		.ok_or_else(|| UI::failure(&format!("No such file or directory: {path}")))
+}
+
 /// `found`, or `None` if the server found no such file or directory.
 pub(crate) fn optional<T>(
 	found: Result<T, filen_sdk_rs::Error>,

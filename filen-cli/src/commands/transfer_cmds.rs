@@ -155,7 +155,7 @@ pub(crate) use self::download_path::{DownloadPath, shown_local_path};
 use crate::{
 	CliConfig, CommandResult,
 	auth::LazyClient,
-	commands::CommandContext,
+	commands::{CommandContext, fs_cmds::find_existing_item},
 	completion::FilenCompleter,
 	docs::DocElement,
 	error::CliError,
@@ -736,21 +736,11 @@ async fn download_to_stdout(
 	}
 	let source_path = working_path.navigate(source_str);
 	let client = client.get(ui).await?.clone();
-	let file = match client
-		.find_item_at_path(&source_path.0)
-		.await
-		.context("Failed to find file or directory")?
-	{
-		Some(NonRootFileType::File(file)) => file,
-		Some(NonRootFileType::Dir(_) | NonRootFileType::Root(_)) => {
+	let file = match find_existing_item(&client, &source_path).await? {
+		NonRootFileType::File(file) => file,
+		NonRootFileType::Dir(_) | NonRootFileType::Root(_) => {
 			return Err(UI::failure(&format!(
 				"Cannot download the directory {} to stdout",
-				source_path
-			)));
-		}
-		None => {
-			return Err(UI::failure(&format!(
-				"No such file or directory: {}",
 				source_path
 			)));
 		}
@@ -1099,16 +1089,7 @@ async fn download_source(
 	destination: &DownloadDestination<'_>,
 	options: &DirDownloadOptions,
 ) -> Result<String> {
-	let Some(item) = client
-		.find_item_at_path(&source_path.0)
-		.await
-		.context("Failed to find file or directory")?
-	else {
-		return Err(UI::failure(&format!(
-			"No such file or directory: {}",
-			source_path
-		)));
-	};
+	let item = find_existing_item(client, source_path).await?;
 	let source = match &item {
 		NonRootFileType::File(file) => {
 			DownloadSource::File(file.name().context("Failed to decrypt file name")?)

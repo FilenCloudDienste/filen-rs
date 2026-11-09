@@ -120,6 +120,7 @@ mod operand;
 mod tree;
 mod versions;
 
+pub(crate) use operand::find_existing_item;
 use operand::{
 	Given, GivenItem, ItemOperand, directory_chain, expand_all, optional, parse_operands, path_of,
 	resolve_item, shown_as,
