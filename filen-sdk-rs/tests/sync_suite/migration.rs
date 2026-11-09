@@ -188,7 +188,7 @@ async fn migrate_01_reopened_baseline_first_pass_is_noop() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let remote: Uuid = resources.dir.uuid();
 	let cache = TestCache::new(&resources.client, remote).await;
-	wait_for_converged_resync(&cache.messages, remote, 0, CACHE_CONVERGE_TIMEOUT).await;
+	settle_cache(&cache, remote, CACHE_CONVERGE_TIMEOUT).await;
 	let local = fresh_local_dir("migrate01");
 	let db_path = temp_cache_path();
 
@@ -252,7 +252,7 @@ async fn migrate_02_move_and_rename_detected_after_reopen() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let remote: Uuid = resources.dir.uuid();
 	let cache = TestCache::new(&resources.client, remote).await;
-	wait_for_converged_resync(&cache.messages, remote, 0, CACHE_CONVERGE_TIMEOUT).await;
+	settle_cache(&cache, remote, CACHE_CONVERGE_TIMEOUT).await;
 	let local = fresh_local_dir("migrate02");
 	let db_path = temp_cache_path();
 
@@ -324,7 +324,7 @@ async fn migrate_03_present_baseline_is_incremental_not_first_sync() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let remote: Uuid = resources.dir.uuid();
 	let cache = TestCache::new(&resources.client, remote).await;
-	wait_for_converged_resync(&cache.messages, remote, 0, CACHE_CONVERGE_TIMEOUT).await;
+	settle_cache(&cache, remote, CACHE_CONVERGE_TIMEOUT).await;
 	let local = fresh_local_dir("migrate03");
 	let db_path = temp_cache_path();
 
@@ -408,7 +408,7 @@ async fn migrate_06_reopen_passes_are_idempotent() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let remote: Uuid = resources.dir.uuid();
 	let cache = TestCache::new(&resources.client, remote).await;
-	wait_for_converged_resync(&cache.messages, remote, 0, CACHE_CONVERGE_TIMEOUT).await;
+	settle_cache(&cache, remote, CACHE_CONVERGE_TIMEOUT).await;
 	let local = fresh_local_dir("migrate06");
 	let db_path = temp_cache_path();
 
@@ -447,7 +447,7 @@ async fn migrate_07_real_change_after_reopen_is_applied() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let remote: Uuid = resources.dir.uuid();
 	let cache = TestCache::new(&resources.client, remote).await;
-	wait_for_converged_resync(&cache.messages, remote, 0, CACHE_CONVERGE_TIMEOUT).await;
+	settle_cache(&cache, remote, CACHE_CONVERGE_TIMEOUT).await;
 	let local = fresh_local_dir("migrate07");
 	let db_path = temp_cache_path();
 
@@ -515,7 +515,7 @@ async fn migrate_10_baseline_durable_across_repeated_cold_starts() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let remote: Uuid = resources.dir.uuid();
 	let cache = TestCache::new(&resources.client, remote).await;
-	wait_for_converged_resync(&cache.messages, remote, 0, CACHE_CONVERGE_TIMEOUT).await;
+	settle_cache(&cache, remote, CACHE_CONVERGE_TIMEOUT).await;
 	let local = fresh_local_dir("migrate10");
 	let db_path = temp_cache_path();
 
@@ -565,7 +565,7 @@ async fn migrate_04_a_foreign_schema_version_fails_closed() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let remote: Uuid = resources.dir.uuid();
 	let cache = TestCache::new(&resources.client, remote).await;
-	wait_for_converged_resync(&cache.messages, remote, 0, CACHE_CONVERGE_TIMEOUT).await;
+	settle_cache(&cache, remote, CACHE_CONVERGE_TIMEOUT).await;
 	let local = fresh_local_dir("migrate04");
 	let db_path = temp_cache_path();
 

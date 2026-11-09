@@ -155,7 +155,7 @@ async fn sec01_baseline_has_no_credentials_or_key_material() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let remote: uuid::Uuid = resources.dir.uuid();
 	let cache = TestCache::new(&resources.client, remote).await;
-	wait_for_converged_resync(&cache.messages, remote, 0, CACHE_CONVERGE_TIMEOUT).await;
+	settle_cache(&cache, remote, CACHE_CONVERGE_TIMEOUT).await;
 	let local = fresh_local_dir("sec01");
 	let baseline_db = temp_cache_path();
 	let engine = SyncEngine::open(cache.client.clone(), baseline_db.clone())
@@ -531,7 +531,7 @@ async fn sec10_event_stream_and_report_omit_secrets() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let remote: uuid::Uuid = resources.dir.uuid();
 	let cache = TestCache::new(&resources.client, remote).await;
-	wait_for_converged_resync(&cache.messages, remote, 0, CACHE_CONVERGE_TIMEOUT).await;
+	settle_cache(&cache, remote, CACHE_CONVERGE_TIMEOUT).await;
 	let local = fresh_local_dir("sec10");
 	let baseline_db = temp_cache_path();
 	let engine = SyncEngine::open(cache.client.clone(), baseline_db.clone())

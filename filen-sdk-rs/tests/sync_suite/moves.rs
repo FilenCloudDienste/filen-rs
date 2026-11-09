@@ -1128,7 +1128,7 @@ async fn move24_cross_pair_move() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let root: Uuid = resources.dir.uuid();
 	let cache = TestCache::new(&resources.client, root).await;
-	wait_for_converged_resync(&cache.messages, root, 0, CACHE_CONVERGE_TIMEOUT).await;
+	settle_cache(&cache, root, CACHE_CONVERGE_TIMEOUT).await;
 
 	let root_dt = DirType::<Normal>::Dir(Cow::Borrowed(&resources.dir));
 	let r1_dir = resources.client.create_dir(&root_dt, "R1").await.unwrap();

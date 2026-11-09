@@ -487,7 +487,7 @@ async fn basic_10_assorted_sizes_roundtrip() {
 	// From 0, not the log's length now: `cache_b` is new, so everything in its log is its own, and
 	// the populate resync `TestCache::new` started may already have finished — a `since` read
 	// here would skip it and wait out the whole timeout.
-	wait_for_converged_resync(&cache_b.messages, remote, 0, CACHE_CONVERGE_TIMEOUT).await;
+	settle_cache(&cache_b, remote, CACHE_CONVERGE_TIMEOUT).await;
 	poll_until(CACHE_CONVERGE_TIMEOUT, || {
 		count_items(cache_b.db_path()) >= expected_items
 	})
@@ -563,7 +563,7 @@ async fn basic_11_ordinary_names_roundtrip() {
 	// From 0, not the log's length now: `cache_b` is new, so everything in its log is its own, and
 	// the populate resync `TestCache::new` started may already have finished — a `since` read
 	// here would skip it and wait out the whole timeout.
-	wait_for_converged_resync(&cache_b.messages, remote, 0, CACHE_CONVERGE_TIMEOUT).await;
+	settle_cache(&cache_b, remote, CACHE_CONVERGE_TIMEOUT).await;
 	poll_until(CACHE_CONVERGE_TIMEOUT, || {
 		count_items(cache_b.db_path()) >= expected_items
 	})
@@ -691,7 +691,7 @@ async fn basic_15_baseline_persists_across_restart() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let remote: Uuid = resources.dir.uuid();
 	let cache = TestCache::new(&resources.client, remote).await;
-	wait_for_converged_resync(&cache.messages, remote, 0, CACHE_CONVERGE_TIMEOUT).await;
+	settle_cache(&cache, remote, CACHE_CONVERGE_TIMEOUT).await;
 
 	let local = fresh_local_dir("restart");
 	write_file(&local, "x.txt", b"x");
@@ -756,7 +756,7 @@ async fn basic_15b_restart_before_the_cache_catches_up_does_not_redo_writes() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let remote: Uuid = resources.dir.uuid();
 	let cache = TestCache::new(&resources.client, remote).await;
-	wait_for_converged_resync(&cache.messages, remote, 0, CACHE_CONVERGE_TIMEOUT).await;
+	settle_cache(&cache, remote, CACHE_CONVERGE_TIMEOUT).await;
 
 	let local = fresh_local_dir("restart-lag");
 	write_file(&local, "sub/inner.txt", b"inner payload");
@@ -1015,7 +1015,7 @@ async fn basic_21_binary_nulls_high_bytes_roundtrip() {
 	// From 0, not the log's length now: `cache_b` is new, so everything in its log is its own, and
 	// the populate resync `TestCache::new` started may already have finished — a `since` read
 	// here would skip it and wait out the whole timeout.
-	wait_for_converged_resync(&cache_b.messages, remote, 0, CACHE_CONVERGE_TIMEOUT).await;
+	settle_cache(&cache_b, remote, CACHE_CONVERGE_TIMEOUT).await;
 	poll_until(CACHE_CONVERGE_TIMEOUT, || {
 		count_items(cache_b.db_path()) >= 2
 	})
@@ -1195,7 +1195,7 @@ async fn basic_25_watch_no_self_resync_loop() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let remote: Uuid = resources.dir.uuid();
 	let cache = TestCache::new(&resources.client, remote).await;
-	wait_for_converged_resync(&cache.messages, remote, 0, CACHE_CONVERGE_TIMEOUT).await;
+	settle_cache(&cache, remote, CACHE_CONVERGE_TIMEOUT).await;
 
 	let local = fresh_local_dir("watchloop");
 	let engine = Arc::new(
@@ -1386,7 +1386,7 @@ async fn basic_add_full_roundtrip_integrity() {
 	// From 0, not the log's length now: `cache_b` is new, so everything in its log is its own, and
 	// the populate resync `TestCache::new` started may already have finished — a `since` read
 	// here would skip it and wait out the whole timeout.
-	wait_for_converged_resync(&cache_b.messages, remote, 0, CACHE_CONVERGE_TIMEOUT).await;
+	settle_cache(&cache_b, remote, CACHE_CONVERGE_TIMEOUT).await;
 	poll_until(CACHE_CONVERGE_TIMEOUT, || {
 		count_items(cache_b.db_path()) >= 1 + 2 + 3
 	})

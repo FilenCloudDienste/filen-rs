@@ -458,7 +458,7 @@ async fn restart_fixture(
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let remote: Uuid = resources.dir.uuid();
 	let cache = TestCache::new(&resources.client, remote).await;
-	wait_for_converged_resync(&cache.messages, remote, 0, CACHE_CONVERGE_TIMEOUT).await;
+	settle_cache(&cache, remote, CACHE_CONVERGE_TIMEOUT).await;
 	let local = fresh_local_dir(tag);
 	let db_path = temp_cache_path();
 	(resources, cache, local, remote, db_path)

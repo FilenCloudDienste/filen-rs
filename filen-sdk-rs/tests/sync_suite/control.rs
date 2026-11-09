@@ -71,7 +71,7 @@ async fn raw_setup_on(
 ) {
 	let remote: Uuid = resources.dir.uuid();
 	let cache = TestCache::new(base, remote).await;
-	wait_for_converged_resync(&cache.messages, remote, 0, CACHE_CONVERGE_TIMEOUT).await;
+	settle_cache(&cache, remote, CACHE_CONVERGE_TIMEOUT).await;
 	let local = fresh_local_dir(tag);
 	(resources, cache, remote, local)
 }
@@ -203,7 +203,7 @@ async fn control_04_add_second_pair_disjoint_both_converge() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let root: Uuid = resources.dir.uuid();
 	let cache = TestCache::new(&resources.client, root).await;
-	wait_for_converged_resync(&cache.messages, root, 0, CACHE_CONVERGE_TIMEOUT).await;
+	settle_cache(&cache, root, CACHE_CONVERGE_TIMEOUT).await;
 
 	// A subfolder per pair, inside the same converged cache subtree. They must be SIBLINGS: a pair
 	// rooted at the shared root would contain the other's folder, which `add_pair` refuses (and
@@ -354,7 +354,7 @@ async fn control_07_three_disjoint_pairs_no_cross_contamination() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let root: Uuid = resources.dir.uuid();
 	let cache = TestCache::new(&resources.client, root).await;
-	wait_for_converged_resync(&cache.messages, root, 0, CACHE_CONVERGE_TIMEOUT).await;
+	settle_cache(&cache, root, CACHE_CONVERGE_TIMEOUT).await;
 
 	let root_dt = DirType::<Normal>::Dir(std::borrow::Cow::Borrowed(&resources.dir));
 	let r1 = cache.client.create_dir(&root_dt, "p1").await.unwrap();
@@ -708,7 +708,7 @@ async fn control_22_bad_root_isolated_from_healthy_pair() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let remote_p1: Uuid = resources.dir.uuid();
 	let cache = TestCache::new(&resources.client, remote_p1).await;
-	wait_for_converged_resync(&cache.messages, remote_p1, 0, CACHE_CONVERGE_TIMEOUT).await;
+	settle_cache(&cache, remote_p1, CACHE_CONVERGE_TIMEOUT).await;
 
 	// Healthy P1.
 	let local_p1 = fresh_local_dir("c22ok");
@@ -773,7 +773,7 @@ async fn control_add_during_watch_live_pickup() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let root: Uuid = resources.dir.uuid();
 	let cache = TestCache::new(&resources.client, root).await;
-	wait_for_converged_resync(&cache.messages, root, 0, CACHE_CONVERGE_TIMEOUT).await;
+	settle_cache(&cache, root, CACHE_CONVERGE_TIMEOUT).await;
 
 	let root_dt = DirType::<Normal>::Dir(std::borrow::Cow::Borrowed(&resources.dir));
 	let r1 = cache.client.create_dir(&root_dt, "watch_p1").await.unwrap();

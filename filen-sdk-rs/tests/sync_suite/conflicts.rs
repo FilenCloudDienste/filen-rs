@@ -2387,7 +2387,7 @@ async fn conflict_18_conflict_persists_across_restart() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let remote: Uuid = resources.dir.uuid();
 	let cache = TestCache::new(&resources.client, remote).await;
-	wait_for_converged_resync(&cache.messages, remote, 0, CACHE_CONVERGE_TIMEOUT).await;
+	settle_cache(&cache, remote, CACHE_CONVERGE_TIMEOUT).await;
 	let local = fresh_local_dir("c18");
 	// A STABLE baseline path (unlike the harness's private random one) is what makes the restart
 	// real: the second engine must load exactly the store the first one wrote.

@@ -1161,10 +1161,13 @@ async fn remote_case_collision_held_back() {
 
 	// Wait (bounded) for the cache (the engine's remote view) to hold BOTH.
 	let db = fx.db_path().to_path_buf();
-	poll_until(Duration::from_secs(60), || {
-		poll_item_sync(&db, upper_uuid) && poll_item_sync(&db, lower_uuid)
-	})
-	.await;
+	assert!(
+		poll_until(Duration::from_secs(60), || {
+			poll_item_sync(&db, upper_uuid) && poll_item_sync(&db, lower_uuid)
+		})
+		.await,
+		"cache never held both case-colliding dirs"
+	);
 
 	// Ground-truth precondition: the remote actually holds BOTH case-colliding dirs. (If the server
 	// rejected the mismatched-hash bypass this would fail here, before the engine is exercised.)

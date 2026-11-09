@@ -124,7 +124,10 @@ async fn roundtrip_large_tree_local_to_remote_then_remote_to_local() {
 	// From 0, not the log's length now: `cache_b` is new, so everything in its log is its own, and
 	// the populate resync `TestCache::new` started may already have finished — a `since` read
 	// here would skip it and wait out the whole timeout.
-	wait_for_converged_resync(&cache_b.messages, remote, 0, converge_timeout).await;
+	assert!(
+		wait_for_converged_resync(&cache_b.messages, remote, 0, converge_timeout).await,
+		"initial resync of remote root never converged"
+	);
 	// Be robust: also explicitly poll the item count until the full tree is present.
 	let converged = poll_until(converge_timeout, || {
 		count_items(cache_b.db_path()) >= expected_items

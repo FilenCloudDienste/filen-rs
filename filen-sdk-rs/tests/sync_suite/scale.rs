@@ -429,7 +429,7 @@ async fn scale_05_deep_nesting_round_trips() {
 	// From 0, not the log's length now: `cache_b` is new, so everything in its log is its own, and
 	// the populate resync `TestCache::new` started may already have finished — a `since` read
 	// here would skip it and wait out the whole timeout.
-	wait_for_converged_resync(&cache_b.messages, remote, 0, CACHE_CONVERGE_TIMEOUT).await;
+	settle_cache(&cache_b, remote, CACHE_CONVERGE_TIMEOUT).await;
 	let converged = poll_until(CACHE_CONVERGE_TIMEOUT, || {
 		count_items(cache_b.db_path()) >= expected_items
 	})
@@ -506,7 +506,7 @@ async fn scale_26_first_sync_of_more_dirs_than_a_chunk() {
 	// A separate client pulls the remote into a fresh local root.
 	let remote = sc.remote;
 	let cache_b = TestCache::new(&sc.resources.client, remote).await;
-	wait_for_converged_resync(&cache_b.messages, remote, 0, CACHE_CONVERGE_TIMEOUT).await;
+	settle_cache(&cache_b, remote, CACHE_CONVERGE_TIMEOUT).await;
 	let converged = poll_until(CACHE_CONVERGE_TIMEOUT, || {
 		count_items(cache_b.db_path()) > dirs + files
 	})
@@ -1363,7 +1363,7 @@ async fn scale_21_baseline_persists_across_restart() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let remote: Uuid = resources.dir.uuid();
 	let cache = TestCache::new(&resources.client, remote).await;
-	wait_for_converged_resync(&cache.messages, remote, 0, CACHE_CONVERGE_TIMEOUT).await;
+	settle_cache(&cache, remote, CACHE_CONVERGE_TIMEOUT).await;
 	let local = fresh_local_dir("scale21");
 	let db_path = temp_cache_path();
 

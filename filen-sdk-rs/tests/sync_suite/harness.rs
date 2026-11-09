@@ -232,12 +232,22 @@ pub async fn plan_settled(engine: &SyncEngine, pair: PairId) -> PlanOutcome {
 	}
 }
 
+/// Waits until `cache` has a converged listing of `root`, and fails the test if it never does, so
+/// a setup timeout does not surface later as an unrelated failure. Uses `since = 0`: the initial
+/// resync `TestCache::new` started may already have finished.
+pub async fn settle_cache(cache: &TestCache, root: Uuid, timeout: Duration) {
+	assert!(
+		wait_for_converged_resync(&cache.messages, root, 0, timeout).await,
+		"initial resync of remote root never converged"
+	);
+}
+
 /// Build a single-client setup in `mode`, with the (empty) remote converged into the cache.
 pub async fn single_client(mode: SyncMode) -> SingleClient {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let remote: Uuid = resources.dir.uuid();
 	let cache = TestCache::new(&resources.client, remote).await;
-	wait_for_converged_resync(&cache.messages, remote, 0, CACHE_CONVERGE_TIMEOUT).await;
+	settle_cache(&cache, remote, CACHE_CONVERGE_TIMEOUT).await;
 	let local = fresh_local_dir("sc");
 	let engine = SyncEngine::open(cache.client.clone(), temp_cache_path())
 		.await

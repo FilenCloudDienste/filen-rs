@@ -852,7 +852,7 @@ async fn filter_user_level_all_pairs() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let root = resources.dir.uuid();
 	let cache = TestCache::new(&resources.client, root).await;
-	wait_for_converged_resync(&cache.messages, root, 0, CACHE_CONVERGE_TIMEOUT).await;
+	settle_cache(&cache, root, CACHE_CONVERGE_TIMEOUT).await;
 	let r1 = create_remote_dir(&cache, &resources.dir, "p1").await;
 	let r2 = create_remote_dir(&cache, &resources.dir, "p2").await;
 	let local1 = fresh_local_dir("filter_user1");

@@ -406,7 +406,7 @@ async fn resil_21_baseline_reused_on_reopen_no_churn() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let remote: Uuid = resources.dir.uuid();
 	let cache = TestCache::new(&resources.client, remote).await;
-	wait_for_converged_resync(&cache.messages, remote, 0, CACHE_CONVERGE_TIMEOUT).await;
+	settle_cache(&cache, remote, CACHE_CONVERGE_TIMEOUT).await;
 	let local = fresh_local_dir("resil21");
 
 	// Use a STABLE baseline DB path so a re-opened engine loads the same store.
