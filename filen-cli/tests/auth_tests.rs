@@ -125,42 +125,6 @@ fn exporting_an_auth_config_without_yes_fails_before_logging_in() {
 	assert!(!path.exists());
 }
 
-#[test]
-fn logout_with_yes_deletes_the_given_auth_config_and_the_cache() {
-	// logout also deletes ./filen-cli-auth-config.txt, so it must not run in the package directory
-	let working_dir = assert_fs::TempDir::new().unwrap();
-	let config_dir = assert_fs::TempDir::new().unwrap();
-	let elsewhere = assert_fs::TempDir::new().unwrap();
-	let auth_config = elsewhere.path().join("my-auth-config.txt");
-	std::fs::write(&auth_config, "filen_cli_auth_config_1:").unwrap();
-	let cache = config_dir.path().join("filen-sdk-rs-cache");
-	std::fs::write(&cache, "cache").unwrap();
-	cargo_bin_cmd!()
-		.current_dir(working_dir.path())
-		.env("FILEN_CLI_TESTING_DISABLE_KEYRING", "1")
-		.args([
-			"--skip-update",
-			"--config-dir",
-			config_dir.path().to_str().unwrap(),
-			"--auth-config-path",
-			auth_config.to_str().unwrap(),
-			"logout",
-			"--yes",
-		])
-		.assert()
-		.success()
-		.stdout(predicates::str::contains(format!(
-			"Deleted auth config file at {}",
-			auth_config.display()
-		)))
-		.stdout(predicates::str::contains(format!(
-			"Deleted the local cache at {}",
-			cache.display()
-		)));
-	assert!(!auth_config.exists());
-	assert!(!cache.exists());
-}
-
 #[shared_test_runtime]
 async fn whoami_prints_the_email_of_the_account() {
 	let (email, _) = get_testing_credentials();
@@ -694,46 +658,6 @@ async fn the_arguments_win_over_an_auth_config_in_the_config_dir() {
 			"Authenticated from CLI arguments",
 		))
 		.stderr(predicates::str::contains("Authenticated from auth config file").not());
-}
-
-/// An auth config file in `config_dir`, with contents that are never read.
-fn auth_config_in(config_dir: &std::path::Path) -> std::path::PathBuf {
-	let auth_config = config_dir.join("filen-cli-auth-config.txt");
-	std::fs::write(&auth_config, "filen_cli_auth_config_1:").unwrap();
-	auth_config
-}
-
-#[test]
-fn logout_without_a_terminal_fails_asking_for_yes() {
-	let working_dir = assert_fs::TempDir::new().unwrap();
-	let config_dir = assert_fs::TempDir::new().unwrap();
-	let auth_config = auth_config_in(config_dir.path());
-	cli_without_stored_credentials(working_dir.path(), config_dir.path())
-		.arg("logout")
-		.assert()
-		.code(2)
-		.stderr(predicates::str::contains(format!(
-			"Cannot ask \"Delete auth config file at {}?\": stdin is not a terminal. \
-			 Pass --yes to answer yes.",
-			auth_config.display()
-		)));
-	assert!(auth_config.exists());
-}
-
-#[test]
-fn logout_with_yes_deletes_the_auth_config_in_the_config_dir() {
-	let working_dir = assert_fs::TempDir::new().unwrap();
-	let config_dir = assert_fs::TempDir::new().unwrap();
-	let auth_config = auth_config_in(config_dir.path());
-	cli_without_stored_credentials(working_dir.path(), config_dir.path())
-		.args(["logout", "--yes"])
-		.assert()
-		.success()
-		.stdout(predicates::str::contains(format!(
-			"Deleted auth config file at {}",
-			auth_config.display()
-		)));
-	assert!(!auth_config.exists());
 }
 
 #[test]

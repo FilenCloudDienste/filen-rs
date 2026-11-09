@@ -5,6 +5,7 @@
 use std::{fs, os::unix::fs::PermissionsExt as _};
 use std::{
 	io::Write as _,
+	path::{Path, PathBuf},
 	process::{Command, Output, Stdio},
 };
 
@@ -141,47 +142,105 @@ fn help_after_a_command_prints_that_commands_help() {
 	}
 }
 
-/// Runs `logout` with `args` on a config directory holding an auth config, without a terminal
-/// on stdin and with the keyring left alone. Returns its output and whether the auth config is
-/// still there.
-fn logout(args: &[&str]) -> (Output, bool) {
-	let config_dir = TempDir::new().unwrap();
-	let working_dir = TempDir::new().unwrap();
-	let auth_config = config_dir.path().join("filen-cli-auth-config.txt");
-	std::fs::write(&auth_config, "filen_cli_auth_config_1:").unwrap();
-	let output = Command::new(assert_cmd::cargo::cargo_bin!())
-		.current_dir(working_dir.path())
-		.env("FILEN_CLI_TESTING_DISABLE_KEYRING", "1")
-		.arg("--config-dir")
-		.arg(config_dir.path())
-		.args(["--skip-update", "logout"])
+/// Runs the CLI with `args`, logged out, in an empty `working_dir` (logout also deletes
+/// ./filen-cli-auth-config.txt, so it must not run in the package directory) and without a
+/// terminal on stdin.
+fn run_in(working_dir: &Path, config_dir: &Path, args: &[&str]) -> Output {
+	logged_out_command(assert_cmd::cargo::cargo_bin!(), config_dir)
+		.current_dir(working_dir)
+		.arg("--skip-update")
 		.args(args)
 		.stdin(Stdio::null())
 		.output()
-		.unwrap();
-	(output, auth_config.exists())
+		.unwrap()
+}
+
+/// An auth config file in `config_dir`, with contents that are never read.
+fn auth_config_in(config_dir: &Path) -> PathBuf {
+	let auth_config = config_dir.join("filen-cli-auth-config.txt");
+	std::fs::write(&auth_config, "filen_cli_auth_config_1:").unwrap();
+	auth_config
 }
 
 #[test]
-fn logout_without_a_terminal_asks_for_yes_and_keeps_the_credentials() {
-	let (output, auth_config_exists) = logout(&[]);
+fn logout_without_a_terminal_fails_asking_for_yes() {
+	let working_dir = TempDir::new().unwrap();
+	let config_dir = TempDir::new().unwrap();
+	let auth_config = auth_config_in(config_dir.path());
+
+	let output = run_in(working_dir.path(), config_dir.path(), &["logout"]);
 
 	assert_eq!(output.status.code(), Some(2));
 	let stderr = String::from_utf8(output.stderr).unwrap();
-	assert!(stderr.contains("stdin is not a terminal"), "{stderr}");
-	assert!(stderr.contains("Pass --yes to answer yes."), "{stderr}");
-	assert!(auth_config_exists);
+	assert!(
+		stderr.contains(&format!(
+			"Cannot ask \"Delete auth config file at {}?\": stdin is not a terminal. \
+			 Pass --yes to answer yes.",
+			auth_config.display()
+		)),
+		"{stderr}"
+	);
+	assert!(auth_config.exists());
 }
 
 #[test]
-fn logout_with_yes_deletes_the_credentials_without_a_terminal() {
-	let (output, auth_config_exists) = logout(&["--yes"]);
+fn logout_with_yes_deletes_the_auth_config_in_the_config_dir() {
+	let working_dir = TempDir::new().unwrap();
+	let config_dir = TempDir::new().unwrap();
+	let auth_config = auth_config_in(config_dir.path());
+
+	let output = run_in(working_dir.path(), config_dir.path(), &["logout", "--yes"]);
 
 	let stderr = String::from_utf8(output.stderr).unwrap();
 	assert_eq!(output.status.code(), Some(0), "{stderr}");
 	let stdout = String::from_utf8(output.stdout).unwrap();
-	assert!(stdout.contains("Deleted auth config file at"), "{stdout}");
-	assert!(!auth_config_exists);
+	assert!(
+		stdout.contains(&format!(
+			"Deleted auth config file at {}",
+			auth_config.display()
+		)),
+		"{stdout}"
+	);
+	assert!(!auth_config.exists());
+}
+
+#[test]
+fn logout_with_yes_deletes_the_given_auth_config_and_the_cache() {
+	let working_dir = TempDir::new().unwrap();
+	let config_dir = TempDir::new().unwrap();
+	let elsewhere = TempDir::new().unwrap();
+	let auth_config = elsewhere.path().join("my-auth-config.txt");
+	std::fs::write(&auth_config, "filen_cli_auth_config_1:").unwrap();
+	let cache = config_dir.path().join("filen-sdk-rs-cache");
+	std::fs::write(&cache, "cache").unwrap();
+
+	let output = run_in(
+		working_dir.path(),
+		config_dir.path(),
+		&[
+			"--auth-config-path",
+			auth_config.to_str().unwrap(),
+			"logout",
+			"--yes",
+		],
+	);
+
+	let stderr = String::from_utf8(output.stderr).unwrap();
+	assert_eq!(output.status.code(), Some(0), "{stderr}");
+	let stdout = String::from_utf8(output.stdout).unwrap();
+	assert!(
+		stdout.contains(&format!(
+			"Deleted auth config file at {}",
+			auth_config.display()
+		)),
+		"{stdout}"
+	);
+	assert!(
+		stdout.contains(&format!("Deleted the local cache at {}", cache.display())),
+		"{stdout}"
+	);
+	assert!(!auth_config.exists());
+	assert!(!cache.exists());
 }
 
 #[test]
