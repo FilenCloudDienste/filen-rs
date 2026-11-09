@@ -7781,6 +7781,30 @@ async fn removing_a_paused_pair_never_lets_its_parked_action_start() {
 	std::fs::remove_file(&path).ok();
 }
 
+/// Removing a pair the engine does not know is a no-op: it succeeds, and leaves no control state
+/// behind that would make the id read as being removed. Removing a known pair twice succeeds both
+/// times.
+#[tokio::test]
+async fn remove_pair_of_an_unknown_pair_is_a_no_op() {
+	let (engine, pair, path) = engine_with_pair("remove_unknown").await;
+	let unknown = pair + 1000;
+	engine.remove_pair(unknown).await.unwrap();
+	assert!(!engine.is_paused(unknown).await);
+	// Unknown, not "being removed": the removal left no retired control channel behind.
+	let refused = engine.pause_pair(unknown).await.unwrap_err();
+	assert_eq!(refused.kind(), ErrorKind::InvalidState);
+	assert!(
+		refused.to_string().contains("unknown sync pair"),
+		"{refused}"
+	);
+
+	engine.remove_pair(pair).await.unwrap();
+	engine.remove_pair(pair).await.unwrap();
+	assert!(locked(&engine.control).pair(pair).unwrap().is_none());
+	drop(engine);
+	std::fs::remove_file(&path).ok();
+}
+
 /// The two things that cut a pass loose — a watch being stopped (whose engine-side half is
 /// [`SyncEngine::cut_loose_pass`], polled by the loop's unparking for as long as it
 /// lives) and the pair being removed — both wait for something, and neither may end up waiting

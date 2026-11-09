@@ -6097,36 +6097,72 @@ impl SyncEngine {
 	/// [`PairRemoved`](super::WatchState::PairRemoved) status; its
 	/// [`WatchHandle`](super::WatchHandle) stays valid, so a caller holding one can still drop or
 	/// stop it.
+	///
+	/// A removal that FAILS (the pair's rows could not be deleted) leaves the pair registered and
+	/// working: its control state is put back as it was, paused or not, and its watch keeps running.
+	/// The pass in flight is still cancelled; the next one re-plans what it did not do.
 	pub async fn remove_pair(&self, pair: PairId) -> Result<(), Error> {
-		// FIRST, before anything of the pair is retired: stop the pass in flight and wait for it to
-		// end. Until it does it may still write — its rows name a pair id that still exists — so a
-		// cancel after the delete would leave a completed action racing the cascade.
-		self.cancel_pass_in_flight(pair).await;
-		self.approvals.lock().await.remove(&pair);
-		// Its row goes with the pair's (`ON DELETE CASCADE`).
-		self.restoring.lock().await.remove(&pair);
-		// Dropping the handle unsubscribes the pair's cache notifications.
-		self.roots.lock().await.remove(&pair);
-		// The pair's journal rows go with it (`ON DELETE CASCADE`); drop the in-memory copies too,
-		// so nothing of the removed pair is left to be consulted or re-persisted.
-		self.pending.forget_pair(pair);
-		let pair_store = self.pair_store(pair).await?;
-		let _registry = self.registry.lock().await;
-		// Under the registry lock, which is also the lock a watch reads the pair and subscribes
-		// under (see `watchable_pair`): a watch setting up right now either registered before this
-		// and gets tripped here, or reads the deleted row afterwards and is refused. Before the
-		// delete, so a loop sitting between two passes learns about the removal at once rather than
-		// starting one more against the rows this is about to take away.
-		if let Some(signal) = self.removals.lock().await.remove(&pair) {
-			let _ = signal.send(true);
+		// An unknown pair is left alone entirely: retiring its control channel below would otherwise
+		// create one, and leave a `Retired` entry for an id nothing will ever remove.
+		{
+			let _registry = self.registry.lock().await;
+			if locked(&self.control)
+				.pair(pair)
+				.map_err(|e| db_error(e, "loading the sync pair"))?
+				.is_none()
+			{
+				return Ok(());
+			}
 		}
+		// Before anything is retired, so a connection that cannot be opened fails the removal with the
+		// pair still untouched.
+		let pair_store = self.pair_store(pair).await?;
+		// FIRST of the changes: stop the pass in flight and wait for it to end. Until it does it may
+		// still write — its rows name a pair id that still exists — so a cancel after the delete would
+		// leave a completed action racing the cascade. The `Retired` state it leaves on the channel is
+		// also what keeps a new pass, and a pause or resume, off the pair while the delete runs.
+		let before = self.cancel_pass_in_flight(pair).await;
+		let _registry = self.registry.lock().await;
 		// On the pair's OWN connection, and off the runtime thread: the registry row is one row,
 		// but the cascade under it takes every baseline, journal and failure row the pair ever had.
 		// On the control connection that cascade would be the one long hold on the lock every other
 		// pair's control verbs go through.
-		off_store(&pair_store, move |store| store.delete_pair(pair))
-			.await?
-			.map_err(|e| db_error(e, "removing a sync pair"))?;
+		let deleted = off_store(&pair_store, move |store| store.delete_pair(pair))
+			.await
+			.and_then(|result| result.map_err(|e| db_error(e, "removing a sync pair")));
+		if let Err(e) = deleted {
+			// The pair is still registered, so put back the control state the removal took away: the
+			// pair keeps working as it did, paused or not. Only while it is still `Retired`, which
+			// nothing but a removal sets; a concurrent removal that retired it first left `before`
+			// `Retired` too, so its state stands.
+			if let Some(control) = self.paused.lock().await.get(&pair) {
+				control.send_if_modified(|state| {
+					if *state == PassControl::Retired {
+						*state = before;
+						true
+					} else {
+						false
+					}
+				});
+			}
+			return Err(e);
+		}
+		// Under the registry lock, which is also the lock a watch reads the pair and subscribes
+		// under (see `watchable_pair`): a watch setting up right now either registered before this
+		// and gets tripped here, or reads the deleted row afterwards and is refused. After the delete,
+		// so a removal that fails leaves the watch running on a pair that is still there; a loop
+		// sitting between two passes meanwhile is held off by the `Retired` gate.
+		if let Some(signal) = self.removals.lock().await.remove(&pair) {
+			let _ = signal.send(true);
+		}
+		self.approvals.lock().await.remove(&pair);
+		// Its row went with the pair's (`ON DELETE CASCADE`).
+		self.restoring.lock().await.remove(&pair);
+		// Dropping the handle unsubscribes the pair's cache notifications.
+		self.roots.lock().await.remove(&pair);
+		// The pair's journal rows went with it (`ON DELETE CASCADE`); drop the in-memory copies too,
+		// so nothing of the removed pair is left to be consulted or re-persisted.
+		self.pending.forget_pair(pair);
 		// Under the same lock as the delete, and as `set_control`'s own write: a pause that landed
 		// in between would leave the map holding an id whose row is gone. The channel itself is
 		// already `Retired` — that is what kept a pause or resume made while this WAITED for the
@@ -6155,7 +6191,9 @@ impl SyncEngine {
 	///
 	/// Holds NO other lock meanwhile: the pass it waits for takes its pair's store lock on its way
 	/// out, to record what it did and what failed.
-	async fn cancel_pass_in_flight(&self, pair: PairId) {
+	///
+	/// Returns the control state the pair had before, for a removal that fails to put back.
+	async fn cancel_pass_in_flight(&self, pair: PairId) -> PassControl {
 		// Only a pass that has ASKED for its gate is reachable — and waited for — here, which a pass
 		// does before it reads either side, so scanning and planning are covered as well as
 		// applying. A pass that asks for its gate AFTER this is stopped by `pass_gate` refusing it,
@@ -6165,7 +6203,7 @@ impl SyncEngine {
 		// pause landing in it would otherwise re-park the pass — on a state nothing left in the
 		// engine can change, holding the drive-write lock until the grace runs out — and a resume
 		// would let it apply the rest of its plan against a pair being taken away.
-		control.send_replace(PassControl::Retired);
+		let before = control.send_replace(PassControl::Retired);
 		if tokio::time::timeout(REMOVE_CANCEL_GRACE, control.closed())
 			.await
 			.is_err()
@@ -6175,6 +6213,7 @@ impl SyncEngine {
 				 {REMOVE_CANCEL_GRACE:?}; retiring the pair anyway"
 			);
 		}
+		before
 	}
 
 	/// Pause `pair`: its watch loop stops running passes, and [`sync_once`](Self::sync_once)
