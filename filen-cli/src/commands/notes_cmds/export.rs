@@ -6,10 +6,11 @@
 //!
 //! Notes go into the export directory itself, trashed notes into its `trash/` subdirectory and
 //! archived notes into `archive/`; each subdirectory is created only when a note goes into it. A
-//! file is named after its note's title, with characters a file name cannot hold replaced by `_`
-//! (a note whose title cannot be decrypted is named `note-<uuid>`), and `-1`, `-2`, ... appended
-//! to tell notes with the same title apart. The extension follows the note's type: rich text notes
-//! are exported as `.html`, Markdown notes and checklists as `.md` (a checklist as a Markdown task
+//! file is named after its note's title, with characters a file name cannot hold replaced by `_`,
+//! and a title Windows reserves for a device, such as `CON` or `NUL`, prefixed with `_` (a note
+//! whose title cannot be decrypted is named `note-<uuid>`), and `-1`, `-2`, ... appended to tell
+//! notes with the same title apart. The extension follows the note's type: rich text notes are
+//! exported as `.html`, Markdown notes and checklists as `.md` (a checklist as a Markdown task
 //! list), and plain text and code notes as `.txt`.
 
 use std::{
@@ -202,11 +203,32 @@ fn unique_path(
 	unreachable!()
 }
 
+/// Windows refuses these as a file name's stem (the text before the first `.`), whatever the
+/// extension and the case.
+const RESERVED_DEVICE_NAMES: &[&str] = &[
+	"CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+	"COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+];
+
+/// Makes a note title usable as a file name on every platform: the title is trimmed, characters
+/// no file name can hold and control characters become `_`, and a stem Windows reserves for a
+/// device gets a leading `_`.
 fn sanitize_file_name(file_name: &str) -> String {
-	file_name
-		.replace(ILLEGAL_FILE_NAME_CHARS, "_")
-		.trim()
-		.to_string()
+	// trimmed first, so that whitespace control characters at either end are dropped rather
+	// than replaced
+	let sanitized = file_name.trim().replace(
+		|c: char| ILLEGAL_FILE_NAME_CHARS.contains(&c) || c.is_control(),
+		"_",
+	);
+	let stem = sanitized.split('.').next().unwrap_or_default();
+	if RESERVED_DEVICE_NAMES
+		.iter()
+		.any(|reserved| stem.eq_ignore_ascii_case(reserved))
+	{
+		format!("_{sanitized}")
+	} else {
+		sanitized
+	}
 }
 
 #[cfg(test)]
@@ -223,6 +245,11 @@ mod tests {
 		assert_eq!(sanitize_file_name("  padded  "), "padded");
 		assert_eq!(sanitize_file_name("///"), "___");
 		assert_eq!(sanitize_file_name(""), "");
+		assert_eq!(sanitize_file_name("a\nb"), "a_b");
+		assert_eq!(sanitize_file_name("CON"), "_CON");
+		assert_eq!(sanitize_file_name("com1"), "_com1");
+		assert_eq!(sanitize_file_name("NUL.x"), "_NUL.x");
+		assert_eq!(sanitize_file_name("Console"), "Console");
 	}
 
 	#[test]
