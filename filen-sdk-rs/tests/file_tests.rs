@@ -11,7 +11,7 @@ use filen_macros::shared_test_runtime;
 
 use filen_sdk_rs::{
 	ErrorKind,
-	auth::Client,
+	auth::{Client, http::ClientConfig, unauth::UnauthClient},
 	consts::CHUNK_SIZE_U64,
 	error::ResultExt,
 	fs::{
@@ -26,12 +26,15 @@ use filen_sdk_rs::{
 		},
 		name::{EntryNameError, EntryNameErrorKind},
 	},
-	io::{FilenMetaExt, client_impl::IoSharedClientExt},
+	io::{
+		FileUploadJournalStore, FilenMetaExt, UploadJournalStore, client_impl::IoSharedClientExt,
+	},
 	util::MaybeSendCallback,
 };
 use filen_types::fs::Uuid;
 use futures::AsyncReadExt;
 use rand::TryRng;
+use test_utils::upload_journal::{NotifyingJournalStore, resumable_upload_contents};
 
 async fn assert_file_upload_download_equal(name: &str, contents_len: usize) {
 	let mut contents = vec![0u8; contents_len];
@@ -2248,6 +2251,205 @@ async fn a_resumed_download_continues_from_the_bytes_an_earlier_one_left() {
 		"the resumed file differs"
 	);
 	assert!(!tmp.exists(), "the temp file was left behind");
+}
+
+fn journal_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+	std::fs::read_dir(dir)
+		.unwrap()
+		.map(|entry| entry.unwrap().path())
+		.collect()
+}
+
+/// A client of the test account, signed in as `client` is, as another process would be.
+fn another_client(client: &Client) -> Client {
+	UnauthClient::from_config(ClientConfig::default())
+		.expect("building an unauthenticated client")
+		.from_stringified(client.to_stringified())
+		.expect("restoring the signed-in client")
+}
+
+/// Uploads `path` into `parent` with `store`, and drops the upload once the store saved its
+/// journal.
+async fn interrupt_upload_after_first_save(
+	client: &Client,
+	parent: Uuid,
+	path: &std::path::Path,
+	store: &NotifyingJournalStore,
+) {
+	tokio::select! {
+		result = client.upload_file_from_path_resuming(
+			FileBuilderOptionalName::new(parent),
+			path.to_owned(),
+			store,
+			None,
+			None,
+		) => panic!("the upload ended before its journal was saved: {:?}", result.map(|(file, _)| file.uuid)),
+		() = store.saved.notified() => {}
+	}
+}
+
+/// A resuming upload with callbacks that sum the bytes sent and record what `on_resumed` reports.
+async fn upload_resuming_counted(
+	client: &Client,
+	parent: Uuid,
+	path: &std::path::Path,
+	store: &dyn UploadJournalStore,
+) -> (filen_sdk_rs::fs::file::RemoteFile, u64, Vec<u64>) {
+	let sent = Arc::new(AtomicU64::new(0));
+	let resumed = Arc::new(Mutex::new(Vec::new()));
+	let (file, _) = client
+		.upload_file_from_path_resuming(
+			FileBuilderOptionalName::new(parent),
+			path.to_owned(),
+			store,
+			Some(Arc::new({
+				let sent = Arc::clone(&sent);
+				move |bytes| {
+					sent.fetch_add(bytes, Ordering::Relaxed);
+				}
+			}) as MaybeSendCallback<u64>),
+			Some(Arc::new({
+				let resumed = Arc::clone(&resumed);
+				move |bytes| resumed.lock().unwrap().push(bytes)
+			}) as MaybeSendCallback<u64>),
+		)
+		.await
+		.unwrap();
+	let resumed = resumed.lock().unwrap().clone();
+	(file, sent.load(Ordering::Relaxed), resumed)
+}
+
+#[shared_test_runtime]
+async fn an_interrupted_upload_resumes_in_a_new_client_sending_fewer_bytes() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let local = tempfile::tempdir().unwrap();
+	let path = local.path().join("resumed_upload.bin");
+	let contents = resumable_upload_contents(0);
+	std::fs::write(&path, &contents).unwrap();
+	let journals = tempfile::tempdir().unwrap();
+	let store = NotifyingJournalStore::open(journals.path(), false).await;
+	interrupt_upload_after_first_save(client, resources.dir.uuid(), &path, &store).await;
+
+	let other = another_client(client);
+	let store = FileUploadJournalStore::open(journals.path().to_owned())
+		.await
+		.unwrap();
+	let (uploaded, sent, resumed) =
+		upload_resuming_counted(&other, resources.dir.uuid(), &path, &store).await;
+
+	let size = u64::try_from(contents.len()).unwrap();
+	assert!(sent < size, "every byte was sent again: {sent} of {size}");
+	// The first upload was dropped with chunks left to send, not after it finished.
+	assert!(sent > 0, "nothing was sent, the first upload was finished");
+	assert_eq!(resumed.len(), 1, "{resumed:?}");
+	assert!(resumed[0] > 0, "nothing was resumed: {resumed:?}");
+	assert_eq!(resumed[0] + sent, size);
+	assert!(
+		client.download_file(&uploaded).await.unwrap() == contents,
+		"the resumed upload differs"
+	);
+	assert_eq!(
+		journal_files(journals.path()),
+		Vec::<std::path::PathBuf>::new()
+	);
+	let (_, files) = client
+		.list_dir(&(&resources.dir).into(), None::<&fn(u64, Option<u64>)>)
+		.await
+		.unwrap();
+	assert_eq!(
+		files
+			.iter()
+			.filter(|file| file.name() == Some("resumed_upload.bin"))
+			.count(),
+		1
+	);
+}
+
+#[shared_test_runtime]
+async fn a_resumed_upload_whose_source_changed_starts_fresh() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let local = tempfile::tempdir().unwrap();
+	let path = local.path().join("changed_upload.bin");
+	std::fs::write(&path, resumable_upload_contents(0)).unwrap();
+	let journals = tempfile::tempdir().unwrap();
+	let store = NotifyingJournalStore::open(journals.path(), false).await;
+	interrupt_upload_after_first_save(client, resources.dir.uuid(), &path, &store).await;
+
+	let changed = resumable_upload_contents(1);
+	let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+	std::fs::write(&path, &changed).unwrap();
+	std::fs::File::options()
+		.write(true)
+		.open(&path)
+		.unwrap()
+		.set_modified(modified + std::time::Duration::from_secs(10))
+		.unwrap();
+	let (uploaded, sent, resumed) =
+		upload_resuming_counted(client, resources.dir.uuid(), &path, &store).await;
+
+	assert_eq!(resumed, Vec::<u64>::new());
+	assert_eq!(sent, u64::try_from(changed.len()).unwrap());
+	assert!(
+		client.download_file(&uploaded).await.unwrap() == changed,
+		"the upload does not hold the changed source"
+	);
+	assert_eq!(
+		journal_files(journals.path()),
+		Vec::<std::path::PathBuf>::new()
+	);
+}
+
+#[shared_test_runtime]
+async fn a_lost_done_finishes_from_the_uploaded_file() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let local = tempfile::tempdir().unwrap();
+	let name = "lost_done_upload.bin";
+	let path = local.path().join(name);
+	let contents = resumable_upload_contents(2);
+	std::fs::write(&path, &contents).unwrap();
+	let journals = tempfile::tempdir().unwrap();
+	// The upload finishes, but its journal survives, as if the answer to upload/done was lost.
+	let keeping = NotifyingJournalStore::open(journals.path(), true).await;
+	let (first, _) = client
+		.upload_file_from_path_resuming(
+			FileBuilderOptionalName::new(resources.dir.uuid()),
+			path.clone(),
+			&keeping,
+			None,
+			None,
+		)
+		.await
+		.unwrap();
+	assert_eq!(journal_files(journals.path()).len(), 1);
+
+	let store = FileUploadJournalStore::open(journals.path().to_owned())
+		.await
+		.unwrap();
+	let (uploaded, sent, resumed) =
+		upload_resuming_counted(client, resources.dir.uuid(), &path, &store).await;
+
+	assert_eq!(sent, 0);
+	assert_eq!(resumed, [u64::try_from(contents.len()).unwrap()]);
+	assert_eq!(uploaded.uuid(), first.uuid());
+	assert_eq!(
+		journal_files(journals.path()),
+		Vec::<std::path::PathBuf>::new()
+	);
+	let test_dir = &resources.dir;
+	let (_, files) = client
+		.list_dir(&test_dir.into(), None::<&fn(u64, Option<u64>)>)
+		.await
+		.unwrap();
+	assert_eq!(
+		files
+			.iter()
+			.filter(|file| file.name() == Some(name))
+			.count(),
+		1
+	);
 }
 
 #[shared_test_runtime]

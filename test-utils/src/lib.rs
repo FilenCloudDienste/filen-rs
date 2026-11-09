@@ -28,6 +28,7 @@ use tracing_subscriber::{
 };
 
 pub mod locks;
+pub mod upload_journal;
 
 pub struct Resources {
 	client: OnceCell<Arc<Client>>,
