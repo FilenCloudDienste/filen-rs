@@ -39,8 +39,8 @@ use super::{
 	facts::{self, PairFacts},
 	guard::{self, DeleteGuard, GuardReason},
 	ignore::{
-		IgnoreDecision, IgnoreLevel, IgnoreRules, IgnoreSource, IgnoredPath, Origin, RemoteRules,
-		RuleCandidates, load_remote_rules, parse_user_ignore, rule_file_dir, rule_file_paths,
+		IgnoreDecision, IgnoreLevel, IgnoreRules, IgnoredPath, Origin, RemoteRules, RuleCandidates,
+		load_remote_rules, parse_user_ignore, rule_file_dir, rule_file_paths,
 	},
 	legacy::{self, LegacyImport},
 	names::{self, Leaf},
@@ -4965,14 +4965,22 @@ impl SyncEngine {
 	/// Read the remote `.filenignore` files `record`'s mode takes rules from (see
 	/// [`load_remote_rules`]), reusing the bodies the pair's last pass read wherever the uuid is the
 	/// same.
+	///
+	/// `set_user_ignore` refuses a text that does not compile, so a stored `user_ignore` fails only
+	/// if this build reads patterns differently from the one that stored it. Guessing what it hides
+	/// could sync what the user meant to hide: the rules block the whole pair and say why.
 	async fn remote_rules(
 		&self,
 		record: &PairRecord,
 		baseline: &Baseline,
 		view: &RemoteView,
 		rule_files: Vec<String>,
-		user: Option<IgnoreSource>,
+		user_ignore: &str,
 	) -> RemoteRules {
+		let (user, user_error) = match parse_user_ignore(user_ignore) {
+			Ok(source) => (Some(source), None),
+			Err(error) => (None, Some(error)),
+		};
 		// Taken rather than copied: a pass on the same pair running alongside only downloads again.
 		let cached = self
 			.remote_rule_bodies
@@ -5009,6 +5017,10 @@ impl SyncEngine {
 			.lock()
 			.await
 			.insert(record.id, mem::take(&mut rules.bodies));
+		if let Some(error) = user_error {
+			rules.blocked.insert(String::new());
+			rules.errors.push(error.to_string());
+		}
 		rules
 	}
 
@@ -5300,10 +5312,6 @@ impl SyncEngine {
 		super::step("view_assembly");
 
 		// The rules, from the same sources and in the same order a whole pass reads them.
-		let (user, user_error) = match parse_user_ignore(&inputs.user_ignore) {
-			Ok(source) => (Some(source), None),
-			Err(error) => (None, Some(error)),
-		};
 		// Which paths could hold a rule file: the resident index, plus any path this pass moved a
 		// node onto. The index answers for every row, and a scan of the view would answer for the
 		// same rows plus one shape it cannot — a directory move carrying a `.filenignore` to a path
@@ -5320,14 +5328,16 @@ impl SyncEngine {
 					.cloned(),
 			)
 			.collect();
-		let mut remote_rules = self
-			.remote_rules(&inputs.record, &inputs.baseline, &view, rule_files, user)
+		let remote_rules = self
+			.remote_rules(
+				&inputs.record,
+				&inputs.baseline,
+				&view,
+				rule_files,
+				&inputs.user_ignore,
+			)
 			.await;
 		super::step("remote_rules");
-		if let Some(error) = user_error {
-			remote_rules.blocked.insert(String::new());
-			remote_rules.errors.push(error.to_string());
-		}
 		let rule_files = RuleFiles::for_pass(
 			inputs.record.mode,
 			&inputs.baseline,
@@ -5659,7 +5669,7 @@ impl SyncEngine {
 		// on disk, so it walks after the read.
 		let early_walk = if record.mode.pushes() {
 			// Parsed again for the remote rules below, as an `IgnoreSource` is not `Clone`. A text that
-			// does not parse is no rules on both, and blocks the pair below.
+			// does not parse is no rules on both, and `remote_rules` blocks the pair.
 			let user = parse_user_ignore(&user_ignore).ok();
 			Some(LocalWalk::start(
 				self.stage(pair)?,
@@ -5741,26 +5751,15 @@ impl SyncEngine {
 		baseline.confirm(&confirmed);
 		let baseline = baseline;
 
-		// `set_user_ignore` refuses a text that does not compile, so a stored one fails only if this
-		// build reads patterns differently from the one that stored it. Guessing what it hides could
-		// sync what the user meant to hide: block the whole pair and say why.
-		let (user, user_error) = match parse_user_ignore(&user_ignore) {
-			Ok(source) => (Some(source), None),
-			Err(error) => (None, Some(error)),
-		};
-		let mut remote_rules = self
+		let remote_rules = self
 			.remote_rules(
 				&record,
 				&baseline,
 				&view,
 				rule_file_paths(&view, &baseline),
-				user,
+				&user_ignore,
 			)
 			.await;
-		if let Some(error) = user_error {
-			remote_rules.blocked.insert(String::new());
-			remote_rules.errors.push(error.to_string());
-		}
 		// Rules come from the side that is the source of truth, plus a pulling pair's local root file
 		// (see `RuleFiles::for_pass`).
 		let rule_files = RuleFiles::for_pass(
