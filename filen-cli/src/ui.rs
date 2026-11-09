@@ -607,24 +607,28 @@ impl UI {
 			return;
 		}
 		let terminal_width = self.get_terminal_width().unwrap_or(10);
-		match grid_layout(items, terminal_width) {
+		let widths = items
+			.iter()
+			.map(|item| ansi_width::ansi_width(item))
+			.collect::<Vec<_>>();
+		match grid_layout(&widths, terminal_width) {
 			GridLayout::OnePerLine => self.print(&items.join("\n")),
 			GridLayout::Columns {
 				column_height,
 				column_widths,
 			} => {
-				let columns = items.chunks(column_height).collect::<Vec<_>>();
 				for row in 0..column_height {
-					let items = columns
+					let cells = column_widths
 						.iter()
-						.zip(&column_widths)
+						.enumerate()
 						.map(|(column, column_width)| {
-							let cell = column.get(row).unwrap_or(&"");
-							let padding = " ".repeat(column_width - ansi_width::ansi_width(cell));
-							format!("{}{}", cell, padding)
+							let index = column * column_height + row;
+							let cell = items.get(index).copied().unwrap_or("");
+							let width = widths.get(index).copied().unwrap_or(0);
+							format!("{}{}", cell, " ".repeat(column_width - width))
 						})
 						.collect::<Vec<_>>();
-					self.print(&items.join("  "));
+					self.print(&cells.join("  "));
 				}
 			}
 		}
@@ -968,33 +972,29 @@ enum GridLayout {
 	},
 }
 
-/// Finds the fewest rows that fit `items` into `terminal_width` cells, measuring every item the
-/// way the grid pads it ([`ansi_width::ansi_width`]), or one item per line when no height fits.
-fn grid_layout(items: &[&str], terminal_width: usize) -> GridLayout {
-	let widest = items
-		.iter()
-		.map(|item| ansi_width::ansi_width(item))
-		.max()
-		.unwrap_or(0);
+/// Finds the fewest rows that fit items of `widths` (in terminal cells, as the grid pads them:
+/// [`ansi_width::ansi_width`]) into `terminal_width` cells, or one item per line when no height
+/// fits.
+fn grid_layout(widths: &[usize], terminal_width: usize) -> GridLayout {
+	let widest = widths.iter().copied().max().unwrap_or(0);
 	if widest > terminal_width {
 		return GridLayout::OnePerLine;
 	}
-	for column_height in 1..=items.len() {
-		let column_widths = items
+	let column_widths = |column_height: usize| {
+		widths
 			.chunks(column_height)
-			.map(|column| {
-				column
-					.iter()
-					.map(|item| ansi_width::ansi_width(item))
-					.max()
-					.unwrap_or(0)
-			})
-			.collect::<Vec<_>>();
-		let spacing_width = (column_widths.len() - 1) * 2;
-		if column_widths.iter().sum::<usize>() + spacing_width <= terminal_width {
+			.map(|column| column.iter().copied().max().unwrap_or(0))
+	};
+	// Fewer rows put more than this many columns side by side, whose spacing alone is wider than
+	// the terminal.
+	let max_columns = terminal_width / 2 + 1;
+	let lowest_height = widths.len().div_ceil(max_columns).max(1);
+	for column_height in lowest_height..=widths.len() {
+		let spacing_width = (widths.len().div_ceil(column_height) - 1) * 2;
+		if column_widths(column_height).sum::<usize>() + spacing_width <= terminal_width {
 			return GridLayout::Columns {
 				column_height,
-				column_widths,
+				column_widths: column_widths(column_height).collect(),
 			};
 		}
 	}
@@ -1561,7 +1561,7 @@ mod tests {
 		let family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}";
 		let name = family.repeat(14);
 		assert_eq!(
-			grid_layout(&[name.as_str(), "a"], 40),
+			grid_layout_of(&[name.as_str(), "a"], 40),
 			GridLayout::OnePerLine
 		);
 	}
@@ -1569,12 +1569,113 @@ mod tests {
 	#[test]
 	fn a_grid_takes_the_fewest_rows_that_fit() {
 		assert_eq!(
-			grid_layout(&["a", "bb", "ccc", "dddd", "e"], 10),
+			grid_layout_of(&["a", "bb", "ccc", "dddd", "e"], 10),
 			GridLayout::Columns {
 				column_height: 3,
 				column_widths: vec![3, 4],
 			}
 		);
+	}
+
+	/// [`grid_layout`] of `items`, measured as [`UI::print_grid`] measures them.
+	fn grid_layout_of(items: &[&str], terminal_width: usize) -> GridLayout {
+		let widths = items
+			.iter()
+			.map(|item| ansi_width::ansi_width(item))
+			.collect::<Vec<_>>();
+		grid_layout(&widths, terminal_width)
+	}
+
+	/// The grid as it was printed before the item widths were measured once: every candidate
+	/// height re-measures every item, and each cell is measured again for its padding.
+	fn reference_grid_lines(items: &[&str], terminal_width: usize) -> Vec<String> {
+		let widest = items
+			.iter()
+			.map(|item| ansi_width::ansi_width(item))
+			.max()
+			.unwrap_or(0);
+		if widest > terminal_width {
+			return items.iter().map(|item| (*item).to_owned()).collect();
+		}
+		for column_height in 1..=items.len() {
+			let columns = items.chunks(column_height).collect::<Vec<_>>();
+			let column_widths = columns
+				.iter()
+				.map(|column| {
+					column
+						.iter()
+						.map(|item| ansi_width::ansi_width(item))
+						.max()
+						.unwrap_or(0)
+				})
+				.collect::<Vec<_>>();
+			let spacing_width = (column_widths.len() - 1) * 2;
+			if column_widths.iter().sum::<usize>() + spacing_width <= terminal_width {
+				return (0..column_height)
+					.map(|row| {
+						columns
+							.iter()
+							.zip(&column_widths)
+							.map(|(column, column_width)| {
+								let cell = column.get(row).unwrap_or(&"");
+								let padding =
+									" ".repeat(column_width - ansi_width::ansi_width(cell));
+								format!("{}{}", cell, padding)
+							})
+							.collect::<Vec<_>>()
+							.join("  ")
+					})
+					.collect();
+			}
+		}
+		items.iter().map(|item| (*item).to_owned()).collect()
+	}
+
+	#[test]
+	fn a_grid_of_many_names_prints_as_the_reference_layout_does() {
+		// a fixed linear congruential generator, so that the names are the same on every run
+		let mut state = 0x2545_f491_4f6c_dd1d_u64;
+		let mut next = |bound: u64| {
+			state = state
+				.wrapping_mul(6_364_136_223_846_793_005)
+				.wrapping_add(1_442_695_040_888_963_407);
+			(state >> 33) % bound
+		};
+		let pieces = [
+			"a",
+			"bc",
+			"\u{4E2D}",
+			"\u{1F600}",
+			"\u{1b}[1mx\u{1b}[0m",
+			"e\u{301}",
+		];
+		let names = (0..500)
+			.map(|_| {
+				let len = 1 + next(12);
+				(0..len)
+					.map(|_| {
+						let piece = usize::try_from(next(6)).expect("below 6");
+						pieces.get(piece).copied().unwrap_or("a")
+					})
+					.collect::<String>()
+			})
+			.collect::<Vec<_>>();
+		let items = names.iter().map(String::as_str).collect::<Vec<_>>();
+
+		for terminal_width in [40, 80, 200] {
+			let printed = Printed::default();
+			let mut ui = printed.terminal_ui();
+			ui.initialize(false, false, Some(terminal_width), true, false);
+			ui.print_grid(&items);
+
+			let mut expected = reference_grid_lines(&items, terminal_width).join("\n");
+			expected.push('\n');
+			assert_eq!(
+				String::from_utf8(printed.bytes()).unwrap(),
+				expected,
+				"terminal width {terminal_width}"
+			);
+		}
 	}
 
 	#[test]
