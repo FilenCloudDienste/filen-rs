@@ -555,7 +555,7 @@ pub(super) fn planned_action(
 			None,
 			None,
 		),
-		// A file's size is read at the source path, where each side still holds the bytes; a
+		// A file's size is read at the destination, where the side that moved holds the node; a
 		// directory has none.
 		SyncAction::MoveRemote { to_path, kind, .. } => (
 			PlannedActionKind::MoveRemote {
@@ -563,7 +563,7 @@ pub(super) fn planned_action(
 			},
 			(*kind).into(),
 			match kind {
-				NodeKind::File => local_size(&rel_path),
+				NodeKind::File => local_size(to_path),
 				NodeKind::Dir => None,
 			},
 			None,
@@ -574,7 +574,7 @@ pub(super) fn planned_action(
 			},
 			(*kind).into(),
 			match kind {
-				NodeKind::File => remote_size(&rel_path),
+				NodeKind::File => remote_size(to_path),
 				NodeKind::Dir => None,
 			},
 			None,
@@ -796,9 +796,10 @@ mod tests {
 		}
 	}
 
+	/// The side that moved holds the node only at the destination, so the size is read there.
 	#[test]
 	fn a_move_reports_the_source_path_and_names_its_destination() {
-		let local = HashMap::from([local_file("old.txt", 7)]);
+		let local = HashMap::from([local_file("new/here.txt", 7)]);
 		let action = planned_action(
 			&SyncAction::MoveRemote {
 				from_path: "old.txt".to_string(),
@@ -821,6 +822,25 @@ mod tests {
 			action.to_string(),
 			r#"move remote "old.txt" -> "new/here.txt""#
 		);
+
+		let remote = HashMap::from([remote_file("moved/there.txt", 9)]);
+		let action = planned_action(
+			&SyncAction::MoveLocal {
+				from_path: "was.txt".to_string(),
+				to_path: "moved/there.txt".to_string(),
+				kind: NodeKind::File,
+			},
+			&HashMap::new(),
+			&remote,
+		);
+		assert_eq!(action.rel_path, "was.txt");
+		assert_eq!(
+			action.kind,
+			PlannedActionKind::MoveLocal {
+				to: "moved/there.txt".to_string()
+			}
+		);
+		assert_eq!(action.size, Some(9));
 	}
 
 	#[test]
