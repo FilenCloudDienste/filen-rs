@@ -3,32 +3,21 @@
 
 use chrono::{DateTime, Utc};
 use filen_macros::shared_test_runtime;
-use filen_sdk_rs::{
-	auth::Client,
-	connect::PasswordState,
-	fs::{HasName as _, HasUUID as _},
-	io::{RemoteDirectory, RemoteFile},
-};
+use filen_sdk_rs::{connect::PasswordState, fs::HasName as _, io::RemoteDirectory};
 use filen_types::api::v3::dir::link::PublicLinkExpiration;
 use predicates::str::contains;
 use serde_json::{Value, json};
-use test_utils::authenticated_cli_with_args;
+use test_utils::{
+	authenticated_cli_with_args,
+	cli::{stdout_of, upload},
+};
 
 /// Where the URLs of public links start.
 const PUBLIC_LINK_BASE_URL: &str = "https://app.filen.io/#/";
 
-async fn upload_file(client: &Client, parent: &RemoteDirectory, name: &str) -> RemoteFile {
-	let file = client.make_file_builder(name, parent.uuid()).unwrap();
-	client.upload_file(file, b"linked").await.unwrap()
-}
-
 /// The absolute path of `name` in the test directory, which is a child of the root.
 fn path_in(test_dir: &RemoteDirectory, name: &str) -> String {
 	format!("/{}/{name}", test_dir.name().unwrap())
-}
-
-fn stdout_of(assert: &assert_cmd::assert::Assert) -> String {
-	String::from_utf8(assert.get_output().stdout.clone()).unwrap()
 }
 
 /// When a link expires, as the link table prints it, from what the SDK read back.
@@ -45,7 +34,7 @@ async fn public_link_show_and_a_run_without_a_terminal_change_nothing() {
 	let client = &resources.client;
 	let test_dir = &resources.dir;
 
-	let file = upload_file(client, test_dir, "shown.txt").await;
+	let file = upload(client, test_dir, "shown.txt", b"linked").await;
 	let mut file_link = client.public_link_file(&file).await.unwrap();
 	file_link.set_expiration(PublicLinkExpiration::ThreeDays);
 	file_link.set_password("secret".to_owned());
@@ -114,7 +103,7 @@ async fn public_link_show_and_a_run_without_a_terminal_change_nothing() {
 	);
 
 	// an item without a link is shown to have none, and gets none
-	let unlinked = upload_file(client, test_dir, "unlinked.txt").await;
+	let unlinked = upload(client, test_dir, "unlinked.txt", b"linked").await;
 	authenticated_cli_with_args!("public-link", &path_in(test_dir, "unlinked.txt"), "--show")
 		.success()
 		.stdout(contains(format!(
@@ -141,7 +130,7 @@ async fn list_public_links_shows_the_path_expiry_and_url_of_each_link() {
 	let client = &resources.client;
 	let test_dir = &resources.dir;
 
-	let file = upload_file(client, test_dir, "listed.txt").await;
+	let file = upload(client, test_dir, "listed.txt", b"linked").await;
 	let mut file_link = client.public_link_file(&file).await.unwrap();
 	file_link.set_expiration(PublicLinkExpiration::OneDay);
 	client.update_file_link(&file, &file_link).await.unwrap();
@@ -236,7 +225,7 @@ async fn public_link_options_set_and_delete_a_link_without_prompting() {
 	let client = &resources.client;
 	let test_dir = &resources.dir;
 
-	let file = upload_file(client, test_dir, "flagged.txt").await;
+	let file = upload(client, test_dir, "flagged.txt", b"linked").await;
 	let path = path_in(test_dir, "flagged.txt");
 
 	authenticated_cli_with_args!(

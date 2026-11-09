@@ -19,6 +19,7 @@ use filen_sdk_rs::{
 use filen_types::fs::Uuid;
 use test_utils::{
 	authenticated_cli_with_args,
+	cli::{exists, file_uuid, is_file, logged_out_command},
 	upload_journal::{NotifyingJournalStore, resumable_upload_contents},
 };
 
@@ -35,13 +36,7 @@ async fn uploading_a_directory_uploads_its_files() {
 
 	authenticated_cli_with_args!("upload", source.to_str().unwrap(), test_dir_name).success();
 
-	assert!(matches!(
-		client
-			.find_item_at_path(&format!("{test_dir_name}/uploaded/nested/a.txt"))
-			.await
-			.unwrap(),
-		Some(NonRootFileType::File(_))
-	));
+	assert!(is_file(client, &format!("{test_dir_name}/uploaded/nested/a.txt")).await);
 }
 
 #[cfg(unix)]
@@ -66,20 +61,8 @@ async fn uploading_a_symlinked_file_keeps_the_links_name() {
 	)
 	.success();
 
-	assert!(matches!(
-		client
-			.find_item_at_path(&format!("{test_dir_name}/link.txt"))
-			.await
-			.unwrap(),
-		Some(NonRootFileType::File(_))
-	));
-	assert!(
-		client
-			.find_item_at_path(&format!("{test_dir_name}/target.txt"))
-			.await
-			.unwrap()
-			.is_none()
-	);
+	assert!(is_file(client, &format!("{test_dir_name}/link.txt")).await);
+	assert!(!exists(client, &format!("{test_dir_name}/target.txt")).await);
 }
 
 #[shared_test_runtime]
@@ -100,20 +83,8 @@ async fn uploading_to_a_new_file_path_renames_the_file() {
 	)
 	.success();
 
-	assert!(matches!(
-		client
-			.find_item_at_path(&format!("{test_dir_name}/dir/new.txt"))
-			.await
-			.unwrap(),
-		Some(NonRootFileType::File(_))
-	));
-	assert!(
-		client
-			.find_item_at_path(&format!("{test_dir_name}/dir/b.txt"))
-			.await
-			.unwrap()
-			.is_none()
-	);
+	assert!(is_file(client, &format!("{test_dir_name}/dir/new.txt")).await);
+	assert!(!exists(client, &format!("{test_dir_name}/dir/b.txt")).await);
 }
 
 #[shared_test_runtime]
@@ -132,13 +103,7 @@ async fn uploading_into_a_missing_directory_creates_it() {
 	)
 	.success();
 
-	assert!(matches!(
-		client
-			.find_item_at_path(&format!("{test_dir_name}/x/y/z/a.txt"))
-			.await
-			.unwrap(),
-		Some(NonRootFileType::File(_))
-	));
+	assert!(is_file(client, &format!("{test_dir_name}/x/y/z/a.txt")).await);
 }
 
 #[shared_test_runtime]
@@ -228,14 +193,6 @@ fn pattern(len: usize) -> Vec<u8> {
 		.collect()
 }
 
-/// The uuid of the file at `path` in the drive.
-async fn remote_file_uuid(client: &Client, path: &str) -> Uuid {
-	match client.find_item_at_path(path).await.unwrap() {
-		Some(NonRootFileType::File(file)) => file.uuid(),
-		other => panic!("expected a file at {path}, found {other:?}"),
-	}
-}
-
 fn set_modified(path: &Path, modified: SystemTime) {
 	std::fs::File::options()
 		.write(true)
@@ -282,11 +239,11 @@ async fn uploading_a_changed_file_again_replaces_it_under_the_same_name() {
 	let source = local.path().join("a.txt");
 	std::fs::write(&source, b"first").unwrap();
 	authenticated_cli_with_args!("upload", source.to_str().unwrap(), test_dir_name).success();
-	let first = remote_file_uuid(client, &format!("{test_dir_name}/a.txt")).await;
+	let first = file_uuid(client, &format!("{test_dir_name}/a.txt")).await;
 
 	std::fs::write(&source, b"second version").unwrap();
 	authenticated_cli_with_args!("upload", source.to_str().unwrap(), test_dir_name).success();
-	let second = remote_file_uuid(client, &format!("{test_dir_name}/a.txt")).await;
+	let second = file_uuid(client, &format!("{test_dir_name}/a.txt")).await;
 	assert_ne!(first, second);
 
 	let back = local.path().join("back.txt");
@@ -459,20 +416,8 @@ async fn an_unreadable_file_fails_only_itself_and_the_upload_exits_nonzero() {
 		String::from_utf8_lossy(&output.stderr)
 	);
 	assert!(printed.contains("locked.txt"), "{printed}");
-	assert!(matches!(
-		client
-			.find_item_at_path(&format!("{test_dir_name}/partial/ok.txt"))
-			.await
-			.unwrap(),
-		Some(NonRootFileType::File(_))
-	));
-	assert!(
-		client
-			.find_item_at_path(&format!("{test_dir_name}/partial/locked.txt"))
-			.await
-			.unwrap()
-			.is_none()
-	);
+	assert!(is_file(client, &format!("{test_dir_name}/partial/ok.txt")).await);
+	assert!(!exists(client, &format!("{test_dir_name}/partial/locked.txt")).await);
 }
 
 #[shared_test_runtime]
@@ -492,13 +437,13 @@ async fn paths_with_spaces_round_trip() {
 		&format!("{test_dir_name}/remote dir/")
 	)
 	.success();
-	assert!(matches!(
-		client
-			.find_item_at_path(&format!("{test_dir_name}/remote dir/my dir/a file.txt"))
-			.await
-			.unwrap(),
-		Some(NonRootFileType::File(_))
-	));
+	assert!(
+		is_file(
+			client,
+			&format!("{test_dir_name}/remote dir/my dir/a file.txt")
+		)
+		.await
+	);
 
 	let back = local.path().join("out dir").join("copy dir");
 	authenticated_cli_with_args!(
@@ -543,21 +488,9 @@ async fn uploading_without_following_symlinks_skips_and_lists_them() {
 	for link in ["link.txt", "link-dir"] {
 		let line = format!("Skipped symlink {}", source.join(link).display());
 		assert!(stdout.lines().any(|l| l == line), "{stdout}");
-		assert!(
-			client
-				.find_item_at_path(&format!("{test_dir_name}/with-links/{link}"))
-				.await
-				.unwrap()
-				.is_none()
-		);
+		assert!(!exists(client, &format!("{test_dir_name}/with-links/{link}")).await);
 	}
-	assert!(matches!(
-		client
-			.find_item_at_path(&format!("{test_dir_name}/with-links/real.txt"))
-			.await
-			.unwrap(),
-		Some(NonRootFileType::File(_))
-	));
+	assert!(is_file(client, &format!("{test_dir_name}/with-links/real.txt")).await);
 }
 
 #[cfg(unix)]
@@ -591,7 +524,7 @@ async fn uploading_without_following_symlinks_lists_them_in_the_json_result() {
 
 /// The uuid of the file at `rel_path` below the test directory.
 async fn file_uuid_at(client: &Client, test_dir_name: &str, rel_path: &str) -> Uuid {
-	remote_file_uuid(client, &format!("{test_dir_name}/{rel_path}")).await
+	file_uuid(client, &format!("{test_dir_name}/{rel_path}")).await
 }
 
 #[shared_test_runtime]
@@ -631,13 +564,7 @@ async fn uploading_with_skip_existing_keeps_same_named_files_whatever_their_case
 		file_uuid_at(client, test_dir_name, "up/Notes.TXT").await,
 		kept
 	);
-	assert!(matches!(
-		client
-			.find_item_at_path(&format!("{test_dir_name}/up/new.txt"))
-			.await
-			.unwrap(),
-		Some(NonRootFileType::File(_))
-	));
+	assert!(is_file(client, &format!("{test_dir_name}/up/new.txt")).await);
 	let stdout = String::from_utf8_lossy(&output.get_output().stdout);
 	assert!(stdout.contains("1 file, 3 B in "), "{stdout}");
 	assert!(stdout.contains(", 1 skipped"), "{stdout}");
@@ -738,11 +665,7 @@ async fn uploading_with_include_and_exclude_takes_only_the_matching_files() {
 	.success();
 
 	let found = |rel_path: &'static str| async move {
-		client
-			.find_item_at_path(&format!("{test_dir_name}/filtered/{rel_path}"))
-			.await
-			.unwrap()
-			.is_some()
+		exists(client, &format!("{test_dir_name}/filtered/{rel_path}")).await
 	};
 	assert!(found("keep/a.JPG").await);
 	for left_out in ["keep/b.txt", "skip", "empty", "top.txt"] {
@@ -770,13 +693,7 @@ async fn uploading_several_items_goes_on_past_one_that_fails() {
 	.failure();
 
 	for name in ["a.txt", "b.txt"] {
-		assert!(matches!(
-			client
-				.find_item_at_path(&format!("{test_dir_name}/several/{name}"))
-				.await
-				.unwrap(),
-			Some(NonRootFileType::File(_))
-		));
+		assert!(is_file(client, &format!("{test_dir_name}/several/{name}")).await);
 	}
 	let stderr = String::from_utf8_lossy(&output.get_output().stderr);
 	assert!(stderr.contains("missing.txt"), "{stderr}");
@@ -850,18 +767,14 @@ async fn a_file_piped_in_through_stdin_comes_back_out_through_stdout() {
 fn uploading_piped_stdin_without_a_login_fails_instead_of_prompting() {
 	// The login prompt cannot read stdin, which carries the file.
 	let config_dir = tempfile::tempdir().unwrap();
-	let output = assert_cmd::Command::new(env!("CARGO_BIN_EXE_filen-cli"))
-		.env("FILEN_CLI_TESTING_DISABLE_KEYRING", "1")
-		.env("FILEN_CLI_TESTING_DISABLE_AUTODETECTED_AUTH_CONFIG", "1")
-		.env_remove("FILEN_CLI_EMAIL")
-		.env_remove("FILEN_CLI_PASSWORD")
-		.env_remove("FILEN_CLI_2FA_CODE")
-		.arg("--config-dir")
-		.arg(config_dir.path())
-		.args(["--skip-update", "upload", "-", "/today.txt"])
-		.write_stdin("the file's contents")
-		.output()
-		.unwrap();
+	let output = assert_cmd::Command::from_std(logged_out_command(
+		Path::new(env!("CARGO_BIN_EXE_filen-cli")),
+		config_dir.path(),
+	))
+	.args(["--skip-update", "upload", "-", "/today.txt"])
+	.write_stdin("the file's contents")
+	.output()
+	.unwrap();
 
 	assert_eq!(output.status.code(), Some(2));
 	let stderr = String::from_utf8_lossy(&output.stderr);
@@ -875,18 +788,14 @@ fn uploading_piped_stdin_without_a_login_fails_instead_of_prompting() {
 fn uploading_stdin_among_commands_piped_into_the_cli_is_refused() {
 	// Needs no account: the refusal comes before any login.
 	let config_dir = tempfile::tempdir().unwrap();
-	let output = assert_cmd::Command::new(env!("CARGO_BIN_EXE_filen-cli"))
-		.env("FILEN_CLI_TESTING_DISABLE_KEYRING", "1")
-		.env("FILEN_CLI_TESTING_DISABLE_AUTODETECTED_AUTH_CONFIG", "1")
-		.env_remove("FILEN_CLI_EMAIL")
-		.env_remove("FILEN_CLI_PASSWORD")
-		.env_remove("FILEN_CLI_2FA_CODE")
-		.arg("--config-dir")
-		.arg(config_dir.path())
-		.arg("--skip-update")
-		.write_stdin("upload - /today.txt\nthe next command, not the file\n")
-		.output()
-		.unwrap();
+	let output = assert_cmd::Command::from_std(logged_out_command(
+		Path::new(env!("CARGO_BIN_EXE_filen-cli")),
+		config_dir.path(),
+	))
+	.arg("--skip-update")
+	.write_stdin("upload - /today.txt\nthe next command, not the file\n")
+	.output()
+	.unwrap();
 
 	assert_eq!(output.status.code(), Some(2));
 	let stderr = String::from_utf8_lossy(&output.stderr);
@@ -940,7 +849,7 @@ async fn uploading_stdin_with_skip_existing_keeps_the_existing_file() {
 
 	let stdout = String::from_utf8_lossy(&output.get_output().stdout);
 	assert!(stdout.contains("1 skipped"), "{stdout}");
-	assert_eq!(remote_file_uuid(client, &remote).await, existing.uuid());
+	assert_eq!(file_uuid(client, &remote).await, existing.uuid());
 }
 
 #[shared_test_runtime]
@@ -1306,19 +1215,15 @@ async fn downloading_a_link_needs_no_login() {
 	// No credentials anywhere, and no prompt for them: a login would fail the command.
 	let config_dir = tempfile::tempdir().unwrap();
 	let local = tempfile::tempdir().unwrap();
-	let output = std::process::Command::new(env!("CARGO_BIN_EXE_filen-cli"))
-		.env("FILEN_CLI_TESTING_DISABLE_KEYRING", "1")
-		.env("FILEN_CLI_TESTING_DISABLE_AUTODETECTED_AUTH_CONFIG", "1")
-		.env_remove("FILEN_CLI_EMAIL")
-		.env_remove("FILEN_CLI_PASSWORD")
-		.env_remove("FILEN_CLI_2FA_CODE")
-		.arg("--config-dir")
-		.arg(config_dir.path())
-		.args(["--skip-update", "--no-input", "download", &url])
-		.arg(local.path())
-		.stdin(Stdio::null())
-		.output()
-		.unwrap();
+	let output = logged_out_command(
+		Path::new(env!("CARGO_BIN_EXE_filen-cli")),
+		config_dir.path(),
+	)
+	.args(["--skip-update", "--no-input", "download", &url])
+	.arg(local.path())
+	.stdin(Stdio::null())
+	.output()
+	.unwrap();
 
 	assert!(
 		output.status.success(),

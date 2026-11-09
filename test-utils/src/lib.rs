@@ -558,8 +558,100 @@ pub mod cli {
 	#[cfg(unix)]
 	use std::os::unix::fs::PermissionsExt;
 
+	use std::{path::Path, process::Command};
+
 	use crate::RESOURCES;
 	use assert_fs::prelude::{FileWriteStr, PathChild};
+	use filen_sdk_rs::{
+		auth::Client,
+		fs::{HasUUID, categories::NonRootFileType, dir::RemoteDirectory, file::RemoteFile},
+		io::client_impl::IoSharedClientExt,
+	};
+	use filen_types::fs::Uuid;
+
+	/// The variables the CLI reads credentials from, its own and those of the old CLI.
+	pub const SCRUBBED_CREDENTIAL_VARS: &[&str] = &[
+		"FILEN_CLI_EMAIL",
+		"FILEN_CLI_PASSWORD",
+		"FILEN_CLI_2FA_CODE",
+		"FILEN_CLI_2FA_SECRET",
+		"FILEN_EMAIL",
+		"FILEN_PASSWORD",
+		"FILEN_2FA_CODE",
+	];
+
+	/// The CLI at `bin` with `config_dir` and none of the credentials of whoever runs the test: no
+	/// keyring, no autodetected auth config and none of [`SCRUBBED_CREDENTIAL_VARS`].
+	pub fn logged_out_command(bin: &Path, config_dir: &Path) -> Command {
+		let mut command = Command::new(bin);
+		command
+			.env("FILEN_CLI_TESTING_DISABLE_KEYRING", "1")
+			.env("FILEN_CLI_TESTING_DISABLE_AUTODETECTED_AUTH_CONFIG", "1");
+		for var in SCRUBBED_CREDENTIAL_VARS {
+			command.env_remove(var);
+		}
+		command.arg("--config-dir").arg(config_dir);
+		command
+	}
+
+	/// What the CLI printed to stdout.
+	pub fn stdout_of(assert: &assert_cmd::assert::Assert) -> String {
+		String::from_utf8(assert.get_output().stdout.clone()).unwrap()
+	}
+
+	/// What the CLI printed to stderr.
+	pub fn stderr_of(assert: &assert_cmd::assert::Assert) -> String {
+		String::from_utf8(assert.get_output().stderr.clone()).unwrap()
+	}
+
+	/// Uploads `content` as `name` into `parent`.
+	pub async fn upload(
+		client: &Client,
+		parent: &RemoteDirectory,
+		name: &str,
+		content: &[u8],
+	) -> RemoteFile {
+		let builder = client.make_file_builder(name, parent.uuid()).unwrap();
+		client.upload_file(builder, content).await.unwrap()
+	}
+
+	/// Whether there is an item at `path` in the drive.
+	pub async fn exists(client: &Client, path: &str) -> bool {
+		client.find_item_at_path(path).await.unwrap().is_some()
+	}
+
+	/// Whether there is a file at `path` in the drive.
+	pub async fn is_file(client: &Client, path: &str) -> bool {
+		matches!(
+			client.find_item_at_path(path).await.unwrap(),
+			Some(NonRootFileType::File(_))
+		)
+	}
+
+	/// The uuid of the file at `path` in the drive.
+	pub async fn file_uuid(client: &Client, path: &str) -> Uuid {
+		match client.find_item_at_path(path).await.unwrap() {
+			Some(NonRootFileType::File(file)) => file.uuid(),
+			other => panic!("expected a file at {path}, found {other:?}"),
+		}
+	}
+
+	/// The content of the file at `path` in the drive.
+	pub async fn file_content(client: &Client, path: &str) -> Vec<u8> {
+		match client.find_item_at_path(path).await.unwrap() {
+			Some(NonRootFileType::File(file)) => client.download_file(file.as_ref()).await.unwrap(),
+			other => panic!("expected a file at {path}, found {other:?}"),
+		}
+	}
+
+	/// Whether `file` is in the trash.
+	pub async fn is_in_trash(client: &Client, file: &RemoteFile) -> bool {
+		let (_, files) = client
+			.list_trash(None::<&fn(u64, Option<u64>)>)
+			.await
+			.unwrap();
+		files.iter().any(|trashed| trashed.uuid() == file.uuid())
+	}
 
 	pub async fn run_authenticated_cli_with_args<I, S>(
 		bin: &mut assert_cmd::Command,

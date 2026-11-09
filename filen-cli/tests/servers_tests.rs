@@ -24,7 +24,7 @@ use regex::Regex;
 use reqwest::{Method, StatusCode};
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
-use test_utils::cli::prepare_cli_auth_config;
+use test_utils::cli::{logged_out_command, prepare_cli_auth_config};
 use tokio::{
 	io::{AsyncBufReadExt, AsyncReadExt, BufReader, Lines},
 	process::{Child, ChildStdout, Command},
@@ -92,16 +92,12 @@ impl Cli {
 	async fn spawn(args: &[&str]) -> Self {
 		let running = RUNNING.acquire().await.unwrap();
 		let (auth_config, auth_config_file) = prepare_cli_auth_config().await;
-		let mut command = Command::new(assert_cmd::cargo::cargo_bin!("filen-cli"));
+		let mut command = Command::from(logged_out_command(
+			assert_cmd::cargo::cargo_bin!("filen-cli"),
+			&config_dir(),
+		));
 		command
-			.env("FILEN_CLI_TESTING_DISABLE_KEYRING", "1")
-			.env("FILEN_CLI_TESTING_DISABLE_AUTODETECTED_AUTH_CONFIG", "1")
-			.env_remove("FILEN_CLI_EMAIL")
-			.env_remove("FILEN_CLI_PASSWORD")
-			.env_remove("FILEN_CLI_2FA_CODE")
 			.env_remove("FILEN_CLI_SERVE_PASSWORD")
-			.arg("--config-dir")
-			.arg(config_dir())
 			.arg("--auth-config-path")
 			.arg(auth_config_file.path())
 			.arg("--skip-update")

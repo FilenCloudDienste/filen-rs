@@ -9,15 +9,10 @@ use filen_sdk_rs::{auth::Client, notes::Note};
 use filen_types::{api::v3::notes::NoteType, fs::Uuid};
 use futures::FutureExt as _;
 use serde_json::Value;
-use test_utils::authenticated_cli_with_args;
-
-fn stdout_of(assert: &assert_cmd::assert::Assert) -> String {
-	String::from_utf8(assert.get_output().stdout.clone()).unwrap()
-}
-
-fn stderr_of(assert: &assert_cmd::assert::Assert) -> String {
-	String::from_utf8(assert.get_output().stderr.clone()).unwrap()
-}
+use test_utils::{
+	authenticated_cli_with_args,
+	cli::{stderr_of, stdout_of},
+};
 
 fn json_of(assert: &assert_cmd::assert::Assert) -> Value {
 	let stdout = stdout_of(assert);

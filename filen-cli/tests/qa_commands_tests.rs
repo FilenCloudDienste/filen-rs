@@ -7,21 +7,16 @@
 
 use std::{
 	io::Write as _,
-	process::{Command, Output, Stdio},
+	process::{Output, Stdio},
 };
+
+use test_utils::cli::logged_out_command;
 
 /// Runs the CLI on `script` piped into it, with a fresh config directory and none of the
 /// credentials of whoever runs the test.
 fn run_script(args: &[&str], script: &str) -> Output {
 	let config_dir = assert_fs::TempDir::new().unwrap();
-	let mut cli = Command::new(assert_cmd::cargo::cargo_bin!())
-		.env("FILEN_CLI_TESTING_DISABLE_KEYRING", "1")
-		.env("FILEN_CLI_TESTING_DISABLE_AUTODETECTED_AUTH_CONFIG", "1")
-		.env_remove("FILEN_CLI_EMAIL")
-		.env_remove("FILEN_CLI_PASSWORD")
-		.env_remove("FILEN_CLI_2FA_CODE")
-		.arg("--config-dir")
-		.arg(config_dir.path())
+	let mut cli = logged_out_command(assert_cmd::cargo::cargo_bin!(), config_dir.path())
 		.arg("--skip-update")
 		.args(args)
 		.stdin(Stdio::piped())
@@ -42,13 +37,14 @@ mod offline {
 	use std::{
 		io::{BufRead as _, BufReader, Read as _, Write as _},
 		net::TcpStream,
-		process::{Child, Command, Stdio},
+		process::{Child, Stdio},
 		sync::mpsc,
 		time::Duration,
 	};
 
 	use assert_fs::TempDir;
 	use regex::Regex;
+	use test_utils::cli::logged_out_command;
 
 	/// Kills the CLI when the test ends, passed or failed: `view-html-docs` serves until it is
 	/// stopped.
@@ -86,12 +82,8 @@ mod offline {
 	fn view_html_docs_serves_each_section_as_html() {
 		let config_dir = TempDir::new().unwrap();
 		let mut cli = KillOnDrop(
-			Command::new(assert_cmd::cargo::cargo_bin!())
+			logged_out_command(assert_cmd::cargo::cargo_bin!(), config_dir.path())
 				.env("FILEN_CLI_TESTING_DISABLE_BROWSER", "1")
-				.env("FILEN_CLI_TESTING_DISABLE_KEYRING", "1")
-				.env("FILEN_CLI_TESTING_DISABLE_AUTODETECTED_AUTH_CONFIG", "1")
-				.arg("--config-dir")
-				.arg(config_dir.path())
 				.arg("--skip-update")
 				.arg("view-html-docs")
 				.stdin(Stdio::null())
@@ -140,10 +132,13 @@ mod live {
 	use std::time::{Duration, Instant};
 
 	use filen_macros::shared_test_runtime;
-	use filen_sdk_rs::fs::{HasName as _, HasUUID as _, categories::NonRootFileType};
+	use filen_sdk_rs::fs::{HasName as _, HasUUID as _};
 	use rand::TryRng as _;
 	use regex::Regex;
-	use test_utils::authenticated_cli_with_args;
+	use test_utils::{
+		authenticated_cli_with_args,
+		cli::{exists, is_file},
+	};
 
 	use super::run_script;
 
@@ -311,20 +306,8 @@ mod live {
 			&format!("{remote_dir}/z w.txt")
 		)
 		.success();
-		assert!(matches!(
-			client
-				.find_item_at_path(&format!("{remote_dir}/z w.txt"))
-				.await
-				.unwrap(),
-			Some(NonRootFileType::File(_))
-		));
-		assert!(
-			client
-				.find_item_at_path(&format!("{remote_dir}/x y.txt"))
-				.await
-				.unwrap()
-				.is_none()
-		);
+		assert!(is_file(client, &format!("{remote_dir}/z w.txt")).await);
+		assert!(!exists(client, &format!("{remote_dir}/x y.txt")).await);
 	}
 
 	/// `cd` and `mv` read quoted paths with spaces in commands piped into the CLI, in either kind
@@ -353,20 +336,8 @@ mod live {
 		assert_eq!(output.status.code(), Some(0), "{stdout}\n{stderr}");
 		// `ls` ran in the directory `cd` changed to
 		assert!(stdout.contains("x y.txt"), "{stdout}");
-		assert!(matches!(
-			client
-				.find_item_at_path(&format!("{remote_dir}/z w.txt"))
-				.await
-				.unwrap(),
-			Some(NonRootFileType::File(_))
-		));
-		assert!(
-			client
-				.find_item_at_path(&format!("{remote_dir}/x y.txt"))
-				.await
-				.unwrap()
-				.is_none()
-		);
+		assert!(is_file(client, &format!("{remote_dir}/z w.txt")).await);
+		assert!(!exists(client, &format!("{remote_dir}/x y.txt")).await);
 	}
 
 	#[shared_test_runtime]

@@ -19,6 +19,7 @@ use predicates::str::contains;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
+use test_utils::cli::logged_out_command;
 use tiny_http::{Header, Response, Server};
 
 /// The target the CLI was built for, which names its release asset.
@@ -212,18 +213,15 @@ impl Installation {
 
 	/// Runs the binary as `mock_version` against the releases `url` serves.
 	fn cli(&self, url: &str, mock_version: &str) -> Command {
-		let mut command = Command::new(&self.executable);
+		let mut command =
+			Command::from_std(logged_out_command(&self.executable, self.config_dir.path()));
 		command
 			.env("FILEN_CLI_TESTING_MOCK_VERSION", mock_version)
 			.env("FILEN_CLI_TESTING_RELEASES_URL", format!("{url}/releases"))
 			.env(
 				"FILEN_CLI_TESTING_ANNOUNCEMENTS_URL",
 				format!("{url}/announcements"),
-			)
-			.env("FILEN_CLI_TESTING_DISABLE_KEYRING", "1")
-			.env("FILEN_CLI_TESTING_DISABLE_AUTODETECTED_AUTH_CONFIG", "1")
-			.arg("--config-dir")
-			.arg(self.config_dir.path());
+			);
 		command
 	}
 

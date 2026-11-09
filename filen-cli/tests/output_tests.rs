@@ -9,6 +9,7 @@ use std::{
 };
 
 use assert_fs::TempDir;
+use test_utils::cli::logged_out_command;
 
 /// Runs the CLI on a fresh config directory with `args`, skipping the update check.
 fn run(args: &[&str]) -> Output {
@@ -186,14 +187,7 @@ fn logout_with_yes_deletes_the_credentials_without_a_terminal() {
 #[test]
 fn logging_in_with_no_input_fails_instead_of_prompting() {
 	let config_dir = TempDir::new().unwrap();
-	let output = Command::new(assert_cmd::cargo::cargo_bin!())
-		.env("FILEN_CLI_TESTING_DISABLE_KEYRING", "1")
-		.env("FILEN_CLI_TESTING_DISABLE_AUTODETECTED_AUTH_CONFIG", "1")
-		.env_remove("FILEN_CLI_EMAIL")
-		.env_remove("FILEN_CLI_PASSWORD")
-		.env_remove("FILEN_CLI_2FA_CODE")
-		.arg("--config-dir")
-		.arg(config_dir.path())
+	let output = logged_out_command(assert_cmd::cargo::cargo_bin!(), config_dir.path())
 		.args(["--skip-update", "--no-input", "ls"])
 		.output()
 		.unwrap();
@@ -214,14 +208,7 @@ fn logging_in_with_no_input_fails_instead_of_prompting() {
 /// stdin, so that it fails before it would ask for an email.
 fn run_logged_out(args: &[&str]) -> Output {
 	let config_dir = TempDir::new().unwrap();
-	Command::new(assert_cmd::cargo::cargo_bin!())
-		.env("FILEN_CLI_TESTING_DISABLE_KEYRING", "1")
-		.env("FILEN_CLI_TESTING_DISABLE_AUTODETECTED_AUTH_CONFIG", "1")
-		.env_remove("FILEN_CLI_EMAIL")
-		.env_remove("FILEN_CLI_PASSWORD")
-		.env_remove("FILEN_CLI_2FA_CODE")
-		.arg("--config-dir")
-		.arg(config_dir.path())
+	logged_out_command(assert_cmd::cargo::cargo_bin!(), config_dir.path())
 		.arg("--skip-update")
 		.args(args)
 		.stdin(Stdio::null())
@@ -266,14 +253,7 @@ fn no_input_without_a_command_runs_the_commands_piped_in() {
 /// piped into it.
 fn run_script(args: &[&str], script: &str) -> Output {
 	let config_dir = TempDir::new().unwrap();
-	let mut cli = Command::new(assert_cmd::cargo::cargo_bin!())
-		.env("FILEN_CLI_TESTING_DISABLE_KEYRING", "1")
-		.env("FILEN_CLI_TESTING_DISABLE_AUTODETECTED_AUTH_CONFIG", "1")
-		.env_remove("FILEN_CLI_EMAIL")
-		.env_remove("FILEN_CLI_PASSWORD")
-		.env_remove("FILEN_CLI_2FA_CODE")
-		.arg("--config-dir")
-		.arg(config_dir.path())
+	let mut cli = logged_out_command(assert_cmd::cargo::cargo_bin!(), config_dir.path())
 		.arg("--skip-update")
 		.args(args)
 		.stdin(Stdio::piped())

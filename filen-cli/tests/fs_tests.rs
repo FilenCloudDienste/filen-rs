@@ -22,26 +22,13 @@ use filen_sdk_rs::{
 	sync::lock::ResourceLock,
 };
 use filen_types::fs::ParentUuid;
-use test_utils::{authenticated_cli_with_args, cli::run_authenticated_cli_with_args};
-
-/// Uploads `content` as `name` into `parent`.
-async fn upload(
-	client: &Client,
-	parent: &RemoteDirectory,
-	name: &str,
-	content: &[u8],
-) -> RemoteFile {
-	let builder = client.make_file_builder(name, parent.uuid()).unwrap();
-	client.upload_file(builder, content).await.unwrap()
-}
-
-/// The content of the file at `path`.
-async fn content_at(client: &Client, path: &str) -> Vec<u8> {
-	let Some(NonRootFileType::File(file)) = client.find_item_at_path(path).await.unwrap() else {
-		panic!("Expected a file at {path}");
-	};
-	client.download_file(file.as_ref()).await.unwrap()
-}
+use test_utils::{
+	authenticated_cli_with_args,
+	cli::{
+		exists, file_content, is_file, is_in_trash, logged_out_command,
+		run_authenticated_cli_with_args, stderr_of, stdout_of, upload,
+	},
+};
 
 #[shared_test_runtime]
 async fn mv_into_a_directory_named_with_a_trailing_slash_keeps_the_source_name() {
@@ -63,13 +50,7 @@ async fn mv_into_a_directory_named_with_a_trailing_slash_keeps_the_source_name()
 	)
 	.success();
 
-	assert!(matches!(
-		client
-			.find_item_at_path(&format!("{test_dir}/dest/a.txt"))
-			.await
-			.unwrap(),
-		Some(NonRootFileType::File(_))
-	));
+	assert!(is_file(client, &format!("{test_dir}/dest/a.txt")).await);
 }
 
 #[shared_test_runtime]
@@ -92,20 +73,8 @@ async fn mv_with_an_invalid_name_into_another_directory_fails_without_moving() {
 	)
 	.failure();
 
-	assert!(matches!(
-		client
-			.find_item_at_path(&format!("{test_dir}/a.txt"))
-			.await
-			.unwrap(),
-		Some(NonRootFileType::File(_))
-	));
-	assert!(
-		client
-			.find_item_at_path(&format!("{test_dir}/dest/a.txt"))
-			.await
-			.unwrap()
-			.is_none()
-	);
+	assert!(is_file(client, &format!("{test_dir}/a.txt")).await);
+	assert!(!exists(client, &format!("{test_dir}/dest/a.txt")).await);
 }
 
 #[shared_test_runtime]
@@ -127,20 +96,8 @@ async fn mv_to_a_missing_directory_named_with_a_trailing_slash_fails_without_ren
 		"No such destination directory: {test_dir}/missing"
 	)));
 
-	assert!(matches!(
-		client
-			.find_item_at_path(&format!("{test_dir}/a.txt"))
-			.await
-			.unwrap(),
-		Some(NonRootFileType::File(_))
-	));
-	assert!(
-		client
-			.find_item_at_path(&format!("{test_dir}/missing"))
-			.await
-			.unwrap()
-			.is_none()
-	);
+	assert!(is_file(client, &format!("{test_dir}/a.txt")).await);
+	assert!(!exists(client, &format!("{test_dir}/missing")).await);
 }
 
 #[shared_test_runtime]
@@ -172,13 +129,7 @@ async fn mkdir_recursive_with_an_invalid_name_fails_without_creating_parents() {
 
 	authenticated_cli_with_args!("mkdir", "-r", &format!("{test_dir}/a/b/c.")).failure();
 
-	assert!(
-		client
-			.find_item_at_path(&format!("{test_dir}/a"))
-			.await
-			.unwrap()
-			.is_none()
-	);
+	assert!(!exists(client, &format!("{test_dir}/a")).await);
 }
 
 #[shared_test_runtime]
@@ -295,13 +246,7 @@ async fn cp_refuses_a_directory_whose_name_exists_in_the_destination() {
 		"Destination already exists: {test_dir}/dest/src"
 	)));
 
-	assert!(
-		client
-			.find_item_at_path(&format!("{test_dir}/dest/src/inner.txt"))
-			.await
-			.unwrap()
-			.is_none()
-	);
+	assert!(!exists(client, &format!("{test_dir}/dest/src/inner.txt")).await);
 }
 
 #[shared_test_runtime]
@@ -327,13 +272,7 @@ async fn mv_refuses_a_destination_whose_name_differs_only_in_case() {
 		"Destination already exists: {test_dir}/dest/A.TXT"
 	)));
 
-	assert!(matches!(
-		client
-			.find_item_at_path(&format!("{test_dir}/a.txt"))
-			.await
-			.unwrap(),
-		Some(NonRootFileType::File(_))
-	));
+	assert!(is_file(client, &format!("{test_dir}/a.txt")).await);
 }
 
 #[shared_test_runtime]
@@ -352,13 +291,7 @@ async fn mv_renames_an_item_to_a_name_differing_only_in_case() {
 	)
 	.success();
 
-	assert!(matches!(
-		client
-			.find_item_at_path(&format!("{test_dir}/A.txt"))
-			.await
-			.unwrap(),
-		Some(NonRootFileType::File(_))
-	));
+	assert!(is_file(client, &format!("{test_dir}/A.txt")).await);
 }
 
 #[shared_test_runtime]
@@ -382,11 +315,11 @@ async fn cp_copies_a_file_into_a_directory() {
 	)));
 
 	assert_eq!(
-		content_at(client, &format!("{test_dir}/dest/a.txt")).await,
+		file_content(client, &format!("{test_dir}/dest/a.txt")).await,
 		b"the file to copy"
 	);
 	assert_eq!(
-		content_at(client, &format!("{test_dir}/a.txt")).await,
+		file_content(client, &format!("{test_dir}/a.txt")).await,
 		b"the file to copy"
 	);
 }
@@ -426,11 +359,11 @@ async fn cp_copies_a_nested_directory_with_identical_content() {
 	)));
 
 	assert_eq!(
-		content_at(client, &format!("{test_dir}/dest/src/top.txt")).await,
+		file_content(client, &format!("{test_dir}/dest/src/top.txt")).await,
 		b"at the top"
 	);
 	assert_eq!(
-		content_at(
+		file_content(
 			client,
 			&format!("{test_dir}/dest/src/sub/deeper/binary.bin")
 		)
@@ -460,16 +393,10 @@ async fn cp_copies_a_file_to_a_new_name() {
 	)));
 
 	assert_eq!(
-		content_at(client, &format!("{test_dir}/dest/b.txt")).await,
+		file_content(client, &format!("{test_dir}/dest/b.txt")).await,
 		b"copied under a new name"
 	);
-	assert!(
-		client
-			.find_item_at_path(&format!("{test_dir}/dest/a.txt"))
-			.await
-			.unwrap()
-			.is_none()
-	);
+	assert!(!exists(client, &format!("{test_dir}/dest/a.txt")).await);
 }
 
 #[shared_test_runtime]
@@ -492,13 +419,7 @@ async fn cp_copies_a_directory_to_a_new_name_next_to_it() {
 	)
 	.success();
 
-	assert!(matches!(
-		client
-			.find_item_at_path(&format!("{test_dir}/copy/inner.txt"))
-			.await
-			.unwrap(),
-		Some(NonRootFileType::File(_))
-	));
+	assert!(is_file(client, &format!("{test_dir}/copy/inner.txt")).await);
 }
 
 #[shared_test_runtime]
@@ -524,13 +445,7 @@ async fn cp_refuses_a_new_path_whose_name_exists_in_its_directory() {
 		"Destination already exists: {test_dir}/b.txt"
 	)));
 
-	assert!(
-		client
-			.find_item_at_path(&format!("{test_dir}/B.TXT"))
-			.await
-			.unwrap()
-			.is_none()
-	);
+	assert!(!exists(client, &format!("{test_dir}/B.TXT")).await);
 }
 
 #[shared_test_runtime]
@@ -556,13 +471,7 @@ async fn cp_refuses_to_copy_a_directory_into_itself() {
 		"Cannot copy {test_dir}/src into itself: {test_dir}/src/copy"
 	)));
 
-	assert!(
-		client
-			.find_item_at_path(&format!("{test_dir}/src/copy"))
-			.await
-			.unwrap()
-			.is_none()
-	);
+	assert!(!exists(client, &format!("{test_dir}/src/copy")).await);
 }
 
 /// Unix only: the CLI is interrupted the way a user interrupts it, with SIGINT.
@@ -606,12 +515,7 @@ async fn cp_interrupted_by_ctrl_c_stops_and_says_what_it_copied() {
 		.spawn()
 		.unwrap();
 	let deadline = Instant::now() + Duration::from_secs(120);
-	while client
-		.find_item_at_path(&format!("{test_dir}/copy"))
-		.await
-		.unwrap()
-		.is_none()
-	{
+	while !exists(client, &format!("{test_dir}/copy")).await {
 		assert!(
 			Instant::now() < deadline && cli.try_wait().unwrap().is_none(),
 			"the copy never started"
@@ -653,14 +557,6 @@ async fn lock_trash(client: &Client) -> Arc<ResourceLock> {
 		.acquire_lock_with_default(test_utils::locks::TRASH)
 		.await
 		.unwrap()
-}
-
-async fn is_in_trash(client: &Client, file: &RemoteFile) -> bool {
-	let (_, files) = client
-		.list_trash(None::<&fn(u64, Option<u64>)>)
-		.await
-		.unwrap();
-	files.iter().any(|trashed| trashed.uuid() == file.uuid())
 }
 
 #[shared_test_runtime]
@@ -847,7 +743,7 @@ async fn list_trash_long_shows_the_size_and_modified_date() {
 	client.trash_file(&mut file).await.unwrap();
 
 	let assert = authenticated_cli_with_args!("list-trash", "-l").success();
-	let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+	let stdout = stdout_of(&assert);
 	let line = stdout
 		.lines()
 		.find(|line| line.ends_with(&format!("  {name}")))
@@ -863,19 +759,15 @@ async fn list_trash_long_shows_the_size_and_modified_date() {
 /// Runs the CLI with `args`, logged out and with no terminal on stdin.
 fn run_logged_out_without_a_terminal(args: &[&str]) -> std::process::Output {
 	let config_dir = assert_fs::TempDir::new().unwrap();
-	std::process::Command::new(env!("CARGO_BIN_EXE_filen-cli"))
-		.env("FILEN_CLI_TESTING_DISABLE_KEYRING", "1")
-		.env("FILEN_CLI_TESTING_DISABLE_AUTODETECTED_AUTH_CONFIG", "1")
-		.env_remove("FILEN_CLI_EMAIL")
-		.env_remove("FILEN_CLI_PASSWORD")
-		.env_remove("FILEN_CLI_2FA_CODE")
-		.arg("--config-dir")
-		.arg(config_dir.path())
-		.arg("--skip-update")
-		.args(args)
-		.stdin(std::process::Stdio::null())
-		.output()
-		.unwrap()
+	logged_out_command(
+		std::path::Path::new(env!("CARGO_BIN_EXE_filen-cli")),
+		config_dir.path(),
+	)
+	.arg("--skip-update")
+	.args(args)
+	.stdin(std::process::Stdio::null())
+	.output()
+	.unwrap()
 }
 
 #[test]
@@ -984,7 +876,7 @@ async fn ls_long_shows_the_modified_date_and_marks_favorites() {
 	upload(client, &resources.dir, "b.txt", b"content").await;
 
 	let assert = authenticated_cli_with_args!("ls", "-l", &test_dir).success();
-	let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+	let stdout = stdout_of(&assert);
 	let lines = stdout.lines().collect::<Vec<&str>>();
 	assert_eq!(lines.len(), 2, "{stdout}");
 	assert_eq!(lines[0], "7 B  2024-03-09 10:20:30 (UTC)  a.txt (*)");
@@ -1188,10 +1080,10 @@ async fn write_writes_its_arguments_joined_by_spaces() {
 	authenticated_cli_with_args!("write", &path, "hello", "world")
 		.success()
 		.stdout(predicates::str::contains(format!("Wrote to {path}")));
-	assert_eq!(content_at(client, &path).await, b"hello world");
+	assert_eq!(file_content(client, &path).await, b"hello world");
 
 	authenticated_cli_with_args!("write", &path, "replaced").success();
-	assert_eq!(content_at(client, &path).await, b"replaced");
+	assert_eq!(file_content(client, &path).await, b"replaced");
 }
 
 #[shared_test_runtime]
@@ -1216,7 +1108,7 @@ async fn write_without_content_arguments_writes_what_stdin_reads() {
 		.success();
 
 	assert!(
-		content_at(client, &path).await == content,
+		file_content(client, &path).await == content,
 		"the written bytes differ"
 	);
 }
@@ -1284,7 +1176,7 @@ async fn touch_on_an_existing_file_keeps_its_content_and_sets_its_modification_d
 	assert_eq!(touched.uuid(), file.uuid());
 	assert!(touched.last_modified().unwrap() > before_touch);
 	assert_eq!(
-		content_at(client, &format!("{test_dir}/a.txt")).await,
+		file_content(client, &format!("{test_dir}/a.txt")).await,
 		b"content"
 	);
 }
@@ -1302,7 +1194,7 @@ async fn touch_creates_an_empty_file() {
 			"Created empty file: {path}"
 		)));
 
-	assert_eq!(content_at(client, &path).await, b"");
+	assert_eq!(file_content(client, &path).await, b"");
 }
 
 #[test]
@@ -1446,7 +1338,7 @@ async fn edit_uploads_what_the_editor_changed_and_leaves_no_temporary_files() {
 		"stdout:\n{stdout}"
 	);
 	assert_eq!(
-		content_at(client, &format!("{test_dir}/a.txt")).await,
+		file_content(client, &format!("{test_dir}/a.txt")).await,
 		b"original\nappended\n"
 	);
 	assert_eq!(files_under(&tmp_dir), Vec::<std::path::PathBuf>::new());
@@ -1544,7 +1436,7 @@ async fn edit_of_a_file_changed_meanwhile_keeps_the_changes_locally() {
 		"stderr:\n{stderr}"
 	);
 	assert_eq!(
-		content_at(client, &format!("{test_dir}/a.txt")).await,
+		file_content(client, &format!("{test_dir}/a.txt")).await,
 		b"theirs\n"
 	);
 	let kept = files_under(&tmp_dir);
@@ -1585,11 +1477,9 @@ async fn search_with_a_limit_below_the_matches_warns_how_many_it_shows() {
 		.await
 		.success();
 
-	let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+	let stdout = stdout_of(&assert);
 	assert_eq!(stdout.lines().count(), 1, "stdout:\n{stdout}");
-	let stderr =
-		console::strip_ansi_codes(&String::from_utf8(assert.get_output().stderr.clone()).unwrap())
-			.into_owned();
+	let stderr = console::strip_ansi_codes(&stderr_of(&assert)).into_owned();
 	assert!(
 		stderr.contains("Showing 1 of 2 results. Use --limit to show more"),
 		"stderr:\n{stderr}"
@@ -1735,7 +1625,7 @@ async fn versions_lists_restores_and_deletes_the_versions_of_a_file() {
 		.stdout(predicates::str::contains(format!(
 			"Restored the version of {path} from "
 		)));
-	assert_eq!(content_at(client, &path).await, b"old");
+	assert_eq!(file_content(client, &path).await, b"old");
 
 	let versions = versions_of(&path).await;
 	let versions = versions.as_array().unwrap();
@@ -1772,7 +1662,7 @@ async fn versions_lists_restores_and_deletes_the_versions_of_a_file() {
 	let versions = versions_of(&path).await;
 	assert_eq!(versions.as_array().unwrap().len(), 1, "{versions}");
 	assert_eq!(versions[0]["uuid"], current_uuid);
-	assert_eq!(content_at(client, &path).await, b"old");
+	assert_eq!(file_content(client, &path).await, b"old");
 }
 
 #[test]
@@ -1818,7 +1708,7 @@ async fn color_sets_a_directorys_color_which_stat_and_ls_show() {
 		"#85bcff"
 	);
 	let assert = authenticated_cli_with_args!("ls", "-l", &test_dir).success();
-	let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+	let stdout = stdout_of(&assert);
 	assert!(stdout.trim_end().ends_with("  docs [#85bcff]"), "{stdout}");
 }
 
@@ -1951,13 +1841,7 @@ async fn commands_find_files_and_directories_named_by_uuid() {
 		.stdout(predicates::str::contains(format!(
 			"Trashed file: {file_operand}"
 		)));
-	assert!(
-		client
-			.find_item_at_path(&format!("{test_dir}/docs/a.txt"))
-			.await
-			.unwrap()
-			.is_none()
-	);
+	assert!(!exists(client, &format!("{test_dir}/docs/a.txt")).await);
 }
 
 #[shared_test_runtime]
@@ -1982,7 +1866,7 @@ async fn mv_moves_an_item_named_by_uuid_into_a_directory_named_by_uuid() {
 	)));
 
 	assert_eq!(
-		content_at(client, &format!("{test_dir}/docs/a.txt")).await,
+		file_content(client, &format!("{test_dir}/docs/a.txt")).await,
 		b"content"
 	);
 }
@@ -2006,7 +1890,7 @@ async fn write_touch_and_mkdir_take_items_named_by_uuid() {
 			"Wrote to {test_dir}/docs/a.txt"
 		)));
 	assert_eq!(
-		content_at(client, &format!("{test_dir}/docs/a.txt")).await,
+		file_content(client, &format!("{test_dir}/docs/a.txt")).await,
 		b"new content"
 	);
 	// writing made a new version, which has a UUID of its own
@@ -2110,11 +1994,6 @@ async fn an_earlier_version_named_by_uuid_is_not_in_the_drive() {
 		)));
 }
 
-/// Whether there is an item at `path`.
-async fn exists(client: &Client, path: &str) -> bool {
-	client.find_item_at_path(path).await.unwrap().is_some()
-}
-
 #[shared_test_runtime]
 async fn rm_deletes_every_item_it_is_given_and_every_item_a_glob_matches() {
 	let resources = test_utils::RESOURCES.get_resources().await;
@@ -2172,9 +2051,7 @@ async fn rm_goes_on_past_an_item_it_cannot_find_and_fails_at_the_end() {
 	.failure();
 
 	assert_eq!(assert.get_output().status.code(), Some(1));
-	let stderr =
-		console::strip_ansi_codes(&String::from_utf8(assert.get_output().stderr.clone()).unwrap())
-			.into_owned();
+	let stderr = console::strip_ansi_codes(&stderr_of(&assert)).into_owned();
 	// in the order the CLI met them, among its log lines
 	let failures = stderr
 		.lines()
@@ -2319,11 +2196,11 @@ async fn cp_copies_every_file_a_glob_matches_into_a_directory() {
 	.success();
 
 	assert_eq!(
-		content_at(client, &format!("{test_dir}/dest/a.txt")).await,
+		file_content(client, &format!("{test_dir}/dest/a.txt")).await,
 		b"a"
 	);
 	assert_eq!(
-		content_at(client, &format!("{test_dir}/dest/b.txt")).await,
+		file_content(client, &format!("{test_dir}/dest/b.txt")).await,
 		b"b"
 	);
 	let (_, files) = client
@@ -2372,7 +2249,7 @@ async fn list_favorites_prints_the_path_of_each_favorited_item() {
 	let assert = authenticated_cli_with_args!("list-favorites").success();
 	// the favorites are the whole account's, so the test looks at its own file only
 	client.set_file_favorite(&mut file, false).await.unwrap();
-	let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+	let stdout = stdout_of(&assert);
 	assert!(
 		stdout
 			.lines()
@@ -2389,7 +2266,7 @@ async fn list_recents_prints_the_path_of_each_recent_item() {
 	upload(client, &resources.dir, "a.txt", b"content").await;
 
 	let assert = authenticated_cli_with_args!("list-recents").success();
-	let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+	let stdout = stdout_of(&assert);
 	assert!(
 		stdout
 			.lines()
@@ -2644,7 +2521,7 @@ async fn cp_copies_an_item_into_a_directory_without_a_path() {
 
 	assert_eq!(file_names_in(client, &sub).await, ["a.txt"]);
 	assert_eq!(
-		content_at(client, &format!("{test_dir}/a.txt")).await,
+		file_content(client, &format!("{test_dir}/a.txt")).await,
 		b"content"
 	);
 }

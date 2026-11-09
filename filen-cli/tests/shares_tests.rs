@@ -15,20 +15,15 @@ use filen_sdk_rs::{
 		HasName as _, HasUUID as _,
 		categories::{RootItemType, Shared},
 	},
-	io::{RemoteDirectory, RemoteFile},
+	io::RemoteDirectory,
 };
 use filen_types::fs::Uuid;
 use futures::FutureExt as _;
 use serde_json::Value;
-use test_utils::authenticated_cli_with_args;
-
-fn stdout_of(assert: &assert_cmd::assert::Assert) -> String {
-	String::from_utf8(assert.get_output().stdout.clone()).unwrap()
-}
-
-fn stderr_of(assert: &assert_cmd::assert::Assert) -> String {
-	String::from_utf8(assert.get_output().stderr.clone()).unwrap()
-}
+use test_utils::{
+	authenticated_cli_with_args,
+	cli::{stderr_of, stdout_of, upload},
+};
 
 fn json_of(assert: &assert_cmd::assert::Assert) -> Value {
 	let stdout = stdout_of(assert);
@@ -49,11 +44,6 @@ fn share_account_cli(share_client: &Client, args: &[&str]) -> assert_cmd::assert
 	// kept until the CLI has read the credentials, then deleted with them
 	drop(temp_dir);
 	assert
-}
-
-async fn upload_file(client: &Client, parent: &RemoteDirectory, name: &str) -> RemoteFile {
-	let file = client.make_file_builder(name, parent.uuid()).unwrap();
-	client.upload_file(file, b"shared").await.unwrap()
 }
 
 /// The absolute path of `name` in the test directory, which is a child of the root.
@@ -176,12 +166,12 @@ async fn share_list_and_unshare_a_file_and_a_directory() {
 	// names only this run uses, as the share account's shared items include other runs'
 	let file_name = format!("{}.txt", test_dir.name().unwrap());
 	let dir_name = format!("{}-dir", test_dir.name().unwrap());
-	let file = upload_file(client, test_dir, &file_name).await;
+	let file = upload(client, test_dir, &file_name, b"shared").await;
 	let dir = client
 		.create_dir(&test_dir.into(), &dir_name)
 		.await
 		.unwrap();
-	let inner = upload_file(client, &dir, "inner.txt").await;
+	let inner = upload(client, &dir, "inner.txt", b"shared").await;
 	let file_path = path_in(test_dir, &file_name);
 	let dir_path = path_in(test_dir, &dir_name);
 	let inner_shared_path = format!("{dir_name}/inner.txt");
@@ -361,7 +351,7 @@ async fn the_share_account_leaves_a_share() {
 
 	// a name only this run uses, as the share account's shared items include other runs'
 	let name = format!("{}.txt", test_dir.name().unwrap());
-	let file = upload_file(client, test_dir, &name).await;
+	let file = upload(client, test_dir, &name, b"shared").await;
 
 	with_contact_and_shares_cleaned_up(client, &share_client, &[file.uuid()], || async {
 		let contact = client
@@ -402,7 +392,7 @@ async fn contacts_lists_the_share_account_and_share_needs_a_contact() {
 	let client = &resources.client;
 	let test_dir = &resources.dir;
 	let share_client = test_utils::SHARE_RESOURCES.client().await;
-	upload_file(client, test_dir, "unshared.txt").await;
+	upload(client, test_dir, "unshared.txt", b"shared").await;
 	let file_path = path_in(test_dir, "unshared.txt");
 
 	with_contact_and_shares_cleaned_up(client, &share_client, &[], || async {

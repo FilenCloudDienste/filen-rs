@@ -7,11 +7,12 @@
 
 use std::{
 	io::{self, Write as _},
-	process::{Command, Output, Stdio},
+	process::{Output, Stdio},
 	sync::{Mutex, PoisonError},
 };
 
 use assert_fs::TempDir;
+use test_utils::cli::logged_out_command;
 
 static SPAWNING: Mutex<()> = Mutex::new(());
 
@@ -23,11 +24,7 @@ fn run_with_closed_stdout(args: &[&str], script: &str) -> Output {
 	// Closing the read end first makes the first write fail, as it does once `head` has its lines.
 	let (reader, writer) = io::pipe().unwrap();
 	drop(reader);
-	let mut cli = Command::new(assert_cmd::cargo::cargo_bin!())
-		.env("FILEN_CLI_TESTING_DISABLE_KEYRING", "1")
-		.env("FILEN_CLI_TESTING_DISABLE_AUTODETECTED_AUTH_CONFIG", "1")
-		.arg("--config-dir")
-		.arg(config_dir.path())
+	let mut cli = logged_out_command(assert_cmd::cargo::cargo_bin!(), config_dir.path())
 		.arg("--skip-update")
 		.args(args)
 		.stdin(Stdio::piped())

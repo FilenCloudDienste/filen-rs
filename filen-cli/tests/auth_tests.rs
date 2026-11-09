@@ -7,7 +7,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use filen_macros::shared_test_runtime;
 use filen_sdk_rs::auth::{Client, TwoFASecret};
 use predicates::prelude::PredicateBooleanExt as _;
-use test_utils::authenticated_cli_with_args;
+use test_utils::{authenticated_cli_with_args, cli::logged_out_command};
 
 fn get_testing_credentials() -> (String, String) {
 	dotenv::dotenv().ok();
@@ -51,31 +51,21 @@ fn authenticate_from_cli_args() {
 fn authenticate_from_the_variables_of_the_old_cli() {
 	let (email, password) = get_testing_credentials();
 	let config_dir = assert_fs::TempDir::new().unwrap();
-	cargo_bin_cmd!()
-		.env("FILEN_CLI_TESTING_DISABLE_KEYRING", "1")
-		.env("FILEN_CLI_TESTING_DISABLE_AUTODETECTED_AUTH_CONFIG", "1")
-		.env_remove("FILEN_CLI_EMAIL")
-		.env_remove("FILEN_CLI_PASSWORD")
-		.env_remove("FILEN_CLI_2FA_CODE")
-		.env("FILEN_EMAIL", &email)
-		.env("FILEN_PASSWORD", &password)
-		.env_remove("FILEN_2FA_CODE")
-		.args([
-			"--skip-update",
-			"--config-dir",
-			config_dir.path().to_str().unwrap(),
-			"-v",
-			"stat",
-			"/",
-		])
-		.assert()
-		.success()
-		.stderr(predicates::str::contains(
-			"Using the credentials from FILEN_EMAIL and FILEN_PASSWORD",
-		))
-		.stderr(predicates::str::contains(
-			"Authenticated from CLI arguments",
-		));
+	assert_cmd::Command::from_std(logged_out_command(
+		assert_cmd::cargo::cargo_bin!(),
+		config_dir.path(),
+	))
+	.env("FILEN_EMAIL", &email)
+	.env("FILEN_PASSWORD", &password)
+	.args(["--skip-update", "-v", "stat", "/"])
+	.assert()
+	.success()
+	.stderr(predicates::str::contains(
+		"Using the credentials from FILEN_EMAIL and FILEN_PASSWORD",
+	))
+	.stderr(predicates::str::contains(
+		"Authenticated from CLI arguments",
+	));
 }
 
 #[shared_test_runtime]
@@ -107,28 +97,21 @@ async fn export_and_authenticate_from_auth_config() {
 fn exporting_an_auth_config_without_yes_fails_before_logging_in() {
 	let config_dir = assert_fs::TempDir::new().unwrap();
 	let path = config_dir.path().join("exported-auth-config.txt");
-	cargo_bin_cmd!()
-		.env("FILEN_CLI_TESTING_DISABLE_KEYRING", "1")
-		.env("FILEN_CLI_TESTING_DISABLE_AUTODETECTED_AUTH_CONFIG", "1")
-		.env_remove("FILEN_CLI_EMAIL")
-		.env_remove("FILEN_CLI_PASSWORD")
-		.env_remove("FILEN_CLI_2FA_CODE")
-		.env_remove("FILEN_EMAIL")
-		.env_remove("FILEN_PASSWORD")
-		.env_remove("FILEN_2FA_CODE")
-		.args([
-			"--skip-update",
-			"--config-dir",
-			config_dir.path().to_str().unwrap(),
-			"export-auth-config",
-			path.to_str().unwrap(),
-		])
-		.assert()
-		.code(2)
-		.stdout("")
-		.stderr(predicates::str::contains("Pass --yes to answer yes."))
-		// the login prompt, which comes after the confirmation
-		.stderr(predicates::str::contains("Not logged in").not());
+	assert_cmd::Command::from_std(logged_out_command(
+		assert_cmd::cargo::cargo_bin!(),
+		config_dir.path(),
+	))
+	.args([
+		"--skip-update",
+		"export-auth-config",
+		path.to_str().unwrap(),
+	])
+	.assert()
+	.code(2)
+	.stdout("")
+	.stderr(predicates::str::contains("Pass --yes to answer yes."))
+	// the login prompt, which comes after the confirmation
+	.stderr(predicates::str::contains("Not logged in").not());
 	assert!(!path.exists());
 }
 
@@ -406,22 +389,11 @@ fn cli_without_stored_credentials(
 	working_dir: &std::path::Path,
 	config_dir: &std::path::Path,
 ) -> assert_cmd::Command {
-	let mut cmd = cargo_bin_cmd!();
-	cmd.current_dir(working_dir)
-		.env("FILEN_CLI_TESTING_DISABLE_KEYRING", "1")
-		.env("FILEN_CLI_TESTING_DISABLE_AUTODETECTED_AUTH_CONFIG", "1")
-		.env_remove("FILEN_CLI_EMAIL")
-		.env_remove("FILEN_CLI_PASSWORD")
-		.env_remove("FILEN_CLI_2FA_CODE")
-		.env_remove("FILEN_CLI_2FA_SECRET")
-		.env_remove("FILEN_EMAIL")
-		.env_remove("FILEN_PASSWORD")
-		.env_remove("FILEN_2FA_CODE")
-		.args([
-			"--skip-update",
-			"--config-dir",
-			config_dir.to_str().unwrap(),
-		]);
+	let mut cmd = assert_cmd::Command::from_std(logged_out_command(
+		assert_cmd::cargo::cargo_bin!(),
+		config_dir,
+	));
+	cmd.current_dir(working_dir).arg("--skip-update");
 	cmd
 }
 

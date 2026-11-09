@@ -6,11 +6,7 @@ use std::process::{Command, Stdio};
 use assert_fs::TempDir;
 use filen_macros::shared_test_runtime;
 use serde_json::Value;
-use test_utils::authenticated_cli_with_args;
-
-fn stdout_of(assert: &assert_cmd::assert::Assert) -> String {
-	String::from_utf8(assert.get_output().stdout.clone()).unwrap()
-}
+use test_utils::{authenticated_cli_with_args, cli::stdout_of};
 
 fn json_of(assert: &assert_cmd::assert::Assert) -> Value {
 	let stdout = stdout_of(assert);

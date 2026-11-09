@@ -15,12 +15,11 @@ use std::{
 use filen_cli::uuid_v5;
 use filen_macros::shared_test_runtime;
 use filen_sdk_rs::{
-	auth::Client,
 	fs::{HasName, HasUUID, categories::NonRootFileType},
-	io::client_impl::IoSharedClientExt as _,
 	sync_engine::SyncEngine,
 };
 use filen_types::fs::Uuid;
+use test_utils::cli::{exists, file_content, file_uuid};
 use tokio::sync::RwLock;
 
 #[shared_test_runtime]
@@ -53,7 +52,7 @@ async fn sync_once_brings_both_sides_across_and_exits_0() {
 		"from the remote side"
 	);
 	assert_eq!(
-		remote_content(client, &format!("{test_dir_name}/from_local.txt")).await,
+		file_content(client, &format!("{test_dir_name}/from_local.txt")).await,
 		b"from the local side"
 	);
 }
@@ -156,7 +155,7 @@ async fn sync_once_applies_a_conflict_resolution_before_it_exits() {
 
 	assert_success(&output);
 	assert_eq!(
-		remote_content(&resources.client, &format!("{test_dir_name}/fight.txt")).await,
+		file_content(&resources.client, &format!("{test_dir_name}/fight.txt")).await,
 		b"the local edit"
 	);
 }
@@ -176,7 +175,7 @@ async fn sync_applies_a_conflict_resolution_while_it_watches() {
 		config_dir.path(),
 		&["--pair", &pair, "--keep-local", "fight.txt"],
 		Duration::from_secs(120),
-		async || remote_content(client, &remote_path).await == b"the local edit",
+		async || file_content(client, &remote_path).await == b"the local edit",
 	)
 	.await;
 
@@ -289,19 +288,15 @@ async fn sync_once_with_exclude_dot_files_keeps_dot_files_local() {
 		".*\n!/.filenignore\n"
 	);
 	assert_eq!(
-		remote_content(client, &format!("{test_dir_name}/visible.txt")).await,
+		file_content(client, &format!("{test_dir_name}/visible.txt")).await,
 		b"goes up"
 	);
 	assert_eq!(
-		remote_content(client, &format!("{test_dir_name}/.filenignore")).await,
+		file_content(client, &format!("{test_dir_name}/.filenignore")).await,
 		b".*\n!/.filenignore\n"
 	);
 	assert!(
-		client
-			.find_item_at_path(&format!("{test_dir_name}/.secret"))
-			.await
-			.unwrap()
-			.is_none(),
+		!exists(client, &format!("{test_dir_name}/.secret")).await,
 		"{}",
 		describe(&output)
 	);
@@ -330,7 +325,7 @@ async fn sync_once_with_yes_creates_a_missing_remote_directory() {
 		describe(&output)
 	);
 	assert_eq!(
-		remote_content(client, &format!("{remote}/up.txt")).await,
+		file_content(client, &format!("{remote}/up.txt")).await,
 		b"goes up"
 	);
 }
@@ -386,14 +381,7 @@ async fn sync_once_without_yes_or_a_terminal_leaves_a_missing_remote_directory_a
 		"{}",
 		describe(&output)
 	);
-	assert!(
-		resources
-			.client
-			.find_item_at_path(&remote)
-			.await
-			.unwrap()
-			.is_none()
-	);
+	assert!(!exists(&resources.client, &remote).await);
 }
 
 /// The state the TypeScript CLI kept for a pair, under the uuid of the pair as it was given, is
@@ -472,7 +460,7 @@ async fn set_sync_mode_switches_a_registered_pair_from_its_next_pass() {
 	.await;
 	assert_success(&output);
 	assert_eq!(
-		remote_content(&resources.client, &format!("{test_dir_name}/kept.txt")).await,
+		file_content(&resources.client, &format!("{test_dir_name}/kept.txt")).await,
 		b"backed up"
 	);
 }
@@ -549,7 +537,7 @@ async fn a_listed_conflict_is_resolved_by_resolve_sync_conflict() {
 	assert_success(&resolved);
 	assert_success(&sync_once(config_dir.path(), &pair, &[]).await);
 	assert_eq!(
-		remote_content(&resources.client, &format!("{test_dir_name}/fight.txt")).await,
+		file_content(&resources.client, &format!("{test_dir_name}/fight.txt")).await,
 		b"the local edit"
 	);
 }
@@ -578,14 +566,7 @@ async fn a_paused_pair_is_left_alone_until_it_is_resumed() {
 		"{}",
 		describe(&paused)
 	);
-	assert!(
-		resources
-			.client
-			.find_item_at_path(&format!("{test_dir_name}/later.txt"))
-			.await
-			.unwrap()
-			.is_none()
-	);
+	assert!(!exists(&resources.client, &format!("{test_dir_name}/later.txt")).await);
 	// nor does a dry run plan a pass that `sync` would not run
 	let dry_run = sync(config_dir.path(), &["--dry-run", &pair]).await;
 	assert_success(&dry_run);
@@ -602,7 +583,7 @@ async fn a_paused_pair_is_left_alone_until_it_is_resumed() {
 	assert_success(&filen(config_dir.path(), &["resume-sync-pair", "1"]).await);
 	assert_success(&sync_once(config_dir.path(), &pair, &[]).await);
 	assert_eq!(
-		remote_content(&resources.client, &format!("{test_dir_name}/later.txt")).await,
+		file_content(&resources.client, &format!("{test_dir_name}/later.txt")).await,
 		b"after the pause"
 	);
 }
@@ -627,12 +608,7 @@ async fn sync_dry_run_prints_the_planned_upload_and_transfers_nothing() {
 		describe(&output)
 	);
 	assert!(
-		resources
-			.client
-			.find_item_at_path(&format!("{test_dir_name}/planned.txt"))
-			.await
-			.unwrap()
-			.is_none(),
+		!exists(&resources.client, &format!("{test_dir_name}/planned.txt")).await,
 		"{}",
 		describe(&output)
 	);
@@ -652,7 +628,7 @@ async fn sync_once_trashes_on_the_remote_a_file_deleted_locally() {
 	let pair = format!("{}:{test_dir_name}", local.path().to_str().unwrap());
 	assert_success(&sync_once(config_dir.path(), &pair, &[]).await);
 	let gone_path = format!("{test_dir_name}/gone.txt");
-	let gone_uuid = remote_file_uuid(client, &gone_path).await;
+	let gone_uuid = file_uuid(client, &gone_path).await;
 
 	std::fs::remove_file(local.path().join("gone.txt")).unwrap();
 	let output = sync_once(config_dir.path(), &pair, &[]).await;
@@ -663,15 +639,7 @@ async fn sync_once_trashes_on_the_remote_a_file_deleted_locally() {
 		"{}",
 		describe(&output)
 	);
-	assert!(
-		client
-			.find_item_at_path(&gone_path)
-			.await
-			.unwrap()
-			.is_none(),
-		"{}",
-		describe(&output)
-	);
+	assert!(!exists(client, &gone_path).await, "{}", describe(&output));
 	let (_, trashed) = client
 		.list_trash(None::<&fn(u64, Option<u64>)>)
 		.await
@@ -682,7 +650,7 @@ async fn sync_once_trashes_on_the_remote_a_file_deleted_locally() {
 		describe(&output)
 	);
 	assert_eq!(
-		remote_content(client, &format!("{test_dir_name}/kept.txt")).await,
+		file_content(client, &format!("{test_dir_name}/kept.txt")).await,
 		b"stays"
 	);
 }
@@ -721,7 +689,7 @@ async fn sync_once_holds_a_mass_deletion_until_it_is_approved() {
 		describe(&held)
 	);
 	assert_eq!(
-		remote_content(client, &format!("{test_dir_name}/doomed_00.txt")).await,
+		file_content(client, &format!("{test_dir_name}/doomed_00.txt")).await,
 		b"doomed_00.txt"
 	);
 
@@ -730,17 +698,13 @@ async fn sync_once_holds_a_mass_deletion_until_it_is_approved() {
 	assert_success(&approved);
 	for name in &doomed {
 		assert!(
-			client
-				.find_item_at_path(&format!("{test_dir_name}/{name}"))
-				.await
-				.unwrap()
-				.is_none(),
+			!exists(client, &format!("{test_dir_name}/{name}")).await,
 			"{name} is still on the remote\n{}",
 			describe(&approved)
 		);
 	}
 	assert_eq!(
-		remote_content(client, &format!("{test_dir_name}/kept.txt")).await,
+		file_content(client, &format!("{test_dir_name}/kept.txt")).await,
 		b"stays"
 	);
 }
@@ -762,7 +726,7 @@ async fn sync_once_keeps_the_remote_version_of_a_conflict_with_keep_remote() {
 		"the remote edit, which is longer"
 	);
 	assert_eq!(
-		remote_content(&resources.client, &format!("{test_dir_name}/fight.txt")).await,
+		file_content(&resources.client, &format!("{test_dir_name}/fight.txt")).await,
 		b"the remote edit, which is longer"
 	);
 	assert_eq!(
@@ -842,13 +806,7 @@ async fn sync_watches_only_the_pairs_it_is_given() {
 		config_dir.path(),
 		&["--pair", &given, "--yes"],
 		Duration::from_secs(120),
-		async || {
-			client
-				.find_item_at_path(&given_path)
-				.await
-				.unwrap()
-				.is_some()
-		},
+		async || exists(client, &given_path).await,
 	)
 	.await;
 
@@ -868,11 +826,7 @@ async fn sync_watches_only_the_pairs_it_is_given() {
 	);
 	// a weaker check, as it races with the stop: nothing of the earlier pair was uploaded
 	assert!(
-		client
-			.find_item_at_path(&format!("{test_dir_name}/earlier/later.txt"))
-			.await
-			.unwrap()
-			.is_none(),
+		!exists(client, &format!("{test_dir_name}/earlier/later.txt")).await,
 		"{}",
 		describe(&output)
 	);
@@ -902,22 +856,13 @@ async fn sync_with_watch_timings_syncs_a_change_made_while_it_watches() {
 		Duration::from_secs(120),
 		async || {
 			if !wrote_second {
-				if client
-					.find_item_at_path(&first_path)
-					.await
-					.unwrap()
-					.is_some()
-				{
+				if exists(client, &first_path).await {
 					std::fs::write(local.path().join("second.txt"), "second").unwrap();
 					wrote_second = true;
 				}
 				return false;
 			}
-			client
-				.find_item_at_path(&second_path)
-				.await
-				.unwrap()
-				.is_some()
+			exists(client, &second_path).await
 		},
 	)
 	.await;
@@ -958,15 +903,11 @@ async fn sync_once_local_to_remote_mirrors_the_local_side() {
 
 	assert_success(&output);
 	assert_eq!(
-		remote_content(client, &format!("{test_dir_name}/second.txt")).await,
+		file_content(client, &format!("{test_dir_name}/second.txt")).await,
 		b"second pass"
 	);
 	assert!(
-		client
-			.find_item_at_path(&format!("{test_dir_name}/remote_only.txt"))
-			.await
-			.unwrap()
-			.is_none(),
+		!exists(client, &format!("{test_dir_name}/remote_only.txt")).await,
 		"{}",
 		describe(&output)
 	);
@@ -1014,11 +955,7 @@ async fn sync_once_remote_to_local_mirrors_the_remote_side() {
 		describe(&output)
 	);
 	assert!(
-		client
-			.find_item_at_path(&format!("{test_dir_name}/local_only.txt"))
-			.await
-			.unwrap()
-			.is_none(),
+		!exists(client, &format!("{test_dir_name}/local_only.txt")).await,
 		"{}",
 		describe(&output)
 	);
@@ -1201,20 +1138,6 @@ fn describe(output: &Output) -> String {
 		String::from_utf8_lossy(&output.stdout),
 		String::from_utf8_lossy(&output.stderr)
 	)
-}
-
-async fn remote_content(client: &Client, path: &str) -> Vec<u8> {
-	match client.find_item_at_path(path).await.unwrap() {
-		Some(NonRootFileType::File(file)) => client.download_file(file.as_ref()).await.unwrap(),
-		other => panic!("expected a file at {path}, got {other:?}"),
-	}
-}
-
-async fn remote_file_uuid(client: &Client, path: &str) -> Uuid {
-	match client.find_item_at_path(path).await.unwrap() {
-		Some(NonRootFileType::File(file)) => file.uuid(),
-		other => panic!("expected a file at {path}, got {other:?}"),
-	}
 }
 
 /// The contents of the copies of `rel_path` in the local trash of the pair rooted at `local_root`,
