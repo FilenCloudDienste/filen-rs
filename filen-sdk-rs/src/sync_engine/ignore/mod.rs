@@ -649,8 +649,6 @@ fn too_large() -> String {
 	format!("larger than {MAX_RULE_FILE_BYTES} bytes, not read")
 }
 
-/// The root-relative directory a `.filenignore` at `rel_path` belongs to, or `None` for any other
-/// path.
 /// The `.filenignore` files a pass offers [`load_remote_rules`], and the view they sit in.
 ///
 /// The two travel together because neither answers alone: the paths say WHICH nodes to consider,
@@ -678,6 +676,8 @@ pub(crate) fn rule_file_paths(view: &RemoteView, baseline: &Baseline) -> Vec<Str
 		.collect()
 }
 
+/// The root-relative directory a `.filenignore` at `rel_path` belongs to, or `None` for any other
+/// path.
 pub(crate) fn rule_file_dir(rel_path: &str) -> Option<&str> {
 	match rel_path.strip_suffix(FILENIGNORE)? {
 		"" => Some(""),

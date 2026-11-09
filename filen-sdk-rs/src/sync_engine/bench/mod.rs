@@ -1858,8 +1858,8 @@ fn remote_delta(lines: &[RemoteLine]) -> Vec<RemoteDeltaEntry> {
 }
 
 /// One announced remote change per picked file, carrying content matching NEITHER the baseline row
-/// nor what the harness just wrote locally — so each path is a genuine both-sides-changed conflict
-/// rather than one side agreeing with the row.
+/// nor what the harness just wrote locally. The engine still plans one action per path and no
+/// conflict, as [`Change::BothSidesPerMille`] documents.
 fn remote_edits(
 	fixture: &Fixture,
 	rows: &[BaselineEntry],
@@ -1897,7 +1897,6 @@ fn remote_edits(
 		.collect()
 }
 
-/// What `scenario`'s change class does to the fixture ON DISK, applied once before any sample runs.
 /// Rewrite the LAST files of `rows` the way an unconfirmed push of ours leaves them, and answer how
 /// many that was (see [`Change::AfterUpload`]).
 ///
@@ -1930,6 +1929,7 @@ fn leave_unconfirmed_pushes(rows: &mut [BaselineEntry], scenario: &Scenario) -> 
 	wanted
 }
 
+/// What `scenario`'s change class does to the fixture ON DISK, applied once before any sample runs.
 fn apply_change(fixture: &Fixture, rows: &[BaselineEntry], scenario: &Scenario) -> Applied {
 	let root = fixture.root();
 	assert!(
@@ -2566,7 +2566,8 @@ async fn measure_in_child(floor: u64, handover: &Handover) -> MemAnswer {
 	);
 	assert_eq!(
 		rows, handover.rows,
-		"the child loaded {rows} row(s) where its parent seeded {}: it is not reading the tree the 		 scenario built",
+		"the child loaded {rows} row(s) where its parent seeded {}: it is not reading the tree the \
+		 scenario built",
 		handover.rows
 	);
 	let pair_loaded_rss = probe::current_rss_bytes();
