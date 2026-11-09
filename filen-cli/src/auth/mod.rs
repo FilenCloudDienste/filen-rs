@@ -1413,65 +1413,131 @@ fn logout_from(
 	cache: CacheAccess,
 	mut confirm: impl FnMut(&mut UI, &str) -> Result<bool>,
 ) -> Result<LogoutOutcome> {
-	let outcome = delete_credentials(config, ui, &stored, &mut confirm)?;
-	offer_to_delete_cache(
+	let (outcome, keyring_error) = delete_credentials(config, ui, &stored, &mut confirm)?;
+	let cache_result = offer_to_delete_cache(
 		ui,
 		&config.config_dir.join(CACHE_FILE_NAME),
 		cache,
 		&mut confirm,
-	)?;
-	Ok(outcome)
+	);
+	match keyring_error {
+		Some(keyring_error) => {
+			// the credentials left in the keyring matter more than the cache
+			if let Err(e) = cache_result {
+				log::warn!("Failed to delete the local cache: {e:#}");
+			}
+			Err(keyring_error)
+		}
+		None => cache_result.map(|()| outcome),
+	}
 }
 
-/// The credentials part of [`logout_from`].
+/// What reading the keyring entry found, when it may hold credentials.
+enum KeyringRead {
+	Found,
+	/// The entry could not be read, so it may hold credentials, which deleting it may still remove.
+	Failed(anyhow::Error),
+}
+
+/// Whether `error`, from reading the keyring, says that the keyring cannot be reached, as on a host
+/// with no keyring service, rather than that an entry it holds cannot be read.
+fn keyring_unreachable(error: &anyhow::Error) -> bool {
+	matches!(
+		error.downcast_ref::<keyring::Error>(),
+		Some(keyring::Error::NoStorageAccess(_) | keyring::Error::PlatformFailure(_))
+	)
+}
+
+/// The credentials part of [`logout_from`]. A keyring entry that cannot be read is still offered
+/// for deletion, unless the keyring itself cannot be reached. A failure to delete the keyring entry, or to remove one that could not be read, is
+/// returned beside the outcome rather than as the error, so that the auth config files and the
+/// cache are still offered. After one, a failure to delete an auth config file is logged instead.
 fn delete_credentials(
 	config: &CliConfig,
 	ui: &mut UI,
 	stored: &StoredCredentials<'_>,
 	confirm: &mut impl FnMut(&mut UI, &str) -> Result<bool>,
-) -> Result<LogoutOutcome> {
+) -> Result<(LogoutOutcome, Option<anyhow::Error>)> {
 	let mut found_any_credentials = false;
 	let mut deleted_any_credentials = false;
-	if let Some(keyring_entry) = stored.keyring_entry
-		&& let Ok(Some(_)) = keyring_entry.read()
-	{
-		found_any_credentials = true;
-		if confirm(ui, "Delete credentials stored in system keyring?")? {
-			let deleted = keyring_entry
-				.delete()
-				.context("Failed to delete SDK config from keyring")?;
-			if deleted {
-				deleted_any_credentials = true;
-				ui.print_success("Credentials deleted from keyring");
-			} else {
-				ui.print_failure("No credentials found in keyring");
+	let mut keyring_error = None;
+	if let Some(keyring_entry) = stored.keyring_entry {
+		let read = match keyring_entry.read() {
+			Ok(Some(_)) => Some(KeyringRead::Found),
+			Ok(None) => None,
+			Err(e) => {
+				// the keyring may hold credentials, so this is not reported as finding none
+				ui.print_warning(&format!("Could not read the system keyring: {e:#}"));
+				found_any_credentials = true;
+				// deleting may still remove an entry that cannot be read, as one that cannot be
+				// decoded, but not one in a keyring that cannot be reached at all
+				(!keyring_unreachable(&e)).then(|| KeyringRead::Failed(e))
 			}
-		}
-	}
-	for path in auth_config_files(stored.given_auth_config, config) {
-		if path.exists() {
+		};
+		if let Some(read) = read {
 			found_any_credentials = true;
-			if confirm(
-				ui,
-				&format!("Delete auth config file at {}?", path.display()),
-			)? {
-				std::fs::remove_file(&path).with_context(|| {
-					format!("Failed to delete auth config file at {}", path.display())
-				})?;
-				deleted_any_credentials = true;
-				ui.print_success(&format!("Deleted auth config file at {}", path.display()));
+			if confirm(ui, "Delete credentials stored in system keyring?")? {
+				match (keyring_entry.delete(), read) {
+					(Ok(true), _) => {
+						deleted_any_credentials = true;
+						ui.print_success("Credentials deleted from keyring");
+					}
+					(Ok(false), KeyringRead::Found) => {
+						ui.print_failure("No credentials found in keyring");
+					}
+					(Ok(false), KeyringRead::Failed(read_error)) => {
+						keyring_error = Some(read_error.context(
+							"Could not read the system keyring, and it held no entry to delete",
+						));
+					}
+					(Err(e), KeyringRead::Found) => {
+						keyring_error = Some(e.context("Failed to delete SDK config from keyring"));
+					}
+					(Err(e), KeyringRead::Failed(read_error)) => {
+						keyring_error = Some(e.context(format!(
+							"Could not read the system keyring ({read_error:#}), and deleting its \
+							 entry failed"
+						)));
+					}
+				}
 			}
 		}
 	}
-	if deleted_any_credentials {
-		Ok(LogoutOutcome::Deleted)
+	let auth_config_result = (|| -> Result<()> {
+		for path in auth_config_files(stored.given_auth_config, config) {
+			if path.exists() {
+				found_any_credentials = true;
+				if confirm(
+					ui,
+					&format!("Delete auth config file at {}?", path.display()),
+				)? {
+					std::fs::remove_file(&path).with_context(|| {
+						format!("Failed to delete auth config file at {}", path.display())
+					})?;
+					deleted_any_credentials = true;
+					ui.print_success(&format!("Deleted auth config file at {}", path.display()));
+				}
+			}
+		}
+		Ok(())
+	})();
+	if let Err(e) = auth_config_result {
+		if keyring_error.is_none() {
+			return Err(e);
+		}
+		// the credentials left in the keyring matter more, so their error is the one returned
+		log::warn!("{e:#}");
+	}
+	let outcome = if deleted_any_credentials {
+		LogoutOutcome::Deleted
 	} else if found_any_credentials {
 		ui.print_muted("Nothing deleted");
-		Ok(LogoutOutcome::NothingDeleted)
+		LogoutOutcome::NothingDeleted
 	} else {
 		ui.print_muted("No credentials found in system keyring or auth config default locations");
-		Ok(LogoutOutcome::NothingFound)
-	}
+		LogoutOutcome::NothingFound
+	};
+	Ok((outcome, keyring_error))
 }
 
 /// The auth config files that exist: `given`, then those in the default locations, each once.
@@ -2267,18 +2333,291 @@ mod tests {
 	/// A keyring that fails every access, as one without a keyring service does.
 	struct UnavailableChunkStore;
 
+	/// The error the keyring fails with where there is no keyring service.
+	fn no_keyring_service() -> anyhow::Error {
+		anyhow!(keyring::Error::NoStorageAccess("no keyring service".into()))
+	}
+
 	impl ChunkStore for UnavailableChunkStore {
 		fn get(&self, _key: &str) -> Result<Option<String>> {
-			Err(anyhow!("no keyring service"))
+			Err(no_keyring_service())
 		}
 
 		fn set(&self, _key: &str, _value: &str) -> Result<()> {
-			Err(anyhow!("no keyring service"))
+			Err(no_keyring_service())
 		}
 
 		fn delete(&self, _key: &str) -> Result<bool> {
-			Err(anyhow!("no keyring service"))
+			Err(no_keyring_service())
 		}
+	}
+
+	/// The error the keyring fails with to read an entry that is not UTF-8.
+	fn bad_encoding() -> anyhow::Error {
+		anyhow!(keyring::Error::BadEncoding(vec![0xff]))
+	}
+
+	/// A keyring that reads but fails to delete a stored value.
+	#[derive(Default)]
+	struct UndeletableChunkStore(MemoryChunkStore);
+
+	impl ChunkStore for UndeletableChunkStore {
+		fn get(&self, key: &str) -> Result<Option<String>> {
+			self.0.get(key)
+		}
+
+		fn set(&self, key: &str, value: &str) -> Result<()> {
+			self.0.set(key, value)
+		}
+
+		fn delete(&self, key: &str) -> Result<bool> {
+			// writing deletes the chunks past the value's last, which are missing here
+			match self.0.get(key)? {
+				Some(_) => Err(anyhow!("delete refused")),
+				None => Ok(false),
+			}
+		}
+	}
+
+	/// A keyring whose stored values cannot be read, as one holding an entry it cannot decode, but
+	/// which deletes them.
+	#[derive(Default)]
+	struct UnreadableChunkStore(MemoryChunkStore);
+
+	impl ChunkStore for UnreadableChunkStore {
+		fn get(&self, _key: &str) -> Result<Option<String>> {
+			Err(bad_encoding())
+		}
+
+		fn set(&self, key: &str, value: &str) -> Result<()> {
+			self.0.set(key, value)
+		}
+
+		fn delete(&self, key: &str) -> Result<bool> {
+			self.0.delete(key)
+		}
+	}
+
+	/// A keyring holding an entry it can neither decode nor delete.
+	struct UnreadableUndeletableChunkStore;
+
+	impl ChunkStore for UnreadableUndeletableChunkStore {
+		fn get(&self, _key: &str) -> Result<Option<String>> {
+			Err(bad_encoding())
+		}
+
+		fn set(&self, _key: &str, _value: &str) -> Result<()> {
+			Err(anyhow!("write refused"))
+		}
+
+		fn delete(&self, _key: &str) -> Result<bool> {
+			Err(anyhow!("delete refused"))
+		}
+	}
+
+	#[test]
+	fn logout_with_an_unreadable_keyring_does_not_report_finding_nothing() {
+		let (_dir, config) = config_in_temp_dir();
+		let store = UnreadableChunkStore::default();
+		let entry = LongKeyringEntry::new(&store, "sdk-config");
+		let printed = Printed::default();
+		let mut asked = Vec::new();
+
+		let outcome = logout_from(
+			&config,
+			&mut printed.ui(),
+			keyring_only(Some(&entry)),
+			CacheAccess::Unused,
+			|_, msg| {
+				asked.push(msg.to_owned());
+				Ok(false)
+			},
+		)
+		.unwrap();
+
+		assert_eq!(outcome, LogoutOutcome::NothingDeleted);
+		assert_eq!(asked, ["Delete credentials stored in system keyring?"]);
+		assert_eq!(
+			console::strip_ansi_codes(&printed.lines()),
+			"⚠ Could not read the system keyring: Data is not UTF-8 encoded\nNothing deleted"
+		);
+	}
+
+	#[test]
+	fn logout_without_a_keyring_service_asks_nothing_about_the_keyring_and_deletes_the_auth_config()
+	{
+		let (_dir, config) = config_in_temp_dir();
+		let path = config.config_dir.join(AUTH_CONFIG_FILENAME);
+		std::fs::write(&path, "secret-config").unwrap();
+		let store = UnavailableChunkStore;
+		let entry = LongKeyringEntry::new(&store, "sdk-config");
+		let printed = Printed::default();
+		let mut asked = Vec::new();
+
+		let outcome = logout_from(
+			&config,
+			&mut printed.ui(),
+			keyring_only(Some(&entry)),
+			CacheAccess::Unused,
+			|_, msg| {
+				asked.push(msg.to_owned());
+				Ok(true)
+			},
+		)
+		.unwrap();
+
+		assert_eq!(outcome, LogoutOutcome::Deleted);
+		assert_eq!(
+			asked,
+			[format!("Delete auth config file at {}?", path.display())]
+		);
+		assert!(!path.exists());
+		assert_eq!(
+			console::strip_ansi_codes(&printed.lines()),
+			format!(
+				"⚠ Could not read the system keyring: Couldn't access platform secure storage: no \
+				 keyring service: no keyring service\n✔ Deleted auth config file at {}",
+				path.display()
+			)
+		);
+	}
+
+	#[test]
+	fn logout_deletes_a_keyring_entry_that_cannot_be_read() {
+		let (_dir, config) = config_in_temp_dir();
+		let store = UnreadableChunkStore::default();
+		let entry = LongKeyringEntry::new(&store, "sdk-config");
+		entry.write("credentials").unwrap();
+		let printed = Printed::default();
+		let mut ui = printed.ui();
+		ui.set_assume_yes(true);
+
+		let outcome = logout_from(
+			&config,
+			&mut ui,
+			keyring_only(Some(&entry)),
+			CacheAccess::Unused,
+			|ui, msg| ui.prompt_confirm(msg, false),
+		)
+		.unwrap();
+
+		assert_eq!(outcome, LogoutOutcome::Deleted);
+		assert_eq!(store.0.keys(), Vec::<String>::new());
+		assert_eq!(
+			console::strip_ansi_codes(&printed.lines()),
+			"⚠ Could not read the system keyring: Data is not UTF-8 encoded\n✔ Credentials deleted \
+			 from keyring"
+		);
+	}
+
+	#[test]
+	fn logout_failing_to_read_and_to_delete_the_keyring_entry_fails_with_both_after_the_auth_config()
+	 {
+		let (_dir, config) = config_in_temp_dir();
+		let path = config.config_dir.join(AUTH_CONFIG_FILENAME);
+		std::fs::write(&path, "secret-config").unwrap();
+		let store = UnreadableUndeletableChunkStore;
+		let entry = LongKeyringEntry::new(&store, "sdk-config");
+		let mut ui = Printed::default().ui();
+		ui.set_assume_yes(true);
+
+		let result = logout_from(
+			&config,
+			&mut ui,
+			keyring_only(Some(&entry)),
+			CacheAccess::Unused,
+			|ui, msg| ui.prompt_confirm(msg, false),
+		);
+
+		let error = result.unwrap_err();
+		assert_eq!(
+			format!("{error:#}"),
+			"Could not read the system keyring (Data is not UTF-8 encoded), and deleting its \
+			 entry failed: delete refused"
+		);
+		assert!(!path.exists());
+	}
+
+	#[test]
+	fn logout_failing_to_read_a_keyring_that_holds_no_entry_to_delete_fails() {
+		let (_dir, config) = config_in_temp_dir();
+		let store = UnreadableChunkStore::default();
+		let entry = LongKeyringEntry::new(&store, "sdk-config");
+		let mut ui = Printed::default().ui();
+		ui.set_assume_yes(true);
+
+		let result = logout_from(
+			&config,
+			&mut ui,
+			keyring_only(Some(&entry)),
+			CacheAccess::Unused,
+			|ui, msg| ui.prompt_confirm(msg, false),
+		);
+
+		let error = result.unwrap_err();
+		assert_eq!(
+			format!("{error:#}"),
+			"Could not read the system keyring, and it held no entry to delete: Data is not UTF-8 \
+			 encoded"
+		);
+	}
+
+	#[test]
+	fn logout_failing_to_delete_the_keyring_entry_still_deletes_the_auth_config() {
+		let (_dir, config) = config_in_temp_dir();
+		let path = config.config_dir.join(AUTH_CONFIG_FILENAME);
+		std::fs::write(&path, "secret-config").unwrap();
+		let store = UndeletableChunkStore::default();
+		let entry = LongKeyringEntry::new(&store, "sdk-config");
+		entry.write("credentials").unwrap();
+		let mut ui = Printed::default().ui();
+		ui.set_assume_yes(true);
+
+		let result = logout_from(
+			&config,
+			&mut ui,
+			keyring_only(Some(&entry)),
+			CacheAccess::Unused,
+			|ui, msg| ui.prompt_confirm(msg, false),
+		);
+
+		let error = result.unwrap_err();
+		assert_eq!(
+			format!("{error:#}"),
+			"Failed to delete SDK config from keyring: delete refused"
+		);
+		assert!(!path.exists());
+		assert_eq!(entry.read().unwrap().as_deref(), Some("credentials"));
+	}
+
+	#[test]
+	fn logout_failing_to_delete_both_the_keyring_entry_and_the_auth_config_returns_the_keyring_error()
+	 {
+		let (_dir, config) = config_in_temp_dir();
+		// remove_file fails on a directory
+		let path = config.config_dir.join(AUTH_CONFIG_FILENAME);
+		std::fs::create_dir(&path).unwrap();
+		let store = UndeletableChunkStore::default();
+		let entry = LongKeyringEntry::new(&store, "sdk-config");
+		entry.write("credentials").unwrap();
+		let mut ui = Printed::default().ui();
+		ui.set_assume_yes(true);
+
+		let result = logout_from(
+			&config,
+			&mut ui,
+			keyring_only(Some(&entry)),
+			CacheAccess::Unused,
+			|ui, msg| ui.prompt_confirm(msg, false),
+		);
+
+		let error = result.unwrap_err();
+		assert_eq!(
+			format!("{error:#}"),
+			"Failed to delete SDK config from keyring: delete refused"
+		);
+		assert!(path.is_dir());
+		assert_eq!(entry.read().unwrap().as_deref(), Some("credentials"));
 	}
 
 	#[test]
