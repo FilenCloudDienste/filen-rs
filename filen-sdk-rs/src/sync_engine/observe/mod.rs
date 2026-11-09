@@ -173,6 +173,22 @@ pub(super) struct LocalObservations {
 	pub(super) errors: Vec<ScanError>,
 }
 
+impl LocalObservations {
+	/// `rel_path` could not be read: the observation is incomplete there, and the error is reported.
+	fn io_failure(&mut self, root: &Path, rel_path: &str, source: std::io::Error) {
+		self.complete = false;
+		self.gaps.unreadable(rel_path, &source);
+		record(
+			&mut self.errors,
+			root,
+			ScanError::Io {
+				rel_path: rel_path.to_owned(),
+				source,
+			},
+		);
+	}
+}
+
 /// What the ancestors of one dirty path said.
 enum Ancestors<'p> {
 	/// Every ancestor is a readable directory the rules do not hide.
@@ -454,16 +470,7 @@ pub(super) fn observe_local(
 	// reading that as a tree of deletions is what the walk's own closing stat guards against. A root
 	// that is no longer a directory holds none of the tree either.
 	if let Err(source) = stat_pair_root(root) {
-		out.complete = false;
-		out.gaps.unreadable("", &source);
-		record(
-			&mut out.errors,
-			root,
-			ScanError::Io {
-				rel_path: String::new(),
-				source,
-			},
-		);
+		out.io_failure(root, "", source);
 		return Ok((out, rules));
 	}
 	if rule_files.reads("") {
@@ -636,16 +643,7 @@ pub(super) fn observe_local(
 							continue;
 						}
 						Err(source) => {
-							out.complete = false;
-							out.gaps.unreadable(path, &source);
-							record(
-								&mut out.errors,
-								root,
-								ScanError::Io {
-									rel_path: path.to_owned(),
-									source,
-								},
-							);
+							out.io_failure(root, path, source);
 							continue;
 						}
 					},
@@ -688,16 +686,7 @@ pub(super) fn observe_local(
 				changed_under_observation(&mut out, root, path, &source);
 			}
 			Err(source) => {
-				out.complete = false;
-				out.gaps.unreadable(path, &source);
-				record(
-					&mut out.errors,
-					root,
-					ScanError::Io {
-						rel_path: path.to_owned(),
-						source,
-					},
-				);
+				out.io_failure(root, path, source);
 			}
 		}
 	}
@@ -706,16 +695,7 @@ pub(super) fn observe_local(
 	// for every path under it, and each of those answers would otherwise stand as an absence. What
 	// was observed present is still true; what was observed absent is not evidence any more.
 	if let Err(source) = stat_pair_root(root) {
-		out.complete = false;
-		out.gaps.unreadable("", &source);
-		record(
-			&mut out.errors,
-			root,
-			ScanError::Io {
-				rel_path: String::new(),
-				source,
-			},
-		);
+		out.io_failure(root, "", source);
 		out.observed
 			.retain(|_, observation| !matches!(observation, LocalObservation::Absent(_)));
 	}
@@ -803,16 +783,7 @@ fn walk_ancestors<'p>(
 				return Ancestors::Unreadable;
 			}
 			Err(source) => {
-				out.complete = false;
-				out.gaps.unreadable(ancestor, &source);
-				record(
-					&mut out.errors,
-					root,
-					ScanError::Io {
-						rel_path: ancestor.to_owned(),
-						source,
-					},
-				);
+				out.io_failure(root, ancestor, source);
 				return Ancestors::Unreadable;
 			}
 		}
@@ -905,16 +876,7 @@ fn read_siblings(root: &Path, dir: &str, out: &mut LocalObservations) -> Option<
 			return None;
 		}
 		Err(source) => {
-			out.complete = false;
-			out.gaps.unreadable(dir, &source);
-			record(
-				&mut out.errors,
-				root,
-				ScanError::Io {
-					rel_path: dir.to_owned(),
-					source,
-				},
-			);
+			out.io_failure(root, dir, source);
 			return None;
 		}
 	};
@@ -923,16 +885,7 @@ fn read_siblings(root: &Path, dir: &str, out: &mut LocalObservations) -> Option<
 		let entry = match entry {
 			Ok(entry) => entry,
 			Err(source) => {
-				out.complete = false;
-				out.gaps.unreadable(dir, &source);
-				record(
-					&mut out.errors,
-					root,
-					ScanError::Io {
-						rel_path: dir.to_owned(),
-						source,
-					},
-				);
+				out.io_failure(root, dir, source);
 				return None;
 			}
 		};

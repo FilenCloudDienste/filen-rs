@@ -1271,13 +1271,7 @@ impl<S: ScanSink> Window<'_, S> {
 				return None;
 			}
 			Err(source) => {
-				self.complete = false;
-				self.gaps.unreadable(&rel_path, &source);
-				record(
-					&mut self.errors,
-					self.root,
-					ScanError::Io { rel_path, source },
-				);
+				self.io_failure(rel_path, source);
 				return None;
 			}
 		};
@@ -1312,16 +1306,8 @@ impl<S: ScanSink> Window<'_, S> {
 				return Some(Found::Claim(rel_path));
 			}
 			Some(Err(source)) => {
-				self.complete = false;
-				self.gaps.unreadable(&rel_path, &source);
-				record(
-					&mut self.errors,
-					self.root,
-					ScanError::Io {
-						rel_path: rel_path.clone(),
-						source,
-					},
-				);
+				// The claim keeps the path as well as the error.
+				self.io_failure(rel_path.clone(), source);
 				return Some(Found::Claim(rel_path));
 			}
 		};
@@ -1333,6 +1319,17 @@ impl<S: ScanSink> Window<'_, S> {
 			mtime_nanos,
 			content_hash,
 		}))
+	}
+
+	/// `rel_path` could not be read: the scan is partial there, and the error is reported.
+	fn io_failure(&mut self, rel_path: String, source: std::io::Error) {
+		self.complete = false;
+		self.gaps.unreadable(&rel_path, &source);
+		record(
+			&mut self.errors,
+			self.root,
+			ScanError::Io { rel_path, source },
+		);
 	}
 
 	fn vanished(&self, rel_path: &str) {
