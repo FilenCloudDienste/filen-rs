@@ -244,6 +244,8 @@ pub(crate) struct CliArgs {
 ///   when it is given none (you write it)
 /// - `rclone/`: the managed rclone, and the state and the file cache of the rclone that `mount`
 ///   and `serve` run
+/// - `uploads/`: the records of unfinished uploads `upload --resume` continues (see
+///   `help transfers`)
 /// - `repl_history`: the lines entered in the REPL
 /// - `last_update_check`: the time of the last update check (see `help updates`)
 /// - `ts_migration_hint_shown`: present once the CLI has pointed out the older CLI's files

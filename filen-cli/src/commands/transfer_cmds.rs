@@ -44,7 +44,17 @@
 //! download fails, to start over next time. So is a file that was not continued and differs from
 //! that hash: what it wrote is not kept. The bytes a download did not have to download again
 //! count as transferred, and the result names them as resumed and leaves them out of the speed.
-//! Without `--resume`, an unfinished file is removed. Uploads cannot be resumed.
+//! Without `--resume`, an unfinished file is removed.
+//!
+//! With `--resume`, an upload that does not finish keeps an encrypted record of the chunks of the
+//! file the drive acknowledged, in `uploads/` in the config directory, and the next
+//! `upload --resume` of the same file to the same place continues it, for a single file and for
+//! the files of an uploaded directory alike: the whole file is read again to check its hash, but
+//! only what is missing is sent. A file that was changed since, or a record more than about a day
+//! old, starts over. Files of 7 MiB or less are not recorded. The bytes an upload did not have to
+//! send again count as transferred, and the result names them as resumed. The records are encrypted
+//! with your account's keys, so only you can read them, and are removed once the upload finishes
+//! or after a day. Without `--resume`, nothing is kept.
 //!
 //! With `--include` and `--exclude`, a directory transfer takes only some of the items inside the
 //! directory. Both take a gitignore-style pattern, can be given several times, and match the path
@@ -126,9 +136,9 @@ use filen_sdk_rs::{
 	},
 	io::{
 		CategoryDirDownloadExtPub, DirDownloadCallback, DirDownloadOptions, DirUploadCallback,
-		DirUploadOptions, ExistingLocalFile, ExistingRemoteFile, PartialDownload, PathMatcher,
-		RemoteDirectory, RemoteFile, SymlinkPolicy, TransferFilter, client_impl::IoSharedClientExt,
-		is_safe_descendant,
+		DirUploadOptions, ExistingLocalFile, ExistingRemoteFile, FileUploadJournalStore,
+		PartialDownload, PathMatcher, RemoteDirectory, RemoteFile, SymlinkPolicy, TransferFilter,
+		UploadJournalStore, client_impl::IoSharedClientExt, is_safe_descendant,
 	},
 	sync_engine::PathPatterns,
 	util::MaybeSendCallback,
@@ -141,7 +151,7 @@ use tokio::{
 };
 
 use crate::{
-	CommandResult,
+	CliConfig, CommandResult,
 	auth::LazyClient,
 	commands::CommandContext,
 	completion::FilenCompleter,
@@ -179,6 +189,10 @@ pub(crate) enum TransferCommands {
 		/// differs or it was modified since, and skip it otherwise (listed with -v)
 		#[arg(long)]
 		update: bool,
+		/// Keep a record of what was uploaded of a file when the upload does not finish, and
+		/// continue from there when the file is uploaded again with --resume
+		#[arg(long)]
+		resume: bool,
 		#[command(flatten)]
 		filter: FilterArgs,
 	},
@@ -259,10 +273,10 @@ pub(crate) const DOCS: &[DocElement] = &[
 impl TransferCommands {
 	pub(super) async fn execute(self, ctx: CommandContext<'_>) -> Result<CommandResult> {
 		let CommandContext {
+			config,
 			ui,
 			client,
 			working_path,
-			..
 		} = ctx;
 		match self {
 			Self::Upload {
@@ -271,8 +285,11 @@ impl TransferCommands {
 				no_follow_symlinks,
 				skip_existing,
 				update,
+				resume,
 				filter,
 			} => {
+				let (sources, destination) = sources_and_destination(source, paths);
+				let sources = expand_source_wildcards(ui, sources)?;
 				let options = DirUploadOptions {
 					symlinks: if no_follow_symlinks {
 						SymlinkPolicy::Skip
@@ -281,10 +298,8 @@ impl TransferCommands {
 					},
 					existing: existing_remote_policy(skip_existing, update),
 					filter: filter.transfer_filter()?,
-					journal: None,
+					journal: upload_journal(resume, &sources, config).await?,
 				};
-				let (sources, destination) = sources_and_destination(source, paths);
-				let sources = expand_source_wildcards(ui, sources)?;
 				upload(
 					ui,
 					client,
@@ -340,6 +355,32 @@ fn existing_remote_policy(skip_existing: bool, update: bool) -> ExistingRemoteFi
 		ExistingRemoteFile::Replace
 	}
 }
+
+/// Where an upload keeps the records of its unfinished files, from its `--resume` flag: nowhere
+/// without it, and in `uploads/` in the config directory with it. Stdin cannot be read again, so
+/// its upload cannot be resumed.
+async fn upload_journal(
+	resume: bool,
+	sources: &[String],
+	config: &CliConfig,
+) -> Result<Option<Arc<dyn UploadJournalStore>>> {
+	if !resume {
+		return Ok(None);
+	}
+	if sources.iter().any(|source| source == STDIO) {
+		return Err(UI::usage_failure(
+			"Cannot resume an upload of stdin (\"-\")",
+		));
+	}
+	let dir = config.config_dir.join(UPLOAD_JOURNAL_DIR);
+	let store = FileUploadJournalStore::open(dir.clone())
+		.await
+		.with_context(|| format!("Failed to open the upload records in {}", dir.display()))?;
+	Ok(Some(Arc::new(store)))
+}
+
+/// The directory in the config directory that keeps the records of unfinished uploads.
+const UPLOAD_JOURNAL_DIR: &str = "uploads";
 
 /// What a download does with what it wrote of a file it did not finish, from its `--resume` flag.
 fn partial_download(resume: bool) -> PartialDownload {
@@ -536,7 +577,7 @@ async fn upload_source(
 				&local.path,
 				target.name.as_ref(),
 				&parent_dir,
-				options.existing,
+				options,
 			),
 		)
 		.await?
@@ -1522,16 +1563,17 @@ fn result_json(
 	})
 }
 
-/// Upload the file `source` as `name` into `destination_dir`, unless `existing` keeps a file of
-/// that name already there.
+/// Upload the file `source` as `name` into `destination_dir`, unless `options` keep a file of that
+/// name already there, continuing an earlier upload of it when `options` hold a journal.
 async fn upload_file(
 	client: &Client,
 	progress: &TransferProgress,
 	source: &Path,
 	name: &str,
 	destination_dir: &DirType<'_, Normal>,
-	existing: ExistingRemoteFile,
+	options: &DirUploadOptions,
 ) -> Result<()> {
+	let existing = options.existing;
 	let mut builder = FileBuilderOptionalName::new(destination_dir.uuid());
 	builder
 		.name(name)
@@ -1547,14 +1589,26 @@ async fn upload_file(
 		progress.skip([source.display().to_string()], size);
 		return Ok(());
 	}
-	client
-		.upload_file_from_path_with_builder(
-			builder,
-			source.to_path_buf(),
-			Some(progress.byte_callback()),
-		)
-		.await
-		.context("Failed to upload file")?;
+	let callback = Some(progress.byte_callback());
+	match options.journal.as_deref() {
+		Some(journal) => {
+			client
+				.upload_file_from_path_resuming(
+					builder,
+					source.to_path_buf(),
+					journal,
+					callback,
+					Some(progress.resumed_callback()),
+				)
+				.await
+		}
+		None => {
+			client
+				.upload_file_from_path_with_builder(builder, source.to_path_buf(), callback)
+				.await
+		}
+	}
+	.context("Failed to upload file")?;
 	progress.complete_single_item();
 	Ok(())
 }
@@ -1757,7 +1811,7 @@ struct ProgressState {
 	total_bytes: u64,
 	done_files: u64,
 	done_bytes: u64,
-	/// The bytes of `done_bytes` that earlier downloads had left, which resumed downloads continue
+	/// The bytes of `done_bytes` that earlier transfers had moved, which resumed transfers continue
 	/// from.
 	resumed_bytes: u64,
 	/// The files left out for what was already at their target, which are not in the totals.
@@ -1835,7 +1889,7 @@ impl ProgressState {
 		noted
 	}
 
-	/// Count `bytes` an earlier download had left as done. They were not moved now, so the speed
+	/// Count `bytes` an earlier transfer had moved as done. They were not moved now, so the speed
 	/// samples are raised by them too, which keeps them out of the speed.
 	fn resume(&mut self, bytes: u64) {
 		self.done_bytes = self.done_bytes.saturating_add(bytes);
@@ -1969,10 +2023,10 @@ fn files_and_bytes(files: u64, bytes: u64) -> String {
 struct Tally {
 	/// The files transferred.
 	files: u64,
-	/// Their bytes, those an earlier download had left included.
+	/// Their bytes, those an earlier transfer had moved included.
 	bytes: u64,
-	/// The bytes of `bytes` that earlier downloads had left, which resumed downloads continued
-	/// from instead of downloading them again.
+	/// The bytes of `bytes` that earlier transfers had moved, which resumed transfers continued
+	/// from instead of moving them again.
 	resumed_bytes: u64,
 	/// The files left out for what was already at their target.
 	skipped: u64,
@@ -1980,7 +2034,7 @@ struct Tally {
 
 /// What a transfer moved and how fast, on average, and how many files it left out for what was
 /// already at their target. The speed counts only the bytes moved in `elapsed`, not those an
-/// earlier download had left.
+/// earlier transfer had moved.
 fn transfer_summary(tally: &Tally, elapsed: Duration) -> String {
 	let mut summary = files_and_bytes(tally.files, tally.bytes);
 	if tally.resumed_bytes > 0 {
@@ -2142,13 +2196,13 @@ impl TransferProgress {
 		}
 	}
 
-	/// A callback for the bytes of a file an earlier download had left, which this one continues
+	/// A callback for the bytes of a file an earlier transfer had moved, which this one continues
 	/// from.
 	fn resumed_callback(&self) -> MaybeSendCallback<'_, u64> {
 		Arc::new(|bytes| self.resume(bytes))
 	}
 
-	/// Count `bytes` an earlier download had left as done, without them adding to the speed.
+	/// Count `bytes` an earlier transfer had moved as done, without them adding to the speed.
 	fn resume(&self, bytes: u64) {
 		let mut state = self.state.lock().unwrap();
 		state.resume(bytes);
@@ -2289,6 +2343,10 @@ impl DirUploadCallback for TransferProgress {
 		);
 	}
 
+	fn on_upload_resumed(&self, resumed_bytes: u64) {
+		self.resume(resumed_bytes);
+	}
+
 	fn on_scan_skipped_symlinks(&self, paths: Vec<PathBuf>) {
 		let paths = paths
 			.iter()
@@ -2395,9 +2453,10 @@ mod tests {
 		existing_remote_policy, expand_source_wildcards, format_duration, local_existing,
 		partial_download, progress_line, resolve_download_target, resolve_upload_target,
 		result_json, skipped_symlinks_line, source_failure, sources_and_destination,
-		stdin_destination, stdin_upload_target, transfer_summary,
+		stdin_destination, stdin_upload_target, transfer_summary, upload_journal,
 	};
 	use crate::{
+		CliConfig,
 		error::CliError,
 		ui::{UI, test_support::Printed},
 		util::RemotePath,
@@ -3122,6 +3181,69 @@ mod tests {
 			link(LinkKind::File, "secret").unwrap().to_string(),
 			format!("public link {LINK_UUID}")
 		);
+	}
+
+	fn config_in(dir: &Path) -> CliConfig {
+		CliConfig {
+			config_dir: dir.to_path_buf(),
+			profiles: crate::auth::Profiles::new(dir, None),
+			config_dir_is_default: false,
+		}
+	}
+
+	#[derive(Debug, clap::Parser)]
+	struct TransferArgs {
+		#[command(subcommand)]
+		command: super::TransferCommands,
+	}
+
+	#[test]
+	fn the_resume_flag_of_upload_is_parsed() {
+		let TransferArgs {
+			command: super::TransferCommands::Upload { resume, .. },
+		} = <TransferArgs as clap::Parser>::try_parse_from(["filen", "upload", "--resume", "a", "b"])
+			.unwrap()
+		else {
+			panic!("not an upload");
+		};
+		assert!(resume);
+	}
+
+	#[tokio::test]
+	async fn upload_with_resume_refuses_stdin() {
+		let config_dir = tempfile::tempdir().unwrap();
+		let error = upload_journal(true, &["-".to_owned()], &config_in(config_dir.path()))
+			.await
+			.unwrap_err();
+		assert_eq!(
+			error.downcast_ref::<CliError>().map(CliError::exit_code),
+			Some(2)
+		);
+		assert_eq!(
+			error.to_string(),
+			"Cannot resume an upload of stdin (\"-\")"
+		);
+		assert!(!config_dir.path().join("uploads").exists());
+	}
+
+	#[tokio::test]
+	async fn upload_without_resume_keeps_no_records() {
+		let config_dir = tempfile::tempdir().unwrap();
+		let journal = upload_journal(false, &["a".to_owned()], &config_in(config_dir.path()))
+			.await
+			.unwrap();
+		assert!(journal.is_none());
+		assert!(!config_dir.path().join("uploads").exists());
+	}
+
+	#[tokio::test]
+	async fn upload_with_resume_keeps_its_records_in_the_config_directory() {
+		let config_dir = tempfile::tempdir().unwrap();
+		let journal = upload_journal(true, &["a".to_owned()], &config_in(config_dir.path()))
+			.await
+			.unwrap();
+		assert!(journal.is_some());
+		assert!(config_dir.path().join("uploads").is_dir());
 	}
 
 	#[test]

@@ -130,6 +130,7 @@ Breaking changes are marked **Breaking**: scripts that depend on the old behavio
 
 - `upload -` uploads stdin, and `download <file> -` writes to stdout
 - `download --resume` continues an unfinished download, checked against the drive's hash
+- `upload --resume` continues an unfinished upload of a file of more than 7 MiB, for about a day
 - `download` of public link URLs, without logging in when every source is a link (`--link-password` or `FILEN_CLI_LINK_PASSWORD` for a protected link)
 - `upload --skip-existing`, `--update` and `--no-follow-symlinks`, `download --no-clobber`, and `--include`/`--exclude` for both
 - `-v` lists each transferred file
