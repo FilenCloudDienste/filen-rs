@@ -1,4 +1,5 @@
 pub(crate) mod account;
+pub(crate) mod appear_offline;
 pub(crate) mod avatar;
 pub(crate) mod base_folder;
 pub(crate) mod dek;

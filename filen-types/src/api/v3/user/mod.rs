@@ -1,4 +1,5 @@
 pub mod account;
+pub mod appear_offline;
 pub mod avatar;
 pub mod base_folder;
 pub mod dek;

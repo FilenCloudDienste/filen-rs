@@ -123,6 +123,36 @@ async fn login_alerts_toggle_round_trip() {
 	assert_eq!(restored, original, "login_alerts flag should be restored");
 }
 
+#[shared_test_runtime]
+async fn appear_offline_toggle_round_trip() {
+	let client = test_utils::RESOURCES.client().await;
+	// Chat participants carry the flag and compare it, so a chat test running meanwhile would
+	// see it flip: hold the chats lock for the whole window.
+	let _chats_lock = client
+		.acquire_lock_with_default(test_utils::locks::CHATS)
+		.await
+		.unwrap();
+	let original = client.get_user_info().await.unwrap().appear_offline;
+
+	let result = AssertUnwindSafe(async {
+		client.set_appear_offline(!original).await.unwrap();
+		let toggled = client.get_user_info().await.unwrap().appear_offline;
+		assert_eq!(toggled, !original, "appear_offline flag should be inverted");
+	})
+	.catch_unwind()
+	.await;
+
+	// Restore even if the body panicked: the flag stays on the shared account otherwise.
+	let restore = client.set_appear_offline(original).await;
+
+	if let Err(panic) = result {
+		std::panic::resume_unwind(panic);
+	}
+	restore.unwrap();
+	let restored = client.get_user_info().await.unwrap().appear_offline;
+	assert_eq!(restored, original, "appear_offline flag should be restored");
+}
+
 /// With versioning enabled, uploading a file with the same name + parent should
 /// retain the previous version (not replace it). With versioning disabled, the
 /// previous upload should not produce a version entry.

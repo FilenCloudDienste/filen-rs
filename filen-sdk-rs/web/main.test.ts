@@ -313,6 +313,19 @@ test("account timestamps are bigint millis, and unset ones are undefined", async
 	}
 })
 
+test("appear offline round trip", async () => {
+	// Chat participants carry the flag, so hold the lock the chat tests take.
+	using _lock = await state.acquireLock({ resource: "test:chats" })
+	const original = (await state.getUserInfo()).appearOffline
+	try {
+		await state.setAppearOffline(!original)
+		expect((await state.getUserInfo()).appearOffline).toBe(!original)
+	} finally {
+		await state.setAppearOffline(original)
+	}
+	expect((await state.getUserInfo()).appearOffline).toBe(original)
+})
+
 test("serialization", async () => {
 	const serializedState = await state.toStringified()
 	expect(serializedState.rootUuid).toEqual(state.root().uuid)

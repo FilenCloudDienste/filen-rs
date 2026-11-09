@@ -197,6 +197,15 @@ impl Client {
 		.await
 	}
 
+	/// Whether the user appears offline to their chat contacts.
+	pub async fn set_appear_offline(&self, appear_offline: bool) -> Result<(), Error> {
+		api::v3::user::appear_offline::post(
+			self.client(),
+			&api::v3::user::appear_offline::Request { appear_offline },
+		)
+		.await
+	}
+
 	pub async fn get_user_events(
 		&self,
 		filter: Option<&str>,
@@ -504,6 +513,17 @@ mod js_impl {
 		pub async fn set_login_alerts_enabled(&self, enabled: bool) -> Result<(), Error> {
 			let this = self.inner();
 			do_on_commander(move || async move { this.set_login_alerts_enabled(enabled).await })
+				.await
+		}
+
+		/// Whether the user appears offline to their chat contacts.
+		#[cfg_attr(
+			all(target_family = "wasm", target_os = "unknown"),
+			wasm_bindgen::prelude::wasm_bindgen(js_name = "setAppearOffline")
+		)]
+		pub async fn set_appear_offline(&self, appear_offline: bool) -> Result<(), Error> {
+			let this = self.inner();
+			do_on_commander(move || async move { this.set_appear_offline(appear_offline).await })
 				.await
 		}
 
