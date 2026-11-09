@@ -44,6 +44,7 @@ use std::{
 	path::{Path, PathBuf},
 	process::ExitStatus,
 	str::FromStr,
+	time::Duration,
 };
 
 use anyhow::{Context, Result};
@@ -74,6 +75,17 @@ const ANNOUNCEMENTS_URL: &str =
 
 /// How long after a check the next one is skipped, in seconds.
 const LAST_CHECK_VALIDITY_SECS: i64 = 5 * 60;
+
+/// How long connecting to GitHub may take, for the check and the download.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long a whole request of the check (the releases or the announcements) may take, so a
+/// stalled connection cannot hold up the command it runs before.
+const CHECK_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// How long the download of a release may go without receiving anything. It has no bound on its
+/// total time, since the binary is large and the connection may be slow.
+const DOWNLOAD_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Checks for updates by querying the GitHub releases API and downloading
 /// and installing the latest release if a newer version is available.
@@ -682,7 +694,24 @@ fn select_asset<'a>(
 /// Downloads `url`, failing on a response that is not a success: its body is an error page, not
 /// the file.
 async fn download_file(url: &str) -> Result<Vec<u8>> {
-	let response = reqwest::get(url)
+	download_file_with_timeouts(url, CONNECT_TIMEOUT, DOWNLOAD_READ_TIMEOUT).await
+}
+
+/// [`download_file`], failing when connecting takes longer than `connect_timeout` or a read
+/// longer than `read_timeout`.
+async fn download_file_with_timeouts(
+	url: &str,
+	connect_timeout: Duration,
+	read_timeout: Duration,
+) -> Result<Vec<u8>> {
+	let client = reqwest::Client::builder()
+		.connect_timeout(connect_timeout)
+		.read_timeout(read_timeout)
+		.build()
+		.expect("building a reqwest client with timeouts (should be impossible to fail)");
+	let response = client
+		.get(url)
+		.send()
 		.await
 		.with_context(|| format!("Failed to download file from {}", url))?;
 	let status = response.status();
@@ -970,8 +999,28 @@ struct GitHubApiClient<'a> {
 
 impl<'a> GitHubApiClient<'a> {
 	fn new(releases_url: &'a str, announcements_url: &'a str) -> Self {
+		Self::with_timeouts(
+			releases_url,
+			announcements_url,
+			CONNECT_TIMEOUT,
+			CHECK_REQUEST_TIMEOUT,
+		)
+	}
+
+	/// A client whose requests fail when connecting takes longer than `connect_timeout`, or the
+	/// whole request longer than `request_timeout`.
+	fn with_timeouts(
+		releases_url: &'a str,
+		announcements_url: &'a str,
+		connect_timeout: Duration,
+		request_timeout: Duration,
+	) -> Self {
 		Self {
-			client: reqwest::Client::new(),
+			client: reqwest::Client::builder()
+				.connect_timeout(connect_timeout)
+				.timeout(request_timeout)
+				.build()
+				.expect("building a reqwest client with timeouts (should be impossible to fail)"),
 			releases_url,
 			announcements_url,
 		}
@@ -1922,6 +1971,68 @@ mod tests {
 			stream.write_all(response.as_bytes()).unwrap();
 		});
 		format!("http://{address}/asset")
+	}
+
+	/// Accepts one connection on a local port, answers its request with `head` and then nothing
+	/// more until the client closes it, and returns its URL.
+	fn serve_and_stall(head: &'static str) -> String {
+		let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+		let address = listener.local_addr().unwrap();
+		std::thread::spawn(move || {
+			let (mut stream, _) = listener.accept().unwrap();
+			let mut request = [0; 1024];
+			let _ = stream.read(&mut request).unwrap();
+			stream.write_all(head.as_bytes()).unwrap();
+			// Holds the connection open until the client gives up on it.
+			while stream.read(&mut request).is_ok_and(|read| read > 0) {}
+		});
+		format!("http://{address}/stalled")
+	}
+
+	/// Whether a timeout of reqwest's caused `error`.
+	fn is_timeout(error: &anyhow::Error) -> bool {
+		error.chain().any(|cause| {
+			cause
+				.downcast_ref::<reqwest::Error>()
+				.is_some_and(reqwest::Error::is_timeout)
+		})
+	}
+
+	/// The short timeout the tests give a stalled server, and the bound past which a test fails
+	/// instead of waiting for a timeout that never comes.
+	const TEST_TIMEOUT: Duration = Duration::from_millis(200);
+	const TEST_BOUND: Duration = Duration::from_secs(10);
+
+	#[tokio::test]
+	async fn an_announcements_fetch_from_a_server_that_never_answers_times_out() {
+		let url = serve_and_stall("");
+		let client = GitHubApiClient::with_timeouts(RELEASES_URL, &url, TEST_TIMEOUT, TEST_TIMEOUT);
+
+		let error = tokio::time::timeout(TEST_BOUND, client.get_announcements())
+			.await
+			.expect("the request should time out on its own")
+			.unwrap_err();
+
+		assert!(is_timeout(&error), "{error:?}");
+	}
+
+	#[tokio::test]
+	async fn a_download_whose_body_stalls_times_out() {
+		let url = serve_and_stall("HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nbin");
+
+		let error = tokio::time::timeout(
+			TEST_BOUND,
+			download_file_with_timeouts(&url, TEST_TIMEOUT, TEST_TIMEOUT),
+		)
+		.await
+		.expect("the download should time out on its own")
+		.unwrap_err();
+
+		assert_eq!(
+			error.to_string(),
+			format!("Failed to download file from {url}")
+		);
+		assert!(is_timeout(&error), "{error:?}");
 	}
 
 	#[tokio::test]
