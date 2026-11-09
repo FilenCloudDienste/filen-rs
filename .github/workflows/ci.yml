@@ -140,7 +140,7 @@ jobs:
           # PATH, so there is nothing to refresh and no install location to guess.
           # nasm stays on choco, where the explicit GITHUB_PATH line already works.
           python -m pip install meson ninja
-          choco install nasm --no-progress
+          ./scripts/choco-install.ps1 nasm; if ($LASTEXITCODE) { exit $LASTEXITCODE }
           echo "C:\Program Files\NASM" >> $env:GITHUB_PATH
       - name: Run clippy all features
         run: cargo clippy -F filen-sdk-rs/heif-decoder,filen-sdk-rs/malformed,filen-sdk-rs/multi-threaded-crypto,filen-sdk-rs/cache,filen-sdk-rs/sync-engine -- -D warnings
@@ -425,6 +425,6 @@ jobs:
           fi
       - name: Install WinFsp
         if: runner.os == 'Windows'
-        run: choco install winfsp -y
+        run: ./scripts/choco-install.ps1 winfsp
       - name: Run the rclone daemon's tests
         run: cargo test -p filen-sdk-rs -F rclone-managed,test-seams --test rclone_daemon_tests --no-fail-fast

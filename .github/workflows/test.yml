@@ -93,7 +93,7 @@ jobs:
           # PATH, so there is nothing to refresh and no install location to guess.
           # nasm stays on choco, where the explicit GITHUB_PATH line already works.
           python -m pip install meson ninja
-          choco install nasm --no-progress
+          ./scripts/choco-install.ps1 nasm; if ($LASTEXITCODE) { exit $LASTEXITCODE }
           echo "C:\Program Files\NASM" >> $env:GITHUB_PATH
       - name: Remove the broken fusermount3 shadow (actions/runner-images#14516)
         if: runner.os == 'Linux'
@@ -107,7 +107,7 @@ jobs:
           fi
       - name: Install WinFsp (rclone mount backend for network-drive tests)
         if: runner.os == 'Windows'
-        run: choco install winfsp -y
+        run: ./scripts/choco-install.ps1 winfsp
       # No nasm: macos-latest is arm64, and dav1d only assembles SIMD on x86.
       - name: Install build tools for heif-decoder's vendored dav1d (macos)
         if: runner.os == 'macOS'
