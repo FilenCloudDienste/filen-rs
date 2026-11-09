@@ -954,12 +954,16 @@ impl LastCheckedConfig {
 }
 
 /// Whether an update check is due at `now`, given when the last one was (both in seconds since
-/// the epoch). A check is due when there was none, or when the last one is
-/// [`LAST_CHECK_VALIDITY_SECS`] or more ago.
+/// the epoch). A check is due when there was none, when the last one is
+/// [`LAST_CHECK_VALIDITY_SECS`] or more ago, or when its time lies in the future (a clock that
+/// was set back would otherwise suppress checks until it caught up).
 fn is_check_due(last_checked: Option<i64>, now: i64) -> bool {
-	last_checked
-		.and_then(|last_checked| last_checked.checked_add(LAST_CHECK_VALIDITY_SECS))
-		.is_none_or(|next_check| next_check <= now)
+	last_checked.is_none_or(|last_checked| {
+		last_checked > now
+			|| last_checked
+				.checked_add(LAST_CHECK_VALIDITY_SECS)
+				.is_none_or(|next_check| next_check <= now)
+	})
 }
 
 // github api
@@ -1192,6 +1196,19 @@ mod tests {
 		assert!(!is_check_due(Some(now), now));
 		assert!(!is_check_due(Some(now - LAST_CHECK_VALIDITY_SECS + 1), now));
 		assert!(is_check_due(Some(now - LAST_CHECK_VALIDITY_SECS), now));
+	}
+
+	#[test]
+	fn a_check_is_skipped_when_the_last_one_was_a_second_ago() {
+		let now = 1_000_000;
+		assert!(!is_check_due(Some(now - 1), now));
+	}
+
+	#[test]
+	fn a_check_is_due_when_the_last_ones_time_is_in_the_future() {
+		let now = 1_000_000;
+		assert!(is_check_due(Some(now + 1), now));
+		assert!(is_check_due(Some(now + LAST_CHECK_VALIDITY_SECS + 1), now));
 	}
 
 	#[test]
