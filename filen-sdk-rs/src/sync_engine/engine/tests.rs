@@ -9773,6 +9773,90 @@ fn retiring_a_superseded_create_lets_the_stranger_stand() {
 	assert_eq!(remote.whole().at("a.txt").unwrap().remote_uuid, theirs);
 }
 
+/// A superseded write journalled both in memory and in a fresh baseline DB, for the retirement
+/// tests below: the store, its pair, the record's uuid and the DB's path.
+fn superseded_write_journalled(
+	tag: &str,
+	pending: &PendingWrites,
+) -> (BaselineStore, PairId, Uuid, PathBuf) {
+	let path = std::env::temp_dir().join(format!("filen_sync_{tag}_{}.db", Uuid::new_v4()));
+	let store = BaselineStore::open(&path).unwrap();
+	let (pair, _) = store
+		.create_pair("/root", Uuid::new_v4(), SyncMode::TwoWay)
+		.unwrap();
+	let ours = Uuid::from_u128(1);
+	store
+		.record_pending(
+			&PendingRow {
+				pair,
+				uuid: ours,
+				kind: created("a.txt", None),
+				recorded_at: Utc::now().timestamp_millis(),
+			},
+			&[],
+			&[],
+		)
+		.unwrap();
+	pending.record(&Observations::default(), pair, ours, created("a.txt", None));
+	(store, pair, ours, path)
+}
+
+/// The uuids `store`'s journal still holds.
+fn journalled(store: &BaselineStore) -> Vec<Uuid> {
+	store
+		.load_pending(Utc::now().timestamp_millis(), grace_millis())
+		.unwrap()
+		.into_iter()
+		.map(|row| row.uuid)
+		.collect()
+}
+
+/// A superseded write whose DELETE fails stays in memory as well: the two must hold the same
+/// records, or the next open folds back the write memory had already given up on.
+#[test]
+fn a_superseded_write_whose_delete_fails_stays_in_memory_too() {
+	let pending = PendingWrites::default();
+	let (store, pair, ours, path) = superseded_write_journalled("retire_refused", &pending);
+	let holder = BaselineStore::open(&path).unwrap();
+	store.busy_timeout_for_test(Duration::from_millis(50));
+
+	{
+		let _held = holder
+			.hold_write_lock(pair, &converged_conflict(Uuid::from_u128(2)))
+			.unwrap();
+		pending
+			.retire_persisted(&store, pair, &[ours])
+			.expect_err("a DELETE contended past the busy timeout must fail rather than wait");
+	}
+	assert_eq!(
+		pending.uuids(),
+		HashSet::from([ours]),
+		"memory gave up a record the DB still holds"
+	);
+	assert_eq!(journalled(&store), [ours]);
+
+	drop((holder, store));
+	for suffix in ["", "-wal", "-shm"] {
+		std::fs::remove_file(format!("{}{suffix}", path.display())).ok();
+	}
+}
+
+/// And one whose DELETE lands is gone from both.
+#[test]
+fn a_superseded_write_whose_delete_lands_is_retired_from_memory_and_the_db() {
+	let pending = PendingWrites::default();
+	let (store, pair, ours, path) = superseded_write_journalled("retire_landed", &pending);
+
+	pending.retire_persisted(&store, pair, &[ours]).unwrap();
+	assert_eq!(pending.uuids(), HashSet::new());
+	assert_eq!(journalled(&store), Vec::<Uuid>::new());
+
+	drop(store);
+	for suffix in ["", "-wal", "-shm"] {
+		std::fs::remove_file(format!("{}{suffix}", path.display())).ok();
+	}
+}
+
 /// A third uuid at the path is not our write lagging: somebody else wrote there after us, and
 /// the reconciler has to see that immediately rather than wait out the grace window.
 #[test]

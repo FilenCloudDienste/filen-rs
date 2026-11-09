@@ -1230,6 +1230,26 @@ impl PendingWrites {
 		self.journal().writes.remove(&uuid);
 	}
 
+	/// Retire `records` from `store`'s journal and then from memory, under the one hold of the
+	/// pair's store the caller has taken, with no await between them: a cancel dropping the read
+	/// in between — the next candidate's lookup is a whole network call wide — would split the two.
+	/// The DELETE goes first, so a failed one leaves memory and the DB holding the same records,
+	/// and the next pass redoes the superseded-head check; retiring first would leave the DB holding
+	/// a record memory has dropped, and the next open would fold this engine's write back over the
+	/// version the server just said replaced it.
+	fn retire_persisted(
+		&self,
+		store: &BaselineStore,
+		pair: PairId,
+		records: &[Uuid],
+	) -> rusqlite::Result<()> {
+		store.delete_pending(pair, records)?;
+		for record in records {
+			self.retire(*record);
+		}
+		Ok(())
+	}
+
 	/// Fold this pair's surviving records into `nodes` — the path-keyed remote view built from the
 	/// cache snapshot — and return how many were applied.
 	///
@@ -4825,17 +4845,8 @@ impl SyncEngine {
 		}
 		if !retired.is_empty() {
 			let pair_store = self.pair_store(pair).await?;
-			// The in-memory retirement and the DELETE that records it under ONE hold of the pair's
-			// store, with no await between them: a cancel dropping this read in between — the next
-			// candidate's lookup is a whole network call wide — would leave the DB holding a record
-			// memory has already retired, and the next open would fold this engine's write back
-			// over the version the server just said replaced it.
-			let store = locked(&pair_store);
-			for record in &retired {
-				self.pending.retire(*record);
-			}
-			store
-				.delete_pending(pair, &retired)
+			self.pending
+				.retire_persisted(&locked(&pair_store), pair, &retired)
 				.map_err(|e| db_error(e, "retiring a superseded write"))?;
 		}
 		Ok(())
