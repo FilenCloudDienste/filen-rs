@@ -177,6 +177,11 @@ fn target_path(export_root: &Path, note: &Note, used_paths: &mut HashSet<PathBuf
 
 /// Returns `<directory>/<file_name>.<extension>`, appending `-1`, `-2`, ... to the file name
 /// until the path is one that hasn't been claimed yet.
+///
+/// `used_paths` holds the claimed paths with their file names lowercased, so names that differ
+/// only by case count as the same file: they would overwrite each other on the case-insensitive
+/// file systems macOS and Windows use by default. The fold applies on every platform, so an
+/// export gets the same file names everywhere.
 fn unique_path(
 	directory: &Path,
 	file_name: &str,
@@ -189,9 +194,9 @@ fn unique_path(
 		} else {
 			format!("-{i}")
 		};
-		let path = directory.join(format!("{file_name}{suffix}.{extension}"));
-		if used_paths.insert(path.clone()) {
-			return path;
+		let name = format!("{file_name}{suffix}.{extension}");
+		if used_paths.insert(directory.join(name.to_lowercase())) {
+			return directory.join(name);
 		}
 	}
 	unreachable!()
@@ -306,6 +311,15 @@ mod tests {
 		assert_eq!(
 			unique_path(&dir.join("trash"), "Same Title", "txt", &mut used),
 			dir.join("trash").join("Same Title.txt")
+		);
+		// names that differ only by case are the same file on macOS and Windows
+		assert_eq!(
+			unique_path(dir, "Todo", "txt", &mut used),
+			dir.join("Todo.txt")
+		);
+		assert_eq!(
+			unique_path(dir, "todo", "txt", &mut used),
+			dir.join("todo-1.txt")
 		);
 	}
 }
