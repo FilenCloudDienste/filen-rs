@@ -33,6 +33,7 @@ use filen_sdk_rs::{
 	fs::HasUUID as _,
 };
 use filen_types::fs::Uuid;
+use inquire::InquireError;
 use serde_json::json;
 use tokio::{sync::mpsc::UnboundedReceiver, time::Instant};
 
@@ -177,7 +178,11 @@ pub(crate) async fn search_cmd(
 				}
 			}
 			result = &mut prompt_task => {
-				break result.context("Failed to await prompt task")?.context("Failed to prompt for search")?;
+				break match result.context("Failed to await prompt task")? {
+					// Esc is already `Ok(None)` from `prompt_skippable`; Ctrl-C cancels as well
+					Err(InquireError::OperationCanceled | InquireError::OperationInterrupted) => None,
+					answer => answer.context("Failed to prompt for search")?,
+				};
 			}
 		}
 	};
