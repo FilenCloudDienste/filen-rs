@@ -479,13 +479,23 @@ pub(crate) async fn upload(
 
 	// Without a destination, upload into the working directory.
 	let into = several || destination_str.is_none_or(|destination| destination.ends_with('/'));
-	let destination_path = working_path.navigate(destination_str.unwrap_or(""));
 	let client = client.get(ui).await?.clone();
-	if several && let RemoteItem::File = find_remote(&client, &destination_path).await? {
-		return Err(UI::failure(&format!(
-			"Not a directory: {}",
-			destination_path
-		)));
+	let mut destination = UploadDestination {
+		path: working_path.navigate(destination_str.unwrap_or("")),
+		into,
+		dir: None,
+	};
+	if several {
+		match find_remote(&client, &destination.path).await? {
+			RemoteItem::Dir(dir) => destination.dir = Some(dir),
+			RemoteItem::File => {
+				return Err(UI::failure(&format!(
+					"Not a directory: {}",
+					destination.path
+				)));
+			}
+			RemoteItem::Nothing => {}
+		}
 	}
 
 	let progress = TransferProgress::new(TransferKind::Upload, ui);
@@ -493,16 +503,7 @@ pub(crate) async fn upload(
 	for (source, local) in locals {
 		let result = match local {
 			Ok(local) => {
-				upload_source(
-					ui,
-					&client,
-					&progress,
-					local,
-					&destination_path,
-					into,
-					&options,
-				)
-				.await
+				upload_source(ui, &client, &progress, local, &mut destination, &options).await
 			}
 			Err(e) => Err(e),
 		};
@@ -517,8 +518,8 @@ pub(crate) async fn upload(
 
 	let (subject, destination) = if several {
 		(
-			format!("{} items to {}", sources.len(), destination_path),
-			destination_path.to_string(),
+			format!("{} items to {}", sources.len(), destination.path),
+			destination.path.to_string(),
 		)
 	} else {
 		let (source, target) = uploaded
@@ -528,28 +529,54 @@ pub(crate) async fn upload(
 	finish(ui, &progress, &subject, &destination)
 }
 
-/// Upload `local` to `destination_path`, inside it when `into` says so, returning the source and
-/// the remote path it was uploaded to.
-async fn upload_source(
+/// Where an upload's sources go: the remote path given, whether they go inside it, and the
+/// directory at that path once it is known to exist, so that several sources look it up once. The
+/// directory is not created up front: nothing is created when every source fails first.
+struct UploadDestination<'a> {
+	path: RemotePath,
+	into: bool,
+	dir: Option<DirType<'a, Normal>>,
+}
+
+/// Upload `local` to `destination`, returning the source and the remote path it was uploaded to.
+/// The destination's directory is looked up only while it is not known yet, and is kept once it
+/// is found or created.
+async fn upload_source<'a>(
 	ui: &mut UI,
-	client: &Arc<Client>,
+	client: &'a Arc<Client>,
 	progress: &TransferProgress,
 	local: LocalSource,
-	destination_path: &RemotePath,
-	into: bool,
+	destination: &mut UploadDestination<'a>,
 	options: &DirUploadOptions,
 ) -> Result<(String, String)> {
-	let destination = find_remote(client, destination_path).await?;
+	let existing = match destination.dir {
+		Some(_) => Existing::Dir,
+		None => {
+			let found = find_remote(client, &destination.path).await?;
+			let existing = found.existing();
+			if let RemoteItem::Dir(dir) = found {
+				destination.dir = Some(dir);
+			}
+			existing
+		}
+	};
 	let target = resolve_upload_target(
-		destination_path,
-		into,
-		destination.existing(),
+		&destination.path,
+		destination.into,
+		existing,
 		&local.name,
 		local.is_dir,
 	)?;
-	let parent_dir = match destination {
-		RemoteItem::Dir(dir) if &target.parent == destination_path => dir,
-		_ => find_or_create_remote_dir(client, &target.parent).await?,
+	let created;
+	let parent_dir = if target.parent == destination.path {
+		let dir = match destination.dir.take() {
+			Some(dir) => dir,
+			None => find_or_create_remote_dir(client, &target.parent).await?,
+		};
+		&*destination.dir.insert(dir)
+	} else {
+		created = find_or_create_remote_dir(client, &target.parent).await?;
+		&created
 	};
 
 	let target_path = target.parent.navigate(target.name.as_ref());
@@ -564,7 +591,7 @@ async fn upload_source(
 				&local.path,
 				target.name.as_ref(),
 				&target_path,
-				&parent_dir,
+				parent_dir,
 				options.clone(),
 			),
 		)
@@ -578,7 +605,7 @@ async fn upload_source(
 				progress,
 				&local.path,
 				target.name.as_ref(),
-				&parent_dir,
+				parent_dir,
 				options,
 			),
 		)
