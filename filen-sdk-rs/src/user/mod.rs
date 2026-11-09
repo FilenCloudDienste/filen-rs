@@ -10,7 +10,7 @@ use filen_types::{
 	api::v3::user::{
 		account::{Personal, UserAccountPlan, UserAccountSubs, UserAccountSubsInvoices},
 		events::UserEventDeserializeError,
-		sub::create::PaymentMethod,
+		sub::{create::PaymentMethod, withdraw::WithdrawalLanguage},
 	},
 	fs::Uuid,
 	serde::str::Base64EncodedBytes,
@@ -252,6 +252,35 @@ impl Client {
 		)
 		.await
 		.map(Base64EncodedBytes::into_bytes)
+	}
+
+	/// Withdraws from the contract of the subscription `uuid` (`UserAccountSubs::id`) in the
+	/// name `name`, mailing the confirmation to `email` in `lang`, and returns when the
+	/// withdrawal was received. Withdrawing again answers with the first withdrawal's time.
+	///
+	/// The backend mails the confirmation before it answers, so the call can take tens of
+	/// seconds.
+	///
+	/// Server codes: `sub_not_found`, `cannot_withdraw_sub_now` (not activated, or more than
+	/// 14 × 24 hours after its start), `invalid_params`.
+	pub async fn withdraw_subscription(
+		&self,
+		uuid: Uuid,
+		name: &str,
+		email: &str,
+		lang: WithdrawalLanguage,
+	) -> Result<DateTime<Utc>, Error> {
+		api::v3::user::sub::withdraw::post(
+			self.client(),
+			&api::v3::user::sub::withdraw::Request {
+				uuid,
+				name: Cow::Borrowed(name),
+				email: Cow::Borrowed(email),
+				lang,
+			},
+		)
+		.await
+		.map(|response| response.withdraw_requested)
 	}
 
 	pub async fn get_user_events(
@@ -627,6 +656,37 @@ mod js_impl {
 			let this = self.inner();
 			do_on_commander(move || async move { this.generate_invoice(invoice_uuid.into()).await })
 				.await
+		}
+
+		/// Withdraws from the contract of the subscription `uuid` (`UserAccountSubs.id`) in the
+		/// name `name`, mailing the confirmation to `email` in `lang`, and resolves with when
+		/// the withdrawal was received, in milliseconds since the epoch (the value
+		/// `UserAccountSubs.withdrawRequested` then holds). Withdrawing again resolves with the
+		/// first withdrawal's time.
+		///
+		/// The backend mails the confirmation before it answers, so the call can take tens of
+		/// seconds.
+		///
+		/// Server codes: `sub_not_found`, `cannot_withdraw_sub_now` (not activated, or more
+		/// than 14 × 24 hours after its start), `invalid_params`.
+		#[cfg_attr(
+			all(target_family = "wasm", target_os = "unknown"),
+			wasm_bindgen::prelude::wasm_bindgen(js_name = "withdrawSubscription")
+		)]
+		pub async fn withdraw_subscription(
+			&self,
+			uuid: UuidStr,
+			name: String,
+			email: String,
+			lang: WithdrawalLanguage,
+		) -> Result<i64, Error> {
+			let this = self.inner();
+			do_on_commander(move || async move {
+				this.withdraw_subscription(uuid.into(), &name, &email, lang)
+					.await
+					.map(|withdraw_requested| withdraw_requested.timestamp_millis())
+			})
+			.await
 		}
 
 		#[cfg_attr(

@@ -111,6 +111,7 @@ tsify_js_param!(
 	filen_types::api::v3::chat::typing::ChatTypingType,
 	filen_types::api::v3::notes::NoteType,
 	filen_types::api::v3::user::sub::create::PaymentMethod,
+	filen_types::api::v3::user::sub::withdraw::WithdrawalLanguage,
 );
 
 #[cfg(any(feature = "wasm-full", feature = "service-worker"))]

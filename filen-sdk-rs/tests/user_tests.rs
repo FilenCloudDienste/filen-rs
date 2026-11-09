@@ -16,7 +16,10 @@ use filen_sdk_rs::{
 	},
 	user::events::{DecryptedUserEvent, DecryptedUserEventKind},
 };
-use filen_types::{api::v3::dir::color::DirColor, fs::Uuid};
+use filen_types::{
+	api::v3::{dir::color::DirColor, user::sub::withdraw::WithdrawalLanguage},
+	fs::Uuid,
+};
 use futures::FutureExt;
 use rand::Rng;
 
@@ -163,6 +166,21 @@ async fn cancelling_an_unknown_subscription_answers_sub_not_found() {
 	let client = test_utils::RESOURCES.client().await;
 	let err = client
 		.cancel_subscription(unknown_uuid())
+		.await
+		.unwrap_err();
+	assert_eq!(err.server_code().as_deref(), Some("sub_not_found"), "{err}");
+}
+
+#[shared_test_runtime]
+async fn withdrawing_from_an_unknown_subscription_answers_sub_not_found() {
+	let client = test_utils::RESOURCES.client().await;
+	let err = client
+		.withdraw_subscription(
+			unknown_uuid(),
+			"Test User",
+			"test@example.com",
+			WithdrawalLanguage::En,
+		)
 		.await
 		.unwrap_err();
 	assert_eq!(err.server_code().as_deref(), Some("sub_not_found"), "{err}");
