@@ -26,7 +26,13 @@ pub(super) const EXCLUDE_DOT_FILES_RULES: &[&str] = &[".*", "!/.filenignore"];
 /// The file is replaced in one rename, never left half written: the new content is written to a
 /// temporary file beside it first, named as the sync engine's partial downloads are, which it never
 /// syncs. A file that is not valid UTF-8, which the engine does not read either, is not changed.
+///
+/// Without a rule to add, the `.filenignore` is not looked at, so a pair with no rules syncs
+/// whatever the file is.
 pub(super) fn add_rules(root: &Path, rules: &[String]) -> Result<()> {
+	if rule_lines(rules).next().is_none() {
+		return Ok(());
+	}
 	let path = root.join(FILENIGNORE);
 	let (text, permissions) = match fs::symlink_metadata(&path) {
 		Ok(meta) if meta.is_file() => {
@@ -69,10 +75,8 @@ pub(super) fn add_rules(root: &Path, rules: &[String]) -> Result<()> {
 /// or `None` when it holds them all. Blank lines in `rules` are not added.
 fn merged_rules(text: &str, rules: &[String]) -> Option<String> {
 	let mut present = text.lines().collect::<HashSet<_>>();
-	let missing = rules
-		.iter()
-		.flat_map(|rule| rule.lines())
-		.filter(|line| !line.trim().is_empty() && present.insert(line))
+	let missing = rule_lines(rules)
+		.filter(|line| present.insert(line))
 		.collect::<Vec<_>>();
 	if missing.is_empty() {
 		return None;
@@ -86,6 +90,14 @@ fn merged_rules(text: &str, rules: &[String]) -> Option<String> {
 		merged.push('\n');
 	}
 	Some(merged)
+}
+
+/// The lines of `rules` that are rules, all but the blank ones.
+fn rule_lines(rules: &[String]) -> impl Iterator<Item = &str> {
+	rules
+		.iter()
+		.flat_map(|rule| rule.lines())
+		.filter(|line| !line.trim().is_empty())
 }
 
 /// Replaces `path`, a file in `root`, with one holding `content` and, if given, `permissions`, in
@@ -212,6 +224,48 @@ mod tests {
 			)
 		);
 		assert_eq!(fs::read(&path).unwrap(), b"*.log\n\xff\n");
+		assert_eq!(names(root.path()), [".filenignore"]);
+	}
+
+	#[test]
+	fn without_rules_a_filenignore_that_is_not_utf_8_is_not_read() {
+		let root = tempfile::tempdir().unwrap();
+		let path = root.path().join(".filenignore");
+		fs::write(&path, [0xff, 0xfe]).unwrap();
+
+		add_rules(root.path(), &rules(&["", " \n"])).unwrap();
+
+		assert_eq!(fs::read(&path).unwrap(), [0xff, 0xfe]);
+		assert_eq!(names(root.path()), [".filenignore"]);
+	}
+
+	#[test]
+	fn without_rules_a_filenignore_directory_is_left_alone() {
+		let root = tempfile::tempdir().unwrap();
+		let path = root.path().join(".filenignore");
+		fs::create_dir(&path).unwrap();
+
+		add_rules(root.path(), &[]).unwrap();
+
+		assert!(fs::symlink_metadata(&path).unwrap().is_dir());
+		assert_eq!(names(&path), Vec::<String>::new());
+		assert_eq!(names(root.path()), [".filenignore"]);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn without_rules_a_symlinked_filenignore_is_left_alone() {
+		let root = tempfile::tempdir().unwrap();
+		let target = tempfile::tempdir().unwrap();
+		let target_file = target.path().join("rules");
+		fs::write(&target_file, "*.log\n").unwrap();
+		let path = root.path().join(".filenignore");
+		std::os::unix::fs::symlink(&target_file, &path).unwrap();
+
+		add_rules(root.path(), &[]).unwrap();
+
+		assert_eq!(fs::read_link(&path).unwrap(), target_file);
+		assert_eq!(fs::read_to_string(&target_file).unwrap(), "*.log\n");
 		assert_eq!(names(root.path()), [".filenignore"]);
 	}
 
