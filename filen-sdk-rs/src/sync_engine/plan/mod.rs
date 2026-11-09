@@ -1267,6 +1267,9 @@ pub(crate) fn unknown_remote_paths(
 	}
 	let mut unknown = BTreeMap::new();
 	let mut never_synced: Vec<UnsyncablePath> = Vec::new();
+	// The reasons already reported per path, so a repeated line is found without scanning every
+	// report. `UnsyncableReason` is not `Hash`, and a path rarely has more than one reason.
+	let mut reported: HashMap<&str, Vec<&UnsyncableReason>> = HashMap::new();
 	for item in skipped {
 		// The baseline's own uuid and lineage indexes, rather than two maps built over every row
 		// of the pair to answer one question per skipped item.
@@ -1278,20 +1281,28 @@ pub(crate) fn unknown_remote_paths(
 			unknown.insert(path, item.reason.clone());
 			continue;
 		}
-		let report = UnsyncablePath {
-			rel_path: item.rel_path.clone(),
-			reason: item.reason.clone(),
-		};
 		// Two undecodable items in one directory, or the items under one skipped directory, report
 		// the same line; once is enough.
-		if !never_synced.contains(&report) {
-			never_synced.push(report);
+		let reasons = reported.entry(item.rel_path.as_str()).or_default();
+		if !reasons.contains(&&item.reason) {
+			reasons.push(&item.reason);
+			never_synced.push(UnsyncablePath {
+				rel_path: item.rel_path.clone(),
+				reason: item.reason.clone(),
+			});
 		}
 	}
 	// A synced directory's subtree is already left alone with it: its synced descendants add no
-	// line of their own.
-	let unknown_dirs: Vec<String> = unknown.keys().cloned().collect();
-	unknown.retain(|path, _| !unknown_dirs.iter().any(|dir| is_under(path, dir)));
+	// line of their own. Each path asks the map for its own ancestors (never itself), which is what
+	// testing it with `is_under` against every key answered.
+	let covered: Vec<String> = unknown
+		.keys()
+		.filter(|path| ancestors(path).any(|at| unknown.contains_key(at)))
+		.cloned()
+		.collect();
+	for path in &covered {
+		unknown.remove(path);
+	}
 	(unknown, never_synced)
 }
 
