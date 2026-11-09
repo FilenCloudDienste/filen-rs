@@ -10,7 +10,7 @@ use filen_sdk_rs::{
 	auth::Client,
 	fs::{
 		HasName as _, HasParent as _, HasUUID as _,
-		categories::{DirType, NonRootFileType, NonRootItemType, Normal},
+		categories::{NonRootFileType, NonRootItemType, Normal, fs::ObjectOrRemainingPath},
 	},
 };
 use filen_types::fs::{ParentUuid, Uuid};
@@ -309,21 +309,29 @@ pub(crate) async fn expand<'a>(
 		let item = resolve_item(client, &operand, what).await?;
 		return Ok(vec![GivenItem { operand, item }]);
 	};
-	if let Some(item) = find_item(client, &operand).await? {
-		return Ok(vec![GivenItem { operand, item }]);
-	}
 	let ItemOperand::Path(path) = &operand else {
 		// only a path has a glob
 		return Err(operand.not_found(what));
 	};
 	let parent = path.parent();
-	let dir = match find_item(client, &ItemOperand::Path(parent.clone())).await? {
-		Some(NonRootFileType::Dir(dir)) => DirType::Dir(dir),
-		Some(NonRootFileType::Root(root)) => DirType::Root(root),
-		Some(NonRootFileType::File(_)) => {
-			return Err(UI::failure(&format!("Not a directory: {}", parent)));
+	// one walk finds the item named exactly like the glob, or else the directory to list; a
+	// parent that is a file fails the walk itself
+	let (mut walked, found) = client
+		.get_items_in_path(&path.0)
+		.await
+		.map_err(|(e, ..)| e)
+		.context("Failed to find file or directory")?;
+	let rest = match found {
+		ObjectOrRemainingPath::Object(item) => {
+			return Ok(vec![GivenItem { operand, item }]);
 		}
-		None => return Err(UI::failure(&format!("No such directory: {}", parent))),
+		ObjectOrRemainingPath::RemainingPath(rest) => rest,
+	};
+	// the walk stops at the first segment it does not find, and the last directory it found is
+	// the parent only when that segment is the glob
+	let dir = match walked.pop() {
+		Some(dir) if Some(rest.trim_start_matches('/')) == path.basename() => dir,
+		_ => return Err(UI::failure(&format!("No such directory: {}", parent))),
 	};
 	let (dirs, files) = client
 		.list_dir::<_, Normal>(&dir, None::<&fn(u64, Option<u64>)>)
