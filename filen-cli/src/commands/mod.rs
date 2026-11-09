@@ -60,6 +60,27 @@ impl Commands {
 			_ => false,
 		}
 	}
+
+	/// Whether this command uses the drive, so that `--working-path` is resolved, which logs in,
+	/// before it runs. Those that need neither the client nor the working path run without logging
+	/// in.
+	pub(crate) fn uses_drive(&self) -> bool {
+		match self {
+			// help, exit and the commands about the CLI itself and the local directory
+			Commands::Misc(_) | Commands::Shell(_) => false,
+			Commands::Auth(command) => command.uses_drive(),
+			Commands::Rclone(command) => command.uses_drive(),
+			Commands::Fs(_)
+			| Commands::Transfer(_)
+			| Commands::Sync(_)
+			| Commands::Notes(_)
+			| Commands::Search(_)
+			| Commands::PublicLinks(_)
+			| Commands::Account(_)
+			| Commands::Contacts(_)
+			| Commands::Shares(_) => true,
+		}
+	}
 }
 // (!) every command needs to be in its module's doc outline parts (`DOCS`), which
 // `docs::DOC_OUTLINE` places into the doc sections

@@ -671,8 +671,13 @@ async fn inner_main(ui: &mut ui::UI, arenas_limited: bool) -> Result<Finished> {
 	// from here or exits, so it waits for those releases, however the commands ended.
 	let finished = async {
 		if let Some(command) = cli_args.command {
-			let working_path =
-				initial_working_path(ui, &mut client, cli_args.working_path.as_deref()).await?;
+			// resolving --working-path logs in, which a command that does not use the drive does
+			// without
+			let given_working_path = cli_args
+				.working_path
+				.as_deref()
+				.filter(|_| command.uses_drive());
+			let working_path = initial_working_path(ui, &mut client, given_working_path).await?;
 			let _ = execute_cancellable(&config, ui, &mut client, &working_path, command).await?;
 			Ok(Finished::Success)
 		} else if script {
@@ -1310,6 +1315,38 @@ mod tests {
 			format!("Filen CLI {}", env!("CARGO_PKG_VERSION"))
 		);
 		assert_eq!(err.lines_or_empty(), "");
+	}
+
+	#[test]
+	fn working_path_is_resolved_only_for_commands_that_use_the_drive() {
+		let uses_drive = |args: &[&str]| {
+			parse_args(args.iter().copied())
+				.unwrap()
+				.args
+				.command
+				.expect("a command")
+				.uses_drive()
+		};
+		for local in [
+			&["filen", "version"][..],
+			&["filen", "completions", "bash"],
+			&["filen", "help"],
+			&["filen", "lpwd"],
+			&["filen", "lls"],
+			&["filen", "install", "latest"],
+			&["filen", "logout"],
+			&["filen", "profiles"],
+			&["filen", "rclone-info"],
+		] {
+			assert!(!uses_drive(local), "{local:?} uses the drive");
+		}
+		for remote in [
+			&["filen", "ls"][..],
+			&["filen", "whoami"],
+			&["filen", "mount"],
+		] {
+			assert!(uses_drive(remote), "{remote:?} does not use the drive");
+		}
 	}
 
 	#[test]

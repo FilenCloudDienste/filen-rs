@@ -79,6 +79,20 @@ pub(crate) const DOCS: &[DocElement] = &[
 ];
 
 impl AuthCommands {
+	/// Whether this command uses the drive: see [`super::Commands::uses_drive`]. `logout` and
+	/// `profiles` work on the local credentials and config only.
+	pub(super) fn uses_drive(&self) -> bool {
+		match self {
+			Self::Logout | Self::Profiles => false,
+			Self::Whoami
+			| Self::ExportAuthConfig { .. }
+			| Self::TwoFactor { .. }
+			| Self::ChangePassword
+			| Self::ChangeEmail { .. }
+			| Self::ExportMasterKeys => true,
+		}
+	}
+
 	pub(super) async fn execute(self, ctx: CommandContext<'_>) -> Result<CommandResult> {
 		let CommandContext {
 			config, ui, client, ..

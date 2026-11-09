@@ -299,6 +299,19 @@ pub(crate) const DOCS: &[DocElement] = &[
 ];
 
 impl RcloneCommands {
+	/// Whether this command uses the drive: see [`super::Commands::uses_drive`]. `rclone-info`
+	/// and `clear-rclone-cache` work on the local Rclone only, and the replaced commands only fail.
+	pub(super) fn uses_drive(&self) -> bool {
+		match self {
+			Self::Rclone { .. } | Self::Mount { .. } | Self::Serve(_) | Self::ExportApiKey => true,
+			Self::RcloneInfo { .. }
+			| Self::ClearRcloneCache
+			| Self::Webdav { .. }
+			| Self::S3 { .. }
+			| Self::WebdavProxy { .. } => false,
+		}
+	}
+
 	pub(super) async fn execute(self, ctx: CommandContext<'_>) -> Result<CommandResult> {
 		let CommandContext {
 			config, ui, client, ..
