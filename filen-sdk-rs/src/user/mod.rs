@@ -228,6 +228,19 @@ impl Client {
 		.map(|response| response.url)
 	}
 
+	/// Cancels the subscription `uuid` (`UserAccountSubs::id`). Cancelling one that is
+	/// already cancelled succeeds.
+	///
+	/// Server codes: `sub_not_found`, `cannot_cancel_sub_now` (not activated yet, or within
+	/// 24 hours of its start), `invalid_params`.
+	pub async fn cancel_subscription(&self, uuid: Uuid) -> Result<(), Error> {
+		api::v3::user::sub::cancel::post(
+			self.client(),
+			&api::v3::user::sub::cancel::Request { uuid },
+		)
+		.await
+	}
+
 	pub async fn get_user_events(
 		&self,
 		filter: Option<&str>,
@@ -572,6 +585,21 @@ mod js_impl {
 				this.create_subscription(u64::from(plan_id), method).await
 			})
 			.await
+		}
+
+		/// Cancels the subscription `uuid` (`UserAccountSubs.id`). Cancelling one that is
+		/// already cancelled succeeds.
+		///
+		/// Server codes: `sub_not_found`, `cannot_cancel_sub_now` (not activated yet, or within
+		/// 24 hours of its start), `invalid_params`.
+		#[cfg_attr(
+			all(target_family = "wasm", target_os = "unknown"),
+			wasm_bindgen::prelude::wasm_bindgen(js_name = "cancelSubscription")
+		)]
+		pub async fn cancel_subscription(&self, uuid: UuidStr) -> Result<(), Error> {
+			let this = self.inner();
+			do_on_commander(move || async move { this.cancel_subscription(uuid.into()).await })
+				.await
 		}
 
 		#[cfg_attr(

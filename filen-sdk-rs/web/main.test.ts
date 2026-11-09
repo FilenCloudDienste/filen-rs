@@ -326,6 +326,20 @@ test("appear offline round trip", async () => {
 	expect((await state.getUserInfo()).appearOffline).toBe(original)
 })
 
+test("billing calls on an id the account does not hold reject with the server's code", async () => {
+	const unknown = "0bad0000-0000-4000-8000-000000000001"
+	const serverCode = async (call: Promise<unknown>) => {
+		try {
+			await call
+		} catch (e) {
+			expect(e).toBeInstanceOf(FilenSdkError)
+			return (e as FilenSdkError).server_code()
+		}
+		expect.fail("Expected the call to reject")
+	}
+	expect(await serverCode(state.cancelSubscription(unknown))).toBe("sub_not_found")
+})
+
 test("serialization", async () => {
 	const serializedState = await state.toStringified()
 	expect(serializedState.rootUuid).toEqual(state.root().uuid)

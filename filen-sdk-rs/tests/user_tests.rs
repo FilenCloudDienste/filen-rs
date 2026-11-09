@@ -153,6 +153,21 @@ async fn appear_offline_toggle_round_trip() {
 	assert_eq!(restored, original, "appear_offline flag should be restored");
 }
 
+/// A subscription id the account does not hold.
+fn unknown_uuid() -> Uuid {
+	Uuid::from_u128(0x0bad_0000_0000_4000_8000_0000_0000_0001)
+}
+
+#[shared_test_runtime]
+async fn cancelling_an_unknown_subscription_answers_sub_not_found() {
+	let client = test_utils::RESOURCES.client().await;
+	let err = client
+		.cancel_subscription(unknown_uuid())
+		.await
+		.unwrap_err();
+	assert_eq!(err.server_code().as_deref(), Some("sub_not_found"), "{err}");
+}
+
 /// With versioning enabled, uploading a file with the same name + parent should
 /// retain the previous version (not replace it). With versioning disabled, the
 /// previous upload should not produce a version entry.
