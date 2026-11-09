@@ -146,8 +146,9 @@ impl WatchConfig {
 	}
 }
 
-/// An active continuous sync. Dropping it stops the background loop, the FS watcher, and the
-/// cache subscription; [`stop`](Self::stop) does the same but waits for the loop to finish.
+/// An active continuous sync. Dropping it stops the background loop, and with it the FS watcher and
+/// the cache subscription, which live as long as the loop does; [`stop`](Self::stop) does the same
+/// but waits for the loop to finish.
 ///
 /// The loop can also end on its own, when the pair is removed underneath it (see
 /// [`SyncEngine::remove_pair`](super::SyncEngine::remove_pair)); the handle stays usable either
@@ -158,10 +159,6 @@ pub struct WatchHandle {
 	// Resolves when the background loop has returned; `stop` awaits it.
 	loop_done: tokio::task::JoinHandle<()>,
 	status: tokio::sync::watch::Receiver<WatchStatus>,
-	// Holds the FS watcher alive for the watch's lifetime; `None` when it could not be set up, and
-	// the status says so (see [`WatchStatus`]). The cache registration lives in the loop, which
-	// asks for it again while it has none (see [`RemoteDoorbell`]).
-	_watcher: Option<notify::RecommendedWatcher>,
 }
 
 impl WatchHandle {
@@ -181,7 +178,6 @@ impl WatchHandle {
 			shutdown,
 			loop_done,
 			status: _status,
-			_watcher,
 		} = self;
 		drop(shutdown);
 		// The loop only fails to join if it panicked; nothing left to wait for either way.
@@ -394,6 +390,7 @@ impl SyncEngine {
 				status: status_tx,
 				remote_root: record.remote_root,
 				remote,
+				watcher,
 			})
 			.in_current_span(),
 		);
@@ -402,7 +399,6 @@ impl SyncEngine {
 			shutdown: shutdown_tx,
 			loop_done,
 			status: status_rx,
-			_watcher: watcher,
 		})
 	}
 }
@@ -462,6 +458,11 @@ struct WatchLoop {
 	remote_root: Uuid,
 	/// The watch's own cache subscription for remote changes, which rings `dirty`.
 	remote: RemoteDoorbell<SyncRootHandle>,
+	/// The FS watcher, held for as long as the loop runs and dropped only after the loop has given
+	/// up the pair's local coverage: while the pair counts as covered, a pass narrows its local read
+	/// to what this watcher recorded. `None` when it could not be set up, and the status says so
+	/// (see [`WatchStatus`]).
+	watcher: Option<notify::RecommendedWatcher>,
 }
 
 /// The background loop: an initial pass, then debounced passes on `dirty`, plus a periodic pass,
@@ -482,6 +483,7 @@ async fn run_loop(watch: WatchLoop) {
 		status,
 		remote_root,
 		mut remote,
+		watcher,
 	} = watch;
 	let mut failures: u32 = 0;
 	// Held from the first pass of a run of failures that could not reach the server until a pass
@@ -632,6 +634,9 @@ async fn run_loop(watch: WatchLoop) {
 	if let Some(changes) = engine.existing_pair_changes(pair).await {
 		changes.uncover_local();
 	}
+	// Only now: a pass that starts while the pair still counts as covered reads the list this
+	// watcher fills.
+	drop(watcher);
 	let ended = if stop.pair_removed() {
 		WatchState::PairRemoved
 	} else {

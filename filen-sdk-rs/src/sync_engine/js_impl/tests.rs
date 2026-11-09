@@ -629,7 +629,8 @@ async fn a_loop_that_ends_without_a_terminal_status_is_reported_stopped() {
 	status_tx.send_modify(|status| status.consecutive_failures = 1);
 	assert_eq!(next_status(&mut received).await.consecutive_failures, 1);
 
-	// The loop panicked: its observer went, its status sender (held by the watcher) did not.
+	// The loop ended without a terminal status while a sender is still open: `loop_gone` alone
+	// must yield the Stopped status.
 	drop(loop_alive);
 	pumping.await.unwrap();
 

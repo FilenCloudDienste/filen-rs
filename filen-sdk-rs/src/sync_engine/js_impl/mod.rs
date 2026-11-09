@@ -921,8 +921,8 @@ impl SyncEngineCore {
 impl Drop for SyncEngineCore {
 	/// A core dropped without [`close`](JsSyncEngine::close) still stops its watches before its
 	/// engine goes. Every other activity holds the core, so watches are all that can be left.
-	/// Spawned, never run here: the last handle can go on the JS thread, and stopping a watch joins
-	/// its filesystem watcher's thread.
+	/// Spawned, never run here: the last handle can go on the JS thread, and stopping a watch waits
+	/// for its loop to end, which is where the loop joins its filesystem watcher's thread.
 	fn drop(&mut self) {
 		let Some(open) = self
 			.engine
@@ -1001,8 +1001,8 @@ fn ended(latest: WatchStatus) -> WatchStatus {
 
 /// Deliver a watch's status once, then every change, until it ends; then free the pair's slot if
 /// it still holds this watch. `loop_gone` resolves when the watch loop has ended, for any reason (a
-/// panic included): the status channel alone never closes while the filesystem watcher holds a
-/// sender, so without it a loop that died would look quiet for ever.
+/// panic included). The status channel closes then too, since the loop's task owns the filesystem
+/// watcher and with it every sender, but `loop_gone` says so directly rather than relying on that.
 async fn pump_status(pump: StatusPump, mut loop_gone: oneshot::Receiver<()>) {
 	let StatusPump {
 		core,
@@ -1045,7 +1045,7 @@ async fn pump_status(pump: StatusPump, mut loop_gone: oneshot::Receiver<()>) {
 		}
 	};
 	if let Some(watch) = running {
-		// Its loop is done, so this only lets go of the watcher.
+		// Its loop is done, so this only joins its finished task.
 		watch.handle.stop().await;
 	}
 }
