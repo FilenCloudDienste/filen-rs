@@ -18,5 +18,6 @@ pub mod password;
 pub mod personal;
 pub mod public_key;
 pub mod settings;
+pub mod sub;
 pub mod two_fa;
 pub mod versioning;

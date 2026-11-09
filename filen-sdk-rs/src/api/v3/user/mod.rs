@@ -18,5 +18,6 @@ pub(crate) mod password;
 pub(crate) mod personal;
 pub(crate) mod public_key;
 pub(crate) mod settings;
+pub(crate) mod sub;
 pub(crate) mod two_fa;
 pub(crate) mod versioning;

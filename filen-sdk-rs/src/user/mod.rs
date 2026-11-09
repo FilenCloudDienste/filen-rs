@@ -10,6 +10,7 @@ use filen_types::{
 	api::v3::user::{
 		account::{Personal, UserAccountPlan, UserAccountSubs, UserAccountSubsInvoices},
 		events::UserEventDeserializeError,
+		sub::create::PaymentMethod,
 	},
 	fs::Uuid,
 	serde::str::Base64EncodedBytes,
@@ -204,6 +205,27 @@ impl Client {
 			&api::v3::user::appear_offline::Request { appear_offline },
 		)
 		.await
+	}
+
+	/// Opens a checkout for the plan `plan_id` paid with `method`, and returns the URL of the
+	/// payment provider's page where the user pays.
+	///
+	/// The request is retried like any other, so a retry after a lost answer can open a second
+	/// checkout; only the one the user pays takes effect.
+	///
+	/// Server codes: `plan_not_found`, `plan_not_active`, `invalid_plan_for_method` (crypto for
+	/// a plan that is not a lifetime one), `rate_limited`, `invalid_params`.
+	pub async fn create_subscription(
+		&self,
+		plan_id: u64,
+		method: PaymentMethod,
+	) -> Result<String, Error> {
+		api::v3::user::sub::create::post(
+			self.client(),
+			&api::v3::user::sub::create::Request { plan_id, method },
+		)
+		.await
+		.map(|response| response.url)
 	}
 
 	pub async fn get_user_events(
@@ -525,6 +547,31 @@ mod js_impl {
 			let this = self.inner();
 			do_on_commander(move || async move { this.set_appear_offline(appear_offline).await })
 				.await
+		}
+
+		/// Opens a checkout for the plan `planId` (a plan id as the remote config lists it)
+		/// paid with `method`, and resolves with the URL of the payment provider's page where
+		/// the user pays.
+		///
+		/// The request is retried like any other, so a retry after a lost answer can open a
+		/// second checkout; only the one the user pays takes effect.
+		///
+		/// Server codes: `plan_not_found`, `plan_not_active`, `invalid_plan_for_method`
+		/// (crypto for a plan that is not a lifetime one), `rate_limited`, `invalid_params`.
+		#[cfg_attr(
+			all(target_family = "wasm", target_os = "unknown"),
+			wasm_bindgen::prelude::wasm_bindgen(js_name = "createSubscription")
+		)]
+		pub async fn create_subscription(
+			&self,
+			plan_id: u32,
+			method: PaymentMethod,
+		) -> Result<String, Error> {
+			let this = self.inner();
+			do_on_commander(move || async move {
+				this.create_subscription(u64::from(plan_id), method).await
+			})
+			.await
 		}
 
 		#[cfg_attr(

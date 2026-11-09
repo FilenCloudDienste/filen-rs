@@ -394,7 +394,9 @@ test("an async call whose params do not parse rejects with Conversion, and the c
 		["a uuid", () => state.getDir("not a uuid")],
 		["a list", () => state.createChat([1] as any)],
 		["a list of strings", () => state.addEventListener(() => {}, [1] as any)],
-		["an optional param", () => state.listOutShared(1 as any)]
+		["an optional param", () => state.listOutShared(1 as any)],
+		// rejected before any request, so no checkout is opened
+		["a unit enum", () => state.createSubscription(1, "card" as any)]
 	]
 	for (const [param, call] of calls) {
 		const error = await call().catch((e: unknown) => e)

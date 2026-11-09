@@ -110,6 +110,7 @@ macro_rules! tsify_js_param {
 tsify_js_param!(
 	filen_types::api::v3::chat::typing::ChatTypingType,
 	filen_types::api::v3::notes::NoteType,
+	filen_types::api::v3::user::sub::create::PaymentMethod,
 );
 
 #[cfg(any(feature = "wasm-full", feature = "service-worker"))]
