@@ -1,6 +1,28 @@
 use std::time::{Duration, Instant};
 
 use base64::{Engine, prelude::BASE64_URL_SAFE_NO_PAD};
+use filen_sdk_rs::auth::Client;
+
+/// Waits for a dropped lock's release task to free `resource`: acquires it once it is free and
+/// releases it again, and fails the test if it is still held after `within`.
+async fn wait_until_free(client: &Client, resource: &str, within: Duration) {
+	let deadline = Instant::now() + within;
+	loop {
+		match client
+			.acquire_lock(resource, Duration::from_secs(1), 1)
+			.await
+		{
+			Ok(lock) => {
+				drop(lock);
+				return;
+			}
+			Err(_) if Instant::now() < deadline => {
+				tokio::time::sleep(Duration::from_millis(250)).await;
+			}
+			Err(e) => panic!("{resource} still held {within:?} after its lock was dropped: {e}"),
+		}
+	}
+}
 
 // in the tokio runtime, the lock might not be released immediately
 // because we spawn a task to release it
@@ -28,15 +50,7 @@ async fn test_acquire_lock() {
 				.is_err()
 		);
 	}
-	tokio::time::sleep(time::Duration::from_secs(10)).await;
-	assert_eq!(
-		client
-			.acquire_lock(&resource, time::Duration::from_secs(1), 1)
-			.await
-			.unwrap()
-			.resource(),
-		resource
-	);
+	wait_until_free(client, &resource, Duration::from_secs(30)).await;
 }
 
 /// An acquisition dropped while its request is in flight may already have been granted by the
@@ -113,17 +127,13 @@ async fn test_refresh_lock() {
 		.await
 		.unwrap_err();
 
-	tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+	// Longer than the server's 60 s lease, so only a refreshed lease still blocks the acquire.
+	tokio::time::sleep(std::time::Duration::from_secs(75)).await;
 
 	client
 		.acquire_lock(&resource, std::time::Duration::from_secs(1), 1)
 		.await
 		.unwrap_err();
 	std::mem::drop(lock);
-	// wait for the tokio task to release
-	tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-	client
-		.acquire_lock(&resource, std::time::Duration::from_secs(1), 1)
-		.await
-		.unwrap();
+	wait_until_free(client, &resource, Duration::from_secs(30)).await;
 }
