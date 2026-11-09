@@ -12,9 +12,8 @@ use clap::{ArgMatches, Command, CommandFactory as _, parser::ValueSource};
 use log::warn;
 
 use crate::{
-	CliArgs, ParsedArgs,
-	log_files::{open_private, private_file_options},
-	parse_repl_line_matches,
+	CliArgs, ParsedArgs, parse_repl_line_matches,
+	private_file::{open_private, open_private_append, private_file_options},
 };
 
 /// The file in the config directory that holds the history.
@@ -93,8 +92,8 @@ impl ReplHistory {
 		let Some(file) = &mut self.file else {
 			return;
 		};
-		let appended = open_private(private_file_options().create(true).append(true), &file.path)
-			.and_then(|mut opened| writeln!(opened, "{line}"));
+		let appended =
+			open_private_append(&file.path).and_then(|mut opened| writeln!(opened, "{line}"));
 		match appended {
 			Ok(()) => file.lines = file.lines.saturating_add(1),
 			Err(e) => {

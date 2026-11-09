@@ -1,19 +1,18 @@
 use std::{
 	ffi::{OsStr, OsString},
-	fs::{self, File, OpenOptions},
+	fs::{self, File},
 	io::{self, Write},
 	path::{Path, PathBuf},
 	sync::{Mutex, PoisonError},
 	time::{Duration, SystemTime},
 };
 #[cfg(unix)]
-use std::{
-	fs::Permissions,
-	os::unix::fs::{OpenOptionsExt, PermissionsExt},
-};
+use std::{fs::Permissions, os::unix::fs::PermissionsExt};
 
 use chrono::{DateTime, Local, NaiveDate};
 use log::{LevelFilter, Log, Metadata, Record};
+
+use crate::private_file::{open_private, open_private_append, private_file_options};
 
 /// The file in the log directory that holds the latest run, from its start.
 pub(crate) const LATEST: &str = "latest.log";
@@ -23,36 +22,11 @@ const DATETIME_FORMAT: &str = "%Y-%m-%d %H:%M:%S";
 
 const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
 
-/// The mode of each log file on unix: only its owner can read or write it, as the log files can
-/// hold paths, file names and error details from the account.
-#[cfg(unix)]
-const PRIVATE_FILE_MODE: u32 = 0o600;
-
-/// The mode of the log directory on unix: only its owner can list or enter it.
+/// The mode of the log directory on unix: only its owner can list or enter it. Each log file is
+/// a private file ([`crate::private_file::PRIVATE_FILE_MODE`]), as the log files can hold paths,
+/// file names and error details from the account.
 #[cfg(unix)]
 const PRIVATE_DIR_MODE: u32 = 0o700;
-
-/// Options that create a file with [`PRIVATE_FILE_MODE`] on unix.
-pub(crate) fn private_file_options() -> OpenOptions {
-	let options = OpenOptions::new();
-	#[cfg(unix)]
-	let options = {
-		let mut options = options;
-		options.mode(PRIVATE_FILE_MODE);
-		options
-	};
-	options
-}
-
-/// Opens `path` with `options`, then sets [`PRIVATE_FILE_MODE`] on it on unix: the mode in
-/// `options` applies only to a file the open creates, and a log file that already exists may have
-/// been created with the default mode by an older CLI.
-pub(crate) fn open_private(options: &OpenOptions, path: &Path) -> io::Result<File> {
-	let file = options.open(path)?;
-	#[cfg(unix)]
-	file.set_permissions(Permissions::from_mode(PRIVATE_FILE_MODE))?;
-	Ok(file)
-}
 
 /// The CLI's log files: `latest.log`, and a `<date>.log` per day next to it.
 ///
@@ -263,8 +237,9 @@ pub(crate) struct ChosenLogFile {
 }
 
 impl ChosenLogFile {
-	/// Opens the file at `path` for appending, creating it with [`PRIVATE_FILE_MODE`] on unix if
-	/// it does not exist. The mode of an existing file is left as it is.
+	/// Opens the file at `path` for appending, creating it with
+	/// [`crate::private_file::PRIVATE_FILE_MODE`] on unix if it does not exist. The mode of an
+	/// existing file is left as it is.
 	pub(crate) fn open(path: &Path, level: LevelFilter) -> io::Result<Self> {
 		Ok(Self {
 			level,
@@ -313,7 +288,7 @@ impl LogFile {
 			&path,
 		)?;
 		Ok(Self {
-			file: open_private(private_file_options().create(true).append(true), &path)?,
+			file: open_private_append(&path)?,
 			path,
 		})
 	}
@@ -321,7 +296,7 @@ impl LogFile {
 	fn open_daily(dir: &Path, day: NaiveDate) -> io::Result<Self> {
 		let path = dir.join(format!("{}.log", day.format("%Y-%m-%d")));
 		Ok(Self {
-			file: open_private(private_file_options().create(true).append(true), &path)?,
+			file: open_private_append(&path)?,
 			path,
 		})
 	}
@@ -347,7 +322,7 @@ impl LogFile {
 			Err(e) if e.kind() == io::ErrorKind::NotFound => {}
 			Err(e) => return Err(e),
 		}
-		self.file = open_private(private_file_options().create(true).append(true), &self.path)?;
+		self.file = open_private_append(&self.path)?;
 		Ok(())
 	}
 

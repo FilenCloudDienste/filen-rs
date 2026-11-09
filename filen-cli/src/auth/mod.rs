@@ -40,6 +40,7 @@ mod profile;
 use std::os::unix::fs::PermissionsExt;
 use std::{
 	borrow::Cow,
+	io::Write as _,
 	path::{Path, PathBuf, is_separator},
 	sync::Arc,
 	time::Duration,
@@ -59,6 +60,7 @@ pub(crate) use self::account::{
 pub(crate) use self::profile::{ProfileName, Profiles, print_profiles};
 use crate::{
 	CliConfig, ClientConfigArgs, build_client_config, default_config_dir, deserialize_auth_config,
+	private_file::{open_private, private_file_options},
 	serialize_auth_config,
 	ui::UI,
 	util::{ChunkStore as _, KeyringChunkStore, LongKeyringEntry},
@@ -1237,24 +1239,17 @@ const AUTH_CONFIG_FILENAME: &str = "filen-cli-auth-config.txt"; // (!) reference
 /// Write `contents` to `path`, creating or truncating it with owner-only permissions
 /// (mode `0o600` on Unix). The auth config holds the master keys, private key and API key,
 /// so it must never be left group- or world-readable for other users on the machine.
+///
+/// A pre-existing file keeps its previous mode through create+truncate, so [`open_private`]
+/// tightens it while it is still empty, before any secret bytes are written.
 fn write_private_file(path: &Path, contents: &str) -> std::io::Result<()> {
-	use std::io::Write;
-
-	let mut options = std::fs::OpenOptions::new();
-	options.write(true).create(true).truncate(true);
-	#[cfg(unix)]
-	{
-		use std::os::unix::fs::OpenOptionsExt;
-		options.mode(0o600);
-	}
-	let mut file = options.open(path)?;
-	// A pre-existing file keeps its previous mode through create+truncate, so tighten it
-	// explicitly while it is still empty, before any secret bytes are written.
-	#[cfg(unix)]
-	{
-		use std::os::unix::fs::PermissionsExt;
-		file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-	}
+	let mut file = open_private(
+		private_file_options()
+			.write(true)
+			.create(true)
+			.truncate(true),
+		path,
+	)?;
 	file.write_all(contents.as_bytes())
 }
 

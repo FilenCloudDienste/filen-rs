@@ -68,6 +68,7 @@ mod interrupt;
 mod local_glob;
 mod log_files;
 mod memory;
+mod private_file;
 mod repl_history;
 mod serve_cert;
 mod ts_leftovers;
