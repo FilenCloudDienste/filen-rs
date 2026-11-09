@@ -15,7 +15,6 @@ mod lock;
 mod mount;
 #[cfg(feature = "rclone-managed")]
 mod passthrough;
-mod private_file;
 mod rc;
 mod recovery;
 mod refusal;

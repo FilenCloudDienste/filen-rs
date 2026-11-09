@@ -12,6 +12,8 @@ pub(crate) mod fs_tree;
 mod js_impl;
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 mod meta_ext;
+#[cfg(feature = "rclone")]
+pub(crate) mod private_file;
 
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 mod canonical_path;

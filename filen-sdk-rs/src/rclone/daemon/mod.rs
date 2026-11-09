@@ -50,11 +50,11 @@ use crate::{
 	Error, ErrorKind,
 	auth::Client,
 	error::ResultExt as _,
+	io::private_file::write_private_file,
 	rclone::{
 		RcloneBinary, RcloneRefusal,
 		binary::{MIN_RCLONE, parse_version},
 		lock::FileLock,
-		private_file::write_private_file,
 		rc::{CoreStatsTransfer, RcClient},
 		recovery::{
 			HTPASSWD_FILE, Instance, PIDFILE, PidRecord, force_unmount, lock_cache,

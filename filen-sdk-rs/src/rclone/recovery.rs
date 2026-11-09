@@ -24,10 +24,10 @@ use tracing::{info, warn};
 use crate::{
 	Error, ErrorKind,
 	error::ResultExt as _,
+	io::private_file::{remove_file_if_present, write_private_file},
 	rclone::{
 		RcloneRefusal,
 		lock::{FileLock, lock, try_lock},
-		private_file::write_private_file,
 		system::{ProcessIdentity, identify, processes_under, stop_processes},
 	},
 };
@@ -548,11 +548,7 @@ fn unmount_commands() -> [(&'static str, &'static [&'static str]); 3] {
 }
 
 fn remove_if_present(path: &Path) -> Result<(), Error> {
-	match std::fs::remove_file(path) {
-		Ok(()) => Ok(()),
-		Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-		Err(e) => Err(Error::from(e).with_context(format!("failed to remove {}", path.display()))),
-	}
+	remove_file_if_present(path).context(format!("failed to remove {}", path.display()))
 }
 
 #[cfg(test)]
