@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::warn;
 
-use super::JOURNAL_MAX_AGE;
+use super::SERVER_RETENTION;
 use crate::{
 	Error, ErrorKind,
 	error::ResultExt as _,
@@ -329,11 +329,11 @@ fn prepare_dir(dir: &Path) -> Result<(), Error> {
 	Ok(())
 }
 
-/// Removes from `dir` the journals that started more than [`JOURNAL_MAX_AGE`] before `now`, the
+/// Removes from `dir` the journals that started more than [`SERVER_RETENTION`] before `now`, the
 /// journal files that cannot be read as one, and leftover temp files.
 fn purge(dir: &Path, now: DateTime<Utc>) -> Result<(), Error> {
 	// Before the earliest time chrono holds, nothing can be older.
-	let cutoff = now.checked_sub_signed(JOURNAL_MAX_AGE);
+	let cutoff = now.checked_sub_signed(SERVER_RETENTION);
 	let entries = std::fs::read_dir(dir).context(format!(
 		"failed to list upload journal directory {}",
 		dir.display()

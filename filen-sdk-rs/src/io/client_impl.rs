@@ -34,7 +34,13 @@ use crate::{
 		categories::{DirType, Normal},
 		file::{FileBuilderOptionalName, chunk::Chunk},
 	},
-	io::{CanonicalPath, FilenMetaExt, PartialDownload, meta_ext::FileTimesExt},
+	io::{
+		CanonicalPath, FilenMetaExt, PartialDownload,
+		meta_ext::FileTimesExt,
+		upload_resume::{
+			ClientResumeBackend, ResumeCallbacks, ResumeSource, UploadJournalStore, upload_resuming,
+		},
+	},
 	util::AtomicDropCanceller,
 };
 
@@ -312,44 +318,8 @@ impl Client {
 		path: PathBuf,
 		callback: Option<MaybeSendCallback<'_, u64>>,
 	) -> Result<(RemoteFile, std::fs::File), Error> {
-		let (meta, file, path) = tokio::task::spawn_blocking(|| {
-			let file = std::fs::File::open(&path)?;
-			let meta = file.metadata()?;
-			Ok::<_, std::io::Error>((meta, file, path))
-		})
-		.await
-		.unwrap()?;
-
-		let mut file_builder = builder.into_builder(
-			&|| {
-				path.file_name()
-					.ok_or_else(|| {
-						Error::custom(
-							ErrorKind::IO,
-							format!("Provided path {} has no file name", path.display()),
-						)
-					})?
-					.to_str()
-					.ok_or_else(|| {
-						Error::custom(
-							ErrorKind::IO,
-							format!(
-								"Provided path {} has invalid UTF-8 in file name",
-								path.display()
-							),
-						)
-					})
-			},
-			self,
-		)?;
-
-		if file_builder.get_created().is_none() {
-			file_builder = file_builder.created(FilenMetaExt::created(&meta));
-		}
-		if file_builder.get_modified().is_none() {
-			file_builder = file_builder.modified(FilenMetaExt::modified(&meta));
-		}
-
+		let (meta, file, path) = open_source(path).await?;
+		let file_builder = self.resolve_path_builder(builder, &path, &meta)?;
 		let original_size = FilenMetaExt::size(&meta);
 
 		let (exif_tee, base_file) = build_exif_tee_from_builder(file_builder);
@@ -395,6 +365,110 @@ impl Client {
 			.expect("a closed writer holds the uploaded file (should be impossible)");
 		Ok((uploaded, file))
 	}
+
+	/// Uploads the file at `path` as
+	/// [`upload_file_from_path_with_builder`](Self::upload_file_from_path_with_builder) does, but
+	/// continues an earlier, unfinished upload of the same file into the same directory under the
+	/// same name, and keeps a journal in `journal` of what this one sent, for a later call to
+	/// continue it when it does not finish.
+	///
+	/// The journal holds the upload's uuid, keys and which chunks the server acknowledged,
+	/// encrypted with the account's master keys. An earlier upload is continued only when the
+	/// file's size, modification time and (on Unix) inode are unchanged, and when it can be
+	/// finished well within about a day of its first chunk, how long the server is assumed to keep
+	/// unfinished chunks; otherwise the upload starts over under a new uuid and keys. A file of fewer
+	/// than 8 chunks is never journaled. Every byte is read again to hash the file, but only the
+	/// chunks not acknowledged are sent. An upload the server already finished, whose answer was
+	/// lost, is not sent again: the finished file is returned. If the server refuses to finish a
+	/// continued upload because chunks are missing, the upload starts over once.
+	///
+	/// `on_resumed` is called once, before anything is sent, with how many bytes an earlier upload
+	/// sent that are not sent again, when there are any. `callback` reports the bytes sent, so the
+	/// two add up to the file's size; after an upload started over, the bytes sent again count
+	/// again. When the server refuses a chunk because the earlier upload was finished after all,
+	/// `on_resumed` is called once more, with the bytes this upload did not send.
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	pub async fn upload_file_from_path_resuming(
+		&self,
+		builder: FileBuilderOptionalName,
+		path: PathBuf,
+		journal: &dyn UploadJournalStore,
+		callback: Option<MaybeSendCallback<'_, u64>>,
+		on_resumed: Option<MaybeSendCallback<'_, u64>>,
+	) -> Result<(RemoteFile, std::fs::File), Error> {
+		let (meta, file, path) = open_source(path).await?;
+		let builder = self.resolve_path_builder(builder, &path, &meta)?;
+		upload_resuming(
+			&ClientResumeBackend { client: self },
+			ResumeSource {
+				builder,
+				file,
+				meta,
+				path,
+			},
+			journal,
+			ResumeCallbacks {
+				callback,
+				on_resumed,
+			},
+		)
+		.await
+	}
+
+	/// `builder` for the upload of the file at `path`, whose metadata is `meta`: named after the
+	/// file unless it has a name, and with the file's created and modified times unless it has
+	/// its own.
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	fn resolve_path_builder(
+		&self,
+		builder: FileBuilderOptionalName,
+		path: &Path,
+		meta: &std::fs::Metadata,
+	) -> Result<FileBuilder, Error> {
+		let mut file_builder = builder.into_builder(
+			&|| {
+				path.file_name()
+					.ok_or_else(|| {
+						Error::custom(
+							ErrorKind::IO,
+							format!("Provided path {} has no file name", path.display()),
+						)
+					})?
+					.to_str()
+					.ok_or_else(|| {
+						Error::custom(
+							ErrorKind::IO,
+							format!(
+								"Provided path {} has invalid UTF-8 in file name",
+								path.display()
+							),
+						)
+					})
+			},
+			self,
+		)?;
+
+		if file_builder.get_created().is_none() {
+			file_builder = file_builder.created(FilenMetaExt::created(meta));
+		}
+		if file_builder.get_modified().is_none() {
+			file_builder = file_builder.modified(FilenMetaExt::modified(meta));
+		}
+		Ok(file_builder)
+	}
+}
+
+/// Opens the file at `path` and reads its metadata, on a blocking thread.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+async fn open_source(path: PathBuf) -> Result<(std::fs::Metadata, std::fs::File, PathBuf), Error> {
+	let (meta, file, path) = tokio::task::spawn_blocking(|| {
+		let file = std::fs::File::open(&path)?;
+		let meta = file.metadata()?;
+		Ok::<_, std::io::Error>((meta, file, path))
+	})
+	.await
+	.unwrap()?;
+	Ok((meta, file, path))
 }
 
 /// What a local scan running on a blocking thread reports back to the task awaiting it.
@@ -512,7 +586,7 @@ where
 
 /// Runs `op` over `file` and `data` on a blocking thread, handing both back.
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-async fn on_blocking_thread(
+pub(super) async fn on_blocking_thread(
 	mut file: std::fs::File,
 	mut data: Vec<u8>,
 	op: impl FnOnce(&mut std::fs::File, &mut Vec<u8>) -> std::io::Result<()> + Send + 'static,
@@ -530,7 +604,11 @@ async fn on_blocking_thread(
 /// Appends what `reader` yields to `data` until `data` holds `len` bytes or `reader` ends,
 /// reading into `data`'s own memory.
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-fn fill_from(reader: &mut impl Read, data: &mut Vec<u8>, len: usize) -> std::io::Result<()> {
+pub(super) fn fill_from(
+	reader: &mut impl Read,
+	data: &mut Vec<u8>,
+	len: usize,
+) -> std::io::Result<()> {
 	let mut filled = data.len();
 	// zeroed first: reading into spare capacity needs `core_io_borrowed_buf`
 	// https://github.com/rust-lang/rust/issues/117693

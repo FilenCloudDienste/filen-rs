@@ -35,8 +35,8 @@ use super::{BaseFile, RemoteFile, meta::DecryptedFileMeta};
 /// A zero-byte file uploads no chunks and keeps the default.
 #[derive(Debug, Clone)]
 pub(crate) struct RemoteFileInfo {
-	region: String,
-	bucket: String,
+	pub(crate) region: String,
+	pub(crate) bucket: String,
 }
 
 impl Default for RemoteFileInfo {

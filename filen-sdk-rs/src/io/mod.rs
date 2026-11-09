@@ -15,7 +15,7 @@ mod meta_ext;
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 pub(crate) mod private_file;
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-mod upload_resume;
+pub(crate) mod upload_resume;
 
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 mod canonical_path;
