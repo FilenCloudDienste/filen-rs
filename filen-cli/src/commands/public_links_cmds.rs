@@ -48,7 +48,7 @@ use filen_sdk_rs::{
 	auth::Client,
 	connect::{DirPublicLinkRW, FilePublicLink, PasswordState},
 	fs::{
-		HasName, HasUUID as _,
+		HasName, HasUUID,
 		categories::{NonRootFileType, NonRootItemType, Normal},
 		file::traits::HasFileInfo as _,
 	},
@@ -318,15 +318,15 @@ pub(crate) async fn list_public_links(ui: &mut UI, client: &mut LazyClient) -> R
 		// resolving a path walks up the tree, and `get_item_path` takes the drive lock for each
 		// walk; holding one here means those all share it instead of re-acquiring it per item
 		let _lock = client.lock_drive().await.context("Failed to lock drive")?;
-		let mut links = stream::iter(dirs.iter().map(|dir| listed_dir_link(client, dir)))
-			.buffered(LINK_STATUS_CONCURRENCY)
-			.try_collect::<Vec<_>>()
-			.await?;
+		let mut links = listed_links(client, &dirs, |dir| {
+			NonRootItemType::Dir(Cow::Borrowed(dir))
+		})
+		.await?;
 		links.extend(
-			stream::iter(files.iter().map(|file| listed_file_link(client, file)))
-				.buffered(LINK_STATUS_CONCURRENCY)
-				.try_collect::<Vec<_>>()
-				.await?,
+			listed_links(client, &files, |file| {
+				NonRootItemType::File(Cow::Borrowed(file))
+			})
+			.await?,
 		);
 		links
 	};
@@ -335,38 +335,40 @@ pub(crate) async fn list_public_links(ui: &mut UI, client: &mut LazyClient) -> R
 	print_public_links(ui, &links)
 }
 
-async fn listed_dir_link(client: &Client, dir: &RemoteDirectory) -> Result<ListedPublicLink> {
-	let path = item_path(client, &NonRootItemType::Dir(Cow::Borrowed(dir))).await;
-	let link = client
-		.get_dir_link_rw(dir)
-		.await
-		.with_context(|| format!("Failed to get the public link of {path}"))?;
-	Ok(ListedPublicLink {
-		path,
-		kind: PublicLinkKind::Directory,
-		item_uuid: dir.uuid().to_string(),
-		link: link.map(|link| ListedLinkStatus {
-			link_uuid: link.uuid().to_string(),
-			expires_at: link.expires_at(),
-			url: dir_public_link_url(&link),
-		}),
-	})
+/// The links of `items`, resolved [`LINK_STATUS_CONCURRENCY`] at a time, in the order of `items`.
+async fn listed_links<'a, I: LinkableItem + HasUUID>(
+	client: &Client,
+	items: &'a [I],
+	item_type: fn(&'a I) -> NonRootItemType<'a, Normal>,
+) -> Result<Vec<ListedPublicLink>> {
+	stream::iter(
+		items
+			.iter()
+			.map(|item| listed_link(client, item, item_type(item))),
+	)
+	.buffered(LINK_STATUS_CONCURRENCY)
+	.try_collect()
+	.await
 }
 
-async fn listed_file_link(client: &Client, file: &RemoteFile) -> Result<ListedPublicLink> {
-	let path = item_path(client, &NonRootItemType::File(Cow::Borrowed(file))).await;
-	let link = client
-		.get_file_link_status(file)
+async fn listed_link<I: LinkableItem + HasUUID>(
+	client: &Client,
+	item: &I,
+	item_type: NonRootItemType<'_, Normal>,
+) -> Result<ListedPublicLink> {
+	let path = item_path(client, &item_type).await;
+	let link = item
+		.link_status(client)
 		.await
 		.with_context(|| format!("Failed to get the public link of {path}"))?;
 	Ok(ListedPublicLink {
 		path,
-		kind: PublicLinkKind::File,
-		item_uuid: file.uuid().to_string(),
+		kind: I::KIND,
+		item_uuid: item.uuid().to_string(),
 		link: link.map(|link| ListedLinkStatus {
-			link_uuid: link.uuid().to_string(),
-			expires_at: link.expires_at(),
-			url: file_public_link_url(file, &link),
+			link_uuid: I::link_uuid(&link),
+			expires_at: I::expires_at(&link),
+			url: item.link_url(&link),
 		}),
 	})
 }
