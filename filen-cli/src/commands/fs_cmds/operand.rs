@@ -14,8 +14,9 @@ use filen_sdk_rs::{
 	},
 };
 use filen_types::fs::{ParentUuid, Uuid};
+use futures::{StreamExt as _, stream};
 
-use super::natural_cmp;
+use super::{PATH_LOOKUP_CONCURRENCY, natural_cmp};
 use crate::{
 	error::{CliError, find_cli_error},
 	ui::UI,
@@ -373,9 +374,10 @@ pub(crate) struct Given<'a> {
 	pub(crate) failures: Failures,
 }
 
-/// The items `operands` name (see [`expand`]), each once, in the order they are first named. An
-/// operand that names none is reported, and the command goes on with the others; a command given
-/// one operand fails with its failure instead.
+/// The items `operands` name (see [`expand`]), each once, in the order they are first named, looked
+/// up [`PATH_LOOKUP_CONCURRENCY`] operands at a time. An operand that names none is reported, and
+/// the command goes on with the others; a command given one operand fails with its failure
+/// instead.
 pub(crate) async fn expand_all<'a>(
 	ui: &mut UI,
 	client: &'a Client,
@@ -386,8 +388,11 @@ pub(crate) async fn expand_all<'a>(
 	let mut items: Vec<GivenItem<'a>> = Vec::with_capacity(operands.len());
 	let mut seen = HashSet::with_capacity(operands.len());
 	let mut unresolved = 0usize;
-	for operand in operands {
-		match expand(client, operand, what).await {
+	let mut results = stream::iter(operands)
+		.map(|operand| expand(client, operand, what))
+		.buffered(PATH_LOOKUP_CONCURRENCY);
+	while let Some(result) = results.next().await {
+		match result {
 			Ok(expanded) => items.extend(
 				expanded
 					.into_iter()
