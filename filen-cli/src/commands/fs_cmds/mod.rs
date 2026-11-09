@@ -50,6 +50,7 @@
 use std::{
 	borrow::Cow,
 	cmp::Ordering,
+	collections::HashMap,
 	env::{self, VarError},
 	ffi::OsStr,
 	fmt,
@@ -2278,10 +2279,10 @@ pub(crate) async fn move_files_or_directories(
 	if items.is_empty() {
 		return failures.finish("moved");
 	}
-	let destination =
+	let mut destination =
 		destination_path(client, working_path, destination_str, failures.given()).await?;
 	for source in items {
-		let moved = move_item(ui, client, source, &destination).await;
+		let moved = move_item(ui, client, source, &mut destination).await;
 		failures.record(ui, moved)?;
 	}
 	failures.finish("moved")
@@ -2294,7 +2295,7 @@ async fn move_item(
 		operand: source_operand,
 		item: source,
 	}: GivenItem<'_>,
-	destination: &GivenDestination,
+	destination: &mut GivenDestination<'_>,
 ) -> Result<()> {
 	let (source_filename, source_parent) = match &source {
 		NonRootFileType::File(file) => (file.name(), *file.parent()),
@@ -2302,6 +2303,7 @@ async fn move_item(
 		NonRootFileType::Root(_) => return Err(UI::failure("Cannot move root directory")),
 	};
 	let source_filename = source_filename.context("Failed to decrypt source name")?;
+	let source_uuid = source.uuid();
 	let source_shown = shown_as(client, &source_operand, &source).await?;
 	let Destination {
 		dir: destination_dir,
@@ -2313,7 +2315,7 @@ async fn move_item(
 		&Source {
 			shown: &source_shown,
 			name: source_filename,
-			uuid: source.uuid(),
+			uuid: source_uuid,
 			parent: source_parent,
 		},
 		destination,
@@ -2369,6 +2371,7 @@ async fn move_item(
 		source_shown,
 		dir_shown.child(&new_name)
 	));
+	destination.record_placed(source_uuid, &new_name);
 	Ok(())
 }
 
@@ -2553,9 +2556,11 @@ fn is_inside(path: &RemotePath, ancestor: &RemotePath) -> bool {
 }
 
 /// The destination a `mv` or `cp` was given.
-enum GivenDestination {
-	/// A path, or a directory named by its UUID that has a path.
+enum GivenDestination<'a> {
+	/// A path, or a directory named by its UUID that has a path, given for one source.
 	Path(DestinationPath),
+	/// An existing directory at a path, given for several sources.
+	Directory(DestinationDirectory<'a>),
 	/// A directory named by its UUID that has no path, as a name above it cannot be decrypted.
 	Pathless {
 		dir: RemoteDirectory,
@@ -2570,23 +2575,46 @@ enum GivenDestination {
 struct DestinationPath {
 	path: RemotePath,
 	/// The destination must be an existing directory to put the sources into, as one written with
-	/// a trailing '/', named by its UUID or given for several sources must.
+	/// a trailing '/' or named by its UUID must.
 	must_be_a_directory: bool,
+}
+
+/// The existing directory a `mv` or `cp` of several sources puts all of them into, looked up once
+/// for the whole command.
+struct DestinationDirectory<'a> {
+	path: RemotePath,
+	dir: DirType<'a, Normal>,
+	/// The names in it, listed when the first source gets as far as the clash check, then kept up
+	/// to date with the items the command puts there. A snapshot: what anything else changes in
+	/// the directory meanwhile is not seen.
+	names: Option<ExistingNames>,
+}
+
+impl GivenDestination<'_> {
+	/// Notes that the item with the UUID `uuid` is now in the destination under `name`.
+	fn record_placed(&mut self, uuid: Uuid, name: &str) {
+		if let Self::Directory(DestinationDirectory {
+			names: Some(names), ..
+		}) = self
+		{
+			names.record(uuid, name);
+		}
+	}
 }
 
 /// The destination a `mv` or `cp` of `sources` items was given as `destination_str`. For several
 /// sources, it is checked to be an existing directory before any is moved or copied.
-async fn destination_path(
-	client: &Client,
+async fn destination_path<'a>(
+	client: &'a Client,
 	working_path: &RemotePath,
 	destination_str: &str,
 	sources: usize,
-) -> Result<GivenDestination> {
+) -> Result<GivenDestination<'a>> {
 	let destination = match ItemOperand::parse(working_path, destination_str)? {
 		// before navigating, which drops the trailing '/'
 		ItemOperand::Path(path) => DestinationPath {
 			path,
-			must_be_a_directory: names_a_directory(destination_str) || sources > 1,
+			must_be_a_directory: names_a_directory(destination_str),
 		},
 		operand => {
 			let item = resolve_item(client, &operand, "destination directory").await?;
@@ -2612,12 +2640,13 @@ async fn destination_path(
 		}
 	};
 	if sources > 1 {
-		match client
+		let dir = match client
 			.find_item_at_path(&destination.path.0)
 			.await
 			.context("Failed to find destination")?
 		{
-			Some(NonRootFileType::Dir(_) | NonRootFileType::Root(_)) => {}
+			Some(NonRootFileType::Dir(dir)) => DirType::Dir(dir),
+			Some(NonRootFileType::Root(root)) => DirType::Root(root),
 			Some(NonRootFileType::File(_)) => {
 				return Err(UI::failure(&format!(
 					"Not a directory: {}",
@@ -2630,7 +2659,12 @@ async fn destination_path(
 					destination.path
 				)));
 			}
-		}
+		};
+		return Ok(GivenDestination::Directory(DestinationDirectory {
+			path: destination.path,
+			dir,
+			names: None,
+		}));
 	}
 	Ok(GivenDestination::Path(destination))
 }
@@ -2640,19 +2674,46 @@ async fn destination_path(
 /// as one already there: it compares names case-insensitively. Moving an item to a name that
 /// differs from its own only in case renames it.
 ///
-/// The comparison lists the whole destination directory, once per source. The server's name-hash
-/// lookups (`dir_exists`, `file_exists`) would take two requests instead, but match only the
-/// hash the uploading client sent, so they miss an item whose name hash a non-conforming client
-/// computed differently, which the listing still finds by its decrypted name.
+/// The comparison lists the whole destination directory: once per source, except for a directory
+/// given for several sources, which is listed once per command and then kept up to date with what
+/// the command puts there (see [`DestinationDirectory`]). The server's name-hash lookups
+/// (`dir_exists`, `file_exists`) would take two requests instead, but match only the hash the
+/// uploading client sent, so they miss an item whose name hash a non-conforming client computed
+/// differently, which the listing still finds by its decrypted name.
 async fn resolve_destination<'a>(
 	client: &'a Client,
 	placement: Placement,
 	source: &Source<'_>,
-	destination: &'a GivenDestination,
+	destination: &'a mut GivenDestination<'_>,
 ) -> Result<Destination<'a>> {
-	let (dir, dir_shown, name) = match destination {
+	// a moved item does not clash with itself
+	let ignored = (placement == Placement::Move).then_some(source.uuid);
+	match destination {
 		GivenDestination::Path(destination) => {
-			resolve_destination_path(client, placement, source, destination).await?
+			let (dir, dir_shown, name) =
+				resolve_destination_path(client, placement, source, destination).await?;
+			let names = list_existing_names(client, &dir).await?;
+			check_name_free(&names, &name, ignored, &dir_shown)?;
+			Ok(Destination {
+				dir,
+				name,
+				dir_shown,
+			})
+		}
+		GivenDestination::Directory(DestinationDirectory { path, dir, names }) => {
+			target_of(placement, source, path, Found::Directory, true)?;
+			let dir: &'a DirType<'_, Normal> = dir;
+			let dir_shown = ShownDirectory::Path(path.clone());
+			let names = match names {
+				Some(names) => names,
+				None => names.insert(list_existing_names(client, dir).await?),
+			};
+			check_name_free(names, source.name, ignored, &dir_shown)?;
+			Ok(Destination {
+				dir: dir.as_borrowed_cow(),
+				name: source.name.to_owned(),
+				dir_shown,
+			})
 		}
 		GivenDestination::Pathless {
 			dir,
@@ -2660,38 +2721,51 @@ async fn resolve_destination<'a>(
 			chain,
 		} => {
 			check_pathless_destination(placement, source, dir.uuid(), operand, chain)?;
-			(
-				DirType::Dir(Cow::Borrowed(dir)),
-				ShownDirectory::Uuid(operand.clone()),
-				source.name.to_owned(),
-			)
+			let dir: &'a RemoteDirectory = dir;
+			let dir = DirType::Dir(Cow::Borrowed(dir));
+			let dir_shown = ShownDirectory::Uuid(operand.clone());
+			let names = list_existing_names(client, &dir).await?;
+			check_name_free(&names, source.name, ignored, &dir_shown)?;
+			Ok(Destination {
+				dir,
+				name: source.name.to_owned(),
+				dir_shown,
+			})
 		}
-	};
+	}
+}
 
-	// A same-name upload would replace the existing file (as a new version) and creating a
-	// same-name directory returns the existing one, so a copy would merge into it.
-	let (existing_dirs, existing_files) = client
-		.list_dir::<_, Normal>(&dir, None::<&fn(u64, Option<u64>)>)
+/// Lists the names in the destination directory `dir` of a `mv` or `cp`.
+async fn list_existing_names(client: &Client, dir: &DirType<'_, Normal>) -> Result<ExistingNames> {
+	let (dirs, files) = client
+		.list_dir::<_, Normal>(dir, None::<&fn(u64, Option<u64>)>)
 		.await
 		.context("Failed to list destination directory")?;
-	let existing_names = existing_dirs
-		.iter()
-		.map(|dir| (dir.uuid(), dir.name()))
-		.chain(existing_files.iter().map(|file| (file.uuid(), file.name())))
-		// a moved item does not clash with itself
-		.filter(|(uuid, _)| placement == Placement::Copy || *uuid != source.uuid)
-		.filter_map(|(_, name)| name);
-	if let Some(existing_name) = clashing_name(existing_names, &name) {
-		return Err(UI::failure(&format!(
+	Ok(ExistingNames::new(
+		dirs.iter()
+			.map(|dir| (dir.uuid(), dir.name()))
+			.chain(files.iter().map(|file| (file.uuid(), file.name())))
+			.filter_map(|(uuid, name)| Some((uuid, name?))),
+	))
+}
+
+/// Refuses `name` for a source put into the directory shown as `dir_shown` when the server would
+/// take it as one of `names` already there, other than the item with the UUID `ignored`. A
+/// same-name upload would replace the existing file (as a new version) and creating a same-name
+/// directory returns the existing one, so a copy would merge into it.
+fn check_name_free(
+	names: &ExistingNames,
+	name: &str,
+	ignored: Option<Uuid>,
+	dir_shown: &ShownDirectory,
+) -> Result<()> {
+	match names.clashing(name, ignored) {
+		Some(existing_name) => Err(UI::failure(&format!(
 			"Destination already exists: {}",
 			dir_shown.child(existing_name)
-		)));
+		))),
+		None => Ok(()),
 	}
-	Ok(Destination {
-		dir,
-		name,
-		dir_shown,
-	})
 }
 
 /// Refuses to put `source` into the directory with the UUID `dir`, shown as `shown`, which has no
@@ -2800,10 +2874,10 @@ pub(crate) async fn copy_files_or_directories(
 	if items.is_empty() {
 		return failures.finish("copied");
 	}
-	let destination =
+	let mut destination =
 		destination_path(client, working_path, destination_str, failures.given()).await?;
 	for source in items {
-		let copied = copy_item(ui, client, source, &destination).await;
+		let copied = copy_item(ui, client, source, &mut destination).await;
 		failures.record(ui, copied)?;
 	}
 	failures.finish("copied")
@@ -2816,7 +2890,7 @@ async fn copy_item(
 		operand: source_operand,
 		item: source,
 	}: GivenItem<'_>,
-	destination: &GivenDestination,
+	given: &mut GivenDestination<'_>,
 ) -> Result<()> {
 	let (source_name, source_parent) = match &source {
 		NonRootFileType::File(file) => (file.name(), *file.parent()),
@@ -2825,7 +2899,11 @@ async fn copy_item(
 	};
 	let source_name = source_name.context("Failed to decrypt source name")?;
 	let source_shown = shown_as(client, &source_operand, &source).await?;
-	let destination = resolve_destination(
+	let Destination {
+		dir: destination_dir,
+		name: new_name,
+		dir_shown,
+	} = resolve_destination(
 		client,
 		Placement::Copy,
 		&Source {
@@ -2834,15 +2912,15 @@ async fn copy_item(
 			uuid: source.uuid(),
 			parent: source_parent,
 		},
-		destination,
+		given,
 	)
 	.await?;
 	// the source's own name is left to the copy, which also copies a name today's rules reject
-	let name = if destination.name == source_name {
+	let name = if new_name == source_name {
 		None
 	} else {
 		Some(
-			ValidatedName::try_from(destination.name.as_str())
+			ValidatedName::try_from(new_name.as_str())
 				.map_err(|e| UI::failure(&format!("Invalid destination name: {}", e)))?,
 		)
 	};
@@ -2856,11 +2934,19 @@ async fn copy_item(
 	};
 	let request = CopyRequest {
 		source,
-		destination: destination.dir.into_owned_cow(),
+		destination: destination_dir.into_owned_cow(),
 		name,
 	};
 	let result = run_copy(ui, client, request, config).await;
-	finish_copy(ui, &source_shown, &destination.dir_shown, result)
+	// a copy that failed partway may still have put its top-level item there
+	let report = match &result {
+		Ok(report) => report,
+		Err(failed) => &failed.report,
+	};
+	if let Some(copied) = report.top_level.first() {
+		given.record_placed(copied.item.uuid(), copied.item.name().unwrap_or(&new_name));
+	}
+	finish_copy(ui, &source_shown, &dir_shown, result)
 }
 
 /// Runs a copy, drawing its progress, until it ends or Ctrl-C cancels it. A cancelled copy stops
@@ -3125,10 +3211,70 @@ fn progress_text(
 /// The name among `existing` that the server treats as the same as `name`: it compares names
 /// case-insensitively.
 fn clashing_name<'a>(existing: impl IntoIterator<Item = &'a str>, name: &str) -> Option<&'a str> {
-	let name = name.to_lowercase();
+	let name = folded_name(name);
 	existing
 		.into_iter()
-		.find(|existing| existing.to_lowercase() == name)
+		.find(|existing| folded_name(existing) == name)
+}
+
+/// `name` as the server compares names: case-insensitively.
+fn folded_name(name: &str) -> String {
+	name.to_lowercase()
+}
+
+/// The names of the items in a directory, looked up as the server compares them (see
+/// [`folded_name`]).
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ExistingNames {
+	/// The items under each folded name, with their names as written.
+	by_name: HashMap<String, Vec<(Uuid, String)>>,
+	/// The folded name each item is under in `by_name`, so that recording an item again finds its
+	/// entry without scanning them all.
+	folded_of: HashMap<Uuid, String>,
+}
+
+impl ExistingNames {
+	fn new<'a>(items: impl IntoIterator<Item = (Uuid, &'a str)>) -> Self {
+		let mut names = Self::default();
+		for (uuid, name) in items {
+			names.insert(uuid, name);
+		}
+		names
+	}
+
+	fn insert(&mut self, uuid: Uuid, name: &str) {
+		let folded = folded_name(name);
+		self.by_name
+			// cloned, as both maps key by it
+			.entry(folded.clone())
+			.or_default()
+			.push((uuid, name.to_owned()));
+		self.folded_of.insert(uuid, folded);
+	}
+
+	/// Notes that the item with the UUID `uuid` is now in the directory under `name`, replacing the
+	/// entry it had there, as a moved item may have one under its old name.
+	fn record(&mut self, uuid: Uuid, name: &str) {
+		if let Some(previous) = self.folded_of.remove(&uuid)
+			&& let Some(items) = self.by_name.get_mut(&previous)
+		{
+			items.retain(|(item, _)| *item != uuid);
+			if items.is_empty() {
+				self.by_name.remove(&previous);
+			}
+		}
+		self.insert(uuid, name);
+	}
+
+	/// The name of an item other than the one with the UUID `ignored` that the server treats as the
+	/// same as `name`.
+	fn clashing(&self, name: &str, ignored: Option<Uuid>) -> Option<&str> {
+		self.by_name
+			.get(&folded_name(name))?
+			.iter()
+			.find(|(uuid, _)| Some(*uuid) != ignored)
+			.map(|(_, name)| name.as_str())
+	}
 }
 
 /// The named directory colors, as the apps offer them.
@@ -4786,6 +4932,69 @@ mod tests {
 	fn a_name_does_not_clash_with_different_names() {
 		assert_eq!(clashing_name(["a.txt.bak", "b.txt"], "a.txt"), None);
 		assert_eq!(clashing_name([], "a.txt"), None);
+	}
+
+	#[test]
+	fn clash_on_the_second_of_two_same_named_sources_in_one_command() {
+		let mut names = ExistingNames::new([(Uuid::from_u128(1), "other.txt")]);
+		assert_eq!(names.clashing("a.txt", None), None);
+		names.record(Uuid::from_u128(2), "a.txt");
+		assert_eq!(names.clashing("A.txt", None), Some("a.txt"));
+		assert_eq!(
+			check_name_free(
+				&names,
+				"A.txt",
+				None,
+				&ShownDirectory::Path(RemotePath::new("/dest"))
+			)
+			.unwrap_err()
+			.to_string(),
+			"Destination already exists: /dest/a.txt"
+		);
+	}
+
+	#[test]
+	fn clash_ignores_a_moved_item_already_in_the_destination() {
+		let names = ExistingNames::new([(Uuid::from_u128(1), "a.txt")]);
+		assert_eq!(names.clashing("A.TXT", Some(Uuid::from_u128(1))), None);
+		assert_eq!(
+			names.clashing("A.TXT", Some(Uuid::from_u128(2))),
+			Some("a.txt")
+		);
+	}
+
+	#[test]
+	fn clash_ignores_only_the_moved_item_among_same_named_ones() {
+		let names =
+			ExistingNames::new([(Uuid::from_u128(1), "a.txt"), (Uuid::from_u128(2), "A.txt")]);
+		assert_eq!(
+			names.clashing("a.txt", Some(Uuid::from_u128(1))),
+			Some("A.txt")
+		);
+	}
+
+	#[test]
+	fn clash_check_of_a_refused_item_leaves_the_names_unchanged() {
+		let names = ExistingNames::new([(Uuid::from_u128(1), "a.txt")]);
+		assert!(
+			check_name_free(
+				&names,
+				"a.txt",
+				None,
+				&ShownDirectory::Path(RemotePath::new("/dest"))
+			)
+			.is_err()
+		);
+		assert_eq!(names, ExistingNames::new([(Uuid::from_u128(1), "a.txt")]));
+		assert_eq!(names.clashing("b.txt", None), None);
+	}
+
+	#[test]
+	fn clash_after_a_move_within_the_directory_sees_only_the_new_name() {
+		let mut names = ExistingNames::new([(Uuid::from_u128(1), "a.txt")]);
+		names.record(Uuid::from_u128(1), "b.txt");
+		assert_eq!(names.clashing("a.txt", None), None);
+		assert_eq!(names.clashing("B.txt", None), Some("b.txt"));
 	}
 
 	#[test]
