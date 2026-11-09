@@ -18,7 +18,7 @@ use filen_macros::shared_test_runtime;
 use filen_sdk_rs::fs::dir::RemoteDirectory;
 use filen_sdk_rs::fs::file::RemoteFile;
 use filen_sdk_rs::fs::{HasName, HasUUID};
-use filen_sdk_rs::sync_engine::{SyncEngine, SyncMode, SyncReport};
+use filen_sdk_rs::sync_engine::{SyncEngine, SyncMode};
 use uuid::Uuid;
 
 use crate::harness::*;
@@ -42,23 +42,6 @@ async fn list_root_tc(tc: &TwoClients) -> (Vec<RemoteDirectory>, Vec<RemoteFile>
 /// Upload `data` as `name` directly under the remote root through the cache's client.
 async fn upload_root(sc: &SingleClient, name: &str, data: &[u8]) -> RemoteFile {
 	upload_to(&sc.cache.client, sc.resources.dir.uuid(), name, data).await
-}
-
-/// Assert a `SyncReport` is a perfectly clean no-op (every counter zero, no conflicts/errors). This
-/// is the observable form of self-write loop-freedom: after convergence, the engine's own writes
-/// must NOT generate any further transferring/deleting work.
-fn assert_noop(r: &SyncReport) {
-	assert_eq!(r.uploaded, 0, "no-op expected, got upload: {r:?}");
-	assert_eq!(r.downloaded, 0, "no-op expected, got download: {r:?}");
-	assert_eq!(r.local_dirs_created, 0, "{r:?}");
-	assert_eq!(r.remote_dirs_created, 0, "{r:?}");
-	assert_eq!(r.locally_deleted, 0, "{r:?}");
-	assert_eq!(r.remotely_trashed, 0, "{r:?}");
-	assert_eq!(r.moved_remote, 0, "{r:?}");
-	assert_eq!(r.moved_local, 0, "{r:?}");
-	assert_eq!(r.conflicts.len(), 0, "{r:?}");
-	assert_eq!(r.held_deletions(), 0, "{r:?}");
-	assert!(r.errors.is_empty(), "{r:?}");
 }
 
 // ===========================================================================

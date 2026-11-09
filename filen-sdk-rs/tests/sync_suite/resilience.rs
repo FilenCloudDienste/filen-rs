@@ -36,21 +36,6 @@ async fn upload_root(sc: &SingleClient, name: &str, data: &[u8]) -> RemoteFile {
 	upload_to(&sc.cache.client, sc.resources.dir.uuid(), name, data).await
 }
 
-/// Assert a `SyncReport` is a perfectly clean no-op (every counter zero, no conflicts/errors).
-fn assert_noop(r: &filen_sdk_rs::sync_engine::SyncReport) {
-	assert_eq!(r.uploaded, 0, "no-op expected, got upload: {r:?}");
-	assert_eq!(r.downloaded, 0, "no-op expected, got download: {r:?}");
-	assert_eq!(r.local_dirs_created, 0, "{r:?}");
-	assert_eq!(r.remote_dirs_created, 0, "{r:?}");
-	assert_eq!(r.locally_deleted, 0, "{r:?}");
-	assert_eq!(r.remotely_trashed, 0, "{r:?}");
-	assert_eq!(r.moved_remote, 0, "{r:?}");
-	assert_eq!(r.moved_local, 0, "{r:?}");
-	assert_eq!(r.conflicts.len(), 0, "{r:?}");
-	assert_eq!(r.held_deletions(), 0, "{r:?}");
-	assert!(r.errors.is_empty(), "{r:?}");
-}
-
 /// A first sync holds its one destination-only deletion until it is approved: `first` held it,
 /// another pass without approval holds it again, and the pass after the approval applies it.
 /// Returns that pass's report.

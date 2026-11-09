@@ -30,7 +30,7 @@ use filen_sdk_rs::fs::HasUUID;
 use filen_sdk_rs::fs::file::RemoteFile;
 #[cfg(feature = "malformed")]
 use filen_sdk_rs::sync_engine::{PlannedActionKind, PlannedTransfer};
-use filen_sdk_rs::sync_engine::{SyncEngine, SyncMode, SyncReport};
+use filen_sdk_rs::sync_engine::{SyncEngine, SyncMode};
 #[cfg(feature = "malformed")]
 use rusqlite::OptionalExtension;
 use uuid::Uuid;
@@ -46,21 +46,6 @@ use crate::helpers::*;
 /// plant a schema version the current build does not understand (MIGRATE-04).
 fn open_read_write_db(path: &std::path::Path) -> rusqlite::Connection {
 	open_sqlite(path).unwrap()
-}
-
-/// Assert a `SyncReport` is a perfectly clean no-op (every counter zero, no conflicts/errors).
-fn assert_noop(r: &SyncReport) {
-	assert_eq!(r.uploaded, 0, "no-op expected, got upload: {r:?}");
-	assert_eq!(r.downloaded, 0, "no-op expected, got download: {r:?}");
-	assert_eq!(r.local_dirs_created, 0, "{r:?}");
-	assert_eq!(r.remote_dirs_created, 0, "{r:?}");
-	assert_eq!(r.locally_deleted, 0, "{r:?}");
-	assert_eq!(r.remotely_trashed, 0, "{r:?}");
-	assert_eq!(r.moved_remote, 0, "{r:?}");
-	assert_eq!(r.moved_local, 0, "{r:?}");
-	assert_eq!(r.conflicts.len(), 0, "{r:?}");
-	assert_eq!(r.held_deletions(), 0, "{r:?}");
-	assert!(r.errors.is_empty(), "{r:?}");
 }
 
 /// A remote `lastModified` with a non-zero millisecond part, so a match proves millisecond

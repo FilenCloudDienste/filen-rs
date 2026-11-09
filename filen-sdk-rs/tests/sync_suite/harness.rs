@@ -423,6 +423,23 @@ pub fn pass_events(events: &[SyncEvent]) -> &[SyncEvent] {
 	}
 }
 
+/// Assert a `SyncReport` is a perfectly clean no-op (every counter zero, no conflicts/errors). This
+/// is the observable form of self-write loop-freedom: after convergence, the engine's own writes
+/// must NOT generate any further transferring/deleting work.
+pub fn assert_noop(r: &SyncReport) {
+	assert_eq!(r.uploaded, 0, "no-op expected, got upload: {r:?}");
+	assert_eq!(r.downloaded, 0, "no-op expected, got download: {r:?}");
+	assert_eq!(r.local_dirs_created, 0, "{r:?}");
+	assert_eq!(r.remote_dirs_created, 0, "{r:?}");
+	assert_eq!(r.locally_deleted, 0, "{r:?}");
+	assert_eq!(r.remotely_trashed, 0, "{r:?}");
+	assert_eq!(r.moved_remote, 0, "{r:?}");
+	assert_eq!(r.moved_local, 0, "{r:?}");
+	assert_eq!(r.conflicts.len(), 0, "{r:?}");
+	assert_eq!(r.held_deletions(), 0, "{r:?}");
+	assert!(r.errors.is_empty(), "{r:?}");
+}
+
 /// Whether `report` holds back `names` — the top-level directories [`stage_case_colliding_dirs`]
 /// made — as a remote name collision, and nothing for any other reason: the twins and the files
 /// under them, which fold together too.
