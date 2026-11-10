@@ -8,10 +8,19 @@
 //! `--content-file <file>` replaces the content with the file's instead, without an editor, and
 //! `--content-file -` with what is read from stdin. Without a terminal, or with `--no-input`,
 //! `note-edit` needs one of them.
+//!
+//! Before saving, `note-edit` reads the note again. When it changed while it was being edited, the
+//! edit is not saved: the error names the temporary file the editor's edit is kept in, or the
+//! content file that was not saved. A change made between that check and the save is still
+//! overwritten. When the edit cannot be saved for another reason, such as the note having been
+//! deleted meanwhile or the network failing, the editor's edit is kept in its temporary file too,
+//! and the error names it.
 
 use std::path::Path;
 
 use anyhow::{Context as _, Result};
+use filen_sdk_rs::{auth::Client, notes::Note};
+use tempfile::TempPath;
 
 use super::{
 	content::{file_extension, note_preview, readable_content, stored_content},
@@ -48,26 +57,149 @@ pub(super) async fn edit_note(
 	let note_type = note.note_type();
 	let current = readable_content(note_type, &stored);
 
-	let edited = match source {
-		EditSource::File(path) => read_content_file(path).await?,
+	let (edited, edited_in) = match source {
+		EditSource::File(path) => (read_content_file(path).await?, EditedIn::ContentFile(path)),
 		EditSource::Editor(editor) => {
-			let edited = edit_in_editor(&editor, &current, file_extension(note_type)).await?;
-			without_added_final_newline(edited, &current)
+			let (edited, temp_file) =
+				edit_in_editor(&editor, &current, file_extension(note_type)).await?;
+			(
+				without_added_final_newline(edited, &current),
+				EditedIn::TempFile(temp_file),
+			)
 		}
 	};
 	if edited == current {
+		edited_in.close()?;
 		ui.print_success(&format!("Note {} is unchanged", describe_note(&note)));
 		return Ok(());
 	}
 
-	let new_stored = stored_content(note_type, &edited);
+	match save_unless_changed(client, &note, &stored, &edited).await {
+		Ok(Save::Saved(latest)) => {
+			edited_in.close()?;
+			ui.print_success(&format!("Saved note {}", describe_note(&latest)));
+			Ok(())
+		}
+		Ok(Save::ChangedMeanwhile(latest)) => {
+			let described = describe_note(&latest);
+			Err(match edited_in {
+				EditedIn::ContentFile(path) => {
+					changed_meanwhile(&described, UnsavedEdit::ContentFile(path))
+				}
+				EditedIn::TempFile(temp_file) => {
+					let kept = temp_file.keep().with_context(|| {
+						format!(
+							"Note {described} changed while it was being edited, and the \
+							 temporary file holding the edit could not be kept"
+						)
+					})?;
+					changed_meanwhile(&described, UnsavedEdit::TempFile(&kept))
+				}
+			})
+		}
+		Err(e) => Err(keep_unsaved_edit(e, edited_in)),
+	}
+}
+
+/// What [`save_unless_changed`] did.
+enum Save {
+	/// The edit was saved to the note, as it is now.
+	Saved(Note),
+	/// The note, as it is now, changed while it was being edited, so nothing was saved.
+	ChangedMeanwhile(Note),
+}
+
+/// Saves `edited` to `note` unless its stored content is no longer `stored`, the content the edit
+/// started from.
+async fn save_unless_changed(
+	client: &Client,
+	note: &Note,
+	stored: &str,
+	edited: &str,
+) -> Result<Save> {
+	// Without a compare-and-set on the server, a change made after this check is still
+	// overwritten.
+	let mut latest = find_note(client, &note.uuid().to_string()).await?;
+	let latest_stored = fetch_content(client, &mut latest).await?;
+	if latest_stored != stored {
+		return Ok(Save::ChangedMeanwhile(latest));
+	}
+
+	let note_type = note.note_type();
+	let new_stored = stored_content(note_type, edited);
 	let preview = note_preview(note_type, &new_stored);
 	client
-		.set_note_content(&mut note, &new_stored, preview)
+		.set_note_content(&mut latest, &new_stored, preview)
 		.await
-		.with_context(|| format!("Failed to save note {}", describe_note(&note)))?;
-	ui.print_success(&format!("Saved note {}", describe_note(&note)));
-	Ok(())
+		.with_context(|| format!("Failed to save note {}", describe_note(&latest)))?;
+	Ok(Save::Saved(latest))
+}
+
+/// `e`, the failure of saving an edit made in `edited_in`, which keeps the editor's temporary file
+/// and names it, so that the edit is not lost.
+fn keep_unsaved_edit(e: anyhow::Error, edited_in: EditedIn<'_>) -> anyhow::Error {
+	match edited_in {
+		EditedIn::ContentFile(_) => e,
+		EditedIn::TempFile(temp_file) => match temp_file.keep() {
+			Ok(kept) => e.context(format!(
+				"The edit was not saved; it is in {}",
+				kept.display()
+			)),
+			Err(keep_err) => e.context(format!(
+				"The edit was not saved, and the temporary file holding it could not be kept: \
+				 {keep_err}"
+			)),
+		},
+	}
+}
+
+/// Where the edited content of a note came from.
+enum EditedIn<'a> {
+	/// A content file, or stdin for `-`.
+	ContentFile(&'a Path),
+	/// The editor's temporary file, removed when dropped.
+	TempFile(TempPath),
+}
+
+impl EditedIn<'_> {
+	/// Removes the editor's temporary file, failing when it cannot be removed.
+	fn close(self) -> Result<()> {
+		match self {
+			Self::ContentFile(_) => Ok(()),
+			Self::TempFile(temp_file) => temp_file
+				.close()
+				.context("Failed to remove the note's temporary file"),
+		}
+	}
+}
+
+/// An edit `note-edit` did not save because the note changed meanwhile.
+#[derive(Debug, Clone, Copy)]
+enum UnsavedEdit<'a> {
+	/// The content file, or stdin for `-`.
+	ContentFile(&'a Path),
+	/// The editor's temporary file, which was kept.
+	TempFile(&'a Path),
+}
+
+/// The failure of an edit not saved because the note `described` names changed while it was
+/// being edited.
+fn changed_meanwhile(described: &str, unsaved: UnsavedEdit<'_>) -> anyhow::Error {
+	UI::failure(&match unsaved {
+		UnsavedEdit::TempFile(path) => format!(
+			"Note {described} changed while it was being edited, so the edit was not saved; it is \
+			 in {}",
+			path.display()
+		),
+		UnsavedEdit::ContentFile(path) if path == Path::new("-") => format!(
+			"Note {described} changed while it was being read, so the content read from stdin \
+			 was not saved"
+		),
+		UnsavedEdit::ContentFile(path) => format!(
+			"Note {described} changed while it was being read, so the content of {} was not saved",
+			path.display()
+		),
+	})
 }
 
 /// The content file when one is given, else the editor, which needs a terminal: without one, or
@@ -119,9 +251,13 @@ fn editor_command(var: impl Fn(&str) -> Option<String>) -> Result<EditorCommand>
 }
 
 /// Runs `editor` on a temporary file holding `content`, named with `extension` so that the editor
-/// knows the format, and returns what the file holds once the editor exits. The file is removed
-/// afterwards.
-async fn edit_in_editor(editor: &EditorCommand, content: &str, extension: &str) -> Result<String> {
+/// knows the format, and returns what the file holds once the editor exits, with the file, which
+/// is removed when dropped.
+async fn edit_in_editor(
+	editor: &EditorCommand,
+	content: &str,
+	extension: &str,
+) -> Result<(String, TempPath)> {
 	let file = tempfile::Builder::new()
 		.prefix("filen-note-")
 		.suffix(&format!(".{extension}"))
@@ -151,9 +287,7 @@ async fn edit_in_editor(editor: &EditorCommand, content: &str, extension: &str) 
 	}
 	let edited = std::fs::read_to_string(&path)
 		.with_context(|| format!("Failed to read the edited note from {}", path.display()))?;
-	path.close()
-		.context("Failed to remove the note's temporary file")?;
-	Ok(edited)
+	Ok((edited, path))
 }
 
 /// `edited` without the final newline an editor adds on saving, when `original` did not end with
@@ -299,10 +433,63 @@ mod tests {
 			[ "$(cat "$1")" = "before" ] || exit 4
 			printf 'after\n' > "$1""#;
 		let editor = editor("sh", &["-c", script, "sh"]);
+		let (edited, temp_file) = edit_in_editor(&editor, "before", "md").await.unwrap();
+		assert_eq!(edited, "after\n");
+		temp_file.close().unwrap();
+	}
+
+	#[test]
+	fn an_edit_kept_after_a_concurrent_change_is_named() {
+		let described = "\"Todo\"";
 		assert_eq!(
-			edit_in_editor(&editor, "before", "md").await.unwrap(),
-			"after\n"
+			changed_meanwhile(
+				described,
+				UnsavedEdit::TempFile(Path::new("/tmp/filen-note-a.md"))
+			)
+			.to_string(),
+			"Note \"Todo\" changed while it was being \
+			 edited, so the edit was not saved; it is in /tmp/filen-note-a.md"
 		);
+		assert_eq!(
+			changed_meanwhile(described, UnsavedEdit::ContentFile(Path::new("new.md"))).to_string(),
+			"Note \"Todo\" changed while it was being \
+			 read, so the content of new.md was not saved"
+		);
+		assert_eq!(
+			changed_meanwhile(described, UnsavedEdit::ContentFile(Path::new("-"))).to_string(),
+			"Note \"Todo\" changed while it was being \
+			 read, so the content read from stdin was not saved"
+		);
+	}
+
+	#[test]
+	fn an_edit_that_could_not_be_saved_is_kept_and_named() {
+		let temp_file = tempfile::NamedTempFile::new().unwrap().into_temp_path();
+		let path = temp_file.to_path_buf();
+		std::fs::write(&path, "the edit").unwrap();
+		let err = keep_unsaved_edit(
+			UI::failure("No note is titled \"x\" or has that UUID"),
+			EditedIn::TempFile(temp_file),
+		);
+		assert_eq!(
+			format!("{err:#}"),
+			format!(
+				"The edit was not saved; it is in {}: No note is titled \"x\" or has that UUID",
+				path.display()
+			)
+		);
+		assert_eq!(exit_code(&err), 1);
+		assert_eq!(std::fs::read_to_string(&path).unwrap(), "the edit");
+		std::fs::remove_file(&path).unwrap();
+	}
+
+	#[test]
+	fn a_content_file_that_could_not_be_saved_keeps_the_error() {
+		let err = keep_unsaved_edit(
+			UI::failure("Failed to save note \"Todo\""),
+			EditedIn::ContentFile(Path::new("new.md")),
+		);
+		assert_eq!(format!("{err:#}"), "Failed to save note \"Todo\"");
 	}
 
 	#[cfg(unix)]
