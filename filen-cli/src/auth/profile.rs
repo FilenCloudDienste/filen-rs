@@ -3,7 +3,8 @@
 //! `profiles/<name>` in the config dir, which is created the first time it is used. A profile has
 //! its own login (in the system keychain or an auth config file), cache, logs and sync pairs, so
 //! that you can stay logged in to several accounts at once. A profile name consists of letters,
-//! digits, `-` and `_`.
+//! digits, `-` and `_`. Names that differ only in case name the same profile, the one created
+//! first; names Windows reserves for devices (`CON`, `NUL`, `COM1`, ...) are refused.
 //!
 //! `profiles` lists the profiles, marking the one in use with `*`. With `--json`, it prints them as
 //! an array of `{"name", "active"}`.
@@ -18,13 +19,14 @@ use std::{
 use anyhow::{Context as _, Result};
 use serde_json::json;
 
-use crate::ui::UI;
+use crate::{ui::UI, util::is_windows_reserved_name};
 
 /// The directory in the config dir that holds a directory for each profile.
 const PROFILES_DIR_NAME: &str = "profiles";
 
 /// The name of a profile, which names its directory: letters, digits, `-` and `_` only, so that it
-/// never names another directory, such as `..` or a path.
+/// never names another directory, such as `..` or a path, and no device name Windows reserves, so
+/// that the directory can exist on every platform.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct ProfileName(String);
 
@@ -36,6 +38,10 @@ pub(crate) enum ProfileNameError {
 	Forbidden {
 		ch: char,
 		at: usize,
+	},
+	/// The name is one Windows reserves for a device, such as `CON` or `nul`.
+	Reserved {
+		name: String,
 	},
 }
 
@@ -49,6 +55,11 @@ impl ProfileName {
 			.find(|(_, ch)| !(ch.is_ascii_alphanumeric() || *ch == '-' || *ch == '_'))
 		{
 			return Err(ProfileNameError::Forbidden { ch, at });
+		}
+		if is_windows_reserved_name(name) {
+			return Err(ProfileNameError::Reserved {
+				name: name.to_owned(),
+			});
 		}
 		Ok(Self(name.to_owned()))
 	}
@@ -75,6 +86,10 @@ impl fmt::Display for ProfileNameError {
 				"a profile name may only contain letters, digits, `-` and `_`, not {ch:?} (at \
 				 byte {at})"
 			),
+			Self::Reserved { name } => write!(
+				f,
+				"a profile name cannot be `{name}`, which Windows reserves for a device"
+			),
 		}
 	}
 }
@@ -92,10 +107,48 @@ pub(crate) struct Profiles {
 impl Profiles {
 	/// The profiles kept in `base_config_dir`, the config dir without a profile, with `active` in
 	/// use.
-	pub(crate) fn new(base_config_dir: &Path, active: Option<ProfileName>) -> Self {
-		Self {
+	///
+	/// `active` names the existing profile spelt like it, or else the one spelt like it but for
+	/// case, so that a case-insensitive file system never gives one directory two profiles with a
+	/// login each. Several profiles spelt like it but for case (on a case-sensitive file system),
+	/// and none exactly like it, are an error.
+	pub(crate) fn new(base_config_dir: &Path, active: Option<ProfileName>) -> Result<Self> {
+		let mut profiles = Self {
 			dir: base_config_dir.join(PROFILES_DIR_NAME),
-			active,
+			active: None,
+		};
+		profiles.active = match active {
+			Some(name) => Some(profiles.existing_spelling(name)?),
+			None => None,
+		};
+		Ok(profiles)
+	}
+
+	/// The existing profile named `name`: exactly, or else but for ASCII case, or `name` itself
+	/// when there is neither.
+	fn existing_spelling(&self, name: ProfileName) -> Result<ProfileName> {
+		let existing = self.list()?;
+		if existing.contains(&name) {
+			return Ok(name);
+		}
+		let mut like = existing
+			.into_iter()
+			.filter(|other| other.as_str().eq_ignore_ascii_case(name.as_str()));
+		match (like.next(), like.next()) {
+			(None, _) => Ok(name),
+			(Some(other), None) => Ok(other),
+			(Some(first), Some(second)) => {
+				let names = [first, second]
+					.into_iter()
+					.chain(like)
+					.map(|other| other.0)
+					.collect::<Vec<_>>()
+					.join(", ");
+				Err(UI::failure(&format!(
+					"Several profiles are named like {} ({names}): pass one of them exactly",
+					name.as_str()
+				)))
+			}
 		}
 	}
 
@@ -233,6 +286,23 @@ mod tests {
 	}
 
 	#[test]
+	fn a_reserved_device_name_is_no_profile_name() {
+		for reserved in ["CON", "nul", "Com1"] {
+			assert_eq!(
+				ProfileName::parse(reserved),
+				Err(ProfileNameError::Reserved {
+					name: reserved.to_owned()
+				})
+			);
+		}
+		assert_eq!(
+			ProfileName::parse("nul").unwrap_err().to_string(),
+			"a profile name cannot be `nul`, which Windows reserves for a device"
+		);
+		assert_eq!(name("CONSOLE").as_str(), "CONSOLE");
+	}
+
+	#[test]
 	fn the_profile_flag_goes_before_or_after_the_command() {
 		for args in [
 			["filen", "--profile", "work", "ls"],
@@ -260,7 +330,7 @@ mod tests {
 	#[test]
 	fn without_a_profile_the_config_dir_is_the_base_one() {
 		let base = assert_fs::TempDir::new().unwrap();
-		let profiles = Profiles::new(base.path(), None);
+		let profiles = Profiles::new(base.path(), None).unwrap();
 
 		assert_eq!(profiles.config_dir(base.path()).unwrap(), base.path());
 		assert!(!base.path().join(PROFILES_DIR_NAME).exists());
@@ -269,12 +339,58 @@ mod tests {
 	#[test]
 	fn a_profile_has_its_config_dir_in_the_profiles_dir_created_on_first_use() {
 		let base = assert_fs::TempDir::new().unwrap();
-		let profiles = Profiles::new(base.path(), Some(name("work")));
+		let profiles = Profiles::new(base.path(), Some(name("work"))).unwrap();
 
 		let dir = profiles.config_dir(base.path()).unwrap();
 
 		assert_eq!(dir, base.path().join("profiles").join("work"));
 		assert!(dir.is_dir());
+	}
+
+	#[test]
+	fn a_profile_in_another_case_uses_the_existing_directory() {
+		let base = assert_fs::TempDir::new().unwrap();
+		std::fs::create_dir_all(base.path().join("profiles").join("Work")).unwrap();
+
+		let profiles = Profiles::new(base.path(), Some(name("work"))).unwrap();
+
+		assert_eq!(
+			profiles.config_dir(base.path()).unwrap(),
+			base.path().join("profiles").join("Work")
+		);
+	}
+
+	// Two directories that differ only in case need a case-sensitive file system.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn an_exact_profile_name_wins_over_another_case() {
+		let base = assert_fs::TempDir::new().unwrap();
+		for profile in ["Work", "work"] {
+			std::fs::create_dir_all(base.path().join("profiles").join(profile)).unwrap();
+		}
+
+		let profiles = Profiles::new(base.path(), Some(name("work"))).unwrap();
+
+		assert_eq!(
+			profiles.config_dir(base.path()).unwrap(),
+			base.path().join("profiles").join("work")
+		);
+	}
+
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn several_profiles_in_other_cases_are_ambiguous() {
+		let base = assert_fs::TempDir::new().unwrap();
+		for profile in ["Work", "WORK"] {
+			std::fs::create_dir_all(base.path().join("profiles").join(profile)).unwrap();
+		}
+
+		let err = Profiles::new(base.path(), Some(name("work"))).unwrap_err();
+
+		assert_eq!(
+			err.to_string(),
+			"Several profiles are named like work (WORK, Work): pass one of them exactly"
+		);
 	}
 
 	#[test]
@@ -290,7 +406,7 @@ mod tests {
 
 		print_profiles(
 			&mut printed.ui(),
-			&Profiles::new(base.path(), Some(name("home"))),
+			&Profiles::new(base.path(), Some(name("home"))).unwrap(),
 		)
 		.unwrap();
 
@@ -307,7 +423,11 @@ mod tests {
 		let mut ui = printed.ui();
 		ui.set_quiet_and_json(false, true);
 
-		print_profiles(&mut ui, &Profiles::new(base.path(), Some(name("work")))).unwrap();
+		print_profiles(
+			&mut ui,
+			&Profiles::new(base.path(), Some(name("work"))).unwrap(),
+		)
+		.unwrap();
 
 		let printed: serde_json::Value = serde_json::from_str(&printed.lines()).unwrap();
 		assert_eq!(
@@ -324,7 +444,11 @@ mod tests {
 		let base = assert_fs::TempDir::new().unwrap();
 		let printed = Printed::default();
 
-		print_profiles(&mut printed.ui(), &Profiles::new(base.path(), None)).unwrap();
+		print_profiles(
+			&mut printed.ui(),
+			&Profiles::new(base.path(), None).unwrap(),
+		)
+		.unwrap();
 
 		assert_eq!(
 			console::strip_ansi_codes(&printed.lines()),
@@ -339,7 +463,7 @@ mod tests {
 		let mut ui = printed.ui();
 		ui.set_quiet_and_json(false, true);
 
-		print_profiles(&mut ui, &Profiles::new(base.path(), None)).unwrap();
+		print_profiles(&mut ui, &Profiles::new(base.path(), None).unwrap()).unwrap();
 
 		assert_eq!(printed.lines(), "[]");
 	}

@@ -512,7 +512,7 @@ async fn inner_main(ui: &mut ui::UI, arenas_limited: bool) -> Result<Finished> {
 		}
 	};
 	// a copy of the short name: the arguments are borrowed whole further down
-	let profiles = auth::Profiles::new(&base_config_dir, cli_args.profile.clone());
+	let profiles = auth::Profiles::new(&base_config_dir, cli_args.profile.clone())?;
 	let config = CliConfig {
 		config_dir: profiles.config_dir(&base_config_dir)?,
 		config_dir_is_default: config_dir_is_default && cli_args.profile.is_none(),

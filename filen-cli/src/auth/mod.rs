@@ -1641,7 +1641,7 @@ mod tests {
 		let dir = assert_fs::TempDir::new().unwrap();
 		let config = CliConfig {
 			config_dir: dir.path().to_path_buf(),
-			profiles: Profiles::new(dir.path(), None),
+			profiles: Profiles::new(dir.path(), None).unwrap(),
 			config_dir_is_default: false,
 		};
 		(dir, config)
@@ -2939,7 +2939,7 @@ mod tests {
 		let missing = config_dir.path().join("missing.txt");
 		let config = CliConfig {
 			config_dir: config_dir.path().to_path_buf(),
-			profiles: Profiles::new(config_dir.path(), None),
+			profiles: Profiles::new(config_dir.path(), None).unwrap(),
 			config_dir_is_default: false,
 		};
 

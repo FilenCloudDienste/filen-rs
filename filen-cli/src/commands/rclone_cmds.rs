@@ -1769,7 +1769,7 @@ mod tests {
 		let config_dir = tempfile::tempdir().unwrap();
 		let config = CliConfig {
 			config_dir: config_dir.path().to_path_buf(),
-			profiles: crate::auth::Profiles::new(config_dir.path(), None),
+			profiles: crate::auth::Profiles::new(config_dir.path(), None).unwrap(),
 			config_dir_is_default: false,
 		};
 		let dir = rclone_dir(&config);
@@ -1798,7 +1798,7 @@ mod tests {
 		let config_dir = tempfile::tempdir().unwrap();
 		let config = CliConfig {
 			config_dir: config_dir.path().to_path_buf(),
-			profiles: crate::auth::Profiles::new(config_dir.path(), None),
+			profiles: crate::auth::Profiles::new(config_dir.path(), None).unwrap(),
 			config_dir_is_default: false,
 		};
 		let cache = cache_dir(&rclone_dir(&config), 1);

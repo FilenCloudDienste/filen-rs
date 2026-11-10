@@ -3286,7 +3286,7 @@ mod tests {
 	fn config_in(dir: &Path) -> CliConfig {
 		CliConfig {
 			config_dir: dir.to_path_buf(),
-			profiles: crate::auth::Profiles::new(dir, None),
+			profiles: crate::auth::Profiles::new(dir, None).unwrap(),
 			config_dir_is_default: false,
 		}
 	}
