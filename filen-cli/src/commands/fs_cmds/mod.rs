@@ -66,10 +66,10 @@ use std::{
 use crate::{
 	CommandResult,
 	auth::LazyClient,
+	command_line::split_command_line,
 	commands::CommandContext,
 	completion::FilenCompleter,
 	docs::DocElement,
-	editor_command::split_command_line,
 	error::{CliError, find_cli_error},
 	interrupt,
 	ui::{self, UI},

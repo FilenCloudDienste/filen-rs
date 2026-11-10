@@ -1,4 +1,4 @@
-//! Splitting the command line `$VISUAL` or `$EDITOR` holds into the editor's program and arguments.
+//! Splitting a command line, as `$VISUAL` or `$EDITOR` holds it, into words.
 
 /// Splits an editor command line into words. A shell's quoting rules on Unix; on Windows, where a
 /// path is full of backslashes, only double quotes group words.

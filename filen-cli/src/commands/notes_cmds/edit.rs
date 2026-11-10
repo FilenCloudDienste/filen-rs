@@ -17,7 +17,7 @@ use super::{
 	content::{file_extension, note_preview, readable_content, stored_content},
 	describe_note, fetch_content, find_note, read_content_file,
 };
-use crate::{auth::LazyClient, editor_command::split_command_line, ui::UI};
+use crate::{auth::LazyClient, command_line::split_command_line, ui::UI};
 
 /// What `note-edit` would ask when it opens an editor, which fails when nobody could use one.
 const OPEN_EDITOR: &str = "Open the note in an editor?";

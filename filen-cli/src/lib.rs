@@ -59,10 +59,10 @@ use crate::{
 };
 
 mod auth;
+mod command_line;
 mod commands;
 mod completion;
 mod docs;
-mod editor_command;
 mod error;
 mod interrupt;
 mod local_glob;
