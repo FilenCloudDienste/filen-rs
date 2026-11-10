@@ -115,7 +115,8 @@ pub struct SyncReport {
 	/// subtree holds.
 	pub moved_local: usize,
 	/// Paths surfaced as conflicts (left untouched), with what each side held: in two-way, both
-	/// sides changed; in a backup mode, the two sides hold items of different kinds.
+	/// sides changed; in a backup mode, the two sides hold items of different kinds. Each with its
+	/// [`reason`](PlannedConflict::reason).
 	pub conflicts: Vec<PlannedConflict>,
 	/// What the mass-delete guard held back this pass — the deletions, plus the create half of a
 	/// held type flip (which is only meaningful together with its delete). Use
@@ -1133,7 +1134,9 @@ async fn apply_plan(
 					applied += 1;
 					note_written(&ctx, &plan, &action, report);
 					tracing::debug!("apply: {} done", action.describe());
-					observer(action.to_event());
+					if let Some(event) = action.to_event() {
+						observer(event);
+					}
 					match action {
 						SyncAction::UploadFile { .. } => report.uploaded += 1,
 						SyncAction::DownloadFile { .. } => report.downloaded += 1,
@@ -1148,9 +1151,12 @@ async fn apply_plan(
 				}) => {
 					applied += 1;
 					note_written(&ctx, &plan, &action, report);
-					observer(action.to_event());
+					if let Some(event) = action.to_event() {
+						observer(event);
+					}
 					observer(SyncEvent::Conflict {
 						rel_path: conflict.rel_path.clone(),
+						reason: conflict.reason,
 					});
 					note_overwrote(report, action.rel_path(), *conflict, unrecorded);
 				}
@@ -2289,7 +2295,9 @@ async fn apply_serial(
 	observer: &mut (dyn FnMut(SyncEvent) + Send),
 ) {
 	let action = &planned.action;
-	observer(action.to_event());
+	if let Some(event) = action.to_event() {
+		observer(event);
+	}
 	tracing::debug!("apply: {}", action.describe());
 	let since = reach.mark();
 	let error = match apply_one(ctx, planned, plan, report, &mut *observer).await {
@@ -2585,7 +2593,9 @@ async fn compose_creates<'c>(
 			settled += 1;
 			continue;
 		}
-		observer(action.to_event());
+		if let Some(event) = action.to_event() {
+			observer(event);
+		}
 		tracing::debug!("apply: {}", action.describe());
 		match compose_create(planned, plan, &earlier) {
 			Ok(create) => {
@@ -3041,7 +3051,9 @@ fn compose_trashes<'c>(
 			settled += 1;
 			continue;
 		}
-		observer(action.to_event());
+		if let Some(event) = action.to_event() {
+			observer(event);
+		}
 		tracing::debug!("apply: {}", action.describe());
 		match compose_trash(planned, plan) {
 			Ok(trash) => composed.push(trash),
@@ -3724,11 +3736,12 @@ async fn apply_transfer(
 					))
 				});
 				return Ok(Transfer::Overwrote {
-					conflict: Box::new(PlannedConflict {
-						rel_path: rel_path.clone(),
-						local: local.map(|node| node.kind.into()),
-						remote: Some(PlannedNodeKind::File),
-					}),
+					conflict: Box::new(PlannedConflict::held(
+						ctx.mode,
+						rel_path.clone(),
+						local.map(|node| node.kind.into()),
+						Some(PlannedNodeKind::File),
+					)),
 					unrecorded,
 				});
 			}
@@ -4055,16 +4068,21 @@ async fn apply_one(
 			report.moved_local += 1;
 		}
 		(SyncAction::Conflict { rel_path }, PassStart::Sides { local, remote }) => {
-			// The engine screens conflicts out of the applied plan and records them itself; this
-			// arm keeps `apply_one` total and correct if one is ever routed through here.
-			record_conflict(
-				ctx.store,
-				ctx.pair,
-				rel_path,
-				local.as_deref(),
-				remote.as_deref(),
-			)
-			.await?;
+			// The engine screens conflicts out of the applied plan, and records and reports them
+			// itself; this arm keeps `apply_one` total and correct if one is ever routed through
+			// here, so it reports what it holds as the engine's conflict loop would.
+			let (local, remote) = (local.as_deref(), remote.as_deref());
+			record_conflict(ctx.store, ctx.pair, rel_path, local, remote).await?;
+			let conflict = PlannedConflict::held(
+				ctx.mode,
+				rel_path.clone(),
+				local.map(|node| node.kind.into()),
+				remote.map(|node| node.kind.into()),
+			);
+			observer(SyncEvent::Conflict {
+				rel_path: conflict.rel_path,
+				reason: conflict.reason,
+			});
 		}
 		(SyncAction::AdoptBaseline { rel_path }, PassStart::Sides { local, remote }) => {
 			// Record the converged state into the baseline with no transfer, so a later one-sided

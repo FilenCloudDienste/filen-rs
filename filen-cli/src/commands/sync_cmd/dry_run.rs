@@ -175,8 +175,8 @@ fn unsyncable_object(path: &UnsyncablePath) -> Value {
 #[cfg(test)]
 mod tests {
 	use filen_sdk_rs::sync_engine::{
-		GuardReason, PlanOutcome, PlannedAction, PlannedActionKind, PlannedConflict,
-		PlannedNodeKind, PlannedTransfer,
+		ConflictReason, GuardReason, PlanOutcome, PlannedAction, PlannedActionKind,
+		PlannedConflict, PlannedNodeKind, PlannedTransfer,
 	};
 	use serde_json::json;
 
@@ -215,6 +215,7 @@ mod tests {
 				rel_path: "c.txt".to_string(),
 				local: Some(PlannedNodeKind::File),
 				remote: None,
+				reason: ConflictReason::Diverged,
 			}],
 			..PlanOutcome::default()
 		}

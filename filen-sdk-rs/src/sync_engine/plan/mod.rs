@@ -197,9 +197,11 @@ impl SyncAction {
 
 	/// The "in progress" [`SyncEvent`] for this action, emitted by the apply layer just before it
 	/// executes the action, except for a file transfer, which the concurrent transfer path reports
-	/// once it has landed.
-	pub(super) fn to_event(&self) -> SyncEvent {
-		match self {
+	/// once it has landed. `None` for a conflict, whose event carries a reason the action does not:
+	/// what holds the conflict reports it, the engine's conflict loop or, should one ever reach the
+	/// apply, `apply_one`'s own arm.
+	pub(super) fn to_event(&self) -> Option<SyncEvent> {
+		Some(match self {
 			Self::UploadFile { rel_path } => SyncEvent::Uploading {
 				rel_path: rel_path.clone(),
 			},
@@ -230,13 +232,11 @@ impl SyncAction {
 				from: from_path.clone(),
 				to: to_path.clone(),
 			},
-			Self::Conflict { rel_path } => SyncEvent::Conflict {
-				rel_path: rel_path.clone(),
-			},
+			Self::Conflict { .. } => return None,
 			Self::AdoptBaseline { rel_path } => SyncEvent::AdoptedBaseline {
 				rel_path: rel_path.clone(),
 			},
-		}
+		})
 	}
 }
 

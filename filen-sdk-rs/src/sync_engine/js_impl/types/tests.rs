@@ -12,6 +12,7 @@ fn conflict(index: usize) -> PlannedConflict {
 		rel_path: format!("conflict-{index}"),
 		local: Some(PlannedNodeKind::File),
 		remote: None,
+		reason: ConflictReason::Diverged,
 	}
 }
 
@@ -300,6 +301,35 @@ fn events_map_with_their_payloads() {
 	for (event, expected) in cases {
 		assert_eq!(SyncEventMessage::from(event), expected);
 	}
+}
+
+#[test]
+fn a_conflict_event_carries_its_reason() {
+	assert_eq!(
+		SyncEventMessage::from(SyncEvent::Conflict {
+			rel_path: "x".to_owned(),
+			reason: ConflictReason::RemoteKeepsDir,
+		}),
+		SyncEventMessage::Conflict {
+			rel_path: "x".to_owned(),
+			reason: ConflictReason::RemoteKeepsDir,
+		}
+	);
+}
+
+#[test]
+fn a_report_keeps_each_conflicts_reason() {
+	let held = PlannedConflict {
+		rel_path: "x".to_owned(),
+		local: Some(PlannedNodeKind::Dir),
+		remote: Some(PlannedNodeKind::File),
+		reason: ConflictReason::LocalKeepsDir,
+	};
+	let report = SyncPassReport::from(SyncReport {
+		conflicts: vec![held.clone()],
+		..SyncReport::default()
+	});
+	assert_eq!(report.conflicts, [held]);
 }
 
 #[test]

@@ -28,8 +28,8 @@ use crate::{
 	},
 	sync::lock::test_support::test_lock_on,
 	sync_engine::{
-		Backlog, BaselineInUse, ConflictResolution, DeleteGuard, GuardReason, LegacyImport,
-		LocalScanProgress, PauseMode, PlanOutcome, PlannedAction, PlannedActionKind,
+		Backlog, BaselineInUse, ConflictReason, ConflictResolution, DeleteGuard, GuardReason,
+		LegacyImport, LocalScanProgress, PauseMode, PlanOutcome, PlannedAction, PlannedActionKind,
 		PlannedConflict, PlannedNodeKind, SyncEvent, SyncMode, SyncReport, TransferDirection,
 		WatchState, WatchStatus,
 		baseline::{BaselineEntry, BaselineState, BaselineStore, NodeKind},
@@ -598,6 +598,7 @@ fn the_recent_ring_keeps_the_latest_events_without_progress_or_reports() {
 	for index in 0..RECENT_EVENTS {
 		observer(SyncEvent::Conflict {
 			rel_path: format!("conflict-{index}"),
+			reason: ConflictReason::Diverged,
 		});
 		observer(SyncEvent::Progress {
 			rel_path: "a".to_owned(),
@@ -613,7 +614,8 @@ fn the_recent_ring_keeps_the_latest_events_without_progress_or_reports() {
 	assert_eq!(
 		recent.front().map(|event| &event.event),
 		Some(&SyncEventMessage::Conflict {
-			rel_path: "conflict-0".to_owned()
+			rel_path: "conflict-0".to_owned(),
+			reason: ConflictReason::Diverged,
 		}),
 		"the oldest of the ring's events is the first conflict: PassStarted fell out"
 	);
@@ -823,6 +825,7 @@ fn releasing_a_plan_empties_its_lists_and_keeps_its_summary() {
 			rel_path: "conflict".to_owned(),
 			local: Some(PlannedNodeKind::File),
 			remote: Some(PlannedNodeKind::File),
+			reason: ConflictReason::Diverged,
 		}],
 		..PlanOutcome::default()
 	});

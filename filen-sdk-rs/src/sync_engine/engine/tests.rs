@@ -98,7 +98,8 @@ fn reconcile_and_screen_resident(prep: &Prepared, state: guard::ScreenState) -> 
 	let conflicts = conflict_actions
 		.iter()
 		.map(|a| {
-			planned_conflict(
+			held_conflict(
+				prep,
 				a.rel_path(),
 				&prep.local_scan.nodes.of(&prep.baseline),
 				&prep.remote_view.nodes.of(&prep.baseline),
@@ -4689,6 +4690,7 @@ fn a_two_way_local_edit_is_held_as_a_conflict_unless_the_account_keeps_old_versi
 						rel_path: "a.txt".to_string(),
 						local: Some(PlannedNodeKind::File),
 						remote: Some(PlannedNodeKind::File),
+						reason: ConflictReason::Diverged,
 					}],
 					"{why}"
 				);
@@ -4797,6 +4799,7 @@ fn the_pass_after_an_unreadable_versioning_setting_takes_the_exit_the_setting_na
 			rel_path: "a.txt".to_string(),
 			local: Some(PlannedNodeKind::File),
 			remote: Some(PlannedNodeKind::File),
+			reason: ConflictReason::Diverged,
 		}]
 	);
 }
@@ -4998,6 +5001,239 @@ async fn planned(engine: &SyncEngine, pair: PairId) -> Vec<(PlannedActionKind, S
 		.collect();
 	planned.sort_by(|a, b| a.1.cmp(&b.1));
 	planned
+}
+
+/// A pair in `mode` whose two sides hold items of different kinds at `x`, held as a conflict as the
+/// first pass over them leaves it. The local side holds `local` there: a file `x` holding
+/// [`KIND_MISMATCH_FILE`], with a remote directory `x` holding `a.txt`; or a directory `x` holding
+/// `new.txt`, with a remote file `x`. No baseline rows besides the conflict's. With the directory
+/// everything is in, the engine, the pair, the local root and the cache, which must outlive the
+/// engine's reads.
+async fn kind_mismatch_held(
+	mode: SyncMode,
+	local_kind: PlannedNodeKind,
+) -> (tempfile::TempDir, SyncEngine, PairId, PathBuf, CacheState) {
+	let dir = tempfile::tempdir().unwrap();
+	let local = dir.path().join("local");
+	std::fs::create_dir(&local).unwrap();
+	let (account, remote_root, x, child) = (
+		Uuid::from_u128(1),
+		Uuid::from_u128(2),
+		Uuid::from_u128(3),
+		Uuid::from_u128(4),
+	);
+	let cache = dir.path().join("cache.db");
+	let mut state = CacheState::new_on_path(&cache, account);
+	state
+		.upsert_dirs([&cacheable_dir(remote_root, account, "pair")].into_iter())
+		.unwrap();
+	let remote_kind = match local_kind {
+		PlannedNodeKind::File => {
+			std::fs::write(local.join("x"), KIND_MISMATCH_FILE).unwrap();
+			state
+				.upsert_dirs([&cacheable_dir(x, remote_root, "x")].into_iter())
+				.unwrap();
+			let file = CacheableFile {
+				hash: Some(Blake3Hash::from([2; 32])),
+				..cacheable_file(child, x, "a.txt")
+			};
+			state.upsert_files([&file].into_iter()).unwrap();
+			PlannedNodeKind::Dir
+		}
+		PlannedNodeKind::Dir => {
+			std::fs::create_dir(local.join("x")).unwrap();
+			std::fs::write(local.join("x").join("new.txt"), b"new").unwrap();
+			let file = CacheableFile {
+				hash: Some(Blake3Hash::from([2; 32])),
+				..cacheable_file(x, remote_root, "x")
+			};
+			state.upsert_files([&file].into_iter()).unwrap();
+			PlannedNodeKind::File
+		}
+	};
+	state.add_converged_roots(&[remote_root]).unwrap();
+	let client = Arc::new(offline_client());
+	client.configure_cache(cache, |_| {}).await.unwrap();
+	let engine = SyncEngine::open(client, dir.path().join("sync.db"))
+		.await
+		.unwrap();
+	let (pair, _) = locked(&engine.control)
+		.create_pair(local.to_str().unwrap(), remote_root, mode)
+		.unwrap();
+
+	let read = engine
+		.read_pass(pair, None, Seeding::Preview, &Arc::default())
+		.await
+		.unwrap();
+	assert_eq!(
+		reconcile_and_screen_resident(&read, screen_state(&read)).conflicts,
+		[PlannedConflict::held(
+			mode,
+			"x".to_string(),
+			Some(local_kind),
+			Some(remote_kind)
+		)]
+	);
+	apply::record_conflict(
+		&engine.pair_store(pair).await.unwrap(),
+		pair,
+		"x",
+		read.local_scan.nodes.of(&read.baseline).at("x").as_deref(),
+		read.remote_view.nodes.of(&read.baseline).at("x").as_deref(),
+	)
+	.await
+	.unwrap();
+	(dir, engine, pair, local, state)
+}
+
+/// What the local file holds in [`kind_mismatch_held`].
+const KIND_MISMATCH_FILE: &[u8] = b"local copy";
+
+/// What a dry run of `pair` plans, by kind and path, and the conflicts it reports.
+async fn planned_with_conflicts(
+	engine: &SyncEngine,
+	pair: PairId,
+) -> (Vec<(PlannedActionKind, String)>, Vec<PlannedConflict>) {
+	let outcome = engine.plan_pair(pair).await.unwrap();
+	let planned = outcome
+		.actions
+		.into_iter()
+		.map(|action| (action.kind, action.rel_path))
+		.collect();
+	(planned, outcome.conflicts)
+}
+
+/// Runs two real passes over `pair`, which [`kind_mismatch_held`] left holding `conflict` as its
+/// first pass would, and checks each reports it again with its reason and acts on nothing else,
+/// and that the pair still holds it: `list_conflicts` lists it, and a dry run plans nothing.
+async fn assert_held_by_the_next_passes(
+	engine: &SyncEngine,
+	pair: PairId,
+	mode: SyncMode,
+	conflict: PlannedConflict,
+) {
+	// A live subscription, so the passes ask no server for one.
+	let registered = Arc::new(());
+	let remote_root = engine.registered_pair(pair).unwrap().remote_root;
+	engine.roots.lock().await.insert(
+		pair,
+		Subscription {
+			handle: SyncRootHandle::unregistered_for_test(remote_root),
+			registered: Arc::downgrade(&registered),
+		},
+	);
+	let held = vec![conflict];
+	for _ in 0..2 {
+		let mut events = Vec::new();
+		engine
+			.sync_once_observed(pair, &mut |event| events.push(event))
+			.await
+			.unwrap();
+		let Some(SyncEvent::PassCompleted { report }) = events.pop() else {
+			panic!("a pass ends with its report: {events:?}");
+		};
+		assert_eq!(
+			events,
+			[
+				SyncEvent::PassStarted { mode },
+				SyncEvent::Conflict {
+					rel_path: held[0].rel_path.clone(),
+					reason: held[0].reason,
+				},
+				SyncEvent::Planned { actions: 0 },
+			]
+		);
+		assert_eq!(report.conflicts, held);
+		assert_eq!(report.errors, Vec::<String>::new());
+	}
+	assert_eq!(engine.list_conflicts(pair).await.unwrap(), held);
+	assert_eq!(
+		planned_with_conflicts(engine, pair).await,
+		(Vec::new(), held)
+	);
+}
+
+/// A row this engine's own upload left is resolved against the file's version history, whatever
+/// the two sides hold now, so a local backup reports it as diverged even once the local path holds
+/// a directory over the remote file: the pass, `list_conflicts` and the refusal agree.
+#[tokio::test]
+async fn an_overwritten_row_is_reported_as_diverged_whatever_the_two_sides_hold() {
+	let (_dir, engine, pair, _local, _cache) =
+		kind_mismatch_held(SyncMode::LocalBackup, PlannedNodeKind::Dir).await;
+	let store = engine.pair_store(pair).await.unwrap();
+	{
+		let store = locked(&store);
+		let row = store.entry(pair, "x").unwrap().unwrap();
+		let overwritten = BaselineEntry {
+			kind: NodeKind::File,
+			state: BaselineState::Overwritten,
+			local_kind: Some(NodeKind::File),
+			remote_kind: Some(NodeKind::File),
+			..row
+		};
+		store.upsert_entry(pair, &overwritten).unwrap();
+	}
+	assert_eq!(
+		planned_with_conflicts(&engine, pair).await,
+		(
+			Vec::new(),
+			vec![PlannedConflict {
+				rel_path: "x".to_string(),
+				local: Some(PlannedNodeKind::Dir),
+				remote: Some(PlannedNodeKind::File),
+				reason: ConflictReason::Diverged,
+			}]
+		)
+	);
+	assert_eq!(
+		engine.list_conflicts(pair).await.unwrap(),
+		[PlannedConflict {
+			rel_path: "x".to_string(),
+			local: Some(PlannedNodeKind::File),
+			remote: Some(PlannedNodeKind::File),
+			reason: ConflictReason::Diverged,
+		}]
+	);
+}
+
+/// A local backup's directory over a remote file is held by the passes after it too, under its
+/// reason, and nothing inside the directory is backed up while it is.
+#[tokio::test]
+async fn a_local_backup_kind_mismatch_is_reported_with_its_reason_and_holds_its_subtree() {
+	let (_dir, engine, pair, _local, _cache) =
+		kind_mismatch_held(SyncMode::LocalBackup, PlannedNodeKind::Dir).await;
+	assert_held_by_the_next_passes(
+		&engine,
+		pair,
+		SyncMode::LocalBackup,
+		PlannedConflict {
+			rel_path: "x".to_string(),
+			local: Some(PlannedNodeKind::Dir),
+			remote: Some(PlannedNodeKind::File),
+			reason: ConflictReason::RemoteKeepsFile,
+		},
+	)
+	.await;
+}
+
+/// A remote backup's local file under a remote directory is held by the passes after it too, under
+/// its reason, and nothing inside the remote directory is pulled while it is.
+#[tokio::test]
+async fn a_remote_backup_kind_mismatch_is_reported_with_its_reason_and_holds_its_subtree() {
+	let (_dir, engine, pair, _local, _cache) =
+		kind_mismatch_held(SyncMode::RemoteBackup, PlannedNodeKind::File).await;
+	assert_held_by_the_next_passes(
+		&engine,
+		pair,
+		SyncMode::RemoteBackup,
+		PlannedConflict {
+			rel_path: "x".to_string(),
+			local: Some(PlannedNodeKind::File),
+			remote: Some(PlannedNodeKind::Dir),
+			reason: ConflictReason::LocalKeepsFile,
+		},
+	)
+	.await;
 }
 
 /// Keeping the local side before any further pass uploads the edit. The row it writes records no
@@ -7726,11 +7962,13 @@ async fn list_conflicts_reads_the_held_rows_only() {
 				rel_path: "a.txt".to_string(),
 				local: Some(PlannedNodeKind::File),
 				remote: Some(PlannedNodeKind::File),
+				reason: ConflictReason::Diverged,
 			},
 			PlannedConflict {
 				rel_path: "b/edited.txt".to_string(),
 				local: Some(PlannedNodeKind::File),
 				remote: None,
+				reason: ConflictReason::Diverged,
 			},
 		]
 	);
@@ -12017,6 +12255,7 @@ fn a_first_pass_completes_only_when_nothing_cut_it_short_or_made_its_read_untrus
 			rel_path: "c.bin".to_string(),
 			local: None,
 			remote: None,
+			reason: ConflictReason::Diverged,
 		}],
 		failed_paths: vec![("a.bin".to_string(), "boom".to_string())],
 		errors: vec!["a.bin: boom".to_string()],

@@ -505,8 +505,8 @@ impl<T> Questions<T> {
 #[cfg(test)]
 mod tests {
 	use filen_sdk_rs::sync_engine::{
-		ConflictResolution, GuardReason, PlannedAction, PlannedActionKind, PlannedConflict,
-		PlannedNodeKind, SyncReport,
+		ConflictReason, ConflictResolution, GuardReason, PlannedAction, PlannedActionKind,
+		PlannedConflict, PlannedNodeKind, SyncReport,
 	};
 	use inquire::InquireError;
 
@@ -530,6 +530,7 @@ mod tests {
 			rel_path: rel_path.to_owned(),
 			local: None,
 			remote: None,
+			reason: ConflictReason::Diverged,
 		}
 	}
 

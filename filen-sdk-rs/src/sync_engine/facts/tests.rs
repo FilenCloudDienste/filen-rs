@@ -9,7 +9,7 @@ use crate::sync_engine::{
 	baseline::{BaselineEntry, BaselineState, NodeKind},
 	ignore::{FILENIGNORE, IgnoreLevel, IgnoreRules},
 	observe::observe_local,
-	outcome::PlannedNodeKind,
+	outcome::{ConflictReason, PlannedNodeKind},
 	plan::SyncAction,
 	scan::{PairRoot, RuleFiles, ScanRoot, scan_local},
 };
@@ -423,6 +423,7 @@ fn the_carry_over_set_names_every_released_action_and_every_streak() {
 		rel_path: "clash.txt".to_owned(),
 		local: Some(PlannedNodeKind::File),
 		remote: Some(PlannedNodeKind::File),
+		reason: ConflictReason::Diverged,
 	}];
 	let failures = HashMap::from([
 		(

@@ -12,11 +12,11 @@ use crate::{
 	Error, ErrorKind,
 	job::millis,
 	sync_engine::{
-		BaselineInUse, BaselineSchemaMismatch, ConflictResolved, DeleteGuard, GuardReason,
-		HaltReason, IgnoredPath, LocalScanProgress, PairId, PairOverlap, PairRecord, PauseMode,
-		PauseOptions, PlanOutcome, PlannedAction, PlannedActionKind, PlannedConflict, RefuseReason,
-		ScanGap, ScanGapCause, SyncEvent, SyncMode, SyncReport, TransferDirection, UnsyncablePath,
-		WatchConfig, WatchStatus,
+		BaselineInUse, BaselineSchemaMismatch, ConflictReason, ConflictResolved, DeleteGuard,
+		GuardReason, HaltReason, IgnoredPath, LocalScanProgress, PairId, PairOverlap, PairRecord,
+		PauseMode, PauseOptions, PlanOutcome, PlannedAction, PlannedActionKind, PlannedConflict,
+		RefuseReason, ScanGap, ScanGapCause, SyncEvent, SyncMode, SyncReport, TransferDirection,
+		UnsyncablePath, WatchConfig, WatchStatus,
 	},
 };
 
@@ -302,7 +302,7 @@ pub struct SyncPassReport {
 	pub moved_remote: u64,
 	pub moved_local: u64,
 	/// Paths held as conflicts: in two-way, both sides changed; in a backup mode, the two
-	/// sides hold items of different kinds.
+	/// sides hold items of different kinds. Each with its reason.
 	pub conflicts: Vec<PlannedConflict>,
 	pub conflicts_total: u64,
 	/// What the mass-delete guard held back: the deletions, plus the create half of a held type
@@ -490,6 +490,7 @@ pub enum SyncEventMessage {
 	},
 	Conflict {
 		rel_path: String,
+		reason: ConflictReason,
 	},
 	DeletionsHeld {
 		count: u64,
@@ -573,7 +574,7 @@ impl From<SyncEvent> for SyncEventMessage {
 			SyncEvent::Planned { actions } => Self::Planned {
 				actions: actions as u64,
 			},
-			SyncEvent::Conflict { rel_path } => Self::Conflict { rel_path },
+			SyncEvent::Conflict { rel_path, reason } => Self::Conflict { rel_path, reason },
 			SyncEvent::DeletionsHeld {
 				count,
 				reason,

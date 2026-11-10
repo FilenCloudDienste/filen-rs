@@ -835,7 +835,7 @@ impl<'a> EventLog<'a> {
 					self.print_needs_attention(ui, pair, &notice);
 				}
 			}
-			SyncEvent::Conflict { rel_path } => {
+			SyncEvent::Conflict { rel_path, .. } => {
 				if is_first_pass
 					&& let Some(resolution) = self.settle.conflict_resolutions.for_path(rel_path)
 				{
@@ -1144,7 +1144,7 @@ fn format_sync_event(event: &SyncEvent) -> Option<String> {
 		SyncEvent::PassStarted { .. } => "Sync pass started".to_string(),
 		SyncEvent::Refused { reason } => format!("Sync pass refused: {reason}"),
 		SyncEvent::Planned { actions } => format!("Planned {actions} action(s)"),
-		SyncEvent::Conflict { rel_path } => {
+		SyncEvent::Conflict { rel_path, .. } => {
 			format!("Conflict: {rel_path} changed on both sides, left untouched")
 		}
 		SyncEvent::DeletionsHeld {
@@ -1221,7 +1221,7 @@ mod tests {
 	use filen_sdk_rs::{
 		Error, ErrorKind,
 		sync_engine::{
-			BaselineInUse, SyncMode, SyncReport, TransferDirection, UnsyncablePath,
+			BaselineInUse, ConflictReason, SyncMode, SyncReport, TransferDirection, UnsyncablePath,
 			UnsyncableReason,
 		},
 	};
@@ -1551,6 +1551,7 @@ mod tests {
 			},
 			SyncEvent::Conflict {
 				rel_path: "c".to_string(),
+				reason: ConflictReason::Diverged,
 			},
 			SyncEvent::Uploading {
 				rel_path: "a".to_string(),
@@ -1655,6 +1656,7 @@ mod tests {
 		for event in [
 			SyncEvent::Conflict {
 				rel_path: "c".to_string(),
+				reason: ConflictReason::Diverged,
 			},
 			SyncEvent::DeletionsHeld {
 				count: 3,
@@ -1733,6 +1735,7 @@ mod tests {
 			(
 				SyncEvent::Conflict {
 					rel_path: "c".to_string(),
+					reason: ConflictReason::Diverged,
 				},
 				0,
 			),

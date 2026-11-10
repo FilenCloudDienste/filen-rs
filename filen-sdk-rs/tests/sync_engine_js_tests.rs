@@ -22,9 +22,9 @@ use filen_sdk_rs::{
 		categories::{DirType, Normal},
 	},
 	sync_engine::{
-		Backlog, ConflictResolution, FullPassReason, IgnoreLevel, JsSyncEngine, PauseMode,
-		PlannedConflict, PlannedNodeKind, SyncEngineListener, SyncEventMessage, SyncMode,
-		SyncPassEvent, SyncRefusal, WatchState, WatchStatus,
+		Backlog, ConflictReason, ConflictResolution, FullPassReason, IgnoreLevel, JsSyncEngine,
+		PauseMode, PlannedConflict, PlannedNodeKind, SyncEngineListener, SyncEventMessage,
+		SyncMode, SyncPassEvent, SyncRefusal, WatchState, WatchStatus,
 	},
 };
 use uuid::Uuid;
@@ -493,6 +493,7 @@ async fn a_file_both_sides_edit_is_held_as_a_conflict() {
 		rel_path: "held.txt".to_owned(),
 		local: Some(PlannedNodeKind::File),
 		remote: Some(PlannedNodeKind::File),
+		reason: ConflictReason::Diverged,
 	};
 	assert_eq!(
 		(
@@ -511,7 +512,8 @@ async fn a_file_both_sides_edit_is_held_as_a_conflict() {
 			.iter()
 			.any(|event| event.event
 				== SyncEventMessage::Conflict {
-					rel_path: "held.txt".to_owned()
+					rel_path: "held.txt".to_owned(),
+					reason: ConflictReason::Diverged,
 				}),
 		"the conflict was never announced"
 	);

@@ -138,7 +138,7 @@ impl WatchLog {
 			.unwrap()
 			.iter()
 			.filter_map(|e| match e {
-				SyncEvent::Conflict { rel_path } => Some(rel_path.clone()),
+				SyncEvent::Conflict { rel_path, .. } => Some(rel_path.clone()),
 				_ => None,
 			})
 			.collect()

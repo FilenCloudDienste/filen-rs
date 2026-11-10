@@ -73,7 +73,7 @@ fn event_fields(pair: PairId, event: &SyncEvent, transfers: &Transfers) -> (&'st
 		}
 		SyncEvent::Refused { reason } => ("refused", json!({ "reason": reason })),
 		SyncEvent::Planned { actions } => ("planned", json!({ "actions": actions })),
-		SyncEvent::Conflict { rel_path } => ("conflict", json!({ "path": rel_path })),
+		SyncEvent::Conflict { rel_path, .. } => ("conflict", json!({ "path": rel_path })),
 		SyncEvent::DeletionsHeld {
 			count,
 			reason,

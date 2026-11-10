@@ -20,6 +20,7 @@ import * as sdk from "../node/index.js"
 const {
 	Backlog,
 	CacheStatusMessage_Tags,
+	ConflictReason,
 	ConflictResolution,
 	DeleteGuardState_Tags,
 	ErrorKind,
@@ -109,6 +110,8 @@ describe("exports", () => {
 			"BacklogNapi",
 			"CacheStatusMessageTags",
 			"CacheStatusMessage_Tags",
+			"ConflictReason",
+			"ConflictReasonNapi",
 			"ConflictResolution",
 			"ConflictResolutionNapi",
 			"DeleteGuardStateTags",
@@ -261,6 +264,10 @@ describe("exports", () => {
 		assert.deepEqual({ ...Backlog }, { Propagate: 0, AdoptDestination: 1 })
 		assert.deepEqual({ ...PauseMode }, { Suspend: 0, Cancel: 1 })
 		assert.deepEqual({ ...ConflictResolution }, { KeepLocal: 0, KeepRemote: 1, KeepBoth: 2 })
+		assert.deepEqual(
+			{ ...ConflictReason },
+			{ Diverged: 0, RemoteKeepsDir: 1, RemoteKeepsFile: 2, LocalKeepsDir: 3, LocalKeepsFile: 4 }
+		)
 		assert.deepEqual({ ...TransferDirection }, { Upload: 0, Download: 1 })
 		assert.deepEqual({ ...RefuseReason }, { RemoteCollision: 0, LocalCollision: 1 })
 		assert.deepEqual({ ...HaltReason }, { LocalStorageFull: 0, RemoteStorageFull: 1, RemoteUnavailable: 2, Unauthenticated: 3 })

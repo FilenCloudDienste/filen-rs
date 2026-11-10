@@ -20,7 +20,7 @@ use crate::{
 	fs::{bulk::create_dirs::CreateDirsError, file::cache::CacheableFile},
 	sync::lock::test_support::{held_lock, undriven_runtime},
 	sync_engine::{
-		SyncMode,
+		ConflictReason, SyncMode,
 		baseline::BaselineStore,
 		bin::test_support::{bucket, day},
 		changes::tests::{cacheable_dir, cacheable_file},
@@ -532,6 +532,7 @@ fn conflict(rel_path: &str) -> PlannedConflict {
 		rel_path: rel_path.to_string(),
 		local: Some(PlannedNodeKind::File),
 		remote: Some(PlannedNodeKind::File),
+		reason: ConflictReason::Diverged,
 	}
 }
 

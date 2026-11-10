@@ -172,7 +172,7 @@ mod tests {
 
 	use filen_sdk_rs::{
 		ErrorKind,
-		sync_engine::{PlannedConflict, SyncEvent, SyncMode, SyncReport},
+		sync_engine::{ConflictReason, PlannedConflict, SyncEvent, SyncMode, SyncReport},
 	};
 
 	use super::{LastPasses, pass_problems, problems_summary};
@@ -182,6 +182,7 @@ mod tests {
 			rel_path: rel_path.to_owned(),
 			local: None,
 			remote: None,
+			reason: ConflictReason::Diverged,
 		}
 	}
 

@@ -46,8 +46,8 @@ use super::{
 	names::{self, Leaf},
 	observe::{self, LocalObservation, LocalObservations},
 	outcome::{
-		PlanOutcome, PlannedAction, PlannedConflict, PlannedNodeKind, RefuseReason, UnsyncablePath,
-		UnsyncableReason, planned_action, planned_conflict,
+		ConflictReason, PlanOutcome, PlannedAction, PlannedConflict, PlannedNodeKind, RefuseReason,
+		UnsyncablePath, UnsyncableReason, planned_action, planned_conflict,
 	},
 	pause::{PassControl, PassGate, PauseOptions, cancel_suspension},
 	plan::{self, RemoteNode, RemoteView, SyncAction},
@@ -3072,6 +3072,14 @@ impl Prepared {
 			.failures
 			.get(action.rel_path())
 			.is_some_and(|failure| failure.mismatched.is_some())
+	}
+
+	/// Whether the row at `rel_path` is held because THIS engine's push buried a concurrent edit
+	/// ([`BaselineState::Overwritten`]).
+	fn overwritten_at(&self, rel_path: &str) -> bool {
+		self.baseline
+			.get(rel_path)
+			.is_some_and(|row| row.state == BaselineState::Overwritten)
 	}
 
 	/// Every path this pass will not act on, and why — reported identically by the dry run and by
@@ -6808,7 +6816,7 @@ impl SyncEngine {
 	/// wait for a pass in flight. A conflict that pass has yet to record appears once it has.
 	/// Errors only if the pair is unknown.
 	pub async fn list_conflicts(&self, pair: PairId) -> Result<Vec<PlannedConflict>, Error> {
-		self.registered_pair(pair)?;
+		let record = self.registered_pair(pair)?;
 		let store = self.pair_store(pair).await?;
 		// A seek of the `(pair_id, state)` index rather than a read of the pair's rows, and it
 		// deliberately does not wait for the pass in flight. Still off the runtime thread: the
@@ -6820,10 +6828,13 @@ impl SyncEngine {
 			})
 			.await?
 			.into_iter()
-			.map(|entry| PlannedConflict {
-				rel_path: entry.rel_path,
-				local: entry.local_kind.map(PlannedNodeKind::from),
-				remote: entry.remote_kind.map(PlannedNodeKind::from),
+			.map(|entry| {
+				PlannedConflict::held(
+					record.mode,
+					entry.rel_path,
+					entry.local_kind.map(PlannedNodeKind::from),
+					entry.remote_kind.map(PlannedNodeKind::from),
+				)
 			})
 			.collect(),
 		)
@@ -7709,13 +7720,10 @@ impl SyncEngine {
 			// row is holding for the caller only exists in the file's history. Re-recording it from
 			// the view would put our own copy on both sides of the conflict and lose the only
 			// reference to the buried one.
-			if prep
-				.baseline
-				.get(rel_path)
-				.is_some_and(|row| row.state == BaselineState::Overwritten)
-			{
+			if prep.overwritten_at(rel_path) {
 				observer(SyncEvent::Conflict {
 					rel_path: rel_path.clone(),
+					reason: conflict.reason,
 				});
 				continue;
 			}
@@ -7748,6 +7756,7 @@ impl SyncEngine {
 			}
 			observer(SyncEvent::Conflict {
 				rel_path: rel_path.clone(),
+				reason: conflict.reason,
 			});
 		}
 		// Every conflict row this pass will write is written: a resolution may land from here on.
@@ -8257,6 +8266,23 @@ fn reconcile_and_screen(
 	})
 }
 
+/// The public view of the conflict `prep`'s pass holds at `rel_path`, with what `local` and `remote`
+/// (the pass's two sides) hold there.
+fn held_conflict(
+	prep: &Prepared,
+	rel_path: &str,
+	local: &impl NodesAt<Node = scan::LocalNode>,
+	remote: &impl NodesAt<Node = RemoteNode>,
+) -> PlannedConflict {
+	let mut conflict = planned_conflict(prep.record.mode, rel_path, local, remote);
+	// A row this engine's own upload left is resolved against the file's version history, whatever
+	// the two sides hold now (see `resolve_overwritten`), so it is never a kind mismatch.
+	if prep.overwritten_at(rel_path) {
+		conflict.reason = ConflictReason::Diverged;
+	}
+	conflict
+}
+
 /// Screen `screen`, the reconciled plan with the directory moves leading it, where it is staged —
 /// `deferred` being the paths the reconcile deferred — in the order a pass always screened it:
 ///
@@ -8319,7 +8345,7 @@ fn screen_plan(
 		prep.remote_view.nodes.of(&prep.baseline),
 	);
 	let mut conflicts = Vec::new();
-	screen.take_conflicts(|path| conflicts.push(planned_conflict(path, &local, &remote)))?;
+	screen.take_conflicts(|path| conflicts.push(held_conflict(prep, path, &local, &remote)))?;
 	// A path that stops being ignored has no rows and syncs like a first sync, whose deletions are held
 	// for approval: the rows the pair tracks elsewhere say nothing about what sits there.
 	let mut first_sync = state.first_sync;

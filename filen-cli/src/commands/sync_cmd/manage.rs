@@ -446,7 +446,9 @@ mod tests {
 
 	use filen_sdk_rs::{
 		ErrorKind,
-		sync_engine::{DeleteGuard, PairRecord, PlannedConflict, PlannedNodeKind, SyncMode},
+		sync_engine::{
+			ConflictReason, DeleteGuard, PairRecord, PlannedConflict, PlannedNodeKind, SyncMode,
+		},
 	};
 	use filen_types::fs::Uuid;
 	use futures::FutureExt as _;
@@ -506,6 +508,7 @@ mod tests {
 			rel_path: "docs/a.txt".to_string(),
 			local: Some(PlannedNodeKind::File),
 			remote: None,
+			reason: ConflictReason::Diverged,
 		};
 
 		assert_eq!(
@@ -520,6 +523,7 @@ mod tests {
 			rel_path: "docs".to_string(),
 			local: Some(PlannedNodeKind::Dir),
 			remote: Some(PlannedNodeKind::File),
+			reason: ConflictReason::Diverged,
 		};
 
 		assert_eq!(

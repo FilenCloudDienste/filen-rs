@@ -5452,9 +5452,9 @@ fn to_event_maps_each_action_to_its_in_progress_event() {
 			rel_path: "a.txt".into()
 		}
 		.to_event(),
-		SyncEvent::Uploading {
+		Some(SyncEvent::Uploading {
 			rel_path: "a.txt".into()
-		}
+		})
 	);
 	assert_eq!(
 		SyncAction::DownloadFile {
@@ -5462,9 +5462,9 @@ fn to_event_maps_each_action_to_its_in_progress_event() {
 			remote_uuid: Uuid::nil(),
 		}
 		.to_event(),
-		SyncEvent::Downloading {
+		Some(SyncEvent::Downloading {
 			rel_path: "b.txt".into()
-		}
+		})
 	);
 	assert_eq!(
 		SyncAction::TrashRemote {
@@ -5473,9 +5473,9 @@ fn to_event_maps_each_action_to_its_in_progress_event() {
 			remote_uuid: Uuid::nil(),
 		}
 		.to_event(),
-		SyncEvent::TrashingRemote {
+		Some(SyncEvent::TrashingRemote {
 			rel_path: "gone".into()
-		}
+		})
 	);
 	assert_eq!(
 		SyncAction::MoveRemote {
@@ -5485,10 +5485,22 @@ fn to_event_maps_each_action_to_its_in_progress_event() {
 			remote_uuid: Uuid::nil(),
 		}
 		.to_event(),
-		SyncEvent::MovingRemote {
+		Some(SyncEvent::MovingRemote {
 			from: "x".into(),
 			to: "y".into(),
+		})
+	);
+}
+
+/// The engine's conflict loop reports a conflict with its reason; the apply has none to give.
+#[test]
+fn to_event_has_no_event_for_a_conflict() {
+	assert_eq!(
+		SyncAction::Conflict {
+			rel_path: "x".into()
 		}
+		.to_event(),
+		None
 	);
 }
 

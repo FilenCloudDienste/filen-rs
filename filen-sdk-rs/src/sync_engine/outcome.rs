@@ -15,6 +15,7 @@ use std::fmt;
 use filen_macros::js_type;
 
 use super::{
+	SyncMode,
 	baseline::NodeKind,
 	guard::GuardReason,
 	ignore::IgnoredPath,
@@ -144,9 +145,88 @@ impl fmt::Display for PlannedAction {
 	}
 }
 
-/// A path both sides changed since the last sync, held until
-/// [`SyncEngine::resolve_conflict`](super::SyncEngine::resolve_conflict) picks a winner. The path
-/// and its subtree are excluded from planning while it is held.
+/// Why a path is held as a conflict. Worked out from the pair's CURRENT mode and the kinds the two
+/// sides hold at the path, so a conflict still held across a mode switch is reported under the new
+/// mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[js_type(export, no_deser, no_default, napi)]
+pub enum ConflictReason {
+	/// The two sides diverged from what they last agreed on: in two-way both changed (two edits, an
+	/// edit against a deletion, two items of different kinds), or, in any mode, this engine's
+	/// upload buried another client's edit, or a local edit sits over a remote version that does
+	/// not match its hash.
+	Diverged,
+	/// [`LocalBackup`](SyncMode::LocalBackup): the remote keeps a directory where the local side
+	/// holds a file. A backup never deletes on its destination, whichever side made the kinds
+	/// differ: the local item changed kind, another client replaced the remote one, or a first sync
+	/// or a mode switch met a remote that already held the other kind.
+	RemoteKeepsDir,
+	/// [`LocalBackup`](SyncMode::LocalBackup): the remote keeps a file where the local side holds a
+	/// directory, whichever side made the kinds differ (see [`RemoteKeepsDir`](Self::RemoteKeepsDir)).
+	RemoteKeepsFile,
+	/// [`RemoteBackup`](SyncMode::RemoteBackup): the local backup keeps a directory where the remote
+	/// holds a file, whichever side made the kinds differ: the remote item changed kind, the local
+	/// one was replaced, or a first sync or a mode switch met a local tree that already held the
+	/// other kind.
+	LocalKeepsDir,
+	/// [`RemoteBackup`](SyncMode::RemoteBackup): the local backup keeps a file where the remote holds
+	/// a directory, whichever side made the kinds differ (see [`LocalKeepsDir`](Self::LocalKeepsDir)).
+	LocalKeepsFile,
+}
+
+impl ConflictReason {
+	/// The reason a conflict is held for in `mode`, where the two sides hold `local` and `remote`.
+	pub(super) fn of(
+		mode: SyncMode,
+		local: Option<PlannedNodeKind>,
+		remote: Option<PlannedNodeKind>,
+	) -> Self {
+		let (Some(local), Some(remote)) = (local, remote) else {
+			return Self::Diverged;
+		};
+		if local == remote {
+			return Self::Diverged;
+		}
+		match mode {
+			SyncMode::LocalBackup => match remote {
+				PlannedNodeKind::Dir => Self::RemoteKeepsDir,
+				PlannedNodeKind::File => Self::RemoteKeepsFile,
+			},
+			SyncMode::RemoteBackup => match local {
+				PlannedNodeKind::Dir => Self::LocalKeepsDir,
+				PlannedNodeKind::File => Self::LocalKeepsFile,
+			},
+			// These modes delete on their destination, so a resolution replaces the item.
+			SyncMode::TwoWay | SyncMode::LocalToRemote | SyncMode::RemoteToLocal => Self::Diverged,
+		}
+	}
+}
+
+impl fmt::Display for ConflictReason {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		f.write_str(match self {
+			Self::Diverged => "both sides changed since the last sync",
+			Self::RemoteKeepsDir => {
+				"the local side holds a file where the remote backup keeps a directory"
+			}
+			Self::RemoteKeepsFile => {
+				"the local side holds a directory where the remote backup keeps a file"
+			}
+			Self::LocalKeepsDir => {
+				"the remote side holds a file where the local backup keeps a directory"
+			}
+			Self::LocalKeepsFile => {
+				"the remote side holds a directory where the local backup keeps a file"
+			}
+		})
+	}
+}
+
+/// A path held as a conflict until
+/// [`SyncEngine::resolve_conflict`](super::SyncEngine::resolve_conflict) picks a winner (or that a
+/// dry run would hold): in two-way both sides changed and diverged; in a backup mode the two sides
+/// hold items of different kinds, whichever side made them so. The path and its subtree are
+/// excluded from planning while it is held; [`reason`](Self::reason) says which.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[js_type(export, no_deser, no_default, napi)]
 pub struct PlannedConflict {
@@ -156,9 +236,26 @@ pub struct PlannedConflict {
 	pub local: Option<PlannedNodeKind>,
 	/// What the remote side holds, `None` when the remote deleted it.
 	pub remote: Option<PlannedNodeKind>,
+	/// Why the path is held, from the pair's mode and the two kinds above when it was reported.
+	pub reason: ConflictReason,
 }
 
 impl PlannedConflict {
+	/// The conflict held at `rel_path` in `mode`, where the two sides hold `local` and `remote`.
+	pub(super) fn held(
+		mode: SyncMode,
+		rel_path: String,
+		local: Option<PlannedNodeKind>,
+		remote: Option<PlannedNodeKind>,
+	) -> Self {
+		Self {
+			rel_path,
+			local,
+			remote,
+			reason: ConflictReason::of(mode, local, remote),
+		}
+	}
+
 	fn side(kind: Option<PlannedNodeKind>) -> String {
 		kind.map_or_else(|| "absent".to_string(), |kind| kind.to_string())
 	}
@@ -168,11 +265,18 @@ impl fmt::Display for PlannedConflict {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		write!(
 			f,
-			"conflict {:?} (local {} vs remote {})",
+			"conflict {:?} (local {} vs remote {}",
 			self.rel_path,
 			Self::side(self.local),
 			Self::side(self.remote)
-		)
+		)?;
+		match self.reason {
+			ConflictReason::Diverged => f.write_str(")"),
+			ConflictReason::RemoteKeepsDir
+			| ConflictReason::RemoteKeepsFile
+			| ConflictReason::LocalKeepsDir
+			| ConflictReason::LocalKeepsFile => write!(f, "; {})", self.reason),
+		}
 	}
 }
 
@@ -457,7 +561,8 @@ pub struct PlanOutcome {
 	/// `held`.
 	pub pass_token: Option<String>,
 	/// Paths that would be surfaced as conflicts — held, never applied: in two-way, both sides
-	/// changed; in a backup mode, the two sides hold items of different kinds.
+	/// changed; in a backup mode, the two sides hold items of different kinds. Each with its
+	/// [`reason`](PlannedConflict::reason).
 	pub conflicts: Vec<PlannedConflict>,
 	/// Paths the engine will not act on at all, and why.
 	pub unsyncable: Vec<UnsyncablePath>,
@@ -613,17 +718,20 @@ pub(super) fn planned_action(
 	}
 }
 
-/// The public view of one conflicted path, with what each side held when it was surfaced.
+/// The public view of one conflicted path in a pair synced in `mode`, with what each side held when
+/// it was surfaced.
 pub(super) fn planned_conflict(
+	mode: SyncMode,
 	rel_path: &str,
 	local: &impl NodesAt<Node = LocalNode>,
 	remote: &impl NodesAt<Node = RemoteNode>,
 ) -> PlannedConflict {
-	PlannedConflict {
-		rel_path: rel_path.to_owned(),
-		local: local.at(rel_path).map(|node| node.kind.into()),
-		remote: remote.at(rel_path).map(|node| node.kind.into()),
-	}
+	PlannedConflict::held(
+		mode,
+		rel_path.to_owned(),
+		local.at(rel_path).map(|node| node.kind.into()),
+		remote.at(rel_path).map(|node| node.kind.into()),
+	)
 }
 
 #[cfg(test)]
@@ -863,12 +971,80 @@ mod tests {
 	#[test]
 	fn a_conflict_records_an_absent_side_rather_than_guessing_a_kind() {
 		let remote = HashMap::from([remote_file("gone.txt", 3)]);
-		let conflict = planned_conflict("gone.txt", &HashMap::new(), &remote);
+		let conflict = planned_conflict(SyncMode::TwoWay, "gone.txt", &HashMap::new(), &remote);
 		assert_eq!(conflict.local, None, "the local side is deleted");
 		assert_eq!(conflict.remote, Some(PlannedNodeKind::File));
+		assert_eq!(conflict.reason, ConflictReason::Diverged);
 		assert_eq!(
 			conflict.to_string(),
 			r#"conflict "gone.txt" (local absent vs remote file)"#
+		);
+	}
+
+	/// The reason in `mode` for each pair of sides, in the order (local file, remote dir), (local
+	/// dir, remote file), (both files), (local file, remote absent).
+	fn reasons_in(mode: SyncMode) -> [ConflictReason; 4] {
+		let (file, dir) = (Some(PlannedNodeKind::File), Some(PlannedNodeKind::Dir));
+		[
+			ConflictReason::of(mode, file, dir),
+			ConflictReason::of(mode, dir, file),
+			ConflictReason::of(mode, file, file),
+			ConflictReason::of(mode, file, None),
+		]
+	}
+
+	#[test]
+	fn local_backup_names_what_the_remote_keeps_where_the_kinds_differ() {
+		assert_eq!(
+			reasons_in(SyncMode::LocalBackup),
+			[
+				ConflictReason::RemoteKeepsDir,
+				ConflictReason::RemoteKeepsFile,
+				ConflictReason::Diverged,
+				ConflictReason::Diverged,
+			]
+		);
+	}
+
+	#[test]
+	fn remote_backup_names_what_the_local_side_keeps_where_the_kinds_differ() {
+		assert_eq!(
+			reasons_in(SyncMode::RemoteBackup),
+			[
+				ConflictReason::LocalKeepsFile,
+				ConflictReason::LocalKeepsDir,
+				ConflictReason::Diverged,
+				ConflictReason::Diverged,
+			]
+		);
+	}
+
+	#[test]
+	fn the_modes_that_delete_on_their_destination_hold_every_conflict_as_diverged() {
+		for mode in [
+			SyncMode::TwoWay,
+			SyncMode::LocalToRemote,
+			SyncMode::RemoteToLocal,
+		] {
+			assert_eq!(reasons_in(mode), [ConflictReason::Diverged; 4], "{mode:?}");
+		}
+	}
+
+	#[test]
+	fn a_kind_mismatch_conflict_renders_its_reason() {
+		let local = HashMap::from([local_file("x", 3)]);
+		let remote = HashMap::from([(
+			"x".to_string(),
+			RemoteNode {
+				kind: NodeKind::Dir,
+				..remote_file("x", 0).1
+			},
+		)]);
+		let conflict = planned_conflict(SyncMode::LocalBackup, "x", &local, &remote);
+		assert_eq!(conflict.reason, ConflictReason::RemoteKeepsDir);
+		assert_eq!(
+			conflict.to_string(),
+			r#"conflict "x" (local file vs remote dir; the local side holds a file where the remote backup keeps a directory)"#
 		);
 	}
 

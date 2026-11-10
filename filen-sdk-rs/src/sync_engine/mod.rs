@@ -112,8 +112,8 @@ pub(crate) use js_impl::{JsSyncEngine, JsSyncPlan, JsSyncWatch, SyncRefusal, syn
 pub use legacy::LegacyImport;
 pub use mode::{Backlog, SyncMode};
 pub use outcome::{
-	HaltReason, PlanOutcome, PlannedAction, PlannedActionKind, PlannedConflict, PlannedNodeKind,
-	PlannedTransfer, RefuseReason, UnsyncablePath, UnsyncableReason,
+	ConflictReason, HaltReason, PlanOutcome, PlannedAction, PlannedActionKind, PlannedConflict,
+	PlannedNodeKind, PlannedTransfer, RefuseReason, UnsyncablePath, UnsyncableReason,
 };
 pub use pause::{DEFAULT_CANCEL_AFTER, PauseMode, PauseOptions};
 pub use scan::{ScanGap, ScanGapCause};

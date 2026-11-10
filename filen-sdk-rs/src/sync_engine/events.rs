@@ -14,7 +14,7 @@ use std::{
 
 use filen_macros::js_type;
 
-use super::{SyncMode, apply::SyncReport};
+use super::{ConflictReason, SyncMode, apply::SyncReport};
 use crate::ErrorKind;
 
 /// A single event from a sync pass, delivered to a [`SyncObserver`] in the order it happens.
@@ -52,8 +52,12 @@ pub enum SyncEvent {
 	/// How many executable actions this pass will apply (after guard screening) — the denominator
 	/// for progress; the in-progress events below tick through it.
 	Planned { actions: usize },
-	/// A two-way path where both sides diverged; left untouched for the caller to resolve.
-	Conflict { rel_path: String },
+	/// A path held as a conflict, surfaced or re-reported by this pass and left untouched for the
+	/// caller to resolve; `reason` says why.
+	Conflict {
+		rel_path: String,
+		reason: ConflictReason,
+	},
 	/// The guard held some deletions back this pass (see [`GuardReason`](super::GuardReason) for
 	/// why it can). `reason` is that reason as a sentence (its `Display`); `pass_token` identifies
 	/// this exact batch, held for this kind of reason, for
