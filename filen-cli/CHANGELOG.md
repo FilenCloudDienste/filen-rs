@@ -29,7 +29,7 @@ Breaking changes are marked **Breaking**: scripts that depend on the old behavio
 #### Prompts and options
 
 - **Breaking:** a question that cannot be asked (with `--no-input`, or without any terminal) fails the command with exit code 2 before it logs in, naming the option that answers it: scripts that ran `export-auth-config`, `empty-trash`, `rm -p` and other confirmed commands without a terminal now pass `--yes`
-- **Breaking:** `export-auth-config` asks to confirm the risk and, if the file exists, to overwrite it (both default No); `export-api-key` at a terminal asks before printing the key
+- **Breaking:** `export-auth-config` asks to confirm the risk and, if the file exists, to overwrite it (both default No), and refuses a path in a missing directory before it asks or logs in; `export-api-key` at a terminal asks before printing the key
 - **Breaking:** `empty-trash` asks to confirm (`--yes` answers it), and prints how many items it deleted
 - **Breaking:** the keyring login is scoped: debug builds use the service `filen-cli-rs-dev`, and a `--config-dir` other than the default keeps a login of its own (entry `sdk-config@<config dir>`), so users of a custom `--config-dir` log in again there; the default config directory keeps its existing login
 - **Breaking:** after `filen rclone`, everything goes to Rclone as it is (`filen rclone -v ls filen:` runs `rclone -v ls filen:`, `filen rclone --help` shows Rclone's help); the CLI's options go before `rclone`, and `--rclone-binary` right after it

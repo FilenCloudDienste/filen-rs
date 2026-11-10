@@ -40,7 +40,7 @@ mod profile;
 use std::os::unix::fs::PermissionsExt;
 use std::{
 	borrow::Cow,
-	path::{Path, PathBuf},
+	path::{Path, PathBuf, is_separator},
 	sync::Arc,
 	time::Duration,
 };
@@ -1291,15 +1291,30 @@ pub(crate) async fn export_auth_config_command(
 }
 
 /// The file `export-auth-config` writes to: `path_arg`, or `filen-cli-auth-config.txt` in it if it
-/// is a directory, or in the `working_dir` without one.
+/// is a directory, or in the `working_dir` without one. Fails if `path_arg` names a directory that
+/// does not exist, or a file in one, so the user is not asked and logged in for nothing.
 fn auth_config_export_path(
 	path_arg: Option<&Path>,
 	working_dir: impl FnOnce() -> Result<PathBuf>,
 ) -> Result<PathBuf> {
+	let no_such_directory =
+		|dir: &Path| UI::failure(&format!("No such directory: {}", dir.display()));
 	Ok(match path_arg {
 		None => working_dir()?.join(AUTH_CONFIG_FILENAME),
 		Some(path) if path.is_dir() => path.join(AUTH_CONFIG_FILENAME),
-		Some(path) => path.to_path_buf(),
+		Some(path) if path.as_os_str().to_string_lossy().ends_with(is_separator) => {
+			return Err(no_such_directory(path));
+		}
+		Some(path) => {
+			if let Some(parent) = path
+				.parent()
+				.filter(|parent| !parent.as_os_str().is_empty())
+				&& !parent.is_dir()
+			{
+				return Err(no_such_directory(parent));
+			}
+			path.to_path_buf()
+		}
 	})
 }
 
@@ -1629,6 +1644,8 @@ fn delete_sqlite_database(path: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+	use std::path::MAIN_SEPARATOR;
+
 	use super::*;
 	use crate::{
 		error::exit_code,
@@ -3208,6 +3225,29 @@ mod tests {
 		let file = dir.path().join("my-auth-config.txt");
 		let path = auth_config_export_path(Some(&file), || panic!("a path was given")).unwrap();
 		assert_eq!(path, file);
+	}
+
+	#[test]
+	fn exporting_into_a_missing_directory_fails() {
+		let dir = assert_fs::TempDir::new().unwrap();
+		let missing = dir.path().join("missing");
+		let err = auth_config_export_path(Some(&missing.join("auth-config.txt")), || {
+			panic!("a path was given")
+		})
+		.unwrap_err();
+		assert_eq!(
+			format!("{err:#}"),
+			format!("No such directory: {}", missing.display())
+		);
+	}
+
+	#[test]
+	fn exporting_to_a_missing_directory_with_a_trailing_separator_fails() {
+		let dir = assert_fs::TempDir::new().unwrap();
+		let missing = format!("{}{}", dir.path().join("missing").display(), MAIN_SEPARATOR);
+		let err = auth_config_export_path(Some(Path::new(&missing)), || panic!("a path was given"))
+			.unwrap_err();
+		assert_eq!(format!("{err:#}"), format!("No such directory: {missing}"));
 	}
 
 	#[test]
