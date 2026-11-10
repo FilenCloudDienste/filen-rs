@@ -473,11 +473,14 @@ pub(crate) fn serve_markdown_docs_as_html(ui: &mut UI) -> Result<()> {
 		.as_ref()
 		.map_err(|e| anyhow::anyhow!("Failed to parse CLI doc outline: {}", e))?;
 
-	let server_port = port_check::free_local_ipv4_port()
-		.ok_or(anyhow::anyhow!("Failed to find free port for docs server"))?;
-
-	let server = tiny_http::Server::http(format!("localhost:{}", server_port))
+	// port 0 lets the OS pick a free port as it binds, so no other process can take it in between
+	let server = tiny_http::Server::http("localhost:0")
 		.map_err(|e| anyhow::anyhow!("Failed to start docs HTTP server: {}", e))?;
+	let server_port = server
+		.server_addr()
+		.to_ip()
+		.map(|addr| addr.port())
+		.context("The docs server listens on no IP address")?;
 
 	// Ctrl-C stops the server: the command blocks its thread while it serves, so nothing could
 	// cancel it, and it looks for Ctrl-C between requests instead

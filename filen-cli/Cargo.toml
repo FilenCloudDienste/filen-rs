@@ -77,7 +77,6 @@ comrak = { version = "0.52.0", default-features = false, features = [
 	"bon",
 ] } # needed to remove feature "clap", since it would cause clap_builder's dependency "terminal_size" to be included, which would make ugly line breaks in the help rendering
 tiny_http = "0.12.0"
-port_check = "0.3.0"
 open = "5.3.5"
 clap_complete = { version = "4.5.65", features = ["unstable-dynamic"] }
 strum = { version = "0.28.0", features = ["derive"] }

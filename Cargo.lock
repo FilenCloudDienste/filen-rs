@@ -2217,7 +2217,6 @@ dependencies = [
  "log",
  "manuel",
  "open",
- "port_check",
  "predicates",
  "rand 0.10.3",
  "rcgen",
