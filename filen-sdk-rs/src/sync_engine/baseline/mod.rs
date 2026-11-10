@@ -754,7 +754,9 @@ pub(crate) enum BaselineChange<'a> {
 	Upsert(&'a BaselineEntry),
 	Delete(&'a str),
 	/// A directory move: the row at `from` and every row under it are re-keyed to sit under `to`,
-	/// in two seeking statements over the rows the store holds (see [`MOVE_AT_PATH`]).
+	/// in two seeking statements over the rows the store holds (see [`MOVE_AT_PATH`]). The failure
+	/// rows under `from` move along; the one at `from` itself is cleared, so an item later created
+	/// there starts with no retry streak.
 	MoveSubtree {
 		from: &'a str,
 		to: &'a str,
@@ -2394,6 +2396,16 @@ impl BaselineStore {
 					self.conn
 						.prepare_cached(MOVE_FAILURES_UNDER_PATH)?
 						.execute(params![pair, from, to])?;
+					// The moved path's own failure row is cleared rather than re-keyed, as the
+					// in-memory side (`fold_dir_moves`) drops it: a park on the moved item ends with
+					// its rename, a row left at `from` would hand its retry streak to an item later
+					// created there, and one re-keyed to `to` would never be cleared, since a pass
+					// ends only the streaks its own actions' paths held before it. A hash mismatch
+					// mark on that row goes with it, so the next pass may download that version once
+					// more before marking it again.
+					self.conn
+						.prepare_cached(CLEAR_FAILURE)?
+						.execute(params![pair, from])?;
 				}
 			}
 		}

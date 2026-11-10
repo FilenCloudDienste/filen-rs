@@ -1976,7 +1976,8 @@ fn a_subtree_move_re_keys_the_source_and_everything_under_it_only() {
 
 /// A directory move takes the failure rows under it along in its transaction, hash mismatch marks
 /// and plain streaks alike, overwriting what sits at the destination. Nothing outside the directory
-/// moves, and a row on the directory itself stays: an in-memory park on it ends with the rename.
+/// moves, and the row on the directory itself is cleared, as an in-memory park on it ends with the
+/// rename.
 #[test]
 fn a_subtree_move_takes_the_failure_rows_under_it_along() {
 	let store = BaselineStore::open_in_memory().unwrap();
@@ -2001,11 +2002,47 @@ fn a_subtree_move_takes_the_failure_rows_under_it_along() {
 	let failures = store.failures(pair).unwrap();
 	let mut paths: Vec<&str> = failures.keys().map(String::as_str).collect();
 	paths.sort_unstable();
-	assert_eq!(paths, ["a", "a0", "b/deep/y", "b/x", "z"]);
+	assert_eq!(paths, ["a0", "b/deep/y", "b/x", "z"]);
 	assert_eq!(failures["b/x"].mismatched, Some(bad));
 	assert_eq!(failures["b/x"].last_error, "does not match");
 	assert_eq!(failures["b/deep/y"].last_error, "a/deep/y");
 	assert_eq!(failures["b/deep/y"].mismatched, None);
+}
+
+/// The failure streak on a moved path itself is cleared by the move, not left behind for an item
+/// later created at the old path to inherit, and not carried to the new path either.
+#[test]
+fn a_moved_paths_own_failure_streak_is_cleared_by_the_move() {
+	let store = BaselineStore::open_in_memory().unwrap();
+	let (pair, _) = store
+		.create_pair("/root", Uuid::new_v4(), SyncMode::TwoWay)
+		.unwrap();
+	store
+		.record_failure(pair, "photos", "permission denied", 1_000)
+		.unwrap();
+	store
+		.record_failure(pair, "photos", "permission denied", 2_000)
+		.unwrap();
+
+	store
+		.apply_changes(
+			pair,
+			&[BaselineChange::MoveSubtree {
+				from: "photos",
+				to: "pictures",
+			}],
+		)
+		.unwrap();
+
+	let failures = store.failures(pair).unwrap();
+	assert!(
+		!failures.contains_key("photos"),
+		"an item created at the old path starts with no streak"
+	);
+	assert!(
+		!failures.contains_key("pictures"),
+		"the streak is not carried to the new path"
+	);
 }
 
 /// A move onto a destination that already holds rows overwrites them, which is what the
