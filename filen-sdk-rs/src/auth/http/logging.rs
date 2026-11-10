@@ -148,7 +148,10 @@ where
 
 #[cfg(test)]
 mod tests {
-	use std::sync::{Arc, Mutex};
+	use std::{
+		mem,
+		sync::{Arc, Mutex},
+	};
 
 	use filen_types::error::ResponseError;
 	use tracing::{Level, Subscriber};
@@ -188,10 +191,9 @@ mod tests {
 			};
 			assert!(futures::executor::block_on(failed).is_err());
 		});
-		Arc::into_inner(levels)
-			.expect("the subscriber is gone")
-			.into_inner()
-			.expect("no test thread panics holding it")
+		// Taken under the lock, not by unwrapping the `Arc`: a subscriber another thread is
+		// registering holds every live one for a moment, this one's layer included.
+		mem::take(&mut *levels.lock().expect("no test thread panics holding it"))
 	}
 
 	#[test]
