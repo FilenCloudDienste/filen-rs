@@ -12,9 +12,10 @@
 //! - `remoteToLocal` (or `cloudToLocal`, `ctl`): the local directory mirrors the remote one, the
 //!   other way round. Nothing is uploaded.
 //! - `localBackup` (or `lb`): as `localToRemote`, but nothing is ever deleted on the remote: a file
-//!   deleted locally stays on the remote.
+//!   deleted locally stays on the remote. A path where the two sides hold a file and a directory is
+//!   a conflict (see below).
 //! - `remoteBackup` (or `cloudBackup`, `cb`): as `remoteToLocal`, but nothing is ever deleted
-//!   locally.
+//!   locally. A path where the two sides hold a file and a directory is a conflict (see below).
 //!
 //! Mode names are case-sensitive. A remote file or directory that a sync deletes goes to the trash
 //! of your Filen drive; a local one goes to the sync pair's `.filen-sync-trash` (see below).
@@ -112,10 +113,14 @@
 //! its conflicts, errors and unsyncable paths, and the bytes it moved. `uploaded` and `downloaded`
 //! come once a file has landed; the other actions (`creating_remote_dir`, `trashing_remote`,
 //! `deleting_local`, `moving_remote` and so on) as they start. What the flags settle is an
-//! `approved` object with a `message`. There is no banner and no status line. A failed action, a
-//! failed pass and a refused pass are their objects on stdout, like every other event, and nothing
-//! of them goes to stderr; failures that are not an event's still go to stderr as text. `--json`
-//! takes precedence over `--quiet`: every event is printed.
+//! `approved` object with a `message`, and a conflict they could not resolve a `resolve_failed`
+//! object with its `path` and a `message`. A `conflict` object carries its `reason` (`diverged`,
+//! `remote_keeps_dir`, `remote_keeps_file`, `local_keeps_dir` or `local_keeps_file`) and the
+//! `resolutions` that can resolve it (`keep_local`, `keep_remote`, `keep_both`). There is no
+//! banner and no status line. A failed action, a failed pass and a refused pass are their objects
+//! on stdout, like every other event, and nothing of them goes to stderr; failures that are not an
+//! event's still go to stderr as text. `--json` takes precedence over `--quiet`: every event is
+//! printed.
 //!
 //! With `--dry-run`, `sync` prints what a pass of each sync pair would do: what it would transfer,
 //! create, move or delete, the deletions the delete guard would hold back and why, the conflicts it
@@ -154,15 +159,29 @@
 //! downloaded, or both, the local one being renamed aside to `<name>.old.<ext>` and synced as a file
 //! of its own.
 //!
+//! In `localBackup` and `remoteBackup`, a path where one side holds a file and the other a directory
+//! is a conflict too, whichever side made them differ: the source changed the item's kind, another
+//! client replaced the destination's, or a first sync met a destination that already held the other
+//! kind. A backup never deletes on its destination, so the destination's item stays, and only what
+//! moves the local item off the path resolves it: keeping both, which renames the local item to
+//! `<name>.old.<ext>`, or, where the local item is a file, keeping the remote version, which moves
+//! it into `.filen-sync-trash`. Renaming or moving either item yourself, or giving one side the
+//! other's kind, makes it an ordinary conflict once a pass has seen that, which any `--keep-*` then
+//! resolves. Keeping the local version cannot resolve it, nor can keeping the remote version over a
+//! local directory: `sync` and `resolve-sync-conflict` refuse those, leave the conflict as it is and
+//! say what would resolve it, and the question at the terminal offers only what does.
+//!
 //! `--approve-mass-deletions` approves the deletions the delete guard holds back, and
 //! `--keep-local`, `--keep-remote` and `--keep-both` resolve conflicts. A `--keep-*` path is
 //! relative to the root of a sync pair, and covers the conflicts at that path and under it as a
 //! directory: `dir` covers `dir/f`, while `a.txt` does not cover `a.txt.bak`. Where two paths cover
 //! a conflict, the longer one decides, and `.` covers the whole sync pair. These flags apply to
 //! every sync pair of the run, and only to what the first pass of each sync pair finds; a pass
-//! that failed before it planned found nothing for them, so they also apply to the next one. With
-//! `--once`, one more pass then applies what was settled before the command exits. What a later
-//! pass holds back or finds in conflict is printed as needing attention, or asked about.
+//! that failed before it planned found nothing for them, so they also apply to the next one. A
+//! flag that cannot resolve the conflict it covers is a failure for that path, which stays a
+//! conflict; with `--once`, one more pass then applies what was settled before the command exits.
+//! What a later pass holds back or finds in conflict is printed as needing attention, or asked
+//! about.
 //!
 //! What the flags leave is asked about at the terminal once the pass that found it has ended, when
 //! stdout and stderr are terminals, there is a terminal to answer at (stdin, or the controlling
@@ -222,8 +241,9 @@ use console::style;
 use filen_sdk_rs::{
 	auth::Client,
 	sync_engine::{
-		BaselineInUse, ConflictResolution, ConflictResolved, PairId, PairRecord, SyncEngine,
-		SyncEvent, SyncMode, UnsyncablePath, UnsyncableReason, WatchConfig, WatchStatus,
+		BaselineInUse, ConflictReason, ConflictResolution, ConflictResolved, PairId, PairRecord,
+		ResolutionRefused, SyncEngine, SyncEvent, SyncMode, UnsyncablePath, UnsyncableReason,
+		WatchConfig, WatchStatus,
 	},
 };
 use log::info;
@@ -331,7 +351,7 @@ pub(crate) enum SyncCommands {
 		#[arg(long)]
 		propagate_deletions: bool,
 	},
-	/// List the conflicts a sync pair holds: paths changed on both sides, which its passes leave alone
+	/// List the conflicts a sync pair holds, which its passes leave alone: paths changed on both sides, or holding a file and a directory in a backup mode
 	ListSyncConflicts {
 		#[arg(help = PAIR_HELP)]
 		pair: String,
@@ -835,7 +855,7 @@ impl<'a> EventLog<'a> {
 					self.print_needs_attention(ui, pair, &notice);
 				}
 			}
-			SyncEvent::Conflict { rel_path, .. } => {
+			SyncEvent::Conflict { rel_path, reason } => {
 				if is_first_pass
 					&& let Some(resolution) = self.settle.conflict_resolutions.for_path(rel_path)
 				{
@@ -849,8 +869,16 @@ impl<'a> EventLog<'a> {
 						"Conflict detected at {rel_path}. You are asked which version to keep once the pass has ended"
 					)
 				} else {
+					let detected = match reason {
+						ConflictReason::Diverged => "Conflict detected".to_owned(),
+						ConflictReason::RemoteKeepsDir
+						| ConflictReason::RemoteKeepsFile
+						| ConflictReason::LocalKeepsDir
+						| ConflictReason::LocalKeepsFile => format!("Conflict detected: {reason}"),
+					};
 					format!(
-						"Conflict detected. To resolve it, re-run the command with --keep-local/--keep-remote/--keep-both \"{rel_path}\""
+						"{detected}. To resolve it, re-run the command with {} \"{rel_path}\"",
+						conflict_resolutions::resolution_flags(*reason)
 					)
 				};
 				self.print_needs_attention(ui, pair, &message);
@@ -990,7 +1018,28 @@ impl<'a> EventLog<'a> {
 		self.redraw_status();
 	}
 
-	/// Prints a failure that is not an event's, such as a conflict that could not be resolved.
+	/// Says that the conflict at `rel_path` of `pair` could not be resolved, as `error` says: with
+	/// `--json`, as a `resolve_failed` object; otherwise as a failure.
+	fn print_resolve_failure(
+		&mut self,
+		ui: &mut UI,
+		pair: PairId,
+		rel_path: &str,
+		error: &filen_sdk_rs::Error,
+	) {
+		let label = self.label(pair);
+		let message = resolve_failure_message(rel_path, Cow::Borrowed(&label), error);
+		if let Output::Json { .. } = self.output {
+			info!("[{label}] {message}");
+			ui.print(&json_events::resolve_failed_line(
+				pair, &label, rel_path, &message,
+			));
+			return;
+		}
+		self.print_failure(ui, &message);
+	}
+
+	/// Prints a failure that is not an event's, such as a paused pair.
 	fn print_failure(&mut self, ui: &mut UI, msg: &str) {
 		self.clear_status();
 		ui.print_failure(msg);
@@ -1067,8 +1116,21 @@ fn resolved_conflict_lines(
 	lines
 }
 
+/// Why the conflict at `rel_path` of the pair labelled `label` could not be resolved, as `e` says:
+/// for a resolution that cannot clear it, why and which can.
 fn resolve_failure_message(rel_path: &str, label: Cow<'_, str>, e: &filen_sdk_rs::Error) -> String {
-	format!("Failed to resolve the conflict for {rel_path} in the sync pair {label}: {e}")
+	match e.downcast_ref::<ResolutionRefused>() {
+		Some(refused) => format!(
+			"{} cannot resolve the conflict at {rel_path} in the sync pair {label}: {}. Resolve it \
+			 with {} instead",
+			conflict_resolutions::flag_name(refused.resolution),
+			questions::held_for(refused.reason),
+			conflict_resolutions::resolution_flags(refused.reason)
+		),
+		None => {
+			format!("Failed to resolve the conflict for {rel_path} in the sync pair {label}: {e}")
+		}
+	}
 }
 
 fn paused_message(pair: PairId, label: Cow<'_, str>) -> String {
@@ -1144,9 +1206,17 @@ fn format_sync_event(event: &SyncEvent) -> Option<String> {
 		SyncEvent::PassStarted { .. } => "Sync pass started".to_string(),
 		SyncEvent::Refused { reason } => format!("Sync pass refused: {reason}"),
 		SyncEvent::Planned { actions } => format!("Planned {actions} action(s)"),
-		SyncEvent::Conflict { rel_path, .. } => {
-			format!("Conflict: {rel_path} changed on both sides, left untouched")
-		}
+		SyncEvent::Conflict { rel_path, reason } => match reason {
+			ConflictReason::Diverged => {
+				format!("Conflict: {rel_path} changed on both sides, left untouched")
+			}
+			ConflictReason::RemoteKeepsDir
+			| ConflictReason::RemoteKeepsFile
+			| ConflictReason::LocalKeepsDir
+			| ConflictReason::LocalKeepsFile => {
+				format!("Conflict: {rel_path} left untouched, as {reason}")
+			}
+		},
 		SyncEvent::DeletionsHeld {
 			count,
 			reason,
@@ -1221,8 +1291,8 @@ mod tests {
 	use filen_sdk_rs::{
 		Error, ErrorKind,
 		sync_engine::{
-			BaselineInUse, ConflictReason, SyncMode, SyncReport, TransferDirection, UnsyncablePath,
-			UnsyncableReason,
+			BaselineInUse, ConflictReason, ConflictResolution, ResolutionRefused, SyncMode,
+			SyncReport, TransferDirection, UnsyncablePath, UnsyncableReason,
 		},
 	};
 	use serde_json::{Value, json};
@@ -1761,7 +1831,10 @@ mod tests {
 		assert_eq!(
 			lines,
 			[
-				json!({"pair": 1, "label": "L", "event": "conflict", "path": "c"}),
+				json!({
+					"pair": 1, "label": "L", "event": "conflict", "path": "c", "reason": "diverged",
+					"resolutions": ["keep_local", "keep_remote", "keep_both"],
+				}),
 				progress(1),
 				progress(3),
 				json!({
@@ -1873,6 +1946,126 @@ mod tests {
 		let planned = SyncEvent::Planned { actions: 2 };
 
 		assert!(!approves_held_after(&[planned, pass_failed()]));
+	}
+
+	#[test]
+	fn a_kind_mismatch_conflict_says_why_it_was_left_untouched() {
+		assert_eq!(
+			format_sync_event(&SyncEvent::Conflict {
+				rel_path: "x".to_string(),
+				reason: ConflictReason::RemoteKeepsDir,
+			})
+			.as_deref(),
+			Some(
+				"Conflict: x left untouched, as the local side holds a file where the remote \
+				 backup keeps a directory"
+			)
+		);
+	}
+
+	#[test]
+	fn a_kind_mismatch_conflict_names_only_the_flags_that_resolve_it() {
+		let (out, _) = printed(
+			Output::Text {
+				quiet: true,
+				status: None,
+			},
+			&[SyncEvent::Conflict {
+				rel_path: "x".to_string(),
+				reason: ConflictReason::LocalKeepsFile,
+			}],
+		);
+
+		assert_eq!(
+			out,
+			[
+				"[L]: [NEEDS ATTENTION] Conflict detected: the remote side holds a directory where \
+			  the local backup keeps a file. To resolve it, re-run the command with \
+			  --keep-remote/--keep-both \"x\""
+			]
+		);
+	}
+
+	/// The error the engine refuses keeping the local version of `x` with, where the remote backup
+	/// keeps a directory.
+	fn refused_keep_local() -> Error {
+		Error::custom_with_source(
+			ErrorKind::InvalidState,
+			ResolutionRefused {
+				rel_path: "x".to_string(),
+				resolution: ConflictResolution::KeepLocal,
+				reason: ConflictReason::RemoteKeepsDir,
+			},
+			None::<&str>,
+		)
+	}
+
+	/// A flag the engine refused is a failure for its path, saying why and what would resolve it.
+	#[test]
+	fn a_refused_resolution_is_a_failure_that_names_what_resolves_it() {
+		let out = Printed::default();
+		let err = Printed::default();
+		let mut ui = Printed::split_ui(&out, &err);
+		let labels = HashMap::from([(1, "L".to_string())]);
+		let settle = Settle {
+			approve_mass_deletions: false,
+			conflict_resolutions: ConflictResolutions::new(vec!["x".to_string()], vec![], vec![])
+				.unwrap(),
+		};
+		let mut log = EventLog::new(
+			&labels,
+			&settle,
+			Output::Text {
+				quiet: false,
+				status: None,
+			},
+		);
+
+		log.print_resolve_failure(&mut ui, 1, "x", &refused_keep_local());
+
+		assert_eq!(out.lines_or_empty(), "");
+		assert!(
+			console::strip_ansi_codes(&err.lines()).ends_with(
+				"--keep-local cannot resolve the conflict at x in the sync pair L: the local side \
+				 holds a file where the remote backup keeps a directory, and the backup does not \
+				 delete its directory. Resolve it with --keep-remote/--keep-both instead"
+			),
+			"{}",
+			err.lines()
+		);
+	}
+
+	#[test]
+	fn json_prints_a_refused_resolution_as_a_resolve_failed_object() {
+		let out = Printed::default();
+		let err = Printed::default();
+		let mut ui = Printed::split_ui(&out, &err);
+		let labels = HashMap::from([(1, "L".to_string())]);
+		let settle = Settle {
+			approve_mass_deletions: false,
+			conflict_resolutions: ConflictResolutions::new(vec![], vec![], vec![]).unwrap(),
+		};
+		let mut log = EventLog::new(
+			&labels,
+			&settle,
+			Output::Json {
+				progress: HashMap::new(),
+			},
+		);
+
+		log.print_resolve_failure(&mut ui, 1, "x", &refused_keep_local());
+
+		assert_eq!(
+			serde_json::from_str::<Value>(&out.lines()).unwrap(),
+			json!({
+				"pair": 1, "label": "L", "event": "resolve_failed", "path": "x",
+				"message": "--keep-local cannot resolve the conflict at x in the sync pair L: the \
+					local side holds a file where the remote backup keeps a directory, and the \
+					backup does not delete its directory. Resolve it with --keep-remote/--keep-both \
+					instead",
+			})
+		);
+		assert_eq!(err.lines_or_empty(), "");
 	}
 
 	#[test]

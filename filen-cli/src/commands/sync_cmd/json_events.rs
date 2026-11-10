@@ -1,6 +1,9 @@
 //! `sync --json`: one JSON object per line for each event, which a program can read as it comes.
 
-use filen_sdk_rs::sync_engine::{PairId, SyncEvent, TransferDirection, WatchState, WatchStatus};
+use filen_sdk_rs::sync_engine::{
+	ConflictReason, ConflictResolution, PairId, SyncEvent, TransferDirection, WatchState,
+	WatchStatus,
+};
 use serde_json::{Map, Value, json};
 
 use super::{sync_pairs::sync_mode_str, transfers::Transfers};
@@ -20,6 +23,51 @@ pub(super) fn event_line(
 /// A line the flags settled, as one line of JSON.
 pub(super) fn approved_line(pair: PairId, label: &str, message: &str) -> String {
 	line(pair, label, "approved", json!({ "message": message }))
+}
+
+/// That the conflict at `rel_path` of `pair` could not be resolved, `message` saying why, as one
+/// line of JSON.
+pub(super) fn resolve_failed_line(
+	pair: PairId,
+	label: &str,
+	rel_path: &str,
+	message: &str,
+) -> String {
+	line(
+		pair,
+		label,
+		"resolve_failed",
+		json!({ "path": rel_path, "message": message }),
+	)
+}
+
+/// How `--json` names `reason`.
+pub(super) fn conflict_reason_str(reason: ConflictReason) -> &'static str {
+	match reason {
+		ConflictReason::Diverged => "diverged",
+		ConflictReason::RemoteKeepsDir => "remote_keeps_dir",
+		ConflictReason::RemoteKeepsFile => "remote_keeps_file",
+		ConflictReason::LocalKeepsDir => "local_keeps_dir",
+		ConflictReason::LocalKeepsFile => "local_keeps_file",
+	}
+}
+
+/// How `--json` names `resolution`.
+fn resolution_str(resolution: ConflictResolution) -> &'static str {
+	match resolution {
+		ConflictResolution::KeepLocal => "keep_local",
+		ConflictResolution::KeepRemote => "keep_remote",
+		ConflictResolution::KeepBoth => "keep_both",
+	}
+}
+
+/// The resolutions that can clear a conflict held for `reason`, as `--json` names them.
+pub(super) fn resolution_strs(reason: ConflictReason) -> Vec<&'static str> {
+	reason
+		.resolutions()
+		.iter()
+		.map(|resolution| resolution_str(*resolution))
+		.collect()
 }
 
 /// The health of `pair`'s watch, as one line of JSON.
@@ -73,7 +121,14 @@ fn event_fields(pair: PairId, event: &SyncEvent, transfers: &Transfers) -> (&'st
 		}
 		SyncEvent::Refused { reason } => ("refused", json!({ "reason": reason })),
 		SyncEvent::Planned { actions } => ("planned", json!({ "actions": actions })),
-		SyncEvent::Conflict { rel_path, .. } => ("conflict", json!({ "path": rel_path })),
+		SyncEvent::Conflict { rel_path, reason } => (
+			"conflict",
+			json!({
+				"path": rel_path,
+				"reason": conflict_reason_str(*reason),
+				"resolutions": resolution_strs(*reason),
+			}),
+		),
 		SyncEvent::DeletionsHeld {
 			count,
 			reason,
@@ -172,13 +227,13 @@ mod tests {
 	use filen_sdk_rs::{
 		ErrorKind,
 		sync_engine::{
-			SyncEvent, SyncMode, SyncReport, TransferDirection, UnsyncablePath, UnsyncableReason,
-			WatchState, WatchStatus,
+			ConflictReason, SyncEvent, SyncMode, SyncReport, TransferDirection, UnsyncablePath,
+			UnsyncableReason, WatchState, WatchStatus,
 		},
 	};
 	use serde_json::{Value, json};
 
-	use super::{approved_line, event_line, watch_status_line};
+	use super::{approved_line, event_line, resolve_failed_line, watch_status_line};
 	use crate::commands::sync_cmd::transfers::Transfers;
 
 	/// The line `event_line` gives for `event` of pair 7 labelled `L`, after `transfers`.
@@ -319,6 +374,37 @@ mod tests {
 				&Transfers::default()
 			),
 			json!({"pair": 7, "label": "L", "event": "deletions_held", "count": 3, "reason": "many"})
+		);
+	}
+
+	#[test]
+	fn a_conflict_carries_its_reason_and_the_resolutions_that_clear_it() {
+		assert_eq!(
+			parsed(
+				&SyncEvent::Conflict {
+					rel_path: "x".to_string(),
+					reason: ConflictReason::RemoteKeepsDir,
+				},
+				&Transfers::default()
+			),
+			json!({
+				"pair": 7, "label": "L", "event": "conflict", "path": "x",
+				"reason": "remote_keeps_dir", "resolutions": ["keep_remote", "keep_both"],
+			})
+		);
+	}
+
+	#[test]
+	fn a_failed_resolution_is_one_line_naming_its_path() {
+		let line = resolve_failed_line(7, "L", "x", "--keep-local cannot resolve it");
+
+		assert!(!line.contains('\n'), "{line}");
+		assert_eq!(
+			serde_json::from_str::<Value>(&line).unwrap(),
+			json!({
+				"pair": 7, "label": "L", "event": "resolve_failed", "path": "x",
+				"message": "--keep-local cannot resolve it",
+			})
 		);
 	}
 

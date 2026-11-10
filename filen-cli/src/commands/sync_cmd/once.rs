@@ -17,7 +17,7 @@ use super::{
 	outcome::{failed_pass_problems, pass_problems, problems_summary},
 	paused_message,
 	questions::{Decision, Questions},
-	resolve_failure_message, resolved_conflict_lines,
+	resolved_conflict_lines,
 };
 use crate::{
 	error::CliError,
@@ -221,6 +221,7 @@ async fn ask(
 			Decision::Resolve {
 				pair,
 				rel_path,
+				reason: _,
 				resolution,
 			} => match engine.resolve_conflict(pair, &rel_path, resolution).await {
 				Ok(resolved) => {
@@ -229,10 +230,7 @@ async fn ask(
 					}
 					settled.insert(pair);
 				}
-				Err(error) => {
-					let message = resolve_failure_message(&rel_path, log.label(pair), &error);
-					log.print_failure(ui, &message);
-				}
+				Err(error) => log.print_resolve_failure(ui, pair, &rel_path, &error),
 			},
 			unanswered @ (Decision::Left(_) | Decision::Failed { .. } | Decision::TooLate(_)) => {
 				log.print_unanswered(ui, &unanswered);
@@ -270,8 +268,7 @@ fn print(ui: &mut UI, log: &mut EventLog<'_>, pair: PairId, message: Message) {
 			log.print_failure(ui, &message);
 		}
 		Message::ResolveFailed { rel_path, error } => {
-			let message = resolve_failure_message(&rel_path, log.label(pair), &error);
-			log.print_failure(ui, &message);
+			log.print_resolve_failure(ui, pair, &rel_path, &error);
 		}
 	}
 }

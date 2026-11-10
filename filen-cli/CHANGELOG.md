@@ -115,6 +115,7 @@ Breaking changes are marked **Breaking**: scripts that depend on the old behavio
 - a missing local or remote root is created after asking (`--yes` answers it)
 - the sync state the older CLI kept for a pair is imported the first time the pair syncs
 - the delete guard holds back mass deletions (`--approve-mass-deletions`), conflicts are reported and resolved with `--keep-local`, `--keep-remote` or `--keep-both`, and at a terminal `sync` asks about both once a pass ends; replaced and deleted local files are kept in `.filen-sync-trash` for 30 days
+- in `localBackup` and `cloudBackup`, a path where one side holds a file and the other a directory is a conflict that only `--keep-both`, or `--keep-remote` over a local file, resolves: `sync` asks only about those, and reports another `--keep-*` as a failure for that path (`resolve_failed` with `--json`)
 - `sync --dry-run` prints what a pass would do; `--debounce-ms` (1 to 60000, default 800) and `--safety-net-secs` tune a continuous sync
 - `sync --json` prints one JSON object per event; a status line shows the transfers at a terminal; `--quiet` prints only what needs attention
 - `sync --once` exits with 0 when every pair is clean and 1 otherwise; a continuous sync exits with 1 after Ctrl-C if a pair failed

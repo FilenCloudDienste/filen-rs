@@ -261,7 +261,10 @@ mod tests {
 					"size": null, "replaces": null,
 				}],
 				"held_reason": "1 deletion(s) exceed the limit of 0",
-				"conflicts": [{"path": "c.txt", "local": "file", "remote": null}],
+				"conflicts": [{
+					"path": "c.txt", "local": "file", "remote": null, "reason": "diverged",
+					"resolutions": ["keep_local", "keep_remote", "keep_both"],
+				}],
 				"unsyncable": [],
 			})
 		);

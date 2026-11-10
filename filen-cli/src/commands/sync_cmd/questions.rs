@@ -1,6 +1,9 @@
 //! The questions `sync` asks at the terminal about what a pass left for a person to settle: a
 //! batch of deletions the delete guard held back, and a conflict.
 //!
+//! A conflict's question offers only the resolutions that can clear it
+//! ([`ConflictReason::resolutions`]), and says why a backup mode holds one.
+//!
 //! A question is asked once a pass has ended, with what its report says, and at most once about
 //! the same thing: a held batch is not asked about again while the guard holds it under the same
 //! token, which changes when the batch does, and a conflict is not asked about again while it
@@ -23,11 +26,12 @@ use std::{
 };
 
 use filen_sdk_rs::sync_engine::{
-	ConflictResolution, GuardReason, PairId, PlannedAction, SyncReport,
+	ConflictReason, ConflictResolution, GuardReason, PairId, PlannedAction, SyncReport,
 };
 use inquire::InquireError;
 use tokio::task::JoinError;
 
+use super::conflict_resolutions::resolution_flags;
 use crate::ui::UI;
 
 /// How many held deletions a question lists before it only counts the rest.
@@ -65,7 +69,12 @@ pub(super) struct HeldBatch {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum Question {
 	Deletions(HeldBatch),
-	Conflict { pair: PairId, rel_path: String },
+	Conflict {
+		pair: PairId,
+		rel_path: String,
+		/// Why it is held, which says what can resolve it.
+		reason: ConflictReason,
+	},
 }
 
 impl Question {
@@ -94,13 +103,55 @@ impl Question {
 				}
 				lines
 			}
-			Self::Conflict { rel_path, .. } => {
-				vec![format!(
-					"Conflict at {rel_path}: it changed on both sides since they were last in sync"
-				)]
-			}
+			Self::Conflict {
+				rel_path, reason, ..
+			} => conflict_intro(rel_path, *reason),
 		}
 	}
+}
+
+/// What is said of the conflict at `rel_path`, held for `reason`, before its prompt: why it is
+/// held, and in a backup mode which side has to change.
+fn conflict_intro(rel_path: &str, reason: ConflictReason) -> Vec<String> {
+	let remedy = match reason {
+		ConflictReason::Diverged => {
+			return vec![format!("Conflict at {rel_path}: {}", held_for(reason))];
+		}
+		ConflictReason::RemoteKeepsDir => {
+			"To back the file up, keep both: it is renamed to <name>.old.<ext> and backed up \
+			 beside the directory. Keeping the remote version moves it to .filen-sync-trash"
+		}
+		ConflictReason::RemoteKeepsFile => {
+			"To back the directory up, keep both: it is renamed to <name>.old.<ext> and backed up \
+			 beside the file"
+		}
+		ConflictReason::LocalKeepsFile => {
+			"To pull the directory, keep the remote version, which moves the file to \
+			 .filen-sync-trash, or keep both, which renames it to <name>.old.<ext>"
+		}
+		ConflictReason::LocalKeepsDir => {
+			"To pull the file, keep both: the directory is renamed to <name>.old.<ext> and stays"
+		}
+	};
+	vec![
+		format!("Conflict at {rel_path}: {}", held_for(reason)),
+		format!(
+			"{remedy}. Or rename or move one of the two yourself, and resolve it once a pass has \
+			 run"
+		),
+	]
+}
+
+/// Why a conflict held for `reason` is held, as it is said after the conflict's path.
+pub(super) fn held_for(reason: ConflictReason) -> String {
+	let kept = match reason {
+		ConflictReason::Diverged => {
+			return "it changed on both sides since they were last in sync".to_owned();
+		}
+		ConflictReason::RemoteKeepsDir | ConflictReason::LocalKeepsDir => "directory",
+		ConflictReason::RemoteKeepsFile | ConflictReason::LocalKeepsFile => "file",
+	};
+	format!("{reason}, and the backup does not delete its {kept}")
 }
 
 /// What is said of `question` when the answer was "not now".
@@ -125,9 +176,12 @@ pub(super) fn failed_line(question: &Question, error: &str) -> String {
 			 command with --approve-mass-deletions",
 			batch.count
 		),
-		Question::Conflict { rel_path, .. } => format!(
+		Question::Conflict {
+			rel_path, reason, ..
+		} => format!(
 			"Could not ask about the conflict at {rel_path}: {error}. To resolve it, re-run the \
-			 command with --keep-local/--keep-remote/--keep-both \"{rel_path}\""
+			 command with {} \"{rel_path}\"",
+			resolution_flags(*reason)
 		),
 	}
 }
@@ -182,6 +236,7 @@ pub(super) enum Decision {
 	Resolve {
 		pair: PairId,
 		rel_path: String,
+		reason: ConflictReason,
 		resolution: ConflictResolution,
 	},
 	/// Not now: no, Esc, or Ctrl-C at the prompt. It is not asked about again unless it changes.
@@ -198,9 +253,16 @@ impl Decision {
 	fn too_late(self) -> Self {
 		match self {
 			Self::Approve(batch) => Self::TooLate(Question::Deletions(batch)),
-			Self::Resolve { pair, rel_path, .. } => {
-				Self::TooLate(Question::Conflict { pair, rel_path })
-			}
+			Self::Resolve {
+				pair,
+				rel_path,
+				reason,
+				resolution: _,
+			} => Self::TooLate(Question::Conflict {
+				pair,
+				rel_path,
+				reason,
+			}),
 			Self::Left(_) | Self::Failed { .. } | Self::TooLate(_) => self,
 		}
 	}
@@ -213,12 +275,17 @@ enum Choice {
 	NotNow,
 }
 
-const CHOICES: [Choice; 4] = [
-	Choice::Keep(ConflictResolution::KeepLocal),
-	Choice::Keep(ConflictResolution::KeepRemote),
-	Choice::Keep(ConflictResolution::KeepBoth),
-	Choice::NotNow,
-];
+/// The options of the question about a conflict held for `reason`: the resolutions that can clear
+/// it, then not now.
+fn choices(reason: ConflictReason) -> Vec<Choice> {
+	reason
+		.resolutions()
+		.iter()
+		.copied()
+		.map(Choice::Keep)
+		.chain([Choice::NotNow])
+		.collect()
+}
 
 impl fmt::Display for Choice {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -256,28 +323,35 @@ fn deletions_decision(
 	}
 }
 
-/// What the prompt about the conflict at `rel_path` of `pair` answered.
+/// What the prompt about the conflict at `rel_path` of `pair`, held for `reason`, answered.
 fn conflict_decision(
 	pair: PairId,
 	rel_path: String,
+	reason: ConflictReason,
 	answer: Result<Result<Choice, InquireError>, JoinError>,
 ) -> Decision {
+	let question = |rel_path| Question::Conflict {
+		pair,
+		rel_path,
+		reason,
+	};
 	match answer {
 		Ok(Ok(Choice::Keep(resolution))) => Decision::Resolve {
 			pair,
 			rel_path,
+			reason,
 			resolution,
 		},
 		Ok(
 			Ok(Choice::NotNow)
 			| Err(InquireError::OperationCanceled | InquireError::OperationInterrupted),
-		) => Decision::Left(Question::Conflict { pair, rel_path }),
+		) => Decision::Left(question(rel_path)),
 		Ok(Err(error)) => Decision::Failed {
-			question: Question::Conflict { pair, rel_path },
+			question: question(rel_path),
 			error: error.to_string(),
 		},
 		Err(error) => Decision::Failed {
-			question: Question::Conflict { pair, rel_path },
+			question: question(rel_path),
 			error: error.to_string(),
 		},
 	}
@@ -303,12 +377,16 @@ fn ask(question: Question, label: &str) -> Pending {
 			});
 			Box::pin(async move { deletions_decision(batch, prompt.await) })
 		}
-		Question::Conflict { pair, rel_path } => {
+		Question::Conflict {
+			pair,
+			rel_path,
+			reason,
+		} => {
 			let message = format!("Which version of {rel_path} in {label} do you keep?");
 			let prompt = tokio::task::spawn_blocking(move || {
-				inquire::Select::new(&message, CHOICES.to_vec()).prompt()
+				inquire::Select::new(&message, choices(reason)).prompt()
 			});
-			Box::pin(async move { conflict_decision(pair, rel_path, prompt.await) })
+			Box::pin(async move { conflict_decision(pair, rel_path, reason, prompt.await) })
 		}
 	}
 }
@@ -371,13 +449,16 @@ impl<T> Questions<T> {
 			.insert(token.to_owned());
 	}
 
-	/// Notes that the flags settled the conflict at `rel_path` of `pair`, which is then not asked
-	/// about.
-	pub(super) fn settled_conflict(&mut self, pair: PairId, rel_path: &str) {
-		self.asked_conflicts
-			.entry(pair)
-			.or_default()
-			.insert(rel_path.to_owned());
+	/// Notes what the flags came to at the conflict at `rel_path` of `pair`: one they `resolved` is
+	/// then not asked about, while one the engine refused to resolve is asked about once its pass
+	/// has ended, as one no flag covers is.
+	pub(super) fn flagged_conflict(&mut self, pair: PairId, rel_path: &str, resolved: bool) {
+		if resolved {
+			self.asked_conflicts
+				.entry(pair)
+				.or_default()
+				.insert(rel_path.to_owned());
+		}
 	}
 
 	/// Queues what `report`, of a pass of `pair` that has ended, leaves to ask about, in place of
@@ -405,11 +486,12 @@ impl<T> Questions<T> {
 				listed: held_lines(&report.held),
 			}));
 		}
-		for rel_path in report.conflict_paths() {
-			if !asked_conflicts.contains(rel_path) {
+		for conflict in &report.conflicts {
+			if !asked_conflicts.contains(&conflict.rel_path) {
 				self.queue.push_back(Question::Conflict {
 					pair,
-					rel_path: rel_path.to_owned(),
+					rel_path: conflict.rel_path.clone(),
+					reason: conflict.reason,
 				});
 			}
 		}
@@ -432,7 +514,7 @@ impl<T> Questions<T> {
 					.or_default()
 					.insert(batch.token.clone());
 			}
-			Question::Conflict { pair, rel_path } => {
+			Question::Conflict { pair, rel_path, .. } => {
 				self.asked_conflicts
 					.entry(*pair)
 					.or_default()
@@ -511,7 +593,7 @@ mod tests {
 	use inquire::InquireError;
 
 	use super::{
-		Choice, Decision, HeldBatch, MAX_DEFERRED_ITEMS, Open, Question, Questions,
+		Choice, Decision, HeldBatch, MAX_DEFERRED_ITEMS, Open, Question, Questions, choices,
 		conflict_decision, deletions_decision, failed_line, held_lines, left_line, too_late_line,
 	};
 
@@ -558,9 +640,14 @@ mod tests {
 	}
 
 	fn conflict_question(rel_path: &str) -> Question {
+		kind_mismatch_question(rel_path, ConflictReason::Diverged)
+	}
+
+	fn kind_mismatch_question(rel_path: &str, reason: ConflictReason) -> Question {
 		Question::Conflict {
 			pair: 1,
 			rel_path: rel_path.to_owned(),
+			reason,
 		}
 	}
 
@@ -626,10 +713,29 @@ mod tests {
 	fn what_the_flags_settled_is_not_asked_about() {
 		let mut questions = Questions::<()>::new(true);
 		questions.settled_batch(1, "t1");
-		questions.settled_conflict(1, "c");
+		questions.flagged_conflict(1, "c", true);
 		questions.raise(1, &report(Some("t1"), &["c", "d"]));
 
 		assert_eq!(all_asked(&mut questions), [conflict_question("d")]);
+	}
+
+	#[test]
+	fn a_conflict_the_flags_could_not_resolve_is_asked_about_for_its_reason() {
+		let mut questions = Questions::<()>::new(true);
+		questions.flagged_conflict(1, "x", false);
+		let mut report = SyncReport::default();
+		report.conflicts = vec![PlannedConflict {
+			rel_path: "x".to_owned(),
+			local: Some(PlannedNodeKind::File),
+			remote: Some(PlannedNodeKind::Dir),
+			reason: ConflictReason::RemoteKeepsDir,
+		}];
+		questions.raise(1, &report);
+
+		assert_eq!(
+			all_asked(&mut questions),
+			[kind_mismatch_question("x", ConflictReason::RemoteKeepsDir)]
+		);
 	}
 
 	#[test]
@@ -644,7 +750,8 @@ mod tests {
 			[
 				Question::Conflict {
 					pair: 2,
-					rel_path: "e".to_owned()
+					rel_path: "e".to_owned(),
+					reason: ConflictReason::Diverged,
 				},
 				conflict_question("d"),
 			]
@@ -724,11 +831,13 @@ mod tests {
 			conflict_decision(
 				1,
 				"c".to_owned(),
+				ConflictReason::Diverged,
 				Ok(Ok(Choice::Keep(ConflictResolution::KeepBoth)))
 			),
 			Decision::Resolve {
 				pair: 1,
 				rel_path: "c".to_owned(),
+				reason: ConflictReason::Diverged,
 				resolution: ConflictResolution::KeepBoth,
 			}
 		);
@@ -738,7 +847,7 @@ mod tests {
 			Err(InquireError::OperationInterrupted),
 		] {
 			assert_eq!(
-				conflict_decision(1, "c".to_owned(), Ok(answer)),
+				conflict_decision(1, "c".to_owned(), ConflictReason::Diverged, Ok(answer)),
 				Decision::Left(conflict_question("c"))
 			);
 		}
@@ -774,6 +883,111 @@ mod tests {
 				"Could not ask about the conflict at c: no tty. To resolve it, re-run the command \
 				 with --keep-local/--keep-remote/--keep-both \"c\"",
 			]
+		);
+	}
+
+	#[test]
+	fn a_conflict_that_diverged_offers_every_resolution() {
+		assert_eq!(
+			choices(ConflictReason::Diverged),
+			[
+				Choice::Keep(ConflictResolution::KeepLocal),
+				Choice::Keep(ConflictResolution::KeepRemote),
+				Choice::Keep(ConflictResolution::KeepBoth),
+				Choice::NotNow,
+			]
+		);
+	}
+
+	#[test]
+	fn a_local_file_under_a_remote_backup_directory_offers_keeping_the_remote_or_both() {
+		assert_eq!(
+			choices(ConflictReason::RemoteKeepsDir),
+			[
+				Choice::Keep(ConflictResolution::KeepRemote),
+				Choice::Keep(ConflictResolution::KeepBoth),
+				Choice::NotNow,
+			]
+		);
+	}
+
+	#[test]
+	fn a_remote_file_over_a_local_backup_directory_offers_only_keeping_both() {
+		assert_eq!(
+			choices(ConflictReason::LocalKeepsDir),
+			[Choice::Keep(ConflictResolution::KeepBoth), Choice::NotNow]
+		);
+	}
+
+	#[test]
+	fn a_local_directory_under_a_remote_backup_file_says_to_keep_both() {
+		assert_eq!(
+			kind_mismatch_question("x", ConflictReason::RemoteKeepsFile).intro(),
+			[
+				"Conflict at x: the local side holds a directory where the remote backup keeps a \
+				 file, and the backup does not delete its file",
+				"To back the directory up, keep both: it is renamed to <name>.old.<ext> and backed \
+				 up beside the file. Or rename or move one of the two yourself, and resolve it once \
+				 a pass has run",
+			]
+		);
+	}
+
+	#[test]
+	fn a_remote_directory_over_a_local_backup_file_says_how_to_pull_it() {
+		assert_eq!(
+			kind_mismatch_question("x", ConflictReason::LocalKeepsFile).intro(),
+			[
+				"Conflict at x: the remote side holds a directory where the local backup keeps a \
+				 file, and the backup does not delete its file",
+				"To pull the directory, keep the remote version, which moves the file to \
+				 .filen-sync-trash, or keep both, which renames it to <name>.old.<ext>. Or rename or \
+				 move one of the two yourself, and resolve it once a pass has run",
+			]
+		);
+	}
+
+	#[test]
+	fn a_conflict_that_could_not_be_asked_about_names_only_the_flags_that_resolve_it() {
+		assert_eq!(
+			failed_line(
+				&kind_mismatch_question("x", ConflictReason::RemoteKeepsFile),
+				"no tty"
+			),
+			"Could not ask about the conflict at x: no tty. To resolve it, re-run the command \
+			 with --keep-both \"x\""
+		);
+	}
+
+	#[test]
+	fn a_raised_conflict_is_asked_about_for_the_reason_its_pass_reported() {
+		let mut questions = Questions::<()>::new(true);
+		let mut report = SyncReport::default();
+		report.conflicts = vec![PlannedConflict {
+			rel_path: "x".to_owned(),
+			local: Some(PlannedNodeKind::Dir),
+			remote: Some(PlannedNodeKind::File),
+			reason: ConflictReason::RemoteKeepsFile,
+		}];
+		questions.raise(1, &report);
+
+		assert_eq!(
+			all_asked(&mut questions),
+			[kind_mismatch_question("x", ConflictReason::RemoteKeepsFile)]
+		);
+	}
+
+	#[test]
+	fn an_answer_once_the_sync_is_stopping_keeps_the_conflicts_reason() {
+		assert_eq!(
+			Decision::Resolve {
+				pair: 1,
+				rel_path: "x".to_owned(),
+				reason: ConflictReason::LocalKeepsDir,
+				resolution: ConflictResolution::KeepBoth,
+			}
+			.too_late(),
+			Decision::TooLate(kind_mismatch_question("x", ConflictReason::LocalKeepsDir))
 		);
 	}
 

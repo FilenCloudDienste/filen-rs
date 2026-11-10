@@ -15,7 +15,7 @@ use super::{
 	outcome::{LastPasses, problems_summary},
 	paused_message,
 	questions::{Answered, Decision, Questions},
-	resolve_failure_message, resolved_conflict_lines,
+	resolved_conflict_lines,
 };
 use crate::{interrupt, memory, ui::UI};
 
@@ -310,6 +310,7 @@ impl Watching<'_, '_> {
 			Decision::Resolve {
 				pair,
 				rel_path,
+				reason: _,
 				resolution,
 			} => {
 				self.resolve(ui, pair, &rel_path, resolution, PassState::Ended)
@@ -363,9 +364,10 @@ impl Watching<'_, '_> {
 				rel_path,
 				resolution,
 			}) => {
-				self.questions.settled_conflict(pair, rel_path);
-				self.resolve(ui, pair, rel_path, resolution, PassState::InFlight)
+				let resolved = self
+					.resolve(ui, pair, rel_path, resolution, PassState::InFlight)
 					.await;
+				self.questions.flagged_conflict(pair, rel_path, resolved);
 			}
 		}
 		// what the pass left is asked about once it has ended
@@ -375,7 +377,8 @@ impl Watching<'_, '_> {
 	}
 
 	/// Resolves the conflict at `rel_path` of `pair` with `resolution`, found by the pass that
-	/// `pass` says, and has the watch apply it.
+	/// `pass` says, and has the watch apply it. Returns whether it was resolved; a failure is
+	/// printed.
 	async fn resolve(
 		&mut self,
 		ui: &mut UI,
@@ -383,7 +386,7 @@ impl Watching<'_, '_> {
 		rel_path: &str,
 		resolution: ConflictResolution,
 		pass: PassState,
-	) {
+	) -> bool {
 		match self
 			.engine
 			.resolve_conflict(pair, rel_path, resolution)
@@ -398,10 +401,11 @@ impl Watching<'_, '_> {
 					self.log.print_approved(ui, pair, &line);
 				}
 				self.apply_soon(ui, pair).await;
+				true
 			}
 			Err(e) => {
-				let message = resolve_failure_message(rel_path, self.log.label(pair), &e);
-				self.log.print_failure(ui, &message);
+				self.log.print_resolve_failure(ui, pair, rel_path, &e);
+				false
 			}
 		}
 	}

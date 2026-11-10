@@ -522,7 +522,10 @@ async fn a_listed_conflict_is_resolved_by_resolve_sync_conflict() {
 	assert_success(&listed);
 	assert_eq!(
 		serde_json::from_slice::<serde_json::Value>(&listed.stdout).unwrap(),
-		serde_json::json!([{"path": "fight.txt", "local": "file", "remote": "file"}])
+		serde_json::json!([{
+			"path": "fight.txt", "local": "file", "remote": "file", "reason": "diverged",
+			"resolutions": ["keep_local", "keep_remote", "keep_both"],
+		}])
 	);
 	let resolved = filen(
 		config_dir.path(),

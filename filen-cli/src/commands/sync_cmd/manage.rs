@@ -15,14 +15,14 @@ use filen_sdk_rs::{
 	ErrorKind,
 	auth::Client,
 	sync_engine::{
-		Backlog, ConflictResolution, PairRecord, PlannedConflict, PlannedNodeKind, SyncEngine,
-		SyncMode,
+		Backlog, ConflictReason, ConflictResolution, PairRecord, PlannedConflict, PlannedNodeKind,
+		SyncEngine, SyncMode,
 	},
 };
 use serde_json::{Value, json};
 
 use super::{
-	conflict_resolutions, open_engine, pair_address, resolve_failure_message,
+	conflict_resolutions, json_events, open_engine, pair_address, resolve_failure_message,
 	resolved_conflict_lines, sync_dirs, sync_pairs,
 };
 use crate::{CliConfig, auth::LazyClient, ui::UI};
@@ -250,23 +250,38 @@ pub(super) async fn list_sync_conflicts(
 	Ok(())
 }
 
-/// The line `list-sync-conflicts` prints for `conflict`.
+/// The line `list-sync-conflicts` prints for `conflict`: what each side holds, and for a backup
+/// mode's kind mismatch why it is held and what resolves it.
 pub(super) fn conflict_line(conflict: &PlannedConflict) -> String {
 	let side = |kind: Option<PlannedNodeKind>| kind.map_or("deleted", node_name);
-	format!(
+	let sides = format!(
 		"{}: local {}, remote {}",
 		conflict.rel_path,
 		side(conflict.local),
 		side(conflict.remote)
-	)
+	);
+	match conflict.reason {
+		ConflictReason::Diverged => sides,
+		ConflictReason::RemoteKeepsDir
+		| ConflictReason::RemoteKeepsFile
+		| ConflictReason::LocalKeepsDir
+		| ConflictReason::LocalKeepsFile => format!(
+			"{sides}, as {}; resolve it with {}",
+			conflict.reason,
+			conflict_resolutions::resolution_flags(conflict.reason)
+		),
+	}
 }
 
-/// `conflict` for `--json`: its path and what each side holds, `null` for a side that deleted it.
+/// `conflict` for `--json`: its path, what each side holds (`null` for a side that deleted it), why
+/// it is held and the resolutions that can clear it.
 pub(super) fn conflict_object(conflict: &PlannedConflict) -> Value {
 	json!({
 		"path": conflict.rel_path,
 		"local": conflict.local.map(node_name),
 		"remote": conflict.remote.map(node_name),
+		"reason": json_events::conflict_reason_str(conflict.reason),
+		"resolutions": json_events::resolution_strs(conflict.reason),
 	})
 }
 
@@ -528,11 +543,37 @@ mod tests {
 
 		assert_eq!(
 			conflict_object(&conflict),
-			json!({"path": "docs", "local": "directory", "remote": "file"})
+			json!({
+				"path": "docs", "local": "directory", "remote": "file", "reason": "diverged",
+				"resolutions": ["keep_local", "keep_remote", "keep_both"],
+			})
 		);
 		assert_eq!(
 			conflict_line(&conflict),
 			"docs: local directory, remote file"
+		);
+	}
+
+	#[test]
+	fn a_kind_mismatch_says_why_it_is_held_and_what_resolves_it() {
+		let conflict = PlannedConflict {
+			rel_path: "docs".to_string(),
+			local: Some(PlannedNodeKind::Dir),
+			remote: Some(PlannedNodeKind::File),
+			reason: ConflictReason::RemoteKeepsFile,
+		};
+
+		assert_eq!(
+			conflict_line(&conflict),
+			"docs: local directory, remote file, as the local side holds a directory where the \
+			 remote backup keeps a file; resolve it with --keep-both"
+		);
+		assert_eq!(
+			conflict_object(&conflict),
+			json!({
+				"path": "docs", "local": "directory", "remote": "file",
+				"reason": "remote_keeps_file", "resolutions": ["keep_both"],
+			})
 		);
 	}
 

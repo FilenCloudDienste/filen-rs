@@ -1,5 +1,5 @@
 use anyhow::Result;
-use filen_sdk_rs::sync_engine::ConflictResolution;
+use filen_sdk_rs::sync_engine::{ConflictReason, ConflictResolution};
 
 use crate::ui::UI;
 
@@ -99,7 +99,8 @@ fn covers(path: &str, rel_path: &str) -> bool {
 			.is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
 }
 
-fn flag_name(resolution: ConflictResolution) -> &'static str {
+/// The flag that gives `resolution`, as `sync` and `resolve-sync-conflict` both name it.
+pub(super) fn flag_name(resolution: ConflictResolution) -> &'static str {
 	match resolution {
 		ConflictResolution::KeepLocal => "--keep-local",
 		ConflictResolution::KeepRemote => "--keep-remote",
@@ -107,11 +108,22 @@ fn flag_name(resolution: ConflictResolution) -> &'static str {
 	}
 }
 
+/// The flags of the resolutions that can clear a conflict held for `reason`
+/// ([`ConflictReason::resolutions`]), joined with `/`.
+pub(super) fn resolution_flags(reason: ConflictReason) -> String {
+	reason
+		.resolutions()
+		.iter()
+		.map(|resolution| flag_name(*resolution))
+		.collect::<Vec<_>>()
+		.join("/")
+}
+
 #[cfg(test)]
 mod tests {
-	use filen_sdk_rs::sync_engine::ConflictResolution;
+	use filen_sdk_rs::sync_engine::{ConflictReason, ConflictResolution};
 
-	use super::ConflictResolutions;
+	use super::{ConflictResolutions, resolution_flags};
 
 	fn keep_local(paths: &[&str]) -> ConflictResolutions {
 		ConflictResolutions::new(
@@ -253,6 +265,27 @@ mod tests {
 		assert_eq!(
 			keep_local(&["dir", "dir/"]).for_path("dir/f.txt"),
 			Some(ConflictResolution::KeepLocal)
+		);
+	}
+
+	#[test]
+	fn the_flags_of_a_conflict_are_those_of_the_resolutions_that_clear_it() {
+		assert_eq!(
+			[
+				ConflictReason::Diverged,
+				ConflictReason::RemoteKeepsDir,
+				ConflictReason::RemoteKeepsFile,
+				ConflictReason::LocalKeepsDir,
+				ConflictReason::LocalKeepsFile,
+			]
+			.map(resolution_flags),
+			[
+				"--keep-local/--keep-remote/--keep-both",
+				"--keep-remote/--keep-both",
+				"--keep-both",
+				"--keep-both",
+				"--keep-remote/--keep-both",
+			]
 		);
 	}
 }
