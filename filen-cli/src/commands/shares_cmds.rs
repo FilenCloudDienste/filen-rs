@@ -12,7 +12,8 @@
 //! lists the directory at that path instead, or shows the file there: the path starts with the
 //! name of a shared item, as `shared-with-me` lists it, and goes down from there (for example
 //! `shared-with-me Photos/2024`). When several people shared items of the same name with you,
-//! `--from <email>` picks the one shared by that account. `leave-share <name>` removes an item
+//! `--from <email>` picks the one shared by that account; without a path, `--from` lists only what
+//! that account shared with you. `leave-share <name>` removes an item
 //! someone shared with you from what is shared with you (after asking to confirm, which `--yes`
 //! answers); only they can share it again.
 //!
@@ -90,7 +91,8 @@ pub(crate) enum SharesCommands {
 		/// A path in what is shared with you, starting with a shared item's name (default: list
 		/// the shared items)
 		path: Option<String>,
-		/// Pick the shared item shared by this account, when several have the path's first name
+		/// Only what this account shared: picks the shared item when several have the path's
+		/// first name, and without a path lists only its items
 		#[arg(long, value_name = "EMAIL")]
 		from: Option<String>,
 	},
@@ -435,6 +437,12 @@ enum RootMatch {
 	Several(Vec<String>),
 }
 
+/// Whether `sharer` is the account `--from` names: emails compare case-insensitively, and the
+/// spaces around `from` are ignored.
+fn is_shared_by(sharer: &str, from: &str) -> bool {
+	sharer.eq_ignore_ascii_case(from.trim())
+}
+
 /// The item, of `(name, sharer email)` pairs, named `name` and shared by `from` when it is given.
 fn match_root<'a>(
 	roots: impl Iterator<Item = (Option<&'a str>, &'a str)>,
@@ -442,7 +450,7 @@ fn match_root<'a>(
 	from: Option<&str>,
 ) -> RootMatch {
 	let mut matching = roots.enumerate().filter(|(_, (root_name, sharer))| {
-		*root_name == Some(name) && from.is_none_or(|from| sharer.eq_ignore_ascii_case(from.trim()))
+		*root_name == Some(name) && from.is_none_or(|from| is_shared_by(sharer, from))
 	});
 	match (matching.next(), matching.next()) {
 		(None, _) => RootMatch::NotFound,
@@ -639,7 +647,7 @@ async fn print_shared_with_me(
 	let client = client.get(ui).await?;
 	let shares = InShares::list(client).await?;
 	let Some((first, rest)) = segments.split_first() else {
-		return print_in_share_roots(ui, &shares);
+		return print_in_share_roots(ui, &shares, from);
 	};
 	let (target, role) = resolve_shared(client, shares, first, rest, from).await?;
 	match target {
@@ -655,11 +663,37 @@ async fn print_shared_with_me(
 	}
 }
 
-fn print_in_share_roots(ui: &mut UI, shares: &InShares) -> Result<()> {
+/// The items, of `(item, sharer email)` pairs, shared by `from`, or all of them without it.
+fn shared_by<'a, T>(
+	items: impl Iterator<Item = (T, &'a str)>,
+	from: Option<&str>,
+) -> impl Iterator<Item = T> {
+	items
+		.filter(move |(_, sharer)| from.is_none_or(|from| is_shared_by(sharer, from)))
+		.map(|(item, _)| item)
+}
+
+/// What `shared-with-me` prints when no item is listed.
+fn nothing_shared_message(from: Option<&str>) -> String {
+	match from {
+		Some(from) => format!("Nothing is shared with you by {}", from.trim()),
+		None => "Nothing is shared with you".to_owned(),
+	}
+}
+
+/// Lists the items shared with this account, only those shared by `from` when it is given.
+fn print_in_share_roots(ui: &mut UI, shares: &InShares, from: Option<&str>) -> Result<()> {
+	let items: Vec<_> = shared_by(
+		shares
+			.items
+			.iter()
+			.map(|item| (item, sharer_of(item).email())),
+		from,
+	)
+	.collect();
 	if ui.json {
 		return ui.print_json(serde_json::Value::Array(
-			shares
-				.items
+			items
 				.iter()
 				.map(|item| {
 					entry_json(
@@ -672,10 +706,10 @@ fn print_in_share_roots(ui: &mut UI, shares: &InShares) -> Result<()> {
 				.collect(),
 		));
 	}
-	if shares.items.is_empty() {
-		ui.print_muted("Nothing is shared with you");
+	if items.is_empty() {
+		ui.print_muted(&nothing_shared_message(from));
 	}
-	for item in &shares.items {
+	for item in items {
 		let name = display_name(root_name(item), item.uuid());
 		ui.print(&format!(
 			"{}  from {}",
@@ -951,6 +985,40 @@ mod tests {
 			match_in(&roots, "Photos", Some("carol@example.com")),
 			RootMatch::NotFound
 		);
+	}
+
+	#[test]
+	fn is_shared_by_ignores_case_and_spaces() {
+		assert!(is_shared_by(ALICE, ALICE));
+		assert!(is_shared_by(ALICE, "  Alice@Example.COM \t"));
+		assert!(!is_shared_by(ALICE, BOB));
+		assert!(!is_shared_by(ALICE, "alice@example"));
+	}
+
+	#[test]
+	fn from_keeps_only_the_items_its_account_shared() {
+		let items = [(1, ALICE), (2, BOB), (3, ALICE)];
+		assert_eq!(
+			shared_by(items.into_iter(), Some(" Alice@example.com")).collect::<Vec<_>>(),
+			[1, 3]
+		);
+		assert_eq!(
+			shared_by(items.into_iter(), Some("carol@example.com")).collect::<Vec<_>>(),
+			Vec::<i32>::new()
+		);
+		assert_eq!(
+			shared_by(items.into_iter(), None).collect::<Vec<_>>(),
+			[1, 2, 3]
+		);
+	}
+
+	#[test]
+	fn the_empty_listing_names_the_account_from_names() {
+		assert_eq!(
+			nothing_shared_message(Some(" carol@example.com ")),
+			"Nothing is shared with you by carol@example.com"
+		);
+		assert_eq!(nothing_shared_message(None), "Nothing is shared with you");
 	}
 
 	#[test]

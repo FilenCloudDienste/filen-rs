@@ -147,7 +147,7 @@ Breaking changes are marked **Breaking**: scripts that depend on the old behavio
 - `FILEN_EMAIL`, `FILEN_PASSWORD` and `FILEN_2FA_CODE`, the older CLI's variables, are read when nothing else gives credentials; `FILEN_CLI_2FA_SECRET` makes the two-factor code from a TOTP secret
 - the login the older CLI saved is imported before the login prompt, and a hint is printed once about the older CLI's other files
 - `contacts`, `contact-request`, `contact-accept`, `contact-deny`, `contact-cancel`, `contact-remove`, `contact-block` and `contact-unblock`
-- `share`, `shared-by-me`, `unshare` (asking first when it would stop sharing with everyone), `shared-with-me`, `leave-share` and `download-shared`
+- `share`, `shared-by-me`, `unshare` (asking first when it would stop sharing with everyone), `shared-with-me` (with `--from <email>`, only what that account shared), `leave-share` and `download-shared`
 - `notes`, `note-cat`, `note-new`, `note-edit`, `note-rm` and `import-notes`
 
 #### Mount and serve
