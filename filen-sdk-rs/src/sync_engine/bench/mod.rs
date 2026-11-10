@@ -437,7 +437,7 @@ pub struct Expect {
 	pub actions: Count,
 	/// Actions the guard held back.
 	pub held: Count,
-	/// Paths surfaced as two-way conflicts.
+	/// Paths surfaced as conflicts.
 	pub conflicts: Count,
 	/// Directory moves folded out of the plan, each carrying its subtree.
 	pub dir_moves: Count,

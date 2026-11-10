@@ -1850,7 +1850,7 @@ pub(super) struct BenchPass {
 	/// held — the whole point of a mass-delete scenario — from a pass that planned nothing at all,
 	/// and both report `actions: 0`.
 	pub(super) held: usize,
-	/// Paths surfaced as two-way conflicts rather than actions.
+	/// Paths surfaced as conflicts rather than actions.
 	pub(super) conflicts: usize,
 	/// Directory moves folded out of the plan, each carrying its whole subtree (see
 	/// [`plan::fold_dir_moves`]). A scenario that moves a directory and folds no move measured a
@@ -3430,8 +3430,7 @@ fn endable_streaks(
 	Ok(ends)
 }
 
-/// Which side wins when a caller resolves a held two-way conflict via
-/// [`SyncEngine::resolve_conflict`].
+/// Which side wins when a caller resolves a held conflict via [`SyncEngine::resolve_conflict`].
 ///
 /// In a backup mode, a conflict over an item the source replaced with one of the other kind comes
 /// back on the next pass after [`KeepLocal`](Self::KeepLocal), and after
@@ -4395,7 +4394,7 @@ impl SyncEngine {
 		Ok(())
 	}
 
-	/// Resolve a two-way conflict the engine is holding at `rel_path` (one reported in
+	/// Resolve a conflict the engine is holding at `rel_path` (one reported in
 	/// [`SyncReport::conflicts`]) by naming the winning side. The resolution takes effect on the
 	/// NEXT pass: the baseline is re-anchored so the winner reads as the changed side and is
 	/// propagated normally, and the path (with its subtree) stops being held.
@@ -8135,7 +8134,7 @@ struct Restored {
 
 /// A reconciled, guard-screened pass.
 struct Screened {
-	/// Paths surfaced as two-way conflicts (held, never applied).
+	/// Paths surfaced as conflicts (held, never applied).
 	conflicts: Vec<PlannedConflict>,
 	/// Every executable action in apply order, screened in the pass's stage: what the guard holds
 	/// ([`Rows::Held`]) and what it lets through ([`Rows::Safe`]) — what an APPROVED pass runs is

@@ -301,7 +301,8 @@ pub struct SyncPassReport {
 	pub remotely_trashed: u64,
 	pub moved_remote: u64,
 	pub moved_local: u64,
-	/// Paths held as two-way conflicts.
+	/// Paths held as conflicts: in two-way, both sides changed; in a backup mode, the two
+	/// sides hold items of different kinds.
 	pub conflicts: Vec<PlannedConflict>,
 	pub conflicts_total: u64,
 	/// What the mass-delete guard held back: the deletions, plus the create half of a held type

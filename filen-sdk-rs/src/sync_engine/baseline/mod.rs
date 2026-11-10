@@ -545,7 +545,7 @@ impl NodeKind {
 pub(crate) enum BaselineState {
 	/// The path is fully reconciled — local, remote, and baseline agree.
 	Synced,
-	/// A two-way conflict was surfaced for this path; it is excluded from further passes until the
+	/// A conflict was surfaced for this path; it is excluded from further passes until the
 	/// caller resolves it.
 	Conflicted,
 	/// A conflict of the same standing, from the other side of the same race: this engine's own

@@ -112,7 +112,8 @@ pub struct SyncReport {
 	/// Items renamed/moved locally in place of a re-download — a directory counts once, whatever its
 	/// subtree holds.
 	pub moved_local: usize,
-	/// Paths surfaced as two-way conflicts (left untouched), with what each side held.
+	/// Paths surfaced as conflicts (left untouched), with what each side held: in two-way, both
+	/// sides changed; in a backup mode, the two sides hold items of different kinds.
 	pub conflicts: Vec<PlannedConflict>,
 	/// What the mass-delete guard held back this pass — the deletions, plus the create half of a
 	/// held type flip (which is only meaningful together with its delete). Use
@@ -4338,7 +4339,7 @@ fn overwritten_entry(
 	}
 }
 
-/// Record a two-way conflict in the baseline: the path is HELD (excluded from planning, along with
+/// Record a conflict in the baseline: the path is HELD (excluded from planning, along with
 /// its subtree) until [`SyncEngine::resolve_conflict`](super::SyncEngine::resolve_conflict) picks a
 /// winner. The row keeps both sides' evidence as of this pass — the local kind/hash/size/mtime the
 /// scan saw and the remote kind/uuid/hash/size — so the resolution can re-anchor the row to the

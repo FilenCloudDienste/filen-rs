@@ -456,7 +456,8 @@ pub struct PlanOutcome {
 	/// [`SyncEngine::approve_deletions`](super::SyncEngine::approve_deletions). Set alongside
 	/// `held`.
 	pub pass_token: Option<String>,
-	/// Paths that would be surfaced as two-way conflicts — held, never applied.
+	/// Paths that would be surfaced as conflicts — held, never applied: in two-way, both sides
+	/// changed; in a backup mode, the two sides hold items of different kinds.
 	pub conflicts: Vec<PlannedConflict>,
 	/// Paths the engine will not act on at all, and why.
 	pub unsyncable: Vec<UnsyncablePath>,
