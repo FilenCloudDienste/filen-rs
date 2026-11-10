@@ -185,6 +185,7 @@ Breaking changes are marked **Breaking**: scripts that depend on the old behavio
 - `logout` offers to delete a keyring entry the keyring cannot decode, so it can be removed, and exits with an error naming both causes when it can neither read nor delete it, instead of reporting nothing deleted
 - `export-notes` replaces control characters in note titles and prefixes `_` to titles Windows reserves for a device, such as `CON`, `NUL`, `COM0` or `LPT¹`, also with spaces before the extension
 - `filen rclone` exits with 128 plus the signal when a signal ended Rclone, instead of 0
+- a terminal error while reading a text or password prompt is a `terminal_input` failure, not an unexpected one with a link to report a bug
 - a failed write to stdout, as on a full disk, ends the command with a message and exit code 1 instead of a crash; in the REPL it fails only that command
 
 ### Security

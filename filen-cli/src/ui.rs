@@ -739,7 +739,6 @@ impl UI {
 				info!("[PROMPT] canceled");
 				Ok(None)
 			}
-			Err(InquireError::IO(e)) => Err(anyhow::anyhow!("IO error: {}", e)),
 			Err(e) => Err(CliError::TerminalInput(e).into()),
 		}
 	}
@@ -1878,6 +1877,21 @@ mod tests {
 			"{failure}"
 		);
 		assert!(failure["error"].get("reportUrl").is_none(), "{failure}");
+	}
+
+	#[test]
+	fn an_io_error_at_a_prompt_is_a_terminal_input_failure() {
+		let err = UI::handle_prompt_result(Err(InquireError::IO(io::Error::other("broken pipe"))))
+			.unwrap_err();
+
+		assert!(
+			matches!(
+				find_cli_error(&err),
+				Some(CliError::TerminalInput(InquireError::IO(_)))
+			),
+			"{err:?}"
+		);
+		assert_eq!(error::exit_code(&err), 1);
 	}
 
 	#[test]
