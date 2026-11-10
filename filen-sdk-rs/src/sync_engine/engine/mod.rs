@@ -3432,6 +3432,11 @@ fn endable_streaks(
 
 /// Which side wins when a caller resolves a held two-way conflict via
 /// [`SyncEngine::resolve_conflict`].
+///
+/// In a backup mode, a conflict over an item the source replaced with one of the other kind comes
+/// back on the next pass after [`KeepLocal`](Self::KeepLocal), and after
+/// [`KeepRemote`](Self::KeepRemote) over a local directory, for as long as the kinds still differ:
+/// see [`SyncMode::LocalBackup`] and [`SyncMode::RemoteBackup`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[js_type(import, no_ser, no_default, napi)]
 pub enum ConflictResolution {
@@ -4394,6 +4399,13 @@ impl SyncEngine {
 	/// [`SyncReport::conflicts`]) by naming the winning side. The resolution takes effect on the
 	/// NEXT pass: the baseline is re-anchored so the winner reads as the changed side and is
 	/// propagated normally, and the path (with its subtree) stops being held.
+	///
+	/// The exception is a backup mode's conflict over an item the source replaced with one of the
+	/// other kind: a backup mode never deletes on its destination, so a resolution that leaves both
+	/// items in place ([`KeepLocal`](ConflictResolution::KeepLocal) always,
+	/// [`KeepRemote`](ConflictResolution::KeepRemote) over a local directory) has nothing to
+	/// propagate, and the next pass reports the same conflict again while the kinds still differ.
+	/// [`SyncMode::LocalBackup`] and [`SyncMode::RemoteBackup`] say which resolutions clear it.
 	///
 	/// [`KeepBoth`](ConflictResolution::KeepBoth) additionally renames the local copy aside to
 	/// `<stem>.old.<ext>` first, so that copy uploads as a new file instead of being overwritten.

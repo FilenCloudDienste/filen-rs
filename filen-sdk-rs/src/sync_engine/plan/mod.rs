@@ -1499,8 +1499,27 @@ fn adopt_if_baseline_stale(
 	actions.push(action);
 }
 
+/// The path where, in a backup mode, the two sides hold items of different kinds (a file on one, a
+/// directory on the other), whichever side changed: the source item changed kind, another client
+/// replaced the destination's, or a first sync met a destination already holding the other kind.
+/// Reconciling that would delete the destination's item first — a directory with its whole subtree
+/// — and a backup mode never deletes on its destination, so the path is surfaced as a conflict
+/// instead, with nothing planned at it: the destination keeps its item, and the engine holds the
+/// path for the caller. While the two sides still hold items of different kinds there after a
+/// resolution, the next pass surfaces the path again.
+fn backup_kind_mismatch_conflict(rel_path: &str, actions: &mut Vec<SyncAction>) {
+	let action = SyncAction::Conflict {
+		rel_path: rel_path.to_string(),
+	};
+	tracing::trace!(
+		"plan: {} — the two sides hold items of different kinds, which a backup mode cannot reconcile without deleting the destination's",
+		action.describe()
+	);
+	actions.push(action);
+}
+
 /// Make the remote match the local at one path (push). `delete_ok` gates deletions (off for backup
-/// modes, which never delete on their destination).
+/// modes, which never delete on their destination, and so hold a kind mismatch as a conflict).
 fn push_to_remote(
 	rel_path: &str,
 	local: Option<&LocalNode>,
@@ -1521,6 +1540,10 @@ fn push_to_remote(
 		(Some(local), Some(remote)) => {
 			if !remote_matches_local(local, remote, base) {
 				if local.kind != remote.kind {
+					if !delete_ok {
+						backup_kind_mismatch_conflict(rel_path, actions);
+						return;
+					}
 					// Type flip: trash the stale remote node, then create the new kind.
 					let trash = SyncAction::TrashRemote {
 						rel_path: rel_path.to_string(),
@@ -1568,7 +1591,8 @@ fn create_remote(rel_path: &str, kind: NodeKind) -> SyncAction {
 	}
 }
 
-/// Make the local match the remote at one path (pull). `delete_ok` gates deletions.
+/// Make the local match the remote at one path (pull). `delete_ok` gates deletions, as in
+/// [`push_to_remote`].
 fn pull_to_local(
 	rel_path: &str,
 	local: Option<&LocalNode>,
@@ -1589,6 +1613,10 @@ fn pull_to_local(
 		(Some(remote), Some(local)) => {
 			if !remote_matches_local(local, remote, base) {
 				if local.kind != remote.kind {
+					if !delete_ok {
+						backup_kind_mismatch_conflict(rel_path, actions);
+						return;
+					}
 					let del = SyncAction::DeleteLocal {
 						rel_path: rel_path.to_string(),
 						kind: local.kind,

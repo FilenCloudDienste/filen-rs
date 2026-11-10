@@ -3817,6 +3817,171 @@ fn a_directory_replace_delete_runs_after_the_moves_out_of_that_directory() {
 	);
 }
 
+/// What a backup mode plans at `x` once the two sides hold items of different kinds there, whichever
+/// side changed: the conflict alone. No delete and no create at the path, and no baseline adoption
+/// either, so the destination's item (and the subtree of a directory) stays and so does the row.
+fn assert_kind_mismatch_is_held_as_a_conflict(
+	mode: SyncMode,
+	baseline: &HashMap<String, BaselineEntry>,
+	local: &HashMap<String, LocalNode>,
+	remote: &HashMap<String, RemoteNode>,
+) {
+	assert_eq!(
+		plan(mode, baseline, local, remote),
+		vec![SyncAction::Conflict {
+			rel_path: "x".to_string(),
+		}],
+		"{mode:?} never deletes on its destination, so where the two sides hold items of different kinds it is a conflict"
+	);
+}
+
+#[test]
+fn type_change_to_a_directory_in_local_backup_keeps_the_remote_file() {
+	let uuid = Uuid::from_u128(1);
+	let baseline = map(vec![("x", base_file("x", uuid, [1; 32]))]);
+	let remote = map(vec![("x", remote_file("x", uuid, [1; 32]))]);
+	let local = map(vec![("x", local_dir("x"))]);
+	assert_kind_mismatch_is_held_as_a_conflict(SyncMode::LocalBackup, &baseline, &local, &remote);
+}
+
+#[test]
+fn type_change_to_a_file_in_local_backup_keeps_the_remote_directory() {
+	let (dir, child) = (Uuid::from_u128(1), Uuid::from_u128(2));
+	let baseline = map(vec![
+		("x", base_dir("x", dir)),
+		("x/a.txt", base_file("x/a.txt", child, [2; 32])),
+	]);
+	let remote = map(vec![
+		("x", remote_dir_node("x", dir)),
+		("x/a.txt", remote_file("x/a.txt", child, [2; 32])),
+	]);
+	let local = map(vec![("x", local_file("x", [1; 32]))]);
+	assert_kind_mismatch_is_held_as_a_conflict(SyncMode::LocalBackup, &baseline, &local, &remote);
+}
+
+#[test]
+fn type_change_to_a_directory_in_remote_backup_keeps_the_local_file() {
+	let (file, dir) = (Uuid::from_u128(1), Uuid::from_u128(2));
+	let baseline = map(vec![("x", base_file("x", file, [1; 32]))]);
+	let local = map(vec![("x", local_file("x", [1; 32]))]);
+	let remote = map(vec![("x", remote_dir_node("x", dir))]);
+	assert_kind_mismatch_is_held_as_a_conflict(SyncMode::RemoteBackup, &baseline, &local, &remote);
+}
+
+#[test]
+fn type_change_to_a_file_in_remote_backup_keeps_the_local_directory() {
+	let (dir, child, file) = (Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(3));
+	let baseline = map(vec![
+		("x", base_dir("x", dir)),
+		("x/a.txt", base_file("x/a.txt", child, [2; 32])),
+	]);
+	let local = map(vec![
+		("x", local_dir("x")),
+		("x/a.txt", local_file("x/a.txt", [2; 32])),
+	]);
+	let remote = map(vec![("x", remote_file("x", file, [1; 32]))]);
+	assert_kind_mismatch_is_held_as_a_conflict(SyncMode::RemoteBackup, &baseline, &local, &remote);
+}
+
+/// Two-way deletes on either side, so a type change there still replaces the item.
+#[test]
+fn type_change_in_two_way_replaces_the_item() {
+	let uuid = Uuid::from_u128(1);
+	let baseline = map(vec![("x", base_file("x", uuid, [1; 32]))]);
+	let remote = map(vec![("x", remote_file("x", uuid, [1; 32]))]);
+	let local = map(vec![("x", local_dir("x"))]);
+	assert_eq!(
+		plan(SyncMode::TwoWay, &baseline, &local, &remote),
+		vec![
+			SyncAction::TrashRemote {
+				rel_path: "x".to_string(),
+				kind: NodeKind::File,
+				remote_uuid: uuid,
+			},
+			SyncAction::CreateRemoteDir {
+				rel_path: "x".to_string(),
+			},
+		]
+	);
+}
+
+/// Another client replaced the remote backup's file with a directory; the local file is unchanged.
+#[test]
+fn a_remote_directory_replacing_the_file_in_local_backup_is_a_conflict() {
+	let (file, dir) = (Uuid::from_u128(1), Uuid::from_u128(2));
+	let baseline = map(vec![("x", base_file("x", file, [1; 32]))]);
+	let local = map(vec![("x", local_file("x", [1; 32]))]);
+	let remote = map(vec![("x", remote_dir_node("x", dir))]);
+	assert_kind_mismatch_is_held_as_a_conflict(SyncMode::LocalBackup, &baseline, &local, &remote);
+}
+
+/// The local backup's directory was replaced with a file; the remote directory is unchanged.
+#[test]
+fn a_local_file_replacing_the_directory_in_remote_backup_is_a_conflict() {
+	let dir = Uuid::from_u128(1);
+	let baseline = map(vec![("x", base_dir("x", dir))]);
+	let remote = map(vec![("x", remote_dir_node("x", dir))]);
+	let local = map(vec![("x", local_file("x", [1; 32]))]);
+	assert_kind_mismatch_is_held_as_a_conflict(SyncMode::RemoteBackup, &baseline, &local, &remote);
+}
+
+#[test]
+fn a_first_local_backup_over_a_remote_directory_is_a_conflict() {
+	let local = map(vec![("x", local_file("x", [1; 32]))]);
+	let remote = map(vec![("x", remote_dir_node("x", Uuid::from_u128(1)))]);
+	assert_kind_mismatch_is_held_as_a_conflict(
+		SyncMode::LocalBackup,
+		&HashMap::new(),
+		&local,
+		&remote,
+	);
+}
+
+#[test]
+fn a_first_remote_backup_over_a_local_directory_is_a_conflict() {
+	let remote = map(vec![("x", remote_file("x", Uuid::from_u128(1), [1; 32]))]);
+	let local = map(vec![("x", local_dir("x"))]);
+	assert_kind_mismatch_is_held_as_a_conflict(
+		SyncMode::RemoteBackup,
+		&HashMap::new(),
+		&local,
+		&remote,
+	);
+}
+
+/// The row was adopted from the remote at a switch to local backup, and the local side now holds a
+/// directory there: the row stops counting as a baseline, and the kinds still differ.
+#[test]
+fn an_adopted_remote_file_in_local_backup_is_a_conflict_once_the_local_side_holds_a_directory() {
+	let uuid = Uuid::from_u128(1);
+	let baseline = map(vec![(
+		"x",
+		BaselineEntry {
+			state: BaselineState::Adopted,
+			..base_file("x", uuid, [1; 32])
+		},
+	)]);
+	let remote = map(vec![("x", remote_file("x", uuid, [1; 32]))]);
+	let local = map(vec![("x", local_dir("x"))]);
+	assert_kind_mismatch_is_held_as_a_conflict(SyncMode::LocalBackup, &baseline, &local, &remote);
+}
+
+/// The row was adopted from the local side at a switch to remote backup, and the remote now holds a
+/// directory there.
+#[test]
+fn an_adopted_local_file_in_remote_backup_is_a_conflict_once_the_remote_holds_a_directory() {
+	let baseline = map(vec![(
+		"x",
+		BaselineEntry {
+			state: BaselineState::Adopted,
+			..base_file("x", Uuid::from_u128(1), [1; 32])
+		},
+	)]);
+	let local = map(vec![("x", local_file("x", [1; 32]))]);
+	let remote = map(vec![("x", remote_dir_node("x", Uuid::from_u128(2)))]);
+	assert_kind_mismatch_is_held_as_a_conflict(SyncMode::RemoteBackup, &baseline, &local, &remote);
+}
+
 /// The paths a pass both deletes and creates are the first halves of its type flips; a path
 /// only one side of that touches is not among them.
 #[test]
