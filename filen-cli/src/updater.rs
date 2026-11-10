@@ -156,12 +156,27 @@ async fn due_update_check(
 /// Says where the update check installed `update`, which the running process does not use.
 fn report_installed(ui: &mut UI, update: &InstalledUpdate) {
 	match &update.installed {
-		InstalledRelease::Renamed(path) => {
+		InstalledRelease::Renamed {
+			path,
+			old,
+			old_binary,
+		} => {
 			ui.print_muted_to_stderr(&format!("Downloaded update to {}", path.display()));
+			warn_if_old_binary_kept(ui, old, old_binary);
 		}
 		InstalledRelease::Replaced(_) => ui.print_muted_to_stderr(
 			"Update installed successfully. It will take effect the next time you run the application.",
 		),
+	}
+}
+
+/// Warns that the old binary at `old` is still there when a renamed update could not delete it.
+fn warn_if_old_binary_kept(ui: &mut UI, old: &Path, old_binary: &OldBinary) {
+	if let OldBinary::Kept(e) = old_binary {
+		ui.print_warning(&format!(
+			"Failed to delete the old binary {}: {e}; delete it yourself",
+			old.display()
+		));
 	}
 }
 
@@ -501,10 +516,7 @@ struct InstalledUpdate {
 /// process's, or 0 when it could not be started, after saying to restart the CLI.
 async fn restart(ui: &mut UI, update: &InstalledUpdate) -> i32 {
 	let executable = update.installed.executable();
-	ui.print_muted_to_stderr(&format!(
-		"Updated to v{}, restarting the CLI...",
-		update.version
-	));
+	announce_restart(ui, update);
 	// Ctrl-C reaches the new process too, which handles it; this one only waits for it to end.
 	let _waiting = (interrupt::catch(), interrupt::own());
 	let status = tokio::process::Command::new(executable)
@@ -512,6 +524,21 @@ async fn restart(ui: &mut UI, update: &InstalledUpdate) -> i32 {
 		.status()
 		.await;
 	restart_exit_code(ui, update, status)
+}
+
+/// Says that the CLI restarts from `update`, after warning that the old binary is still there when
+/// a renamed update could not delete it.
+fn announce_restart(ui: &mut UI, update: &InstalledUpdate) {
+	if let InstalledRelease::Renamed {
+		old, old_binary, ..
+	} = &update.installed
+	{
+		warn_if_old_binary_kept(ui, old, old_binary);
+	}
+	ui.print_muted_to_stderr(&format!(
+		"Updated to v{}, restarting the CLI...",
+		update.version
+	));
 }
 
 /// The exit code to exit with after restarting the CLI from `update`, which ended with `status`:
@@ -629,8 +656,13 @@ pub(crate) async fn install(ui: &mut UI, request: &ReleaseRequest) -> Result<()>
 	};
 	let version = release.tag_name.trim_start_matches('v');
 	match install_release(&env.version, &release, version).await? {
-		InstalledRelease::Renamed(path) => {
+		InstalledRelease::Renamed {
+			path,
+			old,
+			old_binary,
+		} => {
 			ui.print_success(&format!("Installed v{version} to {}", path.display()));
+			warn_if_old_binary_kept(ui, &old, &old_binary);
 		}
 		InstalledRelease::Replaced(_) => ui.print_success(&format!(
 			"Installed v{version}. It takes effect the next time you run the CLI."
@@ -684,9 +716,16 @@ async fn confirm_install(
 /// Where a release was installed.
 #[derive(Debug)]
 enum InstalledRelease {
-	/// At this path, which is the running binary's with the release's version in place of the
-	/// running one; the running binary was deleted.
-	Renamed(PathBuf),
+	/// Under a new name, next to the running binary.
+	Renamed {
+		/// The installed binary: the running binary's path with the release's version in place
+		/// of the running one.
+		path: PathBuf,
+		/// The running binary, which was to be deleted.
+		old: PathBuf,
+		/// Whether `old` was deleted.
+		old_binary: OldBinary,
+	},
 	/// Over the running binary, which is at this path.
 	Replaced(PathBuf),
 }
@@ -695,9 +734,17 @@ impl InstalledRelease {
 	/// The installed binary.
 	fn executable(&self) -> &Path {
 		match self {
-			Self::Renamed(path) | Self::Replaced(path) => path,
+			Self::Renamed { path, .. } | Self::Replaced(path) => path,
 		}
 	}
+}
+
+/// What became of the old binary once a renamed update was in place.
+#[derive(Debug)]
+enum OldBinary {
+	Deleted,
+	/// Deleting it failed with this error; the update is installed all the same.
+	Kept(io::Error),
 }
 
 /// Downloads the asset of `release` built for this target, checks it against what the release
@@ -735,14 +782,18 @@ async fn install_release(
 		let update_path = current_executable.with_file_name(renamed);
 		// writing, syncing and renaming a multi-MB binary blocks, so keep it off the
 		// runtime's workers
-		let update_path = tokio::task::spawn_blocking(move || {
+		let (update_path, old_binary) = tokio::task::spawn_blocking(move || {
 			install_renamed_update(&executable_dir, &content, &update_path, || {
 				self_replace::self_delete()
 			})
-			.map(|()| update_path)
+			.map(|old_binary| (update_path, old_binary))
 		})
 		.await??;
-		Ok(InstalledRelease::Renamed(update_path))
+		Ok(InstalledRelease::Renamed {
+			path: update_path,
+			old: current_executable,
+			old_binary,
+		})
 	} else {
 		tokio::task::spawn_blocking(move || {
 			install_replacing_update(&executable_dir, &content, |staged| {
@@ -934,18 +985,23 @@ fn move_into_place(staged: TempPath, update_path: &Path) -> io::Result<()> {
 /// Installs an update under a new file name, for a binary whose name carries its version:
 /// stages `content` in `executable_dir`, moves it to `update_path`, and only then calls
 /// `delete_old` to remove the running binary. If staging or moving fails, `delete_old` is
-/// never called, so the old binary stays usable, and the staged file is removed.
+/// never called, so the old binary stays usable, and the staged file is removed. Once the
+/// update is in place it stays installed: a failed `delete_old` is [`OldBinary::Kept`], not an
+/// error.
 fn install_renamed_update(
 	executable_dir: &Path,
 	content: &[u8],
 	update_path: &Path,
 	delete_old: impl FnOnce() -> io::Result<()>,
-) -> Result<()> {
+) -> Result<OldBinary> {
 	let staged = stage_update(executable_dir, content)
 		.with_context(|| format!("Failed to write update to {}", executable_dir.display()))?;
 	move_into_place(staged, update_path)
 		.with_context(|| format!("Failed to move update to {}", update_path.display()))?;
-	delete_old().context("Failed to delete old binary")
+	Ok(match delete_old() {
+		Ok(()) => OldBinary::Deleted,
+		Err(e) => OldBinary::Kept(e),
+	})
 }
 
 /// Installs an update over the running binary, for a binary whose name carries no version:
@@ -2303,6 +2359,27 @@ mod tests {
 		);
 	}
 
+	#[test]
+	fn a_restart_from_a_renamed_update_warns_about_a_kept_old_binary() {
+		let printed = Printed::default();
+		let update = InstalledUpdate {
+			version: "0.3.0".to_owned(),
+			installed: InstalledRelease::Renamed {
+				path: PathBuf::from("/bin/filen-cli-v0.3.0-linux-x64"),
+				old: PathBuf::from("/bin/filen-cli-v0.2.9-linux-x64"),
+				old_binary: OldBinary::Kept(io::Error::from(io::ErrorKind::PermissionDenied)),
+			},
+		};
+
+		announce_restart(&mut printed.ui(), &update);
+
+		assert_eq!(
+			console::strip_ansi_codes(&printed.lines()),
+			"⚠ Failed to delete the old binary /bin/filen-cli-v0.2.9-linux-x64: permission denied; \
+			 delete it yourself\nUpdated to v0.3.0, restarting the CLI..."
+		);
+	}
+
 	#[cfg(unix)]
 	#[test]
 	fn a_restarted_cli_passes_on_its_exit_code() {
@@ -2475,7 +2552,7 @@ mod tests {
 		std::fs::write(&old, b"old binary").unwrap();
 		let update_path = dir.path().join("filen-cli-v0.2.9-linux-x64");
 
-		install_renamed_update(dir.path(), b"new binary", &update_path, || {
+		let old_binary = install_renamed_update(dir.path(), b"new binary", &update_path, || {
 			// the new binary must be complete and in place when the old one goes
 			assert_eq!(std::fs::read(&update_path).unwrap(), b"new binary");
 			#[cfg(unix)]
@@ -2484,7 +2561,31 @@ mod tests {
 		})
 		.unwrap();
 
+		assert!(matches!(old_binary, OldBinary::Deleted));
 		assert_eq!(file_names(dir.path()), ["filen-cli-v0.2.9-linux-x64"]);
+	}
+
+	#[test]
+	fn a_renamed_update_whose_old_binary_cannot_be_deleted_stays_installed() {
+		let dir = tempfile::tempdir().unwrap();
+		let old = dir.path().join("filen-cli-v0.2.8-linux-x64");
+		std::fs::write(&old, b"old binary").unwrap();
+		let update_path = dir.path().join("filen-cli-v0.2.9-linux-x64");
+
+		let old_binary = install_renamed_update(dir.path(), b"new binary", &update_path, || {
+			Err(io::Error::from(io::ErrorKind::PermissionDenied))
+		})
+		.unwrap();
+
+		assert!(matches!(
+			old_binary,
+			OldBinary::Kept(e) if e.kind() == io::ErrorKind::PermissionDenied
+		));
+		assert_eq!(std::fs::read(&update_path).unwrap(), b"new binary");
+		assert_eq!(
+			file_names(dir.path()),
+			["filen-cli-v0.2.8-linux-x64", "filen-cli-v0.2.9-linux-x64"]
+		);
 	}
 
 	#[test]
