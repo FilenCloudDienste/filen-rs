@@ -98,7 +98,7 @@ pub use baseline::{PairId, PairRecord};
 pub use changes::FullPassReason;
 pub use engine::{
 	BaselineInUse, BaselineSchemaMismatch, CONFIRM_TENURE, ConflictResolution, ConflictResolved,
-	PATH_FAILURE_RETRY_INTERVAL, PairOverlap, SyncEngine,
+	PATH_FAILURE_RETRY_INTERVAL, PairOverlap, ResolutionRefused, SyncEngine,
 };
 pub use events::{LocalScanProgress, SyncEvent, SyncObserver, TransferDirection};
 pub use guard::{DeleteGuard, GuardReason};

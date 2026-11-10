@@ -66,10 +66,10 @@ use crate::{
 	runtime::{do_on_commander, spawn, spawned},
 	sync::lock::LOCK_RELEASE_SETTLE_BOUND,
 	sync_engine::{
-		Backlog, BaselineInUse, ConflictResolution, DeleteGuard, IgnoredPath, LegacyImport, PairId,
-		PauseMode, PauseOptions, PlanOutcome, PlannedAction, PlannedConflict, SyncEngine,
-		SyncEvent, SyncMode, SyncObserver, UnsyncablePath, WatchConfig, WatchHandle, WatchState,
-		WatchStatus, engine::unknown_pair,
+		Backlog, BaselineInUse, ConflictReason, ConflictResolution, DeleteGuard, IgnoredPath,
+		LegacyImport, PairId, PauseMode, PauseOptions, PlanOutcome, PlannedAction, PlannedConflict,
+		SyncEngine, SyncEvent, SyncMode, SyncObserver, UnsyncablePath, WatchConfig, WatchHandle,
+		WatchState, WatchStatus, engine::unknown_pair,
 	},
 };
 
@@ -1380,7 +1380,8 @@ impl JsSyncEngine {
 
 	/// Resolve the conflict held at `rel_path`, from the next pass on. Returns where the copy that
 	/// lost went: the bin path when `KeepRemote` replaced different local content, or the relative
-	/// path `KeepBoth` kept the local copy at.
+	/// path `KeepBoth` kept the local copy at. A resolution that cannot clear the conflict (see
+	/// `conflictResolutions`) is refused with `SyncRefusal.ResolutionRefused`, and nothing changes.
 	#[napi_export]
 	pub async fn resolve_conflict(
 		&self,
@@ -1392,6 +1393,14 @@ impl JsSyncEngine {
 			core.resolve_conflict(pair_id, &rel_path, resolution).await
 		})
 		.await
+	}
+
+	/// The resolutions that can clear a conflict held for `reason`, in the order `KeepLocal`,
+	/// `KeepRemote`, `KeepBoth`; `resolveConflict` refuses any other with
+	/// `SyncRefusal.ResolutionRefused`.
+	#[napi_export]
+	pub fn conflict_resolutions(&self, reason: ConflictReason) -> Vec<ConflictResolution> {
+		reason.resolutions().to_vec()
 	}
 
 	/// Plan a path that kept failing again on the next pass, without waiting out the engine's

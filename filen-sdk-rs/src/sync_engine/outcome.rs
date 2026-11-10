@@ -15,7 +15,7 @@ use std::fmt;
 use filen_macros::js_type;
 
 use super::{
-	SyncMode,
+	ConflictResolution, SyncMode,
 	baseline::NodeKind,
 	guard::GuardReason,
 	ignore::IgnoredPath,
@@ -145,32 +145,41 @@ impl fmt::Display for PlannedAction {
 	}
 }
 
-/// Why a path is held as a conflict. Worked out from the pair's CURRENT mode and the kinds the two
-/// sides hold at the path, so a conflict still held across a mode switch is reported under the new
-/// mode.
+/// Why a path is held as a conflict, and so which resolutions can clear it
+/// ([`resolutions`](Self::resolutions)). Worked out from the pair's CURRENT mode and the kinds the
+/// two sides hold at the path, so a conflict still held across a mode switch is reported under the
+/// new mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[js_type(export, no_deser, no_default, napi)]
+#[js_type(import, export, no_default, napi)]
 pub enum ConflictReason {
 	/// The two sides diverged from what they last agreed on: in two-way both changed (two edits, an
 	/// edit against a deletion, two items of different kinds), or, in any mode, this engine's
 	/// upload buried another client's edit, or a local edit sits over a remote version that does
-	/// not match its hash.
+	/// not match its hash. Every resolution clears it.
 	Diverged,
 	/// [`LocalBackup`](SyncMode::LocalBackup): the remote keeps a directory where the local side
 	/// holds a file. A backup never deletes on its destination, whichever side made the kinds
 	/// differ: the local item changed kind, another client replaced the remote one, or a first sync
-	/// or a mode switch met a remote that already held the other kind.
+	/// or a mode switch met a remote that already held the other kind. Keeping the remote version
+	/// moves the local file to `.filen-sync-trash`, and keeping both renames it aside, where it is
+	/// backed up; keeping the local version is refused.
 	RemoteKeepsDir,
 	/// [`LocalBackup`](SyncMode::LocalBackup): the remote keeps a file where the local side holds a
 	/// directory, whichever side made the kinds differ (see [`RemoteKeepsDir`](Self::RemoteKeepsDir)).
+	/// Only keeping both, which renames the local directory aside to be backed up under that name,
+	/// clears it.
 	RemoteKeepsFile,
 	/// [`RemoteBackup`](SyncMode::RemoteBackup): the local backup keeps a directory where the remote
 	/// holds a file, whichever side made the kinds differ: the remote item changed kind, the local
 	/// one was replaced, or a first sync or a mode switch met a local tree that already held the
-	/// other kind.
+	/// other kind. Only keeping both, which renames the local directory aside and then pulls the
+	/// remote file, clears it.
 	LocalKeepsDir,
 	/// [`RemoteBackup`](SyncMode::RemoteBackup): the local backup keeps a file where the remote holds
 	/// a directory, whichever side made the kinds differ (see [`LocalKeepsDir`](Self::LocalKeepsDir)).
+	/// Keeping the remote version moves the local file to `.filen-sync-trash`, and keeping both
+	/// renames it aside; either way the remote directory is then pulled. Keeping the local version is
+	/// refused.
 	LocalKeepsFile,
 }
 
@@ -198,6 +207,32 @@ impl ConflictReason {
 			},
 			// These modes delete on their destination, so a resolution replaces the item.
 			SyncMode::TwoWay | SyncMode::LocalToRemote | SyncMode::RemoteToLocal => Self::Diverged,
+		}
+	}
+
+	/// The resolutions that can clear a conflict held for this reason, in the order
+	/// [`KeepLocal`](ConflictResolution::KeepLocal), [`KeepRemote`](ConflictResolution::KeepRemote),
+	/// [`KeepBoth`](ConflictResolution::KeepBoth).
+	/// [`SyncEngine::resolve_conflict`](super::SyncEngine::resolve_conflict) refuses any other with
+	/// [`ResolutionRefused`](super::ResolutionRefused).
+	///
+	/// A backup mode never deletes on its destination, so only a resolution that empties the local
+	/// path clears its kind mismatch: one that leaves both items in place would have the next pass
+	/// hold the same conflict again.
+	pub fn resolutions(self) -> &'static [ConflictResolution] {
+		match self {
+			Self::Diverged => &[
+				ConflictResolution::KeepLocal,
+				ConflictResolution::KeepRemote,
+				ConflictResolution::KeepBoth,
+			],
+			// The local item is a file: keeping the remote moves it to the bin, keeping both renames
+			// it aside.
+			Self::RemoteKeepsDir | Self::LocalKeepsFile => {
+				&[ConflictResolution::KeepRemote, ConflictResolution::KeepBoth]
+			}
+			// The local item is a directory: only keeping both moves it off the path.
+			Self::RemoteKeepsFile | Self::LocalKeepsDir => &[ConflictResolution::KeepBoth],
 		}
 	}
 }
@@ -236,7 +271,8 @@ pub struct PlannedConflict {
 	pub local: Option<PlannedNodeKind>,
 	/// What the remote side holds, `None` when the remote deleted it.
 	pub remote: Option<PlannedNodeKind>,
-	/// Why the path is held, from the pair's mode and the two kinds above when it was reported.
+	/// Why the path is held, from the pair's mode and the two kinds above when it was reported;
+	/// which resolutions clear it is [`ConflictReason::resolutions`].
 	pub reason: ConflictReason,
 }
 
@@ -1027,6 +1063,46 @@ mod tests {
 			SyncMode::RemoteToLocal,
 		] {
 			assert_eq!(reasons_in(mode), [ConflictReason::Diverged; 4], "{mode:?}");
+		}
+	}
+
+	#[test]
+	fn every_resolution_clears_a_divergence() {
+		assert_eq!(
+			ConflictReason::Diverged.resolutions(),
+			[
+				ConflictResolution::KeepLocal,
+				ConflictResolution::KeepRemote,
+				ConflictResolution::KeepBoth,
+			]
+		);
+	}
+
+	#[test]
+	fn a_local_file_against_a_remote_directory_clears_by_moving_the_file_off_the_path() {
+		for reason in [
+			ConflictReason::RemoteKeepsDir,
+			ConflictReason::LocalKeepsFile,
+		] {
+			assert_eq!(
+				reason.resolutions(),
+				[ConflictResolution::KeepRemote, ConflictResolution::KeepBoth],
+				"{reason:?}"
+			);
+		}
+	}
+
+	#[test]
+	fn a_local_directory_against_a_remote_file_clears_only_by_keeping_both() {
+		for reason in [
+			ConflictReason::RemoteKeepsFile,
+			ConflictReason::LocalKeepsDir,
+		] {
+			assert_eq!(
+				reason.resolutions(),
+				[ConflictResolution::KeepBoth],
+				"{reason:?}"
+			);
 		}
 	}
 

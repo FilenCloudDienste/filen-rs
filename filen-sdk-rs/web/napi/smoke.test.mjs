@@ -346,7 +346,8 @@ describe("exports", () => {
 				"LocalRootContains",
 				"RemoteRootInUse",
 				"RemoteRootNested",
-				"RemoteRootContains"
+				"RemoteRootContains",
+				"ResolutionRefused"
 			])
 		)
 		assert.deepEqual(
@@ -378,6 +379,7 @@ describe("exports", () => {
 			"approveDeletions",
 			"cancelPausedActions",
 			"close",
+			"conflictResolutions",
 			"importLegacyState",
 			"lastReport",
 			"listConflicts",
@@ -887,6 +889,19 @@ describe("sync engine, offline", () => {
 		resumed = await pair()
 		assert.equal(resumed.paused, false)
 		assert.equal(resumed.pauseOptions, undefined)
+	})
+
+	test("list the resolutions that can clear a conflict held for each reason", () => {
+		assert.deepEqual(engine.conflictResolutions(ConflictReason.Diverged), [
+			ConflictResolution.KeepLocal,
+			ConflictResolution.KeepRemote,
+			ConflictResolution.KeepBoth
+		])
+		assert.deepEqual(engine.conflictResolutions(ConflictReason.RemoteKeepsDir), [
+			ConflictResolution.KeepRemote,
+			ConflictResolution.KeepBoth
+		])
+		assert.deepEqual(engine.conflictResolutions(ConflictReason.LocalKeepsDir), [ConflictResolution.KeepBoth])
 	})
 
 	test("conflicts and the last report start empty", async () => {

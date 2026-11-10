@@ -507,6 +507,27 @@ async fn an_overlapping_pair_reads_as_its_refusal() {
 }
 
 #[test]
+fn a_refused_resolution_reads_as_its_refusal() {
+	let error = Error::custom_with_source(
+		ErrorKind::InvalidState,
+		ResolutionRefused {
+			rel_path: "x".to_owned(),
+			resolution: ConflictResolution::KeepLocal,
+			reason: ConflictReason::RemoteKeepsFile,
+		},
+		None::<&str>,
+	);
+	assert_eq!(
+		sync_refusal(&error),
+		Some(SyncRefusal::ResolutionRefused {
+			rel_path: "x".to_owned(),
+			resolution: ConflictResolution::KeepLocal,
+			reason: ConflictReason::RemoteKeepsFile,
+		})
+	);
+}
+
+#[test]
 fn an_error_without_a_refusal_has_none() {
 	let error = Error::custom(ErrorKind::InvalidState, "unknown sync pair");
 	assert_eq!(sync_refusal(&error), None);

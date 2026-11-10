@@ -3475,12 +3475,11 @@ fn endable_streaks(
 
 /// Which side wins when a caller resolves a held conflict via [`SyncEngine::resolve_conflict`].
 ///
-/// In a backup mode, a conflict over an item the source replaced with one of the other kind comes
-/// back on the next pass after [`KeepLocal`](Self::KeepLocal), and after
-/// [`KeepRemote`](Self::KeepRemote) over a local directory, for as long as the kinds still differ:
-/// see [`SyncMode::LocalBackup`] and [`SyncMode::RemoteBackup`].
+/// Not every resolution can clear every conflict: [`ConflictReason::resolutions`] says which can,
+/// and [`SyncEngine::resolve_conflict`] refuses the others with [`ResolutionRefused`]; only a backup
+/// mode's kind mismatch narrows them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[js_type(import, no_ser, no_default, napi)]
+#[js_type(import, export, no_default, napi)]
 pub enum ConflictResolution {
 	/// The local copy wins: the next pass pushes it to the remote (or, if the conflict was a
 	/// local deletion, propagates that deletion).
@@ -3634,6 +3633,34 @@ pub struct BaselineSchemaMismatch {
 	pub found: i64,
 	/// The one schema version this build reads.
 	pub expected: i64,
+}
+
+/// Why [`SyncEngine::resolve_conflict`] refused a resolution: it cannot clear the conflict held at
+/// the path (see [`ConflictReason::resolutions`]). Nothing was changed on disk or in the baseline.
+///
+/// Carried as the source of the returned [`Error`], of kind [`ErrorKind::InvalidState`], so a
+/// caller can recover it with [`Error::downcast`].
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+	"{} cannot clear the conflict held at {rel_path:?}: {reason}",
+	resolution_phrase(*resolution)
+)]
+pub struct ResolutionRefused {
+	/// The path the conflict is held at.
+	pub rel_path: String,
+	/// The resolution that was asked for.
+	pub resolution: ConflictResolution,
+	/// Why the conflict is held, which rules the resolution out.
+	pub reason: ConflictReason,
+}
+
+/// `resolution` as the phrase [`ResolutionRefused`]'s message opens with.
+fn resolution_phrase(resolution: ConflictResolution) -> &'static str {
+	match resolution {
+		ConflictResolution::KeepLocal => "keeping the local version",
+		ConflictResolution::KeepRemote => "keeping the remote version",
+		ConflictResolution::KeepBoth => "keeping both versions",
+	}
 }
 
 /// An exclusive OS lock on `<db>-lock`, the file beside a baseline DB that keeps every other engine
@@ -4437,12 +4464,15 @@ impl SyncEngine {
 	/// NEXT pass: the baseline is re-anchored so the winner reads as the changed side and is
 	/// propagated normally, and the path (with its subtree) stops being held.
 	///
-	/// The exception is a backup mode's conflict over an item the source replaced with one of the
-	/// other kind: a backup mode never deletes on its destination, so a resolution that leaves both
-	/// items in place ([`KeepLocal`](ConflictResolution::KeepLocal) always,
+	/// A resolution that cannot clear the held conflict is refused, with a [`ResolutionRefused`]
+	/// and nothing changed on disk or in the baseline: a backup mode never deletes on its
+	/// destination, so where the two sides hold items of different kinds, a resolution that would
+	/// leave both in place ([`KeepLocal`](ConflictResolution::KeepLocal) always,
 	/// [`KeepRemote`](ConflictResolution::KeepRemote) over a local directory) has nothing to
-	/// propagate, and the next pass reports the same conflict again while the kinds still differ.
-	/// [`SyncMode::LocalBackup`] and [`SyncMode::RemoteBackup`] say which resolutions clear it.
+	/// propagate, and the next pass would hold the same conflict again.
+	/// [`ConflictReason::resolutions`] says which resolutions clear a conflict. The refusal reads the
+	/// two sides as the held row records them, which the last pass wrote; a side changed since is
+	/// seen once a pass has run.
 	///
 	/// [`KeepBoth`](ConflictResolution::KeepBoth) additionally renames the local copy aside to
 	/// `<stem>.old.<ext>` first, so that copy uploads as a new file instead of being overwritten.
@@ -4473,8 +4503,8 @@ impl SyncEngine {
 	/// [`removal`](Self::remove_pair) is under way is refused, as the other control verbs are, and
 	/// that removal waits for a resolution already running.
 	///
-	/// Errors if the pair is unknown, is being removed, or no conflict is currently held at
-	/// `rel_path`.
+	/// Errors if the pair is unknown, is being removed, no conflict is currently held at
+	/// `rel_path`, or `resolution` cannot clear it.
 	pub async fn resolve_conflict(
 		&self,
 		pair: PairId,
@@ -4508,6 +4538,23 @@ impl SyncEngine {
 				format!("no conflict is being held at {rel_path:?} for this pair"),
 			)
 		})?;
+		// Before anything is moved or written, so a refusal leaves everything as it was.
+		let reason = ConflictReason::of(
+			record.mode,
+			held.local_kind.map(PlannedNodeKind::from),
+			held.remote_kind.map(PlannedNodeKind::from),
+		);
+		if !reason.resolutions().contains(&resolution) {
+			return Err(Error::custom_with_source(
+				ErrorKind::InvalidState,
+				ResolutionRefused {
+					rel_path: rel_path.to_owned(),
+					resolution,
+					reason,
+				},
+				None::<&str>,
+			));
+		}
 
 		// A divergence this engine's own push created is resolved against the SERVER's version
 		// history rather than against what the remote holds now — our upload is what it holds.

@@ -37,7 +37,7 @@ use crate::{
 			RemoteNode,
 			test_support::{first_dir_deletion, folded},
 		},
-		scan::LocalNode,
+		scan::{LocalNode, QUARANTINE_DIR},
 		side::test_support::copied,
 	},
 };
@@ -5234,6 +5234,283 @@ async fn a_remote_backup_kind_mismatch_is_reported_with_its_reason_and_holds_its
 		},
 	)
 	.await;
+}
+
+/// Asks for `resolution` at the conflict [`kind_mismatch_held`] leaves in `mode` with the local side
+/// holding `local_kind`, and checks it is refused for `reason` with nothing changed: the row, both
+/// items and the held conflict are as they were, and nothing was renamed aside or binned.
+async fn assert_refused(
+	mode: SyncMode,
+	local_kind: PlannedNodeKind,
+	resolution: ConflictResolution,
+	reason: ConflictReason,
+) {
+	let (_dir, engine, pair, local, _cache) = kind_mismatch_held(mode, local_kind).await;
+	let store = engine.pair_store(pair).await.unwrap();
+	let row = locked(&store).entry(pair, "x").unwrap();
+	let conflicts = engine.list_conflicts(pair).await.unwrap();
+
+	let error = engine
+		.resolve_conflict(pair, "x", resolution)
+		.await
+		.unwrap_err();
+	assert_eq!(error.kind(), ErrorKind::InvalidState);
+	assert_eq!(
+		error.downcast_ref::<ResolutionRefused>(),
+		Some(&ResolutionRefused {
+			rel_path: "x".to_string(),
+			resolution,
+			reason,
+		})
+	);
+	assert_eq!(locked(&store).entry(pair, "x").unwrap(), row);
+	match local_kind {
+		PlannedNodeKind::File => {
+			assert_eq!(std::fs::read(local.join("x")).unwrap(), KIND_MISMATCH_FILE);
+		}
+		PlannedNodeKind::Dir => {
+			assert_eq!(
+				std::fs::read(local.join("x").join("new.txt")).unwrap(),
+				b"new"
+			);
+		}
+	}
+	assert!(!local.join("x.old").exists());
+	assert!(!local.join(QUARANTINE_DIR).exists());
+	assert_eq!(engine.list_conflicts(pair).await.unwrap(), conflicts);
+}
+
+#[tokio::test]
+async fn keeping_the_local_file_against_a_remote_backup_directory_is_refused() {
+	assert_refused(
+		SyncMode::LocalBackup,
+		PlannedNodeKind::File,
+		ConflictResolution::KeepLocal,
+		ConflictReason::RemoteKeepsDir,
+	)
+	.await;
+}
+
+#[tokio::test]
+async fn keeping_the_local_directory_against_a_remote_backup_file_is_refused() {
+	assert_refused(
+		SyncMode::LocalBackup,
+		PlannedNodeKind::Dir,
+		ConflictResolution::KeepLocal,
+		ConflictReason::RemoteKeepsFile,
+	)
+	.await;
+}
+
+#[tokio::test]
+async fn keeping_the_remote_backup_file_against_a_local_directory_is_refused() {
+	assert_refused(
+		SyncMode::LocalBackup,
+		PlannedNodeKind::Dir,
+		ConflictResolution::KeepRemote,
+		ConflictReason::RemoteKeepsFile,
+	)
+	.await;
+}
+
+#[tokio::test]
+async fn keeping_the_local_backup_file_against_a_remote_directory_is_refused() {
+	assert_refused(
+		SyncMode::RemoteBackup,
+		PlannedNodeKind::File,
+		ConflictResolution::KeepLocal,
+		ConflictReason::LocalKeepsFile,
+	)
+	.await;
+}
+
+#[tokio::test]
+async fn keeping_the_local_backup_directory_against_a_remote_file_is_refused() {
+	assert_refused(
+		SyncMode::RemoteBackup,
+		PlannedNodeKind::Dir,
+		ConflictResolution::KeepLocal,
+		ConflictReason::LocalKeepsDir,
+	)
+	.await;
+}
+
+#[tokio::test]
+async fn keeping_the_remote_file_against_a_local_backup_directory_is_refused() {
+	assert_refused(
+		SyncMode::RemoteBackup,
+		PlannedNodeKind::Dir,
+		ConflictResolution::KeepRemote,
+		ConflictReason::LocalKeepsDir,
+	)
+	.await;
+}
+
+/// Keeping the remote backup's directory bins the local file, and the backup then has nothing to
+/// do at the path.
+#[tokio::test]
+async fn keeping_the_remote_backup_directory_bins_the_local_file() {
+	let (_dir, engine, pair, local, _cache) =
+		kind_mismatch_held(SyncMode::LocalBackup, PlannedNodeKind::File).await;
+	let quarantined = engine
+		.resolve_conflict(pair, "x", ConflictResolution::KeepRemote)
+		.await
+		.unwrap()
+		.quarantined
+		.expect("the local file goes to the bin");
+	assert_eq!(std::fs::read(quarantined).unwrap(), KIND_MISMATCH_FILE);
+	assert!(!local.join("x").exists());
+	assert_eq!(planned(&engine, pair).await, []);
+	assert_eq!(engine.list_conflicts(pair).await.unwrap(), []);
+}
+
+/// Keeping both renames the local file aside, and the backup uploads it under that name beside the
+/// remote directory.
+#[tokio::test]
+async fn keeping_both_backs_the_local_file_up_beside_the_remote_directory() {
+	let (_dir, engine, pair, local, _cache) =
+		kind_mismatch_held(SyncMode::LocalBackup, PlannedNodeKind::File).await;
+	let resolved = engine
+		.resolve_conflict(pair, "x", ConflictResolution::KeepBoth)
+		.await
+		.unwrap();
+	assert_eq!(resolved.kept_as.as_deref(), Some("x.old"));
+	assert_eq!(
+		std::fs::read(local.join("x.old")).unwrap(),
+		KIND_MISMATCH_FILE
+	);
+	assert_eq!(
+		planned(&engine, pair).await,
+		[(PlannedActionKind::UploadFile, "x.old".to_string())]
+	);
+}
+
+/// Keeping both renames the local directory aside, and the backup creates it under that name beside
+/// the remote file, with what it holds.
+#[tokio::test]
+async fn keeping_both_backs_the_local_directory_up_beside_the_remote_file() {
+	let (_dir, engine, pair, _local, _cache) =
+		kind_mismatch_held(SyncMode::LocalBackup, PlannedNodeKind::Dir).await;
+	let resolved = engine
+		.resolve_conflict(pair, "x", ConflictResolution::KeepBoth)
+		.await
+		.unwrap();
+	assert_eq!(resolved.kept_as.as_deref(), Some("x.old"));
+	assert_eq!(
+		planned(&engine, pair).await,
+		[
+			(PlannedActionKind::CreateRemoteDir, "x.old".to_string()),
+			(PlannedActionKind::UploadFile, "x.old/new.txt".to_string()),
+		]
+	);
+}
+
+/// Keeping the remote directory bins the local backup's file, and the directory is then pulled.
+#[tokio::test]
+async fn keeping_the_remote_directory_bins_the_local_backup_file_and_pulls_the_directory() {
+	let (_dir, engine, pair, local, _cache) =
+		kind_mismatch_held(SyncMode::RemoteBackup, PlannedNodeKind::File).await;
+	let quarantined = engine
+		.resolve_conflict(pair, "x", ConflictResolution::KeepRemote)
+		.await
+		.unwrap()
+		.quarantined
+		.expect("the local file goes to the bin");
+	assert_eq!(std::fs::read(quarantined).unwrap(), KIND_MISMATCH_FILE);
+	assert!(!local.join("x").exists());
+	assert_eq!(
+		planned(&engine, pair).await,
+		[
+			(PlannedActionKind::CreateLocalDir, "x".to_string()),
+			(PlannedActionKind::DownloadFile, "x/a.txt".to_string()),
+		]
+	);
+}
+
+/// Keeping both renames the local backup's file aside, where it stays, and the remote directory is
+/// then pulled.
+#[tokio::test]
+async fn keeping_both_sets_the_local_backup_file_aside_and_pulls_the_directory() {
+	let (_dir, engine, pair, local, _cache) =
+		kind_mismatch_held(SyncMode::RemoteBackup, PlannedNodeKind::File).await;
+	let resolved = engine
+		.resolve_conflict(pair, "x", ConflictResolution::KeepBoth)
+		.await
+		.unwrap();
+	assert_eq!(resolved.kept_as.as_deref(), Some("x.old"));
+	assert_eq!(
+		std::fs::read(local.join("x.old")).unwrap(),
+		KIND_MISMATCH_FILE
+	);
+	assert_eq!(
+		planned(&engine, pair).await,
+		[
+			(PlannedActionKind::CreateLocalDir, "x".to_string()),
+			(PlannedActionKind::DownloadFile, "x/a.txt".to_string()),
+		]
+	);
+}
+
+/// Keeping both renames the local backup's directory aside, where it stays, and the remote file is
+/// then pulled.
+#[tokio::test]
+async fn keeping_both_sets_the_local_backup_directory_aside_and_pulls_the_file() {
+	let (_dir, engine, pair, local, _cache) =
+		kind_mismatch_held(SyncMode::RemoteBackup, PlannedNodeKind::Dir).await;
+	let resolved = engine
+		.resolve_conflict(pair, "x", ConflictResolution::KeepBoth)
+		.await
+		.unwrap();
+	assert_eq!(resolved.kept_as.as_deref(), Some("x.old"));
+	assert_eq!(
+		std::fs::read(local.join("x.old").join("new.txt")).unwrap(),
+		b"new"
+	);
+	assert_eq!(
+		planned(&engine, pair).await,
+		[(PlannedActionKind::DownloadFile, "x".to_string())]
+	);
+}
+
+/// Two-way deletes on either side, so even a resolution that keeps the local directory over the
+/// remote file clears the conflict: the next pass plans to trash the remote file and back the
+/// directory up in its place.
+#[tokio::test]
+async fn keeping_the_local_directory_in_two_way_clears_the_conflict() {
+	let (_dir, engine, pair, _local, _cache) =
+		kind_mismatch_held(SyncMode::TwoWay, PlannedNodeKind::Dir).await;
+	assert_eq!(
+		engine.list_conflicts(pair).await.unwrap()[0].reason,
+		ConflictReason::Diverged
+	);
+	engine
+		.resolve_conflict(pair, "x", ConflictResolution::KeepLocal)
+		.await
+		.unwrap();
+	let outcome = engine.plan_pair(pair).await.unwrap();
+	assert_eq!(outcome.conflicts, [], "{outcome:?}");
+	let kinds = |actions: Vec<PlannedAction>| {
+		actions
+			.into_iter()
+			.map(|action| (action.kind, action.rel_path))
+			.collect::<Vec<_>>()
+	};
+	assert_eq!(
+		kinds(outcome.actions),
+		[(PlannedActionKind::UploadFile, "x/new.txt".to_string())]
+	);
+	// The pair has not synced yet, so the guard holds the trash, and the create that replaces it.
+	assert_eq!(
+		outcome.held_reason,
+		Some(GuardReason::FirstSyncWithDeletions { deletions: 1 })
+	);
+	assert_eq!(
+		kinds(outcome.held),
+		[
+			(PlannedActionKind::TrashRemote, "x".to_string()),
+			(PlannedActionKind::CreateRemoteDir, "x".to_string()),
+		]
+	);
 }
 
 /// Keeping the local side before any further pass uploads the edit. The row it writes records no

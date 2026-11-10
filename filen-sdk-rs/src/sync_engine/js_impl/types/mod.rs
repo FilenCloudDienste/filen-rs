@@ -12,11 +12,12 @@ use crate::{
 	Error, ErrorKind,
 	job::millis,
 	sync_engine::{
-		BaselineInUse, BaselineSchemaMismatch, ConflictReason, ConflictResolved, DeleteGuard,
-		GuardReason, HaltReason, IgnoredPath, LocalScanProgress, PairId, PairOverlap, PairRecord,
-		PauseMode, PauseOptions, PlanOutcome, PlannedAction, PlannedActionKind, PlannedConflict,
-		RefuseReason, ScanGap, ScanGapCause, SyncEvent, SyncMode, SyncReport, TransferDirection,
-		UnsyncablePath, WatchConfig, WatchStatus,
+		BaselineInUse, BaselineSchemaMismatch, ConflictReason, ConflictResolution,
+		ConflictResolved, DeleteGuard, GuardReason, HaltReason, IgnoredPath, LocalScanProgress,
+		PairId, PairOverlap, PairRecord, PauseMode, PauseOptions, PlanOutcome, PlannedAction,
+		PlannedActionKind, PlannedConflict, RefuseReason, ResolutionRefused, ScanGap, ScanGapCause,
+		SyncEvent, SyncMode, SyncReport, TransferDirection, UnsyncablePath, WatchConfig,
+		WatchStatus,
 	},
 };
 
@@ -754,6 +755,13 @@ pub enum SyncRefusal {
 	RemoteRootNested { pair: u64, existing: Uuid },
 	/// The remote folder contains sync pair `pair`'s.
 	RemoteRootContains { pair: u64, existing: Uuid },
+	/// `resolution` cannot clear the conflict held at `rel_path`, which is held for `reason`;
+	/// nothing was changed. The engine's `conflictResolutions` lists the ones that can.
+	ResolutionRefused {
+		rel_path: String,
+		resolution: ConflictResolution,
+		reason: ConflictReason,
+	},
 }
 
 impl From<&BaselineInUse> for SyncRefusal {
@@ -770,6 +778,22 @@ impl From<&BaselineSchemaMismatch> for SyncRefusal {
 			path: mismatch.path.to_string_lossy().into_owned(),
 			found: mismatch.found,
 			expected: mismatch.expected,
+		}
+	}
+}
+
+impl From<&ResolutionRefused> for SyncRefusal {
+	fn from(
+		ResolutionRefused {
+			rel_path,
+			resolution,
+			reason,
+		}: &ResolutionRefused,
+	) -> Self {
+		Self::ResolutionRefused {
+			rel_path: rel_path.clone(),
+			resolution: *resolution,
+			reason: *reason,
 		}
 	}
 }
@@ -814,6 +838,9 @@ pub(crate) fn sync_refusal(error: &Error) -> Option<SyncRefusal> {
 	}
 	if let Some(mismatch) = error.downcast_ref::<BaselineSchemaMismatch>() {
 		return Some(mismatch.into());
+	}
+	if let Some(refused) = error.downcast_ref::<ResolutionRefused>() {
+		return Some(refused.into());
 	}
 	let overlap = error.downcast_ref::<PairOverlap>()?;
 	match SyncRefusal::try_from(overlap) {

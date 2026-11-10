@@ -1517,8 +1517,8 @@ fn adopt_if_baseline_stale(
 /// Reconciling that would delete the destination's item first — a directory with its whole subtree
 /// — and a backup mode never deletes on its destination, so the path is surfaced as a conflict
 /// instead, with nothing planned at it: the destination keeps its item, and the engine holds the
-/// path for the caller. While the two sides still hold items of different kinds there after a
-/// resolution, the next pass surfaces the path again.
+/// path for the caller. Only a resolution that empties the local path clears it
+/// ([`ConflictReason::resolutions`](super::ConflictReason::resolutions)).
 fn backup_kind_mismatch_conflict(rel_path: &str, actions: &mut Vec<SyncAction>) {
 	let action = SyncAction::Conflict {
 		rel_path: rel_path.to_string(),

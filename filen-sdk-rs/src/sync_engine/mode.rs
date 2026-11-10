@@ -27,17 +27,19 @@ pub enum SyncMode {
 	/// mode) met a remote that already held the other kind there.
 	///
 	/// No resolution makes this mode delete the remote item, so while the two sides still hold
-	/// items of different kinds there, [`KeepLocal`](super::ConflictResolution::KeepLocal) leaves
-	/// the conflict in place and the next pass reports it again. So does
+	/// items of different kinds there, [`KeepLocal`](super::ConflictResolution::KeepLocal) is
+	/// refused ([`ResolutionRefused`](super::ResolutionRefused), for
+	/// [`RemoteKeepsDir`](super::ConflictReason::RemoteKeepsDir) and
+	/// [`RemoteKeepsFile`](super::ConflictReason::RemoteKeepsFile)). So is
 	/// [`KeepRemote`](super::ConflictResolution::KeepRemote) over a local directory; over a local
 	/// file it moves that file to `.filen-sync-trash`, which leaves the remote item alone at the
 	/// path. [`KeepBoth`](super::ConflictResolution::KeepBoth) renames the local item aside to
 	/// `<stem>.old.<ext>`, which is backed up under that name. Otherwise the user renames or removes
 	/// either item, or gives one side the other's kind; once a pass has seen that, the conflict is an
 	/// ordinary one any resolution clears. Nothing under the path is backed up while it is held, new
-	/// files inside a local directory included. Switching the pair to
-	/// [`LocalToRemote`](Self::LocalToRemote) does not clear it either: the path stays held until it
-	/// is resolved, and only a resolution made after the switch replaces the remote item.
+	/// files inside a local directory included. Switching the pair to a mode that deletes on the
+	/// destination makes it a [`Diverged`](super::ConflictReason::Diverged) conflict any resolution
+	/// clears; it stays held until resolved.
 	LocalBackup,
 	/// Like [`RemoteToLocal`](Self::RemoteToLocal) but additive: remote changes are pulled down,
 	/// but a remote deletion is NOT mirrored — the local backup retains it. Nor does it replace the
@@ -47,17 +49,20 @@ pub enum SyncMode {
 	/// sync (or a switch to this mode) met a local tree that already held the other kind there.
 	///
 	/// No resolution makes this mode delete the local item, so while the two sides still hold items
-	/// of different kinds there, [`KeepLocal`](super::ConflictResolution::KeepLocal) leaves the
-	/// conflict in place and the next pass reports it again. So does
+	/// of different kinds there, [`KeepLocal`](super::ConflictResolution::KeepLocal) is refused
+	/// ([`ResolutionRefused`](super::ResolutionRefused), for
+	/// [`LocalKeepsDir`](super::ConflictReason::LocalKeepsDir) and
+	/// [`LocalKeepsFile`](super::ConflictReason::LocalKeepsFile)). So is
 	/// [`KeepRemote`](super::ConflictResolution::KeepRemote) over a local directory; over a local
 	/// file it moves that file to `.filen-sync-trash` and the remote item is then pulled.
 	/// [`KeepBoth`](super::ConflictResolution::KeepBoth) renames the local item aside to
 	/// `<stem>.old.<ext>`, where it stays, and the remote item is then pulled. Otherwise the user
 	/// renames or removes either item, or gives one side the other's kind; once a pass has seen
 	/// that, the conflict is an ordinary one any resolution clears. Nothing under the path is backed
-	/// up while it is held, new files inside a remote directory included. Switching the pair to
-	/// [`RemoteToLocal`](Self::RemoteToLocal) does not clear it either: the path stays held until it
-	/// is resolved, and only a resolution made after the switch replaces the local item.
+	/// up while it is held, new files inside a remote directory included. Switching the pair to a
+	/// mode that deletes on the destination makes it a
+	/// [`Diverged`](super::ConflictReason::Diverged) conflict any resolution clears; it stays held
+	/// until resolved.
 	RemoteBackup,
 }
 
