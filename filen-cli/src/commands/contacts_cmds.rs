@@ -262,8 +262,8 @@ fn contact_json(contact: &Contact<'_>) -> serde_json::Value {
 		"userId": contact.user_id,
 		"email": contact.email,
 		"nickName": contact.nick_name,
-		"lastActive": contact.last_active.to_rfc3339(),
-		"timestamp": contact.timestamp.to_rfc3339(),
+		"lastActive": contact.last_active,
+		"timestamp": contact.timestamp,
 	})
 }
 
@@ -290,7 +290,7 @@ fn blocked_json(blocked: &BlockedContact<'_>) -> serde_json::Value {
 		"userId": blocked.user_id,
 		"email": blocked.email,
 		"nickName": non_empty(&blocked.nick_name),
-		"timestamp": blocked.timestamp.to_rfc3339(),
+		"timestamp": blocked.timestamp,
 	})
 }
 
@@ -545,6 +545,38 @@ mod tests {
 				"nickName": null,
 			})
 		);
+	}
+
+	// The 2048-bit SubjectPublicKeyInfo, base64, that filen-types' `serde::rsa` tests and the
+	// SDK's crypto known-answer tests parse; rsa refuses keys under 1024 bits.
+	const PUBLIC_KEY_SPKI: &str = "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAvg+AOhimAL4YHrPu9rqEZC2MUcT7vKWXWlGGyd2dtXhF6reeJvendCiPixh/pDXM+gFWHiwfcyF8DuKl954hvX2TZCA3+ipgrU02BV7yndT/yjwzy7SdfN1qQt2P6fLeRQ4FKSnENouFrDAuxG05Z02i151MZWArbTNFSfDwlicvq1+kqYv5D28M7tH7lwB0qh6SXCLloE5m1480U3elVkDwwlqaxyFiDg1uvaWnIfB3J3dHXuckq2W34Nmyl3HRvvY9ymXFFmi+D/LF0PyAR+Y8srkvWc2KgAR8brQuzzaXwwjy0PJ3U8fGOemIhOYzHYZl+p5QKmKOxvoWIVzWKwIDAQAB";
+
+	#[test]
+	fn contact_and_block_json_dates_are_utc_with_z() {
+		let contact: Contact<'_> = serde_json::from_value(json!({
+			"uuid": A.to_string(),
+			"userId": 7,
+			"email": "alice@example.com",
+			"avatar": null,
+			"nickName": "",
+			"lastActive": 1_700_000_000,
+			"timestamp": 1_700_000_000,
+			"publicKey": PUBLIC_KEY_SPKI,
+		}))
+		.unwrap();
+		let json = contact_json(&contact);
+		assert_eq!(json["lastActive"], "2023-11-14T22:13:20Z");
+		assert_eq!(json["timestamp"], "2023-11-14T22:13:20Z");
+		let blocked: BlockedContact<'_> = serde_json::from_value(json!({
+			"uuid": B.to_string(),
+			"userId": 8,
+			"email": "bob@example.com",
+			"avatar": null,
+			"nickName": "",
+			"timestamp": 1_700_000_000,
+		}))
+		.unwrap();
+		assert_eq!(blocked_json(&blocked)["timestamp"], "2023-11-14T22:13:20Z");
 	}
 
 	fn parsed(args: &[&str]) -> Result<ContactsCommands, clap::error::ErrorKind> {
