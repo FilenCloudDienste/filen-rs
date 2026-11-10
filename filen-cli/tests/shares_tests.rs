@@ -89,15 +89,24 @@ async fn out_shares_of(
 }
 
 /// How long the server may go on listing a share after it answered its removal. Its share
-/// listings catch up with a removal only shortly after it: a listing sent right after one still
-/// held the removed share in about half of the tries, for up to about 160 ms.
-const SHARE_REMOVAL_SETTLE: Duration = Duration::from_secs(10);
+/// listings lag behind a removal by a variable amount: a listing sent right after one still held
+/// the removed share in about half of the tries, for up to about 160 ms, and a full live run saw
+/// the shares listed for more than 10 s. A share still listed after a minute is taken as the
+/// removal not having happened.
+const SHARE_REMOVAL_SETTLE: Duration = Duration::from_secs(60);
+
+/// The longest pause between two looks at the share listings in [`wait_until_unshared`], which
+/// starts at 100 ms, to catch the usual lag of a fraction of a second, and doubles up to this, so
+/// a slow minute sends a few dozen listings rather than hundreds.
+const SHARE_REMOVAL_MAX_POLL: Duration = Duration::from_secs(2);
 
 /// Waits until neither what `client` shared nor what `share_client` was shared lists an item in
 /// `uuids`, once their shares were removed, and fails when they are still listed after
 /// [`SHARE_REMOVAL_SETTLE`].
 async fn wait_until_unshared(client: &Client, share_client: &Client, uuids: &[Uuid]) {
-	let deadline = tokio::time::Instant::now() + SHARE_REMOVAL_SETTLE;
+	let start = tokio::time::Instant::now();
+	let deadline = start + SHARE_REMOVAL_SETTLE;
+	let mut pause = Duration::from_millis(100);
 	loop {
 		let (out_dirs, out_files) = out_shares_of(client, uuids).await;
 		let (in_dirs, in_files) = share_client
@@ -111,15 +120,18 @@ async fn wait_until_unshared(client: &Client, share_client: &Client, uuids: &[Uu
 			.filter(|uuid| uuids.contains(uuid))
 			.count();
 		if out_dirs.is_empty() && out_files.is_empty() && still_in == 0 {
+			eprintln!("share removal showed after {:.1?}", start.elapsed());
 			return;
 		}
 		assert!(
 			tokio::time::Instant::now() < deadline,
-			"{} out-shares and {still_in} in-shares of {uuids:?} still listed {SHARE_REMOVAL_SETTLE:?} \
-			 after their removal",
-			out_dirs.len() + out_files.len()
+			"{} out-shares and {still_in} in-shares of {uuids:?} still listed {:.1?} after their \
+			 removal (budget {SHARE_REMOVAL_SETTLE:?})",
+			out_dirs.len() + out_files.len(),
+			start.elapsed()
 		);
-		tokio::time::sleep(Duration::from_millis(100)).await;
+		tokio::time::sleep(pause).await;
+		pause = (pause * 2).min(SHARE_REMOVAL_MAX_POLL);
 	}
 }
 
