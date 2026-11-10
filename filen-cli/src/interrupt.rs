@@ -2,7 +2,9 @@
 //!
 //! On Unix, SIGTERM and SIGHUP (`docker stop`, a closed terminal) reach the same handler and act
 //! as Ctrl-C does: the first cancels or stops the running command, a further one quits the CLI.
-//! Below, Ctrl-C stands for any of them.
+//! Below, Ctrl-C stands for any of them. The handler cannot tell them apart; a command that passes
+//! the stop on to a child process, as `filen rclone` does, learns which it was from
+//! [`own_signals`].
 //!
 //! Installing the handler replaces an inherited ignore of SIGHUP, so under `nohup` a closed
 //! terminal stops the command as well; `setsid` or a service manager keeps it running instead.
@@ -25,6 +27,8 @@ use std::{
 	sync::{LazyLock, Mutex, PoisonError},
 };
 
+#[cfg(unix)]
+use tokio::signal::unix::{self, SignalKind};
 use tokio::sync::broadcast::{
 	self,
 	error::{RecvError, TryRecvError},
@@ -39,6 +43,9 @@ use crate::{
 /// one a shell reports for a process that SIGINT ended. It is the same after each of them, as the
 /// handler cannot tell them apart.
 pub(crate) const EXIT_INTERRUPTED: i32 = 130;
+
+/// Said once a command stops after Ctrl-C, when a further one quits.
+pub(crate) const PRESS_AGAIN_TO_QUIT: &str = "Press Ctrl-C again to quit.";
 
 /// Sends each Ctrl-C to the commands waiting for one. Ctrl-C is pressed far less often than the
 /// receivers read, so a few slots are plenty.
@@ -394,7 +401,7 @@ impl Owning {
 	/// Lets a further Ctrl-C quit the CLI while the command stops after one, rather than wait for
 	/// it, until the returned [`Stopping`] is dropped, and says so.
 	pub(crate) fn into_stopping(self, ui: &mut UI) -> Stopping {
-		ui.print_muted_to_stderr("Press Ctrl-C again to quit.");
+		ui.print_muted_to_stderr(PRESS_AGAIN_TO_QUIT);
 		lock_state().stopping += 1;
 		// `self` is dropped after this, so the command counts as stopping before it no longer
 		// counts as handling Ctrl-C.
@@ -406,6 +413,84 @@ impl Drop for Owning {
 	fn drop(&mut self) {
 		let mut state = lock_state();
 		state.owning = state.owning.saturating_sub(1);
+	}
+}
+
+/// Which signal a press was, for a command that passes the stop on to a child process. On Windows
+/// every press is [`PressSignal::Interrupt`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PressSignal {
+	/// Ctrl-C, or SIGINT.
+	Interrupt,
+	/// SIGTERM.
+	Terminate,
+	/// SIGHUP.
+	Hangup,
+}
+
+/// Held while a command handles Ctrl-C itself and needs to know which signal each press was: see
+/// [`SignalPresses::next`]. It handles every press itself, the second one included: none quits
+/// the CLI while it is held.
+pub(crate) struct SignalPresses {
+	/// Keeps the command counted as handling Ctrl-C, so a press does not cancel it. Its presses are
+	/// not read on Unix, where the streams below tell which signal each was.
+	#[cfg(unix)]
+	_owning: Owning,
+	/// As on Unix, and it gives the presses.
+	#[cfg(not(unix))]
+	owning: Owning,
+	#[cfg(unix)]
+	interrupt: unix::Signal,
+	#[cfg(unix)]
+	terminate: unix::Signal,
+	#[cfg(unix)]
+	hangup: unix::Signal,
+}
+
+/// Has the running command handle Ctrl-C itself, as [`own`] does, and tells it which signal each
+/// press was. The streams are registered first: they chain to the handler [`install`] set, which
+/// still sees every press, and a press between the two cancels the command as before rather than
+/// go unseen.
+pub(crate) fn own_signals() -> std::io::Result<SignalPresses> {
+	#[cfg(unix)]
+	let (interrupt, terminate, hangup) = (
+		unix::signal(SignalKind::interrupt())?,
+		unix::signal(SignalKind::terminate())?,
+		unix::signal(SignalKind::hangup())?,
+	);
+	Ok(SignalPresses {
+		#[cfg(unix)]
+		_owning: own(),
+		#[cfg(not(unix))]
+		owning: own(),
+		#[cfg(unix)]
+		interrupt,
+		#[cfg(unix)]
+		terminate,
+		#[cfg(unix)]
+		hangup,
+	})
+}
+
+impl SignalPresses {
+	/// Waits for the next press. On Unix that is whichever signal arrives, and two quick presses
+	/// of one signal may be seen as one. A closed stdout, which [`Owning::pressed`] would also
+	/// return for, is not a press here: the child process holds stdout, so the CLI writes nothing
+	/// to it while this is held.
+	pub(crate) async fn next(&mut self) -> PressSignal {
+		#[cfg(unix)]
+		{
+			tokio::select! {
+				_ = self.interrupt.recv() => PressSignal::Interrupt,
+				_ = self.terminate.recv() => PressSignal::Terminate,
+				_ = self.hangup.recv() => PressSignal::Hangup,
+			}
+		}
+		#[cfg(not(unix))]
+		{
+			self.owning.pressed().await;
+			PressSignal::Interrupt
+		}
 	}
 }
 

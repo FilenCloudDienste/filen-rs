@@ -91,6 +91,7 @@ Breaking changes are marked **Breaking**: scripts that depend on the old behavio
 - `mount` on macOS works without macFUSE, through Rclone's NFS mount
 - `filen webdav`, `filen s3` and `filen webdav-proxy`, the older CLI's commands, say what replaced them and exit with 2
 - with `--json`, Rclone notices go to stderr
+- an interrupted `filen rclone` (Ctrl-C, SIGTERM or SIGHUP) asks Rclone to stop and gives it up to 30 seconds, so a mount it runs is unmounted and partial files are removed, and exits with Rclone's exit code; a second one kills Rclone at once. Under systemd, use `KillMode=mixed`
 
 #### Shell, logs and updates
 
@@ -98,7 +99,7 @@ Breaking changes are marked **Breaking**: scripts that depend on the old behavio
 - the log files are created readable by their owner only, keep printed output, prompt answers and secrets out, start `latest.log` empty, expire moved-aside files and cap their total size; the CLI runs on when they cannot be written
 - commands piped into the CLI run one line at a time; Ctrl-D at an empty prompt leaves the REPL, Ctrl-C clears the typed line, and a malformed line no longer ends the REPL
 - Esc at an empty REPL prompt leaves the REPL
-- every command can be interrupted with Ctrl-C, SIGTERM or SIGHUP (exit code 130); a second one quits while `mount`, `serve` or `sync` stops
+- every command can be interrupted with Ctrl-C, SIGTERM or SIGHUP (exit code 130; `filen rclone` exits with Rclone's own exit code instead); a second one quits while `mount`, `serve` or `sync` stops
 - `cd` is refused outside the REPL
 - REPL tab completion works on quoted paths and paths with escaped spaces, and quotes what it completes; on Windows, only double quotes group words and backslashes are kept, as in paths
 - `view-html-docs` stops on one Ctrl-C, loads no fonts from elsewhere, and listens on a port the system picks, so another program cannot take it first

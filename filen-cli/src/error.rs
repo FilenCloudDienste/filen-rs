@@ -7,7 +7,7 @@
 //!   while the command was writing a file's content to stdout (`cat`, `head`, `tail`,
 //!   `download <file> -`), where the reader did not get all of it: `1`,
 //! - `130` when Ctrl-C, SIGTERM or SIGHUP cancelled the command or quit the CLI,
-//! - the exit code of Rclone when `filen rclone ...` failed in Rclone, or 128 plus the signal when a signal ended it.
+//! - the exit code of Rclone when `filen rclone ...` failed or was interrupted (usually 130 after Ctrl-C and 143 after SIGTERM, though Rclone may exit with 0 when it stops cleanly), or 128 plus the signal when a signal ended it.
 
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;

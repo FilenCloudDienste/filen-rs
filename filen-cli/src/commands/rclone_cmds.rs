@@ -19,6 +19,15 @@
 //! `rclone` (`filen -v rclone ls filen:`), except `--rclone-binary <path>`, which goes right after
 //! it.
 //!
+//! If the CLI is interrupted (Ctrl-C, SIGTERM or SIGHUP), Rclone gets up to 30 seconds to stop,
+//! unmounting and removing partial files, before it is killed; a second one kills it at once. The
+//! CLI exits with Rclone's exit code. Uploads still in a mount's cache are not waited for: they stay
+//! in the cache. Under systemd, set `KillMode=mixed`: by default systemd also signals Rclone, which
+//! then gets a second signal and stops without unmounting. Start an Rclone command that reads
+//! the terminal (`rclone config`, `-i`, `ncdu`) in the foreground, not as a background job (`&`)
+//! brought to the foreground later: Rclone stays in the background then, and stops when it
+//! reads.
+//!
 //! A mount or server run this way lacks two things `mount` and `serve` do: when it stops, nothing
 //! gives the uploads still in its cache up to 30 seconds to finish, and nothing checks that the
 //! server refuses requests without credentials, so give it `--user` and `--pass` (or the protocol's
@@ -80,7 +89,7 @@ use filen_sdk_rs::{
 	rclone::{
 		FuseProvider, MountInfo, MountOptions, RcloneBinary, RcloneDaemon, RcloneDaemonConfig,
 		RcloneExit, RcloneRefusal, RcloneStats, ServeAuth, ServeOptions, ServeProtocol, ServeTls,
-		StopOptions, VfsTuning, available_drive_letters, clear_cache, run_rclone,
+		StopCause, StopOptions, VfsTuning, available_drive_letters, clear_cache, run_rclone,
 	},
 };
 use serde_json::{Value, json};
@@ -104,6 +113,10 @@ use crate::{
 #[derive(Debug, Subcommand)]
 pub(crate) enum RcloneCommands {
 	/// Execute an Rclone command using the managed installation
+	///
+	/// If the CLI is interrupted (Ctrl-C, SIGTERM or SIGHUP), Rclone gets up to 30 seconds to stop,
+	/// unmounting and removing partial files, before it is killed; a second one kills it at once.
+	/// The CLI exits with Rclone's exit code.
 	Rclone {
 		#[command(flatten)]
 		binary: RcloneBinaryArg,
@@ -438,6 +451,9 @@ const STOP: StopOptions = StopOptions {
 	drain_timeout_ms: Some(30_000),
 	grace_ms: 10_000,
 };
+
+/// How long `filen rclone` gives Rclone to exit after Ctrl-C, SIGTERM or SIGHUP before killing it.
+const RCLONE_STOP_GRACE: Duration = Duration::from_secs(30);
 
 /// How often the status line of a running mount or server is redrawn.
 const STATUS_INTERVAL: Duration = Duration::from_secs(2);
@@ -977,17 +993,58 @@ pub(crate) async fn execute_rclone(
 	binary: &RcloneBinaryArg,
 	cmd: Vec<String>,
 ) -> Result<()> {
+	// a Ctrl-C while the managed rclone downloads or the CLI logs in still cancels the command
 	let binary = prepare_binary(config, ui, binary).await;
 	let client = client.get(ui).await?;
-	let status = run_rclone(client, &binary, &cmd)
-		.await
-		.context("Failed to run Rclone")?
-		.wait()
-		.await
-		.context("Failed to run Rclone")?;
+	let mut presses = interrupt::own_signals().context("Failed to watch for Ctrl-C")?;
+	// So does one before Rclone has started: dropping `run_rclone` kills `rclone obscure`, or the
+	// Rclone it just started, which has set nothing up yet. Held until Rclone runs, it would fail
+	// the command through a killed `rclone obscure`, or wait out the grace for an Rclone that
+	// started after the terminal's Ctrl-C and never got it.
+	let mut rclone = select! {
+		rclone = run_rclone(client, &binary, &cmd) => rclone.context("Failed to run Rclone")?,
+		_ = presses.next() => return Err(CliError::Interrupted.into()),
+	};
+	let status = select! {
+		status = rclone.wait() => status.context("Failed to run Rclone")?,
+		signal = presses.next() => {
+			// stderr: Rclone's output is on stdout
+			if !ui.is_quiet() {
+				ui.print_muted_to_stderr(&format!(
+					"Stopping Rclone, giving it up to {} seconds to exit...",
+					RCLONE_STOP_GRACE.as_secs()
+				));
+				// Only to someone at a terminal: a service manager follows its SIGTERM with a
+				// SIGKILL, not a Ctrl-C.
+				if signal == interrupt::PressSignal::Interrupt {
+					ui.print_muted_to_stderr(interrupt::PRESS_AGAIN_TO_QUIT);
+				}
+			}
+			// Not `Owning::into_stopping`: its second Ctrl-C quits with `process::exit`, which
+			// runs no destructor, so Rclone would outlive the CLI.
+			select! {
+				status = rclone.stop(stop_cause(signal), RCLONE_STOP_GRACE) => {
+					status.context("Failed to stop Rclone")?
+				}
+				_ = presses.next() => {
+					rclone.kill().context("Failed to kill Rclone")?;
+					rclone.wait().await.context("Failed to run Rclone")?;
+					return Err(CliError::Interrupted.into());
+				}
+			}
+		}
+	};
 	match error::exit_code_of(status) {
 		0 => Ok(()),
 		code => Err(CliError::ChildExit(code).into()),
+	}
+}
+
+/// Why `filen rclone` stops Rclone: a SIGINT may have reached Rclone from the terminal too.
+fn stop_cause(signal: interrupt::PressSignal) -> StopCause {
+	match signal {
+		interrupt::PressSignal::Interrupt => StopCause::Interrupt,
+		interrupt::PressSignal::Terminate | interrupt::PressSignal::Hangup => StopCause::Terminate,
 	}
 }
 
@@ -1581,6 +1638,22 @@ mod tests {
 		parse_args,
 		ui::test_support::Printed,
 	};
+
+	#[test]
+	fn only_a_sigint_is_taken_for_one_the_terminal_sent_rclone_too() {
+		assert_eq!(
+			stop_cause(interrupt::PressSignal::Interrupt),
+			StopCause::Interrupt
+		);
+		assert_eq!(
+			stop_cause(interrupt::PressSignal::Terminate),
+			StopCause::Terminate
+		);
+		assert_eq!(
+			stop_cause(interrupt::PressSignal::Hangup),
+			StopCause::Terminate
+		);
+	}
 
 	/// The protocol of `filen serve <server_type>`.
 	fn parsed_protocol(server_type: &str) -> Result<ServeProtocol, clap::Error> {
