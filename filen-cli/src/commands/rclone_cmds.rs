@@ -1532,7 +1532,9 @@ fn serve_auth(
 	}
 }
 
-/// A size such as `500Mi` or `10Gi` (`10G` is the same, binary), or bytes without a suffix.
+/// A size such as `500Mi` or `10Gi`, in one of the forms `n` or `nB` (bytes) and `nU`, `nUi`,
+/// `nUB` or `nUiB`, where the unit `U` is `K` (or `k`), `M`, `G` or `T`. Every unit is binary:
+/// `10G`, `10Gi`, `10GB` and `10GiB` are all 10 GiB.
 pub(crate) fn parse_size(size: &str) -> Result<u64, String> {
 	let not_a_size = || format!("{size} is not a size such as 500Mi or 10Gi");
 	let digits = size
@@ -1540,13 +1542,22 @@ pub(crate) fn parse_size(size: &str) -> Result<u64, String> {
 		.unwrap_or(size.len());
 	let (number, suffix) = size.split_at(digits);
 	let number: u64 = number.parse().map_err(|_| not_a_size())?;
-	let shift = match suffix.trim_end_matches('B').trim_end_matches('i') {
-		"" => 0,
-		"K" | "k" => 10,
-		"M" => 20,
-		"G" => 30,
-		"T" => 40,
-		_ => return Err(not_a_size()),
+	let shift = match suffix {
+		"" | "B" => 0,
+		_ => {
+			let unit = suffix
+				.strip_suffix("iB")
+				.or_else(|| suffix.strip_suffix('i'))
+				.or_else(|| suffix.strip_suffix('B'))
+				.unwrap_or(suffix);
+			match unit {
+				"K" | "k" => 10,
+				"M" => 20,
+				"G" => 30,
+				"T" => 40,
+				_ => return Err(not_a_size()),
+			}
+		}
 	};
 	number
 		.checked_mul(1 << shift)
@@ -2366,6 +2377,19 @@ mod tests {
 		assert!(parse_size("ten").is_err());
 		assert!(parse_size("10X").is_err());
 		assert!(parse_size("20000000T").is_err());
+	}
+
+	#[test]
+	fn malformed_size_suffixes_are_refused() {
+		for size in ["10iB", "10i", "10BB", "10MBB", "10Mii", "10KiBB"] {
+			assert_eq!(
+				parse_size(size),
+				Err(format!("{size} is not a size such as 500Mi or 10Gi")),
+			);
+		}
+		assert_eq!(parse_size("10KB"), Ok(10 << 10));
+		assert_eq!(parse_size("10kiB"), Ok(10 << 10));
+		assert_eq!(parse_size("10B"), Ok(10));
 	}
 
 	#[test]

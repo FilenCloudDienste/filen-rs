@@ -188,6 +188,7 @@ Breaking changes are marked **Breaking**: scripts that depend on the old behavio
 - `export-notes` replaces control characters in note titles and prefixes `_` to titles Windows reserves for a device, such as `CON`, `NUL`, `COM0` or `LPT¹`, also with spaces before the extension
 - `filen rclone` exits with 128 plus the signal when a signal ended Rclone, instead of 0
 - a terminal error while reading a text or password prompt is a `terminal_input` failure, not an unexpected one with a link to report a bug
+- `mount` and `serve --cache-size` accept only `n`, `nB` and `nU`, `nUi`, `nUB` or `nUiB` with a unit `K`, `M`, `G` or `T`, and refuse a malformed suffix such as `10iB` (read as 10 bytes) or `10MBB` (read as 10 MiB)
 - a failed write to stdout, as on a full disk, ends the command with a message and exit code 1 instead of a crash; in the REPL it fails only that command
 
 ### Security
