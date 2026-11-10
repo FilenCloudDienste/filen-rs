@@ -179,6 +179,7 @@ Breaking changes are marked **Breaking**: scripts that depend on the old behavio
 - `cp` no longer silently replaces or merges into an item of the same name
 - a directory download no longer counts a local file it kept as downloaded, and its progress reaches 100%
 - `cat` of a large file no longer asks when no one can answer
+- `head` and `tail` no longer ask before printing from a large file
 - viewing a file public link no longer replaces it
 - `logout` offers to delete a keyring entry the keyring cannot decode, so it can be removed, and exits with an error naming both causes when it can neither read nor delete it, instead of reporting nothing deleted
 - `export-notes` replaces control characters in note titles and prefixes `_` to titles Windows reserves for a device, such as `CON`, `NUL`, `COM0` or `LPT¹`, also with spaces before the extension

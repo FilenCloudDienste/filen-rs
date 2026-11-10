@@ -876,10 +876,11 @@ pub(crate) enum PrintFileLines {
 	Tail(usize),
 }
 
-/// The largest file, in bytes, that is printed to a terminal without asking first.
+/// The largest file, in bytes, that `cat` prints to a terminal without asking first. `head` and
+/// `tail` never ask, as they print only some of a file's lines.
 const PRINT_WITHOUT_ASKING_MAX_SIZE: u64 = 8 * 1024;
 
-/// Whether to print a file of `size` bytes: a larger one than
+/// Whether `cat` prints files of `size` bytes in all: more than
 /// [`PRINT_WITHOUT_ASKING_MAX_SIZE`] only after asking, and only when a person reads the output.
 /// Output piped into another program or printed as JSON was asked for as it is.
 fn confirm_printing_file(ui: &mut UI, size: u64) -> Result<bool> {
@@ -965,9 +966,6 @@ pub(crate) async fn print_file(
 	let operand = ItemOperand::parse(working_path, file_str)?;
 	let client = client.get(ui).await?;
 	let file = find_file(client, &operand).await?;
-	if !confirm_printing_file(ui, file.size())? {
-		return Ok(());
-	}
 	let mut out = PrintedContent::of(ui);
 	match lines {
 		// nothing to download
