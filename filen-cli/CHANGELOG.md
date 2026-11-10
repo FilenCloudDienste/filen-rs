@@ -93,10 +93,11 @@ Breaking changes are marked **Breaking**: scripts that depend on the old behavio
 
 #### Shell, logs and updates
 
+- **Breaking:** under `nohup`, closing the terminal now stops the command, as SIGHUP interrupts it like Ctrl-C; run it with `setsid` or under a service manager to keep it running
 - the log files are created readable by their owner only, keep printed output, prompt answers and secrets out, start `latest.log` empty, expire moved-aside files and cap their total size; the CLI runs on when they cannot be written
 - commands piped into the CLI run one line at a time; Ctrl-D at an empty prompt leaves the REPL, Ctrl-C clears the typed line, and a malformed line no longer ends the REPL
 - Esc at an empty REPL prompt leaves the REPL
-- every command can be interrupted with Ctrl-C; a second Ctrl-C quits while `mount`, `serve` or `sync` stops
+- every command can be interrupted with Ctrl-C, SIGTERM or SIGHUP (exit code 130); a second one quits while `mount`, `serve` or `sync` stops
 - `cd` is refused outside the REPL
 - REPL tab completion works on quoted paths and paths with escaped spaces, and quotes what it completes
 - `view-html-docs` stops on one Ctrl-C and loads no fonts from elsewhere
@@ -184,6 +185,7 @@ Breaking changes are marked **Breaking**: scripts that depend on the old behavio
 - `logout` offers to delete a keyring entry the keyring cannot decode, so it can be removed, and exits with an error naming both causes when it can neither read nor delete it, instead of reporting nothing deleted
 - `export-notes` replaces control characters in note titles and prefixes `_` to titles Windows reserves for a device, such as `CON`, `NUL`, `COM0` or `LPT¹`, also with spaces before the extension
 - `filen rclone` exits with 128 plus the signal when a signal ended Rclone, instead of 0
+- a failed write to stdout, as on a full disk, ends the command with a message and exit code 1 instead of a crash; in the REPL it fails only that command
 
 ### Security
 

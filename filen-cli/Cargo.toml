@@ -84,7 +84,7 @@ strum = { version = "0.28.0", features = ["derive"] }
 # pinned to the commit of its async-autocomplete branch that Cargo.lock had resolved
 inquire = { git = "https://github.com/JupiterPi/inquire.git", rev = "d8810e58076f7726fc7a30249f6ee0debe7ad4ce" }
 console = "0.16.4"
-ctrlc = "3.5.2"
+ctrlc = { version = "3.5.2", features = ["termination"] }
 futures = "0.3.34"
 # expands the wildcards of upload sources where no shell does (Windows, the REPL, piped commands)
 globset = { version = "0.4.18", default-features = false }

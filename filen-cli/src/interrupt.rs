@@ -1,5 +1,13 @@
 //! Ctrl-C, through one handler installed when the CLI starts.
 //!
+//! On Unix, SIGTERM and SIGHUP (`docker stop`, a closed terminal) reach the same handler and act
+//! as Ctrl-C does: the first cancels or stops the running command, a further one quits the CLI.
+//! Below, Ctrl-C stands for any of them.
+//!
+//! Installing the handler replaces an inherited ignore of SIGHUP, so under `nohup` a closed
+//! terminal stops the command as well; `setsid` or a service manager keeps it running instead.
+//! Keeping the ignore would take reading the signal's disposition first, which is unsafe code.
+//!
 //! While no command runs, Ctrl-C quits the CLI, as it would without a handler. While one runs,
 //! Ctrl-C cancels it ([`catch`]), unless the command handles Ctrl-C itself ([`own`]), as a
 //! transfer, `mount`, `serve` and `sync` do to stop cleanly. A further Ctrl-C while a cancelled
@@ -27,8 +35,9 @@ use crate::{
 	ui::UI,
 };
 
-/// The exit code of the CLI when Ctrl-C quit it or cancelled its command, the one a shell
-/// reports for a process that SIGINT ended.
+/// The exit code of the CLI when Ctrl-C, SIGTERM or SIGHUP quit it or cancelled its command, the
+/// one a shell reports for a process that SIGINT ended. It is the same after each of them, as the
+/// handler cannot tell them apart.
 pub(crate) const EXIT_INTERRUPTED: i32 = 130;
 
 /// Sends each Ctrl-C to the commands waiting for one. Ctrl-C is pressed far less often than the
@@ -40,6 +49,7 @@ static STATE: Mutex<State> = Mutex::new(State {
 	owning: 0,
 	stopping: 0,
 	cancelling: false,
+	presses: 0,
 	stdout_closed: false,
 	streaming_data: 0,
 	data_cut_short: false,
@@ -53,6 +63,27 @@ pub(crate) fn install() -> Result<(), ctrlc::Error> {
 /// What the handler does on Ctrl-C.
 fn on_ctrl_c() {
 	act(lock_state().press());
+}
+
+/// The number of Ctrl-C presses so far, taken by [`press_count`] to tell later whether one came in
+/// between ([`PressCount::pressed_since`]), as while one command of the REPL ran.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct PressCount(u64);
+
+/// Counts the Ctrl-C presses so far: see [`PressCount`].
+pub(crate) fn press_count() -> PressCount {
+	lock_state().press_count()
+}
+
+impl PressCount {
+	/// Whether Ctrl-C was pressed since this count was taken.
+	pub(crate) fn pressed_since(self) -> bool {
+		self.pressed_before(&lock_state())
+	}
+
+	fn pressed_before(self, state: &State) -> bool {
+		state.presses != self.0
+	}
 }
 
 /// Ends the running command, or the CLI if none runs, as Ctrl-C does, after a write to stdout
@@ -129,6 +160,8 @@ struct State {
 	stopping: usize,
 	/// Whether a Ctrl-C has cancelled a command that has not ended yet.
 	cancelling: bool,
+	/// How many times Ctrl-C was pressed since the CLI started.
+	presses: u64,
 	/// Whether stdout was closed.
 	stdout_closed: bool,
 	/// How many commands are writing a file's content to stdout.
@@ -155,6 +188,7 @@ struct Press {
 
 impl State {
 	fn press(&mut self) -> Action {
+		self.presses = self.presses.saturating_add(1);
 		if self.catching == 0 || self.cancelling || self.stopping > 0 {
 			return Action::Quit(EXIT_INTERRUPTED);
 		}
@@ -171,6 +205,10 @@ impl State {
 			return Action::Quit(self.closed_stdout_exit_code());
 		}
 		self.end_running_command()
+	}
+
+	fn press_count(&self) -> PressCount {
+		PressCount(self.presses)
 	}
 
 	fn closed_stdout_exit_code(&self) -> i32 {
@@ -381,15 +419,43 @@ mod tests {
 			owning,
 			stopping: 0,
 			cancelling: false,
+			presses: 0,
 			stdout_closed: false,
 			streaming_data: 0,
 			data_cut_short: false,
 		}
 	}
 
+	/// Asserts that no command counts as running, cancelled or stopping. Whether Ctrl-C was pressed
+	/// is left out: it stays set for the process, so it depends on the tests that ran before.
+	fn assert_idle() {
+		let state = lock_state();
+		assert_eq!(
+			State {
+				presses: 0,
+				..*state
+			},
+			self::state(0, 0)
+		);
+	}
+
 	#[test]
 	fn ctrl_c_with_no_command_running_quits() {
 		assert_eq!(state(0, 0).press(), Action::Quit(EXIT_INTERRUPTED));
+	}
+
+	#[test]
+	fn a_press_count_tells_only_of_ctrl_c_pressed_after_it() {
+		let mut state = state(1, 0);
+		// an earlier command, cancelled by Ctrl-C
+		state.press();
+		state.end_catching();
+		// the next one
+		state.catching += 1;
+		let count = state.press_count();
+		assert!(!count.pressed_before(&state));
+		state.press();
+		assert!(count.pressed_before(&state));
 	}
 
 	#[test]
@@ -460,7 +526,7 @@ mod tests {
 		let stream = stream_data();
 		assert_eq!(lock_state().streaming_data, 1);
 		drop(stream);
-		assert_eq!(*lock_state(), state(0, 0));
+		assert_idle();
 	}
 
 	#[test]
@@ -509,7 +575,7 @@ mod tests {
 
 		let err = command.await.unwrap_err();
 		assert_eq!(crate::error::exit_code(&err), EXIT_INTERRUPTED);
-		assert_eq!(*lock_state(), state(0, 0));
+		assert_idle();
 	}
 
 	#[tokio::test]
@@ -525,7 +591,7 @@ mod tests {
 		.unwrap_err();
 
 		assert_eq!(crate::error::exit_code(&err), EXIT_INTERRUPTED);
-		assert_eq!(*lock_state(), state(0, 0));
+		assert_idle();
 	}
 
 	#[tokio::test]
@@ -540,7 +606,7 @@ mod tests {
 		.await
 		.unwrap();
 
-		assert_eq!(*lock_state(), state(0, 0));
+		assert_idle();
 	}
 
 	#[tokio::test]
@@ -557,7 +623,7 @@ mod tests {
 		assert!(!ctrl_c.was_pressed());
 		drop(ctrl_c);
 		drop(catching);
-		assert_eq!(*lock_state(), state(0, 0));
+		assert_idle();
 	}
 
 	#[tokio::test]
@@ -572,6 +638,6 @@ mod tests {
 		ctrl_c.pressed().await;
 		drop(ctrl_c);
 		drop(catching);
-		assert_eq!(*lock_state(), state(0, 0));
+		assert_idle();
 	}
 }

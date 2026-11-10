@@ -229,6 +229,9 @@ pub(crate) struct UI {
 	/// Whether stdin carries the commands the CLI runs, as in the REPL and for commands piped
 	/// into it.
 	commands_on_stdin: bool,
+	/// Why the first line [`UI::print`] dropped since [`UI::start_command_output`] could not be
+	/// written to stdout, other than because stdout was closed ([`write_stdout_line`]).
+	stdout_write_failure: Option<io::Error>,
 }
 
 impl UI {
@@ -261,6 +264,7 @@ impl UI {
 			disable_suggestions: false,
 			make_output_environment_agnostic_for_replay_testing: false,
 			commands_on_stdin: false,
+			stdout_write_failure: None,
 		}
 	}
 
@@ -389,7 +393,32 @@ impl UI {
 	/// decrypted file contents, which must not reach the log files.
 	pub(crate) fn print(&mut self, msg: &str) {
 		let msg = self.redact_for_replay_testing(msg.to_string());
-		write_stdout_line(&mut self.out, &msg);
+		if let Err(e) = write_stdout_line(&mut self.out, &msg) {
+			// the first failure says why the output was lost; the later ones usually repeat it
+			self.stdout_write_failure.get_or_insert(e);
+		}
+	}
+
+	/// Starts a command's output, so that a line dropped before it, by an earlier command in the
+	/// REPL, does not fail this one ([`UI::finish_command_output`]).
+	pub(crate) fn start_command_output(&mut self) {
+		self.stdout_write_failure = None;
+	}
+
+	/// Fails a command whose output lost a line since [`UI::start_command_output`], as on a full
+	/// disk, so that it does not end as if it had succeeded; in the REPL, that fails the command,
+	/// not the session. After an interrupt (`interrupted`) it does not: after SIGHUP from a
+	/// closed terminal, stdout is the hung-up terminal and every write fails (`EIO` on Unix)
+	/// while the command stops as Ctrl-C stops it, and a clean stop ends as it does after
+	/// SIGTERM.
+	pub(crate) fn finish_command_output(&mut self, interrupted: bool) -> Result<()> {
+		match self.stdout_write_failure.take() {
+			Some(e) if !interrupted => Err(CliError::Failure(format!(
+				"Some output could not be written to stdout: {e}"
+			))
+			.into()),
+			Some(_) | None => Ok(()),
+		}
 	}
 
 	/// Writes `bytes` to stdout as they are, with no newline added, as a file's content is printed.
@@ -976,12 +1005,23 @@ fn grid_layout(items: &[&str], terminal_width: usize) -> GridLayout {
 /// `head` does once it has read its lines, wants no more output: the line is dropped, and the
 /// running command ends as Ctrl-C would end it ([`interrupt::close_stdout`]), so that a sync,
 /// mount or serve stops cleanly and a command cut short does not exit with 0.
-pub(crate) fn write_stdout_line(out: &mut (impl Write + ?Sized), line: &str) {
+///
+/// Any other failed write drops the line too, is logged, and is returned, so that a command
+/// whose output was lost, as on a full disk, does not exit with 0
+/// ([`UI::finish_command_output`]). After SIGHUP from a closed terminal, stdout is the hung-up
+/// terminal and every write fails (`EIO` on Unix) while the command stops as Ctrl-C stops it: a
+/// panic there would cut that stop short, and closing stdout would turn its exit code 130 into 0.
+pub(crate) fn write_stdout_line(out: &mut (impl Write + ?Sized), line: &str) -> io::Result<()> {
 	match writeln!(out, "{}", line) {
-		Ok(()) => {}
-		Err(e) if e.kind() == io::ErrorKind::BrokenPipe => interrupt::close_stdout(),
-		// Any other failed write panics, with the message `println!` panics with.
-		Err(e) => panic!("failed printing to stdout: {e}"),
+		Ok(()) => Ok(()),
+		Err(e) if e.kind() == io::ErrorKind::BrokenPipe => {
+			interrupt::close_stdout();
+			Ok(())
+		}
+		Err(e) => {
+			warn!("Dropped a line of output, as writing to stdout failed: {e}");
+			Err(e)
+		}
 	}
 }
 
@@ -1651,6 +1691,95 @@ mod tests {
 			"✘ An unexpected error occurred: connection reset\n\
 			 ✘ If you believe this is a bug, please report it at https://github.com/FilenCloudDienste/filen-rs/issues"
 		);
+	}
+
+	/// A writer whose every write fails as a full disk fails it.
+	struct FullDisk;
+
+	impl Write for FullDisk {
+		fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+			Err(io::Error::from(io::ErrorKind::StorageFull))
+		}
+
+		fn flush(&mut self) -> io::Result<()> {
+			Ok(())
+		}
+	}
+
+	/// A UI whose stdout fails every write as a full disk does, and the buffer its stderr goes to.
+	fn full_disk_ui(json: bool) -> (UI, Printed) {
+		let err = Printed::default();
+		let mut ui = UI::with_writers(FullDisk, err.clone());
+		ui.json = json;
+		(ui, err)
+	}
+
+	#[test]
+	fn a_line_stdout_could_not_take_fails_the_command() {
+		let (mut ui, _) = full_disk_ui(false);
+		ui.start_command_output();
+		ui.print("lost");
+		let err = ui.finish_command_output(false).unwrap_err();
+		assert_eq!(
+			format!("{err:#}"),
+			format!(
+				"Some output could not be written to stdout: {}",
+				io::Error::from(io::ErrorKind::StorageFull)
+			)
+		);
+		assert!(matches!(find_cli_error(&err), Some(CliError::Failure(_))));
+		assert_eq!(error::exit_code(&err), error::EXIT_FAILURE);
+	}
+
+	#[test]
+	fn a_lost_line_fails_only_the_command_that_printed_it() {
+		let (mut ui, _) = full_disk_ui(false);
+		ui.start_command_output();
+		ui.print("lost");
+		ui.finish_command_output(false).unwrap_err();
+		// the next REPL command prints nothing, and succeeds
+		ui.start_command_output();
+		ui.finish_command_output(false).unwrap();
+	}
+
+	#[test]
+	fn a_line_lost_before_a_command_does_not_fail_it() {
+		let (mut ui, _) = full_disk_ui(false);
+		ui.print("lost before the command, as by an earlier REPL line");
+		ui.start_command_output();
+		ui.finish_command_output(false).unwrap();
+	}
+
+	#[test]
+	fn a_lost_line_with_json_is_reported_as_a_json_failure() {
+		let (mut ui, err_out) = full_disk_ui(true);
+		ui.start_command_output();
+		ui.print("lost");
+		let err = ui.finish_command_output(false).unwrap_err();
+		ui.print_failure_or_error(&err);
+		let printed: serde_json::Value = serde_json::from_str(&err_out.lines()).unwrap();
+		assert_eq!(
+			printed,
+			serde_json::json!({"error": {
+				"message": format!(
+					"Some output could not be written to stdout: {}",
+					io::Error::from(io::ErrorKind::StorageFull)
+				),
+				"kind": "failure",
+				"exitCode": 1,
+			}})
+		);
+	}
+
+	#[test]
+	fn a_lost_line_after_an_interrupt_does_not_fail_the_command() {
+		let (mut ui, _) = full_disk_ui(false);
+		ui.start_command_output();
+		ui.print("lost to a hung-up terminal");
+		ui.finish_command_output(true).unwrap();
+		// and is not left over for the next command either
+		ui.start_command_output();
+		ui.finish_command_output(false).unwrap();
 	}
 
 	/// What `print_failure_or_error` prints for `err` to stdout and to stderr, with or without

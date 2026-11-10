@@ -907,7 +907,14 @@ async fn execute_cancellable(
 	working_path: &RemotePath,
 	command: Commands,
 ) -> Result<CommandResult> {
-	interrupt::cancellable(execute_command(config, ui, client, working_path, command)).await
+	let presses = interrupt::press_count();
+	ui.start_command_output();
+	let result =
+		interrupt::cancellable(execute_command(config, ui, client, working_path, command)).await?;
+	// a command whose output was lost, as on a full disk, did not succeed, unless Ctrl-C stopped
+	// this command: one that stopped an earlier command in the REPL is no excuse
+	ui.finish_command_output(presses.pressed_since())?;
+	Ok(result)
 }
 
 /// The options that shape how a command runs, its output and its confirmations: the CLI's, and
