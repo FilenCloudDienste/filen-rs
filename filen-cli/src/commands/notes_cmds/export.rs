@@ -7,11 +7,12 @@
 //! Notes go into the export directory itself, trashed notes into its `trash/` subdirectory and
 //! archived notes into `archive/`; each subdirectory is created only when a note goes into it. A
 //! file is named after its note's title, with characters a file name cannot hold replaced by `_`,
-//! and a title Windows reserves for a device, such as `CON` or `NUL`, prefixed with `_` (a note
-//! whose title cannot be decrypted is named `note-<uuid>`), and `-1`, `-2`, ... appended to tell
-//! notes with the same title apart. The extension follows the note's type: rich text notes are
-//! exported as `.html`, Markdown notes and checklists as `.md` (a checklist as a Markdown task
-//! list), and plain text and code notes as `.txt`.
+//! and a title Windows reserves for a device, such as `CON`, `NUL`, `COM0` or `LPT¹`, also with
+//! spaces after it, prefixed with `_` (a note whose title cannot be decrypted is named
+//! `note-<uuid>`), and `-1`, `-2`, ... appended to tell notes with the same title apart. The
+//! extension follows the note's type: rich text notes are exported as `.html`, Markdown notes and
+//! checklists as `.md` (a checklist as a Markdown task list), and plain text and code notes as
+//! `.txt`.
 
 use std::{
 	collections::HashSet,
@@ -24,7 +25,7 @@ use anyhow::{Context as _, Result};
 use filen_sdk_rs::{auth::Client, notes::Note};
 
 use super::content::{file_extension, readable_content};
-use crate::{auth::LazyClient, ui::UI};
+use crate::{auth::LazyClient, ui::UI, util::is_windows_reserved_name};
 
 const ILLEGAL_FILE_NAME_CHARS: &[char] = &['<', '>', ':', '"', '/', '\\', '|', '?', '*'];
 
@@ -203,16 +204,9 @@ fn unique_path(
 	unreachable!()
 }
 
-/// Windows refuses these as a file name's stem (the text before the first `.`), whatever the
-/// extension and the case.
-const RESERVED_DEVICE_NAMES: &[&str] = &[
-	"CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
-	"COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
-];
-
 /// Makes a note title usable as a file name on every platform: the title is trimmed, characters
-/// no file name can hold and control characters become `_`, and a stem Windows reserves for a
-/// device gets a leading `_`.
+/// no file name can hold and control characters become `_`, and a name Windows reserves for a
+/// device (see [`is_windows_reserved_name`]) gets a leading `_`.
 fn sanitize_file_name(file_name: &str) -> String {
 	// trimmed first, so that whitespace control characters at either end are dropped rather
 	// than replaced
@@ -220,11 +214,7 @@ fn sanitize_file_name(file_name: &str) -> String {
 		|c: char| ILLEGAL_FILE_NAME_CHARS.contains(&c) || c.is_control(),
 		"_",
 	);
-	let stem = sanitized.split('.').next().unwrap_or_default();
-	if RESERVED_DEVICE_NAMES
-		.iter()
-		.any(|reserved| stem.eq_ignore_ascii_case(reserved))
-	{
+	if is_windows_reserved_name(&sanitized) {
 		format!("_{sanitized}")
 	} else {
 		sanitized
@@ -250,6 +240,13 @@ mod tests {
 		assert_eq!(sanitize_file_name("com1"), "_com1");
 		assert_eq!(sanitize_file_name("NUL.x"), "_NUL.x");
 		assert_eq!(sanitize_file_name("Console"), "Console");
+		assert_eq!(sanitize_file_name("COM0"), "_COM0");
+		assert_eq!(sanitize_file_name("lpt0"), "_lpt0");
+		assert_eq!(sanitize_file_name("COM¹"), "_COM¹");
+		assert_eq!(sanitize_file_name("LPT³.x"), "_LPT³.x");
+		assert_eq!(sanitize_file_name("CON .txt"), "_CON .txt");
+		assert_eq!(sanitize_file_name("NUL."), "_NUL.");
+		assert_eq!(sanitize_file_name("COM10"), "COM10");
 	}
 
 	#[test]

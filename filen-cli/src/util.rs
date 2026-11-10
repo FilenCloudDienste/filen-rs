@@ -214,6 +214,27 @@ pub fn uuid_v5(namespace: Uuid, name: &str) -> Uuid {
 	Uuid::from_bytes(bytes)
 }
 
+/// The device names Windows reserves, see [`is_windows_reserved_name`].
+const WINDOWS_RESERVED_NAMES: &[&str] = &[
+	"CON", "PRN", "AUX", "NUL", "COM0", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7",
+	"COM8", "COM9", "COM¹", "COM²", "COM³", "LPT0", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6",
+	"LPT7", "LPT8", "LPT9", "LPT¹", "LPT²", "LPT³",
+];
+
+/// Whether Windows refuses `name` as a file name because its stem (the text before the first `.`)
+/// names a device: Windows refuses these whatever the extension, the case, or spaces before the
+/// extension.
+pub(crate) fn is_windows_reserved_name(name: &str) -> bool {
+	let stem = name
+		.split('.')
+		.next()
+		.unwrap_or_default()
+		.trim_end_matches(' ');
+	WINDOWS_RESERVED_NAMES
+		.iter()
+		.any(|reserved| stem.eq_ignore_ascii_case(reserved))
+}
+
 #[cfg(test)]
 pub(crate) mod test_support {
 	use std::{cell::RefCell, collections::HashMap};
@@ -398,5 +419,30 @@ mod tests {
 			uuid_v5(Uuid::nil(), "~/Documents:/Backups/Documents").to_string(),
 			"dad62423-e0c8-5cda-923f-8c26137401e3"
 		);
+	}
+
+	#[test]
+	fn windows_reserved_names_ignore_case_extension_and_trailing_spaces() {
+		for name in [
+			"CON",
+			"nul",
+			"Aux.txt",
+			"COM0",
+			"lpt0",
+			"COM9.md",
+			"COM¹",
+			"lpt³.x",
+			"CON .txt",
+			"PRN  ",
+			"NUL.",
+			"LPT2. .txt",
+		] {
+			assert!(is_windows_reserved_name(name), "{name} is reserved");
+		}
+		for name in [
+			"Console", "COM10", "LPT", "COM⁴", " CON", "_CON", "CONx.txt", "", "a.CON",
+		] {
+			assert!(!is_windows_reserved_name(name), "{name} is not reserved");
+		}
 	}
 }

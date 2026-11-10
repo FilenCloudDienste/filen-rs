@@ -181,6 +181,7 @@ Breaking changes are marked **Breaking**: scripts that depend on the old behavio
 - `cat` of a large file no longer asks when no one can answer
 - viewing a file public link no longer replaces it
 - `logout` offers to delete a keyring entry the keyring cannot decode, so it can be removed, and exits with an error naming both causes when it can neither read nor delete it, instead of reporting nothing deleted
+- `export-notes` replaces control characters in note titles and prefixes `_` to titles Windows reserves for a device, such as `CON`, `NUL`, `COM0` or `LPT¹`, also with spaces before the extension
 
 ### Security
 
