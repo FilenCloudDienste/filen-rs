@@ -190,6 +190,7 @@ Breaking changes are marked **Breaking**: scripts that depend on the old behavio
 - `export-notes` replaces control characters in note titles and prefixes `_` to titles Windows reserves for a device, such as `CON`, `NUL`, `COM0` or `LPT¹`, also with spaces before the extension
 - `filen rclone` exits with 128 plus the signal when a signal ended Rclone, instead of 0
 - a terminal error while reading a text or password prompt is a `terminal_input` failure, not an unexpected one with a link to report a bug
+- an auth config is written to a temporary file next to it and renamed over it, so an interrupted write no longer leaves a truncated one; a symlinked auth config keeps its link
 - `mount` and `serve --cache-size` accept only `n`, `nB` and `nU`, `nUi`, `nUB` or `nUiB` with a unit `K`, `M`, `G` or `T`, and refuse a malformed suffix such as `10iB` (read as 10 bytes) or `10MBB` (read as 10 MiB)
 - a sync pair with an empty local or remote path, as in `:/docs` or `/home/me/docs:`, is refused instead of syncing the working directory or the remote working path
 - a sync pairs file that gives an alias `sync` cannot select, one with `:` or a path separator or an empty one, is refused

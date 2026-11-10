@@ -40,7 +40,6 @@ mod profile;
 use std::os::unix::fs::PermissionsExt;
 use std::{
 	borrow::Cow,
-	io::Write as _,
 	path::{Path, PathBuf, is_separator},
 	sync::Arc,
 	time::Duration,
@@ -60,7 +59,7 @@ pub(crate) use self::account::{
 pub(crate) use self::profile::{ProfileName, Profiles, print_profiles};
 use crate::{
 	CliConfig, ClientConfigArgs, build_client_config, default_config_dir, deserialize_auth_config,
-	private_file::{open_private, private_file_options},
+	private_file::replace_private,
 	serialize_auth_config,
 	ui::UI,
 	util::{ChunkStore as _, KeyringChunkStore, LongKeyringEntry},
@@ -1236,21 +1235,12 @@ async fn restore_old_cli_login(
 
 const AUTH_CONFIG_FILENAME: &str = "filen-cli-auth-config.txt"; // (!) referenced in module docs
 
-/// Write `contents` to `path`, creating or truncating it with owner-only permissions
-/// (mode `0o600` on Unix). The auth config holds the master keys, private key and API key,
-/// so it must never be left group- or world-readable for other users on the machine.
-///
-/// A pre-existing file keeps its previous mode through create+truncate, so [`open_private`]
-/// tightens it while it is still empty, before any secret bytes are written.
+/// Write `contents` to `path`, replacing it atomically with [`replace_private`], with owner-only
+/// permissions (mode `0o600` on Unix). The auth config holds the master keys, private key and
+/// API key, so it must never be left group- or world-readable for other users on the machine,
+/// nor truncated by an interrupted write.
 fn write_private_file(path: &Path, contents: &str) -> std::io::Result<()> {
-	let mut file = open_private(
-		private_file_options()
-			.write(true)
-			.create(true)
-			.truncate(true),
-		path,
-	)?;
-	file.write_all(contents.as_bytes())
+	replace_private(path, contents.as_bytes())
 }
 
 /// Export an auth config of `client`'s login to the file `path`.

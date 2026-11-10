@@ -3,7 +3,7 @@
 //! and generated again when it is about to expire or does not name an address a server listens
 //! on.
 
-use std::{collections::BTreeSet, fs, io::Write as _, net::IpAddr, path::Path};
+use std::{collections::BTreeSet, fs, net::IpAddr, path::Path};
 
 use anyhow::{Context as _, Result};
 use base64::{Engine as _, engine::general_purpose::STANDARD as base64};
@@ -12,6 +12,8 @@ use filen_sdk_rs::rclone::ServeTls;
 use rcgen::{CertificateParams, DnType, KeyPair};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
+
+use crate::private_file::replace_private;
 
 /// The directory in the config directory that holds the certificate.
 const DIR: &str = "serve-tls";
@@ -211,17 +213,11 @@ fn ymd(date: NaiveDate) -> (i32, u8, u8) {
 	(date.year(), small(date.month()), small(date.day()))
 }
 
-/// Replaces `dir/name` with `contents`, through a temporary file that only this user can read on
-/// unix (0600), which keeps the private key private.
+/// Replaces `dir/name` with `contents` with [`replace_private`], through a temporary file that
+/// only this user can read on unix (0600), which keeps the private key private.
 fn write_private(dir: &Path, name: &str, contents: &[u8]) -> Result<()> {
 	let path = dir.join(name);
-	let mut file = tempfile::NamedTempFile::new_in(dir)
-		.with_context(|| format!("Failed to write {}", path.display()))?;
-	file.write_all(contents)
-		.with_context(|| format!("Failed to write {}", path.display()))?;
-	file.persist(&path)
-		.with_context(|| format!("Failed to write {}", path.display()))?;
-	Ok(())
+	replace_private(&path, contents).with_context(|| format!("Failed to write {}", path.display()))
 }
 
 /// The SHA-256 fingerprint of `bytes`, uppercase hex bytes joined by `:`.
