@@ -14,13 +14,17 @@
 //!
 //! `events` lists your account's activity log, newest first: logins, uploads, moves, shares and
 //! other changes, one per line with its time (UTC), its type and the item or address it concerns.
-//! `--filter <type>` asks the server for one type of event, and `--limit <n>` prints only the
-//! newest `n`. With `--json`, the events are printed as an array.
+//! `--filter <type>` asks the server for one type of event. Without `--limit` it lists the newest
+//! page the server returns, about 100 events; `--limit <n>` prints only the newest `n`, fetching
+//! older events as needed (at most 10 pages of about 100). The server pages by whole seconds, so
+//! when more events share one second than one page holds, the rest of that second cannot be
+//! fetched: `--limit` lists the events before it all the same, with a warning naming the second.
+//! With `--json`, the events are printed as an array.
 
-use std::num::NonZeroUsize;
+use std::{collections::HashSet, fmt::Display, num::NonZeroUsize};
 
 use anyhow::{Context as _, Result};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use clap::{Subcommand, ValueEnum};
 use filen_sdk_rs::user::{
 	UserInfo,
@@ -51,7 +55,9 @@ pub(crate) enum AccountCommands {
 		/// Only list events of this type, as the server names them (default: all)
 		#[arg(long)]
 		filter: Option<String>,
-		/// Only list the newest events, at most this many
+		/// Print only the newest N events, fetching older events as needed (at most 10 pages of
+		/// about 100); a second holding more events than one page may be listed in part, with a
+		/// warning
 		#[arg(long, value_name = "N")]
 		limit: Option<NonZeroUsize>,
 	},
@@ -450,20 +456,16 @@ fn event_json(event: &DecryptedUserEvent) -> serde_json::Value {
 	})
 }
 
-async fn print_events(
-	ui: &mut UI,
-	client: &mut LazyClient,
-	filter: Option<&str>,
-	limit: Option<NonZeroUsize>,
-) -> Result<()> {
-	let client = client.get(ui).await?;
-	let results = client
-		.get_user_events(filter, None)
-		.await
-		.context("Failed to get account events")?;
-	let mut events = Vec::with_capacity(results.len());
+/// How many pages of events `events --limit` fetches at most, about 100 events each.
+const MAX_EVENT_PAGES: usize = 10;
+
+/// The events of a page that could be read, and how many could not (each logged).
+fn readable_events<E: Display>(
+	page: Vec<Result<DecryptedUserEvent, E>>,
+) -> (Vec<DecryptedUserEvent>, usize) {
+	let mut events = Vec::with_capacity(page.len());
 	let mut unreadable = 0usize;
-	for result in results {
+	for result in page {
 		match result {
 			Ok(event) => events.push(event),
 			Err(e) => {
@@ -472,9 +474,167 @@ async fn print_events(
 			}
 		}
 	}
-	if let Some(limit) = limit {
-		events.truncate(limit.get());
+	(events, unreadable)
+}
+
+/// The events collected over one or more pages, newest first.
+#[derive(Debug)]
+struct CollectedEvents {
+	events: Vec<DecryptedUserEvent>,
+	/// How many events could not be read. An unreadable event that a page fetches again is
+	/// counted again: it has no id to recognise it by. That is one in the second a page overlaps
+	/// the previous one with, or one older than the oldest readable event of a page that added
+	/// no new readable event.
+	unreadable: usize,
+	/// Why the collection stopped short of the limit, if it did before the history ran out.
+	cut_short: Option<CutShort>,
+	/// The seconds paging was stuck at, newest first: a page as large as the first added no new
+	/// event, so it held only events of that second already listed, and the server, which pages
+	/// by whole seconds, cannot return the rest of that second. Paging carried on before that
+	/// second, so only the rest of each of these seconds is missing. A second holding exactly
+	/// one page of events looks the same, so this says events may be missing, not that they are.
+	stuck_seconds: Vec<DateTime<Utc>>,
+}
+
+/// Why [`collect_events`] stopped before the limit and before the oldest event.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum CutShort {
+	/// It fetched as many pages as it may.
+	Capped,
+	/// A page held only events that could not be read, so it gave no timestamp to page back from.
+	/// The first page, or one as large as the first: a smaller later one is the end of the
+	/// history.
+	Unreadable,
+}
+
+/// Collects the newest `limit` events, paging back through older ones: `fetch` returns the
+/// newest page of events strictly before the cutoff it is given, or the newest page for `None`.
+/// A page that adds no new event but is as large as the first (counting the events that could
+/// not be read, as the server returned it) carries on strictly before its oldest second. It is
+/// stuck at that second (see [`CollectedEvents::stuck_seconds`]) if it holds only events already
+/// listed; one that also holds unreadable events may have reached older seconds with them, and is
+/// not. Stops at the limit, at any other page that adds no new event (an empty one included), at
+/// a page with no event that could be read ([`CutShort::Unreadable`]), or after `max_pages`
+/// pages ([`CutShort::Capped`]).
+async fn collect_events<E: Display>(
+	limit: usize,
+	max_pages: usize,
+	mut fetch: impl AsyncFnMut(Option<DateTime<Utc>>) -> Result<Vec<Result<DecryptedUserEvent, E>>>,
+) -> Result<CollectedEvents> {
+	let mut collected = CollectedEvents {
+		events: Vec::new(),
+		unreadable: 0,
+		cut_short: None,
+		stuck_seconds: Vec::new(),
+	};
+	let mut seen = HashSet::new();
+	let mut cutoff = None;
+	let mut first_page_len = None;
+	for _ in 0..max_pages {
+		let raw_page = fetch(cutoff).await?;
+		// Compared as the server returned it: dropping the unreadable events first would let
+		// them hide a stuck page, or make a short page look as large as the first.
+		let page_len = raw_page.len();
+		let first_page_len = *first_page_len.get_or_insert(page_len);
+		let (page, unreadable) = readable_events(raw_page);
+		collected.unreadable += unreadable;
+		let oldest = page.iter().map(|event| event.timestamp).min();
+		let before = collected.events.len();
+		for event in page {
+			if collected.events.len() == limit {
+				return Ok(collected);
+			}
+			if seen.insert(event.id) {
+				collected.events.push(event);
+			}
+		}
+		if collected.events.len() == limit {
+			return Ok(collected);
+		}
+		let Some(oldest) = oldest else {
+			// with no readable event, there is no timestamp to page back from
+			if page_len > 0 && page_len == first_page_len {
+				collected.cut_short = Some(CutShort::Unreadable);
+			}
+			return Ok(collected);
+		};
+		cutoff = if collected.events.len() == before {
+			// A page that adds no readable event holds readable events of its oldest second or
+			// newer, all listed already. A smaller one than the first is the end of the history;
+			// one as large is likely cut off by the server's page size. Without unreadable events
+			// it holds only that second's, the rest of which cannot be fetched; with them, those
+			// may be older events. Either way paging carries on strictly before that second, a
+			// cutoff older than this page's, so paging makes progress.
+			if page_len != first_page_len {
+				return Ok(collected);
+			}
+			if unreadable == 0 {
+				collected.stuck_seconds.push(oldest);
+			}
+			Some(oldest)
+		} else {
+			// The server returns the events strictly before the cutoff's second (see
+			// `filen_types::api::v3::user::events::Request`), so a cutoff at the oldest event's
+			// second would skip the events of that second the page left out. One second later
+			// fetches that second again, and the ids drop the events already listed.
+			let Some(next) = oldest.checked_add_signed(TimeDelta::seconds(1)) else {
+				return Ok(collected);
+			};
+			Some(next)
+		};
 	}
+	collected.cut_short = Some(CutShort::Capped);
+	Ok(collected)
+}
+
+async fn print_events(
+	ui: &mut UI,
+	client: &mut LazyClient,
+	filter: Option<&str>,
+	limit: Option<NonZeroUsize>,
+) -> Result<()> {
+	let client = client.get(ui).await?;
+	let (events, unreadable) = match limit {
+		Some(limit) => {
+			let collected = collect_events(
+				limit.get(),
+				MAX_EVENT_PAGES,
+				async |cutoff: Option<DateTime<Utc>>| {
+					client
+						.get_user_events(filter, cutoff)
+						.await
+						.context("Failed to get account events")
+				},
+			)
+			.await?;
+			match collected.cut_short {
+				Some(CutShort::Capped) => ui.print_warning(&format!(
+					"Listed the newest {} events: older ones take more than {MAX_EVENT_PAGES} requests",
+					collected.events.len()
+				)),
+				Some(CutShort::Unreadable) => ui.print_warning(&format!(
+					"Listed the newest {} events: older ones were not fetched past a page of \
+					 events that could not be read",
+					collected.events.len()
+				)),
+				None => {}
+			}
+			for second in &collected.stuck_seconds {
+				ui.print_warning(&format!(
+					"Some events at {} may not have been listed: more events share that second \
+					 than one request returns",
+					ui::format_date(second)
+				));
+			}
+			(collected.events, collected.unreadable)
+		}
+		None => readable_events(
+			client
+				.get_user_events(filter, None)
+				.await
+				.context("Failed to get account events")?,
+		),
+	};
 	if unreadable > 0 {
 		ui.print_warning(&format!(
 			"Skipped {unreadable} {} that could not be read",
@@ -730,5 +890,244 @@ mod tests {
 			"2023-11-14 22:13:20 (UTC)  folderRenamed"
 		);
 		assert_eq!(event_json(&event)["summary"], serde_json::Value::Null);
+	}
+
+	/// How many events the fake server returns per page.
+	const PAGE_SIZE: usize = 100;
+
+	/// The event with this id, `per_second` events sharing each second, newest (id 0) first.
+	fn paged_event(id: u64, per_second: u64) -> DecryptedUserEvent {
+		DecryptedUserEvent {
+			id,
+			timestamp: at(10_000 - i64::try_from(id / per_second).unwrap()),
+			uuid: Uuid::from_u128(u128::from(id)),
+			kind: Kind::RemovedSharedOutItems(
+				filen_sdk_rs::user::events::UserEventRemovedSharedOutItemsInfo {
+					ip: "192.0.2.1".to_owned(),
+					user_agent: "agent".to_owned(),
+					count: 1,
+					receiver_email: "friend@example.com".to_owned(),
+				},
+			),
+		}
+	}
+
+	/// What the server answers for `total` events, those with an id in `unreadable` failing to
+	/// decrypt: the newest page strictly before the cutoff.
+	fn page_before(
+		event: impl Fn(u64) -> DecryptedUserEvent,
+		total: u64,
+		unreadable: &[u64],
+		cutoff: Option<DateTime<Utc>>,
+	) -> Vec<Result<DecryptedUserEvent, String>> {
+		(0..total)
+			.map(event)
+			.filter(|event| cutoff.is_none_or(|cutoff| event.timestamp < cutoff))
+			.take(PAGE_SIZE)
+			.map(|event| {
+				if unreadable.contains(&event.id) {
+					Err(format!("event {} is unreadable", event.id))
+				} else {
+					Ok(event)
+				}
+			})
+			.collect()
+	}
+
+	/// Collects with a fake server over `total` events, returning the cutoffs it was asked for.
+	async fn collect_from(
+		limit: usize,
+		max_pages: usize,
+		event: impl Fn(u64) -> DecryptedUserEvent,
+		total: u64,
+		unreadable: &[u64],
+	) -> (CollectedEvents, Vec<Option<DateTime<Utc>>>) {
+		let mut cutoffs = Vec::new();
+		let collected = collect_events(limit, max_pages, async |cutoff| {
+			cutoffs.push(cutoff);
+			Ok(page_before(&event, total, unreadable, cutoff))
+		})
+		.await
+		.unwrap();
+		(collected, cutoffs)
+	}
+
+	/// Collects with a fake server over `total` readable events, `per_second` sharing each second.
+	async fn collect_from_fake(
+		limit: usize,
+		max_pages: usize,
+		total: u64,
+		per_second: u64,
+	) -> (CollectedEvents, Vec<Option<DateTime<Utc>>>) {
+		collect_from(
+			limit,
+			max_pages,
+			|id| paged_event(id, per_second),
+			total,
+			&[],
+		)
+		.await
+	}
+
+	/// 50 events a second for three seconds (ids 0 to 149), then the ids from 150 to
+	/// `crowded_end` in the second 9000, then one event a second before that.
+	fn event_with_crowded_second(id: u64, crowded_end: u64) -> DecryptedUserEvent {
+		let mut event = paged_event(id, 50);
+		if (150..crowded_end).contains(&id) {
+			event.timestamp = at(9_000);
+		} else if id >= crowded_end {
+			event.timestamp = at(9_000 - i64::try_from(id - crowded_end + 1).unwrap());
+		}
+		event
+	}
+
+	fn ids(collected: &CollectedEvents) -> Vec<u64> {
+		collected.events.iter().map(|event| event.id).collect()
+	}
+
+	#[tokio::test]
+	async fn events_limit_pages_back_without_duplicates() {
+		// three events per second: the first page ends at id 99, whose second also holds 100
+		// and 101, so the second page starts again at 99
+		let (collected, cutoffs) = collect_from_fake(150, MAX_EVENT_PAGES, 300, 3).await;
+		assert_eq!(ids(&collected), (0..150).collect::<Vec<_>>());
+		assert_eq!(cutoffs, [None, Some(at(10_000 - 33 + 1))]);
+		assert_eq!(collected.unreadable, 0);
+		assert_eq!(collected.cut_short, None);
+		assert!(collected.stuck_seconds.is_empty());
+	}
+
+	#[tokio::test]
+	async fn events_paging_moves_past_a_second_holding_more_than_a_page() {
+		// every event in one second: the second page is the first one again, and the third,
+		// strictly before that second, is empty
+		let (collected, cutoffs) = collect_from_fake(500, MAX_EVENT_PAGES, 300, 300).await;
+		assert_eq!(ids(&collected), (0..100).collect::<Vec<_>>());
+		assert_eq!(cutoffs, [None, Some(at(10_001)), Some(at(10_000))]);
+		assert_eq!(collected.cut_short, None);
+		assert_eq!(collected.stuck_seconds, [at(10_000)]);
+	}
+
+	#[tokio::test]
+	async fn events_paging_lists_the_events_older_than_a_crowded_second() {
+		// 250 events in the second 9000, then 50 older ones: once paging reaches that second,
+		// the next page repeats its newest 100 and adds nothing, so paging carries on before it
+		let (collected, cutoffs) = collect_from(
+			1_000,
+			MAX_EVENT_PAGES,
+			|id| event_with_crowded_second(id, 400),
+			450,
+			&[],
+		)
+		.await;
+		assert_eq!(
+			ids(&collected),
+			(0..250).chain(400..450).collect::<Vec<_>>()
+		);
+		assert_eq!(
+			cutoffs,
+			[
+				None,
+				Some(at(10_000)),
+				Some(at(9_999)),
+				Some(at(9_001)),
+				Some(at(9_001)),
+				Some(at(9_000)),
+				Some(at(8_951)),
+			]
+		);
+		assert_eq!(collected.stuck_seconds, [at(9_000)]);
+		assert_eq!(collected.cut_short, None);
+	}
+
+	#[tokio::test]
+	async fn events_paging_compares_page_sizes_with_the_unreadable_events_counted() {
+		// the first page holds 5 unreadable events, so only 95 readable ones; the stuck page
+		// in the crowded second is a full 100 and must still count as stuck
+		let (collected, cutoffs) = collect_from(
+			1_000,
+			MAX_EVENT_PAGES,
+			|id| event_with_crowded_second(id, 400),
+			400,
+			&[0, 1, 2, 3, 4],
+		)
+		.await;
+		assert_eq!(ids(&collected), (5..250).collect::<Vec<_>>());
+		assert_eq!(collected.unreadable, 5);
+		assert_eq!(collected.stuck_seconds, [at(9_000)]);
+		assert_eq!(cutoffs.last(), Some(&Some(at(9_000))));
+		assert_eq!(collected.cut_short, None);
+	}
+
+	#[tokio::test]
+	async fn events_paging_stops_short_at_a_page_of_only_unreadable_events() {
+		// one event a second, 100 to 199 unreadable: the second page adds only unreadable
+		// events, and the third holds nothing else, so there is no timestamp to page back from
+		let unreadable: Vec<u64> = (100..200).collect();
+		let (collected, cutoffs) = collect_from(
+			1_000,
+			MAX_EVENT_PAGES,
+			|id| paged_event(id, 1),
+			300,
+			&unreadable,
+		)
+		.await;
+		assert_eq!(ids(&collected), (0..100).collect::<Vec<_>>());
+		assert_eq!(
+			cutoffs,
+			[None, Some(at(10_000 - 99 + 1)), Some(at(10_000 - 99))]
+		);
+		assert_eq!(collected.cut_short, Some(CutShort::Unreadable));
+		assert!(collected.stuck_seconds.is_empty());
+	}
+
+	#[tokio::test]
+	async fn events_paging_does_not_take_a_page_adding_only_unreadable_events_for_stuck() {
+		// one event a second, 100 to 198 unreadable: the second page repeats event 99 and adds
+		// only unreadable events, which are older, so paging carries on to the readable ones
+		let unreadable: Vec<u64> = (100..199).collect();
+		let (collected, _) = collect_from(
+			1_000,
+			MAX_EVENT_PAGES,
+			|id| paged_event(id, 1),
+			300,
+			&unreadable,
+		)
+		.await;
+		assert_eq!(
+			ids(&collected),
+			(0..100).chain(199..300).collect::<Vec<_>>()
+		);
+		assert_eq!(collected.unreadable, 198);
+		assert!(collected.stuck_seconds.is_empty());
+		assert_eq!(collected.cut_short, None);
+	}
+
+	#[tokio::test]
+	async fn events_paging_stops_when_the_events_run_out() {
+		let (collected, cutoffs) = collect_from_fake(500, MAX_EVENT_PAGES, 150, 1).await;
+		assert_eq!(ids(&collected), (0..150).collect::<Vec<_>>());
+		assert_eq!(cutoffs.len(), 3);
+		assert_eq!(collected.cut_short, None);
+		assert!(collected.stuck_seconds.is_empty());
+	}
+
+	#[tokio::test]
+	async fn events_history_ending_on_a_full_page_does_not_warn() {
+		// exactly one full page, one event a second: the second page repeats only the oldest
+		// event, a smaller page than the first, so it is the end and not a stuck second
+		let (collected, cutoffs) = collect_from_fake(500, MAX_EVENT_PAGES, 100, 1).await;
+		assert_eq!(ids(&collected), (0..100).collect::<Vec<_>>());
+		assert_eq!(cutoffs, [None, Some(at(10_000 - 99 + 1))]);
+		assert_eq!(collected.cut_short, None);
+		assert!(collected.stuck_seconds.is_empty());
+	}
+
+	#[tokio::test]
+	async fn events_paging_stops_at_the_page_cap() {
+		let (collected, cutoffs) = collect_from_fake(1_000, 2, 3_000, 3).await;
+		assert_eq!(ids(&collected), (0..199).collect::<Vec<_>>());
+		assert_eq!(cutoffs.len(), 2);
+		assert_eq!(collected.cut_short, Some(CutShort::Capped));
 	}
 }

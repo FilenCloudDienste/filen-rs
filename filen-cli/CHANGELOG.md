@@ -140,6 +140,7 @@ Breaking changes are marked **Breaking**: scripts that depend on the old behavio
 #### Account, login, sharing and notes
 
 - `whoami`, `statfs`, `account` (with `versioning`, `login-alerts` and `delete-versions`), `events`, `2fa enable`/`disable`, `change-password`, `change-email` and `export-master-keys`
+- `events --limit <n>` pages back through older events, at most 10 requests; a second holding more events than one request returns may be listed in part, with a warning naming it, and paging stops with a warning at a page holding only events that could not be read
 - `--profile <NAME>` (or `FILEN_CLI_PROFILE`) and `profiles`, a login, cache and logs of their own per profile; profile names that differ only in case are one profile, and names Windows reserves for devices (`CON`, `NUL`, `COM1`, ...) are refused
 - `export-auth-config [PATH]` takes a file or directory
 - `FILEN_EMAIL`, `FILEN_PASSWORD` and `FILEN_2FA_CODE`, the older CLI's variables, are read when nothing else gives credentials; `FILEN_CLI_2FA_SECRET` makes the two-factor code from a TOTP secret
