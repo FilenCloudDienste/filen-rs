@@ -835,10 +835,13 @@ impl futures::AsyncWrite for StdoutWriter {
 			.map(Self::note)
 	}
 
+	/// Tokio hands each write to a blocking thread and reports it as written at once, and its
+	/// shutdown of stdout waits for nothing, so the flush is what waits for the last write: one
+	/// still queued when the runtime shuts down is never made.
 	fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-		Pin::new(&mut self.get_mut().0)
-			.poll_shutdown(cx)
-			.map(Self::note)
+		let stdout = &mut self.get_mut().0;
+		ready!(Pin::new(&mut *stdout).poll_flush(cx).map(Self::note))?;
+		Pin::new(stdout).poll_shutdown(cx).map(Self::note)
 	}
 }
 
