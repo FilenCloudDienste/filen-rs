@@ -6,7 +6,10 @@
 //!
 //! In a terminal, `public-link` offers to edit or delete an existing link, and asks for a new
 //! link's settings: when it expires, a password, and whether the item can be downloaded. The link
-//! is created as soon as its settings are confirmed, and its URL is printed then. Press Esc to
+//! is created as soon as its settings are confirmed, and its URL is printed then. A new link is
+//! created with the default settings (no password, never expires, downloadable) and then given its
+//! own; if that fails and they would have protected the item more, with a password, an expiry or
+//! downloads off, the link is deleted again rather than left open. Press Esc to
 //! cancel a prompt, which creates and changes nothing. `--yes` answers "Enable download?" with yes,
 //! as it answers every yes/no question, so editing a link without downloads turns them on, which it
 //! says on stderr (`--no-download` keeps them off); the other settings are still asked. Without a
@@ -28,7 +31,7 @@ use crate::{
 	CommandResult,
 	auth::LazyClient,
 	commands::{CommandContext, fs_cmds::full_path},
-	completion::FilenCompleter,
+	completion::{FilenCompleter, quote_for_command_line},
 	docs::DocElement,
 	ui::{UI, format_date},
 	util::RemotePath,
@@ -524,9 +527,16 @@ async fn run_link_action<I: LinkableItem>(
 			save_link(ui, client, item, &link).await
 		}
 		(PublicLinkAction::Change(changes), None) => {
-			let mut link = create_new_link(ui, client, item).await?;
-			I::apply_settings(&mut link, changes.applied_to(NEW_LINK_SETTINGS));
-			save_link(ui, client, item, &link).await
+			let link = create_new_link(ui, client, item).await?;
+			save_new_link(
+				ui,
+				client,
+				item,
+				path,
+				link,
+				changes.applied_to(NEW_LINK_SETTINGS),
+			)
+			.await
 		}
 	}
 }
@@ -599,9 +609,171 @@ async fn create_link<I: LinkableItem>(
 	let Some(settings) = new_link_settings(ui, path)? else {
 		return Ok(());
 	};
-	let mut link = create_new_link(ui, client, item).await?;
+	let link = create_new_link(ui, client, item).await?;
+	save_new_link(ui, client, item, path, link, settings).await
+}
+
+/// Saves `settings` to `link`, which was just created for `item`, found at `path`, with the default
+/// settings. When that fails and `settings` protect the item more than the defaults do, the link
+/// is deleted, so that a failed save does not leave the item public without the protection asked
+/// for.
+async fn save_new_link<I: LinkableItem>(
+	ui: &mut UI,
+	client: &Client,
+	item: &I,
+	path: &str,
+	mut link: I::Link,
+	settings: LinkSettings,
+) -> Result<()> {
+	let protections = protections_beyond_defaults(&settings);
 	I::apply_settings(&mut link, settings);
-	save_link(ui, client, item, &link).await
+	let Err(save_error) = save_link(ui, client, item, &link).await else {
+		return Ok(());
+	};
+	let unsaved = UnsavedNewLink {
+		noun: I::KIND.noun(),
+		path,
+		url: item.link_url(&link),
+		protections,
+	};
+	Err(unsaved_new_link_error(save_error, &unsaved, delete_link(ui, client, item, link)).await)
+}
+
+/// What a new link's settings give it that its default settings do not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Protection {
+	Password,
+	Expiry,
+	NoDownloads,
+}
+
+impl Protection {
+	/// The protection as the messages about a new link name it.
+	fn label(self) -> &'static str {
+		match self {
+			Protection::Password => "the password",
+			Protection::Expiry => "the expiry",
+			Protection::NoDownloads => "the download restriction",
+		}
+	}
+}
+
+/// The protections `settings` give a new link beyond [`NEW_LINK_SETTINGS`], empty when the link is
+/// no more open with the default settings than with `settings`.
+fn protections_beyond_defaults(settings: &LinkSettings) -> Vec<Protection> {
+	let password = match settings.password {
+		PasswordChange::Set(_) => Some(Protection::Password),
+		// a new link has no password to keep or remove
+		PasswordChange::Keep | PasswordChange::Clear => None,
+	};
+	let expiry =
+		(settings.expiration != NEW_LINK_SETTINGS.expiration).then_some(Protection::Expiry);
+	let no_downloads = (NEW_LINK_SETTINGS.downloadable && !settings.downloadable)
+		.then_some(Protection::NoDownloads);
+	[password, expiry, no_downloads]
+		.into_iter()
+		.flatten()
+		.collect()
+}
+
+/// A link created for an item whose settings could not be saved.
+struct UnsavedNewLink<'a> {
+	/// What the item is, as [`PublicLinkKind::noun`] names it.
+	noun: &'static str,
+	path: &'a str,
+	/// `None` when the key in the link could not be decrypted.
+	url: Option<String>,
+	/// What the settings that could not be saved would have protected the item with.
+	protections: Vec<Protection>,
+}
+
+/// The error for a new link whose settings failed to save with `save_error`. The link is left as
+/// it is when its default settings are no more open than those asked for; otherwise `delete`
+/// deletes it, and only if that fails too is the item left public.
+async fn unsaved_new_link_error(
+	save_error: anyhow::Error,
+	unsaved: &UnsavedNewLink<'_>,
+	delete: impl Future<Output = Result<()>>,
+) -> anyhow::Error {
+	if unsaved.protections.is_empty() {
+		return save_error.context(new_link_not_saved(unsaved));
+	}
+	match delete.await {
+		Ok(()) => save_error.context(new_link_deleted(unsaved)),
+		Err(delete_error) => save_error.context(new_link_left_open(unsaved, &delete_error)),
+	}
+}
+
+/// The link of `unsaved`, with its URL when known.
+fn unsaved_link_label(unsaved: &UnsavedNewLink<'_>) -> String {
+	let UnsavedNewLink {
+		noun, path, url, ..
+	} = unsaved;
+	match url {
+		Some(url) => format!("the public link of the {noun} {path} ({url})"),
+		None => format!("the public link of the {noun} {path}"),
+	}
+}
+
+/// The commands that change or delete the link of the item at `path`, quoted for the command line.
+fn change_or_delete_commands(path: &str) -> String {
+	let path = quote_for_command_line(path);
+	format!(
+		"change them with `filen public-link {path}`, or delete it with `filen public-link --delete {path}`"
+	)
+}
+
+/// Context for a new link that was left with the default settings, which protect the item no less
+/// than those that could not be saved.
+fn new_link_not_saved(unsaved: &UnsavedNewLink<'_>) -> String {
+	format!(
+		"Created {} with the default settings, but saving the settings failed: {}",
+		unsaved_link_label(unsaved),
+		change_or_delete_commands(unsaved.path)
+	)
+}
+
+/// Context for a new link that was deleted after its settings could not be saved. It names no
+/// command to create the link again: the one that ran may have given the settings as options.
+fn new_link_deleted(unsaved: &UnsavedNewLink<'_>) -> String {
+	let UnsavedNewLink { noun, path, .. } = unsaved;
+	format!(
+		"Saving the settings of the new public link of the {noun} {path} failed, so the link was \
+		 deleted and the {noun} is not public; run the command again to create it"
+	)
+}
+
+/// Context for a new link that could neither be given its settings nor deleted, failing with
+/// `delete_error`, and so leaves its item public without the protection asked for.
+fn new_link_left_open(unsaved: &UnsavedNewLink<'_>, delete_error: &anyhow::Error) -> String {
+	let UnsavedNewLink {
+		noun,
+		path,
+		protections,
+		..
+	} = unsaved;
+	format!(
+		"Created {}, but saving its settings failed, and deleting the link failed too \
+		 ({delete_error:#}): the {noun} {path} is public without {} asked for; {}",
+		unsaved_link_label(unsaved),
+		protection_list(protections),
+		change_or_delete_commands(path)
+	)
+}
+
+/// `protections` named in a sentence: "the password, the expiry and the download restriction".
+fn protection_list(protections: &[Protection]) -> String {
+	match protections.split_last() {
+		None => String::new(),
+		Some((last, [])) => last.label().to_owned(),
+		Some((last, rest)) => {
+			let rest = rest
+				.iter()
+				.map(|protection| protection.label())
+				.collect::<Vec<_>>();
+			format!("{} and {}", rest.join(", "), last.label())
+		}
+	}
 }
 
 /// The settings for a new link for the item at `path`, or `None` when a prompt was cancelled.
@@ -1581,6 +1753,247 @@ mod tests {
 		assert_eq!(
 			url.split_once("%23").map(|(_, key)| key),
 			Some("30306666".repeat(16).as_str())
+		);
+	}
+
+	fn settings_of(
+		expiration: PublicLinkExpiration,
+		password: PasswordChange,
+		downloadable: bool,
+	) -> LinkSettings {
+		LinkSettings {
+			expiration,
+			password,
+			downloadable,
+		}
+	}
+
+	#[test]
+	fn the_default_settings_protect_a_new_link_no_less() {
+		for password in [PasswordChange::Keep, PasswordChange::Clear] {
+			assert_eq!(
+				protections_beyond_defaults(&settings_of(
+					PublicLinkExpiration::Never,
+					password,
+					true
+				)),
+				[]
+			);
+		}
+	}
+
+	#[test]
+	fn a_password_an_expiry_and_downloads_off_each_protect_a_new_link() {
+		assert_eq!(
+			protections_beyond_defaults(&settings_of(
+				PublicLinkExpiration::Never,
+				PasswordChange::Set("secret".to_owned()),
+				true
+			)),
+			[Protection::Password]
+		);
+		assert_eq!(
+			protections_beyond_defaults(&settings_of(
+				PublicLinkExpiration::OneHour,
+				PasswordChange::Keep,
+				true
+			)),
+			[Protection::Expiry]
+		);
+		assert_eq!(
+			protections_beyond_defaults(&settings_of(
+				PublicLinkExpiration::Never,
+				PasswordChange::Keep,
+				false
+			)),
+			[Protection::NoDownloads]
+		);
+		assert_eq!(
+			protections_beyond_defaults(&settings_of(
+				PublicLinkExpiration::ThirtyDays,
+				PasswordChange::Set("secret".to_owned()),
+				false
+			)),
+			[
+				Protection::Password,
+				Protection::Expiry,
+				Protection::NoDownloads
+			]
+		);
+	}
+
+	fn unsaved_link(
+		noun: &'static str,
+		path: &'static str,
+		url: Option<&str>,
+		protections: Vec<Protection>,
+	) -> UnsavedNewLink<'static> {
+		UnsavedNewLink {
+			noun,
+			path,
+			url: url.map(str::to_owned),
+			protections,
+		}
+	}
+
+	/// The error [`unsaved_new_link_error`] gives for `unsaved`, and whether it tried to delete the
+	/// link, which `delete_result` answers.
+	async fn unsaved_error(
+		unsaved: &UnsavedNewLink<'_>,
+		delete_result: Result<()>,
+	) -> (String, bool) {
+		let mut deleted = false;
+		let error = unsaved_new_link_error(anyhow::anyhow!("server refused"), unsaved, async {
+			deleted = true;
+			delete_result
+		})
+		.await;
+		(format!("{error:#}"), deleted)
+	}
+
+	#[tokio::test]
+	async fn a_new_link_left_with_settings_no_more_open_is_kept() {
+		let unsaved = unsaved_link(
+			"file",
+			"/docs/a.txt",
+			Some("https://app.filen.io/#/d/x"),
+			vec![],
+		);
+		assert_eq!(
+			unsaved_error(&unsaved, Ok(())).await,
+			(
+				"Created the public link of the file /docs/a.txt (https://app.filen.io/#/d/x) with \
+				 the default settings, but saving the settings failed: change them with `filen \
+				 public-link /docs/a.txt`, or delete it with `filen public-link --delete \
+				 /docs/a.txt`: server refused"
+					.to_owned(),
+				false
+			)
+		);
+	}
+
+	#[tokio::test]
+	async fn a_new_directory_link_left_with_its_defaults_quotes_the_path_in_the_commands() {
+		let unsaved = unsaved_link("directory", "/my docs", None, vec![]);
+		let quoted = if cfg!(unix) {
+			"'/my docs'"
+		} else {
+			"\"/my docs\""
+		};
+		assert_eq!(
+			unsaved_error(&unsaved, Ok(())).await,
+			(
+				format!(
+					"Created the public link of the directory /my docs with the default settings, \
+					 but saving the settings failed: change them with `filen public-link {quoted}`, \
+					 or delete it with `filen public-link --delete {quoted}`: server refused"
+				),
+				false
+			)
+		);
+	}
+
+	#[tokio::test]
+	async fn a_path_the_shell_would_expand_is_quoted_against_it_in_the_commands() {
+		let unsaved = unsaved_link("file", "/a $b", None, vec![]);
+		let quoted = if cfg!(unix) { "'/a $b'" } else { "\"/a $b\"" };
+		assert_eq!(
+			unsaved_error(&unsaved, Ok(())).await,
+			(
+				format!(
+					"Created the public link of the file /a $b with the default settings, but saving \
+					 the settings failed: change them with `filen public-link {quoted}`, or delete \
+					 it with `filen public-link --delete {quoted}`: server refused"
+				),
+				false
+			)
+		);
+	}
+
+	#[tokio::test]
+	async fn a_new_file_link_whose_protection_failed_to_save_is_deleted() {
+		let unsaved = unsaved_link(
+			"file",
+			"/docs/a b.txt",
+			Some("https://app.filen.io/#/d/x"),
+			vec![Protection::Password],
+		);
+		assert_eq!(
+			unsaved_error(&unsaved, Ok(())).await,
+			(
+				"Saving the settings of the new public link of the file /docs/a b.txt failed, so \
+				 the link was deleted and the file is not public; run the command again to create \
+				 it: server refused"
+					.to_owned(),
+				true
+			)
+		);
+	}
+
+	#[tokio::test]
+	async fn a_new_directory_link_whose_protection_failed_to_save_is_deleted() {
+		let unsaved = unsaved_link("directory", "/docs", None, vec![Protection::Expiry]);
+		assert_eq!(
+			unsaved_error(&unsaved, Ok(())).await,
+			(
+				"Saving the settings of the new public link of the directory /docs failed, so the \
+				 link was deleted and the directory is not public; run the command again to create \
+				 it: server refused"
+					.to_owned(),
+				true
+			)
+		);
+	}
+
+	#[tokio::test]
+	async fn a_new_link_that_cannot_be_deleted_either_says_the_item_is_public_without_its_protection()
+	 {
+		let unsaved = unsaved_link(
+			"file",
+			"/docs/a b.txt",
+			Some("https://app.filen.io/#/d/x"),
+			vec![
+				Protection::Password,
+				Protection::Expiry,
+				Protection::NoDownloads,
+			],
+		);
+		let delete_error = Err(anyhow::anyhow!("offline").context("Failed to delete public link"));
+		let quoted = if cfg!(unix) {
+			"'/docs/a b.txt'"
+		} else {
+			"\"/docs/a b.txt\""
+		};
+		assert_eq!(
+			unsaved_error(&unsaved, delete_error).await,
+			(
+				format!(
+					"Created the public link of the file /docs/a b.txt (https://app.filen.io/#/d/x), \
+					 but saving its settings failed, and deleting the link failed too (Failed to \
+					 delete public link: offline): the file /docs/a b.txt is public without the \
+					 password, the expiry and the download restriction asked for; change them with \
+					 `filen public-link {quoted}`, or delete it with `filen public-link --delete \
+					 {quoted}`: server refused"
+				),
+				true
+			)
+		);
+	}
+
+	#[tokio::test]
+	async fn a_new_directory_link_that_cannot_be_deleted_names_its_one_missing_protection() {
+		let unsaved = unsaved_link("directory", "/docs", None, vec![Protection::NoDownloads]);
+		let delete_error = Err(anyhow::anyhow!("offline"));
+		assert_eq!(
+			unsaved_error(&unsaved, delete_error).await,
+			(
+				"Created the public link of the directory /docs, but saving its settings failed, \
+				 and deleting the link failed too (offline): the directory /docs is public without \
+				 the download restriction asked for; change them with `filen public-link /docs`, or delete it \
+				 with `filen public-link --delete /docs`: server refused"
+					.to_owned(),
+				true
+			)
 		);
 	}
 }

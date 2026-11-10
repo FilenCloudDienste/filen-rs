@@ -185,6 +185,7 @@ Breaking changes are marked **Breaking**: scripts that depend on the old behavio
 - `head` and `tail` no longer ask before printing from a large file
 - viewing a file public link no longer replaces it
 - `logout` offers to delete a keyring entry the keyring cannot decode, so it can be removed, and exits with an error naming both causes when it can neither read nor delete it, instead of reporting nothing deleted
+- when `public-link` creates a link but fails to save its settings, it deletes the link if those settings asked for a password, an expiry or downloads off, so the item is not left public without them; otherwise, or if the delete fails too, the error says the link is public without the settings and how to change or delete it
 - `export-notes` replaces control characters in note titles and prefixes `_` to titles Windows reserves for a device, such as `CON`, `NUL`, `COM0` or `LPT¹`, also with spaces before the extension
 - `filen rclone` exits with 128 plus the signal when a signal ended Rclone, instead of 0
 - a terminal error while reading a text or password prompt is a `terminal_input` failure, not an unexpected one with a link to report a bug

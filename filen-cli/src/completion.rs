@@ -486,6 +486,19 @@ fn quote_word(word: &str, quote: Option<Quote>, quoting: Quoting) -> Option<Cow<
 	}
 }
 
+/// `word` quoted for a command line printed for the user to run in their shell. On Unix that is as
+/// `shlex` quotes it, in single quotes where it needs any: in the double quotes the REPL takes, the
+/// shell would expand a `$`, a backtick or a `!`. On Windows, and for a word `shlex` refuses (one
+/// holding a NUL), it is as a completion quotes it, or as it is where no quoting can give it (a
+/// double quote on Windows).
+pub(crate) fn quote_for_command_line(word: &str) -> Cow<'_, str> {
+	#[cfg(unix)]
+	if let Ok(quoted) = shlex::try_quote(word) {
+		return quoted;
+	}
+	quote_word(word, None, NATIVE_QUOTING).unwrap_or(Cow::Borrowed(word))
+}
+
 /// [`quote_word`] with [`Quoting::Shell`], which can quote every word.
 fn quote_shell_word(word: &str, quote: Option<Quote>) -> Cow<'_, str> {
 	let needs_quotes = word.starts_with('#') || word.contains([' ', '\t', '\n', '"', '\'', '\\']);
@@ -546,6 +559,20 @@ pub(crate) fn completer(
 mod tests {
 	use super::*;
 	use crate::command_line::split_on_double_quotes;
+
+	#[test]
+	fn a_word_printed_for_the_shell_is_quoted_so_that_it_does_not_expand() {
+		for (word, unix, windows) in [
+			("/docs", "/docs", "/docs"),
+			("/my docs", "'/my docs'", "\"/my docs\""),
+			("/a $b", "'/a $b'", "\"/a $b\""),
+			("/a`b", "'/a`b'", "/a`b"),
+			("/a!b", "'/a!b'", "/a!b"),
+		] {
+			let expected = if cfg!(unix) { unix } else { windows };
+			assert_eq!(quote_for_command_line(word), expected, "{word}");
+		}
+	}
 
 	fn words(words: &[&str]) -> Vec<String> {
 		words.iter().map(|word| (*word).to_owned()).collect()
