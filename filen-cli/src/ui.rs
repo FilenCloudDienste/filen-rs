@@ -542,7 +542,7 @@ impl UI {
 				}
 			}
 			FailureKind::Unexpected => {
-				self.print_failure(&format!("An unexpected error occurred: {}", err));
+				self.print_failure(&format!("An unexpected error occurred: {:#}", err));
 				self.print_failure(&format!(
 					"If you believe this is a bug, please report it at {BUG_REPORT_URL}"
 				));
@@ -1780,6 +1780,20 @@ mod tests {
 		// and is not left over for the next command either
 		ui.start_command_output();
 		ui.finish_command_output(false).unwrap();
+	}
+
+	#[test]
+	fn an_unexpected_error_is_printed_with_its_context() {
+		let printed = Printed::default();
+		let mut ui = printed.ui();
+
+		ui.print_failure_or_error(&anyhow::anyhow!("connection reset").context("Failed to list"));
+
+		assert_eq!(
+			console::strip_ansi_codes(&printed.lines()),
+			"✘ An unexpected error occurred: Failed to list: connection reset\n\
+			 ✘ If you believe this is a bug, please report it at https://github.com/FilenCloudDienste/filen-rs/issues"
+		);
 	}
 
 	/// What `print_failure_or_error` prints for `err` to stdout and to stderr, with or without
