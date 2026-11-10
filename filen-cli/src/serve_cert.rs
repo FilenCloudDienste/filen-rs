@@ -18,7 +18,7 @@ const DIR: &str = "serve-tls";
 const CERT_FILE: &str = "cert.pem";
 const KEY_FILE: &str = "key.pem";
 /// What the certificate names and when it expires, which reading it back would need an X.509
-/// parser for, and the fingerprint of the certificate it describes.
+/// parser for, and the fingerprints of the certificate it describes and of its key.
 const INFO_FILE: &str = "cert.json";
 
 /// How long a new certificate is valid for, in days.
@@ -57,6 +57,11 @@ struct CertInfo {
 	/// The fingerprint of the certificate written with this file, which tells a certificate left
 	/// from an interrupted write apart.
 	fingerprint: String,
+	/// The fingerprint of the PEM key written with this file, which tells a key replaced since
+	/// apart. Absent in a file an older CLI wrote, whose pair is then trusted until its next
+	/// regeneration.
+	#[serde(default)]
+	key_fingerprint: Option<String>,
 }
 
 /// The certificate in `config_dir` for servers listening on `hosts` (IP addresses or
@@ -132,15 +137,22 @@ fn names_for(hosts: &[&str]) -> BTreeSet<String> {
 }
 
 /// The certificate in `dir` and the fingerprint of its PEM file, when it is complete: its info
-/// file names it, and the key is there. Anything less is no certificate, to be generated again.
+/// file names it and the key it was made with. Anything less is no certificate, to be generated
+/// again.
 fn read_existing(dir: &Path) -> Option<(CertInfo, String)> {
 	let read = || -> Result<(CertInfo, String)> {
 		let info: CertInfo = serde_json::from_slice(&fs::read(dir.join(INFO_FILE))?)?;
-		let fingerprint = pem_fingerprint(&fs::read_to_string(dir.join(CERT_FILE))?)
+		let key = fs::read(dir.join(KEY_FILE)).context("the key is missing")?;
+		if let Some(key_fingerprint) = &info.key_fingerprint {
+			anyhow::ensure!(*key_fingerprint == fingerprint(&key), "the key changed");
+		}
+		let cert_fingerprint = pem_fingerprint(&fs::read_to_string(dir.join(CERT_FILE))?)
 			.context("not a PEM certificate")?;
-		anyhow::ensure!(info.fingerprint == fingerprint, "the certificate changed");
-		anyhow::ensure!(dir.join(KEY_FILE).is_file(), "the key is missing");
-		Ok((info, fingerprint))
+		anyhow::ensure!(
+			info.fingerprint == cert_fingerprint,
+			"the certificate changed"
+		);
+		Ok((info, cert_fingerprint))
 	};
 	match read() {
 		Ok(existing) => Some(existing),
@@ -174,20 +186,22 @@ fn generate(dir: &Path, names: BTreeSet<String>, now: DateTime<Utc>) -> Result<S
 	let cert = params
 		.self_signed(&key)
 		.context("Failed to make the certificate")?;
-	let fingerprint = fingerprint(cert.der());
+	let key_pem = key.serialize_pem();
+	let cert_fingerprint = fingerprint(cert.der());
 	let info = CertInfo {
 		names,
 		not_after: not_after
 			.and_hms_opt(0, 0, 0)
 			.expect("midnight is a time (should be impossible)")
 			.and_utc(),
-		fingerprint: fingerprint.clone(),
+		fingerprint: cert_fingerprint.clone(),
+		key_fingerprint: Some(fingerprint(key_pem.as_bytes())),
 	};
 	fs::create_dir_all(dir).with_context(|| format!("Failed to create {}", dir.display()))?;
 	write_private(dir, CERT_FILE, cert.pem().as_bytes())?;
-	write_private(dir, KEY_FILE, key.serialize_pem().as_bytes())?;
+	write_private(dir, KEY_FILE, key_pem.as_bytes())?;
 	write_private(dir, INFO_FILE, &serde_json::to_vec_pretty(&info)?)?;
-	Ok(fingerprint)
+	Ok(cert_fingerprint)
 }
 
 /// The year, month and day of `date`, as rcgen takes a date.
@@ -210,9 +224,9 @@ fn write_private(dir: &Path, name: &str, contents: &[u8]) -> Result<()> {
 	Ok(())
 }
 
-/// The fingerprint of the DER certificate `der`.
-fn fingerprint(der: &[u8]) -> String {
-	Sha256::digest(der)
+/// The SHA-256 fingerprint of `bytes`, uppercase hex bytes joined by `:`.
+fn fingerprint(bytes: &[u8]) -> String {
+	Sha256::digest(bytes)
 		.iter()
 		.map(|byte| format!("{byte:02X}"))
 		.collect::<Vec<_>>()
@@ -369,6 +383,36 @@ mod tests {
 
 		assert_eq!(second.origin, CertOrigin::Generated);
 		assert!(Path::new(&second.tls.key_path).is_file());
+	}
+
+	#[test]
+	fn a_replaced_key_replaces_the_certificate() {
+		let config_dir = tempfile::tempdir().unwrap();
+		let first = ensure(config_dir.path(), &["127.0.0.1"], now()).unwrap();
+		let other_key = KeyPair::generate().unwrap().serialize_pem();
+		fs::write(&first.tls.key_path, &other_key).unwrap();
+
+		let second = ensure(config_dir.path(), &["127.0.0.1"], now()).unwrap();
+
+		assert_eq!(second.origin, CertOrigin::Generated);
+		assert_ne!(second.fingerprint, first.fingerprint);
+		assert_ne!(fs::read_to_string(&second.tls.key_path).unwrap(), other_key);
+	}
+
+	#[test]
+	fn an_older_info_without_a_key_fingerprint_is_reused() {
+		let config_dir = tempfile::tempdir().unwrap();
+		let first = ensure(config_dir.path(), &["127.0.0.1"], now()).unwrap();
+		let info_path = config_dir.path().join(DIR).join(INFO_FILE);
+		let mut info: serde_json::Map<String, serde_json::Value> =
+			serde_json::from_slice(&fs::read(&info_path).unwrap()).unwrap();
+		assert!(info.remove("keyFingerprint").is_some());
+		fs::write(&info_path, serde_json::to_vec(&info).unwrap()).unwrap();
+
+		let second = ensure(config_dir.path(), &["127.0.0.1"], now()).unwrap();
+
+		assert_eq!(second.origin, CertOrigin::Reused);
+		assert_eq!(second.fingerprint, first.fingerprint);
 	}
 
 	#[test]
