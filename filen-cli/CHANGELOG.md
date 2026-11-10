@@ -191,6 +191,7 @@ Breaking changes are marked **Breaking**: scripts that depend on the old behavio
 - `mount` and `serve --cache-size` accept only `n`, `nB` and `nU`, `nUi`, `nUB` or `nUiB` with a unit `K`, `M`, `G` or `T`, and refuse a malformed suffix such as `10iB` (read as 10 bytes) or `10MBB` (read as 10 MiB)
 - a sync pair with an empty local or remote path, as in `:/docs` or `/home/me/docs:`, is refused instead of syncing the working directory or the remote working path
 - a sync pairs file that gives an alias `sync` cannot select, one with `:` or a path separator or an empty one, is refused
+- on Windows, `download` and `download-shared` print `C:\...` paths instead of `\\?\C:\...`, where the path means the same without the prefix; they still write into an existing destination through its `\\?\` path, so a downloaded name ending in a dot or a space keeps it there
 - a failed write to stdout, as on a full disk, ends the command with a message and exit code 1 instead of a crash; in the REPL it fails only that command
 
 ### Security

@@ -54,6 +54,9 @@ ansi-width = "0.1.0"
 # `LogFiles` writes the log files.
 ftail = { version = "0.3.1", default-features = false }
 dirs = "6.0.0"
+# download paths printed as `C:\x`, not as the verbatim `\\?\C:\x` downloads write through; the
+# version filen-sdk-rs uses
+dunce = "1.0.5"
 reqwest = { version = "0.12.22", features = [
 	"rustls-tls",
 ], default-features = false }

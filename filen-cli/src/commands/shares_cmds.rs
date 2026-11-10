@@ -24,11 +24,7 @@
 //!
 //! With `--json`, the listings are printed as arrays.
 
-use std::{
-	borrow::Cow,
-	path::{Path, PathBuf},
-	sync::Arc,
-};
+use std::{borrow::Cow, sync::Arc};
 
 use anyhow::{Context as _, Result};
 use clap::Subcommand;
@@ -41,7 +37,7 @@ use filen_sdk_rs::{
 		categories::{DirType, NonRootFileType, NonRootItemType, Normal, RootItemType, Shared},
 		file::traits::File,
 	},
-	io::{AnonymousRemoteFile, DirDownloadOptions, HasFileInfo as _, is_safe_descendant},
+	io::{AnonymousRemoteFile, DirDownloadOptions, HasFileInfo as _},
 };
 use filen_types::fs::Uuid;
 use futures::{StreamExt as _, stream};
@@ -55,8 +51,8 @@ use crate::{
 		contacts_cmds::find_entry,
 		fs_cmds::resolve_item_path,
 		transfer_cmds::{
-			TransferKind, TransferProgress, download_directory, download_file, finish,
-			run_cancellable,
+			DownloadPath, TransferKind, TransferProgress, download_directory, download_file,
+			finish, run_cancellable,
 		},
 	},
 	completion::FilenCompleter,
@@ -760,12 +756,17 @@ fn print_shared_file(ui: &mut UI, file: &AnonymousRemoteFile, sharer: &str) -> R
 
 /// The local path a shared item named `name` is downloaded to inside `destination`. A name that is
 /// not one plain path component would land outside it, so it is refused, not cleaned up.
-fn download_target(destination: &Path, name: Option<&str>, source: &str) -> Result<PathBuf> {
+fn download_target(
+	destination: &DownloadPath,
+	name: Option<&str>,
+	source: &str,
+) -> Result<DownloadPath> {
 	match name {
-		Some(name) if is_safe_descendant(name) => Ok(destination.join(name)),
-		Some(name) => Err(UI::failure(&format!(
-			"Cannot download {source}: its name {name:?} is not a plain file name"
-		))),
+		Some(name) => destination.child(name).ok_or_else(|| {
+			UI::failure(&format!(
+				"Cannot download {source}: its name {name:?} is not a plain file name"
+			))
+		}),
 		None => Err(UI::failure(&format!(
 			"Cannot download {source}: its name could not be decrypted"
 		))),
@@ -800,12 +801,12 @@ async fn download_shared(
 ) -> Result<()> {
 	let (first, rest) = split_download_source(source)?;
 	let destination = destination.unwrap_or(".");
-	let destination = std::fs::canonicalize(destination)
+	let destination = DownloadPath::canonicalize(destination)
 		.map_err(|_| UI::failure(&format!("No such local directory: {destination}")))?;
-	if !destination.is_dir() {
+	if !destination.io().is_dir() {
 		return Err(UI::failure(&format!(
 			"Not a directory: {}",
-			destination.display()
+			destination.shown()
 		)));
 	}
 	// the path as it is shown, without the empty segments a leading or doubled `/` leaves
@@ -845,7 +846,7 @@ async fn download_shared(
 			path
 		}
 	};
-	let target = target.display().to_string();
+	let target = target.shown();
 	finish(ui, &progress, &format!("{source} to {target}"), &target)
 }
 
@@ -855,9 +856,9 @@ async fn download_shared_file(
 	client: &Client,
 	progress: &TransferProgress,
 	file: &dyn File,
-	destination: &Path,
+	destination: &DownloadPath,
 	source: &str,
-) -> Result<PathBuf> {
+) -> Result<DownloadPath> {
 	let path = download_target(destination, file.name(), source)?;
 	run_cancellable(
 		ui,
@@ -1108,20 +1109,27 @@ mod tests {
 
 	#[test]
 	fn a_download_lands_inside_the_destination_under_the_item_name() {
-		let destination = Path::new("/tmp/downloads");
+		let dir = tempfile::tempdir().unwrap();
+		let canonical = std::fs::canonicalize(dir.path()).unwrap();
+		let destination = &DownloadPath::canonicalize(dir.path()).unwrap();
 		assert_eq!(
-			download_target(destination, Some("a.txt"), "Photos/a.txt").unwrap(),
-			Path::new("/tmp/downloads/a.txt")
+			download_target(destination, Some("a.txt"), "Photos/a.txt")
+				.unwrap()
+				.io(),
+			canonical.join("a.txt")
 		);
 		assert_eq!(
-			download_target(destination, Some("..x"), "Photos/..x").unwrap(),
-			Path::new("/tmp/downloads/..x")
+			download_target(destination, Some("..x"), "Photos/..x")
+				.unwrap()
+				.io(),
+			canonical.join("..x")
 		);
 	}
 
 	#[test]
 	fn a_download_refuses_a_name_that_is_not_one_plain_component() {
-		let destination = Path::new("/tmp/downloads");
+		let dir = tempfile::tempdir().unwrap();
+		let destination = &DownloadPath::canonicalize(dir.path()).unwrap();
 		for name in ["..", ".", "", "a/b", "/etc/passwd", "../a.txt"] {
 			let err = download_target(destination, Some(name), "Photos").unwrap_err();
 			assert_eq!(exit_code(&err), 1, "{name:?}");

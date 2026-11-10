@@ -2202,6 +2202,7 @@ dependencies = [
  "ctrlc",
  "dirs",
  "dotenv",
+ "dunce",
  "filen-macros",
  "filen-sdk-rs",
  "filen-types",

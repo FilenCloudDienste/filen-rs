@@ -139,7 +139,7 @@ use filen_sdk_rs::{
 		CategoryDirDownloadExtPub, DirDownloadCallback, DirDownloadOptions, DirUploadCallback,
 		DirUploadOptions, ExistingLocalFile, ExistingRemoteFile, FileUploadJournalStore,
 		PartialDownload, PathMatcher, RemoteDirectory, RemoteFile, SymlinkPolicy, TransferFilter,
-		UploadJournalStore, client_impl::IoSharedClientExt, is_safe_descendant,
+		UploadJournalStore, client_impl::IoSharedClientExt,
 	},
 	sync_engine::PathPatterns,
 	util::MaybeSendCallback,
@@ -151,6 +151,7 @@ use tokio::{
 	select,
 };
 
+pub(crate) use self::download_path::{DownloadPath, shown_local_path};
 use crate::{
 	CliConfig, CommandResult,
 	auth::LazyClient,
@@ -972,7 +973,7 @@ fn upload_name(source: &Path) -> Result<String> {
 
 /// Where a download goes.
 struct DownloadDestination<'a> {
-	path: &'a Path,
+	path: &'a DownloadPath,
 	/// Whether the item goes inside `path` under its own name, as with a trailing separator.
 	into: bool,
 	/// What `path` named before the download.
@@ -1020,11 +1021,8 @@ pub(crate) async fn download(
 			destination_str
 		)));
 	}
-	let destination_path = match existing {
-		Existing::Dir | Existing::File => std::fs::canonicalize(destination_str),
-		Existing::Nothing => std::path::absolute(destination_str),
-	}
-	.map_err(|e| UI::failure(&format!("Cannot read {}: {}", destination_str, e)))?;
+	let destination_path = DownloadPath::resolve(destination_str, existing)
+		.map_err(|e| UI::failure(&format!("Cannot read {}: {}", destination_str, e)))?;
 	let destination = DownloadDestination {
 		path: &destination_path,
 		into,
@@ -1078,7 +1076,7 @@ pub(crate) async fn download(
 	}
 
 	let (subject, destination) = if several {
-		let destination = destination_path.display().to_string();
+		let destination = destination_path.shown();
 		(
 			format!("{} items to {}", sources.len(), destination),
 			destination,
@@ -1175,18 +1173,18 @@ async fn download_source(
 		}
 	};
 	transferred.context("Failed to download")?;
-	Ok(target.display().to_string())
+	Ok(target.shown())
 }
 
 /// Create the missing local directories above `target`.
-fn create_parent_dir(target: &Path) -> Result<()> {
-	let Some(parent) = target.parent() else {
+fn create_parent_dir(target: &DownloadPath) -> Result<()> {
+	let Some(parent) = target.io().parent() else {
 		return Ok(());
 	};
 	std::fs::create_dir_all(parent).map_err(|e| {
 		UI::failure(&format!(
 			"Cannot create directory {}: {}",
-			parent.display(),
+			shown_local_path(parent),
 			e
 		))
 	})
@@ -1400,7 +1398,66 @@ async fn download_link(
 			target
 		}
 	};
-	Ok(target.display().to_string())
+	Ok(target.shown())
+}
+
+/// The local paths a download writes to, kept apart from the form they are printed in.
+mod download_path {
+	use std::{io, path::Path};
+
+	use filen_sdk_rs::io::is_safe_descendant;
+
+	use super::Existing;
+
+	/// A local path a download writes to or under, absolute, and resolved by
+	/// [`std::fs::canonicalize`] where it exists. On Windows that gives the verbatim `\\?\C:\...`
+	/// form, under which a name joined to it is taken as it is: a trailing dot or space is kept, and
+	/// a reserved device name such as `CON` names a file, not the device. It has no `Display`:
+	/// [`DownloadPath::io`] is the path the file system is given, and [`DownloadPath::shown`] the
+	/// form printed.
+	#[derive(Clone, Debug)]
+	pub(crate) struct DownloadPath(std::path::PathBuf);
+
+	impl DownloadPath {
+		/// The path of the download destination `destination`, which `existing` says what it names:
+		/// canonical when it exists, made absolute (resolving nothing) when it does not.
+		pub(super) fn resolve(destination: &str, existing: Existing) -> io::Result<Self> {
+			match existing {
+				Existing::Dir | Existing::File => Self::canonicalize(destination),
+				Existing::Nothing => std::path::absolute(destination).map(Self),
+			}
+		}
+
+		/// The canonical path of `path`, which exists.
+		pub(crate) fn canonicalize(path: impl AsRef<Path>) -> io::Result<Self> {
+			std::fs::canonicalize(path).map(Self)
+		}
+
+		/// The path to read and write through, which is never printed.
+		pub(crate) fn io(&self) -> &Path {
+			&self.0
+		}
+
+		/// The path as it is printed, see [`shown_local_path`].
+		pub(crate) fn shown(&self) -> String {
+			shown_local_path(&self.0)
+		}
+
+		/// Where an item named `name` goes inside this path, or `None` when the name is not a single
+		/// plain path component (`..`, an absolute path, one holding a separator) and joining it
+		/// would leave this path. The name comes from the item's decrypted metadata, which the
+		/// server does not validate.
+		pub(crate) fn child(&self, name: &str) -> Option<Self> {
+			is_safe_descendant(name).then(|| Self(self.0.join(name)))
+		}
+	}
+
+	/// A local path a download reads or writes, as it is printed: on Windows without the verbatim
+	/// `\\?\` prefix where the path means the same without it (`\\?\C:\x` as `C:\x`), as it is
+	/// elsewhere.
+	pub(crate) fn shown_local_path(path: &Path) -> String {
+		dunce::simplified(path).display().to_string()
+	}
 }
 
 /// What a local path names, following symlinks.
@@ -1432,47 +1489,39 @@ enum DownloadSource<'a> {
 /// is the item's new path. A file may replace an existing file, but a directory may not. The
 /// target's parent may not exist yet.
 fn resolve_download_target(
-	destination: &Path,
+	destination: &DownloadPath,
 	into: bool,
 	existing: Existing,
 	source: DownloadSource<'_>,
 	source_path: &dyn fmt::Display,
-) -> Result<PathBuf> {
+) -> Result<DownloadPath> {
 	let inside = || match source {
 		DownloadSource::File(name) | DownloadSource::Dir(name) => {
-			download_target(destination, name).ok_or_else(|| {
+			destination.child(name).ok_or_else(|| {
 				UI::failure(&format!(
 					"Cannot download {}: its name {:?} is not a plain file name",
 					source_path, name
 				))
 			})
 		}
-		DownloadSource::Root => Ok(destination.to_path_buf()),
+		DownloadSource::Root => Ok(destination.clone()),
 	};
 	match existing {
 		Existing::Dir => inside(),
 		Existing::File if into => Err(UI::failure(&format!(
 			"Not a directory: {}",
-			destination.display()
+			destination.shown()
 		))),
 		Existing::File => match source {
-			DownloadSource::File(_) => Ok(destination.to_path_buf()),
+			DownloadSource::File(_) => Ok(destination.clone()),
 			DownloadSource::Dir(_) | DownloadSource::Root => Err(UI::failure(&format!(
 				"Cannot download a directory onto the file {}",
-				destination.display()
+				destination.shown()
 			))),
 		},
 		Existing::Nothing if into => inside(),
-		Existing::Nothing => Ok(destination.to_path_buf()),
+		Existing::Nothing => Ok(destination.clone()),
 	}
-}
-
-/// Where an item named `name` is downloaded to inside `destination`, or `None` when the name is not
-/// a single plain path component (`..`, an absolute path, one holding a separator) and joining it
-/// would leave `destination`. The name comes from the item's decrypted metadata, which the server
-/// does not validate.
-fn download_target(destination: &Path, name: &str) -> Option<PathBuf> {
-	is_safe_descendant(name).then(|| destination.join(name))
 }
 
 /// Await `transfer` until it completes or the user hits Ctrl+C, erasing the progress line either
@@ -1708,7 +1757,7 @@ pub(crate) async fn download_file<C>(
 	client: &C,
 	progress: &TransferProgress,
 	source: &dyn File,
-	target: &Path,
+	target: &DownloadPath,
 	options: &DirDownloadOptions,
 ) -> Result<()>
 where
@@ -1717,8 +1766,8 @@ where
 	progress.start_single_item(source.size());
 	match options.existing {
 		// Whatever is at the path, even a dangling symlink, is kept.
-		ExistingLocalFile::Keep if std::fs::symlink_metadata(target).is_ok() => {
-			progress.skip([target.display().to_string()], source.size());
+		ExistingLocalFile::Keep if std::fs::symlink_metadata(target.io()).is_ok() => {
+			progress.skip([target.shown()], source.size());
 			return Ok(());
 		}
 		ExistingLocalFile::Keep | ExistingLocalFile::ReplaceUnlessSame => {}
@@ -1727,14 +1776,14 @@ where
 	match options.partial {
 		PartialDownload::Discard => {
 			client
-				.download_file_to_path_unless_same_hash(source, target, callback)
+				.download_file_to_path_unless_same_hash(source, target.io(), callback)
 				.await
 		}
 		PartialDownload::Resume => {
 			client
 				.download_file_to_path_resuming(
 					source,
-					target,
+					target.io(),
 					callback,
 					Some(progress.resumed_callback()),
 				)
@@ -1751,7 +1800,7 @@ pub(crate) async fn download_directory<Cat>(
 	client: Arc<Cat::Client>,
 	progress: &TransferProgress,
 	source: DirType<'static, Cat>,
-	target: &Path,
+	target: &DownloadPath,
 	context: Cat::ListDirContext<'_>,
 	options: DirDownloadOptions,
 ) -> Result<()>
@@ -1760,11 +1809,12 @@ where
 	TransferProgress: DirDownloadCallback<Cat>,
 {
 	let target = target
+		.io()
 		.to_str()
 		.ok_or_else(|| {
 			UI::failure(&format!(
 				"Destination path is not valid UTF-8: {}",
-				target.display()
+				target.shown()
 			))
 		})?
 		.to_string();
@@ -2441,7 +2491,9 @@ impl<Cat: Category> DirDownloadCallback<Cat> for TransferProgress {
 		if self.list_files {
 			self.print_above(
 				&mut state,
-				downloaded_files.into_iter().map(|(_, path)| path),
+				downloaded_files
+					.into_iter()
+					.map(|(_, path)| shown_local_path(Path::new(&path))),
 			);
 		}
 		self.advance_locked(&mut state, files, downloaded_bytes);
@@ -2451,7 +2503,12 @@ impl<Cat: Category> DirDownloadCallback<Cat> for TransferProgress {
 		let bytes = skipped_files
 			.iter()
 			.fold(0u64, |bytes, (file, _)| bytes.saturating_add(file.size()));
-		self.skip(skipped_files.into_iter().map(|(_, path)| path), bytes);
+		self.skip(
+			skipped_files
+				.into_iter()
+				.map(|(_, path)| shown_local_path(Path::new(&path))),
+			bytes,
+		);
 	}
 
 	fn on_download_resumed(&self, resumed_bytes: u64) {
@@ -2460,7 +2517,7 @@ impl<Cat: Category> DirDownloadCallback<Cat> for TransferProgress {
 
 	fn on_download_errors(&self, errors: Vec<(Error, String, NonRootItemType<'static, Cat>)>) {
 		self.push_failures(errors.into_iter().map(|(e, path, _)| TransferFailure {
-			path: Some(path),
+			path: Some(shown_local_path(Path::new(&path))),
 			error: e.to_string(),
 		}));
 	}
@@ -2484,14 +2541,14 @@ mod tests {
 	};
 
 	use super::{
-		DownloadSource, Existing, FilterArgs, LinkAccess, LinkKind, ProgressState, PublicLink,
-		SPEED_WINDOW, Tally, TransferFailure, TransferKind, TransferProgress, UploadTarget,
-		canceled_message, decode_hex_key, download_target, ends_the_command, ensure_stdio_is_free,
+		DownloadPath, DownloadSource, Existing, FilterArgs, LinkAccess, LinkKind, ProgressState,
+		PublicLink, SPEED_WINDOW, Tally, TransferFailure, TransferKind, TransferProgress,
+		UploadTarget, canceled_message, decode_hex_key, ends_the_command, ensure_stdio_is_free,
 		existing_remote_policy, expand_source_wildcards, format_duration, local_existing,
 		open_linked_file, partial_download, progress_line, report_canceled,
-		resolve_download_target, resolve_upload_target, result_json, skipped_symlinks_line,
-		source_failure, sources_and_destination, stdin_destination, stdin_upload_target,
-		transfer_summary, upload_journal,
+		resolve_download_target, resolve_upload_target, result_json, shown_local_path,
+		skipped_symlinks_line, source_failure, sources_and_destination, stdin_destination,
+		stdin_upload_target, transfer_summary, upload_journal,
 	};
 	use crate::{
 		CliConfig,
@@ -3422,19 +3479,30 @@ mod tests {
 		);
 	}
 
+	/// `path` made absolute, as [`DownloadPath::resolve`] makes a destination that does not exist.
+	fn absolute(path: &str) -> PathBuf {
+		std::path::absolute(path).unwrap()
+	}
+
+	/// A destination path that is `destination` made absolute, without looking it up.
+	fn destination_path(destination: &str) -> DownloadPath {
+		DownloadPath::resolve(destination, Existing::Nothing).unwrap()
+	}
+
 	fn download_target_of(
 		destination: &str,
 		into: bool,
 		existing: Existing,
 		source: DownloadSource<'_>,
-	) -> Result<std::path::PathBuf, String> {
+	) -> Result<PathBuf, String> {
 		resolve_download_target(
-			Path::new(destination),
+			&destination_path(destination),
 			into,
 			existing,
 			source,
 			&RemotePath::new("/remote/item"),
 		)
+		.map(|target| target.io().to_path_buf())
 		.map_err(|e| e.to_string())
 	}
 
@@ -3442,7 +3510,7 @@ mod tests {
 	fn a_download_to_an_existing_directory_goes_inside_it() {
 		assert_eq!(
 			download_target_of("/dest", false, Existing::Dir, DownloadSource::File("a.txt")),
-			Ok(Path::new("/dest/a.txt").to_path_buf())
+			Ok(absolute("/dest/a.txt"))
 		);
 	}
 
@@ -3455,7 +3523,7 @@ mod tests {
 				Existing::Nothing,
 				DownloadSource::File("a.txt")
 			),
-			Ok(Path::new("/dest/renamed.txt").to_path_buf())
+			Ok(absolute("/dest/renamed.txt"))
 		);
 		assert_eq!(
 			download_target_of(
@@ -3464,7 +3532,7 @@ mod tests {
 				Existing::Nothing,
 				DownloadSource::Dir("a")
 			),
-			Ok(Path::new("/dest/new").to_path_buf())
+			Ok(absolute("/dest/new"))
 		);
 	}
 
@@ -3472,7 +3540,7 @@ mod tests {
 	fn a_download_into_a_missing_directory_goes_inside_it() {
 		assert_eq!(
 			download_target_of("/dest/", true, Existing::Nothing, DownloadSource::Dir("a")),
-			Ok(Path::new("/dest/a").to_path_buf())
+			Ok(absolute("/dest/a"))
 		);
 	}
 
@@ -3480,7 +3548,7 @@ mod tests {
 	fn the_drive_root_is_downloaded_into_a_missing_directory() {
 		assert_eq!(
 			download_target_of("/dest", false, Existing::Nothing, DownloadSource::Root),
-			Ok(Path::new("/dest").to_path_buf())
+			Ok(absolute("/dest"))
 		);
 	}
 
@@ -3493,7 +3561,7 @@ mod tests {
 				Existing::File,
 				DownloadSource::File("a.txt")
 			),
-			Ok(Path::new("/dest/old.txt").to_path_buf())
+			Ok(absolute("/dest/old.txt"))
 		);
 	}
 
@@ -3506,7 +3574,10 @@ mod tests {
 				Existing::File,
 				DownloadSource::Dir("a")
 			),
-			Err("Cannot download a directory onto the file /dest/old.txt".to_owned())
+			Err(format!(
+				"Cannot download a directory onto the file {}",
+				shown_local_path(&absolute("/dest/old.txt"))
+			))
 		);
 	}
 
@@ -3519,7 +3590,10 @@ mod tests {
 				Existing::File,
 				DownloadSource::File("a.txt")
 			),
-			Err("Not a directory: /dest/old.txt/".to_owned())
+			Err(format!(
+				"Not a directory: {}",
+				shown_local_path(&absolute("/dest/old.txt/"))
+			))
 		);
 	}
 
@@ -3548,28 +3622,112 @@ mod tests {
 		);
 	}
 
+	/// Where an item named `name` goes inside the destination `/dest`.
+	fn child_of_dest(name: &str) -> Option<PathBuf> {
+		destination_path("/dest")
+			.child(name)
+			.map(|child| child.io().to_path_buf())
+	}
+
 	#[test]
 	fn a_plain_name_is_downloaded_into_the_destination() {
 		assert_eq!(
-			download_target(Path::new("/dest"), "notes.txt"),
-			Some(Path::new("/dest/notes.txt").to_path_buf())
+			child_of_dest("notes.txt"),
+			Some(absolute("/dest/notes.txt"))
 		);
 	}
 
 	#[test]
 	fn a_parent_reference_is_refused() {
-		assert_eq!(download_target(Path::new("/dest"), ".."), None);
-		assert_eq!(download_target(Path::new("/dest"), "../x"), None);
+		assert_eq!(child_of_dest(".."), None);
+		assert_eq!(child_of_dest("../x"), None);
 	}
 
 	#[test]
 	fn an_absolute_name_is_refused() {
-		assert_eq!(download_target(Path::new("/dest"), "/etc/x"), None);
+		assert_eq!(child_of_dest("/etc/x"), None);
 	}
 
 	#[test]
 	fn a_name_holding_a_separator_is_refused() {
-		assert_eq!(download_target(Path::new("/dest"), "a/b"), None);
+		assert_eq!(child_of_dest("a/b"), None);
+	}
+
+	#[test]
+	fn an_existing_download_destination_is_written_through_its_canonical_path() {
+		let dir = tempfile::tempdir().unwrap();
+		let canonical = fs::canonicalize(dir.path()).unwrap();
+		let destination =
+			DownloadPath::resolve(dir.path().to_str().unwrap(), Existing::Dir).unwrap();
+		assert_eq!(destination.io(), canonical);
+		assert_eq!(
+			destination.child("a.txt").unwrap().io(),
+			canonical.join("a.txt")
+		);
+	}
+
+	#[cfg(not(windows))]
+	#[test]
+	fn a_download_path_is_shown_as_it_is_outside_windows() {
+		assert_eq!(
+			shown_local_path(Path::new(r"\\?\C:\dest\a.txt")),
+			r"\\?\C:\dest\a.txt"
+		);
+		assert_eq!(shown_local_path(Path::new("/dest/a.txt")), "/dest/a.txt");
+	}
+
+	#[cfg(windows)]
+	#[test]
+	fn a_verbatim_download_path_is_shown_without_its_prefix() {
+		assert_eq!(
+			shown_local_path(Path::new(r"\\?\C:\dest\a.txt")),
+			r"C:\dest\a.txt"
+		);
+	}
+
+	#[cfg(windows)]
+	#[test]
+	fn a_verbatim_path_that_means_something_else_without_its_prefix_is_shown_as_it_is() {
+		// without the prefix, Windows would drop the trailing dot and open the device
+		for path in [r"\\?\C:\dest\report.", r"\\?\C:\dest\CON"] {
+			assert_eq!(shown_local_path(Path::new(path)), path);
+		}
+	}
+
+	#[cfg(windows)]
+	#[test]
+	fn an_existing_download_destination_keeps_its_verbatim_prefix_for_io() {
+		let dir = tempfile::tempdir().unwrap();
+		let destination =
+			DownloadPath::resolve(dir.path().to_str().unwrap(), Existing::Dir).unwrap();
+		assert!(
+			destination.io().to_string_lossy().starts_with(r"\\?\"),
+			"{}",
+			destination.shown()
+		);
+		assert!(
+			!destination.shown().starts_with(r"\\?\"),
+			"{}",
+			destination.shown()
+		);
+	}
+
+	#[cfg(windows)]
+	#[test]
+	fn a_name_with_a_trailing_dot_is_downloaded_under_that_name() {
+		let dir = tempfile::tempdir().unwrap();
+		let destination =
+			DownloadPath::resolve(dir.path().to_str().unwrap(), Existing::Dir).unwrap();
+		fs::write(destination.child("report.").unwrap().io(), b"dot").unwrap();
+		fs::write(destination.child("report").unwrap().io(), b"plain").unwrap();
+		assert_eq!(
+			fs::read(destination.child("report.").unwrap().io()).unwrap(),
+			b"dot"
+		);
+		assert_eq!(
+			fs::read(destination.child("report").unwrap().io()).unwrap(),
+			b"plain"
+		);
 	}
 }
 
