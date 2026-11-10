@@ -26,7 +26,7 @@ use unicode_width::{UnicodeWidthChar as _, UnicodeWidthStr};
 
 use crate::{
 	CliArgs,
-	completion::async_completions_available,
+	completion::{async_completions_available, clear_completion_listings},
 	error::{self, CliError, find_cli_error},
 	interrupt,
 	repl_history::ReplHistory,
@@ -649,6 +649,8 @@ impl UI {
 		working_path: &RemotePath,
 	) -> Result<ReplPrompt> {
 		info!("[PROMPT] prompt_repl with path: {}", working_path);
+		// completion lists a directory once per prompt, so the last command's changes show
+		clear_completion_listings();
 		let prompt_prefix = self.redact_for_replay_testing(format!("({})", client.email()));
 		let render_config = RenderConfig::default()
 			.with_prompt_prefix(

@@ -1,4 +1,11 @@
-use std::{borrow::Cow, ffi::OsString, iter, mem, str::FromStr, sync::Arc};
+use std::{
+	borrow::Cow,
+	collections::HashMap,
+	ffi::OsString,
+	iter, mem,
+	str::FromStr,
+	sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError},
+};
 
 use anyhow::{Context, Result};
 use clap::{CommandFactory as _, builder::OsStr};
@@ -246,48 +253,22 @@ impl FilenCompleter {
 				}
 				let path_before_basename = working_path.navigate(input_before_basename);
 
-				// `list_dir` is generic over the category, which the variants alone do not name
-				let parent: DirType<'_, Normal> = match client
-					.find_item_at_path(&path_before_basename.0)
-					.await
-					.context("Failed to find parent dir")?
-				{
-					Some(NonRootFileType::Dir(dir)) => DirType::Dir(dir),
-					Some(NonRootFileType::Root(root)) => DirType::Root(root),
-					// a half-typed path routinely names a parent that does not exist (yet),
-					// which is no error: it just has no completions
-					Some(_) => {
-						log::debug!("No completions: {path_before_basename} is not a directory");
-						return Ok(vec![]);
-					}
+				let names = match cached_listing(&path_before_basename) {
+					Some(names) => names,
 					None => {
-						log::debug!("No completions: {path_before_basename} does not exist");
-						return Ok(vec![]);
+						// read before listing, so that a listing that outlives its prompt is not
+						// cached for the next one
+						let generation = listing_generation();
+						let Some(names) = list_names(client, &path_before_basename).await? else {
+							return Ok(vec![]);
+						};
+						cache_listing(generation, path_before_basename, Arc::clone(&names));
+						names
 					}
 				};
-				let (dirs, files) = client
-					// a completion shows no progress
-					.list_dir(&parent, None::<&fn(u64, Option<u64>)>)
-					.await
-					.context("Failed to list parent directory")?;
-				let mut candidates = Vec::new();
-				for dir in dirs {
-					let name = dir.meta.name().unwrap_or("");
-					if name.starts_with(basename_input) {
-						candidates.push(name.to_string());
-					}
-				}
-				if arg_type == FilenArgType::File || arg_type == FilenArgType::FileOrDirectory {
-					for file in files {
-						let name = file.meta.name().unwrap_or("");
-						if name.starts_with(basename_input) {
-							candidates.push(name.to_string());
-						}
-					}
-				}
-				Ok(candidates
-					.iter()
-					.map(|c| input_before_basename.to_string() + c)
+				Ok(matching_names(&names, basename_input, &arg_type)
+					.into_iter()
+					.map(|name| format!("{input_before_basename}{name}"))
 					.collect())
 			}
 			FilenArgType::HelpTopic => Ok(get_help_topics()
@@ -299,6 +280,123 @@ impl FilenCompleter {
 				.collect()),
 		}
 	}
+}
+
+/// The names in a remote directory, as completion offers them.
+#[derive(Debug, PartialEq, Eq)]
+struct DirNames {
+	dirs: Vec<String>,
+	files: Vec<String>,
+}
+
+/// The directories listed for completion during the current REPL prompt, by path, so that typing
+/// on in one path lists its directory once rather than on every keystroke. They are kept for one
+/// prompt only ([`clear_completion_listings`] runs as each prompt starts), so completion always
+/// sees what the previous command changed. A listing is shared with the tasks completing from it,
+/// which outlive the lock.
+static LISTINGS: LazyLock<Mutex<Listings>> = LazyLock::new(|| {
+	Mutex::new(Listings {
+		generation: ListingGeneration(0),
+		dirs: HashMap::new(),
+	})
+});
+
+struct Listings {
+	/// The prompt the listings in `dirs` were taken during.
+	generation: ListingGeneration,
+	dirs: HashMap<RemotePath, Arc<DirNames>>,
+}
+
+/// Counts the REPL prompts, so that a listing is cached only during the prompt it was taken in: a
+/// completion task can still be listing when its command runs and the next prompt starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ListingGeneration(u64);
+
+fn listings() -> MutexGuard<'static, Listings> {
+	LISTINGS.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Forgets every directory listed for completion; called as each REPL prompt starts.
+pub(crate) fn clear_completion_listings() {
+	let mut listings = listings();
+	listings.dirs.clear();
+	// one per prompt, so it cannot come back round to a generation still in use
+	listings.generation = ListingGeneration(listings.generation.0.wrapping_add(1));
+}
+
+/// The current prompt's generation, to pass to [`cache_listing`] for a listing taken from now on.
+fn listing_generation() -> ListingGeneration {
+	listings().generation
+}
+
+fn cached_listing(path: &RemotePath) -> Option<Arc<DirNames>> {
+	listings().dirs.get(path).map(Arc::clone)
+}
+
+/// Caches `names` as the listing of `path`, unless a prompt started since `generation` was read.
+fn cache_listing(generation: ListingGeneration, path: RemotePath, names: Arc<DirNames>) {
+	let mut listings = listings();
+	if listings.generation == generation {
+		listings.dirs.insert(path, names);
+	}
+}
+
+/// Lists the directory at `path`, or `None` when nothing is there or it is not a directory.
+async fn list_names(client: &Client, path: &RemotePath) -> Result<Option<Arc<DirNames>>> {
+	// `list_dir` is generic over the category, which the variants alone do not name
+	let parent: DirType<'_, Normal> = match client
+		.find_item_at_path(&path.0)
+		.await
+		.context("Failed to find parent dir")?
+	{
+		Some(NonRootFileType::Dir(dir)) => DirType::Dir(dir),
+		Some(NonRootFileType::Root(root)) => DirType::Root(root),
+		// a half-typed path routinely names a parent that does not exist (yet), which is no
+		// error: it just has no completions
+		Some(_) => {
+			log::debug!("No completions: {path} is not a directory");
+			return Ok(None);
+		}
+		None => {
+			log::debug!("No completions: {path} does not exist");
+			return Ok(None);
+		}
+	};
+	let (dirs, files) = client
+		// a completion shows no progress
+		.list_dir(&parent, None::<&fn(u64, Option<u64>)>)
+		.await
+		.context("Failed to list parent directory")?;
+	Ok(Some(Arc::new(DirNames {
+		dirs: dirs
+			.iter()
+			.map(|dir| dir.meta.name().unwrap_or("").to_owned())
+			.collect(),
+		files: files
+			.iter()
+			.map(|file| file.meta.name().unwrap_or("").to_owned())
+			.collect(),
+	})))
+}
+
+/// The names in `names` starting with `basename` that an argument of `arg_type` takes: directories
+/// always, files only where a file fits.
+fn matching_names<'a>(
+	names: &'a DirNames,
+	basename: &str,
+	arg_type: &FilenArgType,
+) -> Vec<&'a str> {
+	let files: &[String] = match arg_type {
+		FilenArgType::File | FilenArgType::FileOrDirectory => &names.files,
+		FilenArgType::Directory | FilenArgType::HelpTopic => &[],
+	};
+	names
+		.dirs
+		.iter()
+		.chain(files)
+		.map(String::as_str)
+		.filter(|name| name.starts_with(basename))
+		.collect()
 }
 
 /// A quote that a shell word opened.
@@ -565,6 +663,51 @@ mod tests {
 
 	fn words(words: &[&str]) -> Vec<String> {
 		words.iter().map(|word| (*word).to_owned()).collect()
+	}
+
+	#[test]
+	fn matching_names_filters_by_prefix_and_type() {
+		let names = DirNames {
+			dirs: words(&["docs", "photos", "drafts"]),
+			files: words(&["dog.png", "notes.txt"]),
+		};
+		assert_eq!(
+			matching_names(&names, "d", &FilenArgType::File),
+			["docs", "drafts", "dog.png"]
+		);
+		assert_eq!(
+			matching_names(&names, "d", &FilenArgType::FileOrDirectory),
+			["docs", "drafts", "dog.png"]
+		);
+		assert_eq!(
+			matching_names(&names, "d", &FilenArgType::Directory),
+			["docs", "drafts"]
+		);
+		assert_eq!(
+			matching_names(&names, "", &FilenArgType::Directory),
+			["docs", "photos", "drafts"]
+		);
+		assert!(matching_names(&names, "x", &FilenArgType::File).is_empty());
+	}
+
+	#[test]
+	fn cleared_listings_are_listed_again() {
+		// a path no other test caches, as the listings are process-wide
+		let path = RemotePath::new("/cleared_listings_are_listed_again");
+		let names = Arc::new(DirNames {
+			dirs: words(&["a"]),
+			files: words(&["b"]),
+		});
+		cache_listing(listing_generation(), path.clone(), Arc::clone(&names));
+		assert_eq!(cached_listing(&path), Some(Arc::clone(&names)));
+		clear_completion_listings();
+		assert_eq!(cached_listing(&path), None);
+
+		// a listing taken during the previous prompt finishes after this one started
+		let previous_generation = listing_generation();
+		clear_completion_listings();
+		cache_listing(previous_generation, path.clone(), names);
+		assert_eq!(cached_listing(&path), None);
 	}
 
 	#[test]
