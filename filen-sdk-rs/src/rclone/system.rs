@@ -167,6 +167,26 @@ pub(crate) async fn stop_processes(
 	.await
 }
 
+/// Asks `process`, if it is still the process it was seen as, to terminate (SIGTERM; where the
+/// platform has no such signal it is killed). On Unix it is then sent SIGCONT, so a process that
+/// job control stopped (SIGTTIN after reading a terminal it is in the background of) acts on the
+/// SIGTERM instead of holding it until it is killed. Returns whether it was running. Unlike
+/// [`stop_processes`] it does not wait: the caller waits on the process itself.
+#[cfg(feature = "rclone-managed")]
+pub(crate) async fn terminate(process: &ProcessIdentity) -> Result<bool, Error> {
+	let pids = [(Pid::from_u32(process.pid), process.started_at)];
+	blocking(move || {
+		let running = signal_all(&pids, Signal::Term) > 0;
+		// Not on Windows, where `signal_all` kills for a signal the platform lacks, and the SIGTERM
+		// above has killed it already.
+		if cfg!(unix) && running {
+			signal_all(&pids, Signal::Continue);
+		}
+		running
+	})
+	.await
+}
+
 /// Sends `signal` to each of `pids` still running with its start time, counting them.
 fn signal_all(pids: &[(Pid, u64)], signal: Signal) -> u32 {
 	let system = refreshed(pids);

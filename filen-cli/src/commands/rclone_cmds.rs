@@ -981,6 +981,9 @@ pub(crate) async fn execute_rclone(
 	let client = client.get(ui).await?;
 	let status = run_rclone(client, &binary, &cmd)
 		.await
+		.context("Failed to run Rclone")?
+		.wait()
+		.await
 		.context("Failed to run Rclone")?;
 	match error::exit_code_of(status) {
 		0 => Ok(()),

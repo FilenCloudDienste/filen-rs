@@ -3,7 +3,8 @@
 //! [`RcloneDaemon`] runs one `rclone rcd` and drives it over its remote control API: mounts and
 //! serves. `rclone-managed` adds what filen-cli uses besides: a pinned rclone release downloaded
 //! into a directory (`RcloneBinary::Managed`), and `run_rclone`, which runs any rclone command in
-//! the foreground with the account as its `filen` remote.
+//! the foreground with the account as its `filen` remote, and stops it with SIGTERM and a grace
+//! period (`RunningRclone`).
 
 mod binary;
 mod daemon;
@@ -35,8 +36,10 @@ pub use js_impl::RcloneDaemonOptions;
 #[cfg(feature = "napi")]
 pub(crate) use js_impl::{JsRcloneDaemon, rclone_refusal};
 pub use mount::{MountInfo, MountOptions, available_drive_letters};
+#[cfg(all(feature = "rclone-managed", feature = "test-seams"))]
+pub use passthrough::run_rclone_local_for_test;
 #[cfg(feature = "rclone-managed")]
-pub use passthrough::run_rclone;
+pub use passthrough::{RunningRclone, StopCause, run_rclone};
 pub use recovery::{StaleRecovery, clear_cache, force_unmount, recover_stale, stop_rclone_under};
 pub use refusal::RcloneRefusal;
 pub use serve::{ServeAuth, ServeInfo, ServeOptions, ServeProtocol, ServeTls};

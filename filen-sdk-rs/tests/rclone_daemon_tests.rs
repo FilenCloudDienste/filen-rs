@@ -1244,3 +1244,113 @@ async fn the_binary_reports_its_version() {
 
 	assert!(version.starts_with("v1."), "{version}");
 }
+
+/// `filen rclone`'s foreground rclone (`run_rclone`), stopped as the CLI stops it on SIGTERM. Unix:
+/// Windows has no SIGTERM, so a stop there is the grace period and then a kill.
+#[cfg(all(unix, feature = "rclone-managed"))]
+mod passthrough {
+	use filen_sdk_rs::rclone::{StopCause, run_rclone_local_for_test};
+
+	use super::*;
+
+	/// How long a stopped rclone has to exit before it is killed, as `filen rclone` gives it.
+	const GRACE: Duration = Duration::from_secs(30);
+	/// The exit code of an rclone that SIGTERM ended once its exit handlers ran.
+	const TERMINATED: i32 = 143;
+
+	fn args(args: &[&str]) -> Vec<String> {
+		args.iter().map(|arg| (*arg).to_owned()).collect()
+	}
+
+	/// Waits up to 20 s for `holds`.
+	async fn eventually(mut holds: impl FnMut() -> bool) -> bool {
+		let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+		while tokio::time::Instant::now() < deadline {
+			if holds() {
+				return true;
+			}
+			tokio::time::sleep(Duration::from_millis(100)).await;
+		}
+		false
+	}
+
+	fn names_in(dir: &Path) -> Vec<String> {
+		std::fs::read_dir(dir)
+			.unwrap()
+			.map(|entry| entry.unwrap().file_name().into_string().unwrap())
+			.collect()
+	}
+
+	/// Whether the system lists a mount on `mount_point`.
+	fn is_mounted(mount_point: &str) -> bool {
+		let mounts = std::process::Command::new("mount").output().unwrap();
+		assert!(mounts.status.success());
+		String::from_utf8(mounts.stdout)
+			.unwrap()
+			.lines()
+			.any(|line| line.contains(&format!(" on {mount_point} ")))
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn a_stopped_rclone_copy_removes_its_partial_files_and_exits_143() {
+		let dirs = Dirs::new();
+		let src = dirs.root.path().join("src");
+		let dst = dirs.root.path().join("dst");
+		std::fs::create_dir(&src).unwrap();
+		std::fs::create_dir(&dst).unwrap();
+		std::fs::write(src.join("large.bin"), vec![7u8; 20 * 1024 * 1024]).unwrap();
+		// 1 MiB/s keeps the copy running; `--disable Copy` stops a copy-on-write file system from
+		// cloning the file at once.
+		let mut rclone = run_rclone_local_for_test(
+			&binary(),
+			&args(&[
+				"copy",
+				src.to_str().unwrap(),
+				dst.to_str().unwrap(),
+				"--bwlimit",
+				"1M",
+				"--disable",
+				"Copy",
+			]),
+		)
+		.await
+		.unwrap();
+		assert!(
+			eventually(|| names_in(&dst).iter().any(|name| name.ends_with(".partial"))).await,
+			"no partial file in {}",
+			dst.display()
+		);
+
+		let status = rclone.stop(StopCause::Terminate, GRACE).await.unwrap();
+
+		assert_eq!(status.code(), Some(TERMINATED));
+		assert_eq!(names_in(&dst), Vec::<String>::new());
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn a_stopped_rclone_mount_is_unmounted() {
+		let dirs = Dirs::new();
+		let mount_point = dirs.mount_point("drive");
+		// macOS mounts without macFUSE through rclone's NFS mount.
+		let command = if cfg!(target_os = "macos") {
+			"nfsmount"
+		} else {
+			"mount"
+		};
+		let mut rclone = run_rclone_local_for_test(
+			&binary(),
+			&args(&[command, dirs.remote().to_str().unwrap(), &mount_point]),
+		)
+		.await
+		.unwrap();
+		assert!(
+			eventually(|| is_mounted(&mount_point)).await,
+			"{mount_point} was not mounted"
+		);
+
+		let status = rclone.stop(StopCause::Terminate, GRACE).await.unwrap();
+
+		assert_eq!(status.code(), Some(TERMINATED));
+		assert!(!is_mounted(&mount_point), "{mount_point} is still mounted");
+	}
+}
