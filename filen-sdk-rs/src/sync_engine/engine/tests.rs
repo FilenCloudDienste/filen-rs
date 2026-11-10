@@ -5584,6 +5584,77 @@ async fn keeping_both_right_after_the_conflict_over_a_damaged_version_uploads_th
 	assert_eq!(marked_paths(&engine, pair).await, Vec::<String>::new());
 }
 
+/// A two-way pair holding a conflict at `a.txt` whose row records `local` on the local side, a
+/// remote file and two different contents, with the local side holding a directory `a.txt` (with
+/// `inner.txt` in it) since. With the directory everything is in, the engine, the pair, the local
+/// root and the row.
+async fn conflict_whose_local_side_became_a_directory(
+	local: Option<NodeKind>,
+) -> (
+	tempfile::TempDir,
+	SyncEngine,
+	PairId,
+	PathBuf,
+	BaselineEntry,
+) {
+	let dir = tempfile::tempdir().unwrap();
+	let (engine, pair, _cache) = engine_with_a_converged_pair(dir.path()).await;
+	let row = BaselineEntry {
+		local_kind: local,
+		remote_hash: Some(hash(4)),
+		..converged_conflict(Uuid::from_u128(3))
+	};
+	locked(&engine.pair_store(pair).await.unwrap())
+		.upsert_entry(pair, &row)
+		.unwrap();
+	let root = dir.path().join("local");
+	std::fs::create_dir(root.join("a.txt")).unwrap();
+	std::fs::write(root.join("a.txt").join("inner.txt"), b"inner").unwrap();
+	(dir, engine, pair, root, row)
+}
+
+/// Asks for `resolution` at the conflict [`conflict_whose_local_side_became_a_directory`] leaves
+/// with `local` recorded, and checks it is refused with nothing changed: the directory, the row and
+/// the bin are as they were.
+async fn assert_refused_over_a_changed_local_side(
+	local: Option<NodeKind>,
+	resolution: ConflictResolution,
+) {
+	let (_dir, engine, pair, root, row) = conflict_whose_local_side_became_a_directory(local).await;
+	let error = engine
+		.resolve_conflict(pair, "a.txt", resolution)
+		.await
+		.unwrap_err();
+	assert_eq!(error.kind(), ErrorKind::InvalidState, "{error}");
+	assert_eq!(
+		std::fs::read(root.join("a.txt").join("inner.txt")).unwrap(),
+		b"inner"
+	);
+	assert!(!root.join(scan::QUARANTINE_DIR).exists());
+	assert!(!root.join("a.old.txt").exists());
+	assert_eq!(
+		locked(&engine.pair_store(pair).await.unwrap())
+			.entry(pair, "a.txt")
+			.unwrap(),
+		Some(row)
+	);
+}
+
+/// Keeping the remote version over a local file that has since become a directory would bin the
+/// whole directory, so it waits for a pass to read it.
+#[tokio::test]
+async fn keeping_the_remote_over_a_local_file_since_replaced_by_a_directory_is_refused() {
+	assert_refused_over_a_changed_local_side(Some(NodeKind::File), ConflictResolution::KeepRemote)
+		.await;
+}
+
+/// Keeping both where the row records no local item would leave a directory put there since
+/// where the remote file is pulled, so it waits for a pass to read it.
+#[tokio::test]
+async fn keeping_both_over_a_local_item_that_appeared_since_is_refused() {
+	assert_refused_over_a_changed_local_side(None, ConflictResolution::KeepBoth).await;
+}
+
 /// The conflict shape this engine's own upload leaves ends the mark the same way: the row goes, so
 /// nothing is left that says the path is waiting for anyone.
 #[tokio::test]

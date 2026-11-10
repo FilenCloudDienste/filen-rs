@@ -3529,6 +3529,37 @@ fn synced_shell(rel_path: &str) -> BaselineEntry {
 }
 
 /// Whether a held conflict row records the same content on both sides.
+/// Refuses, with [`ErrorKind::InvalidState`], to resolve the conflict held at `rel_path` under
+/// `local_root` when the local side holds an item there that is not of `recorded`, the kind the row
+/// holding it records: another kind than the row's, or an item where the row records none. An item
+/// gone since is no refusal: every resolution already answers a local side that holds nothing.
+fn refuse_a_changed_local_side(
+	local_root: &Path,
+	rel_path: &str,
+	recorded: Option<NodeKind>,
+) -> Result<(), Error> {
+	let now = match apply::local_path(local_root, rel_path).symlink_metadata() {
+		Ok(metadata) if metadata.is_dir() => NodeKind::Dir,
+		Ok(_) => NodeKind::File,
+		Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+		Err(error) => return Err(apply::io_err(error)),
+	};
+	if recorded == Some(now) {
+		return Ok(());
+	}
+	Err(Error::custom(
+		ErrorKind::InvalidState,
+		format!(
+			"the local side changed at {rel_path:?} since the last pass, which held its conflict over {}; let a pass run before resolving it",
+			match recorded {
+				Some(NodeKind::File) => "a local file",
+				Some(NodeKind::Dir) => "a local directory",
+				None => "no local item",
+			}
+		),
+	))
+}
+
 fn sides_converged(held: &BaselineEntry) -> bool {
 	held.content_hash.is_some()
 		&& held.content_hash == held.remote_hash
@@ -4474,6 +4505,13 @@ impl SyncEngine {
 	/// two sides as the held row records them, which the last pass wrote; a side changed since is
 	/// seen once a pass has run.
 	///
+	/// What a resolution moves aside, bins or re-anchors is decided by what the held row records of
+	/// the local side, which the last pass wrote. A local side that holds another item since —
+	/// another kind than the row records, or an item where it records none — is refused with
+	/// [`ErrorKind::InvalidState`] and nothing changed, until a pass has read it: binning a directory
+	/// put where the row records a file would bin the whole directory. A local item gone since is
+	/// not refused.
+	///
 	/// [`KeepBoth`](ConflictResolution::KeepBoth) additionally renames the local copy aside to
 	/// `<stem>.old.<ext>` first, so that copy uploads as a new file instead of being overwritten.
 	///
@@ -4504,7 +4542,7 @@ impl SyncEngine {
 	/// that removal waits for a resolution already running.
 	///
 	/// Errors if the pair is unknown, is being removed, no conflict is currently held at
-	/// `rel_path`, or `resolution` cannot clear it.
+	/// `rel_path`, `resolution` cannot clear it, or the local side changed since the last pass.
 	pub async fn resolve_conflict(
 		&self,
 		pair: PairId,
@@ -4555,6 +4593,10 @@ impl SyncEngine {
 				None::<&str>,
 			));
 		}
+		// What the resolution moves aside, bins or anchors is decided by the local kind the last
+		// pass recorded, so a different item there now would be handled as that one: a directory
+		// put where the row records a file would go to the bin whole.
+		refuse_a_changed_local_side(Path::new(&record.local_root), rel_path, held.local_kind)?;
 
 		// A divergence this engine's own push created is resolved against the SERVER's version
 		// history rather than against what the remote holds now — our upload is what it holds.
