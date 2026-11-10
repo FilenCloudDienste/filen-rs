@@ -99,7 +99,7 @@ Breaking changes are marked **Breaking**: scripts that depend on the old behavio
 - Esc at an empty REPL prompt leaves the REPL
 - every command can be interrupted with Ctrl-C, SIGTERM or SIGHUP (exit code 130); a second one quits while `mount`, `serve` or `sync` stops
 - `cd` is refused outside the REPL
-- REPL tab completion works on quoted paths and paths with escaped spaces, and quotes what it completes
+- REPL tab completion works on quoted paths and paths with escaped spaces, and quotes what it completes; on Windows, only double quotes group words and backslashes are kept, as in paths
 - `view-html-docs` stops on one Ctrl-C and loads no fonts from elsewhere
 - the update is staged next to the binary before it replaces it, offered only for a newer version, shows the release notes first, and restarts the REPL on the new version; in the Docker image, a newer release is announced with the `docker pull` command instead of installed
 - the CLI releases the drive locks it took before it exits, waiting at most 5 seconds, so the next command does not wait for them to expire

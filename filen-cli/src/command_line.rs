@@ -1,18 +1,35 @@
-//! Splitting a command line, as `$VISUAL` or `$EDITOR` holds it, into words.
+//! Splitting a command line, as `$VISUAL` or `$EDITOR` or a REPL line holds it, into words.
 
-/// Splits an editor command line into words. A shell's quoting rules on Unix; on Windows, where a
-/// path is full of backslashes, only double quotes group words.
+/// How a command line groups words.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Quoting {
+	/// A shell's rules: single and double quotes, backslash escapes and `#` comments.
+	Shell,
+	/// Only double quotes group words, with no escapes, so the backslashes of a Windows path are
+	/// kept.
+	DoubleQuotes,
+}
+
+/// The quoting of this platform's command lines: [`Quoting::DoubleQuotes`] on Windows, where a
+/// path is full of backslashes, [`Quoting::Shell`] elsewhere.
+pub(crate) const NATIVE_QUOTING: Quoting = if cfg!(windows) {
+	Quoting::DoubleQuotes
+} else {
+	Quoting::Shell
+};
+
+/// Splits an editor command line or a REPL line into words, by [`NATIVE_QUOTING`]. `None` for an
+/// unclosed quote.
 pub(crate) fn split_command_line(line: &str) -> Option<Vec<String>> {
-	if cfg!(windows) {
-		split_on_double_quotes(line)
-	} else {
-		shlex::split(line)
+	match NATIVE_QUOTING {
+		Quoting::Shell => shlex::split(line),
+		Quoting::DoubleQuotes => split_on_double_quotes(line),
 	}
 }
 
 /// Splits `line` at whitespace outside double quotes, with no escapes. `None` for an unclosed
 /// quote.
-fn split_on_double_quotes(line: &str) -> Option<Vec<String>> {
+pub(crate) fn split_on_double_quotes(line: &str) -> Option<Vec<String>> {
 	let mut words = Vec::new();
 	let mut word: Option<String> = None;
 	let mut quoted = false;

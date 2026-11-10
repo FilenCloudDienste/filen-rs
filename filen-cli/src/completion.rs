@@ -8,7 +8,12 @@ use filen_sdk_rs::{
 	fs::categories::{DirType, NonRootFileType, Normal},
 };
 
-use crate::{CliArgs, docs::get_help_topics, util::RemotePath};
+use crate::{
+	CliArgs,
+	command_line::{NATIVE_QUOTING, Quoting},
+	docs::get_help_topics,
+	util::RemotePath,
+};
 
 #[derive(PartialEq, strum::EnumString, strum::Display, Clone)]
 enum FilenArgType {
@@ -314,8 +319,9 @@ enum Quote {
 	Double,
 }
 
-/// REPL input split into shell words as the REPL's line parser (`shlex`) splits a line, except
-/// that the last word may be unfinished: its quote still open, or a backslash at its end.
+/// REPL input split into words as the REPL's line parser
+/// ([`split_command_line`](crate::command_line::split_command_line)) splits a line, except that the
+/// last word may be unfinished: its quote still open, or a backslash at its end.
 #[derive(Debug, PartialEq, Eq)]
 struct SplitInput<'a> {
 	/// The input before the last word, as typed.
@@ -333,11 +339,69 @@ impl SplitInput<'_> {
 	}
 }
 
-/// Splits `input` into shell words, keeping where the last one starts. A quote that is still open
-/// runs to the end of the input, and a backslash at the end is dropped. A `#` that starts a word
-/// comments out the line up to the next newline, so a comment the user is typing leaves the last
-/// word untyped.
-fn split_input(input: &str) -> SplitInput<'_> {
+impl<'a> SplitInput<'a> {
+	/// The split of `input` whose last word starts at `last_word_start` (`None` when the input
+	/// ends between words) and holds `last_word`.
+	fn new(
+		input: &'a str,
+		mut words: Vec<String>,
+		last_word: String,
+		last_word_start: Option<usize>,
+		last_word_quote: Option<Quote>,
+	) -> Self {
+		words.push(last_word);
+		let (prefix, _) = input
+			.split_at_checked(last_word_start.unwrap_or(input.len()))
+			.expect("a word starts at a char boundary (should be impossible)");
+		Self {
+			prefix,
+			words,
+			last_word_quote,
+		}
+	}
+}
+
+/// Splits `input` into words by `quoting`, keeping where the last one starts. A quote that is still
+/// open runs to the end of the input.
+fn split_input(input: &str, quoting: Quoting) -> SplitInput<'_> {
+	match quoting {
+		Quoting::Shell => split_shell_input(input),
+		Quoting::DoubleQuotes => split_double_quoted_input(input),
+	}
+}
+
+/// Splits `input` at whitespace outside double quotes, with no escapes and no comments, as
+/// [`split_on_double_quotes`](crate::command_line::split_on_double_quotes) does.
+fn split_double_quoted_input(input: &str) -> SplitInput<'_> {
+	let mut words = Vec::new();
+	let mut word = String::new();
+	// where the word being read starts, `None` between words
+	let mut word_start = None;
+	let mut quoted = false;
+	let mut last_word_quote = None;
+	for (i, c) in input.char_indices() {
+		if c.is_whitespace() && !quoted {
+			if word_start.take().is_some() {
+				words.push(mem::take(&mut word));
+				last_word_quote = None;
+			}
+			continue;
+		}
+		word_start.get_or_insert(i);
+		if c == '"' {
+			quoted = !quoted;
+			last_word_quote = Some(Quote::Double);
+		} else {
+			word.push(c);
+		}
+	}
+	SplitInput::new(input, words, word, word_start, last_word_quote)
+}
+
+/// Splits `input` into shell words as `shlex` does. A backslash at the end is dropped. A `#` that
+/// starts a word comments out the line up to the next newline, so a comment the user is typing
+/// leaves the last word untyped.
+fn split_shell_input(input: &str) -> SplitInput<'_> {
 	let mut words = Vec::new();
 	let mut word = String::new();
 	// where the word being read starts, `None` between words
@@ -400,21 +464,30 @@ fn split_input(input: &str) -> SplitInput<'_> {
 			},
 		}
 	}
-	words.push(word);
-	let (prefix, _) = input
-		.split_at_checked(word_start.unwrap_or(input.len()))
-		.expect("a word starts at a char boundary (should be impossible)");
-	SplitInput {
-		prefix,
-		words,
-		last_word_quote,
+	SplitInput::new(input, words, word, word_start, last_word_quote)
+}
+
+/// Quotes `word` so that the REPL's line parser reads it back as `word` under `quoting`, or `None`
+/// when no line can give it.
+///
+/// With [`Quoting::Shell`], in the `quote` the user opened, or in double quotes when it holds
+/// whitespace, a quote, a backslash or starts a comment; a word the user opened single quotes for
+/// but that holds one is double-quoted. With [`Quoting::DoubleQuotes`], in double quotes when it
+/// holds whitespace or the user opened a quote; a word holding a double quote has no escape, so it
+/// is `None`.
+fn quote_word(word: &str, quote: Option<Quote>, quoting: Quoting) -> Option<Cow<'_, str>> {
+	match quoting {
+		Quoting::Shell => Some(quote_shell_word(word, quote)),
+		Quoting::DoubleQuotes if word.contains('"') => None,
+		Quoting::DoubleQuotes if quote.is_some() || word.contains(char::is_whitespace) => {
+			Some(Cow::Owned(format!("\"{word}\"")))
+		}
+		Quoting::DoubleQuotes => Some(Cow::Borrowed(word)),
 	}
 }
 
-/// Quotes `word` so that the REPL's line parser reads it back as `word`: in the `quote` the user
-/// opened, or in double quotes when it holds whitespace, a quote, a backslash or starts a comment.
-/// A word the user opened single quotes for but that holds one is double-quoted.
-fn quote_word(word: &str, quote: Option<Quote>) -> Cow<'_, str> {
+/// [`quote_word`] with [`Quoting::Shell`], which can quote every word.
+fn quote_shell_word(word: &str, quote: Option<Quote>) -> Cow<'_, str> {
 	let needs_quotes = word.starts_with('#') || word.contains([' ', '\t', '\n', '"', '\'', '\\']);
 	match quote {
 		None if !needs_quotes => Cow::Borrowed(word),
@@ -441,7 +514,7 @@ pub(crate) fn completer(
 	working_path: &RemotePath,
 	await_result: bool,
 ) -> Vec<String> {
-	let split = split_input(input);
+	let split = split_input(input, NATIVE_QUOTING);
 	if split.last_word_is_untyped() {
 		return Vec::new();
 	}
@@ -459,13 +532,10 @@ pub(crate) fn completer(
 	) {
 		Ok(candidates) => candidates
 			.into_iter()
-			.map(|candidate| {
+			.filter_map(|candidate| {
 				let completion = candidate.get_value().to_string_lossy();
-				format!(
-					"{}{}",
-					split.prefix,
-					quote_word(&completion, split.last_word_quote)
-				)
+				let quoted = quote_word(&completion, split.last_word_quote, NATIVE_QUOTING)?;
+				Some(format!("{}{quoted}", split.prefix))
 			})
 			.collect(),
 		Err(_) => Vec::new(),
@@ -475,6 +545,7 @@ pub(crate) fn completer(
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::command_line::split_on_double_quotes;
 
 	fn words(words: &[&str]) -> Vec<String> {
 		words.iter().map(|word| (*word).to_owned()).collect()
@@ -483,7 +554,7 @@ mod tests {
 	#[test]
 	fn a_plain_last_word_starts_after_the_last_space() {
 		assert_eq!(
-			split_input("cat dir1/f"),
+			split_input("cat dir1/f", Quoting::Shell),
 			SplitInput {
 				prefix: "cat ",
 				words: words(&["cat", "dir1/f"]),
@@ -495,7 +566,7 @@ mod tests {
 	#[test]
 	fn a_closed_quote_in_the_last_word_is_part_of_it() {
 		assert_eq!(
-			split_input("ls \"a dir with spaces\"/f"),
+			split_input("ls \"a dir with spaces\"/f", Quoting::Shell),
 			SplitInput {
 				prefix: "ls ",
 				words: words(&["ls", "a dir with spaces/f"]),
@@ -507,7 +578,7 @@ mod tests {
 	#[test]
 	fn an_open_quote_runs_to_the_end_of_the_input() {
 		assert_eq!(
-			split_input("ls \"a dir with spaces/f"),
+			split_input("ls \"a dir with spaces/f", Quoting::Shell),
 			SplitInput {
 				prefix: "ls ",
 				words: words(&["ls", "a dir with spaces/f"]),
@@ -519,7 +590,7 @@ mod tests {
 	#[test]
 	fn an_open_single_quote_keeps_its_style() {
 		assert_eq!(
-			split_input("cp x 'a dir"),
+			split_input("cp x 'a dir", Quoting::Shell),
 			SplitInput {
 				prefix: "cp x ",
 				words: words(&["cp", "x", "a dir"]),
@@ -531,7 +602,7 @@ mod tests {
 	#[test]
 	fn an_escaped_space_does_not_end_a_word() {
 		assert_eq!(
-			split_input("cat a\\ dir/f"),
+			split_input("cat a\\ dir/f", Quoting::Shell),
 			SplitInput {
 				prefix: "cat ",
 				words: words(&["cat", "a dir/f"]),
@@ -542,20 +613,23 @@ mod tests {
 
 	#[test]
 	fn a_trailing_backslash_is_dropped() {
-		assert_eq!(split_input("cat a\\").words, words(&["cat", "a"]));
+		assert_eq!(
+			split_input("cat a\\", Quoting::Shell).words,
+			words(&["cat", "a"])
+		);
 	}
 
 	#[test]
 	fn a_double_quote_unescapes_only_what_the_line_parser_does() {
 		assert_eq!(
-			split_input("cat \"a\\\"b\\\\c\\d\"").words,
+			split_input("cat \"a\\\"b\\\\c\\d\"", Quoting::Shell).words,
 			words(&["cat", "a\"b\\c\\d"])
 		);
 	}
 
 	#[test]
 	fn a_space_at_the_end_starts_an_empty_last_word() {
-		let split = split_input("ls ");
+		let split = split_input("ls ", Quoting::Shell);
 		assert_eq!(
 			split,
 			SplitInput {
@@ -569,7 +643,7 @@ mod tests {
 
 	#[test]
 	fn an_opened_empty_quote_is_typed() {
-		let split = split_input("ls \"");
+		let split = split_input("ls \"", Quoting::Shell);
 		assert_eq!(split.prefix, "ls ");
 		assert_eq!(split.words, words(&["ls", ""]));
 		assert!(!split.last_word_is_untyped());
@@ -577,7 +651,7 @@ mod tests {
 
 	#[test]
 	fn empty_input_is_one_untyped_word() {
-		let split = split_input("");
+		let split = split_input("", Quoting::Shell);
 		assert_eq!(split.prefix, "");
 		assert!(split.last_word_is_untyped());
 	}
@@ -591,7 +665,7 @@ mod tests {
 			"ls #foo",
 			"cat x #c\nls a#b",
 		] {
-			let mut split = split_input(line);
+			let mut split = split_input(line, Quoting::Shell);
 			if split.last_word_is_untyped() {
 				split.words.pop();
 			}
@@ -601,48 +675,69 @@ mod tests {
 
 	#[test]
 	fn a_comment_being_typed_leaves_nothing_to_complete() {
-		let split = split_input("cat x #fo");
+		let split = split_input("cat x #fo", Quoting::Shell);
 		assert_eq!(split.words, words(&["cat", "x", ""]));
 		assert!(split.last_word_is_untyped());
 	}
 
 	#[test]
 	fn a_hash_inside_a_word_is_part_of_it() {
-		assert_eq!(split_input("cat a#b").words, words(&["cat", "a#b"]));
+		assert_eq!(
+			split_input("cat a#b", Quoting::Shell).words,
+			words(&["cat", "a#b"])
+		);
 	}
 
 	#[test]
 	fn a_word_without_special_characters_is_not_quoted() {
-		assert_eq!(quote_word("dir1/file.txt", None), "dir1/file.txt");
+		assert_eq!(
+			quote_word("dir1/file.txt", None, Quoting::Shell).unwrap(),
+			"dir1/file.txt"
+		);
 	}
 
 	#[test]
 	fn a_word_with_a_space_is_double_quoted() {
 		assert_eq!(
-			quote_word("a dir with spaces/f.txt", None),
+			quote_word("a dir with spaces/f.txt", None, Quoting::Shell).unwrap(),
 			"\"a dir with spaces/f.txt\""
 		);
 	}
 
 	#[test]
 	fn a_word_keeps_the_quote_the_user_opened() {
-		assert_eq!(quote_word("dir1", Some(Quote::Double)), "\"dir1\"");
-		assert_eq!(quote_word("a dir", Some(Quote::Single)), "'a dir'");
+		assert_eq!(
+			quote_word("dir1", Some(Quote::Double), Quoting::Shell).unwrap(),
+			"\"dir1\""
+		);
+		assert_eq!(
+			quote_word("a dir", Some(Quote::Single), Quoting::Shell).unwrap(),
+			"'a dir'"
+		);
 	}
 
 	#[test]
 	fn a_single_quote_in_a_single_quoted_word_switches_to_double_quotes() {
-		assert_eq!(quote_word("it's", Some(Quote::Single)), "\"it's\"");
+		assert_eq!(
+			quote_word("it's", Some(Quote::Single), Quoting::Shell).unwrap(),
+			"\"it's\""
+		);
 	}
 
 	#[test]
 	fn quotes_and_backslashes_are_escaped_in_double_quotes() {
-		assert_eq!(quote_word("a\"b\\c", None), "\"a\\\"b\\\\c\"");
+		assert_eq!(
+			quote_word("a\"b\\c", None, Quoting::Shell).unwrap(),
+			"\"a\\\"b\\\\c\""
+		);
 	}
 
 	#[test]
 	fn a_word_starting_a_comment_is_quoted() {
-		assert_eq!(quote_word("#notes", None), "\"#notes\"");
+		assert_eq!(
+			quote_word("#notes", None, Quoting::Shell).unwrap(),
+			"\"#notes\""
+		);
 	}
 
 	#[test]
@@ -654,8 +749,76 @@ mod tests {
 			("x y", Some(Quote::Double)),
 			("#x", None),
 		] {
-			let line = format!("cat {}", quote_word(word, quote));
+			let line = format!("cat {}", quote_word(word, quote, Quoting::Shell).unwrap());
 			assert_eq!(shlex::split(&line), Some(words(&["cat", word])), "{line}");
 		}
+	}
+
+	#[test]
+	fn a_windows_word_keeps_its_backslashes() {
+		assert_eq!(
+			split_input(r"lcd C:\Users\m", Quoting::DoubleQuotes),
+			SplitInput {
+				prefix: "lcd ",
+				words: words(&["lcd", r"C:\Users\m"]),
+				last_word_quote: None,
+			}
+		);
+	}
+
+	#[test]
+	fn double_quotes_group_a_windows_word() {
+		assert_eq!(
+			split_input(r#"lcd "C:\Program Files\M"#, Quoting::DoubleQuotes),
+			SplitInput {
+				prefix: "lcd ",
+				words: words(&["lcd", r"C:\Program Files\M"]),
+				last_word_quote: Some(Quote::Double),
+			}
+		);
+	}
+
+	#[test]
+	fn split_input_agrees_with_the_windows_line_parser_on_finished_lines() {
+		for line in [
+			r#"cp "C:\a b"\c d\e 'f"#,
+			r"  lls   C:\x  ",
+			r"ls #foo",
+			r#"cat "" x"#,
+		] {
+			let mut split = split_input(line, Quoting::DoubleQuotes);
+			if split.last_word_is_untyped() {
+				split.words.pop();
+			}
+			assert_eq!(Some(split.words), split_on_double_quotes(line), "{line}");
+		}
+	}
+
+	#[test]
+	fn a_quoted_windows_completion_reads_back_as_the_word() {
+		for (word, quote) in [
+			(r"C:\Users\me", None),
+			(r"C:\Program Files\x", None),
+			(r"C:\Users", Some(Quote::Double)),
+			("it's", None),
+			("#x", None),
+		] {
+			let quoted = quote_word(word, quote, Quoting::DoubleQuotes).expect("no double quote");
+			let line = format!("lcd {quoted}");
+			assert_eq!(
+				split_on_double_quotes(&line),
+				Some(words(&["lcd", word])),
+				"{line}"
+			);
+		}
+	}
+
+	#[test]
+	fn a_name_with_a_double_quote_is_not_offered_on_windows() {
+		assert_eq!(quote_word("a\"b", None, Quoting::DoubleQuotes), None);
+		assert_eq!(
+			quote_word("a\"b", Some(Quote::Double), Quoting::DoubleQuotes),
+			None
+		);
 	}
 }

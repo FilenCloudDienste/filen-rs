@@ -1013,7 +1013,7 @@ fn parse_repl_line(line: &str) -> Result<CliArgs, ReplLineError> {
 
 /// [`parse_repl_line`], with what clap parsed the line from.
 fn parse_repl_line_matches(line: &str) -> Result<ParsedArgs, ReplLineError> {
-	let mut args = shlex::split(line.trim()).ok_or(ReplLineError::Quoting)?;
+	let mut args = command_line::split_command_line(line.trim()).ok_or(ReplLineError::Quoting)?;
 	args.insert(0, String::from("filen"));
 	let ParsedArgs { args, matches } = parse_args(args).map_err(ReplLineError::Arguments)?;
 	let startup_options = CliArgs::command()
@@ -1277,9 +1277,22 @@ mod tests {
 	#[test]
 	fn a_repl_line_with_an_unclosed_quote_is_a_quoting_error() {
 		assert!(matches!(
-			parse_repl_line("ls 'my dir"),
+			parse_repl_line("ls \"my dir"),
 			Err(ReplLineError::Quoting)
 		));
+	}
+
+	#[cfg(windows)]
+	#[test]
+	fn a_repl_line_keeps_the_backslashes_of_a_windows_path() {
+		let Ok(CliArgs {
+			command: Some(Commands::Shell(ShellCommands::Lcd { directory })),
+			..
+		}) = parse_repl_line(r"lcd C:\Users\me")
+		else {
+			panic!("did not parse as lcd");
+		};
+		assert_eq!(directory, PathBuf::from(r"C:\Users\me"));
 	}
 
 	#[test]
@@ -1762,7 +1775,7 @@ mod tests {
 
 	#[test]
 	fn a_repl_line_with_a_quoted_argument_is_parsed() {
-		let cli_args = parse_repl_line("ls 'my dir'").unwrap();
+		let cli_args = parse_repl_line("ls \"my dir\"").unwrap();
 		assert!(format!("{:?}", cli_args.command).contains("\"my dir\""));
 	}
 
