@@ -50,9 +50,8 @@ static STATE: Mutex<State> = Mutex::new(State {
 	stopping: 0,
 	cancelling: false,
 	presses: 0,
-	stdout_closed: false,
+	stdout: Stdout::Open,
 	streaming_data: 0,
-	data_cut_short: false,
 });
 
 /// Installs the Ctrl-C handler. Called once, when the CLI starts.
@@ -63,6 +62,12 @@ pub(crate) fn install() -> Result<(), ctrlc::Error> {
 /// What the handler does on Ctrl-C.
 fn on_ctrl_c() {
 	act(lock_state().press());
+}
+
+/// Whether Ctrl-C was pressed since the CLI started, whether it cancelled a command, stopped one
+/// that handles it itself, or neither, as when it quit the CLI.
+pub(crate) fn was_interrupted() -> bool {
+	lock_state().presses > 0
 }
 
 /// The number of Ctrl-C presses so far, taken by [`press_count`] to tell later whether one came in
@@ -95,7 +100,7 @@ pub(crate) fn close_stdout() {
 /// Whether stdout was closed ([`close_stdout`]), so the CLI exits with [`closed_stdout_exit_code`]
 /// and runs no further command.
 pub(crate) fn stdout_closed() -> bool {
-	lock_state().stdout_closed
+	lock_state().stdout != Stdout::Open
 }
 
 /// The exit code of the CLI once stdout was closed: 1 if it closed while a file's content was
@@ -162,12 +167,19 @@ struct State {
 	cancelling: bool,
 	/// How many times Ctrl-C was pressed since the CLI started.
 	presses: u64,
-	/// Whether stdout was closed.
-	stdout_closed: bool,
+	stdout: Stdout,
 	/// How many commands are writing a file's content to stdout.
 	streaming_data: usize,
-	/// Whether stdout was closed while a file's content was being written to it.
-	data_cut_short: bool,
+}
+
+/// Whether stdout was closed, and when.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Stdout {
+	Open,
+	/// Closed while no file's content was being written to it.
+	Closed,
+	/// Closed while a file's content was being written to it, which was cut short.
+	ClosedMidData,
 }
 
 /// What a Ctrl-C does.
@@ -196,11 +208,13 @@ impl State {
 	}
 
 	fn close_stdout(&mut self) -> Action {
-		if self.stdout_closed {
+		if self.stdout != Stdout::Open {
 			return Action::Nothing;
 		}
-		self.stdout_closed = true;
-		self.data_cut_short = self.streaming_data > 0;
+		self.stdout = match self.streaming_data {
+			0 => Stdout::Closed,
+			_ => Stdout::ClosedMidData,
+		};
 		if self.catching == 0 {
 			return Action::Quit(self.closed_stdout_exit_code());
 		}
@@ -212,9 +226,9 @@ impl State {
 	}
 
 	fn closed_stdout_exit_code(&self) -> i32 {
-		match self.data_cut_short {
-			true => EXIT_FAILURE,
-			false => 0,
+		match self.stdout {
+			Stdout::ClosedMidData => EXIT_FAILURE,
+			Stdout::Open | Stdout::Closed => 0,
 		}
 	}
 
@@ -229,9 +243,9 @@ impl State {
 
 	/// The error a command fails with when Ctrl-C, or a closed stdout, cancelled it.
 	fn cancelled_error(&self) -> CliError {
-		match self.stdout_closed {
-			true => CliError::StdoutClosed,
-			false => CliError::Interrupted,
+		match self.stdout {
+			Stdout::Closed | Stdout::ClosedMidData => CliError::StdoutClosed,
+			Stdout::Open => CliError::Interrupted,
 		}
 	}
 
@@ -420,9 +434,8 @@ mod tests {
 			stopping: 0,
 			cancelling: false,
 			presses: 0,
-			stdout_closed: false,
+			stdout: Stdout::Open,
 			streaming_data: 0,
-			data_cut_short: false,
 		}
 	}
 
@@ -445,6 +458,15 @@ mod tests {
 	}
 
 	#[test]
+	fn ctrl_c_is_remembered_after_a_command_that_handles_it_stopped() {
+		let mut state = state(1, 1);
+		state.press();
+		state.owning -= 1;
+		state.end_catching();
+		assert_eq!(state.presses, 1);
+	}
+
+	#[test]
 	fn a_press_count_tells_only_of_ctrl_c_pressed_after_it() {
 		let mut state = state(1, 0);
 		// an earlier command, cancelled by Ctrl-C
@@ -456,6 +478,13 @@ mod tests {
 		assert!(!count.pressed_before(&state));
 		state.press();
 		assert!(count.pressed_before(&state));
+	}
+
+	#[test]
+	fn a_closed_stdout_is_not_taken_for_ctrl_c() {
+		let mut state = state(1, 0);
+		state.close_stdout();
+		assert_eq!(state.presses, 0);
 	}
 
 	#[test]
@@ -501,7 +530,7 @@ mod tests {
 	fn a_closed_stdout_with_no_command_running_quits_with_0() {
 		let mut state = state(0, 0);
 		assert_eq!(state.close_stdout(), Action::Quit(0));
-		assert!(state.stdout_closed);
+		assert_eq!(state.stdout, Stdout::Closed);
 		assert_eq!(state.closed_stdout_exit_code(), 0);
 	}
 

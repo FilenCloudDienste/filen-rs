@@ -290,6 +290,31 @@ fn always_update_replaces_a_binary_without_a_version_in_its_name() {
 }
 
 #[test]
+fn the_update_check_of_a_failing_command_is_reported_after_its_failure() {
+	let server = MockServer::start(Releases::default());
+	let installation = Installation::new("filen-cli");
+	let missing = installation.config_dir.path().join("missing");
+
+	let assert = installation
+		.cli(&server.url, "0.0.0-test")
+		.arg("--always-update")
+		.arg("lls")
+		.arg(&missing)
+		.assert()
+		.failure();
+
+	let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
+	let failure = stderr
+		.find(&format!("Failed to list {}", missing.display()))
+		.unwrap_or_else(|| panic!("no failure in {stderr}"));
+	let installed = stderr
+		.find("Update installed successfully")
+		.unwrap_or_else(|| panic!("no update in {stderr}"));
+	assert!(failure < installed, "{stderr}");
+	assert_eq!(fs::read(&installation.executable).unwrap(), asset("v1.0.0"));
+}
+
+#[test]
 fn the_announcements_for_the_running_version_are_shown() {
 	let server = MockServer::start(Releases::default());
 	let installation = Installation::new("filen-cli");

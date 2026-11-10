@@ -54,7 +54,7 @@ use crate::{
 	docs::{generate_markdown_docs, print_in_app_docs},
 	log_files::{ChosenLogFile, LogFiles, LogLimits},
 	ui::{ConsoleLogLevel, CustomLogger, ReplPrompt},
-	updater::check_for_updates,
+	updater::{PendingUpdateCheck, check_for_updates, start_update_check},
 	util::RemotePath,
 };
 
@@ -455,9 +455,13 @@ async fn async_main(arenas_limited: bool) {
 	let mut ui = ui::UI::new();
 	// call ui.initialize() later after parsing args
 
-	let finished = inner_main(&mut ui, arenas_limited).await;
+	let mut update_check = None;
+	let finished = inner_main(&mut ui, arenas_limited, &mut update_check).await;
 	// whatever the command made of being cut short, nobody reads what is left to print
 	if interrupt::stdout_closed() {
+		if let Some(update_check) = update_check {
+			update_check.abort();
+		}
 		let code = interrupt::closed_stdout_exit_code();
 		if code != 0 {
 			ui.print_failure("Stdout was closed before the whole file was written to it");
@@ -466,13 +470,25 @@ async fn async_main(arenas_limited: bool) {
 		std::process::exit(code);
 	}
 	// translate errors to non-zero exit code
-	match finished {
-		Ok(Finished::Success) => {}
-		Ok(Finished::ScriptLineFailed(code)) => std::process::exit(code),
+	let exit_code = match finished {
+		Ok(Finished::Success) => None,
+		Ok(Finished::ScriptLineFailed(code)) => Some(code),
 		Err(e) => {
 			ui.print_failure_or_error(&e);
-			std::process::exit(error::exit_code(&e));
+			Some(error::exit_code(&e))
 		}
+	};
+	// after the command's output, its failure included
+	if let Some(update_check) = update_check {
+		// after Ctrl-C, the CLI ends without the check, even when the command stopped cleanly
+		if interrupt::was_interrupted() {
+			update_check.abort();
+		} else {
+			update_check.finish(&mut ui).await;
+		}
+	}
+	if let Some(code) = exit_code {
+		std::process::exit(code);
 	}
 }
 
@@ -492,7 +508,13 @@ pub(crate) fn default_config_dir(is_dev: bool) -> Option<PathBuf> {
 	}))
 }
 
-async fn inner_main(ui: &mut ui::UI, arenas_limited: bool) -> Result<Finished> {
+/// Runs one command, the commands piped in, or the REPL. `update_check` receives the update check
+/// they run alongside, which the caller reports after their output, their failure included.
+async fn inner_main(
+	ui: &mut ui::UI,
+	arenas_limited: bool,
+	update_check: &mut Option<PendingUpdateCheck>,
+) -> Result<Finished> {
 	let cli_args = parse_args(std::env::args_os())
 		.unwrap_or_else(|e| e.exit())
 		.args;
@@ -640,21 +662,32 @@ async fn inner_main(ui: &mut ui::UI, arenas_limited: bool) -> Result<Finished> {
 		));
 	}
 
-	if !cli_args.skip_update
-		&& !cli_args
+	*update_check = if cli_args.skip_update
+		|| cli_args
 			.command
 			.as_ref()
 			.is_some_and(Commands::skips_update_check)
 	{
+		None
+	} else if cli_args.command.is_none() && !script {
+		// the REPL offers an update before it starts, and restarts on it
 		check_for_updates(
 			ui,
 			cli_args.force_update_check || cli_args.always_update,
 			cli_args.always_update,
 			&config.config_dir,
-			cli_args.command.is_none() && !script,
 		)
 		.await;
-	}
+		None
+	} else {
+		// a command does not wait for GitHub: the check is reported after it
+		start_update_check(
+			cli_args.force_update_check || cli_args.always_update,
+			cli_args.always_update,
+			&config.config_dir,
+		)
+		.await
+	};
 
 	let client_config_args = ClientConfigArgs::from(&cli_args);
 

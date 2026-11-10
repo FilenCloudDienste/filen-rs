@@ -9,11 +9,12 @@
 //! - In the REPL, it is offered: its release notes are shown and you are asked whether to install
 //!   it (`--yes` answers yes). If you do, the CLI installs it and restarts on it. If you decline, it
 //!   is offered again after the next check.
-//! - With a command, or with commands piped in, it is only announced, saying to update from the
-//!   REPL.
+//! - With a command, or with commands piped in, the check runs while they run, and a newer release
+//!   is announced after them, saying to update from the REPL.
 //! - `--always-update` checks even if the last check was less recent, and installs a newer release
-//!   without asking, also with a command. The command still runs on the release the CLI started
-//!   with, and the new one is used from the next run on. In the REPL, the CLI restarts on it.
+//!   without asking, also with a command, after it. The command still runs on the release the CLI
+//!   started with, and the new one is used from the next run on. In the REPL, the CLI restarts on
+//!   it.
 //! - In the Docker image, the CLI never replaces itself, not even with `--always-update`: a newer
 //!   release is announced with the image to pull (`docker pull filen/cli:<version>`).
 //!
@@ -80,60 +81,37 @@ const LAST_CHECK_VALIDITY_SECS: i64 = 5 * 60;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How long a whole request of the check (the releases or the announcements) may take, so a
-/// stalled connection cannot hold up the command it runs before.
+/// stalled connection cannot hold up the REPL it runs before, or the end of the command it runs
+/// alongside.
 const CHECK_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// How long the download of a release may go without receiving anything. It has no bound on its
 /// total time, since the binary is large and the connection may be slow.
 const DOWNLOAD_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Checks for updates by querying the GitHub releases API and downloading
-/// and installing the latest release if a newer version is available.
-/// This function skips the update check in debug builds.
-/// It also doesn't check for some time if the last check was recent enough.
-/// If the current executable's name contains the version string, the new
-/// executable will be saved with the updated version in its name, and the
-/// old executable will be deleted. Otherwise, the current executable will
-/// be replaced in place.
-/// Annnouncements targeted at the current version will also be displayed.
-/// When not using REPL, updates are not automatically installed, only
-/// a message is shown to the user. Declining the update in the REPL
-/// starts the REPL with the current version.
-/// A failed check (offline, an error from GitHub, a failed install) is printed as a warning
-/// and never fails the command. It still counts as a check, so the next one waits as long as
-/// after a successful one.
+/// Runs the update check of the REPL before it starts: shows the announcements for the running
+/// version and offers a newer release, or installs it with `automatically_update`, then restarts
+/// the CLI on it. Declining keeps the running version. Skipped when it is not due (see
+/// [`due_update_check`]). A failed check (offline, an error from GitHub, a failed install) is
+/// printed as a warning and never stops the REPL. It still counts as a check, so the next one
+/// waits as long as after a successful one.
 pub(crate) async fn check_for_updates(
 	ui: &mut UI,
 	force_update_check: bool,
 	automatically_update: bool,
 	config_dir: &Path,
-	is_repl: bool,
 ) {
-	let env = UpdaterEnv::from_env();
-	if env.is_untested_debug_build() {
-		log::info!("Skipping update check in debug build");
+	let Some((env, last_checked_config)) = due_update_check(force_update_check, config_dir).await
+	else {
 		return;
-	}
-
-	// a forced check is not recorded, so it does not delay the next regular one
-	let last_checked_config = if force_update_check {
-		log::info!("Update check forced via --force-update-check");
-		None
-	} else {
-		let last_checked_config = LastCheckedConfig::new(config_dir);
-		if !last_checked_config.is_check_due().await {
-			return;
-		}
-		Some(last_checked_config)
 	};
-
 	let github_api = env.api();
 	let Some(update) = run_update_check(
 		ui,
 		&env.version,
 		UpdateContext {
 			automatically_update,
-			is_repl,
+			is_repl: true,
 			in_container: IN_DOCKER_IMAGE,
 		},
 		last_checked_config.as_ref(),
@@ -149,17 +127,128 @@ pub(crate) async fn check_for_updates(
 	else {
 		return;
 	};
-	if is_repl {
-		std::process::exit(restart(ui, &update).await);
+	std::process::exit(restart(ui, &update).await);
+}
+
+/// The environment of an update check, and where to record its time (`None` for a forced check,
+/// which is not recorded, so that it does not delay the next regular one), unless no check is due:
+/// in a debug build that no test runs, or when the last check was too recent.
+async fn due_update_check(
+	force_update_check: bool,
+	config_dir: &Path,
+) -> Option<(UpdaterEnv, Option<LastCheckedConfig>)> {
+	let env = UpdaterEnv::from_env();
+	if env.is_untested_debug_build() {
+		log::info!("Skipping update check in debug build");
+		return None;
 	}
-	// the command runs on in this process, on the release it started with
-	match update.installed {
+	if force_update_check {
+		log::info!("Update check forced via --force-update-check");
+		return Some((env, None));
+	}
+	let last_checked_config = LastCheckedConfig::new(config_dir);
+	if !last_checked_config.is_check_due().await {
+		return None;
+	}
+	Some((env, Some(last_checked_config)))
+}
+
+/// Says where the update check installed `update`, which the running process does not use.
+fn report_installed(ui: &mut UI, update: &InstalledUpdate) {
+	match &update.installed {
 		InstalledRelease::Renamed(path) => {
 			ui.print_muted_to_stderr(&format!("Downloaded update to {}", path.display()));
 		}
 		InstalledRelease::Replaced(_) => ui.print_muted_to_stderr(
 			"Update installed successfully. It will take effect the next time you run the application.",
 		),
+	}
+}
+
+/// The (latest release, announcements) fetch of an update check.
+type Fetched = (Result<GitHubRelease>, Result<Vec<Announcement>>);
+
+/// An update check of a command, or of commands piped in, whose fetch runs while they run, so that
+/// they do not wait for GitHub. [`PendingUpdateCheck::finish`] reports it after their output.
+pub(crate) struct PendingUpdateCheck {
+	/// The running version, as [`UpdaterEnv`] gives it.
+	version: String,
+	/// `--always-update`: install a newer release without asking.
+	automatically_update: bool,
+	/// Where the time of the check is written, `None` for a forced check.
+	last_checked_config: Option<LastCheckedConfig>,
+	fetched: tokio::task::JoinHandle<Fetched>,
+}
+
+/// Starts the update check of a command, or of commands piped in, unless it is not due (see
+/// [`due_update_check`]); the REPL runs [`check_for_updates`] instead. The fetch runs on its own
+/// task.
+pub(crate) async fn start_update_check(
+	force_update_check: bool,
+	automatically_update: bool,
+	config_dir: &Path,
+) -> Option<PendingUpdateCheck> {
+	let (env, last_checked_config) = due_update_check(force_update_check, config_dir).await?;
+	let UpdaterEnv {
+		version,
+		releases_url,
+		announcements_url,
+		..
+	} = env;
+	let fetched = tokio::spawn(async move {
+		let github_api = GitHubApiClient::new(&releases_url, &announcements_url);
+		tokio::join!(
+			github_api.get_latest_release(),
+			github_api.get_announcements(),
+		)
+	});
+	Some(PendingUpdateCheck {
+		version,
+		automatically_update,
+		last_checked_config,
+		fetched,
+	})
+}
+
+impl PendingUpdateCheck {
+	/// Waits for the fetch and reports the check: announcements, a newer release, a warning for
+	/// what failed, and with `--always-update` installs the newer release and says where.
+	pub(crate) async fn finish(self, ui: &mut UI) {
+		let Self {
+			version,
+			automatically_update,
+			last_checked_config,
+			fetched,
+		} = self;
+		let installed = run_update_check(
+			ui,
+			&version,
+			UpdateContext {
+				automatically_update,
+				is_repl: false,
+				in_container: IN_DOCKER_IMAGE,
+			},
+			last_checked_config.as_ref(),
+			async move || {
+				fetched.await.unwrap_or_else(|e| {
+					(
+						Err(anyhow::anyhow!("The update check did not finish: {e}")),
+						Err(anyhow::anyhow!("The update check did not finish: {e}")),
+					)
+				})
+			},
+			confirm_update,
+		)
+		.await;
+		if let Some(update) = installed {
+			report_installed(ui, &update);
+		}
+	}
+
+	/// Stops the fetch, for a command that Ctrl-C or a closed stdout ended, after which nothing is
+	/// reported. The check is not recorded, so the next one is not delayed.
+	pub(crate) fn abort(self) {
+		self.fetched.abort();
 	}
 }
 
@@ -227,7 +316,7 @@ async fn run_update_check(
 	version: &str,
 	context: UpdateContext,
 	last_checked_config: Option<&LastCheckedConfig>,
-	fetch: impl AsyncFnOnce() -> (Result<GitHubRelease>, Result<Vec<Announcement>>),
+	fetch: impl AsyncFnOnce() -> Fetched,
 	confirm: impl FnOnce(&mut UI, &str) -> Result<bool>,
 ) -> Option<InstalledUpdate> {
 	let mut installed = None;
@@ -1964,6 +2053,27 @@ mod tests {
 
 		assert_eq!(printed.lines_or_empty(), "");
 		assert_eq!(written_stamp(config_dir.path()), None);
+	}
+
+	#[tokio::test]
+	async fn a_check_started_before_a_command_is_reported_after_its_output() {
+		let printed = Printed::default();
+		let mut ui = printed.terminal_ui();
+		let check = PendingUpdateCheck {
+			version: "0.2.9".to_owned(),
+			automatically_update: false,
+			last_checked_config: None,
+			fetched: tokio::spawn(async { (Ok(release("v0.3.0")), Ok(Vec::new())) }),
+		};
+
+		ui.print("output");
+		check.finish(&mut ui).await;
+
+		assert_eq!(
+			console::strip_ansi_codes(&printed.lines()),
+			"output\n[i] Please update from v0.2.9 to v0.3.0 by invoking the CLI with no command \
+			 specified (REPL)."
+		);
 	}
 
 	/// Serves one HTTP request on a local port with `response`, and returns its URL.

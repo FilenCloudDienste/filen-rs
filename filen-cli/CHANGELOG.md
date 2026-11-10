@@ -21,7 +21,7 @@ Breaking changes are marked **Breaking**: scripts that depend on the old behavio
 - **Breaking:** `cat`, `head` and `tail` print the file's exact bytes, without adding a newline; with `--json` they print `{"text": ...}` and refuse a file that is not UTF-8
 - `ls` and the search results print one item per line when stdout is not a terminal
 - a closed stdout, as in `filen ls | head -1`, ends the command with exit code 0; a command writing a file's content to stdout (`cat`, `head`, `tail`, `download <file> -`) exits with 1 instead, as its reader did not get the whole file
-- update notices, announcements and update check warnings are not printed under `--quiet` or `--json`, or when stdout is not a terminal; a failed update check is a warning and the command carries on
+- update notices, announcements and update check warnings are not printed under `--quiet` or `--json`, or when stdout is not a terminal; a failed update check is a warning and the command carries on; the update check of a command runs alongside it and is reported after its output
 - a command's help, and the docs, show its whole description, not only its first paragraph
 - listings sort directories first, then case-insensitively and naturally (`file2` before `file10`)
 - dates are printed in UTC

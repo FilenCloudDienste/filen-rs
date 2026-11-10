@@ -52,11 +52,11 @@ pub(crate) enum Commands {
 }
 
 impl Commands {
-	/// Whether the update check when the CLI starts is skipped for this command.
+	/// Whether the update check is skipped for this command.
 	pub(crate) fn skips_update_check(&self) -> bool {
 		match self {
 			Commands::Shell(command) => command.skips_update_check(),
-			// every other command runs after the check
+			// every other command runs alongside the check, which is reported after it
 			_ => false,
 		}
 	}

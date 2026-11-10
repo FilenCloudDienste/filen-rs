@@ -66,8 +66,8 @@ pub(crate) const DOCS: &[DocElement] = &[
 ];
 
 impl ShellCommands {
-	/// Whether the update check when the CLI starts is skipped for this command: it works on the
-	/// CLI itself and needs no other release announced.
+	/// Whether the update check is skipped for this command: it works on the CLI itself and needs
+	/// no other release announced.
 	pub(crate) fn skips_update_check(&self) -> bool {
 		match self {
 			Self::Version | Self::Install { .. } | Self::Completions { .. } => true,
