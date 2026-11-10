@@ -34,7 +34,7 @@
 //! or `--quiet`, and written to the log.
 
 #[cfg(unix)]
-use std::os::unix::{fs::PermissionsExt, process::ExitStatusExt};
+use std::os::unix::fs::PermissionsExt;
 use std::{
 	borrow::Cow,
 	cmp::Ordering,
@@ -429,7 +429,7 @@ async fn restart(ui: &mut UI, update: &InstalledUpdate) -> i32 {
 /// its own, or 0 when it could not be started, after saying to restart the CLI.
 fn restart_exit_code(ui: &mut UI, update: &InstalledUpdate, status: io::Result<ExitStatus>) -> i32 {
 	match status {
-		Ok(status) => exit_code_of(status),
+		Ok(status) => error::exit_code_of(status),
 		Err(e) => {
 			ui.print_warning(&format!(
 				"Failed to start {}: {e}",
@@ -450,19 +450,6 @@ fn restart_args(args: impl IntoIterator<Item = OsString>) -> Vec<OsString> {
 		args.insert(0, OsString::from("--skip-update"));
 	}
 	args
-}
-
-/// The exit code to pass on for a process that ended with `status`: its own, or for one a signal
-/// ended, the code a shell reports, 128 plus the signal.
-fn exit_code_of(status: ExitStatus) -> i32 {
-	if let Some(code) = status.code() {
-		return code;
-	}
-	#[cfg(unix)]
-	if let Some(signal) = status.signal() {
-		return signal.saturating_add(128);
-	}
-	error::EXIT_FAILURE
 }
 
 /// Shows the notes of `release`, of `version` (without the leading `v`), if it has any.
@@ -1148,6 +1135,8 @@ fn parse_announcements(text: &str) -> Vec<Announcement> {
 
 #[cfg(test)]
 mod tests {
+	#[cfg(unix)]
+	use std::os::unix::process::ExitStatusExt;
 	use std::{cell::Cell, io::Read, net::TcpListener};
 
 	use super::*;
@@ -2220,13 +2209,6 @@ mod tests {
 	}
 
 	#[cfg(unix)]
-	#[test]
-	fn a_restarted_cli_ended_by_a_signal_exits_as_a_shell_reports_it() {
-		// SIGINT
-		assert_eq!(exit_code_of(ExitStatus::from_raw(2)), 130);
-	}
-
-	#[cfg(unix)]
 	#[tokio::test]
 	async fn the_restarted_cli_runs_with_the_restart_arguments() {
 		let status = tokio::process::Command::new("/bin/sh")
@@ -2237,7 +2219,7 @@ mod tests {
 			.await
 			.unwrap();
 
-		assert_eq!(exit_code_of(status), 7);
+		assert_eq!(error::exit_code_of(status), 7);
 	}
 
 	/// An asset of `size` bytes with `digest`.

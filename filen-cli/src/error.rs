@@ -7,9 +7,11 @@
 //!   while the command was writing a file's content to stdout (`cat`, `head`, `tail`,
 //!   `download <file> -`), where the reader did not get all of it: `1`,
 //! - `130` when Ctrl-C cancelled the command or quit the CLI,
-//! - the exit code of Rclone when `filen rclone ...` failed in Rclone.
+//! - the exit code of Rclone when `filen rclone ...` failed in Rclone, or 128 plus the signal when a signal ended it.
 
-use std::{error::Error, fmt};
+#[cfg(unix)]
+use std::os::unix::process::ExitStatusExt;
+use std::{error::Error, fmt, process::ExitStatus};
 
 use inquire::InquireError;
 
@@ -28,8 +30,8 @@ pub(crate) enum CliError {
 	Usage(String),
 	/// The terminal could not show a prompt or read its answer; exit code 1.
 	TerminalInput(InquireError),
-	/// A child process (Rclone) exited with this code and reported its own error; its code is the
-	/// CLI's exit code.
+	/// A child process (Rclone) failed and reported its own error, if any: the code it exited with,
+	/// or 128 plus the signal that ended it ([`exit_code_of`]); that is the CLI's exit code.
 	ChildExit(i32),
 	/// Ctrl-C cancelled the command; exit code [`EXIT_INTERRUPTED`].
 	Interrupted,
@@ -94,6 +96,19 @@ pub(crate) fn find_cli_error(err: &anyhow::Error) -> Option<&CliError> {
 /// The exit code the CLI exits with after `err`.
 pub(crate) fn exit_code(err: &anyhow::Error) -> i32 {
 	find_cli_error(err).map_or(EXIT_FAILURE, CliError::exit_code)
+}
+
+/// The exit code to pass on for a process that ended with `status`: its own, or for one a signal
+/// ended, the code a shell reports, 128 plus the signal.
+pub(crate) fn exit_code_of(status: ExitStatus) -> i32 {
+	if let Some(code) = status.code() {
+		return code;
+	}
+	#[cfg(unix)]
+	if let Some(signal) = status.signal() {
+		return signal.saturating_add(128);
+	}
+	EXIT_FAILURE
 }
 
 #[cfg(test)]
@@ -178,5 +193,16 @@ mod tests {
 
 		assert!(find_cli_error(&err).is_none());
 		assert_eq!(exit_code(&err), 1);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn a_process_ended_by_a_signal_exits_with_128_plus_the_signal() {
+		// SIGINT
+		assert_eq!(exit_code_of(ExitStatus::from_raw(2)), 130);
+		// SIGKILL
+		assert_eq!(exit_code_of(ExitStatus::from_raw(9)), 137);
+		// exited with 3
+		assert_eq!(exit_code_of(ExitStatus::from_raw(3 << 8)), 3);
 	}
 }

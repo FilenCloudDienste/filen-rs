@@ -94,7 +94,7 @@ use crate::{
 	auth::LazyClient,
 	commands::CommandContext,
 	docs::DocElement,
-	error::CliError,
+	error::{self, CliError},
 	interrupt,
 	serve_cert::{self, CertOrigin, SelfSignedCert},
 	ui::{self, StderrLine, UI},
@@ -979,16 +979,13 @@ pub(crate) async fn execute_rclone(
 ) -> Result<()> {
 	let binary = prepare_binary(config, ui, binary).await;
 	let client = client.get(ui).await?;
-	let exit_code = run_rclone(client, &binary, &cmd)
+	let status = run_rclone(client, &binary, &cmd)
 		.await
-		.context("Failed to run Rclone")?
-		.code();
-	if let Some(exit_code) = exit_code
-		&& exit_code != 0
-	{
-		return Err(CliError::ChildExit(exit_code).into());
+		.context("Failed to run Rclone")?;
+	match error::exit_code_of(status) {
+		0 => Ok(()),
+		code => Err(CliError::ChildExit(code).into()),
 	}
-	Ok(())
 }
 
 /// Prints the version and path of the Rclone binary `binary` names, downloading the managed one
