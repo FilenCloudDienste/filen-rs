@@ -189,6 +189,7 @@ Breaking changes are marked **Breaking**: scripts that depend on the old behavio
 - `filen rclone` exits with 128 plus the signal when a signal ended Rclone, instead of 0
 - a terminal error while reading a text or password prompt is a `terminal_input` failure, not an unexpected one with a link to report a bug
 - `mount` and `serve --cache-size` accept only `n`, `nB` and `nU`, `nUi`, `nUB` or `nUiB` with a unit `K`, `M`, `G` or `T`, and refuse a malformed suffix such as `10iB` (read as 10 bytes) or `10MBB` (read as 10 MiB)
+- a sync pair with an empty local or remote path, as in `:/docs` or `/home/me/docs:`, is refused instead of syncing the working directory or the remote working path
 - a failed write to stdout, as on a full disk, ends the command with a message and exit code 1 instead of a crash; in the REPL it fails only that command
 
 ### Security

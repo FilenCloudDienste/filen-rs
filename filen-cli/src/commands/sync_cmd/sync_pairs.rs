@@ -664,6 +664,18 @@ fn parse_sync_pair_definition(pair: &str) -> Result<ParsedPair> {
 		},
 		None => (rest, SyncMode::TwoWay),
 	};
+	// an empty side would be the working directory or the remote working path, which nobody
+	// writing `:/docs` or `/home/me/docs:` meant to sync
+	if local.is_empty() {
+		return Err(UI::usage_failure(&format!(
+			"Invalid sync pair \"{pair}\": the local path is empty"
+		)));
+	}
+	if remote.is_empty() {
+		return Err(UI::usage_failure(&format!(
+			"Invalid sync pair \"{pair}\": the remote path is empty"
+		)));
+	}
 	Ok(ParsedPair {
 		local: expand_home(local, dirs::home_dir().as_deref()),
 		mode,
@@ -865,6 +877,21 @@ fn read_sync_pairs_file(path: &Path) -> Result<Vec<ParsedPair>> {
 	entries
 		.into_iter()
 		.map(|entry| {
+			// an empty local path would be the file's directory, and an empty remote path the
+			// remote working path
+			let empty_side = if entry.local.is_empty() {
+				Some("local")
+			} else if entry.remote.is_empty() {
+				Some("remote")
+			} else {
+				None
+			};
+			if let Some(side) = empty_side {
+				return Err(UI::failure(&format!(
+					"The sync pairs file {} gives a sync pair an empty {side} path",
+					path.display()
+				)));
+			}
 			let mode = match entry.mode.as_deref() {
 				None => SyncMode::TwoWay,
 				Some(mode) => parse_sync_mode_str(mode).ok_or_else(|| {
@@ -1781,6 +1808,58 @@ mod tests {
 			"Invalid sync pair \"/home/me/docs\": expected <local>:<remote>, \
 			 <local>:<mode>:<remote> or the path to a sync pairs file"
 		);
+	}
+
+	/// An empty side would sync the working directory or the remote working path.
+	#[test]
+	fn a_sync_pair_with_an_empty_local_or_remote_is_a_usage_error() {
+		let messages = [":/r", "/a:", "/a:tw:"].map(|pair| {
+			let error = parse_sync_pair_definition(pair).unwrap_err();
+			(exit_code(&error), error.to_string())
+		});
+
+		assert_eq!(
+			messages,
+			[
+				(
+					2,
+					"Invalid sync pair \":/r\": the local path is empty".to_owned()
+				),
+				(
+					2,
+					"Invalid sync pair \"/a:\": the remote path is empty".to_owned()
+				),
+				(
+					2,
+					"Invalid sync pair \"/a:tw:\": the remote path is empty".to_owned()
+				),
+			]
+		);
+	}
+
+	#[test]
+	fn a_sync_pairs_file_with_an_empty_path_is_a_failure() {
+		let messages = [
+			(r#"[{"local": "", "remote": "/r"}]"#, "local"),
+			(r#"[{"local": "/a", "remote": ""}]"#, "remote"),
+		]
+		.map(|(content, side)| {
+			let (_dir, path) = sync_pairs_file("syncPairs.json", content);
+			let error = read_sync_pairs_file(&path).unwrap_err();
+			(
+				exit_code(&error),
+				error.to_string(),
+				format!(
+					"The sync pairs file {} gives a sync pair an empty {side} path",
+					path.display()
+				),
+			)
+		});
+
+		for (code, message, expected) in messages {
+			assert_eq!(code, 1);
+			assert_eq!(message, expected);
+		}
 	}
 
 	/// The short tokens of the TypeScript CLI name the modes their long names do.
