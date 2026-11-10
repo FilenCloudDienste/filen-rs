@@ -195,6 +195,7 @@ Breaking changes are marked **Breaking**: scripts that depend on the old behavio
 - on Windows, `download` and `download-shared` print `C:\...` paths instead of `\\?\C:\...`, where the path means the same without the prefix; they still write into an existing destination through its `\\?\` path, so a downloaded name ending in a dot or a space keeps it there
 - `note-edit` reads the note again before saving and, when it changed while it was being edited, saves nothing and keeps the edit in its temporary file, whose path it names, instead of overwriting the change; it keeps and names the edit too when it cannot save it for another reason, such as the note having been deleted meanwhile
 - an update installed under a new name, next to a binary whose name carries its version, stays installed when the old binary cannot be deleted, with a warning to delete it, instead of failing the command
+- `view-html-docs` answers a request for an unknown section with 404 Not Found instead of 200 OK
 - a failed write to stdout, as on a full disk, ends the command with a message and exit code 1 instead of a crash; in the REPL it fails only that command
 
 ### Security

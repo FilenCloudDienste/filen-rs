@@ -129,7 +129,8 @@ mod offline {
 		assert!(transfers.contains("<body>"), "{transfers}");
 		assert!(transfers.contains("upload"), "{transfers}");
 
-		let (_, unknown) = get(port, "/no-such-section");
+		let (status, unknown) = get(port, "/no-such-section");
+		assert_eq!(status, 404, "{unknown}");
 		assert_eq!(unknown, "Section not found");
 	}
 }

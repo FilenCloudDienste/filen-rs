@@ -525,7 +525,7 @@ fn respond_with_section(parsed_doc_outline: &[ParsedDocSection], request: Reques
 			|| (request.url() == "/" && section.id == MAIN_SECTION)
 	}) else {
 		return request
-			.respond(Response::from_string("Section not found"))
+			.respond(Response::from_string("Section not found").with_status_code(404))
 			.context("Failed to respond to docs HTTP request");
 	};
 
