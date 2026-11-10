@@ -281,16 +281,12 @@ async fn authenticate_and_get_password(
 			kept: KeptLogin::AuthConfig(export_path),
 		})
 	} else {
-		match authenticate_from_keyring(config, ui, client_config_args).await {
-			Ok(Some(client)) => {
-				log::info!("Authenticated from keyring");
-				return Ok(Login {
-					client,
-					kept: KeptLogin::Keyring,
-				});
-			}
-			Ok(None) => {}
-			Err(e) => log::warn!("Failed to authenticate from keyring: {:?}", e),
+		if let Some(client) = authenticate_from_keyring(config, ui, client_config_args).await {
+			log::info!("Authenticated from keyring");
+			return Ok(Login {
+				client,
+				kept: KeptLogin::Keyring,
+			});
 		}
 		if let Some((login, path)) =
 			authenticate_from_old_cli(config, ui, client_config_args).await?
@@ -880,9 +876,9 @@ async fn authenticate_from_keyring(
 	config: &CliConfig,
 	ui: &mut UI,
 	client_config_args: &ClientConfigArgs,
-) -> Result<Option<Client>> {
+) -> Option<Client> {
 	if keyring_disabled_for_testing() {
-		return Ok(None);
+		return None;
 	}
 	let location = KeyringLocation::of(config);
 	authenticate_from_keyring_entry(
@@ -895,20 +891,25 @@ async fn authenticate_from_keyring(
 
 /// [`authenticate_from_keyring`] with the SDK config in `entry`. Credentials that are corrupt, or
 /// whose login the server no longer accepts, are deleted with a warning, so that the user logs in
-/// again, whether or not they keep the new login.
+/// again, whether or not they keep the new login. A keyring that cannot be read is a warning too,
+/// and the user logs in another way.
 async fn authenticate_from_keyring_entry(
 	entry: &LongKeyringEntry<'_>,
 	ui: &mut UI,
 	client_config_args: &ClientConfigArgs,
-) -> Result<Option<Client>> {
-	let sdk_config = entry
-		.read()
-		.context("Failed to read SDK config from keyring")?;
-	let Some(sdk_config) = sdk_config else {
-		return Ok(None);
+) -> Option<Client> {
+	let sdk_config = match entry.read() {
+		Ok(sdk_config) => sdk_config?,
+		Err(e) => {
+			log::warn!("Failed to read SDK config from keyring: {:#}", e);
+			ui.print_warning(&format!(
+				"The login saved in the system keyring could not be read: {e:#}"
+			));
+			return None;
+		}
 	};
 	match restore_login(&sdk_config, client_config_args).await {
-		Ok(client) => Ok(Some(client)),
+		Ok(client) => Some(client),
 		Err(e) => {
 			log::warn!(
 				"The credentials saved in the keyring cannot be used: {:#}",
@@ -922,7 +923,7 @@ async fn authenticate_from_keyring_entry(
 				);
 			}
 			ui.print_warning("Saved credentials are no longer valid, please log in again");
-			Ok(None)
+			None
 		}
 	}
 }
@@ -3098,8 +3099,7 @@ mod tests {
 			&mut Printed::split_ui(&out, &err),
 			&ClientConfigArgs::default(),
 		)
-		.await
-		.unwrap();
+		.await;
 
 		assert!(found.is_none());
 		assert_eq!(entry.read().unwrap(), None);
@@ -3121,11 +3121,32 @@ mod tests {
 			&mut printed.ui(),
 			&ClientConfigArgs::default(),
 		)
-		.await
-		.unwrap();
+		.await;
 
 		assert!(found.is_none());
 		assert_eq!(printed.lines_or_empty(), "");
+	}
+
+	#[tokio::test]
+	async fn an_unreadable_keyring_is_a_warning() {
+		let store = UnavailableChunkStore;
+		let out = Printed::default();
+		let err = Printed::default();
+
+		let found = authenticate_from_keyring_entry(
+			&LongKeyringEntry::new(&store, "sdk-config"),
+			&mut Printed::split_ui(&out, &err),
+			&ClientConfigArgs::default(),
+		)
+		.await;
+
+		assert!(found.is_none());
+		assert_eq!(out.lines_or_empty(), "");
+		assert_eq!(
+			console::strip_ansi_codes(&err.lines()),
+			"⚠ The login saved in the system keyring could not be read: Couldn't access platform \
+			 secure storage: no keyring service: no keyring service"
+		);
 	}
 
 	/// The error the server answers a request with an API key it no longer accepts with.

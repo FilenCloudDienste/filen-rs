@@ -46,6 +46,7 @@ Breaking changes are marked **Breaking**: scripts that depend on the old behavio
 - a missing or unreadable `--auth-config-path` fails the command instead of logging in another way; a corrupt or revoked one fails with a hint to export a new one
 - on Linux and macOS, an auth config found in a default location that other users can read is refused (and one given with `--auth-config-path` is used with a warning): restrict it with `chmod 600`
 - saved credentials that are corrupt or revoked print a warning and lead to the login prompt; being offline no longer forces a new login
+- a keyring that cannot be read at login prints a warning that says why before the CLI logs in another way
 - the login prompt asks again after a wrong email, password or two-factor code, up to 3 times; the two-factor prompt also takes the recovery key
 - a wrong two-factor code given with the option or environment variable is asked again at a terminal
 - an email without a password (or the reverse) fails with a plain message instead of an unexpected error
