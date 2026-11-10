@@ -872,6 +872,17 @@ fn read_sync_pairs_file(path: &Path) -> Result<Vec<ParsedPair>> {
 			path.display()
 		)));
 	}
+	if let Some(alias) = entries
+		.iter()
+		.filter_map(|entry| entry.alias.as_deref())
+		.find(|alias| !is_alias(alias))
+	{
+		return Err(UI::failure(&format!(
+			"The sync pairs file {} gives the alias \"{alias}\", which `sync` cannot select: an \
+			 alias is a word without \":\" or a path separator",
+			path.display()
+		)));
+	}
 	let base = path.parent().unwrap_or(Path::new(""));
 	let home = dirs::home_dir();
 	entries
@@ -1750,6 +1761,33 @@ mod tests {
 				path.display()
 			)
 		);
+	}
+
+	/// `sync` takes an argument with `:` or a path separator, or an empty one, as a pair or a
+	/// file, never as an alias.
+	#[test]
+	fn a_sync_pairs_file_alias_sync_cannot_select_is_a_failure() {
+		let messages = ["a:b", "a/b", ""].map(|alias| {
+			let (_dir, path) = sync_pairs_file(
+				"syncPairs.json",
+				&format!(r#"[{{"local": "/a", "remote": "/r/a", "alias": "{alias}"}}]"#),
+			);
+			let error = read_sync_pairs_file(&path).unwrap_err();
+			(
+				exit_code(&error),
+				error.to_string(),
+				format!(
+					"The sync pairs file {} gives the alias \"{alias}\", which `sync` cannot \
+					 select: an alias is a word without \":\" or a path separator",
+					path.display()
+				),
+			)
+		});
+
+		for (code, message, expected) in messages {
+			assert_eq!(code, 1);
+			assert_eq!(message, expected);
+		}
 	}
 
 	/// A word between the local path and the remote path that names no mode is reported, rather

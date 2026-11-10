@@ -51,8 +51,9 @@
 //! - `remote`: the remote directory, which may contain a `:`.
 //! - `mode`, or `syncMode` as the TypeScript CLI called it: a mode name or its short form, `twoWay`
 //!   if not given. Giving both is an error.
-//! - `alias`, optional: a name by which `filen sync <alias>` selects the sync pair of the default
-//!   sync pairs file, and by which the commands that manage sync pairs name it.
+//! - `alias`, optional: a word, without `:` or a path separator, by which `filen sync <alias>`
+//!   selects the sync pair of the default sync pairs file, and by which the commands that manage
+//!   sync pairs name it. A file that gives any other alias is refused.
 //! - `ignore`, optional: a list of ignore rules, in `.filenignore` syntax, which are added to the
 //!   `.filenignore` at the local root (see below).
 //! - `excludeDotFiles: true`, optional: stands for the rules `.*` and `!/.filenignore`, so every
