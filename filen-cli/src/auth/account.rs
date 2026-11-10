@@ -11,8 +11,9 @@
 //! The login the CLI keeps is updated with it: the system keychain's, or the auth config file you
 //! logged in with. A password given with `--password` or the environment has to be updated where
 //! your scripts set it (and a login this config dir keeps as well, if it is of the same account,
-//! stops working: the CLI says so), and logins kept elsewhere (another config dir, another device,
-//! an exported auth config, the old Filen CLI's saved login) may stop working.
+//! stops working: the CLI says so), and logins kept elsewhere (another config dir or profile,
+//! another device, an exported auth config, the old Filen CLI's saved login) may stop working,
+//! which the CLI warns about.
 //!
 //! `change-email <new email>` asks for your password and requests the change: Filen sends an
 //! email to confirm it, and the change happens once you confirm it. Then log in again (with
@@ -181,7 +182,7 @@ fn new_password(first: String, repeated: &str) -> Result<String> {
 }
 
 /// Write the login `sdk_config`, whose credentials changed, to where the login was kept, or say
-/// where the user has to update it.
+/// where the user has to update it, then warn that logins kept elsewhere may stop working.
 fn update_kept_login(
 	config: &CliConfig,
 	ui: &mut UI,
@@ -228,22 +229,26 @@ fn update_kept_login_in(
 			path.display()
 		)),
 		KeptLogin::AuthConfig(path) => update_auth_config(ui, path, sdk_config)?,
-		KeptLogin::Keyring => {
-			let Some(entry) = keyring_entry else {
-				log::info!("The keyring is turned off, so the kept login is not updated");
-				return Ok(());
-			};
-			entry.write(sdk_config).map_err(|e| {
-				log::warn!("Failed to update the login in the keyring: {:#}", e);
-				UI::failure(
-					"Failed to update the login kept in the system keychain: log in again with \
-					 `filen logout`, then any command",
-				)
-			})?;
-			ui.print_success("Updated the login kept in the system keychain");
-		}
+		KeptLogin::Keyring => match keyring_entry {
+			None => log::info!("The keyring is turned off, so the kept login is not updated"),
+			Some(entry) => {
+				entry.write(sdk_config).map_err(|e| {
+					log::warn!("Failed to update the login in the keyring: {:#}", e);
+					UI::failure(
+						"Failed to update the login kept in the system keychain: log in again \
+						 with `filen logout`, then any command",
+					)
+				})?;
+				ui.print_success("Updated the login kept in the system keychain");
+			}
+		},
 		KeptLogin::Nowhere => {}
 	}
+	// the CLI cannot see them: the password change replaced the API key they log in with
+	ui.print_warning(
+		"Logins kept elsewhere (another config dir or profile, another device, an exported auth \
+		 config) may stop working: log in again there",
+	);
 	Ok(())
 }
 
@@ -549,6 +554,10 @@ mod tests {
 		assert_eq!(format!("{err:#}"), "The new password must not be empty");
 	}
 
+	/// The warning every successful update of the kept login ends with, without its styling.
+	const STALE_LOGINS_WARNING: &str = "⚠ Logins kept elsewhere (another config dir or profile, \
+		another device, an exported auth config) may stop working: log in again there";
+
 	#[test]
 	fn a_login_kept_in_the_keyring_is_replaced() {
 		let store = MemoryChunkStore::default();
@@ -568,7 +577,7 @@ mod tests {
 		assert_eq!(entry.read().unwrap().as_deref(), Some("the new login"));
 		assert_eq!(
 			console::strip_ansi_codes(&printed.lines()),
-			"✔ Updated the login kept in the system keychain"
+			format!("✔ Updated the login kept in the system keychain\n{STALE_LOGINS_WARNING}")
 		);
 	}
 
@@ -600,7 +609,10 @@ mod tests {
 		assert_eq!(store.keys(), Vec::<String>::new());
 		assert_eq!(
 			console::strip_ansi_codes(&printed.lines()),
-			format!("✔ Updated the auth config file {}", path.display())
+			format!(
+				"✔ Updated the auth config file {}\n{STALE_LOGINS_WARNING}",
+				path.display()
+			)
 		);
 	}
 
@@ -652,8 +664,10 @@ mod tests {
 		assert_eq!(store.keys(), Vec::<String>::new());
 		assert_eq!(
 			console::strip_ansi_codes(&printed.lines()),
-			"⚠ Update the password where your scripts set it: --password, FILEN_CLI_PASSWORD or \
-			 FILEN_PASSWORD"
+			format!(
+				"⚠ Update the password where your scripts set it: --password, FILEN_CLI_PASSWORD \
+				 or FILEN_PASSWORD\n{STALE_LOGINS_WARNING}"
+			)
 		);
 	}
 
@@ -688,7 +702,7 @@ mod tests {
 				 or FILEN_PASSWORD\n\
 				 ⚠ A login is also kept in the system keychain and in the auth config file {}: if \
 				 it is of this account, it no longer works, so log in again with `filen logout`, \
-				 then any command",
+				 then any command\n{STALE_LOGINS_WARNING}",
 				auth_config.display()
 			)
 		);
@@ -713,14 +727,16 @@ mod tests {
 		assert_eq!(store.keys(), Vec::<String>::new());
 		assert_eq!(
 			console::strip_ansi_codes(&printed.lines()),
-			"⚠ The credentials saved by the old Filen CLI at /home/user/.filen-cli-auth-config, \
-			 which this login came from, were not updated and no longer work: log in again on \
-			 the next run, and keep the login"
+			format!(
+				"⚠ The credentials saved by the old Filen CLI at /home/user/.filen-cli-auth-config, \
+				 which this login came from, were not updated and no longer work: log in again on \
+				 the next run, and keep the login\n{STALE_LOGINS_WARNING}"
+			)
 		);
 	}
 
 	#[test]
-	fn a_login_kept_nowhere_has_nothing_to_update() {
+	fn a_login_kept_nowhere_has_nothing_to_update_but_logins_kept_elsewhere() {
 		let store = MemoryChunkStore::default();
 		let entry = LongKeyringEntry::new(&store, "sdk-config");
 		let printed = Printed::default();
@@ -735,7 +751,10 @@ mod tests {
 		.unwrap();
 
 		assert_eq!(store.keys(), Vec::<String>::new());
-		assert_eq!(printed.lines_or_empty(), "");
+		assert_eq!(
+			console::strip_ansi_codes(&printed.lines()),
+			STALE_LOGINS_WARNING
+		);
 	}
 
 	#[test]
