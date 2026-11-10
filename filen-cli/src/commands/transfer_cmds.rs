@@ -101,8 +101,9 @@
 //! `--json`, the result is printed as one object instead: `{"destination": ..., "files": ...,
 //! "bytes": ..., "resumed_bytes": ..., "skipped": ..., "skipped_symlinks": [...], "failed":
 //! [{"path": ..., "error": ...}]}`, where `path` is `null` for a failure not about a single item.
-//! Press Ctrl+C to cancel a running transfer: what was transferred by then is reported on stderr
-//! and the command exits with status 130, where the TypeScript CLI printed "Aborted".
+//! Press Ctrl+C to cancel a running transfer: what was transferred by then, and the items that had
+//! failed, are reported on stderr and the command exits with status 130, where the TypeScript CLI
+//! printed "Aborted".
 
 use std::{
 	borrow::Cow,
@@ -1476,7 +1477,7 @@ fn download_target(destination: &Path, name: &str) -> Option<PathBuf> {
 
 /// Await `transfer` until it completes or the user hits Ctrl+C, erasing the progress line either
 /// way. Cancelling drops the transfer future, which is how the SDK aborts the workers it spawned,
-/// and reports on stderr what had been transferred by then.
+/// and reports on stderr what had been transferred by then and the items that had failed.
 pub(crate) async fn run_cancellable<T>(
 	ui: &mut UI,
 	progress: &TransferProgress,
@@ -1498,10 +1499,29 @@ pub(crate) async fn run_cancellable<T>(
 		// Nobody reads a report on what a closed stdout cut short.
 		None if interrupt::stdout_closed() => Err(CliError::StdoutClosed.into()),
 		None => {
-			let (files, bytes) = progress.done();
-			ui.print_muted_to_stderr(&canceled_message(progress.kind, files, bytes));
+			report_canceled(ui, progress);
 			Err(CliError::Interrupted.into())
 		}
+	}
+}
+
+/// Report on stderr what a canceled transfer had moved, then the items that had failed by then.
+fn report_canceled(ui: &mut UI, progress: &TransferProgress) {
+	let (files, bytes) = progress.done();
+	ui.print_muted_to_stderr(&canceled_message(progress.kind, files, bytes));
+	print_failures(ui, &progress.take_failures());
+}
+
+/// Print the first `MAX_PRINTED_ERRORS` failures on stderr, then how many more there were.
+fn print_failures(ui: &mut UI, failures: &[TransferFailure]) {
+	for failure in failures.iter().take(MAX_PRINTED_ERRORS) {
+		ui.print_failure(&failure.to_string());
+	}
+	if failures.len() > MAX_PRINTED_ERRORS {
+		ui.print_failure(&format!(
+			"... and {} more",
+			failures.len() - MAX_PRINTED_ERRORS
+		));
 	}
 }
 
@@ -1539,15 +1559,7 @@ pub(crate) fn finish(
 		if !skipped_symlinks.is_empty() && !progress.list_files && !ui.is_quiet() {
 			ui.print_muted(&skipped_symlinks_line(skipped_symlinks.len()));
 		}
-		for failure in failures.iter().take(MAX_PRINTED_ERRORS) {
-			ui.print_failure(&failure.to_string());
-		}
-		if failures.len() > MAX_PRINTED_ERRORS {
-			ui.print_failure(&format!(
-				"... and {} more",
-				failures.len() - MAX_PRINTED_ERRORS
-			));
-		}
+		print_failures(ui, &failures);
 		let summary = transfer_summary(&tally, progress.started.elapsed());
 		if failures.is_empty() {
 			ui.print_success(&format!("{} {}: {}", kind.past(), subject, summary));
@@ -2476,10 +2488,10 @@ mod tests {
 		SPEED_WINDOW, Tally, TransferFailure, TransferKind, TransferProgress, UploadTarget,
 		canceled_message, decode_hex_key, download_target, ends_the_command, ensure_stdio_is_free,
 		existing_remote_policy, expand_source_wildcards, format_duration, local_existing,
-		open_linked_file, partial_download, progress_line, resolve_download_target,
-		resolve_upload_target, result_json, skipped_symlinks_line, source_failure,
-		sources_and_destination, stdin_destination, stdin_upload_target, transfer_summary,
-		upload_journal,
+		open_linked_file, partial_download, progress_line, report_canceled,
+		resolve_download_target, resolve_upload_target, result_json, skipped_symlinks_line,
+		source_failure, sources_and_destination, stdin_destination, stdin_upload_target,
+		transfer_summary, upload_journal,
 	};
 	use crate::{
 		CliConfig,
@@ -2843,6 +2855,30 @@ mod tests {
 			canceled_message(TransferKind::Download, 2, MIB),
 			"Downloaded 2 files, 1 MiB before canceling"
 		);
+	}
+
+	#[test]
+	fn a_canceled_transfer_lists_the_failures_collected_before() {
+		let progress = quiet_progress();
+		progress.push_failures([
+			TransferFailure {
+				path: Some("a".to_owned()),
+				error: "Failed to upload: denied".to_owned(),
+			},
+			TransferFailure {
+				path: None,
+				error: "Failed to list /d".to_owned(),
+			},
+		]);
+		let (out, err) = (Printed::default(), Printed::default());
+		let mut ui = Printed::split_ui(&out, &err);
+		report_canceled(&mut ui, &progress);
+		assert_eq!(
+			console::strip_ansi_codes(&err.lines()),
+			"Uploaded 0 files, 0 B before canceling\n✘ a: Failed to upload: denied\n✘ Failed to \
+			 list /d"
+		);
+		assert!(out.bytes().is_empty());
 	}
 
 	#[test]

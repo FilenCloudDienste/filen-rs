@@ -76,7 +76,7 @@ Breaking changes are marked **Breaking**: scripts that depend on the old behavio
 - `upload` of a symlink keeps the link's own name
 - the progress line shows the speed and the time left; the summary shows the files, size, time and average speed, and how many items were skipped
 - with `--json`, `upload` and `download` print one result object (`destination`, `files`, `bytes`, `skipped`, `resumed_bytes`, `failed`)
-- Ctrl-C reports what was transferred before exiting with 130, and also cancels a directory upload during its local scan
+- Ctrl-C reports what was transferred and what failed before exiting with 130, and also cancels a directory upload during its local scan
 
 #### Mount and serve
 
