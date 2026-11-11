@@ -12,7 +12,7 @@ use crate::{
 	util::MaybeSendCallback,
 };
 
-use super::{DownloadError, UploadError};
+use super::{DownloadError, PathToStringExt, UploadError};
 
 #[uniffi::export(with_foreign)]
 pub trait JsDirUploadCallback: Send + Sync {
@@ -323,22 +323,6 @@ impl JsClient {
 					.await
 			})
 			.await
-	}
-}
-
-trait PathToStringExt {
-	fn into_string_lossy(self) -> String;
-}
-
-// replace with string_from_utf8_lossy_owned
-// https://github.com/rust-lang/rust/issues/129436 when stabilized
-impl PathToStringExt for PathBuf {
-	fn into_string_lossy(self) -> String {
-		let os_string = self.into_os_string();
-		match os_string.into_string() {
-			Ok(s) => s,
-			Err(s) => s.to_string_lossy().into_owned(),
-		}
 	}
 }
 

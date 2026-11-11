@@ -27,6 +27,7 @@ const {
 	ConflictResolution,
 	DeleteGuardState_Tags,
 	DirColor_Tags,
+	DirMeta_Tags,
 	ErrorKind,
 	FileEncryptionVersion,
 	FileMeta_Tags,
@@ -947,6 +948,34 @@ describe("transfers, offline", () => {
 			}
 		)
 		assert.equal(existsSync(target), false)
+		assert.deepEqual(calls, [])
+	})
+
+	// A JsDirUploadCallback recording its calls by method name.
+	function dirUploadCallback(calls) {
+		const methods = ["onScanProgress", "onScanErrors", "onScanComplete", "onUploadUpdate", "onUploadErrors"]
+		return Object.fromEntries(methods.map(name => [name, (...args) => calls.push([name, ...args])]))
+	}
+
+	// A ubrn `Dir` that converts, of a directory no request is made for.
+	const synthDir = () => ({
+		uuid: randomUUID(),
+		parent: { tag: ParentUuid_Tags.Uuid, inner: [randomUUID()] },
+		color: { tag: DirColor_Tags.Default },
+		timestamp: 0n,
+		favorited: false,
+		meta: { tag: DirMeta_Tags.Decoded, inner: [{ name: "target", created: undefined }] }
+	})
+
+	test("uploadDirRecursively of a missing directory rejects with a FilenSdkError and reports no scan", async () => {
+		const calls = []
+		await assert.rejects(
+			synthClient(randomUUID()).uploadDirRecursively(join(dir, "missing"), dirUploadCallback(calls), synthDir(), noSignals),
+			e => {
+				assert.equal(assertThrownLikeUbrn(e).kind(), ErrorKind.Io)
+				return true
+			}
+		)
 		assert.deepEqual(calls, [])
 	})
 })

@@ -29,9 +29,8 @@ mod napi_impl;
 #[cfg(feature = "uniffi")]
 mod uniffi_impl;
 
-// No napi export uploads a directory yet.
-#[cfg_attr(feature = "napi", allow(dead_code))]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+#[filen_macros::napi_mirror(export)]
 pub struct UploadError {
 	pub path: String,
 	pub error: Arc<FilenSdkError>,
@@ -46,8 +45,6 @@ pub struct DownloadError {
 }
 
 /// Uploads the contents of the local directory `dir_path` into `target`.
-// No napi export uploads a directory yet.
-#[cfg_attr(feature = "napi", allow(dead_code))]
 pub(crate) async fn upload_dir<C: DirUploadCallback + ?Sized>(
 	client: Arc<Client>,
 	dir_path: String,
@@ -114,4 +111,20 @@ pub(crate) async fn download_file_to_path(
 	let file: RemoteFileType = file.try_into()?;
 	IoSharedClientExt::download_file_to_path(client.as_ref(), &file, file_path.as_ref(), progress)
 		.await
+}
+
+trait PathToStringExt {
+	fn into_string_lossy(self) -> String;
+}
+
+// replace with string_from_utf8_lossy_owned
+// https://github.com/rust-lang/rust/issues/129436 when stabilized
+impl PathToStringExt for PathBuf {
+	fn into_string_lossy(self) -> String {
+		let os_string = self.into_os_string();
+		match os_string.into_string() {
+			Ok(s) => s,
+			Err(s) => s.to_string_lossy().into_owned(),
+		}
+	}
 }

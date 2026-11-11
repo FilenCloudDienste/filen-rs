@@ -1,5 +1,6 @@
 //! The path transfers' napi exports, which take callback objects the macros cannot read:
-//! `JsClient.downloadFileToPath`, `JsClient.uploadFile` and `JsClient.downloadDirRecursively`.
+//! `JsClient.downloadFileToPath`, `JsClient.uploadFile`, `JsClient.downloadDirRecursively` and
+//! `JsClient.uploadDirRecursively`.
 //!
 //! A call's callback object becomes one [`Listener`], read and bound on the JS thread when the call
 //! is made; the SDK's progress reaches it from the commander runtime without waiting on JS. Every
@@ -10,21 +11,21 @@
 //! both cases calls already queued, or made while the transfer stops, may arrive after the
 //! rejection.
 
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
 use napi::{
 	Env,
 	bindgen_prelude::{BigInt, Either, FnArgs, FunctionRef, Object, PromiseRaw, Undefined},
 };
 
-use super::DownloadError;
+use super::{DownloadError, PathToStringExt, UploadError};
 use crate::{
 	Error, auth,
 	fs::categories::{Category, NonRootItemType, fs::CategoryFS},
-	io::DirDownloadCallback,
+	io::{DirDownloadCallback, DirUploadCallback, RemoteDirectory, RemoteFile},
 	js::{
-		AnyDirWithContext, AnyFile, DirWithPath, File, FileBuilderParamsOptionalName, FileWithPath,
-		NonRootDir, NonRootItem,
+		AnyDirWithContext, AnyFile, Dir, DirWithPath, File, FileBuilderParamsOptionalName,
+		FileWithPath, NonRootDir, NonRootItem,
 		napi::{
 			FromWire, IntoWire, Listener, ListenerCall, OptionReturn, Wire, bound_method,
 			read_managed_future, spawn_promise,
@@ -334,10 +335,163 @@ fn download_dir_recursively<'env>(
 	})
 }
 
+/// One call of a directory upload's `JsDirUploadCallback`, its arguments in their wire form.
+pub(crate) enum DirUploadCall {
+	ScanProgress(BigInt, BigInt, BigInt),
+	ScanErrors(Vec<<Arc<Error> as Wire>::Wire>),
+	ScanComplete(BigInt, BigInt, BigInt),
+	UploadUpdate(Vec<<Dir as Wire>::Wire>, Vec<<File as Wire>::Wire>, BigInt),
+	UploadErrors(Vec<<UploadError as Wire>::Wire>),
+}
+
+/// `onUploadUpdate`'s arguments: the directories and files uploaded, and the bytes.
+type UploadUpdateArgs = FnArgs<(Vec<<Dir as Wire>::Wire>, Vec<<File as Wire>::Wire>, BigInt)>;
+
+/// A `JsDirUploadCallback`'s methods, bound to it.
+pub(crate) struct DirUploadMethods {
+	on_scan_progress: FunctionRef<Counts, ()>,
+	on_scan_errors: FunctionRef<Vec<<Arc<Error> as Wire>::Wire>, ()>,
+	on_scan_complete: FunctionRef<Counts, ()>,
+	on_upload_update: FunctionRef<UploadUpdateArgs, ()>,
+	on_upload_errors: FunctionRef<Vec<<UploadError as Wire>::Wire>, ()>,
+}
+
+impl ListenerCall for DirUploadCall {
+	type Methods = DirUploadMethods;
+
+	fn bind(callback: &Object<'_>) -> napi::Result<Self::Methods> {
+		Ok(DirUploadMethods {
+			on_scan_progress: bound_method(callback, "onScanProgress")?,
+			on_scan_errors: bound_method(callback, "onScanErrors")?,
+			on_scan_complete: bound_method(callback, "onScanComplete")?,
+			on_upload_update: bound_method(callback, "onUploadUpdate")?,
+			on_upload_errors: bound_method(callback, "onUploadErrors")?,
+		})
+	}
+
+	fn call(self, env: &Env, methods: &Self::Methods) -> napi::Result<()> {
+		// `call`, not `apply`, as in `FileProgress::call`.
+		match self {
+			Self::ScanProgress(dirs, files, bytes) => methods
+				.on_scan_progress
+				.borrow_back(env)?
+				.call(FnArgs::from((dirs, files, bytes))),
+			Self::ScanErrors(errors) => methods.on_scan_errors.borrow_back(env)?.call(errors),
+			Self::ScanComplete(dirs, files, bytes) => methods
+				.on_scan_complete
+				.borrow_back(env)?
+				.call(FnArgs::from((dirs, files, bytes))),
+			Self::UploadUpdate(dirs, files, bytes) => methods
+				.on_upload_update
+				.borrow_back(env)?
+				.call(FnArgs::from((dirs, files, bytes))),
+			Self::UploadErrors(errors) => methods.on_upload_errors.borrow_back(env)?.call(errors),
+		}
+	}
+}
+
+/// The SDK's directory upload callback for a `JsDirUploadCallback`. Skipped symlinks and files and
+/// resumed bytes go unreported, as on uniffi (the trait's defaults).
+struct NapiDirUploadCallback(Listener<DirUploadCall>);
+
+impl DirUploadCallback for NapiDirUploadCallback {
+	fn on_scan_progress(&self, known_dirs: u64, known_files: u64, known_bytes: u64) {
+		self.0.send(DirUploadCall::ScanProgress(
+			known_dirs.into_wire(),
+			known_files.into_wire(),
+			known_bytes.into_wire(),
+		));
+	}
+
+	fn on_scan_errors(&self, errors: Vec<Error>) {
+		self.0.send(DirUploadCall::ScanErrors(
+			errors
+				.into_iter()
+				.map(|e| Arc::new(e).into_wire())
+				.collect(),
+		));
+	}
+
+	fn on_scan_complete(&self, total_dirs: u64, total_files: u64, total_bytes: u64) {
+		self.0.send(DirUploadCall::ScanComplete(
+			total_dirs.into_wire(),
+			total_files.into_wire(),
+			total_bytes.into_wire(),
+		));
+	}
+
+	fn on_upload_update(
+		&self,
+		uploaded_dirs: Vec<RemoteDirectory>,
+		uploaded_files: Vec<RemoteFile>,
+		uploaded_bytes: u64,
+	) {
+		self.0.send(DirUploadCall::UploadUpdate(
+			uploaded_dirs
+				.into_iter()
+				.map(|dir| Dir::from(dir).into_wire())
+				.collect(),
+			uploaded_files
+				.into_iter()
+				.map(|file| File::from(file).into_wire())
+				.collect(),
+			uploaded_bytes.into_wire(),
+		));
+	}
+
+	fn on_upload_errors(&self, errors: Vec<(PathBuf, Error)>) {
+		self.0.send(DirUploadCall::UploadErrors(
+			errors
+				.into_iter()
+				.map(|(path, error)| {
+					UploadError {
+						path: path.into_string_lossy(),
+						error: Arc::new(error),
+					}
+					.into_wire()
+				})
+				.collect(),
+		));
+	}
+}
+
+/// `uploadDirRecursively`'s body, as [`download_file_to_path`]'s: a callback without one of the
+/// five methods throws napi's own error synchronously; a target or a managed future the SDK cannot
+/// read rejects. Symlinks inside the directory are followed, as on uniffi (the SDK's default).
+// napi-derive registers the method calling this only outside `cfg(test)`.
+#[cfg_attr(test, allow(dead_code))]
+fn upload_dir_recursively<'env>(
+	client: &auth::JsClient,
+	env: &'env Env,
+	dir_path: String,
+	callback: Object<'env>,
+	target: <Dir as Wire>::Wire,
+	managed_future: Object<'env>,
+	async_opts: Option<Object<'env>>,
+) -> napi::Result<PromiseRaw<'env, ()>> {
+	let listener = Listener::<DirUploadCall>::new(env, callback)?;
+	let managed_future = read_managed_future(&managed_future)?;
+	// Read here, on the JS thread: no JS value enters the future.
+	let target = Dir::from_wire(target);
+	let client = client.inner();
+	spawn_promise(env, async_opts, async move {
+		let target = target?;
+		let managed_future = managed_future?;
+		let callback = NapiDirUploadCallback(listener.clone());
+		let uploaded = managed_future
+			.into_js_managed_commander_future(move || async move {
+				super::upload_dir(client, dir_path, target, &callback).await
+			})
+			.await;
+		listener.flushed().await;
+		uploaded
+	})
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::{fs::categories::Normal, js::napi::listener_test_support::recording};
+	use crate::{ErrorKind, fs::categories::Normal, js::napi::listener_test_support::recording};
 
 	#[test]
 	fn a_dir_download_call_keeps_its_counts_on_the_wire() {
@@ -391,6 +545,44 @@ mod tests {
 		assert_eq!(u64::from_wire(known_bytes).unwrap(), 6);
 		assert_eq!(u64::from_wire(total_bytes).unwrap(), 9);
 	}
+
+	#[test]
+	fn a_dir_upload_call_keeps_its_counts_and_failed_paths_on_the_wire() {
+		let (listener, sent) = recording();
+		let callback = NapiDirUploadCallback(listener);
+
+		callback.on_scan_progress(1, 2, u64::MAX);
+		callback.on_scan_complete(3, 0, 5);
+		callback.on_upload_update(Vec::new(), Vec::new(), 7);
+		callback.on_upload_errors(vec![(
+			PathBuf::from("a/b.txt"),
+			Error::custom(ErrorKind::IO, "unreadable"),
+		)]);
+
+		let counts =
+			|a: BigInt, b: BigInt, c: BigInt| [a, b, c].map(|count| u64::from_wire(count).unwrap());
+		let sent = std::mem::take(&mut *sent.lock().unwrap());
+		let [
+			DirUploadCall::ScanProgress(a, b, c),
+			DirUploadCall::ScanComplete(d, e, f),
+			DirUploadCall::UploadUpdate(dirs, files, bytes),
+			DirUploadCall::UploadErrors(errors),
+		] = <[DirUploadCall; 4]>::try_from(sent).ok().unwrap()
+		else {
+			panic!("the calls were not sent as made");
+		};
+		assert_eq!(counts(a, b, c), [1, 2, u64::MAX]);
+		assert_eq!(counts(d, e, f), [3, 0, 5]);
+		assert!(dirs.is_empty() && files.is_empty());
+		assert_eq!(u64::from_wire(bytes).unwrap(), 7);
+		let [error] = <[_; 1]>::try_from(errors).ok().unwrap();
+		assert_eq!(error.path, "a/b.txt");
+		assert!(
+			error.error.message().contains("unreadable"),
+			"{}",
+			error.error.message()
+		);
+	}
 }
 
 // napi-derive's generated FFI glue (the raw N-API calls of each item's callback) lands in this
@@ -403,9 +595,11 @@ mod class {
 	};
 	use napi_derive::napi;
 
-	use super::{download_dir_recursively, download_file_to_path, upload_file};
+	use super::{
+		download_dir_recursively, download_file_to_path, upload_dir_recursively, upload_file,
+	};
 	use crate::js::{
-		AnyDirWithContext, AnyFile, File, FileBuilderParamsOptionalName,
+		AnyDirWithContext, AnyFile, Dir, File, FileBuilderParamsOptionalName,
 		napi::{JsClient, Wire},
 	};
 
@@ -486,6 +680,34 @@ mod class {
 			async_opts: Option<Object<'env>>,
 		) -> napi::Result<PromiseRaw<'env, ()>> {
 			download_dir_recursively(
+				&self.0,
+				env,
+				dir_path,
+				callback,
+				target,
+				managed_future,
+				async_opts,
+			)
+		}
+
+		/// Upload the contents of the local directory `dirPath` into `target`, following the
+		/// symlinks inside it. `callback` gets the scan's and the upload's progress: counts and
+		/// batches of what was uploaded or failed since its last call.
+		#[napi(
+			js_name = "uploadDirRecursively",
+			ts_args_type = "dirPath: string, callback: JsDirUploadCallback, target: Dir, managedFuture: ManagedFuture, asyncOpts_?: { signal: AbortSignal }",
+			ts_return_type = "Promise<void>"
+		)]
+		pub fn __napi_upload_dir_recursively<'env>(
+			&self,
+			env: &'env Env,
+			dir_path: String,
+			callback: Object<'env>,
+			target: <Dir as Wire>::Wire,
+			managed_future: Object<'env>,
+			async_opts: Option<Object<'env>>,
+		) -> napi::Result<PromiseRaw<'env, ()>> {
+			upload_dir_recursively(
 				&self.0,
 				env,
 				dir_path,
