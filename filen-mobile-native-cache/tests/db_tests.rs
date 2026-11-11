@@ -5356,6 +5356,65 @@ pub async fn test_the_drain_retries_a_file_whose_uuid_was_re_minted() {
 	}
 }
 
+// A caller that keeps an edit elsewhere drops the cache's claim on it, and the drain must then leave
+// the file alone: the edit in the slot would otherwise go over whatever the server holds by then.
+// An id that names no file the cache holds drops nothing and is not an error.
+#[shared_test_runtime]
+pub async fn test_a_dropped_pending_upload_is_not_drained() {
+	let (db, rss) = get_isolated_db_resources("drop_pending").await;
+
+	const ON_SERVER: &[u8] = b"v1";
+	rss.client
+		.upload_file(
+			rss.client
+				.make_file_builder("pending_dropped.txt", rss.dir.uuid())
+				.unwrap(),
+			ON_SERVER,
+		)
+		.await
+		.unwrap();
+
+	let test_dir_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
+	let file_path: FfiId = test_dir_path.join("pending_dropped.txt");
+	db.update_dir_children(test_dir_path.clone()).await.unwrap();
+
+	mark_pending_upload_over(&db, &file_path, b"v2 kept elsewhere, never to be drained").await;
+	let (_, stable_uuid) = file_ids(&db, &file_path);
+
+	db.drop_pending_upload(FfiId(format!("stable/{}", Uuid::new_v4())))
+		.await
+		.unwrap();
+	assert!(
+		pending_marker(&db, &file_path).is_some(),
+		"an id naming no file must leave other markers alone"
+	);
+
+	db.drop_pending_upload(FfiId(format!("stable/{stable_uuid}")))
+		.await
+		.unwrap();
+	assert_eq!(
+		pending_marker(&db, &file_path),
+		None,
+		"a dropped upload must leave no marker"
+	);
+	assert_eq!(
+		db.retry_pending_uploads().await.unwrap(),
+		0,
+		"the drain must not deliver a dropped upload"
+	);
+
+	db.update_dir_children(test_dir_path).await.unwrap();
+	match db.query_item(&file_path).unwrap().unwrap() {
+		FfiObject::File(f) => assert_eq!(
+			usize::try_from(f.size).unwrap(),
+			ON_SERVER.len(),
+			"the server must still hold the version the dropped edit would have replaced"
+		),
+		other => panic!("expected a file, got {other:?}"),
+	}
+}
+
 // The drain addresses a marked file through the stable namespace, and that id canonicalises to a
 // display-name path built from the cached row. When the server no longer has anything at that path
 // the walk comes back Partial — the arm that creates a file at the requested name. Creating one

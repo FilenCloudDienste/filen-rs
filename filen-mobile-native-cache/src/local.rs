@@ -1038,6 +1038,31 @@ mod in_runtime_tests {
 			)
 		);
 	}
+
+	/// A dropped marker is no longer counted, so a drain leaves the file's slot alone; an id the
+	/// cache holds no file for drops nothing and is not an error.
+	#[tokio::test]
+	async fn a_dropped_pending_upload_is_no_longer_pending() {
+		let (_dir, cache) = offline_cache_state(sdk_config(1, ROOT_A, "key"));
+		seed_tree(&cache);
+		seed(
+			&cache,
+			"UPDATE items SET pending_upload_at = 1 WHERE stable_uuid = ?1;",
+			[uuid(4)],
+		);
+		assert_eq!(cache.async_pending_upload_count().await.unwrap(), 1);
+
+		cache
+			.drop_pending_upload(FfiId(format!("stable/{}", uuid(7))))
+			.await
+			.unwrap();
+		assert_eq!(cache.async_pending_upload_count().await.unwrap(), 1);
+		cache
+			.drop_pending_upload(FfiId(format!("stable/{}", uuid(4))))
+			.await
+			.unwrap();
+		assert_eq!(cache.async_pending_upload_count().await.unwrap(), 0);
+	}
 }
 
 #[cfg(test)]

@@ -61,7 +61,7 @@ use crate::{
 	abort::{FfiAbortSignal, check_not_aborted, with_abort},
 	auth::{AuthCacheState, FilenMobileCacheState},
 	ffi::{
-		CreateFileResponse, DirWithPathResponse, DownloadResponse, FfiId, FfiObject,
+		CreateFileResponse, DirWithPathResponse, DownloadResponse, FfiFile, FfiId, FfiObject,
 		FileWithPathResponse, ItemType, ObjectWithPathResponse, ParsedFfiId, PathFfiId,
 		QueryChildrenResponse, QueryNonDirChildrenResponse, SearchQueryArgs,
 		SearchQueryResponseEntry, UploadFileInfo,
@@ -483,6 +483,105 @@ impl FilenMobileCacheState {
 		})
 		.await
 	}
+}
+
+/// Rust-only: nothing here is exported over UniFFI.
+impl FilenMobileCacheState {
+	/// Gives up delivering the edit the cache holds for the file `id`: its pending-upload marker
+	/// is dropped, so [`Self::retry_pending_uploads`] no longer uploads the bytes in its slot.
+	///
+	/// For a caller that keeps the edit elsewhere: a files-on-demand provider whose local file,
+	/// the edit's own copy, was kept aside as a new file because the server got a newer version
+	/// meanwhile. Draining that slot would upload the older edit over the newer version. An id
+	/// that names no file the cache holds has nothing to drop.
+	pub async fn drop_pending_upload(&self, id: FfiId) -> Result<(), CacheError> {
+		self.async_execute_authed_owned(async move |auth_state| {
+			auth_state.drop_pending_upload(&id).await
+		})
+		.await
+	}
+
+	/// Uploads the bytes at `os_path` as a new version of the file `id`, for a caller whose own
+	/// file is the edit's copy (a files-on-demand provider, whose user edits the file in place)
+	/// and that hashed it as `expect` while no writer had it open.
+	///
+	/// The bytes go through the file's cache slot as [`Self::modify_file_content`]'s do, and the
+	/// edit is marked while they are on their way, but the cache keeps no edit of its own: once
+	/// this returns, uploaded, refused or failed, the file has no pending-upload marker, so
+	/// [`Self::retry_pending_uploads`] never uploads a copy the caller's file has since moved past.
+	/// Only a call dropped before it returns leaves its marker, for the caller to resolve with
+	/// [`Self::drop_pending_upload`] or [`Self::copy_pending_upload`]. The marker goes on before
+	/// the bytes are copied in, whole or not at all: a call dropped in between leaves it over
+	/// the slot's earlier content, or no slot, which [`Self::copy_pending_upload`] finds nothing to
+	/// copy from, the caller's own file still holding the edit.
+	///
+	/// A copy that does not hash to `expect` was taken while the file was being written, and is
+	/// never uploaded: [`CheckedUpload::Changed`]. It is removed from the slot, so the cache then
+	/// holds no copy of the file and downloads it again when it is next read.
+	pub async fn upload_checked_version(
+		&self,
+		id: FfiId,
+		os_path: String,
+		expect: [u8; 32],
+	) -> Result<CheckedUpload, CacheError> {
+		self.async_execute_authed_owned(async move |auth_state| {
+			auth_state
+				.upload_checked_version(&id, &os_path, expect)
+				.await
+		})
+		.await
+	}
+
+	/// The stable ids of the files whose edits have not reached the server, as `stable/<uuid>`
+	/// ids: those [`Self::retry_pending_uploads`] would upload.
+	pub async fn pending_upload_ids(&self) -> Result<Vec<FfiId>, CacheError> {
+		self.async_execute_authed_owned(async move |auth_state| {
+			Ok(sql::select_pending_uploads(&auth_state.conn())?
+				.into_iter()
+				.map(|stable_uuid| FfiId(format!("{STABLE_PREFIX}{stable_uuid}")))
+				.collect())
+		})
+		.await
+	}
+
+	/// Copies the edit the cache holds for the file `id`, the bytes in its slot that have not
+	/// reached the server, to the new file `dest`, which must not exist yet; the marker stays, for
+	/// the caller to drop once the copy is where it keeps it.
+	///
+	/// For a caller that left an edit marked and can no longer tell whether its own copy holds
+	/// it. A file with nothing outstanding, or whose slot holds what the server has, has nothing
+	/// to copy ([`PendingCopy::Nothing`]): its marker is dropped, as the drain drops it. A slot the
+	/// cache cannot find while a re-minted copy of it may still be on disk keeps its marker and
+	/// fails.
+	pub async fn copy_pending_upload(
+		&self,
+		id: FfiId,
+		dest: PathBuf,
+	) -> Result<PendingCopy, CacheError> {
+		self.async_execute_authed_owned(async move |auth_state| {
+			auth_state.copy_pending_upload(&id, &dest).await
+		})
+		.await
+	}
+}
+
+/// What [`FilenMobileCacheState::upload_checked_version`] did.
+#[derive(Debug, Clone)]
+pub enum CheckedUpload {
+	/// The bytes are the file's new version on the server, or were its content already: the file
+	/// as it now is. Boxed, as the other variant holds nothing.
+	Uploaded(Box<FfiFile>),
+	/// The copy taken did not hash to the hash given: nothing was uploaded.
+	Changed,
+}
+
+/// What [`FilenMobileCacheState::copy_pending_upload`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PendingCopy {
+	/// The edit's bytes are at the destination, and the marker still stands.
+	Copied,
+	/// There was no edit to copy, and no marker stands.
+	Nothing,
 }
 
 impl AuthCacheState {
@@ -2066,6 +2165,152 @@ impl AuthCacheState {
 		Ok(uploaded)
 	}
 
+	/// Drops the pending-upload marker of the file `id` names (see
+	/// [`FilenMobileCacheState::drop_pending_upload`]), under the item's lock so an edit being
+	/// marked or uploaded meanwhile finishes first.
+	pub(crate) async fn drop_pending_upload(&self, id: &FfiId) -> Result<(), CacheError> {
+		let file = match self.select_file_by_id(id) {
+			Ok(file) => file,
+			Err(CacheError::DoesNotExist(_)) => return Ok(()),
+			Err(error) => return Err(error),
+		};
+		let _local_file_guard = self.lock_local_file(file.uuid).await;
+		sql::clear_pending_upload(&self.conn(), file.stable_uuid)?;
+		Ok(())
+	}
+
+	/// Uploads the bytes at `os_path` as the file `id`'s new version unless the copy taken of them
+	/// does not hash to `expect` (see [`FilenMobileCacheState::upload_checked_version`]).
+	///
+	/// The marker goes on before the bytes land and comes off before this returns, whatever the
+	/// outcome: while the upload runs it keeps the cache's size sweep off the slot, and after it,
+	/// the caller's own file is the edit.
+	pub(crate) async fn upload_checked_version(
+		&self,
+		id: &FfiId,
+		os_path: &str,
+		expect: [u8; 32],
+	) -> Result<CheckedUpload, CacheError> {
+		debug!("Uploading a checked version of {} from {os_path}", id.0);
+		let file = self.select_file_by_id(id)?;
+		let DBFileMeta::Decoded(meta) = &file.meta else {
+			return Err(CacheError::remote(format!(
+				"File {} does not have decoded metadata",
+				file.uuid
+			)));
+		};
+		// One guard for the whole edit, as in `modify_file_content`: the upload is handed it.
+		let local_file_guard = self.lock_local_file(file.uuid).await;
+		sql::mark_pending_upload(
+			&self.conn(),
+			file.stable_uuid,
+			chrono::Utc::now().timestamp_millis(),
+		)?;
+		let outcome = self
+			.upload_checked_marked(&file, meta, os_path, expect, &local_file_guard)
+			.await;
+		// Under the guard still, so no edit of this file starts between the outcome and this.
+		let cleared = sql::clear_pending_upload(&self.conn(), file.stable_uuid);
+		drop(local_file_guard);
+		let outcome = outcome?;
+		cleared?;
+		Ok(outcome)
+	}
+
+	/// Copies the edit the slot of the file `id` holds to the new file `dest` (see
+	/// [`FilenMobileCacheState::copy_pending_upload`]), under the item's lock so an edit being
+	/// marked or uploaded meanwhile finishes first.
+	pub(crate) async fn copy_pending_upload(
+		&self,
+		id: &FfiId,
+		dest: &Path,
+	) -> Result<PendingCopy, CacheError> {
+		// A remote edit may have re-minted the row's uuid with the edit in the old slot: reunited
+		// first, as the drain does, or the edit reads as gone.
+		self.rescue_reminted_slots().await;
+		let file = match self.select_file_by_id(id) {
+			Ok(file) => file,
+			Err(CacheError::DoesNotExist(_)) => return Ok(PendingCopy::Nothing),
+			Err(error) => return Err(error),
+		};
+		let _local_file_guard = self.lock_local_file(file.uuid).await;
+		if !self.has_pending_upload(file.stable_uuid)? {
+			return Ok(PendingCopy::Nothing);
+		}
+		let (name, declared) = match &file.meta {
+			DBFileMeta::Decoded(meta) => (Some(meta.name.as_str()), meta.hash),
+			_ => (None, None),
+		};
+		match self.hash_local_file(file.uuid, name).await? {
+			None => {
+				// The same rule as the drain's: bytes still on disk under a retired uuid keep the
+				// marker; bytes that are gone leave nothing to copy.
+				if sql::slot_remint_targets_uuid(&self.conn(), file.uuid)? {
+					return Err(CacheError::io(format!(
+						"the edit of {} is in a re-minted slot not reunited yet",
+						file.stable_uuid
+					)));
+				}
+				sql::clear_pending_upload(&self.conn(), file.stable_uuid)?;
+				return Ok(PendingCopy::Nothing);
+			}
+			Some(held) if Some(<[u8; 32]>::from(held)) == declared => {
+				sql::clear_pending_upload(&self.conn(), file.stable_uuid)?;
+				return Ok(PendingCopy::Nothing);
+			}
+			Some(_) => {}
+		}
+		let slot = self.get_cached_file_path_from_name(&file.uuid.to_string(), name);
+		let dest = dest.to_owned();
+		tokio::task::spawn_blocking(move || copy_to_new_file(&slot, &dest))
+			.await
+			.map_err(|error| CacheError::io(format!("the copy task failed: {error}")))??;
+		Ok(PendingCopy::Copied)
+	}
+
+	/// The body of [`Self::upload_checked_version`], the file marked and its guard held.
+	async fn upload_checked_marked(
+		&self,
+		file: &DBFile,
+		meta: &DBDecryptedFileMeta,
+		os_path: &str,
+		expect: [u8; 32],
+		local_file_guard: &tokio::sync::OwnedMutexGuard<()>,
+	) -> Result<CheckedUpload, CacheError> {
+		self.io_import_cached_file(file.uuid, Some(&meta.name), Path::new(os_path))
+			.await?;
+		let copied = self.hash_local_file(file.uuid, Some(&meta.name)).await?;
+		if copied.map(<[u8; 32]>::from) != Some(expect) {
+			// Written while it was copied: the slot holds bytes the caller never hashed, which may
+			// be torn, under the row's uuid, where a read offline would serve them as the version.
+			// Removed, so the next read downloads the version instead.
+			let slot =
+				self.get_cached_file_path_from_name(&file.uuid.to_string(), Some(&meta.name));
+			match tokio::fs::remove_file(&slot).await {
+				Ok(()) => {}
+				Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+				Err(e) => return Err(e.into()),
+			}
+			self.drop_materialised(file.uuid);
+			return Ok(CheckedUpload::Changed);
+		}
+		if meta.hash == Some(expect) {
+			// The server's content already: the file as it is.
+			let mut unchanged = file.clone();
+			unchanged.pending_upload_at = None;
+			return Ok(CheckedUpload::Uploaded(Box::new(unchanged.into())));
+		}
+		let (remote_file, _new_uuid_guard) = self
+			.upload_marked_edit(file, meta, local_file_guard, None)
+			.await?;
+		let mut uploaded = DBFile::upsert_from_remote(&mut self.conn(), remote_file)?;
+		// The upload renamed the slot under the uuid the server minted for this version.
+		self.record_materialised(uploaded.uuid);
+		// Cleared by the caller, before it returns.
+		uploaded.pending_upload_at = None;
+		Ok(CheckedUpload::Uploaded(Box::new(uploaded.into())))
+	}
+
 	/// Whether the file behind a stable id still has an edit that has not reached the server.
 	///
 	/// Queried rather than read off a cached row: callers act on this under the per-item lock, and
@@ -2648,6 +2893,74 @@ async fn cached_copy(cache_dir: &Path, file: &DBFile) -> std::io::Result<Option<
 		Ok(_) => Ok(None),
 		Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
 		Err(e) => Err(e),
+	}
+}
+
+/// Copies the file `from` to `to`, which must not exist, and syncs it to disk; a copy that fails
+/// partway is removed.
+fn copy_to_new_file(from: &Path, to: &Path) -> std::io::Result<()> {
+	let mut source = std::fs::File::open(from)?;
+	let mut target = std::fs::OpenOptions::new()
+		.write(true)
+		.create_new(true)
+		.open(to)?;
+	let copied = std::io::copy(&mut source, &mut target).and_then(|_| target.sync_all());
+	if copied.is_err() {
+		drop(target);
+		if let Err(error) = std::fs::remove_file(to) {
+			tracing::warn!(
+				"Failed to remove a partial copy at {}: {error}",
+				to.display()
+			);
+		}
+	}
+	copied
+}
+
+#[cfg(test)]
+mod copy_to_new_file_tests {
+	use std::path::PathBuf;
+
+	use super::copy_to_new_file;
+
+	/// A fresh directory of its own under the system's temp directory, removed when dropped.
+	struct Scratch(PathBuf);
+
+	impl Scratch {
+		fn new(prefix: &str) -> Self {
+			let dir = std::env::temp_dir().join(format!("{prefix}-{}", rand::random::<u64>()));
+			std::fs::create_dir_all(&dir).unwrap();
+			Self(dir)
+		}
+	}
+
+	impl Drop for Scratch {
+		fn drop(&mut self) {
+			let _ = std::fs::remove_dir_all(&self.0);
+		}
+	}
+
+	#[test]
+	fn copies_into_a_new_file_and_never_over_one() {
+		let dir = Scratch::new("filen-copy-new");
+		let (from, to) = (dir.0.join("from"), dir.0.join("to"));
+		std::fs::write(&from, b"edit").unwrap();
+		copy_to_new_file(&from, &to).unwrap();
+		assert_eq!(std::fs::read(&to).unwrap(), b"edit");
+		std::fs::write(&to, b"kept").unwrap();
+		assert_eq!(
+			copy_to_new_file(&from, &to).unwrap_err().kind(),
+			std::io::ErrorKind::AlreadyExists
+		);
+		assert_eq!(std::fs::read(&to).unwrap(), b"kept");
+	}
+
+	#[test]
+	fn a_missing_source_leaves_no_file() {
+		let dir = Scratch::new("filen-copy-missing");
+		let to = dir.0.join("to");
+		assert!(copy_to_new_file(&dir.0.join("gone"), &to).is_err());
+		assert!(!to.exists());
 	}
 }
 
