@@ -1710,7 +1710,7 @@ async fn released_locks_are_owed_until_their_releases_are_given_up_on() {
 	client.set_lock_listener(listener);
 	let (drive, notes) = (Uuid::from_u128(1), Uuid::from_u128(2));
 
-	let begin = Instant::now();
+	let (begin, begin_wall) = (Instant::now(), Utc::now());
 	client
 		.release_locks([
 			LockId {
@@ -1723,10 +1723,14 @@ async fn released_locks_are_owed_until_their_releases_are_given_up_on() {
 			},
 		])
 		.await;
+	// The lease's age is the further of the paused clock and the wall clock, which the real
+	// connection attempts of the offline client advance on their own: a release given up on
+	// at that age has run for at least as long on the two clocks together.
 	let elapsed = begin.elapsed();
+	let wall = (Utc::now() - begin_wall).to_std().unwrap_or(Duration::ZERO);
 	assert!(
-		elapsed >= LOCK_SERVER_TTL - RELEASE_RETRY_MAX,
-		"retried while the lease could stand: {elapsed:?}"
+		elapsed + wall >= LOCK_SERVER_TTL - RELEASE_RETRY_MAX,
+		"retried while the lease could stand: {elapsed:?} paused, {wall:?} on the wall clock"
 	);
 	assert!(client.wait_for_lock_releases().now_or_never().is_some());
 
