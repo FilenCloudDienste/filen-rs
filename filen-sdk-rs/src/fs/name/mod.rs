@@ -3,6 +3,33 @@ pub(crate) mod keep_both;
 use serde::{Deserialize, Serialize};
 use unicode_normalization::UnicodeNormalization;
 
+pub use keep_both::collision_key;
+
+/// How many `.old` names [`aside_names`] offers: `.old`, then `.old.1` to `.old.99999`.
+const ASIDE_CANDIDATES: u32 = 100_000;
+
+/// The names a losing copy of `name` is kept aside under in a keep-both conflict, in the order to
+/// try them: `<stem>.old.<ext>`, then `<stem>.old.N.<ext>` for N from 1, the extension being what
+/// follows the last dot when something precedes it (`.bashrc` has none). Unchecked: the caller
+/// takes the first that is free and that its file system and the server accept.
+pub fn aside_names(name: &str) -> impl Iterator<Item = String> {
+	let (stem, ext) = match name.rsplit_once('.') {
+		Some((stem, ext)) if !stem.is_empty() => (stem, Some(ext)),
+		_ => (name, None),
+	};
+	(0..ASIDE_CANDIDATES).map(move |n| {
+		let ordinal = if n == 0 {
+			String::new()
+		} else {
+			format!(".{n}")
+		};
+		match ext {
+			Some(ext) => format!("{stem}.old{ordinal}.{ext}"),
+			None => format!("{stem}.old{ordinal}"),
+		}
+	})
+}
+
 const FORBIDDEN: [bool; 128] = {
 	let mut table = [false; 128];
 	let mut i = 0u8;
@@ -34,7 +61,7 @@ pub struct EntryNameError {
 	pub kind: EntryNameErrorKind,
 }
 
-#[derive(thiserror::Error, Debug, PartialEq)]
+#[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
 pub enum EntryNameErrorKind {
 	#[error("filename is empty")]
 	Empty,

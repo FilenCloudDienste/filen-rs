@@ -82,7 +82,7 @@ use crate::{
 		categories::{DirType, Normal},
 		dir::meta::DirectoryMetaChanges,
 		file::{FileBuilderOptionalName, meta::FileMetaChanges, traits::HasFileInfo},
-		name::ValidatedName,
+		name::{ValidatedName, aside_names},
 	},
 	io::{
 		RemoteDirectory, RemoteFile,
@@ -835,20 +835,7 @@ pub(super) fn aside_target(
 	rel_path: &str,
 ) -> Result<(String, PathBuf), crate::Error> {
 	let (parent, name) = split_parent(rel_path);
-	let (stem, ext) = match name.rsplit_once('.') {
-		Some((stem, ext)) if !stem.is_empty() => (stem, Some(ext)),
-		_ => (name, None),
-	};
-	for n in 0..100_000u32 {
-		let ordinal = if n == 0 {
-			String::new()
-		} else {
-			format!(".{n}")
-		};
-		let candidate = match ext {
-			Some(ext) => format!("{stem}.old{ordinal}.{ext}"),
-			None => format!("{stem}.old{ordinal}"),
-		};
+	for candidate in aside_names(name) {
 		if let Some(rejection) = names::device_rejection(&candidate) {
 			return Err(crate::Error::custom(
 				crate::ErrorKind::InvalidName,

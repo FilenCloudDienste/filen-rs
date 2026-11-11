@@ -29,6 +29,33 @@ fn all_case_combinations(s: &str) -> Vec<String> {
 		.collect()
 }
 
+// ── Keep-both aside names ────────────────────────────────────
+
+#[test]
+fn aside_names_put_old_before_the_last_extension() {
+	let first_three = |name| aside_names(name).take(3).collect::<Vec<_>>();
+	assert_eq!(
+		first_three("a.txt"),
+		["a.old.txt", "a.old.1.txt", "a.old.2.txt"]
+	);
+	assert_eq!(
+		first_three("noext"),
+		["noext.old", "noext.old.1", "noext.old.2"]
+	);
+	assert_eq!(
+		first_three(".bashrc"),
+		[".bashrc.old", ".bashrc.old.1", ".bashrc.old.2"]
+	);
+	assert_eq!(
+		first_three("a.tar.gz"),
+		["a.tar.old.gz", "a.tar.old.1.gz", "a.tar.old.2.gz"]
+	);
+	assert_eq!(
+		aside_names("a.txt").last().as_deref(),
+		Some("a.old.99999.txt")
+	);
+}
+
 // ── Valid names ──────────────────────────────────────────────
 
 #[test]
