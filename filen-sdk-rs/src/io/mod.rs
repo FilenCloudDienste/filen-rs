@@ -41,6 +41,8 @@ pub use local_name::{DeviceRejection, windows_rejection};
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 pub use meta_ext::FilenMetaExt;
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+pub use private_file::{remove_file_if_present, write_private_file_atomically};
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 pub use upload_resume::{
 	FileUploadJournalStore, SealedUploadJournal, UploadJournalId, UploadJournalStore,
 };
