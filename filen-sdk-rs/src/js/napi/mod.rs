@@ -17,6 +17,8 @@ mod types;
 #[deny(unsafe_code)]
 pub(crate) mod bytes;
 #[deny(unsafe_code)]
+mod listener;
+#[deny(unsafe_code)]
 mod promise;
 #[deny(unsafe_code)]
 mod wire;
@@ -24,7 +26,10 @@ mod wire;
 use napi_derive::napi;
 
 pub(crate) use error::throw;
-pub(crate) use managed::{ManagedAbortController, ManagedAbortSignal, PauseSignal};
+pub(crate) use listener::{Listener, ListenerCall};
+pub(crate) use managed::{
+	ManagedAbortController, ManagedAbortSignal, PauseSignal, read_managed_future,
+};
 pub(crate) use promise::spawn_promise;
 pub(crate) use wire::{FromWire, IntoWire, OptionReturn, Wire};
 

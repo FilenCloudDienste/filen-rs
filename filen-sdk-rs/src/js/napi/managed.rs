@@ -4,13 +4,19 @@
 //! napi has no `ManagedFuture.create`: a call takes a plain object whose `abortSignal` and
 //! `pauseSignal` are these classes or `undefined`, as ubrn's record has them.
 
-use std::sync::Arc;
+use std::{any::type_name, sync::Arc};
 
-use napi::bindgen_prelude::{ClassInstance, JsObjectValue, Object};
+use napi::{
+	Env, JsValue, ValueType,
+	bindgen_prelude::{
+		ClassInstance, FromNapiValue, JavaScriptClassExt, JsObjectValue, Object, Unknown,
+		ValidateNapiValue,
+	},
+};
 use napi_derive::napi;
 
 use super::{IntoWire, Wire};
-use crate::js;
+use crate::{Error, ErrorKind, js};
 
 #[napi(js_name = "PauseSignal")]
 pub(crate) struct PauseSignal(pub(crate) js::PauseSignal);
@@ -49,19 +55,52 @@ impl IntoWire for js::ManagedAbortSignal {
 	}
 }
 
-/// Reads the `ManagedFuture` a managed call takes, on the JS thread: napi checks each signal to
-/// be an instance of its class, and the signals' watch channels are cloned out of them, so
-/// nothing of JS is held once it returns.
-// No napi export runs a managed call yet.
-#[allow(dead_code)]
+/// Reads the `ManagedFuture` a managed call takes, on the JS thread; the signals' watch channels
+/// are cloned out of it, so nothing of JS is held once it returns. A napi failure to read it is
+/// thrown (`Err`); a signal that is neither `undefined` nor an instance of its class, `null`
+/// included, is a conversion error for the call to reject with (`Ok(Err)`), as ubrn's converters
+/// refuse it.
 #[deny(unsafe_code)]
-pub(crate) fn read_managed_future(record: &Object<'_>) -> napi::Result<js::ManagedFuture> {
-	let abort_signal: Option<ClassInstance<'_, ManagedAbortSignal>> =
-		record.get_named_property("abortSignal")?;
-	let pause_signal: Option<ClassInstance<'_, PauseSignal>> =
-		record.get_named_property("pauseSignal")?;
-	Ok(js::ManagedFuture {
-		abort_signal: abort_signal.map(|signal| Arc::new(signal.0.clone())),
-		pause_signal: pause_signal.map(|signal| Arc::new(signal.0.clone())),
-	})
+pub(crate) fn read_managed_future(
+	record: &Object<'_>,
+) -> napi::Result<Result<js::ManagedFuture, Error>> {
+	let abort_signal = match read_signal::<ManagedAbortSignal>(record, "abortSignal")? {
+		Ok(signal) => signal.map(|signal| Arc::new(signal.0.clone())),
+		Err(e) => return Ok(Err(e)),
+	};
+	let pause_signal = match read_signal::<PauseSignal>(record, "pauseSignal")? {
+		Ok(signal) => signal.map(|signal| Arc::new(signal.0.clone())),
+		Err(e) => return Ok(Err(e)),
+	};
+	Ok(Ok(js::ManagedFuture {
+		abort_signal,
+		pause_signal,
+	}))
+}
+
+/// `record[name]`, `undefined` or an instance of `T`'s class. Checked by hand: napi's own read
+/// takes `null` for `undefined`, and without type tags (napi8) casts any wrapped object to `T`.
+/// `instanceof` still trusts the prototype chain, which only code that rewires a signal's
+/// prototype can mislead.
+#[deny(unsafe_code)]
+fn read_signal<'env, T>(
+	record: &Object<'env>,
+	name: &str,
+) -> napi::Result<Result<Option<ClassInstance<'env, T>>, Error>>
+where
+	T: JavaScriptClassExt + 'env,
+	ClassInstance<'env, T>: FromNapiValue + ValidateNapiValue,
+{
+	let value: Unknown = record.get_named_property(name)?;
+	if value.get_type()? == ValueType::Undefined {
+		return Ok(Ok(None));
+	}
+	let env = Env::from_raw(record.value().env);
+	if value.get_type()? != ValueType::Object || !T::instance_of(&env, &value)? {
+		return Ok(Err(Error::custom(
+			ErrorKind::Conversion,
+			format!("{name} is neither undefined nor a {}", type_name::<T>()),
+		)));
+	}
+	Ok(Ok(record.get_named_property(name)?))
 }

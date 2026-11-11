@@ -55,8 +55,6 @@ mod pausable {
 		}
 	}
 
-	// No napi export runs a managed call yet.
-	#[cfg_attr(feature = "napi", allow(dead_code))]
 	impl PauseSignal {
 		pub(super) fn into_pausable_on_commander<F, Fut>(
 			self,
@@ -71,6 +69,8 @@ mod pausable {
 		}
 
 		/// The pause requests, for a job that pauses itself instead of being stopped from polling.
+		// napi exports no job (`into_js_managed_commander_job`).
+		#[cfg_attr(feature = "napi", allow(dead_code))]
 		pub(super) fn receiver(&self) -> tokio::sync::watch::Receiver<bool> {
 			self.receiver.clone()
 		}
@@ -132,8 +132,6 @@ mod abortable {
 		}
 	}
 
-	// No napi export runs a managed call yet.
-	#[cfg_attr(feature = "napi", allow(dead_code))]
 	impl ManagedAbortSignal {
 		pub(super) fn into_future(self) -> AbortSignalFuture<impl Future<Output = AbortedError>> {
 			AbortSignalFuture::Some {
@@ -160,8 +158,6 @@ mod abortable {
 	}
 
 	/// Resolves once `signal` aborts; never, without a signal.
-	// No napi export runs a managed call yet.
-	#[cfg_attr(feature = "napi", allow(dead_code))]
 	pub(super) fn abort_future(
 		signal: Option<Arc<ManagedAbortSignal>>,
 	) -> AbortSignalFuture<impl Future<Output = AbortedError>> {
@@ -239,8 +235,6 @@ mod managed {
 		pub pause_signal: Option<Arc<PauseSignal>>,
 	}
 
-	// No napi export runs a managed call yet.
-	#[cfg_attr(feature = "napi", allow(dead_code))]
 	impl ManagedFuture {
 		pub(crate) fn into_js_managed_commander_future<F, Fut>(
 			self,
@@ -263,7 +257,11 @@ mod managed {
 				abort_fut,
 			}
 		}
+	}
 
+	// napi exports no job: its calls run as plain managed futures.
+	#[cfg_attr(feature = "napi", allow(dead_code))]
+	impl ManagedFuture {
 		/// Runs a job that observes pause and cancel itself through its [`JobControl`], so a
 		/// paused job can release what it holds and a cancelled one can report what it did.
 		/// An abort becomes a cancel; a job still running [`CANCEL_GRACE`] after that is dropped.

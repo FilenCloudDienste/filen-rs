@@ -1,6 +1,6 @@
 //! The path transfers of the uniffi and napi bindings: a file downloaded to a path or uploaded
 //! from one, and a directory downloaded or uploaded recursively. The bodies are shared; each
-//! binding hands them its own callbacks (`uniffi_impl`).
+//! binding hands them its own callbacks (`uniffi_impl`, `napi_impl`).
 
 use std::{borrow::Cow, path::PathBuf, sync::Arc};
 
@@ -24,6 +24,8 @@ use crate::{
 	util::MaybeSendCallback,
 };
 
+#[cfg(feature = "napi")]
+mod napi_impl;
 #[cfg(feature = "uniffi")]
 mod uniffi_impl;
 
@@ -108,8 +110,6 @@ pub(crate) async fn upload_file(
 }
 
 /// Downloads `file` to `file_path`, handing `progress` the bytes downloaded since its last call.
-// No napi export downloads a file yet.
-#[cfg_attr(feature = "napi", allow(dead_code))]
 pub(crate) async fn download_file_to_path(
 	client: Arc<Client>,
 	file: AnyFile,

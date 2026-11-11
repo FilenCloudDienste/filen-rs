@@ -6,7 +6,7 @@ import assert from "node:assert/strict"
 import { spawnSync } from "node:child_process"
 import { generateKeyPairSync, randomUUID } from "node:crypto"
 import { once } from "node:events"
-import { copyFileSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs"
+import { copyFileSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import { performance } from "node:perf_hooks"
@@ -733,6 +733,128 @@ describe("files and directories, offline", () => {
 			return true
 		})
 	})
+})
+
+// A ubrn `File` that converts, of a file no request is made for.
+function synthFile(uuid = randomUUID()) {
+	return {
+		uuid,
+		stableUuid: undefined,
+		meta: {
+			tag: FileMeta_Tags.Decoded,
+			inner: [
+				{
+					name: "a.txt",
+					mime: "text/plain",
+					created: undefined,
+					modified: 0n,
+					hash: undefined,
+					size: 1n,
+					key: "0".repeat(32),
+					version: FileEncryptionVersion.V2
+				}
+			]
+		},
+		parent: { tag: ParentUuid_Tags.Uuid, inner: [randomUUID()] },
+		size: 1n,
+		favorited: false,
+		region: "de-1",
+		bucket: "filen-1",
+		timestamp: 0n,
+		chunks: 1n,
+		canMakeThumbnail: false
+	}
+}
+
+const noSignals = { abortSignal: undefined, pauseSignal: undefined }
+
+describe("transfers, offline", () => {
+	let dir
+	before(() => {
+		dir = tempDir("filen-napi-transfers-")
+	})
+	after(() => removeDir(dir))
+
+	const anyFile = file => ({ tag: AnyFile_Tags.File, inner: [file] })
+
+	test("downloadFileToPath with an aborted asyncOpts signal rejects with an AbortError and writes nothing", async () => {
+		const target = join(dir, "aborted")
+		mkdirSync(target)
+		await assert.rejects(
+			synthClient(randomUUID()).downloadFileToPath(anyFile(synthFile()), join(target, "a.txt"), undefined, noSignals, {
+				signal: AbortSignal.abort()
+			}),
+			e => {
+				assert.equal(e.name, "AbortError")
+				assert.equal(FilenSdkError.hasInner(e), false)
+				return true
+			}
+		)
+		assert.deepEqual(readdirSync(target), [])
+	})
+
+	test("downloadFileToPath with an aborted ManagedAbortSignal rejects as Cancelled", async () => {
+		const controller = new ManagedAbortController()
+		controller.abort()
+		const updates = []
+		await assert.rejects(
+			synthClient(randomUUID()).downloadFileToPath(
+				anyFile(synthFile()),
+				join(dir, "cancelled.txt"),
+				{ onUpdate: bytes => updates.push(bytes) },
+				{ abortSignal: controller.signal(), pauseSignal: undefined }
+			),
+			e => {
+				assert.equal(assertThrownLikeUbrn(e).kind(), ErrorKind.Cancelled)
+				return true
+			}
+		)
+		assert.deepEqual(updates, [])
+	})
+
+	test("a download callback without onUpdate throws napi's own error", () => {
+		assert.throws(
+			() => synthClient(randomUUID()).downloadFileToPath(anyFile(synthFile()), join(dir, "never.txt"), {}, noSignals),
+			e => {
+				assert.ok(e instanceof Error)
+				assert.equal(e.code, "InvalidArg")
+				assert.equal(FilenSdkError.hasInner(e), false)
+				return true
+			}
+		)
+	})
+
+	test("downloadFileToPath with a file uuid that is not one rejects with a conversion error", async () => {
+		const pending = synthClient(randomUUID()).downloadFileToPath(
+			anyFile(synthFile("not-a-uuid")),
+			join(dir, "never.txt"),
+			undefined,
+			noSignals
+		)
+		assert.ok(pending instanceof Promise)
+		await assert.rejects(pending, e => {
+			assert.equal(assertThrownLikeUbrn(e).kind(), ErrorKind.Conversion)
+			return true
+		})
+	})
+
+	for (const [name, managedFuture] of [
+		["a null abortSignal", { abortSignal: null, pauseSignal: undefined }],
+		["a null pauseSignal", { abortSignal: undefined, pauseSignal: null }],
+		["a PauseSignal as its abortSignal", { abortSignal: new PauseSignal(), pauseSignal: undefined }],
+		["a ManagedAbortSignal as its pauseSignal", { abortSignal: undefined, pauseSignal: new ManagedAbortController().signal() }],
+		["a plain object as its abortSignal", { abortSignal: { aborted: () => true }, pauseSignal: undefined }]
+	]) {
+		test(`a managed future with ${name} rejects with a conversion error`, async () => {
+			await assert.rejects(
+				synthClient(randomUUID()).downloadFileToPath(anyFile(synthFile()), join(dir, "never.txt"), undefined, managedFuture),
+				e => {
+					assert.equal(assertThrownLikeUbrn(e).kind(), ErrorKind.Conversion)
+					return true
+				}
+			)
+		})
+	}
 })
 
 describe("rclone, offline", () => {

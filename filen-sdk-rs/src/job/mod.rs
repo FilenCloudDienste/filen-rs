@@ -242,8 +242,6 @@ impl JobControl {
 /// Adapts the bindings' abort signal to a job's cooperative cancel; only builds with bindings
 /// (and the tests) use it.
 #[cfg(any(feature = "uniffi", feature = "wasm-full", feature = "napi", test))]
-// No napi export runs a managed call yet.
-#[cfg_attr(feature = "napi", allow(dead_code))]
 pub(crate) mod cancel_grace {
 	use std::{
 		future::Future,

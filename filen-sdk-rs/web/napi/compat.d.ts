@@ -10,8 +10,10 @@
  * required key, an asyncOpts_ whose signal is not an AbortSignal) throws napi's own error
  * synchronously, also from a method that returns a
  * Promise, where ubrn's async methods reject. So does a cache listener without an onMessages
- * method, and a sync engine listener without onEvents and onWatchStatus methods. Every SDK
- * error of an async call rejects, as under ubrn.
+ * method, a sync engine listener without onEvents and onWatchStatus methods, and a transfer
+ * callback without onUpdate. Every SDK error of an async call rejects, as under ubrn, and so
+ * does a managedFuture whose abortSignal or pauseSignal is null or of another class (a
+ * Conversion error).
  *
  * Listener methods are called as methods of the listener (`this` is bound to it), on the JS
  * thread, in the order their deliveries happened. They are read once, when the listener is
@@ -22,7 +24,12 @@
  * queued and the one being delivered) and those of that round not yet handed over. The next round
  * goes to the new listener.
  *
- * Listener calls and promise settlement are not ordered against each other: syncOnce, stopWatch
+ * A transfer's callback object (downloadFileToPath) is read once, when the call is made, and its
+ * methods are called bound to it, on the JS thread, in order. Every call made before the transfer
+ * settles runs before its promise settles, except after an abort through asyncOpts_, which
+ * rejects at once: calls already queued may still arrive after that.
+ *
+ * Sync engine listener calls and promise settlement are not ordered against each other: syncOnce, stopWatch
  * or close may resolve before the listener gets that call's last events or status. A UI reads
  * where a pair stands from listPairs, lastReport and a watch's status, not from arrival order.
  *
@@ -103,4 +110,13 @@ export interface SyncEngineListener {
 	onEvents(events: Array<SyncPassEvent>): void
 	/** A watch's status changed (and once when the watch starts). */
 	onWatchStatus(pairId: bigint, status: WatchStatus): void
+}
+
+/** Receives a file download's progress. */
+export interface JsFileDownloadCallback {
+	/**
+	 * `downloadedBytes` is a **delta**: the plaintext bytes downloaded since the previous call,
+	 * not a running total. Their sum is the file's size once the download completes.
+	 */
+	onUpdate(downloadedBytes: bigint): void
 }

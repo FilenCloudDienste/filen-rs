@@ -947,8 +947,6 @@ mod commander_thread {
 		inner_do_on_commander(None, f)
 	}
 
-	// No napi export runs a managed call yet.
-	#[cfg_attr(feature = "napi", allow(dead_code))]
 	pub(crate) fn do_with_pause_channel_on_commander<F, Fut>(
 		channel: (
 			tokio::sync::watch::Sender<bool>,
