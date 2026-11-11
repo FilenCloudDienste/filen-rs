@@ -1,23 +1,25 @@
 // Live test of the Node-API addon (`npm run build:napi` first): it logs in to the test account and
 // drives a real sync between a temp folder and a fresh remote directory, through the addon only,
-// the way the desktop app does, then serves the account over webdav from a real rclone
+// the way the desktop app does, moves files and a directory tree up and down through the addon's
+// transfers (each suite logs in once), then serves the account over webdav from a real rclone
 // (FILEN_TEST_RCLONE, as rclone_daemon_tests take it; that part is skipped without it). Needs TEST_EMAIL / TEST_PASSWORD, from the environment or from the
 // nearest dotenv file up from this package, as the Rust tests read them; skipped without them.
 //
-// The addon has no API to create a remote directory, so test-utils' `remote-test-dir` lends one
-// (built by `cargo run` here): it prints the directory's uuid and deletes the directory when its
-// stdin closes, which happens when this process ends however it ends. Every pass the engine runs
-// takes the account's drive-write lock itself, as do the directory's creation and deletion; run
-// this alone on the account, like the Rust live suites.
+// Each suite's test directory comes from test-utils' `remote-test-dir` (built by `cargo run` here),
+// not from the addon's createDir, so its deletion does not depend on the addon: it prints the
+// directory's uuid and deletes the directory when its stdin closes, which happens when this process
+// ends however it ends. Every pass the engine runs and every directory upload takes the account's
+// drive-write lock itself, as do the directory's creation and deletion; run this alone on the
+// account, like the Rust live suites.
 
 import assert from "node:assert/strict"
 import { spawn } from "node:child_process"
-import { randomBytes, randomUUID } from "node:crypto"
+import { createHash, randomBytes, randomUUID } from "node:crypto"
 import { once } from "node:events"
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs"
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs"
 import { createServer } from "node:net"
 import { tmpdir } from "node:os"
-import { dirname, join } from "node:path"
+import { basename, dirname, join } from "node:path"
 import { performance } from "node:perf_hooks"
 import { createInterface } from "node:readline"
 import { after, before, describe, test } from "node:test"
@@ -25,9 +27,15 @@ import { setTimeout as sleep } from "node:timers/promises"
 import { fileURLToPath } from "node:url"
 
 import {
+	AnyDirWithContext_Tags,
+	AnyFile_Tags,
+	AnyNormalDir_Tags,
 	ErrorKind,
+	FileMeta_Tags,
 	FilenSdkError,
 	IgnoreLevel_Tags,
+	ManagedAbortController,
+	PauseSignal,
 	PlannedActionKind_Tags,
 	ServeAuth_Tags,
 	ServeProtocol,
@@ -328,6 +336,245 @@ describe("the addon against the server", { skip: email && password ? false : "TE
 	})
 })
 
+/** The hex SHA-256 of the file at `path`. */
+const sha256 = path => createHash("sha256").update(readFileSync(path)).digest("hex")
+
+describe("transfers against the server", { skip: email && password ? false : "TEST_EMAIL / TEST_PASSWORD are unset" }, () => {
+	const noSignals = { abortSignal: undefined, pauseSignal: undefined }
+	let lent, dir, client, remote
+	// The file the first test uploads, and its local source, which the pause test downloads again.
+	let small, smallSource
+
+	const asAnyFile = file => ({ tag: AnyFile_Tags.File, inner: [file] })
+	const asNormalDir = remoteDir => ({ tag: AnyNormalDir_Tags.Dir, inner: [remoteDir] })
+	const asTarget = remoteDir => ({ tag: AnyDirWithContext_Tags.Normal, inner: [asNormalDir(remoteDir)] })
+
+	/** A new local directory `name` in the temp directory. */
+	const localDir = name => {
+		const path = join(dir, name)
+		mkdirSync(path)
+		return path
+	}
+
+	/** Writes `size` random bytes to `name` in the temp directory, and returns its path. */
+	const randomFile = (name, size) => {
+		const path = join(dir, name)
+		writeFileSync(path, randomBytes(size))
+		return path
+	}
+
+	/**
+	 * A file transfer callback summing its deltas, and whether one came after `settled()` (every
+	 * call made before a transfer settles must run before its promise does).
+	 */
+	const fileProgress = settled => {
+		const progress = {
+			sum: 0n,
+			late: 0,
+			onUpdate(bytes) {
+				progress.sum += bytes
+				if (settled()) {
+					progress.late++
+				}
+			}
+		}
+		return progress
+	}
+
+	/** A callback with the methods `methods` recording their calls, each as its argument list. */
+	const recorder = methods => {
+		const calls = Object.fromEntries(methods.map(name => [name, []]))
+		const callback = Object.fromEntries(methods.map(name => [name, (...args) => calls[name].push(args)]))
+		return { calls, callback }
+	}
+
+	before(
+		async () => {
+			lent = lendRemoteDir()
+			const uuid = await lent.uuid
+			assert.ok(uuid, "remote-test-dir exited before lending a directory")
+			dir = realpathSync.native(mkdtempSync(join(tmpdir(), "filen-sdk-rs-live-transfers-")))
+			client = await UnauthJsClient.fromConfig({}).login({ email, password, twoFactorCode: undefined })
+			remote = await client.getDir(uuid)
+		},
+		// The first `cargo run` builds the helper.
+		{ timeout: 30 * 60_000 }
+	)
+
+	after(
+		async () => {
+			try {
+				if (dir) {
+					rmSync(dir, { recursive: true, force: true, maxRetries: 10 })
+				}
+			} finally {
+				if (lent) {
+					lent.helper.stdin.end()
+					const [code] = await lent.exited
+					assert.equal(code, 0, "remote-test-dir failed; see its output above")
+				}
+			}
+		},
+		{ timeout: 10 * 60_000 }
+	)
+
+	test("a file uploaded from a path downloads to another path with the same bytes", async () => {
+		const size = 5 * 512 * 1024
+		smallSource = randomFile("small.bin", size)
+
+		let uploadSettled = false
+		const up = fileProgress(() => uploadSettled)
+		const file = await client
+			.uploadFile({ parent: asNormalDir(remote), noExif: false, noExifOverride: false }, smallSource, up, noSignals)
+			.then(uploaded => {
+				uploadSettled = true
+				return uploaded
+			})
+		assert.equal(up.sum, BigInt(size))
+		assert.equal(up.late, 0, "an upload call ran after its promise settled")
+		assert.equal(file.size, BigInt(size))
+		assert.equal(file.meta.tag, FileMeta_Tags.Decoded)
+		assert.equal(file.meta.inner[0].name, basename(smallSource))
+		small = file
+
+		const target = localDir("small-download")
+		const path = join(target, "copy.bin")
+		let downloadSettled = false
+		const down = fileProgress(() => downloadSettled)
+		await client.downloadFileToPath(asAnyFile(file), path, down, noSignals).then(() => {
+			downloadSettled = true
+		})
+		assert.equal(down.sum, BigInt(size))
+		assert.equal(down.late, 0, "a download call ran after its promise settled")
+		assert.equal(sha256(path), sha256(smallSource))
+		assert.deepEqual(readdirSync(target), ["copy.bin"], "a temp file was left beside the download")
+	})
+
+	test("a download paused before it starts makes no progress until resumed", async () => {
+		assert.ok(small, "the upload test did not run")
+		const target = localDir("paused")
+		const path = join(target, "copy.bin")
+		const pauseSignal = new PauseSignal()
+		pauseSignal.pause()
+		const progress = fileProgress(() => false)
+		const pending = client.downloadFileToPath(asAnyFile(small), path, progress, { abortSignal: undefined, pauseSignal })
+		let settled = false
+		const settledOnce = pending.then(
+			() => (settled = true),
+			() => (settled = true)
+		)
+
+		await sleep(2_000)
+		assert.equal(settled, false, "a paused download settled")
+		assert.equal(progress.sum, 0n, "a paused download made progress")
+		assert.deepEqual(readdirSync(target), [], "a paused download wrote a file")
+
+		pauseSignal.resume()
+		await pending
+		await settledOnce
+		assert.equal(progress.sum, small.size)
+		assert.equal(sha256(path), sha256(smallSource))
+	})
+
+	test("a ManagedAbortController abort mid-download rejects as Cancelled and leaves no partial file", async () => {
+		// Large enough that the download is still running when its first progress call arrives:
+		// progress is reported every 200 ms.
+		const size = 64 * 1024 * 1024
+		const source = randomFile("large.bin", size)
+		const large = await client.uploadFile(
+			{ parent: asNormalDir(remote), noExif: false, noExifOverride: false },
+			source,
+			undefined,
+			noSignals
+		)
+		rmSync(source)
+
+		const target = localDir("aborted")
+		const controller = new ManagedAbortController()
+		let downloaded = 0n
+		const callback = {
+			onUpdate(bytes) {
+				downloaded += bytes
+				if (!controller.signal().aborted()) {
+					controller.abort()
+				}
+			}
+		}
+		await assert.rejects(
+			client.downloadFileToPath(asAnyFile(large), join(target, "large.bin"), callback, {
+				abortSignal: controller.signal(),
+				pauseSignal: undefined
+			}),
+			e => {
+				assert.equal(kind(e), ErrorKind.Cancelled)
+				return true
+			}
+		)
+		// The temp file's guard is dropped on the SDK's own thread after the rejection.
+		await until("the aborted download's temp file was removed", () => readdirSync(target).length === 0, 5_000)
+		assert.ok(downloaded > 0n && downloaded < BigInt(size), `${downloaded} of ${size} bytes downloaded before the abort`)
+	})
+
+	test("a directory uploads recursively and downloads back as the same tree", async () => {
+		const contents = { "a/b.txt": randomBytes(1000), "c.txt": randomBytes(3000) }
+		const totalBytes = BigInt(contents["a/b.txt"].length + contents["c.txt"].length)
+		const local = localDir("tree-up")
+		mkdirSync(join(local, "a"))
+		mkdirSync(join(local, "d"))
+		for (const [relPath, bytes] of Object.entries(contents)) {
+			writeFileSync(join(local, relPath), bytes)
+		}
+		const remoteTree = await client.createDir(asNormalDir(remote), "tree")
+
+		const up = recorder(["onScanProgress", "onScanErrors", "onScanComplete", "onUploadUpdate", "onUploadErrors"])
+		await client.uploadDirRecursively(local, up.callback, remoteTree, noSignals)
+		assert.deepEqual(up.calls.onScanErrors, [])
+		assert.deepEqual(up.calls.onUploadErrors, [])
+		// The walk does not count the root it starts from: `a` and `d`.
+		assert.deepEqual(up.calls.onScanComplete, [[2n, 2n, totalBytes]])
+		const uploadedFiles = up.calls.onUploadUpdate.flatMap(([, files]) => files)
+		assert.deepEqual(uploadedFiles.map(file => file.meta.inner[0].name).sort(), ["b.txt", "c.txt"])
+		assert.equal(
+			up.calls.onUploadUpdate.reduce((sum, [, , bytes]) => sum + bytes, 0n),
+			totalBytes
+		)
+
+		const listErrors = []
+		const listing = await client.listDirRecursiveWithPaths(asTarget(remoteTree), undefined, {
+			onErrors: errors => listErrors.push(...errors)
+		})
+		assert.deepEqual(listErrors, [])
+		assert.deepEqual(listing.files.map(({ path }) => path).sort(), ["a/b.txt", "c.txt"])
+		assert.deepEqual(listing.dirs.map(({ path }) => path).sort(), ["a", "d"])
+		for (const { path, file } of listing.files) {
+			assert.equal(file.size, BigInt(contents[path].length), path)
+		}
+
+		const back = join(dir, "tree-down")
+		const down = recorder([
+			"onQueryDownloadProgress",
+			"onScanProgress",
+			"onScanErrors",
+			"onScanComplete",
+			"onDownloadUpdate",
+			"onDownloadErrors"
+		])
+		await client.downloadDirRecursively(back, down.callback, asTarget(remoteTree), noSignals)
+		assert.deepEqual(down.calls.onScanErrors, [])
+		assert.deepEqual(down.calls.onDownloadErrors, [])
+		assert.equal(
+			down.calls.onDownloadUpdate.reduce((sum, [, , bytes]) => sum + bytes, 0n),
+			totalBytes
+		)
+		assert.deepEqual(readdirSync(back).sort(), ["a", "c.txt", "d"])
+		for (const [relPath, bytes] of Object.entries(contents)) {
+			assert.ok(readFileSync(join(back, relPath)).equals(bytes), relPath)
+		}
+		assert.ok(statSync(join(back, "d")).isDirectory())
+		assert.deepEqual(readdirSync(join(back, "d")), [])
+	})
+})
+
 /** A loopback port no one listens on now. */
 async function freePort() {
 	const server = createServer()
@@ -342,7 +589,11 @@ async function freePort() {
 describe(
 	"the rclone daemon against the server",
 	{
-		skip: !(email && password) ? "TEST_EMAIL / TEST_PASSWORD are unset" : process.env.FILEN_TEST_RCLONE ? false : "FILEN_TEST_RCLONE is unset"
+		skip: !(email && password)
+			? "TEST_EMAIL / TEST_PASSWORD are unset"
+			: process.env.FILEN_TEST_RCLONE
+				? false
+				: "FILEN_TEST_RCLONE is unset"
 	},
 	() => {
 		let dir, daemon
