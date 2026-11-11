@@ -1044,6 +1044,7 @@ pub(crate) async fn execute_rclone(
 fn stop_cause(signal: interrupt::PressSignal) -> StopCause {
 	match signal {
 		interrupt::PressSignal::Interrupt => StopCause::Interrupt,
+		#[cfg(unix)]
 		interrupt::PressSignal::Terminate | interrupt::PressSignal::Hangup => StopCause::Terminate,
 	}
 }
@@ -1645,6 +1646,11 @@ mod tests {
 			stop_cause(interrupt::PressSignal::Interrupt),
 			StopCause::Interrupt
 		);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn a_sigterm_or_sighup_reached_filen_alone() {
 		assert_eq!(
 			stop_cause(interrupt::PressSignal::Terminate),
 			StopCause::Terminate

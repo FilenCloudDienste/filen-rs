@@ -423,8 +423,10 @@ pub(crate) enum PressSignal {
 	/// Ctrl-C, or SIGINT.
 	Interrupt,
 	/// SIGTERM.
+	#[cfg(unix)]
 	Terminate,
 	/// SIGHUP.
+	#[cfg(unix)]
 	Hangup,
 }
 
