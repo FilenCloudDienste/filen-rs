@@ -404,7 +404,7 @@ impl UI {
 				interrupt::close_stdout();
 				Err(CliError::StdoutClosed.into())
 			}
-			Err(e) => Err(anyhow::Error::new(e).context("Failed to write to stdout")),
+			Err(e) => Err(CliError::Failure(format!("Failed to write to stdout: {e}")).into()),
 		}
 	}
 
@@ -1759,6 +1759,33 @@ mod tests {
 		let mut ui = Printed::default().ui();
 		ui.initialize(false, false, None, true, true);
 		assert_eq!(ui.omit_for_replay_testing("value"), "[omit]");
+	}
+
+	#[test]
+	fn a_failed_write_of_bytes_is_a_failure() {
+		/// A stdout whose every write fails as on a full disk.
+		struct StorageFull;
+
+		impl Write for StorageFull {
+			fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+				Err(io::Error::from(io::ErrorKind::StorageFull))
+			}
+
+			fn flush(&mut self) -> io::Result<()> {
+				Ok(())
+			}
+		}
+
+		let mut ui = UI::with_writers(StorageFull, Printed::default());
+		let err = ui.write_stdout_bytes(b"content").unwrap_err();
+		assert!(matches!(find_cli_error(&err), Some(CliError::Failure(_))));
+		assert_eq!(
+			format!("{err:#}"),
+			format!(
+				"Failed to write to stdout: {}",
+				io::Error::from(io::ErrorKind::StorageFull)
+			)
+		);
 	}
 
 	#[test]
