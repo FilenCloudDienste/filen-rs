@@ -33,19 +33,19 @@ pub struct NormalDirWithPath {
 	pub dir: Dir,
 }
 
-#[js_type(export, no_deser)]
+#[js_type(export, no_deser, napi)]
 pub struct DirWithPath {
 	pub path: String,
 	pub dir: NonRootDirTagged,
 }
 
-#[js_type(export)]
+#[js_type(export, napi)]
 pub struct FileWithPath {
 	pub path: String,
 	pub file: File,
 }
 
-#[js_type(export, no_deser)]
+#[js_type(export, no_deser, napi)]
 pub struct DirsAndFilesWithPaths {
 	pub dirs: Vec<DirWithPath>,
 	pub files: Vec<FileWithPath>,

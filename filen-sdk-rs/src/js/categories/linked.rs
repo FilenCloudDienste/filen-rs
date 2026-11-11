@@ -26,7 +26,7 @@ use crate::{
 
 use super::common::dir::RootDirWithMeta;
 
-#[js_type(wasm_all, export)]
+#[js_type(import, export, wasm_all, napi)]
 pub struct LinkedFile {
 	uuid: Uuid,
 	name: MaybeEncrypted<'static, str>,
@@ -91,7 +91,7 @@ impl TryFrom<LinkedFile> for LinkedFileRS {
 	}
 }
 
-#[js_type(wasm_all)]
+#[js_type(import, export, wasm_all, napi)]
 pub struct LinkedDir {
 	inner: super::normal::Dir,
 	__linked_tag: bool,
@@ -112,7 +112,7 @@ impl From<LinkedDir> for LinkedDirectory {
 	}
 }
 
-#[js_type(wasm_all)]
+#[js_type(import, export, wasm_all, napi)]
 pub struct LinkedRootDir {
 	inner: RootDirWithMeta,
 	__linked_tag: bool,
@@ -143,7 +143,7 @@ impl From<LinkedRootDir> for RootDirectoryWithMeta {
 	}
 }
 
-#[js_type(import, export, wasm_all)]
+#[js_type(import, export, wasm_all, napi)]
 pub enum AnyLinkedDir {
 	// `Dir` must precede `Root`: the wasm deserializer is `untagged`, so it tries variants in
 	// order. `LinkedDir`'s inner is a field-superset of `LinkedRootDir`'s inner, so a `Root`
@@ -172,7 +172,7 @@ impl From<DirType<'static, Linked>> for AnyLinkedDir {
 	}
 }
 
-#[js_type(import, export, wasm_all)]
+#[js_type(import, export, wasm_all, napi)]
 /// Converting from a DirPublicLinkRW to a DirPublicLink IS allowed
 /// if all fields are compatible
 /// but converting from a DirPublicLink to a DirPublicLinkRW is not allowed

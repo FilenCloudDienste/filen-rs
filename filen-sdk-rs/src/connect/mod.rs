@@ -97,6 +97,7 @@ pub(crate) trait MakePasswordSaltAndHash {
 	serde(tag = "type", content = "data", rename_all = "camelCase"),
 )]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
+#[filen_macros::napi_mirror(import, export)]
 pub enum PasswordState {
 	Known(String),
 	Hashed(LinkHashedPasswordStatic),

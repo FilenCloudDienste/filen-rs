@@ -206,6 +206,8 @@ impl JsClient {
 	}
 }
 
+// Only the uniffi and wasm bindings list a tree without paths.
+#[cfg_attr(feature = "napi", allow(dead_code))]
 fn dirs_and_files_into_js<D, F>((dirs, files): (Vec<D>, Vec<F>)) -> DirsAndFiles
 where
 	D: Into<NonRootDir>,
@@ -222,6 +224,8 @@ where
 	DirsAndFiles { dirs, files }
 }
 
+// No napi export lists a tree with paths yet.
+#[cfg_attr(feature = "napi", allow(dead_code))]
 #[allow(clippy::type_complexity)]
 fn dirs_and_files_into_js_with_paths<D, F>(
 	(dirs, files): (Vec<(D, String)>, Vec<(F, String)>),
@@ -248,6 +252,8 @@ where
 }
 
 impl JsClient {
+	// Only the uniffi and wasm bindings list a tree without paths.
+	#[cfg_attr(feature = "napi", allow(dead_code))]
 	async fn inner_list_dir_recursive<F>(
 		&self,
 		dir: AnyDirWithContext,
@@ -285,6 +291,8 @@ impl JsClient {
 		.await
 	}
 
+	// No napi export lists a tree with paths yet.
+	#[cfg_attr(feature = "napi", allow(dead_code))]
 	async fn inner_list_dir_recursive_with_paths<F, F1>(
 		&self,
 		dir: AnyDirWithContext,
@@ -347,6 +355,7 @@ impl JsClient {
 		all(target_family = "wasm", target_os = "unknown"),
 		wasm_bindgen::prelude::wasm_bindgen
 	)]
+	#[napi_export]
 	pub fn root(&self) -> Root {
 		self.inner_ref().root().clone().into()
 	}
@@ -355,6 +364,7 @@ impl JsClient {
 		all(target_family = "wasm", target_os = "unknown"),
 		wasm_bindgen::prelude::wasm_bindgen(js_name = "getDir")
 	)]
+	#[napi_export]
 	pub async fn get_dir(&self, uuid: UuidStr) -> Result<Dir, Error> {
 		let this = self.inner();
 		do_on_commander(move || async move { this.get_dir(uuid.into()).await.map(Dir::from) }).await
@@ -372,6 +382,7 @@ impl JsClient {
 		all(target_family = "wasm", target_os = "unknown"),
 		wasm_bindgen::prelude::wasm_bindgen(js_name = "createDir")
 	)]
+	#[napi_export]
 	pub async fn create_dir(&self, parent: AnyNormalDir, name: String) -> Result<Dir, Error> {
 		let this = self.inner();
 		do_on_commander(move || async move {

@@ -35,7 +35,7 @@ use crate::{
 };
 
 #[derive(serde::Deserialize, serde::Serialize)]
-#[js_type(wasm_all, no_deser, no_ser)]
+#[js_type(import, export, wasm_all, no_deser, no_ser, napi)]
 pub struct ShareInfo {
 	pub email: String,
 	pub id: u64,
@@ -43,7 +43,7 @@ pub struct ShareInfo {
 
 #[derive(serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase", tag = "type")]
-#[js_type(import, export, wasm_all, tagged, no_deser, no_ser)]
+#[js_type(import, export, wasm_all, tagged, no_deser, no_ser, napi)]
 pub enum SharingRole {
 	Sharer(ShareInfo),
 	Receiver(ShareInfo),

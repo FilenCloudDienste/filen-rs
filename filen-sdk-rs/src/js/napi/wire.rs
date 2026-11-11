@@ -4,12 +4,26 @@
 //! convert between it and the Rust type. Generated mirrors implement them for `#[js_type(napi)]`
 //! items; this module covers the leaves. Where napi's own conversion of a Rust type would differ
 //! from ubrn's, the wire type is a different one: `u64` and `i64` cross as `BigInt` (napi reads
-//! no `u64`, and passes an `i64` as a `number`), a `Uuid` as a `String`. `f32` has no wire type:
-//! napi reads none.
+//! no `u64`, and passes an `i64` as a `number`), a `Uuid` as a `String`, a date as its
+//! milliseconds in a `BigInt`, and a BLAKE3 hash as a `Uint8Array`. `f32` has no wire type: napi
+//! reads none.
 
+use std::borrow::Cow;
+
+use chrono::{DateTime, Utc};
+use filen_types::{
+	api::v3::dir::link::info::LinkPasswordSalt,
+	crypto::{
+		Blake3Hash, EncryptedString, EncryptedStringStatic, LinkHashedPassword,
+		LinkHashedPasswordStatic,
+	},
+	fs::{StableUuid, UuidStr},
+};
 use napi::bindgen_prelude::{BigInt, Either, Undefined};
+use serde::{Deserialize, de::IntoDeserializer};
 use uuid::Uuid;
 
+use super::bytes::{self, Bytes};
 use crate::{Error, ErrorKind};
 
 /// A type that crosses the napi boundary as `Self::Wire`.
@@ -55,6 +69,10 @@ same_on_wire!(String, bool, u8, u16, u32, i8, i16, i32, f64, ());
 pub(crate) enum WireError {
 	#[error("the bigint does not fit in a {0}")]
 	BigIntOutOfRange(&'static str),
+	#[error("{0} milliseconds from the epoch is not a date the SDK can hold")]
+	DateOutOfRange(i64),
+	#[error("a BLAKE3 hash is 32 bytes, not {0}")]
+	Blake3HashLength(usize),
 }
 
 fn conversion(e: impl std::error::Error + Send + Sync + 'static) -> Error {
@@ -126,6 +144,133 @@ impl FromWire for Uuid {
 impl IntoWire for Uuid {
 	fn into_wire(self) -> String {
 		self.to_string()
+	}
+}
+
+impl Wire for UuidStr {
+	type Wire = String;
+}
+
+impl FromWire for UuidStr {
+	fn from_wire(wire: String) -> Result<Self, Error> {
+		wire.parse().map_err(conversion)
+	}
+}
+
+impl IntoWire for UuidStr {
+	fn into_wire(self) -> String {
+		self.as_ref().to_owned()
+	}
+}
+
+/// A date as uniffi lowers it: its milliseconds from the epoch, an `i64`.
+impl Wire for DateTime<Utc> {
+	type Wire = BigInt;
+}
+
+impl FromWire for DateTime<Utc> {
+	fn from_wire(wire: BigInt) -> Result<Self, Error> {
+		let millis = i64::from_wire(wire)?;
+		DateTime::from_timestamp_millis(millis)
+			.ok_or_else(|| conversion(WireError::DateOutOfRange(millis)))
+	}
+}
+
+impl IntoWire for DateTime<Utc> {
+	fn into_wire(self) -> BigInt {
+		self.timestamp_millis().into_wire()
+	}
+}
+
+impl Wire for StableUuid {
+	type Wire = String;
+}
+
+impl FromWire for StableUuid {
+	// The server mints a stable id, so it has no constructor: one read from JS is one the SDK
+	// handed out, deserialized as it is from a response.
+	fn from_wire(wire: String) -> Result<Self, Error> {
+		Self::deserialize(wire.into_deserializer())
+			.map_err(|e: serde::de::value::Error| conversion(e))
+	}
+}
+
+impl IntoWire for StableUuid {
+	fn into_wire(self) -> String {
+		self.to_string()
+	}
+}
+
+impl Wire for Blake3Hash {
+	type Wire = Bytes;
+}
+
+impl FromWire for Blake3Hash {
+	fn from_wire(wire: Bytes) -> Result<Self, Error> {
+		let hash = bytes::read(wire);
+		<[u8; 32]>::try_from(hash.as_slice())
+			.map(Self::from)
+			.map_err(|_| conversion(WireError::Blake3HashLength(hash.len())))
+	}
+}
+
+impl IntoWire for Blake3Hash {
+	fn into_wire(self) -> Bytes {
+		bytes::write(<[u8; 32]>::from(self).to_vec())
+	}
+}
+
+impl Wire for EncryptedStringStatic {
+	type Wire = String;
+}
+
+impl FromWire for EncryptedStringStatic {
+	fn from_wire(wire: String) -> Result<Self, Error> {
+		Ok(EncryptedString(Cow::Owned(wire)))
+	}
+}
+
+impl IntoWire for EncryptedStringStatic {
+	fn into_wire(self) -> String {
+		self.0.into_owned()
+	}
+}
+
+impl Wire for LinkHashedPasswordStatic {
+	type Wire = String;
+}
+
+impl FromWire for LinkHashedPasswordStatic {
+	fn from_wire(wire: String) -> Result<Self, Error> {
+		Ok(LinkHashedPassword(Cow::Owned(wire)))
+	}
+}
+
+impl IntoWire for LinkHashedPasswordStatic {
+	fn into_wire(self) -> String {
+		self.0.into_owned()
+	}
+}
+
+/// A salt as uniffi lowers it: empty for none, else its text.
+impl Wire for LinkPasswordSalt {
+	type Wire = String;
+}
+
+impl FromWire for LinkPasswordSalt {
+	fn from_wire(wire: String) -> Result<Self, Error> {
+		Self::deserialize(wire.into_deserializer())
+			.map_err(|e: serde::de::value::Error| conversion(e))
+	}
+}
+
+impl IntoWire for LinkPasswordSalt {
+	fn into_wire(self) -> String {
+		match self {
+			Self::None => String::new(),
+			Self::V2(salt) => salt.to_string(),
+			Self::V3(salt) => salt.to_string(),
+		}
 	}
 }
 

@@ -18,12 +18,16 @@ import { Worker } from "node:worker_threads"
 import * as sdk from "../node/index.js"
 
 const {
+	AnyFile_Tags,
 	Backlog,
 	CacheStatusMessage_Tags,
 	ConflictReason,
 	ConflictResolution,
 	DeleteGuardState_Tags,
+	DirColor_Tags,
 	ErrorKind,
+	FileEncryptionVersion,
+	FileMeta_Tags,
 	FilenSdkError,
 	FuseProvider,
 	FuseStatus_Tags,
@@ -36,6 +40,7 @@ const {
 	LogLevel,
 	ManagedAbortController,
 	ManagedAbortSignal,
+	ParentUuid_Tags,
 	PauseMode,
 	PauseSignal,
 	PlannedNodeKind,
@@ -105,10 +110,20 @@ function assertThrownLikeUbrn(e) {
 }
 
 describe("exports", () => {
-	test("are the classes, enums and functions ubrn exposes for login, the cache, the managed futures, the sync engine and rclone", () => {
+	test("are the classes, enums and functions ubrn exposes for login, the cache, the managed futures, files and directories, the sync engine and rclone", () => {
 		// napi's loader also exports each enum and class under its Rust name where that differs
 		// (the *Napi mirrors, *Tags), and the binding flavor it loaded.
 		assert.deepEqual(Object.keys(sdk).sort(), [
+			"AnyDirWithContextTags",
+			"AnyDirWithContext_Tags",
+			"AnyFileTags",
+			"AnyFile_Tags",
+			"AnyLinkedDirTags",
+			"AnyLinkedDir_Tags",
+			"AnyNormalDirTags",
+			"AnyNormalDir_Tags",
+			"AnySharedDirTags",
+			"AnySharedDir_Tags",
 			"Backlog",
 			"BacklogNapi",
 			"CacheStatusMessageTags",
@@ -119,8 +134,16 @@ describe("exports", () => {
 			"ConflictResolutionNapi",
 			"DeleteGuardStateTags",
 			"DeleteGuardState_Tags",
+			"DirColorTags",
+			"DirColor_Tags",
+			"DirMetaTags",
+			"DirMeta_Tags",
 			"ErrorKind",
 			"ErrorKindNapi",
+			"FileEncryptionVersion",
+			"FileEncryptionVersionNapi",
+			"FileMetaTags",
+			"FileMeta_Tags",
 			"FilenSdkError",
 			"FilenSdkErrorNapi",
 			"FuseProvider",
@@ -140,6 +163,16 @@ describe("exports", () => {
 			"LogLevelNapi",
 			"ManagedAbortController",
 			"ManagedAbortSignal",
+			"MaybeEncryptedUniffiTags",
+			"MaybeEncryptedUniffi_Tags",
+			"NonRootDirTags",
+			"NonRootDir_Tags",
+			"NonRootItemTags",
+			"NonRootItem_Tags",
+			"ParentUuidTags",
+			"ParentUuid_Tags",
+			"PasswordStateTags",
+			"PasswordState_Tags",
 			"PauseMode",
 			"PauseModeNapi",
 			"PauseSignal",
@@ -161,6 +194,8 @@ describe("exports", () => {
 			"ServeAuth_Tags",
 			"ServeProtocol",
 			"ServeProtocolNapi",
+			"SharingRoleTags",
+			"SharingRole_Tags",
 			"SyncEventMessageTags",
 			"SyncEventMessage_Tags",
 			"SyncGuardReasonTags",
@@ -254,7 +289,25 @@ describe("exports", () => {
 		)
 	})
 
+	test("number the file encryption versions as the API does", () => {
+		assert.deepEqual({ ...FileEncryptionVersion }, { V1: 1, V2: 2, V3: 3 })
+	})
+
 	test("name the data enums' tags as strings", () => {
+		assert.deepEqual({ ...AnyFile_Tags }, tags(["Linked", "Shared", "File"]))
+		assert.deepEqual({ ...ParentUuid_Tags }, tags(["Uuid", "Trash", "Recents", "Favorites", "Links"]))
+		// Tagged with the Rust names, as uniffi tags them, under ubrn's keys.
+		assert.deepEqual(
+			{ ...FileMeta_Tags },
+			{
+				Decoded: "Decoded",
+				DecryptedUtf8: "DecryptedUTF8",
+				DecryptedRaw: "DecryptedRaw",
+				Encrypted: "Encrypted",
+				RsaEncrypted: "RSAEncrypted"
+			}
+		)
+		assert.deepEqual({ ...DirColor_Tags }, tags(["Default", "Blue", "Green", "Purple", "Red", "Gray", "Custom"]))
 		assert.deepEqual(
 			{ ...CacheStatusMessage_Tags },
 			{ Errors: "Errors", SyncRootsDeleted: "SyncRootsDeleted", ResyncProgress: "ResyncProgress" }
@@ -657,6 +710,30 @@ function watchInWorker(dbPath, rootUuid) {
 		workerData: { addon, dbPath, twoWay: SyncMode.TwoWay, stringified: synthStringified(rootUuid) }
 	})
 }
+
+describe("files and directories, offline", () => {
+	test("root() names the client's root", () => {
+		const rootUuid = randomUUID()
+		assert.deepEqual(synthClient(rootUuid).root(), { uuid: rootUuid })
+	})
+
+	test("getDir with an aborted signal rejects with an AbortError", async () => {
+		await assert.rejects(synthClient(randomUUID()).getDir(randomUUID(), { signal: AbortSignal.abort() }), e => {
+			assert.equal(e.name, "AbortError")
+			assert.equal(FilenSdkError.hasInner(e), false)
+			return true
+		})
+	})
+
+	test("getDir with a uuid that is not one rejects with a conversion error", async () => {
+		const pending = synthClient(randomUUID()).getDir("not-a-uuid")
+		assert.ok(pending instanceof Promise)
+		await assert.rejects(pending, e => {
+			assert.equal(assertThrownLikeUbrn(e).kind(), ErrorKind.Conversion)
+			return true
+		})
+	})
+})
 
 describe("rclone, offline", () => {
 	let dir

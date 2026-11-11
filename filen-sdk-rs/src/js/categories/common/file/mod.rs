@@ -13,7 +13,7 @@ use crate::{
 	thumbnail::might_be_thumbnailable,
 };
 
-#[js_type(import, export, wasm_all)]
+#[js_type(import, export, wasm_all, napi)]
 pub struct File {
 	pub(crate) uuid: Uuid,
 	/// Server-minted whole-life file id — survives content edits and version

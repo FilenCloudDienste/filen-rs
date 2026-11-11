@@ -44,6 +44,11 @@
  *
  * Bytes cross as a Uint8Array where ubrn has an ArrayBuffer: napi has no owned ArrayBuffer.
  *
+ * A data enum (AnyFile, ParentUuid, FileMeta and the rest) is a plain { tag, inner } object,
+ * not an instance of a class as ubrn's are: build one as an object literal, its tag taken from
+ * the enum's X_Tags (ParentUuid_Tags.Uuid), and tell one apart by its tag. A variant without a
+ * payload has no inner.
+ *
  * This header declares what napi cannot generate from Rust. */
 /* eslint-disable */
 
@@ -65,6 +70,15 @@ export type ManagedAbortSignalInterface = ManagedAbortSignal
 
 /** A BLAKE3 hash, 32 bytes. */
 export type Blake3Hash = Uint8Array
+
+/** The milliseconds since the epoch, as uniffi lowers a date. */
+export type DateTime = bigint
+export type Uuid = string
+export type UuidStr = string
+export type StableUuid = string
+export type LinkPasswordSalt = string
+export type LinkHashedPasswordStatic = string
+export type MaybeEncryptedStatic = MaybeEncryptedUniffi
 
 /** What a managed call can be paused and aborted through. */
 export type ManagedFuture = {

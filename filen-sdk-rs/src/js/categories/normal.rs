@@ -15,7 +15,7 @@ use crate::{
 	js::{DirColor, DirMeta, File},
 };
 
-#[js_type(export, wasm_all)]
+#[js_type(import, export, wasm_all, napi)]
 pub struct Root {
 	pub uuid: Uuid,
 }
@@ -32,7 +32,7 @@ impl From<Root> for RootDirectory {
 	}
 }
 
-#[js_type(import, export, wasm_all)]
+#[js_type(import, export, wasm_all, napi)]
 pub struct Dir {
 	pub uuid: Uuid,
 	pub parent: ParentUuid,
@@ -74,7 +74,7 @@ impl From<Dir> for RemoteDirectory {
 }
 
 /// Untagged both ways, so a directory the SDK hands out can be passed back as it is.
-#[js_type(import, untagged, wasm_all)]
+#[js_type(import, untagged, wasm_all, napi)]
 pub enum AnyNormalDir {
 	Dir(Dir),
 	Root(Root),

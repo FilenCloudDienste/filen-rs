@@ -16,7 +16,7 @@ pub enum AnyItemWithContext {
 	Dir(AnyDirWithContext),
 }
 
-#[js_type(export)]
+#[js_type(export, napi)]
 pub enum NonRootItem {
 	NormalDir(Dir),
 	File(File),

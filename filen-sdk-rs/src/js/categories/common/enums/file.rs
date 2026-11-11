@@ -8,7 +8,7 @@ use crate::{
 	js::{File, LinkedFile, SharedFile},
 };
 
-#[js_type(import, untagged, wasm_all)]
+#[js_type(import, untagged, wasm_all, napi)]
 pub enum AnyFile {
 	Linked(LinkedFile),
 	Shared(SharedFile),

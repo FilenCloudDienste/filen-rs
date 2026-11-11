@@ -249,7 +249,11 @@ impl DirectoryMetaChanges {
 // The FFI twin carries the name unvalidated because neither tsify's
 // from_wasm_abi nor uniffi's record lifting can report an error; validation
 // happens here instead, inside the exported function.
-#[cfg(any(all(target_family = "wasm", target_os = "unknown"), feature = "uniffi"))]
+#[cfg(any(
+	all(target_family = "wasm", target_os = "unknown"),
+	feature = "uniffi",
+	feature = "napi"
+))]
 impl TryFrom<crate::js::DirectoryMetaChanges> for DirectoryMetaChanges {
 	type Error = EntryNameError;
 

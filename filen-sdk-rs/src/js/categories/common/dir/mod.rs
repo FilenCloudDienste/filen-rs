@@ -7,7 +7,7 @@ use crate::fs::dir::RootDirectoryWithMeta;
 pub(crate) mod color;
 pub(crate) mod meta;
 
-#[js_type(wasm_all)]
+#[js_type(import, export, wasm_all, napi)]
 pub struct RootDirWithMeta {
 	pub uuid: Uuid,
 	pub color: color::DirColor,

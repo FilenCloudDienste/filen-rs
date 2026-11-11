@@ -10,9 +10,10 @@
 
 mod error;
 mod managed;
+mod types;
 // Plain Rust, so back under the workspace's `unsafe_code` deny, which `js` lifts for this module
-// because of the glue napi-derive generates for the `#[napi]` items here, in `error` and in
-// `managed`. The hand-written impls and helpers beside those items carry the deny one by one.
+// because of the glue napi-derive generates for the `#[napi]` items here, in `error`, `managed`
+// and `types`. The hand-written impls and helpers beside those items carry the deny one by one.
 #[deny(unsafe_code)]
 pub(crate) mod bytes;
 #[deny(unsafe_code)]

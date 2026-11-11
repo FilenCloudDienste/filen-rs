@@ -6,7 +6,7 @@ use filen_types::crypto::{EncryptedString, rsa::RSAEncryptedString};
 
 use crate::fs::dir::{DecryptedDirectoryMeta as DecryptedDirectoryMetaRS, meta::DirectoryMeta};
 
-#[js_type(wasm_all)]
+#[js_type(import, export, wasm_all, napi)]
 pub struct DecryptedDirMeta {
 	pub name: String,
 	#[cfg_attr(
@@ -48,6 +48,7 @@ impl From<DecryptedDirMeta> for DecryptedDirectoryMetaRS<'static> {
 	serde(tag = "type", content = "data", rename_all = "camelCase"),
 )]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
+#[filen_macros::napi_mirror(import, export)]
 pub enum DirMeta {
 	Decoded(DecryptedDirMeta),
 	DecryptedRaw(Vec<u8>),

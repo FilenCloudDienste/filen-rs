@@ -1,6 +1,3 @@
-// The napi build exposes the binding layer it shares with uniffi item by item, and no napi
-// export takes or returns these item types yet.
-#[cfg_attr(feature = "napi", allow(dead_code))]
 mod categories;
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 mod js_param;
@@ -22,7 +19,7 @@ mod meta_changes;
 pub(crate) mod napi;
 #[cfg(any(feature = "wasm-full", feature = "uniffi", feature = "napi"))]
 mod params;
-#[cfg(any(feature = "wasm-full", feature = "uniffi"))]
+#[cfg(any(feature = "wasm-full", feature = "uniffi", feature = "napi"))]
 mod returned_types;
 #[cfg(all(target_family = "wasm", target_os = "unknown",))]
 mod service_worker;
@@ -52,11 +49,10 @@ pub(crate) use categories::{
 	shared::{AnySharedDir, SharedDir, SharedFile, SharedRootDir, SharedRootItem},
 };
 
+#[cfg(any(feature = "wasm-full", feature = "uniffi", feature = "napi"))]
+pub(crate) use categories::common::enums::{NonRootItemTagged, dir::NonRootDirTagged};
 #[cfg(any(feature = "wasm-full", feature = "uniffi"))]
-pub(crate) use categories::{
-	common::enums::{NonRootItemTagged, dir::NonRootDirTagged},
-	normal::NonRootNormalItemTagged,
-};
+pub(crate) use categories::normal::NonRootNormalItemTagged;
 
 #[cfg(feature = "uniffi")]
 pub(crate) use self::uniffi::spawn_ordered_dispatch;
@@ -72,7 +68,7 @@ pub use managed_futures::*;
 pub use meta_changes::*;
 #[cfg(any(feature = "wasm-full", feature = "uniffi", feature = "napi"))]
 pub use params::*;
-#[cfg(any(feature = "wasm-full", feature = "uniffi"))]
+#[cfg(any(feature = "wasm-full", feature = "uniffi", feature = "napi"))]
 pub use returned_types::*;
 #[cfg(feature = "service-worker")]
 pub(crate) use service_worker::impls::*;

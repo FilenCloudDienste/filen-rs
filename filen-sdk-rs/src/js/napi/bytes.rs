@@ -8,8 +8,6 @@
 use napi::bindgen_prelude::Uint8Array;
 
 /// A byte vector's wire type.
-// No napi export takes or returns a byte vector yet.
-#[allow(dead_code)]
 pub(crate) type Bytes = Uint8Array;
 
 /// Copies the bytes out of `bytes`.
@@ -17,15 +15,15 @@ pub(crate) type Bytes = Uint8Array;
 /// Call it on the JS thread, where `bytes` was read: napi's `Uint8Array` borrows memory JS may
 /// change at any time, so it is not safely `Send` (napi marks it so anyway), and only the copy
 /// may move to another thread.
-// No napi export takes a byte vector yet.
-#[allow(dead_code)]
 pub(crate) fn read(bytes: Bytes) -> Vec<u8> {
 	bytes.to_vec()
 }
 
 /// `bytes` as a `Uint8Array` that owns them.
-// No napi export returns a byte vector yet.
-#[allow(dead_code)]
+///
+/// napi hands them to JS as an external buffer, and copies them into one JS allocates where the
+/// runtime refuses external buffers, as Electron's V8 memory cage does (napi's `ToNapiValue` for
+/// `Uint8Array` retries on `napi_no_external_buffers_allowed`).
 pub(crate) fn write(bytes: Vec<u8>) -> Bytes {
 	Uint8Array::new(bytes)
 }

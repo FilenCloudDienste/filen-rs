@@ -7,6 +7,7 @@ use std::borrow::Cow;
 	serde(rename_all = "camelCase")
 )]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
+#[filen_macros::napi_mirror(import, export)]
 pub enum DirColor {
 	Default,
 	Blue,

@@ -56,7 +56,7 @@ pub struct FileBuilderParams {
 	pub no_exif_override: bool,
 }
 
-#[js_type(import, no_ser)]
+#[js_type(import, no_ser, napi)]
 pub struct FileBuilderParamsOptionalName {
 	pub parent: AnyNormalDir,
 	pub name: Option<String>,

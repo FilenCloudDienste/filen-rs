@@ -16,21 +16,21 @@ use crate::{
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 use crate::js::categories::{linked::AnyLinkedDirTagged, shared::AnySharedDirTagged};
 
-#[js_type(import, untagged, wasm_all)]
+#[js_type(import, untagged, wasm_all, napi)]
 pub enum AnyDirWithContext {
 	Shared(AnySharedDirWithContext),
 	Linked(AnyLinkedDirWithContext),
 	Normal(AnyNormalDir),
 }
 
-#[js_type(import, export, wasm_all)]
+#[js_type(import, export, wasm_all, napi)]
 pub struct AnySharedDirWithContext {
 	#[js_type_tagged]
 	pub(crate) dir: AnySharedDir,
 	pub(crate) share_info: SharingRole,
 }
 
-#[js_type(import, export, wasm_all)]
+#[js_type(import, export, wasm_all, napi)]
 pub struct AnyLinkedDirWithContext {
 	#[js_type_tagged]
 	pub(crate) dir: AnyLinkedDir,
@@ -57,7 +57,7 @@ impl From<AnyDirWithContext> for DirByCategoryWithContext {
 	}
 }
 
-#[js_type(export)]
+#[js_type(export, napi)]
 pub enum NonRootDir {
 	Normal(Dir),
 	Shared(SharedDir),
