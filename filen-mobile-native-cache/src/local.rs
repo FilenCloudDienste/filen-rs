@@ -106,30 +106,20 @@ impl FilenMobileCacheState {
 	/// Every pin, as `stable/<id>`, the form the providers identify items by. A permanent delete
 	/// drops the pins it takes; a row that only leaves the cache keeps its pin listed.
 	pub fn pinned_ids(&self) -> Result<Vec<String>, CacheError> {
-		self.sync_execute_authed(|auth_state| {
-			Ok(stable_ids(sql::select_pinned_item_ids(&auth_state.conn())?))
-		})
+		self.sync_execute_authed(AuthCacheState::pinned_ids)
 	}
 
 	/// The files a pin covers whose bytes are not on the device, as `stable/<id>`: what to
 	/// download to honour the pins. Only files the cache knows; see [`Self::pinned_dirs_to_list`].
 	pub fn pinned_files_to_fetch(&self) -> Result<Vec<String>, CacheError> {
-		self.sync_execute_authed(|auth_state| {
-			Ok(stable_ids(sql::select_pinned_files_to_fetch(
-				&auth_state.conn(),
-			)?))
-		})
+		self.sync_execute_authed(AuthCacheState::pinned_files_to_fetch)
 	}
 
 	/// The directories a pin covers that the cache has never listed, as `stable/<id>`. Listing
 	/// them until this comes back empty is what lets [`Self::pinned_files_to_fetch`] name every
 	/// covered file.
 	pub fn pinned_dirs_to_list(&self) -> Result<Vec<String>, CacheError> {
-		self.sync_execute_authed(|auth_state| {
-			Ok(stable_ids(sql::select_pinned_dirs_to_list(
-				&auth_state.conn(),
-			)?))
-		})
+		self.sync_execute_authed(AuthCacheState::pinned_dirs_to_list)
 	}
 
 	/// How many local edits have not reached the server yet.
@@ -147,7 +137,7 @@ impl FilenMobileCacheState {
 	/// The sequence the cache has reached, as the opaque anchor to hand back to
 	/// [`FilenMobileCacheState::enumerate_changes`] to be told what happened after it.
 	pub fn current_sync_anchor(&self) -> Result<Vec<u8>, CacheError> {
-		self.sync_execute_authed(|auth_state| current_sync_anchor(&auth_state.conn()))
+		self.sync_execute_authed(AuthCacheState::current_sync_anchor)
 	}
 
 	/// Everything that happened after `anchor`: the items to (re)render and the ids to drop.
@@ -182,9 +172,7 @@ impl FilenMobileCacheState {
 		anchor: Option<Vec<u8>>,
 		limit: u32,
 	) -> Result<FfiChanges, CacheError> {
-		self.sync_execute_authed(|auth_state| {
-			changes_since(&auth_state.conn(), anchor.as_deref(), limit)
-		})
+		self.sync_execute_authed(|auth_state| auth_state.changes_page(anchor.as_deref(), limit))
 	}
 
 	/// The items this device has a stake in: bytes in the local cache, an edit that has not
@@ -205,11 +193,7 @@ impl FilenMobileCacheState {
 	/// container that is never browsed again. Anchor-first degrades that worst case to duplicate
 	/// delivery, which an idempotent replica absorbs.
 	pub fn query_working_set_with_anchor(&self) -> Result<FfiWorkingSet, CacheError> {
-		self.sync_execute_authed(|auth_state| {
-			let anchor = current_sync_anchor(&auth_state.conn())?;
-			let items = working_set(auth_state)?;
-			Ok(FfiWorkingSet { anchor, items })
-		})
+		self.sync_execute_authed(AuthCacheState::working_set_with_anchor)
 	}
 }
 
@@ -675,6 +659,38 @@ impl AuthCacheState {
 
 	pub(crate) fn root_uuid(&self) -> String {
 		self.client.root().uuid().to_string()
+	}
+
+	/// See [`FilenMobileCacheState::pinned_ids`].
+	fn pinned_ids(&self) -> Result<Vec<String>, CacheError> {
+		Ok(stable_ids(sql::select_pinned_item_ids(&self.conn())?))
+	}
+
+	/// See [`FilenMobileCacheState::pinned_files_to_fetch`].
+	fn pinned_files_to_fetch(&self) -> Result<Vec<String>, CacheError> {
+		Ok(stable_ids(sql::select_pinned_files_to_fetch(&self.conn())?))
+	}
+
+	/// See [`FilenMobileCacheState::pinned_dirs_to_list`].
+	fn pinned_dirs_to_list(&self) -> Result<Vec<String>, CacheError> {
+		Ok(stable_ids(sql::select_pinned_dirs_to_list(&self.conn())?))
+	}
+
+	/// See [`FilenMobileCacheState::current_sync_anchor`].
+	fn current_sync_anchor(&self) -> Result<Vec<u8>, CacheError> {
+		current_sync_anchor(&self.conn())
+	}
+
+	/// See [`FilenMobileCacheState::enumerate_changes_page`].
+	fn changes_page(&self, anchor: Option<&[u8]>, limit: u32) -> Result<FfiChanges, CacheError> {
+		changes_since(&self.conn(), anchor, limit)
+	}
+
+	/// See [`FilenMobileCacheState::query_working_set_with_anchor`].
+	fn working_set_with_anchor(&self) -> Result<FfiWorkingSet, CacheError> {
+		let anchor = current_sync_anchor(&self.conn())?;
+		let items = working_set(self)?;
+		Ok(FfiWorkingSet { anchor, items })
 	}
 }
 

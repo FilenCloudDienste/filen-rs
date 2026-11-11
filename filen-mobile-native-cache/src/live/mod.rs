@@ -1353,13 +1353,7 @@ impl FilenMobileCacheState {
 	/// teardown (`invalidate()` on iOS) is safe: nothing is lost that the next launch does not
 	/// rebuild.
 	pub fn stop_live_updates(&self) {
-		let state = self.sync_get_cache_state_borrowed();
-		if let AuthStatus::Authenticated(auth) = &state.status {
-			if let Some(handle) = lock(&auth.live.handle).take() {
-				handle.drainer.abort();
-			}
-			auth.live.started.store(false, Ordering::Release);
-		}
+		self.sync_get_cache_state_borrowed().stop_live_updates();
 	}
 	/// Registers who to tell when the live path has changed something — the replica's cue to
 	/// ask for a diff (`signalEnumerator(.workingSet)` on iOS). `None` clears it.
@@ -1367,8 +1361,25 @@ impl FilenMobileCacheState {
 	/// Outlives auth changes, unlike the subscription itself: a listener set at startup keeps
 	/// working after a re-auth without the caller having to notice.
 	pub fn set_working_set_listener(&self, listener: Option<Arc<dyn WorkingSetUpdateListener>>) {
-		let state = self.sync_get_cache_state_borrowed();
-		*lock(&state.working_set_listener) = listener;
+		self.sync_get_cache_state_borrowed()
+			.set_working_set_listener(listener);
+	}
+}
+
+impl CacheState {
+	/// See [`FilenMobileCacheState::stop_live_updates`].
+	fn stop_live_updates(&self) {
+		if let AuthStatus::Authenticated(auth) = &self.status {
+			if let Some(handle) = lock(&auth.live.handle).take() {
+				handle.drainer.abort();
+			}
+			auth.live.started.store(false, Ordering::Release);
+		}
+	}
+
+	/// See [`FilenMobileCacheState::set_working_set_listener`].
+	fn set_working_set_listener(&self, listener: Option<Arc<dyn WorkingSetUpdateListener>>) {
+		*lock(&self.working_set_listener) = listener;
 	}
 }
 

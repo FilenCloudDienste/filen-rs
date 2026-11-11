@@ -1275,17 +1275,10 @@ impl FilenMobileCacheState {
 			AuthStatus::Authenticated(auth_state) => f(auth_state),
 			AuthStatus::Unauthenticated(unauth_state) => {
 				self.sync_launch_cleanup_task();
-				match unauth_state.reason {
-					UnauthReason::Disabled => {
-						Err(CacheError::Disabled("Disabled: sync_execute_authed".into()))
-					}
-					UnauthReason::Unauthenticated => Err(CacheError::Unauthenticated(
-						"Unauthenticated: sync_execute_authed".into(),
-					)),
-					UnauthReason::Unavailable => Err(CacheError::Unauthenticated(
-						"Auth state unavailable: sync_execute_authed".into(),
-					)),
-				}
+				Err(unauthenticated_error(
+					&unauth_state.reason,
+					"sync_execute_authed",
+				))
 			}
 		}
 	}
@@ -1316,17 +1309,10 @@ impl FilenMobileCacheState {
 			}
 			AuthStatus::Unauthenticated(unauth_state) => {
 				self.async_launch_cleanup_task().await;
-				match unauth_state.reason {
-					UnauthReason::Disabled => Err(CacheError::Disabled(
-						"Disabled: async_execute_authed_owned".into(),
-					)),
-					UnauthReason::Unauthenticated => Err(CacheError::Unauthenticated(
-						"Unauthenticated: async_execute_authed_owned".into(),
-					)),
-					UnauthReason::Unavailable => Err(CacheError::Unauthenticated(
-						"Auth state unavailable: async_execute_authed_owned".into(),
-					)),
-				}
+				Err(unauthenticated_error(
+					&unauth_state.reason,
+					"async_execute_authed_owned",
+				))
 			}
 		}
 	}
@@ -1352,18 +1338,24 @@ impl FilenMobileCacheState {
 			}
 			AuthStatus::Unauthenticated(unauth_state) => {
 				self.sync_launch_cleanup_task();
-				match unauth_state.reason {
-					UnauthReason::Disabled => Err(CacheError::Disabled(
-						"Disabled: sync_execute_authed_owned".into(),
-					)),
-					UnauthReason::Unauthenticated => Err(CacheError::Unauthenticated(
-						"Unauthenticated: sync_execute_authed_owned".into(),
-					)),
-					UnauthReason::Unavailable => Err(CacheError::Unauthenticated(
-						"Auth state unavailable: sync_execute_authed_owned".into(),
-					)),
-				}
+				Err(unauthenticated_error(
+					&unauth_state.reason,
+					"sync_execute_authed_owned",
+				))
 			}
+		}
+	}
+}
+
+/// The error an executor answers an unauthenticated state with, naming the executor.
+fn unauthenticated_error(reason: &UnauthReason, executor: &str) -> CacheError {
+	match reason {
+		UnauthReason::Disabled => CacheError::Disabled(format!("Disabled: {executor}").into()),
+		UnauthReason::Unauthenticated => {
+			CacheError::Unauthenticated(format!("Unauthenticated: {executor}").into())
+		}
+		UnauthReason::Unavailable => {
+			CacheError::Unauthenticated(format!("Auth state unavailable: {executor}").into())
 		}
 	}
 }
@@ -1604,6 +1596,35 @@ pub(crate) mod test_support {
 		std::fs::write(path, blob).unwrap();
 	}
 
+	/// A state authenticated from a sealed auth.json in a fresh directory, the way the FFI entry
+	/// points build it, and the key it is sealed with.
+	fn sealed_state(
+		prefix: &str,
+		config: FilenSDKConfig,
+	) -> (TempDbDir, EncryptionKey, CacheState) {
+		let dir = TempDbDir::create(prefix);
+		let dek = EncryptionKey::new([7u8; 32]);
+		let auth_file = dir.0.join("auth.json");
+		write_sealed(&auth_file, &dek, &enabled(config));
+		let mut state = CacheState {
+			status: AuthStatus::Unauthenticated(UnauthCacheState {
+				reason: UnauthReason::Disabled,
+			}),
+			auth_file: Arc::new(auth_file),
+			dek: Some(dek),
+			files_dir: dir.0.clone(),
+			db_dir: dir.0.clone(),
+			last_update: std::sync::RwLock::new(None),
+			auth_digest: None,
+			disabled_wipe_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+			working_set_listener: std::sync::Mutex::new(None),
+		};
+		let (file, digest) =
+			parse_auth_read(sync_read_auth_plaintext(&state.auth_file, Some(&dek)));
+		update_state(&mut state, file, digest);
+		(dir, dek, state)
+	}
+
 	/// An authenticated state built from a sealed auth.json, the way the FFI entry points build
 	/// it, with one marker row in its cache DB.
 	pub(crate) struct Session {
@@ -1615,26 +1636,7 @@ pub(crate) mod test_support {
 
 	impl Session {
 		pub(crate) fn start(config: FilenSDKConfig) -> Self {
-			let dir = TempDbDir::create("filen-cache-session-refresh");
-			let dek = EncryptionKey::new([7u8; 32]);
-			let auth_file = dir.0.join("auth.json");
-			write_sealed(&auth_file, &dek, &enabled(config));
-			let mut state = CacheState {
-				status: AuthStatus::Unauthenticated(UnauthCacheState {
-					reason: UnauthReason::Disabled,
-				}),
-				auth_file: Arc::new(auth_file),
-				dek: Some(dek),
-				files_dir: dir.0.clone(),
-				db_dir: dir.0.clone(),
-				last_update: std::sync::RwLock::new(None),
-				auth_digest: None,
-				disabled_wipe_gate: Arc::new(tokio::sync::Semaphore::new(1)),
-				working_set_listener: std::sync::Mutex::new(None),
-			};
-			let (file, digest) =
-				parse_auth_read(sync_read_auth_plaintext(&state.auth_file, Some(&dek)));
-			update_state(&mut state, file, digest);
+			let (dir, dek, state) = sealed_state("filen-cache-session-refresh", config);
 			let session = Session {
 				dir,
 				dek,
@@ -2112,6 +2114,43 @@ mod session_refresh_tests {
 		session.recheck().await;
 
 		assert_eq!(session.unauth_reason(), Some("disabled"));
+	}
+}
+
+#[cfg(test)]
+mod unauthenticated_tests {
+	use super::{CacheError, UnauthReason, unauthenticated_error};
+
+	/// The variant and the message each reason answers with. The messages are shipped, so they are
+	/// pinned here word for word.
+	fn answer(reason: &UnauthReason, executor: &str) -> (&'static str, String) {
+		match unauthenticated_error(reason, executor) {
+			CacheError::Disabled(context) => ("Disabled", context.to_string()),
+			CacheError::Unauthenticated(context) => ("Unauthenticated", context.to_string()),
+			other => panic!("an unauthenticated state cannot answer {other:?}"),
+		}
+	}
+
+	#[test]
+	fn each_unauthenticated_reason_names_itself_and_the_executor() {
+		assert_eq!(
+			answer(&UnauthReason::Disabled, "sync_execute_authed"),
+			("Disabled", "Disabled: sync_execute_authed".to_owned())
+		);
+		assert_eq!(
+			answer(&UnauthReason::Unauthenticated, "async_execute_authed_owned"),
+			(
+				"Unauthenticated",
+				"Unauthenticated: async_execute_authed_owned".to_owned()
+			)
+		);
+		assert_eq!(
+			answer(&UnauthReason::Unavailable, "sync_execute_authed_owned"),
+			(
+				"Unauthenticated",
+				"Auth state unavailable: sync_execute_authed_owned".to_owned()
+			)
+		);
 	}
 }
 
