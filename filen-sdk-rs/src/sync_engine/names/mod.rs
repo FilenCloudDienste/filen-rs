@@ -11,7 +11,6 @@
 use std::{
 	borrow::Cow,
 	collections::HashMap,
-	fmt,
 	fs::Metadata,
 	io::{self, ErrorKind},
 	path::{Path, PathBuf},
@@ -19,49 +18,11 @@ use std::{
 
 use unicode_normalization::{UnicodeNormalization, is_nfc, is_nfd};
 
+use crate::io::local_name::{DeviceRejection, windows_rejection};
+
 /// The longest name, in bytes, every file system the engine writes to on Linux and macOS holds
-/// (`NAME_MAX`). Windows counts UTF-16 code units instead (see [`WINDOWS_MAX_UNITS`]).
+/// (`NAME_MAX`). Windows counts UTF-16 code units instead (see [`windows_rejection`]).
 const MAX_NAME_BYTES: usize = 255;
-
-/// The longest name, in UTF-16 code units, NTFS and the Win32 API hold.
-const WINDOWS_MAX_UNITS: usize = 255;
-
-/// The characters Win32 refuses in a name, besides the control characters below U+0020.
-const WINDOWS_FORBIDDEN: [char; 9] = ['<', '>', ':', '"', '/', '\\', '|', '?', '*'];
-
-/// Why this device's file system cannot hold a remote name under its exact spelling.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum DeviceRejection {
-	/// Longer than the file system holds: `len` bytes, or UTF-16 code units on Windows, of at most
-	/// `max`.
-	TooLong { len: usize, max: usize },
-	/// A character Windows refuses in a name.
-	ForbiddenChar(char),
-	/// A trailing dot or space, which Win32 strips, so the item would land under another name, and
-	/// on top of the item already holding that one.
-	TrailingDotOrSpace,
-	/// A name Windows reserves for a device (`CON`, `NUL`, `COM1`, ... with or without an
-	/// extension), which opens the device instead of a file.
-	ReservedName,
-}
-
-impl fmt::Display for DeviceRejection {
-	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-		match self {
-			Self::TooLong { len, max } => write!(
-				f,
-				"the name is {len} long, more than the {max} this device's file system holds"
-			),
-			Self::ForbiddenChar(ch) => {
-				write!(f, "Windows does not allow the character {ch:?} in a name")
-			}
-			Self::TrailingDotOrSpace => f.write_str(
-				"Windows drops a trailing dot or space, so the item would be stored under another name",
-			),
-			Self::ReservedName => f.write_str("Windows reserves the name for a device"),
-		}
-	}
-}
 
 /// Why this device's file system cannot hold `name` (an NFC remote name, as the view keys it) under
 /// that exact spelling, or `None` when it can.
@@ -84,67 +45,6 @@ fn posix_rejection(name: &str) -> Option<DeviceRejection> {
 	(name.len() > MAX_NAME_BYTES).then_some(DeviceRejection::TooLong {
 		len: name.len(),
 		max: MAX_NAME_BYTES,
-	})
-}
-
-/// [`device_rejection`] on Windows: the length, the forbidden characters, a trailing dot or space,
-/// and the device names. Compiled on every host, so its rules are tested everywhere. Allocates
-/// nothing: the view asks it of every name it places, and of every directory above one.
-fn windows_rejection(name: &str) -> Option<DeviceRejection> {
-	// A UTF-16 unit never takes fewer than one UTF-8 byte, so only a name past the limit in bytes
-	// is counted.
-	if name.len() > WINDOWS_MAX_UNITS {
-		let units = name.encode_utf16().count();
-		if units > WINDOWS_MAX_UNITS {
-			return Some(DeviceRejection::TooLong {
-				len: units,
-				max: WINDOWS_MAX_UNITS,
-			});
-		}
-	}
-	if let Some(ch) = name
-		.chars()
-		.find(|ch| *ch < ' ' || WINDOWS_FORBIDDEN.contains(ch))
-	{
-		return Some(DeviceRejection::ForbiddenChar(ch));
-	}
-	if name.ends_with(['.', ' ']) {
-		return Some(DeviceRejection::TrailingDotOrSpace);
-	}
-	is_windows_device(name).then_some(DeviceRejection::ReservedName)
-}
-
-/// The names Win32 opens a device for, besides `COM` and `LPT` with a digit.
-const WINDOWS_DEVICES: [&str; 6] = ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"];
-
-/// The digits that make `COM` and `LPT` a device name: 0 to 9 and the superscripts 1 to 3.
-const WINDOWS_PORT_DIGITS: [&str; 13] = [
-	"0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "\u{B9}", "\u{B2}", "\u{B3}",
-];
-
-/// Whether Win32 opens a device for `name`: its part before the first dot, trailing spaces dropped,
-/// is a device name in any case. `CON.txt` and `nul.tar.gz` are devices too, unlike what the name
-/// validator checks; Windows 11 stopped reserving some of these with an extension, and refusing them
-/// costs nothing but a pull that could not happen on older Windows.
-fn is_windows_device(name: &str) -> bool {
-	let stem = name
-		.split_once('.')
-		.map_or(name, |(stem, _)| stem)
-		.trim_end_matches(' ');
-	// Three to seven bytes: `CON` to `CONOUT$`, and `COM` with a two-byte superscript digit.
-	if !(3..=7).contains(&stem.len()) {
-		return false;
-	}
-	if WINDOWS_DEVICES
-		.iter()
-		.any(|device| stem.eq_ignore_ascii_case(device))
-	{
-		return true;
-	}
-	// `split_at_checked` refuses a cut inside a character, which no ASCII prefix ends in.
-	stem.split_at_checked(3).is_some_and(|(prefix, digit)| {
-		(prefix.eq_ignore_ascii_case("COM") || prefix.eq_ignore_ascii_case("LPT"))
-			&& WINDOWS_PORT_DIGITS.contains(&digit)
 	})
 }
 
