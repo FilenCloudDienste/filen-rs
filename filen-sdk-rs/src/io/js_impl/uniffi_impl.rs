@@ -1,31 +1,20 @@
-use std::{borrow::Cow, path::PathBuf, sync::Arc};
+use std::{path::PathBuf, sync::Arc};
 
 use crate::{
 	Error,
 	auth::{JsClient, js_impls::UnauthJsClient},
-	error::FilenSdkError,
-	fs::{
-		categories::{Category, Linked, NonRootItemType, Normal, Shared, fs::CategoryFS},
-		file::enums::RemoteFileType,
-	},
-	io::{
-		DirDownloadCallback, client_impl::IoSharedClientExt,
-		dir_download::CategoryDirDownloadExtPub,
-	},
+	fs::categories::{Category, NonRootItemType, fs::CategoryFS},
+	io::{DirDownloadCallback, RemoteDirectory, RemoteFile, client_impl::IoSharedClientExt},
 	js::{
-		AnyDirWithContext, AnyFile, Dir, DirByCategoryWithContext, DirWithPath, File,
-		FileBuilderParamsOptionalName, FileWithPath, LinkedFile, NonRootDir, NonRootItem,
+		AnyDirWithContext, AnyFile, Dir, DirWithPath, File, FileBuilderParamsOptionalName,
+		FileWithPath, LinkedFile, ManagedFuture, NonRootDir, NonRootItem,
 	},
 	util::MaybeSendCallback,
 };
 
-#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
-pub struct UploadError {
-	pub path: String,
-	pub error: Arc<FilenSdkError>,
-}
+use super::{DownloadError, UploadError};
 
-#[cfg_attr(feature = "uniffi", uniffi::export(with_foreign))]
+#[uniffi::export(with_foreign)]
 pub trait JsDirUploadCallback: Send + Sync {
 	fn on_scan_progress(&self, known_dirs: u64, known_files: u64, known_bytes: u64);
 	fn on_scan_errors(&self, errors: Vec<Arc<Error>>);
@@ -76,8 +65,8 @@ impl crate::io::DirUploadCallback for Arc<dyn JsDirUploadCallback> {
 
 	fn on_upload_update(
 		&self,
-		uploaded_dirs: Vec<super::RemoteDirectory>,
-		uploaded_files: Vec<super::RemoteFile>,
+		uploaded_dirs: Vec<RemoteDirectory>,
+		uploaded_files: Vec<RemoteFile>,
 		uploaded_bytes: u64,
 	) {
 		let this = self.clone();
@@ -91,7 +80,7 @@ impl crate::io::DirUploadCallback for Arc<dyn JsDirUploadCallback> {
 		});
 	}
 
-	fn on_upload_errors(&self, errors: Vec<(std::path::PathBuf, Error)>) {
+	fn on_upload_errors(&self, errors: Vec<(PathBuf, Error)>) {
 		let this = self.clone();
 		tokio::task::spawn_blocking(move || {
 			JsDirUploadCallback::on_upload_errors(
@@ -108,14 +97,7 @@ impl crate::io::DirUploadCallback for Arc<dyn JsDirUploadCallback> {
 	}
 }
 
-#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
-pub struct DownloadError {
-	pub error: Arc<Error>,
-	pub path: String,
-	pub item: NonRootItem,
-}
-
-#[cfg_attr(feature = "uniffi", uniffi::export(with_foreign))]
+#[uniffi::export(with_foreign)]
 pub trait JsDirDownloadCallback: Send + Sync {
 	/// Called periodically while /dir/download is listing the directory contents
 	fn on_query_download_progress(&self, known_bytes: u64, total_bytes: Option<u64>);
@@ -237,7 +219,7 @@ where
 	}
 }
 
-#[cfg_attr(feature = "uniffi", uniffi::export(with_foreign))]
+#[uniffi::export(with_foreign)]
 pub trait JsFileDownloadCallback: Send + Sync {
 	/// `downloaded_bytes` is a **delta** — the number of plaintext bytes downloaded *since the
 	/// previous call*, not a running total. Accumulate the values to obtain overall progress
@@ -249,7 +231,7 @@ pub trait JsFileDownloadCallback: Send + Sync {
 	fn on_update(&self, downloaded_bytes: u64);
 }
 
-#[cfg_attr(feature = "uniffi", uniffi::export(with_foreign))]
+#[uniffi::export(with_foreign)]
 pub trait JsFileUploadCallback: Send + Sync {
 	/// `uploaded_bytes` is a **delta** — the number of plaintext bytes uploaded *since the
 	/// previous call*, not a running total. Accumulate the values to obtain overall progress
@@ -261,22 +243,29 @@ pub trait JsFileUploadCallback: Send + Sync {
 	fn on_update(&self, uploaded_bytes: u64);
 }
 
-#[cfg_attr(feature = "uniffi", uniffi::export)]
+/// The progress callback of a file download, calling `callback` off the runtime's threads.
+fn download_progress(callback: Arc<dyn JsFileDownloadCallback>) -> MaybeSendCallback<'static, u64> {
+	Arc::new(move |downloaded_bytes| {
+		let inner_cb = Arc::clone(&callback);
+		tokio::task::spawn_blocking(move || {
+			JsFileDownloadCallback::on_update(inner_cb.as_ref(), downloaded_bytes);
+		});
+	})
+}
+
+#[uniffi::export]
 impl JsClient {
 	pub async fn upload_dir_recursively(
 		&self,
 		dir_path: String,
 		callback: Arc<dyn JsDirUploadCallback>,
 		target: Dir,
-		managed_future: crate::js::ManagedFuture,
+		managed_future: ManagedFuture,
 	) -> Result<(), Error> {
 		let this = self.inner();
 		managed_future
 			.into_js_managed_commander_future(move || async move {
-				let target = target.into();
-				let dir_path = PathBuf::from(dir_path);
-				this.upload_dir_recursively(dir_path, &callback, &target)
-					.await
+				super::upload_dir(this, dir_path, target, &callback).await
 			})
 			.await
 	}
@@ -286,44 +275,13 @@ impl JsClient {
 		dir_path: String,
 		callback: Arc<dyn JsDirDownloadCallback>,
 		target: AnyDirWithContext,
-		managed_future: crate::js::ManagedFuture,
+		managed_future: ManagedFuture,
 	) -> Result<(), Error> {
 		let this = self.inner();
 		managed_future
 			.into_js_managed_commander_future(move || async move {
-				let dir_by_category = DirByCategoryWithContext::from(target);
-				match dir_by_category {
-					DirByCategoryWithContext::Normal(dir) => {
-						Normal::download_dir_recursively(
-							this,
-							dir_path,
-							&DownloadCallbackWrapper(callback),
-							dir,
-							(),
-						)
-						.await
-					}
-					DirByCategoryWithContext::Shared(dir, sharing_role) => {
-						Shared::download_dir_recursively(
-							this,
-							dir_path,
-							&DownloadCallbackWrapper(callback),
-							dir,
-							&sharing_role,
-						)
-						.await
-					}
-					DirByCategoryWithContext::Linked(dir, public_link) => {
-						Linked::download_dir_recursively(
-							Arc::new(this.get_unauthed()),
-							dir_path,
-							&DownloadCallbackWrapper(callback),
-							dir,
-							Cow::Owned(public_link.try_into()?),
-						)
-						.await
-					}
-				}
+				super::download_dir(this, dir_path, target, &DownloadCallbackWrapper(callback))
+					.await
 			})
 			.await
 	}
@@ -333,24 +291,20 @@ impl JsClient {
 		params: FileBuilderParamsOptionalName,
 		file_path: String,
 		callback: Option<Arc<dyn JsFileUploadCallback>>,
-		managed_future: crate::js::ManagedFuture,
+		managed_future: ManagedFuture,
 	) -> Result<File, Error> {
 		let this = self.inner();
 		managed_future
 			.into_js_managed_commander_future(move || async move {
-				let callback = callback.as_ref().map(|cb| {
-					Arc::new(|downloaded_bytes| {
-						let inner_cb = Arc::clone(cb);
+				let callback = callback.map(|cb| {
+					Arc::new(move |uploaded_bytes| {
+						let inner_cb = Arc::clone(&cb);
 						tokio::task::spawn_blocking(move || {
-							JsFileUploadCallback::on_update(inner_cb.as_ref(), downloaded_bytes);
+							JsFileUploadCallback::on_update(inner_cb.as_ref(), uploaded_bytes);
 						});
-					}) as MaybeSendCallback<u64>
+					}) as MaybeSendCallback<'static, u64>
 				});
-
-				let file_path = PathBuf::from(file_path);
-				this.upload_file_from_path_with_builder(params.try_into()?, file_path, callback)
-					.await
-					.map(|(file, _)| File::from(file))
+				super::upload_file(this, params, file_path, callback).await
 			})
 			.await
 	}
@@ -360,28 +314,13 @@ impl JsClient {
 		file: AnyFile,
 		file_path: String,
 		callback: Option<Arc<dyn JsFileDownloadCallback>>,
-		managed_future: crate::js::ManagedFuture,
+		managed_future: ManagedFuture,
 	) -> Result<(), Error> {
 		let this = self.inner();
 		managed_future
 			.into_js_managed_commander_future(move || async move {
-				let callback = callback.as_ref().map(|cb| {
-					Arc::new(|downloaded_bytes| {
-						let inner_cb = Arc::clone(cb);
-						tokio::task::spawn_blocking(move || {
-							JsFileDownloadCallback::on_update(inner_cb.as_ref(), downloaded_bytes);
-						});
-					}) as MaybeSendCallback<u64>
-				});
-
-				let file: RemoteFileType = file.try_into()?;
-				super::client_impl::IoSharedClientExt::download_file_to_path(
-					this.as_ref(),
-					&file,
-					file_path.as_ref(),
-					callback,
-				)
-				.await
+				super::download_file_to_path(this, file, file_path, callback.map(download_progress))
+					.await
 			})
 			.await
 	}
@@ -403,30 +342,25 @@ impl PathToStringExt for PathBuf {
 	}
 }
 
-#[cfg_attr(feature = "uniffi", uniffi::export)]
+#[uniffi::export]
 impl UnauthJsClient {
 	pub async fn download_file_to_path(
 		&self,
 		file: LinkedFile,
 		file_path: String,
 		callback: Option<Arc<dyn JsFileDownloadCallback>>,
-		managed_future: crate::js::ManagedFuture,
+		managed_future: ManagedFuture,
 	) -> Result<(), Error> {
 		let this = self.inner();
 		managed_future
 			.into_js_managed_commander_future(move || async move {
-				let callback = callback.as_ref().map(|cb| {
-					Arc::new(|downloaded_bytes| {
-						let inner_cb = Arc::clone(cb);
-						tokio::task::spawn_blocking(move || {
-							JsFileDownloadCallback::on_update(inner_cb.as_ref(), downloaded_bytes);
-						});
-					}) as MaybeSendCallback<u64>
-				});
-
 				let file: crate::fs::file::LinkedFile = file.try_into()?;
-				this.download_file_to_path(&file, file_path.as_ref(), callback)
-					.await
+				this.download_file_to_path(
+					&file,
+					file_path.as_ref(),
+					callback.map(download_progress),
+				)
+				.await
 			})
 			.await
 	}
