@@ -6,6 +6,8 @@
 //! value here is a plain JS `Error` carrying those properties, and `FilenSdkError` is a plain
 //! class holding the Rust error, with the methods and statics ubrn's has.
 
+use std::sync::Arc;
+
 use napi::{
 	Env, JsValue, ValueType,
 	bindgen_prelude::{
@@ -21,8 +23,10 @@ use crate::{Error, ErrorKind};
 const THROWN_OBJECT: &str = "UniffiThrownObject";
 
 /// Custom error type for the SDK
+// An `Arc`, as uniffi holds an error: a record carrying an error shares it with whoever else
+// holds it, such as the report it was taken from.
 #[napi(js_name = "FilenSdkError")]
-pub(crate) struct FilenSdkErrorNapi(Error);
+pub(crate) struct FilenSdkErrorNapi(Arc<Error>);
 
 #[napi]
 impl FilenSdkErrorNapi {
@@ -174,6 +178,18 @@ impl FilenSdkErrorNapi {
 	}
 }
 
+#[deny(unsafe_code)]
+impl Wire for Arc<Error> {
+	type Wire = FilenSdkErrorNapi;
+}
+
+#[deny(unsafe_code)]
+impl IntoWire for Arc<Error> {
+	fn into_wire(self) -> FilenSdkErrorNapi {
+		FilenSdkErrorNapi(self)
+	}
+}
+
 // The helpers below are plain Rust, so they stay under the workspace's `unsafe_code` deny, which
 // `js` lifts for this module only for napi-derive's glue.
 
@@ -192,7 +208,7 @@ pub(crate) fn throw(env: &Env, err: Error) -> napi::Error {
 #[deny(unsafe_code)]
 fn thrown_object(env: &Env, message: &str, err: Error) -> napi::Result<napi::Error> {
 	let mut thrown = plain_error(env, message)?;
-	thrown.set_named_property("inner", FilenSdkErrorNapi(err))?;
+	thrown.set_named_property("inner", Arc::new(err).into_wire())?;
 	thrown.set_named_property("__baseTypeName", THROWN_OBJECT)?;
 	Ok(napi::Error::from(thrown.to_unknown()))
 }
@@ -204,4 +220,24 @@ pub(super) fn plain_error<'env>(env: &'env Env, message: &str) -> napi::Result<O
 	let mut error = env.create_error(napi::Error::from_reason(message))?;
 	error.delete_named_property("code")?;
 	Ok(error)
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	type ErrorKindWire = <ErrorKind as Wire>::Wire;
+
+	#[test]
+	fn an_arc_error_keeps_its_kind_and_message_on_the_wire() {
+		let err = Arc::new(Error::custom(ErrorKind::Conversion, "not a uuid"));
+		let wire = Arc::clone(&err).into_wire();
+		assert!(Arc::ptr_eq(&wire.0, &err));
+		assert!(matches!(wire.kind(), ErrorKindWire::Conversion));
+		assert_eq!(
+			wire.message(),
+			"Error of kind Conversion: context: not a uuid"
+		);
+		assert!(matches!(wire.inner_message(), Either::B(())));
+	}
 }
