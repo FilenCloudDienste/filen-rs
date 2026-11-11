@@ -3774,6 +3774,21 @@ mod tests {
 	use chrono::TimeZone as _;
 	use filen_sdk_rs::fs::copy::SkippedEntry;
 
+	#[test]
+	fn changes_kept_after_an_unexpected_error_are_a_failure() {
+		let err = kept_changes(
+			anyhow::anyhow!("connection reset"),
+			Path::new("/tmp/edit/a.txt"),
+		);
+
+		assert!(matches!(find_cli_error(&err), Some(CliError::Failure(_))));
+		assert_eq!(crate::error::exit_code(&err), 1);
+		assert_eq!(
+			format!("{err:#}"),
+			"Your changes were not uploaded and are kept at /tmp/edit/a.txt: connection reset"
+		);
+	}
+
 	/// What `head -n lines` prints of a file read in `chunks`, and how many chunks it read.
 	fn head_of(chunks: &[&[u8]], lines: usize) -> (Vec<u8>, usize) {
 		let mut head = HeadLines::new(lines);

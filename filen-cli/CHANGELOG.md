@@ -172,6 +172,7 @@ Breaking changes are marked **Breaking**: scripts that depend on the old behavio
 
 ### Fixed
 
+- `edit` reports that it kept the changes it could not upload as a failure, not as an unexpected error asking for a bug report
 - prompt login with two-factor authentication masks the code and keeps the spaces around a prompted password
 - `mv x /new/` and `mkdir -r /x/y/` no longer panic
 - `cp` no longer silently replaces or merges into an item of the same name

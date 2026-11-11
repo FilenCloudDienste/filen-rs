@@ -80,10 +80,15 @@ impl Error for CliError {
 	}
 }
 
-/// The [`CliError`] in `err`'s chain, if any: the outermost one, should there be several.
+/// The [`CliError`] in `err`'s chain, if any: one given as context first, then the outermost
+/// cause, should there be several.
 pub(crate) fn find_cli_error(err: &anyhow::Error) -> Option<&CliError> {
-	err.chain()
-		.find_map(|cause| cause.downcast_ref::<CliError>())
+	// A context value is no link of the chain: `chain` gives its message, not the value, which
+	// only `anyhow::Error::downcast_ref` sees.
+	err.downcast_ref::<CliError>().or_else(|| {
+		err.chain()
+			.find_map(|cause| cause.downcast_ref::<CliError>())
+	})
 }
 
 /// The exit code the CLI exits with after `err`.
@@ -109,6 +114,22 @@ mod tests {
 		assert!(matches!(cli_error, CliError::Failure(msg) if msg == "No such file: /a"));
 		assert_eq!(exit_code(&err), 1);
 		assert_eq!(format!("{err:#}"), "Failed to copy: No such file: /a");
+	}
+
+	#[test]
+	fn a_failure_given_as_context_is_a_failure() {
+		let err = anyhow::anyhow!("connection reset").context(CliError::Failure(
+			"Your changes are kept at /tmp/a".to_owned(),
+		));
+
+		let cli_error = find_cli_error(&err).unwrap();
+		assert!(
+			matches!(cli_error, CliError::Failure(msg) if msg == "Your changes are kept at /tmp/a")
+		);
+		assert_eq!(
+			format!("{err:#}"),
+			"Your changes are kept at /tmp/a: connection reset"
+		);
 	}
 
 	#[test]
