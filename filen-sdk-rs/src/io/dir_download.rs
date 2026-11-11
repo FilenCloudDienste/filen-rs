@@ -194,7 +194,9 @@ pub(crate) trait CategoryDirDownloadExt: CategoryFSExt {
 			for (entry, path) in iter.canonicalize()? {
 				// A remote name that is not a safe single path component (`..`,
 				// absolute, separator-bearing) is rejected while building the
-				// path, so it cannot escape the download root. Skip the entry;
+				// path, so it cannot escape the download root, and so, on
+				// Windows, is one Windows cannot hold under its exact spelling
+				// (`CON`, `ab:c`, a trailing dot). Skip the entry;
 				// every descendant of an unsafe directory shares the rejected
 				// component and is skipped the same way, quarantining the whole
 				// subtree.

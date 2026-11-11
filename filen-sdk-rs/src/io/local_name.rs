@@ -46,7 +46,8 @@ impl fmt::Display for DeviceRejection {
 /// Why Windows cannot hold `name` under that exact spelling, or `None` when it can: the length, the
 /// forbidden characters, a trailing dot or space, and the device names. Compiled on every host, so
 /// its rules are tested everywhere. Allocates nothing: the sync engine asks it of every name it
-/// places, and of every directory above one.
+/// places, and of every directory above one, and a directory download on Windows of every name it
+/// joins.
 pub(crate) fn windows_rejection(name: &str) -> Option<DeviceRejection> {
 	// A UTF-16 unit never takes fewer than one UTF-8 byte, so only a name past the limit in bytes
 	// is counted.

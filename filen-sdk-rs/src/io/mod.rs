@@ -10,7 +10,7 @@ pub(crate) mod filter;
 pub(crate) mod fs_tree;
 #[cfg(feature = "uniffi")]
 mod js_impl;
-#[cfg(feature = "sync-engine")]
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 pub(crate) mod local_name;
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 mod meta_ext;

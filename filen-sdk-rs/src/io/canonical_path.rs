@@ -1,5 +1,7 @@
 use std::path::{Component, Path, PathBuf};
 
+use crate::io::local_name::windows_rejection;
+
 /// Returns `true` only if `name` is a single, non-traversing path component that
 /// is safe to join onto a confined root: it must be a lone `Normal` component —
 /// never empty, `.`, `..`, separator-bearing, absolute, or otherwise rooted.
@@ -13,6 +15,15 @@ pub fn is_safe_descendant(name: &str) -> bool {
 		(components.next(), components.next()),
 		(Some(Component::Normal(c)), None) if c == name
 	)
+}
+
+/// Whether `name` may be joined onto a download root: [`is_safe_descendant`], and with `windows`,
+/// also a name Windows holds under its exact spelling. Windows opens a device for `CON` or
+/// `nul.txt`, writes `ab:c` to the stream `c` of the file `ab`, and drops a trailing dot or space,
+/// so such a name would land somewhere other than the entry it names. Takes the OS as a parameter
+/// so its rules are tested on every host.
+fn descendant_allowed(name: &str, windows: bool) -> bool {
+	is_safe_descendant(name) && !(windows && windows_rejection(name).is_some())
 }
 
 #[derive(Clone)]
@@ -44,8 +55,10 @@ impl CanonicalPath {
 	/// pushed: a name of `..`, `/etc/x`, or one containing a path separator
 	/// would otherwise escape the root, because [`PathBuf::push`] treats an
 	/// absolute component as *replacing* the whole path and `..` as a real
-	/// parent hop. An unsafe component is rejected outright rather than
-	/// sanitized, so no path outside the root can ever be produced.
+	/// parent hop. On Windows, a name Windows cannot hold under its exact
+	/// spelling (a device name, a `:`, a trailing dot or space) is refused too
+	/// (see [`descendant_allowed`]). An unsafe component is rejected outright
+	/// rather than sanitized, so no path outside the root can ever be produced.
 	pub(crate) fn create_descendant_path<'a>(
 		&'a self,
 		descendants: impl Iterator<Item = &'a str> + Clone,
@@ -58,7 +71,7 @@ impl CanonicalPath {
 		let mut new_path = PathBuf::with_capacity(new_path_len);
 		new_path.push(&self.0);
 		for descendant in descendants {
-			if !is_safe_descendant(descendant) {
+			if !descendant_allowed(descendant, cfg!(windows)) {
 				return Err(std::io::Error::new(
 					std::io::ErrorKind::InvalidInput,
 					format!("refusing to build path with unsafe component {descendant:?}"),
@@ -187,6 +200,63 @@ mod tests {
 			.create_descendant_path(["..evil", "file.txt", "...", "a..b"].iter().copied())
 			.unwrap();
 		assert_eq!(ok.as_ref(), Path::new("/root/..evil/file.txt/.../a..b"));
+	}
+
+	#[test]
+	fn create_descendant_path_refuses_windows_names_only_on_windows() {
+		let cp = make("/root");
+		let result = cp.create_descendant_path(["a", "CON"].iter().copied());
+		assert_eq!(result.is_err(), cfg!(windows));
+	}
+
+	#[test]
+	fn windows_device_names_are_not_allowed_for_windows() {
+		for name in ["CON", "nul.txt", "COM1", "CONIN$", "COM\u{b9}"] {
+			assert!(!descendant_allowed(name, true), "{name:?}");
+		}
+	}
+
+	#[test]
+	fn an_ntfs_stream_name_is_not_allowed_for_windows() {
+		assert!(!descendant_allowed("ab:c", true));
+	}
+
+	#[test]
+	fn a_trailing_dot_or_space_is_not_allowed_for_windows() {
+		assert!(!descendant_allowed("foo.", true));
+		assert!(!descendant_allowed("foo ", true));
+		assert!(descendant_allowed("foo.txt", true));
+	}
+
+	#[test]
+	fn the_same_names_are_allowed_off_windows() {
+		for name in [
+			"CON",
+			"nul.txt",
+			"COM1",
+			"CONIN$",
+			"COM\u{b9}",
+			"ab:c",
+			"foo.",
+			"foo ",
+		] {
+			assert!(descendant_allowed(name, false), "{name:?}");
+		}
+	}
+
+	#[test]
+	fn traversal_is_not_allowed_on_any_os() {
+		for windows in [false, true] {
+			for name in ["..", ".", "", "a/b", "/etc/x"] {
+				assert!(!descendant_allowed(name, windows), "{name:?}");
+			}
+		}
+	}
+
+	#[test]
+	fn is_safe_descendant_still_accepts_con_and_colons() {
+		assert!(is_safe_descendant("CON"));
+		assert!(is_safe_descendant("ab:c"));
 	}
 
 	#[test]

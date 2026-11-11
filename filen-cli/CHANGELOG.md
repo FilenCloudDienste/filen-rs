@@ -183,6 +183,7 @@ Breaking changes are marked **Breaking**: scripts that depend on the old behavio
 - `mv x /new/` and `mkdir -r /x/y/` no longer panic
 - `cp` no longer silently replaces or merges into an item of the same name
 - a directory download no longer counts a local file it kept as downloaded, and its progress reaches 100%
+- a directory download on Windows skips an entry whose name Windows cannot hold (`CON`, `nul.txt`, `ab:c`, a trailing dot or space), as it skips `..`, instead of opening a device, writing an NTFS stream or landing under another name
 - `cat` of a large file no longer asks when no one can answer
 - `head` and `tail` no longer ask before printing from a large file
 - viewing a file public link no longer replaces it
