@@ -980,6 +980,21 @@ impl AuthCacheState {
 		sql::select_object_at_parsed_id(&conn, &id.as_parsed()?)
 	}
 
+	/// The file an FFI id names, as [`AuthCacheState::select_object_by_id`] resolves it:
+	/// [`CacheError::Unsupported`] when the id names another kind of item, and
+	/// [`CacheError::DoesNotExist`] when it names nothing the cache holds.
+	pub(crate) fn select_file_by_id(&self, id: &FfiId) -> Result<DBFile, CacheError> {
+		match self.select_object_by_id(id)? {
+			Some(DBObject::File(file)) => Ok(file),
+			Some(_) => Err(CacheError::Unsupported(
+				format!("Id {id} does not point to a file").into(),
+			)),
+			None => Err(CacheError::DoesNotExist(
+				format!("No item found for id: {id}").into(),
+			)),
+		}
+	}
+
 	/// Replaces a file's content with the bytes at `os_path` (see
 	/// [`FilenMobileCacheState::modify_file_content`]).
 	///
@@ -1005,19 +1020,7 @@ impl AuthCacheState {
 		// Ahead of the marker and the copy, so a call cancelled before it started leaves nothing
 		// of itself behind at all.
 		check_not_aborted(abort.as_ref())?;
-		let mut file = match self.select_object_by_id(&id)? {
-			Some(DBObject::File(file)) => file,
-			Some(_) => {
-				return Err(CacheError::Unsupported(
-					format!("Id {id} does not point to a file").into(),
-				));
-			}
-			None => {
-				return Err(CacheError::DoesNotExist(
-					format!("No item found for id: {id}").into(),
-				));
-			}
-		};
+		let mut file = self.select_file_by_id(&id)?;
 		let DBFileMeta::Decoded(meta) = &file.meta else {
 			return Err(CacheError::remote(format!(
 				"File {} does not have decoded metadata",
