@@ -95,7 +95,7 @@ pub use self::ignore::{
 };
 pub use apply::SyncReport;
 pub use baseline::{PairId, PairRecord};
-pub use changes::FullPassReason;
+pub use changes::{FullPassReason, LocalEventScope, local_event_scope};
 pub use engine::{
 	BaselineInUse, BaselineSchemaMismatch, CONFIRM_TENURE, ConflictResolution, ConflictResolved,
 	PATH_FAILURE_RETRY_INTERVAL, PairOverlap, ResolutionRefused, SyncEngine,
@@ -117,4 +117,10 @@ pub use outcome::{
 };
 pub use pause::{DEFAULT_CANCEL_AFTER, PauseMode, PauseOptions};
 pub use scan::{ScanGap, ScanGapCause};
+// The local watch's timings, for a watcher outside the engine that coalesces the same events; it
+// reads each event as the engine does through `local_event_scope`.
+pub use watch::{
+	DEBOUNCE as WATCH_DEBOUNCE, MAX_DEBOUNCE_BURST as WATCH_MAX_DEBOUNCE_BURST,
+	SAFETY_NET as WATCH_SAFETY_NET, backoff as watch_backoff, net_interval as safety_net_interval,
+};
 pub use watch::{WatchConfig, WatchHandle, WatchState, WatchStatus};

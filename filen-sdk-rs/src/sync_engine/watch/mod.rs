@@ -63,15 +63,15 @@ use crate::{
 };
 
 /// Default quiet window a burst of change events is coalesced over before a sync pass runs.
-const DEBOUNCE: Duration = Duration::from_millis(800);
+pub const DEBOUNCE: Duration = Duration::from_millis(800);
 /// How many debounce windows a burst of change events may hold a pass off for, whether or not it
 /// ever goes quiet. A tree something writes into continuously — a build directory, a log — never
 /// does, and the quiet window alone would hold the pass for as long as the writing lasts.
-const MAX_DEBOUNCE_BURST: u32 = 8;
+pub const MAX_DEBOUNCE_BURST: u32 = 8;
 /// Default FLOOR for the periodic whole-tree pass — the backstop for anything the watchers miss or
 /// coalesce. The interval actually used scales up from here with what such a pass costs this pair
 /// (see [`net_interval`]).
-const SAFETY_NET: Duration = Duration::from_secs(300);
+pub const SAFETY_NET: Duration = Duration::from_secs(300);
 /// How much wall time the safety net leaves between whole-tree passes per unit of time one COSTS:
 /// a 1 % duty cycle, so a pair never spends more than about a hundredth of its life re-reading
 /// itself for a change nothing announced.
@@ -997,7 +997,7 @@ async fn user_ignore_changed(rules: &mut tokio::sync::watch::Receiver<u64>) {
 
 /// How long to wait before the next pass after `failures` consecutive failed ones: nothing while
 /// healthy, then [`BASE_BACKOFF`] doubling per failure, capped at [`MAX_BACKOFF`].
-fn backoff(failures: u32) -> Option<Duration> {
+pub fn backoff(failures: u32) -> Option<Duration> {
 	let doublings = failures.checked_sub(1)?.min(31);
 	Some((BASE_BACKOFF * 2u32.pow(doublings)).min(MAX_BACKOFF))
 }
@@ -1086,7 +1086,7 @@ fn net_due(last_whole_pass: Instant, now: Instant, every: Duration) -> bool {
 ///
 /// A `floor` above the ceiling wins: a caller asking for a slower backstop than 6 h gets it, and
 /// clamping to a max below the min would panic.
-fn net_interval(floor: Duration, cost: Duration) -> Duration {
+pub fn net_interval(floor: Duration, cost: Duration) -> Duration {
 	cost.saturating_mul(SAFETY_NET_DUTY)
 		.clamp(floor, floor.max(MAX_SAFETY_NET))
 }

@@ -308,7 +308,7 @@ impl fmt::Display for FullPassReason {
 /// What one filesystem event means for the local changelist. Pure, so the whole table is testable
 /// without a watcher.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LocalEventScope {
+pub enum LocalEventScope {
 	/// Nothing can be narrowed down any more; the reason says what was lost.
 	Collapse(FullPassReason),
 	/// Re-observe the event's paths.
@@ -323,7 +323,7 @@ enum LocalEventScope {
 /// trusted. Everything that mutates — create, remove, data/metadata/name modify, and the catch-all
 /// kinds every backend falls back to — names paths to re-observe. Only non-mutating access is
 /// dropped, except inotify's `CLOSE_WRITE`, which is how a finished write announces itself.
-fn local_event_scope(event: &Event) -> LocalEventScope {
+pub fn local_event_scope(event: &Event) -> LocalEventScope {
 	if event.need_rescan() {
 		return LocalEventScope::Collapse(FullPassReason::KernelDropped);
 	}
