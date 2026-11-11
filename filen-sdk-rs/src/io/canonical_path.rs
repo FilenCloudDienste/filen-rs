@@ -197,9 +197,18 @@ mod tests {
 	fn create_descendant_path_accepts_names_with_dots_that_are_not_traversal() {
 		let cp = make("/root");
 		let ok = cp
-			.create_descendant_path(["..evil", "file.txt", "...", "a..b"].iter().copied())
+			.create_descendant_path(["..evil", "file.txt", "a..b"].iter().copied())
 			.unwrap();
-		assert_eq!(ok.as_ref(), Path::new("/root/..evil/file.txt/.../a..b"));
+		assert_eq!(ok.as_ref(), Path::new("/root/..evil/file.txt/a..b"));
+	}
+
+	#[test]
+	fn a_name_of_only_dots_is_refused_only_on_windows() {
+		let cp = make("/root");
+		let result = cp.create_descendant_path(["a", "..."].iter().copied());
+		assert_eq!(result.is_err(), cfg!(windows));
+		assert!(descendant_allowed("...", false));
+		assert!(!descendant_allowed("...", true));
 	}
 
 	#[test]
