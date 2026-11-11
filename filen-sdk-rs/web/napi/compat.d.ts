@@ -39,6 +39,9 @@
  * stops one that outlasts that. A JsRcloneDaemon that is garbage-collected kills its rclone; stop
  * is how to stop it gracefully.
  *
+ * napi has no ManagedFuture.create: a managed call takes a plain object, whose abortSignal and
+ * pauseSignal are a ManagedAbortSignal and a PauseSignal or undefined.
+ *
  * This header declares what napi cannot generate from Rust. */
 /* eslint-disable */
 
@@ -54,6 +57,15 @@ export type JsSyncEngineInterface = JsSyncEngine
 export type JsSyncPlanInterface = JsSyncPlan
 export type JsSyncWatchInterface = JsSyncWatch
 export type JsRcloneDaemonInterface = JsRcloneDaemon
+export type PauseSignalInterface = PauseSignal
+export type ManagedAbortControllerInterface = ManagedAbortController
+export type ManagedAbortSignalInterface = ManagedAbortSignal
+
+/** What a managed call can be paused and aborted through. */
+export type ManagedFuture = {
+	abortSignal: ManagedAbortSignalInterface | undefined
+	pauseSignal: PauseSignalInterface | undefined
+}
 
 /**
  * Receives every status-message batch the cache worker emits (see [`CacheStatusMessage`]).

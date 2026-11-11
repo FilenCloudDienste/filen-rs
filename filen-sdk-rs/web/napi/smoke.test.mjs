@@ -34,7 +34,10 @@ const {
 	JsSyncPlan,
 	JsSyncWatch,
 	LogLevel,
+	ManagedAbortController,
+	ManagedAbortSignal,
 	PauseMode,
+	PauseSignal,
 	PlannedNodeKind,
 	RcloneRefusal_Tags,
 	RefuseReason,
@@ -102,7 +105,7 @@ function assertThrownLikeUbrn(e) {
 }
 
 describe("exports", () => {
-	test("are the classes, enums and functions ubrn exposes for login, the cache, the sync engine and rclone", () => {
+	test("are the classes, enums and functions ubrn exposes for login, the cache, the managed futures, the sync engine and rclone", () => {
 		// napi's loader also exports each enum and class under its Rust name where that differs
 		// (the *Napi mirrors, *Tags), and the binding flavor it loaded.
 		assert.deepEqual(Object.keys(sdk).sort(), [
@@ -135,8 +138,11 @@ describe("exports", () => {
 			"JsSyncWatch",
 			"LogLevel",
 			"LogLevelNapi",
+			"ManagedAbortController",
+			"ManagedAbortSignal",
 			"PauseMode",
 			"PauseModeNapi",
+			"PauseSignal",
 			"PlannedActionKindTags",
 			"PlannedActionKind_Tags",
 			"PlannedNodeKind",
@@ -458,6 +464,18 @@ describe("exports", () => {
 		assert.equal(typeof JsClient.prototype.startRcloneDaemon, "function")
 	})
 
+	test("the managed future classes carry ubrn's methods", () => {
+		const methods = cls => {
+			assert.equal(typeof cls, "function")
+			return Object.getOwnPropertyNames(cls.prototype)
+				.filter(name => name !== "constructor")
+				.sort()
+		}
+		assert.deepEqual(methods(PauseSignal), ["isPaused", "pause", "resume"])
+		assert.deepEqual(methods(ManagedAbortController), ["abort", "signal"])
+		assert.deepEqual(methods(ManagedAbortSignal), ["aborted"])
+	})
+
 	test("defaultSyncIgnorePatterns lists the OS clutter", () => {
 		const patterns = sdk.defaultSyncIgnorePatterns()
 		assert.ok(Array.isArray(patterns) && patterns.length > 0)
@@ -469,6 +487,27 @@ describe("exports", () => {
 	test("init and setLogLevel run", () => {
 		sdk.init()
 		sdk.setLogLevel(LogLevel.Warn)
+	})
+})
+
+describe("managed futures", () => {
+	test("a PauseSignal reads back pause and resume", () => {
+		const signal = new PauseSignal()
+		assert.equal(signal.isPaused(), false)
+		signal.pause()
+		assert.equal(signal.isPaused(), true)
+		signal.resume()
+		assert.equal(signal.isPaused(), false)
+	})
+
+	test("a ManagedAbortController's signal reads aborted once aborted", () => {
+		const controller = new ManagedAbortController()
+		const taken = controller.signal()
+		assert.ok(taken instanceof ManagedAbortSignal)
+		assert.equal(taken.aborted(), false)
+		controller.abort()
+		assert.equal(taken.aborted(), true)
+		assert.equal(controller.signal().aborted(), true)
 	})
 })
 

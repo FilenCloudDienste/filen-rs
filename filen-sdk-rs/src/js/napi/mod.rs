@@ -9,9 +9,10 @@
 //! no raw `i64`, `u64` or `f32` (only their wire types).
 
 mod error;
+mod managed;
 // Plain Rust, so back under the workspace's `unsafe_code` deny, which `js` lifts for this module
-// because of the glue napi-derive generates for the `#[napi]` items here and in `error`. The
-// hand-written impls and helpers beside those items carry the deny one by one.
+// because of the glue napi-derive generates for the `#[napi]` items here, in `error` and in
+// `managed`. The hand-written impls and helpers beside those items carry the deny one by one.
 #[deny(unsafe_code)]
 mod promise;
 #[deny(unsafe_code)]
@@ -20,6 +21,7 @@ mod wire;
 use napi_derive::napi;
 
 pub(crate) use error::throw;
+pub(crate) use managed::{ManagedAbortController, ManagedAbortSignal, PauseSignal};
 pub(crate) use promise::spawn_promise;
 pub(crate) use wire::{FromWire, IntoWire, OptionReturn, Wire};
 

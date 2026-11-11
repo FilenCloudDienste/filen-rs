@@ -30,6 +30,7 @@ mod pausable {
 		}
 	}
 
+	#[filen_macros::js_exports]
 	#[cfg_attr(feature = "uniffi", uniffi::export)]
 	impl PauseSignal {
 		#[cfg_attr(feature = "uniffi", uniffi::constructor)]
@@ -38,14 +39,17 @@ mod pausable {
 			Self { sender, receiver }
 		}
 
+		#[napi_export]
 		pub fn is_paused(&self) -> bool {
 			*self.receiver.borrow()
 		}
 
+		#[napi_export]
 		pub fn pause(&self) {
 			let _ = self.sender.send(true);
 		}
 
+		#[napi_export]
 		pub fn resume(&self) {
 			let _ = self.sender.send(false);
 		}
@@ -91,6 +95,7 @@ mod abortable {
 		}
 	}
 
+	#[filen_macros::js_exports]
 	#[cfg_attr(feature = "uniffi", uniffi::export)]
 	impl ManagedAbortController {
 		#[cfg_attr(feature = "uniffi", uniffi::constructor)]
@@ -99,12 +104,14 @@ mod abortable {
 			Self { sender, receiver }
 		}
 
+		#[napi_export]
 		pub fn signal(&self) -> ManagedAbortSignal {
 			ManagedAbortSignal {
 				receiver: self.receiver.clone(),
 			}
 		}
 
+		#[napi_export]
 		pub fn abort(&self) {
 			let _ = self.sender.send(true);
 		}
@@ -116,8 +123,10 @@ mod abortable {
 		receiver: tokio::sync::watch::Receiver<bool>,
 	}
 
+	#[filen_macros::js_exports]
 	#[cfg_attr(feature = "uniffi", uniffi::export)]
 	impl ManagedAbortSignal {
+		#[napi_export]
 		pub fn aborted(&self) -> bool {
 			*self.receiver.borrow()
 		}
