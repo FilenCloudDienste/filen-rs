@@ -105,7 +105,15 @@ fn path_ts(ty: &Type, path: &TypePath, pos: Position) -> syn::Result<String> {
 		("Result", [ok, ..]) if pos == Position::Return => ubrn_ts(ok, Position::Return)?,
 		("Result", _) => return Err(no_rule(ty, "`Result` is only a return type")),
 		("Arc", [inner]) => ubrn_ts(inner, pos)?,
-		(_, []) => upper_camel(&name),
+		// uniffi crosses it as its custom type of that name (filen-types' `crypto`).
+		("MaybeEncrypted", [inner]) if is_str(inner) => "MaybeEncryptedStatic".to_owned(),
+		// `#[js_type]`'s `XTagged` twin is wasm's; on uniffi and napi it is an alias of `X`,
+		// which is the type ubrn prints.
+		(_, []) => upper_camel(
+			name.strip_suffix("Tagged")
+				.filter(|aliased| !aliased.is_empty())
+				.unwrap_or(&name),
+		),
 		_ => return Err(no_rule(ty, "this generic type has no napi rule yet")),
 	})
 }
@@ -129,6 +137,10 @@ fn type_args(segment: &PathSegment) -> Option<Vec<&Type>> {
 
 fn is_u8(ty: &Type) -> bool {
 	matches!(ty, Type::Path(path) if path.qself.is_none() && path.path.is_ident("u8"))
+}
+
+fn is_str(ty: &Type) -> bool {
+	matches!(ty, Type::Path(path) if path.qself.is_none() && path.path.is_ident("str"))
 }
 
 fn no_rule(ty: &Type, why: &str) -> syn::Error {
@@ -359,6 +371,33 @@ mod tests {
 		assert_eq!(
 			ts(syn::parse_quote!(TwoFASecret), Position::Return),
 			"TwoFaSecret"
+		);
+	}
+
+	#[test]
+	fn a_tagged_twin_is_the_type_it_aliases() {
+		assert_eq!(
+			ts(syn::parse_quote!(NonRootDirTagged), Position::Field),
+			"NonRootDir"
+		);
+		assert_eq!(
+			ts(syn::parse_quote!(Vec<NonRootItemTagged>), Position::Field),
+			"Array<NonRootItem>"
+		);
+	}
+
+	#[test]
+	fn a_maybe_encrypted_string_is_uniffis_custom_type() {
+		assert_eq!(
+			ts(
+				syn::parse_quote!(MaybeEncrypted<'static, str>),
+				Position::Field
+			),
+			"MaybeEncryptedStatic"
+		);
+		assert!(
+			error(syn::parse_quote!(MaybeEncrypted<'a, [u8]>), Position::Field)
+				.contains("generic type has no napi rule")
 		);
 	}
 

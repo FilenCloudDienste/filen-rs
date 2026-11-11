@@ -459,6 +459,75 @@ fn a_tuple_variant_carries_its_fields_as_a_tuple_inner() {
 }
 
 #[test]
+fn a_variant_tag_is_the_rust_name_as_uniffi_writes_it() {
+	let item: Item = syn::parse_quote! {
+		pub enum FileMeta {
+			DecryptedUTF8(String),
+			Encrypted(String),
+		}
+	};
+	let tokens = mirror_of(true, true, item);
+	assert!(
+		tokens.contains(&compact(quote! {
+			pub enum FileMetaNapi {
+				DecryptedUTF8 {
+					#[napi(ts_type = "[string]")]
+					inner: (<String as crate::js::napi::Wire>::Wire,),
+				},
+				Encrypted {
+					#[napi(ts_type = "[string]")]
+					inner: (<String as crate::js::napi::Wire>::Wire,),
+				},
+			}
+		})),
+		"{tokens}"
+	);
+	assert!(
+		tokens.contains(&compact(quote! {
+			pub enum FileMetaTags {
+				#[napi(value = "DecryptedUTF8")]
+				DecryptedUtf8,
+				Encrypted,
+			}
+		})),
+		"{tokens}"
+	);
+	assert!(
+		tokens.contains(&compact(quote! {
+			FileMetaNapi::DecryptedUTF8 { inner } => Self::DecryptedUTF8(
+				<String as crate::js::napi::FromWire>::from_wire(inner.0)?,
+			)
+		})),
+		"{tokens}"
+	);
+}
+
+#[test]
+fn an_exported_data_enum_aliases_its_tagged_twin_on_napi_as_on_uniffi() {
+	let item: Item = syn::parse_quote! {
+		pub enum NonRootDir {
+			Normal(Dir),
+		}
+	};
+	let alias = |cfg: TokenStream2| {
+		compact(quote! {
+			#[cfg(#cfg)]
+			pub type NonRootDirTagged = NonRootDir;
+		})
+	};
+	let with = js_type(quote!(export, napi), item.clone());
+	assert!(
+		with.contains(&alias(quote!(any(feature = "uniffi", feature = "napi")))),
+		"{with}"
+	);
+	let without = js_type(quote!(export), item);
+	assert!(
+		without.contains(&alias(quote!(feature = "uniffi"))),
+		"{without}"
+	);
+}
+
+#[test]
 fn a_two_field_tuple_variant_keeps_their_order() {
 	let item: Item = syn::parse_quote! {
 		pub enum Entry {

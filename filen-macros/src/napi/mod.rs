@@ -365,7 +365,7 @@ fn enum_mirror(item: &ItemEnum, directions: Directions) -> syn::Result<TokenStre
 	}
 }
 
-/// The mirror's name for `variant`: ubrn's, which is also the tag napi writes for it.
+/// ubrn's name for `variant`: its key in a numeric enum or an `X_Tags` enum.
 fn variant_mirror_ident(variant: &Variant) -> Ident {
 	Ident::new(
 		&upper_camel(&variant.ident.unraw().to_string()),
@@ -455,9 +455,18 @@ fn data_enum_mirror(item: &ItemEnum, directions: Directions) -> syn::Result<Toke
 	let mut writes = Vec::new();
 	for variant in &item.variants {
 		let ident = &variant.ident;
-		let wire = variant_mirror_ident(variant);
+		let key = variant_mirror_ident(variant);
+		// napi writes a variant's name as its tag, and uniffi tags it with its Rust name, which
+		// ubrn keeps as the value of the `X_Tags` key it cases.
+		let tag = variant.ident.unraw();
 		let attrs = docs(&variant.attrs);
-		tag_variants.push(wire.clone());
+		tag_variants.push(if key == tag {
+			quote!(#key)
+		} else {
+			let value = tag.to_string();
+			quote!(#[napi(value = #value)] #key)
+		});
+		let wire = &tag;
 		match &variant.fields {
 			Fields::Unit => {
 				variants.push(quote!(#(#attrs)* #wire));
@@ -465,8 +474,8 @@ fn data_enum_mirror(item: &ItemEnum, directions: Directions) -> syn::Result<Toke
 				writes.push(quote!(Self::#ident => #mirror::#wire));
 			}
 			Fields::Named(named) => {
-				let payload = format_ident!("{}{}Inner", name.unraw(), wire);
-				let payload_js_name = format!("{js_name}_{wire}_Inner");
+				let payload = format_ident!("{}{}Inner", name.unraw(), key);
+				let payload_js_name = format!("{js_name}_{key}_Inner");
 				let fields = mirror_fields(&named.named, name)?;
 				let defs = fields.iter().map(|field| &field.def);
 				payloads.push(quote! {

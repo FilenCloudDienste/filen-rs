@@ -1433,6 +1433,7 @@ fn js_param_impl(name: &Ident, generics: &Generics, state: &JsTypeState) -> Toke
 }
 
 fn parse_struct(mut item_struct: ItemStruct, state: JsTypeState) -> TokenStream2 {
+	let alias_cfg = tagged_alias_cfg(&state);
 	let js_param = js_param_impl(&item_struct.ident, &item_struct.generics, &state);
 	let from_abi = add_comma_if_needed(state.from_abi);
 
@@ -1547,8 +1548,8 @@ fn parse_struct(mut item_struct: ItemStruct, state: JsTypeState) -> TokenStream2
 					}
 				}
 
-				/// Uniffi alias so downstream code can refer to `{Name}Tagged` on all platforms.
-				#[cfg(feature = "uniffi")]
+				/// Alias off wasm, so downstream code can refer to `{Name}Tagged` on all platforms.
+				#[cfg(#alias_cfg)]
 				#vis type #tagged_name = #name;
 
 
@@ -1627,6 +1628,16 @@ fn parse_struct(mut item_struct: ItemStruct, state: JsTypeState) -> TokenStream2
 	}
 }
 
+/// Where the `XTagged` twin, wasm's own type, is an alias of `X`: on uniffi, and on napi when
+/// the type is mirrored there.
+fn tagged_alias_cfg(state: &JsTypeState) -> TokenStream2 {
+	if state.napi {
+		quote!(any(feature = "uniffi", feature = "napi"))
+	} else {
+		quote!(feature = "uniffi")
+	}
+}
+
 /// Returns true if every variant of the enum is a fieldless (unit) variant.
 fn is_fieldless_enum(item_enum: &ItemEnum) -> bool {
 	!item_enum.variants.is_empty()
@@ -1651,6 +1662,7 @@ fn default_enum_serde_repr(item_enum: &ItemEnum) -> proc_macro2::TokenStream {
 }
 
 fn enum_tokens(mut item_enum: ItemEnum, state: JsTypeState) -> TokenStream2 {
+	let alias_cfg = tagged_alias_cfg(&state);
 	let js_param = js_param_impl(&item_enum.ident, &item_enum.generics, &state);
 	let name = &item_enum.ident;
 	let vis = &item_enum.vis;
@@ -1772,7 +1784,7 @@ fn enum_tokens(mut item_enum: ItemEnum, state: JsTypeState) -> TokenStream2 {
 						}
 					}
 
-					#[cfg(feature = "uniffi")]
+					#[cfg(#alias_cfg)]
 					#vis type #tagged_name = #name;
 				},
 				quote! {
