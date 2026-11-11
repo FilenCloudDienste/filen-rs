@@ -7,13 +7,14 @@
 //! cross-item name resolution are never relied on.
 //!
 //! Generated code names `::napi`, `::napi_derive` and the wire layer in `crate::js::napi`
-//! (`Wire`, `FromWire`, `IntoWire`, `OptionReturn`, `throw`, `spawn_promise`), and sits behind
-//! `#[cfg(feature = "napi")]`.
+//! (`Wire`, `FromWire`, `IntoWire`, `OptionReturn`, `throw`, `spawn_promise`, `bytes`), and sits
+//! behind `#[cfg(feature = "napi")]`.
 //!
 //! Wire types are written syntactically around a leaf: an `Option<T>` is
 //! `Option<<T as Wire>::Wire>`, a `Vec<T>` is `Vec<<T as Wire>::Wire>`, never
 //! `<Option<T> as Wire>::Wire`, because napi-derive tells an optional object field by the literal
-//! `Option` segment of its type.
+//! `Option` segment of its type. A `Vec<u8>` is the leaf `crate::js::napi::bytes::Bytes`, read and
+//! written by `bytes::read` and `bytes::write`: a `Wire` impl for it would overlap `Vec<T>`'s.
 
 #[cfg(test)]
 mod tests;
@@ -299,9 +300,8 @@ fn struct_mirror(item: &ItemStruct, directions: Directions) -> syn::Result<Token
 
 	let from_wire = directions.import.then(|| {
 		let reads = fields.iter().map(|MirrorField { ident, ty, .. }| {
-			quote! {
-				#ident: <#ty as crate::js::napi::FromWire>::from_wire(wire.#ident)?
-			}
+			let read = read_wire(ty, quote!(wire.#ident));
+			quote!(#ident: #read)
 		});
 		quote! {
 			impl crate::js::napi::FromWire for #name {
@@ -313,9 +313,8 @@ fn struct_mirror(item: &ItemStruct, directions: Directions) -> syn::Result<Token
 	});
 	let into_wire = directions.export.then(|| {
 		let writes = fields.iter().map(|MirrorField { ident, ty, .. }| {
-			quote! {
-				#ident: <#ty as crate::js::napi::IntoWire>::into_wire(self.#ident)
-			}
+			let write = write_wire(ty, quote!(self.#ident));
+			quote!(#ident: #write)
 		});
 		quote! {
 			impl crate::js::napi::IntoWire for #name {
@@ -437,7 +436,9 @@ fn flat_enum_mirror(item: &ItemEnum, directions: Directions) -> TokenStream2 {
 ///
 /// napi cannot inline a variant's payload type (it refuses `skip_typescript` on an object), so
 /// each struct variant's `inner` is an exported `X_V_Inner` object, which TypeScript compares
-/// with ubrn's inline `Readonly<{ .. }>` structurally.
+/// with ubrn's inline `Readonly<{ .. }>` structurally. A tuple variant's `inner` is a Rust tuple,
+/// which napi reads and writes as an array, typed as the tuple ubrn prints in its
+/// `Readonly<[..]>`.
 fn data_enum_mirror(item: &ItemEnum, directions: Directions) -> syn::Result<TokenStream2> {
 	let name = &item.ident;
 	let mirror = format_ident!("{}Napi", name.unraw());
@@ -482,9 +483,8 @@ fn data_enum_mirror(item: &ItemEnum, directions: Directions) -> syn::Result<Toke
 					}
 				});
 				let field_reads = fields.iter().map(|MirrorField { ident, ty, .. }| {
-					quote! {
-						#ident: <#ty as crate::js::napi::FromWire>::from_wire(inner.#ident)?
-					}
+					let read = read_wire(ty, quote!(inner.#ident));
+					quote!(#ident: #read)
 				});
 				reads.push(quote! {
 					#mirror::#wire { inner } => Self::#ident { #(#field_reads,)* }
@@ -493,9 +493,8 @@ fn data_enum_mirror(item: &ItemEnum, directions: Directions) -> syn::Result<Toke
 					.iter()
 					.map(|MirrorField { ident, .. }| quote!(#ident));
 				let field_writes = fields.iter().map(|MirrorField { ident, ty, .. }| {
-					quote! {
-						#ident: <#ty as crate::js::napi::IntoWire>::into_wire(#ident)
-					}
+					let write = write_wire(ty, quote!(#ident));
+					quote!(#ident: #write)
 				});
 				writes.push(quote! {
 					Self::#ident { #(#bindings,)* } => #mirror::#wire {
@@ -503,11 +502,51 @@ fn data_enum_mirror(item: &ItemEnum, directions: Directions) -> syn::Result<Toke
 					}
 				});
 			}
-			Fields::Unnamed(_) => {
-				return Err(syn::Error::new_spanned(
-					variant,
-					"tuple variants have no napi rule yet (ubrn prints `inner: Readonly<[..]>`)",
-				));
+			Fields::Unnamed(unnamed) => {
+				let elems: Vec<Type> = unnamed
+					.unnamed
+					.iter()
+					.map(|field| rebased(&field.ty, name))
+					.collect();
+				let mut elem_ts = Vec::new();
+				for elem in &elems {
+					if first_type_arg(elem, "Option").is_some() {
+						return Err(syn::Error::new_spanned(
+							elem,
+							"an `Option` in a tuple variant has no napi rule yet: napi writes its \
+							 `None` as null, ubrn types it as undefined",
+						));
+					}
+					elem_ts.push(ubrn_ts(elem, Position::Field)?);
+				}
+				let ts_type = format!("[{}]", elem_ts.join(", "));
+				let wires = elems.iter().map(wire_type);
+				variants.push(quote! {
+					#(#attrs)*
+					#wire {
+						#[napi(ts_type = #ts_type)]
+						inner: (#(#wires,)*),
+					}
+				});
+				let elem_reads = elems.iter().enumerate().map(|(i, ty)| {
+					let index = syn::Index::from(i);
+					read_wire(ty, quote!(inner.#index))
+				});
+				reads.push(quote! {
+					#mirror::#wire { inner } => Self::#ident(#(#elem_reads,)*)
+				});
+				let bindings: Vec<Ident> = (0..elems.len())
+					.map(|i| format_ident!("field_{i}"))
+					.collect();
+				let elem_writes = elems
+					.iter()
+					.zip(&bindings)
+					.map(|(ty, binding)| write_wire(ty, quote!(#binding)));
+				writes.push(quote! {
+					Self::#ident(#(#bindings,)*) => #mirror::#wire {
+						inner: (#(#elem_writes,)*),
+					}
+				});
 			}
 		}
 	}
@@ -558,6 +597,9 @@ fn data_enum_mirror(item: &ItemEnum, directions: Directions) -> syn::Result<Toke
 
 /// `ty`'s wire type: `Option` and `Vec` written out around the leaf's `Wire` type.
 fn wire_type(ty: &Type) -> TokenStream2 {
+	if is_bytes(ty) {
+		return quote!(crate::js::napi::bytes::Bytes);
+	}
 	if let Type::Path(path) = ty
 		&& path.qself.is_none()
 		&& let Some(last) = path.path.segments.last()
@@ -573,6 +615,30 @@ fn wire_type(ty: &Type) -> TokenStream2 {
 		}
 	}
 	quote!(<#ty as crate::js::napi::Wire>::Wire)
+}
+
+/// Whether `ty` is a `Vec<u8>`, which crosses as `crate::js::napi::bytes::Bytes`.
+fn is_bytes(ty: &Type) -> bool {
+	first_type_arg(ty, "Vec")
+		.is_some_and(|inner| matches!(inner, Type::Path(path) if path.path.is_ident("u8")))
+}
+
+/// Reads `wire`, a `ty`'s wire value, as a `ty`, in a fn returning `Result<_, crate::Error>`.
+fn read_wire(ty: &Type, wire: TokenStream2) -> TokenStream2 {
+	if is_bytes(ty) {
+		quote!(crate::js::napi::bytes::read(#wire))
+	} else {
+		quote!(<#ty as crate::js::napi::FromWire>::from_wire(#wire)?)
+	}
+}
+
+/// Writes `value`, a `ty`, as its wire value.
+fn write_wire(ty: &Type, value: TokenStream2) -> TokenStream2 {
+	if is_bytes(ty) {
+		quote!(crate::js::napi::bytes::write(#value))
+	} else {
+		quote!(<#ty as crate::js::napi::IntoWire>::into_wire(#value))
+	}
 }
 
 /// The docs on an item, which napi prints as JSDoc.
@@ -760,12 +826,14 @@ struct Wrapper {
 
 /// The napi method calling `method`.
 ///
-/// Params arrive as their wire types and are read with `FromWire`. A sync method throws a failed
-/// read or its `Err` in ubrn's error shape through `crate::js::napi::throw`. An async method
-/// returns a promise through `crate::js::napi::spawn_promise`, which takes ubrn's trailing
-/// `asyncOpts_` and rejects with the error or an abort; its params are read with `FromWire` inside
-/// that future, so a failed read (a bad uuid, a bigint out of range) rejects, as it does under
-/// ubrn. napi-derive converts each JS argument to its wire type before the wrapper runs, though,
+/// Params arrive as their wire types and are read with `FromWire` (a byte vector is copied out of
+/// its `Uint8Array`), on the JS thread. A sync method throws a failed read or its `Err` in ubrn's
+/// error shape through `crate::js::napi::throw`. An async method returns a promise through
+/// `crate::js::napi::spawn_promise`, which takes ubrn's trailing `asyncOpts_` and rejects with the
+/// error or an abort; its params are read before that future is spawned, so nothing borrowed from
+/// JS (a `Uint8Array`'s memory) enters it, and the future starts by taking each read's `Result`,
+/// so a failed read (a bad uuid, a bigint out of range) rejects, as it does under ubrn.
+/// napi-derive converts each JS argument to its wire type before the wrapper runs, though,
 /// so a JS value of the wrong type (a `number` where a `bigint` belongs, a missing required key)
 /// still throws synchronously from the method, where ubrn's `async` method would reject. A method
 /// without a receiver is a static.
@@ -779,8 +847,12 @@ fn export_wrapper(method: &ImplItemFn, self_ident: &Ident) -> syn::Result<Wrappe
 	let mut aliases = Vec::new();
 	let mut params = Vec::new();
 	let mut param_idents = Vec::new();
-	let mut reads = Vec::new();
-	let mut read_into = Vec::new();
+	// What reads each param: on a sync call; on an async one, before the future is spawned and as
+	// the future starts.
+	let mut sync_reads = Vec::new();
+	let mut spawn_reads = Vec::new();
+	let mut future_reads = Vec::new();
+	let mut fallible_reads = false;
 	let mut args = Vec::new();
 	let mut ts_args = Vec::new();
 	let mut receiver = None;
@@ -817,8 +889,19 @@ fn export_wrapper(method: &ImplItemFn, self_ident: &Ident) -> syn::Result<Wrappe
 		aliases.push((alias.clone(), wire_type(&owned)));
 		params.push(quote!(#ident: #alias));
 		param_idents.push(ident);
-		reads.push(quote!(<#owned as crate::js::napi::FromWire>::from_wire(#ident)));
-		read_into.push(ident);
+		if is_bytes(&owned) {
+			let read = || quote!(let #ident = crate::js::napi::bytes::read(#ident););
+			sync_reads.push(read());
+			spawn_reads.push(read());
+		} else {
+			fallible_reads = true;
+			let read = quote!(<#owned as crate::js::napi::FromWire>::from_wire(#ident));
+			sync_reads.push(quote! {
+				let #ident = #read.map_err(|e| crate::js::napi::throw(env, e))?;
+			});
+			spawn_reads.push(quote!(let #ident = #read;));
+			future_reads.push(quote!(let #ident = #ident?;));
+		}
 		args.push(if lend {
 			quote!(&#ident)
 		} else {
@@ -905,9 +988,10 @@ fn export_wrapper(method: &ImplItemFn, self_ident: &Ident) -> syn::Result<Wrappe
 					#(#params,)*
 					async_opts: ::std::option::Option<::napi::bindgen_prelude::Object<'env>>,
 				) -> #returns {
+					#(#spawn_reads)*
 					#this
 					crate::js::napi::spawn_promise(env, async_opts, async move {
-						#(let #read_into = #reads?;)*
+						#(#future_reads)*
 						#output
 					})
 				}
@@ -932,7 +1016,7 @@ fn export_wrapper(method: &ImplItemFn, self_ident: &Ident) -> syn::Result<Wrappe
 		} else {
 			wrap(call)
 		};
-		let needs_env = fallible || !params.is_empty();
+		let needs_env = fallible || fallible_reads;
 		let env_param = needs_env.then(|| quote!(env: &::napi::Env,));
 		let env_arg = needs_env.then(|| quote!(env,));
 		Ok(Wrapper {
@@ -943,7 +1027,7 @@ fn export_wrapper(method: &ImplItemFn, self_ident: &Ident) -> syn::Result<Wrappe
 					#env_param
 					#(#params,)*
 				) -> ::napi::Result<__NapiReturn> {
-					#(let #read_into = #reads.map_err(|e| crate::js::napi::throw(env, e))?;)*
+					#(#sync_reads)*
 					#this
 					::std::result::Result::Ok(<#ret as crate::js::napi::IntoWire>::into_wire(#value))
 				}

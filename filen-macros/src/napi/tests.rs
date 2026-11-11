@@ -388,14 +388,6 @@ fn a_cfgd_variant_is_kept_only_where_its_cfg_holds() {
 fn shapes_without_a_napi_rule_are_errors() {
 	assert!(
 		mirror_error(syn::parse_quote!(
-			pub enum Role {
-				Sharer(u64),
-			}
-		))
-		.contains("tuple variants have no napi rule")
-	);
-	assert!(
-		mirror_error(syn::parse_quote!(
 			pub enum Code {
 				A = 1,
 			}
@@ -415,6 +407,206 @@ fn shapes_without_a_napi_rule_are_errors() {
 			}
 		))
 		.contains("generic types")
+	);
+}
+
+#[test]
+fn a_tuple_variant_carries_its_fields_as_a_tuple_inner() {
+	let item: Item = syn::parse_quote! {
+		pub enum AnyFile {
+			File(File),
+			Gone,
+		}
+	};
+	let tokens = mirror_of(true, true, item);
+	assert!(
+		tokens.contains(&compact(quote! {
+			pub enum AnyFileNapi {
+				File {
+					#[napi(ts_type = "[File]")]
+					inner: (<File as crate::js::napi::Wire>::Wire,),
+				},
+				Gone,
+			}
+		})),
+		"{tokens}"
+	);
+	assert!(
+		tokens.contains(&compact(quote! {
+			AnyFileNapi::File { inner } => Self::File(
+				<File as crate::js::napi::FromWire>::from_wire(inner.0)?,
+			)
+		})),
+		"{tokens}"
+	);
+	assert!(
+		tokens.contains(&compact(quote! {
+			Self::File(field_0,) => AnyFileNapi::File {
+				inner: (<File as crate::js::napi::IntoWire>::into_wire(field_0),),
+			}
+		})),
+		"{tokens}"
+	);
+	assert!(
+		tokens.contains(&compact(quote! {
+			pub enum AnyFileTags {
+				File,
+				Gone,
+			}
+		})),
+		"{tokens}"
+	);
+}
+
+#[test]
+fn a_two_field_tuple_variant_keeps_their_order() {
+	let item: Item = syn::parse_quote! {
+		pub enum Entry {
+			Named(u64, String),
+		}
+	};
+	let tokens = mirror_of(true, true, item);
+	assert!(
+		tokens.contains(&compact(quote! {
+			Named {
+				#[napi(ts_type = "[bigint, string]")]
+				inner: (
+					<u64 as crate::js::napi::Wire>::Wire,
+					<String as crate::js::napi::Wire>::Wire,
+				),
+			}
+		})),
+		"{tokens}"
+	);
+	assert!(
+		tokens.contains(&compact(quote! {
+			EntryNapi::Named { inner } => Self::Named(
+				<u64 as crate::js::napi::FromWire>::from_wire(inner.0)?,
+				<String as crate::js::napi::FromWire>::from_wire(inner.1)?,
+			)
+		})),
+		"{tokens}"
+	);
+	assert!(
+		tokens.contains(&compact(quote! {
+			Self::Named(field_0, field_1,) => EntryNapi::Named {
+				inner: (
+					<u64 as crate::js::napi::IntoWire>::into_wire(field_0),
+					<String as crate::js::napi::IntoWire>::into_wire(field_1),
+				),
+			}
+		})),
+		"{tokens}"
+	);
+}
+
+#[test]
+fn an_optional_tuple_element_is_refused() {
+	// napi writes a `None` inside an array as null, where ubrn's typings say undefined
+	assert!(
+		mirror_error(syn::parse_quote!(
+			pub enum Lookup {
+				Found(Option<u64>),
+			}
+		))
+		.contains("an `Option` in a tuple variant has no napi rule")
+	);
+}
+
+#[test]
+fn a_date_time_field_is_a_bigint() {
+	let item: Item = syn::parse_quote! {
+		pub struct Dir {
+			pub created: Option<DateTime<Utc>>,
+			pub timestamp: DateTime<Utc>,
+		}
+	};
+	let tokens = mirror_of(true, true, item);
+	assert!(
+		tokens.contains(&compact(quote! {
+			#[napi(js_name = "created", ts_type = "bigint | undefined")]
+			pub created: ::std::option::Option<<DateTime<Utc> as crate::js::napi::Wire>::Wire>,
+			#[napi(js_name = "timestamp", ts_type = "bigint")]
+			pub timestamp: <DateTime<Utc> as crate::js::napi::Wire>::Wire,
+		})),
+		"{tokens}"
+	);
+}
+
+#[test]
+fn a_byte_vector_field_is_a_uint8_array_read_through_bytes() {
+	let item: Item = syn::parse_quote! {
+		pub struct Chunk {
+			pub data: Vec<u8>,
+		}
+	};
+	let tokens = mirror_of(true, true, item);
+	assert!(
+		tokens.contains(&compact(quote! {
+			#[napi(js_name = "data", ts_type = "Uint8Array")]
+			pub data: crate::js::napi::bytes::Bytes,
+		})),
+		"{tokens}"
+	);
+	assert!(
+		tokens.contains(&compact(
+			quote!(data: crate::js::napi::bytes::read(wire.data),)
+		)),
+		"{tokens}"
+	);
+	assert!(
+		tokens.contains(&compact(
+			quote!(data: crate::js::napi::bytes::write(self.data),)
+		)),
+		"{tokens}"
+	);
+
+	let item: Item = syn::parse_quote! {
+		pub enum FileMeta {
+			DecryptedRaw(Vec<u8>),
+		}
+	};
+	let tokens = mirror_of(true, true, item);
+	assert!(
+		tokens.contains(&compact(quote! {
+			DecryptedRaw {
+				#[napi(ts_type = "[Uint8Array]")]
+				inner: (crate::js::napi::bytes::Bytes,),
+			}
+		})),
+		"{tokens}"
+	);
+	assert!(
+		tokens.contains(&compact(quote! {
+			FileMetaNapi::DecryptedRaw { inner } => Self::DecryptedRaw(
+				crate::js::napi::bytes::read(inner.0),
+			)
+		})),
+		"{tokens}"
+	);
+	assert!(
+		tokens.contains(&compact(quote! {
+			inner: (crate::js::napi::bytes::write(field_0),)
+		})),
+		"{tokens}"
+	);
+}
+
+#[test]
+fn an_sdk_error_field_is_a_filen_sdk_error_interface() {
+	let item: Item = syn::parse_quote! {
+		pub struct UploadError {
+			pub path: String,
+			pub error: Arc<Error>,
+		}
+	};
+	let tokens = mirror_of(false, true, item);
+	assert!(
+		tokens.contains(&compact(quote! {
+			#[napi(js_name = "error", ts_type = "FilenSdkErrorInterface")]
+			pub error: <Arc<Error> as crate::js::napi::Wire>::Wire,
+		})),
+		"{tokens}"
 	);
 }
 
@@ -515,9 +707,10 @@ fn an_async_method_returns_a_promise_through_spawn_promise() {
 				params: __NapiParamParams,
 				async_opts: ::std::option::Option<::napi::bindgen_prelude::Object<'env>>,
 			) -> ::napi::Result<::napi::bindgen_prelude::PromiseRaw<'env, __NapiReturn>> {
+				let params = <crate::js::LoginParams as crate::js::napi::FromWire>::from_wire(params);
 				let this = ::std::clone::Clone::clone(this);
 				crate::js::napi::spawn_promise(env, async_opts, async move {
-					let params = <crate::js::LoginParams as crate::js::napi::FromWire>::from_wire(params)?;
+					let params = params?;
 					this.login(params).await
 				})
 			}
@@ -697,10 +890,12 @@ fn an_option_return_is_undefined_when_none() {
 	);
 	assert!(
 		tokens.contains(&compact(quote! {
-			async move {
-				let name = <String as crate::js::napi::FromWire>::from_wire(name)?;
+			let name = <String as crate::js::napi::FromWire>::from_wire(name);
+			let this = ::std::clone::Clone::clone(this);
+			crate::js::napi::spawn_promise(env, async_opts, async move {
+				let name = name?;
 				::std::result::Result::map(this.find(name).await, crate::js::napi::OptionReturn)
-			}
+			})
 		})),
 		"{tokens}"
 	);
@@ -777,8 +972,8 @@ fn a_param_without_a_ts_rule_is_an_error() {
 	let item: ItemImpl = syn::parse_quote! {
 		impl JsClient {
 			#[napi_export]
-			pub async fn upload(&self, bytes: Vec<u8>) -> Result<(), Error> {
-				self.inner_upload(bytes).await
+			pub async fn touch(&self, modified: SystemTime) -> Result<(), Error> {
+				self.inner_touch(modified).await
 			}
 		}
 	};
@@ -786,7 +981,71 @@ fn a_param_without_a_ts_rule_is_an_error() {
 		js_exports_tokens(item)
 			.unwrap_err()
 			.to_string()
-			.contains("ArrayBuffer")
+			.contains("`SystemTime`, `Duration` and `Instant` have no napi rule")
+	);
+}
+
+#[test]
+fn an_async_wrapper_reads_its_params_before_spawning() {
+	// A `Uint8Array` borrows memory JS may change, so the bytes are copied on the JS thread, and a
+	// failed read is carried into the future, so it still rejects rather than throws.
+	let item: ItemImpl = syn::parse_quote! {
+		impl JsClient {
+			#[napi_export]
+			pub async fn upload(&self, parent: UuidStr, data: Vec<u8>) -> Result<(), Error> {
+				self.inner_upload(parent, data).await
+			}
+		}
+	};
+	let tokens = exports(item);
+	assert!(
+		tokens.contains(&compact(quote! {
+			type __NapiParamParent = <UuidStr as crate::js::napi::Wire>::Wire;
+			type __NapiParamData = crate::js::napi::bytes::Bytes;
+		})),
+		"{tokens}"
+	);
+	assert!(
+		tokens.contains(&compact(quote! {
+			let parent = <UuidStr as crate::js::napi::FromWire>::from_wire(parent);
+			let data = crate::js::napi::bytes::read(data);
+			let this = ::std::clone::Clone::clone(this);
+			crate::js::napi::spawn_promise(env, async_opts, async move {
+				let parent = parent?;
+				this.upload(parent, data).await
+			})
+		})),
+		"{tokens}"
+	);
+	assert!(
+		tokens.contains(
+			r#"ts_args_type="parent:string,data:Uint8Array,asyncOpts_?:{signal:AbortSignal}""#
+		),
+		"{tokens}"
+	);
+}
+
+#[test]
+fn a_sync_wrapper_copies_a_byte_param_without_an_env() {
+	let item: ItemImpl = syn::parse_quote! {
+		impl JsClient {
+			#[napi_export]
+			pub fn checksum(&self, data: Vec<u8>) -> u32 {
+				self.inner_checksum(&data)
+			}
+		}
+	};
+	let tokens = exports(item);
+	assert!(
+		tokens.contains(&compact(quote! {
+			fn __napi_call(this: &JsClient, data: __NapiParamData,) -> ::napi::Result<__NapiReturn> {
+				let data = crate::js::napi::bytes::read(data);
+				::std::result::Result::Ok(<u32 as crate::js::napi::IntoWire>::into_wire(
+					this.checksum(data)
+				))
+			}
+		})),
+		"{tokens}"
 	);
 }
 

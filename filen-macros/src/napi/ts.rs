@@ -63,12 +63,17 @@ fn path_ts(ty: &Type, path: &TypePath, pos: Position) -> syn::Result<String> {
 		}
 		("char", []) => return Err(no_rule(ty, "uniffi has no `char`: use a String")),
 		("Self", []) => return Err(no_rule(ty, "`Self` must be replaced by the type's name")),
-		("SystemTime" | "DateTime" | "Duration" | "Instant", _) => {
+		// uniffi lowers a chrono `DateTime` as its milliseconds, an `i64` (filen-types'
+		// `uniffi_impls`).
+		("DateTime", _) => "bigint".to_owned(),
+		("SystemTime" | "Duration" | "Instant", _) => {
 			return Err(no_rule(
 				ty,
-				"dates and durations have no napi rule yet (ubrn prints a Date)",
+				"`SystemTime`, `Duration` and `Instant` have no napi rule yet (ubrn prints a Date)",
 			));
 		}
+		// ubrn types an object as its class's interface wherever another type holds it.
+		("Error" | "FilenSdkError", []) => "FilenSdkErrorInterface".to_owned(),
 		("HashMap" | "BTreeMap" | "HashSet" | "BTreeSet", _) => {
 			return Err(no_rule(
 				ty,
@@ -85,12 +90,17 @@ fn path_ts(ty: &Type, path: &TypePath, pos: Position) -> syn::Result<String> {
 			));
 		}
 		("Option", [inner]) => format!("{} | undefined", ubrn_ts(inner, Position::Element)?),
-		("Vec", [inner]) if is_u8(inner) => {
-			return Err(no_rule(
-				ty,
-				"`Vec<u8>` has no napi rule yet (ubrn prints an ArrayBuffer)",
-			));
-		}
+		// ubrn prints an ArrayBuffer, which napi cannot own: the bytes cross as a Uint8Array,
+		// copied by `crate::js::napi::bytes` where they are read and written.
+		("Vec", [inner]) if is_u8(inner) => match pos {
+			Position::Field | Position::Param => "Uint8Array".to_owned(),
+			Position::Return | Position::Element => {
+				return Err(no_rule(
+					ty,
+					"a `Vec<u8>` has a napi rule only as a field or a param (a Uint8Array)",
+				));
+			}
+		},
 		("Vec", [inner]) => format!("Array<{}>", ubrn_ts(inner, Position::Element)?),
 		("Result", [ok, ..]) if pos == Position::Return => ubrn_ts(ok, Position::Return)?,
 		("Result", _) => return Err(no_rule(ty, "`Result` is only a return type")),
@@ -373,17 +383,67 @@ mod tests {
 	}
 
 	#[test]
-	fn bytes_maps_dates_and_tuples_are_errors() {
-		assert!(error(syn::parse_quote!(Vec<u8>), Position::Field).contains("ArrayBuffer"));
+	fn a_date_time_is_a_bigint() {
+		assert_eq!(
+			ts(syn::parse_quote!(chrono::DateTime<Utc>), Position::Field),
+			"bigint"
+		);
+		assert_eq!(
+			ts(syn::parse_quote!(Option<DateTime<Utc>>), Position::Param),
+			"bigint | undefined"
+		);
+	}
+
+	#[test]
+	fn a_byte_vector_is_a_uint8_array_as_a_field_or_a_param_only() {
+		assert_eq!(
+			ts(syn::parse_quote!(Vec<u8>), Position::Field),
+			"Uint8Array"
+		);
+		assert_eq!(
+			ts(syn::parse_quote!(Vec<u8>), Position::Param),
+			"Uint8Array"
+		);
+		for (ty, pos) in [
+			(syn::parse_quote!(Vec<u8>), Position::Return),
+			(syn::parse_quote!(Option<Vec<u8>>), Position::Field),
+			(syn::parse_quote!(Vec<Vec<u8>>), Position::Param),
+		] {
+			assert!(
+				error(ty, pos).contains("only as a field or a param"),
+				"{pos:?}"
+			);
+		}
+	}
+
+	#[test]
+	fn the_sdk_error_is_its_interface() {
+		assert_eq!(
+			ts(syn::parse_quote!(Arc<crate::Error>), Position::Field),
+			"FilenSdkErrorInterface"
+		);
+		assert_eq!(
+			ts(syn::parse_quote!(FilenSdkError), Position::Param),
+			"FilenSdkErrorInterface"
+		);
+	}
+
+	#[test]
+	fn maps_tuples_and_std_times_are_errors() {
 		assert!(
 			error(syn::parse_quote!(HashMap<String, u32>), Position::Field)
 				.contains("maps and sets")
 		);
-		assert!(
-			error(syn::parse_quote!(chrono::DateTime<Utc>), Position::Field)
-				.contains("dates and durations")
-		);
-		assert!(error(syn::parse_quote!(SystemTime), Position::Field).contains("dates"));
+		for ty in [
+			quote::quote!(std::time::SystemTime),
+			quote::quote!(Duration),
+			quote::quote!(Instant),
+		] {
+			assert!(
+				error(syn::parse2(ty).unwrap(), Position::Field)
+					.contains("`SystemTime`, `Duration` and `Instant` have no napi rule")
+			);
+		}
 		assert!(error(syn::parse_quote!((u32, u32)), Position::Field).contains("tuples"));
 	}
 
