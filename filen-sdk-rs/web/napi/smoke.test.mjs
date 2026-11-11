@@ -6,7 +6,7 @@ import assert from "node:assert/strict"
 import { spawnSync } from "node:child_process"
 import { generateKeyPairSync, randomUUID } from "node:crypto"
 import { once } from "node:events"
-import { copyFileSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs"
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import { performance } from "node:perf_hooks"
@@ -18,6 +18,7 @@ import { Worker } from "node:worker_threads"
 import * as sdk from "../node/index.js"
 
 const {
+	AnyDirWithContext_Tags,
 	AnyFile_Tags,
 	AnyNormalDir_Tags,
 	Backlog,
@@ -896,6 +897,57 @@ describe("transfers, offline", () => {
 			}
 		)
 		assert.deepEqual(updates, [])
+	})
+
+	// A JsDirDownloadCallback recording its calls by method name, without the methods `without`.
+	function dirDownloadCallback(calls, without = []) {
+		const methods = ["onQueryDownloadProgress", "onScanProgress", "onScanErrors", "onScanComplete", "onDownloadUpdate", "onDownloadErrors"]
+		return Object.fromEntries(
+			methods.filter(name => !without.includes(name)).map(name => [name, (...args) => calls.push([name, ...args])])
+		)
+	}
+
+	// The root of a synthesized account, as an AnyDirWithContext.
+	const rootTarget = () => ({
+		tag: AnyDirWithContext_Tags.Normal,
+		inner: [{ tag: AnyNormalDir_Tags.Root, inner: [{ uuid: randomUUID() }] }]
+	})
+
+	test("a dir download callback missing onDownloadErrors throws napi's own error", () => {
+		const calls = []
+		assert.throws(
+			() =>
+				synthClient(randomUUID()).downloadDirRecursively(
+					join(dir, "never"),
+					dirDownloadCallback(calls, ["onDownloadErrors"]),
+					rootTarget(),
+					noSignals
+				),
+			e => {
+				assert.ok(e instanceof Error)
+				assert.equal(e.code, "InvalidArg")
+				assert.equal(FilenSdkError.hasInner(e), false)
+				return true
+			}
+		)
+		assert.deepEqual(calls, [])
+	})
+
+	test("downloadDirRecursively with an aborted signal rejects with an AbortError and creates nothing", async () => {
+		const target = join(dir, "tree")
+		const calls = []
+		await assert.rejects(
+			synthClient(randomUUID()).downloadDirRecursively(target, dirDownloadCallback(calls), rootTarget(), noSignals, {
+				signal: AbortSignal.abort()
+			}),
+			e => {
+				assert.equal(e.name, "AbortError")
+				assert.equal(FilenSdkError.hasInner(e), false)
+				return true
+			}
+		)
+		assert.equal(existsSync(target), false)
+		assert.deepEqual(calls, [])
 	})
 })
 

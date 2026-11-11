@@ -26,7 +26,9 @@ mod wire;
 use napi_derive::napi;
 
 pub(crate) use error::throw;
-pub(crate) use listener::{Listener, ListenerCall};
+#[cfg(test)]
+pub(crate) use listener::test_support as listener_test_support;
+pub(crate) use listener::{Listener, ListenerCall, bound_method};
 pub(crate) use managed::{
 	ManagedAbortController, ManagedAbortSignal, PauseSignal, read_managed_future,
 };

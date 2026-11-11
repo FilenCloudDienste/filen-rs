@@ -37,9 +37,8 @@ pub struct UploadError {
 	pub error: Arc<FilenSdkError>,
 }
 
-// No napi export downloads a directory yet.
-#[cfg_attr(feature = "napi", allow(dead_code))]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+#[filen_macros::napi_mirror(export)]
 pub struct DownloadError {
 	pub error: Arc<Error>,
 	pub path: String,
@@ -62,8 +61,6 @@ pub(crate) async fn upload_dir<C: DirUploadCallback + ?Sized>(
 }
 
 /// Downloads `target` and everything below it into the local directory `dir_path`.
-// No napi export downloads a directory yet.
-#[cfg_attr(feature = "napi", allow(dead_code))]
 pub(crate) async fn download_dir<C>(
 	client: Arc<Client>,
 	dir_path: String,

@@ -21,7 +21,9 @@ use std::{
 
 use napi::{
 	Env, Status,
-	bindgen_prelude::Object,
+	bindgen_prelude::{
+		FromNapiValue, Function, FunctionRef, JsObjectValue, JsValuesTupleIntoVec, Object,
+	},
 	threadsafe_function::{ThreadsafeCallContext, ThreadsafeFunctionCallMode},
 };
 use tokio::sync::{oneshot, watch};
@@ -37,6 +39,16 @@ pub(crate) trait ListenerCall: Send + 'static {
 
 	/// Make this call on the JS thread.
 	fn call(self, env: &Env, methods: &Self::Methods) -> napi::Result<()>;
+}
+
+/// `callback`'s method `name`, bound to it, for [`ListenerCall::bind`]: ubrn calls a callback's
+/// methods as its methods, so `this` is the callback. A missing method fails with napi's own error.
+pub(crate) fn bound_method<Args: JsValuesTupleIntoVec, Return: FromNapiValue>(
+	callback: &Object<'_>,
+	name: &str,
+) -> napi::Result<FunctionRef<Args, Return>> {
+	let method: Function<'_, Args, Return> = callback.get_named_property(name)?;
+	method.bind(callback)?.create_ref()
 }
 
 /// What the queue carries: a call, or the marker [`Listener::flushed`] waits for.
@@ -171,6 +183,40 @@ impl<C: ListenerCall> JsSide<C> {
 				let _ = done.send(());
 			}
 		}
+	}
+}
+
+/// Listeners for the tests of the calls built on them.
+#[cfg(test)]
+pub(crate) mod test_support {
+	use std::sync::Mutex;
+
+	use super::*;
+
+	/// The calls a [`recording`] listener was sent, in order.
+	pub(crate) type Sent<C> = Arc<Mutex<Vec<C>>>;
+
+	/// A listener that keeps the calls it is sent instead of making them, and whose flushes
+	/// resolve at once.
+	pub(crate) fn recording<C: ListenerCall>() -> (Listener<C>, Sent<C>) {
+		let sent = Sent::<C>::default();
+		let record = Arc::clone(&sent);
+		let (env_alive, env_gone) = watch::channel(());
+		let listener = Listener::with_send(
+			move |message| {
+				// The environment lives as long as the listener.
+				let _ = &env_alive;
+				match message {
+					Message::Call(call) => record.lock().unwrap().push(call),
+					Message::Flush(done) => {
+						let _ = done.send(());
+					}
+				}
+				Status::Ok
+			},
+			env_gone,
+		);
+		(listener, sent)
 	}
 }
 

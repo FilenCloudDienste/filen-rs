@@ -11,7 +11,8 @@
  * synchronously, also from a method that returns a
  * Promise, where ubrn's async methods reject. So does a cache listener without an onMessages
  * method, a sync engine listener without onEvents and onWatchStatus methods, and a transfer
- * callback without onUpdate. Every SDK error of an async call rejects, as under ubrn, and so
+ * callback without one of its methods (onUpdate, or the six of a JsDirDownloadCallback). Every
+ * SDK error of an async call rejects, as under ubrn, and so
  * does a managedFuture whose abortSignal or pauseSignal is null or of another class (a
  * Conversion error).
  *
@@ -24,12 +25,13 @@
  * queued and the one being delivered) and those of that round not yet handed over. The next round
  * goes to the new listener.
  *
- * A transfer's callback object (downloadFileToPath, uploadFile) is read once, when the call is
- * made, and its methods are called bound to it, on the JS thread, in order. Every call made before
- * the transfer settles runs before its promise settles, except after an abort. One through
- * asyncOpts_ rejects at once; one through the managedFuture's ManagedAbortSignal rejects as soon
- * as the transfer is told to stop, which may still make a call and remove its temp file just
- * after. Either way, calls already queued or made while it stops may arrive after the rejection.
+ * A transfer's callback object (downloadFileToPath, uploadFile, downloadDirRecursively) is read
+ * once, when the call is made, and its methods are called bound to it, on the JS thread, in order.
+ * Every call made before the transfer settles runs before its promise settles, except after an
+ * abort. One through asyncOpts_ rejects at once; one through the managedFuture's
+ * ManagedAbortSignal rejects as soon as the transfer is told to stop, which may still make a call
+ * and remove its temp files just after. Either way, calls already queued or made while it stops
+ * may arrive after the rejection.
  *
  * Sync engine listener calls and promise settlement are not ordered against each other: syncOnce, stopWatch
  * or close may resolve before the listener gets that call's last events or status. A UI reads
@@ -130,4 +132,20 @@ export interface JsFileUploadCallback {
 	 * running total. Their sum is the file's size once the upload completes.
 	 */
 	onUpdate(uploadedBytes: bigint): void
+}
+
+/** Receives a directory download's progress. */
+export interface JsDirDownloadCallback {
+	/** Called periodically while /dir/download is listing the directory contents. */
+	onQueryDownloadProgress(knownBytes: bigint, totalBytes: bigint | undefined): void
+	/** Called during tree building. */
+	onScanProgress(knownDirs: bigint, knownFiles: bigint, knownBytes: bigint): void
+	/** Called when errors occur during tree building. */
+	onScanErrors(errors: Array<FilenSdkErrorInterface>): void
+	/** Called when tree building is complete. */
+	onScanComplete(totalDirs: bigint, totalFiles: bigint, totalBytes: bigint): void
+	/** Called periodically during the download process. */
+	onDownloadUpdate(downloadedDirs: Array<DirWithPath>, downloadedFiles: Array<FileWithPath>, downloadedBytes: bigint): void
+	/** Called when errors occur during the download process. */
+	onDownloadErrors(errors: Array<DownloadError>): void
 }
