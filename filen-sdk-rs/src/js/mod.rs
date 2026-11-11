@@ -4,7 +4,12 @@
 mod categories;
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 mod js_param;
-#[cfg(any(feature = "wasm-full", feature = "uniffi", feature = "service-worker"))]
+#[cfg(any(
+	feature = "wasm-full",
+	feature = "uniffi",
+	feature = "service-worker",
+	feature = "napi"
+))]
 mod managed_futures;
 mod meta_changes;
 // napi-derive's generated FFI glue (the raw N-API calls in the conversion impls and callbacks it
@@ -57,7 +62,12 @@ pub(crate) use categories::{
 pub(crate) use self::uniffi::spawn_ordered_dispatch;
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 pub use js_param::{JsParam, parse_tsify};
-#[cfg(any(feature = "wasm-full", feature = "uniffi", feature = "service-worker"))]
+#[cfg(any(
+	feature = "wasm-full",
+	feature = "uniffi",
+	feature = "service-worker",
+	feature = "napi"
+))]
 pub use managed_futures::*;
 pub use meta_changes::*;
 #[cfg(any(feature = "wasm-full", feature = "uniffi", feature = "napi"))]

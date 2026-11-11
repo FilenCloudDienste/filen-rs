@@ -1,3 +1,4 @@
+pub use abortable::{ManagedAbortController, ManagedAbortSignal};
 pub use managed::ManagedFuture;
 pub use pausable::PauseSignal;
 
@@ -16,7 +17,8 @@ mod pausable {
 	}
 
 	/// A signal that can pause and resume async operations
-	#[derive(Clone, uniffi::Object)]
+	#[derive(Clone)]
+	#[cfg_attr(feature = "uniffi", derive(uniffi::Object))]
 	pub struct PauseSignal {
 		sender: tokio::sync::watch::Sender<bool>,
 		receiver: tokio::sync::watch::Receiver<bool>,
@@ -28,9 +30,9 @@ mod pausable {
 		}
 	}
 
-	#[uniffi::export]
+	#[cfg_attr(feature = "uniffi", uniffi::export)]
 	impl PauseSignal {
-		#[uniffi::constructor]
+		#[cfg_attr(feature = "uniffi", uniffi::constructor)]
 		pub fn new() -> Self {
 			let (sender, receiver) = tokio::sync::watch::channel(false);
 			Self { sender, receiver }
@@ -49,6 +51,8 @@ mod pausable {
 		}
 	}
 
+	// No napi export runs a managed call yet.
+	#[cfg_attr(feature = "napi", allow(dead_code))]
 	impl PauseSignal {
 		pub(super) fn into_pausable_on_commander<F, Fut>(
 			self,
@@ -75,15 +79,21 @@ mod abortable {
 
 	use crate::error::AbortedError;
 
-	#[derive(uniffi::Object)]
+	#[cfg_attr(feature = "uniffi", derive(uniffi::Object))]
 	pub struct ManagedAbortController {
 		sender: tokio::sync::watch::Sender<bool>,
 		receiver: tokio::sync::watch::Receiver<bool>,
 	}
 
-	#[uniffi::export]
+	impl Default for ManagedAbortController {
+		fn default() -> Self {
+			Self::new()
+		}
+	}
+
+	#[cfg_attr(feature = "uniffi", uniffi::export)]
 	impl ManagedAbortController {
-		#[uniffi::constructor]
+		#[cfg_attr(feature = "uniffi", uniffi::constructor)]
 		pub fn new() -> Self {
 			let (sender, receiver) = tokio::sync::watch::channel(false);
 			Self { sender, receiver }
@@ -100,18 +110,21 @@ mod abortable {
 		}
 	}
 
-	#[derive(Clone, uniffi::Object)]
+	#[derive(Clone)]
+	#[cfg_attr(feature = "uniffi", derive(uniffi::Object))]
 	pub struct ManagedAbortSignal {
 		receiver: tokio::sync::watch::Receiver<bool>,
 	}
 
-	#[uniffi::export]
+	#[cfg_attr(feature = "uniffi", uniffi::export)]
 	impl ManagedAbortSignal {
 		pub fn aborted(&self) -> bool {
 			*self.receiver.borrow()
 		}
 	}
 
+	// No napi export runs a managed call yet.
+	#[cfg_attr(feature = "napi", allow(dead_code))]
 	impl ManagedAbortSignal {
 		pub(super) fn into_future(self) -> AbortSignalFuture<impl Future<Output = AbortedError>> {
 			AbortSignalFuture::Some {
@@ -138,6 +151,8 @@ mod abortable {
 	}
 
 	/// Resolves once `signal` aborts; never, without a signal.
+	// No napi export runs a managed call yet.
+	#[cfg_attr(feature = "napi", allow(dead_code))]
 	pub(super) fn abort_future(
 		signal: Option<Arc<ManagedAbortSignal>>,
 	) -> AbortSignalFuture<impl Future<Output = AbortedError>> {
@@ -209,12 +224,14 @@ mod managed {
 
 	use super::{abortable::*, pausable::*};
 
-	#[derive(uniffi::Record)]
+	#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 	pub struct ManagedFuture {
 		pub abort_signal: Option<Arc<ManagedAbortSignal>>,
 		pub pause_signal: Option<Arc<PauseSignal>>,
 	}
 
+	// No napi export runs a managed call yet.
+	#[cfg_attr(feature = "napi", allow(dead_code))]
 	impl ManagedFuture {
 		pub(crate) fn into_js_managed_commander_future<F, Fut>(
 			self,

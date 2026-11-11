@@ -662,9 +662,17 @@ impl_from!(
 
 #[derive(Debug, Error)]
 #[error("Operation was cancelled")]
-#[cfg(any(all(target_family = "wasm", target_os = "unknown"), feature = "uniffi"))]
+#[cfg(any(
+	all(target_family = "wasm", target_os = "unknown"),
+	feature = "uniffi",
+	feature = "napi"
+))]
 pub(crate) struct AbortedError;
-#[cfg(any(all(target_family = "wasm", target_os = "unknown"), feature = "uniffi"))]
+#[cfg(any(
+	all(target_family = "wasm", target_os = "unknown"),
+	feature = "uniffi",
+	feature = "napi"
+))]
 impl_from!(AbortedError, ErrorKind::Cancelled);
 
 impl_from!(EntryNameError, ErrorKind::InvalidName);

@@ -947,8 +947,8 @@ mod commander_thread {
 		inner_do_on_commander(None, f)
 	}
 
-	// The managed futures that pause a job are not on napi yet.
-	#[cfg(any(feature = "uniffi", feature = "wasm-full"))]
+	// No napi export runs a managed call yet.
+	#[cfg_attr(feature = "napi", allow(dead_code))]
 	pub(crate) fn do_with_pause_channel_on_commander<F, Fut>(
 		channel: (
 			tokio::sync::watch::Sender<bool>,
@@ -983,13 +983,7 @@ where
 	})?
 }
 
-#[cfg(feature = "napi")]
-pub(crate) use commander_thread::do_on_commander;
-#[cfg(feature = "uniffi")]
-pub(crate) use commander_thread::{
-	CommanderFutHandle, do_on_commander, do_with_pause_channel_on_commander,
-};
-#[cfg(feature = "wasm-full")]
+#[cfg(any(feature = "uniffi", feature = "wasm-full", feature = "napi"))]
 pub(crate) use commander_thread::{
 	CommanderFutHandle, do_on_commander, do_with_pause_channel_on_commander,
 };

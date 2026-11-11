@@ -241,7 +241,9 @@ impl JobControl {
 
 /// Adapts the bindings' abort signal to a job's cooperative cancel; only builds with bindings
 /// (and the tests) use it.
-#[cfg(any(feature = "uniffi", feature = "wasm-full", test))]
+#[cfg(any(feature = "uniffi", feature = "wasm-full", feature = "napi", test))]
+// No napi export runs a managed call yet.
+#[cfg_attr(feature = "napi", allow(dead_code))]
 pub(crate) mod cancel_grace {
 	use std::{
 		future::Future,
@@ -257,7 +259,7 @@ pub(crate) mod cancel_grace {
 
 	/// How long a cancelled job may take to finish what cannot be interrupted (a directory create or
 	/// file registration already sent) and report it, before it is dropped as is.
-	#[cfg(any(feature = "uniffi", feature = "wasm-full"))]
+	#[cfg(any(feature = "uniffi", feature = "wasm-full", feature = "napi"))]
 	pub(crate) const CANCEL_GRACE: Duration = Duration::from_secs(5);
 
 	/// Runs `job`, ending it with [`ErrorKind::Cancelled`] if it has not finished `grace` after
