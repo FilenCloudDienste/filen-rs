@@ -1366,6 +1366,29 @@ impl FilenMobileCacheState {
 	}
 }
 
+/// [`FilenMobileCacheState::stop_live_updates`] and
+/// [`FilenMobileCacheState::set_working_set_listener`] for a caller inside a tokio runtime, where
+/// the exported methods panic on a busy cache state (see `FilenMobileCacheState::async_query_item`).
+/// Rust-only: nothing here is exported over UniFFI.
+impl FilenMobileCacheState {
+	/// [`Self::stop_live_updates`], awaiting the cache state.
+	pub async fn async_stop_live_updates(&self) {
+		self.async_get_cache_state_borrowed()
+			.await
+			.stop_live_updates();
+	}
+
+	/// [`Self::set_working_set_listener`], awaiting the cache state.
+	pub async fn async_set_working_set_listener(
+		&self,
+		listener: Option<Arc<dyn WorkingSetUpdateListener>>,
+	) {
+		self.async_get_cache_state_borrowed()
+			.await
+			.set_working_set_listener(listener);
+	}
+}
+
 impl CacheState {
 	/// See [`FilenMobileCacheState::stop_live_updates`].
 	fn stop_live_updates(&self) {

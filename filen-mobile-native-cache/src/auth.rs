@@ -916,7 +916,9 @@ impl FilenMobileCacheState {
 		Some(state)
 	}
 
-	async fn async_get_cache_state_borrowed(&self) -> tokio::sync::RwLockReadGuard<'_, CacheState> {
+	pub(crate) async fn async_get_cache_state_borrowed(
+		&self,
+	) -> tokio::sync::RwLockReadGuard<'_, CacheState> {
 		let state = self.state.read().await;
 		let now = Instant::now();
 
@@ -1266,6 +1268,10 @@ impl FilenMobileCacheState {
 		}
 	}
 
+	/// Runs `f` on the authenticated state. Blocks on the crate's runtime when the state is busy,
+	/// so it is for callers outside a runtime: inside one it panics instead (see
+	/// [`Self::sync_get_cache_state_borrowed`]), and those callers use
+	/// [`Self::async_execute_authed`].
 	pub(crate) fn sync_execute_authed<T>(
 		&self,
 		f: impl FnOnce(&AuthCacheState) -> Result<T, CacheError> + Send,
@@ -1283,6 +1289,28 @@ impl FilenMobileCacheState {
 				))
 			}
 		}
+	}
+
+	/// [`Self::sync_execute_authed`] for a caller inside a tokio runtime: it awaits a busy state
+	/// where the sync one blocks or panics. `f` runs under the state's read guard, as there.
+	pub(crate) async fn async_execute_authed<T>(
+		&self,
+		f: impl FnOnce(&AuthCacheState) -> Result<T, CacheError>,
+	) -> Result<T, CacheError> {
+		trace!("async_execute_authed");
+		self.ensure_live_updates();
+		let state = self.async_get_cache_state_borrowed().await;
+		let err = match &state.status {
+			AuthStatus::Authenticated(auth_state) => return f(auth_state),
+			AuthStatus::Unauthenticated(unauth_state) => {
+				unauthenticated_error(&unauth_state.reason, "async_execute_authed")
+			}
+		};
+		// The guard goes before the cleanup task takes one of its own: a writer queued between
+		// the two would wait for this one while the second waited for it.
+		drop(state);
+		self.async_launch_cleanup_task().await;
+		Err(err)
 	}
 
 	pub(crate) async fn async_execute_authed_owned<T>(
@@ -1534,8 +1562,9 @@ pub(crate) mod test_support {
 	use filen_types::auth::{AuthVersion, FilenSDKConfig};
 
 	use super::{
-		AuthCacheState, AuthFile, AuthStatus, CacheState, UnauthCacheState, UnauthReason,
-		parse_auth_read, recheck_authenticated, sync_read_auth_plaintext, update_state,
+		AuthCacheState, AuthFile, AuthStatus, BackgroundTasks, CacheState, FilenMobileCacheState,
+		UnauthCacheState, UnauthReason, parse_auth_read, recheck_authenticated,
+		sync_read_auth_plaintext, update_state,
 	};
 
 	/// Removes the DB directory when dropped so a failing assertion doesn't leak temp files.
@@ -1625,6 +1654,22 @@ pub(crate) mod test_support {
 			parse_auth_read(sync_read_auth_plaintext(&state.auth_file, Some(&dek)));
 		update_state(&mut state, file, digest);
 		(dir, dek, state)
+	}
+
+	/// An authenticated [`FilenMobileCacheState`] that never touches the network: it does not
+	/// re-read its auth.json or bring the live path up, like the in-memory constructor. The
+	/// directory goes when the returned [`TempDbDir`] is dropped.
+	pub(crate) fn offline_cache_state(
+		config: FilenSDKConfig,
+	) -> (TempDbDir, FilenMobileCacheState) {
+		let (dir, _, state) = sealed_state("filen-cache-offline-state", config);
+		let cache = FilenMobileCacheState {
+			state: Arc::new(tokio::sync::RwLock::new(state)),
+			state_write_coordinator: Arc::new(tokio::sync::Mutex::new(())),
+			allow_auth_disable: false,
+			tasks: BackgroundTasks::default(),
+		};
+		(dir, cache)
 	}
 
 	/// An authenticated state built from a sealed auth.json, the way the FFI entry points build
@@ -2121,7 +2166,13 @@ mod session_refresh_tests {
 
 #[cfg(test)]
 mod unauthenticated_tests {
-	use super::{CacheError, UnauthReason, unauthenticated_error};
+	use std::time::Instant;
+
+	use super::{
+		AuthStatus, CacheError, UnauthCacheState, UnauthReason,
+		test_support::{ROOT_A, offline_cache_state, sdk_config},
+		unauthenticated_error,
+	};
 
 	/// The variant and the message each reason answers with. The messages are shipped, so they are
 	/// pinned here word for word.
@@ -2153,6 +2204,33 @@ mod unauthenticated_tests {
 				"Auth state unavailable: sync_execute_authed_owned".to_owned()
 			)
 		);
+	}
+
+	/// The async executor answers an unauthenticated state as the others do, naming itself, and
+	/// runs nothing of the caller's.
+	#[tokio::test]
+	async fn the_async_executor_answers_an_unauthenticated_state_with_its_name() {
+		let (_dir, cache) = offline_cache_state(sdk_config(1, ROOT_A, "key"));
+		{
+			let mut state = cache.state.write().await;
+			state.status = AuthStatus::Unauthenticated(UnauthCacheState {
+				reason: UnauthReason::Disabled,
+			});
+			// fresh, so the executor takes the state as it is instead of re-reading auth.json
+			*state.last_update.write().unwrap() = Some(Instant::now());
+		}
+
+		let err = cache
+			.async_execute_authed(|_| -> Result<(), CacheError> {
+				panic!("an unauthenticated state runs nothing")
+			})
+			.await
+			.unwrap_err();
+
+		let CacheError::Disabled(context) = err else {
+			panic!("a disabled state answers Disabled, got {err:?}");
+		};
+		assert_eq!(context.to_string(), "Disabled: async_execute_authed");
 	}
 }
 

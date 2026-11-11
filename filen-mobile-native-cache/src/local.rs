@@ -197,6 +197,106 @@ impl FilenMobileCacheState {
 	}
 }
 
+/// The queries above for a caller inside a tokio runtime, each running the same body as its
+/// namesake without the `async_` prefix.
+///
+/// The exported methods block on the crate's runtime while the cache state is busy: while the auth
+/// re-check is adopting a changed auth.json, or is queued behind a read that a transfer holds for
+/// its whole length. On a runtime thread that block is a panic, so a caller there uses these, which
+/// await the state instead. Rust-only: nothing here is exported over UniFFI.
+///
+/// Only the wait for the state is awaited. The query itself runs synchronously on the calling
+/// task, through the database connection's mutex, as the exported methods run it: a query that
+/// waits on that mutex (behind a live update applying a batch, say) holds its runtime thread
+/// until it gets it.
+impl FilenMobileCacheState {
+	/// [`Self::query_dir_children`], awaiting the cache state.
+	pub async fn async_query_dir_children(
+		&self,
+		path: &FfiId,
+		order_by: Option<String>,
+	) -> Result<Option<QueryChildrenResponse>, CacheError> {
+		self.async_execute_authed(|auth_state| auth_state.query_dir_children(path, order_by))
+			.await
+	}
+
+	/// [`Self::query_item`], awaiting the cache state.
+	pub async fn async_query_item(&self, path: &FfiId) -> Result<Option<FfiObject>, CacheError> {
+		self.async_execute_authed(|auth_state| auth_state.query_item(path))
+			.await
+	}
+
+	/// [`Self::insert_into_local_data_for_path`], awaiting the cache state.
+	pub async fn async_insert_into_local_data_for_path(
+		&self,
+		path: FfiId,
+		key: String,
+		value: Option<String>,
+	) -> Result<FfiObject, CacheError> {
+		self.async_execute_authed(|auth_state| {
+			auth_state.insert_into_local_data_for_path(path, key, value)
+		})
+		.await
+	}
+
+	/// [`Self::set_pinned`], awaiting the cache state.
+	pub async fn async_set_pinned(&self, id: &str, pinned: bool) -> Result<(), CacheError> {
+		self.async_execute_authed(|auth_state| auth_state.set_pinned(id, pinned))
+			.await
+	}
+
+	/// [`Self::pinned_ids`], awaiting the cache state.
+	pub async fn async_pinned_ids(&self) -> Result<Vec<String>, CacheError> {
+		self.async_execute_authed(AuthCacheState::pinned_ids).await
+	}
+
+	/// [`Self::pinned_files_to_fetch`], awaiting the cache state.
+	pub async fn async_pinned_files_to_fetch(&self) -> Result<Vec<String>, CacheError> {
+		self.async_execute_authed(AuthCacheState::pinned_files_to_fetch)
+			.await
+	}
+
+	/// [`Self::pinned_dirs_to_list`], awaiting the cache state.
+	pub async fn async_pinned_dirs_to_list(&self) -> Result<Vec<String>, CacheError> {
+		self.async_execute_authed(AuthCacheState::pinned_dirs_to_list)
+			.await
+	}
+
+	/// [`Self::pending_upload_count`], awaiting the cache state.
+	pub async fn async_pending_upload_count(&self) -> Result<u32, CacheError> {
+		self.async_execute_authed(AuthCacheState::pending_upload_count)
+			.await
+	}
+
+	/// [`Self::root_uuid`], awaiting the cache state.
+	pub async fn async_root_uuid(&self) -> Result<String, CacheError> {
+		self.async_execute_authed(|auth_state| Ok(auth_state.root_uuid()))
+			.await
+	}
+
+	/// [`Self::current_sync_anchor`], awaiting the cache state.
+	pub async fn async_current_sync_anchor(&self) -> Result<Vec<u8>, CacheError> {
+		self.async_execute_authed(AuthCacheState::current_sync_anchor)
+			.await
+	}
+
+	/// [`Self::enumerate_changes_page`], awaiting the cache state.
+	pub async fn async_enumerate_changes_page(
+		&self,
+		anchor: Option<Vec<u8>>,
+		limit: u32,
+	) -> Result<FfiChanges, CacheError> {
+		self.async_execute_authed(|auth_state| auth_state.changes_page(anchor.as_deref(), limit))
+			.await
+	}
+
+	/// [`Self::query_working_set_with_anchor`], awaiting the cache state.
+	pub async fn async_query_working_set_with_anchor(&self) -> Result<FfiWorkingSet, CacheError> {
+		self.async_execute_authed(AuthCacheState::working_set_with_anchor)
+			.await
+	}
+}
+
 fn stable_ids(ids: Vec<Uuid>) -> Vec<String> {
 	ids.into_iter()
 		.map(|id| format!("{STABLE_PREFIX}{id}"))
@@ -691,6 +791,252 @@ impl AuthCacheState {
 		let anchor = current_sync_anchor(&self.conn())?;
 		let items = working_set(self)?;
 		Ok(FfiWorkingSet { anchor, items })
+	}
+}
+
+#[cfg(test)]
+mod in_runtime_tests {
+	use std::{
+		panic::{AssertUnwindSafe, catch_unwind},
+		pin::pin,
+		str::FromStr,
+		time::Duration,
+	};
+
+	use filen_types::fs::Uuid;
+
+	use crate::{
+		auth::{
+			AuthStatus, FilenMobileCacheState,
+			test_support::{ROOT_A, offline_cache_state, sdk_config},
+		},
+		ffi::{FfiId, FfiObject},
+	};
+
+	/// How long a twin is left waiting on the write guard before the guard goes. The clock is
+	/// paused, so this costs no wall time.
+	const WRITE_HELD_FOR: Duration = Duration::from_secs(60);
+
+	#[tokio::test(start_paused = true)]
+	async fn an_async_query_inside_a_runtime_waits_out_a_state_write() {
+		let (_dir, cache) = offline_cache_state(sdk_config(1, ROOT_A, "key"));
+		let write = cache.state.write().await;
+
+		let mut query = pin!(cache.async_root_uuid());
+		assert!(
+			tokio::time::timeout(WRITE_HELD_FOR, &mut query)
+				.await
+				.is_err(),
+			"the query cannot read the state under the write guard"
+		);
+		drop(write);
+
+		assert_eq!(query.await.unwrap(), ROOT_A);
+	}
+
+	/// A twin runs the same body as the exported query it mirrors.
+	#[tokio::test]
+	async fn an_async_query_answers_what_its_sync_namesake_does() {
+		let (_dir, cache) = offline_cache_state(sdk_config(1, ROOT_A, "key"));
+		let root = FfiId(ROOT_A.to_owned());
+
+		let Some(FfiObject::Root(sync_root)) = cache.query_item(&root).unwrap() else {
+			panic!("the account root is a root");
+		};
+		let Some(FfiObject::Root(async_root)) = cache.async_query_item(&root).await.unwrap() else {
+			panic!("the account root is a root");
+		};
+		assert_eq!(sync_root.uuid, ROOT_A);
+		assert_eq!(async_root.uuid, ROOT_A);
+	}
+
+	fn assert_send<T: Send>(_: &T) {}
+
+	/// A files-on-demand provider spawns the twins on a multi-threaded runtime, which needs each
+	/// future to be `Send`. The check is that this compiles: the futures are built and dropped
+	/// without being polled.
+	#[test]
+	fn every_async_twin_can_be_spawned_onto_another_thread() {
+		let (_dir, cache) = offline_cache_state(sdk_config(1, ROOT_A, "key"));
+		let root = FfiId(ROOT_A.to_owned());
+
+		assert_send(&cache.async_query_dir_children(&root, None));
+		assert_send(&cache.async_query_item(&root));
+		assert_send(&cache.async_insert_into_local_data_for_path(
+			root.clone(),
+			"k".to_owned(),
+			None,
+		));
+		assert_send(&cache.async_set_pinned(ROOT_A, true));
+		assert_send(&cache.async_pinned_ids());
+		assert_send(&cache.async_pinned_files_to_fetch());
+		assert_send(&cache.async_pinned_dirs_to_list());
+		assert_send(&cache.async_pending_upload_count());
+		assert_send(&cache.async_root_uuid());
+		assert_send(&cache.async_current_sync_anchor());
+		assert_send(&cache.async_enumerate_changes_page(None, 1));
+		assert_send(&cache.async_query_working_set_with_anchor());
+		assert_send(&cache.async_stop_live_updates());
+		assert_send(&cache.async_set_working_set_listener(None));
+	}
+
+	fn uuid(byte: u8) -> Uuid {
+		Uuid::from_bytes([byte; 16])
+	}
+
+	/// Runs `sql` on the cache's database.
+	fn seed(cache: &FilenMobileCacheState, sql: &str, params: impl rusqlite::Params) {
+		let state = cache.state.try_read().unwrap();
+		let AuthStatus::Authenticated(auth) = &state.status else {
+			panic!("the offline state is authenticated");
+		};
+		auth.conn().execute(sql, params).unwrap();
+	}
+
+	/// Under the root: dir 1, listed, holding dir 2, never listed, and file 3 (stable id 4),
+	/// whose bytes are not on the device. Pinning dir 1 then gives three different pin lists.
+	fn seed_tree(cache: &FilenMobileCacheState) {
+		let root = Uuid::from_str(ROOT_A).unwrap();
+		for (dir, parent, last_listed) in [(uuid(1), root, 1), (uuid(2), uuid(1), 0)] {
+			seed(
+				cache,
+				"INSERT INTO items (uuid, parent, type) VALUES (?1, ?2, 1);",
+				rusqlite::params![dir, parent],
+			);
+			seed(
+				cache,
+				"INSERT INTO dirs (id, color, timestamp, metadata_state, raw_metadata, last_listed)
+				VALUES (last_insert_rowid(), 'default', 1, 2, 'enc', ?1);",
+				[last_listed],
+			);
+		}
+		seed(
+			cache,
+			"INSERT INTO items (uuid, stable_uuid, parent, type) VALUES (?1, ?2, ?3, 2);",
+			rusqlite::params![uuid(3), uuid(4), uuid(1)],
+		);
+		seed(
+			cache,
+			"INSERT INTO files (id, size, chunks, region, bucket, timestamp, metadata_state,
+				raw_metadata)
+			VALUES (last_insert_rowid(), 1, 1, 'de-1', 'b', 1, 2, 'enc');",
+			[],
+		);
+	}
+
+	/// Each twin runs the body of its namesake: over a tree where the pin lists, the change-feed
+	/// pages and the listings all differ, a twin wired to another body answers something else.
+	#[tokio::test]
+	async fn each_async_query_answers_what_its_sync_namesake_does() {
+		let (_dir, cache) = offline_cache_state(sdk_config(1, ROOT_A, "key"));
+		seed_tree(&cache);
+		let stable = |byte| vec![format!("stable/{}", uuid(byte))];
+
+		cache
+			.async_set_pinned(&uuid(1).to_string(), true)
+			.await
+			.unwrap();
+		assert_eq!(cache.pinned_ids().unwrap(), stable(1));
+		assert_eq!(cache.async_pinned_ids().await.unwrap(), stable(1));
+		assert_eq!(cache.pinned_files_to_fetch().unwrap(), stable(4));
+		assert_eq!(
+			cache.async_pinned_files_to_fetch().await.unwrap(),
+			stable(4)
+		);
+		assert_eq!(cache.pinned_dirs_to_list().unwrap(), stable(2));
+		assert_eq!(cache.async_pinned_dirs_to_list().await.unwrap(), stable(2));
+
+		assert_eq!(cache.pending_upload_count().unwrap(), 0);
+		assert_eq!(cache.async_pending_upload_count().await.unwrap(), 0);
+		assert_eq!(
+			cache.async_current_sync_anchor().await.unwrap(),
+			cache.current_sync_anchor().unwrap()
+		);
+		for limit in [0, 1] {
+			let page = cache.enumerate_changes_page(None, limit).unwrap();
+			assert_eq!(page.more, limit == 1);
+			assert_eq!(
+				cache
+					.async_enumerate_changes_page(None, limit)
+					.await
+					.unwrap(),
+				page
+			);
+		}
+		assert_eq!(
+			cache.async_query_working_set_with_anchor().await.unwrap(),
+			cache.query_working_set_with_anchor().unwrap()
+		);
+
+		let root = FfiId(ROOT_A.to_owned());
+		let children = cache.query_dir_children(&root, None).unwrap();
+		assert_eq!(
+			children.as_ref().map(|listing| listing.objects.len()),
+			Some(1),
+			"the root holds dir 1"
+		);
+		assert_eq!(
+			format!(
+				"{:?}",
+				cache.async_query_dir_children(&root, None).await.unwrap()
+			),
+			format!("{children:?}")
+		);
+		let missing = || FfiId(format!("{ROOT_A}/missing"));
+		assert_eq!(
+			format!(
+				"{:?}",
+				cache
+					.async_insert_into_local_data_for_path(missing(), "k".to_owned(), None)
+					.await
+			),
+			format!(
+				"{:?}",
+				cache.insert_into_local_data_for_path(missing(), "k".to_owned(), None)
+			)
+		);
+
+		cache
+			.async_set_pinned(&uuid(1).to_string(), false)
+			.await
+			.unwrap();
+		assert!(cache.pinned_ids().unwrap().is_empty());
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn the_async_listener_registration_waits_out_a_state_write() {
+		let (_dir, cache) = offline_cache_state(sdk_config(1, ROOT_A, "key"));
+		let write = cache.state.write().await;
+
+		let mut register = pin!(cache.async_set_working_set_listener(None));
+		assert!(
+			tokio::time::timeout(WRITE_HELD_FOR, &mut register)
+				.await
+				.is_err(),
+			"the registration cannot reach the state under the write guard"
+		);
+		drop(write);
+
+		register.await;
+	}
+
+	/// The sync queries cannot wait for the state inside a runtime. The write guard stands in for
+	/// the auth re-check adopting a changed auth.json, which holds it.
+	#[tokio::test]
+	async fn a_sync_query_inside_a_runtime_panics_while_the_state_is_written() {
+		let (_dir, cache) = offline_cache_state(sdk_config(1, ROOT_A, "key"));
+		let write = cache.state.write().await;
+
+		let panic = catch_unwind(AssertUnwindSafe(|| cache.root_uuid()))
+			.expect_err("the query cannot have read the state under the write guard");
+		drop(write);
+
+		assert_eq!(
+			panic.downcast_ref::<&str>(),
+			Some(
+				&"Synchronous access to async state is not allowed, use async_get_cache_state instead"
+			)
+		);
 	}
 }
 
