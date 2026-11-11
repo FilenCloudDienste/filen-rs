@@ -10,9 +10,11 @@ use filen_mobile_native_cache::{
 		FfiChanges, FfiDir, FfiFile, FfiId, FfiNonRootObject, FfiObject, ItemType, SearchQueryArgs,
 		SearchQueryResponseEntry, UploadFileInfo,
 	},
+	range::{ByteRange, RangeIntegrity, RangeRead, RangeReadError, RangeSink},
 	traits::{ProgressCallback, SearchUpdateCallback, WorkingSetUpdateListener},
 };
 use filen_sdk_rs::{
+	consts::CHUNK_SIZE_U64,
 	crypto::{shared::DataCrypter, v3::EncryptionKey},
 	fs::{
 		HasName, HasUUID,
@@ -8140,4 +8142,446 @@ pub async fn test_replaying_a_purge_from_the_trash_retires_the_row() {
 	db.stop_live_updates();
 	db.set_materialized_containers(vec![]).await.unwrap();
 	rss.client.delete_dir_permanently(container).await.unwrap();
+}
+
+// Range reads (`read_file_range`): bytes of a remote file handed to a sink as they are decrypted,
+// without the whole file landing in the cache. Every range below is placed relative to the SDK's
+// chunk size, so the pieces a sink sees follow from it.
+
+/// Two whole chunks and part of a third, so the end of the file is not on a chunk boundary.
+const RANGE_FIXTURE_SIZE: u64 = 2 * CHUNK_SIZE_U64 + CHUNK_SIZE_U64 / 2 + 3;
+
+/// [`RANGE_FIXTURE_SIZE`] bytes, each a function of its offset.
+fn range_fixture_contents() -> Vec<u8> {
+	(0..RANGE_FIXTURE_SIZE)
+		.map(|i| u8::try_from(i % 251).unwrap())
+		.collect()
+}
+
+/// The test directory's path id, listed into the cache, as a range read resolves its id from the
+/// cache alone.
+async fn list_range_dir(db: &FilenMobileCacheState, rss: &TestResources) -> FfiId {
+	let dir_path: FfiId = format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
+	db.update_dir_children(dir_path.clone()).await.unwrap();
+	dir_path
+}
+
+/// Uploads a file of [`range_fixture_contents`] and has the cache list it.
+async fn upload_range_fixture(
+	db: &FilenMobileCacheState,
+	rss: &TestResources,
+	name: &str,
+) -> (FfiId, Vec<u8>) {
+	let contents = range_fixture_contents();
+	let file = rss.client.make_file_builder(name, rss.dir.uuid()).unwrap();
+	rss.client.upload_file(file, &contents).await.unwrap();
+	(list_range_dir(db, rss).await.join(name), contents)
+}
+
+/// Keeps what a range read delivers, and where each piece started.
+#[derive(Default)]
+struct CollectingSink {
+	started: Option<RangeRead>,
+	pieces: Vec<(u64, usize)>,
+	bytes: Vec<u8>,
+}
+
+impl RangeSink for CollectingSink {
+	type Error = std::convert::Infallible;
+
+	fn on_start(&mut self, read: &RangeRead) -> Result<(), Self::Error> {
+		self.started = Some(*read);
+		Ok(())
+	}
+
+	fn on_bytes(
+		&mut self,
+		offset: u64,
+		bytes: &[u8],
+	) -> impl Future<Output = Result<(), Self::Error>> + Send {
+		self.pieces.push((offset, bytes.len()));
+		self.bytes.extend_from_slice(bytes);
+		std::future::ready(Ok(()))
+	}
+}
+
+/// Reads `[offset, offset + len)` of `id` into a fresh sink.
+async fn read_range(
+	db: &FilenMobileCacheState,
+	id: &FfiId,
+	offset: u64,
+	len: u64,
+) -> (
+	Result<RangeRead, RangeReadError<std::convert::Infallible>>,
+	CollectingSink,
+) {
+	let mut sink = CollectingSink::default();
+	let res = db
+		.read_file_range(id, ByteRange::new(offset, len).unwrap(), &mut sink, None)
+		.await;
+	(res, sink)
+}
+
+fn byte_range(offset: u64, end: u64) -> std::ops::Range<usize> {
+	usize::try_from(offset).unwrap()..usize::try_from(end).unwrap()
+}
+
+#[shared_test_runtime]
+pub async fn test_read_file_range_splits_at_chunk_edges() {
+	let (db, rss) = get_db_resources().await;
+	let (id, contents) = upload_range_fixture(&db, &rss, "range_chunk_edges.bin").await;
+	let c = CHUNK_SIZE_U64;
+	let chunk = usize::try_from(c).unwrap();
+
+	// (offset, len, the pieces the sink must see)
+	let cases = [
+		(0, 1, vec![(0, 1)]),
+		(1, 4095, vec![(1, 4095)]),
+		(c - 1, 2, vec![(c - 1, 1), (c, 1)]),
+		(c - 4096, 8192, vec![(c - 4096, 4096), (c, 4096)]),
+		(c, c, vec![(c, chunk)]),
+		(c + 1, c, vec![(c + 1, chunk - 1), (2 * c, 1)]),
+	];
+	for (offset, len, pieces) in cases {
+		let (res, sink) = read_range(&db, &id, offset, len).await;
+		let read = res.unwrap();
+		assert_eq!(read.range, ByteRange::new(offset, len).unwrap());
+		assert_eq!(read.file_size, RANGE_FIXTURE_SIZE);
+		assert_eq!(read.integrity, RangeIntegrity::Unchecked);
+		assert_eq!(sink.started, Some(read));
+		assert_eq!(sink.pieces, pieces, "range {offset}+{len}");
+		assert_eq!(sink.bytes, contents[byte_range(offset, offset + len)]);
+	}
+
+	// The whole file, one piece per chunk, checked against the hash the upload declared.
+	let (res, sink) = read_range(&db, &id, 0, RANGE_FIXTURE_SIZE).await;
+	assert_eq!(res.unwrap().integrity, RangeIntegrity::HashChecked);
+	assert_eq!(
+		sink.pieces,
+		vec![(0, chunk), (c, chunk), (2 * c, chunk / 2 + 3)]
+	);
+	assert_eq!(sink.bytes, contents);
+}
+
+#[shared_test_runtime]
+pub async fn test_read_file_range_clamps_at_eof() {
+	let (db, rss) = get_db_resources().await;
+	let (id, contents) = upload_range_fixture(&db, &rss, "range_eof.bin").await;
+	let size = RANGE_FIXTURE_SIZE;
+
+	// The last byte.
+	let (res, sink) = read_range(&db, &id, size - 1, 1).await;
+	assert_eq!(res.unwrap().range, ByteRange::new(size - 1, 1).unwrap());
+	assert_eq!(sink.bytes, contents[byte_range(size - 1, size)]);
+
+	// An aligned request reaching past the end, as a placeholder hydration asks for its tail,
+	// reads to the end and says so.
+	let tail = size / 4096 * 4096;
+	for len in [8192, u64::MAX - tail] {
+		let (res, sink) = read_range(&db, &id, tail, len).await;
+		let read = res.unwrap();
+		assert_eq!(read.range, ByteRange::new(tail, size - tail).unwrap());
+		assert_eq!(read.range.end(), size);
+		assert_eq!(
+			sink.pieces,
+			vec![(tail, usize::try_from(size - tail).unwrap())]
+		);
+		assert_eq!(sink.bytes, contents[byte_range(tail, size)]);
+	}
+
+	// Nothing of a range starting at or past the end exists, and the sink hears nothing of it.
+	for offset in [size, size + 1, u64::MAX - 1] {
+		let (res, sink) = read_range(&db, &id, offset, 1).await;
+		match res {
+			Err(RangeReadError::PastEnd {
+				offset: at,
+				size: s,
+				..
+			}) => assert_eq!((at, s), (offset, size)),
+			other => panic!("expected PastEnd for offset {offset}, got {other:?}"),
+		}
+		assert_eq!(sink.started, None);
+		assert!(sink.pieces.is_empty());
+	}
+}
+
+/// Trips the abort on the first bytes it gets, then never accepts them, so the read cannot finish
+/// before the abort is seen.
+struct AbortingSink {
+	controller: Arc<FfiAbortController>,
+	pieces: usize,
+}
+
+impl RangeSink for AbortingSink {
+	type Error = std::convert::Infallible;
+
+	fn on_start(&mut self, _read: &RangeRead) -> Result<(), Self::Error> {
+		Ok(())
+	}
+
+	fn on_bytes(
+		&mut self,
+		_offset: u64,
+		_bytes: &[u8],
+	) -> impl Future<Output = Result<(), Self::Error>> + Send {
+		self.pieces += 1;
+		self.controller.abort();
+		std::future::pending()
+	}
+}
+
+#[shared_test_runtime]
+pub async fn test_read_file_range_aborted_mid_read() {
+	let (db, rss) = get_db_resources().await;
+	let (id, _) = upload_range_fixture(&db, &rss, "range_abort.bin").await;
+	let controller = Arc::new(FfiAbortController::new());
+	let signal = controller.signal();
+	let mut sink = AbortingSink {
+		controller,
+		pieces: 0,
+	};
+
+	let res = db
+		.read_file_range(
+			&id,
+			ByteRange::new(0, RANGE_FIXTURE_SIZE).unwrap(),
+			&mut sink,
+			Some(&signal),
+		)
+		.await;
+
+	assert!(
+		matches!(res, Err(RangeReadError::Cache(CacheError::Aborted(_)))),
+		"got {res:?}"
+	);
+	assert_eq!(
+		sink.pieces, 1,
+		"the abort must stop the read after the first piece"
+	);
+}
+
+#[shared_test_runtime]
+pub async fn test_read_file_range_aborted_before_it_starts() {
+	let (db, rss) = get_db_resources().await;
+	let id: FfiId = format!(
+		"{}/{}/range_never_read.bin",
+		db.root_uuid().unwrap(),
+		rss.dir.name().unwrap()
+	)
+	.into();
+	let controller = FfiAbortController::new();
+	controller.abort();
+	let mut sink = CollectingSink::default();
+
+	let res = db
+		.read_file_range(
+			&id,
+			ByteRange::new(0, 1).unwrap(),
+			&mut sink,
+			Some(&controller.signal()),
+		)
+		.await;
+
+	assert!(
+		matches!(res, Err(RangeReadError::Cache(CacheError::Aborted(_)))),
+		"got {res:?}"
+	);
+	assert_eq!(sink.started, None);
+}
+
+/// A sink that refuses the read in `on_start`, or the bytes after `accept` pieces.
+struct RefusingSink {
+	refuse_start: bool,
+	accept: usize,
+	pieces: Vec<(u64, usize)>,
+}
+
+impl RangeSink for RefusingSink {
+	type Error = &'static str;
+
+	fn on_start(&mut self, _read: &RangeRead) -> Result<(), Self::Error> {
+		if self.refuse_start {
+			Err("refused the read")
+		} else {
+			Ok(())
+		}
+	}
+
+	fn on_bytes(
+		&mut self,
+		offset: u64,
+		bytes: &[u8],
+	) -> impl Future<Output = Result<(), Self::Error>> + Send {
+		let res = if self.pieces.len() < self.accept {
+			self.pieces.push((offset, bytes.len()));
+			Ok(())
+		} else {
+			Err("refused the bytes")
+		};
+		std::future::ready(res)
+	}
+}
+
+#[shared_test_runtime]
+pub async fn test_read_file_range_ends_where_the_sink_refuses() {
+	let (db, rss) = get_db_resources().await;
+	let (id, _) = upload_range_fixture(&db, &rss, "range_refused.bin").await;
+	let whole = ByteRange::new(0, RANGE_FIXTURE_SIZE).unwrap();
+
+	// Refused before anything is downloaded: nothing is delivered.
+	let mut sink = RefusingSink {
+		refuse_start: true,
+		accept: usize::MAX,
+		pieces: Vec::new(),
+	};
+	let res = db.read_file_range(&id, whole, &mut sink, None).await;
+	assert!(
+		matches!(res, Err(RangeReadError::Sink("refused the read"))),
+		"got {res:?}"
+	);
+	assert!(sink.pieces.is_empty());
+
+	// Refused on the second piece: the first is all the sink took, and nothing follows.
+	let mut sink = RefusingSink {
+		refuse_start: false,
+		accept: 1,
+		pieces: Vec::new(),
+	};
+	let res = db.read_file_range(&id, whole, &mut sink, None).await;
+	assert!(
+		matches!(res, Err(RangeReadError::Sink("refused the bytes"))),
+		"got {res:?}"
+	);
+	assert_eq!(
+		sink.pieces,
+		vec![(0, usize::try_from(CHUNK_SIZE_U64).unwrap())]
+	);
+}
+
+#[shared_test_runtime]
+pub async fn test_read_file_range_resolves_ids_from_the_cache() {
+	let (db, rss) = get_db_resources().await;
+	let (path_id, contents) = upload_range_fixture(&db, &rss, "range_ids.bin").await;
+	let dir_id = list_range_dir(&db, &rss).await;
+
+	// A `stable/<id>` names the file's row, and reads what its path does.
+	let Some(FfiObject::File(file)) = db.query_item(&path_id).unwrap() else {
+		panic!("the fixture is a file");
+	};
+	let stable_id: FfiId = format!("stable/{}", file.stable_uuid).into();
+	let offset = CHUNK_SIZE_U64 - 4096;
+	let (by_path, path_sink) = read_range(&db, &path_id, offset, 8192).await;
+	let (by_stable, stable_sink) = read_range(&db, &stable_id, offset, 8192).await;
+	assert_eq!(by_stable.unwrap(), by_path.unwrap());
+	assert_eq!(stable_sink.pieces, path_sink.pieces);
+	assert_eq!(
+		stable_sink.bytes,
+		contents[byte_range(offset, offset + 8192)]
+	);
+
+	// A directory is no file, and a path naming nothing the cache holds is no item; neither
+	// reaches the sink.
+	let (res, sink) = read_range(&db, &dir_id, 0, 1).await;
+	assert!(
+		matches!(res, Err(RangeReadError::Cache(CacheError::Unsupported(_)))),
+		"got {res:?}"
+	);
+	assert_eq!(sink.started, None);
+	let (res, sink) = read_range(&db, &dir_id.join("range_missing.bin"), 0, 1).await;
+	assert!(
+		matches!(res, Err(RangeReadError::Cache(CacheError::DoesNotExist(_)))),
+		"got {res:?}"
+	);
+	assert_eq!(sink.started, None);
+}
+
+/// Trips the abort with the piece that ends the range, and takes that piece.
+struct AbortingAtTheEndSink {
+	controller: FfiAbortController,
+	end: u64,
+	pieces: Vec<(u64, usize)>,
+}
+
+impl RangeSink for AbortingAtTheEndSink {
+	type Error = std::convert::Infallible;
+
+	fn on_start(&mut self, _read: &RangeRead) -> Result<(), Self::Error> {
+		Ok(())
+	}
+
+	fn on_bytes(
+		&mut self,
+		offset: u64,
+		bytes: &[u8],
+	) -> impl Future<Output = Result<(), Self::Error>> + Send {
+		self.pieces.push((offset, bytes.len()));
+		if offset + u64::try_from(bytes.len()).unwrap() == self.end {
+			self.controller.abort();
+		}
+		std::future::ready(Ok(()))
+	}
+}
+
+#[shared_test_runtime]
+pub async fn test_read_file_range_aborted_after_its_last_byte_succeeds() {
+	let (db, rss) = get_db_resources().await;
+	let (id, _) = upload_range_fixture(&db, &rss, "range_abort_at_end.bin").await;
+	let offset = CHUNK_SIZE_U64 - 4096;
+	let mut sink = AbortingAtTheEndSink {
+		controller: FfiAbortController::new(),
+		end: offset + 8192,
+		pieces: Vec::new(),
+	};
+	let signal = sink.controller.signal();
+
+	let res = db
+		.read_file_range(
+			&id,
+			ByteRange::new(offset, 8192).unwrap(),
+			&mut sink,
+			Some(&signal),
+		)
+		.await;
+
+	assert!(signal.is_aborted());
+	assert_eq!(
+		res.unwrap().range,
+		ByteRange::new(offset, 8192).unwrap(),
+		"every byte was delivered before the abort"
+	);
+	assert_eq!(sink.pieces, vec![(offset, 4096), (CHUNK_SIZE_U64, 4096)]);
+}
+
+/// A whole-file read of a file whose content does not hash to the BLAKE3 its metadata declares
+/// fails with the chunk that completes the file, before that chunk reaches the sink.
+#[cfg(feature = "malformed")]
+#[shared_test_runtime]
+pub async fn test_read_file_range_of_a_file_not_matching_its_hash_fails() {
+	let (db, rss) = get_db_resources().await;
+	let name = "range_hash_mismatch.bin";
+	let contents = range_fixture_contents();
+	let file = rss.client.make_file_builder(name, rss.dir.uuid()).unwrap();
+	let mut file = rss.client.upload_file(file, &contents).await.unwrap();
+	rss.client
+		.replace_file_hash(&mut file, blake3::hash(b"other bytes").into())
+		.await
+		.unwrap();
+	let id = list_range_dir(&db, &rss).await.join(name);
+
+	let (res, sink) = read_range(&db, &id, 0, RANGE_FIXTURE_SIZE).await;
+
+	assert!(
+		matches!(
+			res,
+			Err(RangeReadError::Cache(CacheError::ContentHashMismatch(_)))
+		),
+		"got {res:?}"
+	);
+	assert_eq!(
+		sink.started.map(|read| read.integrity),
+		Some(RangeIntegrity::HashChecked)
+	);
+	let chunk = usize::try_from(CHUNK_SIZE_U64).unwrap();
+	assert_eq!(sink.pieces, vec![(0, chunk), (CHUNK_SIZE_U64, chunk)]);
+	assert_eq!(sink.bytes, contents[..2 * chunk]);
 }

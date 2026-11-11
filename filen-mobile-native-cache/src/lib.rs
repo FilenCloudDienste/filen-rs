@@ -13,6 +13,7 @@ pub use error::CacheError;
 pub mod auth;
 pub(crate) mod live;
 pub mod local;
+pub mod range;
 pub mod remote;
 pub(crate) mod replay;
 pub mod thumbnail;

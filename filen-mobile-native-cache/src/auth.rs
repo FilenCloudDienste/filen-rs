@@ -807,8 +807,10 @@ async fn recheck_authenticated(
 
 /// Applies a refreshed session. The same account (user id and root uuid) keeps everything but
 /// the client: the cache DB, the gap bookkeeping, the materialized set, the file locks. Every
-/// operation holds the state read guard for its whole duration, so this runs only once those
-/// already in flight are done with the old client. The live path is reset to resubscribe on the
+/// operation but a range read holds the state read guard for its whole duration, so this runs
+/// only once those already in flight are done with the old client; a range read
+/// ([`FilenMobileCacheState::read_file_range`]) writes nothing of the cache's and finishes on the
+/// client it started with. The live path is reset to resubscribe on the
 /// new client, since the socket authenticates with the api key, and the search, bound to the old
 /// client, is dropped for the next query to recreate. Thumbnail settings arrive with the new
 /// client's config; the file budgets apply at the next full build.
