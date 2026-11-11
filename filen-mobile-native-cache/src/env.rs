@@ -3,6 +3,7 @@ use std::{
 	sync::{Arc, Mutex, MutexGuard, OnceLock},
 };
 
+use filen_sdk_rs::auth::http::LogLevel;
 use tokio::{
 	runtime::{Builder, Runtime},
 	task::{AbortHandle, JoinSet},
@@ -13,11 +14,18 @@ static RUNTIME: OnceLock<Runtime> = OnceLock::new();
 /// Idempotent; installs the per-target tracing subscriber (logcat on Android, os_log on Apple
 /// targets, fmt elsewhere) unless a host already installed one.
 pub(crate) fn init_logger() {
-	#[cfg(target_vendor = "apple")]
-	let level = filen_sdk_rs::auth::http::LogLevel::Info;
-	#[cfg(not(target_vendor = "apple"))]
-	let level = filen_sdk_rs::auth::http::LogLevel::Debug;
-	filen_sdk_rs::obs::try_init(level);
+	filen_sdk_rs::obs::try_init(default_log_level(cfg!(target_os = "android")));
+}
+
+/// The first-party level [`init_logger`] starts at: Debug on Android, Info everywhere else
+/// (Apple, and the desktop targets such as Windows and Linux). Takes the target as a flag so both
+/// answers are testable on any host.
+fn default_log_level(android: bool) -> LogLevel {
+	if android {
+		LogLevel::Debug
+	} else {
+		LogLevel::Info
+	}
 }
 
 /// Idempotent; caps the global rayon pool at 2 threads so the extension stays near-idle. Must
@@ -151,6 +159,24 @@ impl BackgroundTasks {
 		self.0
 			.lock()
 			.unwrap_or_else(|poisoned| poisoned.into_inner())
+	}
+}
+
+#[cfg(test)]
+mod log_level_tests {
+	use filen_sdk_rs::auth::http::LogLevel;
+
+	use super::default_log_level;
+
+	#[test]
+	fn android_starts_at_debug() {
+		assert!(matches!(default_log_level(true), LogLevel::Debug));
+	}
+
+	/// Apple, Windows and Linux all start at Info.
+	#[test]
+	fn every_other_target_starts_at_info() {
+		assert!(matches!(default_log_level(false), LogLevel::Info));
 	}
 }
 
