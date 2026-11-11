@@ -2,6 +2,7 @@
 	"UniffiThrownObject": "napi/compat.d.ts declares it for FilenSdkError.hasInner/getInner; ubrn's is a runtime class the react-native package does not export",
 	"__napiBindingTarget": "napi's loader reports which binding it loaded; ubrn has no counterpart",
 	"FilenSdkErrorNapi": "napi aliases a class by its Rust name when that differs from its JS name",
+	"Blake3Hash": "napi has no owned ArrayBuffer; bytes cross as a Uint8Array",
 	"CacheStatusMessage_Errors_Inner": "napi cannot inline a data-enum variant's payload, so it names it; ubrn inlines it in the variant",
 	"CacheStatusMessage_ResyncProgress_Inner": "napi cannot inline a data-enum variant's payload, so it names it; ubrn inlines it in the variant",
 	"CacheStatusMessage_SyncRootsDeleted_Inner": "napi cannot inline a data-enum variant's payload, so it names it; ubrn inlines it in the variant",

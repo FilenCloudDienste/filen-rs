@@ -42,6 +42,8 @@
  * napi has no ManagedFuture.create: a managed call takes a plain object, whose abortSignal and
  * pauseSignal are a ManagedAbortSignal and a PauseSignal or undefined.
  *
+ * Bytes cross as a Uint8Array where ubrn has an ArrayBuffer: napi has no owned ArrayBuffer.
+ *
  * This header declares what napi cannot generate from Rust. */
 /* eslint-disable */
 
@@ -60,6 +62,9 @@ export type JsRcloneDaemonInterface = JsRcloneDaemon
 export type PauseSignalInterface = PauseSignal
 export type ManagedAbortControllerInterface = ManagedAbortController
 export type ManagedAbortSignalInterface = ManagedAbortSignal
+
+/** A BLAKE3 hash, 32 bytes. */
+export type Blake3Hash = Uint8Array
 
 /** What a managed call can be paused and aborted through. */
 export type ManagedFuture = {

@@ -14,6 +14,8 @@ mod managed;
 // because of the glue napi-derive generates for the `#[napi]` items here, in `error` and in
 // `managed`. The hand-written impls and helpers beside those items carry the deny one by one.
 #[deny(unsafe_code)]
+pub(crate) mod bytes;
+#[deny(unsafe_code)]
 mod promise;
 #[deny(unsafe_code)]
 mod wire;
