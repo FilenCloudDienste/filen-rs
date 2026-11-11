@@ -65,7 +65,10 @@ impl FfiAbortSignal {
 	/// A controller dropped without an explicit abort is NOT an abort: an app that fails to
 	/// retain it — ARC finalising it mid-transfer — must not thereby cancel the transfer, so that
 	/// branch parks forever rather than resolving.
-	pub(crate) async fn aborted(&self) {
+	///
+	/// Public for a Rust caller that waits on its own work before handing the signal to a call,
+	/// such as a provider queueing a read behind a concurrency limit.
+	pub async fn aborted(&self) {
 		let mut receiver = self.receiver.clone();
 		loop {
 			if *receiver.borrow_and_update() {
