@@ -113,6 +113,202 @@ impl JsClient {
 	}
 }
 
+/// `JsClient.listDirRecursiveWithPaths` on napi, which takes callback objects the macros cannot
+/// read. Each becomes one [`Listener`](crate::js::napi::Listener), read and bound on the JS thread
+/// when the call is made; the listing resolves with the whole tree at once, and every callback call
+/// made before it returned runs before its promise settles.
+#[cfg(feature = "napi")]
+mod napi_impl {
+	use std::sync::Arc;
+
+	use napi::{
+		Env,
+		bindgen_prelude::{BigInt, Either, FnArgs, FunctionRef, Object, PromiseRaw, Undefined},
+	};
+
+	use crate::{
+		Error, auth,
+		js::{
+			AnyDirWithContext, DirsAndFilesWithPaths,
+			napi::{
+				FromWire, IntoWire, Listener, ListenerCall, OptionReturn, Wire, bound_method,
+				spawn_promise,
+			},
+		},
+	};
+
+	/// One call of a listing's `DirContentDownloadProgressCallback`: the bytes listed so far and
+	/// the total.
+	pub(super) struct ListProgress {
+		downloaded: BigInt,
+		/// `undefined` while the total is unknown, as ubrn passes it, where napi writes `null`.
+		total: Either<BigInt, Undefined>,
+	}
+
+	impl ListProgress {
+		fn new(downloaded: u64, total: Option<u64>) -> Self {
+			Self {
+				downloaded: downloaded.into_wire(),
+				total: OptionReturn(total).into_wire(),
+			}
+		}
+	}
+
+	impl ListenerCall for ListProgress {
+		type Methods = FunctionRef<FnArgs<(BigInt, Either<BigInt, Undefined>)>, ()>;
+
+		fn bind(callback: &Object<'_>) -> napi::Result<Self::Methods> {
+			bound_method(callback, "onProgress")
+		}
+
+		fn call(self, env: &Env, on_progress: &Self::Methods) -> napi::Result<()> {
+			// `call`, not `apply`: it takes a throw out of the environment and returns it, where a
+			// pending one would end the process as an uncaught exception.
+			on_progress
+				.borrow_back(env)?
+				.call(FnArgs::from((self.downloaded, self.total)))
+		}
+	}
+
+	/// One call of a listing's `DirContentDownloadErrorCallback`: the errors the scan met.
+	pub(super) struct ListErrors(Vec<<Arc<Error> as Wire>::Wire>);
+
+	impl ListenerCall for ListErrors {
+		type Methods = FunctionRef<Vec<<Arc<Error> as Wire>::Wire>, ()>;
+
+		fn bind(callback: &Object<'_>) -> napi::Result<Self::Methods> {
+			bound_method(callback, "onErrors")
+		}
+
+		fn call(self, env: &Env, on_errors: &Self::Methods) -> napi::Result<()> {
+			// `call`, not `apply`, as in `ListProgress::call`.
+			on_errors.borrow_back(env)?.call(self.0)
+		}
+	}
+
+	/// `listDirRecursiveWithPaths`'s body, outside the module whose `#[napi] impl` needs the
+	/// `unsafe_code` allow. A callback without its method throws napi's own error synchronously; a
+	/// directory the SDK cannot read rejects.
+	// napi-derive registers the method calling this only outside `cfg(test)`.
+	#[cfg_attr(test, allow(dead_code))]
+	fn list_dir_recursive_with_paths<'env>(
+		client: &auth::JsClient,
+		env: &'env Env,
+		dir: <AnyDirWithContext as Wire>::Wire,
+		list_dir_progress_callback: Option<Object<'env>>,
+		scan_error_callback: Object<'env>,
+		async_opts: Option<Object<'env>>,
+	) -> napi::Result<PromiseRaw<'env, <DirsAndFilesWithPaths as Wire>::Wire>> {
+		let progress = list_dir_progress_callback
+			.map(|callback| Listener::<ListProgress>::new(env, callback))
+			.transpose()?;
+		let errors = Listener::<ListErrors>::new(env, scan_error_callback)?;
+		// Read here, on the JS thread: no JS value enters the future.
+		let dir = AnyDirWithContext::from_wire(dir);
+		let client = client.clone();
+		spawn_promise(env, async_opts, async move {
+			let dir = dir?;
+			let on_progress = progress.clone().map(|listener| {
+				move |downloaded, total| listener.send(ListProgress::new(downloaded, total))
+			});
+			let on_errors = {
+				let errors = errors.clone();
+				move |scan_errors: Vec<Error>| {
+					errors.send(ListErrors(
+						scan_errors
+							.into_iter()
+							.map(|e| Arc::new(e).into_wire())
+							.collect(),
+					));
+				}
+			};
+			let listed = client
+				.inner_list_dir_recursive_with_paths(dir, on_progress, on_errors)
+				.await;
+			if let Some(progress) = &progress {
+				progress.flushed().await;
+			}
+			errors.flushed().await;
+			listed
+		})
+	}
+
+	// napi-derive's generated FFI glue (the raw N-API calls of the method's callback) lands in
+	// this module, which holds nothing but the napi impl forwarding to
+	// `list_dir_recursive_with_paths`.
+	#[allow(unsafe_code)]
+	mod class {
+		use napi::{
+			Env,
+			bindgen_prelude::{Object, PromiseRaw},
+		};
+		use napi_derive::napi;
+
+		use super::list_dir_recursive_with_paths;
+		use crate::js::{
+			AnyDirWithContext, DirsAndFilesWithPaths,
+			napi::{JsClient, Wire},
+		};
+
+		#[napi]
+		impl JsClient {
+			/// List `dir` and everything below it, in one batch. Each path is the remote names
+			/// from `dir` down, joined with `/` and relative to `dir`; the names are NOT checked
+			/// for components unsafe on a local disk (`..`, separators, reserved names).
+			/// `listDirProgressCallback` gets the bytes of the listing downloaded so far and its
+			/// total, if known; `scanErrorCallback` the errors met reading the listing.
+			#[napi(
+				js_name = "listDirRecursiveWithPaths",
+				ts_args_type = "dir: AnyDirWithContext, listDirProgressCallback: DirContentDownloadProgressCallback | undefined, scanErrorCallback: DirContentDownloadErrorCallback, asyncOpts_?: { signal: AbortSignal }",
+				ts_return_type = "Promise<DirsAndFilesWithPaths>"
+			)]
+			pub fn __napi_list_dir_recursive_with_paths<'env>(
+				&self,
+				env: &'env Env,
+				dir: <AnyDirWithContext as Wire>::Wire,
+				list_dir_progress_callback: Option<Object<'env>>,
+				scan_error_callback: Object<'env>,
+				async_opts: Option<Object<'env>>,
+			) -> napi::Result<PromiseRaw<'env, <DirsAndFilesWithPaths as Wire>::Wire>> {
+				list_dir_recursive_with_paths(
+					&self.0,
+					env,
+					dir,
+					list_dir_progress_callback,
+					scan_error_callback,
+					async_opts,
+				)
+			}
+		}
+	}
+
+	#[cfg(test)]
+	mod tests {
+		use super::*;
+
+		#[test]
+		fn an_unknown_listing_total_is_written_as_undefined() {
+			let ListProgress {
+				downloaded: unknown_downloaded,
+				total: Either::B(()),
+			} = ListProgress::new(4, None)
+			else {
+				panic!("an unknown total was not undefined");
+			};
+			let ListProgress {
+				downloaded,
+				total: Either::A(total),
+			} = ListProgress::new(6, Some(u64::MAX))
+			else {
+				panic!("a known total was not a bigint");
+			};
+			assert_eq!(u64::from_wire(unknown_downloaded).unwrap(), 4);
+			assert_eq!(u64::from_wire(downloaded).unwrap(), 6);
+			assert_eq!(u64::from_wire(total).unwrap(), u64::MAX);
+		}
+	}
+}
+
 #[filen_macros::js_exports]
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 #[wasm_bindgen::prelude::wasm_bindgen(js_class = "Client")]
@@ -224,8 +420,6 @@ where
 	DirsAndFiles { dirs, files }
 }
 
-// No napi export lists a tree with paths yet.
-#[cfg_attr(feature = "napi", allow(dead_code))]
 #[allow(clippy::type_complexity)]
 fn dirs_and_files_into_js_with_paths<D, F>(
 	(dirs, files): (Vec<(D, String)>, Vec<(F, String)>),
@@ -291,8 +485,6 @@ impl JsClient {
 		.await
 	}
 
-	// No napi export lists a tree with paths yet.
-	#[cfg_attr(feature = "napi", allow(dead_code))]
 	async fn inner_list_dir_recursive_with_paths<F, F1>(
 		&self,
 		dir: AnyDirWithContext,

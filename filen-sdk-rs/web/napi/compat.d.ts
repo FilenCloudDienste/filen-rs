@@ -11,8 +11,8 @@
  * synchronously, also from a method that returns a
  * Promise, where ubrn's async methods reject. So does a cache listener without an onMessages
  * method, a sync engine listener without onEvents and onWatchStatus methods, and a transfer
- * callback without one of its methods (onUpdate, the six of a JsDirDownloadCallback or the five
- * of a JsDirUploadCallback). Every
+ * callback without one of its methods (onUpdate, the six of a JsDirDownloadCallback, the five
+ * of a JsDirUploadCallback, or a listing's onProgress or onErrors). Every
  * SDK error of an async call rejects, as under ubrn, and so
  * does a managedFuture whose abortSignal or pauseSignal is null or of another class (a
  * Conversion error).
@@ -27,7 +27,7 @@
  * goes to the new listener.
  *
  * A transfer's callback object (downloadFileToPath, uploadFile, downloadDirRecursively,
- * uploadDirRecursively) is read
+ * uploadDirRecursively, and listDirRecursiveWithPaths' two) is read
  * once, when the call is made, and its methods are called bound to it, on the JS thread, in order.
  * Every call made before the transfer settles runs before its promise settles, except after an
  * abort. One through asyncOpts_ rejects at once; one through the managedFuture's
@@ -164,4 +164,15 @@ export interface JsDirUploadCallback {
 	onUploadUpdate(uploadedDirs: Array<Dir>, uploadedFiles: Array<File>, uploadedBytes: bigint): void
 	/** Called when errors occur during the upload process, each with the local path that failed. */
 	onUploadErrors(errors: Array<UploadError>): void
+}
+
+/** Receives a recursive listing's download progress (listDirRecursiveWithPaths). */
+export interface DirContentDownloadProgressCallback {
+	/** The bytes of the listing downloaded so far, and its total once known. */
+	onProgress(bytesDownloaded: bigint, totalBytes: bigint | undefined): void
+}
+
+/** Receives the errors a recursive listing meets reading its entries (listDirRecursiveWithPaths). */
+export interface DirContentDownloadErrorCallback {
+	onErrors(errors: Array<FilenSdkErrorInterface>): void
 }

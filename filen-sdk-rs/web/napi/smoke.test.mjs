@@ -978,6 +978,36 @@ describe("transfers, offline", () => {
 		)
 		assert.deepEqual(calls, [])
 	})
+
+	test("listDirRecursiveWithPaths with an aborted signal rejects with an AbortError", async () => {
+		const calls = []
+		await assert.rejects(
+			synthClient(randomUUID()).listDirRecursiveWithPaths(
+				rootTarget(),
+				{ onProgress: (...args) => calls.push(["onProgress", ...args]) },
+				{ onErrors: errors => calls.push(["onErrors", errors]) },
+				{ signal: AbortSignal.abort() }
+			),
+			e => {
+				assert.equal(e.name, "AbortError")
+				assert.equal(FilenSdkError.hasInner(e), false)
+				return true
+			}
+		)
+		assert.deepEqual(calls, [])
+	})
+
+	test("a listing error callback without onErrors throws napi's own error", () => {
+		assert.throws(
+			() => synthClient(randomUUID()).listDirRecursiveWithPaths(rootTarget(), undefined, {}),
+			e => {
+				assert.ok(e instanceof Error)
+				assert.equal(e.code, "InvalidArg")
+				assert.equal(FilenSdkError.hasInner(e), false)
+				return true
+			}
+		)
+	})
 })
 
 describe("rclone, offline", () => {
