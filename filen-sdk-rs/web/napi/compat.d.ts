@@ -24,10 +24,12 @@
  * queued and the one being delivered) and those of that round not yet handed over. The next round
  * goes to the new listener.
  *
- * A transfer's callback object (downloadFileToPath) is read once, when the call is made, and its
- * methods are called bound to it, on the JS thread, in order. Every call made before the transfer
- * settles runs before its promise settles, except after an abort through asyncOpts_, which
- * rejects at once: calls already queued may still arrive after that.
+ * A transfer's callback object (downloadFileToPath, uploadFile) is read once, when the call is
+ * made, and its methods are called bound to it, on the JS thread, in order. Every call made before
+ * the transfer settles runs before its promise settles, except after an abort. One through
+ * asyncOpts_ rejects at once; one through the managedFuture's ManagedAbortSignal rejects as soon
+ * as the transfer is told to stop, which may still make a call and remove its temp file just
+ * after. Either way, calls already queued or made while it stops may arrive after the rejection.
  *
  * Sync engine listener calls and promise settlement are not ordered against each other: syncOnce, stopWatch
  * or close may resolve before the listener gets that call's last events or status. A UI reads
@@ -119,4 +121,13 @@ export interface JsFileDownloadCallback {
 	 * not a running total. Their sum is the file's size once the download completes.
 	 */
 	onUpdate(downloadedBytes: bigint): void
+}
+
+/** Receives a file upload's progress. */
+export interface JsFileUploadCallback {
+	/**
+	 * `uploadedBytes` is a **delta**: the plaintext bytes uploaded since the previous call, not a
+	 * running total. Their sum is the file's size once the upload completes.
+	 */
+	onUpdate(uploadedBytes: bigint): void
 }

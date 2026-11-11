@@ -30,6 +30,7 @@
 	"JsClient.getDir": "takes or returns a Dir, whose meta's DecryptedRaw bytes cross as a Uint8Array where ubrn has an ArrayBuffer",
 	"JsClient.createDir": "takes or returns a Dir, whose meta's DecryptedRaw bytes cross as a Uint8Array where ubrn has an ArrayBuffer",
 	"JsClient.downloadFileToPath": "takes an AnyFile, whose file meta's DecryptedRaw bytes cross as a Uint8Array where ubrn has an ArrayBuffer",
+	"JsClient.uploadFile": "takes a FileBuilderParamsOptionalName and returns a File, whose metas' DecryptedRaw bytes cross as a Uint8Array where ubrn has an ArrayBuffer",
 	"JsClientInterface": "takes or returns a Dir or an AnyFile, whose meta's DecryptedRaw bytes cross as a Uint8Array where ubrn has an ArrayBuffer",
 	"CacheStatusMessage_Errors_Inner": "napi cannot inline a data-enum variant's payload, so it names it; ubrn inlines it in the variant",
 	"CacheStatusMessage_ResyncProgress_Inner": "napi cannot inline a data-enum variant's payload, so it names it; ubrn inlines it in the variant",

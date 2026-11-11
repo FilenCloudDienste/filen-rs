@@ -1,11 +1,14 @@
 //! The path transfers' napi exports, which take callback objects the macros cannot read:
-//! `JsClient.downloadFileToPath`.
+//! `JsClient.downloadFileToPath` and `JsClient.uploadFile`.
 //!
 //! A call's callback object becomes one [`Listener`], read and bound on the JS thread when the call
 //! is made; the SDK's progress reaches it from the commander runtime without waiting on JS. Every
 //! call it makes before the SDK returns reaches JS before the call's promise settles (the call
-//! awaits [`Listener::flushed`]), except after an abort through `asyncOpts_`, which drops the call
-//! at once: its queued calls may then still arrive after it rejected.
+//! awaits [`Listener::flushed`]), except after an abort: one through `asyncOpts_` drops the call at
+//! once, and one through the managed future's `ManagedAbortSignal` rejects as soon as the transfer
+//! is told to stop, while it may still make a call or two and remove its temp file just after. In
+//! both cases calls already queued, or made while the transfer stops, may arrive after the
+//! rejection.
 
 use std::sync::Arc;
 
@@ -17,7 +20,7 @@ use napi::{
 use crate::{
 	auth,
 	js::{
-		AnyFile,
+		AnyFile, File, FileBuilderParamsOptionalName,
 		napi::{
 			FromWire, IntoWire, Listener, ListenerCall, Wire, read_managed_future, spawn_promise,
 		},
@@ -86,6 +89,42 @@ fn download_file_to_path<'env>(
 	})
 }
 
+/// `uploadFile`'s body, as [`download_file_to_path`]'s: a callback without a callable `onUpdate`
+/// throws napi's own error synchronously; params or a managed future the SDK cannot read reject.
+// napi-derive registers the method calling this only outside `cfg(test)`.
+#[cfg_attr(test, allow(dead_code))]
+fn upload_file<'env>(
+	client: &auth::JsClient,
+	env: &'env Env,
+	params: <FileBuilderParamsOptionalName as Wire>::Wire,
+	file_path: String,
+	callback: Option<Object<'env>>,
+	managed_future: Object<'env>,
+	async_opts: Option<Object<'env>>,
+) -> napi::Result<PromiseRaw<'env, <File as Wire>::Wire>> {
+	let listener = callback
+		.map(|callback| Listener::<FileProgress>::new(env, callback))
+		.transpose()?;
+	let managed_future = read_managed_future(&managed_future)?;
+	// Read here, on the JS thread: no JS value enters the future.
+	let params = FileBuilderParamsOptionalName::from_wire(params);
+	let client = client.inner();
+	spawn_promise(env, async_opts, async move {
+		let params = params?;
+		let managed_future = managed_future?;
+		let progress = listener.clone().map(file_progress);
+		let uploaded = managed_future
+			.into_js_managed_commander_future(move || {
+				super::upload_file(client, params, file_path, progress)
+			})
+			.await;
+		if let Some(listener) = &listener {
+			listener.flushed().await;
+		}
+		uploaded
+	})
+}
+
 // napi-derive's generated FFI glue (the raw N-API calls of each item's callback) lands in this
 // module, which holds nothing but the napi item forwarding to plain Rust.
 #[allow(unsafe_code)]
@@ -96,9 +135,9 @@ mod class {
 	};
 	use napi_derive::napi;
 
-	use super::download_file_to_path;
+	use super::{download_file_to_path, upload_file};
 	use crate::js::{
-		AnyFile,
+		AnyFile, File, FileBuilderParamsOptionalName,
 		napi::{JsClient, Wire},
 	};
 
@@ -125,6 +164,34 @@ mod class {
 				&self.0,
 				env,
 				file,
+				file_path,
+				callback,
+				managed_future,
+				async_opts,
+			)
+		}
+
+		/// Upload the local file at `filePath` as `params` describe it, named as the local file
+		/// when `params` gives no name. `callback.onUpdate` gets the bytes uploaded since its last call (a delta,
+		/// not a running total).
+		#[napi(
+			js_name = "uploadFile",
+			ts_args_type = "params: FileBuilderParamsOptionalName, filePath: string, callback: JsFileUploadCallback | undefined, managedFuture: ManagedFuture, asyncOpts_?: { signal: AbortSignal }",
+			ts_return_type = "Promise<File>"
+		)]
+		pub fn __napi_upload_file<'env>(
+			&self,
+			env: &'env Env,
+			params: <FileBuilderParamsOptionalName as Wire>::Wire,
+			file_path: String,
+			callback: Option<Object<'env>>,
+			managed_future: Object<'env>,
+			async_opts: Option<Object<'env>>,
+		) -> napi::Result<PromiseRaw<'env, <File as Wire>::Wire>> {
+			upload_file(
+				&self.0,
+				env,
+				params,
 				file_path,
 				callback,
 				managed_future,

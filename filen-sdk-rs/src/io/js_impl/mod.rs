@@ -95,8 +95,6 @@ where
 
 /// Uploads the local file at `file_path` as `params` describe it, handing `progress` the bytes
 /// uploaded since its last call.
-// No napi export uploads a file yet.
-#[cfg_attr(feature = "napi", allow(dead_code))]
 pub(crate) async fn upload_file(
 	client: Arc<Client>,
 	params: FileBuilderParamsOptionalName,

@@ -19,6 +19,7 @@ import * as sdk from "../node/index.js"
 
 const {
 	AnyFile_Tags,
+	AnyNormalDir_Tags,
 	Backlog,
 	CacheStatusMessage_Tags,
 	ConflictReason,
@@ -855,6 +856,47 @@ describe("transfers, offline", () => {
 			)
 		})
 	}
+
+	// Upload params into the root of a synthesized account.
+	const uploadParams = () => ({
+		parent: { tag: AnyNormalDir_Tags.Root, inner: [{ uuid: randomUUID() }] },
+		noExif: false,
+		noExifOverride: false
+	})
+
+	test("uploadFile of a missing path rejects with an IO error before any request", async () => {
+		const updates = []
+		await assert.rejects(
+			synthClient(randomUUID()).uploadFile(
+				uploadParams(),
+				join(dir, "missing.txt"),
+				{ onUpdate: bytes => updates.push(bytes) },
+				noSignals
+			),
+			e => {
+				assert.equal(assertThrownLikeUbrn(e).kind(), ErrorKind.Io)
+				return true
+			}
+		)
+		assert.deepEqual(updates, [])
+	})
+
+	test("uploadFile with an aborted signal rejects and calls no callback", async () => {
+		const source = join(dir, "upload.txt")
+		writeFileSync(source, "a")
+		const updates = []
+		await assert.rejects(
+			synthClient(randomUUID()).uploadFile(uploadParams(), source, { onUpdate: bytes => updates.push(bytes) }, noSignals, {
+				signal: AbortSignal.abort()
+			}),
+			e => {
+				assert.equal(e.name, "AbortError")
+				assert.equal(FilenSdkError.hasInner(e), false)
+				return true
+			}
+		)
+		assert.deepEqual(updates, [])
+	})
 })
 
 describe("rclone, offline", () => {
