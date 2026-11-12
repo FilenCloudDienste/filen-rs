@@ -3463,12 +3463,13 @@ fn a_directory_removed_under_the_walk_is_a_gap_of_the_scan() {
 
 #[test]
 fn nanos_past_is_zero_for_an_mtime_past_chronos_range() {
+	// A multiple of 100 ns: a Windows `SystemTime` holds 100 ns ticks and drops the rest.
 	assert_eq!(
 		nanos_past(
-			UNIX_EPOCH + Duration::from_millis(1500) + Duration::from_nanos(250),
+			UNIX_EPOCH + Duration::from_millis(1500) + Duration::from_nanos(1_300),
 			1500
 		),
-		250
+		1_300
 	);
 	assert_eq!(nanos_past(UNIX_EPOCH - Duration::from_millis(1), -1), 0);
 
