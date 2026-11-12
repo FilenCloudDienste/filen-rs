@@ -1,6 +1,7 @@
 use std::{
 	borrow::Cow,
 	env, mem,
+	path::Path,
 	sync::{Arc, Mutex, OnceLock, PoisonError},
 	time::Duration,
 };
@@ -172,6 +173,23 @@ impl Resources {
 			lock,
 		)
 	}
+}
+
+/// Copies the executable `from` to `to`. On Unix in a `cp` of its own: a child another test forks
+/// while this process holds `to` open for writing keeps it open until it execs, `O_CLOEXEC` or not,
+/// and running `to` meanwhile fails with `ETXTBSY`.
+pub fn copy_executable(from: &Path, to: &Path) {
+	#[cfg(unix)]
+	{
+		let status = std::process::Command::new("cp")
+			.arg(from)
+			.arg(to)
+			.status()
+			.unwrap();
+		assert!(status.success(), "{status}");
+	}
+	#[cfg(not(unix))]
+	std::fs::copy(from, to).unwrap();
 }
 
 static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();

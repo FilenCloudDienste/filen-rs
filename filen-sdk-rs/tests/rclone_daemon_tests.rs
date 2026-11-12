@@ -17,6 +17,7 @@ use filen_sdk_rs::rclone::{
 };
 use serde_json::json;
 use tempfile::TempDir;
+use test_utils::copy_executable;
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
 
 const GRACEFUL: StopOptions = StopOptions {
@@ -460,23 +461,6 @@ async fn concurrent_managed_downloads_install_one_runnable_binary() {
 		.unwrap();
 	assert!(version.status.success(), "{version:?}");
 	assert!(version.stdout.starts_with(b"rclone v"), "{version:?}");
-}
-
-/// Copies the executable `from` to `to`. On Unix in a `cp` of its own: a child another test forks
-/// while this process holds `to` open for writing keeps it open until it execs, `O_CLOEXEC` or not,
-/// and running `to` meanwhile fails with `ETXTBSY`.
-fn copy_executable(from: &Path, to: &Path) {
-	#[cfg(unix)]
-	{
-		let status = std::process::Command::new("cp")
-			.arg(from)
-			.arg(to)
-			.status()
-			.unwrap();
-		assert!(status.success(), "{status}");
-	}
-	#[cfg(not(unix))]
-	std::fs::copy(from, to).unwrap();
 }
 
 /// An `rclone rcd` that does nothing until it is stopped.

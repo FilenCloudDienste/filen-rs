@@ -20,7 +20,7 @@ use predicates::str::contains;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
-use test_utils::cli::logged_out_command;
+use test_utils::{cli::logged_out_command, copy_executable};
 use tiny_http::{Header, Response, Server};
 
 /// The target the CLI was built for, which names its release asset.
@@ -238,7 +238,7 @@ impl Installation {
 	fn new(name: &str) -> Self {
 		let bin_dir = tempfile::tempdir().unwrap();
 		let executable = bin_dir.path().join(format!("{name}{EXE_SUFFIX}"));
-		fs::copy(assert_cmd::cargo::cargo_bin!(), &executable).unwrap();
+		copy_executable(assert_cmd::cargo::cargo_bin!(), &executable);
 		Self {
 			bin_dir,
 			executable,
