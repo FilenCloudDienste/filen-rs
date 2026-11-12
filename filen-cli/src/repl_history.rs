@@ -261,7 +261,7 @@ mod tests {
 
 	#[test]
 	fn a_line_that_does_not_parse_is_not_saved() {
-		assert!(!is_safe_to_save("ls 'unclosed"));
+		assert!(!is_safe_to_save("ls \"unclosed"));
 		assert!(!is_safe_to_save("unknowncommand hunter2"));
 	}
 
