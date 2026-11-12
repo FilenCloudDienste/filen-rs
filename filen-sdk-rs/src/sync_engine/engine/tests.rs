@@ -6944,11 +6944,13 @@ fn a_lock_that_fails_otherwise_refuses_the_open() {
 async fn a_finished_pass_gives_back_the_pair_writers_page_cache() {
 	let dir = tempfile::tempdir().unwrap();
 	let path = dir.path().join("baseline.db");
+	let local = dir.path().join("local");
+	std::fs::create_dir(&local).unwrap();
 	let engine = SyncEngine::open(Arc::new(offline_client()), path.clone())
 		.await
 		.unwrap();
 	let (pair, _) = locked(&engine.control)
-		.create_pair("/root", Uuid::new_v4(), SyncMode::TwoWay)
+		.create_pair(local.to_str().unwrap(), Uuid::new_v4(), SyncMode::TwoWay)
 		.unwrap();
 	let store = cache_a_rewritten_page(&engine, pair, &path).await;
 
@@ -6982,7 +6984,7 @@ async fn an_idle_wake_keeps_the_pair_writers_page_cache() {
 		);
 		return;
 	};
-	let (engine, pair, path) = engine_with_pair("idle_wake_release").await;
+	let (_root, engine, pair, path) = engine_with_pair("idle_wake_release").await;
 	// Watched, with nothing announced on either side: the wake a quiet tree's watch makes.
 	let changes = engine.pair_changes(pair).await;
 	changes.cover_local();
@@ -7034,7 +7036,7 @@ fn answer_alone(name: &str) -> String {
 /// does, whatever its read came to.
 #[tokio::test]
 async fn a_dry_run_gives_back_the_pair_writers_page_cache() {
-	let (engine, pair, path) = engine_with_pair("plan_release").await;
+	let (_root, engine, pair, path) = engine_with_pair("plan_release").await;
 	let store = cache_a_rewritten_page(&engine, pair, &path).await;
 
 	// Offline, so the read fails before anything is planned: the way out is what is under test.
@@ -7056,7 +7058,7 @@ async fn a_dry_run_gives_back_the_pair_writers_page_cache() {
 /// adopted.
 #[tokio::test]
 async fn an_adoption_gives_back_the_pair_writers_page_cache() {
-	let (engine, pair, path) = engine_with_pair("adopt_release").await;
+	let (_root, engine, pair, path) = engine_with_pair("adopt_release").await;
 	let store = cache_a_rewritten_page(&engine, pair, &path).await;
 
 	// Offline, as the dry run above.
@@ -7077,7 +7079,7 @@ async fn an_adoption_gives_back_the_pair_writers_page_cache() {
 /// And so does the confirmation sweep a resume runs, which reads every unconfirmed row.
 #[tokio::test]
 async fn a_confirmation_sweep_gives_back_the_pair_writers_page_cache() {
-	let (engine, pair, path) = engine_with_pair("sweep_release").await;
+	let (_root, engine, pair, path) = engine_with_pair("sweep_release").await;
 	// A push no announcement has confirmed, so the sweep reads the rows instead of returning at
 	// its first look.
 	let pushed = synced_file(
@@ -8111,9 +8113,14 @@ const STUCK_AFTER: Duration = Duration::from_secs(30);
 /// as on an idle one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn a_pairs_store_hold_does_not_delay_another_pairs_control_verbs() {
-	let (engine, pair_a, path) = engine_with_pair("store_split_control").await;
+	let (_root, engine, pair_a, path) = engine_with_pair("store_split_control").await;
+	let root_b = tempfile::tempdir().unwrap();
 	let (pair_b, _) = locked(&engine.control)
-		.create_pair("/root-b", Uuid::new_v4(), SyncMode::TwoWay)
+		.create_pair(
+			root_b.path().to_str().unwrap(),
+			Uuid::new_v4(),
+			SyncMode::TwoWay,
+		)
 		.unwrap();
 	let store_b = engine.pair_store(pair_b).await.unwrap();
 	locked(&store_b)
@@ -8152,7 +8159,7 @@ async fn a_pairs_store_hold_does_not_delay_another_pairs_control_verbs() {
 /// whole-tree SQLite work from stalling a runtime this engine shares with everything else.
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn a_pairs_whole_tree_store_work_waits_off_the_runtime_thread() {
-	let (engine, pair, path) = engine_with_pair("store_off_runtime").await;
+	let (_root, engine, pair, path) = engine_with_pair("store_off_runtime").await;
 	let engine = Arc::new(engine);
 	let store = engine.pair_store(pair).await.unwrap();
 	let hold = StoreHold::take(Arc::clone(&store)).await;
@@ -8206,29 +8213,35 @@ async fn a_pairs_whole_tree_store_work_waits_off_the_runtime_thread() {
 	std::fs::remove_file(&path).ok();
 }
 
-/// A fresh engine on a throwaway baseline DB, with one pair registered.
+/// A fresh engine on a throwaway baseline DB, with one pair registered at a fresh empty directory,
+/// which lasts as long as the returned guard.
 ///
 /// An offline client is enough to open an engine, here and in every test that opens one:
 /// [`SyncEngine::open`] only hands it to the cache to subscribe each pair's remote root, and a
 /// subscription the cache refuses leaves that pair on the grace window instead of failing the
 /// open (see [`SyncEngine::observe_pair`]) — which is exactly what an unconfigured cache
 /// answers.
-async fn engine_with_pair(tag: &str) -> (SyncEngine, PairId, PathBuf) {
+async fn engine_with_pair(tag: &str) -> (tempfile::TempDir, SyncEngine, PairId, PathBuf) {
+	let root = tempfile::tempdir().unwrap();
 	let path = std::env::temp_dir().join(format!("filen_sync_{tag}_{}.db", Uuid::new_v4()));
 	let engine = SyncEngine::open(Arc::new(offline_client()), path.clone())
 		.await
 		.unwrap();
 	let (pair, _) = locked(&engine.control)
-		.create_pair("/root", Uuid::new_v4(), SyncMode::TwoWay)
+		.create_pair(
+			root.path().to_str().unwrap(),
+			Uuid::new_v4(),
+			SyncMode::TwoWay,
+		)
 		.unwrap();
-	(engine, pair, path)
+	(root, engine, pair, path)
 }
 
 /// The user ignore patterns round-trip, and a text with a bad line is refused whole, naming that
 /// line and leaving the stored text alone.
 #[tokio::test]
 async fn user_ignore_patterns_round_trip_and_a_bad_text_is_refused_whole() {
-	let (engine, _, path) = engine_with_pair("user_ignore").await;
+	let (_root, engine, _, path) = engine_with_pair("user_ignore").await;
 	assert_eq!(engine.user_ignore().await.unwrap(), "");
 	engine.set_user_ignore("*.psd\nbuild/").await.unwrap();
 	assert_eq!(engine.user_ignore().await.unwrap(), "*.psd\nbuild/");
@@ -8271,7 +8284,7 @@ async fn user_ignore_patterns_round_trip_and_a_bad_text_is_refused_whole() {
 /// side held — and nothing from a synced row; an unknown pair is an error, not an empty list.
 #[tokio::test]
 async fn list_conflicts_reads_the_held_rows_only() {
-	let (engine, pair, path) = engine_with_pair("list_conflicts").await;
+	let (_root, engine, pair, path) = engine_with_pair("list_conflicts").await;
 	assert!(engine.list_conflicts(pair).await.unwrap().is_empty());
 	let hash = Blake3Hash::from([7; 32]);
 	{
@@ -8330,7 +8343,7 @@ async fn list_conflicts_reads_the_held_rows_only() {
 /// is gone, so the pass fails before it reads either side and that is its only event.
 #[tokio::test]
 async fn a_pass_that_fails_outright_reports_pass_failed() {
-	let (engine, pair, path) = engine_with_pair("pass_failed").await;
+	let (_root, engine, pair, path) = engine_with_pair("pass_failed").await;
 	engine.remove_pair(pair).await.unwrap();
 
 	let mut events = Vec::new();
@@ -8376,7 +8389,7 @@ fn pass_in_flight(gate: PassGate) -> tokio::task::JoinHandle<Vec<&'static str>> 
 /// racing the delete of the rows it would write into.
 #[tokio::test]
 async fn removing_a_pair_drops_the_transfer_in_flight_and_waits_for_the_pass() {
-	let (engine, pair, path) = engine_with_pair("remove_mid_pass").await;
+	let (_root, engine, pair, path) = engine_with_pair("remove_mid_pass").await;
 	let pass = pass_in_flight(engine.pass_gate(pair).await.unwrap());
 	tokio::task::yield_now().await;
 	assert!(
@@ -8404,7 +8417,7 @@ async fn removing_a_pair_drops_the_transfer_in_flight_and_waits_for_the_pass() {
 /// sync is gone.
 #[tokio::test]
 async fn removing_a_paused_pair_never_lets_its_parked_action_start() {
-	let (engine, pair, path) = engine_with_pair("remove_parked").await;
+	let (_root, engine, pair, path) = engine_with_pair("remove_parked").await;
 	engine.pause_pair(pair).await.unwrap();
 	let pass = pass_in_flight(engine.pass_gate(pair).await.unwrap());
 	tokio::task::yield_now().await;
@@ -8430,7 +8443,7 @@ async fn removing_a_paused_pair_never_lets_its_parked_action_start() {
 /// times.
 #[tokio::test]
 async fn remove_pair_of_an_unknown_pair_is_a_no_op() {
-	let (engine, pair, path) = engine_with_pair("remove_unknown").await;
+	let (_root, engine, pair, path) = engine_with_pair("remove_unknown").await;
 	let unknown = pair + 1000;
 	engine.remove_pair(unknown).await.unwrap();
 	assert!(!engine.is_paused(unknown).await);
@@ -8457,7 +8470,7 @@ async fn remove_pair_of_an_unknown_pair_is_a_no_op() {
 async fn a_stop_and_a_removal_of_the_same_pair_never_wait_on_each_other() {
 	// STOP first: the watch is already gone and has cut the parked pass loose; the removal that
 	// follows finds a pass that is cancelled but has not unwound yet.
-	let (engine, pair, path) = engine_with_pair("stop_then_remove").await;
+	let (_root, engine, pair, path) = engine_with_pair("stop_then_remove").await;
 	engine.pause_pair(pair).await.unwrap();
 	let pass = pass_in_flight(engine.pass_gate(pair).await.unwrap());
 	tokio::task::yield_now().await;
@@ -8473,7 +8486,7 @@ async fn a_stop_and_a_removal_of_the_same_pair_never_wait_on_each_other() {
 
 	// REMOVE first: the stopped watch keeps unparking a pair the engine has already forgotten,
 	// which must neither block nor resurrect the control state the removal took away.
-	let (engine, pair, path) = engine_with_pair("remove_then_stop").await;
+	let (_root, engine, pair, path) = engine_with_pair("remove_then_stop").await;
 	engine.pause_pair(pair).await.unwrap();
 	let pass = pass_in_flight(engine.pass_gate(pair).await.unwrap());
 	tokio::task::yield_now().await;
@@ -8493,7 +8506,7 @@ async fn a_stop_and_a_removal_of_the_same_pair_never_wait_on_each_other() {
 
 	// PAUSE first, with no escalation window at all: nothing but the removal can end this pass,
 	// so a removal that waited for the pause to be reversed would wait for ever.
-	let (engine, pair, path) = engine_with_pair("pause_then_remove").await;
+	let (_root, engine, pair, path) = engine_with_pair("pause_then_remove").await;
 	let pass = pass_in_flight(engine.pass_gate(pair).await.unwrap());
 	tokio::task::yield_now().await;
 	engine
@@ -8572,7 +8585,7 @@ where
 /// than handed an `Ok` for a pause that took on nothing.
 #[tokio::test(start_paused = true)]
 async fn a_pause_landing_while_a_removal_waits_cannot_re_park_the_pass() {
-	let (engine, pair, path) = engine_with_pair("pause_during_removal").await;
+	let (_root, engine, pair, path) = engine_with_pair("pause_during_removal").await;
 	let engine = Arc::new(engine);
 	let (done, elapsed) = a_removal_raced_by(&engine, pair, || async {
 		let refused = engine
@@ -8621,7 +8634,7 @@ async fn a_pause_landing_while_a_removal_waits_cannot_re_park_the_pass() {
 /// pause above is.
 #[tokio::test(start_paused = true)]
 async fn a_resume_landing_while_a_removal_waits_cannot_restart_the_pass() {
-	let (engine, pair, path) = engine_with_pair("resume_during_removal").await;
+	let (_root, engine, pair, path) = engine_with_pair("resume_during_removal").await;
 	let engine = Arc::new(engine);
 	let (done, elapsed) = a_removal_raced_by(&engine, pair, || async {
 		let refused = engine
@@ -8659,7 +8672,7 @@ async fn a_resume_landing_while_a_removal_waits_cannot_restart_the_pass() {
 /// above are.
 #[tokio::test(start_paused = true)]
 async fn cancelling_the_paused_actions_while_a_removal_waits_is_refused() {
-	let (engine, pair, path) = engine_with_pair("cancel_during_removal").await;
+	let (_root, engine, pair, path) = engine_with_pair("cancel_during_removal").await;
 	let engine = Arc::new(engine);
 	let (done, elapsed) = a_removal_raced_by(&engine, pair, || async {
 		let refused = engine
@@ -8691,7 +8704,7 @@ async fn cancelling_the_paused_actions_while_a_removal_waits_is_refused() {
 /// two trees takes as long as writing them, so that window is not a corner case.
 #[tokio::test]
 async fn a_pass_takes_its_gate_before_it_reads_either_side() {
-	let (engine, pair, path) = engine_with_pair("gate_before_read").await;
+	let (_root, engine, pair, path) = engine_with_pair("gate_before_read").await;
 	// Offline, so the pass fails in its remote enumeration. That it registered a control channel
 	// before getting that far is what says the gate came first.
 	assert!(
@@ -8713,7 +8726,7 @@ async fn a_pass_takes_its_gate_before_it_reads_either_side() {
 /// hand a permanently broken path a fresh set of retries each time the lock is contended.
 #[tokio::test]
 async fn a_pass_that_could_not_take_the_drive_lock_leaves_every_failure_streak_alone() {
-	let (engine, pair, path) = engine_with_pair("lock_failure_streaks").await;
+	let (_root, engine, pair, path) = engine_with_pair("lock_failure_streaks").await;
 	{
 		let pair_store = engine.pair_store(pair).await.unwrap();
 		let store = locked(&pair_store);
@@ -8772,7 +8785,7 @@ async fn a_pass_that_could_not_take_the_drive_lock_leaves_every_failure_streak_a
 async fn streak_under_a_folded_directory(
 	tag: &str,
 ) -> (SyncEngine, PairId, PathBuf, Vec<(String, String)>) {
-	let (engine, pair, path) = engine_with_pair(tag).await;
+	let (_root, engine, pair, path) = engine_with_pair(tag).await;
 	let streaks = {
 		let pair_store = engine.pair_store(pair).await.unwrap();
 		let store = locked(&pair_store);
@@ -8851,7 +8864,7 @@ async fn a_directory_deletion_that_fails_leaves_the_streaks_of_the_deletions_it_
 /// failure has no streak to end, and is the one that begins it.
 #[tokio::test]
 async fn a_pass_that_ends_no_streak_still_records_its_failures() {
-	let (engine, pair, path) = engine_with_pair("first_failure_recorded").await;
+	let (_root, engine, pair, path) = engine_with_pair("first_failure_recorded").await;
 
 	let mut report = SyncReport {
 		failed_paths: vec![("broken.txt".to_string(), "boom".to_string())],
@@ -8880,7 +8893,7 @@ async fn a_pass_that_ends_no_streak_still_records_its_failures() {
 /// still counts in full.
 #[tokio::test]
 async fn a_remote_outage_counts_against_its_path_only_once_per_spacing() {
-	let (engine, pair, path) = engine_with_pair("transient_spaced").await;
+	let (_root, engine, pair, path) = engine_with_pair("transient_spaced").await;
 
 	for _ in 0..2 {
 		let mut report = SyncReport {
@@ -9112,7 +9125,7 @@ async fn a_cancel_during_the_read_half_ends_the_pass_with_the_paused_report() {
 /// remote, before either side is read: the wait is under the gate too.
 #[tokio::test(start_paused = true)]
 async fn a_cancel_during_the_wait_for_the_remote_ends_the_pass_with_the_paused_report() {
-	let (engine, pair, path) = engine_with_pair("cancel_during_wait").await;
+	let (_root, engine, pair, path) = engine_with_pair("cancel_during_wait").await;
 	let engine = Arc::new(engine);
 	// Whether the cache holds the root converged is the first thing a pass asks of the slot.
 	let slot = engine.client.cache_slot.lock().await;
@@ -9154,7 +9167,7 @@ async fn a_cancel_during_the_wait_for_the_remote_ends_the_pass_with_the_paused_r
 /// carry on with, and parked it would hold the caller for the whole wait.
 #[tokio::test(start_paused = true)]
 async fn a_suspension_during_the_wait_for_the_remote_ends_the_pass_with_the_paused_report() {
-	let (engine, pair, path) = engine_with_pair("suspend_during_wait").await;
+	let (_root, engine, pair, path) = engine_with_pair("suspend_during_wait").await;
 	let engine = Arc::new(engine);
 	// Whether the cache holds the root converged is the first thing a pass asks of the slot.
 	let slot = engine.client.cache_slot.lock().await;
@@ -9196,7 +9209,7 @@ async fn a_suspension_during_the_wait_for_the_remote_ends_the_pass_with_the_paus
 /// pair, which nobody paused, stays running.
 #[tokio::test(start_paused = true)]
 async fn cutting_a_pass_loose_ends_its_wait_for_the_remote() {
-	let (engine, pair, path) = engine_with_pair("cut_loose_during_wait").await;
+	let (_root, engine, pair, path) = engine_with_pair("cut_loose_during_wait").await;
 	let engine = Arc::new(engine);
 	let slot = engine.client.cache_slot.lock().await;
 	let mut pass = tokio::spawn({
@@ -9274,7 +9287,9 @@ async fn a_resolution_waits_for_the_pass_reading_the_pair() {
 /// before resuming: the pause does not make the resolution wait.
 #[tokio::test]
 async fn a_paused_pair_is_still_resolvable() {
-	let (engine, pair, path) = engine_with_pair("resolve_paused").await;
+	let (root, engine, pair, path) = engine_with_pair("resolve_paused").await;
+	// The local side the conflict row records, so the resolution finds it unchanged.
+	std::fs::write(root.path().join("a.txt"), b"local").unwrap();
 	engine
 		.pause_pair_with(
 			pair,
@@ -9304,7 +9319,7 @@ async fn a_paused_pair_is_still_resolvable() {
 /// with the words the others use, rather than writing a row the removal is about to take away.
 #[tokio::test(start_paused = true)]
 async fn resolving_a_conflict_while_a_removal_waits_is_refused() {
-	let (engine, pair, path) = engine_with_pair("resolve_during_removal").await;
+	let (_root, engine, pair, path) = engine_with_pair("resolve_during_removal").await;
 	let engine = Arc::new(engine);
 	let (done, _) = a_removal_raced_by(&engine, pair, || async {
 		let refused = engine
@@ -9473,7 +9488,7 @@ async fn keeping_both_names_the_path_it_kept_the_local_copy_at() {
 /// expired buckets, a second one that day does not look again, and the next day's does.
 #[tokio::test]
 async fn a_pairs_bin_is_pruned_once_a_day() {
-	let (engine, pair, path) = engine_with_pair("bin_prune_daily").await;
+	let (_root, engine, pair, path) = engine_with_pair("bin_prune_daily").await;
 	let root = tempfile::tempdir().unwrap();
 	dated_bin(root.path());
 	let old = bucket(root.path(), NaiveDate::from_ymd_opt(2026, 9, 1).unwrap());
@@ -9520,7 +9535,7 @@ async fn a_pairs_bin_is_pruned_once_a_day() {
 /// A prune a pause stopped does not count as the day's: the pair's next pass prunes again.
 #[tokio::test]
 async fn a_bin_prune_stopped_by_a_pause_runs_again_on_the_next_pass() {
-	let (engine, pair, path) = engine_with_pair("bin_prune_paused").await;
+	let (_root, engine, pair, path) = engine_with_pair("bin_prune_paused").await;
 	let root = tempfile::tempdir().unwrap();
 	dated_bin(root.path());
 	let old = bucket(root.path(), NaiveDate::from_ymd_opt(2026, 9, 1).unwrap());
@@ -9760,7 +9775,7 @@ async fn filen_syncs_trash_is_left_alone_once_the_pair_has_a_row() {
 /// for a pair nobody paused nor makes a removal wait for a call that writes nothing.
 #[tokio::test]
 async fn a_dry_run_takes_no_pass_gate() {
-	let (engine, pair, path) = engine_with_pair("plan_no_gate").await;
+	let (_root, engine, pair, path) = engine_with_pair("plan_no_gate").await;
 	// Offline, so the remote enumeration inside fails; the gate would have been taken before
 	// that, which is what this is about.
 	let _ = engine.plan_pair(pair).await;
@@ -9787,8 +9802,14 @@ async fn engine_whose_baseline_read_fails() -> (SyncEngine, PairId, tempfile::Te
 	client.configure_cache(cache, |_| {}).await.unwrap();
 	let db = dir.path().join("sync.db");
 	let engine = SyncEngine::open(client, db.clone()).await.unwrap();
+	let local = dir.path().join("local");
+	std::fs::create_dir(&local).unwrap();
 	let (pair, _) = locked(&engine.control)
-		.create_pair("/root", Uuid::from_u128(2), SyncMode::TwoWay)
+		.create_pair(
+			local.to_str().unwrap(),
+			Uuid::from_u128(2),
+			SyncMode::TwoWay,
+		)
 		.unwrap();
 	// Once the pair's store is open, which creates the index.
 	engine.pair_store(pair).await.unwrap();
@@ -9844,7 +9865,7 @@ async fn an_adoption_whose_read_fails_returns_the_failure_and_keeps_the_mode() {
 /// there reads as "the transfers are being given up" while they run happily on.
 #[tokio::test]
 async fn cancelling_the_actions_of_a_pair_that_is_not_paused_is_refused() {
-	let (engine, pair, path) = engine_with_pair("cancel_not_paused").await;
+	let (_root, engine, pair, path) = engine_with_pair("cancel_not_paused").await;
 
 	let running = engine
 		.cancel_paused_actions(pair)
@@ -9883,7 +9904,7 @@ async fn cancelling_the_actions_of_a_pair_that_is_not_paused_is_refused() {
 /// plan (uploads, remote trashes, local deletions) against rows the removal has taken away.
 #[tokio::test]
 async fn a_pass_that_asks_for_its_gate_after_the_removal_is_refused() {
-	let (engine, pair, path) = engine_with_pair("gate_after_removal").await;
+	let (_root, engine, pair, path) = engine_with_pair("gate_after_removal").await;
 	engine.remove_pair(pair).await.unwrap();
 
 	assert!(
@@ -13469,7 +13490,7 @@ async fn a_dry_run_still_shows_the_conflict_where_no_evidence_holds() {
 /// Only a pair whose remote root is the drive root holds the account's data directory.
 #[tokio::test]
 async fn only_a_pair_rooted_at_the_drive_root_is_drive_rooted() {
-	let (engine, _, path) = engine_with_pair("pair_root").await;
+	let (_root, engine, _, path) = engine_with_pair("pair_root").await;
 	assert_eq!(
 		engine.pair_root(engine.client.root().uuid()),
 		PairRoot::Drive
@@ -13552,7 +13573,7 @@ fn filen_sync_state() -> tempfile::TempDir {
 
 #[tokio::test]
 async fn filen_sync_state_imports_into_a_pair_that_has_not_synced() {
-	let (engine, pair, path) = engine_with_pair("legacy_import").await;
+	let (_root, engine, pair, path) = engine_with_pair("legacy_import").await;
 	let state = filen_sync_state();
 	let import = engine
 		.import_legacy_state(pair, state.path().to_path_buf())
@@ -13575,7 +13596,7 @@ async fn filen_sync_state_imports_into_a_pair_that_has_not_synced() {
 
 #[tokio::test]
 async fn filen_sync_state_is_refused_once_the_pair_has_a_row() {
-	let (engine, pair, path) = engine_with_pair("legacy_import_synced").await;
+	let (_root, engine, pair, path) = engine_with_pair("legacy_import_synced").await;
 	locked(&engine.control)
 		.upsert_entry(
 			pair,
@@ -13599,7 +13620,7 @@ async fn filen_sync_state_is_refused_once_the_pair_has_a_row() {
 
 #[tokio::test]
 async fn filen_sync_state_is_refused_for_an_unknown_pair() {
-	let (engine, pair, path) = engine_with_pair("legacy_import_unknown").await;
+	let (_root, engine, pair, path) = engine_with_pair("legacy_import_unknown").await;
 	let state = filen_sync_state();
 	let error = engine
 		.import_legacy_state(pair + 1, state.path().to_path_buf())
@@ -14578,7 +14599,7 @@ fn a_twin_a_scoped_pass_holds_no_node_for_is_no_collision() {
 /// a pass that halted, while one of an action the halt held back, which never ran, keeps its own.
 #[tokio::test]
 async fn a_success_in_a_halted_pass_ends_its_streak_and_a_held_action_keeps_its_own() {
-	let (engine, pair, path) = engine_with_pair("halted_pass_streaks").await;
+	let (_root, engine, pair, path) = engine_with_pair("halted_pass_streaks").await;
 	{
 		let pair_store = engine.pair_store(pair).await.unwrap();
 		let store = locked(&pair_store);
@@ -14616,7 +14637,7 @@ async fn a_success_in_a_halted_pass_ends_its_streak_and_a_held_action_keeps_its_
 /// could not make or move there — even in a pass that did not halt: its streak stays as it was.
 #[tokio::test]
 async fn an_action_that_never_ran_keeps_its_streak_in_a_pass_that_went_on() {
-	let (engine, pair, path) = engine_with_pair("held_subtree_streaks").await;
+	let (_root, engine, pair, path) = engine_with_pair("held_subtree_streaks").await;
 	{
 		let pair_store = engine.pair_store(pair).await.unwrap();
 		locked(&pair_store)
