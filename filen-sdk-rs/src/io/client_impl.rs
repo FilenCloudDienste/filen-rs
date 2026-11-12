@@ -383,7 +383,8 @@ impl Client {
 	/// than 8 chunks is never journaled. Every byte is read again to hash the file, but only the
 	/// chunks not acknowledged are sent. An upload the server already finished, whose answer was
 	/// lost, is not sent again: the finished file is returned. If the server refuses to finish a
-	/// continued upload because chunks are missing, the upload starts over once.
+	/// continued upload because chunks are missing or it no longer has the upload, the upload
+	/// starts over once.
 	///
 	/// `on_resumed` is called once, before anything is sent, with how many bytes an earlier upload
 	/// sent that are not sent again, when there are any. `callback` reports the bytes sent, so the

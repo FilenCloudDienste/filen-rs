@@ -72,6 +72,8 @@ pub(crate) enum UploadDoneRejection {
 	ChunkCountTooHigh,
 	/// `invalid_upload_key`: the chunks were sent under another upload key.
 	InvalidUploadKey,
+	/// `upload_not_found`: the server dropped the upload, and its chunks with it.
+	UploadNotFound,
 }
 
 impl UploadDoneRejection {
@@ -81,6 +83,7 @@ impl UploadDoneRejection {
 			"chunk_mismatch" => Some(Self::ChunkCountTooLow),
 			"upload_chunks_not_matching" => Some(Self::ChunkCountTooHigh),
 			"invalid_upload_key" => Some(Self::InvalidUploadKey),
+			"upload_not_found" => Some(Self::UploadNotFound),
 			_ => None,
 		}
 	}
@@ -221,7 +224,11 @@ pub(crate) async fn upload_resuming<B: ResumeBackend>(
 			Err(error) => error,
 		};
 		match UploadDoneRejection::of(&error) {
-			Some(UploadDoneRejection::ChunksMissing | UploadDoneRejection::InvalidUploadKey) => {
+			Some(
+				UploadDoneRejection::ChunksMissing
+				| UploadDoneRejection::InvalidUploadKey
+				| UploadDoneRejection::UploadNotFound,
+			) => {
 				journal.remove().await;
 				// Nothing is sent again under the old upload key: the server's behaviour past the
 				// chunks' expiry is unknown. A fresh upload is started once.

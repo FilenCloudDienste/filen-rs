@@ -635,6 +635,52 @@ async fn a_fresh_upload_whose_done_reports_missing_chunks_fails_without_restarti
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_resumed_upload_the_server_no_longer_has_restarts_once_under_a_new_uuid() {
+	let (_dir, path, contents) = source(SIZE);
+	let store = RecordingStore::default();
+	interrupted(&store, &path).await;
+
+	let backend = FakeResumeBackend::new().done_rejects_once("upload_not_found");
+	let run = run(&backend, &store, &path, 2).await;
+
+	let uploaded = run.result.unwrap();
+	assert_ne!(uploaded.uuid, Uuid::from_u128(1));
+	assert_ne!(uploaded.uuid, Uuid::from_u128(2));
+	assert_eq!(backend.sent_indices(Uuid::from_u128(1)), [7, 8, 9, 10]);
+	assert_eq!(
+		sorted(backend.sent_indices(uploaded.uuid)),
+		(0..CHUNKS).collect::<Vec<_>>()
+	);
+	let registered = backend.registered.lock().unwrap();
+	assert_eq!(registered.len(), 1);
+	assert_eq!(registered[0].file.uuid, uploaded.uuid);
+	assert_eq!(
+		registered[0].completion.hash,
+		Blake3Hash::from(blake3::hash(&contents))
+	);
+	assert!(store.is_empty(), "the journal was kept");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_fresh_upload_the_server_does_not_have_fails_and_drops_the_journal() {
+	let (_dir, path, _) = source(SIZE);
+	let store = RecordingStore::default();
+	let backend = FakeResumeBackend::new().done_rejects_once("upload_not_found");
+
+	let run = run(&backend, &store, &path, 1).await;
+
+	let e = run.result.unwrap_err();
+	assert_eq!(e.server_code().as_deref(), Some("upload_not_found"));
+	assert_eq!(backend.registered.lock().unwrap().len(), 0);
+	assert_eq!(
+		sorted(backend.sent_indices(Uuid::from_u128(1))),
+		(0..CHUNKS).collect::<Vec<_>>()
+	);
+	assert!(store.saves() > 0, "no journal was saved");
+	assert!(store.is_empty(), "the journal was kept");
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_done_rejected_for_a_wrong_chunk_count_fails_and_drops_the_journal() {
 	for code in ["chunk_mismatch", "upload_chunks_not_matching"] {
 		let (_dir, path, _) = source(SIZE);
