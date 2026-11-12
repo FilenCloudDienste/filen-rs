@@ -72,12 +72,22 @@ static BINARY: LazyLock<Vec<u8>> =
 /// The hex SHA-256 digests of the assets, by tag, computed once each.
 static ASSET_DIGESTS: LazyLock<Mutex<HashMap<String, String>>> = LazyLock::new(Mutex::default);
 
+/// The trailer appended to the binary in the release asset of `tag`.
+fn asset_trailer(tag: &str) -> String {
+	format!("\nfilen-cli-test-asset-{tag}")
+}
+
 /// The release asset of `tag`: the CLI's binary, with a trailer that tells the releases apart.
 fn asset(tag: &str) -> Vec<u8> {
 	// an owned copy, since the trailer is appended to it
 	let mut asset = BINARY.clone();
-	asset.extend_from_slice(format!("\nfilen-cli-test-asset-{tag}").as_bytes());
+	asset.extend_from_slice(asset_trailer(tag).as_bytes());
 	asset
+}
+
+/// The size in bytes of the release asset of `tag`, without building it.
+fn asset_len(tag: &str) -> usize {
+	BINARY.len() + asset_trailer(tag).len()
 }
 
 /// The SHA-256 digest of `bytes` in lowercase hex, as the updater prints and GitHub lists it.
@@ -109,6 +119,16 @@ struct MockServer {
 
 impl MockServer {
 	fn start(releases: Releases) -> Self {
+		// Read the binary, and hash every asset the releases list a digest of, before serving: on a
+		// cold page cache the read takes seconds, which an answer to the update check, sent with
+		// the announcements under one short timeout, cannot afford.
+		LazyLock::force(&BINARY);
+		if let ListedDigest::OfAsset = releases.digest {
+			asset_digest(releases.latest);
+			for tag in releases.tags {
+				asset_digest(tag);
+			}
+		}
 		let server = Arc::new(Server::http("127.0.0.1:0").unwrap());
 		let url = format!("http://{}", server.server_addr().to_ip().unwrap());
 		let requests = Arc::new(Mutex::new(Vec::new()));
@@ -161,7 +181,6 @@ fn respond(releases: Releases, url: &str, path: &str) -> (u16, Vec<u8>) {
 				br#"{"message": "Unavailable"}"#.to_vec(),
 			);
 		}
-		let asset = asset(tag);
 		let digest = match releases.digest {
 			ListedDigest::Missing => None,
 			ListedDigest::OfAsset => Some(format!("sha256:{}", asset_digest(tag))),
@@ -182,7 +201,7 @@ fn respond(releases: Releases, url: &str, path: &str) -> (u16, Vec<u8>) {
 					"name": format!("filen-cli-{tag}-{TARGET}"),
 					"browser_download_url": format!("{url}/download/{tag}"),
 					"digest": digest,
-					"size": asset.len(),
+					"size": asset_len(tag),
 				},
 			],
 		});
