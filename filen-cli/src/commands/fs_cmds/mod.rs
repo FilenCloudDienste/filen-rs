@@ -55,12 +55,13 @@ use std::{
 	ffi::OsStr,
 	fmt,
 	fs::{self, File},
-	io::{self, BufRead as _, BufReader, IsTerminal as _, Read as _},
+	io::{self, BufRead as _, BufReader, IsTerminal as _},
 	iter::Peekable,
 	path::{Path, PathBuf},
 	pin::pin,
 	str::Chars,
 	sync::{Arc, Mutex, MutexGuard, PoisonError},
+	task::{Poll, ready},
 	thread,
 };
 
@@ -2232,30 +2233,63 @@ pub(crate) async fn touch_file(
 /// Bytes read from stdin. A thread reads them, as std reads stdin blocking, and passes them on
 /// through a channel short enough that it reads no faster than they are taken.
 fn stdin_reader() -> impl AsyncRead + Unpin {
+	read_on_thread(|| io::stdin().lock())
+}
+
+/// What the reading thread sends: a chunk, or how its input ended.
+enum ThreadRead {
+	Chunk(Vec<u8>),
+	End,
+	Failed(io::Error),
+}
+
+/// Bytes read from what `open` returns, on a thread of their own. They end only where the thread
+/// says the input ended: a thread that stops without saying so (it panicked) fails the read, so a
+/// truncated input never passes for a complete one.
+fn read_on_thread<R: io::Read>(
+	open: impl FnOnce() -> R + Send + 'static,
+) -> impl AsyncRead + Unpin {
 	const READ_SIZE: usize = 64 * 1024;
-	let (mut sender, receiver) = mpsc::channel::<io::Result<Vec<u8>>>(4);
+	let (mut sender, receiver) = mpsc::channel::<ThreadRead>(4);
 	thread::spawn(move || {
-		let mut stdin = io::stdin().lock();
+		let mut input = open();
 		loop {
 			let mut buf = vec![0; READ_SIZE];
-			let read = match stdin.read(&mut buf) {
-				Ok(0) => return,
-				Ok(read) => Ok(read),
+			let read = match input.read(&mut buf) {
+				Ok(0) => ThreadRead::End,
+				Ok(read) => {
+					buf.truncate(read);
+					ThreadRead::Chunk(buf)
+				}
 				Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-				Err(e) => Err(e),
+				Err(e) => ThreadRead::Failed(e),
 			};
-			let done = read.is_err();
-			let sent = executor::block_on(sender.send(read.map(|read| {
-				buf.truncate(read);
-				buf
-			})));
+			let last = !matches!(read, ThreadRead::Chunk(_));
+			let sent = executor::block_on(sender.send(read));
 			// a closed channel: the upload has ended
-			if done || sent.is_err() {
+			if last || sent.is_err() {
 				return;
 			}
 		}
 	});
-	receiver.into_async_read()
+	let mut receiver = Some(receiver);
+	stream::poll_fn(move |cx| {
+		let Some(reads) = &mut receiver else {
+			return Poll::Ready(None);
+		};
+		let last = match ready!(reads.poll_next_unpin(cx)) {
+			Some(ThreadRead::Chunk(chunk)) => return Poll::Ready(Some(Ok(chunk))),
+			Some(ThreadRead::End) => None,
+			Some(ThreadRead::Failed(e)) => Some(Err(e)),
+			None => Some(Err(io::Error::new(
+				io::ErrorKind::UnexpectedEof,
+				"stopped reading before the end of the input",
+			))),
+		};
+		receiver = None;
+		Poll::Ready(last)
+	})
+	.into_async_read()
 }
 
 /// Moves and/or renames files or directories, following the semantics of the Unix `mv`:
@@ -3973,6 +4007,54 @@ mod tests {
 	use crate::ui::test_support::Printed;
 	use chrono::TimeZone as _;
 	use filen_sdk_rs::fs::copy::SkippedEntry;
+
+	/// Reads nothing: the first read fails, or panics with `panics`.
+	struct BrokenInput {
+		panics: bool,
+	}
+
+	impl io::Read for BrokenInput {
+		fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+			if self.panics {
+				panic!("the input broke");
+			}
+			Err(io::Error::other("the input broke"))
+		}
+	}
+
+	/// What reading [`read_on_thread`] over `partial`, then `broken`, to the end gives.
+	fn read_to_end_on_thread(partial: &'static [u8], broken: BrokenInput) -> io::Result<Vec<u8>> {
+		let mut reader = read_on_thread(move || io::Read::chain(partial, broken));
+		let mut read = Vec::new();
+		executor::block_on(reader.read_to_end(&mut read)).map(|_| read)
+	}
+
+	#[test]
+	fn an_input_read_on_a_thread_is_read_to_its_end() {
+		let input = vec![7u8; 200 * 1024];
+		let expected = input.clone();
+		let mut reader = read_on_thread(move || io::Cursor::new(input));
+		let mut read = Vec::new();
+		executor::block_on(reader.read_to_end(&mut read)).unwrap();
+		assert_eq!(read, expected);
+	}
+
+	#[test]
+	fn a_read_error_on_the_thread_fails_the_read() {
+		let error = read_to_end_on_thread(b"partial", BrokenInput { panics: false }).unwrap_err();
+		assert_eq!(error.kind(), io::ErrorKind::Other);
+		assert_eq!(error.to_string(), "the input broke");
+	}
+
+	#[test]
+	fn a_thread_that_panics_fails_the_read_instead_of_ending_it() {
+		let error = read_to_end_on_thread(b"partial", BrokenInput { panics: true }).unwrap_err();
+		assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+		assert_eq!(
+			error.to_string(),
+			"stopped reading before the end of the input"
+		);
+	}
 
 	#[test]
 	fn changes_kept_after_an_unexpected_error_are_a_failure() {
