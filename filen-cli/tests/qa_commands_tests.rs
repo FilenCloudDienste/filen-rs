@@ -311,7 +311,7 @@ mod live {
 	}
 
 	/// `cd` and `mv` read quoted paths with spaces in commands piped into the CLI, in either kind
-	/// of quotes.
+	/// of quotes where the platform has both: on Windows only double quotes group words.
 	#[shared_test_runtime]
 	async fn piped_commands_take_quoted_paths_with_spaces() {
 		let resources = test_utils::RESOURCES.get_resources().await;
@@ -325,10 +325,15 @@ mod live {
 		client.upload_file(file, b"content").await.unwrap();
 		let remote_dir = format!("/{}/dir with spaces", test_dir.name().unwrap());
 		let (_auth_config_dir, auth_config) = test_utils::cli::prepare_cli_auth_config().await;
+		let source = if cfg!(windows) {
+			"\"x y.txt\""
+		} else {
+			"'x y.txt'"
+		};
 
 		let output = run_script(
 			&["--auth-config-path", auth_config.to_str().unwrap()],
-			&format!("cd \"{remote_dir}\"\nls\nmv 'x y.txt' \"z w.txt\"\n"),
+			&format!("cd \"{remote_dir}\"\nls\nmv {source} \"z w.txt\"\n"),
 		);
 
 		let stdout = String::from_utf8_lossy(&output.stdout);
