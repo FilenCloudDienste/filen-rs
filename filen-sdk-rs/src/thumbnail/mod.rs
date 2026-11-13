@@ -1447,6 +1447,8 @@ mod js_impls {
 	use super::{MemSource, PreviewSegment, remote_chunks::local_decode_job};
 	#[cfg(any(all(target_family = "wasm", target_os = "unknown"), feature = "uniffi"))]
 	use super::{ThumbnailFit, locate_embedded_preview, make_thumbnail_from_source};
+	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+	use crate::js::stream_pump::spawn_stream_pump;
 	use crate::{
 		Error,
 		auth::{JsClient, js_impls::UnauthJsClient, shared_client::SharedClient},
@@ -1745,21 +1747,15 @@ mod js_impls {
 	// is a `ReadableStream`, and both calls below start by draining one.
 	// -----------------------------------------------------------------------
 
-	/// Pumps a JS `ReadableStream` into a channel from the CALLING thread,
-	/// which is where the stream's JS object lives — the same split
-	/// `uploadFileFromReader` uses, because a `ReadableStream` cannot be moved
-	/// to the commander.
-	///
-	/// A read error arrives in-band as the last item, so the consumer sees it
-	/// where it sees the bytes. A consumer that stops reading (it settled its
-	/// verdict early) drops the receiver, and the pump ends with it.
+	/// Pumps a JS `ReadableStream` into a channel from the CALLING thread
+	/// ([`spawn_stream_pump`], as `uploadFileFromReader` does). A consumer
+	/// that settled its verdict early drops the receiver, and the pump ends
+	/// with it.
 	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
-	fn spawn_stream_pump(
+	fn stream_chunks(
 		reader: web_sys::ReadableStream,
 	) -> Result<tokio::sync::mpsc::Receiver<Result<Vec<u8>, Error>>, Error> {
-		use futures::AsyncReadExt;
-
-		let mut reader = wasm_streams::ReadableStream::from_raw(reader)
+		let reader = wasm_streams::ReadableStream::from_raw(reader)
 			.try_into_async_read()
 			.map_err(|(e, _)| {
 				Error::custom(
@@ -1767,30 +1763,7 @@ mod js_impls {
 					format!("got error when converting to ReadableStream: {e:?}"),
 				)
 			})?;
-		let (sender, receiver) = tokio::sync::mpsc::channel::<Result<Vec<u8>, Error>>(10);
-		crate::runtime::spawn_local(async move {
-			let mut buffer = vec![0u8; 64 * 1024];
-			loop {
-				match reader.read(&mut buffer).await {
-					Ok(0) => break,
-					Ok(n) => {
-						if sender.send(Ok(buffer[..n].to_vec())).await.is_err() {
-							return;
-						}
-					}
-					Err(e) => {
-						let _ = sender
-							.send(Err(Error::custom(
-								crate::ErrorKind::IO,
-								format!("error reading from stream: {e:?}"),
-							)))
-							.await;
-						return;
-					}
-				}
-			}
-		});
-		Ok(receiver)
+		Ok(spawn_stream_pump(reader, None, None::<fn(u64)>))
 	}
 
 	/// Collects the whole stream into one buffer, or fails with
@@ -1811,7 +1784,7 @@ mod js_impls {
 	/// `ImageError`, which is what a broken bitstream answers: a caller that
 	/// wants to retry over the chunks after the upload has to be able to tell
 	/// the two apart from the kind alone.
-	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+	#[cfg(any(all(target_family = "wasm", target_os = "unknown"), test))]
 	async fn buffer_source_stream(
 		chunks: &mut tokio::sync::mpsc::Receiver<Result<Vec<u8>, Error>>,
 		known_size: Option<u64>,
@@ -1876,7 +1849,7 @@ mod js_impls {
 	where
 		C: SharedClient + Send + Sync + 'static,
 	{
-		let mut chunks = spawn_stream_pump(params.reader)?;
+		let mut chunks = stream_chunks(params.reader)?;
 		let (max_width, max_height, known_size, lossy_quality) = (
 			params.max_width,
 			params.max_height,
@@ -1952,7 +1925,7 @@ mod js_impls {
 		use crate::fs::file::service_worker::MAX_BUFFER_SIZE_BEFORE_FLUSH;
 		use futures::AsyncWriteExt;
 
-		let mut chunks = spawn_stream_pump(params.reader)?;
+		let mut chunks = stream_chunks(params.reader)?;
 		// The same bridge `writeEmbeddedPreview` uses: frames cross to a local
 		// task that owns the JS stream, so the copy never holds more than one
 		// flush buffer on top of the source buffer.
@@ -2429,6 +2402,36 @@ mod js_impls {
 				managed_future,
 			)
 			.await
+		}
+	}
+
+	#[cfg(test)]
+	mod tests {
+		use futures::{TryStreamExt, stream};
+
+		use super::buffer_source_stream;
+		use crate::{ErrorKind, js::stream_pump::pump_stream};
+
+		#[tokio::test]
+		async fn a_streamed_source_that_fails_is_an_error_not_the_bytes_before_it() {
+			let reader = stream::iter([
+				Ok(b"partial".to_vec()),
+				Err(std::io::Error::other("broken")),
+			])
+			.into_async_read();
+			let (sender, mut chunks) = tokio::sync::mpsc::channel(10);
+
+			let ((), buffered) = tokio::join!(
+				pump_stream(reader, None, None::<fn(u64)>, sender),
+				buffer_source_stream(&mut chunks, None, 1024),
+			);
+
+			let error = buffered.unwrap_err();
+			assert_eq!(error.kind(), ErrorKind::IO);
+			assert_eq!(
+				error.to_string(),
+				"Error of kind IO: context: error reading from stream: Custom { kind: Other, error: \"broken\" }"
+			);
 		}
 	}
 }

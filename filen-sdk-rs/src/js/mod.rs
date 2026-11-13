@@ -23,6 +23,11 @@ mod params;
 mod returned_types;
 #[cfg(all(target_family = "wasm", target_os = "unknown",))]
 mod service_worker;
+#[cfg(any(
+	all(target_family = "wasm", target_os = "unknown", feature = "wasm-full"),
+	test
+))]
+pub(crate) mod stream_pump;
 #[cfg(all(test, feature = "uniffi"))]
 pub(crate) mod test_support;
 #[cfg(feature = "uniffi")]

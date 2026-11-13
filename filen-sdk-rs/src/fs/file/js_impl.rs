@@ -1,9 +1,7 @@
-#[cfg(all(target_family = "wasm", target_os = "unknown"))]
-use std::cmp::min;
 use std::sync::Arc;
 
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
-use crate::{ErrorKind, fs::file::traits::HasFileInfo};
+use crate::{ErrorKind, fs::file::traits::HasFileInfo, js::stream_pump::spawn_stream_pump};
 
 use crate::{
 	Error,
@@ -25,8 +23,6 @@ use filen_types::fs::{StableUuid, UuidStr};
 use bytes::Bytes;
 #[cfg(any(all(target_family = "wasm", target_os = "unknown"), test))]
 use futures::AsyncRead;
-#[cfg(all(target_family = "wasm", target_os = "unknown"))]
-use futures::AsyncReadExt;
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 use wasm_bindgen::prelude::JsValue;
 
@@ -90,55 +86,16 @@ impl JsClient {
 		&self,
 		params: crate::js::UploadFileStreamParams,
 	) -> Result<File, JsValue> {
-		let (data_sender, data_receiver) = tokio::sync::mpsc::channel::<Result<Vec<u8>, Error>>(10);
-
 		let progress_callback = params.progress.map(|progress| {
 			move |bytes: u64| {
 				let _ = progress.call1(&JsValue::UNDEFINED, &bytes.into());
 			}
 		});
 
-		let mut reader = wasm_streams::ReadableStream::from_raw(params.reader)
+		let reader = wasm_streams::ReadableStream::from_raw(params.reader)
 			.try_into_async_read()
 			.map_err(|(e, _)| e)?;
-
-		crate::runtime::spawn_local(async move {
-			let mut written = 0u64;
-			let max_cache_size = const { 64usize * 1024 };
-			let cache_size = min(
-				params
-					.known_size
-					.and_then(|v| usize::try_from(v).ok())
-					.unwrap_or(max_cache_size),
-				max_cache_size,
-			);
-			let mut buffer = vec![0u8; cache_size];
-			loop {
-				match reader.read(&mut buffer).await {
-					Ok(0) => return, // EOF
-					Ok(n) => {
-						// should never fail to convert usize to u64
-						written += u64::try_from(n).unwrap();
-						// a closed channel: the upload has ended, with a result of its own
-						if data_sender.send(Ok(buffer[..n].to_vec())).await.is_err() {
-							return;
-						}
-						if let Some(callback) = &progress_callback {
-							callback(written);
-						}
-					}
-					Err(e) => {
-						let _ = data_sender
-							.send(Err(Error::custom(
-								ErrorKind::IO,
-								format!("error reading from stream: {:?}", e),
-							)))
-							.await;
-						return;
-					}
-				}
-			}
-		});
+		let data_receiver = spawn_stream_pump(reader, params.known_size, progress_callback);
 
 		let this = self.inner();
 
@@ -481,10 +438,10 @@ impl UnauthJsClient {
 #[cfg(all(test, feature = "uniffi"))]
 mod tests {
 	use filen_types::fs::Uuid;
-	use futures::AsyncReadExt;
+	use futures::{AsyncReadExt, TryStreamExt, stream};
 
 	use super::*;
-	use crate::{ErrorKind, auth::test_support::offline_client};
+	use crate::{ErrorKind, auth::test_support::offline_client, js::stream_pump::pump_stream};
 
 	/// A reader over `items`, its channel closed after the last one as the pump closes it at the
 	/// end of the stream.
@@ -554,6 +511,33 @@ mod tests {
 		assert_eq!(
 			error.to_string(),
 			"Error of kind IO: context: error reading from stream: broken"
+		);
+	}
+
+	#[tokio::test]
+	async fn an_upload_pumped_from_a_stream_that_fails_ends_with_the_read_error() {
+		let client = offline_client();
+		let builder = client
+			.make_file_builder("payload.bin", Uuid::from_u128(1))
+			.unwrap();
+		let source = stream::iter([Ok(vec![7u8; 1024]), Err(std::io::Error::other("broken"))])
+			.into_async_read();
+		let (sender, receiver) = tokio::sync::mpsc::channel(10);
+		let mut reader = StreamReader {
+			receiver,
+			leftover: Bytes::new(),
+		};
+
+		let ((), uploaded) = tokio::join!(
+			pump_stream(source, None, None::<fn(u64)>, sender),
+			client.upload_file_from_reader(builder, &mut reader, None, None),
+		);
+
+		let error = uploaded.unwrap_err();
+		assert_eq!(error.kind(), ErrorKind::IO);
+		assert_eq!(
+			error.to_string(),
+			"Error of kind IO: context: error reading from stream: Custom { kind: Other, error: \"broken\" }"
 		);
 	}
 }
