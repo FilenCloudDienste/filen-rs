@@ -527,6 +527,28 @@ test("File Streams", async () => {
 	expect([...partialBytes]).toEqual([...new TextEncoder().encode("file")])
 })
 
+test("an upload from a stream that errors rejects and leaves no file", async () => {
+	const name = "errored-stream.txt"
+	let pulled = false
+	const reader = new ReadableStream<Uint8Array>({
+		pull(controller) {
+			if (pulled) {
+				controller.error(new Error("the source failed"))
+				return
+			}
+			pulled = true
+			controller.enqueue(new TextEncoder().encode("partial"))
+		}
+	})
+
+	const error = await state.uploadFileFromReader({ parent: testDir, name, reader }).catch((e: unknown) => e)
+
+	expect(error).toBeInstanceOf(FilenSdkError)
+	expect((error as FilenSdkError).kind).toBe("IO")
+	const { files } = await state.listDir(testDir)
+	expect(files.map(file => getFileMeta(file.meta)?.name)).not.toContain(name)
+})
+
 test("abort", async () => {
 	const abortController = new AbortController()
 	const fileAPromise = state.uploadFile(new TextEncoder().encode("file a"), {

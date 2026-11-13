@@ -21,45 +21,43 @@ use crate::{
 };
 use filen_types::fs::{StableUuid, UuidStr};
 
+#[cfg(any(all(target_family = "wasm", target_os = "unknown"), test))]
+use bytes::Bytes;
+#[cfg(any(all(target_family = "wasm", target_os = "unknown"), test))]
+use futures::AsyncRead;
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
-use futures::{AsyncRead, AsyncReadExt};
+use futures::AsyncReadExt;
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 use wasm_bindgen::prelude::JsValue;
 
-#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+/// The bytes of a JS `ReadableStream`, which a task on the calling thread pumps into `receiver`
+/// because the stream cannot be moved to the commander. A read error arrives in-band as the last
+/// item and is returned as one, so the upload fails rather than taking the closed channel for the
+/// end of the stream and finishing a truncated file.
+#[cfg(any(all(target_family = "wasm", target_os = "unknown"), test))]
 struct StreamReader {
-	receiver: tokio::sync::mpsc::Receiver<Vec<u8>>,
-	current_chunk: Option<Vec<u8>>,
+	receiver: tokio::sync::mpsc::Receiver<Result<Vec<u8>, Error>>,
+	/// What `buf` had no room for of the last chunk received, handed out before the next one.
+	leftover: Bytes,
 }
 
-#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+#[cfg(any(all(target_family = "wasm", target_os = "unknown"), test))]
 impl AsyncRead for StreamReader {
 	fn poll_read(
 		mut self: std::pin::Pin<&mut Self>,
 		cx: &mut std::task::Context<'_>,
 		buf: &mut [u8],
 	) -> std::task::Poll<std::io::Result<usize>> {
-		let current_chunk = match self.current_chunk.take() {
-			Some(chunk) => chunk,
-			None => match self.receiver.poll_recv(cx) {
-				std::task::Poll::Ready(Some(chunk)) => chunk,
-				std::task::Poll::Ready(None) => {
-					// no more data
-					return std::task::Poll::Ready(Ok(0));
-				}
-				std::task::Poll::Pending => {
-					// no data available yet
-					return std::task::Poll::Pending;
-				}
-			},
-		};
-
-		let len = std::cmp::min(buf.len(), current_chunk.len());
-		buf[..len].copy_from_slice(&current_chunk[..len]);
-		if len < current_chunk.len() {
-			// still have data left in the chunk
-			self.current_chunk = Some(current_chunk[len..].to_vec());
+		while self.leftover.is_empty() {
+			match std::task::ready!(self.receiver.poll_recv(cx)) {
+				Some(Ok(chunk)) => self.leftover = Bytes::from(chunk),
+				Some(Err(e)) => return std::task::Poll::Ready(Err(std::io::Error::other(e))),
+				// the pump ends the channel only at the end of the stream
+				None => return std::task::Poll::Ready(Ok(0)),
+			}
 		}
+		let len = std::cmp::min(buf.len(), self.leftover.len());
+		buf[..len].copy_from_slice(&self.leftover.split_to(len));
 		std::task::Poll::Ready(Ok(len))
 	}
 }
@@ -92,9 +90,7 @@ impl JsClient {
 		&self,
 		params: crate::js::UploadFileStreamParams,
 	) -> Result<File, JsValue> {
-		let (data_sender, data_receiver) = tokio::sync::mpsc::channel::<Vec<u8>>(10);
-
-		let (result_sender, result_receiver) = tokio::sync::oneshot::channel::<Result<(), Error>>();
+		let (data_sender, data_receiver) = tokio::sync::mpsc::channel::<Result<Vec<u8>, Error>>(10);
 
 		let progress_callback = params.progress.map(|progress| {
 			move |bytes: u64| {
@@ -119,16 +115,12 @@ impl JsClient {
 			let mut buffer = vec![0u8; cache_size];
 			loop {
 				match reader.read(&mut buffer).await {
-					Ok(0) => break, // EOF
+					Ok(0) => return, // EOF
 					Ok(n) => {
 						// should never fail to convert usize to u64
 						written += u64::try_from(n).unwrap();
-						let data = buffer[..n].to_vec();
-						if data_sender.send(data).await.is_err() {
-							let _ = result_sender.send(Err(Error::custom(
-								ErrorKind::Cancelled,
-								"upload task cancelled",
-							)));
+						// a closed channel: the upload has ended, with a result of its own
+						if data_sender.send(Ok(buffer[..n].to_vec())).await.is_err() {
 							return;
 						}
 						if let Some(callback) = &progress_callback {
@@ -136,15 +128,16 @@ impl JsClient {
 						}
 					}
 					Err(e) => {
-						let _ = result_sender.send(Err(Error::custom(
-							ErrorKind::IO,
-							format!("error reading from stream: {:?}", e),
-						)));
+						let _ = data_sender
+							.send(Err(Error::custom(
+								ErrorKind::IO,
+								format!("error reading from stream: {:?}", e),
+							)))
+							.await;
 						return;
 					}
 				}
 			}
-			let _ = result_sender.send(Ok(()));
 		});
 
 		let this = self.inner();
@@ -154,20 +147,12 @@ impl JsClient {
 			.into_js_managed_commander_future(move || async move {
 				let mut reader = StreamReader {
 					receiver: data_receiver,
-					current_chunk: None,
+					leftover: Bytes::new(),
 				};
 
 				let builder = params.file_builder_params.into_file_builder(&this)?;
-				let file = this
-					.upload_file_from_reader(builder, &mut reader, None, params.known_size)
-					.await?;
-				result_receiver.await.unwrap_or_else(|_| {
-					Err(Error::custom(
-						ErrorKind::Cancelled,
-						"upload task result sender dropped",
-					))
-				})?;
-				Ok(file)
+				this.upload_file_from_reader(builder, &mut reader, None, params.known_size)
+					.await
 			})?
 			.await?;
 
@@ -490,5 +475,85 @@ impl UnauthJsClient {
 		params: crate::js::DownloadFileStreamParams,
 	) -> Result<(), Error> {
 		download_file_to_writer_generic(self.inner(), params).await
+	}
+}
+
+#[cfg(all(test, feature = "uniffi"))]
+mod tests {
+	use filen_types::fs::Uuid;
+	use futures::AsyncReadExt;
+
+	use super::*;
+	use crate::{ErrorKind, auth::test_support::offline_client};
+
+	/// A reader over `items`, its channel closed after the last one as the pump closes it at the
+	/// end of the stream.
+	fn stream_reader(items: Vec<Result<Vec<u8>, Error>>) -> StreamReader {
+		let (sender, receiver) = tokio::sync::mpsc::channel(items.len());
+		for item in items {
+			sender
+				.try_send(item)
+				.expect("the channel has room for every item");
+		}
+		StreamReader {
+			receiver,
+			leftover: Bytes::new(),
+		}
+	}
+
+	fn read_error() -> Error {
+		Error::custom(ErrorKind::IO, "error reading from stream: broken")
+	}
+
+	#[tokio::test]
+	async fn a_stream_reader_reads_every_chunk_in_order_then_ends() {
+		let mut reader = stream_reader(vec![Ok(b"hello ".to_vec()), Ok(b"world".to_vec())]);
+		let mut read = Vec::new();
+		reader.read_to_end(&mut read).await.unwrap();
+		assert_eq!(read, b"hello world");
+	}
+
+	#[tokio::test]
+	async fn a_stream_reader_hands_out_a_chunk_larger_than_the_buffer_in_parts() {
+		let mut reader = stream_reader(vec![Ok(b"abcdef".to_vec())]);
+		let mut buf = [0u8; 4];
+		assert_eq!(reader.read(&mut buf).await.unwrap(), 4);
+		assert_eq!(&buf, b"abcd");
+		assert_eq!(reader.read(&mut buf).await.unwrap(), 2);
+		assert_eq!(&buf[..2], b"ef");
+		assert_eq!(reader.read(&mut buf).await.unwrap(), 0);
+	}
+
+	#[tokio::test]
+	async fn a_stream_reader_fails_on_a_read_error_instead_of_ending() {
+		let mut reader = stream_reader(vec![Ok(b"partial".to_vec()), Err(read_error())]);
+		let mut buf = [0u8; 16];
+		assert_eq!(reader.read(&mut buf).await.unwrap(), 7);
+		let error = Error::from(reader.read(&mut buf).await.unwrap_err());
+		assert_eq!(error.kind(), ErrorKind::IO);
+		assert_eq!(
+			error.to_string(),
+			"Error of kind IO: context: error reading from stream: broken"
+		);
+	}
+
+	#[tokio::test]
+	async fn an_upload_from_a_stream_that_fails_ends_with_the_read_error() {
+		let client = offline_client();
+		let builder = client
+			.make_file_builder("payload.bin", Uuid::from_u128(1))
+			.unwrap();
+		let mut reader = stream_reader(vec![Ok(vec![7u8; 1024]), Err(read_error())]);
+
+		let error = client
+			.upload_file_from_reader(builder, &mut reader, None, None)
+			.await
+			.unwrap_err();
+
+		assert_eq!(error.kind(), ErrorKind::IO);
+		assert_eq!(
+			error.to_string(),
+			"Error of kind IO: context: error reading from stream: broken"
+		);
 	}
 }
