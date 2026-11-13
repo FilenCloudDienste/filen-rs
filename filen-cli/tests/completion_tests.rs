@@ -103,9 +103,15 @@ async fn completes_commands_and_remote_paths() {
 		"cat \"a dir with spaces/f",
 		&["cat \"a dir with spaces/file_in_dir_with_spaces.txt\""],
 	);
+	// a backslash escapes a space only in shell quoting; on Windows it is an ordinary character, so
+	// the word being completed is `spaces/f`, which matches nothing
 	test_completer(
 		"cat a\\ dir\\ with\\ spaces/f",
-		&["cat \"a dir with spaces/file_in_dir_with_spaces.txt\""],
+		if cfg!(windows) {
+			&[]
+		} else {
+			&["cat \"a dir with spaces/file_in_dir_with_spaces.txt\""]
+		},
 	);
 
 	// handle relative path parts like "." and ".."
