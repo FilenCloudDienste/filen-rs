@@ -599,18 +599,29 @@ mod unauth_js_client_impl {
 		Error,
 		auth::js_impls::UnauthJsClient,
 		fs::categories::{DirType, Linked, NonRootFileType},
-		js::AnyLinkedDirWithContext,
+		js::{AnyLinkedDirWithContext, DirPublicLink},
 	};
 	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 	use crate::{ErrorKind, js::stream_writer};
 	#[cfg(feature = "uniffi")]
 	use crate::{js::spawn_ordered_dispatch, runtime::do_on_commander};
 
+	/// The requested items of a linked zip: the directory, with everything below it.
+	fn linked_dir_items(
+		dir: AnyLinkedDirWithContext,
+	) -> (Vec<NonRootFileType<'static, Linked>>, DirPublicLink) {
+		(
+			vec![NonRootFileType::from(DirType::<Linked>::from(dir.dir))],
+			dir.link,
+		)
+	}
+
 	#[cfg(feature = "uniffi")]
 	impl UnauthJsClient {
-		async fn inner_download_linked_dir_to_zip<F>(
+		async fn inner_download_linked_items_to_zip<F>(
 			&self,
-			dir: AnyLinkedDirWithContext,
+			items: Vec<NonRootFileType<'static, Linked>>,
+			link: DirPublicLink,
 			callback: Option<F>,
 		) -> Result<Vec<u8>, Error>
 		where
@@ -618,21 +629,44 @@ mod unauth_js_client_impl {
 		{
 			let this = self.inner();
 			do_on_commander(move || async move {
-				let parsed_dir = DirType::<Linked>::from(dir.dir);
-				let link = dir.link;
-
-				let items = [NonRootFileType::<Linked>::from(parsed_dir)];
-				let writer = this
-					.download_items_to_zip::<Linked, _>(
-						&items,
-						Vec::new(),
-						callback.as_ref(),
-						Cow::Owned(link.try_into()?),
-					)
-					.await?;
-				Ok(writer)
+				this.download_items_to_zip::<Linked, _>(
+					&items,
+					Vec::new(),
+					callback.as_ref(),
+					Cow::Owned(link.try_into()?),
+				)
+				.await
 			})
 			.await
+		}
+
+		async fn uniffi_download_linked_items_to_zip(
+			&self,
+			items: Vec<NonRootFileType<'static, Linked>>,
+			link: DirPublicLink,
+			callback: Option<Arc<dyn ZipDownloadProgressCallback>>,
+		) -> Result<Vec<u8>, Error> {
+			let Some(callback) = callback else {
+				return self
+					.inner_download_linked_items_to_zip(items, link, None::<fn(u64, u64, u64, u64)>)
+					.await;
+			};
+			let (sender, delivered) =
+				spawn_ordered_dispatch(move |(bw, tb, ip, ti): (u64, u64, u64, u64)| {
+					callback.on_progress(bw, tb, ip, ti);
+				});
+			let result = self
+				.inner_download_linked_items_to_zip(
+					items,
+					link,
+					Some(move |bw: u64, tb: u64, ip: u64, ti: u64| {
+						let _ = sender.send((bw, tb, ip, ti));
+					}),
+				)
+				.await;
+			// the download dropped its sender: this returns once every report was delivered
+			let _ = delivered.await;
+			result
 		}
 	}
 
@@ -656,42 +690,19 @@ mod unauth_js_client_impl {
 			dir: AnyLinkedDirWithContext,
 			callback: Option<Arc<dyn ZipDownloadProgressCallback>>,
 		) -> Result<Vec<u8>, Error> {
-			let Some(callback) = callback else {
-				return self
-					.inner_download_linked_dir_to_zip(dir, None::<fn(u64, u64, u64, u64)>)
-					.await;
-			};
-			let (sender, delivered) =
-				spawn_ordered_dispatch(move |(bw, tb, ip, ti): (u64, u64, u64, u64)| {
-					callback.on_progress(bw, tb, ip, ti);
-				});
-			let result = self
-				.inner_download_linked_dir_to_zip(
-					dir,
-					Some(move |bw: u64, tb: u64, ip: u64, ti: u64| {
-						let _ = sender.send((bw, tb, ip, ti));
-					}),
-				)
-				.await;
-			// the download dropped its sender: this returns once every report was delivered
-			let _ = delivered.await;
-			result
+			let (items, link) = linked_dir_items(dir);
+			self.uniffi_download_linked_items_to_zip(items, link, callback)
+				.await
 		}
 	}
 
-	#[filen_macros::js_exports]
 	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
-	#[wasm_bindgen::prelude::wasm_bindgen(js_class = "UnauthClient")]
 	impl UnauthJsClient {
-		#[wasm_bindgen::prelude::wasm_bindgen(js_name = "downloadLinkedDirToZip")]
-		pub async fn download_linked_dir_to_zip(
+		async fn wasm_download_linked_items_to_zip(
 			&self,
-			dir: AnyLinkedDirWithContext,
-			#[wasm_bindgen(unchecked_param_type = "WritableStream<Uint8Array>")]
+			items: Vec<NonRootFileType<'static, Linked>>,
+			link: DirPublicLink,
 			writable_stream: web_sys::WritableStream,
-			#[wasm_bindgen(
-				unchecked_param_type = "(bytesWritten: bigint, totalBytes: bigint, itemsProcessed: bigint, totalItems: bigint) => void | undefined"
-			)]
 			progress: web_sys::js_sys::Function,
 			managed_future: crate::js::ManagedFuture,
 		) -> Result<(), Error> {
@@ -723,12 +734,9 @@ mod unauth_js_client_impl {
 			};
 
 			let this = self.inner();
-			let parsed_dir = DirType::<Linked>::from(dir.dir);
-			let link = dir.link;
 
 			managed_future
 				.into_js_managed_commander_future(move || async move {
-					let items = [NonRootFileType::<Linked>::from(parsed_dir)];
 					this.download_items_to_zip::<Linked, _>(
 						&items,
 						writer,
@@ -744,6 +752,34 @@ mod unauth_js_client_impl {
 					})
 				})?
 				.await
+		}
+	}
+
+	#[filen_macros::js_exports]
+	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+	#[wasm_bindgen::prelude::wasm_bindgen(js_class = "UnauthClient")]
+	impl UnauthJsClient {
+		#[wasm_bindgen::prelude::wasm_bindgen(js_name = "downloadLinkedDirToZip")]
+		pub async fn download_linked_dir_to_zip(
+			&self,
+			dir: AnyLinkedDirWithContext,
+			#[wasm_bindgen(unchecked_param_type = "WritableStream<Uint8Array>")]
+			writable_stream: web_sys::WritableStream,
+			#[wasm_bindgen(
+				unchecked_param_type = "(bytesWritten: bigint, totalBytes: bigint, itemsProcessed: bigint, totalItems: bigint) => void | undefined"
+			)]
+			progress: web_sys::js_sys::Function,
+			managed_future: crate::js::ManagedFuture,
+		) -> Result<(), Error> {
+			let (items, link) = linked_dir_items(dir);
+			self.wasm_download_linked_items_to_zip(
+				items,
+				link,
+				writable_stream,
+				progress,
+				managed_future,
+			)
+			.await
 		}
 	}
 }
