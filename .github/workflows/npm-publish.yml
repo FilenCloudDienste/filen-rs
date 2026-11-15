@@ -40,7 +40,8 @@ jobs:
           - target: aarch64-pc-windows-msvc
             os: windows-latest
           - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
+            # On ubuntu-26.04 the smoke test's process dies in its offline sync engine suite.
+            os: ubuntu-24.04
             smoke-test: true
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-24.04-arm
