@@ -49,7 +49,10 @@ pub(crate) use categories::{
 		},
 		file::{File, meta::FileMeta, version::FileVersion},
 	},
-	linked::{AnyLinkedDir, DirPublicLink, DirPublicLinkRW, LinkedDir, LinkedFile, LinkedRootDir},
+	linked::{
+		AnyLinkedDir, DirPublicLink, DirPublicLinkRW, LinkedDir, LinkedFile, LinkedRootDir,
+		NonRootLinkedItem,
+	},
 	normal::{AnyNormalDir, Dir, NonRootNormalItem, Root},
 	shared::{AnySharedDir, SharedDir, SharedFile, SharedRootDir, SharedRootItem},
 };

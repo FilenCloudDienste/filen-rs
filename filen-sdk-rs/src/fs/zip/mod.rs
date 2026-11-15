@@ -599,7 +599,7 @@ mod unauth_js_client_impl {
 		Error,
 		auth::js_impls::UnauthJsClient,
 		fs::categories::{DirType, Linked, NonRootFileType},
-		js::{AnyLinkedDirWithContext, DirPublicLink},
+		js::{AnyLinkedDirWithContext, DirPublicLink, NonRootLinkedItem},
 	};
 	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 	use crate::{ErrorKind, js::stream_writer};
@@ -614,6 +614,16 @@ mod unauth_js_client_impl {
 			vec![NonRootFileType::from(DirType::<Linked>::from(dir.dir))],
 			dir.link,
 		)
+	}
+
+	/// The requested items of a linked zip: files and directories listed in the link.
+	fn linked_items(
+		items: Vec<NonRootLinkedItem>,
+	) -> Result<Vec<NonRootFileType<'static, Linked>>, Error> {
+		items
+			.into_iter()
+			.map(|item| NonRootFileType::try_from(item).map_err(Error::from))
+			.collect()
 	}
 
 	#[cfg(feature = "uniffi")]
@@ -692,6 +702,18 @@ mod unauth_js_client_impl {
 		) -> Result<Vec<u8>, Error> {
 			let (items, link) = linked_dir_items(dir);
 			self.uniffi_download_linked_items_to_zip(items, link, callback)
+				.await
+		}
+
+		/// Zips `items`, listed in the directory link `link`: files at the top of the archive,
+		/// directories as top-level folders with everything below them.
+		pub async fn download_linked_items_to_zip(
+			&self,
+			items: Vec<NonRootLinkedItem>,
+			link: DirPublicLink,
+			callback: Option<Arc<dyn ZipDownloadProgressCallback>>,
+		) -> Result<Vec<u8>, Error> {
+			self.uniffi_download_linked_items_to_zip(linked_items(items)?, link, callback)
 				.await
 		}
 	}
@@ -774,6 +796,31 @@ mod unauth_js_client_impl {
 			let (items, link) = linked_dir_items(dir);
 			self.wasm_download_linked_items_to_zip(
 				items,
+				link,
+				writable_stream,
+				progress,
+				managed_future,
+			)
+			.await
+		}
+
+		/// Zips `items`, listed in the directory link `link`: files at the top of the archive,
+		/// directories as top-level folders with everything below them.
+		#[wasm_bindgen::prelude::wasm_bindgen(js_name = "downloadLinkedItemsToZip")]
+		pub async fn download_linked_items_to_zip(
+			&self,
+			items: Vec<NonRootLinkedItem>,
+			link: DirPublicLink,
+			#[wasm_bindgen(unchecked_param_type = "WritableStream<Uint8Array>")]
+			writable_stream: web_sys::WritableStream,
+			#[wasm_bindgen(
+				unchecked_param_type = "(bytesWritten: bigint, totalBytes: bigint, itemsProcessed: bigint, totalItems: bigint) => void | undefined"
+			)]
+			progress: web_sys::js_sys::Function,
+			managed_future: crate::js::ManagedFuture,
+		) -> Result<(), Error> {
+			self.wasm_download_linked_items_to_zip(
+				linked_items(items)?,
 				link,
 				writable_stream,
 				progress,

@@ -17,14 +17,14 @@ use crate::{
 	error::ResultExt,
 	fs::{
 		HasName,
-		categories::{DirType, Linked},
+		categories::{DirType, Linked, NonRootFileType},
 		dir::{LinkedDirectory, RootDirectoryWithMeta},
 		file::{LinkedFile as LinkedFileRS, traits::HasFileInfo},
 	},
 	thumbnail::might_be_thumbnailable,
 };
 
-use super::common::dir::RootDirWithMeta;
+use super::common::{dir::RootDirWithMeta, file::File};
 
 #[js_type(import, export, wasm_all, napi)]
 pub struct LinkedFile {
@@ -169,6 +169,24 @@ impl From<DirType<'static, Linked>> for AnyLinkedDir {
 			DirType::Root(dir) => Self::Root(dir.into_owned().into()),
 			DirType::Dir(dir) => Self::Dir(dir.into_owned().into()),
 		}
+	}
+}
+
+/// A directory or file listed in a directory link, as `listLinkedDir` returns them.
+#[js_type(import)]
+pub enum NonRootLinkedItem {
+	Dir(LinkedDir),
+	File(File),
+}
+
+impl TryFrom<NonRootLinkedItem> for NonRootFileType<'static, Linked> {
+	type Error = ConversionError;
+
+	fn try_from(value: NonRootLinkedItem) -> Result<Self, Self::Error> {
+		Ok(match value {
+			NonRootLinkedItem::Dir(dir) => Self::Dir(Cow::Owned(dir.into())),
+			NonRootLinkedItem::File(file) => Self::File(Cow::Owned(file.try_into()?)),
+		})
 	}
 }
 
@@ -361,6 +379,40 @@ mod tests {
 			assert_eq!(js.downloadable, downloadable);
 			assert_eq!(LinkedFileRS::try_from(js).unwrap(), rs);
 		}
+	}
+
+	// A file listed in a link has no stable id, so it must come back as the link's own file
+	// type rather than be refused as a drive file.
+	#[test]
+	fn listed_linked_items_convert_back() {
+		use crate::fs::{
+			drive_job::test_support::{PARENT, drive_dir, stored_file},
+			file::enums::RemoteFileType,
+		};
+
+		let dir = LinkedDirectory(drive_dir(Uuid::from_u128(1), "d"));
+		let RemoteFileType::File(file) = stored_file(Uuid::from_u128(2), PARENT, "f", 3, 1, None)
+		else {
+			panic!("stored_file is a drive file");
+		};
+		let file = file.into_owned();
+
+		let converted = [
+			NonRootLinkedItem::Dir(LinkedDir::from(dir.clone())),
+			NonRootLinkedItem::File(File::from(file.clone())),
+		]
+		.into_iter()
+		.map(NonRootFileType::try_from)
+		.collect::<Result<Vec<_>, _>>()
+		.unwrap();
+
+		assert_eq!(
+			converted,
+			[
+				NonRootFileType::<Linked>::Dir(Cow::Owned(dir)),
+				NonRootFileType::File(Cow::Owned(file)),
+			]
+		);
 	}
 
 	#[test]

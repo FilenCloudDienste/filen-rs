@@ -994,6 +994,150 @@ async fn download_linked_dir_to_zip() {
 }
 
 #[shared_test_runtime]
+async fn download_linked_items_to_zip() {
+	use std::{
+		collections::BTreeSet,
+		io::{BufReader, Read, Seek},
+		sync::Mutex,
+	};
+
+	use filen_sdk_rs::{
+		auth::unauth::UnauthClient,
+		fs::categories::{Linked, NonRootFileType},
+	};
+	use tokio_util::compat::TokioAsyncWriteCompatExt;
+	use zip::ZipArchive;
+
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = &resources.dir;
+
+	// linked_items/ {picked.txt, left.txt, picked_dir/ {inner.txt, deep/ {deep.txt}}, left_dir/ {left_inner.txt}}
+	let linked = client
+		.create_dir(&test_dir.into(), "linked_items")
+		.await
+		.unwrap();
+	let picked_dir = client
+		.create_dir(&(&linked).into(), "picked_dir")
+		.await
+		.unwrap();
+	let deep = client
+		.create_dir(&(&picked_dir).into(), "deep")
+		.await
+		.unwrap();
+	let left_dir = client
+		.create_dir(&(&linked).into(), "left_dir")
+		.await
+		.unwrap();
+	for (name, parent, content) in [
+		("picked.txt", linked.uuid(), &b"picked file"[..]),
+		("left.txt", linked.uuid(), b"left file"),
+		("inner.txt", picked_dir.uuid(), b"inner file"),
+		("deep.txt", deep.uuid(), b"deep file"),
+		("left_inner.txt", left_dir.uuid(), b"left inner file"),
+	] {
+		let builder = client.make_file_builder(name, parent).unwrap();
+		client.upload_file(builder, content).await.unwrap();
+	}
+
+	let link = client
+		.public_link_dir::<fn(u64, Option<u64>)>(&linked, None)
+		.await
+		.unwrap();
+
+	let unauth_client =
+		UnauthClient::from_config(filen_sdk_rs::auth::http::ClientConfig::default()).unwrap();
+	let info = unauth_client
+		.get_dir_public_link_info(link.uuid(), &link.key_string().unwrap())
+		.await
+		.unwrap();
+
+	// pick from the link's own listing, as a visitor's selection would
+	let (dirs, files) = unauth_client
+		.list_linked_dir::<fn(u64, Option<u64>)>(&(&info.root).into(), &info.link, None)
+		.await
+		.unwrap();
+	let picked_file = files
+		.into_iter()
+		.find(|f| f.name() == Some("picked.txt"))
+		.unwrap();
+	let picked_dir = dirs
+		.into_iter()
+		.find(|d| d.name() == Some("picked_dir"))
+		.unwrap();
+	let items = [
+		NonRootFileType::<Linked>::File(Cow::Owned(picked_file)),
+		NonRootFileType::<Linked>::Dir(Cow::Owned(picked_dir)),
+	];
+
+	let tmp = std::env::temp_dir();
+	let mut options = tokio::fs::OpenOptions::new();
+	options.create(true).write(true).read(true).truncate(true);
+	let zip_file = options
+		.open(tmp.join("test_linked_items.zip"))
+		.await
+		.unwrap()
+		.compat_write();
+	let last_progress = Mutex::new(None);
+	let progress = |bw: u64, tb: u64, ip: u64, ti: u64| {
+		*last_progress.lock().unwrap() = Some((bw, tb, ip, ti));
+	};
+	let zip_file = unauth_client
+		.download_items_to_zip::<Linked, _>(
+			&items,
+			zip_file,
+			Some(&progress),
+			Cow::Borrowed(&info.link),
+		)
+		.await
+		.unwrap();
+
+	// the two requested items, then inner.txt and deep/ once picked_dir is listed, then
+	// deep.txt once deep/ is
+	let total_bytes =
+		u64::try_from(b"picked file".len() + b"inner file".len() + b"deep file".len()).unwrap();
+	assert_eq!(
+		*last_progress.lock().unwrap(),
+		Some((total_bytes, total_bytes, 5, 5))
+	);
+
+	let mut zip_file = zip_file.into_inner().into_std().await;
+	zip_file.seek(std::io::SeekFrom::Start(0)).unwrap();
+	let mut archive = ZipArchive::new(BufReader::new(zip_file)).unwrap();
+	let names = archive
+		.file_names()
+		.map(|name| name.unwrap().into_owned())
+		.collect::<BTreeSet<_>>();
+	assert_eq!(
+		names,
+		BTreeSet::from(
+			[
+				"picked.txt",
+				"picked_dir/",
+				"picked_dir/inner.txt",
+				"picked_dir/deep/",
+				"picked_dir/deep/deep.txt",
+			]
+			.map(ToOwned::to_owned)
+		)
+	);
+
+	for (name, content) in [
+		("picked.txt", &b"picked file"[..]),
+		("picked_dir/inner.txt", b"inner file"),
+		("picked_dir/deep/deep.txt", b"deep file"),
+	] {
+		let mut buf = Vec::new();
+		archive
+			.by_name(name)
+			.unwrap()
+			.read_to_end(&mut buf)
+			.unwrap();
+		assert_eq!(buf, content, "{name}");
+	}
+}
+
+#[shared_test_runtime]
 async fn not_found_error() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = &resources.client;
