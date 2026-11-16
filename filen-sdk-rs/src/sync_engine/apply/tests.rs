@@ -177,7 +177,12 @@ fn a_hold_is_spent_after_its_time_or_its_batch() {
 fn only_a_remote_write_waits_for_the_lock() {
 	let now = Instant::now();
 	let budget = LockBudget::default();
-	for lease in [Lease::Unheld, Lease::Released { at: now }] {
+	let hold = UndrivenHold::new();
+	let released = Lease::Released {
+		at: now,
+		release: hold.lock.release_watch(),
+	};
+	for lease in [Lease::Unheld, released] {
 		assert!(lease.admits(&budget, &download("a"), true, now));
 		assert!(!lease.admits(&budget, &trash("b", NodeKind::File), false, now));
 		assert!(!lease.admits(&budget, &upload("c"), true, now));
@@ -190,6 +195,84 @@ fn only_a_remote_write_waits_for_the_lock() {
 			now
 		));
 	}
+}
+
+/// The release of a pass's lease, as a test plays it: `state` at first.
+fn release_at(state: LeaseRelease) -> (watch::Sender<LeaseRelease>, watch::Receiver<LeaseRelease>) {
+	watch::channel(state)
+}
+
+/// A release that the server answers only after the pass let the lock go: the pass stays away
+/// for the whole rest after that answer, so it never asks while its old lease still stands.
+#[tokio::test(start_paused = true)]
+async fn a_pass_rests_from_its_slow_release_s_answer_not_from_letting_go() {
+	let let_go = Instant::now();
+	let (release, mut watched) = release_at(LeaseRelease::Sent);
+	let rest = LockBudget::default().rest;
+	let ((), ()) = tokio::join!(rested(let_go, &mut watched, rest), async {
+		tokio::time::sleep(Duration::from_secs(3)).await;
+		release.send_replace(LeaseRelease::Settled { at: Instant::now() });
+	});
+	assert_eq!(let_go.elapsed(), Duration::from_secs(3 + 5));
+}
+
+/// A release answered before the pass comes to ask again leaves only what is left of the rest
+/// after that answer.
+#[tokio::test(start_paused = true)]
+async fn a_pass_rests_only_what_is_left_after_an_answered_release() {
+	let let_go = Instant::now();
+	let (_release, mut watched) = release_at(LeaseRelease::Settled {
+		at: let_go + Duration::from_secs(1),
+	});
+	tokio::time::sleep(Duration::from_secs(4)).await;
+	rested(let_go, &mut watched, LockBudget::default().rest).await;
+	assert_eq!(let_go.elapsed(), Duration::from_secs(1 + 5));
+}
+
+/// While another holder in the process keeps the lease, no release goes out and the pass may
+/// share that lease again once the rest has passed since it let go.
+#[tokio::test(start_paused = true)]
+async fn a_pass_whose_lease_another_holder_keeps_rests_from_letting_go() {
+	let let_go = Instant::now();
+	let (_release, mut watched) = release_at(LeaseRelease::Held);
+	rested(let_go, &mut watched, LockBudget::default().rest).await;
+	assert_eq!(let_go.elapsed(), Duration::from_secs(5));
+}
+
+/// The other holder letting go during the rest sends the release, and the rest then runs from
+/// that release's answer.
+#[tokio::test(start_paused = true)]
+async fn a_lease_another_holder_lets_go_during_the_rest_is_rested_from_its_answer() {
+	let let_go = Instant::now();
+	let (release, mut watched) = release_at(LeaseRelease::Held);
+	let ((), ()) = tokio::join!(
+		rested(let_go, &mut watched, LockBudget::default().rest),
+		async {
+			tokio::time::sleep(Duration::from_secs(2)).await;
+			release.send_replace(LeaseRelease::Sent);
+			tokio::time::sleep(Duration::from_secs(4)).await;
+			release.send_replace(LeaseRelease::Settled { at: Instant::now() });
+		}
+	);
+	assert_eq!(let_go.elapsed(), Duration::from_secs(2 + 4 + 5));
+}
+
+/// A real lease the pass lets go: its release, offline here, is given up on long after the pass
+/// let go, and the pass rests from then.
+#[tokio::test(start_paused = true)]
+async fn a_pass_rests_from_when_its_real_release_settles() {
+	let lock = Arc::new(crate::sync::lock::test_support::test_lock(
+		tokio::runtime::Handle::try_current().ok(),
+	));
+	let mut watched = lock.release_watch();
+	let let_go = Instant::now();
+	drop(lock);
+	rested(let_go, &mut watched, LockBudget::default().rest).await;
+	let LeaseRelease::Settled { at } = *watched.borrow() else {
+		panic!("the rest ends only after the release settled");
+	};
+	assert!(at > let_go + LockBudget::default().rest);
+	assert_eq!(Instant::now(), at + Duration::from_secs(5));
 }
 
 /// [`note_failure`] of `error` as the pass takes it when no server was shown answering while its

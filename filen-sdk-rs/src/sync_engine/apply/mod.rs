@@ -88,13 +88,16 @@ use crate::{
 		RemoteDirectory, RemoteFile,
 		client_impl::{KeepLocalWhen, download_to_path},
 	},
-	sync::lock::{ATTEMPTS_DEFAULT, ResourceLock, confirm_or_retake},
+	sync::lock::{ATTEMPTS_DEFAULT, LeaseRelease, ResourceLock, confirm_or_retake},
 	util::{MaybeArc, MaybeSendCallback},
 };
 use reach::Reach;
 use room::LocalRoom;
 pub(super) use room::{FreeSpace, free_space};
-use tokio::{sync::mpsc::UnboundedSender, time::Instant};
+use tokio::{
+	sync::{mpsc::UnboundedSender, watch},
+	time::{Instant, sleep_until},
+};
 
 /// Outcome of one apply pass.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -1529,8 +1532,12 @@ enum Lease {
 		/// How many remote writes started under it.
 		writes: usize,
 	},
-	/// Let go at `at`; not asked for again before [`PASS_LOCK_YIELD`](super::engine::PASS_LOCK_YIELD) has passed.
-	Released { at: Instant },
+	/// Let go at `at`, with `release` where the release of the lease it held stands; not asked for
+	/// again before the rest has passed (see [`rested`]).
+	Released {
+		at: Instant,
+		release: watch::Receiver<LeaseRelease>,
+	},
 }
 
 impl Lease {
@@ -1542,8 +1549,14 @@ impl Lease {
 	/// Let a spent hold go, when the next action sits where a release splits nothing, and with it
 	/// the links and shares looked up during it, unless another holder in the process shares it.
 	fn release_if_spent(&mut self, ctx: &ApplyContext<'_>, releasable: bool, now: Instant) {
-		if releasable && self.spent(&ctx.lock_budget, now) {
-			*self = Self::Released { at: now };
+		if releasable
+			&& self.spent(&ctx.lock_budget, now)
+			&& let Self::Held { lock, .. } = std::mem::replace(self, Self::Unheld)
+		{
+			// watched from before the drop, which may send the release
+			let release = lock.release_watch();
+			drop(lock);
+			*self = Self::Released { at: now, release };
 			ctx.client.forget_ended_hold_targets();
 		}
 	}
@@ -1616,9 +1629,9 @@ impl Lease {
 		let now = Instant::now();
 		self.release_if_spent(ctx, releasable, now);
 		if !self.admits(&ctx.lock_budget, action, releasable, now) {
-			if let Self::Released { at } = *self {
+			if let Self::Released { at, release } = self {
 				ctx.gate
-					.guard(tokio::time::sleep_until(at + ctx.lock_budget.rest))
+					.guard(rested(*at, release, ctx.lock_budget.rest))
 					.await?;
 			}
 			if !ctx.gate.wait_to_start().await {
@@ -1666,6 +1679,35 @@ impl Lease {
 			None => {
 				note_interrupted(report, remaining, observer);
 				ControlFlow::Break(())
+			}
+		}
+	}
+}
+
+/// Resolves once a pass that let the drive lock go at `let_go` may ask for it again: `rest` after the
+/// server answered the release of the lease it held, or the release was given up on, as `release`
+/// reports it (see [`PASS_LOCK_YIELD`](super::engine::PASS_LOCK_YIELD)). While another holder in the
+/// process keeps that lease, no release is sent, and `rest` after `let_go` is enough: asking again
+/// then shares that holder's lease.
+async fn rested(let_go: Instant, release: &mut watch::Receiver<LeaseRelease>, rest: Duration) {
+	loop {
+		let state = *release.borrow_and_update();
+		// A closed channel without a settled release cannot happen (the release settles it before
+		// it lets go); the rest ends there rather than never.
+		match state {
+			LeaseRelease::Settled { at } => return sleep_until(at + rest).await,
+			LeaseRelease::Held => {
+				tokio::select! {
+					() = sleep_until(let_go + rest) => return,
+					changed = release.changed() => if changed.is_err() {
+						return;
+					},
+				}
+			}
+			LeaseRelease::Sent => {
+				if release.changed().await.is_err() {
+					return;
+				}
 			}
 		}
 	}

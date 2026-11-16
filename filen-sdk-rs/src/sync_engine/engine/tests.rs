@@ -11080,19 +11080,40 @@ fn the_pass_lock_ceiling_polls_again_inside_the_confirmation_window() {
 	);
 }
 
-/// A pass that lets the drive lock go has to stay away from it long enough for a client on the
-/// default ladder to poll once, or the release frees nothing: the pass would take the lock back
-/// before anyone else asked.
+/// A pass that lets the drive lock go has to stay away from it long enough for another pass on
+/// a connection that announces nothing to poll once on its own schedule, or the release frees
+/// nothing for it: the pass would take the lock back before the other one asked. (A pass on an
+/// announcing connection polls on the announcement; one whose announcement is lost polls only
+/// once a lock lease and usually loses this turn, see `PASS_LOCK_YIELD`.)
 #[test]
-fn a_released_drive_lock_stays_free_past_one_default_poll() {
+fn a_released_drive_lock_stays_free_past_one_pass_poll() {
 	assert!(
-		PASS_LOCK_YIELD > MAX_SLEEP_TIME_DEFAULT,
-		"a pass asking again after {PASS_LOCK_YIELD:?} can beat a client sleeping out \
-			 {MAX_SLEEP_TIME_DEFAULT:?} every time"
+		PASS_LOCK_YIELD >= PASS_LOCK_MAX_SLEEP,
+		"a pass asking again after {PASS_LOCK_YIELD:?} can beat a pass polling every \
+			 {PASS_LOCK_MAX_SLEEP:?} every time"
 	);
 	assert!(
 		PASS_LOCK_MAX_HOLD > PASS_LOCK_YIELD,
 		"a pass that stays away longer than it holds the lock spends most of a large push idle"
+	);
+}
+
+/// A pass stays away from a drive lock it let go for 5 s after the server answered the release.
+#[test]
+fn a_released_drive_lock_is_rested_from_for_five_seconds() {
+	assert_eq!(PASS_LOCK_YIELD, Duration::from_secs(5));
+	assert_eq!(LockBudget::default().rest, Duration::from_secs(5));
+}
+
+/// The rest after a release is sized for waiters a release announcement wakes, not for clients
+/// that only poll on the default ladder: those can lose their turn while a sync keeps writing, a
+/// tradeoff taken so a large push does not idle out a whole default sleep per batch.
+#[test]
+fn a_released_drive_lock_is_asked_for_again_before_a_default_poll() {
+	assert!(
+		PASS_LOCK_YIELD < MAX_SLEEP_TIME_DEFAULT,
+		"a pass staying away {PASS_LOCK_YIELD:?} sits out a whole default sleep \
+			 ({MAX_SLEEP_TIME_DEFAULT:?}) per batch, which the wakes made unnecessary"
 	);
 }
 

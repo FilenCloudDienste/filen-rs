@@ -7,7 +7,7 @@ use std::{
 use filen_types::{auth::APIKey, fs::Uuid};
 use tokio::runtime::{Builder, Handle, Runtime};
 
-use super::{Confirmed, ResourceLock, SharedLease};
+use super::{Confirmed, LeaseRelease, ResourceLock, SharedLease};
 use crate::auth::{
 	http::{AuthClient, ClientConfig, test_support::unauthed_via_proxy},
 	unauth::{UnauthClient, test_support::offline_unauthed},
@@ -59,6 +59,7 @@ pub(crate) fn test_lock_on(
 			confirming: tokio::sync::Mutex::new(None),
 			confirmations: AtomicU64::new(0),
 			handle,
+			release: tokio::sync::watch::Sender::new(LeaseRelease::Held),
 		}
 		.hold(),
 	}

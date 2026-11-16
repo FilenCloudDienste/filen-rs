@@ -229,10 +229,16 @@ pub(super) enum PendingKind {
 /// What the window is NOT above is the account-wide drive-write lock. Two clients of one account
 /// serialize their uploads on it, so the one that queues lands its version as far behind the other's
 /// as its wait was long — the live suite has measured a same-round race spread 30 s apart, back when
-/// a pass polled for the lock on the shared ladder's 30 s ceiling. A pass polls on
-/// `PASS_LOCK_MAX_SLEEP` now, which bounds the part of that wait the acquisition adds; what no
-/// ceiling can bound is the rest of the holder's batch, which runs on under the lock after its
-/// upload for up to `PASS_LOCK_MAX_HOLD` (longer while a transfer started inside it finishes). A
+/// a pass polled for the lock on the shared ladder's 30 s ceiling. A pass waiting for the lock now
+/// polls as soon as the socket announces its release, and on `PASS_LOCK_MAX_SLEEP` on a connection
+/// that announces nothing, which bounds the part of that wait the acquisition adds. On a connection
+/// that announces, a release whose announcement is lost is polled for only once a lock lease (60 s)
+/// after the pass's last scheduled poll, far past this window, and so is every release while the
+/// server's announcements are out although its lock probe says it sends them: such a race reads
+/// as an ordinary later edit, the cost taken for not polling a contended lock every few seconds
+/// (see `PASS_LOCK_MAX_SLEEP`). What no schedule can bound is the rest of the holder's batch, which
+/// runs on under the lock after its upload for up to `PASS_LOCK_MAX_HOLD` (longer while a transfer
+/// started inside it finishes). A
 /// race stretched past the window is, by every piece of evidence the engine has, an ordinary later
 /// edit: our push confirms and the foreign version is pulled over our local copy, leaving only the
 /// pusher's interleave check to surface it, and a CREATE race has no replaced version for that check
@@ -240,26 +246,34 @@ pub(super) enum PendingKind {
 pub const CONFIRM_TENURE: Duration = Duration::from_secs(10);
 
 /// The ceiling on ONE sleep of the drive-lock acquisition a pass makes, with the lock module's
-/// default attempt count, so the whole wait's bound moves with it: 8640 polls of at most 5 s give
-/// up after about 12 h where the default ladder allowed about 72 h, with the same `RetryFailed`
-/// at the end.
+/// default attempt count, so the whole wait's bound moves with it: on a connection that announces
+/// nothing, 8640 polls of at most 5 s give up after about 12 h where the default ladder allowed
+/// about 72 h, with the same `RetryFailed` at the end.
 ///
 /// A pass holds the account-wide drive-write lock for a batch of its apply at a time (see
 /// [`PASS_LOCK_MAX_HOLD`]), so two clients of one account run their batches one after the other, and
-/// the second one's version lands as far behind the first's as its wait for the lock was long. Past [`CONFIRM_TENURE`] that is no longer a race by
-/// any evidence the engine has: the first client's push has tenured, so it pulls the second's
-/// version over its own copy instead of surfacing a conflict, and the bytes it planned survive only
-/// as a server version. The default ladder ([`crate::sync::lock`], capped at
-/// [`MAX_SLEEP_TIME_DEFAULT`](crate::sync::lock::MAX_SLEEP_TIME_DEFAULT), 30 s per sleep) puts a
-/// missed release well past the window on its own: a client that polls a moment too early sleeps out
-/// its whole current step before it asks again. Half the window bounds that miss to a fraction of it
-/// instead, for the price of more polls on a lock held through a long batch. Only the ENGINE's own
-/// acquisition is bounded this way; every other caller of [`Client::lock_drive`] keeps the default
-/// ladder.
+/// the second one's version lands as far behind the first's as its wait for the lock was long. Past
+/// [`CONFIRM_TENURE`] that is no longer a race by any evidence the engine has: the first client's
+/// push has tenured, so it pulls the second's version over its own copy instead of surfacing a
+/// conflict, and the bytes it planned survive only as a server version.
 ///
-/// A client whose socket delivers the server's lock announcements also polls as soon as a release is
-/// announced, without using an attempt. This schedule stays as it is for it, and catches a release
-/// whose announcement is lost.
+/// What gets a waiting pass to a release in time is the wake: a client whose socket delivers the
+/// server's lock announcements polls as soon as a release is announced, without using an attempt.
+/// Such a client does not poll on this schedule: after each scheduled poll it pauses a lock lease
+/// (60 s, or the shorter lease a server announced), which is the only safety net against a lost
+/// announcement, so its 8640 scheduled polls last about six days. A release whose announcement is
+/// lost then reaches the pass up to a lease late, well past [`CONFIRM_TENURE`], and while the
+/// server's announcements are out although its lock probe says it sends them, every release does;
+/// that tradeoff was taken for a contended wait costing one request a lease rather than one every
+/// 5 s. This schedule is the whole mechanism on a connection that announces nothing (no socket, a
+/// server that predates the announcements, a lock probe that went unanswered). There the default
+/// ladder ([`crate::sync::lock`], capped
+/// at [`MAX_SLEEP_TIME_DEFAULT`](crate::sync::lock::MAX_SLEEP_TIME_DEFAULT), 30 s per sleep) would
+/// put a missed release well past the window on its own: a client that polls a moment too early
+/// sleeps out its whole current step before it asks again. Half the window bounds that miss to a
+/// fraction of it instead, for the price of more polls on a lock held through a long batch. Only the
+/// ENGINE's own acquisition is bounded this way; every other caller of [`Client::lock_drive`] keeps
+/// the default ladder.
 ///
 /// It does NOT bound the whole gap between the two versions. The winner holds the lock until the end
 /// of its batch, so its upload can already be older than the window by the time the loser is let in;
@@ -285,14 +299,31 @@ pub(super) const PASS_LOCK_MAX_BATCH: usize = 500;
 
 /// How long a pass that let the drive-write lock go stays away from it before asking again.
 ///
-/// The lock has no queue: whoever polls first after a release takes it. A pass asking again at once
-/// would win nearly every time against a client sleeping out the default ladder
-/// ([`MAX_SLEEP_TIME_DEFAULT`](crate::sync::lock::MAX_SLEEP_TIME_DEFAULT), 30 s per sleep), so the
-/// release would free nothing. Staying away past one whole default sleep lets every waiting client
-/// poll at least once; the extra 5 s covers the release itself, which is a request sent after the
-/// lock is dropped. Only remote writes wait on it — local actions and downloads carry on meanwhile.
-pub(super) const PASS_LOCK_YIELD: Duration =
-	Duration::from_secs(crate::sync::lock::MAX_SLEEP_TIME_DEFAULT.as_secs() + 5);
+/// The lock has no queue: whoever polls first after a release takes it, so a pass asking again at
+/// once would win nearly every time and the release would free nothing. What lets a waiting client
+/// in first is the wake: a client whose socket delivers the server's lock announcements polls as
+/// soon as the release is announced, which costs the release request, the announcement and that
+/// poll: a few round trips, normally far shorter than the rest. A waiting pass whose connection
+/// announces nothing polls on [`PASS_LOCK_MAX_SLEEP`], no longer apart than the rest, so it usually
+/// gets one poll in before this pass asks again; one whose announcement is lost polls only once a
+/// lock lease (see [`PASS_LOCK_MAX_SLEEP`]), and usually loses this turn.
+///
+/// The rest runs from when the server answered this pass's release, or the release was given up
+/// on, not from when the pass let the lock go: the release is a request of its own, which can take
+/// longer than the rest, and a pass asking again while its old lease still stood would be refused
+/// and then wait for the release's announcement, or a lease. While another holder in the process
+/// (the cache worker's resync, another pair's pass) still holds the lease, no release goes out, and
+/// the pass takes the lock back from that holder once the rest has passed since it let go: it then
+/// shares that lease and asks the server nothing.
+///
+/// The tradeoff, accepted: a client that only polls on the default ladder's steps
+/// ([`MAX_SLEEP_TIME_DEFAULT`](crate::sync::lock::MAX_SLEEP_TIME_DEFAULT), 30 s per sleep — older
+/// filen-rs builds, filen-sdk-ts and other SDKs) usually sleeps through the whole rest, so while a
+/// sync keeps writing, batch after batch and pass after pass, it can lose its turn every time. Staying
+/// away past one whole default sleep would have let it in, at the price of every large push sitting
+/// idle for over half a minute per batch. Only remote writes wait on the rest — local actions and
+/// downloads carry on meanwhile.
+pub(super) const PASS_LOCK_YIELD: Duration = Duration::from_secs(5);
 
 /// The bounds a pass keeps each hold of the drive-write lock within. Always the three constants
 /// above, except where a test shrinks them to make a release happen inside a small pass.

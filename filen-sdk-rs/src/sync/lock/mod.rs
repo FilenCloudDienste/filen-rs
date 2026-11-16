@@ -286,6 +286,32 @@ struct ReleaseRequest {
 	_pending: PendingRelease,
 	// keeps the lock owed until this release is answered or given up on
 	_record: Option<Arc<LockRecord>>,
+	// settles the lease's release state once this release is answered or given up on: the
+	// release of a held lease's last handle only
+	_settles: Option<SettlesRelease>,
+}
+
+/// Where the release of a held lease stands (see [`ResourceLock::release_watch`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LeaseRelease {
+	/// A handle of the lease is still held, so no release was sent.
+	Held,
+	/// The last handle was dropped, and its release is on its way.
+	Sent,
+	/// The server answered the release `at` this time, or it was given up on then: retried
+	/// past the lease, or cancelled.
+	Settled { at: Instant },
+}
+
+/// Settles a lease's [`LeaseRelease`] when dropped, with the release request it travels in.
+#[derive(Debug)]
+struct SettlesRelease(tokio::sync::watch::Sender<LeaseRelease>);
+
+impl Drop for SettlesRelease {
+	fn drop(&mut self) {
+		self.0
+			.send_replace(LeaseRelease::Settled { at: Instant::now() });
+	}
 }
 
 /// When the server last confirmed the lease a release frees, which bounds its retries (see
@@ -329,7 +355,16 @@ impl OwedRelease {
 			confirmed,
 			_pending: pending,
 			_record: record,
+			_settles: None,
 		}))
+	}
+
+	/// The release, which settles `settles` once it is answered or given up on.
+	fn settling(mut self, settles: SettlesRelease) -> Self {
+		if let Some(request) = &mut self.0 {
+			request._settles = Some(settles);
+		}
+		self
 	}
 
 	/// Sends the release and waits for the server's answer, or until it is given up on.
@@ -465,6 +500,8 @@ struct SharedLease {
 	handle: Option<tokio::runtime::Handle>,
 	// The lock's report to the client's lock listener, kept until its releases took theirs.
 	record: Option<Arc<LockRecord>>,
+	// Where the release sent once the last handle drops stands, shared with that release.
+	release: tokio::sync::watch::Sender<LeaseRelease>,
 }
 
 impl PartialEq for ResourceLock {
@@ -561,6 +598,14 @@ impl ResourceLock {
 		// here; a closed channel would mean the lock is gone anyway.
 		let _ = receiver.wait_for(|valid| !*valid).await;
 	}
+
+	/// Watches where the release of this lock's lease stands: [`LeaseRelease::Held`] while a
+	/// handle of it is held, then [`LeaseRelease::Sent`] once the last one is dropped, and
+	/// [`LeaseRelease::Settled`] once the server answered that release or it was given up on.
+	#[cfg(any(test, feature = "sync-engine"))]
+	pub(crate) fn release_watch(&self) -> tokio::sync::watch::Receiver<LeaseRelease> {
+		self.lease.release.subscribe()
+	}
 }
 
 impl SharedLease {
@@ -588,7 +633,7 @@ impl SharedLease {
 				"Lost lock '{}', releasing it in case the server still holds it",
 				self.resource,
 			);
-			self.spawn_release();
+			self.spawn_release(None);
 		}
 	}
 
@@ -685,14 +730,14 @@ impl SharedLease {
 	// instead of stalling it out to the TTL, and if the lease is truly gone the Release is a
 	// harmless no-op keyed to our uuid.
 	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-	fn spawn_release(&self) {
+	fn spawn_release(&self, settles: Option<SettlesRelease>) {
 		// Prefer the ambient runtime: it is alive by definition, while the captured handle's
 		// runtime may have shut down since acquisition (spawning there would silently cancel
 		// the release).
 		let handle = tokio::runtime::Handle::try_current()
 			.ok()
 			.or_else(|| self.handle.clone());
-		let owed = self.owed_release();
+		let owed = self.owed_release(settles);
 		match handle {
 			// Spawning on a handle whose runtime has shut down does not panic: the task is
 			// cancelled without being polled, and `owed` sends the release from its own thread.
@@ -703,8 +748,8 @@ impl SharedLease {
 	}
 
 	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
-	fn spawn_release(&self) {
-		let owed = self.owed_release();
+	fn spawn_release(&self, settles: Option<SettlesRelease>) {
+		let owed = self.owed_release(settles);
 		// `runtime::spawn_local` (unlike raw `wasm_bindgen_futures::spawn_local`) holds the
 		// spawning SDK worker open until the future completes, so a worker whose other tasks
 		// finish cannot close mid-request and silently skip the release. On the main thread it
@@ -714,9 +759,10 @@ impl SharedLease {
 
 	/// The release of this lease, counted in the client's [`PendingReleases`] from now until it
 	/// is answered or given up on (see [`release`]). It reads the lease's confirmations as they
-	/// come, so a refresh the keep-alive records after the drop still extends the retries.
-	fn owed_release(&self) -> OwedRelease {
-		OwedRelease::new(
+	/// come, so a refresh the keep-alive records after the drop still extends the retries. It
+	/// settles `settles`, if any, once it is answered or given up on.
+	fn owed_release(&self, settles: Option<SettlesRelease>) -> OwedRelease {
+		let owed = OwedRelease::new(
 			Arc::clone(&self.client),
 			lock_url().into(),
 			self.uuid,
@@ -724,7 +770,11 @@ impl SharedLease {
 			LeaseConfirmed::Watched(self.confirmed.clone()),
 			// refcount bump
 			self.record.clone(),
-		)
+		);
+		match settles {
+			Some(settles) => owed.settling(settles),
+			None => owed,
+		}
 	}
 }
 
@@ -732,7 +782,9 @@ impl Drop for SharedLease {
 	// async drop is not supported in Rust, so the release is spawned
 	fn drop(&mut self) {
 		self.client.lock_board.let_go(self.uuid);
-		self.spawn_release();
+		self.release.send_replace(LeaseRelease::Sent);
+		// a second handle on the state, for the release to settle
+		self.spawn_release(Some(SettlesRelease(self.release.clone())));
 	}
 }
 
@@ -1493,6 +1545,7 @@ impl Client {
 			#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 			handle: tokio::runtime::Handle::try_current().ok(),
 			record,
+			release: tokio::sync::watch::Sender::new(LeaseRelease::Held),
 		}
 		.hold();
 		keep_lock_alive(&lease);

@@ -228,6 +228,45 @@ fn the_release_of_a_dropped_lock_is_waited_for_until_it_is_answered() {
 	assert_eq!(rt.metrics().num_alive_tasks(), 0);
 }
 
+/// A lease's release state follows its handles: held while one is, sent once the last one is
+/// dropped, and settled once that release was answered or, as here offline, given up on.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+#[test]
+fn a_lease_release_is_held_then_sent_then_settled() {
+	// paused, so the retries of the release, which fails offline, take no real time
+	let rt = tokio::runtime::Builder::new_current_thread()
+		.enable_all()
+		.start_paused(true)
+		.build()
+		.unwrap();
+	let lock = rt.block_on(async { test_lock(tokio::runtime::Handle::try_current().ok()) });
+	let clone = lock.clone();
+	let mut release = lock.release_watch();
+	let _guard = rt.enter();
+	drop(lock);
+	assert_eq!(
+		*release.borrow(),
+		LeaseRelease::Held,
+		"a clone holds the lease"
+	);
+
+	let let_go = Instant::now();
+	drop(clone);
+	assert_eq!(*release.borrow_and_update(), LeaseRelease::Sent);
+	rt.block_on(release.changed()).unwrap();
+	let LeaseRelease::Settled { at } = *release.borrow() else {
+		panic!("the release settles once given up on");
+	};
+	assert!(
+		at > let_go,
+		"settled when the release was given up on, not when it was sent"
+	);
+	assert!(
+		rt.block_on(release.changed()).is_err(),
+		"nothing changes after the settlement"
+	);
+}
+
 /// A runtime for a test to watch requests arrive on, and a proxy on it that `client` sends them to.
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 fn proxy_and_client() -> (
