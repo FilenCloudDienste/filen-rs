@@ -9,6 +9,10 @@ use crate::auth::http::{
 	ClientConfig,
 	test_support::{GATEWAY_CONNECT, client_via_proxy, read_head, respond_with},
 };
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+use crate::socket::LockTransport;
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+use filen_types::api::v3::socket::LockEventType;
 
 /// The caller-chosen ceiling is what bounds how late a contended acquisition's NEXT poll is —
 /// the sync engine picks a short one so a pass that misses another client's release is back
@@ -1007,6 +1011,8 @@ enum AcquireStep {
 	SlowGrant(u64),
 	/// server answers acquired: false (someone else holds the lock)
 	Refuse,
+	/// server answers acquired: false after this many seconds
+	SlowRefuse(u64),
 	/// no answer: the request failed in transport
 	Unreachable,
 	/// the server answered with an error
@@ -1027,6 +1033,10 @@ fn scripted_acquire(polls: &[AcquireStep]) -> impl FnMut() -> ScriptedLockFut {
 				Ok(true)
 			}),
 			AcquireStep::Refuse => Box::pin(async { Ok(false) }),
+			AcquireStep::SlowRefuse(secs) => Box::pin(async move {
+				tokio::time::sleep(Duration::from_secs(secs)).await;
+				Ok(false)
+			}),
 			AcquireStep::Unreachable => Box::pin(async {
 				Err(Error::custom(
 					ErrorKind::Reqwest,
@@ -1052,6 +1062,7 @@ async fn acquire_refusals_use_up_the_attempts() {
 		"r",
 		Duration::from_secs(30),
 		3,
+		quiet(),
 	)
 	.await
 	.unwrap_err();
@@ -1069,6 +1080,7 @@ async fn acquire_delays_stop_growing_at_max_sleep_time() {
 		"r",
 		Duration::from_millis(500),
 		5,
+		quiet(),
 	)
 	.await
 	.unwrap_err();
@@ -1090,6 +1102,7 @@ async fn acquire_grant_is_anchored_to_its_send_time() {
 		"r",
 		Duration::from_secs(30),
 		10,
+		quiet(),
 	)
 	.await
 	.unwrap();
@@ -1107,6 +1120,7 @@ async fn acquire_transport_error_on_the_first_poll_fails_fast() {
 		"r",
 		Duration::from_secs(30),
 		10,
+		quiet(),
 	)
 	.await
 	.unwrap_err();
@@ -1128,6 +1142,7 @@ async fn acquire_transport_error_after_an_answer_keeps_polling() {
 		"r",
 		Duration::from_secs(30),
 		10,
+		quiet(),
 	)
 	.await
 	.unwrap();
@@ -1150,6 +1165,7 @@ async fn acquire_transport_errors_past_the_limit_fail_the_acquisition() {
 		"r",
 		Duration::from_secs(30),
 		10,
+		quiet(),
 	)
 	.await
 	.unwrap_err();
@@ -1177,6 +1193,7 @@ async fn acquire_answer_resets_the_transport_error_count() {
 		"r",
 		Duration::from_secs(30),
 		10,
+		quiet(),
 	)
 	.await
 	.unwrap();
@@ -1193,6 +1210,7 @@ async fn acquire_transport_error_uses_up_an_attempt() {
 		"r",
 		Duration::from_secs(30),
 		2,
+		quiet(),
 	)
 	.await
 	.unwrap_err();
@@ -1209,11 +1227,479 @@ async fn acquire_server_error_after_an_answer_is_returned() {
 		"r",
 		Duration::from_secs(30),
 		10,
+		quiet(),
 	)
 	.await
 	.unwrap_err();
 	assert_eq!(err.kind(), ErrorKind::Server);
 	assert_eq!(begin.elapsed(), Duration::ZERO);
+}
+
+/// The wakes `wakes` of a wait for `resource` over `transport`, which never changes.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+fn wakes_on(
+	wakes: tokio::sync::watch::Receiver<()>,
+	transport: LockTransport,
+	resource: &str,
+) -> LockWakes {
+	LockWakes::new(wakes, tokio::sync::watch::channel(transport).1, resource)
+}
+
+/// The wakes of a wait for `resource` on `transport` with nothing to wake it: neither
+/// changes again.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+fn quiet_on(transport: LockTransport, resource: &str) -> LockWakes {
+	wakes_on(tokio::sync::watch::channel(()).1, transport, resource)
+}
+
+/// The wakes of a wait on a connection without announcements, with nothing to wake it.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+fn quiet() -> LockWakes {
+	quiet_on(LockTransport::None, "r")
+}
+
+/// A connection whose server speaks socket lock protocol 2, which announces the leases.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+fn announcing() -> LockTransport {
+	LockTransport::Socket {
+		generation: 1,
+		version: 2,
+		ttl: Duration::from_secs(60),
+	}
+}
+
+/// A connection whose lock probe went unanswered: it delivers announcements or not, and nothing
+/// says which, so its waits keep their schedule.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+const UNPROBED: LockTransport = LockTransport::Http { generation: 1 };
+
+/// The resource the waits woken through a [`LockBoard`] are for.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+const DRIVE: &str = "drive-write";
+
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+fn announced(resource: &str) -> filen_types::api::v3::socket::LockAnnouncement<'static> {
+	filen_types::api::v3::socket::LockAnnouncement {
+		resource: Cow::Owned(resource.to_owned()),
+		uuid: Uuid::from_u128(1),
+		lease_id: Cow::Borrowed("lease-a"),
+		timestamp: DateTime::from_timestamp_millis(1_760_270_400_123).unwrap(),
+	}
+}
+
+/// A scripted wait's `polls`, and the send time of each poll it makes, from `begin`.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+fn timed_acquire(
+	begin: Instant,
+	polls: &[AcquireStep],
+) -> (
+	impl FnMut() -> ScriptedLockFut,
+	Arc<std::sync::Mutex<Vec<Duration>>>,
+) {
+	let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+	let mut script = scripted_acquire(polls);
+	// a second handle, for the poll closure
+	let record = Arc::clone(&sent);
+	let poll = move || {
+		record.lock().unwrap().push(begin.elapsed());
+		script()
+	};
+	(poll, sent)
+}
+
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+fn millis(sent: &[u64]) -> Vec<Duration> {
+	sent.iter().copied().map(Duration::from_millis).collect()
+}
+
+/// The polls of a wait refused 11 times on the 30 s ladder: the 11th is sent at 22 s, and the
+/// next is due 13.75 s later, at 35.75 s.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+const ELEVEN_LADDER_POLLS: [u64; 11] = [
+	0, 0, 250, 500, 1_000, 1_750, 3_000, 5_000, 8_250, 13_500, 22_000,
+];
+
+/// [`ELEVEN_LADDER_POLLS`] followed by `more`.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+fn after_eleven_ladder_polls(more: &[u64]) -> Vec<Duration> {
+	let mut sent = ELEVEN_LADDER_POLLS.to_vec();
+	sent.extend_from_slice(more);
+	millis(&sent)
+}
+
+/// A wait on a connection that may not announce keeps its ladder, and an announcement that does
+/// arrive still brings a poll forward.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+#[tokio::test(start_paused = true)]
+async fn a_release_announced_during_a_long_step_is_polled_for_at_once() {
+	let begin = Instant::now();
+	let board = LockBoard::default();
+	let mut script = vec![AcquireStep::Refuse; 11];
+	script.push(AcquireStep::Grant);
+	let (poll, sent) = timed_acquire(begin, &script);
+
+	let (granted_at, ()) = tokio::join!(
+		acquire_loop(
+			poll,
+			DRIVE,
+			Duration::from_secs(30),
+			20,
+			wakes_on(board.wakes(DRIVE), UNPROBED, DRIVE),
+		),
+		async {
+			sleep(Duration::from_secs(25)).await;
+			board.announced(&LockEventType::LockReleased(announced(DRIVE)), 7);
+		}
+	);
+	assert_eq!(granted_at.unwrap().at - begin, Duration::from_secs(25));
+	assert_eq!(*sent.lock().unwrap(), after_eleven_ladder_polls(&[25_000]));
+}
+
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+#[tokio::test(start_paused = true)]
+async fn a_refused_early_poll_waits_out_the_scheduled_pause() {
+	let begin = Instant::now();
+	let board = LockBoard::default();
+	let mut script = vec![AcquireStep::Refuse; 12];
+	script.push(AcquireStep::Grant);
+	let (poll, sent) = timed_acquire(begin, &script);
+
+	let (granted_at, ()) = tokio::join!(
+		acquire_loop(
+			poll,
+			DRIVE,
+			Duration::from_secs(30),
+			20,
+			wakes_on(board.wakes(DRIVE), UNPROBED, DRIVE),
+		),
+		async {
+			sleep(Duration::from_secs(25)).await;
+			board.announced(&LockEventType::LockTimeout(announced(DRIVE)), 7);
+		}
+	);
+	// the early poll at 25 s is refused, and the 12th scheduled one is still due at 35.75 s
+	assert_eq!(
+		granted_at.unwrap().at - begin,
+		Duration::from_millis(35_750)
+	);
+	assert_eq!(
+		*sent.lock().unwrap(),
+		after_eleven_ladder_polls(&[25_000, 35_750])
+	);
+}
+
+/// On an announcing connection the release's announcement is what gets a waiter the lock: the
+/// wait polls for it within the floor, where its next scheduled poll is a lease away.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+#[tokio::test(start_paused = true)]
+async fn an_announced_release_is_polled_for_long_before_the_next_lease_poll() {
+	let begin = Instant::now();
+	let board = LockBoard::default();
+	let (poll, sent) = timed_acquire(begin, &[AcquireStep::Refuse, AcquireStep::Grant]);
+
+	let (granted_at, ()) = tokio::join!(
+		acquire_loop(
+			poll,
+			DRIVE,
+			Duration::from_secs(30),
+			20,
+			wakes_on(board.wakes(DRIVE), announcing(), DRIVE),
+		),
+		async {
+			sleep(Duration::from_secs(3)).await;
+			board.announced(&LockEventType::LockReleased(announced(DRIVE)), 7);
+		}
+	);
+	assert_eq!(granted_at.unwrap().at - begin, Duration::from_secs(3));
+	assert_eq!(*sent.lock().unwrap(), millis(&[0, 3_000]));
+}
+
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+#[tokio::test(start_paused = true)]
+async fn a_reconnect_wakes_a_wait() {
+	let begin = Instant::now();
+	let board = LockBoard::default();
+	let (poll, sent) = timed_acquire(begin, &[AcquireStep::Refuse, AcquireStep::Grant]);
+
+	let (granted_at, ()) = tokio::join!(
+		acquire_loop(
+			poll,
+			DRIVE,
+			Duration::from_secs(30),
+			20,
+			wakes_on(board.wakes(DRIVE), announcing(), DRIVE),
+		),
+		async {
+			sleep(Duration::from_secs(25)).await;
+			board.connected();
+		}
+	);
+	assert_eq!(granted_at.unwrap().at - begin, Duration::from_secs(25));
+	assert_eq!(*sent.lock().unwrap(), millis(&[0, 25_000]));
+}
+
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+#[tokio::test(start_paused = true)]
+async fn a_lease_announced_acquired_does_not_wake_a_wait() {
+	let begin = Instant::now();
+	let board = LockBoard::default();
+	let (poll, sent) = timed_acquire(begin, &[AcquireStep::Refuse, AcquireStep::Grant]);
+
+	let (granted_at, ()) = tokio::join!(
+		acquire_loop(
+			poll,
+			DRIVE,
+			Duration::from_secs(30),
+			20,
+			wakes_on(board.wakes(DRIVE), announcing(), DRIVE),
+		),
+		async {
+			sleep(Duration::from_secs(25)).await;
+			board.announced(&LockEventType::LockAcquired(announced(DRIVE)), 7);
+		}
+	);
+	// only the safety poll a lease after the first one
+	assert_eq!(granted_at.unwrap().at - begin, Duration::from_secs(60));
+	assert_eq!(*sent.lock().unwrap(), millis(&[0, 60_000]));
+}
+
+/// Each scheduled poll on an announcing connection, the safety poll a lease, uses an attempt, and
+/// `RetryFailed` comes once the pause after the last one ran out, as on the ladder.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+#[tokio::test(start_paused = true)]
+async fn an_announcing_connection_polls_once_a_lease() {
+	let begin = Instant::now();
+	let (poll, sent) = timed_acquire(begin, &[AcquireStep::Refuse; 3]);
+	let err = acquire_loop(
+		poll,
+		"r",
+		Duration::from_secs(30),
+		3,
+		quiet_on(announcing(), "r"),
+	)
+	.await
+	.unwrap_err();
+	assert_eq!(err.kind(), ErrorKind::RetryFailed);
+	assert_eq!(begin.elapsed(), Duration::from_secs(180));
+	assert_eq!(*sent.lock().unwrap(), millis(&[0, 60_000, 120_000]));
+}
+
+/// A schedule whose delays outgrow the lease (a `max_sleep_time` past it) keeps them on an
+/// announcing connection: the safety poll comes once a lease at the most often.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+#[tokio::test(start_paused = true)]
+async fn an_announcing_wait_keeps_delays_longer_than_a_lease() {
+	let begin = Instant::now();
+	let mut script = vec![AcquireStep::Refuse; 15];
+	script.push(AcquireStep::Grant);
+	let (poll, sent) = timed_acquire(begin, &script);
+	let granted_at = acquire_loop(
+		poll,
+		"r",
+		Duration::from_secs(90),
+		20,
+		quiet_on(announcing(), "r"),
+	)
+	.await
+	.unwrap();
+	// The 90 s ladder's delays stay below a lease up to the 14th (58.25 s); the 15th is its
+	// 90 s ceiling.
+	let mut expected: Vec<u64> = (0..15).map(|n| n * 60_000).collect();
+	expected.push(14 * 60_000 + 90_000);
+	assert_eq!(*sent.lock().unwrap(), millis(&expected));
+	assert_eq!(granted_at.at - begin, Duration::from_secs(930));
+}
+
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+#[tokio::test(start_paused = true)]
+async fn a_wait_without_announcements_keeps_the_ladder() {
+	let cases = [
+		(LockTransport::None, "r"),
+		(LockTransport::Connecting, "r"),
+		(LockTransport::Probing { generation: 1 }, "r"),
+		(UNPROBED, "r"),
+		(
+			LockTransport::Socket {
+				generation: 1,
+				version: 1,
+				ttl: Duration::from_secs(60),
+			},
+			"r",
+		),
+		// a resource the server never announces
+		(announcing(), "a}b"),
+	];
+	for (transport, resource) in cases {
+		let label = format!("{transport:?} {resource}");
+		let begin = Instant::now();
+		let (poll, sent) = timed_acquire(begin, &[AcquireStep::Refuse; 3]);
+		let err = acquire_loop(
+			poll,
+			resource,
+			Duration::from_secs(30),
+			3,
+			quiet_on(transport, resource),
+		)
+		.await
+		.unwrap_err();
+		assert_eq!(err.kind(), ErrorKind::RetryFailed, "{label}");
+		assert_eq!(begin.elapsed(), Duration::from_millis(500), "{label}");
+		assert_eq!(*sent.lock().unwrap(), millis(&[0, 0, 250]), "{label}");
+	}
+}
+
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+#[test]
+fn an_announcing_pause_is_a_lease_unless_the_schedule_is_longer() {
+	let wakes = quiet_on(announcing(), "r");
+	assert_eq!(wakes.pause(Duration::ZERO), Duration::from_secs(60));
+	assert_eq!(
+		wakes.pause(Duration::from_secs(30)),
+		Duration::from_secs(60)
+	);
+	assert_eq!(
+		wakes.pause(Duration::from_secs(90)),
+		Duration::from_secs(90)
+	);
+	let ladder = quiet_on(LockTransport::None, "r");
+	assert_eq!(
+		ladder.pause(Duration::from_secs(30)),
+		Duration::from_secs(30)
+	);
+}
+
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+#[tokio::test(start_paused = true)]
+async fn a_wake_uses_no_attempt() {
+	let begin = Instant::now();
+	let (wake, wakes) = tokio::sync::watch::channel(());
+	let (poll, sent) = timed_acquire(begin, &[AcquireStep::Refuse; 4]);
+
+	let (err, ()) = tokio::join!(
+		acquire_loop(
+			poll,
+			"r",
+			Duration::from_secs(30),
+			2,
+			wakes_on(wakes, announcing(), "r"),
+		),
+		async {
+			sleep(Duration::from_secs(10)).await;
+			wake.send_replace(());
+			sleep(Duration::from_secs(60)).await;
+			wake.send_replace(());
+		}
+	);
+	assert_eq!(err.unwrap_err().kind(), ErrorKind::RetryFailed);
+	// two scheduled polls and their pauses, as without the wakes
+	assert_eq!(begin.elapsed(), Duration::from_secs(120));
+	assert_eq!(*sent.lock().unwrap(), millis(&[0, 10_000, 60_000, 70_000]));
+}
+
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+#[tokio::test(start_paused = true)]
+async fn early_polls_are_a_floor_apart() {
+	let begin = Instant::now();
+	let (wake, wakes) = tokio::sync::watch::channel(());
+	let (poll, sent) = timed_acquire(
+		begin,
+		&[AcquireStep::Refuse, AcquireStep::Refuse, AcquireStep::Grant],
+	);
+
+	let (granted_at, ()) = tokio::join!(
+		acquire_loop(
+			poll,
+			"r",
+			Duration::from_secs(30),
+			20,
+			wakes_on(wakes, announcing(), "r"),
+		),
+		async {
+			sleep(Duration::from_millis(100)).await;
+			wake.send_replace(());
+			sleep(Duration::from_millis(200)).await;
+			wake.send_replace(());
+		}
+	);
+	assert_eq!(granted_at.unwrap().at - begin, Duration::from_millis(500));
+	// woken at 0.1 s and 0.3 s
+	assert_eq!(*sent.lock().unwrap(), millis(&[0, 250, 500]));
+}
+
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+#[tokio::test(start_paused = true)]
+async fn a_wake_during_a_poll_polls_again_once_it_is_answered() {
+	let begin = Instant::now();
+	let (wake, wakes) = tokio::sync::watch::channel(());
+	let (poll, sent) = timed_acquire(begin, &[AcquireStep::SlowRefuse(5), AcquireStep::Grant]);
+
+	let (granted_at, ()) = tokio::join!(
+		acquire_loop(
+			poll,
+			"r",
+			Duration::from_secs(30),
+			20,
+			wakes_on(wakes, announcing(), "r"),
+		),
+		async {
+			// during the first poll, which is refused at 5 s
+			sleep(Duration::from_secs(2)).await;
+			wake.send_replace(());
+		}
+	);
+	assert_eq!(granted_at.unwrap().at - begin, Duration::from_secs(5));
+	assert_eq!(*sent.lock().unwrap(), millis(&[0, 5_000]));
+}
+
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+#[tokio::test(start_paused = true)]
+async fn a_wait_pauses_a_lease_once_its_connection_announces() {
+	let begin = Instant::now();
+	let (transport, transports) = tokio::sync::watch::channel(LockTransport::Connecting);
+	let wakes = LockWakes::new(tokio::sync::watch::channel(()).1, transports, "r");
+	let mut script = vec![AcquireStep::Refuse; 7];
+	script.push(AcquireStep::Grant);
+	let (poll, sent) = timed_acquire(begin, &script);
+
+	let (granted_at, ()) = tokio::join!(
+		acquire_loop(poll, "r", Duration::from_secs(30), 20, wakes),
+		async {
+			sleep(Duration::from_secs(4)).await;
+			transport.send_replace(announcing());
+		}
+	);
+	// the 7th poll, at 3 s, was due again 2 s later on the ladder, and is a lease later now
+	assert_eq!(granted_at.unwrap().at - begin, Duration::from_secs(63));
+	assert_eq!(
+		*sent.lock().unwrap(),
+		millis(&[0, 0, 250, 500, 1_000, 1_750, 3_000, 63_000])
+	);
+}
+
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+#[tokio::test(start_paused = true)]
+async fn a_wait_goes_back_to_the_ladder_once_announcements_stop() {
+	let begin = Instant::now();
+	let (transport, transports) = tokio::sync::watch::channel(announcing());
+	let wakes = LockWakes::new(tokio::sync::watch::channel(()).1, transports, "r");
+	let (poll, sent) = timed_acquire(
+		begin,
+		&[AcquireStep::Refuse, AcquireStep::Refuse, AcquireStep::Grant],
+	);
+
+	let (granted_at, ()) = tokio::join!(
+		acquire_loop(poll, "r", Duration::from_secs(30), 20, wakes),
+		async {
+			sleep(Duration::from_secs(10)).await;
+			transport.send_replace(LockTransport::Connecting);
+		}
+	);
+	// the ladder's first pause, 0 s, ran out long before; the next is 0.25 s
+	assert_eq!(
+		granted_at.unwrap().at - begin,
+		Duration::from_millis(10_250)
+	);
+	assert_eq!(*sent.lock().unwrap(), millis(&[0, 10_000, 10_250]));
 }
 
 #[test]

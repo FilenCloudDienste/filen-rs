@@ -1,7 +1,11 @@
+#[cfg(feature = "test-seams")]
+use std::borrow::Cow;
 use std::time::{Duration, Instant};
 
 use base64::{Engine, prelude::BASE64_URL_SAFE_NO_PAD};
 use filen_sdk_rs::auth::Client;
+#[cfg(feature = "test-seams")]
+use filen_sdk_rs::socket::DecryptedSocketEvent;
 
 /// Waits for a dropped lock's release task to free `resource`: acquires it once it is free and
 /// releases it again, and fails the test if it is still held after `within`.
@@ -136,4 +140,56 @@ async fn test_refresh_lock() {
 		.unwrap_err();
 	std::mem::drop(lock);
 	wait_until_free(client, &resource, Duration::from_secs(30)).await;
+}
+
+/// A lock wait on a connection that delivers the server's lock announcements polls as soon as the
+/// holder's release is announced, and otherwise only once a lease (60 s) after its last scheduled
+/// poll. The release comes 5 s into the wait, so only the announcement can get it the lock within
+/// seconds of the release.
+#[cfg(feature = "test-seams")]
+#[filen_macros::shared_test_runtime]
+async fn a_release_wakes_a_waiter() {
+	let client = test_utils::RESOURCES.client().await;
+	// The announcements arrive over the socket, which a listener keeps open.
+	let _listener = client
+		.add_event_listener(
+			Box::new(|_: &DecryptedSocketEvent<'_>| {}),
+			Some(vec![Cow::Borrowed("authSuccess")]),
+		)
+		.await
+		.unwrap();
+	let version = tokio::time::timeout(
+		Duration::from_secs(20),
+		client.lock_protocol_version_for_test(),
+	)
+	.await
+	.expect("the lockHello probe settles");
+	assert_eq!(version, Some(2), "the server does not announce locks");
+
+	let resource = format!(
+		"rs-{}",
+		BASE64_URL_SAFE_NO_PAD.encode(rand::random::<[u8; 32]>())
+	);
+	let holder = client
+		.acquire_lock(&resource, Duration::from_secs(1), 1)
+		.await
+		.unwrap();
+	let (waiter, released_at) = tokio::join!(
+		client.acquire_lock(&resource, Duration::from_secs(30), 5),
+		async {
+			// The waiter's first poll is refused, and its next scheduled one is a lease away.
+			tokio::time::sleep(Duration::from_secs(5)).await;
+			drop(holder);
+			Instant::now()
+		}
+	);
+	let waited = released_at.elapsed();
+	let waiter = waiter.expect("the waiter gets the lock");
+	assert!(
+		waited < Duration::from_secs(3),
+		"the waiter got the lock {waited:?} after its release"
+	);
+	println!("the waiter got the lock {waited:?} after its release");
+	drop(waiter);
+	wait_until_free(&client, &resource, Duration::from_secs(30)).await;
 }

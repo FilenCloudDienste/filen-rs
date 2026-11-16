@@ -42,6 +42,17 @@ const ENDED_LEASE_KEEP: Duration = Duration::from_secs(10 * 60);
 /// announcement takes a little longer to arrive.
 const RETIRED_KEEP: Duration = LOCK_SERVER_TTL.saturating_add(Duration::from_secs(10));
 
+/// Whether the server announces the leases of `resource` at all. It does not for a name its
+/// store cannot place by a hash tag: one holding a `}` whose first `{` is not followed by a `}`
+/// with at least one character in between (`a}b`, `{}x`, `{}a{b}`).
+pub(crate) fn announces(resource: &str) -> bool {
+	!resource.contains('}')
+		|| resource
+			.split_once('{')
+			.and_then(|(_, after)| after.find('}'))
+			.is_some_and(|close| close > 0)
+}
+
 /// The client's lock bookkeeping that the socket's lock announcements are checked against (see
 /// the module docs). One per `AuthClient`, shared by all its leases and its websocket task.
 #[derive(Default)]
@@ -262,10 +273,6 @@ impl LockBoard {
 
 	/// Changes whenever a wait for `resource` should poll again before its scheduled time: a
 	/// lease of it was announced ended, or a connection was authenticated.
-	#[cfg_attr(
-		not(test),
-		expect(dead_code, reason = "no lock wait is woken by announcements yet")
-	)]
 	pub(crate) fn wakes(&self, resource: &str) -> watch::Receiver<()> {
 		let mut board = self.board();
 		if let Some(wake) = board.wakes.get(resource) {

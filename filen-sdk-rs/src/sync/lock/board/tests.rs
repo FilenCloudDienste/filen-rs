@@ -210,6 +210,28 @@ async fn the_wake_channel_of_a_wait_that_ended_is_dropped() {
 	assert_eq!(board.board().wakes.len(), 0);
 }
 
+#[test]
+fn only_names_a_hash_tag_can_place_are_announced() {
+	let cases = [
+		("drive-write", true),
+		("test:notes", true),
+		("{a}b", true),
+		("x{a}b}", true),
+		("{ab}", true),
+		("{", true),
+		("a{b", true),
+		("a}b", false),
+		("}", false),
+		("{}x", false),
+		("{}a{b}", false),
+		("}{a}", true),
+		("a}{b", false),
+	];
+	for (resource, announced) in cases {
+		assert_eq!(announces(resource), announced, "{resource}");
+	}
+}
+
 /// An ended lease is remembered for ten minutes: a `lockAcquired` arriving later than that
 /// opens it again.
 #[tokio::test(start_paused = true)]

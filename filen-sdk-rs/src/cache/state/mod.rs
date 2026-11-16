@@ -119,7 +119,11 @@ const EVENT_SHED_CAP: usize = 50_000;
 /// starvation that froze resyncs under contention). ONE lock uuid for the whole wait is what the
 /// lock protocol asks of a poll whose answer was lost: one sent again with the same uuid is
 /// answered as the lease it may have been granted, not as another holder's.
-/// ~60 polls x 2 s ~= 2 min before falling back to the retry timer.
+/// ~60 polls x 2 s ~= 2 min before falling back to the retry timer. That is the schedule of a
+/// client whose socket does not deliver the server's lock announcements. One whose socket does
+/// polls as soon as a release is announced, and otherwise once a lock lease (60 s) after its last
+/// scheduled poll, so the same 60 polls last about an hour; should the announcements stop while
+/// the server still says it sends them, each release then reaches the resync up to a lease late.
 const RESYNC_LOCK_MAX_SLEEP: Duration = Duration::from_secs(2);
 const RESYNC_LOCK_PATIENT_ATTEMPTS: usize = 60;
 /// After a patient acquisition still times out (or any listing failure), the worker waits this

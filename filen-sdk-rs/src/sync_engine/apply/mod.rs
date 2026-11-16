@@ -1593,9 +1593,13 @@ impl Lease {
 	/// `None` means the pass was cancelled meanwhile; an `Err` is a lock the pass could not take.
 	///
 	/// The lock is polled on a schedule of the engine's own (`PASS_LOCK_MAX_SLEEP`, default attempt
-	/// count) rather than the shared default ladder, so a pass that misses another client's release
-	/// picks the lock up inside the confirmation window instead of tens of seconds later, where its
-	/// round no longer reads as a race against the one it queued behind.
+	/// count) rather than the shared default ladder. On a connection that announces nothing, that
+	/// is what picks the lock up inside the confirmation window after another client's release,
+	/// instead of tens of seconds later, where the pass's round no longer reads as a race against
+	/// the one it queued behind. On a connection that announces, the release's announcement does
+	/// that, and a release whose announcement is lost, or every release while the server's
+	/// announcements are out, is picked up only by the poll once a lock lease, past the window
+	/// (the tradeoff `PASS_LOCK_MAX_SLEEP` describes).
 	///
 	/// It is taken UNDER the gate, because acquiring it is itself a wait a pause has to be able to
 	/// reach: a contended acquisition retries for hours, so a pass told to stop while queueing for

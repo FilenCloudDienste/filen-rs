@@ -28,6 +28,9 @@ use super::{
 /// announcements.
 const LOCK_PROTOCOL_VERSIONS: RangeInclusive<u64> = 1..=2;
 
+/// The first socket lock protocol version whose connections deliver the lock announcements.
+const LOCK_ANNOUNCEMENTS_VERSION: u64 = 2;
+
 /// How lock operations can travel right now, as the websocket task last published it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LockTransport {
@@ -47,6 +50,18 @@ pub(crate) enum LockTransport {
 	/// Connection `generation` cannot carry lock operations: its server did not answer the
 	/// probe in time, or answered with a version this client does not speak.
 	Http { generation: u64 },
+}
+
+impl LockTransport {
+	/// Whether the connection delivers the lock announcements: its server answered the probe
+	/// with a protocol version that has them. A connection whose probe went unanswered may
+	/// deliver them too, but nothing says it does.
+	pub(crate) fn announces(&self) -> bool {
+		match self {
+			Self::Socket { version, .. } => *version >= LOCK_ANNOUNCEMENTS_VERSION,
+			Self::None | Self::Connecting | Self::Probing { .. } | Self::Http { .. } => false,
+		}
+	}
 }
 
 /// The client's [`LockTransport`], published by one websocket task at a time.
@@ -93,12 +108,8 @@ impl LockTransportSlot {
 		claim
 	}
 
-	/// Watches the transport, starting from the current one.
-	// Read only by the test seam so far: nothing routes lock operations by it yet.
-	#[cfg_attr(
-		not(any(test, feature = "test-seams")),
-		expect(dead_code, reason = "no lock operation reads the transport yet")
-	)]
+	/// Watches the transport, starting from the current one: a lock wait follows it, as only a
+	/// connection that delivers the lock announcements wakes the wait.
 	pub(crate) fn subscribe(&self) -> watch::Receiver<LockTransport> {
 		self.shared.current.subscribe()
 	}
@@ -373,6 +384,27 @@ mod tests {
 				ttl: Duration::from_secs(60)
 			}
 		);
+	}
+
+	#[test]
+	fn only_a_connection_on_protocol_two_or_later_announces() {
+		let socket = |version| LockTransport::Socket {
+			generation: 1,
+			version,
+			ttl: Duration::from_secs(60),
+		};
+		let cases = [
+			(LockTransport::None, false),
+			(LockTransport::Connecting, false),
+			(LockTransport::Probing { generation: 1 }, false),
+			(LockTransport::Http { generation: 1 }, false),
+			(socket(1), false),
+			(socket(2), true),
+			(socket(3), true),
+		];
+		for (transport, announces) in cases {
+			assert_eq!(transport.announces(), announces, "{transport:?}");
+		}
 	}
 
 	#[test]

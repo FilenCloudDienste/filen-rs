@@ -257,6 +257,10 @@ pub const CONFIRM_TENURE: Duration = Duration::from_secs(10);
 /// acquisition is bounded this way; every other caller of [`Client::lock_drive`] keeps the default
 /// ladder.
 ///
+/// A client whose socket delivers the server's lock announcements also polls as soon as a release is
+/// announced, without using an attempt. This schedule stays as it is for it, and catches a release
+/// whose announcement is lost.
+///
 /// It does NOT bound the whole gap between the two versions. The winner holds the lock until the end
 /// of its batch, so its upload can already be older than the window by the time the loser is let in;
 /// what this bounds is the part the acquisition itself adds — the wait AFTER the release.

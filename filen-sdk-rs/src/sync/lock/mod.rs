@@ -39,10 +39,12 @@ use crate::{
 };
 
 mod board;
+mod wait;
 
 pub(crate) use board::LockBoard;
 #[cfg(test)]
 pub(crate) use board::{Holder, OpenLease};
+use wait::{LockWakes, NextPoll};
 
 pub(crate) const MAX_SLEEP_TIME_DEFAULT: time::Duration = time::Duration::from_secs(30);
 pub(crate) const ATTEMPTS_DEFAULT: usize = 8640; // 8640
@@ -1263,9 +1265,21 @@ fn may_have_been_granted(error: &Error) -> bool {
 	}
 }
 
-/// Polls for the lock up to `attempts` times on [`fibonacci_iter`]'s schedule, sleeping after
-/// every poll that does not get it. Returns the send time of the granting poll, or
-/// [`ErrorKind::RetryFailed`] once the attempts run out.
+/// Polls for the lock until a poll gets it, with `attempts` scheduled polls at most: the first at
+/// once, and each later one once the pause after the one before ran out. Returns the send time of
+/// the granting poll, or [`ErrorKind::RetryFailed`] once the pause after the last scheduled poll
+/// ran out too.
+///
+/// While the client's connection does not deliver the lock announcements, the pauses follow
+/// [`fibonacci_iter`]'s schedule, capped at `max_sleep_time`. While it does, the pause after the
+/// n-th scheduled poll is the n-th delay of that schedule or a lock lease, whichever is longer
+/// (see [`LockWakes::pause`]): a safety poll once a lease, which is all that catches a release
+/// whose announcement was lost. The pause switches between the two as the transport changes. On
+/// any connection an announcement that the lock may be free (`wakes`) brings a poll forward, at
+/// most one per [`wait::EARLY_POLL_FLOOR`]: that poll uses no attempt, and if it is refused, the
+/// pause runs on to its scheduled end. So the attempts count the scheduled polls only, safety polls
+/// included, and on an announcing connection a wait ends with [`ErrorKind::RetryFailed`] after about
+/// `attempts` leases, or `attempts` times `max_sleep_time` where that is longer.
 ///
 /// `poll` builds the future for a single Acquire round-trip, resolving to the server's
 /// `acquired` flag. Generic over it so the schedule is unit-testable against a scripted server
@@ -1274,8 +1288,8 @@ fn may_have_been_granted(error: &Error) -> bool {
 /// A failed request ([`ErrorKind::reached_no_server`]: no response, an unverified certificate, a timeout, or an HTTP error status,
 /// 5xx/408/429 only once the retry layer gave up on them) is returned at once while no poll has
 /// been answered, so an offline caller fails fast. After an answer, up to
-/// [`ACQUIRE_TRANSPORT_ERROR_LIMIT`] of them in a row are waited out like a refusal, each using
-/// up an attempt: a wait that can last hours must not be lost to one network blip. Natively a
+/// [`ACQUIRE_TRANSPORT_ERROR_LIMIT`] of them in a row, early polls included, are waited out like a
+/// refusal: a wait that can last hours must not be lost to one network blip. Natively a
 /// stalled request can take the whole read timeout (300 s by default) each time. Any other error
 /// is returned as is.
 async fn acquire_loop<F, Fut>(
@@ -1283,6 +1297,7 @@ async fn acquire_loop<F, Fut>(
 	resource: &str,
 	max_sleep_time: Duration,
 	attempts: usize,
+	mut wakes: LockWakes,
 ) -> Result<Confirmed, Error>
 where
 	F: FnMut() -> Fut,
@@ -1290,10 +1305,28 @@ where
 {
 	let mut answered = false;
 	let mut transport_errors = 0;
-	for (i, delay) in (0..attempts).zip(fibonacci_iter(max_sleep_time)) {
+	let mut schedule = (1..=attempts).zip(fibonacci_iter(max_sleep_time));
+	let retry_failed = || {
+		Error::custom(
+			ErrorKind::RetryFailed,
+			format!("Failed to acquire lock on resource '{resource}' after {attempts} attempts"),
+		)
+	};
+	let Some((mut attempt, mut delay)) = schedule.next() else {
+		return Err(retry_failed());
+	};
+	let mut next = NextPoll::Scheduled;
+	// when the pause after the last scheduled poll began
+	let mut paused_at = Instant::now();
+	loop {
+		wakes.polling();
 		// The server's lease clock starts when it processes this request, no
 		// earlier than now — the refresh schedule is anchored to the send time.
 		let attempt_started = Confirmed::now();
+		let early = match next {
+			NextPoll::Scheduled => "",
+			NextPoll::Early => " (early)",
+		};
 		match poll().await {
 			// A lease that runs from this poll's send, even after an earlier poll the server
 			// granted with only the answer lost: a server that grants an Acquire repeated with
@@ -1304,11 +1337,8 @@ where
 				answered = true;
 				transport_errors = 0;
 				debug!(
-					"Attempt {}/{}: Failed to acquire lock on resource: {}. Retrying in {:?}",
-					i + 1,
-					attempts,
-					resource,
-					delay
+					"Attempt {attempt}/{attempts}{early}: Failed to acquire lock on resource: {resource}. Next scheduled poll {:?} after the last",
+					wakes.pause(delay)
 				);
 			}
 			Err(e)
@@ -1318,20 +1348,20 @@ where
 			{
 				transport_errors += 1;
 				tracing::warn!(
-					"Attempt {}/{}: lock request for resource {resource} failed, retrying in {delay:?}: {e}",
-					i + 1,
-					attempts,
+					"Attempt {attempt}/{attempts}{early}: lock request for resource {resource} failed, next scheduled poll {:?} after the last: {e}",
+					wakes.pause(delay)
 				);
 			}
 			Err(e) => return Err(e),
 		}
-		sleep(delay).await;
+		if next == NextPoll::Scheduled {
+			paused_at = Instant::now();
+		}
+		next = wakes.next_poll(paused_at, delay, attempt_started.at).await;
+		if next == NextPoll::Scheduled {
+			(attempt, delay) = schedule.next().ok_or_else(retry_failed)?;
+		}
 	}
-
-	Err(Error::custom(
-		ErrorKind::RetryFailed,
-		format!("Failed to acquire lock on resource '{resource}' after {attempts} attempts"),
-	))
 }
 
 /// One Acquire round-trip with the serialized request `body`, sent to `url`: the server's
@@ -1357,11 +1387,23 @@ impl Client {
 	/// Attempts to acquire a lock on the specified resource.
 	/// If the lock is acquired, it returns a [`ResourceLock`] that releases the lock when dropped.
 	///
-	/// Polls up to `attempts` times, sleeping after each poll that does not get the lock on a
-	/// schedule that grows to `max_sleep_time`, and fails with [`ErrorKind::RetryFailed`] when
-	/// the attempts run out. An error on the first poll is returned at once; once the server has
-	/// answered, a few failed requests in a row (no response, or an HTTP error status) are
-	/// waited out like refusals. When it fails after a poll whose answer was lost, so that the
+	/// Makes up to `attempts` scheduled polls, pausing after each one that does not get the
+	/// lock, and fails with [`ErrorKind::RetryFailed`] once the pause after the last one runs
+	/// out. The pauses grow to `max_sleep_time` on a fibonacci schedule. While the client's
+	/// socket delivers the server's lock announcements (its server answered the socket's lock
+	/// probe with protocol 2 or later), each pause lasts a lock lease (60 s) instead, or
+	/// `max_sleep_time` if that is longer, so `attempts` bounds the wait to about that many
+	/// leases; and on any connection an announcement that a lease of the resource ended, or a
+	/// reconnect, brings a poll forward without using an attempt.
+	///
+	/// So on such a connection the announcement is what gets a waiter the lock, within a few
+	/// round trips of its release, and the poll once a lease is only the safety net. A server that
+	/// answers the probe but delivers no announcements, as during an outage of its announcements,
+	/// leaves every wait on that safety net: each release is then noticed up to a lease late,
+	/// whatever `max_sleep_time` says. That is the tradeoff taken: a contended wait costs a
+	/// request a lease, not one per step of the schedule.
+	/// An error on the first poll is returned at once; once the server has answered, a few failed requests in a
+	/// row (no response, or an HTTP error status) are waited out like refusals. When it fails after a poll whose answer was lost, so that the
 	/// server may have granted the lock without anyone knowing, a release of it goes out from a
 	/// task of its own, and natively from a thread of its own when the caller stops waiting for it;
 	/// [`Self::wait_for_lock_releases`] waits for it.
@@ -1400,6 +1442,7 @@ impl Client {
 			record: record.clone(),
 			lost: Arc::default(),
 		};
+		let wakes = LockWakes::for_client(&client, &resource);
 		let acquired = acquire_loop(
 			|| {
 				request_acquire(
@@ -1418,6 +1461,7 @@ impl Client {
 			&resource,
 			max_sleep_time,
 			attempts,
+			wakes,
 		)
 		.await;
 		let acquired_at = match acquired {

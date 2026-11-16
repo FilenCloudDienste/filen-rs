@@ -11060,9 +11060,12 @@ fn tenure(
 }
 
 /// The pass's drive-lock ceiling earns its place only by staying inside the confirmation window:
-/// a pass that missed another client's release has to poll again, take the lock and upload while
-/// the round it queued behind is still a race by the engine's own measure. Two sleeps' worth of
-/// room is the whole of it — there is no third poll left inside the window.
+/// a pass on a connection that announces nothing has to poll again after another client's
+/// release, take the lock and upload while the round it queued behind is still a race by the
+/// engine's own measure. Two sleeps' worth of room is the whole of it — there is no third poll
+/// left inside the window. A pass on a connection that announces is woken by the release instead,
+/// and one that misses the announcement polls only once a lock lease, which no ceiling here
+/// bounds.
 #[test]
 fn the_pass_lock_ceiling_polls_again_inside_the_confirmation_window() {
 	assert!(

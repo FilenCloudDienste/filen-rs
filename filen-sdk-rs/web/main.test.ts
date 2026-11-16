@@ -987,8 +987,10 @@ const CONTACT_TEST_TIMEOUT = cap(600_000)
 const CONTACT_LOCK = {
 	resource: "test:contact",
 	maxSleepTime: 30,
-	// the poll schedule sleeps at most `maxSleepTime` seconds after each poll
-	attempts: Math.floor(CONTACT_TEST_TIMEOUT / 30_000)
+	// the wait pauses at most `maxSleepTime` seconds after each scheduled poll on a connection
+	// that announces nothing, but a lock lease (60 s, longer than `maxSleepTime`) on one that
+	// delivers the server's lock announcements, so the lease bounds each pause
+	attempts: Math.floor(CONTACT_TEST_TIMEOUT / 60_000)
 }
 
 test("sharing", { timeout: CONTACT_TEST_TIMEOUT }, async () => {
