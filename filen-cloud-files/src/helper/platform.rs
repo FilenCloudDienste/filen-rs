@@ -2,7 +2,7 @@
 //! command loop runs on fakes on every host: [`Platform`] (sync roots, the local file system, the
 //! watcher, the key store) and [`DriveOpener`] (the cache, opened on a sealed session).
 
-use std::{fmt, path::Path, sync::Arc};
+use std::{fmt, path::Path, sync::Arc, time::SystemTime};
 
 use filen_mobile_native_cache::auth::FilenMobileCacheState;
 use filen_types::fs::Uuid;
@@ -189,6 +189,9 @@ pub trait Platform: sealed::Sealed + Send + Sync + 'static {
 
 	/// Whether this process runs elevated.
 	fn elevated(&self) -> bool;
+
+	/// The time now, which dates a root an unregister sets aside.
+	fn now(&self) -> SystemTime;
 }
 
 /// Opens the drive on a sealed session. Sealed, as [`Drive`] is.

@@ -9,6 +9,7 @@ use std::{
 		Arc, Condvar, Mutex, MutexGuard, PoisonError,
 		atomic::{AtomicUsize, Ordering},
 	},
+	time::{Duration, SystemTime},
 };
 
 use filen_types::fs::Uuid;
@@ -26,6 +27,10 @@ use crate::{
 	sealed,
 	test_support::{FakeDrive, FakeEntry, FakeLocal, MemoryKeyStore},
 };
+
+/// The time the fake platform's clock always reads, in seconds since the Unix epoch: 2026-11-12
+/// 12:00 UTC.
+const FAKE_NOW_SECS: u64 = 1_794_484_800;
 
 /// What the fake platform was asked to do, in order.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -640,6 +645,11 @@ impl Platform for FakePlatform {
 
 	fn elevated(&self) -> bool {
 		self.state().elevated
+	}
+
+	/// Always [`FAKE_NOW_SECS`], so a test knows the date an unregister sets a root aside under.
+	fn now(&self) -> SystemTime {
+		SystemTime::UNIX_EPOCH + Duration::from_secs(FAKE_NOW_SECS)
 	}
 }
 

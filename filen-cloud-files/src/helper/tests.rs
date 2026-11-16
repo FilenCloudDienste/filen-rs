@@ -1592,6 +1592,26 @@ async fn a_planned_aside_taken_since_is_never_renamed_onto() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn an_unregister_picks_an_aside_nothing_is_at() {
+	let disk = Disk::new();
+	let (platform, drive) = world();
+	let mut rig = served_with_changes(&disk, &platform, &drive).await;
+	// The fake platform's clock, 2026-11-12 12:00 UTC.
+	let taken = disk.0.path().join("Filen (not synced 2026-11-12)");
+	platform.occupy(&taken);
+	let report = ok(&rig.request(unregister_request()).await).clone();
+	assert_eq!(platform.aside(&taken), Some(Vec::new()));
+	assert_eq!(
+		report["keptIn"],
+		json!(format!("{} 2", taken.to_str().unwrap()))
+	);
+	assert_eq!(
+		kept_place(&disk, &platform),
+		report["keptIn"].as_str().map(str::to_owned)
+	);
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_root_that_cannot_be_renamed_aside_is_reported_where_it_stays() {
 	let disk = Disk::new();
 	let (platform, drive) = world();
