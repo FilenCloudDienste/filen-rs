@@ -341,6 +341,33 @@ fn prepended_data_is_skipped_and_counted() {
 	assert_eq!(read_all(&sfx, None).unwrap()[0].2, b"alpha");
 }
 
+/// A CRX3 Chrome extension: `Cr24`, version 3, the length of a signed
+/// protobuf header and the header itself, then the zip with offsets relative to
+/// its own start.
+#[test]
+fn a_chrome_extension_reads_as_the_zip_behind_its_header() {
+	let zip = ours(
+		&[("manifest.json", Some(&b"{}"[..]))],
+		ZipMethod::Deflate { level: 6 },
+		None,
+	);
+	let header = [0xA5u8; 581];
+	let mut crx = b"Cr24".to_vec();
+	crx.extend_from_slice(&3u32.to_le_bytes());
+	crx.extend_from_slice(&u32::try_from(header.len()).unwrap().to_le_bytes());
+	crx.extend_from_slice(&header);
+	let prefix = crx.len() as u64;
+	crx.extend_from_slice(&zip);
+	let mut source = Cursor::new(&crx);
+	let index = read_index(&mut source, crx.len() as u64, READ_BACK_ZIP).unwrap();
+	assert_eq!((index.shift, index.prefix_bytes), (prefix, prefix));
+	let entries = read_all(&crx, None).unwrap();
+	assert_eq!(
+		(entries[0].0.as_str(), entries[0].2.as_slice()),
+		("manifest.json", &b"{}"[..])
+	);
+}
+
 #[test]
 fn entries_are_visited_in_local_header_order_and_overlaps_refused() {
 	let zip = ours(

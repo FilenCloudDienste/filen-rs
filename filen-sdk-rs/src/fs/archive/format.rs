@@ -106,6 +106,11 @@ pub(crate) fn detect(head: &[u8], name: &str) -> Option<Detected> {
 	if head.first_chunk().is_some_and(is_tar_header) {
 		return Some(Detected::Tar);
 	}
+	// a Chrome extension (CRX2 or CRX3): a signed header, then a plain zip, which the zip
+	// reader finds past the header as it does any prepended data
+	if head.starts_with(b"Cr24") {
+		return Some(Detected::Zip);
+	}
 	if head.starts_with(&[0x1F, 0x8B]) {
 		return Some(Detected::Stream(StreamCodec::Gzip));
 	}
@@ -365,6 +370,11 @@ mod tests {
 			Some(Detected::Stream(StreamCodec::Zstd))
 		);
 		assert_eq!(detect(&tar_header("a.txt"), "x"), Some(Detected::Tar));
+		assert_eq!(
+			detect(b"Cr24\x03\0\0\0\x45\x02\0\0", "extension.crx"),
+			Some(Detected::Zip)
+		);
+		assert_eq!(detect(b"Cr24\x02\0\0\0", "x"), Some(Detected::Zip));
 	}
 
 	#[test]
@@ -434,7 +444,7 @@ mod tests {
 	#[test]
 	fn a_tar_header_wins_over_magic_its_first_path_happens_to_spell() {
 		// a plain tar's first bytes are its first member's path, which may spell a weak magic
-		for name in ["LZIP/notes.txt", "BZh9.txt", "BZh1/"] {
+		for name in ["LZIP/notes.txt", "BZh9.txt", "BZh1/", "Cr24/manifest.json"] {
 			assert_eq!(
 				detect(&tar_header(name), "x"),
 				Some(Detected::Tar),
