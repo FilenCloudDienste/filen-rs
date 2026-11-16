@@ -944,6 +944,9 @@ impl PartialEq for AuthClient {
 
 impl Eq for AuthClient {}
 
+/// The `on_failed_attempt` hook of a request whose attempts nobody watches.
+fn ignore_failed_attempt(_: &Error) {}
+
 /// Send one attempt of `request`, and note in `answers` the server's answer to it, if it got one
 /// (see [`ServerAnswers`]). `answers` is a handle of its own, cloned per attempt, because the
 /// authenticated stacks need an attempt's future to outlive the borrow of the client that built
@@ -1175,6 +1178,23 @@ fn is_pre_send_connect_failure(err: &reqwest::Error) -> bool {
 
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 fn is_pre_send_connect_failure(_err: &reqwest::Error) -> bool {
+	false
+}
+
+/// True for a request that failed while its connection was being set up: the name did not
+/// resolve, the TCP connect or the proxy tunnel was refused or timed out, or the TLS handshake
+/// failed. The request is written only once the connection stands, so not one byte of it reached
+/// the server. Wider than [`is_pre_send_connect_failure`], which leaves the connect timeouts out
+/// for the retry policy's sake, not because they could have been sent. Off wasm only, like
+/// `reqwest::Error::is_connect`: the fetch backend exposes no connect phase, so there a failed
+/// request may always have been sent.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+pub(crate) fn failed_before_sending(err: &reqwest::Error) -> bool {
+	err.is_connect()
+}
+
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+pub(crate) fn failed_before_sending(_err: &reqwest::Error) -> bool {
 	false
 }
 
@@ -1668,8 +1688,14 @@ impl AuthClient {
 	where
 		Res: DeserializeOwned + Debug,
 	{
-		self.post_raw_bytes_auth_with(request, url, endpoint, RequestClass::Transfer)
-			.await
+		self.post_raw_bytes_auth_with(
+			request,
+			url,
+			endpoint,
+			RequestClass::Transfer,
+			ignore_failed_attempt,
+		)
+		.await
 	}
 
 	/// [`Self::post_raw_bytes_auth`] for a lock request: sent as a [`RequestClass::Lock`], in the
@@ -1683,26 +1709,54 @@ impl AuthClient {
 	where
 		Res: DeserializeOwned + Debug,
 	{
-		self.post_raw_bytes_auth_with(request, url, endpoint, RequestClass::Lock)
+		self.post_raw_bytes_auth_lock_reporting(request, url, endpoint, ignore_failed_attempt)
 			.await
 	}
 
-	/// [`Self::post_raw_bytes_auth`] under the limits of `class`.
-	async fn post_raw_bytes_auth_with<Res>(
+	/// [`Self::post_raw_bytes_auth_lock`], handing the error of each of its attempts that fails to
+	/// `on_failed_attempt`, before the retry layer decides whether to send it again: the error the
+	/// call returns is only the last attempt's.
+	pub(crate) async fn post_raw_bytes_auth_lock_reporting<Res, F>(
+		&self,
+		request: Bytes,
+		url: &str,
+		endpoint: Cow<'static, str>,
+		on_failed_attempt: F,
+	) -> Result<Res, Error>
+	where
+		Res: DeserializeOwned + Debug,
+		F: Fn(&Error) + Clone + MaybeSendSync + 'static,
+	{
+		self.post_raw_bytes_auth_with(
+			request,
+			url,
+			endpoint,
+			RequestClass::Lock,
+			on_failed_attempt,
+		)
+		.await
+	}
+
+	/// [`Self::post_raw_bytes_auth`] under the limits of `class`, handing the error of each failed
+	/// attempt to `on_failed_attempt`.
+	async fn post_raw_bytes_auth_with<Res, F>(
 		&self,
 		request: Bytes,
 		url: &str,
 		endpoint: Cow<'static, str>,
 		class: RequestClass,
+		on_failed_attempt: F,
 	) -> Result<Res, Error>
 	where
 		Res: DeserializeOwned + Debug,
+		F: Fn(&Error) + Clone + MaybeSendSync + 'static,
 	{
 		let builder = ServiceBuilder::new()
 			.layer(logging::LogLayer::new(endpoint)) // optional logging
 			.layer(url_parser::UrlParseLayer) // required to parse URL string to reqwest::Url
 			.layer(self.unauthed.state.limits.layer(class)) // the class's concurrency limits
 			.layer(self.unauthed.state.retry.clone()) // required to map RetryError to Error
+			.layer(retry::OnFailedAttemptLayer::new(on_failed_attempt)) // sees every attempt's error
 			.layer(self.unauthed.state.rate_limiter.clone()) // optional
 			.layer(deserialize::DeserializeLayer::<Res>::new())
 			.layer(download_body::full::DownloadLayer::new()); // required to download full response body to bytes

@@ -7,7 +7,7 @@ use super::*;
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 use crate::auth::http::{
 	ClientConfig,
-	test_support::{GATEWAY_CONNECT, client_via_proxy, read_head},
+	test_support::{GATEWAY_CONNECT, client_via_proxy, read_head, respond_with},
 };
 
 /// The caller-chosen ceiling is what bounds how late a contended acquisition's NEXT poll is —
@@ -341,6 +341,7 @@ fn a_lock_request_its_caller_stopped_waiting_for_is_waited_for_until_it_ends() {
 		Uuid::from_u128(1),
 		"test-resource".into(),
 		None,
+		Arc::default(),
 	));
 	rt.block_on(async {
 		assert!(futures::poll!(&mut request).is_pending());
@@ -1215,6 +1216,376 @@ async fn acquire_server_error_after_an_answer_is_returned() {
 	assert_eq!(begin.elapsed(), Duration::ZERO);
 }
 
+#[test]
+fn a_lost_answer_may_have_been_granted() {
+	assert!(may_have_been_granted(&Error::custom(
+		ErrorKind::Reqwest,
+		"connection reset"
+	)));
+	assert!(may_have_been_granted(&Error::custom(
+		ErrorKind::Response,
+		"truncated answer"
+	)));
+	assert!(may_have_been_granted(&internal_error()));
+}
+
+#[test]
+fn an_answer_or_an_unverified_server_was_not_granted() {
+	assert!(!may_have_been_granted(&Error::from(
+		filen_types::error::ResponseError::ApiError {
+			message: None,
+			code: Some("invalid_params".to_owned()),
+		}
+	)));
+	assert!(!may_have_been_granted(&Error::custom(
+		ErrorKind::TlsVerification,
+		"unknown issuer"
+	)));
+	assert!(!may_have_been_granted(&Error::custom(
+		ErrorKind::Internal,
+		"the lock request's task ended without an answer"
+	)));
+}
+
+/// The server's `internal_error` answer.
+fn internal_error() -> Error {
+	Error::from(filen_types::error::ResponseError::ApiError {
+		message: None,
+		code: Some("internal_error".to_owned()),
+	})
+}
+
+/// A transport failure after the request may have been written.
+fn connection_reset() -> Error {
+	Error::custom(ErrorKind::Reqwest, "connection reset")
+}
+
+/// A refused connect never sent the Acquire: the SDK error keeps the transport error it wraps,
+/// so the connect phase can be told apart.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+#[tokio::test]
+async fn a_refused_connect_was_not_granted() {
+	let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+	let addr = listener.local_addr().unwrap();
+	// nothing listens once it is dropped, so the connect is refused at once
+	drop(listener);
+	let refused = reqwest::Client::new()
+		.get(format!("http://{addr}/"))
+		.send()
+		.await
+		.expect_err("a connect to a closed port must fail");
+	let error = Error::from(refused);
+	assert_eq!(error.kind(), ErrorKind::Reqwest);
+	assert!(!may_have_been_granted(&error), "{error}");
+}
+
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+#[tokio::test(start_paused = true)]
+async fn lost_answers_keep_the_latest_attempt_that_may_have_been_granted() {
+	let begin = Instant::now();
+	let lost = LostAnswers::default();
+	lost.note(&internal_error());
+	sleep(Duration::from_secs(1)).await;
+	lost.note(&connection_reset());
+	sleep(Duration::from_secs(1)).await;
+	// an answer that granted nothing does not clear it
+	lost.note(&Error::custom(ErrorKind::Server, "scripted server error"));
+	assert_eq!(
+		lost.latest().map(|at| at.at - begin),
+		Some(Duration::from_secs(1))
+	);
+}
+
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+#[tokio::test(start_paused = true)]
+async fn lost_answers_ignore_an_earlier_attempt_noted_late() {
+	let begin = Instant::now();
+	let lost = LostAnswers::default();
+	let earlier = Confirmed::now();
+	sleep(Duration::from_secs(1)).await;
+	lost.note(&connection_reset());
+	lost.record(earlier);
+	assert_eq!(
+		lost.latest().map(|at| at.at - begin),
+		Some(Duration::from_secs(1))
+	);
+}
+
+/// An acquisition of the uuid 1 on `test-resource` by `client`.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+fn acquisition(client: &Arc<AuthClient>) -> Acquisition {
+	let uuid = Uuid::from_u128(1);
+	Acquisition {
+		client: Arc::clone(client),
+		url: lock_url().into(),
+		uuid,
+		resource: "test-resource".into(),
+		record: client.lock_listener.record(uuid, "test-resource"),
+		lost: Arc::default(),
+	}
+}
+
+/// An acquisition that fails after a lost answer releases its uuid once, owed until that release
+/// is given up on.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+#[tokio::test(start_paused = true)]
+async fn a_lost_answer_is_released_once() {
+	let (client, events) = listened_client();
+	let uuid = Uuid::from_u128(1);
+	let acquisition = acquisition(&client);
+	acquisition.lost.note(&connection_reset());
+	let error = acquisition.failed(connection_reset());
+	assert_eq!(error.kind(), ErrorKind::Reqwest);
+	assert_eq!(*client.pending_lock_releases.0.borrow(), 1);
+	let owed = lock_event(LockEventKind::Owed, uuid, "test-resource");
+	assert_eq!(recorded(&events), std::slice::from_ref(&owed));
+
+	client.pending_lock_releases.settled().await;
+	assert_eq!(
+		recorded(&events),
+		[
+			owed,
+			lock_event(LockEventKind::Settled, uuid, "test-resource")
+		]
+	);
+}
+
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+#[tokio::test(start_paused = true)]
+async fn an_acquisition_with_every_poll_answered_sends_no_release() {
+	let (client, events) = listened_client();
+	let uuid = Uuid::from_u128(1);
+	let acquisition = acquisition(&client);
+	acquisition
+		.lost
+		.note(&Error::custom(ErrorKind::Server, "scripted server error"));
+	let error = acquisition.failed(Error::custom(ErrorKind::RetryFailed, "refused"));
+	assert_eq!(error.kind(), ErrorKind::RetryFailed);
+	assert_eq!(*client.pending_lock_releases.0.borrow(), 0);
+	assert_eq!(
+		recorded(&events),
+		[
+			lock_event(LockEventKind::Owed, uuid, "test-resource"),
+			lock_event(LockEventKind::Settled, uuid, "test-resource")
+		]
+	);
+}
+
+/// A poll that gets the lock after a lost answer holds the lease under the same uuid: nothing is
+/// released, not even once the acquisition is dropped.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+#[tokio::test(start_paused = true)]
+async fn a_granted_acquisition_releases_no_lost_answer() {
+	let client = offline_client();
+	let acquisition = acquisition(&client);
+	acquisition.lost.note(&connection_reset());
+	acquisition.granted();
+	assert_eq!(*client.pending_lock_releases.0.borrow(), 0);
+}
+
+/// The lease of a grant whose answer was lost is timed from the attempt failing, not from the
+/// poll's start: a poll whose last attempt failed a minute in still owes the release.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+#[tokio::test(start_paused = true)]
+async fn a_lost_answer_late_in_a_long_poll_is_released() {
+	let client = offline_client();
+	let acquisition = acquisition(&client);
+	sleep(LOCK_SERVER_TTL + Duration::from_secs(1)).await;
+	acquisition.lost.note(&connection_reset());
+	drop(acquisition.failed(connection_reset()));
+	assert_eq!(*client.pending_lock_releases.0.borrow(), 1);
+}
+
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+#[tokio::test(start_paused = true)]
+async fn a_lost_answer_within_its_lease_is_released() {
+	let client = offline_client();
+	let acquisition = acquisition(&client);
+	acquisition.lost.note(&connection_reset());
+	sleep(LOCK_SERVER_TTL - Duration::from_secs(1)).await;
+	drop(acquisition.failed(Error::custom(ErrorKind::RetryFailed, "refused")));
+	assert_eq!(*client.pending_lock_releases.0.borrow(), 1);
+}
+
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+#[tokio::test(start_paused = true)]
+async fn a_lost_answer_past_its_lease_is_not_released() {
+	let client = offline_client();
+	let acquisition = acquisition(&client);
+	acquisition.lost.note(&connection_reset());
+	sleep(LOCK_SERVER_TTL).await;
+	drop(acquisition.failed(Error::custom(ErrorKind::RetryFailed, "refused")));
+	assert_eq!(*client.pending_lock_releases.0.borrow(), 0);
+}
+
+/// An acquisition its caller stopped waiting for after a lost answer, here during the sleep before
+/// its next poll, sends the release from a thread of its own.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+#[test]
+fn a_cancelled_acquisition_releases_a_lost_answer() {
+	let (observer, proxy, client) = proxy_and_client();
+	let acquisition = acquisition(&client);
+	// so late in its lease that the release is not sent again when the proxy drops it
+	acquisition
+		.lost
+		.record(confirmed_ago(LOCK_SERVER_TTL - Duration::from_millis(100)));
+
+	std::thread::spawn(move || drop(acquisition))
+		.join()
+		.unwrap();
+
+	assert_release_is_sent_and_waited_for(&observer, proxy, &client);
+}
+
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+#[tokio::test(start_paused = true)]
+async fn a_cancelled_acquisition_with_every_poll_answered_sends_no_release() {
+	let client = offline_client();
+	drop(acquisition(&client));
+	assert_eq!(*client.pending_lock_releases.0.borrow(), 0);
+}
+
+/// Each attempt of a poll is noted, not only the last one the retry layer returns: a first
+/// attempt the server read before the connection closed, then retries whose connects are refused,
+/// fail the poll with a connect failure that hides the first.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+#[tokio::test]
+async fn a_written_attempt_behind_a_refused_connect_is_noted() {
+	let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+	let addr = listener.local_addr().unwrap();
+	let server = tokio::spawn(async move {
+		let (mut socket, _) = listener.accept().await.unwrap();
+		// every connect after this one is refused
+		drop(listener);
+		read_head(&mut socket).await;
+		// closed unanswered, as a connection that died after the request was written
+	});
+	let client = crate::auth::http::test_support::client(ClientConfig::default());
+	let lost = Arc::new(LostAnswers::default());
+	let error = send_acquire(
+		&client,
+		&format!("http://{addr}/v3/user/lock"),
+		Bytes::new(),
+		{
+			let lost = Arc::clone(&lost);
+			move |error: &Error| lost.note(error)
+		},
+	)
+	.await
+	.expect_err("the server never answers");
+	server.await.unwrap();
+	assert!(
+		!may_have_been_granted(&error),
+		"the poll fails with a connect failure: {error}"
+	);
+	assert!(
+		lost.latest().is_some(),
+		"the first attempt may have been granted"
+	);
+}
+
+/// A lock request whose caller is gone, with an attempt that may have been granted unseen,
+/// releases it from its own task.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+#[tokio::test]
+async fn a_lock_request_nobody_waits_for_releases_a_lost_answer() {
+	let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+	let addr = listener.local_addr().unwrap();
+	let (first_written, attempt_written) = tokio::sync::oneshot::channel();
+	let (caller_gone, wait_for_caller) = tokio::sync::oneshot::channel::<()>();
+	let server = tokio::spawn(async move {
+		let (mut socket, _) = listener.accept().await.unwrap();
+		read_head(&mut socket).await;
+		first_written.send(()).unwrap();
+		wait_for_caller.await.unwrap();
+		// Every attempt is closed unanswered, as a connection that died after the request was
+		// written, until the release comes.
+		drop(socket);
+		loop {
+			let (mut socket, _) = listener.accept().await.unwrap();
+			read_head(&mut socket).await;
+			if read_until_either(&mut socket, "acquire", "release").await == "release" {
+				respond_with(
+					&mut socket,
+					r#"{"status":true,"data":{"acquired":false,"released":true,"refreshed":false,"resource":"test-resource"}}"#,
+				)
+				.await;
+				// held open, its body unread, so the answer is not reset
+				return socket;
+			}
+		}
+	});
+	let client = Arc::new(crate::auth::http::test_support::client(
+		ClientConfig::default(),
+	));
+	let acquisition = Arc::new(LostAnswers::default());
+	let mut request = Box::pin(request_acquire(
+		Arc::clone(&client),
+		format!("http://{addr}/v3/user/lock").into(),
+		// told apart from the release's body
+		Bytes::from_static(b"acquire"),
+		Uuid::from_u128(1),
+		"test-resource".into(),
+		None,
+		Arc::clone(&acquisition),
+	));
+	tokio::select! {
+		_ = &mut request => panic!("the server holds the first attempt"),
+		written = attempt_written => written.unwrap(),
+	}
+	drop(request);
+	caller_gone.send(()).unwrap();
+
+	let _release = timeout(Duration::from_secs(30), server)
+		.await
+		.expect("the release is sent")
+		.unwrap();
+	timeout(
+		Duration::from_secs(30),
+		client.pending_lock_releases.settled(),
+	)
+	.await
+	.expect("the release is answered");
+	assert!(acquisition.latest().is_some());
+}
+
+/// Reads a request body off a scripted server's connection until it holds `one` or `other`, and
+/// returns which.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+async fn read_until_either<'a>(
+	socket: &mut tokio::net::TcpStream,
+	one: &'a str,
+	other: &'a str,
+) -> &'a str {
+	let mut body = Vec::new();
+	let mut byte = [0u8; 1];
+	loop {
+		tokio::io::AsyncReadExt::read_exact(socket, &mut byte)
+			.await
+			.unwrap();
+		body.push(byte[0]);
+		if body.ends_with(one.as_bytes()) {
+			return one;
+		}
+		if body.ends_with(other.as_bytes()) {
+			return other;
+		}
+	}
+}
+
+/// Offline, the Acquire never left the machine, so the failed acquisition leaves no release
+/// behind: the transport error survives the retry layer for the connect phase to be told apart.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+#[tokio::test(start_paused = true)]
+async fn an_acquisition_that_never_connected_sends_no_release() {
+	let client = crate::auth::unauth::test_support::offline_client();
+	client
+		.acquire_lock("test-resource", MAX_SLEEP_TIME_DEFAULT, 1)
+		.await
+		.unwrap_err();
+	assert_eq!(*client.client().pending_lock_releases.0.borrow(), 0);
+}
+
 /// A release that cannot get through holds a shutdown up for the bound only: here the proxy
 /// takes the release's connection and never answers it, as a network that drops every packet.
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
@@ -1620,6 +1991,7 @@ fn a_lock_request_its_caller_stopped_waiting_for_stays_owed_until_it_ends() {
 		uuid,
 		"test-resource".into(),
 		client.lock_listener.record(uuid, "test-resource"),
+		Arc::default(),
 	));
 	rt.block_on(async {
 		assert!(futures::poll!(&mut request).is_pending());

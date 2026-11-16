@@ -11,7 +11,9 @@ use std::{
 use tokio::time::Duration;
 use tower::{Layer, Service, ServiceExt, retry::Policy};
 
-use super::{MAX_CONNECT_RETRIES, MAX_RETRIES, RetryError, RetryMapLayer, RetryPolicy};
+use super::{
+	MAX_CONNECT_RETRIES, MAX_RETRIES, OnFailedAttemptLayer, RetryError, RetryMapLayer, RetryPolicy,
+};
 use crate::auth::http::tower_wasm_time::tps_budget::TpsBudget;
 
 /// A single request that always fails with a retryable error must give up after `MAX_RETRIES`
@@ -311,5 +313,62 @@ async fn real_retry_stack_gives_up_on_a_persistent_connect_failure() {
 		start.elapsed(),
 		Duration::from_millis(1400),
 		"the whole latency an offline device pays before the error reaches it"
+	);
+}
+
+/// Fails its first call as a connection that died after the request was written, then every
+/// other as a connect that was refused.
+#[derive(Clone)]
+struct WrittenThenRefused {
+	calls: Arc<AtomicUsize>,
+}
+
+impl Service<()> for WrittenThenRefused {
+	type Response = ();
+	type Error = RetryError<&'static str>;
+	type Future = Pin<Box<dyn Future<Output = Result<(), RetryError<&'static str>>> + Send>>;
+
+	fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+		Poll::Ready(Ok(()))
+	}
+
+	fn call(&mut self, _req: ()) -> Self::Future {
+		let first = self.calls.fetch_add(1, Ordering::SeqCst) == 0;
+		Box::pin(async move {
+			Err(if first {
+				RetryError::Retry("connection reset")
+			} else {
+				RetryError::RetryAfterBackoff("connection refused")
+			})
+		})
+	}
+}
+
+/// The caller sees only the last attempt's error; the hook under the retry layer sees each.
+#[tokio::test(start_paused = true)]
+async fn the_failed_attempt_hook_sees_every_attempt() {
+	let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+	let hook = {
+		let seen = Arc::clone(&seen);
+		move |e: &&'static str| seen.lock().unwrap().push(*e)
+	};
+	let stack = RetryMapLayer::new(RetryPolicy::new(TpsBudget::default())).layer(
+		OnFailedAttemptLayer::new(hook).layer(WrittenThenRefused {
+			calls: Arc::default(),
+		}),
+	);
+
+	let result: Result<(), &str> = stack.oneshot(()).await;
+
+	assert_eq!(result, Err("connection refused"));
+	assert_eq!(
+		*seen.lock().unwrap(),
+		[
+			"connection reset",
+			"connection refused",
+			"connection refused",
+			"connection refused",
+			"connection refused"
+		]
 	);
 }

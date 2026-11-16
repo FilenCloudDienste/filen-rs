@@ -266,7 +266,7 @@ where
 async fn lock_acquires_do_not_wait_for_the_request_pool() {
 	lock_request_beside_a_full_request_pool(LOCK_ANSWER, |client, url| async move {
 		// the poll acquire_lock sends
-		crate::sync::lock::send_acquire(&client, &url, Bytes::new())
+		crate::sync::lock::send_acquire(&client, &url, Bytes::new(), |_: &crate::Error| {})
 			.await
 			.map(drop)
 	})

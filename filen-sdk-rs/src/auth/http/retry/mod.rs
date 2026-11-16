@@ -1,4 +1,9 @@
-use std::{sync::Arc, time::Duration};
+use std::{
+	pin::Pin,
+	sync::Arc,
+	task::{Context, Poll},
+	time::Duration,
+};
 
 use futures::future::{self, Either, Map};
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
@@ -86,6 +91,13 @@ impl<E> RetryError<E> {
 		match self {
 			RetryError::Retry(e) | RetryError::RetryAfterBackoff(e) => e,
 			RetryError::NoRetry(e) => e,
+		}
+	}
+
+	/// The error, however it was tagged.
+	fn inner(&self) -> &E {
+		match self {
+			RetryError::Retry(e) | RetryError::RetryAfterBackoff(e) | RetryError::NoRetry(e) => e,
 		}
 	}
 }
@@ -200,6 +212,85 @@ where
 
 	fn clone_request(&mut self, req: &Req) -> Option<Req> {
 		Some(req.clone())
+	}
+}
+
+/// Hands the error of every failed attempt to a hook, before the retry layer it sits under decides
+/// whether to send the request again. The retry layer passes on only the last attempt's error,
+/// which can hide what an earlier attempt did: a request written to a connection that died before
+/// its answer, then retried on a connect that failed, reaches its caller as a connect failure,
+/// although the server may have processed it.
+#[derive(Clone)]
+pub(crate) struct OnFailedAttemptLayer<F> {
+	hook: F,
+}
+
+impl<F> OnFailedAttemptLayer<F> {
+	pub(crate) fn new(hook: F) -> Self {
+		Self { hook }
+	}
+}
+
+impl<S, F: Clone> Layer<S> for OnFailedAttemptLayer<F> {
+	type Service = OnFailedAttempt<S, F>;
+
+	fn layer(&self, inner: S) -> Self::Service {
+		OnFailedAttempt {
+			inner,
+			hook: self.hook.clone(),
+		}
+	}
+}
+
+/// See [`OnFailedAttemptLayer`].
+#[derive(Clone)]
+pub(crate) struct OnFailedAttempt<S, F> {
+	inner: S,
+	hook: F,
+}
+
+impl<S, F, Req, Res, E> Service<Req> for OnFailedAttempt<S, F>
+where
+	S: Service<Req, Response = Res, Error = RetryError<E>>,
+	F: Fn(&E) + Clone,
+{
+	type Response = Res;
+	type Error = RetryError<E>;
+	type Future = OnFailedAttemptFuture<S::Future, F>;
+
+	fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+		self.inner.poll_ready(cx)
+	}
+
+	fn call(&mut self, req: Req) -> Self::Future {
+		OnFailedAttemptFuture {
+			inner: self.inner.call(req),
+			hook: self.hook.clone(),
+		}
+	}
+}
+
+#[pin_project::pin_project]
+pub(crate) struct OnFailedAttemptFuture<Fut, F> {
+	#[pin]
+	inner: Fut,
+	hook: F,
+}
+
+impl<Fut, F, Res, E> Future for OnFailedAttemptFuture<Fut, F>
+where
+	Fut: Future<Output = Result<Res, RetryError<E>>>,
+	F: Fn(&E),
+{
+	type Output = Fut::Output;
+
+	fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+		let this = self.project();
+		let result = std::task::ready!(this.inner.poll(cx));
+		if let Err(e) = &result {
+			(this.hook)(e.inner());
+		}
+		Poll::Ready(result)
 	}
 }
 

@@ -29,7 +29,10 @@ use wasmtimer::{
 
 use crate::{
 	ErrorKind, api,
-	auth::{Client, http::AuthClient},
+	auth::{
+		Client,
+		http::{AuthClient, failed_before_sending},
+	},
 	consts::gateway_url,
 	error::{Error, LockLostError},
 	util::{MaybeSend, MaybeSendSync},
@@ -283,8 +286,10 @@ enum LeaseConfirmed {
 	/// the drop still extends the retries.
 	Watched(tokio::sync::watch::Sender<Confirmed>),
 	/// A lock request's grant, which runs from no earlier than the request's send, which comes
-	/// after this. Also the start of a release of a lock an earlier run of the app held (see
-	/// [`Client::release_locks`]), whose lease cannot stand longer than one confirmed then.
+	/// after this, or a grant that may have been made to an attempt whose answer was lost, which
+	/// failed then ([`LostAnswers`]). Also the start of a release of a lock an earlier run of the
+	/// app held (see [`Client::release_locks`]), whose lease cannot stand longer than one
+	/// confirmed then.
 	Sent(Confirmed),
 }
 
@@ -329,6 +334,15 @@ impl OwedRelease {
 	/// No release is needed after all: nothing was granted, or the caller took the grant.
 	fn settle(mut self) {
 		self.0 = None;
+	}
+
+	/// The release of a lock request with an attempt that may have been granted with its answer
+	/// lost, which failed `at` ([`LostAnswers`]): its retries are bounded from then.
+	fn lost_at(mut self, at: Confirmed) -> Self {
+		if let Some(request) = &mut self.0 {
+			request.confirmed = LeaseConfirmed::Sent(at);
+		}
+		self
 	}
 }
 
@@ -1008,7 +1022,9 @@ fn keep_lock_alive(lease: &Arc<SharedLease>) {
 /// that stops waiting (a `select!` that moved on, a dropped future) does not cut the request short.
 /// A request cut short can still be granted server-side, and a lease nobody knows of holds the
 /// resource for every client until it expires. Whoever sees the answer decides what happens to it:
-/// the caller, if it is still waiting, and otherwise the task, which releases what was granted.
+/// the caller, if it is still waiting, and otherwise the task, which releases what was granted or
+/// what an attempt whose answer was lost may have been granted ([`LostAnswers`]). Those attempts
+/// are also noted in `acquisition`, the acquisition's own, for the caller.
 /// Only the task can do that safely — a release sent the moment the caller gave up can reach the
 /// server before the grant does, and then releases nothing. The task counts in the client's
 /// [`PendingReleases`] until it handed the answer over or released the grant, so a process that
@@ -1024,6 +1040,7 @@ async fn request_acquire(
 	uuid: Uuid,
 	resource: Arc<str>,
 	record: Option<Arc<LockRecord>>,
+	acquisition: Arc<LostAnswers>,
 ) -> Result<bool, Error> {
 	let (answer, answered) = tokio::sync::oneshot::channel();
 	// a lease granted to this request runs from no earlier than its send, which comes after this
@@ -1037,13 +1054,27 @@ async fn request_acquire(
 		LeaseConfirmed::Sent(sent),
 		record,
 	);
+	// this request's attempts only, so the task knows whether one of them may have been granted
+	let lost = Arc::new(LostAnswers::default());
 	// Detached, not cancelled: the task must outlive a caller that stopped waiting.
 	drop(crate::runtime::spawn_task_maybe_send(async move {
-		let acquired = send_acquire(&client, &url, body).await;
-		match answer.send(acquired) {
-			Err(Ok(true)) => owed.send().await,
+		// a second handle on this request's, for the hook every attempt reports to
+		let acquired = send_acquire(&client, &url, body, {
+			let lost = Arc::clone(&lost);
+			move |error: &Error| lost.note(error)
+		})
+		.await;
+		let lost_at = lost.latest();
+		if let Some(at) = lost_at {
+			acquisition.record(at);
+		}
+		match (answer.send(acquired), lost_at) {
+			(Err(Ok(true)), _) => owed.send().await,
+			// Nobody waits for the answer, and an attempt may have been granted with its answer
+			// lost: the caller cannot release it any more.
+			(Err(Ok(false) | Err(_)), Some(at)) => owed.lost_at(at).send().await,
 			// the caller took the answer, a grant with it, or nothing was granted
-			Ok(()) | Err(Ok(false) | Err(_)) => owed.settle(),
+			(Ok(()), _) | (Err(Ok(false) | Err(_)), None) => owed.settle(),
 		}
 	}));
 	answered.await.unwrap_or_else(|_| {
@@ -1073,6 +1104,143 @@ fn fibonacci_iter(max_retry_time: Duration) -> impl Iterator<Item = Duration> {
 /// [`LOCK_LOSS_BUDGET`]: no lease is at stake while waiting, and a device that went offline
 /// mid-wait still gets its error after a few polls instead of after the whole schedule.
 const ACQUIRE_TRANSPORT_ERROR_LIMIT: usize = 3;
+
+/// When the latest of a lock request's Acquire attempts that the server may have granted with its
+/// answer lost failed (see [`may_have_been_granted`]): a lease nobody knows of, which holds the
+/// resource for every client until it runs out unless it is released. Each attempt of a request
+/// reports its failure here, whether the retry layer sends the request again or gives up on it:
+/// the error the request returns is only its last attempt's, and a connect that failed after a
+/// first attempt was written hides that attempt.
+///
+/// The time an attempt failed, not when it was sent, as it bounds how long a lease granted to
+/// it could still stand: the server processes a request between its send and the failure, short
+/// of one still on its way when its connection died.
+///
+/// A later refusal does not clear it. A server that grants an Acquire repeated with the holder's
+/// own uuid again, as the lock protocol describes, refuses one only once the lost grant is gone;
+/// but [`acquire_loop`] also allows for a server that refuses the repeat, and there the polls
+/// after a lost grant are refused until its lease runs out. A release that finds nothing to free
+/// costs one request.
+#[derive(Debug)]
+struct LostAnswers(tokio::sync::watch::Sender<Option<Confirmed>>);
+
+impl Default for LostAnswers {
+	fn default() -> Self {
+		Self(tokio::sync::watch::Sender::new(None))
+	}
+}
+
+impl LostAnswers {
+	/// Notes an attempt that failed with `error` now, if it may have been granted.
+	fn note(&self, error: &Error) {
+		if may_have_been_granted(error) {
+			self.record(Confirmed::now());
+		}
+	}
+
+	/// Notes an attempt that may have been granted and failed `at`, unless a later one is noted.
+	fn record(&self, at: Confirmed) {
+		self.0.send_if_modified(|latest| {
+			let later = latest.is_none_or(|latest| at.is_newer_than(&latest));
+			if later {
+				*latest = Some(at);
+			}
+			later
+		});
+	}
+
+	/// When the latest attempt that may have been granted failed.
+	fn latest(&self) -> Option<Confirmed> {
+		*self.0.borrow()
+	}
+
+	/// [`Self::latest`], if a lease granted to it could still stand, and forgets it.
+	fn take_standing(&self) -> Option<Confirmed> {
+		self.0
+			.send_replace(None)
+			.filter(|at| at.age() < LOCK_SERVER_TTL)
+	}
+}
+
+/// An acquisition of `uuid` on `resource` in progress, which owes a release while one of its polls
+/// may have been granted with its answer lost ([`LostAnswers`]). Settled by [`Self::granted`] or
+/// [`Self::failed`]; dropped before either, as when the caller stops waiting for
+/// [`Client::acquire_lock`], it sends that release from a thread of its own (see
+/// [`OwedRelease`]).
+struct Acquisition {
+	client: Arc<AuthClient>,
+	url: Arc<str>,
+	uuid: Uuid,
+	resource: Arc<str>,
+	record: Option<Arc<LockRecord>>,
+	lost: Arc<LostAnswers>,
+}
+
+impl Acquisition {
+	/// The release owed for a poll that may have been granted unseen, if its lease could still
+	/// stand. It counts in the client's [`PendingReleases`] and keeps the lock owed until it is
+	/// answered or given up on.
+	fn owed_release(&self) -> Option<OwedRelease> {
+		let at = self.lost.take_standing()?;
+		Some(OwedRelease::new(
+			Arc::clone(&self.client),
+			Arc::clone(&self.url),
+			self.uuid,
+			Arc::clone(&self.resource),
+			LeaseConfirmed::Sent(at),
+			// refcount bump: the release keeps the lock owed
+			self.record.clone(),
+		))
+	}
+
+	/// A poll got the lock: the lease `uuid` holds now is the caller's, and must not be released.
+	fn granted(self) {
+		self.lost.0.send_replace(None);
+	}
+
+	/// The error the acquisition fails with, once the release owed for a poll that may have been
+	/// granted unseen is on its way. It goes out from a task of its own, like each poll's request
+	/// (see [`request_acquire`]), so an offline caller still gets its error at once.
+	fn failed(self, error: Error) -> Error {
+		if let Some(owed) = self.owed_release() {
+			tracing::warn!(
+				"Releasing lock {} in case a poll whose answer was lost got it: {error}",
+				self.resource
+			);
+			drop(crate::runtime::spawn_task_maybe_send(owed.send()));
+		}
+		error
+	}
+}
+
+impl Drop for Acquisition {
+	fn drop(&mut self) {
+		if let Some(owed) = self.owed_release() {
+			tracing::warn!(
+				"Releasing lock {} in case a poll whose answer was lost got it, as its acquisition was cancelled",
+				self.resource
+			);
+			// sends the release from a thread of its own
+			drop(owed);
+		}
+	}
+}
+
+/// Whether the Acquire attempt that failed with `error` may have been granted: the server may have
+/// processed it, and only its answer was lost. That is an attempt that failed in transport after
+/// it may have been sent (anything [`ErrorKind::Reqwest`] but a failure to set up the connection,
+/// [`failed_before_sending`]), an answer that could not be read ([`ErrorKind::Response`]), and an
+/// `internal_error` answer. An unverified certificate ([`ErrorKind::TlsVerification`]) means
+/// nothing was sent, and every other server refusal is an answer that granted nothing.
+fn may_have_been_granted(error: &Error) -> bool {
+	match error.kind() {
+		ErrorKind::Reqwest => !error
+			.downcast_ref::<reqwest::Error>()
+			.is_some_and(failed_before_sending),
+		ErrorKind::Response => true,
+		_ => error.server_code().as_deref() == Some("internal_error"),
+	}
+}
 
 /// Polls for the lock up to `attempts` times on [`fibonacci_iter`]'s schedule, sleeping after
 /// every poll that does not get it. Returns the send time of the granting poll, or
@@ -1146,17 +1314,19 @@ where
 }
 
 /// One Acquire round-trip with the serialized request `body`, sent to `url`: the server's
-/// `acquired` flag.
+/// `acquired` flag. Each attempt that fails is handed to `on_failed_attempt`.
 pub(crate) async fn send_acquire(
 	client: &AuthClient,
 	url: &str,
 	body: Bytes,
+	on_failed_attempt: impl Fn(&Error) + Clone + MaybeSendSync + 'static,
 ) -> Result<bool, Error> {
 	client
-		.post_raw_bytes_auth_lock::<api::v3::user::lock::Response>(
+		.post_raw_bytes_auth_lock_reporting::<api::v3::user::lock::Response, _>(
 			body,
 			url,
 			api::v3::user::lock::ENDPOINT.into(),
+			on_failed_attempt,
 		)
 		.await
 		.map(|response| response.acquired)
@@ -1170,7 +1340,10 @@ impl Client {
 	/// schedule that grows to `max_sleep_time`, and fails with [`ErrorKind::RetryFailed`] when
 	/// the attempts run out. An error on the first poll is returned at once; once the server has
 	/// answered, a few failed requests in a row (no response, or an HTTP error status) are
-	/// waited out like refusals.
+	/// waited out like refusals. When it fails after a poll whose answer was lost, so that the
+	/// server may have granted the lock without anyone knowing, a release of it goes out from a
+	/// task of its own, and natively from a thread of its own when the caller stops waiting for it;
+	/// [`Self::wait_for_lock_releases`] waits for it.
 	#[tracing::instrument(
 		name = "acquire_lock",
 		skip_all,
@@ -1197,7 +1370,16 @@ impl Client {
 		let client = self.arc_client();
 		// Owed from the first Acquire on: a request can be granted after its caller stopped waiting.
 		let record = client.lock_listener.record(uuid, &resource);
-		let acquired_at = acquire_loop(
+		let acquisition = Acquisition {
+			client: Arc::clone(&client),
+			url: Arc::clone(&url),
+			uuid,
+			resource: Arc::clone(&shared_resource),
+			// refcount bump
+			record: record.clone(),
+			lost: Arc::default(),
+		};
+		let acquired = acquire_loop(
 			|| {
 				request_acquire(
 					Arc::clone(&client),
@@ -1208,13 +1390,22 @@ impl Client {
 					Arc::clone(&shared_resource),
 					// refcount bump
 					record.clone(),
+					// a second handle, for the request task that can outlive this call
+					Arc::clone(&acquisition.lost),
 				)
 			},
 			&resource,
 			max_sleep_time,
 			attempts,
 		)
-		.await?;
+		.await;
+		let acquired_at = match acquired {
+			Ok(acquired_at) => {
+				acquisition.granted();
+				acquired_at
+			}
+			Err(e) => return Err(acquisition.failed(e)),
+		};
 		let lease = Arc::new(SharedLease {
 			uuid,
 			client,
