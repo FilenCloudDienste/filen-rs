@@ -3674,6 +3674,28 @@ async fn an_unsent_edit_of_a_file_holding_changes_is_left_to_the_file() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn an_upload_killed_before_its_bytes_reached_the_cache_is_sent_from_the_file() {
+	let world = unstarted();
+	let (stable, _) = world.placed_file("f.txt", b"one");
+	// The run before marked the edit and was killed before its bytes reached the cache's slot,
+	// which still holds the version: the cache has nothing to copy, and the placeholder, never
+	// set in sync, holds the edit.
+	world.drive.mark_pending(stable, b"one");
+	world
+		.local
+		.user_write(&root_path("f.txt"), b"edit")
+		.unwrap();
+	world.local.take_watch_events();
+	world.engine.start();
+	world.settle().await;
+	world.settle().await;
+	assert_eq!(world.drive.history(stable), [b"edit".to_vec()]);
+	assert!(world.in_sync("f.txt"));
+	assert!(world.drive.pending_uploads().is_empty());
+	assert_eq!(world.drive.child(&root_dir(), "f.old.txt"), None);
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_failed_edit_held_open_over_a_restart_never_replaces_a_newer_version() {
 	let (world, stable) = failed_edit_then_newer_remote(world().await).await;
 	let writer = world.local.user_open_for_write(&root_path("f.txt"));
