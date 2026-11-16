@@ -19,6 +19,7 @@ mod log_safe;
 mod names;
 mod os;
 mod placeholder;
+mod populate;
 mod root_path;
 #[cfg(any(test, feature = "test-seams"))]
 pub mod test_support;
@@ -39,4 +40,5 @@ pub use os::cfapi::{CfCall, Hresult, ProviderInfoError, SyncRootPathError, WinEr
 pub use placeholder::{
 	FileSize, FileTime, NegativeSize, PlaceholderSpec, SpecKind, UnrepresentableTime,
 };
+pub use populate::{SkipReason, SkippedItem};
 pub use root_path::{CaseKey, RootPath, RootPathError};
