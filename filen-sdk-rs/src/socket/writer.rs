@@ -33,11 +33,6 @@ impl<WT: WriterTask> Writer<WT> {
 
 	/// Queues `frame` behind the frames queued before it, failing at once when the queue is full
 	/// or the task has ended.
-	// Only the tests queue frames so far; the connected loop has nothing of its own to send yet.
-	#[cfg_attr(
-		not(test),
-		expect(dead_code, reason = "no frame producer yet outside tests")
-	)]
 	pub(super) fn try_queue(&self, frame: String) -> Result<(), mpsc::error::TrySendError<String>> {
 		self.outbound.try_send(frame)
 	}

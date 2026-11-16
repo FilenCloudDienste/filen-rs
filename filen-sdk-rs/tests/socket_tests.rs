@@ -1270,3 +1270,40 @@ async fn lock_acquire_and_release_are_announced() {
 		ids.lock
 	);
 }
+
+/// The server answers the `lockHello` probe an authenticated connection sends, with a socket
+/// lock protocol version this client speaks.
+#[cfg(feature = "test-seams")]
+#[shared_test_runtime]
+async fn lock_hello_is_answered() {
+	let client = test_utils::RESOURCES.client().await;
+
+	let (events_sender, mut events_receiver) = tokio::sync::mpsc::unbounded_channel();
+	let _handle = client
+		.add_event_listener(
+			Box::new(move |event| {
+				let _ = events_sender.send(event.to_owned_cow());
+			}),
+			Some(vec![Cow::Borrowed("authSuccess")]),
+		)
+		.await
+		.unwrap();
+	await_event(
+		&mut events_receiver,
+		|event| *event == DecryptedSocketEvent::AuthSuccess,
+		Duration::from_secs(20),
+		"authSuccess",
+	)
+	.await;
+
+	let version = tokio::time::timeout(
+		Duration::from_secs(20),
+		client.lock_protocol_version_for_test(),
+	)
+	.await
+	.expect("the lockHello probe settles");
+	assert!(
+		matches!(version, Some(1 | 2)),
+		"expected socket locks, got {version:?}"
+	);
+}

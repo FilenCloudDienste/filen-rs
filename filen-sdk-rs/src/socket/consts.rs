@@ -14,6 +14,13 @@ pub(super) const MESSAGE_CONNECT_PAYLOAD: &str =
 		Err(_) => panic!("Failed to create handshake payload string"),
 	};
 
+/// The prefix of an ack frame: `43<id>[<args...>]`.
+pub(super) const MESSAGE_ACK_PREFIX: &str =
+	match str::from_utf8(&[PacketType::Message as u8, MessageType::Ack as u8]) {
+		Ok(s) => s,
+		Err(_) => panic!("Failed to create ack prefix string"),
+	};
+
 pub(super) const PING_MESSAGE: &str = match str::from_utf8(&[PacketType::Ping as u8]) {
 	Ok(s) => s,
 	Err(_) => panic!("Failed to create ping message string"),
@@ -32,6 +39,10 @@ pub(super) const OUTBOUND_FRAME_CAPACITY: usize = 64;
 /// handshake + auth). Without it, a black-holed TCP connect or a handshake
 /// read against a dead peer parks the websocket task forever with no retry.
 pub(super) const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long a `lockHello` probe waits for its ack before the connection uses HTTP for locks. The
+/// server defines no timeout; a server without socket locks never answers.
+pub(super) const LOCK_HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub(super) const WEBSOCKET_URL_CORE: &str =
 	"wss://socket.filen.io/socket.io/?EIO=3&transport=websocket&t=";

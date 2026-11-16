@@ -95,6 +95,21 @@ pub struct HandShake<'a> {
 	pub ping_timeout: u64,
 }
 
+/// The server's answer to a `lockHello` probe (`42<id>["lockHello"]`), the one argument of its
+/// ack: which socket lock protocol the connection speaks. A server that does not support socket
+/// locks never answers.
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct LockHello {
+	/// The socket lock protocol version: `1` for `lockHello` and `lock`, `2` for those plus the
+	/// lock announcements.
+	#[serde(with = "crate::serde::number::permissive_u64")]
+	pub version: u64,
+	/// How long a lock's lease lasts after its last acquire or refresh, in seconds.
+	#[serde(with = "crate::serde::number::permissive_u64")]
+	pub ttl_seconds: u64,
+}
+
 /// Wraps a serde_json object deserializer, injecting a `"type"` tag entry
 /// before the object's own entries. Presents wire-format data
 /// `["event-name", {fields...}]` as internally-tagged `{"type": "eventName", fields...}`.
@@ -1399,6 +1414,30 @@ pub struct FolderDeletedPermanent {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn a_lock_hello_answer_deserializes_with_numbers_or_strings() {
+		for json in [
+			r#"{"version":2,"ttlSeconds":60}"#,
+			r#"{"version":"2","ttlSeconds":"60"}"#,
+			r#"{"version":2.0,"ttlSeconds":60,"extra":true}"#,
+		] {
+			assert_eq!(
+				serde_json::from_str::<LockHello>(json).unwrap(),
+				LockHello {
+					version: 2,
+					ttl_seconds: 60
+				},
+				"{json}"
+			);
+		}
+	}
+
+	#[test]
+	fn a_lock_hello_answer_without_a_field_is_rejected() {
+		assert!(serde_json::from_str::<LockHello>(r#"{"version":2}"#).is_err());
+		assert!(serde_json::from_str::<LockHello>(r#"{"ttlSeconds":60}"#).is_err());
+	}
 
 	#[test]
 	fn classify_known_events() {

@@ -5,7 +5,11 @@ use wasm_bindgen::JsCast;
 
 use crate::{Error, ErrorKind};
 
-use super::{consts::WEBSOCKET_URL_CORE, traits::*, writer};
+use super::{
+	consts::{MESSAGE_ACK_PREFIX, WEBSOCKET_URL_CORE},
+	traits::*,
+	writer,
+};
 
 /// Owns the browser socket and closes it when the last wrapper is dropped.
 ///
@@ -37,6 +41,7 @@ impl Deref for WebSocketGuard {
 pub(super) struct WasmSocket {
 	socket: WebSocketGuard,
 	msg_receiver: tokio::sync::mpsc::Receiver<String>,
+	ack_receiver: tokio::sync::mpsc::UnboundedReceiver<String>,
 	close_receiver: Option<tokio::sync::oneshot::Receiver<()>>,
 }
 
@@ -109,6 +114,7 @@ impl Receiver<String> for WasmReceiver {
 pub(super) struct UnauthedWasmSocket {
 	socket: WebSocketGuard,
 	msg_receiver: tokio::sync::mpsc::Receiver<String>,
+	ack_receiver: tokio::sync::mpsc::UnboundedReceiver<String>,
 	close_receiver: tokio::sync::oneshot::Receiver<()>,
 }
 
@@ -119,6 +125,7 @@ impl UnauthedSocket<UnauthedWasmSender, UnauthedWasmReceiver, String> for Unauth
 		};
 		let receiver = UnauthedWasmReceiver {
 			msg_receiver: self.msg_receiver,
+			ack_receiver: self.ack_receiver,
 			close_receiver: Some(self.close_receiver),
 		};
 		(sender, receiver)
@@ -162,6 +169,10 @@ impl Sender for UnauthedWasmSender {
 
 pub(super) struct UnauthedWasmReceiver {
 	msg_receiver: tokio::sync::mpsc::Receiver<String>,
+	/// Acks, which bypass `msg_receiver`'s bound: a dropped ack would turn an answered event
+	/// into one whose outcome is unknown. A server sends one per event this client sent with an
+	/// ack id.
+	ack_receiver: tokio::sync::mpsc::UnboundedReceiver<String>,
 	close_receiver: Option<tokio::sync::oneshot::Receiver<()>>,
 }
 
@@ -174,9 +185,11 @@ impl Receiver<String> for UnauthedWasmReceiver {
 			// (message-first, so frames that arrived before the close are still
 			// drained in order) keeps this cancellation-safe: nothing is consumed
 			// unless an arm actually completes.
+			// Acks and other frames have no order between them: an ack is routed by its id.
 			tokio::select! {
 				biased;
 				msg = self.msg_receiver.recv() => return msg.map(Ok),
+				Some(ack) = self.ack_receiver.recv() => return Some(Ok(ack)),
 				_ = close_receiver => {}
 			}
 			// the close fired: never poll the finished oneshot again
@@ -184,7 +197,11 @@ impl Receiver<String> for UnauthedWasmReceiver {
 		}
 		// closed: no new frames can arrive — deliver anything still buffered,
 		// then report end-of-stream
-		self.msg_receiver.try_recv().ok().map(Ok)
+		self.msg_receiver
+			.try_recv()
+			.or_else(|_| self.ack_receiver.try_recv())
+			.ok()
+			.map(Ok)
 	}
 }
 
@@ -235,6 +252,7 @@ impl
 		// an event burst and a consumer busy decrypting — keep it roomy; overflow
 		// still only drops the excess with a warning.
 		let (msg_sender, msg_receiver) = tokio::sync::mpsc::channel::<String>(64);
+		let (ack_sender, ack_receiver) = tokio::sync::mpsc::unbounded_channel::<String>();
 		let on_msg_closure = wasm_bindgen::prelude::Closure::<dyn Fn(web_sys::MessageEvent)>::new(
 			move |e: web_sys::MessageEvent| {
 				// skip non-text frames (Blob/ArrayBuffer) like native does —
@@ -243,6 +261,11 @@ impl
 					tracing::warn!("received non-text WebSocket message, ignoring");
 					return;
 				};
+				if text.starts_with(MESSAGE_ACK_PREFIX) {
+					// The receiver only goes away with the socket.
+					let _ = ack_sender.send(text);
+					return;
+				}
 				if let Err(TrySendError::Full(msg)) = msg_sender.try_send(text) {
 					tracing::warn!(
 						"WebSocket message channel full, dropping message '{:?}'",
@@ -310,6 +333,7 @@ impl
 		Ok(UnauthedWasmSocket {
 			socket: ws,
 			msg_receiver,
+			ack_receiver,
 			close_receiver,
 		})
 	}
@@ -321,6 +345,7 @@ impl
 		Self {
 			socket: unauthed_sender.socket,
 			msg_receiver: unauthed_receiver.msg_receiver,
+			ack_receiver: unauthed_receiver.ack_receiver,
 			close_receiver: unauthed_receiver.close_receiver,
 		}
 	}
@@ -331,6 +356,7 @@ impl
 		});
 		let receiver = WasmReceiver(UnauthedWasmReceiver {
 			msg_receiver: self.msg_receiver,
+			ack_receiver: self.ack_receiver,
 			close_receiver: self.close_receiver,
 		});
 		(sender, receiver)

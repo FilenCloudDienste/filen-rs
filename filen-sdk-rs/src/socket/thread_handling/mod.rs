@@ -14,21 +14,23 @@ use crate::{
 };
 
 use super::{
+	acks::parse_ack,
 	consts::{
 		CONNECT_TIMEOUT, MESSAGE_CONNECT_PAYLOAD, MESSAGE_EVENT_PAYLOAD, PING_INTERVAL,
 		RECONNECT_DELAY, RECONNECT_MAX,
 	},
 	events::DecryptedSocketEvent,
 	listener_manager::{ConnectedListenerManager, DisconnectedListenerManager, ListenerManagerExt},
+	lock_transport::{ConnectionLocks, LockTransport, LockTransportClaim},
 	traits::*,
 };
 
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-use tokio::time::{Instant, sleep, timeout};
+use tokio::time::{Instant, sleep, sleep_until, timeout};
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 use wasmtimer::{
 	std::Instant,
-	tokio::{sleep, timeout},
+	tokio::{sleep, sleep_until, timeout},
 };
 
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
@@ -315,6 +317,9 @@ pub(super) struct WebSocketConfig {
 	pub(super) user_id: u64,
 	/// The pause before the next attempt after one failed.
 	pub(super) backoff: ReconnectBackoff,
+	/// What this task publishes its lock transport through. It goes with the config, so it ends
+	/// with the task, or with a worker given up on before it started.
+	pub(super) lock_claim: LockTransportClaim,
 }
 
 /// The pause between attempts to connect that fail, whatever failed (the network, TLS, a proxy,
@@ -373,16 +378,20 @@ fn spawn_websocket_thread(
 ) -> (tokio::sync::mpsc::Sender<SocketRequest>, WorkerStart) {
 	let (request_sender, request_receiver) = tokio::sync::mpsc::channel::<SocketRequest>(16);
 
+	// Claimed here, in spawn order, so a task that is late to start or slow to end never
+	// publishes over the one spawned after it.
+	let lock_claim = client.lock_transport.claim();
 	let config = WebSocketConfig {
 		client,
 		reconnect_delay: RECONNECT_DELAY,
 		ping_interval: PING_INTERVAL,
 		user_id,
 		backoff: ReconnectBackoff::default(),
+		lock_claim,
 	};
 
 	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-	let f = |request_receiver| {
+	let f = |(request_receiver, config)| {
 		run_async_websocket_task::<native::NativeSocket, _, _, _, _, _, _, _, _>(
 			config,
 			request_receiver,
@@ -392,7 +401,7 @@ fn spawn_websocket_thread(
 	};
 
 	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
-	let f = |request_receiver| {
+	let f = |(request_receiver, config)| {
 		run_async_websocket_task::<wasm::WasmSocket, _, _, _, _, _, _, _, _>(
 			config,
 			request_receiver,
@@ -401,7 +410,9 @@ fn spawn_websocket_thread(
 		)
 	};
 
-	let start = crate::runtime::spawn_async_claiming("websocket", request_receiver, f);
+	// The config travels with the receiver, not in `f`: a worker given up on drops its input,
+	// and with it the lock claim, where `f` would leak.
+	let start = crate::runtime::spawn_async_claiming("websocket", (request_receiver, config), f);
 
 	(request_sender, start)
 }
@@ -427,6 +438,10 @@ where
 	WT: WriterTask<Sender = S>,
 {
 	let (mut receiver, writer) = web_socket.split_into_receiver_and_writer(config.ping_interval);
+	// `lockHello` once per connection, after `authSuccess` (`perform_handshake` waited for it).
+	let mut locks = ConnectionLocks::probe(&config.lock_claim, Instant::now(), |frame| {
+		writer.try_queue(frame)
+	});
 
 	let mut should_retry = true;
 
@@ -440,6 +455,7 @@ where
 	let mut liveness = std::pin::pin!(sleep(liveness_timeout));
 
 	loop {
+		let ack_deadline = locks.next_deadline();
 		tokio::select! {
 			biased;
 			request = request_receiver.recv() => {
@@ -488,6 +504,18 @@ where
 				message.as_ref().len()
 			);
 
+				match parse_ack(message.as_ref()) {
+					Some(Ok(ack)) => {
+						locks.on_ack(&ack);
+						continue;
+					}
+					Some(Err(e)) => {
+						tracing::warn!("Ignoring a malformed WebSocket ack: {e}");
+						continue;
+					}
+					None => {}
+				}
+
 				match super::events::try_parse_message_from_str(message.into_stable_deref()) {
 					Ok(Some(event_yoke)) => {
 						if listeners.should_decrypt_event(event_yoke.get()) {
@@ -518,6 +546,10 @@ where
 					}
 				}
 			},
+			// Re-armed on every turn, from the earliest deadline of the acks this connection waits for.
+			() = sleep_until(ack_deadline.unwrap_or_else(Instant::now)), if ack_deadline.is_some() => {
+				locks.expire(Instant::now());
+			},
 			_ = liveness.as_mut() => {
 				tracing::warn!(
 					"No WebSocket traffic within {:?}, reconnecting",
@@ -527,6 +559,9 @@ where
 			},
 		}
 	}
+	// Published before anything else is torn down: no lock operation may count on this
+	// connection from here on.
+	locks.disconnected();
 	// Events that already arrived must survive the teardown: broadcast anything
 	// still decrypting instead of dropping it with the queue — reconnects are
 	// routine (transport errors, liveness) and must not silently lose events.
@@ -666,9 +701,13 @@ async fn run_async_websocket_task<W, S, R, RV, US, UR, T, UW, WT>(
 	UW: UnauthedSocket<US, UR, RV>,
 	WT: WriterTask<Sender = S>,
 {
+	// `config.lock_claim` publishes `None` as the task ends, unless a successor was spawned
+	// already: one is as soon as the last strong request sender is dropped, while this task may
+	// still be serving or tearing down.
 	let mut disconnected_listeners = DisconnectedListenerManager::new();
 
 	loop {
+		config.lock_claim.publish(LockTransport::Connecting);
 		let streams = match initialize_websocket::<W, _, _, _, _, _, _, _, _>(
 			&mut config,
 			&mut request_receiver,

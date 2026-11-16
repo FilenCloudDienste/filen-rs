@@ -18,6 +18,11 @@ use reqwest::{
 use serde::{Serialize, de::DeserializeOwned};
 use tower::{ServiceBuilder, ServiceExt};
 
+#[cfg(any(
+	not(all(target_family = "wasm", target_os = "unknown")),
+	feature = "wasm-full"
+))]
+use crate::socket::LockTransportSlot;
 use crate::{
 	Error,
 	auth::{
@@ -909,6 +914,13 @@ pub struct AuthClient {
 	/// What the lock requests report the locks they may leave held to (see
 	/// `Client::set_lock_listener`).
 	pub(crate) lock_listener: LockListenerSlot,
+	/// Whether the socket can carry lock operations, as the websocket task publishes it. Builds
+	/// without a socket (`service-worker`) use HTTP for every lock operation.
+	#[cfg(any(
+		not(all(target_family = "wasm", target_os = "unknown")),
+		feature = "wasm-full"
+	))]
+	pub(crate) lock_transport: LockTransportSlot,
 }
 
 impl std::fmt::Debug for AuthClient {
@@ -1229,6 +1241,11 @@ impl AuthClient {
 			batcher: Batcher::default(),
 			pending_lock_releases: PendingReleases::default(),
 			lock_listener: LockListenerSlot::default(),
+			#[cfg(any(
+				not(all(target_family = "wasm", target_os = "unknown")),
+				feature = "wasm-full"
+			))]
+			lock_transport: LockTransportSlot::default(),
 		}
 	}
 

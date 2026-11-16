@@ -119,10 +119,9 @@ mod pipeline {
 	pub(super) enum ServerAction {
 		/// deliver this frame to the client
 		Msg(String),
-		/// deliver this frame after the delay elapses (the paused clock
-		/// auto-advances to it); NOTE: the item is consumed when `receive`
-		/// is first polled, so a script must not rely on redelivery if
-		/// another select arm wins during the delay
+		/// deliver this frame once the delay elapsed, counted from when `receive` was first
+		/// polled for it (the paused clock auto-advances to it); a `receive` cancelled meanwhile
+		/// by another select arm leaves it in place, due at the same instant
 		Delayed(Duration, String),
 		/// surface a transport-level receive error
 		Err(&'static str),
@@ -243,16 +242,25 @@ mod pipeline {
 
 	pub(super) struct FakeReceiver {
 		script: VecDeque<ServerAction>,
+		/// When the `Delayed` frame at the front of the script is due.
+		due: Option<Instant>,
+	}
+
+	impl FakeReceiver {
+		fn new(script: VecDeque<ServerAction>) -> Self {
+			Self { script, due: None }
+		}
 	}
 
 	impl Receiver<FakeMsg> for FakeReceiver {
 		async fn receive(&mut self) -> Option<Result<FakeMsg, Error>> {
+			if let Some(ServerAction::Delayed(delay, _)) = self.script.front() {
+				let due = *self.due.get_or_insert_with(|| Instant::now() + *delay);
+				tokio::time::sleep_until(due).await;
+				self.due = None;
+			}
 			match self.script.pop_front() {
-				Some(ServerAction::Msg(s)) => Some(Ok(FakeMsg(s))),
-				Some(ServerAction::Delayed(delay, s)) => {
-					tokio::time::sleep(delay).await;
-					Some(Ok(FakeMsg(s)))
-				}
+				Some(ServerAction::Msg(s) | ServerAction::Delayed(_, s)) => Some(Ok(FakeMsg(s))),
 				Some(ServerAction::Err(s)) => Some(Err(Error::custom(ErrorKind::Server, s))),
 				Some(ServerAction::Close) => None,
 				// an exhausted script behaves like a black-holed connection
@@ -271,12 +279,7 @@ mod pipeline {
 
 	impl UnauthedSocket<FakeSender, FakeReceiver, FakeMsg> for FakeUnauthedSocket {
 		fn split(self) -> (FakeSender, FakeReceiver) {
-			(
-				FakeSender,
-				FakeReceiver {
-					script: self.script,
-				},
-			)
+			(FakeSender, FakeReceiver::new(self.script))
 		}
 	}
 
@@ -353,12 +356,7 @@ mod pipeline {
 		}
 
 		fn into_parts(self) -> (FakeSender, FakeReceiver) {
-			(
-				FakeSender,
-				FakeReceiver {
-					script: self.script,
-				},
-			)
+			(FakeSender, FakeReceiver::new(self.script))
 		}
 	}
 
@@ -394,11 +392,17 @@ mod pipeline {
 
 	fn test_config() -> WebSocketConfig {
 		let unauthed = UnauthClient::from_config(ClientConfig::default()).unwrap();
+		test_config_for(Arc::new(AuthClient::from_unauthed(
+			unauthed,
+			Arc::new(RwLock::new(APIKey(Cow::Borrowed("test-api-key")))),
+		)))
+	}
+
+	/// The config of a task spawned now for `client`.
+	fn test_config_for(client: Arc<AuthClient>) -> WebSocketConfig {
 		WebSocketConfig {
-			client: Arc::new(AuthClient::from_unauthed(
-				unauthed,
-				Arc::new(RwLock::new(APIKey(Cow::Borrowed("test-api-key")))),
-			)),
+			lock_claim: client.lock_transport.claim(),
+			client,
 			reconnect_delay: RECONNECT_DELAY,
 			ping_interval: PING_INTERVAL,
 			user_id: 0,
@@ -936,9 +940,7 @@ mod pipeline {
 		// anything, without an error or a close frame
 		let socket = FakeSocket::from_unauthed_parts(
 			FakeSender,
-			FakeReceiver {
-				script: vec![ServerAction::Hang].into(),
-			},
+			FakeReceiver::new(vec![ServerAction::Hang].into()),
 		);
 
 		let (_request_sender, mut request_receiver) = tokio::sync::mpsc::channel(16);
@@ -976,13 +978,13 @@ mod pipeline {
 		// would fire; the deadline must restart from that frame
 		let socket = FakeSocket::from_unauthed_parts(
 			FakeSender,
-			FakeReceiver {
-				script: vec![
+			FakeReceiver::new(
+				vec![
 					ServerAction::Delayed(liveness - Duration::from_secs(1), "3".to_string()),
 					ServerAction::Hang,
 				]
 				.into(),
-			},
+			),
 		);
 
 		let (_request_sender, mut request_receiver) = tokio::sync::mpsc::channel(16);
@@ -1030,16 +1032,15 @@ mod pipeline {
 	const PING: [&str; 2] = ["2", r#"42["authed", <ms>]"#];
 
 	/// A session pings as soon as it starts and then every ping interval, and stops pinging once
-	/// it is torn down: here at 0, 15 and 30 s, until the liveness deadline ends it at 35 s.
+	/// it is torn down: here at 0, 15 and 30 s, until the liveness deadline ends it at 35 s. The
+	/// `lockHello` probe goes out once, behind the first ping.
 	#[tokio::test(start_paused = true)]
 	async fn a_session_pings_every_interval_until_it_ends() {
 		prime(Vec::new());
 		let config = test_config();
 		let socket = FakeSocket::from_unauthed_parts(
 			FakeSender,
-			FakeReceiver {
-				script: vec![ServerAction::Hang].into(),
-			},
+			FakeReceiver::new(vec![ServerAction::Hang].into()),
 		);
 		let (_request_sender, mut request_receiver) = tokio::sync::mpsc::channel(16);
 		let mut listeners = DisconnectedListenerManager::new()
@@ -1069,7 +1070,7 @@ mod pipeline {
 		);
 		assert!(should_retry);
 		assert_eq!(begin.elapsed(), Duration::from_secs(35));
-		assert_eq!(counts, [2, 4, 6]);
+		assert_eq!(counts, [3, 5, 7]);
 
 		tokio::time::sleep(Duration::from_secs(60)).await;
 		assert_eq!(
@@ -1077,12 +1078,210 @@ mod pipeline {
 			[
 				"2",
 				r#"42["authed", <ms>]"#,
+				r#"420["lockHello"]"#,
 				"2",
 				r#"42["authed", <ms>]"#,
 				"2",
 				r#"42["authed", <ms>]"#,
 			]
 		);
+	}
+
+	/// The client's lock transport, as the websocket task last published it.
+	fn lock_transport(client: &AuthClient) -> LockTransport {
+		*client.lock_transport.subscribe().borrow()
+	}
+
+	/// The `lockHello` probes sent so far.
+	fn sent_probes() -> Vec<String> {
+		sent_messages()
+			.into_iter()
+			.filter(|frame| frame.contains("lockHello"))
+			.collect()
+	}
+
+	const LOCK_HELLO_V2: &str = r#"430[{"version":2,"ttlSeconds":60}]"#;
+
+	/// An authenticated connection sends `lockHello` with ack id 0, is probing until the answer
+	/// arrives, then speaks socket locks; once the task ends nothing carries locks.
+	#[tokio::test(start_paused = true)]
+	async fn an_answered_lock_hello_selects_socket_locks() {
+		let config = test_config();
+		let client = Arc::clone(&config.client);
+		assert_eq!(lock_transport(&client), LockTransport::Connecting);
+		let connections = vec![FakeConnection::new(handshake_then(vec![
+			ServerAction::Delayed(Duration::from_secs(1), LOCK_HELLO_V2.to_string()),
+			ServerAction::Hang,
+		]))];
+		drive(connections, config, async |sender| {
+			sleep(Duration::from_millis(500)).await;
+			assert_eq!(
+				lock_transport(&client),
+				LockTransport::Probing { generation: 1 }
+			);
+			sleep(Duration::from_secs(1)).await;
+			assert_eq!(
+				lock_transport(&client),
+				LockTransport::Socket {
+					generation: 1,
+					version: 2,
+					ttl: Duration::from_secs(60)
+				}
+			);
+			drop(sender);
+		})
+		.await;
+		assert_eq!(lock_transport(&client), LockTransport::None);
+		assert_eq!(sent_probes(), [r#"420["lockHello"]"#]);
+	}
+
+	/// A server that does not answer `lockHello` within 5 s leaves the connection on HTTP, and
+	/// its answer after that is ignored.
+	#[tokio::test(start_paused = true)]
+	async fn an_unanswered_lock_hello_falls_back_to_http_after_five_seconds() {
+		let config = test_config();
+		let client = Arc::clone(&config.client);
+		let connections = vec![FakeConnection::new(handshake_then(vec![
+			ServerAction::Delayed(Duration::from_secs(6), LOCK_HELLO_V2.to_string()),
+			ServerAction::Hang,
+		]))];
+		drive(connections, config, async |sender| {
+			sleep(Duration::from_millis(4_999)).await;
+			assert_eq!(
+				lock_transport(&client),
+				LockTransport::Probing { generation: 1 }
+			);
+			sleep(Duration::from_millis(2)).await;
+			assert_eq!(
+				lock_transport(&client),
+				LockTransport::Http { generation: 1 }
+			);
+			sleep(Duration::from_secs(2)).await;
+			assert_eq!(
+				lock_transport(&client),
+				LockTransport::Http { generation: 1 }
+			);
+			drop(sender);
+		})
+		.await;
+	}
+
+	/// A lost connection stops carrying locks at once, and the next one probes again with ack
+	/// ids starting from 0 and the next generation.
+	#[tokio::test(start_paused = true)]
+	async fn a_reconnect_probes_again_from_ack_id_zero() {
+		let config = test_config();
+		let client = Arc::clone(&config.client);
+		let connections = vec![
+			FakeConnection::new(handshake_then(vec![
+				ServerAction::Msg(LOCK_HELLO_V2.to_string()),
+				ServerAction::Delayed(Duration::from_secs(2), "3".to_string()),
+				ServerAction::Close,
+			])),
+			// Reconnected after `RECONNECT_DELAY`, at 3 s.
+			FakeConnection::new(handshake_then(vec![
+				ServerAction::Delayed(
+					Duration::from_secs(1),
+					r#"430[{"version":1,"ttlSeconds":30}]"#.to_string(),
+				),
+				ServerAction::Hang,
+			])),
+		];
+		drive(connections, config, async |sender| {
+			sleep(Duration::from_secs(1)).await;
+			assert_eq!(
+				lock_transport(&client),
+				LockTransport::Socket {
+					generation: 1,
+					version: 2,
+					ttl: Duration::from_secs(60)
+				}
+			);
+			sleep(Duration::from_millis(1_500)).await;
+			assert_eq!(lock_transport(&client), LockTransport::Connecting);
+			sleep(Duration::from_secs(1)).await;
+			assert_eq!(
+				lock_transport(&client),
+				LockTransport::Probing { generation: 2 }
+			);
+			sleep(Duration::from_secs(1)).await;
+			assert_eq!(
+				lock_transport(&client),
+				LockTransport::Socket {
+					generation: 2,
+					version: 1,
+					ttl: Duration::from_secs(30)
+				}
+			);
+			drop(sender);
+		})
+		.await;
+		assert_eq!(
+			sent_probes(),
+			[r#"420["lockHello"]"#, r#"420["lockHello"]"#]
+		);
+	}
+
+	/// A task still running when its successor was spawned (its last listener handle was
+	/// dropped, and one added again at once) publishes nothing once it ends: neither the loss of
+	/// its connection nor the end of the task overwrite the successor's live connection.
+	#[tokio::test(start_paused = true)]
+	async fn a_task_that_ends_after_its_successor_started_leaves_the_transport_alone() {
+		let first = test_config();
+		let client = Arc::clone(&first.client);
+		prime(vec![
+			FakeConnection::new(handshake_then(vec![
+				ServerAction::Msg(LOCK_HELLO_V2.to_string()),
+				ServerAction::Hang,
+			])),
+			FakeConnection::new(handshake_then(vec![
+				ServerAction::Msg(r#"430[{"version":1,"ttlSeconds":30}]"#.to_string()),
+				ServerAction::Hang,
+			])),
+		]);
+		let (first_sender, first_receiver) = tokio::sync::mpsc::channel(16);
+		let (second_sender, second_receiver) = tokio::sync::mpsc::channel(16);
+		let first_task = run_async_websocket_task::<FakeSocket, _, _, _, _, _, _, _, _>(
+			first,
+			first_receiver,
+			Arc::new(NoopCrypter),
+			test_private_key(),
+		);
+		let live = LockTransport::Socket {
+			generation: 2,
+			version: 1,
+			ttl: Duration::from_secs(30),
+		};
+		let driver = async {
+			sleep(Duration::from_secs(1)).await;
+			assert_eq!(
+				lock_transport(&client),
+				LockTransport::Socket {
+					generation: 1,
+					version: 2,
+					ttl: Duration::from_secs(60)
+				}
+			);
+			let second = run_async_websocket_task::<FakeSocket, _, _, _, _, _, _, _, _>(
+				test_config_for(Arc::clone(&client)),
+				second_receiver,
+				Arc::new(NoopCrypter),
+				test_private_key(),
+			);
+			let second_driver = async {
+				sleep(Duration::from_secs(1)).await;
+				assert_eq!(lock_transport(&client), live);
+				// The first task ends only now.
+				drop(first_sender);
+				sleep(Duration::from_secs(1)).await;
+				assert_eq!(lock_transport(&client), live);
+				drop(second_sender);
+			};
+			tokio::join!(second, second_driver);
+		};
+		tokio::join!(first_task, driver);
+		assert_eq!(connect_count(), 2);
+		assert_eq!(lock_transport(&client), LockTransport::None);
 	}
 
 	/// Queued frames go out in the order they were queued, after the ping that was due.

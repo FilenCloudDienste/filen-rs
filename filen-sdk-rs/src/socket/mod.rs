@@ -2,11 +2,13 @@ use crate::{Error, auth::Client};
 
 use std::borrow::Cow;
 
+mod acks;
 mod consts;
 mod events;
 #[cfg(any(feature = "wasm-full", feature = "uniffi"))]
 mod js;
 mod listener_manager;
+mod lock_transport;
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 pub(crate) mod native;
 mod thread_handling;
@@ -17,7 +19,10 @@ mod writer;
 
 use traits::EventListenerCallback;
 
-pub(crate) use thread_handling::WebSocketHandle;
+#[cfg(feature = "test-seams")]
+use lock_transport::LockTransport;
+
+pub(crate) use {lock_transport::LockTransportSlot, thread_handling::WebSocketHandle};
 
 pub use {events::*, thread_handling::ListenerHandle};
 
@@ -73,6 +78,32 @@ impl Client {
 			.lock()
 			.unwrap_or_else(|e| e.into_inner())
 			.is_connected()
+	}
+
+	// Test seam: the live socket tests check what the `lockHello` probe found. Gated behind the
+	// `test-seams` feature, which production builds never enable.
+	/// Waits until the current connection's `lockHello` probe is settled and returns the socket
+	/// lock protocol version its server speaks, or `None` when the connection uses HTTP for locks
+	/// (or the websocket task ended). Test code only.
+	#[cfg(feature = "test-seams")]
+	pub async fn lock_protocol_version_for_test(&self) -> Option<u64> {
+		let mut transport = self.client().lock_transport.subscribe();
+		let settled = transport
+			.wait_for(|transport| {
+				matches!(
+					transport,
+					LockTransport::None | LockTransport::Socket { .. } | LockTransport::Http { .. }
+				)
+			})
+			.await
+			.ok()?;
+		match *settled {
+			LockTransport::Socket { version, .. } => Some(version),
+			LockTransport::None
+			| LockTransport::Connecting
+			| LockTransport::Probing { .. }
+			| LockTransport::Http { .. } => None,
+		}
 	}
 
 	pub async fn get_last_event_ids(
