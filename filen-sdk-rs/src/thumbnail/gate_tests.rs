@@ -80,7 +80,19 @@ fn a_known_mime_admits_what_the_name_does_not() {
 		Some("art.psd"),
 		Some("image/vnd.adobe.photoshop")
 	));
-	assert!(!might_be_thumbnailable(Some("icon"), Some("image/x-icon")));
+	assert!(!might_be_thumbnailable(Some("frame"), Some("image/x-tga")));
+}
+
+#[test]
+fn icons_and_animated_pngs_are_admitted_by_name_or_mime() {
+	assert!(might_be_thumbnailable(Some("favicon.ico"), None));
+	assert!(might_be_thumbnailable(Some("APP.ICO"), None));
+	assert!(might_be_thumbnailable(Some("spinner.apng"), None));
+	for mime in ["image/x-icon", "image/vnd.microsoft.icon", "image/apng"] {
+		assert!(might_be_thumbnailable(Some("icon"), Some(mime)), "{mime}");
+	}
+	// Cursors share the container but are not decoded.
+	assert!(!might_be_thumbnailable(Some("arrow.cur"), None));
 }
 
 #[test]

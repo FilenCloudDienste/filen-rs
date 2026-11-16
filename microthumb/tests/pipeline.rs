@@ -2690,3 +2690,162 @@ fn svg_design_tool_exports_thumbnail_at_every_target() {
 		"expected the layer allowance, got {err}"
 	);
 }
+
+// ---- APNG and ICO ----
+
+#[test]
+fn apng_thumbnails_its_default_image() {
+	let (w, h) = (48u32, 24u32);
+	let px = usize::try_from(w * h).unwrap();
+	let mut bytes = Vec::new();
+	{
+		let mut enc = png::Encoder::new(&mut bytes, w, h);
+		enc.set_color(png::ColorType::Rgb);
+		enc.set_depth(png::BitDepth::Eight);
+		enc.set_animated(2, 0).unwrap();
+		let mut writer = enc.write_header().unwrap();
+		writer.write_image_data(&[255, 0, 0].repeat(px)).unwrap();
+		writer.write_image_data(&[0, 255, 0].repeat(px)).unwrap();
+		writer.finish().unwrap();
+	}
+	assert!(
+		bytes.windows(4).any(|w| w == b"acTL"),
+		"fixture must be animated"
+	);
+	let result = thumb(Box::new(MemSource(bytes)), &spec(64))
+		.unwrap()
+		.expect("apng must thumbnail");
+	assert_eq!((result.width, result.height), (w, h));
+	assert!(
+		mean_channel(&result.rgba, 0) > 200,
+		"expected the RED first frame"
+	);
+	assert!(mean_channel(&result.rgba, 1) < 50);
+}
+
+fn rgba_png(w: u32, h: u32, rgba: [u8; 4]) -> Vec<u8> {
+	let image = image::RgbaImage::from_pixel(w, h, image::Rgba(rgba));
+	let mut bytes = Vec::new();
+	image
+		.write_to(&mut Cursor::new(&mut bytes), ImageFormat::Png)
+		.unwrap();
+	bytes
+}
+
+fn ico_of_pngs(entries: &[(u32, u32, [u8; 4])]) -> Vec<u8> {
+	use image::codecs::ico::{IcoEncoder, IcoFrame};
+	let pngs: Vec<(u32, u32, Vec<u8>)> = entries
+		.iter()
+		.map(|&(w, h, rgba)| (w, h, rgba_png(w, h, rgba)))
+		.collect();
+	let frames: Vec<IcoFrame<'_>> = pngs
+		.iter()
+		.map(|(w, h, png)| {
+			IcoFrame::with_encoded(png.as_slice(), *w, *h, image::ExtendedColorType::Rgba8).unwrap()
+		})
+		.collect();
+	let mut bytes = Vec::new();
+	IcoEncoder::new(&mut bytes).encode_images(&frames).unwrap();
+	bytes
+}
+
+#[test]
+fn ico_thumbnails_its_largest_entry() {
+	let bytes = ico_of_pngs(&[
+		(16, 16, [0, 255, 0, 255]),
+		(64, 64, [255, 0, 0, 255]),
+		(32, 32, [0, 0, 255, 255]),
+	]);
+	let result = thumb(Box::new(MemSource(bytes)), &spec(128))
+		.unwrap()
+		.expect("ico must thumbnail");
+	assert_eq!((result.width, result.height), (64, 64));
+	assert!(
+		mean_channel(&result.rgba, 0) > 200,
+		"expected the RED entry"
+	);
+	assert!(mean_channel(&result.rgba, 1) < 50);
+}
+
+/// The classic layout: a bottom-up 32-bit DIB at doubled height, then the
+/// 1-bit AND mask.
+#[test]
+fn ico_bmp_entries_decode_with_their_mask() {
+	let (w, h) = (8u32, 4u32);
+	let mut dib = Vec::new();
+	dib.extend_from_slice(&40u32.to_le_bytes());
+	dib.extend_from_slice(&w.to_le_bytes());
+	dib.extend_from_slice(&(h * 2).to_le_bytes());
+	dib.extend_from_slice(&1u16.to_le_bytes());
+	dib.extend_from_slice(&32u16.to_le_bytes());
+	dib.extend_from_slice(&[0u8; 24]);
+	for _ in 0..w * h {
+		dib.extend_from_slice(&[255, 0, 0, 255]); // BGRA blue
+	}
+	dib.extend_from_slice(&[0u8; 16]); // AND mask: 4 rows of 4 bytes
+	let mut bytes = Vec::new();
+	bytes.extend_from_slice(&[0, 0, 1, 0]);
+	bytes.extend_from_slice(&1u16.to_le_bytes());
+	bytes.extend_from_slice(&[8, 4, 0, 0]);
+	bytes.extend_from_slice(&1u16.to_le_bytes());
+	bytes.extend_from_slice(&32u16.to_le_bytes());
+	bytes.extend_from_slice(&u32::try_from(dib.len()).unwrap().to_le_bytes());
+	bytes.extend_from_slice(&22u32.to_le_bytes());
+	bytes.extend_from_slice(&dib);
+	let result = thumb(Box::new(MemSource(bytes)), &spec(64))
+		.unwrap()
+		.expect("bmp ico must thumbnail");
+	assert_eq!((result.width, result.height), (w, h));
+	assert!(mean_channel(&result.rgba, 2) > 200, "expected BLUE");
+	assert!(mean_channel(&result.rgba, 0) < 50);
+}
+
+#[test]
+fn a_forged_ico_directory_count_is_refused_unread() {
+	let mut bytes = vec![0, 0, 1, 0];
+	bytes.extend_from_slice(&u16::MAX.to_le_bytes());
+	bytes.resize(64, 0);
+	assert!(matches!(
+		thumb(Box::new(MemSource(bytes)), &spec(64)),
+		Err(ThumbError::Decode(_))
+	));
+	// An empty directory and a cursor are not icons this crate decodes.
+	for header in [[0u8, 0, 1, 0, 0, 0], [0, 0, 2, 0, 1, 0]] {
+		let mut bytes = header.to_vec();
+		bytes.resize(64, 0);
+		assert_eq!(
+			generate(Box::new(MemSource(bytes)), &spec(64)).unwrap(),
+			ThumbOutcome::Unsupported
+		);
+	}
+}
+
+/// A 256-px directory entry whose PNG declares 4096 px a side: the `image`
+/// crate accepts it (it matches entries only up to 256), the side cap does
+/// not. Hand-built IHDR with no image data; encoding it would be the attack.
+#[test]
+fn an_oversized_ico_png_entry_is_refused_before_decoding() {
+	let mut png = Vec::new();
+	png.extend_from_slice(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
+	let mut ihdr = Vec::new();
+	ihdr.extend_from_slice(&4096u32.to_be_bytes());
+	ihdr.extend_from_slice(&4096u32.to_be_bytes());
+	ihdr.extend_from_slice(&[8, 6, 0, 0, 0]); // 8-bit RGBA
+	png_chunk(&mut png, b"IHDR", &ihdr);
+	png_chunk(&mut png, b"IDAT", &[0x78, 0x9C]);
+	png_chunk(&mut png, b"IEND", &[]);
+	let mut bytes = Vec::new();
+	bytes.extend_from_slice(&[0, 0, 1, 0]);
+	bytes.extend_from_slice(&1u16.to_le_bytes());
+	bytes.extend_from_slice(&[0, 0, 0, 0]);
+	bytes.extend_from_slice(&1u16.to_le_bytes());
+	bytes.extend_from_slice(&32u16.to_le_bytes());
+	bytes.extend_from_slice(&u32::try_from(png.len()).unwrap().to_le_bytes());
+	bytes.extend_from_slice(&22u32.to_le_bytes());
+	bytes.extend_from_slice(&png);
+	let roomy = ThumbSpec::new(64, 64, usize::MAX / 2);
+	match thumb(Box::new(MemSource(bytes)), &roomy) {
+		Err(ThumbError::Decode(msg)) => assert!(msg.contains("1024"), "{msg}"),
+		other => panic!("expected the side cap, got {other:?}"),
+	}
+}

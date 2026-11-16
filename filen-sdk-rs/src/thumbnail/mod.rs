@@ -45,9 +45,12 @@ use crate::{ErrorKind, error::Error};
 const THUMBNAILABLE_EXTENSIONS: &[&str] = &[
 	// Formats the pipeline decodes directly. `svgz` is deliberately absent:
 	// the pipeline refuses gzipped SVG (no inflate), so looking would cost a
-	// chunk and answer nothing.
+	// chunk and answer nothing. `apng` is a PNG whose first frame is the
+	// default image, and `ico` decodes its best entry.
+	"apng",
 	"bmp",
 	"gif",
+	"ico",
 	"jfif",
 	"jpe",
 	"jpeg",
@@ -128,7 +131,7 @@ fn extension_is_thumbnailable(ext: &str) -> bool {
 /// The stored mime, read through the same cfg-gated table: `image/<sub>` is
 /// `<sub>` as an extension, bar the handful of subtypes that spell it
 /// differently. Anything the table does not know — `vnd.adobe.photoshop`,
-/// `x-icon` — stays out, exactly as its extension would, and a mime never
+/// `x-tga` — stays out, exactly as its extension would, and a mime never
 /// admits what this build cannot decode.
 fn mime_is_thumbnailable(mime: &str) -> bool {
 	let Some(sub) = mime.strip_prefix("image/") else {
@@ -139,6 +142,7 @@ fn mime_is_thumbnailable(mime: &str) -> bool {
 		"svg+xml" => "svg",
 		"x-qoi" => "qoi",
 		"tiff" => "tif",
+		"x-icon" | "vnd.microsoft.icon" => "ico",
 		other => other,
 	})
 }

@@ -15,6 +15,9 @@ svg = ["dep:resvg", "dep:roxmltree", "dep:num-traits"]
 image = { version = "0.25.6", default-features = false, features = [
 	"bmp",
 	"gif",
+	# ICO pulls the `png` codec in beside `bmp`; the `png` crate is already a
+	# dependency of its own here.
+	"ico",
 	"qoi",
 	"tiff",
 	"webp",
@@ -54,6 +57,7 @@ blake3 = "1.8"
 image = { version = "0.25.6", default-features = false, features = [
 	"bmp",
 	"gif",
+	"ico",
 	"jpeg",
 	"png",
 	"qoi",

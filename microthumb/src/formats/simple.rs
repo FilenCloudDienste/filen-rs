@@ -1,5 +1,5 @@
 //! The formats the `image` crate can only decode whole-frame (WebP, GIF,
-//! BMP, TIFF, QOI). No streaming exists for them here, so the honest answer
+//! BMP, TIFF, QOI, ICO). No streaming exists for them here, so the honest answer
 //! is a full-frame peak estimate and the budget check drawing the line —
 //! ~2.5 MP under the default budget. Photos rarely travel in these formats
 //! at sensor resolutions; web-sized images sail through.
@@ -14,6 +14,29 @@ use crate::{
 };
 
 pub struct Simple;
+
+/// An ICO directory holds one 16-byte entry per size. Real icons carry a
+/// dozen at most; the cap keeps a forged count (up to 65535) from making the
+/// `image` crate read and allocate a directory nobody ships.
+const MAX_ICO_ENTRIES: u16 = 256;
+
+/// The format caps an entry at 256 px a side, but its PNG entries may declare
+/// more, and the `image` crate only matches the directory against the header
+/// up to 256. Anything past this is no icon; the full-frame budget check would
+/// refuse most of it anyway, this refuses it by name before any decode work.
+const MAX_ICO_SIDE: u32 = 1024;
+
+/// `00 00 01 00` plus a non-zero entry count. Cursors (`00 00 02 00`) stay out:
+/// their hotspot fields are read as planes and depth, and nobody keeps a
+/// photo in one.
+fn ico_entry_count(prefix: &[u8]) -> Option<u16> {
+	let header = prefix.get(..6)?;
+	if header[..4] != [0, 0, 1, 0] {
+		return None;
+	}
+	let count = u16::from_le_bytes([header[4], header[5]]);
+	(count != 0).then_some(count)
+}
 
 fn sniff_format(prefix: &[u8]) -> Option<image::ImageFormat> {
 	if prefix.len() >= 12 && &prefix[..4] == b"RIFF" && &prefix[8..12] == b"WEBP" {
@@ -30,6 +53,9 @@ fn sniff_format(prefix: &[u8]) -> Option<image::ImageFormat> {
 	}
 	if prefix.starts_with(b"qoif") {
 		return Some(image::ImageFormat::Qoi);
+	}
+	if ico_entry_count(prefix).is_some() {
+		return Some(image::ImageFormat::Ico);
 	}
 	None
 }
@@ -48,6 +74,11 @@ impl FormatDecoder for Simple {
 		let n = src.read_at(0, &mut prefix)?;
 		let format = sniff_format(&prefix[..n])
 			.ok_or_else(|| ThumbError::Decode("format vanished between sniff and open".into()))?;
+		if ico_entry_count(&prefix[..n]).is_some_and(|count| count > MAX_ICO_ENTRIES) {
+			return Err(ThumbError::Decode(format!(
+				"ICO directory lists more than {MAX_ICO_ENTRIES} entries"
+			)));
+		}
 		// Header-only parse over a borrowed reader; `into_decoder` consumes
 		// its reader with no way back out, so the owned source stays here and
 		// decode_into builds a second decoder over the same bytes.
@@ -59,6 +90,13 @@ impl FormatDecoder for Simple {
 			let orientation = decoder.orientation().map(|o| o.to_exif()).unwrap_or(1);
 			(dims, orientation)
 		};
+		// The `image` crate decodes the entry it ranks best (colour depth,
+		// then area); only that entry's header is checked here.
+		if format == image::ImageFormat::Ico && dims.0.max(dims.1) > MAX_ICO_SIDE {
+			return Err(ThumbError::Decode(format!(
+				"ICO entry is larger than {MAX_ICO_SIDE} px a side"
+			)));
+		}
 		Ok(Box::new(PreparedSimple {
 			src,
 			format,
