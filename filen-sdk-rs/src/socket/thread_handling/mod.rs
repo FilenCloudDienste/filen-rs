@@ -1,6 +1,6 @@
 use std::{borrow::Cow, ops::Deref, sync::Arc, time::Duration};
 
-use filen_types::api::v3::socket::{HandShake, PacketType};
+use filen_types::api::v3::socket::{HandShake, PacketType, SocketEvent};
 use futures::{StreamExt, stream::FuturesOrdered};
 use rsa::PrivateKey;
 use yoke::Yoke;
@@ -438,6 +438,9 @@ where
 	WT: WriterTask<Sender = S>,
 {
 	let (mut receiver, writer) = web_socket.split_into_receiver_and_writer(config.ping_interval);
+	// Before this connection's first announcement: those sent while there was none are lost.
+	// Dropped at the connection's end, however the task ends.
+	let board_connection = config.client.lock_board.connection();
 	// `lockHello` once per connection, after `authSuccess` (`perform_handshake` waited for it).
 	let mut locks = ConnectionLocks::probe(&config.lock_claim, Instant::now(), |frame| {
 		writer.try_queue(frame)
@@ -518,6 +521,11 @@ where
 
 				match super::events::try_parse_message_from_str(message.into_stable_deref()) {
 					Ok(Some(event_yoke)) => {
+						// Ahead of the gate below, which drops what no listener asked for: the
+						// lock board sees every announcement.
+						if let SocketEvent::Lock { inner, lock_message_id } = event_yoke.get() {
+							config.client.lock_board.announced(inner, *lock_message_id);
+						}
 						if listeners.should_decrypt_event(event_yoke.get()) {
 							decryption_futures.push_back(async move {
 								// this performs unnecessary cloning, ideally we would use an async
@@ -562,6 +570,7 @@ where
 	// Published before anything else is torn down: no lock operation may count on this
 	// connection from here on.
 	locks.disconnected();
+	drop(board_connection);
 	// Events that already arrived must survive the teardown: broadcast anything
 	// still decrypting instead of dropping it with the queue — reconnects are
 	// routine (transport errors, liveness) and must not silently lose events.

@@ -38,6 +38,12 @@ use crate::{
 	util::{MaybeSend, MaybeSendSync},
 };
 
+mod board;
+
+pub(crate) use board::LockBoard;
+#[cfg(test)]
+pub(crate) use board::{Holder, OpenLease};
+
 pub(crate) const MAX_SLEEP_TIME_DEFAULT: time::Duration = time::Duration::from_secs(30);
 pub(crate) const ATTEMPTS_DEFAULT: usize = 8640; // 8640
 
@@ -259,7 +265,7 @@ impl std::fmt::Debug for LockRecord {
 /// tasks, drops it unsettled. The release then goes out from a thread of its own, still counted,
 /// so the server does not hold the lock until its lease runs out. On wasm, where a task is not
 /// cancelled that way (`runtime::spawn_local` holds its worker open), it is not sent and stops
-/// counting.
+/// counting. Either way the client's lock board retires its uuid at the drop.
 ///
 /// For a lock request that release is best-effort only. Its task was cancelled with the
 /// request's outcome unknown, and the Acquire may still be on its way: a release that reaches the
@@ -349,6 +355,12 @@ impl OwedRelease {
 impl Drop for OwedRelease {
 	fn drop(&mut self) {
 		if let Some(request) = self.0.take() {
+			// Here, not only once the release goes out: on wasm it never does, and the uuid is let
+			// go all the same.
+			request
+				.client
+				.lock_board
+				.retire(request.uuid, &request.resource);
 			request.send_detached();
 		}
 	}
@@ -356,6 +368,7 @@ impl Drop for OwedRelease {
 
 impl ReleaseRequest {
 	async fn send(&self) {
+		self.client.lock_board.retire(self.uuid, &self.resource);
 		release(&self.client, &self.url, self.uuid, &self.resource, || {
 			self.confirmed.age()
 		})
@@ -548,6 +561,13 @@ impl ResourceLock {
 }
 
 impl SharedLease {
+	/// The lease, registered on its client's [`LockBoard`] as held until it is dropped.
+	fn hold(self) -> Arc<Self> {
+		let lease = Arc::new(self);
+		lease.client.lock_board.hold(&lease);
+		lease
+	}
+
 	fn is_lost(&self) -> bool {
 		!*self.valid.borrow()
 	}
@@ -708,6 +728,7 @@ impl SharedLease {
 impl Drop for SharedLease {
 	// async drop is not supported in Rust, so the release is spawned
 	fn drop(&mut self) {
+		self.client.lock_board.let_go(self.uuid);
 		self.spawn_release();
 	}
 }
@@ -1406,7 +1427,7 @@ impl Client {
 			}
 			Err(e) => return Err(acquisition.failed(e)),
 		};
-		let lease = Arc::new(SharedLease {
+		let lease = SharedLease {
 			uuid,
 			client,
 			resource,
@@ -1417,7 +1438,8 @@ impl Client {
 			#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 			handle: tokio::runtime::Handle::try_current().ok(),
 			record,
-		});
+		}
+		.hold();
 		keep_lock_alive(&lease);
 		Ok(Arc::new(ResourceLock { lease }))
 	}

@@ -34,7 +34,7 @@ use crate::{
 		unauth::UnauthClient,
 	},
 	consts::{FULL_CHUNK_BYTES, gateway_url},
-	sync::lock::{LockListenerSlot, PendingReleases},
+	sync::lock::{LockBoard, LockListenerSlot, PendingReleases},
 	thumbnail::{MAX_THUMBNAIL_SOURCE_BYTES, REMOTE_SOURCE_RESIDENT_BYTES},
 	util::{MaybeSend, MaybeSendSync},
 };
@@ -914,6 +914,9 @@ pub struct AuthClient {
 	/// What the lock requests report the locks they may leave held to (see
 	/// `Client::set_lock_listener`).
 	pub(crate) lock_listener: LockListenerSlot,
+	/// What the socket's lock announcements are checked against: the leases they report, this
+	/// client's held leases, and the uuids it released.
+	pub(crate) lock_board: LockBoard,
 	/// Whether the socket can carry lock operations, as the websocket task publishes it. Builds
 	/// without a socket (`service-worker`) use HTTP for every lock operation.
 	#[cfg(any(
@@ -1241,6 +1244,7 @@ impl AuthClient {
 			batcher: Batcher::default(),
 			pending_lock_releases: PendingReleases::default(),
 			lock_listener: LockListenerSlot::default(),
+			lock_board: LockBoard::default(),
 			#[cfg(any(
 				not(all(target_family = "wasm", target_os = "unknown")),
 				feature = "wasm-full"

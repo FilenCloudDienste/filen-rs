@@ -49,7 +49,7 @@ pub(crate) fn test_lock_on(
 	let uuid = Uuid::new_v4();
 	let resource = "test-resource";
 	ResourceLock {
-		lease: Arc::new(SharedLease {
+		lease: SharedLease {
 			uuid,
 			record: client.lock_listener.record(uuid, resource),
 			client,
@@ -59,7 +59,8 @@ pub(crate) fn test_lock_on(
 			confirming: tokio::sync::Mutex::new(None),
 			confirmations: AtomicU64::new(0),
 			handle,
-		}),
+		}
+		.hold(),
 	}
 }
 

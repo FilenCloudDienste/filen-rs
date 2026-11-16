@@ -112,6 +112,7 @@ mod pipeline {
 			events::DecryptedSocketEvent,
 			writer::{self, Writer},
 		},
+		sync::lock::{Holder, OpenLease},
 	};
 
 	// ----- scripted fake transport -----
@@ -1282,6 +1283,85 @@ mod pipeline {
 		tokio::join!(first_task, driver);
 		assert_eq!(connect_count(), 2);
 		assert_eq!(lock_transport(&client), LockTransport::None);
+	}
+
+	/// Every lock announcement reaches the client's lock board, also one no listener asked for,
+	/// and a connection's end forgets it: the next connection wakes the lock waits instead, as
+	/// announcements may have been lost meanwhile.
+	#[tokio::test(start_paused = true)]
+	async fn a_lock_announcement_no_listener_asked_for_reaches_the_lock_board() {
+		let config = test_config();
+		let client = Arc::clone(&config.client);
+		let connections = vec![
+			FakeConnection::new(handshake_then(vec![
+				ServerAction::Msg(
+					r#"42["lockAcquired",{"resource":"drive-write","uuid":"6b1c2a4e-3f0d-4b8a-9e2f-0c1d2e3f4a5b","leaseId":"lease-1","timestamp":1760270400123,"messageId":4,"lockMessageId":17}]"#
+						.to_string(),
+				),
+				ServerAction::Delayed(Duration::from_secs(2), "3".to_string()),
+				ServerAction::Close,
+			])),
+			// Reconnected after `RECONNECT_DELAY`, at 3 s.
+			FakeConnection::new(handshake_then(vec![ServerAction::Hang])),
+		];
+		drive(connections, config, async |sender| {
+			sleep(Duration::from_secs(1)).await;
+			assert_eq!(
+				client.lock_board.holder("drive-write"),
+				Holder::Lease(OpenLease {
+					holder: Uuid::from_u128(0x6b1c2a4e_3f0d_4b8a_9e2f_0c1d2e3f4a5b),
+					lock_message_id: 17,
+				})
+			);
+			let wakes = client.lock_board.wakes("drive-write");
+			sleep(Duration::from_millis(1_500)).await;
+			assert_eq!(client.lock_board.holder("drive-write"), Holder::Unknown);
+			assert!(!wakes.has_changed().unwrap());
+			sleep(Duration::from_secs(1)).await;
+			assert!(wakes.has_changed().unwrap());
+			assert_eq!(client.lock_board.holder("drive-write"), Holder::Unknown);
+			drop(sender);
+		})
+		.await;
+	}
+
+	/// A websocket task cancelled mid-connection forgets the announced leases as one whose
+	/// connection ended does: with no connection behind them, the holders are unknown.
+	#[tokio::test(start_paused = true)]
+	async fn a_cancelled_websocket_task_forgets_the_announced_leases() {
+		let config = test_config();
+		let client = Arc::clone(&config.client);
+		let (request_sender, request_receiver) = tokio::sync::mpsc::channel(16);
+		prime(vec![FakeConnection::new(handshake_then(vec![
+			ServerAction::Msg(
+				r#"42["lockAcquired",{"resource":"drive-write","uuid":"6b1c2a4e-3f0d-4b8a-9e2f-0c1d2e3f4a5b","leaseId":"lease-1","timestamp":1760270400123,"messageId":4,"lockMessageId":17}]"#
+					.to_string(),
+			),
+			ServerAction::Hang,
+		]))]);
+		let mut task = Box::pin(
+			run_async_websocket_task::<FakeSocket, _, _, _, _, _, _, _, _>(
+				config,
+				request_receiver,
+				Arc::new(NoopCrypter),
+				test_private_key(),
+			),
+		);
+		tokio::select! {
+			() = &mut task => panic!("the task ended while its connection hung"),
+			() = sleep(Duration::from_secs(1)) => {}
+		}
+		assert_eq!(
+			client.lock_board.holder("drive-write"),
+			Holder::Lease(OpenLease {
+				holder: Uuid::from_u128(0x6b1c2a4e_3f0d_4b8a_9e2f_0c1d2e3f4a5b),
+				lock_message_id: 17,
+			})
+		);
+
+		drop(task);
+		assert_eq!(client.lock_board.holder("drive-write"), Holder::Unknown);
+		drop(request_sender);
 	}
 
 	/// Queued frames go out in the order they were queued, after the ping that was due.
