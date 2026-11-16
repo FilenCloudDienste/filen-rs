@@ -35,6 +35,7 @@ use filen_cloud_files::test_support::pattern;
 use serde_json::{Value, json};
 
 use crate::{
+	explorer,
 	report::{Outcome, Report},
 	tree,
 };
@@ -56,6 +57,10 @@ const MARKERS: [&str; 5] = [
 const RECALL_ON_DATA_ACCESS: u64 = 0x40_0000;
 /// How long a request's reply may take: a loaded guest stops for tens of seconds (see `stall`).
 const REPLY: Duration = Duration::from_secs(120);
+/// The name the `fake` mode's root is shown under in File Explorer.
+const DISPLAY_NAME: &str = "Filen (H18)";
+/// An icon file every Windows has, for the `fake` mode's root.
+const ICON: &str = r"C:\Windows\explorer.exe";
 
 /// One line the helper wrote, as the driver logs it.
 fn log_line(log: &Mutex<File>, n: u32, started: Instant, line: &str) {
@@ -452,6 +457,9 @@ fn fake(
 	let base = tree::ROOT.to_string();
 	let auth = session(USER, &base, |n| format!("{}-{n}", MARKERS[n.min(4)]));
 	let args = serve_args(&layout.state, true);
+	// H18-sweep: what a run killed between the OS's unregister and its clean-up left, planted.
+	let gone = root.with_file_name("Orphan");
+	let orphan = explorer::plant_orphan(report, &gone);
 	let mut helper = Helper::spawn(exe, &args, out, 1, log, started)?;
 
 	// H1: hello first.
@@ -464,13 +472,20 @@ fn fake(
 		format!("{hello:?}"),
 	);
 
-	// H2: register; the root exists afterwards, not yet registered with the OS.
-	let reply = helper.request(register(root, &layout.data, USER));
+	// H2: register, naming what File Explorer shows; the root exists afterwards, not yet
+	// registered with the OS.
+	let mut branded = register(root, &layout.data, USER);
+	branded["displayName"] = json!(DISPLAY_NAME);
+	branded["iconPath"] = json!(ICON);
+	branded["iconIndex"] = json!(0);
+	let reply = helper.request(branded);
 	report.check(
 		"H2-register",
 		value(reply.as_ref()) == json!({ "state": "registered", "resumed": false }),
 		format!("{reply:?}"),
 	);
+	// The helper swept the planted entries when it started.
+	explorer::check_unbranded(report, "H18-sweep", &gone, orphan.as_deref(), out)?;
 	let listed = helper.request(json!({ "t": "listRoots" }));
 	report.info("H2-listRoots", format!("{listed:?}"));
 
@@ -478,7 +493,7 @@ fn fake(
 	let reply = helper.request(json!({ "t": "setAuth", "userId": USER, "json": auth }));
 	report.check(
 		"H3-setAuth",
-		value(reply.as_ref()) == json!({ "state": "serving", "adopted": false }),
+		value(reply.as_ref()) == json!({ "state": "serving", "adopted": false, "branded": true }),
 		format!("{reply:?}"),
 	);
 	let watching = helper.event(Duration::from_secs(60), |line| {
@@ -492,6 +507,10 @@ fn fake(
 			&& value(listed.as_ref())["roots"][0]["serving"] == true,
 		format!("{listed:?}"),
 	);
+
+	// H18: what File Explorer is told about the served root, and what its commands do.
+	let clsid = explorer::check_branded(report, "H18", root, USER, DISPLAY_NAME, out)?;
+	explorer::check_commands(report, "H18", &root.join("big.bin"));
 
 	// H13: the registry keys the registration wrote.
 	for (hive, file) in [("HKCU", "reg-hkcu.txt"), ("HKLM", "reg-hklm.txt")] {
@@ -612,7 +631,7 @@ fn fake(
 	let reply = helper.request(json!({ "t": "setAuth", "userId": USER, "json": auth }));
 	report.check(
 		"H7-setAuth-again",
-		value(reply.as_ref()) == json!({ "state": "serving", "adopted": false }),
+		value(reply.as_ref()) == json!({ "state": "serving", "adopted": false, "branded": true }),
 		format!("{reply:?}"),
 	);
 	let never = user("read", &root.join("never.bin"), None);
@@ -719,6 +738,8 @@ fn fake(
 		done["unregistered"] == true,
 		format!("{reply:?}"),
 	);
+	// H18-unbranded: nothing of what File Explorer was told is left.
+	explorer::check_unbranded(report, "H18-unbranded", root, clsid.as_deref(), out)?;
 	let kept_in = done["keptIn"].as_str().map(PathBuf::from);
 	let kept = |name: &str| {
 		done["kept"].as_array().is_some_and(|kept| {

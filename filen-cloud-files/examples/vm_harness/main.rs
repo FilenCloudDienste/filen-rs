@@ -34,6 +34,9 @@
 //!   `<out>\helper.txt`; `fake` drives `<exe> helper` (this harness), `prod` the shipping helper
 //!   with no session.
 //! - `user <op> <path> [text]`: one user-side file operation, for `helper-drive`.
+//! - `explorer gone|machine-gone <root> <out>`: no File Explorer key names `<root>` any more
+//!   (`machine-gone`: none but the user's navigation-pane class), into
+//!   `<out>\explorer.txt`.
 //! - `read-one <path>`, `read-to <path> <offset> <len> <file>` and `keys-load <account> <file>`:
 //!   the second processes `check` and `keys` start.
 //!
@@ -50,6 +53,8 @@ mod after;
 mod check;
 #[cfg(windows)]
 mod events;
+#[cfg(windows)]
+mod explorer;
 #[cfg(windows)]
 mod helper;
 #[cfg(windows)]
@@ -122,6 +127,7 @@ fn main() -> ExitCode {
 			Err(_) => return usage(),
 		},
 		["helper-drive", exe, out, mode] => helper_drive::run(exe.as_ref(), out.as_ref(), mode),
+		["explorer", op, root, out] => explorer::run(op, root.as_ref(), out.as_ref()),
 		["user", op, path] => helper_drive::user_op(op, path.as_ref(), None),
 		["user", op, path, text] => helper_drive::user_op(op, path.as_ref(), Some(text)),
 		["keys-load", account, file] => keys::load_in_child(account, file.as_ref()),
@@ -148,7 +154,7 @@ fn usage() -> ExitCode {
 		"usage: vm_harness provide <root> <out> <secs> | provide-local <root> <out> <secs> | local \
 		 <root> <out> | saves <root> <out> | remote <root> <out> | pins <root> <out> | check <root> <out> | saves-loop <root> <out> <iterations> | quiet <out> | after <root> <out> | \
 		 keys <out> | helper --state-dir <dir> --rearm-secs <n> | helper-drive <exe> <out> \
-		 fake|prod | user <op> <path> [text] | read-one <path> | read-to <path> <offset> <len> <file> | keys-load <account> \
+		 fake|prod | user <op> <path> [text] | explorer gone|machine-gone <root> <out> | read-one <path> | read-to <path> <offset> <len> <file> | keys-load <account> \
 		 <file>"
 	);
 	ExitCode::from(2)
