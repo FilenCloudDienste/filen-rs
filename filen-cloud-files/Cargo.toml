@@ -98,5 +98,11 @@ name = "helper_spawn"
 name = "helper_secrets"
 required-features = ["test-seams"]
 
+# Drives the Windows layer in a Windows VM with no account: a provider serving the fake drive
+# through cfapi, and readers in other processes. An example, so it is never installed or shipped.
+[[example]]
+name = "vm_harness"
+required-features = ["test-seams"]
+
 [lints]
 workspace = true
