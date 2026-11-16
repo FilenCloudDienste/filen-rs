@@ -111,10 +111,15 @@ const EVENT_SHED_CAP: usize = 50_000;
 /// The resync's drive-lock poll cadence (fibonacci ramp capped at 2 s) and how many polls one
 /// acquisition makes before giving up. This is a SINGLE, PATIENT acquisition: the worker drains
 /// events and serves read queries CONCURRENTLY while it waits (see `run_resync`), so it does not
-/// need to give up early for liveness — and a single acquisition keeps ONE lock uuid for its
-/// whole wait, so if the server queues waiters we hold our place instead of going to the back of
-/// the line behind the unbounded FS-op acquirers on every retry (the starvation that froze
-/// resyncs under contention). ~60 polls x 2 s ~= 2 min before falling back to the retry timer.
+/// need to give up early for liveness. The server keeps no queue of waiters: it answers every
+/// Acquire at once, granted or refused, and a freed lock goes to whichever poll reaches it first.
+/// So the resync wins the lock by polling soon after a release, which the 2 s cap keeps short
+/// beside the longer ramps of the unbounded FS-op acquirers, and by not stopping: a resync that
+/// gave up and came back on its retry timer missed the releases in between to them (the
+/// starvation that froze resyncs under contention). ONE lock uuid for the whole wait is what the
+/// lock protocol asks of a poll whose answer was lost: one sent again with the same uuid is
+/// answered as the lease it may have been granted, not as another holder's.
+/// ~60 polls x 2 s ~= 2 min before falling back to the retry timer.
 const RESYNC_LOCK_MAX_SLEEP: Duration = Duration::from_secs(2);
 const RESYNC_LOCK_PATIENT_ATTEMPTS: usize = 60;
 /// After a patient acquisition still times out (or any listing failure), the worker waits this
@@ -2961,11 +2966,12 @@ impl CacheState {
 		// `get_dir` (which also yields the node to materialize so the diff has an anchor row); the account
 		// root uses its already-materialized `roots` row.
 		// PATIENT lock acquisition. A SINGLE acquisition (one lock uuid) that NEVER gives up early:
-		// giving up and re-acquiring with a fresh uuid forfeited our place in the server's waiter
-		// set every retry, so the unbounded FS-op acquirers (which keep ONE uuid and wait) starved
-		// the resync under contention. We drain events and serve read queries CONCURRENTLY while we
-		// wait, so the worker stays live (the reason the acquisition used to be bounded — but
-		// bounding is what lost the race). Draining happens only BEFORE we hold the lock; the
+		// the server queues no waiter and a freed lock goes to the first poll that reaches it, so a
+		// resync that gave up and re-acquired on its retry timer missed the releases in between,
+		// and the unbounded FS-op acquirers (which keep polling) starved it under contention. We
+		// drain events and serve read queries CONCURRENTLY while we wait, so the worker stays live
+		// (the reason the acquisition used to be bounded — but bounding is what lost the race).
+		// Draining happens only BEFORE we hold the lock; the
 		// snapshot id we read once we hold it is >= any drained watermark (remote ids are
 		// monotonic), so committing it never regresses the watermark.
 		tracing::debug!(
