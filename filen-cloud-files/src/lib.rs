@@ -11,6 +11,7 @@
 // Stdout carries the helper's protocol alone.
 #![deny(clippy::print_stdout)]
 
+mod auth;
 mod dispatch;
 mod drive;
 mod failure;
@@ -32,6 +33,12 @@ mod sealed {
 	pub trait Sealed {}
 }
 
+// Exported in tests too, where the Credential Manager store is built on every host.
+pub use auth::{
+	AuthPayload, AuthPayloadError, DataDir, DataDirError, KeyAccount, KeyAccountError,
+	KeyLengthError, KeyStore, KeyStoreError, SEALING_KEY_LEN, SealingKey, SessionError,
+	SessionOwner, SessionStore,
+};
 pub use dispatch::{CacheDispatcher, CloudFilesCallback, DispatchConfig, Dispatcher};
 pub use drive::Drive;
 pub use failure::Failure;

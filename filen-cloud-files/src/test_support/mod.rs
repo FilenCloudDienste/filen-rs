@@ -4,6 +4,7 @@
 mod fake_drive;
 mod fake_local;
 mod fake_os;
+mod memory_key_store;
 
 #[cfg(feature = "test-seams")]
 pub use crate::local::relocate_for_test;
@@ -15,3 +16,4 @@ pub use fake_local::{
 	ProviderAct, UserChange, name, root_path,
 };
 pub use fake_os::{FakeData, FakeEvent, FakeOs, FakePopulate};
+pub use memory_key_store::MemoryKeyStore;
