@@ -23,7 +23,7 @@ use crate::{
 			DELEGATE_FOLDER_CLSID, DESKTOP_NAMESPACE, FOLDER_VALUE_FLAGS, HIDE_DESKTOP_ICONS,
 			MARKER_VALUE, PROPERTY_BAG_ATTRIBUTES, SHELL_FOLDER_ATTRIBUTES, SHELL32,
 			SORT_ORDER_INDEX, SYNC_ROOT_FLAGS, SYNC_ROOT_MANAGER, USER_CLSIDS, UnbrandablePath,
-			brandable_root, icon_resource, namespace_clsid, registry_string, same_root,
+			brandable_root, icon_resource, is_own_key, namespace_clsid, registry_string, same_root,
 			sync_root_key_name,
 		},
 	},
@@ -212,6 +212,120 @@ pub(crate) fn remove_navigation_entry(clsid: &str) -> Result<(), ExplorerError> 
 		delete_tree(Hive::CurrentUser, &format!(r"{USER_CLSIDS}\{clsid}")),
 	];
 	steps.into_iter().collect()
+}
+
+/// Removes what shows in File Explorer roots the OS no longer holds as this provider's, as `live`
+/// says of each root's path, for the Windows user this process runs as: its sync root list entries
+/// of this provider (`Filen!<SID>!*`) and its navigation-pane classes carrying this provider's
+/// marker, each with its entry and hidden icon. Nothing else is touched. How many were removed;
+/// every one is tried, and the first failure is returned.
+pub(crate) fn sweep(live: impl Fn(&Path) -> bool) -> Result<u64, ExplorerError> {
+	sweep_as(&own_sid()?, &live)
+}
+
+/// [`sweep`] for the Windows user `sid`.
+fn sweep_as(sid: &str, live: &dyn Fn(&Path) -> bool) -> Result<u64, ExplorerError> {
+	let mut removed = 0_u64;
+	let mut first = Ok(());
+	let mut note = |result: Result<bool, ExplorerError>| match result {
+		Ok(true) => removed = removed.saturating_add(1),
+		Ok(false) => {}
+		Err(error) => {
+			if first.is_ok() {
+				first = Err(error);
+			}
+		}
+	};
+	match subkeys(Hive::LocalMachine, SYNC_ROOT_MANAGER) {
+		Ok(Some((list, names))) => {
+			for name in names.iter().filter(|name| is_own_key(name, sid)) {
+				note(sweep_entry(&list, name, sid, live));
+			}
+		}
+		Ok(None) => {}
+		Err(error) => note(Err(error)),
+	}
+	match subkeys(Hive::CurrentUser, USER_CLSIDS) {
+		Ok(Some((classes, names))) => {
+			for name in &names {
+				note(sweep_class(&classes, name, live));
+			}
+		}
+		Ok(None) => {}
+		Err(error) => note(Err(error)),
+	}
+	first.map(|()| removed)
+}
+
+/// The key `path` below `hive` and the names of its subkeys; `None` when it is not there.
+fn subkeys(hive: Hive, path: &str) -> Result<Option<(RegKey, Vec<String>)>, ExplorerError> {
+	let Some(key) = ffi::reg_open(hive, &wide(path)?).map_err(io("opening a registry key"))? else {
+		return Ok(None);
+	};
+	let names = ffi::reg_subkeys(&key)
+		.map_err(io("listing registry keys"))?
+		.iter()
+		.map(|name| String::from_utf16_lossy(name))
+		.collect();
+	Ok(Some((key, names)))
+}
+
+/// Removes this provider's sync root list entry `name` below `list` unless the root it names for
+/// the Windows user `sid` is `live`: whether it was removed.
+fn sweep_entry(
+	list: &RegKey,
+	name: &str,
+	sid: &str,
+	live: &dyn Fn(&Path) -> bool,
+) -> Result<bool, ExplorerError> {
+	let root = match ffi::reg_open_subkey(list, &wide(&format!(r"{name}\UserSyncRoots"))?)
+		.map_err(io("opening a registry key"))?
+	{
+		Some(roots) => ffi::reg_query_string(&roots, Some(&wide(sid)?))
+			.map_err(io("reading a registry value"))?,
+		None => None,
+	};
+	if root.is_some_and(|root| live(Path::new(&String::from_utf16_lossy(&root)))) {
+		return Ok(false);
+	}
+	debug!(target: LOG_TARGET, key = %name, "removing a sync root list entry left behind");
+	delete_tree(Hive::LocalMachine, &format!(r"{SYNC_ROOT_MANAGER}\{name}"))?;
+	Ok(true)
+}
+
+/// Removes the navigation-pane class `name` below `classes`, with its entry and hidden icon, when
+/// it carries this provider's marker and the root it names is not `live`: whether it was removed.
+fn sweep_class(
+	classes: &RegKey,
+	name: &str,
+	live: &dyn Fn(&Path) -> bool,
+) -> Result<bool, ExplorerError> {
+	let Some(class) =
+		ffi::reg_open_subkey(classes, &wide(name)?).map_err(io("opening a registry key"))?
+	else {
+		return Ok(false);
+	};
+	let marked = ffi::reg_query_dword(&class, &wide(MARKER_VALUE)?)
+		.map_err(io("reading a registry value"))?
+		== Some(1);
+	if !marked {
+		return Ok(false);
+	}
+	let root = match ffi::reg_open_subkey(&class, &wide(r"Instance\InitPropertyBag")?)
+		.map_err(io("opening a registry key"))?
+	{
+		Some(bag) => ffi::reg_query_string(&bag, Some(&wide("TargetFolderPath")?))
+			.map_err(io("reading a registry value"))?,
+		None => None,
+	};
+	drop(class);
+	if root.is_some_and(|root| live(Path::new(&String::from_utf16_lossy(&root)))) {
+		return Ok(false);
+	}
+	// Any key text, not checked as a class name: quoted.
+	debug!(target: LOG_TARGET, ?name, "removing a navigation-pane entry left behind");
+	remove_navigation_entry(name)?;
+	Ok(true)
 }
 
 /// Removes what [`brand`] wrote for `user`'s root at `root`, within `scope`, for the Windows

@@ -321,6 +321,8 @@ where
 		blocking(move || platform.platform_build()).await
 	};
 	send(&out, OutMessage::Hello(Hello::new(build)));
+	// What a run stopped between the OS's unregister and its own clean-up left in File Explorer.
+	unregister::sweep_branding(&platform).await;
 	// Bounded, so a parent writing faster than the helper answers waits on its pipe.
 	let (tx, mut incoming) = mpsc::channel(INCOMING_LEN);
 	let (stop, stopping) = watch::channel(false);
@@ -650,6 +652,7 @@ impl<P: Platform, O: DriveOpener> Helper<P, O> {
 		if let Some(entry) = self.index.entry(user).cloned() {
 			unregister::finish_stopped(&self.platform, &mut self.index, &entry).await?;
 		}
+		unregister::sweep_branding(&self.platform).await;
 		let existing = {
 			let platform = Arc::clone(&self.platform);
 			let checked = root.clone();

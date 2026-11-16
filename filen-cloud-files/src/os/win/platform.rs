@@ -22,7 +22,9 @@ use crate::{
 	local::LocalEngine,
 	os::{
 		LocalWatcher, WatchSink,
-		cfapi::{SyncRootOwner, SyncRootPathError, WinError, sync_root_owner},
+		cfapi::{
+			SyncRootOwner, SyncRootPathError, WinError, explorer::sweep_keeps, sync_root_owner,
+		},
 		win::{
 			ConnectedRoot, LOG_TARGET, ProviderInfo, RegisteredRoot, SyncRootPath, WinLocalFs,
 			explorer,
@@ -236,6 +238,17 @@ impl Platform for WinPlatform {
 		scope: BrandingScope,
 	) -> Result<(), PlatformError> {
 		explorer::unbrand(root, user, scope).map_err(|e| failed(PlatformOp::Unbrand, e))
+	}
+
+	/// A root whose registration cannot be read counts as live, as does one on a volume not
+	/// present (see [`sweep_keeps`]).
+	fn sweep_branding(&self) -> Result<u64, PlatformError> {
+		explorer::sweep(|root| {
+			sweep_keeps(&self.existing_registration(root), || {
+				root.ancestors().last().is_some_and(Path::exists)
+			})
+		})
+		.map_err(|e| failed(PlatformOp::SweepBranding, e))
 	}
 }
 

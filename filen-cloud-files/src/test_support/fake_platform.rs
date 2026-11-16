@@ -140,6 +140,7 @@ struct PlatformState {
 	branding_calls: Vec<BrandingCall>,
 	fail_brands: u32,
 	fail_unbrands: u32,
+	sweeps: usize,
 	/// Whether the root was connected at each brand, in order.
 	connected_when_branded: Vec<bool>,
 }
@@ -471,6 +472,11 @@ impl FakePlatform {
 		self.state().fail_brands = count;
 	}
 
+	/// How many times what roots no longer registered left was swept.
+	pub fn branding_sweeps(&self) -> usize {
+		self.state().sweeps
+	}
+
 	/// Whether the root was connected when each brand ran, in order.
 	pub fn connected_when_branded(&self) -> Vec<bool> {
 		self.state().connected_when_branded.clone()
@@ -796,6 +802,22 @@ impl Platform for FakePlatform {
 			state.user_branding.remove(root);
 		}
 		Ok(())
+	}
+
+	fn sweep_branding(&self) -> Result<u64, PlatformError> {
+		let mut state = self.state();
+		state.sweeps += 1;
+		let live: HashSet<PathBuf> = state
+			.registered
+			.iter()
+			.filter(|(_, account_root)| account_root.is_some())
+			.map(|(root, _)| root.clone())
+			.collect();
+		let before = state.machine_branding.len() + state.user_branding.len();
+		state.machine_branding.retain(|root, _| live.contains(root));
+		state.user_branding.retain(|root, _| live.contains(root));
+		let after = state.machine_branding.len() + state.user_branding.len();
+		Ok(u64::try_from(before - after).unwrap_or(u64::MAX))
 	}
 }
 

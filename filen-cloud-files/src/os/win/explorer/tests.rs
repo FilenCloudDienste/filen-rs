@@ -278,3 +278,49 @@ fn removing_a_root_removes_its_navigation_entry_past_a_list_entry_it_cannot_read
 	assert!(unbrand_as(&sid, &root, user, BrandingScope::User).is_err());
 	assert!(!present(Hive::CurrentUser, &class(&sid, user)));
 }
+
+#[test]
+fn the_sweep_tries_every_entry_past_one_it_cannot_read() {
+	// Roots of this test alone, so the sweep removes nothing another test wrote.
+	let gone = PathBuf::from(format!(
+		r"C:\filen-explorer-sweep-test-{}\Gone",
+		std::process::id()
+	));
+	let gone_text = gone.to_str().unwrap();
+	let (unreadable, removable) = (test_user(61), test_user(62));
+	let mut cleanup = Cleanup::new(&[OTHER_SID], &[unreadable, removable]);
+	for user in [unreadable, removable] {
+		set_value(
+			Hive::LocalMachine,
+			&format!(r"{}\UserSyncRoots", entry(OTHER_SID, user)),
+			Some(OTHER_SID),
+			gone_text,
+		);
+	}
+	cleanup.lock(
+		Hive::LocalMachine,
+		&format!(r"{}\UserSyncRoots", entry(OTHER_SID, unreadable)),
+	);
+	// Two marked classes, in the order the registry lists them, the first one unreadable.
+	let classes = [
+		format!(r"{USER_CLSIDS}\{{0F11E7E5-0000-8000-8000-{:012}}}", 1),
+		format!(r"{USER_CLSIDS}\{{0F11E7E5-0000-8000-8000-{:012}}}", 2),
+	];
+	for class in &classes {
+		cleanup.extra.push((Hive::CurrentUser, class.clone()));
+		set_dword(&create(Hive::CurrentUser, class).unwrap(), MARKER_VALUE, 1).unwrap();
+		set_value(
+			Hive::CurrentUser,
+			&format!(r"{class}\Instance\InitPropertyBag"),
+			Some("TargetFolderPath"),
+			gone_text,
+		);
+	}
+	cleanup.lock(Hive::CurrentUser, &classes[0]);
+	let prefix = gone.parent().unwrap().to_path_buf();
+	let swept = sweep_as(OTHER_SID, &|root| !root.starts_with(&prefix));
+	assert!(swept.is_err(), "{swept:?}");
+	assert!(present(Hive::LocalMachine, &entry(OTHER_SID, unreadable)));
+	assert!(!present(Hive::LocalMachine, &entry(OTHER_SID, removable)));
+	assert!(!present(Hive::CurrentUser, &classes[1]));
+}

@@ -2164,5 +2164,60 @@ async fn a_failed_removal_of_the_branding_is_reported_left_by_unregister_all() {
 	let done = unregister_all(platform.clone(), &state, true).await;
 	assert!(done.roots[0].outcome.as_ref().unwrap().unregistered);
 	assert!(done.roots[0].branding_left);
+	// What it left, the sweep that ends the run removed.
+	assert_eq!(platform.branding_entries(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_kill_between_the_os_unregister_and_the_clean_up_is_swept_when_the_helper_starts() {
+	let disk = Disk::new();
+	let (platform, drive) = world();
+	let rig = served_with_changes(&disk, &platform, &drive).await;
+	platform.kill_at(KillPoint::After(FakeStep::Unregister));
+	killed_unregister(rig, &platform).await;
+	assert_eq!(platform.registration(&disk.root()), None);
+	assert_eq!(platform.branding_entries(), 2, "left by the killed run");
+	let mut rig = Rig::start(&disk, &platform, &drive);
+	assert_eq!(rig.line().await["t"], "hello");
+	ok(&rig.request(json!({ "t": "getState" })).await);
+	assert_eq!(platform.branding_entries(), 0);
+	ok(&rig.request(unregister_request()).await);
+	reported_once(&disk, &platform, rig).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_sweep_leaves_a_root_the_os_still_holds_shown_and_a_restart_writes_no_second_entry() {
+	let disk = Disk::new();
+	let (platform, drive) = world();
+	let mut rig = Rig::start(&disk, &platform, &drive);
+	ok(&rig.register(&disk).await);
+	ok(&rig.set_auth("42", ACCOUNT_ROOT).await);
+	let (reason, _) = rig.close().await;
+	assert_eq!(reason, ExitReason::InputClosed);
+	let mut rig = Rig::start(&disk, &platform, &drive);
+	ok(&rig.register(&disk).await);
+	// One at each start and one at each register.
+	assert_eq!(platform.branding_sweeps(), 4);
 	assert_eq!(platform.branding_entries(), 2);
+	assert_eq!(
+		platform.machine_branding(&disk.root()),
+		Some(UserId::from(42))
+	);
+}
+
+#[tokio::test(start_paused = true)]
+async fn left_over_entries_of_another_root_are_swept_by_unregister_all_but_not_when_elevated() {
+	let disk = Disk::new();
+	let (platform, _drive) = world();
+	let gone = disk.0.path().join("Gone");
+	platform.leave_branding(&gone, UserId::from(7));
+	let state = StateDir::new(disk.state()).unwrap();
+	platform.set_elevated(true);
+	unregister_all(platform.clone(), &state, true).await;
+	assert_eq!(platform.branding_sweeps(), 0);
+	assert_eq!(platform.branding_entries(), 2);
+	platform.set_elevated(false);
+	unregister_all(platform.clone(), &state, true).await;
+	assert_eq!(platform.branding_sweeps(), 1);
+	assert_eq!(platform.branding_entries(), 0);
 }

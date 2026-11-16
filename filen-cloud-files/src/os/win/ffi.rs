@@ -56,7 +56,7 @@ use windows_sys::{
 				HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, KEY_WRITE, REG_DWORD,
 				REG_EXPAND_SZ, REG_OPTION_NON_VOLATILE, REG_SZ, REG_VALUE_TYPE, RegCloseKey,
 				RegCreateKeyExW, RegDeleteKeyValueW, RegDeleteTreeW, RegEnumKeyExW, RegEnumValueW,
-				RegOpenKeyExW, RegSetValueExW,
+				RegOpenKeyExW, RegQueryValueExW, RegSetValueExW,
 			},
 			Threading::{GetCurrentProcess, OpenProcessToken},
 		},
@@ -499,6 +499,58 @@ fn string_units(bytes: &[u8]) -> Vec<u16> {
 		units.pop();
 	}
 	units
+}
+
+/// The value `name` of `key` (its default value when `None`): `Ok(None)` when it is not there.
+#[allow(unsafe_code)] // Win32 FFI: reads a registry value.
+fn reg_query(
+	key: &RegKey,
+	name: Option<&WideNul>,
+) -> io::Result<Option<(REG_VALUE_TYPE, Vec<u8>)>> {
+	let mut data = vec![0_u8; MAX_STRING_VALUE_BYTES];
+	let mut len =
+		u32::try_from(data.len()).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+	let mut kind: REG_VALUE_TYPE = 0;
+	let name = name.map_or(ptr::null(), |name| name.with_nul().as_ptr());
+	// SAFETY: the key is open for the call; `name` is null or NUL-terminated and borrowed for it;
+	// `data` is an exclusively borrowed buffer of `len` bytes, which the call sets to the bytes
+	// written; `kind` is a live out-param.
+	let code = unsafe {
+		RegQueryValueExW(
+			key.0,
+			name,
+			ptr::null(),
+			&mut kind,
+			data.as_mut_ptr(),
+			&mut len,
+		)
+	};
+	match code {
+		ERROR_SUCCESS => {}
+		ERROR_FILE_NOT_FOUND => return Ok(None),
+		code => return Err(io::Error::from_raw_os_error(code.cast_signed())),
+	}
+	let len = usize::try_from(len).map_err(|_| io::Error::from(io::ErrorKind::InvalidData))?;
+	data.truncate(len);
+	Ok(Some((kind, data)))
+}
+
+/// The string value `name` of `key` (`REG_SZ` or `REG_EXPAND_SZ`, unexpanded), without its NUL;
+/// `None` when it is not there or not a string.
+pub(super) fn reg_query_string(
+	key: &RegKey,
+	name: Option<&WideNul>,
+) -> io::Result<Option<Vec<u16>>> {
+	Ok(reg_query(key, name)?
+		.filter(|(kind, _)| matches!(*kind, REG_SZ | REG_EXPAND_SZ))
+		.map(|(_, bytes)| string_units(&bytes)))
+}
+
+/// The `REG_DWORD` value `name` of `key`; `None` when it is not there or not a `REG_DWORD`.
+pub(super) fn reg_query_dword(key: &RegKey, name: &WideNul) -> io::Result<Option<u32>> {
+	Ok(reg_query(key, Some(name))?
+		.filter(|(kind, _)| *kind == REG_DWORD)
+		.and_then(|(_, bytes)| bytes.first_chunk().copied().map(u32::from_le_bytes)))
 }
 
 /// The longest value name the registry holds, its NUL included.

@@ -27,7 +27,7 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use filen_sdk_rs::fs::name::aside_names;
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::{
 	auth::{DataDir, KeyStore, SessionStore},
@@ -411,6 +411,26 @@ pub(crate) struct EntryUnregistered {
 	/// Whether anything that showed the root in File Explorer may be left: an elevated run leaves
 	/// the per-user navigation-pane entry, and a failed removal leaves what it did not remove.
 	pub(crate) branding_left: bool,
+}
+
+/// Removes what shows in File Explorer roots the OS no longer holds (see
+/// [`Platform::sweep_branding`]), as the user only: an elevated process may hold another account's
+/// hive. A failure is logged; the next run tries again.
+pub(crate) async fn sweep_branding<P: Platform>(platform: &Arc<P>) {
+	if platform.elevated() {
+		return;
+	}
+	let sweeping = Arc::clone(platform);
+	match blocking(move || sweeping.sweep_branding()).await {
+		Ok(0) => {}
+		Ok(removed) => info!(
+			removed,
+			"removed File Explorer entries of roots no longer registered"
+		),
+		Err(error) => {
+			warn!(%error, "removing File Explorer entries of roots no longer registered failed")
+		}
+	}
 }
 
 /// Removes what showed `user`'s root at `root` in File Explorer, once the OS let the root go, as
@@ -1083,6 +1103,7 @@ pub async fn unregister_all<P: Platform>(
 			branding_left,
 		});
 	}
+	sweep_branding(&platform).await;
 	UnregisterAll {
 		roots,
 		index_failed: false,

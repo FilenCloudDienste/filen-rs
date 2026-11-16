@@ -46,6 +46,8 @@ pub enum PlatformOp {
 	Brand,
 	/// Removing what showed a root in File Explorer.
 	Unbrand,
+	/// Removing what shows roots the OS no longer holds in File Explorer.
+	SweepBranding,
 }
 
 impl fmt::Display for PlatformOp {
@@ -62,6 +64,7 @@ impl fmt::Display for PlatformOp {
 			Self::SetAside => "moving the unregistered root aside",
 			Self::Brand => "showing the root in File Explorer",
 			Self::Unbrand => "removing the root from File Explorer",
+			Self::SweepBranding => "removing roots no longer registered from File Explorer",
 		})
 	}
 }
@@ -223,6 +226,12 @@ pub trait Platform: sealed::Sealed + Send + Sync + 'static {
 	/// not there is gone already.
 	fn unbrand(&self, root: &Path, user: UserId, scope: BrandingScope)
 	-> Result<(), PlatformError>;
+
+	/// Removes what [`Platform::brand`] wrote, as the Windows user this process runs as, for every
+	/// root the OS no longer holds as this provider's sync root: what a run stopped between the
+	/// OS's unregister and [`Platform::unbrand`] left. Touches only this provider's entries. How
+	/// many were removed.
+	fn sweep_branding(&self) -> Result<u64, PlatformError>;
 }
 
 /// Opens the drive on a sealed session. Sealed, as [`Drive`] is.

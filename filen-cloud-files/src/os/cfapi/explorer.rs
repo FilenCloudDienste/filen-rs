@@ -5,7 +5,7 @@
 
 use crate::{
 	branding::{Branding, IconPath},
-	helper::UserId,
+	helper::{ExistingRoot, UserId},
 };
 
 /// The machine-wide sync root list, under `HKEY_LOCAL_MACHINE`. Its ACL lets every user create
@@ -59,6 +59,14 @@ pub(crate) const SORT_ORDER_INDEX: u32 = 0x42;
 /// The sync root list entry of `user`'s root for the Windows user `sid`: `Filen!<SID>!<userId>`.
 pub(crate) fn sync_root_key_name(sid: &str, user: UserId) -> String {
 	format!("{KEY_PREFIX}{sid}!{user}")
+}
+
+/// Whether `name` is a sync root list entry this provider wrote for the Windows user `sid`.
+pub(crate) fn is_own_key(name: &str, sid: &str) -> bool {
+	name.strip_prefix(KEY_PREFIX)
+		.and_then(|rest| rest.strip_prefix(sid))
+		.and_then(|rest| rest.strip_prefix('!'))
+		.is_some_and(|user| UserId::parse(user).is_some())
 }
 
 /// The class of `user`'s navigation-pane entry for the Windows user `sid`, as the registry spells
@@ -125,6 +133,21 @@ pub(crate) fn same_root(a: &str, b: &str) -> bool {
 	trim(a) == trim(b)
 }
 
+/// Whether the sweep leaves what shows a root in File Explorer, the OS having reported
+/// `registration` of its path: unless the OS positively holds no registration of this provider's
+/// there. One that cannot be read counts as live, and so does a root on a volume not present
+/// (`volume_present`), whose registration the OS cannot report: nothing is removed on a doubt.
+pub(crate) fn sweep_keeps<E>(
+	registration: &Result<Option<ExistingRoot>, E>,
+	volume_present: impl FnOnce() -> bool,
+) -> bool {
+	match registration {
+		Ok(Some(ExistingRoot { ours: true, .. })) | Err(_) => true,
+		Ok(Some(ExistingRoot { ours: false, .. })) => false,
+		Ok(None) => !volume_present(),
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -137,6 +160,18 @@ mod tests {
 			sync_root_key_name(SID, UserId::from(42)),
 			"Filen!S-1-5-21-3291749577-2867003985-2111167235-1000!42"
 		);
+	}
+
+	#[test]
+	fn only_keys_of_this_provider_and_this_windows_user_are_its_own() {
+		let own = sync_root_key_name(SID, UserId::from(42));
+		assert!(is_own_key(&own, SID));
+		assert!(!is_own_key(&own, "S-1-5-21-1-2-3-1001"));
+		assert!(!is_own_key(&format!("{SID}!42"), SID));
+		assert!(!is_own_key(&format!("FilenProbe!{SID}!42"), SID));
+		assert!(!is_own_key(&format!("Filen!{SID}!"), SID));
+		assert!(!is_own_key(&format!("Filen!{SID}!x"), SID));
+		assert!(!is_own_key(&format!("Filen!{SID}0!42"), SID));
 	}
 
 	#[test]
@@ -179,6 +214,35 @@ mod tests {
 	fn a_root_with_a_percent_sign_is_not_branded() {
 		assert_eq!(brandable_root(r"C:\Users\u\Filen"), Ok(r"C:\Users\u\Filen"));
 		assert_eq!(brandable_root(r"C:\Users\%u%\Filen"), Err(UnbrandablePath));
+	}
+
+	#[test]
+	fn the_sweep_removes_only_what_the_os_positively_holds_no_root_of_this_providers_for() {
+		let ours = ExistingRoot {
+			ours: true,
+			account_root: None,
+		};
+		let other = ExistingRoot {
+			ours: false,
+			account_root: None,
+		};
+		let cases: [(Result<Option<ExistingRoot>, ()>, bool, bool); 7] = [
+			(Ok(Some(ours)), true, true),
+			(Ok(Some(other)), true, false),
+			(Ok(None), true, false),
+			// A root on a volume not mounted has no registration the OS can read.
+			(Ok(None), false, true),
+			(Err(()), true, true),
+			(Err(()), false, true),
+			(Ok(Some(ours)), false, true),
+		];
+		for (registration, volume_present, keeps) in cases {
+			assert_eq!(
+				sweep_keeps(&registration, || volume_present),
+				keeps,
+				"{registration:?} volume present {volume_present}"
+			);
+		}
 	}
 
 	#[test]
