@@ -48,12 +48,13 @@ pub use failure::Failure;
 pub use helper::{
 	ActivityEntry, ActivityKind, CacheOpener, Cleared, DriveOpener, ErrorCode, ExistingRoot,
 	ExitReason, FatalCode, Hello, HelperConfig, InMessage, KeptEarlier, KeptId, KeptItem,
-	KeptItemReason, MAX_LINE_BYTES, MAX_LIST_ENTRIES, MAX_MESSAGE_CHARS, OutMessage,
+	KeptItemReason, MAX_LINE_BYTES, MAX_LIST_ENTRIES, MAX_MESSAGE_CHARS, MIN_BUILD, OutMessage,
 	PROTOCOL_VERSION, ParseError, PhaseName, Platform, PlatformError, PlatformFailed, PlatformOp,
 	Registration, ReplyError, ReplyValue, Request, RequestId, RootDir, RootDirError, RootListing,
-	RootRefusal, SkippedEntry, SkippedPlace, StateDir, StateDirError, StateReport, StatusEvent,
-	UnregisterAll, UnregisterAllEntry, UnregisterReport, UserId, install_stderr_logging,
-	parse_line, run_helper, unregister_all,
+	RootRefusal, SkippedEntry, SkippedPlace, StateDir, StateDirError, StateLock, StateReport,
+	StatusEvent, UnregisterAll, UnregisterAllEntry, UnregisterReport, UserId, fatal,
+	install_stderr_logging, parse_line, run_helper, serve_stdio, unregister_all,
+	unregister_all_stdio,
 };
 pub use identity::{IdentityBlob, IdentityError, MAX_IDENTITY_LEN, PlaceholderIdentity};
 pub use local::{

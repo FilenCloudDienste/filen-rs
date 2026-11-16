@@ -89,5 +89,14 @@ tokio = { version = "1.47.1", features = [
 	"time",
 ] }
 
+# The helper binary as the desktop app spawns it.
+[[test]]
+name = "helper_spawn"
+
+# The helper over in-memory pipes with a global logger, so no thread's log escapes the check.
+[[test]]
+name = "helper_secrets"
+required-features = ["test-seams"]
+
 [lints]
 workspace = true

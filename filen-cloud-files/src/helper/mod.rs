@@ -4,6 +4,7 @@
 mod events;
 mod framing;
 mod index;
+mod launch;
 mod logging;
 mod platform;
 mod protocol;
@@ -15,6 +16,7 @@ mod validate;
 mod watch_keeper;
 
 pub use index::{StateDir, StateDirError};
+pub use launch::{MIN_BUILD, StateLock, fatal, serve_stdio, unregister_all_stdio};
 pub use logging::install_stderr_logging;
 pub use platform::{
 	CacheOpener, DriveOpener, ExistingRoot, Platform, PlatformError, PlatformFailed, PlatformOp,
