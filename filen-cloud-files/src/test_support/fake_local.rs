@@ -176,6 +176,12 @@ struct LocalState {
 	busy_dehydrations: u32,
 	/// What the user does to the file at the path while the provider hashes it.
 	during_hash: Option<(CaseKey, DuringHash)>,
+	/// An ordinary file the user moves over another path while the provider next hashes it through
+	/// a settled handle: from, to.
+	replace_during_settled_hash: Option<(RootPath, RootPath)>,
+	/// An ordinary directory the user renames once the provider opened it to convert it, and before
+	/// it does.
+	during_dir_convert: Option<DuringDirConvert>,
 	/// A pin the user gives an item just as the provider acts on another.
 	pin_during: Option<PinDuring>,
 	/// Where a hydration takes a file's bytes from, by its stable id.
@@ -215,6 +221,10 @@ struct LocalState {
 	fail_copy: HashMap<CaseKey, LocalError>,
 	/// How many more reverts to plain before a test kills the helper.
 	kill_after_reverts: Option<u32>,
+	/// Every read of where an open item is now fails with this, while set.
+	fail_handle_paths: Option<LocalError>,
+	/// Paths at or under which the watcher's events reach no job ([`FakeLocal::swallow_events`]).
+	swallowed: Vec<RootPath>,
 }
 
 /// What the user does to a file while the provider hashes it.
@@ -224,6 +234,16 @@ enum DuringHash {
 	Write(Vec<u8>),
 	/// Gives it this pin of its own.
 	Pin(PinAttr),
+}
+
+/// What the user does to an ordinary directory once the provider opened it to convert it.
+#[derive(Debug, Clone)]
+struct DuringDirConvert {
+	/// The directory, renamed to `to`.
+	from: RootPath,
+	to: RootPath,
+	/// Whether a new ordinary directory is then made at `from`.
+	refill: bool,
 }
 
 /// A pin the user gives the item `target` as the provider acts on the item `on`.
@@ -391,6 +411,17 @@ impl LocalState {
 		self.nodes.values_mut().find(|node| node.id == id)
 	}
 
+	/// The error [`FakeLocal::fail_revert`] set for the path the item `id` is at, if any.
+	fn revert_refused(&self, id: u128) -> Result<(), LocalError> {
+		match self
+			.by_id(id)
+			.and_then(|node| self.fail_revert.get(&node.path.case_key()))
+		{
+			Some(error) => Err(*error),
+			None => Ok(()),
+		}
+	}
+
 	fn by_id(&self, id: u128) -> Option<&Node> {
 		self.nodes.values().find(|node| node.id == id)
 	}
@@ -484,6 +515,28 @@ impl fmt::Debug for Source {
 	}
 }
 
+/// The stable id of the file `placeholder` stands for, if it stands for one.
+fn held_stable(placeholder: &FakePlaceholder) -> Option<Uuid> {
+	match PlaceholderIdentity::decode(&placeholder.identity) {
+		Ok(PlaceholderIdentity::File { stable, .. }) => Some(stable),
+		_ => None,
+	}
+}
+
+/// Fills the file `node`, a placeholder of the file `stable`, with what `source` gives for it, as
+/// a hydration does: only when that is as long as the file, which keeps its bytes otherwise.
+fn fill_from(node: &mut Node, stable: Option<Uuid>, source: Option<Source>) {
+	let size = node.size();
+	let filled = source
+		.zip(stable)
+		.map(|(Source(source), stable)| source(stable));
+	if let (Some(filled), NodeKind::File { bytes, .. }) = (filled, &mut node.kind)
+		&& u64::try_from(filled.len()).ok() == Some(size)
+	{
+		*bytes = filled;
+	}
+}
+
 /// What a user's delete or rename did.
 #[derive(Debug)]
 pub enum UserChange<R> {
@@ -535,6 +588,8 @@ impl FakeLocal {
 			fail_dehydrate: None,
 			busy_dehydrations: 0,
 			during_hash: None,
+			replace_during_settled_hash: None,
+			during_dir_convert: None,
 			pin_during: None,
 			source: None,
 			fail_convert: None,
@@ -555,6 +610,8 @@ impl FakeLocal {
 			fail_revert: HashMap::new(),
 			fail_copy: HashMap::new(),
 			kill_after_reverts: None,
+			fail_handle_paths: None,
+			swallowed: Vec::new(),
 		})))
 	}
 
@@ -690,6 +747,51 @@ impl FakeLocal {
 	/// Makes the user write `bytes` to the file `path` while the provider's next hash of it runs.
 	pub fn edit_during_hash(&self, path: &RootPath, bytes: &[u8]) {
 		self.state().during_hash = Some((path.case_key(), DuringHash::Write(bytes.to_vec())));
+	}
+
+	/// Makes the user move the ordinary file `from` over `to` ([`FakeLocal::user_replace`]) while
+	/// the provider's next hash of it through a settled handle runs: the handle shares deleting, so
+	/// the rename goes through, and the handle follows the file.
+	pub fn replace_during_settled_hash(&self, from: &RootPath, to: &RootPath) {
+		self.state().replace_during_settled_hash = Some((from.clone(), to.clone()));
+	}
+
+	/// Makes the user rename the ordinary directory `from` to `to` ([`FakeLocal::user_rename`]) once
+	/// the provider opened it to convert it and checked it is the directory it expects, and before
+	/// the convert: the handle shares deleting, so the rename goes through, and the handle follows
+	/// the directory.
+	pub fn rename_during_dir_convert(&self, from: &RootPath, to: &RootPath) {
+		self.state().during_dir_convert = Some(DuringDirConvert {
+			from: from.clone(),
+			to: to.clone(),
+			refill: false,
+		});
+	}
+
+	/// As [`FakeLocal::rename_during_dir_convert`], then makes a new ordinary directory at `from`.
+	pub fn replace_during_dir_convert(&self, from: &RootPath, to: &RootPath) {
+		self.state().during_dir_convert = Some(DuringDirConvert {
+			from: from.clone(),
+			to: to.clone(),
+			refill: true,
+		});
+	}
+
+	/// Runs what the user does to the directory `path` once the provider opened it to convert it.
+	fn run_during_dir_convert(&self, path: &RootPath) {
+		let during = self
+			.state()
+			.during_dir_convert
+			.take_if(|during| during.from.case_key() == path.case_key());
+		if let Some(during) = during {
+			assert!(matches!(
+				self.user_rename(&during.from, &during.to),
+				Ok(UserChange::Done)
+			));
+			if during.refill {
+				self.user_mkdir(&during.from);
+			}
+		}
 	}
 
 	/// Makes the user give the file `path` the pin `pin` while the provider's next hash of it runs.
@@ -1201,11 +1303,43 @@ impl FakeLocal {
 	/// [`FakeLocal::lose_watch_events`].
 	pub fn take_watch_events(&self) -> Vec<LocalEvent> {
 		let mut state = self.state();
-		let events = std::mem::take(&mut state.watch);
+		let mut events = std::mem::take(&mut state.watch);
 		if std::mem::take(&mut state.lost_events) {
 			return vec![LocalEvent::Rescan];
 		}
+		let swallowed = |path: &RootPath| {
+			state
+				.swallowed
+				.iter()
+				.any(|under| path.case_key() == under.case_key() || path.starts_with(under))
+		};
+		events.retain(|event| match event {
+			LocalEvent::Created(path)
+			| LocalEvent::Modified(path)
+			| LocalEvent::Removed(path)
+			| LocalEvent::Closed(path) => !swallowed(path),
+			LocalEvent::Renamed { to, .. } => !swallowed(to),
+			LocalEvent::Rescan => true,
+		});
 		events
+	}
+
+	/// Makes every watcher event naming a path at or under `path` (a rename by its target) reach no
+	/// job, until [`FakeLocal::stop_swallowing`]: as when each job such an event brought looked in
+	/// the instant the item there was a placeholder of another item's identity, found it in sync,
+	/// and stopped.
+	pub fn swallow_events(&self, path: &RootPath) {
+		self.state().swallowed.push(path.clone());
+	}
+
+	/// Lets every watcher event through again.
+	pub fn stop_swallowing(&self) {
+		self.state().swallowed.clear();
+	}
+
+	/// Makes every read of where an open item is now fail with `error`, while set.
+	pub fn fail_handle_paths(&self, error: Option<LocalError>) {
+		self.state().fail_handle_paths = error;
 	}
 
 	/// Makes the watcher lose its events: the next take reports a rescan instead.
@@ -1330,6 +1464,16 @@ impl FakeLocal {
 		Ok(())
 	}
 
+	/// Where the item `id` an open handle holds is now: `None` once it is gone, or the error
+	/// [`FakeLocal::fail_handle_paths`] set.
+	fn handle_path(&self, id: u128) -> Result<Option<RootPath>, LocalError> {
+		let state = self.state();
+		if let Some(error) = state.fail_handle_paths {
+			return Err(error);
+		}
+		Ok(state.by_id(id).map(|node| node.path.clone()))
+	}
+
 	fn settled_node<T>(
 		&self,
 		file: &FakeSettled,
@@ -1403,6 +1547,12 @@ impl Drop for FakeSettled {
 			*open -= 1;
 		}
 	}
+}
+
+/// A directory the provider holds open to convert it: it follows the directory through a rename.
+#[derive(Debug)]
+pub struct FakeDir {
+	id: u128,
 }
 
 /// The answer to one fake `NOTIFY_DELETE`.
@@ -1629,6 +1779,8 @@ impl LocalFs for FakeLocal {
 
 	type Settled = FakeSettled;
 
+	type Dir = FakeDir;
+
 	fn inspect(&self, path: &RootPath) -> Result<LocalEntry, LocalError> {
 		let mut state = self.state();
 		*state.inspected.entry(path.case_key()).or_default() += 1;
@@ -1687,6 +1839,20 @@ impl LocalFs for FakeLocal {
 		if state.writers.get(&id).is_some_and(|open| *open > 0) {
 			return Err(LocalError::Busy);
 		}
+		// As measured on Windows: the provider's own open of a placeholder for reading that refuses
+		// writers fetches all of its data the file does not hold before it returns.
+		let source = state.source.clone();
+		if let Some(node) = state.by_id_mut(id)
+			&& let size = node.size()
+			&& let Some(placeholder) = node.placeholder.as_mut()
+			&& placeholder.on_disk < size
+		{
+			placeholder.on_disk = size;
+			let stable = held_stable(placeholder);
+			fill_from(node, stable, source);
+			let path = node.path.clone();
+			state.ops.push(LocalOp::Hydrated(path));
+		}
 		*state.settled.entry(id).or_default() += 1;
 		Ok(FakeSettled {
 			local: self.clone(),
@@ -1714,7 +1880,14 @@ impl LocalFs for FakeLocal {
 		};
 		let hash = *blake3::hash(bytes).as_bytes();
 		if partial {
-			state.ops.push(LocalOp::HashedPartial(path));
+			state.ops.push(LocalOp::HashedPartial(path.clone()));
+		}
+		let replace = state
+			.replace_during_settled_hash
+			.take_if(|(from, _)| from.case_key() == path.case_key());
+		drop(state);
+		if let Some((from, to)) = replace {
+			self.user_replace(&from, &to);
 		}
 		Ok(hash)
 	}
@@ -1771,6 +1944,30 @@ impl LocalFs for FakeLocal {
 		Ok(())
 	}
 
+	/// Fails as [`FakeLocal::fail_revert`] makes a revert of the path the file is at fail.
+	fn revert_settled(&self, file: &FakeSettled) -> Result<(), LocalError> {
+		let mut state = self.state();
+		state.revert_refused(file.id)?;
+		let node = state.by_id_mut(file.id).ok_or(LocalError::NotFound)?;
+		if node
+			.placeholder
+			.as_ref()
+			.is_none_or(|placeholder| placeholder.on_disk < node.size())
+		{
+			// cfapi refuses an ordinary file, and a file not all on disk.
+			return Err(LocalError::Os(crate::os::OsError::Rejected { code: -1 }));
+		}
+		node.placeholder = None;
+		let path = node.path.clone();
+		state.ops.push(LocalOp::Reverted(path));
+		Ok(())
+	}
+
+	/// The file's path by its id, which follows it through a rename; `None` once it is gone.
+	fn settled_path(&self, file: &FakeSettled) -> Result<Option<RootPath>, LocalError> {
+		self.handle_path(file.id)
+	}
+
 	fn update_file(
 		&self,
 		file: &FakeSettled,
@@ -1801,6 +1998,41 @@ impl LocalFs for FakeLocal {
 		Ok(())
 	}
 
+	fn mark_partial_in_sync(
+		&self,
+		path: &RootPath,
+		expect: LocalFileId,
+		identity: PlaceholderIdentity,
+	) -> Result<(), LocalError> {
+		let mut state = self.state();
+		if let Some(error) = state.fail_update.take().or(state.fail_file_updates) {
+			return Err(error);
+		}
+		let lose = state.lose_in_sync_marks;
+		let node = state
+			.get_mut(path)
+			.filter(|node| node.id == expect.get() && matches!(node.kind, NodeKind::File { .. }))
+			.ok_or(LocalError::NotFound)?;
+		let size = node.size();
+		let placeholder = node.placeholder.as_mut().ok_or(LocalError::NotFound)?;
+		if placeholder.identity != identity.encode() {
+			return Err(LocalError::NotFound);
+		}
+		if placeholder.modified_bytes > 0 || placeholder.on_disk >= size {
+			return Err(LocalError::Modified);
+		}
+		placeholder.in_sync = !lose;
+		state.ops.push(LocalOp::Updated {
+			path: path.clone(),
+			identity,
+			in_sync: true,
+		});
+		if lose {
+			state.watch.push(LocalEvent::Modified(path.clone()));
+		}
+		Ok(())
+	}
+
 	fn retag_unsynced(
 		&self,
 		path: &RootPath,
@@ -1825,10 +2057,20 @@ impl LocalFs for FakeLocal {
 		Ok(())
 	}
 
+	/// What the user does once the provider opened the directory to convert it
+	/// ([`FakeLocal::rename_during_dir_convert`]) runs as this returns.
+	fn open_dir(&self, path: &RootPath, expect: LocalFileId) -> Result<FakeDir, LocalError> {
+		self.state()
+			.get(path)
+			.filter(|node| node.id == expect.get() && matches!(node.kind, NodeKind::Dir { .. }))
+			.ok_or(LocalError::NotFound)?;
+		self.run_during_dir_convert(path);
+		Ok(FakeDir { id: expect.get() })
+	}
+
 	fn convert_dir(
 		&self,
-		path: &RootPath,
-		expect: LocalFileId,
+		dir: &FakeDir,
 		identity: PlaceholderIdentity,
 		populated: bool,
 	) -> Result<(), LocalError> {
@@ -1836,17 +2078,56 @@ impl LocalFs for FakeLocal {
 		if let Some(error) = state.fail_convert.take() {
 			return Err(error);
 		}
-		let node = state
-			.get_mut(path)
-			.filter(|node| node.id == expect.get())
-			.ok_or(LocalError::NotFound)?;
+		let node = state.by_id_mut(dir.id).ok_or(LocalError::NotFound)?;
 		node.placeholder = Some(FakePlaceholder::new(identity, 0, populated));
+		let path = node.path.clone();
 		state.ops.push(LocalOp::ConvertedDir {
 			path: path.clone(),
 			identity,
 			populated,
 		});
-		state.watch.push(LocalEvent::Modified(path.clone()));
+		state.watch.push(LocalEvent::Modified(path));
+		Ok(())
+	}
+
+	/// Fails as [`FakeLocal::fail_revert`] makes a revert of the path the directory is at fail.
+	fn revert_dir(&self, dir: &FakeDir) -> Result<(), LocalError> {
+		let mut state = self.state();
+		state.revert_refused(dir.id)?;
+		let node = state.by_id_mut(dir.id).ok_or(LocalError::NotFound)?;
+		if node.placeholder.take().is_none() {
+			// cfapi refuses an ordinary directory.
+			return Err(LocalError::Os(crate::os::OsError::Rejected { code: -1 }));
+		}
+		let path = node.path.clone();
+		state.ops.push(LocalOp::Reverted(path));
+		Ok(())
+	}
+
+	/// The directory's path by its id, as for a file.
+	fn dir_path(&self, dir: &FakeDir) -> Result<Option<RootPath>, LocalError> {
+		self.handle_path(dir.id)
+	}
+
+	fn update_open_dir(
+		&self,
+		dir: &FakeDir,
+		identity: PlaceholderIdentity,
+	) -> Result<(), LocalError> {
+		let mut state = self.state();
+		if let Some(error) = state.fail_update.take() {
+			return Err(error);
+		}
+		let node = state.by_id_mut(dir.id).ok_or(LocalError::NotFound)?;
+		let placeholder = node.placeholder.as_mut().ok_or(LocalError::NotFound)?;
+		placeholder.identity = identity.encode();
+		placeholder.in_sync = true;
+		let path = node.path.clone();
+		state.ops.push(LocalOp::DirUpdated {
+			path: path.clone(),
+			identity,
+		});
+		state.watch.push(LocalEvent::Modified(path));
 		Ok(())
 	}
 
@@ -1877,20 +2158,10 @@ impl LocalFs for FakeLocal {
 			.ok_or(LocalError::NotFound)?;
 		let size = node.size();
 		let placeholder = node.placeholder.as_mut().ok_or(LocalError::NotFound)?;
-		let stable = match PlaceholderIdentity::decode(&placeholder.identity) {
-			Ok(PlaceholderIdentity::File { stable, .. }) => Some(stable),
-			_ => None,
-		};
+		let stable = held_stable(placeholder);
 		if !stall {
 			placeholder.on_disk = size;
-			let filled = source
-				.zip(stable)
-				.map(|(Source(source), stable)| source(stable));
-			if let (Some(filled), NodeKind::File { bytes, .. }) = (filled, &mut node.kind)
-				&& u64::try_from(filled.len()).ok() == Some(size)
-			{
-				*bytes = filled;
-			}
+			fill_from(node, stable, source);
 		}
 		state.ops.push(LocalOp::Hydrated(path.clone()));
 		state.watch.push(LocalEvent::Modified(path.clone()));

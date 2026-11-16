@@ -16,6 +16,7 @@ mod drive;
 mod failure;
 mod hydrate;
 mod identity;
+mod local;
 mod log_safe;
 mod names;
 mod os;
@@ -35,6 +36,10 @@ pub use dispatch::{CacheDispatcher, CloudFilesCallback, DispatchConfig, Dispatch
 pub use drive::Drive;
 pub use failure::Failure;
 pub use identity::{IdentityBlob, IdentityError, MAX_IDENTITY_LEN, PlaceholderIdentity};
+pub use local::{
+	CacheLocalEngine, ConflictKind, KeptReason, LocalConfig, LocalEngine, LocalReport, LocalSkip,
+	RemoteApplied, RemoteHints, UndoneOp, VetoedOp,
+};
 pub use names::{NameRejection, PlaceholderName};
 // Exported in tests too, where `os::cfapi` is built on every host.
 #[cfg(any(windows, test))]

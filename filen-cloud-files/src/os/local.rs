@@ -265,6 +265,11 @@ pub trait LocalFs: sealed::Sealed + Send + Sync + 'static {
 	/// no write slips between the two.
 	type Settled: Send + 'static;
 
+	/// A directory opened for writing its attributes, shared with every other handle: what the core
+	/// converts a directory through. A rename of the directory goes through while it is open, and
+	/// the handle follows it.
+	type Dir: Send + 'static;
+
 	/// What is at `path`, read without opening the item's data, so a placeholder is not hydrated.
 	fn inspect(&self, path: &RootPath) -> Result<LocalEntry, LocalError>;
 
@@ -274,7 +279,8 @@ pub trait LocalFs: sealed::Sealed + Send + Sync + 'static {
 	-> Result<Vec<Result<RootPath, RootPathError>>, LocalError>;
 
 	/// Opens the file `path` as a [`LocalFs::Settled`]: [`LocalError::Busy`] while any other
-	/// handle has it open for writing.
+	/// handle has it open for writing. A placeholder not all on disk is fetched whole by the open
+	/// itself (measured on Windows), so this is for a file whose bytes the caller reads or holds.
 	fn open_settled(&self, path: &RootPath) -> Result<Self::Settled, LocalError>;
 
 	/// The id and stamp of the file `file` holds.
@@ -295,6 +301,15 @@ pub trait LocalFs: sealed::Sealed + Send + Sync + 'static {
 		in_sync: bool,
 	) -> Result<(), LocalError>;
 
+	/// Makes the placeholder `file`, all its data on disk, an ordinary file again, its data left as
+	/// it is: takes back a convert that a rename of the file, then still ordinary and announced by
+	/// no callback, overtook.
+	fn revert_settled(&self, file: &Self::Settled) -> Result<(), LocalError>;
+
+	/// Where the file `file` is now, read through the handle, which follows the file through a
+	/// rename: `Ok(None)` once it left the sync root.
+	fn settled_path(&self, file: &Self::Settled) -> Result<Option<RootPath>, LocalError>;
+
 	/// Gives the placeholder `file` the identity `identity`, marked in sync when `in_sync` and not
 	/// in sync otherwise.
 	fn update_file(
@@ -302,6 +317,21 @@ pub trait LocalFs: sealed::Sealed + Send + Sync + 'static {
 		file: &Self::Settled,
 		identity: PlaceholderIdentity,
 		in_sync: bool,
+	) -> Result<(), LocalError>;
+
+	/// Marks the file placeholder at `path` in sync again, if it is still the item `expect` holding
+	/// `identity`, not all on disk and with no byte written since it was last in sync: only its name
+	/// or attributes changed, as a write hydrates the whole file first. Its size and times stay as
+	/// the platform holds them, and its data is neither read nor fetched. Checked through the handle
+	/// it is marked through, before the mark and after it: [`LocalError::Modified`] once it is all
+	/// on disk or holds a written byte, left not in sync when it came all on disk during the mark,
+	/// as a write the mark hid would have; [`LocalError::NotFound`] when another item or identity is
+	/// there.
+	fn mark_partial_in_sync(
+		&self,
+		path: &RootPath,
+		expect: LocalFileId,
+		identity: PlaceholderIdentity,
 	) -> Result<(), LocalError>;
 
 	/// Gives the placeholder at `path` the identity `identity` and marks it not in sync, whatever
@@ -313,15 +343,33 @@ pub trait LocalFs: sealed::Sealed + Send + Sync + 'static {
 		identity: PlaceholderIdentity,
 	) -> Result<(), LocalError>;
 
-	/// Makes the ordinary directory at `path`, if still the item `expect`, the placeholder
-	/// `identity`, in sync. Unless `populated`, the platform asks the provider for its children
-	/// the next time it is listed.
+	/// Opens the directory at `path`, if still the item `expect`, as a [`LocalFs::Dir`].
+	fn open_dir(&self, path: &RootPath, expect: LocalFileId) -> Result<Self::Dir, LocalError>;
+
+	/// Makes the ordinary directory `dir` the placeholder `identity`, in sync. Unless `populated`,
+	/// the platform asks the provider for its children the next time it is listed.
 	fn convert_dir(
 		&self,
-		path: &RootPath,
-		expect: LocalFileId,
+		dir: &Self::Dir,
 		identity: PlaceholderIdentity,
 		populated: bool,
+	) -> Result<(), LocalError>;
+
+	/// Makes the directory placeholder `dir` an ordinary directory again, what it holds left as it
+	/// is: takes back a convert that a rename of the directory, then still ordinary and announced by
+	/// no callback, overtook.
+	fn revert_dir(&self, dir: &Self::Dir) -> Result<(), LocalError>;
+
+	/// Where the directory `dir` is now, read through the handle as [`LocalFs::settled_path`] reads
+	/// a file's.
+	fn dir_path(&self, dir: &Self::Dir) -> Result<Option<RootPath>, LocalError>;
+
+	/// Gives the directory placeholder `dir` the identity `identity` and marks it in sync, as
+	/// [`LocalFs::update_dir`] does through a handle of its own.
+	fn update_open_dir(
+		&self,
+		dir: &Self::Dir,
+		identity: PlaceholderIdentity,
 	) -> Result<(), LocalError>;
 
 	/// Marks the directory placeholder at `path`, if still the item `expect`, in sync.

@@ -1,12 +1,49 @@
 //! What the helper's INFO, WARN and ERROR lines show of the user's items. The helper logs at INFO
 //! by default and the desktop app keeps what it logs in files, so those lines never carry a file
-//! or folder name: they name an item by its ids. The sync root's own location and the helper's
-//! state and data directories are not the user's items: lines about them name them as they are.
+//! or folder name: they name an item by its ids, and one known only by its path by a [`Tag`]. The
+//! path itself is logged at DEBUG, beside its tag, so a debug log ties each tag to its path. The
+//! sync root's own location and the helper's state and data directories are not the user's items:
+//! lines about them name them as they are.
 
-use std::fmt;
+use std::{
+	fmt,
+	hash::{BuildHasher, Hash, RandomState},
+	sync::OnceLock,
+};
 
 use filen_mobile_native_cache::CacheError;
 use tracing::debug;
+
+use crate::root_path::RootPath;
+
+/// Keys every tag, anew each run, so a tag names nothing outside the run.
+static TAG_KEY: OnceLock<RandomState> = OnceLock::new();
+
+/// An item's tag in the log: 32 bits of a hash keyed anew each run. Two lines of one run about one
+/// item carry one tag; nothing outside the run maps it back to what was hashed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Tag(u64);
+
+impl Tag {
+	/// The tag of `value`: an item's id, or its path.
+	pub(crate) fn of(value: &(impl Hash + ?Sized)) -> Self {
+		Self(TAG_KEY.get_or_init(RandomState::new).hash_one(value) & 0xffff_ffff)
+	}
+}
+
+impl fmt::Display for Tag {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		write!(f, "{:08x}", self.0)
+	}
+}
+
+/// The tag a line at INFO or WARN names the item at `path` by, after logging the path with it at
+/// DEBUG. The tag is of the path's case key, so every spelling of one NTFS item shares it.
+pub(crate) fn path_tag(path: &RootPath) -> Tag {
+	let tag = Tag::of(&path.case_key());
+	debug!(item = %tag, %path, "an item's path");
+	tag
+}
 
 /// An error a line at INFO or WARN shows. The cache's text may quote a name it or the server put
 /// in it, so an error the cache made shows its kind alone ([`ErrorText::Cache`]), after its text

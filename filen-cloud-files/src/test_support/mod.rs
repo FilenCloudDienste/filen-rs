@@ -5,6 +5,8 @@ mod fake_drive;
 mod fake_local;
 mod fake_os;
 
+#[cfg(feature = "test-seams")]
+pub use crate::local::relocate_for_test;
 #[cfg(test)]
 pub(crate) use fake_drive::place_files;
 pub use fake_drive::{DriveCall, DriveOp, FakeDrive, TIMESTAMP_MILLIS, ffi_dir, ffi_file, pattern};
