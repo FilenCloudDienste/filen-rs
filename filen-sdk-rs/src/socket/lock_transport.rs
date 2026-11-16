@@ -22,7 +22,7 @@ use tokio::time::{Instant, timeout};
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 use wasmtimer::{std::Instant, tokio::timeout};
 
-use crate::sync::lock::LockPayload;
+use crate::sync::lock::{LeaseTermsSlot, LockPayload};
 
 use super::{
 	acks::{Ack, AckArgs, PendingAcks, Settled},
@@ -49,7 +49,8 @@ pub(crate) enum LockTransport {
 	/// Connection `generation` is authenticated and waits for the `lockHello` ack.
 	Probing { generation: u64 },
 	/// Connection `generation` speaks socket lock protocol `version`, with leases of `ttl` as
-	/// the server announced it (not clamped), and sends the lock operations handed to `commands`.
+	/// the server announced it (not clamped: the slot's [`LeaseTermsSlot`] is what clamps it),
+	/// and sends the lock operations handed to `commands`.
 	Socket {
 		generation: u64,
 		version: u64,
@@ -80,6 +81,9 @@ impl LockTransport {
 /// last strong request sender was dropped while it still had requests to serve, or it is
 /// draining its teardown), and whatever it publishes from then on would describe a connection
 /// that no longer carries anything.
+///
+/// The lease length a connection of the latest claim announces tightens the client's
+/// [`LeaseTermsSlot`], which outlives the connection.
 #[derive(Default)]
 pub(crate) struct LockTransportSlot {
 	// Shared with the claims: each one lives in a spawned task (reason: a `'static` boundary).
@@ -93,19 +97,35 @@ struct SlotState {
 	/// The count of connections so far. Connections are numbered across websocket tasks, so a
 	/// task started after another never reuses a generation.
 	generations: AtomicU64,
+	/// What the lease lengths the connections announce tighten.
+	terms: LeaseTermsSlot,
 }
 
-impl Default for SlotState {
-	fn default() -> Self {
+impl SlotState {
+	fn new(terms: LeaseTermsSlot) -> Self {
 		Self {
 			current: watch::Sender::new(LockTransport::None),
 			claims: AtomicU64::new(0),
 			generations: AtomicU64::new(0),
+			terms,
 		}
 	}
 }
 
+impl Default for SlotState {
+	fn default() -> Self {
+		Self::new(LeaseTermsSlot::default())
+	}
+}
+
 impl LockTransportSlot {
+	/// A slot whose connections' announced lease lengths tighten `terms`.
+	pub(crate) fn observing(terms: LeaseTermsSlot) -> Self {
+		Self {
+			shared: Arc::new(SlotState::new(terms)),
+		}
+	}
+
 	/// Claims the slot for a websocket task about to be spawned, publishing that it connects:
 	/// from here on nothing a task claimed earlier publishes is heard.
 	pub(super) fn claim(&self) -> LockTransportClaim {
@@ -238,6 +258,14 @@ impl LockTransportClaim {
 		});
 	}
 
+	/// A connection announced leases of `ttl`, which tightens the slot's [`LeaseTermsSlot`]
+	/// while no later task claimed the slot.
+	fn observe_lease(&self, ttl: Duration) {
+		if self.slot.claims.load(Ordering::Acquire) == self.number {
+			self.slot.terms.observe(ttl);
+		}
+	}
+
 	fn next_generation(&self) -> u64 {
 		self.slot.generations.fetch_add(1, Ordering::Relaxed) + 1
 	}
@@ -353,10 +381,12 @@ impl<'a> ConnectionLocks<'a> {
 		);
 		let (commands, receiver) = LockCommands::channel();
 		self.commands = Some(receiver);
+		let ttl = Duration::from_secs(hello.ttl_seconds);
+		self.claim.observe_lease(ttl);
 		self.claim.publish(LockTransport::Socket {
 			generation: self.generation,
 			version: hello.version,
-			ttl: Duration::from_secs(hello.ttl_seconds),
+			ttl,
 			commands,
 		});
 	}
@@ -762,6 +792,30 @@ mod tests {
 		assert_eq!(current(&slot), Seen::Connecting);
 		drop(successor);
 		assert_eq!(current(&slot), Seen::None);
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn the_lease_length_the_latest_connection_announces_tightens_the_terms() {
+		let terms = LeaseTermsSlot::default();
+		// a second handle on the terms, which the test reads
+		let slot = LockTransportSlot::observing(terms.clone());
+		let ending = slot.claim();
+		let (mut first, _) = probed(&ending);
+		answer(&mut first, r#"430[{"version":2,"ttlSeconds":30}]"#);
+		assert_eq!(terms.current().ttl(), Duration::from_secs(30));
+
+		// A superseded task's connection is not heard.
+		let successor = slot.claim();
+		let (mut late, _) = probed(&ending);
+		answer(&mut late, r#"430[{"version":2,"ttlSeconds":20}]"#);
+		assert_eq!(terms.current().ttl(), Duration::from_secs(30));
+
+		// A longer lease does not loosen them, nor does the connection's end.
+		let (mut second, _) = probed(&successor);
+		answer(&mut second, r#"430[{"version":2,"ttlSeconds":60}]"#);
+		assert_eq!(terms.current().ttl(), Duration::from_secs(30));
+		second.disconnected();
+		assert_eq!(terms.current().ttl(), Duration::from_secs(30));
 	}
 
 	/// A connection whose probe found socket locks, and the commands it published.

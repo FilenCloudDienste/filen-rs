@@ -30,21 +30,26 @@ fn the_backoff_ramp_never_sleeps_longer_than_its_ceiling() {
 
 #[test]
 fn refresh_delay_saturates_when_first_poll_is_late() {
+	let terms = LeaseTerms::DEFAULT;
 	assert_eq!(
-		refresh_delay_after(LOCK_REFRESH_INTERVAL + Duration::from_secs(1)),
+		terms.refresh_delay_after(LOCK_REFRESH_INTERVAL + Duration::from_secs(1)),
 		Duration::ZERO
 	);
 	assert_eq!(
-		refresh_delay_after(Duration::from_secs(u64::MAX)),
+		terms.refresh_delay_after(Duration::from_secs(u64::MAX)),
 		Duration::ZERO
 	);
 }
 
 #[test]
 fn refresh_delay_subtracts_elapsed_time() {
-	assert_eq!(refresh_delay_after(Duration::ZERO), LOCK_REFRESH_INTERVAL);
+	let terms = LeaseTerms::DEFAULT;
 	assert_eq!(
-		refresh_delay_after(Duration::from_secs(5)),
+		terms.refresh_delay_after(Duration::ZERO),
+		LOCK_REFRESH_INTERVAL
+	);
+	assert_eq!(
+		terms.refresh_delay_after(Duration::from_secs(5)),
 		LOCK_REFRESH_INTERVAL - Duration::from_secs(5)
 	);
 }
@@ -918,6 +923,7 @@ async fn lock_drop_ends_refresh_loop_silently() {
 		&confirmed_at(begin),
 		&held(),
 		&Suspicion::default(),
+		&LeaseTermsSlot::default(),
 	)
 	.await;
 	assert_eq!(exit, LoopExit::Dropped);
@@ -934,6 +940,7 @@ async fn server_refusal_is_authoritative_loss() {
 		&confirmed_at(begin),
 		&held(),
 		&Suspicion::default(),
+		&LeaseTermsSlot::default(),
 	)
 	.await;
 	assert_eq!(exit, LoopExit::Lost);
@@ -950,6 +957,7 @@ async fn transient_refresh_error_retries_and_recovers() {
 		&confirmed,
 		&held(),
 		&Suspicion::default(),
+		&LeaseTermsSlot::default(),
 	)
 	.await;
 	assert_eq!(exit, LoopExit::Dropped);
@@ -970,6 +978,7 @@ async fn failing_refreshes_are_retried_until_the_lease_lapses() {
 		&confirmed_at(begin),
 		&held(),
 		&Suspicion::default(),
+		&LeaseTermsSlot::default(),
 	)
 	.await;
 	assert_eq!(exit, LoopExit::Lost);
@@ -985,6 +994,7 @@ async fn hung_refresh_is_cut_off_when_the_lease_lapses() {
 		&confirmed_at(begin),
 		&held(),
 		&Suspicion::default(),
+		&LeaseTermsSlot::default(),
 	)
 	.await;
 	assert_eq!(exit, LoopExit::Lost);
@@ -1003,6 +1013,7 @@ async fn a_refresh_late_past_the_budget_asks_the_server_before_any_loss() {
 		&confirmed_at(begin),
 		&held(),
 		&Suspicion::default(),
+		&LeaseTermsSlot::default(),
 	)
 	.await;
 	assert_eq!(exit, LoopExit::Dropped);
@@ -1021,6 +1032,7 @@ async fn a_suspend_past_the_ttl_is_loss_by_the_wall_clock() {
 		&confirmed,
 		&held(),
 		&Suspicion::default(),
+		&LeaseTermsSlot::default(),
 	)
 	.await;
 	assert_eq!(exit, LoopExit::Lost);
@@ -1032,12 +1044,14 @@ async fn a_suspend_while_waiting_is_refreshed_after_at_once() {
 	let begin = Instant::now();
 	let (confirmed, valid) = (confirmed_at(begin), held());
 	let suspicion = Suspicion::default();
+	let terms = LeaseTermsSlot::default();
 	let (exit, ()) = tokio::join!(
 		refresh_loop(
 			scripted_refresh(&[Step::Confirm, Step::Drop]),
 			&confirmed,
 			&valid,
 			&suspicion,
+			&terms,
 		),
 		async {
 			sleep(Duration::from_millis(2500)).await;
@@ -1060,6 +1074,7 @@ async fn a_lock_lost_elsewhere_is_refreshed_no_more() {
 	let begin = Instant::now();
 	let (confirmed, valid) = (confirmed_at(begin), held());
 	let suspicion = Suspicion::default();
+	let terms = LeaseTermsSlot::default();
 	let (exit, ()) = tokio::join!(
 		// one refresh is scripted: a second would panic
 		refresh_loop(
@@ -1067,6 +1082,7 @@ async fn a_lock_lost_elsewhere_is_refreshed_no_more() {
 			&confirmed,
 			&valid,
 			&suspicion,
+			&terms,
 		),
 		async {
 			sleep(Duration::from_millis(20_500)).await;
@@ -1085,12 +1101,14 @@ async fn a_refresh_answered_after_the_lock_was_lost_does_not_confirm_it() {
 	let confirmed = confirmed_at(begin);
 	let valid = held();
 	let suspicion = Suspicion::default();
+	let terms = LeaseTermsSlot::default();
 	let (exit, ()) = tokio::join!(
 		refresh_loop(
 			scripted_refresh(&[Step::SlowConfirm(5)]),
 			&confirmed,
 			&valid,
 			&suspicion,
+			&terms,
 		),
 		async {
 			sleep(Duration::from_secs(17)).await;
@@ -1108,12 +1126,14 @@ async fn a_refresh_answered_after_the_lock_was_lost_does_not_confirm_it() {
 async fn a_suspicion_is_refreshed_at_once_and_a_refusal_loses_the_lock() {
 	let begin = Instant::now();
 	let (confirmed, valid, suspicion) = (confirmed_at(begin), held(), Suspicion::default());
+	let terms = LeaseTermsSlot::default();
 	let (exit, ()) = tokio::join!(
 		refresh_loop(
 			scripted_refresh(&[Step::Refuse]),
 			&confirmed,
 			&valid,
 			&suspicion,
+			&terms,
 		),
 		async {
 			sleep(Duration::from_millis(5_500)).await;
@@ -1130,12 +1150,14 @@ async fn a_suspicion_is_refreshed_at_once_and_a_refusal_loses_the_lock() {
 async fn a_confirmed_refresh_answers_the_suspicion_raised_before_it() {
 	let begin = Instant::now();
 	let (confirmed, valid, suspicion) = (confirmed_at(begin), held(), Suspicion::default());
+	let terms = LeaseTermsSlot::default();
 	let (exit, ()) = tokio::join!(
 		refresh_loop(
 			scripted_refresh(&[Step::Confirm, Step::Drop]),
 			&confirmed,
 			&valid,
 			&suspicion,
+			&terms,
 		),
 		async {
 			sleep(Duration::from_secs(5)).await;
@@ -1157,12 +1179,14 @@ async fn a_confirmed_refresh_answers_the_suspicion_raised_before_it() {
 async fn a_suspicion_raised_during_a_refresh_is_refreshed_again() {
 	let begin = Instant::now();
 	let (confirmed, valid, suspicion) = (confirmed_at(begin), held(), Suspicion::default());
+	let terms = LeaseTermsSlot::default();
 	let (exit, ()) = tokio::join!(
 		refresh_loop(
 			scripted_refresh(&[Step::SlowConfirm(2), Step::Confirm, Step::Drop]),
 			&confirmed,
 			&valid,
 			&suspicion,
+			&terms,
 		),
 		async {
 			sleep(Duration::from_secs(16)).await;
@@ -1186,6 +1210,7 @@ async fn slow_confirm_keeps_cadence_anchored_to_send_time() {
 		&confirmed_at(begin),
 		&held(),
 		&Suspicion::default(),
+		&LeaseTermsSlot::default(),
 	)
 	.await;
 	assert_eq!(exit, LoopExit::Dropped);
@@ -1193,6 +1218,157 @@ async fn slow_confirm_keeps_cadence_anchored_to_send_time() {
 	// SEND (at 30s), not 15s after the response (35s) — a slow round-trip
 	// must not stretch the cadence past the server TTL
 	assert_eq!(begin.elapsed(), Duration::from_secs(30));
+}
+
+/// The client's lease terms after a connection announced leases of `secs`.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+fn announced_terms(secs: u64) -> LeaseTermsSlot {
+	let terms = LeaseTermsSlot::default();
+	terms.observe(Duration::from_secs(secs));
+	terms
+}
+
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+#[tokio::test(start_paused = true)]
+async fn a_30_s_announced_lease_is_refreshed_every_7_5_s() {
+	let begin = Instant::now();
+	let confirmed = confirmed_at(begin);
+	let exit = refresh_loop(
+		scripted_refresh(&[Step::Confirm, Step::Drop]),
+		&confirmed,
+		&held(),
+		&Suspicion::default(),
+		&announced_terms(30),
+	)
+	.await;
+	assert_eq!(exit, LoopExit::Dropped);
+	// confirmed at 7.5 s, the drop observed at the refresh 7.5 s after it
+	assert_eq!(confirmed.borrow().at - begin, Duration::from_millis(7_500));
+	assert_eq!(begin.elapsed(), Duration::from_secs(15));
+}
+
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+#[tokio::test(start_paused = true)]
+async fn a_hung_refresh_is_cut_off_when_a_30_s_announced_lease_lapses() {
+	let begin = Instant::now();
+	let exit = refresh_loop(
+		scripted_refresh(&[Step::Hang]),
+		&confirmed_at(begin),
+		&held(),
+		&Suspicion::default(),
+		&announced_terms(30),
+	)
+	.await;
+	assert_eq!(exit, LoopExit::Lost);
+	assert_eq!(begin.elapsed(), Duration::from_secs(30));
+}
+
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+#[tokio::test(start_paused = true)]
+async fn a_shorter_lease_announced_while_held_is_refreshed_on_its_terms_from_then() {
+	let begin = Instant::now();
+	let (confirmed, valid, suspicion) = (confirmed_at(begin), held(), Suspicion::default());
+	let terms = LeaseTermsSlot::default();
+	let (exit, ()) = tokio::join!(
+		refresh_loop(
+			scripted_refresh(&[Step::Confirm, Step::Drop]),
+			&confirmed,
+			&valid,
+			&suspicion,
+			&terms,
+		),
+		async {
+			sleep(Duration::from_millis(5_500)).await;
+			terms.observe(Duration::from_secs(10));
+		}
+	);
+	assert_eq!(exit, LoopExit::Dropped);
+	// 5.5 s old against a 2.5 s interval: refreshed at the next look at the clock (6 s), and
+	// the drop observed 2.5 s after that, not on the 15 s schedule
+	assert_eq!(confirmed.borrow().at - begin, Duration::from_secs(6));
+	assert_eq!(begin.elapsed(), Duration::from_millis(8_500));
+}
+
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+#[tokio::test(start_paused = true)]
+async fn a_hung_refresh_is_cut_off_by_a_shorter_lease_announced_while_it_waits() {
+	let begin = Instant::now();
+	let (confirmed, valid, suspicion) = (confirmed_at(begin), held(), Suspicion::default());
+	let terms = LeaseTermsSlot::default();
+	let (exit, ()) = tokio::join!(
+		refresh_loop(
+			scripted_refresh(&[Step::Hang]),
+			&confirmed,
+			&valid,
+			&suspicion,
+			&terms,
+		),
+		async {
+			// the refresh went out at 15 s under the 60 s terms
+			sleep(Duration::from_secs(20)).await;
+			terms.observe(Duration::from_secs(30));
+		}
+	);
+	assert_eq!(exit, LoopExit::Lost);
+	// cut off when the 30 s lease lapsed, not at the 60 s its send was timed by
+	assert_eq!(begin.elapsed(), Duration::from_secs(30));
+}
+
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+#[tokio::test(start_paused = true)]
+async fn a_confirmation_is_cut_off_by_a_shorter_lease_announced_while_it_waits() {
+	let client = offline_client();
+	// a second handle on the client, to announce the lease on
+	let lock = test_lock_on(Arc::clone(&client), None);
+	lock.lease
+		.confirmed
+		.send_replace(confirmed_ago(LOCK_LOSS_BUDGET + Duration::from_secs(5)));
+	let begin = Instant::now();
+	let asked = std::cell::Cell::new(0);
+	let (confirmed, ()) = tokio::join!(lock.confirm_via(unanswered_refresh(&asked)), async {
+		// the request was given 30 s under the 60 s terms
+		sleep(Duration::from_secs(2)).await;
+		client.lease_terms.observe(Duration::from_secs(40));
+	});
+	assert_eq!(confirmed.unwrap_err().kind(), ErrorKind::LockLost);
+	// lost once the lease is 40 s old, not at the 60 s its send was timed by
+	assert_eq!(begin.elapsed(), Duration::from_secs(10));
+	assert_eq!(asked.get(), 1);
+	assert!(lock.lease.is_lost());
+}
+
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+#[tokio::test(start_paused = true)]
+async fn a_lock_under_a_30_s_announced_lease_is_unconfirmed_after_12_5_s() {
+	let client = offline_client();
+	// a second handle on the client, to announce the lease on
+	let lock = test_lock_on(Arc::clone(&client), None);
+	client.lease_terms.observe(Duration::from_secs(30));
+	tokio::time::advance(Duration::from_millis(12_499)).await;
+	assert!(lock.is_valid());
+	tokio::time::advance(Duration::from_millis(1)).await;
+	assert!(!lock.is_valid());
+	assert!(!lock.lease.is_lost(), "the lease may still stand");
+}
+
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+#[tokio::test(start_paused = true)]
+async fn a_lock_past_a_30_s_announced_lease_is_lost_without_asking_the_server() {
+	let client = offline_client();
+	// a second handle on the client, to announce the lease on
+	let lock = test_lock_on(Arc::clone(&client), None);
+	client.lease_terms.observe(Duration::from_secs(30));
+	lock.lease
+		.confirmed
+		.send_replace(confirmed_ago(Duration::from_secs(30)));
+	let asked = std::cell::Cell::new(0);
+	let error = lock
+		.confirm_via(counted_refresh(&asked, Duration::ZERO, Ok(true)))
+		.await
+		.unwrap_err();
+	assert_eq!(error.kind(), ErrorKind::LockLost);
+	assert_eq!(asked.get(), 0);
+	assert!(lock.lease.is_lost());
 }
 
 /// One scripted outcome for an [`acquire_loop`] poll.
@@ -1429,14 +1605,20 @@ async fn acquire_server_error_after_an_answer_is_returned() {
 	assert_eq!(begin.elapsed(), Duration::ZERO);
 }
 
-/// The wakes `wakes` of a wait for `resource` over `transport`, which never changes.
+/// The wakes `wakes` of a wait for `resource` over `transport`, which never changes, under the
+/// default lease terms.
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 fn wakes_on(
 	wakes: tokio::sync::watch::Receiver<()>,
 	transport: LockTransport,
 	resource: &str,
 ) -> LockWakes {
-	LockWakes::new(wakes, tokio::sync::watch::channel(transport).1, resource)
+	LockWakes::new(
+		wakes,
+		tokio::sync::watch::channel(transport).1,
+		resource,
+		LeaseTermsSlot::default(),
+	)
 }
 
 /// The wakes of a wait for `resource` on `transport` with nothing to wake it: neither
@@ -1764,6 +1946,29 @@ fn an_announcing_pause_is_a_lease_unless_the_schedule_is_longer() {
 	);
 }
 
+/// The safety poll comes once a lease of the client's terms: a server that announced 30 s
+/// leases is polled every 30 s.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+#[tokio::test(start_paused = true)]
+async fn the_safety_poll_comes_once_a_lease_of_the_announced_terms() {
+	let begin = Instant::now();
+	let terms = LeaseTermsSlot::default();
+	terms.observe(Duration::from_secs(30));
+	let wakes = LockWakes::new(
+		tokio::sync::watch::channel(()).1,
+		tokio::sync::watch::channel(announcing()).1,
+		"r",
+		terms,
+	);
+	let (poll, sent) = timed_acquire(begin, &[AcquireStep::Refuse; 3]);
+	let err = acquire_loop(poll, "r", Duration::from_secs(5), 3, wakes)
+		.await
+		.unwrap_err();
+	assert_eq!(err.kind(), ErrorKind::RetryFailed);
+	assert_eq!(begin.elapsed(), Duration::from_secs(90));
+	assert_eq!(*sent.lock().unwrap(), millis(&[0, 30_000, 60_000]));
+}
+
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 #[tokio::test(start_paused = true)]
 async fn a_wake_uses_no_attempt() {
@@ -1852,7 +2057,12 @@ async fn a_wake_during_a_poll_polls_again_once_it_is_answered() {
 async fn a_wait_pauses_a_lease_once_its_connection_announces() {
 	let begin = Instant::now();
 	let (transport, transports) = tokio::sync::watch::channel(LockTransport::Connecting);
-	let wakes = LockWakes::new(tokio::sync::watch::channel(()).1, transports, "r");
+	let wakes = LockWakes::new(
+		tokio::sync::watch::channel(()).1,
+		transports,
+		"r",
+		LeaseTermsSlot::default(),
+	);
 	let mut script = vec![AcquireStep::Refuse; 7];
 	script.push(AcquireStep::Grant);
 	let (poll, sent) = timed_acquire(begin, &script);
@@ -1877,7 +2087,12 @@ async fn a_wait_pauses_a_lease_once_its_connection_announces() {
 async fn a_wait_goes_back_to_the_ladder_once_announcements_stop() {
 	let begin = Instant::now();
 	let (transport, transports) = tokio::sync::watch::channel(announcing());
-	let wakes = LockWakes::new(tokio::sync::watch::channel(()).1, transports, "r");
+	let wakes = LockWakes::new(
+		tokio::sync::watch::channel(()).1,
+		transports,
+		"r",
+		LeaseTermsSlot::default(),
+	);
 	let (poll, sent) = timed_acquire(
 		begin,
 		&[AcquireStep::Refuse, AcquireStep::Refuse, AcquireStep::Grant],
@@ -3207,6 +3422,26 @@ mod over_the_socket {
 		};
 		assert_eq!(waited, Duration::from_secs(5));
 		assert!(LOCK_REFRESH_INTERVAL + waited < LOCK_LOSS_BUDGET);
+	}
+
+	/// Under a shorter lease the socket is waited on for half the shorter time the lock is still
+	/// relied on: 2.5 s of the 5 s left of a 30 s lease's 12.5 s.
+	#[tokio::test(start_paused = true)]
+	async fn a_due_refresh_under_a_shorter_lease_waits_for_a_silent_socket_half_its_time_left() {
+		let lock = unconfirmed_lock(Duration::from_millis(7_500));
+		lock.lease
+			.client
+			.lease_terms
+			.observe(Duration::from_secs(30));
+		// a confirmation asks the server while a suspicion stands
+		lock.lease.suspicion.raise();
+		let (_published, mut commands) = speak_socket_locks(&lock.lease.client);
+		let uuid = lock.lease.uuid;
+		let waited = tokio::select! {
+			_ = lock.confirm() => panic!("the offline client cannot confirm the lock"),
+			waited = wait_out(&mut commands, "refresh", uuid) => waited,
+		};
+		assert_eq!(waited, Duration::from_millis(2_500));
 	}
 
 	/// A lock no longer relied on waits for a socket that stopped answering only a second before

@@ -21,7 +21,7 @@ use crate::{
 	auth::{Client, http::AuthClient},
 };
 
-use super::{LOCK_SERVER_TTL, board};
+use super::{LeaseTermsSlot, board};
 
 /// The least time between the sends of two polls of one wait when a wake brings the second
 /// forward, so a burst of announcements costs a poll per this time at most.
@@ -35,7 +35,8 @@ pub(super) const EARLY_POLL_FLOOR: Duration = Duration::from_millis(250);
 ///
 /// On a connection that delivers the lock announcements (its server answered the `lockHello`
 /// probe with protocol 2 or later), the wake is what gets the wait the lock: after each scheduled
-/// poll it pauses a lock lease (60 s), or the schedule's delay if that is longer (see
+/// poll it pauses a lock lease (the lease length of the client's [`LeaseTerms`](super::LeaseTerms),
+/// 60 s unless a server announced a shorter one), or the schedule's delay if that is longer (see
 /// [`Self::pause`]),
 /// and that one poll a lease is the only safety net against a lost announcement. A server that
 /// answers the probe but delivers no announcements leaves every such wait polling once a lease.
@@ -47,6 +48,8 @@ pub(super) struct LockWakes {
 	transport: TransportWatch,
 	/// Whether the server announces the resource's leases at all (see [`board::announces`]).
 	announced: bool,
+	/// The client's lease terms, whose lease length a pause on an announcing connection lasts.
+	terms: LeaseTermsSlot,
 }
 
 /// What the next poll of a wait is.
@@ -69,6 +72,8 @@ impl LockWakes {
 			client.lock_board.wakes(resource),
 			client.lock_transport.subscribe(),
 			resource,
+			// a handle on the client's terms
+			client.lease_terms.clone(),
 		)
 	}
 
@@ -83,10 +88,13 @@ impl LockWakes {
 			wakes: client.lock_board.wakes(resource),
 			transport: TransportWatch,
 			announced: board::announces(resource),
+			// a handle on the client's terms
+			terms: client.lease_terms.clone(),
 		}
 	}
 
-	/// The wakes `wakes` of a wait for `resource`, over the lock transport `transport`.
+	/// The wakes `wakes` of a wait for `resource`, over the lock transport `transport`, under the
+	/// lease terms `terms`.
 	#[cfg(any(
 		not(all(target_family = "wasm", target_os = "unknown")),
 		feature = "wasm-full"
@@ -95,20 +103,24 @@ impl LockWakes {
 		wakes: watch::Receiver<()>,
 		transport: watch::Receiver<LockTransport>,
 		resource: &str,
+		terms: LeaseTermsSlot,
 	) -> Self {
 		Self {
 			wakes,
 			transport: TransportWatch(transport),
 			announced: board::announces(resource),
+			terms,
 		}
 	}
 
 	/// How long the wait pauses after a scheduled poll whose schedule says `delay`: a lock lease
-	/// ([`LOCK_SERVER_TTL`]) while an announcement would wake it, unless `delay` is longer, and
-	/// `delay` otherwise.
+	/// (the terms' lease length) while an announcement would wake it, unless `delay` is longer,
+	/// and `delay` otherwise. The terms change only when a connection announces its lease length,
+	/// which it does before it is published as the transport, so a wait reading them again when
+	/// the transport changes is up to date.
 	pub(super) fn pause(&self, delay: Duration) -> Duration {
 		if self.announced && self.transport.announces() {
-			max(delay, LOCK_SERVER_TTL)
+			max(delay, self.terms.current().ttl())
 		} else {
 			delay
 		}

@@ -34,7 +34,7 @@ use crate::{
 		unauth::UnauthClient,
 	},
 	consts::{FULL_CHUNK_BYTES, gateway_url},
-	sync::lock::{LockBoard, LockListenerSlot, PendingReleases},
+	sync::lock::{LeaseTermsSlot, LockBoard, LockListenerSlot, PendingReleases},
 	thumbnail::{MAX_THUMBNAIL_SOURCE_BYTES, REMOTE_SOURCE_RESIDENT_BYTES},
 	util::{MaybeSend, MaybeSendSync},
 };
@@ -917,6 +917,9 @@ pub struct AuthClient {
 	/// What the socket's lock announcements are checked against: the leases they report, this
 	/// client's held leases, and the uuids it released.
 	pub(crate) lock_board: LockBoard,
+	/// The timings this client's held locks are kept under, tightened by the lease length each
+	/// connection of its socket announces.
+	pub(crate) lease_terms: LeaseTermsSlot,
 	/// Whether the socket can carry lock operations, as the websocket task publishes it. Builds
 	/// without a socket (`service-worker`) use HTTP for every lock operation.
 	#[cfg(any(
@@ -1238,6 +1241,7 @@ impl AuthClient {
 		unauthed: UnauthClient,
 		api_key: Arc<RwLock<APIKey<'static>>>,
 	) -> Self {
+		let lease_terms = LeaseTermsSlot::default();
 		Self {
 			unauthed,
 			api_key,
@@ -1249,7 +1253,9 @@ impl AuthClient {
 				not(all(target_family = "wasm", target_os = "unknown")),
 				feature = "wasm-full"
 			))]
-			lock_transport: LockTransportSlot::default(),
+			// a second handle on the client's terms, for the connections to tighten
+			lock_transport: LockTransportSlot::observing(lease_terms.clone()),
+			lease_terms,
 		}
 	}
 

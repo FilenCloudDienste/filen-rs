@@ -44,6 +44,7 @@ use crate::{
 
 mod board;
 mod route;
+mod terms;
 mod wait;
 
 pub(crate) use board::LockBoard;
@@ -57,6 +58,8 @@ pub(crate) use board::lock_announced;
 pub(crate) use board::{Holder, OpenLease};
 pub(crate) use route::LockPayload;
 use route::route_lock_op;
+use terms::LeaseTerms;
+pub(crate) use terms::LeaseTermsSlot;
 use wait::{LockWakes, NextPoll, noting_refusal, wait_socket, while_contended};
 
 pub(crate) const MAX_SLEEP_TIME_DEFAULT: time::Duration = time::Duration::from_secs(30);
@@ -522,7 +525,9 @@ impl ReleaseRequest {
 /// While the lock is held, no other client can acquire the lock on the same resource.
 /// The lock is automatically released [`LOCK_SERVER_TTL`] after the last refresh the
 /// server processed, so a background task refreshes it every [`LOCK_REFRESH_INTERVAL`],
-/// retrying a failed refresh.
+/// retrying a failed refresh. These timings, and the [`LOCK_LOSS_BUDGET`] below, are for that
+/// 60 s lease: once a connection of the client's socket announces shorter leases, its locks are
+/// kept under timings shortened in proportion, which do not lengthen again.
 ///
 /// A lock whose last confirmed refresh is older than [`LOCK_LOSS_BUDGET`] (by the monotonic or
 /// the wall clock, so a system suspend counts) is unconfirmed: [`Self::is_valid`] reads false
@@ -604,7 +609,7 @@ impl ResourceLock {
 	pub fn is_valid(&self) -> bool {
 		!self.lease.is_lost()
 			&& !self.lease.suspicion.is_raised()
-			&& self.lease.age() < LOCK_LOSS_BUDGET
+			&& self.lease.age() < self.lease.terms().loss_budget()
 	}
 
 	/// `Ok` once the lease is confirmed: at once while [`Self::is_valid`], otherwise after
@@ -711,11 +716,21 @@ impl SharedLease {
 	/// How long a refresh of the lease sent now waits for the socket's answer before it goes
 	/// over HTTP as well (see [`refresh_socket_wait`]).
 	fn refresh_socket_wait(&self) -> Duration {
-		refresh_socket_wait(self.age(), LOCK_LOSS_BUDGET)
+		refresh_socket_wait(self.age(), self.terms().loss_budget())
 	}
 
 	fn age(&self) -> Duration {
 		self.confirmed.borrow().age()
+	}
+
+	/// The timings the lease is kept under, as its client's socket last tightened them.
+	fn terms(&self) -> LeaseTerms {
+		self.client.lease_terms.current()
+	}
+
+	/// How long the lease stands after its last confirmation, by its [`Self::terms`].
+	fn ttl(&self) -> Duration {
+		self.terms().ttl()
 	}
 
 	/// Marks the lease lost, and sends a release for it in case the server still holds it after
@@ -746,12 +761,12 @@ impl SharedLease {
 		if self.is_lost() {
 			return Some(Err(self.lost_error()));
 		}
-		let age = self.age();
-		if age < LOCK_LOSS_BUDGET && !self.suspicion.is_raised() {
+		let (age, terms) = (self.age(), self.terms());
+		if age < terms.loss_budget() && !self.suspicion.is_raised() {
 			return Some(Ok(()));
 		}
 		// Past the lease, a confirmation could not be trusted (see `ask`): it has lapsed.
-		if age >= LOCK_SERVER_TTL {
+		if age >= terms.ttl() {
 			self.mark_lost();
 			return Some(Err(self.lost_error()));
 		}
@@ -779,8 +794,9 @@ impl SharedLease {
 			let mut request = pin!(request);
 			let answer = loop {
 				let seen = *confirmations.borrow_and_update();
-				// the lease could stand this long, by the newest confirmation
-				let remaining = LOCK_SERVER_TTL.saturating_sub(seen.age());
+				let terms = self.terms();
+				// the lease could stand this long, by the newest confirmation and the terms
+				let remaining = terms.ttl().saturating_sub(seen.age());
 				tokio::select! {
 					answer = timeout(remaining, request.as_mut()) => break answer,
 					() = lost.wait_for(|valid| !*valid).map(drop) => return Err(self.lost_error()),
@@ -789,13 +805,15 @@ impl SharedLease {
 							return settled;
 						}
 					}
+					// a shorter lease announced meanwhile cuts the request off sooner
+					() = self.client.lease_terms.changed_from(terms) => {}
 				}
 			};
 			match answer {
 				// Only an answer received inside the lease, for a lock not lost meanwhile, is
 				// trusted: an older server confirms any refresh, also one for a lease that lapsed
 				// and was handed to another client.
-				Ok(Ok(true)) if !self.is_lost() && self.age() < LOCK_SERVER_TTL => {
+				Ok(Ok(true)) if !self.is_lost() && self.age() < self.ttl() => {
 					// Before the confirmation, which wakes whoever waits for it.
 					self.suspicion.answered(mark);
 					record_confirmation(&self.confirmed, sent);
@@ -1064,15 +1082,19 @@ where
 	}
 }
 
+/// How often a held lock is refreshed under a [`LOCK_SERVER_TTL`] lease ([`LeaseTerms`] shortens
+/// it for a shorter one).
 const LOCK_REFRESH_INTERVAL: time::Duration = time::Duration::from_secs(15);
 /// Server-side lease for a held lock: the server auto-releases a lock 60s after the last
 /// acquire/refresh it processed. Measured against the live API: another client got a resource
-/// 60s after the holder's acquire, and 90s after an acquire refreshed at 30s.
+/// 60s after the holder's acquire, and 90s after an acquire refreshed at 30s. A held lock is kept
+/// under a shorter lease once the server announces one ([`LeaseTerms`]); releases are retried for
+/// this long all the same, as a late release frees nothing but its own lease.
 const LOCK_SERVER_TTL: time::Duration = time::Duration::from_secs(60);
 /// How old the last server-confirmed refresh of a held lock may be for the lock to be relied on
 /// without asking the server again ([`ResourceLock::is_valid`]). The margin below
 /// [`LOCK_SERVER_TTL`] absorbs the send-to-server-processing skew and the time a write takes to
-/// reach the server.
+/// reach the server. [`LeaseTerms`] keeps the same share of a shorter lease.
 const LOCK_LOSS_BUDGET: time::Duration = time::Duration::from_secs(25);
 /// Delay between retries of a failed refresh.
 const LOCK_RETRY_INTERVAL: time::Duration = time::Duration::from_secs(1);
@@ -1082,18 +1104,14 @@ const LOCK_RETRY_INTERVAL: time::Duration = time::Duration::from_secs(1);
 /// timer runs out.
 const LOCK_CLOCK_TICK: time::Duration = time::Duration::from_secs(1);
 
-/// How long to sleep before the next refresh, given how long ago the lease was last confirmed.
-fn refresh_delay_after(elapsed: Duration) -> Duration {
-	LOCK_REFRESH_INTERVAL.saturating_sub(elapsed)
-}
-
-/// Sleeps until the next refresh is due, by the age of the lease's last confirmation, in steps
-/// of at most [`LOCK_CLOCK_TICK`], or until a suspicion is raised, which makes it due at once.
-/// `false` once the lock is lost meanwhile.
+/// Sleeps until the next refresh is due, by the age of the lease's last confirmation and the
+/// `terms`' interval, in steps of at most [`LOCK_CLOCK_TICK`], or until a suspicion is raised,
+/// which makes it due at once. `false` once the lock is lost meanwhile.
 async fn until_refresh_due(
 	confirmed: &tokio::sync::watch::Sender<Confirmed>,
 	valid: &tokio::sync::watch::Sender<bool>,
 	suspicion: &Suspicion,
+	terms: &LeaseTermsSlot,
 ) -> bool {
 	// Subscribed before the first look, so a suspicion raised after it ends the sleep.
 	let mut suspicions = suspicion.0.subscribe();
@@ -1104,7 +1122,9 @@ async fn until_refresh_due(
 		if suspicion.is_raised() {
 			return true;
 		}
-		let delay = refresh_delay_after(confirmed.borrow().age());
+		let delay = terms
+			.current()
+			.refresh_delay_after(confirmed.borrow().age());
 		if delay.is_zero() {
 			return true;
 		}
@@ -1133,14 +1153,17 @@ enum LoopExit {
 /// `suspicion` makes a refresh due at once, and a confirmed one answers the suspicions raised
 /// before its send.
 ///
+/// The schedule and the lease's length are read from `terms`, so a server announcing a shorter
+/// lease shortens them for a lock already held, a refresh in flight included.
+///
 /// `refresh` builds the future for a single Refresh round-trip (resolving to the
 /// server's `refreshed` flag), or returns `None` once the lock has been dropped.
 /// Generic over the refresh action so the schedule is unit-testable against a scripted
 /// server on a paused clock.
 ///
 /// The lock is only declared lost on the server's word, or once no refresh was confirmed for
-/// [`LOCK_SERVER_TTL`], when the lease has lapsed whatever the server would answer. Before
-/// that, failing refreshes are retried: an unconfirmed lock stops being relied on through
+/// the lease's length ([`LOCK_SERVER_TTL`] by default), when the lease has lapsed whatever the
+/// server would answer. Before that, failing refreshes are retried: an unconfirmed lock stops being relied on through
 /// [`ResourceLock::is_valid`] and is confirmed again once a refresh gets through, so a network
 /// blip or a short system suspend does not cost the lock.
 async fn refresh_loop<F, Fut>(
@@ -1148,6 +1171,7 @@ async fn refresh_loop<F, Fut>(
 	confirmed: &tokio::sync::watch::Sender<Confirmed>,
 	valid: &tokio::sync::watch::Sender<bool>,
 	suspicion: &Suspicion,
+	terms: &LeaseTermsSlot,
 ) -> LoopExit
 where
 	F: FnMut() -> Option<Fut>,
@@ -1157,23 +1181,34 @@ where
 	// when it processes a request, never earlier than its send, so the age only ever
 	// overestimates the lease's.
 	loop {
-		if !until_refresh_due(confirmed, valid, suspicion).await {
+		if !until_refresh_due(confirmed, valid, suspicion, terms).await {
 			return LoopExit::Lost;
 		}
 		let age = confirmed.borrow().age();
-		let Some(remaining) = LOCK_SERVER_TTL.checked_sub(age).filter(|r| !r.is_zero()) else {
+		if terms.current().ttl() <= age {
 			return LoopExit::Lost;
-		};
+		}
 		let Some(fut) = refresh() else {
 			return LoopExit::Dropped;
 		};
 		let sent = Confirmed::now();
 		let mark = suspicion.mark();
-		match timeout(remaining, fut).await {
+		let mut fut = pin!(fut);
+		let answer = loop {
+			let seen = terms.current();
+			// the lease could stand this long, by the terms as they are now
+			let remaining = seen.ttl().saturating_sub(confirmed.borrow().age());
+			tokio::select! {
+				answer = timeout(remaining, fut.as_mut()) => break answer,
+				// a shorter lease announced meanwhile cuts the refresh off sooner
+				() = terms.changed_from(seen) => {}
+			}
+		};
+		match answer {
 			// Only an answer received inside the lease, for a lock not marked lost meanwhile, is
 			// trusted: an older server confirms any refresh, also one for a lease that lapsed and
 			// was handed to another client.
-			Ok(Ok(true)) if *valid.borrow() && confirmed.borrow().age() < LOCK_SERVER_TTL => {
+			Ok(Ok(true)) if *valid.borrow() && confirmed.borrow().age() < terms.current().ttl() => {
 				// Before the confirmation, which wakes whoever waits for it.
 				suspicion.answered(mark);
 				record_confirmation(confirmed, sent);
@@ -1194,6 +1229,7 @@ async fn run_keep_alive(
 	confirmed: tokio::sync::watch::Sender<Confirmed>,
 	valid: tokio::sync::watch::Sender<bool>,
 	suspicion: Suspicion,
+	terms: LeaseTermsSlot,
 ) {
 	let refresh = || {
 		let lease = weak.upgrade()?;
@@ -1209,7 +1245,7 @@ async fn run_keep_alive(
 			.await
 		})
 	};
-	if refresh_loop(refresh, &confirmed, &valid, &suspicion).await == LoopExit::Lost
+	if refresh_loop(refresh, &confirmed, &valid, &suspicion, &terms).await == LoopExit::Lost
 		&& let Some(lease) = weak.upgrade()
 	{
 		lease.mark_lost();
@@ -1224,6 +1260,7 @@ fn keep_lock_alive(lease: &Arc<SharedLease>) {
 		lease.confirmed.clone(),
 		lease.valid.clone(),
 		lease.suspicion.clone(),
+		lease.client.lease_terms.clone(),
 	);
 	// Same no-ambient-runtime hazard as the release: spawn on the runtime the lock was acquired
 	// on. The ambient fallback is unreachable through `acquire_lock` (reqwest already
@@ -1247,6 +1284,7 @@ fn keep_lock_alive(lease: &Arc<SharedLease>) {
 		lease.confirmed.clone(),
 		lease.valid.clone(),
 		lease.suspicion.clone(),
+		lease.client.lease_terms.clone(),
 	));
 }
 
@@ -1611,10 +1649,10 @@ impl Client {
 	/// lock, and fails with [`ErrorKind::RetryFailed`] once the pause after the last one runs
 	/// out. The pauses grow to `max_sleep_time` on a fibonacci schedule. While the client's
 	/// socket delivers the server's lock announcements (its server answered the socket's lock
-	/// probe with protocol 2 or later), each pause lasts a lock lease (60 s) instead, or
-	/// `max_sleep_time` if that is longer, so `attempts` bounds the wait to about that many
-	/// leases; and on any connection an announcement that a lease of the resource ended, or a
-	/// reconnect, brings a poll forward without using an attempt.
+	/// probe with protocol 2 or later), each pause lasts a lock lease (60 s, or the shorter lease
+	/// a server announced) instead, or `max_sleep_time` if that is longer, so `attempts` bounds the
+	/// wait to about that many leases; and on any connection an announcement that a lease of the
+	/// resource ended, or a reconnect, brings a poll forward without using an attempt.
 	///
 	/// So on such a connection the announcement is what gets a waiter the lock, within a few
 	/// round trips of its release, and the poll once a lease is only the safety net. A server that
