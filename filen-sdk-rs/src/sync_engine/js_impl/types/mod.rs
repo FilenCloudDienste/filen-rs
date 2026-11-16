@@ -16,8 +16,8 @@ use crate::{
 		ConflictResolved, DeleteGuard, GuardReason, HaltReason, IgnoredPath, LocalScanProgress,
 		PairId, PairOverlap, PairRecord, PauseMode, PauseOptions, PlanOutcome, PlannedAction,
 		PlannedActionKind, PlannedConflict, RefuseReason, ResolutionRefused, ScanGap, ScanGapCause,
-		SyncEvent, SyncMode, SyncReport, TransferDirection, UnsyncablePath, WatchConfig,
-		WatchStatus,
+		SyncEvent, SyncMode, SyncReport, TransferDirection, UnsyncablePath, UnsyncableReason,
+		WatchConfig, WatchStatus,
 	},
 };
 
@@ -315,6 +315,9 @@ pub struct SyncPassReport {
 	/// Paths the engine will not act on, and why.
 	pub unsyncable: Vec<UnsyncablePath>,
 	pub unsyncable_total: u64,
+	/// How many of the unsyncable paths are directory symlinks (`LocalAlias`), counted over all of
+	/// them: the rest are what needs a person.
+	pub unsyncable_local_alias_total: u64,
 	/// The top of each subtree the ignore rules hide.
 	pub ignored: Vec<IgnoredPath>,
 	pub ignored_total: u64,
@@ -433,6 +436,10 @@ impl From<SyncReport> for SyncPassReport {
 		} = report;
 		let (conflicts, conflicts_total) = capped(conflicts);
 		let (held, held_total) = capped(held);
+		let unsyncable_local_alias_total = unsyncable
+			.iter()
+			.filter(|path| matches!(path.reason, UnsyncableReason::LocalAlias { .. }))
+			.count() as u64;
 		let (unsyncable, unsyncable_total) = capped(unsyncable);
 		let (ignored, ignored_total) = capped(ignored);
 		let (errors, errors_total) = capped(errors);
@@ -453,6 +460,7 @@ impl From<SyncReport> for SyncPassReport {
 			held_deletions,
 			unsyncable,
 			unsyncable_total,
+			unsyncable_local_alias_total,
 			ignored,
 			ignored_total,
 			refused,

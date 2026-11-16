@@ -245,7 +245,10 @@ describe("the addon against the server", { skip: email && password ? false : "TE
 	test("a one-shot pass is announced in order under one pass id and reported", async () => {
 		const from = events.length
 		const report = await engine.syncOnce(pair)
-		assert.deepEqual([report.uploaded, report.remoteDirsCreated, report.ignoredTotal], [2n, 1n, 1n])
+		assert.deepEqual(
+			[report.uploaded, report.remoteDirsCreated, report.ignoredTotal, report.unsyncableTotal, report.unsyncableLocalAliasTotal],
+			[2n, 1n, 1n, 0n, 0n]
+		)
 		assert.deepEqual(report.errors, [])
 		assert.equal(report.passError, undefined)
 

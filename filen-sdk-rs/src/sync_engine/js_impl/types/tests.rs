@@ -96,6 +96,36 @@ fn a_report_past_the_limit_keeps_the_first_entries_and_counts_them_all() {
 }
 
 #[test]
+fn a_report_counts_its_directory_symlinks_past_the_limit() {
+	let unsyncable = |reason: UnsyncableReason| {
+		move |index| UnsyncablePath {
+			rel_path: format!("unsyncable-{index}"),
+			reason: reason.clone(),
+		}
+	};
+	let alias = UnsyncableReason::LocalAlias {
+		target: "real".to_owned(),
+	};
+	let report = SyncPassReport::from(SyncReport {
+		unsyncable: (0..600)
+			.map(unsyncable(UnsyncableReason::RemoteUndecodable))
+			.chain((600..1500).map(unsyncable(alias.clone())))
+			.collect(),
+		..SyncReport::default()
+	});
+
+	assert_eq!(report.unsyncable.len(), 1000);
+	assert_eq!(report.unsyncable_total, 1500);
+	assert_eq!(report.unsyncable_local_alias_total, 900);
+	// The engine's order, which a plan's pages share.
+	assert_eq!(report.unsyncable.last(), Some(&unsyncable(alias)(999)));
+	assert_eq!(
+		SyncPassReport::from(report_with(1001)).unsyncable_local_alias_total,
+		0
+	);
+}
+
+#[test]
 fn a_report_carries_its_counts_and_why_its_pass_failed() {
 	let report = SyncReport {
 		downloaded: 2,
