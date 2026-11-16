@@ -1,29 +1,147 @@
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+use std::{
+	io,
+	pin::Pin,
+	task::{Context, Poll, ready},
+};
+
 use futures::{AsyncRead, AsyncReadExt};
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+use futures::{StreamExt, future::Either};
 use tokio::sync::mpsc;
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+use wasm_bindgen::{JsCast, JsValue};
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+use wasm_streams::readable::IntoStream;
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+use web_sys::js_sys::{Object, Uint8Array};
 
 use crate::{Error, ErrorKind};
 
 /// The most a pump reads from its stream at a time.
 const MAX_READ_LEN: usize = 64 * 1024;
 
-/// Pumps a JS `ReadableStream`'s reader into a channel from a task on the CALLING thread, which is
-/// where the stream's JS object lives: a `ReadableStream` cannot be moved to the commander.
+/// Pumps a JS `ReadableStream` into a channel from a task on the CALLING thread, which is where
+/// the stream's JS object lives: a `ReadableStream` cannot be moved to the commander.
 ///
 /// Reads at most 64 KiB at a time, and no more than `size_hint` when the caller knows how much
 /// there is. `progress` gets the bytes handed over so far after each read.
 ///
 /// A read error arrives in-band as the last item, so the consumer sees it where it sees the bytes;
 /// a closed channel only ever means the end of the stream. A consumer that stops reading drops the
-/// receiver, and the pump ends with it.
+/// receiver; the pump notices when its next read is done, and ends, cancelling the stream.
+///
+/// Fails with `Conversion` only when the stream cannot be read at all, because it is already
+/// locked to a reader.
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 pub(crate) fn spawn_stream_pump(
-	reader: impl AsyncRead + Unpin + 'static,
+	stream: web_sys::ReadableStream,
 	size_hint: Option<u64>,
 	progress: Option<impl Fn(u64) + 'static>,
-) -> mpsc::Receiver<Result<Vec<u8>, Error>> {
+) -> Result<mpsc::Receiver<Result<Vec<u8>, Error>>, Error> {
+	let reader = stream_reader(stream)?;
 	let (sender, receiver) = mpsc::channel(10);
 	crate::runtime::spawn_local(pump_stream(reader, size_hint, progress, sender));
-	receiver
+	Ok(receiver)
+}
+
+/// Reads a byte stream (`Blob.stream()`, a `fetch` body) through a BYOB reader, straight into the
+/// pump's buffer, and any other `ReadableStream` (one built by hand, the output of `pipeThrough`
+/// or a `TransformStream`) through its default reader, a buffer at a time out of each chunk. Both
+/// readers cancel the stream when dropped.
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+fn stream_reader(
+	stream: web_sys::ReadableStream,
+) -> Result<impl AsyncRead + Unpin + 'static, Error> {
+	match wasm_streams::ReadableStream::from_raw(stream).try_into_async_read() {
+		Ok(bytes) => Ok(Either::Left(bytes)),
+		// Not a byte stream, or locked: `getReader({ mode: "byob" })` threw without locking it,
+		// and the default reader below fails in turn if it is locked.
+		Err((_, stream)) => {
+			let chunks = stream.try_into_stream().map_err(|(e, _)| {
+				// as text, since a `JsValue` is not `Send`; the thumbnail calls' existing message
+				Error::custom(
+					ErrorKind::Conversion,
+					format!("got error when converting to ReadableStream: {e:?}"),
+				)
+			})?;
+			Ok(Either::Right(ChunkReader {
+				chunks,
+				current: None,
+			}))
+		}
+	}
+}
+
+/// A default reader's chunks as an `AsyncRead`. A read copies at most the caller's buffer out of
+/// the current chunk, so however large a chunk the source enqueues, wasm memory holds no more of
+/// it at a time than the pump's buffer, as with the BYOB reader.
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+struct ChunkReader {
+	chunks: IntoStream<'static>,
+	/// The chunk being read and how many of its bytes have been, until it is used up.
+	current: Option<(Uint8Array, u32)>,
+}
+
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+impl AsyncRead for ChunkReader {
+	fn poll_read(
+		self: Pin<&mut Self>,
+		cx: &mut Context<'_>,
+		buf: &mut [u8],
+	) -> Poll<io::Result<usize>> {
+		let this = self.get_mut();
+		if buf.is_empty() {
+			return Poll::Ready(Ok(0));
+		}
+		loop {
+			if let Some((chunk, read)) = &mut this.current {
+				let rest = chunk.length() - *read;
+				if rest > 0 {
+					let len = usize::try_from(rest).map_or(buf.len(), |rest| rest.min(buf.len()));
+					let end = *read
+						+ u32::try_from(len).expect(
+							"len is at most the u32 rest of the chunk (should be impossible)",
+						);
+					chunk.subarray(*read, end).copy_to(&mut buf[..len]);
+					*read = end;
+					return Poll::Ready(Ok(len));
+				}
+				this.current = None;
+			}
+			// an empty chunk is skipped: only the end of the stream reads as 0
+			match ready!(this.chunks.poll_next_unpin(cx)) {
+				Some(Ok(chunk)) => this.current = Some((uint8_chunk(chunk)?, 0)),
+				Some(Err(e)) => return Poll::Ready(Err(io::Error::other(js_error_message(&e)))),
+				None => return Poll::Ready(Ok(0)),
+			}
+		}
+	}
+}
+
+/// A default reader's chunk as the `Uint8Array` the parameter's TypeScript type promises; any
+/// other chunk fails the read instead of being converted.
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+fn uint8_chunk(chunk: JsValue) -> io::Result<Uint8Array> {
+	chunk.dyn_into::<Uint8Array>().map_err(|chunk| {
+		// the chunk's type only: its contents are the caller's data
+		let found = chunk.js_typeof().as_string().unwrap_or_default();
+		io::Error::new(
+			io::ErrorKind::InvalidData,
+			format!("a stream chunk is not a Uint8Array (typeof {found})"),
+		)
+	})
+}
+
+/// A JS value as text, as wasm-streams words a BYOB read error, so a source that fails reads the
+/// same through either reader. Kept as text because a `JsValue` is not `Send`, so it cannot be
+/// the `io::Error`'s source.
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+fn js_error_message(value: &JsValue) -> String {
+	value
+		.as_string()
+		.or_else(|| Object::try_from(value).and_then(|object| object.to_string().as_string()))
+		.unwrap_or_else(|| "Unknown error".to_owned())
 }
 
 /// The body of [`spawn_stream_pump`]'s task.

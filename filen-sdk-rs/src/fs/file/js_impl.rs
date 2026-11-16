@@ -92,10 +92,7 @@ impl JsClient {
 			}
 		});
 
-		let reader = wasm_streams::ReadableStream::from_raw(params.reader)
-			.try_into_async_read()
-			.map_err(|(e, _)| e)?;
-		let data_receiver = spawn_stream_pump(reader, params.known_size, progress_callback);
+		let data_receiver = spawn_stream_pump(params.reader, params.known_size, progress_callback)?;
 
 		let this = self.inner();
 

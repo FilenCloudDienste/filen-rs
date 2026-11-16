@@ -1755,15 +1755,7 @@ mod js_impls {
 	fn stream_chunks(
 		reader: web_sys::ReadableStream,
 	) -> Result<tokio::sync::mpsc::Receiver<Result<Vec<u8>, Error>>, Error> {
-		let reader = wasm_streams::ReadableStream::from_raw(reader)
-			.try_into_async_read()
-			.map_err(|(e, _)| {
-				Error::custom(
-					crate::ErrorKind::Conversion,
-					format!("got error when converting to ReadableStream: {e:?}"),
-				)
-			})?;
-		Ok(spawn_stream_pump(reader, None, None::<fn(u64)>))
+		spawn_stream_pump(reader, None, None::<fn(u64)>)
 	}
 
 	/// Collects the whole stream into one buffer, or fails with

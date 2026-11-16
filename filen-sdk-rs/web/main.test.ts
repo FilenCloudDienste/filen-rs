@@ -545,26 +545,134 @@ test("File Streams", async () => {
 	expect([...partialBytes]).toEqual([...new TextEncoder().encode("file")])
 })
 
-test("an upload from a stream that errors rejects and leaves no file", async () => {
-	const name = "errored-stream.txt"
-	let pulled = false
-	const reader = new ReadableStream<Uint8Array>({
-		pull(controller) {
-			if (pulled) {
-				controller.error(new Error("the source failed"))
-				return
-			}
-			pulled = true
-			controller.enqueue(new TextEncoder().encode("partial"))
+/// What a stream's `pull` may do: the default controller offers it as is, while a byte stream's
+/// `close` must also answer a BYOB read already waiting (see `streamOfKind`).
+type StreamSource = { enqueue(chunk: Uint8Array<ArrayBuffer>): void; error(e: Error): void; close(): void }
+
+/// Both kinds of stream a caller can hand the SDK: a byte stream, as `Blob.stream()` and a fetch
+/// body are, which it reads through a BYOB reader, and a default stream, as one built by hand or
+/// the output of `pipeThrough` is, which it reads chunk by chunk.
+const STREAM_KINDS = ["default", "byte"] as const
+
+function streamOfKind(kind: (typeof STREAM_KINDS)[number], pull: (source: StreamSource) => void): ReadableStream<Uint8Array> {
+	return kind === "byte"
+		? new ReadableStream({
+				type: "bytes",
+				pull: controller =>
+					pull({
+						enqueue: chunk => controller.enqueue(chunk),
+						error: e => controller.error(e),
+						close: () => {
+							controller.close()
+							// a BYOB read already waiting settles only once its request is answered
+							controller.byobRequest?.respond(0)
+						}
+					})
+			})
+		: new ReadableStream<Uint8Array>({ pull: controller => pull(controller) })
+}
+
+/// A stream handing out `chunks` in order, one per pull, then closing.
+function streamOfChunks(kind: (typeof STREAM_KINDS)[number], chunks: Uint8Array<ArrayBuffer>[]): ReadableStream<Uint8Array> {
+	let next = 0
+	return streamOfKind(kind, source => {
+		const chunk = chunks[next++]
+		if (chunk === undefined) {
+			source.close()
+		} else {
+			source.enqueue(chunk)
+		}
+	})
+}
+
+async function expectNoFileNamed(name: string) {
+	const { files } = await state.listDir(testDir)
+	expect(files.map(file => getFileMeta(file.meta)?.name)).not.toContain(name)
+}
+
+test.each(STREAM_KINDS)("an upload from a %s stream keeps every chunk's bytes", async kind => {
+	// one chunk larger than the 64 KiB the SDK reads at a time, and on a default stream an empty
+	// one, which a byte stream refuses to enqueue and which must not read as its end
+	const chunks = [
+		new TextEncoder().encode("first "),
+		...(kind === "default" ? [new Uint8Array(0)] : []),
+		Uint8Array.from({ length: 70_000 }, (_, i) => i % 251),
+		new TextEncoder().encode(" last")
+	]
+	const expected = new Uint8Array(await new Blob(chunks).arrayBuffer())
+
+	let progress = 0n
+	const file = await state.uploadFileFromReader({
+		parent: testDir,
+		name: `chunked-${kind}-stream.bin`,
+		reader: streamOfChunks(kind, chunks),
+		knownSize: expected.length,
+		progress: (bytes: bigint) => {
+			progress = bytes
 		}
 	})
 
-	const error = await state.uploadFileFromReader({ parent: testDir, name, reader }).catch((e: unknown) => e)
+	expect(progress).toBe(70_011n)
+	const downloaded = await collectBytes((writer: WritableStream<Uint8Array>) => state.downloadFileToWriter({ file, writer }))
+	expect(downloaded.length).toBe(70_011)
+	expect(downloaded).toEqual(expected)
+})
+
+test.each(STREAM_KINDS)("an upload from a %s stream that errors rejects and leaves no file", async kind => {
+	const name = `errored-${kind}-stream.txt`
+	let pulled = false
+	const reader = streamOfKind(kind, source => {
+		if (pulled) {
+			source.error(new Error("the source failed"))
+			return
+		}
+		pulled = true
+		source.enqueue(new TextEncoder().encode("partial"))
+	})
+
+	const error = await state.uploadFileFromReader({ parent: testDir, name, reader, knownSize: undefined }).catch((e: unknown) => e)
 
 	expect(error).toBeInstanceOf(FilenSdkError)
 	expect((error as FilenSdkError).kind).toBe("IO")
-	const { files } = await state.listDir(testDir)
-	expect(files.map(file => getFileMeta(file.meta)?.name)).not.toContain(name)
+	// both readers word the source's own error alike
+	expect((error as FilenSdkError).message).toContain("Error: the source failed")
+	await expectNoFileNamed(name)
+})
+
+test("an upload from a stream whose chunk is not a Uint8Array rejects, cancels the stream and leaves no file", async () => {
+	const name = "string-chunk-stream.txt"
+	const chunks: unknown[] = [new TextEncoder().encode("bytes first"), "not bytes"]
+	let cancelled = false
+	const reader = new ReadableStream<Uint8Array>({
+		pull(controller) {
+			controller.enqueue(chunks.shift() as Uint8Array)
+		},
+		cancel() {
+			cancelled = true
+		}
+	})
+
+	const error = await state.uploadFileFromReader({ parent: testDir, name, reader, knownSize: undefined }).catch((e: unknown) => e)
+
+	expect(error).toBeInstanceOf(FilenSdkError)
+	expect((error as FilenSdkError).kind).toBe("IO")
+	expect((error as FilenSdkError).message).toContain("a stream chunk is not a Uint8Array (typeof string)")
+	// the pump drops its reader once the read fails, which cancels the source
+	await vi.waitFor(() => expect(cancelled).toBe(true))
+	await expectNoFileNamed(name)
+})
+
+test("an upload from a locked stream rejects with a conversion error", async () => {
+	const reader = new Blob(["locked"]).stream()
+	const lock = reader.getReader()
+
+	const error = await state
+		.uploadFileFromReader({ parent: testDir, name: "locked-stream.txt", reader, knownSize: undefined })
+		.catch((e: unknown) => e)
+
+	expect(error).toBeInstanceOf(FilenSdkError)
+	expect((error as FilenSdkError).kind).toBe("Conversion")
+	lock.releaseLock()
 })
 
 test("abort", async () => {
@@ -1083,6 +1191,20 @@ test("lossy webp thumbnails", async () => {
 	const bitmap = await createImageBitmap(new Blob([fromStream.webpData], { type: "image/webp" }))
 	expect([bitmap.width, bitmap.height]).toEqual([fromStream.width, fromStream.height])
 	bitmap.close()
+})
+
+test("a thumbnail from a default stream matches the one from a byte stream", async () => {
+	const bytes = await generateImage(600, 400, "image/jpeg")
+	const half = Math.floor(bytes.length / 2)
+	const thumbnailOf = async (reader: ReadableStream<Uint8Array>) =>
+		expectThumbnail(await state.makeThumbnailFromStream({ reader, knownSize: bytes.length, maxWidth: 256, maxHeight: 256 }))
+
+	const fromDefault = await thumbnailOf(streamOfChunks("default", [bytes.subarray(0, half), bytes.subarray(half)]))
+	const fromBytes = await thumbnailOf(new Blob([bytes]).stream())
+
+	expect(fromDefault.width).toBe(256)
+	expect([fromDefault.width, fromDefault.height]).toEqual([fromBytes.width, fromBytes.height])
+	expect(fromDefault.webpData).toEqual(fromBytes.webpData)
 })
 
 /// Camera RAW, the case the extension gate exists for: the stored mime is whatever the
