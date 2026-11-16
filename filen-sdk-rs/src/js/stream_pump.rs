@@ -33,7 +33,10 @@ pub(crate) async fn pump_stream(
 	progress: Option<impl Fn(u64)>,
 	sender: mpsc::Sender<Result<Vec<u8>, Error>>,
 ) {
+	// A zero hint (an empty file) must not size the buffer: a read into an empty buffer returns 0,
+	// which reads as the end of the stream, and a BYOB reader refuses an empty view outright.
 	let read_len = size_hint
+		.filter(|&size| size > 0)
 		.and_then(|size| usize::try_from(size).ok())
 		.map_or(MAX_READ_LEN, |size| size.min(MAX_READ_LEN));
 	let mut buffer = vec![0u8; read_len];
@@ -105,6 +108,12 @@ mod tests {
 			[b"abcd".to_vec(), b"efgh".to_vec(), b"ij".to_vec()]
 		);
 		assert_eq!(progress.into_inner(), [4, 8, 10]);
+	}
+
+	#[tokio::test]
+	async fn a_pump_with_a_zero_size_hint_still_reads_the_stream() {
+		let items = pump(Cursor::new(b"abc".to_vec()), Some(0), None::<fn(u64)>).await;
+		assert_eq!(chunks(items), [b"abc".to_vec()]);
 	}
 
 	#[tokio::test]

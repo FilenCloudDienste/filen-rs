@@ -481,6 +481,24 @@ async function collectBytes(download: (writer: WritableStream<Uint8Array>) => Pr
 	return stream.bytes()
 }
 
+test("an upload of an empty file from a stream with knownSize 0 makes an empty file", async () => {
+	let progress: bigint | undefined
+	const file = await state.uploadFileFromReader({
+		parent: testDir,
+		name: "empty-from-stream.txt",
+		reader: new Blob([]).stream(),
+		knownSize: 0,
+		progress: (bytes: bigint) => {
+			progress = bytes
+		}
+	})
+
+	expect(file.size).toBe(0n)
+	expect(progress).toBeUndefined()
+	const downloaded = await collectBytes((writer: WritableStream<Uint8Array>) => state.downloadFileToWriter({ file, writer }))
+	expect(downloaded.length).toBe(0)
+})
+
 test("File Streams", async () => {
 	const data = "test file data"
 	const blob = new Blob([data])
