@@ -117,6 +117,7 @@ fn index(root: &Path) -> (tempfile::TempDir, RootsIndex) {
 			account_root: Some(ACCOUNT_ROOT),
 			kept: Vec::new(),
 			unregistered: false,
+			branding: None,
 		})
 		.unwrap();
 	(temp, index)

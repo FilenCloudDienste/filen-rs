@@ -164,6 +164,7 @@ mod tests {
 			account_root: None,
 			kept: Vec::new(),
 			unregistered: false,
+			branding: None,
 		}
 	}
 

@@ -557,7 +557,7 @@ impl<P: Platform, O: DriveOpener> Helper<P, O> {
 			root,
 			user,
 			data_dir,
-			..
+			branding,
 		} = registration;
 		let data_dir = DataDir::new(data_dir)
 			.map_err(|e| ReplyError::new(ErrorCode::DataDirInvalid, e.to_string()))?;
@@ -675,6 +675,7 @@ impl<P: Platform, O: DriveOpener> Helper<P, O> {
 				account_root: account_root.or(known),
 				kept: Vec::new(),
 				unregistered: false,
+				branding,
 			})
 			.map_err(|e| index_error(&e))?;
 		let registered = Registered {
@@ -1245,6 +1246,7 @@ impl<P: Platform, O: DriveOpener> Helper<P, O> {
 					root: entry.root.clone(),
 					user: entry.user,
 					data_dir: entry.data_dir.clone(),
+					branding: entry.branding.clone(),
 				};
 				if let Err(error) = self.register(registration).await {
 					warn!(code = ?reply_code(&error), "serving the root before unregistering it failed");

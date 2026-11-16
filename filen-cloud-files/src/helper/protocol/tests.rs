@@ -369,6 +369,36 @@ fn a_register_carries_its_fields() {
 	assert_eq!(registration.root.as_path(), Path::new("C:\\r"));
 	assert_eq!(registration.data_dir, PathBuf::from("C:\\d"));
 	assert_eq!(registration.user, UserId::from(42));
+	assert_eq!(registration.branding, None);
+}
+
+#[test]
+fn a_register_carries_the_branding_it_names() {
+	let message = parse_line(
+		r#"{"t":"register","id":1,"root":"C:\\r","userId":"42","dataDir":"C:\\d","displayName":"Filen (2)","iconPath":"C:\\F\\Filen.exe","iconIndex":-5}"#,
+	)
+	.unwrap();
+	let Request::Register(registration) = message.request else {
+		panic!("not a register");
+	};
+	let branding = registration.branding.unwrap();
+	assert_eq!(branding.display_name.as_str(), "Filen (2)");
+	assert_eq!(
+		branding.icon.as_ref().map(|icon| icon.as_str()),
+		Some("C:\\F\\Filen.exe")
+	);
+	assert_eq!(branding.icon_index, -5);
+}
+
+#[test]
+fn a_refused_branding_names_its_rule_and_quotes_nothing() {
+	let error = parse_line(
+		r#"{"t":"register","id":3,"root":"C:\\r","userId":"42","dataDir":"C:\\d","displayName":"secret%"}"#,
+	)
+	.unwrap_err();
+	assert_eq!(error.code, ErrorCode::InvalidMessage);
+	assert_eq!(error.id, Some(id(3)));
+	assert_eq!(error.message, "displayName holds a %");
 }
 
 #[test]

@@ -13,9 +13,11 @@ use std::path::{Path, PathBuf};
 use filen_sdk_rs::io::write_private_file_atomically;
 use filen_types::fs::Uuid;
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
-use crate::helper::protocol::{
-	ErrorCode, KeptEarlier, KeptId, KeptItem, ReplyError, RootDir, UserId,
+use crate::{
+	branding::Branding,
+	helper::protocol::{ErrorCode, KeptEarlier, KeptId, KeptItem, ReplyError, RootDir, UserId},
 };
 
 /// The index's format version.
@@ -82,6 +84,10 @@ pub(crate) struct RootEntry {
 	pub(crate) kept: Vec<KeptRecord>,
 	/// The root is unregistered and the user's data wiped: the entry stays only for `kept`.
 	pub(crate) unregistered: bool,
+	/// What File Explorer shows for the root, as the last `register` named it; `None` for the
+	/// default. Kept so a root served again without a `register` (before an unregister) shows the
+	/// same.
+	pub(crate) branding: Option<Branding>,
 }
 
 impl RootEntry {
@@ -193,6 +199,12 @@ struct EntryWire {
 	kept: Vec<KeptWire>,
 	#[serde(default, skip_serializing_if = "is_false")]
 	unregistered: bool,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	display_name: Option<String>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	icon_path: Option<String>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	icon_index: Option<i32>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -372,6 +384,20 @@ impl RootsIndex {
 					account_root: entry.account_root,
 					kept: entry.kept.iter().map(kept_wire).collect(),
 					unregistered: entry.unregistered,
+					display_name: entry
+						.branding
+						.as_ref()
+						.map(|branding| branding.display_name.as_str().to_owned()),
+					icon_path: entry
+						.branding
+						.as_ref()
+						.and_then(|branding| branding.icon.as_ref())
+						.map(|icon| icon.as_str().to_owned()),
+					icon_index: entry
+						.branding
+						.as_ref()
+						.filter(|branding| branding.icon.is_some())
+						.map(|branding| branding.icon_index),
 				})
 				.collect(),
 		};
@@ -409,9 +435,28 @@ fn parse(bytes: &[u8]) -> Option<Vec<RootEntry>> {
 					.map(kept_record)
 					.collect::<Option<_>>()?,
 				unregistered: entry.unregistered,
+				branding: stored_branding(
+					entry.display_name.as_deref(),
+					entry.icon_path.as_deref(),
+					entry.icon_index,
+				),
 			})
 		})
 		.collect()
+}
+
+/// The branding an entry stored, or the default when it holds none, or one this build refuses:
+/// the index is a file any process of the user can write, and the default is always safe to show,
+/// so a bad value does not make the whole index unreadable.
+fn stored_branding(
+	display_name: Option<&str>,
+	icon: Option<&str>,
+	icon_index: Option<i32>,
+) -> Option<Branding> {
+	Branding::parse(display_name, icon, icon_index)
+		.inspect_err(|error| warn!(%error, "the index's branding is refused; the default is shown"))
+		.ok()
+		.flatten()
 }
 
 fn kept_wire(record: &KeptRecord) -> KeptWire {
@@ -464,7 +509,42 @@ mod tests {
 			account_root: None,
 			kept: Vec::new(),
 			unregistered: false,
+			branding: None,
 		}
+	}
+
+	#[test]
+	fn a_roots_branding_is_written_through_and_read_back() {
+		let (_temp, dir) = state_dir();
+		let mut index = RootsIndex::load(&dir).unwrap();
+		let mut named = entry(1, "C:\\a");
+		named.branding =
+			Branding::parse(Some("Filen (2)"), Some("C:\\Filen\\Filen.exe"), Some(2)).unwrap();
+		index.upsert(named.clone()).unwrap();
+		index.upsert(entry(2, "C:\\b")).unwrap();
+		let bytes = std::fs::read(dir.path().join(INDEX_FILE_NAME)).unwrap();
+		let text = String::from_utf8(bytes).unwrap();
+		assert!(
+			text.contains(
+				r#""displayName":"Filen (2)","iconPath":"C:\\Filen\\Filen.exe","iconIndex":2"#
+			),
+			"{text}"
+		);
+		let loaded = RootsIndex::load(&dir).unwrap();
+		assert_eq!(loaded.entries(), [named, entry(2, "C:\\b")]);
+	}
+
+	#[test]
+	fn a_branding_the_index_holds_that_this_build_refuses_reads_as_the_default() {
+		let (_temp, dir) = state_dir();
+		std::fs::create_dir_all(dir.path()).unwrap();
+		std::fs::write(
+			dir.path().join(INDEX_FILE_NAME),
+			r#"{"version":1,"roots":[{"userId":"1","root":"C:\\a","dataDir":"C:\\d","accountRoot":null,"displayName":"%x%","iconPath":"rel.ico"}]}"#,
+		)
+		.unwrap();
+		let loaded = RootsIndex::load(&dir).unwrap();
+		assert_eq!(loaded.entries()[0].branding, None);
 	}
 
 	#[test]
