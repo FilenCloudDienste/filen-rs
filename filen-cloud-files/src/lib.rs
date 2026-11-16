@@ -11,11 +11,15 @@
 // Stdout carries the helper's protocol alone.
 #![deny(clippy::print_stdout)]
 
+mod drive;
 mod failure;
 mod identity;
 mod names;
+mod os;
 mod placeholder;
 mod root_path;
+#[cfg(any(test, feature = "test-seams"))]
+pub mod test_support;
 
 /// Seals the OS-facing traits: only this crate implements them, so the core can rely on what each
 /// implementation does.
@@ -23,6 +27,7 @@ mod sealed {
 	pub trait Sealed {}
 }
 
+pub use drive::Drive;
 pub use failure::Failure;
 pub use identity::{IdentityBlob, IdentityError, MAX_IDENTITY_LEN, PlaceholderIdentity};
 pub use names::{NameRejection, PlaceholderName};
