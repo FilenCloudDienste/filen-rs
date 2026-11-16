@@ -132,17 +132,24 @@ mod pipeline {
 		sync::{Arc, Mutex, OnceLock, RwLock},
 	};
 
-	use filen_types::{auth::APIKey, crypto::EncryptedString, fs::Uuid};
+	use filen_types::{
+		api::v3::user::lock::{LockType, Request},
+		auth::APIKey,
+		crypto::EncryptedString,
+		fs::Uuid,
+	};
 
 	use super::*;
 	use crate::{
 		auth::{http::ClientConfig, unauth::UnauthClient},
 		crypto::error::ConversionError,
 		socket::{
+			LockCommands, LockReply, ack_args,
 			events::DecryptedSocketEvent,
+			lock_transport::test_support::Seen,
 			writer::{self, Writer},
 		},
-		sync::lock::{Holder, OpenLease},
+		sync::lock::{Holder, LockPayload, OpenLease},
 	};
 
 	// ----- scripted fake transport -----
@@ -1119,8 +1126,8 @@ mod pipeline {
 	}
 
 	/// The client's lock transport, as the websocket task last published it.
-	fn lock_transport(client: &AuthClient) -> LockTransport {
-		*client.lock_transport.subscribe().borrow()
+	fn lock_transport(client: &AuthClient) -> Seen {
+		Seen::from(&client.lock_transport.current())
 	}
 
 	/// The `lockHello` probes sent so far.
@@ -1139,21 +1146,18 @@ mod pipeline {
 	async fn an_answered_lock_hello_selects_socket_locks() {
 		let config = test_config();
 		let client = Arc::clone(&config.client);
-		assert_eq!(lock_transport(&client), LockTransport::Connecting);
+		assert_eq!(lock_transport(&client), Seen::Connecting);
 		let connections = vec![FakeConnection::new(handshake_then(vec![
 			ServerAction::Delayed(Duration::from_secs(1), LOCK_HELLO_V2.to_string()),
 			ServerAction::Hang,
 		]))];
 		drive(connections, config, async |sender| {
 			sleep(Duration::from_millis(500)).await;
-			assert_eq!(
-				lock_transport(&client),
-				LockTransport::Probing { generation: 1 }
-			);
+			assert_eq!(lock_transport(&client), Seen::Probing { generation: 1 });
 			sleep(Duration::from_secs(1)).await;
 			assert_eq!(
 				lock_transport(&client),
-				LockTransport::Socket {
+				Seen::Socket {
 					generation: 1,
 					version: 2,
 					ttl: Duration::from_secs(60)
@@ -1162,7 +1166,7 @@ mod pipeline {
 			drop(sender);
 		})
 		.await;
-		assert_eq!(lock_transport(&client), LockTransport::None);
+		assert_eq!(lock_transport(&client), Seen::None);
 		assert_eq!(sent_probes(), [r#"420["lockHello"]"#]);
 	}
 
@@ -1178,20 +1182,11 @@ mod pipeline {
 		]))];
 		drive(connections, config, async |sender| {
 			sleep(Duration::from_millis(4_999)).await;
-			assert_eq!(
-				lock_transport(&client),
-				LockTransport::Probing { generation: 1 }
-			);
+			assert_eq!(lock_transport(&client), Seen::Probing { generation: 1 });
 			sleep(Duration::from_millis(2)).await;
-			assert_eq!(
-				lock_transport(&client),
-				LockTransport::Http { generation: 1 }
-			);
+			assert_eq!(lock_transport(&client), Seen::Http { generation: 1 });
 			sleep(Duration::from_secs(2)).await;
-			assert_eq!(
-				lock_transport(&client),
-				LockTransport::Http { generation: 1 }
-			);
+			assert_eq!(lock_transport(&client), Seen::Http { generation: 1 });
 			drop(sender);
 		})
 		.await;
@@ -1222,23 +1217,20 @@ mod pipeline {
 			sleep(Duration::from_secs(1)).await;
 			assert_eq!(
 				lock_transport(&client),
-				LockTransport::Socket {
+				Seen::Socket {
 					generation: 1,
 					version: 2,
 					ttl: Duration::from_secs(60)
 				}
 			);
 			sleep(Duration::from_millis(1_500)).await;
-			assert_eq!(lock_transport(&client), LockTransport::Connecting);
+			assert_eq!(lock_transport(&client), Seen::Connecting);
+			sleep(Duration::from_secs(1)).await;
+			assert_eq!(lock_transport(&client), Seen::Probing { generation: 2 });
 			sleep(Duration::from_secs(1)).await;
 			assert_eq!(
 				lock_transport(&client),
-				LockTransport::Probing { generation: 2 }
-			);
-			sleep(Duration::from_secs(1)).await;
-			assert_eq!(
-				lock_transport(&client),
-				LockTransport::Socket {
+				Seen::Socket {
 					generation: 2,
 					version: 1,
 					ttl: Duration::from_secs(30)
@@ -1278,7 +1270,7 @@ mod pipeline {
 			Arc::new(NoopCrypter),
 			test_private_key(),
 		);
-		let live = LockTransport::Socket {
+		let live = Seen::Socket {
 			generation: 2,
 			version: 1,
 			ttl: Duration::from_secs(30),
@@ -1287,7 +1279,7 @@ mod pipeline {
 			sleep(Duration::from_secs(1)).await;
 			assert_eq!(
 				lock_transport(&client),
-				LockTransport::Socket {
+				Seen::Socket {
 					generation: 1,
 					version: 2,
 					ttl: Duration::from_secs(60)
@@ -1312,7 +1304,99 @@ mod pipeline {
 		};
 		tokio::join!(first_task, driver);
 		assert_eq!(connect_count(), 2);
-		assert_eq!(lock_transport(&client), LockTransport::None);
+		assert_eq!(lock_transport(&client), Seen::None);
+	}
+
+	/// The commands of the connection that speaks socket locks now.
+	fn lock_commands(client: &AuthClient) -> LockCommands {
+		match client.lock_transport.current() {
+			LockTransport::Socket { commands, .. } => commands,
+			other => panic!("no connection speaks socket locks: {other:?}"),
+		}
+	}
+
+	/// A Refresh of the lock with uuid 1 on `r`.
+	fn refresh_payload() -> LockPayload {
+		LockPayload::new(&Request {
+			uuid: Uuid::from_u128(1),
+			r#type: LockType::Refresh,
+			resource: Cow::Borrowed("r"),
+		})
+		.unwrap()
+	}
+
+	/// A lock operation handed to a connection that speaks socket locks goes out as a `lock`
+	/// event with the id after the probe's, behind the probe, and the server's ack answers it.
+	#[tokio::test(start_paused = true)]
+	async fn a_lock_operation_travels_over_the_socket_and_its_ack_answers_it() {
+		let config = test_config();
+		let client = Arc::clone(&config.client);
+		let connections = vec![FakeConnection::new(handshake_then(vec![
+			ServerAction::Msg(LOCK_HELLO_V2.to_string()),
+			ServerAction::Delayed(
+				Duration::from_secs(1),
+				r#"431[{"status":true}]"#.to_string(),
+			),
+			ServerAction::Hang,
+		]))];
+		drive(connections, config, async |sender| {
+			sleep(Duration::from_millis(500)).await;
+			let reply = lock_commands(&client).send(refresh_payload(), None).await;
+			assert_eq!(reply, LockReply::Answered(ack_args(r#"[{"status":true}]"#)));
+			drop(sender);
+		})
+		.await;
+		assert_eq!(
+			sent_frames()
+				.into_iter()
+				// the events sent with an ack id
+				.filter(|frame| frame
+					.strip_prefix("42")
+					.is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit())))
+				.collect::<Vec<_>>(),
+			[
+				r#"420["lockHello"]"#,
+				r#"421["lock",{"uuid":"00000000-0000-0000-0000-000000000001","type":"refresh","resource":"r"}]"#,
+			]
+		);
+	}
+
+	/// A connection whose API key the server no longer accepts for lock operations ends, and the
+	/// next one authenticates and probes again.
+	#[tokio::test(start_paused = true)]
+	async fn a_rejected_key_makes_the_socket_reconnect() {
+		let config = test_config();
+		let client = Arc::clone(&config.client);
+		let connections = vec![
+			FakeConnection::new(handshake_then(vec![
+				ServerAction::Msg(LOCK_HELLO_V2.to_string()),
+				ServerAction::Hang,
+			])),
+			FakeConnection::new(handshake_then(vec![
+				ServerAction::Msg(LOCK_HELLO_V2.to_string()),
+				ServerAction::Hang,
+			])),
+		];
+		drive(connections, config, async |sender| {
+			sleep(Duration::from_millis(500)).await;
+			assert_eq!(connect_count(), 1);
+			lock_commands(&client).reauthenticate();
+			sleep(Duration::from_millis(100)).await;
+			assert_eq!(lock_transport(&client), Seen::Connecting);
+			// Reconnected after `RECONNECT_DELAY`.
+			sleep(Duration::from_secs(1)).await;
+			assert_eq!(connect_count(), 2);
+			assert_eq!(
+				lock_transport(&client),
+				Seen::Socket {
+					generation: 2,
+					version: 2,
+					ttl: Duration::from_secs(60)
+				}
+			);
+			drop(sender);
+		})
+		.await;
 	}
 
 	/// Every lock announcement reaches the client's lock board, also one no listener asked for,

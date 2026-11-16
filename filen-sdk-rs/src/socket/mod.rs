@@ -20,9 +20,25 @@ mod writer;
 use traits::EventListenerCallback;
 
 #[cfg(feature = "test-seams")]
-use lock_transport::LockTransport;
+use filen_types::{
+	api::{
+		response::FilenResponse,
+		v3::user::lock::{LockType, Request, Response},
+	},
+	fs::Uuid,
+};
 
-pub(crate) use {lock_transport::LockTransportSlot, thread_handling::WebSocketHandle};
+#[cfg(feature = "test-seams")]
+use crate::sync::lock::LockPayload;
+
+#[cfg(test)]
+pub(crate) use acks::test_support::ack_args;
+#[cfg(test)]
+pub(crate) use lock_transport::test_support as lock_transport_test_support;
+pub(crate) use {
+	lock_transport::{LockCommands, LockReply, LockTransport, LockTransportSlot},
+	thread_handling::WebSocketHandle,
+};
 
 pub use {events::*, thread_handling::ListenerHandle};
 
@@ -167,6 +183,34 @@ impl Client {
 			| LockTransport::Probing { .. }
 			| LockTransport::Http { .. } => None,
 		}
+	}
+
+	// Test seam: the live lock tests check that a lock operation is answered over the socket, which
+	// a lock operation of the client's own falls back from to HTTP without a trace. Gated behind
+	// the `test-seams` feature, which production builds never enable.
+	/// Asks the current connection, over the socket only, whether `resource` is locked: `None`
+	/// when no connection speaks socket locks or the socket left the answer unknown. Test code
+	/// only.
+	#[cfg(feature = "test-seams")]
+	pub async fn socket_lock_status_for_test(&self, resource: &str) -> Option<bool> {
+		let LockTransport::Socket { commands, .. } = self.client().lock_transport.current() else {
+			return None;
+		};
+		let payload = LockPayload::new(&Request {
+			uuid: Uuid::new_v4(),
+			r#type: LockType::Status,
+			resource: Cow::Borrowed(resource),
+		})
+		.ok()?;
+		let LockReply::Answered(args) = commands.send(payload, None).await else {
+			return None;
+		};
+		let response = args
+			.single_arg::<FilenResponse<'_, Response<'_>>>()
+			.ok()?
+			.into_data()
+			.ok()?;
+		Some(response.status.is_some())
 	}
 
 	pub async fn get_last_event_ids(

@@ -7,6 +7,10 @@
 //! of a remote file not matching its hash additionally need the `malformed` feature to construct
 //! their preconditions: run the suite with `-F sync-engine-live-tests,malformed` to include them.
 
+// The sync engine's and the cache's futures nest deep enough that computing the layout of a
+// future awaiting them overflows the default limit of 128 queries.
+#![recursion_limit = "256"]
+
 use std::{borrow::Cow, path::PathBuf, sync::Arc, time::Duration};
 
 use filen_macros::shared_test_runtime;

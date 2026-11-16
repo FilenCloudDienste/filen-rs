@@ -5,6 +5,10 @@
 //!   - `SYNC_STRESS_N`             (Test 1, default 10_000): item count of the round-trip tree.
 //!   - `SYNC_STRESS_CONTENTION_N`  (Test 2, default 200):    total disjoint-file count.
 
+// The sync engine's and the cache's futures nest deep enough that computing the layout of a
+// future awaiting them overflows the default limit of 128 queries.
+#![recursion_limit = "256"]
+
 use std::{collections::BTreeSet, path::Path, time::Duration};
 
 use filen_macros::shared_test_runtime;

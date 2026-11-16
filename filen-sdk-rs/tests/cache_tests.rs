@@ -1,3 +1,7 @@
+// The sync engine's and the cache's futures nest deep enough that computing the layout of a
+// future awaiting them overflows the default limit of 128 queries.
+#![recursion_limit = "256"]
+
 use std::{
 	borrow::Cow,
 	path::Path,

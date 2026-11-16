@@ -29,8 +29,29 @@ impl Ack<'_> {
 
 	/// The ack's arguments when there is exactly one, as `T`.
 	pub(super) fn single_arg<T: DeserializeOwned>(&self) -> Result<T, serde_json::Error> {
-		serde_json::from_str::<(T,)>(self.args).map(|(arg,)| arg)
+		single_arg(self.args)
 	}
+
+	/// The ack's arguments, kept for whoever waits for them to parse.
+	pub(super) fn to_owned_args(&self) -> AckArgs {
+		AckArgs(self.args.to_owned())
+	}
+}
+
+/// An ack's arguments, a JSON array not yet parsed, handed to the task that waits for the ack so
+/// the connection's loop does no parsing for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AckArgs(String);
+
+impl AckArgs {
+	/// The arguments when there is exactly one, as `T`.
+	pub(crate) fn single_arg<T: DeserializeOwned>(&self) -> Result<T, serde_json::Error> {
+		single_arg(&self.0)
+	}
+}
+
+fn single_arg<T: DeserializeOwned>(args: &str) -> Result<T, serde_json::Error> {
+	serde_json::from_str::<(T,)>(args).map(|(arg,)| arg)
 }
 
 /// Why a frame that starts like an ack is not one this client can have asked for.
@@ -115,18 +136,18 @@ impl<W> Default for PendingAcks<W> {
 
 impl<W> PendingAcks<W> {
 	/// Registers `waiter` for an ack due by `deadline` and returns the id to send the event
-	/// with, or `None` when every id is taken.
-	pub(super) fn insert(&mut self, waiter: W, deadline: Instant) -> Option<u32> {
+	/// with, or hands `waiter` back when every id is taken.
+	pub(super) fn insert(&mut self, waiter: W, deadline: Instant) -> Result<u32, W> {
 		// Of `len + 1` consecutive ids at least one is free, unless every id is taken.
 		for _ in 0..=self.entries.len() {
 			let id = self.next_id;
 			self.next_id = self.next_id.wrapping_add(1);
 			if let Entry::Vacant(entry) = self.entries.entry(id) {
 				entry.insert(Pending::Waiting { deadline, waiter });
-				return Some(id);
+				return Ok(id);
 			}
 		}
-		None
+		Err(waiter)
 	}
 
 	/// Settles the ack with `id`, freeing the id.
@@ -136,6 +157,22 @@ impl<W> PendingAcks<W> {
 			Some(Pending::Abandoned) => Settled::Stale,
 			None => Settled::Unknown,
 		}
+	}
+
+	/// How many ids are taken: the acks waited for, and those given up on that did not arrive.
+	pub(super) fn len(&self) -> usize {
+		self.entries.len()
+	}
+
+	/// The waiters of every ack still waited for, which no ack will reach any more: the
+	/// connection ended.
+	pub(super) fn into_waiters(self) -> impl Iterator<Item = W> {
+		self.entries
+			.into_values()
+			.filter_map(|pending| match pending {
+				Pending::Waiting { waiter, .. } => Some(waiter),
+				Pending::Abandoned => None,
+			})
 	}
 
 	/// The earliest deadline of an ack still waited for.
@@ -160,6 +197,16 @@ impl<W> PendingAcks<W> {
 			}
 		}
 		expired
+	}
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+	use super::AckArgs;
+
+	/// The arguments `json` (a JSON array) of an ack a test plays the server for.
+	pub(crate) fn ack_args(json: &str) -> AckArgs {
+		AckArgs(json.to_owned())
 	}
 }
 
@@ -218,15 +265,15 @@ mod tests {
 	async fn ids_count_up_from_zero_and_skip_pending_ones() {
 		let deadline = Instant::now() + Duration::from_secs(5);
 		let mut pending = PendingAcks::default();
-		assert_eq!(pending.insert('a', deadline), Some(0));
-		assert_eq!(pending.insert('b', deadline), Some(1));
+		assert_eq!(pending.insert('a', deadline), Ok(0));
+		assert_eq!(pending.insert('b', deadline), Ok(1));
 		assert_eq!(pending.settle(0), Settled::Answered('a'));
 
 		pending.next_id = u32::MAX;
-		assert_eq!(pending.insert('c', deadline), Some(u32::MAX));
+		assert_eq!(pending.insert('c', deadline), Ok(u32::MAX));
 		// 0 is free again, 1 is still pending.
-		assert_eq!(pending.insert('d', deadline), Some(0));
-		assert_eq!(pending.insert('e', deadline), Some(2));
+		assert_eq!(pending.insert('d', deadline), Ok(0));
+		assert_eq!(pending.insert('e', deadline), Ok(2));
 		assert_eq!(pending.settle(1), Settled::Answered('b'));
 		assert_eq!(pending.settle(u32::MAX), Settled::Answered('c'));
 	}
@@ -235,11 +282,8 @@ mod tests {
 	async fn an_ack_after_its_deadline_is_stale_and_frees_its_id() {
 		let begin = Instant::now();
 		let mut pending = PendingAcks::default();
-		assert_eq!(pending.insert('a', begin + Duration::from_secs(5)), Some(0));
-		assert_eq!(
-			pending.insert('b', begin + Duration::from_secs(10)),
-			Some(1)
-		);
+		assert_eq!(pending.insert('a', begin + Duration::from_secs(5)), Ok(0));
+		assert_eq!(pending.insert('b', begin + Duration::from_secs(10)), Ok(1));
 		assert_eq!(
 			pending.next_deadline(),
 			Some(begin + Duration::from_secs(5))
@@ -261,7 +305,7 @@ mod tests {
 
 		// The abandoned id stays taken until its ack arrives.
 		pending.next_id = 0;
-		assert_eq!(pending.insert('c', begin), Some(2));
+		assert_eq!(pending.insert('c', begin), Ok(2));
 		assert_eq!(pending.settle(0), Settled::Stale);
 		assert_eq!(pending.settle(0), Settled::Unknown);
 		assert_eq!(pending.settle(7), Settled::Unknown);

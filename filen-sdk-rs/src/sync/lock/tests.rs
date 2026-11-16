@@ -380,7 +380,7 @@ fn a_lock_request_its_caller_stopped_waiting_for_is_waited_for_until_it_ends() {
 	let mut request = Box::pin(request_acquire(
 		Arc::clone(&client),
 		lock_url().into(),
-		Bytes::new(),
+		lock_payload(LockType::Acquire, Uuid::from_u128(1), "test-resource").unwrap(),
 		Uuid::from_u128(1),
 		"test-resource".into(),
 		None,
@@ -1459,6 +1459,7 @@ fn announcing() -> LockTransport {
 		generation: 1,
 		version: 2,
 		ttl: Duration::from_secs(60),
+		commands: crate::socket::lock_transport_test_support::scripted_commands().0,
 	}
 }
 
@@ -1717,6 +1718,7 @@ async fn a_wait_without_announcements_keeps_the_ladder() {
 				generation: 1,
 				version: 1,
 				ttl: Duration::from_secs(60),
+				commands: crate::socket::lock_transport_test_support::scripted_commands().0,
 			},
 			"r",
 		),
@@ -2365,8 +2367,8 @@ async fn a_lock_request_nobody_waits_for_releases_a_lost_answer() {
 	let mut request = Box::pin(request_acquire(
 		Arc::clone(&client),
 		format!("http://{addr}/v3/user/lock").into(),
-		// told apart from the release's body
-		Bytes::from_static(b"acquire"),
+		// told apart from the release's body by its type
+		lock_payload(LockType::Acquire, Uuid::from_u128(1), "test-resource").unwrap(),
 		Uuid::from_u128(1),
 		"test-resource".into(),
 		None,
@@ -2671,12 +2673,11 @@ async fn a_shutdown_waits_for_a_retrying_release_within_its_bound() {
 async fn a_release_retry_never_frees_a_newer_lease() {
 	let (old, newer) = (Uuid::new_v4(), Uuid::new_v4());
 	let holder = std::cell::Cell::new(Some(old));
-	let body = release_body(old, "drive-write").unwrap();
+	let payload = lock_payload(LockType::Release, old, "drive-write").unwrap();
 	let mut released = Vec::new();
 	release_loop(
 		|| {
-			let request: api::v3::user::lock::Request =
-				serde_json::from_slice(&body).expect("a lock request");
+			let request: Request = serde_json::from_str(payload.json()).expect("a lock request");
 			assert!(matches!(request.r#type, LockType::Release));
 			assert_eq!(request.resource, "drive-write");
 			released.push(request.uuid);
@@ -2830,7 +2831,7 @@ fn a_lock_request_its_caller_stopped_waiting_for_stays_owed_until_it_ends() {
 	let mut request = Box::pin(request_acquire(
 		Arc::clone(&client),
 		lock_url().into(),
-		Bytes::new(),
+		lock_payload(LockType::Acquire, uuid, "test-resource").unwrap(),
 		uuid,
 		"test-resource".into(),
 		client.lock_listener.record(uuid, "test-resource"),
@@ -2969,4 +2970,277 @@ async fn released_locks_are_owed_until_their_releases_are_given_up_on() {
 			lock_event(LockEventKind::Settled, notes, "notes-write"),
 		]
 	);
+}
+
+/// Lock operations over a socket the test plays.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+mod over_the_socket {
+	use tokio::sync::mpsc;
+
+	use super::*;
+	use crate::socket::{
+		LockReply, LockTransport, ack_args,
+		lock_transport_test_support::{LockCommand, Published, publish, scripted_commands},
+	};
+
+	/// Publishes a connection that speaks socket locks on `client`, until the returned value
+	/// drops. Returns the end its commands arrive at.
+	fn speak_socket_locks(client: &AuthClient) -> (Published, mpsc::Receiver<LockCommand>) {
+		let (commands, receiver) = scripted_commands();
+		let published = publish(
+			&client.lock_transport,
+			LockTransport::Socket {
+				generation: 1,
+				version: 2,
+				ttl: Duration::from_secs(60),
+				commands,
+			},
+		);
+		(published, receiver)
+	}
+
+	/// Takes the next operation handed to the connection, checks it is a `kind` of lock `uuid`
+	/// on `resource`, and replies `reply`.
+	async fn serve(
+		commands: &mut mpsc::Receiver<LockCommand>,
+		kind: &str,
+		uuid: Uuid,
+		resource: &str,
+		reply: LockReply,
+	) {
+		let Some(LockCommand::Send { payload, reply: to }) = commands.recv().await else {
+			panic!("an operation is handed to the connection");
+		};
+		assert_eq!(
+			payload.json(),
+			format!(r#"{{"uuid":"{uuid}","type":"{kind}","resource":"{resource}"}}"#)
+		);
+		to.send(reply).unwrap();
+	}
+
+	/// An answer of the server's with `data` as its data.
+	fn answered(data: &str) -> LockReply {
+		LockReply::Answered(ack_args(&format!(
+			r#"[{{"status":true,"message":"","code":"","data":{data}}}]"#
+		)))
+	}
+
+	/// The keep-alive's refresh, and a confirmation's, goes over the socket: an offline client's
+	/// HTTP could not confirm the lock.
+	#[tokio::test(start_paused = true)]
+	async fn a_confirmation_is_answered_over_the_socket() {
+		let lock = unconfirmed_lock(LOCK_LOSS_BUDGET + Duration::from_secs(5));
+		let (_published, mut commands) = speak_socket_locks(&lock.lease.client);
+		let refreshed = answered(
+			r#"{"acquired":false,"released":false,"refreshed":true,"resource":"test-resource","status":"locked"}"#,
+		);
+		let (confirmed, ()) = tokio::join!(
+			lock.confirm(),
+			serve(
+				&mut commands,
+				"refresh",
+				lock.lease.uuid,
+				"test-resource",
+				refreshed
+			)
+		);
+		confirmed.unwrap();
+		assert!(lock.is_valid());
+	}
+
+	/// An Acquire the socket cannot say it ran may have been granted, and may still be: noted for
+	/// the acquisition, which owes a release for it should it fail, as it does here offline.
+	#[tokio::test(start_paused = true)]
+	async fn an_acquire_the_socket_left_unknown_may_have_been_granted() {
+		let client = offline_client();
+		let (_published, mut commands) = speak_socket_locks(&client);
+		let uuid = Uuid::from_u128(1);
+		let acquisition = Arc::new(LostAnswers::default());
+		let request = request_acquire(
+			Arc::clone(&client),
+			lock_url().into(),
+			lock_payload(LockType::Acquire, uuid, "test-resource").unwrap(),
+			uuid,
+			"test-resource".into(),
+			None,
+			Arc::clone(&acquisition),
+		);
+		let (acquired, ()) = tokio::join!(
+			request,
+			serve(
+				&mut commands,
+				"acquire",
+				uuid,
+				"test-resource",
+				LockReply::Unknown
+			)
+		);
+		acquired.expect_err("offline, HTTP never reaches the server");
+		assert!(acquisition.latest().is_some());
+	}
+
+	/// An Acquire the socket did not send was never granted there.
+	#[tokio::test(start_paused = true)]
+	async fn an_acquire_the_socket_did_not_send_is_not_noted() {
+		let client = offline_client();
+		let (_published, mut commands) = speak_socket_locks(&client);
+		let uuid = Uuid::from_u128(1);
+		let acquisition = Arc::new(LostAnswers::default());
+		let request = request_acquire(
+			Arc::clone(&client),
+			lock_url().into(),
+			lock_payload(LockType::Acquire, uuid, "test-resource").unwrap(),
+			uuid,
+			"test-resource".into(),
+			None,
+			Arc::clone(&acquisition),
+		);
+		let (acquired, ()) = tokio::join!(
+			request,
+			serve(
+				&mut commands,
+				"acquire",
+				uuid,
+				"test-resource",
+				LockReply::NotSent
+			)
+		);
+		acquired.expect_err("offline, HTTP never reaches the server");
+		assert!(acquisition.latest().is_none());
+	}
+
+	/// A release sent from a thread of its own, on a runtime of its own, reaches a live socket:
+	/// the server's answer there settles it, and nothing goes over HTTP.
+	#[test]
+	fn a_release_sent_from_a_thread_of_its_own_goes_over_a_live_socket() {
+		let (observer, proxy, client) = proxy_and_client();
+		let (_published, mut commands) = speak_socket_locks(&client);
+		let lock = test_lock_on(Arc::clone(&client), None);
+		let uuid = lock.lease.uuid;
+
+		std::thread::spawn(move || std::mem::drop(lock))
+			.join()
+			.unwrap();
+
+		let released = answered(
+			r#"{"acquired":false,"released":true,"refreshed":false,"resource":"test-resource","status":null}"#,
+		);
+		observer.block_on(async {
+			timeout(
+				Duration::from_secs(30),
+				serve(&mut commands, "release", uuid, "test-resource", released),
+			)
+			.await
+			.expect("the release is handed to the socket");
+			timeout(
+				Duration::from_secs(30),
+				client.pending_lock_releases.settled(),
+			)
+			.await
+			.expect("the socket's answer settles the release");
+			assert!(proxy.accept().now_or_never().is_none());
+		});
+	}
+
+	/// A release sent from a thread of its own while the socket's task is gone, its channel
+	/// closed, goes over HTTP at once.
+	#[test]
+	fn a_release_sent_from_a_thread_of_its_own_with_the_socket_task_gone_goes_over_http() {
+		let (observer, proxy, client) = proxy_and_client();
+		let (_published, commands) = speak_socket_locks(&client);
+		drop(commands);
+		let lock = test_lock_on(Arc::clone(&client), None);
+		confirmed_a_lease_ago(&lock);
+
+		std::thread::spawn(move || std::mem::drop(lock))
+			.join()
+			.unwrap();
+
+		assert_release_is_sent_and_waited_for(&observer, proxy, &client);
+	}
+
+	/// Takes the next operation handed to the connection, checks it is a `kind` of lock `uuid`,
+	/// and answers nothing, as a socket that stopped answering: how long its caller waited for it.
+	async fn wait_out(
+		commands: &mut mpsc::Receiver<LockCommand>,
+		kind: &str,
+		uuid: Uuid,
+	) -> Duration {
+		let begin = Instant::now();
+		let Some(LockCommand::Send { payload, mut reply }) = commands.recv().await else {
+			panic!("an operation is handed to the connection");
+		};
+		assert_eq!(
+			payload.json(),
+			format!(r#"{{"uuid":"{uuid}","type":"{kind}","resource":"test-resource"}}"#)
+		);
+		reply.closed().await;
+		begin.elapsed()
+	}
+
+	/// A release over a socket that stopped answering goes over HTTP soon enough for a shutdown,
+	/// which waits for it no longer than the settle bound, to see it sent.
+	#[tokio::test(start_paused = true)]
+	async fn a_release_waits_for_a_silent_socket_two_seconds() {
+		let client = offline_client();
+		let (_published, mut commands) = speak_socket_locks(&client);
+		let lock = test_lock_on(Arc::clone(&client), None);
+		let uuid = lock.lease.uuid;
+		drop(lock);
+		let waited = wait_out(&mut commands, "release", uuid).await;
+		assert_eq!(waited, Duration::from_secs(2));
+		assert!(waited * 2 <= LOCK_RELEASE_SETTLE_BOUND);
+	}
+
+	/// A refresh sent when the keep-alive's is due, over a socket that stopped answering, goes
+	/// over HTTP with half the time the lock is relied on still left for its answer.
+	#[tokio::test(start_paused = true)]
+	async fn a_due_refresh_waits_for_a_silent_socket_half_the_time_left() {
+		let lock = unconfirmed_lock(LOCK_REFRESH_INTERVAL);
+		// a confirmation asks the server while a suspicion stands
+		lock.lease.suspicion.raise();
+		let (_published, mut commands) = speak_socket_locks(&lock.lease.client);
+		let uuid = lock.lease.uuid;
+		let waited = tokio::select! {
+			_ = lock.confirm() => panic!("the offline client cannot confirm the lock"),
+			waited = wait_out(&mut commands, "refresh", uuid) => waited,
+		};
+		assert_eq!(waited, Duration::from_secs(5));
+		assert!(LOCK_REFRESH_INTERVAL + waited < LOCK_LOSS_BUDGET);
+	}
+
+	/// A lock no longer relied on waits for a socket that stopped answering only a second before
+	/// it asks HTTP again.
+	#[tokio::test(start_paused = true)]
+	async fn an_unconfirmed_lock_waits_for_a_silent_socket_one_second() {
+		let lock = unconfirmed_lock(LOCK_LOSS_BUDGET + Duration::from_secs(5));
+		let (_published, mut commands) = speak_socket_locks(&lock.lease.client);
+		let uuid = lock.lease.uuid;
+		let waited = tokio::select! {
+			_ = lock.confirm() => panic!("the offline client cannot confirm the lock"),
+			waited = wait_out(&mut commands, "refresh", uuid) => waited,
+		};
+		assert_eq!(waited, Duration::from_secs(1));
+	}
+
+	#[test]
+	fn a_refresh_waits_for_the_socket_half_the_time_the_lease_is_still_relied_on() {
+		let budget = Duration::from_secs(25);
+		assert_eq!(
+			refresh_socket_wait(Duration::ZERO, budget),
+			Duration::from_millis(12_500)
+		);
+		assert_eq!(
+			refresh_socket_wait(Duration::from_secs(15), budget),
+			Duration::from_secs(5)
+		);
+		assert_eq!(
+			refresh_socket_wait(Duration::from_secs(24), budget),
+			Duration::from_secs(1)
+		);
+		assert_eq!(
+			refresh_socket_wait(Duration::from_secs(u64::MAX), budget),
+			Duration::from_secs(1)
+		);
+	}
 }

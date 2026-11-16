@@ -5,6 +5,10 @@
 //!
 //! Shared scaffolding lives in `harness`.
 
+// The sync engine's and the cache's futures nest deep enough that computing the layout of a
+// future awaiting them overflows the default limit of 128 queries.
+#![recursion_limit = "256"]
+
 mod helpers;
 
 #[path = "sync_suite/harness.rs"]

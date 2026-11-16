@@ -12,7 +12,10 @@ use std::{
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use filen_macros::js_type;
-use filen_types::{api::v3::user::lock::LockType, fs::Uuid};
+use filen_types::{
+	api::v3::user::lock::{LockType, Request, Response},
+	fs::Uuid,
+};
 use futures::{FutureExt, future::join_all};
 use tokio::sync::Notify;
 use tracing::debug;
@@ -40,6 +43,7 @@ use crate::{
 };
 
 mod board;
+mod route;
 mod wait;
 
 pub(crate) use board::LockBoard;
@@ -51,6 +55,8 @@ pub(crate) use board::LockBoard;
 pub(crate) use board::lock_announced;
 #[cfg(test)]
 pub(crate) use board::{Holder, OpenLease};
+pub(crate) use route::LockPayload;
+use route::route_lock_op;
 use wait::{LockWakes, NextPoll, noting_refusal, wait_socket, while_contended};
 
 pub(crate) const MAX_SLEEP_TIME_DEFAULT: time::Duration = time::Duration::from_secs(30);
@@ -623,8 +629,17 @@ impl ResourceLock {
 	pub(crate) async fn confirm(&self) -> Result<(), Error> {
 		let lease = &*self.lease;
 		let url = lock_url();
-		self.confirm_via(|| send_refresh(&lease.client, &url, lease.uuid, &lease.resource))
-			.await
+		self.confirm_via(|| {
+			let socket_wait = lease.refresh_socket_wait();
+			send_refresh(
+				&lease.client,
+				&url,
+				lease.uuid,
+				&lease.resource,
+				socket_wait,
+			)
+		})
+		.await
 	}
 
 	/// [`Self::confirm`] with the refresh round-trip `refresh`, so it can be scripted in tests.
@@ -691,6 +706,12 @@ impl SharedLease {
 
 	fn is_lost(&self) -> bool {
 		!*self.valid.borrow()
+	}
+
+	/// How long a refresh of the lease sent now waits for the socket's answer before it goes
+	/// over HTTP as well (see [`refresh_socket_wait`]).
+	fn refresh_socket_wait(&self) -> Duration {
+		refresh_socket_wait(self.age(), LOCK_LOSS_BUDGET)
 	}
 
 	fn age(&self) -> Duration {
@@ -868,25 +889,51 @@ impl Drop for SharedLease {
 	}
 }
 
-/// One Refresh round-trip for the lock `uuid` on `resource`, sent to `url`: the server's
+/// One round trip of the lock operation `payload` over the client's socket or, failing that, to
+/// `url` (see [`route_lock_op`]), waiting at most `socket_wait` for the socket's answer.
+async fn send_lock_request(
+	client: &AuthClient,
+	url: &str,
+	payload: &LockPayload,
+	socket_wait: Duration,
+) -> Result<Response<'static>, Error> {
+	route_lock_op(
+		client,
+		payload,
+		Some(socket_wait),
+		|| api::v3::user::lock::post(client, url, payload),
+		// A Refresh or a Release that runs late changes no lease of another holder: a Refresh
+		// never grants one, and a Release frees only the lease of its uuid.
+		|| {},
+	)
+	.await
+}
+
+/// The serialized lock operation `kind` for the lock `uuid` on `resource`.
+fn lock_payload(kind: LockType, uuid: Uuid, resource: &str) -> Result<LockPayload, Error> {
+	Ok(LockPayload::new(&Request {
+		uuid,
+		r#type: kind,
+		resource: Cow::Borrowed(resource),
+	})?)
+}
+
+/// One Refresh round-trip for the lock `uuid` on `resource`, over the client's socket, waited on
+/// for at most `socket_wait` (see [`refresh_socket_wait`]), or sent to `url`: the server's
 /// `refreshed` flag.
 async fn send_refresh(
 	client: &AuthClient,
 	url: &str,
 	uuid: Uuid,
 	resource: &str,
+	socket_wait: Duration,
 ) -> Result<bool, Error> {
-	let result = api::v3::user::lock::post(
-		client,
-		url,
-		&api::v3::user::lock::Request {
-			uuid,
-			r#type: LockType::Refresh,
-			resource: Cow::Borrowed(resource),
-		},
-	)
-	.await
-	.map(|r| r.refreshed);
+	let result = match lock_payload(LockType::Refresh, uuid, resource) {
+		Ok(payload) => send_lock_request(client, url, &payload, socket_wait)
+			.await
+			.map(|r| r.refreshed),
+		Err(e) => Err(e),
+	};
 	match &result {
 		Ok(true) => debug!("Refreshed lock: {resource}"),
 		Ok(false) => tracing::warn!("Server refused to refresh lock: {resource}"),
@@ -895,35 +942,28 @@ async fn send_refresh(
 	result
 }
 
-/// The serialized Release of the lock `uuid` on `resource`. The server only releases a lease
-/// `uuid` holds, and every lease is acquired under a uuid of its own, so this body can never
-/// free a later lease of the same client, however late it arrives.
-fn release_body(uuid: Uuid, resource: &str) -> Result<Bytes, Error> {
-	Ok(Bytes::from_owner(serde_json::to_vec(
-		&api::v3::user::lock::Request {
-			uuid,
-			r#type: LockType::Release,
-			resource: Cow::Borrowed(resource),
-		},
-	)?))
+/// The least a refresh waits for the socket's answer.
+const REFRESH_SOCKET_MIN_WAIT: Duration = Duration::from_secs(1);
+
+/// How long a refresh of a lease confirmed `age` ago, relied on while its confirmation is younger
+/// than `loss_budget`, waits for the socket's answer before it goes over HTTP as well: half the
+/// time the lease is still relied on, so that HTTP can confirm it before it stops being, and at
+/// least [`REFRESH_SOCKET_MIN_WAIT`] once it is not relied on any more. The connection waits for
+/// the ack longer than that, and a socket that stopped answering is noticed after two acks that
+/// did not come; until then each refresh waits on it only this long.
+fn refresh_socket_wait(age: Duration, loss_budget: Duration) -> Duration {
+	(loss_budget.saturating_sub(age) / 2).max(REFRESH_SOCKET_MIN_WAIT)
 }
 
-/// One Release round-trip with the serialized request `body`, sent to `url`: the server's
-/// `released` flag.
-async fn send_release(client: &AuthClient, url: &str, body: Bytes) -> Result<bool, Error> {
-	client
-		.post_raw_bytes_auth_lock::<api::v3::user::lock::Response>(
-			body,
-			url,
-			api::v3::user::lock::ENDPOINT.into(),
-		)
-		.await
-		.map(|response| response.released)
-}
-
-/// Releases the lock `uuid` on `resource`, sent to `url`, retrying a release that fails in
-/// transport while the lease could still stand (see [`release_loop`]). `lease_age` is the time
-/// since the server last confirmed the lease.
+/// Releases the lock `uuid` on `resource`, over the client's socket or sent to `url`, retrying a
+/// release that fails in transport while the lease could still stand (see [`release_loop`]).
+/// `lease_age` is the time since the server last confirmed the lease.
+///
+/// The server only releases a lease `uuid` holds, and every lease is acquired under a uuid of its
+/// own, so this can never free a later lease of the same client, however late it arrives. Each
+/// attempt goes over whichever transport the client has then: a socket that came up during the
+/// retries carries the next one, and the connection the lease's other operations went over
+/// carries it while it still carries lock operations (see [`route`]).
 async fn release(
 	client: &AuthClient,
 	url: &str,
@@ -931,16 +971,19 @@ async fn release(
 	resource: &str,
 	lease_age: impl Fn() -> Duration,
 ) {
-	let body = match release_body(uuid, resource) {
-		Ok(body) => body,
+	let payload = match lock_payload(LockType::Release, uuid, resource) {
+		Ok(payload) => payload,
 		Err(e) => {
 			tracing::warn!("Failed to release lock {resource}: {e}");
 			return;
 		}
 	};
-	// refcount bump: every attempt resends the same Release body
 	release_loop(
-		|| send_release(client, url, body.clone()),
+		|| async {
+			send_lock_request(client, url, &payload, RELEASE_SOCKET_WAIT)
+				.await
+				.map(|response| response.released)
+		},
 		lease_age,
 		resource,
 	)
@@ -952,6 +995,11 @@ async fn release(
 const RELEASE_RETRY_FIRST: Duration = Duration::from_millis(250);
 /// The longest pause between two attempts of a release.
 const RELEASE_RETRY_MAX: Duration = Duration::from_secs(4);
+/// How long a release waits for the socket's answer before it goes over HTTP as well: well within
+/// the time a shutdown waits for releases (`LOCK_RELEASE_SETTLE_BOUND`, and the CLI's), so that a
+/// socket that stopped answering does not keep the release from reaching the server before the
+/// process exits.
+const RELEASE_SOCKET_WAIT: Duration = Duration::from_secs(2);
 
 /// Sends a release with `send` (one round trip, resolving to the server's `released` flag)
 /// until the server answers it.
@@ -1149,9 +1197,17 @@ async fn run_keep_alive(
 ) {
 	let refresh = || {
 		let lease = weak.upgrade()?;
-		Some(
-			async move { send_refresh(&lease.client, &lock_url(), lease.uuid, &lease.resource).await },
-		)
+		Some(async move {
+			let socket_wait = lease.refresh_socket_wait();
+			send_refresh(
+				&lease.client,
+				&lock_url(),
+				lease.uuid,
+				&lease.resource,
+				socket_wait,
+			)
+			.await
+		})
 	};
 	if refresh_loop(refresh, &confirmed, &valid, &suspicion).await == LoopExit::Lost
 		&& let Some(lease) = weak.upgrade()
@@ -1212,7 +1268,7 @@ fn keep_lock_alive(lease: &Arc<SharedLease>) {
 async fn request_acquire(
 	client: Arc<AuthClient>,
 	url: Arc<str>,
-	body: Bytes,
+	payload: LockPayload,
 	uuid: Uuid,
 	resource: Arc<str>,
 	record: Option<Arc<LockRecord>>,
@@ -1234,12 +1290,24 @@ async fn request_acquire(
 	let lost = Arc::new(LostAnswers::default());
 	// Detached, not cancelled: the task must outlive a caller that stopped waiting.
 	drop(crate::runtime::spawn_task_maybe_send(async move {
-		// a second handle on this request's, for the hook every attempt reports to
-		let acquired = send_acquire(&client, &url, body, {
-			let lost = Arc::clone(&lost);
-			move |error: &Error| lost.note(error)
-		})
-		.await;
+		let acquired = route_lock_op(
+			&client,
+			&payload,
+			// An acquire left unknown is owed a release: it waits as long as the connection does.
+			None,
+			|| {
+				// a second handle on this request's, for the hook every attempt reports to
+				let lost = Arc::clone(&lost);
+				send_acquire(&client, &url, payload.body(), move |error: &Error| {
+					lost.note(error)
+				})
+			},
+			// The socket may have granted it, and an Acquire that runs late can still: the HTTP
+			// attempt that follows is refused then, and a release is owed for it all the same.
+			|| lost.record(Confirmed::now()),
+		)
+		.await
+		.map(|response| response.acquired);
 		let lost_at = lost.latest();
 		if let Some(at) = lost_at {
 			acquisition.record(at);
@@ -1517,23 +1585,22 @@ where
 	}
 }
 
-/// One Acquire round-trip with the serialized request `body`, sent to `url`: the server's
-/// `acquired` flag. Each attempt that fails is handed to `on_failed_attempt`.
+/// One Acquire round-trip over HTTP with the serialized request `body`, sent to `url`. Each
+/// attempt that fails is handed to `on_failed_attempt`.
 pub(crate) async fn send_acquire(
 	client: &AuthClient,
 	url: &str,
 	body: Bytes,
 	on_failed_attempt: impl Fn(&Error) + Clone + MaybeSendSync + 'static,
-) -> Result<bool, Error> {
+) -> Result<Response<'static>, Error> {
 	client
-		.post_raw_bytes_auth_lock_reporting::<api::v3::user::lock::Response, _>(
+		.post_raw_bytes_auth_lock_reporting(
 			body,
 			url,
 			api::v3::user::lock::ENDPOINT.into(),
 			on_failed_attempt,
 		)
 		.await
-		.map(|response| response.acquired)
 }
 
 impl Client {
@@ -1576,11 +1643,7 @@ impl Client {
 		let resource = resource.into();
 		tracing::Span::current().record("resource", resource.as_str());
 		let uuid = Uuid::new_v4();
-		let bytes = Bytes::from_owner(serde_json::to_vec(&api::v3::user::lock::Request {
-			uuid,
-			r#type: LockType::Acquire,
-			resource: Cow::Borrowed(&resource),
-		})?);
+		let payload = lock_payload(LockType::Acquire, uuid, &resource)?;
 		// Shared with each attempt's request task, which can outlive this call (see
 		// `request_acquire`).
 		let url: Arc<str> = lock_url().into();
@@ -1607,8 +1670,8 @@ impl Client {
 						request_acquire(
 							Arc::clone(&client),
 							Arc::clone(&url),
-							// refcount bump: every poll resends the same Acquire body
-							bytes.clone(),
+							// refcount bump: every poll resends the same Acquire
+							payload.clone(),
 							uuid,
 							Arc::clone(&shared_resource),
 							// refcount bump

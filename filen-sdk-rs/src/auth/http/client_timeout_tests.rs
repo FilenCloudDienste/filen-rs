@@ -5,11 +5,16 @@ use std::{
 };
 
 use bytes::Bytes;
-use filen_types::{api::v3::user::lock::LockType, fs::Uuid};
+use filen_types::{
+	api::v3::user::lock::{LockType, Request},
+	fs::Uuid,
+};
 use tokio::{
 	io::{AsyncReadExt, AsyncWriteExt},
 	net::{TcpListener, TcpStream},
 };
+
+use crate::sync::lock::LockPayload;
 
 use super::{
 	AuthClient, ClientConfig, DEFAULT_CONNECT_TIMEOUT, DEFAULT_READ_TIMEOUT,
@@ -283,17 +288,14 @@ async fn send_lock_request(
 	url: String,
 	kind: LockType,
 ) -> Result<(), crate::Error> {
-	crate::api::v3::user::lock::post(
-		&client,
-		&url,
-		&crate::api::v3::user::lock::Request {
-			uuid: Uuid::new_v4(),
-			r#type: kind,
-			resource: Cow::Borrowed("r"),
-		},
-	)
-	.await
-	.map(drop)
+	let payload = LockPayload::new(&Request {
+		uuid: Uuid::new_v4(),
+		r#type: kind,
+		resource: Cow::Borrowed("r"),
+	})?;
+	crate::api::v3::user::lock::post(&client, &url, &payload)
+		.await
+		.map(drop)
 }
 
 #[tokio::test]

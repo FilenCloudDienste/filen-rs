@@ -22,7 +22,7 @@ use super::{
 	},
 	events::DecryptedSocketEvent,
 	listener_manager::{ConnectedListenerManager, DisconnectedListenerManager, ListenerManagerExt},
-	lock_transport::{ConnectionLocks, LockTransport, LockTransportClaim},
+	lock_transport::{CommandOutcome, ConnectionLocks, LockTransport, LockTransportClaim},
 	traits::*,
 };
 
@@ -567,6 +567,18 @@ where
 							"Error parsing WebSocket message: {}, continuing...",
 							e
 						);
+					}
+				}
+			},
+			command = locks.next_command(), if locks.takes_commands() => {
+				let outcome = locks.on_command(command, Instant::now(), |frame| writer.try_queue(frame));
+				match outcome {
+					CommandOutcome::Served => {}
+					CommandOutcome::Reauthenticate => {
+						tracing::warn!(
+							"The server no longer accepts this connection's API key, reconnecting"
+						);
+						break;
 					}
 				}
 			},

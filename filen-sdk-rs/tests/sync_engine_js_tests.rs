@@ -5,6 +5,10 @@
 //! --test-threads=1` (needs TEST_EMAIL / TEST_PASSWORD, and TEST_SHARE_EMAIL /
 //! TEST_SHARE_PASSWORD for the second account a refused open uses).
 
+// The sync engine's and the cache's futures nest deep enough that computing the layout of a
+// future awaiting them overflows the default limit of 128 queries.
+#![recursion_limit = "256"]
+
 use std::{
 	borrow::Cow,
 	collections::BTreeSet,

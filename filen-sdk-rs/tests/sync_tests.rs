@@ -266,6 +266,60 @@ async fn a_contended_wait_opens_the_socket_for_the_release() {
 	wait_until_free(&holding, &resource, Duration::from_secs(30)).await;
 }
 
+/// A connection that speaks socket locks answers a lock operation over the socket, and sees the
+/// locks the client takes and releases however they travelled.
+#[cfg(feature = "test-seams")]
+#[filen_macros::shared_test_runtime]
+async fn a_lock_operation_is_answered_over_the_socket() {
+	let shared = test_utils::RESOURCES.client().await;
+	// A client of its own, signed in as the shared one is, so its socket is the test's.
+	let client = UnauthClient::from_config(ClientConfig::default())
+		.expect("building an unauthenticated client")
+		.from_stringified(shared.to_stringified())
+		.expect("restoring the signed-in client");
+	let _listener = client
+		.add_event_listener(
+			Box::new(|_: &DecryptedSocketEvent<'_>| {}),
+			Some(vec![Cow::Borrowed("authSuccess")]),
+		)
+		.await
+		.unwrap();
+	let version = tokio::time::timeout(
+		Duration::from_secs(20),
+		client.lock_protocol_version_for_test(),
+	)
+	.await
+	.expect("the lockHello probe settles");
+	assert!(version.is_some(), "the server does not speak socket locks");
+
+	let resource = format!(
+		"rs-{}",
+		BASE64_URL_SAFE_NO_PAD.encode(rand::random::<[u8; 32]>())
+	);
+	assert_eq!(
+		client.socket_lock_status_for_test(&resource).await,
+		Some(false)
+	);
+	let lock = client
+		.acquire_lock(&resource, Duration::from_secs(1), 1)
+		.await
+		.unwrap();
+	assert_eq!(
+		client.socket_lock_status_for_test(&resource).await,
+		Some(true)
+	);
+	drop(lock);
+	// The release goes out from a task of its own.
+	let dropped = Instant::now();
+	while client.socket_lock_status_for_test(&resource).await != Some(false) {
+		assert!(
+			dropped.elapsed() < Duration::from_secs(30),
+			"{resource} still held 30 s after its lock was dropped"
+		);
+		tokio::time::sleep(Duration::from_millis(250)).await;
+	}
+}
+
 /// A held lock whose lease another client releases (the server releases a lease for its uuid,
 /// whoever asks) is lost as soon as the release is announced: the announcement makes the holder
 /// refresh at once, and the server refuses that refresh. Its keep-alive alone would find out at

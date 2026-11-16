@@ -43,6 +43,21 @@ pub(super) const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long a `lockHello` probe waits for its ack before the connection uses HTTP for locks. The
 /// server defines no timeout; a server without socket locks never answers.
 pub(super) const LOCK_HELLO_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a `lock` event waits for its ack before its outcome is taken as unknown, and the
+/// operation goes to HTTP.
+pub(super) const LOCK_ACK_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a lock operation waits for its connection's reply: the ack timeout, plus a margin for
+/// a connection loop that is slow to notice it ran out. A loop that never replies (its runtime
+/// shutting down under it) then costs the operation this long, not forever.
+pub(super) const LOCK_REPLY_TIMEOUT: Duration = Duration::from_secs(11);
+/// How many `lock` events a connection may have unanswered, those it gave up on included: the
+/// server refuses more than this many on one socket, and counts one it has not answered whatever
+/// the client gave up on.
+pub(super) const LOCK_MAX_IN_FLIGHT: usize = 32;
+/// After how many `lock` acks that did not come in time a connection stops carrying lock
+/// operations: a server that answers them that late is no faster than HTTP, and each one costs
+/// its operation [`LOCK_ACK_TIMEOUT`].
+pub(super) const LOCK_DEGRADE_AFTER: usize = 2;
 
 pub(super) const WEBSOCKET_URL_CORE: &str =
 	"wss://socket.filen.io/socket.io/?EIO=3&transport=websocket&t=";

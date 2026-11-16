@@ -9,6 +9,9 @@
 	cfg_select
 )]
 #![allow(type_alias_bounds)]
+// `Client::extract_archive`'s future nests deep enough that computing its layout overflows the
+// default limit of 128 queries in an optimized build.
+#![recursion_limit = "256"]
 
 // The archive codecs run on a thread they may block, which on wasm only the threaded `wasm-full`
 // build has (`blocking::WorkerSlot`).
