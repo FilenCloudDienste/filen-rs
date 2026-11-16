@@ -41,6 +41,15 @@ pub use local::{
 	RemoteApplied, RemoteHints, UndoneOp, VetoedOp,
 };
 pub use names::{NameRejection, PlaceholderName};
+pub use os::{
+	AlignedChunk, CancelRequest, CancelledRange, CheckedHash, Completed, DataResponder,
+	DehydrateReason, DehydrateRequest, DehydrateResponder, DeleteRequest, DeleteResponder,
+	EntryOutcome, FetchDataRequest, FileSnapshot, FileStamp, IfPinned, LocalEntry, LocalError,
+	LocalEvent, LocalFileId, LocalFs, LocalKind, LocalWatcher, OptionalRange, OsError, PinAttr,
+	PlaceholderState, PopulateRequest, PopulateResponder, RenameRequest, RenameResponder,
+	RenameTarget, RequestedRange, TransferKey, UnsupportedKind, Updated, WatchError, WatchSignal,
+	WatchSink,
+};
 // Exported in tests too, where `os::cfapi` is built on every host.
 #[cfg(any(windows, test))]
 pub use os::cfapi::{CfCall, Hresult, ProviderInfoError, SyncRootPathError, WinError};

@@ -7,6 +7,7 @@
 #[cfg(any(windows, test))]
 pub(crate) mod cfapi;
 mod local;
+mod watch;
 
 pub(crate) use local::ticks_to_unix_millis;
 pub use local::{
@@ -15,6 +16,7 @@ pub use local::{
 	LocalFileId, LocalFs, LocalKind, PinAttr, PlaceholderState, RenameRequest, RenameResponder,
 	RenameTarget, UnsupportedKind, Updated,
 };
+pub use watch::{LocalWatcher, WatchError, WatchSignal, WatchSink};
 
 use crate::{failure::Failure, identity::IdentityBlob, placeholder::PlaceholderSpec, sealed};
 
