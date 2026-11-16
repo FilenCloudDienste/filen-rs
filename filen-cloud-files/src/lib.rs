@@ -11,6 +11,7 @@
 // Stdout carries the helper's protocol alone.
 #![deny(clippy::print_stdout)]
 
+mod dispatch;
 mod drive;
 mod failure;
 mod hydrate;
@@ -30,6 +31,7 @@ mod sealed {
 	pub trait Sealed {}
 }
 
+pub use dispatch::{CacheDispatcher, CloudFilesCallback, DispatchConfig, Dispatcher};
 pub use drive::Drive;
 pub use failure::Failure;
 pub use identity::{IdentityBlob, IdentityError, MAX_IDENTITY_LEN, PlaceholderIdentity};
