@@ -1,3 +1,6 @@
+use futures::FutureExt;
+use tokio::sync::mpsc::error::TryRecvError;
+
 use super::*;
 
 // Regression test for the "websocket thread has been closed" error.
@@ -82,6 +85,33 @@ fn requests_to_a_worker_given_up_on_fail_with_the_startup_error() {
 			.now_or_never(),
 	);
 	assert!(!handle.is_connected());
+}
+
+// A socket task partway through a connection attempt drops and restarts the attempt for any
+// listener request, so a contended lock wait, which only needs some socket open, sends nothing to
+// a task that is live already: a listener added and removed for every wait could keep a slow
+// handshake from ever finishing.
+#[tokio::test]
+async fn a_lock_wait_sends_no_request_to_a_live_socket_task() {
+	let client = crate::auth::test_support::offline_client_opening_lock_wait_socket();
+	let (sender, mut receiver) = tokio::sync::mpsc::channel::<SocketRequest>(16);
+	*client
+		.socket_handle
+		.lock()
+		.unwrap_or_else(|e| e.into_inner()) = WebSocketHandle {
+		request_sender: Some(sender.downgrade()),
+		start: WorkerStart::default(),
+	};
+
+	let listener = client
+		.listen_for_lock_announcements()
+		.now_or_never()
+		.expect("resolves without waiting on the socket task")
+		.expect("a live socket task is no error");
+	assert!(listener.is_none());
+	assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
+	// The other listener's sender, which keeps the task live.
+	drop(sender);
 }
 
 #[test]

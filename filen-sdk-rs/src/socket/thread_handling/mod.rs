@@ -87,6 +87,21 @@ impl WebSocketHandle {
 		RequestSender { sender, start }
 	}
 
+	/// A request sender to a websocket task spawned for it, or `None` when one is live already:
+	/// for a listener that only needs some socket open, and must not send its requests to a task
+	/// that may be partway through a connection attempt, which drops and restarts the attempt for
+	/// any listener request.
+	pub(super) fn request_sender_unless_live(
+		&mut self,
+		auth_client: &Arc<AuthClient>,
+		client: &Client,
+	) -> Option<RequestSender> {
+		match self.live_sender() {
+			Some(_) => None,
+			None => Some(self.get_request_sender(auth_client, client)),
+		}
+	}
+
 	/// Asks the websocket task, if there is one, to end a backoff pause and reconnect now. One
 	/// `try_send`, never blocking: a full channel already holds requests the task serves at once
 	/// (a burst's wakes among them), and with no task there is nothing to reconnect.

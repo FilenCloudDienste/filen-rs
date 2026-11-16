@@ -1702,6 +1702,169 @@ async fn a_wait_goes_back_to_the_ladder_once_announcements_stop() {
 	assert_eq!(*sent.lock().unwrap(), millis(&[0, 10_000, 10_250]));
 }
 
+/// When a contended wait's socket was opened and dropped, from the wait's start.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+#[derive(Debug, Default, PartialEq)]
+struct SocketLog {
+	opened: Vec<Duration>,
+	dropped: Vec<Duration>,
+}
+
+/// The socket a contended wait keeps open, which notes when it is dropped.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+struct FakeSocket {
+	log: Arc<std::sync::Mutex<SocketLog>>,
+	begin: Instant,
+}
+
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+impl Drop for FakeSocket {
+	fn drop(&mut self) {
+		self.log.lock().unwrap().dropped.push(self.begin.elapsed());
+	}
+}
+
+/// Whether a contended wait's socket opens.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+#[derive(Clone, Copy)]
+enum SocketOpen {
+	Opens,
+	Fails,
+}
+
+/// A scripted wait of `attempts` scheduled polls on the ladder, run as `acquire_lock` runs it:
+/// its result, the send time of each poll, and what became of its socket, which `open` decides.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+async fn contended_wait(
+	polls: &[AcquireStep],
+	attempts: usize,
+	open: SocketOpen,
+) -> (Result<Duration, Error>, Vec<Duration>, SocketLog) {
+	let begin = Instant::now();
+	let log = Arc::new(std::sync::Mutex::new(SocketLog::default()));
+	let (mut poll, sent) = timed_acquire(begin, polls);
+	let contended = Notify::new();
+	// a second handle, for the socket
+	let socket_log = Arc::clone(&log);
+	let acquired = while_contended(
+		acquire_loop(
+			|| noting_refusal(&contended, poll()),
+			"r",
+			Duration::from_secs(30),
+			attempts,
+			quiet(),
+		),
+		&contended,
+		move || async move {
+			socket_log.lock().unwrap().opened.push(begin.elapsed());
+			match open {
+				SocketOpen::Opens => Ok(Some(FakeSocket {
+					log: socket_log,
+					begin,
+				})),
+				SocketOpen::Fails => Err(Error::custom(
+					ErrorKind::InvalidState,
+					"websocket thread has been closed",
+				)),
+			}
+		},
+	)
+	.await;
+	let sent = sent.lock().unwrap().clone();
+	let log = std::mem::take(&mut *log.lock().unwrap());
+	(acquired.map(|at| at.at - begin), sent, log)
+}
+
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+#[tokio::test(start_paused = true)]
+async fn a_wait_whose_first_poll_gets_the_lock_opens_no_socket() {
+	let (acquired, sent, log) = contended_wait(&[AcquireStep::Grant], 10, SocketOpen::Opens).await;
+	assert_eq!(acquired.unwrap(), Duration::ZERO);
+	assert_eq!(sent, millis(&[0]));
+	assert_eq!(log, SocketLog::default());
+}
+
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+#[tokio::test(start_paused = true)]
+async fn a_refused_poll_opens_the_socket_once_and_the_grant_drops_it() {
+	let (acquired, sent, log) = contended_wait(
+		&[
+			AcquireStep::Refuse,
+			AcquireStep::Refuse,
+			AcquireStep::Refuse,
+			AcquireStep::Grant,
+		],
+		10,
+		SocketOpen::Opens,
+	)
+	.await;
+	assert_eq!(acquired.unwrap(), Duration::from_millis(500));
+	assert_eq!(sent, millis(&[0, 0, 250, 500]));
+	assert_eq!(
+		log,
+		SocketLog {
+			opened: millis(&[0]),
+			dropped: millis(&[500]),
+		}
+	);
+}
+
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+#[tokio::test(start_paused = true)]
+async fn a_wait_that_runs_out_of_attempts_drops_its_socket() {
+	let (acquired, sent, log) =
+		contended_wait(&[AcquireStep::Refuse; 3], 3, SocketOpen::Opens).await;
+	assert_eq!(acquired.unwrap_err().kind(), ErrorKind::RetryFailed);
+	assert_eq!(sent, millis(&[0, 0, 250]));
+	assert_eq!(
+		log,
+		SocketLog {
+			opened: millis(&[0]),
+			dropped: millis(&[500]),
+		}
+	);
+}
+
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+#[tokio::test(start_paused = true)]
+async fn a_socket_that_cannot_be_opened_leaves_the_wait_on_its_schedule() {
+	let (acquired, sent, log) = contended_wait(
+		&[AcquireStep::Refuse, AcquireStep::Refuse, AcquireStep::Grant],
+		10,
+		SocketOpen::Fails,
+	)
+	.await;
+	assert_eq!(acquired.unwrap(), Duration::from_millis(250));
+	assert_eq!(sent, millis(&[0, 0, 250]));
+	assert_eq!(
+		log,
+		SocketLog {
+			opened: millis(&[0]),
+			dropped: Vec::new(),
+		}
+	);
+}
+
+/// The unit tests' clients have no server behind them: a refused lock poll scripted for one of
+/// them must not connect to the real socket.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+#[tokio::test(start_paused = true)]
+async fn offline_test_clients_open_no_socket_for_a_lock_wait() {
+	for client in [
+		crate::auth::test_support::offline_client(),
+		crate::auth::unauth::test_support::offline_client(),
+	] {
+		assert!(
+			client
+				.listen_for_lock_announcements()
+				.await
+				.unwrap()
+				.is_none()
+		);
+		assert!(!client.is_socket_connected());
+	}
+}
+
 #[test]
 fn a_lost_answer_may_have_been_granted() {
 	assert!(may_have_been_granted(&Error::custom(

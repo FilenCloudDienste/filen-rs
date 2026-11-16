@@ -14,6 +14,7 @@ use chrono::{DateTime, Utc};
 use filen_macros::js_type;
 use filen_types::{api::v3::user::lock::LockType, fs::Uuid};
 use futures::{FutureExt, future::join_all};
+use tokio::sync::Notify;
 use tracing::debug;
 
 // The keep-alive schedule must use the same clock as the async timers so that the
@@ -44,7 +45,7 @@ mod wait;
 pub(crate) use board::LockBoard;
 #[cfg(test)]
 pub(crate) use board::{Holder, OpenLease};
-use wait::{LockWakes, NextPoll};
+use wait::{LockWakes, NextPoll, noting_refusal, wait_socket, while_contended};
 
 pub(crate) const MAX_SLEEP_TIME_DEFAULT: time::Duration = time::Duration::from_secs(30);
 pub(crate) const ATTEMPTS_DEFAULT: usize = 8640; // 8640
@@ -1401,7 +1402,9 @@ impl Client {
 	/// answers the probe but delivers no announcements, as during an outage of its announcements,
 	/// leaves every wait on that safety net: each release is then noticed up to a lease late,
 	/// whatever `max_sleep_time` says. That is the tradeoff taken: a contended wait costs a
-	/// request a lease, not one per step of the schedule.
+	/// request a lease, not one per step of the schedule. Once a poll is
+	/// refused, the client's socket is kept open for the announcements until the wait ends,
+	/// opened for it when no event listener has (the wasm service-worker build has no socket).
 	/// An error on the first poll is returned at once; once the server has answered, a few failed requests in a
 	/// row (no response, or an HTTP error status) are waited out like refusals. When it fails after a poll whose answer was lost, so that the
 	/// server may have granted the lock without anyone knowing, a release of it goes out from a
@@ -1443,25 +1446,33 @@ impl Client {
 			lost: Arc::default(),
 		};
 		let wakes = LockWakes::for_client(&client, &resource);
-		let acquired = acquire_loop(
-			|| {
-				request_acquire(
-					Arc::clone(&client),
-					Arc::clone(&url),
-					// refcount bump: every poll resends the same Acquire body
-					bytes.clone(),
-					uuid,
-					Arc::clone(&shared_resource),
-					// refcount bump
-					record.clone(),
-					// a second handle, for the request task that can outlive this call
-					Arc::clone(&acquisition.lost),
-				)
-			},
-			&resource,
-			max_sleep_time,
-			attempts,
-			wakes,
+		let contended = Notify::new();
+		let acquired = while_contended(
+			acquire_loop(
+				|| {
+					noting_refusal(
+						&contended,
+						request_acquire(
+							Arc::clone(&client),
+							Arc::clone(&url),
+							// refcount bump: every poll resends the same Acquire body
+							bytes.clone(),
+							uuid,
+							Arc::clone(&shared_resource),
+							// refcount bump
+							record.clone(),
+							// a second handle, for the request task that can outlive this call
+							Arc::clone(&acquisition.lost),
+						),
+					)
+				},
+				&resource,
+				max_sleep_time,
+				attempts,
+				wakes,
+			),
+			&contended,
+			|| wait_socket(self),
 		)
 		.await;
 		let acquired_at = match acquired {

@@ -26,7 +26,70 @@ pub(crate) use {lock_transport::LockTransportSlot, thread_handling::WebSocketHan
 
 pub use {events::*, thread_handling::ListenerHandle};
 
+/// Whether a lock wait of a client that finds its lock taken opens the socket, for the server's
+/// lock announcements to wake it (see [`Client::listen_for_lock_announcements`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum LockWaitSocket {
+	/// It does: a client with a server behind it.
+	#[default]
+	Opens,
+	/// It never does: a client with no server behind it, as the unit tests and the sync engine's
+	/// benchmark harness build, which must not connect to the real socket.
+	// Only the offline clients of `auth::test_support` are built with it, and a build without
+	// that module has none: the tradeoff is a variant a shipping build never constructs, for a
+	// seam that keeps those clients off the network without a test-only branch.
+	#[cfg_attr(
+		not(any(test, all(feature = "sync-engine", feature = "bench-internals"))),
+		expect(
+			dead_code,
+			reason = "only the offline clients of auth::test_support never open the socket"
+		)
+	)]
+	Never,
+}
+
+/// The announcements that wake a lock wait: a lease ended.
+const LOCK_WAKE_EVENT_TYPES: [&str; 2] = ["lockReleased", "lockTimeout"];
+
 impl Client {
+	/// Opens the socket for a lock wait that found its lock taken, when no listener has, so the
+	/// server's lock announcements reach the client's lock board and can wake the wait: a
+	/// listener that does nothing with what it gets, which lets the socket close once dropped
+	/// with the last one. Resolves once it is registered, without waiting for the socket to
+	/// connect.
+	///
+	/// `None` when another listener keeps the socket open already, or for a client that opens no
+	/// socket for its lock waits ([`LockWaitSocket::Never`]). A live socket is left alone because
+	/// it may be partway through a connection attempt, which any listener request restarts: a
+	/// listener added and removed for every contended wait could keep a slow handshake from ever
+	/// finishing. Should that listener be dropped before the wait ends, the socket closes and the
+	/// wait polls on its schedule.
+	pub(crate) async fn listen_for_lock_announcements(
+		&self,
+	) -> Result<Option<ListenerHandle>, Error> {
+		match self.lock_wait_socket {
+			LockWaitSocket::Never => Ok(None),
+			LockWaitSocket::Opens => {
+				let request_sender = self
+					.socket_handle
+					.lock()
+					.unwrap_or_else(|e| e.into_inner())
+					.request_sender_unless_live(self.arc_client_ref(), self);
+				match request_sender {
+					None => Ok(None),
+					Some(request_sender) => request_sender
+						.add_event_listener_sync(
+							// The board reads every announcement ahead of the listeners.
+							Box::new(|_: &DecryptedSocketEvent<'_>| {}),
+							Some(LOCK_WAKE_EVENT_TYPES.map(Cow::Borrowed).to_vec()),
+						)
+						.await
+						.map(Some),
+				}
+			}
+		}
+	}
+
 	pub async fn add_event_listener(
 		&self,
 		callback: EventListenerCallback,

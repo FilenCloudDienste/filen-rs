@@ -1,9 +1,10 @@
 //! When a lock wait polls again: on its schedule, or early, once the socket's lock
-//! announcements say the lock may be free.
+//! announcements say the lock may be free; and the socket a wait keeps open for them once it
+//! finds its lock taken.
 
-use std::{cmp::max, future::pending, time::Duration};
+use std::{cmp::max, convert::Infallible, future::pending, time::Duration};
 
-use tokio::sync::watch;
+use tokio::sync::{Notify, watch};
 
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 use tokio::time::{Instant, sleep_until};
@@ -14,8 +15,11 @@ use wasmtimer::{std::Instant, tokio::sleep_until};
 	not(all(target_family = "wasm", target_os = "unknown")),
 	feature = "wasm-full"
 ))]
-use crate::socket::LockTransport;
-use crate::auth::http::AuthClient;
+use crate::socket::{ListenerHandle, LockTransport};
+use crate::{
+	Error,
+	auth::{Client, http::AuthClient},
+};
 
 use super::{LOCK_SERVER_TTL, board};
 
@@ -149,6 +153,72 @@ impl LockWakes {
 			}
 		}
 	}
+}
+
+/// `answer`, the answer to a poll of a lock wait, which notifies `contended` when it is a
+/// refusal (see [`while_contended`]).
+pub(super) async fn noting_refusal(
+	contended: &Notify,
+	answer: impl Future<Output = Result<bool, Error>>,
+) -> Result<bool, Error> {
+	let answer = answer.await;
+	if matches!(answer, Ok(false)) {
+		// A permit stays stored until the first notification is awaited; later ones add nothing.
+		contended.notify_one();
+	}
+	answer
+}
+
+/// Runs the lock wait `wait`, and once `contended` is notified (see [`noting_refusal`]: a poll
+/// of it was refused, so another holder may keep it waiting for long) keeps the socket open for
+/// the rest of it, for the server's lock announcements to wake it: `open` is called once, and
+/// what it resolves to is held until `wait` ends. A wait whose first poll gets the lock opens
+/// nothing. A socket that cannot be opened leaves the wait on its schedule.
+pub(super) async fn while_contended<T, H, Fut>(
+	wait: impl Future<Output = T>,
+	contended: &Notify,
+	open: impl FnOnce() -> Fut,
+) -> T
+where
+	Fut: Future<Output = Result<Option<H>, Error>>,
+{
+	let keep_open = async {
+		contended.notified().await;
+		// held until the wait ends, which drops this future
+		let _socket = match open().await {
+			Ok(socket) => socket,
+			Err(e) => {
+				tracing::warn!(
+					"Could not open the socket for a contended lock wait, which polls on its schedule: {e}"
+				);
+				None
+			}
+		};
+		pending::<Infallible>().await
+	};
+	tokio::select! {
+		biased;
+		out = wait => out,
+		never = keep_open => match never {},
+	}
+}
+
+/// Keeps the socket open for a contended lock wait of `client` (see [`while_contended`]).
+#[cfg(any(
+	not(all(target_family = "wasm", target_os = "unknown")),
+	feature = "wasm-full"
+))]
+pub(super) async fn wait_socket(client: &Client) -> Result<Option<ListenerHandle>, Error> {
+	client.listen_for_lock_announcements().await
+}
+
+/// A build without a socket (`service-worker`) keeps none open for a lock wait.
+#[cfg(not(any(
+	not(all(target_family = "wasm", target_os = "unknown")),
+	feature = "wasm-full"
+)))]
+pub(super) async fn wait_socket(_client: &Client) -> Result<Option<Infallible>, Error> {
+	Ok(None)
 }
 
 async fn sleep_until_or_never(at: Option<Instant>) {

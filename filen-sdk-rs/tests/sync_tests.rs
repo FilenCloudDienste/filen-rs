@@ -5,6 +5,8 @@ use std::time::{Duration, Instant};
 use base64::{Engine, prelude::BASE64_URL_SAFE_NO_PAD};
 use filen_sdk_rs::auth::Client;
 #[cfg(feature = "test-seams")]
+use filen_sdk_rs::auth::{http::ClientConfig, unauth::UnauthClient};
+#[cfg(feature = "test-seams")]
 use filen_sdk_rs::socket::DecryptedSocketEvent;
 
 /// Waits for a dropped lock's release task to free `resource`: acquires it once it is free and
@@ -192,4 +194,70 @@ async fn a_release_wakes_a_waiter() {
 	println!("the waiter got the lock {waited:?} after its release");
 	drop(waiter);
 	wait_until_free(&client, &resource, Duration::from_secs(30)).await;
+}
+
+/// A lock wait of a client whose socket no listener opened opens it once its lock is found
+/// taken, so the announcement of the holder's release gets it the lock within seconds, where its
+/// next scheduled poll is a lease (60 s) away; and lets it close once it has the lock.
+#[cfg(feature = "test-seams")]
+#[filen_macros::shared_test_runtime]
+async fn a_contended_wait_opens_the_socket_for_the_release() {
+	let holding = test_utils::RESOURCES.client().await;
+	// A client of its own, signed in as the shared one is, whose socket nothing opened.
+	let waiting = UnauthClient::from_config(ClientConfig::default())
+		.expect("building an unauthenticated client")
+		.from_stringified(holding.to_stringified())
+		.expect("restoring the signed-in client");
+	assert!(!waiting.is_socket_connected());
+
+	let resource = format!(
+		"rs-{}",
+		BASE64_URL_SAFE_NO_PAD.encode(rand::random::<[u8; 32]>())
+	);
+	let holder = holding
+		.acquire_lock(&resource, Duration::from_secs(1), 1)
+		.await
+		.unwrap();
+	let (waiter, released_at) = tokio::join!(
+		waiting.acquire_lock(&resource, Duration::from_secs(30), 20),
+		async {
+			// The waiter's first poll is refused, which opens its socket.
+			let opened = Instant::now();
+			while !waiting.is_socket_connected() {
+				assert!(
+					opened.elapsed() < Duration::from_secs(10),
+					"the contended wait opened no socket"
+				);
+				tokio::time::sleep(Duration::from_millis(50)).await;
+			}
+			let version = tokio::time::timeout(
+				Duration::from_secs(20),
+				waiting.lock_protocol_version_for_test(),
+			)
+			.await
+			.expect("the lockHello probe settles");
+			assert_eq!(version, Some(2), "the server does not announce locks");
+			drop(holder);
+			Instant::now()
+		}
+	);
+	let waited = released_at.elapsed();
+	let waiter = waiter.expect("the waiter gets the lock");
+	assert!(
+		waited < Duration::from_secs(10),
+		"the waiter got the lock {waited:?} after its release"
+	);
+	println!("the waiter got the lock {waited:?} after its release");
+
+	// The wait's listener was the socket's only one.
+	let ended = Instant::now();
+	while waiting.is_socket_connected() {
+		assert!(
+			ended.elapsed() < Duration::from_secs(5),
+			"the socket outlived the wait"
+		);
+		tokio::time::sleep(Duration::from_millis(50)).await;
+	}
+	drop(waiter);
+	wait_until_free(&holding, &resource, Duration::from_secs(30)).await;
 }

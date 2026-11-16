@@ -44,7 +44,7 @@ use crate::{
 	not(all(target_family = "wasm", target_os = "unknown")),
 	feature = "wasm-full"
 ))]
-use crate::socket::WebSocketHandle;
+use crate::socket::{LockWaitSocket, WebSocketHandle};
 
 pub mod http;
 #[cfg(any(feature = "wasm-full", feature = "uniffi", feature = "napi"))]
@@ -279,6 +279,12 @@ pub struct Client {
 		feature = "wasm-full"
 	))]
 	pub(crate) socket_handle: std::sync::Mutex<WebSocketHandle>,
+	/// Whether a contended lock wait opens the socket for the lock announcements.
+	#[cfg(any(
+		not(all(target_family = "wasm", target_os = "unknown")),
+		feature = "wasm-full"
+	))]
+	pub(crate) lock_wait_socket: LockWaitSocket,
 
 	/// The cache configuration + a weak reference to the live cache worker (see
 	/// [`Client::add_sync_root`]). A tokio `Mutex` because it is held across the worker
@@ -1045,6 +1051,11 @@ pub(crate) mod test_support {
 	use base64::{Engine, prelude::BASE64_STANDARD};
 	use rsa::{PrivateKey, pkcs8::EncodePrivateKey};
 
+	#[cfg(any(
+		not(all(target_family = "wasm", target_os = "unknown")),
+		feature = "wasm-full"
+	))]
+	use super::LockWaitSocket;
 	use super::{Client, StringifiedClient, http::ClientConfig, unauth::UnauthClient};
 
 	/// A client with no account and no network behind it, for tests and benchmarks that build
@@ -1062,7 +1073,7 @@ pub(crate) mod test_support {
 	pub(crate) fn offline_client_with_root(root_uuid: &str) -> Client {
 		let private_key =
 			PrivateKey::new(&mut rand::rng(), 1024).expect("generating a throwaway RSA key");
-		UnauthClient::from_config(ClientConfig::default())
+		let client = UnauthClient::from_config(ClientConfig::default())
 			.expect("building an unauthenticated client makes no network call")
 			.from_stringified(StringifiedClient {
 				email: "offline@example.invalid".to_owned(),
@@ -1080,6 +1091,37 @@ pub(crate) mod test_support {
 				max_parallel_requests: None,
 				max_io_memory_usage: None,
 			})
-			.expect("the offline credentials parse")
+			.expect("the offline credentials parse");
+		without_lock_wait_socket(client)
+	}
+
+	/// [`offline_client`], whose lock waits open the socket as a signed-in client's do, for a
+	/// test that seeds the socket task the waits talk to.
+	#[cfg(all(
+		test,
+		any(
+			not(all(target_family = "wasm", target_os = "unknown")),
+			feature = "wasm-full"
+		)
+	))]
+	pub(crate) fn offline_client_opening_lock_wait_socket() -> Client {
+		Client {
+			lock_wait_socket: LockWaitSocket::Opens,
+			..offline_client()
+		}
+	}
+
+	/// `client`, whose lock waits never open the socket: a client with no server behind it must
+	/// not connect to the real one when a test scripts a refused lock poll.
+	pub(crate) fn without_lock_wait_socket(client: Client) -> Client {
+		#[cfg(any(
+			not(all(target_family = "wasm", target_os = "unknown")),
+			feature = "wasm-full"
+		))]
+		let client = Client {
+			lock_wait_socket: LockWaitSocket::Never,
+			..client
+		};
+		client
 	}
 }

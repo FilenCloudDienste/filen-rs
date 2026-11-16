@@ -17,7 +17,7 @@ use rsa::{PrivateKey, PublicKey, pkcs8::DecodePrivateKey};
 	not(all(target_family = "wasm", target_os = "unknown")),
 	feature = "wasm-full"
 ))]
-use crate::socket::WebSocketHandle;
+use crate::socket::{LockWaitSocket, WebSocketHandle};
 use crate::{
 	Error, api,
 	auth::{
@@ -123,6 +123,11 @@ impl UnauthClient {
 				feature = "wasm-full"
 			))]
 			socket_handle: std::sync::Mutex::new(WebSocketHandle::default()),
+			#[cfg(any(
+				not(all(target_family = "wasm", target_os = "unknown")),
+				feature = "wasm-full"
+			))]
+			lock_wait_socket: LockWaitSocket::default(),
 			#[cfg(feature = "cache")]
 			cache_slot: Default::default(),
 			nickname: RwLock::new(None),
@@ -298,6 +303,11 @@ async fn finish_login(
 				feature = "wasm-full"
 			))]
 			socket_handle: std::sync::Mutex::new(WebSocketHandle::default()),
+			#[cfg(any(
+				not(all(target_family = "wasm", target_os = "unknown")),
+				feature = "wasm-full"
+			))]
+			lock_wait_socket: LockWaitSocket::default(),
 			#[cfg(feature = "cache")]
 			cache_slot: Default::default(),
 			nickname: RwLock::new(None),
@@ -804,7 +814,7 @@ pub(crate) mod test_support {
 	fn logged_in(unauthed: UnauthClient) -> Client {
 		// tiny key: never used for real crypto, only to make a client that parses
 		let key = PrivateKey::new(&mut rand::rng(), 1024).expect("a test key");
-		unauthed
+		let client = unauthed
 			.from_stringified(StringifiedClient {
 				email: "offline@example.com".to_owned(),
 				user_id: 1,
@@ -818,7 +828,8 @@ pub(crate) mod test_support {
 				max_parallel_requests: None,
 				max_io_memory_usage: None,
 			})
-			.expect("the client parses")
+			.expect("the client parses");
+		crate::auth::test_support::without_lock_wait_socket(client)
 	}
 
 	/// Whether `error` is the failure of a lock request (`v3/user/lock`): what a call that takes
