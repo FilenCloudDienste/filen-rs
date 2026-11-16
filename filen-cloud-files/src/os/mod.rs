@@ -8,6 +8,8 @@
 pub(crate) mod cfapi;
 mod local;
 mod watch;
+#[cfg(windows)]
+pub(crate) mod win;
 
 pub(crate) use local::ticks_to_unix_millis;
 pub use local::{

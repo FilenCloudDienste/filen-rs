@@ -240,6 +240,16 @@ fn a_transfer_refused_as_not_a_cloud_file_ends_the_request() {
 }
 
 #[test]
+fn only_a_transfer_refused_as_not_a_cloud_file_is_still_failed() {
+	assert!(transfer_refusal_unconfirmed(Hresult::new(
+		0x8007_0178_u32.cast_signed()
+	)));
+	assert!(!transfer_refusal_unconfirmed(Hresult::from_win32(398)));
+	assert!(!transfer_refusal_unconfirmed(Hresult::from_win32(393)));
+	assert!(!transfer_refusal_unconfirmed(Hresult::new(E_INVALIDARG)));
+}
+
+#[test]
 fn a_field_is_present_when_the_struct_reaches_its_end() {
 	assert!(field_present(16, 8, 8));
 	assert!(!field_present(15, 8, 8));

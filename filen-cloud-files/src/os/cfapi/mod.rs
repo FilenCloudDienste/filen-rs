@@ -729,6 +729,15 @@ pub(crate) fn transfer_error(hr: Hresult) -> OsError {
 	}
 }
 
+/// Whether a `TRANSFER_DATA` refused with `hr`, which [`transfer_error`] ends as cancelled, is
+/// still answered with a failure: `ERROR_NOT_A_CLOUD_FILE`, whose request was gone each time it
+/// was measured but whose cause is not established, so a request still live is not left to wait
+/// out the OS's 60 s timeout. A failure answer to a request gone is refused, as one to a cancelled
+/// request was measured to be. A refusal as cancelled or aborted is the OS's own cancel.
+pub(crate) fn transfer_refusal_unconfirmed(hr: Hresult) -> bool {
+	hr == Hresult::from_win32(ERROR_NOT_A_CLOUD_FILE)
+}
+
 /// Whether a struct cfapi passed, `struct_size` bytes long, holds the field of `field_size` bytes
 /// at `field_offset`: an older Windows may pass a shorter struct than this build declares.
 pub(crate) fn field_present(struct_size: u32, field_offset: usize, field_size: usize) -> bool {

@@ -8,6 +8,8 @@ mod memory_key_store;
 
 #[cfg(feature = "test-seams")]
 pub use crate::local::relocate_for_test;
+#[cfg(all(windows, feature = "test-seams"))]
+pub use crate::os::win::user_dehydrate;
 #[cfg(test)]
 pub(crate) use fake_drive::place_files;
 pub use fake_drive::{DriveCall, DriveOp, FakeDrive, TIMESTAMP_MILLIS, ffi_dir, ffi_file, pattern};
