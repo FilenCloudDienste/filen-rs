@@ -89,6 +89,10 @@ tokio = { version = "1.47.1", features = [
 	"time",
 ] }
 
+[[test]]
+name = "cloud_files_live"
+required-features = ["test-seams"]
+
 # The helper binary as the desktop app spawns it.
 [[test]]
 name = "helper_spawn"
