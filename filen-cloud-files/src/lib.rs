@@ -13,7 +13,9 @@
 
 mod drive;
 mod failure;
+mod hydrate;
 mod identity;
+mod log_safe;
 mod names;
 mod os;
 mod placeholder;
