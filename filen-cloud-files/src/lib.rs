@@ -39,6 +39,8 @@ pub use auth::{
 	KeyLengthError, KeyStore, KeyStoreError, SEALING_KEY_LEN, SealingKey, SessionError,
 	SessionOwner, SessionStore,
 };
+#[cfg(any(windows, test))]
+pub use auth::{CredentialError, CredentialManagerKeyStore};
 pub use dispatch::{CacheDispatcher, CloudFilesCallback, DispatchConfig, Dispatcher};
 pub use drive::Drive;
 pub use failure::Failure;
