@@ -1,0 +1,93 @@
+[package]
+name = "filen-cloud-files"
+version = "0.1.0"
+authors = ["FilenCloudDienste"]
+edition = "2024"
+repository = "https://github.com/FilenCloudDienste/filen-rs"
+license = "AGPL-3.0"
+publish = false
+metadata.workspaces = { independent = true }
+
+[features]
+# Test-only: exposes the fake drive, the fake OS and the in-memory key store, and gates the live
+# tests, which log into the test account, and the Windows VM harness. Never in a shipping build.
+test-seams = []
+
+[dependencies]
+filen-mobile-native-cache = { path = "../filen-mobile-native-cache" }
+# The auth.json seal (EncryptionKey, DataCrypter), CHUNK_SIZE_U64, the Windows name rule, the
+# private-file writer, and from the sync engine (`sync-engine`) its default ignore patterns and
+# its local watch timings; the cache crate turns on the features it needs.
+filen-sdk-rs = { path = "../filen-sdk-rs", default-features = false, features = [
+	"sync-engine",
+] }
+filen-types = { path = "../filen-types" }
+blake3 = "1.8.3"
+# The date an unregistered root is set aside under.
+chrono = "0.4.41"
+# Catching a request's panic in the command loop.
+futures = "0.3.31"
+# The sync root's watcher: the version the sync engine's watcher locks.
+notify = "8.2.0"
+# The sealing key.
+rand = "0.10.3"
+# The helper's protocol messages, each checked against its schema (unknown and duplicate fields
+# refused).
+serde = { version = "1.0.219", features = ["derive"] }
+# The pushed AuthFile, checked and re-encoded, and the helper's protocol lines.
+serde_json = "1.0.142"
+thiserror = "2.0.14"
+# The dispatcher's runtime handle, task set, read permits and its wait for a permit or a cancel;
+# `rt-multi-thread` for `block_in_place`, which the Windows layer runs each cfapi transfer in;
+# `io-util` for the helper's line reader, `io-std` for its stdin and stdout.
+tokio = { version = "1.47.1", features = [
+	"io-std",
+	"io-util",
+	"macros",
+	"rt",
+	"rt-multi-thread",
+	"sync",
+] }
+tracing = "0.1"
+# The helper's logger, on stderr: installed first, as the cache installs one on stdout, which
+# carries the helper's protocol, when none is.
+tracing-subscriber = { version = "0.3", default-features = false, features = [
+	"env-filter",
+	"fmt",
+	"std",
+] }
+
+[target.'cfg(windows)'.dependencies]
+# The Cloud Files API (cfapi) and the Win32 types its structs and codes use, and the process
+# token's elevation (`Win32_Security`, `Win32_System_Threading`) the helper refuses to run with;
+# linked by raw-dylib, so no import library is needed on any target.
+windows-sys = { version = "0.61.2", features = [
+	"Win32_Foundation",
+	"Win32_Security",
+	"Win32_Storage_CloudFilters",
+	"Win32_Storage_FileSystem",
+	"Win32_System_CorrelationVector",
+	"Win32_System_IO",
+	"Win32_System_Threading",
+] }
+# The key auth.json is sealed under, in Windows Credential Manager.
+keyring = { version = "3.6.3", features = ["windows-native"] }
+
+[dev-dependencies]
+# The live tests' shared runtime.
+filen-macros = { path = "../filen-macros" }
+# keyring's mock credential, which the Credential Manager key store's tests run on, on every host.
+keyring = "3.6.3"
+tempfile = "3.23.0"
+test-utils = { path = "../test-utils" }
+# `test-util` gives the tests `start_paused`; `time` its auto-advancing sleep, which waits for the
+# runtime to go idle without real time passing.
+tokio = { version = "1.47.1", features = [
+	"rt-multi-thread",
+	"macros",
+	"test-util",
+	"time",
+] }
+
+[lints]
+workspace = true

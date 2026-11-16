@@ -2242,6 +2242,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "filen-cloud-files"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "chrono",
+ "filen-macros",
+ "filen-mobile-native-cache",
+ "filen-sdk-rs",
+ "filen-types",
+ "futures",
+ "keyring",
+ "notify",
+ "rand 0.10.3",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "test-utils",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "filen-macros"
 version = "0.2.0"
 dependencies = [
