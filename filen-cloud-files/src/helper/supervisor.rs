@@ -26,6 +26,7 @@ use tracing::{debug, info, warn};
 
 use crate::{
 	auth::{AuthPayload, DataDir, KeyStore, KeyStoreError, SessionError, SessionStore},
+	branding::Branding,
 	dispatch::{CloudFilesCallback, DispatchConfig, Dispatcher},
 	drive::Drive,
 	helper::{
@@ -39,7 +40,7 @@ use crate::{
 			Registration, ReplyError, ReplyValue, Request, RootDir, RootListing, StateReport,
 			StatusEvent, UnregisterReport, UserId, parse_line,
 		},
-		unregister::{self, Held, Stopped, unregister_entry},
+		unregister::{self, EntryUnregistered, Held, Stopped, unregister_entry},
 		validate,
 		watch_keeper::{Keeper, Keeping, keep_watching},
 	},
@@ -153,6 +154,8 @@ struct Registered<P: Platform> {
 	data_dir: DataDir,
 	/// The OS's registration, once registered or taken over in this run.
 	cf: Option<P::Registered>,
+	/// What File Explorer shows for the root; `None` for the default.
+	branding: Option<Branding>,
 }
 
 /// A root served with a session.
@@ -162,6 +165,10 @@ struct Serving<P: Platform, D: Drive> {
 	data_dir: DataDir,
 	/// The account the root is registered for and the drive signed in as.
 	account_root: Uuid,
+	/// What File Explorer shows for the root; `None` for the default.
+	branding: Option<Branding>,
+	/// Whether File Explorer was last told what to show for the root without a failure.
+	branded: bool,
 	store: SessionStore,
 	keys: P::Keys,
 	drive: Arc<D>,
@@ -581,11 +588,7 @@ impl<P: Platform, O: DriveOpener> Helper<P, O> {
 				&& validate::same_path(held_root, &root)
 				&& validate::same_path(held_data.path(), data_dir.path())
 			{
-				return Ok(ReplyValue::Registered {
-					state,
-					resumed: false,
-					kept_earlier: Vec::new(),
-				});
+				return self.registered_again(user, branding, state).await;
 			}
 			return Err(ReplyError::new(
 				ErrorCode::AlreadyRegistered,
@@ -675,14 +678,16 @@ impl<P: Platform, O: DriveOpener> Helper<P, O> {
 				account_root: account_root.or(known),
 				kept: Vec::new(),
 				unregistered: false,
-				branding,
+				branding: branding.clone(),
 			})
 			.map_err(|e| index_error(&e))?;
+		let asked = branding.is_some();
 		let registered = Registered {
 			user,
 			root,
 			data_dir,
 			cf: None,
+			branding,
 		};
 		// Resumes a session sealed by an earlier run: the root is this provider's, for the account
 		// the index says the user owns, and the session is on disk.
@@ -700,9 +705,9 @@ impl<P: Platform, O: DriveOpener> Helper<P, O> {
 		};
 		self.phase = phase;
 		self.status();
-		let state = match self.phase {
-			Phase::Serving(_) => PhaseName::Serving,
-			Phase::Idle | Phase::Registered(_) => PhaseName::Registered,
+		let (state, branded) = match &self.phase {
+			Phase::Serving(serving) => (PhaseName::Serving, asked.then_some(serving.branded)),
+			Phase::Idle | Phase::Registered(_) => (PhaseName::Registered, None),
 		};
 		let kept_earlier = self
 			.index
@@ -717,6 +722,40 @@ impl<P: Platform, O: DriveOpener> Helper<P, O> {
 			state,
 			resumed,
 			kept_earlier,
+			branded,
+		})
+	}
+
+	/// A `register` of the root already held, by the same user and data directory: answered as it
+	/// stands, after rewriting what File Explorer shows when the request names a branding (shown at
+	/// once when the root is served, else when it is).
+	async fn registered_again(
+		&mut self,
+		user: UserId,
+		branding: Option<Branding>,
+		state: PhaseName,
+	) -> Result<ReplyValue, ReplyError> {
+		let mut branded = None;
+		if let Some(branding) = branding {
+			self.index
+				.set_branding(user, Some(branding.clone()))
+				.map_err(|e| index_error(&e))?;
+			match &mut self.phase {
+				Phase::Serving(serving) => {
+					serving.branded =
+						brand(&self.platform, &serving.root, user, Some(&branding)).await;
+					serving.branding = Some(branding);
+					branded = Some(serving.branded);
+				}
+				Phase::Registered(registered) => registered.branding = Some(branding),
+				Phase::Idle => {}
+			}
+		}
+		Ok(ReplyValue::Registered {
+			state,
+			resumed: false,
+			kept_earlier: Vec::new(),
+			branded,
 		})
 	}
 
@@ -777,17 +816,25 @@ impl<P: Platform, O: DriveOpener> Helper<P, O> {
 				let sealed = serving.store.seal(&payload).map_err(session_error);
 				self.phase = Phase::Serving(serving);
 				sealed?;
-				Ok(ReplyValue::Serving { adopted: true })
+				Ok(ReplyValue::Serving {
+					adopted: true,
+					branded: None,
+				})
 			}
 			Phase::Registered(registered) => {
+				let asked = registered.branding.is_some();
 				match self
 					.serve(registered, Some(payload), owner.account_root)
 					.await
 				{
 					Ok(serving) => {
+						let branded = asked.then_some(serving.branded);
 						self.phase = Phase::Serving(Box::new(serving));
 						self.status();
-						Ok(ReplyValue::Serving { adopted: false })
+						Ok(ReplyValue::Serving {
+							adopted: false,
+							branded,
+						})
 					}
 					Err((registered, error)) => {
 						self.phase = Phase::Registered(registered);
@@ -864,6 +911,14 @@ impl<P: Platform, O: DriveOpener> Helper<P, O> {
 			registered.cf = Some(cf);
 			return Err((registered, index_error(&error)));
 		}
+		// Before connecting, so the first window Explorer opens on the root shows it branded.
+		let branded = brand(
+			&self.platform,
+			&registered.root,
+			registered.user,
+			registered.branding.as_ref(),
+		)
+		.await;
 		let callback = Arc::clone(&self.callback) as Arc<dyn CloudFilesCallback>;
 		let local = {
 			let platform = Arc::clone(&self.platform);
@@ -938,6 +993,7 @@ impl<P: Platform, O: DriveOpener> Helper<P, O> {
 			user,
 			root,
 			data_dir,
+			branding,
 			..
 		} = registered;
 		Ok(Serving {
@@ -945,6 +1001,8 @@ impl<P: Platform, O: DriveOpener> Helper<P, O> {
 			root,
 			data_dir,
 			account_root,
+			branding,
+			branded,
 			store,
 			keys,
 			drive,
@@ -1021,6 +1079,7 @@ impl<P: Platform, O: DriveOpener> Helper<P, O> {
 			connected,
 			keeper,
 			probes,
+			branding,
 			..
 		} = serving;
 		// Awaited, a watcher still starting included, so no watcher outlives the engine.
@@ -1046,6 +1105,7 @@ impl<P: Platform, O: DriveOpener> Helper<P, O> {
 				root,
 				data_dir,
 				cf,
+				branding,
 			},
 			store,
 			keys,
@@ -1151,7 +1211,7 @@ impl<P: Platform, O: DriveOpener> Helper<P, O> {
 			None => (None, None),
 		};
 		match unregister_entry(&self.platform, &mut self.index, &entry, cf, delete_hydrated).await {
-			Ok(report) => {
+			Ok(EntryUnregistered { report, .. }) => {
 				if active {
 					self.status();
 				}
@@ -1176,6 +1236,7 @@ impl<P: Platform, O: DriveOpener> Helper<P, O> {
 						root: entry.root.clone(),
 						data_dir,
 						cf: registered,
+						branding: entry.branding.clone(),
 					};
 					self.phase = match served {
 						Some(account_root) => {
@@ -1279,6 +1340,24 @@ impl<P: Platform, O: DriveOpener> Helper<P, O> {
 			self.stop_serving(*serving).await;
 		}
 	}
+}
+
+/// Tells File Explorer what to show for `user`'s root at `root`: `branding`, or the default. A
+/// failure is logged and changes nothing else, as the root is served all the same: whether it
+/// worked.
+async fn brand<P: Platform>(
+	platform: &Arc<P>,
+	root: &RootDir,
+	user: UserId,
+	branding: Option<&Branding>,
+) -> bool {
+	let platform = Arc::clone(platform);
+	let root = root.to_path_buf();
+	let branding = branding.cloned().unwrap_or_default();
+	blocking(move || platform.brand(&root, user, &branding))
+		.await
+		.inspect_err(|error| warn!(%error, "showing the root in File Explorer failed"))
+		.is_ok()
 }
 
 /// Reports how many items in the root hold what the drive does not have yet

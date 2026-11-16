@@ -302,6 +302,15 @@ impl RootsIndex {
 		self.commit(entries)
 	}
 
+	/// Records what File Explorer shows for `user`'s root, if the index holds it.
+	pub(crate) fn set_branding(
+		&mut self,
+		user: UserId,
+		branding: Option<Branding>,
+	) -> Result<(), IndexError> {
+		self.change(user, |entry| entry.branding = branding)
+	}
+
 	/// Records what an unregister of `user`'s root kept, replacing the record with its id, or the
 	/// record of an unregister whose items are still in the root (one stopped part way, whose
 	/// items a new walk found again). A settled record that kept nothing is dropped instead.

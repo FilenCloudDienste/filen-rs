@@ -124,6 +124,7 @@ fn out_message(case: &str) -> OutMessage {
 				state: PhaseName::Registered,
 				resumed: false,
 				kept_earlier: Vec::new(),
+				branded: None,
 			},
 		),
 		"reply register resumed" => reply(
@@ -132,6 +133,7 @@ fn out_message(case: &str) -> OutMessage {
 				state: PhaseName::Serving,
 				resumed: true,
 				kept_earlier: Vec::new(),
+				branded: None,
 			},
 		),
 		"reply register keptEarlier" => reply(
@@ -148,9 +150,32 @@ fn out_message(case: &str) -> OutMessage {
 					kept_count: 1,
 					kept_in: Some(PathBuf::from("C:\\Users\\u\\Filen (not synced 2026-11-12)")),
 				}],
+				branded: None,
 			},
 		),
-		"reply setAuth" => reply(2, ReplyValue::Serving { adopted: true }),
+		"reply register branded" => reply(
+			1,
+			ReplyValue::Registered {
+				state: PhaseName::Serving,
+				resumed: true,
+				kept_earlier: Vec::new(),
+				branded: Some(false),
+			},
+		),
+		"reply setAuth" => reply(
+			2,
+			ReplyValue::Serving {
+				adopted: true,
+				branded: None,
+			},
+		),
+		"reply setAuth branded" => reply(
+			2,
+			ReplyValue::Serving {
+				adopted: false,
+				branded: Some(true),
+			},
+		),
 		"reply clearAuth" => reply(3, ReplyValue::Cleared { cleared: false }),
 		"reply unregister" => reply(4, ReplyValue::Unregistered(report())),
 		"reply unregister keptEarlier" => reply(
@@ -317,14 +342,36 @@ fn out_message(case: &str) -> OutMessage {
 						kept_earlier: Vec::new(),
 					}),
 					key_left: true,
+					branding_left: false,
 				},
 				UnregisterAllEntry {
 					user: UserId::from(43),
 					root: RootDir::parse("D:\\Filen".to_owned()).unwrap(),
 					outcome: Err(ReplyError::new(ErrorCode::UnsyncedChanges, "m")),
 					key_left: false,
+					branding_left: false,
 				},
 			],
+		},
+		"unregisterAll brandingLeft" => OutMessage::UnregisterAll {
+			roots: vec![UnregisterAllEntry {
+				user: UserId::from(42),
+				root: root(),
+				outcome: Ok(UnregisterReport {
+					unregistered: true,
+					deleted_hydrated: 0,
+					kept: Vec::new(),
+					kept_count: 0,
+					kept_in: None,
+					root_removed: true,
+					key_deleted: false,
+					data_deleted: false,
+					kept_id: None,
+					kept_earlier: Vec::new(),
+				}),
+				key_left: true,
+				branding_left: true,
+			}],
 		},
 		other => panic!("no message for the output case {other}"),
 	}
@@ -355,7 +402,7 @@ fn every_output_fixture_is_byte_for_byte_what_the_helper_writes() {
 		assert_eq!(line, expected, "{}", case.case);
 		checked += 1;
 	}
-	assert_eq!(checked, 24);
+	assert_eq!(checked, 27);
 }
 
 #[test]

@@ -1,5 +1,7 @@
-//! Every `unsafe` block of the crate: the cfapi calls, each behind a safe function whose arguments
-//! make the call sound. Nothing else lives here.
+//! Every `unsafe` block of the crate: the cfapi calls, and the Win32 calls around them (the
+//! process token, volumes, files by handle, the registry keys File Explorer reads and the shell's
+//! change notification), each behind a safe function whose arguments make the call sound.
+//! Nothing else lives here.
 
 use std::{
 	ffi::{OsString, c_void},
@@ -16,11 +18,27 @@ use std::{
 };
 
 use tracing::error;
+#[cfg(test)]
+use windows_sys::Win32::{
+	Security::{
+		ACL, ACL_REVISION, DACL_SECURITY_INFORMATION, InitializeAcl, InitializeSecurityDescriptor,
+		SECURITY_DESCRIPTOR, SetSecurityDescriptorDacl,
+	},
+	Storage::FileSystem::WRITE_DAC,
+	System::Registry::RegSetKeySecurity,
+};
 // The bindings module is the cfapi surface this file exists to call.
 use windows_sys::{
 	Win32::{
-		Foundation::{ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED, HANDLE, STATUS_SUCCESS},
-		Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation},
+		Foundation::{
+			ERROR_FILE_NOT_FOUND, ERROR_INVALID_PARAMETER, ERROR_MORE_DATA, ERROR_NO_MORE_ITEMS,
+			ERROR_NOT_SUPPORTED, ERROR_SUCCESS, HANDLE, LocalFree, STATUS_SUCCESS, WIN32_ERROR,
+		},
+		Security::{
+			Authorization::{ConvertSidToStringSidW, GetSecurityInfo, SE_REGISTRY_KEY},
+			GetTokenInformation, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+			TOKEN_ELEVATION, TOKEN_QUERY, TOKEN_USER, TokenElevation, TokenUser,
+		},
 		Storage::{
 			CloudFilters::*,
 			FileSystem::{
@@ -33,9 +51,18 @@ use windows_sys::{
 				GetVolumeInformationByHandleW, MoveFileExW, SetFileInformationByHandle,
 			},
 		},
-		System::Threading::{GetCurrentProcess, OpenProcessToken},
+		System::{
+			Registry::{
+				HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, KEY_WRITE, REG_DWORD,
+				REG_EXPAND_SZ, REG_OPTION_NON_VOLATILE, REG_SZ, REG_VALUE_TYPE, RegCloseKey,
+				RegCreateKeyExW, RegDeleteKeyValueW, RegDeleteTreeW, RegEnumKeyExW, RegEnumValueW,
+				RegOpenKeyExW, RegSetValueExW,
+			},
+			Threading::{GetCurrentProcess, OpenProcessToken},
+		},
+		UI::Shell::{SHCNE_UPDATEDIR, SHCNF_PATHW, SHChangeNotify},
 	},
-	core::GUID,
+	core::{GUID, PWSTR},
 };
 
 use super::{
@@ -253,6 +280,429 @@ pub(super) fn revert(file: &File) -> Hresult {
 	Hresult::new(unsafe {
 		CfRevertPlaceholder(file.as_raw_handle(), CF_REVERT_FLAG_NONE, ptr::null_mut())
 	})
+}
+
+/// A registry hive the provider writes under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Hive {
+	/// `HKEY_CURRENT_USER`: the user this process runs as.
+	CurrentUser,
+	/// `HKEY_LOCAL_MACHINE`.
+	LocalMachine,
+}
+
+impl Hive {
+	fn key(self) -> HKEY {
+		match self {
+			Self::CurrentUser => HKEY_CURRENT_USER,
+			Self::LocalMachine => HKEY_LOCAL_MACHINE,
+		}
+	}
+}
+
+/// A registry call's result as an I/O result.
+fn win32(code: WIN32_ERROR) -> io::Result<()> {
+	if code == ERROR_SUCCESS {
+		Ok(())
+	} else {
+		Err(io::Error::from_raw_os_error(code.cast_signed()))
+	}
+}
+
+/// An open registry key, closed when dropped.
+pub(super) struct RegKey(HKEY);
+
+impl Drop for RegKey {
+	#[allow(unsafe_code)] // Win32 FFI: closes a registry key.
+	fn drop(&mut self) {
+		// SAFETY: `self.0` is a key `reg_create` or `reg_open` opened, owned by this value alone,
+		// closed once, here.
+		unsafe { RegCloseKey(self.0) };
+	}
+}
+
+/// The key `path` below `hive`, created when missing, open to read and write.
+#[allow(unsafe_code)] // Win32 FFI: creates or opens a registry key.
+pub(super) fn reg_create(hive: Hive, path: &WideNul) -> io::Result<RegKey> {
+	let mut key: HKEY = ptr::null_mut();
+	// SAFETY: `path` is NUL-terminated and borrowed for the call; no class or security
+	// attributes are passed, which the call accepts as null; `key` is a live, exclusively
+	// borrowed out-param; the disposition is not asked for.
+	win32(unsafe {
+		RegCreateKeyExW(
+			hive.key(),
+			path.with_nul().as_ptr(),
+			0,
+			ptr::null(),
+			REG_OPTION_NON_VOLATILE,
+			KEY_READ | KEY_WRITE,
+			ptr::null(),
+			&mut key,
+			ptr::null_mut(),
+		)
+	})?;
+	Ok(RegKey(key))
+}
+
+/// The key `path` below the open key or hive `parent`, open to read (`KEY_READ`); `None` when it
+/// is not there.
+///
+/// # Safety
+///
+/// `parent` is a predefined hive or a key open for the call.
+#[allow(unsafe_code)] // Win32 FFI: opens a registry key.
+unsafe fn open_below(parent: HKEY, path: &WideNul) -> io::Result<Option<RegKey>> {
+	let mut key: HKEY = ptr::null_mut();
+	// SAFETY: `parent` is valid for the call (the caller's promise); `path` is NUL-terminated and
+	// borrowed for it; `key` is a live, exclusively borrowed out-param.
+	let code = unsafe { RegOpenKeyExW(parent, path.with_nul().as_ptr(), 0, KEY_READ, &mut key) };
+	match code {
+		ERROR_SUCCESS => Ok(Some(RegKey(key))),
+		ERROR_FILE_NOT_FOUND => Ok(None),
+		code => Err(io::Error::from_raw_os_error(code.cast_signed())),
+	}
+}
+
+/// The key `path` below `hive`, open to read; `None` when it is not there.
+#[allow(unsafe_code)] // Win32 FFI: the hive entry to `open_below`.
+pub(super) fn reg_open(hive: Hive, path: &WideNul) -> io::Result<Option<RegKey>> {
+	// SAFETY: a predefined hive.
+	unsafe { open_below(hive.key(), path) }
+}
+
+/// The key `path` below the open key `key`, open to read; `None` when it is not there.
+#[allow(unsafe_code)] // Win32 FFI: the subkey entry to `open_below`.
+pub(super) fn reg_open_subkey(key: &RegKey, path: &WideNul) -> io::Result<Option<RegKey>> {
+	// SAFETY: `key` is open while borrowed.
+	unsafe { open_below(key.0, path) }
+}
+
+/// Sets the value `name` of `key` (its default value when `None`) to `bytes`, of type `kind`.
+#[allow(unsafe_code)] // Win32 FFI: writes a registry value.
+fn reg_set(
+	key: &RegKey,
+	name: Option<&WideNul>,
+	kind: REG_VALUE_TYPE,
+	bytes: &[u8],
+) -> io::Result<()> {
+	let len =
+		u32::try_from(bytes.len()).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+	let name = name.map_or(ptr::null(), |name| name.with_nul().as_ptr());
+	// SAFETY: the key is open for the call; `name` is null or NUL-terminated and borrowed for it;
+	// `bytes` is valid for `len` bytes, which the call copies before it returns.
+	win32(unsafe { RegSetValueExW(key.0, name, 0, kind, bytes.as_ptr(), len) })
+}
+
+/// Sets the string value `name` of `key` (its default value when `None`) to `value`: a
+/// `REG_EXPAND_SZ` when `expand`, else a `REG_SZ`.
+pub(super) fn reg_set_string(
+	key: &RegKey,
+	name: Option<&WideNul>,
+	value: &WideNul,
+	expand: bool,
+) -> io::Result<()> {
+	let bytes: Vec<u8> = value
+		.with_nul()
+		.iter()
+		.flat_map(|unit| unit.to_le_bytes())
+		.collect();
+	reg_set(
+		key,
+		name,
+		if expand { REG_EXPAND_SZ } else { REG_SZ },
+		&bytes,
+	)
+}
+
+/// Sets the `REG_DWORD` value `name` of `key` to `value`.
+pub(super) fn reg_set_dword(key: &RegKey, name: &WideNul, value: u32) -> io::Result<()> {
+	reg_set(key, Some(name), REG_DWORD, &value.to_le_bytes())
+}
+
+/// Deletes the key `path` below `hive` with every key and value below it; a key that is not there
+/// is gone already.
+#[allow(unsafe_code)] // Win32 FFI: deletes a registry key and its subkeys.
+pub(super) fn reg_delete_tree(hive: Hive, path: &WideNul) -> io::Result<()> {
+	// SAFETY: `path` is NUL-terminated and borrowed for the call.
+	match unsafe { RegDeleteTreeW(hive.key(), path.with_nul().as_ptr()) } {
+		ERROR_SUCCESS | ERROR_FILE_NOT_FOUND => Ok(()),
+		code => Err(io::Error::from_raw_os_error(code.cast_signed())),
+	}
+}
+
+/// Deletes the value `name` of the key `path` below `hive`; one that is not there is gone already.
+#[allow(unsafe_code)] // Win32 FFI: deletes a registry value.
+pub(super) fn reg_delete_value(hive: Hive, path: &WideNul, name: &WideNul) -> io::Result<()> {
+	// SAFETY: `path` and `name` are NUL-terminated and borrowed for the call.
+	match unsafe {
+		RegDeleteKeyValueW(
+			hive.key(),
+			path.with_nul().as_ptr(),
+			name.with_nul().as_ptr(),
+		)
+	} {
+		ERROR_SUCCESS | ERROR_FILE_NOT_FOUND => Ok(()),
+		code => Err(io::Error::from_raw_os_error(code.cast_signed())),
+	}
+}
+
+/// The longest key name the registry holds, its NUL included.
+const MAX_KEY_NAME_UNITS: usize = 256;
+
+/// The names of `key`'s subkeys.
+#[allow(unsafe_code)] // Win32 FFI: lists a registry key's subkeys.
+pub(super) fn reg_subkeys(key: &RegKey) -> io::Result<Vec<Vec<u16>>> {
+	let mut names = Vec::new();
+	for index in 0_u32.. {
+		let mut name = [0_u16; MAX_KEY_NAME_UNITS];
+		let mut len =
+			u32::try_from(name.len()).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+		// SAFETY: the key is open for the call; `name` is an exclusively borrowed buffer of `len`
+		// units, which the call sets to the units written; no class or time is asked for.
+		let code = unsafe {
+			RegEnumKeyExW(
+				key.0,
+				index,
+				name.as_mut_ptr(),
+				&mut len,
+				ptr::null(),
+				ptr::null_mut(),
+				ptr::null_mut(),
+				ptr::null_mut(),
+			)
+		};
+		match code {
+			ERROR_SUCCESS => {}
+			ERROR_NO_MORE_ITEMS => break,
+			code => return Err(io::Error::from_raw_os_error(code.cast_signed())),
+		}
+		let len = usize::try_from(len).map_err(|_| io::Error::from(io::ErrorKind::InvalidData))?;
+		names.push(
+			name.get(..len)
+				.ok_or_else(|| io::Error::from(io::ErrorKind::InvalidData))?
+				.to_vec(),
+		);
+	}
+	Ok(names)
+}
+
+/// The most bytes a string value is read for: a 32,767-unit path and its NUL, with room to spare.
+const MAX_STRING_VALUE_BYTES: usize = 65_540;
+
+/// The units of a string value's bytes, without the NULs that end it.
+fn string_units(bytes: &[u8]) -> Vec<u16> {
+	let mut units: Vec<u16> = bytes
+		.chunks_exact(2)
+		.filter_map(|pair| pair.first_chunk().copied().map(u16::from_le_bytes))
+		.collect();
+	while units.last() == Some(&0) {
+		units.pop();
+	}
+	units
+}
+
+/// The longest value name the registry holds, its NUL included.
+const MAX_VALUE_NAME_UNITS: usize = 16_384;
+
+/// Every string value of `key` (`REG_SZ` or `REG_EXPAND_SZ`, unexpanded) by name, without NULs;
+/// values of other types are left out.
+#[allow(unsafe_code)] // Win32 FFI: lists a registry key's values.
+pub(super) fn reg_string_values(key: &RegKey) -> io::Result<Vec<(Vec<u16>, Vec<u16>)>> {
+	let mut values = Vec::new();
+	let mut name = vec![0_u16; MAX_VALUE_NAME_UNITS];
+	let mut data = vec![0_u8; MAX_STRING_VALUE_BYTES];
+	for index in 0_u32.. {
+		let mut name_len =
+			u32::try_from(name.len()).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+		let mut data_len =
+			u32::try_from(data.len()).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+		let mut kind: u32 = 0;
+		// SAFETY: the key is open for the call; `name` and `data` are exclusively borrowed buffers
+		// of `name_len` units and `data_len` bytes, which the call sets to what it wrote; `kind`
+		// is a live out-param.
+		let code = unsafe {
+			RegEnumValueW(
+				key.0,
+				index,
+				name.as_mut_ptr(),
+				&mut name_len,
+				ptr::null(),
+				&mut kind,
+				data.as_mut_ptr(),
+				&mut data_len,
+			)
+		};
+		match code {
+			ERROR_SUCCESS => {}
+			ERROR_NO_MORE_ITEMS => break,
+			// A value too long to be a path is no root of this provider's.
+			ERROR_MORE_DATA => continue,
+			code => return Err(io::Error::from_raw_os_error(code.cast_signed())),
+		}
+		if !matches!(kind, REG_SZ | REG_EXPAND_SZ) {
+			continue;
+		}
+		let name_len =
+			usize::try_from(name_len).map_err(|_| io::Error::from(io::ErrorKind::InvalidData))?;
+		let data_len =
+			usize::try_from(data_len).map_err(|_| io::Error::from(io::ErrorKind::InvalidData))?;
+		let invalid = || io::Error::from(io::ErrorKind::InvalidData);
+		values.push((
+			name.get(..name_len).ok_or_else(invalid)?.to_vec(),
+			string_units(data.get(..data_len).ok_or_else(invalid)?),
+		));
+	}
+	Ok(values)
+}
+
+/// The string SID of the user this process runs as (`S-1-5-21-...`), from its token.
+#[allow(unsafe_code)] // Win32 FFI: reads the process token's user and spells its SID.
+pub(super) fn current_user_sid() -> io::Result<Vec<u16>> {
+	let mut token: HANDLE = ptr::null_mut();
+	// SAFETY: as in `token_elevated`.
+	if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+		return Err(io::Error::last_os_error());
+	}
+	// SAFETY: as in `token_elevated`: the handle is open and owned here, closed once.
+	let token = unsafe { OwnedHandle::from_raw_handle(token) };
+	// A `TOKEN_USER` and the SID it points into, which the call writes after it; u64s, so the
+	// struct's pointer is aligned. 128 bytes hold the 16 of a `TOKEN_USER` and the 68 of a SID of
+	// the 15 sub-authorities a SID can have.
+	let mut buffer = [0_u64; 16];
+	let mut returned = 0_u32;
+	let size = u32::try_from(size_of_val(&buffer))
+		.map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+	// SAFETY: the token handle is open for the call; `buffer` is exclusively borrowed, `size`
+	// bytes long and aligned for `TOKEN_USER`; `returned` is a live out-param.
+	let ok = unsafe {
+		GetTokenInformation(
+			token.as_raw_handle(),
+			TokenUser,
+			buffer.as_mut_ptr().cast(),
+			size,
+			&mut returned,
+		)
+	};
+	if ok == 0 {
+		return Err(io::Error::last_os_error());
+	}
+	// SAFETY: the call succeeded, so the buffer starts with a `TOKEN_USER` whose `Sid` points at
+	// a valid SID inside the same buffer, which lives until the end of this function.
+	let sid = unsafe { buffer.as_ptr().cast::<TOKEN_USER>().read() }
+		.User
+		.Sid;
+	// SAFETY: as above, `sid` is valid while `buffer` lives, past this call.
+	unsafe { sid_string(sid) }
+}
+
+/// The string form of `sid` (`S-1-5-21-...`).
+///
+/// # Safety
+///
+/// `sid` points at a valid SID for the call.
+#[allow(unsafe_code)] // Win32 FFI: spells a SID.
+unsafe fn sid_string(sid: PSID) -> io::Result<Vec<u16>> {
+	let mut text: PWSTR = ptr::null_mut();
+	// SAFETY: `sid` is a valid SID (the caller's promise); `text` is a live out-param, which the
+	// call sets to a string it allocated with `LocalAlloc`.
+	if unsafe { ConvertSidToStringSidW(sid, &mut text) } == 0 {
+		return Err(io::Error::last_os_error());
+	}
+	// SAFETY: the call succeeded, so `text` is a NUL-terminated string, read before it is freed.
+	let units = unsafe { read_wide(text) };
+	// SAFETY: `text` was allocated by `ConvertSidToStringSidW` with `LocalAlloc`, freed once, here.
+	unsafe { LocalFree(text.cast()) };
+	units.ok_or_else(|| io::Error::from(io::ErrorKind::InvalidData))
+}
+
+/// The string SID of the owner of the open key `key`.
+#[allow(unsafe_code)] // Win32 FFI: reads a registry key's owner.
+pub(super) fn reg_owner_sid(key: &RegKey) -> io::Result<Vec<u16>> {
+	let mut owner: PSID = ptr::null_mut();
+	let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
+	// SAFETY: the key is open for the call, with `READ_CONTROL` (in `KEY_READ`, which every key of
+	// this module is opened with), and a key handle is the handle `SE_REGISTRY_KEY` takes; `owner`
+	// and `descriptor` are live out-params; the group and the ACLs are not asked for, which the
+	// call accepts as null. On success `owner` points into `descriptor`, which the call allocated
+	// with `LocalAlloc`.
+	win32(unsafe {
+		GetSecurityInfo(
+			key.0,
+			SE_REGISTRY_KEY,
+			OWNER_SECURITY_INFORMATION,
+			&mut owner,
+			ptr::null_mut(),
+			ptr::null_mut(),
+			ptr::null_mut(),
+			&mut descriptor,
+		)
+	})?;
+	// SAFETY: `owner` points into `descriptor`, freed only after this call.
+	let units = unsafe { sid_string(owner) };
+	// SAFETY: `descriptor` was allocated by `GetSecurityInfo` with `LocalAlloc`, freed once, here,
+	// after the last use of `owner`.
+	unsafe { LocalFree(descriptor.cast()) };
+	units
+}
+
+/// Tells the shell the directory `path` changed (`SHCNE_UPDATEDIR`), so the windows showing it
+/// read it again.
+#[allow(unsafe_code)] // Win32 FFI: notifies the shell of a changed directory.
+pub(super) fn notify_dir_updated(path: &WideNul) {
+	// SAFETY: `path` is NUL-terminated and borrowed for the call, which reads it before it
+	// returns, as `SHCNF_PATHW` says; the second item is unused by `SHCNE_UPDATEDIR`.
+	unsafe {
+		SHChangeNotify(
+			SHCNE_UPDATEDIR.cast_signed(),
+			SHCNF_PATHW,
+			path.with_nul().as_ptr().cast(),
+			ptr::null(),
+		);
+	}
+}
+
+/// `SECURITY_DESCRIPTOR_REVISION`.
+#[cfg(test)]
+const SECURITY_DESCRIPTOR_REVISION: u32 = 1;
+
+/// Replaces the DACL of the key `path` below `hive`, which this process's user owns: an empty one
+/// when `deny_all`, so no one may open it, else none, so everyone may. For tests of a key that
+/// cannot be read.
+#[cfg(test)]
+#[allow(unsafe_code)] // Win32 FFI: replaces a registry key's DACL, for tests.
+pub(super) fn reg_set_dacl_for_test(hive: Hive, path: &WideNul, deny_all: bool) -> io::Result<()> {
+	let mut key: HKEY = ptr::null_mut();
+	// SAFETY: `path` is NUL-terminated and borrowed for the call; `key` is a live, exclusively
+	// borrowed out-param. An owner may always open its key for `WRITE_DAC`.
+	win32(unsafe { RegOpenKeyExW(hive.key(), path.with_nul().as_ptr(), 0, WRITE_DAC, &mut key) })?;
+	let key = RegKey(key);
+	let mut acl = ACL::default();
+	let acl_size = u32::try_from(size_of::<ACL>())
+		.map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+	// SAFETY: `acl` is a live, exclusively borrowed buffer of `acl_size` bytes, which the call
+	// makes an ACL with no entry.
+	if unsafe { InitializeAcl(&raw mut acl, acl_size, ACL_REVISION) } == 0 {
+		return Err(io::Error::last_os_error());
+	}
+	let mut descriptor = SECURITY_DESCRIPTOR::default();
+	let descriptor_ptr: PSECURITY_DESCRIPTOR = (&raw mut descriptor).cast();
+	// SAFETY: `descriptor_ptr` points at a live, exclusively borrowed `SECURITY_DESCRIPTOR`.
+	if unsafe { InitializeSecurityDescriptor(descriptor_ptr, SECURITY_DESCRIPTOR_REVISION) } == 0 {
+		return Err(io::Error::last_os_error());
+	}
+	let dacl: *const ACL = if deny_all {
+		&raw const acl
+	} else {
+		ptr::null()
+	};
+	// SAFETY: the descriptor was initialised above; `dacl` is null (no DACL) or the ACL above,
+	// which outlives every use of the descriptor in this function.
+	if unsafe { SetSecurityDescriptorDacl(descriptor_ptr, 1, dacl, 0) } == 0 {
+		return Err(io::Error::last_os_error());
+	}
+	// SAFETY: the key is open with `WRITE_DAC`; the descriptor is a valid absolute descriptor whose
+	// DACL lives for the call.
+	win32(unsafe { RegSetKeySecurity(key.0, DACL_SECURITY_INFORMATION, descriptor_ptr) })
 }
 
 /// The keys a callback's answers are sent under, copied out of its `CF_CALLBACK_INFO` before the

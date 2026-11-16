@@ -54,7 +54,9 @@
 {"case":"reply register","dir":"out","line":{"t":"reply","id":1,"ok":true,"value":{"state":"registered","resumed":false}}}
 {"case":"reply register resumed","dir":"out","line":{"t":"reply","id":1,"ok":true,"value":{"state":"serving","resumed":true}}}
 {"case":"reply register keptEarlier","dir":"out","line":{"t":"reply","id":1,"ok":true,"value":{"state":"serving","resumed":true,"keptEarlier":[{"id":"00000000000000ab","kept":[{"path":"new.txt","reason":"notUploaded"}],"keptCount":1,"keptIn":"C:\\Users\\u\\Filen (not synced 2026-11-12)"}]}}}
+{"case":"reply register branded","dir":"out","line":{"t":"reply","id":1,"ok":true,"value":{"state":"serving","resumed":true,"branded":false}}}
 {"case":"reply setAuth","dir":"out","line":{"t":"reply","id":2,"ok":true,"value":{"state":"serving","adopted":true}}}
+{"case":"reply setAuth branded","dir":"out","line":{"t":"reply","id":2,"ok":true,"value":{"state":"serving","adopted":false,"branded":true}}}
 {"case":"reply clearAuth","dir":"out","line":{"t":"reply","id":3,"ok":true,"value":{"cleared":false}}}
 {"case":"reply unregister","dir":"out","line":{"t":"reply","id":4,"ok":true,"value":{"unregistered":true,"deletedHydrated":3,"kept":[{"path":"a\\b.txt","reason":"modified"},{"path":"new.txt","reason":"notUploaded"}],"keptCount":2,"keptIn":"C:\\Users\\u\\Filen (not synced 2026-11-12)","rootRemoved":false,"keyDeleted":true,"dataDeleted":true}}}
 {"case":"reply unregister keptEarlier","dir":"out","line":{"t":"reply","id":4,"ok":true,"value":{"unregistered":true,"deletedHydrated":3,"kept":[{"path":"a\\b.txt","reason":"modified"},{"path":"new.txt","reason":"notUploaded"}],"keptCount":2,"keptIn":"C:\\Users\\u\\Filen (not synced 2026-11-12) 2","rootRemoved":false,"keyDeleted":true,"dataDeleted":true,"keptId":"0123456789abcdef","keptEarlier":[{"id":"00000000000000ab","kept":[],"keptCount":3,"keptIn":"C:\\Users\\u\\Filen (not synced 2026-11-12)"},{"id":"ffffffffffffffff","kept":[],"keptCount":1,"keptIn":null}]}}}
@@ -73,3 +75,4 @@
 {"case":"authRevoked","dir":"out","line":{"t":"authRevoked","userId":"42"}}
 {"case":"protocolError","dir":"out","line":{"t":"protocolError","code":"lineTooLong"}}
 {"case":"unregisterAll","dir":"out","line":{"t":"unregisterAll","roots":[{"userId":"42","root":"C:\\Users\\u\\Filen","ok":{"unregistered":true,"deletedHydrated":0,"kept":[],"keptCount":0,"keptIn":null,"rootRemoved":true,"keyDeleted":false,"dataDeleted":false},"keyLeft":true},{"userId":"43","root":"D:\\Filen","error":{"code":"unsyncedChanges","message":"m"},"keyLeft":false}]}}
+{"case":"unregisterAll brandingLeft","dir":"out","line":{"t":"unregisterAll","roots":[{"userId":"42","root":"C:\\Users\\u\\Filen","ok":{"unregistered":true,"deletedHydrated":0,"kept":[],"keptCount":0,"keptIn":null,"rootRemoved":true,"keyDeleted":false,"dataDeleted":false},"keyLeft":true,"brandingLeft":true}]}}

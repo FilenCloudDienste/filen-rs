@@ -13,14 +13,16 @@ use tokio::{
 };
 
 use crate::{
+	branding::Branding,
 	helper::{
-		ErrorCode, ExitReason, HelperConfig, RootRefusal, StateDir, run_helper, unregister_all,
+		BrandingScope, ErrorCode, ExitReason, HelperConfig, RootRefusal, StateDir, UserId,
+		run_helper, unregister_all,
 	},
 	identity::PlaceholderIdentity,
 	os::LocalError,
 	test_support::{
-		FakeDrive, FakeEntry, FakeLocal, FakeOpener, FakePlatform, FakeStep, KillPoint,
-		PlatformCall, root_path,
+		BrandingCall, FakeDrive, FakeEntry, FakeLocal, FakeOpener, FakePlatform, FakeStep,
+		KillPoint, PlatformCall, root_path,
 	},
 };
 
@@ -1923,4 +1925,244 @@ async fn a_report_not_known_read_is_listed_with_the_roots() {
 		"{}",
 		index_text(&disk)
 	);
+}
+
+/// A `register` of user 42's root naming a display name and an icon.
+fn register_branded(disk: &Disk, name: &str) -> Value {
+	let mut message = register(disk, "42");
+	message["displayName"] = json!(name);
+	message["iconPath"] = json!("C:\\Program Files\\Filen\\Filen.exe");
+	message["iconIndex"] = json!(0);
+	message
+}
+
+/// The branding [`register_branded`] names.
+fn branding(name: &str) -> Branding {
+	Branding::parse(
+		Some(name),
+		Some("C:\\Program Files\\Filen\\Filen.exe"),
+		Some(0),
+	)
+	.unwrap()
+	.unwrap()
+}
+
+fn brand_call(disk: &Disk, branding: Branding) -> BrandingCall {
+	BrandingCall::Brand {
+		root: disk.root(),
+		user: UserId::from(42),
+		branding,
+	}
+}
+
+fn unbrand_call(disk: &Disk, scope: BrandingScope) -> BrandingCall {
+	BrandingCall::Unbrand {
+		root: disk.root(),
+		user: UserId::from(42),
+		scope,
+	}
+}
+
+#[tokio::test(start_paused = true)]
+async fn serving_a_branded_root_shows_it_once_and_says_so() {
+	let disk = Disk::new();
+	let (platform, drive) = world();
+	let mut rig = Rig::start(&disk, &platform, &drive);
+	assert_eq!(
+		ok(&rig.request(register_branded(&disk, "Filen (2)")).await),
+		&json!({ "state": "registered", "resumed": false })
+	);
+	assert!(
+		platform.branding_calls().is_empty(),
+		"nothing shown before it is served"
+	);
+	assert_eq!(
+		ok(&rig.set_auth("42", ACCOUNT_ROOT).await),
+		&json!({ "state": "serving", "adopted": false, "branded": true })
+	);
+	assert_eq!(
+		platform.branding_calls(),
+		[brand_call(&disk, branding("Filen (2)"))]
+	);
+	assert_eq!(
+		platform.machine_branding(&disk.root()),
+		Some(UserId::from(42))
+	);
+	assert_eq!(
+		platform
+			.user_branding(&disk.root())
+			.map(|entry| entry.branding),
+		Some(branding("Filen (2)"))
+	);
+	// Shown between the OS's registration and the connection.
+	assert_eq!(platform.connected_when_branded(), [false]);
+	assert_eq!(
+		platform.calls()[..2],
+		[
+			PlatformCall::Register {
+				root: disk.root(),
+				account_root: ACCOUNT_ROOT,
+			},
+			PlatformCall::Connect(disk.root()),
+		]
+	);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_root_whose_register_names_no_branding_is_shown_as_filen_and_the_reply_says_nothing() {
+	let disk = Disk::new();
+	let (platform, drive) = world();
+	let mut rig = Rig::start(&disk, &platform, &drive);
+	ok(&rig.register(&disk).await);
+	assert_eq!(
+		ok(&rig.set_auth("42", ACCOUNT_ROOT).await),
+		&json!({ "state": "serving", "adopted": false })
+	);
+	assert_eq!(
+		platform.branding_calls(),
+		[brand_call(&disk, Branding::default())]
+	);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_branding_that_fails_is_logged_and_the_root_is_served_all_the_same() {
+	let disk = Disk::new();
+	let (platform, drive) = world();
+	platform.fail_brands(1);
+	let mut rig = Rig::start(&disk, &platform, &drive);
+	ok(&rig.request(register_branded(&disk, "Filen")).await);
+	assert_eq!(
+		ok(&rig.set_auth("42", ACCOUNT_ROOT).await),
+		&json!({ "state": "serving", "adopted": false, "branded": false })
+	);
+	assert!(platform.is_connected(&disk.root()));
+	rig.until(|line| line["t"] == "status" && line["watching"] == true)
+		.await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_root_served_again_after_a_restart_is_shown_with_the_same_values() {
+	let disk = Disk::new();
+	let (platform, drive) = world();
+	let mut rig = Rig::start(&disk, &platform, &drive);
+	ok(&rig.request(register_branded(&disk, "Filen (2)")).await);
+	ok(&rig.set_auth("42", ACCOUNT_ROOT).await);
+	rig.close().await;
+	let mut rig = Rig::start(&disk, &platform, &drive);
+	assert_eq!(
+		ok(&rig.request(register_branded(&disk, "Filen (2)")).await),
+		&json!({ "state": "serving", "resumed": true, "branded": true })
+	);
+	assert_eq!(
+		platform.branding_calls(),
+		[
+			brand_call(&disk, branding("Filen (2)")),
+			brand_call(&disk, branding("Filen (2)")),
+		]
+	);
+	assert_eq!(platform.branding_entries(), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_repeated_register_naming_a_new_name_shows_it_at_once() {
+	let disk = Disk::new();
+	let (platform, drive) = world();
+	let mut rig = Rig::start(&disk, &platform, &drive);
+	ok(&rig.request(register_branded(&disk, "Filen")).await);
+	ok(&rig.set_auth("42", ACCOUNT_ROOT).await);
+	assert_eq!(
+		ok(&rig.request(register_branded(&disk, "Filen (2)")).await),
+		&json!({ "state": "serving", "resumed": false, "branded": true })
+	);
+	assert_eq!(
+		platform
+			.user_branding(&disk.root())
+			.map(|entry| entry.branding),
+		Some(branding("Filen (2)"))
+	);
+	assert!(index_text(&disk).contains("\"displayName\":\"Filen (2)\""));
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_unregister_removes_the_branding_only_once_the_os_let_the_root_go() {
+	let disk = Disk::new();
+	let (platform, drive) = world();
+	let mut rig = Rig::start(&disk, &platform, &drive);
+	ok(&rig.request(register_branded(&disk, "Filen")).await);
+	ok(&rig.set_auth("42", ACCOUNT_ROOT).await);
+	platform.fail_unregisters(1);
+	assert_eq!(code(&rig.request(unregister_request()).await), "os");
+	assert_eq!(
+		platform.branding_entries(),
+		2,
+		"a root still registered stays shown"
+	);
+	assert!(
+		!platform
+			.branding_calls()
+			.iter()
+			.any(|call| matches!(call, BrandingCall::Unbrand { .. }))
+	);
+	let report = ok(&rig.request(unregister_request()).await).clone();
+	assert_eq!(report["unregistered"], true);
+	assert!(report.get("brandingLeft").is_none(), "{report}");
+	assert_eq!(platform.branding_entries(), 0);
+	assert_eq!(
+		platform.branding_calls().last(),
+		Some(&unbrand_call(&disk, BrandingScope::User))
+	);
+}
+
+#[tokio::test(start_paused = true)]
+async fn unregister_all_removes_the_branding() {
+	let disk = Disk::new();
+	let (platform, drive) = world();
+	let mut rig = Rig::start(&disk, &platform, &drive);
+	ok(&rig.request(register_branded(&disk, "Filen")).await);
+	ok(&rig.set_auth("42", ACCOUNT_ROOT).await);
+	rig.close().await;
+	let state = StateDir::new(disk.state()).unwrap();
+	let done = unregister_all(platform.clone(), &state, true).await;
+	assert!(!done.roots[0].branding_left);
+	assert!(!done.line().to_line().contains("brandingLeft"));
+	assert_eq!(platform.branding_entries(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_elevated_unregister_all_removes_only_the_machine_entry_and_reports_the_rest_left() {
+	let disk = Disk::new();
+	let (platform, drive) = world();
+	let mut rig = Rig::start(&disk, &platform, &drive);
+	ok(&rig.request(register_branded(&disk, "Filen")).await);
+	ok(&rig.set_auth("42", ACCOUNT_ROOT).await);
+	rig.close().await;
+	let calls_before = platform.branding_calls().len();
+	let state = StateDir::new(disk.state()).unwrap();
+	platform.set_elevated(true);
+	let done = unregister_all(platform.clone(), &state, true).await;
+	assert!(done.roots[0].branding_left);
+	assert!(done.line().to_line().contains("\"brandingLeft\":true"));
+	assert_eq!(platform.machine_branding(&disk.root()), None);
+	assert!(platform.user_branding(&disk.root()).is_some());
+	// Nothing is shown, so no icon path is read, by an elevated run.
+	assert_eq!(
+		platform.branding_calls()[calls_before..],
+		[unbrand_call(&disk, BrandingScope::MachineOnly)]
+	);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_failed_removal_of_the_branding_is_reported_left_by_unregister_all() {
+	let disk = Disk::new();
+	let (platform, drive) = world();
+	let mut rig = Rig::start(&disk, &platform, &drive);
+	ok(&rig.register(&disk).await);
+	ok(&rig.set_auth("42", ACCOUNT_ROOT).await);
+	rig.close().await;
+	platform.fail_unbrands(1);
+	let state = StateDir::new(disk.state()).unwrap();
+	let done = unregister_all(platform.clone(), &state, true).await;
+	assert!(done.roots[0].outcome.as_ref().unwrap().unregistered);
+	assert!(done.roots[0].branding_left);
+	assert_eq!(platform.branding_entries(), 2);
 }

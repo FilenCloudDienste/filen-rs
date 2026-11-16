@@ -9,10 +9,11 @@ use filen_types::fs::Uuid;
 
 use crate::{
 	auth::{KeyAccount, KeyStore, KeyStoreError, SessionStore},
+	branding::Branding,
 	dispatch::Dispatcher,
 	drive::Drive,
 	helper::{
-		protocol::{ErrorCode, ReplyError},
+		protocol::{ErrorCode, ReplyError, UserId},
 		unregister::Cleared,
 	},
 	local::LocalEngine,
@@ -41,6 +42,10 @@ pub enum PlatformOp {
 	Tidy,
 	/// Moving an unregistered root aside.
 	SetAside,
+	/// Showing a root in File Explorer.
+	Brand,
+	/// Removing what showed a root in File Explorer.
+	Unbrand,
 }
 
 impl fmt::Display for PlatformOp {
@@ -55,6 +60,8 @@ impl fmt::Display for PlatformOp {
 			Self::Watch => "watching the sync root",
 			Self::Tidy => "tidying the unregistered root",
 			Self::SetAside => "moving the unregistered root aside",
+			Self::Brand => "showing the root in File Explorer",
+			Self::Unbrand => "removing the root from File Explorer",
 		})
 	}
 }
@@ -110,6 +117,19 @@ pub struct ExistingRoot {
 	pub ours: bool,
 	/// The account root its identity carries, when it is ours and the identity reads.
 	pub account_root: Option<Uuid>,
+}
+
+/// What removing a root from File Explorer may touch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrandingScope {
+	/// Everything [`Platform::brand`] wrote for the user's root, as the Windows user this process
+	/// runs as: what the helper, run as the user, removes.
+	User,
+	/// Only the machine-wide sync root list entry of the user's root, of the Windows user this
+	/// process runs as, when it names exactly the root; the per-user navigation-pane entry stays, as
+	/// this process's user hive may be another account's: what an elevated process (the
+	/// uninstaller) removes.
+	MachineOnly,
 }
 
 /// The OS as the helper uses it. Sealed: only this crate's Windows layer and its fake implement
@@ -192,6 +212,17 @@ pub trait Platform: sealed::Sealed + Send + Sync + 'static {
 
 	/// The time now, which dates a root an unregister sets aside.
 	fn now(&self) -> SystemTime;
+
+	/// Shows `root`, `user`'s registered root, in File Explorer as `branding` says: its name, its
+	/// status icons and commands, and its navigation-pane entry. Writes every value each time, so
+	/// a repeat is harmless; a failure may leave part of it written, which [`Platform::unbrand`]
+	/// removes.
+	fn brand(&self, root: &Path, user: UserId, branding: &Branding) -> Result<(), PlatformError>;
+
+	/// Removes what [`Platform::brand`] wrote for `user`'s root at `root`, within `scope`; what was
+	/// not there is gone already.
+	fn unbrand(&self, root: &Path, user: UserId, scope: BrandingScope)
+	-> Result<(), PlatformError>;
 }
 
 /// Opens the drive on a sealed session. Sealed, as [`Drive`] is.

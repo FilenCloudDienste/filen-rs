@@ -19,8 +19,8 @@ pub use index::{StateDir, StateDirError};
 pub use launch::{MIN_BUILD, StateLock, fatal, serve_stdio, unregister_all_stdio};
 pub use logging::install_stderr_logging;
 pub use platform::{
-	CacheOpener, DriveOpener, ExistingRoot, Platform, PlatformError, PlatformFailed, PlatformOp,
-	RootRefusal,
+	BrandingScope, CacheOpener, DriveOpener, ExistingRoot, Platform, PlatformError, PlatformFailed,
+	PlatformOp, RootRefusal,
 };
 pub use supervisor::{ExitReason, HelperConfig, run_helper};
 pub use unregister::{Cleared, UnregisterAll, unregister_all};

@@ -16,11 +16,12 @@ use filen_types::fs::Uuid;
 
 use crate::{
 	auth::{KeyAccount, KeyStore, KeyStoreError, SealingKey, SessionStore},
+	branding::Branding,
 	dispatch::Dispatcher,
 	drive::Drive,
 	helper::{
-		Cleared, DriveOpener, ExistingRoot, Platform, PlatformError, PlatformFailed, PlatformOp,
-		RootRefusal,
+		BrandingScope, Cleared, DriveOpener, ExistingRoot, Platform, PlatformError, PlatformFailed,
+		PlatformOp, RootRefusal, UserId,
 	},
 	local::LocalEngine,
 	os::{WatchSignal, WatchSink},
@@ -132,6 +133,41 @@ struct PlatformState {
 	kill: Option<KillPoint>,
 	/// What a test runs when an unregister reaches a point, once each.
 	hooks: Vec<(KillPoint, Box<dyn FnOnce() + Send>)>,
+	/// The machine-wide sync root list entries, by root: whose root each names.
+	machine_branding: HashMap<PathBuf, UserId>,
+	/// The per-user navigation-pane entries, by root.
+	user_branding: HashMap<PathBuf, FakeBranding>,
+	branding_calls: Vec<BrandingCall>,
+	fail_brands: u32,
+	fail_unbrands: u32,
+	/// Whether the root was connected at each brand, in order.
+	connected_when_branded: Vec<bool>,
+}
+
+/// What a fake navigation-pane entry shows, and for whom.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FakeBranding {
+	/// Whose root it shows.
+	pub user: UserId,
+	/// What it shows.
+	pub branding: Branding,
+}
+
+/// What the fake platform was asked to show in File Explorer, in order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BrandingCall {
+	/// A root was shown.
+	Brand {
+		root: PathBuf,
+		user: UserId,
+		branding: Branding,
+	},
+	/// A root's entries were removed, within a scope.
+	Unbrand {
+		root: PathBuf,
+		user: UserId,
+		scope: BrandingScope,
+	},
 }
 
 /// Runs what `state` was told to run at `point`, then panics, as a killed helper stops, when it
@@ -394,6 +430,56 @@ impl FakePlatform {
 	fn kill_at_point(&self, point: KillPoint) {
 		kill_at(&self.state, point);
 	}
+
+	/// Whose root the machine-wide sync root list entry of `root` names, if there is one.
+	pub fn machine_branding(&self, root: &Path) -> Option<UserId> {
+		self.state().machine_branding.get(root).copied()
+	}
+
+	/// The per-user navigation-pane entry of `root`, if there is one.
+	pub fn user_branding(&self, root: &Path) -> Option<FakeBranding> {
+		self.state().user_branding.get(root).cloned()
+	}
+
+	/// How many entries of either kind File Explorer holds.
+	pub fn branding_entries(&self) -> usize {
+		let state = self.state();
+		state.machine_branding.len() + state.user_branding.len()
+	}
+
+	/// What the platform was asked to show in File Explorer, in order.
+	pub fn branding_calls(&self) -> Vec<BrandingCall> {
+		self.state().branding_calls.clone()
+	}
+
+	/// Leaves both entries of `user`'s root at `root`, as a run killed before removing them does.
+	pub fn leave_branding(&self, root: &Path, user: UserId) {
+		let mut state = self.state();
+		state.machine_branding.insert(root.to_path_buf(), user);
+		state.user_branding.insert(
+			root.to_path_buf(),
+			FakeBranding {
+				user,
+				branding: Branding::default(),
+			},
+		);
+	}
+
+	/// Fails the next `count` brands, having written the sync root list entry only, as a registry
+	/// write refused part way does.
+	pub fn fail_brands(&self, count: u32) {
+		self.state().fail_brands = count;
+	}
+
+	/// Whether the root was connected when each brand ran, in order.
+	pub fn connected_when_branded(&self) -> Vec<bool> {
+		self.state().connected_when_branded.clone()
+	}
+
+	/// Fails the next `count` unbrands, having removed nothing.
+	pub fn fail_unbrands(&self, count: u32) {
+		self.state().fail_unbrands = count;
+	}
 }
 
 impl sealed::Sealed for FakePlatform {}
@@ -650,6 +736,66 @@ impl Platform for FakePlatform {
 	/// Always [`FAKE_NOW_SECS`], so a test knows the date an unregister sets a root aside under.
 	fn now(&self) -> SystemTime {
 		SystemTime::UNIX_EPOCH + Duration::from_secs(FAKE_NOW_SECS)
+	}
+
+	fn brand(&self, root: &Path, user: UserId, branding: &Branding) -> Result<(), PlatformError> {
+		let mut state = self.state();
+		let connected = state.connected.contains(root);
+		state.connected_when_branded.push(connected);
+		state.branding_calls.push(BrandingCall::Brand {
+			root: root.to_path_buf(),
+			user,
+			branding: branding.clone(),
+		});
+		state.machine_branding.insert(root.to_path_buf(), user);
+		if state.fail_brands > 0 {
+			state.fail_brands -= 1;
+			return Err(PlatformError::Failed {
+				op: PlatformOp::Brand,
+				source: Box::new(Switched),
+			});
+		}
+		state.user_branding.insert(
+			root.to_path_buf(),
+			FakeBranding {
+				user,
+				branding: branding.clone(),
+			},
+		);
+		Ok(())
+	}
+
+	fn unbrand(
+		&self,
+		root: &Path,
+		user: UserId,
+		scope: BrandingScope,
+	) -> Result<(), PlatformError> {
+		let mut state = self.state();
+		state.branding_calls.push(BrandingCall::Unbrand {
+			root: root.to_path_buf(),
+			user,
+			scope,
+		});
+		if state.fail_unbrands > 0 {
+			state.fail_unbrands -= 1;
+			return Err(PlatformError::Failed {
+				op: PlatformOp::Unbrand,
+				source: Box::new(Switched),
+			});
+		}
+		if state.machine_branding.get(root) == Some(&user) {
+			state.machine_branding.remove(root);
+		}
+		if scope == BrandingScope::User
+			&& state
+				.user_branding
+				.get(root)
+				.is_some_and(|entry| entry.user == user)
+		{
+			state.user_branding.remove(root);
+		}
+		Ok(())
 	}
 }
 

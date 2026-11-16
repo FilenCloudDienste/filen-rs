@@ -12,11 +12,12 @@ use windows_sys::Win32::Storage::FileSystem::{
 
 use crate::{
 	auth::{CredentialManagerKeyStore, KeyAccount, KeyStoreError},
+	branding::Branding,
 	dispatch::Dispatcher,
 	drive::Drive,
 	helper::{
-		Cleared, ExistingRoot, Platform, PlatformError, PlatformFailed, PlatformOp, RootRefusal,
-		clear_plain_root, path_taken, set_plain_root_aside,
+		BrandingScope, Cleared, ExistingRoot, Platform, PlatformError, PlatformFailed, PlatformOp,
+		RootRefusal, UserId, clear_plain_root, path_taken, set_plain_root_aside,
 	},
 	local::LocalEngine,
 	os::{
@@ -24,6 +25,7 @@ use crate::{
 		cfapi::{SyncRootOwner, SyncRootPathError, WinError, sync_root_owner},
 		win::{
 			ConnectedRoot, LOG_TARGET, ProviderInfo, RegisteredRoot, SyncRootPath, WinLocalFs,
+			explorer,
 			ffi::item_info,
 			platform_info, register,
 			sync_root::sync_root_info,
@@ -221,6 +223,19 @@ impl Platform for WinPlatform {
 
 	fn now(&self) -> SystemTime {
 		SystemTime::now()
+	}
+
+	fn brand(&self, root: &Path, user: UserId, branding: &Branding) -> Result<(), PlatformError> {
+		explorer::brand(root, user, branding).map_err(|e| failed(PlatformOp::Brand, e))
+	}
+
+	fn unbrand(
+		&self,
+		root: &Path,
+		user: UserId,
+		scope: BrandingScope,
+	) -> Result<(), PlatformError> {
+		explorer::unbrand(root, user, scope).map_err(|e| failed(PlatformOp::Unbrand, e))
 	}
 }
 

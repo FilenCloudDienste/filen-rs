@@ -2,6 +2,10 @@
 //! with, and the NUL-terminated UTF-16 strings it takes. No Windows API and no `unsafe` here, so
 //! this compiles, and is tested, on every host; `os::win` checks each code against `windows-sys`.
 
+// Read only by the Windows layer; on other hosts only its tests build it.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) mod explorer;
+
 use std::{fmt, iter};
 
 use filen_types::fs::Uuid;

@@ -8,6 +8,7 @@
 //! the runtime's tasks.
 
 mod callbacks;
+mod explorer;
 mod ffi;
 mod local;
 mod platform;

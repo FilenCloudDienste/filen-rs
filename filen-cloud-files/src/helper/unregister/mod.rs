@@ -34,7 +34,7 @@ use crate::{
 	helper::{
 		blocking,
 		index::{IndexError, KeptPlace, KeptRecord, RootEntry, RootsIndex, StateDir, index_error},
-		platform::{Platform, PlatformError, RootRefusal, platform_error},
+		platform::{BrandingScope, Platform, PlatformError, RootRefusal, platform_error},
 		protocol::{
 			ErrorCode, KeptId, KeptItem, KeptItemReason, MAX_LIST_ENTRIES, OutMessage, ReplyError,
 			UnregisterAllEntry, UnregisterReport, UserId,
@@ -399,6 +399,37 @@ pub(crate) struct RootOutcome {
 	pub(crate) tidied: Tidied,
 	/// What was kept, settled; `None` for a root left as it was.
 	pub(crate) record: Option<KeptRecord>,
+	/// Whether anything that showed the root in File Explorer may be left (see [`unbrand`]).
+	pub(crate) branding_left: bool,
+}
+
+/// What [`unregister_entry`] did.
+#[derive(Debug)]
+pub(crate) struct EntryUnregistered {
+	/// The reply's report.
+	pub(crate) report: UnregisterReport,
+	/// Whether anything that showed the root in File Explorer may be left: an elevated run leaves
+	/// the per-user navigation-pane entry, and a failed removal leaves what it did not remove.
+	pub(crate) branding_left: bool,
+}
+
+/// Removes what showed `user`'s root at `root` in File Explorer, once the OS let the root go, as
+/// far as this process may: everything as the user, only the machine-wide sync root list entry
+/// elevated (see [`BrandingScope`]). Whether anything may be left; a failure is logged, and what
+/// it left is cleared by a later run as the user.
+pub(crate) async fn unbrand<P: Platform>(platform: &Arc<P>, root: &Path, user: UserId) -> bool {
+	let scope = if platform.elevated() {
+		BrandingScope::MachineOnly
+	} else {
+		BrandingScope::User
+	};
+	let unbranding = Arc::clone(platform);
+	let root = root.to_path_buf();
+	let removed = blocking(move || unbranding.unbrand(&root, user, scope))
+		.await
+		.inspect_err(|error| warn!(%error, "removing the root from File Explorer failed"))
+		.is_ok();
+	!removed || scope == BrandingScope::MachineOnly
 }
 
 /// What the OS holds of a root whose unregister stopped.
@@ -571,6 +602,9 @@ pub(crate) async fn unregister_root<P: Platform>(
 			});
 		}
 	}
+	// Only now the OS let the root go, so a failed unregister keeps the root shown as it is; first
+	// of what follows, which may stop.
+	let branding_left = unbrand(platform, root, user).await;
 	// From here the OS holds nothing: a record that cannot be written stops the unregister before
 	// the data and the key go, and the next `unregister` or `register` finishes it.
 	let released = |error: &IndexError| Stopped {
@@ -598,6 +632,7 @@ pub(crate) async fn unregister_root<P: Platform>(
 		deleted_hydrated: settled.deleted_hydrated,
 		tidied,
 		record,
+		branding_left,
 	})
 }
 
@@ -809,24 +844,27 @@ pub(crate) async fn unregister_entry<P: Platform>(
 	entry: &RootEntry,
 	registered: Option<P::Registered>,
 	delete_hydrated: bool,
-) -> Result<UnregisterReport, Stopped<P::Registered>> {
+) -> Result<EntryUnregistered, Stopped<P::Registered>> {
 	let stopped = |error: ReplyError| Stopped {
 		held: Held::Unknown,
 		error,
 	};
 	if entry.unregistered {
 		// An earlier unregister finished, root, data and key; only what it kept waits to be told.
-		return Ok(UnregisterReport {
-			unregistered: true,
-			deleted_hydrated: 0,
-			kept: Vec::new(),
-			kept_count: 0,
-			kept_in: None,
-			root_removed: true,
-			key_deleted: true,
-			data_deleted: true,
-			kept_id: None,
-			kept_earlier: entry.earlier(None),
+		return Ok(EntryUnregistered {
+			branding_left: false,
+			report: UnregisterReport {
+				unregistered: true,
+				deleted_hydrated: 0,
+				kept: Vec::new(),
+				kept_count: 0,
+				kept_in: None,
+				root_removed: true,
+				key_deleted: true,
+				data_deleted: true,
+				kept_id: None,
+				kept_earlier: entry.earlier(None),
+			},
 		});
 	}
 	let data_dir = DataDir::new(entry.data_dir.clone())
@@ -894,6 +932,8 @@ pub(crate) async fn unregister_entry<P: Platform>(
 				kept_in: Some(entry.root.to_path_buf()),
 			},
 			record: None,
+			// A sync root list entry naming exactly the root is gone with the registration.
+			branding_left: unbrand(platform, &entry.root, entry.user).await,
 		},
 		// Not registered: an unregister stopped after the OS let the root go left the record of
 		// what it kept, finished here; a root without one holds ordinary items only (see
@@ -911,6 +951,8 @@ pub(crate) async fn unregister_entry<P: Platform>(
 				deleted_hydrated: 0,
 				tidied,
 				record,
+				// What an unregister stopped after the OS let the root go may have left.
+				branding_left: unbrand(platform, &entry.root, entry.user).await,
 			}
 		}
 	};
@@ -946,17 +988,20 @@ pub(crate) async fn unregister_entry<P: Platform>(
 		Some(record) if record.kept_count > 0 => (record.kept, record.kept_count, Some(record.id)),
 		Some(_) | None => (Vec::new(), 0, None),
 	};
-	Ok(UnregisterReport {
-		unregistered: true,
-		deleted_hydrated: outcome.deleted_hydrated,
-		kept,
-		kept_count,
-		kept_in: outcome.tidied.kept_in,
-		root_removed: outcome.tidied.root_removed,
-		key_deleted,
-		data_deleted,
-		kept_id,
-		kept_earlier,
+	Ok(EntryUnregistered {
+		report: UnregisterReport {
+			unregistered: true,
+			deleted_hydrated: outcome.deleted_hydrated,
+			kept,
+			kept_count,
+			kept_in: outcome.tidied.kept_in,
+			root_removed: outcome.tidied.root_removed,
+			key_deleted,
+			data_deleted,
+			kept_id,
+			kept_earlier,
+		},
+		branding_left: outcome.branding_left,
 	})
 }
 
@@ -1021,18 +1066,21 @@ pub async fn unregister_all<P: Platform>(
 	};
 	let mut roots = Vec::new();
 	for entry in index.entries().to_vec() {
-		let outcome = unregister_entry(&platform, &mut index, &entry, None, delete_hydrated)
-			.await
-			.map_err(|stopped| stopped.error);
-		let key_left = match &outcome {
-			Ok(report) => !report.key_deleted,
-			Err(_) => true,
+		let outcome = unregister_entry(&platform, &mut index, &entry, None, delete_hydrated).await;
+		let (outcome, key_left, branding_left) = match outcome {
+			Ok(done) => {
+				let key_left = !done.report.key_deleted;
+				(Ok(done.report), key_left, done.branding_left)
+			}
+			// A root still registered is still shown, as it should be.
+			Err(stopped) => (Err(stopped.error), true, false),
 		};
 		roots.push(UnregisterAllEntry {
 			user: entry.user,
 			root: entry.root,
 			outcome,
 			key_left,
+			branding_left,
 		});
 	}
 	UnregisterAll {

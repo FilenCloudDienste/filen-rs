@@ -761,13 +761,20 @@ pub enum ReplyValue {
 		/// What earlier unregisters kept.
 		#[serde(rename = "keptEarlier", skip_serializing_if = "Vec::is_empty")]
 		kept_earlier: Vec<KeptEarlier>,
+		/// Whether File Explorer was told what to show for the root without a failure: only when
+		/// the request named a branding and the root is served, as only a served root is shown.
+		#[serde(skip_serializing_if = "Option::is_none")]
+		branded: Option<bool>,
 	},
 	/// `setAuth`: serving; `adopted` when the root was served already and the cache takes the new
-	/// session on its own.
+	/// session on its own; `branded` as in `register`'s, when the `register` named a branding and
+	/// this request started serving the root.
 	#[serde(serialize_with = "serving_value")]
 	Serving {
 		/// Whether the session went to a root already served.
 		adopted: bool,
+		/// Whether File Explorer was told what to show for the root without a failure.
+		branded: Option<bool>,
 	},
 	/// `clearAuth`: whether the user was known.
 	Cleared {
@@ -929,6 +936,11 @@ pub struct UnregisterAllEntry {
 	pub outcome: Result<UnregisterReport, ReplyError>,
 	/// Whether the user's sealing key was left, as an elevated run cannot delete it.
 	pub key_left: bool,
+	/// Whether anything that showed the unregistered root in File Explorer may be left: an
+	/// elevated run leaves the per-user navigation-pane entry, which the helper's next run as the
+	/// user clears. Left out when false.
+	#[serde(skip_serializing_if = "is_false")]
+	pub branding_left: bool,
 }
 
 /// The `hello` line's fields.
@@ -1066,10 +1078,18 @@ fn lossy_path<S: Serializer>(path: &Option<PathBuf>, s: S) -> Result<S::Ok, S::E
 }
 
 /// `setAuth`'s value: always serving.
-fn serving_value<S: Serializer>(adopted: &bool, s: S) -> Result<S::Ok, S::Error> {
-	let mut value = s.serialize_struct("Serving", 2)?;
+fn serving_value<S: Serializer>(
+	adopted: &bool,
+	branded: &Option<bool>,
+	s: S,
+) -> Result<S::Ok, S::Error> {
+	let mut value = s.serialize_struct("Serving", 3)?;
 	value.serialize_field("state", &PhaseName::Serving)?;
 	value.serialize_field("adopted", adopted)?;
+	match branded {
+		Some(branded) => value.serialize_field("branded", branded)?,
+		None => value.skip_field("branded")?,
+	}
 	value.end()
 }
 
@@ -1103,6 +1123,10 @@ fn report_or_error<S: Serializer>(
 		Err(error) => fields.serialize_field("error", error)?,
 	}
 	fields.end()
+}
+
+fn is_false(value: &bool) -> bool {
+	!*value
 }
 
 fn is_zero(count: &u64) -> bool {
