@@ -43,6 +43,12 @@ mod board;
 mod wait;
 
 pub(crate) use board::LockBoard;
+// Fed by the websocket task, which builds without a socket (`service-worker`) do not have.
+#[cfg(any(
+	not(all(target_family = "wasm", target_os = "unknown")),
+	feature = "wasm-full"
+))]
+pub(crate) use board::lock_announced;
 #[cfg(test)]
 pub(crate) use board::{Holder, OpenLease};
 use wait::{LockWakes, NextPoll, noting_refusal, wait_socket, while_contended};
@@ -96,6 +102,61 @@ fn record_confirmation(confirmed: &tokio::sync::watch::Sender<Confirmed>, sent: 
 		}
 		later
 	});
+}
+
+/// The socket's lock announcements that said a held lease may be lost, and which of them the
+/// server has answered since: [`ResourceLock::is_valid`] reads the lease as unconfirmed while
+/// one is unanswered. A refresh answers the suspicions raised before its send
+/// ([`Self::mark`]) once the server confirms it ([`Self::answered`]), and the keep-alive sends
+/// one as soon as a suspicion is raised.
+///
+/// Counted rather than timed: a suspicion raised while a refresh is on its way may have been
+/// announced after the server processed it, so that refresh cannot answer it, however close the
+/// clocks read.
+#[derive(Debug, Clone, Default)]
+struct Suspicion(tokio::sync::watch::Sender<Suspicions>);
+
+#[derive(Debug, Clone, Copy, Default)]
+struct Suspicions {
+	raised: u64,
+	/// The highest [`SuspicionMark`] a confirmation answered.
+	answered: u64,
+}
+
+/// The suspicions of a lease raised before a refresh of it was sent, which its confirmation
+/// answers.
+#[derive(Debug, Clone, Copy)]
+struct SuspicionMark(u64);
+
+impl Suspicion {
+	/// An announcement says the lease may be lost.
+	fn raise(&self) {
+		// Saturating: a lease sees nowhere near `u64::MAX` announcements.
+		self.0
+			.send_modify(|suspicions| suspicions.raised = suspicions.raised.saturating_add(1));
+	}
+
+	/// Whether a suspicion is raised and not answered yet.
+	fn is_raised(&self) -> bool {
+		let suspicions = self.0.borrow();
+		suspicions.raised > suspicions.answered
+	}
+
+	/// The suspicions a refresh sent now answers once confirmed.
+	fn mark(&self) -> SuspicionMark {
+		SuspicionMark(self.0.borrow().raised)
+	}
+
+	/// The server confirmed a refresh sent at `mark`.
+	fn answered(&self, mark: SuspicionMark) {
+		self.0.send_if_modified(|suspicions| {
+			let later = mark.0 > suspicions.answered;
+			if later {
+				suspicions.answered = mark.0;
+			}
+			later
+		});
+	}
 }
 
 /// Where a lock request goes: a gateway's lock endpoint.
@@ -459,11 +520,14 @@ impl ReleaseRequest {
 ///
 /// A lock whose last confirmed refresh is older than [`LOCK_LOSS_BUDGET`] (by the monotonic or
 /// the wall clock, so a system suspend counts) is unconfirmed: [`Self::is_valid`] reads false
-/// until the server confirms it again. It is LOST once the server refuses a refresh, or no
-/// refresh was confirmed within [`LOCK_SERVER_TTL`]: [`Self::wait_for_loss`] resolves, the
-/// keep-alive stops, a release of the lease is sent in case the server still holds it after
-/// all, and the cached [`Client::lock_drive`] family acquires a new lock instead of handing it
-/// out — another client may hold the resource from that point on.
+/// until the server confirms it again. So is one a lock announcement over the client's socket
+/// says may be lost (its lease ended, or another lease of its resource began), until the server
+/// confirms a refresh sent after it, which the keep-alive sends at once. It is LOST once the
+/// server refuses a refresh, or no refresh was confirmed within [`LOCK_SERVER_TTL`]:
+/// [`Self::wait_for_loss`] resolves, the keep-alive stops, a release of the lease is sent in
+/// case the server still holds it after all, and the cached [`Client::lock_drive`] family
+/// acquires a new lock instead of handing it out — another client may hold the resource from
+/// that point on.
 ///
 /// The release request is spawned onto the ambient tokio runtime at drop time when one exists,
 /// falling back to the runtime the lock was acquired on. When neither is available, or the
@@ -488,6 +552,9 @@ struct SharedLease {
 	valid: tokio::sync::watch::Sender<bool>,
 	// The lease's latest confirmation, shared with the keep-alive task.
 	confirmed: tokio::sync::watch::Sender<Confirmed>,
+	// The announcements that said the lease may be lost, shared with the keep-alive task, which
+	// refreshes the lease as soon as one comes.
+	suspicion: Suspicion,
 	// One [`ResourceLock::confirm`] asks the server at a time; the others wait for its outcome.
 	// Holds the error the last one failed with, for those that waited for it.
 	confirming: tokio::sync::Mutex<Option<Arc<Error>>>,
@@ -519,18 +586,24 @@ impl ResourceLock {
 	}
 
 	/// Whether the server confirmed this lock's lease within [`LOCK_LOSS_BUDGET`] and has not
-	/// refused it since.
+	/// refused it since, and no lock announcement over the client's socket said since that the
+	/// lease may be lost.
 	///
 	/// `false` means another client may already hold the resource, or soon may: the lock is
-	/// lost, or its last confirmation is too old to rely on (a refresh failing, or the system
-	/// was suspended). An unconfirmed lock turns valid again once the keep-alive gets a refresh
-	/// through; a lost one never does, and holders should re-acquire.
+	/// lost, or unconfirmed: its last confirmation is too old to rely on (a refresh failing, or
+	/// the system was suspended), or an announcement said its lease ended or another lease of
+	/// its resource began. An unconfirmed lock turns valid again once the keep-alive gets a
+	/// refresh through, which it sends at once after such an announcement; a lost one never
+	/// does, and holders should re-acquire.
 	pub fn is_valid(&self) -> bool {
-		!self.lease.is_lost() && self.lease.age() < LOCK_LOSS_BUDGET
+		!self.lease.is_lost()
+			&& !self.lease.suspicion.is_raised()
+			&& self.lease.age() < LOCK_LOSS_BUDGET
 	}
 
 	/// `Ok` once the lease is confirmed: at once while [`Self::is_valid`], otherwise after
-	/// asking the server with a refresh. A lost lease is an [`ErrorKind::LockLost`] error.
+	/// asking the server with a refresh, which an announcement that the lease may be lost
+	/// raised since must have been sent after. A lost lease is an [`ErrorKind::LockLost`] error.
 	///
 	/// A refresh failing in transport ([`ErrorKind::reached_no_server`]) says nothing about the lease, so
 	/// the server is asked again, every [`LOCK_RETRY_INTERVAL`], until the lease is confirmed or
@@ -646,13 +719,14 @@ impl SharedLease {
 	}
 
 	/// What a confirmation is answered with without asking the server: lost, confirmed recently
-	/// enough, or lapsed, which loses it. `None` while it is unconfirmed and could still stand.
+	/// enough with no suspicion raised since, or lapsed, which loses it. `None` while it is
+	/// unconfirmed and could still stand.
 	fn settled(&self) -> Option<Result<(), Error>> {
 		if self.is_lost() {
 			return Some(Err(self.lost_error()));
 		}
 		let age = self.age();
-		if age < LOCK_LOSS_BUDGET {
+		if age < LOCK_LOSS_BUDGET && !self.suspicion.is_raised() {
 			return Some(Ok(()));
 		}
 		// Past the lease, a confirmation could not be trusted (see `ask`): it has lapsed.
@@ -679,6 +753,7 @@ impl SharedLease {
 				return settled;
 			}
 			let sent = Confirmed::now();
+			let mark = self.suspicion.mark();
 			let request = refresh();
 			let mut request = pin!(request);
 			let answer = loop {
@@ -700,8 +775,13 @@ impl SharedLease {
 				// trusted: an older server confirms any refresh, also one for a lease that lapsed
 				// and was handed to another client.
 				Ok(Ok(true)) if !self.is_lost() && self.age() < LOCK_SERVER_TTL => {
+					// Before the confirmation, which wakes whoever waits for it.
+					self.suspicion.answered(mark);
 					record_confirmation(&self.confirmed, sent);
-					return Ok(());
+					// A suspicion raised while it was on its way is asked about again.
+					if !self.suspicion.is_raised() {
+						return Ok(());
+					}
 				}
 				Ok(Ok(false)) => {
 					self.mark_lost();
@@ -960,20 +1040,31 @@ fn refresh_delay_after(elapsed: Duration) -> Duration {
 }
 
 /// Sleeps until the next refresh is due, by the age of the lease's last confirmation, in steps
-/// of at most [`LOCK_CLOCK_TICK`]. `false` once the lock is lost meanwhile.
+/// of at most [`LOCK_CLOCK_TICK`], or until a suspicion is raised, which makes it due at once.
+/// `false` once the lock is lost meanwhile.
 async fn until_refresh_due(
 	confirmed: &tokio::sync::watch::Sender<Confirmed>,
 	valid: &tokio::sync::watch::Sender<bool>,
+	suspicion: &Suspicion,
 ) -> bool {
+	// Subscribed before the first look, so a suspicion raised after it ends the sleep.
+	let mut suspicions = suspicion.0.subscribe();
 	loop {
 		if !*valid.borrow() {
 			return false;
+		}
+		if suspicion.is_raised() {
+			return true;
 		}
 		let delay = refresh_delay_after(confirmed.borrow().age());
 		if delay.is_zero() {
 			return true;
 		}
-		sleep(delay.min(LOCK_CLOCK_TICK)).await;
+		tokio::select! {
+			() = sleep(delay.min(LOCK_CLOCK_TICK)) => {}
+			// The sender is borrowed for this call, so the channel cannot close meanwhile.
+			_ = suspicions.changed() => {}
+		}
 	}
 }
 
@@ -990,7 +1081,9 @@ enum LoopExit {
 
 /// Drives the refresh schedule for one held lock until it is dropped or lost, recording every
 /// confirmation in `confirmed`. `valid` is the lock's loss flag: once it is cleared, by the loop
-/// or by anyone else, the loop sends no further refresh and ends.
+/// or by anyone else, the loop sends no further refresh and ends. A suspicion raised on
+/// `suspicion` makes a refresh due at once, and a confirmed one answers the suspicions raised
+/// before its send.
 ///
 /// `refresh` builds the future for a single Refresh round-trip (resolving to the
 /// server's `refreshed` flag), or returns `None` once the lock has been dropped.
@@ -1006,6 +1099,7 @@ async fn refresh_loop<F, Fut>(
 	mut refresh: F,
 	confirmed: &tokio::sync::watch::Sender<Confirmed>,
 	valid: &tokio::sync::watch::Sender<bool>,
+	suspicion: &Suspicion,
 ) -> LoopExit
 where
 	F: FnMut() -> Option<Fut>,
@@ -1015,7 +1109,7 @@ where
 	// when it processes a request, never earlier than its send, so the age only ever
 	// overestimates the lease's.
 	loop {
-		if !until_refresh_due(confirmed, valid).await {
+		if !until_refresh_due(confirmed, valid, suspicion).await {
 			return LoopExit::Lost;
 		}
 		let age = confirmed.borrow().age();
@@ -1026,11 +1120,14 @@ where
 			return LoopExit::Dropped;
 		};
 		let sent = Confirmed::now();
+		let mark = suspicion.mark();
 		match timeout(remaining, fut).await {
 			// Only an answer received inside the lease, for a lock not marked lost meanwhile, is
 			// trusted: an older server confirms any refresh, also one for a lease that lapsed and
 			// was handed to another client.
 			Ok(Ok(true)) if *valid.borrow() && confirmed.borrow().age() < LOCK_SERVER_TTL => {
+				// Before the confirmation, which wakes whoever waits for it.
+				suspicion.answered(mark);
 				record_confirmation(confirmed, sent);
 			}
 			// Refused (the server no longer recognizes the lock), answered too late, or lost
@@ -1048,6 +1145,7 @@ async fn run_keep_alive(
 	weak: Weak<SharedLease>,
 	confirmed: tokio::sync::watch::Sender<Confirmed>,
 	valid: tokio::sync::watch::Sender<bool>,
+	suspicion: Suspicion,
 ) {
 	let refresh = || {
 		let lease = weak.upgrade()?;
@@ -1055,7 +1153,7 @@ async fn run_keep_alive(
 			async move { send_refresh(&lease.client, &lock_url(), lease.uuid, &lease.resource).await },
 		)
 	};
-	if refresh_loop(refresh, &confirmed, &valid).await == LoopExit::Lost
+	if refresh_loop(refresh, &confirmed, &valid, &suspicion).await == LoopExit::Lost
 		&& let Some(lease) = weak.upgrade()
 	{
 		lease.mark_lost();
@@ -1069,6 +1167,7 @@ fn keep_lock_alive(lease: &Arc<SharedLease>) {
 		Arc::downgrade(lease),
 		lease.confirmed.clone(),
 		lease.valid.clone(),
+		lease.suspicion.clone(),
 	);
 	// Same no-ambient-runtime hazard as the release: spawn on the runtime the lock was acquired
 	// on. The ambient fallback is unreachable through `acquire_lock` (reqwest already
@@ -1091,6 +1190,7 @@ fn keep_lock_alive(lease: &Arc<SharedLease>) {
 		Arc::downgrade(lease),
 		lease.confirmed.clone(),
 		lease.valid.clone(),
+		lease.suspicion.clone(),
 	));
 }
 
@@ -1540,6 +1640,7 @@ impl Client {
 			resource,
 			valid: tokio::sync::watch::Sender::new(true),
 			confirmed: tokio::sync::watch::Sender::new(acquired_at),
+			suspicion: Suspicion::default(),
 			confirming: tokio::sync::Mutex::new(None),
 			confirmations: AtomicU64::new(0),
 			#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]

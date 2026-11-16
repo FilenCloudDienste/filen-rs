@@ -515,6 +515,64 @@ async fn a_suspend_past_the_budget_leaves_the_lock_unconfirmed_until_the_server_
 
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 #[tokio::test]
+async fn a_suspect_lock_is_unconfirmed_until_the_server_confirms_it() {
+	let lock = test_lock(None);
+	lock.lease.suspicion.raise();
+	assert!(!lock.is_valid());
+	assert!(!lock.lease.is_lost(), "the lease may still stand");
+	let asked = std::cell::Cell::new(0);
+	lock.confirm_via(counted_refresh(&asked, Duration::ZERO, Ok(true)))
+		.await
+		.unwrap();
+	assert_eq!(asked.get(), 1);
+	assert!(lock.is_valid());
+}
+
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+#[tokio::test]
+async fn a_suspect_lock_the_server_refuses_is_lost() {
+	let lock = test_lock(None);
+	lock.lease.suspicion.raise();
+	let asked = std::cell::Cell::new(0);
+	let error = lock
+		.confirm_via(counted_refresh(&asked, Duration::ZERO, Ok(false)))
+		.await
+		.unwrap_err();
+	assert_eq!(error.kind(), ErrorKind::LockLost);
+	assert_eq!(asked.get(), 1);
+	assert!(lock.lease.is_lost());
+	assert!(!lock.is_valid());
+}
+
+/// A suspicion raised while the confirmation's refresh is on its way is asked about again.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+#[tokio::test(start_paused = true)]
+async fn a_suspicion_raised_during_a_confirmation_is_asked_about_again() {
+	let begin = Instant::now();
+	let lock = test_lock(None);
+	lock.lease.suspicion.raise();
+	let asked = std::cell::Cell::new(0);
+	let (confirmed, ()) = tokio::join!(
+		lock.confirm_via(scripted_answers(
+			&asked,
+			[
+				(Duration::from_secs(2), Ok(true)),
+				(Duration::from_secs(2), Ok(true))
+			]
+		)),
+		async {
+			sleep(Duration::from_secs(1)).await;
+			lock.lease.suspicion.raise();
+		}
+	);
+	confirmed.unwrap();
+	assert_eq!(asked.get(), 2);
+	assert_eq!(begin.elapsed(), Duration::from_secs(4));
+	assert!(lock.is_valid());
+}
+
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+#[tokio::test]
 async fn a_refused_confirmation_loses_the_lock() {
 	let lock = unconfirmed_lock(LOCK_LOSS_BUDGET + Duration::from_secs(5));
 	let asked = std::cell::Cell::new(0);
@@ -859,6 +917,7 @@ async fn lock_drop_ends_refresh_loop_silently() {
 		scripted_refresh(&[Step::Confirm, Step::Drop]),
 		&confirmed_at(begin),
 		&held(),
+		&Suspicion::default(),
 	)
 	.await;
 	assert_eq!(exit, LoopExit::Dropped);
@@ -874,6 +933,7 @@ async fn server_refusal_is_authoritative_loss() {
 		scripted_refresh(&[Step::Refuse]),
 		&confirmed_at(begin),
 		&held(),
+		&Suspicion::default(),
 	)
 	.await;
 	assert_eq!(exit, LoopExit::Lost);
@@ -889,6 +949,7 @@ async fn transient_refresh_error_retries_and_recovers() {
 		scripted_refresh(&[Step::TransportErr, Step::Confirm, Step::Confirm, Step::Drop]),
 		&confirmed,
 		&held(),
+		&Suspicion::default(),
 	)
 	.await;
 	assert_eq!(exit, LoopExit::Dropped);
@@ -908,6 +969,7 @@ async fn failing_refreshes_are_retried_until_the_lease_lapses() {
 		scripted_refresh(&[Step::TransportErr; 45]),
 		&confirmed_at(begin),
 		&held(),
+		&Suspicion::default(),
 	)
 	.await;
 	assert_eq!(exit, LoopExit::Lost);
@@ -922,6 +984,7 @@ async fn hung_refresh_is_cut_off_when_the_lease_lapses() {
 		scripted_refresh(&[Step::Hang]),
 		&confirmed_at(begin),
 		&held(),
+		&Suspicion::default(),
 	)
 	.await;
 	assert_eq!(exit, LoopExit::Lost);
@@ -939,6 +1002,7 @@ async fn a_refresh_late_past_the_budget_asks_the_server_before_any_loss() {
 		scripted_refresh(&[Step::Confirm, Step::Drop]),
 		&confirmed_at(begin),
 		&held(),
+		&Suspicion::default(),
 	)
 	.await;
 	assert_eq!(exit, LoopExit::Dropped);
@@ -952,7 +1016,13 @@ async fn a_suspend_past_the_ttl_is_loss_by_the_wall_clock() {
 	// the monotonic clock did not see the suspend, so only the wall clock can tell
 	let confirmed =
 		tokio::sync::watch::Sender::new(suspended_for(LOCK_SERVER_TTL + Duration::from_secs(5)));
-	let exit = refresh_loop(scripted_refresh(&[]), &confirmed, &held()).await;
+	let exit = refresh_loop(
+		scripted_refresh(&[]),
+		&confirmed,
+		&held(),
+		&Suspicion::default(),
+	)
+	.await;
 	assert_eq!(exit, LoopExit::Lost);
 }
 
@@ -961,11 +1031,13 @@ async fn a_suspend_past_the_ttl_is_loss_by_the_wall_clock() {
 async fn a_suspend_while_waiting_is_refreshed_after_at_once() {
 	let begin = Instant::now();
 	let (confirmed, valid) = (confirmed_at(begin), held());
+	let suspicion = Suspicion::default();
 	let (exit, ()) = tokio::join!(
 		refresh_loop(
 			scripted_refresh(&[Step::Confirm, Step::Drop]),
 			&confirmed,
-			&valid
+			&valid,
+			&suspicion,
 		),
 		async {
 			sleep(Duration::from_millis(2500)).await;
@@ -987,9 +1059,15 @@ async fn a_suspend_while_waiting_is_refreshed_after_at_once() {
 async fn a_lock_lost_elsewhere_is_refreshed_no_more() {
 	let begin = Instant::now();
 	let (confirmed, valid) = (confirmed_at(begin), held());
+	let suspicion = Suspicion::default();
 	let (exit, ()) = tokio::join!(
 		// one refresh is scripted: a second would panic
-		refresh_loop(scripted_refresh(&[Step::Confirm]), &confirmed, &valid),
+		refresh_loop(
+			scripted_refresh(&[Step::Confirm]),
+			&confirmed,
+			&valid,
+			&suspicion,
+		),
 		async {
 			sleep(Duration::from_millis(20_500)).await;
 			valid.send_replace(false);
@@ -1006,11 +1084,13 @@ async fn a_refresh_answered_after_the_lock_was_lost_does_not_confirm_it() {
 	let begin = Instant::now();
 	let confirmed = confirmed_at(begin);
 	let valid = held();
+	let suspicion = Suspicion::default();
 	let (exit, ()) = tokio::join!(
 		refresh_loop(
 			scripted_refresh(&[Step::SlowConfirm(5)]),
 			&confirmed,
-			&valid
+			&valid,
+			&suspicion,
 		),
 		async {
 			sleep(Duration::from_secs(17)).await;
@@ -1025,12 +1105,87 @@ async fn a_refresh_answered_after_the_lock_was_lost_does_not_confirm_it() {
 
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 #[tokio::test(start_paused = true)]
+async fn a_suspicion_is_refreshed_at_once_and_a_refusal_loses_the_lock() {
+	let begin = Instant::now();
+	let (confirmed, valid, suspicion) = (confirmed_at(begin), held(), Suspicion::default());
+	let (exit, ()) = tokio::join!(
+		refresh_loop(
+			scripted_refresh(&[Step::Refuse]),
+			&confirmed,
+			&valid,
+			&suspicion,
+		),
+		async {
+			sleep(Duration::from_millis(5_500)).await;
+			suspicion.raise();
+		}
+	);
+	assert_eq!(exit, LoopExit::Lost);
+	// refreshed when the suspicion was raised, not when the 15 s timer ran out
+	assert_eq!(begin.elapsed(), Duration::from_millis(5_500));
+}
+
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+#[tokio::test(start_paused = true)]
+async fn a_confirmed_refresh_answers_the_suspicion_raised_before_it() {
+	let begin = Instant::now();
+	let (confirmed, valid, suspicion) = (confirmed_at(begin), held(), Suspicion::default());
+	let (exit, ()) = tokio::join!(
+		refresh_loop(
+			scripted_refresh(&[Step::Confirm, Step::Drop]),
+			&confirmed,
+			&valid,
+			&suspicion,
+		),
+		async {
+			sleep(Duration::from_secs(5)).await;
+			suspicion.raise();
+			assert!(suspicion.is_raised());
+		}
+	);
+	assert_eq!(exit, LoopExit::Dropped);
+	assert!(!suspicion.is_raised());
+	// refreshed at 5 s, and the drop observed at the refresh 15 s after it
+	assert_eq!(confirmed.borrow().at - begin, Duration::from_secs(5));
+	assert_eq!(begin.elapsed(), Duration::from_secs(20));
+}
+
+/// A suspicion raised while a refresh is on its way may have been announced after the server
+/// processed it: only a refresh sent after it answers it.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+#[tokio::test(start_paused = true)]
+async fn a_suspicion_raised_during_a_refresh_is_refreshed_again() {
+	let begin = Instant::now();
+	let (confirmed, valid, suspicion) = (confirmed_at(begin), held(), Suspicion::default());
+	let (exit, ()) = tokio::join!(
+		refresh_loop(
+			scripted_refresh(&[Step::SlowConfirm(2), Step::Confirm, Step::Drop]),
+			&confirmed,
+			&valid,
+			&suspicion,
+		),
+		async {
+			sleep(Duration::from_secs(16)).await;
+			suspicion.raise();
+		}
+	);
+	assert_eq!(exit, LoopExit::Dropped);
+	assert!(!suspicion.is_raised());
+	// sent at 15 s and confirmed at 17 s, refreshed again at 17 s, and the drop observed 15 s
+	// after that
+	assert_eq!(confirmed.borrow().at - begin, Duration::from_secs(17));
+	assert_eq!(begin.elapsed(), Duration::from_secs(32));
+}
+
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+#[tokio::test(start_paused = true)]
 async fn slow_confirm_keeps_cadence_anchored_to_send_time() {
 	let begin = Instant::now();
 	let exit = refresh_loop(
 		scripted_refresh(&[Step::SlowConfirm(5), Step::Drop]),
 		&confirmed_at(begin),
 		&held(),
+		&Suspicion::default(),
 	)
 	.await;
 	assert_eq!(exit, LoopExit::Dropped);

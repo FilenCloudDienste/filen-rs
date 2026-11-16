@@ -11,6 +11,7 @@ use crate::{
 	crypto::shared::MetaCrypter,
 	error::ResultExt,
 	runtime::WorkerStart,
+	sync::lock::lock_announced,
 };
 
 use super::{
@@ -539,7 +540,7 @@ where
 						// Ahead of the gate below, which drops what no listener asked for: the
 						// lock board sees every announcement.
 						if let SocketEvent::Lock { inner, lock_message_id } = event_yoke.get() {
-							config.client.lock_board.announced(inner, *lock_message_id);
+							lock_announced(&config.client, inner, *lock_message_id);
 						}
 						if listeners.should_decrypt_event(event_yoke.get()) {
 							decryption_futures.push_back(async move {

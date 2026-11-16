@@ -1,5 +1,7 @@
 #[cfg(feature = "test-seams")]
 use std::borrow::Cow;
+#[cfg(feature = "test-seams")]
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use base64::{Engine, prelude::BASE64_URL_SAFE_NO_PAD};
@@ -8,6 +10,8 @@ use filen_sdk_rs::auth::Client;
 use filen_sdk_rs::auth::{http::ClientConfig, unauth::UnauthClient};
 #[cfg(feature = "test-seams")]
 use filen_sdk_rs::socket::DecryptedSocketEvent;
+#[cfg(feature = "test-seams")]
+use filen_sdk_rs::sync::lock::{LockEvent, LockEventKind};
 
 /// Waits for a dropped lock's release task to free `resource`: acquires it once it is free and
 /// releases it again, and fails the test if it is still held after `within`.
@@ -260,4 +264,76 @@ async fn a_contended_wait_opens_the_socket_for_the_release() {
 	}
 	drop(waiter);
 	wait_until_free(&holding, &resource, Duration::from_secs(30)).await;
+}
+
+/// A held lock whose lease another client releases (the server releases a lease for its uuid,
+/// whoever asks) is lost as soon as the release is announced: the announcement makes the holder
+/// refresh at once, and the server refuses that refresh. Its keep-alive alone would find out at
+/// its next refresh, 15 s after the acquire.
+#[cfg(feature = "test-seams")]
+#[filen_macros::shared_test_runtime]
+async fn a_lock_released_elsewhere_is_lost_at_once() {
+	let releasing = test_utils::RESOURCES.client().await;
+	// A client of its own, signed in as the shared one is, so its lock listener and its socket
+	// are the test's.
+	let holding = UnauthClient::from_config(ClientConfig::default())
+		.expect("building an unauthenticated client")
+		.from_stringified(releasing.to_stringified())
+		.expect("restoring the signed-in client");
+	let owed = Arc::new(Mutex::new(Vec::new()));
+	holding.set_lock_listener({
+		// a second handle, for the listener
+		let owed = Arc::clone(&owed);
+		move |event: LockEvent| {
+			if matches!(event.kind, LockEventKind::Owed) {
+				owed.lock().unwrap().push(event.lock);
+			}
+		}
+	});
+	// The announcements arrive over the socket, which a listener keeps open.
+	let _listener = holding
+		.add_event_listener(
+			Box::new(|_: &DecryptedSocketEvent<'_>| {}),
+			Some(vec![Cow::Borrowed("authSuccess")]),
+		)
+		.await
+		.unwrap();
+	let version = tokio::time::timeout(
+		Duration::from_secs(20),
+		holding.lock_protocol_version_for_test(),
+	)
+	.await
+	.expect("the lockHello probe settles");
+	assert_eq!(version, Some(2), "the server does not announce locks");
+
+	let resource = format!(
+		"rs-{}",
+		BASE64_URL_SAFE_NO_PAD.encode(rand::random::<[u8; 32]>())
+	);
+	let lock = holding
+		.acquire_lock(&resource, Duration::from_secs(1), 1)
+		.await
+		.unwrap();
+	assert!(lock.is_valid());
+	let id = {
+		let mut owed = owed.lock().unwrap();
+		assert_eq!(owed.len(), 1, "one lock is owed");
+		owed.pop().unwrap()
+	};
+	assert_eq!(id.resource, resource);
+
+	let released_at = Instant::now();
+	releasing.release_locks([id]).await;
+	tokio::time::timeout(Duration::from_secs(10), lock.wait_for_loss())
+		.await
+		.expect("the lock is lost within 10 s of its release");
+	let lost_after = released_at.elapsed();
+	println!("the lock was lost {lost_after:?} after its release was sent");
+	assert!(
+		lost_after < Duration::from_secs(5),
+		"the lock was lost {lost_after:?} after its release was sent"
+	);
+	assert!(!lock.is_valid());
+	drop(lock);
+	wait_until_free(&releasing, &resource, Duration::from_secs(30)).await;
 }

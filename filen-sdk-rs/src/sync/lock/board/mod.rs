@@ -3,7 +3,8 @@
 //!
 //! Announcements are hints. They arrive in any order, are lost while the socket is disconnected
 //! and are not replayed, so whether this client holds a lock is still decided only by the
-//! answers to its own lock requests.
+//! answers to its own lock requests. An announcement that a held lease may be lost only makes
+//! the lease unconfirmed until the server answers a refresh of it (see [`super::Suspicion`]).
 
 // Only the websocket task feeds the board, and builds without a socket (`service-worker`) have
 // none.
@@ -23,7 +24,10 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
-use filen_types::{api::v3::socket::LockEventType, fs::Uuid};
+use filen_types::{
+	api::v3::socket::{LockAnnouncement, LockEventType},
+	fs::Uuid,
+};
 use tokio::sync::watch;
 
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
@@ -31,7 +35,8 @@ use tokio::time::Instant;
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 use wasmtimer::std::Instant;
 
-use super::{LOCK_SERVER_TTL, SharedLease};
+use super::{Confirmed, LOCK_SERVER_TTL, LeaseConfirmed, OwedRelease, SharedLease, lock_url};
+use crate::auth::http::AuthClient;
 
 /// How long an ended lease is remembered: long enough for its `lockAcquired`, which can arrive
 /// after its end, to find it ended.
@@ -67,9 +72,27 @@ struct Board {
 	/// and when a connection is authenticated, as announcements may have been lost before it.
 	wakes: HashMap<String, watch::Sender<()>>,
 	/// The leases this client holds, by uuid, until the last handle on one is dropped.
-	held: HashMap<Uuid, Weak<SharedLease>>,
+	held: HashMap<Uuid, Held>,
 	/// The uuids this client let go, by uuid, for [`RETIRED_KEEP`].
 	retired: HashMap<Uuid, Retired>,
+}
+
+/// A lease this client holds, and its resource, so an announcement is checked against it without
+/// upgrading it under the board's lock (see [`LockBoard::held`]).
+struct Held {
+	resource: Box<str>,
+	lease: Weak<SharedLease>,
+}
+
+/// What a lock announcement says about this client's own leases (see [`LockBoard::announced`]).
+#[derive(Default)]
+pub(crate) struct OwnLeases {
+	/// The held leases it says may be lost: its lease of theirs ended, or another lease of their
+	/// resource began.
+	suspect: Vec<Weak<SharedLease>>,
+	/// A uuid this client let go of that a lease began for: a lock request of it was granted
+	/// after its release was sent or given up on, as a request whose outcome was unknown can be.
+	regranted: Option<Uuid>,
 }
 
 /// A uuid this client let go: it sent a release for it, or gave up on one, on `resource` at
@@ -138,10 +161,13 @@ enum LeaseSeen {
 }
 
 impl Leases {
-	fn acquired(&mut self, lease_id: &str, lease: OpenLease) {
+	/// Adds the lease unless it ended. `true` if that opened it, `false` if it was open or ended
+	/// already.
+	fn acquired(&mut self, lease_id: &str, lease: OpenLease) -> bool {
 		match self.0.get_mut(lease_id) {
 			None => {
 				self.0.insert(lease_id.into(), LeaseSeen::Open(lease));
+				true
 			}
 			// A lease is announced acquired once. Should it come twice, the higher counter wins,
 			// so the order they arrive in does not matter.
@@ -149,18 +175,24 @@ impl Leases {
 				if (lease.lock_message_id, lease.holder) > (open.lock_message_id, open.holder) {
 					*open = lease;
 				}
+				false
 			}
-			Some(LeaseSeen::Ended(_)) => {}
+			Some(LeaseSeen::Ended(_)) => false,
 		}
 	}
 
-	fn ended(&mut self, lease_id: &str, now: Instant) {
+	/// Marks the lease ended. `true` if that ended it, `false` if it had ended already.
+	fn ended(&mut self, lease_id: &str, now: Instant) -> bool {
 		match self.0.get_mut(lease_id) {
 			None => {
 				self.0.insert(lease_id.into(), LeaseSeen::Ended(now));
+				true
 			}
-			Some(seen @ LeaseSeen::Open(_)) => *seen = LeaseSeen::Ended(now),
-			Some(LeaseSeen::Ended(_)) => {}
+			Some(seen @ LeaseSeen::Open(_)) => {
+				*seen = LeaseSeen::Ended(now);
+				true
+			}
+			Some(LeaseSeen::Ended(_)) => false,
 		}
 	}
 
@@ -198,6 +230,23 @@ impl Board {
 			wake.send_replace(());
 		}
 	}
+
+	/// The held leases of `resource` whose uuid is `suspect`.
+	fn held_on(&self, resource: &str, suspect: impl Fn(Uuid) -> bool) -> Vec<Weak<SharedLease>> {
+		self.held
+			.iter()
+			.filter(|(uuid, held)| &*held.resource == resource && suspect(**uuid))
+			// a second handle on the lease, upgraded once the board's lock is left
+			.map(|(_, held)| Weak::clone(&held.lease))
+			.collect()
+	}
+
+	/// Whether this client let `uuid` on `resource` go within [`RETIRED_KEEP`] before `now`.
+	fn is_retired_at(&self, resource: &str, uuid: Uuid, now: DateTime<Utc>) -> bool {
+		self.retired
+			.get(&uuid)
+			.is_some_and(|retired| &*retired.resource == resource && retired.is_kept_at(now))
+	}
 }
 
 impl LockBoard {
@@ -207,28 +256,46 @@ impl LockBoard {
 
 	/// Applies a lock announcement with the user's lock announcement counter `lock_message_id`.
 	/// An ended lease wakes the waits for its resource.
-	pub(crate) fn announced(&self, event: &LockEventType<'_>, lock_message_id: u64) {
+	///
+	/// Returns what it says about this client's own leases, each once, when it first ends or
+	/// opens a lease: a held lease whose lease it ends, or of whose resource it opens another
+	/// lease, may be lost; and a retired uuid it opens a lease for was granted late. A lease of a
+	/// held uuid opening is the client's own grant, and says nothing.
+	pub(crate) fn announced(&self, event: &LockEventType<'_>, lock_message_id: u64) -> OwnLeases {
 		let now = Instant::now();
 		let mut board = self.board();
-		let (announcement, ended) = match event {
-			LockEventType::LockAcquired(announcement) => (announcement, false),
-			LockEventType::LockReleased(announcement)
-			| LockEventType::LockTimeout(announcement) => (announcement, true),
-		};
+		let (announcement, ended) = announcement_of(event);
 		let resource = announcement.resource.as_ref();
+		let holder = announcement.uuid;
 		let leases = board.announced.entry(resource.to_owned()).or_default();
 		leases.prune(now);
 		if ended {
-			leases.ended(&announcement.lease_id, now);
+			let newly = leases.ended(&announcement.lease_id, now);
 			board.wake(resource);
+			if !newly {
+				return OwnLeases::default();
+			}
+			OwnLeases {
+				suspect: board.held_on(resource, |uuid| uuid == holder),
+				regranted: None,
+			}
 		} else {
-			leases.acquired(
+			let newly = leases.acquired(
 				&announcement.lease_id,
 				OpenLease {
-					holder: announcement.uuid,
+					holder,
 					lock_message_id,
 				},
 			);
+			if !newly {
+				return OwnLeases::default();
+			}
+			OwnLeases {
+				suspect: board.held_on(resource, |uuid| uuid != holder),
+				regranted: board
+					.is_retired_at(resource, holder, Utc::now())
+					.then_some(holder),
+			}
 		}
 	}
 
@@ -287,7 +354,13 @@ impl LockBoard {
 
 	/// Registers `lease` as held by this client, until [`Self::let_go`].
 	pub(super) fn hold(&self, lease: &Arc<SharedLease>) {
-		self.board().held.insert(lease.uuid, Arc::downgrade(lease));
+		self.board().held.insert(
+			lease.uuid,
+			Held {
+				resource: lease.resource.as_str().into(),
+				lease: Arc::downgrade(lease),
+			},
+		);
 	}
 
 	/// The last handle on the lease `uuid` is gone.
@@ -298,15 +371,13 @@ impl LockBoard {
 	/// The lease `uuid` this client holds, if it does.
 	// The upgraded lease leaves the board's lock before it can be dropped: dropping the last
 	// handle on a lease takes that lock again (`let_go`).
-	#[cfg_attr(
-		not(test),
-		expect(
-			dead_code,
-			reason = "no announcement is checked against the held leases yet"
-		)
-	)]
+	#[cfg(test)]
 	pub(super) fn held(&self, uuid: Uuid) -> Option<Arc<SharedLease>> {
-		let held = self.board().held.get(&uuid).cloned();
+		let held = self
+			.board()
+			.held
+			.get(&uuid)
+			.map(|held| Weak::clone(&held.lease));
 		held?.upgrade()
 	}
 
@@ -327,19 +398,63 @@ impl LockBoard {
 	}
 
 	/// Whether this client let `uuid` on `resource` go within [`RETIRED_KEEP`].
-	#[cfg_attr(
-		not(test),
-		expect(
-			dead_code,
-			reason = "no announcement is checked against the retired uuids yet"
-		)
-	)]
+	#[cfg(test)]
 	pub(super) fn is_retired(&self, resource: &str, uuid: Uuid) -> bool {
-		let now = Utc::now();
-		self.board()
-			.retired
-			.get(&uuid)
-			.is_some_and(|retired| &*retired.resource == resource && retired.is_kept_at(now))
+		self.board().is_retired_at(resource, uuid, Utc::now())
+	}
+}
+
+/// The lease `event` announces, and whether it says the lease ended.
+fn announcement_of<'a>(event: &'a LockEventType<'_>) -> (&'a LockAnnouncement<'a>, bool) {
+	match event {
+		LockEventType::LockAcquired(announcement) => (announcement, false),
+		LockEventType::LockReleased(announcement) | LockEventType::LockTimeout(announcement) => {
+			(announcement, true)
+		}
+	}
+}
+
+/// Applies a lock announcement to `client`'s [`LockBoard`] (see [`LockBoard::announced`]), and
+/// acts on what it says about the client's own leases: a held lease it says may be lost is
+/// refreshed at once and unconfirmed until the server answers, and a uuid granted after the
+/// client let it go is released once more.
+///
+/// The release of a late grant is best-effort, as the announcement is: a grant whose
+/// announcement is lost holds the resource until its lease runs out, as without announcements.
+/// A `lockAcquired` that only arrived after the client's own release of a lease it held costs one
+/// release that frees nothing.
+pub(crate) fn lock_announced(
+	client: &Arc<AuthClient>,
+	event: &LockEventType<'_>,
+	lock_message_id: u64,
+) {
+	let OwnLeases { suspect, regranted } = client.lock_board.announced(event, lock_message_id);
+	// Upgraded here, off the board's lock, which dropping the last handle on one takes.
+	for lease in suspect.iter().filter_map(Weak::upgrade) {
+		if !lease.is_lost() {
+			tracing::info!(
+				"A lock announcement says lock '{}' may be lost, asking the server",
+				lease.resource
+			);
+			lease.suspicion.raise();
+		}
+	}
+	if let Some(uuid) = regranted {
+		let resource = announcement_of(event).0.resource.as_ref();
+		tracing::warn!("Lock '{resource}' was granted after it was let go, releasing it again");
+		// Counted in the client's pending releases like any other, without a lock listener
+		// record: the listener saw this lock settle already, and sees each lock settle once.
+		let owed = OwedRelease::new(
+			Arc::clone(client),
+			lock_url().into(),
+			uuid,
+			resource.into(),
+			// the late grant was made before its announcement arrived, so its lease runs out no
+			// later than a lease from now
+			LeaseConfirmed::Sent(Confirmed::now()),
+			None,
+		);
+		drop(crate::runtime::spawn_task_maybe_send(owed.send()));
 	}
 }
 

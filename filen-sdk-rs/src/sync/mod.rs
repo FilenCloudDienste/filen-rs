@@ -211,11 +211,12 @@ mod js_impl {
 
 		/// Whether the server confirmed the lock's lease recently enough to rely on it.
 		/// `false` means another client may hold the resource, or soon may: the lock is
-		/// unconfirmed (a refresh failing, or the system was suspended), which reads `true`
-		/// again once its keep-alive gets a refresh through, or lost (a refused refresh, or
-		/// none confirmed while the lease could last), which never does. Both read `false`
-		/// here: do not rely on the lock while it does, and once it has read `false` for
-		/// longer than the lease (60 seconds), acquire a new lock.
+		/// unconfirmed (a refresh failing, the system was suspended, or a lock announcement
+		/// over the client's socket said its lease ended or another lease of its resource
+		/// began), which reads `true` again once its keep-alive gets a refresh through, or
+		/// lost (a refused refresh, or none confirmed while the lease could last), which never
+		/// does. Both read `false` here: do not rely on the lock while it does, and once it
+		/// has read `false` for longer than the lease (60 seconds), acquire a new lock.
 		#[cfg_attr(
 			all(target_family = "wasm", target_os = "unknown"),
 			wasm_bindgen::prelude::wasm_bindgen(js_name = "isValid")

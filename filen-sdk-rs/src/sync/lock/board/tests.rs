@@ -17,9 +17,13 @@ use wasmtimer::tokio::sleep;
 const DRIVE: &str = "drive-write";
 
 fn announcement(resource: &str, holder: u128, lease_id: &str) -> LockAnnouncement<'static> {
+	announcement_of_uuid(resource, Uuid::from_u128(holder), lease_id)
+}
+
+fn announcement_of_uuid(resource: &str, holder: Uuid, lease_id: &str) -> LockAnnouncement<'static> {
 	LockAnnouncement {
 		resource: Cow::Owned(resource.to_owned()),
-		uuid: Uuid::from_u128(holder),
+		uuid: holder,
 		lease_id: Cow::Owned(lease_id.to_owned()),
 		timestamp: DateTime::from_timestamp_millis(1_760_270_400_123).unwrap(),
 	}
@@ -353,4 +357,148 @@ async fn a_lease_is_held_until_its_last_handle_drops_then_retired() {
 
 	client.pending_lock_releases.settled().await;
 	assert!(client.lock_board.is_retired("test-resource", uuid));
+}
+
+/// The resource of the locks [`test_lock_on`] makes.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+const HELD: &str = "test-resource";
+
+/// A lock `client` holds on [`HELD`], with no keep-alive, so only the announcements change it.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+fn held_lock(client: &Arc<AuthClient>) -> super::super::ResourceLock {
+	test_lock_on(Arc::clone(client), None)
+}
+
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+#[tokio::test(start_paused = true)]
+async fn a_release_of_a_held_lease_announced_makes_it_unconfirmed() {
+	let client = offline_client();
+	let lock = held_lock(&client);
+	assert!(lock.is_valid());
+	lock_announced(
+		&client,
+		&LockEventType::LockReleased(announcement_of_uuid(HELD, lock.lease.uuid, "lease-a")),
+		2,
+	);
+	assert!(!lock.is_valid());
+	assert!(!lock.lease.is_lost(), "only the server's answer loses it");
+}
+
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+#[tokio::test(start_paused = true)]
+async fn a_timeout_of_a_held_lease_announced_makes_it_unconfirmed() {
+	let client = offline_client();
+	let lock = held_lock(&client);
+	lock_announced(
+		&client,
+		&LockEventType::LockTimeout(announcement_of_uuid(HELD, lock.lease.uuid, "lease-a")),
+		2,
+	);
+	assert!(!lock.is_valid());
+}
+
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+#[tokio::test(start_paused = true)]
+async fn another_lease_of_a_held_resource_announced_makes_it_unconfirmed() {
+	let client = offline_client();
+	let lock = held_lock(&client);
+	lock_announced(
+		&client,
+		&LockEventType::LockAcquired(announcement(HELD, 1, "lease-b")),
+		3,
+	);
+	assert!(!lock.is_valid());
+	assert_eq!(*client.pending_lock_releases.0.borrow(), 0);
+}
+
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+#[tokio::test(start_paused = true)]
+async fn the_lease_of_a_held_lock_announced_acquired_says_nothing() {
+	let client = offline_client();
+	let lock = held_lock(&client);
+	lock_announced(
+		&client,
+		&LockEventType::LockAcquired(announcement_of_uuid(HELD, lock.lease.uuid, "lease-a")),
+		1,
+	);
+	assert!(lock.is_valid());
+	assert_eq!(*client.pending_lock_releases.0.borrow(), 0);
+}
+
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+#[tokio::test(start_paused = true)]
+async fn announcements_for_another_resource_say_nothing_of_a_held_lock() {
+	let client = offline_client();
+	let lock = held_lock(&client);
+	lock_announced(
+		&client,
+		&LockEventType::LockAcquired(announcement(DRIVE, 1, "lease-b")),
+		3,
+	);
+	lock_announced(
+		&client,
+		&LockEventType::LockReleased(announcement_of_uuid(DRIVE, lock.lease.uuid, "lease-a")),
+		4,
+	);
+	assert!(lock.is_valid());
+}
+
+/// An announcement that arrives twice raises its suspicion once: one refresh confirmed after the
+/// first answers both.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+#[tokio::test(start_paused = true)]
+async fn an_announcement_applied_twice_raises_one_suspicion() {
+	let client = offline_client();
+	let lock = held_lock(&client);
+	let foreign = LockEventType::LockAcquired(announcement(HELD, 1, "lease-b"));
+	lock_announced(&client, &foreign, 3);
+	let mark = lock.lease.suspicion.mark();
+	lock_announced(&client, &foreign, 3);
+	lock.lease.suspicion.answered(mark);
+	assert!(lock.is_valid());
+}
+
+/// A lease announced acquired for a uuid this client let go was granted late: it is released
+/// once, however often the announcement arrives, and counted in the pending releases until that
+/// release is given up on.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+#[tokio::test(start_paused = true)]
+async fn a_late_grant_of_a_retired_uuid_is_released_once() {
+	let client = offline_client();
+	let uuid = Uuid::from_u128(1);
+	client.lock_board.retire(uuid, &Arc::from(DRIVE));
+	let late = acquired("lease-a", 1);
+
+	lock_announced(&client, &late, 5);
+	assert_eq!(*client.pending_lock_releases.0.borrow(), 1);
+	lock_announced(&client, &late, 5);
+	assert_eq!(*client.pending_lock_releases.0.borrow(), 1);
+
+	client.pending_lock_releases.settled().await;
+	assert!(client.lock_board.is_retired(DRIVE, uuid));
+}
+
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+#[tokio::test(start_paused = true)]
+async fn a_lease_of_a_uuid_retired_on_another_resource_is_not_released() {
+	let client = offline_client();
+	client
+		.lock_board
+		.retire(Uuid::from_u128(1), &Arc::from("notes-write"));
+	lock_announced(&client, &acquired("lease-a", 1), 5);
+	assert_eq!(*client.pending_lock_releases.0.borrow(), 0);
+}
+
+/// A lease that was announced ended before its `lockAcquired` arrived is over: its late grant
+/// needs no release.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+#[tokio::test(start_paused = true)]
+async fn an_ended_lease_of_a_retired_uuid_is_not_released() {
+	let client = offline_client();
+	client
+		.lock_board
+		.retire(Uuid::from_u128(1), &Arc::from(DRIVE));
+	lock_announced(&client, &released("lease-a", 1), 6);
+	lock_announced(&client, &acquired("lease-a", 1), 5);
+	assert_eq!(*client.pending_lock_releases.0.borrow(), 0);
 }
