@@ -26,6 +26,8 @@ pub(super) const RECONNECT_DELAY: Duration = Duration::from_secs(1);
 /// second would load the server or proxy, the battery and the log for as long as the app runs.
 pub(super) const RECONNECT_MAX: Duration = Duration::from_secs(60);
 pub(super) const PING_INTERVAL: Duration = Duration::from_secs(15);
+/// How many frames the connected loop can queue for the writer task before queueing fails.
+pub(super) const OUTBOUND_FRAME_CAPACITY: usize = 64;
 /// Ceiling for one full connection setup (websocket connect + socket.io
 /// handshake + auth). Without it, a black-holed TCP connect or a handshake
 /// read against a dead peer parks the websocket task forever with no retry.

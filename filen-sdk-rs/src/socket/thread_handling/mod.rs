@@ -407,7 +407,7 @@ fn spawn_websocket_thread(
 }
 
 /// Handles the initialized websocket connection, processing incoming messages and managing listeners.
-async fn handle_initialized_websocket<W, S, R, RV, US, UR, T, UW, PT>(
+async fn handle_initialized_websocket<W, S, R, RV, US, UR, T, UW, WT>(
 	config: &WebSocketConfig,
 	web_socket: W,
 	request_receiver: &mut tokio::sync::mpsc::Receiver<SocketRequest>,
@@ -416,7 +416,7 @@ async fn handle_initialized_websocket<W, S, R, RV, US, UR, T, UW, PT>(
 	private_key: &PrivateKey,
 ) -> bool
 where
-	W: Socket<T, UW, S, R, RV, US, UR, PT>,
+	W: Socket<T, UW, S, R, RV, US, UR, WT>,
 	S: Sender,
 	R: Receiver<RV>,
 	RV: IntoStableDeref + AsRef<str> + Send,
@@ -424,10 +424,9 @@ where
 	US: UnauthedSender<AuthedType = S>,
 	UR: UnauthedReceiver<RV, AuthedType = R>,
 	UW: UnauthedSocket<US, UR, RV>,
-	PT: PingTask<S>,
+	WT: WriterTask<Sender = S>,
 {
-	let (mut receiver, ping_task) =
-		web_socket.split_into_receiver_and_ping_task(config.ping_interval);
+	let (mut receiver, writer) = web_socket.split_into_receiver_and_writer(config.ping_interval);
 
 	let mut should_retry = true;
 
@@ -537,17 +536,17 @@ where
 			listeners.broadcast_event(decrypted.get());
 		}
 	}
-	ping_task.abort();
+	writer.abort();
 	should_retry
 }
 
-async fn initialize_websocket<W, S, R, RV, US, UR, T, UW, PT>(
+async fn initialize_websocket<W, S, R, RV, US, UR, T, UW, WT>(
 	config: &mut WebSocketConfig,
 	request_receiver: &mut tokio::sync::mpsc::Receiver<SocketRequest>,
 	listeners: &mut DisconnectedListenerManager,
 ) -> Option<W>
 where
-	W: Socket<T, UW, S, R, RV, US, UR, PT>,
+	W: Socket<T, UW, S, R, RV, US, UR, WT>,
 	S: Sender,
 	R: Receiver<RV>,
 	RV: IntoStableDeref + AsRef<str>,
@@ -555,7 +554,7 @@ where
 	US: UnauthedSender<AuthedType = S>,
 	UR: UnauthedReceiver<RV, AuthedType = R>,
 	UW: UnauthedSocket<US, UR, RV>,
-	PT: PingTask<S>,
+	WT: WriterTask<Sender = S>,
 {
 	loop {
 		// Re-read the key on every attempt: a password change rotates it in
@@ -651,13 +650,13 @@ async fn pause_serving_requests(
 	}
 }
 
-async fn run_async_websocket_task<W, S, R, RV, US, UR, T, UW, PT>(
+async fn run_async_websocket_task<W, S, R, RV, US, UR, T, UW, WT>(
 	mut config: WebSocketConfig,
 	mut request_receiver: tokio::sync::mpsc::Receiver<SocketRequest>,
 	crypter: Arc<impl MetaCrypter + 'static>,
 	private_key: Arc<PrivateKey>,
 ) where
-	W: Socket<T, UW, S, R, RV, US, UR, PT>,
+	W: Socket<T, UW, S, R, RV, US, UR, WT>,
 	S: Sender,
 	R: Receiver<RV>,
 	RV: IntoStableDeref + AsRef<str> + Send,
@@ -665,7 +664,7 @@ async fn run_async_websocket_task<W, S, R, RV, US, UR, T, UW, PT>(
 	US: UnauthedSender<AuthedType = S>,
 	UR: UnauthedReceiver<RV, AuthedType = R>,
 	UW: UnauthedSocket<US, UR, RV>,
-	PT: PingTask<S>,
+	WT: WriterTask<Sender = S>,
 {
 	let mut disconnected_listeners = DisconnectedListenerManager::new();
 
@@ -754,7 +753,7 @@ fn handle_request(request: SocketRequest, listeners: &mut impl ListenerManagerEx
 	}
 }
 
-async fn connect_and_build_socket<UW, US, UR, RV, W, S, R, T, PT>(
+async fn connect_and_build_socket<UW, US, UR, RV, W, S, R, T, WT>(
 	client: &AuthClient,
 	api_key: &str,
 	listeners: &mut DisconnectedListenerManager,
@@ -763,12 +762,12 @@ where
 	UW: UnauthedSocket<US, UR, RV>,
 	US: UnauthedSender<AuthedType = S>,
 	UR: UnauthedReceiver<RV, AuthedType = R>,
-	W: Socket<T, UW, S, R, RV, US, UR, PT>,
+	W: Socket<T, UW, S, R, RV, US, UR, WT>,
 	S: Sender,
 	R: Receiver<RV>,
 	RV: IntoStableDeref + AsRef<str>,
 	<RV::Output as Deref>::Target: AsRef<str>,
-	PT: PingTask<S>,
+	WT: WriterTask<Sender = S>,
 {
 	// Set once the request is built, so a setup that fails after it says how it went.
 	let mut proxied = false;
@@ -800,7 +799,7 @@ where
 // transient reconnects — which the caller's retry loop already reports at WARN — don't double-log
 // benign network churn at ERROR.
 #[tracing::instrument(name = "websocket_handshake", skip_all, err(level = "debug"))]
-async fn perform_handshake<UW, US, UR, RV, W, S, R, T, PT>(
+async fn perform_handshake<UW, US, UR, RV, W, S, R, T, WT>(
 	unauthed_ws: UW,
 	disconnected_listeners: &mut DisconnectedListenerManager,
 	api_key: &str,
@@ -809,12 +808,12 @@ where
 	UW: UnauthedSocket<US, UR, RV>,
 	US: UnauthedSender<AuthedType = S>,
 	UR: UnauthedReceiver<RV, AuthedType = R>,
-	W: Socket<T, UW, S, R, RV, US, UR, PT>,
+	W: Socket<T, UW, S, R, RV, US, UR, WT>,
 	S: Sender,
 	R: Receiver<RV>,
 	RV: IntoStableDeref + AsRef<str>,
 	<RV::Output as Deref>::Target: AsRef<str>,
-	PT: PingTask<S>,
+	WT: WriterTask<Sender = S>,
 {
 	let (mut write, mut read) = unauthed_ws.split();
 

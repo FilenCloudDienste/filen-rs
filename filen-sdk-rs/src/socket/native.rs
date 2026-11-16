@@ -4,16 +4,13 @@ use futures::{
 	StreamExt,
 	stream::{SplitSink, SplitStream},
 };
-use tokio::net::TcpStream;
+use tokio::{net::TcpStream, sync::mpsc};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use tungstenite::{Message, Utf8Bytes};
 
 use crate::{Error, ErrorKind, auth::http::AuthClient};
 
-use super::{
-	consts::{PING_MESSAGE, WEBSOCKET_URL_CORE},
-	traits::*,
-};
+use super::{consts::WEBSOCKET_URL_CORE, traits::*, writer};
 
 impl IntoStableDeref for Utf8Bytes {
 	type Output = Box<Utf8Bytes>;
@@ -25,46 +22,25 @@ impl IntoStableDeref for Utf8Bytes {
 	}
 }
 
-pub(super) struct NativePingTask {
+pub(super) struct NativeWriterTask {
 	task_handle: tokio::task::JoinHandle<()>,
 }
 
-impl PingTask<NativeSender> for NativePingTask {
-	fn abort(self) {
-		self.task_handle.abort();
+impl WriterTask for NativeWriterTask {
+	type Sender = NativeSender;
+
+	fn spawn(
+		sender: NativeSender,
+		ping_interval: Duration,
+		outbound: mpsc::Receiver<String>,
+	) -> Self {
+		Self {
+			task_handle: tokio::spawn(writer::run(sender, ping_interval, outbound)),
+		}
 	}
 
-	fn new(mut sender: NativeSender, interval_duration: Duration) -> Self {
-		let task_handle = tokio::spawn(async move {
-			let mut interval = tokio::time::interval(interval_duration);
-
-			loop {
-				interval.tick().await;
-
-				match sender
-					.send_multiple([
-						Cow::Borrowed(PING_MESSAGE),
-						Cow::Owned(format!(
-							r#"42["authed", {}]"#,
-							chrono::Utc::now().timestamp_millis()
-						)),
-					])
-					.await
-				{
-					Ok(Some(())) => {}
-					Ok(None) => {
-						tracing::debug!("WebSocket has been closed, stopping ping task");
-						break;
-					}
-					Err(e) => {
-						tracing::warn!("Failed to send WebSocket ping: {e}");
-						continue;
-					}
-				}
-			}
-		});
-
-		Self { task_handle }
+	fn abort(self) {
+		self.task_handle.abort();
 	}
 }
 
@@ -216,7 +192,7 @@ impl
 		Utf8Bytes,
 		UnauthedNativeSender,
 		UnauthedNativeReceiver,
-		NativePingTask,
+		NativeWriterTask,
 	> for NativeSocket
 {
 	#[cfg_attr(not(platform_net), allow(unused_variables))]
@@ -300,12 +276,10 @@ impl
 		}
 	}
 
-	fn split_into_receiver_and_ping_task(
-		self,
-		ping_interval: Duration,
-	) -> (NativeReceiver, NativePingTask) {
-		let sender = NativeSender(UnauthedNativeSender { write: self.write });
-		let receiver = NativeReceiver(UnauthedNativeReceiver { read: self.read });
-		(receiver, NativePingTask::new(sender, ping_interval))
+	fn into_parts(self) -> (NativeSender, NativeReceiver) {
+		(
+			NativeSender(UnauthedNativeSender { write: self.write }),
+			NativeReceiver(UnauthedNativeReceiver { read: self.read }),
+		)
 	}
 }

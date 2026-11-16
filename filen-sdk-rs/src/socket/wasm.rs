@@ -1,14 +1,11 @@
-use std::{borrow::Cow, cell::Cell, fmt::Write, ops::Deref, time::Duration};
+use std::{borrow::Cow, cell::Cell, ops::Deref, time::Duration};
 
 use tokio::sync::mpsc::error::TrySendError;
 use wasm_bindgen::JsCast;
 
 use crate::{Error, ErrorKind};
 
-use super::{
-	consts::{PING_MESSAGE, WEBSOCKET_URL_CORE},
-	traits::*,
-};
+use super::{consts::WEBSOCKET_URL_CORE, traits::*, writer};
 
 /// Owns the browser socket and closes it when the last wrapper is dropped.
 ///
@@ -51,68 +48,38 @@ impl IntoStableDeref for String {
 	}
 }
 
-pub(super) struct WasmPingTask {
+pub(super) struct WasmWriterTask {
 	stop_channel: tokio::sync::oneshot::Sender<()>,
 }
 
-impl PingTask<WasmSender> for WasmPingTask {
-	fn abort(self) {
-		let _ = self.stop_channel.send(());
-	}
+impl WriterTask for WasmWriterTask {
+	type Sender = WasmSender;
 
-	fn new(mut sender: WasmSender, interval_duration: std::time::Duration) -> Self {
-		let mut interval = wasmtimer::tokio::interval(interval_duration);
-
-		let mut timestamp_string = String::new();
-
-		let (stop_channel, mut stop_receiver) = tokio::sync::oneshot::channel();
+	fn spawn(
+		sender: WasmSender,
+		ping_interval: Duration,
+		outbound: tokio::sync::mpsc::Receiver<String>,
+	) -> Self {
+		let (stop_channel, stop_receiver) = tokio::sync::oneshot::channel();
 
 		wasm_bindgen_futures::spawn_local(async move {
-			loop {
-				// Bail promptly on abort (send or sender drop): this sender owns
-				// the WebSocketGuard, so the browser socket only closes once this
-				// task exits — waiting out the next tick would keep the old
-				// connection open into the next reconnect attempt.
-				tokio::select! {
-					biased;
-					_ = &mut stop_receiver => {
-						tracing::debug!("Stopping WebSocket ping task");
-						break;
-					}
-					_ = interval.tick() => {}
+			// Bail promptly on abort (send or sender drop): the writer owns the WebSocketGuard,
+			// so the browser socket only closes once it is dropped, and waiting out the next
+			// tick would keep the old connection open into the next reconnect attempt.
+			tokio::select! {
+				biased;
+				_ = stop_receiver => {
+					tracing::debug!("Stopping WebSocket writer task");
 				}
-
-				timestamp_string.clear();
-				if let Err(e) = write!(
-					&mut timestamp_string,
-					r#"42["authed", {}]"#,
-					chrono::Utc::now().timestamp_millis()
-				) {
-					tracing::error!("Failed to format WebSocket authed ping: {e}");
-					break;
-				}
-
-				match sender
-					.send_multiple([
-						Cow::Borrowed(PING_MESSAGE),
-						Cow::Borrowed(&timestamp_string),
-					])
-					.await
-				{
-					Ok(Some(())) => {}
-					Ok(None) => {
-						tracing::debug!("WebSocket has been closed, stopping ping task");
-						break;
-					}
-					Err(e) => {
-						tracing::error!("Failed to send WebSocket ping: {e}");
-						continue;
-					}
-				}
+				() = writer::run(sender, ping_interval, outbound) => {}
 			}
 		});
 
-		WasmPingTask { stop_channel }
+		WasmWriterTask { stop_channel }
+	}
+
+	fn abort(self) {
+		let _ = self.stop_channel.send(());
 	}
 }
 
@@ -234,7 +201,7 @@ impl
 		String,
 		UnauthedWasmSender,
 		UnauthedWasmReceiver,
-		WasmPingTask,
+		WasmWriterTask,
 	> for WasmSocket
 {
 	async fn build_request(_client: &crate::auth::http::AuthClient) -> Result<String, Error> {
@@ -358,10 +325,7 @@ impl
 		}
 	}
 
-	fn split_into_receiver_and_ping_task(
-		self,
-		ping_interval: Duration,
-	) -> (WasmReceiver, WasmPingTask) {
+	fn into_parts(self) -> (WasmSender, WasmReceiver) {
 		let sender = WasmSender(UnauthedWasmSender {
 			socket: self.socket,
 		});
@@ -369,6 +333,6 @@ impl
 			msg_receiver: self.msg_receiver,
 			close_receiver: self.close_receiver,
 		});
-		(receiver, WasmPingTask::new(sender, ping_interval))
+		(sender, receiver)
 	}
 }

@@ -108,7 +108,10 @@ mod pipeline {
 	use crate::{
 		auth::{http::ClientConfig, unauth::UnauthClient},
 		crypto::error::ConversionError,
-		socket::events::DecryptedSocketEvent,
+		socket::{
+			events::DecryptedSocketEvent,
+			writer::{self, Writer},
+		},
 	};
 
 	// ----- scripted fake transport -----
@@ -277,14 +280,23 @@ mod pipeline {
 		}
 	}
 
-	pub(super) struct FakeNoopPingTask;
+	/// The production writer loop, spawned on the test's runtime.
+	pub(super) struct FakeWriterTask(tokio::task::JoinHandle<()>);
 
-	impl PingTask<FakeSender> for FakeNoopPingTask {
-		fn new(_: FakeSender, _: Duration) -> Self {
-			Self
+	impl WriterTask for FakeWriterTask {
+		type Sender = FakeSender;
+
+		fn spawn(
+			sender: FakeSender,
+			ping_interval: Duration,
+			outbound: tokio::sync::mpsc::Receiver<String>,
+		) -> Self {
+			Self(tokio::spawn(writer::run(sender, ping_interval, outbound)))
 		}
 
-		fn abort(self) {}
+		fn abort(self) {
+			self.0.abort();
+		}
 	}
 
 	pub(super) struct FakeSocket {
@@ -300,7 +312,7 @@ mod pipeline {
 			FakeMsg,
 			FakeSender,
 			FakeReceiver,
-			FakeNoopPingTask,
+			FakeWriterTask,
 		> for FakeSocket
 	{
 		async fn build_request(_client: &AuthClient) -> Result<(), Error> {
@@ -340,15 +352,12 @@ mod pipeline {
 			}
 		}
 
-		fn split_into_receiver_and_ping_task(
-			self,
-			_ping_interval: Duration,
-		) -> (FakeReceiver, FakeNoopPingTask) {
+		fn into_parts(self) -> (FakeSender, FakeReceiver) {
 			(
+				FakeSender,
 				FakeReceiver {
 					script: self.script,
 				},
-				FakeNoopPingTask,
 			)
 		}
 	}
@@ -1001,6 +1010,116 @@ mod pipeline {
 		);
 	}
 
+	/// The sent frames, with each authed ping's wall-clock timestamp replaced by `<ms>`.
+	fn sent_frames() -> Vec<String> {
+		sent_messages()
+			.into_iter()
+			.map(|frame| match frame.strip_prefix(r#"42["authed", "#) {
+				Some(rest)
+					if rest.strip_suffix(']').is_some_and(|ms| {
+						!ms.is_empty() && ms.bytes().all(|b| b.is_ascii_digit())
+					}) =>
+				{
+					r#"42["authed", <ms>]"#.to_string()
+				}
+				_ => frame,
+			})
+			.collect()
+	}
+
+	const PING: [&str; 2] = ["2", r#"42["authed", <ms>]"#];
+
+	/// A session pings as soon as it starts and then every ping interval, and stops pinging once
+	/// it is torn down: here at 0, 15 and 30 s, until the liveness deadline ends it at 35 s.
+	#[tokio::test(start_paused = true)]
+	async fn a_session_pings_every_interval_until_it_ends() {
+		prime(Vec::new());
+		let config = test_config();
+		let socket = FakeSocket::from_unauthed_parts(
+			FakeSender,
+			FakeReceiver {
+				script: vec![ServerAction::Hang].into(),
+			},
+		);
+		let (_request_sender, mut request_receiver) = tokio::sync::mpsc::channel(16);
+		let mut listeners = DisconnectedListenerManager::new()
+			.into_connected(&std::sync::atomic::AtomicU64::new(0));
+		let private_key = test_private_key();
+
+		let begin = tokio::time::Instant::now();
+		// The frames sent by 1, 16 and 31 s: one ping each time.
+		let pings_over_time = async {
+			let mut counts = Vec::new();
+			for at in [1, 16, 31] {
+				tokio::time::sleep_until(begin + Duration::from_secs(at)).await;
+				counts.push(sent_frames().len());
+			}
+			counts
+		};
+		let (should_retry, counts) = tokio::join!(
+			handle_initialized_websocket(
+				&config,
+				socket,
+				&mut request_receiver,
+				&mut listeners,
+				&NoopCrypter,
+				&private_key,
+			),
+			pings_over_time,
+		);
+		assert!(should_retry);
+		assert_eq!(begin.elapsed(), Duration::from_secs(35));
+		assert_eq!(counts, [2, 4, 6]);
+
+		tokio::time::sleep(Duration::from_secs(60)).await;
+		assert_eq!(
+			sent_frames(),
+			[
+				"2",
+				r#"42["authed", <ms>]"#,
+				"2",
+				r#"42["authed", <ms>]"#,
+				"2",
+				r#"42["authed", <ms>]"#,
+			]
+		);
+	}
+
+	/// Queued frames go out in the order they were queued, after the ping that was due.
+	#[tokio::test(start_paused = true)]
+	async fn queued_frames_are_sent_in_order() {
+		prime(Vec::new());
+		let writer = Writer::<FakeWriterTask>::spawn(FakeSender, PING_INTERVAL);
+		writer.try_queue("42[\"first\"]".to_string()).unwrap();
+		writer.try_queue("42[\"second\"]".to_string()).unwrap();
+
+		tokio::time::sleep(Duration::from_secs(1)).await;
+		assert_eq!(
+			sent_frames(),
+			[
+				"2",
+				r#"42["authed", <ms>]"#,
+				r#"42["first"]"#,
+				r#"42["second"]"#
+			]
+		);
+		writer.abort();
+	}
+
+	/// Aborting the writer discards the frames it has not sent yet.
+	#[tokio::test(start_paused = true)]
+	async fn an_aborted_writer_discards_unsent_frames() {
+		prime(Vec::new());
+		let writer = Writer::<FakeWriterTask>::spawn(FakeSender, PING_INTERVAL);
+		tokio::time::sleep(Duration::from_secs(1)).await;
+
+		writer.try_queue("42[\"late\"]".to_string()).unwrap();
+		writer.abort();
+
+		tokio::time::sleep(PING_INTERVAL * 2).await;
+		assert_eq!(sent_frames(), PING);
+	}
+
 	#[tokio::test(start_paused = true)]
 	async fn hung_handshake_times_out_and_stays_retryable() {
 		let begin = tokio::time::Instant::now();
@@ -1020,7 +1139,7 @@ mod pipeline {
 				FakeSender,
 				FakeReceiver,
 				(),
-				FakeNoopPingTask,
+				FakeWriterTask,
 			>(&test_config().client, "key", &mut listeners),
 		)
 		.await

@@ -13,6 +13,7 @@ mod thread_handling;
 mod traits;
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 mod wasm;
+mod writer;
 
 use traits::EventListenerCallback;
 
