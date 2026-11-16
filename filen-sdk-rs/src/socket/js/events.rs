@@ -25,7 +25,7 @@ use crate::{
 
 use crate::socket::events::{
 	DecryptedChatEvent, DecryptedContactEvent, DecryptedDriveEvent, DecryptedGeneralEvent,
-	DecryptedNoteEvent,
+	DecryptedLockEvent, DecryptedNoteEvent,
 };
 
 #[js_type(export, no_deser, tagged)]
@@ -40,6 +40,7 @@ pub enum SocketEvent {
 	Note(NoteSocketEvent),
 	Contact(ContactSocketEvent),
 	General(GeneralSocketEvent),
+	Lock(LockSocketEvent),
 }
 
 #[js_type(export, no_deser)]
@@ -84,6 +85,18 @@ pub struct GeneralSocketEvent {
 	pub inner: GeneralEvent,
 	#[cfg_attr(feature = "wasm-full", tsify(type = "bigint"))]
 	pub general_message_id: u64,
+}
+
+/// A user lock's lease began or ended, whoever caused it. A hint for showing lock state, never
+/// proof of holding a lock: announcements may arrive out of order or be lost, and nothing is
+/// replayed after a reconnect.
+#[js_type(export, no_deser)]
+pub struct LockSocketEvent {
+	pub inner: LockAnnouncementEvent,
+	/// The user's lock announcement counter (`lock` in `v3/messageIds`). It does not give the
+	/// order the changes happened in.
+	#[cfg_attr(feature = "wasm-full", tsify(type = "bigint"))]
+	pub lock_message_id: u64,
 }
 
 #[js_type(export, no_deser, tagged)]
@@ -145,6 +158,46 @@ pub enum ContactEvent {
 pub enum GeneralEvent {
 	PasswordChanged,
 	NewEvent(NewEvent),
+}
+
+#[js_type(export, no_deser, tagged)]
+pub enum LockAnnouncementEvent {
+	/// A new lease began: an acquire took the free lock.
+	Acquired(LockAnnouncement),
+	/// The lease's holder released it.
+	Released(LockAnnouncement),
+	/// The lease ran out without being released.
+	Timeout(LockAnnouncement),
+}
+
+/// One lease of a user lock, as a lock announcement reports it.
+#[js_type]
+pub struct LockAnnouncement {
+	/// The lock's resource (e.g. `drive-write`).
+	pub resource: String,
+	/// The lease's holder: the `uuid` of the request that acquired it (the old holder's for a
+	/// timeout).
+	pub uuid: Uuid,
+	/// Identifies the lease, opaque; a holder acquiring again gets a new one.
+	pub lease_id: String,
+	/// Server time of the announcement. Informational only: do not order by it.
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		serde(with = "chrono::serde::ts_milliseconds"),
+		tsify(type = "bigint")
+	)]
+	pub timestamp: DateTime<Utc>,
+}
+
+impl From<&crate::socket::events::LockAnnouncement<'_>> for LockAnnouncement {
+	fn from(event: &crate::socket::events::LockAnnouncement<'_>) -> Self {
+		Self {
+			resource: event.resource.to_string(),
+			uuid: event.uuid,
+			lease_id: event.lease_id.to_string(),
+			timestamp: event.timestamp,
+		}
+	}
 }
 
 impl From<&DecryptedSocketEvent<'_>> for SocketEvent {
@@ -270,6 +323,17 @@ impl From<&DecryptedSocketEvent<'_>> for SocketEvent {
 				inner: match inner {
 					DecryptedGeneralEvent::PasswordChanged => GeneralEvent::PasswordChanged,
 					DecryptedGeneralEvent::NewEvent(e) => GeneralEvent::NewEvent(e.into()),
+				},
+			}),
+			DecryptedSocketEvent::Lock {
+				inner,
+				lock_message_id,
+			} => SocketEvent::Lock(LockSocketEvent {
+				lock_message_id: *lock_message_id,
+				inner: match inner {
+					DecryptedLockEvent::Acquired(e) => LockAnnouncementEvent::Acquired(e.into()),
+					DecryptedLockEvent::Released(e) => LockAnnouncementEvent::Released(e.into()),
+					DecryptedLockEvent::Timeout(e) => LockAnnouncementEvent::Timeout(e.into()),
 				},
 			}),
 		}
@@ -658,5 +722,31 @@ mod tests {
 				drive_message_id: 42
 			})
 		));
+	}
+
+	#[test]
+	fn a_lock_announcement_reaches_the_js_event_with_every_field() {
+		let decrypted = DecryptedSocketEvent::Lock {
+			inner: DecryptedLockEvent::Timeout(crate::socket::events::LockAnnouncement {
+				resource: "notes-write".into(),
+				uuid: Uuid::from_u128(1),
+				lease_id: "lease-7".into(),
+				timestamp: DateTime::from_timestamp_millis(1_760_270_400_123).unwrap(),
+			}),
+			lock_message_id: 9,
+		};
+		let js: SocketEvent = (&decrypted).into();
+		assert_eq!(
+			js,
+			SocketEvent::Lock(LockSocketEvent {
+				inner: LockAnnouncementEvent::Timeout(LockAnnouncement {
+					resource: "notes-write".to_string(),
+					uuid: Uuid::from_u128(1),
+					lease_id: "lease-7".to_string(),
+					timestamp: DateTime::from_timestamp_millis(1_760_270_400_123).unwrap(),
+				}),
+				lock_message_id: 9,
+			})
+		);
 	}
 }

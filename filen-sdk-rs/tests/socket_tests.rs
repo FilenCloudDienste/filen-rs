@@ -10,13 +10,14 @@ use filen_sdk_rs::{
 		file::meta::{FileMeta, FileMetaChanges},
 	},
 	socket::{
-		DecryptedChatEvent, DecryptedContactEvent, DecryptedDriveEvent, DecryptedNoteEvent,
-		DecryptedSocketEvent,
+		DecryptedChatEvent, DecryptedContactEvent, DecryptedDriveEvent, DecryptedLockEvent,
+		DecryptedNoteEvent, DecryptedSocketEvent,
 	},
 };
 use filen_types::{
 	api::v3::{chat::typing::ChatTypingType, dir::color::DirColor},
 	crypto::MaybeEncrypted,
+	fs::Uuid,
 	traits::CowHelpersExt,
 };
 use test_utils::{await_event, await_map_event, await_not_event};
@@ -1189,5 +1190,83 @@ async fn note() {
 	assert_eq!(
 		MaybeEncrypted::Decrypted(Cow::Borrowed(note.title().unwrap())),
 		event.new_title
+	);
+}
+
+/// Taking and releasing a lock over HTTP is announced on the socket: the acquire as
+/// `lockAcquired`, the release as `lockReleased` of the same lease (in either order), and the
+/// lock counter of
+/// `v3/messageIds` has reached both ids. The resource is unique to the run, so no other test or
+/// device takes it.
+#[shared_test_runtime]
+async fn lock_acquire_and_release_are_announced() {
+	let client = test_utils::RESOURCES.client().await;
+	let resource = format!("filen-rs-test-lock-announcement-{}", Uuid::new_v4());
+
+	let (events_sender, mut events_receiver) = tokio::sync::mpsc::unbounded_channel();
+	let _handle = client
+		.add_event_listener(
+			Box::new(move |event| {
+				let _ = events_sender.send(event.to_owned_cow());
+			}),
+			Some(vec![
+				Cow::Borrowed("authSuccess"),
+				Cow::Borrowed("lockAcquired"),
+				Cow::Borrowed("lockReleased"),
+			]),
+		)
+		.await
+		.unwrap();
+	// announcements are not replayed: the socket must be authenticated before the acquire
+	await_event(
+		&mut events_receiver,
+		|event| *event == DecryptedSocketEvent::AuthSuccess,
+		Duration::from_secs(20),
+		"authSuccess",
+	)
+	.await;
+
+	let lock = client
+		.acquire_lock_with_default(resource.as_str())
+		.await
+		.unwrap();
+	drop(lock);
+	client.wait_for_lock_releases().await;
+
+	// announcements may arrive in any order, so both are collected by one wait
+	let (mut acquired, mut released) = (None, None);
+	let ((acquired, acquired_id), (released, released_id)) = await_map_event(
+		&mut events_receiver,
+		|event| {
+			match event {
+				DecryptedSocketEvent::Lock {
+					inner: DecryptedLockEvent::Acquired(announcement),
+					lock_message_id,
+				} if announcement.resource == resource => {
+					acquired = Some((announcement, lock_message_id));
+				}
+				DecryptedSocketEvent::Lock {
+					inner: DecryptedLockEvent::Released(announcement),
+					lock_message_id,
+				} if announcement.resource == resource => {
+					released = Some((announcement, lock_message_id));
+				}
+				_ => {}
+			}
+			acquired.clone().zip(released.clone())
+		},
+		Duration::from_secs(20),
+		"lockAcquired and lockReleased",
+	)
+	.await;
+
+	assert_eq!(released.lease_id, acquired.lease_id);
+	assert_eq!(released.uuid, acquired.uuid);
+	assert_ne!(released_id, acquired_id);
+	let ids = client.get_last_event_ids().await.unwrap();
+	assert!(
+		ids.lock >= released_id.max(acquired_id),
+		"v3/messageIds lock counter {} is behind the announced ids {acquired_id} and {released_id}",
+		ids.lock
 	);
 }

@@ -102,12 +102,13 @@ mod pipeline {
 		sync::{Arc, Mutex, OnceLock, RwLock},
 	};
 
-	use filen_types::{auth::APIKey, crypto::EncryptedString};
+	use filen_types::{auth::APIKey, crypto::EncryptedString, fs::Uuid};
 
 	use super::*;
 	use crate::{
 		auth::{http::ClientConfig, unauth::UnauthClient},
 		crypto::error::ConversionError,
+		socket::events::DecryptedSocketEvent,
 	};
 
 	// ----- scripted fake transport -----
@@ -802,6 +803,83 @@ mod pipeline {
 		assert_eq!(
 			events.lock().unwrap().as_slice(),
 			["authSuccess", "fileTrash", "reconnecting", "authSuccess"]
+		);
+	}
+
+	/// A lock announcement goes from the wire to a listener filtered on its name: parsed,
+	/// passed by the pre-decryption gate, and delivered with every field. The announcement the
+	/// filter does not name is not delivered.
+	#[tokio::test(start_paused = true)]
+	async fn a_lock_announcement_reaches_a_listener_filtered_on_its_name() {
+		let (request_sender, request_receiver) = tokio::sync::mpsc::channel(16);
+
+		let final_sender = request_sender.clone();
+		prime(vec![
+			FakeConnection::new(handshake_then(vec![
+				ServerAction::Msg(
+					r#"42["lockAcquired",{"resource":"drive-write","uuid":"6b1c2a4e-3f0d-4b8a-9e2f-0c1d2e3f4a5b","leaseId":"lease-1","timestamp":1760270400123,"messageId":4,"lockMessageId":17}]"#
+						.to_string(),
+				),
+				ServerAction::Msg(
+					r#"42["lockReleased",{"resource":"drive-write","uuid":"6b1c2a4e-3f0d-4b8a-9e2f-0c1d2e3f4a5b","leaseId":"lease-1","timestamp":1760270401000,"messageId":5,"lockMessageId":18}]"#
+						.to_string(),
+				),
+				ServerAction::Err("connection reset"),
+			])),
+			FakeConnection::new(handshake_then(vec![ServerAction::Hang]))
+				.with_on_connect(move || drop(final_sender)),
+		]);
+
+		let lock_events = Arc::new(Mutex::new(Vec::new()));
+		let recorded = Arc::clone(&lock_events);
+		let callback: EventListenerCallback = Box::new(move |event| {
+			if let DecryptedSocketEvent::Lock {
+				inner,
+				lock_message_id,
+			} = event
+			{
+				let lease = inner.announcement();
+				recorded.lock().unwrap().push((
+					inner.event_type(),
+					*lock_message_id,
+					lease.resource.to_string(),
+					lease.uuid,
+					lease.lease_id.to_string(),
+					lease.timestamp.timestamp_millis(),
+				));
+			}
+		});
+		let (id_sender, _id_receiver) = tokio::sync::oneshot::channel();
+		let (_canceller, cancel_receiver) = tokio::sync::oneshot::channel();
+		request_sender
+			.send(SocketRequest::AddListener {
+				id_sender,
+				cancel_receiver,
+				callback,
+				event_types: Some(vec![Cow::Borrowed("lockReleased")]),
+			})
+			.await
+			.unwrap();
+		drop(request_sender);
+
+		run_async_websocket_task::<FakeSocket, _, _, _, _, _, _, _, _>(
+			test_config(),
+			request_receiver,
+			Arc::new(NoopCrypter),
+			test_private_key(),
+		)
+		.await;
+
+		assert_eq!(
+			lock_events.lock().unwrap().as_slice(),
+			[(
+				"lockReleased",
+				18,
+				"drive-write".to_string(),
+				Uuid::from_u128(0x6b1c2a4e_3f0d_4b8a_9e2f_0c1d2e3f4a5b),
+				"lease-1".to_string(),
+				1_760_270_401_000,
+			)]
 		);
 	}
 

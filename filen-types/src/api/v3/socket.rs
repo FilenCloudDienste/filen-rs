@@ -232,6 +232,7 @@ enum EventCategory {
 	Note,
 	Contact,
 	General,
+	Lock,
 }
 
 /// Maps the raw wire event name to its category and the camelCase serde variant name.
@@ -290,6 +291,11 @@ fn classify_event(name: &str) -> Option<(EventCategory, &'static str)> {
 		// General events
 		"new-event" => (General, "newEvent"),
 		"passwordChanged" => (General, "passwordChanged"),
+
+		// Lock announcements (camelCase from backend, socket lock protocol version 2)
+		"lockAcquired" => (Lock, "lockAcquired"),
+		"lockReleased" => (Lock, "lockReleased"),
+		"lockTimeout" => (Lock, "lockTimeout"),
 
 		_ => return None,
 	})
@@ -394,6 +400,27 @@ pub enum GeneralEventType<'a> {
 	NewEvent(NewEvent<'a>),
 }
 
+/// A change of a user lock's lease, announced to every authenticated socket of the user,
+/// whichever device or transport (socket or `v3/user/lock`) caused it.
+///
+/// Announcements are hints: they may arrive in any order, may be lost (nothing is replayed
+/// after a reconnect) and are not sent at all in some cases, so whether this client holds a
+/// lock is only ever decided by the answers to its own lock requests.
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
+#[serde(tag = "enum_type", rename_all = "camelCase")]
+pub enum LockEventType<'a> {
+	/// A new lease began: an acquire took the free lock. A holder re-acquiring the lease it
+	/// already has is not announced.
+	#[serde(borrow)]
+	LockAcquired(LockAnnouncement<'a>),
+	/// The lease's holder released it.
+	#[serde(borrow)]
+	LockReleased(LockAnnouncement<'a>),
+	/// The lease ran out without being released.
+	#[serde(borrow)]
+	LockTimeout(LockAnnouncement<'a>),
+}
+
 // ── Top-level event ─────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Eq, CowHelpers, Yokeable)]
@@ -421,6 +448,12 @@ pub enum SocketEvent<'a> {
 	General {
 		inner: GeneralEventType<'a>,
 		general_message_id: u64,
+	},
+	Lock {
+		inner: LockEventType<'a>,
+		/// The user's lock announcement counter (`lock` in `v3/messageIds`). Announcements
+		/// arrive out of order, so it does not give the order the changes happened in.
+		lock_message_id: u64,
 	},
 }
 
@@ -525,6 +558,16 @@ impl<'de> Deserialize<'de> for SocketEvent<'de> {
 							general_message_id,
 						}
 					}
+					EventCategory::Lock => {
+						let inner =
+							LockEventType::deserialize(inject).map_err(serde::de::Error::custom)?;
+						let lock_message_id =
+							extract_id!(raw, "lockMessageId").map_err(serde::de::Error::custom)?;
+						SocketEvent::Lock {
+							inner,
+							lock_message_id,
+						}
+					}
 				};
 
 				Ok(event)
@@ -613,6 +656,16 @@ impl GeneralEventType<'_> {
 	}
 }
 
+impl LockEventType<'_> {
+	pub fn event_type(&self) -> &'static str {
+		match self {
+			Self::LockAcquired(_) => "lockAcquired",
+			Self::LockReleased(_) => "lockReleased",
+			Self::LockTimeout(_) => "lockTimeout",
+		}
+	}
+}
+
 impl SocketEvent<'_> {
 	pub fn event_type(&self) -> &'static str {
 		match self {
@@ -622,6 +675,7 @@ impl SocketEvent<'_> {
 			Self::Note { inner, .. } => inner.event_type(),
 			Self::Contact { inner, .. } => inner.event_type(),
 			Self::General { inner, .. } => inner.event_type(),
+			Self::Lock { inner, .. } => inner.event_type(),
 		}
 	}
 }
@@ -646,6 +700,30 @@ pub struct NewEvent<'a> {
 	pub timestamp: DateTime<Utc>,
 	#[serde(borrow)]
 	pub info: Cow<'a, str>,
+}
+
+/// One lease of a user lock, as a lock announcement reports it.
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
+#[serde(rename_all = "camelCase")]
+pub struct LockAnnouncement<'a> {
+	/// The lock's resource (e.g. `drive-write`).
+	#[serde(borrow)]
+	pub resource: Cow<'a, str>,
+	/// The lease's holder: the `uuid` of the request that acquired it. For a timeout, the
+	/// old holder's.
+	///
+	/// The server compares holders as the exact string sent; parsing folds case, so two
+	/// holders spelled with different case compare equal here. This SDK sends lowercase.
+	pub uuid: Uuid,
+	/// Identifies the lease, opaque. Each lease has its own: the same holder acquiring again
+	/// after its lease ended gets a new one. A lease is announced acquired at most once and
+	/// ended (released or timed out) at most once.
+	#[serde(borrow)]
+	pub lease_id: Cow<'a, str>,
+	/// Server time when the announcement was made. Informational only: do not order
+	/// announcements by it.
+	#[serde(with = "crate::serde::time::seconds_or_millis")]
+	pub timestamp: DateTime<Utc>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
@@ -1344,7 +1422,135 @@ mod tests {
 			classify_event("new-event"),
 			Some((EventCategory::General, "newEvent"))
 		);
+		assert_eq!(
+			classify_event("lockAcquired"),
+			Some((EventCategory::Lock, "lockAcquired"))
+		);
+		assert_eq!(
+			classify_event("lockReleased"),
+			Some((EventCategory::Lock, "lockReleased"))
+		);
+		assert_eq!(
+			classify_event("lockTimeout"),
+			Some((EventCategory::Lock, "lockTimeout"))
+		);
 		assert_eq!(classify_event("unknown-event"), None);
+	}
+
+	fn lock_frame(event: &str) -> String {
+		format!(
+			r#"["{event}",{{"resource":"drive-write","uuid":"6b1c2a4e-3f0d-4b8a-9e2f-0c1d2e3f4a5b","leaseId":"0c2f7a1e-5b4d-4e8f-9a3c-2d1e0f9b8a7c","timestamp":1760270400123,"messageId":4,"lockMessageId":17}}]"#
+		)
+	}
+
+	fn expected_announcement() -> LockAnnouncement<'static> {
+		LockAnnouncement {
+			resource: Cow::Borrowed("drive-write"),
+			uuid: Uuid::from_u128(0x6b1c2a4e_3f0d_4b8a_9e2f_0c1d2e3f4a5b),
+			lease_id: Cow::Borrowed("0c2f7a1e-5b4d-4e8f-9a3c-2d1e0f9b8a7c"),
+			timestamp: DateTime::from_timestamp_millis(1_760_270_400_123).unwrap(),
+		}
+	}
+
+	#[test]
+	fn a_lock_acquired_announcement_parses_every_field() {
+		let frame = lock_frame("lockAcquired");
+		let event: SocketEvent = serde_json::from_str(&frame).unwrap();
+		assert_eq!(
+			event,
+			SocketEvent::Lock {
+				inner: LockEventType::LockAcquired(expected_announcement()),
+				lock_message_id: 17,
+			}
+		);
+		assert_eq!(event.event_type(), "lockAcquired");
+	}
+
+	#[test]
+	fn a_lock_released_announcement_parses_as_released() {
+		let frame = lock_frame("lockReleased");
+		let event: SocketEvent = serde_json::from_str(&frame).unwrap();
+		assert_eq!(
+			event,
+			SocketEvent::Lock {
+				inner: LockEventType::LockReleased(expected_announcement()),
+				lock_message_id: 17,
+			}
+		);
+		assert_eq!(event.event_type(), "lockReleased");
+	}
+
+	#[test]
+	fn a_lock_timeout_announcement_parses_as_timeout() {
+		let frame = lock_frame("lockTimeout");
+		let event: SocketEvent = serde_json::from_str(&frame).unwrap();
+		assert_eq!(
+			event,
+			SocketEvent::Lock {
+				inner: LockEventType::LockTimeout(expected_announcement()),
+				lock_message_id: 17,
+			}
+		);
+		assert_eq!(event.event_type(), "lockTimeout");
+	}
+
+	#[test]
+	fn a_lock_announcement_borrows_its_strings_from_the_frame() {
+		let frame = lock_frame("lockAcquired");
+		let event: SocketEvent = serde_json::from_str(&frame).unwrap();
+		let SocketEvent::Lock {
+			inner: LockEventType::LockAcquired(announcement),
+			..
+		} = event
+		else {
+			panic!("expected a lockAcquired announcement, got {event:?}");
+		};
+		assert!(matches!(announcement.resource, Cow::Borrowed(_)));
+		assert!(matches!(announcement.lease_id, Cow::Borrowed(_)));
+	}
+
+	#[test]
+	fn an_upper_case_holder_uuid_parses_to_the_same_uuid() {
+		let frame = lock_frame("lockAcquired").replace(
+			"6b1c2a4e-3f0d-4b8a-9e2f-0c1d2e3f4a5b",
+			"6B1C2A4E-3F0D-4B8A-9E2F-0C1D2E3F4A5B",
+		);
+		let event: SocketEvent = serde_json::from_str(&frame).unwrap();
+		let SocketEvent::Lock {
+			inner: LockEventType::LockAcquired(announcement),
+			..
+		} = event
+		else {
+			panic!("expected a lockAcquired announcement, got {event:?}");
+		};
+		assert_eq!(announcement.uuid, expected_announcement().uuid);
+	}
+
+	#[test]
+	fn a_lock_message_id_sent_as_a_string_still_parses() {
+		let frame =
+			lock_frame("lockReleased").replace(r#""lockMessageId":17"#, r#""lockMessageId":"17""#);
+		let event: SocketEvent = serde_json::from_str(&frame).unwrap();
+		assert!(matches!(
+			event,
+			SocketEvent::Lock {
+				lock_message_id: 17,
+				..
+			}
+		));
+	}
+
+	#[test]
+	fn a_lock_announcement_without_its_lock_message_id_fails() {
+		let frame = lock_frame("lockAcquired").replace(r#","lockMessageId":17"#, "");
+		assert!(serde_json::from_str::<SocketEvent>(&frame).is_err());
+	}
+
+	#[test]
+	fn a_lock_announcement_missing_a_field_fails() {
+		let frame = lock_frame("lockTimeout")
+			.replace(r#""leaseId":"0c2f7a1e-5b4d-4e8f-9a3c-2d1e0f9b8a7c","#, "");
+		assert!(serde_json::from_str::<SocketEvent>(&frame).is_err());
 	}
 
 	#[test]

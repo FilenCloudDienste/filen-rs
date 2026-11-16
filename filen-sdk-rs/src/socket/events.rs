@@ -8,8 +8,8 @@ use filen_types::{
 		dir::color::DirColor,
 		notes::NoteType,
 		socket::{
-			ChatEventType, ContactEventType, DriveEventType, GeneralEventType, MessageType,
-			NoteEventType, PacketType, SocketEvent,
+			ChatEventType, ContactEventType, DriveEventType, GeneralEventType, LockEventType,
+			MessageType, NoteEventType, PacketType, SocketEvent,
 		},
 	},
 	auth::FileEncryptionVersion,
@@ -25,8 +25,8 @@ pub use filen_types::api::v3::socket::{
 	ChatConversationDeleted, ChatConversationParticipantLeft, ChatMessageDelete,
 	ChatMessageEmbedDisabled, ChatTyping, ContactRequestReceived, FileArchived,
 	FileDeletedPermanent, FileTrash, FolderColorChanged, FolderDeletedPermanent, FolderTrash,
-	NewEvent, NoteArchived, NoteDeleted, NoteParticipantPermissions, NoteParticipantRemoved,
-	NoteRestored,
+	LockAnnouncement, NewEvent, NoteArchived, NoteDeleted, NoteParticipantPermissions,
+	NoteParticipantRemoved, NoteRestored,
 };
 
 use crate::{
@@ -173,6 +173,12 @@ pub enum DecryptedSocketEvent<'a> {
 		inner: DecryptedGeneralEvent<'a>,
 		general_message_id: u64,
 	},
+	/// A user lock's lease began or ended, whoever caused it. A hint for showing lock state,
+	/// never proof of holding a lock: see [`LockEventType`].
+	Lock {
+		inner: DecryptedLockEvent<'a>,
+		lock_message_id: u64,
+	},
 }
 
 impl DecryptedSocketEvent<'_> {
@@ -188,6 +194,7 @@ impl DecryptedSocketEvent<'_> {
 			Self::Note { inner, .. } => inner.event_type(),
 			Self::Contact { inner, .. } => inner.event_type(),
 			Self::General { inner, .. } => inner.event_type(),
+			Self::Lock { inner, .. } => inner.event_type(),
 		}
 	}
 
@@ -210,6 +217,9 @@ impl DecryptedSocketEvent<'_> {
 			Self::General {
 				general_message_id, ..
 			} => Some(*general_message_id),
+			Self::Lock {
+				lock_message_id, ..
+			} => Some(*lock_message_id),
 		}
 	}
 }
@@ -423,6 +433,42 @@ impl DecryptedGeneralEvent<'_> {
 	}
 }
 
+/// A lock announcement; see [`LockEventType`] for what each kind means and what is not
+/// guaranteed. Nothing in it is encrypted.
+#[derive(Debug, Clone, PartialEq, Eq, CowHelpers)]
+pub enum DecryptedLockEvent<'a> {
+	Acquired(LockAnnouncement<'a>),
+	Released(LockAnnouncement<'a>),
+	Timeout(LockAnnouncement<'a>),
+}
+
+impl<'a> DecryptedLockEvent<'a> {
+	pub fn event_type(&self) -> &'static str {
+		match self {
+			Self::Acquired(_) => "lockAcquired",
+			Self::Released(_) => "lockReleased",
+			Self::Timeout(_) => "lockTimeout",
+		}
+	}
+
+	/// The lease the announcement is about, whichever kind it is.
+	pub fn announcement(&self) -> &LockAnnouncement<'a> {
+		match self {
+			Self::Acquired(a) | Self::Released(a) | Self::Timeout(a) => a,
+		}
+	}
+}
+
+impl<'a> From<LockEventType<'a>> for DecryptedLockEvent<'a> {
+	fn from(event: LockEventType<'a>) -> Self {
+		match event {
+			LockEventType::LockAcquired(a) => Self::Acquired(a),
+			LockEventType::LockReleased(a) => Self::Released(a),
+			LockEventType::LockTimeout(a) => Self::Timeout(a),
+		}
+	}
+}
+
 /// The `event_type()` string this wire event will present as AFTER decryption.
 ///
 /// Mirrors the fold performed by [`DecryptedSocketEvent::try_from_encrypted`]:
@@ -625,6 +671,13 @@ impl DecryptedSocketEvent<'_> {
 							general_message_id,
 						}
 					}
+					SocketEvent::Lock {
+						inner,
+						lock_message_id,
+					} => DecryptedSocketEvent::Lock {
+						inner: inner.into(),
+						lock_message_id,
+					},
 				})
 			})
 		})

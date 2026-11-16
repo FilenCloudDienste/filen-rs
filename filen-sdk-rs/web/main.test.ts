@@ -1810,6 +1810,42 @@ test("locks are reported owed until settled, and a released lock is free at once
 	await state.releaseLocks([owed.lock])
 })
 
+/// Taking and releasing a lock is announced on the socket as `lockAcquired` and `lockReleased`
+/// of one lease, in either order. The resource is unique to the run, so nothing else takes it.
+test("lock acquire and release are announced on the socket", async () => {
+	const resource = `test:lock-announcement-${crypto.randomUUID()}`
+	const events: SocketEvent[] = []
+	using _listener = await state.addEventListener(event => events.push(event), ["authSuccess", "lockAcquired", "lockReleased"])
+	// announcements are not replayed: the socket must be authenticated before the acquire
+	await vi.waitFor(() => expect(events.some(e => e.type === "authSuccess")).toBe(true), { timeout: 20_000 })
+
+	const held = await state.acquireLock({ resource })
+	held.drop()
+	await state.waitForLockReleases()
+
+	const announced = (kind: string) =>
+		events.flatMap(e => (e.type === "lock" && e.inner.type === kind && e.inner.resource === resource ? [e] : []))
+	await vi.waitFor(
+		() => {
+			expect(announced("acquired")).toHaveLength(1)
+			expect(announced("released")).toHaveLength(1)
+		},
+		{ timeout: 20_000 }
+	)
+	const [acquired] = announced("acquired")
+	const [released] = announced("released")
+	if (acquired.type !== "lock" || released.type !== "lock") {
+		throw new Error("unreachable: filtered on lock events")
+	}
+	expect(released.inner.leaseId).toBe(acquired.inner.leaseId)
+	expect(released.inner.uuid).toBe(acquired.inner.uuid)
+	expect(typeof acquired.lockMessageId).toBe("bigint")
+	expect(typeof acquired.inner.timestamp).toBe("bigint")
+	expect((await state.getLastEventIds()).lock).toBeGreaterThanOrEqual(
+		acquired.lockMessageId > released.lockMessageId ? acquired.lockMessageId : released.lockMessageId
+	)
+})
+
 test("chats", async () => {
 	// Hold the same account-wide `test:chats` server lock the native chat tests take
 	// (chat_tests.rs `lock_chat`): this suite shares the V2 account with the native matrix
