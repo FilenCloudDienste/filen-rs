@@ -76,8 +76,8 @@ use crate::{
 		OptionalRange, RequestedRange,
 		cfapi::{
 			CreateValues, E_FAIL, E_INVALIDARG, Hresult, MAX_SYNC_ROOT_IDENTITY_LEN,
-			SyncRootIdentity, WideNul, create_values, field_present, identity_len, take_until_nul,
-			volume_path,
+			SyncRootIdentity, WideNul, create_values, field_present, identity_len, image_file_name,
+			take_until_nul, volume_path,
 		},
 	},
 	placeholder::PlaceholderSpec,
@@ -1679,12 +1679,21 @@ unsafe fn callback_info(
 	});
 	let process = read_field!(info, size, CF_CALLBACK_INFO, ProcessInfo: *mut CF_PROCESS_INFO)
 		.filter(|process| !process.is_null());
-	let pid = process.and_then(|process| {
-		// SAFETY: a non-null `ProcessInfo` points at a `CF_PROCESS_INFO` valid for the callback,
-		// which starts with its `u32` size.
-		let process_size = unsafe { process.cast::<u32>().read_unaligned() };
-		read_field!(process, process_size, CF_PROCESS_INFO, ProcessId: u32)
-	});
+	// SAFETY: a non-null `ProcessInfo` points at a `CF_PROCESS_INFO` valid for the callback, which
+	// starts with its `u32` size.
+	let process_size = process.map(|process| unsafe { process.cast::<u32>().read_unaligned() });
+	let pid = process
+		.zip(process_size)
+		.and_then(|(process, size)| read_field!(process, size, CF_PROCESS_INFO, ProcessId: u32));
+	let image = process
+		.zip(process_size)
+		.and_then(
+			|(process, size)| read_field!(process, size, CF_PROCESS_INFO, ImagePath: *const u16),
+		)
+		// SAFETY: `ImagePath` is null or a NUL-terminated string valid for the callback.
+		.and_then(|path| unsafe { read_wide(path) })
+		.as_deref()
+		.and_then(image_file_name);
 	let context = read_field!(info, size, CF_CALLBACK_INFO, CallbackContext: *mut c_void)
 		.unwrap_or(ptr::null_mut());
 	// SAFETY: the only context this module connects with is a `&'static ContextSlot`.
@@ -1694,6 +1703,7 @@ unsafe fn callback_info(
 		file_size,
 		identity,
 		pid,
+		image,
 		slot,
 	})
 }

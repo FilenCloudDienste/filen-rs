@@ -839,3 +839,34 @@ fn another_providers_root_or_a_path_inside_a_root_is_not_ours() {
 		SyncRootOwner::Other
 	);
 }
+
+#[test]
+fn only_the_file_name_of_a_readers_image_is_logged() {
+	let wide = |text: &str| -> Vec<u16> { text.encode_utf16().collect() };
+	let cases: [(&str, Option<&str>); 8] = [
+		(r"C:\Windows\explorer.exe", Some("explorer.exe")),
+		(
+			r"C:\Users\alice\AppData\Local\Microsoft\WindowsApps\Photos.exe",
+			Some("Photos.exe"),
+		),
+		(
+			r"\Device\HarddiskVolume3\Program Files\Windows Defender\MsMpEng.exe",
+			Some("MsMpEng.exe"),
+		),
+		("C:/tools/reader.exe", Some("reader.exe")),
+		("SearchProtocolHost.exe", Some("SearchProtocolHost.exe")),
+		("", None),
+		(r"C:\Windows\", None),
+		(r"\\?\C:\x\é.exe", Some("é.exe")),
+	];
+	for (path, expected) in cases {
+		assert_eq!(
+			image_file_name(&wide(path)).as_deref(),
+			expected,
+			"{path:?}"
+		);
+	}
+	let long = format!(r"C:\{}", "a".repeat(256));
+	assert_eq!(image_file_name(&wide(&long)), None);
+	assert!(image_file_name(&wide(&format!(r"C:\{}", "a".repeat(255)))).is_some());
+}

@@ -602,6 +602,20 @@ pub struct WinError {
 	pub code: Hresult,
 }
 
+/// The most UTF-16 units of an image's file name logged: a file name's longest.
+const MAX_IMAGE_NAME_UNITS: usize = 255;
+
+/// The file name of the image a callback's process runs (`CF_PROCESS_INFO.ImagePath`), for the
+/// log: its last component only, so no user's directory or other part of the path is logged;
+/// `None` for an empty path, one ending in a separator, or a name longer than a file name holds.
+pub(crate) fn image_file_name(path: &[u16]) -> Option<String> {
+	let name = path.rsplit(|unit| is_separator(*unit)).next()?;
+	if name.is_empty() || name.len() > MAX_IMAGE_NAME_UNITS {
+		return None;
+	}
+	Some(String::from_utf16_lossy(name))
+}
+
 /// A string as cfapi takes it: UTF-16 with exactly one NUL, its last unit. Only the parsers in
 /// this module build one, which is what makes passing its pointer to cfapi sound.
 #[derive(Clone, PartialEq, Eq)]

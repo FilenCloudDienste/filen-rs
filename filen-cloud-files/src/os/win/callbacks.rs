@@ -40,6 +40,8 @@ pub(super) struct CallbackInfo {
 	pub(super) identity: Result<IdentityBlob, IdentityError>,
 	/// The process whose access raised the callback, when the OS names one.
 	pub(super) pid: Option<u32>,
+	/// That process's image's file name, never its path, when the OS names one.
+	pub(super) image: Option<String>,
 	/// The connection's context; `None` only if cfapi passed none.
 	pub(super) slot: Option<&'static ContextSlot>,
 }
@@ -71,6 +73,7 @@ pub(super) fn fetch_data(info: CallbackInfo, range: Option<RequestedRange>, path
 		optional_offset = optional.map(OptionalRange::offset),
 		optional_len = optional.map(OptionalRange::length),
 		pid = info.pid,
+		reader = info.image.as_deref(),
 		"cf callback"
 	);
 	let own = own_process(&info);
