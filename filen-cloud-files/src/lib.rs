@@ -15,6 +15,7 @@ mod auth;
 mod dispatch;
 mod drive;
 mod failure;
+mod helper;
 mod hydrate;
 mod identity;
 mod local;
@@ -44,6 +45,16 @@ pub use auth::{CredentialError, CredentialManagerKeyStore};
 pub use dispatch::{CacheDispatcher, CloudFilesCallback, DispatchConfig, Dispatcher};
 pub use drive::Drive;
 pub use failure::Failure;
+pub use helper::{
+	ActivityEntry, ActivityKind, CacheOpener, Cleared, DriveOpener, ErrorCode, ExistingRoot,
+	ExitReason, FatalCode, Hello, HelperConfig, InMessage, KeptEarlier, KeptId, KeptItem,
+	KeptItemReason, MAX_LINE_BYTES, MAX_LIST_ENTRIES, MAX_MESSAGE_CHARS, OutMessage,
+	PROTOCOL_VERSION, ParseError, PhaseName, Platform, PlatformError, PlatformFailed, PlatformOp,
+	Registration, ReplyError, ReplyValue, Request, RequestId, RootDir, RootDirError, RootListing,
+	RootRefusal, SkippedEntry, SkippedPlace, StateDir, StateDirError, StateReport, StatusEvent,
+	UnregisterAll, UnregisterAllEntry, UnregisterReport, UserId, install_stderr_logging,
+	parse_line, run_helper, unregister_all,
+};
 pub use identity::{IdentityBlob, IdentityError, MAX_IDENTITY_LEN, PlaceholderIdentity};
 pub use local::{
 	CacheLocalEngine, ConflictKind, KeptReason, LocalConfig, LocalEngine, LocalReport, LocalSkip,

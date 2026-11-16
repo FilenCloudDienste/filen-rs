@@ -4,6 +4,7 @@
 mod fake_drive;
 mod fake_local;
 mod fake_os;
+mod fake_platform;
 mod memory_key_store;
 
 #[cfg(feature = "test-seams")]
@@ -18,4 +19,8 @@ pub use fake_local::{
 	ProviderAct, UserChange, name, root_path,
 };
 pub use fake_os::{FakeData, FakeEvent, FakeOs, FakePopulate};
+pub use fake_platform::{
+	FakeConnected, FakeKeys, FakeOpener, FakePlatform, FakeRegistered, FakeStep, FakeWatcher,
+	KillPoint, PlatformCall, WatchGate,
+};
 pub use memory_key_store::MemoryKeyStore;
