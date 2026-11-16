@@ -31,6 +31,9 @@ pub use drive::Drive;
 pub use failure::Failure;
 pub use identity::{IdentityBlob, IdentityError, MAX_IDENTITY_LEN, PlaceholderIdentity};
 pub use names::{NameRejection, PlaceholderName};
+// Exported in tests too, where `os::cfapi` is built on every host.
+#[cfg(any(windows, test))]
+pub use os::cfapi::{CfCall, Hresult, ProviderInfoError, SyncRootPathError, WinError};
 pub use placeholder::{
 	FileSize, FileTime, NegativeSize, PlaceholderSpec, SpecKind, UnrepresentableTime,
 };

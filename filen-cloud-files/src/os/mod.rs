@@ -3,6 +3,9 @@
 //! consumes it, so a request is answered at most once, and an implementation's `Drop` fails a
 //! request left unanswered, so a panic or a shutdown never leaves the OS waiting out its timeout.
 
+// The Windows layer's rules, apart from the calls: built on Windows, and in tests on every host.
+#[cfg(any(windows, test))]
+pub(crate) mod cfapi;
 mod local;
 
 pub(crate) use local::ticks_to_unix_millis;
