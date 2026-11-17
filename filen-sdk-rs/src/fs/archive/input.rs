@@ -111,7 +111,7 @@ struct ArchiveInput<B> {
 	hasher: blake3::Hasher,
 	/// The codec read the archive front to back, once: `hasher` covers it all.
 	sequential: bool,
-	ask: Option<(u64, oneshot::Sender<Vec<u8>>)>,
+	ask: Option<(u64, oneshot::Sender<Arc<Vec<u8>>>)>,
 	/// The job's floor of input: one chunk it can always take, outside the client's budget, so
 	/// it never waits on memory a transfer or another job holds.
 	slot: Arc<Semaphore>,
@@ -145,7 +145,7 @@ impl<B: DriveBackend> ArchiveInput<B> {
 
 	/// The codec asks for chunk `index`, which means it is done with the one before; answered
 	/// by [`Self::advance`] once the chunk is in.
-	fn ask(&mut self, index: u64, reply: oneshot::Sender<Vec<u8>>) {
+	fn ask(&mut self, index: u64, reply: oneshot::Sender<Arc<Vec<u8>>>) {
 		self.reading = None;
 		if index != self.served {
 			// a jump (a zip is read from its end): what was fetched ahead is of no use
@@ -229,7 +229,7 @@ impl<B: DriveBackend> ArchiveInput<B> {
 		self.served += 1;
 		self.run += 1;
 		self.hasher.update_rayon(&data);
-		let _ = reply.send(data);
+		let _ = reply.send(Arc::new(data));
 	}
 
 	fn drop_prefetched(&mut self) {

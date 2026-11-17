@@ -53,11 +53,12 @@ pub(crate) const ARCHIVE_STALL_TIMEOUT: Duration = Duration::from_secs(60);
 pub(crate) enum WorkerEvent {
 	/// The codec needs chunk `index` of the plaintext of its input `source`: the archive when
 	/// extracting (always 0), a source file by its place in the job's entries when compressing.
-	/// A fetch that fails stops the job, and the reply is dropped unanswered.
+	/// A fetch that fails stops the job, and the reply is dropped unanswered. The chunk is
+	/// shared, so the driver can keep it for a later job without a copy.
 	Ask {
 		source: u32,
 		index: u64,
-		reply: oneshot::Sender<Vec<u8>>,
+		reply: oneshot::Sender<Arc<Vec<u8>>>,
 	},
 	/// What the archive turned out to be; sent before any entry.
 	Opened(ArchiveFormat),
@@ -288,7 +289,7 @@ impl WorkerPort {
 	}
 
 	/// Chunk `index` of `source`'s plaintext, parking until the driver has fetched it.
-	pub(crate) fn fetch(&self, source: u32, index: u64) -> io::Result<Vec<u8>> {
+	pub(crate) fn fetch(&self, source: u32, index: u64) -> io::Result<Arc<Vec<u8>>> {
 		let (reply, answer) = oneshot::channel();
 		self.send(WorkerEvent::Ask {
 			source,
@@ -443,7 +444,7 @@ pub(crate) struct ChunkInput<'p> {
 	source: u32,
 	len: u64,
 	next: u64,
-	chunk: Vec<u8>,
+	chunk: Arc<Vec<u8>>,
 	pos: usize,
 	/// Bytes read and counted: the source's first ones, as it is read in order.
 	read: u64,
@@ -456,7 +457,7 @@ impl<'p> ChunkInput<'p> {
 			source,
 			len,
 			next: 0,
-			chunk: Vec::new(),
+			chunk: Arc::default(),
 			pos: 0,
 			read: 0,
 		}
@@ -504,7 +505,7 @@ pub(crate) struct CachedInput<'p> {
 	source: u32,
 	len: u64,
 	/// The most recent chunks, most recent first.
-	cache: Vec<(u64, Vec<u8>)>,
+	cache: Vec<(u64, Arc<Vec<u8>>)>,
 	slots: usize,
 	/// One bit per chunk, set once it was first read, so one fetched again counts as read once:
 	/// 16 KiB for a 128 GiB archive. Grown only as far as a fetch that succeeded reaches, so a
@@ -830,7 +831,7 @@ mod tests {
 				.chunks(CHUNK_SIZE)
 				.nth(usize::try_from(index).unwrap())
 				.unwrap();
-			let _ = reply.send(chunk.to_vec());
+			let _ = reply.send(Arc::new(chunk.to_vec()));
 		}
 		(asked, (&mut link.done).await.unwrap())
 	}

@@ -230,7 +230,7 @@ struct Driver<B: DriveBackend> {
 	/// count as paused while one still holds memory.
 	ready: VecDeque<(ChunkKey, Vec<u8>, OwnedSemaphorePermit, OpGuard)>,
 	reading: Option<OwnedSemaphorePermit>,
-	ask: Option<(ChunkKey, oneshot::Sender<Vec<u8>>)>,
+	ask: Option<(ChunkKey, oneshot::Sender<Arc<Vec<u8>>>)>,
 
 	destination: Uuid,
 	upload: Arc<B::Upload>,
@@ -596,7 +596,7 @@ impl<B: DisposalBackend> Driver<B> {
 				size,
 				bytes_done: 0,
 			});
-		let _ = reply.send(data);
+		let _ = reply.send(Arc::new(data));
 	}
 
 	/// Fails the job when the data `source` was read as, every chunk of it hashed, is not what its

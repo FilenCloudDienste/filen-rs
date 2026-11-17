@@ -172,7 +172,7 @@ fn run_job_holding(job: StreamJob, mut answer: impl FnMut(u64) -> Option<Vec<u8>
 			WorkerEvent::Ask { index, reply, .. } => {
 				asked.push(index);
 				if let Some(chunk) = answer(index) {
-					let _ = reply.send(chunk);
+					let _ = reply.send(Arc::new(chunk));
 				}
 			}
 			WorkerEvent::Opened(layout) => seen.push(Seen::Opened(layout)),
@@ -632,7 +632,7 @@ fn the_codec_stops_once_its_driver_is_gone() {
 	let Some(WorkerEvent::Ask { reply, .. }) = link.events.blocking_recv() else {
 		panic!("the codec asks for the archive first");
 	};
-	reply.send(archive).unwrap();
+	reply.send(Arc::new(archive)).unwrap();
 	drop(link);
 	has_exited
 		.recv_timeout(Duration::from_secs(10))

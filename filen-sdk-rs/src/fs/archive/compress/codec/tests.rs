@@ -1,7 +1,7 @@
 //! The codec on its real thread, driven from the test thread, and what it writes read back
 //! through the SDK's own decoders and tar reader.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use chrono::TimeZone;
 
@@ -107,7 +107,7 @@ fn drive(
 				if short == Some(source) && end == data.len() {
 					end -= 1;
 				}
-				let _ = reply.send(data[start..end].to_vec());
+				let _ = reply.send(Arc::new(data[start..end].to_vec()));
 			}
 			WorkerEvent::Data(chunk) => {
 				written.chunks.push(chunk.len());

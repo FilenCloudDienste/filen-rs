@@ -715,7 +715,7 @@ async fn a_codec_waiting_for_its_chunk_is_not_given_up_on() {
 	tokio::time::sleep(2 * ARCHIVE_STALL_TIMEOUT).await;
 	assert!(!job.running.is_finished());
 	setup.backend.release_all();
-	assert_eq!(answer.await.unwrap(), setup.contents[0]);
+	assert_eq!(*answer.await.unwrap(), setup.contents[0]);
 
 	cancel.send_replace(true);
 	let failed = job.running.await.unwrap().unwrap_err();
