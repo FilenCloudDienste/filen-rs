@@ -316,6 +316,8 @@ pub(crate) struct DownloadTask {
 	pub(crate) start: CodecStart<CodecResult>,
 	/// Where a reader whose download this is keeps the chunks read last.
 	pub(crate) chunks: Option<Arc<Retained>>,
+	/// Where the entry's data ends in the archive, when a held index says.
+	pub(crate) read_end: Option<u64>,
 }
 
 /// Runs a download: waits for a job slot, starts the codec, serves it the archive and writes the
@@ -337,6 +339,7 @@ pub(crate) async fn run_download<W: AsyncWrite + Unpin + MaybeSend>(
 		config,
 		start,
 		chunks,
+		read_end,
 	} = task;
 	let started = start_reading(
 		memory,
@@ -348,6 +351,7 @@ pub(crate) async fn run_download<W: AsyncWrite + Unpin + MaybeSend>(
 			reading: EntryDownloadPhase::Reading,
 			name: EntryDownloadReport::NAME,
 			chunks,
+			read_end,
 		},
 		start,
 	)

@@ -190,6 +190,9 @@ impl ArchiveBytes for UnauthFile {
 struct ArchiveInput {
 	source: Arc<dyn ArchiveBytes>,
 	chunks: u64,
+	/// Chunks past this one are fetched only when the codec asks for them: none of what the
+	/// job reads lies there.
+	ahead_end: u64,
 	next_fetch: u64,
 	fetches: FuturesOrdered<MaybeSendBoxFuture<'static, FetchedChunk>>,
 	/// Fetched chunks the codec has not asked for yet; held only while the feed counts as
@@ -221,9 +224,12 @@ impl ArchiveInput {
 		memory: Arc<Semaphore>,
 		source: Arc<dyn ArchiveBytes>,
 		kept: Option<Arc<Retained>>,
+		read_end: Option<u64>,
 	) -> Self {
+		let chunks = source.len().div_ceil(CHUNK_SIZE_U64);
 		Self {
-			chunks: source.len().div_ceil(CHUNK_SIZE_U64),
+			chunks,
+			ahead_end: read_end.map_or(chunks, |end| end.div_ceil(CHUNK_SIZE_U64).min(chunks)),
 			memory,
 			source,
 			next_fetch: 0,
@@ -302,8 +308,10 @@ impl ArchiveInput {
 		let ahead = if self.run >= 2 { PREFETCH_CHUNKS } else { 1 };
 		while self.fetches.len() + self.ready.len() < ahead
 			&& self.next_fetch < self.chunks
-			// short of a run, only the chunk the codec waits for
-			&& (ahead > 1 || self.ask.is_some() && self.next_fetch <= self.served)
+			// short of a run, or past where the job's data ends, only the chunk the codec waits
+			// for
+			&& (ahead > 1 && self.next_fetch < self.ahead_end
+				|| self.ask.is_some() && self.next_fetch <= self.served)
 		{
 			let Some(permit) = take_memory(&self.slot, &self.memory) else {
 				break;
@@ -431,17 +439,19 @@ pub(crate) enum Fed<T> {
 
 impl<T> CodecFeed<T> {
 	/// A feed of `source` to the codec at the other end of `link`, counted as `running`, the
-	/// chunks it reads kept in `chunks` when it is a reader's job; what goes beyond the job's
-	/// floor of one chunk draws on the client's `memory`.
+	/// chunks it reads kept in `chunks` when it is a reader's job, and nothing past `read_end`
+	/// fetched ahead; what goes beyond the job's floor of one chunk draws on the client's
+	/// `memory`.
 	pub(crate) fn new(
 		memory: Arc<Semaphore>,
 		source: Arc<dyn ArchiveBytes>,
 		link: WorkerLink<Result<T, Error>>,
 		running: OpGuard,
 		chunks: Option<Arc<Retained>>,
+		read_end: Option<u64>,
 	) -> Self {
 		Self {
-			input: ArchiveInput::new(memory, source, chunks),
+			input: ArchiveInput::new(memory, source, chunks, read_end),
 			link,
 			running: Some(running),
 			stall: StallWatch::default(),
@@ -576,6 +586,9 @@ pub(crate) struct ReadingJob<'a, S: JobState> {
 	pub(crate) name: &'a str,
 	/// Where a reader whose job this is keeps the chunks read last.
 	pub(crate) chunks: Option<Arc<Retained>>,
+	/// Where in the archive the data the job reads ends, when known: nothing past it is
+	/// fetched ahead.
+	pub(crate) read_end: Option<u64>,
 }
 
 /// Starts a job that reads `archive` through a codec: checks its chunks, waits for a job slot
@@ -595,6 +608,7 @@ pub(crate) async fn start_reading<S: JobState, T>(
 		reading,
 		name,
 		chunks,
+		read_end,
 	} = job;
 	if let Err(error) = source.check() {
 		return Err((S::Phase::FAILED, Arc::new(error)));
@@ -608,7 +622,7 @@ pub(crate) async fn start_reading<S: JobState, T>(
 	let link = start().map_err(|error| (S::Phase::FAILED, Arc::new(error)))?;
 	Ok((
 		lease,
-		CodecFeed::new(memory, source, link, reporter.op(), chunks),
+		CodecFeed::new(memory, source, link, reporter.op(), chunks, read_end),
 	))
 }
 
@@ -797,7 +811,7 @@ mod tests {
 		backend.contents.insert(archive.uuid(), bytes);
 		let memory = backend.memory();
 		let source = DriveFile::new(Arc::new(backend), archive);
-		let mut input = ArchiveInput::new(memory, source, None);
+		let mut input = ArchiveInput::new(memory, source, None, None);
 		let reporter = ExtractReporter::new(Ignore, 0);
 		let ops = reporter.ops();
 		// a zip's head, then its index at the end: nothing fetched ahead of either
@@ -807,5 +821,31 @@ mod tests {
 		assert_eq!(read(&mut input, &ops, 19).await, 20);
 		assert_eq!(read(&mut input, &ops, 3).await, 4);
 		assert_eq!(read(&mut input, &ops, 4).await, 9);
+	}
+
+	#[tokio::test]
+	async fn nothing_is_fetched_ahead_past_where_the_jobs_data_ends() {
+		let bytes = pattern(20 * CHUNK_SIZE, 2);
+		let archive = remote_file(
+			Uuid::from_u128(1),
+			Uuid::from_u128(2),
+			"a.zip",
+			&bytes,
+			None,
+		);
+		let mut backend = FakeBackend::new(Uuid::from_u128(3)).with_memory(8);
+		backend.contents.insert(archive.uuid(), bytes);
+		let memory = backend.memory();
+		let source = DriveFile::new(Arc::new(backend), archive);
+		// the data ends one byte into chunk 6
+		let mut input = ArchiveInput::new(memory, source, None, Some(6 * CHUNK_SIZE_U64 + 1));
+		let reporter = ExtractReporter::new(Ignore, 0);
+		let ops = reporter.ops();
+		assert_eq!(read(&mut input, &ops, 3).await, 4);
+		assert_eq!(read(&mut input, &ops, 4).await, 7);
+		assert_eq!(read(&mut input, &ops, 5).await, 7);
+		assert_eq!(read(&mut input, &ops, 6).await, 7);
+		// asked for all the same, a chunk past it is fetched, and only that one
+		assert_eq!(read(&mut input, &ops, 7).await, 8);
 	}
 }

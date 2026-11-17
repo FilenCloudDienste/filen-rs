@@ -1252,6 +1252,38 @@ async fn a_rars_members_are_listed_from_its_held_table_and_read_checked() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rar_job_decodes_through_the_held_parse_reading_only_its_members_chunks() {
+	let members: Vec<Vec<u8>> = (0..6)
+		.map(|at| incompressible(600 << 10, 80 + at))
+		.collect();
+	let names: Vec<String> = (0..6).map(|at| format!("{at}.jpg")).collect();
+	let files: Vec<(&str, &[u8])> = names
+		.iter()
+		.zip(&members)
+		.map(|(name, data)| (name.as_str(), &data[..]))
+		.collect();
+	for store in [true, false] {
+		let rar = rar_of(rars::ArchiveVersion::Rar50, &files, store, false, None);
+		let (backend, reader) = opened("pages.cbr", rar, None).await;
+		fetched(&backend);
+		// the fifth and sixth lie in chunks 2 and 3: nothing else is read again (opening read
+		// all of it, and the reader may still keep the two it read last)
+		let (result, written) = read_entries(&reader, &[4, 5], Some(0)).await;
+		assert_eq!(result.unwrap().entries, 2);
+		assert_eq!(written[1].2, members[5]);
+		let read = fetched(&backend);
+		assert!(
+			read.iter().all(|chunk| (2..=3).contains(chunk)),
+			"store {store}: {read:?}"
+		);
+		// two jobs at once: the one that finds the held parse busy parses the RAR itself
+		let (first, second) = tokio::join!(downloaded(&reader, 0), downloaded(&reader, 5));
+		assert_eq!(first.unwrap().0, members[0]);
+		assert_eq!(second.unwrap().0, members[5]);
+	}
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_encrypted_rar_opens_under_its_password_alone() {
 	let data = text(4000, 53);
 	let rar = rar_of(
@@ -1291,4 +1323,177 @@ async fn a_comic_book_rar_behind_a_stub_is_read_by_its_name() {
 	let (_, reader) = opened("comic.cbr", cbr, None).await;
 	assert_eq!(range(&reader, 0, 0, 100).await.unwrap(), page[..100]);
 	assert_eq!(downloaded(&reader, 0).await.unwrap().0, page);
+}
+
+/// The reader's benchmarks, run by hand (they print what they measure, and check the counters
+/// bound it): `cargo test -p filen-sdk-rs --release --lib -- --ignored --nocapture
+/// fs::archive::reader::tests::bench`. Native numbers; wasm runs the same code on its CPU pool.
+mod bench {
+	use std::time::Instant;
+
+	use super::*;
+	use crate::fs::archive::test_support::rar_of;
+
+	fn mib(bytes: u64) -> f64 {
+		bytes as f64 / f64::from(1 << 20)
+	}
+
+	fn rate(bytes: u64, started: Instant) -> f64 {
+		mib(bytes) / started.elapsed().as_secs_f64()
+	}
+
+	/// Archive bytes fetched to read a window of 50 pages of a 200-page comic book, stored as
+	/// comic books are: a page costs its own bytes and at most the chunks it shares.
+	#[ignore = "a benchmark: run by hand with --release --ignored --nocapture"]
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+	async fn bench_bytes_fetched_for_fifty_comic_pages() {
+		let pages: Vec<Vec<u8>> = (0..200)
+			.map(|page| incompressible(300 << 10, page + 1))
+			.collect();
+		let names: Vec<String> = (0..200).map(|page| format!("{page:03}.jpg")).collect();
+		let zip_files: Vec<_> = names
+			.iter()
+			.zip(&pages)
+			.map(|(name, page)| (name.as_str(), &page[..], ZipMethod::Stored, None))
+			.collect();
+		let rar_files: Vec<_> = names
+			.iter()
+			.zip(&pages)
+			.map(|(name, page)| (name.as_str(), &page[..]))
+			.collect();
+		let books = [
+			("comic.cbz", zip_with(&zip_files)),
+			(
+				"comic.cbr",
+				rar_of(rars::ArchiveVersion::Rar50, &rar_files, true, false, None),
+			),
+		];
+		let window: Vec<u32> = (100..150).collect();
+		let page_bytes: u64 = window
+			.iter()
+			.map(|&page| pages[page as usize].len() as u64)
+			.sum();
+		for (name, book) in books {
+			let book_bytes = book.len() as u64;
+			let (backend, reader) = opened(name, book, None).await;
+			let opening = fetched(&backend).len() as u64;
+			let started = Instant::now();
+			let (result, written) = read_entries(&reader, &window, Some(0)).await;
+			let elapsed = started.elapsed();
+			assert_eq!(result.unwrap().entries, 50, "{name}");
+			assert!(
+				written
+					.iter()
+					.all(|(page, _, data)| *data == pages[*page as usize])
+			);
+			let pass = fetched(&backend).len() as u64;
+			println!(
+				"{name}: {:.1} MiB book, open {opening} chunks; 50 pages = {:.1} MiB read as {pass} \
+				 chunks ({:.1} MiB) in {elapsed:?}",
+				mib(book_bytes),
+				mib(page_bytes),
+				mib(pass * CHUNK_SIZE_U64),
+			);
+			assert!(
+				pass * CHUNK_SIZE_U64 <= page_bytes + 2 * CHUNK_SIZE_U64,
+				"{name}: {pass} chunks"
+			);
+		}
+	}
+
+	/// Inflate throughput of an entry read by range in 1 MiB windows, front to back, and how
+	/// long a jump back takes with checkpoints 4, 16 and 32 MiB apart: each decodes at most the
+	/// spacing (from the checkpoint before it) and the window.
+	#[ignore = "a benchmark: run by hand with --release --ignored --nocapture"]
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+	async fn bench_inflate_throughput_and_seek_latency() {
+		let data = text(64 << 20, 61);
+		let len = data.len() as u64;
+		let zip = zip_with(&[("big", &data, ZipMethod::Deflate { level: 6 }, None)]);
+		for spacing in [4u64 << 20, 16 << 20, 32 << 20] {
+			let (_, reader) = opened("z.zip", zip.clone(), None).await;
+			let retained = reader.retained.as_ref().unwrap();
+			retained.keep_seeks(StreamKey::Entry(0), Seeks::with_limits(spacing, 64 << 20));
+			let started = Instant::now();
+			let window = 1 << 20;
+			let mut at = 0;
+			while at < len {
+				let end = (at + window).min(len);
+				range(&reader, 0, at, end).await.unwrap();
+				at = end;
+			}
+			let throughput = rate(len, started);
+			let seeks = retained.take_seeks(StreamKey::Entry(0)).unwrap();
+			assert_eq!(seeks.decoded_for_test(), len);
+			let mut decoded = seeks.decoded_for_test();
+			retained.keep_seeks(StreamKey::Entry(0), seeks);
+			let jumps = 16u64;
+			let mut most = 0;
+			let started = Instant::now();
+			for jump in 0..jumps {
+				// back and forth over the entry, never where the last read stopped
+				let to = (jump * 37 + 11) % 61 * (len / 64);
+				range(&reader, 0, to, to + 4096).await.unwrap();
+				let seeks = retained.take_seeks(StreamKey::Entry(0)).unwrap();
+				let now = seeks.decoded_for_test();
+				most = most.max(now - decoded);
+				decoded = now;
+				retained.keep_seeks(StreamKey::Entry(0), seeks);
+			}
+			let per_jump = started.elapsed() / u32::try_from(jumps).unwrap();
+			println!(
+				"inflate {:.0} MiB/s over {:.0} MiB; checkpoints {:.0} MiB apart: a jump takes \
+				 {per_jump:?}, decoding at most {:.1} MiB",
+				throughput,
+				mib(len),
+				mib(spacing),
+				mib(most),
+			);
+			assert!(most <= spacing + 2 * inflate::STEP_BYTES, "{most}");
+		}
+	}
+
+	/// Decode rate of a solid block (7z LZMA2, RAR 5) read to its last entry, and the time a
+	/// pass would take to reach an entry 512 MiB into one at that rate.
+	#[ignore = "a benchmark: run by hand with --release --ignored --nocapture"]
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+	async fn bench_solid_block_decode_rate() {
+		let parts: Vec<Vec<u8>> = (0..8).map(|part| text(4 << 20, 70 + part)).collect();
+		let names: Vec<String> = (0..8).map(|part| format!("{part}.txt")).collect();
+		let block: u64 = parts.iter().map(|part| part.len() as u64).sum();
+		let sevenz_files: Vec<_> = names
+			.iter()
+			.zip(&parts)
+			.map(|(name, part)| (name.as_str(), Some(&part[..])))
+			.collect();
+		let rar_files: Vec<_> = names
+			.iter()
+			.zip(&parts)
+			.map(|(name, part)| (name.as_str(), &part[..]))
+			.collect();
+		let archives = [
+			(
+				"s.7z",
+				sevenz_of(&sevenz_files, SevenZMethod::Lzma2 { level: 1 }, true, None),
+			),
+			(
+				"s.rar",
+				rar_of(rars::ArchiveVersion::Rar50, &rar_files, false, true, None),
+			),
+		];
+		for (name, archive) in archives {
+			let (_, reader) = opened(name, archive, None).await;
+			let started = Instant::now();
+			let (result, written) = read_entries(&reader, &[7], None).await;
+			let decode = rate(block, started);
+			assert_eq!(result.unwrap().entries, 1, "{name}");
+			assert_eq!(written[0].2, parts[7], "{name}");
+			println!(
+				"{name}: solid block of {:.0} MiB decoded at {decode:.0} MiB/s; reaching an entry \
+				 512 MiB in takes {:.1} s",
+				mib(block),
+				512.0 / decode,
+			);
+		}
+	}
 }

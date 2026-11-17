@@ -101,6 +101,7 @@ pub(crate) async fn open(job: ReadJob, callback: impl ListCallback) -> Result<Op
 			reading: ListPhase::Reading,
 			name: ListReport::NAME,
 			chunks,
+			read_end: None,
 		},
 		start,
 	)
@@ -229,6 +230,7 @@ pub(crate) async fn download<W: AsyncWrite + Unpin + MaybeSend>(
 		len: source.len(),
 		expansion_base,
 	};
+	let read_end = index.data_end(&[u64::from(entry.index)]);
 	let start = start_codec(input, &config, extraction, task, index);
 	run_download(
 		DownloadTask {
@@ -240,6 +242,7 @@ pub(crate) async fn download<W: AsyncWrite + Unpin + MaybeSend>(
 			config,
 			start,
 			chunks,
+			read_end,
 		},
 		writer,
 	)

@@ -138,11 +138,9 @@ pub(crate) fn extract_stream(port: &WorkerPort, job: StreamJob) -> Result<Archiv
 			HeldIndex::SevenZ { index, keys } => {
 				return extract_held_sevenz(&mut walk, input(), index, keys, &job);
 			}
-			HeldIndex::Rar(table) if walk.listing() => {
-				return extract_rar(&mut walk, input(), &job, Some(table));
-			}
-			// a tar is read from its start, and a RAR's members are decoded by a parse of it
-			HeldIndex::Tar(_) | HeldIndex::Rar(_) => {}
+			HeldIndex::Rar(table) => return extract_rar(&mut walk, input(), &job, Some(table)),
+			// a tar is read from its start
+			HeldIndex::Tar(_) => {}
 		}
 	}
 	// a listing asked for its index records where a tar's members lie

@@ -185,6 +185,7 @@ fn download_with(
 				config: test_config(),
 				start: codec(job),
 				chunks: None,
+				read_end: None,
 			};
 			tokio::spawn(async move { run_download(task, &mut writer).await.0 })
 		}

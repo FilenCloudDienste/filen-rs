@@ -1,8 +1,9 @@
 //! Reading a RAR (1.3 to 7) through rars: its headers parsed from the archive read through the
 //! driver, then its members decoded in archive order, each checked against its CRC-32 or BLAKE2sp
-//! hash. A multi-volume archive is refused. The members' table is handed back to be held, which a
-//! later listing is made from without parsing again; a job that decodes parses again, as rars
-//! keeps its own state per parse.
+//! hash. A multi-volume archive is refused. The members' table is handed back to be held, with
+//! rars' own parse: a later listing is made from the table, and a later job that decodes points
+//! the held parse at its own input instead of reading every header again, which in an archive of
+//! small members means every chunk of it.
 
 #![warn(unreachable_pub, unused_qualifications)]
 
@@ -12,6 +13,7 @@ use std::{
 	mem,
 	ops::Range,
 	rc::Rc,
+	sync::{Arc, Mutex, PoisonError},
 };
 
 use chrono::{DateTime, Utc};
@@ -46,7 +48,28 @@ pub(crate) struct RarTable {
 	/// Some member is compressed on from the history of those before it.
 	pub(crate) solid: bool,
 	pub(crate) members: Vec<RarMember>,
+	/// rars' parse of the archive, which the table was made from.
+	parsed: Option<HeldRar>,
 }
+
+/// rars' parse of a RAR, kept for the jobs after the one that made it. rars reads the archive
+/// through `input`, which a job fills with its own input while it holds `busy`, and empties
+/// before it ends; a job that finds it busy parses the archive again.
+struct HeldRar {
+	archive: Archive,
+	input: Arc<Mutex<Option<CachedInput<'static>>>>,
+	busy: Mutex<()>,
+}
+
+impl std::fmt::Debug for HeldRar {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("HeldRar").finish_non_exhaustive()
+	}
+}
+
+/// Heap a parse holds per member, besides the table's own: rars' header block and the name it
+/// keeps of it.
+const PARSED_MEMBER_BYTES: u64 = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RarKind {
@@ -85,12 +108,20 @@ pub(crate) struct RarMember {
 impl RarTable {
 	/// The heap it takes, in bytes.
 	pub(crate) fn heap_bytes(&self) -> u64 {
-		(self.members.capacity() * size_of::<RarMember>()
-			+ self
-				.members
-				.iter()
-				.map(|member| member.name.capacity())
-				.sum::<usize>()) as u64
+		let names: usize = self
+			.members
+			.iter()
+			.map(|member| member.name.capacity())
+			.sum();
+		let table = (self.members.capacity() * size_of::<RarMember>() + names) as u64;
+		let parsed = if self.parsed.is_some() {
+			(self.members.len() as u64)
+				.saturating_mul(PARSED_MEMBER_BYTES)
+				.saturating_add(names as u64)
+		} else {
+			0
+		};
+		table.saturating_add(parsed)
 	}
 }
 
@@ -132,23 +163,29 @@ fn read_options<'a>(job: &'a StreamJob) -> ArchiveReadOptions<'a> {
 	.with_max_reader_workspace_bytes(job.limits.decoder_memory)
 }
 
-/// The RAR `input` holds, past any self-extracting stub, as a source of its own: rars reads a
-/// seekable source as if the archive started at its start.
+/// The RAR in the input a job puts in `input`, past any self-extracting stub, as a source of its
+/// own: rars reads a seekable source as if the archive started at its start.
 struct Shifted {
-	inner: CachedInput<'static>,
-	/// Where the archive starts in `inner`.
+	input: Arc<Mutex<Option<CachedInput<'static>>>>,
+	/// The archive's file's length.
+	len: u64,
+	/// Where the archive starts in it.
 	offset: u64,
 }
 
 impl ByteSource for Shifted {
 	fn len(&self) -> u64 {
-		self.inner.len() - self.offset
+		self.len - self.offset
 	}
 
 	fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
-		match offset.checked_add(self.offset) {
-			Some(at) => self.inner.read_at(at, buf),
-			None => Ok(0),
+		let Some(at) = offset.checked_add(self.offset) else {
+			return Ok(0);
+		};
+		let mut input = self.input.lock().unwrap_or_else(PoisonError::into_inner);
+		match input.as_mut() {
+			Some(input) => input.read_at(at, buf),
+			None => Err(io::Error::other("no archive job reads the RAR")),
 		}
 	}
 }
@@ -156,41 +193,72 @@ impl ByteSource for Shifted {
 /// Where the RAR in `input` starts: at its start, or after a self-extracting stub of at most
 /// rars' scan limit, which only the archive's name made it look for.
 fn archive_start(input: &mut CachedInput<'static>) -> Result<u64, Error> {
-	let scan = usize::try_from(input.len().min(rars::SFX_SCAN_LIMIT as u64))
-		.expect("the scan limit fits in memory");
-	let mut head = vec![0u8; scan];
-	let mut filled = 0;
-	while filled < scan {
-		let read = input
-			.read_at(filled as u64, &mut head[filled..])
-			.map_err(read_failure)?;
-		if read == 0 {
-			break;
+	let limit = input.len().min(rars::SFX_SCAN_LIMIT as u64);
+	let mut head = Vec::new();
+	// the archive's first chunk, then the rest of the scan only when a stub precedes the RAR
+	for scan in [limit.min(CHUNK_SIZE as u64), limit] {
+		let scan = usize::try_from(scan).expect("the scan limit fits in memory");
+		let mut filled = head.len();
+		head.resize(scan, 0);
+		while filled < scan {
+			let read = input
+				.read_at(filled as u64, &mut head[filled..])
+				.map_err(read_failure)?;
+			if read == 0 {
+				break;
+			}
+			filled += read;
 		}
-		filled += read;
+		head.truncate(filled);
+		if let Some(signature) = rars::find_archive_start(&head, rars::SFX_SCAN_LIMIT) {
+			return Ok(signature.offset as u64);
+		}
 	}
-	head.truncate(filled);
-	rars::find_archive_start(&head, rars::SFX_SCAN_LIMIT)
-		.map(|signature| signature.offset as u64)
-		.ok_or_else(|| {
-			Error::custom(
-				ErrorKind::ArchiveUnsupported,
-				"the file is not an archive the SDK can extract",
-			)
-		})
+	Err(Error::custom(
+		ErrorKind::ArchiveUnsupported,
+		"the file is not an archive the SDK can extract",
+	))
 }
 
-/// Parses the RAR `input` reads, through the driver; where it starts in `input` too.
-fn parse(input: CachedInput<'_>, job: &StreamJob) -> Result<(Archive, u64), Error> {
+/// A parse of the RAR `input` reads, through the driver.
+struct Parsed {
+	archive: Archive,
+	/// Where the archive starts in its file.
+	offset: u64,
+	/// What rars reads it through, holding `input` until the job empties it.
+	input: Arc<Mutex<Option<CachedInput<'static>>>>,
+}
+
+impl Parsed {
+	/// The parse, to be held once its job is done with it.
+	fn held(self) -> HeldRar {
+		*self.input.lock().unwrap_or_else(PoisonError::into_inner) = None;
+		HeldRar {
+			archive: self.archive,
+			input: self.input,
+			busy: Mutex::new(()),
+		}
+	}
+}
+
+/// Parses the RAR `input` reads, through the driver.
+fn parse(input: CachedInput<'_>, job: &StreamJob) -> Result<Parsed, Error> {
 	let mut input = input.into_owned();
 	let offset = archive_start(&mut input)?;
+	let len = input.len();
+	let input = Arc::new(Mutex::new(Some(input)));
 	let source = SeqReader::new(Box::new(Shifted {
-		inner: input,
+		input: Arc::clone(&input),
+		len,
 		offset,
 	}));
 	let archive = rars::ArchiveReader::read_reader_with_options(source, read_options(job))
 		.map_err(|error| rar_error(&error))?;
-	Ok((archive, offset))
+	Ok(Parsed {
+		archive,
+		offset,
+		input,
+	})
 }
 
 /// What `archive`'s headers say of its members, `offset` bytes into its file; a multi-volume
@@ -279,6 +347,7 @@ fn table_of(archive: &Archive, offset: u64) -> Result<RarTable, Error> {
 		});
 	}
 	Ok(RarTable {
+		parsed: None,
 		version,
 		headers_encrypted,
 		solid: table
@@ -323,19 +392,29 @@ pub(super) fn extract_rar(
 	job: &StreamJob,
 	held: Option<&RarTable>,
 ) -> Result<ArchiveEnd, Error> {
-	if let Some(table) = held
-		&& walk.listing()
-	{
-		return list_rar(walk, table, job);
+	if let Some(table) = held {
+		if walk.listing() {
+			return list_rar(walk, table, job);
+		}
+		if let Some(parsed) = &table.parsed
+			&& let Ok(_busy) = parsed.busy.try_lock()
+		{
+			*parsed.input.lock().unwrap_or_else(PoisonError::into_inner) = Some(input.into_owned());
+			let end = decode_rar(walk, &parsed.archive, table, job);
+			// the held parse keeps nothing of this job
+			*parsed.input.lock().unwrap_or_else(PoisonError::into_inner) = None;
+			return end;
+		}
 	}
-	let (archive, offset) = parse(input, job)?;
-	let table = table_of(&archive, offset)?;
+	let parsed = parse(input, job)?;
+	let mut table = table_of(&parsed.archive, parsed.offset)?;
 	let end = if walk.listing() {
 		list_rar(walk, &table, job)?
 	} else {
-		decode_rar(walk, &archive, &table, job)?
+		decode_rar(walk, &parsed.archive, &table, job)?
 	};
 	if held.is_none() && matches!(job.index, IndexUse::ReadAndReturn) {
+		table.parsed = Some(parsed.held());
 		walk.port
 			.send(WorkerEvent::Indexed(Box::new(HeldIndex::Rar(table))))
 			.map_err(read_failure)?;
@@ -343,10 +422,12 @@ pub(super) fn extract_rar(
 	Ok(end)
 }
 
-/// Opens a RAR for a reader: its table, entries unread.
+/// Opens a RAR for a reader: its table, entries unread, with the parse it was made from.
 pub(super) fn open_rar(input: CachedInput<'_>, job: &StreamJob) -> Result<RarTable, Error> {
-	let (archive, offset) = parse(input, job)?;
-	table_of(&archive, offset)
+	let parsed = parse(input, job)?;
+	let mut table = table_of(&parsed.archive, parsed.offset)?;
+	table.parsed = Some(parsed.held());
+	Ok(table)
 }
 
 /// The RAR listed from its table.

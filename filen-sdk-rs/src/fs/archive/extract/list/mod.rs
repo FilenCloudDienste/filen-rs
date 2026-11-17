@@ -557,6 +557,7 @@ pub(crate) async fn run_list(task: ListTask) -> Result<Listed, ListFailed> {
 			reading: ListPhase::Reading,
 			name: ListReport::NAME,
 			chunks,
+			read_end: None,
 		},
 		start,
 	)

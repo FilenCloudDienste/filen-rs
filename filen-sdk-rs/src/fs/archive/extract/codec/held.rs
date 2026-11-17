@@ -17,7 +17,7 @@ pub(crate) enum HeldIndex {
 	Zip(ZipIndex),
 	/// A tar's, which a codec job cannot start from: a tar is read from its start.
 	Tar(TarTable),
-	/// A RAR's, which a listing is made from; a job that decodes parses the RAR again.
+	/// A RAR's, with rars' parse of it, which a later job decodes through.
 	Rar(RarTable),
 	SevenZ {
 		index: SevenZIndex,
@@ -36,6 +36,48 @@ impl HeldIndex {
 			Self::Rar(table) => table.heap_bytes(),
 			Self::SevenZ { index, keys } => index.heap_bytes().saturating_add(keys.heap_bytes()),
 		}
+	}
+
+	/// Where in the archive the data of the members `ordinals` ends, when the index says for
+	/// each of them: a job that reads only them needs nothing past it. `None` for a tar, whose
+	/// offsets a compressed one counts in what it decodes to, and for a member the index places
+	/// nowhere.
+	pub(crate) fn data_end(&self, ordinals: &[u64]) -> Option<u64> {
+		let mut end = 0u64;
+		for &ordinal in ordinals {
+			let member_end = match self {
+				Self::Zip(index) => index
+					.entries
+					.iter()
+					.find(|entry| entry.ordinal == ordinal)
+					.map(|entry| index.shift.saturating_add(entry.data_limit))?,
+				Self::SevenZ { index, .. } => {
+					let entry = index
+						.entries
+						.get(usize::try_from(ordinal).ok()?)
+						.filter(|entry| entry.ordinal == ordinal)?;
+					match &entry.stream {
+						// an empty file, which no folder stores
+						None => 0,
+						Some(stream) => {
+							let folder = index.folders.get(stream.folder)?;
+							let last = folder.first_pack + folder.packed.len().checked_sub(1)?;
+							index
+								.pack_offsets
+								.get(last)?
+								.saturating_add(*index.pack_sizes.get(last)?)
+						}
+					}
+				}
+				Self::Rar(table) => {
+					let member = table.members.get(usize::try_from(ordinal).ok()?)?;
+					member.data.as_ref()?.end
+				}
+				Self::Tar(_) => return None,
+			};
+			end = end.max(member_end);
+		}
+		Some(end)
 	}
 }
 
@@ -67,4 +109,14 @@ pub(crate) enum IndexUse {
 	/// An earlier job on the same archive, under the same password, read it: the job reads
 	/// neither the head nor the index, and starts at its entries.
 	Held(Arc<HeldIndex>),
+}
+
+impl IndexUse {
+	/// [`HeldIndex::data_end`] of a held index; `None` for an index the job reads itself.
+	pub(crate) fn data_end(&self, ordinals: &[u64]) -> Option<u64> {
+		match self {
+			Self::Held(index) => index.data_end(ordinals),
+			Self::Read | Self::ReadAndReturn => None,
+		}
+	}
 }

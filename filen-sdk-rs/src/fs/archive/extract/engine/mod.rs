@@ -348,6 +348,7 @@ pub(crate) async fn run_extract<B: DisposalBackend>(
 			reading: ExtractPhase::Scanning,
 			name: ExtractReport::NAME,
 			chunks: None,
+			read_end: None,
 		},
 		start,
 	)

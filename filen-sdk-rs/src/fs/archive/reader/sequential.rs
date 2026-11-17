@@ -126,6 +126,7 @@ impl Reader {
 			control: _,
 		} = self.read_job(control.clone());
 		let reporter = EntryDownloadReporter::new(callback, source.len());
+		let read_end = index.data_end(selection.ordinals());
 		let task = Task::Download {
 			selection,
 			max_solid_skip,
@@ -146,6 +147,7 @@ impl Reader {
 				reading: EntryDownloadPhase::Reading,
 				name: EntriesReadReport::NAME,
 				chunks,
+				read_end,
 			},
 			start,
 		)
