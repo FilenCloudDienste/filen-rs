@@ -2,6 +2,7 @@
 //! encryption (ZipCrypto, read only: it is broken, and the SDK never writes it).
 
 use std::{
+	fmt,
 	io::{self, Read, Take, Write},
 	mem,
 };
@@ -9,7 +10,7 @@ use std::{
 use aes_gcm::aes::{Aes128, Aes192, Aes256};
 use ctr::{
 	Ctr128LE,
-	cipher::{KeyIvInit, StreamCipher},
+	cipher::{KeyIvInit, StreamCipher, StreamCipherSeek},
 };
 use filen_macros::js_type;
 use filen_types::error::ConversionError;
@@ -305,7 +306,90 @@ impl<W: Write> Write for AesWriter<W> {
 	}
 }
 
+/// WinZip AES's keystream for an entry, to decrypt its data from any offset: a range read never
+/// checks the authentication code, which covers the whole entry.
+pub(crate) struct AesStream(Cipher);
+
+impl fmt::Debug for AesStream {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		f.write_str("AesStream(..)")
+	}
+}
+
+impl AesStream {
+	/// The keystream of the entry whose `salt` and password `verifier` these are, under
+	/// `password`; a wrong password fails the verifier.
+	pub(crate) fn open(
+		password: &ArchivePassword,
+		strength: AesStrength,
+		salt: &[u8],
+		verifier: [u8; 2],
+	) -> Result<Self, CryptoError> {
+		let keys = derive(password, salt, strength);
+		if keys.verifier != verifier {
+			return Err(CryptoError::WrongPassword);
+		}
+		Ok(Self(keys.cipher))
+	}
+
+	/// Decrypts `data`, which starts `offset` bytes into the entry's encrypted data.
+	pub(crate) fn decrypt_at(&mut self, offset: u64, data: &mut [u8]) {
+		match &mut self.0 {
+			Cipher::Aes128(cipher) => cipher.seek(offset),
+			Cipher::Aes192(cipher) => cipher.seek(offset),
+			Cipher::Aes256(cipher) => cipher.seek(offset),
+		}
+		self.0.apply(data);
+	}
+}
+
+/// ZipCrypto's state after some of an entry's data, to go on decrypting from there.
+#[derive(Clone)]
+pub(crate) struct ZipCryptoState(CryptoKeys);
+
+impl fmt::Debug for ZipCryptoState {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		f.write_str("ZipCryptoState(..)")
+	}
+}
+
+impl ZipCryptoState {
+	/// The state after the entry's 12-byte encryption `header` under `password`; `check` is
+	/// what its last byte decrypts to under the right one (see [`ZipCryptoReader::new`]).
+	pub(crate) fn open(
+		password: &ArchivePassword,
+		header: &[u8; ZIP_CRYPTO_HEADER_LEN],
+		check: u8,
+	) -> Result<Self, CryptoError> {
+		let mut keys = CryptoKeys::new(password.as_bytes());
+		let mut last = 0;
+		for &byte in header {
+			last = keys.decrypt(byte);
+		}
+		if last != check {
+			return Err(CryptoError::WrongPassword);
+		}
+		Ok(Self(keys))
+	}
+
+	/// Decrypts `data` with a copy of the state, leaving the state as it is.
+	pub(crate) fn decrypted(&self, data: &mut [u8]) {
+		let mut keys = self.0.clone();
+		for byte in data {
+			*byte = keys.decrypt(*byte);
+		}
+	}
+
+	/// Moves the state past `plain`, the decrypted bytes that come next.
+	pub(crate) fn advance(&mut self, plain: &[u8]) {
+		for &byte in plain {
+			self.0.update(byte);
+		}
+	}
+}
+
 /// The three keys of ZipCrypto.
+#[derive(Clone)]
 struct CryptoKeys([u32; 3]);
 
 impl CryptoKeys {

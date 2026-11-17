@@ -5,6 +5,7 @@
 
 #![warn(unreachable_pub, unused_qualifications)]
 
+mod inflate;
 mod sequential;
 mod slice;
 
@@ -37,9 +38,10 @@ use crate::{
 		file::{enums::RemoteFileType, traits::HasFileInfo},
 	},
 	job::{JobControl, report::JobFailed},
-	util::MaybeSend,
+	util::{MaybeSend, SeededMap},
 };
 
+pub(crate) use inflate::{Seeks, StreamKey};
 pub use sequential::{EntriesReadFailed, EntriesReadReport};
 pub use slice::EntryByteAccess;
 pub(crate) use slice::Resolved;
@@ -128,13 +130,13 @@ impl ArchiveReader {
 	}
 
 	/// How `entry`'s bytes can be read (see [`EntryByteAccess`]): resolved from the index the
-	/// reader holds (for a stored zip entry, reading its local header too, through the chunks
-	/// the reader keeps), then kept with the index. Fails as
+	/// reader holds (for a zip entry read by range, reading its local header too, through the
+	/// chunks the reader keeps), then kept with the index. Fails as
 	/// [`ArchiveReader::download_entry`] does, for an entry of another archive, one not in this
 	/// one, a directory or link, or one an extraction would skip. A bare tar's file members are
 	/// `Mapped` once a listing found where they lie (the reader lists the tar for it when it
-	/// holds no listing); a compressed tar's members and a single compressed file are
-	/// `Sequential`.
+	/// holds no listing), and a gzip tar's are `Seekable`; the members of a tar compressed
+	/// otherwise and a single compressed file are `Sequential`.
 	pub async fn entry_byte_access(
 		&self,
 		entry: ArchiveEntryId,
@@ -142,13 +144,19 @@ impl ArchiveReader {
 		self.reader.entry_byte_access(entry).await
 	}
 
-	/// Writes bytes `start..end` of `entry`, which has to be
-	/// [`EntryByteAccess::Mapped`], to `writer`, then closes `writer`. Only the archive's
-	/// chunks the range lies in are read, a few ahead while the client's file-IO budget has room
-	/// for them, and those the reader keeps not at all; no job slot is taken. The bytes are not
-	/// checked against the entry's checksum, which covers it whole. Fails with
-	/// [`ErrorKind::InvalidState`] for a range past the entry's end or an entry not mapped;
-	/// dropping the future stops the read.
+	/// Writes bytes `start..end` of `entry`, which has to be [`EntryByteAccess::Mapped`] or
+	/// [`EntryByteAccess::Seekable`], to `writer`, then closes `writer`. A mapped entry's range
+	/// reads only the archive's chunks it lies in, a few ahead while the client's file-IO budget
+	/// has room for them, and those the reader keeps not at all. A seekable one is decoded from
+	/// where the read of it before stopped, or from the nearest checkpoint before `start`, in
+	/// steps of at most 1 MiB of output on the CPU pool; reads of one entry run one at a time,
+	/// and the reader keeps the decoder state of the two entries read by range last. No job slot
+	/// is taken. The bytes are not checked against the entry's checksum, which covers it whole.
+	/// Fails with [`ErrorKind::InvalidState`] for a range past the entry's end or an entry read
+	/// only whole, and with
+	/// [`ErrorKind::ArchiveWrongPassword`](crate::ErrorKind::ArchiveWrongPassword) when an
+	/// encrypted entry's password check fails (ZipCrypto's lets 1 wrong password in 256 through,
+	/// whose ranges then decode as damage or noise). Dropping the future stops the read.
 	pub async fn read_entry_range<W>(
 		&self,
 		entry: ArchiveEntryId,
@@ -253,6 +261,8 @@ pub(crate) struct Reader<B> {
 	format: Mutex<Option<ArchiveFormat>>,
 	/// What it keeps between its calls; `None` for a reader of one call, which keeps nothing.
 	retained: Option<Arc<Retained>>,
+	/// One lock per stream read by range, so its reads decode one at a time.
+	flights: Mutex<SeededMap<StreamKey, Arc<tokio::sync::Mutex<()>>>>,
 	closed: AtomicBool,
 }
 
@@ -287,6 +297,7 @@ impl<B: DriveBackend> Reader<B> {
 			settings,
 			format: Mutex::new(None),
 			retained: None,
+			flights: Mutex::default(),
 			closed: AtomicBool::new(false),
 		}
 	}
@@ -312,6 +323,19 @@ impl<B: DriveBackend> Reader<B> {
 		if let Some(retained) = &self.retained {
 			retained.close();
 		}
+	}
+
+	/// The lock reads of `key` take, so they decode one at a time; one waiting goes on from
+	/// where the one before it parked its cursor.
+	pub(crate) fn flight(&self, key: StreamKey) -> Arc<tokio::sync::Mutex<()>> {
+		let mut flights = self.flights.lock().unwrap_or_else(PoisonError::into_inner);
+		// the locks no read holds or waits on go
+		flights.retain(|_, flight| Arc::strong_count(flight) > 1);
+		Arc::clone(flights.entry(key).or_default())
+	}
+
+	pub(crate) fn archive_uuid(&self) -> Uuid {
+		self.archive.uuid()
 	}
 
 	/// The error of a call on a closed reader.
@@ -455,9 +479,9 @@ impl<B: DriveBackend> Reader<B> {
 					.await
 					.map(|()| size)
 			}
-			Ok(Resolved::Whole { .. } | Resolved::Sequential { .. }) => {
-				Err(Arc::new(EntryDownloadError::NotIndexed.into()))
-			}
+			Ok(
+				Resolved::Seekable { .. } | Resolved::Whole { .. } | Resolved::Sequential { .. },
+			) => Err(Arc::new(EntryDownloadError::NotIndexed.into())),
 			Err(error) => Err(error),
 		};
 		match read {

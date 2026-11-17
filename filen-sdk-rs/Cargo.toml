@@ -24,6 +24,7 @@ wasm-full = ["multi-threaded-crypto", "archive"]
 archive = [
 	"dep:tar",
 	"dep:flate2",
+	"dep:miniz_oxide",
 	"dep:bzip2",
 	"dep:lzma-rust2",
 	"dep:lz4_flex",
@@ -276,6 +277,10 @@ tar = { version = "0.4.46", default-features = false, optional = true }
 flate2 = { version = "1.1", default-features = false, features = [
 	"rust_backend",
 ], optional = true }
+# The seekable inflate an entry read by range goes through: its core decompressor's state can be
+# cloned at a checkpoint, which flate2 does not expose. Pinned to the version flate2 brings in
+# already, so the build holds one copy.
+miniz_oxide = { version = "=0.8.9", optional = true }
 bzip2 = { version = "0.6", optional = true }
 lzma-rust2 = { version = "0.21", default-features = false, features = [
 	"std",

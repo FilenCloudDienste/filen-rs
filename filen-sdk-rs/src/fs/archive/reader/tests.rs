@@ -1,6 +1,6 @@
 //! Readers against the fake drive, with the real codec on its thread.
 
-use std::sync::Arc;
+use std::{io::Write, sync::Arc};
 
 use filen_types::fs::Uuid;
 
@@ -16,7 +16,7 @@ use crate::{
 				TarMember, archive_password, gzip, incompressible, sevenz_of, tar_of, tar_with,
 			},
 			zip::{
-				crypto::AesStrength,
+				crypto::{AesStrength, test_support::zip_crypto_encrypt},
 				write::{Encryption, ZipMethod, ZipWriter},
 			},
 		},
@@ -383,20 +383,18 @@ async fn a_zips_entries_are_mapped_only_when_stored_as_they_are() {
 	);
 	assert_eq!(
 		access(1).await.unwrap(),
-		EntryByteAccess::Whole { size: 5000 }
+		EntryByteAccess::Seekable { size: 5000 }
 	);
 	assert_eq!(
 		access(2).await.unwrap(),
-		EntryByteAccess::Whole { size: 5000 }
+		EntryByteAccess::Seekable { size: 5000 }
 	);
 	assert_eq!(access(3).await.unwrap_err().kind(), ErrorKind::InvalidState);
 	assert_eq!(access(4).await.unwrap_err().kind(), ErrorKind::InvalidState);
 	assert_eq!(access(9).await.unwrap_err().kind(), ErrorKind::InvalidState);
 	assert_eq!(range(&reader, 0, 0, 5000).await.unwrap(), data);
-	assert_eq!(
-		range(&reader, 1, 0, 1).await.unwrap_err().kind(),
-		ErrorKind::InvalidState
-	);
+	assert_eq!(range(&reader, 1, 0, 5000).await.unwrap(), data);
+	assert_eq!(range(&reader, 2, 10, 20).await.unwrap(), data[10..20]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -558,17 +556,14 @@ async fn a_tar_readers_listing_seeks_past_member_data() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_compressed_tars_members_are_read_in_order_at_their_listed_sizes() {
+async fn a_gzip_tars_members_are_seekable_at_their_listed_sizes() {
 	let tar = tar_with(&[TarMember::Data("a.txt", b"alpha")]);
 	let (_, reader) = opened("t.tar.gz", gzip(&tar), None).await;
 	assert_eq!(
 		reader.entry_byte_access(entry(0)).await.unwrap(),
-		EntryByteAccess::Sequential { size: Some(5) }
+		EntryByteAccess::Seekable { size: 5 }
 	);
-	assert_eq!(
-		range(&reader, 0, 0, 1).await.unwrap_err().kind(),
-		ErrorKind::InvalidState
-	);
+	assert_eq!(range(&reader, 0, 1, 5).await.unwrap(), b"lpha");
 }
 
 /// What a pass wrote, by entry, in the order the writers were asked for.
@@ -736,4 +731,258 @@ async fn a_bare_tars_members_are_read_as_ranges_with_no_job() {
 	let (result, written) = read_entries(&reader, &[1], None).await;
 	result.unwrap();
 	assert_eq!(written[0].2, big);
+}
+
+/// Bytes deflate about halves: letters of a 16-letter alphabet, by xorshift from `seed`.
+fn text(len: usize, seed: u64) -> Vec<u8> {
+	incompressible(len, seed)
+		.into_iter()
+		.map(|byte| b'a' + (byte & 0x0F))
+		.collect()
+}
+
+/// Ranges of an entry of `len` bytes to check: its ends, around chunk and window boundaries,
+/// and some by xorshift from `seed`.
+fn ranges(len: u64, seed: u64) -> Vec<(u64, u64)> {
+	let mut ranges = vec![(0, 1), (len - 1, len), (0, len), (len / 2, len / 2)];
+	for at in [CHUNK_SIZE_U64, 32 << 10, 4 << 20] {
+		if at + 10 <= len {
+			ranges.push((at - 10, at + 10));
+		}
+	}
+	let mut state = seed;
+	let mut next = || {
+		state ^= state << 13;
+		state ^= state >> 7;
+		state ^= state << 17;
+		state
+	};
+	for _ in 0..12 {
+		let start = next() % len;
+		let end = (start + next() % (len - start + 1)).min(len);
+		ranges.push((start, end));
+	}
+	ranges
+}
+
+async fn check_ranges(reader: &Reader<FakeBackend>, index: u32, data: &[u8], seed: u64) {
+	assert_eq!(
+		reader.entry_byte_access(entry(index)).await.unwrap(),
+		EntryByteAccess::Seekable {
+			size: data.len() as u64
+		}
+	);
+	for (start, end) in ranges(data.len() as u64, seed) {
+		let (from, to) = (
+			usize::try_from(start).unwrap(),
+			usize::try_from(end).unwrap(),
+		);
+		let read = range(reader, index, start, end).await.unwrap();
+		assert!(read == data[from..to], "{start}..{end}");
+	}
+}
+
+/// A zip of `files`, each ZipCrypto-encrypted under `password`, stored or deflated, built by
+/// hand: no writer the tests have writes ZipCrypto.
+fn zip_crypto_zip(files: &[(&str, &[u8], bool)], password: &[u8]) -> Vec<u8> {
+	let mut zip = Vec::new();
+	let mut central = Vec::new();
+	for (name, data, deflate) in files {
+		let crc = crc32fast::hash(data);
+		let packed = if *deflate {
+			let mut encoder =
+				flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+			encoder.write_all(data).unwrap();
+			encoder.finish().unwrap()
+		} else {
+			data.to_vec()
+		};
+		let stored = zip_crypto_encrypt(password, (crc >> 24) as u8, &packed);
+		let offset = u32::try_from(zip.len()).unwrap();
+		let method: u16 = if *deflate { 8 } else { 0 };
+		let common = [
+			&20u16.to_le_bytes()[..],
+			&1u16.to_le_bytes(),
+			&method.to_le_bytes(),
+			&0u16.to_le_bytes(),
+			&0x21u16.to_le_bytes(),
+			&crc.to_le_bytes(),
+			&u32::try_from(stored.len()).unwrap().to_le_bytes(),
+			&u32::try_from(data.len()).unwrap().to_le_bytes(),
+			&u16::try_from(name.len()).unwrap().to_le_bytes(),
+			&0u16.to_le_bytes(),
+		]
+		.concat();
+		zip.extend(0x0403_4b50u32.to_le_bytes());
+		zip.extend(&common);
+		zip.extend(name.as_bytes());
+		zip.extend(&stored);
+		central.extend(0x0201_4b50u32.to_le_bytes());
+		central.extend(20u16.to_le_bytes());
+		central.extend(&common);
+		central.extend([0u8; 10]);
+		central.extend(offset.to_le_bytes());
+		central.extend(name.as_bytes());
+	}
+	let central_at = u32::try_from(zip.len()).unwrap();
+	let count = u16::try_from(files.len()).unwrap().to_le_bytes();
+	zip.extend(&central);
+	zip.extend(0x0605_4b50u32.to_le_bytes());
+	zip.extend([0u8; 4]);
+	zip.extend(count);
+	zip.extend(count);
+	zip.extend(u32::try_from(central.len()).unwrap().to_le_bytes());
+	zip.extend(central_at.to_le_bytes());
+	zip.extend([0u8; 2]);
+	zip
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_deflated_zip_entry_reads_any_range_as_a_full_decode_does() {
+	let data = text(9 << 20, 5);
+	let zip = zip_with(&[
+		(
+			"small",
+			b"hello hello hello",
+			ZipMethod::Deflate { level: 6 },
+			None,
+		),
+		("big", &data, ZipMethod::Deflate { level: 6 }, None),
+	]);
+	let (_, reader) = opened("z.zip", zip, None).await;
+	check_ranges(&reader, 1, &data, 11).await;
+	assert_eq!(range(&reader, 0, 6, 11).await.unwrap(), b"hello");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn encrypted_zip_entries_read_by_range_under_their_password() {
+	let data = text(3 << 20, 6);
+	let zip = zip_with(&[
+		(
+			"deflated",
+			&data,
+			ZipMethod::Deflate { level: 6 },
+			Some("pw"),
+		),
+		("stored", &data, ZipMethod::Stored, Some("pw")),
+	]);
+	let (_, reader) = opened("aes.zip", zip.clone(), Some("pw")).await;
+	check_ranges(&reader, 0, &data, 21).await;
+	check_ranges(&reader, 1, &data, 22).await;
+	let (_, wrong) = opened("aes.zip", zip, Some("nope")).await;
+	assert_eq!(
+		range(&wrong, 0, 0, 1).await.unwrap_err().kind(),
+		ErrorKind::ArchiveWrongPassword
+	);
+	let crypto = zip_crypto_zip(
+		&[("deflated", &data, true), ("stored", &data, false)],
+		b"pw",
+	);
+	let (_, reader) = opened("zc.zip", crypto, Some("pw")).await;
+	check_ranges(&reader, 0, &data, 31).await;
+	check_ranges(&reader, 1, &data, 32).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reading_on_in_windows_decodes_the_entry_about_once() {
+	let data = text(12 << 20, 7);
+	let zip = zip_with(&[("big", &data, ZipMethod::Deflate { level: 6 }, None)]);
+	let (_, reader) = opened("z.zip", zip, None).await;
+	let len = data.len() as u64;
+	let window = 300 << 10;
+	let mut at = 0;
+	while at < len {
+		let end = (at + window).min(len);
+		let read = range(&reader, 0, at, end).await.unwrap();
+		assert!(read == data[usize::try_from(at).unwrap()..usize::try_from(end).unwrap()]);
+		at = end;
+	}
+	let retained = reader.retained.as_ref().unwrap();
+	let seeks = retained.take_seeks(StreamKey::Entry(0)).unwrap();
+	assert_eq!(seeks.decoded_for_test(), len);
+	// checkpoints were laid on the way, every 4 MiB at the first call boundary past it
+	let laid = seeks.checkpoints_for_test();
+	assert_eq!(laid.len(), 2, "{laid:?}");
+	for (at, laid) in laid.iter().enumerate() {
+		let spacing = (at as u64 + 1) * (4 << 20);
+		assert!((spacing..spacing + (64 << 10)).contains(laid), "{laid}");
+	}
+	retained.keep_seeks(StreamKey::Entry(0), seeks);
+	// a jump back starts at the checkpoint before it
+	let start = (8 << 20) + 5;
+	range(&reader, 0, start, start + 10).await.unwrap();
+	let seeks = retained.take_seeks(StreamKey::Entry(0)).unwrap();
+	assert!(seeks.decoded_for_test() < len + (1 << 20));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn checkpoints_are_thinned_once_they_take_too_much() {
+	let data = text(3 << 20, 8);
+	let zip = zip_with(&[("big", &data, ZipMethod::Deflate { level: 6 }, None)]);
+	let (_, reader) = opened("z.zip", zip, None).await;
+	let retained = reader.retained.as_ref().unwrap();
+	retained.keep_seeks(
+		StreamKey::Entry(0),
+		Seeks::with_limits(64 << 10, 4 * inflate::CURSOR_BYTES),
+	);
+	let len = data.len() as u64;
+	range(&reader, 0, len - 1, len).await.unwrap();
+	let seeks = retained.take_seeks(StreamKey::Entry(0)).unwrap();
+	let laid = seeks.checkpoints_for_test();
+	assert!(laid.len() <= 4, "{laid:?}");
+	assert!(laid.len() >= 2, "{laid:?}");
+	assert!(
+		laid.windows(2).all(|pair| pair[1] - pair[0] >= 1 << 20),
+		"{laid:?}"
+	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_reads_of_one_entry_at_once_both_get_their_bytes() {
+	let data = text(4 << 20, 9);
+	let zip = zip_with(&[("big", &data, ZipMethod::Deflate { level: 6 }, None)]);
+	let (_, reader) = opened("z.zip", zip, None).await;
+	let (a, b) = tokio::join!(
+		range(&reader, 0, 1 << 20, 2 << 20),
+		range(&reader, 0, 3 << 20, 4 << 20)
+	);
+	assert!(a.unwrap() == data[1 << 20..2 << 20]);
+	assert!(b.unwrap() == data[3 << 20..4 << 20]);
+}
+
+/// A gzip member of `data`, its header carrying every optional field.
+fn gzip_member(data: &[u8]) -> Vec<u8> {
+	let mut member = vec![0x1F, 0x8B, 8, 2 | 4 | 8 | 16, 0, 0, 0, 0, 0, 3];
+	member.extend(3u16.to_le_bytes());
+	member.extend(b"xyz");
+	member.extend(b"name.tar\0");
+	member.extend(b"a comment\0");
+	// the header's CRC-16: the low half of its CRC-32
+	let header_crc = crc32fast::hash(&member).to_le_bytes();
+	member.extend(&header_crc[..2]);
+	let mut encoder = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::fast());
+	encoder.write_all(data).unwrap();
+	member.extend(encoder.finish().unwrap());
+	member.extend(crc32fast::hash(data).to_le_bytes());
+	member.extend(u32::try_from(data.len()).unwrap().to_le_bytes());
+	member
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_gzip_tars_members_read_by_range_across_its_members() {
+	let big = text(3 << 20, 10);
+	let tar = tar_with(&[
+		TarMember::Data("a.txt", b"alpha"),
+		TarMember::Data("big.bin", &big),
+		TarMember::Data("c.txt", b"gamma"),
+	]);
+	// two members, split inside the big file, and padding after them
+	let split = 2 << 20;
+	let mut gz = gzip_member(&tar[..split]);
+	gz.extend(gzip_member(&tar[split..]));
+	gz.extend([0u8; 16]);
+	let (_, reader) = opened("t.tar.gz", gz, None).await;
+	check_ranges(&reader, 1, &big, 41).await;
+	assert_eq!(range(&reader, 2, 0, 5).await.unwrap(), b"gamma");
+	assert_eq!(range(&reader, 0, 0, 5).await.unwrap(), b"alpha");
 }

@@ -19,11 +19,11 @@ use crate::{
 				ArchiveEntryId, EntryDownloadError, ExtractSkipReason, codec::HeldIndex,
 				path_refusal,
 			},
-			format::ArchiveFormat,
+			format::{ArchiveFormat, StreamCodec},
 			input::{PREFETCH_CHUNKS, take_memory, whole_chunk},
 			sevenz::read::{Method, SevenZIndex, SevenZKind},
 			zip::{
-				LOCAL_HEADER_SIG, METHOD_STORED,
+				LOCAL_HEADER_SIG, METHOD_DEFLATE, METHOD_STORED,
 				read::{LOCAL_HEADER_LEN, LOCAL_HEADER_LEN_U64, ZipEncryption, ZipIndex, ZipKind},
 			},
 		},
@@ -34,7 +34,10 @@ use crate::{
 	util::{MaybeSend, MaybeSendBoxFuture},
 };
 
-use super::{Reader, Unreported};
+use super::{
+	Reader, Unreported,
+	inflate::{CipherSpec, Framing, SeekCodec, SeekStream, StreamKey},
+};
 
 /// How an entry's bytes can be read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,6 +52,16 @@ pub enum EntryByteAccess {
 		/// The entry's size in bytes.
 		size: u64,
 	},
+	/// Deflated, or stored under ZipCrypto or WinZip AES (a zip entry), or a member of a gzip
+	/// tar: any range of it is read through a decoder that goes on from where the read before it
+	/// stopped, or from a checkpoint it laid every few MiB of output, so reading on costs about
+	/// the range and a jump back about one checkpoint's spacing. The decoding runs off the
+	/// thread that drives the SDK's tasks, takes no job slot, and is not checked against the
+	/// entry's checksum, which covers the whole entry: a download checks it.
+	Seekable {
+		/// The entry's size in bytes.
+		size: u64,
+	},
 	/// Compressed or encrypted, read whole by
 	/// [`ArchiveReader::download_entry`](super::ArchiveReader::download_entry), which checks it
 	/// against its checksum.
@@ -56,7 +69,8 @@ pub enum EntryByteAccess {
 		/// The entry's size in bytes, as the archive states it.
 		size: u64,
 	},
-	/// A member of a compressed tar, or a single compressed file: only read front to back.
+	/// A member of a tar compressed other than with gzip, or a single compressed file: only
+	/// read front to back.
 	Sequential {
 		/// Its size in bytes, when a listing found it.
 		size: Option<u64>,
@@ -68,6 +82,12 @@ pub enum EntryByteAccess {
 pub(crate) enum Resolved {
 	/// The entry's data starts `offset` bytes into the archive.
 	Mapped {
+		offset: u64,
+		size: u64,
+	},
+	/// The entry is bytes `offset..offset + size` of what `stream` decodes to.
+	Seekable {
+		stream: SeekStream,
 		offset: u64,
 		size: u64,
 	},
@@ -83,23 +103,37 @@ impl From<Resolved> for EntryByteAccess {
 	fn from(resolved: Resolved) -> Self {
 		match resolved {
 			Resolved::Mapped { size, .. } => Self::Mapped { size },
+			Resolved::Seekable { size, .. } => Self::Seekable { size },
 			Resolved::Whole { size } => Self::Whole { size },
 			Resolved::Sequential { size } => Self::Sequential { size },
 		}
 	}
 }
 
-/// How a zip's or 7z's entry is read, from the index alone; a zip's stored entry needs its local
-/// header too (`Mapped` at the header's offset, to be read).
+/// How a zip's or 7z's entry is read, from the index alone; a zip's entry read by range needs its
+/// local header too.
 enum FromIndex {
 	Resolved(Resolved),
-	/// A stored zip entry, whose data follows its local header at `header` (counted from the
-	/// archive's start), and has to end by `limit`.
+	/// A zip entry read by range, whose data follows its local header at `header` (counted from
+	/// the archive's start), and has to end by `limit`.
 	ZipHeader {
 		header: u64,
 		limit: u64,
 		compressed: u64,
 		size: u64,
+		how: ZipRange,
+	},
+}
+
+/// How a zip entry's data is read by range.
+#[derive(Clone, Copy)]
+enum ZipRange {
+	/// As it is stored.
+	Mapped,
+	/// Through a decoder.
+	Seekable {
+		codec: SeekCodec,
+		cipher: CipherSpec,
 	},
 }
 
@@ -131,18 +165,34 @@ fn zip_access(index: &ZipIndex, ordinal: u64) -> Result<FromIndex, Error> {
 	if !entry.supported() {
 		return Err(EntryDownloadError::Skipped(ExtractSkipReason::UnsupportedMethod).into());
 	}
-	if entry.method == METHOD_STORED
-		&& entry.encryption == ZipEncryption::None
-		&& entry.compressed_size == entry.size
-	{
-		return Ok(FromIndex::ZipHeader {
-			header: index.shift.saturating_add(entry.header_offset),
-			limit: index.shift.saturating_add(entry.data_limit),
-			compressed: entry.compressed_size,
-			size: entry.size,
-		});
-	}
-	Ok(FromIndex::Resolved(Resolved::Whole { size: entry.size }))
+	let cipher = match entry.encryption {
+		ZipEncryption::None => CipherSpec::None,
+		ZipEncryption::ZipCrypto { check } => CipherSpec::ZipCrypto { check },
+		ZipEncryption::Aes { strength, .. } => CipherSpec::Aes { strength },
+	};
+	let how = match (entry.method, cipher) {
+		(METHOD_STORED, CipherSpec::None) if entry.compressed_size == entry.size => {
+			ZipRange::Mapped
+		}
+		(METHOD_STORED, CipherSpec::ZipCrypto { .. } | CipherSpec::Aes { .. }) => {
+			ZipRange::Seekable {
+				codec: SeekCodec::Copy,
+				cipher,
+			}
+		}
+		(METHOD_DEFLATE, _) => ZipRange::Seekable {
+			codec: SeekCodec::Deflate,
+			cipher,
+		},
+		_ => return Ok(FromIndex::Resolved(Resolved::Whole { size: entry.size })),
+	};
+	Ok(FromIndex::ZipHeader {
+		header: index.shift.saturating_add(entry.header_offset),
+		limit: index.shift.saturating_add(entry.data_limit),
+		compressed: entry.compressed_size,
+		size: entry.size,
+		how,
+	})
 }
 
 /// What reading `ordinal` of the 7z `index` costs.
@@ -221,23 +271,39 @@ impl<B: DriveBackend> Reader<B> {
 		end: u64,
 		writer: &mut W,
 	) -> Result<(), Arc<Error>> {
-		let (offset, size) = match self.resolve(entry).await? {
-			Resolved::Mapped { offset, size } => (offset, size),
+		let within = |size: u64| {
+			if start > end || end > size {
+				return Err(Arc::new(Error::custom(
+					ErrorKind::InvalidState,
+					format!("the range {start}..{end} is not within the entry's {size} bytes"),
+				)));
+			}
+			Ok(())
+		};
+		match self.resolve(entry).await? {
+			Resolved::Mapped { offset, size } => {
+				within(size)?;
+				self.read_archive(offset + start, offset + end, writer)
+					.await?;
+			}
+			Resolved::Seekable {
+				stream,
+				offset,
+				size,
+			} => {
+				within(size)?;
+				// closes the writer
+				return self
+					.read_seekable(stream, offset + start..offset + end, writer)
+					.await;
+			}
 			Resolved::Whole { .. } | Resolved::Sequential { .. } => {
 				return Err(Arc::new(Error::custom(
 					ErrorKind::InvalidState,
-					"the entry is not stored as it is, so it is only read whole",
+					"the entry is only read whole, or front to back",
 				)));
 			}
-		};
-		if start > end || end > size {
-			return Err(Arc::new(Error::custom(
-				ErrorKind::InvalidState,
-				format!("the range {start}..{end} is not within the entry's {size} bytes"),
-			)));
 		}
-		self.read_archive(offset + start, offset + end, writer)
-			.await?;
 		writer
 			.close()
 			.await
@@ -270,7 +336,26 @@ impl<B: DriveBackend> Reader<B> {
 							limit,
 							compressed,
 							size,
-						} => self.zip_data(header, limit, compressed, size).await?,
+							how,
+						} => {
+							let (offset, compressed) =
+								self.zip_data(header, limit, compressed).await?;
+							match how {
+								ZipRange::Mapped => Resolved::Mapped { offset, size },
+								ZipRange::Seekable { codec, cipher } => Resolved::Seekable {
+									stream: SeekStream {
+										key: StreamKey::Entry(ordinal),
+										start: offset,
+										len: compressed,
+										codec,
+										framing: Framing::Raw,
+										cipher,
+									},
+									offset: 0,
+									size,
+								},
+							}
+						}
 					},
 					HeldIndex::SevenZ { index, .. } => sevenz_access(index, ordinal)?,
 					HeldIndex::Tar(_) => return Err(Arc::new(not_held())),
@@ -290,6 +375,18 @@ impl<B: DriveBackend> Reader<B> {
 							return Err(Arc::new(EntryDownloadError::NotAFile.into()));
 						}
 						(None, Some(offset)) => Resolved::Mapped {
+							offset: offset.get(),
+							size: span.size,
+						},
+						(Some(StreamCodec::Gzip), Some(offset)) => Resolved::Seekable {
+							stream: SeekStream {
+								key: StreamKey::Gzip,
+								start: 0,
+								len: self.archive.size(),
+								codec: SeekCodec::Deflate,
+								framing: Framing::Gzip,
+								cipher: CipherSpec::None,
+							},
 							offset: offset.get(),
 							size: span.size,
 						},
@@ -342,8 +439,7 @@ impl<B: DriveBackend> Reader<B> {
 		header: u64,
 		limit: u64,
 		compressed: u64,
-		size: u64,
-	) -> Result<Resolved, Arc<Error>> {
+	) -> Result<(u64, u64), Arc<Error>> {
 		let corrupt = |what| Arc::new(Error::custom(ErrorKind::ArchiveCorrupt, what));
 		let end = header
 			.checked_add(LOCAL_HEADER_LEN_U64)
@@ -362,13 +458,13 @@ impl<B: DriveBackend> Reader<B> {
 				EntryDownloadError::Skipped(ExtractSkipReason::OverlappingData).into(),
 			));
 		}
-		Ok(Resolved::Mapped { offset, size })
+		Ok((offset, compressed))
 	}
 
 	/// Writes bytes `from..to` of the archive file to `writer`, chunk by chunk: those the reader
 	/// keeps from there, the others fetched a few ahead while the client's file-IO budget has
 	/// room for them, and kept as the ones read last.
-	async fn read_archive<W: AsyncWrite + Unpin + MaybeSend>(
+	pub(super) async fn read_archive<W: AsyncWrite + Unpin + MaybeSend>(
 		&self,
 		from: u64,
 		to: u64,
@@ -418,7 +514,7 @@ impl<B: DriveBackend> Reader<B> {
 	}
 
 	/// Chunk `index` of the archive: kept by the reader, or fetched and kept.
-	fn chunk_for_range(
+	pub(super) fn chunk_for_range(
 		&self,
 		index: u64,
 		permit: Option<OwnedSemaphorePermit>,

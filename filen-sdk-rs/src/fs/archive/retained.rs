@@ -18,7 +18,10 @@ use std::{
 
 use crate::{runtime::spawn_task_maybe_send, util::SeededMap, util::sleep};
 
-use super::{extract::codec::HeldIndex, reader::Resolved};
+use super::{
+	extract::codec::HeldIndex,
+	reader::{Resolved, Seeks, StreamKey},
+};
 
 /// Most heap one reader's index may take and still be held: a larger one is read again by every
 /// job that needs it.
@@ -26,6 +29,9 @@ pub(crate) const MAX_HELD_INDEX_BYTES: u64 = 32 << 20;
 
 /// Chunks of its archive a reader keeps: the two read last.
 pub(crate) const READER_CHUNKS: usize = 2;
+
+/// Streams a reader keeps decoder state for: the two read by range last.
+pub(crate) const READER_SEEKS: usize = 2;
 
 /// How long a reader keeps its chunks once nothing used it.
 pub(crate) const CHUNKS_IDLE_DROP: Duration = Duration::from_secs(30);
@@ -77,7 +83,7 @@ impl RetainedPool {
 				.collect();
 			others.sort_by_key(|holder| holder.used.load(Ordering::Relaxed));
 			'take: for other in &others {
-				for tier in [Tier::Chunks, Tier::Index] {
+				for tier in [Tier::Checkpoints, Tier::Chunks, Tier::Index] {
 					let freed = other.evict(tier);
 					self.charged.fetch_sub(freed, Ordering::AcqRel);
 					if fits(self.charged.load(Ordering::Acquire)) {
@@ -115,6 +121,8 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 /// What a reader keeps, in the order it is given up when room is needed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tier {
+	/// Decoder cursors and their checkpoints.
+	Checkpoints,
 	Chunks,
 	Index,
 }
@@ -138,6 +146,8 @@ struct State {
 	access_bytes: u64,
 	/// Most recently used first.
 	chunks: Vec<(u64, Charged<Arc<Vec<u8>>>)>,
+	/// The decoder state of the streams read by range last, most recently used first.
+	seeks: Vec<(StreamKey, Charged<Box<Seeks>>)>,
 	/// A task drops the chunks once the reader was idle for [`CHUNKS_IDLE_DROP`].
 	sweeping: bool,
 	/// Kept nothing more once closed.
@@ -159,6 +169,7 @@ impl State {
 				.iter()
 				.map(|(_, chunk)| chunk.bytes)
 				.sum::<u64>()
+			+ self.seeks.iter().map(|(_, seeks)| seeks.bytes).sum::<u64>()
 	}
 }
 
@@ -243,6 +254,57 @@ impl Retained {
 		if !kept {
 			self.pool.release(ACCESS_BYTES);
 		}
+	}
+
+	/// Takes what is kept of stream `key`'s decoding, for a read that gives it back once done.
+	pub(crate) fn take_seeks(&self, key: StreamKey) -> Option<Seeks> {
+		self.touch();
+		let mut state = lock(&self.state);
+		let at = state.seeks.iter().position(|(kept, _)| *kept == key)?;
+		let (_, seeks) = state.seeks.remove(at);
+		drop(state);
+		self.pool.release(seeks.bytes);
+		Some(*seeks.value)
+	}
+
+	/// Keeps stream `key`'s decoding as the one used last, giving up the one used longest ago
+	/// when [`READER_SEEKS`] are kept, unless no room can be made for it.
+	pub(crate) fn keep_seeks(&self, key: StreamKey, seeks: Seeks) {
+		self.touch();
+		let bytes = seeks.bytes();
+		let oldest = {
+			let mut state = lock(&self.state);
+			if state.closed {
+				return;
+			}
+			(state.seeks.len() >= READER_SEEKS).then(|| state.seeks.pop())
+		};
+		self.pool
+			.release(oldest.flatten().map_or(0, |(_, oldest)| oldest.bytes));
+		if !self.pool.charge(self, self.budget, bytes) {
+			return;
+		}
+		let mut state = lock(&self.state);
+		if state.closed {
+			drop(state);
+			self.pool.release(bytes);
+			return;
+		}
+		state.seeks.insert(
+			0,
+			(
+				key,
+				Charged {
+					value: Box::new(seeks),
+					bytes,
+				},
+			),
+		);
+		let keep = READER_SEEKS.min(state.seeks.len());
+		let over: Vec<_> = state.seeks.drain(keep..).collect();
+		drop(state);
+		self.pool
+			.release(over.iter().map(|(_, seeks)| seeks.bytes).sum());
 	}
 
 	/// Chunk `index` of the archive, when it is kept.
@@ -332,6 +394,10 @@ impl Retained {
 	fn evict(&self, tier: Tier) -> u64 {
 		let mut state = lock(&self.state);
 		match tier {
+			Tier::Checkpoints => std::mem::take(&mut state.seeks)
+				.iter()
+				.map(|(_, seeks)| seeks.bytes)
+				.sum(),
 			Tier::Chunks => std::mem::take(&mut state.chunks)
 				.iter()
 				.map(|(_, chunk)| chunk.bytes)
@@ -475,6 +541,24 @@ mod tests {
 		assert!(a.index().is_none());
 		assert_eq!(kept(&b), [2, 1]);
 		assert_eq!(pool.charged.load(Ordering::Acquire), 2000 + index_bytes);
+	}
+
+	#[tokio::test]
+	async fn a_readers_decoder_state_goes_before_its_chunks() {
+		let pool = Arc::new(RetainedPool::default());
+		let seeks = Seeks::new().bytes();
+		let budget = seeks + 2000;
+		let (a, b) = (
+			Retained::new(Arc::clone(&pool), budget),
+			Retained::new(Arc::clone(&pool), budget),
+		);
+		a.keep_seeks(StreamKey::Entry(0), Seeks::new());
+		a.keep_chunk(0, chunk(1000));
+		a.keep_chunk(1, chunk(1000));
+		b.keep_chunk(0, chunk(usize::try_from(seeks).unwrap()));
+		assert!(a.take_seeks(StreamKey::Entry(0)).is_none());
+		assert_eq!(kept(&a), [1, 0]);
+		assert_eq!(pool.charged.load(Ordering::Acquire), budget);
 	}
 
 	#[tokio::test]

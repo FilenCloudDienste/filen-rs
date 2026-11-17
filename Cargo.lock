@@ -2339,6 +2339,7 @@ dependencies = [
  "md4",
  "microthumb",
  "mime_guess 2.0.5 (git+https://github.com/abonander/mime_guess?rev=90f3d09696f7c08dcac94ca2bb2a279383bb20ce)",
+ "miniz_oxide",
  "multer",
  "napi",
  "napi-build",
