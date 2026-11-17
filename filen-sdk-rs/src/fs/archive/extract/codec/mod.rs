@@ -156,6 +156,9 @@ pub(crate) fn extract_stream(port: &WorkerPort, job: StreamJob) -> Result<Archiv
 				(walked.unread + trailing, walked.spans)
 			} else {
 				let walked = walk_tar(&mut walk, TarReader::new(source, max), record)?;
+				if walked.stopped {
+					return Ok(ArchiveEnd::plain(0, 0));
+				}
 				let trailing = drain_trailing(walked.rest.0).map_err(read_failure)?;
 				(walked.unread + trailing, walked.spans)
 			};
@@ -185,6 +188,11 @@ pub(crate) fn extract_stream(port: &WorkerPort, job: StreamJob) -> Result<Archiv
 					record,
 				)?;
 				send_table(port, record, walked.spans)?;
+				if walked.stopped {
+					// the stream's own check is at its end, which a download stopping at its
+					// last entry does not reach
+					return Ok(ArchiveEnd::plain(0, walked.files));
+				}
 				let (_, mut decoded) = walked.rest.0.into_inner();
 				// zero blocks after the end-of-archive marker are the usual record padding
 				let tar_trailing = drain_trailing(&mut decoded).map_err(read_failure)?;

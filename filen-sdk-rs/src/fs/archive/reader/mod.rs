@@ -5,6 +5,7 @@
 
 #![warn(unreachable_pub, unused_qualifications)]
 
+mod sequential;
 mod slice;
 
 use std::sync::{
@@ -39,6 +40,7 @@ use crate::{
 	util::MaybeSend,
 };
 
+pub use sequential::{EntriesReadFailed, EntriesReadReport};
 pub use slice::EntryByteAccess;
 pub(crate) use slice::Resolved;
 
@@ -162,6 +164,39 @@ impl ArchiveReader {
 			.await
 	}
 
+	/// Reads `entries` in one ordered pass, in the archive's order whatever order they are given
+	/// in: each is written to the writer `writer_for` gives it, with its size when the archive
+	/// states it (no writer: it is decoded and thrown away), and that writer is closed once the
+	/// entry was checked against its checksum. The pass takes one of the
+	/// [`ArchiveConfig::job_concurrency`] archive job slots and gives it back as soon as the last
+	/// entry is written, the rest of the archive unread; a bare tar's members are read as ranges
+	/// of it instead, with no slot. Ask for a window of entries, not the whole archive: each pass
+	/// decodes a solid block from its start up to its first entry.
+	///
+	/// `max_solid_skip` bounds what the pass may decode and throw away to reach the entries, in
+	/// all: in 7z solid blocks, or a compressed tar a listing found the members of. A pass over
+	/// more fails with
+	/// [`ErrorKind::ArchiveSolidSkipExceeded`](crate::ErrorKind::ArchiveSolidSkipExceeded)
+	/// before any of it is read; `None` allows any. Fails as
+	/// [`ArchiveReader::download_entry`] does on an entry that is no file to read; progress goes
+	/// to `callback`, and `control` pauses and cancels the pass.
+	pub async fn read_entries<W, F>(
+		&self,
+		entries: &[ArchiveEntryId],
+		writer_for: F,
+		max_solid_skip: Option<u64>,
+		callback: impl EntryDownloadCallback,
+		control: JobControl,
+	) -> Result<EntriesReadReport, EntriesReadFailed>
+	where
+		W: AsyncWrite + Unpin + MaybeSend,
+		F: FnMut(ArchiveEntryId, Option<u64>) -> Option<W> + MaybeSend,
+	{
+		self.reader
+			.read_entries(entries, writer_for, max_solid_skip, callback, control)
+			.await
+	}
+
 	/// Lists the archive's entries, as [`Client::list_archive`] does with the reader's settings,
 	/// a zip's or 7z's from the index the reader holds. A bare tar is walked by seeking past its
 	/// members' data, so only the chunks its headers (and its PAX and GNU long-name records) lie
@@ -182,7 +217,7 @@ impl ArchiveReader {
 	/// block, what the block stores before it). A bare tar's file member is read as a range of
 	/// the archive, with no job slot, and `report.checked` is `false`: a tar has no checksum of
 	/// its members. A compressed tar's or a single compressed file's fails with
-	/// [`ErrorKind::ArchiveUnsupported`]: those are only read front to back.
+	/// [`ErrorKind::ArchiveUnsupported`]: [`ArchiveReader::read_entries`] reads those.
 	pub async fn download_entry<W>(
 		&self,
 		entry: ArchiveEntryId,

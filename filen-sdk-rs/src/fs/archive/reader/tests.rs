@@ -10,7 +10,7 @@ use crate::{
 	consts::{CHUNK_SIZE, CHUNK_SIZE_U64},
 	fs::{
 		archive::{
-			extract::{ArchiveEntry, EntryDownloadUpdate, ListUpdate},
+			extract::{ArchiveEntry, EntryDownloadUpdate, ListUpdate, SolidSkipExceeded},
 			sevenz::write::{SevenZEncryption, SevenZMethod},
 			test_support::{
 				TarMember, archive_password, gzip, incompressible, sevenz_of, tar_of, tar_with,
@@ -307,6 +307,15 @@ fn _reader_futures_are_send(
 		Ignore,
 		JobControl::default(),
 	));
+	assert_send(reader.read_entries(
+		&[entry(0)],
+		|_, _| Some(futures::io::sink()),
+		None,
+		Ignore,
+		JobControl::default(),
+	));
+	assert_send(reader.entry_byte_access(entry(0)));
+	assert_send(reader.read_entry_range(entry(0), 0, 1, &mut futures::io::sink()));
 }
 
 /// A zip of `files`, each under its method and, when given, AES under its password.
@@ -560,4 +569,171 @@ async fn a_compressed_tars_members_are_read_in_order_at_their_listed_sizes() {
 		range(&reader, 0, 0, 1).await.unwrap_err().kind(),
 		ErrorKind::InvalidState
 	);
+}
+
+/// What a pass wrote, by entry, in the order the writers were asked for.
+type Written = Arc<Mutex<Vec<(u32, Option<u64>, Arc<Mutex<Vec<u8>>>)>>>;
+
+/// A writer recording into its buffer.
+struct Recording(Arc<Mutex<Vec<u8>>>);
+
+impl AsyncWrite for Recording {
+	fn poll_write(
+		self: std::pin::Pin<&mut Self>,
+		_: &mut std::task::Context<'_>,
+		buf: &[u8],
+	) -> std::task::Poll<std::io::Result<usize>> {
+		self.0.lock().unwrap().extend_from_slice(buf);
+		std::task::Poll::Ready(Ok(buf.len()))
+	}
+
+	fn poll_flush(
+		self: std::pin::Pin<&mut Self>,
+		_: &mut std::task::Context<'_>,
+	) -> std::task::Poll<std::io::Result<()>> {
+		std::task::Poll::Ready(Ok(()))
+	}
+
+	fn poll_close(
+		self: std::pin::Pin<&mut Self>,
+		_: &mut std::task::Context<'_>,
+	) -> std::task::Poll<std::io::Result<()>> {
+		std::task::Poll::Ready(Ok(()))
+	}
+}
+
+async fn read_entries(
+	reader: &Reader<FakeBackend>,
+	indexes: &[u32],
+	max_solid_skip: Option<u64>,
+) -> (
+	Result<EntriesReadReport, EntriesReadFailed>,
+	Vec<(u32, Option<u64>, Vec<u8>)>,
+) {
+	let written: Written = Arc::default();
+	let into = Arc::clone(&written);
+	let entries: Vec<ArchiveEntryId> = indexes.iter().map(|&index| entry(index)).collect();
+	let result = reader
+		.read_entries(
+			&entries,
+			move |entry: ArchiveEntryId, size| {
+				let buffer = Arc::default();
+				into.lock()
+					.unwrap()
+					.push((entry.index, size, Arc::clone(&buffer)));
+				Some(Recording(buffer))
+			},
+			max_solid_skip,
+			Ignore,
+			JobControl::default(),
+		)
+		.await;
+	let written = written
+		.lock()
+		.unwrap()
+		.iter()
+		.map(|(index, size, data)| (*index, *size, data.lock().unwrap().clone()))
+		.collect();
+	(result, written)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pass_writes_the_entries_asked_for_in_archive_order_each_checked() {
+	let (zip, data) = spread_zip();
+	let (_, reader) = opened("z.zip", zip, None).await;
+	let (result, written) = read_entries(&reader, &[2, 0], Some(0)).await;
+	let report = result.unwrap();
+	assert_eq!(report.entries, 2);
+	assert!(report.checked);
+	assert_eq!(
+		written,
+		[
+			(0, Some(data[0].len() as u64), data[0].clone()),
+			(2, Some(data[2].len() as u64), data[2].clone()),
+		]
+	);
+	assert_eq!(reader.config.free_slots(), reader.config.job_concurrency());
+	// a directory is no file to read
+	let zip = zip_with(&[("a", b"alpha", ZipMethod::Stored, None)]);
+	let (_, reader) = opened("d.zip", zip, None).await;
+	let (result, _) = read_entries(&reader, &[1], None).await;
+	assert_eq!(result.unwrap_err().error.kind(), ErrorKind::InvalidState);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pass_over_a_compressed_tar_ends_at_its_last_entry() {
+	let tail = incompressible(4 * CHUNK_SIZE, 3);
+	let tar = tar_with(&[
+		TarMember::Data("a.txt", b"alpha"),
+		TarMember::Data("b.txt", b"beta"),
+		TarMember::Data("tail.bin", &tail),
+	]);
+	let gz = gzip(&tar);
+	let len = gz.len() as u64;
+	let (_, reader) = opened("t.tar.gz", gz, None).await;
+	let (result, written) = read_entries(&reader, &[1], None).await;
+	let report = result.unwrap();
+	assert_eq!(written, [(1, Some(4), b"beta".to_vec())]);
+	// the stream's own check, at its end, is not reached
+	assert!(!report.checked);
+	assert!(report.bytes_read < len, "{} of {len}", report.bytes_read);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pass_is_refused_when_its_solid_block_throws_away_more_than_allowed() {
+	let files: Vec<Vec<u8>> = (1..=3).map(|seed| incompressible(1000, seed)).collect();
+	let entries: Vec<(&str, Option<&[u8]>)> = ["a", "b", "c"]
+		.iter()
+		.zip(&files)
+		.map(|(path, data)| (*path, Some(&data[..])))
+		.collect();
+	let sevenz = sevenz_of(&entries, SevenZMethod::Lzma2 { level: 1 }, true, None);
+	let (_, reader) = opened("s.7z", sevenz, None).await;
+	// a is decoded and thrown away to reach b, and c goes on from b
+	let (result, _) = read_entries(&reader, &[1, 2], Some(999)).await;
+	let error = result.unwrap_err().error;
+	assert_eq!(error.kind(), ErrorKind::ArchiveSolidSkipExceeded);
+	let exceeded = error.downcast_ref::<SolidSkipExceeded>().unwrap();
+	assert_eq!(exceeded.skipped_bytes, 1000);
+	let (result, written) = read_entries(&reader, &[2, 1], Some(1000)).await;
+	assert_eq!(result.unwrap().entries, 2);
+	assert_eq!(
+		written,
+		[
+			(1, Some(1000), files[1].clone()),
+			(2, Some(1000), files[2].clone()),
+		]
+	);
+	// a and c: b is thrown away too
+	let (result, _) = read_entries(&reader, &[0, 2], Some(999)).await;
+	assert_eq!(
+		result.unwrap_err().error.kind(),
+		ErrorKind::ArchiveSolidSkipExceeded
+	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_bare_tars_members_are_read_as_ranges_with_no_job() {
+	let (tar, big) = spread_tar();
+	let (backend, archive, config) = drive("t.tar", tar, 64 << 20);
+	let reader = reader_of(&backend, &archive, &config, None);
+	reader.open(Ignore, JobControl::default()).await.unwrap();
+	reader.list(Ignore, JobControl::default()).await.unwrap();
+	fetched(&backend);
+	let (result, written) = read_entries(&reader, &[3, 0], None).await;
+	let report = result.unwrap();
+	assert_eq!(report.entries, 2);
+	assert!(!report.checked);
+	assert_eq!(
+		written,
+		[
+			(0, Some(5), b"alpha".to_vec()),
+			(3, Some(5), b"gamma".to_vec())
+		]
+	);
+	// both lie in chunks kept from the listing
+	assert_eq!(fetched(&backend), Vec::<u64>::new());
+	let (result, written) = read_entries(&reader, &[1], None).await;
+	result.unwrap();
+	assert_eq!(written[0].2, big);
 }

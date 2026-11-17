@@ -41,6 +41,9 @@ pub(super) struct Walked<R> {
 	pub(super) files: u64,
 	/// Where each member's data lies, by ordinal, when a listing was asked to record it.
 	pub(super) spans: Vec<TarSpan>,
+	/// It ended at a download's last entry, before the end of the tar: `rest` is not after
+	/// the end marker.
+	pub(super) stopped: bool,
 }
 
 /// Sends every member of the tar `tar` reads, or what each is when listing, recording where each
@@ -57,7 +60,16 @@ pub(super) fn walk_tar<R: TarSource>(
 	// an extraction's driver resolves hard links against the files it created
 	let mut listed_files = SeededMap::default();
 	let mut shadowed = Shadowed::default();
-	while let Some(member) = tar.next_member().map_err(Error::from)? {
+	let mut stopped = false;
+	loop {
+		// a download ends with its last entry, the rest of the tar unread
+		if walk.met_all_chosen() {
+			stopped = true;
+			break;
+		}
+		let Some(member) = tar.next_member().map_err(Error::from)? else {
+			break;
+		};
 		let this = ordinal;
 		ordinal += 1;
 		if member.kind == MemberKind::Dir {
@@ -145,6 +157,7 @@ pub(super) fn walk_tar<R: TarSource>(
 		unread,
 		files,
 		spans,
+		stopped,
 	})
 }
 

@@ -280,6 +280,10 @@ fn sevenz_entries(
 			&& entry.size > 0
 	};
 	for entry in &index.entries {
+		// a download ends with its last entry, giving its slot back
+		if walk.met_all_chosen() {
+			break;
+		}
 		// what is left out is not read: its name decides whether it is chosen
 		let verdict = walk.judge(&sevenz_unread(index, entry))?;
 		if matches!(verdict, Verdict::Ignore) {
@@ -443,30 +447,53 @@ fn sevenz_access(index: &SevenZIndex, entry: &SevenZEntry, folder_files: &[u64])
 	}
 }
 
-/// Refuses a download of an entry its solid block stores after more than `limit` bytes of other
-/// files, from the index alone: before any of the block is fetched. The numbers are the ones the
-/// listing shows for it ([`sevenz_access`]).
+/// Refuses a download whose entries' solid blocks have more than `limit` bytes of other files
+/// decoded and thrown away to reach them, from the index alone: before any of a block is
+/// fetched. The entries are read in index order, each going on from the one before when its
+/// block stores it after that one (as the folder cursor reads them), else from its block's start.
+/// For one entry the bytes and the estimate are the ones the listing shows for it
+/// ([`sevenz_access`]); for several, their sums.
 fn check_solid_skip(index: &SevenZIndex, walk: &Walk, limit: u64) -> Result<(), Error> {
 	let folder_files = folder_files(index);
+	let (mut thrown, mut estimated, mut run) = (0u64, 0u64, 0u64);
+	// the block being read, and how far into it
+	let mut at: Option<(usize, u64)> = None;
 	for entry in index
 		.entries
 		.iter()
 		.filter(|entry| walk.chose(entry.ordinal))
 	{
-		if let EntryAccess::SolidBlock {
-			skipped_bytes,
-			estimated_packed_bytes,
-			..
-		} = sevenz_access(index, entry, &folder_files)
-			&& exceeds_limit(skipped_bytes, limit)
-		{
-			return Err(SolidSkipExceeded {
+		let (
+			Some(stream),
+			EntryAccess::SolidBlock {
 				skipped_bytes,
-				limit,
 				estimated_packed_bytes,
+				..
+			},
+		) = (entry.stream, sevenz_access(index, entry, &folder_files))
+		else {
+			continue;
+		};
+		match at {
+			Some((folder, end)) if folder == stream.folder && end <= skipped_bytes => {
+				thrown = thrown.saturating_add(skipped_bytes - end);
 			}
-			.into());
+			_ => {
+				estimated = estimated.saturating_add(run);
+				thrown = thrown.saturating_add(skipped_bytes);
+			}
 		}
+		run = estimated_packed_bytes;
+		at = Some((stream.folder, skipped_bytes.saturating_add(entry.size)));
+	}
+	estimated = estimated.saturating_add(run);
+	if exceeds_limit(thrown, limit) {
+		return Err(SolidSkipExceeded {
+			skipped_bytes: thrown,
+			limit,
+			estimated_packed_bytes: estimated,
+		}
+		.into());
 	}
 	Ok(())
 }

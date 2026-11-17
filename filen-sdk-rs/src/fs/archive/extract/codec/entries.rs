@@ -42,11 +42,12 @@ pub(crate) enum Task {
 	/// reading it (see [`Seeking`](crate::fs::archive::tar_iter::Seeking)): a reader lists so,
 	/// where reading the whole tar would check its hash.
 	ListSeeking { archive: Uuid },
-	/// Sends one file entry with its data, as a partial extraction of it alone does, without
-	/// checking the password on an entry up front: nothing is created that a wrong password
-	/// would have to undo, and the entry proves the password as it is read. A 7z entry its
-	/// solid block stores after more than `max_solid_skip` bytes of other files is refused
-	/// before any of the block is read; `None` allows any.
+	/// Sends the file entries chosen with their data, as a partial extraction of them alone
+	/// does, without checking the password on an entry up front: nothing is created that a
+	/// wrong password would have to undo, and each entry proves the password as it is read.
+	/// The codec ends once it sent the last of them. 7z entries whose solid blocks have more
+	/// than `max_solid_skip` bytes of other files decoded and thrown away to reach them are
+	/// refused before any of a block is read; `None` allows any.
 	Download {
 		selection: Selection,
 		max_solid_skip: Option<u64>,
@@ -65,6 +66,11 @@ pub(crate) struct Selection {
 }
 
 impl Selection {
+	/// The chosen entries' ordinals, sorted, each once.
+	pub(crate) fn ordinals(&self) -> &[u64] {
+		&self.ordinals
+	}
+
 	/// The directory the chosen entries land relative to.
 	pub(crate) fn base(&self) -> &[ValidatedName] {
 		&self.base
@@ -416,6 +422,14 @@ impl<'p> Walk<'p> {
 		match self.mode {
 			Mode::Download { max_solid_skip, .. } => max_solid_skip,
 			Mode::Extract { .. } | Mode::List { .. } => None,
+		}
+	}
+
+	/// Whether a download has met every entry it chose: what follows them is not read.
+	pub(super) fn met_all_chosen(&self) -> bool {
+		match &self.mode {
+			Mode::Download { chooser, .. } => chooser.met >= chooser.selection.ordinals.len(),
+			Mode::Extract { .. } | Mode::List { .. } => false,
 		}
 	}
 

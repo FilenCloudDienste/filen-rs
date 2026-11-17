@@ -233,6 +233,10 @@ fn zip_entries(
 	}
 	let mut unaccounted_bytes = around_entries(index);
 	for entry in &index.entries {
+		// a download ends with its last entry, giving its slot back
+		if walk.met_all_chosen() {
+			break;
+		}
 		let found = zip_found(entry, false, None);
 		let verdict = walk.judge(&found)?;
 		// what a partial extraction leaves out is not read at all, its local header included: a
