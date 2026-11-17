@@ -220,10 +220,11 @@ impl ArchiveReader {
 	/// decodes a solid block from its start up to its first entry.
 	///
 	/// `max_solid_skip` bounds what the pass may decode and throw away to reach the entries, in
-	/// all: in 7z solid blocks, or a compressed tar a listing found the members of. A pass over
-	/// more fails with
-	/// [`ErrorKind::ArchiveSolidSkipExceeded`](crate::ErrorKind::ArchiveSolidSkipExceeded)
-	/// before any of it is read; `None` allows any. Fails as
+	/// all: in 7z solid blocks, solid RARs, and compressed tars. A pass over more fails with
+	/// [`ErrorKind::ArchiveSolidSkipExceeded`](crate::ErrorKind::ArchiveSolidSkipExceeded):
+	/// before any of it is read for a 7z, a RAR, and a compressed tar the reader holds a listing
+	/// of; for a compressed tar it holds none of, as soon as what it threw away passes the bound.
+	/// `None` allows any. Fails as
 	/// [`ArchiveReader::download_entry`] does on an entry that is no file to read; progress goes
 	/// to `callback`, and `control` pauses and cancels the pass.
 	pub async fn read_entries<W, F, Fut>(

@@ -433,6 +433,11 @@ impl<'p> Walk<'p> {
 		}
 	}
 
+	/// Whether entry `ordinal` is to be read: every entry of a whole extraction, else one chosen.
+	pub(super) fn wants(&self, ordinal: u64) -> bool {
+		self.chooser().is_none_or(|chooser| chooser.chosen(ordinal))
+	}
+
 	/// Whether entry `ordinal` was chosen (by a partial extraction or a download).
 	pub(super) fn chose(&self, ordinal: u64) -> bool {
 		self.chooser()

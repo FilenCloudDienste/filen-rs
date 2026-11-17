@@ -707,6 +707,75 @@ async fn a_pass_is_refused_when_its_solid_block_throws_away_more_than_allowed() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_solid_rar_is_held_to_what_a_pass_may_throw_away() {
+	let files: Vec<Vec<u8>> = (0..3).map(|at| text(1000, 90 + at)).collect();
+	let named: Vec<(&str, &[u8])> = ["a", "b", "c"]
+		.into_iter()
+		.zip(&files)
+		.map(|(name, data)| (name, &data[..]))
+		.collect();
+	let rar = rar_of(rars::ArchiveVersion::Rar50, &named, false, true, None);
+	let (_, reader) = opened("s.rar", rar, None).await;
+	// a is decoded and thrown away to reach b, and c goes on from b
+	let (result, _) = read_entries(&reader, &[1, 2], Some(999)).await;
+	let error = result.unwrap_err().error;
+	assert_eq!(error.kind(), ErrorKind::ArchiveSolidSkipExceeded);
+	assert_eq!(
+		error
+			.downcast_ref::<SolidSkipExceeded>()
+			.unwrap()
+			.skipped_bytes,
+		1000
+	);
+	let (result, written) = read_entries(&reader, &[2, 1], Some(1000)).await;
+	assert_eq!(result.unwrap().entries, 2);
+	assert_eq!(written[1].2, files[2]);
+	// the first decodes alone; a download's default allows no skip
+	assert_eq!(downloaded(&reader, 0).await.unwrap().0, files[0]);
+	let mut sink = futures::io::sink();
+	let refused = reader
+		.download_entry(
+			entry(2),
+			&mut sink,
+			ReaderDownloadEntryConfig::default().max_solid_skip,
+			Ignore,
+			JobControl::default(),
+		)
+		.await
+		.unwrap_err();
+	assert_eq!(refused.error.kind(), ErrorKind::ArchiveSolidSkipExceeded);
+	assert_eq!(
+		refused
+			.error
+			.downcast_ref::<SolidSkipExceeded>()
+			.unwrap()
+			.skipped_bytes,
+		2000
+	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_compressed_tar_not_listed_is_held_to_what_a_pass_may_throw_away() {
+	let (big, small) = (text(300 << 10, 95), text(100, 96));
+	let tgz = gzip(&tar_of(&[("big.txt", &big), ("small.txt", &small)]));
+	let (_, reader) = opened("t.tar.gz", tgz, None).await;
+	assert!(!reader.index_held());
+	let (result, _) = read_entries(&reader, &[1], Some(1000)).await;
+	let error = result.unwrap_err().error;
+	assert_eq!(error.kind(), ErrorKind::ArchiveSolidSkipExceeded);
+	assert!(
+		error
+			.downcast_ref::<SolidSkipExceeded>()
+			.unwrap()
+			.skipped_bytes
+			> 1000
+	);
+	let (result, written) = read_entries(&reader, &[1], Some(big.len() as u64)).await;
+	assert_eq!(result.unwrap().entries, 1);
+	assert_eq!(written[0].2, small);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_bare_tars_members_are_read_as_ranges_with_no_job() {
 	let (tar, big) = spread_tar();
 	let (backend, archive, config) = drive("t.tar", tar, 64 << 20);

@@ -23,14 +23,18 @@ use rars::{Archive, ArchiveReadOptions, ExtractionDecision};
 use crate::{
 	Error, ErrorKind,
 	consts::CHUNK_SIZE,
-	fs::archive::{
-		error::read_failure,
-		extract::{
-			list::{ArchiveEntryKind, EntryAccess, PasswordCheck},
-			storage_exceeded,
+	fs::{
+		archive::{
+			error::read_failure,
+			extract::{
+				SolidSkipExceeded,
+				list::{ArchiveEntryKind, EntryAccess, PasswordCheck},
+				storage_exceeded,
+			},
+			format::{ArchiveFormat, RarVersion},
+			worker::{CachedInput, EntryKind, WorkerEvent, WorkerPort, from_source},
 		},
-		format::{ArchiveFormat, RarVersion},
-		worker::{CachedInput, EntryKind, WorkerEvent, WorkerPort, from_source},
+		drive_job::exceeds_limit,
 	},
 };
 
@@ -634,6 +638,10 @@ fn decode_rar(
 	if let Some(error) = storage_exceeded(job.limits.max_bytes, extracted) {
 		return Err(error);
 	}
+	let history = solid_history(table, |ordinal| walk.wants(ordinal));
+	if let Some(limit) = walk.max_solid_skip() {
+		check_solid_skip(table, &history, walk, limit)?;
+	}
 	let port = walk.port;
 	port.send(WorkerEvent::Opened(ArchiveFormat::Rar {
 		version: table.version,
@@ -649,7 +657,7 @@ fn decode_rar(
 	// the walk's own errors, which rars only carries as its own
 	let mut failed: Option<Error> = None;
 	let decided = archive.extract_with_control(decode_options(job, parsed), |_| {
-		let decision = decide(walk, table, ordinal, &sending);
+		let decision = decide(walk, table, &history, ordinal, &sending);
 		ordinal += 1;
 		decision.map_err(|error| {
 			failed = Some(error);
@@ -665,11 +673,72 @@ fn decode_rar(
 	Ok(ArchiveEnd::plain(0, 0))
 }
 
+/// For each member, whether a member read after it is solid and decodes on from its history,
+/// directly or through members between them: `wants` tells the members read.
+fn solid_history(table: &RarTable, wants: impl Fn(u64) -> bool) -> Vec<bool> {
+	let mut history = vec![false; table.members.len()];
+	if !table.solid {
+		return history;
+	}
+	let mut needed = false;
+	for (at, member) in table.members.iter().enumerate().rev() {
+		// directories and links hold no data, and stored data goes past the decoder
+		if member.kind != RarKind::File || member.packing == RarPacking::Stored {
+			continue;
+		}
+		history[at] = needed;
+		let read = wants(at as u64) || needed;
+		// a solid member read needs the one before it; a member that is not solid starts afresh
+		needed = read && member.packing == RarPacking::Solid;
+	}
+	history
+}
+
+/// Whether `member`, the `ordinal`-th, is decoded though left out, for the history after it.
+fn feeds(history: &[bool], ordinal: u64, member: &RarMember) -> bool {
+	member.kind == RarKind::File
+		&& member.packing != RarPacking::Stored
+		&& usize::try_from(ordinal)
+			.ok()
+			.and_then(|at| history.get(at))
+			.is_some_and(|&needed| needed)
+}
+
+/// Refuses a download that would decode and throw away more than `limit` bytes of a solid RAR to
+/// reach its entries: the members left out that the ones read decode on from.
+fn check_solid_skip(
+	table: &RarTable,
+	history: &[bool],
+	walk: &Walk,
+	limit: u64,
+) -> Result<(), Error> {
+	let (mut thrown, mut packed) = (0u64, 0u64);
+	for (ordinal, member) in (0u64..).zip(&table.members) {
+		let read = walk.wants(ordinal) && member.kind == RarKind::File;
+		if read || feeds(history, ordinal, member) {
+			packed = packed.saturating_add(member.packed);
+		}
+		if !read && feeds(history, ordinal, member) {
+			thrown = thrown.saturating_add(member.size);
+		}
+	}
+	if exceeds_limit(thrown, limit) {
+		return Err(SolidSkipExceeded {
+			skipped_bytes: thrown,
+			limit,
+			estimated_packed_bytes: packed,
+		}
+		.into());
+	}
+	Ok(())
+}
+
 /// What becomes of member `ordinal`: the one before it ended (rars verified it before coming
 /// here), then this one judged.
 fn decide(
 	walk: &mut Walk,
 	table: &RarTable,
+	history: &[bool],
 	ordinal: u64,
 	sending: &Rc<RefCell<Sending>>,
 ) -> Result<ExtractionDecision, Error> {
@@ -687,10 +756,9 @@ fn decide(
 			)
 		})?;
 	let found = rar_found(ordinal, member);
-	// in a solid archive, a compressed member left out is decoded all the same, for the
-	// history the members after it need (its first member is not itself solid)
+	// a member left out that a solid one read after it decodes on from is decoded all the same
 	let pass = || {
-		if table.solid && member.packing != RarPacking::Stored && member.kind == RarKind::File {
+		if feeds(history, ordinal, member) {
 			ExtractionDecision::Extract(Box::new(io::sink()))
 		} else {
 			ExtractionDecision::Skip

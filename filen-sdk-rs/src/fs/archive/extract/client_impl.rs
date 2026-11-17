@@ -140,9 +140,12 @@ pub struct EntryDownloadConfig {
 	/// [`EntryAccess::SolidBlock`](super::EntryAccess::SolidBlock) `skipped_bytes`, as a
 	/// listing shows them. An entry stored after more fails with
 	/// [`ErrorKind::ArchiveSolidSkipExceeded`](crate::ErrorKind::ArchiveSolidSkipExceeded) once
-	/// the index is read, before any of its block is fetched. `None` allows any skip. `Some(0)`
-	/// by default: a solid entry stored after others is downloaded only once the caller accepted
-	/// what it costs.
+	/// the index is read, before any of its block is fetched. A solid RAR's members are bounded
+	/// the same way (what the entry decodes on from, before it), and a compressed tar's read
+	/// through an archive reader too (what it stores before the entry, refused up front when the
+	/// reader holds a listing of it, else as soon as that passes the bound). `None` allows any
+	/// skip. `Some(0)` by default: a solid entry stored after others is downloaded only once the
+	/// caller accepted what it costs.
 	pub max_solid_skip: Option<u64>,
 }
 

@@ -9,16 +9,19 @@ use chrono::DateTime;
 
 use crate::{
 	Error,
-	fs::archive::{
-		entry_path::{ArchivePath, PathRejection, entry_path},
-		error::read_failure,
-		extract::{
-			ExtractSkipReason,
-			list::{ArchiveEntryKind, EntryAccess, ListedSkipReason},
+	fs::{
+		archive::{
+			entry_path::{ArchivePath, PathRejection, entry_path},
+			error::read_failure,
+			extract::{
+				ExtractSkipReason, SolidSkipExceeded,
+				list::{ArchiveEntryKind, EntryAccess, ListedSkipReason},
+			},
+			limits::display_path,
+			tar_iter::{MemberKind, TarError, TarMember, TarReader, TarSource},
+			worker::{EntryKind, LinkHead, WorkerEvent},
 		},
-		limits::display_path,
-		tar_iter::{MemberKind, TarError, TarMember, TarReader, TarSource},
-		worker::{EntryKind, LinkHead, WorkerEvent},
+		drive_job::exceeds_limit,
 	},
 	util::SeededMap,
 };
@@ -52,8 +55,26 @@ pub(super) fn walk_tar<R: TarSource>(
 	walk: &mut Walk,
 	mut tar: TarReader<R>,
 	record: bool,
+	skip_limit: Option<SkipLimit>,
 ) -> Result<Walked<R>, Error> {
 	let mut spans = Vec::new();
+	// data of members passed over, which a compressed tar decodes all the same
+	let mut thrown = 0u64;
+	let mut pass_over = |size: u64| -> Result<(), Error> {
+		let Some(SkipLimit { limit, archive_len }) = skip_limit else {
+			return Ok(());
+		};
+		thrown = thrown.saturating_add(size);
+		if exceeds_limit(thrown, limit) {
+			return Err(SolidSkipExceeded {
+				skipped_bytes: thrown,
+				limit,
+				estimated_packed_bytes: archive_len,
+			}
+			.into());
+		}
+		Ok(())
+	};
 	let mut ordinal = 0;
 	let mut unread = 0u64;
 	let mut files = 0u64;
@@ -110,9 +131,11 @@ pub(super) fn walk_tar<R: TarSource>(
 		let (path, apple_double) = match walk.judge(&found)? {
 			Verdict::Ignore | Verdict::Root | Verdict::Held => {
 				shadowed.note(key, Some(Shadow::Other));
+				pass_over(member.size)?;
 				continue;
 			}
 			Verdict::Skip(reason) => {
+				pass_over(member.size)?;
 				shadowed.note(key, Some(Shadow::of((&reason).into())));
 				walk.port
 					.send(found.skipped(reason))
@@ -159,6 +182,14 @@ pub(super) fn walk_tar<R: TarSource>(
 		spans,
 		stopped,
 	})
+}
+
+/// How much a download may decode and throw away of a compressed tar to reach its entries
+/// ([`Walk::max_solid_skip`]), and the archive's length, which estimates what that fetches.
+#[derive(Clone, Copy)]
+pub(super) struct SkipLimit {
+	pub(super) limit: u64,
+	pub(super) archive_len: u64,
 }
 
 /// The file a hard link names, as a path, and as its listing shows it.

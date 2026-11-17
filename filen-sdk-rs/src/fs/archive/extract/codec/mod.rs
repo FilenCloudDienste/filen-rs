@@ -45,7 +45,7 @@ pub(crate) use held::{HeldIndex, IndexUse, TarSpan, TarTable};
 pub(crate) use rar::{RarKind, RarPacking, RarTable};
 use rar::{extract_rar, open_rar};
 use sevenz::{extract_held_sevenz, extract_sevenz, read_sevenz_held};
-use tar::walk_tar;
+use tar::{SkipLimit, walk_tar};
 use zip::{extract_held_zip, extract_zip, read_zip_index};
 
 /// What the codec may spend on an archive.
@@ -158,12 +158,18 @@ pub(crate) fn extract_stream(port: &WorkerPort, job: StreamJob) -> Result<Archiv
 			let (unaccounted, spans) = if matches!(job.task, Task::ListSeeking { .. }) {
 				let mut input = CachedInput::rereading(source.into_inner().1);
 				let seeking = Seeking::new(BorrowedSeqReader::new(&mut input), job.len);
-				let walked = walk_tar(&mut walk, TarReader::from_source(seeking, max), record)?;
+				// a bare tar's members are passed over by seeking past them: nothing to bound
+				let walked = walk_tar(
+					&mut walk,
+					TarReader::from_source(seeking, max),
+					record,
+					None,
+				)?;
 				// what follows the end marker is read: zero padding, mostly in its chunk
 				let trailing = drain_trailing(walked.rest).map_err(read_failure)?;
 				(walked.unread + trailing, walked.spans)
 			} else {
-				let walked = walk_tar(&mut walk, TarReader::new(source, max), record)?;
+				let walked = walk_tar(&mut walk, TarReader::new(source, max), record, None)?;
 				if walked.stopped {
 					return Ok(ArchiveEnd::plain(0, 0));
 				}
@@ -191,10 +197,15 @@ pub(crate) fn extract_stream(port: &WorkerPort, job: StreamJob) -> Result<Archiv
 					codec: Some(codec),
 				}))
 				.map_err(read_failure)?;
+				let skip_limit = walk.max_solid_skip().map(|limit| SkipLimit {
+					limit,
+					archive_len: job.len,
+				});
 				let walked = walk_tar(
 					&mut walk,
 					TarReader::new(Cursor::new(block).chain(decoded), job.limits.max_members),
 					record,
+					skip_limit,
 				)?;
 				send_table(port, record, walked.spans)?;
 				if walked.stopped {
