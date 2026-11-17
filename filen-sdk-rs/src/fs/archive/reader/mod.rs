@@ -22,7 +22,7 @@ use tokio::sync::Semaphore;
 
 use crate::{
 	Error, ErrorKind,
-	auth::Client,
+	auth::{Client, unauth::UnauthClient},
 	fs::{
 		HasName,
 		archive::{
@@ -36,7 +36,7 @@ use crate::{
 				reading::{ReadJob, download, list, open},
 			},
 			format::ArchiveFormat,
-			input::{ArchiveBytes, DriveFile},
+			input::{ArchiveBytes, DriveFile, UnauthFile},
 			retained::Retained,
 		},
 		drive_job::backend::{ClientBackend, DriveBackend},
@@ -44,7 +44,7 @@ use crate::{
 	},
 	job::{JobControl, report::JobFailed},
 	thumbnail::EmbeddedPreview,
-	util::{MaybeArc, MaybeSend, SeededMap},
+	util::{MaybeSend, SeededMap},
 };
 
 pub(crate) use inflate::{Seeks, StreamKey};
@@ -68,9 +68,11 @@ impl Default for ReaderDownloadEntryConfig {
 	}
 }
 
-/// An open archive: see [`Client::open_archive_reader`].
+/// An open archive: see [`Client::open_archive_reader`]. A clone is the same reader, which
+/// [`close`](Self::close) closes for every clone.
+#[derive(Clone)]
 pub struct ArchiveReader {
-	reader: MaybeArc<Reader>,
+	reader: Arc<Reader>,
 }
 
 impl Client {
@@ -101,7 +103,34 @@ impl Client {
 		);
 		reader.open(callback, control).await?;
 		Ok(ArchiveReader {
-			reader: MaybeArc::new(reader),
+			reader: Arc::new(reader),
+		})
+	}
+}
+
+impl UnauthClient {
+	/// [`Client::open_archive_reader`] without a session: opens `archive`, a file a public link
+	/// gives, reading its chunks through this client.
+	pub async fn open_archive_reader(
+		&self,
+		archive: RemoteFileType<'static>,
+		config: ListConfig,
+		callback: impl ListCallback,
+		control: JobControl,
+	) -> Result<ArchiveReader, ListFailed> {
+		let state = self.state();
+		let name = archive.name().unwrap_or_default().to_owned();
+		let reader = Reader::of(
+			Arc::clone(state.memory_semaphore()),
+			UnauthFile::new(self.clone(), archive),
+			name,
+			state.archives().clone(),
+			config,
+		)
+		.keeping();
+		reader.open(callback, control).await?;
+		Ok(ArchiveReader {
+			reader: Arc::new(reader),
 		})
 	}
 }
@@ -181,9 +210,10 @@ impl ArchiveReader {
 	}
 
 	/// Reads `entries` in one ordered pass, in the archive's order whatever order they are given
-	/// in: each is written to the writer `writer_for` gives it, with its size when the archive
-	/// states it (no writer: it is decoded and thrown away), and that writer is closed once the
-	/// entry was checked against its checksum. The pass takes one of the
+	/// in: each is written to the writer `writer_for` resolves to, asked with its size when the
+	/// archive states it as the pass reaches it (no writer: it is decoded and thrown away; an
+	/// error ends the pass with it), and that writer is closed once the entry was checked
+	/// against its checksum. The pass takes one of the
 	/// [`ArchiveConfig::job_concurrency`] archive job slots and gives it back as soon as the last
 	/// entry is written, the rest of the archive unread; a bare tar's members are read as ranges
 	/// of it instead, with no slot. Ask for a window of entries, not the whole archive: each pass
@@ -196,7 +226,7 @@ impl ArchiveReader {
 	/// before any of it is read; `None` allows any. Fails as
 	/// [`ArchiveReader::download_entry`] does on an entry that is no file to read; progress goes
 	/// to `callback`, and `control` pauses and cancels the pass.
-	pub async fn read_entries<W, F>(
+	pub async fn read_entries<W, F, Fut>(
 		&self,
 		entries: &[ArchiveEntryId],
 		writer_for: F,
@@ -206,7 +236,8 @@ impl ArchiveReader {
 	) -> Result<EntriesReadReport, EntriesReadFailed>
 	where
 		W: AsyncWrite + Unpin + MaybeSend,
-		F: FnMut(ArchiveEntryId, Option<u64>) -> Option<W> + MaybeSend,
+		F: FnMut(ArchiveEntryId, Option<u64>) -> Fut + MaybeSend,
+		Fut: Future<Output = Result<Option<W>, Error>> + MaybeSend,
 	{
 		self.reader
 			.read_entries(entries, writer_for, max_solid_skip, callback, control)
@@ -242,7 +273,7 @@ impl ArchiveReader {
 		let reader = Reader::nested(&self.reader, bytes, name, password);
 		reader.open(callback, control).await?;
 		Ok(ArchiveReader {
-			reader: MaybeArc::new(reader),
+			reader: Arc::new(reader),
 		})
 	}
 
@@ -317,7 +348,7 @@ pub(crate) struct Reader {
 	/// The client's file-IO budget, which chunks in flight are drawn from.
 	memory: Arc<Semaphore>,
 	/// The archive's bytes.
-	source: MaybeArc<dyn ArchiveBytes>,
+	source: Arc<dyn ArchiveBytes>,
 	/// Its name, which tells some formats.
 	name: String,
 	id: Uuid,
@@ -344,11 +375,7 @@ impl Reader {
 		config: ArchiveConfig,
 		settings: ListConfig,
 	) -> Self {
-		let retained = Retained::new(Arc::clone(&config.retained), config.retained_budget());
-		Self {
-			retained: Some(retained),
-			..Self::once(backend, archive, config, settings)
-		}
+		Self::once(backend, archive, config, settings).keeping()
 	}
 
 	/// A reader for one call, which keeps nothing: what [`Client::list_archive`] and
@@ -359,10 +386,29 @@ impl Reader {
 		config: ArchiveConfig,
 		settings: ListConfig,
 	) -> Self {
+		let name = archive.name().unwrap_or_default().to_owned();
+		Self::of(
+			backend.memory(),
+			DriveFile::new(backend, archive),
+			name,
+			config,
+			settings,
+		)
+	}
+
+	/// A reader for one call of `source`, named `name`, under the client's `memory` and
+	/// `config` and the reader's `settings`.
+	fn of(
+		memory: Arc<Semaphore>,
+		source: Arc<dyn ArchiveBytes>,
+		name: String,
+		config: ArchiveConfig,
+		settings: ListConfig,
+	) -> Self {
 		Self {
-			memory: backend.memory(),
-			name: archive.name().unwrap_or_default().to_owned(),
-			source: DriveFile::new(backend, archive),
+			memory,
+			name,
+			source,
 			id: Uuid::new_v4(),
 			config,
 			settings,
@@ -372,6 +418,17 @@ impl Reader {
 			expansion_base: None,
 			flights: Mutex::default(),
 			closed: AtomicBool::new(false),
+		}
+	}
+
+	/// This reader, keeping what its calls read for the calls after them.
+	fn keeping(self) -> Self {
+		Self {
+			retained: Some(Retained::new(
+				Arc::clone(&self.config.retained),
+				self.config.retained_budget(),
+			)),
+			..self
 		}
 	}
 
@@ -581,7 +638,7 @@ impl Reader {
 	pub(crate) fn read_job(&self, control: JobControl) -> ReadJob {
 		ReadJob {
 			memory: Arc::clone(&self.memory),
-			source: MaybeArc::clone(&self.source),
+			source: Arc::clone(&self.source),
 			name: self.name.clone(),
 			expansion_base: self.expansion_base,
 			config: self.config.clone(),

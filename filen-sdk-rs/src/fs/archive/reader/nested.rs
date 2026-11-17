@@ -23,7 +23,7 @@ use crate::{
 		input::ArchiveBytes,
 		retained::Retained,
 	},
-	util::{MaybeArc, MaybeSendBoxFuture},
+	util::MaybeSendBoxFuture,
 };
 
 use super::{Reader, Resolved};
@@ -33,7 +33,7 @@ pub(crate) const MAX_NESTING: u8 = 3;
 
 /// An entry of an archive another reader opened, read as an archive's bytes.
 pub(crate) struct EntryBytes {
-	parent: MaybeArc<Reader>,
+	parent: Arc<Reader>,
 	entry: ArchiveEntryId,
 	len: u64,
 	id: Uuid,
@@ -94,7 +94,7 @@ impl Reader {
 	/// parent's settings but for `password`.
 	pub(crate) fn nested(
 		parent: &Self,
-		bytes: MaybeArc<EntryBytes>,
+		bytes: Arc<EntryBytes>,
 		name: String,
 		password: Option<ArchivePassword>,
 	) -> Self {
@@ -124,9 +124,9 @@ impl Reader {
 	/// stored under; refused for an entry only read whole or front to back, and past
 	/// [`MAX_NESTING`].
 	pub(crate) async fn entry_bytes(
-		self: &MaybeArc<Self>,
+		self: &Arc<Self>,
 		entry: ArchiveEntryId,
-	) -> Result<(MaybeArc<EntryBytes>, String), Arc<Error>> {
+	) -> Result<(Arc<EntryBytes>, String), Arc<Error>> {
 		if self.depth >= MAX_NESTING {
 			return Err(Arc::new(Error::custom(
 				ErrorKind::ArchiveUnsupported,
@@ -151,8 +151,8 @@ impl Reader {
 			return Err(Arc::new(expansion_exceeded(limit)));
 		}
 		let name = self.entry_name(entry).await?;
-		let bytes = MaybeArc::new(EntryBytes {
-			parent: MaybeArc::clone(self),
+		let bytes = Arc::new(EntryBytes {
+			parent: Arc::clone(self),
 			entry,
 			len,
 			id: nested_id(self.archive_uuid(), u64::from(entry.index)),

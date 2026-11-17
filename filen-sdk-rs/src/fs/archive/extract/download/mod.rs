@@ -307,7 +307,7 @@ pub(crate) struct DownloadTask {
 	pub(crate) memory: Arc<Semaphore>,
 	pub(crate) control: JobControl,
 	pub(crate) reporter: MaybeArc<EntryDownloadReporter>,
-	pub(crate) source: MaybeArc<dyn ArchiveBytes>,
+	pub(crate) source: Arc<dyn ArchiveBytes>,
 	/// The ordinal of the entry chosen.
 	pub(crate) ordinal: u64,
 	pub(crate) config: ArchiveConfig,

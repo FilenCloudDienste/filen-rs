@@ -290,12 +290,13 @@ async fn a_tar_reader_opens_on_its_head_alone() {
 /// futures.
 fn _reader_futures_are_send(
 	client: Arc<Client>,
+	unauth: &UnauthClient,
 	archive: RemoteFileType<'static>,
 	reader: &ArchiveReader,
 ) {
 	fn assert_send<T: Send>(_: T) {}
 	assert_send(client.open_archive_reader(
-		archive,
+		archive.clone(),
 		ListConfig::default(),
 		Ignore,
 		JobControl::default(),
@@ -310,13 +311,19 @@ fn _reader_futures_are_send(
 	));
 	assert_send(reader.read_entries(
 		&[entry(0)],
-		|_, _| Some(futures::io::sink()),
+		|_, _| std::future::ready(Ok(Some(futures::io::sink()))),
 		None,
 		Ignore,
 		JobControl::default(),
 	));
 	assert_send(reader.entry_byte_access(entry(0)));
 	assert_send(reader.read_entry_range(entry(0), 0, 1, &mut futures::io::sink()));
+	assert_send(unauth.open_archive_reader(
+		archive,
+		ListConfig::default(),
+		Ignore,
+		JobControl::default(),
+	));
 }
 
 /// A zip of `files`, each under its method and, when given, AES under its password.
@@ -608,7 +615,7 @@ async fn read_entries(
 				into.lock()
 					.unwrap()
 					.push((entry.index, size, Arc::clone(&buffer)));
-				Some(Recording(buffer))
+				std::future::ready(Ok(Some(Recording(buffer))))
 			},
 			max_solid_skip,
 			Ignore,
@@ -980,14 +987,14 @@ async fn a_gzip_tars_members_read_by_range_across_its_members() {
 }
 
 /// Opens entry `index` of `parent` as a nested archive.
-async fn nested(parent: &MaybeArc<Reader>, index: u32) -> Result<MaybeArc<Reader>, Arc<Error>> {
+async fn nested(parent: &Arc<Reader>, index: u32) -> Result<Arc<Reader>, Arc<Error>> {
 	let (bytes, name) = parent.entry_bytes(entry_of(parent, index)).await?;
 	let reader = Reader::nested(parent, bytes, name, None);
 	reader
 		.open(Ignore, JobControl::default())
 		.await
 		.map_err(|failed| failed.error)?;
-	Ok(MaybeArc::new(reader))
+	Ok(Arc::new(reader))
 }
 
 /// Entry `index` of the archive `reader` reads.
@@ -1021,7 +1028,7 @@ async fn an_archive_inside_an_archive_is_read_through_its_entry() {
 			("inner.tar", &tar, method, None),
 		]);
 		let (_, outer) = opened("outer.zip", outer, None).await;
-		let outer = MaybeArc::new(outer);
+		let outer = Arc::new(outer);
 		let zip = nested(&outer, 0).await.unwrap();
 		assert_eq!(zip.format(), Some(ArchiveFormat::Zip));
 		assert!(zip.index_held());
@@ -1060,7 +1067,7 @@ async fn archives_nest_three_deep_and_no_deeper() {
 		archive = zip_with(&[("next.zip", &archive, ZipMethod::Stored, None)]);
 	}
 	let (_, root) = opened("root.zip", archive, None).await;
-	let mut reader = MaybeArc::new(root);
+	let mut reader = Arc::new(root);
 	for _ in 0..3 {
 		reader = nested(&reader, 0).await.unwrap();
 	}
@@ -1076,7 +1083,7 @@ async fn an_entry_only_read_whole_is_not_opened() {
 	let outer = zip_with(&[("inner.zip", &inner, ZipMethod::Bzip2 { level: 6 }, None)]);
 	let (_, outer) = opened("outer.zip", outer, None).await;
 	assert_eq!(
-		nested(&MaybeArc::new(outer), 0).await.err().unwrap().kind(),
+		nested(&Arc::new(outer), 0).await.err().unwrap().kind(),
 		ErrorKind::ArchiveUnsupported
 	);
 }
@@ -1115,7 +1122,7 @@ async fn the_expansion_limit_counts_across_the_chain() {
 		},
 	);
 	outer.open(Ignore, JobControl::default()).await.unwrap();
-	let outer = MaybeArc::new(outer);
+	let outer = Arc::new(outer);
 	// 4 MiB from a few KiB is past the limit, though the entry states no more than it holds
 	assert_eq!(
 		nested(&outer, 0).await.err().unwrap().kind(),

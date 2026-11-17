@@ -19,7 +19,7 @@ use crate::{
 		worker::{self, CodecStart, WorkerEvent, unexpected_event},
 	},
 	job::{JobControl, report::JobReport},
-	util::{MaybeArc, MaybeSend},
+	util::MaybeSend,
 };
 
 use super::{
@@ -35,7 +35,7 @@ use super::{
 pub(crate) struct ReadJob {
 	/// The client's file-IO budget.
 	pub(crate) memory: Arc<Semaphore>,
-	pub(crate) source: MaybeArc<dyn ArchiveBytes>,
+	pub(crate) source: Arc<dyn ArchiveBytes>,
 	/// The archive's name, which tells some formats.
 	pub(crate) name: String,
 	/// See [`CodecLimits::expansion_base`].

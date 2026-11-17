@@ -12,6 +12,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 
 use crate::{
 	Error, ErrorKind,
+	auth::unauth::UnauthClient,
 	consts::{CALLBACK_INTERVAL, CHUNK_SIZE_U64, FULL_CHUNK_BYTES},
 	error::ContentHashMismatchError,
 	fs::{
@@ -25,7 +26,7 @@ use crate::{
 		drive_job::{Fatal, backend::DriveBackend, cancelled},
 		file::{
 			enums::RemoteFileType,
-			read::{check_chunks_consistent, chunk_plaintext_len},
+			read::{check_chunks_consistent, chunk_plaintext_len, fetch_decrypted_chunk_data},
 			traits::{HasFileInfo, HasRemoteFileInfo},
 		},
 	},
@@ -33,7 +34,7 @@ use crate::{
 		JobControl, Stopped,
 		report::{JobPhase, JobState, OpGuard, Ops, Reporter},
 	},
-	util::{MaybeArc, MaybeSend, MaybeSendBoxFuture, MaybeSendSync, sleep},
+	util::{MaybeArc, MaybeSend, MaybeSendBoxFuture, sleep},
 };
 
 /// Chunks fetched ahead of a codec, memory permitting: of the archive it reads, or of the
@@ -94,8 +95,9 @@ pub(crate) fn whole_chunk(
 }
 
 /// What a reading codec reads: the plaintext of a file in the drive, or of an entry of an
-/// archive another reader opened.
-pub(crate) trait ArchiveBytes: MaybeSendSync + 'static {
+/// archive another reader opened. `Send` and `Sync` on wasm too, so that a reader holding one
+/// moves to the commander thread its calls run on.
+pub(crate) trait ArchiveBytes: Send + Sync + 'static {
 	/// Its length in bytes.
 	fn len(&self) -> u64;
 	/// What it is known by: a drive file's uuid, a nested archive's derived id.
@@ -118,8 +120,8 @@ pub(crate) struct DriveFile<B> {
 }
 
 impl<B: DriveBackend> DriveFile<B> {
-	pub(crate) fn new(backend: Arc<B>, file: RemoteFileType<'static>) -> MaybeArc<Self> {
-		MaybeArc::new(Self { backend, file })
+	pub(crate) fn new(backend: Arc<B>, file: RemoteFileType<'static>) -> Arc<Self> {
+		Arc::new(Self { backend, file })
 	}
 }
 
@@ -148,8 +150,45 @@ impl<B: DriveBackend> ArchiveBytes for DriveFile<B> {
 	}
 }
 
+/// A file read without a session, as a public link gives it: through `client`.
+pub(crate) struct UnauthFile {
+	client: UnauthClient,
+	file: RemoteFileType<'static>,
+}
+
+impl UnauthFile {
+	pub(crate) fn new(client: UnauthClient, file: RemoteFileType<'static>) -> Arc<Self> {
+		Arc::new(Self { client, file })
+	}
+}
+
+impl ArchiveBytes for UnauthFile {
+	fn len(&self) -> u64 {
+		self.file.size()
+	}
+
+	fn id(&self) -> Uuid {
+		self.file.uuid()
+	}
+
+	fn hash(&self) -> Option<Blake3Hash> {
+		self.file.hash()
+	}
+
+	fn check(&self) -> Result<(), Error> {
+		check_chunks_consistent(self.file.chunks(), self.file.size())
+	}
+
+	fn chunk(&self, index: u64) -> MaybeSendBoxFuture<'_, Result<Vec<u8>, Error>> {
+		Box::pin(async move {
+			let data = fetch_decrypted_chunk_data(&self.client, &self.file, index, None).await?;
+			whole_chunk(&self.file, index, data)
+		})
+	}
+}
+
 struct ArchiveInput {
-	source: MaybeArc<dyn ArchiveBytes>,
+	source: Arc<dyn ArchiveBytes>,
 	chunks: u64,
 	next_fetch: u64,
 	fetches: FuturesOrdered<MaybeSendBoxFuture<'static, FetchedChunk>>,
@@ -180,7 +219,7 @@ struct ArchiveInput {
 impl ArchiveInput {
 	fn new(
 		memory: Arc<Semaphore>,
-		source: MaybeArc<dyn ArchiveBytes>,
+		source: Arc<dyn ArchiveBytes>,
 		kept: Option<Arc<Retained>>,
 	) -> Self {
 		Self {
@@ -201,7 +240,7 @@ impl ArchiveInput {
 		}
 	}
 
-	fn source(&self) -> &MaybeArc<dyn ArchiveBytes> {
+	fn source(&self) -> &Arc<dyn ArchiveBytes> {
 		&self.source
 	}
 
@@ -271,7 +310,7 @@ impl ArchiveInput {
 			};
 			let index = self.next_fetch;
 			self.next_fetch += 1;
-			let source = MaybeArc::clone(&self.source);
+			let source = Arc::clone(&self.source);
 			let op = ops.op();
 			self.fetches.push_back(Box::pin(async move {
 				let result = source.chunk(index).await;
@@ -396,7 +435,7 @@ impl<T> CodecFeed<T> {
 	/// floor of one chunk draws on the client's `memory`.
 	pub(crate) fn new(
 		memory: Arc<Semaphore>,
-		source: MaybeArc<dyn ArchiveBytes>,
+		source: Arc<dyn ArchiveBytes>,
 		link: WorkerLink<Result<T, Error>>,
 		running: OpGuard,
 		chunks: Option<Arc<Retained>>,
@@ -460,7 +499,7 @@ impl<T> CodecFeed<T> {
 		self.input.owes_codec()
 	}
 
-	pub(crate) fn source(&self) -> &MaybeArc<dyn ArchiveBytes> {
+	pub(crate) fn source(&self) -> &Arc<dyn ArchiveBytes> {
 		self.input.source()
 	}
 
@@ -545,7 +584,7 @@ pub(crate) struct ReadingJob<'a, S: JobState> {
 /// phase the job ends in and why.
 pub(crate) async fn start_reading<S: JobState, T>(
 	memory: Arc<Semaphore>,
-	source: MaybeArc<dyn ArchiveBytes>,
+	source: Arc<dyn ArchiveBytes>,
 	job: ReadingJob<'_, S>,
 	start: impl FnOnce() -> Result<WorkerLink<Result<T, Error>>, Error>,
 ) -> Result<(OwnedSemaphorePermit, CodecFeed<T>), (S::Phase, Arc<Error>)> {

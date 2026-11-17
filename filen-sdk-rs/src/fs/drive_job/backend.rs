@@ -88,8 +88,9 @@ pub(crate) struct UploadSpec {
 pub(crate) type Propagated = Result<Vec<Error>, Error>;
 
 /// The drive operations a job needs. The production implementation is the client; tests use a
-/// fake with the real memory semaphore.
-pub(crate) trait DriveBackend: MaybeSendSync + 'static {
+/// fake with the real memory semaphore. `Send` and `Sync` on wasm too, so a reader of an archive
+/// (which holds one) moves to the thread its calls run on.
+pub(crate) trait DriveBackend: Send + Sync + 'static {
 	type DriveLock: Lease + MaybeSendSync + 'static;
 	type Upload: MaybeSendSync + 'static;
 

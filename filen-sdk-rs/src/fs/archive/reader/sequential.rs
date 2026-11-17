@@ -64,7 +64,7 @@ impl Reader {
 	/// Reads `entries` in one ordered pass (see the module docs), each written to the writer
 	/// `writer_for` gives it (in archive order, with its size when the archive states it), or
 	/// decoded and thrown away when it gives none.
-	pub(crate) async fn read_entries<W, F>(
+	pub(crate) async fn read_entries<W, F, Fut>(
 		&self,
 		entries: &[ArchiveEntryId],
 		mut writer_for: F,
@@ -74,7 +74,8 @@ impl Reader {
 	) -> Result<EntriesReadReport, EntriesReadFailed>
 	where
 		W: AsyncWrite + Unpin + MaybeSend,
-		F: FnMut(ArchiveEntryId, Option<u64>) -> Option<W> + MaybeSend,
+		F: FnMut(ArchiveEntryId, Option<u64>) -> Fut + MaybeSend,
+		Fut: Future<Output = Result<Option<W>, Error>> + MaybeSend,
 	{
 		let failed = |error: Arc<Error>| EntriesReadFailed {
 			report: EntriesReadReport::default(),
@@ -197,7 +198,7 @@ impl Reader {
 	}
 
 	/// Reads a bare tar's members chosen, in order, each as a range of the archive.
-	async fn read_members<W, F>(
+	async fn read_members<W, F, Fut>(
 		&self,
 		selection: &Selection,
 		mut writer_for: F,
@@ -205,7 +206,8 @@ impl Reader {
 	) -> Result<EntriesReadReport, EntriesReadFailed>
 	where
 		W: AsyncWrite + Unpin + MaybeSend,
-		F: FnMut(ArchiveEntryId, Option<u64>) -> Option<W> + MaybeSend,
+		F: FnMut(ArchiveEntryId, Option<u64>) -> Fut + MaybeSend,
+		Fut: Future<Output = Result<Option<W>, Error>> + MaybeSend,
 	{
 		let mut report = EntriesReadReport::default();
 		for &ordinal in selection.ordinals() {
@@ -217,7 +219,8 @@ impl Reader {
 				let Resolved::Mapped { size, .. } = self.resolve(entry).await? else {
 					return Err(Arc::new(EntryDownloadError::NotAFile.into()));
 				};
-				let Some(mut writer) = writer_for(entry, Some(size)) else {
+				let Some(mut writer) = writer_for(entry, Some(size)).await.map_err(Arc::new)?
+				else {
 					return Ok(0);
 				};
 				self.read_entry_range(entry, 0, size, &mut writer).await?;
@@ -279,10 +282,11 @@ struct EntriesSink<'p, W, F> {
 	index: Option<Box<HeldIndex>>,
 }
 
-impl<W, F> FeedSink for EntriesSink<'_, W, F>
+impl<W, F, Fut> FeedSink for EntriesSink<'_, W, F>
 where
 	W: AsyncWrite + Unpin + MaybeSend,
-	F: FnMut(ArchiveEntryId, Option<u64>) -> Option<W> + MaybeSend,
+	F: FnMut(ArchiveEntryId, Option<u64>) -> Fut + MaybeSend,
+	Fut: Future<Output = Result<Option<W>, Error>> + MaybeSend,
 {
 	async fn take(&mut self, event: WorkerEvent) -> Result<(), Error> {
 		match (&mut self.current, event) {
@@ -297,7 +301,7 @@ where
 			) => {
 				let entry = ArchiveEntryId::of(self.archive, ordinal);
 				self.left = self.left.saturating_sub(1);
-				self.current = match (self.writer_for)(entry, size) {
+				self.current = match (self.writer_for)(entry, size).await? {
 					Some(writer) => Current::Writing(writer),
 					None => Current::Dropping,
 				};
