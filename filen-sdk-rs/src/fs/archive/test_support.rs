@@ -265,7 +265,9 @@ fn append_link_verbatim(
 
 /// Every member of a tar with its data, read back through the SDK's reader in small pieces, so
 /// a body is read in many.
-pub(crate) fn tar_members<R: Read>(tar: &mut TarReader<R>) -> Vec<(tar_iter::TarMember, Vec<u8>)> {
+pub(crate) fn tar_members<R: tar_iter::TarSource>(
+	tar: &mut TarReader<R>,
+) -> Vec<(tar_iter::TarMember, Vec<u8>)> {
 	let mut members = Vec::new();
 	while let Some(member) = tar.next_member().unwrap() {
 		let mut data = Vec::new();

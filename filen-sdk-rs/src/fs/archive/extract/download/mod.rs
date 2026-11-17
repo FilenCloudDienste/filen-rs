@@ -266,7 +266,7 @@ impl EntryDownloadReporter {
 	}
 
 	/// The download reached its entry, which the archive states is `size` bytes long.
-	fn entry_found(&self, size: Option<u64>) {
+	pub(crate) fn entry_found(&self, size: Option<u64>) {
 		self.with_state(|state| {
 			state.entry_bytes = size;
 			state.core.mark_changed();
@@ -274,7 +274,7 @@ impl EntryDownloadReporter {
 	}
 
 	/// `total` bytes of the entry were written so far.
-	fn wrote(&self, total: u64) {
+	pub(crate) fn wrote(&self, total: u64) {
 		self.with_state(|state| {
 			state.bytes_written = total;
 			state.core.mark_changed();

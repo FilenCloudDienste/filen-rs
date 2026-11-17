@@ -220,6 +220,7 @@ fn run_job_holding(job: StreamJob, mut answer: impl FnMut(u64) -> Option<Vec<u8>
 				seen.push(Seen::Indexed(match *index {
 					HeldIndex::Zip(_) => ArchiveFormat::Zip,
 					HeldIndex::SevenZ { .. } => ArchiveFormat::SevenZ,
+					HeldIndex::Tar(_) => ArchiveFormat::Tar { codec: None },
 				}));
 				held = Some(index);
 			}

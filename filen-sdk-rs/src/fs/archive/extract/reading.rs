@@ -151,6 +151,7 @@ impl FeedSink for OpenSink {
 /// Lists the archive.
 pub(crate) async fn list<B: DriveBackend>(
 	job: ReadJob<B>,
+	task: Task,
 	callback: impl ListCallback,
 ) -> Result<Listed, ListFailed> {
 	let ReadJob {
@@ -162,9 +163,6 @@ pub(crate) async fn list<B: DriveBackend>(
 		chunks,
 		control,
 	} = job;
-	let task = Task::List {
-		archive: archive.uuid(),
-	};
 	let start = start_codec(&archive, &config, settings.into_extraction(), task, index);
 	run_list(ListTask {
 		backend,

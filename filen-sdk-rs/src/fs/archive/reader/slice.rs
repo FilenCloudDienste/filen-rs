@@ -30,10 +30,11 @@ use crate::{
 		drive_job::backend::DriveBackend,
 		file::traits::HasFileInfo,
 	},
+	job::JobControl,
 	util::{MaybeSend, MaybeSendBoxFuture},
 };
 
-use super::Reader;
+use super::{Reader, Unreported};
 
 /// How an entry's bytes can be read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -245,7 +246,7 @@ impl<B: DriveBackend> Reader<B> {
 	}
 
 	/// How `entry` is read, from what the reader keeps, or else from its index.
-	async fn resolve(&self, entry: ArchiveEntryId) -> Result<Resolved, Arc<Error>> {
+	pub(super) async fn resolve(&self, entry: ArchiveEntryId) -> Result<Resolved, Arc<Error>> {
 		self.ensure_open()?;
 		if entry.archive != self.archive.uuid() {
 			return Err(Arc::new(not_held()));
@@ -272,11 +273,35 @@ impl<B: DriveBackend> Reader<B> {
 						} => self.zip_data(header, limit, compressed, size).await?,
 					},
 					HeldIndex::SevenZ { index, .. } => sevenz_access(index, ordinal)?,
+					HeldIndex::Tar(_) => return Err(Arc::new(not_held())),
 				}
 			}
-			Some(ArchiveFormat::Tar { .. } | ArchiveFormat::Single { .. }) => {
-				Resolved::Sequential { size: None }
-			}
+			Some(ArchiveFormat::Tar { codec }) => match self.tar_table().await? {
+				Some(index) => {
+					let HeldIndex::Tar(table) = &*index else {
+						return Err(Arc::new(not_held()));
+					};
+					let span = usize::try_from(ordinal)
+						.ok()
+						.and_then(|at| table.members.get(at))
+						.ok_or_else(not_held)?;
+					match (codec, span.data) {
+						(_, None) => {
+							return Err(Arc::new(EntryDownloadError::NotAFile.into()));
+						}
+						(None, Some(offset)) => Resolved::Mapped {
+							offset: offset.get(),
+							size: span.size,
+						},
+						(Some(_), Some(_)) => Resolved::Sequential {
+							size: Some(span.size),
+						},
+					}
+				}
+				// no room to hold where its members lie: read through, as ever
+				None => Resolved::Sequential { size: None },
+			},
+			Some(ArchiveFormat::Single { .. }) => Resolved::Sequential { size: None },
 			None => {
 				return Err(Arc::new(Error::custom(
 					ErrorKind::InvalidState,
@@ -288,6 +313,24 @@ impl<B: DriveBackend> Reader<B> {
 			retained.keep_access(ordinal, resolved);
 		}
 		Ok(resolved)
+	}
+
+	/// Where a tar's members lie, as a listing found: the table held, or else the archive
+	/// listed again for it; `None` when there is no room to hold it.
+	async fn tar_table(&self) -> Result<Option<Arc<HeldIndex>>, Arc<Error>> {
+		let held = || {
+			self.retained
+				.as_ref()
+				.and_then(|retained| retained.index())
+				.filter(|index| matches!(**index, HeldIndex::Tar(_)))
+		};
+		if let Some(index) = held() {
+			return Ok(Some(index));
+		}
+		self.list(Unreported, JobControl::default())
+			.await
+			.map_err(|failed| failed.error)?;
+		Ok(held())
 	}
 
 	/// Where a stored zip entry's data starts: after its local header at `header`, whose name

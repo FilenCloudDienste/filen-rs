@@ -11,6 +11,8 @@ mod zip;
 
 use std::io::{self, Cursor, Read};
 
+use microthumb::BorrowedSeqReader;
+
 use crate::{
 	Error, ErrorKind,
 	fs::archive::{
@@ -24,7 +26,7 @@ use crate::{
 		},
 		limits::display_path,
 		password::ArchivePassword,
-		tar_iter::TAR_BLOCK,
+		tar_iter::{Seeking, TAR_BLOCK, TarReader},
 		worker::{
 			CachedInput, ChunkInput, EntryKind, WorkerEvent, WorkerPort, from_source,
 			send_file_data,
@@ -38,7 +40,7 @@ use super::{
 };
 use entries::{Found, Verdict, Walk, apple_double};
 pub(crate) use entries::{LinkKeys, Selection, Task};
-pub(crate) use held::{HeldIndex, IndexUse};
+pub(crate) use held::{HeldIndex, IndexUse, TarSpan, TarTable};
 use sevenz::{extract_held_sevenz, extract_sevenz, read_sevenz_held};
 use tar::walk_tar;
 use zip::{extract_held_zip, extract_zip, read_zip_index};
@@ -123,14 +125,18 @@ pub(crate) fn extract_stream(port: &WorkerPort, job: StreamJob) -> Result<Archiv
 	);
 	if let IndexUse::Held(held) = &job.index {
 		// neither the head nor the index is read again: the job starts at its entries
-		let input = CachedInput::new(port, 0, job.len);
-		return match &**held {
-			HeldIndex::Zip(index) => extract_held_zip(&mut walk, input, index, &job),
+		let input = || CachedInput::new(port, 0, job.len);
+		match &**held {
+			HeldIndex::Zip(index) => return extract_held_zip(&mut walk, input(), index, &job),
 			HeldIndex::SevenZ { index, keys } => {
-				extract_held_sevenz(&mut walk, input, index, keys, &job)
+				return extract_held_sevenz(&mut walk, input(), index, keys, &job);
 			}
-		};
+			// a tar is read from its start
+			HeldIndex::Tar(_) => {}
+		}
 	}
+	// a listing asked for its index records where a tar's members lie
+	let record = walk.listing() && matches!(job.index, IndexUse::ReadAndReturn);
 	let mut input = ChunkInput::new(port, 0, job.len);
 	let mut head = [0u8; DETECT_HEAD_LEN];
 	let head_len = read_full(&mut input, &mut head).map_err(read_failure)?;
@@ -140,11 +146,21 @@ pub(crate) fn extract_stream(port: &WorkerPort, job: StreamJob) -> Result<Archiv
 		Some(Detected::Tar) => {
 			port.send(WorkerEvent::Opened(ArchiveFormat::Tar { codec: None }))
 				.map_err(read_failure)?;
-			let walked = walk_tar(&mut walk, source, job.limits.max_members)?;
-			Ok(ArchiveEnd::plain(
-				walked.unread + drain_trailing(walked.rest).map_err(read_failure)?,
-				0,
-			))
+			let max = job.limits.max_members;
+			let (unaccounted, spans) = if matches!(job.task, Task::ListSeeking { .. }) {
+				let mut input = CachedInput::rereading(source.into_inner().1);
+				let seeking = Seeking::new(BorrowedSeqReader::new(&mut input), job.len);
+				let walked = walk_tar(&mut walk, TarReader::from_source(seeking, max), record)?;
+				// what follows the end marker is read: zero padding, mostly in its chunk
+				let trailing = drain_trailing(walked.rest).map_err(read_failure)?;
+				(walked.unread + trailing, walked.spans)
+			} else {
+				let walked = walk_tar(&mut walk, TarReader::new(source, max), record)?;
+				let trailing = drain_trailing(walked.rest.0).map_err(read_failure)?;
+				(walked.unread + trailing, walked.spans)
+			};
+			send_table(port, record, spans)?;
+			Ok(ArchiveEnd::plain(unaccounted, 0))
 		}
 		Some(Detected::Stream(codec)) => {
 			let decoder =
@@ -165,10 +181,11 @@ pub(crate) fn extract_stream(port: &WorkerPort, job: StreamJob) -> Result<Archiv
 				.map_err(read_failure)?;
 				let walked = walk_tar(
 					&mut walk,
-					Cursor::new(block).chain(decoded),
-					job.limits.max_members,
+					TarReader::new(Cursor::new(block).chain(decoded), job.limits.max_members),
+					record,
 				)?;
-				let (_, mut decoded) = walked.rest.into_inner();
+				send_table(port, record, walked.spans)?;
+				let (_, mut decoded) = walked.rest.0.into_inner();
 				// zero blocks after the end-of-archive marker are the usual record padding
 				let tar_trailing = drain_trailing(&mut decoded).map_err(read_failure)?;
 				let end = decoded.inner.end().expect("drained to the end");
@@ -267,6 +284,16 @@ fn not_an_archive() -> Error {
 		ErrorKind::ArchiveUnsupported,
 		"the file is not an archive the SDK can extract",
 	)
+}
+
+/// Hands the driver where a tar's members lie, `spans`, recorded when `record`.
+fn send_table(port: &WorkerPort, record: bool, spans: Vec<TarSpan>) -> Result<(), Error> {
+	if !record {
+		return Ok(());
+	}
+	let table = TarTable { members: spans };
+	port.send(WorkerEvent::Indexed(Box::new(HeldIndex::Tar(table))))
+		.map_err(read_failure)
 }
 
 /// A single compressed file: one entry, named after the archive without its codec extension.

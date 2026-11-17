@@ -1,6 +1,9 @@
 //! Reading a tar, bare or decoded from a compressed stream, member by member.
 
-use std::io::{self, Read};
+use std::{
+	io::{self, Read},
+	num::NonZeroU64,
+};
 
 use chrono::DateTime;
 
@@ -14,14 +17,14 @@ use crate::{
 			list::{ArchiveEntryKind, EntryAccess, ListedSkipReason},
 		},
 		limits::display_path,
-		tar_iter::{MemberKind, TarError, TarMember, TarReader},
+		tar_iter::{MemberKind, TarError, TarMember, TarReader, TarSource},
 		worker::{EntryKind, LinkHead, WorkerEvent},
 	},
 	util::SeededMap,
 };
 
 use super::{
-	Taken,
+	Taken, TarSpan,
 	entries::{
 		Found, LinkKeys, Listed, MacShape, Verdict, Walk, apple_double, found_path, symlink,
 	},
@@ -36,15 +39,18 @@ pub(super) struct Walked<R> {
 	pub(super) unread: u64,
 	/// Files sent.
 	pub(super) files: u64,
+	/// Where each member's data lies, by ordinal, when a listing was asked to record it.
+	pub(super) spans: Vec<TarSpan>,
 }
 
-/// Sends every member of the tar in `reader`, or what each is when listing.
-pub(super) fn walk_tar<R: Read>(
+/// Sends every member of the tar `tar` reads, or what each is when listing, recording where each
+/// one's data lies when `record`.
+pub(super) fn walk_tar<R: TarSource>(
 	walk: &mut Walk,
-	reader: R,
-	max_members: u64,
+	mut tar: TarReader<R>,
+	record: bool,
 ) -> Result<Walked<R>, Error> {
-	let mut tar = TarReader::new(reader, max_members);
+	let mut spans = Vec::new();
 	let mut ordinal = 0;
 	let mut unread = 0u64;
 	let mut files = 0u64;
@@ -67,6 +73,17 @@ pub(super) fn walk_tar<R: Read>(
 			_ => None,
 		};
 		if walk.listing() {
+			if record {
+				let holds_data = match member.kind {
+					MemberKind::File => true,
+					MemberKind::Hardlink { .. } => member.size > 0,
+					_ => false,
+				};
+				spans.push(TarSpan {
+					data: NonZeroU64::new(member.data_offset).filter(|_| holds_data),
+					size: member.size,
+				});
+			}
 			list_member(
 				walk,
 				&mut tar,
@@ -127,6 +144,7 @@ pub(super) fn walk_tar<R: Read>(
 		rest: tar.into_inner(),
 		unread,
 		files,
+		spans,
 	})
 }
 
@@ -249,7 +267,7 @@ impl Shadowed {
 
 /// Lists the member `found`, a hard link to `link_target` resolved against `listed_files`, the
 /// files listed before it as extracted, which it joins when it is one.
-fn list_member<R: Read>(
+fn list_member<R: TarSource>(
 	walk: &mut Walk,
 	tar: &mut TarReader<R>,
 	mut found: Found,
@@ -338,7 +356,7 @@ fn link_event(
 /// The current member's data.
 struct TarBody<'t, R>(&'t mut TarReader<R>);
 
-impl<R: Read> Read for TarBody<'_, R> {
+impl<R: TarSource> Read for TarBody<'_, R> {
 	fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
 		self.0.read_body(buf).map_err(|error| match error {
 			TarError::Read(error) => error,

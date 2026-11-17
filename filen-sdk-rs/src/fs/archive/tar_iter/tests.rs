@@ -453,3 +453,81 @@ fn non_utf8_paths_decode_as_latin1() {
 	assert_eq!(members[0].0.path, "café.txt");
 	assert!(members[0].0.path_rewritten);
 }
+
+/// Every member's header, read without its data: what a listing walks.
+fn headers<R: TarSource>(mut reader: TarReader<R>) -> Vec<TarMember> {
+	let mut members = Vec::new();
+	while let Some(member) = reader.next_member().unwrap() {
+		members.push(member);
+	}
+	members
+}
+
+#[test]
+fn a_walk_seeking_past_member_data_finds_what_one_reading_it_does() {
+	let long = "d/".repeat(80) + "long.txt";
+	let pax = pax_record("path", "pax/ünï.txt") + &pax_record("size", "3");
+	let sparse = pax_record("GNU.sparse.major", "1") + &pax_record("GNU.sparse.name", "vm.img");
+	let mut archive = Vec::new();
+	member(&mut archive, b"a.txt", b'0', b"alpha");
+	member(&mut archive, b"././@LongLink", b'L', long.as_bytes());
+	member(&mut archive, b"short", b'0', &[1u8; 700]);
+	member(&mut archive, b"././@LongLink", b'K', b"target/of/link");
+	member(&mut archive, b"link", b'2', b"");
+	member(&mut archive, b"PaxHeader", b'x', pax.as_bytes());
+	// the ustar size field says 0; the PAX record's 3 bytes follow
+	archive.extend_from_slice(&header(b"ignored", b'0', 0));
+	archive.extend(padded(b"pax"));
+	member(&mut archive, b"PaxHeader", b'x', sparse.as_bytes());
+	member(&mut archive, b"./GNUSparseFile.1/vm.img", b'0', b"map+data");
+	archive.extend_from_slice(&gnu_header(b"old-sparse", b'S', 4));
+	archive.extend(padded(b"data"));
+	member(&mut archive, b"dir/", b'5', b"");
+	member(&mut archive, b"last.bin", b'0', &[9u8; 3000]);
+	archive.extend([0u8; 2 * TAR_BLOCK]);
+	let len = archive.len() as u64;
+	let read = headers(TarReader::new(archive.as_slice(), 100));
+	let sought = headers(TarReader::from_source(
+		Seeking::new(io::Cursor::new(archive.as_slice()), len),
+		100,
+	));
+	assert_eq!(sought, read);
+	let paths: Vec<&str> = read.iter().map(|member| member.path.as_str()).collect();
+	assert_eq!(
+		paths,
+		[
+			"a.txt",
+			long.as_str(),
+			"link",
+			"pax/ünï.txt",
+			"./GNUSparseFile.1/vm.img",
+			"old-sparse",
+			"dir/",
+			"last.bin"
+		]
+	);
+	// each member's data lies at its offset
+	let data = |member: &TarMember| {
+		let at = usize::try_from(member.data_offset).unwrap();
+		&archive[at..at + usize::try_from(member.size).unwrap()]
+	};
+	assert_eq!(data(&read[0]), b"alpha");
+	assert_eq!(data(&read[1]), &[1u8; 700][..]);
+	assert_eq!(data(&read[3]), b"pax");
+	assert_eq!(data(&read[7]), &[9u8; 3000][..]);
+}
+
+#[test]
+fn a_walk_seeking_past_the_end_finds_the_data_cut_short() {
+	let mut archive = Vec::new();
+	member(&mut archive, b"a.bin", b'0', &[7u8; 2000]);
+	archive.truncate(TAR_BLOCK + 1000);
+	let len = archive.len() as u64;
+	let mut reader =
+		TarReader::from_source(Seeking::new(io::Cursor::new(archive.as_slice()), len), 100);
+	assert!(reader.next_member().unwrap().is_some());
+	assert!(matches!(
+		reader.next_member(),
+		Err(TarError::Corrupt("a member's data ends early"))
+	));
+}

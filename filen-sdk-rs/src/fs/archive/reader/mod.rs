@@ -23,16 +23,17 @@ use crate::{
 		archive::{
 			config::ArchiveConfig,
 			extract::{
-				ArchiveEntryId, EntryDownloadCallback, EntryDownloadConfig, EntryDownloadFailed,
-				EntryDownloadReport, ListCallback, ListConfig, ListFailed, ListReport,
-				codec::{HeldIndex, IndexUse},
+				ArchiveEntryId, EntryDownloadCallback, EntryDownloadConfig, EntryDownloadError,
+				EntryDownloadFailed, EntryDownloadPhase, EntryDownloadReport,
+				EntryDownloadReporter, ListCallback, ListConfig, ListFailed, ListReport,
+				codec::{HeldIndex, IndexUse, Task},
 				reading::{ReadJob, download, list, open},
 			},
 			format::ArchiveFormat,
 			retained::Retained,
 		},
 		drive_job::backend::{ClientBackend, DriveBackend},
-		file::enums::RemoteFileType,
+		file::{enums::RemoteFileType, traits::HasFileInfo},
 	},
 	job::{JobControl, report::JobFailed},
 	util::MaybeSend,
@@ -128,8 +129,10 @@ impl ArchiveReader {
 	/// reader holds (for a stored zip entry, reading its local header too, through the chunks
 	/// the reader keeps), then kept with the index. Fails as
 	/// [`ArchiveReader::download_entry`] does, for an entry of another archive, one not in this
-	/// one, a directory or link, or one an extraction would skip. A tar's members and a single
-	/// compressed file are `Sequential`.
+	/// one, a directory or link, or one an extraction would skip. A bare tar's file members are
+	/// `Mapped` once a listing found where they lie (the reader lists the tar for it when it
+	/// holds no listing); a compressed tar's members and a single compressed file are
+	/// `Sequential`.
 	pub async fn entry_byte_access(
 		&self,
 		entry: ArchiveEntryId,
@@ -160,7 +163,10 @@ impl ArchiveReader {
 	}
 
 	/// Lists the archive's entries, as [`Client::list_archive`] does with the reader's settings,
-	/// a zip's or 7z's from the index the reader holds.
+	/// a zip's or 7z's from the index the reader holds. A bare tar is walked by seeking past its
+	/// members' data, so only the chunks its headers (and its PAX and GNU long-name records) lie
+	/// in are read, and its hash is not checked; a compressed tar is read through. Where a tar's
+	/// members lie is held as an index is, 16 bytes a member.
 	pub async fn list(
 		&self,
 		callback: impl ListCallback,
@@ -173,7 +179,10 @@ impl ArchiveReader {
 	/// as [`Client::download_archive_entry`] does with the reader's settings: checked against
 	/// the CRC-32 or authentication code the archive has for it before `writer` is closed. Only
 	/// the entry is read when the reader holds the index (and, for a 7z entry in a solid
-	/// block, what the block stores before it).
+	/// block, what the block stores before it). A bare tar's file member is read as a range of
+	/// the archive, with no job slot, and `report.checked` is `false`: a tar has no checksum of
+	/// its members. A compressed tar's or a single compressed file's fails with
+	/// [`ErrorKind::ArchiveUnsupported`]: those are only read front to back.
 	pub async fn download_entry<W>(
 		&self,
 		entry: ArchiveEntryId,
@@ -344,7 +353,14 @@ impl<B: DriveBackend> Reader<B> {
 				error: Arc::new(error),
 			});
 		}
-		let listed = list(self.read_job(control), callback).await?;
+		// a reader that keeps what it reads lists a bare tar by seeking past its members' data;
+		// one for a single call reads it whole, as a listing always did, its hash checked
+		let archive = self.archive.uuid();
+		let task = match self.retained {
+			Some(_) => Task::ListSeeking { archive },
+			None => Task::List { archive },
+		};
+		let listed = list(self.read_job(control), task, callback).await?;
 		self.note_format(listed.report.format);
 		self.hold(listed.index);
 		Ok(listed.report)
@@ -367,6 +383,11 @@ impl<B: DriveBackend> Reader<B> {
 				error: Arc::new(error),
 			});
 		}
+		if let Some(ArchiveFormat::Tar { codec: None }) = self.format()
+			&& self.retained.is_some()
+		{
+			return self.download_member(entry, writer, callback).await;
+		}
 		let (downloaded, index) = download(
 			self.read_job(control),
 			entry,
@@ -377,6 +398,51 @@ impl<B: DriveBackend> Reader<B> {
 		.await;
 		self.hold(index);
 		downloaded
+	}
+
+	/// Downloads a bare tar's member, whose data lies in the archive as it is: as a range of the
+	/// archive, which takes no job slot. A tar holds no checksum of its members.
+	async fn download_member<W>(
+		&self,
+		entry: ArchiveEntryId,
+		writer: &mut W,
+		callback: impl EntryDownloadCallback,
+	) -> Result<EntryDownloadReport, EntryDownloadFailed>
+	where
+		W: AsyncWrite + Unpin + MaybeSend,
+	{
+		let reporter = EntryDownloadReporter::new(callback, self.archive.size());
+		reporter.set_phase(EntryDownloadPhase::Reading);
+		let read = match self.resolve(entry).await {
+			Ok(Resolved::Mapped { size, .. }) => {
+				reporter.entry_found(Some(size));
+				self.read_entry_range(entry, 0, size, writer)
+					.await
+					.map(|()| size)
+			}
+			Ok(Resolved::Whole { .. } | Resolved::Sequential { .. }) => {
+				Err(Arc::new(EntryDownloadError::NotIndexed.into()))
+			}
+			Err(error) => Err(error),
+		};
+		match read {
+			Ok(size) => {
+				reporter.wrote(size);
+				reporter.finish(EntryDownloadPhase::Done);
+				Ok(EntryDownloadReport {
+					bytes_written: size,
+					bytes_read: size,
+					checked: false,
+				})
+			}
+			Err(error) => {
+				reporter.finish(EntryDownloadPhase::Failed);
+				Err(JobFailed {
+					report: EntryDownloadReport::default(),
+					error,
+				})
+			}
+		}
 	}
 
 	/// What a job of this reader reads, and how.

@@ -29,11 +29,11 @@ use codec::Selection;
 
 pub use client_impl::{EntryDownloadConfig, ExtractConfig, ListConfig};
 pub(crate) use codec::path_refusal;
-pub(crate) use download::EntryDownloadError;
 pub use download::{
 	EntryDownloadCallback, EntryDownloadFailed, EntryDownloadPhase, EntryDownloadReport,
 	EntryDownloadUpdate, SolidSkipExceeded,
 };
+pub(crate) use download::{EntryDownloadError, EntryDownloadReporter};
 pub use list::{
 	ArchiveEntry, ArchiveEntryKind, EntryAccess, ListCallback, ListFailed, ListPhase, ListReport,
 	ListTotals, ListUpdate, ListedPath, ListedSkipReason, MAX_LISTED_BYTES, MAX_LISTED_ENTRIES,

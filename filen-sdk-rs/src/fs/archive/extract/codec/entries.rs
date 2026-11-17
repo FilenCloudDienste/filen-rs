@@ -38,6 +38,10 @@ pub(crate) enum Task {
 	Extract(Option<Selection>),
 	/// Sends what every entry of the archive `archive` is, and none of their data.
 	List { archive: Uuid },
+	/// As [`Task::List`], a bare tar's members walked by seeking past their data rather than
+	/// reading it (see [`Seeking`](crate::fs::archive::tar_iter::Seeking)): a reader lists so,
+	/// where reading the whole tar would check its hash.
+	ListSeeking { archive: Uuid },
 	/// Sends one file entry with its data, as a partial extraction of it alone does, without
 	/// checking the password on an entry up front: nothing is created that a wrong password
 	/// would have to undo, and the entry proves the password as it is read. A 7z entry its
@@ -360,7 +364,9 @@ impl<'p> Walk<'p> {
 			Task::Extract(selection) => Mode::Extract {
 				chooser: selection.clone().map(Chooser::new),
 			},
-			Task::List { archive } => Mode::List { archive: *archive },
+			Task::List { archive } | Task::ListSeeking { archive } => {
+				Mode::List { archive: *archive }
+			}
 			Task::Download {
 				selection,
 				max_solid_skip,

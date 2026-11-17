@@ -15,6 +15,8 @@
 //! header's size in a pax archive too. Reading a stated size as data anywhere else would let a
 //! link hide members from both tools inside what they take for headers.
 
+mod seek;
+
 use std::io::{self, Read};
 
 use tar::{EntryType, GnuExtSparseHeader, Header};
@@ -22,6 +24,29 @@ use tar::{EntryType, GnuExtSparseHeader, Header};
 use crate::{Error, ErrorKind, fs::drive_job::exceeds_limit};
 
 use super::{bytes::read_full, error::read_failure, format::is_tar_header};
+
+pub(crate) use seek::Seeking;
+
+/// A tar's bytes as [`TarReader`] reads them: in order, the data it does not need skipped.
+pub(crate) trait TarSource: Read {
+	/// Skips the next `bytes`; how many it skipped, fewer only at the end.
+	fn skip(&mut self, bytes: u64) -> io::Result<u64>;
+}
+
+/// A tar read front to back: what is skipped is read and thrown away.
+pub(crate) struct Streamed<R>(pub(crate) R);
+
+impl<R: Read> Read for Streamed<R> {
+	fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+		self.0.read(buf)
+	}
+}
+
+impl<R: Read> TarSource for Streamed<R> {
+	fn skip(&mut self, bytes: u64) -> io::Result<u64> {
+		io::copy(&mut (&mut self.0).take(bytes), &mut io::sink())
+	}
+}
 
 /// Bytes of a tar block: headers, and member data padded to a whole number of them.
 pub(crate) const TAR_BLOCK: usize = 512;
@@ -76,6 +101,8 @@ pub(crate) struct TarMember {
 	pub(crate) path_rewritten: bool,
 	/// Bytes of data stored for the member, which [`TarReader::read_body`] reads.
 	pub(crate) size: u64,
+	/// Where that data starts in the tar (decoded, for a compressed one).
+	pub(crate) data_offset: u64,
 	pub(crate) modified: Option<MemberTime>,
 }
 
@@ -154,12 +181,21 @@ pub(crate) struct TarReader<R> {
 	members: u64,
 	max_members: u64,
 	ended: bool,
+	/// Bytes of the tar read or skipped so far.
+	position: u64,
 }
 
-impl<R: Read> TarReader<R> {
+impl<R: Read> TarReader<Streamed<R>> {
+	/// Reads tar headers from `inner`, front to back (see [`TarReader::from_source`]).
+	pub(crate) fn new(inner: R, max_members: u64) -> Self {
+		Self::from_source(Streamed(inner), max_members)
+	}
+}
+
+impl<R: TarSource> TarReader<R> {
 	/// Reads tar headers from `inner`; more than `max_members` headers (every record counts)
 	/// is refused.
-	pub(crate) fn new(inner: R, max_members: u64) -> Self {
+	pub(crate) fn from_source(inner: R, max_members: u64) -> Self {
 		Self {
 			inner,
 			flavor: Flavor::Old,
@@ -168,6 +204,7 @@ impl<R: Read> TarReader<R> {
 			members: 0,
 			max_members,
 			ended: false,
+			position: 0,
 		}
 	}
 
@@ -273,6 +310,7 @@ impl<R: Read> TarReader<R> {
 			path,
 			path_rewritten,
 			size,
+			data_offset: self.position,
 			modified,
 		})
 	}
@@ -290,6 +328,7 @@ impl<R: Read> TarReader<R> {
 			return Err(TarError::Corrupt("a member's data ends early"));
 		}
 		self.remaining -= read as u64;
+		self.position += read as u64;
 		Ok(read)
 	}
 
@@ -308,7 +347,8 @@ impl<R: Read> TarReader<R> {
 			.ok_or(TarError::Corrupt("a member's size is out of range"))?;
 		self.remaining = 0;
 		self.padding = 0;
-		let skipped = io::copy(&mut (&mut self.inner).take(rest), &mut io::sink())?;
+		let skipped = self.inner.skip(rest)?;
+		self.position += skipped;
 		if skipped != rest {
 			return Err(TarError::Corrupt("a member's data ends early"));
 		}
@@ -320,6 +360,7 @@ impl<R: Read> TarReader<R> {
 	fn read_header_block(&mut self) -> Result<Option<[u8; TAR_BLOCK]>, TarError> {
 		let mut block = [0u8; TAR_BLOCK];
 		let read = read_full(&mut self.inner, &mut block)?;
+		self.position += read as u64;
 		if read == 0 {
 			return Ok(None);
 		}
@@ -344,13 +385,17 @@ impl<R: Read> TarReader<R> {
 			));
 		}
 		let mut record = vec![0u8; usize::try_from(size).expect("capped above")];
-		if read_full(&mut self.inner, &mut record)? != record.len() {
+		let read = read_full(&mut self.inner, &mut record)?;
+		self.position += read as u64;
+		if read != record.len() {
 			return Err(TarError::Corrupt(
 				"a long name or extended header ends early",
 			));
 		}
 		let pad = padding(size);
-		if io::copy(&mut (&mut self.inner).take(pad), &mut io::sink())? != pad {
+		let skipped = self.inner.skip(pad)?;
+		self.position += skipped;
+		if skipped != pad {
 			return Err(TarError::Corrupt(
 				"a long name or extended header ends early",
 			));
@@ -371,7 +416,9 @@ impl<R: Read> TarReader<R> {
 				return Err(TarError::Corrupt("a sparse member's map is too long"));
 			}
 			let mut block = GnuExtSparseHeader::new();
-			if read_full(&mut self.inner, block.as_mut_bytes())? != TAR_BLOCK {
+			let read = read_full(&mut self.inner, block.as_mut_bytes())?;
+			self.position += read as u64;
+			if read != TAR_BLOCK {
 				return Err(TarError::Corrupt("a sparse member's map ends early"));
 			}
 			extended = block.isextended[0] != 0;

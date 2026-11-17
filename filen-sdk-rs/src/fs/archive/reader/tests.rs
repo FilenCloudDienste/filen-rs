@@ -12,7 +12,9 @@ use crate::{
 		archive::{
 			extract::{ArchiveEntry, EntryDownloadUpdate, ListUpdate},
 			sevenz::write::{SevenZEncryption, SevenZMethod},
-			test_support::{archive_password, incompressible, sevenz_of},
+			test_support::{
+				TarMember, archive_password, gzip, incompressible, sevenz_of, tar_of, tar_with,
+			},
 			zip::{
 				crypto::AesStrength,
 				write::{Encryption, ZipMethod, ZipWriter},
@@ -270,7 +272,7 @@ async fn a_7z_reader_opens_its_encrypted_index_once_under_its_password() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_tar_reader_opens_on_its_head_alone() {
-	let tar = crate::fs::archive::test_support::tar_of(&[("a.txt", b"alpha")]);
+	let tar = tar_of(&[("a.txt", b"alpha")]);
 	let (backend, archive, config) = drive("t.tar", tar, 64 << 20);
 	let reader = reader_of(&backend, &archive, &config, None);
 	reader.open(Ignore, JobControl::default()).await.unwrap();
@@ -480,4 +482,82 @@ async fn a_reader_reads_the_index_again_to_resolve_an_entry() {
 	assert_eq!(range(&reader, 2, 0, 5).await.unwrap(), data[2][..5]);
 	assert!(fetched(&backend).contains(&last));
 	assert!(reader.index_held());
+}
+
+/// A tar of a small file, one of three chunks, a directory and a small file after it: the last
+/// header lies three chunks after the first.
+fn spread_tar() -> (Vec<u8>, Vec<u8>) {
+	let big = incompressible(3 * CHUNK_SIZE, 7);
+	let tar = tar_with(&[
+		TarMember::Data("a.txt", b"alpha"),
+		TarMember::Data("big.bin", &big),
+		TarMember::Data("dir/", b""),
+		TarMember::Data("dir/c.txt", b"gamma"),
+	]);
+	(tar, big)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tar_readers_listing_seeks_past_member_data() {
+	let (tar, big) = spread_tar();
+	let last = (tar.len() as u64 - 1) / CHUNK_SIZE_U64;
+	let (backend, archive, config) = drive("t.tar", tar, 64 << 20);
+	let read = Reader::once(
+		Arc::clone(&backend),
+		archive.clone(),
+		config.clone(),
+		ListConfig::default(),
+	)
+	.list(Ignore, JobControl::default())
+	.await
+	.unwrap();
+	assert_eq!(fetched(&backend), (0..=last).collect::<Vec<_>>());
+	let reader = reader_of(&backend, &archive, &config, None);
+	reader.open(Ignore, JobControl::default()).await.unwrap();
+	let sought = reader.list(Ignore, JobControl::default()).await.unwrap();
+	// the head, kept by the open, and the chunk of the headers after the big member
+	assert_eq!(fetched(&backend), [0, last]);
+	assert_eq!(sought.entries, read.entries);
+	assert_eq!(sought.totals, read.totals);
+	assert_eq!(sought.unaccounted_bytes, read.unaccounted_bytes);
+	assert!(reader.index_held());
+
+	assert_eq!(
+		reader.entry_byte_access(entry(1)).await.unwrap(),
+		EntryByteAccess::Mapped {
+			size: big.len() as u64
+		}
+	);
+	let len = big.len() as u64;
+	assert_eq!(
+		range(&reader, 1, len - 10, len).await.unwrap(),
+		big[big.len() - 10..]
+	);
+	assert_eq!(range(&reader, 3, 0, 5).await.unwrap(), b"gamma");
+	assert_eq!(
+		reader.entry_byte_access(entry(2)).await.unwrap_err().kind(),
+		ErrorKind::InvalidState
+	);
+	// a member is downloaded as a range of the archive: a tar's members have no checksum
+	let mut written = futures::io::Cursor::new(Vec::new());
+	let report = reader
+		.download_entry(entry(0), &mut written, None, Ignore, JobControl::default())
+		.await
+		.unwrap();
+	assert_eq!(written.into_inner(), b"alpha");
+	assert!(!report.checked);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_compressed_tars_members_are_read_in_order_at_their_listed_sizes() {
+	let tar = tar_with(&[TarMember::Data("a.txt", b"alpha")]);
+	let (_, reader) = opened("t.tar.gz", gzip(&tar), None).await;
+	assert_eq!(
+		reader.entry_byte_access(entry(0)).await.unwrap(),
+		EntryByteAccess::Sequential { size: Some(5) }
+	);
+	assert_eq!(
+		range(&reader, 0, 0, 1).await.unwrap_err().kind(),
+		ErrorKind::InvalidState
+	);
 }
