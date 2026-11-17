@@ -82,16 +82,20 @@ pub enum EntryAccess {
 	/// tar's member. `skipped_bytes` is the `max_solid_skip` a download or pass of the entry
 	/// alone needs.
 	SolidBlock {
-		/// Bytes decoded and thrown away before the entry's first byte. Exact: the sizes of
-		/// the files a 7z block or a solid RAR stores before it, and for a compressed tar
-		/// where the member's data starts in the tar. 0 for the first.
+		/// Bytes decoded and thrown away before the entry's first byte: the sizes of the files
+		/// a 7z block or a solid RAR stores before it, exact; for a compressed tar, where the
+		/// member's data starts in the tar, exact for a reader holding the tar's listing, and
+		/// for a download that reads the tar through a bound always enough (what it throws
+		/// away counts the members' data alone, not their headers). 0 for the first.
 		skipped_bytes: u64,
 		/// Archive bytes fetched to reach the entry's end: for a 7z block at its average
 		/// compression ratio, ⌈block_packed_bytes × (skipped_bytes + size) ÷ the block's
 		/// unpacked size⌉, an estimate, as compression is rarely even across a block; for a
 		/// solid RAR the packed sizes of its files up to the entry, exact; for a compressed tar
-		/// the archive bytes its decoder had taken once past the entry's data, which is exact but
-		/// for what the decoder reads ahead (some KiB).
+		/// the archive bytes its decoder had taken once past the entry's data, an approximation:
+		/// a decoder takes its input a compressed block at a time (up to about 900 KiB for
+		/// bzip2, an xz block or a zstd frame), and a fetch is rounded up to the archive's 1 MiB
+		/// chunks, so the fetch can differ from it by up to a block plus a chunk.
 		estimated_packed_bytes: u64,
 		/// The most a read of this entry fetches: the 7z block's packed size, or the packed
 		/// size of a solid RAR's files, or a compressed tar's length. Exact.

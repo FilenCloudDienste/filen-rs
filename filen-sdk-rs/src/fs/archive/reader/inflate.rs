@@ -727,9 +727,9 @@ impl Reader {
 					"the archive reader is closed",
 				))
 			})?;
-			// the checkpoint this step may lay (at most one: they are farther apart than a step
-			// decodes), charged before it is laid; with no room, those laid are thinned to what
-			// is charged
+			// the next checkpoint this step may lay, charged before it is laid; a step of very
+			// compressible data may lay more than one, which `lay` thins to what is charged, as
+			// it thins those laid already when there is no room for another
 			charged.cover(seeks.checkpoint_bytes() + CURSOR_BYTES);
 			seeks.cap_checkpoints(charged.bytes());
 			// the stored bytes from the cursor on: to the end of their chunk, or as many as a

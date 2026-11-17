@@ -368,8 +368,9 @@ struct Pending {
 /// Lists `pending`, whose data the walk just passed, a hard link resolved against
 /// `listed_files`, the files listed before it as extracted, which it joins when it is one. For
 /// a `compressed` tar, what reaching it costs: what the tar stores before its data, decoded and
-/// thrown away, and the archive bytes the decoder had taken once past its data (a little more, by
-/// what the decoder reads ahead), which a read of it alone fetches.
+/// thrown away, and the archive bytes the decoder had taken once past its data, which
+/// approximates what a read of it alone fetches (see
+/// [`EntryAccess::SolidBlock`]'s `estimated_packed_bytes`).
 fn list_member(
 	walk: &mut Walk,
 	pending: Pending,
