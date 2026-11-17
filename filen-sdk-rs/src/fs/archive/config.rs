@@ -119,6 +119,14 @@ impl ArchiveConfig {
 	/// with [`ErrorKind::ArchiveTooLarge`], a compression whose encoder needs more with
 	/// [`ErrorKind::InsufficientMemory`].
 	///
+	/// A RAR's headers are parsed into a quarter of it at most, which bounds how many members
+	/// (and service headers) a RAR may have, below the member limit of a zip or 7z: about
+	/// `codec_mem_budget ÷ 4 ÷ 1104` for a RAR 5, `÷ 496` for a RAR 1.5 to 4 and `÷ 256` for a
+	/// RAR 1.3. With the default budget that is 30 393, 67 650 and 131 072 on the web and iOS
+	/// (128 MiB), 45 590, 101 475 and 196 608 on Android (192 MiB), and 60 787, 135 300 and
+	/// 262 144 elsewhere (256 MiB). A RAR with more fails with [`ErrorKind::ArchiveTooLarge`],
+	/// saying so.
+	///
 	/// [`ErrorKind::ArchiveTooLarge`]: crate::ErrorKind::ArchiveTooLarge
 	/// [`ErrorKind::InsufficientMemory`]: crate::ErrorKind::InsufficientMemory
 	pub fn codec_mem_budget(&self) -> u64 {

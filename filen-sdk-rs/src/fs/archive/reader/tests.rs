@@ -1443,6 +1443,12 @@ async fn a_rar_header_flood_is_refused_before_rars_keeps_it() {
 			"{files} files, {services} services: {}",
 			failed.error
 		);
+		// saying why, and what it depends on
+		let said = failed.error.to_string();
+		assert!(
+			said.contains("headers") && said.contains("codec_mem_budget"),
+			"{said}"
+		);
 	}
 }
 

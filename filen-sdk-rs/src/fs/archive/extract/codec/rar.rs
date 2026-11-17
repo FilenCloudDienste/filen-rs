@@ -78,18 +78,18 @@ impl std::fmt::Debug for HeldRar {
 /// decoder.
 const PARSE_SHARE: u64 = 2;
 
-/// Inline bytes of the largest header block rars keeps, of any RAR version.
-const BLOCK_BYTES: u64 = {
-	let rar50 = size_of::<rars::rar50::Block>();
-	let rar15 = size_of::<rars::rar15_40::Block>();
-	let rar13 = size_of::<rars::rar13::Entry>();
-	let most = if rar50 > rar15 { rar50 } else { rar15 };
-	(if most > rar13 { most } else { rar13 }) as u64
-};
-
-/// Heap one header can cost before its variable fields: rars' block, twice over for the slack
-/// of the Vec it grows in, and the member the table makes of it.
-const HEADER_HEAP: u64 = 2 * BLOCK_BYTES + size_of::<RarMember>() as u64;
+/// Heap one header of a RAR of `family` can cost before its variable fields: rars' block, twice
+/// over for the slack of the Vec it grows in, and the member the table makes of it. 1104 bytes
+/// for a RAR 5, 496 for a RAR 1.5 to 4, 256 for a RAR 1.3.
+fn header_heap(family: rars::ArchiveFamily) -> u64 {
+	let block = match family {
+		rars::ArchiveFamily::Rar13 => size_of::<rars::rar13::Entry>(),
+		rars::ArchiveFamily::Rar15To40 => size_of::<rars::rar15_40::Block>(),
+		// RAR 5's, the largest, for a family rars may add
+		_ => size_of::<rars::rar50::Block>(),
+	};
+	(2 * block + size_of::<RarMember>()) as u64
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RarKind {
@@ -149,6 +149,27 @@ fn rar_error(error: &rars::Error) -> Error {
 	{
 		return Error::custom(ErrorKind::Cancelled, "the archive job ended");
 	}
+	match error.root_cause() {
+		rars::Error::HeaderCountLimitExceeded { limit, .. } => {
+			return Error::custom(
+				ErrorKind::ArchiveTooLarge,
+				format!(
+					"the RAR holds more than {limit} headers, the most the client's archive codec \
+					 memory reads of one (see ArchiveConfig::codec_mem_budget)"
+				),
+			);
+		}
+		rars::Error::HeaderBytesLimitExceeded { limit, .. } => {
+			return Error::custom(
+				ErrorKind::ArchiveTooLarge,
+				format!(
+					"the RAR's headers take more than {limit} bytes, the most the client's archive \
+					 codec memory reads of one (see ArchiveConfig::codec_mem_budget)"
+				),
+			);
+		}
+		_ => {}
+	}
 	let kind = match error.kind() {
 		rars::ErrorKind::PasswordRequired => ErrorKind::ArchivePasswordRequired,
 		rars::ErrorKind::BadPassword => ErrorKind::ArchiveWrongPassword,
@@ -168,9 +189,9 @@ fn rar_error(error: &rars::Error) -> Error {
 /// What parsing the RAR's headers may spend: its share of the job's decoder memory, every
 /// header counted (members and service headers alike) before rars keeps it, and its bytes, whose
 /// names and fields the parse and the table copy.
-fn parse_options<'a>(job: &'a StreamJob) -> ArchiveReadOptions<'a> {
+fn parse_options<'a>(job: &'a StreamJob, family: rars::ArchiveFamily) -> ArchiveReadOptions<'a> {
 	let share = job.limits.decoder_memory / PARSE_SHARE;
-	let headers = (share / 2 / HEADER_HEAP).min(job.limits.max_members.saturating_add(2));
+	let headers = (share / 2 / header_heap(family)).min(job.limits.max_members.saturating_add(2));
 	ArchiveReadOptions::with_optional_password(
 		job.password.as_ref().map(|password| password.as_bytes()),
 	)
@@ -281,7 +302,7 @@ const SFX_SCAN_BYTES: usize = 1 << 20;
 
 /// Where the RAR in `input` starts: at its start, or after a self-extracting stub of at most
 /// [`SFX_SCAN_BYTES`], which only the archive's name made it look for.
-fn archive_start(input: &mut CachedInput<'static>) -> Result<u64, Error> {
+fn archive_start(input: &mut CachedInput<'static>) -> Result<(u64, rars::ArchiveFamily), Error> {
 	let scan = usize::try_from(input.len())
 		.unwrap_or(usize::MAX)
 		.min(SFX_SCAN_BYTES);
@@ -298,7 +319,7 @@ fn archive_start(input: &mut CachedInput<'static>) -> Result<u64, Error> {
 	}
 	head.truncate(filled);
 	rars::find_archive_start(&head, SFX_SCAN_BYTES)
-		.map(|signature| signature.offset as u64)
+		.map(|signature| (signature.offset as u64, signature.family))
 		.ok_or_else(|| {
 			Error::custom(
 				ErrorKind::ArchiveUnsupported,
@@ -334,7 +355,7 @@ impl Parsed {
 /// Parses the RAR `input` reads, through the driver.
 fn parse(input: CachedInput<'_>, job: &StreamJob) -> Result<Parsed, Error> {
 	let mut input = input.into_owned();
-	let offset = archive_start(&mut input)?;
+	let (offset, family) = archive_start(&mut input)?;
 	let len = input.len();
 	let input = Arc::new(Mutex::new(Some(input)));
 	let source = SeqReader::new(Box::new(Shifted {
@@ -342,7 +363,7 @@ fn parse(input: CachedInput<'_>, job: &StreamJob) -> Result<Parsed, Error> {
 		len,
 		offset,
 	}));
-	let archive = rars::ArchiveReader::read_reader_with_options(source, parse_options(job))
+	let archive = rars::ArchiveReader::read_reader_with_options(source, parse_options(job, family))
 		.map_err(|error| rar_error(&error))?;
 	let heap = parse_heap(&archive);
 	if heap > job.limits.decoder_memory / PARSE_SHARE {

@@ -197,8 +197,9 @@ impl ArchiveReader {
 	/// where the read of it before stopped, or from the nearest checkpoint before `start`, in
 	/// steps of at most 1 MiB of output on the CPU pool, its output held to the reader's
 	/// expansion limit; reads of one entry (of one member of a gzip tar) run one at a time, the
-	/// reader decodes two streams at once at most, and it keeps the decoder state of the two read
-	/// by range last, charging the checkpoints a read lays to its budget before laying them. The
+	/// reader decodes two steps at once at most (a read waiting on `writer` holds none), and it
+	/// keeps the decoder state of the two streams read by range last, charging the checkpoints a
+	/// read lays to its budget before laying them and giving that back however the read ends. The
 	/// read takes no job slot unless the index or tar listing is read again (see
 	/// [`Self::entry_byte_access`]), which `control` pauses; a cancel through it ends the read
 	/// at once. The bytes are not checked against the entry's checksum, which covers it whole.
