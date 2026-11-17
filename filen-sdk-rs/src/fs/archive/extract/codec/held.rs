@@ -38,6 +38,14 @@ impl HeldIndex {
 			Self::SevenZ { .. } => ArchiveFormat::SevenZ,
 		}
 	}
+
+	/// The heap it takes, in bytes.
+	pub(crate) fn heap_bytes(&self) -> u64 {
+		match self {
+			Self::Zip(index) => index.heap_bytes(),
+			Self::SevenZ { index, keys } => index.heap_bytes().saturating_add(keys.heap_bytes()),
+		}
+	}
 }
 
 /// Where a codec job gets the archive's index from.

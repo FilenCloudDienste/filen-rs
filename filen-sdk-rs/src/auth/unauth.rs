@@ -557,6 +557,8 @@ mod service_worker_client_tests {
 			archive_codec_mem_budget: None,
 			#[cfg(feature = "archive")]
 			archive_job_concurrency: None,
+			#[cfg(feature = "archive")]
+			archive_retained_budget: None,
 			batch_window_ms: None,
 		}
 	}

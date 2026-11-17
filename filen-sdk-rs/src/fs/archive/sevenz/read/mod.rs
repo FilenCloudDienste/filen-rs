@@ -315,6 +315,37 @@ impl SevenZIndex {
 	}
 }
 
+impl SevenZIndex {
+	/// The heap it takes, in bytes: what holding it for later jobs costs.
+	pub(crate) fn heap_bytes(&self) -> u64 {
+		let entries = self.entries.capacity() * mem::size_of::<SevenZEntry>()
+			+ self
+				.entries
+				.iter()
+				.map(|entry| entry.name.capacity())
+				.sum::<usize>();
+		let folders = self.folders.capacity() * mem::size_of::<Folder>()
+			+ self
+				.folders
+				.iter()
+				.map(|folder| {
+					folder.coders.capacity() * mem::size_of::<Coder>()
+						+ folder
+							.coders
+							.iter()
+							.map(|coder| coder.props.len())
+							.sum::<usize>() + folder.bind_pairs.capacity()
+						* mem::size_of::<(usize, usize)>()
+						+ folder.packed.capacity() * mem::size_of::<usize>()
+						+ folder.unpack_sizes.capacity() * mem::size_of::<u64>()
+				})
+				.sum::<usize>();
+		let packs =
+			(self.pack_offsets.capacity() + self.pack_sizes.capacity()) * mem::size_of::<u64>();
+		(mem::size_of::<Self>() + entries + folders + packs) as u64
+	}
+}
+
 /// What reading may spend on its index's heap.
 struct Heap {
 	left: u64,
@@ -352,6 +383,16 @@ pub(crate) struct DerivedKey {
 /// the same password, which then derive none of them again.
 #[derive(Debug, Default)]
 pub(crate) struct HeldKeys(Vec<DerivedKey>);
+
+impl HeldKeys {
+	/// The heap they take, in bytes.
+	pub(crate) fn heap_bytes(&self) -> u64 {
+		self.0
+			.iter()
+			.map(|derived| (mem::size_of::<DerivedKey>() + derived.salt.capacity()) as u64)
+			.sum()
+	}
+}
 
 impl<'p> Keys<'p> {
 	pub(crate) fn new(password: Option<&'p ArchivePassword>) -> Self {

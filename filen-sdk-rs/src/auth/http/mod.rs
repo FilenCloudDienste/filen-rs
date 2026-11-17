@@ -173,6 +173,9 @@ pub struct ClientConfig {
 	/// See [`ClientConfig::with_archive_job_concurrency`].
 	#[cfg(feature = "archive")]
 	pub(crate) archive_job_concurrency: usize,
+	/// See [`ClientConfig::with_archive_retained_budget`].
+	#[cfg(feature = "archive")]
+	pub(crate) archive_retained_budget: u64,
 	/// See [`ClientConfig::with_batch_window`].
 	batch_window: Duration,
 }
@@ -197,6 +200,16 @@ impl ClientConfig {
 	#[cfg(feature = "archive")]
 	pub fn with_archive_job_concurrency(mut self, archive_job_concurrency: usize) -> Self {
 		self.archive_job_concurrency = archive_job_concurrency;
+		self
+	}
+
+	/// Memory archive readers keep between their calls (indexes read, the archive chunks read
+	/// last), shared by every reader of the process; the platform's (48 MiB on the web, 64 MiB on
+	/// iOS and Android, 128 MiB elsewhere) is the most it can be, and 0 keeps nothing (see
+	/// [`ArchiveConfig::retained_budget`](crate::fs::archive::ArchiveConfig::retained_budget)).
+	#[cfg(feature = "archive")]
+	pub fn with_archive_retained_budget(mut self, archive_retained_budget: u64) -> Self {
+		self.archive_retained_budget = archive_retained_budget;
 		self
 	}
 
@@ -383,6 +396,8 @@ impl Default for ClientConfig {
 			archive_codec_mem_budget: crate::fs::archive::config::CODEC_MEM_BUDGET,
 			#[cfg(feature = "archive")]
 			archive_job_concurrency: crate::fs::archive::config::JOB_CONCURRENCY,
+			#[cfg(feature = "archive")]
+			archive_retained_budget: crate::fs::archive::config::RETAINED_BUDGET,
 			batch_window: DEFAULT_BATCH_WINDOW,
 			file_io_memory_budget: {
 				#[cfg(not(target_os = "ios"))]
@@ -465,6 +480,14 @@ pub struct JsClientConfig {
 	#[cfg_attr(all(target_family = "wasm", target_os = "unknown"), serde(default))]
 	#[cfg_attr(feature = "uniffi", uniffi(default = None))]
 	pub archive_job_concurrency: Option<u32>,
+	/// Memory archive readers keep between their calls (indexes read, the archive chunks read
+	/// last), in bytes, shared by every reader of the process; the platform's when left out, and
+	/// at most that (48 MiB on the web, 64 MiB on iOS and Android, 128 MiB elsewhere). 0 keeps
+	/// nothing: every call reads the archive's index again.
+	#[cfg(feature = "archive")]
+	#[cfg_attr(all(target_family = "wasm", target_os = "unknown"), serde(default))]
+	#[cfg_attr(feature = "uniffi", uniffi(default = None))]
+	pub archive_retained_budget: Option<u64>,
 	/// How long calls to a route with a bulk twin wait for others to send with them as one bulk
 	/// request, in milliseconds; the first call of a burst goes out at once. 5 when left out; 0
 	/// turns batching off (every call alone); at most 1000.
@@ -540,6 +563,9 @@ impl From<JsClientConfig> for ClientConfig {
 			}
 			if let Some(concurrency) = value.archive_job_concurrency {
 				config = config.with_archive_job_concurrency(concurrency as usize);
+			}
+			if let Some(budget) = value.archive_retained_budget {
+				config = config.with_archive_retained_budget(budget);
 			}
 		}
 		if let Some(ms) = value.batch_window_ms {

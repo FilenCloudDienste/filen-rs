@@ -22,6 +22,14 @@ mod js_impl;
 mod limits;
 mod names;
 mod password;
+#[cfg_attr(
+	not(test),
+	expect(
+		dead_code,
+		reason = "the archive reader, which keeps what it reads between its calls, is its user"
+	)
+)]
+mod retained;
 mod sevenz;
 mod tar_iter;
 #[cfg(test)]

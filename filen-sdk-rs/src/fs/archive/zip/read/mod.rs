@@ -176,6 +176,27 @@ pub(crate) struct ZipIndex {
 	pub(crate) trailing_bytes: u64,
 }
 
+impl ZipIndex {
+	/// The heap it takes, in bytes: what holding it for later jobs costs.
+	pub(crate) fn heap_bytes(&self) -> u64 {
+		let entries = |entries: &Vec<ZipEntry>| {
+			entries.capacity() * mem::size_of::<ZipEntry>()
+				+ entries
+					.iter()
+					.map(|entry| entry.name.capacity())
+					.sum::<usize>()
+		};
+		let duplicates = self.duplicate_names.capacity() * mem::size_of::<String>()
+			+ self
+				.duplicate_names
+				.iter()
+				.map(String::capacity)
+				.sum::<usize>();
+		(mem::size_of::<Self>() + entries(&self.entries) + entries(&self.overlapping) + duplicates)
+			as u64
+	}
+}
+
 fn u16_at(bytes: &[u8], at: usize) -> u16 {
 	u16::from_le_bytes([bytes[at], bytes[at + 1]])
 }

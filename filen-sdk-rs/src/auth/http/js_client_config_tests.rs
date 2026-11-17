@@ -15,6 +15,7 @@ fn base() -> JsClientConfig {
 		thumbnail_decode_concurrency: None,
 		archive_codec_mem_budget: None,
 		archive_job_concurrency: None,
+		archive_retained_budget: None,
 		batch_window_ms: None,
 	}
 }

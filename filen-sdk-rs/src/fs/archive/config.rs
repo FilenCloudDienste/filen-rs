@@ -6,6 +6,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::{
 	auth::http::ClientConfig,
+	fs::archive::retained::{RetainedPool, process_pool},
 	job::{JobControl, Stopped, report::Ops},
 };
 
@@ -17,6 +18,7 @@ mod defaults {
 	pub(crate) const JOB_CONCURRENCY: usize = 1;
 	pub(crate) const MAX_MEMBERS: u64 = 250_000;
 	pub(crate) const MAX_INDEX_BYTES: u64 = 16 << 20;
+	pub(crate) const RETAINED_BUDGET: u64 = 48 << 20;
 }
 #[cfg(target_os = "ios")]
 mod defaults {
@@ -24,6 +26,7 @@ mod defaults {
 	pub(crate) const JOB_CONCURRENCY: usize = 1;
 	pub(crate) const MAX_MEMBERS: u64 = 1_000_000;
 	pub(crate) const MAX_INDEX_BYTES: u64 = 32 << 20;
+	pub(crate) const RETAINED_BUDGET: u64 = 64 << 20;
 }
 #[cfg(target_os = "android")]
 mod defaults {
@@ -31,6 +34,7 @@ mod defaults {
 	pub(crate) const JOB_CONCURRENCY: usize = 1;
 	pub(crate) const MAX_MEMBERS: u64 = 1_000_000;
 	pub(crate) const MAX_INDEX_BYTES: u64 = 32 << 20;
+	pub(crate) const RETAINED_BUDGET: u64 = 64 << 20;
 }
 #[cfg(not(any(
 	all(target_family = "wasm", target_os = "unknown"),
@@ -42,9 +46,10 @@ mod defaults {
 	pub(crate) const JOB_CONCURRENCY: usize = 2;
 	pub(crate) const MAX_MEMBERS: u64 = 1_000_000;
 	pub(crate) const MAX_INDEX_BYTES: u64 = 32 << 20;
+	pub(crate) const RETAINED_BUDGET: u64 = 128 << 20;
 }
 
-pub(crate) use defaults::{CODEC_MEM_BUDGET, JOB_CONCURRENCY};
+pub(crate) use defaults::{CODEC_MEM_BUDGET, JOB_CONCURRENCY, RETAINED_BUDGET};
 
 /// The smallest codec budget: enough for every decoder at its default settings.
 const MIN_CODEC_MEM_BUDGET: u64 = 16 << 20;
@@ -60,6 +65,15 @@ pub struct ArchiveConfig {
 	codec_mem_budget: u64,
 	/// See [`ArchiveConfig::job_concurrency`].
 	job_concurrency: usize,
+	/// See [`ArchiveConfig::retained_budget`].
+	retained_budget: u64,
+	/// What every archive reader of the process keeps between its calls, charged against
+	/// `retained_budget`.
+	#[expect(
+		dead_code,
+		reason = "the archive reader, which keeps what it reads between its calls, is its user"
+	)]
+	pub(crate) retained: Arc<RetainedPool>,
 	/// Most members an archive may have, every tar record counted, and most directories an
 	/// extraction plans, those only implied by the paths below them counted too, as are the
 	/// folders in `__MACOSX` folders when macOS metadata is left out. Extracting or
@@ -96,6 +110,9 @@ impl ArchiveConfig {
 		Self {
 			codec_mem_budget: config.archive_codec_mem_budget.max(MIN_CODEC_MEM_BUDGET),
 			job_concurrency,
+			// lowered only: the pool is the process's, and its default the platform's ceiling
+			retained_budget: config.archive_retained_budget.min(RETAINED_BUDGET),
+			retained: process_pool(),
 			max_members: defaults::MAX_MEMBERS,
 			max_index_bytes: defaults::MAX_INDEX_BYTES,
 			gate,
@@ -117,6 +134,15 @@ impl ArchiveConfig {
 	/// without taking it.
 	pub fn job_concurrency(&self) -> usize {
 		self.job_concurrency
+	}
+
+	/// Memory, in bytes, that archive readers keep between their calls: indexes read, and the
+	/// archive chunks read last. It is shared by every reader of the process: a reader that needs
+	/// more takes it from the readers used least recently, which then read again what they gave
+	/// up. 48 MiB on the web, 64 MiB on iOS and Android, 128 MiB elsewhere, or less when the
+	/// client's config asks for less; 0 keeps nothing.
+	pub fn retained_budget(&self) -> u64 {
+		self.retained_budget
 	}
 
 	/// Waits for a job slot, held until dropped. A pause stops the wait: the job waits the pause
@@ -181,5 +207,17 @@ mod tests {
 			ArchiveConfig::new(&ClientConfig::default().with_archive_job_concurrency(usize::MAX));
 		assert_eq!(config.job_concurrency(), Semaphore::MAX_PERMITS);
 		assert_eq!(config.free_slots(), Semaphore::MAX_PERMITS);
+	}
+
+	#[test]
+	fn the_retained_budget_can_be_lowered_but_not_raised() {
+		let lowered =
+			ArchiveConfig::new(&ClientConfig::default().with_archive_retained_budget(5 << 20));
+		assert_eq!(lowered.retained_budget(), 5 << 20);
+		let raised =
+			ArchiveConfig::new(&ClientConfig::default().with_archive_retained_budget(u64::MAX));
+		assert_eq!(raised.retained_budget(), RETAINED_BUDGET);
+		let none = ArchiveConfig::new(&ClientConfig::default().with_archive_retained_budget(0));
+		assert_eq!(none.retained_budget(), 0);
 	}
 }
