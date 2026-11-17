@@ -145,19 +145,26 @@ pub(super) fn extract_zip(
 	mut input: CachedInput<'_>,
 	job: &StreamJob,
 ) -> Result<ArchiveEnd, Error> {
-	let mut source = BorrowedSeqReader::new(&mut input);
-	let limits = ZipLimits {
-		max_index_bytes: job.limits.max_index_bytes,
-		max_entries: job.limits.max_members,
-	};
-	let index = read_index(&mut source, job.len, limits).map_err(Error::from)?;
-	let end = zip_entries(walk, &mut source, &index, job)?;
+	let index = read_zip_index(&mut input, job)?;
+	let end = zip_entries(walk, &mut BorrowedSeqReader::new(&mut input), &index, job)?;
 	if matches!(job.index, IndexUse::ReadAndReturn) {
 		walk.port
 			.send(WorkerEvent::Indexed(Box::new(HeldIndex::Zip(index))))
 			.map_err(read_failure)?;
 	}
 	Ok(end)
+}
+
+/// A zip's index, read from `input` within the job's limits.
+pub(super) fn read_zip_index(
+	input: &mut CachedInput<'_>,
+	job: &StreamJob,
+) -> Result<ZipIndex, Error> {
+	let limits = ZipLimits {
+		max_index_bytes: job.limits.max_index_bytes,
+		max_entries: job.limits.max_members,
+	};
+	read_index(&mut BorrowedSeqReader::new(input), job.len, limits).map_err(Error::from)
 }
 
 /// A zip whose `index` an earlier job read, from its entries on.

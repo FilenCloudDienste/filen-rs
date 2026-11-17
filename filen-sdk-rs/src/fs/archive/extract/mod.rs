@@ -6,6 +6,7 @@ pub(super) mod codec;
 mod download;
 mod engine;
 mod list;
+pub(super) mod reading;
 pub(super) mod report;
 #[cfg(test)]
 mod test_support;

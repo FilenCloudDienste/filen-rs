@@ -25,7 +25,7 @@ use crate::{
 					wrong_key,
 				},
 			},
-			worker::{CachedInput, EntryKind, WorkerEvent, from_source},
+			worker::{CachedInput, EntryKind, WorkerEvent, WorkerPort, from_source},
 		},
 		drive_job::exceeds_limit,
 	},
@@ -181,6 +181,25 @@ pub(super) fn extract_sevenz(
 		.map_err(read_failure)?;
 	}
 	Ok(end)
+}
+
+/// A 7z's index, read from `input`, with the keys derived for it, to hold for later jobs.
+pub(super) fn read_sevenz_held(
+	port: &WorkerPort,
+	mut input: CachedInput<'_>,
+	job: &StreamJob,
+) -> Result<HeldIndex, Error> {
+	let keep_alive = || port.keep_alive();
+	let mut keys = Keys::new(job.password.as_ref()).with_on_round(&keep_alive);
+	let index = read_sevenz_index(
+		&mut BorrowedSeqReader::new(&mut input),
+		job.len,
+		sevenz_limits(job),
+		&mut keys,
+	)
+	.map_err(Error::from)?;
+	let keys = keys.into_held();
+	Ok(HeldIndex::SevenZ { index, keys })
 }
 
 /// A 7z whose `index` an earlier job read, from its entries on, with the keys it derived.

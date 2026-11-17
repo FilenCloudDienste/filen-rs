@@ -217,7 +217,10 @@ fn run_job_holding(job: StreamJob, mut answer: impl FnMut(u64) -> Option<Vec<u8>
 			WorkerEvent::Listed(entry) => seen.push(Seen::Listed(*entry)),
 			WorkerEvent::Head(_) => panic!("an extracting codec sent a head"),
 			WorkerEvent::Indexed(index) => {
-				seen.push(Seen::Indexed(index.format()));
+				seen.push(Seen::Indexed(match *index {
+					HeldIndex::Zip(_) => ArchiveFormat::Zip,
+					HeldIndex::SevenZ { .. } => ArchiveFormat::SevenZ,
+				}));
 				held = Some(index);
 			}
 		}

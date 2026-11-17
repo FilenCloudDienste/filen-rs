@@ -1,0 +1,326 @@
+//! A handle on one archive in the drive, which its calls share so each reads only what it needs:
+//! an index read once is held for the calls after it, and so are the archive's chunks read last
+//! (within [`ArchiveConfig::retained_budget`]). No job stays alive between two calls: each runs
+//! a codec job of its own, for its own duration, and is handed what the reader holds.
+
+#![warn(unreachable_pub, unused_qualifications)]
+
+use std::sync::{
+	Arc, Mutex, PoisonError,
+	atomic::{AtomicBool, Ordering},
+};
+
+use filen_types::fs::Uuid;
+use futures::AsyncWrite;
+
+use crate::{
+	Error, ErrorKind,
+	auth::Client,
+	fs::{
+		HasUUID,
+		archive::{
+			config::ArchiveConfig,
+			extract::{
+				ArchiveEntryId, EntryDownloadCallback, EntryDownloadConfig, EntryDownloadFailed,
+				EntryDownloadReport, ListCallback, ListConfig, ListFailed, ListReport,
+				codec::{HeldIndex, IndexUse},
+				reading::{ReadJob, download, list, open},
+			},
+			format::ArchiveFormat,
+			retained::Retained,
+		},
+		drive_job::backend::{ClientBackend, DriveBackend},
+		file::enums::RemoteFileType,
+	},
+	job::{JobControl, report::JobFailed},
+	util::MaybeSend,
+};
+
+/// How [`ArchiveReader::download_entry`] reads its entry; the reader's settings (from
+/// [`Client::open_archive_reader`]) give the rest.
+#[derive(Debug, Clone)]
+pub struct ReaderDownloadEntryConfig {
+	/// As [`EntryDownloadConfig::max_solid_skip`]: `Some(0)` by default.
+	pub max_solid_skip: Option<u64>,
+}
+
+impl Default for ReaderDownloadEntryConfig {
+	fn default() -> Self {
+		Self {
+			max_solid_skip: EntryDownloadConfig::default().max_solid_skip,
+		}
+	}
+}
+
+/// An open archive: see [`Client::open_archive_reader`].
+pub struct ArchiveReader {
+	reader: Reader<ClientBackend>,
+}
+
+impl Client {
+	/// Opens `archive` for the calls of an [`ArchiveReader`], under `config`'s settings, which
+	/// every call of the reader keeps.
+	///
+	/// A zip or 7z has its first chunk and its index read, and the index is held for the
+	/// reader's later calls, which then start at their entries (a 7z's keys derived for it come
+	/// with it). A tar or single compressed file has only its head read. Opening takes one of the
+	/// [`ArchiveConfig::job_concurrency`] archive job slots for its own duration, reports its
+	/// progress to `callback` (which gets no entries: [`ArchiveReader::list`] lists them) and can
+	/// be paused and cancelled through `control`.
+	///
+	/// Fails as a listing does: a 7z whose index is encrypted needs the password here.
+	pub async fn open_archive_reader(
+		self: Arc<Self>,
+		archive: RemoteFileType<'static>,
+		config: ListConfig,
+		callback: impl ListCallback,
+		control: JobControl,
+	) -> Result<ArchiveReader, ListFailed> {
+		let config_of_client = self.archives().clone();
+		let reader = Reader::new(
+			Arc::new(ClientBackend::new(self)),
+			archive,
+			config_of_client,
+			config,
+		);
+		reader.open(callback, control).await?;
+		Ok(ArchiveReader { reader })
+	}
+}
+
+impl ArchiveReader {
+	/// This reader's own id: a new one each time an archive is opened.
+	pub fn id(&self) -> Uuid {
+		self.reader.id
+	}
+
+	/// The id of its archive, which the [`ArchiveEntryId`]s of its entries carry: the file's
+	/// uuid, so the ids [`Client::list_archive`] gives are this reader's too.
+	pub fn archive_id(&self) -> Uuid {
+		self.reader.archive.uuid()
+	}
+
+	/// What the archive is; `None` only if opening could not tell, which fails the open.
+	pub fn format(&self) -> Option<ArchiveFormat> {
+		self.reader.format()
+	}
+
+	/// Whether the reader holds the archive's index right now. A held index can be given up
+	/// for room another reader needs (see
+	/// [`ArchiveConfig::retained_budget`](crate::fs::archive::ArchiveConfig::retained_budget)):
+	/// the next call that needs it reads it again, and holds it again when it can.
+	pub fn index_held(&self) -> bool {
+		self.reader.index_held()
+	}
+
+	/// Gives up what the reader holds. Every later call fails with
+	/// [`ErrorKind::InvalidState`]; a call already running goes on to its end.
+	pub fn close(&self) {
+		self.reader.close();
+	}
+
+	/// Lists the archive's entries, as [`Client::list_archive`] does with the reader's settings,
+	/// a zip's or 7z's from the index the reader holds.
+	pub async fn list(
+		&self,
+		callback: impl ListCallback,
+		control: JobControl,
+	) -> Result<ListReport, ListFailed> {
+		self.reader.list(callback, control).await
+	}
+
+	/// Writes the data of `entry`, a file of the zip or 7z, to `writer`, then closes `writer`,
+	/// as [`Client::download_archive_entry`] does with the reader's settings: checked against
+	/// the CRC-32 or authentication code the archive has for it before `writer` is closed. Only
+	/// the entry is read when the reader holds the index (and, for a 7z entry in a solid
+	/// block, what the block stores before it).
+	pub async fn download_entry<W>(
+		&self,
+		entry: ArchiveEntryId,
+		writer: &mut W,
+		config: ReaderDownloadEntryConfig,
+		callback: impl EntryDownloadCallback,
+		control: JobControl,
+	) -> Result<EntryDownloadReport, EntryDownloadFailed>
+	where
+		W: AsyncWrite + Unpin + MaybeSend,
+	{
+		self.reader
+			.download_entry(entry, writer, config.max_solid_skip, callback, control)
+			.await
+	}
+}
+
+/// What a reader holds and how it reads, over any drive backend.
+pub(crate) struct Reader<B> {
+	backend: Arc<B>,
+	archive: RemoteFileType<'static>,
+	id: Uuid,
+	config: ArchiveConfig,
+	settings: ListConfig,
+	format: Mutex<Option<ArchiveFormat>>,
+	/// What it keeps between its calls; `None` for a reader of one call, which keeps nothing.
+	retained: Option<Arc<Retained>>,
+	closed: AtomicBool,
+}
+
+impl<B: DriveBackend> Reader<B> {
+	/// A reader of `archive`, under the client's `config` and the reader's `settings`.
+	pub(crate) fn new(
+		backend: Arc<B>,
+		archive: RemoteFileType<'static>,
+		config: ArchiveConfig,
+		settings: ListConfig,
+	) -> Self {
+		let retained = Retained::new(Arc::clone(&config.retained), config.retained_budget());
+		Self {
+			retained: Some(retained),
+			..Self::once(backend, archive, config, settings)
+		}
+	}
+
+	/// A reader for one call, which keeps nothing: what [`Client::list_archive`] and
+	/// [`Client::download_archive_entry`] read through.
+	pub(crate) fn once(
+		backend: Arc<B>,
+		archive: RemoteFileType<'static>,
+		config: ArchiveConfig,
+		settings: ListConfig,
+	) -> Self {
+		Self {
+			backend,
+			archive,
+			id: Uuid::new_v4(),
+			config,
+			settings,
+			format: Mutex::new(None),
+			retained: None,
+			closed: AtomicBool::new(false),
+		}
+	}
+
+	pub(crate) fn format(&self) -> Option<ArchiveFormat> {
+		*self.format.lock().unwrap_or_else(PoisonError::into_inner)
+	}
+
+	fn note_format(&self, format: Option<ArchiveFormat>) {
+		if let Some(format) = format {
+			*self.format.lock().unwrap_or_else(PoisonError::into_inner) = Some(format);
+		}
+	}
+
+	pub(crate) fn index_held(&self) -> bool {
+		self.retained
+			.as_ref()
+			.is_some_and(|retained| retained.index().is_some())
+	}
+
+	pub(crate) fn close(&self) {
+		self.closed.store(true, Ordering::SeqCst);
+		if let Some(retained) = &self.retained {
+			retained.close();
+		}
+	}
+
+	/// The error of a call on a closed reader.
+	pub(crate) fn ensure_open(&self) -> Result<(), Error> {
+		if self.closed.load(Ordering::SeqCst) {
+			return Err(Error::custom(
+				ErrorKind::InvalidState,
+				"the archive reader is closed",
+			));
+		}
+		Ok(())
+	}
+
+	/// Where the next job gets the index from: the one held, or read and handed back to be held.
+	fn index_use(&self) -> IndexUse {
+		match self.retained.as_ref().map(|retained| retained.index()) {
+			Some(Some(index)) => IndexUse::Held(index),
+			Some(None) => IndexUse::ReadAndReturn,
+			None => IndexUse::Read,
+		}
+	}
+
+	/// Holds `index`, which a job read, for the calls after it.
+	pub(crate) fn hold(&self, index: Option<Box<HeldIndex>>) {
+		if let (Some(retained), Some(index)) = (&self.retained, index)
+			&& !self.closed.load(Ordering::SeqCst)
+		{
+			retained.hold_index(Arc::from(index));
+		}
+	}
+
+	pub(crate) async fn open(
+		&self,
+		callback: impl ListCallback,
+		control: JobControl,
+	) -> Result<(), ListFailed> {
+		let opened = open(self.read_job(control), callback).await?;
+		self.note_format(Some(opened.format));
+		self.hold(opened.index);
+		Ok(())
+	}
+
+	pub(crate) async fn list(
+		&self,
+		callback: impl ListCallback,
+		control: JobControl,
+	) -> Result<ListReport, ListFailed> {
+		if let Err(error) = self.ensure_open() {
+			return Err(JobFailed {
+				report: ListReport::empty(),
+				error: Arc::new(error),
+			});
+		}
+		let listed = list(self.read_job(control), callback).await?;
+		self.note_format(listed.report.format);
+		self.hold(listed.index);
+		Ok(listed.report)
+	}
+
+	pub(crate) async fn download_entry<W>(
+		&self,
+		entry: ArchiveEntryId,
+		writer: &mut W,
+		max_solid_skip: Option<u64>,
+		callback: impl EntryDownloadCallback,
+		control: JobControl,
+	) -> Result<EntryDownloadReport, EntryDownloadFailed>
+	where
+		W: AsyncWrite + Unpin + MaybeSend,
+	{
+		if let Err(error) = self.ensure_open() {
+			return Err(JobFailed {
+				report: EntryDownloadReport::default(),
+				error: Arc::new(error),
+			});
+		}
+		let (downloaded, index) = download(
+			self.read_job(control),
+			entry,
+			writer,
+			max_solid_skip,
+			callback,
+		)
+		.await;
+		self.hold(index);
+		downloaded
+	}
+
+	/// What a job of this reader reads, and how.
+	pub(crate) fn read_job(&self, control: JobControl) -> ReadJob<B> {
+		ReadJob {
+			backend: Arc::clone(&self.backend),
+			archive: self.archive.clone(),
+			config: self.config.clone(),
+			settings: self.settings.clone(),
+			index: self.index_use(),
+			chunks: self.retained.clone(),
+			control,
+		}
+	}
+}
+
+#[cfg(test)]
+mod tests;

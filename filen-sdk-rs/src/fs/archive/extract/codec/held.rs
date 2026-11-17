@@ -6,7 +6,6 @@
 use std::sync::Arc;
 
 use crate::fs::archive::{
-	format::ArchiveFormat,
 	sevenz::read::{HeldKeys, SevenZIndex},
 	zip::read::ZipIndex,
 };
@@ -24,21 +23,6 @@ pub(crate) enum HeldIndex {
 }
 
 impl HeldIndex {
-	/// What the archive is.
-	#[cfg_attr(
-		not(test),
-		expect(
-			dead_code,
-			reason = "the archive reader, which holds indexes, reads it"
-		)
-	)]
-	pub(crate) fn format(&self) -> ArchiveFormat {
-		match self {
-			Self::Zip(_) => ArchiveFormat::Zip,
-			Self::SevenZ { .. } => ArchiveFormat::SevenZ,
-		}
-	}
-
 	/// The heap it takes, in bytes.
 	pub(crate) fn heap_bytes(&self) -> u64 {
 		match self {
@@ -50,13 +34,6 @@ impl HeldIndex {
 
 /// Where a codec job gets the archive's index from.
 #[derive(Debug, Clone)]
-#[cfg_attr(
-	not(test),
-	expect(
-		dead_code,
-		reason = "the archive reader, which holds indexes, starts such jobs"
-	)
-)]
 pub(crate) enum IndexUse {
 	/// It reads the archive's head and index itself, as any job does on its own.
 	Read,

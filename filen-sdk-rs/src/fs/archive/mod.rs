@@ -22,13 +22,7 @@ mod js_impl;
 mod limits;
 mod names;
 mod password;
-#[cfg_attr(
-	not(test),
-	expect(
-		dead_code,
-		reason = "the archive reader, which keeps what it reads between its calls, is its user"
-	)
-)]
+mod reader;
 mod retained;
 mod sevenz;
 mod tar_iter;
@@ -59,5 +53,6 @@ pub use extract::{
 };
 pub use format::{ArchiveFormat, StreamCodec, archive_default_name};
 pub use password::ArchivePassword;
+pub use reader::{ArchiveReader, ReaderDownloadEntryConfig};
 pub use sevenz::write::{SevenZEncryption, SevenZMethod};
 pub use zip::{crypto::AesStrength, write::ZipMethod};

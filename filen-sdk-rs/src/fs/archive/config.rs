@@ -69,10 +69,6 @@ pub struct ArchiveConfig {
 	retained_budget: u64,
 	/// What every archive reader of the process keeps between its calls, charged against
 	/// `retained_budget`.
-	#[expect(
-		dead_code,
-		reason = "the archive reader, which keeps what it reads between its calls, is its user"
-	)]
 	pub(crate) retained: Arc<RetainedPool>,
 	/// Most members an archive may have, every tar record counted, and most directories an
 	/// extraction plans, those only implied by the paths below them counted too, as are the
@@ -183,6 +179,14 @@ pub(crate) mod test_support {
 	use super::ArchiveConfig;
 
 	impl ArchiveConfig {
+		/// Settings whose readers draw on a pool of their own of `budget` bytes, so a test's
+		/// readers meet no other test's.
+		pub(crate) fn with_own_pool(mut self, budget: u64) -> Self {
+			self.retained_budget = budget;
+			self.retained = std::sync::Arc::default();
+			self
+		}
+
 		/// Job slots no job holds.
 		pub(crate) fn free_slots(&self) -> usize {
 			self.gate.available_permits()

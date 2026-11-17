@@ -183,8 +183,9 @@ fn download_with(
 				ordinal: u64::from(entry.index),
 				config: test_config(),
 				start: codec(job),
+				chunks: None,
 			};
-			tokio::spawn(async move { run_download(task, &mut writer).await })
+			tokio::spawn(async move { run_download(task, &mut writer).await.0 })
 		}
 	};
 	Download {

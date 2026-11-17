@@ -8,12 +8,7 @@ use futures::AsyncWrite;
 use crate::{
 	auth::Client,
 	fs::{
-		HasName, HasUUID,
-		archive::{
-			ArchivePassword,
-			config::ArchiveConfig,
-			worker::{self, CodecStart},
-		},
+		archive::{ArchivePassword, reader::Reader},
 		drive_job::backend::ClientBackend,
 		file::{enums::RemoteFileType, traits::HasFileInfo},
 	},
@@ -24,15 +19,15 @@ use crate::{
 use super::{
 	ArchiveEntryId, ArchiveSource, EntryDownloadCallback, EntryDownloadFailed, EntryDownloadReport,
 	ExpansionLimit, ExtractCallback, ExtractFailed, ExtractReport, ExtractRequest, ExtractWhat,
-	codec::{CodecLimits, IndexUse, StreamJob, Task, extract_stream},
-	download::{DownloadTask, EntryDownloadReporter, choose_entry, run_download},
-	engine::{ArchiveDisposal, CodecResult, ExtractTask, run_extract},
-	list::{ListCallback, ListFailed, ListReport, ListReporter, ListTask, run_list},
+	codec::{IndexUse, Task},
+	engine::{ArchiveDisposal, ExtractTask, run_extract},
+	list::{ListCallback, ListFailed, ListReport},
+	reading::start_codec,
 	report::Reporter,
 };
 
 /// How an extraction runs: its limits, the archive's password and what it leaves out. The
-/// client's [`ArchiveConfig`] sets the rest (codec memory, and how many archive jobs run at
+/// client's [`ArchiveConfig`](crate::fs::archive::ArchiveConfig) sets the rest (codec memory, and how many archive jobs run at
 /// once).
 #[derive(Debug, Clone)]
 pub struct ExtractConfig {
@@ -130,7 +125,7 @@ impl ListConfig {
 	}
 }
 
-/// How [`Client::download_archive_entry`] reads its archive. The client's [`ArchiveConfig`] sets
+/// How [`Client::download_archive_entry`] reads its archive. The client's [`ArchiveConfig`](crate::fs::archive::ArchiveConfig) sets
 /// the rest (codec memory, and how many archive jobs run at once).
 #[derive(Debug, Clone)]
 pub struct EntryDownloadConfig {
@@ -245,7 +240,13 @@ impl Client {
 			.unwrap_or_default();
 		let (max_bytes, max_items, expansion) =
 			(config.max_bytes, config.max_items, config.expansion_limit);
-		let start = start_codec(&archive, &archives, config, Task::Extract(selection));
+		let start = start_codec(
+			&archive,
+			&archives,
+			config,
+			Task::Extract(selection),
+			IndexUse::Read,
+		);
 		run_extract(ExtractTask {
 			backend: Arc::new(ClientBackend::new(self)),
 			control,
@@ -300,18 +301,13 @@ impl Client {
 		control: JobControl,
 	) -> Result<ListReport, ListFailed> {
 		let archives = self.archives().clone();
-		let task = Task::List {
-			archive: archive.uuid(),
-		};
-		let start = start_codec(&archive, &archives, config.into_extraction(), task);
-		run_list(ListTask {
-			backend: Arc::new(ClientBackend::new(self)),
-			control,
-			reporter: ListReporter::new(callback, archive.size()),
+		Reader::once(
+			Arc::new(ClientBackend::new(self)),
 			archive,
-			config: archives,
-			start,
-		})
+			archives,
+			config,
+		)
+		.list(callback, control)
 		.await
 	}
 
@@ -359,67 +355,27 @@ impl Client {
 	where
 		W: AsyncWrite + Unpin + MaybeSend,
 	{
-		let reporter = EntryDownloadReporter::new(callback, archive.size());
-		let (archive, selection) = choose_entry(archive, entry, &reporter)?;
 		let archives = self.archives().clone();
 		let EntryDownloadConfig {
 			expansion_limit,
 			password,
 			max_solid_skip,
 		} = config;
-		// the entry was chosen by its id, so macOS metadata is not left out
-		let extraction = ExtractConfig {
-			max_bytes: None,
-			max_items: None,
+		let settings = ListConfig {
 			expansion_limit,
-			password,
+			// the entry is chosen by its id, so macOS metadata is not left out
 			skip_mac_metadata: false,
+			password,
 		};
-		let task = Task::Download {
-			selection,
-			max_solid_skip,
-		};
-		let start = start_codec(&archive, &archives, extraction, task);
-		run_download(
-			DownloadTask {
-				backend: Arc::new(ClientBackend::new(self)),
-				control,
-				reporter,
-				archive,
-				ordinal: u64::from(entry.index),
-				config: archives,
-				start,
-			},
-			writer,
+		Reader::once(
+			Arc::new(ClientBackend::new(self)),
+			archive,
+			archives,
+			settings,
 		)
+		.download_entry(entry, writer, max_solid_skip, callback, control)
 		.await
 	}
-}
-
-/// Starts the codec that reads `archive` for `task`, under the client's `archives` settings and
-/// the job's `config`.
-fn start_codec(
-	archive: &RemoteFileType<'static>,
-	archives: &ArchiveConfig,
-	config: ExtractConfig,
-	task: Task,
-) -> CodecStart<CodecResult> {
-	let job = StreamJob {
-		name: archive.name().unwrap_or_default().to_owned(),
-		len: archive.size(),
-		limits: CodecLimits {
-			decoder_memory: archives.codec_mem_budget(),
-			max_members: archives.max_members,
-			expansion: config.expansion_limit,
-			max_index_bytes: archives.max_index_bytes,
-			max_bytes: config.max_bytes,
-		},
-		password: config.password,
-		skip_mac_metadata: config.skip_mac_metadata,
-		task,
-		index: IndexUse::Read,
-	};
-	Box::new(move || worker::start(move |port| extract_stream(&port, job)))
 }
 
 #[cfg(test)]
@@ -428,6 +384,7 @@ mod tests {
 	use crate::{
 		ErrorKind,
 		fs::{
+			HasUUID,
 			archive::extract::{
 				ArchiveEntry, EntryDownloadUpdate, EntrySelection, ExtractRoot, ExtractUpdate,
 				ExtractedTopLevel, ListUpdate,

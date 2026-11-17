@@ -39,9 +39,9 @@ use super::{
 use entries::{Found, Verdict, Walk, apple_double};
 pub(crate) use entries::{LinkKeys, Selection, Task};
 pub(crate) use held::{HeldIndex, IndexUse};
-use sevenz::{extract_held_sevenz, extract_sevenz};
+use sevenz::{extract_held_sevenz, extract_sevenz, read_sevenz_held};
 use tar::walk_tar;
-use zip::{extract_held_zip, extract_zip};
+use zip::{extract_held_zip, extract_zip, read_zip_index};
 
 /// What the codec may spend on an archive.
 #[derive(Debug, Clone, Copy)]
@@ -158,15 +158,7 @@ pub(crate) fn extract_stream(port: &WorkerPort, job: StreamJob) -> Result<Archiv
 			let mut block = [0u8; TAR_BLOCK];
 			let block_len = read_full(&mut decoded, &mut block).map_err(read_failure)?;
 			let block = &block[..block_len];
-			// both refuse a block cut short. An empty tar decodes to its end-of-archive marker
-			// alone, so only its name tells it from a file of zeros
-			let tar = block.first_chunk().is_some_and(is_tar_header)
-				|| is_end_marker(block)
-					&& matches!(
-						ArchiveFormat::of_name(&job.name),
-						Some(ArchiveFormat::Tar { codec: Some(_) })
-					);
-			if tar {
+			if decodes_to_tar(block, &job.name) {
 				port.send(WorkerEvent::Opened(ArchiveFormat::Tar {
 					codec: Some(codec),
 				}))
@@ -200,11 +192,76 @@ pub(crate) fn extract_stream(port: &WorkerPort, job: StreamJob) -> Result<Archiv
 			CachedInput::rereading(source.into_inner().1),
 			&job,
 		),
-		None => Err(Error::custom(
-			ErrorKind::ArchiveUnsupported,
-			"the file is not an archive the SDK can extract",
-		)),
+		None => Err(not_an_archive()),
 	}
+}
+
+/// Opens an archive through `port` for a reader: tells what it is from its head, and for a zip
+/// or 7z reads its index and hands it to the driver
+/// ([`WorkerEvent::Indexed`]), entries unread. A tar or a single compressed file has no index:
+/// only its head is read (for a compressed one, the first block it decodes to, which tells a
+/// tar from a single file).
+pub(crate) fn open_archive(port: &WorkerPort, job: StreamJob) -> Result<ArchiveEnd, Error> {
+	let mut input = ChunkInput::new(port, 0, job.len);
+	let mut head = [0u8; DETECT_HEAD_LEN];
+	let head_len = read_full(&mut input, &mut head).map_err(read_failure)?;
+	let head = &head[..head_len];
+	let format = match detect(head, &job.name) {
+		Some(Detected::Tar) => ArchiveFormat::Tar { codec: None },
+		Some(Detected::Stream(codec)) => {
+			let source = Cursor::new(head).chain(input);
+			let mut decoder =
+				open_stream(codec, source, job.limits.decoder_memory).map_err(Error::from)?;
+			let mut block = [0u8; TAR_BLOCK];
+			let block_len = read_full(&mut decoder, &mut block).map_err(read_failure)?;
+			if decodes_to_tar(&block[..block_len], &job.name) {
+				ArchiveFormat::Tar { codec: Some(codec) }
+			} else {
+				ArchiveFormat::Single { codec }
+			}
+		}
+		Some(Detected::Zip) => {
+			let mut input = CachedInput::rereading(input);
+			let index = read_zip_index(&mut input, &job)?;
+			port.send(WorkerEvent::Opened(ArchiveFormat::Zip))
+				.map_err(read_failure)?;
+			port.send(WorkerEvent::Indexed(Box::new(HeldIndex::Zip(index))))
+				.map_err(read_failure)?;
+			return Ok(ArchiveEnd::plain(0, 0));
+		}
+		Some(Detected::SevenZ) => {
+			let index = read_sevenz_held(port, CachedInput::rereading(input), &job)?;
+			port.send(WorkerEvent::Opened(ArchiveFormat::SevenZ))
+				.map_err(read_failure)?;
+			port.send(WorkerEvent::Indexed(Box::new(index)))
+				.map_err(read_failure)?;
+			return Ok(ArchiveEnd::plain(0, 0));
+		}
+		None => return Err(not_an_archive()),
+	};
+	port.send(WorkerEvent::Opened(format))
+		.map_err(read_failure)?;
+	Ok(ArchiveEnd::plain(0, 0))
+}
+
+/// Whether a stream whose first decoded block is `block` holds a tar, its archive named
+/// `name`. Both refuse a block cut short. An empty tar decodes to its end-of-archive marker
+/// alone, so only its name tells it from a file of zeros.
+fn decodes_to_tar(block: &[u8], name: &str) -> bool {
+	block.first_chunk().is_some_and(is_tar_header)
+		|| is_end_marker(block)
+			&& matches!(
+				ArchiveFormat::of_name(name),
+				Some(ArchiveFormat::Tar { codec: Some(_) })
+			)
+}
+
+/// What a file that is no archive the SDK reads fails with.
+fn not_an_archive() -> Error {
+	Error::custom(
+		ErrorKind::ArchiveUnsupported,
+		"the file is not an archive the SDK can extract",
+	)
 }
 
 /// A single compressed file: one entry, named after the archive without its codec extension.

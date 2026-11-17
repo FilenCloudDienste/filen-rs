@@ -248,7 +248,7 @@ async fn read<B: DriveBackend>(
 	mut check: Check,
 ) -> Result<Result<(), Unread>, Stopped> {
 	let file = Arc::new(RemoteFileType::from(archive.clone()));
-	let mut feed = CodecFeed::new(Arc::clone(backend), file, link, reporter.op());
+	let mut feed = CodecFeed::new(Arc::clone(backend), file, link, reporter.op(), None);
 	// what the reader read so far, each chunk counted once however often it asks for it
 	let mut verified = 0;
 	let mut report_verified = |feed: &CodecFeed<B, ArchiveEnd>| {

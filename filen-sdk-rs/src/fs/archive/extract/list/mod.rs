@@ -13,6 +13,7 @@ use crate::{
 			config::ArchiveConfig,
 			format::ArchiveFormat,
 			input::{FeedSink, ReadingDriver, ReadingJob, start_reading},
+			retained::Retained,
 			worker::{CodecStart, WorkerEvent, unexpected_event},
 		},
 		drive_job::backend::DriveBackend,
@@ -27,6 +28,7 @@ use crate::{
 
 use super::{
 	DuplicateEntries, ExtractSkipReason,
+	codec::HeldIndex,
 	engine::CodecResult,
 	report::{ArchiveEntryId, CALLBACK_BATCH, ReadsArchive, RunState},
 };
@@ -508,11 +510,34 @@ pub(crate) struct ListTask<B> {
 	pub(crate) config: ArchiveConfig,
 	/// Starts the codec; called once the job holds its lease.
 	pub(crate) start: CodecStart<CodecResult>,
+	/// Where a reader whose listing this is keeps the chunks read last.
+	pub(crate) chunks: Option<Arc<Retained>>,
+}
+
+impl ListReport {
+	/// The report of a listing that found nothing yet.
+	pub(crate) fn empty() -> Self {
+		Self {
+			format: None,
+			password: PasswordCheck::NotNeeded,
+			entries: Vec::new(),
+			omitted_entries: 0,
+			totals: ListTotals::default(),
+			unaccounted_bytes: 0,
+			duplicates: None,
+		}
+	}
+}
+
+/// What a listing found, and the index its codec handed back when asked to.
+pub(crate) struct Listed {
+	pub(crate) report: ListReport,
+	pub(crate) index: Option<Box<HeldIndex>>,
 }
 
 /// Runs a listing: waits for a job slot, starts the codec, and serves it the archive, collecting
 /// the entries it lists.
-pub(crate) async fn run_list<B: DriveBackend>(task: ListTask<B>) -> Result<ListReport, ListFailed> {
+pub(crate) async fn run_list<B: DriveBackend>(task: ListTask<B>) -> Result<Listed, ListFailed> {
 	let ListTask {
 		backend,
 		control,
@@ -520,16 +545,9 @@ pub(crate) async fn run_list<B: DriveBackend>(task: ListTask<B>) -> Result<ListR
 		archive,
 		config,
 		start,
+		chunks,
 	} = task;
-	let mut listing = ListReport {
-		format: None,
-		password: PasswordCheck::NotNeeded,
-		entries: Vec::new(),
-		omitted_entries: 0,
-		totals: ListTotals::default(),
-		unaccounted_bytes: 0,
-		duplicates: None,
-	};
+	let mut listing = ListReport::empty();
 	let started = start_reading(
 		backend,
 		Arc::new(archive),
@@ -539,6 +557,7 @@ pub(crate) async fn run_list<B: DriveBackend>(task: ListTask<B>) -> Result<ListR
 			reporter: &reporter,
 			reading: ListPhase::Reading,
 			name: ListReport::NAME,
+			chunks,
 		},
 		start,
 	)
@@ -554,13 +573,14 @@ pub(crate) async fn run_list<B: DriveBackend>(task: ListTask<B>) -> Result<ListR
 		}
 	};
 	let mut driver = ReadingDriver::new(feed, &control, &reporter);
-	let outcome = driver
-		.run(&mut ListSink {
-			listing: &mut listing,
-			kept_bytes: 0,
-			reporter: &reporter,
-		})
-		.await;
+	let mut sink = ListSink {
+		listing: &mut listing,
+		kept_bytes: 0,
+		reporter: &reporter,
+		index: None,
+	};
+	let outcome = driver.run(&mut sink).await;
+	let index = sink.index;
 	if let Some(end) = driver.end {
 		listing.password = end.password;
 		listing.unaccounted_bytes = end.unaccounted_bytes;
@@ -569,7 +589,10 @@ pub(crate) async fn run_list<B: DriveBackend>(task: ListTask<B>) -> Result<ListR
 	let (phase, result) = driver.fatal.end(outcome, &control, ListReport::NAME);
 	reporter.finish(phase);
 	match result {
-		Ok(()) => Ok(listing),
+		Ok(()) => Ok(Listed {
+			report: listing,
+			index,
+		}),
 		Err(error) => Err(ListFailed {
 			report: listing,
 			error,
@@ -584,6 +607,8 @@ struct ListSink<'l> {
 	/// The text of the entries the listing keeps.
 	kept_bytes: usize,
 	reporter: &'l ListReporter,
+	/// The index the codec handed back.
+	index: Option<Box<HeldIndex>>,
 }
 
 impl FeedSink for ListSink<'_> {
@@ -594,6 +619,7 @@ impl FeedSink for ListSink<'_> {
 				add_entry(self.listing, &mut self.kept_bytes, &entry);
 				self.reporter.listed(*entry);
 			}
+			WorkerEvent::Indexed(index) => self.index = Some(index),
 			// the feed answers asks, and a listing's codec sends nothing else
 			WorkerEvent::Ask { .. }
 			| WorkerEvent::Entry(_)
@@ -601,8 +627,7 @@ impl FeedSink for ListSink<'_> {
 			| WorkerEvent::Data(_)
 			| WorkerEvent::FileEnd
 			| WorkerEvent::Link(_)
-			| WorkerEvent::Head(_)
-			| WorkerEvent::Indexed(_) => return Err(unexpected_event()),
+			| WorkerEvent::Head(_) => return Err(unexpected_event()),
 		}
 		Ok(())
 	}

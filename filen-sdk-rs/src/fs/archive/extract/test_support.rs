@@ -170,14 +170,16 @@ pub(super) fn list(setup: &Setup, control: JobControl, config: ArchiveConfig) ->
 			},
 		)
 	};
-	let running = tokio::spawn(run_list(ListTask {
+	let task = ListTask {
 		backend: Arc::clone(&setup.backend),
 		control,
 		reporter: MaybeArc::clone(&reporter),
 		archive: setup.archive.clone(),
 		config,
 		start: Box::new(move || worker::start(move |port| extract_stream(&port, job))),
-	}));
+		chunks: None,
+	};
+	let running = tokio::spawn(async move { run_list(task).await.map(|listed| listed.report) });
 	Listing {
 		running,
 		recorder,

@@ -13,6 +13,7 @@ use crate::{
 			config::ArchiveConfig,
 			format::ArchiveFormat,
 			input::{FeedSink, ReadingDriver, ReadingJob, start_reading},
+			retained::Retained,
 			worker::{CodecStart, EntryHead, EntryKind, WorkerEvent, unexpected_event},
 		},
 		drive_job::backend::DriveBackend,
@@ -27,7 +28,7 @@ use crate::{
 
 use super::{
 	EntrySelection, ExtractSkipReason,
-	codec::Selection,
+	codec::{HeldIndex, Selection},
 	engine::CodecResult,
 	report::{ArchiveEntryId, ReadsArchive, RunState},
 };
@@ -313,14 +314,20 @@ pub(crate) struct DownloadTask<B> {
 	/// Starts the codec, on a [`Task::Download`](super::codec::Task::Download) of the entry;
 	/// called once the job holds its lease.
 	pub(crate) start: CodecStart<CodecResult>,
+	/// Where a reader whose download this is keeps the chunks read last.
+	pub(crate) chunks: Option<Arc<Retained>>,
 }
 
 /// Runs a download: waits for a job slot, starts the codec, serves it the archive and writes the
-/// entry it sends to `writer`, which is closed once the codec returned having checked it.
+/// entry it sends to `writer`, which is closed once the codec returned having checked it. What
+/// the download did, and the index its codec handed back when asked to.
 pub(crate) async fn run_download<B: DriveBackend, W: AsyncWrite + Unpin + MaybeSend>(
 	task: DownloadTask<B>,
 	writer: &mut W,
-) -> Result<EntryDownloadReport, EntryDownloadFailed> {
+) -> (
+	Result<EntryDownloadReport, EntryDownloadFailed>,
+	Option<Box<HeldIndex>>,
+) {
 	let DownloadTask {
 		backend,
 		control,
@@ -329,6 +336,7 @@ pub(crate) async fn run_download<B: DriveBackend, W: AsyncWrite + Unpin + MaybeS
 		ordinal,
 		config,
 		start,
+		chunks,
 	} = task;
 	let started = start_reading(
 		backend,
@@ -339,6 +347,7 @@ pub(crate) async fn run_download<B: DriveBackend, W: AsyncWrite + Unpin + MaybeS
 			reporter: &reporter,
 			reading: EntryDownloadPhase::Reading,
 			name: EntryDownloadReport::NAME,
+			chunks,
 		},
 		start,
 	)
@@ -347,10 +356,11 @@ pub(crate) async fn run_download<B: DriveBackend, W: AsyncWrite + Unpin + MaybeS
 		Ok(started) => started,
 		Err((phase, error)) => {
 			reporter.finish(phase);
-			return Err(EntryDownloadFailed {
+			let failed = EntryDownloadFailed {
 				report: EntryDownloadReport::default(),
 				error,
-			});
+			};
+			return (Err(failed), None);
 		}
 	};
 	let mut driver = ReadingDriver::new(feed, &control, &reporter);
@@ -361,6 +371,7 @@ pub(crate) async fn run_download<B: DriveBackend, W: AsyncWrite + Unpin + MaybeS
 		ordinal,
 		state: SinkState::Waiting,
 		bytes_written: 0,
+		index: None,
 	};
 	let mut outcome = driver.run(&mut sink).await;
 	if outcome.is_ok() && driver.fatal.error().is_none() {
@@ -395,10 +406,11 @@ pub(crate) async fn run_download<B: DriveBackend, W: AsyncWrite + Unpin + MaybeS
 		bytes_read,
 		checked: result.is_ok() && checked,
 	};
-	match result {
+	let result = match result {
 		Ok(()) => Ok(report),
 		Err(error) => Err(EntryDownloadFailed { report, error }),
-	}
+	};
+	(result, sink.index)
 }
 
 /// How far a download's codec has sent its entry.
@@ -421,6 +433,8 @@ struct EntrySink<'d, W> {
 	ordinal: u64,
 	state: SinkState,
 	bytes_written: u64,
+	/// The index the codec handed back.
+	index: Option<Box<HeldIndex>>,
 }
 
 impl<W: AsyncWrite + Unpin + MaybeSend> FeedSink for EntrySink<'_, W> {
@@ -467,6 +481,8 @@ impl<W: AsyncWrite + Unpin + MaybeSend> FeedSink for EntrySink<'_, W> {
 				self.reporter.wrote(self.bytes_written);
 			}
 			(SinkState::Writing, WorkerEvent::FileEnd) => self.state = SinkState::Ended,
+			// sent once the codec is done with it, whatever became of the entry
+			(_, WorkerEvent::Indexed(index)) => self.index = Some(index),
 			// the feed answers asks, and a download's codec sends nothing else
 			(
 				_,
@@ -478,8 +494,7 @@ impl<W: AsyncWrite + Unpin + MaybeSend> FeedSink for EntrySink<'_, W> {
 				| WorkerEvent::FileEnd
 				| WorkerEvent::Link(_)
 				| WorkerEvent::Listed(_)
-				| WorkerEvent::Head(_)
-				| WorkerEvent::Indexed(_),
+				| WorkerEvent::Head(_),
 			) => return Err(unexpected_event()),
 		}
 		Ok(())

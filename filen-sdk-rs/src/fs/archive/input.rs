@@ -19,6 +19,7 @@ use crate::{
 		archive::{
 			config::ArchiveConfig,
 			extract::report::ReadsArchive,
+			retained::Retained,
 			worker::{StallWatch, WorkerEvent, WorkerLink, codec_failed, worker_died},
 		},
 		drive_job::{Fatal, backend::DriveBackend, cancelled},
@@ -117,10 +118,17 @@ struct ArchiveInput<B> {
 	slot: Arc<Semaphore>,
 	/// The client's file-IO budget, for what goes beyond the floor.
 	memory: Arc<Semaphore>,
+	/// Where the reader whose job this is keeps the chunks read last, for its later jobs: one
+	/// asked for that is kept is served from there.
+	kept: Option<Arc<Retained>>,
 }
 
 impl<B: DriveBackend> ArchiveInput<B> {
-	fn new(backend: Arc<B>, archive: Arc<RemoteFileType<'static>>) -> Self {
+	fn new(
+		backend: Arc<B>,
+		archive: Arc<RemoteFileType<'static>>,
+		kept: Option<Arc<Retained>>,
+	) -> Self {
 		Self {
 			chunks: archive.size().div_ceil(CHUNK_SIZE_U64),
 			memory: backend.memory(),
@@ -136,6 +144,7 @@ impl<B: DriveBackend> ArchiveInput<B> {
 			sequential: true,
 			ask: None,
 			slot: Arc::new(Semaphore::new(1)),
+			kept,
 		}
 	}
 
@@ -155,6 +164,17 @@ impl<B: DriveBackend> ArchiveInput<B> {
 			self.next_fetch = index;
 			self.served = index;
 			self.run = 0;
+		}
+		// one not fetched yet, and kept by the reader, needs no fetch
+		if index >= self.next_fetch
+			&& let Some(data) = self.kept.as_ref().and_then(|kept| kept.chunk(index))
+		{
+			self.next_fetch = index + 1;
+			self.served = index + 1;
+			self.run += 1;
+			self.hasher.update_rayon(&data);
+			let _ = reply.send(data);
+			return;
 		}
 		self.ask = Some((index, reply));
 		self.serve_ask();
@@ -223,13 +243,17 @@ impl<B: DriveBackend> ArchiveInput<B> {
 		if self.ready.front().is_none_or(|(ready, ..)| ready != index) {
 			return;
 		}
-		let (_, data, permit) = self.ready.pop_front().expect("just checked");
+		let (index, data, permit) = self.ready.pop_front().expect("just checked");
 		let (_, reply) = self.ask.take().expect("just checked");
 		self.reading = Some(permit);
 		self.served += 1;
 		self.run += 1;
 		self.hasher.update_rayon(&data);
-		let _ = reply.send(Arc::new(data));
+		let data = Arc::new(data);
+		if let Some(kept) = &self.kept {
+			kept.keep_chunk(index, Arc::clone(&data));
+		}
+		let _ = reply.send(data);
 	}
 
 	fn drop_prefetched(&mut self) {
@@ -316,15 +340,17 @@ pub(crate) enum Fed<T> {
 }
 
 impl<B: DriveBackend, T> CodecFeed<B, T> {
-	/// A feed of `archive` to the codec at the other end of `link`, counted as `running`.
+	/// A feed of `archive` to the codec at the other end of `link`, counted as `running`, the
+	/// chunks it reads kept in `chunks` when it is a reader's job.
 	pub(crate) fn new(
 		backend: Arc<B>,
 		archive: Arc<RemoteFileType<'static>>,
 		link: WorkerLink<Result<T, Error>>,
 		running: OpGuard,
+		chunks: Option<Arc<Retained>>,
 	) -> Self {
 		Self {
-			input: ArchiveInput::new(backend, archive),
+			input: ArchiveInput::new(backend, archive, chunks),
 			link,
 			running: Some(running),
 			stall: StallWatch::default(),
@@ -457,6 +483,8 @@ pub(crate) struct ReadingJob<'a, S: JobState> {
 	pub(crate) reading: S::Phase,
 	/// What the job's report calls it.
 	pub(crate) name: &'a str,
+	/// Where a reader whose job this is keeps the chunks read last.
+	pub(crate) chunks: Option<Arc<Retained>>,
 }
 
 /// Starts a job that reads `archive` through a codec: checks its chunks, waits for a job slot
@@ -475,6 +503,7 @@ pub(crate) async fn start_reading<B: DriveBackend, S: JobState, T>(
 		reporter,
 		reading,
 		name,
+		chunks,
 	} = job;
 	if let Err(error) = check_chunks_consistent(archive.chunks(), archive.size()) {
 		return Err((S::Phase::FAILED, Arc::new(error)));
@@ -486,7 +515,10 @@ pub(crate) async fn start_reading<B: DriveBackend, S: JobState, T>(
 	};
 	reporter.set_phase(reading);
 	let link = start().map_err(|error| (S::Phase::FAILED, Arc::new(error)))?;
-	Ok((lease, CodecFeed::new(backend, archive, link, reporter.op())))
+	Ok((
+		lease,
+		CodecFeed::new(backend, archive, link, reporter.op(), chunks),
+	))
 }
 
 /// Takes a read-only job's codec events, one at a time, in archive order.
@@ -672,7 +704,7 @@ mod tests {
 		);
 		let mut backend = FakeBackend::new(Uuid::from_u128(3)).with_memory(8);
 		backend.contents.insert(archive.uuid(), bytes);
-		let mut input = ArchiveInput::new(Arc::new(backend), Arc::new(archive));
+		let mut input = ArchiveInput::new(Arc::new(backend), Arc::new(archive), None);
 		let reporter = ExtractReporter::new(Ignore, 0);
 		let ops = reporter.ops();
 		// a zip's head, then its index at the end: nothing fetched ahead of either

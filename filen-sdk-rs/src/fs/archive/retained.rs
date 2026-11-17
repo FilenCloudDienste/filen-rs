@@ -331,6 +331,28 @@ impl Drop for Retained {
 }
 
 #[cfg(test)]
+pub(crate) mod test_support {
+	use std::sync::atomic::Ordering;
+
+	use super::{Retained, RetainedPool, Tier};
+
+	impl RetainedPool {
+		/// Bytes charged in all.
+		pub(crate) fn charged_for_test(&self) -> u64 {
+			self.charged.load(Ordering::Acquire)
+		}
+	}
+
+	impl Retained {
+		/// Gives up the index, as when another reader needed the room.
+		pub(crate) fn evict_index_for_test(&self) {
+			let freed = self.evict(Tier::Index);
+			self.pool.release(freed);
+		}
+	}
+}
+
+#[cfg(test)]
 mod tests {
 	use super::*;
 	use crate::fs::archive::zip::read::{ZipEntry, ZipIndex};
