@@ -76,22 +76,27 @@ pub enum EntryAccess {
 		/// for an empty 7z file, which no folder stores.
 		packed_bytes: u64,
 	},
-	/// A 7z entry in a solid block: a folder storing several files as one compressed
-	/// stream. The files the block stores before it are fetched and decoded first, then
-	/// thrown away.
+	/// An entry reached by decoding what is stored before it, then throwing that away: a 7z
+	/// entry in a solid block (a folder storing several files as one compressed stream), a
+	/// solid RAR's member (rars decodes every file of one before the entry), or a compressed
+	/// tar's member. `skipped_bytes` is the `max_solid_skip` a download or pass of the entry
+	/// alone needs.
 	SolidBlock {
-		/// Bytes decoded and thrown away before the entry's first byte: the sizes of the
-		/// files the block stores before it. Exact. 0 for the block's first file.
+		/// Bytes decoded and thrown away before the entry's first byte. Exact: the sizes of
+		/// the files a 7z block or a solid RAR stores before it, and for a compressed tar
+		/// where the member's data starts in the tar. 0 for the first.
 		skipped_bytes: u64,
-		/// Archive bytes fetched to reach the entry's end, at the block's average
-		/// compression ratio: ⌈block_packed_bytes × (skipped_bytes + size) ÷ the block's
-		/// unpacked size⌉, at most `block_packed_bytes`. An estimate: compression is rarely
-		/// even across a block.
+		/// Archive bytes fetched to reach the entry's end: for a 7z block at its average
+		/// compression ratio, ⌈block_packed_bytes × (skipped_bytes + size) ÷ the block's
+		/// unpacked size⌉, an estimate, as compression is rarely even across a block; for a
+		/// solid RAR the packed sizes of its files up to the entry, exact; for a compressed tar
+		/// the archive's length, as what it decodes to is only known once read.
 		estimated_packed_bytes: u64,
-		/// The block's packed size: the most a read of this entry fetches. Exact.
+		/// The most a read of this entry fetches: the 7z block's packed size, or the packed
+		/// size of a solid RAR's files, or a compressed tar's length. Exact.
 		block_packed_bytes: u64,
 	},
-	/// Only read front to back: a tar's member, or a single compressed file.
+	/// Only read front to back: a bare tar's member, or a single compressed file.
 	Sequential,
 }
 

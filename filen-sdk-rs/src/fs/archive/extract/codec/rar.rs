@@ -49,7 +49,8 @@ pub(crate) struct RarTable {
 	pub(crate) version: RarVersion,
 	/// Its headers are encrypted, so the password opened them.
 	pub(crate) headers_encrypted: bool,
-	/// Some member is compressed on from the history of those before it.
+	/// The archive is solid, by its main header or a member's flag: rars then decodes its files in
+	/// order, skipping none.
 	pub(crate) solid: bool,
 	pub(crate) members: Vec<RarMember>,
 	/// rars' parse of the archive, which the table was made from.
@@ -444,13 +445,20 @@ fn table_of(archive: &Archive, offset: u64) -> Result<RarTable, Error> {
 			data,
 		});
 	}
+	// as rars tells a solid archive: by its main header, or (RAR 1.5 on) any member's flag
+	let solid = match archive {
+		Archive::Rar13(rar) => rar.main.is_solid(),
+		Archive::Rar15To40(rar) => rar.main.is_solid(),
+		Archive::Rar50Plus(rar) => rar.main.is_solid(),
+		_ => false,
+	} || table
+		.iter()
+		.any(|member| member.packing == RarPacking::Solid);
 	Ok(RarTable {
 		parsed: None,
 		version,
 		headers_encrypted,
-		solid: table
-			.iter()
-			.any(|member| member.packing == RarPacking::Solid),
+		solid,
 		members: table,
 	})
 }
@@ -536,15 +544,34 @@ fn list_rar(walk: &mut Walk, table: &RarTable, job: &StreamJob) -> Result<Archiv
 			version: table.version,
 		}))
 		.map_err(read_failure)?;
+	// in a solid archive every file before an entry is decoded and thrown away to reach it
+	let block_packed: u64 = table
+		.members
+		.iter()
+		.filter(|member| member.kind == RarKind::File)
+		.map(|member| member.packed)
+		.sum();
+	let (mut skipped, mut packed) = (0u64, 0u64);
 	for (ordinal, member) in (0u64..).zip(&table.members) {
-		let access = if member.packing == RarPacking::Solid {
-			EntryAccess::Sequential
+		let file = member.kind == RarKind::File;
+		if file {
+			packed = packed.saturating_add(member.packed);
+		}
+		let access = if table.solid {
+			EntryAccess::SolidBlock {
+				skipped_bytes: skipped,
+				estimated_packed_bytes: packed,
+				block_packed_bytes: block_packed,
+			}
 		} else {
 			EntryAccess::Direct {
 				packed_bytes: member.packed,
 			}
 		};
 		walk.list(rar_found(ordinal, member), None, access)?;
+		if file {
+			skipped = skipped.saturating_add(member.size);
+		}
 	}
 	walk.send_mac_folders().map_err(read_failure)?;
 	let encrypted = table.members.iter().any(|member| member.encrypted);
@@ -638,9 +665,8 @@ fn decode_rar(
 	if let Some(error) = storage_exceeded(job.limits.max_bytes, extracted) {
 		return Err(error);
 	}
-	let history = solid_history(table, |ordinal| walk.wants(ordinal));
 	if let Some(limit) = walk.max_solid_skip() {
-		check_solid_skip(table, &history, walk, limit)?;
+		check_solid_skip(table, walk, limit)?;
 	}
 	let port = walk.port;
 	port.send(WorkerEvent::Opened(ArchiveFormat::Rar {
@@ -657,7 +683,7 @@ fn decode_rar(
 	// the walk's own errors, which rars only carries as its own
 	let mut failed: Option<Error> = None;
 	let decided = archive.extract_with_control(decode_options(job, parsed), |_| {
-		let decision = decide(walk, table, &history, ordinal, &sending);
+		let decision = decide(walk, table, ordinal, &sending);
 		ordinal += 1;
 		decision.map_err(|error| {
 			failed = Some(error);
@@ -673,52 +699,28 @@ fn decode_rar(
 	Ok(ArchiveEnd::plain(0, 0))
 }
 
-/// For each member, whether a member read after it is solid and decodes on from its history,
-/// directly or through members between them: `wants` tells the members read.
-fn solid_history(table: &RarTable, wants: impl Fn(u64) -> bool) -> Vec<bool> {
-	let mut history = vec![false; table.members.len()];
+/// Refuses a download that would decode and throw away more than `limit` bytes of a solid RAR to
+/// reach its entries. rars decodes a solid archive's members in order and skips none of its
+/// files: every file before the last one read that is not read itself is thrown away.
+fn check_solid_skip(table: &RarTable, walk: &Walk, limit: u64) -> Result<(), Error> {
 	if !table.solid {
-		return history;
+		return Ok(());
 	}
-	let mut needed = false;
-	for (at, member) in table.members.iter().enumerate().rev() {
-		// directories and links hold no data, and stored data goes past the decoder
-		if member.kind != RarKind::File || member.packing == RarPacking::Stored {
+	let Some(last) = (0u64..)
+		.zip(&table.members)
+		.filter(|(ordinal, member)| member.kind == RarKind::File && walk.wants(*ordinal))
+		.map(|(ordinal, _)| ordinal)
+		.last()
+	else {
+		return Ok(());
+	};
+	let (mut thrown, mut packed) = (0u64, 0u64);
+	for (ordinal, member) in (0u64..=last).zip(&table.members) {
+		if member.kind != RarKind::File {
 			continue;
 		}
-		history[at] = needed;
-		let read = wants(at as u64) || needed;
-		// a solid member read needs the one before it; a member that is not solid starts afresh
-		needed = read && member.packing == RarPacking::Solid;
-	}
-	history
-}
-
-/// Whether `member`, the `ordinal`-th, is decoded though left out, for the history after it.
-fn feeds(history: &[bool], ordinal: u64, member: &RarMember) -> bool {
-	member.kind == RarKind::File
-		&& member.packing != RarPacking::Stored
-		&& usize::try_from(ordinal)
-			.ok()
-			.and_then(|at| history.get(at))
-			.is_some_and(|&needed| needed)
-}
-
-/// Refuses a download that would decode and throw away more than `limit` bytes of a solid RAR to
-/// reach its entries: the members left out that the ones read decode on from.
-fn check_solid_skip(
-	table: &RarTable,
-	history: &[bool],
-	walk: &Walk,
-	limit: u64,
-) -> Result<(), Error> {
-	let (mut thrown, mut packed) = (0u64, 0u64);
-	for (ordinal, member) in (0u64..).zip(&table.members) {
-		let read = walk.wants(ordinal) && member.kind == RarKind::File;
-		if read || feeds(history, ordinal, member) {
-			packed = packed.saturating_add(member.packed);
-		}
-		if !read && feeds(history, ordinal, member) {
+		packed = packed.saturating_add(member.packed);
+		if !walk.wants(ordinal) {
 			thrown = thrown.saturating_add(member.size);
 		}
 	}
@@ -738,7 +740,6 @@ fn check_solid_skip(
 fn decide(
 	walk: &mut Walk,
 	table: &RarTable,
-	history: &[bool],
 	ordinal: u64,
 	sending: &Rc<RefCell<Sending>>,
 ) -> Result<ExtractionDecision, Error> {
@@ -756,9 +757,10 @@ fn decide(
 			)
 		})?;
 	let found = rar_found(ordinal, member);
-	// a member left out that a solid one read after it decodes on from is decoded all the same
+	// rars skips no file of a solid archive: one left out is decoded all the same, and thrown
+	// away (what follows the last one read is never reached)
 	let pass = || {
-		if feeds(history, ordinal, member) {
+		if table.solid && member.kind == RarKind::File {
 			ExtractionDecision::Extract(Box::new(io::sink()))
 		} else {
 			ExtractionDecision::Skip

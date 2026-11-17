@@ -141,9 +141,10 @@ pub struct EntryDownloadConfig {
 	/// listing shows them. An entry stored after more fails with
 	/// [`ErrorKind::ArchiveSolidSkipExceeded`](crate::ErrorKind::ArchiveSolidSkipExceeded) once
 	/// the index is read, before any of its block is fetched. A solid RAR's members are bounded
-	/// the same way (what the entry decodes on from, before it), and a compressed tar's read
-	/// through an archive reader too (what it stores before the entry, refused up front when the
-	/// reader holds a listing of it, else as soon as that passes the bound). `None` allows any
+	/// the same way (every file it stores before the entry), and a compressed tar's (what it
+	/// stores before the entry, refused up front when a reader holds a listing of it, else as
+	/// soon as that passes the bound): the listing's `skipped_bytes` is always enough. `None`
+	/// allows any
 	/// skip. `Some(0)` by default: a solid entry stored after others is downloaded only once the
 	/// caller accepted what it costs.
 	pub max_solid_skip: Option<u64>,
@@ -341,9 +342,12 @@ impl Client {
 	/// - a 7z entry stored after more of its solid block than `config.max_solid_skip` allows
 	///   ([`ErrorKind::ArchiveSolidSkipExceeded`](crate::ErrorKind::ArchiveSolidSkipExceeded)),
 	///   before any of its block is fetched;
-	/// - a tar or a single compressed file
+	/// - a bare tar or a single compressed file
 	///   ([`ErrorKind::ArchiveUnsupported`](crate::ErrorKind::ArchiveUnsupported)), which are
-	///   only read front to back.
+	///   only read front to back. A compressed tar's member is read by decoding what the tar
+	///   stores before it, which `config.max_solid_skip` bounds as it bounds a solid block
+	///   (see [`EntryAccess::SolidBlock`](super::EntryAccess::SolidBlock)); its data is not
+	///   checked (`checked` is `false`), the stream's own check being at the tar's end.
 	///
 	/// The password is checked on this entry alone, as it is read: a plain entry needs none.
 	/// The download takes one of the [`ArchiveConfig::job_concurrency`] archive job slots,

@@ -12,7 +12,8 @@ use crate::{
 	fs::{
 		archive::{
 			extract::{
-				ArchiveEntry, EntryDownloadUpdate, ExpansionLimit, ListUpdate, SolidSkipExceeded,
+				ArchiveEntry, EntryAccess, EntryDownloadUpdate, ExpansionLimit, ListUpdate,
+				SolidSkipExceeded,
 			},
 			sevenz::write::{SevenZEncryption, SevenZMethod},
 			test_support::{
@@ -1998,4 +1999,91 @@ async fn an_aes_entry_shorter_than_its_header_and_code_fails_cleanly() {
 	}
 	assert!(range(&reader, 0, 0, 5).await.is_err());
 	assert!(downloaded(&reader, 0).await.is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_solid_rar_of_every_version_skips_nothing_and_lists_what_it_throws_away() {
+	// compressible text around an incompressible member, which a writer may store
+	let files: Vec<Vec<u8>> = vec![
+		text(3000, 101),
+		incompressible(4000, 102),
+		text(5000, 103),
+		text(6000, 104),
+	];
+	let named: Vec<(&str, &[u8])> = ["a.txt", "b.bin", "c.txt", "d.txt"]
+		.into_iter()
+		.zip(&files)
+		.map(|(name, data)| (name, &data[..]))
+		.collect();
+	for version in [
+		rars::ArchiveVersion::Rar13,
+		rars::ArchiveVersion::Rar15,
+		rars::ArchiveVersion::Rar20,
+		rars::ArchiveVersion::Rar29,
+		rars::ArchiveVersion::Rar50,
+	] {
+		let rar = rar_of(version, &named, false, true, None);
+		let (_, reader) = opened("s.rar", rar, None).await;
+		let listed = reader.list(Ignore, JobControl::default()).await.unwrap();
+		let skipped: Vec<u64> = listed
+			.entries
+			.iter()
+			.map(|entry| match entry.access {
+				Some(EntryAccess::SolidBlock { skipped_bytes, .. }) => skipped_bytes,
+				ref other => panic!("{version:?}: {other:?}"),
+			})
+			.collect();
+		assert_eq!(skipped, [0, 3000, 7000, 12000], "{version:?}");
+		// what the listing states is what a pass may throw away, and not a byte less
+		let (result, written) = read_entries(&reader, &[2], Some(7000)).await;
+		assert_eq!(result.unwrap().entries, 1, "{version:?}");
+		assert_eq!(written[0].2, files[2], "{version:?}");
+		let (result, _) = read_entries(&reader, &[2], Some(6999)).await;
+		assert_eq!(
+			result.unwrap_err().error.kind(),
+			ErrorKind::ArchiveSolidSkipExceeded,
+			"{version:?}"
+		);
+		// the stored member too is reached by decoding all before it
+		let (result, written) = read_entries(&reader, &[1, 3], None).await;
+		assert_eq!(result.unwrap().entries, 2, "{version:?}");
+		assert_eq!(written[0].2, files[1], "{version:?}");
+		assert_eq!(written[1].2, files[3], "{version:?}");
+		assert_eq!(
+			downloaded(&reader, 3).await.unwrap().0,
+			files[3],
+			"{version:?}"
+		);
+	}
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_compressed_tars_listing_states_what_reaching_a_member_throws_away() {
+	let (tar, big) = spread_tar();
+	let tgz = gzip(&tar);
+	let len = tgz.len() as u64;
+	let (_, reader) = opened("t.tar.gz", tgz, None).await;
+	let listed = reader.list(Ignore, JobControl::default()).await.unwrap();
+	let Some(EntryAccess::SolidBlock {
+		skipped_bytes,
+		block_packed_bytes,
+		..
+	}) = listed.entries[3].access
+	else {
+		panic!("{:?}", listed.entries[3].access);
+	};
+	assert_eq!(block_packed_bytes, len);
+	// the listing's bound is enough, a byte less is not
+	let (result, written) = read_entries(&reader, &[3], Some(skipped_bytes)).await;
+	assert_eq!(result.unwrap().entries, 1);
+	assert_eq!(written[0].2, b"gamma");
+	// a download reads it as the listing says, its stream not checked before the tar's end
+	let (data, checked) = downloaded(&reader, 3).await.unwrap();
+	assert_eq!((data.as_slice(), checked), (&b"gamma"[..], false));
+	reader.retained.as_ref().unwrap().evict_index_for_test();
+	let (result, _) = read_entries(&reader, &[3], Some(big.len() as u64 - 1)).await;
+	assert_eq!(
+		result.unwrap_err().error.kind(),
+		ErrorKind::ArchiveSolidSkipExceeded
+	);
 }

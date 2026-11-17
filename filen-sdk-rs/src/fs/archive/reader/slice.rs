@@ -257,7 +257,7 @@ fn sevenz_access(index: &SevenZIndex, ordinal: u64) -> Result<Resolved, Error> {
 }
 
 /// What reading `ordinal` of the RAR `table` costs: a stored, unencrypted member lies in the
-/// archive as it is; another, unless solid, is decoded whole; a solid one front to back.
+/// archive as it is; another is decoded whole, or in a solid archive front to back.
 fn rar_access(table: &RarTable, ordinal: u64) -> Result<Resolved, Error> {
 	let member = usize::try_from(ordinal)
 		.ok()
@@ -276,7 +276,8 @@ fn rar_access(table: &RarTable, ordinal: u64) -> Result<Resolved, Error> {
 				size: member.size,
 			}
 		}
-		(_, RarPacking::Solid) => Resolved::Sequential {
+		// read whole, it decodes every file of a solid archive before it
+		_ if table.solid => Resolved::Sequential {
 			size: Some(member.size),
 		},
 		_ => Resolved::Whole { size: member.size },

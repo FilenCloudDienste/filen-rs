@@ -56,6 +56,7 @@ pub(super) fn walk_tar<R: TarSource>(
 	mut tar: TarReader<R>,
 	record: bool,
 	skip_limit: Option<SkipLimit>,
+	compressed_len: Option<u64>,
 ) -> Result<Walked<R>, Error> {
 	let mut spans = Vec::new();
 	// data of members passed over, which a compressed tar decodes all the same
@@ -117,10 +118,20 @@ pub(super) fn walk_tar<R: TarSource>(
 					size: member.size,
 				});
 			}
+			// a compressed tar decodes all it stores before a member to reach it
+			let access = match compressed_len {
+				Some(len) => EntryAccess::SolidBlock {
+					skipped_bytes: member.data_offset,
+					estimated_packed_bytes: len,
+					block_packed_bytes: len,
+				},
+				None => EntryAccess::Sequential,
+			};
 			list_member(
 				walk,
 				&mut tar,
 				found,
+				access,
 				link_target,
 				&mut listed_files,
 				&mut shadowed,
@@ -315,6 +326,7 @@ fn list_member<R: TarSource>(
 	walk: &mut Walk,
 	tar: &mut TarReader<R>,
 	mut found: Found,
+	access: EntryAccess,
 	link_target: Option<HardlinkTarget>,
 	listed_files: &mut ListedFiles,
 	shadowed: &mut Shadowed,
@@ -346,7 +358,7 @@ fn list_member<R: TarSource>(
 	let key = shadowed.key(&found.path);
 	let size = found.size;
 	let is_dir = found.kind == ArchiveEntryKind::Dir;
-	let shadow = match walk.list(found, apple_double, EntryAccess::Sequential)? {
+	let shadow = match walk.list(found, apple_double, access)? {
 		_ if is_dir => Some(Shadow::Other),
 		Listed::Extracted => {
 			if let Some(key) = key {

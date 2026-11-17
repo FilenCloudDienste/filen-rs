@@ -164,12 +164,13 @@ pub(crate) fn extract_stream(port: &WorkerPort, job: StreamJob) -> Result<Archiv
 					TarReader::from_source(seeking, max),
 					record,
 					None,
+					None,
 				)?;
 				// what follows the end marker is read: zero padding, mostly in its chunk
 				let trailing = drain_trailing(walked.rest).map_err(read_failure)?;
 				(walked.unread + trailing, walked.spans)
 			} else {
-				let walked = walk_tar(&mut walk, TarReader::new(source, max), record, None)?;
+				let walked = walk_tar(&mut walk, TarReader::new(source, max), record, None, None)?;
 				if walked.stopped {
 					return Ok(ArchiveEnd::plain(0, 0));
 				}
@@ -206,6 +207,7 @@ pub(crate) fn extract_stream(port: &WorkerPort, job: StreamJob) -> Result<Archiv
 					TarReader::new(Cursor::new(block).chain(decoded), job.limits.max_members),
 					record,
 					skip_limit,
+					Some(job.len),
 				)?;
 				send_table(port, record, walked.spans)?;
 				if walked.stopped {

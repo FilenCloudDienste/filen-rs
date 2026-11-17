@@ -400,8 +400,9 @@ impl JsClient {
 	/// another archive (`InvalidState`), and for a `path` no file can be created beside. The
 	/// download fails before it writes anything for a directory or a link (`InvalidState`), an
 	/// entry an extraction would skip (an unsafe path, an unsupported method, overlapping data),
-	/// a solid entry past `max_solid_skip` (`ArchiveSolidSkipExceeded`), and a tar's member or a
-	/// single compressed file (`ArchiveUnsupported`), which are only read front to back. It takes
+	/// a solid entry past `max_solid_skip` (`ArchiveSolidSkipExceeded`), and a bare tar's member or a
+	/// single compressed file (`ArchiveUnsupported`), which are only read front to back (a
+	/// compressed tar's member is reached as a solid entry is, unchecked). It takes
 	/// one of the archive job slots, and can be paused and cancelled through `managed_future`.
 	///
 	/// Unlike `download_file_to_path`, which fails with the error, this returns the report

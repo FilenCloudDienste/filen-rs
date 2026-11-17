@@ -448,12 +448,16 @@ impl<W: AsyncWrite + Unpin + MaybeSend> FeedSink for EntrySink<'_, W> {
 			(
 				SinkState::Waiting,
 				WorkerEvent::Opened(
-					ArchiveFormat::Zip | ArchiveFormat::SevenZ | ArchiveFormat::Rar { .. },
+					ArchiveFormat::Zip
+					| ArchiveFormat::SevenZ
+					| ArchiveFormat::Rar { .. }
+					// a compressed tar's member, reached by decoding what it stores before it
+					| ArchiveFormat::Tar { codec: Some(_) },
 				),
 			) => {}
 			(
 				SinkState::Waiting,
-				WorkerEvent::Opened(ArchiveFormat::Tar { .. } | ArchiveFormat::Single { .. }),
+				WorkerEvent::Opened(ArchiveFormat::Tar { codec: None } | ArchiveFormat::Single { .. }),
 			) => return Err(EntryDownloadError::NotIndexed.into()),
 			(
 				SinkState::Waiting,

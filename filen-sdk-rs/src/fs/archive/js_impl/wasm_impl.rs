@@ -493,8 +493,9 @@ impl JsClient {
 	/// do not parse (`Conversion`) and for an entry of another archive (`InvalidState`). The
 	/// download fails before it writes anything for a directory or a link (`InvalidState`), an
 	/// entry an extraction would skip (an unsafe path, an unsupported method, overlapping data),
-	/// a solid entry past `maxSolidSkip` (`ArchiveSolidSkipExceeded`), and a tar's member or a
-	/// single compressed file (`ArchiveUnsupported`), which are only read front to back. It takes
+	/// a solid entry past `maxSolidSkip` (`ArchiveSolidSkipExceeded`), and a bare tar's member or a
+	/// single compressed file (`ArchiveUnsupported`), which are only read front to back (a
+	/// compressed tar's member is reached as a solid entry is, unchecked). It takes
 	/// one of the archive job slots, and can be paused and cancelled through `managedFuture`.
 	///
 	/// Unlike `downloadFileToWriter`, which rejects with the error, this resolves with the
