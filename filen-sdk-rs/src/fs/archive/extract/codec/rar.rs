@@ -18,7 +18,7 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use microthumb::{ByteSource, SeqReader};
-use rars::{Archive, ArchiveMember, ArchiveReadOptions, ExtractionDecision};
+use rars::{Archive, ArchiveReadOptions, ExtractionDecision};
 
 use crate::{
 	Error, ErrorKind,
@@ -57,6 +57,8 @@ pub(crate) struct RarTable {
 /// before it ends; a job that finds it busy parses the archive again.
 struct HeldRar {
 	archive: Archive,
+	/// The heap the parse holds, measured once it was made.
+	heap: u64,
 	input: Arc<Mutex<Option<CachedInput<'static>>>>,
 	busy: Mutex<()>,
 }
@@ -67,9 +69,22 @@ impl std::fmt::Debug for HeldRar {
 	}
 }
 
-/// Heap a parse holds per member, besides the table's own: rars' header block and the name it
-/// keeps of it.
-const PARSED_MEMBER_BYTES: u64 = 512;
+/// The share of a codec job's decoder memory a RAR's parse may take: the rest is left to the
+/// decoder.
+const PARSE_SHARE: u64 = 2;
+
+/// Inline bytes of the largest header block rars keeps, of any RAR version.
+const BLOCK_BYTES: u64 = {
+	let rar50 = size_of::<rars::rar50::Block>();
+	let rar15 = size_of::<rars::rar15_40::Block>();
+	let rar13 = size_of::<rars::rar13::Entry>();
+	let most = if rar50 > rar15 { rar50 } else { rar15 };
+	(if most > rar13 { most } else { rar13 }) as u64
+};
+
+/// Heap one header can cost before its variable fields: rars' block, twice over for the slack
+/// of the Vec it grows in, and the member the table makes of it.
+const HEADER_HEAP: u64 = 2 * BLOCK_BYTES + size_of::<RarMember>() as u64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RarKind {
@@ -114,14 +129,7 @@ impl RarTable {
 			.map(|member| member.name.capacity())
 			.sum();
 		let table = (self.members.capacity() * size_of::<RarMember>() + names) as u64;
-		let parsed = if self.parsed.is_some() {
-			(self.members.len() as u64)
-				.saturating_mul(PARSED_MEMBER_BYTES)
-				.saturating_add(names as u64)
-		} else {
-			0
-		};
-		table.saturating_add(parsed)
+		table.saturating_add(self.parsed.as_ref().map_or(0, |parsed| parsed.heap))
 	}
 }
 
@@ -152,15 +160,87 @@ fn rar_error(error: &rars::Error) -> Error {
 	)
 }
 
-/// What reading the RAR may spend, as the job allows.
-fn read_options<'a>(job: &'a StreamJob) -> ArchiveReadOptions<'a> {
+/// What parsing the RAR's headers may spend: its share of the job's decoder memory, every
+/// header counted (members and service headers alike) before rars keeps it, and its bytes, whose
+/// names and fields the parse and the table copy.
+fn parse_options<'a>(job: &'a StreamJob) -> ArchiveReadOptions<'a> {
+	let share = job.limits.decoder_memory / PARSE_SHARE;
+	let headers = (share / 2 / HEADER_HEAP).min(job.limits.max_members.saturating_add(2));
 	ArchiveReadOptions::with_optional_password(
 		job.password.as_ref().map(|password| password.as_bytes()),
 	)
-	.with_max_header_count(job.limits.max_members.saturating_add(2))
-	.with_max_header_bytes(job.limits.max_index_bytes)
+	.with_max_header_count(headers)
+	.with_max_header_bytes(job.limits.max_index_bytes.min(share / 2 / 3))
 	.with_rar50_dictionary_size_limit(job.limits.decoder_memory)
 	.with_max_reader_workspace_bytes(job.limits.decoder_memory)
+}
+
+/// What decoding the RAR's members may spend: the job's decoder memory, less what a parse this
+/// job made holds.
+fn decode_options<'a>(job: &'a StreamJob, parsed: u64) -> ArchiveReadOptions<'a> {
+	let left = job.limits.decoder_memory.saturating_sub(parsed);
+	ArchiveReadOptions::with_optional_password(
+		job.password.as_ref().map(|password| password.as_bytes()),
+	)
+	.with_rar50_dictionary_size_limit(left)
+	.with_max_reader_workspace_bytes(left)
+}
+
+/// The heap rars' parse of a RAR holds: its header blocks inline, at the capacity of the Vec
+/// they are in, and the names and fields each one keeps.
+fn parse_heap(archive: &Archive) -> u64 {
+	let heap = match archive {
+		Archive::Rar13(rar) => {
+			rar.entries.capacity() * size_of::<rars::rar13::Entry>()
+				+ rar
+					.entries
+					.iter()
+					.map(|entry| entry.name.capacity() + entry.extra.capacity())
+					.sum::<usize>()
+		}
+		Archive::Rar15To40(rar) => {
+			rar.blocks.capacity() * size_of::<rars::rar15_40::Block>()
+				+ rar
+					.blocks
+					.iter()
+					.map(|block| match block {
+						rars::rar15_40::Block::File(file)
+						| rars::rar15_40::Block::NewSub(rars::rar15_40::NewSubHeader {
+							file,
+							..
+						}) => rar15_file_heap(file),
+						_ => 0,
+					})
+					.sum::<usize>()
+		}
+		Archive::Rar50Plus(rar) => {
+			rar.blocks.capacity() * size_of::<rars::rar50::Block>()
+				+ rar
+					.blocks
+					.iter()
+					.map(|block| match block {
+						rars::rar50::Block::File(file) | rars::rar50::Block::Service(file) => {
+							file.name.capacity()
+								+ file.service_data.as_ref().map_or(0, Vec::capacity)
+								+ file
+									.redirection
+									.as_ref()
+									.map_or(0, |redirection| redirection.target_name.capacity())
+						}
+						_ => 0,
+					})
+					.sum::<usize>()
+		}
+		_ => 0,
+	};
+	heap as u64
+}
+
+fn rar15_file_heap(file: &rars::rar15_40::FileHeader) -> usize {
+	file.name.capacity()
+		+ file.unicode_name.as_ref().map_or(0, Vec::capacity)
+		+ file.file_comment.capacity()
+		+ file.ext_time.capacity()
 }
 
 /// The RAR in the input a job puts in `input`, past any self-extracting stub, as a source of its
@@ -190,34 +270,36 @@ impl ByteSource for Shifted {
 	}
 }
 
+/// Longest self-extracting stub a RAR may follow: what a stub tool writes, and no more than one
+/// chunk of the archive is scanned for it.
+const SFX_SCAN_BYTES: usize = 1 << 20;
+
 /// Where the RAR in `input` starts: at its start, or after a self-extracting stub of at most
-/// rars' scan limit, which only the archive's name made it look for.
+/// [`SFX_SCAN_BYTES`], which only the archive's name made it look for.
 fn archive_start(input: &mut CachedInput<'static>) -> Result<u64, Error> {
-	let limit = input.len().min(rars::SFX_SCAN_LIMIT as u64);
-	let mut head = Vec::new();
-	// the archive's first chunk, then the rest of the scan only when a stub precedes the RAR
-	for scan in [limit.min(CHUNK_SIZE as u64), limit] {
-		let scan = usize::try_from(scan).expect("the scan limit fits in memory");
-		let mut filled = head.len();
-		head.resize(scan, 0);
-		while filled < scan {
-			let read = input
-				.read_at(filled as u64, &mut head[filled..])
-				.map_err(read_failure)?;
-			if read == 0 {
-				break;
-			}
-			filled += read;
+	let scan = usize::try_from(input.len())
+		.unwrap_or(usize::MAX)
+		.min(SFX_SCAN_BYTES);
+	let mut head = vec![0u8; scan];
+	let mut filled = 0;
+	while filled < scan {
+		let read = input
+			.read_at(filled as u64, &mut head[filled..])
+			.map_err(read_failure)?;
+		if read == 0 {
+			break;
 		}
-		head.truncate(filled);
-		if let Some(signature) = rars::find_archive_start(&head, rars::SFX_SCAN_LIMIT) {
-			return Ok(signature.offset as u64);
-		}
+		filled += read;
 	}
-	Err(Error::custom(
-		ErrorKind::ArchiveUnsupported,
-		"the file is not an archive the SDK can extract",
-	))
+	head.truncate(filled);
+	rars::find_archive_start(&head, SFX_SCAN_BYTES)
+		.map(|signature| signature.offset as u64)
+		.ok_or_else(|| {
+			Error::custom(
+				ErrorKind::ArchiveUnsupported,
+				"the file is not an archive the SDK can extract",
+			)
+		})
 }
 
 /// A parse of the RAR `input` reads, through the driver.
@@ -227,6 +309,8 @@ struct Parsed {
 	offset: u64,
 	/// What rars reads it through, holding `input` until the job empties it.
 	input: Arc<Mutex<Option<CachedInput<'static>>>>,
+	/// The heap the parse holds.
+	heap: u64,
 }
 
 impl Parsed {
@@ -235,6 +319,7 @@ impl Parsed {
 		*self.input.lock().unwrap_or_else(PoisonError::into_inner) = None;
 		HeldRar {
 			archive: self.archive,
+			heap: self.heap,
 			input: self.input,
 			busy: Mutex::new(()),
 		}
@@ -252,12 +337,20 @@ fn parse(input: CachedInput<'_>, job: &StreamJob) -> Result<Parsed, Error> {
 		len,
 		offset,
 	}));
-	let archive = rars::ArchiveReader::read_reader_with_options(source, read_options(job))
+	let archive = rars::ArchiveReader::read_reader_with_options(source, parse_options(job))
 		.map_err(|error| rar_error(&error))?;
+	let heap = parse_heap(&archive);
+	if heap > job.limits.decoder_memory / PARSE_SHARE {
+		return Err(Error::custom(
+			ErrorKind::ArchiveTooLarge,
+			format!("the RAR's headers take {heap} bytes, more than its parse may"),
+		));
+	}
 	Ok(Parsed {
 		archive,
 		offset,
 		input,
+		heap,
 	})
 }
 
@@ -299,11 +392,12 @@ fn table_of(archive: &Archive, offset: u64) -> Result<RarTable, Error> {
 			));
 		}
 	};
-	let members: Vec<ArchiveMember> = archive.members().collect();
+	// one member made at a time: the parse holds them all already
+	let count = archive.members().count();
 	// offsets only when every member has its own, as the members list them
-	let data = data.filter(|data| data.len() == members.len());
-	let mut table = Vec::with_capacity(members.len());
-	for (at, member) in members.iter().enumerate() {
+	let data = data.filter(|data| data.len() == count);
+	let mut table = Vec::with_capacity(count);
+	for (at, member) in archive.members().enumerate() {
 		let meta = &member.meta;
 		if meta.is_split_before || meta.is_split_after {
 			return Err(Error::custom(
@@ -400,7 +494,8 @@ pub(super) fn extract_rar(
 			&& let Ok(_busy) = parsed.busy.try_lock()
 		{
 			*parsed.input.lock().unwrap_or_else(PoisonError::into_inner) = Some(input.into_owned());
-			let end = decode_rar(walk, &parsed.archive, table, job);
+			// the held parse is charged to the reader that holds it
+			let end = decode_rar(walk, &parsed.archive, table, job, 0);
 			// the held parse keeps nothing of this job
 			*parsed.input.lock().unwrap_or_else(PoisonError::into_inner) = None;
 			return end;
@@ -411,7 +506,7 @@ pub(super) fn extract_rar(
 	let end = if walk.listing() {
 		list_rar(walk, &table, job)?
 	} else {
-		decode_rar(walk, &parsed.archive, &table, job)?
+		decode_rar(walk, &parsed.archive, &table, job, parsed.heap)?
 	};
 	if held.is_none() && matches!(job.index, IndexUse::ReadAndReturn) {
 		table.parsed = Some(parsed.held());
@@ -519,6 +614,7 @@ fn decode_rar(
 	archive: &Archive,
 	table: &RarTable,
 	job: &StreamJob,
+	parsed: u64,
 ) -> Result<ArchiveEnd, Error> {
 	let ordinals = 0u64..;
 	walk.check_selection(
@@ -552,7 +648,7 @@ fn decode_rar(
 	let mut ordinal = 0u64;
 	// the walk's own errors, which rars only carries as its own
 	let mut failed: Option<Error> = None;
-	let decided = archive.extract_with_control(read_options(job), |_| {
+	let decided = archive.extract_with_control(decode_options(job, parsed), |_| {
 		let decision = decide(walk, table, ordinal, &sending);
 		ordinal += 1;
 		decision.map_err(|error| {

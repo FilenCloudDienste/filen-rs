@@ -644,3 +644,54 @@ pub(crate) fn rar_of(
 		.unwrap();
 	rar
 }
+
+/// `value` as a RAR 5 variable-length integer.
+fn rar5_vint(mut value: u64, out: &mut Vec<u8>) {
+	loop {
+		let byte = (value & 0x7F) as u8;
+		value >>= 7;
+		if value == 0 {
+			out.push(byte);
+			return;
+		}
+		out.push(byte | 0x80);
+	}
+}
+
+/// A RAR 5 header of `fields` (its type first), framed with its size and CRC-32.
+fn rar5_header(fields: &[u8]) -> Vec<u8> {
+	let mut sized = Vec::new();
+	rar5_vint(fields.len() as u64, &mut sized);
+	sized.extend_from_slice(fields);
+	let mut header = crc32fast::hash(&sized).to_le_bytes().to_vec();
+	header.extend(sized);
+	header
+}
+
+/// A RAR 5 file (type 2) or service (type 3) header, stored and empty, named `name`.
+fn rar5_empty_member(kind: u8, name: &str) -> Vec<u8> {
+	let mut fields = Vec::new();
+	for value in [u64::from(kind), 0, 0, 0, 0, 0, 0, name.len() as u64] {
+		// type, header flags, file flags, unpacked size, attributes, compression, host OS, name
+		rar5_vint(value, &mut fields);
+	}
+	fields.extend_from_slice(name.as_bytes());
+	rar5_header(&fields)
+}
+
+/// A RAR 5 built by hand, as no writer would: `files` empty files, then `services` service
+/// headers (which are no members), each header a few bytes; for a header flood.
+pub(crate) fn rar5_header_flood(files: usize, services: usize) -> Vec<u8> {
+	let mut rar = b"Rar!\x1a\x07\x01\x00".to_vec();
+	// the main header: type 1, no header flags, no archive flags
+	rar.extend(rar5_header(&[1, 0, 0]));
+	for file in 0..files {
+		rar.extend(rar5_empty_member(2, &format!("{file}.txt")));
+	}
+	for _ in 0..services {
+		rar.extend(rar5_empty_member(3, "CMT"));
+	}
+	// the end of archive header: type 5, no header flags, no end flags
+	rar.extend(rar5_header(&[5, 0, 0]));
+	rar
+}

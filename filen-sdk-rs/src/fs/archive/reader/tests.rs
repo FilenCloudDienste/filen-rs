@@ -16,8 +16,8 @@ use crate::{
 			},
 			sevenz::write::{SevenZEncryption, SevenZMethod},
 			test_support::{
-				TarMember, archive_password, gzip, incompressible, rar_of, sevenz_of, tar_of,
-				tar_with,
+				TarMember, archive_password, gzip, incompressible, rar_of, rar5_header_flood,
+				sevenz_of, tar_of, tar_with,
 			},
 			zip::{
 				crypto::{AesStrength, test_support::zip_crypto_encrypt},
@@ -1281,6 +1281,49 @@ async fn a_rar_job_decodes_through_the_held_parse_reading_only_its_members_chunk
 		assert_eq!(first.unwrap().0, members[0]);
 		assert_eq!(second.unwrap().0, members[5]);
 	}
+}
+
+/// A reader of `bytes` under the smallest codec budget, whose RAR parse admits a few thousand
+/// headers.
+fn tight_reader(name: &str, bytes: Vec<u8>) -> Reader {
+	let (backend, archive, _) = drive(name, bytes, 64 << 20);
+	let config = ArchiveConfig::new(&ClientConfig::default().with_archive_codec_mem_budget(0))
+		.with_own_pool(64 << 20);
+	reader_of(&backend, &archive, &config, None)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rar_header_flood_is_refused_before_rars_keeps_it() {
+	// service headers are no members, but they are headers all the same
+	let few = tight_reader("few.rar", rar5_header_flood(10, 10));
+	few.open(Ignore, JobControl::default()).await.unwrap();
+	assert_eq!(
+		few.list(Ignore, JobControl::default())
+			.await
+			.unwrap()
+			.entries
+			.len(),
+		10
+	);
+	for (files, services) in [(5000, 0), (1, 5000)] {
+		let flood = tight_reader("flood.rar", rar5_header_flood(files, services));
+		let failed = flood.open(Ignore, JobControl::default()).await.unwrap_err();
+		assert_eq!(
+			failed.error.kind(),
+			ErrorKind::ArchiveTooLarge,
+			"{files} files, {services} services: {}",
+			failed.error
+		);
+	}
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_held_rar_parse_is_charged_as_rars_holds_it() {
+	let (_, reader) = opened("services.rar", rar5_header_flood(1, 2000), None).await;
+	let index = reader.retained.as_ref().unwrap().index().unwrap();
+	assert!(matches!(&*index, HeldIndex::Rar(_)));
+	// every header rars keeps, the service headers too, at its block's size
+	assert!(index.heap_bytes() >= 2002 * size_of::<rars::rar50::Block>() as u64);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
