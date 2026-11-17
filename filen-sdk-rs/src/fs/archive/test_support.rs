@@ -618,3 +618,29 @@ impl DisposalBackend for FakeBackend {
 		Ok(self.versioned_files.contains(&uuid))
 	}
 }
+
+/// A RAR of `files`, as `rars` writes one: stored or compressed, solid or not, and encrypted
+/// under `password` (with its headers too, for a RAR 5).
+pub(crate) fn rar_of(
+	version: rars::ArchiveVersion,
+	files: &[(&str, &[u8])],
+	store: bool,
+	solid: bool,
+	password: Option<&str>,
+) -> Vec<u8> {
+	let mut builder = rars::Builder::new(version)
+		.store(store)
+		.solid(solid)
+		.password(password.map(|password| password.as_bytes().to_vec()))
+		.header_encryption(password.is_some() && version == rars::ArchiveVersion::Rar50);
+	for (name, data) in files {
+		builder
+			.add_bytes(name.as_bytes().to_vec(), data.to_vec(), None, None)
+			.unwrap();
+	}
+	let mut rar = Vec::new();
+	builder
+		.write_to(&mut rar, &rars::WriterResources::new(256 << 20), None)
+		.unwrap();
+	rar
+}

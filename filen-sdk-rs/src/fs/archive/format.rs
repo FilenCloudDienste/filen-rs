@@ -63,6 +63,24 @@ pub enum ArchiveFormat {
 		/// The stream's codec.
 		codec: StreamCodec,
 	},
+	/// A RAR, read only (the SDK writes none), its entries checked against their CRC-32s or
+	/// BLAKE2sp hashes.
+	Rar {
+		/// Which generation of the format.
+		version: RarVersion,
+	},
+}
+
+/// The generations of the RAR format, each read by a decoder of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[js_type(export, no_deser, no_default)]
+pub enum RarVersion {
+	/// RAR 1.3 and 1.4, from the DOS days.
+	Rar13,
+	/// RAR 1.5 to 4.x.
+	Rar15To40,
+	/// RAR 5 and later, RAR 7 included.
+	Rar50Plus,
 }
 
 impl ArchiveFormat {
@@ -84,6 +102,26 @@ pub(crate) enum Detected {
 	/// A compressed stream: a compressed tar when the first block it decodes to is a tar
 	/// header (see [`is_tar_header`]), otherwise a single compressed file.
 	Stream(StreamCodec),
+	/// A RAR: its signature at the start, or a name that says RAR, whose signature may come
+	/// after a self-extracting stub.
+	Rar,
+}
+
+/// What a RAR starts with: RAR 1.5 and later (`Rar!\x1a\x07`), or RAR 1.3 (`RE~^`).
+const RAR_SIGNATURES: [&[u8]; 2] = [b"Rar!\x1a\x07", b"RE~^"];
+
+/// The names a RAR goes by (a comic book archive is a renamed RAR).
+const RAR_EXTENSIONS: [&str; 2] = [".rar", ".cbr"];
+
+/// The extension a RAR goes by that `name` ends in.
+fn rar_extension(name: &str) -> Option<&'static str> {
+	RAR_EXTENSIONS.iter().copied().find(|extension| {
+		name.len()
+			.checked_sub(extension.len())
+			.filter(|&at| at > 0)
+			.and_then(|at| name.get(at..))
+			.is_some_and(|tail| tail.eq_ignore_ascii_case(extension))
+	})
 }
 
 /// Bytes of the head of a file that [`detect`] looks at: enough for a tar header's checksum.
@@ -102,6 +140,12 @@ pub(crate) fn detect(head: &[u8], name: &str) -> Option<Detected> {
 	}
 	if head.starts_with(&SEVEN_Z_SIGNATURE) {
 		return Some(Detected::SevenZ);
+	}
+	if RAR_SIGNATURES
+		.iter()
+		.any(|signature| head.starts_with(signature))
+	{
+		return Some(Detected::Rar);
 	}
 	if head.first_chunk().is_some_and(is_tar_header) {
 		return Some(Detected::Tar);
@@ -145,7 +189,11 @@ pub(crate) fn detect(head: &[u8], name: &str) -> Option<Detected> {
 	if head.starts_with(b"LZIP") {
 		return Some(Detected::Stream(StreamCodec::Lzip));
 	}
-	// no magic: the name is all there is to go by
+	// no magic: the name is all there is to go by. A RAR's signature may follow a
+	// self-extracting stub, which the RAR reader looks past
+	if rar_extension(name).is_some() {
+		return Some(Detected::Rar);
+	}
 	let (extension, format) = match_extension(name)?;
 	match format {
 		ArchiveFormat::Zip => Some(Detected::Zip),
@@ -299,6 +347,11 @@ pub(crate) fn match_extension(name: &str) -> Option<(&'static str, ArchiveFormat
 /// the whole name when it has none of them. Never empty when `name` is not, but not always a name
 /// an item may have (`..zip` → `.`).
 pub(crate) fn archive_stem(name: &str) -> &str {
+	if let Some(extension) = rar_extension(name) {
+		return name
+			.get(..name.len() - extension.len())
+			.expect("rar_extension found the extension at a char boundary (should be impossible)");
+	}
 	match match_extension(name) {
 		Some((extension, _)) => name.get(..name.len() - extension.len()).expect(
 			"match_extension found the extension at a char boundary (should be impossible)",

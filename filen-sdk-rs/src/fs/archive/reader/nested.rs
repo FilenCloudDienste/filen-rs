@@ -166,7 +166,7 @@ impl Reader {
 		let ordinal = u64::from(entry.index);
 		if !matches!(
 			self.format(),
-			Some(ArchiveFormat::Zip | ArchiveFormat::SevenZ)
+			Some(ArchiveFormat::Zip | ArchiveFormat::SevenZ | ArchiveFormat::Rar { .. })
 		) {
 			return Ok(String::new());
 		}
@@ -181,6 +181,10 @@ impl Reader {
 				.ok()
 				.and_then(|at| index.entries.get(at))
 				.map(|entry| entry.name.as_str()),
+			HeldIndex::Rar(table) => usize::try_from(ordinal)
+				.ok()
+				.and_then(|at| table.members.get(at))
+				.map(|member| member.name.as_str()),
 			HeldIndex::Tar(_) => None,
 		};
 		Ok(path

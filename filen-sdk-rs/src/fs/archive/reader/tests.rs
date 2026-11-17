@@ -16,7 +16,8 @@ use crate::{
 			},
 			sevenz::write::{SevenZEncryption, SevenZMethod},
 			test_support::{
-				TarMember, archive_password, gzip, incompressible, sevenz_of, tar_of, tar_with,
+				TarMember, archive_password, gzip, incompressible, rar_of, sevenz_of, tar_of,
+				tar_with,
 			},
 			zip::{
 				crypto::{AesStrength, test_support::zip_crypto_encrypt},
@@ -1173,4 +1174,114 @@ async fn a_raw_entrys_embedded_preview_is_written_from_its_range() {
 			.kind(),
 		ErrorKind::ArchiveUnsupported
 	);
+}
+
+/// Entry `index` downloaded whole, and whether it was checked.
+async fn downloaded(reader: &Reader, index: u32) -> Result<(Vec<u8>, bool), Arc<Error>> {
+	let mut written = futures::io::Cursor::new(Vec::new());
+	let report = reader
+		.download_entry(
+			entry(index),
+			&mut written,
+			Some(u64::MAX),
+			Ignore,
+			JobControl::default(),
+		)
+		.await
+		.map_err(|failed| failed.error)?;
+	Ok((written.into_inner(), report.checked))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rars_members_are_listed_from_its_held_table_and_read_checked() {
+	let (a, b) = (text(300 << 10, 51), text(5000, 52));
+	let files = [("dir/a.txt", &a[..]), ("b.txt", &b[..])];
+	for version in [rars::ArchiveVersion::Rar29, rars::ArchiveVersion::Rar50] {
+		for (store, solid) in [(false, false), (true, false), (false, true)] {
+			let rar = rar_of(version, &files, store, solid, None);
+			let (backend, reader) = opened("a.rar", rar, None).await;
+			assert!(
+				matches!(reader.format(), Some(ArchiveFormat::Rar { .. })),
+				"{version:?}"
+			);
+			assert!(reader.index_held());
+			fetched(&backend);
+			let listed = reader.list(Ignore, JobControl::default()).await.unwrap();
+			assert_eq!(fetched(&backend), Vec::<u64>::new());
+			let paths: Vec<&str> = listed
+				.entries
+				.iter()
+				.map(|entry| entry.stored_path.as_str())
+				.collect();
+			assert_eq!(paths, ["dir/a.txt", "b.txt"], "{version:?}");
+			// a solid archive's first member is decoded on its own
+			let access = reader.entry_byte_access(entry(1)).await.unwrap();
+			let expected = match (store, solid) {
+				(true, _) => EntryByteAccess::Mapped {
+					size: b.len() as u64,
+				},
+				(false, false) => EntryByteAccess::Whole {
+					size: b.len() as u64,
+				},
+				(false, true) => EntryByteAccess::Sequential {
+					size: Some(b.len() as u64),
+				},
+			};
+			assert_eq!(access, expected, "{version:?} store {store} solid {solid}");
+			if store {
+				assert_eq!(range(&reader, 0, 10, 20).await.unwrap(), a[10..20]);
+			}
+			let (data, checked) = downloaded(&reader, 1)
+				.await
+				.unwrap_or_else(|e| panic!("{version:?} store {store} solid {solid}: {e:?}"));
+			assert_eq!(data, b, "{version:?} store {store} solid {solid}");
+			assert!(checked);
+			let (result, written) = read_entries(&reader, &[1, 0], None).await;
+			assert_eq!(result.unwrap().entries, 2);
+			assert_eq!(written[0].2, a);
+			assert_eq!(written[1].2, b);
+		}
+	}
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_encrypted_rar_opens_under_its_password_alone() {
+	let data = text(4000, 53);
+	let rar = rar_of(
+		rars::ArchiveVersion::Rar50,
+		&[("secret.txt", &data[..])],
+		false,
+		false,
+		Some("pw"),
+	);
+	let (backend, archive, config) = drive("s.rar", rar.clone(), 64 << 20);
+	let wrong = reader_of(&backend, &archive, &config, Some("nope"));
+	assert_eq!(
+		wrong
+			.open(Ignore, JobControl::default())
+			.await
+			.unwrap_err()
+			.error
+			.kind(),
+		ErrorKind::ArchiveWrongPassword
+	);
+	let (_, reader) = opened("s.rar", rar, Some("pw")).await;
+	assert_eq!(downloaded(&reader, 0).await.unwrap().0, data);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_comic_book_rar_behind_a_stub_is_read_by_its_name() {
+	let page = text(2000, 54);
+	let mut cbr = vec![0x4D, 0x5A];
+	cbr.extend(vec![0u8; 1000]);
+	cbr.extend(rar_of(
+		rars::ArchiveVersion::Rar50,
+		&[("01.png", &page[..])],
+		true,
+		false,
+		None,
+	));
+	let (_, reader) = opened("comic.cbr", cbr, None).await;
+	assert_eq!(range(&reader, 0, 0, 100).await.unwrap(), page[..100]);
+	assert_eq!(downloaded(&reader, 0).await.unwrap().0, page);
 }

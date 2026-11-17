@@ -2355,6 +2355,7 @@ dependencies = [
  "port_check",
  "ppmd-rust",
  "rand 0.10.3",
+ "rars",
  "rayon",
  "regex",
  "reqwest",
@@ -3451,7 +3452,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4b0f83760fb341a774ed326568e19f5a863af4a952def8c39f9ab92fd95b88e5"
 dependencies = [
  "equivalent",
- "hashbrown 0.15.5",
+ "hashbrown 0.16.1",
  "serde",
  "serde_core",
 ]
@@ -5474,7 +5475,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.59.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -5590,6 +5591,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "513962919efc330f829edb2535844d1b912b0fbe2ca165d613e4e8788bb05a5a"
 dependencies = [
  "rand_core 0.9.3",
+]
+
+[[package]]
+name = "rars"
+version = "0.12.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f10c4922c8ceb429e2eed0b2f61672f673d53a42fdfeb07fd0e143777ee9a979"
+dependencies = [
+ "aes 0.9.3",
+ "aho-corasick",
+ "crc32fast",
+ "getrandom 0.4.2",
+ "hmac 0.13.0",
+ "sha1 0.11.0",
+ "sha2 0.11.1",
+ "zeroize",
 ]
 
 [[package]]

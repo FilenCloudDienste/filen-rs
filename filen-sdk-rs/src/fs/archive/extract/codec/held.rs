@@ -5,6 +5,7 @@
 
 use std::{mem, num::NonZeroU64, sync::Arc};
 
+use super::rar::RarTable;
 use crate::fs::archive::{
 	sevenz::read::{HeldKeys, SevenZIndex},
 	zip::read::ZipIndex,
@@ -16,6 +17,8 @@ pub(crate) enum HeldIndex {
 	Zip(ZipIndex),
 	/// A tar's, which a codec job cannot start from: a tar is read from its start.
 	Tar(TarTable),
+	/// A RAR's, which a listing is made from; a job that decodes parses the RAR again.
+	Rar(RarTable),
 	SevenZ {
 		index: SevenZIndex,
 		/// The keys derived for the index and the entries read with it, under the job's
@@ -30,6 +33,7 @@ impl HeldIndex {
 		match self {
 			Self::Zip(index) => index.heap_bytes(),
 			Self::Tar(table) => (table.members.capacity() * mem::size_of::<TarSpan>()) as u64,
+			Self::Rar(table) => table.heap_bytes(),
 			Self::SevenZ { index, keys } => index.heap_bytes().saturating_add(keys.heap_bytes()),
 		}
 	}

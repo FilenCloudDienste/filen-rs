@@ -45,7 +45,7 @@ use crate::{
 			},
 			test_support::{
 				APPLE_DOUBLE, TarMember, archive_password, gzip, hash, incompressible, pattern,
-				sevenz_of, tar_of, tar_with, zip_of,
+				rar_of, sevenz_of, tar_of, tar_with, zip_of,
 			},
 			worker::{self, ARCHIVE_STALL_TIMEOUT, LinkHead},
 		},
@@ -371,6 +371,38 @@ async fn extracts_a_compressed_tar_into_a_new_folder() {
 	);
 	assert_eq!(job.recorder.last().phase, ExtractPhase::Done);
 	assert_released(&setup, &job.reporter, &job.recorder);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn extracts_a_solid_rar_into_a_new_folder() {
+	let big = pattern(2 * CHUNK_SIZE + 100, 8);
+	for version in [rars::ArchiveVersion::Rar29, rars::ArchiveVersion::Rar50] {
+		let rar = rar_of(
+			version,
+			&[("docs/a.txt", b"alpha"), ("docs/big.bin", &big)],
+			false,
+			true,
+			None,
+		);
+		let setup = setup("sample.rar", rar, |_| {});
+		let job = start(&setup, Options::default());
+		let report = job.running.await.unwrap().unwrap();
+		assert_eq!(created_dirs(&setup), ["sample", "docs"], "{version:?}");
+		assert_eq!(
+			finished(&setup),
+			BTreeMap::from([
+				("sample/docs/a.txt".to_owned(), (5, 1, hash(b"alpha"))),
+				(
+					"sample/docs/big.bin".to_owned(),
+					(big.len() as u64, 3, hash(&big))
+				),
+			]),
+			"{version:?}"
+		);
+		assert_eq!(report.counts.files_done, 2);
+		assert_eq!(report.unaccounted_bytes, 0);
+		assert_released(&setup, &job.reporter, &job.recorder);
+	}
 }
 
 /// The report's renames as path, name and reason, sorted: they are recorded as entries finish.

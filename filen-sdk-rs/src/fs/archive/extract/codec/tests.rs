@@ -222,6 +222,9 @@ fn run_job_holding(job: StreamJob, mut answer: impl FnMut(u64) -> Option<Vec<u8>
 					HeldIndex::Zip(_) => ArchiveFormat::Zip,
 					HeldIndex::SevenZ { .. } => ArchiveFormat::SevenZ,
 					HeldIndex::Tar(_) => ArchiveFormat::Tar { codec: None },
+					HeldIndex::Rar(ref table) => ArchiveFormat::Rar {
+						version: table.version,
+					},
 				}));
 				held = Some(index);
 			}

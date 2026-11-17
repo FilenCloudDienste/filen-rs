@@ -5,6 +5,7 @@
 
 mod entries;
 mod held;
+mod rar;
 mod sevenz;
 mod tar;
 mod zip;
@@ -41,6 +42,8 @@ use super::{
 use entries::{Found, Verdict, Walk, apple_double};
 pub(crate) use entries::{LinkKeys, Selection, Task};
 pub(crate) use held::{HeldIndex, IndexUse, TarSpan, TarTable};
+pub(crate) use rar::{RarKind, RarPacking, RarTable};
+use rar::{extract_rar, open_rar};
 use sevenz::{extract_held_sevenz, extract_sevenz, read_sevenz_held};
 use tar::walk_tar;
 use zip::{extract_held_zip, extract_zip, read_zip_index};
@@ -135,8 +138,11 @@ pub(crate) fn extract_stream(port: &WorkerPort, job: StreamJob) -> Result<Archiv
 			HeldIndex::SevenZ { index, keys } => {
 				return extract_held_sevenz(&mut walk, input(), index, keys, &job);
 			}
-			// a tar is read from its start
-			HeldIndex::Tar(_) => {}
+			HeldIndex::Rar(table) if walk.listing() => {
+				return extract_rar(&mut walk, input(), &job, Some(table));
+			}
+			// a tar is read from its start, and a RAR's members are decoded by a parse of it
+			HeldIndex::Tar(_) | HeldIndex::Rar(_) => {}
 		}
 	}
 	// a listing asked for its index records where a tar's members lie
@@ -222,6 +228,12 @@ pub(crate) fn extract_stream(port: &WorkerPort, job: StreamJob) -> Result<Archiv
 			CachedInput::rereading(source.into_inner().1),
 			&job,
 		),
+		Some(Detected::Rar) => extract_rar(
+			&mut walk,
+			CachedInput::rereading(source.into_inner().1),
+			&job,
+			None,
+		),
 		None => Err(not_an_archive()),
 	}
 }
@@ -256,6 +268,16 @@ pub(crate) fn open_archive(port: &WorkerPort, job: StreamJob) -> Result<ArchiveE
 			port.send(WorkerEvent::Opened(ArchiveFormat::Zip))
 				.map_err(read_failure)?;
 			port.send(WorkerEvent::Indexed(Box::new(HeldIndex::Zip(index))))
+				.map_err(read_failure)?;
+			return Ok(ArchiveEnd::plain(0, 0));
+		}
+		Some(Detected::Rar) => {
+			let table = open_rar(CachedInput::rereading(input), &job)?;
+			port.send(WorkerEvent::Opened(ArchiveFormat::Rar {
+				version: table.version,
+			}))
+			.map_err(read_failure)?;
+			port.send(WorkerEvent::Indexed(Box::new(HeldIndex::Rar(table))))
 				.map_err(read_failure)?;
 			return Ok(ArchiveEnd::plain(0, 0));
 		}

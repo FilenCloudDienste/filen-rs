@@ -14,7 +14,9 @@ use crate::{
 	consts::CHUNK_SIZE_U64,
 	fs::archive::{
 		extract::{
-			ArchiveEntryId, EntryDownloadError, ExtractSkipReason, codec::HeldIndex, path_refusal,
+			ArchiveEntryId, EntryDownloadError, ExtractSkipReason,
+			codec::{HeldIndex, RarKind, RarPacking, RarTable},
+			path_refusal,
 		},
 		format::{ArchiveFormat, StreamCodec},
 		input::{PREFETCH_CHUNKS, take_memory},
@@ -245,6 +247,33 @@ fn sevenz_access(index: &SevenZIndex, ordinal: u64) -> Result<Resolved, Error> {
 	})
 }
 
+/// What reading `ordinal` of the RAR `table` costs: a stored, unencrypted member lies in the
+/// archive as it is; another, unless solid, is decoded whole; a solid one front to back.
+fn rar_access(table: &RarTable, ordinal: u64) -> Result<Resolved, Error> {
+	let member = usize::try_from(ordinal)
+		.ok()
+		.and_then(|at| table.members.get(at))
+		.ok_or_else(not_held)?;
+	if member.kind != RarKind::File {
+		return Err(EntryDownloadError::NotAFile.into());
+	}
+	if let Some(reason) = path_refusal(&member.name) {
+		return Err(EntryDownloadError::Skipped(reason).into());
+	}
+	Ok(match (&member.data, member.packing) {
+		(Some(data), RarPacking::Stored) if !member.encrypted && member.packed == member.size => {
+			Resolved::Mapped {
+				offset: data.start,
+				size: member.size,
+			}
+		}
+		(_, RarPacking::Solid) => Resolved::Sequential {
+			size: Some(member.size),
+		},
+		_ => Resolved::Whole { size: member.size },
+	})
+}
+
 /// A chunk of the archive read for a range, and the memory it holds while it is written.
 type RangeChunk = (Arc<Vec<u8>>, Option<OwnedSemaphorePermit>);
 
@@ -326,7 +355,7 @@ impl Reader {
 			return Ok(resolved);
 		}
 		let resolved = match self.format() {
-			Some(ArchiveFormat::Zip | ArchiveFormat::SevenZ) => {
+			Some(ArchiveFormat::Zip | ArchiveFormat::SevenZ | ArchiveFormat::Rar { .. }) => {
 				let index = self.held_index().await?;
 				match &*index {
 					HeldIndex::Zip(index) => match zip_access(index, ordinal)? {
@@ -358,6 +387,7 @@ impl Reader {
 						}
 					},
 					HeldIndex::SevenZ { index, .. } => sevenz_access(index, ordinal)?,
+					HeldIndex::Rar(table) => rar_access(table, ordinal)?,
 					HeldIndex::Tar(_) => return Err(Arc::new(not_held())),
 				}
 			}

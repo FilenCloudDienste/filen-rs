@@ -51,7 +51,7 @@ pub use extract::{
 	ListedSkipReason, MAX_LISTED_BYTES, MAX_LISTED_ENTRIES, OmittedRecords, PasswordCheck,
 	SolidSkipExceeded,
 };
-pub use format::{ArchiveFormat, StreamCodec, archive_default_name};
+pub use format::{ArchiveFormat, RarVersion, StreamCodec, archive_default_name};
 pub use password::ArchivePassword;
 pub use reader::{
 	ArchiveReader, EntriesReadFailed, EntriesReadReport, EntryByteAccess, ReaderDownloadEntryConfig,

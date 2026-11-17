@@ -442,7 +442,9 @@ impl<W: AsyncWrite + Unpin + MaybeSend> FeedSink for EntrySink<'_, W> {
 		match (self.state, event) {
 			(
 				SinkState::Waiting,
-				WorkerEvent::Opened(ArchiveFormat::Zip | ArchiveFormat::SevenZ),
+				WorkerEvent::Opened(
+					ArchiveFormat::Zip | ArchiveFormat::SevenZ | ArchiveFormat::Rar { .. },
+				),
 			) => {}
 			(
 				SinkState::Waiting,

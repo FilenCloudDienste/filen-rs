@@ -264,7 +264,9 @@ pub(crate) fn from_source(error: &io::Error) -> bool {
 	error.get_ref().is_some_and(|inner| inner.is::<JobEnded>())
 }
 
-/// The codec's end of the exchange.
+/// The codec's end of the exchange. A copy is the same end: a reader that has to own its input
+/// (a RAR's) holds one.
+#[derive(Clone)]
 pub(crate) struct WorkerPort {
 	events: mpsc::Sender<WorkerEvent>,
 	shared: Arc<WorkerShared>,
@@ -494,7 +496,7 @@ impl Read for ChunkInput<'_> {
 /// A chunk shorter than its place in the input promises fails the read with `UnexpectedEof`,
 /// rather than ending the input early as a short read past the data would.
 pub(crate) struct CachedInput<'p> {
-	port: &'p WorkerPort,
+	port: PortRef<'p>,
 	source: u32,
 	len: u64,
 	/// The most recent chunks, most recent first.
@@ -508,16 +510,48 @@ pub(crate) struct CachedInput<'p> {
 	counted_prefix: u64,
 }
 
+/// The port an input fetches through: borrowed from the codec, or owned by an input a reader
+/// has to own.
+enum PortRef<'p> {
+	Borrowed(&'p WorkerPort),
+	Owned(WorkerPort),
+}
+
+impl std::ops::Deref for PortRef<'_> {
+	type Target = WorkerPort;
+
+	fn deref(&self) -> &WorkerPort {
+		match self {
+			Self::Borrowed(port) => port,
+			Self::Owned(port) => port,
+		}
+	}
+}
+
 impl<'p> CachedInput<'p> {
 	pub(crate) fn new(port: &'p WorkerPort, source: u32, len: u64) -> Self {
 		Self {
-			port,
+			port: PortRef::Borrowed(port),
 			source,
 			len,
 			cache: Vec::new(),
 			slots: 2,
 			read_chunks: Vec::new(),
 			counted_prefix: 0,
+		}
+	}
+
+	/// The same input, owning a copy of its port: for a reader that keeps its input as long as
+	/// it likes (a RAR's).
+	pub(crate) fn into_owned(self) -> CachedInput<'static> {
+		CachedInput {
+			port: PortRef::Owned(WorkerPort::clone(&self.port)),
+			source: self.source,
+			len: self.len,
+			cache: self.cache,
+			slots: self.slots,
+			read_chunks: self.read_chunks,
+			counted_prefix: self.counted_prefix,
 		}
 	}
 

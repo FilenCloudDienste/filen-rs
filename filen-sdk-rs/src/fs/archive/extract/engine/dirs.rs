@@ -166,7 +166,10 @@ impl<B: DisposalBackend> Driver<B> {
 		let new_folder = match (&self.root, layout) {
 			(
 				ExtractRoot::NewFolder { name },
-				ArchiveFormat::Tar { .. } | ArchiveFormat::Zip | ArchiveFormat::SevenZ,
+				ArchiveFormat::Tar { .. }
+				| ArchiveFormat::Zip
+				| ArchiveFormat::SevenZ
+				| ArchiveFormat::Rar { .. },
 			) => Some(name.clone()),
 			(_, ArchiveFormat::Single { .. }) | (ExtractRoot::Destination, _) => None,
 		};
