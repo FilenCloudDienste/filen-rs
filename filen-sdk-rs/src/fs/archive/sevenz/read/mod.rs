@@ -333,26 +333,49 @@ impl Heap {
 /// Derived keys, kept for the folders that share them, and the rounds still allowed.
 pub(crate) struct Keys<'p> {
 	password: Option<&'p ArchivePassword>,
+	/// Keys an earlier job derived from the same password, looked up before any is derived.
+	held: &'p [DerivedKey],
 	derived: Vec<DerivedKey>,
 	rounds_left: u64,
 	on_round: Option<&'p dyn Fn() -> io::Result<()>>,
 }
 
 /// A key and what it was derived with; the IV is not part of it.
-struct DerivedKey {
+#[derive(Debug)]
+pub(crate) struct DerivedKey {
 	cycles_power: u8,
 	salt: Vec<u8>,
 	key: Key,
 }
 
+/// The keys a job derived, kept with the index it read for later jobs on the same archive under
+/// the same password, which then derive none of them again.
+#[derive(Debug, Default)]
+pub(crate) struct HeldKeys(Vec<DerivedKey>);
+
 impl<'p> Keys<'p> {
 	pub(crate) fn new(password: Option<&'p ArchivePassword>) -> Self {
 		Self {
 			password,
+			held: &[],
 			derived: Vec::new(),
 			rounds_left: KDF_ROUNDS_BUDGET,
 			on_round: None,
 		}
+	}
+
+	/// Looks keys up in `held` before deriving any: they were derived from the same password by
+	/// an earlier job on the same archive.
+	pub(crate) fn with_held(self, held: &'p HeldKeys) -> Self {
+		Self {
+			held: &held.0,
+			..self
+		}
+	}
+
+	/// The keys this job derived, to hold for later jobs.
+	pub(crate) fn into_held(self) -> HeldKeys {
+		HeldKeys(self.derived)
 	}
 
 	/// Calls `on_round` as a key derivation progresses (see [`derive_key`]); its error stops
@@ -372,14 +395,15 @@ impl<'p> Keys<'p> {
 	fn key(&mut self, props: &AesProps) -> Result<&Key, SevenZError> {
 		let password = self.password.ok_or(SevenZError::PasswordRequired)?;
 		let (cycles_power, salt) = (props.cycles_power(), props.salt());
-		if let Some(at) = self
-			.derived
-			.iter()
-			.position(|derived| derived.cycles_power == cycles_power && derived.salt == salt)
-		{
+		let derived_with =
+			|derived: &DerivedKey| derived.cycles_power == cycles_power && derived.salt == salt;
+		if let Some(held) = self.held.iter().find(|derived| derived_with(derived)) {
+			return Ok(&held.key);
+		}
+		if let Some(at) = self.derived.iter().position(derived_with) {
 			return Ok(&self.derived[at].key);
 		}
-		if exceeds_limit(self.derived.len() as u64 + 1, MAX_KEYS) {
+		if exceeds_limit((self.held.len() + self.derived.len()) as u64 + 1, MAX_KEYS) {
 			return Err(SevenZError::Unsupported("a 7z archive with too many keys"));
 		}
 		let rounds = match cycles_power {

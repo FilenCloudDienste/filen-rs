@@ -24,7 +24,7 @@ use crate::{
 use super::{
 	ArchiveEntryId, ArchiveSource, EntryDownloadCallback, EntryDownloadFailed, EntryDownloadReport,
 	ExpansionLimit, ExtractCallback, ExtractFailed, ExtractReport, ExtractRequest, ExtractWhat,
-	codec::{CodecLimits, StreamJob, Task, extract_stream},
+	codec::{CodecLimits, IndexUse, StreamJob, Task, extract_stream},
 	download::{DownloadTask, EntryDownloadReporter, choose_entry, run_download},
 	engine::{ArchiveDisposal, CodecResult, ExtractTask, run_extract},
 	list::{ListCallback, ListFailed, ListReport, ListReporter, ListTask, run_list},
@@ -417,6 +417,7 @@ fn start_codec(
 		password: config.password,
 		skip_mac_metadata: config.skip_mac_metadata,
 		task,
+		index: IndexUse::Read,
 	};
 	Box::new(move || worker::start(move |port| extract_stream(&port, job)))
 }

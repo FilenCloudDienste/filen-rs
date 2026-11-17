@@ -27,7 +27,7 @@ use crate::{
 		HasName, HasUUID,
 		archive::{
 			config::ArchiveConfig,
-			extract::codec::{ArchiveEnd, CodecLimits, StreamJob, Task, extract_stream},
+			extract::codec::{ArchiveEnd, CodecLimits, IndexUse, StreamJob, Task, extract_stream},
 			format::ArchiveFormat,
 			input::{CodecFeed, Fed},
 			worker::{self, EntryHead, EntryKind, WorkerEvent, WorkerLink, worker_died},
@@ -97,6 +97,7 @@ impl ReadBack {
 					// every entry the job wrote comes back, whatever its name
 					skip_mac_metadata: false,
 					task: Task::Extract(None),
+					index: IndexUse::Read,
 				};
 				worker::start(move |port| extract_stream(&port, job))
 			}),
@@ -216,6 +217,7 @@ impl Check {
 			}
 			WorkerEvent::Listed(_) => return Err("its reader listed it".to_owned()),
 			WorkerEvent::Head(_) => return Err("its reader wrote".to_owned()),
+			WorkerEvent::Indexed(_) => return Err("its reader handed back its index".to_owned()),
 		}
 		Ok(())
 	}

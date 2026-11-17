@@ -1,10 +1,7 @@
 //! Reading a zip: its central directory first, then its entries in the order of their local
 //! headers.
 
-use std::{
-	io::{self, Read, Seek},
-	mem,
-};
+use std::io::{self, Read, Seek};
 
 use microthumb::BorrowedSeqReader;
 
@@ -35,7 +32,8 @@ use crate::{
 };
 
 use super::{
-	ArchiveEnd, LIST_READ_BYTES, PASSWORD_PROBE_BYTES, StreamJob, Taken, check_stated_size,
+	ArchiveEnd, HeldIndex, IndexUse, LIST_READ_BYTES, PASSWORD_PROBE_BYTES, StreamJob, Taken,
+	check_stated_size,
 	entries::{Found, MacShape, Verdict, Walk, apple_double, found_path, symlink},
 	likely_wrong_password, link_target, take_file,
 };
@@ -141,7 +139,7 @@ fn check_zip_password<R: Read + Seek>(
 }
 
 /// A zip read from `source`: its entries in local-header order, each checked against its CRC-32
-/// or authentication code.
+/// or authentication code. Its index goes to the driver afterwards when the job asks for it.
 pub(super) fn extract_zip(
 	walk: &mut Walk,
 	mut input: CachedInput<'_>,
@@ -152,24 +150,44 @@ pub(super) fn extract_zip(
 		max_index_bytes: job.limits.max_index_bytes,
 		max_entries: job.limits.max_members,
 	};
-	let mut index = read_index(&mut source, job.len, limits).map_err(Error::from)?;
+	let index = read_index(&mut source, job.len, limits).map_err(Error::from)?;
+	let end = zip_entries(walk, &mut source, &index, job)?;
+	if matches!(job.index, IndexUse::ReadAndReturn) {
+		walk.port
+			.send(WorkerEvent::Indexed(Box::new(HeldIndex::Zip(index))))
+			.map_err(read_failure)?;
+	}
+	Ok(end)
+}
+
+/// A zip whose `index` an earlier job read, from its entries on.
+pub(super) fn extract_held_zip(
+	walk: &mut Walk,
+	mut input: CachedInput<'_>,
+	index: &ZipIndex,
+	job: &StreamJob,
+) -> Result<ArchiveEnd, Error> {
+	zip_entries(walk, &mut BorrowedSeqReader::new(&mut input), index, job)
+}
+
+/// A zip's entries, read from `source` by its `index`.
+fn zip_entries(
+	walk: &mut Walk,
+	source: &mut BorrowedSeqReader<'_>,
+	index: &ZipIndex,
+	job: &StreamJob,
+) -> Result<ArchiveEnd, Error> {
 	let entry_limits = EntryLimits {
 		decoder_memory: job.limits.decoder_memory,
 	};
 	let password = job.password.as_ref();
 	let duplicates = (index.duplicate_count > 0).then(|| DuplicateEntries {
-		names: mem::take(&mut index.duplicate_names),
+		// a copy: the index may be held for later jobs, which report them too
+		names: index.duplicate_names.clone(),
 		count: index.duplicate_count,
 	});
 	if walk.listing() {
-		return list_zip(
-			walk,
-			&mut source,
-			&index,
-			password,
-			entry_limits,
-			duplicates,
-		);
+		return list_zip(walk, source, index, password, entry_limits, duplicates);
 	}
 	walk.check_selection(index.entries.iter().chain(&index.overlapping).map(|entry| {
 		(
@@ -191,7 +209,7 @@ pub(super) fn extract_zip(
 		return Err(error);
 	}
 	// set once an encrypted entry read back whole against its CRC-32 or authentication code
-	let mut verified = check_zip_password(&mut source, &index, walk, password, entry_limits)?
+	let mut verified = check_zip_password(source, index, walk, password, entry_limits)?
 		.verified(ZipError::PasswordRequired, ZipError::WrongPassword)
 		.map_err(Error::from)?;
 
@@ -206,7 +224,7 @@ pub(super) fn extract_zip(
 				.map_err(read_failure)?;
 		}
 	}
-	let mut unaccounted_bytes = around_entries(&index);
+	let mut unaccounted_bytes = around_entries(index);
 	for entry in &index.entries {
 		let found = zip_found(entry, false, None);
 		let verdict = walk.judge(&found)?;
@@ -216,7 +234,7 @@ pub(super) fn extract_zip(
 			continue;
 		}
 		unaccounted_bytes = unaccounted_bytes.saturating_add(unaccounted_at(
-			&mut source,
+			source,
 			index.shift,
 			entry,
 			password,
@@ -225,9 +243,8 @@ pub(super) fn extract_zip(
 		let (path, apple_double) = match verdict {
 			Verdict::Ignore | Verdict::Root | Verdict::Held => continue,
 			Verdict::Skip(ExtractSkipReason::Symlink { .. }) => {
-				let target =
-					zip_symlink_target(&mut source, index.shift, entry, password, entry_limits)
-						.map_err(read_failure)?;
+				let target = zip_symlink_target(source, index.shift, entry, password, entry_limits)
+					.map_err(read_failure)?;
 				walk.port
 					.send(found.skipped(ExtractSkipReason::Symlink {
 						target: target.unwrap_or_default(),
@@ -250,7 +267,7 @@ pub(super) fn extract_zip(
 			continue;
 		}
 		// opened before it is announced: its local header may show it overlapping the next
-		match open_entry(&mut source, index.shift, entry, password, entry_limits) {
+		match open_entry(source, index.shift, entry, password, entry_limits) {
 			Ok(mut reader) => {
 				verified |= take_zip_file(
 					walk,

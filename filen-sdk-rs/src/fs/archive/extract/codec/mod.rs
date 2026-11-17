@@ -4,6 +4,7 @@
 //! entry is instead of its data.
 
 mod entries;
+mod held;
 mod sevenz;
 mod tar;
 mod zip;
@@ -37,9 +38,10 @@ use super::{
 };
 use entries::{Found, Verdict, Walk, apple_double};
 pub(crate) use entries::{LinkKeys, Selection, Task};
-use sevenz::extract_sevenz;
+pub(crate) use held::{HeldIndex, IndexUse};
+use sevenz::{extract_held_sevenz, extract_sevenz};
 use tar::walk_tar;
-use zip::extract_zip;
+use zip::{extract_held_zip, extract_zip};
 
 /// What the codec may spend on an archive.
 #[derive(Debug, Clone, Copy)]
@@ -68,6 +70,8 @@ pub(crate) struct StreamJob {
 	/// [`ExtractConfig::skip_mac_metadata`](super::ExtractConfig::skip_mac_metadata)).
 	pub(crate) skip_mac_metadata: bool,
 	pub(crate) task: Task,
+	/// Where the archive's index comes from: read by the job, or held from an earlier one.
+	pub(crate) index: IndexUse,
 }
 
 /// How an archive ended.
@@ -117,6 +121,16 @@ pub(crate) fn extract_stream(port: &WorkerPort, job: StreamJob) -> Result<Archiv
 		job.skip_mac_metadata,
 		job.limits.max_members,
 	);
+	if let IndexUse::Held(held) = &job.index {
+		// neither the head nor the index is read again: the job starts at its entries
+		let input = CachedInput::new(port, 0, job.len);
+		return match &**held {
+			HeldIndex::Zip(index) => extract_held_zip(&mut walk, input, index, &job),
+			HeldIndex::SevenZ { index, keys } => {
+				extract_held_sevenz(&mut walk, input, index, keys, &job)
+			}
+		};
+	}
 	let mut input = ChunkInput::new(port, 0, job.len);
 	let mut head = [0u8; DETECT_HEAD_LEN];
 	let head_len = read_full(&mut input, &mut head).map_err(read_failure)?;

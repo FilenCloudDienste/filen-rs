@@ -601,7 +601,8 @@ impl FeedSink for ListSink<'_> {
 			| WorkerEvent::Data(_)
 			| WorkerEvent::FileEnd
 			| WorkerEvent::Link(_)
-			| WorkerEvent::Head(_) => return Err(unexpected_event()),
+			| WorkerEvent::Head(_)
+			| WorkerEvent::Indexed(_) => return Err(unexpected_event()),
 		}
 		Ok(())
 	}

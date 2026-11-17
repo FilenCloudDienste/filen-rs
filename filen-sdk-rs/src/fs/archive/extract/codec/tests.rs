@@ -3,7 +3,7 @@
 
 use std::{
 	io::{Cursor, Write},
-	sync::mpsc,
+	sync::{Arc, mpsc},
 	time::Duration,
 };
 
@@ -78,6 +78,8 @@ enum Seen {
 	/// A hard link at a path, to the file at another.
 	Link(u64, String, String),
 	Listed(ArchiveEntry),
+	/// The index handed back, of an archive of this format.
+	Indexed(ArchiveFormat),
 }
 
 fn run_with(
@@ -114,6 +116,7 @@ fn run_counting(
 			password: password.map(archive_password),
 			skip_mac_metadata: false,
 			task: Task::Extract(None),
+			index: IndexUse::Read,
 		},
 	)
 }
@@ -132,13 +135,42 @@ fn run_job(archive: &[u8], job: StreamJob) -> (Vec<Seen>, Result<ArchiveEnd, Err
 /// unanswered, as a driver does when the fetch failed and stopped the job.
 fn run_job_answering(
 	job: StreamJob,
-	mut answer: impl FnMut(u64) -> Option<Vec<u8>>,
+	answer: impl FnMut(u64) -> Option<Vec<u8>>,
 ) -> (Vec<Seen>, Result<ArchiveEnd, Error>, u64) {
+	let run = run_job_holding(job, answer);
+	(run.seen, run.result, run.read)
+}
+
+/// What a codec job did, with what [`run_job_answering`] leaves out.
+struct JobRun {
+	seen: Vec<Seen>,
+	result: Result<ArchiveEnd, Error>,
+	/// Bytes of the archive it counted as read.
+	read: u64,
+	/// The chunks it asked for, in order.
+	asked: Vec<u64>,
+	/// The index it handed back.
+	index: Option<Box<HeldIndex>>,
+}
+
+/// `archive` through the codec running `job`, every chunk answered.
+fn run_job_on(archive: &[u8], job: StreamJob) -> JobRun {
+	run_job_holding(job, |index| {
+		let start = usize::try_from(index * CHUNK_SIZE_U64).unwrap();
+		let end = (start + CHUNK_SIZE).min(archive.len());
+		Some(archive[start..end].to_vec())
+	})
+}
+
+fn run_job_holding(job: StreamJob, mut answer: impl FnMut(u64) -> Option<Vec<u8>>) -> JobRun {
 	let mut link = worker::start(move |port| extract_stream(&port, job)).unwrap();
 	let mut seen = Vec::new();
+	let mut asked = Vec::new();
+	let mut held = None;
 	while let Some(event) = link.events.blocking_recv() {
 		match event {
 			WorkerEvent::Ask { index, reply, .. } => {
+				asked.push(index);
 				if let Some(chunk) = answer(index) {
 					let _ = reply.send(chunk);
 				}
@@ -184,11 +216,21 @@ fn run_job_answering(
 			)),
 			WorkerEvent::Listed(entry) => seen.push(Seen::Listed(*entry)),
 			WorkerEvent::Head(_) => panic!("an extracting codec sent a head"),
+			WorkerEvent::Indexed(index) => {
+				seen.push(Seen::Indexed(index.format()));
+				held = Some(index);
+			}
 		}
 	}
 	// the result follows the events closing, once the codec's thread hands it over
 	let result = futures::executor::block_on(&mut link.done).expect("the codec died");
-	(seen, result, link.shared.input_bytes())
+	JobRun {
+		seen,
+		result,
+		read: link.shared.input_bytes(),
+		asked,
+		index: held,
+	}
 }
 
 fn run(archive: &[u8], name: &str) -> (Vec<Seen>, Result<ArchiveEnd, Error>) {
@@ -580,6 +622,7 @@ fn the_codec_stops_once_its_driver_is_gone() {
 				password: None,
 				skip_mac_metadata: false,
 				task: Task::Extract(None),
+				index: IndexUse::Read,
 			},
 		);
 		let _ = exited.send(());
@@ -1248,6 +1291,7 @@ fn check_archive(archive: &str, bytes: &[u8], mut rows: Vec<String>) {
 			// the driver extracts it as a copy of its target
 			Seen::Link(_, path, target) => Some(format!("hardlink\t{path}\t{target}")),
 			Seen::Listed(entry) => panic!("{archive}: an extraction listed {entry:?}"),
+			Seen::Indexed(format) => panic!("{archive}: an extraction handed back a {format:?}"),
 		})
 		.collect();
 	if end.unaccounted_bytes > 0 {
@@ -1404,6 +1448,7 @@ fn job_of(archive: &[u8], name: &str, skip_mac_metadata: bool, task: Task) -> St
 		password: None,
 		skip_mac_metadata,
 		task,
+		index: IndexUse::Read,
 	}
 }
 
@@ -1417,6 +1462,7 @@ fn outline(seen: &[Seen]) -> Vec<String> {
 			Seen::Skipped(_, path, _, reason) => Some(format!("skip {path} {reason:?}")),
 			Seen::Link(_, path, target) => Some(format!("link {path} -> {target}")),
 			Seen::Listed(entry) => panic!("an extraction listed {entry:?}"),
+			Seen::Indexed(format) => panic!("an extraction handed back a {format:?}"),
 		})
 		.collect()
 }
@@ -2512,4 +2558,135 @@ fn a_mac_folder_is_sent_once_everything_in_it_was_judged() {
 			"{name}"
 		);
 	}
+}
+
+/// A zip of three stored entries of a chunk and more each: its head, each entry and its index
+/// lie in chunks of their own, the index in the last.
+fn spread_zip() -> (Vec<u8>, [Vec<u8>; 3]) {
+	let data = [
+		incompressible(CHUNK_SIZE + 10, 1),
+		incompressible(CHUNK_SIZE + 20, 2),
+		incompressible(CHUNK_SIZE + 30, 3),
+	];
+	let mut writer = crate::fs::archive::zip::write::ZipWriter::new(Vec::new());
+	for (at, data) in data.iter().enumerate() {
+		writer
+			.add_file(
+				&format!("{at}.bin"),
+				None,
+				data.len() as u64,
+				crate::fs::archive::zip::write::ZipMethod::Stored,
+				None,
+				&mut &data[..],
+			)
+			.unwrap();
+	}
+	(writer.finish().unwrap(), data)
+}
+
+/// A download of entry `ordinal` alone, through an index `index` says where to get.
+fn download_job(archive: &[u8], name: &str, ordinal: u64, index: IndexUse) -> StreamJob {
+	StreamJob {
+		index,
+		..job_of(
+			archive,
+			name,
+			false,
+			Task::Download {
+				selection: Selection::new([ordinal], Vec::new()),
+				max_solid_skip: None,
+			},
+		)
+	}
+}
+
+#[test]
+fn a_listing_asked_for_its_index_hands_it_back_once_done() {
+	let (zip, _) = spread_zip();
+	let run = run_job_on(
+		&zip,
+		StreamJob {
+			index: IndexUse::ReadAndReturn,
+			..job_of(&zip, "z.zip", false, Task::List { archive: LISTED })
+		},
+	);
+	run.result.unwrap();
+	assert_eq!(run.seen.last(), Some(&Seen::Indexed(ArchiveFormat::Zip)));
+	let Some(index) = run.index else {
+		panic!("no index handed back");
+	};
+	let HeldIndex::Zip(index) = *index else {
+		panic!("not a zip's index");
+	};
+	assert_eq!(index.entries.len(), 3);
+	// a job that only reads it hands nothing back
+	let run = run_job_on(
+		&zip,
+		job_of(&zip, "z.zip", false, Task::List { archive: LISTED }),
+	);
+	assert!(run.index.is_none());
+}
+
+#[test]
+fn a_job_on_a_held_zip_index_reads_neither_the_head_nor_the_index() {
+	let (zip, data) = spread_zip();
+	let last = (zip.len() as u64 - 1) / CHUNK_SIZE_U64;
+	let alone = run_job_on(&zip, download_job(&zip, "z.zip", 1, IndexUse::Read));
+	alone.result.unwrap();
+	// the end record is looked for in the last 64 KiB, which reach back into chunk 2
+	assert_eq!(alone.asked, [0, last - 1, last, 1, 2]);
+	let held = run_job_on(
+		&zip,
+		download_job(&zip, "z.zip", 0, IndexUse::ReadAndReturn),
+	)
+	.index
+	.unwrap();
+	let held = Arc::new(*held);
+	let again = run_job_on(&zip, download_job(&zip, "z.zip", 1, IndexUse::Held(held)));
+	again.result.unwrap();
+	// only the chunks of the entry's local header and data
+	assert_eq!(again.asked, [1, 2]);
+	assert_eq!(again.seen, alone.seen);
+	let Some(Seen::File { data: read, .. }) = again.seen.get(1) else {
+		panic!("no file sent: {:?}", again.seen);
+	};
+	assert_eq!(read, &data[1]);
+}
+
+#[test]
+fn a_job_on_a_held_sevenz_index_reads_its_entries_with_the_held_keys() {
+	// the header comes after c, chunks past b's end
+	let files = [
+		incompressible(CHUNK_SIZE + 10, 1),
+		incompressible(CHUNK_SIZE + 20, 2),
+		incompressible(2 * CHUNK_SIZE, 3),
+	];
+	let sevenz = sevenz_of(
+		&[
+			("a.bin", Some(&files[0])),
+			("b.bin", Some(&files[1])),
+			("c.bin", Some(&files[2])),
+		],
+		SevenZMethod::Copy,
+		false,
+		Some((SevenZEncryption::EntriesAndHeaders, "pw")),
+	);
+	let last = (sevenz.len() as u64 - 1) / CHUNK_SIZE_U64;
+	let with_password = |index| StreamJob {
+		password: Some(archive_password("pw")),
+		..download_job(&sevenz, "s.7z", 1, index)
+	};
+	let first = run_job_on(&sevenz, with_password(IndexUse::ReadAndReturn));
+	first.result.unwrap();
+	assert_eq!(first.asked.first(), Some(&0));
+	assert!(first.asked.contains(&last));
+	let held = Arc::new(*first.index.unwrap());
+	let again = run_job_on(&sevenz, with_password(IndexUse::Held(held)));
+	again.result.unwrap();
+	assert!(!again.asked.contains(&last), "{:?}", again.asked);
+	assert_eq!(again.seen, first.seen[..first.seen.len() - 1]);
+	let Some(Seen::File { data, .. }) = again.seen.get(1) else {
+		panic!("no file sent: {:?}", again.seen);
+	};
+	assert_eq!(data, &files[1]);
 }

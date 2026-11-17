@@ -39,7 +39,7 @@ use crate::{
 use super::{
 	bytes::read_full,
 	entry_path::ArchivePath,
-	extract::{ArchiveEntry, ExtractSkipReason},
+	extract::{ArchiveEntry, ExtractSkipReason, codec::HeldIndex},
 	format::ArchiveFormat,
 };
 
@@ -77,6 +77,17 @@ pub(crate) enum WorkerEvent {
 	/// When compressing into a format whose start is written last (a 7z): the archive's first
 	/// chunk, sent after all the others.
 	Head(Vec<u8>),
+	/// The index the codec read, for a job asked to hand it back
+	/// ([`IndexUse::ReadAndReturn`](super::extract::codec::IndexUse::ReadAndReturn)): sent once
+	/// the codec is done with it.
+	#[cfg_attr(
+		not(test),
+		expect(
+			dead_code,
+			reason = "the archive reader, which holds indexes, takes it"
+		)
+	)]
+	Indexed(Box<HeldIndex>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -662,7 +662,8 @@ impl<B: DisposalBackend> Driver<B> {
 			| WorkerEvent::Entry(_)
 			| WorkerEvent::Skipped(_)
 			| WorkerEvent::Link(_)
-			| WorkerEvent::Listed(_) => self.stop_with(unexpected_event()),
+			| WorkerEvent::Listed(_)
+			| WorkerEvent::Indexed(_) => self.stop_with(unexpected_event()),
 		}
 	}
 

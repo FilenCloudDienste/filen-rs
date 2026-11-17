@@ -802,3 +802,46 @@ fn a_reparse_name_of_an_odd_length_is_no_link() {
 	data[14] = 2;
 	assert_eq!(windows_link_target(&data).as_deref(), Some("a"));
 }
+
+#[test]
+fn keys_held_from_an_earlier_read_are_not_derived_again() {
+	let archive = ours(
+		&sample(),
+		SevenZMethod::Lzma2 { level: 1 },
+		true,
+		Some((SevenZEncryption::EntriesAndHeaders, "pw")),
+	);
+	let password = archive_password("pw");
+	let mut first = Keys::new(Some(&password));
+	let index = read_index(
+		&mut Cursor::new(&archive),
+		archive.len() as u64,
+		READ_BACK_SEVEN_Z,
+		&mut first,
+	)
+	.unwrap();
+	assert_eq!(
+		first.rounds_left,
+		KDF_ROUNDS_BUDGET - (1 << TEST_CYCLES_POWER)
+	);
+	let held = first.into_held();
+	assert_eq!(held.0.len(), 1);
+
+	let mut again = Keys::new(Some(&password)).with_held(&held);
+	let mut cursor = FolderCursor::new(Cursor::new(&archive), READ_BACK_SEVEN_Z.decoder_memory);
+	let mut read = Vec::new();
+	for entry in index.entries.iter().filter(|entry| entry.stream.is_some()) {
+		let mut data = Vec::new();
+		cursor
+			.open(&index, entry, &mut again)
+			.unwrap()
+			.read_to_end(&mut data)
+			.unwrap();
+		read.push((entry.name.clone(), entry.kind, data));
+	}
+	assert_eq!(again.rounds_left, KDF_ROUNDS_BUDGET);
+	assert!(again.derived.is_empty());
+	let mut expected = in_our_order(&sample());
+	expected.retain(|(_, kind, data)| *kind == SevenZKind::File && !data.is_empty());
+	assert_eq!(read, expected);
+}

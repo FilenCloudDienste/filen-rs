@@ -20,8 +20,9 @@ use crate::{
 			sevenz::{
 				SevenZError,
 				read::{
-					FolderCursor, Keys, SevenZEntry, SevenZIndex, SevenZKind, SevenZLimits,
-					read_error, read_index as read_sevenz_index, windows_link_target, wrong_key,
+					FolderCursor, HeldKeys, Keys, SevenZEntry, SevenZIndex, SevenZKind,
+					SevenZLimits, read_error, read_index as read_sevenz_index, windows_link_target,
+					wrong_key,
 				},
 			},
 			worker::{CachedInput, EntryKind, WorkerEvent, from_source},
@@ -31,7 +32,8 @@ use crate::{
 };
 
 use super::{
-	ArchiveEnd, LIST_READ_BYTES, PASSWORD_PROBE_BYTES, StreamJob, Taken, check_stated_size,
+	ArchiveEnd, HeldIndex, IndexUse, LIST_READ_BYTES, PASSWORD_PROBE_BYTES, StreamJob, Taken,
+	check_stated_size,
 	entries::{Found, MacShape, Verdict, Walk, apple_double, found_path, symlink},
 	likely_wrong_password, link_target, take_file,
 };
@@ -140,8 +142,18 @@ fn sevenz_found<'e, 's, R: Read + Seek + 's>(
 	Ok((found, None))
 }
 
+/// What reading a 7z may spend, as the job allows.
+fn sevenz_limits(job: &StreamJob) -> SevenZLimits {
+	SevenZLimits {
+		max_index_bytes: job.limits.max_index_bytes,
+		max_entries: job.limits.max_members,
+		decoder_memory: job.limits.decoder_memory,
+	}
+}
+
 /// A 7z read from `source`: its entries in header order, folder by folder, each checked against
-/// its CRC-32 when the header lists one.
+/// its CRC-32 when the header lists one. Its index, and the keys derived for it and its entries,
+/// go to the driver afterwards when the job asks for them.
 pub(super) fn extract_sevenz(
 	walk: &mut Walk,
 	mut input: CachedInput<'_>,
@@ -152,23 +164,58 @@ pub(super) fn extract_sevenz(
 	// be given up on as a dead codec, and a cancel would wait it out
 	let keep_alive = || port.keep_alive();
 	let mut keys = Keys::new(job.password.as_ref()).with_on_round(&keep_alive);
-	let limits = SevenZLimits {
-		max_index_bytes: job.limits.max_index_bytes,
-		max_entries: job.limits.max_members,
-		decoder_memory: job.limits.decoder_memory,
-	};
 	let index = read_sevenz_index(
 		&mut BorrowedSeqReader::new(&mut input),
 		job.len,
-		limits,
+		sevenz_limits(job),
 		&mut keys,
 	)
 	.map_err(Error::from)?;
+	let end = sevenz_entries(walk, input, &index, &mut keys, job)?;
+	if matches!(job.index, IndexUse::ReadAndReturn) {
+		let keys = keys.into_held();
+		port.send(WorkerEvent::Indexed(Box::new(HeldIndex::SevenZ {
+			index,
+			keys,
+		})))
+		.map_err(read_failure)?;
+	}
+	Ok(end)
+}
+
+/// A 7z whose `index` an earlier job read, from its entries on, with the keys it derived.
+pub(super) fn extract_held_sevenz(
+	walk: &mut Walk,
+	input: CachedInput<'_>,
+	index: &SevenZIndex,
+	held: &HeldKeys,
+	job: &StreamJob,
+) -> Result<ArchiveEnd, Error> {
+	let port = walk.port;
+	let keep_alive = || port.keep_alive();
+	let mut keys = Keys::new(job.password.as_ref())
+		.with_held(held)
+		.with_on_round(&keep_alive);
+	sevenz_entries(walk, input, index, &mut keys, job)
+}
+
+/// A 7z's entries, read from `input` by its `index`.
+fn sevenz_entries(
+	walk: &mut Walk,
+	mut input: CachedInput<'_>,
+	index: &SevenZIndex,
+	keys: &mut Keys<'_>,
+	job: &StreamJob,
+) -> Result<ArchiveEnd, Error> {
+	let port = walk.port;
 	// a folder's packed streams are read in turns (BCJ2 has four)
 	input.set_slots((index.max_packed_streams() + 1).min(MAX_SEVEN_Z_SLOTS));
-	let mut cursor = FolderCursor::new(BorrowedSeqReader::new(&mut input), limits.decoder_memory);
+	let mut cursor = FolderCursor::new(
+		BorrowedSeqReader::new(&mut input),
+		job.limits.decoder_memory,
+	);
 	if walk.listing() {
-		return list_sevenz(walk, &mut cursor, &index, &mut keys, job);
+		return list_sevenz(walk, &mut cursor, index, keys, job);
 	}
 	walk.check_selection(index.entries.iter().map(|entry| {
 		(
@@ -189,9 +236,9 @@ pub(super) fn extract_sevenz(
 		return Err(error);
 	}
 	if let Some(limit) = walk.max_solid_skip() {
-		check_solid_skip(&index, walk, limit)?;
+		check_solid_skip(index, walk, limit)?;
 	}
-	let mut verified = check_sevenz_password(&mut cursor, &index, walk, &mut keys)?
+	let mut verified = check_sevenz_password(&mut cursor, index, walk, keys)?
 		.verified(SevenZError::PasswordRequired, SevenZError::WrongPassword)
 		.map_err(Error::from)?;
 
@@ -215,13 +262,13 @@ pub(super) fn extract_sevenz(
 	};
 	for entry in &index.entries {
 		// what is left out is not read: its name decides whether it is chosen
-		let verdict = walk.judge(&sevenz_unread(&index, entry))?;
+		let verdict = walk.judge(&sevenz_unread(index, entry))?;
 		if matches!(verdict, Verdict::Ignore) {
 			continue;
 		}
 		// a reparse point's data says whether it is a link, so it is read before anything is
 		// sent, and sent from here when it is a file's
-		let (found, held) = sevenz_found(&mut cursor, &index, entry, &mut keys)
+		let (found, held) = sevenz_found(&mut cursor, index, entry, keys)
 			.map_err(|error| judged(Error::from(error), entry, verified))?;
 		if entry.kind == SevenZKind::Reparse {
 			verified |= proves(entry);
@@ -250,7 +297,7 @@ pub(super) fn extract_sevenz(
 			)
 			.map_err(read_failure),
 			(Some(_), None) => cursor
-				.open(&index, entry, &mut keys)
+				.open(index, entry, keys)
 				.map_err(Error::from)
 				.and_then(|mut data| {
 					take_file(

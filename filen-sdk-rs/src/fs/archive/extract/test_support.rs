@@ -24,7 +24,7 @@ use crate::{
 
 use super::{
 	ArchiveEntry, ExpansionLimit, ExtractRoot, ListCallback, ListFailed, ListReport, ListUpdate,
-	codec::{CodecLimits, Selection, StreamJob, Task, extract_stream},
+	codec::{CodecLimits, IndexUse, Selection, StreamJob, Task, extract_stream},
 	engine::ArchiveDisposal,
 	list::{ListReporter, ListTask, run_list},
 };
@@ -119,6 +119,7 @@ pub(super) fn stream_job(setup: &Setup, options: &Options) -> StreamJob {
 		password: options.password.clone(),
 		skip_mac_metadata: true,
 		task: Task::Extract(options.selection.clone()),
+		index: IndexUse::Read,
 	}
 }
 

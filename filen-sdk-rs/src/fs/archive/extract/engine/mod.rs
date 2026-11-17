@@ -739,9 +739,12 @@ impl<B: DisposalBackend> Driver<B> {
 			WorkerEvent::Data(data) => self.take_data(data),
 			WorkerEvent::FileEnd => self.end_file(),
 			WorkerEvent::Link(link) => self.on_link(*link),
-			// the feed answers asks, only a compressing codec sends a head, and only a listing's
-			// lists
-			WorkerEvent::Ask { .. } | WorkerEvent::Head(_) | WorkerEvent::Listed(_) => {
+			// the feed answers asks, only a compressing codec sends a head, only a listing's lists,
+			// and an extraction never asks for its index back
+			WorkerEvent::Ask { .. }
+			| WorkerEvent::Head(_)
+			| WorkerEvent::Listed(_)
+			| WorkerEvent::Indexed(_) => {
 				self.stop_with(unexpected_event());
 			}
 		}
