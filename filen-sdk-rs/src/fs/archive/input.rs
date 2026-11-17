@@ -4,7 +4,7 @@
 //! only reads its archive (a listing, an entry's download), which serves it, takes its events and
 //! its result, and gives it up when it stops moving.
 
-use std::{collections::VecDeque, sync::Arc};
+use std::{collections::VecDeque, sync::Arc, time::Duration};
 
 use filen_types::{crypto::Blake3Hash, fs::Uuid};
 use futures::{StreamExt, stream::FuturesOrdered};
@@ -36,6 +36,27 @@ use crate::{
 	},
 	util::{MaybeArc, MaybeSend, MaybeSendBoxFuture, sleep},
 };
+
+/// Longest a job that only reads its archive waits on where its entries go (a write, a close, or
+/// the writer asked for) before it fails and gives back its job slot: a stream nobody drains
+/// never keeps every other archive job waiting on the slot (the one of a whole page, on the web).
+#[cfg(not(test))]
+pub(crate) const SINK_STALL_TIMEOUT: Duration = super::worker::ARCHIVE_STALL_TIMEOUT;
+#[cfg(test)]
+pub(crate) const SINK_STALL_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// `work` on where a job's entries go, failed once it made no progress for
+/// [`SINK_STALL_TIMEOUT`].
+pub(crate) async fn unstalled<T>(work: impl Future<Output = T>) -> Result<T, Error> {
+	tokio::select! {
+		biased;
+		done = work => Ok(done),
+		() = sleep(SINK_STALL_TIMEOUT) => Err(Error::custom(
+			ErrorKind::IO,
+			format!("where the entry goes took nothing for {SINK_STALL_TIMEOUT:?}"),
+		)),
+	}
+}
 
 /// Chunks fetched ahead of a codec, memory permitting: of the archive it reads, or of the
 /// sources a compression reads.

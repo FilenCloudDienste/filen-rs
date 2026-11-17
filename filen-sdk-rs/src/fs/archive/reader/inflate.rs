@@ -198,6 +198,8 @@ pub(crate) struct Seeks {
 	checkpoints: Vec<Cursor>,
 	spacing: u64,
 	max_bytes: u64,
+	/// What the read in flight reserved for checkpoints, which may hold them below `max_bytes`.
+	reserved: u64,
 	aes: Option<AesStream>,
 	/// Output the stream's reads decoded in all, to tell a seek that went on from where the
 	/// read before stopped from one that decoded from far back.
@@ -215,6 +217,7 @@ impl Seeks {
 			checkpoints: Vec::new(),
 			spacing,
 			max_bytes,
+			reserved: u64::MAX,
 			aes: None,
 			decoded: 0,
 		}
@@ -264,8 +267,24 @@ impl Seeks {
 		{
 			return;
 		}
+		// no room for even one: the read goes on without laying any
+		if self.room() < CURSOR_BYTES {
+			return;
+		}
 		self.checkpoints.push(cursor.clone());
-		if self.checkpoints.len() as u64 * CURSOR_BYTES > self.max_bytes {
+		self.thin_within();
+	}
+
+	/// What the checkpoints may take.
+	fn room(&self) -> u64 {
+		self.max_bytes.min(self.reserved)
+	}
+
+	/// Halves the checkpoints, doubling their spacing, until they take at most [`Self::room`].
+	fn thin_within(&mut self) {
+		while !self.checkpoints.is_empty()
+			&& self.checkpoints.len() as u64 * CURSOR_BYTES > self.room()
+		{
 			let mut keep = false;
 			self.checkpoints.retain(|_| {
 				keep = !keep;
@@ -273,6 +292,37 @@ impl Seeks {
 			});
 			self.spacing = self.spacing.saturating_mul(2);
 		}
+	}
+
+	/// Lets the checkpoints take at most `bytes`, the room a read reserved for them, thinning
+	/// those laid already to fit.
+	pub(crate) fn cap_checkpoints(&mut self, bytes: u64) {
+		self.reserved = bytes;
+		self.thin_within();
+	}
+
+	/// Decoding that starts from `cursor`, with no checkpoints of its own yet.
+	fn from_cursor(cursor: Option<Cursor>, spacing: u64) -> Self {
+		Self {
+			parked: cursor,
+			..Self::with_limits(spacing, MAX_CHECKPOINT_BYTES)
+		}
+	}
+
+	/// Takes in what a read of a member decoded from a cursor of these: the checkpoints it laid,
+	/// and where it parked.
+	fn merge(&mut self, read: Self) {
+		self.checkpoints.extend(read.checkpoints);
+		self.checkpoints
+			.sort_by_key(|checkpoint| checkpoint.decoded);
+		self.checkpoints
+			.dedup_by_key(|checkpoint| checkpoint.decoded);
+		self.reserved = read.reserved;
+		self.thin_within();
+		if read.parked.is_some() {
+			self.parked = read.parked;
+		}
+		self.decoded = self.decoded.saturating_add(read.decoded);
 	}
 }
 
@@ -501,27 +551,98 @@ fn gzip_header(bytes: &[u8]) -> Result<Option<usize>, Error> {
 }
 
 impl Reader {
-	/// Writes output `want` of `stream` to `writer`.
+	/// Writes output `want` of `stream`, which holds member `ordinal`, to `writer`. A reader
+	/// decodes [`READER_SEEKS`](crate::fs::archive::retained::READER_SEEKS) streams at once at most; the checkpoints a read lays are charged
+	/// to the reader's budget before they are laid, as far as it has room.
 	pub(crate) async fn read_seekable<W: AsyncWrite + Unpin + MaybeSend>(
 		&self,
 		stream: SeekStream,
+		ordinal: u64,
 		want: Range<u64>,
 		writer: &mut W,
 	) -> Result<(), Arc<Error>> {
-		let flight = self.flight(stream.key);
-		let _flight = flight.lock().await;
-		let mut seeks = self
-			.retained
-			.as_ref()
-			.and_then(|retained| retained.take_seeks(stream.key))
-			.unwrap_or_else(Seeks::new);
-		let read = self
-			.read_stream(&stream, &mut seeks, want.clone(), writer)
-			.await;
-		if let Some(retained) = &self.retained {
-			retained.keep_seeks(stream.key, seeks);
+		let _seat = self.seek_seats.acquire().await.map_err(|_| {
+			Arc::new(Error::custom(
+				ErrorKind::InvalidState,
+				"the archive reader is closed",
+			))
+		})?;
+		match stream.key {
+			StreamKey::Entry(_) => {
+				// one read of an entry at a time: the next goes on from where it parked
+				let flight = self.flight((stream.key, None));
+				let _flight = flight.lock().await;
+				let mut seeks = self.take_seeks(stream.key);
+				let reserved = self.reserve_checkpoints(&mut seeks);
+				let read = self.read_stream(&stream, &mut seeks, want, writer).await;
+				self.put_seeks(stream.key, seeks, reserved);
+				read
+			}
+			StreamKey::Gzip => self.read_gzip_member(stream, ordinal, want, writer).await,
 		}
-		read
+	}
+
+	/// [`Self::read_seekable`] of a gzip tar's member: reads of one member run one at a time,
+	/// while those of others go on beside them, each from the checkpoint before it (or where a
+	/// read parked) in the stream they share, held only while it is taken and given back.
+	async fn read_gzip_member<W: AsyncWrite + Unpin + MaybeSend>(
+		&self,
+		stream: SeekStream,
+		ordinal: u64,
+		want: Range<u64>,
+		writer: &mut W,
+	) -> Result<(), Arc<Error>> {
+		let member = self.flight((stream.key, Some(ordinal)));
+		let _member = member.lock().await;
+		let shared = self.flight((stream.key, None));
+		let (start, spacing) = {
+			let _shared = shared.lock().await;
+			let mut seeks = self.take_seeks(stream.key);
+			let start = seeks.start_at(want.start);
+			let spacing = seeks.spacing;
+			self.put_seeks(stream.key, seeks, 0);
+			(start, spacing)
+		};
+		let mut read = Seeks::from_cursor(start, spacing);
+		let reserved = self.reserve_checkpoints(&mut read);
+		let result = self.read_stream(&stream, &mut read, want, writer).await;
+		let _shared = shared.lock().await;
+		let mut seeks = self.take_seeks(stream.key);
+		seeks.merge(read);
+		self.put_seeks(stream.key, seeks, reserved);
+		result
+	}
+
+	/// The decoding of `key` the reader keeps, taken for a read; a new one when it keeps none.
+	fn take_seeks(&self, key: StreamKey) -> Seeks {
+		self.retained
+			.as_ref()
+			.and_then(|retained| retained.take_seeks(key))
+			.unwrap_or_else(Seeks::new)
+	}
+
+	/// Charges the reader's budget for the checkpoints `seeks` may take while a read is in
+	/// flight, as much of [`MAX_CHECKPOINT_BYTES`] as it has room for, capping them to that:
+	/// what was charged, for [`Self::put_seeks`] to give back.
+	fn reserve_checkpoints(&self, seeks: &mut Seeks) -> u64 {
+		// a reader for one call keeps nothing past it, and reads no range
+		let Some(retained) = &self.retained else {
+			return 0;
+		};
+		let reserved = [MAX_CHECKPOINT_BYTES, MAX_CHECKPOINT_BYTES / 4]
+			.into_iter()
+			.find(|&bytes| retained.reserve(bytes))
+			.unwrap_or(0);
+		seeks.cap_checkpoints(reserved);
+		reserved
+	}
+
+	/// Keeps `seeks` for the reads after, giving back the `reserved` charge of its read.
+	fn put_seeks(&self, key: StreamKey, seeks: Seeks, reserved: u64) {
+		if let Some(retained) = &self.retained {
+			retained.release_reserved(reserved);
+			retained.keep_seeks(key, seeks);
+		}
 	}
 
 	async fn read_stream<W: AsyncWrite + Unpin + MaybeSend>(

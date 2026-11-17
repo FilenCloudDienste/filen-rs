@@ -12,17 +12,24 @@ use microthumb::ByteSource;
 
 use crate::{
 	Error, ErrorKind,
-	consts::CHUNK_SIZE_U64,
-	fs::archive::extract::ArchiveEntryId,
+	consts::{CHUNK_SIZE_U64, FULL_CHUNK_BYTES},
+	fs::{archive::extract::ArchiveEntryId, drive_job::cancelled},
+	job::{JobControl, Stopped},
 	runtime::do_cpu_intensive,
 	thumbnail::{EmbeddedPreview, PreviewSegment, locate_embedded_preview},
 	util::MaybeSend,
 };
 
-use super::{Reader, Resolved};
+use super::{Reader, Resolved, slice::RANGE_READ};
 
 /// Most chunks of an entry a walk may read: a real container takes two to four.
 const MAX_WALK_CHUNKS: usize = 16;
+
+/// The client's file-IO budget a chunk the walk holds is charged.
+fn chunk_permits() -> u32 {
+	u32::try_from(FULL_CHUNK_BYTES)
+		.expect("a full chunk is about 1 MiB, far below u32::MAX (should be impossible)")
+}
 
 /// An entry's chunks read so far, as the walk reads them; one it reaches unread is noted, and the
 /// read fails.
@@ -61,8 +68,9 @@ impl Reader {
 		&self,
 		entry: ArchiveEntryId,
 		writer: &mut W,
+		control: &JobControl,
 	) -> Result<Option<EmbeddedPreview>, Arc<Error>> {
-		let len = match self.resolve(entry).await? {
+		let len = match self.resolve(entry, control).await? {
 			Resolved::Mapped { size, .. } | Resolved::Seekable { size, .. } => size,
 			Resolved::Whole { .. } | Resolved::Sequential { .. } => {
 				return Err(Arc::new(Error::custom(
@@ -72,6 +80,8 @@ impl Reader {
 			}
 		};
 		let mut chunks: Vec<(u64, Vec<u8>)> = Vec::new();
+		// each chunk the walk holds is charged to the client's file-IO budget, waited for
+		let mut held = Vec::new();
 		let preview = loop {
 			let (located, missing) = do_cpu_intensive(|| {
 				let mut source = Walked {
@@ -88,8 +98,21 @@ impl Reader {
 				(Err(_), Some(index)) if chunks.len() < MAX_WALK_CHUNKS => {
 					let start = index * CHUNK_SIZE_U64;
 					let end = (start + CHUNK_SIZE_U64).min(len);
+					let permit = control
+						.until_stopping(
+							Arc::clone(&self.memory).acquire_many_owned(chunk_permits()),
+						)
+						.await
+						.map_err(|Stopped| cancelled(RANGE_READ))?
+						.map_err(|_| {
+							Arc::new(Error::custom(
+								ErrorKind::Internal,
+								"the client's file-IO budget was closed",
+							))
+						})?;
+					held.push(permit);
 					let mut chunk = futures::io::Cursor::new(Vec::new());
-					self.write_entry_range(entry, start, end, &mut chunk)
+					self.write_entry_range(entry, start, end, &mut chunk, control)
 						.await?;
 					chunks.push((index, chunk.into_inner()));
 				}
@@ -103,11 +126,13 @@ impl Reader {
 			}
 		};
 		drop(chunks);
+		drop(held);
 		if let Some(preview) = &preview {
 			for segment in preview.segments() {
 				match segment {
 					PreviewSegment::Source { start, end } => {
-						self.write_entry_range(entry, start, end, writer).await?;
+						self.write_entry_range(entry, start, end, writer, control)
+							.await?;
 					}
 					PreviewSegment::App1(app1) => writer
 						.write_all(&app1)

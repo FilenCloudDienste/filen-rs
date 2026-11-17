@@ -12,21 +12,27 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use crate::{
 	Error, ErrorKind,
 	consts::CHUNK_SIZE_U64,
-	fs::archive::{
-		extract::{
-			ArchiveEntryId, EntryDownloadError, ExtractSkipReason,
-			codec::{HeldIndex, RarKind, RarPacking, RarTable},
-			path_refusal,
+	fs::{
+		archive::{
+			extract::{
+				ArchiveEntryId, EntryDownloadError, ExtractSkipReason,
+				codec::{
+					HeldIndex, IndexUse, RarKind, RarPacking, RarTable, Task, expansion_exceeded,
+				},
+				path_refusal,
+				reading::{ReadJob, list},
+			},
+			format::{ArchiveFormat, StreamCodec},
+			input::{PREFETCH_CHUNKS, take_memory},
+			sevenz::read::{Method, SevenZIndex, SevenZKind},
+			zip::{
+				LOCAL_HEADER_SIG, METHOD_DEFLATE, METHOD_STORED,
+				read::{LOCAL_HEADER_LEN, LOCAL_HEADER_LEN_U64, ZipEncryption, ZipIndex, ZipKind},
+			},
 		},
-		format::{ArchiveFormat, StreamCodec},
-		input::{PREFETCH_CHUNKS, take_memory},
-		sevenz::read::{Method, SevenZIndex, SevenZKind},
-		zip::{
-			LOCAL_HEADER_SIG, METHOD_DEFLATE, METHOD_STORED,
-			read::{LOCAL_HEADER_LEN, LOCAL_HEADER_LEN_U64, ZipEncryption, ZipIndex, ZipKind},
-		},
+		drive_job::cancelled,
 	},
-	job::JobControl,
+	job::{JobControl, Stopped},
 	util::{MaybeSend, MaybeSendBoxFuture},
 };
 
@@ -34,6 +40,9 @@ use super::{
 	Reader, Unreported,
 	inflate::{CipherSpec, Framing, SeekCodec, SeekStream, StreamKey},
 };
+
+/// What a range read is called when it is cancelled.
+pub(super) const RANGE_READ: &str = "range read";
 
 /// How an entry's bytes can be read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -278,12 +287,16 @@ fn rar_access(table: &RarTable, ordinal: u64) -> Result<Resolved, Error> {
 type RangeChunk = (Arc<Vec<u8>>, Option<OwnedSemaphorePermit>);
 
 impl Reader {
-	/// How `entry`'s bytes can be read: resolved once, then kept with the index.
+	/// How `entry`'s bytes can be read: resolved once, then kept with the index. Reading the
+	/// index or listing a tar again for it runs under `control`.
 	pub(crate) async fn entry_byte_access(
 		&self,
 		entry: ArchiveEntryId,
+		control: &JobControl,
 	) -> Result<EntryByteAccess, Arc<Error>> {
-		self.resolve(entry).await.map(EntryByteAccess::from)
+		self.resolve(entry, control)
+			.await
+			.map(EntryByteAccess::from)
 	}
 
 	/// Writes bytes `start..end` of `entry`, read by range, to `writer`, then closes it.
@@ -293,18 +306,25 @@ impl Reader {
 		start: u64,
 		end: u64,
 		writer: &mut W,
+		control: &JobControl,
 	) -> Result<(), Arc<Error>> {
-		self.write_entry_range(entry, start, end, writer).await?;
-		writer.close().await.map_err(|error| Arc::new(error.into()))
+		self.write_entry_range(entry, start, end, writer, control)
+			.await?;
+		match control.until_stopping(writer.close()).await {
+			Ok(closed) => closed.map_err(|error| Arc::new(error.into())),
+			Err(Stopped) => Err(cancelled(RANGE_READ)),
+		}
 	}
 
-	/// Writes bytes `start..end` of `entry`, read by range, to `writer`, leaving it open.
+	/// Writes bytes `start..end` of `entry`, read by range, to `writer`, leaving it open; a stop
+	/// of `control` ends it.
 	pub(crate) async fn write_entry_range<W: AsyncWrite + Unpin + MaybeSend>(
 		&self,
 		entry: ArchiveEntryId,
 		start: u64,
 		end: u64,
 		writer: &mut W,
+		control: &JobControl,
 	) -> Result<(), Arc<Error>> {
 		let within = |size: u64| {
 			if start > end || end > size {
@@ -315,33 +335,56 @@ impl Reader {
 			}
 			Ok(())
 		};
-		match self.resolve(entry).await? {
-			Resolved::Mapped { offset, size } => {
-				within(size)?;
-				self.read_archive(offset + start, offset + end, writer)
-					.await?;
+		let read = async {
+			match self.resolve(entry, control).await? {
+				Resolved::Mapped { offset, size } => {
+					within(size)?;
+					self.read_archive(offset + start, offset + end, writer)
+						.await
+				}
+				Resolved::Seekable {
+					stream,
+					offset,
+					size,
+				} => {
+					within(size)?;
+					// what the entry decodes to is held to the expansion limit, as an archive
+					// nested in it is
+					let base = self.expansion_base.unwrap_or(self.source.len());
+					if let Some(limit) = self.settings.expansion_limit
+						&& !limit.allows(base, size)
+					{
+						return Err(Arc::new(expansion_exceeded(limit)));
+					}
+					self.read_seekable(
+						stream,
+						u64::from(entry.index),
+						offset + start..offset + end,
+						writer,
+					)
+					.await
+				}
+				Resolved::Whole { .. } | Resolved::Sequential { .. } => {
+					Err(Arc::new(Error::custom(
+						ErrorKind::InvalidState,
+						"the entry is only read whole, or front to back",
+					)))
+				}
 			}
-			Resolved::Seekable {
-				stream,
-				offset,
-				size,
-			} => {
-				within(size)?;
-				self.read_seekable(stream, offset + start..offset + end, writer)
-					.await?;
-			}
-			Resolved::Whole { .. } | Resolved::Sequential { .. } => {
-				return Err(Arc::new(Error::custom(
-					ErrorKind::InvalidState,
-					"the entry is only read whole, or front to back",
-				)));
-			}
-		}
-		Ok(())
+		};
+		control
+			.until_stopping(read)
+			.await
+			.unwrap_or_else(|Stopped| Err(cancelled(RANGE_READ)))
 	}
 
-	/// How `entry` is read, from what the reader keeps, or else from its index.
-	pub(super) async fn resolve(&self, entry: ArchiveEntryId) -> Result<Resolved, Arc<Error>> {
+	/// How `entry` is read, from what the reader keeps, or else from its index: read again, or a
+	/// tar listed again, under `control` when the reader no longer holds it.
+	pub(super) async fn resolve(
+		&self,
+		entry: ArchiveEntryId,
+		control: &JobControl,
+	) -> Result<Resolved, Arc<Error>> {
 		self.ensure_open()?;
 		if entry.archive != self.source.id() {
 			return Err(Arc::new(not_held()));
@@ -356,7 +399,7 @@ impl Reader {
 		}
 		let resolved = match self.format() {
 			Some(ArchiveFormat::Zip | ArchiveFormat::SevenZ | ArchiveFormat::Rar { .. }) => {
-				let index = self.held_index().await?;
+				let index = self.held_index(control).await?;
 				match &*index {
 					HeldIndex::Zip(index) => match zip_access(index, ordinal)? {
 						FromIndex::Resolved(resolved) => resolved,
@@ -391,43 +434,10 @@ impl Reader {
 					HeldIndex::Tar(_) => return Err(Arc::new(not_held())),
 				}
 			}
-			Some(ArchiveFormat::Tar { codec }) => match self.tar_table().await? {
-				Some(index) => {
-					let HeldIndex::Tar(table) = &*index else {
-						return Err(Arc::new(not_held()));
-					};
-					let span = usize::try_from(ordinal)
-						.ok()
-						.and_then(|at| table.members.get(at))
-						.ok_or_else(not_held)?;
-					match (codec, span.data) {
-						(_, None) => {
-							return Err(Arc::new(EntryDownloadError::NotAFile.into()));
-						}
-						(None, Some(offset)) => Resolved::Mapped {
-							offset: offset.get(),
-							size: span.size,
-						},
-						(Some(StreamCodec::Gzip), Some(offset)) => Resolved::Seekable {
-							stream: SeekStream {
-								key: StreamKey::Gzip,
-								start: 0,
-								len: self.source.len(),
-								codec: SeekCodec::Deflate,
-								framing: Framing::Gzip,
-								cipher: CipherSpec::None,
-							},
-							offset: offset.get(),
-							size: span.size,
-						},
-						(Some(_), Some(_)) => Resolved::Sequential {
-							size: Some(span.size),
-						},
-					}
-				}
-				// no room to hold where its members lie: read through, as ever
-				None => Resolved::Sequential { size: None },
-			},
+			Some(ArchiveFormat::Tar { codec }) => {
+				let index = self.tar_table(control).await?;
+				self.tar_access(&index, codec, ordinal)?
+			}
 			Some(ArchiveFormat::Single { .. }) => Resolved::Sequential { size: None },
 			None => {
 				return Err(Arc::new(Error::custom(
@@ -442,22 +452,77 @@ impl Reader {
 		Ok(resolved)
 	}
 
-	/// Where a tar's members lie, as a listing found: the table held, or else the archive
-	/// listed again for it; `None` when there is no room to hold it.
-	async fn tar_table(&self) -> Result<Option<Arc<HeldIndex>>, Arc<Error>> {
-		let held = || {
-			self.retained
-				.as_ref()
-				.and_then(|retained| retained.index())
-				.filter(|index| matches!(**index, HeldIndex::Tar(_)))
+	/// How member `ordinal` of a tar compressed with `codec` is read, from `index`, its table.
+	pub(super) fn tar_access(
+		&self,
+		index: &HeldIndex,
+		codec: Option<StreamCodec>,
+		ordinal: u64,
+	) -> Result<Resolved, Arc<Error>> {
+		let HeldIndex::Tar(table) = index else {
+			return Err(Arc::new(not_held()));
 		};
-		if let Some(index) = held() {
-			return Ok(Some(index));
+		let span = usize::try_from(ordinal)
+			.ok()
+			.and_then(|at| table.members.get(at))
+			.ok_or_else(not_held)?;
+		Ok(match (codec, span.data) {
+			(_, None) => return Err(Arc::new(EntryDownloadError::NotAFile.into())),
+			(None, Some(offset)) => Resolved::Mapped {
+				offset: offset.get(),
+				size: span.size,
+			},
+			(Some(StreamCodec::Gzip), Some(offset)) => Resolved::Seekable {
+				stream: SeekStream {
+					key: StreamKey::Gzip,
+					start: 0,
+					len: self.source.len(),
+					codec: SeekCodec::Deflate,
+					framing: Framing::Gzip,
+					cipher: CipherSpec::None,
+				},
+				offset: offset.get(),
+				size: span.size,
+			},
+			(Some(_), Some(_)) => Resolved::Sequential {
+				size: Some(span.size),
+			},
+		})
+	}
+
+	/// Where a tar's members lie, as a listing found: the table held, or else the archive listed
+	/// again for it under `control` (which takes a job slot), held again when there is room and
+	/// used for the call either way, so how a member is read never depends on that room.
+	pub(super) async fn tar_table(
+		&self,
+		control: &JobControl,
+	) -> Result<Arc<HeldIndex>, Arc<Error>> {
+		if let Some(index) = self
+			.retained
+			.as_ref()
+			.and_then(|retained| retained.index())
+			.filter(|index| matches!(**index, HeldIndex::Tar(_)))
+		{
+			return Ok(index);
 		}
-		self.list(Unreported, JobControl::default())
+		let job = ReadJob {
+			// the job hands its table back, whether or not the reader can hold it
+			index: IndexUse::ReadAndReturn,
+			..self.read_job(control.clone())
+		};
+		let archive = self.source.id();
+		let listed = list(job, Task::ListSeeking { archive }, Unreported)
 			.await
 			.map_err(|failed| failed.error)?;
-		Ok(held())
+		self.note_format(listed.report.format);
+		let index: Arc<HeldIndex> = listed.index.map(Arc::from).ok_or_else(|| {
+			Arc::new(Error::custom(
+				ErrorKind::Internal,
+				"listing the tar gave no table of its members",
+			))
+		})?;
+		self.hold_shared(Arc::clone(&index));
+		Ok(index)
 	}
 
 	/// Where a stored zip entry's data starts: after its local header at `header`, whose name

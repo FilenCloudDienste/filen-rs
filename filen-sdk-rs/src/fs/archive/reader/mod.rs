@@ -37,7 +37,7 @@ use crate::{
 			},
 			format::ArchiveFormat,
 			input::{ArchiveBytes, DriveFile, UnauthFile},
-			retained::Retained,
+			retained::{READER_SEEKS, Retained},
 		},
 		drive_job::backend::{ClientBackend, DriveBackend},
 		file::enums::RemoteFileType,
@@ -174,11 +174,17 @@ impl ArchiveReader {
 	/// `Mapped` once a listing found where they lie (the reader lists the tar for it when it
 	/// holds no listing), and a gzip tar's are `Seekable`; the members of a tar compressed
 	/// otherwise and a single compressed file are `Sequential`.
+	///
+	/// When the reader gave up its index or its tar listing for room another reader needed, it
+	/// reads it again: a job that takes one of the archive job slots, which `control` pauses and
+	/// cancels. A listing read again is used for the call even when there is no room to keep it,
+	/// so an entry's access never depends on that room.
 	pub async fn entry_byte_access(
 		&self,
 		entry: ArchiveEntryId,
+		control: JobControl,
 	) -> Result<EntryByteAccess, Arc<Error>> {
-		self.reader.entry_byte_access(entry).await
+		self.reader.entry_byte_access(entry, &control).await
 	}
 
 	/// Writes bytes `start..end` of `entry`, which has to be [`EntryByteAccess::Mapped`] or
@@ -186,9 +192,13 @@ impl ArchiveReader {
 	/// reads only the archive's chunks it lies in, a few ahead while the client's file-IO budget
 	/// has room for them, and those the reader keeps not at all. A seekable one is decoded from
 	/// where the read of it before stopped, or from the nearest checkpoint before `start`, in
-	/// steps of at most 1 MiB of output on the CPU pool; reads of one entry run one at a time,
-	/// and the reader keeps the decoder state of the two entries read by range last. No job slot
-	/// is taken. The bytes are not checked against the entry's checksum, which covers it whole.
+	/// steps of at most 1 MiB of output on the CPU pool, its output held to the reader's
+	/// expansion limit; reads of one entry (of one member of a gzip tar) run one at a time, the
+	/// reader decodes two streams at once at most, and it keeps the decoder state of the two read
+	/// by range last, charging the checkpoints a read lays to its budget before laying them. The
+	/// read takes no job slot unless the index or tar listing is read again (see
+	/// [`Self::entry_byte_access`]), which `control` pauses; a cancel through it ends the read
+	/// at once. The bytes are not checked against the entry's checksum, which covers it whole.
 	/// Fails with [`ErrorKind::InvalidState`] for a range past the entry's end or an entry read
 	/// only whole, and with
 	/// [`ErrorKind::ArchiveWrongPassword`](crate::ErrorKind::ArchiveWrongPassword) when an
@@ -200,12 +210,13 @@ impl ArchiveReader {
 		start: u64,
 		end: u64,
 		writer: &mut W,
+		control: JobControl,
 	) -> Result<(), Arc<Error>>
 	where
 		W: AsyncWrite + Unpin + MaybeSend,
 	{
 		self.reader
-			.read_entry_range(entry, start, end, writer)
+			.read_entry_range(entry, start, end, writer, &control)
 			.await
 	}
 
@@ -226,7 +237,9 @@ impl ArchiveReader {
 	/// of; for a compressed tar it holds none of, as soon as what it threw away passes the bound.
 	/// `None` allows any. Fails as
 	/// [`ArchiveReader::download_entry`] does on an entry that is no file to read; progress goes
-	/// to `callback`, and `control` pauses and cancels the pass.
+	/// to `callback`, and `control` pauses and cancels the pass, a wait for `writer_for` too. A
+	/// writer that takes nothing for a minute, or a `writer_for` that does not answer for as long,
+	/// fails the pass with [`ErrorKind::IO`], giving its job slot back.
 	pub async fn read_entries<W, F, Fut>(
 		&self,
 		entries: &[ArchiveEntryId],
@@ -265,7 +278,7 @@ impl ArchiveReader {
 	) -> Result<ArchiveReader, ListFailed> {
 		let (bytes, name) = self
 			.reader
-			.entry_bytes(entry)
+			.entry_bytes(entry, &control)
 			.await
 			.map_err(|error| JobFailed {
 				report: ListReport::empty(),
@@ -289,12 +302,13 @@ impl ArchiveReader {
 		&self,
 		entry: ArchiveEntryId,
 		writer: &mut W,
+		control: JobControl,
 	) -> Result<Option<EmbeddedPreview>, Arc<Error>>
 	where
 		W: AsyncWrite + Unpin + MaybeSend,
 	{
 		self.reader
-			.write_entry_embedded_preview(entry, writer)
+			.write_entry_embedded_preview(entry, writer, &control)
 			.await
 	}
 
@@ -336,6 +350,10 @@ impl ArchiveReader {
 	}
 }
 
+/// What reads of a reader take turns on: a stream, and for the members of one stream read beside
+/// each other, a member.
+pub(crate) type FlightKey = (StreamKey, Option<u64>);
+
 /// A listing's progress nobody hears of: a call that reads the index again for itself.
 struct Unreported;
 
@@ -363,7 +381,10 @@ pub(crate) struct Reader {
 	/// See [`CodecLimits::expansion_base`](super::extract::codec::CodecLimits).
 	expansion_base: Option<u64>,
 	/// One lock per stream read by range, so its reads decode one at a time.
-	flights: Mutex<SeededMap<StreamKey, Arc<tokio::sync::Mutex<()>>>>,
+	/// Keyed by stream, and by member for the members of one stream read beside each other.
+	flights: Mutex<SeededMap<FlightKey, Arc<tokio::sync::Mutex<()>>>>,
+	/// Streams it decodes at once, at most [`READER_SEEKS`].
+	seek_seats: Semaphore,
 	closed: AtomicBool,
 }
 
@@ -418,6 +439,7 @@ impl Reader {
 			depth: 0,
 			expansion_base: None,
 			flights: Mutex::default(),
+			seek_seats: Semaphore::new(READER_SEEKS),
 			closed: AtomicBool::new(false),
 		}
 	}
@@ -458,7 +480,7 @@ impl Reader {
 
 	/// The lock reads of `key` take, so they decode one at a time; one waiting goes on from
 	/// where the one before it parked its cursor.
-	pub(crate) fn flight(&self, key: StreamKey) -> Arc<tokio::sync::Mutex<()>> {
+	pub(crate) fn flight(&self, key: FlightKey) -> Arc<tokio::sync::Mutex<()>> {
 		let mut flights = self.flights.lock().unwrap_or_else(PoisonError::into_inner);
 		// the locks no read holds or waits on go
 		flights.retain(|_, flight| Arc::strong_count(flight) > 1);
@@ -489,12 +511,16 @@ impl Reader {
 		}
 	}
 
-	/// The archive's index: the one held, or else read again (and held again when it can be).
-	pub(crate) async fn held_index(&self) -> Result<Arc<HeldIndex>, Arc<Error>> {
+	/// The archive's index: the one held, or else read again under `control`, which takes a job
+	/// slot (and held again when it can be).
+	pub(crate) async fn held_index(
+		&self,
+		control: &JobControl,
+	) -> Result<Arc<HeldIndex>, Arc<Error>> {
 		if let Some(index) = self.retained.as_ref().and_then(|retained| retained.index()) {
 			return Ok(index);
 		}
-		let opened = open(self.read_job(JobControl::default()), Unreported)
+		let opened = open(self.read_job(control.clone()), Unreported)
 			.await
 			.map_err(|failed| failed.error)?;
 		self.note_format(Some(opened.format));
@@ -504,12 +530,17 @@ impl Reader {
 				"the archive has no index",
 			))
 		})?);
+		self.hold_shared(Arc::clone(&index));
+		Ok(index)
+	}
+
+	/// Holds `index` for the calls after this one, when there is room.
+	pub(crate) fn hold_shared(&self, index: Arc<HeldIndex>) {
 		if let Some(retained) = &self.retained
 			&& !self.closed.load(Ordering::SeqCst)
 		{
-			retained.hold_index(Arc::clone(&index));
+			retained.hold_index(index);
 		}
-		Ok(index)
 	}
 
 	/// Holds `index`, which a job read, for the calls after it.
@@ -576,7 +607,9 @@ impl Reader {
 		if let Some(ArchiveFormat::Tar { codec: None }) = self.format()
 			&& self.retained.is_some()
 		{
-			return self.download_member(entry, writer, callback).await;
+			return self
+				.download_member(entry, writer, callback, &control)
+				.await;
 		}
 		let (downloaded, index) = download(
 			self.read_job(control),
@@ -597,16 +630,17 @@ impl Reader {
 		entry: ArchiveEntryId,
 		writer: &mut W,
 		callback: impl EntryDownloadCallback,
+		control: &JobControl,
 	) -> Result<EntryDownloadReport, EntryDownloadFailed>
 	where
 		W: AsyncWrite + Unpin + MaybeSend,
 	{
 		let reporter = EntryDownloadReporter::new(callback, self.source.len());
 		reporter.set_phase(EntryDownloadPhase::Reading);
-		let read = match self.resolve(entry).await {
+		let read = match self.resolve(entry, control).await {
 			Ok(Resolved::Mapped { size, .. }) => {
 				reporter.entry_found(Some(size));
-				self.read_entry_range(entry, 0, size, writer)
+				self.read_entry_range(entry, 0, size, writer, control)
 					.await
 					.map(|()| size)
 			}
@@ -626,7 +660,11 @@ impl Reader {
 				})
 			}
 			Err(error) => {
-				reporter.finish(EntryDownloadPhase::Failed);
+				reporter.finish(if error.kind() == ErrorKind::Cancelled {
+					EntryDownloadPhase::Cancelled
+				} else {
+					EntryDownloadPhase::Failed
+				});
 				Err(JobFailed {
 					report: EntryDownloadReport::default(),
 					error,

@@ -172,20 +172,21 @@ async fn open_nested_job(
 		.map_err(|failed| Error::unshared(failed.error))
 }
 
-/// Runs `call` on the commander thread under `managed_future`'s abort and pause signals.
+/// Runs `call` on the commander thread as a job of `managed_future`: its abort signal stops it
+/// through the [`JobControl`] it is handed, which pauses it too.
 async fn managed<T, F, Fut>(managed_future: ManagedFuture, call: F) -> Result<T, Error>
 where
-	F: FnOnce() -> Fut + Send + 'static,
+	F: FnOnce(JobControl) -> Fut + Send + 'static,
 	Fut: Future<Output = Result<T, Error>> + MaybeSend + 'static,
 	T: Send + 'static,
 {
 	#[cfg(feature = "wasm-full")]
 	{
-		managed_future.into_js_managed_commander_future(call)?.await
+		managed_future.into_js_managed_commander_job(call)?.await
 	}
 	#[cfg(not(feature = "wasm-full"))]
 	{
-		managed_future.into_js_managed_commander_future(call).await
+		managed_future.into_js_managed_commander_job(call).await
 	}
 }
 
@@ -430,9 +431,9 @@ mod uniffi_bindings {
 			managed_future: ManagedFuture,
 		) -> Result<EntryByteAccess, Error> {
 			let reader = self.reader();
-			managed(managed_future, move || async move {
+			managed(managed_future, move |control| async move {
 				reader
-					.entry_byte_access(entry)
+					.entry_byte_access(entry, control)
 					.await
 					.map_err(Error::unshared)
 			})
@@ -449,13 +450,13 @@ mod uniffi_bindings {
 			managed_future: ManagedFuture,
 		) -> Result<Vec<u8>, Error> {
 			let reader = self.reader();
-			managed(managed_future, move || async move {
+			managed(managed_future, move |control| async move {
 				let len = end.saturating_sub(start).min(RANGE_PREALLOCATED);
 				let mut read = futures::io::Cursor::new(Vec::with_capacity(
 					usize::try_from(len).unwrap_or(usize::MAX),
 				));
 				reader
-					.read_entry_range(entry, start, end, &mut read)
+					.read_entry_range(entry, start, end, &mut read, control)
 					.await
 					.map_err(Error::unshared)?;
 				Ok(read.into_inner())
@@ -573,7 +574,7 @@ mod uniffi_bindings {
 			managed_future: ManagedFuture,
 		) -> Result<EmbeddedPreviewResult, Error> {
 			let reader = self.reader();
-			managed(managed_future, move || async move {
+			managed(managed_future, move |control| async move {
 				let path = PathBuf::from(path);
 				let (guard, file) = crate::io::client_impl::TmpFileGuard::create_beside(
 					&path,
@@ -582,7 +583,7 @@ mod uniffi_bindings {
 				.await?;
 				let mut file = file.compat_write();
 				let preview = reader
-					.write_entry_embedded_preview(entry, &mut file)
+					.write_entry_embedded_preview(entry, &mut file, control)
 					.await
 					.map_err(Error::unshared)?;
 				drop(file);
@@ -1014,12 +1015,15 @@ mod wasm_bindings {
 			managed_future: Option<ManagedFuture>,
 		) -> Result<EntryByteAccess, Error> {
 			let reader = self.reader();
-			managed(managed_future.unwrap_or_default(), move || async move {
-				reader
-					.entry_byte_access(entry)
-					.await
-					.map_err(Error::unshared)
-			})
+			managed(
+				managed_future.unwrap_or_default(),
+				move |control| async move {
+					reader
+						.entry_byte_access(entry, control)
+						.await
+						.map_err(Error::unshared)
+				},
+			)
 			.await
 		}
 
@@ -1030,9 +1034,9 @@ mod wasm_bindings {
 			let reader = self.reader();
 			let mut writer = ClosingStream::new(params.writer)?;
 			let (entry, start, end) = (params.entry, params.start, params.end);
-			managed(params.managed_future, move || async move {
+			managed(params.managed_future, move |control| async move {
 				reader
-					.read_entry_range(entry, start, end, &mut writer)
+					.read_entry_range(entry, start, end, &mut writer, control)
 					.await
 					.map_err(Error::unshared)
 			})
@@ -1160,9 +1164,9 @@ mod wasm_bindings {
 			let reader = self.reader();
 			let mut writer = ClosingStream::new(params.writer)?;
 			let entry = params.entry;
-			managed(params.managed_future, move || async move {
+			managed(params.managed_future, move |control| async move {
 				reader
-					.write_entry_embedded_preview(entry, &mut writer)
+					.write_entry_embedded_preview(entry, &mut writer, control)
 					.await
 					.map(EmbeddedPreviewResult::from)
 					.map_err(Error::unshared)

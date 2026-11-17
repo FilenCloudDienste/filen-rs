@@ -316,8 +316,14 @@ fn _reader_futures_are_send(
 		Ignore,
 		JobControl::default(),
 	));
-	assert_send(reader.entry_byte_access(entry(0)));
-	assert_send(reader.read_entry_range(entry(0), 0, 1, &mut futures::io::sink()));
+	assert_send(reader.entry_byte_access(entry(0), JobControl::default()));
+	assert_send(reader.read_entry_range(
+		entry(0),
+		0,
+		1,
+		&mut futures::io::sink(),
+		JobControl::default(),
+	));
 	assert_send(unauth.open_archive_reader(
 		archive,
 		ListConfig::default(),
@@ -360,7 +366,13 @@ async fn opened(name: &str, bytes: Vec<u8>, password: Option<&str>) -> (Arc<Fake
 async fn range(reader: &Reader, index: u32, start: u64, end: u64) -> Result<Vec<u8>, Arc<Error>> {
 	let mut written = futures::io::Cursor::new(Vec::new());
 	reader
-		.read_entry_range(entry(index), start, end, &mut written)
+		.read_entry_range(
+			entry(index),
+			start,
+			end,
+			&mut written,
+			&JobControl::default(),
+		)
 		.await?;
 	Ok(written.into_inner())
 }
@@ -375,7 +387,8 @@ async fn a_zips_entries_are_mapped_only_when_stored_as_they_are() {
 		("../escapes", &data, ZipMethod::Stored, None),
 	]);
 	let (_, reader) = opened("z.zip", zip, Some("pw")).await;
-	let access = |index| reader.entry_byte_access(entry(index));
+	let control = JobControl::default();
+	let access = |index| reader.entry_byte_access(entry(index), &control);
 	assert_eq!(
 		access(0).await.unwrap(),
 		EntryByteAccess::Mapped { size: 5000 }
@@ -405,7 +418,10 @@ async fn a_mapped_range_fetches_only_the_chunks_it_lies_in() {
 	let len = data[1].len() as u64;
 	let at = CHUNK_SIZE_U64;
 	assert_eq!(
-		reader.entry_byte_access(entry(1)).await.unwrap(),
+		reader
+			.entry_byte_access(entry(1), &JobControl::default())
+			.await
+			.unwrap(),
 		EntryByteAccess::Mapped { size: len }
 	);
 	assert_eq!(fetched(&backend), [1]);
@@ -435,11 +451,18 @@ async fn a_mapped_range_fetches_only_the_chunks_it_lies_in() {
 		ErrorKind::InvalidState
 	);
 	// resolved once
-	reader.entry_byte_access(entry(1)).await.unwrap();
+	reader
+		.entry_byte_access(entry(1), &JobControl::default())
+		.await
+		.unwrap();
 	assert_eq!(fetched(&backend), Vec::<u64>::new());
 	reader.close();
 	assert_eq!(
-		reader.entry_byte_access(entry(1)).await.unwrap_err().kind(),
+		reader
+			.entry_byte_access(entry(1), &JobControl::default())
+			.await
+			.unwrap_err()
+			.kind(),
 		ErrorKind::InvalidState
 	);
 }
@@ -452,7 +475,10 @@ async fn a_7z_entry_is_mapped_when_its_folder_only_copies() {
 		let copied = sevenz_of(&files, SevenZMethod::Copy, solid, None);
 		let (_, reader) = opened("c.7z", copied, None).await;
 		assert_eq!(
-			reader.entry_byte_access(entry(1)).await.unwrap(),
+			reader
+				.entry_byte_access(entry(1), &JobControl::default())
+				.await
+				.unwrap(),
 			EntryByteAccess::Mapped { size: 4000 },
 			"solid {solid}"
 		);
@@ -462,7 +488,10 @@ async fn a_7z_entry_is_mapped_when_its_folder_only_copies() {
 	let compressed = sevenz_of(&files, SevenZMethod::Lzma2 { level: 1 }, false, None);
 	let (_, reader) = opened("l.7z", compressed, None).await;
 	assert_eq!(
-		reader.entry_byte_access(entry(1)).await.unwrap(),
+		reader
+			.entry_byte_access(entry(1), &JobControl::default())
+			.await
+			.unwrap(),
 		EntryByteAccess::Whole { size: 4000 }
 	);
 	let encrypted = sevenz_of(
@@ -473,7 +502,10 @@ async fn a_7z_entry_is_mapped_when_its_folder_only_copies() {
 	);
 	let (_, reader) = opened("e.7z", encrypted, Some("pw")).await;
 	assert_eq!(
-		reader.entry_byte_access(entry(0)).await.unwrap(),
+		reader
+			.entry_byte_access(entry(0), &JobControl::default())
+			.await
+			.unwrap(),
 		EntryByteAccess::Whole { size: 3000 }
 	);
 }
@@ -529,7 +561,10 @@ async fn a_tar_readers_listing_seeks_past_member_data() {
 	assert!(reader.index_held());
 
 	assert_eq!(
-		reader.entry_byte_access(entry(1)).await.unwrap(),
+		reader
+			.entry_byte_access(entry(1), &JobControl::default())
+			.await
+			.unwrap(),
 		EntryByteAccess::Mapped {
 			size: big.len() as u64
 		}
@@ -541,7 +576,11 @@ async fn a_tar_readers_listing_seeks_past_member_data() {
 	);
 	assert_eq!(range(&reader, 3, 0, 5).await.unwrap(), b"gamma");
 	assert_eq!(
-		reader.entry_byte_access(entry(2)).await.unwrap_err().kind(),
+		reader
+			.entry_byte_access(entry(2), &JobControl::default())
+			.await
+			.unwrap_err()
+			.kind(),
 		ErrorKind::InvalidState
 	);
 	// a member is downloaded as a range of the archive: a tar's members have no checksum
@@ -559,7 +598,10 @@ async fn a_gzip_tars_members_are_seekable_at_their_listed_sizes() {
 	let tar = tar_with(&[TarMember::Data("a.txt", b"alpha")]);
 	let (_, reader) = opened("t.tar.gz", gzip(&tar), None).await;
 	assert_eq!(
-		reader.entry_byte_access(entry(0)).await.unwrap(),
+		reader
+			.entry_byte_access(entry(0), &JobControl::default())
+			.await
+			.unwrap(),
 		EntryByteAccess::Seekable { size: 5 }
 	);
 	assert_eq!(range(&reader, 0, 1, 5).await.unwrap(), b"lpha");
@@ -835,7 +877,10 @@ fn ranges(len: u64, seed: u64) -> Vec<(u64, u64)> {
 
 async fn check_ranges(reader: &Reader, index: u32, data: &[u8], seed: u64) {
 	assert_eq!(
-		reader.entry_byte_access(entry(index)).await.unwrap(),
+		reader
+			.entry_byte_access(entry(index), &JobControl::default())
+			.await
+			.unwrap(),
 		EntryByteAccess::Seekable {
 			size: data.len() as u64
 		}
@@ -1057,7 +1102,9 @@ async fn a_gzip_tars_members_read_by_range_across_its_members() {
 
 /// Opens entry `index` of `parent` as a nested archive.
 async fn nested(parent: &Arc<Reader>, index: u32) -> Result<Arc<Reader>, Arc<Error>> {
-	let (bytes, name) = parent.entry_bytes(entry_of(parent, index)).await?;
+	let (bytes, name) = parent
+		.entry_bytes(entry_of(parent, index), &JobControl::default())
+		.await?;
 	let reader = Reader::nested(parent, bytes, name, None);
 	reader
 		.open(Ignore, JobControl::default())
@@ -1077,7 +1124,13 @@ fn entry_of(reader: &Reader, index: u32) -> ArchiveEntryId {
 async fn range_of(reader: &Reader, index: u32, start: u64, end: u64) -> Vec<u8> {
 	let mut written = futures::io::Cursor::new(Vec::new());
 	reader
-		.read_entry_range(entry_of(reader, index), start, end, &mut written)
+		.read_entry_range(
+			entry_of(reader, index),
+			start,
+			end,
+			&mut written,
+			&JobControl::default(),
+		)
 		.await
 		.unwrap();
 	written.into_inner()
@@ -1227,7 +1280,7 @@ async fn a_raw_entrys_embedded_preview_is_written_from_its_range() {
 	for index in [0, 1] {
 		let mut written = futures::io::Cursor::new(Vec::new());
 		let preview = reader
-			.write_entry_embedded_preview(entry(index), &mut written)
+			.write_entry_embedded_preview(entry(index), &mut written, &JobControl::default())
 			.await
 			.unwrap()
 			.expect("a preview");
@@ -1236,7 +1289,7 @@ async fn a_raw_entrys_embedded_preview_is_written_from_its_range() {
 	}
 	let mut written = futures::io::Cursor::new(Vec::new());
 	let none = reader
-		.write_entry_embedded_preview(entry(2), &mut written)
+		.write_entry_embedded_preview(entry(2), &mut written, &JobControl::default())
 		.await
 		.unwrap();
 	assert!(none.is_none());
@@ -1244,7 +1297,7 @@ async fn a_raw_entrys_embedded_preview_is_written_from_its_range() {
 	let mut written = futures::io::Cursor::new(Vec::new());
 	assert_eq!(
 		reader
-			.write_entry_embedded_preview(entry(3), &mut written)
+			.write_entry_embedded_preview(entry(3), &mut written, &JobControl::default())
 			.await
 			.unwrap_err()
 			.kind(),
@@ -1291,7 +1344,10 @@ async fn a_rars_members_are_listed_from_its_held_table_and_read_checked() {
 				.collect();
 			assert_eq!(paths, ["dir/a.txt", "b.txt"], "{version:?}");
 			// a solid archive's first member is decoded on its own
-			let access = reader.entry_byte_access(entry(1)).await.unwrap();
+			let access = reader
+				.entry_byte_access(entry(1), &JobControl::default())
+				.await
+				.unwrap();
 			let expected = match (store, solid) {
 				(true, _) => EntryByteAccess::Mapped {
 					size: b.len() as u64,
@@ -1607,5 +1663,212 @@ mod bench {
 				512.0 / decode,
 			);
 		}
+	}
+}
+
+/// A writer that never takes a byte, as a stream nobody drains.
+struct Stalled;
+
+impl AsyncWrite for Stalled {
+	fn poll_write(
+		self: std::pin::Pin<&mut Self>,
+		_: &mut std::task::Context<'_>,
+		_: &[u8],
+	) -> std::task::Poll<std::io::Result<usize>> {
+		std::task::Poll::Pending
+	}
+
+	fn poll_flush(
+		self: std::pin::Pin<&mut Self>,
+		_: &mut std::task::Context<'_>,
+	) -> std::task::Poll<std::io::Result<()>> {
+		std::task::Poll::Pending
+	}
+
+	fn poll_close(
+		self: std::pin::Pin<&mut Self>,
+		_: &mut std::task::Context<'_>,
+	) -> std::task::Poll<std::io::Result<()>> {
+		std::task::Poll::Pending
+	}
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stalled_writer_fails_its_pass_and_gives_its_slot_back() {
+	let (zip, _) = spread_zip();
+	let (backend, archive, config) = drive("z.zip", zip, 64 << 20);
+	let reader = reader_of(&backend, &archive, &config, None);
+	reader.open(Ignore, JobControl::default()).await.unwrap();
+	let slots = config.free_slots();
+	let stalled = reader
+		.read_entries(
+			&[entry(0)],
+			|_, _| std::future::ready(Ok(Some(Stalled))),
+			None,
+			Ignore,
+			JobControl::default(),
+		)
+		.await
+		.unwrap_err();
+	assert_eq!(stalled.error.kind(), ErrorKind::IO, "{}", stalled.error);
+	// a writer asked for that never comes fails the same way
+	let unanswered = reader
+		.read_entries(
+			&[entry(0)],
+			|_, _| std::future::pending::<Result<Option<Stalled>, Error>>(),
+			None,
+			Ignore,
+			JobControl::default(),
+		)
+		.await
+		.unwrap_err();
+	assert_eq!(unanswered.error.kind(), ErrorKind::IO);
+	assert_eq!(config.free_slots(), slots);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelling_a_pass_mid_entry_ends_it_at_once() {
+	let (zip, _) = spread_zip();
+	let (_, reader) = opened("z.zip", zip, None).await;
+	let (control, controller) = JobControl::new();
+	let canceller = tokio::spawn(async move {
+		tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+		controller.cancel();
+	});
+	let started = std::time::Instant::now();
+	let cancelled = reader
+		.read_entries(
+			&[entry(0), entry(1)],
+			|_, _| std::future::ready(Ok(Some(Stalled))),
+			None,
+			Ignore,
+			control,
+		)
+		.await
+		.unwrap_err();
+	canceller.await.unwrap();
+	assert_eq!(cancelled.error.kind(), ErrorKind::Cancelled);
+	assert_eq!(cancelled.report.entries, 0);
+	// well before a stall would have ended it
+	assert!(started.elapsed() < crate::fs::archive::input::SINK_STALL_TIMEOUT);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_bare_tar_pass_under_no_budget_lists_once_and_counts_only_what_it_wrote() {
+	let (tar, _) = spread_tar();
+	let (backend, archive, config) = drive("t.tar", tar, 0);
+	let reader = reader_of(&backend, &archive, &config, None);
+	reader.open(Ignore, JobControl::default()).await.unwrap();
+	fetched(&backend);
+	let written: Written = Arc::default();
+	let into = Arc::clone(&written);
+	let report = reader
+		.read_entries(
+			&[entry(0), entry(3)],
+			move |entry: ArchiveEntryId, _| {
+				// the first is passed over
+				let buffer = Arc::default();
+				let writer = (entry.index == 3).then(|| {
+					into.lock()
+						.unwrap()
+						.push((entry.index, None, Arc::clone(&buffer)));
+					Recording(buffer)
+				});
+				std::future::ready(Ok(writer))
+			},
+			None,
+			Ignore,
+			JobControl::default(),
+		)
+		.await
+		.unwrap();
+	assert_eq!(report.entries, 1);
+	assert_eq!(report.bytes_written, 5);
+	assert_eq!(written.lock().unwrap().len(), 1);
+	// one listing seeks the tar's headers once: its first chunk and its last two
+	let read = fetched(&backend);
+	assert!(read.len() <= 6, "{read:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_gzip_tars_access_holds_without_room_to_keep_its_table() {
+	let (tar, big) = spread_tar();
+	let (backend, archive, config) = drive("t.tar.gz", gzip(&tar), 0);
+	let reader = reader_of(&backend, &archive, &config, None);
+	reader.open(Ignore, JobControl::default()).await.unwrap();
+	let control = JobControl::default();
+	for _ in 0..2 {
+		assert_eq!(
+			reader.entry_byte_access(entry(1), &control).await.unwrap(),
+			EntryByteAccess::Seekable {
+				size: big.len() as u64
+			}
+		);
+	}
+	assert_eq!(range(&reader, 1, 10, 20).await.unwrap(), big[10..20]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_gzip_tars_members_are_read_beside_a_stalled_one() {
+	let (tar, big) = spread_tar();
+	let (_, reader) = opened("t.tar.gz", gzip(&tar), None).await;
+	let reader = Arc::new(reader);
+	let (control, controller) = JobControl::new();
+	let stalled = {
+		let reader = Arc::clone(&reader);
+		tokio::spawn(async move {
+			let mut writer = Stalled;
+			reader
+				.read_entry_range(entry(1), 0, 100, &mut writer, &control)
+				.await
+		})
+	};
+	tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+	let read = tokio::time::timeout(std::time::Duration::from_secs(10), range(&reader, 3, 0, 5))
+		.await
+		.expect("another member is read while the first one's writer stalls");
+	assert_eq!(read.unwrap(), b"gamma");
+	controller.cancel();
+	assert_eq!(
+		stalled.await.unwrap().unwrap_err().kind(),
+		ErrorKind::Cancelled
+	);
+	// the member's reads take turns: the next goes on once the stalled one ended
+	assert_eq!(range(&reader, 1, 3, 9).await.unwrap(), big[3..9]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cancelled_range_read_that_reads_the_index_again_ends() {
+	let (zip, data) = spread_zip();
+	let (_, reader) = opened("z.zip", zip, None).await;
+	reader.retained.as_ref().unwrap().evict_index_for_test();
+	let (control, controller) = JobControl::new();
+	controller.cancel();
+	let mut written = futures::io::Cursor::new(Vec::new());
+	let cancelled = reader
+		.read_entry_range(entry(0), 0, 10, &mut written, &control)
+		.await
+		.unwrap_err();
+	assert_eq!(cancelled.kind(), ErrorKind::Cancelled);
+	assert_eq!(range(&reader, 0, 0, 10).await.unwrap(), data[0][..10]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn checkpoints_laid_in_flight_are_charged_and_capped_by_the_budget() {
+	let data = text(12 << 20, 41);
+	let zip = zip_with(&[("big", &data, ZipMethod::Deflate { level: 6 }, None)]);
+	// room for little more than the reader's own index
+	let (backend, archive, config) = drive("z.zip", zip, 200 << 10);
+	let reader = reader_of(&backend, &archive, &config, None);
+	reader.open(Ignore, JobControl::default()).await.unwrap();
+	let len = data.len() as u64;
+	assert_eq!(
+		range(&reader, 0, len - 10, len).await.unwrap(),
+		data[data.len() - 10..]
+	);
+	let retained = reader.retained.as_ref().unwrap();
+	assert!(config.retained.charged_for_test() <= 200 << 10);
+	if let Some(seeks) = retained.take_seeks(StreamKey::Entry(0)) {
+		assert!(seeks.bytes() <= 200 << 10, "{}", seeks.bytes());
 	}
 }

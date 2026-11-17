@@ -14,7 +14,7 @@ use crate::{
 	fs::archive::{
 		config::ArchiveConfig,
 		format::ArchiveFormat,
-		input::{ArchiveBytes, FeedSink, ReadingDriver, ReadingJob, start_reading},
+		input::{ArchiveBytes, FeedSink, ReadingDriver, ReadingJob, start_reading, unstalled},
 		retained::Retained,
 		worker::{CodecStart, EntryHead, EntryKind, WorkerEvent, unexpected_event},
 	},
@@ -381,9 +381,10 @@ pub(crate) async fn run_download<W: AsyncWrite + Unpin + MaybeSend>(
 	if outcome.is_ok() && driver.fatal.error().is_none() {
 		if sink.state == SinkState::Ended {
 			// the codec returned, so the data written was checked: only now is it finished
-			match control.until_stopping(sink.writer.close()).await {
-				Ok(Ok(())) => {}
-				Ok(Err(error)) => driver.fatal.record(Arc::new(Error::from(error))),
+			match control.until_stopping(unstalled(sink.writer.close())).await {
+				Ok(Ok(Ok(()))) => {}
+				Ok(Ok(Err(error))) => driver.fatal.record(Arc::new(Error::from(error))),
+				Ok(Err(error)) => driver.fatal.record(Arc::new(error)),
 				Err(Stopped) => {
 					reporter.wind_down(&control);
 					outcome = Err(Stopped);
@@ -477,12 +478,12 @@ impl<W: AsyncWrite + Unpin + MaybeSend> FeedSink for EntrySink<'_, W> {
 				// a stop ends the write; the driver sees the job stopping next
 				let Ok(written) = self
 					.control
-					.until_stopping(self.writer.write_all(&data))
+					.until_stopping(unstalled(self.writer.write_all(&data)))
 					.await
 				else {
 					return Ok(());
 				};
-				written?;
+				written??;
 				self.bytes_written = self.bytes_written.saturating_add(data.len() as u64);
 				self.reporter.wrote(self.bytes_written);
 			}

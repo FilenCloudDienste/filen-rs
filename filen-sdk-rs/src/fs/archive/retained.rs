@@ -307,6 +307,17 @@ impl Retained {
 			.release(over.iter().map(|(_, seeks)| seeks.bytes).sum());
 	}
 
+	/// Charges `bytes` a read holds while it is in flight, as anything kept is charged; whether
+	/// there was room, taken from other readers if need be.
+	pub(crate) fn reserve(&self, bytes: u64) -> bool {
+		self.pool.charge(self, self.budget, bytes)
+	}
+
+	/// Gives back `bytes` [`Self::reserve`] charged.
+	pub(crate) fn release_reserved(&self, bytes: u64) {
+		self.pool.release(bytes);
+	}
+
 	/// Chunk `index` of the archive, when it is kept.
 	pub(crate) fn chunk(&self, index: u64) -> Option<Arc<Vec<u8>>> {
 		self.touch();

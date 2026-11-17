@@ -6,7 +6,7 @@
 
 #![warn(unreachable_pub, unused_qualifications)]
 
-use std::sync::{Arc, Mutex, atomic::AtomicBool};
+use std::sync::Arc;
 
 use filen_types::{crypto::Blake3Hash, fs::Uuid};
 
@@ -21,8 +21,8 @@ use crate::{
 		},
 		format::ArchiveFormat,
 		input::ArchiveBytes,
-		retained::Retained,
 	},
+	job::JobControl,
 	util::MaybeSendBoxFuture,
 };
 
@@ -59,8 +59,9 @@ impl ArchiveBytes for EntryBytes {
 			let end = start.saturating_add(CHUNK_SIZE_U64).min(self.len);
 			let capacity = usize::try_from(end - start).expect("a chunk fits in memory");
 			let mut chunk = futures::io::Cursor::new(Vec::with_capacity(capacity));
+			// the nested job stops by dropping the fetch: no control of its own reaches here
 			self.parent
-				.read_entry_range(self.entry, start, end, &mut chunk)
+				.read_entry_range(self.entry, start, end, &mut chunk, &JobControl::default())
 				.await
 				.map_err(unshared)?;
 			Ok(chunk.into_inner())
@@ -98,25 +99,22 @@ impl Reader {
 		name: String,
 		password: Option<ArchivePassword>,
 	) -> Self {
-		let config = parent.config.clone();
-		let retained = Retained::new(Arc::clone(&config.retained), config.retained_budget());
+		let settings = ListConfig {
+			password,
+			..parent.settings.clone()
+		};
 		Self {
-			memory: Arc::clone(&parent.memory),
-			source: bytes,
-			name,
-			id: Uuid::new_v4(),
-			config,
-			settings: ListConfig {
-				password,
-				..parent.settings.clone()
-			},
-			format: Mutex::new(None),
-			retained: Some(retained),
 			depth: parent.depth + 1,
 			// the chain counts against what the drive stores of its outermost archive
 			expansion_base: Some(parent.expansion_base.unwrap_or(parent.source.len())),
-			flights: Mutex::default(),
-			closed: AtomicBool::new(false),
+			..Self::of(
+				Arc::clone(&parent.memory),
+				bytes,
+				name,
+				parent.config.clone(),
+				settings,
+			)
+			.keeping()
 		}
 	}
 
@@ -126,6 +124,7 @@ impl Reader {
 	pub(crate) async fn entry_bytes(
 		self: &Arc<Self>,
 		entry: ArchiveEntryId,
+		control: &JobControl,
 	) -> Result<(Arc<EntryBytes>, String), Arc<Error>> {
 		if self.depth >= MAX_NESTING {
 			return Err(Arc::new(Error::custom(
@@ -133,7 +132,7 @@ impl Reader {
 				format!("an archive nested more than {MAX_NESTING} deep"),
 			)));
 		}
-		let len = match self.resolve(entry).await? {
+		let len = match self.resolve(entry, control).await? {
 			Resolved::Mapped { size, .. } | Resolved::Seekable { size, .. } => size,
 			Resolved::Whole { .. } | Resolved::Sequential { .. } => {
 				return Err(Arc::new(Error::custom(
@@ -150,7 +149,7 @@ impl Reader {
 		{
 			return Err(Arc::new(expansion_exceeded(limit)));
 		}
-		let name = self.entry_name(entry).await?;
+		let name = self.entry_name(entry, control).await?;
 		let bytes = Arc::new(EntryBytes {
 			parent: Arc::clone(self),
 			entry,
@@ -162,7 +161,11 @@ impl Reader {
 
 	/// The last segment of the path `entry` is stored at, which tells some formats; empty for a
 	/// tar's member, whose path the reader does not keep (its contents tell its format).
-	async fn entry_name(&self, entry: ArchiveEntryId) -> Result<String, Arc<Error>> {
+	async fn entry_name(
+		&self,
+		entry: ArchiveEntryId,
+		control: &JobControl,
+	) -> Result<String, Arc<Error>> {
 		let ordinal = u64::from(entry.index);
 		if !matches!(
 			self.format(),
@@ -170,7 +173,7 @@ impl Reader {
 		) {
 			return Ok(String::new());
 		}
-		let index = self.held_index().await?;
+		let index = self.held_index(control).await?;
 		let path = match &*index {
 			HeldIndex::Zip(index) => index
 				.entries

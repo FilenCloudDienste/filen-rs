@@ -20,13 +20,13 @@ use crate::{
 				reading::{CodecInput, ReadJob, download_extraction, start_codec},
 			},
 			format::ArchiveFormat,
-			input::{FeedSink, ReadingDriver, ReadingJob, start_reading},
+			input::{FeedSink, ReadingDriver, ReadingJob, start_reading, unstalled},
 			worker::{EntryHead, EntryKind, WorkerEvent, unexpected_event},
 		},
 		drive_job::{cancelled, exceeds_limit},
 	},
 	job::{
-		JobControl,
+		JobControl, Stopped,
 		report::{JobFailed, JobReport},
 	},
 	util::MaybeSend,
@@ -212,24 +212,36 @@ impl Reader {
 		Fut: Future<Output = Result<Option<W>, Error>> + MaybeSend,
 	{
 		let mut report = EntriesReadReport::default();
+		// one table for the whole pass, held or not, so a member never costs a listing of its own
+		let table = match self.tar_table(control).await {
+			Ok(table) => table,
+			Err(error) => return Err(EntriesReadFailed { report, error }),
+		};
 		for &ordinal in selection.ordinals() {
 			let entry = ArchiveEntryId::of(self.source.id(), ordinal);
 			let read = async {
 				if control.is_stopping() {
 					return Err(cancelled(EntriesReadReport::NAME));
 				}
-				let Resolved::Mapped { size, .. } = self.resolve(entry).await? else {
+				let Resolved::Mapped { size, .. } = self.tar_access(&table, None, ordinal)? else {
 					return Err(Arc::new(EntryDownloadError::NotAFile.into()));
 				};
-				let Some(mut writer) = writer_for(entry, Some(size)).await.map_err(Arc::new)?
-				else {
-					return Ok(0);
+				let asked = control
+					.until_stopping(unstalled(writer_for(entry, Some(size))))
+					.await
+					.map_err(|Stopped| cancelled(EntriesReadReport::NAME))?;
+				let Some(mut writer) = asked.and_then(|asked| asked).map_err(Arc::new)? else {
+					return Ok(None);
 				};
-				self.read_entry_range(entry, 0, size, &mut writer).await?;
-				Ok(size)
+				// a stop ends the read mid-member
+				self.read_entry_range(entry, 0, size, &mut writer, control)
+					.await?;
+				Ok(Some(size))
 			};
 			match read.await {
-				Ok(size) => {
+				// a member no writer took is passed over, not written
+				Ok(None) => {}
+				Ok(Some(size)) => {
 					report.entries += 1;
 					report.bytes_written = report.bytes_written.saturating_add(size);
 					report.bytes_read = report.bytes_read.saturating_add(size);
@@ -303,7 +315,15 @@ where
 			) => {
 				let entry = ArchiveEntryId::of(self.archive, ordinal);
 				self.left = self.left.saturating_sub(1);
-				self.current = match (self.writer_for)(entry, size).await? {
+				// a stop ends the wait for a writer; the driver sees the job stopping next
+				let Ok(asked) = self
+					.control
+					.until_stopping(unstalled((self.writer_for)(entry, size)))
+					.await
+				else {
+					return Ok(());
+				};
+				self.current = match asked?? {
 					Some(writer) => Current::Writing(writer),
 					None => Current::Dropping,
 				};
@@ -316,20 +336,25 @@ where
 			}
 			(Current::Writing(writer), WorkerEvent::Data(data)) => {
 				// a stop ends the write; the driver sees the job stopping next
-				let Ok(written) = self.control.until_stopping(writer.write_all(&data)).await else {
+				let Ok(written) = self
+					.control
+					.until_stopping(unstalled(writer.write_all(&data)))
+					.await
+				else {
 					return Ok(());
 				};
-				written?;
+				written??;
 				self.bytes_written = self.bytes_written.saturating_add(data.len() as u64);
 				self.reporter.wrote(self.bytes_written);
 			}
 			(Current::Dropping, WorkerEvent::Data(_)) => {}
 			(Current::Writing(writer), WorkerEvent::FileEnd) => {
 				// the codec sends the end once the data matched its checksum
-				let Ok(closed) = self.control.until_stopping(writer.close()).await else {
+				let Ok(closed) = self.control.until_stopping(unstalled(writer.close())).await
+				else {
 					return Ok(());
 				};
-				closed?;
+				closed??;
 				self.entries += 1;
 				self.current = Current::Between;
 			}

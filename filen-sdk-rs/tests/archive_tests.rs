@@ -1646,7 +1646,10 @@ async fn read_through(reader: &ArchiveReader, big: &[u8], notes: &[u8]) {
 	let big_id = entry(&listing, "source/big.bin").id;
 	let notes_id = entry(&listing, "source/notes.txt").id;
 	assert_eq!(
-		reader.entry_byte_access(big_id).await.unwrap(),
+		reader
+			.entry_byte_access(big_id, JobControl::default())
+			.await
+			.unwrap(),
 		EntryByteAccess::Mapped {
 			size: big.len() as u64
 		}
@@ -1659,6 +1662,7 @@ async fn read_through(reader: &ArchiveReader, big: &[u8], notes: &[u8]) {
 			start,
 			start + 20,
 			&mut futures::io::Cursor::new(&mut range),
+			JobControl::default(),
 		)
 		.await
 		.unwrap();
