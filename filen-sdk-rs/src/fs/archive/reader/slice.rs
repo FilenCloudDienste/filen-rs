@@ -257,8 +257,20 @@ impl Reader {
 		self.resolve(entry).await.map(EntryByteAccess::from)
 	}
 
-	/// Writes bytes `start..end` of the mapped `entry` to `writer`, then closes it.
+	/// Writes bytes `start..end` of `entry`, read by range, to `writer`, then closes it.
 	pub(crate) async fn read_entry_range<W: AsyncWrite + Unpin + MaybeSend>(
+		&self,
+		entry: ArchiveEntryId,
+		start: u64,
+		end: u64,
+		writer: &mut W,
+	) -> Result<(), Arc<Error>> {
+		self.write_entry_range(entry, start, end, writer).await?;
+		writer.close().await.map_err(|error| Arc::new(error.into()))
+	}
+
+	/// Writes bytes `start..end` of `entry`, read by range, to `writer`, leaving it open.
+	pub(crate) async fn write_entry_range<W: AsyncWrite + Unpin + MaybeSend>(
 		&self,
 		entry: ArchiveEntryId,
 		start: u64,
@@ -286,10 +298,8 @@ impl Reader {
 				size,
 			} => {
 				within(size)?;
-				// closes the writer
-				return self
-					.read_seekable(stream, offset + start..offset + end, writer)
-					.await;
+				self.read_seekable(stream, offset + start..offset + end, writer)
+					.await?;
 			}
 			Resolved::Whole { .. } | Resolved::Sequential { .. } => {
 				return Err(Arc::new(Error::custom(
@@ -298,10 +308,6 @@ impl Reader {
 				)));
 			}
 		}
-		writer
-			.close()
-			.await
-			.map_err(|error| Arc::new(error.into()))?;
 		Ok(())
 	}
 

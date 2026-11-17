@@ -7,6 +7,7 @@
 
 mod inflate;
 mod nested;
+mod raw;
 mod sequential;
 mod slice;
 
@@ -42,6 +43,7 @@ use crate::{
 		file::enums::RemoteFileType,
 	},
 	job::{JobControl, report::JobFailed},
+	thumbnail::EmbeddedPreview,
 	util::{MaybeArc, MaybeSend, SeededMap},
 };
 
@@ -242,6 +244,26 @@ impl ArchiveReader {
 		Ok(ArchiveReader {
 			reader: MaybeArc::new(reader),
 		})
+	}
+
+	/// Writes the embedded preview of `entry`, a RAW photo (or another container microthumb
+	/// walks), to `writer`, then closes `writer`: the JPEG its camera stored, byte for byte, but
+	/// for a rotation only the container knows, spliced in as EXIF. `None`, `writer` closed
+	/// empty, when it has none. Only an entry read by range (`Mapped` or `Seekable`, see
+	/// [`ArchiveReader::entry_byte_access`]) is walked, through the few reads its container
+	/// takes and never held whole; one read only whole or front to back fails with
+	/// [`ErrorKind::ArchiveUnsupported`](crate::ErrorKind::ArchiveUnsupported).
+	pub async fn write_entry_embedded_preview<W>(
+		&self,
+		entry: ArchiveEntryId,
+		writer: &mut W,
+	) -> Result<Option<EmbeddedPreview>, Arc<Error>>
+	where
+		W: AsyncWrite + Unpin + MaybeSend,
+	{
+		self.reader
+			.write_entry_embedded_preview(entry, writer)
+			.await
 	}
 
 	/// Lists the archive's entries, as [`Client::list_archive`] does with the reader's settings,

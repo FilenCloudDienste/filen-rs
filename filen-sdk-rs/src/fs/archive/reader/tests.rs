@@ -5,6 +5,7 @@ use std::{io::Write, sync::Arc};
 use filen_types::fs::Uuid;
 
 use super::{nested::nested_id, *};
+use crate::thumbnail::test_support::{PREVIEW_AT, jpeg_bytes, raw_with};
 use crate::{
 	auth::http::ClientConfig,
 	consts::{CHUNK_SIZE, CHUNK_SIZE_U64},
@@ -1133,4 +1134,43 @@ async fn the_expansion_limit_counts_across_the_chain() {
 		.await
 		.unwrap_err();
 	assert_eq!(failed.error.kind(), ErrorKind::ArchiveTooLarge);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_raw_entrys_embedded_preview_is_written_from_its_range() {
+	let jpeg = jpeg_bytes(640, 480);
+	let raw = raw_with(&jpeg, 1, jpeg.len() as u64);
+	let zip = zip_with(&[
+		("stored.dng", &raw, ZipMethod::Stored, None),
+		("deflated.dng", &raw, ZipMethod::Deflate { level: 6 }, None),
+		("note.txt", b"no preview here", ZipMethod::Stored, None),
+		("whole.dng", &raw, ZipMethod::Bzip2 { level: 6 }, None),
+	]);
+	let (_, reader) = opened("raw.zip", zip, None).await;
+	for index in [0, 1] {
+		let mut written = futures::io::Cursor::new(Vec::new());
+		let preview = reader
+			.write_entry_embedded_preview(entry(index), &mut written)
+			.await
+			.unwrap()
+			.expect("a preview");
+		assert_eq!(u64::from(PREVIEW_AT), preview.located.offset);
+		assert!(written.into_inner() == jpeg, "{index}");
+	}
+	let mut written = futures::io::Cursor::new(Vec::new());
+	let none = reader
+		.write_entry_embedded_preview(entry(2), &mut written)
+		.await
+		.unwrap();
+	assert!(none.is_none());
+	assert!(written.into_inner().is_empty());
+	let mut written = futures::io::Cursor::new(Vec::new());
+	assert_eq!(
+		reader
+			.write_entry_embedded_preview(entry(3), &mut written)
+			.await
+			.unwrap_err()
+			.kind(),
+		ErrorKind::ArchiveUnsupported
+	);
 }

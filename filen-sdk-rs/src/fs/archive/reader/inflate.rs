@@ -501,7 +501,7 @@ fn gzip_header(bytes: &[u8]) -> Result<Option<usize>, Error> {
 }
 
 impl Reader {
-	/// Writes output `want` of `stream` to `writer`, then closes it.
+	/// Writes output `want` of `stream` to `writer`.
 	pub(crate) async fn read_seekable<W: AsyncWrite + Unpin + MaybeSend>(
 		&self,
 		stream: SeekStream,
@@ -521,8 +521,7 @@ impl Reader {
 		if let Some(retained) = &self.retained {
 			retained.keep_seeks(stream.key, seeks);
 		}
-		read?;
-		writer.close().await.map_err(|error| Arc::new(error.into()))
+		read
 	}
 
 	async fn read_stream<W: AsyncWrite + Unpin + MaybeSend>(
