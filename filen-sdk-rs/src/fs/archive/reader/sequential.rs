@@ -12,7 +12,6 @@ use futures::{AsyncWrite, AsyncWriteExt};
 use crate::{
 	Error, ErrorKind,
 	fs::{
-		HasUUID,
 		archive::{
 			extract::{
 				ArchiveEntryId, EntryDownloadCallback, EntryDownloadError, EntryDownloadPhase,
@@ -24,8 +23,7 @@ use crate::{
 			input::{FeedSink, ReadingDriver, ReadingJob, start_reading},
 			worker::{EntryHead, EntryKind, WorkerEvent, unexpected_event},
 		},
-		drive_job::{backend::DriveBackend, cancelled, exceeds_limit},
-		file::traits::HasFileInfo,
+		drive_job::{cancelled, exceeds_limit},
 	},
 	job::{
 		JobControl,
@@ -62,7 +60,7 @@ impl JobReport for EntriesReadReport {
 /// its writer is left unclosed.
 pub type EntriesReadFailed = JobFailed<EntriesReadReport>;
 
-impl<B: DriveBackend> Reader<B> {
+impl Reader {
 	/// Reads `entries` in one ordered pass (see the module docs), each written to the writer
 	/// `writer_for` gives it (in archive order, with its size when the archive states it), or
 	/// decoded and thrown away when it gives none.
@@ -84,7 +82,7 @@ impl<B: DriveBackend> Reader<B> {
 		};
 		self.ensure_open()
 			.map_err(|error| failed(Arc::new(error)))?;
-		let archive = self.archive.uuid();
+		let archive = self.source.id();
 		if entries.is_empty() || entries.iter().any(|entry| entry.archive != archive) {
 			return Err(failed(Arc::new(Error::custom(
 				ErrorKind::InvalidState,
@@ -109,30 +107,38 @@ impl<B: DriveBackend> Reader<B> {
 				SolidSkipExceeded {
 					skipped_bytes: skipped,
 					limit,
-					estimated_packed_bytes: self.archive.size(),
+					estimated_packed_bytes: self.source.len(),
 				}
 				.into(),
 			)));
 		}
 		let left = selection.ordinals().len();
 		let ReadJob {
-			backend,
-			archive: file,
+			memory,
+			source,
+			name,
 			config,
 			settings,
 			index,
 			chunks,
 			control: _,
 		} = self.read_job(control.clone());
-		let reporter = EntryDownloadReporter::new(callback, file.size());
+		let reporter = EntryDownloadReporter::new(callback, source.len());
 		let task = Task::Download {
 			selection,
 			max_solid_skip,
 		};
-		let start = start_codec(&file, &config, download_extraction(settings), task, index);
+		let start = start_codec(
+			&name,
+			source.len(),
+			&config,
+			download_extraction(settings),
+			task,
+			index,
+		);
 		let started = start_reading(
-			backend,
-			Arc::new(file),
+			memory,
+			source,
 			ReadingJob {
 				config: &config,
 				control: &control,
@@ -204,7 +210,7 @@ impl<B: DriveBackend> Reader<B> {
 	{
 		let mut report = EntriesReadReport::default();
 		for &ordinal in selection.ordinals() {
-			let entry = ArchiveEntryId::of(self.archive.uuid(), ordinal);
+			let entry = ArchiveEntryId::of(self.source.id(), ordinal);
 			let read = async {
 				if control.is_stopping() {
 					return Err(cancelled(EntriesReadReport::NAME));

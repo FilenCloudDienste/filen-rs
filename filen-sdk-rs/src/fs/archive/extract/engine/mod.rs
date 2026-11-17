@@ -52,7 +52,7 @@ use crate::{
 			},
 			entry_path::{ArchivePath, joined},
 			format::ArchiveFormat,
-			input::{CodecFeed, Fed, ReadingJob, start_reading},
+			input::{CodecFeed, DriveFile, Fed, ReadingJob, start_reading},
 			limits::keep,
 			names::DirId,
 			worker::{
@@ -252,7 +252,7 @@ struct Driver<B: DriveBackend> {
 	max_bytes: Option<u64>,
 	max_items: Option<u64>,
 	config: ArchiveConfig,
-	feed: CodecFeed<B, ArchiveEnd>,
+	feed: CodecFeed<ArchiveEnd>,
 	/// The floor's output chunk; its input chunk is the feed's.
 	output_slot: Arc<Semaphore>,
 	/// The client's file-IO budget, for what goes beyond the floor.
@@ -339,8 +339,8 @@ pub(crate) async fn run_extract<B: DisposalBackend>(
 
 	let archive = Arc::new(archive);
 	let started = start_reading(
-		Arc::clone(&backend),
-		Arc::clone(&archive),
+		backend.memory(),
+		DriveFile::new(Arc::clone(&backend), RemoteFileType::clone(&archive)),
 		ReadingJob {
 			config: &config,
 			control: &control,

@@ -7,20 +7,16 @@
 use std::sync::Arc;
 
 use futures::AsyncWrite;
+use tokio::sync::Semaphore;
 
 use crate::{
 	Error,
-	fs::{
-		HasName, HasUUID,
-		archive::{
-			config::ArchiveConfig,
-			format::ArchiveFormat,
-			input::{FeedSink, ReadingDriver, ReadingJob, start_reading},
-			retained::Retained,
-			worker::{self, CodecStart, WorkerEvent, unexpected_event},
-		},
-		drive_job::backend::DriveBackend,
-		file::{enums::RemoteFileType, traits::HasFileInfo},
+	fs::archive::{
+		config::ArchiveConfig,
+		format::ArchiveFormat,
+		input::{ArchiveBytes, FeedSink, ReadingDriver, ReadingJob, start_reading},
+		retained::Retained,
+		worker::{self, CodecStart, WorkerEvent, unexpected_event},
 	},
 	job::{JobControl, report::JobReport},
 	util::MaybeSend,
@@ -36,9 +32,12 @@ use super::{
 };
 
 /// What one job of a reader reads, and how.
-pub(crate) struct ReadJob<B> {
-	pub(crate) backend: Arc<B>,
-	pub(crate) archive: RemoteFileType<'static>,
+pub(crate) struct ReadJob {
+	/// The client's file-IO budget.
+	pub(crate) memory: Arc<Semaphore>,
+	pub(crate) source: Arc<dyn ArchiveBytes>,
+	/// The archive's name, which tells some formats.
+	pub(crate) name: String,
 	/// The client's archive settings.
 	pub(crate) config: ArchiveConfig,
 	/// The reader's.
@@ -58,26 +57,25 @@ pub(crate) struct Opened {
 
 /// Opens the archive: what it is, and a zip's or 7z's index (see
 /// [`open_archive`](super::codec::open_archive)).
-pub(crate) async fn open<B: DriveBackend>(
-	job: ReadJob<B>,
-	callback: impl ListCallback,
-) -> Result<Opened, ListFailed> {
+pub(crate) async fn open(job: ReadJob, callback: impl ListCallback) -> Result<Opened, ListFailed> {
 	let ReadJob {
-		backend,
-		archive,
+		memory,
+		source,
+		name,
 		config,
 		settings,
 		index: _,
 		chunks,
 		control,
 	} = job;
-	let reporter = ListReporter::new(callback, archive.size());
+	let reporter = ListReporter::new(callback, source.len());
 	let codec = stream_job(
-		&archive,
+		&name,
+		source.len(),
 		&config,
 		settings.into_extraction(),
 		Task::List {
-			archive: archive.uuid(),
+			archive: source.id(),
 		},
 		IndexUse::ReadAndReturn,
 	);
@@ -88,8 +86,8 @@ pub(crate) async fn open<B: DriveBackend>(
 		error,
 	};
 	let started = start_reading(
-		backend,
-		Arc::new(archive),
+		memory,
+		source,
 		ReadingJob {
 			config: &config,
 			control: &control,
@@ -149,26 +147,34 @@ impl FeedSink for OpenSink {
 }
 
 /// Lists the archive.
-pub(crate) async fn list<B: DriveBackend>(
-	job: ReadJob<B>,
+pub(crate) async fn list(
+	job: ReadJob,
 	task: Task,
 	callback: impl ListCallback,
 ) -> Result<Listed, ListFailed> {
 	let ReadJob {
-		backend,
-		archive,
+		memory,
+		source,
+		name,
 		config,
 		settings,
 		index,
 		chunks,
 		control,
 	} = job;
-	let start = start_codec(&archive, &config, settings.into_extraction(), task, index);
+	let start = start_codec(
+		&name,
+		source.len(),
+		&config,
+		settings.into_extraction(),
+		task,
+		index,
+	);
 	run_list(ListTask {
-		backend,
+		memory,
 		control,
-		reporter: ListReporter::new(callback, archive.size()),
-		archive,
+		reporter: ListReporter::new(callback, source.len()),
+		source,
 		config,
 		start,
 		chunks,
@@ -177,8 +183,8 @@ pub(crate) async fn list<B: DriveBackend>(
 }
 
 /// Downloads `entry`; what the download did, and the index it read.
-pub(crate) async fn download<B: DriveBackend, W: AsyncWrite + Unpin + MaybeSend>(
-	job: ReadJob<B>,
+pub(crate) async fn download<W: AsyncWrite + Unpin + MaybeSend>(
+	job: ReadJob,
 	entry: ArchiveEntryId,
 	writer: &mut W,
 	max_solid_skip: Option<u64>,
@@ -188,16 +194,17 @@ pub(crate) async fn download<B: DriveBackend, W: AsyncWrite + Unpin + MaybeSend>
 	Option<Box<HeldIndex>>,
 ) {
 	let ReadJob {
-		backend,
-		archive,
+		memory,
+		source,
+		name,
 		config,
 		settings,
 		index,
 		chunks,
 		control,
 	} = job;
-	let reporter = EntryDownloadReporter::new(callback, archive.size());
-	let (archive, selection) = match choose_entry(archive, entry, &reporter) {
+	let reporter = EntryDownloadReporter::new(callback, source.len());
+	let selection = match choose_entry(source.id(), entry, &reporter) {
 		Ok(chosen) => chosen,
 		Err(failed) => return (Err(failed), None),
 	};
@@ -206,13 +213,13 @@ pub(crate) async fn download<B: DriveBackend, W: AsyncWrite + Unpin + MaybeSend>
 		selection,
 		max_solid_skip,
 	};
-	let start = start_codec(&archive, &config, extraction, task, index);
+	let start = start_codec(&name, source.len(), &config, extraction, task, index);
 	run_download(
 		DownloadTask {
-			backend,
+			memory,
 			control,
 			reporter,
-			archive,
+			source,
 			ordinal: u64::from(entry.index),
 			config,
 			start,
@@ -226,15 +233,16 @@ pub(crate) async fn download<B: DriveBackend, W: AsyncWrite + Unpin + MaybeSend>
 /// The settings a job's codec reads `archive` under: the client's `archives`, the job's
 /// `config`, its `task`, and where it gets the index from.
 pub(super) fn stream_job(
-	archive: &RemoteFileType<'static>,
+	name: &str,
+	len: u64,
 	archives: &ArchiveConfig,
 	config: ExtractConfig,
 	task: Task,
 	index: IndexUse,
 ) -> StreamJob {
 	StreamJob {
-		name: archive.name().unwrap_or_default().to_owned(),
-		len: archive.size(),
+		name: name.to_owned(),
+		len,
 		limits: CodecLimits {
 			decoder_memory: archives.codec_mem_budget(),
 			max_members: archives.max_members,
@@ -251,13 +259,14 @@ pub(super) fn stream_job(
 
 /// Starts the codec that reads `archive` for `task` (see [`stream_job`]).
 pub(crate) fn start_codec(
-	archive: &RemoteFileType<'static>,
+	name: &str,
+	len: u64,
 	archives: &ArchiveConfig,
 	config: ExtractConfig,
 	task: Task,
 	index: IndexUse,
 ) -> CodecStart<CodecResult> {
-	let job = stream_job(archive, archives, config, task, index);
+	let job = stream_job(name, len, archives, config, task, index);
 	Box::new(move || worker::start(move |port| extract_stream(&port, job)))
 }
 

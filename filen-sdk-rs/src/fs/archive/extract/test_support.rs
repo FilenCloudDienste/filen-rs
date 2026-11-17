@@ -18,6 +18,7 @@ use crate::{
 		drive_job::test_support::{FakeBackend, remote_file},
 		file::{enums::RemoteFileType, traits::HasFileInfo},
 	},
+	fs::{archive::input::DriveFile, drive_job::backend::DriveBackend},
 	job::JobControl,
 	util::MaybeArc,
 };
@@ -171,10 +172,10 @@ pub(super) fn list(setup: &Setup, control: JobControl, config: ArchiveConfig) ->
 		)
 	};
 	let task = ListTask {
-		backend: Arc::clone(&setup.backend),
+		memory: DriveBackend::memory(&*setup.backend),
 		control,
 		reporter: MaybeArc::clone(&reporter),
-		archive: setup.archive.clone(),
+		source: DriveFile::new(Arc::clone(&setup.backend), setup.archive.clone()),
 		config,
 		start: Box::new(move || worker::start(move |port| extract_stream(&port, job))),
 		chunks: None,

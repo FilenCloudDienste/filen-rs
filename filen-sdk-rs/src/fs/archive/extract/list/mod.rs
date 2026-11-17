@@ -3,21 +3,19 @@
 
 use std::{sync::Arc, time::Duration};
 
+use tokio::sync::Semaphore;
+
 use chrono::{DateTime, Utc};
 use filen_macros::js_type;
 
 use crate::{
 	Error,
-	fs::{
-		archive::{
-			config::ArchiveConfig,
-			format::ArchiveFormat,
-			input::{FeedSink, ReadingDriver, ReadingJob, start_reading},
-			retained::Retained,
-			worker::{CodecStart, WorkerEvent, unexpected_event},
-		},
-		drive_job::backend::DriveBackend,
-		file::enums::RemoteFileType,
+	fs::archive::{
+		config::ArchiveConfig,
+		format::ArchiveFormat,
+		input::{ArchiveBytes, FeedSink, ReadingDriver, ReadingJob, start_reading},
+		retained::Retained,
+		worker::{CodecStart, WorkerEvent, unexpected_event},
 	},
 	job::{
 		self, JobControl,
@@ -502,11 +500,12 @@ impl ArchiveEntry {
 }
 
 /// What [`run_list`] needs.
-pub(crate) struct ListTask<B> {
-	pub(crate) backend: Arc<B>,
+pub(crate) struct ListTask {
+	/// The client's file-IO budget.
+	pub(crate) memory: Arc<Semaphore>,
 	pub(crate) control: JobControl,
 	pub(crate) reporter: MaybeArc<ListReporter>,
-	pub(crate) archive: RemoteFileType<'static>,
+	pub(crate) source: Arc<dyn ArchiveBytes>,
 	pub(crate) config: ArchiveConfig,
 	/// Starts the codec; called once the job holds its lease.
 	pub(crate) start: CodecStart<CodecResult>,
@@ -537,20 +536,20 @@ pub(crate) struct Listed {
 
 /// Runs a listing: waits for a job slot, starts the codec, and serves it the archive, collecting
 /// the entries it lists.
-pub(crate) async fn run_list<B: DriveBackend>(task: ListTask<B>) -> Result<Listed, ListFailed> {
+pub(crate) async fn run_list(task: ListTask) -> Result<Listed, ListFailed> {
 	let ListTask {
-		backend,
+		memory,
 		control,
 		reporter,
-		archive,
+		source,
 		config,
 		start,
 		chunks,
 	} = task;
 	let mut listing = ListReport::empty();
 	let started = start_reading(
-		backend,
-		Arc::new(archive),
+		memory,
+		source,
 		ReadingJob {
 			config: &config,
 			control: &control,

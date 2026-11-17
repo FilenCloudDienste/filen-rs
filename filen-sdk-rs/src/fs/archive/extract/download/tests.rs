@@ -41,6 +41,7 @@ use crate::{
 		drive_job::test_support::{Request, wait_until},
 		file::traits::HasFileInfo,
 	},
+	fs::{archive::input::DriveFile, drive_job::backend::DriveBackend},
 	job::test_support::controls,
 };
 
@@ -154,9 +155,9 @@ fn download_with(
 	let recorder = Arc::new(EntryDownloadRecorder::default());
 	let reporter = EntryDownloadReporter::new(Arc::clone(&recorder), setup.archive.size());
 	let mut writer = Writer(Arc::clone(&written));
-	let running = match choose_entry(setup.archive.clone(), entry, &reporter) {
+	let running = match choose_entry(setup.archive.uuid(), entry, &reporter) {
 		Err(failed) => tokio::spawn(async move { Err(failed) }),
-		Ok((archive, selection)) => {
+		Ok(selection) => {
 			let EntryDownloadConfig {
 				expansion_limit,
 				password,
@@ -176,10 +177,10 @@ fn download_with(
 				..stream_job(setup, &options)
 			};
 			let task = DownloadTask {
-				backend: Arc::clone(&setup.backend),
+				memory: DriveBackend::memory(&*setup.backend),
 				control,
 				reporter: MaybeArc::clone(&reporter),
-				archive,
+				source: DriveFile::new(Arc::clone(&setup.backend), setup.archive.clone()),
 				ordinal: u64::from(entry.index),
 				config: test_config(),
 				start: codec(job),

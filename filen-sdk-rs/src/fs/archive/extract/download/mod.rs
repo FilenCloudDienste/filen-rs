@@ -3,21 +3,20 @@
 
 use std::{sync::Arc, time::Duration};
 
+use tokio::sync::Semaphore;
+
 use filen_macros::js_type;
+use filen_types::fs::Uuid;
 use futures::{AsyncWrite, AsyncWriteExt};
 
 use crate::{
 	Error, ErrorKind,
-	fs::{
-		archive::{
-			config::ArchiveConfig,
-			format::ArchiveFormat,
-			input::{FeedSink, ReadingDriver, ReadingJob, start_reading},
-			retained::Retained,
-			worker::{CodecStart, EntryHead, EntryKind, WorkerEvent, unexpected_event},
-		},
-		drive_job::backend::DriveBackend,
-		file::enums::RemoteFileType,
+	fs::archive::{
+		config::ArchiveConfig,
+		format::ArchiveFormat,
+		input::{ArchiveBytes, FeedSink, ReadingDriver, ReadingJob, start_reading},
+		retained::Retained,
+		worker::{CodecStart, EntryHead, EntryKind, WorkerEvent, unexpected_event},
 	},
 	job::{
 		self, JobControl, Stopped,
@@ -27,7 +26,7 @@ use crate::{
 };
 
 use super::{
-	EntrySelection, ExtractSkipReason,
+	ExtractSkipReason,
 	codec::{HeldIndex, Selection},
 	engine::CodecResult,
 	report::{ArchiveEntryId, ReadsArchive, RunState},
@@ -282,32 +281,33 @@ impl EntryDownloadReporter {
 	}
 }
 
-/// `archive` and the selection of its entry `entry` alone; a download of an entry of another
-/// archive is refused before it starts, with its last update.
+/// The selection of entry `entry` alone of the archive `archive`; a download of an entry of
+/// another archive is refused before it starts, with its last update.
 pub(crate) fn choose_entry(
-	archive: RemoteFileType<'static>,
+	archive: Uuid,
 	entry: ArchiveEntryId,
 	reporter: &EntryDownloadReporter,
-) -> Result<(RemoteFileType<'static>, Selection), EntryDownloadFailed> {
-	// the check a partial extraction of the one entry makes
-	match EntrySelection::new(archive, vec![entry], Vec::new()) {
-		Ok(selection) => Ok(selection.into_parts()),
-		Err(error) => {
-			reporter.finish(EntryDownloadPhase::Failed);
-			Err(EntryDownloadFailed {
-				report: EntryDownloadReport::default(),
-				error: Arc::new(error),
-			})
-		}
+) -> Result<Selection, EntryDownloadFailed> {
+	if entry.archive == archive {
+		return Ok(Selection::new([u64::from(entry.index)], Vec::new()));
 	}
+	reporter.finish(EntryDownloadPhase::Failed);
+	Err(EntryDownloadFailed {
+		report: EntryDownloadReport::default(),
+		error: Arc::new(Error::custom(
+			ErrorKind::InvalidState,
+			"an entry chosen to extract is of another archive",
+		)),
+	})
 }
 
 /// What [`run_download`] needs.
-pub(crate) struct DownloadTask<B> {
-	pub(crate) backend: Arc<B>,
+pub(crate) struct DownloadTask {
+	/// The client's file-IO budget.
+	pub(crate) memory: Arc<Semaphore>,
 	pub(crate) control: JobControl,
 	pub(crate) reporter: MaybeArc<EntryDownloadReporter>,
-	pub(crate) archive: RemoteFileType<'static>,
+	pub(crate) source: Arc<dyn ArchiveBytes>,
 	/// The ordinal of the entry chosen.
 	pub(crate) ordinal: u64,
 	pub(crate) config: ArchiveConfig,
@@ -321,26 +321,26 @@ pub(crate) struct DownloadTask<B> {
 /// Runs a download: waits for a job slot, starts the codec, serves it the archive and writes the
 /// entry it sends to `writer`, which is closed once the codec returned having checked it. What
 /// the download did, and the index its codec handed back when asked to.
-pub(crate) async fn run_download<B: DriveBackend, W: AsyncWrite + Unpin + MaybeSend>(
-	task: DownloadTask<B>,
+pub(crate) async fn run_download<W: AsyncWrite + Unpin + MaybeSend>(
+	task: DownloadTask,
 	writer: &mut W,
 ) -> (
 	Result<EntryDownloadReport, EntryDownloadFailed>,
 	Option<Box<HeldIndex>>,
 ) {
 	let DownloadTask {
-		backend,
+		memory,
 		control,
 		reporter,
-		archive,
+		source,
 		ordinal,
 		config,
 		start,
 		chunks,
 	} = task;
 	let started = start_reading(
-		backend,
-		Arc::new(archive),
+		memory,
+		source,
 		ReadingJob {
 			config: &config,
 			control: &control,

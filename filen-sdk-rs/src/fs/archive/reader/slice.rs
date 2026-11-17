@@ -12,23 +12,17 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use crate::{
 	Error, ErrorKind,
 	consts::CHUNK_SIZE_U64,
-	fs::{
-		HasUUID,
-		archive::{
-			extract::{
-				ArchiveEntryId, EntryDownloadError, ExtractSkipReason, codec::HeldIndex,
-				path_refusal,
-			},
-			format::{ArchiveFormat, StreamCodec},
-			input::{PREFETCH_CHUNKS, take_memory, whole_chunk},
-			sevenz::read::{Method, SevenZIndex, SevenZKind},
-			zip::{
-				LOCAL_HEADER_SIG, METHOD_DEFLATE, METHOD_STORED,
-				read::{LOCAL_HEADER_LEN, LOCAL_HEADER_LEN_U64, ZipEncryption, ZipIndex, ZipKind},
-			},
+	fs::archive::{
+		extract::{
+			ArchiveEntryId, EntryDownloadError, ExtractSkipReason, codec::HeldIndex, path_refusal,
 		},
-		drive_job::backend::DriveBackend,
-		file::traits::HasFileInfo,
+		format::{ArchiveFormat, StreamCodec},
+		input::{PREFETCH_CHUNKS, take_memory},
+		sevenz::read::{Method, SevenZIndex, SevenZKind},
+		zip::{
+			LOCAL_HEADER_SIG, METHOD_DEFLATE, METHOD_STORED,
+			read::{LOCAL_HEADER_LEN, LOCAL_HEADER_LEN_U64, ZipEncryption, ZipIndex, ZipKind},
+		},
 	},
 	job::JobControl,
 	util::{MaybeSend, MaybeSendBoxFuture},
@@ -254,7 +248,7 @@ fn sevenz_access(index: &SevenZIndex, ordinal: u64) -> Result<Resolved, Error> {
 /// A chunk of the archive read for a range, and the memory it holds while it is written.
 type RangeChunk = (Arc<Vec<u8>>, Option<OwnedSemaphorePermit>);
 
-impl<B: DriveBackend> Reader<B> {
+impl Reader {
 	/// How `entry`'s bytes can be read: resolved once, then kept with the index.
 	pub(crate) async fn entry_byte_access(
 		&self,
@@ -314,7 +308,7 @@ impl<B: DriveBackend> Reader<B> {
 	/// How `entry` is read, from what the reader keeps, or else from its index.
 	pub(super) async fn resolve(&self, entry: ArchiveEntryId) -> Result<Resolved, Arc<Error>> {
 		self.ensure_open()?;
-		if entry.archive != self.archive.uuid() {
+		if entry.archive != self.source.id() {
 			return Err(Arc::new(not_held()));
 		}
 		let ordinal = u64::from(entry.index);
@@ -382,7 +376,7 @@ impl<B: DriveBackend> Reader<B> {
 							stream: SeekStream {
 								key: StreamKey::Gzip,
 								start: 0,
-								len: self.archive.size(),
+								len: self.source.len(),
 								codec: SeekCodec::Deflate,
 								framing: Framing::Gzip,
 								cipher: CipherSpec::None,
@@ -443,7 +437,7 @@ impl<B: DriveBackend> Reader<B> {
 		let corrupt = |what| Arc::new(Error::custom(ErrorKind::ArchiveCorrupt, what));
 		let end = header
 			.checked_add(LOCAL_HEADER_LEN_U64)
-			.filter(|&end| end <= self.archive.size())
+			.filter(|&end| end <= self.source.len())
 			.ok_or_else(|| corrupt("an entry's local header runs past the end of the zip"))?;
 		let mut bytes = futures::io::Cursor::new(Vec::with_capacity(LOCAL_HEADER_LEN));
 		self.read_archive(header, end, &mut bytes).await?;
@@ -476,7 +470,7 @@ impl<B: DriveBackend> Reader<B> {
 		let (first, last) = (from / CHUNK_SIZE_U64, (to - 1) / CHUNK_SIZE_U64);
 		// the call's floor of one chunk, outside the client's budget, as a job has
 		let slot = Arc::new(Semaphore::new(1));
-		let memory = self.backend.memory();
+		let memory = Arc::clone(&self.memory);
 		let mut pending: FuturesOrdered<MaybeSendBoxFuture<'_, Result<RangeChunk, Arc<Error>>>> =
 			FuturesOrdered::new();
 		let mut next = first;
@@ -527,8 +521,7 @@ impl<B: DriveBackend> Reader<B> {
 			{
 				return Ok((chunk, None));
 			}
-			let data = self.backend.fetch_chunk(&self.archive, index).await?;
-			let chunk = Arc::new(whole_chunk(&self.archive, index, data)?);
+			let chunk = Arc::new(self.source.chunk(index).await?);
 			if let Some(retained) = &self.retained {
 				retained.keep_chunk(index, Arc::clone(&chunk));
 			}

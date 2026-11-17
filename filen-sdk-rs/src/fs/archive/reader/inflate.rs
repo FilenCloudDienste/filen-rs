@@ -26,12 +26,9 @@ use miniz_oxide::inflate::{
 use crate::{
 	Error, ErrorKind,
 	consts::CHUNK_SIZE_U64,
-	fs::{
-		archive::zip::crypto::{
-			AES_AUTH_CODE_LEN_U64, AES_VERIFIER_LEN, AesStream, AesStrength, ZIP_CRYPTO_HEADER_LEN,
-			ZIP_CRYPTO_HEADER_LEN_U64, ZipCryptoState,
-		},
-		drive_job::backend::DriveBackend,
+	fs::archive::zip::crypto::{
+		AES_AUTH_CODE_LEN_U64, AES_VERIFIER_LEN, AesStream, AesStrength, ZIP_CRYPTO_HEADER_LEN,
+		ZIP_CRYPTO_HEADER_LEN_U64, ZipCryptoState,
 	},
 	runtime::do_cpu_intensive,
 	util::MaybeSend,
@@ -503,7 +500,7 @@ fn gzip_header(bytes: &[u8]) -> Result<Option<usize>, Error> {
 	Ok((at <= bytes.len()).then_some(at))
 }
 
-impl<B: DriveBackend> Reader<B> {
+impl Reader {
 	/// Writes output `want` of `stream` to `writer`, then closes it.
 	pub(crate) async fn read_seekable<W: AsyncWrite + Unpin + MaybeSend>(
 		&self,

@@ -8,6 +8,7 @@ use futures::AsyncWrite;
 use crate::{
 	auth::Client,
 	fs::{
+		HasName,
 		archive::{ArchivePassword, reader::Reader},
 		drive_job::backend::ClientBackend,
 		file::{enums::RemoteFileType, traits::HasFileInfo},
@@ -241,7 +242,8 @@ impl Client {
 		let (max_bytes, max_items, expansion) =
 			(config.max_bytes, config.max_items, config.expansion_limit);
 		let start = start_codec(
-			&archive,
+			archive.name().unwrap_or_default(),
+			archive.size(),
 			&archives,
 			config,
 			Task::Extract(selection),

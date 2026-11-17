@@ -78,7 +78,7 @@ fn reader_of(
 	archive: &RemoteFileType<'static>,
 	config: &ArchiveConfig,
 	password: Option<&str>,
-) -> Reader<FakeBackend> {
+) -> Reader {
 	Reader::new(
 		Arc::clone(backend),
 		archive.clone(),
@@ -105,10 +105,7 @@ fn entry(index: u32) -> ArchiveEntryId {
 	}
 }
 
-async fn download(
-	reader: &Reader<FakeBackend>,
-	index: u32,
-) -> Result<Vec<u8>, EntryDownloadFailed> {
+async fn download(reader: &Reader, index: u32) -> Result<Vec<u8>, EntryDownloadFailed> {
 	let mut written = futures::io::Cursor::new(Vec::new());
 	reader
 		.download_entry(
@@ -342,23 +339,14 @@ fn zip_with(files: &[(&str, &[u8], ZipMethod, Option<&str>)]) -> Vec<u8> {
 	writer.finish().unwrap()
 }
 
-async fn opened(
-	name: &str,
-	bytes: Vec<u8>,
-	password: Option<&str>,
-) -> (Arc<FakeBackend>, Reader<FakeBackend>) {
+async fn opened(name: &str, bytes: Vec<u8>, password: Option<&str>) -> (Arc<FakeBackend>, Reader) {
 	let (backend, archive, config) = drive(name, bytes, 64 << 20);
 	let reader = reader_of(&backend, &archive, &config, password);
 	reader.open(Ignore, JobControl::default()).await.unwrap();
 	(backend, reader)
 }
 
-async fn range(
-	reader: &Reader<FakeBackend>,
-	index: u32,
-	start: u64,
-	end: u64,
-) -> Result<Vec<u8>, Arc<Error>> {
+async fn range(reader: &Reader, index: u32, start: u64, end: u64) -> Result<Vec<u8>, Arc<Error>> {
 	let mut written = futures::io::Cursor::new(Vec::new());
 	reader
 		.read_entry_range(entry(index), start, end, &mut written)
@@ -598,7 +586,7 @@ impl AsyncWrite for Recording {
 }
 
 async fn read_entries(
-	reader: &Reader<FakeBackend>,
+	reader: &Reader,
 	indexes: &[u32],
 	max_solid_skip: Option<u64>,
 ) -> (
@@ -765,7 +753,7 @@ fn ranges(len: u64, seed: u64) -> Vec<(u64, u64)> {
 	ranges
 }
 
-async fn check_ranges(reader: &Reader<FakeBackend>, index: u32, data: &[u8], seed: u64) {
+async fn check_ranges(reader: &Reader, index: u32, data: &[u8], seed: u64) {
 	assert_eq!(
 		reader.entry_byte_access(entry(index)).await.unwrap(),
 		EntryByteAccess::Seekable {

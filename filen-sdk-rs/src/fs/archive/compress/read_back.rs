@@ -29,7 +29,7 @@ use crate::{
 			config::ArchiveConfig,
 			extract::codec::{ArchiveEnd, CodecLimits, IndexUse, StreamJob, Task, extract_stream},
 			format::ArchiveFormat,
-			input::{CodecFeed, Fed},
+			input::{CodecFeed, DriveFile, Fed},
 			worker::{self, EntryHead, EntryKind, WorkerEvent, WorkerLink, worker_died},
 		},
 		drive_job::backend::DriveBackend,
@@ -247,11 +247,11 @@ async fn read<B: DriveBackend>(
 	link: WorkerLink<ReadBackResult>,
 	mut check: Check,
 ) -> Result<Result<(), Unread>, Stopped> {
-	let file = Arc::new(RemoteFileType::from(archive.clone()));
-	let mut feed = CodecFeed::new(Arc::clone(backend), file, link, reporter.op(), None);
+	let file = DriveFile::new(Arc::clone(backend), RemoteFileType::from(archive.clone()));
+	let mut feed = CodecFeed::new(backend.memory(), file, link, reporter.op(), None);
 	// what the reader read so far, each chunk counted once however often it asks for it
 	let mut verified = 0;
-	let mut report_verified = |feed: &CodecFeed<B, ArchiveEnd>| {
+	let mut report_verified = |feed: &CodecFeed<ArchiveEnd>| {
 		let read = feed.bytes_read();
 		reporter.archive_verified(read - verified);
 		verified = read;

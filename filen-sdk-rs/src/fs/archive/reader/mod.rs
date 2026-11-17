@@ -16,12 +16,13 @@ use std::sync::{
 
 use filen_types::fs::Uuid;
 use futures::AsyncWrite;
+use tokio::sync::Semaphore;
 
 use crate::{
 	Error, ErrorKind,
 	auth::Client,
 	fs::{
-		HasUUID,
+		HasName,
 		archive::{
 			config::ArchiveConfig,
 			extract::{
@@ -32,10 +33,11 @@ use crate::{
 				reading::{ReadJob, download, list, open},
 			},
 			format::ArchiveFormat,
+			input::{ArchiveBytes, DriveFile},
 			retained::Retained,
 		},
 		drive_job::backend::{ClientBackend, DriveBackend},
-		file::{enums::RemoteFileType, traits::HasFileInfo},
+		file::enums::RemoteFileType,
 	},
 	job::{JobControl, report::JobFailed},
 	util::{MaybeSend, SeededMap},
@@ -64,7 +66,7 @@ impl Default for ReaderDownloadEntryConfig {
 
 /// An open archive: see [`Client::open_archive_reader`].
 pub struct ArchiveReader {
-	reader: Reader<ClientBackend>,
+	reader: Reader,
 }
 
 impl Client {
@@ -107,7 +109,7 @@ impl ArchiveReader {
 	/// The id of its archive, which the [`ArchiveEntryId`]s of its entries carry: the file's
 	/// uuid, so the ids [`Client::list_archive`] gives are this reader's too.
 	pub fn archive_id(&self) -> Uuid {
-		self.reader.archive.uuid()
+		self.reader.source.id()
 	}
 
 	/// What the archive is; `None` only if opening could not tell, which fails the open.
@@ -252,9 +254,13 @@ impl ListCallback for Unreported {
 }
 
 /// What a reader holds and how it reads, over any drive backend.
-pub(crate) struct Reader<B> {
-	backend: Arc<B>,
-	archive: RemoteFileType<'static>,
+pub(crate) struct Reader {
+	/// The client's file-IO budget, which chunks in flight are drawn from.
+	memory: Arc<Semaphore>,
+	/// The archive's bytes.
+	source: Arc<dyn ArchiveBytes>,
+	/// Its name, which tells some formats.
+	name: String,
 	id: Uuid,
 	config: ArchiveConfig,
 	settings: ListConfig,
@@ -266,9 +272,10 @@ pub(crate) struct Reader<B> {
 	closed: AtomicBool,
 }
 
-impl<B: DriveBackend> Reader<B> {
-	/// A reader of `archive`, under the client's `config` and the reader's `settings`.
-	pub(crate) fn new(
+impl Reader {
+	/// A reader of `archive` in the drive, under the client's `config` and the reader's
+	/// `settings`.
+	pub(crate) fn new<B: DriveBackend>(
 		backend: Arc<B>,
 		archive: RemoteFileType<'static>,
 		config: ArchiveConfig,
@@ -283,15 +290,16 @@ impl<B: DriveBackend> Reader<B> {
 
 	/// A reader for one call, which keeps nothing: what [`Client::list_archive`] and
 	/// [`Client::download_archive_entry`] read through.
-	pub(crate) fn once(
+	pub(crate) fn once<B: DriveBackend>(
 		backend: Arc<B>,
 		archive: RemoteFileType<'static>,
 		config: ArchiveConfig,
 		settings: ListConfig,
 	) -> Self {
 		Self {
-			backend,
-			archive,
+			memory: backend.memory(),
+			name: archive.name().unwrap_or_default().to_owned(),
+			source: DriveFile::new(backend, archive),
 			id: Uuid::new_v4(),
 			config,
 			settings,
@@ -335,7 +343,7 @@ impl<B: DriveBackend> Reader<B> {
 	}
 
 	pub(crate) fn archive_uuid(&self) -> Uuid {
-		self.archive.uuid()
+		self.source.id()
 	}
 
 	/// The error of a call on a closed reader.
@@ -414,7 +422,7 @@ impl<B: DriveBackend> Reader<B> {
 		}
 		// a reader that keeps what it reads lists a bare tar by seeking past its members' data;
 		// one for a single call reads it whole, as a listing always did, its hash checked
-		let archive = self.archive.uuid();
+		let archive = self.source.id();
 		let task = match self.retained {
 			Some(_) => Task::ListSeeking { archive },
 			None => Task::List { archive },
@@ -470,7 +478,7 @@ impl<B: DriveBackend> Reader<B> {
 	where
 		W: AsyncWrite + Unpin + MaybeSend,
 	{
-		let reporter = EntryDownloadReporter::new(callback, self.archive.size());
+		let reporter = EntryDownloadReporter::new(callback, self.source.len());
 		reporter.set_phase(EntryDownloadPhase::Reading);
 		let read = match self.resolve(entry).await {
 			Ok(Resolved::Mapped { size, .. }) => {
@@ -505,10 +513,11 @@ impl<B: DriveBackend> Reader<B> {
 	}
 
 	/// What a job of this reader reads, and how.
-	pub(crate) fn read_job(&self, control: JobControl) -> ReadJob<B> {
+	pub(crate) fn read_job(&self, control: JobControl) -> ReadJob {
 		ReadJob {
-			backend: Arc::clone(&self.backend),
-			archive: self.archive.clone(),
+			memory: Arc::clone(&self.memory),
+			source: Arc::clone(&self.source),
+			name: self.name.clone(),
 			config: self.config.clone(),
 			settings: self.settings.clone(),
 			index: self.index_use(),

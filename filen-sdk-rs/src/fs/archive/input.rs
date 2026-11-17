@@ -6,7 +6,7 @@
 
 use std::{collections::VecDeque, sync::Arc};
 
-use filen_types::crypto::Blake3Hash;
+use filen_types::{crypto::Blake3Hash, fs::Uuid};
 use futures::{StreamExt, stream::FuturesOrdered};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 
@@ -33,7 +33,7 @@ use crate::{
 		JobControl, Stopped,
 		report::{JobPhase, JobState, OpGuard, Ops, Reporter},
 	},
-	util::{MaybeArc, MaybeSend, MaybeSendBoxFuture, sleep},
+	util::{MaybeArc, MaybeSend, MaybeSendBoxFuture, MaybeSendSync, sleep},
 };
 
 /// Chunks fetched ahead of a codec, memory permitting: of the archive it reads, or of the
@@ -93,9 +93,63 @@ pub(crate) fn whole_chunk(
 	))
 }
 
-struct ArchiveInput<B> {
+/// What a reading codec reads: the plaintext of a file in the drive, or of an entry of an
+/// archive another reader opened.
+pub(crate) trait ArchiveBytes: MaybeSendSync + 'static {
+	/// Its length in bytes.
+	fn len(&self) -> u64;
+	/// What it is known by: a drive file's uuid, a nested archive's derived id.
+	fn id(&self) -> Uuid;
+	/// The BLAKE3 hash its metadata declares, which a whole read is checked against.
+	fn hash(&self) -> Option<Blake3Hash>;
+	/// Whether its chunks can be read as it states them; checked before a job starts.
+	fn check(&self) -> Result<(), Error> {
+		Ok(())
+	}
+	/// Plaintext chunk `index`, of [`CHUNK_SIZE`](crate::consts::CHUNK_SIZE) bytes but for the
+	/// last one, checked to be whole.
+	fn chunk(&self, index: u64) -> MaybeSendBoxFuture<'_, Result<Vec<u8>, Error>>;
+}
+
+/// A file in the drive, read through `backend`.
+pub(crate) struct DriveFile<B> {
 	backend: Arc<B>,
-	archive: Arc<RemoteFileType<'static>>,
+	file: RemoteFileType<'static>,
+}
+
+impl<B: DriveBackend> DriveFile<B> {
+	pub(crate) fn new(backend: Arc<B>, file: RemoteFileType<'static>) -> Arc<Self> {
+		Arc::new(Self { backend, file })
+	}
+}
+
+impl<B: DriveBackend> ArchiveBytes for DriveFile<B> {
+	fn len(&self) -> u64 {
+		self.file.size()
+	}
+
+	fn id(&self) -> Uuid {
+		self.file.uuid()
+	}
+
+	fn hash(&self) -> Option<Blake3Hash> {
+		self.file.hash()
+	}
+
+	fn check(&self) -> Result<(), Error> {
+		check_chunks_consistent(self.file.chunks(), self.file.size())
+	}
+
+	fn chunk(&self, index: u64) -> MaybeSendBoxFuture<'_, Result<Vec<u8>, Error>> {
+		Box::pin(async move {
+			let data = self.backend.fetch_chunk(&self.file, index).await?;
+			whole_chunk(&self.file, index, data)
+		})
+	}
+}
+
+struct ArchiveInput {
+	source: Arc<dyn ArchiveBytes>,
 	chunks: u64,
 	next_fetch: u64,
 	fetches: FuturesOrdered<MaybeSendBoxFuture<'static, FetchedChunk>>,
@@ -123,17 +177,16 @@ struct ArchiveInput<B> {
 	kept: Option<Arc<Retained>>,
 }
 
-impl<B: DriveBackend> ArchiveInput<B> {
+impl ArchiveInput {
 	fn new(
-		backend: Arc<B>,
-		archive: Arc<RemoteFileType<'static>>,
+		memory: Arc<Semaphore>,
+		source: Arc<dyn ArchiveBytes>,
 		kept: Option<Arc<Retained>>,
 	) -> Self {
 		Self {
-			chunks: archive.size().div_ceil(CHUNK_SIZE_U64),
-			memory: backend.memory(),
-			backend,
-			archive,
+			chunks: source.len().div_ceil(CHUNK_SIZE_U64),
+			memory,
+			source,
 			next_fetch: 0,
 			fetches: FuturesOrdered::new(),
 			ready: VecDeque::new(),
@@ -148,8 +201,8 @@ impl<B: DriveBackend> ArchiveInput<B> {
 		}
 	}
 
-	fn archive(&self) -> &Arc<RemoteFileType<'static>> {
-		&self.archive
+	fn source(&self) -> &Arc<dyn ArchiveBytes> {
+		&self.source
 	}
 
 	/// The codec asks for chunk `index`, which means it is done with the one before; answered
@@ -218,11 +271,10 @@ impl<B: DriveBackend> ArchiveInput<B> {
 			};
 			let index = self.next_fetch;
 			self.next_fetch += 1;
-			let backend = Arc::clone(&self.backend);
-			let archive = Arc::clone(&self.archive);
+			let source = Arc::clone(&self.source);
 			let op = ops.op();
 			self.fetches.push_back(Box::pin(async move {
-				let result = backend.fetch_chunk(&archive, index).await;
+				let result = source.chunk(index).await;
 				(index, result, permit, op)
 			}) as MaybeSendBoxFuture<'static, _>);
 		}
@@ -230,8 +282,7 @@ impl<B: DriveBackend> ArchiveInput<B> {
 
 	/// Takes in a fetched chunk; the error that ends the job when it failed or came back short.
 	fn fetch_finished(&mut self, (index, result, permit, _op): FetchedChunk) -> Result<(), Error> {
-		let data = whole_chunk(&self.archive, index, result?)?;
-		self.ready.push_back((index, data, permit));
+		self.ready.push_back((index, result?, permit));
 		self.serve_ask();
 		Ok(())
 	}
@@ -304,8 +355,8 @@ impl<B: DriveBackend> ArchiveInput<B> {
 /// A reading codec and the archive it reads, as the drivers of an extraction, a listing and a
 /// compression's read-back all serve it: its asks answered from the archive, its events and its
 /// result taken, and the codec given up on once it stops moving.
-pub(crate) struct CodecFeed<B, T> {
-	input: ArchiveInput<B>,
+pub(crate) struct CodecFeed<T> {
+	input: ArchiveInput,
 	link: WorkerLink<Result<T, Error>>,
 	/// Counts the feed as an operation in flight while the codec reads, so the job is only
 	/// reported paused once the feed gave back everything it held on top of the codec's chunk.
@@ -339,18 +390,19 @@ pub(crate) enum Fed<T> {
 	Finished(Result<T, Error>),
 }
 
-impl<B: DriveBackend, T> CodecFeed<B, T> {
-	/// A feed of `archive` to the codec at the other end of `link`, counted as `running`, the
-	/// chunks it reads kept in `chunks` when it is a reader's job.
+impl<T> CodecFeed<T> {
+	/// A feed of `source` to the codec at the other end of `link`, counted as `running`, the
+	/// chunks it reads kept in `chunks` when it is a reader's job; what goes beyond the job's
+	/// floor of one chunk draws on the client's `memory`.
 	pub(crate) fn new(
-		backend: Arc<B>,
-		archive: Arc<RemoteFileType<'static>>,
+		memory: Arc<Semaphore>,
+		source: Arc<dyn ArchiveBytes>,
 		link: WorkerLink<Result<T, Error>>,
 		running: OpGuard,
 		chunks: Option<Arc<Retained>>,
 	) -> Self {
 		Self {
-			input: ArchiveInput::new(backend, archive, chunks),
+			input: ArchiveInput::new(memory, source, chunks),
 			link,
 			running: Some(running),
 			stall: StallWatch::default(),
@@ -408,8 +460,8 @@ impl<B: DriveBackend, T> CodecFeed<B, T> {
 		self.input.owes_codec()
 	}
 
-	pub(crate) fn archive(&self) -> &Arc<RemoteFileType<'static>> {
-		self.input.archive()
+	pub(crate) fn source(&self) -> &Arc<dyn ArchiveBytes> {
+		self.input.source()
 	}
 
 	pub(crate) fn events_closed(&self) -> bool {
@@ -430,9 +482,9 @@ impl<B: DriveBackend, T> CodecFeed<B, T> {
 	/// what it read is not what the archive's metadata declares. `None` when it matches, or
 	/// cannot be checked: read only in part or out of order, or with no hash in its metadata.
 	pub(crate) fn hash_mismatch(&self) -> Option<ContentHashMismatchError> {
-		let archive = self.archive();
-		let (expected, actual) = (archive.hash()?, self.read_whole()?);
-		ContentHashMismatchError::check(archive.uuid(), expected, actual).err()
+		let source = self.source();
+		let (expected, actual) = (source.hash()?, self.read_whole()?);
+		ContentHashMismatchError::check(source.id(), expected, actual).err()
 	}
 
 	/// Drops every fetch and what was fetched, and the codec's ask: the job is stopping.
@@ -465,7 +517,7 @@ impl<B: DriveBackend, T> CodecFeed<B, T> {
 	/// chunk it waits on counts as owed, and so does anything once it returned).
 	pub(crate) fn give_up_if_stalled(&mut self, owed: bool) -> bool {
 		let owed = owed || self.input.owes_codec() || self.stage == Stage::Done;
-		let archive = self.input.archive().uuid();
+		let archive = self.input.source().id();
 		if !self.stall.give_up_if_stalled(&self.link, owed, archive) {
 			return false;
 		}
@@ -491,12 +543,12 @@ pub(crate) struct ReadingJob<'a, S: JobState> {
 /// (holding nothing meanwhile, see [`ArchiveConfig::admit`]), enters the job's `reading` phase
 /// and starts the codec. The slot, held until dropped, and the codec's feed; `Err` with the
 /// phase the job ends in and why.
-pub(crate) async fn start_reading<B: DriveBackend, S: JobState, T>(
-	backend: Arc<B>,
-	archive: Arc<RemoteFileType<'static>>,
+pub(crate) async fn start_reading<S: JobState, T>(
+	memory: Arc<Semaphore>,
+	source: Arc<dyn ArchiveBytes>,
 	job: ReadingJob<'_, S>,
 	start: impl FnOnce() -> Result<WorkerLink<Result<T, Error>>, Error>,
-) -> Result<(OwnedSemaphorePermit, CodecFeed<B, T>), (S::Phase, Arc<Error>)> {
+) -> Result<(OwnedSemaphorePermit, CodecFeed<T>), (S::Phase, Arc<Error>)> {
 	let ReadingJob {
 		config,
 		control,
@@ -505,7 +557,7 @@ pub(crate) async fn start_reading<B: DriveBackend, S: JobState, T>(
 		name,
 		chunks,
 	} = job;
-	if let Err(error) = check_chunks_consistent(archive.chunks(), archive.size()) {
+	if let Err(error) = source.check() {
 		return Err((S::Phase::FAILED, Arc::new(error)));
 	}
 	// leased before the codec starts, so a waiting job holds nothing
@@ -517,7 +569,7 @@ pub(crate) async fn start_reading<B: DriveBackend, S: JobState, T>(
 	let link = start().map_err(|error| (S::Phase::FAILED, Arc::new(error)))?;
 	Ok((
 		lease,
-		CodecFeed::new(backend, archive, link, reporter.op(), chunks),
+		CodecFeed::new(memory, source, link, reporter.op(), chunks),
 	))
 }
 
@@ -529,8 +581,8 @@ pub(crate) trait FeedSink {
 
 /// The driver of a job that only reads its archive (a listing, an entry's download): it creates
 /// nothing in the drive.
-pub(crate) struct ReadingDriver<'j, B, S: JobState, T> {
-	feed: CodecFeed<B, T>,
+pub(crate) struct ReadingDriver<'j, S: JobState, T> {
+	feed: CodecFeed<T>,
 	control: &'j JobControl,
 	reporter: &'j MaybeArc<Reporter<S>>,
 	/// How the archive ended, once the codec returned it.
@@ -538,9 +590,9 @@ pub(crate) struct ReadingDriver<'j, B, S: JobState, T> {
 	pub(crate) fatal: Fatal,
 }
 
-impl<'j, B: DriveBackend, S: ReadsArchive, T> ReadingDriver<'j, B, S, T> {
+impl<'j, S: ReadsArchive, T> ReadingDriver<'j, S, T> {
 	pub(crate) fn new(
-		feed: CodecFeed<B, T>,
+		feed: CodecFeed<T>,
 		control: &'j JobControl,
 		reporter: &'j MaybeArc<Reporter<S>>,
 	) -> Self {
@@ -617,7 +669,7 @@ impl<'j, B: DriveBackend, S: ReadsArchive, T> ReadingDriver<'j, B, S, T> {
 			}
 			Err(error) => {
 				// an error the driver caused (it failed a fetch) is already the job's
-				let archive = self.feed.archive().uuid();
+				let archive = self.feed.source().id();
 				if codec_failed(archive, &error, self.fatal.error().is_some()) {
 					// an archive read whole that does not match its hash fails as such, whatever
 					// its codec made of the data that is not the file's
@@ -676,7 +728,7 @@ mod tests {
 
 	/// Answers the codec asking for chunk `index`, then lets `input` fetch ahead; the chunk it
 	/// fetches next.
-	async fn read(input: &mut ArchiveInput<FakeBackend>, ops: &Ops, index: u64) -> u64 {
+	async fn read(input: &mut ArchiveInput, ops: &Ops, index: u64) -> u64 {
 		let (reply, answer) = oneshot::channel();
 		input.ask(index, reply);
 		while input.owes_codec() {
@@ -704,7 +756,9 @@ mod tests {
 		);
 		let mut backend = FakeBackend::new(Uuid::from_u128(3)).with_memory(8);
 		backend.contents.insert(archive.uuid(), bytes);
-		let mut input = ArchiveInput::new(Arc::new(backend), Arc::new(archive), None);
+		let memory = backend.memory();
+		let source = DriveFile::new(Arc::new(backend), archive);
+		let mut input = ArchiveInput::new(memory, source, None);
 		let reporter = ExtractReporter::new(Ignore, 0);
 		let ops = reporter.ops();
 		// a zip's head, then its index at the end: nothing fetched ahead of either
