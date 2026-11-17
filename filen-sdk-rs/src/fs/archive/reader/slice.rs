@@ -327,6 +327,48 @@ impl Reader {
 		writer: &mut W,
 		control: &JobControl,
 	) -> Result<(), Arc<Error>> {
+		let read = async {
+			let resolved = self.resolve(entry, control).await?;
+			self.write_resolved(resolved, entry, start, end, writer)
+				.await
+		};
+		control
+			.until_stopping(read)
+			.await
+			.unwrap_or_else(|Stopped| Err(cancelled(RANGE_READ)))
+	}
+
+	/// [`Self::read_entry_range`] of an entry resolved before: its index is not needed again.
+	pub(crate) async fn read_resolved<W: AsyncWrite + Unpin + MaybeSend>(
+		&self,
+		resolved: Resolved,
+		entry: ArchiveEntryId,
+		start: u64,
+		end: u64,
+		writer: &mut W,
+		control: &JobControl,
+	) -> Result<(), Arc<Error>> {
+		self.ensure_open()?;
+		let read = async {
+			self.write_resolved(resolved, entry, start, end, writer)
+				.await?;
+			writer.close().await.map_err(|error| Arc::new(error.into()))
+		};
+		control
+			.until_stopping(read)
+			.await
+			.unwrap_or_else(|Stopped| Err(cancelled(RANGE_READ)))
+	}
+
+	/// Writes bytes `start..end` of `entry`, which reads as `resolved`, to `writer`.
+	async fn write_resolved<W: AsyncWrite + Unpin + MaybeSend>(
+		&self,
+		resolved: Resolved,
+		entry: ArchiveEntryId,
+		start: u64,
+		end: u64,
+		writer: &mut W,
+	) -> Result<(), Arc<Error>> {
 		let within = |size: u64| {
 			if start > end || end > size {
 				return Err(Arc::new(Error::custom(
@@ -336,47 +378,39 @@ impl Reader {
 			}
 			Ok(())
 		};
-		let read = async {
-			match self.resolve(entry, control).await? {
-				Resolved::Mapped { offset, size } => {
-					within(size)?;
-					self.read_archive(offset + start, offset + end, writer)
-						.await
-				}
-				Resolved::Seekable {
-					stream,
-					offset,
-					size,
-				} => {
-					within(size)?;
-					// what the entry decodes to is held to the expansion limit, as an archive
-					// nested in it is
-					let base = self.expansion_base.unwrap_or(self.source.len());
-					if let Some(limit) = self.settings.expansion_limit
-						&& !limit.allows(base, size)
-					{
-						return Err(Arc::new(expansion_exceeded(limit)));
-					}
-					self.read_seekable(
-						stream,
-						u64::from(entry.index),
-						offset + start..offset + end,
-						writer,
-					)
+		match resolved {
+			Resolved::Mapped { offset, size } => {
+				within(size)?;
+				self.read_archive(offset + start, offset + end, writer)
 					.await
-				}
-				Resolved::Whole { .. } | Resolved::Sequential { .. } => {
-					Err(Arc::new(Error::custom(
-						ErrorKind::InvalidState,
-						"the entry is only read whole, or front to back",
-					)))
-				}
 			}
-		};
-		control
-			.until_stopping(read)
-			.await
-			.unwrap_or_else(|Stopped| Err(cancelled(RANGE_READ)))
+			Resolved::Seekable {
+				stream,
+				offset,
+				size,
+			} => {
+				within(size)?;
+				// what the entry decodes to is held to the expansion limit, as an archive nested
+				// in it is
+				let base = self.expansion_base.unwrap_or(self.source.len());
+				if let Some(limit) = self.settings.expansion_limit
+					&& !limit.allows(base, size)
+				{
+					return Err(Arc::new(expansion_exceeded(limit)));
+				}
+				self.read_seekable(
+					stream,
+					u64::from(entry.index),
+					offset + start..offset + end,
+					writer,
+				)
+				.await
+			}
+			Resolved::Whole { .. } | Resolved::Sequential { .. } => Err(Arc::new(Error::custom(
+				ErrorKind::InvalidState,
+				"the entry is only read whole, or front to back",
+			))),
+		}
 	}
 
 	/// How `entry` is read, from what the reader keeps, or else from its index: read again, or a

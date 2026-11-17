@@ -7,7 +7,7 @@
 use std::{collections::VecDeque, sync::Arc, time::Duration};
 
 use filen_types::{crypto::Blake3Hash, fs::Uuid};
-use futures::{StreamExt, stream::FuturesOrdered};
+use futures::{AsyncWrite, AsyncWriteExt, StreamExt, stream::FuturesOrdered};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 
 use crate::{
@@ -37,13 +37,35 @@ use crate::{
 	util::{MaybeArc, MaybeSend, MaybeSendBoxFuture, sleep},
 };
 
-/// Longest a job that only reads its archive waits on where its entries go (a write, a close, or
-/// the writer asked for) before it fails and gives back its job slot: a stream nobody drains
-/// never keeps every other archive job waiting on the slot (the one of a whole page, on the web).
+/// Longest a job that only reads its archive waits on where its entries go before it fails and
+/// gives back its job slot: since the writer last took a byte, or for a close or a writer asked
+/// for. A stream nobody drains never keeps every other archive job waiting on the slot (the one
+/// of a whole page, on the web); one that drains, however slowly, is waited for.
 #[cfg(not(test))]
 pub(crate) const SINK_STALL_TIMEOUT: Duration = super::worker::ARCHIVE_STALL_TIMEOUT;
 #[cfg(test)]
 pub(crate) const SINK_STALL_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Most of an entry's data handed to its writer at once, so taking any of it counts as progress.
+const PROGRESS_SLICE: usize = 64 << 10;
+
+/// Writes `data` to `writer`, failed once the writer took nothing for [`SINK_STALL_TIMEOUT`]:
+/// the wait starts again with every slice of it the writer takes.
+pub(crate) async fn write_unstalled<W: AsyncWrite + Unpin>(
+	writer: &mut W,
+	data: &[u8],
+) -> Result<(), Error> {
+	let mut at = 0;
+	while at < data.len() {
+		let slice = &data[at..data.len().min(at + PROGRESS_SLICE)];
+		let taken = unstalled(writer.write(slice)).await??;
+		if taken == 0 {
+			return Err(std::io::Error::from(std::io::ErrorKind::WriteZero).into());
+		}
+		at += taken;
+	}
+	Ok(())
+}
 
 /// `work` on where a job's entries go, failed once it made no progress for
 /// [`SINK_STALL_TIMEOUT`].

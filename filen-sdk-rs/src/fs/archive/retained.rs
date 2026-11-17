@@ -440,29 +440,42 @@ impl Retained {
 		self.index_held.load(Ordering::Acquire)
 	}
 
-	/// Gives up everything, and keeps nothing more: the reader closed. Never waits on the
-	/// state's lock: when a call holds it, a task gives everything up once the call let go.
+	/// Gives up everything, and keeps nothing more: the reader closed. On the web it never waits
+	/// on the state's lock, which a JS thread must not: when a call holds it, a task on that
+	/// thread gives everything up once the call let go. Elsewhere it waits the moment a call
+	/// holds the lock, from whatever thread it is called on, runtime or not.
 	pub(crate) fn close(self: &Arc<Self>) {
 		if self.closed.swap(true, Ordering::AcqRel) {
 			return;
 		}
 		self.index_held.store(false, Ordering::Release);
-		if self.release_all() {
-			return;
+		#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+		if !self.release_all(false) {
+			let retained = Arc::clone(self);
+			drop(spawn_task_maybe_send(async move {
+				while !retained.release_all(false) {
+					sleep(Duration::from_millis(1)).await;
+				}
+			}));
 		}
-		let retained = Arc::clone(self);
-		drop(spawn_task_maybe_send(async move {
-			while !retained.release_all() {
-				sleep(Duration::from_millis(1)).await;
-			}
-		}));
+		#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+		self.release_all(true);
 	}
 
-	/// Gives up everything it holds, when the state's lock is free; whether it was.
-	fn release_all(&self) -> bool {
-		let Ok(mut state) = self.state.try_lock() else {
-			return false;
+	/// Gives up everything it holds, waiting for the state's lock when `wait`, else only when it
+	/// is free; whether it did.
+	fn release_all(&self, wait: bool) -> bool {
+		let mut state = if wait {
+			lock(&self.state)
+		} else {
+			match self.state.try_lock() {
+				Ok(state) => state,
+				Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+				Err(std::sync::TryLockError::WouldBlock) => return false,
+			}
 		};
+		// a hold that raced the close may have set it again
+		self.index_held.store(false, Ordering::Release);
 		let freed = state.bytes();
 		let kept = std::mem::take(&mut *state);
 		drop(state);
@@ -494,6 +507,11 @@ pub(crate) mod test_support {
 	}
 
 	impl Retained {
+		/// What it holds kept, as its state charges it.
+		pub(crate) fn held_for_test(&self) -> u64 {
+			super::lock(&self.state).bytes()
+		}
+
 		/// Gives up the index, as when another reader needed the room.
 		pub(crate) fn evict_index_for_test(&self) {
 			let freed = self.evict(Tier::Index);
@@ -614,22 +632,38 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn closing_never_waits_on_a_call_holding_the_state() {
+	async fn closing_waits_out_a_call_holding_the_state_off_any_runtime() {
 		let pool = Arc::new(RetainedPool::default());
 		let retained = Retained::new(Arc::clone(&pool), 5000);
 		retained.keep_chunk(0, chunk(1000));
-		let held = lock(&retained.state);
-		retained.close();
+		// a call on another thread holds the state a moment; this thread has no runtime
+		let (held, release) = std::sync::mpsc::channel::<()>();
+		let holder = {
+			let retained = Arc::clone(&retained);
+			let (locked, wait) = std::sync::mpsc::channel();
+			let holder = std::thread::spawn(move || {
+				let state = lock(&retained.state);
+				locked.send(()).unwrap();
+				release.recv().unwrap();
+				drop(state);
+			});
+			wait.recv().unwrap();
+			holder
+		};
+		let releaser = std::thread::spawn(move || {
+			std::thread::sleep(Duration::from_millis(20));
+			held.send(()).unwrap();
+		});
+		// closed from a thread of no runtime, as a foreign caller's
+		let closer = {
+			let retained = Arc::clone(&retained);
+			std::thread::spawn(move || retained.close())
+		};
+		closer.join().unwrap();
+		holder.join().unwrap();
+		releaser.join().unwrap();
 		assert!(retained.is_closed());
-		assert_eq!(pool.charged.load(Ordering::Acquire), 1000);
-		drop(held);
-		// a task gives it up once the call let go
-		for _ in 0..1000 {
-			if pool.charged.load(Ordering::Acquire) == 0 {
-				break;
-			}
-			sleep(Duration::from_millis(1)).await;
-		}
+		assert!(!retained.holds_index());
 		assert_eq!(pool.charged.load(Ordering::Acquire), 0);
 		retained.keep_chunk(1, chunk(1000));
 		assert_eq!(kept(&retained), Vec::<u64>::new());

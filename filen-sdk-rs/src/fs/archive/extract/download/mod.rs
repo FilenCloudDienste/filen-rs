@@ -14,7 +14,10 @@ use crate::{
 	fs::archive::{
 		config::ArchiveConfig,
 		format::ArchiveFormat,
-		input::{ArchiveBytes, FeedSink, ReadingDriver, ReadingJob, start_reading, unstalled},
+		input::{
+			ArchiveBytes, FeedSink, ReadingDriver, ReadingJob, start_reading, unstalled,
+			write_unstalled,
+		},
 		retained::Retained,
 		worker::{CodecStart, EntryHead, EntryKind, WorkerEvent, unexpected_event},
 	},
@@ -482,12 +485,12 @@ impl<W: AsyncWrite + Unpin + MaybeSend> FeedSink for EntrySink<'_, W> {
 				// a stop ends the write; the driver sees the job stopping next
 				let Ok(written) = self
 					.control
-					.until_stopping(unstalled(self.writer.write_all(&data)))
+					.until_stopping(write_unstalled(&mut self.writer, &data))
 					.await
 				else {
 					return Ok(());
 				};
-				written??;
+				written?;
 				self.bytes_written = self.bytes_written.saturating_add(data.len() as u64);
 				self.reporter.wrote(self.bytes_written);
 			}

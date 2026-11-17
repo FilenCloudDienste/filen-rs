@@ -1,6 +1,6 @@
 //! Readers against the fake drive, with the real codec on its thread.
 
-use std::{io::Write, sync::Arc};
+use std::{io::Write, sync::Arc, time::Duration};
 
 use filen_types::fs::Uuid;
 
@@ -2086,4 +2086,177 @@ async fn a_compressed_tars_listing_states_what_reaching_a_member_throws_away() {
 		result.unwrap_err().error.kind(),
 		ErrorKind::ArchiveSolidSkipExceeded
 	);
+}
+
+/// Three deflated entries of 2 MiB, read by range through a decoder.
+fn deflated_zip() -> (Vec<u8>, Vec<Vec<u8>>) {
+	let data: Vec<Vec<u8>> = (0..3).map(|at| text(2 << 20, 110 + at)).collect();
+	let names = ["0.txt", "1.txt", "2.txt"];
+	let files: Vec<(&str, &[u8], ZipMethod, Option<&str>)> = names
+		.iter()
+		.zip(&data)
+		.map(|(name, data)| (*name, &data[..], ZipMethod::Deflate { level: 6 }, None))
+		.collect();
+	(zip_with(&files), data)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_range_reads_give_back_every_byte_they_charged() {
+	let (zip, _) = deflated_zip();
+	let (backend, archive, config) = drive("z.zip", zip, 64 << 20);
+	let reader = Arc::new(reader_of(&backend, &archive, &config, None));
+	reader.open(Ignore, JobControl::default()).await.unwrap();
+	let before = config.retained.charged_for_test();
+	for index in 0..3 {
+		let (control, controller) = JobControl::new();
+		let read = {
+			let reader = Arc::clone(&reader);
+			tokio::spawn(async move {
+				let mut writer = Stalled;
+				reader
+					.read_entry_range(entry(index), 0, 1 << 20, &mut writer, &control)
+					.await
+			})
+		};
+		tokio::time::sleep(Duration::from_millis(50)).await;
+		controller.cancel();
+		assert_eq!(
+			read.await.unwrap().unwrap_err().kind(),
+			ErrorKind::Cancelled
+		);
+	}
+	// what stays charged is what the reader keeps, and no reservation of a read
+	let retained = reader.retained.as_ref().unwrap();
+	assert_eq!(config.retained.charged_for_test(), retained.held_for_test());
+	assert!(retained.held_for_test() >= before);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn range_reads_stalled_on_their_writers_hold_no_other_read_up() {
+	let (zip, data) = deflated_zip();
+	let (_, reader) = opened("z.zip", zip, None).await;
+	let reader = Arc::new(reader);
+	let (control, controller) = JobControl::new();
+	let stalled: Vec<_> = (0..2)
+		.map(|index| {
+			let (reader, control) = (Arc::clone(&reader), control.clone());
+			tokio::spawn(async move {
+				let mut writer = Stalled;
+				reader
+					.read_entry_range(entry(index), 0, 100, &mut writer, &control)
+					.await
+			})
+		})
+		.collect();
+	tokio::time::sleep(Duration::from_millis(100)).await;
+	let read = tokio::time::timeout(Duration::from_secs(10), range(&reader, 2, 0, 100))
+		.await
+		.expect("a third entry is read while two readers stall on their writers");
+	assert_eq!(read.unwrap(), data[2][..100]);
+	controller.cancel();
+	for stalled in stalled {
+		assert_eq!(
+			stalled.await.unwrap().unwrap_err().kind(),
+			ErrorKind::Cancelled
+		);
+	}
+}
+
+/// A writer that takes 16 KiB every 20 ms: slow, but never stalled.
+struct Trickle {
+	data: Arc<Mutex<Vec<u8>>>,
+	wait: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
+}
+
+impl AsyncWrite for Trickle {
+	fn poll_write(
+		mut self: std::pin::Pin<&mut Self>,
+		cx: &mut std::task::Context<'_>,
+		buf: &[u8],
+	) -> std::task::Poll<std::io::Result<usize>> {
+		let wait = self
+			.wait
+			.get_or_insert_with(|| Box::pin(tokio::time::sleep(Duration::from_millis(20))));
+		if wait.as_mut().poll(cx).is_pending() {
+			return std::task::Poll::Pending;
+		}
+		self.wait = None;
+		let taken = buf.len().min(16 << 10);
+		self.data.lock().unwrap().extend_from_slice(&buf[..taken]);
+		std::task::Poll::Ready(Ok(taken))
+	}
+
+	fn poll_flush(
+		self: std::pin::Pin<&mut Self>,
+		_: &mut std::task::Context<'_>,
+	) -> std::task::Poll<std::io::Result<()>> {
+		std::task::Poll::Ready(Ok(()))
+	}
+
+	fn poll_close(
+		self: std::pin::Pin<&mut Self>,
+		_: &mut std::task::Context<'_>,
+	) -> std::task::Poll<std::io::Result<()>> {
+		std::task::Poll::Ready(Ok(()))
+	}
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_slow_writer_that_keeps_taking_bytes_is_waited_for() {
+	let (zip, data) = spread_zip();
+	let (_, reader) = opened("z.zip", zip, None).await;
+	let written = Arc::new(Mutex::new(Vec::new()));
+	let into = Arc::clone(&written);
+	// a chunk takes longer than the stall timeout, but no slice of it does
+	let report = reader
+		.read_entries(
+			&[entry(0)],
+			move |_, _| {
+				std::future::ready(Ok(Some(Trickle {
+					data: Arc::clone(&into),
+					wait: None,
+				})))
+			},
+			None,
+			Ignore,
+			JobControl::default(),
+		)
+		.await
+		.unwrap();
+	assert_eq!(report.entries, 1);
+	assert!(*written.lock().unwrap() == data[0]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_nested_job_on_one_slot_never_needs_its_parents_index_again() {
+	let (inner, data) = deflated_zip();
+	let outer = zip_with(&[("inner.zip", &inner, ZipMethod::Deflate { level: 6 }, None)]);
+	let (backend, archive, _) = drive("outer.zip", outer, 64 << 20);
+	// one job slot, as on the web and on mobile
+	let config = ArchiveConfig::new(&ClientConfig::default().with_archive_job_concurrency(1))
+		.with_own_pool(64 << 20);
+	let outer = Arc::new(reader_of(&backend, &archive, &config, None));
+	outer.open(Ignore, JobControl::default()).await.unwrap();
+	let inner = nested(&outer, 0).await.unwrap();
+	// the parent gave its index up: the nested job's reads go on without reading it again
+	outer.retained.as_ref().unwrap().evict_index_for_test();
+	let buffer: Arc<Mutex<Vec<u8>>> = Arc::default();
+	let into = Arc::clone(&buffer);
+	let entries = [entry_of(&inner, 2)];
+	let report = tokio::time::timeout(
+		Duration::from_secs(30),
+		inner.read_entries(
+			&entries,
+			move |_, _| std::future::ready(Ok(Some(Recording(Arc::clone(&into))))),
+			None,
+			Ignore,
+			JobControl::default(),
+		),
+	)
+	.await
+	.expect("the nested pass takes the one slot and needs no other")
+	.unwrap();
+	assert_eq!(report.entries, 1);
+	assert!(*buffer.lock().unwrap() == data[2]);
+	assert_eq!(config.free_slots(), 1);
 }

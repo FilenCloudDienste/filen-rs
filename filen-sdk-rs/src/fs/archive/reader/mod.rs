@@ -11,12 +11,9 @@ mod raw;
 mod sequential;
 mod slice;
 
-use std::{
-	sync::{
-		Arc, Mutex, OnceLock, PoisonError, Weak,
-		atomic::{AtomicBool, Ordering},
-	},
-	time::Duration,
+use std::sync::{
+	Arc, Mutex, OnceLock, PoisonError, Weak,
+	atomic::{AtomicBool, Ordering},
 };
 
 use filen_types::fs::Uuid;
@@ -46,9 +43,8 @@ use crate::{
 		file::enums::RemoteFileType,
 	},
 	job::{JobControl, report::JobFailed},
-	runtime::spawn_task_maybe_send,
 	thumbnail::EmbeddedPreview,
-	util::{MaybeSend, SeededMap, sleep},
+	util::{MaybeSend, SeededMap},
 };
 
 pub(crate) use inflate::{Seeks, StreamKey};
@@ -482,8 +478,9 @@ impl Reader {
 			.is_some_and(|retained| retained.holds_index())
 	}
 
-	/// Closes the reader, and the readers of archives nested in it with it. Never waits on a
-	/// lock: what another call holds is given up by a task once that call let go of it.
+	/// Closes the reader, and the readers of archives nested in it with it. On the web it never
+	/// waits on a lock (see [`Retained::close`]); elsewhere it waits the moment a call holds one,
+	/// from any thread.
 	pub(crate) fn close(self: &Arc<Self>) {
 		if self.closed.swap(true, Ordering::SeqCst) {
 			return;
@@ -491,21 +488,30 @@ impl Reader {
 		if let Some(retained) = &self.retained {
 			retained.close();
 		}
-		if self.close_nested() {
-			return;
+		#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+		if !self.close_nested(false) {
+			let reader = Arc::clone(self);
+			drop(crate::runtime::spawn_task_maybe_send(async move {
+				while !reader.close_nested(false) {
+					crate::util::sleep(std::time::Duration::from_millis(1)).await;
+				}
+			}));
 		}
-		let reader = Arc::clone(self);
-		drop(spawn_task_maybe_send(async move {
-			while !reader.close_nested() {
-				sleep(Duration::from_millis(1)).await;
-			}
-		}));
+		#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+		self.close_nested(true);
 	}
 
-	/// Closes the readers nested in this one, when their list's lock is free; whether it was.
-	fn close_nested(&self) -> bool {
-		let Ok(mut nested) = self.nested.try_lock() else {
-			return false;
+	/// Closes the readers nested in this one, waiting for their list's lock when `wait`, else
+	/// only when it is free; whether it did.
+	fn close_nested(&self, wait: bool) -> bool {
+		let mut nested = if wait {
+			self.nested.lock().unwrap_or_else(PoisonError::into_inner)
+		} else {
+			match self.nested.try_lock() {
+				Ok(nested) => nested,
+				Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+				Err(std::sync::TryLockError::WouldBlock) => return false,
+			}
 		};
 		let nested = std::mem::take(&mut *nested);
 		for reader in nested.iter().filter_map(Weak::upgrade) {

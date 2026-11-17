@@ -26,9 +26,12 @@ use miniz_oxide::inflate::{
 use crate::{
 	Error, ErrorKind,
 	consts::CHUNK_SIZE_U64,
-	fs::archive::zip::crypto::{
-		AES_AUTH_CODE_LEN_U64, AES_VERIFIER_LEN, AesStream, AesStrength, ZIP_CRYPTO_HEADER_LEN,
-		ZIP_CRYPTO_HEADER_LEN_U64, ZipCryptoState,
+	fs::archive::{
+		retained::Retained,
+		zip::crypto::{
+			AES_AUTH_CODE_LEN_U64, AES_VERIFIER_LEN, AesStream, AesStrength, ZIP_CRYPTO_HEADER_LEN,
+			ZIP_CRYPTO_HEADER_LEN_U64, ZipCryptoState,
+		},
 	},
 	runtime::do_cpu_intensive,
 	util::MaybeSend,
@@ -55,6 +58,52 @@ const MAX_GZIP_NAME: usize = 64 << 10;
 const MAX_GZIP_HEADER: usize = 10 + 2 + u16::MAX as usize + 2 * (MAX_GZIP_NAME + 1) + 2;
 /// Bytes of a gzip member's trailer: its CRC-32 and size.
 const GZIP_TRAILER: usize = 8;
+
+/// What a read in flight holds charged to its reader's budget for the checkpoints it lays: they
+/// are kept with the reader's state, uncharged, until the read ends. Given back when it drops,
+/// however the read ends; a reader for one call, which keeps nothing, charges nothing.
+pub(crate) struct Reservation<'r> {
+	retained: Option<&'r Retained>,
+	bytes: u64,
+}
+
+impl<'r> Reservation<'r> {
+	pub(crate) fn new(retained: Option<&'r Retained>) -> Self {
+		Self { retained, bytes: 0 }
+	}
+
+	/// What it holds; unbounded for a reader that keeps nothing.
+	pub(crate) fn bytes(&self) -> u64 {
+		if self.retained.is_some() {
+			self.bytes
+		} else {
+			u64::MAX
+		}
+	}
+
+	/// Holds `total` bytes, charging what it holds not yet, when there is room; whether it does.
+	pub(crate) fn cover(&mut self, total: u64) -> bool {
+		let Some(retained) = self.retained else {
+			return true;
+		};
+		if total <= self.bytes {
+			return true;
+		}
+		if !retained.reserve(total - self.bytes) {
+			return false;
+		}
+		self.bytes = total;
+		true
+	}
+}
+
+impl Drop for Reservation<'_> {
+	fn drop(&mut self) {
+		if let Some(retained) = self.retained {
+			retained.release_reserved(self.bytes);
+		}
+	}
+}
 
 /// Which stream of a reader a cursor decodes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -297,6 +346,11 @@ impl Seeks {
 			});
 			self.spacing = self.spacing.saturating_mul(2);
 		}
+	}
+
+	/// What the checkpoints take.
+	pub(crate) fn checkpoint_bytes(&self) -> u64 {
+		self.checkpoints.len() as u64 * CURSOR_BYTES
 	}
 
 	/// Lets the checkpoints take at most `bytes`, the room a read reserved for them, thinning
@@ -557,9 +611,12 @@ fn gzip_header(bytes: &[u8]) -> Result<Option<usize>, Error> {
 }
 
 impl Reader {
-	/// Writes output `want` of `stream`, which holds member `ordinal`, to `writer`. A reader
-	/// decodes [`READER_SEEKS`](crate::fs::archive::retained::READER_SEEKS) streams at once at most; the checkpoints a read lays are charged
-	/// to the reader's budget before they are laid, as far as it has room.
+	/// Writes output `want` of `stream`, which holds member `ordinal`, to `writer`. Reads of one
+	/// entry (of one member of a gzip tar) take turns; a reader decodes
+	/// [`READER_SEEKS`](crate::fs::archive::retained::READER_SEEKS) steps at once at most, a step
+	/// holding its seat only while it fetches and decodes, never while its output is written. The
+	/// checkpoints a read lays are charged to the reader's budget before they are laid, as far as
+	/// it has room, and given back however the read ends, a dropped one too.
 	pub(crate) async fn read_seekable<W: AsyncWrite + Unpin + MaybeSend>(
 		&self,
 		stream: SeekStream,
@@ -567,21 +624,18 @@ impl Reader {
 		want: Range<u64>,
 		writer: &mut W,
 	) -> Result<(), Arc<Error>> {
-		let _seat = self.seek_seats.acquire().await.map_err(|_| {
-			Arc::new(Error::custom(
-				ErrorKind::InvalidState,
-				"the archive reader is closed",
-			))
-		})?;
 		match stream.key {
 			StreamKey::Entry(_) => {
 				// one read of an entry at a time: the next goes on from where it parked
 				let flight = self.flight((stream.key, None));
 				let _flight = flight.lock().await;
 				let mut seeks = self.take_seeks(stream.key);
-				let reserved = self.reserve_checkpoints(&mut seeks);
-				let read = self.read_stream(&stream, &mut seeks, want, writer).await;
-				self.put_seeks(stream.key, seeks, reserved);
+				let mut charged = Reservation::new(self.retained.as_deref());
+				let read = self
+					.read_stream(&stream, &mut seeks, &mut charged, want, writer)
+					.await;
+				drop(charged);
+				self.put_seeks(stream.key, seeks);
 				read
 			}
 			StreamKey::Gzip => self.read_gzip_member(stream, ordinal, want, writer).await,
@@ -606,16 +660,19 @@ impl Reader {
 			let mut seeks = self.take_seeks(stream.key);
 			let start = seeks.start_at(want.start);
 			let spacing = seeks.spacing;
-			self.put_seeks(stream.key, seeks, 0);
+			self.put_seeks(stream.key, seeks);
 			(start, spacing)
 		};
 		let mut read = Seeks::from_cursor(start, spacing);
-		let reserved = self.reserve_checkpoints(&mut read);
-		let result = self.read_stream(&stream, &mut read, want, writer).await;
+		let mut charged = Reservation::new(self.retained.as_deref());
+		let result = self
+			.read_stream(&stream, &mut read, &mut charged, want, writer)
+			.await;
+		drop(charged);
 		let _shared = shared.lock().await;
 		let mut seeks = self.take_seeks(stream.key);
 		seeks.merge(read);
-		self.put_seeks(stream.key, seeks, reserved);
+		self.put_seeks(stream.key, seeks);
 		result
 	}
 
@@ -627,26 +684,9 @@ impl Reader {
 			.unwrap_or_else(Seeks::new)
 	}
 
-	/// Charges the reader's budget for the checkpoints `seeks` may take while a read is in
-	/// flight, as much of [`MAX_CHECKPOINT_BYTES`] as it has room for, capping them to that:
-	/// what was charged, for [`Self::put_seeks`] to give back.
-	fn reserve_checkpoints(&self, seeks: &mut Seeks) -> u64 {
-		// a reader for one call keeps nothing past it, and reads no range
-		let Some(retained) = &self.retained else {
-			return 0;
-		};
-		let reserved = [MAX_CHECKPOINT_BYTES, MAX_CHECKPOINT_BYTES / 4]
-			.into_iter()
-			.find(|&bytes| retained.reserve(bytes))
-			.unwrap_or(0);
-		seeks.cap_checkpoints(reserved);
-		reserved
-	}
-
-	/// Keeps `seeks` for the reads after, giving back the `reserved` charge of its read.
-	fn put_seeks(&self, key: StreamKey, seeks: Seeks, reserved: u64) {
+	/// Keeps `seeks` for the reads after.
+	fn put_seeks(&self, key: StreamKey, seeks: Seeks) {
 		if let Some(retained) = &self.retained {
-			retained.release_reserved(reserved);
 			retained.keep_seeks(key, seeks);
 		}
 	}
@@ -655,6 +695,7 @@ impl Reader {
 		&self,
 		stream: &SeekStream,
 		seeks: &mut Seeks,
+		charged: &mut Reservation<'_>,
 		want: Range<u64>,
 		writer: &mut W,
 	) -> Result<(), Arc<Error>> {
@@ -678,6 +719,19 @@ impl Reader {
 		}
 		let mut contiguous: Option<Vec<u8>> = None;
 		while cursor.decoded < want.end {
+			// a seat for the fetch and the decode, given back before the output is written, so
+			// a consumer that takes nothing keeps no other read of the reader waiting
+			let seat = self.seek_seats.acquire().await.map_err(|_| {
+				Arc::new(Error::custom(
+					ErrorKind::InvalidState,
+					"the archive reader is closed",
+				))
+			})?;
+			// the checkpoint this step may lay (at most one: they are farther apart than a step
+			// decodes), charged before it is laid; with no room, those laid are thinned to what
+			// is charged
+			charged.cover(seeks.checkpoint_bytes() + CURSOR_BYTES);
+			seeks.cap_checkpoints(charged.bytes());
 			// the stored bytes from the cursor on: to the end of their chunk, or as many as a
 			// header needs at once
 			let at = stream.start + cursor.consumed;
@@ -704,6 +758,7 @@ impl Reader {
 				do_cpu_intensive(|| step(&mut cursor, stream, seeks, &input, &want, &mut out))
 					.await?;
 			drop(bytes);
+			drop(seat);
 			if !out.is_empty() {
 				writer
 					.write_all(&out)

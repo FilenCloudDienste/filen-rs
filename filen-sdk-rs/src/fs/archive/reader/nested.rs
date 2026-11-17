@@ -35,6 +35,9 @@ pub(crate) const MAX_NESTING: u8 = 3;
 pub(crate) struct EntryBytes {
 	parent: Arc<Reader>,
 	entry: ArchiveEntryId,
+	/// Where the entry lies, resolved once: a nested job's reads never need the parent's index
+	/// again, which reading would take a second job slot for while this job holds one.
+	resolved: Resolved,
 	len: u64,
 	id: Uuid,
 }
@@ -61,7 +64,14 @@ impl ArchiveBytes for EntryBytes {
 			let mut chunk = futures::io::Cursor::new(Vec::with_capacity(capacity));
 			// the nested job stops by dropping the fetch: no control of its own reaches here
 			self.parent
-				.read_entry_range(self.entry, start, end, &mut chunk, &JobControl::default())
+				.read_resolved(
+					self.resolved,
+					self.entry,
+					start,
+					end,
+					&mut chunk,
+					&JobControl::default(),
+				)
 				.await
 				.map_err(unshared)?;
 			Ok(chunk.into_inner())
@@ -134,7 +144,8 @@ impl Reader {
 				format!("an archive nested more than {MAX_NESTING} deep"),
 			)));
 		}
-		let len = match self.resolve(entry, control).await? {
+		let resolved = self.resolve(entry, control).await?;
+		let len = match resolved {
 			Resolved::Mapped { size, .. } | Resolved::Seekable { size, .. } => size,
 			Resolved::Whole { .. } | Resolved::Sequential { .. } => {
 				return Err(Arc::new(Error::custom(
@@ -155,6 +166,7 @@ impl Reader {
 		let bytes = Arc::new(EntryBytes {
 			parent: Arc::clone(self),
 			entry,
+			resolved,
 			len,
 			id: nested_id(self.archive_uuid(), u64::from(entry.index)),
 		});

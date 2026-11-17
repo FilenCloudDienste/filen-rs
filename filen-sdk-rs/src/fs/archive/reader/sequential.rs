@@ -20,7 +20,9 @@ use crate::{
 				reading::{CodecInput, ReadJob, download_extraction, start_codec},
 			},
 			format::ArchiveFormat,
-			input::{FeedSink, ReadingDriver, ReadingJob, start_reading, unstalled},
+			input::{
+				FeedSink, ReadingDriver, ReadingJob, start_reading, unstalled, write_unstalled,
+			},
 			worker::{EntryHead, EntryKind, WorkerEvent, unexpected_event},
 		},
 		drive_job::{cancelled, exceeds_limit},
@@ -338,12 +340,12 @@ where
 				// a stop ends the write; the driver sees the job stopping next
 				let Ok(written) = self
 					.control
-					.until_stopping(unstalled(writer.write_all(&data)))
+					.until_stopping(write_unstalled(writer, &data))
 					.await
 				else {
 					return Ok(());
 				};
-				written??;
+				written?;
 				self.bytes_written = self.bytes_written.saturating_add(data.len() as u64);
 				self.reporter.wrote(self.bytes_written);
 			}
