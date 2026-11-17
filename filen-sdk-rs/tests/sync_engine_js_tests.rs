@@ -51,6 +51,8 @@ fn js_client(base: &Client) -> JsClient {
 		#[cfg(feature = "archive")]
 		archive_codec_mem_budget: None,
 		#[cfg(feature = "archive")]
+		archive_retained_budget: None,
+		#[cfg(feature = "archive")]
 		archive_job_concurrency: None,
 		batch_window_ms: None,
 	};
