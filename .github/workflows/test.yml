@@ -585,8 +585,6 @@ jobs:
           sh wasm-pack.sh
         working-directory: ./filen-sdk-rs
       - name: Run TS tests
-        # we're waiting on https://github.com/RReverser/wasm-bindgen-rayon/issues/32
-        # for webkit/safari support
         run: |
           npm install
           npx playwright install --with-deps

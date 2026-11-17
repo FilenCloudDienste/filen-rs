@@ -240,6 +240,21 @@ async function generateImage(width: number, height: number, type: string): Promi
 	return new Uint8Array(await blob.arrayBuffer())
 }
 
+/// Whether the browser can encode `type`: one without an encoder for it returns a PNG
+/// instead, as WebKit on macOS does for WebP.
+async function canEncode(type: string): Promise<boolean> {
+	const canvas = new OffscreenCanvas(1, 1)
+
+	// Chromium refuses to encode a canvas without a rendering context.
+	canvas.getContext("2d")
+
+	const blob = await canvas.convertToBlob({ type })
+
+	return blob.type === type
+}
+
+const canEncodeWebp = await canEncode("image/webp")
+
 // FIRST in the file on purpose: wasm linear memory is a monotone high-water
 // mark, so any earlier test's peak would mask the growth this one measures.
 test("thumbnail decode stays inside a bounded memory budget", async () => {
@@ -1137,7 +1152,9 @@ test("thumbnail", async () => {
 	expect(completed).toContainEqual("webp")
 })
 
-test("large webp thumbnail", async () => {
+// The input is generated with the browser's WebP encoder; the thumbnail is decoded and
+// encoded in wasm, the same in every browser.
+test.skipIf(!canEncodeWebp)("large webp thumbnail", async () => {
 	// WebP has no streaming decoder here, so microthumb prices it at a full
 	// RGBA frame plus a copy (8 bytes per source pixel) and the budget decides.
 	// The committed parrot.webp is 0.67 MP and fits any budget; 3.84 MP does not

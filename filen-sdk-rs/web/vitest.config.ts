@@ -1,4 +1,6 @@
-import { createReadStream, createWriteStream, existsSync, mkdirSync, renameSync, statSync } from "node:fs"
+import { createReadStream, createWriteStream, existsSync, mkdirSync, mkdtempSync, renameSync, rmSync, statSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 import { Readable } from "node:stream"
 import { pipeline } from "node:stream/promises"
 import type { ReadableStream as NodeReadableStream } from "node:stream/web"
@@ -93,6 +95,15 @@ function workerConsoleShim(): Plugin {
 	}
 }
 
+// A new, empty WebKit profile for this run, removed when vitest exits.
+function webkitProfile(): string {
+	const dir = mkdtempSync(join(tmpdir(), "vitest-webkit-profile-"))
+
+	process.on("exit", () => rmSync(dir, { recursive: true, force: true }))
+
+	return dir
+}
+
 // Every test and hook gets 3 minutes, times `VITE_TEST_TIMEOUT_MULT` (default 1). The nightly
 // sets 10: there each upload queues on the account-wide drive-write lock behind six native
 // legs, and a cap sized for one machine says nothing (2026-09-04: a test of two tiny uploads
@@ -123,6 +134,19 @@ export default defineConfig({
 					},
 					{
 						browser: "firefox"
+					},
+					{
+						browser: "webkit",
+						// A regular Playwright WebKit context is ephemeral, like a private window, and there
+						// `navigator.storage.getDirectory()` rejects with UnknownError, so every test that
+						// writes to OPFS would fail. A persistent context in a fresh profile has OPFS and
+						// carries nothing over between runs. The provider drops `persistentContext` when the
+						// instance opens more than one page, hence the single worker.
+						provider: playwright({
+							actionTimeout: 3600_000,
+							persistentContext: webkitProfile()
+						}),
+						maxWorkers: 1
 					}
 				]
 			}
