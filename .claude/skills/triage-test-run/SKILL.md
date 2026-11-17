@@ -49,8 +49,8 @@ gh run list --repo FilenCloudDienste/filen-rs --workflow test.yml --commit <sha>
 "Last night" = the most recent completed scheduled `Tests` run (they start ~00:40 UTC and take up
 to 4 h 30 m; a run still `in_progress` has partial logs — say so and wait or triage the finished
 legs). A run id or URL from the user wins. `Tests` = 6 native legs (`test (os, V1|V2)`: three OSes ×
-two accounts, V1 and V2, plus one share account) + `test-wasm` (chromium then firefox, one after
-the other; firefox runs even when chromium fails) + `test-2fa (V1|V2)` after the matrix, then
+two accounts, V1 and V2, plus one share account) + `test-wasm` (chromium, firefox, then webkit, one
+after the other; each runs even when an earlier one fails) + `test-2fa (V1|V2)` after the matrix, then
 `test-sync-engine` (Linux, V2: the cache and sync engine live binaries, one step each), then
 `test-cli (os, V2|V1)`: the CLI's live targets (`-F cli-live-tests`), which the native legs do not
 build, as six legs (three OSes × V2 and V1) that run one at a time after both the sync engine's job

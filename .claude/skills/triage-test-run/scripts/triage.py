@@ -59,6 +59,8 @@ VT_BROWSER = re.compile(
     r"^\s*[✓❯×]\s+(chromium|firefox|webkit)\s+(\S+) \((\d+) tests?(?: \| (\d+) failed)?(?: \| (\d+) skipped)?\)\s+(\d+)ms$"
 )
 VT_TEST = re.compile(r"^\s{2,}([✓×↓])\s(.+?)\s*(\d+)ms$")
+# test-wasm's browsers, in the order the npm test script runs them.
+VT_BROWSERS = ("chromium", "firefox", "webkit")
 VT_FAIL = re.compile(r"^\s*FAIL\s+(chromium|firefox|webkit)\s+(\S+) > (.+?)\s*$")
 VT_LOC = re.compile(r"^\s*❯ (\S+):(\d+):(\d+)$")
 VT_SUMMARY = re.compile(r"^\s*Tests\s+(?:(\d+) failed \| )?(\d+) passed(?: \| (\d+) skipped)? \((\d+)\)$")
@@ -619,10 +621,11 @@ def cmd_failures(args):
                 s = info.get("summary", {})
                 print(f"   vitest {b}: {s.get('passed', '?')} passed, {s.get('failed', info['failed'])} failed, "
                       f"{info['total_ms'] // 1000}s total, finished {hhmm(info['finished_at'])}")
-            for b in ("chromium", "firefox"):
+            for b in VT_BROWSERS:
                 if b not in leg["browsers"] and leg["short"] == "wasm":
                     print(f"   vitest {b}: NOT RUN (the build failed or the step died first; on runs whose npm "
-                          f"script chains the browsers with &&, a chromium failure also skips firefox)")
+                          f"script chains the browsers with &&, a chromium failure also skips firefox; runs "
+                          f"before webkit joined the script never run it)")
     print(f"\n== suggested clusters (mechanical: same test, or shared panic site / message head) -> "
           f"{d / 'clusters.json'}{clusters_note}")
     for c in data["suggested_clusters"]:
@@ -666,7 +669,7 @@ def cmd_timeline(args):
         print(f"{key[:46]:<48}" + "".join(f"{rows[key].get(n, '-'):<{w}}" for n in names))
     for l in data["legs"]:
         if l["short"] == "wasm" or l["browsers"]:
-            for b in ("chromium", "firefox"):
+            for b in VT_BROWSERS:
                 info = l["browsers"].get(b)
                 if not info:
                     print(f"\n{l['short']} vitest {b}: NOT RUN")
