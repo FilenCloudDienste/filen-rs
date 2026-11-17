@@ -279,9 +279,9 @@ flate2 = { version = "1.1", default-features = false, features = [
 	"rust_backend",
 ], optional = true }
 # The seekable inflate an entry read by range goes through: its core decompressor's state can be
-# cloned at a checkpoint, which flate2 does not expose. Pinned to the version flate2 brings in
-# already, so the build holds one copy.
-miniz_oxide = { version = "=0.8.9", optional = true }
+# cloned at a checkpoint, which flate2 does not expose. Required as flate2 requires it, so the
+# build holds one copy and a flate2 update is never held back.
+miniz_oxide = { version = "0.8.5", optional = true }
 # RAR 1.3 to 7 reading. Apache-2.0, `#![forbid(unsafe_code)]`; pinned, as it is young. Only its
 # `encryption` feature: no writer, no rayon (the SDK runs its codec on its own worker).
 rars = { version = "=0.12.4", default-features = false, features = [
