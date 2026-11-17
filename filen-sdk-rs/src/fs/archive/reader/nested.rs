@@ -78,7 +78,9 @@ pub(crate) fn unshared(error: Arc<Error>) -> Error {
 
 /// The id a nested archive's entries carry: derived from the archive it is in and its place
 /// there, so the same entry opened again gets the same id (a UUID of version 8, its bytes a
-/// BLAKE3 of both).
+/// BLAKE3 of both). Not version 5, a name-based UUID: that is SHA-1, which the SDK has no
+/// implementation of but through a dependency of its own; version 8 is the RFC 9562 layout for
+/// a hash the application chooses.
 pub(crate) fn nested_id(outer: Uuid, ordinal: u64) -> Uuid {
 	let mut hasher = blake3::Hasher::new();
 	hasher.update(b"filen archive entry");

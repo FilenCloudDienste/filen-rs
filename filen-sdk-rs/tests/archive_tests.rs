@@ -1636,8 +1636,38 @@ fn fixture_noise(mut seed: u32, len: usize) -> Vec<u8> {
 		.collect()
 }
 
-/// Reads entries of `reader`'s stored zip by range, whole and in one pass: `big` spans chunks.
-async fn read_through(reader: &ArchiveReader, big: &[u8], notes: &[u8]) {
+/// A writer collecting what it is given, for a pass to write an entry to.
+#[derive(Clone, Default)]
+struct Collected(Arc<Mutex<Vec<u8>>>);
+
+impl futures::AsyncWrite for Collected {
+	fn poll_write(
+		self: std::pin::Pin<&mut Self>,
+		_: &mut std::task::Context<'_>,
+		buf: &[u8],
+	) -> std::task::Poll<std::io::Result<usize>> {
+		self.0.lock().unwrap().extend_from_slice(buf);
+		std::task::Poll::Ready(Ok(buf.len()))
+	}
+
+	fn poll_flush(
+		self: std::pin::Pin<&mut Self>,
+		_: &mut std::task::Context<'_>,
+	) -> std::task::Poll<std::io::Result<()>> {
+		std::task::Poll::Ready(Ok(()))
+	}
+
+	fn poll_close(
+		self: std::pin::Pin<&mut Self>,
+		_: &mut std::task::Context<'_>,
+	) -> std::task::Poll<std::io::Result<()>> {
+		std::task::Poll::Ready(Ok(()))
+	}
+}
+
+/// Reads entries of `reader`'s zip by range, whole and in one pass, checking every byte: `big`
+/// spans chunks, and is `Seekable` when the zip is `deflated`, else `Mapped`.
+async fn read_through(reader: &ArchiveReader, big: &[u8], notes: &[u8], deflated: bool) {
 	let recorder = Arc::new(ListRecorder::default());
 	let listing = reader
 		.list(Arc::clone(&recorder), JobControl::default())
@@ -1645,29 +1675,34 @@ async fn read_through(reader: &ArchiveReader, big: &[u8], notes: &[u8]) {
 		.unwrap();
 	let big_id = entry(&listing, "source/big.bin").id;
 	let notes_id = entry(&listing, "source/notes.txt").id;
+	let size = big.len() as u64;
 	assert_eq!(
 		reader
 			.entry_byte_access(big_id, JobControl::default())
 			.await
 			.unwrap(),
-		EntryByteAccess::Mapped {
-			size: big.len() as u64
+		if deflated {
+			EntryByteAccess::Seekable { size }
+		} else {
+			EntryByteAccess::Mapped { size }
 		}
 	);
-	let start = CHUNK_SIZE_U64 - 10;
-	let mut range = Vec::new();
-	reader
-		.read_entry_range(
-			big_id,
-			start,
-			start + 20,
-			&mut futures::io::Cursor::new(&mut range),
-			JobControl::default(),
-		)
-		.await
-		.unwrap();
-	let at = usize::try_from(start).unwrap();
-	assert_eq!(range, big[at..at + 20]);
+	// across the archive's first chunk boundary, then back before it
+	for start in [CHUNK_SIZE_U64 - 10, 5] {
+		let mut range = Vec::new();
+		reader
+			.read_entry_range(
+				big_id,
+				start,
+				start + 20,
+				&mut futures::io::Cursor::new(&mut range),
+				JobControl::default(),
+			)
+			.await
+			.unwrap();
+		let at = usize::try_from(start).unwrap();
+		assert_eq!(range, big[at..at + 20]);
+	}
 	let mut whole = Vec::new();
 	let report = reader
 		.download_entry(
@@ -1681,14 +1716,15 @@ async fn read_through(reader: &ArchiveReader, big: &[u8], notes: &[u8]) {
 		.unwrap();
 	assert!(report.checked);
 	assert_eq!(whole, notes);
-	let written = Arc::new(Mutex::new(Vec::new()));
+	let written: Arc<Mutex<Vec<(u32, Collected)>>> = Arc::default();
 	let into = Arc::clone(&written);
 	let report = reader
 		.read_entries(
-			&[notes_id, big_id],
+			&[big_id, notes_id],
 			move |entry, _| {
-				into.lock().unwrap().push(entry);
-				std::future::ready(Ok(Some(futures::io::sink())))
+				let writer = Collected::default();
+				into.lock().unwrap().push((entry.index, writer.clone()));
+				std::future::ready(Ok(Some(writer)))
 			},
 			Some(0),
 			Arc::new(EntryDownloadRecorder::default()),
@@ -1698,11 +1734,16 @@ async fn read_through(reader: &ArchiveReader, big: &[u8], notes: &[u8]) {
 		.unwrap();
 	assert_eq!(report.entries, 2);
 	assert!(report.checked);
-	assert_eq!(written.lock().unwrap().len(), 2);
+	let written = written.lock().unwrap();
+	assert_eq!(written.len(), 2);
+	for (index, writer) in written.iter() {
+		let expected = if *index == big_id.index { big } else { notes };
+		assert_eq!(&*writer.0.lock().unwrap(), expected);
+	}
 }
 
-/// A reader opened on an archive in the drive, and one opened without a session on the same
-/// archive through its public link, read its entries by range, whole and in a pass.
+/// Readers opened on a stored and a deflated zip in the drive, and without a session on the same
+/// archives through their public links, read their entries by range, whole and in a pass.
 #[shared_test_runtime]
 async fn an_archive_reader_reads_a_drive_archive_and_a_linked_one() {
 	let (resources, _lock) = test_utils::RESOURCES.get_resources_with_lock().await;
@@ -1710,46 +1751,51 @@ async fn an_archive_reader_reads_a_drive_archive_and_a_linked_one() {
 	let test_dir = &resources.dir;
 	let (source, _) = tree(&client, test_dir).await;
 	let destination = client.create_dir(&test_dir.into(), "reader").await.unwrap();
-	let (archive, _) = compress(
-		&client,
-		CompressSources::Keep(vec![ItemSource::Dir(ItemSourceDir::Normal(source))]),
-		&destination,
-		"stored.zip",
-		CompressFormat::Zip {
-			method: ZipMethod::Stored,
-			encryption: None,
-		},
-		None,
-	)
-	.await;
 	// as `tree` uploaded them
 	let (big, notes) = (data(CHUNK_SIZE + 4321, 7), b"hello archive");
-
-	let reader = client
-		.clone()
-		.open_archive_reader(
-			archive.clone().into(),
-			ListConfig::default(),
-			Arc::new(ListRecorder::default()),
-			JobControl::default(),
+	for (name, method) in [
+		("stored.zip", ZipMethod::Stored),
+		("deflated.zip", ZipMethod::Deflate { level: 6 }),
+	] {
+		let deflated = method != ZipMethod::Stored;
+		let (archive, _) = compress(
+			&client,
+			CompressSources::Keep(vec![ItemSource::Dir(ItemSourceDir::Normal(source.clone()))]),
+			&destination,
+			name,
+			CompressFormat::Zip {
+				method,
+				encryption: None,
+			},
+			None,
 		)
-		.await
-		.unwrap();
-	assert!(reader.index_held());
-	read_through(&reader, &big, notes).await;
-	reader.close();
+		.await;
+		let reader = client
+			.clone()
+			.open_archive_reader(
+				archive.clone().into(),
+				ListConfig::default(),
+				Arc::new(ListRecorder::default()),
+				JobControl::default(),
+			)
+			.await
+			.unwrap();
+		assert!(reader.index_held());
+		read_through(&reader, &big, notes, deflated).await;
+		reader.close();
 
-	let linked = linked_file(&client, &archive).await;
-	let reader = client
-		.get_unauthed()
-		.open_archive_reader(
-			linked,
-			ListConfig::default(),
-			Arc::new(ListRecorder::default()),
-			JobControl::default(),
-		)
-		.await
-		.unwrap();
-	assert_eq!(reader.archive_id(), archive.uuid());
-	read_through(&reader, &big, notes).await;
+		let linked = linked_file(&client, &archive).await;
+		let reader = client
+			.get_unauthed()
+			.open_archive_reader(
+				linked,
+				ListConfig::default(),
+				Arc::new(ListRecorder::default()),
+				JobControl::default(),
+			)
+			.await
+			.unwrap();
+		assert_eq!(reader.archive_id(), archive.uuid());
+		read_through(&reader, &big, notes, deflated).await;
+	}
 }

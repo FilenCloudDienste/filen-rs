@@ -46,8 +46,13 @@ pub(crate) const MAX_CHECKPOINT_BYTES: u64 = 16 << 20;
 const WINDOW: usize = 32 << 10;
 /// Most stored bytes one decompressor call is given.
 const PIECE: usize = 32 << 10;
-/// Most a gzip member's header may take.
-const MAX_GZIP_HEADER: usize = 64 << 10;
+/// Longest name, and longest comment, a gzip member's header may carry: RFC 1952 bounds
+/// neither, and nothing writes one this long.
+const MAX_GZIP_NAME: usize = 64 << 10;
+/// Most a gzip member's header may take: its fixed 10 bytes, an extra field of the most its
+/// 2-byte length allows, a name and a comment of at most [`MAX_GZIP_NAME`] each with their
+/// terminators, and the header's CRC-16.
+const MAX_GZIP_HEADER: usize = 10 + 2 + u16::MAX as usize + 2 * (MAX_GZIP_NAME + 1) + 2;
 /// Bytes of a gzip member's trailer: its CRC-32 and size.
 const GZIP_TRAILER: usize = 8;
 
@@ -535,10 +540,11 @@ fn gzip_header(bytes: &[u8]) -> Result<Option<usize>, Error> {
 	}
 	for flag in [FNAME, FCOMMENT] {
 		if flags & flag != 0 {
-			let Some(nul) = bytes
-				.get(at..)
-				.and_then(|rest| rest.iter().position(|&b| b == 0))
-			else {
+			let rest = bytes.get(at..).unwrap_or_default();
+			let Some(nul) = rest.iter().take(MAX_GZIP_NAME + 1).position(|&b| b == 0) else {
+				if rest.len() > MAX_GZIP_NAME {
+					return Err(damaged("a gzip member's name or comment is too long"));
+				}
 				return Ok(None);
 			};
 			at += nul + 1;

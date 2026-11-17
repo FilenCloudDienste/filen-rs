@@ -194,6 +194,7 @@ async fn a_closed_reader_refuses_every_call_and_keeps_nothing() {
 	let (backend, archive, config) = drive("z.zip", zip, 64 << 20);
 	let reader = reader_of(&backend, &archive, &config, None);
 	reader.open(Ignore, JobControl::default()).await.unwrap();
+	let reader = Arc::new(reader);
 	reader.close();
 	assert!(!reader.index_held());
 	let failed = download(&reader, 0).await.unwrap_err();
@@ -456,6 +457,7 @@ async fn a_mapped_range_fetches_only_the_chunks_it_lies_in() {
 		.await
 		.unwrap();
 	assert_eq!(fetched(&backend), Vec::<u64>::new());
+	let reader = Arc::new(reader);
 	reader.close();
 	assert_eq!(
 		reader
@@ -1105,12 +1107,13 @@ async fn nested(parent: &Arc<Reader>, index: u32) -> Result<Arc<Reader>, Arc<Err
 	let (bytes, name) = parent
 		.entry_bytes(entry_of(parent, index), &JobControl::default())
 		.await?;
-	let reader = Reader::nested(parent, bytes, name, None);
+	let reader = Arc::new(Reader::nested(parent, bytes, name, None));
+	parent.adopt(&reader);
 	reader
 		.open(Ignore, JobControl::default())
 		.await
 		.map_err(|failed| failed.error)?;
-	Ok(Arc::new(reader))
+	Ok(reader)
 }
 
 /// Entry `index` of the archive `reader` reads.
@@ -1732,7 +1735,7 @@ async fn cancelling_a_pass_mid_entry_ends_it_at_once() {
 	let (_, reader) = opened("z.zip", zip, None).await;
 	let (control, controller) = JobControl::new();
 	let canceller = tokio::spawn(async move {
-		tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+		tokio::time::sleep(Duration::from_millis(50)).await;
 		controller.cancel();
 	});
 	let started = std::time::Instant::now();
@@ -1823,8 +1826,8 @@ async fn a_gzip_tars_members_are_read_beside_a_stalled_one() {
 				.await
 		})
 	};
-	tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-	let read = tokio::time::timeout(std::time::Duration::from_secs(10), range(&reader, 3, 0, 5))
+	tokio::time::sleep(Duration::from_millis(50)).await;
+	let read = tokio::time::timeout(Duration::from_secs(10), range(&reader, 3, 0, 5))
 		.await
 		.expect("another member is read while the first one's writer stalls");
 	assert_eq!(read.unwrap(), b"gamma");
@@ -1871,4 +1874,128 @@ async fn checkpoints_laid_in_flight_are_charged_and_capped_by_the_budget() {
 	if let Some(seeks) = retained.take_seeks(StreamKey::Entry(0)) {
 		assert!(seeks.bytes() <= 200 << 10, "{}", seeks.bytes());
 	}
+}
+
+/// A writer that takes nothing until `released`, telling `started` once it was first asked.
+struct Gated {
+	started: Arc<AtomicBool>,
+	released: Arc<AtomicBool>,
+}
+
+impl AsyncWrite for Gated {
+	fn poll_write(
+		self: std::pin::Pin<&mut Self>,
+		cx: &mut std::task::Context<'_>,
+		buf: &[u8],
+	) -> std::task::Poll<std::io::Result<usize>> {
+		self.started.store(true, Ordering::SeqCst);
+		if self.released.load(Ordering::SeqCst) {
+			return std::task::Poll::Ready(Ok(buf.len()));
+		}
+		cx.waker().wake_by_ref();
+		std::task::Poll::Pending
+	}
+
+	fn poll_flush(
+		self: std::pin::Pin<&mut Self>,
+		_: &mut std::task::Context<'_>,
+	) -> std::task::Poll<std::io::Result<()>> {
+		std::task::Poll::Ready(Ok(()))
+	}
+
+	fn poll_close(
+		self: std::pin::Pin<&mut Self>,
+		_: &mut std::task::Context<'_>,
+	) -> std::task::Poll<std::io::Result<()>> {
+		std::task::Poll::Ready(Ok(()))
+	}
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn closing_a_reader_closes_the_readers_nested_in_it_mid_read() {
+	let big = incompressible(3 * CHUNK_SIZE, 97);
+	let inner = zip_with(&[("big", &big, ZipMethod::Stored, None)]);
+	let outer = zip_with(&[("inner.zip", &inner, ZipMethod::Stored, None)]);
+	let (_, outer) = opened("outer.zip", outer, None).await;
+	let outer = Arc::new(outer);
+	let inner = nested(&outer, 0).await.unwrap();
+	let (started, released) = (Arc::default(), Arc::new(AtomicBool::new(false)));
+	let read = {
+		let inner = Arc::clone(&inner);
+		let mut writer = Gated {
+			started: Arc::clone(&started),
+			released: Arc::clone(&released),
+		};
+		let len = big.len() as u64;
+		tokio::spawn(async move {
+			let entry = entry_of(&inner, 0);
+			inner
+				.read_entry_range(entry, 0, len, &mut writer, &JobControl::default())
+				.await
+		})
+	};
+	while !started.load(Ordering::SeqCst) {
+		tokio::time::sleep(Duration::from_millis(1)).await;
+	}
+	outer.close();
+	released.store(true, Ordering::SeqCst);
+	assert_eq!(
+		read.await.unwrap().unwrap_err().kind(),
+		ErrorKind::InvalidState
+	);
+	assert!(!inner.index_held());
+	let mut written = futures::io::Cursor::new(Vec::new());
+	let entry = entry_of(&inner, 0);
+	assert_eq!(
+		inner
+			.read_entry_range(entry, 0, 10, &mut written, &JobControl::default())
+			.await
+			.unwrap_err()
+			.kind(),
+		ErrorKind::InvalidState
+	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_gzip_tar_with_the_longest_extra_field_and_a_long_name_reads_by_range() {
+	let (tar, big) = spread_tar();
+	let mut encoder = flate2::GzBuilder::new()
+		.extra(vec![7u8; usize::from(u16::MAX)])
+		.filename(vec![b'n'; 60_000])
+		.comment(vec![b'c'; 60_000])
+		.write(Vec::new(), flate2::Compression::default());
+	encoder.write_all(&tar).unwrap();
+	let tgz = encoder.finish().unwrap();
+	let (_, reader) = opened("t.tar.gz", tgz, None).await;
+	assert_eq!(range(&reader, 1, 100, 200).await.unwrap(), big[100..200]);
+	// a name past what any writer makes is refused, not searched for without end
+	let mut encoder = flate2::GzBuilder::new()
+		.filename(vec![b'n'; 70_000])
+		.write(Vec::new(), flate2::Compression::default());
+	encoder.write_all(&tar).unwrap();
+	let (backend, archive, config) = drive("t.tar.gz", encoder.finish().unwrap(), 64 << 20);
+	let reader = reader_of(&backend, &archive, &config, None);
+	let refused = match reader.open(Ignore, JobControl::default()).await {
+		Err(failed) => failed.error.kind(),
+		Ok(_) => range(&reader, 1, 100, 200).await.unwrap_err().kind(),
+	};
+	assert_eq!(refused, ErrorKind::ArchiveCorrupt);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_aes_entry_shorter_than_its_header_and_code_fails_cleanly() {
+	let mut zip = zip_with(&[("s", b"hello", ZipMethod::Stored, Some("pw"))]);
+	let central = zip
+		.windows(4)
+		.position(|window| window == b"PK\x01\x02")
+		.unwrap();
+	// salt, verifier and authentication code take 28 bytes: the entry states 20
+	zip[central + 20..central + 24].copy_from_slice(&20u32.to_le_bytes());
+	let (backend, archive, config) = drive("a.zip", zip, 64 << 20);
+	let reader = reader_of(&backend, &archive, &config, Some("pw"));
+	if reader.open(Ignore, JobControl::default()).await.is_err() {
+		return;
+	}
+	assert!(range(&reader, 0, 0, 5).await.is_err());
+	assert!(downloaded(&reader, 0).await.is_err());
 }

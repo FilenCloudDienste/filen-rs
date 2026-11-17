@@ -11,9 +11,12 @@ mod raw;
 mod sequential;
 mod slice;
 
-use std::sync::{
-	Arc, Mutex, PoisonError,
-	atomic::{AtomicBool, Ordering},
+use std::{
+	sync::{
+		Arc, Mutex, OnceLock, PoisonError, Weak,
+		atomic::{AtomicBool, Ordering},
+	},
+	time::Duration,
 };
 
 use filen_types::fs::Uuid;
@@ -43,8 +46,9 @@ use crate::{
 		file::enums::RemoteFileType,
 	},
 	job::{JobControl, report::JobFailed},
+	runtime::spawn_task_maybe_send,
 	thumbnail::EmbeddedPreview,
-	util::{MaybeSend, SeededMap},
+	util::{MaybeSend, SeededMap, sleep},
 };
 
 pub(crate) use inflate::{Seeks, StreamKey};
@@ -160,8 +164,11 @@ impl ArchiveReader {
 		self.reader.index_held()
 	}
 
-	/// Gives up what the reader holds. Every later call fails with
-	/// [`ErrorKind::InvalidState`]; a call already running goes on to its end.
+	/// Gives up what the reader holds, and closes the readers of archives nested in it (see
+	/// [`Self::open_nested`]). Every later call fails with [`ErrorKind::InvalidState`], and so
+	/// does a range read already running, at its next chunk; a job already running (a listing,
+	/// a download, a pass) runs to its end, keeping nothing for after it. Never waits on a lock,
+	/// so a JS thread may call it.
 	pub fn close(&self) {
 		self.reader.close();
 	}
@@ -284,11 +291,10 @@ impl ArchiveReader {
 				report: ListReport::empty(),
 				error,
 			})?;
-		let reader = Reader::nested(&self.reader, bytes, name, password);
+		let reader = Arc::new(Reader::nested(&self.reader, bytes, name, password));
+		self.reader.adopt(&reader);
 		reader.open(callback, control).await?;
-		Ok(ArchiveReader {
-			reader: Arc::new(reader),
-		})
+		Ok(ArchiveReader { reader })
 	}
 
 	/// Writes the embedded preview of `entry`, a RAW photo (or another container microthumb
@@ -373,7 +379,10 @@ pub(crate) struct Reader {
 	id: Uuid,
 	config: ArchiveConfig,
 	settings: ListConfig,
-	format: Mutex<Option<ArchiveFormat>>,
+	/// Read without a lock, which a JS thread never waits on.
+	format: OnceLock<ArchiveFormat>,
+	/// The readers of archives nested in this one, closed with it.
+	nested: Mutex<Vec<Weak<Reader>>>,
 	/// What it keeps between its calls; `None` for a reader of one call, which keeps nothing.
 	retained: Option<Arc<Retained>>,
 	/// How many archives it is nested in: 0 for an archive in the drive.
@@ -434,7 +443,8 @@ impl Reader {
 			id: Uuid::new_v4(),
 			config,
 			settings,
-			format: Mutex::new(None),
+			format: OnceLock::new(),
+			nested: Mutex::default(),
 			retained: None,
 			depth: 0,
 			expansion_base: None,
@@ -456,25 +466,63 @@ impl Reader {
 	}
 
 	pub(crate) fn format(&self) -> Option<ArchiveFormat> {
-		*self.format.lock().unwrap_or_else(PoisonError::into_inner)
+		self.format.get().copied()
 	}
 
 	fn note_format(&self, format: Option<ArchiveFormat>) {
 		if let Some(format) = format {
-			*self.format.lock().unwrap_or_else(PoisonError::into_inner) = Some(format);
+			// an archive's format does not change: the first one told stands
+			let _ = self.format.set(format);
 		}
 	}
 
 	pub(crate) fn index_held(&self) -> bool {
 		self.retained
 			.as_ref()
-			.is_some_and(|retained| retained.index().is_some())
+			.is_some_and(|retained| retained.holds_index())
 	}
 
-	pub(crate) fn close(&self) {
-		self.closed.store(true, Ordering::SeqCst);
+	/// Closes the reader, and the readers of archives nested in it with it. Never waits on a
+	/// lock: what another call holds is given up by a task once that call let go of it.
+	pub(crate) fn close(self: &Arc<Self>) {
+		if self.closed.swap(true, Ordering::SeqCst) {
+			return;
+		}
 		if let Some(retained) = &self.retained {
 			retained.close();
+		}
+		if self.close_nested() {
+			return;
+		}
+		let reader = Arc::clone(self);
+		drop(spawn_task_maybe_send(async move {
+			while !reader.close_nested() {
+				sleep(Duration::from_millis(1)).await;
+			}
+		}));
+	}
+
+	/// Closes the readers nested in this one, when their list's lock is free; whether it was.
+	fn close_nested(&self) -> bool {
+		let Ok(mut nested) = self.nested.try_lock() else {
+			return false;
+		};
+		let nested = std::mem::take(&mut *nested);
+		for reader in nested.iter().filter_map(Weak::upgrade) {
+			reader.close();
+		}
+		true
+	}
+
+	/// Takes `reader`, of an archive nested in this one, to close with this one; closed at once
+	/// when this one is.
+	fn adopt(&self, reader: &Arc<Self>) {
+		let mut nested = self.nested.lock().unwrap_or_else(PoisonError::into_inner);
+		nested.retain(|reader| reader.strong_count() > 0);
+		nested.push(Arc::downgrade(reader));
+		drop(nested);
+		if self.closed.load(Ordering::SeqCst) {
+			reader.close();
 		}
 	}
 

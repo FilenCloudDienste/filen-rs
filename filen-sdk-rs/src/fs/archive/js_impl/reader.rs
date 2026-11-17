@@ -194,6 +194,11 @@ where
 #[cfg(feature = "uniffi")]
 const RANGE_PREALLOCATED: u64 = 16 << 20;
 
+/// Longest range the uniffi `read_entry_range` returns in memory; a longer one is written to a
+/// file through `download_entry` or `read_entries`.
+#[cfg(feature = "uniffi")]
+const MAX_RANGE_BYTES: u64 = 64 << 20;
+
 #[cfg(feature = "uniffi")]
 mod uniffi_bindings {
 	use std::{
@@ -208,11 +213,11 @@ mod uniffi_bindings {
 	use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 
 	use super::{
-		ArchiveReader, EntriesReadReport, Opener, RANGE_PREALLOCATED, list_job, managed,
-		open_nested_job, reader_config,
+		ArchiveReader, EntriesReadReport, MAX_RANGE_BYTES, Opener, RANGE_PREALLOCATED, list_job,
+		managed, open_nested_job, reader_config,
 	};
 	use crate::{
-		Error,
+		Error, ErrorKind,
 		auth::{JsClient, js_impls::UnauthJsClient},
 		fs::archive::{
 			ArchiveFormat, EntryByteAccess, ReaderDownloadEntryConfig,
@@ -263,6 +268,20 @@ mod uniffi_bindings {
 	impl EntryDownloadCallback for ReadEntriesChannel {
 		fn on_update(&self, update: extract::EntryDownloadUpdate) {
 			let _ = self.0.send(ReadEntriesDelivery::Update(update));
+		}
+	}
+
+	/// The file of the entry a pass is writing, removed when the guard drops with the entry
+	/// unfinished.
+	#[derive(Default)]
+	struct Unfinished(Arc<Mutex<Option<PathBuf>>>);
+
+	impl Drop for Unfinished {
+		fn drop(&mut self) {
+			let path = self.0.lock().unwrap_or_else(PoisonError::into_inner).take();
+			if let Some(path) = path {
+				let _ = std::fs::remove_file(path);
+			}
 		}
 	}
 
@@ -400,8 +419,10 @@ mod uniffi_bindings {
 			self.inner.index_held()
 		}
 
-		/// Gives up what the reader holds. Every later call fails with `InvalidState`; a call
-		/// already running goes on to its end.
+		/// Gives up what the reader holds, and closes the readers of archives nested in it.
+		/// Every later call fails with `InvalidState`, and so does a range read already
+		/// running, at its next chunk; a job already running (a listing, a download, a pass)
+		/// runs to its end. Never waits on a lock.
 		pub fn close(&self) {
 			self.inner.close();
 		}
@@ -441,7 +462,9 @@ mod uniffi_bindings {
 		}
 
 		/// Bytes `start..end` of `entry`, which has to be `Mapped` or `Seekable`, unchecked
-		/// (the entry's checksum covers it whole). Takes no job slot.
+		/// (the entry's checksum covers it whole), at most 64 MiB of it: a longer range is
+		/// refused (`InvalidState`), to be written to a file instead. Takes no job slot unless
+		/// the reader reads its index again (see the core `ArchiveReader::entry_byte_access`).
 		pub async fn read_entry_range(
 			&self,
 			entry: ArchiveEntryId,
@@ -450,6 +473,15 @@ mod uniffi_bindings {
 			managed_future: ManagedFuture,
 		) -> Result<Vec<u8>, Error> {
 			let reader = self.reader();
+			if end.saturating_sub(start) > MAX_RANGE_BYTES {
+				return Err(Error::custom(
+					ErrorKind::InvalidState,
+					format!(
+						"a range of more than {MAX_RANGE_BYTES} bytes is written to a file \
+						 (download_entry or read_entries), not returned"
+					),
+				));
+			}
 			managed(managed_future, move |control| async move {
 				let len = end.saturating_sub(start).min(RANGE_PREALLOCATED);
 				let mut read = futures::io::Cursor::new(Vec::with_capacity(
@@ -525,23 +557,19 @@ mod uniffi_bindings {
 						}
 					},
 					move |sender, control| async move {
-						let writing = Arc::new(Mutex::new(None));
+						// the file of an entry the pass did not finish goes, also when the job is
+						// dropped
+						let writing = Unfinished::default();
 						let result = reader
 							.read_entries(
 								&entries,
-								|entry, _| entry_file(&dir, entry, sender.clone(), &writing),
+								|entry, _| entry_file(&dir, entry, sender.clone(), &writing.0),
 								max_solid_skip,
 								ReadEntriesChannel(sender.clone()),
 								control,
 							)
 							.await;
-						let unfinished = writing
-							.lock()
-							.unwrap_or_else(PoisonError::into_inner)
-							.take();
-						if let Some(path) = unfinished {
-							let _ = tokio::fs::remove_file(path).await;
-						}
+						drop(writing);
 						Ok(EntriesReadReport::new(result))
 					},
 				)
@@ -611,6 +639,36 @@ mod uniffi_bindings {
 			announce: Some((entry, path, sender)),
 			writing: Arc::clone(writing),
 		}))
+	}
+
+	#[cfg(test)]
+	mod tests {
+		use super::*;
+
+		#[tokio::test]
+		async fn an_unfinished_entrys_file_goes_when_the_pass_is_dropped() {
+			let dir = std::env::temp_dir().join(format!("filen-entries-{}", Uuid::new_v4()));
+			std::fs::create_dir_all(&dir).unwrap();
+			let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+			let writing = Unfinished::default();
+			let entry = ArchiveEntryId {
+				archive: Uuid::new_v4(),
+				index: 3,
+			};
+			let mut file = entry_file(&dir, entry, sender, &writing.0)
+				.await
+				.unwrap()
+				.unwrap();
+			futures::AsyncWriteExt::write_all(&mut file, b"part of it")
+				.await
+				.unwrap();
+			assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+			// the pass's future dropped mid-entry: its file goes with the guard
+			drop(file);
+			drop(writing);
+			assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+			std::fs::remove_dir(&dir).unwrap();
+		}
 	}
 }
 
@@ -982,8 +1040,10 @@ mod wasm_bindings {
 			self.inner.index_held()
 		}
 
-		/// Gives up what the reader holds. Every later call fails with `InvalidState`; a call
-		/// already running goes on to its end.
+		/// Gives up what the reader holds, and closes the readers of archives nested in it.
+		/// Every later call fails with `InvalidState`, and so does a range read already
+		/// running, at its next chunk; a job already running (a listing, a download, a pass)
+		/// runs to its end. Never waits on a lock.
 		pub fn close(&self) {
 			self.inner.close();
 		}
@@ -1028,7 +1088,8 @@ mod wasm_bindings {
 		}
 
 		/// Writes a range of a `mapped` or `seekable` entry to a stream, unchecked (the entry's
-		/// checksum covers it whole), and closes the stream. Takes no job slot.
+		/// checksum covers it whole), and closes the stream. Takes no job slot unless the reader
+		/// reads its index again, which `managedFuture` pauses and cancels.
 		#[wasm_bindgen(js_name = "readEntryRange")]
 		pub async fn read_entry_range(&self, params: ReadEntryRangeParams) -> Result<(), Error> {
 			let reader = self.reader();

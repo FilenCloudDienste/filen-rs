@@ -11,7 +11,7 @@
 use std::{
 	sync::{
 		Arc, LazyLock, Mutex, MutexGuard, PoisonError, Weak,
-		atomic::{AtomicU64, Ordering},
+		atomic::{AtomicBool, AtomicU64, Ordering},
 	},
 	time::Duration,
 };
@@ -82,8 +82,10 @@ impl RetainedPool {
 				.filter(|holder| !std::ptr::eq(&**holder, requester))
 				.collect();
 			others.sort_by_key(|holder| holder.used.load(Ordering::Relaxed));
-			'take: for other in &others {
-				for tier in [Tier::Checkpoints, Tier::Chunks, Tier::Index] {
+			// a tier of every reader before the next tier of any: an index read again costs a
+			// job, the others only a fetch or a decode
+			'take: for tier in [Tier::Checkpoints, Tier::Chunks, Tier::Index] {
+				for other in &others {
 					let freed = other.evict(tier);
 					self.charged.fetch_sub(freed, Ordering::AcqRel);
 					if fits(self.charged.load(Ordering::Acquire)) {
@@ -134,6 +136,11 @@ pub(crate) struct Retained {
 	budget: u64,
 	/// When it was used last, on the pool's clock.
 	used: AtomicU64,
+	/// Keeps nothing more once set; read without the state's lock, which a JS thread never
+	/// waits on.
+	closed: AtomicBool,
+	/// Whether `state` holds an index, read without its lock.
+	index_held: AtomicBool,
 	state: Mutex<State>,
 }
 
@@ -150,8 +157,6 @@ struct State {
 	seeks: Vec<(StreamKey, Charged<Box<Seeks>>)>,
 	/// A task drops the chunks once the reader was idle for [`CHUNKS_IDLE_DROP`].
 	sweeping: bool,
-	/// Kept nothing more once closed.
-	closed: bool,
 }
 
 /// Something kept, and the bytes it was charged.
@@ -180,6 +185,8 @@ impl Retained {
 			used: AtomicU64::new(pool.clock.fetch_add(1, Ordering::Relaxed)),
 			pool,
 			budget,
+			closed: AtomicBool::new(false),
+			index_held: AtomicBool::new(false),
 			state: Mutex::new(State::default()),
 		});
 		retained.pool.register(Arc::downgrade(&retained));
@@ -208,7 +215,7 @@ impl Retained {
 	pub(crate) fn hold_index(&self, index: Arc<HeldIndex>) -> bool {
 		self.touch();
 		let bytes = index.heap_bytes();
-		if bytes > MAX_HELD_INDEX_BYTES || lock(&self.state).closed {
+		if bytes > MAX_HELD_INDEX_BYTES || self.is_closed() {
 			return false;
 		}
 		let replaced = lock(&self.state).index.take();
@@ -218,7 +225,7 @@ impl Retained {
 			return false;
 		}
 		let mut state = lock(&self.state);
-		if state.closed {
+		if self.is_closed() {
 			drop(state);
 			self.pool.release(bytes);
 			return false;
@@ -227,6 +234,7 @@ impl Retained {
 			value: index,
 			bytes,
 		});
+		self.index_held.store(true, Ordering::Release);
 		drop(state);
 		self.pool
 			.release(replaced.map_or(0, |replaced| replaced.bytes));
@@ -242,11 +250,11 @@ impl Retained {
 	/// Keeps how entry `ordinal` is read, unless no room can be made for it.
 	pub(crate) fn keep_access(&self, ordinal: u64, resolved: Resolved) {
 		self.touch();
-		if lock(&self.state).closed || !self.pool.charge(self, self.budget, ACCESS_BYTES) {
+		if self.is_closed() || !self.pool.charge(self, self.budget, ACCESS_BYTES) {
 			return;
 		}
 		let mut state = lock(&self.state);
-		let kept = !state.closed && state.accesses.insert(ordinal, resolved).is_none();
+		let kept = !self.is_closed() && state.accesses.insert(ordinal, resolved).is_none();
 		if kept {
 			state.access_bytes += ACCESS_BYTES;
 		}
@@ -274,7 +282,7 @@ impl Retained {
 		let bytes = seeks.bytes();
 		let oldest = {
 			let mut state = lock(&self.state);
-			if state.closed {
+			if self.is_closed() {
 				return;
 			}
 			(state.seeks.len() >= READER_SEEKS).then(|| state.seeks.pop())
@@ -285,7 +293,7 @@ impl Retained {
 			return;
 		}
 		let mut state = lock(&self.state);
-		if state.closed {
+		if self.is_closed() {
 			drop(state);
 			self.pool.release(bytes);
 			return;
@@ -334,7 +342,7 @@ impl Retained {
 		let bytes = data.capacity() as u64;
 		let oldest = {
 			let mut state = lock(&self.state);
-			if state.closed || state.chunks.iter().any(|(kept, _)| *kept == index) {
+			if self.is_closed() || state.chunks.iter().any(|(kept, _)| *kept == index) {
 				return;
 			}
 			(state.chunks.len() >= READER_CHUNKS).then(|| state.chunks.pop())
@@ -345,7 +353,7 @@ impl Retained {
 			return;
 		}
 		let mut state = lock(&self.state);
-		if state.closed {
+		if self.is_closed() {
 			drop(state);
 			self.pool.release(bytes);
 			return;
@@ -414,6 +422,7 @@ impl Retained {
 				.map(|(_, chunk)| chunk.bytes)
 				.sum(),
 			Tier::Index => {
+				self.index_held.store(false, Ordering::Release);
 				state.accesses = SeededMap::default();
 				std::mem::take(&mut state.access_bytes)
 					+ state.index.take().map_or(0, |index| index.bytes)
@@ -421,16 +430,45 @@ impl Retained {
 		}
 	}
 
-	/// Gives up everything, and keeps nothing more: the reader closed.
-	pub(crate) fn close(&self) {
-		let mut state = lock(&self.state);
-		state.closed = true;
+	/// Whether the reader closed.
+	fn is_closed(&self) -> bool {
+		self.closed.load(Ordering::Acquire)
+	}
+
+	/// Whether it holds an index, without waiting on anything.
+	pub(crate) fn holds_index(&self) -> bool {
+		self.index_held.load(Ordering::Acquire)
+	}
+
+	/// Gives up everything, and keeps nothing more: the reader closed. Never waits on the
+	/// state's lock: when a call holds it, a task gives everything up once the call let go.
+	pub(crate) fn close(self: &Arc<Self>) {
+		if self.closed.swap(true, Ordering::AcqRel) {
+			return;
+		}
+		self.index_held.store(false, Ordering::Release);
+		if self.release_all() {
+			return;
+		}
+		let retained = Arc::clone(self);
+		drop(spawn_task_maybe_send(async move {
+			while !retained.release_all() {
+				sleep(Duration::from_millis(1)).await;
+			}
+		}));
+	}
+
+	/// Gives up everything it holds, when the state's lock is free; whether it was.
+	fn release_all(&self) -> bool {
+		let Ok(mut state) = self.state.try_lock() else {
+			return false;
+		};
 		let freed = state.bytes();
 		let kept = std::mem::take(&mut *state);
-		state.closed = true;
 		drop(state);
 		drop(kept);
 		self.pool.release(freed);
+		true
 	}
 }
 
@@ -552,6 +590,49 @@ mod tests {
 		assert!(a.index().is_none());
 		assert_eq!(kept(&b), [2, 1]);
 		assert_eq!(pool.charged.load(Ordering::Acquire), 2000 + index_bytes);
+	}
+
+	#[tokio::test]
+	async fn a_tier_of_every_reader_goes_before_the_next_tier_of_any() {
+		let pool = Arc::new(RetainedPool::default());
+		let index = index(0);
+		let index_bytes = index.heap_bytes();
+		let budget = index_bytes + 2000;
+		let (a, b, c) = (
+			Retained::new(Arc::clone(&pool), budget),
+			Retained::new(Arc::clone(&pool), budget),
+			Retained::new(Arc::clone(&pool), budget),
+		);
+		assert!(a.hold_index(index));
+		b.keep_chunk(0, chunk(1000));
+		// a was used longest ago, but its index costs a job to read again: b's chunk goes first
+		c.keep_chunk(0, chunk(1500));
+		assert!(holds_index(&a));
+		assert!(a.holds_index());
+		assert_eq!(kept(&b), Vec::<u64>::new());
+		assert_eq!(kept(&c), [0]);
+	}
+
+	#[tokio::test]
+	async fn closing_never_waits_on_a_call_holding_the_state() {
+		let pool = Arc::new(RetainedPool::default());
+		let retained = Retained::new(Arc::clone(&pool), 5000);
+		retained.keep_chunk(0, chunk(1000));
+		let held = lock(&retained.state);
+		retained.close();
+		assert!(retained.is_closed());
+		assert_eq!(pool.charged.load(Ordering::Acquire), 1000);
+		drop(held);
+		// a task gives it up once the call let go
+		for _ in 0..1000 {
+			if pool.charged.load(Ordering::Acquire) == 0 {
+				break;
+			}
+			sleep(Duration::from_millis(1)).await;
+		}
+		assert_eq!(pool.charged.load(Ordering::Acquire), 0);
+		retained.keep_chunk(1, chunk(1000));
+		assert_eq!(kept(&retained), Vec::<u64>::new());
 	}
 
 	#[tokio::test]
