@@ -86,7 +86,12 @@ function respond(e: FetchEvent, handler: () => Promise<Response>) {
 self.addEventListener("fetch", (e: FetchEvent) => {
 	try {
 		const url = new URL(e.request.url)
-		console.log(`Handling fetch event for ${url.pathname}`)
+
+		// Only its own routes: every other request the page makes passes through untouched.
+		if (url.pathname.startsWith("/serviceWorker/")) {
+			console.log(`Handling fetch event for ${url.pathname}`)
+		}
+
 		switch (url.pathname) {
 			case "/serviceWorker/download": {
 				const file = url.searchParams.get("file")
