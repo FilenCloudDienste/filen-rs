@@ -28,6 +28,8 @@ use crate::{
 use codec::Selection;
 
 pub use client_impl::{EntryDownloadConfig, ExtractConfig, ListConfig};
+pub(crate) use codec::path_refusal;
+pub(crate) use download::EntryDownloadError;
 pub use download::{
 	EntryDownloadCallback, EntryDownloadFailed, EntryDownloadPhase, EntryDownloadReport,
 	EntryDownloadUpdate, SolidSkipExceeded,

@@ -16,9 +16,9 @@ use std::{
 	time::Duration,
 };
 
-use crate::{runtime::spawn_task_maybe_send, util::sleep};
+use crate::{runtime::spawn_task_maybe_send, util::SeededMap, util::sleep};
 
-use super::extract::codec::HeldIndex;
+use super::{extract::codec::HeldIndex, reader::Resolved};
 
 /// Most heap one reader's index may take and still be held: a larger one is read again by every
 /// job that needs it.
@@ -37,6 +37,9 @@ static PROCESS_POOL: LazyLock<Arc<RetainedPool>> = LazyLock::new(Arc::default);
 pub(crate) fn process_pool() -> Arc<RetainedPool> {
 	Arc::clone(&PROCESS_POOL)
 }
+
+/// What one entry's access kept takes, a map's room to grow included.
+const ACCESS_BYTES: u64 = 2 * size_of::<(u64, Resolved)>() as u64;
 
 /// Every reader's retained state, and what it is charged in all.
 #[derive(Default)]
@@ -129,6 +132,10 @@ pub(crate) struct Retained {
 #[derive(Default)]
 struct State {
 	index: Option<Charged<Arc<HeldIndex>>>,
+	/// How each entry resolved so far is read, which goes with the index.
+	accesses: SeededMap<u64, Resolved>,
+	/// What `accesses` is charged.
+	access_bytes: u64,
 	/// Most recently used first.
 	chunks: Vec<(u64, Charged<Arc<Vec<u8>>>)>,
 	/// A task drops the chunks once the reader was idle for [`CHUNKS_IDLE_DROP`].
@@ -146,6 +153,7 @@ struct Charged<T> {
 impl State {
 	fn bytes(&self) -> u64 {
 		self.index.as_ref().map_or(0, |index| index.bytes)
+			+ self.access_bytes
 			+ self
 				.chunks
 				.iter()
@@ -212,6 +220,29 @@ impl Retained {
 		self.pool
 			.release(replaced.map_or(0, |replaced| replaced.bytes));
 		true
+	}
+
+	/// How entry `ordinal` is read, when it was resolved before.
+	pub(crate) fn access(&self, ordinal: u64) -> Option<Resolved> {
+		self.touch();
+		lock(&self.state).accesses.get(&ordinal).copied()
+	}
+
+	/// Keeps how entry `ordinal` is read, unless no room can be made for it.
+	pub(crate) fn keep_access(&self, ordinal: u64, resolved: Resolved) {
+		self.touch();
+		if lock(&self.state).closed || !self.pool.charge(self, self.budget, ACCESS_BYTES) {
+			return;
+		}
+		let mut state = lock(&self.state);
+		let kept = !state.closed && state.accesses.insert(ordinal, resolved).is_none();
+		if kept {
+			state.access_bytes += ACCESS_BYTES;
+		}
+		drop(state);
+		if !kept {
+			self.pool.release(ACCESS_BYTES);
+		}
 	}
 
 	/// Chunk `index` of the archive, when it is kept.
@@ -305,7 +336,11 @@ impl Retained {
 				.iter()
 				.map(|(_, chunk)| chunk.bytes)
 				.sum(),
-			Tier::Index => state.index.take().map_or(0, |index| index.bytes),
+			Tier::Index => {
+				state.accesses = SeededMap::default();
+				std::mem::take(&mut state.access_bytes)
+					+ state.index.take().map_or(0, |index| index.bytes)
+			}
 		}
 	}
 

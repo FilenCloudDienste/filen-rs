@@ -13,7 +13,7 @@ pub(crate) mod read;
 pub(crate) mod write;
 
 /// Record signatures.
-const LOCAL_HEADER_SIG: u32 = 0x0403_4b50;
+pub(crate) const LOCAL_HEADER_SIG: u32 = 0x0403_4b50;
 const CENTRAL_HEADER_SIG: u32 = 0x0201_4b50;
 const EOCD_SIG: u32 = 0x0605_4b50;
 const EOCD64_SIG: u32 = 0x0606_4b50;

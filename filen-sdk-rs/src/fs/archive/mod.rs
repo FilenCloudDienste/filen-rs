@@ -53,6 +53,6 @@ pub use extract::{
 };
 pub use format::{ArchiveFormat, StreamCodec, archive_default_name};
 pub use password::ArchivePassword;
-pub use reader::{ArchiveReader, ReaderDownloadEntryConfig};
+pub use reader::{ArchiveReader, EntryByteAccess, ReaderDownloadEntryConfig};
 pub use sevenz::write::{SevenZEncryption, SevenZMethod};
 pub use zip::{crypto::AesStrength, write::ZipMethod};

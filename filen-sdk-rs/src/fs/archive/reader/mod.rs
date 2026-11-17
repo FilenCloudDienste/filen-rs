@@ -5,6 +5,8 @@
 
 #![warn(unreachable_pub, unused_qualifications)]
 
+mod slice;
+
 use std::sync::{
 	Arc, Mutex, PoisonError,
 	atomic::{AtomicBool, Ordering},
@@ -35,6 +37,9 @@ use crate::{
 	job::{JobControl, report::JobFailed},
 	util::MaybeSend,
 };
+
+pub use slice::EntryByteAccess;
+pub(crate) use slice::Resolved;
 
 /// How [`ArchiveReader::download_entry`] reads its entry; the reader's settings (from
 /// [`Client::open_archive_reader`]) give the rest.
@@ -119,6 +124,41 @@ impl ArchiveReader {
 		self.reader.close();
 	}
 
+	/// How `entry`'s bytes can be read (see [`EntryByteAccess`]): resolved from the index the
+	/// reader holds (for a stored zip entry, reading its local header too, through the chunks
+	/// the reader keeps), then kept with the index. Fails as
+	/// [`ArchiveReader::download_entry`] does, for an entry of another archive, one not in this
+	/// one, a directory or link, or one an extraction would skip. A tar's members and a single
+	/// compressed file are `Sequential`.
+	pub async fn entry_byte_access(
+		&self,
+		entry: ArchiveEntryId,
+	) -> Result<EntryByteAccess, Arc<Error>> {
+		self.reader.entry_byte_access(entry).await
+	}
+
+	/// Writes bytes `start..end` of `entry`, which has to be
+	/// [`EntryByteAccess::Mapped`], to `writer`, then closes `writer`. Only the archive's
+	/// chunks the range lies in are read, a few ahead while the client's file-IO budget has room
+	/// for them, and those the reader keeps not at all; no job slot is taken. The bytes are not
+	/// checked against the entry's checksum, which covers it whole. Fails with
+	/// [`ErrorKind::InvalidState`] for a range past the entry's end or an entry not mapped;
+	/// dropping the future stops the read.
+	pub async fn read_entry_range<W>(
+		&self,
+		entry: ArchiveEntryId,
+		start: u64,
+		end: u64,
+		writer: &mut W,
+	) -> Result<(), Arc<Error>>
+	where
+		W: AsyncWrite + Unpin + MaybeSend,
+	{
+		self.reader
+			.read_entry_range(entry, start, end, writer)
+			.await
+	}
+
 	/// Lists the archive's entries, as [`Client::list_archive`] does with the reader's settings,
 	/// a zip's or 7z's from the index the reader holds.
 	pub async fn list(
@@ -149,6 +189,14 @@ impl ArchiveReader {
 			.download_entry(entry, writer, config.max_solid_skip, callback, control)
 			.await
 	}
+}
+
+/// A listing's progress nobody hears of: a call that reads the index again for itself.
+struct Unreported;
+
+impl ListCallback for Unreported {
+	fn on_entries_batch(&self, _: Vec<crate::fs::archive::extract::ArchiveEntry>) {}
+	fn on_update(&self, _: crate::fs::archive::extract::ListUpdate) {}
 }
 
 /// What a reader holds and how it reads, over any drive backend.
@@ -240,6 +288,29 @@ impl<B: DriveBackend> Reader<B> {
 			Some(None) => IndexUse::ReadAndReturn,
 			None => IndexUse::Read,
 		}
+	}
+
+	/// The archive's index: the one held, or else read again (and held again when it can be).
+	pub(crate) async fn held_index(&self) -> Result<Arc<HeldIndex>, Arc<Error>> {
+		if let Some(index) = self.retained.as_ref().and_then(|retained| retained.index()) {
+			return Ok(index);
+		}
+		let opened = open(self.read_job(JobControl::default()), Unreported)
+			.await
+			.map_err(|failed| failed.error)?;
+		self.note_format(Some(opened.format));
+		let index: Arc<HeldIndex> = Arc::from(opened.index.ok_or_else(|| {
+			Arc::new(Error::custom(
+				ErrorKind::InvalidState,
+				"the archive has no index",
+			))
+		})?);
+		if let Some(retained) = &self.retained
+			&& !self.closed.load(Ordering::SeqCst)
+		{
+			retained.hold_index(Arc::clone(&index));
+		}
+		Ok(index)
 	}
 
 	/// Holds `index`, which a job read, for the calls after it.

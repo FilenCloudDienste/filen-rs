@@ -256,6 +256,11 @@ fn decodes_to_tar(block: &[u8], name: &str) -> bool {
 			)
 }
 
+/// Why an extraction skips an entry stored at `stored` for its path alone, if it does.
+pub(crate) fn path_refusal(stored: &str) -> Option<ExtractSkipReason> {
+	entry_path(stored).err().map(entries::path_skip_reason)
+}
+
 /// What a file that is no archive the SDK reads fails with.
 fn not_an_archive() -> Error {
 	Error::custom(

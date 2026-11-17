@@ -142,7 +142,7 @@ impl From<SolidSkipExceeded> for Error {
 
 /// Why the entry chosen cannot be downloaded.
 #[derive(Debug, thiserror::Error)]
-pub(super) enum EntryDownloadError {
+pub(crate) enum EntryDownloadError {
 	/// A tar's or a single compressed file's, which are only read front to back.
 	#[error("only a zip's or 7z's entries can be downloaded alone")]
 	NotIndexed,

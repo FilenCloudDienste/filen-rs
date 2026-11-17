@@ -13,7 +13,10 @@ use crate::{
 			extract::{ArchiveEntry, EntryDownloadUpdate, ListUpdate},
 			sevenz::write::{SevenZEncryption, SevenZMethod},
 			test_support::{archive_password, incompressible, sevenz_of},
-			zip::write::{ZipMethod, ZipWriter},
+			zip::{
+				crypto::AesStrength,
+				write::{Encryption, ZipMethod, ZipWriter},
+			},
 		},
 		drive_job::test_support::{FakeBackend, remote_file},
 	},
@@ -302,4 +305,179 @@ fn _reader_futures_are_send(
 		Ignore,
 		JobControl::default(),
 	));
+}
+
+/// A zip of `files`, each under its method and, when given, AES under its password.
+fn zip_with(files: &[(&str, &[u8], ZipMethod, Option<&str>)]) -> Vec<u8> {
+	let mut writer = ZipWriter::new(Vec::new());
+	for &(path, data, method, password) in files {
+		let password = password.map(archive_password);
+		let encryption = password.as_ref().map(|password| Encryption {
+			password,
+			strength: AesStrength::Aes256,
+		});
+		writer
+			.add_file(
+				path,
+				None,
+				data.len() as u64,
+				method,
+				encryption,
+				&mut &data[..],
+			)
+			.unwrap();
+	}
+	writer.add_dir("dir", None).unwrap();
+	writer.finish().unwrap()
+}
+
+async fn opened(
+	name: &str,
+	bytes: Vec<u8>,
+	password: Option<&str>,
+) -> (Arc<FakeBackend>, Reader<FakeBackend>) {
+	let (backend, archive, config) = drive(name, bytes, 64 << 20);
+	let reader = reader_of(&backend, &archive, &config, password);
+	reader.open(Ignore, JobControl::default()).await.unwrap();
+	(backend, reader)
+}
+
+async fn range(
+	reader: &Reader<FakeBackend>,
+	index: u32,
+	start: u64,
+	end: u64,
+) -> Result<Vec<u8>, Arc<Error>> {
+	let mut written = futures::io::Cursor::new(Vec::new());
+	reader
+		.read_entry_range(entry(index), start, end, &mut written)
+		.await?;
+	Ok(written.into_inner())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_zips_entries_are_mapped_only_when_stored_as_they_are() {
+	let data = incompressible(5000, 1);
+	let zip = zip_with(&[
+		("stored", &data, ZipMethod::Stored, None),
+		("deflated", &data, ZipMethod::Deflate { level: 6 }, None),
+		("stored-aes", &data, ZipMethod::Stored, Some("pw")),
+		("../escapes", &data, ZipMethod::Stored, None),
+	]);
+	let (_, reader) = opened("z.zip", zip, Some("pw")).await;
+	let access = |index| reader.entry_byte_access(entry(index));
+	assert_eq!(
+		access(0).await.unwrap(),
+		EntryByteAccess::Mapped { size: 5000 }
+	);
+	assert_eq!(
+		access(1).await.unwrap(),
+		EntryByteAccess::Whole { size: 5000 }
+	);
+	assert_eq!(
+		access(2).await.unwrap(),
+		EntryByteAccess::Whole { size: 5000 }
+	);
+	assert_eq!(access(3).await.unwrap_err().kind(), ErrorKind::InvalidState);
+	assert_eq!(access(4).await.unwrap_err().kind(), ErrorKind::InvalidState);
+	assert_eq!(access(9).await.unwrap_err().kind(), ErrorKind::InvalidState);
+	assert_eq!(range(&reader, 0, 0, 5000).await.unwrap(), data);
+	assert_eq!(
+		range(&reader, 1, 0, 1).await.unwrap_err().kind(),
+		ErrorKind::InvalidState
+	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_mapped_range_fetches_only_the_chunks_it_lies_in() {
+	let (zip, data) = spread_zip();
+	let (backend, reader) = opened("z.zip", zip, None).await;
+	fetched(&backend);
+	// entry 1 lies in chunks 1 and 2: its local header too
+	let len = data[1].len() as u64;
+	let at = CHUNK_SIZE_U64;
+	assert_eq!(
+		reader.entry_byte_access(entry(1)).await.unwrap(),
+		EntryByteAccess::Mapped { size: len }
+	);
+	assert_eq!(fetched(&backend), [1]);
+	for (start, end) in [
+		(0, 1),
+		(len - 1, len),
+		(0, len),
+		(100, 100),
+		(at / 2, at / 2 + 3),
+	] {
+		let start_at = usize::try_from(start).unwrap();
+		let end_at = usize::try_from(end).unwrap();
+		assert_eq!(
+			range(&reader, 1, start, end).await.unwrap(),
+			data[1][start_at..end_at],
+			"{start}..{end}"
+		);
+	}
+	// chunk 2 once, chunk 1 kept from the header
+	assert_eq!(fetched(&backend), [2]);
+	assert_eq!(
+		range(&reader, 1, 0, len + 1).await.unwrap_err().kind(),
+		ErrorKind::InvalidState
+	);
+	assert_eq!(
+		range(&reader, 1, 5, 4).await.unwrap_err().kind(),
+		ErrorKind::InvalidState
+	);
+	// resolved once
+	reader.entry_byte_access(entry(1)).await.unwrap();
+	assert_eq!(fetched(&backend), Vec::<u64>::new());
+	reader.close();
+	assert_eq!(
+		reader.entry_byte_access(entry(1)).await.unwrap_err().kind(),
+		ErrorKind::InvalidState
+	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_7z_entry_is_mapped_when_its_folder_only_copies() {
+	let (a, b) = (incompressible(3000, 1), incompressible(4000, 2));
+	let files = [("a", Some(&a[..])), ("b", Some(&b[..]))];
+	for solid in [false, true] {
+		let copied = sevenz_of(&files, SevenZMethod::Copy, solid, None);
+		let (_, reader) = opened("c.7z", copied, None).await;
+		assert_eq!(
+			reader.entry_byte_access(entry(1)).await.unwrap(),
+			EntryByteAccess::Mapped { size: 4000 },
+			"solid {solid}"
+		);
+		assert_eq!(range(&reader, 1, 10, 4000).await.unwrap(), b[10..]);
+		assert_eq!(range(&reader, 0, 0, 3000).await.unwrap(), a);
+	}
+	let compressed = sevenz_of(&files, SevenZMethod::Lzma2 { level: 1 }, false, None);
+	let (_, reader) = opened("l.7z", compressed, None).await;
+	assert_eq!(
+		reader.entry_byte_access(entry(1)).await.unwrap(),
+		EntryByteAccess::Whole { size: 4000 }
+	);
+	let encrypted = sevenz_of(
+		&files,
+		SevenZMethod::Copy,
+		false,
+		Some((SevenZEncryption::Entries, "pw")),
+	);
+	let (_, reader) = opened("e.7z", encrypted, Some("pw")).await;
+	assert_eq!(
+		reader.entry_byte_access(entry(0)).await.unwrap(),
+		EntryByteAccess::Whole { size: 3000 }
+	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reader_reads_the_index_again_to_resolve_an_entry() {
+	let (zip, data) = spread_zip();
+	let last = (zip.len() as u64 - 1) / CHUNK_SIZE_U64;
+	let (backend, reader) = opened("z.zip", zip, None).await;
+	reader.retained.as_ref().unwrap().evict_index_for_test();
+	fetched(&backend);
+	assert_eq!(range(&reader, 2, 0, 5).await.unwrap(), data[2][..5]);
+	assert!(fetched(&backend).contains(&last));
+	assert!(reader.index_held());
 }
