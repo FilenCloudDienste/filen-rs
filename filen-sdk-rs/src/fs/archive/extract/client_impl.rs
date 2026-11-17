@@ -23,7 +23,7 @@ use super::{
 	codec::{IndexUse, Task},
 	engine::{ArchiveDisposal, ExtractTask, run_extract},
 	list::{ListCallback, ListFailed, ListReport},
-	reading::start_codec,
+	reading::{CodecInput, start_codec},
 	report::Reporter,
 };
 
@@ -241,9 +241,13 @@ impl Client {
 			.unwrap_or_default();
 		let (max_bytes, max_items, expansion) =
 			(config.max_bytes, config.max_items, config.expansion_limit);
+		let input = CodecInput {
+			name: archive.name().unwrap_or_default(),
+			len: archive.size(),
+			expansion_base: None,
+		};
 		let start = start_codec(
-			archive.name().unwrap_or_default(),
-			archive.size(),
+			input,
 			&archives,
 			config,
 			Task::Extract(selection),

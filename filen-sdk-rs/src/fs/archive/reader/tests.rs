@@ -4,13 +4,15 @@ use std::{io::Write, sync::Arc};
 
 use filen_types::fs::Uuid;
 
-use super::*;
+use super::{nested::nested_id, *};
 use crate::{
 	auth::http::ClientConfig,
 	consts::{CHUNK_SIZE, CHUNK_SIZE_U64},
 	fs::{
 		archive::{
-			extract::{ArchiveEntry, EntryDownloadUpdate, ListUpdate, SolidSkipExceeded},
+			extract::{
+				ArchiveEntry, EntryDownloadUpdate, ExpansionLimit, ListUpdate, SolidSkipExceeded,
+			},
 			sevenz::write::{SevenZEncryption, SevenZMethod},
 			test_support::{
 				TarMember, archive_password, gzip, incompressible, sevenz_of, tar_of, tar_with,
@@ -973,4 +975,162 @@ async fn a_gzip_tars_members_read_by_range_across_its_members() {
 	check_ranges(&reader, 1, &big, 41).await;
 	assert_eq!(range(&reader, 2, 0, 5).await.unwrap(), b"gamma");
 	assert_eq!(range(&reader, 0, 0, 5).await.unwrap(), b"alpha");
+}
+
+/// Opens entry `index` of `parent` as a nested archive.
+async fn nested(parent: &MaybeArc<Reader>, index: u32) -> Result<MaybeArc<Reader>, Arc<Error>> {
+	let (bytes, name) = parent.entry_bytes(entry_of(parent, index)).await?;
+	let reader = Reader::nested(parent, bytes, name, None);
+	reader
+		.open(Ignore, JobControl::default())
+		.await
+		.map_err(|failed| failed.error)?;
+	Ok(MaybeArc::new(reader))
+}
+
+/// Entry `index` of the archive `reader` reads.
+fn entry_of(reader: &Reader, index: u32) -> ArchiveEntryId {
+	ArchiveEntryId {
+		archive: reader.archive_uuid(),
+		index,
+	}
+}
+
+async fn range_of(reader: &Reader, index: u32, start: u64, end: u64) -> Vec<u8> {
+	let mut written = futures::io::Cursor::new(Vec::new());
+	reader
+		.read_entry_range(entry_of(reader, index), start, end, &mut written)
+		.await
+		.unwrap();
+	written.into_inner()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_archive_inside_an_archive_is_read_through_its_entry() {
+	let data = text(200 << 10, 12);
+	let inner = zip_with(&[
+		("a.txt", b"alpha", ZipMethod::Stored, None),
+		("text", &data, ZipMethod::Deflate { level: 6 }, None),
+	]);
+	let tar = tar_with(&[TarMember::Data("t.txt", b"in a tar")]);
+	for method in [ZipMethod::Stored, ZipMethod::Deflate { level: 6 }] {
+		let outer = zip_with(&[
+			("inner.zip", &inner, method, None),
+			("inner.tar", &tar, method, None),
+		]);
+		let (_, outer) = opened("outer.zip", outer, None).await;
+		let outer = MaybeArc::new(outer);
+		let zip = nested(&outer, 0).await.unwrap();
+		assert_eq!(zip.format(), Some(ArchiveFormat::Zip));
+		assert!(zip.index_held());
+		let listed = zip.list(Ignore, JobControl::default()).await.unwrap();
+		let id = nested_id(ARCHIVE, 0);
+		assert_eq!(zip.archive_uuid(), id);
+		assert!(listed.entries.iter().all(|entry| entry.id.archive == id));
+		assert_eq!(range_of(&zip, 0, 0, 5).await, b"alpha");
+		assert!(range_of(&zip, 1, 1000, 2000).await == data[1000..2000]);
+		// a download through it is checked
+		let mut written = futures::io::Cursor::new(Vec::new());
+		let report = zip
+			.download_entry(
+				entry_of(&zip, 1),
+				&mut written,
+				None,
+				Ignore,
+				JobControl::default(),
+			)
+			.await
+			.unwrap();
+		assert!(report.checked);
+		assert!(written.into_inner() == data);
+		let tar = nested(&outer, 1).await.unwrap();
+		tar.list(Ignore, JobControl::default()).await.unwrap();
+		assert_eq!(range_of(&tar, 0, 0, 8).await, b"in a tar");
+		// opened again, the same ids
+		assert_eq!(nested(&outer, 0).await.unwrap().archive_uuid(), id);
+	}
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn archives_nest_three_deep_and_no_deeper() {
+	let mut archive = zip_with(&[("a.txt", b"alpha", ZipMethod::Stored, None)]);
+	for _ in 0..4 {
+		archive = zip_with(&[("next.zip", &archive, ZipMethod::Stored, None)]);
+	}
+	let (_, root) = opened("root.zip", archive, None).await;
+	let mut reader = MaybeArc::new(root);
+	for _ in 0..3 {
+		reader = nested(&reader, 0).await.unwrap();
+	}
+	assert_eq!(
+		nested(&reader, 0).await.err().unwrap().kind(),
+		ErrorKind::ArchiveUnsupported
+	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_entry_only_read_whole_is_not_opened() {
+	let inner = zip_with(&[("a.txt", b"alpha", ZipMethod::Stored, None)]);
+	let outer = zip_with(&[("inner.zip", &inner, ZipMethod::Bzip2 { level: 6 }, None)]);
+	let (_, outer) = opened("outer.zip", outer, None).await;
+	assert_eq!(
+		nested(&MaybeArc::new(outer), 0).await.err().unwrap().kind(),
+		ErrorKind::ArchiveUnsupported
+	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_expansion_limit_counts_across_the_chain() {
+	let limit = ExpansionLimit {
+		ratio: 10,
+		floor: 1 << 20,
+	};
+	// the inner zip states no more than it holds, and compresses to next to nothing outside
+	let zeros = vec![0u8; 4 << 20];
+	let inner = zip_with(&[("zeros", &zeros, ZipMethod::Stored, None)]);
+	let outer = zip_with(&[
+		("inner.zip", &inner, ZipMethod::Deflate { level: 9 }, None),
+		(
+			"small.zip",
+			&zip_with(&[(
+				"z",
+				&zeros[..2 << 20],
+				ZipMethod::Deflate { level: 9 },
+				None,
+			)]),
+			ZipMethod::Stored,
+			None,
+		),
+	]);
+	let (backend, archive, config) = drive("outer.zip", outer, 64 << 20);
+	let outer = Reader::new(
+		Arc::clone(&backend),
+		archive,
+		config,
+		ListConfig {
+			expansion_limit: Some(limit),
+			..ListConfig::default()
+		},
+	);
+	outer.open(Ignore, JobControl::default()).await.unwrap();
+	let outer = MaybeArc::new(outer);
+	// 4 MiB from a few KiB is past the limit, though the entry states no more than it holds
+	assert_eq!(
+		nested(&outer, 0).await.err().unwrap().kind(),
+		ErrorKind::ArchiveTooLarge
+	);
+	// the stored one opens, but what it decodes to counts against the outermost archive
+	let small = nested(&outer, 1).await.unwrap();
+	let mut written = futures::io::Cursor::new(Vec::new());
+	let failed = small
+		.download_entry(
+			entry_of(&small, 0),
+			&mut written,
+			None,
+			Ignore,
+			JobControl::default(),
+		)
+		.await
+		.unwrap_err();
+	assert_eq!(failed.error.kind(), ErrorKind::ArchiveTooLarge);
 }

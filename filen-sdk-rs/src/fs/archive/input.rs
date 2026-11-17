@@ -118,8 +118,8 @@ pub(crate) struct DriveFile<B> {
 }
 
 impl<B: DriveBackend> DriveFile<B> {
-	pub(crate) fn new(backend: Arc<B>, file: RemoteFileType<'static>) -> Arc<Self> {
-		Arc::new(Self { backend, file })
+	pub(crate) fn new(backend: Arc<B>, file: RemoteFileType<'static>) -> MaybeArc<Self> {
+		MaybeArc::new(Self { backend, file })
 	}
 }
 
@@ -149,7 +149,7 @@ impl<B: DriveBackend> ArchiveBytes for DriveFile<B> {
 }
 
 struct ArchiveInput {
-	source: Arc<dyn ArchiveBytes>,
+	source: MaybeArc<dyn ArchiveBytes>,
 	chunks: u64,
 	next_fetch: u64,
 	fetches: FuturesOrdered<MaybeSendBoxFuture<'static, FetchedChunk>>,
@@ -180,7 +180,7 @@ struct ArchiveInput {
 impl ArchiveInput {
 	fn new(
 		memory: Arc<Semaphore>,
-		source: Arc<dyn ArchiveBytes>,
+		source: MaybeArc<dyn ArchiveBytes>,
 		kept: Option<Arc<Retained>>,
 	) -> Self {
 		Self {
@@ -201,7 +201,7 @@ impl ArchiveInput {
 		}
 	}
 
-	fn source(&self) -> &Arc<dyn ArchiveBytes> {
+	fn source(&self) -> &MaybeArc<dyn ArchiveBytes> {
 		&self.source
 	}
 
@@ -271,7 +271,7 @@ impl ArchiveInput {
 			};
 			let index = self.next_fetch;
 			self.next_fetch += 1;
-			let source = Arc::clone(&self.source);
+			let source = MaybeArc::clone(&self.source);
 			let op = ops.op();
 			self.fetches.push_back(Box::pin(async move {
 				let result = source.chunk(index).await;
@@ -396,7 +396,7 @@ impl<T> CodecFeed<T> {
 	/// floor of one chunk draws on the client's `memory`.
 	pub(crate) fn new(
 		memory: Arc<Semaphore>,
-		source: Arc<dyn ArchiveBytes>,
+		source: MaybeArc<dyn ArchiveBytes>,
 		link: WorkerLink<Result<T, Error>>,
 		running: OpGuard,
 		chunks: Option<Arc<Retained>>,
@@ -460,7 +460,7 @@ impl<T> CodecFeed<T> {
 		self.input.owes_codec()
 	}
 
-	pub(crate) fn source(&self) -> &Arc<dyn ArchiveBytes> {
+	pub(crate) fn source(&self) -> &MaybeArc<dyn ArchiveBytes> {
 		self.input.source()
 	}
 
@@ -545,7 +545,7 @@ pub(crate) struct ReadingJob<'a, S: JobState> {
 /// phase the job ends in and why.
 pub(crate) async fn start_reading<S: JobState, T>(
 	memory: Arc<Semaphore>,
-	source: Arc<dyn ArchiveBytes>,
+	source: MaybeArc<dyn ArchiveBytes>,
 	job: ReadingJob<'_, S>,
 	start: impl FnOnce() -> Result<WorkerLink<Result<T, Error>>, Error>,
 ) -> Result<(OwnedSemaphorePermit, CodecFeed<T>), (S::Phase, Arc<Error>)> {

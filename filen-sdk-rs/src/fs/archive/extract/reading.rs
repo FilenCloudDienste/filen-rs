@@ -19,7 +19,7 @@ use crate::{
 		worker::{self, CodecStart, WorkerEvent, unexpected_event},
 	},
 	job::{JobControl, report::JobReport},
-	util::MaybeSend,
+	util::{MaybeArc, MaybeSend},
 };
 
 use super::{
@@ -35,9 +35,11 @@ use super::{
 pub(crate) struct ReadJob {
 	/// The client's file-IO budget.
 	pub(crate) memory: Arc<Semaphore>,
-	pub(crate) source: Arc<dyn ArchiveBytes>,
+	pub(crate) source: MaybeArc<dyn ArchiveBytes>,
 	/// The archive's name, which tells some formats.
 	pub(crate) name: String,
+	/// See [`CodecLimits::expansion_base`].
+	pub(crate) expansion_base: Option<u64>,
 	/// The client's archive settings.
 	pub(crate) config: ArchiveConfig,
 	/// The reader's.
@@ -62,6 +64,7 @@ pub(crate) async fn open(job: ReadJob, callback: impl ListCallback) -> Result<Op
 		memory,
 		source,
 		name,
+		expansion_base,
 		config,
 		settings,
 		index: _,
@@ -70,8 +73,11 @@ pub(crate) async fn open(job: ReadJob, callback: impl ListCallback) -> Result<Op
 	} = job;
 	let reporter = ListReporter::new(callback, source.len());
 	let codec = stream_job(
-		&name,
-		source.len(),
+		CodecInput {
+			name: &name,
+			len: source.len(),
+			expansion_base,
+		},
 		&config,
 		settings.into_extraction(),
 		Task::List {
@@ -156,6 +162,7 @@ pub(crate) async fn list(
 		memory,
 		source,
 		name,
+		expansion_base,
 		config,
 		settings,
 		index,
@@ -163,8 +170,11 @@ pub(crate) async fn list(
 		control,
 	} = job;
 	let start = start_codec(
-		&name,
-		source.len(),
+		CodecInput {
+			name: &name,
+			len: source.len(),
+			expansion_base,
+		},
 		&config,
 		settings.into_extraction(),
 		task,
@@ -197,6 +207,7 @@ pub(crate) async fn download<W: AsyncWrite + Unpin + MaybeSend>(
 		memory,
 		source,
 		name,
+		expansion_base,
 		config,
 		settings,
 		index,
@@ -213,7 +224,12 @@ pub(crate) async fn download<W: AsyncWrite + Unpin + MaybeSend>(
 		selection,
 		max_solid_skip,
 	};
-	let start = start_codec(&name, source.len(), &config, extraction, task, index);
+	let input = CodecInput {
+		name: &name,
+		len: source.len(),
+		expansion_base,
+	};
+	let start = start_codec(input, &config, extraction, task, index);
 	run_download(
 		DownloadTask {
 			memory,
@@ -230,23 +246,32 @@ pub(crate) async fn download<W: AsyncWrite + Unpin + MaybeSend>(
 	.await
 }
 
+/// What a job's codec is told of the archive it reads.
+pub(crate) struct CodecInput<'a> {
+	/// Its name, which tells some formats.
+	pub(crate) name: &'a str,
+	pub(crate) len: u64,
+	/// See [`CodecLimits::expansion_base`].
+	pub(crate) expansion_base: Option<u64>,
+}
+
 /// The settings a job's codec reads `archive` under: the client's `archives`, the job's
 /// `config`, its `task`, and where it gets the index from.
 pub(super) fn stream_job(
-	name: &str,
-	len: u64,
+	input: CodecInput<'_>,
 	archives: &ArchiveConfig,
 	config: ExtractConfig,
 	task: Task,
 	index: IndexUse,
 ) -> StreamJob {
 	StreamJob {
-		name: name.to_owned(),
-		len,
+		name: input.name.to_owned(),
+		len: input.len,
 		limits: CodecLimits {
 			decoder_memory: archives.codec_mem_budget(),
 			max_members: archives.max_members,
 			expansion: config.expansion_limit,
+			expansion_base: input.expansion_base,
 			max_index_bytes: archives.max_index_bytes,
 			max_bytes: config.max_bytes,
 		},
@@ -259,14 +284,13 @@ pub(super) fn stream_job(
 
 /// Starts the codec that reads `archive` for `task` (see [`stream_job`]).
 pub(crate) fn start_codec(
-	name: &str,
-	len: u64,
+	input: CodecInput<'_>,
 	archives: &ArchiveConfig,
 	config: ExtractConfig,
 	task: Task,
 	index: IndexUse,
 ) -> CodecStart<CodecResult> {
-	let job = stream_job(name, len, archives, config, task, index);
+	let job = stream_job(input, archives, config, task, index);
 	Box::new(move || worker::start(move |port| extract_stream(&port, job)))
 }
 

@@ -6,6 +6,7 @@
 #![warn(unreachable_pub, unused_qualifications)]
 
 mod inflate;
+mod nested;
 mod sequential;
 mod slice;
 
@@ -24,6 +25,7 @@ use crate::{
 	fs::{
 		HasName,
 		archive::{
+			ArchivePassword,
 			config::ArchiveConfig,
 			extract::{
 				ArchiveEntryId, EntryDownloadCallback, EntryDownloadConfig, EntryDownloadError,
@@ -40,7 +42,7 @@ use crate::{
 		file::enums::RemoteFileType,
 	},
 	job::{JobControl, report::JobFailed},
-	util::{MaybeSend, SeededMap},
+	util::{MaybeArc, MaybeSend, SeededMap},
 };
 
 pub(crate) use inflate::{Seeks, StreamKey};
@@ -66,7 +68,7 @@ impl Default for ReaderDownloadEntryConfig {
 
 /// An open archive: see [`Client::open_archive_reader`].
 pub struct ArchiveReader {
-	reader: Reader,
+	reader: MaybeArc<Reader>,
 }
 
 impl Client {
@@ -96,7 +98,9 @@ impl Client {
 			config,
 		);
 		reader.open(callback, control).await?;
-		Ok(ArchiveReader { reader })
+		Ok(ArchiveReader {
+			reader: MaybeArc::new(reader),
+		})
 	}
 }
 
@@ -207,6 +211,39 @@ impl ArchiveReader {
 			.await
 	}
 
+	/// Opens `entry`, an archive inside this one, as a reader of its own, which reads its bytes
+	/// through this reader: an entry `Mapped` or `Seekable` (see [`ArchiveReader::entry_byte_access`])
+	/// only, at most three archives deep. The nested reader has this one's settings but for
+	/// `password`, and its entries carry an id derived from this archive's and the entry's, the
+	/// same each time the entry is opened. The expansion limit counts what any archive of the
+	/// chain decodes to against what the drive stores of the outermost one. Opening reads the
+	/// nested archive's head and index, as [`Client::open_archive_reader`] does; a zip inside a
+	/// deflated entry has its index at its end, so the entry is decoded once to there.
+	///
+	/// Fails with [`ErrorKind::ArchiveUnsupported`](crate::ErrorKind::ArchiveUnsupported) for an
+	/// entry only read whole or front to back (extract it to open it), and past three levels.
+	pub async fn open_nested(
+		&self,
+		entry: ArchiveEntryId,
+		password: Option<ArchivePassword>,
+		callback: impl ListCallback,
+		control: JobControl,
+	) -> Result<ArchiveReader, ListFailed> {
+		let (bytes, name) = self
+			.reader
+			.entry_bytes(entry)
+			.await
+			.map_err(|error| JobFailed {
+				report: ListReport::empty(),
+				error,
+			})?;
+		let reader = Reader::nested(&self.reader, bytes, name, password);
+		reader.open(callback, control).await?;
+		Ok(ArchiveReader {
+			reader: MaybeArc::new(reader),
+		})
+	}
+
 	/// Lists the archive's entries, as [`Client::list_archive`] does with the reader's settings,
 	/// a zip's or 7z's from the index the reader holds. A bare tar is walked by seeking past its
 	/// members' data, so only the chunks its headers (and its PAX and GNU long-name records) lie
@@ -258,7 +295,7 @@ pub(crate) struct Reader {
 	/// The client's file-IO budget, which chunks in flight are drawn from.
 	memory: Arc<Semaphore>,
 	/// The archive's bytes.
-	source: Arc<dyn ArchiveBytes>,
+	source: MaybeArc<dyn ArchiveBytes>,
 	/// Its name, which tells some formats.
 	name: String,
 	id: Uuid,
@@ -267,6 +304,10 @@ pub(crate) struct Reader {
 	format: Mutex<Option<ArchiveFormat>>,
 	/// What it keeps between its calls; `None` for a reader of one call, which keeps nothing.
 	retained: Option<Arc<Retained>>,
+	/// How many archives it is nested in: 0 for an archive in the drive.
+	depth: u8,
+	/// See [`CodecLimits::expansion_base`](super::extract::codec::CodecLimits).
+	expansion_base: Option<u64>,
 	/// One lock per stream read by range, so its reads decode one at a time.
 	flights: Mutex<SeededMap<StreamKey, Arc<tokio::sync::Mutex<()>>>>,
 	closed: AtomicBool,
@@ -305,6 +346,8 @@ impl Reader {
 			settings,
 			format: Mutex::new(None),
 			retained: None,
+			depth: 0,
+			expansion_base: None,
 			flights: Mutex::default(),
 			closed: AtomicBool::new(false),
 		}
@@ -516,8 +559,9 @@ impl Reader {
 	pub(crate) fn read_job(&self, control: JobControl) -> ReadJob {
 		ReadJob {
 			memory: Arc::clone(&self.memory),
-			source: Arc::clone(&self.source),
+			source: MaybeArc::clone(&self.source),
 			name: self.name.clone(),
+			expansion_base: self.expansion_base,
 			config: self.config.clone(),
 			settings: self.settings.clone(),
 			index: self.index_use(),

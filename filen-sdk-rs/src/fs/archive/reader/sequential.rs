@@ -17,7 +17,7 @@ use crate::{
 				ArchiveEntryId, EntryDownloadCallback, EntryDownloadError, EntryDownloadPhase,
 				EntryDownloadReporter, SolidSkipExceeded,
 				codec::{HeldIndex, Selection, Task},
-				reading::{ReadJob, download_extraction, start_codec},
+				reading::{CodecInput, ReadJob, download_extraction, start_codec},
 			},
 			format::ArchiveFormat,
 			input::{FeedSink, ReadingDriver, ReadingJob, start_reading},
@@ -117,6 +117,7 @@ impl Reader {
 			memory,
 			source,
 			name,
+			expansion_base,
 			config,
 			settings,
 			index,
@@ -128,14 +129,12 @@ impl Reader {
 			selection,
 			max_solid_skip,
 		};
-		let start = start_codec(
-			&name,
-			source.len(),
-			&config,
-			download_extraction(settings),
-			task,
-			index,
-		);
+		let input = CodecInput {
+			name: &name,
+			len: source.len(),
+			expansion_base,
+		};
+		let start = start_codec(input, &config, download_extraction(settings), task, index);
 		let started = start_reading(
 			memory,
 			source,

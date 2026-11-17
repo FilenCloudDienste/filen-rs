@@ -505,7 +505,7 @@ pub(crate) struct ListTask {
 	pub(crate) memory: Arc<Semaphore>,
 	pub(crate) control: JobControl,
 	pub(crate) reporter: MaybeArc<ListReporter>,
-	pub(crate) source: Arc<dyn ArchiveBytes>,
+	pub(crate) source: MaybeArc<dyn ArchiveBytes>,
 	pub(crate) config: ArchiveConfig,
 	/// Starts the codec; called once the job holds its lease.
 	pub(crate) start: CodecStart<CodecResult>,

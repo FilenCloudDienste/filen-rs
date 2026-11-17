@@ -114,6 +114,7 @@ pub(super) fn stream_job(setup: &Setup, options: &Options) -> StreamJob {
 			decoder_memory: CODEC_MEM_BUDGET,
 			max_members: options.config.max_members,
 			expansion: options.expansion,
+			expansion_base: None,
 			max_index_bytes: 32 << 20,
 			max_bytes: options.max_bytes,
 		},

@@ -58,6 +58,7 @@ const LIMITS: CodecLimits = CodecLimits {
 		floor: 256 << 20,
 	}),
 	max_index_bytes: 32 << 20,
+	expansion_base: None,
 	max_bytes: None,
 };
 

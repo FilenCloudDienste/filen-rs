@@ -53,6 +53,10 @@ pub(crate) struct CodecLimits {
 	/// Most members read, of any format; in a tar every record counts.
 	pub(crate) max_members: u64,
 	pub(crate) expansion: Option<ExpansionLimit>,
+	/// For an archive nested in others, the stored bytes of the outermost one, which `expansion`
+	/// counts what it decodes to against, across the whole chain; `None` for an archive in the
+	/// drive, whose own bytes it counts against.
+	pub(crate) expansion_base: Option<u64>,
 	/// Most bytes of an archive's index (a zip's central directory, a 7z's header) read.
 	pub(crate) max_index_bytes: u64,
 	/// Storage free for the files, which an archive stating its sizes up front is refused for
@@ -172,6 +176,7 @@ pub(crate) fn extract_stream(port: &WorkerPort, job: StreamJob) -> Result<Archiv
 				inner: decoder,
 				port,
 				limit: job.limits.expansion,
+				base: job.limits.expansion_base,
 				decoded: 0,
 			};
 			let mut block = [0u8; TAR_BLOCK];
@@ -279,6 +284,11 @@ fn decodes_to_tar(block: &[u8], name: &str) -> bool {
 				ArchiveFormat::of_name(name),
 				Some(ArchiveFormat::Tar { codec: Some(_) })
 			)
+}
+
+/// The error for decoding to more than `limit` lets an archive decode to.
+pub(crate) fn expansion_exceeded(limit: ExpansionLimit) -> Error {
+	ExpansionExceeded(limit.ratio).into()
 }
 
 /// Why an extraction skips an entry stored at `stored` for its path alone, if it does.
@@ -450,7 +460,9 @@ fn check_stated_size(job: &StreamJob, sizes: impl IntoIterator<Item = u64>) -> R
 		.into_iter()
 		.fold(0u64, |total, size| total.saturating_add(size));
 	match job.limits.expansion {
-		Some(limit) if !limit.allows(job.len, stated) => Err(ExpansionExceeded(limit.ratio).into()),
+		Some(limit) if !limit.allows(job.limits.expansion_base.unwrap_or(job.len), stated) => {
+			Err(ExpansionExceeded(limit.ratio).into())
+		}
 		_ => Ok(()),
 	}
 }
@@ -469,6 +481,8 @@ struct Expanding<'p, D> {
 	inner: D,
 	port: &'p WorkerPort,
 	limit: Option<ExpansionLimit>,
+	/// See [`CodecLimits::expansion_base`].
+	base: Option<u64>,
 	decoded: u64,
 }
 
@@ -477,8 +491,11 @@ impl<D: Read> Read for Expanding<'_, D> {
 		let n = self.inner.read(buf)?;
 		self.decoded += n as u64;
 		if let Some(limit) = self.limit
-			&& !limit.allows(self.port.shared().input_bytes(), self.decoded)
-		{
+			&& !limit.allows(
+				self.base
+					.unwrap_or_else(|| self.port.shared().input_bytes()),
+				self.decoded,
+			) {
 			return Err(io::Error::new(
 				io::ErrorKind::InvalidData,
 				Error::from(ExpansionExceeded(limit.ratio)),

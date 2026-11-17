@@ -82,6 +82,7 @@ impl ReadBack {
 			max_members: config.max_members,
 			// the archive is the job's own: whatever it expands to was read to write it
 			expansion: None,
+			expansion_base: None,
 			max_index_bytes: config.max_index_bytes,
 			// reading back creates nothing in the drive
 			max_bytes: None,
