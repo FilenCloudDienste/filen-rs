@@ -65,6 +65,34 @@ function rawFixtures(): Plugin {
 	}
 }
 
+// Starts every module worker script vite serves the tests with forwardWorkerConsole
+// (worker-console-shim.ts): the SDK's filen-sdk-worker-thread.js, spawned from Rust by a plain
+// URL, and wasm-bindgen-rayon's workerHelpers.js, a `?worker_file` module. The service worker
+// comes prebuilt from the public dir, which vite serves untransformed, so sw.ts makes the call.
+const WORKER_CONSOLE_SHIM = "virtual:worker-console-shim"
+const WORKER_SCRIPTS = ["/filen-sdk-worker-thread.js", "/workerHelpers.js"]
+
+function workerConsoleShim(): Plugin {
+	return {
+		name: "worker-console-shim",
+		resolveId(id) {
+			return id === WORKER_CONSOLE_SHIM ? fileURLToPath(new URL("./worker-console-shim.ts", import.meta.url)) : undefined
+		},
+		transform(code, id) {
+			const path = id.split("?")[0]
+
+			if (!WORKER_SCRIPTS.some(script => path.endsWith(script))) {
+				return undefined
+			}
+
+			return {
+				code: `import { forwardWorkerConsole } from ${JSON.stringify(WORKER_CONSOLE_SHIM)};\nforwardWorkerConsole();\n${code}`,
+				map: null
+			}
+		}
+	}
+}
+
 // Every test and hook gets 3 minutes, times `VITE_TEST_TIMEOUT_MULT` (default 1). The nightly
 // sets 10: there each upload queues on the account-wide drive-write lock behind six native
 // legs, and a cap sized for one machine says nothing (2026-09-04: a test of two tiny uploads
@@ -75,8 +103,9 @@ const TIMEOUT = 180_000 * TIMEOUT_MULT
 
 export default defineConfig({
 	...mergeConfig(viteConfig, {
-		plugins: [rawFixtures()],
+		plugins: [rawFixtures(), workerConsoleShim()],
 		test: {
+			setupFiles: ["./worker-console-relay.setup.ts"],
 			// The napi addon's tests run under plain node (`npm run test:napi`), not in a browser.
 			exclude: [...configDefaults.exclude, "napi/**"],
 			hookTimeout: TIMEOUT,

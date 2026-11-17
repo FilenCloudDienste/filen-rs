@@ -1,6 +1,9 @@
 /// <reference types="@types/serviceworker" />
 
 import init, { Client, fromStringified, type StringifiedClient, type File } from "./service-worker/sdk-rs.js"
+import { forwardWorkerConsole } from "./worker-console-shim.ts"
+
+forwardWorkerConsole()
 
 self.addEventListener("install", () => {
 	console.log("Installing service worker...")
