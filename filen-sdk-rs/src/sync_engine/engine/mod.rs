@@ -286,16 +286,14 @@ pub(super) const PASS_LOCK_MAX_SLEEP: Duration = Duration::from_secs(5);
 ///
 /// The lock is what makes every other device of the account wait to write, so a pass that held it
 /// for its whole apply shut them out for as long as a large first sync ran — hours at the request
-/// rate ceiling. A minute keeps the per-op acquire/release round trips the pass-wide lock replaced
-/// down to one pair per batch, while nothing else on the account waits longer than about a minute
-/// plus the transfers still finishing when it runs out: a transfer that started inside the batch is
-/// never cut short to release, so one long upload stretches that batch to its own length.
-pub(super) const PASS_LOCK_MAX_HOLD: Duration = Duration::from_secs(60);
-
-/// How many remote writes a pass starts under one hold of the drive-write lock before it lets it go,
-/// whichever of this and [`PASS_LOCK_MAX_HOLD`] comes first. Small writes at the request rate ceiling
-/// fit a few hundred to a minute; this caps a batch of them on its own.
-pub(super) const PASS_LOCK_MAX_BATCH: usize = 500;
+/// rate ceiling. A minute and a half keeps the per-op acquire/release round trips the pass-wide lock
+/// replaced down to one pair per batch, and the [`PASS_LOCK_YIELD`] the pass sits out after each to
+/// a small share of its remote writes' time, while nothing else on the account waits longer than
+/// about that plus the transfers still finishing when it runs out: a transfer that started inside
+/// the batch is never cut short to release, so one long upload stretches that batch to its own
+/// length. Time is the only bound: how many writes a batch starts does not end it, so a batch of
+/// bulk requests or of small uploads runs its whole time.
+pub(super) const PASS_LOCK_MAX_HOLD: Duration = Duration::from_secs(90);
 
 /// How long a pass that let the drive-write lock go stays away from it before asking again.
 ///
@@ -325,14 +323,13 @@ pub(super) const PASS_LOCK_MAX_BATCH: usize = 500;
 /// downloads carry on meanwhile.
 pub(super) const PASS_LOCK_YIELD: Duration = Duration::from_secs(5);
 
-/// The bounds a pass keeps each hold of the drive-write lock within. Always the three constants
-/// above, except where a test shrinks them to make a release happen inside a small pass.
+/// The bounds a pass keeps each hold of the drive-write lock within. Always [`PASS_LOCK_MAX_HOLD`]
+/// and [`PASS_LOCK_YIELD`], except where a test shrinks them to make a release happen inside a
+/// small pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct LockBudget {
 	/// How long one hold lasts ([`PASS_LOCK_MAX_HOLD`]).
 	pub(super) hold: Duration,
-	/// How many remote writes one hold starts ([`PASS_LOCK_MAX_BATCH`]).
-	pub(super) batch: usize,
 	/// How long the pass stays away from the lock after letting it go ([`PASS_LOCK_YIELD`]).
 	pub(super) rest: Duration,
 }
@@ -341,7 +338,6 @@ impl Default for LockBudget {
 	fn default() -> Self {
 		Self {
 			hold: PASS_LOCK_MAX_HOLD,
-			batch: PASS_LOCK_MAX_BATCH,
 			rest: PASS_LOCK_YIELD,
 		}
 	}
@@ -1894,12 +1890,13 @@ pub struct SyncEngine {
 
 #[cfg(feature = "malformed")]
 impl SyncEngine {
-	/// Test-only: bound each hold of the drive-write lock a pass takes to `hold` or `batch` remote
-	/// writes, whichever comes first, and stay away from the lock for `rest` after letting it go —
-	/// so a pass small enough for a test still releases the lock part-way. Every production engine
-	/// keeps `PASS_LOCK_MAX_HOLD`, `PASS_LOCK_MAX_BATCH` and `PASS_LOCK_YIELD`.
-	pub fn set_lock_budget(&mut self, hold: Duration, batch: usize, rest: Duration) {
-		self.lock_budget = LockBudget { hold, batch, rest };
+	/// Test-only: bound each hold of the drive-write lock a pass takes to `hold`, and stay away from
+	/// the lock for `rest` after letting it go — so a pass small enough for a test still releases
+	/// the lock part-way. A `hold` of zero is spent as soon as it is taken: the pass lets the lock go
+	/// at every boundary that allows it, once the remote writes in flight have finished. Every
+	/// production engine keeps `PASS_LOCK_MAX_HOLD` and `PASS_LOCK_YIELD`.
+	pub fn set_lock_budget(&mut self, hold: Duration, rest: Duration) {
+		self.lock_budget = LockBudget { hold, rest };
 	}
 }
 

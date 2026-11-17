@@ -870,7 +870,7 @@ async fn resil_add_unwritable_baseline_fails_safe() {
 }
 
 /// RESIL-LOCK — a pass lets the account's drive-write lock go between batches. With a hold spent
-/// after one remote write, another client of the account (its own lock cache, so a real server-side
+/// as soon as it is taken, so after each remote write, another client of the account (its own lock cache, so a real server-side
 /// acquisition) takes the lock while the pass still has uploads left, and the pass then takes it back
 /// and finishes every upload. Needs `-F malformed` for the lock-budget seam.
 #[cfg(feature = "malformed")]
@@ -879,8 +879,7 @@ async fn resil_lock_released_between_batches() {
 	const FILES: usize = 4;
 	let mut sc = single_client(SyncMode::LocalToRemote).await;
 	sc.engine.set_lock_budget(
-		std::time::Duration::from_secs(60),
-		1,
+		std::time::Duration::ZERO,
 		std::time::Duration::from_secs(10),
 	);
 	for i in 0..FILES {

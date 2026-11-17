@@ -155,20 +155,31 @@ fn each_entry_carries_what_its_action_reads() {
 	);
 }
 
-/// A hold runs its course on time or on count, whichever comes first.
+/// A hold runs its course on time alone, at a minute and a half.
 #[test]
-fn a_hold_is_spent_after_its_time_or_its_batch() {
+fn a_hold_is_spent_after_its_time() {
 	let budget = LockBudget::default();
+	assert_eq!(budget.hold, Duration::from_secs(90));
 	let since = Instant::now();
-	assert!(!hold_spent(&budget, since, 0, since));
+	assert!(!hold_spent(&budget, since, since));
 	assert!(!hold_spent(
 		&budget,
 		since,
-		budget.batch - 1,
 		since + budget.hold - Duration::from_millis(1)
 	));
-	assert!(hold_spent(&budget, since, 0, since + budget.hold));
-	assert!(hold_spent(&budget, since, budget.batch, since));
+	assert!(hold_spent(&budget, since, since + budget.hold));
+}
+
+/// A hold of zero, the seam a test uses to make a pass let the lock go after each remote write, is
+/// spent the moment it is taken.
+#[test]
+fn a_zero_hold_is_spent_at_once() {
+	let budget = LockBudget {
+		hold: Duration::ZERO,
+		..LockBudget::default()
+	};
+	let since = Instant::now();
+	assert!(hold_spent(&budget, since, since));
 }
 
 /// Without a held lock only a remote write has to wait for one; nothing that is merely local or a
@@ -3035,22 +3046,6 @@ fn a_run_stops_at_another_kind_and_at_its_limit() {
 		.map(Vec::len)
 		.collect();
 	assert_eq!(lengths, [50, 50, 20]);
-
-	// A hold with room for ten writes, the first of the run already counted against it.
-	let budget = LockBudget {
-		batch: 10,
-		..LockBudget::default()
-	};
-	let lease = Lease::Held {
-		lock: Arc::clone(&hold.lock),
-		since: Instant::now(),
-		writes: 1,
-	};
-	let (_dir, mut plan) = staged_entries(&many);
-	let room = chunk_room(&lease, &budget);
-	let lengths: Vec<usize> = runs(&mut plan, room).iter().map(Vec::len).collect();
-	assert_eq!(lengths, [10; 12]);
-	assert_eq!(Lease::Unheld.room(&budget), 0);
 }
 
 #[test]
@@ -3556,21 +3551,6 @@ fn a_run_of_trashes_stops_at_another_kind_and_at_its_limit() {
 		.map(Vec::len)
 		.collect();
 	assert_eq!(lengths, [50, 50, 20]);
-
-	// A hold with room for ten writes, the first of the run already counted against it.
-	let budget = LockBudget {
-		batch: 10,
-		..LockBudget::default()
-	};
-	let lease = Lease::Held {
-		lock: Arc::clone(&hold.lock),
-		since: Instant::now(),
-		writes: 1,
-	};
-	let (_dir, mut plan) = staged_entries(&many);
-	let room = chunk_room(&lease, &budget);
-	let lengths: Vec<usize> = runs(&mut plan, room).iter().map(Vec::len).collect();
-	assert_eq!(lengths, [10; 12]);
 }
 
 /// The pair's baseline rows, and its journal, as (uuid, kind).

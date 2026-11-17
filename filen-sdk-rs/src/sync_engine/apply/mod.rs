@@ -884,7 +884,7 @@ fn millis_to_dt(millis: i64) -> DateTime<Utc> {
 /// pass's rows nor its two sides — and holds no read transaction open behind the commits it makes
 /// (see [`PlannedEntry::stage`]).
 ///
-/// The drive-write lock is held per bounded BATCH of remote writes (see [`Lease`]) so the per-op
+/// The drive-write lock is held a time-bounded stretch of the apply at a time (see [`Lease`]) so the per-op
 /// `lock_drive` calls inside upload/create become free clones of the held lock instead of each
 /// doing an acquire+release server round-trip — the dominant per-file cost at scale — while no other
 /// device of the account waits on it for longer than about [`PASS_LOCK_MAX_HOLD`](super::engine::PASS_LOCK_MAX_HOLD). It is let go
@@ -1060,7 +1060,6 @@ async fn apply_plan(
 					applied += 1;
 					continue;
 				}
-				lease.note_start(&entry.action);
 				remote_in_flight += usize::from(mutates_remote(&entry.action));
 				in_flight.push(run_transfer(&ctx, &reach, entry, target, &progress));
 			}
@@ -1248,7 +1247,7 @@ async fn apply_serial_run(
 		.prepare_or_stop(ctx, action, releasable, report, total - *applied, observer)
 		.await?;
 	if is_trash(action) {
-		let chunk = match take_chunk(ctx, plan, lease, run, entry, is_trash).await {
+		let chunk = match take_chunk(ctx, plan, run, entry, is_trash).await {
 			Ok(chunk) => chunk,
 			Err(error) => {
 				note_unread_plan(report, &error);
@@ -1259,7 +1258,7 @@ async fn apply_serial_run(
 		return ControlFlow::Continue(());
 	}
 	if run == Run::Before && is_remote_dir_create(action) {
-		let chunk = match take_chunk(ctx, plan, lease, run, entry, is_remote_dir_create).await {
+		let chunk = match take_chunk(ctx, plan, run, entry, is_remote_dir_create).await {
 			Ok(chunk) => chunk,
 			Err(error) => {
 				note_unread_plan(report, &error);
@@ -1516,7 +1515,8 @@ fn superseded(error: &crate::Error) -> bool {
 	error.server_code().as_deref() == Some("file_is_versioned")
 }
 
-/// The pass's hold on the account-wide drive-write lock, taken per bounded batch of its apply.
+/// The pass's hold on the account-wide drive-write lock, taken for a time-bounded stretch of its
+/// apply at a time.
 ///
 /// Nothing but this holds the pass's `Arc` of the lock, so moving out of [`Held`](Self::Held) drops
 /// it; the lock is really released when the last in-process holder lets go — the SDK ops of the pass
@@ -1529,8 +1529,6 @@ enum Lease {
 		lock: Arc<ResourceLock>,
 		/// When this hold began.
 		since: Instant,
-		/// How many remote writes started under it.
-		writes: usize,
 	},
 	/// Let go at `at`, with `release` where the release of the lease it held stands; not asked for
 	/// again before the rest has passed (see [`rested`]).
@@ -1543,7 +1541,7 @@ enum Lease {
 impl Lease {
 	/// Whether the hold has run its course (see [`hold_spent`]).
 	fn spent(&self, budget: &LockBudget, now: Instant) -> bool {
-		matches!(self, Self::Held { since, writes, .. } if hold_spent(budget, *since, *writes, now))
+		matches!(self, Self::Held { since, .. } if hold_spent(budget, *since, now))
 	}
 
 	/// Let a spent hold go, when the next action sits where a release splits nothing, and with it
@@ -1576,14 +1574,6 @@ impl Lease {
 		!mutates_remote(action) || matches!(self, Self::Held { lock, .. } if lock.is_valid())
 	}
 
-	/// How many more remote writes the hold starts before its batch is spent; none without a hold.
-	fn room(&self, budget: &LockBudget) -> usize {
-		match self {
-			Self::Held { writes, .. } => budget.batch.saturating_sub(*writes),
-			Self::Unheld | Self::Released { .. } => 0,
-		}
-	}
-
 	/// The lock, while it is held.
 	fn held(&self) -> Option<&Arc<ResourceLock>> {
 		match self {
@@ -1592,16 +1582,7 @@ impl Lease {
 		}
 	}
 
-	/// Count `action` against the hold when it writes to the remote.
-	fn note_start(&mut self, action: &SyncAction) {
-		if mutates_remote(action)
-			&& let Self::Held { writes, .. } = self
-		{
-			*writes += 1;
-		}
-	}
-
-	/// Get the lease ready for `action` and count it: let a spent hold go at a boundary that allows
+	/// Get the lease ready for `action`: let a spent hold go at a boundary that allows
 	/// it, and take the lock before a remote write that finds none (or one whose lease was lost).
 	/// `None` means the pass was cancelled meanwhile; an `Err` is a lock the pass could not take.
 	///
@@ -1651,10 +1632,8 @@ impl Lease {
 			*self = Self::Held {
 				lock,
 				since: Instant::now(),
-				writes: 0,
 			};
 		}
-		self.note_start(action);
 		Some(Ok(()))
 	}
 
@@ -1713,12 +1692,10 @@ async fn rested(let_go: Instant, release: &mut watch::Receiver<LeaseRelease>, re
 	}
 }
 
-/// Whether a hold of the drive lock that began at `since` and has started `writes` remote writes has
-/// run its course: the budget's time or its batch — by default
-/// [`PASS_LOCK_MAX_HOLD`](super::engine::PASS_LOCK_MAX_HOLD) or
-/// [`PASS_LOCK_MAX_BATCH`](super::engine::PASS_LOCK_MAX_BATCH) — whichever comes first.
-fn hold_spent(budget: &LockBudget, since: Instant, writes: usize, now: Instant) -> bool {
-	now.saturating_duration_since(since) >= budget.hold || writes >= budget.batch
+/// Whether a hold of the drive lock that began at `since` has run its course: it has lasted the
+/// budget's time, by default [`PASS_LOCK_MAX_HOLD`](super::engine::PASS_LOCK_MAX_HOLD).
+fn hold_spent(budget: &LockBudget, since: Instant, now: Instant) -> bool {
+	now.saturating_duration_since(since) >= budget.hold
 }
 
 /// Where the directory moves that failed this pass, or that it held back, were headed: nothing
@@ -2387,33 +2364,20 @@ fn is_trash(action: &SyncAction) -> bool {
 	matches!(action, SyncAction::TrashRemote { .. })
 }
 
-/// `first`, which the lease has already been prepared and counted for, and the rest of its run in
-/// `run` that `same` holds for, as one chunk: at most [`SYNC_BULK_CHUNK`] actions, and no more than
-/// the hold has room for. Each is counted against the hold here, with no release inside a chunk, so
-/// a tie is never split.
+/// `first`, which the lease has already been prepared for, and the rest of its run in `run` that
+/// `same` holds for, as one chunk: at most [`SYNC_BULK_CHUNK`] actions, all under the one hold, with
+/// no release inside a chunk, so a tie is never split.
 async fn take_chunk(
 	ctx: &ApplyContext<'_>,
 	plan: &mut PagedPlan,
-	lease: &mut Lease,
 	run: Run,
 	first: PlannedEntry,
 	same: impl Fn(&SyncAction) -> bool,
 ) -> Result<Vec<PlannedEntry>, crate::Error> {
-	let more = plan
-		.take_run(ctx, run, chunk_room(lease, &ctx.lock_budget), same)
-		.await?;
-	for staged in &more {
-		lease.note_start(&staged.entry.action);
-	}
+	let more = plan.take_run(ctx, run, SYNC_BULK_CHUNK - 1, same).await?;
 	Ok(std::iter::once(first)
 		.chain(more.into_iter().map(|staged| staged.entry))
 		.collect())
-}
-
-/// How many more actions a chunk takes after its first, which `lease` has been counted for: what
-/// fits in one bulk request and in the hold.
-fn chunk_room(lease: &Lease, budget: &LockBudget) -> usize {
-	(SYNC_BULK_CHUNK - 1).min(lease.room(budget))
 }
 
 /// What a chunk of directory creates reads besides its plan (see [`apply_creates`]).
