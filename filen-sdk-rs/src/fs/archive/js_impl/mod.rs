@@ -1353,6 +1353,8 @@ pub fn archive_default_name(name: String) -> String {
 	super::archive_default_name(&name).into()
 }
 
+mod reader;
+
 #[cfg(feature = "uniffi")]
 mod uniffi_impl;
 

@@ -16,15 +16,16 @@ use filen_sdk_rs::{
 		HasName, HasUUID,
 		archive::{
 			AesStrength, ArchiveEntry, ArchiveEntryKind, ArchiveFormat, ArchivePassword,
-			ArchiveSource, CompressCallback, CompressConfig, CompressFormat, CompressPhase,
-			CompressReport, CompressRequest, CompressSources, CompressUpdate, Compression,
-			DisposalOutcome, EntryDownloadCallback, EntryDownloadConfig, EntryDownloadPhase,
-			EntryDownloadReport, EntryDownloadUpdate, EntrySelection, ExtractCallback,
-			ExtractConfig, ExtractFailed, ExtractPhase, ExtractRenameReason, ExtractReport,
-			ExtractRequest, ExtractRoot, ExtractSkipReason, ExtractUpdate, ExtractWhat,
-			ExtractedTopLevel, KeptReason, ListCallback, ListConfig, ListFailed, ListPhase,
-			ListReport, ListTotals, ListUpdate, ListedSkipReason, PasswordCheck, SevenZEncryption,
-			SevenZMethod, SourceDisposal, StreamCodec, ZipMethod,
+			ArchiveReader, ArchiveSource, CompressCallback, CompressConfig, CompressFormat,
+			CompressPhase, CompressReport, CompressRequest, CompressSources, CompressUpdate,
+			Compression, DisposalOutcome, EntryByteAccess, EntryDownloadCallback,
+			EntryDownloadConfig, EntryDownloadPhase, EntryDownloadReport, EntryDownloadUpdate,
+			EntrySelection, ExtractCallback, ExtractConfig, ExtractFailed, ExtractPhase,
+			ExtractRenameReason, ExtractReport, ExtractRequest, ExtractRoot, ExtractSkipReason,
+			ExtractUpdate, ExtractWhat, ExtractedTopLevel, KeptReason, ListCallback, ListConfig,
+			ListFailed, ListPhase, ListReport, ListTotals, ListUpdate, ListedSkipReason,
+			PasswordCheck, ReaderDownloadEntryConfig, SevenZEncryption, SevenZMethod,
+			SourceDisposal, StreamCodec, ZipMethod,
 		},
 		categories::{DirType, NonRootItemType},
 		copy::{ItemSource, ItemSourceDir, JobControl},
@@ -1633,4 +1634,118 @@ fn fixture_noise(mut seed: u32, len: usize) -> Vec<u8> {
 			(seed >> 16).to_le_bytes()[0]
 		})
 		.collect()
+}
+
+/// Reads entries of `reader`'s stored zip by range, whole and in one pass: `big` spans chunks.
+async fn read_through(reader: &ArchiveReader, big: &[u8], notes: &[u8]) {
+	let recorder = Arc::new(ListRecorder::default());
+	let listing = reader
+		.list(Arc::clone(&recorder), JobControl::default())
+		.await
+		.unwrap();
+	let big_id = entry(&listing, "source/big.bin").id;
+	let notes_id = entry(&listing, "source/notes.txt").id;
+	assert_eq!(
+		reader.entry_byte_access(big_id).await.unwrap(),
+		EntryByteAccess::Mapped {
+			size: big.len() as u64
+		}
+	);
+	let start = CHUNK_SIZE_U64 - 10;
+	let mut range = Vec::new();
+	reader
+		.read_entry_range(
+			big_id,
+			start,
+			start + 20,
+			&mut futures::io::Cursor::new(&mut range),
+		)
+		.await
+		.unwrap();
+	let at = usize::try_from(start).unwrap();
+	assert_eq!(range, big[at..at + 20]);
+	let mut whole = Vec::new();
+	let report = reader
+		.download_entry(
+			notes_id,
+			&mut whole,
+			ReaderDownloadEntryConfig::default(),
+			Arc::new(EntryDownloadRecorder::default()),
+			JobControl::default(),
+		)
+		.await
+		.unwrap();
+	assert!(report.checked);
+	assert_eq!(whole, notes);
+	let written = Arc::new(Mutex::new(Vec::new()));
+	let into = Arc::clone(&written);
+	let report = reader
+		.read_entries(
+			&[notes_id, big_id],
+			move |entry, _| {
+				into.lock().unwrap().push(entry);
+				std::future::ready(Ok(Some(futures::io::sink())))
+			},
+			Some(0),
+			Arc::new(EntryDownloadRecorder::default()),
+			JobControl::default(),
+		)
+		.await
+		.unwrap();
+	assert_eq!(report.entries, 2);
+	assert!(report.checked);
+	assert_eq!(written.lock().unwrap().len(), 2);
+}
+
+/// A reader opened on an archive in the drive, and one opened without a session on the same
+/// archive through its public link, read its entries by range, whole and in a pass.
+#[shared_test_runtime]
+async fn an_archive_reader_reads_a_drive_archive_and_a_linked_one() {
+	let (resources, _lock) = test_utils::RESOURCES.get_resources_with_lock().await;
+	let client = resources.client.clone();
+	let test_dir = &resources.dir;
+	let (source, _) = tree(&client, test_dir).await;
+	let destination = client.create_dir(&test_dir.into(), "reader").await.unwrap();
+	let (archive, _) = compress(
+		&client,
+		CompressSources::Keep(vec![ItemSource::Dir(ItemSourceDir::Normal(source))]),
+		&destination,
+		"stored.zip",
+		CompressFormat::Zip {
+			method: ZipMethod::Stored,
+			encryption: None,
+		},
+		None,
+	)
+	.await;
+	// as `tree` uploaded them
+	let (big, notes) = (data(CHUNK_SIZE + 4321, 7), b"hello archive");
+
+	let reader = client
+		.clone()
+		.open_archive_reader(
+			archive.clone().into(),
+			ListConfig::default(),
+			Arc::new(ListRecorder::default()),
+			JobControl::default(),
+		)
+		.await
+		.unwrap();
+	assert!(reader.index_held());
+	read_through(&reader, &big, notes).await;
+	reader.close();
+
+	let linked = linked_file(&client, &archive).await;
+	let reader = client
+		.get_unauthed()
+		.open_archive_reader(
+			linked,
+			ListConfig::default(),
+			Arc::new(ListRecorder::default()),
+			JobControl::default(),
+		)
+		.await
+		.unwrap();
+	assert_eq!(reader.archive_id(), archive.uuid());
+	read_through(&reader, &big, notes).await;
 }

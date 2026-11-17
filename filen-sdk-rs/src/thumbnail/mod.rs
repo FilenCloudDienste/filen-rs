@@ -1432,6 +1432,9 @@ mod remote_chunks {
 pub use remote_chunks::RemoteChunkSource;
 
 #[cfg(any(feature = "wasm-full", feature = "uniffi"))]
+pub(crate) use js_impls::EmbeddedPreviewResult;
+
+#[cfg(any(feature = "wasm-full", feature = "uniffi"))]
 mod js_impls {
 	use std::sync::Arc;
 

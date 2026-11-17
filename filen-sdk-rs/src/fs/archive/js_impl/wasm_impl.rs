@@ -215,7 +215,7 @@ pub struct DownloadArchiveEntryParams {
 /// Reads `maxSolidSkip`, which has no default. Serde refuses the property left out, as the
 /// field has neither `default` nor a plain `Option` deserializer; one set to `undefined` reaches
 /// this, and is refused the same way rather than read as `null`.
-fn required_solid_skip<'de, D: Deserializer<'de>>(
+pub(super) fn required_solid_skip<'de, D: Deserializer<'de>>(
 	deserializer: D,
 ) -> Result<Option<u64>, D::Error> {
 	let value: JsValue = serde_wasm_bindgen::preserve::deserialize(deserializer)?;
@@ -286,13 +286,13 @@ impl ExtractCallbacks {
 	}
 }
 
-struct ListCallbacks {
-	on_entries_batch: Option<js_sys::Function>,
-	on_update: Option<js_sys::Function>,
+pub(super) struct ListCallbacks {
+	pub(super) on_entries_batch: Option<js_sys::Function>,
+	pub(super) on_update: Option<js_sys::Function>,
 }
 
 impl ListCallbacks {
-	fn deliver(&self, delivery: ListDelivery) {
+	pub(super) fn deliver(&self, delivery: ListDelivery) {
 		match delivery {
 			// the batch's text counts as queued until the callback has returned
 			ListDelivery::Entries(entries, _queued) => {

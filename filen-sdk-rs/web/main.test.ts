@@ -3016,6 +3016,58 @@ test("listArchive lists an archive's entries and checks its password", async () 
 	expect(listing.entries.every(entry => entry.id.archive === archive!.uuid)).toBe(true)
 })
 
+test("an ArchiveReader opened through the client and through a file link reads entries by range, whole and in one pass", async () => {
+	const parent = await state.createDir(testDir, "archive-reader")
+	const source = await archiveSource(parent, 21)
+	const format: CompressFormat = { type: "zip", method: { type: "stored" } }
+	const { archive } = await state.compressItems({ items: [source.root], destination: parent, name: "stored.zip", format })
+	const link = await state.publicLinkFile(archive!)
+	const linked = await unauthClient.getLinkedFile(link.linkUuid, getFileMeta(archive!.meta)!.key, null)
+
+	for (const reader of [
+		await state.openArchiveReader({ archive: archive! }),
+		await unauthClient.openArchiveReader({ archive: linked })
+	]) {
+		expect([reader.format, reader.indexHeld, reader.archiveId]).toStrictEqual([{ type: "zip" }, true, archive!.uuid])
+		const { entries } = await reader.list({})
+		const entry = (path: string) => entries.find(e => e.path?.path === path)!.id
+		const data = entry("archived/sub/data.bin")
+		expect(await reader.entryByteAccess(data)).toStrictEqual({ type: "mapped", size: BigInt(source.data.length) })
+
+		// a range across the archive's first chunk boundary, into a stream closed once it is written
+		const range = recordingStream()
+		await reader.readEntryRange({ entry: data, start: 1024n * 1024n - 7n, end: 1024n * 1024n + 9n, writer: range.writer })
+		expect(range.ended.closed).toBe(true)
+		expect(range.bytes()).toStrictEqual(source.data.slice(1024 * 1024 - 7, 1024 * 1024 + 9))
+
+		const whole = recordingStream()
+		const downloaded = await reader.downloadEntry({ entry: entry("archived/notes.txt"), writer: whole.writer, maxSolidSkip: 0 })
+		expect([downloaded.error, downloaded.checked]).toStrictEqual([undefined, true])
+		expect(whole.bytes()).toStrictEqual(source.notes)
+
+		// each entry asked for gets its own stream as the pass reaches it, in the archive's order
+		const asked: bigint[] = []
+		const streams = new Map<number, ReturnType<typeof recordingStream>>()
+		const pass = await reader.readEntries({
+			entries: [data, entry("archived/notes.txt")],
+			writerFor: (id, size) => {
+				asked.push(size!)
+				const stream = recordingStream()
+				streams.set(id.index, stream)
+				return stream.writer
+			},
+			maxSolidSkip: 0
+		})
+		expect([pass.error, pass.entries, pass.checked]).toStrictEqual([undefined, 2n, true])
+		expect(asked.sort()).toStrictEqual([BigInt(source.notes.length), BigInt(source.data.length)].sort())
+		expect(streams.get(data.index)!.bytes()).toStrictEqual(source.data)
+
+		reader.close()
+		await expect(reader.entryByteAccess(data)).rejects.toMatchObject({ kind: "InvalidState" })
+		reader.free()
+	}
+})
+
 test("downloadArchiveEntry streams one zip entry to a WritableStream, and resolves a refusal or a stream that fails to close with its error", async () => {
 	const parent = await state.createDir(testDir, "archive-download")
 	const source = await archiveSource(parent, 16)
