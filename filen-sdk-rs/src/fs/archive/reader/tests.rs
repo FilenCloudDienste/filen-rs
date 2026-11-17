@@ -2357,3 +2357,37 @@ async fn a_solid_rars_stored_files_are_read_alone_as_they_lie() {
 		assert_eq!(written[1].2, files[2]);
 	}
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tar_listing_keeps_the_last_good_member_before_a_damaged_header() {
+	let tar = tar_of(&[("a.txt", b"alpha"), ("b.txt", b"beta")]);
+	for compressed in [false, true] {
+		let mut damaged = tar.clone();
+		// the second header, after the first's and its data's block: its checksum broken
+		damaged[1024 + 148..1024 + 156].copy_from_slice(b"9999999\0");
+		let (name, bytes) = if compressed {
+			("t.tar.gz", gzip(&damaged))
+		} else {
+			("t.tar", damaged)
+		};
+		let (backend, archive, config) = drive(name, bytes, 64 << 20);
+		let reader = reader_of(&backend, &archive, &config, None);
+		reader.open(Ignore, JobControl::default()).await.unwrap();
+		let failed = reader
+			.list(Ignore, JobControl::default())
+			.await
+			.unwrap_err();
+		let listed: Vec<&str> = failed
+			.report
+			.entries
+			.iter()
+			.map(|entry| entry.stored_path.as_str())
+			.collect();
+		assert_eq!(
+			listed,
+			["a.txt"],
+			"compressed {compressed}: {}",
+			failed.error
+		);
+	}
+}

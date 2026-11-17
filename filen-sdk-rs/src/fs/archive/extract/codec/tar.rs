@@ -104,9 +104,11 @@ pub(super) fn walk_tar<R: TarSource>(
 			stopped = true;
 			break;
 		}
-		let next = tar.next_member().map_err(Error::from)?;
+		let next = tar.next_member().map_err(Error::from);
+		// the member before is whole once its data was passed, even when the header after it is
+		// damaged: listed before that ends the listing
 		list_pending(walk, pending.take(), &mut listed_files, &mut shadowed)?;
-		let Some(member) = next else {
+		let Some(member) = next? else {
 			break;
 		};
 		let this = ordinal;
