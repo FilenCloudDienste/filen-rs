@@ -2031,25 +2031,42 @@ async fn a_solid_rar_of_every_version_skips_nothing_and_lists_what_it_throws_awa
 		let rar = rar_of(version, &named, false, true, None);
 		let (_, reader) = opened("s.rar", rar, None).await;
 		let listed = reader.list(Ignore, JobControl::default()).await.unwrap();
-		let skipped: Vec<u64> = listed
-			.entries
-			.iter()
-			.map(|entry| match entry.access {
-				Some(EntryAccess::SolidBlock { skipped_bytes, .. }) => skipped_bytes,
-				ref other => panic!("{version:?}: {other:?}"),
-			})
-			.collect();
-		assert_eq!(skipped, [0, 3000, 7000, 12000], "{version:?}");
+		// a file the writer stored is read alone as it lies; any other decodes every file before
+		let control = JobControl::default();
+		let mut bounds = Vec::new();
+		let mut before = 0u64;
+		for (at, listed) in listed.entries.iter().enumerate() {
+			let index = u32::try_from(at).unwrap();
+			let mapped = matches!(
+				reader
+					.entry_byte_access(entry(index), &control)
+					.await
+					.unwrap(),
+				EntryByteAccess::Mapped { .. }
+			);
+			match listed.access {
+				Some(EntryAccess::Direct { .. }) if mapped => bounds.push(None),
+				Some(EntryAccess::SolidBlock { skipped_bytes, .. }) if !mapped => {
+					assert_eq!(skipped_bytes, before, "{version:?} {at}");
+					bounds.push(Some(skipped_bytes));
+				}
+				ref other => panic!("{version:?} {at}: {other:?}, mapped {mapped}"),
+			}
+			before += files[at].len() as u64;
+		}
 		// what the listing states is what a pass may throw away, and not a byte less
-		let (result, written) = read_entries(&reader, &[2], Some(7000)).await;
+		let bound = bounds[2].unwrap_or(0);
+		let (result, written) = read_entries(&reader, &[2], Some(bound)).await;
 		assert_eq!(result.unwrap().entries, 1, "{version:?}");
 		assert_eq!(written[0].2, files[2], "{version:?}");
-		let (result, _) = read_entries(&reader, &[2], Some(6999)).await;
-		assert_eq!(
-			result.unwrap_err().error.kind(),
-			ErrorKind::ArchiveSolidSkipExceeded,
-			"{version:?}"
-		);
+		if let Some(bound) = bounds[2] {
+			let (result, _) = read_entries(&reader, &[2], Some(bound - 1)).await;
+			assert_eq!(
+				result.unwrap_err().error.kind(),
+				ErrorKind::ArchiveSolidSkipExceeded,
+				"{version:?}"
+			);
+		}
 		// the stored member too is reached by decoding all before it
 		let (result, written) = read_entries(&reader, &[1, 3], None).await;
 		assert_eq!(result.unwrap().entries, 2, "{version:?}");
@@ -2288,4 +2305,55 @@ async fn a_nested_job_on_one_slot_never_needs_its_parents_index_again() {
 	assert_eq!(report.entries, 1);
 	assert!(*buffer.lock().unwrap() == data[2]);
 	assert_eq!(config.free_slots(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_solid_rars_stored_files_are_read_alone_as_they_lie() {
+	let files: Vec<Vec<u8>> = (0..3).map(|at| incompressible(5000, 120 + at)).collect();
+	let named: Vec<(&str, &[u8])> = ["a.jpg", "b.jpg", "c.jpg"]
+		.into_iter()
+		.zip(&files)
+		.map(|(name, data)| (name, &data[..]))
+		.collect();
+	// writers of these versions store what does not compress, solid or not
+	for version in [rars::ArchiveVersion::Rar20, rars::ArchiveVersion::Rar50] {
+		let rar = rar_of(version, &named, false, true, None);
+		let (backend, reader) = opened("s.rar", rar, None).await;
+		let listed = reader.list(Ignore, JobControl::default()).await.unwrap();
+		if !listed
+			.entries
+			.iter()
+			.all(|entry| matches!(entry.access, Some(EntryAccess::Direct { .. })))
+		{
+			// this writer compressed them after all: what the other test covers
+			assert_ne!(version, rars::ArchiveVersion::Rar20);
+			continue;
+		}
+		assert_eq!(
+			reader
+				.entry_byte_access(entry(2), &JobControl::default())
+				.await
+				.unwrap(),
+			EntryByteAccess::Mapped { size: 5000 }
+		);
+		fetched(&backend);
+		// a download's default allows no skip, and none is needed: checked against its CRC-32
+		let mut written = futures::io::Cursor::new(Vec::new());
+		let report = reader
+			.download_entry(
+				entry(2),
+				&mut written,
+				Some(0),
+				Ignore,
+				JobControl::default(),
+			)
+			.await
+			.unwrap();
+		assert!(report.checked, "{version:?}");
+		assert_eq!(written.into_inner(), files[2], "{version:?}");
+		let (result, written) = read_entries(&reader, &[2, 1], Some(0)).await;
+		assert_eq!(result.unwrap().entries, 2, "{version:?}");
+		assert_eq!(written[0].2, files[1]);
+		assert_eq!(written[1].2, files[2]);
+	}
 }

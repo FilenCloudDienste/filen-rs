@@ -16,9 +16,7 @@ use crate::{
 		archive::{
 			extract::{
 				ArchiveEntryId, EntryDownloadError, ExtractSkipReason,
-				codec::{
-					HeldIndex, IndexUse, RarKind, RarPacking, RarTable, Task, expansion_exceeded,
-				},
+				codec::{HeldIndex, IndexUse, RarKind, RarTable, Task, expansion_exceeded},
 				path_refusal,
 				reading::{ReadJob, list},
 			},
@@ -269,13 +267,11 @@ fn rar_access(table: &RarTable, ordinal: u64) -> Result<Resolved, Error> {
 	if let Some(reason) = path_refusal(&member.name) {
 		return Err(EntryDownloadError::Skipped(reason).into());
 	}
-	Ok(match (&member.data, member.packing) {
-		(Some(data), RarPacking::Stored) if !member.encrypted && member.packed == member.size => {
-			Resolved::Mapped {
-				offset: data.start,
-				size: member.size,
-			}
-		}
+	Ok(match member.mapped() {
+		Some(data) => Resolved::Mapped {
+			offset: data.start,
+			size: member.size,
+		},
 		// read whole, it decodes every file of a solid archive before it
 		_ if table.solid => Resolved::Sequential {
 			size: Some(member.size),

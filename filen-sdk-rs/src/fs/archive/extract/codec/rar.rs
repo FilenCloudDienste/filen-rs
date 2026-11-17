@@ -123,6 +123,22 @@ pub(crate) struct RarMember {
 	pub(crate) packing: RarPacking,
 	/// Where its packed data lies in the archive, when the parse says.
 	pub(crate) data: Option<Range<u64>>,
+	/// The CRC-32 of its data, when its header holds one (not a RAR 1.3's, nor a RAR 5's that
+	/// holds a BLAKE2sp hash instead).
+	pub(crate) crc32: Option<u32>,
+}
+
+impl RarMember {
+	/// Where its data lies in the archive as it is, to be read as a range of it: a stored,
+	/// unencrypted file, whose offset the parse gave.
+	pub(crate) fn mapped(&self) -> Option<&Range<u64>> {
+		self.data.as_ref().filter(|_| {
+			self.kind == RarKind::File
+				&& self.packing == RarPacking::Stored
+				&& !self.encrypted
+				&& self.packed == self.size
+		})
+	}
 }
 
 impl RarTable {
@@ -464,6 +480,11 @@ fn table_of(archive: &Archive, offset: u64) -> Result<RarTable, Error> {
 				(false, true) => RarPacking::Solid,
 			},
 			data,
+			crc32: match &member.detail {
+				rars::ArchiveMemberDetail::Rar15To40 { crc32, .. } => Some(*crc32),
+				rars::ArchiveMemberDetail::Rar50Plus { crc32, .. } => *crc32,
+				_ => None,
+			},
 		});
 	}
 	// as rars tells a solid archive: by its main header, or (RAR 1.5 on) any member's flag
@@ -528,7 +549,7 @@ pub(super) fn extract_rar(
 		{
 			*parsed.input.lock().unwrap_or_else(PoisonError::into_inner) = Some(input.into_owned());
 			// the held parse is charged to the reader that holds it
-			let end = decode_rar(walk, &parsed.archive, table, job, 0);
+			let end = decode_rar(walk, &parsed.archive, &parsed.input, table, job, 0);
 			// the held parse keeps nothing of this job
 			*parsed.input.lock().unwrap_or_else(PoisonError::into_inner) = None;
 			return end;
@@ -539,7 +560,14 @@ pub(super) fn extract_rar(
 	let end = if walk.listing() {
 		list_rar(walk, &table, job)?
 	} else {
-		decode_rar(walk, &parsed.archive, &table, job, parsed.heap)?
+		decode_rar(
+			walk,
+			&parsed.archive,
+			&parsed.input,
+			&table,
+			job,
+			parsed.heap,
+		)?
 	};
 	if held.is_none() && matches!(job.index, IndexUse::ReadAndReturn) {
 		table.parsed = Some(parsed.held());
@@ -578,7 +606,8 @@ fn list_rar(walk: &mut Walk, table: &RarTable, job: &StreamJob) -> Result<Archiv
 		if file {
 			packed = packed.saturating_add(member.packed);
 		}
-		let access = if table.solid {
+		// a stored file is read as it lies, alone, whatever the archive
+		let access = if table.solid && member.mapped().is_none() {
 			EntryAccess::SolidBlock {
 				skipped_bytes: skipped,
 				estimated_packed_bytes: packed,
@@ -664,6 +693,7 @@ impl Write for MemberWriter {
 fn decode_rar(
 	walk: &mut Walk,
 	archive: &Archive,
+	input: &Mutex<Option<CachedInput<'static>>>,
 	table: &RarTable,
 	job: &StreamJob,
 	parsed: u64,
@@ -686,7 +716,14 @@ fn decode_rar(
 	if let Some(error) = storage_exceeded(job.limits.max_bytes, extracted) {
 		return Err(error);
 	}
-	if let Some(limit) = walk.max_solid_skip() {
+	// stored files read alone lie in the archive as they are: they are read so, with no decoder,
+	// which in a solid archive would decode every file before them
+	let mut wanted = (0u64..)
+		.zip(&table.members)
+		.filter(|(ordinal, member)| member.kind == RarKind::File && walk.wants(*ordinal))
+		.peekable();
+	let direct = wanted.peek().is_some() && wanted.all(|(_, member)| member.mapped().is_some());
+	if !direct && let Some(limit) = walk.max_solid_skip() {
 		check_solid_skip(table, walk, limit)?;
 	}
 	let port = walk.port;
@@ -700,6 +737,9 @@ fn decode_rar(
 		open: false,
 		failed: false,
 	}));
+	if direct {
+		return read_stored(walk, input, table, &sending);
+	}
 	let mut ordinal = 0u64;
 	// the walk's own errors, which rars only carries as its own
 	let mut failed: Option<Error> = None;
@@ -718,6 +758,67 @@ fn decode_rar(
 	sending.borrow_mut().end_file().map_err(read_failure)?;
 	walk.send_mac_folders().map_err(read_failure)?;
 	Ok(ArchiveEnd::plain(0, 0))
+}
+
+/// Sends the stored files the walk takes as they lie in `input`, each checked against its CRC-32
+/// when its header holds one, the walk judging every member in archive order as rars' would.
+fn read_stored(
+	walk: &mut Walk,
+	input: &Mutex<Option<CachedInput<'static>>>,
+	table: &RarTable,
+	sending: &Rc<RefCell<Sending>>,
+) -> Result<ArchiveEnd, Error> {
+	let mut unchecked = 0u64;
+	let mut buffer = vec![0u8; CHUNK_SIZE];
+	for (ordinal, member) in (0u64..).zip(&table.members) {
+		let mut writer = match decide(walk, table, ordinal, sending)? {
+			ExtractionDecision::Stop => break,
+			ExtractionDecision::Skip => continue,
+			ExtractionDecision::Extract(writer) => writer,
+		};
+		// what the walk left out is passed over, not decoded
+		let (true, Some(data)) = (sending.borrow().open, member.mapped()) else {
+			continue;
+		};
+		let mut crc = crc32fast::Hasher::new();
+		let mut at = data.start;
+		while at < data.end {
+			let want = usize::try_from(data.end - at)
+				.unwrap_or(usize::MAX)
+				.min(buffer.len());
+			let read = {
+				let mut input = input.lock().unwrap_or_else(PoisonError::into_inner);
+				let input = input.as_mut().ok_or_else(|| {
+					Error::custom(ErrorKind::Internal, "no archive job reads the RAR")
+				})?;
+				input
+					.read_at(at, &mut buffer[..want])
+					.map_err(read_failure)?
+			};
+			if read == 0 {
+				return Err(Error::custom(
+					ErrorKind::ArchiveCorrupt,
+					"a RAR member's data runs past the end of the archive",
+				));
+			}
+			crc.update(&buffer[..read]);
+			writer.write_all(&buffer[..read]).map_err(read_failure)?;
+			at += read as u64;
+		}
+		match member.crc32 {
+			Some(stated) if stated != crc.finalize() => {
+				return Err(Error::custom(
+					ErrorKind::ArchiveCorrupt,
+					"a RAR member's data does not match its CRC-32",
+				));
+			}
+			Some(_) => {}
+			None => unchecked += 1,
+		}
+	}
+	sending.borrow_mut().end_file().map_err(read_failure)?;
+	walk.send_mac_folders().map_err(read_failure)?;
+	Ok(ArchiveEnd::plain(0, unchecked))
 }
 
 /// Refuses a download that would decode and throw away more than `limit` bytes of a solid RAR to

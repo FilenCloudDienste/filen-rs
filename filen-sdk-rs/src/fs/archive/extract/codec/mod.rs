@@ -45,7 +45,7 @@ use super::{
 use entries::{Found, Verdict, Walk, apple_double};
 pub(crate) use entries::{LinkKeys, Selection, Task};
 pub(crate) use held::{HeldIndex, IndexUse, TarSpan, TarTable};
-pub(crate) use rar::{RarKind, RarPacking, RarTable};
+pub(crate) use rar::{RarKind, RarTable};
 use rar::{extract_rar, open_rar};
 use sevenz::{extract_held_sevenz, extract_sevenz, read_sevenz_held};
 use tar::{Compressed, Counted, SkipLimit, walk_tar};
