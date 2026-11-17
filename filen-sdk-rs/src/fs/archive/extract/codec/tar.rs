@@ -1,8 +1,10 @@
 //! Reading a tar, bare or decoded from a compressed stream, member by member.
 
 use std::{
+	cell::Cell,
 	io::{self, Read},
 	num::NonZeroU64,
+	rc::Rc,
 };
 
 use chrono::DateTime;
@@ -56,7 +58,7 @@ pub(super) fn walk_tar<R: TarSource>(
 	mut tar: TarReader<R>,
 	record: bool,
 	skip_limit: Option<SkipLimit>,
-	compressed_len: Option<u64>,
+	compressed: Option<&Compressed>,
 ) -> Result<Walked<R>, Error> {
 	let mut spans = Vec::new();
 	// data of members passed over, which a compressed tar decodes all the same
@@ -83,13 +85,28 @@ pub(super) fn walk_tar<R: TarSource>(
 	let mut listed_files = SeededMap::default();
 	let mut shadowed = Shadowed::default();
 	let mut stopped = false;
+	// a listing's member, listed once the walk passed its data, which tells where a compressed
+	// tar's data of it ends
+	let mut pending: Option<Pending> = None;
+	let list_pending = |walk: &mut Walk,
+	                    pending: Option<Pending>,
+	                    listed_files: &mut ListedFiles,
+	                    shadowed: &mut Shadowed|
+	 -> Result<(), Error> {
+		match pending {
+			Some(pending) => list_member(walk, pending, compressed, listed_files, shadowed),
+			None => Ok(()),
+		}
+	};
 	loop {
 		// a download ends with its last entry, the rest of the tar unread
 		if walk.met_all_chosen() {
 			stopped = true;
 			break;
 		}
-		let Some(member) = tar.next_member().map_err(Error::from)? else {
+		let next = tar.next_member().map_err(Error::from)?;
+		list_pending(walk, pending.take(), &mut listed_files, &mut shadowed)?;
+		let Some(member) = next else {
 			break;
 		};
 		let this = ordinal;
@@ -118,24 +135,22 @@ pub(super) fn walk_tar<R: TarSource>(
 					size: member.size,
 				});
 			}
-			// a compressed tar decodes all it stores before a member to reach it
-			let access = match compressed_len {
-				Some(len) => EntryAccess::SolidBlock {
-					skipped_bytes: member.data_offset,
-					estimated_packed_bytes: len,
-					block_packed_bytes: len,
-				},
-				None => EntryAccess::Sequential,
+			// a listing reads a tar through: an AppleDouble member is told by its data here
+			let apple_double = match found.mac_shape() {
+				Some(MacShape::AppleDoubleName) => Some(
+					apple_double(&mut TarBody(&mut tar))
+						.map_err(read_failure)?
+						.0,
+				),
+				_ => None,
 			};
-			list_member(
-				walk,
-				&mut tar,
-				found,
-				access,
+			drop(found);
+			pending = Some(Pending {
+				member,
+				ordinal: this,
+				apple_double,
 				link_target,
-				&mut listed_files,
-				&mut shadowed,
-			)?;
+			});
 			continue;
 		}
 		let key = shadowed.key(&found.path);
@@ -184,6 +199,7 @@ pub(super) fn walk_tar<R: TarSource>(
 		);
 		files += taken.files();
 	}
+	list_pending(walk, pending.take(), &mut listed_files, &mut shadowed)?;
 	walk.send_mac_folders().map_err(read_failure)?;
 	walk.finish()?;
 	Ok(Walked {
@@ -320,17 +336,54 @@ impl Shadowed {
 	}
 }
 
-/// Lists the member `found`, a hard link to `link_target` resolved against `listed_files`, the
-/// files listed before it as extracted, which it joins when it is one.
-fn list_member<R: TarSource>(
-	walk: &mut Walk,
-	tar: &mut TarReader<R>,
-	mut found: Found,
-	access: EntryAccess,
+/// A compressed tar's archive bytes, and how many of them its decoder has taken so far.
+pub(super) struct Compressed {
+	pub(super) len: u64,
+	pub(super) taken: Rc<Cell<u64>>,
+}
+
+/// A compressed tar's stored bytes, counting those its decoder takes.
+pub(super) struct Counted<R> {
+	pub(super) inner: R,
+	pub(super) taken: Rc<Cell<u64>>,
+}
+
+impl<R: Read> Read for Counted<R> {
+	fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+		let read = self.inner.read(buf)?;
+		self.taken.set(self.taken.get().saturating_add(read as u64));
+		Ok(read)
+	}
+}
+
+/// A member a listing read the header of, listed once the walk passed its data.
+struct Pending {
+	member: TarMember,
+	ordinal: u64,
+	/// Whether its data starts as an AppleDouble file's, when its name says it may.
+	apple_double: Option<bool>,
 	link_target: Option<HardlinkTarget>,
+}
+
+/// Lists `pending`, whose data the walk just passed, a hard link resolved against
+/// `listed_files`, the files listed before it as extracted, which it joins when it is one. For
+/// a `compressed` tar, what reaching it costs: what the tar stores before its data, decoded and
+/// thrown away, and the archive bytes the decoder had taken once past its data (a little more, by
+/// what the decoder reads ahead), which a read of it alone fetches.
+fn list_member(
+	walk: &mut Walk,
+	pending: Pending,
+	compressed: Option<&Compressed>,
 	listed_files: &mut ListedFiles,
 	shadowed: &mut Shadowed,
 ) -> Result<(), Error> {
+	let Pending {
+		member,
+		ordinal,
+		apple_double,
+		link_target,
+	} = pending;
+	let mut found = member_found(&member, ordinal);
 	if let Some((target, shown)) = link_target {
 		let linked = shadowed.key(&target).and_then(|key| listed_files.get(&key));
 		match (shadowed.at(&target), linked) {
@@ -347,14 +400,14 @@ fn list_member<R: TarSource>(
 			}
 		}
 	}
-	// a listing reads a tar through: an AppleDouble member is told by its data here
-	let apple_double = match found.mac_shape() {
-		Some(MacShape::AppleDoubleName) => {
-			Some(apple_double(&mut TarBody(tar)).map_err(read_failure)?.0)
-		}
-		_ => None,
+	let access = match compressed {
+		Some(compressed) => EntryAccess::SolidBlock {
+			skipped_bytes: member.data_offset,
+			estimated_packed_bytes: compressed.taken.get().min(compressed.len),
+			block_packed_bytes: compressed.len,
+		},
+		None => EntryAccess::Sequential,
 	};
-	let ordinal = found.ordinal;
 	let key = shadowed.key(&found.path);
 	let size = found.size;
 	let is_dir = found.kind == ArchiveEntryKind::Dir;

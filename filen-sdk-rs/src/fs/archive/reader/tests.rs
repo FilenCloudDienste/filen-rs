@@ -2079,6 +2079,29 @@ async fn a_compressed_tars_listing_states_what_reaching_a_member_throws_away() {
 		panic!("{:?}", listed.entries[3].access);
 	};
 	assert_eq!(block_packed_bytes, len);
+	// what reaching each member fetches, as far as the decoder took the archive past its data:
+	// a.txt lies in the head of a tar mostly made of big.bin, which comes after it
+	let estimated: Vec<u64> = listed
+		.entries
+		.iter()
+		.filter_map(|entry| match entry.access {
+			Some(EntryAccess::SolidBlock {
+				estimated_packed_bytes,
+				..
+			}) => Some(estimated_packed_bytes),
+			// a directory, which holds no data to reach
+			None => None,
+			ref other => panic!("{other:?}"),
+		})
+		.collect();
+	assert_eq!(estimated.len(), 3, "{estimated:?}");
+	assert!(
+		estimated.windows(2).all(|pair| pair[0] <= pair[1]),
+		"{estimated:?}"
+	);
+	assert!(estimated.iter().all(|&bytes| bytes <= len), "{estimated:?}");
+	assert!(estimated[0] < len / 4, "{estimated:?} of {len}");
+	assert!(estimated[1] > big.len() as u64 / 2, "{estimated:?}");
 	// the listing's bound is enough, a byte less is not
 	let (result, written) = read_entries(&reader, &[3], Some(skipped_bytes)).await;
 	assert_eq!(result.unwrap().entries, 1);

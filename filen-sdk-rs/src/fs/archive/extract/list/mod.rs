@@ -90,7 +90,8 @@ pub enum EntryAccess {
 		/// compression ratio, ⌈block_packed_bytes × (skipped_bytes + size) ÷ the block's
 		/// unpacked size⌉, an estimate, as compression is rarely even across a block; for a
 		/// solid RAR the packed sizes of its files up to the entry, exact; for a compressed tar
-		/// the archive's length, as what it decodes to is only known once read.
+		/// the archive bytes its decoder had taken once past the entry's data, which is exact but
+		/// for what the decoder reads ahead (some KiB).
 		estimated_packed_bytes: u64,
 		/// The most a read of this entry fetches: the 7z block's packed size, or the packed
 		/// size of a solid RAR's files, or a compressed tar's length. Exact.
