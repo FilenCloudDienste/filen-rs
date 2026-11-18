@@ -560,6 +560,7 @@ fn list_update(millis: u64) -> extract::ListUpdate {
 		bytes_per_second: None,
 		eta: None,
 		active_time: Duration::from_millis(millis),
+		reading: None,
 	}
 }
 

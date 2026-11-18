@@ -375,6 +375,9 @@ pub(crate) struct FakeBackend {
 	/// Requests about a directory or file of a name that wait while they are in the set, each
 	/// wait logged in [`FakeLog::held_named`].
 	held_named: watch::Sender<HashSet<(Request, String)>>,
+	/// Fetches of a chunk at this index or after wait while it is set, each wait logged in
+	/// [`FakeLog::held`]: a job is stopped partway through a file.
+	fetches_held_from: watch::Sender<Option<u64>>,
 	/// Lowercased names the destination holds without the listing having shown them.
 	pub(crate) existing: Mutex<HashSet<String>>,
 	/// Names the server registers as a new version of the given existing file (a client
@@ -434,6 +437,7 @@ impl FakeBackend {
 			fail_state_of: HashSet::new(),
 			held: watch::Sender::new(HashSet::new()),
 			held_named: watch::Sender::new(HashSet::new()),
+			fetches_held_from: watch::Sender::new(None),
 			existing: Mutex::new(HashSet::new()),
 			version_of: HashMap::new(),
 			lock_calls: AtomicUsize::new(0),
@@ -507,10 +511,16 @@ impl FakeBackend {
 		});
 	}
 
+	/// Holds each fetch of a chunk at `index` or after, of any file, until [`Self::release_all`].
+	pub(crate) fn hold_fetches_from(&self, index: u64) {
+		self.fetches_held_from.send_replace(Some(index));
+	}
+
 	/// Lets every held request go on, and holds none from now on.
 	pub(crate) fn release_all(&self) {
 		self.held.send_replace(HashSet::new());
 		self.held_named.send_replace(HashSet::new());
+		self.fetches_held_from.send_replace(None);
 	}
 
 	/// Loses the lease of every drive lock held now; locks taken after it hold theirs.
@@ -771,6 +781,16 @@ impl DriveBackend for FakeBackend {
 		index: u64,
 	) -> Result<Vec<u8>, Error> {
 		self.hold(Request::Fetch, file.uuid()).await;
+		let held_from = |from: &Option<u64>| from.is_some_and(|from| index >= from);
+		if held_from(&self.fetches_held_from.borrow()) {
+			self.log().held.push((Request::Fetch, file.uuid()));
+			// the sender lives in `self`, which outlives this wait
+			let _ = self
+				.fetches_held_from
+				.subscribe()
+				.wait_for(|from| !held_from(from))
+				.await;
+		}
 		let name = file.name().unwrap_or_default().to_owned();
 		if self.quirks.contains(&Quirk::ReverseChunks) {
 			tokio::time::sleep(Duration::from_millis(10 * (file.chunks() - index))).await;

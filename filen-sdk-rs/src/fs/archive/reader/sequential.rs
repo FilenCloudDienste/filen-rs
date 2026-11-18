@@ -372,6 +372,8 @@ where
 				| WorkerEvent::FileEnd
 				| WorkerEvent::Link(_)
 				| WorkerEvent::Listed(_)
+				| WorkerEvent::Reading { .. }
+				| WorkerEvent::Passed(_)
 				| WorkerEvent::Head(_),
 			) => return Err(unexpected_event()),
 		}

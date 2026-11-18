@@ -2435,7 +2435,7 @@ async fn a_tar_header_stating_more_than_the_archive_holds_is_not_listed() {
 		("t.tar", past_the_end.clone(), ErrorKind::ArchiveCorrupt),
 		("t.tar", huge.clone(), ErrorKind::ArchiveCorrupt),
 		("t.tar.gz", gzip(&past_the_end), ErrorKind::ArchiveCorrupt),
-		("t.tar.gz", gzip(&huge), ErrorKind::ArchiveCorrupt),
+		("t.tar.gz", gzip(&huge), ErrorKind::ArchiveTooLarge),
 	];
 	for (at, (name, bytes, kind)) in cases.into_iter().enumerate() {
 		let (listed, error) = failed_listing(name, bytes).await;

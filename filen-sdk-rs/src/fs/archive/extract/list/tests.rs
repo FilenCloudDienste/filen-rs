@@ -518,3 +518,164 @@ fn stated_sizes_add_up_without_overflowing() {
 	}
 	assert_eq!((totals.bytes, totals.bytes_skipped), (u64::MAX, u64::MAX));
 }
+
+/// A tar of a member of six chunks, `alone` or with a small one after it, gzipped when
+/// `compressed`, listed with every fetch past its second chunk held, so the listing stops inside
+/// the first member's data: its setup and the listing, under `control`.
+async fn tar_listing_held_inside_a_member(
+	compressed: bool,
+	alone: bool,
+	control: JobControl,
+) -> (Setup, Listing, Vec<u8>) {
+	let data = incompressible(6 * CHUNK_SIZE, 0x5A);
+	let members: &[(&str, &[u8])] = if alone {
+		&[("big.bin", &data)]
+	} else {
+		&[("big.bin", &data), ("after.txt", b"after")]
+	};
+	let tar = tar_of(members);
+	let (name, bytes) = if compressed {
+		("bundle.tar.gz", gzip(&tar))
+	} else {
+		("bundle.tar", tar)
+	};
+	let setup = setup(name, bytes.clone(), |_| {});
+	setup.backend.hold_fetches_from(2);
+	let listing = list(&setup, control, test_config());
+	wait_until("a fetch inside the member is held", || {
+		!setup.backend.log().held.is_empty()
+	})
+	.await;
+	(setup, listing, bytes)
+}
+
+/// The update the listing sent last that names an entry as read.
+fn named_as_read(recorder: &ListRecorder) -> Option<ArchiveEntry> {
+	let updates = recorder.updates.lock().unwrap();
+	updates
+		.iter()
+		.rev()
+		.find_map(|update| update.reading.clone())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_single_member_compressed_tar_names_its_member_before_decoding_its_data() {
+	let (control, _controller) = JobControl::new();
+	let (held, listing, tgz) = tar_listing_held_inside_a_member(true, true, control).await;
+	let len = tgz.len() as u64;
+	wait_until("an update names the member read", || {
+		named_as_read(&listing.recorder).is_some()
+	})
+	.await;
+	let reading = named_as_read(&listing.recorder).unwrap();
+	// listed from its header: its row, and the most reaching it costs, until its data is passed
+	assert_eq!(reading.stored_path, "big.bin");
+	assert_eq!(reading.kind, ArchiveEntryKind::File);
+	assert_eq!(reading.size, Some(6 * CHUNK_SIZE as u64));
+	assert!(reading.modified.is_some());
+	assert_eq!(
+		reading.access,
+		Some(EntryAccess::SolidBlock {
+			skipped_bytes: TAR_BLOCK as u64,
+			estimated_packed_bytes: len,
+			block_packed_bytes: len,
+		})
+	);
+	assert!(listing.recorder.entries.lock().unwrap().is_empty());
+	held.backend.release_all();
+	let listed = listing.running.await.unwrap().unwrap();
+	let paths: Vec<&str> = listed
+		.entries
+		.iter()
+		.map(|entry| entry.stored_path.as_str())
+		.collect();
+	assert_eq!(paths, ["big.bin"]);
+	// once passed, it states what the decoder had taken by then
+	let Some(EntryAccess::SolidBlock {
+		estimated_packed_bytes,
+		..
+	}) = listed.entries[0].access
+	else {
+		panic!("{:?}", listed.entries[0].access);
+	};
+	assert!(
+		estimated_packed_bytes > 5 * CHUNK_SIZE as u64 && estimated_packed_bytes <= len,
+		"{estimated_packed_bytes} of {len}"
+	);
+	assert_eq!(listing.recorder.last().reading, None);
+	assert_eq!(*listing.recorder.entries.lock().unwrap(), listed.entries);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tar_listing_cancelled_inside_a_member_lists_it() {
+	for compressed in [false, true] {
+		let (_pause, cancel, control) = controls();
+		let (_held, listing, bytes) =
+			tar_listing_held_inside_a_member(compressed, false, control).await;
+		let len = bytes.len() as u64;
+		if compressed {
+			wait_until("the member is read", || {
+				listing.reporter.read(|state| state.reading.is_some())
+			})
+			.await;
+		} else {
+			wait_until("the member is listed", || {
+				listing.reporter.read(|state| state.entries == 1)
+			})
+			.await;
+		}
+		cancel.send_replace(true);
+		let failed = listing.running.await.unwrap().unwrap_err();
+		assert_eq!(failed.error.kind(), ErrorKind::Cancelled, "{compressed}");
+		let entries = &failed.report.entries;
+		let paths: Vec<&str> = entries
+			.iter()
+			.map(|entry| entry.stored_path.as_str())
+			.collect();
+		assert_eq!(paths, ["big.bin"], "compressed {compressed}");
+		assert_eq!(entries[0].size, Some(6 * CHUNK_SIZE as u64));
+		let access = if compressed {
+			// its data not passed: the most reaching it costs, and its skip exact
+			EntryAccess::SolidBlock {
+				skipped_bytes: TAR_BLOCK as u64,
+				estimated_packed_bytes: len,
+				block_packed_bytes: len,
+			}
+		} else {
+			EntryAccess::Sequential
+		};
+		assert_eq!(entries[0].access, Some(access), "compressed {compressed}");
+		assert_eq!(failed.report.totals.files, 1);
+		// the callback had it too, and is told nothing is read any more
+		assert_eq!(*listing.recorder.entries.lock().unwrap(), *entries);
+		let last = listing.recorder.last();
+		assert_eq!(
+			(last.phase, last.entries, last.reading),
+			(ListPhase::Cancelled, 1, None)
+		);
+	}
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_bare_tars_member_is_listed_from_its_header_before_its_data_was_read() {
+	let (control, _controller) = JobControl::new();
+	let (held, listing, _) = tar_listing_held_inside_a_member(false, false, control).await;
+	wait_until("the member is handed over", || {
+		!listing.recorder.entries.lock().unwrap().is_empty()
+	})
+	.await;
+	let entry = listing.recorder.entries.lock().unwrap()[0].clone();
+	assert_eq!(
+		(entry.stored_path.as_str(), entry.size, entry.access),
+		(
+			"big.bin",
+			Some(6 * CHUNK_SIZE as u64),
+			Some(EntryAccess::Sequential)
+		)
+	);
+	// a member listed is not named as read
+	assert_eq!(named_as_read(&listing.recorder), None);
+	held.backend.release_all();
+	let listed = listing.running.await.unwrap().unwrap();
+	assert_eq!(listed.totals.files, 2);
+}

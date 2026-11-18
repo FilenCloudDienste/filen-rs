@@ -168,6 +168,13 @@ fn run_job_holding(job: StreamJob, mut answer: impl FnMut(u64) -> Option<Vec<u8>
 	let mut seen = Vec::new();
 	let mut asked = Vec::new();
 	let mut held = None;
+	// a compressed tar's member sent as read, listed as a listing's driver lists it
+	let mut reading: Option<Box<ArchiveEntry>> = None;
+	let passed = |reading: &mut Option<Box<ArchiveEntry>>, seen: &mut Vec<Seen>, taken| {
+		let mut entry = reading.take().expect("a member passed without one read");
+		entry.passed(taken);
+		seen.push(Seen::Listed(*entry));
+	};
 	while let Some(event) = link.events.blocking_recv() {
 		match event {
 			WorkerEvent::Ask { index, reply, .. } => {
@@ -216,6 +223,16 @@ fn run_job_holding(job: StreamJob, mut answer: impl FnMut(u64) -> Option<Vec<u8>
 				link.target.joined(),
 			)),
 			WorkerEvent::Listed(entry) => seen.push(Seen::Listed(*entry)),
+			WorkerEvent::Reading {
+				entry,
+				passed: taken,
+			} => {
+				if let Some(taken) = taken {
+					passed(&mut reading, &mut seen, taken);
+				}
+				assert!(reading.replace(entry).is_none(), "a member read unlisted");
+			}
+			WorkerEvent::Passed(taken) => passed(&mut reading, &mut seen, taken),
 			WorkerEvent::Head(_) => panic!("an extracting codec sent a head"),
 			WorkerEvent::Indexed(index) => {
 				seen.push(Seen::Indexed(match *index {

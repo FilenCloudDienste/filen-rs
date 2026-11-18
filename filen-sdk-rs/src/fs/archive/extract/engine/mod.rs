@@ -746,6 +746,8 @@ impl<B: DisposalBackend> Driver<B> {
 			WorkerEvent::Ask { .. }
 			| WorkerEvent::Head(_)
 			| WorkerEvent::Listed(_)
+			| WorkerEvent::Reading { .. }
+			| WorkerEvent::Passed(_)
 			| WorkerEvent::Indexed(_) => {
 				self.stop_with(unexpected_event());
 			}

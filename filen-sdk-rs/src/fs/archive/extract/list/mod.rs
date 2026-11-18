@@ -95,7 +95,10 @@ pub enum EntryAccess {
 		/// the archive bytes its decoder had taken once past the entry's data, an approximation:
 		/// a decoder takes its input a compressed block at a time (up to about 900 KiB for
 		/// bzip2, an xz block or a zstd frame), and a fetch is rounded up to the archive's 1 MiB
-		/// chunks, so the fetch can differ from it by up to a block plus a chunk.
+		/// chunks, so the fetch can differ from it by up to a block plus a chunk. A compressed
+		/// tar's member whose data the listing had not passed yet (a listing's
+		/// [`ListUpdate::reading`], or the member a listing stopped inside) states
+		/// `block_packed_bytes`, the most it can be.
 		estimated_packed_bytes: u64,
 		/// The most a read of this entry fetches: the 7z block's packed size, or the packed
 		/// size of a solid RAR's files, or a compressed tar's length. Exact.
@@ -365,6 +368,14 @@ pub struct ListUpdate {
 	pub eta: Option<Duration>,
 	/// Time spent running, paused time left out.
 	pub active_time: Duration,
+	/// The entry whose data the listing is decoding, as its header lists it, before it is
+	/// listed: a compressed tar's file, listed once its data was passed, which tells what reaching
+	/// it fetches (until then its `estimated_packed_bytes` is the archive's length). A listing
+	/// that ends while it reads one lists it so when it was cancelled or stopped by the job (a
+	/// fetch that failed), and not when its data turned out damaged or cut short. `None`
+	/// otherwise: a bare tar's members are listed from their headers, a zip's or 7z's from its
+	/// index. Always `None` on the last update.
+	pub reading: Option<ArchiveEntry>,
 }
 
 /// Receives a listing's entries and progress. All calls come from the one job, in order.
@@ -393,6 +404,9 @@ pub(crate) struct ListState {
 	entries: u64,
 	/// Entries not delivered yet: they go out in batches, each before the next update.
 	pending: Vec<ArchiveEntry>,
+	/// The entry the codec sent as [`WorkerEvent::Reading`] last, until it is listed (see
+	/// [`ListUpdate::reading`]).
+	reading: Option<ArchiveEntry>,
 }
 
 impl JobState for ListState {
@@ -432,6 +446,7 @@ impl JobState for ListState {
 			bytes_per_second: snapshot.bytes_per_second,
 			eta: snapshot.eta,
 			active_time: snapshot.active_time,
+			reading: self.reading.clone(),
 		});
 	}
 
@@ -456,6 +471,7 @@ impl ListReporter {
 				bytes_read: 0,
 				entries: 0,
 				pending: Vec::new(),
+				reading: None,
 			},
 			Box::new(callback),
 		)
@@ -464,15 +480,60 @@ impl ListReporter {
 	/// Delivered in a batch of up to [`CALLBACK_BATCH`] entries right before the next update.
 	pub(crate) fn listed(&self, entry: ArchiveEntry) {
 		let mut full = false;
+		self.with_state(|state| full = state.push(entry));
+		if full {
+			self.update_now();
+		}
+	}
+
+	/// The codec reads the data of `entry`, which is listed once it was passed.
+	fn reading(&self, entry: Box<ArchiveEntry>) {
 		self.with_state(|state| {
-			state.entries += 1;
-			state.pending.push(entry);
+			state.reading = Some(*entry);
 			state.core.mark_changed();
-			full = state.pending.len() >= CALLBACK_BATCH;
+		});
+	}
+
+	/// Lists the entry the codec was reading, handed to `add` first, in the same change that
+	/// stops naming it as read: no update falls between. Its data was passed with `taken` archive
+	/// bytes taken, or when `None` was not, and it keeps the most it can cost. Whether there
+	/// was one.
+	fn list_reading(&self, taken: Option<u64>, add: impl FnOnce(&ArchiveEntry)) -> bool {
+		let (mut found, mut full) = (false, false);
+		self.with_state(|state| {
+			let Some(mut entry) = state.reading.take() else {
+				return;
+			};
+			if let Some(taken) = taken {
+				entry.passed(taken);
+			}
+			add(&entry);
+			found = true;
+			full = state.push(entry);
 		});
 		if full {
 			self.update_now();
 		}
+		found
+	}
+
+	/// Stops naming the entry the codec was reading, which is not listed.
+	fn drop_reading(&self) {
+		self.with_state(|state| {
+			if state.reading.take().is_some() {
+				state.core.mark_changed();
+			}
+		});
+	}
+}
+
+impl ListState {
+	/// Counts `entry` in and queues it for the callback; whether a batch is full.
+	fn push(&mut self, entry: ArchiveEntry) -> bool {
+		self.entries += 1;
+		self.pending.push(entry);
+		self.core.mark_changed();
+		self.pending.len() >= CALLBACK_BATCH
 	}
 }
 
@@ -494,6 +555,18 @@ fn add_entry(listing: &mut ListReport, kept_bytes: &mut usize, entry: &ArchiveEn
 }
 
 impl ArchiveEntry {
+	/// Its data was passed, the decoder having taken `estimated_packed_bytes` of the archive:
+	/// what reaching a compressed tar's member listed from its header fetches.
+	pub(crate) fn passed(&mut self, estimated_packed_bytes: u64) {
+		if let Some(EntryAccess::SolidBlock {
+			estimated_packed_bytes: estimated,
+			..
+		}) = &mut self.access
+		{
+			*estimated = estimated_packed_bytes;
+		}
+	}
+
 	/// The bytes of text it holds.
 	pub(crate) fn text_bytes(&self) -> usize {
 		let target = match &self.kind {
@@ -590,7 +663,20 @@ pub(crate) async fn run_list(task: ListTask) -> Result<Listed, ListFailed> {
 		index: None,
 	};
 	let outcome = driver.run(&mut sink).await;
-	let index = sink.index;
+	let ListSink {
+		index,
+		mut kept_bytes,
+		..
+	} = sink;
+	// a member whose data the codec was decoding: listed when the job stopped it (a cancel, a
+	// fetch that failed), not when the codec ended on its data, damaged or cut short
+	if outcome.is_err() {
+		reporter.list_reading(None, |entry| {
+			add_entry(&mut listing, &mut kept_bytes, entry);
+		});
+	} else {
+		reporter.drop_reading();
+	}
 	if let Some(end) = driver.end {
 		listing.password = end.password;
 		listing.unaccounted_bytes = end.unaccounted_bytes;
@@ -621,14 +707,39 @@ struct ListSink<'l> {
 	index: Option<Box<HeldIndex>>,
 }
 
+impl ListSink<'_> {
+	fn listed(&mut self, entry: ArchiveEntry) {
+		add_entry(self.listing, &mut self.kept_bytes, &entry);
+		self.reporter.listed(entry);
+	}
+
+	/// Lists the entry the codec was reading, whose data it passed having taken `taken` archive
+	/// bytes.
+	fn passed(&mut self, taken: u64) -> Result<(), Error> {
+		let (listing, kept_bytes) = (&mut *self.listing, &mut self.kept_bytes);
+		let listed = self.reporter.list_reading(Some(taken), |entry| {
+			add_entry(listing, kept_bytes, entry);
+		});
+		if listed {
+			Ok(())
+		} else {
+			Err(unexpected_event())
+		}
+	}
+}
+
 impl FeedSink for ListSink<'_> {
 	async fn take(&mut self, event: WorkerEvent) -> Result<(), Error> {
 		match event {
 			WorkerEvent::Opened(format) => self.listing.format = Some(format),
-			WorkerEvent::Listed(entry) => {
-				add_entry(self.listing, &mut self.kept_bytes, &entry);
-				self.reporter.listed(*entry);
+			WorkerEvent::Listed(entry) => self.listed(*entry),
+			WorkerEvent::Reading { entry, passed } => {
+				if let Some(taken) = passed {
+					self.passed(taken)?;
+				}
+				self.reporter.reading(entry);
 			}
+			WorkerEvent::Passed(taken) => self.passed(taken)?,
 			WorkerEvent::Indexed(index) => self.index = Some(index),
 			// the feed answers asks, and a listing's codec sends nothing else
 			WorkerEvent::Ask { .. }

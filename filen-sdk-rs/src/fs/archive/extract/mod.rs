@@ -203,7 +203,12 @@ impl ExpansionLimit {
 	/// Whether `decoded` bytes are within the limit for an archive of which `read` bytes were
 	/// read.
 	pub(crate) fn allows(self, read: u64, decoded: u64) -> bool {
-		decoded <= self.floor.max(read.saturating_mul(self.ratio))
+		decoded <= self.max_decoded(read)
+	}
+
+	/// Most bytes an archive of which `read` bytes were read may decode to.
+	pub(crate) fn max_decoded(self, read: u64) -> u64 {
+		self.floor.max(read.saturating_mul(self.ratio))
 	}
 }
 

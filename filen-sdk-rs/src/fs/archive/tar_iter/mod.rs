@@ -106,6 +106,16 @@ pub(crate) struct TarMember {
 	pub(crate) modified: Option<MemberTime>,
 }
 
+impl TarMember {
+	/// Where its data ends in the tar, padding included: the tar holds that much once the member
+	/// is whole. `None` for a size so large it is out of range.
+	pub(crate) fn stored_end(&self) -> Option<u64> {
+		self.data_offset
+			.checked_add(self.size)?
+			.checked_add(padding(self.size))
+	}
+}
+
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum TarError {
 	#[error(transparent)]

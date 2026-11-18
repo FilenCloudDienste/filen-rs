@@ -216,7 +216,9 @@ impl Check {
 			WorkerEvent::Link(link) => {
 				return Err(format!("{} is a hard link", link.unresolved.path));
 			}
-			WorkerEvent::Listed(_) => return Err("its reader listed it".to_owned()),
+			WorkerEvent::Listed(_) | WorkerEvent::Reading { .. } | WorkerEvent::Passed(_) => {
+				return Err("its reader listed it".to_owned());
+			}
 			WorkerEvent::Head(_) => return Err("its reader wrote".to_owned()),
 			WorkerEvent::Indexed(_) => return Err("its reader handed back its index".to_owned()),
 		}

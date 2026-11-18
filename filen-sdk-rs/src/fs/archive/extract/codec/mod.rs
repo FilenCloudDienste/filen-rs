@@ -48,7 +48,7 @@ pub(crate) use held::{HeldIndex, IndexUse, TarSpan, TarTable};
 pub(crate) use rar::{RarKind, RarTable};
 use rar::{extract_rar, open_rar};
 use sevenz::{extract_held_sevenz, extract_sevenz, read_sevenz_held};
-use tar::{Compressed, Counted, SkipLimit, walk_tar};
+use tar::{Compressed, Counted, SkipLimit, Stored, walk_tar};
 use zip::{extract_held_zip, extract_zip, read_zip_index};
 
 /// What the codec may spend on an archive.
@@ -167,13 +167,19 @@ pub(crate) fn extract_stream(port: &WorkerPort, job: StreamJob) -> Result<Archiv
 					TarReader::from_source(seeking, max),
 					record,
 					None,
-					None,
+					Stored::Bare { len: job.len },
 				)?;
 				// what follows the end marker is read: zero padding, mostly in its chunk
 				let trailing = drain_trailing(walked.rest).map_err(read_failure)?;
 				(walked.unread + trailing, walked.spans)
 			} else {
-				let walked = walk_tar(&mut walk, TarReader::new(source, max), record, None, None)?;
+				let walked = walk_tar(
+					&mut walk,
+					TarReader::new(source, max),
+					record,
+					None,
+					Stored::Bare { len: job.len },
+				)?;
 				if walked.stopped {
 					return Ok(ArchiveEnd::plain(0, 0));
 				}
@@ -188,6 +194,10 @@ pub(crate) fn extract_stream(port: &WorkerPort, job: StreamJob) -> Result<Archiv
 			let compressed = Compressed {
 				len: job.len,
 				taken: Rc::default(),
+				expansion: job
+					.limits
+					.expansion
+					.map(|limit| (limit, job.limits.expansion_base.unwrap_or(job.len))),
 			};
 			let source = Counted {
 				inner: source,
@@ -219,7 +229,7 @@ pub(crate) fn extract_stream(port: &WorkerPort, job: StreamJob) -> Result<Archiv
 					TarReader::new(Cursor::new(block).chain(decoded), job.limits.max_members),
 					record,
 					skip_limit,
-					Some(&compressed),
+					Stored::Compressed(&compressed),
 				)?;
 				send_table(port, record, walked.spans)?;
 				if walked.stopped {

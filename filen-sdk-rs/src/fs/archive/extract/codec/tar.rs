@@ -16,7 +16,7 @@ use crate::{
 			entry_path::{ArchivePath, PathRejection, entry_path},
 			error::read_failure,
 			extract::{
-				ExtractSkipReason, SolidSkipExceeded,
+				ExpansionLimit, ExtractSkipReason, SolidSkipExceeded,
 				list::{ArchiveEntryKind, EntryAccess, ListedSkipReason},
 			},
 			limits::display_path,
@@ -29,7 +29,7 @@ use crate::{
 };
 
 use super::{
-	Taken, TarSpan,
+	ExpansionExceeded, Taken, TarSpan,
 	entries::{
 		Found, LinkKeys, Listed, MacShape, Verdict, Walk, apple_double, found_path, symlink,
 	},
@@ -52,13 +52,15 @@ pub(super) struct Walked<R> {
 }
 
 /// Sends every member of the tar `tar` reads, or what each is when listing, recording where each
-/// one's data lies when `record`.
+/// one's data lies when `record`. A listing lists a member from its header: a bare tar's at once,
+/// a compressed tar's file sent as [`WorkerEvent::Reading`] while its data is decoded, then listed
+/// once that data was passed, which tells what reaching it fetches.
 pub(super) fn walk_tar<R: TarSource>(
 	walk: &mut Walk,
 	mut tar: TarReader<R>,
 	record: bool,
 	skip_limit: Option<SkipLimit>,
-	compressed: Option<&Compressed>,
+	stored: Stored,
 ) -> Result<Walked<R>, Error> {
 	let mut spans = Vec::new();
 	// data of members passed over, which a compressed tar decodes all the same
@@ -85,33 +87,34 @@ pub(super) fn walk_tar<R: TarSource>(
 	let mut listed_files = SeededMap::default();
 	let mut shadowed = Shadowed::default();
 	let mut stopped = false;
-	// a listing's member, listed once the walk passed its data, which tells where a compressed
-	// tar's data of it ends
-	let mut pending: Option<Pending> = None;
-	let list_pending = |walk: &mut Walk,
-	                    pending: Option<Pending>,
-	                    listed_files: &mut ListedFiles,
-	                    shadowed: &mut Shadowed|
-	 -> Result<(), Error> {
-		match pending {
-			Some(pending) => list_member(walk, pending, compressed, listed_files, shadowed),
-			None => Ok(()),
-		}
-	};
+	// a listing sent the member before as `Reading`: listed once its data was passed
+	let mut reading = false;
 	loop {
 		// a download ends with its last entry, the rest of the tar unread
 		if walk.met_all_chosen() {
 			stopped = true;
 			break;
 		}
-		if pending.is_some() {
+		if reading {
 			// passed only once all of its data was there: one that ends early is not listed
 			tar.skip_rest().map_err(Error::from)?;
 		}
 		let next = tar.next_member().map_err(Error::from);
+		// what the decoder had taken once past the member's data
+		let mut passed = match stored {
+			Stored::Compressed(compressed) if reading => Some(compressed.taken()),
+			_ => None,
+		};
+		reading = false;
 		// the member before is whole once its data was passed, even when the header after it is
 		// damaged: listed before that ends the listing
-		list_pending(walk, pending.take(), &mut listed_files, &mut shadowed)?;
+		if !matches!(next, Ok(Some(_)))
+			&& let Some(taken) = passed.take()
+		{
+			walk.port
+				.send(WorkerEvent::Passed(taken))
+				.map_err(read_failure)?;
+		}
 		let Some(member) = next? else {
 			break;
 		};
@@ -151,12 +154,19 @@ pub(super) fn walk_tar<R: TarSource>(
 				_ => None,
 			};
 			drop(found);
-			pending = Some(Pending {
-				member,
-				ordinal: this,
-				apple_double,
-				link_target,
-			});
+			reading = list_member(
+				walk,
+				&member,
+				Heard {
+					ordinal: this,
+					apple_double,
+					link_target,
+					passed,
+				},
+				stored,
+				&mut listed_files,
+				&mut shadowed,
+			)?;
 			continue;
 		}
 		let key = shadowed.key(&found.path);
@@ -205,7 +215,6 @@ pub(super) fn walk_tar<R: TarSource>(
 		);
 		files += taken.files();
 	}
-	list_pending(walk, pending.take(), &mut listed_files, &mut shadowed)?;
 	walk.send_mac_folders().map_err(read_failure)?;
 	walk.finish()?;
 	Ok(Walked {
@@ -342,10 +351,30 @@ impl Shadowed {
 	}
 }
 
+/// How a tar is stored, which a listing tells a member's cost by and checks its header against.
+#[derive(Clone, Copy)]
+pub(super) enum Stored<'c> {
+	/// As it is, in an archive of `len` bytes.
+	Bare {
+		len: u64,
+	},
+	Compressed(&'c Compressed),
+}
+
 /// A compressed tar's archive bytes, and how many of them its decoder has taken so far.
 pub(super) struct Compressed {
 	pub(super) len: u64,
 	pub(super) taken: Rc<Cell<u64>>,
+	/// The expansion limit, when there is one, and the bytes it counts what the tar decodes to
+	/// against (see [`CodecLimits::expansion_base`](super::CodecLimits::expansion_base)).
+	pub(super) expansion: Option<(ExpansionLimit, u64)>,
+}
+
+impl Compressed {
+	/// The archive bytes the decoder has taken so far.
+	fn taken(&self) -> u64 {
+		self.taken.get().min(self.len)
+	}
 }
 
 /// A compressed tar's stored bytes, counting those its decoder takes.
@@ -362,35 +391,39 @@ impl<R: Read> Read for Counted<R> {
 	}
 }
 
-/// A member a listing read the header of, listed once the walk passed its data.
-struct Pending {
-	member: TarMember,
+/// What a listing knows of a member besides its header.
+struct Heard {
 	ordinal: u64,
 	/// Whether its data starts as an AppleDouble file's, when its name says it may.
 	apple_double: Option<bool>,
 	link_target: Option<HardlinkTarget>,
+	/// What the decoder had taken once past the data of the member sent as
+	/// [`WorkerEvent::Reading`] before it, which is listed first.
+	passed: Option<u64>,
 }
 
-/// Lists `pending`, whose data the walk just passed, a hard link resolved against
-/// `listed_files`, the files listed before it as extracted, which it joins when it is one. For
-/// a `compressed` tar, what reaching it costs: what the tar stores before its data, decoded and
-/// thrown away, and the archive bytes the decoder had taken once past its data, which
-/// approximates what a read of it alone fetches (see
-/// [`EntryAccess::SolidBlock`]'s `estimated_packed_bytes`).
+/// Lists `member` from its header, a hard link resolved against `listed_files`, the files listed
+/// before it as extracted, which it joins when it is one. A bare tar's member is listed at once,
+/// once its data is known to lie within the archive. A `Compressed` tar's file with data is sent
+/// as [`WorkerEvent::Reading`]: what reaching it costs is what the tar stores before its data,
+/// decoded and thrown away, and the archive bytes the decoder will have taken once past its data,
+/// which approximates what a read of it alone fetches (see [`EntryAccess::SolidBlock`]'s
+/// `estimated_packed_bytes`) and is told once the walk passed it. Whether it was sent so.
 fn list_member(
 	walk: &mut Walk,
-	pending: Pending,
-	compressed: Option<&Compressed>,
+	member: &TarMember,
+	heard: Heard,
+	stored: Stored,
 	listed_files: &mut ListedFiles,
 	shadowed: &mut Shadowed,
-) -> Result<(), Error> {
-	let Pending {
-		member,
+) -> Result<bool, Error> {
+	let Heard {
 		ordinal,
 		apple_double,
 		link_target,
-	} = pending;
-	let mut found = member_found(&member, ordinal);
+		mut passed,
+	} = heard;
+	let mut found = member_found(member, ordinal);
 	if let Some((target, shown)) = link_target {
 		let linked = shadowed.key(&target).and_then(|key| listed_files.get(&key));
 		match (shadowed.at(&target), linked) {
@@ -407,18 +440,60 @@ fn list_member(
 			}
 		}
 	}
-	let access = match compressed {
-		Some(compressed) => EntryAccess::SolidBlock {
-			skipped_bytes: member.data_offset,
-			estimated_packed_bytes: compressed.taken.get().min(compressed.len),
-			block_packed_bytes: compressed.len,
-		},
-		None => EntryAccess::Sequential,
+	let costed: Result<_, Error> = match stored {
+		// a header stating more data than the archive holds is not listed: passing it fails
+		Stored::Bare { len } if member.stored_end().is_none_or(|end| end > len) => {
+			Err(TarError::Corrupt("a member's data ends early").into())
+		}
+		Stored::Bare { .. } => Ok((EntryAccess::Sequential, false)),
+		// nor one stating more than the tar may decode to, which decoding it would fail on
+		Stored::Compressed(Compressed {
+			expansion: Some((limit, base)),
+			..
+		}) if member
+			.data_offset
+			.checked_add(member.size)
+			.is_none_or(|end| end > limit.max_decoded(*base)) =>
+		{
+			Err(ExpansionExceeded(limit.ratio).into())
+		}
+		Stored::Compressed(compressed) => {
+			let reading = found.kind == ArchiveEntryKind::File && member.size > 0;
+			// a file without data is passed already
+			let estimated_packed_bytes = if reading {
+				compressed.len
+			} else {
+				compressed.taken()
+			};
+			let access = EntryAccess::SolidBlock {
+				skipped_bytes: member.data_offset,
+				estimated_packed_bytes,
+				block_packed_bytes: compressed.len,
+			};
+			Ok((access, reading))
+		}
 	};
+	// the member before was passed, whatever this header says: listed first, unless this one
+	// tells it with its own event
+	let reading = matches!(costed, Ok((_, true)));
+	if !reading && let Some(taken) = passed.take() {
+		walk.port
+			.send(WorkerEvent::Passed(taken))
+			.map_err(read_failure)?;
+	}
+	let (access, reading) = costed?;
 	let key = shadowed.key(&found.path);
 	let size = found.size;
 	let is_dir = found.kind == ArchiveEntryKind::Dir;
-	let shadow = match walk.list(found, apple_double, access)? {
+	let listed = if reading {
+		walk.list_as(found, apple_double, access, |entry| WorkerEvent::Reading {
+			entry,
+			passed,
+		})?
+	} else {
+		walk.list(found, apple_double, access)?
+	};
+	let shadow = match listed {
 		_ if is_dir => Some(Shadow::Other),
 		Listed::Extracted => {
 			if let Some(key) = key {
@@ -430,7 +505,8 @@ fn list_member(
 		Listed::Root | Listed::Held => Some(Shadow::Other),
 	};
 	shadowed.note(key, shadow);
-	Ok(())
+	// a file is always sent; only a directory is held back, or is the root
+	Ok(reading && matches!(listed, Listed::Extracted | Listed::Skipped(_)))
 }
 
 /// What the driver is sent for `member`, a hard link taken at `path`: the link to the file it

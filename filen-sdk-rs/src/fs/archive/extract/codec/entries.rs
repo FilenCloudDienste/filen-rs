@@ -616,6 +616,17 @@ impl<'p> Walk<'p> {
 		apple_double: Option<bool>,
 		access: EntryAccess,
 	) -> Result<Listed, Error> {
+		self.list_as(found, apple_double, access, WorkerEvent::Listed)
+	}
+
+	/// As [`Self::list`], the entry sent as the event `event` makes of it.
+	pub(super) fn list_as(
+		&mut self,
+		found: Found,
+		apple_double: Option<bool>,
+		access: EntryAccess,
+		event: impl FnOnce(Box<ArchiveEntry>) -> WorkerEvent,
+	) -> Result<Listed, Error> {
 		if found.is_dir() && matches!(found.path, Err(PathRejection::Empty)) {
 			// the archive's own root, which no extraction creates
 			return Ok(Listed::Root);
@@ -688,7 +699,7 @@ impl<'p> Walk<'p> {
 			Some(reason) => Listed::Skipped(*reason),
 		};
 		self.port
-			.send(WorkerEvent::Listed(Box::new(entry)))
+			.send(event(Box::new(entry)))
 			.map_err(read_failure)?;
 		Ok(listed)
 	}

@@ -508,6 +508,8 @@ impl<W: AsyncWrite + Unpin + MaybeSend> FeedSink for EntrySink<'_, W> {
 				| WorkerEvent::FileEnd
 				| WorkerEvent::Link(_)
 				| WorkerEvent::Listed(_)
+				| WorkerEvent::Reading { .. }
+				| WorkerEvent::Passed(_)
 				| WorkerEvent::Head(_),
 			) => return Err(unexpected_event()),
 		}

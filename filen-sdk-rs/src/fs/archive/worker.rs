@@ -75,6 +75,19 @@ pub(crate) enum WorkerEvent {
 	Link(Box<LinkHead>),
 	/// When listing: what an entry is, and what extracting it would do.
 	Listed(Box<ArchiveEntry>),
+	/// When listing a compressed tar: a file member as its header lists it, whose data the codec
+	/// decodes next. What reaching it fetches is told once that data was passed, by a
+	/// [`Self::Passed`] or the next `Reading`'s `passed`; until then its `estimated_packed_bytes`
+	/// is the archive's length, the most it can be. `passed`: the data of the member sent
+	/// `Reading` before it was passed, the decoder having taken this many archive bytes; that
+	/// member is listed first.
+	Reading {
+		entry: Box<ArchiveEntry>,
+		passed: Option<u64>,
+	},
+	/// When listing a compressed tar: the data of the member sent [`Self::Reading`] last was
+	/// passed, the decoder having taken this many archive bytes; that member is listed.
+	Passed(u64),
 	/// When compressing into a format whose start is written last (a 7z): the archive's first
 	/// chunk, sent after all the others.
 	Head(Vec<u8>),
