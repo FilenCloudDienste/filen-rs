@@ -108,12 +108,8 @@ pub(super) fn walk_tar<R: TarSource>(
 		reading = false;
 		// the member before is whole once its data was passed, even when the header after it is
 		// damaged: listed before that ends the listing
-		if !matches!(next, Ok(Some(_)))
-			&& let Some(taken) = passed.take()
-		{
-			walk.port
-				.send(WorkerEvent::Passed(taken))
-				.map_err(read_failure)?;
+		if !matches!(next, Ok(Some(_))) {
+			send_passed(walk, &mut passed)?;
 		}
 		let Some(member) = next? else {
 			break;
@@ -144,29 +140,26 @@ pub(super) fn walk_tar<R: TarSource>(
 					size: member.size,
 				});
 			}
-			// a listing reads a tar through: an AppleDouble member is told by its data here
-			let apple_double = match found.mac_shape() {
-				Some(MacShape::AppleDoubleName) => Some(
-					apple_double(&mut TarBody(&mut tar))
-						.map_err(read_failure)?
-						.0,
-				),
-				_ => None,
-			};
 			drop(found);
-			reading = list_member(
+			let listed = list_member(
 				walk,
+				&mut tar,
 				&member,
 				Heard {
 					ordinal: this,
-					apple_double,
 					link_target,
-					passed,
+					passed: &mut passed,
 				},
 				stored,
 				&mut listed_files,
 				&mut shadowed,
-			)?;
+			);
+			// the member before is whole all the same: listed before what failed with this one
+			// ends the listing
+			if listed.is_err() {
+				send_passed(walk, &mut passed)?;
+			}
+			reading = listed?;
 			continue;
 		}
 		let key = shadowed.key(&found.path);
@@ -392,25 +385,37 @@ impl<R: Read> Read for Counted<R> {
 }
 
 /// What a listing knows of a member besides its header.
-struct Heard {
+struct Heard<'p> {
 	ordinal: u64,
-	/// Whether its data starts as an AppleDouble file's, when its name says it may.
-	apple_double: Option<bool>,
 	link_target: Option<HardlinkTarget>,
 	/// What the decoder had taken once past the data of the member sent as
-	/// [`WorkerEvent::Reading`] before it, which is listed first.
-	passed: Option<u64>,
+	/// [`WorkerEvent::Reading`] before it, which is listed first: taken once it was sent.
+	passed: &'p mut Option<u64>,
 }
 
-/// Lists `member` from its header, a hard link resolved against `listed_files`, the files listed
-/// before it as extracted, which it joins when it is one. A bare tar's member is listed at once,
-/// once its data is known to lie within the archive. A `Compressed` tar's file with data is sent
-/// as [`WorkerEvent::Reading`]: what reaching it costs is what the tar stores before its data,
-/// decoded and thrown away, and the archive bytes the decoder will have taken once past its data,
-/// which approximates what a read of it alone fetches (see [`EntryAccess::SolidBlock`]'s
-/// `estimated_packed_bytes`) and is told once the walk passed it. Whether it was sent so.
-fn list_member(
+/// Lists the member sent as [`WorkerEvent::Reading`] last, whose data was `passed`, unless that
+/// was told already.
+fn send_passed(walk: &Walk, passed: &mut Option<u64>) -> Result<(), Error> {
+	match passed.take() {
+		Some(taken) => walk
+			.port
+			.send(WorkerEvent::Passed(taken))
+			.map_err(read_failure),
+		None => Ok(()),
+	}
+}
+
+/// Lists `member` from its header, `tar` at its data, a hard link resolved against
+/// `listed_files`, the files listed before it as extracted, which it joins when it is one. A bare
+/// tar's member is listed at once, once its data is known to lie within the archive. A
+/// `Compressed` tar's file that stores data is sent as [`WorkerEvent::Reading`], and listed
+/// once the walk passed that data. A file's cost is what the tar stores before its data, decoded
+/// and thrown away, and the archive bytes the decoder will have taken once past its data, which
+/// approximates what a read of it alone fetches (see [`EntryAccess::SolidBlock`]'s
+/// `estimated_packed_bytes`) and is told once passed. Whether it was sent as read.
+fn list_member<R: TarSource>(
 	walk: &mut Walk,
+	tar: &mut TarReader<R>,
 	member: &TarMember,
 	heard: Heard,
 	stored: Stored,
@@ -419,11 +424,17 @@ fn list_member(
 ) -> Result<bool, Error> {
 	let Heard {
 		ordinal,
-		apple_double,
 		link_target,
-		mut passed,
+		passed,
 	} = heard;
 	let mut found = member_found(member, ordinal);
+	// a listing reads a tar through: an AppleDouble member is told by its data here
+	let apple_double = match found.mac_shape() {
+		Some(MacShape::AppleDoubleName) => {
+			Some(apple_double(&mut TarBody(tar)).map_err(read_failure)?.0)
+		}
+		_ => None,
+	};
 	if let Some((target, shown)) = link_target {
 		let linked = shadowed.key(&target).and_then(|key| listed_files.get(&key));
 		match (shadowed.at(&target), linked) {
@@ -473,26 +484,24 @@ fn list_member(
 			Ok((access, reading))
 		}
 	};
-	// the member before was passed, whatever this header says: listed first, unless this one
-	// tells it with its own event
-	let reading = matches!(costed, Ok((_, true)));
-	if !reading && let Some(taken) = passed.take() {
-		walk.port
-			.send(WorkerEvent::Passed(taken))
-			.map_err(read_failure)?;
-	}
 	let (access, reading) = costed?;
+	// the member before, unless this one tells it with its own event
+	if !reading {
+		send_passed(walk, passed)?;
+	}
 	let key = shadowed.key(&found.path);
 	let size = found.size;
 	let is_dir = found.kind == ArchiveEntryKind::Dir;
 	let listed = if reading {
 		walk.list_as(found, apple_double, access, |entry| WorkerEvent::Reading {
 			entry,
-			passed,
+			passed: passed.take(),
 		})?
 	} else {
 		walk.list(found, apple_double, access)?
 	};
+	// a directory held back, or the root, sent nothing that told the member before
+	send_passed(walk, passed)?;
 	let shadow = match listed {
 		_ if is_dir => Some(Shadow::Other),
 		Listed::Extracted => {
@@ -505,7 +514,7 @@ fn list_member(
 		Listed::Root | Listed::Held => Some(Shadow::Other),
 	};
 	shadowed.note(key, shadow);
-	// a file is always sent; only a directory is held back, or is the root
+	// only a directory is held back, or is the root
 	Ok(reading && matches!(listed, Listed::Extracted | Listed::Skipped(_)))
 }
 

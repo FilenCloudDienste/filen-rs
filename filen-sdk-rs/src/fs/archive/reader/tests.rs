@@ -2460,3 +2460,24 @@ async fn a_tar_cut_inside_a_header_lists_the_members_before_it_alone() {
 		);
 	}
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tar_cut_inside_an_appledouble_files_head_lists_the_member_before_it() {
+	// as bsdtar writes a macOS file: its AppleDouble file right before it
+	let mut tar = tar_of(&[
+		("a.bin", &[7u8; 700][..]),
+		("._b.txt", &[0u8; 100][..]),
+		("b.txt", b"beta"),
+	]);
+	// the AppleDouble header follows a.bin's header and its two blocks of data: cut 4 bytes into
+	// its data, inside the 8-byte head that tells it
+	tar.truncate(3 * 512 + 512 + 4);
+	for (name, bytes) in [("t.tar", tar.clone()), ("t.tar.gz", gzip(&tar))] {
+		let (listed, error) = failed_listing(name, bytes).await;
+		assert_eq!(
+			(listed, error),
+			(vec!["a.bin".to_owned()], ErrorKind::ArchiveCorrupt),
+			"{name}"
+		);
+	}
+}
