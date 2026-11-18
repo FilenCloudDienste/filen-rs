@@ -3,13 +3,29 @@
 //! removes everything it wrote; a test of another Windows user's keys writes them under a made-up
 //! SID. Windows only.
 
-use std::path::PathBuf;
+use std::{
+	path::PathBuf,
+	sync::{Mutex, PoisonError},
+};
 
 use super::*;
 use crate::os::cfapi::explorer::DEFAULT_ICON;
 
 /// A SID no account has, for keys written as if by another Windows user.
 const OTHER_SID: &str = "S-1-5-21-1000-1000-1000-4242";
+
+/// SIDs no account has, each used by one test alone, so no other test's entries are listed for
+/// them while it runs.
+const LONE_SID: &str = "S-1-5-21-1000-1000-1000-4243";
+const SWEPT_SID: &str = "S-1-5-21-1000-1000-1000-4244";
+const UNBRAND_SID: &str = "S-1-5-21-1000-1000-1000-4245";
+
+/// Held by each test that sweeps, for the whole test: the sweep reads every navigation-pane class of
+/// the user, and one of them locks a class of its own against reading until it ends.
+static SWEEPING: Mutex<()> = Mutex::new(());
+
+/// The context menu commands' key name of the tests that write none: no test writes one there.
+const NO_COMMANDS: &str = "FilenCloudFilesTestNone";
 
 /// The tests' Filen user `n`: no account's id is this high.
 fn test_user(n: u64) -> UserId {
@@ -123,7 +139,7 @@ fn a_root_is_shown_with_every_key_and_removed_again() {
 	let _cleanup = Cleanup::new(&[&sid], &[user]);
 	let root = test_root("shown");
 	let root_text = root.to_str().unwrap();
-	brand_as(&sid, &root, user, &branding("Filen (2)")).unwrap();
+	brand_as(&sid, &root, user, &branding("Filen (2)"), NO_COMMANDS).unwrap();
 	let entry = entry(&sid, user);
 	let class = class(&sid, user);
 	let clsid = namespace_clsid(&sid, user);
@@ -164,7 +180,7 @@ fn a_root_is_shown_with_every_key_and_removed_again() {
 	assert!(present(hkcu, &format!(r"{DESKTOP_NAMESPACE}\{clsid}")));
 	assert_eq!(dword_value(hkcu, HIDE_DESKTOP_ICONS, &clsid), Some(1));
 
-	unbrand_as(&sid, &root, user, BrandingScope::User).unwrap();
+	unbrand_as(&sid, &root, user, BrandingScope::User, NO_COMMANDS).unwrap();
 	assert!(!present(hklm, &entry));
 	assert!(!present(hkcu, &class));
 	assert!(!present(hkcu, &format!(r"{DESKTOP_NAMESPACE}\{clsid}")));
@@ -178,7 +194,7 @@ fn a_root_whose_path_holds_a_percent_sign_is_not_shown() {
 	let _cleanup = Cleanup::new(&[&sid], &[user]);
 	let root = test_root("%USERNAME%");
 	assert!(matches!(
-		brand_as(&sid, &root, user, &Branding::default()),
+		brand_as(&sid, &root, user, &Branding::default(), NO_COMMANDS),
 		Err(ExplorerError::Unbrandable(_))
 	));
 	assert!(!present(Hive::LocalMachine, &entry(&sid, user)));
@@ -192,10 +208,10 @@ fn removing_one_root_leaves_another_root_of_the_same_user_shown() {
 	let _cleanup = Cleanup::new(&[&sid], &[user]);
 	let first = test_root("first");
 	let second = test_root("second");
-	brand_as(&sid, &first, user, &Branding::default()).unwrap();
+	brand_as(&sid, &first, user, &Branding::default(), NO_COMMANDS).unwrap();
 	// A second state directory registered a root of the same user since: the same key names.
-	brand_as(&sid, &second, user, &Branding::default()).unwrap();
-	unbrand_as(&sid, &first, user, BrandingScope::User).unwrap();
+	brand_as(&sid, &second, user, &Branding::default(), NO_COMMANDS).unwrap();
+	unbrand_as(&sid, &first, user, BrandingScope::User, NO_COMMANDS).unwrap();
 	let entry = entry(&sid, user);
 	assert_eq!(
 		string_value(
@@ -215,7 +231,7 @@ fn removing_one_root_leaves_another_root_of_the_same_user_shown() {
 		.as_deref(),
 		second.to_str()
 	);
-	unbrand_as(&sid, &second, user, BrandingScope::User).unwrap();
+	unbrand_as(&sid, &second, user, BrandingScope::User, NO_COMMANDS).unwrap();
 	assert!(!present(Hive::LocalMachine, &entry));
 	assert!(!present(Hive::CurrentUser, &class(&sid, user)));
 }
@@ -231,6 +247,7 @@ fn a_sync_root_list_entry_another_account_owns_is_not_written() {
 		&test_root("squatted"),
 		user,
 		&Branding::default(),
+		NO_COMMANDS,
 	);
 	assert!(matches!(shown, Err(ExplorerError::NotOwned)), "{shown:?}");
 	assert_eq!(
@@ -250,7 +267,7 @@ fn an_elevated_removal_leaves_the_entry_of_another_windows_user() {
 	let mut cleanup = Cleanup::new(&[&sid, OTHER_SID], &[user]);
 	let root = test_root("elevated");
 	let root_text = root.to_str().unwrap();
-	brand_as(&sid, &root, user, &Branding::default()).unwrap();
+	brand_as(&sid, &root, user, &Branding::default(), NO_COMMANDS).unwrap();
 	let other = entry(OTHER_SID, user);
 	cleanup.extra.push((Hive::LocalMachine, other.clone()));
 	set_value(
@@ -259,7 +276,7 @@ fn an_elevated_removal_leaves_the_entry_of_another_windows_user() {
 		Some(OTHER_SID),
 		root_text,
 	);
-	unbrand_as(&sid, &root, user, BrandingScope::MachineOnly).unwrap();
+	unbrand_as(&sid, &root, user, BrandingScope::MachineOnly, NO_COMMANDS).unwrap();
 	assert!(!present(Hive::LocalMachine, &entry(&sid, user)));
 	assert!(present(Hive::LocalMachine, &other));
 	assert!(present(Hive::CurrentUser, &class(&sid, user)));
@@ -271,17 +288,19 @@ fn removing_a_root_removes_its_navigation_entry_past_a_list_entry_it_cannot_read
 	let user = test_user(6);
 	let mut cleanup = Cleanup::new(&[&sid], &[user]);
 	let root = test_root("unreadable");
-	brand_as(&sid, &root, user, &Branding::default()).unwrap();
+	brand_as(&sid, &root, user, &Branding::default(), NO_COMMANDS).unwrap();
 	cleanup.lock(
 		Hive::LocalMachine,
 		&format!(r"{}\UserSyncRoots", entry(&sid, user)),
 	);
-	assert!(unbrand_as(&sid, &root, user, BrandingScope::User).is_err());
+	assert!(unbrand_as(&sid, &root, user, BrandingScope::User, NO_COMMANDS).is_err());
 	assert!(!present(Hive::CurrentUser, &class(&sid, user)));
 }
 
 #[test]
 fn the_sweep_tries_every_entry_past_one_it_cannot_read() {
+	// Released after `cleanup` has unlocked the class.
+	let _sweeping = SWEEPING.lock().unwrap_or_else(PoisonError::into_inner);
 	// Roots of this test alone, so the sweep removes nothing another test wrote.
 	let gone = PathBuf::from(format!(
 		r"C:\filen-explorer-sweep-test-{}\Gone",
@@ -319,9 +338,250 @@ fn the_sweep_tries_every_entry_past_one_it_cannot_read() {
 	}
 	cleanup.lock(Hive::CurrentUser, &classes[0]);
 	let prefix = gone.parent().unwrap().to_path_buf();
-	let swept = sweep_as(OTHER_SID, &|root| !root.starts_with(&prefix));
+	let swept = sweep_as(OTHER_SID, &|root| !root.starts_with(&prefix), NO_COMMANDS);
 	assert!(swept.is_err(), "{swept:?}");
 	assert!(present(Hive::LocalMachine, &entry(OTHER_SID, unreadable)));
 	assert!(!present(Hive::LocalMachine, &entry(OTHER_SID, removable)));
 	assert!(!present(Hive::CurrentUser, &classes[1]));
+}
+
+/// The context menu commands' key name of test `n`, of this test run alone.
+fn command_key(n: u32) -> String {
+	format!("FilenCloudFilesTest{}x{n}", std::process::id())
+}
+
+/// Removes, when dropped, both submenus under a test's command key name.
+struct CommandCleanup(String);
+
+impl Drop for CommandCleanup {
+	fn drop(&mut self) {
+		for tree in command_trees(&self.0) {
+			drop(delete_tree(Hive::CurrentUser, &tree));
+		}
+	}
+}
+
+/// Commands starting this test binary, which is there, so they are written.
+fn present_commands() -> (String, Branding) {
+	let app = std::env::current_exe().unwrap();
+	let app = app.to_str().unwrap().to_owned();
+	let commands = ExplorerCommands::parse(&app, None, Some("Teilen & Link"), None, None).unwrap();
+	let branding = Branding::parse(Some("Filen (2)"), None, None, Some(commands))
+		.unwrap()
+		.unwrap();
+	(app, branding)
+}
+
+/// Writes `branding`'s commands under `key` as `brand_as` does, without a root.
+fn plant_commands(key: &str, branding: &Branding) {
+	write_commands(key, branding, branding.commands.as_deref().unwrap()).unwrap();
+}
+
+#[test]
+fn a_root_whose_branding_names_commands_offers_them_with_every_value() {
+	let sid = own();
+	let user = test_user(7);
+	let _cleanup = Cleanup::new(&[&sid], &[user]);
+	let key = command_key(7);
+	let _commands = CommandCleanup(key.clone());
+	let (app, branding) = present_commands();
+	let root = test_root("commands");
+	brand_as(&sid, &root, user, &branding, &key).unwrap();
+	let [files, folders] = command_trees(&key);
+	let hkcu = Hive::CurrentUser;
+	for tree in [&files, &folders] {
+		assert_eq!(
+			string_value(hkcu, tree, Some("AppliesTo")).as_deref(),
+			Some(r#"System.StorageProviderId:="Filen""#)
+		);
+		assert_eq!(dword_value(hkcu, tree, MARKER_VALUE), Some(1));
+		assert_eq!(
+			string_value(hkcu, tree, Some("MUIVerb")).as_deref(),
+			Some("Filen (2)")
+		);
+		assert_eq!(
+			string_value(hkcu, tree, Some("Icon")),
+			Some(format!("{app},0"))
+		);
+		assert_eq!(
+			string_value(hkcu, tree, Some("SubCommands")).as_deref(),
+			Some("")
+		);
+		assert_eq!(
+			string_value(hkcu, tree, Some("MultiSelectModel")).as_deref(),
+			Some("Single")
+		);
+		assert_eq!(
+			string_value(hkcu, &format!(r"{tree}\shell\01share"), Some("MUIVerb")).as_deref(),
+			Some("Teilen && Link")
+		);
+		assert_eq!(
+			string_value(hkcu, &format!(r"{tree}\shell\02web\command"), None),
+			Some(format!("\"{app}\" --filen-explorer-command=web \"%1\""))
+		);
+	}
+	assert_eq!(
+		string_value(hkcu, &format!(r"{files}\shell\03versions"), Some("MUIVerb")).as_deref(),
+		Some("Version history")
+	);
+	assert!(!present(hkcu, &format!(r"{folders}\shell\03versions")));
+	// A repeat writes the same, in place.
+	brand_as(&sid, &root, user, &branding, &key).unwrap();
+	assert_eq!(
+		string_value(hkcu, &format!(r"{files}\shell\01share\command"), None),
+		Some(format!("\"{app}\" --filen-explorer-command=share \"%1\""))
+	);
+}
+
+#[test]
+fn commands_naming_an_app_that_is_not_there_are_not_written_and_the_root_is_shown() {
+	let sid = own();
+	let user = test_user(8);
+	let _cleanup = Cleanup::new(&[&sid], &[user]);
+	let key = command_key(8);
+	let _commands = CommandCleanup(key.clone());
+	let commands = ExplorerCommands::parse(
+		r"C:\filen-explorer-tests\missing.exe",
+		None,
+		None,
+		None,
+		None,
+	)
+	.unwrap();
+	let branding = Branding::parse(None, None, None, Some(commands))
+		.unwrap()
+		.unwrap();
+	brand_as(&sid, &test_root("no-app"), user, &branding, &key).unwrap();
+	assert!(present(Hive::LocalMachine, &entry(&sid, user)));
+	for tree in command_trees(&key) {
+		assert!(!present(Hive::CurrentUser, &tree), "{tree}");
+	}
+}
+
+#[test]
+fn the_commands_stay_while_the_user_has_another_root() {
+	let sid = own();
+	let (first_user, second_user) = (test_user(9), test_user(10));
+	let _cleanup = Cleanup::new(&[&sid], &[first_user, second_user]);
+	let key = command_key(9);
+	let _commands = CommandCleanup(key.clone());
+	let (_, branding) = present_commands();
+	let (first, second) = (test_root("first-commands"), test_root("second-commands"));
+	brand_as(&sid, &first, first_user, &branding, &key).unwrap();
+	brand_as(&sid, &second, second_user, &branding, &key).unwrap();
+	unbrand_as(&sid, &first, first_user, BrandingScope::User, &key).unwrap();
+	for tree in command_trees(&key) {
+		assert!(present(Hive::CurrentUser, &tree), "{tree}");
+	}
+}
+
+#[test]
+fn removing_the_last_root_of_a_windows_user_removes_the_commands() {
+	let user = test_user(15);
+	let mut cleanup = Cleanup::new(&[UNBRAND_SID], &[user]);
+	let key = command_key(15);
+	let _commands = CommandCleanup(key.clone());
+	let (_, branding) = present_commands();
+	plant_commands(&key, &branding);
+	// The root's sync root list entry, as `brand_as` writes it for another Windows user.
+	let root = test_root("last");
+	let listed = entry(UNBRAND_SID, user);
+	cleanup.extra.push((Hive::LocalMachine, listed.clone()));
+	set_value(
+		Hive::LocalMachine,
+		&format!(r"{listed}\UserSyncRoots"),
+		Some(UNBRAND_SID),
+		root.to_str().unwrap(),
+	);
+	unbrand_as(UNBRAND_SID, &root, user, BrandingScope::User, &key).unwrap();
+	assert!(!present(Hive::LocalMachine, &listed));
+	for tree in command_trees(&key) {
+		assert!(!present(Hive::CurrentUser, &tree), "{tree}");
+	}
+}
+
+#[test]
+fn an_elevated_removal_leaves_the_commands() {
+	let sid = own();
+	let user = test_user(11);
+	let _cleanup = Cleanup::new(&[&sid], &[user]);
+	let key = command_key(11);
+	let _commands = CommandCleanup(key.clone());
+	let (_, branding) = present_commands();
+	let root = test_root("elevated-commands");
+	brand_as(&sid, &root, user, &branding, &key).unwrap();
+	unbrand_as(&sid, &root, user, BrandingScope::MachineOnly, &key).unwrap();
+	assert!(!present(Hive::LocalMachine, &entry(&sid, user)));
+	for tree in command_trees(&key) {
+		assert!(present(Hive::CurrentUser, &tree), "{tree}");
+	}
+}
+
+#[test]
+fn the_commands_of_a_windows_user_with_no_root_left_are_removed_unless_another_entry_is_there() {
+	let user = test_user(12);
+	let mut cleanup = Cleanup::new(&[LONE_SID], &[user]);
+	let key = command_key(12);
+	let _commands = CommandCleanup(key.clone());
+	let (_, branding) = present_commands();
+	plant_commands(&key, &branding);
+	let other = entry(LONE_SID, user);
+	cleanup.extra.push((Hive::LocalMachine, other.clone()));
+	set_value(
+		Hive::LocalMachine,
+		&format!(r"{other}\UserSyncRoots"),
+		Some(LONE_SID),
+		r"C:\filen-explorer-tests\kept",
+	);
+	assert_eq!(remove_commands_unless_rooted(LONE_SID, &key).unwrap(), 0);
+	for tree in command_trees(&key) {
+		assert!(present(Hive::CurrentUser, &tree), "{tree}");
+	}
+	delete_tree(Hive::LocalMachine, &other).unwrap();
+	assert_eq!(remove_commands_unless_rooted(LONE_SID, &key).unwrap(), 2);
+	for tree in command_trees(&key) {
+		assert!(!present(Hive::CurrentUser, &tree), "{tree}");
+	}
+}
+
+#[test]
+fn a_command_key_without_the_marker_is_left_alone() {
+	let key = command_key(13);
+	let _commands = CommandCleanup(key.clone());
+	let [files, folders] = command_trees(&key);
+	set_value(Hive::CurrentUser, &files, Some("MUIVerb"), "someone else's");
+	set_dword(
+		&create(Hive::CurrentUser, &folders).unwrap(),
+		MARKER_VALUE,
+		0,
+	)
+	.unwrap();
+	assert_eq!(remove_commands_unless_rooted(SWEPT_SID, &key).unwrap(), 0);
+	assert!(present(Hive::CurrentUser, &files));
+	assert!(present(Hive::CurrentUser, &folders));
+}
+
+#[test]
+fn an_empty_command_key_a_removal_cut_short_left_is_removed() {
+	let key = command_key(16);
+	let _commands = CommandCleanup(key.clone());
+	let [files, _] = command_trees(&key);
+	drop(create(Hive::CurrentUser, &files).unwrap());
+	assert_eq!(remove_commands_unless_rooted(SWEPT_SID, &key).unwrap(), 1);
+	assert!(!present(Hive::CurrentUser, &files));
+}
+
+#[test]
+fn the_sweep_removes_the_commands_once_no_entry_of_the_user_is_left() {
+	let _sweeping = SWEEPING.lock().unwrap_or_else(PoisonError::into_inner);
+	let key = command_key(14);
+	let _commands = CommandCleanup(key.clone());
+	let (_, branding) = present_commands();
+	plant_commands(&key, &branding);
+	// Of a SID no other test writes an entry of.
+	let swept = sweep_as(SWEPT_SID, &|_| true, &key).unwrap();
+	assert_eq!(swept, 2);
+	for tree in command_trees(&key) {
+		assert!(!present(Hive::CurrentUser, &tree), "{tree}");
+	}
 }

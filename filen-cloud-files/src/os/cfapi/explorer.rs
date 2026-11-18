@@ -4,7 +4,7 @@
 //! process. Pure, so the key names and values are tested on every host; `os::win` writes them.
 
 use crate::{
-	branding::{Branding, IconPath},
+	branding::{AppPath, Branding, CommandLabel, ExplorerCommands, IconPath},
 	helper::{ExistingRoot, UserId},
 };
 
@@ -107,6 +107,233 @@ pub(crate) fn icon_resource(branding: &Branding, exists: impl Fn(&IconPath) -> b
 	}
 }
 
+/// The provider id File Explorer reports for an item in a root of this provider
+/// (`System.StorageProviderId`): the first `!`-separated part of the root's sync root list entry.
+/// Measured to exist only while that entry is there; without it Explorer reports "computer".
+pub(crate) const PROVIDER_ID: &str = "Filen";
+
+/// The context menu commands' key, below [`FILE_VERBS`] and [`DIRECTORY_VERBS`]: this provider's
+/// marker, which it also carries as a value, so only a key this provider wrote is removed.
+pub(crate) const COMMAND_KEY: &str = MARKER_VALUE;
+
+/// Where File Explorer reads a user's context menu commands on every file, under
+/// `HKEY_CURRENT_USER`.
+pub(crate) const FILE_VERBS: &str = r"Software\Classes\*\shell";
+
+/// Where File Explorer reads a user's context menu commands on every folder (a root and the
+/// navigation pane's entry included), under `HKEY_CURRENT_USER`. A folder's background takes none:
+/// it cannot be limited to a provider's items.
+pub(crate) const DIRECTORY_VERBS: &str = r"Software\Classes\Directory\shell";
+
+/// The switch the app's command line names the action with.
+const COMMAND_SWITCH: &str = "--filen-explorer-command";
+
+/// The English labels the commands show when the parent names none.
+const DEFAULT_SHARE_LABEL: &str = "Share / create public link";
+const DEFAULT_WEB_LABEL: &str = "View on filen.io";
+const DEFAULT_VERSIONS_LABEL: &str = "Version history";
+
+/// A context menu command the app carries out on an item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CommandAction {
+	/// Opens the item's public link dialog.
+	Share,
+	/// Opens the item in the web app.
+	Web,
+	/// Opens a file's version history.
+	Versions,
+}
+
+impl CommandAction {
+	/// The action as the app's command line spells it.
+	pub(crate) fn as_str(self) -> &'static str {
+		match self {
+			Self::Share => "share",
+			Self::Web => "web",
+			Self::Versions => "versions",
+		}
+	}
+
+	/// The command's key below the submenu's `shell`: numbered, as Explorer orders a submenu by key
+	/// name.
+	fn key(self) -> &'static str {
+		match self {
+			Self::Share => "01share",
+			Self::Web => "02web",
+			Self::Versions => "03versions",
+		}
+	}
+}
+
+/// The command line File Explorer runs for `action` on an item: the app, quoted, the action, and
+/// the item's full path quoted as Explorer substitutes it for `%1`.
+pub(crate) fn command_line(app: &AppPath, action: CommandAction) -> String {
+	format!(
+		"\"{}\" {COMMAND_SWITCH}={} \"%1\"",
+		app.as_str(),
+		action.as_str()
+	)
+}
+
+/// A registry value the commands write: never expandable, so no `%` is read as a variable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CommandData {
+	/// A `REG_SZ`, the key's default value when `name` is `None`.
+	Text {
+		/// The value's name.
+		name: Option<&'static str>,
+		/// What it holds.
+		text: String,
+	},
+	/// A `REG_DWORD`.
+	Number {
+		/// The value's name.
+		name: &'static str,
+		/// What it holds.
+		number: u32,
+	},
+}
+
+/// One value the commands write, in the key `key` below `HKEY_CURRENT_USER`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CommandValue {
+	/// The key, below `HKEY_CURRENT_USER`.
+	pub(crate) key: String,
+	/// The value.
+	pub(crate) data: CommandData,
+}
+
+/// `label` as a menu shows it unchanged: a `&` would mark the next letter as the item's
+/// accelerator, so each is doubled.
+fn menu_text(label: &str) -> String {
+	label.replace('&', "&&")
+}
+
+/// The two submenus' keys below `HKEY_CURRENT_USER`, named `key`: on files, then on folders.
+pub(crate) fn command_trees(key: &str) -> [String; 2] {
+	[
+		format!(r"{FILE_VERBS}\{key}"),
+		format!(r"{DIRECTORY_VERBS}\{key}"),
+	]
+}
+
+/// The value that limits a submenu to the items of this provider's roots.
+const APPLIES_TO: &str = "AppliesTo";
+
+/// The values that show a submenu, as [`command_values`] writes them.
+const SUBMENU_VALUES: [&str; 4] = ["MUIVerb", "Icon", "MultiSelectModel", "SubCommands"];
+
+/// Every value that offers `commands` in File Explorer's context menu on the items of this
+/// provider's roots, under the submenus named `key`, in the order they are written: in each
+/// submenu, first the marker, so a key a write cut short leaves is still found and removed, then
+/// the scope (`AppliesTo`), so it never leaves a command offered on every item, then the
+/// commands, then what shows the submenu. The submenu is
+/// labelled with `commands`' menu label or `branding`'s display name, and shows `branding`'s icon
+/// when its file `exists`, else the app's. Folders get no version history.
+pub(crate) fn command_values(
+	key: &str,
+	branding: &Branding,
+	commands: &ExplorerCommands,
+	exists: impl Fn(&IconPath) -> bool,
+) -> Vec<CommandValue> {
+	let label = |label: Option<&CommandLabel>, default: &str| {
+		menu_text(label.map_or(default, CommandLabel::as_str))
+	};
+	let menu = label(commands.menu.as_ref(), branding.display_name.as_str());
+	let icon = match &branding.icon {
+		Some(icon) if exists(icon) => format!("{},{}", icon.as_str(), branding.icon_index),
+		Some(_) | None => format!("{},0", commands.app.as_str()),
+	};
+	let actions = [
+		(
+			CommandAction::Share,
+			label(commands.share.as_ref(), DEFAULT_SHARE_LABEL),
+		),
+		(
+			CommandAction::Web,
+			label(commands.web.as_ref(), DEFAULT_WEB_LABEL),
+		),
+		(
+			CommandAction::Versions,
+			label(commands.versions.as_ref(), DEFAULT_VERSIONS_LABEL),
+		),
+	];
+	let text = |key: &str, name: Option<&'static str>, text: &str| CommandValue {
+		key: key.to_owned(),
+		data: CommandData::Text {
+			name,
+			text: text.to_owned(),
+		},
+	};
+	let [files, folders] = command_trees(key);
+	let mut values = Vec::new();
+	for (tree, on_files) in [(files, true), (folders, false)] {
+		values.push(CommandValue {
+			key: tree.clone(),
+			data: CommandData::Number {
+				name: MARKER_VALUE,
+				number: 1,
+			},
+		});
+		values.push(text(
+			&tree,
+			Some(APPLIES_TO),
+			&format!("System.StorageProviderId:=\"{PROVIDER_ID}\""),
+		));
+		for (action, label) in &actions {
+			if *action == CommandAction::Versions && !on_files {
+				continue;
+			}
+			let verb = format!(r"{tree}\shell\{}", action.key());
+			values.push(text(&verb, Some("MUIVerb"), label));
+			values.push(text(&verb, Some("MultiSelectModel"), "Single"));
+			values.push(text(
+				&format!(r"{verb}\command"),
+				None,
+				&command_line(&commands.app, *action),
+			));
+		}
+		let [verb, icon_value, select, sub_commands] = SUBMENU_VALUES;
+		values.push(text(&tree, Some(verb), &menu));
+		values.push(text(&tree, Some(icon_value), &icon));
+		values.push(text(&tree, Some(select), "Single"));
+		values.push(text(&tree, Some(sub_commands), ""));
+	}
+	values
+}
+
+/// One step of removing a submenu, below `HKEY_CURRENT_USER`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CommandRemoval {
+	/// Deletes the key with every key and value below it.
+	Tree(String),
+	/// Deletes the value `name` of the key `key`.
+	Value {
+		/// The key.
+		key: String,
+		/// The value's name.
+		name: &'static str,
+	},
+}
+
+/// The steps that remove the submenu `tree`, one of [`command_trees`], in order, so that a removal
+/// cut short anywhere, within a step too, leaves neither a command offered outside the roots nor a
+/// key without the marker: one registry call deletes a key's values in no order it states, so no
+/// step deletes the scope or the marker with anything that outlives it. First the commands, then
+/// what shows the submenu, then the scope, last the key, which by then holds only the marker: cut
+/// short, an empty key, which the sweep removes too.
+pub(crate) fn command_removal(tree: &str) -> Vec<CommandRemoval> {
+	let value = |name| CommandRemoval::Value {
+		key: tree.to_owned(),
+		name,
+	};
+	let mut steps = vec![CommandRemoval::Tree(format!(r"{tree}\shell"))];
+	steps.extend(SUBMENU_VALUES.into_iter().map(value));
+	steps.push(value(APPLIES_TO));
+	steps.push(CommandRemoval::Tree(tree.to_owned()));
+	steps
+}
+
 /// Why a root's path cannot go in the registry's expandable strings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error("the root's path holds a %, which the registry would read as a variable")]
@@ -150,6 +377,8 @@ pub(crate) fn sweep_keeps<E>(
 
 #[cfg(test)]
 mod tests {
+	use std::collections::{BTreeMap, BTreeSet};
+
 	use super::*;
 
 	const SID: &str = "S-1-5-21-3291749577-2867003985-2111167235-1000";
@@ -242,6 +471,294 @@ mod tests {
 				keeps,
 				"{registration:?} volume present {volume_present}"
 			);
+		}
+	}
+
+	#[test]
+	fn the_provider_id_is_what_the_sync_root_list_entries_start_with() {
+		assert_eq!(KEY_PREFIX, format!("{PROVIDER_ID}!"));
+	}
+
+	const APP: &str = r"C:\Program Files\Filen\Filen.exe";
+
+	fn commands(labels: [Option<&str>; 4]) -> ExplorerCommands {
+		let [menu, share, web, versions] = labels;
+		ExplorerCommands::parse(APP, menu, share, web, versions).unwrap()
+	}
+
+	/// A text value `name` of `key` holding `text`.
+	fn text(key: &str, name: Option<&'static str>, text: &str) -> CommandValue {
+		CommandValue {
+			key: key.to_owned(),
+			data: CommandData::Text {
+				name,
+				text: text.to_owned(),
+			},
+		}
+	}
+
+	/// The text values named `name`, by key.
+	fn named<'a>(values: &'a [CommandValue], wanted: &str) -> Vec<(&'a str, &'a str)> {
+		values
+			.iter()
+			.filter_map(|value| match &value.data {
+				CommandData::Text {
+					name: Some(name),
+					text,
+				} if *name == wanted => Some((value.key.as_str(), text.as_str())),
+				CommandData::Text { .. } | CommandData::Number { .. } => None,
+			})
+			.collect()
+	}
+
+	#[test]
+	fn the_commands_are_written_marker_and_scope_first_with_versions_on_files_only() {
+		let values = command_values("K", &Branding::default(), &commands([None; 4]), |_| true);
+		let file = r"Software\Classes\*\shell\K";
+		let dir = r"Software\Classes\Directory\shell\K";
+		let verb = |tree: &str, key: &str, label: &str, action: &str| {
+			let at = format!(r"{tree}\shell\{key}");
+			[
+				text(&at, Some("MUIVerb"), label),
+				text(&at, Some("MultiSelectModel"), "Single"),
+				text(
+					&format!(r"{at}\command"),
+					None,
+					&format!(
+						r#""C:\Program Files\Filen\Filen.exe" --filen-explorer-command={action} "%1""#
+					),
+				),
+			]
+		};
+		let head = |tree: &str| {
+			[
+				CommandValue {
+					key: tree.to_owned(),
+					data: CommandData::Number {
+						name: "FilenCloudFiles",
+						number: 1,
+					},
+				},
+				text(
+					tree,
+					Some("AppliesTo"),
+					r#"System.StorageProviderId:="Filen""#,
+				),
+			]
+		};
+		let tail = |tree: &str| {
+			[
+				text(tree, Some("MUIVerb"), "Filen"),
+				text(tree, Some("Icon"), r"C:\Program Files\Filen\Filen.exe,0"),
+				text(tree, Some("MultiSelectModel"), "Single"),
+				text(tree, Some("SubCommands"), ""),
+			]
+		};
+		let mut expected = Vec::new();
+		expected.extend(head(file));
+		expected.extend(verb(file, "01share", "Share / create public link", "share"));
+		expected.extend(verb(file, "02web", "View on filen.io", "web"));
+		expected.extend(verb(file, "03versions", "Version history", "versions"));
+		expected.extend(tail(file));
+		expected.extend(head(dir));
+		expected.extend(verb(dir, "01share", "Share / create public link", "share"));
+		expected.extend(verb(dir, "02web", "View on filen.io", "web"));
+		expected.extend(tail(dir));
+		assert_eq!(values, expected);
+		assert_eq!(command_trees("K"), [file, dir]);
+	}
+
+	/// The registry as far as the submenus go: each key below `HKEY_CURRENT_USER`, with the names
+	/// of its values (`""` for the default one).
+	type Model = BTreeMap<String, BTreeSet<&'static str>>;
+
+	/// What is wrong with `model` for the submenu `tree`, if anything: a command offered while the
+	/// submenu has no scope, or a key left without the marker that is not an empty submenu key, the
+	/// two a sweep removes.
+	fn unsafe_state(model: &Model, tree: &str) -> Option<&'static str> {
+		let below = format!(r"{tree}\");
+		let top = model.get(tree);
+		let has = |name| top.is_some_and(|values| values.contains(name));
+		let offered = model.iter().any(|(key, values)| {
+			key.starts_with(&format!(r"{tree}\shell\"))
+				&& key.ends_with(r"\command")
+				&& values.contains("")
+		});
+		if offered && !has(APPLIES_TO) {
+			return Some("a command is offered without the scope");
+		}
+		let left = model
+			.iter()
+			.any(|(key, values)| key.starts_with(&below) || (key == tree && !values.is_empty()));
+		(left && !has(MARKER_VALUE)).then_some("a key is left without the marker")
+	}
+
+	/// Writes `value` into `model`, creating its key and the keys above it below `tree`.
+	fn write(model: &mut Model, tree: &str, value: &CommandValue) {
+		let mut key = value.key.as_str();
+		let name = match &value.data {
+			CommandData::Text { name, .. } => name.unwrap_or(""),
+			CommandData::Number { name, .. } => name,
+		};
+		model.entry(key.to_owned()).or_default().insert(name);
+		while key != tree {
+			key = key.rsplit_once('\\').map_or(tree, |(parent, _)| parent);
+			model.entry(key.to_owned()).or_default();
+		}
+	}
+
+	/// Checks every state removing `tree` by `plan` passes through, a step cut short included: a
+	/// step that deletes a whole key may delete any one of the values below it first. The first
+	/// unsafe state, if any.
+	fn remove_by(mut model: Model, tree: &str, plan: &[CommandRemoval]) -> Result<(), String> {
+		for step in plan {
+			match step {
+				CommandRemoval::Value { key, name } => {
+					if let Some(values) = model.get_mut(key) {
+						values.remove(name);
+					}
+				}
+				CommandRemoval::Tree(at) => {
+					let covered: Vec<(String, &'static str)> = model
+						.iter()
+						.filter(|(key, _)| *key == at || key.starts_with(&format!(r"{at}\")))
+						.flat_map(|(key, values)| values.iter().map(|name| (key.clone(), *name)))
+						.collect();
+					for (key, name) in covered {
+						let mut cut = model.clone();
+						if let Some(values) = cut.get_mut(&key) {
+							values.remove(name);
+						}
+						if let Some(problem) = unsafe_state(&cut, tree) {
+							return Err(format!(
+								"{step:?} cut short after {key}:{name:?}: {problem}"
+							));
+						}
+					}
+					model.retain(|key, _| key != at && !key.starts_with(&format!(r"{at}\")));
+				}
+			}
+			if let Some(problem) = unsafe_state(&model, tree) {
+				return Err(format!("after {step:?}: {problem}"));
+			}
+		}
+		if model
+			.keys()
+			.any(|key| key == tree || key.starts_with(&format!(r"{tree}\")))
+		{
+			return Err("the submenu is left".to_owned());
+		}
+		Ok(())
+	}
+
+	#[test]
+	fn a_write_of_the_commands_cut_short_anywhere_leaves_nothing_unscoped_or_unmarked() {
+		let values = command_values("K", &Branding::default(), &commands([None; 4]), |_| true);
+		for tree in command_trees("K") {
+			let mut model = Model::new();
+			for value in values.iter().filter(|value| value.key.starts_with(&tree)) {
+				write(&mut model, &tree, value);
+				assert_eq!(unsafe_state(&model, &tree), None, "after {value:?}");
+			}
+		}
+	}
+
+	#[test]
+	fn a_removal_of_the_commands_cut_short_anywhere_leaves_nothing_unscoped_or_unmarked() {
+		let values = command_values("K", &Branding::default(), &commands([None; 4]), |_| true);
+		for tree in command_trees("K") {
+			let mut model = Model::new();
+			for value in values.iter().filter(|value| value.key.starts_with(&tree)) {
+				write(&mut model, &tree, value);
+			}
+			assert_eq!(
+				remove_by(model.clone(), &tree, &command_removal(&tree)),
+				Ok(())
+			);
+			// One delete of the whole tree may drop the scope while a command is left.
+			assert!(remove_by(model, &tree, &[CommandRemoval::Tree(tree.clone())]).is_err());
+		}
+	}
+
+	#[test]
+	fn a_command_line_quotes_an_app_path_holding_spaces_and_the_items_path() {
+		let app = AppPath::parse(r"C:\Program Files (x86)\My Filen\Filen.exe").unwrap();
+		assert_eq!(
+			command_line(&app, CommandAction::Versions),
+			r#""C:\Program Files (x86)\My Filen\Filen.exe" --filen-explorer-command=versions "%1""#
+		);
+	}
+
+	#[test]
+	fn the_labels_given_are_shown_with_each_ampersand_doubled() {
+		let branding = Branding::parse(Some("Filen & Co"), None, None, None)
+			.unwrap()
+			.unwrap();
+		let values = command_values(
+			"K",
+			&branding,
+			&commands([None, Some("Teilen & Link"), Some("Web"), Some("A&&B")]),
+			|_| true,
+		);
+		assert_eq!(
+			named(&values, "MUIVerb"),
+			[
+				(
+					r"Software\Classes\*\shell\K\shell\01share",
+					"Teilen && Link"
+				),
+				(r"Software\Classes\*\shell\K\shell\02web", "Web"),
+				(r"Software\Classes\*\shell\K\shell\03versions", "A&&&&B"),
+				(r"Software\Classes\*\shell\K", "Filen && Co"),
+				(
+					r"Software\Classes\Directory\shell\K\shell\01share",
+					"Teilen && Link"
+				),
+				(r"Software\Classes\Directory\shell\K\shell\02web", "Web"),
+				(r"Software\Classes\Directory\shell\K", "Filen && Co"),
+			]
+		);
+		let menu = command_values(
+			"K",
+			&branding,
+			&commands([Some("Mein Filen"), None, None, None]),
+			|_| true,
+		);
+		assert!(menu.contains(&text(
+			r"Software\Classes\*\shell\K",
+			Some("MUIVerb"),
+			"Mein Filen"
+		)));
+	}
+
+	#[test]
+	fn the_submenu_shows_the_brandings_icon_when_its_file_is_there_and_the_apps_otherwise() {
+		let branding = Branding::parse(None, Some(r"C:\Filen\filen.ico"), Some(-3), None)
+			.unwrap()
+			.unwrap();
+		let icons = |branding: &Branding, exists: bool| {
+			let values = command_values("K", branding, &commands([None; 4]), |_| exists);
+			named(&values, "Icon")
+				.into_iter()
+				.map(|(_, icon)| icon.to_owned())
+				.collect::<Vec<_>>()
+		};
+		assert_eq!(
+			icons(&branding, true),
+			[r"C:\Filen\filen.ico,-3", r"C:\Filen\filen.ico,-3"]
+		);
+		let app = r"C:\Program Files\Filen\Filen.exe,0";
+		assert_eq!(icons(&branding, false), [app, app]);
+		assert_eq!(icons(&Branding::default(), true), [app, app]);
+	}
+
+	#[test]
+	fn no_command_value_names_a_variable_but_the_items_path() {
+		let values = command_values("K", &Branding::default(), &commands([None; 4]), |_| true);
+		for value in &values {
+			if let CommandData::Text { text, .. } = &value.data {
+				assert!(!text.replace("\"%1\"", "").contains('%'), "{value:?}");
+			}
 		}
 	}
 

@@ -1,29 +1,31 @@
 //! Showing a sync root in File Explorer, unpackaged: the registry keys
 //! `StorageProviderSyncRootManager.Register` writes, written by the helper itself as the user (the
 //! machine-wide sync root list lets every user create and delete a subkey of their own), and
-//! removed once the OS let the root go. The values are `os::cfapi::explorer`'s.
+//! removed once the OS let the root go; and the context menu commands the parent names, per user,
+//! removed with the user's last root. The values are `os::cfapi::explorer`'s.
 
 #[cfg(test)]
 mod tests;
 
 use std::{io, path::Path};
 
-use tracing::debug;
+use tracing::{debug, warn};
 
 use super::{
 	LOG_TARGET,
 	ffi::{self, Hive, RegKey},
 };
 use crate::{
-	branding::Branding,
+	branding::{Branding, ExplorerCommands},
 	helper::{BrandingScope, UserId},
 	os::cfapi::{
 		WideNul,
 		explorer::{
-			DELEGATE_FOLDER_CLSID, DESKTOP_NAMESPACE, FOLDER_VALUE_FLAGS, HIDE_DESKTOP_ICONS,
-			MARKER_VALUE, PROPERTY_BAG_ATTRIBUTES, SHELL_FOLDER_ATTRIBUTES, SHELL32,
-			SORT_ORDER_INDEX, SYNC_ROOT_FLAGS, SYNC_ROOT_MANAGER, USER_CLSIDS, UnbrandablePath,
-			brandable_root, icon_resource, is_own_key, namespace_clsid, registry_string, same_root,
+			COMMAND_KEY, CommandData, CommandRemoval, DELEGATE_FOLDER_CLSID, DESKTOP_NAMESPACE,
+			FOLDER_VALUE_FLAGS, HIDE_DESKTOP_ICONS, MARKER_VALUE, PROPERTY_BAG_ATTRIBUTES,
+			SHELL_FOLDER_ATTRIBUTES, SHELL32, SORT_ORDER_INDEX, SYNC_ROOT_FLAGS, SYNC_ROOT_MANAGER,
+			USER_CLSIDS, UnbrandablePath, brandable_root, command_removal, command_trees,
+			command_values, icon_resource, is_own_key, namespace_clsid, registry_string, same_root,
 			sync_root_key_name,
 		},
 	},
@@ -118,17 +120,21 @@ fn notify(path: &Path) {
 /// the Windows user this process runs as: the navigation-pane class first, marked as this
 /// provider's so one a stopped run left is found, then its navigation-pane entry, then the sync
 /// root list entry, which gives the root its status icons and commands, written only into keys
-/// the user owns (every user may create keys in that list). A repeat writes the same.
+/// the user owns (every user may create keys in that list); last, when `branding` names them and
+/// the app is there, the context menu commands, which the entry's provider id scopes. A repeat
+/// writes the same. A failure to write the commands is logged and fails nothing: what shows the
+/// root is written.
 pub(crate) fn brand(root: &Path, user: UserId, branding: &Branding) -> Result<(), ExplorerError> {
-	brand_as(&own_sid()?, root, user, branding)
+	brand_as(&own_sid()?, root, user, branding, COMMAND_KEY)
 }
 
-/// [`brand`] for the Windows user `sid`.
+/// [`brand`] for the Windows user `sid`, the commands under the key name `commands`.
 fn brand_as(
 	sid: &str,
 	root: &Path,
 	user: UserId,
 	branding: &Branding,
+	commands: &str,
 ) -> Result<(), ExplorerError> {
 	let root_text = brandable_root(root.to_str().ok_or(ExplorerError::NotUtf8)?)?;
 	let clsid = namespace_clsid(sid, user);
@@ -194,9 +200,88 @@ fn brand_as(
 		owned_by(&key, sid)?;
 		set_string(&key, Some(sid), root_text, false)?;
 	}
+	if let Some(offered) = &branding.commands {
+		if Path::new(offered.app.as_str()).is_file() {
+			if let Err(error) = write_commands(commands, branding, offered) {
+				warn!(target: LOG_TARGET, %error, "writing File Explorer's context menu commands failed");
+			}
+		} else {
+			warn!(
+				target: LOG_TARGET,
+				app = offered.app.as_str(),
+				"the app the context menu commands start is not there; they are not written"
+			);
+		}
+	}
 	debug!(target: LOG_TARGET, ?root, %clsid, "showed the root in File Explorer");
 	notify(root);
 	Ok(())
+}
+
+/// Writes every value of [`command_values`] for `offered`, under the key name `key`, in order, in
+/// place: a repeat writes the same.
+fn write_commands(
+	key: &str,
+	branding: &Branding,
+	offered: &ExplorerCommands,
+) -> Result<(), ExplorerError> {
+	for value in command_values(key, branding, offered, |icon| {
+		Path::new(icon.as_str()).is_file()
+	}) {
+		let at = create(Hive::CurrentUser, &value.key)?;
+		match &value.data {
+			CommandData::Text { name, text } => set_string(&at, *name, text, false)?,
+			CommandData::Number { name, number } => set_dword(&at, name, *number)?,
+		}
+	}
+	Ok(())
+}
+
+/// Removes the context menu commands under the key name `key` unless the Windows user `sid` still
+/// has a sync root list entry of this provider: each submenu only when it carries this provider's
+/// marker, or is a key with no marker, subkey or string value, which a removal cut short at its
+/// very end leaves; step by step as
+/// [`command_removal`] says, so a removal cut short earlier leaves the marker on what is left. How
+/// many were removed; a list that cannot be read removes nothing.
+fn remove_commands_unless_rooted(sid: &str, key: &str) -> Result<u64, ExplorerError> {
+	if let Some((_, names)) = subkeys(Hive::LocalMachine, SYNC_ROOT_MANAGER)?
+		&& names.iter().any(|name| is_own_key(name, sid))
+	{
+		return Ok(0);
+	}
+	let mut removed = 0_u64;
+	for tree in command_trees(key) {
+		let Some(submenu) = ffi::reg_open(Hive::CurrentUser, &wide(&tree)?)
+			.map_err(io("opening a registry key"))?
+		else {
+			continue;
+		};
+		let marker = ffi::reg_query_dword(&submenu, &wide(MARKER_VALUE)?)
+			.map_err(io("reading a registry value"))?;
+		let marked = marker == Some(1);
+		let empty = marker.is_none()
+			&& ffi::reg_subkeys(&submenu)
+				.map_err(io("listing registry keys"))?
+				.is_empty()
+			&& ffi::reg_string_values(&submenu)
+				.map_err(io("reading registry values"))?
+				.is_empty();
+		drop(submenu);
+		if marked || empty {
+			debug!(target: LOG_TARGET, %tree, "removing File Explorer's context menu commands");
+			for step in command_removal(&tree) {
+				match step {
+					CommandRemoval::Tree(path) => delete_tree(Hive::CurrentUser, &path)?,
+					CommandRemoval::Value { key, name } => {
+						ffi::reg_delete_value(Hive::CurrentUser, &wide(&key)?, &wide(name)?)
+							.map_err(io("deleting a registry value"))?;
+					}
+				}
+			}
+			removed = removed.saturating_add(1);
+		}
+	}
+	Ok(removed)
 }
 
 /// Removes the navigation-pane entry `clsid` of the Windows user this process runs as: its entry
@@ -217,14 +302,15 @@ pub(crate) fn remove_navigation_entry(clsid: &str) -> Result<(), ExplorerError> 
 /// Removes what shows in File Explorer roots the OS no longer holds as this provider's, as `live`
 /// says of each root's path, for the Windows user this process runs as: its sync root list entries
 /// of this provider (`Filen!<SID>!*`) and its navigation-pane classes carrying this provider's
-/// marker, each with its entry and hidden icon. Nothing else is touched. How many were removed;
+/// marker, each with its entry and hidden icon; then, once no entry of the user's is left, the
+/// context menu commands carrying the marker. Nothing else is touched. How many were removed;
 /// every one is tried, and the first failure is returned.
 pub(crate) fn sweep(live: impl Fn(&Path) -> bool) -> Result<u64, ExplorerError> {
-	sweep_as(&own_sid()?, &live)
+	sweep_as(&own_sid()?, &live, COMMAND_KEY)
 }
 
-/// [`sweep`] for the Windows user `sid`.
-fn sweep_as(sid: &str, live: &dyn Fn(&Path) -> bool) -> Result<u64, ExplorerError> {
+/// [`sweep`] for the Windows user `sid`, the commands under the key name `commands`.
+fn sweep_as(sid: &str, live: &dyn Fn(&Path) -> bool, commands: &str) -> Result<u64, ExplorerError> {
 	let mut removed = 0_u64;
 	let mut first = Ok(());
 	let mut note = |result: Result<bool, ExplorerError>| match result {
@@ -253,6 +339,14 @@ fn sweep_as(sid: &str, live: &dyn Fn(&Path) -> bool) -> Result<u64, ExplorerErro
 		}
 		Ok(None) => {}
 		Err(error) => note(Err(error)),
+	}
+	match remove_commands_unless_rooted(sid, commands) {
+		Ok(count) => removed = removed.saturating_add(count),
+		Err(error) => {
+			if first.is_ok() {
+				first = Err(error);
+			}
+		}
 	}
 	first.map(|()| removed)
 }
@@ -330,22 +424,24 @@ fn sweep_class(
 
 /// Removes what [`brand`] wrote for `user`'s root at `root`, within `scope`, for the Windows
 /// user this process runs as: as the user, the sync root list entry, then the navigation-pane
-/// entry; elevated, only the sync root list entry. Each only when it names `root`, as another root
-/// of the same user has the same names. Every step is tried; the first failure is returned.
+/// entry, and the context menu commands once no sync root list entry of the user's is left;
+/// elevated, only the sync root list entry. Each only when it names `root`, as another root of the
+/// same user has the same names. Every step is tried; the first failure is returned.
 pub(crate) fn unbrand(
 	root: &Path,
 	user: UserId,
 	scope: BrandingScope,
 ) -> Result<(), ExplorerError> {
-	unbrand_as(&own_sid()?, root, user, scope)
+	unbrand_as(&own_sid()?, root, user, scope, COMMAND_KEY)
 }
 
-/// [`unbrand`] for the Windows user `sid`.
+/// [`unbrand`] for the Windows user `sid`, the commands under the key name `commands`.
 fn unbrand_as(
 	sid: &str,
 	root: &Path,
 	user: UserId,
 	scope: BrandingScope,
+	commands: &str,
 ) -> Result<(), ExplorerError> {
 	let root_text = root.to_str().ok_or(ExplorerError::NotUtf8)?;
 	let entry = format!(r"{SYNC_ROOT_MANAGER}\{}", sync_root_key_name(sid, user));
@@ -372,7 +468,9 @@ fn unbrand_as(
 					Ok(())
 				}
 			});
-			[machine, navigation].into_iter().collect()
+			// After the entry's removal, which the commands outlive only while another entry is left.
+			let offered = remove_commands_unless_rooted(sid, commands).map(|_| ());
+			[machine, navigation, offered].into_iter().collect()
 		}
 		BrandingScope::MachineOnly => machine,
 	};

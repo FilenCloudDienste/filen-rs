@@ -16,7 +16,7 @@ use filen_types::fs::Uuid;
 
 use crate::{
 	auth::{KeyAccount, KeyStore, KeyStoreError, SealingKey, SessionStore},
-	branding::Branding,
+	branding::{Branding, ExplorerCommands},
 	dispatch::Dispatcher,
 	drive::Drive,
 	helper::{
@@ -143,6 +143,9 @@ struct PlatformState {
 	sweeps: usize,
 	/// Whether the root was connected at each brand, in order.
 	connected_when_branded: Vec<bool>,
+	/// The context menu commands, one set per Windows user, as the last brand naming them wrote
+	/// them.
+	commands: Option<ExplorerCommands>,
 }
 
 /// What a fake navigation-pane entry shows, and for whom.
@@ -486,6 +489,11 @@ impl FakePlatform {
 	pub fn fail_unbrands(&self, count: u32) {
 		self.state().fail_unbrands = count;
 	}
+
+	/// The context menu commands File Explorer offers, if any.
+	pub fn explorer_commands(&self) -> Option<ExplorerCommands> {
+		self.state().commands.clone()
+	}
 }
 
 impl sealed::Sealed for FakePlatform {}
@@ -768,6 +776,10 @@ impl Platform for FakePlatform {
 				branding: branding.clone(),
 			},
 		);
+		// Written last, as the Windows layer does; a brand naming none leaves them.
+		if let Some(commands) = &branding.commands {
+			state.commands = Some((**commands).clone());
+		}
 		Ok(())
 	}
 
@@ -801,6 +813,10 @@ impl Platform for FakePlatform {
 		{
 			state.user_branding.remove(root);
 		}
+		// The commands go with the user's last sync root list entry; elevated, they stay.
+		if scope == BrandingScope::User && state.machine_branding.is_empty() {
+			state.commands = None;
+		}
 		Ok(())
 	}
 
@@ -813,10 +829,19 @@ impl Platform for FakePlatform {
 			.filter(|(_, account_root)| account_root.is_some())
 			.map(|(root, _)| root.clone())
 			.collect();
-		let before = state.machine_branding.len() + state.user_branding.len();
+		let held = |state: &PlatformState| {
+			state.machine_branding.len()
+				+ state.user_branding.len()
+				+ usize::from(state.commands.is_some())
+		};
+		let before = held(&state);
 		state.machine_branding.retain(|root, _| live.contains(root));
 		state.user_branding.retain(|root, _| live.contains(root));
-		let after = state.machine_branding.len() + state.user_branding.len();
+		// The commands go once no sync root list entry is left.
+		if state.machine_branding.is_empty() {
+			state.commands = None;
+		}
+		let after = held(&state);
 		Ok(u64::try_from(before - after).unwrap_or(u64::MAX))
 	}
 }

@@ -13,7 +13,7 @@ use tokio::{
 };
 
 use crate::{
-	branding::Branding,
+	branding::{Branding, ExplorerCommands},
 	helper::{
 		BrandingScope, ErrorCode, ExitReason, HelperConfig, RootRefusal, StateDir, UserId,
 		run_helper, unregister_all,
@@ -2221,4 +2221,120 @@ async fn left_over_entries_of_another_root_are_swept_by_unregister_all_but_not_w
 	unregister_all(platform.clone(), &state, true).await;
 	assert_eq!(platform.branding_sweeps(), 1);
 	assert_eq!(platform.branding_entries(), 0);
+}
+
+/// A `register` of user 42's root naming the context menu commands, one label translated.
+fn register_with_commands(disk: &Disk) -> Value {
+	let mut message = register(disk, "42");
+	message["explorerCommands"] = json!({
+		"appPath": "C:\\Program Files\\Filen\\Filen.exe",
+		"share": "Teilen",
+	});
+	message
+}
+
+/// The commands [`register_with_commands`] names.
+fn explorer_commands() -> ExplorerCommands {
+	ExplorerCommands::parse(
+		"C:\\Program Files\\Filen\\Filen.exe",
+		None,
+		Some("Teilen"),
+		None,
+		None,
+	)
+	.unwrap()
+}
+
+#[tokio::test(start_paused = true)]
+async fn serving_a_root_whose_register_names_commands_offers_them_in_file_explorer() {
+	let disk = Disk::new();
+	let (platform, drive) = world();
+	let mut rig = Rig::start(&disk, &platform, &drive);
+	ok(&rig.request(register_with_commands(&disk)).await);
+	assert_eq!(platform.explorer_commands(), None, "nothing before serving");
+	assert_eq!(
+		ok(&rig.set_auth("42", ACCOUNT_ROOT).await),
+		&json!({ "state": "serving", "adopted": false, "branded": true })
+	);
+	assert_eq!(
+		platform.branding_calls(),
+		[brand_call(
+			&disk,
+			Branding::parse(None, None, None, Some(explorer_commands()))
+				.unwrap()
+				.unwrap()
+		)]
+	);
+	assert_eq!(platform.explorer_commands(), Some(explorer_commands()));
+	assert!(!index_text(&disk).contains("Filen.exe"), "not stored");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_register_naming_no_commands_leaves_those_an_earlier_one_offered() {
+	let disk = Disk::new();
+	let (platform, drive) = world();
+	let mut rig = Rig::start(&disk, &platform, &drive);
+	ok(&rig.request(register_with_commands(&disk)).await);
+	ok(&rig.set_auth("42", ACCOUNT_ROOT).await);
+	rig.close().await;
+	let mut rig = Rig::start(&disk, &platform, &drive);
+	assert_eq!(
+		ok(&rig.register(&disk).await),
+		&json!({ "state": "serving", "resumed": true })
+	);
+	assert_eq!(platform.branding_calls().len(), 2);
+	assert_eq!(platform.explorer_commands(), Some(explorer_commands()));
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_unregister_of_the_last_root_removes_the_commands() {
+	let disk = Disk::new();
+	let (platform, drive) = world();
+	let mut rig = Rig::start(&disk, &platform, &drive);
+	ok(&rig.request(register_with_commands(&disk)).await);
+	ok(&rig.set_auth("42", ACCOUNT_ROOT).await);
+	assert_eq!(
+		ok(&rig.request(unregister_request()).await)["unregistered"],
+		true
+	);
+	assert_eq!(platform.explorer_commands(), None);
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_elevated_unregister_all_leaves_the_commands_and_one_as_the_user_removes_them() {
+	let disk = Disk::new();
+	let (platform, drive) = world();
+	let mut rig = Rig::start(&disk, &platform, &drive);
+	ok(&rig.request(register_with_commands(&disk)).await);
+	ok(&rig.set_auth("42", ACCOUNT_ROOT).await);
+	rig.close().await;
+	let state = StateDir::new(disk.state()).unwrap();
+	platform.set_elevated(true);
+	unregister_all(platform.clone(), &state, true).await;
+	assert_eq!(platform.machine_branding(&disk.root()), None);
+	assert_eq!(platform.explorer_commands(), Some(explorer_commands()));
+	platform.set_elevated(false);
+	unregister_all(platform.clone(), &state, true).await;
+	assert_eq!(platform.explorer_commands(), None);
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_commands_a_run_killed_after_the_os_unregister_left_are_swept_when_the_helper_starts() {
+	let disk = Disk::new();
+	let (platform, drive) = world();
+	let mut rig = Rig::start(&disk, &platform, &drive);
+	ok(&rig.request(register_with_commands(&disk)).await);
+	ok(&rig.set_auth("42", ACCOUNT_ROOT).await);
+	platform.kill_at(KillPoint::After(FakeStep::Unregister));
+	killed_unregister(rig, &platform).await;
+	assert_eq!(platform.registration(&disk.root()), None);
+	assert_eq!(
+		platform.explorer_commands(),
+		Some(explorer_commands()),
+		"left by the killed run"
+	);
+	let mut rig = Rig::start(&disk, &platform, &drive);
+	assert_eq!(rig.line().await["t"], "hello");
+	ok(&rig.request(json!({ "t": "getState" })).await);
+	assert_eq!(platform.explorer_commands(), None);
 }
