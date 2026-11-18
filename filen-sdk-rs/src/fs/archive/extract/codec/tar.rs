@@ -104,6 +104,10 @@ pub(super) fn walk_tar<R: TarSource>(
 			stopped = true;
 			break;
 		}
+		if pending.is_some() {
+			// passed only once all of its data was there: one that ends early is not listed
+			tar.skip_rest().map_err(Error::from)?;
+		}
 		let next = tar.next_member().map_err(Error::from);
 		// the member before is whole once its data was passed, even when the header after it is
 		// damaged: listed before that ends the listing

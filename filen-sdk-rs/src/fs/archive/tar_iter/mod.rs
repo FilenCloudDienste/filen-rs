@@ -338,7 +338,9 @@ impl<R: TarSource> TarReader<R> {
 		self.inner
 	}
 
-	fn skip_rest(&mut self) -> Result<(), TarError> {
+	/// Skips whatever of the current member's data was not read, and its padding: once it
+	/// returned, the member's data was passed whole. [`Self::next_member`] does it first.
+	pub(crate) fn skip_rest(&mut self) -> Result<(), TarError> {
 		// a member size near u64::MAX (PAX, or GNU base-256) must not wrap to a short skip,
 		// which would read the member's data as headers other tools never see
 		let rest = self

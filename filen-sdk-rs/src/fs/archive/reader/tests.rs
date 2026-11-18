@@ -2391,3 +2391,72 @@ async fn a_tar_listing_keeps_the_last_good_member_before_a_damaged_header() {
 		);
 	}
 }
+
+/// `tar` with the header at `at` stating `size` bytes of data, its checksum set to match.
+fn with_stated_size(mut tar: Vec<u8>, at: usize, size: u64) -> Vec<u8> {
+	let mut header = tar::Header::new_old();
+	header
+		.as_mut_bytes()
+		.copy_from_slice(&tar[at..at + crate::fs::archive::tar_iter::TAR_BLOCK]);
+	header.set_size(size);
+	header.set_cksum();
+	tar[at..at + crate::fs::archive::tar_iter::TAR_BLOCK].copy_from_slice(header.as_bytes());
+	tar
+}
+
+/// What a listing of `bytes`, named `name`, that fails lists, and the kind of its error.
+async fn failed_listing(name: &str, bytes: Vec<u8>) -> (Vec<String>, ErrorKind) {
+	let (backend, archive, config) = drive(name, bytes, 64 << 20);
+	let reader = reader_of(&backend, &archive, &config, None);
+	reader.open(Ignore, JobControl::default()).await.unwrap();
+	let failed = reader
+		.list(Ignore, JobControl::default())
+		.await
+		.unwrap_err();
+	let listed = failed
+		.report
+		.entries
+		.iter()
+		.map(|entry| entry.stored_path.clone())
+		.collect();
+	(listed, failed.error.kind())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tar_header_stating_more_than_the_archive_holds_is_not_listed() {
+	let tar = tar_of(&[("a.txt", b"alpha"), ("b.txt", b"beta")]);
+	// the second header, after the first's and its data's block
+	let second = 1024;
+	// past the archive, though within what a gzip tar of it may decode to
+	let past_the_end = with_stated_size(tar.clone(), second, 64 << 10);
+	// past what anything this small may decode to
+	let huge = with_stated_size(tar, second, 1 << 40);
+	let cases = [
+		("t.tar", past_the_end.clone(), ErrorKind::ArchiveCorrupt),
+		("t.tar", huge.clone(), ErrorKind::ArchiveCorrupt),
+		("t.tar.gz", gzip(&past_the_end), ErrorKind::ArchiveCorrupt),
+		("t.tar.gz", gzip(&huge), ErrorKind::ArchiveCorrupt),
+	];
+	for (at, (name, bytes, kind)) in cases.into_iter().enumerate() {
+		let (listed, error) = failed_listing(name, bytes).await;
+		assert_eq!(
+			(listed, error),
+			(vec!["a.txt".to_owned()], kind),
+			"case {at}"
+		);
+	}
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tar_cut_inside_a_header_lists_the_members_before_it_alone() {
+	let mut tar = tar_of(&[("a.txt", b"alpha"), ("b.txt", b"beta")]);
+	tar.truncate(1024 + 200);
+	for (name, bytes) in [("t.tar", tar.clone()), ("t.tar.gz", gzip(&tar))] {
+		let (listed, error) = failed_listing(name, bytes).await;
+		assert_eq!(
+			(listed, error),
+			(vec!["a.txt".to_owned()], ErrorKind::ArchiveCorrupt),
+			"{name}"
+		);
+	}
+}
