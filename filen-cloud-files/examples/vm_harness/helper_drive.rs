@@ -6,7 +6,8 @@
 //!
 //! Two modes:
 //! - `fake`: `<exe>` is this harness (`vm_harness helper`), serving the tree from the fake drive:
-//!   H1 to H12 and H16 of the design, and H17.
+//!   H1 to H12 and H16 of the design, H17, and H18 and H19: what File Explorer shows for the root
+//!   and the context menu commands it offers on the root's items, which start `verb_stub`.
 //! - `prod`: `<exe>` is the shipping `filen-cloud-files.exe`, with no session: a pushed session
 //!   whose every field is made up, which nothing may echo.
 //! - `leave`: as `fake`, only registers, serves, reads one file and shuts down, leaving the root
@@ -32,6 +33,7 @@ use std::{
 };
 
 use filen_cloud_files::test_support::pattern;
+use filen_types::fs::Uuid;
 use serde_json::{Value, json};
 
 use crate::{
@@ -61,6 +63,11 @@ const REPLY: Duration = Duration::from_secs(120);
 const DISPLAY_NAME: &str = "Filen (H18)";
 /// An icon file every Windows has, for the `fake` mode's root.
 const ICON: &str = r"C:\Windows\explorer.exe";
+/// The share command's label the `fake` mode names, with a `&` the helper doubles.
+const SHARE_LABEL: &str = "Share & link";
+/// Names the context menu commands are run on: spaces and parentheses, the characters `cmd.exe`
+/// would read, and letters outside ASCII.
+const COMMAND_NAMES: [&str; 3] = ["my file (1).txt", "a&b %x% ^c.txt", "Ünïcødé 名前 ✓.txt"];
 
 /// One line the helper wrote, as the driver logs it.
 fn log_line(log: &Mutex<File>, n: u32, started: Instant, line: &str) {
@@ -415,6 +422,149 @@ pub(crate) fn run(exe: &Path, out: &Path, mode: &str) -> Outcome {
 	passed.map(|passed| passed && report.passed())
 }
 
+/// How many `fetch_data` callbacks the helper `n`'s log holds so far.
+fn fetches(out: &Path, n: u32) -> usize {
+	fs::read_to_string(out.join(format!("helper-{n}.stderr")))
+		.map_or(0, |log| log.matches("\"fetch_data\"").count())
+}
+
+/// H19, on the served root of the `fake` mode with the commands starting `stub`.
+fn h19(
+	helper: &mut Helper,
+	root: &Path,
+	stub: &Path,
+	report: &mut Report,
+	out: &Path,
+) -> std::io::Result<()> {
+	let fetched = fetches(out, 1);
+	explorer::check_command_keys(
+		report,
+		"H19-keys",
+		stub,
+		[
+			DISPLAY_NAME,
+			&SHARE_LABEL.replace('&', "&&"),
+			"View on filen.io",
+			"Version history",
+		],
+		&format!("{ICON},0"),
+		out,
+	)?;
+	for name in COMMAND_NAMES {
+		let written = user(
+			"write",
+			&root.join(name),
+			Some("a name the commands are run on"),
+		);
+		report.check(&format!("H19-write-{name}"), written["ok"] == true, written);
+	}
+	let outside = out.join("h19-outside.txt");
+	let sibling = root.with_file_name("FilenOther");
+	fs::create_dir_all(&sibling)?;
+	fs::write(&outside, "outside the root")?;
+	fs::write(sibling.join("h19.txt"), "beside the root")?;
+	explorer::check_menu_scope(
+		report,
+		"H19-scope",
+		DISPLAY_NAME,
+		&[
+			root.join("small.txt"),
+			root.join("sub").join("inner.bin"),
+			root.join("sub"),
+			root.to_path_buf(),
+			root.join("big.bin"),
+		],
+		&[outside, sibling.join("h19.txt"), sibling],
+	);
+	let named: Vec<PathBuf> = COMMAND_NAMES.iter().map(|name| root.join(name)).collect();
+	explorer::check_command_lines(
+		report,
+		"H19-argv",
+		&[named, vec![root.join("big.bin")]].concat(),
+	);
+	explorer::report_cascade_invoke(report, "H19-cascade", &root.join("small.txt"), SHARE_LABEL);
+	// No menu opened and no command run asked the provider for a byte.
+	let now = fetches(out, 1);
+	report.check(
+		"H19-no-fetch",
+		now == fetched,
+		format!("fetch_data callbacks {fetched} -> {now}"),
+	);
+	h19_identify(helper, root, report);
+	Ok(())
+}
+
+/// H19-identify: what `identify` answers for the served root's items, read from the placeholders
+/// and the drive's cache, raising no download.
+fn h19_identify(helper: &mut Helper, root: &Path, report: &mut Report) {
+	let mut ask =
+		|path: &Path| helper.request(json!({ "t": "identify", "path": path.to_string_lossy() }));
+	let uuid = |uuid: Option<Uuid>| json!(uuid.map(|uuid| uuid.to_string()));
+	let deep = root.join("sub").join("deeper").join("deep.bin");
+	let before = user("exists", &deep, None);
+	let cases = [
+		(
+			"root",
+			root.to_path_buf(),
+			json!({ "kind": "root", "uuid": tree::ROOT.to_string(), "parents": [] }),
+		),
+		(
+			"dir",
+			root.join("sub"),
+			json!({ "kind": "dir", "uuid": uuid(tree::dir_uuid("sub")), "parents": [] }),
+		),
+	];
+	for (name, path, expected) in cases {
+		let reply = ask(&path);
+		report.check(
+			&format!("H19-identify-{name}"),
+			value(reply.as_ref()) == expected,
+			format!("{reply:?}"),
+		);
+	}
+	let reply = ask(&deep);
+	let found = value(reply.as_ref());
+	report.check(
+		"H19-identify-file",
+		found["kind"] == "file"
+			&& found["stableUuid"] == uuid(tree::stable_of("sub\\deeper\\deep.bin"))
+			&& found["uuid"].is_string()
+			&& found["parents"]
+				== json!([
+					uuid(tree::dir_uuid("sub")),
+					uuid(tree::dir_uuid("sub\\deeper"))
+				]),
+		format!("{reply:?}"),
+	);
+	let after = user("exists", &deep, None);
+	report.check(
+		"H19-identify-no-download",
+		before["attributes"] == after["attributes"],
+		format!("{before} -> {after}"),
+	);
+	let refusals = [
+		("not-found", root.join("h19-gone.txt"), "notFound"),
+		(
+			"sibling",
+			root.with_file_name("FilenOther").join("h19.txt"),
+			"notInRoot",
+		),
+		(
+			"dotted",
+			root.join("sub").join("..").join("small.txt"),
+			"notInRoot",
+		),
+	];
+	for (name, path, wanted) in refusals {
+		let reply = ask(&path);
+		report.check(
+			&format!("H19-identify-{name}"),
+			code(reply.as_ref()).as_deref() == Some(wanted),
+			format!("{reply:?}"),
+		);
+	}
+}
+
 /// The helper's arguments for the state directory `state`, and the rearm the fake mode asks for.
 fn serve_args(state: &Path, fake: bool) -> Vec<OsString> {
 	let mut args: Vec<OsString> = Vec::new();
@@ -460,6 +610,11 @@ fn fake(
 	// H18-sweep: what a run killed between the OS's unregister and its clean-up left, planted.
 	let gone = root.with_file_name("Orphan");
 	let orphan = explorer::plant_orphan(report, &gone);
+	// H19-sweep: and the context menu commands, which go with the user's last root.
+	explorer::plant_command_keys(report, "H19-sweep");
+	// What the commands start: `verb_stub`, built beside this harness.
+	let stub = std::env::current_exe()?.with_file_name("verb_stub.exe");
+	report.check("H19-stub", stub.is_file(), stub.display());
 	let mut helper = Helper::spawn(exe, &args, out, 1, log, started)?;
 
 	// H1: hello first.
@@ -478,6 +633,8 @@ fn fake(
 	branded["displayName"] = json!(DISPLAY_NAME);
 	branded["iconPath"] = json!(ICON);
 	branded["iconIndex"] = json!(0);
+	branded["explorerCommands"] =
+		json!({ "appPath": stub.to_string_lossy(), "share": SHARE_LABEL });
 	let reply = helper.request(branded);
 	report.check(
 		"H2-register",
@@ -486,6 +643,7 @@ fn fake(
 	);
 	// The helper swept the planted entries when it started.
 	explorer::check_unbranded(report, "H18-sweep", &gone, orphan.as_deref(), out)?;
+	explorer::check_command_keys_gone(report, "H19-sweep");
 	let listed = helper.request(json!({ "t": "listRoots" }));
 	report.info("H2-listRoots", format!("{listed:?}"));
 
@@ -511,6 +669,10 @@ fn fake(
 	// H18: what File Explorer is told about the served root, and what its commands do.
 	let clsid = explorer::check_branded(report, "H18", root, USER, DISPLAY_NAME, out)?;
 	explorer::check_commands(report, "H18", &root.join("big.bin"));
+
+	// H19: the context menu commands, offered on the served root's items only, starting the app
+	// with exactly the item's path, and downloading nothing.
+	h19(&mut helper, root, &stub, report, out)?;
 
 	// H13: the registry keys the registration wrote.
 	for (hive, file) in [("HKCU", "reg-hkcu.txt"), ("HKLM", "reg-hklm.txt")] {
@@ -738,8 +900,10 @@ fn fake(
 		done["unregistered"] == true,
 		format!("{reply:?}"),
 	);
-	// H18-unbranded: nothing of what File Explorer was told is left.
+	// H18-unbranded: nothing of what File Explorer was told is left, the user's last root's
+	// commands included.
 	explorer::check_unbranded(report, "H18-unbranded", root, clsid.as_deref(), out)?;
+	explorer::check_command_keys_gone(report, "H19-unbranded");
 	let kept_in = done["keptIn"].as_str().map(PathBuf::from);
 	let kept = |name: &str| {
 		done["kept"].as_array().is_some_and(|kept| {

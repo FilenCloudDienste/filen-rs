@@ -113,5 +113,10 @@ required-features = ["test-seams"]
 name = "vm_harness"
 required-features = ["test-seams"]
 
+# Stands in for the desktop app as the program File Explorer's context menu commands start, for the
+# VM harness's checks: records the command line it was given. Std only.
+[[example]]
+name = "verb_stub"
+
 [lints]
 workspace = true

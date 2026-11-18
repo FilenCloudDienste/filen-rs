@@ -1,12 +1,14 @@
 //! What File Explorer is told about a served root, checked from outside the helper as a user's
 //! process sees it: the registry keys through `reg.exe`, the shell's commands and properties
-//! through PowerShell's `Shell.Application`, run as the logged-on user. Used by `helper-drive`'s
-//! H18 steps, and by `explorer <op> <root> <out>` after an `--unregister-all`.
+//! through PowerShell's `Shell.Application`, run as the logged-on user, and the context menu
+//! commands' command lines, run as File Explorer runs them against `verb_stub`. Used by
+//! `helper-drive`'s H18 and H19 steps, and by `explorer <op> <root> <out>` after an
+//! `--unregister-all`.
 
 use std::{
 	fs,
-	os::windows::fs::MetadataExt,
-	path::Path,
+	os::windows::{fs::MetadataExt, process::CommandExt},
+	path::{Path, PathBuf},
 	process::Command,
 	thread,
 	time::{Duration, Instant},
@@ -388,7 +390,11 @@ pub(crate) fn run(op: &str, root: &Path, out: &Path) -> Outcome {
 	fs::create_dir_all(out)?;
 	let mut report = Report::create(&out.join("explorer.txt"))?;
 	match op {
-		"gone" => check_unbranded(&mut report, "E-gone", root, None, out)?,
+		"gone" => {
+			check_unbranded(&mut report, "E-gone", root, None, out)?;
+			// The user's last root went: the context menu commands with it.
+			check_command_keys_gone(&mut report, "E-commands-gone");
+		}
 		// What an elevated unregister leaves: the machine-wide entry gone, the user's class kept.
 		"machine-gone" => {
 			let root_text = root.to_string_lossy();
@@ -398,6 +404,13 @@ pub(crate) fn run(op: &str, root: &Path, out: &Path) -> Outcome {
 				out.join("explorer-machine-gone.txt"),
 				format!("{machine}\n{classes}"),
 			)?;
+			// The user's context menu commands, which an elevated run leaves as they were: none
+			// when the root it unregistered was registered without them, as `leave` registers it.
+			let commands = reg_query(&[FILE_VERBS]);
+			report.info(
+				"E-commands",
+				format!("submenu on files present: {}", !not_found(&commands)),
+			);
 			report.check(
 				"E-machine-gone",
 				not_found(&machine) && !not_found(&classes),
@@ -411,4 +424,309 @@ pub(crate) fn run(op: &str, root: &Path, out: &Path) -> Outcome {
 		_ => report.fail("E-op", format!("unknown op {op}")),
 	}
 	Ok(report.passed())
+}
+
+/// The context menu commands' submenu on files, and on folders.
+const FILE_VERBS: &str = r"HKCU\Software\Classes\*\shell\FilenCloudFiles";
+const DIRECTORY_VERBS: &str = r"HKCU\Software\Classes\Directory\shell\FilenCloudFiles";
+
+/// Each command the submenus hold: its key, its action, and whether folders offer it.
+const COMMANDS: [(&str, &str, bool); 3] = [
+	("01share", "share", true),
+	("02web", "web", true),
+	("03versions", "versions", false),
+];
+
+/// Whether `text` holds a `reg query` line naming the empty `REG_SZ` value `name`.
+fn has_empty(text: &str, name: &str) -> bool {
+	text.lines().any(|line| {
+		let fields: Vec<&str> = line
+			.split("    ")
+			.map(str::trim)
+			.filter(|f| !f.is_empty())
+			.collect();
+		fields == [name, "REG_SZ"]
+	})
+}
+
+/// The command line File Explorer is to run for `action`, as the helper writes it.
+fn command_line(app: &Path, action: &str) -> String {
+	format!(
+		"\"{}\" --filen-explorer-command={action} \"%1\"",
+		app.display()
+	)
+}
+
+/// Checks both submenus the helper writes for the commands starting `app`, every value with its
+/// exact type: scoped to this provider's items, marked, labelled `menu` with `icon`, single
+/// selection, each command's label (`share`, and the helper's English defaults) and command line,
+/// and version history on files only. Dumps them to `<out>\explorer-commands-<step>.txt`.
+pub(crate) fn check_command_keys(
+	report: &mut Report,
+	step: &str,
+	app: &Path,
+	labels: [&str; 4],
+	icon: &str,
+	out: &Path,
+) -> std::io::Result<()> {
+	let [menu, share, web, versions] = labels;
+	let mut dump = String::new();
+	for (tree, on_files) in [(FILE_VERBS, true), (DIRECTORY_VERBS, false)] {
+		let head = reg_query(&[tree]);
+		dump.push_str(&head);
+		let kind = if on_files { "files" } else { "folders" };
+		report.check(
+			&format!("{step}-{kind}-submenu"),
+			has_value(
+				&head,
+				"AppliesTo",
+				"REG_SZ",
+				r#"System.StorageProviderId:="Filen""#,
+			) && has_value(&head, "FilenCloudFiles", "REG_DWORD", "0x1")
+				&& has_value(&head, "MUIVerb", "REG_SZ", menu)
+				&& has_value(&head, "Icon", "REG_SZ", icon)
+				&& has_value(&head, "MultiSelectModel", "REG_SZ", "Single")
+				&& has_empty(&head, "SubCommands"),
+			format!("{tree}: {} lines", head.lines().count()),
+		);
+		for ((key, action, on_folders), label) in COMMANDS.into_iter().zip([share, web, versions]) {
+			let verb = format!(r"{tree}\shell\{key}");
+			let values = reg_query(&[&verb]);
+			let command = reg_query(&[&format!(r"{verb}\command")]);
+			dump.push_str(&values);
+			dump.push_str(&command);
+			let name = format!("{step}-{kind}-{action}");
+			if on_files || on_folders {
+				report.check(
+					&name,
+					has_value(&values, "MUIVerb", "REG_SZ", label)
+						&& has_value(&values, "MultiSelectModel", "REG_SZ", "Single")
+						&& has_value(&command, "(Default)", "REG_SZ", &command_line(app, action)),
+					format!("{} {}", values.trim(), command.trim()),
+				);
+			} else {
+				report.check(
+					&name,
+					not_found(&values),
+					format!("absent: {}", values.trim()),
+				);
+			}
+		}
+	}
+	fs::write(out.join(format!("explorer-commands-{step}.txt")), dump)?;
+	Ok(())
+}
+
+/// Checks neither submenu is there any more.
+pub(crate) fn check_command_keys_gone(report: &mut Report, step: &str) {
+	let files = reg_query(&[FILE_VERBS]);
+	let folders = reg_query(&[DIRECTORY_VERBS]);
+	report.check(
+		step,
+		not_found(&files) && not_found(&folders),
+		format!("files {} folders {}", files.trim(), folders.trim()),
+	);
+}
+
+/// Plants both submenus, marked, as a run killed between the OS's unregister and its clean-up
+/// leaves them once its last root is gone, and checks they are there (`<step>-planted`).
+pub(crate) fn plant_command_keys(report: &mut Report, step: &str) {
+	let add = |args: &[&str]| output(Command::new("reg").arg("add").args(args).arg("/f"));
+	for tree in [FILE_VERBS, DIRECTORY_VERBS] {
+		add(&[tree, "/v", "FilenCloudFiles", "/t", "REG_DWORD", "/d", "1"]);
+		add(&[tree, "/v", "MUIVerb", "/t", "REG_SZ", "/d", "orphan"]);
+	}
+	let planted = [
+		reg_query(&[FILE_VERBS, "/v", "FilenCloudFiles"]),
+		reg_query(&[DIRECTORY_VERBS, "/v", "FilenCloudFiles"]),
+	];
+	report.check(
+		&format!("{step}-planted"),
+		planted.iter().all(|text| text.contains("REG_DWORD")),
+		planted.join("\n"),
+	);
+}
+
+/// A plain command the scope check plants beside the helper's submenus, with their scope.
+const SCOPE_PROBES: [&str; 2] = [
+	r"HKCU\Software\Classes\*\shell\FilenScopeProbe",
+	r"HKCU\Software\Classes\Directory\shell\FilenScopeProbe",
+];
+/// The probe's label.
+const SCOPE_PROBE_LABEL: &str = "Filen scope probe";
+
+/// Checks the submenu the helper wrote is offered on each of `inside` and on none of `outside`,
+/// and that opening a menu raised no download: the attributes of each item inside stay as they
+/// were. The shell's `Verbs()` lists no cascading submenu (one with `SubCommands`), though File
+/// Explorer's menu shows it, so the scope is checked through a plain command planted for the
+/// check with the `AppliesTo` the helper wrote, and removed after; whether `Verbs()` lists the
+/// submenu `menu` itself is reported.
+pub(crate) fn check_menu_scope(
+	report: &mut Report,
+	step: &str,
+	menu: &str,
+	inside: &[PathBuf],
+	outside: &[PathBuf],
+) {
+	let head = reg_query(&[FILE_VERBS]);
+	let Some(scope) = value_of(&head, "AppliesTo") else {
+		report.fail(
+			&format!("{step}-scope"),
+			format!("no AppliesTo: {}", head.trim()),
+		);
+		return;
+	};
+	let add = |args: &[&str]| output(Command::new("reg").arg("add").args(args).arg("/f"));
+	for probe in SCOPE_PROBES {
+		add(&[
+			probe,
+			"/v",
+			"MUIVerb",
+			"/t",
+			"REG_SZ",
+			"/d",
+			SCOPE_PROBE_LABEL,
+		]);
+		add(&[probe, "/v", "AppliesTo", "/t", "REG_SZ", "/d", scope]);
+		add(&[
+			&format!(r"{probe}\command"),
+			"/ve",
+			"/t",
+			"REG_SZ",
+			"/d",
+			"notepad.exe",
+		]);
+	}
+	let planted = reg_query(&[SCOPE_PROBES[0], "/v", "AppliesTo"]);
+	report.check(
+		&format!("{step}-probe"),
+		value_of(&planted, "AppliesTo") == Some(scope),
+		planted.trim(),
+	);
+	let shown = |path: &Path| {
+		let (verbs, provider) = verbs_and_provider(path);
+		let probe = verbs.iter().any(|verb| verb == SCOPE_PROBE_LABEL);
+		let submenu = verbs.iter().any(|verb| verb == menu);
+		(probe, submenu, verbs, provider)
+	};
+	for (n, path) in inside.iter().enumerate() {
+		let before = attributes(path);
+		let (offered, submenu, verbs, provider) = shown(path);
+		let after = attributes(path);
+		report.check(
+			&format!("{step}-inside-{n}"),
+			offered && before == after,
+			format!(
+				"{}: {provider:?} {before:x?} -> {after:x?}; submenu listed {submenu}; {}",
+				path.display(),
+				verbs.join("|")
+			),
+		);
+	}
+	for (n, path) in outside.iter().enumerate() {
+		let (offered, submenu, verbs, provider) = shown(path);
+		report.check(
+			&format!("{step}-outside-{n}"),
+			!offered && !submenu,
+			format!("{}: {provider:?}; {}", path.display(), verbs.join("|")),
+		);
+	}
+	for probe in SCOPE_PROBES {
+		output(Command::new("reg").args(["delete", probe, "/f"]));
+	}
+	let left = SCOPE_PROBES.map(|probe| reg_query(&[probe]));
+	report.check(
+		&format!("{step}-probe-removed"),
+		left.iter().all(|text| not_found(text)),
+		left.join(" ").trim(),
+	);
+}
+
+/// Where the stub writes what each of its processes was given.
+fn stub_records() -> Option<PathBuf> {
+	std::env::var_os("LOCALAPPDATA").map(|base| PathBuf::from(base).join("filen-verb-stub"))
+}
+
+/// The arguments the stub's process `pid` recorded, each decoded from its UTF-16 units.
+fn stub_argv(pid: u32) -> Option<Vec<String>> {
+	let text = fs::read_to_string(stub_records()?.join(format!("{pid}.txt"))).ok()?;
+	text.split('\n')
+		.map(|line| {
+			let units = line
+				.split(' ')
+				.filter(|unit| !unit.is_empty())
+				.map(|unit| u16::from_str_radix(unit, 16).ok())
+				.collect::<Option<Vec<u16>>>()?;
+			String::from_utf16(&units).ok()
+		})
+		.collect()
+}
+
+/// Runs the command line the submenu on files holds for `action` on `item` as File Explorer
+/// does, `%1` replaced by the item's full path and the rest passed to the program unparsed: what
+/// the program was given.
+fn run_command(action: &str, item: &Path) -> Result<Vec<String>, String> {
+	let command = reg_query(&[&format!(
+		r"{FILE_VERBS}\shell\{}\command",
+		COMMANDS
+			.iter()
+			.find(|(_, name, _)| *name == action)
+			.map_or("", |(key, _, _)| *key)
+	)]);
+	let line = value_of(&command, "(Default)").ok_or_else(|| format!("no command: {command}"))?;
+	let (app, args) = line
+		.strip_prefix('"')
+		.and_then(|rest| rest.split_once('"'))
+		.ok_or_else(|| format!("not a quoted program: {line}"))?;
+	let args = args.trim_start().replace("%1", &item.to_string_lossy());
+	let mut child = Command::new(app)
+		.raw_arg(&args)
+		.spawn()
+		.map_err(|error| format!("not started: {error}"))?;
+	let pid = child.id();
+	child.wait().map_err(|error| error.to_string())?;
+	stub_argv(pid).ok_or_else(|| format!("process {pid} recorded nothing"))
+}
+
+/// Runs each command on each of `items` and checks the program got exactly its action and the
+/// item's full path, nothing else, whatever the name holds; and that no download was raised: each
+/// item's attributes stay as they were.
+pub(crate) fn check_command_lines(report: &mut Report, step: &str, items: &[PathBuf]) {
+	for (n, item) in items.iter().enumerate() {
+		for (_, action, _) in COMMANDS {
+			let before = attributes(item);
+			let given = run_command(action, item);
+			let after = attributes(item);
+			let expected = [
+				format!("--filen-explorer-command={action}"),
+				item.to_string_lossy().into_owned(),
+			];
+			report.check(
+				&format!("{step}-{n}-{action}"),
+				given
+					.as_ref()
+					.is_ok_and(|argv| argv.len() == 3 && argv.get(1..) == Some(&expected[..]))
+					&& before == after,
+				format!("{given:?} {before:x?} -> {after:x?}"),
+			);
+		}
+	}
+}
+
+/// Tries the share command on `item` through the shell's verbs, as `check_commands` runs the
+/// root's: whether a submenu's command is reached this way is not known, so it is reported, not
+/// checked.
+pub(crate) fn report_cascade_invoke(report: &mut Report, step: &str, item: &Path, share: &str) {
+	let records = |dir: Option<PathBuf>| {
+		dir.and_then(|dir| fs::read_dir(dir).ok())
+			.map_or(0, |entries| entries.filter_map(Result::ok).count())
+	};
+	let before = records(stub_records());
+	let invoked = invoke(item, &share.replace('&', ""));
+	thread::sleep(Duration::from_secs(3));
+	let after = records(stub_records());
+	report.info(
+		step,
+		format!("{}: stub records {before} -> {after}", invoked.trim()),
+	);
 }
