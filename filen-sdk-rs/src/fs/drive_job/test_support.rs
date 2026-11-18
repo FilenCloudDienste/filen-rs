@@ -378,6 +378,9 @@ pub(crate) struct FakeBackend {
 	/// Fetches of a chunk at this index or after wait while it is set, each wait logged in
 	/// [`FakeLog::held`]: a job is stopped partway through a file.
 	fetches_held_from: watch::Sender<Option<u64>>,
+	/// What a fetch held by [`Self::hold_fetches_from`] fails with once it is let go; `None` lets
+	/// it go on.
+	held_fetches_fail: Mutex<Option<ErrorKind>>,
 	/// Lowercased names the destination holds without the listing having shown them.
 	pub(crate) existing: Mutex<HashSet<String>>,
 	/// Names the server registers as a new version of the given existing file (a client
@@ -438,6 +441,7 @@ impl FakeBackend {
 			held: watch::Sender::new(HashSet::new()),
 			held_named: watch::Sender::new(HashSet::new()),
 			fetches_held_from: watch::Sender::new(None),
+			held_fetches_fail: Mutex::new(None),
 			existing: Mutex::new(HashSet::new()),
 			version_of: HashMap::new(),
 			lock_calls: AtomicUsize::new(0),
@@ -514,6 +518,12 @@ impl FakeBackend {
 	/// Holds each fetch of a chunk at `index` or after, of any file, until [`Self::release_all`].
 	pub(crate) fn hold_fetches_from(&self, index: u64) {
 		self.fetches_held_from.send_replace(Some(index));
+	}
+
+	/// Fails each fetch held by [`Self::hold_fetches_from`] with `kind` once it is let go, as a
+	/// connection lost partway through a file.
+	pub(crate) fn fail_held_fetches(&self, kind: ErrorKind) {
+		*self.held_fetches_fail.lock().unwrap() = Some(kind);
 	}
 
 	/// Lets every held request go on, and holds none from now on.
@@ -790,6 +800,9 @@ impl DriveBackend for FakeBackend {
 				.subscribe()
 				.wait_for(|from| !held_from(from))
 				.await;
+			if let Some(kind) = *self.held_fetches_fail.lock().unwrap() {
+				return Err(Error::custom(kind, "fetch failed"));
+			}
 		}
 		let name = file.name().unwrap_or_default().to_owned();
 		if self.quirks.contains(&Quirk::ReverseChunks) {

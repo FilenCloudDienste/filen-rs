@@ -2483,6 +2483,21 @@ async fn a_tar_cut_inside_an_appledouble_files_head_lists_the_member_before_it()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tar_cut_inside_a_members_padding_lists_the_members_before_it_alone() {
+	let mut tar = tar_of(&[("a.txt", b"alpha"), ("b.txt", b"beta")]);
+	// b.txt's data whole, the block it pads to cut
+	tar.truncate(3 * 512 + 4 + 10);
+	for (name, bytes) in [("t.tar", tar.clone()), ("t.tar.gz", gzip(&tar))] {
+		let (listed, error) = failed_listing(name, bytes).await;
+		assert_eq!(
+			(listed, error),
+			(vec!["a.txt".to_owned()], ErrorKind::ArchiveCorrupt),
+			"{name}"
+		);
+	}
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_tar_member_of_any_kind_whose_stated_data_ends_early_is_not_listed() {
 	let kinds = [
 		TarMember::Data("d/", b""),

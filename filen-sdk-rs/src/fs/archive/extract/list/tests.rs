@@ -680,6 +680,38 @@ async fn a_bare_tars_member_is_listed_from_its_header_before_its_data_was_read()
 	assert_eq!(listed.totals.files, 2);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_compressed_tar_listing_stopped_inside_a_member_by_a_failed_fetch_lists_it() {
+	let (control, _controller) = JobControl::new();
+	let (held, listing, tgz) = tar_listing_held_inside_a_member(true, false, control).await;
+	let len = tgz.len() as u64;
+	wait_until("the member is read", || {
+		listing.reporter.read(|state| state.reading.is_some())
+	})
+	.await;
+	held.backend.fail_held_fetches(ErrorKind::IO);
+	held.backend.release_all();
+	let failed = listing.running.await.unwrap().unwrap_err();
+	assert_eq!(failed.error.kind(), ErrorKind::IO);
+	// stopped by the job, not by its data: listed, at the most reaching it costs
+	let entries = &failed.report.entries;
+	assert_eq!(entries.len(), 1, "{entries:?}");
+	assert_eq!(entries[0].stored_path, "big.bin");
+	assert_eq!(
+		entries[0].access,
+		Some(EntryAccess::SolidBlock {
+			skipped_bytes: TAR_BLOCK as u64,
+			estimated_packed_bytes: len,
+			block_packed_bytes: len,
+		})
+	);
+	let last = listing.recorder.last();
+	assert_eq!(
+		(last.phase, last.entries, last.reading),
+		(ListPhase::Failed, 1, None)
+	);
+}
+
 #[test]
 fn a_member_read_while_another_still_is_is_refused_rather_than_lost() {
 	let entry = |index| {
