@@ -457,7 +457,10 @@ fn list_member<R: TarSource>(
 			Err(TarError::Corrupt("a member's data ends early").into())
 		}
 		Stored::Bare { .. } => Ok((EntryAccess::Sequential, false)),
-		// nor one stating more than the tar may decode to, which decoding it would fail on
+		// nor one stating more than the tar may decode to, which decoding it would fail on. The
+		// header alone cannot tell a member that large from a damaged size field: refused as too
+		// large, as decoding an honest one would be, where a damaged one would fail as corrupt
+		// once the stream ran out
 		Stored::Compressed(Compressed {
 			expansion: Some((limit, base)),
 			..
