@@ -1431,7 +1431,7 @@ mod remote_chunks {
 ))]
 pub use remote_chunks::RemoteChunkSource;
 
-#[cfg(any(feature = "wasm-full", feature = "uniffi"))]
+#[cfg(all(feature = "archive", any(feature = "wasm-full", feature = "uniffi")))]
 pub(crate) use js_impls::EmbeddedPreviewResult;
 
 #[cfg(any(feature = "wasm-full", feature = "uniffi"))]
