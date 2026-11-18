@@ -487,12 +487,23 @@ impl ListReporter {
 		}
 	}
 
-	/// The codec reads the data of `entry`, which is listed once it was passed.
-	fn reading(&self, entry: Box<ArchiveEntry>) {
+	/// The codec reads the data of `entry`, which is listed once it was passed. Refused while
+	/// it still reads another, which would be lost.
+	fn reading(&self, entry: Box<ArchiveEntry>) -> Result<(), Error> {
+		let mut refused = false;
 		self.with_state(|state| {
+			if state.reading.is_some() {
+				refused = true;
+				return;
+			}
 			state.reading = Some(*entry);
 			state.core.mark_changed();
 		});
+		if refused {
+			Err(unexpected_event())
+		} else {
+			Ok(())
+		}
 	}
 
 	/// Lists the entry the codec was reading, handed to `add` first, in the same change that
@@ -738,7 +749,7 @@ impl FeedSink for ListSink<'_> {
 				if let Some(taken) = passed {
 					self.passed(taken)?;
 				}
-				self.reporter.reading(entry);
+				self.reporter.reading(entry)?;
 			}
 			WorkerEvent::Passed(taken) => self.passed(taken)?,
 			WorkerEvent::Indexed(index) => self.index = Some(index),

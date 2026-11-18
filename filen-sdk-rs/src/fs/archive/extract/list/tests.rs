@@ -679,3 +679,37 @@ async fn a_bare_tars_member_is_listed_from_its_header_before_its_data_was_read()
 	let listed = listing.running.await.unwrap().unwrap();
 	assert_eq!(listed.totals.files, 2);
 }
+
+#[test]
+fn a_member_read_while_another_still_is_is_refused_rather_than_lost() {
+	let entry = |index| {
+		Box::new(ArchiveEntry {
+			id: ArchiveEntryId {
+				archive: Uuid::nil(),
+				index,
+			},
+			stored_path: format!("{index}.bin"),
+			stored_path_truncated: false,
+			path: Some(ListedPath::plain(format!("{index}.bin"))),
+			size: Some(1),
+			modified: None,
+			encrypted: false,
+			method: None,
+			skip: None,
+			mac_metadata: false,
+			kind: ArchiveEntryKind::File,
+			access: Some(EntryAccess::Sequential),
+		})
+	};
+	let reporter = ListReporter::new(Arc::new(ListRecorder::default()), 100);
+	reporter.reading(entry(0)).unwrap();
+	assert_eq!(
+		reporter.reading(entry(1)).unwrap_err().kind(),
+		ErrorKind::Internal
+	);
+	// the one read first is kept, to be listed
+	assert_eq!(
+		reporter.read(|state| state.reading.as_ref().map(|entry| entry.id.index)),
+		Some(0)
+	);
+}
