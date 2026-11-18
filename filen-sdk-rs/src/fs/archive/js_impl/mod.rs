@@ -363,10 +363,11 @@ pub struct ListUpdate {
 	/// Time spent running, paused time left out, in milliseconds.
 	pub active_time_ms: u64,
 	/// The entry whose data the listing is decoding, as its header lists it, before it is
-	/// listed: a compressed tar's file, which an app may show as being read. It is listed once
-	/// its data was passed, with what reaching it fetches (until then its `estimatedPackedBytes`
-	/// is the archive's length), and also when the listing is cancelled while it reads it, or
-	/// stopped by a fetch that failed; not when its data turns out damaged or cut short.
+	/// listed: a compressed tar's member that stores data (a file, as a rule), which an app may
+	/// show as being read. It is listed once its data was passed, a file with what reaching it
+	/// fetches (until then its `estimatedPackedBytes` is the archive's length), and also when the
+	/// listing is cancelled while it reads it, or stopped by a fetch that failed; not when its
+	/// data turns out damaged or cut short.
 	/// `undefined` otherwise (a bare tar's members are listed from their headers, a zip's or 7z's
 	/// from its index), and on the last update.
 	pub reading: Option<ArchiveEntry>,

@@ -2481,3 +2481,27 @@ async fn a_tar_cut_inside_an_appledouble_files_head_lists_the_member_before_it()
 		);
 	}
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tar_member_of_any_kind_whose_stated_data_ends_early_is_not_listed() {
+	let kinds = [
+		TarMember::Data("d/", b""),
+		TarMember::Symlink {
+			path: "l",
+			target: "a.txt",
+		},
+	];
+	for kind in kinds {
+		let tar = tar_with(&[TarMember::Data("a.txt", b"alpha"), kind]);
+		// the second member states more data than the end-of-archive blocks after it hold
+		let tar = with_stated_size(tar, 1024, 4096);
+		for (name, bytes) in [("t.tar", tar.clone()), ("t.tar.gz", gzip(&tar))] {
+			let (listed, error) = failed_listing(name, bytes).await;
+			assert_eq!(
+				(listed, error),
+				(vec!["a.txt".to_owned()], ErrorKind::ArchiveCorrupt),
+				"{name}"
+			);
+		}
+	}
+}

@@ -369,12 +369,13 @@ pub struct ListUpdate {
 	/// Time spent running, paused time left out.
 	pub active_time: Duration,
 	/// The entry whose data the listing is decoding, as its header lists it, before it is
-	/// listed: a compressed tar's file, listed once its data was passed, which tells what reaching
-	/// it fetches (until then its `estimated_packed_bytes` is the archive's length). A listing
-	/// that ends while it reads one lists it so when it was cancelled or stopped by the job (a
-	/// fetch that failed), and not when its data turned out damaged or cut short. `None`
-	/// otherwise: a bare tar's members are listed from their headers, a zip's or 7z's from its
-	/// index. Always `None` on the last update.
+	/// listed: a compressed tar's member that stores data (a file, as a rule), listed once its
+	/// data was passed, which for a file tells what reaching it fetches (until then its
+	/// `estimated_packed_bytes` is the archive's length). A listing that ends while it reads one
+	/// lists it so when it was cancelled or stopped by the job (a fetch that failed), and not
+	/// when its data turned out damaged or cut short. `None` otherwise: a bare tar's members are
+	/// listed from their headers, a zip's or 7z's from its index. Always `None` on the last
+	/// update.
 	pub reading: Option<ArchiveEntry>,
 }
 

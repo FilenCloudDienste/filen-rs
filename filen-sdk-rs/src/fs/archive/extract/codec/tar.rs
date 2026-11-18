@@ -408,7 +408,7 @@ fn send_passed(walk: &Walk, passed: &mut Option<u64>) -> Result<(), Error> {
 /// Lists `member` from its header, `tar` at its data, a hard link resolved against
 /// `listed_files`, the files listed before it as extracted, which it joins when it is one. A bare
 /// tar's member is listed at once, once its data is known to lie within the archive. A
-/// `Compressed` tar's file that stores data is sent as [`WorkerEvent::Reading`], and listed
+/// `Compressed` tar's member that stores data is sent as [`WorkerEvent::Reading`], and listed
 /// once the walk passed that data. A file's cost is what the tar stores before its data, decoded
 /// and thrown away, and the archive bytes the decoder will have taken once past its data, which
 /// approximates what a read of it alone fetches (see [`EntryAccess::SolidBlock`]'s
@@ -469,7 +469,8 @@ fn list_member<R: TarSource>(
 			Err(ExpansionExceeded(limit.ratio).into())
 		}
 		Stored::Compressed(compressed) => {
-			let reading = found.kind == ArchiveEntryKind::File && member.size > 0;
+			// listed once its data was passed, whatever its kind, so one cut short is not
+			let reading = member.size > 0;
 			// a file without data is passed already
 			let estimated_packed_bytes = if reading {
 				compressed.len
