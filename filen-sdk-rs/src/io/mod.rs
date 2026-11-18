@@ -37,6 +37,8 @@ pub use dir_download::{
 pub use dir_upload::{DirUploadCallback, DirUploadOptions, ExistingRemoteFile, SymlinkPolicy};
 pub use filter::{PathMatcher, TransferFilter};
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+pub use local_name::{DeviceRejection, windows_rejection};
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 pub use meta_ext::FilenMetaExt;
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 pub use upload_resume::{

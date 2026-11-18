@@ -11,7 +11,7 @@ const WINDOWS_FORBIDDEN: [char; 9] = ['<', '>', ':', '"', '/', '\\', '|', '?', '
 
 /// Why this device's file system cannot hold a remote name under its exact spelling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DeviceRejection {
+pub enum DeviceRejection {
 	/// Longer than the file system holds: `len` bytes, or UTF-16 code units on Windows, of at most
 	/// `max`.
 	TooLong { len: usize, max: usize },
@@ -43,12 +43,14 @@ impl fmt::Display for DeviceRejection {
 	}
 }
 
+impl std::error::Error for DeviceRejection {}
+
 /// Why Windows cannot hold `name` under that exact spelling, or `None` when it can: the length, the
 /// forbidden characters, a trailing dot or space, and the device names. Compiled on every host, so
 /// its rules are tested everywhere. Allocates nothing: the sync engine asks it of every name it
-/// places, and of every directory above one, and a directory download on Windows of every name it
-/// joins.
-pub(crate) fn windows_rejection(name: &str) -> Option<DeviceRejection> {
+/// places, and of every directory above one, a directory download on Windows of every name it
+/// joins, and the Windows Cloud Files provider of every placeholder it creates.
+pub fn windows_rejection(name: &str) -> Option<DeviceRejection> {
 	// A UTF-16 unit never takes fewer than one UTF-8 byte, so only a name past the limit in bytes
 	// is counted.
 	if name.len() > WINDOWS_MAX_UNITS {
