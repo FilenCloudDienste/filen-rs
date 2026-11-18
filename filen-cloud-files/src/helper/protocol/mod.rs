@@ -24,7 +24,7 @@ use serde_json::{Map, Value};
 
 use crate::{
 	auth::{AuthPayload, AuthPayloadError, KeyAccount},
-	branding::Branding,
+	branding::{Branding, BrandingError, ExplorerCommands},
 	failure::Failure,
 	local::ConflictKind,
 };
@@ -32,8 +32,8 @@ use crate::{
 /// The protocol's version, sent in `hello`. Both sides require an exact match, and every change to
 /// a message bumps it, an added field included, as both sides refuse unknown fields; but for an
 /// optional request field the helper takes, with a reply field sent only to a parent that sent it
-/// (`register`'s `displayName`, `iconPath` and `iconIndex`, and `branded`), which a parent of the
-/// same version that knows neither never sees.
+/// (`register`'s `displayName`, `iconPath`, `iconIndex` and `explorerCommands`, and `branded`),
+/// which a parent of the same version that knows neither never sees.
 pub const PROTOCOL_VERSION: u32 = 1;
 
 /// The longest input line taken, in bytes, its newline excluded: a pushed session of 1 MiB
@@ -180,8 +180,9 @@ pub struct Registration {
 	/// The user's data directory, as given: the command loop checks it is absolute and UTF-8, and
 	/// missing, empty or one the helper created (`dataDirNotEmpty` otherwise).
 	pub data_dir: PathBuf,
-	/// What File Explorer shows for the root, from the optional `displayName`, `iconPath` and
-	/// `iconIndex`; `None` when the request named none of them, and the root shows the default.
+	/// What File Explorer shows for the root, from the optional `displayName`, `iconPath`,
+	/// `iconIndex` and `explorerCommands`; `None` when the request named none of them, and the root
+	/// shows the default.
 	pub branding: Option<Branding>,
 }
 
@@ -380,6 +381,23 @@ struct RegisterWire {
 	icon_path: Option<String>,
 	#[serde(default)]
 	icon_index: Option<i32>,
+	#[serde(default)]
+	explorer_commands: Option<ExplorerCommandsWire>,
+}
+
+/// `register`'s `explorerCommands`: the app's path, and each label the parent translated.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct ExplorerCommandsWire {
+	app_path: String,
+	#[serde(default)]
+	menu: Option<String>,
+	#[serde(default)]
+	share: Option<String>,
+	#[serde(default)]
+	web: Option<String>,
+	#[serde(default)]
+	versions: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -529,12 +547,28 @@ fn registration(id: RequestId, wire: RegisterWire) -> Result<Registration, Parse
 		));
 	}
 	let user = user_id(id, &wire.user_id)?;
+	let invalid =
+		|e: BrandingError| ParseError::new(Some(id), ErrorCode::InvalidMessage, e.to_string());
+	let commands = wire
+		.explorer_commands
+		.map(|commands| {
+			ExplorerCommands::parse(
+				&commands.app_path,
+				commands.menu.as_deref(),
+				commands.share.as_deref(),
+				commands.web.as_deref(),
+				commands.versions.as_deref(),
+			)
+		})
+		.transpose()
+		.map_err(invalid)?;
 	let branding = Branding::parse(
 		wire.display_name.as_deref(),
 		wire.icon_path.as_deref(),
 		wire.icon_index,
+		commands,
 	)
-	.map_err(|e| ParseError::new(Some(id), ErrorCode::InvalidMessage, e.to_string()))?;
+	.map_err(invalid)?;
 	Ok(Registration {
 		root,
 		user,

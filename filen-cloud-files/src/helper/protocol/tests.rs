@@ -438,6 +438,39 @@ fn a_register_carries_the_branding_it_names() {
 }
 
 #[test]
+fn a_register_carries_the_explorer_commands_it_names() {
+	let message = parse_line(
+		r#"{"t":"register","id":1,"root":"C:\\r","userId":"42","dataDir":"C:\\d","explorerCommands":{"appPath":"C:\\F\\Filen.exe","share":"Teilen"}}"#,
+	)
+	.unwrap();
+	let Request::Register(registration) = message.request else {
+		panic!("not a register");
+	};
+	let branding = registration.branding.unwrap();
+	assert_eq!(branding.display_name.as_str(), "Filen");
+	assert_eq!(
+		branding.commands.map(|commands| *commands),
+		Some(
+			ExplorerCommands::parse("C:\\F\\Filen.exe", None, Some("Teilen"), None, None).unwrap()
+		)
+	);
+}
+
+#[test]
+fn a_refused_app_path_names_its_rule_and_quotes_nothing() {
+	let error = parse_line(
+		r#"{"t":"register","id":3,"root":"C:\\r","userId":"42","dataDir":"C:\\d","explorerCommands":{"appPath":"C:\\secret%\\Filen.exe"}}"#,
+	)
+	.unwrap_err();
+	assert_eq!(error.code, ErrorCode::InvalidMessage);
+	assert_eq!(error.id, Some(id(3)));
+	assert_eq!(
+		error.message,
+		"explorerCommands.appPath holds a control character, a %, a quote or a /"
+	);
+}
+
+#[test]
 fn a_refused_branding_names_its_rule_and_quotes_nothing() {
 	let error = parse_line(
 		r#"{"t":"register","id":3,"root":"C:\\r","userId":"42","dataDir":"C:\\d","displayName":"secret%"}"#,

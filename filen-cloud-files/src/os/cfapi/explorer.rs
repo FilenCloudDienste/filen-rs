@@ -202,7 +202,7 @@ mod tests {
 
 	#[test]
 	fn the_icon_resource_names_the_icon_when_its_file_is_there() {
-		let branding = Branding::parse(None, Some(r"C:\Filen\Filen.exe"), Some(-3))
+		let branding = Branding::parse(None, Some(r"C:\Filen\Filen.exe"), Some(-3), None)
 			.unwrap()
 			.unwrap();
 		assert_eq!(icon_resource(&branding, |_| true), r"C:\Filen\Filen.exe,-3");

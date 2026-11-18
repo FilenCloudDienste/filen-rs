@@ -462,7 +462,7 @@ fn stored_branding(
 	icon: Option<&str>,
 	icon_index: Option<i32>,
 ) -> Option<Branding> {
-	Branding::parse(display_name, icon, icon_index)
+	Branding::parse(display_name, icon, icon_index, None)
 		.inspect_err(|error| warn!(%error, "the index's branding is refused; the default is shown"))
 		.ok()
 		.flatten()
@@ -502,7 +502,7 @@ mod tests {
 	use std::os::unix::fs::PermissionsExt;
 
 	use super::*;
-	use crate::helper::protocol::KeptItemReason;
+	use crate::{branding::ExplorerCommands, helper::protocol::KeptItemReason};
 
 	fn state_dir() -> (tempfile::TempDir, StateDir) {
 		let temp = tempfile::tempdir().unwrap();
@@ -527,8 +527,13 @@ mod tests {
 		let (_temp, dir) = state_dir();
 		let mut index = RootsIndex::load(&dir).unwrap();
 		let mut named = entry(1, "C:\\a");
-		named.branding =
-			Branding::parse(Some("Filen (2)"), Some("C:\\Filen\\Filen.exe"), Some(2)).unwrap();
+		named.branding = Branding::parse(
+			Some("Filen (2)"),
+			Some("C:\\Filen\\Filen.exe"),
+			Some(2),
+			None,
+		)
+		.unwrap();
 		index.upsert(named.clone()).unwrap();
 		index.upsert(entry(2, "C:\\b")).unwrap();
 		let bytes = std::fs::read(dir.path().join(INDEX_FILE_NAME)).unwrap();
@@ -541,6 +546,26 @@ mod tests {
 		);
 		let loaded = RootsIndex::load(&dir).unwrap();
 		assert_eq!(loaded.entries(), [named, entry(2, "C:\\b")]);
+	}
+
+	#[test]
+	fn a_roots_explorer_commands_are_not_written_to_the_index() {
+		let (_temp, dir) = state_dir();
+		let mut index = RootsIndex::load(&dir).unwrap();
+		let commands =
+			ExplorerCommands::parse("C:\\Filen\\Filen.exe", Some("Filen"), None, None, None)
+				.unwrap();
+		let mut named = entry(1, "C:\\a");
+		named.branding = Branding::parse(Some("Filen (2)"), None, None, Some(commands)).unwrap();
+		index.upsert(named).unwrap();
+		let text = std::fs::read_to_string(dir.path().join(INDEX_FILE_NAME)).unwrap();
+		assert!(text.contains(r#""displayName":"Filen (2)""#), "{text}");
+		assert!(!text.contains("Filen.exe"), "{text}");
+		let loaded = RootsIndex::load(&dir).unwrap();
+		assert_eq!(
+			loaded.entries()[0].branding,
+			Branding::parse(Some("Filen (2)"), None, None, None).unwrap()
+		);
 	}
 
 	#[test]

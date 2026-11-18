@@ -114,12 +114,12 @@ fn an_icon_path_holds_1024_utf16_units_and_no_more() {
 
 #[test]
 fn a_register_naming_nothing_has_no_branding_of_its_own() {
-	assert_eq!(Branding::parse(None, None, None), Ok(None));
+	assert_eq!(Branding::parse(None, None, None, None), Ok(None));
 }
 
 #[test]
 fn a_register_naming_only_a_name_keeps_the_system_icon() {
-	let branding = Branding::parse(Some("Filen (2)"), None, None)
+	let branding = Branding::parse(Some("Filen (2)"), None, None, None)
 		.unwrap()
 		.unwrap();
 	assert_eq!(branding.display_name.as_str(), "Filen (2)");
@@ -129,7 +129,7 @@ fn a_register_naming_only_a_name_keeps_the_system_icon() {
 
 #[test]
 fn a_register_naming_only_an_icon_keeps_the_default_name() {
-	let branding = Branding::parse(None, Some("C:\\Filen\\Filen.exe"), Some(-3))
+	let branding = Branding::parse(None, Some("C:\\Filen\\Filen.exe"), Some(-3), None)
 		.unwrap()
 		.unwrap();
 	assert_eq!(branding.display_name.as_str(), "Filen");
@@ -143,7 +143,136 @@ fn a_register_naming_only_an_icon_keeps_the_default_name() {
 #[test]
 fn an_icon_index_without_an_icon_path_is_refused() {
 	assert_eq!(
-		Branding::parse(Some("Filen"), None, Some(1)),
+		Branding::parse(Some("Filen"), None, Some(1), None),
 		Err(BrandingError::IndexWithoutPath)
+	);
+}
+
+#[test]
+fn app_paths_follow_the_rule() {
+	let cases: [(&str, Result<(), BrandingError>); 18] = [
+		("C:\\Program Files\\Filen\\Filen.exe", Ok(())),
+		("d:\\Filen\\FILEN.EXE", Ok(())),
+		("C:\\Programme\\Fílen (x86)\\Filen.exe", Ok(())),
+		("", Err(BrandingError::AppPathLength)),
+		("Filen.exe", Err(BrandingError::AppPathNotAbsolute)),
+		("C:Filen.exe", Err(BrandingError::AppPathNotAbsolute)),
+		(
+			"\\\\server\\share\\Filen.exe",
+			Err(BrandingError::AppPathNotAbsolute),
+		),
+		(
+			"\\\\?\\C:\\Filen\\Filen.exe",
+			Err(BrandingError::AppPathNotAbsolute),
+		),
+		("C:/Filen/Filen.exe", Err(BrandingError::AppPathNotAbsolute)),
+		(
+			"C:\\Fi\"len\\Filen.exe",
+			Err(BrandingError::AppPathCharacter),
+		),
+		(
+			"C:\\%TEMP%\\Filen.exe",
+			Err(BrandingError::AppPathCharacter),
+		),
+		(
+			"C:\\a\u{1}b\\Filen.exe",
+			Err(BrandingError::AppPathCharacter),
+		),
+		("C:\\a/../Filen.exe", Err(BrandingError::AppPathCharacter)),
+		("C:\\Filen/Filen.exe", Err(BrandingError::AppPathCharacter)),
+		("C:\\a\\..\\Filen.exe", Err(BrandingError::AppPathComponent)),
+		("C:\\.\\Filen.exe", Err(BrandingError::AppPathComponent)),
+		("C:\\Filen\\Filen.dll", Err(BrandingError::AppPathExtension)),
+		("C:\\Filen.exe\\Filen", Err(BrandingError::AppPathExtension)),
+	];
+	for (path, expected) in cases {
+		assert_eq!(AppPath::parse(path).map(|_| ()), expected, "{path:?}");
+	}
+}
+
+#[test]
+fn an_app_path_holds_1024_utf16_units_and_no_more() {
+	let path = |units: usize| format!("C:\\{}.exe", "a".repeat(units - 7));
+	assert_eq!(path(1024).encode_utf16().count(), 1024);
+	assert!(AppPath::parse(&path(1024)).is_ok());
+	assert_eq!(
+		AppPath::parse(&path(1025)),
+		Err(BrandingError::AppPathLength)
+	);
+}
+
+#[test]
+fn command_labels_follow_the_display_name_rule_with_their_own_errors() {
+	let cases: [(&str, Result<(), BrandingError>); 9] = [
+		("Share / create public link", Ok(())),
+		("Freigeben & Link erstellen", Ok(())),
+		("Версии", Ok(())),
+		("", Err(BrandingError::CommandLabelLength)),
+		("a\tb", Err(BrandingError::CommandLabelControl)),
+		(" Share", Err(BrandingError::CommandLabelWhitespace)),
+		("100% Filen", Err(BrandingError::CommandLabelPercent)),
+		(
+			"@shell32.dll,-8506",
+			Err(BrandingError::CommandLabelIndirect),
+		),
+		("Share @ home", Ok(())),
+	];
+	for (label, expected) in cases {
+		assert_eq!(
+			CommandLabel::parse(label).map(|_| ()),
+			expected,
+			"{label:?}"
+		);
+	}
+	assert!(CommandLabel::parse(&"a".repeat(255)).is_ok());
+	assert_eq!(
+		CommandLabel::parse(&"a".repeat(256)),
+		Err(BrandingError::CommandLabelLength)
+	);
+}
+
+#[test]
+fn explorer_commands_carry_the_app_and_each_label_given() {
+	let commands = ExplorerCommands::parse(
+		"C:\\Program Files\\Filen\\Filen.exe",
+		None,
+		Some("Teilen"),
+		None,
+		Some("Versionen"),
+	)
+	.unwrap();
+	assert_eq!(commands.app.as_str(), "C:\\Program Files\\Filen\\Filen.exe");
+	assert_eq!(commands.menu, None);
+	assert_eq!(
+		commands.share.as_ref().map(CommandLabel::as_str),
+		Some("Teilen")
+	);
+	assert_eq!(commands.web, None);
+	assert_eq!(
+		commands.versions.as_ref().map(CommandLabel::as_str),
+		Some("Versionen")
+	);
+	assert_eq!(
+		ExplorerCommands::parse("Filen.exe", None, None, None, None),
+		Err(BrandingError::AppPathNotAbsolute)
+	);
+	assert_eq!(
+		ExplorerCommands::parse("C:\\Filen.exe", Some(""), None, None, None),
+		Err(BrandingError::CommandLabelLength)
+	);
+}
+
+#[test]
+fn a_register_naming_only_commands_keeps_the_default_name_and_icon() {
+	let commands = ExplorerCommands::parse("C:\\Filen\\Filen.exe", None, None, None, None).unwrap();
+	let branding = Branding::parse(None, None, None, Some(commands.clone()))
+		.unwrap()
+		.unwrap();
+	assert_eq!(
+		branding,
+		Branding {
+			commands: Some(Box::new(commands)),
+			..Branding::default()
+		}
 	);
 }

@@ -43,7 +43,9 @@ pub use auth::{
 };
 #[cfg(any(windows, test))]
 pub use auth::{CredentialError, CredentialManagerKeyStore};
-pub use branding::{Branding, BrandingError, DisplayName, IconPath};
+pub use branding::{
+	AppPath, Branding, BrandingError, CommandLabel, DisplayName, ExplorerCommands, IconPath,
+};
 pub use dispatch::{CacheDispatcher, CloudFilesCallback, DispatchConfig, Dispatcher};
 pub use drive::Drive;
 pub use failure::Failure;

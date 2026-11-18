@@ -29,6 +29,7 @@ fn branding(name: &str) -> Branding {
 		Some(name),
 		Some(r"C:\filen-explorer-tests\missing.exe"),
 		Some(3),
+		None,
 	)
 	.unwrap()
 	.unwrap()

@@ -1942,6 +1942,7 @@ fn branding(name: &str) -> Branding {
 		Some(name),
 		Some("C:\\Program Files\\Filen\\Filen.exe"),
 		Some(0),
+		None,
 	)
 	.unwrap()
 	.unwrap()
