@@ -5,6 +5,7 @@ use serde::Deserialize;
 use serde_json::{Value, value::RawValue};
 
 use super::*;
+use crate::helper::identify::{NOT_FOUND, NOT_IN_ROOT, NOT_SERVING, NOT_SYNCED, UNKNOWN_ITEM};
 
 /// The golden fixtures the desktop app reads too.
 const FIXTURES: &str = include_str!(concat!(
@@ -35,6 +36,7 @@ fn request_type(request: &Request) -> &'static str {
 		Request::SetAuth { .. } => "setAuth",
 		Request::ClearAuth { .. } => "clearAuth",
 		Request::Unregister { .. } => "unregister",
+		Request::Identify { .. } => "identify",
 		Request::ListRoots => "listRoots",
 		Request::GetState => "getState",
 		Request::Shutdown => "shutdown",
@@ -373,6 +375,32 @@ fn out_message(case: &str) -> OutMessage {
 				branding_left: true,
 			}],
 		},
+		"reply identify file" => reply(
+			9,
+			ReplyValue::Identified(IdentifiedItem::File {
+				uuid: Uuid::from_u128(0x303),
+				stable_uuid: Uuid::from_u128(0x302),
+				parents: vec![Uuid::from_u128(0x201), Uuid::from_u128(0x202)],
+			}),
+		),
+		"reply identify dir" => reply(
+			9,
+			ReplyValue::Identified(IdentifiedItem::Dir {
+				uuid: Uuid::from_u128(0x202),
+				parents: vec![Uuid::from_u128(0x201)],
+			}),
+		),
+		"reply identify root" => reply(
+			9,
+			ReplyValue::Identified(IdentifiedItem::Root {
+				uuid: Uuid::from_u128(0x100),
+			}),
+		),
+		"reply error notInRoot" => identify_error(ErrorCode::NotInRoot, NOT_IN_ROOT),
+		"reply error notSynced" => identify_error(ErrorCode::NotSynced, NOT_SYNCED),
+		"reply error unknownItem" => identify_error(ErrorCode::UnknownItem, UNKNOWN_ITEM),
+		"reply error notServing" => identify_error(ErrorCode::NotServing, NOT_SERVING),
+		"reply error notFound" => identify_error(ErrorCode::NotFound, NOT_FOUND),
 		other => panic!("no message for the output case {other}"),
 	}
 }
@@ -402,7 +430,32 @@ fn every_output_fixture_is_byte_for_byte_what_the_helper_writes() {
 		assert_eq!(line, expected, "{}", case.case);
 		checked += 1;
 	}
-	assert_eq!(checked, 27);
+	assert_eq!(checked, 35);
+}
+
+/// `identify`'s refusal of `code`, as the command loop words it.
+fn identify_error(code: ErrorCode, message: &str) -> OutMessage {
+	OutMessage::Reply {
+		id: id(9),
+		outcome: Err(ReplyError::new(code, message)),
+	}
+}
+
+#[test]
+fn an_identify_carries_its_path() {
+	let message = parse_line(r#"{"t":"identify","id":4,"path":"C:\\r\\a b\\ü.txt"}"#).unwrap();
+	let Request::Identify { path } = message.request else {
+		panic!("not an identify");
+	};
+	assert_eq!(path.as_str(), "C:\\r\\a b\\ü.txt");
+}
+
+#[test]
+fn an_identify_path_holds_32767_utf16_units_and_no_more() {
+	assert!(ItemPath::parse(format!("C:\\{}", "a".repeat(32_764))).is_some());
+	assert_eq!(ItemPath::parse(format!("C:\\{}", "a".repeat(32_765))), None);
+	assert_eq!(ItemPath::parse(String::new()), None);
+	assert_eq!(ItemPath::parse("C:\\a\0b".to_owned()), None);
 }
 
 #[test]

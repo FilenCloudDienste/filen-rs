@@ -2,7 +2,7 @@
 
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
-use filen_mobile_native_cache::CacheError;
+use filen_mobile_native_cache::{CacheError, ffi::FfiNonRootObject};
 use filen_types::fs::Uuid;
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -22,7 +22,7 @@ use crate::{
 	os::LocalError,
 	test_support::{
 		BrandingCall, FakeDrive, FakeEntry, FakeLocal, FakeOpener, FakePlatform, FakeStep,
-		KillPoint, PlatformCall, root_path,
+		KillPoint, PlatformCall, ffi_dir, ffi_file, root_path,
 	},
 };
 
@@ -2337,4 +2337,332 @@ async fn the_commands_a_run_killed_after_the_os_unregister_left_are_swept_when_t
 	assert_eq!(rig.line().await["t"], "hello");
 	ok(&rig.request(json!({ "t": "getState" })).await);
 	assert_eq!(platform.explorer_commands(), None);
+}
+
+const DIR_A: Uuid = Uuid::from_u128(0x201);
+const DIR_B: Uuid = Uuid::from_u128(0x202);
+const FILE_STABLE: Uuid = Uuid::from_u128(0x302);
+const FILE_VERSION: Uuid = Uuid::from_u128(0x303);
+
+/// `a/b/f.txt` on the drive and in the root, as placeholders: the directories `a` ([`DIR_A`]) and
+/// `a/b` ([`DIR_B`]) and the file ([`FILE_STABLE`] at [`FILE_VERSION`]), not on disk.
+fn identify_world() -> (FakePlatform, Arc<FakeDrive>) {
+	let (platform, drive) = world();
+	let mut a = ffi_dir(DIR_A, "a");
+	a.parent = ACCOUNT_ROOT.to_string();
+	let mut b = ffi_dir(DIR_B, "b");
+	b.parent = DIR_A.to_string();
+	let mut file = ffi_file(FILE_STABLE, FILE_VERSION, "f.txt", 4);
+	file.parent = DIR_B.to_string();
+	drive.list(&ACCOUNT_ROOT.to_string(), vec![FfiNonRootObject::Dir(a)]);
+	drive.list(&format!("stable/{DIR_A}"), vec![FfiNonRootObject::Dir(b)]);
+	drive.list(
+		&format!("stable/{DIR_B}"),
+		vec![FfiNonRootObject::File(file)],
+	);
+	drive.add_file(FILE_STABLE, FILE_VERSION, b"data");
+	let local = platform.local();
+	local.place_dir(&root_path("a"), PlaceholderIdentity::Dir { uuid: DIR_A });
+	local.place_dir(&root_path("a\\b"), PlaceholderIdentity::Dir { uuid: DIR_B });
+	local.place_file_with(
+		&root_path("a\\b\\f.txt"),
+		PlaceholderIdentity::File {
+			stable: FILE_STABLE,
+			version: FILE_VERSION,
+		},
+		b"data",
+		false,
+	);
+	(platform, drive)
+}
+
+/// A helper serving the root of [`identify_world`].
+async fn identifying(disk: &Disk, platform: &FakePlatform, drive: &Arc<FakeDrive>) -> Rig {
+	let mut rig = Rig::start(disk, platform, drive);
+	ok(&rig.register(disk).await);
+	ok(&rig.set_auth("42", ACCOUNT_ROOT).await);
+	rig
+}
+
+/// `identify` of `path`, as the parent words it.
+fn identify(path: &std::path::Path) -> Value {
+	json!({ "t": "identify", "path": path.to_str().unwrap() })
+}
+
+#[tokio::test(start_paused = true)]
+async fn identify_before_register_is_refused_as_not_registered() {
+	let disk = Disk::new();
+	let (platform, drive) = identify_world();
+	let mut rig = Rig::start(&disk, &platform, &drive);
+	let reply = rig.request(identify(&disk.root().join("a"))).await;
+	assert_eq!(code(&reply), "notRegistered");
+}
+
+#[tokio::test(start_paused = true)]
+async fn identify_of_a_root_registered_but_not_served_is_refused_as_not_serving() {
+	let disk = Disk::new();
+	let (platform, drive) = identify_world();
+	let mut rig = Rig::start(&disk, &platform, &drive);
+	ok(&rig.register(&disk).await);
+	let reply = rig.request(identify(&disk.root().join("a"))).await;
+	assert_eq!(code(&reply), "notServing");
+	assert_eq!(reply["error"]["message"], "the root is not served");
+}
+
+#[tokio::test(start_paused = true)]
+async fn identify_of_a_nested_file_names_its_version_its_stable_id_and_its_directories() {
+	let disk = Disk::new();
+	let (platform, drive) = identify_world();
+	let mut rig = identifying(&disk, &platform, &drive).await;
+	let reply = rig
+		.request(identify(&disk.root().join("a").join("b").join("f.txt")))
+		.await;
+	assert_eq!(
+		ok(&reply),
+		&json!({
+			"kind": "file",
+			"uuid": FILE_VERSION.to_string(),
+			"stableUuid": FILE_STABLE.to_string(),
+			"parents": [DIR_A.to_string(), DIR_B.to_string()],
+		})
+	);
+	// Answered from the placeholder and the cache: nothing read, nothing downloaded.
+	assert_eq!(drive.reads(), Vec::<(u64, u64)>::new());
+	assert_eq!(
+		platform
+			.local()
+			.entry(&root_path("a\\b\\f.txt"))
+			.map(|entry| entry.on_disk),
+		Some(0)
+	);
+}
+
+#[tokio::test(start_paused = true)]
+async fn identify_of_a_directory_names_the_directories_above_it() {
+	let disk = Disk::new();
+	let (platform, drive) = identify_world();
+	let mut rig = identifying(&disk, &platform, &drive).await;
+	let reply = rig
+		.request(identify(&disk.root().join("a").join("b")))
+		.await;
+	assert_eq!(
+		ok(&reply),
+		&json!({ "kind": "dir", "uuid": DIR_B.to_string(), "parents": [DIR_A.to_string()] })
+	);
+}
+
+#[tokio::test(start_paused = true)]
+async fn identify_of_the_root_names_the_account_root() {
+	let disk = Disk::new();
+	let (platform, drive) = identify_world();
+	let mut rig = identifying(&disk, &platform, &drive).await;
+	let reply = rig.request(identify(&disk.root())).await;
+	assert_eq!(
+		ok(&reply),
+		&json!({ "kind": "root", "uuid": ACCOUNT_ROOT.to_string(), "parents": [] })
+	);
+}
+
+#[tokio::test(start_paused = true)]
+async fn identify_of_a_path_outside_the_root_is_refused_as_not_in_root() {
+	let disk = Disk::new();
+	let (platform, drive) = identify_world();
+	let mut rig = identifying(&disk, &platform, &drive).await;
+	let root = disk.root();
+	let sibling = format!("{}2/a", root.to_str().unwrap());
+	let dotted = format!("{}/a/../a", root.to_str().unwrap());
+	for path in [
+		disk.0.path().join("elsewhere.txt").to_str().unwrap(),
+		sibling.as_str(),
+		dotted.as_str(),
+		"a/b/f.txt",
+	] {
+		let reply = rig.request(json!({ "t": "identify", "path": path })).await;
+		assert_eq!(code(&reply), "notInRoot", "{path}");
+	}
+}
+
+#[tokio::test(start_paused = true)]
+async fn identify_of_an_ordinary_file_is_refused_as_not_synced() {
+	let disk = Disk::new();
+	let (platform, drive) = identify_world();
+	let mut rig = identifying(&disk, &platform, &drive).await;
+	platform.local().user_create(&root_path("new.txt"), b"new");
+	let reply = rig.request(identify(&disk.root().join("new.txt"))).await;
+	assert_eq!(code(&reply), "notSynced");
+}
+
+#[tokio::test(start_paused = true)]
+async fn identify_of_a_file_set_apart_from_the_drive_is_refused_as_not_synced() {
+	let disk = Disk::new();
+	let (platform, drive) = identify_world();
+	platform.local().place_file(
+		&root_path("a\\copy.txt"),
+		PlaceholderIdentity::Detached {
+			nonce: Uuid::from_u128(0x900),
+		},
+		b"mine",
+	);
+	let mut rig = identifying(&disk, &platform, &drive).await;
+	let reply = rig
+		.request(identify(&disk.root().join("a").join("copy.txt")))
+		.await;
+	assert_eq!(code(&reply), "notSynced");
+}
+
+#[tokio::test(start_paused = true)]
+async fn identify_of_nothing_is_refused_as_not_found() {
+	let disk = Disk::new();
+	let (platform, drive) = identify_world();
+	let mut rig = identifying(&disk, &platform, &drive).await;
+	let reply = rig.request(identify(&disk.root().join("gone.txt"))).await;
+	assert_eq!(code(&reply), "notFound");
+}
+
+#[tokio::test(start_paused = true)]
+async fn identify_of_a_placeholder_the_cache_does_not_hold_is_refused_as_unknown() {
+	let disk = Disk::new();
+	let (platform, drive) = identify_world();
+	platform.local().place_file_with(
+		&root_path("a\\stray.txt"),
+		PlaceholderIdentity::File {
+			stable: Uuid::from_u128(0x700),
+			version: Uuid::from_u128(0x701),
+		},
+		b"x",
+		false,
+	);
+	let mut rig = identifying(&disk, &platform, &drive).await;
+	let reply = rig
+		.request(identify(&disk.root().join("a").join("stray.txt")))
+		.await;
+	assert_eq!(code(&reply), "unknownItem");
+}
+
+#[tokio::test(start_paused = true)]
+async fn identify_of_a_file_the_drive_holds_in_the_trash_is_refused_as_unknown() {
+	let disk = Disk::new();
+	let (platform, drive) = identify_world();
+	drive.remote_trash(FILE_STABLE);
+	let mut rig = identifying(&disk, &platform, &drive).await;
+	let reply = rig
+		.request(identify(&disk.root().join("a").join("b").join("f.txt")))
+		.await;
+	assert_eq!(code(&reply), "unknownItem");
+}
+
+#[tokio::test(start_paused = true)]
+async fn identify_of_a_file_in_a_trashed_directory_is_refused_as_unknown() {
+	let disk = Disk::new();
+	let (platform, drive) = identify_world();
+	drive.remote_trash(DIR_A);
+	let mut rig = identifying(&disk, &platform, &drive).await;
+	let reply = rig
+		.request(identify(&disk.root().join("a").join("b").join("f.txt")))
+		.await;
+	assert_eq!(code(&reply), "unknownItem");
+}
+
+#[tokio::test(start_paused = true)]
+async fn identify_when_the_cache_cannot_be_read_answers_io_without_its_cause() {
+	let disk = Disk::new();
+	let (platform, drive) = identify_world();
+	let mut rig = identifying(&disk, &platform, &drive).await;
+	drive.fail_query(CacheError::remote("the server said secret"));
+	let reply = rig
+		.request(identify(&disk.root().join("a").join("b").join("f.txt")))
+		.await;
+	assert_eq!(code(&reply), "io");
+	assert_eq!(reply["error"]["message"], "reading the cache failed");
+}
+
+#[tokio::test(start_paused = true)]
+async fn identify_in_a_directory_cycle_stops_at_the_hop_bound_as_internal() {
+	let disk = Disk::new();
+	let (platform, drive) = identify_world();
+	let (c, d) = (Uuid::from_u128(0x501), Uuid::from_u128(0x502));
+	let mut dir_c = ffi_dir(c, "c");
+	dir_c.parent = d.to_string();
+	let mut dir_d = ffi_dir(d, "d");
+	dir_d.parent = c.to_string();
+	drive.list(
+		&format!("stable/{}", Uuid::from_u128(0x500)),
+		vec![FfiNonRootObject::Dir(dir_c), FfiNonRootObject::Dir(dir_d)],
+	);
+	platform
+		.local()
+		.place_dir(&root_path("a\\c"), PlaceholderIdentity::Dir { uuid: c });
+	let mut rig = identifying(&disk, &platform, &drive).await;
+	let reply = rig
+		.request(identify(&disk.root().join("a").join("c")))
+		.await;
+	assert_eq!(code(&reply), "internal");
+	assert_eq!(
+		reply["error"]["message"],
+		"the item is deeper than any directory tree"
+	);
+}
+
+#[tokio::test(start_paused = true)]
+async fn identify_below_a_parent_that_is_a_file_answers_internal() {
+	let disk = Disk::new();
+	let (platform, drive) = identify_world();
+	let odd = Uuid::from_u128(0x601);
+	let mut dir = ffi_dir(odd, "odd");
+	dir.parent = FILE_STABLE.to_string();
+	drive.list(
+		&format!("stable/{}", Uuid::from_u128(0x600)),
+		vec![FfiNonRootObject::Dir(dir)],
+	);
+	platform
+		.local()
+		.place_dir(&root_path("a\\odd"), PlaceholderIdentity::Dir { uuid: odd });
+	let mut rig = identifying(&disk, &platform, &drive).await;
+	let reply = rig
+		.request(identify(&disk.root().join("a").join("odd")))
+		.await;
+	assert_eq!(code(&reply), "internal");
+	assert_eq!(
+		reply["error"]["message"],
+		"an item's parent is not a directory"
+	);
+}
+
+#[tokio::test(start_paused = true)]
+async fn identify_of_a_root_identity_below_the_root_is_refused_as_not_synced() {
+	let disk = Disk::new();
+	let (platform, drive) = identify_world();
+	platform.local().place_dir(
+		&root_path("a\\nested"),
+		PlaceholderIdentity::Root { root: ACCOUNT_ROOT },
+	);
+	let mut rig = identifying(&disk, &platform, &drive).await;
+	let reply = rig
+		.request(identify(&disk.root().join("a").join("nested")))
+		.await;
+	assert_eq!(code(&reply), "notSynced");
+}
+
+#[tokio::test(start_paused = true)]
+async fn identify_of_a_file_placeholder_the_cache_holds_as_a_directory_answers_internal() {
+	let disk = Disk::new();
+	let (platform, drive) = identify_world();
+	platform.local().place_file_with(
+		&root_path("a\\posing.txt"),
+		PlaceholderIdentity::File {
+			stable: DIR_B,
+			version: Uuid::from_u128(0x801),
+		},
+		b"x",
+		false,
+	);
+	let mut rig = identifying(&disk, &platform, &drive).await;
+	let reply = rig
+		.request(identify(&disk.root().join("a").join("posing.txt")))
+		.await;
+	assert_eq!(code(&reply), "internal");
+	assert_eq!(
+		reply["error"]["message"],
+		"the cache holds the placeholder's item as another kind"
+	);
 }

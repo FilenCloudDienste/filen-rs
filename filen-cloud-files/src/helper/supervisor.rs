@@ -33,12 +33,13 @@ use crate::{
 		blocking,
 		events::{self, HelperCallback, Out},
 		framing::{Frame, next_frame},
+		identify::{self, NOT_SERVING},
 		index::{RootEntry, RootsIndex, StateDir, index_error},
 		platform::{DriveOpener, Platform, RootRefusal, platform_error},
 		protocol::{
-			ErrorCode, FatalCode, Hello, InMessage, KeptId, OutMessage, ParseError, PhaseName,
-			Registration, ReplyError, ReplyValue, Request, RootDir, RootListing, StateReport,
-			StatusEvent, UnregisterReport, UserId, parse_line,
+			ErrorCode, FatalCode, Hello, IdentifiedItem, InMessage, ItemPath, KeptId, OutMessage,
+			ParseError, PhaseName, Registration, ReplyError, ReplyValue, Request, RootDir,
+			RootListing, StateReport, StatusEvent, UnregisterReport, UserId, parse_line,
 		},
 		unregister::{self, EntryUnregistered, Held, Stopped, unregister_entry},
 		validate,
@@ -485,9 +486,31 @@ impl<P: Platform, O: DriveOpener> Helper<P, O> {
 				user,
 				delete_hydrated,
 			} => self.unregister(user, delete_hydrated).await,
+			Request::Identify { path } => self.identify(&path).await.map(ReplyValue::Identified),
 			Request::ListRoots => Ok(self.list_roots().await),
 			Request::GetState => Ok(ReplyValue::State(self.state().await)),
 			Request::Shutdown => Ok(ReplyValue::Empty {}),
+		}
+	}
+
+	/// The drive item at `path` in the served root (see [`identify::identify`]).
+	async fn identify(&self, path: &ItemPath) -> Result<IdentifiedItem, ReplyError> {
+		match &self.phase {
+			Phase::Idle => Err(ReplyError::new(
+				ErrorCode::NotRegistered,
+				"no root is registered",
+			)),
+			Phase::Registered(_) => Err(ReplyError::new(ErrorCode::NotServing, NOT_SERVING)),
+			Phase::Serving(serving) => {
+				identify::identify(
+					&self.platform,
+					&serving.root,
+					serving.account_root,
+					&*serving.drive,
+					path,
+				)
+				.await
+			}
 		}
 	}
 

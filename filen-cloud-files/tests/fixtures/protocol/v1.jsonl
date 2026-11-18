@@ -59,6 +59,11 @@
 {"case":"empty command label","dir":"in","line":{"t":"register","id":81,"root":"C:\\Users\\u\\Filen","userId":"42","dataDir":"C:\\Users\\u\\AppData\\Local\\Filen\\cloud-files\\42","explorerCommands":{"appPath":"C:\\Program Files\\Filen\\Filen.exe","share":""}},"expect":{"code":"invalidMessage","id":81}}
 {"case":"command label naming a resource string","dir":"in","line":{"t":"register","id":82,"root":"C:\\Users\\u\\Filen","userId":"42","dataDir":"C:\\Users\\u\\AppData\\Local\\Filen\\cloud-files\\42","explorerCommands":{"appPath":"C:\\Program Files\\Filen\\Filen.exe","web":"@shell32.dll,-8506"}},"expect":{"code":"invalidMessage","id":82}}
 {"case":"unknown field in explorerCommands","dir":"in","line":{"t":"register","id":83,"root":"C:\\Users\\u\\Filen","userId":"42","dataDir":"C:\\Users\\u\\AppData\\Local\\Filen\\cloud-files\\42","explorerCommands":{"appPath":"C:\\Program Files\\Filen\\Filen.exe","icon":"C:\\x.ico"}},"expect":{"code":"invalidMessage","id":83}}
+{"case":"identify","dir":"in","line":{"t":"identify","id":84,"path":"C:\\Users\\u\\Filen\\a\\b.txt"},"expect":{"t":"identify"}}
+{"case":"identify without path","dir":"in","line":{"t":"identify","id":85},"expect":{"code":"invalidMessage","id":85}}
+{"case":"empty identify path","dir":"in","line":{"t":"identify","id":86,"path":""},"expect":{"code":"invalidMessage","id":86}}
+{"case":"identify path with a NUL","dir":"in","line":{"t":"identify","id":87,"path":"C:\\Users\\u\\Filen\\a\u0000b"},"expect":{"code":"invalidMessage","id":87}}
+{"case":"identify unknown field","dir":"in","line":{"t":"identify","id":88,"path":"C:\\Users\\u\\Filen\\a\\b.txt","action":"share"},"expect":{"code":"invalidMessage","id":88}}
 {"case":"hello","dir":"out","line":{"t":"hello","protocol":1,"version":"<crate version>","build":26300}}
 {"case":"fatal","dir":"out","line":{"t":"fatal","code":"elevated","message":"the helper runs elevated"}}
 {"case":"reply register","dir":"out","line":{"t":"reply","id":1,"ok":true,"value":{"state":"registered","resumed":false}}}
@@ -86,3 +91,11 @@
 {"case":"protocolError","dir":"out","line":{"t":"protocolError","code":"lineTooLong"}}
 {"case":"unregisterAll","dir":"out","line":{"t":"unregisterAll","roots":[{"userId":"42","root":"C:\\Users\\u\\Filen","ok":{"unregistered":true,"deletedHydrated":0,"kept":[],"keptCount":0,"keptIn":null,"rootRemoved":true,"keyDeleted":false,"dataDeleted":false},"keyLeft":true},{"userId":"43","root":"D:\\Filen","error":{"code":"unsyncedChanges","message":"m"},"keyLeft":false}]}}
 {"case":"unregisterAll brandingLeft","dir":"out","line":{"t":"unregisterAll","roots":[{"userId":"42","root":"C:\\Users\\u\\Filen","ok":{"unregistered":true,"deletedHydrated":0,"kept":[],"keptCount":0,"keptIn":null,"rootRemoved":true,"keyDeleted":false,"dataDeleted":false},"keyLeft":true,"brandingLeft":true}]}}
+{"case":"reply identify file","dir":"out","line":{"t":"reply","id":9,"ok":true,"value":{"kind":"file","uuid":"00000000-0000-0000-0000-000000000303","stableUuid":"00000000-0000-0000-0000-000000000302","parents":["00000000-0000-0000-0000-000000000201","00000000-0000-0000-0000-000000000202"]}}}
+{"case":"reply identify dir","dir":"out","line":{"t":"reply","id":9,"ok":true,"value":{"kind":"dir","uuid":"00000000-0000-0000-0000-000000000202","parents":["00000000-0000-0000-0000-000000000201"]}}}
+{"case":"reply identify root","dir":"out","line":{"t":"reply","id":9,"ok":true,"value":{"kind":"root","uuid":"00000000-0000-0000-0000-000000000100","parents":[]}}}
+{"case":"reply error notInRoot","dir":"out","line":{"t":"reply","id":9,"ok":false,"error":{"code":"notInRoot","message":"the path is not inside the served root"}}}
+{"case":"reply error notSynced","dir":"out","line":{"t":"reply","id":9,"ok":false,"error":{"code":"notSynced","message":"the item is not synced with the drive"}}}
+{"case":"reply error unknownItem","dir":"out","line":{"t":"reply","id":9,"ok":false,"error":{"code":"unknownItem","message":"the drive holds no such item, or holds it in the trash"}}}
+{"case":"reply error notServing","dir":"out","line":{"t":"reply","id":9,"ok":false,"error":{"code":"notServing","message":"the root is not served"}}}
+{"case":"reply error notFound","dir":"out","line":{"t":"reply","id":9,"ok":false,"error":{"code":"notFound","message":"nothing is at the path"}}}

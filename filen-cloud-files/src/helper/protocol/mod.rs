@@ -33,7 +33,8 @@ use crate::{
 /// a message bumps it, an added field included, as both sides refuse unknown fields; but for an
 /// optional request field the helper takes, with a reply field sent only to a parent that sent it
 /// (`register`'s `displayName`, `iconPath`, `iconIndex` and `explorerCommands`, and `branded`),
-/// which a parent of the same version that knows neither never sees.
+/// which a parent of the same version that knows neither never sees; and but for a request only a
+/// parent that knows it sends (`identify`, with the error codes only its reply carries).
 pub const PROTOCOL_VERSION: u32 = 1;
 
 /// The longest input line taken, in bytes, its newline excluded: a pushed session of 1 MiB
@@ -170,6 +171,23 @@ impl AsRef<Path> for RootDir {
 	}
 }
 
+/// A path `identify` asks about, as the parent spells it: the rule on [`RootDir`], 1 to 32,767
+/// UTF-16 units with no NUL. Whether it lies in the served root is the command loop's check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ItemPath(String);
+
+impl ItemPath {
+	/// `path` as an item path, if it follows the rule on [`ItemPath`].
+	pub fn parse(path: String) -> Option<Self> {
+		RootDir::parse(path).ok().map(|root| Self(root.0))
+	}
+
+	/// The path as the wire spells it.
+	pub fn as_str(&self) -> &str {
+		&self.0
+	}
+}
+
 /// A `register` request: the root to serve for a user, and where the user's data lives.
 #[derive(Debug)]
 pub struct Registration {
@@ -221,6 +239,12 @@ pub enum Request {
 	},
 	/// Lists the roots the helper knows.
 	ListRoots,
+	/// Which drive item the path names in the served root: read from the placeholder there and the
+	/// cache alone, so nothing is downloaded and nothing is asked of the server.
+	Identify {
+		/// The item's full path.
+		path: ItemPath,
+	},
 	/// The helper's state. While a root is served, its pending count waits for a walk of the whole
 	/// root, at most a few seconds, and holds up the requests behind it meanwhile; it is null past
 	/// that, or once a stop was asked for.
@@ -291,6 +315,18 @@ pub enum ErrorCode {
 	CredentialStore,
 	/// The root holds local changes that cannot be kept safely.
 	UnsyncedChanges,
+	/// The request needs the registered root served.
+	NotServing,
+	/// The path is not inside the served root: not an absolute path on a drive letter, holding a
+	/// `.` or `..` component, or outside it.
+	NotInRoot,
+	/// Nothing is at the path.
+	NotFound,
+	/// The item at the path is not one the drive has: not uploaded yet, a local copy set apart
+	/// from the drive, or a placeholder whose identity this build cannot read.
+	NotSynced,
+	/// The cache holds no item for the placeholder, or holds it in the trash.
+	UnknownItem,
 }
 
 /// Why the helper refused to start: sent as the only line before it exits, with the exit code
@@ -434,6 +470,16 @@ struct UnregisterWire {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct IdentifyWire {
+	#[serde(rename = "t")]
+	_t: IgnoredAny,
+	#[serde(rename = "id")]
+	_id: IgnoredAny,
+	path: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct BareWire {
 	#[serde(rename = "t")]
 	_t: IgnoredAny,
@@ -514,6 +560,18 @@ pub fn parse_line(line: &str) -> Result<InMessage, ParseError> {
 			Request::Unregister {
 				user: user_id(id, &wire.user_id)?,
 				delete_hydrated: wire.delete_hydrated,
+			}
+		}
+		"identify" => {
+			let wire: IdentifyWire = serde_json::from_str(line).map_err(schema)?;
+			Request::Identify {
+				path: ItemPath::parse(wire.path).ok_or_else(|| {
+					ParseError::new(
+						Some(id),
+						ErrorCode::InvalidMessage,
+						"path is not 1 to 32,767 UTF-16 units without a NUL",
+					)
+				})?,
 			}
 		}
 		"listRoots" | "getState" | "shutdown" => {
@@ -780,6 +838,58 @@ pub struct StateReport {
 	pub pending_uploads: Option<u64>,
 }
 
+/// The drive item `identify` found, as the web app names it: `parents` are the directories from
+/// the account's root down to the item's own directory, outermost first, the account's root left
+/// out; empty for an item at the top of the drive and for the root itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IdentifiedItem {
+	/// A file, by its current version and its stable id.
+	File {
+		/// The current version's uuid, as the cache holds it.
+		uuid: Uuid,
+		/// The file's stable id.
+		stable_uuid: Uuid,
+		/// Its directories.
+		parents: Vec<Uuid>,
+	},
+	/// A directory.
+	Dir {
+		/// Its uuid.
+		uuid: Uuid,
+		/// The directories above it.
+		parents: Vec<Uuid>,
+	},
+	/// The root itself, the account's root directory.
+	Root {
+		/// The account's root directory's uuid.
+		uuid: Uuid,
+	},
+}
+
+impl Serialize for IdentifiedItem {
+	/// `{"kind","uuid","stableUuid"?,"parents"}`, `parents` empty for the root.
+	fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+		let (kind, uuid, stable_uuid, parents) = match self {
+			Self::File {
+				uuid,
+				stable_uuid,
+				parents,
+			} => ("file", uuid, Some(stable_uuid), parents.as_slice()),
+			Self::Dir { uuid, parents } => ("dir", uuid, None, parents.as_slice()),
+			Self::Root { uuid } => ("root", uuid, None, [].as_slice()),
+		};
+		let mut fields = s.serialize_struct("IdentifiedItem", 4)?;
+		fields.serialize_field("kind", kind)?;
+		fields.serialize_field("uuid", uuid)?;
+		match stable_uuid {
+			Some(stable_uuid) => fields.serialize_field("stableUuid", stable_uuid)?,
+			None => fields.skip_field("stableUuid")?,
+		}
+		fields.serialize_field("parents", parents)?;
+		fields.end()
+	}
+}
+
 /// A successful reply's value, the object each variant spells.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(untagged)]
@@ -824,6 +934,8 @@ pub enum ReplyValue {
 	},
 	/// `getState`.
 	State(StateReport),
+	/// `identify`.
+	Identified(IdentifiedItem),
 	/// `shutdown`: an empty object.
 	Empty {},
 }
