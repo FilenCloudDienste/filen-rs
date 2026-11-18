@@ -362,6 +362,14 @@ pub struct ListUpdate {
 	pub eta_ms: Option<u64>,
 	/// Time spent running, paused time left out, in milliseconds.
 	pub active_time_ms: u64,
+	/// The entry whose data the listing is decoding, as its header lists it, before it is
+	/// listed: a compressed tar's file, which an app may show as being read. It is listed once
+	/// its data was passed, with what reaching it fetches (until then its `estimatedPackedBytes`
+	/// is the archive's length), and also when the listing is cancelled while it reads it, or
+	/// stopped by a fetch that failed; not when its data turns out damaged or cut short.
+	/// `undefined` otherwise (a bare tar's members are listed from their headers, a zip's or 7z's
+	/// from its index), and on the last update.
+	pub reading: Option<ArchiveEntry>,
 }
 
 /// What a listing found, whether it completed, was cancelled or failed: the archive, and its
@@ -696,6 +704,7 @@ impl ListUpdate {
 			bytes_per_second: update.bytes_per_second,
 			eta_ms: update.eta.map(millis),
 			active_time_ms: millis(update.active_time),
+			reading: update.reading,
 		}
 	}
 }
@@ -1019,7 +1028,8 @@ const MAX_UNDELIVERED_ENTRY_BYTES: usize = MAX_LISTED_BYTES;
 enum ListDelivery {
 	/// Entries, held against [`MAX_UNDELIVERED_ENTRY_BYTES`] until delivered.
 	Entries(Vec<ArchiveEntry>, QueuedEntries),
-	Update(ListUpdate),
+	/// Boxed: with the entry being read, it is several times the size of a batch of entries.
+	Update(Box<ListUpdate>),
 }
 
 /// The memory a batch of entries on its way to the app holds, given back once it is delivered
@@ -1084,7 +1094,7 @@ impl ListCallback for ListChannel {
 
 	fn on_update(&self, update: extract::ListUpdate) {
 		let update = ListUpdate::new(update, self.undelivered.load(Ordering::Relaxed));
-		let _ = self.sender.send(ListDelivery::Update(update));
+		let _ = self.sender.send(ListDelivery::Update(Box::new(update)));
 	}
 }
 

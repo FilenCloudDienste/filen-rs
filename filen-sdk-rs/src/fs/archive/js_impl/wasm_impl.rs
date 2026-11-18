@@ -298,7 +298,7 @@ impl ListCallbacks {
 			ListDelivery::Entries(entries, _queued) => {
 				call_callback(self.on_entries_batch.as_ref(), &entries)
 			}
-			ListDelivery::Update(update) => call_callback(self.on_update.as_ref(), &update),
+			ListDelivery::Update(update) => call_callback(self.on_update.as_ref(), &*update),
 		}
 	}
 }

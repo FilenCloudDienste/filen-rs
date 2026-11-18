@@ -697,6 +697,7 @@ fn a_listing_carries_why_it_ended_and_the_entries_read_by_then() {
 	let update = ListUpdate::new(
 		extract::ListUpdate {
 			eta: Some(Duration::from_millis(300)),
+			reading: Some(archive_entry(2)),
 			..list_update(1200)
 		},
 		7,
@@ -710,6 +711,8 @@ fn a_listing_carries_why_it_ended_and_the_entries_read_by_then() {
 		),
 		(Some(300), 1200, 1, 7)
 	);
+	// the member being read passes through as it is
+	assert_eq!(update.reading, Some(archive_entry(2)));
 	let listing = extract::ListReport {
 		format: Some(ArchiveFormat::Zip),
 		password: PasswordCheck::Wrong,

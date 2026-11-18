@@ -200,7 +200,7 @@ pub(super) fn deliver_list(callback: &dyn ListArchiveCallback, delivery: ListDel
 	match delivery {
 		// the batch's text counts as queued until the callback has returned
 		ListDelivery::Entries(entries, _queued) => callback.on_entries_batch(entries),
-		ListDelivery::Update(update) => callback.on_update(update),
+		ListDelivery::Update(update) => callback.on_update(*update),
 	}
 }
 
