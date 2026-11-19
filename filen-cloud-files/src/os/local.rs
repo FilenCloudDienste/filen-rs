@@ -375,6 +375,17 @@ pub trait LocalFs: sealed::Sealed + Send + Sync + 'static {
 	/// Marks the directory placeholder at `path`, if still the item `expect`, in sync.
 	fn set_dir_in_sync(&self, path: &RootPath, expect: LocalFileId) -> Result<(), LocalError>;
 
+	/// Marks the directory placeholder at `path`, if still the item `expect`, populated, its
+	/// identity `identity` kept: the platform no longer asks the provider for its children, as after
+	/// it populated the directory itself. What the directory holds and its in-sync state stay as
+	/// they are. For a directory whose children the provider placed itself.
+	fn set_dir_populated(
+		&self,
+		path: &RootPath,
+		expect: LocalFileId,
+		identity: PlaceholderIdentity,
+	) -> Result<(), LocalError>;
+
 	/// Fetches every byte of the file placeholder at `path` the file does not hold yet, if it is
 	/// still the item `expect`.
 	fn hydrate(&self, path: &RootPath, expect: LocalFileId) -> Result<(), LocalError>;

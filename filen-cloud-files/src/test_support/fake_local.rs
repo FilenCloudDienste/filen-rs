@@ -62,6 +62,8 @@ pub enum LocalOp {
 	},
 	/// A directory placeholder was marked in sync.
 	DirInSync(RootPath),
+	/// A directory placeholder was marked populated by the provider.
+	DirPopulated(RootPath),
 	/// A file placeholder was hydrated whole.
 	Hydrated(RootPath),
 	/// A partly hydrated file was hashed: reading it would have asked the provider for its data.
@@ -2142,6 +2144,28 @@ impl LocalFs for FakeLocal {
 			.ok_or(LocalError::NotFound)?
 			.in_sync = true;
 		state.ops.push(LocalOp::DirInSync(path.clone()));
+		Ok(())
+	}
+
+	/// As measured for a directory's metadata update: one watcher modification of it.
+	fn set_dir_populated(
+		&self,
+		path: &RootPath,
+		expect: LocalFileId,
+		identity: PlaceholderIdentity,
+	) -> Result<(), LocalError> {
+		let mut state = self.state();
+		let node = state
+			.get_mut(path)
+			.filter(|node| node.id == expect.get() && matches!(node.kind, NodeKind::Dir { .. }))
+			.ok_or(LocalError::NotFound)?;
+		let placeholder = node.placeholder.as_mut().ok_or(LocalError::NotFound)?;
+		if PlaceholderIdentity::decode(&placeholder.identity).ok() != Some(identity) {
+			return Err(LocalError::NotFound);
+		}
+		placeholder.populated = true;
+		state.ops.push(LocalOp::DirPopulated(path.clone()));
+		state.watch.push(LocalEvent::Modified(path.clone()));
 		Ok(())
 	}
 

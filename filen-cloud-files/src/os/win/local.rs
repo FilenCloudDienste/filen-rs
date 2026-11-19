@@ -20,7 +20,8 @@ use windows_sys::Win32::{
 			CF_CONVERT_FLAG_ENABLE_ON_DEMAND_POPULATION, CF_CONVERT_FLAG_MARK_IN_SYNC,
 			CF_CONVERT_FLAG_NONE, CF_PIN_STATE, CF_PIN_STATE_PINNED, CF_PIN_STATE_UNPINNED,
 			CF_PIN_STATE_UNSPECIFIED, CF_UPDATE_FLAG_CLEAR_IN_SYNC, CF_UPDATE_FLAG_DEHYDRATE,
-			CF_UPDATE_FLAG_MARK_IN_SYNC, CF_UPDATE_FLAG_VERIFY_IN_SYNC,
+			CF_UPDATE_FLAG_DISABLE_ON_DEMAND_POPULATION, CF_UPDATE_FLAG_MARK_IN_SYNC,
+			CF_UPDATE_FLAG_VERIFY_IN_SYNC,
 		},
 		FileSystem::{
 			DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_FLAG_BACKUP_SEMANTICS,
@@ -676,6 +677,26 @@ impl LocalFs for WinLocalFs {
 	fn set_dir_in_sync(&self, path: &RootPath, expect: LocalFileId) -> Result<(), LocalError> {
 		let file = open_expected(&self.full(path), expect, FILE_WRITE_ATTRIBUTES)?;
 		checked(ffi::set_in_sync(&file))
+	}
+
+	/// `CfUpdatePlaceholder` with `CF_UPDATE_FLAG_DISABLE_ON_DEMAND_POPULATION` and the identity the
+	/// directory holds, through a handle for writing attributes, as `update_dir` changes it. Not
+	/// measured: that the flag outside a callback marks a never-populated directory populated (no
+	/// more `FETCH_PLACEHOLDERS`, its state no longer partial), and what the platform does with a
+	/// `FETCH_PLACEHOLDERS` it raised for the directory just before (its answer's entries already
+	/// there come back as `ERROR_ALREADY_EXISTS`, as measured for a never-populated directory).
+	fn set_dir_populated(
+		&self,
+		path: &RootPath,
+		expect: LocalFileId,
+		identity: PlaceholderIdentity,
+	) -> Result<(), LocalError> {
+		let file = open_expected(&self.full(path), expect, FILE_WRITE_ATTRIBUTES)?;
+		checked(ffi::update(
+			&file,
+			&identity.encode(),
+			CF_UPDATE_FLAG_DISABLE_ON_DEMAND_POPULATION,
+		))
 	}
 
 	/// Through a handle for reading attributes only, which refuses no other handle: measured
