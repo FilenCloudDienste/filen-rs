@@ -214,6 +214,9 @@ struct DriveState {
 	reported: (Vec<String>, usize),
 	/// How many pages of the change feed were read.
 	pages_read: usize,
+	/// Directories whose children the cache has not listed yet: its own reads give them none
+	/// until a listing refreshed from the server.
+	unlisted: HashSet<String>,
 }
 
 /// The change feed: every item's latest change, and the items removed for good.
@@ -464,6 +467,7 @@ impl FakeDrive {
 				stale: None,
 				reported: (Vec::new(), 0),
 				pages_read: 0,
+				unlisted: HashSet::new(),
 			}),
 			started: watch::Sender::new(0),
 			active: AtomicUsize::new(0),
@@ -889,6 +893,12 @@ impl FakeDrive {
 			dirs: state.dirs.clone(),
 			trash: state.trash.clone(),
 		});
+	}
+
+	/// Makes the cache hold no children of the directory `dir` (a cache id) until a listing of it
+	/// refreshed from the server, as for a directory it knows from its parent's listing alone.
+	pub fn unlisted(&self, dir: &str) {
+		self.state().unlisted.insert(dir.to_owned());
 	}
 
 	/// The directories last reported populated, as reported, and how many reports there were.
@@ -1489,6 +1499,7 @@ impl Drive for FakeDrive {
 		if let Some(error) = state.fail_list.take() {
 			return Err(error);
 		}
+		state.unlisted.remove(&dir.0);
 		let parent = ffi_dir(
 			stable_uuid(&dir)
 				.or_else(|| Uuid::parse_str(&dir.0).ok())
@@ -1547,8 +1558,13 @@ impl Drive for FakeDrive {
 				.unwrap_or_default(),
 			"parent",
 		);
+		let unlisted = state.unlisted.contains(&dir.0);
 		Ok(dirs.get(&dir.0).map(|children| QueryChildrenResponse {
-			objects: children.clone(),
+			objects: if unlisted {
+				Vec::new()
+			} else {
+				children.clone()
+			},
 			parent,
 		}))
 	}

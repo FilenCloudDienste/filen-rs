@@ -6,6 +6,7 @@ use std::{
 
 use filen_mobile_native_cache::{CacheError, ffi::FfiFile};
 use filen_sdk_rs::consts::CHUNK_SIZE_U64;
+use filen_sdk_rs::sync_engine::WATCH_SAFETY_NET;
 use filen_types::fs::Uuid;
 use tokio::{
 	runtime::Handle,
@@ -20,10 +21,10 @@ use crate::{
 	dispatch::CloudFilesCallback,
 	failure::Failure,
 	identity::PlaceholderIdentity,
-	os::{LocalError, PinAttr},
-	populate::SkippedItem,
+	os::{LocalError, LocalFs, OsError, PinAttr},
+	populate::{SkipReason, SkippedItem, spec_for},
 	root_path::RootPath,
-	test_support::{FakeDrive, FakeLocal, LocalOp, ProviderAct, pattern, root_path},
+	test_support::{DriveCall, FakeDrive, FakeLocal, LocalOp, ProviderAct, pattern, root_path},
 };
 
 const ROOT_UUID: Uuid = Uuid::from_u128(0x100);
@@ -33,11 +34,14 @@ const SIZE: usize = 2 << 20;
 /// The quiet window of the default configuration.
 const QUIET: Duration = Duration::from_secs(5);
 
+/// What the engine reported, and the remote children it reported skipped.
 #[derive(Default)]
-struct Reports(Mutex<Vec<LocalReport>>);
+struct Reports(Mutex<Vec<LocalReport>>, Mutex<Vec<SkippedItem>>);
 
 impl CloudFilesCallback for Reports {
-	fn on_skipped_items(&self, _directory: PlaceholderIdentity, _items: &[SkippedItem]) {}
+	fn on_skipped_items(&self, _directory: PlaceholderIdentity, items: &[SkippedItem]) {
+		lock(&self.1).extend_from_slice(items);
+	}
 
 	fn on_local_report(&self, report: &LocalReport) {
 		lock(&self.0).push(report.clone());
@@ -690,37 +694,281 @@ async fn a_new_remote_file_under_a_pinned_directory_arrives_hydrated() {
 	assert_eq!(world.damaged(), Vec::new());
 }
 
+impl World {
+	/// A remote directory `path` (its last component its name) in the directory `parent` (a cache
+	/// id) whose placeholder the platform never populated, and its cache id.
+	fn unopened_dir(&self, parent: &str, path: &str) -> String {
+		let name = root_path(path).name().unwrap().as_str().to_owned();
+		let dir = self.drive.add_remote_dir(parent, &name);
+		let uuid = Uuid::parse_str(&dir.uuid).unwrap();
+		self.local
+			.place_dir_unpopulated(&root_path(path), PlaceholderIdentity::Dir { uuid });
+		dir_id(&dir.uuid)
+	}
+
+	/// A remote directory `name` in the directory `parent` (a cache id) with no placeholder, and
+	/// its cache id.
+	fn remote_dir(&self, parent: &str, name: &str) -> String {
+		dir_id(&self.drive.add_remote_dir(parent, name).uuid)
+	}
+
+	/// A tree nothing ever listed: `d`, whose placeholder was never populated, holding `a.bin` and
+	/// `s`, which holds `b.bin` and `t`, which holds `c.bin`. Returns each file's path and size.
+	fn unopened_tree(&self) -> [(&'static str, u64); 3] {
+		let d = self.unopened_dir(&root_dir(), "d");
+		self.drive.add_remote_file(&d, "a.bin", &pattern(5000));
+		let s = self.remote_dir(&d, "s");
+		self.drive.add_remote_file(&s, "b.bin", &pattern(6000));
+		let t = self.remote_dir(&s, "t");
+		self.drive.add_remote_file(&t, "c.bin", &pattern(7000));
+		[
+			(r"d\a.bin", 5000),
+			(r"d\s\b.bin", 6000),
+			(r"d\s\t\c.bin", 7000),
+		]
+	}
+
+	/// What the directory `dir` holds, sorted.
+	fn listed(&self, dir: &str) -> Vec<RootPath> {
+		let mut listed: Vec<RootPath> = LocalFs::list_dir(&self.local, &root_path(dir))
+			.unwrap()
+			.into_iter()
+			.map(Result::unwrap)
+			.collect();
+		listed.sort_by_key(RootPath::to_string);
+		listed
+	}
+
+	/// How often the provider marked the directory `path` populated.
+	fn populations(&self, path: &str) -> usize {
+		self.count(&LocalOp::DirPopulated(root_path(path)))
+	}
+
+	/// How many placeholders the provider created under `dir`, at any depth.
+	fn created_under(&self, dir: &str) -> usize {
+		let dir = root_path(dir);
+		self.local
+			.ops()
+			.iter()
+			.filter(|op| {
+				matches!(op, LocalOp::PlaceholderCreated { path, .. } if path.starts_with(&dir) && *path != dir)
+			})
+			.count()
+	}
+}
+
 #[tokio::test(start_paused = true)]
-async fn a_pinned_directory_populated_later_hydrates_what_it_got() {
+async fn pinning_a_never_opened_tree_three_levels_deep_hydrates_all_of_it() {
 	let world = unstarted();
-	let dir = world.drive.add_remote_dir(&root_dir(), "d");
-	let uuid = Uuid::parse_str(&dir.uuid).unwrap();
-	world
-		.local
-		.place_dir_unpopulated(&root_path("d"), PlaceholderIdentity::Dir { uuid });
-	let file = world
-		.drive
-		.add_remote_file(&dir_id(&dir.uuid), "a.bin", &pattern(5000));
+	let files = world.unopened_tree();
 	let world = world.started().await;
 	world.local.user_pin(&root_path("d"), PinAttr::Pinned);
-	world.run(Duration::from_secs(10)).await;
+	world.run(Duration::from_secs(30)).await;
+	for (path, size) in files {
+		let entry = world.local.entry(&root_path(path)).expect(path);
+		assert_eq!(entry.on_disk, size, "{path} hydrated");
+		assert_eq!(entry.bytes, pattern(usize::try_from(size).unwrap()));
+	}
 	assert_eq!(
-		world.local.entry(&root_path(r"d\a.bin")),
-		None,
-		"never listed"
+		[
+			world.populations("d"),
+			world.populations(r"d\s"),
+			world.populations(r"d\s\t")
+		],
+		[1, 1, 1]
 	);
-	// The user lists it: the platform populates it, and the dispatcher hints it.
-	let spec = crate::populate::spec_for(&filen_mobile_native_cache::ffi::FfiNonRootObject::File(
-		file,
-	))
-	.unwrap();
-	world.local.populate(&root_path("d"), &[spec]);
-	world
-		.engine
-		.hints()
-		.populated(PlaceholderIdentity::Dir { uuid });
+	assert_eq!(world.damaged(), Vec::new());
+	assert_eq!(world.drive.writes(), Vec::new());
+	// Each directory is in the populated set the cache keeps fresh.
+	world.run(Duration::from_secs(5)).await;
+	assert_eq!(world.drive.reported_dirs().0.len(), 4);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_never_opened_folder_the_cache_has_not_listed_is_listed_from_the_server() {
+	let world = unstarted();
+	let d = world.unopened_dir(&root_dir(), "d");
+	world.drive.add_remote_file(&d, "a.bin", &pattern(5000));
+	world.drive.unlisted(&d);
+	let world = world.started().await;
+	world.local.user_pin(&root_path("d"), PinAttr::Pinned);
 	world.run(Duration::from_secs(20)).await;
 	assert_eq!(world.on_disk(r"d\a.bin"), 5000);
+	assert_eq!(world.populations("d"), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn unpinning_a_never_opened_tree_while_it_is_populated_stops_and_frees_it() {
+	let world = unstarted();
+	world.unopened_tree();
+	let lists = world.drive.gate_calls(DriveCall::List);
+	let world = world.started().await;
+	world.local.user_pin(&root_path("d"), PinAttr::Pinned);
+	// `d`'s listing passes; `s`'s waits at the gate.
+	lists.add_permits(1);
+	world.run(Duration::from_secs(10)).await;
+	assert_eq!(world.on_disk(r"d\a.bin"), 5000);
+	assert_eq!(world.populations("d"), 1);
+	world.local.user_pin(&root_path("d"), PinAttr::Unpinned);
+	world.run(Duration::from_secs(10)).await;
+	world.drive.stop_gating(DriveCall::List);
+	lists.add_permits(16);
+	world.run(Duration::from_secs(30)).await;
+	assert_eq!(world.on_disk(r"d\a.bin"), 0, "freed as the unpin asks");
+	assert_eq!(world.created_under(r"d\s"), 0, "`s` was not populated");
+	assert_eq!(world.populations(r"d\s"), 0);
+	assert!(lock(&world.reports.0).contains(&LocalReport::Freed {
+		path: root_path(r"d\a.bin")
+	}));
+	assert_eq!(
+		world.local.entry(&root_path("d")).unwrap().pin,
+		PinAttr::Unspecified
+	);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_never_opened_folder_pinned_offline_is_populated_once_online_without_spinning() {
+	let world = unstarted();
+	let files = world.unopened_tree();
+	let world = world.started().await;
+	world.drive.set_offline(true);
+	world.local.user_pin(&root_path("d"), PinAttr::Pinned);
+	world.run(Duration::from_secs(120)).await;
+	assert_eq!(world.created_under("d"), 0);
+	let parked: Vec<LocalReport> = world
+		.parked()
+		.into_iter()
+		.filter(
+			|report| matches!(report, LocalReport::Parked { path, .. } if *path == root_path("d")),
+		)
+		.collect();
+	assert!(parked.len() <= 1, "reported at most once: {parked:?}");
+	// A job asking again at once would read the directory thousands of times in two minutes.
+	let looks = world.local.inspections(&root_path("d"));
+	assert!(looks < 100, "read {looks} times");
+	world.drive.set_offline(false);
+	world.run(WATCH_SAFETY_NET * 2).await;
+	for (path, size) in files {
+		assert_eq!(world.on_disk(path), size, "{path} hydrated");
+	}
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_user_listing_a_pinned_folder_as_the_provider_populates_it_places_each_item_once() {
+	let world = unstarted();
+	let files = world.unopened_tree();
+	let lists = world.drive.gate_calls(DriveCall::List);
+	let world = world.started().await;
+	world.local.user_pin(&root_path("d"), PinAttr::Pinned);
+	world.run(Duration::from_secs(2)).await;
+	// The provider's listing of `d` waits at the gate while a user lists `d`: the platform
+	// populates it, and the dispatcher hints it.
+	let d = world
+		.local
+		.entry(&root_path("d"))
+		.unwrap()
+		.identity
+		.unwrap();
+	let PlaceholderIdentity::Dir { uuid } = d else {
+		panic!("a directory");
+	};
+	let cache_id = dir_id(&uuid.to_string());
+	let specs: Vec<_> = world
+		.drive
+		.names(&cache_id)
+		.iter()
+		.map(|name| spec_for(&world.drive.child(&cache_id, name).unwrap()).unwrap())
+		.collect();
+	world.local.populate(&root_path("d"), &specs);
+	world.engine.hints().populated(d);
+	world.run(Duration::from_secs(2)).await;
+	world.drive.stop_gating(DriveCall::List);
+	lists.add_permits(16);
+	world.run(Duration::from_secs(30)).await;
+	assert_eq!(
+		world.created_under("d") - world.created_under(r"d\s"),
+		0,
+		"the user's listing placed `d`'s items"
+	);
+	assert_eq!(world.populations("d"), 0);
+	assert_eq!(
+		world.populations(r"d\s"),
+		1,
+		"`s`, never listed, the provider populates"
+	);
+	assert_eq!(
+		world.listed("d"),
+		[root_path(r"d\a.bin"), root_path(r"d\s")]
+	);
+	for (path, size) in files {
+		assert_eq!(world.on_disk(path), size, "{path} hydrated");
+	}
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_remote_folder_added_under_a_pinned_folder_arrives_populated_and_hydrated() {
+	let world = unstarted();
+	let dir = world.placed_dir("d");
+	world.local.user_pin(&root_path("d"), PinAttr::Pinned);
+	let world = world.started().await;
+	let new = world.remote_dir(&dir, "new");
+	world.drive.add_remote_file(&new, "x.bin", &pattern(6000));
+	let deeper = world.remote_dir(&new, "deeper");
+	world
+		.drive
+		.add_remote_file(&deeper, "y.bin", &pattern(7000));
+	world.run(Duration::from_secs(30)).await;
+	assert_eq!(world.on_disk(r"d\new\x.bin"), 6000);
+	assert_eq!(world.on_disk(r"d\new\deeper\y.bin"), 7000);
+	assert_eq!(
+		[
+			world.populations(r"d\new"),
+			world.populations(r"d\new\deeper")
+		],
+		[1, 1]
+	);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_never_opened_folder_with_a_name_windows_cannot_hold_skips_and_reports_it() {
+	let world = unstarted();
+	let d = world.unopened_dir(&root_dir(), "d");
+	world.drive.add_remote_file(&d, "ok.bin", &pattern(5000));
+	let bad = world.drive.add_remote_file(&d, "a:b.bin", &pattern(10));
+	let world = world.started().await;
+	world.local.user_pin(&root_path("d"), PinAttr::Pinned);
+	world.run(Duration::from_secs(20)).await;
+	assert_eq!(world.on_disk(r"d\ok.bin"), 5000);
+	assert_eq!(world.listed("d"), [root_path(r"d\ok.bin")]);
+	assert_eq!(world.populations("d"), 1, "populated with what it can hold");
+	let skipped = lock(&world.reports.1).clone();
+	assert_eq!(skipped.len(), 1);
+	assert_eq!(skipped[0].id(), bad.stable_uuid);
+	assert_eq!(skipped[0].name(), Some("a:b.bin"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_never_opened_folder_with_an_item_the_os_refuses_skips_and_reports_it() {
+	let world = unstarted();
+	let d = world.unopened_dir(&root_dir(), "d");
+	world.drive.add_remote_file(&d, "ok.bin", &pattern(5000));
+	let bad = world.drive.add_remote_file(&d, "refused.bin", &pattern(10));
+	let refused = OsError::Rejected { code: -1 };
+	world
+		.local
+		.fail_placements_named("refused.bin", LocalError::Os(refused));
+	let world = world.started().await;
+	world.local.user_pin(&root_path("d"), PinAttr::Pinned);
+	world.run(Duration::from_secs(20)).await;
+	assert_eq!(world.on_disk(r"d\ok.bin"), 5000);
+	assert_eq!(world.listed("d"), [root_path(r"d\ok.bin")]);
+	assert_eq!(world.populations("d"), 1, "populated with what it can hold");
+	assert_eq!(world.parked(), Vec::new());
+	let skipped = lock(&world.reports.1).clone();
+	assert_eq!(skipped.len(), 1, "{skipped:?}");
+	assert_eq!(skipped[0].id(), bad.stable_uuid);
+	assert_eq!(skipped[0].name(), Some("refused.bin"));
+	assert_eq!(skipped[0].reason(), &SkipReason::Refused(refused));
 }
 
 #[tokio::test(start_paused = true)]
@@ -1013,6 +1261,46 @@ async fn pinning_a_tree_larger_than_the_queue_hydrates_all_of_it() {
 	world.run(Duration::from_secs(120)).await;
 	for (path, size) in &files {
 		assert_eq!(world.on_disk(path), *size, "{path} hydrated");
+	}
+}
+
+#[tokio::test(start_paused = true)]
+async fn pinning_a_never_opened_tree_larger_than_the_queue_hydrates_all_of_it() {
+	let config = LocalConfig {
+		max_concurrent_jobs: NonZeroUsize::new(2).unwrap(),
+		max_concurrent_hydrations: NonZeroUsize::new(2).unwrap(),
+		max_queued: NonZeroUsize::new(8).unwrap(),
+		..LocalConfig::default()
+	};
+	let world = unstarted_with(config);
+	let dir = world.unopened_dir(&root_dir(), "d");
+	let mut files = Vec::new();
+	for n in 0..10 {
+		world
+			.drive
+			.add_remote_file(&dir, &format!("f{n}.bin"), &pattern(900 + n));
+		files.push((format!(r"d\f{n}.bin"), u64::try_from(900 + n).unwrap()));
+	}
+	for sub in 0..4 {
+		let made = world.remote_dir(&dir, &format!("s{sub}"));
+		for n in 0..12 {
+			world
+				.drive
+				.add_remote_file(&made, &format!("f{n}.bin"), &pattern(1000 + n));
+			files.push((
+				format!(r"d\s{sub}\f{n}.bin"),
+				u64::try_from(1000 + n).unwrap(),
+			));
+		}
+	}
+	let world = world.started().await;
+	world.local.user_pin(&root_path("d"), PinAttr::Pinned);
+	world.run(Duration::from_secs(300)).await;
+	for (path, size) in &files {
+		assert_eq!(world.on_disk(path), *size, "{path} hydrated");
+	}
+	for sub in 0..4 {
+		assert_eq!(world.populations(&format!(r"d\s{sub}")), 1);
 	}
 }
 

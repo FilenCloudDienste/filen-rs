@@ -18,11 +18,19 @@
 //! | pinned, not all on disk | completed, whatever is on disk, then checked |
 //! | all on disk, not yet checked | hashed and compared with its declared hash |
 //! | a pinned directory | the job queued on each of its items |
+//! | a pinned directory the platform has not populated | populated from the server, then as above |
 //!
 //! A pin is the nearest explicit one on the item or a directory above it (`attrib +P`, Explorer's
 //! "Always keep on this device"): measured, the platform hydrates nothing for it, and a pin set on
 //! a directory alone reaches no item in it, while one set recursively or inherited by a new item
 //! marks each item; the nearest explicit pin covers both. A child's own pin wins, as on iOS.
+//!
+//! Nor does the platform populate a pinned directory nothing has listed (measured from Explorer:
+//! its items waited for a listing, a subdirectory never listed for good), so the job populates it
+//! itself, through the remote side's reconcile ([`populate_pinned`]), and then queues the job on
+//! what it placed: a pinned tree ends on disk a directory at a time, each directory's items queued
+//! as the queue has room. An unpin meanwhile stops it at the next directory, whose job then finds
+//! no pin.
 //!
 //! A placeholder that is not clean is the local side's, which runs first on the same path; the
 //! job leaves it.
@@ -40,6 +48,7 @@ use super::{
 	jobs::{failed, local_failed},
 	lock,
 	queue::{Delay, Kind, Outcome},
+	remote::populate_pinned,
 	report::LocalReport,
 };
 use crate::{
@@ -263,7 +272,13 @@ pub(super) async fn run<D: Drive, L: LocalFs>(
 			Ok(inherited) => inherited,
 			Err(error) => return local_failed(error),
 		};
-		return settle_dir(inner, path, effective(state.pin(), inherited)).await;
+		return settle_dir(
+			inner,
+			path,
+			effective(state.pin(), inherited),
+			!state.partial(),
+		)
+		.await;
 	}
 	let Some(file) = CleanFile::from_entry(entry) else {
 		return Outcome::Done;
@@ -403,15 +418,22 @@ async fn unpin_dir<D: Drive, L: LocalFs>(
 
 /// Queues the job on each item of the clean directory placeholder at `path` whose pin, own or
 /// inherited, is `pin`, so each brings itself to the pin. Its items are listed only when the pin
-/// asks for work: a directory not populated yet lists none and is left so; its first listing
-/// populates it and queues the job on it again.
+/// asks for work, and a pinned directory not `populated` yet is populated first: a failed
+/// population (the drive offline) ends the job, which the queue tries again with its backoff.
 async fn settle_dir<D: Drive, L: LocalFs>(
 	inner: &Arc<Inner<D, L>>,
 	path: &RootPath,
 	pin: PinAttr,
+	populated: bool,
 ) -> Outcome {
 	if pin != PinAttr::Pinned {
 		return Outcome::Done;
+	}
+	if !populated {
+		match populate_pinned(inner, path).await {
+			Outcome::Done => {}
+			outcome => return outcome,
+		}
 	}
 	let dir = path.clone();
 	match inner.fs(move |local| local.list_dir(&dir)).await {

@@ -2,6 +2,14 @@
 //! and the directory does not gets a placeholder, a placeholder whose item moved, changed or went is
 //! queued for its remote job, and a name an ordinary item holds is left to the local side, which
 //! adopts the item when it equals the remote one and keeps both otherwise.
+//!
+//! The same reconcile populates a pinned directory the platform never populated (never listed), so
+//! what a pin covers ends on disk without the user listing each directory: listed from the server
+//! as a population is, every child placed, then the directory marked populated, last, so a listing
+//! by the user meanwhile still has the platform ask for its children. Measured (Windows 11, in the
+//! VM): a placeholder created in a directory not yet populated stays as it is when the platform
+//! populates the directory later, its entry in that population answered as already there, so
+//! whichever of the two places an item first keeps it, and the other leaves it.
 
 use std::{
 	collections::{HashMap, HashSet},
@@ -9,7 +17,7 @@ use std::{
 	time::Duration,
 };
 
-use filen_mobile_native_cache::ffi::FfiObject;
+use filen_mobile_native_cache::ffi::{FfiId, FfiObject, QueryChildrenResponse};
 use filen_sdk_rs::fs::name::collision_key;
 use filen_types::fs::Uuid;
 use tracing::{debug, warn};
@@ -27,9 +35,9 @@ use crate::{
 		report::{LocalReport, RemoteApplied},
 	},
 	log_safe::path_tag,
-	os::{LocalEntry, LocalError, LocalFs, PinAttr},
+	os::{LocalEntry, LocalError, LocalFileId, LocalFs, PinAttr},
 	placeholder::PlaceholderSpec,
-	populate::{SkippedItem, plan_entries},
+	populate::{SkipReason, SkippedItem, plan_entries},
 	root_path::{CaseKey, RootPath},
 };
 
@@ -40,6 +48,16 @@ const RENAME_AGAIN: Duration = Duration::from_millis(250);
 /// How many reconciles of a directory in a row may leave something for another job before it waits
 /// for the next walk: an item the reconcile cannot read or place would have it look every second.
 const MAX_DEFERRALS: u32 = 60;
+
+/// Which directory a reconcile works on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+	/// One the platform populated, from the cache's listing.
+	Populated,
+	/// A pinned one the platform has not populated, from the server's listing, then marked
+	/// populated once every child has its placeholder.
+	PinnedUnpopulated,
+}
 
 /// The reconcile of the directory at `dir`. It waits while a rename into the directory is allowed
 /// and not yet done as the drive has it: reading the children opens each, and the rename's target
@@ -52,17 +70,42 @@ pub(in crate::local) async fn children<D: Drive, L: LocalFs>(
 	inner: &Arc<Inner<D, L>>,
 	dir: &RootPath,
 ) -> Outcome {
+	reconcile(inner, dir, Mode::Populated).await
+}
+
+/// Populates the pinned directory at `dir`, which the platform has not populated, as the platform
+/// would on a listing: its children from the server, each placed as the reconcile places an item
+/// missing locally, then the directory marked populated. Placed into a pinned directory, a child
+/// takes its pin. Done at once when the directory is populated, no longer pinned once listed, or
+/// gone; an item left for another job has it tried again, as the reconcile does, and the
+/// directory is marked populated only once nothing is left.
+pub(in crate::local) async fn populate_pinned<D: Drive, L: LocalFs>(
+	inner: &Arc<Inner<D, L>>,
+	dir: &RootPath,
+) -> Outcome {
+	reconcile(inner, dir, Mode::PinnedUnpopulated).await
+}
+
+/// The reconcile of the directory at `dir` in `mode`, as [`children`] and [`populate_pinned`] say.
+async fn reconcile<D: Drive, L: LocalFs>(
+	inner: &Arc<Inner<D, L>>,
+	dir: &RootPath,
+	mode: Mode,
+) -> Outcome {
 	if renaming_into(inner, dir) {
 		return Outcome::Wait(RENAME_AGAIN);
 	}
-	let identity = match inner.inspect(dir).await {
+	let (identity, local_id) = match inner.inspect(dir).await {
 		Ok(LocalEntry::Placeholder {
 			identity:
 				Ok(identity @ (PlaceholderIdentity::Root { .. } | PlaceholderIdentity::Dir { .. })),
 			state,
+			id,
 			..
-		}) if !state.partial() => identity,
-		// Not populated, or not a directory placeholder any more: nothing of the drive's in it.
+		}) if state.partial() == (mode == Mode::PinnedUnpopulated) => (identity, id),
+		// Not a directory placeholder any more, or not populated: nothing of the drive's in it.
+		// Populated meanwhile, a pinned one is the platform's population's, whose hint reconciles
+		// it.
 		Ok(_) => return Outcome::Done,
 		Err(error) => return local_failed(error),
 	};
@@ -77,21 +120,20 @@ pub(in crate::local) async fn children<D: Drive, L: LocalFs>(
 		inner.push_kind(&other, Delay::Now, Kind::Remote);
 		return Outcome::Done;
 	}
+	let listing = match listed_children(inner, id, mode).await {
+		Ok(Some(listing)) => listing,
+		// Gone from the drive: the directory's own remote job deals with it.
+		Ok(None) => return Outcome::Done,
+		Err(outcome) => return outcome,
+	};
 	let pinned = match inner.pin_of(dir).await {
 		Ok(pin) => pin == PinAttr::Pinned,
 		Err(error) => return local_failed(error),
 	};
-	let listing = match inner.drive.cached_children(&id).await {
-		Ok(Some(listing)) => listing,
-		// The cache does not hold the directory: listed from the server instead.
-		Ok(None) => match inner.drive.list_children(id).await {
-			Ok(Some(listing)) => listing,
-			// Gone from the drive: the directory's own remote job deals with it.
-			Ok(None) => return Outcome::Done,
-			Err(error) => return failed(&error),
-		},
-		Err(error) => return failed(&error),
-	};
+	if mode == Mode::PinnedUnpopulated && !pinned {
+		// Unpinned while it was listed: left for a listing to populate.
+		return Outcome::Done;
+	}
 	let (specs, skipped) = plan_entries(&listing);
 	if !skipped.is_empty() {
 		inner.report_listed_skips(identity, skipped);
@@ -130,6 +172,7 @@ pub(in crate::local) async fn children<D: Drive, L: LocalFs>(
 		}
 	}
 	let mut deferred = false;
+	let mut refused = Vec::new();
 	let mut listed = HashSet::with_capacity(specs.len());
 	for spec in &specs {
 		let Some(uuid) = populated_uuid(spec.identity()) else {
@@ -181,8 +224,10 @@ pub(in crate::local) async fn children<D: Drive, L: LocalFs>(
 				{
 					Ok(()) => {
 						lock(&inner.state).index.insert(&at, uuid);
-						if pinned {
-							// Placed into a pinned directory: it arrives hydrated.
+						if pinned && mode == Mode::Populated {
+							// Placed into a pinned directory: it arrives hydrated. A directory
+							// populated here has its hydration job queue each item once done,
+							// waiting for room in the queue.
 							inner.push_kind(&at, Delay::Now, Kind::Hydration);
 						}
 						inner.report(LocalReport::Remote(RemoteApplied::Created {
@@ -191,6 +236,18 @@ pub(in crate::local) async fn children<D: Drive, L: LocalFs>(
 						}));
 					}
 					Err(LocalError::Exists) => deferred = true,
+					// Refused by the OS, as a population's entry can be: skipped and reported as
+					// the population skips it, so one item holds back neither the rest of the
+					// directory nor, for a pinned one, its hydration. The next reconcile tries it
+					// again.
+					Err(LocalError::Os(error)) => {
+						debug!(%at, %error, "the OS refused a remote item's placeholder");
+						refused.push(SkippedItem::new(
+							uuid.to_string(),
+							Some(spec.name().as_str().to_owned()),
+							SkipReason::Refused(error),
+						));
+					}
 					Err(error) => {
 						debug!(%at, %error, "placing a remote item failed");
 						deferred = true;
@@ -198,6 +255,9 @@ pub(in crate::local) async fn children<D: Drive, L: LocalFs>(
 				}
 			}
 		}
+	}
+	if !refused.is_empty() {
+		inner.report_listed_skips(identity, refused);
 	}
 	for (path, entry) in local.values() {
 		if let LocalEntry::Placeholder {
@@ -209,11 +269,16 @@ pub(in crate::local) async fn children<D: Drive, L: LocalFs>(
 			inner.push_kind(path, Delay::Now, Kind::Remote);
 		}
 	}
-	let mut state = lock(&inner.state);
 	if !deferred {
-		state.deferrals.remove(&dir.case_key());
-		return Outcome::Done;
+		lock(&inner.state).deferrals.remove(&dir.case_key());
+		return match mode {
+			Mode::Populated => Outcome::Done,
+			Mode::PinnedUnpopulated => {
+				mark_populated(inner, dir, local_id, identity, dir_uuid).await
+			}
+		};
 	}
+	let mut state = lock(&inner.state);
 	let deferrals = state.deferrals.entry(dir.case_key()).or_default();
 	*deferrals += 1;
 	if *deferrals < MAX_DEFERRALS {
@@ -223,6 +288,61 @@ pub(in crate::local) async fn children<D: Drive, L: LocalFs>(
 	drop(state);
 	warn!(dir = %path_tag(dir), "a reconcile kept leaving items for other jobs; waiting for the next walk");
 	Outcome::Park(Failure::Transient)
+}
+
+/// The children of the directory `id` the reconcile in `mode` works from: the cache's (from the
+/// server when it does not hold the directory) for a populated directory, the server's for one the
+/// platform never populated, as a population lists it, since the cache need not have listed it.
+async fn listed_children<D: Drive, L: LocalFs>(
+	inner: &Arc<Inner<D, L>>,
+	id: FfiId,
+	mode: Mode,
+) -> Result<Option<QueryChildrenResponse>, Outcome> {
+	if mode == Mode::Populated {
+		match inner.drive.cached_children(&id).await {
+			Ok(Some(listing)) => return Ok(Some(listing)),
+			// The cache does not hold the directory: listed from the server instead.
+			Ok(None) => {}
+			Err(error) => return Err(failed(&error)),
+		}
+	}
+	inner
+		.drive
+		.list_children(id)
+		.await
+		.map_err(|error| failed(&error))
+}
+
+/// Marks the directory placeholder `local_id` at `dir`, of `identity` (the index's `uuid`),
+/// populated, once the provider placed every child it lists; left as it is when the platform
+/// populated it meanwhile (a user listed it), whose hint reconciles it.
+async fn mark_populated<D: Drive, L: LocalFs>(
+	inner: &Arc<Inner<D, L>>,
+	dir: &RootPath,
+	local_id: LocalFileId,
+	identity: PlaceholderIdentity,
+	uuid: Uuid,
+) -> Outcome {
+	match inner.inspect(dir).await {
+		Ok(LocalEntry::Placeholder { id, state, .. }) if id == local_id && state.partial() => {}
+		Ok(_) => return Outcome::Done,
+		Err(error) => return local_failed(error),
+	}
+	let target = dir.clone();
+	match inner
+		.fs(move |local| local.set_dir_populated(&target, local_id, identity))
+		.await
+	{
+		Ok(()) => {
+			debug!(%dir, "populated a pinned directory");
+			let changed = lock(&inner.state).index.mark_populated(uuid);
+			if changed {
+				inner.populated_changed();
+			}
+			Outcome::Done
+		}
+		Err(error) => local_failed(error),
+	}
 }
 
 /// Where an item missing from a directory as just read has its placeholder, as the index says.

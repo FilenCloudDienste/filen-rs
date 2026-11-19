@@ -208,6 +208,8 @@ struct LocalState {
 	unrepresentable: HashSet<CaseKey>,
 	/// Every placeholder the provider creates fails with this, while set.
 	fail_placements: Option<LocalError>,
+	/// Every placeholder of one of these names the provider creates fails with the error.
+	fail_placements_named: HashMap<String, LocalError>,
 	/// Paths whose state reads fail with the error, while set.
 	fail_inspect: HashMap<CaseKey, LocalError>,
 	/// How often the provider read each path's state.
@@ -605,6 +607,7 @@ impl FakeLocal {
 			fail_completion: HashSet::new(),
 			unrepresentable: HashSet::new(),
 			fail_placements: None,
+			fail_placements_named: HashMap::new(),
 			fail_inspect: HashMap::new(),
 			inspected: HashMap::new(),
 			fail_list: HashMap::new(),
@@ -853,6 +856,13 @@ impl FakeLocal {
 	/// Fails every placeholder the provider creates from now on with `error`, or none with `None`.
 	pub fn fail_placements(&self, error: Option<LocalError>) {
 		self.state().fail_placements = error;
+	}
+
+	/// Fails every placeholder named `name` the provider creates from now on with `error`.
+	pub fn fail_placements_named(&self, name: &str, error: LocalError) {
+		self.state()
+			.fail_placements_named
+			.insert(name.to_owned(), error);
 	}
 
 	/// Makes every read of `path`'s state fail with `error` while it is set; `None` clears it.
@@ -1436,6 +1446,13 @@ impl FakeLocal {
 		let mut state = self.state();
 		if let Some(error) = state.fail_placements.filter(|_| record) {
 			return Err(error);
+		}
+		if let Some(error) = state
+			.fail_placements_named
+			.get(spec.name().as_str())
+			.filter(|_| record)
+		{
+			return Err(*error);
 		}
 		let path = parent.join(spec.name().clone());
 		if state.get(&path).is_some() {

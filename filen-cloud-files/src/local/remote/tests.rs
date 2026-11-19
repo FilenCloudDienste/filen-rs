@@ -24,7 +24,7 @@ use crate::{
 	dispatch::CloudFilesCallback,
 	failure::Failure,
 	identity::PlaceholderIdentity,
-	os::{Completed, LocalEntry, LocalError, LocalEvent, LocalFs, OsError, PinAttr},
+	os::{Completed, LocalEntry, LocalError, LocalEvent, LocalFs, PinAttr},
 	populate::{SkipReason, SkippedItem},
 	root_path::RootPath,
 	test_support::{DriveCall, DriveOp, FakeDrive, FakeLocal, LocalOp, root_path},
@@ -1464,9 +1464,7 @@ async fn a_reconcile_that_keeps_deferring_does_not_hold_back_its_directorys_remo
 	world
 		.drive
 		.add_remote_file(&dir_id(&uuid.to_string()), "b.txt", b"b");
-	world
-		.local
-		.fail_placements(Some(LocalError::Os(OsError::Rejected { code: -1 })));
+	world.local.fail_placements(Some(LocalError::Busy));
 	let world = world.started().await;
 	world.drive.remote_rename(uuid, "e");
 	world.settle().await;
@@ -1480,9 +1478,7 @@ async fn a_reconcile_that_keeps_deferring_waits_for_the_next_walk() {
 	world
 		.drive
 		.add_remote_file(&dir_id(&uuid.to_string()), "b.txt", b"b");
-	world
-		.local
-		.fail_placements(Some(LocalError::Os(OsError::Rejected { code: -1 })));
+	world.local.fail_placements(Some(LocalError::Busy));
 	let world = world.started().await;
 	world.run(Duration::from_secs(120)).await;
 	assert!(

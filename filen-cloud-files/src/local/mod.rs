@@ -1159,6 +1159,9 @@ impl<D: Drive, L: LocalFs> Inner<D, L> {
 						} else if state.pin() == PinAttr::Unpinned {
 							// Its unpin not yet passed down before a restart.
 							Some(Kind::Hydration)
+						} else if pin == PinAttr::Pinned && state.partial() {
+							// Pinned and never populated: its job populates it.
+							Some(Kind::Hydration)
 						} else {
 							None
 						}
