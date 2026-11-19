@@ -8,6 +8,7 @@ use filen_sdk_rs::fs::HasName;
 use filen_sdk_rs::fs::HasUUID;
 use filen_sdk_rs::sync::lock::ResourceLock;
 use filen_sdk_rs::sync_engine::{SyncEngine, SyncMode};
+use test_utils::with_versions_and_versioning;
 use tracing::Instrument;
 use uuid::Uuid;
 

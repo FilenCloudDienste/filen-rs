@@ -32,6 +32,8 @@ use filen_sdk_rs::sync_engine::{
 	ConflictResolution, PlannedAction, PlannedActionKind, SyncEvent, SyncReport, UnsyncablePath,
 	UnsyncableReason,
 };
+#[cfg(feature = "malformed")]
+use test_utils::{with_versioning, with_versions_and_versioning};
 use uuid::Uuid;
 
 mod helpers;

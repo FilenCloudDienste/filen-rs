@@ -1,6 +1,7 @@
 use std::{
 	borrow::Cow,
 	env, mem,
+	panic::{AssertUnwindSafe, resume_unwind},
 	path::Path,
 	sync::{Arc, Mutex, OnceLock, PoisonError},
 	time::Duration,
@@ -19,7 +20,7 @@ use filen_sdk_rs::{
 };
 use filen_types::api::v3::contacts::Contact;
 
-use futures::{StreamExt, stream::FuturesUnordered};
+use futures::{FutureExt, StreamExt, stream::FuturesUnordered};
 use tokio::sync::OnceCell;
 use tracing_subscriber::{
 	Layer,
@@ -495,6 +496,41 @@ pub async fn lock_chat(client: &Client) -> Arc<ResourceLock> {
 		.unwrap();
 	client.get_user_info().await.unwrap();
 	lock
+}
+
+/// Run `body` with the account's file-versioning setting at `enabled`, holding
+/// [`locks::USER_VERSIONING`], and put the setting back to what it was afterwards, also when `body`
+/// panics: a setting left changed would change what every later test on the shared account sees.
+/// For a test that lists file versions, [`with_versions_and_versioning`].
+pub async fn with_versioning<T>(
+	client: &Client,
+	enabled: bool,
+	body: impl Future<Output = T>,
+) -> T {
+	let _versioning_lock = client
+		.acquire_lock_with_default(locks::USER_VERSIONING)
+		.await
+		.unwrap();
+	let original = client.get_user_info().await.unwrap().versioning_enabled;
+	client.set_versioning_enabled(enabled).await.unwrap();
+	// Nothing that can fail may sit between the call above and this guard.
+	let outcome = AssertUnwindSafe(body).catch_unwind().await;
+	client.set_versioning_enabled(original).await.unwrap();
+	outcome.unwrap_or_else(|panic| resume_unwind(panic))
+}
+
+/// [`with_versioning`], also holding [`locks::VERSIONS`] (taken first, the order every test holding
+/// both uses) for a test that reads a file's version history.
+pub async fn with_versions_and_versioning<T>(
+	client: &Client,
+	enabled: bool,
+	body: impl Future<Output = T>,
+) -> T {
+	let _versions_lock = client
+		.acquire_lock_with_default(locks::VERSIONS)
+		.await
+		.unwrap();
+	with_versioning(client, enabled, body).await
 }
 
 pub async fn await_event<F, T>(
