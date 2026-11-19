@@ -17,7 +17,8 @@ pub const VERSIONS: &str = "test:versions";
 ///   it needs instead of assuming the account's.
 ///
 /// So a test holding either lock never runs while another test has the setting changed.
-/// [`crate::with_versioning`] does both.
+/// [`crate::with_versioning`] does both, and the wasm tests take the same two names in the same
+/// order.
 pub const USER_VERSIONING: &str = "test:user-versioning";
 
 /// The trash: emptying it is account-wide, so a test that trashes something and then looks for
