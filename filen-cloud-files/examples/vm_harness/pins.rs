@@ -65,6 +65,7 @@ fn run_all(s: &mut Scenarios) -> io::Result<()> {
 	pin_file(s)?;
 	pin_dir(s)?;
 	pin_dir_recursive(s)?;
+	pin_unopened(s);
 	new_under_pin(s);
 	bump_pinned(s)?;
 	free(s)?;
@@ -172,7 +173,8 @@ fn pin_file(s: &mut Scenarios) -> io::Result<()> {
 }
 
 /// P2a: `attrib +P` on a directory alone, which marks no item in it: the provider hydrates every
-/// file under it, in a populated subdirectory at once, and in one never listed once it is listed.
+/// file under it, in a populated subdirectory at once, and in one never listed too (the provider
+/// populates it itself; the scenario's listing of it then changes nothing).
 fn pin_dir(s: &mut Scenarios) -> io::Result<()> {
 	list(s, "px\\pa")?;
 	list(s, "px\\pa\\sub")?;
@@ -214,6 +216,48 @@ fn pin_dir_recursive(s: &mut Scenarios) -> io::Result<()> {
 		Err(error) => s.check("P2b-attrib", false, error),
 	}
 	Ok(())
+}
+
+/// P2c: `attrib +P` on the directory `px\pn` alone, which nothing ever listed, nor its
+/// subdirectory `deep` or `deep\deeper`: the provider populates each itself and hydrates every
+/// file. The scenario lists none of them and opens nothing under a directory before that
+/// directory reads populated (opening a path in a directory not yet populated has the platform
+/// populate it first, measured), so a population it finds is the provider's.
+fn pin_unopened(s: &mut Scenarios) {
+	let dirs = ["px\\pn", "px\\pn\\deep", "px\\pn\\deep\\deeper"];
+	s.info("P2c-before", format!("{:x?}", attributes(s, dirs[0])));
+	if !attrib_on(s, "P2c", &["+P"], dirs[0]) {
+		return;
+	}
+	let started = Instant::now();
+	for dir in dirs {
+		// A directory not yet populated reads offline and recalled on access (0x401410).
+		let populated = wait(PINNED_WITHIN, || {
+			attributes(s, dir).filter(|bits| full(*bits))
+		});
+		s.check(
+			&format!("P2c-populated-{dir}"),
+			populated.is_some(),
+			format!(
+				"attributes {:x?} after {:?}",
+				attributes(s, dir),
+				started.elapsed()
+			),
+		);
+		if populated.is_none() {
+			return;
+		}
+	}
+	expect_hydrated(
+		s,
+		"P2c-pin-unopened-hydrated",
+		&[
+			"px\\pn\\a.bin",
+			"px\\pn\\deep\\b.bin",
+			"px\\pn\\deep\\deeper\\c.bin",
+		],
+		false,
+	);
 }
 
 /// P3: a file another device adds under the pinned `px\pa` arrives hydrated.

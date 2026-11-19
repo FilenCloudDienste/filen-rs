@@ -44,6 +44,10 @@ pub(crate) const DIRS: &[(&str, u128)] = &[
 	("px\\pu", 0x3019),
 	("px\\pu\\sub", 0x301A),
 	("sx", 0x301B),
+	// Pinned while never listed, nor anything under it: the provider populates it all itself.
+	("px\\pn", 0x301C),
+	("px\\pn\\deep", 0x301D),
+	("px\\pn\\deep\\deeper", 0x301E),
 ];
 /// `emptydir/`, which has no children.
 pub(crate) const EMPTYDIR: Uuid = Uuid::from_u128(0x3003);
@@ -198,6 +202,9 @@ pub(crate) const FILES: &[TreeFile] = &[
 	file("sx\\conf.txt", 10_004, Content::Plain),
 	file("sx\\f1.txt", 10_005, Content::Plain),
 	file("sx\\pend.txt", 10_006, Content::Plain),
+	file("px\\pn\\a.bin", 9_016, Content::Plain),
+	file("px\\pn\\deep\\b.bin", 9_017, Content::Plain),
+	file("px\\pn\\deep\\deeper\\c.bin", 9_018, Content::Plain),
 ];
 
 /// Names in the root the core must skip, as Windows cannot hold them.
