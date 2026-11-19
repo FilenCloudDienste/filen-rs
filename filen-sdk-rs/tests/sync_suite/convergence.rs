@@ -8,7 +8,7 @@ use filen_sdk_rs::fs::HasName;
 use filen_sdk_rs::fs::HasUUID;
 use filen_sdk_rs::sync::lock::ResourceLock;
 use filen_sdk_rs::sync_engine::{SyncEngine, SyncMode};
-use test_utils::with_versions_and_versioning;
+use test_utils::with_versioning;
 use tracing::Instrument;
 use uuid::Uuid;
 
@@ -1729,7 +1729,7 @@ fn cached_stable_uuid(db_path: &std::path::Path, uuid: Uuid) -> Option<StableUui
 #[shared_test_runtime]
 async fn converge_a8_versioning_disabled_edit_keeps_one_lineage() {
 	let sc = single_client(SyncMode::TwoWay).await;
-	with_versions_and_versioning(&sc.resources.client, false, versioning_disabled_body(&sc)).await;
+	with_versioning(&sc.resources.client, false, versioning_disabled_body(&sc)).await;
 	sc.cleanup();
 }
 

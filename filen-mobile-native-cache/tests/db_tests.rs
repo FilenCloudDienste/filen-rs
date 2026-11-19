@@ -23,7 +23,7 @@ use filen_sdk_rs::{
 use filen_types::fs::Uuid;
 use futures::{StreamExt, future::BoxFuture, stream::FuturesUnordered};
 use rand::TryRng;
-use test_utils::TestResources;
+use test_utils::{TestResources, with_versioning};
 
 // Mirrors the app-side auth.json encryption (fileProvider.ts) so the file-init test exercises the
 // real decrypt path in FilenMobileCacheState::new: version(0x01) ++ nonce(12) ++ ciphertext ++ tag(16).
@@ -709,66 +709,61 @@ pub async fn test_remote_rename_and_edit_preserves_row_identity() {
 pub async fn test_versioning_disabled_edit_ghost_is_not_adopted() {
 	let (db, rss) = get_db_resources().await;
 
-	let _version_lock = rss
-		.client
-		.acquire_lock_with_default(test_utils::locks::VERSIONS)
-		.await
-		.unwrap();
-	rss.client.set_versioning_enabled(false).await.unwrap();
+	with_versioning(&rss.client, false, async {
+		let old_content = b"versioning off v1";
+		let old_file = rss
+			.client
+			.upload_file(
+				rss.client
+					.make_file_builder("versioning_off_ghost.txt", rss.dir.uuid())
+					.unwrap(),
+				old_content,
+			)
+			.await
+			.unwrap();
 
-	let old_content = b"versioning off v1";
-	let old_file = rss
-		.client
-		.upload_file(
-			rss.client
-				.make_file_builder("versioning_off_ghost.txt", rss.dir.uuid())
-				.unwrap(),
-			old_content,
-		)
-		.await
-		.unwrap();
+		let test_dir_path: FfiId =
+			format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
+		let file_path: FfiId = test_dir_path.join("versioning_off_ghost.txt");
 
-	let test_dir_path: FfiId =
-		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
-	let file_path: FfiId = test_dir_path.join("versioning_off_ghost.txt");
+		// prime the cache with the original row
+		let downloaded_path = db
+			.download_file_if_changed_by_path(file_path.clone(), None)
+			.await
+			.unwrap();
+		assert_eq!(std::fs::read(&downloaded_path).unwrap(), old_content);
 
-	// prime the cache with the original row
-	let downloaded_path = db
-		.download_file_if_changed_by_path(file_path.clone(), None)
-		.await
-		.unwrap();
-	assert_eq!(std::fs::read(&downloaded_path).unwrap(), old_content);
+		// edit remotely: in-place replace; the old uuid becomes the short-lived trashed ghost
+		let new_content = b"versioning off v2";
+		let new_file = rss
+			.client
+			.upload_file(
+				rss.client
+					.make_file_builder("versioning_off_ghost.txt", rss.dir.uuid())
+					.unwrap(),
+				new_content,
+			)
+			.await
+			.unwrap();
+		assert_ne!(new_file.uuid(), old_file.uuid());
+		assert_eq!(new_file.stable_uuid(), old_file.stable_uuid());
 
-	// edit remotely: in-place replace; the old uuid becomes the short-lived trashed ghost
-	let new_content = b"versioning off v2";
-	let new_file = rss
-		.client
-		.upload_file(
-			rss.client
-				.make_file_builder("versioning_off_ghost.txt", rss.dir.uuid())
-				.unwrap(),
-			new_content,
-		)
-		.await
-		.unwrap();
-	assert_ne!(new_file.uuid(), old_file.uuid());
-	assert_eq!(new_file.stable_uuid(), old_file.stable_uuid());
+		// the very next open revalidates the dead uuid against the ghost and must recover
+		let downloaded_path = db
+			.download_file_if_changed_by_path(file_path.clone(), None)
+			.await
+			.unwrap();
+		assert_eq!(std::fs::read(&downloaded_path).unwrap(), new_content);
 
-	// the very next open revalidates the dead uuid against the ghost and must recover
-	let downloaded_path = db
-		.download_file_if_changed_by_path(file_path.clone(), None)
-		.await
-		.unwrap();
-	assert_eq!(std::fs::read(&downloaded_path).unwrap(), new_content);
+		// the cached row self-healed to the new head and was never marked trashed
+		match db.query_item(&file_path).unwrap() {
+			Some(FfiObject::File(f)) => assert_eq!(f.uuid, new_file.uuid().to_string()),
+			other => panic!("expected the healed file row, got {other:?}"),
+		}
 
-	// the cached row self-healed to the new head and was never marked trashed
-	match db.query_item(&file_path).unwrap() {
-		Some(FfiObject::File(f)) => assert_eq!(f.uuid, new_file.uuid().to_string()),
-		other => panic!("expected the healed file row, got {other:?}"),
-	}
-
-	rss.client.set_versioning_enabled(true).await.unwrap();
-	std::fs::remove_file(&downloaded_path).ok();
+		std::fs::remove_file(&downloaded_path).ok();
+	})
+	.await;
 }
 
 #[shared_test_runtime]
@@ -5939,62 +5934,56 @@ pub async fn test_the_change_feed_follows_an_item_from_creation_to_deletion() {
 pub async fn test_a_versioning_disabled_edit_is_one_update_and_no_retirement() {
 	let (db, rss) = get_db_resources().await;
 
-	let _version_lock = rss
-		.client
-		.acquire_lock_with_default(test_utils::locks::VERSIONS)
-		.await
-		.unwrap();
-	rss.client.set_versioning_enabled(false).await.unwrap();
+	with_versioning(&rss.client, false, async {
+		let old_file = rss
+			.client
+			.upload_file(
+				rss.client
+					.make_file_builder("feed_versioning_off.txt", rss.dir.uuid())
+					.unwrap(),
+				b"versioning off v1",
+			)
+			.await
+			.unwrap();
 
-	let old_file = rss
-		.client
-		.upload_file(
-			rss.client
-				.make_file_builder("feed_versioning_off.txt", rss.dir.uuid())
-				.unwrap(),
-			b"versioning off v1",
-		)
-		.await
-		.unwrap();
+		let test_dir_path: FfiId =
+			format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
+		db.update_dir_children(test_dir_path.clone()).await.unwrap();
 
-	let test_dir_path: FfiId =
-		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
-	db.update_dir_children(test_dir_path.clone()).await.unwrap();
+		let anchor = db.current_sync_anchor().unwrap();
 
-	let anchor = db.current_sync_anchor().unwrap();
+		let new_file = rss
+			.client
+			.upload_file(
+				rss.client
+					.make_file_builder("feed_versioning_off.txt", rss.dir.uuid())
+					.unwrap(),
+				b"versioning off v2",
+			)
+			.await
+			.unwrap();
+		assert_ne!(new_file.uuid(), old_file.uuid());
+		assert_eq!(new_file.stable_uuid(), old_file.stable_uuid());
+		db.update_dir_children(test_dir_path).await.unwrap();
 
-	let new_file = rss
-		.client
-		.upload_file(
-			rss.client
-				.make_file_builder("feed_versioning_off.txt", rss.dir.uuid())
-				.unwrap(),
-			b"versioning off v2",
-		)
-		.await
-		.unwrap();
-	assert_ne!(new_file.uuid(), old_file.uuid());
-	assert_eq!(new_file.stable_uuid(), old_file.stable_uuid());
-	db.update_dir_children(test_dir_path).await.unwrap();
-
-	let changes = db.enumerate_changes(Some(anchor)).unwrap();
-	let stable = old_file.stable_uuid().to_string();
-	let edited = one_feed_file(&changes, &stable, "versioning-disabled edit");
-	assert_eq!(
-		edited.uuid,
-		new_file.uuid().to_string(),
-		"the feed must carry the new head, not the ghost the edit left behind"
-	);
-	assert!(
-		!feed_retires(&changes, &stable),
-		"the file's identity survived the edit; retiring it would evict the file"
-	);
-	assert!(
-		!feed_retires(&changes, &old_file.uuid().to_string()),
-		"a re-minted uuid is not an identity any replica was ever given"
-	);
-
-	rss.client.set_versioning_enabled(true).await.unwrap();
+		let changes = db.enumerate_changes(Some(anchor)).unwrap();
+		let stable = old_file.stable_uuid().to_string();
+		let edited = one_feed_file(&changes, &stable, "versioning-disabled edit");
+		assert_eq!(
+			edited.uuid,
+			new_file.uuid().to_string(),
+			"the feed must carry the new head, not the ghost the edit left behind"
+		);
+		assert!(
+			!feed_retires(&changes, &stable),
+			"the file's identity survived the edit; retiring it would evict the file"
+		);
+		assert!(
+			!feed_retires(&changes, &old_file.uuid().to_string()),
+			"a re-minted uuid is not an identity any replica was ever given"
+		);
+	})
+	.await;
 }
 
 // An anchor names a sequence in one incarnation of the database. A wipe reinitialises the schema
@@ -6269,59 +6258,53 @@ pub async fn test_update_and_query_item_follows_a_file_to_its_deletion() {
 pub async fn test_update_and_query_item_follows_a_versioning_disabled_edit() {
 	let (db, rss) = get_db_resources().await;
 
-	let _version_lock = rss
-		.client
-		.acquire_lock_with_default(test_utils::locks::VERSIONS)
-		.await
-		.unwrap();
-	rss.client.set_versioning_enabled(false).await.unwrap();
+	with_versioning(&rss.client, false, async {
+		let old_file = rss
+			.client
+			.upload_file(
+				rss.client
+					.make_file_builder("refresh_versioning_off.txt", rss.dir.uuid())
+					.unwrap(),
+				b"versioning off v1",
+			)
+			.await
+			.unwrap();
 
-	let old_file = rss
-		.client
-		.upload_file(
-			rss.client
-				.make_file_builder("refresh_versioning_off.txt", rss.dir.uuid())
-				.unwrap(),
-			b"versioning off v1",
-		)
-		.await
-		.unwrap();
+		let test_dir_path: FfiId =
+			format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
+		db.update_dir_children(test_dir_path).await.unwrap();
 
-	let test_dir_path: FfiId =
-		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
-	db.update_dir_children(test_dir_path).await.unwrap();
+		const EDITED: &[u8] = b"versioning off v2";
+		let new_file = rss
+			.client
+			.upload_file(
+				rss.client
+					.make_file_builder("refresh_versioning_off.txt", rss.dir.uuid())
+					.unwrap(),
+				EDITED,
+			)
+			.await
+			.unwrap();
+		assert_ne!(new_file.uuid(), old_file.uuid());
+		assert_eq!(new_file.stable_uuid(), old_file.stable_uuid());
 
-	const EDITED: &[u8] = b"versioning off v2";
-	let new_file = rss
-		.client
-		.upload_file(
-			rss.client
-				.make_file_builder("refresh_versioning_off.txt", rss.dir.uuid())
-				.unwrap(),
-			EDITED,
-		)
-		.await
-		.unwrap();
-	assert_ne!(new_file.uuid(), old_file.uuid());
-	assert_eq!(new_file.stable_uuid(), old_file.stable_uuid());
-
-	let stable = old_file.stable_uuid().to_string();
-	let head = match db
-		.update_and_query_item(format!("stable/{stable}").into())
-		.await
-		.unwrap()
-	{
-		Some(FfiObject::File(f)) => f,
-		other => panic!("expected the replaced file's head, got {other:?}"),
-	};
-	assert_eq!(head.uuid, new_file.uuid().to_string());
-	assert_eq!(usize::try_from(head.size).unwrap(), EDITED.len());
-	assert_eq!(
-		head.original_parent, None,
-		"the ghost the edit left behind is trashed; the head is not"
-	);
-
-	rss.client.set_versioning_enabled(true).await.unwrap();
+		let stable = old_file.stable_uuid().to_string();
+		let head = match db
+			.update_and_query_item(format!("stable/{stable}").into())
+			.await
+			.unwrap()
+		{
+			Some(FfiObject::File(f)) => f,
+			other => panic!("expected the replaced file's head, got {other:?}"),
+		};
+		assert_eq!(head.uuid, new_file.uuid().to_string());
+		assert_eq!(usize::try_from(head.size).unwrap(), EDITED.len());
+		assert_eq!(
+			head.original_parent, None,
+			"the ghost the edit left behind is trashed; the head is not"
+		);
+	})
+	.await;
 }
 
 // The same call over a directory, and over ids that name nothing. Both forms below still answer

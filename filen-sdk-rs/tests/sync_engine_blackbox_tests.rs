@@ -33,7 +33,7 @@ use filen_sdk_rs::sync_engine::{
 	UnsyncableReason,
 };
 #[cfg(feature = "malformed")]
-use test_utils::{with_versioning, with_versions_and_versioning};
+use test_utils::with_versioning;
 use uuid::Uuid;
 
 mod helpers;
@@ -1335,7 +1335,7 @@ async fn a_remote_file_not_matching_its_hash_is_skipped_until_it_changes() {
 async fn a_local_edit_uploads_over_a_remote_file_not_matching_its_hash() {
 	let fx = Fixture::new().await;
 	fx.wait_initial_converged().await;
-	with_versions_and_versioning(&fx.client, true, async {
+	with_versioning(&fx.client, true, async {
 		let synced = b"the content both sides synced";
 		let first = upload_remote(&fx, "bad.txt", synced).await;
 		let db = fx.db_path().to_path_buf();
@@ -1900,7 +1900,7 @@ async fn a_watched_pairs_marked_file_deleted_on_the_remote_ends_the_skip() {
 async fn a_watched_pairs_local_edit_uploads_over_a_marked_version() {
 	let fx = Fixture::new().await;
 	fx.wait_initial_converged().await;
-	with_versions_and_versioning(&fx.client, true, async {
+	with_versioning(&fx.client, true, async {
 		let engine = Arc::new(fx.open_engine().await);
 		let pair = engine
 			.add_pair(fx.local.clone(), fx.remote_uuid, SyncMode::TwoWay)

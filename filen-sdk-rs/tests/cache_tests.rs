@@ -22,6 +22,7 @@ use filen_sdk_rs::{
 };
 use filen_types::{api::v3::dir::color::DirColor, fs::ParentUuid, traits::CowHelpersExt};
 use rusqlite::params;
+use test_utils::with_versioning;
 use uuid::Uuid;
 
 mod helpers;
@@ -2227,102 +2228,85 @@ async fn test_cache_file_sync_root_follows_an_edit() {
 #[shared_test_runtime]
 async fn test_cache_file_sync_root_follows_a_versioning_disabled_edit() {
 	let resources = test_utils::RESOURCES.get_resources().await;
-	// Same order as the socket and user tests: version-chain lock, then the account-wide
-	// versioning-flag lock.
-	let _version_lock = resources
-		.client
-		.acquire_lock_with_default(test_utils::locks::VERSIONS)
-		.await
-		.unwrap();
-	let _versioning_lock = resources
-		.client
-		.acquire_lock_with_default(test_utils::locks::USER_VERSIONING)
-		.await
-		.unwrap();
-	resources
-		.client
-		.set_versioning_enabled(false)
-		.await
-		.unwrap();
+	with_versioning(&resources.client, false, async {
+		let client = derive_client(resources.client.as_ref());
+		let test_dir = &resources.dir;
+		let path = temp_cache_path();
+		client.configure_cache(path.clone(), |_| {}).await.unwrap();
 
-	let client = derive_client(resources.client.as_ref());
-	let test_dir = &resources.dir;
-	let path = temp_cache_path();
-	client.configure_cache(path.clone(), |_| {}).await.unwrap();
+		let file = client
+			.make_file_builder("file_root_vd_edit.txt", test_dir.uuid())
+			.unwrap();
+		let file = client.upload_file(file, b"v1").await.unwrap();
 
-	let file = client
-		.make_file_builder("file_root_vd_edit.txt", test_dir.uuid())
-		.unwrap();
-	let file = client.upload_file(file, b"v1").await.unwrap();
+		// What the file root is told is the difference between re-keying the row and deleting it:
+		// the retirement must reach it as the identity update it is, never as a removal.
+		let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+		let seen_cb = seen.clone();
+		let recording: SyncRootCallback =
+			Box::new(move |events: &mut dyn Iterator<Item = &CacheEvent<'_>>| {
+				seen_cb
+					.lock()
+					.unwrap()
+					.extend(events.map(|event| format!("{:?}", event.event)));
+			});
+		let _handle = client
+			.clone()
+			.add_file_sync_root(file.stable_uuid(), recording)
+			.await
+			.unwrap();
+		ensure_socket_ready(&client).await;
 
-	// What the file root is told is the difference between re-keying the row and deleting it:
-	// the retirement must reach it as the identity update it is, never as a removal.
-	let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-	let seen_cb = seen.clone();
-	let recording: SyncRootCallback =
-		Box::new(move |events: &mut dyn Iterator<Item = &CacheEvent<'_>>| {
-			seen_cb
-				.lock()
-				.unwrap()
-				.extend(events.map(|event| format!("{:?}", event.event)));
-		});
-	let _handle = client
-		.clone()
-		.add_file_sync_root(file.stable_uuid(), recording)
-		.await
-		.unwrap();
-	ensure_socket_ready(&client).await;
-
-	assert!(
-		poll_for_item(&path, file.uuid(), Duration::from_secs(30)).await,
-		"the convergence fetch populates the tracked file (nothing else can)"
-	);
-
-	// backend timestamps have a resolution of one second
-	tokio::time::sleep(Duration::from_secs(2)).await;
-	let edited = client
-		.upload_file(
-			client
-				.make_file_builder("file_root_vd_edit.txt", test_dir.uuid())
-				.unwrap(),
-			b"v2 contents",
-		)
-		.await
-		.unwrap();
-	assert_ne!(edited.uuid(), file.uuid(), "an edit re-mints the uuid");
-	assert_eq!(
-		edited.stable_uuid(),
-		file.stable_uuid(),
-		"the lineage's stable id moves to the successor"
-	);
-
-	assert!(
-		poll_for_item(&path, edited.uuid(), Duration::from_secs(30)).await,
-		"the tracked row is re-filed under the successor uuid"
-	);
-	assert!(
-		poll_for_item_absent(&path, file.uuid(), Duration::from_secs(30)).await,
-		"the superseded uuid is retired"
-	);
-	// The dispatch lands after the commit the polls observed, so give it a moment of its own.
-	let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-	loop {
-		let events = seen.lock().unwrap().clone();
-		if events.iter().any(|event| event.contains("Trashed")) {
-			assert!(
-				events.iter().all(|event| !event.contains("Removed")),
-				"no removal is ever dispatched for the tracked lineage: {events:?}"
-			);
-			break;
-		}
 		assert!(
-			tokio::time::Instant::now() < deadline,
-			"the retirement never reached the file root as an identity update: {events:?}"
+			poll_for_item(&path, file.uuid(), Duration::from_secs(30)).await,
+			"the convergence fetch populates the tracked file (nothing else can)"
 		);
-		tokio::time::sleep(Duration::from_millis(200)).await;
-	}
 
-	resources.client.set_versioning_enabled(true).await.unwrap();
+		// backend timestamps have a resolution of one second
+		tokio::time::sleep(Duration::from_secs(2)).await;
+		let edited = client
+			.upload_file(
+				client
+					.make_file_builder("file_root_vd_edit.txt", test_dir.uuid())
+					.unwrap(),
+				b"v2 contents",
+			)
+			.await
+			.unwrap();
+		assert_ne!(edited.uuid(), file.uuid(), "an edit re-mints the uuid");
+		assert_eq!(
+			edited.stable_uuid(),
+			file.stable_uuid(),
+			"the lineage's stable id moves to the successor"
+		);
+
+		assert!(
+			poll_for_item(&path, edited.uuid(), Duration::from_secs(30)).await,
+			"the tracked row is re-filed under the successor uuid"
+		);
+		assert!(
+			poll_for_item_absent(&path, file.uuid(), Duration::from_secs(30)).await,
+			"the superseded uuid is retired"
+		);
+		// The dispatch lands after the commit the polls observed, so give it a moment of its own.
+		let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+		loop {
+			let events = seen.lock().unwrap().clone();
+			if events.iter().any(|event| event.contains("Trashed")) {
+				assert!(
+					events.iter().all(|event| !event.contains("Removed")),
+					"no removal is ever dispatched for the tracked lineage: {events:?}"
+				);
+				break;
+			}
+			assert!(
+				tokio::time::Instant::now() < deadline,
+				"the retirement never reached the file root as an identity update: {events:?}"
+			);
+			tokio::time::sleep(Duration::from_millis(200)).await;
+		}
+	})
+	.await;
 }
 
 /// A tracked file TRASHED while the cache was closed. No socket event for it will ever be

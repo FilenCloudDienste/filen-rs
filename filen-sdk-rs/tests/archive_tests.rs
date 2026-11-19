@@ -40,6 +40,7 @@ use filen_sdk_rs::{
 	io::client_impl::IoSharedClientExt,
 };
 use filen_types::fs::Uuid;
+use test_utils::with_versioning;
 // Only the hash-mismatch test, which needs the `malformed` seam, reads these.
 #[cfg(feature = "malformed")]
 use {filen_sdk_rs::fs::HasParent, filen_types::fs::ParentUuid};
@@ -784,93 +785,80 @@ async fn deleting_sources_for_good_keeps_a_file_with_versions() {
 	// the version locks first, so this test never holds the drive lock while it waits for a
 	// test that holds them and writes to the drive
 	let client = test_utils::RESOURCES.client().await;
-	let _versions_lock = client
-		.acquire_lock_with_default(test_utils::locks::VERSIONS)
-		.await
-		.unwrap();
-	let _versioning_lock = client
-		.acquire_lock_with_default(test_utils::locks::USER_VERSIONING)
-		.await
-		.unwrap();
-	let (resources, _lock) = test_utils::RESOURCES.get_resources_with_lock().await;
-	let test_dir = &resources.dir;
-	let versioning = client.get_user_info().await.unwrap().versioning_enabled;
-	if !versioning {
-		client.set_versioning_enabled(true).await.unwrap();
-	}
+	with_versioning(&client, true, async {
+		let (resources, _lock) = test_utils::RESOURCES.get_resources_with_lock().await;
+		let test_dir = &resources.dir;
 
-	let sources = client
-		.create_dir(&test_dir.into(), "versioned")
-		.await
-		.unwrap();
-	upload(&client, &sources, "report.txt", b"first draft").await;
-	// the same name in the same folder: the server keeps the first as an older version
-	let versioned = upload(&client, &sources, "report.txt", b"final draft").await;
-	let single = upload(&client, &sources, "plain.txt", b"only draft").await;
-	assert!(
-		client.list_file_versions(&versioned).await.unwrap().len() >= 2,
-		"the second upload keeps the first as a version"
-	);
-	let destination = client
-		.create_dir(&test_dir.into(), "archives")
-		.await
-		.unwrap();
+		let sources = client
+			.create_dir(&test_dir.into(), "versioned")
+			.await
+			.unwrap();
+		upload(&client, &sources, "report.txt", b"first draft").await;
+		// the same name in the same folder: the server keeps the first as an older version
+		let versioned = upload(&client, &sources, "report.txt", b"final draft").await;
+		let single = upload(&client, &sources, "plain.txt", b"only draft").await;
+		assert!(
+			client.list_file_versions(&versioned).await.unwrap().len() >= 2,
+			"the second upload keeps the first as a version"
+		);
+		let destination = client
+			.create_dir(&test_dir.into(), "archives")
+			.await
+			.unwrap();
 
-	let (_, report) = compress(
-		&client,
-		CompressSources::Dispose {
-			how: SourceDisposal::DeletePermanently,
-			items: vec![
-				NonRootItemType::File(Cow::Owned(versioned.clone())),
-				NonRootItemType::File(Cow::Owned(single.clone())),
-			],
-		},
-		&destination,
-		"drafts.tar",
-		CompressFormat::Tar { compression: None },
-		None,
-	)
-	.await;
-	let outcome = |uuid| {
-		&report
-			.dispositions
-			.iter()
-			.find(|disposition| disposition.uuid == uuid)
-			.expect("every source is reported")
-			.outcome
-	};
-	assert!(
-		matches!(
-			outcome(versioned.uuid()),
-			DisposalOutcome::Kept {
-				reason: KeptReason::HasVersions,
-				..
-			}
-		),
-		"{:?}",
-		outcome(versioned.uuid())
-	);
-	assert!(
-		matches!(
-			outcome(single.uuid()),
-			DisposalOutcome::Disposed {
+		let (_, report) = compress(
+			&client,
+			CompressSources::Dispose {
 				how: SourceDisposal::DeletePermanently,
-				bytes_freed,
-			} if *bytes_freed == single.size()
-		),
-		"{:?}",
-		outcome(single.uuid())
-	);
-	let (_, left) = contents(&client, &sources).await;
-	let left: Vec<_> = left
-		.iter()
-		.map(|(path, file)| (path.as_str(), file.uuid()))
-		.collect();
-	assert_eq!(left, [("report.txt", versioned.uuid())]);
-
-	if !versioning {
-		client.set_versioning_enabled(false).await.unwrap();
-	}
+				items: vec![
+					NonRootItemType::File(Cow::Owned(versioned.clone())),
+					NonRootItemType::File(Cow::Owned(single.clone())),
+				],
+			},
+			&destination,
+			"drafts.tar",
+			CompressFormat::Tar { compression: None },
+			None,
+		)
+		.await;
+		let outcome = |uuid| {
+			&report
+				.dispositions
+				.iter()
+				.find(|disposition| disposition.uuid == uuid)
+				.expect("every source is reported")
+				.outcome
+		};
+		assert!(
+			matches!(
+				outcome(versioned.uuid()),
+				DisposalOutcome::Kept {
+					reason: KeptReason::HasVersions,
+					..
+				}
+			),
+			"{:?}",
+			outcome(versioned.uuid())
+		);
+		assert!(
+			matches!(
+				outcome(single.uuid()),
+				DisposalOutcome::Disposed {
+					how: SourceDisposal::DeletePermanently,
+					bytes_freed,
+				} if *bytes_freed == single.size()
+			),
+			"{:?}",
+			outcome(single.uuid())
+		);
+		let (_, left) = contents(&client, &sources).await;
+		let left: Vec<_> = left
+			.iter()
+			.map(|(path, file)| (path.as_str(), file.uuid()))
+			.collect();
+		assert_eq!(left, [("report.txt", versioned.uuid())]);
+	})
+	.await;
 }
 
 /// Items read through public links compress like the user's own, and an archive read through

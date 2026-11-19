@@ -20,7 +20,7 @@ use filen_types::{
 	fs::Uuid,
 	traits::CowHelpersExt,
 };
-use test_utils::{await_event, await_map_event, await_not_event};
+use test_utils::{await_event, await_map_event, await_not_event, with_versioning};
 
 #[shared_test_runtime]
 async fn test_websocket_auth() {
@@ -128,284 +128,281 @@ async fn test_websocket_file_events() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = &resources.client;
 
-	let _version_lock = client
-		.acquire_lock_with_default(test_utils::locks::VERSIONS)
-		.await
-		.unwrap();
-	client.set_versioning_enabled(true).await.unwrap();
+	with_versioning(client, true, async {
+		let dir = &resources.dir;
+		let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+		let _handle = client
+			.add_event_listener(
+				Box::new(move |event| {
+					let _ = sender.send(event.to_owned_cow());
+				}),
+				None,
+			)
+			.await
+			.unwrap();
 
-	let dir = &resources.dir;
-	let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
-	let _handle = client
-		.add_event_listener(
-			Box::new(move |event| {
-				let _ = sender.send(event.to_owned_cow());
-			}),
-			None,
+		let file_a = client.make_file_builder("file_a.txt", dir.uuid()).unwrap();
+		let mut file_a = client
+			.upload_file(file_a, b"file a contents")
+			.await
+			.unwrap();
+
+		let event = await_map_event(
+			&mut receiver,
+			|event| match event {
+				DecryptedSocketEvent::Drive {
+					inner: DecryptedDriveEvent::FileNew(data),
+					..
+				} => {
+					if data.0.uuid == file_a.uuid() {
+						Some(data)
+					} else {
+						None
+					}
+				}
+				_ => None,
+			},
+			Duration::from_secs(20),
+			"fileNew",
 		)
-		.await
-		.unwrap();
+		.await;
 
-	let file_a = client.make_file_builder("file_a.txt", dir.uuid()).unwrap();
-	let mut file_a = client
-		.upload_file(file_a, b"file a contents")
-		.await
-		.unwrap();
+		assert_eq!(event.0, file_a);
 
-	let event = await_map_event(
-		&mut receiver,
-		|event| match event {
-			DecryptedSocketEvent::Drive {
-				inner: DecryptedDriveEvent::FileNew(data),
-				..
-			} => {
-				if data.0.uuid == file_a.uuid() {
-					Some(data)
-				} else {
-					None
+		// Hold the trash lock across trash -> restore: another leg's account-global empty-trash
+		// (serialized on this lock) would permanently delete the file mid-window.
+		let _trash_lock = client
+			.acquire_lock_with_default(test_utils::locks::TRASH)
+			.await
+			.unwrap();
+		client.trash_file(&mut file_a).await.unwrap();
+		await_event(
+			&mut receiver,
+			|event| match event {
+				DecryptedSocketEvent::Drive {
+					inner: DecryptedDriveEvent::FileTrash(data),
+					..
+				} => data.uuid == file_a.uuid(),
+				_ => false,
+			},
+			Duration::from_secs(20),
+			"fileTrash",
+		)
+		.await;
+
+		client.restore_file(&mut file_a).await.unwrap();
+
+		let event = await_map_event(
+			&mut receiver,
+			|event| match event {
+				DecryptedSocketEvent::Drive {
+					inner: DecryptedDriveEvent::FileRestore(data),
+					..
+				} => {
+					if data.0.uuid == file_a.uuid() {
+						Some(data)
+					} else {
+						None
+					}
 				}
-			}
-			_ => None,
-		},
-		Duration::from_secs(20),
-		"fileNew",
-	)
-	.await;
+				_ => None,
+			},
+			Duration::from_secs(20),
+			"fileRestore",
+		)
+		.await;
 
-	assert_eq!(event.0, file_a);
+		assert_eq!(event.0, file_a);
 
-	// Hold the trash lock across trash -> restore: another leg's account-global empty-trash
-	// (serialized on this lock) would permanently delete the file mid-window.
-	let _trash_lock = client
-		.acquire_lock_with_default(test_utils::locks::TRASH)
-		.await
-		.unwrap();
-	client.trash_file(&mut file_a).await.unwrap();
-	await_event(
-		&mut receiver,
-		|event| match event {
-			DecryptedSocketEvent::Drive {
-				inner: DecryptedDriveEvent::FileTrash(data),
-				..
-			} => data.uuid == file_a.uuid(),
-			_ => false,
-		},
-		Duration::from_secs(20),
-		"fileTrash",
-	)
-	.await;
+		let old_file_a = file_a;
 
-	client.restore_file(&mut file_a).await.unwrap();
+		let file_a = client.make_file_builder("file_a.txt", dir.uuid()).unwrap();
+		let mut file_a = client
+			.upload_file(file_a, b"file b contents")
+			.await
+			.unwrap();
 
-	let event = await_map_event(
-		&mut receiver,
-		|event| match event {
-			DecryptedSocketEvent::Drive {
-				inner: DecryptedDriveEvent::FileRestore(data),
-				..
-			} => {
-				if data.0.uuid == file_a.uuid() {
-					Some(data)
-				} else {
-					None
+		// A versioning-ENABLED edit archives the old uuid as a version OF the lineage, so this
+		// event names the lineage — unlike the versioning-disabled `fileTrash`, which names the
+		// retired row (see `test_websocket_file_edit_versioning_disabled`).
+		let archived = await_map_event(
+			&mut receiver,
+			|event| match event {
+				DecryptedSocketEvent::Drive {
+					inner: DecryptedDriveEvent::FileArchived(file),
+					..
+				} if file.uuid == old_file_a.uuid() => Some(file),
+				_ => None,
+			},
+			Duration::from_secs(20),
+			"fileArchived",
+		)
+		.await;
+		assert_eq!(
+			archived.stable_uuid,
+			old_file_a.stable_uuid(),
+			"fileArchived names the lineage the version joined"
+		);
+		assert_eq!(
+			archived.new_uuid,
+			Some(file_a.uuid()),
+			"fileArchived from an edit points at its successor via newUUID"
+		);
+
+		client.set_file_favorite(&mut file_a, true).await.unwrap();
+		let event = await_map_event(
+			&mut receiver,
+			|event| match event {
+				DecryptedSocketEvent::Drive {
+					inner: DecryptedDriveEvent::ItemFavorite(inner),
+					..
+				} => {
+					if inner.0.uuid() == file_a.uuid() {
+						Some(inner)
+					} else {
+						None
+					}
 				}
-			}
-			_ => None,
-		},
-		Duration::from_secs(20),
-		"fileRestore",
-	)
-	.await;
+				_ => None,
+			},
+			Duration::from_secs(20),
+			"itemFavorite",
+		)
+		.await;
 
-	assert_eq!(event.0, file_a);
+		assert_eq!(event.0, NonRootItemType::File(Cow::Borrowed(&file_a)));
 
-	let old_file_a = file_a;
+		let old_version = client
+			.list_file_versions(&file_a)
+			.await
+			.unwrap()
+			.pop()
+			.unwrap();
 
-	let file_a = client.make_file_builder("file_a.txt", dir.uuid()).unwrap();
-	let mut file_a = client
-		.upload_file(file_a, b"file b contents")
-		.await
-		.unwrap();
+		client
+			.restore_file_version(&mut file_a, old_version)
+			.await
+			.unwrap();
 
-	// A versioning-ENABLED edit archives the old uuid as a version OF the lineage, so this
-	// event names the lineage — unlike the versioning-disabled `fileTrash`, which names the
-	// retired row (see `test_websocket_file_edit_versioning_disabled`).
-	let archived = await_map_event(
-		&mut receiver,
-		|event| match event {
-			DecryptedSocketEvent::Drive {
-				inner: DecryptedDriveEvent::FileArchived(file),
-				..
-			} if file.uuid == old_file_a.uuid() => Some(file),
-			_ => None,
-		},
-		Duration::from_secs(20),
-		"fileArchived",
-	)
-	.await;
-	assert_eq!(
-		archived.stable_uuid,
-		old_file_a.stable_uuid(),
-		"fileArchived names the lineage the version joined"
-	);
-	assert_eq!(
-		archived.new_uuid,
-		Some(file_a.uuid()),
-		"fileArchived from an edit points at its successor via newUUID"
-	);
-
-	client.set_file_favorite(&mut file_a, true).await.unwrap();
-	let event = await_map_event(
-		&mut receiver,
-		|event| match event {
-			DecryptedSocketEvent::Drive {
-				inner: DecryptedDriveEvent::ItemFavorite(inner),
-				..
-			} => {
-				if inner.0.uuid() == file_a.uuid() {
-					Some(inner)
-				} else {
-					None
-				}
-			}
-			_ => None,
-		},
-		Duration::from_secs(20),
-		"itemFavorite",
-	)
-	.await;
-
-	assert_eq!(event.0, NonRootItemType::File(Cow::Borrowed(&file_a)));
-
-	let old_version = client
-		.list_file_versions(&file_a)
-		.await
-		.unwrap()
-		.pop()
-		.unwrap();
-
-	client
-		.restore_file_version(&mut file_a, old_version)
-		.await
-		.unwrap();
-
-	let mut event = await_map_event(
-		&mut receiver,
-		|event| match event {
-			DecryptedSocketEvent::Drive {
-				inner: DecryptedDriveEvent::FileArchiveRestored(file),
-				..
-			} if file.file.uuid() == file_a.uuid() => Some(file),
-			_ => None,
-		},
-		Duration::from_secs(20),
-		"fileArchiveRestored",
-	)
-	.await;
-	if let (FileMeta::Decoded(event_meta), FileMeta::Decoded(meta)) =
-		(&mut event.file.meta, &file_a.meta)
-	{
-		// restore file version updates the last modified time to fix a bug in the old sync engine
+		let mut event = await_map_event(
+			&mut receiver,
+			|event| match event {
+				DecryptedSocketEvent::Drive {
+					inner: DecryptedDriveEvent::FileArchiveRestored(file),
+					..
+				} if file.file.uuid() == file_a.uuid() => Some(file),
+				_ => None,
+			},
+			Duration::from_secs(20),
+			"fileArchiveRestored",
+		)
+		.await;
+		if let (FileMeta::Decoded(event_meta), FileMeta::Decoded(meta)) =
+			(&mut event.file.meta, &file_a.meta)
+		{
+			// restore file version updates the last modified time to fix a bug in the old sync engine
+			// so we need to adjust that here before we assert_eq
+			event_meta.last_modified = meta.last_modified;
+		}
+		// og favorited status is kept in the event and listed history
+		// but is not set in the updated file during restore
 		// so we need to adjust that here before we assert_eq
-		event_meta.last_modified = meta.last_modified;
-	}
-	// og favorited status is kept in the event and listed history
-	// but is not set in the updated file during restore
-	// so we need to adjust that here before we assert_eq
-	event.file.favorited = file_a.favorited;
+		event.file.favorited = file_a.favorited;
 
-	assert_eq!(event.file, file_a);
+		assert_eq!(event.file, file_a);
 
-	await_event(
-		&mut receiver,
-		|event| match event {
-			DecryptedSocketEvent::Drive {
-				inner: DecryptedDriveEvent::FileMetadataChanged(data),
-				..
-			} => data.uuid == file_a.uuid(),
-			_ => false,
-		},
-		Duration::from_secs(20),
-		"fileMetadataChanged",
-	)
-	.await;
-
-	let new_name = "file_a_renamed.txt";
-
-	client
-		.update_file_metadata(
-			&mut file_a,
-			FileMetaChanges::default().name(new_name).unwrap(),
+		await_event(
+			&mut receiver,
+			|event| match event {
+				DecryptedSocketEvent::Drive {
+					inner: DecryptedDriveEvent::FileMetadataChanged(data),
+					..
+				} => data.uuid == file_a.uuid(),
+				_ => false,
+			},
+			Duration::from_secs(20),
+			"fileMetadataChanged",
 		)
-		.await
-		.unwrap();
+		.await;
 
-	let event = await_map_event(
-		&mut receiver,
-		|event| match event {
-			DecryptedSocketEvent::Drive {
-				inner: DecryptedDriveEvent::FileMetadataChanged(data),
-				..
-			} => {
-				if data.uuid == file_a.uuid() {
-					Some(data)
-				} else {
-					None
+		let new_name = "file_a_renamed.txt";
+
+		client
+			.update_file_metadata(
+				&mut file_a,
+				FileMetaChanges::default().name(new_name).unwrap(),
+			)
+			.await
+			.unwrap();
+
+		let event = await_map_event(
+			&mut receiver,
+			|event| match event {
+				DecryptedSocketEvent::Drive {
+					inner: DecryptedDriveEvent::FileMetadataChanged(data),
+					..
+				} => {
+					if data.uuid == file_a.uuid() {
+						Some(data)
+					} else {
+						None
+					}
 				}
-			}
-			_ => None,
-		},
-		Duration::from_secs(20),
-		"fileMetadataChanged",
-	)
-	.await;
+				_ => None,
+			},
+			Duration::from_secs(20),
+			"fileMetadataChanged",
+		)
+		.await;
 
-	assert_eq!(file_a.meta, event.metadata);
+		assert_eq!(file_a.meta, event.metadata);
 
-	let new_parent = client.create_dir(&dir.into(), "move_target").await.unwrap();
+		let new_parent = client.create_dir(&dir.into(), "move_target").await.unwrap();
 
-	client
-		.move_file(&mut file_a, &(&new_parent).into())
-		.await
-		.unwrap();
+		client
+			.move_file(&mut file_a, &(&new_parent).into())
+			.await
+			.unwrap();
 
-	let event = await_map_event(
-		&mut receiver,
-		|event| match event {
-			DecryptedSocketEvent::Drive {
-				inner: DecryptedDriveEvent::FileMove(data),
-				..
-			} => {
-				if data.0.uuid == file_a.uuid() {
-					Some(data)
-				} else {
-					None
+		let event = await_map_event(
+			&mut receiver,
+			|event| match event {
+				DecryptedSocketEvent::Drive {
+					inner: DecryptedDriveEvent::FileMove(data),
+					..
+				} => {
+					if data.0.uuid == file_a.uuid() {
+						Some(data)
+					} else {
+						None
+					}
 				}
-			}
-			_ => None,
-		},
-		Duration::from_secs(20),
-		"fileMove",
-	)
-	.await;
+				_ => None,
+			},
+			Duration::from_secs(20),
+			"fileMove",
+		)
+		.await;
 
-	assert_eq!(event.0, file_a);
+		assert_eq!(event.0, file_a);
 
-	let uuid = file_a.uuid();
+		let uuid = file_a.uuid();
 
-	client.delete_file_permanently(file_a).await.unwrap();
-	await_event(
-		&mut receiver,
-		|event| match event {
-			DecryptedSocketEvent::Drive {
-				inner: DecryptedDriveEvent::FileDeletedPermanent(data),
-				..
-			} => data.uuid == uuid,
-			_ => false,
-		},
-		Duration::from_secs(20),
-		"fileDeletedPermanent",
-	)
+		client.delete_file_permanently(file_a).await.unwrap();
+		await_event(
+			&mut receiver,
+			|event| match event {
+				DecryptedSocketEvent::Drive {
+					inner: DecryptedDriveEvent::FileDeletedPermanent(data),
+					..
+				} => data.uuid == uuid,
+				_ => false,
+			},
+			Duration::from_secs(20),
+			"fileDeletedPermanent",
+		)
+		.await;
+	})
 	.await;
 }
 
@@ -424,129 +421,117 @@ async fn test_websocket_file_edit_versioning_disabled() {
 	let client = &resources.client;
 	let dir = &resources.dir;
 
-	// Same order as user_tests::versioning_creates_versions_on_duplicate_upload:
-	// version-chain lock first, then the account-wide versioning-flag lock.
-	let _version_lock = client
-		.acquire_lock_with_default(test_utils::locks::VERSIONS)
-		.await
-		.unwrap();
-	let _versioning_lock = client
-		.acquire_lock_with_default(test_utils::locks::USER_VERSIONING)
-		.await
-		.unwrap();
+	with_versioning(client, false, async {
+		let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+		let _handle = client
+			.add_event_listener(
+				Box::new(move |event| {
+					let _ = sender.send(event.to_owned_cow());
+				}),
+				None,
+			)
+			.await
+			.unwrap();
 
-	client.set_versioning_enabled(false).await.unwrap();
+		let file = client
+			.make_file_builder("vd_edit_test.txt", dir.uuid())
+			.unwrap();
+		let first = client.upload_file(file, b"first contents").await.unwrap();
+		assert_eq!(
+			first.uuid(),
+			first.stable_uuid(),
+			"a fresh upload starts its lineage: stable_uuid == uuid"
+		);
 
-	let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
-	let _handle = client
-		.add_event_listener(
-			Box::new(move |event| {
-				let _ = sender.send(event.to_owned_cow());
-			}),
-			None,
-		)
-		.await
-		.unwrap();
-
-	let file = client
-		.make_file_builder("vd_edit_test.txt", dir.uuid())
-		.unwrap();
-	let first = client.upload_file(file, b"first contents").await.unwrap();
-	assert_eq!(
-		first.uuid(),
-		first.stable_uuid(),
-		"a fresh upload starts its lineage: stable_uuid == uuid"
-	);
-
-	await_event(
-		&mut receiver,
-		|event| match event {
-			DecryptedSocketEvent::Drive {
-				inner: DecryptedDriveEvent::FileNew(data),
-				..
-			} => data.0.uuid == first.uuid(),
-			_ => false,
-		},
-		Duration::from_secs(20),
-		"fileNew (first upload)",
-	)
-	.await;
-
-	let file = client
-		.make_file_builder("vd_edit_test.txt", dir.uuid())
-		.unwrap();
-	let second = client.upload_file(file, b"second contents").await.unwrap();
-
-	assert_ne!(second.uuid(), first.uuid(), "an edit re-mints the uuid");
-	assert_eq!(
-		second.stable_uuid(),
-		first.stable_uuid(),
-		"an edit keeps the lineage's stable id"
-	);
-
-	// fileNew(second) and fileTrash(first) arrive in no guaranteed order, and the
-	// await helpers discard non-matching events — record the fileNew while waiting
-	// for the trash so neither ordering loses it.
-	let mut saw_successor_file_new = false;
-	let trash = await_map_event(
-		&mut receiver,
-		|event| match event {
-			DecryptedSocketEvent::Drive {
-				inner: DecryptedDriveEvent::FileNew(data),
-				..
-			} if data.0.uuid == second.uuid() => {
-				assert_eq!(
-					data.0.stable_uuid(),
-					first.stable_uuid(),
-					"the successor's fileNew carries the lineage's stable id"
-				);
-				saw_successor_file_new = true;
-				None
-			}
-			DecryptedSocketEvent::Drive {
-				inner: DecryptedDriveEvent::FileTrash(data),
-				..
-			} if data.uuid == first.uuid() => Some(data),
-			_ => None,
-		},
-		Duration::from_secs(20),
-		"fileTrash (versioning-disabled edit)",
-	)
-	.await;
-
-	assert_ne!(
-		trash.stable_uuid,
-		first.stable_uuid(),
-		"a fileTrash with newUUID names the retired row's own stable id, never the lineage's"
-	);
-	assert_eq!(
-		trash.new_uuid,
-		Some(second.uuid()),
-		"fileTrash from an edit must point at its successor via newUUID"
-	);
-
-	if !saw_successor_file_new {
-		let successor_stable = await_map_event(
+		await_event(
 			&mut receiver,
 			|event| match event {
 				DecryptedSocketEvent::Drive {
 					inner: DecryptedDriveEvent::FileNew(data),
 					..
-				} if data.0.uuid == second.uuid() => Some(data.0.stable_uuid()),
+				} => data.0.uuid == first.uuid(),
+				_ => false,
+			},
+			Duration::from_secs(20),
+			"fileNew (first upload)",
+		)
+		.await;
+
+		let file = client
+			.make_file_builder("vd_edit_test.txt", dir.uuid())
+			.unwrap();
+		let second = client.upload_file(file, b"second contents").await.unwrap();
+
+		assert_ne!(second.uuid(), first.uuid(), "an edit re-mints the uuid");
+		assert_eq!(
+			second.stable_uuid(),
+			first.stable_uuid(),
+			"an edit keeps the lineage's stable id"
+		);
+
+		// fileNew(second) and fileTrash(first) arrive in no guaranteed order, and the
+		// await helpers discard non-matching events — record the fileNew while waiting
+		// for the trash so neither ordering loses it.
+		let mut saw_successor_file_new = false;
+		let trash = await_map_event(
+			&mut receiver,
+			|event| match event {
+				DecryptedSocketEvent::Drive {
+					inner: DecryptedDriveEvent::FileNew(data),
+					..
+				} if data.0.uuid == second.uuid() => {
+					assert_eq!(
+						data.0.stable_uuid(),
+						first.stable_uuid(),
+						"the successor's fileNew carries the lineage's stable id"
+					);
+					saw_successor_file_new = true;
+					None
+				}
+				DecryptedSocketEvent::Drive {
+					inner: DecryptedDriveEvent::FileTrash(data),
+					..
+				} if data.uuid == first.uuid() => Some(data),
 				_ => None,
 			},
 			Duration::from_secs(20),
-			"fileNew (successor of a versioning-disabled edit)",
+			"fileTrash (versioning-disabled edit)",
 		)
 		.await;
-		assert_eq!(
-			successor_stable,
-			first.stable_uuid(),
-			"the successor's fileNew carries the lineage's stable id"
-		);
-	}
 
-	client.set_versioning_enabled(true).await.unwrap();
+		assert_ne!(
+			trash.stable_uuid,
+			first.stable_uuid(),
+			"a fileTrash with newUUID names the retired row's own stable id, never the lineage's"
+		);
+		assert_eq!(
+			trash.new_uuid,
+			Some(second.uuid()),
+			"fileTrash from an edit must point at its successor via newUUID"
+		);
+
+		if !saw_successor_file_new {
+			let successor_stable = await_map_event(
+				&mut receiver,
+				|event| match event {
+					DecryptedSocketEvent::Drive {
+						inner: DecryptedDriveEvent::FileNew(data),
+						..
+					} if data.0.uuid == second.uuid() => Some(data.0.stable_uuid()),
+					_ => None,
+				},
+				Duration::from_secs(20),
+				"fileNew (successor of a versioning-disabled edit)",
+			)
+			.await;
+			assert_eq!(
+				successor_stable,
+				first.stable_uuid(),
+				"the successor's fileNew carries the lineage's stable id"
+			);
+		}
+	})
+	.await;
 }
 
 #[shared_test_runtime]

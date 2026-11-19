@@ -22,6 +22,7 @@ use filen_types::{
 };
 use futures::FutureExt;
 use rand::RngExt;
+use test_utils::with_versioning;
 
 fn file_meta_name<'a>(meta: &'a FileMeta<'_>) -> Option<&'a str> {
 	match meta {
@@ -93,19 +94,30 @@ const LOCK_PERSONAL_INFO: &str = "test:user-personal-info";
 #[shared_test_runtime]
 async fn versioning_toggle_round_trip() {
 	let client = test_utils::RESOURCES.client().await;
-	let _lock = client
-		.acquire_lock_with_default(test_utils::locks::USER_VERSIONING)
-		.await
-		.unwrap();
-	let original = client.get_user_info().await.unwrap().versioning_enabled;
-
-	client.set_versioning_enabled(!original).await.unwrap();
-	let toggled = client.get_user_info().await.unwrap().versioning_enabled;
-	assert_eq!(toggled, !original, "versioning flag should be inverted");
-
-	client.set_versioning_enabled(original).await.unwrap();
-	let restored = client.get_user_info().await.unwrap().versioning_enabled;
-	assert_eq!(restored, original, "versioning flag should be restored");
+	// Read under USER_VERSIONING, so no test has the setting changed while it is read. The lock is
+	// released before with_versioning takes VERSIONS, which keeps the order every test uses.
+	let settled_versioning = || async {
+		let _lock = client
+			.acquire_lock_with_default(test_utils::locks::USER_VERSIONING)
+			.await
+			.unwrap();
+		client.get_user_info().await.unwrap().versioning_enabled
+	};
+	let original = settled_versioning().await;
+	// Both values, so one of them differs from the account's: with_versioning reads the setting,
+	// sets it and puts the original back.
+	for enabled in [false, true] {
+		with_versioning(&client, enabled, async {
+			let seen = client.get_user_info().await.unwrap().versioning_enabled;
+			assert_eq!(seen, enabled, "the versioning flag should read back as set");
+		})
+		.await;
+	}
+	assert_eq!(
+		settled_versioning().await,
+		original,
+		"the versioning flag should be restored"
+	);
 }
 
 #[shared_test_runtime]
@@ -206,69 +218,50 @@ async fn versioning_creates_versions_on_duplicate_upload() {
 	let client = &resources.client;
 	let test_dir = &resources.dir;
 
-	let _version_lock = client
-		.acquire_lock_with_default(test_utils::locks::VERSIONS)
-		.await
-		.unwrap();
+	with_versioning(client, true, async {
+		let first = client
+			.make_file_builder("versioning-test.txt", test_dir.uuid())
+			.unwrap();
+		let first = client.upload_file(first, b"first content").await.unwrap();
+		tokio::time::sleep(Duration::from_secs(2)).await;
 
-	let _lock = client
-		.acquire_lock_with_default(test_utils::locks::USER_VERSIONING)
-		.await
-		.unwrap();
-	let original_versioning = client.get_user_info().await.unwrap().versioning_enabled;
+		let second = client
+			.make_file_builder("versioning-test.txt", test_dir.uuid())
+			.unwrap();
+		let second = client.upload_file(second, b"second content").await.unwrap();
 
-	if !original_versioning {
-		client.set_versioning_enabled(true).await.unwrap();
-	}
-
-	let restore_versioning = |enabled: bool| async move {
-		let client = test_utils::RESOURCES.client().await;
-		client.set_versioning_enabled(enabled).await.unwrap();
-	};
-
-	let first = client
-		.make_file_builder("versioning-test.txt", test_dir.uuid())
-		.unwrap();
-	let first = client.upload_file(first, b"first content").await.unwrap();
-	tokio::time::sleep(Duration::from_secs(2)).await;
-
-	let second = client
-		.make_file_builder("versioning-test.txt", test_dir.uuid())
-		.unwrap();
-	let second = client.upload_file(second, b"second content").await.unwrap();
-
-	let versions = client.list_file_versions(&second).await.unwrap();
-	assert!(
-		versions.len() >= 2,
-		"expected at least 2 versions (current + previous) with versioning enabled, got {}",
-		versions.len()
-	);
-	let expected_name = first.name().expect("first upload should have a name");
-	for v in &versions {
-		assert_eq!(
-			v.metadata().name(),
-			Some(expected_name),
-			"all versions should share the same filename"
+		let versions = client.list_file_versions(&second).await.unwrap();
+		assert!(
+			versions.len() >= 2,
+			"expected at least 2 versions (current + previous) with versioning enabled, got {}",
+			versions.len()
 		);
-	}
+		let expected_name = first.name().expect("first upload should have a name");
+		for v in &versions {
+			assert_eq!(
+				v.metadata().name(),
+				Some(expected_name),
+				"all versions should share the same filename"
+			);
+		}
 
-	client.set_versioning_enabled(false).await.unwrap();
-	tokio::time::sleep(Duration::from_secs(2)).await;
+		client.set_versioning_enabled(false).await.unwrap();
+		tokio::time::sleep(Duration::from_secs(2)).await;
 
-	let third = client
-		.make_file_builder("versioning-test.txt", test_dir.uuid())
-		.unwrap();
-	let third = client.upload_file(third, b"third content").await.unwrap();
+		let third = client
+			.make_file_builder("versioning-test.txt", test_dir.uuid())
+			.unwrap();
+		let third = client.upload_file(third, b"third content").await.unwrap();
 
-	let versions_after_disable = client.list_file_versions(&third).await.unwrap();
-	assert!(
-		versions_after_disable.len() <= versions.len(),
-		"versioning disabled should NOT grow the version chain (was {}, now {})",
-		versions.len(),
-		versions_after_disable.len()
-	);
-
-	restore_versioning(original_versioning).await;
+		let versions_after_disable = client.list_file_versions(&third).await.unwrap();
+		assert!(
+			versions_after_disable.len() <= versions.len(),
+			"versioning disabled should NOT grow the version chain (was {}, now {})",
+			versions.len(),
+			versions_after_disable.len()
+		);
+	})
+	.await;
 }
 
 #[shared_test_runtime]
@@ -591,45 +584,34 @@ async fn events_file_versioned_on_duplicate_upload() {
 	let dir = &resources.dir;
 	let since = chrono::Utc::now();
 
-	let _lock = client
-		.acquire_lock_with_default(test_utils::locks::USER_VERSIONING)
-		.await
-		.unwrap();
-	let original_versioning = client.get_user_info().await.unwrap().versioning_enabled;
-	if !original_versioning {
-		client.set_versioning_enabled(true).await.unwrap();
-	}
+	with_versioning(client, true, async {
+		let file_name = unique_name("versioned");
 
-	let file_name = unique_name("versioned");
+		let first = client.make_file_builder(&file_name, dir.uuid()).unwrap();
+		let _first = client.upload_file(first, b"v1").await.unwrap();
+		tokio::time::sleep(Duration::from_secs(2)).await;
 
-	let first = client.make_file_builder(&file_name, dir.uuid()).unwrap();
-	let _first = client.upload_file(first, b"v1").await.unwrap();
-	tokio::time::sleep(Duration::from_secs(2)).await;
+		let second = client.make_file_builder(&file_name, dir.uuid()).unwrap();
+		let _second = client.upload_file(second, b"v2").await.unwrap();
 
-	let second = client.make_file_builder(&file_name, dir.uuid()).unwrap();
-	let _second = client.upload_file(second, b"v2").await.unwrap();
-
-	// fileVersioned event for our filename should appear after the second upload
-	let versioned_event = poll_for_event(
-		client,
-		since,
-		|event| match &event.kind {
-			DecryptedUserEventKind::FileVersioned(info)
-				if file_meta_name(&info.metadata) == Some(file_name.as_str()) =>
-			{
-				Some(info.clone())
-			}
-			_ => None,
-		},
-		"fileVersioned",
-	)
+		// fileVersioned event for our filename should appear after the second upload
+		let versioned_event = poll_for_event(
+			client,
+			since,
+			|event| match &event.kind {
+				DecryptedUserEventKind::FileVersioned(info)
+					if file_meta_name(&info.metadata) == Some(file_name.as_str()) =>
+				{
+					Some(info.clone())
+				}
+				_ => None,
+			},
+			"fileVersioned",
+		)
+		.await;
+		assert_file_meta_name(&versioned_event.metadata, &file_name);
+	})
 	.await;
-	assert_file_meta_name(&versioned_event.metadata, &file_name);
-
-	// Restore previous versioning state
-	if !original_versioning {
-		client.set_versioning_enabled(false).await.unwrap();
-	}
 }
 
 #[shared_test_runtime]

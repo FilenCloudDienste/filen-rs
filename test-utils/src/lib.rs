@@ -498,15 +498,20 @@ pub async fn lock_chat(client: &Client) -> Arc<ResourceLock> {
 	lock
 }
 
-/// Run `body` with the account's file-versioning setting at `enabled`, holding
-/// [`locks::USER_VERSIONING`], and put the setting back to what it was afterwards, also when `body`
-/// panics: a setting left changed would change what every later test on the shared account sees.
-/// For a test that lists file versions, [`with_versions_and_versioning`].
+/// Run `body` with the account's file-versioning setting at `enabled`, holding [`locks::VERSIONS`]
+/// then [`locks::USER_VERSIONING`], and put the setting back to what it was afterwards, also when
+/// `body` panics: a setting left changed would change what every later test on the shared account
+/// sees. Every test that changes the setting runs it through here, and so does every test that
+/// relies on its value; see [`locks::USER_VERSIONING`].
 pub async fn with_versioning<T>(
 	client: &Client,
 	enabled: bool,
 	body: impl Future<Output = T>,
 ) -> T {
+	let _versions_lock = client
+		.acquire_lock_with_default(locks::VERSIONS)
+		.await
+		.unwrap();
 	let _versioning_lock = client
 		.acquire_lock_with_default(locks::USER_VERSIONING)
 		.await
@@ -517,20 +522,6 @@ pub async fn with_versioning<T>(
 	let outcome = AssertUnwindSafe(body).catch_unwind().await;
 	client.set_versioning_enabled(original).await.unwrap();
 	outcome.unwrap_or_else(|panic| resume_unwind(panic))
-}
-
-/// [`with_versioning`], also holding [`locks::VERSIONS`] (taken first, the order every test holding
-/// both uses) for a test that reads a file's version history.
-pub async fn with_versions_and_versioning<T>(
-	client: &Client,
-	enabled: bool,
-	body: impl Future<Output = T>,
-) -> T {
-	let _versions_lock = client
-		.acquire_lock_with_default(locks::VERSIONS)
-		.await
-		.unwrap();
-	with_versioning(client, enabled, body).await
 }
 
 pub async fn await_event<F, T>(

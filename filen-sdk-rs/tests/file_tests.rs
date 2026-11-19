@@ -34,7 +34,10 @@ use filen_sdk_rs::{
 use filen_types::fs::Uuid;
 use futures::AsyncReadExt;
 use rand::TryRng;
-use test_utils::upload_journal::{NotifyingJournalStore, resumable_upload_contents};
+use test_utils::{
+	upload_journal::{NotifyingJournalStore, resumable_upload_contents},
+	with_versioning,
+};
 
 async fn assert_file_upload_download_equal(name: &str, contents_len: usize) {
 	let mut contents = vec![0u8; contents_len];
@@ -451,50 +454,47 @@ async fn get_replaced_file() {
 
 	// replace-archives-a-version semantics require account-wide versioning to be ON; don't
 	// rely on ambient state (user_tests pins the versioning-off behavior)
-	let _version_lock = client
-		.acquire_lock_with_default(test_utils::locks::VERSIONS)
-		.await
-		.unwrap();
-	client.set_versioning_enabled(true).await.unwrap();
+	with_versioning(client, true, async {
+		let file = client
+			.make_file_builder("replaced.txt", test_dir.uuid())
+			.unwrap();
+		let old_file = client.upload_file(file, b"old contents").await.unwrap();
 
-	let file = client
-		.make_file_builder("replaced.txt", test_dir.uuid())
-		.unwrap();
-	let old_file = client.upload_file(file, b"old contents").await.unwrap();
+		let file = client
+			.make_file_builder("replaced.txt", test_dir.uuid())
+			.unwrap();
+		let new_file = client.upload_file(file, b"new contents").await.unwrap();
+		assert_ne!(old_file.uuid(), new_file.uuid());
 
-	let file = client
-		.make_file_builder("replaced.txt", test_dir.uuid())
-		.unwrap();
-	let new_file = client.upload_file(file, b"new contents").await.unwrap();
-	assert_ne!(old_file.uuid(), new_file.uuid());
+		// Stable identity across the replace: the first upload minted the lineage
+		// id (stable == uuid), and the replacing upload reports that it edited the
+		// existing lineage (stable == the original's id, != its own fresh uuid).
+		assert_eq!(old_file.stable_uuid(), old_file.uuid());
+		assert_eq!(new_file.stable_uuid(), old_file.uuid());
+		assert_ne!(new_file.stable_uuid(), new_file.uuid());
 
-	// Stable identity across the replace: the first upload minted the lineage
-	// id (stable == uuid), and the replacing upload reports that it edited the
-	// existing lineage (stable == the original's id, != its own fresh uuid).
-	assert_eq!(old_file.stable_uuid(), old_file.uuid());
-	assert_eq!(new_file.stable_uuid(), old_file.uuid());
-	assert_ne!(new_file.stable_uuid(), new_file.uuid());
+		let versions = client.list_file_versions(&new_file).await.unwrap();
+		assert_eq!(versions.len(), 2);
+		// every version row carries the single lineage stable id
+		for version in &versions {
+			assert_eq!(version.stable_uuid(), old_file.stable_uuid());
+		}
 
-	let versions = client.list_file_versions(&new_file).await.unwrap();
-	assert_eq!(versions.len(), 2);
-	// every version row carries the single lineage stable id
-	for version in &versions {
-		assert_eq!(version.stable_uuid(), old_file.stable_uuid());
-	}
+		let got_old = client.get_file(old_file.uuid()).await.unwrap();
+		assert_eq!(got_old, old_file);
 
-	let got_old = client.get_file(old_file.uuid()).await.unwrap();
-	assert_eq!(got_old, old_file);
-
-	// `versioned` is the discriminator the RemoteFile alone cannot carry.
-	let old_info = client.get_file_with_info(old_file.uuid()).await.unwrap();
-	assert!(old_info.versioned);
-	assert_eq!(old_info.file, old_file);
-	// a superseded uuid still resolves the lineage's stable id — this is how a
-	// cache can recover a file's identity after a remote edit
-	assert_eq!(old_info.file.stable_uuid(), old_file.stable_uuid());
-	let new_info = client.get_file_with_info(new_file.uuid()).await.unwrap();
-	assert!(!new_info.versioned);
-	assert_eq!(new_info.file, new_file);
+		// `versioned` is the discriminator the RemoteFile alone cannot carry.
+		let old_info = client.get_file_with_info(old_file.uuid()).await.unwrap();
+		assert!(old_info.versioned);
+		assert_eq!(old_info.file, old_file);
+		// a superseded uuid still resolves the lineage's stable id — this is how a
+		// cache can recover a file's identity after a remote edit
+		assert_eq!(old_info.file.stable_uuid(), old_file.stable_uuid());
+		let new_info = client.get_file_with_info(new_file.uuid()).await.unwrap();
+		assert!(!new_info.versioned);
+		assert_eq!(new_info.file, new_file);
+	})
+	.await;
 }
 
 #[shared_test_runtime]
@@ -724,86 +724,83 @@ async fn file_versions() {
 
 	let client = &resources.client;
 	let test_dir = &resources.dir;
-	let _version_lock = client
-		.acquire_lock_with_default(test_utils::locks::VERSIONS)
-		.await
-		.unwrap();
-	client.set_versioning_enabled(true).await.unwrap();
-
-	let mut versions = Vec::new();
-	// TODO: when backend supports size in version info, use different lengths for these strings
-	for content in ["Version 1", "Version a 2", "Version as 3", "Version asd 4"] {
-		let base_file = client.make_file_builder("test", test_dir.uuid()).unwrap();
-		let file = client
-			.upload_file(base_file, content.as_bytes())
-			.await
-			.unwrap();
-		// we do this because timestamps have a resolution of 1 second on the backend
-		tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-		versions.push((file, content));
-	}
-	let mut current = versions.pop().unwrap().0;
-
-	let mut listed_versions = client.list_file_versions(&current).await.unwrap();
-
-	let current_version = listed_versions.remove(0);
-
-	assert_eq!(current_version.metadata(), current.get_meta());
-	assert_eq!(current_version.timestamp(), current.timestamp);
-
-	assert_eq!(listed_versions.len(), versions.len());
-	for (listed, (expected, expected_content)) in
-		listed_versions.into_iter().zip(versions.iter_mut().rev())
-	{
-		assert_eq!(listed.metadata(), expected.get_meta());
-		assert_eq!(listed.size(), expected.size());
-		assert_eq!(listed.timestamp(), expected.timestamp());
-		client
-			.restore_file_version(&mut current, listed)
-			.await
-			.unwrap();
-		let downloaded = client.download_file(&current).await.unwrap();
-		assert_eq!(&downloaded, expected_content.as_bytes());
-		let mut old_last_modified = None;
-		if let (FileMeta::Decoded(expected_meta), FileMeta::Decoded(meta)) =
-			(&mut expected.meta, &current.meta)
-		{
-			// restore file version updates the last modified time to fix a bug in the old sync engine
-			// so we need to adjust that here before we assert_eq
-			old_last_modified = Some(expected_meta.last_modified);
-			expected_meta.last_modified = meta.last_modified;
+	with_versioning(client, true, async {
+		let mut versions = Vec::new();
+		// TODO: when backend supports size in version info, use different lengths for these strings
+		for content in ["Version 1", "Version a 2", "Version as 3", "Version asd 4"] {
+			let base_file = client.make_file_builder("test", test_dir.uuid()).unwrap();
+			let file = client
+				.upload_file(base_file, content.as_bytes())
+				.await
+				.unwrap();
+			// we do this because timestamps have a resolution of 1 second on the backend
+			tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+			versions.push((file, content));
 		}
-		assert_eq!(&current, expected);
+		let mut current = versions.pop().unwrap().0;
 
-		if let Some(old_last_modified) = old_last_modified {
-			if let FileMeta::Decoded(expected) = &mut expected.meta {
-				// undo the previous change for the next iteration
-				expected.last_modified = old_last_modified;
-			} else {
-				unreachable!();
+		let mut listed_versions = client.list_file_versions(&current).await.unwrap();
+
+		let current_version = listed_versions.remove(0);
+
+		assert_eq!(current_version.metadata(), current.get_meta());
+		assert_eq!(current_version.timestamp(), current.timestamp);
+
+		assert_eq!(listed_versions.len(), versions.len());
+		for (listed, (expected, expected_content)) in
+			listed_versions.into_iter().zip(versions.iter_mut().rev())
+		{
+			assert_eq!(listed.metadata(), expected.get_meta());
+			assert_eq!(listed.size(), expected.size());
+			assert_eq!(listed.timestamp(), expected.timestamp());
+			client
+				.restore_file_version(&mut current, listed)
+				.await
+				.unwrap();
+			let downloaded = client.download_file(&current).await.unwrap();
+			assert_eq!(&downloaded, expected_content.as_bytes());
+			let mut old_last_modified = None;
+			if let (FileMeta::Decoded(expected_meta), FileMeta::Decoded(meta)) =
+				(&mut expected.meta, &current.meta)
+			{
+				// restore file version updates the last modified time to fix a bug in the old sync engine
+				// so we need to adjust that here before we assert_eq
+				old_last_modified = Some(expected_meta.last_modified);
+				expected_meta.last_modified = meta.last_modified;
+			}
+			assert_eq!(&current, expected);
+
+			if let Some(old_last_modified) = old_last_modified {
+				if let FileMeta::Decoded(expected) = &mut expected.meta {
+					// undo the previous change for the next iteration
+					expected.last_modified = old_last_modified;
+				} else {
+					unreachable!();
+				}
 			}
 		}
-	}
 
-	// restoring the already-current version is a success no-op that leaves the
-	// file's identity untouched (the newest-first sort is by ORIGINAL upload
-	// timestamp, so after the restores above the head is not element 0 — pick
-	// it by uuid)
-	let head = client
-		.list_file_versions(&current)
-		.await
-		.unwrap()
-		.into_iter()
-		.find(|v| v.uuid() == current.uuid())
-		.expect("the live head must appear in its own version list");
-	let before_uuid = current.uuid();
-	let before_stable = current.stable_uuid();
-	client
-		.restore_file_version(&mut current, head)
-		.await
-		.unwrap();
-	assert_eq!(current.uuid(), before_uuid);
-	assert_eq!(current.stable_uuid(), before_stable);
+		// restoring the already-current version is a success no-op that leaves the
+		// file's identity untouched (the newest-first sort is by ORIGINAL upload
+		// timestamp, so after the restores above the head is not element 0 — pick
+		// it by uuid)
+		let head = client
+			.list_file_versions(&current)
+			.await
+			.unwrap()
+			.into_iter()
+			.find(|v| v.uuid() == current.uuid())
+			.expect("the live head must appear in its own version list");
+		let before_uuid = current.uuid();
+		let before_stable = current.stable_uuid();
+		client
+			.restore_file_version(&mut current, head)
+			.await
+			.unwrap();
+		assert_eq!(current.uuid(), before_uuid);
+		assert_eq!(current.stable_uuid(), before_stable);
+	})
+	.await;
 }
 
 /// HTTP provider tests.
@@ -1949,48 +1946,45 @@ async fn restore_file_version_reports_a_raced_head_as_stale() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = &resources.client;
 	let test_dir = &resources.dir;
-	let _version_lock = client
-		.acquire_lock_with_default(test_utils::locks::VERSIONS)
-		.await
-		.unwrap();
-	client.set_versioning_enabled(true).await.unwrap();
+	with_versioning(client, true, async {
+		let mut uploaded = Vec::new();
+		for content in ["v1", "vv2", "vvv3"] {
+			let builder = client
+				.make_file_builder("stale_restore", test_dir.uuid())
+				.unwrap();
+			uploaded.push(
+				client
+					.upload_file(builder, content.as_bytes())
+					.await
+					.unwrap(),
+			);
+			// backend timestamps have a resolution of one second
+			tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+		}
+		let head = uploaded.pop().unwrap();
+		let superseded = uploaded.pop().unwrap();
+		let oldest = uploaded.pop().unwrap();
+		assert_ne!(superseded.uuid(), head.uuid());
 
-	let mut uploaded = Vec::new();
-	for content in ["v1", "vv2", "vvv3"] {
-		let builder = client
-			.make_file_builder("stale_restore", test_dir.uuid())
-			.unwrap();
-		uploaded.push(
-			client
-				.upload_file(builder, content.as_bytes())
-				.await
-				.unwrap(),
+		let versions = client.list_file_versions(&head).await.unwrap();
+		let oldest_version = versions
+			.into_iter()
+			.find(|v| v.uuid() == oldest.uuid())
+			.expect("the first upload must still be listed as a version");
+
+		// The caller is still holding a head that has since been superseded.
+		let mut stale = superseded;
+		let err = client
+			.restore_file_version(&mut stale, oldest_version)
+			.await
+			.expect_err("restoring against a superseded head must fail");
+		assert_eq!(
+			err.kind(),
+			ErrorKind::StaleState,
+			"a raced restore must be reported as stale, got: {err:?}"
 		);
-		// backend timestamps have a resolution of one second
-		tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-	}
-	let head = uploaded.pop().unwrap();
-	let superseded = uploaded.pop().unwrap();
-	let oldest = uploaded.pop().unwrap();
-	assert_ne!(superseded.uuid(), head.uuid());
-
-	let versions = client.list_file_versions(&head).await.unwrap();
-	let oldest_version = versions
-		.into_iter()
-		.find(|v| v.uuid() == oldest.uuid())
-		.expect("the first upload must still be listed as a version");
-
-	// The caller is still holding a head that has since been superseded.
-	let mut stale = superseded;
-	let err = client
-		.restore_file_version(&mut stale, oldest_version)
-		.await
-		.expect_err("restoring against a superseded head must fail");
-	assert_eq!(
-		err.kind(),
-		ErrorKind::StaleState,
-		"a raced restore must be reported as stale, got: {err:?}"
-	);
+	})
+	.await;
 }
 
 // A restore that fails for a reason other than a lost race must not be reported as retryable —
@@ -2007,52 +2001,49 @@ async fn restore_file_version_does_not_report_a_deleted_version_as_stale() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = &resources.client;
 	let test_dir = &resources.dir;
-	let _version_lock = client
-		.acquire_lock_with_default(test_utils::locks::VERSIONS)
-		.await
-		.unwrap();
-	client.set_versioning_enabled(true).await.unwrap();
+	with_versioning(client, true, async {
+		let first = client
+			.upload_file(
+				client
+					.make_file_builder("stale_restore_deleted", test_dir.uuid())
+					.unwrap(),
+				b"v1",
+			)
+			.await
+			.unwrap();
+		// backend timestamps have a resolution of one second
+		tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+		let mut head = client
+			.upload_file(
+				client
+					.make_file_builder("stale_restore_deleted", test_dir.uuid())
+					.unwrap(),
+				b"vv2",
+			)
+			.await
+			.unwrap();
 
-	let first = client
-		.upload_file(
-			client
-				.make_file_builder("stale_restore_deleted", test_dir.uuid())
-				.unwrap(),
-			b"v1",
-		)
-		.await
-		.unwrap();
-	// backend timestamps have a resolution of one second
-	tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-	let mut head = client
-		.upload_file(
-			client
-				.make_file_builder("stale_restore_deleted", test_dir.uuid())
-				.unwrap(),
-			b"vv2",
-		)
-		.await
-		.unwrap();
+		let older = client
+			.list_file_versions(&head)
+			.await
+			.unwrap()
+			.into_iter()
+			.find(|v| v.uuid() == first.uuid())
+			.expect("the first upload must be listed as a version");
+		client.delete_file_version(older.clone()).await.unwrap();
 
-	let older = client
-		.list_file_versions(&head)
-		.await
-		.unwrap()
-		.into_iter()
-		.find(|v| v.uuid() == first.uuid())
-		.expect("the first upload must be listed as a version");
-	client.delete_file_version(older.clone()).await.unwrap();
-
-	// `current` is the live head, so nothing here is stale — the version is simply gone.
-	let err = client
-		.restore_file_version(&mut head, older)
-		.await
-		.expect_err("restoring a deleted version must fail");
-	assert_ne!(
-		err.kind(),
-		ErrorKind::StaleState,
-		"a deleted version is not a race and must not be reported as retryable, got: {err:?}"
-	);
+		// `current` is the live head, so nothing here is stale — the version is simply gone.
+		let err = client
+			.restore_file_version(&mut head, older)
+			.await
+			.expect_err("restoring a deleted version must fail");
+		assert_ne!(
+			err.kind(),
+			ErrorKind::StaleState,
+			"a deleted version is not a race and must not be reported as retryable, got: {err:?}"
+		);
+	})
+	.await;
 }
 
 /// A content edit re-mints the file's `uuid` — only the server-minted whole-life id follows the
