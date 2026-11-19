@@ -25,6 +25,7 @@ use filen_sdk_rs::{
 		SyncReport, WatchConfig,
 	},
 };
+use test_utils::with_versioning;
 
 use crate::harness::*;
 use crate::helpers::*;
@@ -1053,89 +1054,92 @@ async fn filter_hiding_everything_is_not_an_emptied_remote() {
 #[shared_test_runtime]
 async fn filter_unignore_local_to_remote_holds_the_destination_deletion() {
 	let sc = single_client(SyncMode::LocalToRemote).await;
-	write_file(&sc.local, "keep.txt", b"tracked");
-	write_file(&sc.local, "assets/photo.bin", b"v1");
-	let seed = sc.sync().await;
-	clean(&seed);
-	assert_eq!(seed.uploaded, 2, "{seed:?}");
+	// A same-name upload keeps the old file as a version (same stable id) only with versioning on.
+	with_versioning(&sc.resources.client, true, async {
+		write_file(&sc.local, "keep.txt", b"tracked");
+		write_file(&sc.local, "assets/photo.bin", b"v1");
+		let seed = sc.sync().await;
+		clean(&seed);
+		assert_eq!(seed.uploaded, 2, "{seed:?}");
 
-	write_file(&sc.local, ".filenignore", b"assets/\n");
-	let untracking = sc.sync().await;
-	clean(&untracking);
-	assert_eq!(
-		untracking.ignored,
-		vec![by_root_file("assets", "assets/", true)]
-	);
-	assert_eq!(untracking.remotely_trashed, 0, "{untracking:?}");
+		write_file(&sc.local, ".filenignore", b"assets/\n");
+		let untracking = sc.sync().await;
+		clean(&untracking);
+		assert_eq!(
+			untracking.ignored,
+			vec![by_root_file("assets", "assets/", true)]
+		);
+		assert_eq!(untracking.remotely_trashed, 0, "{untracking:?}");
 
-	// Another client changes the destination while the rule hides it: an edit of the file this
-	// device still holds, and a file only the remote has.
-	let assets = remote_dir_at(&sc, "assets").await;
-	let destination_copy =
-		upload_remote(&sc.cache, &assets, "photo.bin", b"v2 from the remote").await;
-	upload_remote(&sc.cache, &assets, "extra.bin", b"another client's").await;
-	let ignored = sc.sync().await;
-	clean(&ignored);
-	assert_eq!(
-		(ignored.uploaded, ignored.remotely_trashed),
-		(0, 0),
-		"an ignored path was synced: {ignored:?}"
-	);
-	assert_eq!(
-		ignored.ignored,
-		vec![by_root_file("assets", "assets/", false)]
-	);
+		// Another client changes the destination while the rule hides it: an edit of the file this
+		// device still holds, and a file only the remote has.
+		let assets = remote_dir_at(&sc, "assets").await;
+		let destination_copy =
+			upload_remote(&sc.cache, &assets, "photo.bin", b"v2 from the remote").await;
+		upload_remote(&sc.cache, &assets, "extra.bin", b"another client's").await;
+		let ignored = sc.sync().await;
+		clean(&ignored);
+		assert_eq!(
+			(ignored.uploaded, ignored.remotely_trashed),
+			(0, 0),
+			"an ignored path was synced: {ignored:?}"
+		);
+		assert_eq!(
+			ignored.ignored,
+			vec![by_root_file("assets", "assets/", false)]
+		);
 
-	write_file(&sc.local, ".filenignore", b"# nothing ignored\n");
-	let unignored = sc.sync().await;
-	clean(&unignored);
-	assert!(unignored.ignored.is_empty(), "{unignored:?}");
-	assert_eq!(
-		unignored.uploaded, 2,
-		"the edited .filenignore and the source's own copy of photo.bin: {unignored:?}"
-	);
-	assert!(
-		matches!(
-			unignored.guard,
-			Some(GuardReason::FirstSyncWithDeletions { deletions: 1 })
-		),
-		"{unignored:?}"
-	);
-	assert_eq!(unignored.remotely_trashed, 0, "{unignored:?}");
-	assert_eq!(
-		remote_bytes(&sc, "assets/photo.bin").await,
-		b"v1",
-		"the source overwrites the destination's copy"
-	);
-	// Overwrites it, never destroys it: the edit this device never saw is still on the path's version
-	// chain, which is what makes a one-way overwrite of an unseen copy safe to do unasked.
-	let head = remote_tree(&sc.cache.client, &sc.resources.dir)
-		.await
-		.remove("assets/photo.bin")
-		.flatten()
-		.expect("no remote file at assets/photo.bin");
-	let versions = sc.cache.client.list_file_versions(&head).await.unwrap();
-	assert!(
-		versions.iter().any(|v| v.uuid() == destination_copy.uuid()),
-		"the destination's copy did not survive as a server version: {versions:?}"
-	);
+		write_file(&sc.local, ".filenignore", b"# nothing ignored\n");
+		let unignored = sc.sync().await;
+		clean(&unignored);
+		assert!(unignored.ignored.is_empty(), "{unignored:?}");
+		assert_eq!(
+			unignored.uploaded, 2,
+			"the edited .filenignore and the source's own copy of photo.bin: {unignored:?}"
+		);
+		assert!(
+			matches!(
+				unignored.guard,
+				Some(GuardReason::FirstSyncWithDeletions { deletions: 1 })
+			),
+			"{unignored:?}"
+		);
+		assert_eq!(unignored.remotely_trashed, 0, "{unignored:?}");
+		assert_eq!(
+			remote_bytes(&sc, "assets/photo.bin").await,
+			b"v1",
+			"the source overwrites the destination's copy"
+		);
+		// Overwrites it, never destroys it: the edit this device never saw is still on the path's version
+		// chain, which is what makes a one-way overwrite of an unseen copy safe to do unasked.
+		let head = remote_tree(&sc.cache.client, &sc.resources.dir)
+			.await
+			.remove("assets/photo.bin")
+			.flatten()
+			.expect("no remote file at assets/photo.bin");
+		let versions = sc.cache.client.list_file_versions(&head).await.unwrap();
+		assert!(
+			versions.iter().any(|v| v.uuid() == destination_copy.uuid()),
+			"the destination's copy did not survive as a server version: {versions:?}"
+		);
 
-	let held = sc.sync().await;
-	clean(&held);
-	assert_eq!(
-		held.remotely_trashed, 0,
-		"the hold stands until it is approved: {held:?}"
-	);
-	let token = held.deletion_token.expect("the deletion is still held");
-	sc.engine.approve_deletions(sc.pair, &token).await;
-	let approved = sc.sync().await;
-	clean(&approved);
-	assert_eq!(approved.remotely_trashed, 1, "{approved:?}");
-	assert_eq!(
-		remote_paths(&sc.cache.client, &sc.resources.dir).await,
-		paths(&[".filenignore", "assets", "assets/photo.bin", "keep.txt"])
-	);
-
+		let held = sc.sync().await;
+		clean(&held);
+		assert_eq!(
+			held.remotely_trashed, 0,
+			"the hold stands until it is approved: {held:?}"
+		);
+		let token = held.deletion_token.expect("the deletion is still held");
+		sc.engine.approve_deletions(sc.pair, &token).await;
+		let approved = sc.sync().await;
+		clean(&approved);
+		assert_eq!(approved.remotely_trashed, 1, "{approved:?}");
+		assert_eq!(
+			remote_paths(&sc.cache.client, &sc.resources.dir).await,
+			paths(&[".filenignore", "assets", "assets/photo.bin", "keep.txt"])
+		);
+	})
+	.await;
 	sc.cleanup();
 }
 

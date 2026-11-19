@@ -78,6 +78,11 @@ async fn account_shows_the_email_and_settings_but_no_secret() {
 #[shared_test_runtime]
 async fn account_as_json_has_the_settings_the_sdk_reports() {
 	let client = test_utils::RESOURCES.client().await;
+	// Keeps a test that changes the versioning setting from doing so between the two reads.
+	let _versioning_lock = client
+		.acquire_lock_with_default(test_utils::locks::USER_VERSIONING)
+		.await
+		.unwrap();
 	let info = client.get_user_info().await.unwrap();
 
 	let assert = authenticated_cli_with_args!("account", "--json").success();

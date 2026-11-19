@@ -1684,41 +1684,45 @@ async fn test_cache_item_favorite_via_socket() {
 #[shared_test_runtime]
 async fn test_cache_file_archived_via_socket() {
 	let resources = test_utils::RESOURCES.get_resources().await;
-	let client = &resources.client;
-	let test_dir = &resources.dir;
-	let cache = TestCache::new(client, resources.dir.uuid()).await;
+	// A same-name upload keeps the old file as a version (same stable id) only with versioning on.
+	with_versioning(&resources.client, true, async {
+		let client = &resources.client;
+		let test_dir = &resources.dir;
+		let cache = TestCache::new(client, resources.dir.uuid()).await;
 
-	let file = client
-		.make_file_builder("cache_file_archive.txt", test_dir.uuid())
-		.unwrap();
-	let _original = client.upload_file(file, b"original content").await.unwrap();
-	let original_uuid: Uuid = _original.uuid();
+		let file = client
+			.make_file_builder("cache_file_archive.txt", test_dir.uuid())
+			.unwrap();
+		let _original = client.upload_file(file, b"original content").await.unwrap();
+		let original_uuid: Uuid = _original.uuid();
 
-	assert!(
-		poll_for_item(cache.db_path(), original_uuid, Duration::from_secs(30)).await,
-		"original file should appear in cache"
-	);
+		assert!(
+			poll_for_item(cache.db_path(), original_uuid, Duration::from_secs(30)).await,
+			"original file should appear in cache"
+		);
 
-	// Upload a new file with the same name — this archives the old one
-	let replacement = client
-		.make_file_builder("cache_file_archive.txt", test_dir.uuid())
-		.unwrap();
-	let replacement = client
-		.upload_file(replacement, b"replacement content")
-		.await
-		.unwrap();
-	let replacement_uuid: Uuid = replacement.uuid();
+		// Upload a new file with the same name — this archives the old one
+		let replacement = client
+			.make_file_builder("cache_file_archive.txt", test_dir.uuid())
+			.unwrap();
+		let replacement = client
+			.upload_file(replacement, b"replacement content")
+			.await
+			.unwrap();
+		let replacement_uuid: Uuid = replacement.uuid();
 
-	// Original should be removed (archived) from cache
-	assert!(
-		poll_for_item_absent(cache.db_path(), original_uuid, Duration::from_secs(30)).await,
-		"original file should be removed from cache after FileArchived event"
-	);
+		// Original should be removed (archived) from cache
+		assert!(
+			poll_for_item_absent(cache.db_path(), original_uuid, Duration::from_secs(30)).await,
+			"original file should be removed from cache after FileArchived event"
+		);
 
-	assert!(
-		poll_for_item(cache.db_path(), replacement_uuid, Duration::from_secs(30)).await,
-		"replacement file should appear in cache"
-	);
+		assert!(
+			poll_for_item(cache.db_path(), replacement_uuid, Duration::from_secs(30)).await,
+			"replacement file should appear in cache"
+		);
+	})
+	.await;
 }
 
 #[shared_test_runtime]
@@ -2177,49 +2181,53 @@ async fn test_cache_resync_reports_progress() {
 #[shared_test_runtime]
 async fn test_cache_file_sync_root_follows_an_edit() {
 	let resources = test_utils::RESOURCES.get_resources().await;
-	let client = derive_client(resources.client.as_ref());
-	let test_dir = &resources.dir;
-	let path = temp_cache_path();
-	client.configure_cache(path.clone(), |_| {}).await.unwrap();
+	// A same-name upload keeps the old file as a version (same stable id) only with versioning on.
+	with_versioning(&resources.client, true, async {
+		let client = derive_client(resources.client.as_ref());
+		let test_dir = &resources.dir;
+		let path = temp_cache_path();
+		client.configure_cache(path.clone(), |_| {}).await.unwrap();
 
-	let file = client
-		.make_file_builder("file_root_edit.txt", test_dir.uuid())
-		.unwrap();
-	let file = client.upload_file(file, b"v1").await.unwrap();
+		let file = client
+			.make_file_builder("file_root_edit.txt", test_dir.uuid())
+			.unwrap();
+		let file = client.upload_file(file, b"v1").await.unwrap();
 
-	let _handle = client
-		.clone()
-		.add_file_sync_root(file.stable_uuid(), noop_sync_root_callback())
-		.await
-		.unwrap();
-	ensure_socket_ready(&client).await;
+		let _handle = client
+			.clone()
+			.add_file_sync_root(file.stable_uuid(), noop_sync_root_callback())
+			.await
+			.unwrap();
+		ensure_socket_ready(&client).await;
 
-	assert!(
-		poll_for_item(&path, file.uuid(), Duration::from_secs(30)).await,
-		"the convergence fetch populates the tracked file (nothing else can)"
-	);
+		assert!(
+			poll_for_item(&path, file.uuid(), Duration::from_secs(30)).await,
+			"the convergence fetch populates the tracked file (nothing else can)"
+		);
 
-	// backend timestamps have a resolution of one second
-	tokio::time::sleep(Duration::from_secs(2)).await;
-	let edited = client
-		.upload_file(
-			client
-				.make_file_builder("file_root_edit.txt", test_dir.uuid())
-				.unwrap(),
-			b"v2 contents",
-		)
-		.await
-		.unwrap();
-	assert_ne!(edited.uuid(), file.uuid(), "an edit re-mints the uuid");
+		// backend timestamps have a resolution of one second
+		tokio::time::sleep(Duration::from_secs(2)).await;
+		let edited = client
+			.upload_file(
+				client
+					.make_file_builder("file_root_edit.txt", test_dir.uuid())
+					.unwrap(),
+				b"v2 contents",
+			)
+			.await
+			.unwrap();
+		assert_ne!(edited.uuid(), file.uuid(), "an edit re-mints the uuid");
 
-	assert!(
-		poll_for_item(&path, edited.uuid(), Duration::from_secs(30)).await,
-		"the tracked row is re-filed under the successor uuid"
-	);
-	assert!(
-		poll_for_item_absent(&path, file.uuid(), Duration::from_secs(30)).await,
-		"the superseded uuid is retired"
-	);
+		assert!(
+			poll_for_item(&path, edited.uuid(), Duration::from_secs(30)).await,
+			"the tracked row is re-filed under the successor uuid"
+		);
+		assert!(
+			poll_for_item_absent(&path, file.uuid(), Duration::from_secs(30)).await,
+			"the superseded uuid is retired"
+		);
+	})
+	.await;
 }
 /// The same edit on a versioning-DISABLED account. There the server retires the old uuid with a
 /// `fileTrash` whose stable id is the retired row's own freshly minted one — never the lineage's,

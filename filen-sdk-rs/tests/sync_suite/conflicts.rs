@@ -16,6 +16,7 @@ use filen_sdk_rs::fs::{HasName, HasUUID};
 use filen_sdk_rs::sync_engine::{
 	CONFIRM_TENURE, ConflictResolution, ConflictResolved, SyncEngine, SyncEvent, SyncMode,
 };
+use test_utils::with_versioning;
 use uuid::Uuid;
 
 use crate::harness::*;
@@ -2520,105 +2521,40 @@ async fn conflict_18_conflict_persists_across_restart() {
 #[shared_test_runtime]
 async fn conflict_26_same_round_edits_surface_on_the_superseded_client() {
 	let tc = two_clients(SyncMode::TwoWay).await;
-	let mut conflicts = BTreeSet::new();
+	// A same-name upload keeps the old file as a version (same stable id) only with versioning on.
+	with_versioning(&tc.resources.client, true, async {
+		let mut conflicts = BTreeSet::new();
 
-	// Converge a shared "BASE" on both sides.
-	write_file(&tc.local_a, "race.txt", b"BASE");
-	converge(
-		tc.peer_a(),
-		tc.peer_b(),
-		Order::AFirst,
-		&mut conflicts,
-		"c26-baseline",
-		|| trees_equal(&tc.local_a, &tc.local_b) && read_eq(&tc.local_b, "race.txt", b"BASE"),
-	)
-	.await;
-	assert!(
-		conflicts.is_empty(),
-		"the baseline round must be conflict-free: {conflicts:?}"
-	);
-
-	// Give BOTH clients a pass that lists the shared version as the remote head. That observation
-	// is what records BASE as the content both sides hold; without it neither side has an agreed
-	// content to measure the divergence below against, and the loser would just pull.
-	let (_d, files) = tc.list_root().await;
-	let base_uuid: Uuid = find_file(&files, "race.txt")
-		.expect("race.txt missing")
-		.uuid();
-	for cache in [&tc.cache_a, &tc.cache_b] {
+		// Converge a shared "BASE" on both sides.
+		write_file(&tc.local_a, "race.txt", b"BASE");
+		converge(
+			tc.peer_a(),
+			tc.peer_b(),
+			Order::AFirst,
+			&mut conflicts,
+			"c26-baseline",
+			|| trees_equal(&tc.local_a, &tc.local_b) && read_eq(&tc.local_b, "race.txt", b"BASE"),
+		)
+		.await;
 		assert!(
-			poll_for_item(cache.db_path(), base_uuid, CACHE_CONVERGE_TIMEOUT).await,
-			"a cache never listed the shared version"
+			conflicts.is_empty(),
+			"the baseline round must be conflict-free: {conflicts:?}"
 		);
-	}
-	let (rc_a, rc_b) = sync_round(
-		&tc.engine_a,
-		tc.pair_a,
-		&tc.engine_b,
-		tc.pair_b,
-		Order::AFirst,
-	)
-	.await;
-	assert!(rc_a.errors.is_empty(), "{rc_a:?}");
-	assert!(rc_b.errors.is_empty(), "{rc_b:?}");
 
-	// Let the clock leave the second the shared version was stamped in. The server records a
-	// version's time to the second, and the winner's side of this race is recognised by the buried
-	// version being LATER than the one its pass saw — inside one second the version chain cannot
-	// order them at all (see `plan::interleaved_version`). The race below is still one round.
-	tokio::time::sleep(Duration::from_millis(1500)).await;
-
-	// Both clients edit and push in the SAME round: the server linearises the two uploads, so one
-	// version ends up on top of the other and its author never saw its own push as the head.
-	write_file(&tc.local_a, "race.txt", b"A-EDIT");
-	write_file(&tc.local_b, "race.txt", b"B-EDIT-LONGER");
-	let (ra, rb) = sync_round(
-		&tc.engine_a,
-		tc.pair_a,
-		&tc.engine_b,
-		tc.pair_b,
-		Order::Concurrent,
-	)
-	.await;
-	assert!(ra.errors.is_empty(), "A errors: {:?}", ra.errors);
-	assert!(rb.errors.is_empty(), "B errors: {:?}", rb.errors);
-	assert_eq!(
-		ra.uploaded + rb.uploaded,
-		2,
-		"both clients must have pushed their edit: {ra:?} / {rb:?}"
-	);
-
-	// One of the two uploads is now the remote head; the other is a version underneath it. Both
-	// caches must be reading THAT state before the rounds below, never the intermediate one where
-	// a client still lists the version its own upload replaced: sampled there, the loser confirms
-	// its own push against the snapshot, and the round after it pulls the winner like an ordinary
-	// remote edit — the test would pass over an engine that never surfaced anything.
-	let (_d, files) = tc.list_root().await;
-	let head = find_file(&files, "race.txt").expect("race.txt missing after the concurrent round");
-	let head_uuid = head.uuid();
-	// Distinct-length sentinels, so the surviving size names the winner (see `remote_file_size_in`).
-	let b_won = head.size == b"B-EDIT-LONGER".len() as u64;
-	assert!(
-		b_won || head.size == b"A-EDIT".len() as u64,
-		"the head is neither client's edit: {} bytes",
-		head.size
-	);
-	assert_race_staged_inside_the_window(&tc, head, "c26").await;
-	for cache in [&tc.cache_a, &tc.cache_b] {
-		assert!(
-			poll_for_item(cache.db_path(), head_uuid, CACHE_CONVERGE_TIMEOUT).await,
-			"a cache never listed the version that won the race"
-		);
-	}
-
-	// The superseded client sees a foreign version of the same file on top of a push it never saw
-	// land. That is the conflict this test exists for; a held conflict need not converge, so the
-	// rounds below only collect what is reported — per client, because the two sides of one race
-	// hold DIFFERENT conflicts: the loser's is the foreign version sitting on its push, the
-	// winner's is the edit its own upload buried, which only the server's version chain shows.
-	let (mut from_a, mut from_b) = (BTreeSet::new(), BTreeSet::new());
-	for _ in 0..6 {
-		let (ra, rb) = sync_round(
+		// Give BOTH clients a pass that lists the shared version as the remote head. That observation
+		// is what records BASE as the content both sides hold; without it neither side has an agreed
+		// content to measure the divergence below against, and the loser would just pull.
+		let (_d, files) = tc.list_root().await;
+		let base_uuid: Uuid = find_file(&files, "race.txt")
+			.expect("race.txt missing")
+			.uuid();
+		for cache in [&tc.cache_a, &tc.cache_b] {
+			assert!(
+				poll_for_item(cache.db_path(), base_uuid, CACHE_CONVERGE_TIMEOUT).await,
+				"a cache never listed the shared version"
+			);
+		}
+		let (rc_a, rc_b) = sync_round(
 			&tc.engine_a,
 			tc.pair_a,
 			&tc.engine_b,
@@ -2626,112 +2562,182 @@ async fn conflict_26_same_round_edits_surface_on_the_superseded_client() {
 			Order::AFirst,
 		)
 		.await;
+		assert!(rc_a.errors.is_empty(), "{rc_a:?}");
+		assert!(rc_b.errors.is_empty(), "{rc_b:?}");
+
+		// Let the clock leave the second the shared version was stamped in. The server records a
+		// version's time to the second, and the winner's side of this race is recognised by the buried
+		// version being LATER than the one its pass saw — inside one second the version chain cannot
+		// order them at all (see `plan::interleaved_version`). The race below is still one round.
+		tokio::time::sleep(Duration::from_millis(1500)).await;
+
+		// Both clients edit and push in the SAME round: the server linearises the two uploads, so one
+		// version ends up on top of the other and its author never saw its own push as the head.
+		write_file(&tc.local_a, "race.txt", b"A-EDIT");
+		write_file(&tc.local_b, "race.txt", b"B-EDIT-LONGER");
+		let (ra, rb) = sync_round(
+			&tc.engine_a,
+			tc.pair_a,
+			&tc.engine_b,
+			tc.pair_b,
+			Order::Concurrent,
+		)
+		.await;
 		assert!(ra.errors.is_empty(), "A errors: {:?}", ra.errors);
 		assert!(rb.errors.is_empty(), "B errors: {:?}", rb.errors);
-		from_a.extend(ra.conflict_paths().map(str::to_string));
-		from_b.extend(rb.conflict_paths().map(str::to_string));
-		conflicts.extend(from_a.iter().chain(from_b.iter()).cloned());
-		if conflicts.iter().any(|c| c.contains("race.txt")) {
-			break;
-		}
-		tokio::time::sleep(Duration::from_millis(1500)).await;
-	}
-	let (loser, winner) = if b_won {
-		(&from_a, &from_b)
-	} else {
-		(&from_b, &from_a)
-	};
-	assert!(
-		loser.iter().any(|c| c.contains("race.txt")),
-		"a same-round edit by both clients must surface on the superseded client, not resolve \
-		 itself silently: {conflicts:?}"
-	);
-	// And the WINNER's side of the same race. Its upload was versioned on top of an edit it never
-	// saw: nothing it can read afterwards shows that — the remote head is its own copy and its
-	// baseline agrees — so the pass asks the server's version chain as the upload lands and holds
-	// what it buried. Without that, the overwritten edit is visible to nobody but its author.
-	assert!(
-		winner.iter().any(|c| c.contains("race.txt")),
-		"the client whose upload buried the other's edit must surface it too: {winner:?}"
-	);
-
-	// Neither edit was destroyed: both are still readable somewhere across the two trees.
-	assert!(
-		bytes_recoverable_anywhere(&tc.local_a, b"A-EDIT")
-			|| bytes_recoverable_anywhere(&tc.local_b, b"A-EDIT"),
-		"A's edit was destroyed — data loss"
-	);
-	assert!(
-		bytes_recoverable_anywhere(&tc.local_a, b"B-EDIT-LONGER")
-			|| bytes_recoverable_anywhere(&tc.local_b, b"B-EDIT-LONGER"),
-		"B's edit was destroyed — data loss"
-	);
-
-	// Resolve both halves and converge. The winner keeps BOTH — the version it buried comes back
-	// down beside its own copy under a name of its own — and the loser takes the head, whose bytes
-	// it is about to be handed anyway. Both clients must end up with both files, one per name.
-	let (win_engine, win_pair) = if b_won {
-		(&tc.engine_b, tc.pair_b)
-	} else {
-		(&tc.engine_a, tc.pair_a)
-	};
-	let (lose_engine, lose_pair) = if b_won {
-		(&tc.engine_a, tc.pair_a)
-	} else {
-		(&tc.engine_b, tc.pair_b)
-	};
-	let (won_bytes, lost_bytes): (&[u8], &[u8]) = if b_won {
-		(b"B-EDIT-LONGER", b"A-EDIT")
-	} else {
-		(b"A-EDIT", b"B-EDIT-LONGER")
-	};
-	assert_eq!(
-		win_engine
-			.resolve_conflict(win_pair, "race.txt", ConflictResolution::KeepBoth)
-			.await
-			.unwrap(),
-		ConflictResolved {
-			quarantined: None,
-			kept_as: Some("race.old.txt".to_string()),
-		},
-		"keep-both leaves its copy in the tree, not in the bin, and names it"
-	);
-	let gave_way = lose_engine
-		.resolve_conflict(lose_pair, "race.txt", ConflictResolution::KeepRemote)
-		.await
-		.unwrap()
-		.quarantined
-		.expect("the side that gave way must be told where its own copy went");
-	assert_eq!(
-		std::fs::read(&gave_way).unwrap().as_slice(),
-		lost_bytes,
-		"the named path does not hold the copy that gave way"
-	);
-
-	converge(
-		tc.peer_a(),
-		tc.peer_b(),
-		Order::AFirst,
-		&mut conflicts,
-		"c26-resolved",
-		|| {
-			[&tc.local_a, &tc.local_b].iter().all(|root| {
-				read_eq(root, "race.txt", won_bytes) && read_eq(root, "race.old.txt", lost_bytes)
-			})
-		},
-	)
-	.await;
-
-	// One file per name on the remote: keeping both added a file, it did not duplicate one.
-	let (_d, files) = tc.list_root().await;
-	for name in ["race.txt", "race.old.txt"] {
 		assert_eq!(
-			files.iter().filter(|f| f.name() == Some(name)).count(),
-			1,
-			"{name} exists more than once on the remote after resolving"
+			ra.uploaded + rb.uploaded,
+			2,
+			"both clients must have pushed their edit: {ra:?} / {rb:?}"
 		);
-	}
 
+		// One of the two uploads is now the remote head; the other is a version underneath it. Both
+		// caches must be reading THAT state before the rounds below, never the intermediate one where
+		// a client still lists the version its own upload replaced: sampled there, the loser confirms
+		// its own push against the snapshot, and the round after it pulls the winner like an ordinary
+		// remote edit — the test would pass over an engine that never surfaced anything.
+		let (_d, files) = tc.list_root().await;
+		let head =
+			find_file(&files, "race.txt").expect("race.txt missing after the concurrent round");
+		let head_uuid = head.uuid();
+		// Distinct-length sentinels, so the surviving size names the winner (see `remote_file_size_in`).
+		let b_won = head.size == b"B-EDIT-LONGER".len() as u64;
+		assert!(
+			b_won || head.size == b"A-EDIT".len() as u64,
+			"the head is neither client's edit: {} bytes",
+			head.size
+		);
+		assert_race_staged_inside_the_window(&tc, head, "c26").await;
+		for cache in [&tc.cache_a, &tc.cache_b] {
+			assert!(
+				poll_for_item(cache.db_path(), head_uuid, CACHE_CONVERGE_TIMEOUT).await,
+				"a cache never listed the version that won the race"
+			);
+		}
+
+		// The superseded client sees a foreign version of the same file on top of a push it never saw
+		// land. That is the conflict this test exists for; a held conflict need not converge, so the
+		// rounds below only collect what is reported — per client, because the two sides of one race
+		// hold DIFFERENT conflicts: the loser's is the foreign version sitting on its push, the
+		// winner's is the edit its own upload buried, which only the server's version chain shows.
+		let (mut from_a, mut from_b) = (BTreeSet::new(), BTreeSet::new());
+		for _ in 0..6 {
+			let (ra, rb) = sync_round(
+				&tc.engine_a,
+				tc.pair_a,
+				&tc.engine_b,
+				tc.pair_b,
+				Order::AFirst,
+			)
+			.await;
+			assert!(ra.errors.is_empty(), "A errors: {:?}", ra.errors);
+			assert!(rb.errors.is_empty(), "B errors: {:?}", rb.errors);
+			from_a.extend(ra.conflict_paths().map(str::to_string));
+			from_b.extend(rb.conflict_paths().map(str::to_string));
+			conflicts.extend(from_a.iter().chain(from_b.iter()).cloned());
+			if conflicts.iter().any(|c| c.contains("race.txt")) {
+				break;
+			}
+			tokio::time::sleep(Duration::from_millis(1500)).await;
+		}
+		let (loser, winner) = if b_won {
+			(&from_a, &from_b)
+		} else {
+			(&from_b, &from_a)
+		};
+		assert!(
+			loser.iter().any(|c| c.contains("race.txt")),
+			"a same-round edit by both clients must surface on the superseded client, not resolve \
+		 itself silently: {conflicts:?}"
+		);
+		// And the WINNER's side of the same race. Its upload was versioned on top of an edit it never
+		// saw: nothing it can read afterwards shows that — the remote head is its own copy and its
+		// baseline agrees — so the pass asks the server's version chain as the upload lands and holds
+		// what it buried. Without that, the overwritten edit is visible to nobody but its author.
+		assert!(
+			winner.iter().any(|c| c.contains("race.txt")),
+			"the client whose upload buried the other's edit must surface it too: {winner:?}"
+		);
+
+		// Neither edit was destroyed: both are still readable somewhere across the two trees.
+		assert!(
+			bytes_recoverable_anywhere(&tc.local_a, b"A-EDIT")
+				|| bytes_recoverable_anywhere(&tc.local_b, b"A-EDIT"),
+			"A's edit was destroyed — data loss"
+		);
+		assert!(
+			bytes_recoverable_anywhere(&tc.local_a, b"B-EDIT-LONGER")
+				|| bytes_recoverable_anywhere(&tc.local_b, b"B-EDIT-LONGER"),
+			"B's edit was destroyed — data loss"
+		);
+
+		// Resolve both halves and converge. The winner keeps BOTH — the version it buried comes back
+		// down beside its own copy under a name of its own — and the loser takes the head, whose bytes
+		// it is about to be handed anyway. Both clients must end up with both files, one per name.
+		let (win_engine, win_pair) = if b_won {
+			(&tc.engine_b, tc.pair_b)
+		} else {
+			(&tc.engine_a, tc.pair_a)
+		};
+		let (lose_engine, lose_pair) = if b_won {
+			(&tc.engine_a, tc.pair_a)
+		} else {
+			(&tc.engine_b, tc.pair_b)
+		};
+		let (won_bytes, lost_bytes): (&[u8], &[u8]) = if b_won {
+			(b"B-EDIT-LONGER", b"A-EDIT")
+		} else {
+			(b"A-EDIT", b"B-EDIT-LONGER")
+		};
+		assert_eq!(
+			win_engine
+				.resolve_conflict(win_pair, "race.txt", ConflictResolution::KeepBoth)
+				.await
+				.unwrap(),
+			ConflictResolved {
+				quarantined: None,
+				kept_as: Some("race.old.txt".to_string()),
+			},
+			"keep-both leaves its copy in the tree, not in the bin, and names it"
+		);
+		let gave_way = lose_engine
+			.resolve_conflict(lose_pair, "race.txt", ConflictResolution::KeepRemote)
+			.await
+			.unwrap()
+			.quarantined
+			.expect("the side that gave way must be told where its own copy went");
+		assert_eq!(
+			std::fs::read(&gave_way).unwrap().as_slice(),
+			lost_bytes,
+			"the named path does not hold the copy that gave way"
+		);
+
+		converge(
+			tc.peer_a(),
+			tc.peer_b(),
+			Order::AFirst,
+			&mut conflicts,
+			"c26-resolved",
+			|| {
+				[&tc.local_a, &tc.local_b].iter().all(|root| {
+					read_eq(root, "race.txt", won_bytes)
+						&& read_eq(root, "race.old.txt", lost_bytes)
+				})
+			},
+		)
+		.await;
+
+		// One file per name on the remote: keeping both added a file, it did not duplicate one.
+		let (_d, files) = tc.list_root().await;
+		for name in ["race.txt", "race.old.txt"] {
+			assert_eq!(
+				files.iter().filter(|f| f.name() == Some(name)).count(),
+				1,
+				"{name} exists more than once on the remote after resolving"
+			);
+		}
+	})
+	.await;
 	tc.cleanup();
 }
 
@@ -2750,165 +2756,170 @@ async fn conflict_26_same_round_edits_surface_on_the_superseded_client() {
 #[shared_test_runtime]
 async fn conflict_27_concurrent_same_name_create_surfaces_a_conflict() {
 	let tc = two_clients(SyncMode::TwoWay).await;
-	let mut conflicts = BTreeSet::new();
+	// A same-name upload keeps the old file as a version (same stable id) only with versioning on.
+	with_versioning(&tc.resources.client, true, async {
+		let mut conflicts = BTreeSet::new();
 
-	// One empty pass per client before the race. A pair's first pass after its cache started
-	// waits for the cache to converge the remote root, re-checking once a second, so two fresh
-	// caches can start their race passes a tick apart, and the later one then plans against a view
-	// that already holds the other's upload: a sequential create, not a race. After this pass both
-	// caches hold the root converged and both race passes read it at once. Nothing exists on either
-	// side yet, so it records no baseline row for race.txt and the race below still starts from none.
-	let (w_a, w_b) = sync_round(
-		&tc.engine_a,
-		tc.pair_a,
-		&tc.engine_b,
-		tc.pair_b,
-		Order::Concurrent,
-	)
-	.await;
-	for warm in [&w_a, &w_b] {
-		assert!(warm.errors.is_empty(), "{warm:?}");
-		assert_eq!(warm.uploaded, 0, "the empty pass uploaded: {warm:?}");
-		assert_eq!(warm.downloaded, 0, "the empty pass downloaded: {warm:?}");
-	}
-
-	// Distinct lengths, so the surviving size names which upload won the race.
-	write_file(&tc.local_a, "race.txt", b"AAA-from-a");
-	write_file(&tc.local_b, "race.txt", b"BBB-from-b-and-longer");
-
-	// Both passes at once: the server linearizes the two uploads into two versions of ONE file.
-	let (r0a, r0b) = sync_round(
-		&tc.engine_a,
-		tc.pair_a,
-		&tc.engine_b,
-		tc.pair_b,
-		Order::Concurrent,
-	)
-	.await;
-	assert!(
-		r0a.errors.is_empty() && r0b.errors.is_empty(),
-		"{r0a:?} {r0b:?}"
-	);
-	assert_eq!(
-		r0a.uploaded + r0b.uploaded,
-		2,
-		"both clients must have pushed their own copy: {r0a:?} {r0b:?}"
-	);
-
-	// One upload is now the remote head, the other a version underneath it. Both caches must be
-	// reading THAT state before the rounds below, never the intermediate one where the loser still
-	// lists its own upload as the head: sampled there, the loser confirms its own push against the
-	// snapshot and then pulls the winner like an ordinary later edit — and the test would pass over
-	// an engine that never surfaced anything (see CONFLICT-26, which has the same hazard).
-	let (_d, files) = tc.list_root().await;
-	let head = find_file(&files, "race.txt").expect("race.txt missing after the concurrent round");
-	let head_uuid = head.uuid();
-	assert!(
-		head.size == b"AAA-from-a".len() as u64
-			|| head.size == b"BBB-from-b-and-longer".len() as u64,
-		"the head is neither client's copy: {} bytes",
-		head.size
-	);
-	assert_race_staged_inside_the_window(&tc, head, "c27").await;
-	for cache in [&tc.cache_a, &tc.cache_b] {
-		assert!(
-			poll_for_item(cache.db_path(), head_uuid, CACHE_CONVERGE_TIMEOUT).await,
-			"a cache never listed the version that won the race"
-		);
-	}
-
-	for _ in 0..8 {
-		let (ra, rb) = sync_round(
+		// One empty pass per client before the race. A pair's first pass after its cache started
+		// waits for the cache to converge the remote root, re-checking once a second, so two fresh
+		// caches can start their race passes a tick apart, and the later one then plans against a view
+		// that already holds the other's upload: a sequential create, not a race. After this pass both
+		// caches hold the root converged and both race passes read it at once. Nothing exists on either
+		// side yet, so it records no baseline row for race.txt and the race below still starts from none.
+		let (w_a, w_b) = sync_round(
 			&tc.engine_a,
 			tc.pair_a,
 			&tc.engine_b,
 			tc.pair_b,
-			Order::AFirst,
+			Order::Concurrent,
+		)
+		.await;
+		for warm in [&w_a, &w_b] {
+			assert!(warm.errors.is_empty(), "{warm:?}");
+			assert_eq!(warm.uploaded, 0, "the empty pass uploaded: {warm:?}");
+			assert_eq!(warm.downloaded, 0, "the empty pass downloaded: {warm:?}");
+		}
+
+		// Distinct lengths, so the surviving size names which upload won the race.
+		write_file(&tc.local_a, "race.txt", b"AAA-from-a");
+		write_file(&tc.local_b, "race.txt", b"BBB-from-b-and-longer");
+
+		// Both passes at once: the server linearizes the two uploads into two versions of ONE file.
+		let (r0a, r0b) = sync_round(
+			&tc.engine_a,
+			tc.pair_a,
+			&tc.engine_b,
+			tc.pair_b,
+			Order::Concurrent,
 		)
 		.await;
 		assert!(
-			ra.errors.is_empty() && rb.errors.is_empty(),
-			"{ra:?} {rb:?}"
+			r0a.errors.is_empty() && r0b.errors.is_empty(),
+			"{r0a:?} {r0b:?}"
 		);
-		for c in ra.conflict_paths().chain(rb.conflict_paths()) {
-			conflicts.insert(c.to_string());
+		assert_eq!(
+			r0a.uploaded + r0b.uploaded,
+			2,
+			"both clients must have pushed their own copy: {r0a:?} {r0b:?}"
+		);
+
+		// One upload is now the remote head, the other a version underneath it. Both caches must be
+		// reading THAT state before the rounds below, never the intermediate one where the loser still
+		// lists its own upload as the head: sampled there, the loser confirms its own push against the
+		// snapshot and then pulls the winner like an ordinary later edit — and the test would pass over
+		// an engine that never surfaced anything (see CONFLICT-26, which has the same hazard).
+		let (_d, files) = tc.list_root().await;
+		let head =
+			find_file(&files, "race.txt").expect("race.txt missing after the concurrent round");
+		let head_uuid = head.uuid();
+		assert!(
+			head.size == b"AAA-from-a".len() as u64
+				|| head.size == b"BBB-from-b-and-longer".len() as u64,
+			"the head is neither client's copy: {} bytes",
+			head.size
+		);
+		assert_race_staged_inside_the_window(&tc, head, "c27").await;
+		for cache in [&tc.cache_a, &tc.cache_b] {
+			assert!(
+				poll_for_item(cache.db_path(), head_uuid, CACHE_CONVERGE_TIMEOUT).await,
+				"a cache never listed the version that won the race"
+			);
 		}
-		tokio::time::sleep(Duration::from_millis(1500)).await;
-	}
 
-	assert!(
-		conflicts.iter().any(|c| c.contains("race.txt")),
-		"the loser of a concurrent same-name create must surface a conflict: {conflicts:?}"
-	);
-	assert!(
-		bytes_recoverable_anywhere(&tc.local_a, b"AAA-from-a")
-			|| bytes_recoverable_anywhere(&tc.local_b, b"AAA-from-a"),
-		"A's content destroyed — data loss"
-	);
-	assert!(
-		bytes_recoverable_anywhere(&tc.local_a, b"BBB-from-b-and-longer")
-			|| bytes_recoverable_anywhere(&tc.local_b, b"BBB-from-b-and-longer"),
-		"B's content destroyed — data loss"
-	);
+		for _ in 0..8 {
+			let (ra, rb) = sync_round(
+				&tc.engine_a,
+				tc.pair_a,
+				&tc.engine_b,
+				tc.pair_b,
+				Order::AFirst,
+			)
+			.await;
+			assert!(
+				ra.errors.is_empty() && rb.errors.is_empty(),
+				"{ra:?} {rb:?}"
+			);
+			for c in ra.conflict_paths().chain(rb.conflict_paths()) {
+				conflicts.insert(c.to_string());
+			}
+			tokio::time::sleep(Duration::from_millis(1500)).await;
+		}
 
-	// The negative, on the same fixture and a path of its own: create, let ONE pass list our own
-	// version as the remote head (which records it as the agreed content), then a foreign edit.
-	// That edit is strictly later than our push, and must pull rather than surface — otherwise the
-	// rule above would turn every ordinary sequential edit into a conflict.
-	write_file(&tc.local_a, "solo.txt", b"S1");
-	let s0 = tc.engine_a.sync_once(tc.pair_a).await.unwrap();
-	assert!(s0.errors.is_empty(), "{s0:?}");
-	assert_eq!(s0.uploaded, 1, "{s0:?}");
+		assert!(
+			conflicts.iter().any(|c| c.contains("race.txt")),
+			"the loser of a concurrent same-name create must surface a conflict: {conflicts:?}"
+		);
+		assert!(
+			bytes_recoverable_anywhere(&tc.local_a, b"AAA-from-a")
+				|| bytes_recoverable_anywhere(&tc.local_b, b"AAA-from-a"),
+			"A's content destroyed — data loss"
+		);
+		assert!(
+			bytes_recoverable_anywhere(&tc.local_a, b"BBB-from-b-and-longer")
+				|| bytes_recoverable_anywhere(&tc.local_b, b"BBB-from-b-and-longer"),
+			"B's content destroyed — data loss"
+		);
 
-	let (_d, files) = tc.list_root().await;
-	let ours: Uuid = find_file(&files, "solo.txt")
-		.expect("solo.txt never reached the remote")
-		.uuid();
-	assert!(
-		poll_for_item(tc.cache_a.db_path(), ours, CACHE_CONVERGE_TIMEOUT).await,
-		"A's cache never observed A's own push"
-	);
-	let s1 = tc.engine_a.sync_once(tc.pair_a).await.unwrap();
-	assert!(s1.errors.is_empty(), "{s1:?}");
-	assert_eq!(
-		s1.uploaded + s1.downloaded,
-		0,
-		"the confirming pass must be a no-op: {s1:?}"
-	);
+		// The negative, on the same fixture and a path of its own: create, let ONE pass list our own
+		// version as the remote head (which records it as the agreed content), then a foreign edit.
+		// That edit is strictly later than our push, and must pull rather than surface — otherwise the
+		// rule above would turn every ordinary sequential edit into a conflict.
+		write_file(&tc.local_a, "solo.txt", b"S1");
+		let s0 = tc.engine_a.sync_once(tc.pair_a).await.unwrap();
+		assert!(s0.errors.is_empty(), "{s0:?}");
+		assert_eq!(s0.uploaded, 1, "{s0:?}");
 
-	let edited = tc.upload_root("solo.txt", b"S2-remote").await;
-	let edited_uuid: Uuid = edited.uuid();
-	let db_a = tc.cache_a.db_path().to_path_buf();
-	assert!(
-		poll_until(CACHE_CONVERGE_TIMEOUT, || {
-			query_cached_file(&db_a, edited_uuid).map(|t| t.1) == Some(b"S2-remote".len() as i64)
-		})
-		.await,
-		"A's cache never reflected the foreign edit"
-	);
-	let mut s2 = tc.engine_a.sync_once(tc.pair_a).await.unwrap();
-	let deadline = std::time::Instant::now() + Duration::from_secs(30);
-	while s2.downloaded == 0
-		&& s2
-			.errors
-			.iter()
-			.any(|e| e.contains("FileChangedDuringSync"))
-		&& std::time::Instant::now() < deadline
-	{
-		tokio::time::sleep(Duration::from_millis(500)).await;
-		s2 = tc.engine_a.sync_once(tc.pair_a).await.unwrap();
-	}
-	assert!(s2.errors.is_empty(), "{s2:?}");
-	assert_eq!(
-		s2.downloaded, 1,
-		"an edit made after a CONFIRMED push must pull: {s2:?}"
-	);
-	assert!(
-		!s2.conflict_paths().any(|c| c.contains("solo.txt")),
-		"a confirmed push must not conflict with a later foreign edit: {s2:?}"
-	);
-	assert!(read_eq(&tc.local_a, "solo.txt", b"S2-remote"));
+		let (_d, files) = tc.list_root().await;
+		let ours: Uuid = find_file(&files, "solo.txt")
+			.expect("solo.txt never reached the remote")
+			.uuid();
+		assert!(
+			poll_for_item(tc.cache_a.db_path(), ours, CACHE_CONVERGE_TIMEOUT).await,
+			"A's cache never observed A's own push"
+		);
+		let s1 = tc.engine_a.sync_once(tc.pair_a).await.unwrap();
+		assert!(s1.errors.is_empty(), "{s1:?}");
+		assert_eq!(
+			s1.uploaded + s1.downloaded,
+			0,
+			"the confirming pass must be a no-op: {s1:?}"
+		);
 
+		let edited = tc.upload_root("solo.txt", b"S2-remote").await;
+		let edited_uuid: Uuid = edited.uuid();
+		let db_a = tc.cache_a.db_path().to_path_buf();
+		assert!(
+			poll_until(CACHE_CONVERGE_TIMEOUT, || {
+				query_cached_file(&db_a, edited_uuid).map(|t| t.1)
+					== Some(b"S2-remote".len() as i64)
+			})
+			.await,
+			"A's cache never reflected the foreign edit"
+		);
+		let mut s2 = tc.engine_a.sync_once(tc.pair_a).await.unwrap();
+		let deadline = std::time::Instant::now() + Duration::from_secs(30);
+		while s2.downloaded == 0
+			&& s2
+				.errors
+				.iter()
+				.any(|e| e.contains("FileChangedDuringSync"))
+			&& std::time::Instant::now() < deadline
+		{
+			tokio::time::sleep(Duration::from_millis(500)).await;
+			s2 = tc.engine_a.sync_once(tc.pair_a).await.unwrap();
+		}
+		assert!(s2.errors.is_empty(), "{s2:?}");
+		assert_eq!(
+			s2.downloaded, 1,
+			"an edit made after a CONFIRMED push must pull: {s2:?}"
+		);
+		assert!(
+			!s2.conflict_paths().any(|c| c.contains("solo.txt")),
+			"a confirmed push must not conflict with a later foreign edit: {s2:?}"
+		);
+		assert!(read_eq(&tc.local_a, "solo.txt", b"S2-remote"));
+	})
+	.await;
 	tc.cleanup();
 }
 
@@ -2930,90 +2941,37 @@ async fn conflict_27_concurrent_same_name_create_surfaces_a_conflict() {
 #[shared_test_runtime]
 async fn conflict_28_keep_remote_restores_the_buried_edit() {
 	let tc = two_clients(SyncMode::TwoWay).await;
-	let mut conflicts = BTreeSet::new();
+	// A same-name upload keeps the old file as a version (same stable id) only with versioning on.
+	with_versioning(&tc.resources.client, true, async {
+		let mut conflicts = BTreeSet::new();
 
-	// Converge a shared "BASE", then give both clients a pass that lists it as the remote head —
-	// that observation is what records BASE as the content both sides hold (see CONFLICT-26).
-	write_file(&tc.local_a, "race.txt", b"BASE");
-	converge(
-		tc.peer_a(),
-		tc.peer_b(),
-		Order::AFirst,
-		&mut conflicts,
-		"c28-baseline",
-		|| trees_equal(&tc.local_a, &tc.local_b) && read_eq(&tc.local_b, "race.txt", b"BASE"),
-	)
-	.await;
-	assert!(
-		conflicts.is_empty(),
-		"the baseline round must be conflict-free: {conflicts:?}"
-	);
-	let (_d, files) = tc.list_root().await;
-	let base_uuid: Uuid = find_file(&files, "race.txt")
-		.expect("race.txt missing")
-		.uuid();
-	for cache in [&tc.cache_a, &tc.cache_b] {
+		// Converge a shared "BASE", then give both clients a pass that lists it as the remote head —
+		// that observation is what records BASE as the content both sides hold (see CONFLICT-26).
+		write_file(&tc.local_a, "race.txt", b"BASE");
+		converge(
+			tc.peer_a(),
+			tc.peer_b(),
+			Order::AFirst,
+			&mut conflicts,
+			"c28-baseline",
+			|| trees_equal(&tc.local_a, &tc.local_b) && read_eq(&tc.local_b, "race.txt", b"BASE"),
+		)
+		.await;
 		assert!(
-			poll_for_item(cache.db_path(), base_uuid, CACHE_CONVERGE_TIMEOUT).await,
-			"a cache never listed the shared version"
+			conflicts.is_empty(),
+			"the baseline round must be conflict-free: {conflicts:?}"
 		);
-	}
-	let (rc_a, rc_b) = sync_round(
-		&tc.engine_a,
-		tc.pair_a,
-		&tc.engine_b,
-		tc.pair_b,
-		Order::AFirst,
-	)
-	.await;
-	assert!(rc_a.errors.is_empty(), "{rc_a:?}");
-	assert!(rc_b.errors.is_empty(), "{rc_b:?}");
-
-	// Let the clock leave the second the shared version was stamped in. The server records a
-	// version's time to the second, and the winner's side of this race is recognised by the buried
-	// version being LATER than the one its pass saw — inside one second the version chain cannot
-	// order them at all (see `plan::interleaved_version`). The race below is still one round.
-	tokio::time::sleep(Duration::from_millis(1500)).await;
-
-	// Both edit and push in the SAME round: one upload lands on top of the other.
-	write_file(&tc.local_a, "race.txt", b"A-EDIT");
-	write_file(&tc.local_b, "race.txt", b"B-EDIT-LONGER");
-	let (ra, rb) = sync_round(
-		&tc.engine_a,
-		tc.pair_a,
-		&tc.engine_b,
-		tc.pair_b,
-		Order::Concurrent,
-	)
-	.await;
-	assert!(ra.errors.is_empty(), "A errors: {:?}", ra.errors);
-	assert!(rb.errors.is_empty(), "B errors: {:?}", rb.errors);
-	assert_eq!(
-		ra.uploaded + rb.uploaded,
-		2,
-		"both clients must have pushed their edit: {ra:?} / {rb:?}"
-	);
-
-	// Distinct-length sentinels, so the surviving size names the winner.
-	let (_d, files) = tc.list_root().await;
-	let head = find_file(&files, "race.txt").expect("race.txt missing after the concurrent round");
-	let head_uuid = head.uuid();
-	let b_won = head.size == b"B-EDIT-LONGER".len() as u64;
-	assert!(
-		b_won || head.size == b"A-EDIT".len() as u64,
-		"the head is neither client's edit: {} bytes",
-		head.size
-	);
-	for cache in [&tc.cache_a, &tc.cache_b] {
-		assert!(
-			poll_for_item(cache.db_path(), head_uuid, CACHE_CONVERGE_TIMEOUT).await,
-			"a cache never listed the version that won the race"
-		);
-	}
-
-	let (mut from_a, mut from_b) = (BTreeSet::new(), BTreeSet::new());
-	for _ in 0..6 {
-		let (ra, rb) = sync_round(
+		let (_d, files) = tc.list_root().await;
+		let base_uuid: Uuid = find_file(&files, "race.txt")
+			.expect("race.txt missing")
+			.uuid();
+		for cache in [&tc.cache_a, &tc.cache_b] {
+			assert!(
+				poll_for_item(cache.db_path(), base_uuid, CACHE_CONVERGE_TIMEOUT).await,
+				"a cache never listed the shared version"
+			);
+		}
+		let (rc_a, rc_b) = sync_round(
 			&tc.engine_a,
 			tc.pair_a,
 			&tc.engine_b,
@@ -3021,86 +2979,143 @@ async fn conflict_28_keep_remote_restores_the_buried_edit() {
 			Order::AFirst,
 		)
 		.await;
+		assert!(rc_a.errors.is_empty(), "{rc_a:?}");
+		assert!(rc_b.errors.is_empty(), "{rc_b:?}");
+
+		// Let the clock leave the second the shared version was stamped in. The server records a
+		// version's time to the second, and the winner's side of this race is recognised by the buried
+		// version being LATER than the one its pass saw — inside one second the version chain cannot
+		// order them at all (see `plan::interleaved_version`). The race below is still one round.
+		tokio::time::sleep(Duration::from_millis(1500)).await;
+
+		// Both edit and push in the SAME round: one upload lands on top of the other.
+		write_file(&tc.local_a, "race.txt", b"A-EDIT");
+		write_file(&tc.local_b, "race.txt", b"B-EDIT-LONGER");
+		let (ra, rb) = sync_round(
+			&tc.engine_a,
+			tc.pair_a,
+			&tc.engine_b,
+			tc.pair_b,
+			Order::Concurrent,
+		)
+		.await;
 		assert!(ra.errors.is_empty(), "A errors: {:?}", ra.errors);
 		assert!(rb.errors.is_empty(), "B errors: {:?}", rb.errors);
-		from_a.extend(ra.conflict_paths().map(str::to_string));
-		from_b.extend(rb.conflict_paths().map(str::to_string));
-		conflicts.extend(from_a.iter().chain(from_b.iter()).cloned());
-		if from_a
-			.iter()
-			.chain(from_b.iter())
-			.any(|c| c.contains("race.txt"))
-		{
-			break;
+		assert_eq!(
+			ra.uploaded + rb.uploaded,
+			2,
+			"both clients must have pushed their edit: {ra:?} / {rb:?}"
+		);
+
+		// Distinct-length sentinels, so the surviving size names the winner.
+		let (_d, files) = tc.list_root().await;
+		let head =
+			find_file(&files, "race.txt").expect("race.txt missing after the concurrent round");
+		let head_uuid = head.uuid();
+		let b_won = head.size == b"B-EDIT-LONGER".len() as u64;
+		assert!(
+			b_won || head.size == b"A-EDIT".len() as u64,
+			"the head is neither client's edit: {} bytes",
+			head.size
+		);
+		for cache in [&tc.cache_a, &tc.cache_b] {
+			assert!(
+				poll_for_item(cache.db_path(), head_uuid, CACHE_CONVERGE_TIMEOUT).await,
+				"a cache never listed the version that won the race"
+			);
 		}
-		tokio::time::sleep(Duration::from_millis(1500)).await;
-	}
-	let (winner, loser) = if b_won {
-		(&from_b, &from_a)
-	} else {
-		(&from_a, &from_b)
-	};
-	assert!(
-		winner.iter().any(|c| c.contains("race.txt")),
-		"the client whose upload buried the other's edit must surface it: {winner:?}"
-	);
-	assert!(
-		loser.iter().any(|c| c.contains("race.txt")),
-		"the superseded client must surface its own side of the race: {loser:?}"
-	);
 
-	// The winner asks for the copy it was shown — the edit it buried.
-	let (win_engine, win_pair) = if b_won {
-		(&tc.engine_b, tc.pair_b)
-	} else {
-		(&tc.engine_a, tc.pair_a)
-	};
-	let (won_bytes, lost_bytes): (&[u8], &[u8]) = if b_won {
-		(b"B-EDIT-LONGER", b"A-EDIT")
-	} else {
-		(b"A-EDIT", b"B-EDIT-LONGER")
-	};
-	let ours_aside = win_engine
-		.resolve_conflict(win_pair, "race.txt", ConflictResolution::KeepRemote)
-		.await
-		.unwrap()
-		.quarantined
-		.expect("restoring the buried version must say where our own copy went");
-	assert_eq!(
-		std::fs::read(&ours_aside).unwrap().as_slice(),
-		won_bytes,
-		"the named path does not hold the copy the restore moved aside"
-	);
+		let (mut from_a, mut from_b) = (BTreeSet::new(), BTreeSet::new());
+		for _ in 0..6 {
+			let (ra, rb) = sync_round(
+				&tc.engine_a,
+				tc.pair_a,
+				&tc.engine_b,
+				tc.pair_b,
+				Order::AFirst,
+			)
+			.await;
+			assert!(ra.errors.is_empty(), "A errors: {:?}", ra.errors);
+			assert!(rb.errors.is_empty(), "B errors: {:?}", rb.errors);
+			from_a.extend(ra.conflict_paths().map(str::to_string));
+			from_b.extend(rb.conflict_paths().map(str::to_string));
+			conflicts.extend(from_a.iter().chain(from_b.iter()).cloned());
+			if from_a
+				.iter()
+				.chain(from_b.iter())
+				.any(|c| c.contains("race.txt"))
+			{
+				break;
+			}
+			tokio::time::sleep(Duration::from_millis(1500)).await;
+		}
+		let (winner, loser) = if b_won {
+			(&from_b, &from_a)
+		} else {
+			(&from_a, &from_b)
+		};
+		assert!(
+			winner.iter().any(|c| c.contains("race.txt")),
+			"the client whose upload buried the other's edit must surface it: {winner:?}"
+		);
+		assert!(
+			loser.iter().any(|c| c.contains("race.txt")),
+			"the superseded client must surface its own side of the race: {loser:?}"
+		);
 
-	// Ground truth, read from the server rather than from either client's cache: the buried
-	// version is the head again, under one name.
-	let (_d, files) = tc.list_root().await;
-	let remote: Vec<_> = files
-		.iter()
-		.filter(|f| f.name() == Some("race.txt"))
-		.collect();
-	assert_eq!(
-		remote.len(),
-		1,
-		"race.txt exists more than once on the remote"
-	);
-	assert_eq!(
-		remote[0].size,
-		lost_bytes.len() as u64,
-		"keep-remote left the resolver's own bytes as the head instead of restoring the version \
+		// The winner asks for the copy it was shown — the edit it buried.
+		let (win_engine, win_pair) = if b_won {
+			(&tc.engine_b, tc.pair_b)
+		} else {
+			(&tc.engine_a, tc.pair_a)
+		};
+		let (won_bytes, lost_bytes): (&[u8], &[u8]) = if b_won {
+			(b"B-EDIT-LONGER", b"A-EDIT")
+		} else {
+			(b"A-EDIT", b"B-EDIT-LONGER")
+		};
+		let ours_aside = win_engine
+			.resolve_conflict(win_pair, "race.txt", ConflictResolution::KeepRemote)
+			.await
+			.unwrap()
+			.quarantined
+			.expect("restoring the buried version must say where our own copy went");
+		assert_eq!(
+			std::fs::read(&ours_aside).unwrap().as_slice(),
+			won_bytes,
+			"the named path does not hold the copy the restore moved aside"
+		);
+
+		// Ground truth, read from the server rather than from either client's cache: the buried
+		// version is the head again, under one name.
+		let (_d, files) = tc.list_root().await;
+		let remote: Vec<_> = files
+			.iter()
+			.filter(|f| f.name() == Some("race.txt"))
+			.collect();
+		assert_eq!(
+			remote.len(),
+			1,
+			"race.txt exists more than once on the remote"
+		);
+		assert_eq!(
+			remote[0].size,
+			lost_bytes.len() as u64,
+			"keep-remote left the resolver's own bytes as the head instead of restoring the version \
 		 it buried"
-	);
-	// And the bytes it displaced are still recoverable, as every resolution must leave them.
-	assert!(
-		bytes_recoverable_anywhere(&tc.local_a, won_bytes)
-			|| bytes_recoverable_anywhere(&tc.local_b, won_bytes),
-		"the winner's own edit was destroyed — data loss"
-	);
-	// What the two trees do NEXT is deliberately not asserted here. A restore puts a version the
-	// cache had already seen archived back at the head, and nothing announces that, so both
-	// clients read the path as absent until their next resync — a gap in the cache's event
-	// handling, not in the resolution this test is about (CONFLICT-26 covers converging after a
-	// resolution that leaves the head alone).
-
+		);
+		// And the bytes it displaced are still recoverable, as every resolution must leave them.
+		assert!(
+			bytes_recoverable_anywhere(&tc.local_a, won_bytes)
+				|| bytes_recoverable_anywhere(&tc.local_b, won_bytes),
+			"the winner's own edit was destroyed — data loss"
+		);
+		// What the two trees do NEXT is deliberately not asserted here. A restore puts a version the
+		// cache had already seen archived back at the head, and nothing announces that, so both
+		// clients read the path as absent until their next resync — a gap in the cache's event
+		// handling, not in the resolution this test is about (CONFLICT-26 covers converging after a
+		// resolution that leaves the head alone).
+	})
+	.await;
 	tc.cleanup();
 }

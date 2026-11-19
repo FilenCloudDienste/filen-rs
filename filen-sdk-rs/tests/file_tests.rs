@@ -2051,58 +2051,62 @@ async fn restore_file_version_does_not_report_a_deleted_version_as_stale() {
 #[shared_test_runtime]
 async fn get_file_by_stable_uuid_returns_the_edited_head() {
 	let resources = test_utils::RESOURCES.get_resources().await;
-	let client = &resources.client;
-	let test_dir = &resources.dir;
+	// A same-name upload keeps the old file as a version (same stable id) only with versioning on.
+	with_versioning(&resources.client, true, async {
+		let client = &resources.client;
+		let test_dir = &resources.dir;
 
-	let first = client
-		.upload_file(
-			client
-				.make_file_builder("stable_lineage.txt", test_dir.uuid())
-				.unwrap(),
-			b"v1",
-		)
-		.await
-		.unwrap();
-	// backend timestamps have a resolution of one second
-	tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-	let edited = client
-		.upload_file(
-			client
-				.make_file_builder("stable_lineage.txt", test_dir.uuid())
-				.unwrap(),
+		let first = client
+			.upload_file(
+				client
+					.make_file_builder("stable_lineage.txt", test_dir.uuid())
+					.unwrap(),
+				b"v1",
+			)
+			.await
+			.unwrap();
+		// backend timestamps have a resolution of one second
+		tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+		let edited = client
+			.upload_file(
+				client
+					.make_file_builder("stable_lineage.txt", test_dir.uuid())
+					.unwrap(),
+				b"edited contents",
+			)
+			.await
+			.unwrap();
+		assert_ne!(edited.uuid(), first.uuid(), "an edit re-mints the uuid");
+		assert_eq!(
+			edited.stable_uuid(),
+			first.stable_uuid(),
+			"an edit keeps the lineage's stable id"
+		);
+
+		let head = client
+			.get_file_by_stable_uuid(first.stable_uuid())
+			.await
+			.unwrap();
+
+		assert_eq!(
+			head.uuid(),
+			edited.uuid(),
+			"the by-stable fetch must return the live head, not the superseded uuid"
+		);
+		assert_ne!(head.uuid(), first.uuid());
+		assert_eq!(
+			head.stable_uuid(),
+			first.stable_uuid(),
+			"the head carries the same whole-life id it was fetched by"
+		);
+		assert_eq!(head.name().unwrap(), "stable_lineage.txt");
+		assert_eq!(
+			client.download_file(&head).await.unwrap(),
 			b"edited contents",
-		)
-		.await
-		.unwrap();
-	assert_ne!(edited.uuid(), first.uuid(), "an edit re-mints the uuid");
-	assert_eq!(
-		edited.stable_uuid(),
-		first.stable_uuid(),
-		"an edit keeps the lineage's stable id"
-	);
-
-	let head = client
-		.get_file_by_stable_uuid(first.stable_uuid())
-		.await
-		.unwrap();
-
-	assert_eq!(
-		head.uuid(),
-		edited.uuid(),
-		"the by-stable fetch must return the live head, not the superseded uuid"
-	);
-	assert_ne!(head.uuid(), first.uuid());
-	assert_eq!(
-		head.stable_uuid(),
-		first.stable_uuid(),
-		"the head carries the same whole-life id it was fetched by"
-	);
-	assert_eq!(head.name().unwrap(), "stable_lineage.txt");
-	assert_eq!(
-		client.download_file(&head).await.unwrap(),
-		b"edited contents",
-		"the head's content metadata must describe the edit"
-	);
+			"the head's content metadata must describe the edit"
+		);
+	})
+	.await;
 }
 
 /// The definitive-not-found contract of `v3/file/stable`: a lineage the server does not know —
