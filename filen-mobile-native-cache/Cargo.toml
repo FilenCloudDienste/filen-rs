@@ -41,7 +41,8 @@ rusqlite = { version = "0.39", features = [
 	"functions",
 ] }
 filen-types = { path = "../filen-types", features = ["rusqlite"] }
-image = { version = "0.25.6", default-features = false } # only need the error type here
+# The error type, and the header of a cached WebP thumbnail.
+image = { version = "0.25.6", default-features = false, features = ["webp"] }
 
 # Optional dependencies
 tokio = { version = "1.47.1", features = ["rt-multi-thread", "macros", "fs"] }
