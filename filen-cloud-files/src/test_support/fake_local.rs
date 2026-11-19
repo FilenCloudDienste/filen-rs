@@ -13,6 +13,7 @@ use std::{
 	},
 };
 
+use filen_sdk_rs::thumbnail::{ByteSource, MemSource};
 use filen_types::fs::Uuid;
 
 use crate::{
@@ -1794,6 +1795,29 @@ impl LocalFs for FakeLocal {
 			to: to.clone(),
 		});
 		Ok(())
+	}
+
+	fn open_on_disk(
+		&self,
+		path: &RootPath,
+		expect: LocalFileId,
+	) -> Result<Box<dyn ByteSource>, LocalError> {
+		let state = self.state();
+		let node = state
+			.get(path)
+			.filter(|node| node.id == expect.get())
+			.ok_or(LocalError::NotFound)?;
+		let NodeKind::File { bytes, .. } = &node.kind else {
+			return Err(LocalError::NotFound);
+		};
+		if node
+			.placeholder
+			.as_ref()
+			.is_some_and(|placeholder| placeholder.on_disk < node.size())
+		{
+			return Err(LocalError::NotFound);
+		}
+		Ok(Box::new(MemSource(bytes.clone())))
 	}
 
 	type Settled = FakeSettled;

@@ -28,7 +28,7 @@ const MAX_HOPS: usize = 4096;
 
 /// How this OS spells a path the parent names.
 #[derive(Debug, Clone, Copy)]
-struct Spelling {
+pub(crate) struct Spelling {
 	/// What separates its components.
 	separator: char,
 	/// Whether it starts with a drive letter (`X:\`), and takes no `/` either.
@@ -44,9 +44,9 @@ const WINDOWS: Spelling = Spelling {
 
 /// This host's.
 #[cfg(windows)]
-const HOST: Spelling = WINDOWS;
+pub(crate) const HOST: Spelling = WINDOWS;
 #[cfg(not(windows))]
-const HOST: Spelling = Spelling {
+pub(crate) const HOST: Spelling = Spelling {
 	separator: '/',
 	drive: false,
 };
@@ -61,7 +61,11 @@ pub(crate) const NOT_FOUND: &str = "nothing is at the path";
 /// The components of `path` below `root`, as `spelling` spells both, compared without case as
 /// Windows compares names; empty for the root itself. `None` when `path` is not absolute as
 /// `spelling` says, holds a `.` or `..` component (never resolved), or is not `root` or below it.
-fn below_root<'a>(root: &str, path: &'a str, spelling: Spelling) -> Option<Vec<&'a str>> {
+pub(crate) fn below_root<'a>(
+	root: &str,
+	path: &'a str,
+	spelling: Spelling,
+) -> Option<Vec<&'a str>> {
 	let absolute = if spelling.drive {
 		let mut chars = path.chars();
 		let lettered = matches!(

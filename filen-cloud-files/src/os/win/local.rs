@@ -31,6 +31,7 @@ use windows_sys::Win32::{
 	},
 };
 
+use filen_sdk_rs::thumbnail::{ByteSource, FileSource};
 use tracing::{debug, warn};
 
 use super::{ffi, sync_root::SyncRootPath};
@@ -381,6 +382,30 @@ impl LocalFs for WinLocalFs {
 			return Err(io_error(&error));
 		}
 		Ok(())
+	}
+
+	/// Read through a handle for reading shared with every other, after its id and, for a
+	/// placeholder, the bytes on disk were checked through it, as [`LocalFs::copy_to_plain`] reads.
+	fn open_on_disk(
+		&self,
+		path: &RootPath,
+		expect: LocalFileId,
+	) -> Result<Box<dyn ByteSource>, LocalError> {
+		let file = open(&self.full(path), GENERIC_READ, SHARE_ALL, 0)?;
+		let info = ffi::item_info(&file).map_err(|error| io_error(&error))?;
+		let LocalKind::File(stamp) = kind_of(&file, &info)? else {
+			return Err(LocalError::NotFound);
+		};
+		let on_disk = match ffi::placeholder_info(&file) {
+			Ok(standard) => byte_count(standard.on_disk),
+			Err(hr) if hr == Hresult::from_win32(ERROR_NOT_A_CLOUD_FILE) => stamp.size,
+			Err(hr) => return Err(local_error(hr)),
+		};
+		if info.file_id != expect.get() || on_disk < stamp.size {
+			return Err(LocalError::NotFound);
+		}
+		let source = FileSource::new(file).map_err(|error| io_error(&error))?;
+		Ok(Box::new(source))
 	}
 
 	type Settled = WinSettled;

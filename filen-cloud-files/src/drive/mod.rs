@@ -1,7 +1,10 @@
 //! The cache calls the core makes, behind a trait so population, hydration and the local side run
 //! offline against a fake drive in the tests.
 
-use std::{path::PathBuf, sync::Arc};
+use std::{
+	path::PathBuf,
+	sync::{Arc, atomic::AtomicBool},
+};
 
 use filen_mobile_native_cache::{
 	CacheError,
@@ -10,8 +13,10 @@ use filen_mobile_native_cache::{
 	ffi::{FfiChanges, FfiDir, FfiFile, FfiId, FfiObject, QueryChildrenResponse, UploadFileInfo},
 	range::{ByteRange, RangeRead, RangeReadError, RangeSink},
 	remote::{CheckedUpload, PendingCopy},
+	thumbnail::FittedOutcome,
 	traits::WorkingSetUpdateListener,
 };
+use filen_sdk_rs::thumbnail::ByteSource;
 
 use crate::sealed;
 
@@ -82,6 +87,29 @@ pub trait Drive: sealed::Sealed + Send + Sync + 'static {
 		sink: &mut S,
 		abort: Option<&Arc<FfiAbortSignal>>,
 	) -> impl Future<Output = Result<RangeRead, RangeReadError<S::Error>>> + Send;
+
+	/// The thumbnail of the file `id` fitted inside a `max_side` pixel square, its aspect ratio
+	/// kept, made from the remote file's chunks, never from the local placeholder, and kept in the
+	/// cache's thumbnail directory, as [`FilenMobileCacheState::fitted_thumbnail`] makes it. Setting
+	/// `cancel` stops the decode at its next chunk.
+	fn fitted_thumbnail(
+		&self,
+		id: &FfiId,
+		max_side: u32,
+		cancel: &Arc<AtomicBool>,
+	) -> impl Future<Output = Result<FittedOutcome, CacheError>> + Send;
+
+	/// The thumbnail of local bytes, `source`, of a file named `name`, fitted as
+	/// [`Drive::fitted_thumbnail`] fits it and not cached, as
+	/// [`FilenMobileCacheState::fitted_thumbnail_of_local`] makes it. Setting `cancel` stops the
+	/// decode at its next read.
+	fn fitted_thumbnail_of_local(
+		&self,
+		source: Box<dyn ByteSource>,
+		name: &str,
+		max_side: u32,
+		cancel: &Arc<AtomicBool>,
+	) -> impl Future<Output = Result<FittedOutcome, CacheError>> + Send;
 
 	/// The item `id`, refreshed from the server first; `None` when the server no longer has it. A
 	/// trashed item comes back with its original parent set.
@@ -253,6 +281,25 @@ impl Drive for FilenMobileCacheState {
 		id: FfiId,
 	) -> impl Future<Output = Result<Option<FfiObject>, CacheError>> + Send {
 		self.update_and_query_item(id)
+	}
+
+	fn fitted_thumbnail(
+		&self,
+		id: &FfiId,
+		max_side: u32,
+		cancel: &Arc<AtomicBool>,
+	) -> impl Future<Output = Result<FittedOutcome, CacheError>> + Send {
+		FilenMobileCacheState::fitted_thumbnail(self, id, max_side, cancel)
+	}
+
+	fn fitted_thumbnail_of_local(
+		&self,
+		source: Box<dyn ByteSource>,
+		name: &str,
+		max_side: u32,
+		cancel: &Arc<AtomicBool>,
+	) -> impl Future<Output = Result<FittedOutcome, CacheError>> + Send {
+		FilenMobileCacheState::fitted_thumbnail_of_local(self, source, name, max_side, cancel)
 	}
 
 	async fn upload_file(

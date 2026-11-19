@@ -56,6 +56,10 @@ pub(crate) const SHELL_FOLDER_ATTRIBUTES: u32 = 0xF080_004D;
 /// The navigation pane's order of the entry: where OneDrive's sits.
 pub(crate) const SORT_ORDER_INDEX: u32 = 0x42;
 
+/// This provider's thumbnail class, which the helper exe serves as a COM local server
+/// (`os::win::com`): `{CE43ED2E-6C0A-4846-A973-E43FFFACF389}`, minted for it.
+pub(crate) const THUMBNAIL_CLSID: u128 = 0xce43_ed2e_6c0a_4846_a973_e43f_ffac_f389;
+
 /// The sync root list entry of `user`'s root for the Windows user `sid`: `Filen!<SID>!<userId>`.
 pub(crate) fn sync_root_key_name(sid: &str, user: UserId) -> String {
 	format!("{KEY_PREFIX}{sid}!{user}")
@@ -382,6 +386,15 @@ mod tests {
 	use super::*;
 
 	const SID: &str = "S-1-5-21-3291749577-2867003985-2111167235-1000";
+
+	#[test]
+	fn the_thumbnail_class_is_its_own_and_not_the_probes() {
+		assert_eq!(
+			format!("{THUMBNAIL_CLSID:032x}"),
+			"ce43ed2e6c0a4846a973e43fffacf389"
+		);
+		assert_ne!(THUMBNAIL_CLSID, 0x1111_1111_2222_3333_4444_5555_5555_5555);
+	}
 
 	#[test]
 	fn the_sync_root_key_names_the_provider_the_windows_user_and_the_filen_user() {

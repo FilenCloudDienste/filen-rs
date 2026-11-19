@@ -8,6 +8,8 @@
 
 use std::{path::PathBuf, sync::atomic::AtomicBool};
 
+use filen_sdk_rs::thumbnail::ByteSource;
+
 use crate::{
 	failure::Failure,
 	identity::{IdentityBlob, IdentityError, PlaceholderIdentity},
@@ -479,6 +481,18 @@ pub trait LocalFs: sealed::Sealed + Send + Sync + 'static {
 	/// Makes the placeholder at `path`, if it is still the item `expect`, an ordinary file or
 	/// directory, its data left as it is: unregistering the root then cannot touch it.
 	fn revert_to_plain(&self, path: &RootPath, expect: LocalFileId) -> Result<(), LocalError>;
+
+	/// The bytes of the file at `path`, an ordinary file or a placeholder, for reading at any offset,
+	/// if it is still the item `expect` and all its data is on disk: [`LocalError::NotFound`] when
+	/// the file is another item or not all on disk. Opened through a handle that refuses no other
+	/// and checked through it, so a user's writer is never held up and the read asks the provider
+	/// for nothing. A dehydration that lands after the check is not stopped: a read past it then
+	/// asks the provider for the bytes, as any reader would.
+	fn open_on_disk(
+		&self,
+		path: &RootPath,
+		expect: LocalFileId,
+	) -> Result<Box<dyn ByteSource>, LocalError>;
 
 	/// Copies the bytes of the file at `path`, if it is still the item `expect` and all its data is
 	/// on disk, into a new ordinary file at `to`: [`LocalError::Exists`] when anything is at `to`,

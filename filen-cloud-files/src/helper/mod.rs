@@ -16,6 +16,7 @@ mod unregister;
 mod validate;
 mod watch_keeper;
 
+pub(crate) use identify::{HOST, below_root};
 pub use index::{StateDir, StateDirError};
 pub use launch::{MIN_BUILD, StateLock, fatal, serve_stdio, unregister_all_stdio};
 pub use logging::install_stderr_logging;

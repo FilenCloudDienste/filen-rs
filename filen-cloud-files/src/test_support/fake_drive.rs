@@ -15,7 +15,7 @@ use std::{
 	path::{Path, PathBuf},
 	sync::{
 		Arc, Mutex, MutexGuard, PoisonError,
-		atomic::{AtomicUsize, Ordering},
+		atomic::{AtomicBool, AtomicUsize, Ordering},
 	},
 	thread,
 	time::Duration,
@@ -30,9 +30,14 @@ use filen_mobile_native_cache::{
 	},
 	range::{ByteRange, RangeIntegrity, RangeRead, RangeReadError, RangeSink},
 	remote::{CheckedUpload, PendingCopy},
+	thumbnail::{FittedOutcome, encode_fitted},
 	traits::WorkingSetUpdateListener,
 };
-use filen_sdk_rs::{consts::CHUNK_SIZE_U64, fs::name::collision_key};
+use filen_sdk_rs::{
+	consts::CHUNK_SIZE_U64,
+	fs::name::collision_key,
+	thumbnail::{ByteSource, MemSource, ThumbSpec, might_be_thumbnailable},
+};
 use filen_types::fs::Uuid;
 use serde_json::{Value, json};
 use tokio::{
@@ -267,6 +272,9 @@ pub enum DriveCall {
 	Query,
 	/// [`Drive::copy_pending_upload`], gated once its copy is written, before it returns.
 	CopyPending,
+	/// [`Drive::fitted_thumbnail`] and [`Drive::fitted_thumbnail_of_local`]; only the remote one
+	/// is gated.
+	Thumbnail,
 }
 
 /// A call the drive answered, in order, by the ids and names it was given.
@@ -290,6 +298,10 @@ pub enum DriveOp {
 	Move { id: String, parent: String },
 	/// The cache's copy of a marked edit of the file `id` asked for.
 	CopyPending(String),
+	/// A thumbnail of the remote file `id` asked for.
+	Thumbnail(String),
+	/// A thumbnail of local bytes of a file named `name` asked for.
+	LocalThumbnail(String),
 }
 
 impl DriveOp {
@@ -297,7 +309,11 @@ impl DriveOp {
 	pub fn writes(&self) -> bool {
 		!matches!(
 			self,
-			Self::List(_) | Self::Refresh(_) | Self::CopyPending(_)
+			Self::List(_)
+				| Self::Refresh(_)
+				| Self::CopyPending(_)
+				| Self::Thumbnail(_)
+				| Self::LocalThumbnail(_)
 		)
 	}
 
@@ -317,6 +333,8 @@ impl DriveOp {
 			Self::Rename { id, name } => json!({ "op": "Rename", "id": id, "name": name }),
 			Self::Move { id, parent } => json!({ "op": "Move", "id": id, "parent": parent }),
 			Self::CopyPending(id) => json!({ "op": "CopyPending", "id": id }),
+			Self::Thumbnail(id) => json!({ "op": "Thumbnail", "id": id }),
+			Self::LocalThumbnail(name) => json!({ "op": "LocalThumbnail", "name": name }),
 		}
 	}
 }
@@ -1454,6 +1472,11 @@ impl FakeDrive {
 }
 
 /// The uuid a `stable/<uuid>` id names.
+/// The spec the fake decodes thumbnails under: a `max_side` square and a 16 MiB budget.
+fn thumbnail_spec(max_side: u32) -> ThumbSpec {
+	ThumbSpec::new(max_side, max_side, 16 * 1024 * 1024)
+}
+
 fn stable_uuid(id: &FfiId) -> Option<Uuid> {
 	Uuid::parse_str(id.0.strip_prefix("stable/")?).ok()
 }
@@ -1793,6 +1816,52 @@ impl Drive for FakeDrive {
 
 	/// The live item, a trashed one with its original parent, a file only [`FakeDrive::add_file`]
 	/// holds, or the root.
+	/// Decodes the file's bytes as the cache would, under a fixed 16 MiB budget; the name gate is
+	/// left to the local variant, as the bytes' format decides here.
+	async fn fitted_thumbnail(
+		&self,
+		id: &FfiId,
+		max_side: u32,
+		cancel: &Arc<AtomicBool>,
+	) -> Result<FittedOutcome, CacheError> {
+		self.enter_gated(DriveCall::Thumbnail, DriveOp::Thumbnail(id.0.clone()))
+			.await?;
+		if cancel.load(Ordering::Relaxed) {
+			return Err(CacheError::Aborted("the thumbnail was cancelled".into()));
+		}
+		let bytes = stable_uuid(id)
+			.and_then(|stable| {
+				self.state()
+					.files
+					.get(&stable)
+					.map(|content| content.bytes.to_vec())
+			})
+			.ok_or_else(|| CacheError::DoesNotExist("the drive holds no such file".into()))?;
+		encode_fitted(Box::new(MemSource(bytes)), &thumbnail_spec(max_side))
+			.map_err(CacheError::from)
+	}
+
+	/// As the cache does, offline too: only a switch fails it.
+	async fn fitted_thumbnail_of_local(
+		&self,
+		source: Box<dyn ByteSource>,
+		name: &str,
+		max_side: u32,
+		cancel: &Arc<AtomicBool>,
+	) -> Result<FittedOutcome, CacheError> {
+		self.enter_cached(DriveCall::Thumbnail)?;
+		self.state()
+			.ops
+			.push(DriveOp::LocalThumbnail(name.to_owned()));
+		if cancel.load(Ordering::Relaxed) {
+			return Err(CacheError::Aborted("the thumbnail was cancelled".into()));
+		}
+		if !might_be_thumbnailable(Some(name), None) {
+			return Ok(FittedOutcome::Unsupported);
+		}
+		encode_fitted(source, &thumbnail_spec(max_side)).map_err(CacheError::from)
+	}
+
 	async fn refresh_item(&self, id: FfiId) -> Result<Option<FfiObject>, CacheError> {
 		self.enter_gated(DriveCall::Refresh, DriveOp::Refresh(id.0.clone()))
 			.await?;

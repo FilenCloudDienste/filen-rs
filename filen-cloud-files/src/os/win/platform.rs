@@ -5,9 +5,12 @@ use std::{fs::File, os::windows::fs::OpenOptionsExt, path::Path, sync::Arc, time
 
 use filen_types::fs::Uuid;
 use tracing::{debug, warn};
-use windows_sys::Win32::Storage::FileSystem::{
-	FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
-	FILE_SHARE_WRITE,
+use windows_sys::{
+	Win32::Storage::FileSystem::{
+		FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+		FILE_SHARE_WRITE,
+	},
+	core::GUID,
 };
 
 use crate::{
@@ -23,10 +26,13 @@ use crate::{
 	os::{
 		LocalWatcher, WatchSink,
 		cfapi::{
-			SyncRootOwner, SyncRootPathError, WinError, explorer::sweep_keeps, sync_root_owner,
+			SyncRootOwner, SyncRootPathError, WinError,
+			explorer::{THUMBNAIL_CLSID, sweep_keeps},
+			sync_root_owner,
 		},
 		win::{
 			ConnectedRoot, LOG_TARGET, ProviderInfo, RegisteredRoot, SyncRootPath, WinLocalFs,
+			com::{ComError, ThumbnailServer},
 			explorer,
 			ffi::item_info,
 			platform_info, register,
@@ -36,6 +42,7 @@ use crate::{
 		},
 	},
 	sealed,
+	thumbnails::ThumbnailHandler,
 };
 
 /// The Windows platform the helper serves sync roots on.
@@ -58,6 +65,7 @@ impl Platform for WinPlatform {
 	type Registered = RegisteredRoot;
 	type Connected = ConnectedRoot;
 	type Watcher = LocalWatcher;
+	type Thumbnails = ThumbnailServer;
 
 	fn platform_build(&self) -> Option<u32> {
 		platform_info().ok().map(|info| info.build)
@@ -249,6 +257,24 @@ impl Platform for WinPlatform {
 			})
 		})
 		.map_err(|e| failed(PlatformOp::SweepBranding, e))
+	}
+
+	/// Through the COM layer (`com`); a build without one serves none.
+	fn serve_thumbnails(
+		&self,
+		handler: ThumbnailHandler,
+	) -> Result<Option<ThumbnailServer>, PlatformError> {
+		match ThumbnailServer::start(GUID::from_u128(THUMBNAIL_CLSID), handler) {
+			Ok(server) => Ok(Some(server)),
+			Err(ComError::NotImplemented) => {
+				debug!(target: LOG_TARGET, "this build does not serve thumbnails");
+				Ok(None)
+			}
+		}
+	}
+
+	fn stop_thumbnails(&self, server: ThumbnailServer) {
+		server.stop();
 	}
 }
 

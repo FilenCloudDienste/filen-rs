@@ -19,6 +19,7 @@ use crate::{
 	local::LocalEngine,
 	os::{LocalFs, WatchSink},
 	sealed,
+	thumbnails::ThumbnailHandler,
 };
 
 /// A platform operation, for errors.
@@ -48,6 +49,8 @@ pub enum PlatformOp {
 	Unbrand,
 	/// Removing what shows roots the OS no longer holds in File Explorer.
 	SweepBranding,
+	/// Starting to answer File Explorer's thumbnail requests.
+	ServeThumbnails,
 }
 
 impl fmt::Display for PlatformOp {
@@ -65,6 +68,7 @@ impl fmt::Display for PlatformOp {
 			Self::Brand => "showing the root in File Explorer",
 			Self::Unbrand => "removing the root from File Explorer",
 			Self::SweepBranding => "removing roots no longer registered from File Explorer",
+			Self::ServeThumbnails => "starting to answer File Explorer's thumbnail requests",
 		})
 	}
 }
@@ -148,6 +152,9 @@ pub trait Platform: sealed::Sealed + Send + Sync + 'static {
 	type Connected: fmt::Debug + Send + 'static;
 	/// A running watcher of the root; dropping it stops it.
 	type Watcher: Send + 'static;
+	/// A running server of File Explorer's thumbnail requests, stopped by
+	/// [`Platform::stop_thumbnails`].
+	type Thumbnails: Send + 'static;
 
 	/// The Cloud Files platform's build, when known.
 	fn platform_build(&self) -> Option<u32>;
@@ -226,6 +233,18 @@ pub trait Platform: sealed::Sealed + Send + Sync + 'static {
 	/// not there is gone already.
 	fn unbrand(&self, root: &Path, user: UserId, scope: BrandingScope)
 	-> Result<(), PlatformError>;
+
+	/// Starts answering File Explorer's thumbnail requests for this provider's roots with
+	/// `handler`, for the life of the process: `None` when this build serves none. Explorer asks
+	/// only for roots [`Platform::brand`] named this provider's thumbnail class for, which it does
+	/// only on a build that serves them.
+	fn serve_thumbnails(
+		&self,
+		handler: ThumbnailHandler,
+	) -> Result<Option<Self::Thumbnails>, PlatformError>;
+
+	/// Stops `server`: later requests are answered by the class's fallback, which refuses each.
+	fn stop_thumbnails(&self, server: Self::Thumbnails);
 
 	/// Removes what [`Platform::brand`] wrote, as the Windows user this process runs as, for every
 	/// root the OS no longer holds as this provider's sync root: what a run stopped between the

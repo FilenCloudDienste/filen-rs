@@ -27,6 +27,7 @@ use crate::{
 	os::{WatchSignal, WatchSink},
 	sealed,
 	test_support::{FakeDrive, FakeEntry, FakeLocal, MemoryKeyStore},
+	thumbnails::ThumbnailHandler,
 };
 
 /// The time the fake platform's clock always reads, in seconds since the Unix epoch: 2026-11-12
@@ -146,7 +147,23 @@ struct PlatformState {
 	/// The context menu commands, one set per Windows user, as the last brand naming them wrote
 	/// them.
 	commands: Option<ExplorerCommands>,
+	thumbnails: ThumbnailState,
 }
+
+/// The fake's thumbnail server.
+#[derive(Default)]
+struct ThumbnailState {
+	/// Whether this build serves thumbnails, as one with the COM layer does.
+	implemented: bool,
+	/// The handler the running server answers with.
+	handler: Option<ThumbnailHandler>,
+	/// How many servers were started and stopped.
+	servers: (usize, usize),
+}
+
+/// The fake's running thumbnail server.
+#[derive(Debug)]
+pub struct FakeThumbnails;
 
 /// What a fake navigation-pane entry shows, and for whom.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -435,6 +452,21 @@ impl FakePlatform {
 		kill_at(&self.state, point);
 	}
 
+	/// Makes the platform serve thumbnails, as a build with the COM layer does, or not.
+	pub fn implement_thumbnails(&self, implemented: bool) {
+		self.state().thumbnails.implemented = implemented;
+	}
+
+	/// The handler the running thumbnail server answers File Explorer with, if one runs.
+	pub fn thumbnail_handler(&self) -> Option<ThumbnailHandler> {
+		self.state().thumbnails.handler.clone()
+	}
+
+	/// How many thumbnail servers were started, and how many stopped.
+	pub fn thumbnail_servers(&self) -> (usize, usize) {
+		self.state().thumbnails.servers
+	}
+
 	/// Whose root the machine-wide sync root list entry of `root` names, if there is one.
 	pub fn machine_branding(&self, root: &Path) -> Option<UserId> {
 		self.state().machine_branding.get(root).copied()
@@ -540,6 +572,7 @@ impl Platform for FakePlatform {
 	type Registered = FakeRegistered;
 	type Connected = FakeConnected;
 	type Watcher = FakeWatcher;
+	type Thumbnails = FakeThumbnails;
 
 	fn platform_build(&self) -> Option<u32> {
 		Some(26300)
@@ -818,6 +851,25 @@ impl Platform for FakePlatform {
 			state.commands = None;
 		}
 		Ok(())
+	}
+
+	fn serve_thumbnails(
+		&self,
+		handler: ThumbnailHandler,
+	) -> Result<Option<FakeThumbnails>, PlatformError> {
+		let thumbnails = &mut self.state().thumbnails;
+		if !thumbnails.implemented {
+			return Ok(None);
+		}
+		thumbnails.handler = Some(handler);
+		thumbnails.servers.0 += 1;
+		Ok(Some(FakeThumbnails))
+	}
+
+	fn stop_thumbnails(&self, _server: FakeThumbnails) {
+		let thumbnails = &mut self.state().thumbnails;
+		thumbnails.handler = None;
+		thumbnails.servers.1 += 1;
 	}
 
 	fn sweep_branding(&self) -> Result<u64, PlatformError> {

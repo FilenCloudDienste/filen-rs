@@ -2252,6 +2252,7 @@ dependencies = [
  "filen-sdk-rs",
  "filen-types",
  "futures",
+ "image-webp",
  "keyring",
  "notify",
  "rand 0.10.3",

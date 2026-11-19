@@ -27,6 +27,9 @@ blake3 = "1.8.3"
 chrono = "0.4.41"
 # Catching a request's panic in the command loop.
 futures = "0.3.31"
+# Decoding the cache's WebP thumbnails into the pixels File Explorer takes: the decoder `image`
+# already uses for WebP, at the version the lockfile holds.
+image-webp = "0.2.4"
 # The sync root's watcher: the version the sync engine's watcher locks.
 notify = "8.2.0"
 # The sealing key.

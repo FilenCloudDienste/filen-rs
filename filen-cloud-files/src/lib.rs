@@ -28,6 +28,7 @@ mod populate;
 mod root_path;
 #[cfg(any(test, feature = "test-seams"))]
 pub mod test_support;
+mod thumbnails;
 
 /// Seals the OS-facing traits: only this crate implements them, so the core can rely on what each
 /// implementation does.
@@ -81,8 +82,8 @@ pub use os::cfapi::{CfCall, Hresult, ProviderInfoError, SyncRootPathError, WinEr
 #[cfg(windows)]
 pub use os::win::{
 	ConnectError, ConnectFailed, ConnectedRoot, DisconnectFailed, PlatformInfo, ProviderInfo,
-	RegisterFailed, RegisteredRoot, SyncRootPath, UnregisterFailed, WinLocalFs, WinPlatform,
-	WinSettled, is_elevated, platform_info, register, take_over, unregister_path,
+	RegisterFailed, RegisteredRoot, SyncRootPath, ThumbnailServer, UnregisterFailed, WinLocalFs,
+	WinPlatform, WinSettled, is_elevated, platform_info, register, take_over, unregister_path,
 	volume_file_system,
 };
 pub use placeholder::{
@@ -90,3 +91,4 @@ pub use placeholder::{
 };
 pub use populate::{SkipReason, SkippedItem};
 pub use root_path::{CaseKey, RootPath, RootPathError};
+pub use thumbnails::{Thumbnail, ThumbnailAlpha, ThumbnailHandler, ThumbnailRefusal};

@@ -48,6 +48,7 @@ use crate::{
 	local::{LocalConfig, LocalEngine},
 	log_safe,
 	os::LocalFs,
+	thumbnails::{ThumbnailConfig, ThumbnailService},
 };
 
 /// How many requests wait, read and parsed, for the command loop.
@@ -206,6 +207,11 @@ struct Helper<P: Platform, O: DriveOpener> {
 	/// The kept reports the last reply carried, by user: the parent's next request says it read
 	/// them, and their records go.
 	reported: Vec<(UserId, Vec<KeptId>)>,
+	/// Answers File Explorer's thumbnail requests for the served root, and refuses them while none
+	/// is. Reason for the Arc: the thumbnail server's handler holds it too.
+	thumbnails: Arc<ThumbnailService<P::Local, O::Drive>>,
+	/// The thumbnail server, for the life of the run; `None` on a build that serves none.
+	thumbnail_server: Option<P::Thumbnails>,
 }
 
 /// One line from the parent, as the reader hands it on.
@@ -329,6 +335,22 @@ where
 	let (stop, stopping) = watch::channel(false);
 	let reader = tokio::spawn(read_input(input, tx, stop));
 	let callback = events::reporting(out.clone(), config.coalesce);
+	let thumbnails = Arc::new(ThumbnailService::new(
+		ThumbnailConfig::default(),
+		Handle::current(),
+	));
+	let thumbnail_server = {
+		let platform = Arc::clone(&platform);
+		let handler = thumbnails.handler();
+		match blocking(move || platform.serve_thumbnails(handler)).await {
+			Ok(server) => server,
+			Err(error) => {
+				// File Explorer then gets the class's fallback, which refuses every request.
+				warn!(%error, "serving File Explorer's thumbnails failed");
+				None
+			}
+		}
+	};
 	let mut helper = Helper {
 		platform,
 		opener: Arc::new(opener),
@@ -339,6 +361,8 @@ where
 		stopping,
 		phase: Phase::Idle,
 		reported: Vec::new(),
+		thumbnails,
+		thumbnail_server,
 	};
 	helper.status();
 	let reason = loop {
@@ -952,6 +976,7 @@ impl<P: Platform, O: DriveOpener> Helper<P, O> {
 			blocking(move || platform.local_fs(&root)).await
 		};
 		// The engine keeps what it needs across a restart in the root's data directory.
+		let thumbnail_local = Arc::clone(&local);
 		let engine = Arc::new(LocalEngine::new_keeping_records(
 			Arc::clone(&drive),
 			local,
@@ -983,6 +1008,8 @@ impl<P: Platform, O: DriveOpener> Helper<P, O> {
 			}
 		};
 		engine.start();
+		self.thumbnails
+			.serve(registered.root.clone(), thumbnail_local, Arc::clone(&drive));
 		let watching = Arc::new(AtomicBool::new(false));
 		let keeper = {
 			let engine = Arc::clone(&engine);
@@ -1108,6 +1135,7 @@ impl<P: Platform, O: DriveOpener> Helper<P, O> {
 			branding,
 			..
 		} = serving;
+		self.thumbnails.stop_serving();
 		// Awaited, a watcher still starting included, so no watcher outlives the engine.
 		keeper.stop().await;
 		for probe in probes {
@@ -1364,6 +1392,10 @@ impl<P: Platform, O: DriveOpener> Helper<P, O> {
 				watching: false,
 			}));
 			self.stop_serving(*serving).await;
+		}
+		if let Some(server) = self.thumbnail_server.take() {
+			let platform = Arc::clone(&self.platform);
+			blocking(move || platform.stop_thumbnails(server)).await;
 		}
 	}
 }
