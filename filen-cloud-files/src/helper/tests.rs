@@ -2666,3 +2666,54 @@ async fn identify_of_a_file_placeholder_the_cache_holds_as_a_directory_answers_i
 		"the cache holds the placeholder's item as another kind"
 	);
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_build_without_the_com_layer_serves_and_names_no_thumbnail_class() {
+	let disk = Disk::new();
+	let (platform, drive) = world();
+	let mut rig = Rig::start(&disk, &platform, &drive);
+	ok(&rig.register(&disk).await);
+	ok(&rig.set_auth("42", ACCOUNT_ROOT).await);
+	assert_eq!(platform.thumbnail_servers(), (0, 0));
+	assert!(!platform.thumbnail_provider(&disk.root()));
+	assert!(!platform.thumbnail_class());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_build_serving_thumbnails_names_its_class_for_the_root_until_it_is_unregistered() {
+	let disk = Disk::new();
+	let (platform, drive) = world();
+	platform.implement_thumbnails(true);
+	let mut rig = Rig::start(&disk, &platform, &drive);
+	ok(&rig.register(&disk).await);
+	ok(&rig.set_auth("42", ACCOUNT_ROOT).await);
+	assert_eq!(platform.thumbnail_servers(), (1, 0));
+	assert!(platform.thumbnail_handler().is_some());
+	assert!(platform.thumbnail_provider(&disk.root()));
+	assert!(platform.thumbnail_class());
+
+	ok(&rig.request(unregister_request()).await);
+	assert!(!platform.thumbnail_provider(&disk.root()));
+	assert!(!platform.thumbnail_class());
+	assert_eq!(
+		ok(&rig.request(json!({ "t": "shutdown" })).await),
+		&json!({})
+	);
+	assert_eq!(rig.task.await.unwrap(), ExitReason::Shutdown);
+	assert_eq!(platform.thumbnail_servers(), (1, 1));
+	assert!(platform.thumbnail_handler().is_none());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_thumbnail_class_left_by_a_stopped_run_is_swept_at_the_next_start() {
+	let disk = Disk::new();
+	let (platform, drive) = world();
+	let gone = disk.0.path().join("Gone");
+	platform.leave_branding(&gone, UserId::from(7));
+	platform.leave_thumbnails(&gone);
+	let mut rig = Rig::start(&disk, &platform, &drive);
+	assert_eq!(rig.line().await["t"], "hello");
+	ok(&rig.request(json!({ "t": "listRoots" })).await);
+	assert!(!platform.thumbnail_provider(&gone));
+	assert!(!platform.thumbnail_class());
+}

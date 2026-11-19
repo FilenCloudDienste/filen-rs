@@ -1,8 +1,10 @@
 //! Showing a sync root in File Explorer, unpackaged: the registry keys
 //! `StorageProviderSyncRootManager.Register` writes, written by the helper itself as the user (the
 //! machine-wide sync root list lets every user create and delete a subkey of their own), and
-//! removed once the OS let the root go; and the context menu commands the parent names, per user,
-//! removed with the user's last root. The values are `os::cfapi::explorer`'s.
+//! removed once the OS let the root go; the context menu commands the parent names, per user,
+//! removed with the user's last root; and, on a build that serves thumbnails (`com`), the
+//! thumbnail class per user, removed with the user's last root, and the root's entry naming it.
+//! The values are `os::cfapi::explorer`'s.
 
 #[cfg(test)]
 mod tests;
@@ -12,7 +14,7 @@ use std::{io, path::Path};
 use tracing::{debug, warn};
 
 use super::{
-	LOG_TARGET,
+	LOG_TARGET, com,
 	ffi::{self, Hive, RegKey},
 };
 use crate::{
@@ -24,9 +26,11 @@ use crate::{
 			COMMAND_KEY, CommandData, CommandRemoval, DELEGATE_FOLDER_CLSID, DESKTOP_NAMESPACE,
 			FOLDER_VALUE_FLAGS, HIDE_DESKTOP_ICONS, MARKER_VALUE, PROPERTY_BAG_ATTRIBUTES,
 			SHELL_FOLDER_ATTRIBUTES, SHELL32, SORT_ORDER_INDEX, SYNC_ROOT_FLAGS, SYNC_ROOT_MANAGER,
-			USER_CLSIDS, UnbrandablePath, brandable_root, command_removal, command_trees,
-			command_values, icon_resource, is_own_key, namespace_clsid, registry_string, same_root,
-			sync_root_key_name,
+			THUMBNAIL_CLASS_NAME, THUMBNAIL_PROVIDER_VALUE, USER_CLSIDS, UnbrandablePath,
+			brandable_root, command_removal, command_trees, command_values, icon_resource,
+			is_own_key, namespace_clsid, registry_string, same_root, sweeps_navigation_class,
+			sync_root_key_name, thumbnail_class_key, thumbnail_clsid_text,
+			thumbnail_server_command,
 		},
 	},
 };
@@ -124,8 +128,111 @@ fn notify(path: &Path) {
 /// the app is there, the context menu commands, which the entry's provider id scopes. A repeat
 /// writes the same. A failure to write the commands is logged and fails nothing: what shows the
 /// root is written.
+///
+/// Then, on a build that serves thumbnails, the thumbnail class and the entry's value naming it;
+/// on one that does not, the value is removed, so Explorer goes back to its own thumbnails. A
+/// failure there is logged and fails nothing either.
 pub(crate) fn brand(root: &Path, user: UserId, branding: &Branding) -> Result<(), ExplorerError> {
-	brand_as(&own_sid()?, root, user, branding, COMMAND_KEY)
+	let sid = own_sid()?;
+	brand_as(&sid, root, user, branding, COMMAND_KEY)?;
+	let server = if com::is_implemented() {
+		match std::env::current_exe() {
+			Ok(exe) => match exe.to_str().and_then(thumbnail_server_command) {
+				Some(command) => Some(command),
+				None => {
+					warn!(target: LOG_TARGET, ?exe, "the helper's path cannot start the thumbnail class");
+					None
+				}
+			},
+			Err(error) => {
+				warn!(target: LOG_TARGET, %error, "the helper's path is not known; no thumbnail class");
+				None
+			}
+		}
+	} else {
+		None
+	};
+	let (key, clsid) = (thumbnail_class_key(), thumbnail_clsid_text());
+	let class = ThumbnailClass {
+		key: &key,
+		clsid: &clsid,
+	};
+	if let Err(error) = set_thumbnails_as(&sid, user, class, server.as_deref()) {
+		warn!(target: LOG_TARGET, %error, "registering File Explorer's thumbnail class failed");
+	}
+	Ok(())
+}
+
+/// Where a thumbnail class is registered: its key under `HKEY_CURRENT_USER`, and the class id the
+/// root's entry names.
+#[derive(Debug, Clone, Copy)]
+struct ThumbnailClass<'a> {
+	key: &'a str,
+	clsid: &'a str,
+}
+
+/// With `server`, the class's local server command line: writes `class`, marked as this
+/// provider's, with its `LocalServer32`, then the value of `user`'s sync root list entry naming it,
+/// in that order, so Explorer never reads a value naming a class not registered. Without, removes
+/// the entry's value and leaves the class to [`remove_thumbnail_class_unless_rooted`]. The entry is
+/// [`brand_as`]'s, owned by the Windows user `sid`.
+fn set_thumbnails_as(
+	sid: &str,
+	user: UserId,
+	class: ThumbnailClass<'_>,
+	server: Option<&str>,
+) -> Result<(), ExplorerError> {
+	let entry = format!(r"{SYNC_ROOT_MANAGER}\{}", sync_root_key_name(sid, user));
+	let Some(server) = server else {
+		return ffi::reg_delete_value(
+			Hive::LocalMachine,
+			&wide(&entry)?,
+			&wide(THUMBNAIL_PROVIDER_VALUE)?,
+		)
+		.map_err(io("deleting a registry value"));
+	};
+	{
+		let key = create(Hive::CurrentUser, class.key)?;
+		set_string(&key, None, THUMBNAIL_CLASS_NAME, false)?;
+		set_dword(&key, MARKER_VALUE, 1)?;
+	}
+	set_string(
+		&create(Hive::CurrentUser, &format!(r"{}\LocalServer32", class.key))?,
+		None,
+		server,
+		false,
+	)?;
+	let key = create(Hive::LocalMachine, &entry)?;
+	owned_by(&key, sid)?;
+	set_string(&key, Some(THUMBNAIL_PROVIDER_VALUE), class.clsid, false)?;
+	debug!(target: LOG_TARGET, clsid = class.clsid, "registered File Explorer's thumbnail class");
+	Ok(())
+}
+
+/// Removes the thumbnail class at `class` unless the Windows user `sid` still has a sync root list
+/// entry of this provider, and only when it carries this provider's marker: whether it was
+/// removed. A list that cannot be read removes nothing.
+fn remove_thumbnail_class_unless_rooted(sid: &str, class: &str) -> Result<bool, ExplorerError> {
+	if let Some((_, names)) = subkeys(Hive::LocalMachine, SYNC_ROOT_MANAGER)?
+		&& names.iter().any(|name| is_own_key(name, sid))
+	{
+		return Ok(false);
+	}
+	let Some(key) =
+		ffi::reg_open(Hive::CurrentUser, &wide(class)?).map_err(io("opening a registry key"))?
+	else {
+		return Ok(false);
+	};
+	let marked = ffi::reg_query_dword(&key, &wide(MARKER_VALUE)?)
+		.map_err(io("reading a registry value"))?
+		== Some(1);
+	drop(key);
+	if !marked {
+		return Ok(false);
+	}
+	debug!(target: LOG_TARGET, %class, "removing File Explorer's thumbnail class");
+	delete_tree(Hive::CurrentUser, class)?;
+	Ok(true)
 }
 
 /// [`brand`] for the Windows user `sid`, the commands under the key name `commands`.
@@ -302,15 +409,22 @@ pub(crate) fn remove_navigation_entry(clsid: &str) -> Result<(), ExplorerError> 
 /// Removes what shows in File Explorer roots the OS no longer holds as this provider's, as `live`
 /// says of each root's path, for the Windows user this process runs as: its sync root list entries
 /// of this provider (`Filen!<SID>!*`) and its navigation-pane classes carrying this provider's
-/// marker, each with its entry and hidden icon; then, once no entry of the user's is left, the
+/// marker, each with its entry and hidden icon, never the thumbnail class, which is no
+/// navigation-pane entry; then, once no entry of the user's is left, the thumbnail class and the
 /// context menu commands carrying the marker. Nothing else is touched. How many were removed;
 /// every one is tried, and the first failure is returned.
 pub(crate) fn sweep(live: impl Fn(&Path) -> bool) -> Result<u64, ExplorerError> {
-	sweep_as(&own_sid()?, &live, COMMAND_KEY)
+	sweep_as(&own_sid()?, &live, COMMAND_KEY, &thumbnail_class_key())
 }
 
-/// [`sweep`] for the Windows user `sid`, the commands under the key name `commands`.
-fn sweep_as(sid: &str, live: &dyn Fn(&Path) -> bool, commands: &str) -> Result<u64, ExplorerError> {
+/// [`sweep`] for the Windows user `sid`, the commands under the key name `commands` and the
+/// thumbnail class at `thumbnails`.
+fn sweep_as(
+	sid: &str,
+	live: &dyn Fn(&Path) -> bool,
+	commands: &str,
+	thumbnails: &str,
+) -> Result<u64, ExplorerError> {
 	let mut removed = 0_u64;
 	let mut first = Ok(());
 	let mut note = |result: Result<bool, ExplorerError>| match result {
@@ -333,13 +447,20 @@ fn sweep_as(sid: &str, live: &dyn Fn(&Path) -> bool, commands: &str) -> Result<u
 	}
 	match subkeys(Hive::CurrentUser, USER_CLSIDS) {
 		Ok(Some((classes, names))) => {
+			// This build's thumbnail class is no navigation-pane entry whichever class this sweep
+			// was handed: the tests hand it their own.
+			let installed = thumbnail_class_key();
 			for name in &names {
-				note(sweep_class(&classes, name, live));
+				if format!(r"{USER_CLSIDS}\{name}").eq_ignore_ascii_case(&installed) {
+					continue;
+				}
+				note(sweep_class(&classes, name, thumbnails, live));
 			}
 		}
 		Ok(None) => {}
 		Err(error) => note(Err(error)),
 	}
+	note(remove_thumbnail_class_unless_rooted(sid, thumbnails));
 	match remove_commands_unless_rooted(sid, commands) {
 		Ok(count) => removed = removed.saturating_add(count),
 		Err(error) => {
@@ -387,11 +508,13 @@ fn sweep_entry(
 	Ok(true)
 }
 
-/// Removes the navigation-pane class `name` below `classes`, with its entry and hidden icon, when
-/// it carries this provider's marker and the root it names is not `live`: whether it was removed.
+/// Removes the navigation-pane class `name` below `classes`, with its entry and hidden icon, as
+/// [`sweeps_navigation_class`] says: when it carries this provider's marker, is not the thumbnail
+/// class at `thumbnails`, and the root it names is not `live`. Whether it was removed.
 fn sweep_class(
 	classes: &RegKey,
 	name: &str,
+	thumbnails: &str,
 	live: &dyn Fn(&Path) -> bool,
 ) -> Result<bool, ExplorerError> {
 	let Some(class) =
@@ -402,18 +525,27 @@ fn sweep_class(
 	let marked = ffi::reg_query_dword(&class, &wide(MARKER_VALUE)?)
 		.map_err(io("reading a registry value"))?
 		== Some(1);
-	if !marked {
-		return Ok(false);
-	}
-	let root = match ffi::reg_open_subkey(&class, &wide(r"Instance\InitPropertyBag")?)
-		.map_err(io("opening a registry key"))?
-	{
-		Some(bag) => ffi::reg_query_string(&bag, Some(&wide("TargetFolderPath")?))
-			.map_err(io("reading a registry value"))?,
-		None => None,
+	let root = || -> Result<Option<String>, ExplorerError> {
+		let bag = ffi::reg_open_subkey(&class, &wide(r"Instance\InitPropertyBag")?)
+			.map_err(io("opening a registry key"))?;
+		let Some(bag) = bag else {
+			return Ok(None);
+		};
+		Ok(
+			ffi::reg_query_string(&bag, Some(&wide("TargetFolderPath")?))
+				.map_err(io("reading a registry value"))?
+				.map(|root| String::from_utf16_lossy(&root)),
+		)
 	};
+	let swept = sweeps_navigation_class(
+		&format!(r"{USER_CLSIDS}\{name}"),
+		thumbnails,
+		marked,
+		root,
+		|root| live(Path::new(root)),
+	)?;
 	drop(class);
-	if root.is_some_and(|root| live(Path::new(&String::from_utf16_lossy(&root)))) {
+	if !swept {
 		return Ok(false);
 	}
 	// Any key text, not checked as a class name: quoted.
@@ -426,22 +558,33 @@ fn sweep_class(
 /// user this process runs as: as the user, the sync root list entry, then the navigation-pane
 /// entry, and the context menu commands once no sync root list entry of the user's is left;
 /// elevated, only the sync root list entry. Each only when it names `root`, as another root of the
-/// same user has the same names. Every step is tried; the first failure is returned.
+/// same user has the same names. The entry's thumbnail value goes with the entry, and, as the user,
+/// the thumbnail class with the user's last entry. Every step is tried; the first failure is
+/// returned.
 pub(crate) fn unbrand(
 	root: &Path,
 	user: UserId,
 	scope: BrandingScope,
 ) -> Result<(), ExplorerError> {
-	unbrand_as(&own_sid()?, root, user, scope, COMMAND_KEY)
+	unbrand_as(
+		&own_sid()?,
+		root,
+		user,
+		scope,
+		COMMAND_KEY,
+		&thumbnail_class_key(),
+	)
 }
 
-/// [`unbrand`] for the Windows user `sid`, the commands under the key name `commands`.
+/// [`unbrand`] for the Windows user `sid`, the commands under the key name `commands` and the
+/// thumbnail class at `thumbnails`.
 fn unbrand_as(
 	sid: &str,
 	root: &Path,
 	user: UserId,
 	scope: BrandingScope,
 	commands: &str,
+	thumbnails: &str,
 ) -> Result<(), ExplorerError> {
 	let root_text = root.to_str().ok_or(ExplorerError::NotUtf8)?;
 	let entry = format!(r"{SYNC_ROOT_MANAGER}\{}", sync_root_key_name(sid, user));
@@ -468,9 +611,13 @@ fn unbrand_as(
 					Ok(())
 				}
 			});
-			// After the entry's removal, which the commands outlive only while another entry is left.
+			// After the entry's removal, which the commands and the thumbnail class outlive only
+			// while another entry is left.
 			let offered = remove_commands_unless_rooted(sid, commands).map(|_| ());
-			[machine, navigation, offered].into_iter().collect()
+			let thumbnail_class = remove_thumbnail_class_unless_rooted(sid, thumbnails).map(|_| ());
+			[machine, navigation, offered, thumbnail_class]
+				.into_iter()
+				.collect()
 		}
 		BrandingScope::MachineOnly => machine,
 	};

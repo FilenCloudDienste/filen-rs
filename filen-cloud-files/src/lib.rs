@@ -57,9 +57,10 @@ pub use helper::{
 	MAX_MESSAGE_CHARS, MIN_BUILD, OutMessage, PROTOCOL_VERSION, ParseError, PhaseName, Platform,
 	PlatformError, PlatformFailed, PlatformOp, Registration, ReplyError, ReplyValue, Request,
 	RequestId, RootDir, RootDirError, RootListing, RootRefusal, SkippedEntry, SkippedPlace,
-	StateDir, StateDirError, StateLock, StateReport, StatusEvent, UnregisterAll,
-	UnregisterAllEntry, UnregisterReport, UserId, fatal, install_stderr_logging, parse_line,
-	run_helper, serve_stdio, unregister_all, unregister_all_stdio,
+	StateDir, StateDirError, StateLock, StateReport, StatusEvent, THUMBNAIL_SERVER_ARG,
+	THUMBNAIL_SERVER_IDLE, UnregisterAll, UnregisterAllEntry, UnregisterReport, UserId, fatal,
+	install_stderr_logging, parse_line, run_helper, serve_refusing_thumbnails, serve_stdio,
+	unregister_all, unregister_all_stdio,
 };
 pub use identity::{IdentityBlob, IdentityError, MAX_IDENTITY_LEN, PlaceholderIdentity};
 pub use local::{

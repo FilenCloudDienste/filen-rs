@@ -5,7 +5,7 @@
 
 use crate::{
 	branding::{AppPath, Branding, CommandLabel, ExplorerCommands, IconPath},
-	helper::{ExistingRoot, UserId},
+	helper::{ExistingRoot, THUMBNAIL_SERVER_ARG, UserId},
 };
 
 /// The machine-wide sync root list, under `HKEY_LOCAL_MACHINE`. Its ACL lets every user create
@@ -59,6 +59,39 @@ pub(crate) const SORT_ORDER_INDEX: u32 = 0x42;
 /// This provider's thumbnail class, which the helper exe serves as a COM local server
 /// (`os::win::com`): `{CE43ED2E-6C0A-4846-A973-E43FFFACF389}`, minted for it.
 pub(crate) const THUMBNAIL_CLSID: u128 = 0xce43_ed2e_6c0a_4846_a973_e43f_ffac_f389;
+
+/// The sync root list entry's value naming the COM class File Explorer asks for the thumbnails of
+/// the root's files. Measured: once it is set, Explorer asks only that class, out of process, for
+/// every file of the root, hydrated ones included, so it is written only by a build that serves
+/// the class.
+pub(crate) const THUMBNAIL_PROVIDER_VALUE: &str = "ThumbnailProvider";
+
+/// The thumbnail class's name: its key's default value.
+pub(crate) const THUMBNAIL_CLASS_NAME: &str = "Filen thumbnails";
+
+/// [`THUMBNAIL_CLSID`] as the registry spells a class: braced, upper-case hex.
+pub(crate) fn thumbnail_clsid_text() -> String {
+	let clsid = THUMBNAIL_CLSID;
+	format!(
+		"{{{:08X}-{:04X}-{:04X}-{:04X}-{:012X}}}",
+		clsid >> 96,
+		(clsid >> 80) & 0xffff,
+		(clsid >> 64) & 0xffff,
+		(clsid >> 48) & 0xffff,
+		clsid & 0xffff_ffff_ffff
+	)
+}
+
+/// The thumbnail class's key, under `HKEY_CURRENT_USER`: a class of the user's own.
+pub(crate) fn thumbnail_class_key() -> String {
+	format!(r"{USER_CLSIDS}\{}", thumbnail_clsid_text())
+}
+
+/// The thumbnail class's `LocalServer32` command line, which starts the helper exe at `exe`:
+/// quoted, as the path may hold spaces; `None` for a path holding a `"`, which no quoting carries.
+pub(crate) fn thumbnail_server_command(exe: &str) -> Option<String> {
+	(!exe.contains('"')).then(|| format!("\"{exe}\" {THUMBNAIL_SERVER_ARG}"))
+}
 
 /// The sync root list entry of `user`'s root for the Windows user `sid`: `Filen!<SID>!<userId>`.
 pub(crate) fn sync_root_key_name(sid: &str, user: UserId) -> String {
@@ -364,6 +397,26 @@ pub(crate) fn same_root(a: &str, b: &str) -> bool {
 	trim(a) == trim(b)
 }
 
+/// Whether the sweep removes the class at `class` below `HKEY_CURRENT_USER` as a navigation-pane
+/// entry left behind, from what it read of the key: whether it carries this provider's `marked`,
+/// and the root its `Instance\InitPropertyBag` names, read by `root` only for a marked class that
+/// is not the thumbnail class at `thumbnails`, and kept when `live`. The thumbnail class carries
+/// the marker too but no property bag, and is never a navigation-pane entry: it goes with the
+/// user's last sync root list entry instead. A class without the marker is never touched. Key
+/// names compare without case, as the registry's do.
+pub(crate) fn sweeps_navigation_class<E>(
+	class: &str,
+	thumbnails: &str,
+	marked: bool,
+	root: impl FnOnce() -> Result<Option<String>, E>,
+	live: impl FnOnce(&str) -> bool,
+) -> Result<bool, E> {
+	if !marked || class.eq_ignore_ascii_case(thumbnails) {
+		return Ok(false);
+	}
+	Ok(!root()?.is_some_and(|root| live(&root)))
+}
+
 /// Whether the sweep leaves what shows a root in File Explorer, the OS having reported
 /// `registration` of its path: unless the OS positively holds no registration of this provider's
 /// there. One that cannot be read counts as live, and so does a root on a volume not present
@@ -386,6 +439,28 @@ mod tests {
 	use super::*;
 
 	const SID: &str = "S-1-5-21-3291749577-2867003985-2111167235-1000";
+
+	#[test]
+	fn the_thumbnail_class_is_spelled_as_the_registry_spells_a_class() {
+		assert_eq!(
+			thumbnail_clsid_text(),
+			"{CE43ED2E-6C0A-4846-A973-E43FFFACF389}"
+		);
+		assert_eq!(
+			thumbnail_class_key(),
+			r"Software\Classes\CLSID\{CE43ED2E-6C0A-4846-A973-E43FFFACF389}"
+		);
+	}
+
+	#[test]
+	fn the_thumbnail_server_command_quotes_the_exe_and_names_the_mode() {
+		assert_eq!(
+			thumbnail_server_command(r"C:\Program Files\Filen\resources\filen-cloud-files.exe")
+				.as_deref(),
+			Some(r#""C:\Program Files\Filen\resources\filen-cloud-files.exe" --thumbnail-server"#)
+		);
+		assert_eq!(thumbnail_server_command(r#"C:\a"b.exe"#), None);
+	}
 
 	#[test]
 	fn the_thumbnail_class_is_its_own_and_not_the_probes() {
@@ -485,6 +560,64 @@ mod tests {
 				"{registration:?} volume present {volume_present}"
 			);
 		}
+	}
+
+	/// What [`sweeps_navigation_class`] decides for the class `class` read as `marked` with the
+	/// property bag `bag`, its root `live` or not, and whether it read the bag.
+	fn swept(class: &str, marked: bool, bag: Option<&str>, live: bool) -> (bool, bool) {
+		let mut read = false;
+		let removed = sweeps_navigation_class::<()>(
+			class,
+			&thumbnail_class_key(),
+			marked,
+			|| {
+				read = true;
+				Ok(bag.map(str::to_owned))
+			},
+			|_| live,
+		)
+		.unwrap();
+		(removed, read)
+	}
+
+	#[test]
+	fn the_navigation_sweep_keeps_the_marked_thumbnail_class_without_a_property_bag() {
+		let thumbnails = thumbnail_class_key();
+		assert_eq!(swept(&thumbnails, true, None, false), (false, false));
+		// Key names compare without case.
+		assert_eq!(
+			swept(&thumbnails.to_lowercase(), true, None, false),
+			(false, false)
+		);
+	}
+
+	#[test]
+	fn the_navigation_sweep_removes_a_marked_class_whose_root_is_not_live() {
+		let class = format!(r"{USER_CLSIDS}\{}", namespace_clsid(SID, UserId::from(42)));
+		let root = Some(r"C:\Users\u\Filen");
+		assert_eq!(swept(&class, true, root, false), (true, true));
+		assert_eq!(swept(&class, true, root, true), (false, true));
+		// A class a write cut short left before its property bag.
+		assert_eq!(swept(&class, true, None, true), (true, true));
+	}
+
+	#[test]
+	fn the_navigation_sweep_never_touches_an_unmarked_class() {
+		let class = format!(r"{USER_CLSIDS}\{{0E5AAE11-A475-4C5B-AB00-C66DE400274E}}");
+		assert_eq!(swept(&class, false, None, false), (false, false));
+		assert_eq!(
+			swept(&thumbnail_class_key(), false, None, false),
+			(false, false)
+		);
+	}
+
+	#[test]
+	fn the_navigation_sweep_passes_a_failed_read_of_the_property_bag_on() {
+		let class = format!(r"{USER_CLSIDS}\{}", namespace_clsid(SID, UserId::from(42)));
+		assert_eq!(
+			sweeps_navigation_class(&class, &thumbnail_class_key(), true, || Err("x"), |_| true),
+			Err("x")
+		);
 	}
 
 	#[test]

@@ -159,6 +159,10 @@ struct ThumbnailState {
 	handler: Option<ThumbnailHandler>,
 	/// How many servers were started and stopped.
 	servers: (usize, usize),
+	/// The roots whose sync root list entry names the thumbnail class.
+	provider: HashSet<PathBuf>,
+	/// Whether the user's thumbnail class is registered.
+	class: bool,
 }
 
 /// The fake's running thumbnail server.
@@ -460,6 +464,24 @@ impl FakePlatform {
 	/// The handler the running thumbnail server answers File Explorer with, if one runs.
 	pub fn thumbnail_handler(&self) -> Option<ThumbnailHandler> {
 		self.state().thumbnails.handler.clone()
+	}
+
+	/// Whether the sync root list entry of `root` names the thumbnail class.
+	pub fn thumbnail_provider(&self, root: &Path) -> bool {
+		self.state().thumbnails.provider.contains(root)
+	}
+
+	/// Whether the user's thumbnail class is registered.
+	pub fn thumbnail_class(&self) -> bool {
+		self.state().thumbnails.class
+	}
+
+	/// Leaves the thumbnail class and `root`'s entry naming it, as a run stopped before removing
+	/// them does; the entry itself is [`FakePlatform::leave_branding`]'s.
+	pub fn leave_thumbnails(&self, root: &Path) {
+		let thumbnails = &mut self.state().thumbnails;
+		thumbnails.class = true;
+		thumbnails.provider.insert(root.to_path_buf());
 	}
 
 	/// How many thumbnail servers were started, and how many stopped.
@@ -813,6 +835,15 @@ impl Platform for FakePlatform {
 		if let Some(commands) = &branding.commands {
 			state.commands = Some((**commands).clone());
 		}
+		// Then the thumbnail class and the entry's value, on a build serving thumbnails; on
+		// another, the value goes.
+		let thumbnails = &mut state.thumbnails;
+		if thumbnails.implemented {
+			thumbnails.class = true;
+			thumbnails.provider.insert(root.to_path_buf());
+		} else {
+			thumbnails.provider.remove(root);
+		}
 		Ok(())
 	}
 
@@ -837,6 +868,8 @@ impl Platform for FakePlatform {
 		}
 		if state.machine_branding.get(root) == Some(&user) {
 			state.machine_branding.remove(root);
+			// The value goes with its entry.
+			state.thumbnails.provider.remove(root);
 		}
 		if scope == BrandingScope::User
 			&& state
@@ -846,9 +879,11 @@ impl Platform for FakePlatform {
 		{
 			state.user_branding.remove(root);
 		}
-		// The commands go with the user's last sync root list entry; elevated, they stay.
+		// The commands and the thumbnail class go with the user's last sync root list entry;
+		// elevated, they stay.
 		if scope == BrandingScope::User && state.machine_branding.is_empty() {
 			state.commands = None;
+			state.thumbnails.class = false;
 		}
 		Ok(())
 	}
@@ -885,13 +920,16 @@ impl Platform for FakePlatform {
 			state.machine_branding.len()
 				+ state.user_branding.len()
 				+ usize::from(state.commands.is_some())
+				+ usize::from(state.thumbnails.class)
 		};
 		let before = held(&state);
 		state.machine_branding.retain(|root, _| live.contains(root));
 		state.user_branding.retain(|root, _| live.contains(root));
-		// The commands go once no sync root list entry is left.
+		state.thumbnails.provider.retain(|root| live.contains(root));
+		// The commands and the thumbnail class go once no sync root list entry is left.
 		if state.machine_branding.is_empty() {
 			state.commands = None;
+			state.thumbnails.class = false;
 		}
 		let after = held(&state);
 		Ok(u64::try_from(before - after).unwrap_or(u64::MAX))

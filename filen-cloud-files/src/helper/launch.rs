@@ -5,16 +5,22 @@
 use std::{
 	fs::{File, TryLockError},
 	io::Write,
+	sync::{Arc, Mutex, PoisonError},
+	time::{Duration, Instant},
 };
 
 use tokio::runtime::Runtime;
+use tracing::{info, warn};
 
-use crate::helper::{
-	HelperConfig, StateDir,
-	platform::{DriveOpener, Platform},
-	protocol::{FatalCode, OutMessage},
-	supervisor::run_helper,
-	unregister::unregister_all,
+use crate::{
+	helper::{
+		HelperConfig, StateDir,
+		platform::{DriveOpener, Platform},
+		protocol::{FatalCode, OutMessage},
+		supervisor::run_helper,
+		unregister::unregister_all,
+	},
+	thumbnails::{ThumbnailHandler, ThumbnailRefusal},
 };
 
 /// The oldest Windows build the provider runs on: 19041 (Windows 10 2004) is the oldest base still
@@ -78,6 +84,62 @@ fn check_build<P: Platform>(platform: &P) -> Result<(), (FatalCode, String)> {
 			format!("Windows build {build:?} is older than {MIN_BUILD}"),
 		)),
 	}
+}
+
+/// The argument the thumbnail class's local server command line starts the helper exe with
+/// (`"<exe>" --thumbnail-server`): what tells an instance COM started, to which COM appends
+/// `-Embedding`, from one the desktop app spawned.
+pub const THUMBNAIL_SERVER_ARG: &str = "--thumbnail-server";
+
+/// How long the instance COM started waits for a thumbnail request before it exits.
+pub const THUMBNAIL_SERVER_IDLE: Duration = Duration::from_secs(10);
+
+/// A handler that answers every request [`ThumbnailRefusal::SignedOut`], noting when it was last
+/// asked in `asked`.
+fn refusing_handler(asked: Arc<Mutex<Instant>>) -> ThumbnailHandler {
+	Arc::new(move |_, _| {
+		*asked.lock().unwrap_or_else(PoisonError::into_inner) = Instant::now();
+		Err(ThumbnailRefusal::SignedOut)
+	})
+}
+
+/// Serves the thumbnail class as the instance COM starts when no helper serves it, which is when
+/// none runs: it answers every request [`ThumbnailRefusal::SignedOut`], as no root is served, and
+/// exits once `idle` passed without a request. It never takes the state directory's lock, opens a
+/// session or connects a root. The process's exit code: 0, also on a build that serves no
+/// thumbnails, which exits at once; 1 when the server could not start. Refuses, with one `fatal`
+/// line, to run elevated.
+pub fn serve_refusing_thumbnails<P: Platform>(platform: P, idle: Duration) -> u8 {
+	if platform.elevated() {
+		return fatal(
+			FatalCode::Elevated,
+			"the thumbnail server runs elevated; run it as the signed-in user",
+		);
+	}
+	let asked = Arc::new(Mutex::new(Instant::now()));
+	let server = match platform.serve_thumbnails(refusing_handler(Arc::clone(&asked))) {
+		Ok(Some(server)) => server,
+		Ok(None) => {
+			info!("this build serves no thumbnails; exiting");
+			return 0;
+		}
+		Err(error) => {
+			warn!(%error, "the thumbnail server could not start");
+			return 1;
+		}
+	};
+	loop {
+		let quiet = asked
+			.lock()
+			.unwrap_or_else(PoisonError::into_inner)
+			.elapsed();
+		let Some(left) = idle.checked_sub(quiet).filter(|left| !left.is_zero()) else {
+			break;
+		};
+		std::thread::sleep(left.min(Duration::from_secs(1)));
+	}
+	platform.stop_thumbnails(server);
+	0
 }
 
 /// The multi-thread runtime the helper runs on.
@@ -157,7 +219,13 @@ pub fn unregister_all_stdio<P: Platform>(
 
 #[cfg(test)]
 mod tests {
+	use filen_types::fs::Uuid;
+
 	use super::*;
+	use crate::{
+		identity::PlaceholderIdentity,
+		test_support::{FakeLocal, FakePlatform},
+	};
 
 	#[test]
 	fn a_second_lock_on_the_state_directory_is_refused_until_the_first_goes() {
@@ -182,6 +250,50 @@ mod tests {
 			StateLock::acquire(&dir).unwrap_err().0,
 			FatalCode::StateDirInvalid
 		);
+	}
+
+	#[test]
+	fn the_instance_com_starts_refuses_every_request_and_notes_it() {
+		let start = Instant::now();
+		let asked = Arc::new(Mutex::new(start));
+		let handler = refusing_handler(Arc::clone(&asked));
+		assert_eq!(
+			handler(std::path::Path::new(r"C:\Users\u\Filen\a.jpg"), 96),
+			Err(ThumbnailRefusal::SignedOut)
+		);
+		assert!(*asked.lock().unwrap() >= start);
+	}
+
+	#[test]
+	fn the_instance_com_starts_stops_its_server_once_idle() {
+		let platform = FakePlatform::new(FakeLocal::new(PlaceholderIdentity::Root {
+			root: Uuid::from_u128(1),
+		}));
+		platform.implement_thumbnails(true);
+		assert_eq!(
+			serve_refusing_thumbnails(platform.clone(), Duration::ZERO),
+			0
+		);
+		assert_eq!(platform.thumbnail_servers(), (1, 1));
+	}
+
+	#[test]
+	fn the_instance_com_starts_exits_at_once_on_a_build_serving_none_and_refuses_elevation() {
+		let platform = FakePlatform::new(FakeLocal::new(PlaceholderIdentity::Root {
+			root: Uuid::from_u128(1),
+		}));
+		assert_eq!(
+			serve_refusing_thumbnails(platform.clone(), THUMBNAIL_SERVER_IDLE),
+			0
+		);
+		assert_eq!(platform.thumbnail_servers(), (0, 0));
+		platform.implement_thumbnails(true);
+		platform.set_elevated(true);
+		assert_eq!(
+			serve_refusing_thumbnails(platform.clone(), THUMBNAIL_SERVER_IDLE),
+			FatalCode::Elevated.exit_code()
+		);
+		assert_eq!(platform.thumbnail_servers(), (0, 0));
 	}
 
 	#[test]

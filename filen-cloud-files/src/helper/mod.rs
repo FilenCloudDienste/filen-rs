@@ -18,7 +18,10 @@ mod watch_keeper;
 
 pub(crate) use identify::{HOST, below_root};
 pub use index::{StateDir, StateDirError};
-pub use launch::{MIN_BUILD, StateLock, fatal, serve_stdio, unregister_all_stdio};
+pub use launch::{
+	MIN_BUILD, StateLock, THUMBNAIL_SERVER_ARG, THUMBNAIL_SERVER_IDLE, fatal,
+	serve_refusing_thumbnails, serve_stdio, unregister_all_stdio,
+};
 pub use logging::install_stderr_logging;
 pub use platform::{
 	BrandingScope, CacheOpener, DriveOpener, ExistingRoot, Platform, PlatformError, PlatformFailed,

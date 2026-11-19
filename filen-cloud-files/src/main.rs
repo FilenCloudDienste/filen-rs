@@ -4,7 +4,9 @@
 //!
 //! `filen-cloud-files --state-dir <dir> [--log-level <level>]` serves; `filen-cloud-files
 //! --unregister-all --state-dir <dir> [--keep-hydrated]` unregisters every root, as the
-//! uninstaller does. A refusal to start is one `fatal` line and its code's exit code
+//! uninstaller does; `filen-cloud-files --thumbnail-server [-Embedding]` is what COM starts for File
+//! Explorer's thumbnail class when no helper serves it: it refuses every request and exits once
+//! idle (see `serve_refusing_thumbnails`). A refusal to start is one `fatal` line and its code's exit code
 //! (`FatalCode::exit_code`): 2 a wrong command line, 10 elevated, 11 a Windows build older than
 //! supported, 12 another helper holds the state directory, 13 the state directory is unusable, 14
 //! not Windows, 15 the async runtime could not be built. `--unregister-all` exits 0 when every root is gone, 20 when something was kept or
@@ -19,24 +21,29 @@ use std::{ffi::OsString, path::PathBuf, process::ExitCode, str::FromStr};
 
 #[cfg(windows)]
 use filen_cloud_files::{
-	CacheOpener, HelperConfig, StateDir, WinPlatform, install_stderr_logging, serve_stdio,
-	unregister_all_stdio,
+	CacheOpener, HelperConfig, StateDir, THUMBNAIL_SERVER_IDLE, WinPlatform,
+	install_stderr_logging, serve_refusing_thumbnails, serve_stdio, unregister_all_stdio,
 };
-use filen_cloud_files::{FatalCode, fatal};
+use filen_cloud_files::{FatalCode, THUMBNAIL_SERVER_ARG, fatal};
 use tracing::level_filters::LevelFilter;
 
 /// What the command line asks.
 #[derive(Debug, PartialEq, Eq)]
 struct Args {
-	state_dir: PathBuf,
 	log_level: LevelFilter,
 	mode: Mode,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 enum Mode {
-	Serve,
-	UnregisterAll { delete_hydrated: bool },
+	Serve {
+		state_dir: PathBuf,
+	},
+	UnregisterAll {
+		state_dir: PathBuf,
+		delete_hydrated: bool,
+	},
+	ThumbnailServer,
 }
 
 /// The command line `args`, or why it is wrong.
@@ -46,6 +53,8 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Args, String> {
 	let mut log_level = LevelFilter::INFO;
 	let mut unregister_all = false;
 	let mut keep_hydrated = false;
+	let mut thumbnail_server = false;
+	let mut embedding = false;
 	while let Some(arg) = args.next() {
 		match arg.to_str() {
 			Some("--state-dir") => {
@@ -62,22 +71,37 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Args, String> {
 			}
 			Some("--unregister-all") => unregister_all = true,
 			Some("--keep-hydrated") => keep_hydrated = true,
+			Some(THUMBNAIL_SERVER_ARG) => thumbnail_server = true,
+			// What COM appends to a local server's command line.
+			Some("-Embedding" | "/Embedding") => embedding = true,
 			_ => return Err(format!("unknown argument {arg:?}")),
 		}
+	}
+	if thumbnail_server {
+		if state_dir.is_some() || unregister_all || keep_hydrated {
+			return Err(format!("{THUMBNAIL_SERVER_ARG} takes only --log-level"));
+		}
+		return Ok(Args {
+			log_level,
+			mode: Mode::ThumbnailServer,
+		});
+	}
+	if embedding {
+		return Err(format!("-Embedding goes with {THUMBNAIL_SERVER_ARG}"));
 	}
 	let state_dir = state_dir.ok_or("--state-dir is required")?;
 	if keep_hydrated && !unregister_all {
 		return Err("--keep-hydrated goes with --unregister-all".to_owned());
 	}
 	Ok(Args {
-		state_dir,
 		log_level,
 		mode: if unregister_all {
 			Mode::UnregisterAll {
+				state_dir,
 				delete_hydrated: !keep_hydrated,
 			}
 		} else {
-			Mode::Serve
+			Mode::Serve { state_dir }
 		},
 	})
 }
@@ -102,15 +126,20 @@ fn run(_args: Args) -> u8 {
 fn run(args: Args) -> u8 {
 	// Before anything else logs: the cache installs a logger on stdout when none is.
 	install_stderr_logging(args.log_level);
-	let state_dir = match StateDir::new(args.state_dir) {
-		Ok(dir) => dir,
-		Err(error) => return fatal(FatalCode::StateDirInvalid, &error.to_string()),
-	};
+	let state_dir = |dir: PathBuf| StateDir::new(dir).map_err(|error| error.to_string());
 	match args.mode {
-		Mode::Serve => serve_stdio(WinPlatform, CacheOpener, HelperConfig::new(state_dir)),
-		Mode::UnregisterAll { delete_hydrated } => {
-			unregister_all_stdio(WinPlatform, &state_dir, delete_hydrated)
-		}
+		Mode::Serve { state_dir: dir } => match state_dir(dir) {
+			Ok(dir) => serve_stdio(WinPlatform, CacheOpener, HelperConfig::new(dir)),
+			Err(message) => fatal(FatalCode::StateDirInvalid, &message),
+		},
+		Mode::UnregisterAll {
+			state_dir: dir,
+			delete_hydrated,
+		} => match state_dir(dir) {
+			Ok(dir) => unregister_all_stdio(WinPlatform, &dir, delete_hydrated),
+			Err(message) => fatal(FatalCode::StateDirInvalid, &message),
+		},
+		Mode::ThumbnailServer => serve_refusing_thumbnails(WinPlatform, THUMBNAIL_SERVER_IDLE),
 	}
 }
 
@@ -127,9 +156,10 @@ mod tests {
 		assert_eq!(
 			args(&["--state-dir", "C:\\s"]).unwrap(),
 			Args {
-				state_dir: PathBuf::from("C:\\s"),
 				log_level: LevelFilter::INFO,
-				mode: Mode::Serve,
+				mode: Mode::Serve {
+					state_dir: PathBuf::from("C:\\s"),
+				},
 			}
 		);
 		assert!(args(&[]).is_err());
@@ -143,6 +173,7 @@ mod tests {
 				.unwrap()
 				.mode,
 			Mode::UnregisterAll {
+				state_dir: PathBuf::from("s"),
 				delete_hydrated: true
 			}
 		);
@@ -151,10 +182,25 @@ mod tests {
 				.unwrap()
 				.mode,
 			Mode::UnregisterAll {
+				state_dir: PathBuf::from("s"),
 				delete_hydrated: false
 			}
 		);
 		assert!(args(&["--keep-hydrated", "--state-dir", "s"]).is_err());
+	}
+
+	#[test]
+	fn the_thumbnail_server_com_starts_needs_no_state_dir_and_takes_embedding() {
+		for line in [
+			&["--thumbnail-server"][..],
+			&["--thumbnail-server", "-Embedding"],
+			&["--thumbnail-server", "/Embedding"],
+		] {
+			assert_eq!(args(line).unwrap().mode, Mode::ThumbnailServer, "{line:?}");
+		}
+		assert!(args(&["--thumbnail-server", "--state-dir", "s"]).is_err());
+		assert!(args(&["--thumbnail-server", "--unregister-all"]).is_err());
+		assert!(args(&["--state-dir", "s", "-Embedding"]).is_err());
 	}
 
 	#[test]

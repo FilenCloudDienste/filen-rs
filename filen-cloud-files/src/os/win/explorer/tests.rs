@@ -5,7 +5,7 @@
 
 use std::{
 	path::PathBuf,
-	sync::{Mutex, PoisonError},
+	sync::{Mutex, MutexGuard, PoisonError},
 };
 
 use super::*;
@@ -20,12 +20,33 @@ const LONE_SID: &str = "S-1-5-21-1000-1000-1000-4243";
 const SWEPT_SID: &str = "S-1-5-21-1000-1000-1000-4244";
 const UNBRAND_SID: &str = "S-1-5-21-1000-1000-1000-4245";
 
-/// Held by each test that sweeps, for the whole test: the sweep reads every navigation-pane class of
-/// the user, and one of them locks a class of its own against reading until it ends.
-static SWEEPING: Mutex<()> = Mutex::new(());
-
 /// The context menu commands' key name of the tests that write none: no test writes one there.
 const NO_COMMANDS: &str = "FilenCloudFilesTestNone";
+
+/// The thumbnail class key of the tests that write none: no test writes one there.
+const NO_THUMBNAILS: &str = r"Software\Classes\CLSID\{00000000-F11E-4E00-8000-000000000000}";
+
+/// Held by every test that sweeps the user's classes or writes a marked class, a thumbnail class
+/// or a navigation-pane class (`brand_as` marks one before it writes its property bag): a sweep
+/// removes every marked class with no property bag but the thumbnail class it is handed and this
+/// build's, so another test's would vanish mid-test.
+static MARKED_CLASSES: Mutex<()> = Mutex::new(());
+
+/// [`MARKED_CLASSES`], held until the test ends; a test that failed holding it does not fail the
+/// others.
+fn marked_classes() -> MutexGuard<'static, ()> {
+	MARKED_CLASSES
+		.lock()
+		.unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The thumbnail class the thumbnail tests write, each its own.
+fn test_thumbnail_class(n: u8) -> (String, String) {
+	let clsid = format!("{{00000000-F11E-4E00-8000-0000000000{n:02X}}}");
+	(format!(r"{USER_CLSIDS}\{clsid}"), clsid)
+}
+
+const SERVER: &str = r#""C:\filen-explorer-tests\filen-cloud-files.exe" --thumbnail-server"#;
 
 /// The tests' Filen user `n`: no account's id is this high.
 fn test_user(n: u64) -> UserId {
@@ -134,6 +155,7 @@ impl Drop for Cleanup {
 
 #[test]
 fn a_root_is_shown_with_every_key_and_removed_again() {
+	let _marked = marked_classes();
 	let sid = own();
 	let user = test_user(1);
 	let _cleanup = Cleanup::new(&[&sid], &[user]);
@@ -180,7 +202,15 @@ fn a_root_is_shown_with_every_key_and_removed_again() {
 	assert!(present(hkcu, &format!(r"{DESKTOP_NAMESPACE}\{clsid}")));
 	assert_eq!(dword_value(hkcu, HIDE_DESKTOP_ICONS, &clsid), Some(1));
 
-	unbrand_as(&sid, &root, user, BrandingScope::User, NO_COMMANDS).unwrap();
+	unbrand_as(
+		&sid,
+		&root,
+		user,
+		BrandingScope::User,
+		NO_COMMANDS,
+		NO_THUMBNAILS,
+	)
+	.unwrap();
 	assert!(!present(hklm, &entry));
 	assert!(!present(hkcu, &class));
 	assert!(!present(hkcu, &format!(r"{DESKTOP_NAMESPACE}\{clsid}")));
@@ -203,6 +233,7 @@ fn a_root_whose_path_holds_a_percent_sign_is_not_shown() {
 
 #[test]
 fn removing_one_root_leaves_another_root_of_the_same_user_shown() {
+	let _marked = marked_classes();
 	let sid = own();
 	let user = test_user(3);
 	let _cleanup = Cleanup::new(&[&sid], &[user]);
@@ -211,7 +242,15 @@ fn removing_one_root_leaves_another_root_of_the_same_user_shown() {
 	brand_as(&sid, &first, user, &Branding::default(), NO_COMMANDS).unwrap();
 	// A second state directory registered a root of the same user since: the same key names.
 	brand_as(&sid, &second, user, &Branding::default(), NO_COMMANDS).unwrap();
-	unbrand_as(&sid, &first, user, BrandingScope::User, NO_COMMANDS).unwrap();
+	unbrand_as(
+		&sid,
+		&first,
+		user,
+		BrandingScope::User,
+		NO_COMMANDS,
+		NO_THUMBNAILS,
+	)
+	.unwrap();
 	let entry = entry(&sid, user);
 	assert_eq!(
 		string_value(
@@ -231,13 +270,22 @@ fn removing_one_root_leaves_another_root_of_the_same_user_shown() {
 		.as_deref(),
 		second.to_str()
 	);
-	unbrand_as(&sid, &second, user, BrandingScope::User, NO_COMMANDS).unwrap();
+	unbrand_as(
+		&sid,
+		&second,
+		user,
+		BrandingScope::User,
+		NO_COMMANDS,
+		NO_THUMBNAILS,
+	)
+	.unwrap();
 	assert!(!present(Hive::LocalMachine, &entry));
 	assert!(!present(Hive::CurrentUser, &class(&sid, user)));
 }
 
 #[test]
 fn a_sync_root_list_entry_another_account_owns_is_not_written() {
+	let _marked = marked_classes();
 	let user = test_user(4);
 	let _cleanup = Cleanup::new(&[OTHER_SID], &[user]);
 	// The entry is created by this process, so it is not owned by OTHER_SID: as an entry another
@@ -262,6 +310,7 @@ fn a_sync_root_list_entry_another_account_owns_is_not_written() {
 
 #[test]
 fn an_elevated_removal_leaves_the_entry_of_another_windows_user() {
+	let _marked = marked_classes();
 	let sid = own();
 	let user = test_user(5);
 	let mut cleanup = Cleanup::new(&[&sid, OTHER_SID], &[user]);
@@ -276,7 +325,15 @@ fn an_elevated_removal_leaves_the_entry_of_another_windows_user() {
 		Some(OTHER_SID),
 		root_text,
 	);
-	unbrand_as(&sid, &root, user, BrandingScope::MachineOnly, NO_COMMANDS).unwrap();
+	unbrand_as(
+		&sid,
+		&root,
+		user,
+		BrandingScope::MachineOnly,
+		NO_COMMANDS,
+		NO_THUMBNAILS,
+	)
+	.unwrap();
 	assert!(!present(Hive::LocalMachine, &entry(&sid, user)));
 	assert!(present(Hive::LocalMachine, &other));
 	assert!(present(Hive::CurrentUser, &class(&sid, user)));
@@ -284,6 +341,7 @@ fn an_elevated_removal_leaves_the_entry_of_another_windows_user() {
 
 #[test]
 fn removing_a_root_removes_its_navigation_entry_past_a_list_entry_it_cannot_read() {
+	let _marked = marked_classes();
 	let sid = own();
 	let user = test_user(6);
 	let mut cleanup = Cleanup::new(&[&sid], &[user]);
@@ -293,14 +351,23 @@ fn removing_a_root_removes_its_navigation_entry_past_a_list_entry_it_cannot_read
 		Hive::LocalMachine,
 		&format!(r"{}\UserSyncRoots", entry(&sid, user)),
 	);
-	assert!(unbrand_as(&sid, &root, user, BrandingScope::User, NO_COMMANDS).is_err());
+	assert!(
+		unbrand_as(
+			&sid,
+			&root,
+			user,
+			BrandingScope::User,
+			NO_COMMANDS,
+			NO_THUMBNAILS
+		)
+		.is_err()
+	);
 	assert!(!present(Hive::CurrentUser, &class(&sid, user)));
 }
 
 #[test]
 fn the_sweep_tries_every_entry_past_one_it_cannot_read() {
-	// Released after `cleanup` has unlocked the class.
-	let _sweeping = SWEEPING.lock().unwrap_or_else(PoisonError::into_inner);
+	let _marked = marked_classes();
 	// Roots of this test alone, so the sweep removes nothing another test wrote.
 	let gone = PathBuf::from(format!(
 		r"C:\filen-explorer-sweep-test-{}\Gone",
@@ -337,12 +404,42 @@ fn the_sweep_tries_every_entry_past_one_it_cannot_read() {
 		);
 	}
 	cleanup.lock(Hive::CurrentUser, &classes[0]);
+	// The thumbnail class among them, marked too and with no property bag, as `set_thumbnails_as`
+	// writes it.
+	let (thumbnails, _) = test_thumbnail_class(6);
+	cleanup.extra.push((Hive::CurrentUser, thumbnails.clone()));
+	{
+		let key = create(Hive::CurrentUser, &thumbnails).unwrap();
+		set_string(&key, None, THUMBNAIL_CLASS_NAME, false).unwrap();
+		set_dword(&key, MARKER_VALUE, 1).unwrap();
+	}
+	set_value(
+		Hive::CurrentUser,
+		&format!(r"{thumbnails}\LocalServer32"),
+		None,
+		SERVER,
+	);
 	let prefix = gone.parent().unwrap().to_path_buf();
-	let swept = sweep_as(OTHER_SID, &|root| !root.starts_with(&prefix), NO_COMMANDS);
+	let swept = sweep_as(
+		OTHER_SID,
+		&|root| !root.starts_with(&prefix),
+		NO_COMMANDS,
+		&thumbnails,
+	);
 	assert!(swept.is_err(), "{swept:?}");
 	assert!(present(Hive::LocalMachine, &entry(OTHER_SID, unreadable)));
 	assert!(!present(Hive::LocalMachine, &entry(OTHER_SID, removable)));
 	assert!(!present(Hive::CurrentUser, &classes[1]));
+	// Not a navigation-pane entry: kept, with its server, while an entry of the user is left.
+	assert_eq!(
+		string_value(
+			Hive::CurrentUser,
+			&format!(r"{thumbnails}\LocalServer32"),
+			None
+		)
+		.as_deref(),
+		Some(SERVER)
+	);
 }
 
 /// The context menu commands' key name of test `n`, of this test run alone.
@@ -379,6 +476,7 @@ fn plant_commands(key: &str, branding: &Branding) {
 
 #[test]
 fn a_root_whose_branding_names_commands_offers_them_with_every_value() {
+	let _marked = marked_classes();
 	let sid = own();
 	let user = test_user(7);
 	let _cleanup = Cleanup::new(&[&sid], &[user]);
@@ -435,6 +533,7 @@ fn a_root_whose_branding_names_commands_offers_them_with_every_value() {
 
 #[test]
 fn commands_naming_an_app_that_is_not_there_are_not_written_and_the_root_is_shown() {
+	let _marked = marked_classes();
 	let sid = own();
 	let user = test_user(8);
 	let _cleanup = Cleanup::new(&[&sid], &[user]);
@@ -460,6 +559,7 @@ fn commands_naming_an_app_that_is_not_there_are_not_written_and_the_root_is_show
 
 #[test]
 fn the_commands_stay_while_the_user_has_another_root() {
+	let _marked = marked_classes();
 	let sid = own();
 	let (first_user, second_user) = (test_user(9), test_user(10));
 	let _cleanup = Cleanup::new(&[&sid], &[first_user, second_user]);
@@ -469,7 +569,15 @@ fn the_commands_stay_while_the_user_has_another_root() {
 	let (first, second) = (test_root("first-commands"), test_root("second-commands"));
 	brand_as(&sid, &first, first_user, &branding, &key).unwrap();
 	brand_as(&sid, &second, second_user, &branding, &key).unwrap();
-	unbrand_as(&sid, &first, first_user, BrandingScope::User, &key).unwrap();
+	unbrand_as(
+		&sid,
+		&first,
+		first_user,
+		BrandingScope::User,
+		&key,
+		NO_THUMBNAILS,
+	)
+	.unwrap();
 	for tree in command_trees(&key) {
 		assert!(present(Hive::CurrentUser, &tree), "{tree}");
 	}
@@ -493,7 +601,15 @@ fn removing_the_last_root_of_a_windows_user_removes_the_commands() {
 		Some(UNBRAND_SID),
 		root.to_str().unwrap(),
 	);
-	unbrand_as(UNBRAND_SID, &root, user, BrandingScope::User, &key).unwrap();
+	unbrand_as(
+		UNBRAND_SID,
+		&root,
+		user,
+		BrandingScope::User,
+		&key,
+		NO_THUMBNAILS,
+	)
+	.unwrap();
 	assert!(!present(Hive::LocalMachine, &listed));
 	for tree in command_trees(&key) {
 		assert!(!present(Hive::CurrentUser, &tree), "{tree}");
@@ -502,6 +618,7 @@ fn removing_the_last_root_of_a_windows_user_removes_the_commands() {
 
 #[test]
 fn an_elevated_removal_leaves_the_commands() {
+	let _marked = marked_classes();
 	let sid = own();
 	let user = test_user(11);
 	let _cleanup = Cleanup::new(&[&sid], &[user]);
@@ -510,7 +627,15 @@ fn an_elevated_removal_leaves_the_commands() {
 	let (_, branding) = present_commands();
 	let root = test_root("elevated-commands");
 	brand_as(&sid, &root, user, &branding, &key).unwrap();
-	unbrand_as(&sid, &root, user, BrandingScope::MachineOnly, &key).unwrap();
+	unbrand_as(
+		&sid,
+		&root,
+		user,
+		BrandingScope::MachineOnly,
+		&key,
+		NO_THUMBNAILS,
+	)
+	.unwrap();
 	assert!(!present(Hive::LocalMachine, &entry(&sid, user)));
 	for tree in command_trees(&key) {
 		assert!(present(Hive::CurrentUser, &tree), "{tree}");
@@ -573,15 +698,115 @@ fn an_empty_command_key_a_removal_cut_short_left_is_removed() {
 
 #[test]
 fn the_sweep_removes_the_commands_once_no_entry_of_the_user_is_left() {
-	let _sweeping = SWEEPING.lock().unwrap_or_else(PoisonError::into_inner);
+	let _marked = marked_classes();
 	let key = command_key(14);
 	let _commands = CommandCleanup(key.clone());
 	let (_, branding) = present_commands();
 	plant_commands(&key, &branding);
 	// Of a SID no other test writes an entry of.
-	let swept = sweep_as(SWEPT_SID, &|_| true, &key).unwrap();
+	let swept = sweep_as(SWEPT_SID, &|_| true, &key, NO_THUMBNAILS).unwrap();
 	assert_eq!(swept, 2);
 	for tree in command_trees(&key) {
 		assert!(!present(Hive::CurrentUser, &tree), "{tree}");
 	}
+}
+
+#[test]
+fn a_build_serving_thumbnails_registers_its_class_then_names_it_on_the_entry() {
+	let _marked = marked_classes();
+	let sid = own_sid().unwrap();
+	let user = test_user(40);
+	let root = test_root("thumbnails");
+	let (key, clsid) = test_thumbnail_class(1);
+	let class = ThumbnailClass {
+		key: &key,
+		clsid: &clsid,
+	};
+	brand_as(&sid, &root, user, &Branding::default(), NO_COMMANDS).unwrap();
+	set_thumbnails_as(&sid, user, class, Some(SERVER)).unwrap();
+	assert_eq!(
+		string_value(Hive::CurrentUser, &key, None).as_deref(),
+		Some(THUMBNAIL_CLASS_NAME)
+	);
+	assert_eq!(
+		string_value(Hive::CurrentUser, &format!(r"{key}\LocalServer32"), None).as_deref(),
+		Some(SERVER)
+	);
+	assert_eq!(
+		string_value(
+			Hive::LocalMachine,
+			&entry(&sid, user),
+			Some(THUMBNAIL_PROVIDER_VALUE)
+		)
+		.as_deref(),
+		Some(clsid.as_str())
+	);
+	unbrand_as(&sid, &root, user, BrandingScope::User, NO_COMMANDS, &key).unwrap();
+	assert!(!present(Hive::LocalMachine, &entry(&sid, user)));
+	// Another test's entry of this user may still be listed; then the class stays for it.
+	if !present(Hive::CurrentUser, &key) {
+		return;
+	}
+	delete_tree(Hive::CurrentUser, &key).unwrap();
+}
+
+#[test]
+fn a_build_not_serving_thumbnails_removes_the_entrys_value_and_writes_no_class() {
+	let _marked = marked_classes();
+	let sid = own_sid().unwrap();
+	let user = test_user(41);
+	let root = test_root("no-thumbnails");
+	let (key, clsid) = test_thumbnail_class(2);
+	let class = ThumbnailClass {
+		key: &key,
+		clsid: &clsid,
+	};
+	brand_as(&sid, &root, user, &Branding::default(), NO_COMMANDS).unwrap();
+	set_thumbnails_as(&sid, user, class, Some(SERVER)).unwrap();
+	set_thumbnails_as(&sid, user, class, None).unwrap();
+	assert_eq!(
+		string_value(
+			Hive::LocalMachine,
+			&entry(&sid, user),
+			Some(THUMBNAIL_PROVIDER_VALUE)
+		),
+		None
+	);
+	delete_tree(Hive::CurrentUser, &key).unwrap();
+	set_thumbnails_as(&sid, user, class, None).unwrap();
+	assert!(!present(Hive::CurrentUser, &key));
+	unbrand_as(
+		&sid,
+		&root,
+		user,
+		BrandingScope::User,
+		NO_COMMANDS,
+		NO_THUMBNAILS,
+	)
+	.unwrap();
+}
+
+#[test]
+fn a_thumbnail_class_left_with_no_entry_is_swept_only_when_marked() {
+	let _marked = marked_classes();
+	let (marked, _) = test_thumbnail_class(3);
+	let (foreign, _) = test_thumbnail_class(4);
+	set_dword(
+		&create(Hive::CurrentUser, &marked).unwrap(),
+		MARKER_VALUE,
+		1,
+	)
+	.unwrap();
+	set_string(
+		&create(Hive::CurrentUser, &foreign).unwrap(),
+		None,
+		"not ours",
+		false,
+	)
+	.unwrap();
+	assert!(remove_thumbnail_class_unless_rooted(LONE_SID, &marked).unwrap());
+	assert!(!remove_thumbnail_class_unless_rooted(LONE_SID, &foreign).unwrap());
+	assert!(!present(Hive::CurrentUser, &marked));
+	assert!(present(Hive::CurrentUser, &foreign));
+	delete_tree(Hive::CurrentUser, &foreign).unwrap();
 }
