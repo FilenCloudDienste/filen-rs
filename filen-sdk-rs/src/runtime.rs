@@ -497,6 +497,8 @@ mod worker_start {
 
 #[cfg(any(feature = "uniffi", feature = "wasm-full", feature = "napi"))]
 mod commander_thread {
+	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+	use std::ops::Deref;
 	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 	use std::sync::OnceLock;
 	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
@@ -961,6 +963,60 @@ mod commander_thread {
 	{
 		inner_do_on_commander(Some(channel), f)
 	}
+
+	/// Holds a value whose drop must not run on the page's main thread, and drops it on the
+	/// commander worker when the page drops this.
+	///
+	/// JS frees a wasm object on the thread that holds it, the page's as a rule. There, a drop that
+	/// takes a lock a worker may hold waits for it with `Atomics.wait`, which the page forbids, and
+	/// one that spawns work spawns it on the page, whose wasmtimer timers then run their callback,
+	/// which locks a mutex every worker shares, on the page too.
+	///
+	/// Only for values the page drops: handing the value over takes the commander handle's mutex,
+	/// which the page takes on every call to the commander, so a worker dropping one could hold
+	/// that mutex while the page waits for it. A value workers drop should drop where it is.
+	///
+	/// The commander starts its tasks in the order they were sent, so the value is dropped before
+	/// any call sent to the commander after this was dropped starts. It drops where this does only
+	/// when the commander was given up on.
+	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+	pub(crate) struct DropOnCommander<T: Send + 'static>(
+		// `None` only once this was dropped
+		Option<T>,
+	);
+
+	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+	impl<T: Send + 'static> DropOnCommander<T> {
+		pub(crate) fn new(value: T) -> Self {
+			Self(Some(value))
+		}
+	}
+
+	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+	impl<T: Send + 'static> Deref for DropOnCommander<T> {
+		type Target = T;
+
+		fn deref(&self) -> &T {
+			self.0
+				.as_ref()
+				.expect("only Drop takes the value (should be impossible)")
+		}
+	}
+
+	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+	impl<T: Send + 'static> Drop for DropOnCommander<T> {
+		fn drop(&mut self) {
+			if let Some(value) = self.0.take() {
+				// Nothing waits for the task, so its handle goes at once, which cancels it. The
+				// commander calls this closure before it looks for the cancellation, so the value
+				// drops there all the same.
+				drop(do_on_commander(move || {
+					drop(value);
+					std::future::ready(())
+				}));
+			}
+		}
+	}
 }
 
 /// Runs `call` as a task of its own, which runs to the end even when the wait for it is dropped (a
@@ -981,6 +1037,12 @@ where
 	})?
 }
 
+#[cfg(all(
+	any(feature = "uniffi", feature = "wasm-full", feature = "napi"),
+	target_family = "wasm",
+	target_os = "unknown"
+))]
+pub(crate) use commander_thread::DropOnCommander;
 #[cfg(any(feature = "uniffi", feature = "wasm-full", feature = "napi"))]
 pub(crate) use commander_thread::{
 	CommanderFutHandle, do_on_commander, do_with_pause_channel_on_commander,

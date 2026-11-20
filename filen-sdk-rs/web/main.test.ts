@@ -1865,6 +1865,37 @@ test("lock acquire and release are announced on the socket", async () => {
 	)
 })
 
+/// JS drops a lock on the page's thread (`drop()`, or the `free()` a `using` scope calls), and
+/// its release must not run there: the release's timers would run wasmtimer's callback on the
+/// page, which locks a mutex every worker shares, an `Atomics.wait` the page forbids. Every
+/// timer the SDK arms on the page goes through `setTimeout` from its glue, so none may from the
+/// drop until the release is answered. The release still precedes the next call: a single
+/// poll then gets the lock again.
+test("a lock dropped by JS is released off the page's thread", async () => {
+	const resource = `test:lock-page-drop-${crypto.randomUUID()}`
+	const held = await state.acquireLock({ resource })
+
+	const sdkTimers: string[] = []
+	const pageSetTimeout = globalThis.setTimeout
+	globalThis.setTimeout = ((...args: Parameters<typeof setTimeout>) => {
+		const stack = new Error().stack ?? ""
+		if (stack.includes("sdk-rs.js") || stack.includes("sdk-rs_bg.wasm")) {
+			sdkTimers.push(stack)
+		}
+		return pageSetTimeout(...args)
+	}) as typeof setTimeout
+	try {
+		held.drop()
+		await state.waitForLockReleases()
+	} finally {
+		globalThis.setTimeout = pageSetTimeout
+	}
+
+	expect(sdkTimers).toEqual([])
+	using again = await state.acquireLock({ resource, attempts: 1 })
+	expect(again.resource()).toBe(resource)
+})
+
 test("chats", async () => {
 	// Hold the same account-wide `test:chats` server lock the native chat tests take
 	// (chat_tests.rs `lock_chat`): this suite shares the V2 account with the native matrix

@@ -172,6 +172,8 @@ mod js_impl {
 
 	#[cfg(feature = "uniffi")]
 	use crate::js::spawn_ordered_dispatch;
+	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+	use crate::runtime::DropOnCommander;
 	use crate::{
 		Error,
 		auth::JsClient,
@@ -179,17 +181,40 @@ mod js_impl {
 		sync::lock::{self},
 	};
 
+	// JS frees a `ResourceLock` on the thread that holds it, the page's as a rule, and dropping
+	// the last handle of a lock releases it: it takes locks a worker may hold, and spawns the
+	// release on the dropping thread, whose timers then fire there. Neither may happen on the
+	// page (see `DropOnCommander`), so on wasm the handle is dropped on the commander.
+	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+	type LockHandle = DropOnCommander<Arc<lock::ResourceLock>>;
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	type LockHandle = Arc<lock::ResourceLock>;
+
 	#[cfg_attr(
 		all(target_family = "wasm", target_os = "unknown"),
 		wasm_bindgen::prelude::wasm_bindgen
 	)]
 	#[cfg_attr(feature = "uniffi", derive(uniffi::Object))]
-	pub struct ResourceLock(Arc<lock::ResourceLock>);
+	pub struct ResourceLock(LockHandle);
+
+	impl ResourceLock {
+		fn new(lock: Arc<lock::ResourceLock>) -> Self {
+			#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+			{
+				Self(DropOnCommander::new(lock))
+			}
+			#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+			{
+				Self(lock)
+			}
+		}
+	}
 
 	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 	#[wasm_bindgen::prelude::wasm_bindgen]
 	impl ResourceLock {
 		/// Utility function to be able to immediately drop the lock from JS
+		// The release starts on the commander, before any later call to the SDK does.
 		#[wasm_bindgen::prelude::wasm_bindgen]
 		pub fn drop(self) {}
 	}
@@ -253,7 +278,8 @@ mod js_impl {
 		)]
 		pub async fn lock_drive(&self) -> Result<ResourceLock, Error> {
 			let this = self.inner();
-			do_on_commander(move || async move { this.lock_drive().await.map(ResourceLock) }).await
+			do_on_commander(move || async move { this.lock_drive().await.map(ResourceLock::new) })
+				.await
 		}
 
 		#[cfg_attr(
@@ -275,7 +301,7 @@ mod js_impl {
 						.unwrap_or(lock::ATTEMPTS_DEFAULT),
 				)
 				.await
-				.map(ResourceLock)
+				.map(ResourceLock::new)
 			})
 			.await
 		}
