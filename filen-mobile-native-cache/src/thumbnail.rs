@@ -89,6 +89,11 @@ fn fitted_file_name(max_side: u32) -> String {
 	format!("fit{max_side}.webp")
 }
 
+/// The directory the thumbnails of the file version `uuid` are kept in, below `thumbnail_dir`.
+fn item_thumbnail_dir(thumbnail_dir: &Path, uuid: Uuid) -> PathBuf {
+	thumbnail_dir.join(uuid.to_string())
+}
+
 /// The width and height a WebP image declares in its header, read without decoding it.
 fn webp_dimensions(webp: &[u8]) -> Result<(u32, u32), image::ImageError> {
 	ImageReader::with_format(Cursor::new(webp), ImageFormat::WebP).into_dimensions()
@@ -235,7 +240,7 @@ impl FilenMobileCacheState {
 		let (client, file, dir) = self
 			.async_execute_authed_owned(async |auth_state| {
 				let file = RemoteFile::try_from(auth_state.select_file_by_id(item)?)?;
-				let dir = auth_state.thumbnail_dir.join(file.uuid().to_string());
+				let dir = item_thumbnail_dir(&auth_state.thumbnail_dir, file.uuid());
 				Ok((Arc::clone(&auth_state.client), file, dir))
 			})
 			.await?;
@@ -300,6 +305,22 @@ impl FilenMobileCacheState {
 			cancel: Arc::clone(cancel),
 		});
 		decode_fitted(&client, source, spec, cancel).await
+	}
+
+	/// The thumbnail of the file version `uuid` fitted inside a `max_side` pixel square, if the
+	/// thumbnail cache holds it, as [`FilenMobileCacheState::fitted_thumbnail`] kept it: read from
+	/// disk with no server round trip, nothing decoded and nothing made. Keyed by the version, so a
+	/// thumbnail of another version is never answered. Signed out, it fails as the cache does.
+	pub async fn cached_fitted_thumbnail(
+		&self,
+		uuid: Uuid,
+		max_side: u32,
+	) -> Result<Option<FittedThumbnail>, CacheError> {
+		let thumbnail_dir = self
+			.async_execute_authed_owned(async |auth_state| Ok(auth_state.thumbnail_dir.clone()))
+			.await?;
+		cached_fitted(&item_thumbnail_dir(&thumbnail_dir, uuid).join(fitted_file_name(max_side)))
+			.await
 	}
 }
 
