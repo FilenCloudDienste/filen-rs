@@ -17,17 +17,23 @@
 //! to `THUMBNAIL_SERVER_IDLE` (10 s) after File Explorer's last thumbnail request, and longer while
 //! Explorer goes on asking. Whatever replaces the exe ends those processes first or retries until
 //! the file is free.
+//!
+//! A Windows-subsystem exe, so no launch, COM's above all, opens a console window. Its parent reads
+//! it through the pipes it passes; without them, what it writes goes nowhere and stdin reads as
+//! closed, but for `--unregister-all` and a wrong command line, which attach to the console of the
+//! terminal that started them, if any.
 
 #![deny(clippy::print_stdout)]
 // The helper's future, over the cache and the SDK's drive calls and lock, nests deeper than the
 // default limit of 128 queries the compiler takes to lay it out on Windows.
 #![recursion_limit = "256"]
+#![cfg_attr(windows, windows_subsystem = "windows")]
 
 use std::{ffi::OsString, path::PathBuf, process::ExitCode, str::FromStr};
 
 #[cfg(windows)]
 use filen_cloud_files::{
-	CacheOpener, HelperConfig, StateDir, THUMBNAIL_SERVER_IDLE, WinPlatform,
+	CacheOpener, HelperConfig, StateDir, THUMBNAIL_SERVER_IDLE, WinPlatform, attach_parent_console,
 	install_stderr_logging, serve_refusing_thumbnails, serve_stdio, unregister_all_stdio,
 };
 use filen_cloud_files::{FatalCode, THUMBNAIL_SERVER_ARG, fatal};
@@ -115,7 +121,11 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Args, String> {
 fn main() -> ExitCode {
 	let args = match parse(std::env::args_os().skip(1)) {
 		Ok(args) => args,
-		Err(message) => return ExitCode::from(fatal(FatalCode::Usage, &message)),
+		Err(message) => {
+			#[cfg(windows)]
+			attach_parent_console();
+			return ExitCode::from(fatal(FatalCode::Usage, &message));
+		}
 	};
 	ExitCode::from(run(args))
 }
@@ -132,6 +142,10 @@ fn run(_args: Args) -> u8 {
 fn run(args: Args) -> u8 {
 	// Before anything else logs: the cache installs a logger on stdout when none is.
 	install_stderr_logging(args.log_level);
+	// Before its line is written, a refusal's included: a person may have run it from a terminal.
+	if matches!(args.mode, Mode::UnregisterAll { .. }) {
+		attach_parent_console();
+	}
 	let state_dir = |dir: PathBuf| StateDir::new(dir).map_err(|error| error.to_string());
 	match args.mode {
 		Mode::Serve { state_dir: dir } => match state_dir(dir) {

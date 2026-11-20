@@ -37,7 +37,7 @@ use windows_sys::{
 		Foundation::{
 			ERROR_FILE_NOT_FOUND, ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_PARAMETER,
 			ERROR_MORE_DATA, ERROR_NO_MORE_ITEMS, ERROR_NOT_SUPPORTED, ERROR_SUCCESS, HANDLE,
-			LocalFree, STATUS_SUCCESS, WIN32_ERROR,
+			INVALID_HANDLE_VALUE, LocalFree, STATUS_SUCCESS, WIN32_ERROR,
 		},
 		Graphics::Gdi::{
 			BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateDIBSection, DIB_RGB_COLORS, DeleteObject,
@@ -66,6 +66,7 @@ use windows_sys::{
 			},
 		},
 		System::{
+			Console::{ATTACH_PARENT_PROCESS, AttachConsole, GetStdHandle, STD_OUTPUT_HANDLE},
 			Registry::{
 				HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, KEY_WRITE, REG_DWORD,
 				REG_EXPAND_SZ, REG_OPTION_NON_VOLATILE, REG_SZ, REG_VALUE_TYPE, RegCloseKey,
@@ -336,6 +337,21 @@ pub(super) fn final_path(file: &File) -> io::Result<Vec<u16>> {
 		path.resize(written, 0);
 	}
 	Err(io::Error::from(io::ErrorKind::InvalidData))
+}
+
+/// Attaches this process to its parent's console (`AttachConsole(ATTACH_PARENT_PROCESS)`) when it
+/// has no standard output, which a Windows-subsystem exe started from a terminal has not, so what
+/// it writes reaches that terminal. Nothing when stdout is a handle already (a pipe the parent
+/// passed) or the parent has no console.
+#[allow(unsafe_code)] // Win32 FFI: reads the stdout handle and attaches to the parent's console.
+pub(super) fn attach_parent_console() {
+	// SAFETY: takes a constant; the handle returned is only compared, never used or closed.
+	let stdout = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
+	if stdout.is_null() || stdout == INVALID_HANDLE_VALUE {
+		// SAFETY: takes a constant; it fails, harmlessly, when the parent has no console or this
+		// process has one already.
+		unsafe { AttachConsole(ATTACH_PARENT_PROCESS) };
+	}
 }
 
 /// A registry hive the provider writes under.

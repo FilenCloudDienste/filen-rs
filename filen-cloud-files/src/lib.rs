@@ -84,8 +84,8 @@ pub use os::cfapi::{CfCall, Hresult, ProviderInfoError, SyncRootPathError, WinEr
 pub use os::win::{
 	ComSecurity, ConnectError, ConnectFailed, ConnectedRoot, DisconnectFailed, PlatformInfo,
 	ProviderInfo, RegisterFailed, RegisteredRoot, SyncRootPath, ThumbnailServer, UnregisterFailed,
-	WinLocalFs, WinPlatform, WinSettled, is_elevated, platform_info, register, take_over,
-	unregister_path, volume_file_system,
+	WinLocalFs, WinPlatform, WinSettled, attach_parent_console, is_elevated, platform_info,
+	register, take_over, unregister_path, volume_file_system,
 };
 pub use placeholder::{
 	FileSize, FileTime, NegativeSize, PlaceholderSpec, SpecKind, UnrepresentableTime,

@@ -19,6 +19,13 @@ pub fn is_elevated() -> io::Result<bool> {
 	ffi::token_elevated()
 }
 
+/// Attaches the process to the console of the terminal that started it, when it has no stdout of
+/// its own: the helper is a Windows-subsystem exe, which gets no console, so a person running
+/// `--unregister-all` from a terminal sees its line. A parent that passed pipes keeps them.
+pub fn attach_parent_console() {
+	ffi::attach_parent_console();
+}
+
 /// The name of the file system (`NTFS`, `ReFS`, `FAT32`) of the volume `path` is on, read at
 /// `path` or, when it does not exist yet, at its nearest existing ancestor; with that path.
 pub fn volume_file_system(path: &Path) -> io::Result<(String, PathBuf)> {

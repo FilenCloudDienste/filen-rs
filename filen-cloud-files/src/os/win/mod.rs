@@ -42,7 +42,7 @@ pub use self::sync_root::{
 	RegisterFailed, RegisteredRoot, SyncRootPath, UnregisterFailed, platform_info, register,
 	take_over, unregister_path,
 };
-pub use self::system::{is_elevated, volume_file_system};
+pub use self::system::{attach_parent_console, is_elevated, volume_file_system};
 use super::cfapi;
 
 /// The target every event of the Windows layer is logged under.
