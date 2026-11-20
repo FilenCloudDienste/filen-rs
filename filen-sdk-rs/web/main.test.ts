@@ -3276,6 +3276,80 @@ test("listArchive reports SolidBlock access for a solid 7z entry; downloadArchiv
 	}
 })
 
+/// The page's thread may not wait on a lock: Chromium throws "Atomics.wait cannot be called in
+/// this context" there, and WebKit traps with an out-of-bounds memory access. A download into a
+/// WritableStream is produced on a worker, and the page must never want a lock that worker can
+/// hold. Entries of a highly compressed archive decode faster than the page writes them, into
+/// streams that take every chunk at once, so the producers keep waiting on the page while it
+/// takes what they sent: on and off, for as long as it runs, the two want the same lock at once,
+/// and any error the page throws meanwhile fails the test. Firefox allows the wait, so only
+/// Chromium and WebKit catch it. The rounds stop after 30 s or 64 rounds, whichever comes first:
+/// each download leaks some of the page's externref table, so a fast host must not run more of
+/// them than a slow one, and 1024 downloads were more than the unfixed code ever needed to fail.
+test("streamed downloads take no lock on the page's thread that their workers hold", async () => {
+	const parent = await state.createDir(testDir, "stream-contention")
+	const source = await state.createDir(parent, "zeros")
+	const size = 16 * 1024 * 1024
+	await state.uploadFile(new Uint8Array(size), { parent: source, name: "zeros.bin" })
+	const { archive } = await state.compressItems({
+		items: [source],
+		destination: parent,
+		name: "zeros.tar.zst",
+		format: { type: "tar", compression: { codec: "zstd" } }
+	})
+	const { entries } = await state.listArchive({ archive: archive! })
+	const zeros = entries.find(entry => entry.path?.path === "zeros/zeros.bin")!
+
+	const pageErrors: unknown[] = []
+	let pageFailed: () => void = () => {}
+	const failure = new Promise<void>(resolve => {
+		pageFailed = resolve
+	})
+	const onError = (event: ErrorEvent) => {
+		pageErrors.push(event.error ?? event.message)
+		pageFailed()
+	}
+	const onRejection = (event: PromiseRejectionEvent) => {
+		pageErrors.push(event.reason)
+		pageFailed()
+	}
+	addEventListener("error", onError)
+	addEventListener("unhandledrejection", onRejection)
+	// a page that trapped never finishes the download it trapped in, which this cancels
+	const abort = new AbortController()
+	const reports: [unknown, number][] = []
+	const until = Date.now() + 30_000
+	try {
+		for (let rounds = 0; rounds < 64 && Date.now() < until && pageErrors.length === 0; rounds++) {
+			const round = Array.from({ length: 16 }, async (): Promise<[unknown, number]> => {
+				let written = 0
+				const writer = new WritableStream<Uint8Array>({
+					write(chunk) {
+						written += chunk.length
+					}
+				})
+				const report = await state.downloadArchiveEntry({
+					archive: archive!,
+					entry: zeros.id,
+					writer,
+					maxSolidSkip: null,
+					managedFuture: { abortSignal: abort.signal }
+				})
+				return [report.error, written]
+			})
+			await Promise.race([Promise.all(round).then(done => reports.push(...done)), failure])
+		}
+	} finally {
+		abort.abort()
+		removeEventListener("error", onError)
+		removeEventListener("unhandledrejection", onRejection)
+	}
+
+	expect(pageErrors).toStrictEqual([])
+	expect(reports.length).toBeGreaterThan(0)
+	expect(reports.filter(([error, written]) => error !== undefined || written !== size)).toStrictEqual([])
+})
+
 test("extractArchiveEntries extracts the entries chosen below a base, one again into a retry's directory, and refuses a bad call", async () => {
 	const parent = await state.createDir(testDir, "archive-entries")
 	const source = await archiveSource(parent, 13)

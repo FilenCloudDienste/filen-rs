@@ -925,25 +925,49 @@ mod commander_thread {
 		}
 		#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 		{
-			let mut slot = COMMANDER_RUNTIME_HANDLE
-				.lock()
-				.unwrap_or_else(PoisonError::into_inner);
-			// A worker given up on dropped its inbox, closing the channel.
-			if slot
-				.as_ref()
-				.is_some_and(|runtime| runtime.sender.is_closed())
-			{
-				*slot = None;
-			}
-			let runtime = slot.get_or_insert_with(RuntimeHandle::new);
+			with_commander(|runtime| {
+				let (fut_builder, handle) =
+					make_future_builder_with_handle(pause_signal, f, runtime.start.clone());
 
-			let (fut_builder, handle) =
-				make_future_builder_with_handle(pause_signal, f, runtime.start.clone());
+				runtime.build_and_spawn(fut_builder);
 
-			runtime.build_and_spawn(fut_builder);
-
-			handle
+				handle
+			})
 		}
+	}
+
+	/// Calls `f` with the commander's handle, spawning a commander first when there is none or
+	/// the last one was given up on.
+	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+	fn with_commander<R>(f: impl FnOnce(&RuntimeHandle) -> R) -> R {
+		let mut slot = COMMANDER_RUNTIME_HANDLE
+			.lock()
+			.unwrap_or_else(PoisonError::into_inner);
+		// A worker given up on dropped its inbox, closing the channel.
+		if slot
+			.as_ref()
+			.is_some_and(|runtime| runtime.sender.is_closed())
+		{
+			*slot = None;
+		}
+		f(slot.get_or_insert_with(RuntimeHandle::new))
+	}
+
+	/// Starts the future `f` builds on the commander worker, where it runs to its end: unlike
+	/// [`do_on_commander`]'s, nothing waits for it and nothing cancels it.
+	///
+	/// When the commander is given up on before it starts, `f` is dropped unbuilt, on the thread
+	/// that gave up on it, which is the one that spawned it.
+	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+	pub(crate) fn spawn_on_commander<F, Fut>(f: F)
+	where
+		F: FnOnce() -> Fut + Send + 'static,
+		Fut: Future<Output = ()> + 'static,
+	{
+		with_commander(|runtime| {
+			// Fails only once the worker was given up on, dropping `f` here.
+			let _ = runtime.sender.send(Box::new(f));
+		});
 	}
 
 	/// Runs an async function on a dedicated 'commander' worker thread, returning the result.
@@ -1048,16 +1072,16 @@ where
 	})?
 }
 
+#[cfg(any(feature = "uniffi", feature = "wasm-full", feature = "napi"))]
+pub(crate) use commander_thread::{
+	CommanderFutHandle, do_on_commander, do_with_pause_channel_on_commander,
+};
 #[cfg(all(
 	any(feature = "uniffi", feature = "wasm-full", feature = "napi"),
 	target_family = "wasm",
 	target_os = "unknown"
 ))]
-pub(crate) use commander_thread::DropOnCommander;
-#[cfg(any(feature = "uniffi", feature = "wasm-full", feature = "napi"))]
-pub(crate) use commander_thread::{
-	CommanderFutHandle, do_on_commander, do_with_pause_channel_on_commander,
-};
+pub(crate) use commander_thread::{DropOnCommander, spawn_on_commander};
 
 #[cfg(feature = "wasm-full")]
 mod wasm_threading {
@@ -1168,6 +1192,13 @@ mod wasm_threading {
 		worker.set_onerror(Some(onerror.as_ref().unchecked_ref()));
 		// The handler must outlive the worker; one small leaked closure per spawn is acceptable.
 		onerror.forget();
+		// The worker's own `postMessage` calls, which only ever send a port this thread asked for.
+		let onmessage = Closure::<dyn FnMut(web_sys::MessageEvent)>::new(
+			super::worker_ports::on_worker_message,
+		);
+		worker.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
+		// as `onerror`
+		onmessage.forget();
 		SPAWNED_WORKERS.with_borrow_mut(|workers| workers.push(worker));
 
 		Ok(())
@@ -1188,6 +1219,113 @@ mod wasm_threading {
 		std::mem::drop(worker_handle);
 	}
 }
+
+/// Hands `MessagePort`s from workers to the thread that spawned them, so that the two can talk
+/// without sharing anything in wasm memory.
+///
+/// The page's main thread may not wait on a lock: Chromium throws "Atomics.wait cannot be called
+/// in this context" there, and WebKit traps. A channel in wasm memory can take a lock a worker
+/// holds (tokio's bounded channel locks its waiters on every receive, as a sender waiting for room
+/// does), so traffic between a worker and the page goes through a `MessageChannel` instead, whose
+/// messages the page takes as events. A port gets to the other thread the only way one can,
+/// transferred by `postMessage`: a thread asks for one with [`port_from_worker`] and hands the
+/// [`PortRequest`] to a worker it spawned, which sends a port back with its own `postMessage`,
+/// which reaches its `Worker` object on the thread that asked.
+#[cfg(all(feature = "wasm-full", target_family = "wasm", target_os = "unknown"))]
+mod worker_ports {
+	use std::{
+		cell::RefCell,
+		collections::HashMap,
+		sync::atomic::{AtomicU64, Ordering},
+	};
+
+	use wasm_bindgen::{JsCast, JsValue};
+	use web_sys::{
+		DedicatedWorkerGlobalScope, MessageEvent, MessagePort,
+		js_sys::{self, Array},
+	};
+
+	/// What a thread does with the port it asked for, given `None` instead when its request was
+	/// dropped unsent on that thread.
+	type OnPort = Box<dyn FnOnce(Option<MessagePort>)>;
+
+	thread_local! {
+		/// This thread's requests that no port answered yet.
+		static WAITING: RefCell<HashMap<u64, OnPort>> = RefCell::new(HashMap::new());
+	}
+
+	/// Unique across threads, so a port can only ever answer the thread that asked for it.
+	static NEXT_REQUEST: AtomicU64 = AtomicU64::new(0);
+
+	/// A thread's request for a port, for a worker that thread spawned to
+	/// [`send`](Self::send) one with.
+	pub(crate) struct PortRequest {
+		/// `None` once sent.
+		id: Option<u64>,
+	}
+
+	/// Asks for a port: a worker this thread spawned sends it with the returned request, and
+	/// `on_port` gets it here, or gets `None` should the request be dropped unsent on this thread.
+	/// A request dropped unsent on another thread is lost, and `on_port` never called.
+	pub(crate) fn port_from_worker(
+		on_port: impl FnOnce(Option<MessagePort>) + 'static,
+	) -> PortRequest {
+		let id = NEXT_REQUEST.fetch_add(1, Ordering::Relaxed);
+		WAITING.with_borrow_mut(|waiting| waiting.insert(id, Box::new(on_port)));
+		PortRequest { id: Some(id) }
+	}
+
+	impl PortRequest {
+		/// Transfers `port` to the thread that asked. Only from a worker that thread spawned: it
+		/// goes to this worker's parent.
+		pub(crate) fn send(mut self, port: MessagePort) -> Result<(), JsValue> {
+			let id = self.id.take().expect(
+				"only `send` and `drop` take the id, and both consume the request (should be impossible)",
+			);
+			let scope = js_sys::global().dyn_into::<DedicatedWorkerGlobalScope>()?;
+			scope.post_message_with_transfer(
+				&Array::of2(&JsValue::from(id), &port),
+				&Array::of1(&port),
+			)
+		}
+	}
+
+	impl Drop for PortRequest {
+		fn drop(&mut self) {
+			if let Some(on_port) = self.id.take().and_then(take_waiting) {
+				on_port(None);
+			}
+		}
+	}
+
+	fn take_waiting(id: u64) -> Option<OnPort> {
+		WAITING.with_borrow_mut(|waiting| waiting.remove(&id))
+	}
+
+	/// Takes a message a worker this thread spawned posted to it: the port of a [`PortRequest`].
+	pub(super) fn on_worker_message(event: MessageEvent) {
+		let sent = event.data().dyn_into::<Array>().ok().and_then(|sent| {
+			let id = u64::try_from(sent.get(0)).ok()?;
+			let port = sent.get(1).dyn_into::<MessagePort>().ok()?;
+			Some((id, port))
+		});
+		let Some((id, port)) = sent else {
+			tracing::warn!("a worker posted a message that is not a port to its parent; dropped");
+			return;
+		};
+		match take_waiting(id) {
+			Some(on_port) => on_port(Some(port)),
+			// asked for by another thread, which the worker is no child of
+			None => {
+				tracing::error!("a worker sent a port no request on this thread waits for; closed");
+				port.close();
+			}
+		}
+	}
+}
+
+#[cfg(all(feature = "wasm-full", target_family = "wasm", target_os = "unknown"))]
+pub(crate) use worker_ports::{PortRequest, port_from_worker};
 
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 fn spawn_local_on_worker(f: impl Future<Output = ()> + 'static) {

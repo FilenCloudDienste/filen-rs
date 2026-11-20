@@ -490,6 +490,10 @@ web-sys = { version = "0.3.22", default-features = false, features = [
 	"WorkerOptions",
 	"WorkerType",
 	"DedicatedWorkerGlobalScope",
+	# a stream download's chunks reach the page's thread over a MessageChannel
+	# (js/service_worker/shared.rs)
+	"MessageChannel",
+	"MessagePort",
 	# AbortController/AbortSignal power the wasm abort-registration path and its tests
 	# (multi_threaded.rs); AbortSignal is otherwise only pulled in transitively.
 	"AbortController",

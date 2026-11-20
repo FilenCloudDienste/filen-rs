@@ -14,8 +14,10 @@ use wasm_bindgen::{JsCast, JsValue};
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 use wasm_streams::readable::IntoStream;
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
-use web_sys::js_sys::{Object, Uint8Array};
+use web_sys::js_sys::Uint8Array;
 
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+use crate::js::js_error_message;
 use crate::{Error, ErrorKind};
 
 /// The most a pump reads from its stream at a time.
@@ -131,17 +133,6 @@ fn uint8_chunk(chunk: JsValue) -> io::Result<Uint8Array> {
 			format!("a stream chunk is not a Uint8Array (typeof {found})"),
 		)
 	})
-}
-
-/// A JS value as text, as wasm-streams words a BYOB read error, so a source that fails reads the
-/// same through either reader. Kept as text because a `JsValue` is not `Send`, so it cannot be
-/// the `io::Error`'s source.
-#[cfg(all(target_family = "wasm", target_os = "unknown"))]
-fn js_error_message(value: &JsValue) -> String {
-	value
-		.as_string()
-		.or_else(|| Object::try_from(value).and_then(|object| object.to_string().as_string()))
-		.unwrap_or_else(|| "Unknown error".to_owned())
 }
 
 /// The body of [`spawn_stream_pump`]'s task.
