@@ -30,7 +30,7 @@ use crate::{
 			brandable_root, command_removal, command_trees, command_values, icon_resource,
 			is_own_key, namespace_clsid, registry_string, same_root, sweeps_navigation_class,
 			sync_root_key_name, thumbnail_class_key, thumbnail_clsid_text,
-			thumbnail_server_command,
+			thumbnail_server_command, thumbnail_server_exe, thumbnail_value_is_stale,
 		},
 	},
 };
@@ -104,6 +104,15 @@ fn owned_by(key: &RegKey, sid: &str) -> Result<(), ExplorerError> {
 	}
 }
 
+/// Whether the key `path` below `HKEY_LOCAL_MACHINE` is owned by the Windows user `sid`, or is not
+/// there: [`ExplorerError::NotOwned`] otherwise. Nothing is created.
+fn owned_or_absent(path: &str, sid: &str) -> Result<(), ExplorerError> {
+	match ffi::reg_open(Hive::LocalMachine, &wide(path)?).map_err(io("opening a registry key"))? {
+		Some(key) => owned_by(&key, sid),
+		None => Ok(()),
+	}
+}
+
 /// The SID of the Windows user this process runs as.
 fn own_sid() -> Result<String, ExplorerError> {
 	let units = ffi::current_user_sid().map_err(io("reading the process's user"))?;
@@ -124,7 +133,8 @@ fn notify(path: &Path) {
 /// the Windows user this process runs as: the navigation-pane class first, marked as this
 /// provider's so one a stopped run left is found, then its navigation-pane entry, then the sync
 /// root list entry, which gives the root its status icons and commands, written only into keys
-/// the user owns (every user may create keys in that list); last, when `branding` names them and
+/// the user owns (every user may create keys in that list), and nothing at all while one is there
+/// that another account owns; last, when `branding` names them and
 /// the app is there, the context menu commands, which the entry's provider id scopes. A repeat
 /// writes the same. A failure to write the commands is logged and fails nothing: what shows the
 /// root is written.
@@ -247,6 +257,12 @@ fn brand_as(
 	let clsid = namespace_clsid(sid, user);
 	let name = branding.display_name.as_str();
 	let icon = icon_resource(branding, |icon| Path::new(icon.as_str()).is_file());
+	let entry = format!(r"{SYNC_ROOT_MANAGER}\{}", sync_root_key_name(sid, user));
+	let roots = format!(r"{entry}\UserSyncRoots");
+	// Before anything is written: an entry another account created ahead of the user leaves no
+	// navigation-pane entry either. Checked again as each key is created.
+	owned_or_absent(&entry, sid)?;
+	owned_or_absent(&roots, sid)?;
 	let class = format!(r"{USER_CLSIDS}\{clsid}");
 	{
 		let key = create(Hive::CurrentUser, &class)?;
@@ -293,7 +309,6 @@ fn brand_as(
 		false,
 	)?;
 	set_dword(&create(Hive::CurrentUser, HIDE_DESKTOP_ICONS)?, &clsid, 1)?;
-	let entry = format!(r"{SYNC_ROOT_MANAGER}\{}", sync_root_key_name(sid, user));
 	{
 		let key = create(Hive::LocalMachine, &entry)?;
 		owned_by(&key, sid)?;
@@ -303,7 +318,7 @@ fn brand_as(
 		set_string(&key, Some("NamespaceCLSID"), &clsid, false)?;
 	}
 	{
-		let key = create(Hive::LocalMachine, &format!(r"{entry}\UserSyncRoots"))?;
+		let key = create(Hive::LocalMachine, &roots)?;
 		owned_by(&key, sid)?;
 		set_string(&key, Some(sid), root_text, false)?;
 	}
@@ -408,22 +423,32 @@ pub(crate) fn remove_navigation_entry(clsid: &str) -> Result<(), ExplorerError> 
 
 /// Removes what shows in File Explorer roots the OS no longer holds as this provider's, as `live`
 /// says of each root's path, for the Windows user this process runs as: its sync root list entries
-/// of this provider (`Filen!<SID>!*`) and its navigation-pane classes carrying this provider's
+/// of this provider (`Filen!<SID>!*`) that it owns and its navigation-pane classes carrying this provider's
 /// marker, each with its entry and hidden icon, never the thumbnail class, which is no
 /// navigation-pane entry; then, once no entry of the user's is left, the thumbnail class and the
-/// context menu commands carrying the marker. Nothing else is touched. How many were removed;
-/// every one is tried, and the first failure is returned.
+/// context menu commands carrying the marker; last, the value of every entry left that names the
+/// thumbnail class while the class is not registered (an older build's), so Explorer is not
+/// pointed at a class COM cannot start: a helper that serves writes both again when it brands.
+/// Nothing else is touched. How many were removed; every one is tried, and the first failure is
+/// returned.
 pub(crate) fn sweep(live: impl Fn(&Path) -> bool) -> Result<u64, ExplorerError> {
-	sweep_as(&own_sid()?, &live, COMMAND_KEY, &thumbnail_class_key())
+	let (key, clsid) = (thumbnail_class_key(), thumbnail_clsid_text());
+	let thumbnails = ThumbnailClass {
+		key: &key,
+		clsid: &clsid,
+	};
+	let sid = own_sid()?;
+	sweep_as(&sid, &sid, &live, COMMAND_KEY, thumbnails)
 }
 
-/// [`sweep`] for the Windows user `sid`, the commands under the key name `commands` and the
-/// thumbnail class at `thumbnails`.
+/// [`sweep`] for the Windows user `sid`, removing only the sync root list entries the Windows user
+/// `owner` owns, the commands under the key name `commands` and the thumbnail class `thumbnails`.
 fn sweep_as(
 	sid: &str,
+	owner: &str,
 	live: &dyn Fn(&Path) -> bool,
 	commands: &str,
-	thumbnails: &str,
+	thumbnails: ThumbnailClass<'_>,
 ) -> Result<u64, ExplorerError> {
 	let mut removed = 0_u64;
 	let mut first = Ok(());
@@ -439,7 +464,7 @@ fn sweep_as(
 	match subkeys(Hive::LocalMachine, SYNC_ROOT_MANAGER) {
 		Ok(Some((list, names))) => {
 			for name in names.iter().filter(|name| is_own_key(name, sid)) {
-				note(sweep_entry(&list, name, sid, live));
+				note(sweep_entry(&list, name, sid, owner, live));
 			}
 		}
 		Ok(None) => {}
@@ -454,18 +479,85 @@ fn sweep_as(
 				if format!(r"{USER_CLSIDS}\{name}").eq_ignore_ascii_case(&installed) {
 					continue;
 				}
-				note(sweep_class(&classes, name, thumbnails, live));
+				note(sweep_class(&classes, name, thumbnails.key, live));
 			}
 		}
 		Ok(None) => {}
 		Err(error) => note(Err(error)),
 	}
-	note(remove_thumbnail_class_unless_rooted(sid, thumbnails));
-	match remove_commands_unless_rooted(sid, commands) {
-		Ok(count) => removed = removed.saturating_add(count),
-		Err(error) => {
-			if first.is_ok() {
-				first = Err(error);
+	note(remove_thumbnail_class_unless_rooted(sid, thumbnails.key));
+	for counted in [
+		remove_commands_unless_rooted(sid, commands),
+		remove_stale_thumbnail_values_as(sid, thumbnails),
+	] {
+		match counted {
+			Ok(count) => removed = removed.saturating_add(count),
+			Err(error) => {
+				if first.is_ok() {
+					first = Err(error);
+				}
+			}
+		}
+	}
+	first.map(|()| removed)
+}
+
+/// Removes the value naming `class` from each sync root list entry of this provider for the
+/// Windows user `sid` while the class has no `LocalServer32` COM could start: none, or one whose
+/// command names no exe that is there (see [`thumbnail_value_is_stale`]). How many were removed. Every entry is tried; the first failure
+/// is returned.
+fn remove_stale_thumbnail_values_as(
+	sid: &str,
+	class: ThumbnailClass<'_>,
+) -> Result<u64, ExplorerError> {
+	let registered = match ffi::reg_open(
+		Hive::CurrentUser,
+		&wide(&format!(r"{}\LocalServer32", class.key))?,
+	)
+	.map_err(io("opening a registry key"))?
+	{
+		Some(server) => ffi::reg_query_string(&server, None)
+			.map_err(io("reading a registry value"))?
+			.is_some_and(|command| {
+				thumbnail_server_exe(&String::from_utf16_lossy(&command))
+					.is_some_and(|exe| Path::new(exe).is_file())
+			}),
+		None => false,
+	};
+	let Some((list, names)) = subkeys(Hive::LocalMachine, SYNC_ROOT_MANAGER)? else {
+		return Ok(0);
+	};
+	let value = wide(THUMBNAIL_PROVIDER_VALUE)?;
+	let mut removed = 0_u64;
+	let mut first = Ok(());
+	for name in names.iter().filter(|name| is_own_key(name, sid)) {
+		let stale = wide(name).and_then(|key| {
+			let named =
+				match ffi::reg_open_subkey(&list, &key).map_err(io("opening a registry key"))? {
+					Some(entry) => ffi::reg_query_string(&entry, Some(&value))
+						.map_err(io("reading a registry value"))?,
+					None => None,
+				};
+			let named = named.map(|named| String::from_utf16_lossy(&named));
+			if !thumbnail_value_is_stale(named.as_deref(), class.clsid, registered) {
+				return Ok(false);
+			}
+			debug!(target: LOG_TARGET, key = %name, "removing a thumbnail value naming no registered class");
+			ffi::reg_delete_value(
+				Hive::LocalMachine,
+				&wide(&format!(r"{SYNC_ROOT_MANAGER}\{name}"))?,
+				&value,
+			)
+			.map_err(io("deleting a registry value"))?;
+			Ok(true)
+		});
+		match stale {
+			Ok(true) => removed = removed.saturating_add(1),
+			Ok(false) => {}
+			Err(error) => {
+				if first.is_ok() {
+					first = Err(error);
+				}
 			}
 		}
 	}
@@ -486,13 +578,30 @@ fn subkeys(hive: Hive, path: &str) -> Result<Option<(RegKey, Vec<String>)>, Expl
 }
 
 /// Removes this provider's sync root list entry `name` below `list` unless the root it names for
-/// the Windows user `sid` is `live`: whether it was removed.
+/// the Windows user `sid` is `live`, or the entry is not owned by the Windows user `owner`: one
+/// another account created ahead of the user, which is theirs and which the user may not delete.
+/// Whether it was removed.
 fn sweep_entry(
 	list: &RegKey,
 	name: &str,
 	sid: &str,
+	owner: &str,
 	live: &dyn Fn(&Path) -> bool,
 ) -> Result<bool, ExplorerError> {
+	let Some(entry) =
+		ffi::reg_open_subkey(list, &wide(name)?).map_err(io("opening a registry key"))?
+	else {
+		return Ok(false);
+	};
+	match owned_by(&entry, owner) {
+		Ok(()) => {}
+		Err(ExplorerError::NotOwned) => {
+			debug!(target: LOG_TARGET, key = %name, "leaving a sync root list entry another account owns");
+			return Ok(false);
+		}
+		Err(error) => return Err(error),
+	}
+	drop(entry);
 	let root = match ffi::reg_open_subkey(list, &wide(&format!(r"{name}\UserSyncRoots"))?)
 		.map_err(io("opening a registry key"))?
 	{

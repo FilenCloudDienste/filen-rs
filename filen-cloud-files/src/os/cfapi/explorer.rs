@@ -93,6 +93,13 @@ pub(crate) fn thumbnail_server_command(exe: &str) -> Option<String> {
 	(!exe.contains('"')).then(|| format!("\"{exe}\" {THUMBNAIL_SERVER_ARG}"))
 }
 
+/// The exe the `LocalServer32` command line `command` starts, as [`thumbnail_server_command`]
+/// writes it: the quoted path at its start; `None` for a command not written that way.
+pub(crate) fn thumbnail_server_exe(command: &str) -> Option<&str> {
+	let (exe, _) = command.strip_prefix('"')?.split_once('"')?;
+	(!exe.is_empty()).then_some(exe)
+}
+
 /// The sync root list entry of `user`'s root for the Windows user `sid`: `Filen!<SID>!<userId>`.
 pub(crate) fn sync_root_key_name(sid: &str, user: UserId) -> String {
 	format!("{KEY_PREFIX}{sid}!{user}")
@@ -417,6 +424,16 @@ pub(crate) fn sweeps_navigation_class<E>(
 	Ok(!root()?.is_some_and(|root| live(&root)))
 }
 
+/// Whether the value `named` of a sync root list entry of this provider (its
+/// [`THUMBNAIL_PROVIDER_VALUE`]) points File Explorer at the thumbnail class `clsid` while that
+/// class is not `registered` (no `LocalServer32` COM could start, or one naming an exe no longer
+/// there, as a helper moved by an update leaves it): stale, as an older build may have left it, so
+/// it is removed and Explorer goes back to its own thumbnails until a serving
+/// helper writes both again. A value naming another class is not this provider's to judge.
+pub(crate) fn thumbnail_value_is_stale(named: Option<&str>, clsid: &str, registered: bool) -> bool {
+	!registered && named.is_some_and(|named| named.trim().eq_ignore_ascii_case(clsid))
+}
+
 /// Whether the sweep leaves what shows a root in File Explorer, the OS having reported
 /// `registration` of its path: unless the OS positively holds no registration of this provider's
 /// there. One that cannot be read counts as live, and so does a root on a volume not present
@@ -460,6 +477,20 @@ mod tests {
 			Some(r#""C:\Program Files\Filen\resources\filen-cloud-files.exe" --thumbnail-server"#)
 		);
 		assert_eq!(thumbnail_server_command(r#"C:\a"b.exe"#), None);
+	}
+
+	#[test]
+	fn the_thumbnail_server_command_names_the_exe_it_starts() {
+		let exe = r"C:\Program Files\Filen\resources\filen-cloud-files.exe";
+		let command = thumbnail_server_command(exe).unwrap();
+		assert_eq!(thumbnail_server_exe(&command), Some(exe));
+		// Not as `thumbnail_server_command` writes it: no exe this provider knows.
+		assert_eq!(thumbnail_server_exe(exe), None);
+		assert_eq!(
+			thumbnail_server_exe(r#""C:\a.exe --thumbnail-server"#),
+			None
+		);
+		assert_eq!(thumbnail_server_exe(r#""" --thumbnail-server"#), None);
 	}
 
 	#[test]
@@ -618,6 +649,24 @@ mod tests {
 			sweeps_navigation_class(&class, &thumbnail_class_key(), true, || Err("x"), |_| true),
 			Err("x")
 		);
+	}
+
+	#[test]
+	fn a_value_naming_the_thumbnail_class_is_stale_only_while_the_class_is_not_registered() {
+		let clsid = thumbnail_clsid_text();
+		assert!(thumbnail_value_is_stale(Some(&clsid), &clsid, false));
+		assert!(thumbnail_value_is_stale(
+			Some(&clsid.to_lowercase()),
+			&clsid,
+			false
+		));
+		assert!(!thumbnail_value_is_stale(Some(&clsid), &clsid, true));
+		assert!(!thumbnail_value_is_stale(None, &clsid, false));
+		assert!(!thumbnail_value_is_stale(
+			Some("{00000000-F11E-4E00-8000-000000000005}"),
+			&clsid,
+			false
+		));
 	}
 
 	#[test]

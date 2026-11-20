@@ -19,12 +19,20 @@ const OTHER_SID: &str = "S-1-5-21-1000-1000-1000-4242";
 const LONE_SID: &str = "S-1-5-21-1000-1000-1000-4243";
 const SWEPT_SID: &str = "S-1-5-21-1000-1000-1000-4244";
 const UNBRAND_SID: &str = "S-1-5-21-1000-1000-1000-4245";
+const STALE_SID: &str = "S-1-5-21-1000-1000-1000-4248";
+const SQUATTED_SID: &str = "S-1-5-21-1000-1000-1000-4249";
 
 /// The context menu commands' key name of the tests that write none: no test writes one there.
 const NO_COMMANDS: &str = "FilenCloudFilesTestNone";
 
 /// The thumbnail class key of the tests that write none: no test writes one there.
 const NO_THUMBNAILS: &str = r"Software\Classes\CLSID\{00000000-F11E-4E00-8000-000000000000}";
+
+/// [`NO_THUMBNAILS`] with its class id, for the sweep.
+const NO_THUMBNAIL_CLASS: ThumbnailClass<'static> = ThumbnailClass {
+	key: NO_THUMBNAILS,
+	clsid: "{00000000-F11E-4E00-8000-000000000000}",
+};
 
 /// Held by every test that sweeps the user's classes or writes a marked class, a thumbnail class
 /// or a navigation-pane class (`brand_as` marks one before it writes its property bag): a sweep
@@ -309,6 +317,61 @@ fn a_sync_root_list_entry_another_account_owns_is_not_written() {
 }
 
 #[test]
+fn a_root_whose_entry_another_account_created_first_gets_no_navigation_entry() {
+	let _marked = marked_classes();
+	let user = test_user(13);
+	let _cleanup = Cleanup::new(&[OTHER_SID], &[user]);
+	// Created ahead of the call, by this process, so not owned by OTHER_SID.
+	drop(create(Hive::LocalMachine, &entry(OTHER_SID, user)).unwrap());
+	let shown = brand_as(
+		OTHER_SID,
+		&test_root("squatted-first"),
+		user,
+		&Branding::default(),
+		NO_COMMANDS,
+	);
+	assert!(matches!(shown, Err(ExplorerError::NotOwned)), "{shown:?}");
+	let clsid = namespace_clsid(OTHER_SID, user);
+	assert!(!present(Hive::CurrentUser, &class(OTHER_SID, user)));
+	assert!(!present(
+		Hive::CurrentUser,
+		&format!(r"{DESKTOP_NAMESPACE}\{clsid}")
+	));
+	assert_eq!(
+		dword_value(Hive::CurrentUser, HIDE_DESKTOP_ICONS, &clsid),
+		None
+	);
+}
+
+#[test]
+fn the_sweep_leaves_an_entry_another_account_owns_and_fails_nothing() {
+	let _marked = marked_classes();
+	let gone = PathBuf::from(format!(
+		r"C:\filen-explorer-squat-test-{}\Gone",
+		std::process::id()
+	));
+	let user = test_user(71);
+	let _cleanup = Cleanup::new(&[SQUATTED_SID], &[user]);
+	set_value(
+		Hive::LocalMachine,
+		&format!(r"{}\UserSyncRoots", entry(SQUATTED_SID, user)),
+		Some(SQUATTED_SID),
+		gone.to_str().unwrap(),
+	);
+	let prefix = gone.parent().unwrap().to_path_buf();
+	// The entry is this process's, so not owned by OTHER_SID: as an entry another account created.
+	let swept = sweep_as(
+		SQUATTED_SID,
+		OTHER_SID,
+		&|root| !root.starts_with(&prefix),
+		NO_COMMANDS,
+		NO_THUMBNAIL_CLASS,
+	);
+	assert_eq!(swept.unwrap(), 0);
+	assert!(present(Hive::LocalMachine, &entry(SQUATTED_SID, user)));
+}
+
+#[test]
 fn an_elevated_removal_leaves_the_entry_of_another_windows_user() {
 	let _marked = marked_classes();
 	let sid = own();
@@ -406,7 +469,7 @@ fn the_sweep_tries_every_entry_past_one_it_cannot_read() {
 	cleanup.lock(Hive::CurrentUser, &classes[0]);
 	// The thumbnail class among them, marked too and with no property bag, as `set_thumbnails_as`
 	// writes it.
-	let (thumbnails, _) = test_thumbnail_class(6);
+	let (thumbnails, clsid) = test_thumbnail_class(6);
 	cleanup.extra.push((Hive::CurrentUser, thumbnails.clone()));
 	{
 		let key = create(Hive::CurrentUser, &thumbnails).unwrap();
@@ -422,9 +485,13 @@ fn the_sweep_tries_every_entry_past_one_it_cannot_read() {
 	let prefix = gone.parent().unwrap().to_path_buf();
 	let swept = sweep_as(
 		OTHER_SID,
+		&own(),
 		&|root| !root.starts_with(&prefix),
 		NO_COMMANDS,
-		&thumbnails,
+		ThumbnailClass {
+			key: &thumbnails,
+			clsid: &clsid,
+		},
 	);
 	assert!(swept.is_err(), "{swept:?}");
 	assert!(present(Hive::LocalMachine, &entry(OTHER_SID, unreadable)));
@@ -440,6 +507,97 @@ fn the_sweep_tries_every_entry_past_one_it_cannot_read() {
 		.as_deref(),
 		Some(SERVER)
 	);
+}
+
+#[test]
+fn a_value_naming_a_thumbnail_class_not_registered_is_removed_and_one_registered_kept() {
+	let _marked = marked_classes();
+	let users = [test_user(44), test_user(45)];
+	let mut cleanup = Cleanup::new(&[STALE_SID], &users);
+	let (key, clsid) = test_thumbnail_class(7);
+	cleanup.extra.push((Hive::CurrentUser, key.clone()));
+	let class = ThumbnailClass {
+		key: &key,
+		clsid: &clsid,
+	};
+	let [named, other] = users;
+	set_value(
+		Hive::LocalMachine,
+		&entry(STALE_SID, named),
+		Some(THUMBNAIL_PROVIDER_VALUE),
+		&clsid,
+	);
+	set_value(
+		Hive::LocalMachine,
+		&entry(STALE_SID, other),
+		Some(THUMBNAIL_PROVIDER_VALUE),
+		"{00000000-F11E-4E00-8000-000000000005}",
+	);
+	let value = |user| {
+		string_value(
+			Hive::LocalMachine,
+			&entry(STALE_SID, user),
+			Some(THUMBNAIL_PROVIDER_VALUE),
+		)
+	};
+	// The class is not there: the value naming it goes, the one naming another class stays.
+	assert_eq!(
+		remove_stale_thumbnail_values_as(STALE_SID, class).unwrap(),
+		1
+	);
+	assert_eq!(value(named), None);
+	assert!(present(Hive::LocalMachine, &entry(STALE_SID, named)));
+	assert!(value(other).is_some());
+	// A class key with no server is not registered either.
+	set_dword(&create(Hive::CurrentUser, &key).unwrap(), MARKER_VALUE, 1).unwrap();
+	set_value(
+		Hive::LocalMachine,
+		&entry(STALE_SID, named),
+		Some(THUMBNAIL_PROVIDER_VALUE),
+		&clsid,
+	);
+	assert_eq!(
+		remove_stale_thumbnail_values_as(STALE_SID, class).unwrap(),
+		1
+	);
+	assert_eq!(value(named), None);
+	// A server whose exe is not there, as a helper moved by an update leaves it: not registered.
+	set_value(
+		Hive::CurrentUser,
+		&format!(r"{key}\LocalServer32"),
+		None,
+		SERVER,
+	);
+	set_value(
+		Hive::LocalMachine,
+		&entry(STALE_SID, named),
+		Some(THUMBNAIL_PROVIDER_VALUE),
+		&clsid,
+	);
+	assert_eq!(
+		remove_stale_thumbnail_values_as(STALE_SID, class).unwrap(),
+		1
+	);
+	assert_eq!(value(named), None);
+	// Registered, naming an exe that is there: kept.
+	let exe = std::env::current_exe().unwrap();
+	set_value(
+		Hive::CurrentUser,
+		&format!(r"{key}\LocalServer32"),
+		None,
+		&thumbnail_server_command(exe.to_str().unwrap()).unwrap(),
+	);
+	set_value(
+		Hive::LocalMachine,
+		&entry(STALE_SID, named),
+		Some(THUMBNAIL_PROVIDER_VALUE),
+		&clsid,
+	);
+	assert_eq!(
+		remove_stale_thumbnail_values_as(STALE_SID, class).unwrap(),
+		0
+	);
+	assert_eq!(value(named).as_deref(), Some(clsid.as_str()));
 }
 
 /// The context menu commands' key name of test `n`, of this test run alone.
@@ -704,7 +862,7 @@ fn the_sweep_removes_the_commands_once_no_entry_of_the_user_is_left() {
 	let (_, branding) = present_commands();
 	plant_commands(&key, &branding);
 	// Of a SID no other test writes an entry of.
-	let swept = sweep_as(SWEPT_SID, &|_| true, &key, NO_THUMBNAILS).unwrap();
+	let swept = sweep_as(SWEPT_SID, &own(), &|_| true, &key, NO_THUMBNAIL_CLASS).unwrap();
 	assert_eq!(swept, 2);
 	for tree in command_trees(&key) {
 		assert!(!present(Hive::CurrentUser, &tree), "{tree}");
