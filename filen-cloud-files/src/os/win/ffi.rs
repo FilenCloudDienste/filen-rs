@@ -703,11 +703,23 @@ unsafe fn sid_string(sid: PSID) -> io::Result<Vec<u16>> {
 	if unsafe { ConvertSidToStringSidW(sid, &mut text) } == 0 {
 		return Err(io::Error::last_os_error());
 	}
+	// Allocated by `ConvertSidToStringSidW` with `LocalAlloc`, freed once the units are read.
+	let text = LocalBox(text.cast());
 	// SAFETY: the call succeeded, so `text` is a NUL-terminated string, read before it is freed.
-	let units = unsafe { read_wide(text) };
-	// SAFETY: `text` was allocated by `ConvertSidToStringSidW` with `LocalAlloc`, freed once, here.
-	unsafe { LocalFree(text.cast()) };
-	units.ok_or_else(|| io::Error::from(io::ErrorKind::InvalidData))
+	unsafe { read_wide(text.0.cast()) }.ok_or_else(|| io::Error::from(io::ErrorKind::InvalidData))
+}
+
+/// Memory a Win32 call allocated with `LocalAlloc` and handed this process, freed (`LocalFree`)
+/// when this drops: null or a pointer such a call returned, owned by this value alone.
+struct LocalBox(*mut c_void);
+
+impl Drop for LocalBox {
+	#[allow(unsafe_code)] // Win32 FFI: frees what a call allocated.
+	fn drop(&mut self) {
+		// SAFETY: the pointer is null, which `LocalFree` ignores, or was allocated with
+		// `LocalAlloc` by the call that returned it and is owned here, freed once.
+		unsafe { LocalFree(self.0) };
+	}
 }
 
 /// The string SID of the owner of the open key `key`.
@@ -732,12 +744,10 @@ pub(super) fn reg_owner_sid(key: &RegKey) -> io::Result<Vec<u16>> {
 			&mut descriptor,
 		)
 	})?;
+	// Allocated by `GetSecurityInfo` with `LocalAlloc`, freed after the last use of `owner`.
+	let _descriptor = LocalBox(descriptor);
 	// SAFETY: `owner` points into `descriptor`, freed only after this call.
-	let units = unsafe { sid_string(owner) };
-	// SAFETY: `descriptor` was allocated by `GetSecurityInfo` with `LocalAlloc`, freed once, here,
-	// after the last use of `owner`.
-	unsafe { LocalFree(descriptor.cast()) };
-	units
+	unsafe { sid_string(owner) }
 }
 
 /// Tells the shell the directory `path` changed (`SHCNE_UPDATEDIR`), so the windows showing it
