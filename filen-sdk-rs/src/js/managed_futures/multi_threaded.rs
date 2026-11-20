@@ -375,7 +375,7 @@ mod managed {
 		error::AbortedError,
 		job::{
 			JobControl,
-			cancel_grace::{CANCEL_GRACE, CancelOnAbort, with_cancel_grace},
+			cancel_grace::{CANCEL_GRACE, CancelOnAbort, cancel_on_request},
 		},
 		runtime::{self, CommanderFutHandle},
 	};
@@ -433,10 +433,9 @@ mod managed {
 		{
 			let abort_fut = self.abort_signal.into_future()?;
 			let pause = self.pause_signal.into_receiver()?;
-			let (cancel, cancel_rx) = tokio::sync::watch::channel(false);
+			let (cancel, cancel_rx) = tokio::sync::oneshot::channel();
 			let handle = runtime::do_on_commander(move || {
-				let control = JobControl::from_receivers(pause, Some(cancel_rx.clone()));
-				with_cancel_grace(job(control), cancel_rx, CANCEL_GRACE)
+				cancel_on_request(job, pause, cancel_rx, CANCEL_GRACE)
 			});
 			Ok(CancelOnAbort::new(handle, abort_fut, cancel))
 		}

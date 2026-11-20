@@ -762,6 +762,8 @@ mod commander_thread {
 			cancel_signal: tokio::sync::oneshot::Receiver<()>,
 			result_sender: Option<tokio::sync::oneshot::Sender<T>>,
 			paused: bool,
+			// Dropped after `pause_stream`, as declared after it (see `CommanderFutBuilder`).
+			_pause_open: tokio::sync::watch::Sender<bool>,
 		}
 	}
 
@@ -773,6 +775,13 @@ mod commander_thread {
 	{
 		future_builder: F,
 		pause_stream: tokio_stream::wrappers::WatchStream<bool>,
+		/// Keeps the pause channel open for as long as the commander watches it, so that the
+		/// handle's sender, which the page drops, is never the last one while the commander does.
+		/// Dropping the last sender wakes the receivers under the lock a receiver takes as it
+		/// starts or stops waiting for a change, and the page may not wait for a lock the
+		/// commander holds (see `DropOnCommander`). The future drops its stream before this, so
+		/// when the page's drop is the last, the commander is done with the channel.
+		pause_open: tokio::sync::watch::Sender<bool>,
 		cancel_signal: tokio::sync::oneshot::Receiver<()>,
 		result_sender: tokio::sync::oneshot::Sender<T>,
 	}
@@ -790,6 +799,7 @@ mod commander_thread {
 				cancel_signal: self.cancel_signal,
 				result_sender: Some(self.result_sender),
 				paused: false,
+				_pause_open: self.pause_open,
 			}
 		}
 	}
@@ -874,6 +884,7 @@ mod commander_thread {
 		let fut_builder = CommanderFutBuilder {
 			future_builder: fut_builder,
 			pause_stream: tokio_stream::wrappers::WatchStream::new(pause_signal_rx),
+			pause_open: pause_signal_tx.clone(),
 			cancel_signal: cancel_signal_rx,
 			result_sender,
 		};

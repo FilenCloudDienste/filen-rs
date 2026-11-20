@@ -245,14 +245,15 @@ impl JobControl {
 pub(crate) mod cancel_grace {
 	use std::{
 		future::Future,
-		pin::Pin,
+		pin::{Pin, pin},
 		task::{Context, Poll},
 		time::Duration,
 	};
 
 	use pin_project_lite::pin_project;
-	use tokio::sync::watch;
+	use tokio::sync::{oneshot, watch};
 
+	use super::JobControl;
 	use crate::{Error, ErrorKind, util::sleep};
 
 	/// How long a cancelled job may take to finish what cannot be interrupted (a directory create or
@@ -260,10 +261,43 @@ pub(crate) mod cancel_grace {
 	#[cfg(any(feature = "uniffi", feature = "wasm-full", feature = "napi"))]
 	pub(crate) const CANCEL_GRACE: Duration = Duration::from_secs(5);
 
+	/// The job's half of a [`CancelOnAbort`]: runs the job `job` builds with a [`JobControl`] whose
+	/// pause is `pause` and whose cancel turns on once the [`CancelOnAbort`] asks for it through
+	/// `cancel`, ending it as [`with_cancel_grace`] does.
+	///
+	/// The cancel's watch channel is made, set and dropped here, where the job runs, and only a
+	/// oneshot crosses to the [`CancelOnAbort`], which on wasm waits on the page's main thread.
+	/// Setting or closing a watch channel locks what its receivers lock as they start or stop
+	/// waiting for a change, and the page may not wait for a lock the job's worker holds (see
+	/// `DropOnCommander`); a oneshot locks nothing.
+	pub(crate) async fn cancel_on_request<F, Fut, T>(
+		job: F,
+		pause: Option<watch::Receiver<bool>>,
+		cancel: oneshot::Receiver<()>,
+		grace: Duration,
+	) -> Result<T, Error>
+	where
+		F: FnOnce(JobControl) -> Fut,
+		Fut: Future<Output = Result<T, Error>>,
+	{
+		let (cancelled, cancelled_rx) = watch::channel(false);
+		let control = JobControl::from_receivers(pause, Some(cancelled_rx.clone()));
+		let mut run = pin!(with_cancel_grace(job(control), cancelled_rx, grace));
+		tokio::select! {
+			biased;
+			result = &mut run => return result,
+			// a cancel dropped without being asked for is none
+			Ok(()) = cancel => {
+				cancelled.send_replace(true);
+			}
+		}
+		run.await
+	}
+
 	/// Runs `job`, ending it with [`ErrorKind::Cancelled`] if it has not finished `grace` after
-	/// `cancel` turned `true`. The job sees the same cancel through its
-	/// [`JobControl`](super::JobControl) and normally ends on its own well within the grace period.
-	pub(crate) async fn with_cancel_grace<T>(
+	/// `cancel` turned `true`. The job sees the same cancel through its [`JobControl`] and
+	/// normally ends on its own well within the grace period.
+	async fn with_cancel_grace<T>(
 		job: impl Future<Output = Result<T, Error>>,
 		mut cancel: watch::Receiver<bool>,
 		grace: Duration,
@@ -285,25 +319,25 @@ pub(crate) mod cancel_grace {
 	}
 
 	pin_project! {
-		/// Resolves with `job`, turning `abort` resolving into a cooperative cancel: it sets `cancel`
-		/// and keeps waiting for the job, which then winds down (see [`with_cancel_grace`]).
+		/// Resolves with `job`, turning `abort` resolving into a cooperative cancel: it asks for the
+		/// cancel through `cancel`, whose receiver [`cancel_on_request`] holds, and keeps waiting for
+		/// the job, which then winds down (see [`with_cancel_grace`]).
 		pub(crate) struct CancelOnAbort<J, A> {
 			#[pin]
 			job: J,
 			#[pin]
 			abort: A,
-			cancel: watch::Sender<bool>,
-			aborted: bool,
+			// `None` once the abort resolved
+			cancel: Option<oneshot::Sender<()>>,
 		}
 	}
 
 	impl<J, A> CancelOnAbort<J, A> {
-		pub(crate) fn new(job: J, abort: A, cancel: watch::Sender<bool>) -> Self {
+		pub(crate) fn new(job: J, abort: A, cancel: oneshot::Sender<()>) -> Self {
 			Self {
 				job,
 				abort,
-				cancel,
-				aborted: false,
+				cancel: Some(cancel),
 			}
 		}
 	}
@@ -314,9 +348,12 @@ pub(crate) mod cancel_grace {
 		fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
 			let this = self.project();
 			// an abort future must not be polled again once it has resolved
-			if !*this.aborted && this.abort.poll(cx).is_ready() {
-				*this.aborted = true;
-				this.cancel.send_replace(true);
+			if this.cancel.is_some()
+				&& this.abort.poll(cx).is_ready()
+				&& let Some(cancel) = this.cancel.take()
+			{
+				// fails only once the job ended, which then needs no cancel
+				let _ = cancel.send(());
 			}
 			this.job.poll(cx)
 		}
@@ -330,7 +367,7 @@ pub(crate) mod cancel_grace {
 		};
 
 		use super::*;
-		use crate::job::{JobControl, test_support::SetOnDrop};
+		use crate::job::test_support::SetOnDrop;
 
 		#[tokio::test(start_paused = true)]
 		async fn a_cancelled_job_that_finishes_in_time_keeps_its_result() {
@@ -366,22 +403,38 @@ pub(crate) mod cancel_grace {
 
 		#[tokio::test(start_paused = true)]
 		async fn an_abort_becomes_a_cancel_the_job_sees() {
-			let (cancel, cancel_rx) = watch::channel(false);
-			let control = JobControl::from_receivers(None, Some(cancel_rx));
-			let (abort, abort_rx) = tokio::sync::oneshot::channel::<()>();
-			let job = {
-				let control = control.clone();
-				async move {
+			let (cancel, cancel_rx) = oneshot::channel();
+			let job = cancel_on_request(
+				|control| async move {
 					control.stopping().await;
-					Ok::<_, Error>("wound down")
-				}
-			};
+					Ok::<_, Error>(control.is_cancelled())
+				},
+				None,
+				cancel_rx,
+				Duration::from_secs(5),
+			);
+			let (abort, abort_rx) = oneshot::channel::<()>();
 			let run = tokio::spawn(CancelOnAbort::new(job, abort_rx, cancel));
 			tokio::time::sleep(Duration::from_secs(1)).await;
 			assert!(!run.is_finished());
 			abort.send(()).unwrap();
-			assert_eq!(run.await.unwrap().unwrap(), "wound down");
-			assert!(control.is_cancelled());
+			assert!(run.await.unwrap().unwrap(), "the job wound down cancelled");
+		}
+
+		#[tokio::test(start_paused = true)]
+		async fn a_cancel_dropped_without_being_asked_for_leaves_the_job_running() {
+			let (cancel, cancel_rx) = oneshot::channel::<()>();
+			let job = cancel_on_request(
+				|control| async move {
+					tokio::time::sleep(Duration::from_secs(60)).await;
+					Ok::<_, Error>(control.is_cancelled())
+				},
+				None,
+				cancel_rx,
+				Duration::from_secs(5),
+			);
+			drop(cancel);
+			assert!(!job.await.unwrap(), "the job ran to its end uncancelled");
 		}
 	}
 }
