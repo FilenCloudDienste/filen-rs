@@ -13,10 +13,11 @@ use filen_mobile_native_cache::{
 	ffi::{FfiChanges, FfiDir, FfiFile, FfiId, FfiObject, QueryChildrenResponse, UploadFileInfo},
 	range::{ByteRange, RangeRead, RangeReadError, RangeSink},
 	remote::{CheckedUpload, PendingCopy},
-	thumbnail::FittedOutcome,
+	thumbnail::{FittedOutcome, FittedThumbnail},
 	traits::WorkingSetUpdateListener,
 };
 use filen_sdk_rs::thumbnail::ByteSource;
+use filen_types::fs::Uuid;
 
 use crate::sealed;
 
@@ -98,6 +99,16 @@ pub trait Drive: sealed::Sealed + Send + Sync + 'static {
 		max_side: u32,
 		cancel: &Arc<AtomicBool>,
 	) -> impl Future<Output = Result<FittedOutcome, CacheError>> + Send;
+
+	/// The thumbnail of the file version `version` fitted inside a `max_side` pixel square, if the
+	/// cache's thumbnail directory holds it, as [`Drive::fitted_thumbnail`] kept it: read from disk
+	/// with no server round trip and nothing made, as
+	/// [`FilenMobileCacheState::cached_fitted_thumbnail`] reads it.
+	fn cached_fitted_thumbnail(
+		&self,
+		version: Uuid,
+		max_side: u32,
+	) -> impl Future<Output = Result<Option<FittedThumbnail>, CacheError>> + Send;
 
 	/// The thumbnail of local bytes, `source`, of a file named `name`, fitted as
 	/// [`Drive::fitted_thumbnail`] fits it and not cached, as
@@ -290,6 +301,14 @@ impl Drive for FilenMobileCacheState {
 		cancel: &Arc<AtomicBool>,
 	) -> impl Future<Output = Result<FittedOutcome, CacheError>> + Send {
 		FilenMobileCacheState::fitted_thumbnail(self, id, max_side, cancel)
+	}
+
+	fn cached_fitted_thumbnail(
+		&self,
+		version: Uuid,
+		max_side: u32,
+	) -> impl Future<Output = Result<Option<FittedThumbnail>, CacheError>> + Send {
+		FilenMobileCacheState::cached_fitted_thumbnail(self, version, max_side)
 	}
 
 	fn fitted_thumbnail_of_local(

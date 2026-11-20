@@ -31,7 +31,7 @@ use tokio::{
 };
 use tracing::{debug, warn};
 
-use self::recent::Recent;
+pub(crate) use self::recent::Recent;
 pub(super) use self::{
 	apply::{Step, apply, detached_as_extra, may_hold_edit, remove_gone_dir, upload_pending},
 	children::{children, populate_pinned},

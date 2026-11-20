@@ -1,6 +1,7 @@
 //! A map of at most a given number of entries that drops the least recently touched one past it:
 //! what the hints remember of reads, verifications and damage is bounded, as each forgotten entry
-//! costs only work done again (a walk finds a partly read file, a verified file is hashed again).
+//! costs only work done again (a walk finds a partly read file, a verified file is hashed again),
+//! and the item versions the thumbnail service told File Explorer of.
 
 use std::{
 	collections::{BTreeMap, HashMap},
@@ -12,7 +13,7 @@ use tracing::debug;
 
 /// The map. Keys are ids the drive minted, so the default randomly seeded hasher stays.
 #[derive(Debug)]
-pub(super) struct Recent<K, V> {
+pub(crate) struct Recent<K, V> {
 	entries: HashMap<K, (V, u64)>,
 	/// Every key by when it was last touched, oldest first.
 	order: BTreeMap<u64, K>,
@@ -24,7 +25,7 @@ pub(super) struct Recent<K, V> {
 
 impl<K: Copy + Eq + Hash + Debug, V> Recent<K, V> {
 	/// An empty map of at most `cap` entries (at least one), naming its entries `what` in the log.
-	pub(super) fn new(cap: usize, what: &'static str) -> Self {
+	pub(crate) fn new(cap: usize, what: &'static str) -> Self {
 		Self {
 			entries: HashMap::new(),
 			order: BTreeMap::new(),
@@ -36,7 +37,7 @@ impl<K: Copy + Eq + Hash + Debug, V> Recent<K, V> {
 
 	/// Sets `key` to `value` as the most recently touched entry, dropping the least recently
 	/// touched one past the bound.
-	pub(super) fn insert(&mut self, key: K, value: V) {
+	pub(crate) fn insert(&mut self, key: K, value: V) {
 		let tick = self.tick();
 		if let Some((_, old)) = self.entries.insert(key, (value, tick)) {
 			self.order.remove(&old);
@@ -51,7 +52,7 @@ impl<K: Copy + Eq + Hash + Debug, V> Recent<K, V> {
 	}
 
 	/// The value of `key`, if held, untouched.
-	pub(super) fn get(&self, key: &K) -> Option<&V> {
+	pub(crate) fn get(&self, key: &K) -> Option<&V> {
 		self.entries.get(key).map(|(value, _)| value)
 	}
 

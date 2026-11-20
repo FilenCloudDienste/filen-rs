@@ -92,4 +92,6 @@ pub use placeholder::{
 };
 pub use populate::{SkipReason, SkippedItem};
 pub use root_path::{CaseKey, RootPath, RootPathError};
-pub use thumbnails::{Thumbnail, ThumbnailAlpha, ThumbnailHandler, ThumbnailRefusal};
+pub use thumbnails::{
+	Thumbnail, ThumbnailAlpha, ThumbnailCancel, ThumbnailHandler, ThumbnailRefusal,
+};

@@ -30,7 +30,7 @@ use filen_mobile_native_cache::{
 	},
 	range::{ByteRange, RangeIntegrity, RangeRead, RangeReadError, RangeSink},
 	remote::{CheckedUpload, PendingCopy},
-	thumbnail::{FittedOutcome, encode_fitted},
+	thumbnail::{FittedOutcome, FittedThumbnail, encode_fitted},
 	traits::WorkingSetUpdateListener,
 };
 use filen_sdk_rs::{
@@ -152,6 +152,32 @@ pub struct FakeDrive {
 	active: AtomicUsize,
 	/// The most reads ever active at once.
 	max_active: AtomicUsize,
+	/// The remote thumbnails in the making.
+	thumbnails: InFlight,
+}
+
+/// How many calls of a kind are in progress, and the most ever at once.
+#[derive(Debug, Default)]
+struct InFlight {
+	now: AtomicUsize,
+	most: AtomicUsize,
+}
+
+/// Counts a call as in progress until dropped, its future dropped included.
+struct Entered<'a>(&'a InFlight);
+
+impl<'a> Entered<'a> {
+	fn new(calls: &'a InFlight) -> Self {
+		let now = calls.now.fetch_add(1, Ordering::SeqCst) + 1;
+		calls.most.fetch_max(now, Ordering::SeqCst);
+		Self(calls)
+	}
+}
+
+impl Drop for Entered<'_> {
+	fn drop(&mut self) {
+		self.0.now.fetch_sub(1, Ordering::SeqCst);
+	}
 }
 
 /// Whether the echoes of the provider's own writes are held back, as the real cache tells its
@@ -222,6 +248,12 @@ struct DriveState {
 	/// Directories whose children the cache has not listed yet: its own reads give them none
 	/// until a listing refreshed from the server.
 	unlisted: HashSet<String>,
+	/// The fitted thumbnails kept, by the file version and side made at, as the cache keeps them.
+	fitted: HashMap<(Uuid, u32), FittedThumbnail>,
+	/// How many times the kept thumbnails were looked in.
+	cache_lookups: usize,
+	/// Whether thumbnails made are kept.
+	fitted_kept: Fitted,
 }
 
 /// The change feed: every item's latest change, and the items removed for good.
@@ -275,6 +307,8 @@ pub enum DriveCall {
 	/// [`Drive::fitted_thumbnail`] and [`Drive::fitted_thumbnail_of_local`]; only the remote one
 	/// is gated.
 	Thumbnail,
+	/// [`Drive::cached_fitted_thumbnail`]; never gated.
+	CachedThumbnail,
 }
 
 /// A call the drive answered, in order, by the ids and names it was given.
@@ -419,6 +453,15 @@ enum Versions {
 	Ignored,
 }
 
+/// What the drive does with a remote thumbnail it made.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Fitted {
+	/// Keeps it, as the cache does.
+	Kept,
+	/// Keeps nothing, as a cache that cannot write.
+	Unkept,
+}
+
 /// One file's content.
 struct FakeContent {
 	version: Uuid,
@@ -486,7 +529,11 @@ impl FakeDrive {
 				reported: (Vec::new(), 0),
 				pages_read: 0,
 				unlisted: HashSet::new(),
+				fitted: HashMap::new(),
+				cache_lookups: 0,
+				fitted_kept: Fitted::Kept,
 			}),
+			thumbnails: InFlight::default(),
 			started: watch::Sender::new(0),
 			active: AtomicUsize::new(0),
 			max_active: AtomicUsize::new(0),
@@ -621,6 +668,31 @@ impl FakeDrive {
 	/// The most reads that were ever in progress at once.
 	pub fn max_concurrent_reads(&self) -> usize {
 		self.max_active.load(Ordering::SeqCst)
+	}
+
+	/// How many remote thumbnails are in the making now, and the most ever at once; a call whose
+	/// future was dropped is no longer counted.
+	pub fn thumbnails_in_flight(&self) -> (usize, usize) {
+		(
+			self.thumbnails.now.load(Ordering::SeqCst),
+			self.thumbnails.most.load(Ordering::SeqCst),
+		)
+	}
+
+	/// How many times the kept thumbnails were looked in ([`Drive::cached_fitted_thumbnail`]).
+	pub fn thumbnail_cache_lookups(&self) -> usize {
+		self.state().cache_lookups
+	}
+
+	/// Whether a fitted thumbnail of the file version `version` made at `side` is kept.
+	pub fn keeps_thumbnail(&self, version: Uuid, side: u32) -> bool {
+		self.state().fitted.contains_key(&(version, side))
+	}
+
+	/// Makes every later remote thumbnail made go unkept, as a cache that cannot write leaves it,
+	/// or kept again.
+	pub fn keep_no_thumbnails(&self, none: bool) {
+		self.state().fitted_kept = if none { Fitted::Unkept } else { Fitted::Kept };
 	}
 
 	/// The `(start, end)` of every range a read was asked for, in order.
@@ -1818,27 +1890,52 @@ impl Drive for FakeDrive {
 	/// holds, or the root.
 	/// Decodes the file's bytes as the cache would, under a fixed 16 MiB budget; the name gate is
 	/// left to the local variant, as the bytes' format decides here.
+	/// A thumbnail made is kept by the file's version, as the cache keeps it; one the gate held
+	/// fails as unreachable when the drive went offline meanwhile, as a download cut off does.
 	async fn fitted_thumbnail(
 		&self,
 		id: &FfiId,
 		max_side: u32,
 		cancel: &Arc<AtomicBool>,
 	) -> Result<FittedOutcome, CacheError> {
+		let _entered = Entered::new(&self.thumbnails);
 		self.enter_gated(DriveCall::Thumbnail, DriveOp::Thumbnail(id.0.clone()))
 			.await?;
 		if cancel.load(Ordering::Relaxed) {
 			return Err(CacheError::Aborted("the thumbnail was cancelled".into()));
 		}
-		let bytes = stable_uuid(id)
+		if self.state().offline {
+			return Err(offline_error());
+		}
+		let (version, bytes) = stable_uuid(id)
 			.and_then(|stable| {
 				self.state()
 					.files
 					.get(&stable)
-					.map(|content| content.bytes.to_vec())
+					.map(|content| (content.version, content.bytes.to_vec()))
 			})
 			.ok_or_else(|| CacheError::DoesNotExist("the drive holds no such file".into()))?;
-		encode_fitted(Box::new(MemSource(bytes)), &thumbnail_spec(max_side))
-			.map_err(CacheError::from)
+		let outcome = encode_fitted(Box::new(MemSource(bytes)), &thumbnail_spec(max_side))
+			.map_err(CacheError::from)?;
+		if let FittedOutcome::Thumbnail(thumbnail) = &outcome {
+			let mut state = self.state();
+			if state.fitted_kept == Fitted::Kept {
+				state.fitted.insert((version, max_side), thumbnail.clone());
+			}
+		}
+		Ok(outcome)
+	}
+
+	/// What [`FakeDrive::fitted_thumbnail`] kept, offline too: only a switch fails it.
+	async fn cached_fitted_thumbnail(
+		&self,
+		version: Uuid,
+		max_side: u32,
+	) -> Result<Option<FittedThumbnail>, CacheError> {
+		self.enter_cached(DriveCall::CachedThumbnail)?;
+		let mut state = self.state();
+		state.cache_lookups += 1;
+		Ok(state.fitted.get(&(version, max_side)).cloned())
 	}
 
 	/// As the cache does, offline too: only a switch fails it.

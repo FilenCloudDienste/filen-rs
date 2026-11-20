@@ -97,7 +97,7 @@ pub const THUMBNAIL_SERVER_IDLE: Duration = Duration::from_secs(10);
 /// A handler that answers every request [`ThumbnailRefusal::SignedOut`], noting when it was last
 /// asked in `asked`.
 fn refusing_handler(asked: Arc<Mutex<Instant>>) -> ThumbnailHandler {
-	Arc::new(move |_, _| {
+	Arc::new(move |_, _, _| {
 		*asked.lock().unwrap_or_else(PoisonError::into_inner) = Instant::now();
 		Err(ThumbnailRefusal::SignedOut)
 	})
@@ -225,6 +225,7 @@ mod tests {
 	use crate::{
 		identity::PlaceholderIdentity,
 		test_support::{FakeLocal, FakePlatform},
+		thumbnails::ThumbnailCancel,
 	};
 
 	#[test]
@@ -258,7 +259,11 @@ mod tests {
 		let asked = Arc::new(Mutex::new(start));
 		let handler = refusing_handler(Arc::clone(&asked));
 		assert_eq!(
-			handler(std::path::Path::new(r"C:\Users\u\Filen\a.jpg"), 96),
+			handler(
+				std::path::Path::new(r"C:\Users\u\Filen\a.jpg"),
+				96,
+				&ThumbnailCancel::default()
+			),
 			Err(ThumbnailRefusal::SignedOut)
 		);
 		assert!(*asked.lock().unwrap() >= start);

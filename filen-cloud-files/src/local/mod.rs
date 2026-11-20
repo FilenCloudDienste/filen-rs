@@ -71,7 +71,10 @@ use self::{
 	remote::{Index, populated_uuid},
 	veto::{DeleteStage, PendingDelete, PendingRename},
 };
-pub(crate) use self::{records::RECORD_FILE_NAMES, remote::FileVersion};
+pub(crate) use self::{
+	records::RECORD_FILE_NAMES,
+	remote::{FileVersion, Recent},
+};
 pub use self::{
 	remote::RemoteHints,
 	report::{ConflictKind, KeptReason, LocalReport, LocalSkip, RemoteApplied, UndoneOp, VetoedOp},
