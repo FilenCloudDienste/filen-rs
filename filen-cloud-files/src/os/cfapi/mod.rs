@@ -5,6 +5,9 @@
 // Read only by the Windows layer; on other hosts only its tests build it.
 #[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) mod explorer;
+// Read only by the Windows layer's COM server; on other hosts only its tests build it.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) mod gate;
 
 use std::{fmt, iter};
 
