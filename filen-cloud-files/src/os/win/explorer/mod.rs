@@ -202,6 +202,25 @@ fn remove_thumbnail_values_as(sid: &str) -> Result<(), ExplorerError> {
 	first
 }
 
+/// Removes the value naming the thumbnail class from `user`'s sync root list entry, for the Windows
+/// user this process runs as: what the helper does once it stops serving the root because the user
+/// signed out, so File Explorer goes back to its own thumbnails there. The class stays while the
+/// entry does ([`remove_thumbnail_class_unless_rooted`]). A value not there is gone already.
+pub(crate) fn remove_thumbnail_value(user: UserId) -> Result<(), ExplorerError> {
+	remove_thumbnail_value_as(&own_sid()?, user)
+}
+
+/// [`remove_thumbnail_value`] for the Windows user `sid`.
+fn remove_thumbnail_value_as(sid: &str, user: UserId) -> Result<(), ExplorerError> {
+	let entry = format!(r"{SYNC_ROOT_MANAGER}\{}", sync_root_key_name(sid, user));
+	ffi::reg_delete_value(
+		Hive::LocalMachine,
+		&wide(&entry)?,
+		&wide(THUMBNAIL_PROVIDER_VALUE)?,
+	)
+	.map_err(io("deleting a registry value"))
+}
+
 /// Where a thumbnail class is registered: its key under `HKEY_CURRENT_USER`, and the class id the
 /// root's entry names.
 #[derive(Debug, Clone, Copy)]
@@ -221,15 +240,10 @@ fn set_thumbnails_as(
 	class: ThumbnailClass<'_>,
 	server: Option<&str>,
 ) -> Result<(), ExplorerError> {
-	let entry = format!(r"{SYNC_ROOT_MANAGER}\{}", sync_root_key_name(sid, user));
 	let Some(server) = server else {
-		return ffi::reg_delete_value(
-			Hive::LocalMachine,
-			&wide(&entry)?,
-			&wide(THUMBNAIL_PROVIDER_VALUE)?,
-		)
-		.map_err(io("deleting a registry value"));
+		return remove_thumbnail_value_as(sid, user);
 	};
+	let entry = format!(r"{SYNC_ROOT_MANAGER}\{}", sync_root_key_name(sid, user));
 	{
 		let key = create(Hive::CurrentUser, class.key)?;
 		set_string(&key, None, THUMBNAIL_CLASS_NAME, false)?;

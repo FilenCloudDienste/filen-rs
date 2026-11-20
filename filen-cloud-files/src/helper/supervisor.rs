@@ -5,6 +5,7 @@
 use std::{
 	mem,
 	panic::AssertUnwindSafe,
+	path::PathBuf,
 	sync::{
 		Arc,
 		atomic::{AtomicBool, Ordering},
@@ -1222,11 +1223,17 @@ impl<P: Platform, O: DriveOpener> Helper<P, O> {
 		)
 	}
 
+	/// Signs `user` out: stops serving their root, when served, then deletes the session and the
+	/// sealing key, and withdraws the thumbnail class from the root's entry
+	/// ([`Platform::withdraw_root_thumbnails`]), so File Explorer shows its own thumbnails there while
+	/// no session is; a sign-in names it again.
 	async fn clear_auth(&mut self, user: UserId) -> Result<ReplyValue, ReplyError> {
 		match mem::replace(&mut self.phase, Phase::Idle) {
 			Phase::Serving(serving) if serving.user == user => {
 				let (registered, store, keys) = self.stop_serving(*serving).await;
 				let dir = registered.data_dir.clone();
+				self.withdraw_root_thumbnails(registered.root.to_path_buf(), user)
+					.await;
 				self.phase = Phase::Registered(registered);
 				self.status();
 				// The cache is stopped, so nothing reads auth.json to wipe what it cached on its own.
@@ -1241,16 +1248,27 @@ impl<P: Platform, O: DriveOpener> Helper<P, O> {
 				Ok(ReplyValue::Cleared { cleared: true })
 			}
 			phase => {
-				let dir = match &phase {
-					Phase::Registered(registered) if registered.user == user => {
-						Some(registered.data_dir.clone())
+				let (dir, root) = match &phase {
+					Phase::Registered(registered) if registered.user == user => (
+						Some(registered.data_dir.clone()),
+						Some(registered.root.to_path_buf()),
+					),
+					Phase::Idle | Phase::Registered(_) | Phase::Serving(_) => {
+						match self.index.entry(user) {
+							Some(entry) => (
+								DataDir::new(entry.data_dir.clone()).ok(),
+								// An unregistered root's entry is gone, its value with it.
+								(!entry.unregistered).then(|| entry.root.to_path_buf()),
+							),
+							None => (None, None),
+						}
 					}
-					Phase::Idle | Phase::Registered(_) | Phase::Serving(_) => self
-						.index
-						.entry(user)
-						.and_then(|entry| DataDir::new(entry.data_dir.clone()).ok()),
 				};
 				self.phase = phase;
+				// The value a helper that only stopped left, named while a session served the root.
+				if let Some(root) = root {
+					self.withdraw_root_thumbnails(root, user).await;
+				}
 				let Some(dir) = dir else {
 					return Ok(ReplyValue::Cleared { cleared: false });
 				};
@@ -1436,6 +1454,13 @@ impl<P: Platform, O: DriveOpener> Helper<P, O> {
 			}
 			phase => self.phase = phase,
 		}
+	}
+
+	/// Removes the value naming the thumbnail class from the entry of `user`'s root at `root`, on a
+	/// build that serves thumbnails; a failure is logged.
+	async fn withdraw_root_thumbnails(&self, root: PathBuf, user: UserId) {
+		let platform = Arc::clone(&self.platform);
+		blocking(move || platform.withdraw_root_thumbnails(&root, user)).await;
 	}
 
 	/// Takes what the thumbnail server's start answered (`None` when it panicked). A server that

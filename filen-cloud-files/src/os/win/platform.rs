@@ -283,6 +283,12 @@ impl Platform for WinPlatform {
 		}
 	}
 
+	fn withdraw_root_thumbnails(&self, _root: &Path, user: UserId) {
+		if let Err(error) = explorer::remove_thumbnail_value(user) {
+			warn!(target: LOG_TARGET, %error, "removing the root's thumbnail class failed");
+		}
+	}
+
 	fn stop_thumbnails(&self, server: ThumbnailServer) {
 		server.stop();
 	}

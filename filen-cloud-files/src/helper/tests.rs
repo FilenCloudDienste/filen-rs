@@ -2899,3 +2899,74 @@ async fn a_thumbnail_class_left_by_a_stopped_run_is_swept_at_the_next_start() {
 	assert!(!platform.thumbnail_provider(&gone));
 	assert!(!platform.thumbnail_class());
 }
+
+/// A helper serving thumbnails for the root, the class named for it.
+async fn serving_thumbnails(disk: &Disk, platform: &FakePlatform, drive: &Arc<FakeDrive>) -> Rig {
+	platform.implement_thumbnails(true);
+	let mut rig = Rig::start(disk, platform, drive);
+	ok(&rig.register(disk).await);
+	ok(&rig.set_auth("42", ACCOUNT_ROOT).await);
+	eventually("the served root names the class", || {
+		platform.thumbnail_provider(&disk.root())
+	})
+	.await;
+	rig
+}
+
+#[tokio::test(start_paused = true)]
+async fn signing_out_withdraws_the_thumbnail_class_from_the_root_until_a_sign_in() {
+	let disk = Disk::new();
+	let (platform, drive) = world();
+	let mut rig = serving_thumbnails(&disk, &platform, &drive).await;
+
+	ok(&rig
+		.request(json!({ "t": "clearAuth", "userId": "42" }))
+		.await);
+	assert!(
+		!platform.thumbnail_provider(&disk.root()),
+		"File Explorer's own thumbnails while signed out"
+	);
+	assert!(platform.thumbnail_class(), "the class stays with the entry");
+	assert_eq!(platform.root_thumbnail_withdrawals(), 1);
+	assert_eq!(platform.thumbnail_withdrawals(), 0, "only this root's");
+
+	ok(&rig.set_auth("42", ACCOUNT_ROOT).await);
+	assert!(platform.thumbnail_provider(&disk.root()), "named again");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_helper_that_only_stops_leaves_the_thumbnail_class_named_for_the_root() {
+	let disk = Disk::new();
+	let (platform, drive) = world();
+	let mut rig = serving_thumbnails(&disk, &platform, &drive).await;
+
+	ok(&rig.request(json!({ "t": "shutdown" })).await);
+	assert_eq!(rig.task.await.unwrap(), ExitReason::Shutdown);
+	assert!(
+		platform.thumbnail_provider(&disk.root()),
+		"the instance COM starts answers until the next helper serves"
+	);
+	assert!(platform.thumbnail_class());
+	assert_eq!(platform.root_thumbnail_withdrawals(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn signing_out_of_a_root_not_served_withdraws_the_class_an_earlier_run_named() {
+	let disk = Disk::new();
+	let (platform, drive) = world();
+	let mut rig = serving_thumbnails(&disk, &platform, &drive).await;
+	ok(&rig.request(json!({ "t": "shutdown" })).await);
+	assert_eq!(rig.task.await.unwrap(), ExitReason::Shutdown);
+	// The session went while no helper ran: the next one registers the root without serving it.
+	std::fs::remove_file(disk.data().join("auth.json")).unwrap();
+	let mut rig = Rig::start(&disk, &platform, &drive);
+	let registered = ok(&rig.register(&disk).await).clone();
+	assert_eq!(registered["state"], "registered");
+	assert!(platform.thumbnail_provider(&disk.root()));
+
+	ok(&rig
+		.request(json!({ "t": "clearAuth", "userId": "42" }))
+		.await);
+	assert!(!platform.thumbnail_provider(&disk.root()));
+	assert_eq!(platform.root_thumbnail_withdrawals(), 1);
+}

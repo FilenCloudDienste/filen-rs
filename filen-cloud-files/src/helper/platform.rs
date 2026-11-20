@@ -266,6 +266,15 @@ pub trait Platform: sealed::Sealed + Send + Sync + 'static {
 	/// Stops `server`: later requests are answered by the class's fallback, which refuses each.
 	fn stop_thumbnails(&self, server: Self::Thumbnails);
 
+	/// Removes the value naming the thumbnail class from the entry of `user`'s root at `root`, as
+	/// the Windows user this process runs as: what the helper does once the user signed out, so
+	/// File Explorer shows its own thumbnails of the files on disk there instead of the class's
+	/// fallback, which refuses every request while no session is served. The class stays while
+	/// the user has an entry; [`Platform::brand`] names it again once a session serves the root. A
+	/// helper that only stops leaves the value, so the root shows the same across the app's
+	/// restarts. A failure is logged.
+	fn withdraw_root_thumbnails(&self, root: &Path, user: UserId);
+
 	/// Removes the value naming the thumbnail class from every root's entry, as the Windows user
 	/// this process runs as, not only from those branded in this run: what the helper does when
 	/// [`Platform::secure_thumbnails`] or [`Platform::serve_thumbnails`] failed, so File Explorer

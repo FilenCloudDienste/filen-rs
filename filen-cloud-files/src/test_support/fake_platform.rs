@@ -185,6 +185,8 @@ struct ThumbnailState {
 	withdrawals: usize,
 	/// How many of the next removals of that value panic, as a bug there would.
 	panic_withdrawals: u32,
+	/// How many times the value was removed from one root's entry.
+	root_withdrawals: usize,
 	/// Holds every start until released, as a COM initialisation that hangs does.
 	hold: Option<Arc<HoldState>>,
 	/// How many starts wait at the hold now.
@@ -612,6 +614,11 @@ impl FakePlatform {
 	/// How many times the value naming the thumbnail class was removed from every root.
 	pub fn thumbnail_withdrawals(&self) -> usize {
 		self.state().thumbnails.withdrawals
+	}
+
+	/// How many times the value naming the thumbnail class was removed from one root's entry.
+	pub fn root_thumbnail_withdrawals(&self) -> usize {
+		self.state().thumbnails.root_withdrawals
 	}
 
 	/// Makes the next removal of the value naming the thumbnail class panic.
@@ -1072,6 +1079,12 @@ impl Platform for FakePlatform {
 		let thumbnails = &mut self.state().thumbnails;
 		thumbnails.handler = None;
 		thumbnails.servers.1 += 1;
+	}
+
+	fn withdraw_root_thumbnails(&self, root: &Path, _user: UserId) {
+		let thumbnails = &mut self.state().thumbnails;
+		thumbnails.provider.remove(root);
+		thumbnails.root_withdrawals += 1;
 	}
 
 	fn withdraw_thumbnails(&self) {
