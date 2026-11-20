@@ -28,7 +28,9 @@ use filen_types::fs::Uuid;
 use serde_json::{Map, Value, json};
 use tracing::{debug, info, warn};
 
-use filen_cloud_files::test_support::FakeDrive;
+use filen_cloud_files::test_support::{
+	FakeDrive, held_convert, hold_next_convert, release_convert,
+};
 
 use crate::{events, report::Outcome, stall, tree};
 
@@ -368,6 +370,10 @@ pub(crate) fn run(root: &Path, out: &Path, secs: u64, local: bool) -> Outcome {
 ///   file there the cache holds unsent, as an upload killed on its way leaves it;
 /// - `pending`: the engine's count of items the drive does not have yet after a walk of the root,
 ///   as the helper's `getState` answers it, `null` when unknown;
+/// - `hold <prefix> <ms>`: the next convert of a new ordinary file or directory whose name starts
+///   with `prefix` waits just before it converts, until `release` or for `<ms>` at most, logging
+///   "paused before convert"; `held` answers the path held then, `-` while none is; `release` lets
+///   it go on, and disarms a hold that caught nothing;
 /// - `pause` and `resume`: stop serving and disconnect the root, keeping it registered, as a
 ///   provider that is not running leaves it; then connect it again with a new engine, keeping the
 ///   records of the one before, as a provider starting up, which reconciles the root with the
@@ -533,6 +539,21 @@ fn run_command(context: &Context, command: &str) -> String {
 			}
 			_ => format!("err no directory {dir} or size {size}"),
 		},
+		["hold", prefix, ms] => match ms.parse() {
+			Ok(ms) => {
+				hold_next_convert(prefix, Duration::from_millis(ms));
+				"ok armed".to_owned()
+			}
+			Err(_) => format!("err not a number of milliseconds {ms}"),
+		},
+		["held"] => format!(
+			"ok {}",
+			held_convert().map_or_else(|| "-".to_owned(), |path| path.to_string())
+		),
+		["release"] => {
+			release_convert();
+			"ok released".to_owned()
+		}
 		["quiet", switch @ ("on" | "off")] => {
 			drive.quiet_signals(*switch == "on");
 			"ok quiet".to_owned()

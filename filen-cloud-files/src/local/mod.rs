@@ -17,6 +17,8 @@
 //! and the remote side changes only clean placeholders, handing anything holding local data to the
 //! local side.
 
+#[cfg(feature = "test-seams")]
+mod convert_hold;
 mod dehydrate;
 mod hydration;
 mod jobs;
@@ -57,6 +59,8 @@ use tokio::{
 };
 use tracing::{debug, warn};
 
+#[cfg(feature = "test-seams")]
+pub use self::convert_hold::{held_convert, hold_next_convert, release_convert};
 #[cfg(feature = "test-seams")]
 pub use self::relocate::relocate_for_test;
 use self::{

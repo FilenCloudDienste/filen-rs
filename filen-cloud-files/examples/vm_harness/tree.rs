@@ -11,8 +11,8 @@ use filen_types::fs::Uuid;
 pub(crate) const ROOT: Uuid = Uuid::from_u128(0xF11E_0000_0000_0000_0000_0000_0000_0001);
 /// Every directory of the tree below the root, parents first, with its uuid. `lx` holds what the
 /// local-change scenarios change, `rx` what the remote-change scenarios change, `px` what the
-/// pin scenarios change and `sx` what the save and restart scenarios change; nothing else in the
-/// tree is changed.
+/// pin scenarios change, `sx` what the save and restart scenarios change and `ox` what the
+/// overtaken-convert scenarios change; nothing else in the tree is changed.
 pub(crate) const DIRS: &[(&str, u128)] = &[
 	("sub", 0x3001),
 	("sub\\deeper", 0x3002),
@@ -48,6 +48,8 @@ pub(crate) const DIRS: &[(&str, u128)] = &[
 	("px\\pn", 0x301C),
 	("px\\pn\\deep", 0x301D),
 	("px\\pn\\deep\\deeper", 0x301E),
+	// What the overtaken-convert scenarios save over and make new items in.
+	("ox", 0x301F),
 ];
 /// `emptydir/`, which has no children.
 pub(crate) const EMPTYDIR: Uuid = Uuid::from_u128(0x3003);
@@ -205,6 +207,8 @@ pub(crate) const FILES: &[TreeFile] = &[
 	file("px\\pn\\a.bin", 9_016, Content::Plain),
 	file("px\\pn\\deep\\b.bin", 9_017, Content::Plain),
 	file("px\\pn\\deep\\deeper\\c.bin", 9_018, Content::Plain),
+	// The overtaken-convert scenarios' file, of a size no other file has.
+	file("ox\\save.txt", 10_101, Content::Plain),
 ];
 
 /// Names in the root the core must skip, as Windows cannot hold them.

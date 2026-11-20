@@ -21,6 +21,10 @@
 //! - `pins <root> <out>`: the pin scenarios, a user pinning and unpinning items of the root and
 //!   asking the platform to dehydrate files, into `<out>\pins.txt`; after `remote`, before
 //!   `check`.
+//! - `overtake <root> <out>`: the overtaken-convert scenarios, a user renaming a new file or
+//!   directory in the window before its convert, the provider `provide-local` serves held in it
+//!   through its `hold` control command, into `<out>\overtake.txt`; on a fresh `provide-local`,
+//!   or after `saves`, before `remote`.
 //! - `check <root> <out>`: the reader's scenarios, into `<out>\check.txt`.
 //! - `saves-loop <root> <out> <iterations>`: atomic saves in a loop (`File.Replace`, Office's
 //!   save, a rename over a file) on a root `provide-local` serves, into `<out>\loop.txt`.
@@ -64,6 +68,8 @@ mod keys;
 #[cfg(windows)]
 mod local;
 #[cfg(windows)]
+mod overtake;
+#[cfg(windows)]
 mod pins;
 #[cfg(windows)]
 mod provide;
@@ -94,8 +100,9 @@ fn main() -> ExitCode {
 fn main() -> ExitCode {
 	let args: Vec<String> = std::env::args().skip(1).collect();
 	let args: Vec<&str> = args.iter().map(String::as_str).collect();
-	if let Some(&("local" | "saves" | "saves-loop" | "remote" | "pins" | "check" | "read-to")) =
-		args.first()
+	if let Some(
+		&("local" | "saves" | "saves-loop" | "overtake" | "remote" | "pins" | "check" | "read-to"),
+	) = args.first()
 	{
 		stall::watch_thread(false);
 	}
@@ -115,6 +122,7 @@ fn main() -> ExitCode {
 		},
 		["local", root, out] => local::run(root.as_ref(), out.as_ref()),
 		["saves", root, out] => saves::run(root.as_ref(), out.as_ref()),
+		["overtake", root, out] => overtake::run(root.as_ref(), out.as_ref()),
 		["remote", root, out] => remote::run(root.as_ref(), out.as_ref()),
 		["pins", root, out] => pins::run(root.as_ref(), out.as_ref()),
 		["quiet", out] => local::quiet(out.as_ref()),
@@ -152,7 +160,7 @@ fn main() -> ExitCode {
 fn usage() -> ExitCode {
 	eprintln!(
 		"usage: vm_harness provide <root> <out> <secs> | provide-local <root> <out> <secs> | local \
-		 <root> <out> | saves <root> <out> | remote <root> <out> | pins <root> <out> | check <root> <out> | saves-loop <root> <out> <iterations> | quiet <out> | after <root> <out> | \
+		 <root> <out> | saves <root> <out> | overtake <root> <out> | remote <root> <out> | pins <root> <out> | check <root> <out> | saves-loop <root> <out> <iterations> | quiet <out> | after <root> <out> | \
 		 keys <out> | helper --state-dir <dir> --rearm-secs <n> | helper-drive <exe> <out> \
 		 fake|prod | user <op> <path> [text] | explorer gone|machine-gone <root> <out> | read-one <path> | read-to <path> <offset> <len> <file> | keys-load <account> \
 		 <file>"

@@ -417,6 +417,8 @@ impl<D: Drive, L: LocalFs> Inner<D, L> {
 					.update_file(&file, identity, in_sync)
 					.map(|()| Converted::Here),
 				Was::Plain => {
+					#[cfg(feature = "test-seams")]
+					super::convert_hold::before_convert(&at);
 					local.convert_file(&file, identity, in_sync)?;
 					match local.inspect(&at) {
 						Ok(
@@ -512,6 +514,8 @@ impl<D: Drive, L: LocalFs> Inner<D, L> {
 						.map(|()| Converted::Here);
 				}
 				let dir = local.open_dir(&at, id)?;
+				#[cfg(feature = "test-seams")]
+				super::convert_hold::before_convert(&at);
 				local.convert_dir(&dir, identity, populated)?;
 				match local.inspect(&at) {
 					Ok(

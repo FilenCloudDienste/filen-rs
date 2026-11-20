@@ -8,7 +8,7 @@ mod fake_platform;
 mod memory_key_store;
 
 #[cfg(feature = "test-seams")]
-pub use crate::local::relocate_for_test;
+pub use crate::local::{held_convert, hold_next_convert, release_convert, relocate_for_test};
 #[cfg(all(windows, feature = "test-seams"))]
 pub use crate::os::win::user_dehydrate;
 #[cfg(test)]

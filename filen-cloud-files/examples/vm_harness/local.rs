@@ -108,6 +108,14 @@ impl Remote {
 			.find(|item| field(item, "uuid").is_some_and(|held| same_uuid(held, uuid)))
 	}
 
+	/// The items in the trash.
+	pub(crate) fn trash(&self) -> &[Value] {
+		self.0
+			.get("trash")
+			.and_then(Value::as_array)
+			.map_or(&[], Vec::as_slice)
+	}
+
 	/// Whether the item `uuid` is in the trash.
 	pub(crate) fn trashed(&self, uuid: &str) -> bool {
 		self.0
