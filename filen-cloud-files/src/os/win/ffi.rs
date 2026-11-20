@@ -45,10 +45,11 @@ use windows_sys::{
 				FILE_ATTRIBUTE_TAG_INFO, FILE_BASIC_INFO, FILE_DISPOSITION_FLAG_DELETE,
 				FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE,
 				FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FILE_DISPOSITION_INFO_EX, FILE_ID_INFO,
-				FILE_INFO_BY_HANDLE_CLASS, FILE_RENAME_INFO, FILE_RENAME_INFO_0,
-				FileAttributeTagInfo, FileBasicInfo, FileDispositionInfoEx, FileIdInfo,
-				FileRenameInfo, FileRenameInfoEx, GetFileInformationByHandleEx,
-				GetVolumeInformationByHandleW, MoveFileExW, SetFileInformationByHandle,
+				FILE_INFO_BY_HANDLE_CLASS, FILE_NAME_NORMALIZED, FILE_RENAME_INFO,
+				FILE_RENAME_INFO_0, FileAttributeTagInfo, FileBasicInfo, FileDispositionInfoEx,
+				FileIdInfo, FileRenameInfo, FileRenameInfoEx, GetFileInformationByHandleEx,
+				GetFinalPathNameByHandleW, GetVolumeInformationByHandleW, MoveFileExW,
+				SetFileInformationByHandle, VOLUME_NAME_DOS,
 			},
 		},
 		System::{
@@ -280,6 +281,46 @@ pub(super) fn revert(file: &File) -> Hresult {
 	Hresult::new(unsafe {
 		CfRevertPlaceholder(file.as_raw_handle(), CF_REVERT_FLAG_NONE, ptr::null_mut())
 	})
+}
+
+/// The full path of the item `file` is open on, from `GetFinalPathNameByHandleW`: normalized, on
+/// the volume's drive letter, with the verbatim prefix (`\\?\C:\...`). The handle follows the item
+/// through a rename, so this is where the item is now.
+#[allow(unsafe_code)] // Win32 FFI: reads the path of the item a handle is open on.
+pub(super) fn final_path(file: &File) -> io::Result<Vec<u16>> {
+	/// How many times a path that grew between two calls is read again.
+	const ATTEMPTS: usize = 4;
+	// MAX_PATH + 1: a longer path is read again into a buffer of the size the call asks for.
+	let mut path = vec![0_u16; 261];
+	for _ in 0..ATTEMPTS {
+		let Ok(capacity) = u32::try_from(path.len()) else {
+			return Err(io::Error::from(io::ErrorKind::InvalidInput));
+		};
+		// SAFETY: the handle is borrowed from a live `File` for the call; `path` is an exclusively
+		// borrowed buffer of `capacity` units, which the call writes at most.
+		let written = unsafe {
+			GetFinalPathNameByHandleW(
+				file.as_raw_handle(),
+				path.as_mut_ptr(),
+				capacity,
+				FILE_NAME_NORMALIZED | VOLUME_NAME_DOS,
+			)
+		};
+		let Ok(written) = usize::try_from(written) else {
+			return Err(io::Error::from(io::ErrorKind::InvalidData));
+		};
+		if written == 0 {
+			return Err(io::Error::last_os_error());
+		}
+		if written < path.len() {
+			// The path's length, its NUL left out.
+			path.truncate(written);
+			return Ok(path);
+		}
+		// Too small: `written` is the size the path needs, its NUL included.
+		path.resize(written, 0);
+	}
+	Err(io::Error::from(io::ErrorKind::InvalidData))
 }
 
 /// A registry hive the provider writes under.

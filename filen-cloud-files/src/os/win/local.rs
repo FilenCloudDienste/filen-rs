@@ -44,7 +44,7 @@ use crate::{
 		cfapi::{
 			CreateValues, E_FAIL, E_INVALIDARG, ERROR_NOT_A_CLOUD_FILE, Hresult, ReparseKind,
 			WideNul, create_values, entry_outcomes, is_partial, local_error, long_path, path_nul,
-			pin_attr, reparse_kind, win32_local_error,
+			pin_attr, reparse_kind, root_path_of, root_relative, win32_local_error,
 		},
 	},
 	placeholder::{PlaceholderSpec, SpecKind},
@@ -93,6 +93,19 @@ impl WinLocalFs {
 			full.push(name.as_str());
 		}
 		full
+	}
+
+	/// Where the item `file` is open on is now, below the root: `Ok(None)` once it left the root. A
+	/// name on the way the core cannot name fails as an invalid argument.
+	fn path_through(&self, file: &File) -> Result<Option<RootPath>, LocalError> {
+		let full = ffi::final_path(file).map_err(|error| io_error(&error))?;
+		let root: Vec<u16> = self.root.as_os_str().encode_wide().collect();
+		let Some(components) = root_relative(&root, &full) else {
+			return Ok(None);
+		};
+		root_path_of(&components)
+			.map(Some)
+			.map_err(|_| LocalError::Os(OsError::Rejected { code: E_INVALIDARG }))
 	}
 
 	/// The full path of `path` as a Win32 call takes it, in its long form when it needs one.
@@ -548,9 +561,8 @@ impl LocalFs for WinLocalFs {
 		checked(ffi::revert(&file.file))
 	}
 
-	/// Not read through the handle here: the core walks the root instead.
-	fn settled_path(&self, _file: &WinSettled) -> Result<Option<RootPath>, LocalError> {
-		Err(LocalError::Os(OsError::Rejected { code: E_FAIL }))
+	fn settled_path(&self, file: &WinSettled) -> Result<Option<RootPath>, LocalError> {
+		self.path_through(&file.file)
 	}
 
 	/// `MARK_IN_SYNC` marks the file in sync whatever was written to it (measured: it hides a
@@ -680,9 +692,8 @@ impl LocalFs for WinLocalFs {
 		checked(ffi::revert(&dir.file))
 	}
 
-	/// Not read through the handle here: the core walks the root instead.
-	fn dir_path(&self, _dir: &WinDir) -> Result<Option<RootPath>, LocalError> {
-		Err(LocalError::Os(OsError::Rejected { code: E_FAIL }))
+	fn dir_path(&self, dir: &WinDir) -> Result<Option<RootPath>, LocalError> {
+		self.path_through(&dir.file)
 	}
 
 	/// The update [`LocalFs::update_dir`] makes, through the handle the directory was converted
