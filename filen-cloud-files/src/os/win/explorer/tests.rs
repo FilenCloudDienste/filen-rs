@@ -19,6 +19,8 @@ const OTHER_SID: &str = "S-1-5-21-1000-1000-1000-4242";
 const LONE_SID: &str = "S-1-5-21-1000-1000-1000-4243";
 const SWEPT_SID: &str = "S-1-5-21-1000-1000-1000-4244";
 const UNBRAND_SID: &str = "S-1-5-21-1000-1000-1000-4245";
+const UNNAMED_SID: &str = "S-1-5-21-1000-1000-1000-4246";
+const NAMED_SID: &str = "S-1-5-21-1000-1000-1000-4247";
 const STALE_SID: &str = "S-1-5-21-1000-1000-1000-4248";
 const SQUATTED_SID: &str = "S-1-5-21-1000-1000-1000-4249";
 
@@ -967,4 +969,34 @@ fn a_thumbnail_class_left_with_no_entry_is_swept_only_when_marked() {
 	assert!(!present(Hive::CurrentUser, &marked));
 	assert!(present(Hive::CurrentUser, &foreign));
 	delete_tree(Hive::CurrentUser, &foreign).unwrap();
+}
+
+#[test]
+fn a_server_that_did_not_start_unnames_the_class_on_every_entry_of_the_user_only() {
+	let users = [test_user(42), test_user(43)];
+	let _cleanup = Cleanup::new(&[UNNAMED_SID, NAMED_SID], &users);
+	for sid in [UNNAMED_SID, NAMED_SID] {
+		for user in users {
+			set_value(
+				Hive::LocalMachine,
+				&entry(sid, user),
+				Some(THUMBNAIL_PROVIDER_VALUE),
+				"{00000000-F11E-4E00-8000-000000000005}",
+			);
+		}
+	}
+	remove_thumbnail_values_as(UNNAMED_SID).unwrap();
+	for user in users {
+		let value = |sid| {
+			string_value(
+				Hive::LocalMachine,
+				&entry(sid, user),
+				Some(THUMBNAIL_PROVIDER_VALUE),
+			)
+		};
+		assert_eq!(value(UNNAMED_SID), None);
+		assert!(present(Hive::LocalMachine, &entry(UNNAMED_SID, user)));
+		assert!(value(NAMED_SID).is_some());
+	}
+	remove_thumbnail_values_as(UNNAMED_SID).unwrap();
 }

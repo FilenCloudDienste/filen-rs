@@ -11,6 +11,12 @@
 //! supported, 12 another helper holds the state directory, 13 the state directory is unusable, 14
 //! not Windows, 15 the async runtime could not be built. `--unregister-all` exits 0 when every root is gone, 20 when something was kept or
 //! left, 21 when nothing could be done.
+//!
+//! Replacing or deleting the exe (an update, the uninstaller): besides the helper the app spawned,
+//! COM may have started `--thumbnail-server` instances of it, which keep the exe file open for up
+//! to `THUMBNAIL_SERVER_IDLE` (10 s) after File Explorer's last thumbnail request, and longer while
+//! Explorer goes on asking. Whatever replaces the exe ends those processes first or retries until
+//! the file is free.
 
 #![deny(clippy::print_stdout)]
 // The helper's future, over the cache and the SDK's drive calls and lock, nests deeper than the

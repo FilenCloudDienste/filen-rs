@@ -2,7 +2,7 @@
 //! `StorageProviderSyncRootManager.Register` writes, written by the helper itself as the user (the
 //! machine-wide sync root list lets every user create and delete a subkey of their own), and
 //! removed once the OS let the root go; the context menu commands the parent names, per user,
-//! removed with the user's last root; and, on a build that serves thumbnails (`com`), the
+//! removed with the user's last root; and, while the process serves thumbnails (`com`), the
 //! thumbnail class per user, removed with the user's last root, and the root's entry naming it.
 //! The values are `os::cfapi::explorer`'s.
 
@@ -139,13 +139,13 @@ fn notify(path: &Path) {
 /// writes the same. A failure to write the commands is logged and fails nothing: what shows the
 /// root is written.
 ///
-/// Then, on a build that serves thumbnails, the thumbnail class and the entry's value naming it;
-/// on one that does not, the value is removed, so Explorer goes back to its own thumbnails. A
-/// failure there is logged and fails nothing either.
+/// Then, while this process serves thumbnails, the thumbnail class and the entry's value naming
+/// it; otherwise (its server did not start) the value is removed, so Explorer goes back to its own
+/// thumbnails. A failure there is logged and fails nothing either.
 pub(crate) fn brand(root: &Path, user: UserId, branding: &Branding) -> Result<(), ExplorerError> {
 	let sid = own_sid()?;
 	brand_as(&sid, root, user, branding, COMMAND_KEY)?;
-	let server = if com::is_implemented() {
+	let server = if com::is_serving() {
 		match std::env::current_exe() {
 			Ok(exe) => match exe.to_str().and_then(thumbnail_server_command) {
 				Some(command) => Some(command),
@@ -171,6 +171,35 @@ pub(crate) fn brand(root: &Path, user: UserId, branding: &Branding) -> Result<()
 		warn!(target: LOG_TARGET, %error, "registering File Explorer's thumbnail class failed");
 	}
 	Ok(())
+}
+
+/// Removes the value naming the thumbnail class from every sync root list entry of this provider
+/// for the Windows user this process runs as: what a process whose server did not start does, so
+/// File Explorer goes back to its own thumbnails on the roots it does not brand too. Every entry is
+/// tried; the first failure is returned.
+pub(crate) fn remove_thumbnail_values() -> Result<(), ExplorerError> {
+	remove_thumbnail_values_as(&own_sid()?)
+}
+
+/// [`remove_thumbnail_values`] for the Windows user `sid`.
+fn remove_thumbnail_values_as(sid: &str) -> Result<(), ExplorerError> {
+	let Some((_, names)) = subkeys(Hive::LocalMachine, SYNC_ROOT_MANAGER)? else {
+		return Ok(());
+	};
+	let value = wide(THUMBNAIL_PROVIDER_VALUE)?;
+	let mut first = Ok(());
+	for name in names.iter().filter(|name| is_own_key(name, sid)) {
+		let removed = wide(&format!(r"{SYNC_ROOT_MANAGER}\{name}")).and_then(|entry| {
+			ffi::reg_delete_value(Hive::LocalMachine, &entry, &value)
+				.map_err(io("deleting a registry value"))
+		});
+		if let Err(error) = removed
+			&& first.is_ok()
+		{
+			first = Err(error);
+		}
+	}
+	first
 }
 
 /// Where a thumbnail class is registered: its key under `HKEY_CURRENT_USER`, and the class id the

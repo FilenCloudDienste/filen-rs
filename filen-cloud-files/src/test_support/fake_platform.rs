@@ -126,6 +126,11 @@ struct PlatformState {
 	fail_connect: bool,
 	panic_check_root: bool,
 	elevated: bool,
+	/// The build the platform reports.
+	build: ReportedBuild,
+	/// How many times who may call the thumbnail server had been set at each read of the build,
+	/// in order.
+	securings_at_build: Vec<usize>,
 	keys: HashMap<String, Arc<MemoryKeyStore>>,
 	/// What each path the root was renamed to holds; also paths taken by something else.
 	asides: HashMap<PathBuf, Vec<FakeEntry>>,
@@ -150,6 +155,15 @@ struct PlatformState {
 	thumbnails: ThumbnailState,
 }
 
+/// The build the fake platform reports, `None` for one it cannot read: 26300 until a test sets one.
+struct ReportedBuild(Option<u32>);
+
+impl Default for ReportedBuild {
+	fn default() -> Self {
+		Self(Some(26300))
+	}
+}
+
 /// The fake's thumbnail server.
 #[derive(Default)]
 struct ThumbnailState {
@@ -163,11 +177,78 @@ struct ThumbnailState {
 	provider: HashSet<PathBuf>,
 	/// Whether the user's thumbnail class is registered.
 	class: bool,
+	/// What fails.
+	failing: ThumbnailFailures,
+	/// How many times who may call the server was set.
+	securings: usize,
+	/// How many times the value naming the class was removed from every root.
+	withdrawals: usize,
+	/// How many of the next removals of that value panic, as a bug there would.
+	panic_withdrawals: u32,
+	/// Holds every start until released, as a COM initialisation that hangs does.
+	hold: Option<Arc<HoldState>>,
+	/// How many starts wait at the hold now.
+	held: usize,
+}
+
+/// What the fake's thumbnail server was told to fail.
+#[derive(Default)]
+struct ThumbnailFailures {
+	/// Setting who may call the server, as in a process whose COM security was set already.
+	security: bool,
+	/// Starting a server, as one whose COM calls are refused.
+	server: bool,
 }
 
 /// The fake's running thumbnail server.
 #[derive(Debug)]
 pub struct FakeThumbnails;
+
+/// The fake's proof that who may call its thumbnail server was set: made only by its
+/// [`Platform::secure_thumbnails`].
+#[derive(Debug, Clone, Copy)]
+pub struct FakeThumbnailSecurity(());
+
+/// Whether a [`StartHold`] was released, and what wakes the starts waiting on it.
+#[derive(Default)]
+struct HoldState {
+	released: Mutex<bool>,
+	woken: Condvar,
+}
+
+impl HoldState {
+	fn release(&self) {
+		*self.released.lock().unwrap_or_else(PoisonError::into_inner) = true;
+		self.woken.notify_all();
+	}
+
+	/// Blocks until released.
+	fn wait(&self) {
+		let released = self.released.lock().unwrap_or_else(PoisonError::into_inner);
+		let _released = self
+			.woken
+			.wait_while(released, |released| !*released)
+			.unwrap_or_else(PoisonError::into_inner);
+	}
+}
+
+/// Holds every start of the fake's thumbnail server, from
+/// [`FakePlatform::hold_thumbnail_starts`], until [`StartHold::release`] or its drop, so a test
+/// that fails while one is held does not leave it blocking the runtime's shutdown.
+pub struct StartHold(Arc<HoldState>);
+
+impl StartHold {
+	/// Lets every start waiting, and every later one, go on.
+	pub fn release(&self) {
+		self.0.release();
+	}
+}
+
+impl Drop for StartHold {
+	fn drop(&mut self) {
+		self.0.release();
+	}
+}
 
 /// What a fake navigation-pane entry shows, and for whom.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -343,6 +424,17 @@ impl FakePlatform {
 		self.state().elevated = elevated;
 	}
 
+	/// Makes the platform report `build`, `None` for one it cannot read; 26300 until set.
+	pub fn set_platform_build(&self, build: Option<u32>) {
+		self.state().build = ReportedBuild(build);
+	}
+
+	/// How many times who may call the thumbnail server had been set at each read of the
+	/// platform's build, in order.
+	pub fn securings_at_build_reads(&self) -> Vec<usize> {
+		self.state().securings_at_build.clone()
+	}
+
 	/// Fails the next `count` watcher starts.
 	pub fn fail_watch_starts(&self, count: u32) {
 		self.state().fail_watch_starts = count;
@@ -489,6 +581,44 @@ impl FakePlatform {
 		self.state().thumbnails.servers
 	}
 
+	/// Fails every start of a thumbnail server, on a build serving thumbnails.
+	pub fn fail_thumbnail_servers(&self) {
+		self.state().thumbnails.failing.server = true;
+	}
+
+	/// Fails every setting of who may call the thumbnail server, on a build serving thumbnails.
+	pub fn fail_thumbnail_security(&self) {
+		self.state().thumbnails.failing.security = true;
+	}
+
+	/// How many times who may call the thumbnail server was set, or failed to be.
+	pub fn thumbnail_securings(&self) -> usize {
+		self.state().thumbnails.securings
+	}
+
+	/// Holds every start of a thumbnail server, on a build serving thumbnails, until the hold is
+	/// released or dropped; a failing start fails once released.
+	pub fn hold_thumbnail_starts(&self) -> StartHold {
+		let hold = Arc::new(HoldState::default());
+		self.state().thumbnails.hold = Some(Arc::clone(&hold));
+		StartHold(hold)
+	}
+
+	/// How many starts of a thumbnail server wait at the hold now.
+	pub fn thumbnail_starts_held(&self) -> usize {
+		self.state().thumbnails.held
+	}
+
+	/// How many times the value naming the thumbnail class was removed from every root.
+	pub fn thumbnail_withdrawals(&self) -> usize {
+		self.state().thumbnails.withdrawals
+	}
+
+	/// Makes the next removal of the value naming the thumbnail class panic.
+	pub fn panic_on_next_thumbnail_withdrawal(&self) {
+		self.state().thumbnails.panic_withdrawals = 1;
+	}
+
 	/// Whose root the machine-wide sync root list entry of `root` names, if there is one.
 	pub fn machine_branding(&self, root: &Path) -> Option<UserId> {
 		self.state().machine_branding.get(root).copied()
@@ -595,9 +725,13 @@ impl Platform for FakePlatform {
 	type Connected = FakeConnected;
 	type Watcher = FakeWatcher;
 	type Thumbnails = FakeThumbnails;
+	type ThumbnailSecurity = FakeThumbnailSecurity;
 
 	fn platform_build(&self) -> Option<u32> {
-		Some(26300)
+		let mut state = self.state();
+		let securings = state.thumbnails.securings;
+		state.securings_at_build.push(securings);
+		state.build.0
 	}
 
 	fn check_root(&self, _root: &Path) -> Result<(), RootRefusal> {
@@ -835,10 +969,11 @@ impl Platform for FakePlatform {
 		if let Some(commands) = &branding.commands {
 			state.commands = Some((**commands).clone());
 		}
-		// Then the thumbnail class and the entry's value, on a build serving thumbnails; on
-		// another, the value goes.
+		// Then the thumbnail class and the entry's value, while a thumbnail server runs, as the
+		// Windows layer writes them only while the process serves (`com::is_serving`); else the
+		// value goes.
 		let thumbnails = &mut state.thumbnails;
-		if thumbnails.implemented {
+		if thumbnails.handler.is_some() {
 			thumbnails.class = true;
 			thumbnails.provider.insert(root.to_path_buf());
 		} else {
@@ -888,23 +1023,65 @@ impl Platform for FakePlatform {
 		Ok(())
 	}
 
-	fn serve_thumbnails(
-		&self,
-		handler: ThumbnailHandler,
-	) -> Result<Option<FakeThumbnails>, PlatformError> {
+	fn secure_thumbnails(&self) -> Result<Option<FakeThumbnailSecurity>, PlatformError> {
 		let thumbnails = &mut self.state().thumbnails;
 		if !thumbnails.implemented {
 			return Ok(None);
 		}
+		thumbnails.securings += 1;
+		if thumbnails.failing.security {
+			return Err(PlatformError::Failed {
+				op: PlatformOp::SecureThumbnails,
+				source: Box::new(Switched),
+			});
+		}
+		Ok(Some(FakeThumbnailSecurity(())))
+	}
+
+	fn serve_thumbnails(
+		&self,
+		_security: FakeThumbnailSecurity,
+		handler: ThumbnailHandler,
+	) -> Result<FakeThumbnails, PlatformError> {
+		let hold = {
+			let thumbnails = &mut self.state().thumbnails;
+			let hold = thumbnails.hold.clone();
+			if hold.is_some() {
+				thumbnails.held += 1;
+			}
+			hold
+		};
+		// Not under the state's lock, which every other call takes.
+		if let Some(hold) = hold {
+			hold.wait();
+			self.state().thumbnails.held -= 1;
+		}
+		let thumbnails = &mut self.state().thumbnails;
+		if thumbnails.failing.server {
+			return Err(PlatformError::Failed {
+				op: PlatformOp::ServeThumbnails,
+				source: Box::new(Switched),
+			});
+		}
 		thumbnails.handler = Some(handler);
 		thumbnails.servers.0 += 1;
-		Ok(Some(FakeThumbnails))
+		Ok(FakeThumbnails)
 	}
 
 	fn stop_thumbnails(&self, _server: FakeThumbnails) {
 		let thumbnails = &mut self.state().thumbnails;
 		thumbnails.handler = None;
 		thumbnails.servers.1 += 1;
+	}
+
+	fn withdraw_thumbnails(&self) {
+		let thumbnails = &mut self.state().thumbnails;
+		if thumbnails.panic_withdrawals > 0 {
+			thumbnails.panic_withdrawals -= 1;
+			panic!("the fake platform was told to panic");
+		}
+		thumbnails.provider.clear();
+		thumbnails.withdrawals += 1;
 	}
 
 	fn sweep_branding(&self) -> Result<u64, PlatformError> {

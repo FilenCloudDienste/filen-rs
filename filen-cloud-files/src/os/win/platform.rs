@@ -32,7 +32,7 @@ use crate::{
 		},
 		win::{
 			ConnectedRoot, LOG_TARGET, ProviderInfo, RegisteredRoot, SyncRootPath, WinLocalFs,
-			com::{ComError, ThumbnailServer},
+			com::{ComSecurity, ThumbnailServer},
 			explorer,
 			ffi::item_info,
 			platform_info, register,
@@ -66,6 +66,7 @@ impl Platform for WinPlatform {
 	type Connected = ConnectedRoot;
 	type Watcher = LocalWatcher;
 	type Thumbnails = ThumbnailServer;
+	type ThumbnailSecurity = ComSecurity;
 
 	fn platform_build(&self) -> Option<u32> {
 		platform_info().ok().map(|info| info.build)
@@ -259,17 +260,26 @@ impl Platform for WinPlatform {
 		.map_err(|e| failed(PlatformOp::SweepBranding, e))
 	}
 
-	/// Through the COM layer (`com`); a build without one serves none.
+	/// The process's COM security, through the COM layer (`com`).
+	fn secure_thumbnails(&self) -> Result<Option<ComSecurity>, PlatformError> {
+		ComSecurity::establish()
+			.map(Some)
+			.map_err(|error| failed(PlatformOp::SecureThumbnails, error))
+	}
+
+	/// Through the COM layer (`com`).
 	fn serve_thumbnails(
 		&self,
+		security: ComSecurity,
 		handler: ThumbnailHandler,
-	) -> Result<Option<ThumbnailServer>, PlatformError> {
-		match ThumbnailServer::start(GUID::from_u128(THUMBNAIL_CLSID), handler) {
-			Ok(server) => Ok(Some(server)),
-			Err(ComError::NotImplemented) => {
-				debug!(target: LOG_TARGET, "this build does not serve thumbnails");
-				Ok(None)
-			}
+	) -> Result<ThumbnailServer, PlatformError> {
+		ThumbnailServer::start(security, GUID::from_u128(THUMBNAIL_CLSID), handler)
+			.map_err(|error| failed(PlatformOp::ServeThumbnails, error))
+	}
+
+	fn withdraw_thumbnails(&self) {
+		if let Err(error) = explorer::remove_thumbnail_values() {
+			warn!(target: LOG_TARGET, %error, "removing the roots' thumbnail class failed");
 		}
 	}
 

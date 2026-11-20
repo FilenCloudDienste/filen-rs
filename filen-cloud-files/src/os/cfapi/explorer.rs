@@ -3,6 +3,8 @@
 //! measured against what `StorageProviderSyncRootManager.Register` writes for an unpackaged
 //! process. Pure, so the key names and values are tested on every host; `os::win` writes them.
 
+use std::fmt;
+
 use crate::{
 	branding::{AppPath, Branding, CommandLabel, ExplorerCommands, IconPath},
 	helper::{ExistingRoot, THUMBNAIL_SERVER_ARG, UserId},
@@ -69,17 +71,28 @@ pub(crate) const THUMBNAIL_PROVIDER_VALUE: &str = "ThumbnailProvider";
 /// The thumbnail class's name: its key's default value.
 pub(crate) const THUMBNAIL_CLASS_NAME: &str = "Filen thumbnails";
 
+/// A GUID, as the `u128` `GUID::from_u128` takes, displayed as the registry spells a class or an
+/// interface: braced, upper-case hex.
+pub(crate) struct BracedGuid(pub(crate) u128);
+
+impl fmt::Display for BracedGuid {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		let v = self.0;
+		write!(
+			f,
+			"{{{:08X}-{:04X}-{:04X}-{:04X}-{:012X}}}",
+			v >> 96,
+			(v >> 80) & 0xffff,
+			(v >> 64) & 0xffff,
+			(v >> 48) & 0xffff,
+			v & 0xffff_ffff_ffff
+		)
+	}
+}
+
 /// [`THUMBNAIL_CLSID`] as the registry spells a class: braced, upper-case hex.
 pub(crate) fn thumbnail_clsid_text() -> String {
-	let clsid = THUMBNAIL_CLSID;
-	format!(
-		"{{{:08X}-{:04X}-{:04X}-{:04X}-{:012X}}}",
-		clsid >> 96,
-		(clsid >> 80) & 0xffff,
-		(clsid >> 64) & 0xffff,
-		(clsid >> 48) & 0xffff,
-		clsid & 0xffff_ffff_ffff
-	)
+	BracedGuid(THUMBNAIL_CLSID).to_string()
 }
 
 /// The thumbnail class's key, under `HKEY_CURRENT_USER`: a class of the user's own.
@@ -466,6 +479,22 @@ mod tests {
 		assert_eq!(
 			thumbnail_class_key(),
 			r"Software\Classes\CLSID\{CE43ED2E-6C0A-4846-A973-E43FFFACF389}"
+		);
+	}
+
+	#[test]
+	fn a_guid_is_braced_upper_case_hex_in_its_fields() {
+		assert_eq!(
+			BracedGuid(0xe357_fccd_a995_4576_b01f_2346_3015_4e96).to_string(),
+			"{E357FCCD-A995-4576-B01F-234630154E96}"
+		);
+		assert_eq!(
+			BracedGuid(0x0000_0001_0000_0000_c000_0000_0000_0046).to_string(),
+			"{00000001-0000-0000-C000-000000000046}"
+		);
+		assert_eq!(
+			BracedGuid(u128::MAX).to_string(),
+			"{FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF}"
 		);
 	}
 

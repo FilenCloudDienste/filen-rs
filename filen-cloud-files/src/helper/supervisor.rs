@@ -18,7 +18,7 @@ use futures::FutureExt;
 use tokio::{
 	io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader},
 	runtime::Handle,
-	sync::{mpsc, watch},
+	sync::{mpsc, oneshot, watch},
 	task::JoinHandle,
 	time::{Instant, sleep},
 };
@@ -35,7 +35,7 @@ use crate::{
 		framing::{Frame, next_frame},
 		identify::{self, NOT_SERVING},
 		index::{RootEntry, RootsIndex, StateDir, index_error},
-		platform::{DriveOpener, Platform, RootRefusal, platform_error},
+		platform::{DriveOpener, Platform, PlatformError, RootRefusal, platform_error},
 		protocol::{
 			ErrorCode, FatalCode, Hello, IdentifiedItem, InMessage, ItemPath, KeptId, OutMessage,
 			ParseError, PhaseName, Registration, ReplyError, ReplyValue, Request, RootDir,
@@ -48,8 +48,12 @@ use crate::{
 	local::{LocalConfig, LocalEngine},
 	log_safe,
 	os::LocalFs,
-	thumbnails::{ThumbnailConfig, ThumbnailService},
+	thumbnails::{ThumbnailConfig, ThumbnailHandler, ThumbnailService},
 };
+
+/// How the thumbnail server's start, which runs in the background, is answered: the server, `None`
+/// on a build that serves none, or why it did not start; a start that panicked drops its sender.
+type ThumbnailStart<T> = oneshot::Receiver<Result<Option<T>, PlatformError>>;
 
 /// How many requests wait, read and parsed, for the command loop.
 const INCOMING_LEN: usize = 16;
@@ -210,7 +214,8 @@ struct Helper<P: Platform, O: DriveOpener> {
 	/// Answers File Explorer's thumbnail requests for the served root, and refuses them while none
 	/// is. Reason for the Arc: the thumbnail server's handler holds it too.
 	thumbnails: Arc<ThumbnailService<P::Local, O::Drive>>,
-	/// The thumbnail server, for the life of the run; `None` on a build that serves none.
+	/// The thumbnail server, from its start's success to the end of the run; `None` before, on a
+	/// build that serves none, and after a failed start.
 	thumbnail_server: Option<P::Thumbnails>,
 }
 
@@ -286,8 +291,16 @@ async fn write_output<W: AsyncWrite + Unpin + Send>(
 /// unregisters or wipes anything on its way out: a served root is disconnected and stays
 /// registered. Needs a multi-thread runtime on Windows, as the Windows layer refuses to connect
 /// on another.
+///
+/// `security` is what [`Platform::secure_thumbnails`] answered, called by the process's start
+/// before it built the runtime this runs on, as [`serve_stdio`] does: the thumbnail server starts
+/// only with its proof, `None` starts none, and a failure is answered as the server's failed start
+/// is, the class withdrawn from every root.
+///
+/// [`serve_stdio`]: crate::helper::serve_stdio
 pub async fn run_helper<P, O, R, W>(
 	platform: P,
+	security: Result<Option<P::ThumbnailSecurity>, PlatformError>,
 	opener: O,
 	config: HelperConfig,
 	input: R,
@@ -339,18 +352,10 @@ where
 		ThumbnailConfig::default(),
 		Handle::current(),
 	));
-	let thumbnail_server = {
-		let platform = Arc::clone(&platform);
-		let handler = thumbnails.handler();
-		match blocking(move || platform.serve_thumbnails(handler)).await {
-			Ok(server) => server,
-			Err(error) => {
-				// File Explorer then gets the class's fallback, which refuses every request.
-				warn!(%error, "serving File Explorer's thumbnails failed");
-				None
-			}
-		}
-	};
+	// In the background, so a COM start that hangs holds up no request of the parent's; answered
+	// in the loop below (`Helper::thumbnails_started`).
+	let mut thumbnail_start = start_thumbnails(&platform, security, thumbnails.handler());
+	let mut thumbnails_starting = true;
 	let mut helper = Helper {
 		platform,
 		opener: Arc::new(opener),
@@ -362,13 +367,23 @@ where
 		phase: Phase::Idle,
 		reported: Vec::new(),
 		thumbnails,
-		thumbnail_server,
+		thumbnail_server: None,
 	};
 	helper.status();
 	let reason = loop {
 		tokio::select! {
 			biased;
 			_ = &mut writer => break ExitReason::OutputClosed,
+			started = &mut thumbnail_start, if thumbnails_starting => {
+				thumbnails_starting = false;
+				// Guarded as a request is: a panic stops the helper in order.
+				let answered = AssertUnwindSafe(helper.thumbnails_started(started.ok()))
+					.catch_unwind()
+					.await;
+				if answered.is_err() {
+					break ExitReason::Internal;
+				}
+			}
 			next = incoming.recv() => match next {
 				None => break ExitReason::InputClosed,
 				Some(Incoming::Unframed(code)) => helper.send(OutMessage::ProtocolError { code }),
@@ -439,7 +454,9 @@ where
 			});
 		}
 	}
-	helper.stop().await;
+	helper
+		.stop(thumbnails_starting.then_some(thumbnail_start))
+		.await;
 	let Helper { out, callback, .. } = helper;
 	drop(callback);
 	drop(out);
@@ -454,6 +471,45 @@ where
 fn send(out: &Out, message: OutMessage) {
 	// The writer is gone only once the parent closed stdout, which ends the loop.
 	let _ = out.send(message);
+}
+
+/// Starts the thumbnail server under `security` answering with `handler` on the blocking pool,
+/// detached, as the start blocks (on Windows up to the COM layer's own bound): what it answers
+/// comes through the receiver. Once the receiver is closed, as the helper's stop closes one still
+/// waiting, a server that starts after all is stopped at once, on the same thread. Without the
+/// proof nothing starts: the receiver answers at once with `None`, or with why the security was not
+/// set.
+fn start_thumbnails<P: Platform>(
+	platform: &Arc<P>,
+	security: Result<Option<P::ThumbnailSecurity>, PlatformError>,
+	handler: ThumbnailHandler,
+) -> ThumbnailStart<P::Thumbnails> {
+	let (started, start) = oneshot::channel();
+	let security = match security {
+		Ok(Some(security)) => security,
+		unsecured => {
+			// The receiver is still held here.
+			let _ = started.send(unsecured.map(|_| None));
+			return start;
+		}
+	};
+	let platform = Arc::clone(platform);
+	// Not awaited: the helper's stop does not wait for a start in progress.
+	drop(tokio::task::spawn_blocking(move || {
+		let served = platform.serve_thumbnails(security, handler).map(Some);
+		match started.send(served) {
+			Err(Ok(Some(server))) => {
+				info!("the thumbnail server started after the helper stopped; stopping it");
+				platform.stop_thumbnails(server);
+			}
+			// Logged here, as nothing takes it now.
+			Err(Err(error)) => {
+				warn!(%error, "serving File Explorer's thumbnails failed after the helper stopped");
+			}
+			Ok(()) | Err(Ok(None)) => {}
+		}
+	}));
+	start
 }
 
 impl<P: Platform, O: DriveOpener> Helper<P, O> {
@@ -1382,8 +1438,44 @@ impl<P: Platform, O: DriveOpener> Helper<P, O> {
 		}
 	}
 
-	/// Stops whatever runs, leaving the root registered and its session on disk.
-	async fn stop(&mut self) {
+	/// Takes what the thumbnail server's start answered (`None` when it panicked). A server that
+	/// started names the class for the root served now, which its brand left without it while no
+	/// server ran; a root served later is branded with it anyway. A start that failed, as one
+	/// without the process's thumbnail security does, withdraws the class from every root.
+	async fn thumbnails_started(
+		&mut self,
+		started: Option<Result<Option<P::Thumbnails>, PlatformError>>,
+	) {
+		match started {
+			Some(Ok(None)) => return,
+			Some(Ok(Some(server))) => {
+				self.thumbnail_server = Some(server);
+				if let Phase::Serving(serving) = &mut self.phase {
+					serving.branded = brand(
+						&self.platform,
+						&serving.root,
+						serving.user,
+						serving.branding.as_ref(),
+					)
+					.await;
+				}
+				return;
+			}
+			Some(Err(error)) => warn!(%error, "serving File Explorer's thumbnails failed"),
+			None => warn!("serving File Explorer's thumbnails failed: its start panicked"),
+		}
+		// The value naming the class goes from every root, and no root is branded with it without
+		// a server, so File Explorer keeps its own thumbnails instead of the class's fallback,
+		// which refuses every request. Here, not in the platform's start, which the instance COM
+		// starts runs too: that one brands nothing, and may fail while a helper serves.
+		let platform = Arc::clone(&self.platform);
+		blocking(move || platform.withdraw_thumbnails()).await;
+	}
+
+	/// Stops whatever runs, leaving the root registered and its session on disk. `start` is the
+	/// thumbnail server's start when it was not answered yet: no longer waited for, it stops the
+	/// server itself should one start after all.
+	async fn stop(&mut self, start: Option<ThumbnailStart<P::Thumbnails>>) {
 		if let Phase::Serving(serving) = mem::replace(&mut self.phase, Phase::Idle) {
 			self.send(OutMessage::Status(StatusEvent {
 				state: PhaseName::Stopping,
@@ -1392,6 +1484,13 @@ impl<P: Platform, O: DriveOpener> Helper<P, O> {
 				watching: false,
 			}));
 			self.stop_serving(*serving).await;
+		}
+		if let Some(mut start) = start {
+			// Closed first, so a server is either taken here or stopped by its start.
+			start.close();
+			if let Ok(started) = start.try_recv() {
+				self.thumbnails_started(Some(started)).await;
+			}
 		}
 		if let Some(server) = self.thumbnail_server.take() {
 			let platform = Arc::clone(&self.platform);

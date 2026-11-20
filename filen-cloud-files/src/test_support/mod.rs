@@ -21,6 +21,7 @@ pub use fake_local::{
 pub use fake_os::{FakeData, FakeEvent, FakeOs, FakePopulate};
 pub use fake_platform::{
 	BrandingCall, FakeBranding, FakeConnected, FakeKeys, FakeOpener, FakePlatform, FakeRegistered,
-	FakeStep, FakeThumbnails, FakeWatcher, KillPoint, PlatformCall, WatchGate,
+	FakeStep, FakeThumbnailSecurity, FakeThumbnails, FakeWatcher, KillPoint, PlatformCall,
+	StartHold, WatchGate,
 };
 pub use memory_key_store::MemoryKeyStore;

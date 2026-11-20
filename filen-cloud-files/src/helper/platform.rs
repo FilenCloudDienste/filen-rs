@@ -49,6 +49,8 @@ pub enum PlatformOp {
 	Unbrand,
 	/// Removing what shows roots the OS no longer holds in File Explorer.
 	SweepBranding,
+	/// Setting who may call the process's thumbnail server.
+	SecureThumbnails,
 	/// Starting to answer File Explorer's thumbnail requests.
 	ServeThumbnails,
 }
@@ -68,6 +70,7 @@ impl fmt::Display for PlatformOp {
 			Self::Brand => "showing the root in File Explorer",
 			Self::Unbrand => "removing the root from File Explorer",
 			Self::SweepBranding => "removing roots no longer registered from File Explorer",
+			Self::SecureThumbnails => "setting who may call the thumbnail server",
 			Self::ServeThumbnails => "starting to answer File Explorer's thumbnail requests",
 		})
 	}
@@ -155,6 +158,9 @@ pub trait Platform: sealed::Sealed + Send + Sync + 'static {
 	/// A running server of File Explorer's thumbnail requests, stopped by
 	/// [`Platform::stop_thumbnails`].
 	type Thumbnails: Send + 'static;
+	/// Proof that [`Platform::secure_thumbnails`] set who may call this process's thumbnail
+	/// server, which [`Platform::serve_thumbnails`] takes: no server starts without it.
+	type ThumbnailSecurity: Copy + Send + 'static;
 
 	/// The Cloud Files platform's build, when known.
 	fn platform_build(&self) -> Option<u32>;
@@ -234,17 +240,42 @@ pub trait Platform: sealed::Sealed + Send + Sync + 'static {
 	fn unbrand(&self, root: &Path, user: UserId, scope: BrandingScope)
 	-> Result<(), PlatformError>;
 
+	/// Sets, for the whole process and once, who may call the thumbnail server
+	/// [`Platform::serve_thumbnails`] starts: on Windows the process's COM security, which COM sets
+	/// to its defaults itself the first time anything in the process uses COM. So every process
+	/// that may serve thumbnails calls it first and synchronously, before any COM or shell use and
+	/// before it builds its runtime ([`serve_stdio`], [`serve_refusing_thumbnails`]). The proof, or
+	/// `None` when this build serves no thumbnails. Bounded (on Windows, the COM layer's own wait).
+	///
+	/// [`serve_stdio`]: crate::helper::serve_stdio
+	/// [`serve_refusing_thumbnails`]: crate::helper::serve_refusing_thumbnails
+	fn secure_thumbnails(&self) -> Result<Option<Self::ThumbnailSecurity>, PlatformError>;
+
 	/// Starts answering File Explorer's thumbnail requests for this provider's roots with
-	/// `handler`, for the life of the process: `None` when this build serves none. Explorer asks
-	/// only for roots [`Platform::brand`] named this provider's thumbnail class for, which it does
-	/// only on a build that serves them.
+	/// `handler`, for the life of the process, under the access `security` proves set. Explorer
+	/// asks only for roots [`Platform::brand`] named this provider's thumbnail class for, which it
+	/// does only while a server started here runs. May block for long (on Windows, the COM layer's
+	/// own bound on its start), so the helper starts it in the background and brands the root it
+	/// serves again once it started.
 	fn serve_thumbnails(
 		&self,
+		security: Self::ThumbnailSecurity,
 		handler: ThumbnailHandler,
-	) -> Result<Option<Self::Thumbnails>, PlatformError>;
+	) -> Result<Self::Thumbnails, PlatformError>;
 
 	/// Stops `server`: later requests are answered by the class's fallback, which refuses each.
 	fn stop_thumbnails(&self, server: Self::Thumbnails);
+
+	/// Removes the value naming the thumbnail class from every root's entry, as the Windows user
+	/// this process runs as, not only from those branded in this run: what the helper does when
+	/// [`Platform::secure_thumbnails`] or [`Platform::serve_thumbnails`] failed, so File Explorer
+	/// keeps its own thumbnails instead of the class's fallback, which refuses every request. Only
+	/// the helper, which brands, calls it. A failure is logged.
+	///
+	/// Assumes one helper per Windows user: the class id is one per Windows user, not per app user
+	/// or root, so this strips the value from every entry of this provider the Windows user has,
+	/// another helper's of the same Windows user included, were one to run.
+	fn withdraw_thumbnails(&self);
 
 	/// Removes what [`Platform::brand`] wrote, as the Windows user this process runs as, for every
 	/// root the OS no longer holds as this provider's sync root: what a run stopped between the

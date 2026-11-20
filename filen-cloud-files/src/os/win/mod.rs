@@ -1,7 +1,8 @@
 //! The OS seam on Windows, over the Cloud Files API (cfapi) through raw `windows-sys`: registering
 //! a sync root, connecting it to a dispatcher, and answering the OS's requests through the
-//! responders. Every `unsafe` block of the crate lives in `ffi`, and the COM layer's in `com`;
-//! everything else here is safe.
+//! responders. Every `unsafe` block of the crate lives in `ffi`, but the COM layer's own (the
+//! apartment, the process's COM security, the class's registration and the objects COM calls),
+//! which lives in `com`; everything else here is safe.
 //!
 //! A callback runs on an OS thread: `ffi` copies it into owned values, `callbacks` builds the
 //! responder and hands the request to the dispatcher, which spawns the work on its runtime and
@@ -31,7 +32,7 @@ use windows_sys::Win32::{
 	Storage::{CloudFilters, FileSystem},
 };
 
-pub use self::com::ThumbnailServer;
+pub use self::com::{ComSecurity, ThumbnailServer};
 #[cfg(feature = "test-seams")]
 pub use self::local::user_dehydrate;
 pub use self::local::{WinLocalFs, WinSettled};

@@ -208,6 +208,17 @@ impl Thumbnail {
 	pub fn alpha(&self) -> ThumbnailAlpha {
 		self.alpha
 	}
+
+	/// A thumbnail of `width` by `height` pixels `bgra`, as given, for the COM layer's tests.
+	#[cfg(all(test, windows))]
+	pub(crate) fn for_test(width: u32, height: u32, bgra: Vec<u8>, alpha: ThumbnailAlpha) -> Self {
+		Self {
+			width,
+			height,
+			bgra,
+			alpha,
+		}
+	}
 }
 
 /// What the COM layer is handed: the service's answer for a path, the size asked for, in pixels,

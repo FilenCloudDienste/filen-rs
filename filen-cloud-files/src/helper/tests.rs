@@ -15,8 +15,8 @@ use tokio::{
 use crate::{
 	branding::{Branding, ExplorerCommands},
 	helper::{
-		BrandingScope, ErrorCode, ExitReason, HelperConfig, RootRefusal, StateDir, UserId,
-		run_helper, unregister_all,
+		BrandingScope, ErrorCode, ExitReason, HelperConfig, Platform, RootRefusal, StateDir,
+		UserId, run_helper, unregister_all,
 	},
 	identity::PlaceholderIdentity,
 	os::LocalError,
@@ -101,8 +101,11 @@ impl Rig {
 		let (input, helper_input) = tokio::io::duplex(1 << 22);
 		let (helper_output, output) = tokio::io::duplex(1 << 22);
 		let config = HelperConfig::new(StateDir::new(disk.state()).unwrap());
+		// Before the helper runs, as the process's start sets it.
+		let security = platform.secure_thumbnails();
 		let task = tokio::spawn(run_helper(
 			platform.clone(),
+			security,
 			FakeOpener::new(Arc::clone(drive)),
 			config,
 			helper_input,
@@ -2674,9 +2677,184 @@ async fn a_build_without_the_com_layer_serves_and_names_no_thumbnail_class() {
 	let mut rig = Rig::start(&disk, &platform, &drive);
 	ok(&rig.register(&disk).await);
 	ok(&rig.set_auth("42", ACCOUNT_ROOT).await);
+	assert_eq!(platform.thumbnail_securings(), 0);
 	assert_eq!(platform.thumbnail_servers(), (0, 0));
+	assert_eq!(platform.thumbnail_withdrawals(), 0);
 	assert!(!platform.thumbnail_provider(&disk.root()));
 	assert!(!platform.thumbnail_class());
+}
+
+/// Yields until `done` holds, for a real minute at most, then fails saying `what`. Yields rather
+/// than sleeps: while a thumbnail server's start is held on the blocking pool, the paused clock
+/// does not move.
+async fn eventually(what: &str, done: impl Fn() -> bool) {
+	let started = std::time::Instant::now();
+	while !done() {
+		assert!(
+			started.elapsed() < Duration::from_secs(60),
+			"never happened: {what}"
+		);
+		tokio::task::yield_now().await;
+	}
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_helper_whose_thumbnail_server_fails_withdraws_the_class_from_every_root() {
+	let disk = Disk::new();
+	let (platform, drive) = world();
+	platform.implement_thumbnails(true);
+	platform.fail_thumbnail_servers();
+	let mut rig = Rig::start(&disk, &platform, &drive);
+	ok(&rig.register(&disk).await);
+	ok(&rig.set_auth("42", ACCOUNT_ROOT).await);
+	eventually("the class was withdrawn", || {
+		platform.thumbnail_withdrawals() == 1
+	})
+	.await;
+	assert_eq!(platform.thumbnail_servers(), (0, 0));
+	assert!(!platform.thumbnail_provider(&disk.root()));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_helper_whose_thumbnail_security_failed_starts_no_server_and_withdraws_the_class() {
+	let disk = Disk::new();
+	let (platform, drive) = world();
+	platform.implement_thumbnails(true);
+	platform.fail_thumbnail_security();
+	let mut rig = Rig::start(&disk, &platform, &drive);
+	ok(&rig.register(&disk).await);
+	ok(&rig.set_auth("42", ACCOUNT_ROOT).await);
+	eventually("the class was withdrawn", || {
+		platform.thumbnail_withdrawals() == 1
+	})
+	.await;
+	assert_eq!(platform.thumbnail_securings(), 1);
+	assert_eq!(platform.thumbnail_servers(), (0, 0));
+	assert!(platform.thumbnail_handler().is_none());
+	assert!(!platform.thumbnail_provider(&disk.root()));
+	assert!(!platform.thumbnail_class());
+	ok(&rig.request(json!({ "t": "shutdown" })).await);
+	assert_eq!(rig.task.await.unwrap(), ExitReason::Shutdown);
+	assert_eq!(platform.thumbnail_servers(), (0, 0));
+	assert_eq!(platform.thumbnail_withdrawals(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_panic_answering_the_thumbnail_servers_start_stops_the_helper_in_order() {
+	let disk = Disk::new();
+	let (platform, drive) = world();
+	platform.implement_thumbnails(true);
+	platform.fail_thumbnail_servers();
+	platform.panic_on_next_thumbnail_withdrawal();
+	let rig = Rig::start(&disk, &platform, &drive);
+	assert_eq!(rig.task.await.unwrap(), ExitReason::Internal);
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_parent_is_answered_while_the_thumbnail_server_still_starts() {
+	let disk = Disk::new();
+	let (platform, drive) = world();
+	platform.implement_thumbnails(true);
+	let hold = platform.hold_thumbnail_starts();
+	let mut rig = Rig::start(&disk, &platform, &drive);
+	assert_eq!(rig.line().await["t"], "hello");
+	eventually("the start reached the hold", || {
+		platform.thumbnail_starts_held() == 1
+	})
+	.await;
+
+	ok(&rig.request(json!({ "t": "listRoots" })).await);
+	ok(&rig.register(&disk).await);
+	assert_eq!(platform.thumbnail_starts_held(), 1, "still starting");
+	assert_eq!(platform.thumbnail_servers(), (0, 0));
+
+	hold.release();
+	ok(&rig.request(json!({ "t": "shutdown" })).await);
+	assert_eq!(rig.task.await.unwrap(), ExitReason::Shutdown);
+	// Stopped by the helper's stop, or by the start itself when it answered after the stop.
+	eventually("the server was started and stopped", || {
+		platform.thumbnail_servers() == (1, 1)
+	})
+	.await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_root_served_while_the_thumbnail_server_starts_names_its_class_once_it_started() {
+	let disk = Disk::new();
+	let (platform, drive) = world();
+	platform.implement_thumbnails(true);
+	let hold = platform.hold_thumbnail_starts();
+	let mut rig = Rig::start(&disk, &platform, &drive);
+	ok(&rig.register(&disk).await);
+	ok(&rig.set_auth("42", ACCOUNT_ROOT).await);
+	// Branded with no server running: no value naming the class yet.
+	assert!(platform.user_branding(&disk.root()).is_some());
+	assert!(!platform.thumbnail_provider(&disk.root()));
+	assert!(!platform.thumbnail_class());
+
+	hold.release();
+	eventually("the served root names the class", || {
+		platform.thumbnail_provider(&disk.root())
+	})
+	.await;
+	assert!(platform.thumbnail_class());
+	assert_eq!(platform.thumbnail_servers(), (1, 0));
+	assert_eq!(platform.thumbnail_withdrawals(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_thumbnail_server_start_that_fails_late_withdraws_the_class() {
+	let disk = Disk::new();
+	let (platform, drive) = world();
+	platform.implement_thumbnails(true);
+	platform.fail_thumbnail_servers();
+	let hold = platform.hold_thumbnail_starts();
+	let mut rig = Rig::start(&disk, &platform, &drive);
+	ok(&rig.register(&disk).await);
+	ok(&rig.set_auth("42", ACCOUNT_ROOT).await);
+	assert_eq!(platform.thumbnail_withdrawals(), 0, "not answered yet");
+
+	hold.release();
+	eventually("the class was withdrawn", || {
+		platform.thumbnail_withdrawals() == 1
+	})
+	.await;
+	assert_eq!(platform.thumbnail_servers(), (0, 0));
+	assert!(!platform.thumbnail_provider(&disk.root()));
+	ok(&rig.request(json!({ "t": "shutdown" })).await);
+	assert_eq!(rig.task.await.unwrap(), ExitReason::Shutdown);
+	assert_eq!(platform.thumbnail_withdrawals(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stop_while_the_thumbnail_server_starts_ends_and_stops_the_server_started_late() {
+	let disk = Disk::new();
+	let (platform, drive) = world();
+	platform.implement_thumbnails(true);
+	let hold = platform.hold_thumbnail_starts();
+	let mut rig = Rig::start(&disk, &platform, &drive);
+	ok(&rig.register(&disk).await);
+	ok(&rig.set_auth("42", ACCOUNT_ROOT).await);
+	eventually("the start reached the hold", || {
+		platform.thumbnail_starts_held() == 1
+	})
+	.await;
+
+	ok(&rig.request(json!({ "t": "shutdown" })).await);
+	assert_eq!(rig.task.await.unwrap(), ExitReason::Shutdown);
+	assert_eq!(
+		platform.thumbnail_servers(),
+		(0, 0),
+		"the stop did not wait"
+	);
+
+	hold.release();
+	eventually("the late server was stopped", || {
+		platform.thumbnail_servers() == (1, 1)
+	})
+	.await;
+	assert!(platform.thumbnail_handler().is_none());
+	assert!(!platform.thumbnail_provider(&disk.root()));
 }
 
 #[tokio::test(start_paused = true)]
@@ -2687,6 +2865,10 @@ async fn a_build_serving_thumbnails_names_its_class_for_the_root_until_it_is_unr
 	let mut rig = Rig::start(&disk, &platform, &drive);
 	ok(&rig.register(&disk).await);
 	ok(&rig.set_auth("42", ACCOUNT_ROOT).await);
+	eventually("the served root names the class", || {
+		platform.thumbnail_provider(&disk.root())
+	})
+	.await;
 	assert_eq!(platform.thumbnail_servers(), (1, 0));
 	assert!(platform.thumbnail_handler().is_some());
 	assert!(platform.thumbnail_provider(&disk.root()));
