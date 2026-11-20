@@ -1,13 +1,14 @@
-//! Every `unsafe` block of the crate: the cfapi calls, and the Win32 calls around them (the
-//! process token, volumes, files by handle, the registry keys File Explorer reads and the shell's
-//! change notification), each behind a safe function whose arguments make the call sound.
-//! Nothing else lives here.
+//! Every `unsafe` block of the crate but the COM layer's own (in `com`): the cfapi calls, and the
+//! Win32 calls around them (the process token, volumes, files by handle, the registry keys File
+//! Explorer reads, the shell's change notification, the security descriptor the thumbnail
+//! server's access is built from, and the bitmaps it hands File Explorer), each behind a safe
+//! function whose arguments make the call sound. Nothing else lives here.
 
 use std::{
 	ffi::{OsString, c_void},
 	fs::File,
 	io,
-	mem::{offset_of, size_of, size_of_val},
+	mem::{self, offset_of, size_of, size_of_val},
 	os::windows::{
 		ffi::OsStringExt,
 		io::{AsRawHandle, FromRawHandle, OwnedHandle},
@@ -17,11 +18,14 @@ use std::{
 	ptr, slice,
 };
 
-use tracing::error;
+use tracing::{error, warn};
 #[cfg(test)]
 use windows_sys::Win32::{
+	Graphics::Gdi::{CreateCompatibleDC, DIBSECTION, DeleteDC, GetObjectW, GetPixel, SelectObject},
 	Security::{
-		ACL, ACL_REVISION, DACL_SECURITY_INFORMATION, InitializeAcl, InitializeSecurityDescriptor,
+		ACCESS_ALLOWED_ACE, ACL_REVISION, DACL_SECURITY_INFORMATION, GetAce,
+		GetSecurityDescriptorDacl, GetSecurityDescriptorGroup, GetSecurityDescriptorOwner,
+		InitializeAcl, InitializeSecurityDescriptor, IsValidSecurityDescriptor,
 		SECURITY_DESCRIPTOR, SetSecurityDescriptorDacl,
 	},
 	Storage::FileSystem::WRITE_DAC,
@@ -31,13 +35,22 @@ use windows_sys::Win32::{
 use windows_sys::{
 	Win32::{
 		Foundation::{
-			ERROR_FILE_NOT_FOUND, ERROR_INVALID_PARAMETER, ERROR_MORE_DATA, ERROR_NO_MORE_ITEMS,
-			ERROR_NOT_SUPPORTED, ERROR_SUCCESS, HANDLE, LocalFree, STATUS_SUCCESS, WIN32_ERROR,
+			ERROR_FILE_NOT_FOUND, ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_PARAMETER,
+			ERROR_MORE_DATA, ERROR_NO_MORE_ITEMS, ERROR_NOT_SUPPORTED, ERROR_SUCCESS, HANDLE,
+			LocalFree, STATUS_SUCCESS, WIN32_ERROR,
+		},
+		Graphics::Gdi::{
+			BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateDIBSection, DIB_RGB_COLORS, DeleteObject,
+			HBITMAP,
 		},
 		Security::{
-			Authorization::{ConvertSidToStringSidW, GetSecurityInfo, SE_REGISTRY_KEY},
-			GetTokenInformation, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
-			TOKEN_ELEVATION, TOKEN_QUERY, TOKEN_USER, TokenElevation, TokenUser,
+			ACL,
+			Authorization::{
+				ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+				GetSecurityInfo, SDDL_REVISION_1, SE_REGISTRY_KEY,
+			},
+			GetTokenInformation, MakeAbsoluteSD, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+			PSID, TOKEN_ELEVATION, TOKEN_QUERY, TOKEN_USER, TokenElevation, TokenUser,
 		},
 		Storage::{
 			CloudFilters::*,
@@ -750,6 +763,209 @@ pub(super) fn reg_owner_sid(key: &RegKey) -> io::Result<Vec<u16>> {
 	unsafe { sid_string(owner) }
 }
 
+/// An absolute security descriptor and the buffers its pointers point into: valid, and the parts
+/// it points at live as long as the value. The buffers are `u64` words, so each part is aligned,
+/// and moving the value leaves them in place.
+pub(super) struct AbsoluteDescriptor {
+	descriptor: Vec<u64>,
+	_dacl: Vec<u64>,
+	_sacl: Vec<u64>,
+	_owner: Vec<u64>,
+	_group: Vec<u64>,
+}
+
+impl AbsoluteDescriptor {
+	/// The descriptor that `sddl` spells, in the absolute form a call such as
+	/// `CoInitializeSecurity` takes.
+	#[allow(unsafe_code)] // Win32 FFI: converts a security descriptor.
+	pub(super) fn from_sddl(sddl: &str) -> io::Result<Self> {
+		let sddl: Vec<u16> = sddl.encode_utf16().chain([0]).collect();
+		let mut relative: PSECURITY_DESCRIPTOR = ptr::null_mut();
+		// SAFETY: `sddl` is NUL-terminated; `relative` is a live out-param the call sets to a
+		// descriptor it allocated with `LocalAlloc`; no size is asked for.
+		let converted = unsafe {
+			ConvertStringSecurityDescriptorToSecurityDescriptorW(
+				sddl.as_ptr(),
+				SDDL_REVISION_1,
+				&mut relative,
+				ptr::null_mut(),
+			)
+		};
+		if converted == 0 {
+			return Err(io::Error::last_os_error());
+		}
+		let relative = LocalBox(relative);
+		let mut sizes = [0_u32; 5];
+		let [
+			descriptor_size,
+			dacl_size,
+			sacl_size,
+			owner_size,
+			group_size,
+		] = &mut sizes;
+		// SAFETY: `relative` is a valid self-relative descriptor; every buffer is null with a
+		// size of 0, so the call only writes the sizes it needs, through live out-params.
+		let sized = unsafe {
+			MakeAbsoluteSD(
+				relative.0,
+				ptr::null_mut(),
+				descriptor_size,
+				ptr::null_mut(),
+				dacl_size,
+				ptr::null_mut(),
+				sacl_size,
+				ptr::null_mut(),
+				owner_size,
+				ptr::null_mut(),
+				group_size,
+			)
+		};
+		if sized == 0 {
+			let error = io::Error::last_os_error();
+			if error.raw_os_error() != i32::try_from(ERROR_INSUFFICIENT_BUFFER).ok() {
+				return Err(error);
+			}
+		}
+		let mut buffers = [const { Vec::new() }; 5];
+		for (buffer, size) in buffers.iter_mut().zip(sizes) {
+			*buffer = vec![0_u64; words(size)?];
+		}
+		let [descriptor, dacl, sacl, owner, group] = &mut buffers;
+		let [
+			descriptor_size,
+			dacl_size,
+			sacl_size,
+			owner_size,
+			group_size,
+		] = &mut sizes;
+		// SAFETY: `relative` is a valid self-relative descriptor; each buffer is null with a size
+		// of 0, or holds at least the bytes the first call asked for, aligned for its part; each
+		// size is a live in/out-param.
+		let made = unsafe {
+			MakeAbsoluteSD(
+				relative.0,
+				buffer_ptr(descriptor),
+				descriptor_size,
+				buffer_ptr(dacl).cast::<ACL>(),
+				dacl_size,
+				buffer_ptr(sacl).cast::<ACL>(),
+				sacl_size,
+				buffer_ptr(owner),
+				owner_size,
+				buffer_ptr(group),
+				group_size,
+			)
+		};
+		if made == 0 {
+			return Err(io::Error::last_os_error());
+		}
+		let [descriptor, dacl, sacl, owner, group] = buffers;
+		Ok(Self {
+			descriptor,
+			_dacl: dacl,
+			_sacl: sacl,
+			_owner: owner,
+			_group: group,
+		})
+	}
+
+	/// The descriptor, for the call that takes it: valid while `self` lives. Mutable only because
+	/// the calls' signatures are: derived from a shared borrow, it is only for calls that read the
+	/// descriptor (an `[in]` parameter) and never for one that writes through it.
+	pub(super) fn as_ptr(&self) -> PSECURITY_DESCRIPTOR {
+		self.descriptor.as_ptr().cast_mut().cast()
+	}
+}
+
+/// How many `u64` words hold `bytes` bytes.
+fn words(bytes: u32) -> io::Result<usize> {
+	usize::try_from(bytes)
+		.map(|bytes| bytes.div_ceil(size_of::<u64>()))
+		.map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))
+}
+
+/// The start of `buffer` for `MakeAbsoluteSD`: null when it is empty, as the call takes for a part
+/// the descriptor does not have.
+fn buffer_ptr(buffer: &mut [u64]) -> *mut c_void {
+	if buffer.is_empty() {
+		ptr::null_mut()
+	} else {
+		buffer.as_mut_ptr().cast()
+	}
+}
+
+/// What a security descriptor holds, read back for tests: the owner's and the group's SIDs, and
+/// the DACL's entries, each its type, its access mask and its SID, every SID spelled
+/// (`S-1-5-...`).
+#[cfg(test)]
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct DescriptorEntries {
+	pub(super) owner: Vec<u16>,
+	pub(super) group: Vec<u16>,
+	pub(super) dacl: Vec<(u8, u32, Vec<u16>)>,
+}
+
+/// What `descriptor` holds, for tests. Fails the test when it is not valid, has no owner or group,
+/// or has no DACL (a DACL that is absent or null admits everyone).
+#[cfg(test)]
+#[allow(unsafe_code)] // Win32 FFI: reads a security descriptor back, for tests.
+pub(super) fn descriptor_entries_for_test(descriptor: &AbsoluteDescriptor) -> DescriptorEntries {
+	let sd = descriptor.as_ptr();
+	// SAFETY: `sd` is the absolute descriptor `descriptor` holds, live for this function.
+	assert_ne!(unsafe { IsValidSecurityDescriptor(sd) }, 0);
+	let mut defaulted = 0;
+	let (mut owner, mut group): (PSID, PSID) = (ptr::null_mut(), ptr::null_mut());
+	// SAFETY: as above; the out-params are live for the calls.
+	unsafe {
+		assert_ne!(
+			GetSecurityDescriptorOwner(sd, &mut owner, &mut defaulted),
+			0
+		);
+		assert_ne!(
+			GetSecurityDescriptorGroup(sd, &mut group, &mut defaulted),
+			0
+		);
+	}
+	assert!(!owner.is_null() && !group.is_null(), "no owner or group");
+	let mut present = 0;
+	let mut dacl: *mut ACL = ptr::null_mut();
+	// SAFETY: as above; the out-params are live for the call.
+	assert_ne!(
+		unsafe { GetSecurityDescriptorDacl(sd, &mut present, &mut dacl, &mut defaulted) },
+		0
+	);
+	assert!(present != 0 && !dacl.is_null(), "no DACL");
+	// SAFETY: `dacl` points at the ACL in `descriptor`'s buffers.
+	let count = unsafe { (*dacl).AceCount };
+	let entries = (0..u32::from(count))
+		.map(|index| {
+			let mut ace: *mut c_void = ptr::null_mut();
+			// SAFETY: `dacl` is a valid ACL with more than `index` entries; `ace` is live.
+			assert_ne!(unsafe { GetAce(dacl, index, &mut ace) }, 0);
+			let ace = ace.cast::<ACCESS_ALLOWED_ACE>();
+			// SAFETY: every entry starts with an `ACE_HEADER`, read first.
+			let kind = unsafe { (*ace).Header.AceType };
+			// Type 0, an `ACCESS_ALLOWED_ACE`, is the only one read further.
+			assert_eq!(kind, 0, "an entry that does not allow");
+			// SAFETY: an `ACCESS_ALLOWED_ACE`, whose SID starts at `SidStart`, inside the ACL.
+			unsafe {
+				(
+					kind,
+					(*ace).Mask,
+					sid_string((&raw mut (*ace).SidStart).cast()).unwrap(),
+				)
+			}
+		})
+		.collect();
+	// SAFETY: both point at SIDs in `descriptor`'s buffers, which live for this function.
+	let (owner, group) = unsafe { (sid_string(owner).unwrap(), sid_string(group).unwrap()) };
+	DescriptorEntries {
+		owner,
+		group,
+		dacl: entries,
+	}
+}
+
 /// Tells the shell the directory `path` changed (`SHCNE_UPDATEDIR`), so the windows showing it
 /// read it again.
 #[allow(unsafe_code)] // Win32 FFI: notifies the shell of a changed directory.
@@ -786,6 +1002,187 @@ pub(super) fn notify_item_updated(path: &WideNul) {
 			ptr::null(),
 		);
 	}
+}
+
+/// Why [`dib_section`] made no section.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DibError {
+	/// The size does not fit a DIB section, or the pixels do not match it.
+	Size,
+	/// `CreateDIBSection` failed: GDI is out of memory or objects.
+	Gdi,
+}
+
+/// `pixels`, `width` by `height` BGRA pixels in rows top-down, as a top-down 32-bit DIB section.
+/// Each failure is logged.
+#[allow(unsafe_code)] // GDI FFI: makes a DIB section and fills it.
+pub(super) fn dib_section(width: u32, height: u32, pixels: &[u8]) -> Result<DibSection, DibError> {
+	let expected = usize::try_from(width)
+		.ok()
+		.zip(usize::try_from(height).ok())
+		.and_then(|(width, height)| width.checked_mul(height)?.checked_mul(4));
+	let (Ok(width), Ok(height)) = (i32::try_from(width), i32::try_from(height)) else {
+		warn!(target: LOG_TARGET, width, height, "a thumbnail is too large for a DIB section");
+		return Err(DibError::Size);
+	};
+	if width == 0 || height == 0 || expected != Some(pixels.len()) {
+		warn!(
+			target: LOG_TARGET,
+			width,
+			height,
+			len = pixels.len(),
+			"a thumbnail's pixels do not match its size",
+		);
+		return Err(DibError::Size);
+	}
+	let header_size = u32::try_from(size_of::<BITMAPINFOHEADER>()).map_err(|_| DibError::Size)?;
+	let info = BITMAPINFO {
+		bmiHeader: BITMAPINFOHEADER {
+			biSize: header_size,
+			biWidth: width,
+			// Negative: the rows run top-down, as the pixels do.
+			biHeight: -height,
+			biPlanes: 1,
+			biBitCount: 32,
+			biCompression: BI_RGB,
+			..BITMAPINFOHEADER::default()
+		},
+		..BITMAPINFO::default()
+	};
+	let mut bits: *mut c_void = ptr::null_mut();
+	// SAFETY: `info` is a valid `BITMAPINFO` for the call; `bits` is a live out-param. No DC is
+	// needed with `DIB_RGB_COLORS` and no palette, and no section handle is passed.
+	let section = unsafe {
+		CreateDIBSection(
+			ptr::null_mut(),
+			&info,
+			DIB_RGB_COLORS,
+			&mut bits,
+			ptr::null_mut(),
+			0,
+		)
+	};
+	if section.is_null() || bits.is_null() {
+		warn!(
+			target: LOG_TARGET,
+			error = %io::Error::last_os_error(),
+			"CreateDIBSection failed",
+		);
+		if !section.is_null() {
+			// SAFETY: the section was made above and is not handed out.
+			unsafe { DeleteObject(section) };
+		}
+		return Err(DibError::Gdi);
+	}
+	// SAFETY: the section holds `width * height` 32-bit pixels in rows of `width * 4` bytes,
+	// which need no padding, so `bits` points at `pixels.len()` writable bytes the section owns,
+	// apart from `pixels`.
+	unsafe { ptr::copy_nonoverlapping(pixels.as_ptr(), bits.cast::<u8>(), pixels.len()) };
+	Ok(DibSection(section))
+}
+
+/// A DIB section [`dib_section`] made, deleted when this drops unless it was handed out.
+pub(super) struct DibSection(HBITMAP);
+
+impl DibSection {
+	/// The bitmap, now the caller's to delete.
+	pub(super) fn into_raw(self) -> HBITMAP {
+		let bitmap = self.0;
+		mem::forget(self);
+		bitmap
+	}
+}
+
+impl Drop for DibSection {
+	#[allow(unsafe_code)] // GDI FFI: deletes a bitmap not handed out.
+	fn drop(&mut self) {
+		// SAFETY: the section `dib_section` made, never handed out, deleted once, here.
+		unsafe { DeleteObject(self.0) };
+	}
+}
+
+#[cfg(test)]
+impl DibSection {
+	/// The bitmap, still this value's, for tests.
+	pub(super) fn bitmap(&self) -> HBITMAP {
+		self.0
+	}
+}
+
+/// A DIB section as GDI reports it, for tests: its width, height, bits per pixel and the bytes of
+/// its pixels.
+#[cfg(test)]
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct DibBits {
+	pub(super) width: i32,
+	pub(super) height: i32,
+	pub(super) bits_per_pixel: u16,
+	pub(super) bytes: Vec<u8>,
+}
+
+/// What GDI reports of the DIB section `bitmap` (`GetObjectW`), for tests; `None` when it is not
+/// one, as a deleted handle is not. `GetObjectW` tells nothing of the order of the rows in memory:
+/// it reports a positive height for a top-down DIB section too (measured).
+#[cfg(test)]
+#[allow(unsafe_code)] // GDI FFI: reads a DIB section back, for tests.
+pub(super) fn dib_bits_for_test(bitmap: HBITMAP) -> Option<DibBits> {
+	// SAFETY: a zeroed `DIBSECTION` is a valid value of the plain struct.
+	let mut info: DIBSECTION = unsafe { mem::zeroed() };
+	let size = i32::try_from(size_of::<DIBSECTION>()).ok()?;
+	// SAFETY: `info` is writable for `size` bytes; a handle that is not a live object is refused,
+	// not read.
+	let written = unsafe { GetObjectW(bitmap, size, ptr::from_mut(&mut info).cast()) };
+	if written != size || info.dsBm.bmBits.is_null() {
+		return None;
+	}
+	let len = usize::try_from(info.dsBm.bmWidthBytes)
+		.ok()?
+		.checked_mul(usize::try_from(info.dsBm.bmHeight).ok()?)?;
+	// SAFETY: GDI reports the section's bits, which hold `bmWidthBytes * bmHeight` bytes while the
+	// section lives, which it does for this call, as the caller does not delete it meanwhile.
+	let bytes = unsafe { slice::from_raw_parts(info.dsBm.bmBits.cast::<u8>(), len) }.to_vec();
+	Some(DibBits {
+		width: info.dsBm.bmWidth,
+		height: info.dsBm.bmHeight,
+		bits_per_pixel: info.dsBm.bmBitsPixel,
+		bytes,
+	})
+}
+
+/// The colours GDI draws in the first column of `bitmap`, a live bitmap selected into no DC, from
+/// its top row down, `rows` of them, as `COLORREF`s (`0x00BBGGRR`): the image as shown, whatever
+/// order its rows have in memory. For tests.
+#[cfg(test)]
+#[allow(unsafe_code)] // GDI FFI: reads a bitmap's pixels through a DC, for tests.
+pub(super) fn first_column_for_test(bitmap: HBITMAP, rows: i32) -> Vec<u32> {
+	// SAFETY: no argument; a null DC asks for a memory DC like the screen's, deleted below.
+	let dc = unsafe { CreateCompatibleDC(ptr::null_mut()) };
+	assert!(!dc.is_null());
+	// SAFETY: `dc` is the live memory DC above; GDI refuses a handle that is not a bitmap, or one
+	// selected into another DC.
+	let previous = unsafe { SelectObject(dc, bitmap) };
+	assert!(!previous.is_null());
+	let colours = (0..rows)
+		// SAFETY: `dc` is live, with `bitmap` selected.
+		.map(|row| unsafe { GetPixel(dc, 0, row) })
+		.collect();
+	// SAFETY: `previous` was selected into `dc` before; the DC is this function's, deleted once,
+	// which leaves `bitmap` to its owner.
+	unsafe {
+		SelectObject(dc, previous);
+		assert_ne!(DeleteDC(dc), 0);
+	}
+	colours
+}
+
+/// Deletes `bitmap`, a bitmap the test owns, such as one a thumbnail object handed out: whether
+/// GDI deleted it. For tests.
+#[cfg(test)]
+#[allow(unsafe_code)] // GDI FFI: deletes a bitmap, for tests.
+pub(super) fn delete_bitmap_for_test(bitmap: HBITMAP) -> bool {
+	// SAFETY: GDI refuses a handle that is not a live object; the caller owns the bitmap, deleted
+	// once, here.
+	unsafe { DeleteObject(bitmap) != 0 }
 }
 
 /// `SECURITY_DESCRIPTOR_REVISION`.
@@ -1687,10 +2084,10 @@ const CANCEL_RANGE: usize = PARAMS + offset_of!(CF_CALLBACK_PARAMETERS_0_0, Anon
 ///
 /// # Safety
 ///
-/// `string` is null or points at a NUL-terminated UTF-16 string cfapi passed, valid for the
-/// callback.
-#[allow(unsafe_code)] // cfapi FFI: reads a string a callback passed.
-unsafe fn read_wide(string: *const u16) -> Option<Vec<u16>> {
+/// `string` is null or points at a NUL-terminated UTF-16 string valid for the call: one cfapi
+/// passed a callback, or one a Win32 or COM call returned.
+#[allow(unsafe_code)] // Win32 FFI: reads a string the OS passed or returned.
+pub(super) unsafe fn read_wide(string: *const u16) -> Option<Vec<u16>> {
 	if string.is_null() {
 		return None;
 	}

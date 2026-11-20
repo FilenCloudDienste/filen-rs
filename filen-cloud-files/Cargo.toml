@@ -64,10 +64,12 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
 # The Cloud Files API (cfapi) and the Win32 types its structs and codes use, and the process
 # token's elevation and user (`Win32_Security`, `Win32_System_Threading`) the helper refuses to run
 # with and spells the user's SID from (`Win32_Security_Authorization`), and the registry keys and
-# shell notification that show a root in File Explorer (`Win32_System_Registry`, `Win32_UI_Shell`);
-# linked by raw-dylib, so no import library is needed on any target.
+# shell notification that show a root in File Explorer (`Win32_System_Registry`, `Win32_UI_Shell`),
+# and the bitmaps the thumbnail server hands File Explorer (`Win32_Graphics_Gdi`); linked by
+# raw-dylib, so no import library is needed on any target.
 windows-sys = { version = "0.61.2", features = [
 	"Win32_Foundation",
+	"Win32_Graphics_Gdi",
 	"Win32_Security",
 	"Win32_Security_Authorization",
 	"Win32_Storage_CloudFilters",
