@@ -425,6 +425,13 @@ impl LocalFs for WinLocalFs {
 
 	type Dir = WinDir;
 
+	fn notify_item_updated(&self, path: &RootPath) {
+		let units: Vec<u16> = self.full(path).as_os_str().encode_wide().collect();
+		if let Some(path) = path_nul(&units) {
+			ffi::notify_item_updated(&path);
+		}
+	}
+
 	/// Opens the item for reading its attributes only, without following a reparse point, to tell
 	/// a placeholder from a link; then a placeholder again, following it, for its cfapi state, as
 	/// the state reads were measured through such handles. Neither open hydrates.

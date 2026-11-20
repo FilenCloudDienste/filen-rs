@@ -61,7 +61,9 @@ use windows_sys::{
 			},
 			Threading::{GetCurrentProcess, OpenProcessToken},
 		},
-		UI::Shell::{SHCNE_UPDATEDIR, SHCNF_PATHW, SHChangeNotify},
+		UI::Shell::{
+			SHCNE_UPDATEDIR, SHCNE_UPDATEITEM, SHCNF_FLUSHNOWAIT, SHCNF_PATHW, SHChangeNotify,
+		},
 	},
 	core::{GUID, PWSTR},
 };
@@ -748,6 +750,28 @@ pub(super) fn notify_dir_updated(path: &WideNul) {
 		SHChangeNotify(
 			SHCNE_UPDATEDIR.cast_signed(),
 			SHCNF_PATHW,
+			path.with_nul().as_ptr().cast(),
+			ptr::null(),
+		);
+	}
+}
+
+/// Tells the shell the item `path` changed (`SHCNE_UPDATEITEM`), so the windows showing it ask
+/// for its thumbnail again, starting the delivery and returning without waiting for it
+/// (`SHCNF_FLUSHNOWAIT`). Whether File Explorer asks again for an item it was answered
+/// `WTS_E_EXTRACTIONPENDING` for is unmeasured. The path is a string, so no interface is marshaled;
+/// whether the shell uses COM inside the call is undocumented, which the process's start covers
+/// either way: it sets the COM security before it starts the runtime this is called from.
+#[allow(unsafe_code)] // Win32 FFI: notifies the shell of a changed item.
+pub(super) fn notify_item_updated(path: &WideNul) {
+	// SAFETY: `path` is NUL-terminated and borrowed for the call, which, as for
+	// `notify_dir_updated`, takes the path in before it returns (from memory: the shell turns it
+	// into an item id list in the call, whatever the flush flags); the second item is unused by
+	// `SHCNE_UPDATEITEM`.
+	unsafe {
+		SHChangeNotify(
+			SHCNE_UPDATEITEM.cast_signed(),
+			SHCNF_PATHW | SHCNF_FLUSHNOWAIT,
 			path.with_nul().as_ptr().cast(),
 			ptr::null(),
 		);

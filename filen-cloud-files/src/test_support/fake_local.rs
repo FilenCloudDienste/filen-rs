@@ -157,6 +157,8 @@ struct LocalState {
 	next_id: u128,
 	clock: i64,
 	ops: Vec<LocalOp>,
+	/// The items the windows showing them were told changed, in order.
+	notified: Vec<RootPath>,
 	watch: Vec<LocalEvent>,
 	lost_events: bool,
 	/// A write the user is in the middle of when the drive next copies the file at the path: the
@@ -582,6 +584,7 @@ impl FakeLocal {
 			next_id: 1,
 			clock: 0,
 			ops: Vec::new(),
+			notified: Vec::new(),
 			watch: Vec::new(),
 			lost_events: false,
 			torn_copy: None,
@@ -1382,6 +1385,12 @@ impl FakeLocal {
 		self.state().ops.clone()
 	}
 
+	/// The items the windows showing them were told changed ([`LocalFs::notify_item_updated`]), in
+	/// order.
+	pub fn notified_items(&self) -> Vec<RootPath> {
+		self.state().notified.clone()
+	}
+
 	/// Makes every upload path a real file under `dir`, holding the file's bytes as they are when
 	/// the path is handed out, so the real cache can upload from it.
 	pub fn mirror_uploads(&self, dir: PathBuf) {
@@ -1823,6 +1832,10 @@ impl LocalFs for FakeLocal {
 	type Settled = FakeSettled;
 
 	type Dir = FakeDir;
+
+	fn notify_item_updated(&self, path: &RootPath) {
+		self.state().notified.push(path.clone());
+	}
 
 	fn inspect(&self, path: &RootPath) -> Result<LocalEntry, LocalError> {
 		let mut state = self.state();

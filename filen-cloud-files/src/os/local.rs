@@ -513,6 +513,11 @@ pub trait LocalFs: sealed::Sealed + Send + Sync + 'static {
 		expect: LocalFileId,
 		identity: PlaceholderIdentity,
 	) -> Result<(), LocalError>;
+
+	/// Tells the windows showing the item at `path` that it changed, so they ask for its thumbnail
+	/// again: what the thumbnail service does once it finished one it answered "not yet" for. Only
+	/// a hint: nothing is read or changed, and a failure goes unnoticed.
+	fn notify_item_updated(&self, path: &RootPath);
 }
 
 /// A `NOTIFY_DELETE` callback: a placeholder is about to be deleted, and the core allows it or
