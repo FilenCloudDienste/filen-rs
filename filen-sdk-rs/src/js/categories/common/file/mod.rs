@@ -35,6 +35,12 @@ pub struct File {
 	pub(crate) meta: FileMeta,
 
 	parent: ParentUuid,
+	/// The directory this file was in before it was trashed: set only while `parent` is
+	/// `"trash"`, which drops it. wasm only; napi and uniffi carry it in `parent` itself.
+	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	#[tsify(optional)]
+	trashed_from: Option<Uuid>,
 	#[cfg_attr(
 		all(target_family = "wasm", target_os = "unknown"),
 		tsify(type = "bigint")
@@ -84,6 +90,8 @@ impl File {
 			uuid: file.uuid,
 			stable_uuid,
 			meta,
+			#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+			trashed_from: file.parent.original_parent(),
 			parent: file.parent,
 			size: file.size,
 			favorited: file.favorited,
@@ -99,6 +107,9 @@ impl File {
 			uuid: self.uuid,
 			stable_uuid,
 			meta: self.meta.try_into()?,
+			#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+			parent: self.parent.with_original_parent(self.trashed_from),
+			#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 			parent: self.parent,
 			size: self.size,
 			favorited: self.favorited,

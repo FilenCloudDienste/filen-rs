@@ -45,12 +45,20 @@ pub struct Dir {
 	pub timestamp: DateTime<Utc>,
 	pub favorited: bool,
 	pub meta: DirMeta,
+	/// The directory this one was in before it was trashed: set only while `parent` is
+	/// `"trash"`, which drops it. wasm only; napi and uniffi carry it in `parent` itself.
+	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	#[tsify(optional)]
+	pub trashed_from: Option<Uuid>,
 }
 
 impl From<RemoteDirectory> for Dir {
 	fn from(dir: RemoteDirectory) -> Self {
 		Dir {
 			uuid: dir.uuid,
+			#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+			trashed_from: dir.parent.original_parent(),
 			parent: dir.parent,
 			color: dir.color.into(),
 			favorited: dir.favorited,
@@ -62,9 +70,13 @@ impl From<RemoteDirectory> for Dir {
 
 impl From<Dir> for RemoteDirectory {
 	fn from(dir: Dir) -> Self {
+		#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+		let parent = dir.parent.with_original_parent(dir.trashed_from);
+		#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+		let parent = dir.parent;
 		RemoteDirectory::from_meta(
 			dir.uuid,
-			dir.parent,
+			parent,
 			dir.color.into(),
 			dir.favorited,
 			dir.timestamp,

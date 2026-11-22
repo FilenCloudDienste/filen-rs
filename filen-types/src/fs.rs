@@ -52,8 +52,9 @@ pub enum ParentUuid {
 	/// A trashed item's parent. Carries the item's *original* parent so a trashed file/dir
 	/// remembers where it came from. By convention this is always a real uuid for an actual
 	/// item; the sole exception is the transient list-trash request target, which uses
-	/// [`Uuid::nil`] as a placeholder (the payload is dropped by every string/wire encoding —
-	/// [`ParentUuid::to_str`] renders `"trash"` regardless).
+	/// [`Uuid::nil`] as a placeholder. The string encoding drops the payload
+	/// ([`ParentUuid::to_str`] renders `"trash"` regardless); the wasm item types carry it
+	/// beside `parent` as `trashedFrom`, see [`ParentUuid::with_original_parent`].
 	Trash(Uuid),
 	Recents,
 	Favorites,
@@ -96,6 +97,16 @@ impl ParentUuid {
 		match self {
 			ParentUuid::Trash(original) if !original.is_nil() => Some(*original),
 			_ => None,
+		}
+	}
+
+	/// A trashed parent with its original parent put back, for a parent read from the string
+	/// encoding (which drops it) next to the original carried separately. Any other parent, or a
+	/// missing original, is returned as it is.
+	pub fn with_original_parent(self, original: Option<Uuid>) -> Self {
+		match (self, original) {
+			(ParentUuid::Trash(_), Some(original)) => ParentUuid::Trash(original),
+			_ => self,
 		}
 	}
 
@@ -396,5 +407,19 @@ mod tests {
 			ParentUuid::from_str(parent_uuid.to_str().as_ref()).unwrap(),
 			parent_uuid
 		);
+	}
+
+	#[test]
+	fn a_trashed_parent_takes_back_its_original_parent() {
+		let original = Uuid::new_v4();
+		let read = ParentUuid::from_str("trash").unwrap();
+		assert_eq!(read.original_parent(), None);
+		let restored = read.with_original_parent(Some(original));
+		assert_eq!(restored, ParentUuid::Trash(original));
+		assert_eq!(restored.original_parent(), Some(original));
+		assert_eq!(restored.to_str().as_ref(), "trash");
+		assert_eq!(read.with_original_parent(None), read);
+		let plain = ParentUuid::Uuid(Uuid::new_v4());
+		assert_eq!(plain.with_original_parent(Some(original)), plain);
 	}
 }
