@@ -86,7 +86,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: ''
-          shared-key: cargo-build-release-cli
+          # one cache per target: a target directory holds build scripts built for the leg's
+          # host (inside cross's image for the Linux targets), and the aarch64 gnu image's glibc
+          # 2.23 cannot run one another leg built
+          shared-key: cargo-build-release-cli-${{ matrix.target }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
       # note: I'm not sure if all these extra build dependencies are actually required, but it's not worth figuring it out right now
       - name: Install and configure dependencies
