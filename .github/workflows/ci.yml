@@ -71,6 +71,10 @@ jobs:
       # and some cases need `malformed`, so none of the passes above compile them.
       - name: Run clippy on sync engine targets
         run: cargo clippy -p filen-sdk-rs -F sync-engine-live-tests,malformed --all-targets -- -D warnings
+      # Cloud Files' live suite, helper_secrets and the VM harness examples need `test-seams`,
+      # so none of the passes above compile them.
+      - name: Run clippy on Cloud Files test-seams targets
+        run: cargo clippy -p filen-cloud-files -F test-seams --all-targets -- -D warnings
       # The desktop Node-API addon's feature set; no other pass enables `napi`.
       - name: Run clippy napi
         run: cargo clippy -p filen-sdk-rs -F napi,cache,sync-engine,rclone --all-targets -- -D warnings
@@ -152,6 +156,10 @@ jobs:
         run: cargo clippy --tests -F filen-cli/cli-live-tests -- -D warnings
       - name: Run clippy on tests with cache
         run: cargo clippy --tests -F cache -- -D warnings
+      # Cloud Files' Windows layer under `test-seams`: its live suite, helper_secrets and the VM
+      # harness examples, which no other pass compiles.
+      - name: Run clippy on Cloud Files test-seams targets
+        run: cargo clippy -p filen-cloud-files -F test-seams --all-targets -- -D warnings
       - name: Run unit tests
         run: cargo test --lib -F cache,sync-engine --no-fail-fast
         env:
@@ -160,6 +168,10 @@ jobs:
           TEST_SHARE_EMAIL: 'test_share@filen.io'
           TEST_SHARE_PASSWORD: 'test_share_password'
           RUST_LOG: debug
+      # The helper binary as the desktop app spawns it, and the check that no line or log of the
+      # helper shows a session's secrets: offline, on fakes, with no account.
+      - name: Run Cloud Files helper tests
+        run: cargo test -p filen-cloud-files -F test-seams --test helper_secrets --test helper_spawn --no-fail-fast
 
   ci-macos:
     # also runs iOS and Android clippy

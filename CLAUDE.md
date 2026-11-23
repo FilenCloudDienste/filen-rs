@@ -120,6 +120,16 @@ FILEN_TEST_RCLONE=/path/to/rclone cargo test -p filen-sdk-rs -F rclone,test-seam
 # The CLI's tests: the targets that log into the test account are gated on `cli-live-tests`
 # (filen-cli/Cargo.toml lists them); without it only the offline ones build
 cargo test -p filen-cli -F cli-live-tests
+# Cloud Files: the core's unit tests run on fakes on every host; the Windows layer's need Windows.
+# helper_spawn spawns the helper binary and helper_secrets checks its lines and logs for a
+# session's secrets, both offline; cloud_files_live logs into the test account and takes its
+# drive-write lock (test.yml runs it nightly in test-sync-engine, single-threaded)
+cargo test -p filen-cloud-files --lib
+cargo test -p filen-cloud-files -F test-seams --test helper_secrets --test helper_spawn
+cargo test -p filen-cloud-files -F test-seams --test cloud_files_live -- --test-threads=1
+# Its test-seams targets (the live suite, helper_secrets, the VM harness examples), as the hooks
+# and CI lint them; add --target x86_64-pc-windows-gnu off Windows for its Windows layer
+cargo clippy -p filen-cloud-files -F test-seams --all-targets
 ```
 
 Integration tests require environment variables (can be in `.env`):
@@ -208,9 +218,10 @@ committing never triggers a vendored C++ build and needs no `meson` / `ninja` / 
 wasi-sdk. Every `heif-decoder` pass lives in pre-push.
 
 - **pre-commit** — `cargo fmt --all --check`, `cargo fmt` inside `filen-sdk-rs`, `taplo
-  lint`/`fmt --check`, `sqlfluff` on staged `.sql`, then six clippy passes: workspace
+  lint`/`fmt --check`, `sqlfluff` on staged `.sql`, then seven clippy passes: workspace
   (`--exclude heif-decoder --all-targets -F filen-cli/cli-live-tests`), `-p filen-sdk-rs -F uniffi,http-provider`,
-  `-p filen-sdk-rs -F sync-engine-live-tests,malformed --all-targets` and
+  `-p filen-sdk-rs -F sync-engine-live-tests,malformed --all-targets`,
+  `-p filen-cloud-files -F test-seams --all-targets` and
   `-p filen-sdk-rs -F napi,cache,sync-engine,rclone --all-targets` (the same commands as ci-linux), and
   wasm32 `-F wasm-full,cache` + `--no-default-features -F service-worker` (both run from the
   `filen-sdk-rs` directory). **On a cold cargo cache this takes several minutes** — warm the
@@ -262,8 +273,9 @@ package-scoped `clippy -p filen-sdk-rs --no-default-features -F uniffi,http-prov
 that builds the SDK without `archive`, cross-compiles for Android, iOS and Windows, and
 builds and smoke-tests the napi addon on Linux, macOS and Windows and checks its typings
 against ubrn's on Linux (`ci-napi`), and runs `rclone_daemon_tests` against the managed rclone
-with FUSE 3 on Linux and WinFsp on Windows (`ci-rclone`) — none of
-which the hooks attempt. `ci.yml`
+with FUSE 3 on Linux and WinFsp on Windows (`ci-rclone`), and on Windows lints
+`filen-cloud-files -F test-seams --all-targets` and runs its offline `helper_secrets` and
+`helper_spawn` — none of which the hooks attempt. `ci.yml`
 runs only on `main`, `dev` and pull requests into them. Every other branch push, and every
 pull request into `main` or `dev` (from a fork too), runs `branch-lint.yml`, the fast checks
 a branch that skipped the hooks would miss: the diff policy and commit-message checks
@@ -274,9 +286,10 @@ The sync engine's live tests run only nightly (or on a `[test]` commit/PR), in `
 `test-sync-engine` job: after the matrix and 2FA legs, Linux, V2 account, one
 `!cancelled()` step per binary — `cache_tests`, `cache_search_tests`,
 `sync_engine_blackbox_tests` and `sync_suite`, all `-p filen-sdk-rs -F sync-engine-live-tests,malformed`,
-then the mobile binding's `sync_engine_js_tests` with `-F uniffi,sync-engine`, the engine
-binaries with `--test-threads=1`, and last the desktop addon's `test:napi:live` after a
-`build:napi`. The CLI's live targets (`-p filen-cli -F cli-live-tests`) run after that, in
+then the mobile binding's `sync_engine_js_tests` with `-F uniffi,sync-engine` and Cloud Files'
+`cloud_files_live` with `-p filen-cloud-files -F test-seams` (its core on the fake OS, so
+Linux serves), the engine and Cloud Files binaries with `--test-threads=1`, and last the
+desktop addon's `test:napi:live` after a `build:napi`. The CLI's live targets (`-p filen-cli -F cli-live-tests`) run after that, in
 `test-cli`, on the V2 and the V1 account and on Linux, macOS and Windows, all six legs one
 after the other (`max-parallel: 1`) once test-wasm has finished too, so none of them overlaps
 another, the sync engine's job or the wasm tests; the matrix legs, which share an account

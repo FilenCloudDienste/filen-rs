@@ -259,7 +259,9 @@ jobs:
     # The cache's live binaries (`cache_tests`, `cache_search_tests`) run here too. They
     # contend for the same drive-write lock, so they cannot join the matrix legs, three of
     # which share each account concurrently. The engine's remote view is the cache, and
-    # `sync-engine` implies `cache`, so they reuse this job's build.
+    # `sync-engine` implies `cache`, so they reuse this job's build. Cloud Files' live suite
+    # (`cloud_files_live`) runs here for the same reason: it drives the provider's core on the
+    # cache, through its fake OS, so it runs on any host, and takes the same lock.
     #
     # The engine suites are `required-features = ["sync-engine-live-tests"]`, which only
     # these jobs enable: filen-cli turns `sync-engine` on, so the matrix's workspace-root
@@ -345,6 +347,19 @@ jobs:
           TEST_SHARE_EMAIL: ${{ secrets['V2_SHARE_ACC_EMAIL'] }}
           TEST_SHARE_PASSWORD: ${{ secrets['V2_SHARE_ACC_PASS'] }}
           RUST_LOG: filen_sdk_rs::sync_engine=debug,info
+      # Cloud Files' live suite: its core against the real cache and the account, through the
+      # fake OS, so it needs no Windows. Its tests take the drive-write lock, and the cache's own
+      # client takes it for each write, so it runs single-threaded here like the engine binaries.
+      # `-p filen-cloud-files` without `heif-decoder` keeps the vendored C++ out of the build.
+      - name: Run cloud_files_live (single-threaded)
+        if: ${{ !cancelled() }}
+        run: cargo test -p filen-cloud-files -F test-seams --test cloud_files_live --no-fail-fast -- --test-threads=1
+        env:
+          TEST_EMAIL: ${{ secrets['V2_TEST_ACC_EMAIL'] }}
+          TEST_PASSWORD: ${{ secrets['V2_TEST_ACC_PASS'] }}
+          TEST_SHARE_EMAIL: ${{ secrets['V2_SHARE_ACC_EMAIL'] }}
+          TEST_SHARE_PASSWORD: ${{ secrets['V2_SHARE_ACC_PASS'] }}
+          RUST_LOG: filen_cloud_files=debug,filen_mobile_native_cache=debug,info
       # The desktop addon, driven live under node. Its test borrows its remote directory from
       # test-utils' remote-test-dir, which it builds with cargo run.
       - name: Install Node.js
