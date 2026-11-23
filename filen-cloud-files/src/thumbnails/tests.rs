@@ -163,6 +163,35 @@ async fn a_partly_hydrated_file_is_thumbnailed_from_the_drive() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn an_online_only_file_the_drive_holds_a_newer_version_of_is_not_thumbnailed_from_it() {
+	let setup = served();
+	setup.local.place_file_with(
+		&root_path("a.bmp"),
+		file_identity(),
+		&bmp(50, 50, [1, 2, 3]),
+		false,
+	);
+	let newer = Uuid::from_u128(3);
+	setup.drive.add_file(STABLE, newer, &bmp(20, 10, [4, 5, 6]));
+
+	let answer = setup.service.request(&full("a.bmp"), 96).await;
+
+	assert_eq!(answer.err(), Some(ThumbnailRefusal::Failed));
+	assert_eq!(
+		setup.drive.ops(),
+		vec![DriveOp::Thumbnail(format!("stable/{STABLE}"))]
+	);
+	assert_eq!(
+		setup
+			.drive
+			.cached_fitted_thumbnail(newer, 96)
+			.await
+			.unwrap(),
+		None
+	);
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_file_edited_locally_is_thumbnailed_from_its_edit() {
 	let setup = served();
 	placed(&setup, &bmp(40, 40, [0; 3]), true, &bmp(40, 40, [0; 3]));

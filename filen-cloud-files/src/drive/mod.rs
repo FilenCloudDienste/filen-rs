@@ -89,13 +89,15 @@ pub trait Drive: sealed::Sealed + Send + Sync + 'static {
 		abort: Option<&Arc<FfiAbortSignal>>,
 	) -> impl Future<Output = Result<RangeRead, RangeReadError<S::Error>>> + Send;
 
-	/// The thumbnail of the file `id` fitted inside a `max_side` pixel square, its aspect ratio
-	/// kept, made from the remote file's chunks, never from the local placeholder, and kept in the
-	/// cache's thumbnail directory, as [`FilenMobileCacheState::fitted_thumbnail`] makes it. Setting
-	/// `cancel` stops the decode at its next chunk.
+	/// The thumbnail of the version `version` of the file `id` fitted inside a `max_side` pixel
+	/// square, its aspect ratio kept, made from the remote file's chunks, never from the local
+	/// placeholder, and kept in the cache's thumbnail directory, as
+	/// [`FilenMobileCacheState::fitted_thumbnail`] makes it; [`CacheError::DoesNotExist`] when the
+	/// cache holds another version of the file. Setting `cancel` stops the decode at its next chunk.
 	fn fitted_thumbnail(
 		&self,
 		id: &FfiId,
+		version: Uuid,
 		max_side: u32,
 		cancel: &Arc<AtomicBool>,
 	) -> impl Future<Output = Result<FittedOutcome, CacheError>> + Send;
@@ -297,10 +299,11 @@ impl Drive for FilenMobileCacheState {
 	fn fitted_thumbnail(
 		&self,
 		id: &FfiId,
+		version: Uuid,
 		max_side: u32,
 		cancel: &Arc<AtomicBool>,
 	) -> impl Future<Output = Result<FittedOutcome, CacheError>> + Send {
-		FilenMobileCacheState::fitted_thumbnail(self, id, max_side, cancel)
+		FilenMobileCacheState::fitted_thumbnail(self, id, version, max_side, cancel)
 	}
 
 	fn cached_fitted_thumbnail(

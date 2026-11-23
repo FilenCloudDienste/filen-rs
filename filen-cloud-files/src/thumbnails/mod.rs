@@ -336,14 +336,15 @@ enum Plan {
 		id: LocalFileId,
 		key: Bytes,
 	},
-	/// The drive's file, by its `stable/<uuid>` id.
-	Remote { id: FfiId, key: Bytes },
+	/// The drive's file, by its `stable/<uuid>` id, at the version `version` its placeholder names.
+	Remote { id: FfiId, version: Uuid },
 }
 
 impl Plan {
-	fn key(&self) -> &Bytes {
+	fn key(&self) -> Bytes {
 		match self {
-			Self::Local { key, .. } | Self::Remote { key, .. } => key,
+			Self::Local { key, .. } => *key,
+			Self::Remote { version, .. } => Bytes::Remote { version: *version },
 		}
 	}
 
@@ -936,7 +937,7 @@ impl<L: LocalFs, D: Drive> ThumbnailService<L, D> {
 		until: Instant,
 	) -> (Asked, Result<Thumbnail, ThumbnailRefusal>) {
 		let made_at = work.made_at;
-		let bytes = *work.plan.key();
+		let bytes = work.plan.key();
 		let key = (bytes, made_at);
 		let kept = self.best_kept(bytes, made_at, &work.drive).await;
 		let remembered = self.lane.remembered(&key);
@@ -1317,7 +1318,7 @@ impl<L: LocalFs, D: Drive> Lane<L, D> {
 	/// still served. One the cache did not keep is not told: the ask that followed would find
 	/// nothing kept, be answered Pending again and be told again, a loop with no end.
 	async fn tell(self: &Arc<Self>, work: &Work<L, D>) {
-		let key = (*work.plan.key(), work.made_at);
+		let key = (work.plan.key(), work.made_at);
 		if self.kept(&key, &work.drive).await.is_none() {
 			debug!(
 				"a thumbnail finished in the background was not kept; not telling File Explorer"
@@ -1353,7 +1354,7 @@ impl<L: LocalFs, D: Drive> Lane<L, D> {
 		if state.generation != work.generation {
 			return;
 		}
-		let bytes = *work.plan.key();
+		let bytes = work.plan.key();
 		if state.burst.told_or_owed(&bytes) {
 			return;
 		}
@@ -1548,7 +1549,11 @@ impl<L: LocalFs, D: Drive> Work<L, D> {
 					.fitted_thumbnail_of_local(source, &name, self.made_at, cancel)
 					.await
 			}
-			Plan::Remote { id, .. } => self.drive.fitted_thumbnail(id, self.made_at, cancel).await,
+			Plan::Remote { id, version } => {
+				self.drive
+					.fitted_thumbnail(id, *version, self.made_at, cancel)
+					.await
+			}
 		};
 		match outcome {
 			Ok(FittedOutcome::Thumbnail(thumbnail)) => Finished::Made(Arc::new(thumbnail)),
@@ -1631,10 +1636,7 @@ async fn plan<L: LocalFs>(local: &Arc<L>, at: &RootPath) -> Result<Plan, Thumbna
 						let id = identity
 							.cache_id()
 							.ok_or(ThumbnailRefusal::NotAPlaceholder)?;
-						Ok(Plan::Remote {
-							id,
-							key: Bytes::Remote { version },
-						})
+						Ok(Plan::Remote { id, version })
 					} else {
 						// Edited locally and not all on disk: neither side holds the bytes the
 						// file shows, and reading them would hydrate it.

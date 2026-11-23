@@ -1891,10 +1891,12 @@ impl Drive for FakeDrive {
 	/// Decodes the file's bytes as the cache would, under a fixed 16 MiB budget; the name gate is
 	/// left to the local variant, as the bytes' format decides here.
 	/// A thumbnail made is kept by the file's version, as the cache keeps it; one the gate held
-	/// fails as unreachable when the drive went offline meanwhile, as a download cut off does.
+	/// fails as unreachable when the drive went offline meanwhile, as a download cut off does. A
+	/// file held at another version than `expected` is refused as the cache refuses it.
 	async fn fitted_thumbnail(
 		&self,
 		id: &FfiId,
+		expected: Uuid,
 		max_side: u32,
 		cancel: &Arc<AtomicBool>,
 	) -> Result<FittedOutcome, CacheError> {
@@ -1915,6 +1917,11 @@ impl Drive for FakeDrive {
 					.map(|content| (content.version, content.bytes.to_vec()))
 			})
 			.ok_or_else(|| CacheError::DoesNotExist("the drive holds no such file".into()))?;
+		if version != expected {
+			return Err(CacheError::DoesNotExist(
+				"the drive holds another version of the file".into(),
+			));
+		}
 		let outcome = encode_fitted(Box::new(MemSource(bytes)), &thumbnail_spec(max_side))
 			.map_err(CacheError::from)?;
 		if let FittedOutcome::Thumbnail(thumbnail) = &outcome {

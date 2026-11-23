@@ -220,9 +220,12 @@ async fn store_fitted(dir: &Path, name: &str, webp: &[u8]) -> Result<(), CacheEr
 
 // Rust-only: not exported through UniFFI. The cropped `get_thumbnail` above is unchanged.
 impl FilenMobileCacheState {
-	/// The thumbnail of the file `item` names, fitted inside a `max_side` pixel square with its
-	/// aspect ratio kept (where [`FilenMobileCacheState::get_thumbnail`] crops to fill the box), made
-	/// from the remote file's chunks and kept in the thumbnail cache beside the cropped sizes.
+	/// The thumbnail of the version `version` of the file `item` names, fitted inside a `max_side`
+	/// pixel square with its aspect ratio kept (where [`FilenMobileCacheState::get_thumbnail`] crops
+	/// to fill the box), made from the remote file's chunks and kept in the thumbnail cache beside the
+	/// cropped sizes. When the cache resolves `item` to another version, nothing is made and the call
+	/// fails with [`CacheError::DoesNotExist`]: the caller's thumbnail is keyed by `version`, and
+	/// another version's pixels would be answered and kept under the wrong key.
 	///
 	/// The cache state is locked only while the id is resolved, as in
 	/// [`FilenMobileCacheState::read_file_range`]: the decode runs on the client the state held then,
@@ -231,6 +234,7 @@ impl FilenMobileCacheState {
 	pub async fn fitted_thumbnail(
 		&self,
 		item: &FfiId,
+		version: Uuid,
 		max_side: u32,
 		cancel: &Arc<AtomicBool>,
 	) -> Result<FittedOutcome, CacheError> {
@@ -244,6 +248,15 @@ impl FilenMobileCacheState {
 				Ok((Arc::clone(&auth_state.client), file, dir))
 			})
 			.await?;
+		if file.uuid() != version {
+			return Err(CacheError::DoesNotExist(
+				format!(
+					"the cache holds version {} of the file, not {version}",
+					file.uuid()
+				)
+				.into(),
+			));
+		}
 		// From the name and the stored mime, as `get_or_make_thumbnail` decides.
 		if !might_be_thumbnailable(file.name(), file.mime()) {
 			return Ok(FittedOutcome::Unsupported);
