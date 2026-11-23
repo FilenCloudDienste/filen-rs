@@ -124,6 +124,12 @@ required-features = ["test-seams"]
 name = "vm_harness"
 required-features = ["test-seams"]
 
+# Logs into the test account for the VM checks of the shipping helper: seeds a test directory and
+# writes the session the helper's setAuth takes to a private file, which no one reads.
+[[example]]
+name = "vm_session"
+required-features = ["test-seams"]
+
 # Stands in for the desktop app as the program File Explorer's context menu commands start, for the
 # VM harness's checks: records the command line it was given. Std only.
 [[example]]
