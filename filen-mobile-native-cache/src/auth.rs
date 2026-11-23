@@ -481,9 +481,10 @@ pub struct AuthFile {
 	pub max_thumbnail_files_budget: Option<u64>,
 	#[serde(default)]
 	pub max_cache_files_budget: Option<u64>,
-	/// Thumbnail policy. Absent means the file-provider extension's tuned values (see
-	/// [`thumbnail_client_config`]); the SDK's own defaults are sized for a whole app process
-	/// and would not survive this extension's jetsam ceiling.
+	/// Thumbnail policy, in bytes. Absent means this target's default
+	/// ([`DEFAULT_THUMBNAIL_MEM_BUDGET_FOR_TARGET`]: the extension's 12 MiB on macOS, iOS and
+	/// Android, 256 MiB for the desktop helper on Windows and Linux; see
+	/// [`thumbnail_client_config`]). A value set here wins on every target.
 	#[serde(default)]
 	pub thumbnail_mem_budget: Option<u64>,
 	#[serde(default)]
@@ -496,23 +497,67 @@ pub struct AuthFile {
 	pub thumbnail_item_concurrency: Option<u32>,
 }
 
-/// The extension decodes under the SAFE preset, not the SDK's app-process default: it has ~20 MB
-/// before jetsam, so ONE 12 MiB decode at a time is all that fits — and this gate also covers the
-/// single-item `get_thumbnail` path (Android's only route). auth.json may raise either. On macOS
-/// it also halves the file I/O budget.
+/// The kind of process the cache decodes thumbnails in, which decides its default memory budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ThumbnailHost {
+	/// A process under a tight memory ceiling: the iOS and macOS file-provider extensions (an iOS
+	/// one has about 20 MB before jetsam) and Android's provider.
+	Extension,
+	/// The desktop helper process on Windows and Linux, which has no extension memory ceiling.
+	DesktopHelper,
+}
+
+impl ThumbnailHost {
+	/// The host this build runs in.
+	const CURRENT: Self = if cfg!(any(target_os = "windows", target_os = "linux")) {
+		Self::DesktopHelper
+	} else {
+		Self::Extension
+	};
+
+	/// The thumbnail memory budget this host decodes under when auth.json sets none, in bytes.
+	const fn default_mem_budget(self) -> usize {
+		match self {
+			Self::Extension => DEFAULT_THUMBNAIL_MEM_BUDGET,
+			Self::DesktopHelper => 256 * 1024 * 1024,
+		}
+	}
+}
+
+/// The thumbnail memory budget when auth.json sets none, in bytes: 256 MiB on Windows and Linux,
+/// microthumb's 12 MiB (sized for the iOS extension's jetsam ceiling) everywhere else.
+///
+/// A desktop helper process has no extension memory ceiling, and the small budget costs it most
+/// images: an untiled HEIF or AVIF is charged about 12 bytes per pixel when it is 8-bit or its
+/// chroma is 4:2:0, so 12 MiB shrinks or refuses anything above about 0.7 MP, while 256 MiB covers
+/// about 20 MP. One deeper than 8 bits at 4:2:2 or 4:4:4, or of a format the decoder cannot tell,
+/// is charged 20 bytes per pixel, so 256 MiB covers about 13 MP of it.
+const DEFAULT_THUMBNAIL_MEM_BUDGET_FOR_TARGET: usize = ThumbnailHost::CURRENT.default_mem_budget();
+
+/// The thumbnail memory budget for a `configured` auth.json value, `default` when it is absent.
+fn thumbnail_mem_budget(configured: Option<u64>, default: usize) -> usize {
+	configured.map_or(default, |budget| {
+		// Same floor `JsClientConfig` applies to the same knob, for the same reason: the remote
+		// path subtracts the chunk source's two resident slots, so a budget at or below that
+		// saturates to 0 and refuses every REMOTE thumbnail while local ones keep working — a
+		// silent, half-broken state a host cannot see.
+		usize::try_from(budget)
+			.unwrap_or(usize::MAX)
+			.max(2 * REMOTE_SOURCE_RESIDENT_BYTES)
+	})
+}
+
+/// The cache decodes under its own budget, not the SDK's app-process default: an extension has
+/// ~20 MB before jetsam, so ONE 12 MiB decode at a time is all that fits there, while the desktop
+/// helper on Windows and Linux gets 256 MiB (see [`DEFAULT_THUMBNAIL_MEM_BUDGET_FOR_TARGET`]),
+/// still one decode at a time. This gate also covers the single-item `get_thumbnail` path
+/// (Android's only route). auth.json may set either on every target. On macOS it also halves the
+/// file I/O budget.
 fn thumbnail_client_config(settings: &AuthFile) -> ClientConfig {
 	let mut config = ClientConfig::default()
-		.with_thumbnail_mem_budget(settings.thumbnail_mem_budget.map_or(
-			DEFAULT_THUMBNAIL_MEM_BUDGET,
-			|budget| {
-				// Same floor `JsClientConfig` applies to the same knob, for the same reason:
-				// the remote path subtracts the chunk source's two resident slots, so a budget
-				// at or below that saturates to 0 and refuses every REMOTE thumbnail while
-				// local ones keep working — a silent, half-broken state a host cannot see.
-				usize::try_from(budget)
-					.unwrap_or(usize::MAX)
-					.max(2 * REMOTE_SOURCE_RESIDENT_BYTES)
-			},
+		.with_thumbnail_mem_budget(thumbnail_mem_budget(
+			settings.thumbnail_mem_budget,
+			DEFAULT_THUMBNAIL_MEM_BUDGET_FOR_TARGET,
 		))
 		// 0 is floored to 1 by the SDK, so no clamp here.
 		.with_thumbnail_decode_concurrency(
@@ -2067,5 +2112,63 @@ mod session_refresh_tests {
 		session.recheck().await;
 
 		assert_eq!(session.unauth_reason(), Some("disabled"));
+	}
+}
+
+#[cfg(test)]
+mod thumbnail_budget_tests {
+	use filen_sdk_rs::thumbnail::REMOTE_SOURCE_RESIDENT_BYTES;
+
+	use super::{DEFAULT_THUMBNAIL_MEM_BUDGET_FOR_TARGET, ThumbnailHost, thumbnail_mem_budget};
+
+	const MIB: usize = 1024 * 1024;
+
+	#[test]
+	fn the_desktop_helper_defaults_to_256_mib() {
+		assert_eq!(
+			thumbnail_mem_budget(None, ThumbnailHost::DesktopHelper.default_mem_budget()),
+			256 * MIB
+		);
+	}
+
+	#[test]
+	fn an_extension_defaults_to_12_mib() {
+		assert_eq!(
+			thumbnail_mem_budget(None, ThumbnailHost::Extension.default_mem_budget()),
+			12 * MIB
+		);
+	}
+
+	#[test]
+	fn a_configured_budget_wins_on_every_host() {
+		for host in [ThumbnailHost::Extension, ThumbnailHost::DesktopHelper] {
+			assert_eq!(
+				thumbnail_mem_budget(Some(64 << 20), host.default_mem_budget()),
+				64 * MIB,
+				"{host:?}"
+			);
+		}
+	}
+
+	#[test]
+	fn a_configured_budget_below_the_floor_is_raised_to_it_on_every_host() {
+		for host in [ThumbnailHost::Extension, ThumbnailHost::DesktopHelper] {
+			assert_eq!(
+				thumbnail_mem_budget(Some(0), host.default_mem_budget()),
+				2 * REMOTE_SOURCE_RESIDENT_BYTES,
+				"{host:?}"
+			);
+		}
+	}
+
+	#[test]
+	fn windows_and_linux_build_for_the_desktop_helper_and_the_rest_for_an_extension() {
+		let (host, budget) = if cfg!(any(target_os = "windows", target_os = "linux")) {
+			(ThumbnailHost::DesktopHelper, 256 * MIB)
+		} else {
+			(ThumbnailHost::Extension, 12 * MIB)
+		};
+		assert_eq!(ThumbnailHost::CURRENT, host);
+		assert_eq!(DEFAULT_THUMBNAIL_MEM_BUDGET_FOR_TARGET, budget);
 	}
 }
