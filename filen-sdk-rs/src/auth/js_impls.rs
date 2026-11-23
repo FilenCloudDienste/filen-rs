@@ -158,6 +158,7 @@ impl JsClient {
 		all(target_family = "wasm", target_os = "unknown"),
 		wasm_bindgen(js_name = "setRequestRateLimit")
 	)]
+	#[napi_export]
 	pub async fn set_request_rate_limit(&self, requests_per_sec: u32) -> Result<(), Error> {
 		let this = self.inner();
 
@@ -178,6 +179,7 @@ impl JsClient {
 	/// Note the asymmetry with construction: `upload_bandwidth_kilobytes_per_sec` values in
 	/// 1..16 are rejected as an error there, while this runtime setter silently clamps them.
 	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	#[napi_export]
 	pub async fn set_bandwidth_limits(&self, upload_kbps: u32, download_kbps: u32) {
 		let upload_kbps = NonZeroU32::new(upload_kbps);
 		let download_kbps = NonZeroU32::new(download_kbps);

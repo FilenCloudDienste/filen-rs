@@ -578,6 +578,9 @@ describe("UnauthJsClient", () => {
 		assert.equal(typeof client.health, "function")
 		assert.equal(typeof JsClient.prototype.health, "function")
 		assert.equal(typeof JsClient.prototype.reconnectSocket, "function")
+		for (const setter of ["setRequestRateLimit", "setBandwidthLimits"]) {
+			assert.equal(typeof JsClient.prototype[setter], "function", setter)
+		}
 	})
 
 	test("fromConfig throws a FilenSdkError the way ubrn throws it", () => {
