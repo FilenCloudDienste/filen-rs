@@ -19,6 +19,8 @@ mod meta_changes;
 pub(crate) mod napi;
 #[cfg(any(feature = "wasm-full", feature = "uniffi", feature = "napi"))]
 mod params;
+#[cfg(all(feature = "wasm-full", target_family = "wasm", target_os = "unknown"))]
+pub(crate) mod port_channel;
 #[cfg(any(feature = "wasm-full", feature = "uniffi", feature = "napi"))]
 mod returned_types;
 #[cfg(all(target_family = "wasm", target_os = "unknown",))]

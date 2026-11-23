@@ -365,16 +365,16 @@ impl Frames {
 /// the stream's thread answers each once it did it.
 #[cfg(feature = "wasm-full")]
 mod cross_thread {
-	use futures::{
-		StreamExt,
-		channel::mpsc::{UnboundedReceiver, unbounded},
-	};
 	use serde::{Deserialize, Serialize};
-	use wasm_bindgen::{JsCast, JsValue, closure::Closure};
-	use web_sys::{MessageChannel, MessageEvent, MessagePort, js_sys::Uint8Array};
+	use wasm_bindgen::{JsCast, JsValue};
+	use web_sys::{MessagePort, js_sys::Uint8Array};
 
 	use super::{Frames, Gathered, JsStream, StreamFailure, producer_dropped};
-	use crate::{Error, ErrorKind, runtime::PortRequest};
+	use crate::{
+		Error,
+		js::port_channel::{self, PortMessages, broken},
+		runtime::PortRequest,
+	};
 
 	/// What the commander orders the stream's thread to do.
 	enum Order {
@@ -419,56 +419,13 @@ mod cross_thread {
 		Failed(String),
 	}
 
-	/// The messages a port gets, in the order they came, on this thread.
-	struct PortMessages {
-		port: MessagePort,
-		messages: UnboundedReceiver<JsValue>,
-		/// Called by the port with each message for as long as this holds it.
-		_on_message: Closure<dyn FnMut(MessageEvent)>,
-	}
-
-	impl PortMessages {
-		fn new(port: MessagePort) -> Self {
-			let (sender, messages) = unbounded();
-			let on_message = Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
-				// fails only once this was dropped, which takes the handler off the port first
-				let _ = sender.unbounded_send(event.data());
-			});
-			// which also starts the port
-			port.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
-			Self {
-				port,
-				messages,
-				_on_message: on_message,
-			}
-		}
-
-		async fn next(&mut self) -> JsValue {
-			self.messages.next().await.expect(
-				"the port's handler, which this holds, holds the sender (should be impossible)",
-			)
-		}
-	}
-
-	impl Drop for PortMessages {
-		fn drop(&mut self) {
-			self.port.set_onmessage(None);
-		}
-	}
-
 	impl Frames {
 		/// Hands the chunks to the thread that made `request`, over a `MessageChannel` whose port
 		/// goes there, gathering the next once that thread answered it wrote the one before.
 		/// Answers how the stream ended.
 		pub(super) async fn hand_over(mut self, request: PortRequest) -> Result<(), Error> {
-			// Neither fails short of the browser refusing a new channel, or the transfer of a port
-			// it just made, and the stream's thread is then never told: its stream stays open.
-			let channel = MessageChannel::new()
-				.map_err(|e| broken(format!("failed to open the stream's channel: {e:?}")))?;
-			request
-				.send(channel.port2())
-				.map_err(|e| broken(format!("failed to send the stream's port: {e:?}")))?;
-			let mut answers = PortMessages::new(channel.port1());
+			// Should it fail, the stream's thread is never told: its stream stays open.
+			let mut answers = port_channel::open(request)?;
 			let result = loop {
 				let (order, expected) = match self.next().await {
 					// copied out of wasm memory, into a buffer of the message's own
@@ -479,7 +436,7 @@ mod cross_thread {
 					Gathered::Done => (Order::Close, Expected::Closed),
 					Gathered::Dropped => (Order::Abort, Expected::Aborted),
 				};
-				if let Err(e) = order.post(&answers.port) {
+				if let Err(e) = order.post(answers.port()) {
 					break Err(broken(format!(
 						"failed to send the stream's thread an order: {e:?}"
 					)));
@@ -493,14 +450,14 @@ mod cross_thread {
 					// Any other pairing breaks the exchange. The abort keeps the stream from being
 					// left open, should the stream's thread still take orders.
 					(_, _) => {
-						let _ = Order::Abort.post(&answers.port);
+						let _ = Order::Abort.post(answers.port());
 						break Err(broken(
 							"the stream's thread answered out of turn".to_owned(),
 						));
 					}
 				}
 			};
-			answers.port.close();
+			answers.port().close();
 			result
 		}
 	}
@@ -512,12 +469,6 @@ mod cross_thread {
 		Aborted,
 	}
 
-	/// The error for an exchange with the stream's thread that broke down, which only a browser
-	/// refusing what a `MessageChannel` takes can do.
-	fn broken(message: String) -> Error {
-		Error::custom(ErrorKind::Internal, message)
-	}
-
 	impl<P: Fn(u64)> JsStream<P> {
 		/// Does what the commander orders over `port`, answering each order, until the close or
 		/// the abort.
@@ -526,7 +477,7 @@ mod cross_thread {
 			let answer = loop {
 				match Order::from_js(orders.next().await) {
 					Order::Write(chunk) => match self.write(chunk).await {
-						Ok(()) => post_answer(&orders.port, &Answer::Written),
+						Ok(()) => post_answer(orders.port(), &Answer::Written),
 						Err(failure) => break Answer::Failed(failure.0),
 					},
 					Order::Close => {
@@ -541,7 +492,7 @@ mod cross_thread {
 					}
 				}
 			};
-			post_answer(&orders.port, &answer);
+			post_answer(orders.port(), &answer);
 		}
 	}
 
