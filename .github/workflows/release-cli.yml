@@ -192,7 +192,9 @@ jobs:
         run: |
           # make sure the version exists in the changelog and the job fails otherwise
           parse-changelog filen-cli/CHANGELOG.md $version
-          printf "## $(parse-changelog filen-cli/CHANGELOG.md $version --title)\n\n$(parse-changelog filen-cli/CHANGELOG.md $version)" > filen-cli/release_notes.md
+          # the changelog goes in as arguments, not as the format, where a `%` or `\` in it
+          # would be read as a directive or an escape
+          printf '## %s\n\n%s' "$(parse-changelog filen-cli/CHANGELOG.md $version --title)" "$(parse-changelog filen-cli/CHANGELOG.md $version)" > filen-cli/release_notes.md
 
       # add link to git tag in release notes header
       - name: Add tag link to release notes
