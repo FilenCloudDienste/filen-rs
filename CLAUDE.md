@@ -189,6 +189,13 @@ desktop addon (`build:napi` enables both). Likewise `rclone` with either binding
 rclone daemon's (`rclone::js_impl`): `build:napi` enables it, and so does the parity check's
 uniffi reference, which the mobile build leaves out.
 
+`filen-cloud-files` (no default features):
+
+| Feature | What it enables |
+|---------|-----------------|
+| `test-seams` | Test-only: exposes the fake drive, the fake OS and platform and the in-memory key store (`test_support`), and gates the live `cloud_files_live` suite, the offline `helper_secrets` check and the Windows VM harness examples — never in a shipping build |
+| `heif-decoder` | HEIC, HEIF and AVIF thumbnails for File Explorer, through `filen-mobile-native-cache/heif-decoder` (the vendored libheif, libde265 and dav1d, so the native build prerequisites below). Off by default, so package-scoped builds and the hooks need no C++ toolchain; the desktop app's helper build turns it on |
+
 ## Git Hooks
 
 Hooks live in `scripts/git-hooks/` and are required. Claude Code sessions install them
@@ -343,6 +350,7 @@ gnullvm exe still needs llvm-mingw's `libunwind.dll` beside it, as without the f
 | `test-utils` | Shared integration test infrastructure (accounts, cleanup, async runtime) |
 | `uniffi-bindgen` / `uniffi-bindgen-swift` | Thin wrappers to drive UniFFI codegen for Kotlin and Swift |
 | `filen-cli` | CLI tool for interacting with Filen drive |
+| `filen-cloud-files` | Windows files-on-demand provider on the Cloud Files API (cfapi): the platform-independent core (placeholders, hydration, local and remote changes) on the cache crate, the Windows layer (`src/os/win/`) and the `filen-cloud-files` helper binary the desktop app spawns; the core's tests run on fakes on every host |
 
 `ruzstd` is pinned by rev to upstream main (`filen-sdk-rs/Cargo.toml`, 91a3a6eb4), not a crates.io
 release: upstream's fix for bounding each block's decoded size, including a block's literals with

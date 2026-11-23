@@ -12,6 +12,10 @@ metadata.workspaces = { independent = true }
 # Test-only: exposes the fake drive, the fake OS and the in-memory key store, and gates the live
 # tests, which log into the test account, and the Windows VM harness. Never in a shipping build.
 test-seams = []
+# HEIC, HEIF and AVIF thumbnails, through the cache's vendored libheif, libde265 and dav1d. Not a
+# default: it builds that C and C++ from source (cmake, meson, ninja, and nasm on x86), so the
+# desktop's helper build turns it on, and package-scoped builds and the hooks stay without it.
+heif-decoder = ["filen-mobile-native-cache/heif-decoder"]
 
 [dependencies]
 filen-mobile-native-cache = { path = "../filen-mobile-native-cache" }
