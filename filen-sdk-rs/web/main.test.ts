@@ -42,6 +42,7 @@ import init, {
 	archiveMaxLevel
 } from "./sdk-rs.js"
 import { expect, beforeAll, test, afterAll, afterEach, vi } from "vitest"
+import { server } from "vitest/browser"
 import { ZipReader, Uint8ArrayWriter, type Entry } from "@zip.js/zip.js"
 
 console.log("Initializing WASM...")
@@ -3362,6 +3363,83 @@ test("streamed downloads take no lock on the page's thread that their workers ho
 	expect(pageErrors).toStrictEqual([])
 	expect(reports.length).toBeGreaterThan(0)
 	expect(reports.filter(([error, written]) => error !== undefined || written !== size)).toStrictEqual([])
+})
+
+/// The page's thread may not wait on a lock (see the test above), and a stream the SDK reads for an
+/// upload or a thumbnail is read there, the commander worker taking what it reads. Sixteen
+/// thumbnails at a time are made from streams that hand out 4 MiB a pull, which the page reads a
+/// buffer at a time without waiting for the source, about as fast as the commander takes the
+/// buffers, so the page keeps finding the commander's channel full while the commander empties it,
+/// and any error the page throws meanwhile fails the test. The two reach for one lock at once
+/// often, but the page only waits when the commander holds it long, which is rare, so this runs for
+/// 60 s or 1024 calls a lane, whichever comes first (a lane got through about 700 in 60 s here), so
+/// that a fast host does not stream more through one page than it can take (a page that streams too
+/// much runs out of its externref table, see the test above). Even so it catches a page that takes
+/// the lock only about every other run, so one green run proves little. Only Chromium runs it:
+/// Firefox allows the wait, so it cannot fail there, and WebKit, which forbids it too, was never
+/// seen to lose this race, while the garbage of this many reads takes its page past 2 GB, where it
+/// was killed in half the runs that followed the test above. Thumbnails rather than uploads:
+/// `uploadFileFromReader` reads through the same pump, without the network between one buffer and
+/// the next.
+test.runIf(server.browser === "chromium")("streams read on the page's thread take no lock that the commander holds", async () => {
+	const thumbnails = UnauthClient.from_config({ thumbnailDecodeConcurrency: 16 })
+	const size = 16 * 1024 * 1024
+	const pull = 4 * 1024 * 1024
+
+	const pageErrors: unknown[] = []
+	let pageFailed: () => void = () => {}
+	const failure = new Promise<void>(resolve => {
+		pageFailed = resolve
+	})
+	const onError = (event: ErrorEvent) => {
+		pageErrors.push(event.error ?? event.message)
+		pageFailed()
+	}
+	const onRejection = (event: PromiseRejectionEvent) => {
+		pageErrors.push(event.reason)
+		pageFailed()
+	}
+	addEventListener("error", onError)
+	addEventListener("unhandledrejection", onRejection)
+	// a page that trapped never finishes the call it trapped in, which this cancels
+	const abort = new AbortController()
+	const verdicts: string[] = []
+	const until = Date.now() + 60_000
+	const lane = async () => {
+		for (let calls = 0; calls < 1024 && Date.now() < until && pageErrors.length === 0; calls++) {
+			let left = size
+			const reader = new ReadableStream<Uint8Array>({
+				pull(controller) {
+					if (left === 0) {
+						controller.close()
+						return
+					}
+					controller.enqueue(new Uint8Array(pull))
+					left -= pull
+				}
+			})
+			const result = await thumbnails.makeThumbnailFromStream({
+				reader,
+				knownSize: size,
+				maxWidth: 64,
+				maxHeight: 64,
+				managedFuture: { abortSignal: abort.signal }
+			})
+			verdicts.push(result.type)
+		}
+	}
+	try {
+		await Promise.race([Promise.all(Array.from({ length: 16 }, lane)), failure])
+	} finally {
+		abort.abort()
+		removeEventListener("error", onError)
+		removeEventListener("unhandledrejection", onRejection)
+	}
+
+	expect(pageErrors).toStrictEqual([])
+	expect(verdicts.length).toBeGreaterThan(0)
+	// zeros are no image format
+	expect(new Set(verdicts)).toStrictEqual(new Set(["unsupported"]))
 })
 
 test("extractArchiveEntries extracts the entries chosen below a base, one again into a retry's directory, and refuses a bad call", async () => {

@@ -1025,6 +1025,14 @@ mod commander_thread {
 		pub(crate) fn new(value: T) -> Self {
 			Self(Some(value))
 		}
+
+		/// Takes the value back, on the commander, to drop it where it is: dropping this on the
+		/// commander would hand it to the commander again, which a worker may not do (see above).
+		pub(crate) fn into_inner(mut self) -> T {
+			self.0
+				.take()
+				.expect("only Drop and this take the value (should be impossible)")
+		}
 	}
 
 	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
@@ -1034,7 +1042,7 @@ mod commander_thread {
 		fn deref(&self) -> &T {
 			self.0
 				.as_ref()
-				.expect("only Drop takes the value (should be impossible)")
+				.expect("only Drop and `into_inner` take the value (should be impossible)")
 		}
 	}
 
@@ -1266,7 +1274,11 @@ mod worker_ports {
 
 	/// Asks for a port: a worker this thread spawned sends it with the returned request, and
 	/// `on_port` gets it here, or gets `None` should the request be dropped unsent on this thread.
-	/// A request dropped unsent on another thread is lost, and `on_port` never called.
+	/// A request dropped unsent on another thread is lost, and `on_port` never called, as it is
+	/// when a worker this thread did not spawn sends the port: the port goes to that worker's
+	/// parent, which closes it. Either way `on_port`, and all it owns, stays waiting here for good:
+	/// a thread asks only a worker it spawned, as the stream bridges ask the commander only on the
+	/// thread that spawned it.
 	pub(crate) fn port_from_worker(
 		on_port: impl FnOnce(Option<MessagePort>) + 'static,
 	) -> PortRequest {

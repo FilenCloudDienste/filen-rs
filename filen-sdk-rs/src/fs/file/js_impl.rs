@@ -26,10 +26,10 @@ use futures::AsyncRead;
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 use wasm_bindgen::prelude::JsValue;
 
-/// The bytes of a JS `ReadableStream`, which a task on the calling thread pumps into `receiver`
-/// because the stream cannot be moved to the commander. A read error arrives in-band as the last
-/// item and is returned as one, so the upload fails rather than taking the closed channel for the
-/// end of the stream and finishing a truncated file.
+/// The bytes of a JS `ReadableStream`, which a task on the calling thread reads because the stream
+/// cannot be moved to the commander, and the commander puts into `receiver` (`spawn_stream_pump`).
+/// A read error arrives in-band as the last item and is returned as one, so the upload fails rather
+/// than taking the closed channel for the end of the stream and finishing a truncated file.
 #[cfg(any(all(target_family = "wasm", target_os = "unknown"), test))]
 struct StreamReader {
 	receiver: tokio::sync::mpsc::Receiver<Result<Vec<u8>, Error>>,
@@ -98,15 +98,17 @@ impl JsClient {
 
 		let file = params
 			.managed_future
-			.into_js_managed_commander_future(move || async move {
+			.into_js_managed_commander_future(move || {
 				let mut reader = StreamReader {
-					receiver: data_receiver,
+					// on the commander, which drops it
+					receiver: data_receiver.into_inner(),
 					leftover: Bytes::new(),
 				};
-
-				let builder = params.file_builder_params.into_file_builder(&this)?;
-				this.upload_file_from_reader(builder, &mut reader, None, params.known_size)
-					.await
+				async move {
+					let builder = params.file_builder_params.into_file_builder(&this)?;
+					this.upload_file_from_reader(builder, &mut reader, None, params.known_size)
+						.await
+				}
 			})?
 			.await?;
 

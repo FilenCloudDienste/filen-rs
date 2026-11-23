@@ -1455,7 +1455,7 @@ mod js_impls {
 	#[cfg(any(all(target_family = "wasm", target_os = "unknown"), feature = "uniffi"))]
 	use super::{ThumbnailFit, locate_embedded_preview, make_thumbnail_from_source};
 	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
-	use crate::js::stream_pump::spawn_stream_pump;
+	use crate::js::stream_pump::{PumpedChunks, spawn_stream_pump};
 	use crate::{
 		Error,
 		auth::{JsClient, js_impls::UnauthJsClient, shared_client::SharedClient},
@@ -1754,14 +1754,12 @@ mod js_impls {
 	// is a `ReadableStream`, and both calls below start by draining one.
 	// -----------------------------------------------------------------------
 
-	/// Pumps a JS `ReadableStream` into a channel from the CALLING thread
-	/// ([`spawn_stream_pump`], as `uploadFileFromReader` does). A consumer
-	/// that settled its verdict early drops the receiver, and the pump ends
-	/// with it.
+	/// Pumps a JS `ReadableStream` into a channel the commander takes out
+	/// of the result ([`spawn_stream_pump`], as `uploadFileFromReader` does).
+	/// A consumer that settled its verdict early drops the receiver, and the
+	/// pump ends with it.
 	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
-	fn stream_chunks(
-		reader: web_sys::ReadableStream,
-	) -> Result<tokio::sync::mpsc::Receiver<Result<Vec<u8>, Error>>, Error> {
+	fn stream_chunks(reader: web_sys::ReadableStream) -> Result<PumpedChunks, Error> {
 		spawn_stream_pump(reader, None, None::<fn(u64)>)
 	}
 
@@ -1848,7 +1846,7 @@ mod js_impls {
 	where
 		C: SharedClient + Send + Sync + 'static,
 	{
-		let mut chunks = stream_chunks(params.reader)?;
+		let chunks = stream_chunks(params.reader)?;
 		let (max_width, max_height, known_size, lossy_quality) = (
 			params.max_width,
 			params.max_height,
@@ -1858,37 +1856,42 @@ mod js_impls {
 
 		params
 			.managed_future
-			.into_js_managed_commander_future(move || async move {
-				let thumbnails = client.get_unauth_client().thumbnails();
-				// Held from BEFORE the buffering to after the decode. On wasm the
-				// buffer is the bigger half of what a call costs and linear memory
-				// is never returned to the host, so a gate that only covered the
-				// decode would bound nothing: N concurrent callers would each park
-				// `max_source_bytes` on the one commander thread.
-				let decode_permit = thumbnails.decode_permit().await;
-				let buf =
-					buffer_source_stream(&mut chunks, known_size, thumbnails.max_source_bytes)
+			.into_js_managed_commander_future(move || {
+				// on the commander, which drops it
+				let mut chunks = chunks.into_inner();
+				async move {
+					let thumbnails = client.get_unauth_client().thumbnails();
+					// Held from BEFORE the buffering to after the decode. On wasm the
+					// buffer is the bigger half of what a call costs and linear memory
+					// is never returned to the host, so a gate that only covered the
+					// decode would bound nothing: N concurrent callers would each park
+					// `max_source_bytes` on the one commander thread.
+					let decode_permit = thumbnails.decode_permit().await;
+					let buf =
+						buffer_source_stream(&mut chunks, known_size, thumbnails.max_source_bytes)
+							.await?;
+					// `spec_in_memory`, not `spec_local`: the buffer stays resident
+					// under the decode, so it comes off the budget the way a remote
+					// source's chunk slots do. What is left bounds the DECODE.
+					let spec = thumbnails.spec_in_memory(max_width, max_height, buf.len());
+					let workers = thumbnails.decode_concurrency();
+					let (outcome, webp_data) =
+						local_decode_job(&decode_permit, workers, move || {
+							let mut webp = Vec::new();
+							let outcome = make_thumbnail_from_source(
+								Box::new(MemSource(buf)),
+								&spec,
+								ThumbnailFit::Contain,
+								lossy_quality,
+								&mut webp,
+							)?;
+							Ok((outcome, webp))
+						})
 						.await?;
-				// `spec_in_memory`, not `spec_local`: the buffer stays resident
-				// under the decode, so it comes off the budget the way a remote
-				// source's chunk slots do. What is left bounds the DECODE.
-				let spec = thumbnails.spec_in_memory(max_width, max_height, buf.len());
-				let workers = thumbnails.decode_concurrency();
-				let (outcome, webp_data) = local_decode_job(&decode_permit, workers, move || {
-					let mut webp = Vec::new();
-					let outcome = make_thumbnail_from_source(
-						Box::new(MemSource(buf)),
-						&spec,
-						ThumbnailFit::Contain,
-						lossy_quality,
-						&mut webp,
-					)?;
-					Ok((outcome, webp))
-				})
-				.await?;
-				Ok(MakeThumbnailInMemoryResult::from_outcome(
-					outcome, webp_data,
-				))
+					Ok(MakeThumbnailInMemoryResult::from_outcome(
+						outcome, webp_data,
+					))
+				}
 			})?
 			.await
 	}
@@ -1924,7 +1927,7 @@ mod js_impls {
 		use crate::fs::file::service_worker::MAX_BUFFER_SIZE_BEFORE_FLUSH;
 		use futures::AsyncWriteExt;
 
-		let mut chunks = stream_chunks(params.reader)?;
+		let chunks = stream_chunks(params.reader)?;
 		// The same bridge `writeEmbeddedPreview` uses: frames cross to a local
 		// task that owns the JS stream, so the copy never holds more than one
 		// flush buffer on top of the source buffer.
@@ -1937,71 +1940,75 @@ mod js_impls {
 
 		params
 			.managed_future
-			.into_js_managed_commander_future(move || async move {
-				let thumbnails = client.get_unauth_client().thumbnails();
-				// Held from BEFORE the buffering to after the copy, for the same
-				// reason the thumbnail path holds it: the buffer, not the locate,
-				// is what this call costs the page.
-				let decode_permit = thumbnails.decode_permit().await;
-				let buf =
-					buffer_source_stream(&mut chunks, known_size, thumbnails.max_source_bytes)
-						.await?;
-				// The locate is what the gate bounds; the buffer comes back out
-				// of the source so the copy can slice it.
-				let workers = thumbnails.decode_concurrency();
-				let (located, buf) = local_decode_job(&decode_permit, workers, move || {
-					let mut source = MemSource(buf);
-					let located = locate_embedded_preview(&mut source)?;
-					Ok((located, source.0))
-				})
-				.await?;
-				if let Some(preview) = &located {
-					for segment in preview.segments() {
-						match segment {
-							PreviewSegment::Source { start, end } => {
-								// The locate answered against these very bytes, so
-								// the range is inside them — checked anyway, since
-								// the alternative to a message is a panic.
-								let slice = usize::try_from(start)
-									.ok()
-									.zip(usize::try_from(end).ok())
-									.and_then(|(start, end)| buf.get(start..end))
-									.ok_or_else(|| {
-										Error::custom(
-											crate::ErrorKind::ImageError,
-											format!(
-												"embedded preview ends at {end}, past the {} bytes buffered",
-												buf.len()
-											),
-										)
-									})?;
-								// One flush buffer at a time. `StreamWriter` never
-								// splits what it is handed — it copies the whole
-								// slice and ships it as one frame, which the
-								// receiving task copies again — so a 25 MB
-								// full-size preview handed over in one call would
-								// cost two more copies of itself. The remote
-								// sibling gets this from its reader; here the
-								// chunking is the reader.
-								for part in slice.chunks(MAX_BUFFER_SIZE_BEFORE_FLUSH) {
-									writer.write_all(part).await?;
+			.into_js_managed_commander_future(move || {
+				// on the commander, which drops it
+				let mut chunks = chunks.into_inner();
+				async move {
+					let thumbnails = client.get_unauth_client().thumbnails();
+					// Held from BEFORE the buffering to after the copy, for the same
+					// reason the thumbnail path holds it: the buffer, not the locate,
+					// is what this call costs the page.
+					let decode_permit = thumbnails.decode_permit().await;
+					let buf =
+						buffer_source_stream(&mut chunks, known_size, thumbnails.max_source_bytes)
+							.await?;
+					// The locate is what the gate bounds; the buffer comes back out
+					// of the source so the copy can slice it.
+					let workers = thumbnails.decode_concurrency();
+					let (located, buf) = local_decode_job(&decode_permit, workers, move || {
+						let mut source = MemSource(buf);
+						let located = locate_embedded_preview(&mut source)?;
+						Ok((located, source.0))
+					})
+					.await?;
+					if let Some(preview) = &located {
+						for segment in preview.segments() {
+							match segment {
+								PreviewSegment::Source { start, end } => {
+									// The locate answered against these very bytes, so
+									// the range is inside them — checked anyway, since
+									// the alternative to a message is a panic.
+									let slice = usize::try_from(start)
+										.ok()
+										.zip(usize::try_from(end).ok())
+										.and_then(|(start, end)| buf.get(start..end))
+										.ok_or_else(|| {
+											Error::custom(
+												crate::ErrorKind::ImageError,
+												format!(
+													"embedded preview ends at {end}, past the {} bytes buffered",
+													buf.len()
+												),
+											)
+										})?;
+									// One flush buffer at a time. `StreamWriter` never
+									// splits what it is handed — it copies the whole
+									// slice and ships it as one frame, which the
+									// receiving task copies again — so a 25 MB
+									// full-size preview handed over in one call would
+									// cost two more copies of itself. The remote
+									// sibling gets this from its reader; here the
+									// chunking is the reader.
+									for part in slice.chunks(MAX_BUFFER_SIZE_BEFORE_FLUSH) {
+										writer.write_all(part).await?;
+									}
 								}
+								PreviewSegment::App1(app1) => writer.write_all(&app1).await?,
 							}
-							PreviewSegment::App1(app1) => writer.write_all(&app1).await?,
 						}
 					}
+					writer.close().await?;
+					// The close sent the Done frame; wait for the JS side to have
+					// taken every byte before answering, or a caller could read the
+					// file back before it is whole.
+					result_receiver.await.unwrap_or_else(|_| {
+						Err(Error::custom(
+							crate::ErrorKind::Cancelled,
+							"preview write task cancelled",
+						))
+					})?;
+					Ok(EmbeddedPreviewResult::from(located))
 				}
-				writer.close().await?;
-				// The close sent the Done frame; wait for the JS side to have
-				// taken every byte before answering, or a caller could read the
-				// file back before it is whole.
-				result_receiver.await.unwrap_or_else(|_| {
-					Err(Error::custom(
-						crate::ErrorKind::Cancelled,
-						"preview write task cancelled",
-					))
-				})?;
-				Ok(EmbeddedPreviewResult::from(located))
 			})?
 			.await
 	}
