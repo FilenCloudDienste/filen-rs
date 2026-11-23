@@ -306,6 +306,20 @@ test("the gateway's health check resolves through the unauthed and the logged-in
 	await state.health()
 })
 
+test("a client's concurrency, memory budget and request rate change live, and a budget too small is rejected", async () => {
+	// a client of its own, so the suite's client keeps its limits
+	const tuned = UnauthClient.from_config({}).fromStringified(await state.toStringified())
+	await tuned.setConcurrency(2)
+	await tuned.setConcurrency(0)
+	await tuned.setFileIoMemoryBudget(64n * 1024n * 1024n)
+	await tuned.setRequestRateLimit(64)
+	const error = await tuned.setFileIoMemoryBudget(1n).catch((e: unknown) => e)
+	expect(error).toBeInstanceOf(FilenSdkError)
+	expect((error as FilenSdkError).kind).toBe("InvalidState")
+	// still sends with its new limits
+	expect((await tuned.listDir(tuned.root())).dirs).toBeDefined()
+})
+
 test("account info", async () => {
 	const info = await state.getUserInfo()
 	expect(info.email).toBe(import.meta.env.VITE_TEST_EMAIL)

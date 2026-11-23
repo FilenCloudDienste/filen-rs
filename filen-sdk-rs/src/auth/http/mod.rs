@@ -55,6 +55,7 @@ mod deserialize;
 mod download_body;
 mod limit;
 mod logging;
+mod resizable;
 mod retry;
 mod serialize;
 #[cfg(all(test, not(all(target_family = "wasm", target_os = "unknown"))))]
@@ -66,6 +67,7 @@ mod url_parser;
 pub(crate) use answers::AnswerMark;
 pub(crate) use answers::ServerAnswers;
 use class_limit::{RequestClass, RequestLimits};
+use resizable::ResizableSemaphore;
 use tower_wasm_time::tps_budget::TpsBudget;
 
 impl Client {
@@ -754,20 +756,19 @@ const MAX_BATCH_WINDOW: Duration = Duration::from_secs(1);
 
 #[derive(Clone)]
 pub(crate) struct SharedClientState {
-	/// The concurrency limits every request is sent under, by [`RequestClass`].
-	limits: RequestLimits,
-	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-	max_concurrency: usize,
+	/// The concurrency limits every request is sent under, by [`RequestClass`]. `Arc`: every
+	/// client sharing this state sends under the same limits, and a resize reaches them all.
+	limits: Arc<RequestLimits>,
 	retry: retry::RetryMapLayer,
 	rate_limiter: limit::GlobalRateLimitLayer,
 	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 	upload_limiter: limit::RateLimiter,
 	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 	download_limiter: DownloadBandwidthLimiterLayer,
-	memory_semaphore: Arc<tokio::sync::Semaphore>,
-	/// The semaphore's initial permit count (bytes). Stored so a stream can size its read-ahead
-	/// against the total budget, which `available_permits()` cannot give.
-	file_io_memory_budget: usize,
+	/// The file-IO memory budget, in bytes: one permit per byte. Its size is the total budget, which
+	/// a stream sizes its read-ahead against and `available_permits()` cannot give. `Arc`: every
+	/// client sharing this state shares the budget, and a resize reaches them all.
+	memory: Arc<ResizableSemaphore>,
 	thumbnails: ThumbnailConfig,
 	#[cfg(feature = "archive")]
 	archives: crate::fs::archive::ArchiveConfig,
@@ -792,37 +793,7 @@ pub(crate) struct SharedClientState {
 
 impl SharedClientState {
 	pub(crate) fn new(config: ClientConfig) -> Result<Self, Error> {
-		// A budget below one full encrypted chunk can never satisfy `Chunk::acquire`, which calls
-		// `acquire_many(chunk_size)` on the memory semaphore: it would await more permits than the
-		// semaphore will ever hold and hang every upload/download forever. Reject it in *every*
-		// build, not only when `http-provider` (with its stricter half-budget rule below) is
-		// compiled in.
-		if config.file_io_memory_budget < FULL_CHUNK_BYTES {
-			return Err(Error::custom(
-				crate::ErrorKind::InvalidState,
-				format!(
-					"file_io_memory_budget ({}) is too small: it must hold at least one chunk \
-					 ({} bytes)",
-					config.file_io_memory_budget, FULL_CHUNK_BYTES
-				),
-			));
-		}
-
-		// The local HTTP provider caps a single stream's read-ahead window at half the shared
-		// memory budget, so one stream can never pin the whole budget and starve a concurrent
-		// download. That cap is meaningless if half the budget cannot hold even one chunk, so
-		// reject such a configuration at construction rather than silently degrade.
-		#[cfg(feature = "http-provider")]
-		if config.file_io_memory_budget / 2 < FULL_CHUNK_BYTES {
-			return Err(Error::custom(
-				crate::ErrorKind::InvalidState,
-				format!(
-					"file_io_memory_budget ({}) is too small: half of it must hold at least one \
-					 chunk ({} bytes)",
-					config.file_io_memory_budget, FULL_CHUNK_BYTES
-				),
-			));
-		}
+		check_memory_budget(config.file_io_memory_budget)?;
 
 		// Built before `config.log_level` is moved out below.
 		let thumbnails = ThumbnailConfig::new(&config);
@@ -855,19 +826,16 @@ impl SharedClientState {
 		};
 
 		Ok(Self {
-			// both clamp the configured concurrency the same way, in `transfer_concurrency`, the
-			// one place every construction path converges on
-			limits: RequestLimits::new(config.concurrency),
-			#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-			max_concurrency: class_limit::transfer_concurrency(config.concurrency),
+			// clamps the configured concurrency in `transfer_concurrency`, the one place every
+			// construction path and `set_concurrency` converge on
+			limits: Arc::new(RequestLimits::new(config.concurrency)),
 			retry: retry::RetryMapLayer::new(retry::RetryPolicy::new(config.retry_budget)),
 			rate_limiter: limit::GlobalRateLimitLayer::new(config.rate_limit_per_sec),
 			#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 			upload_limiter,
 			#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 			download_limiter,
-			memory_semaphore: Arc::new(tokio::sync::Semaphore::new(config.file_io_memory_budget)),
-			file_io_memory_budget: config.file_io_memory_budget,
+			memory: Arc::new(ResizableSemaphore::new(config.file_io_memory_budget)),
 			thumbnails,
 			#[cfg(feature = "archive")]
 			archives,
@@ -902,7 +870,7 @@ impl SharedClientState {
 	}
 
 	pub(crate) fn memory_semaphore(&self) -> &Arc<tokio::sync::Semaphore> {
-		&self.memory_semaphore
+		self.memory.semaphore()
 	}
 
 	pub(crate) fn thumbnails(&self) -> &ThumbnailConfig {
@@ -914,18 +882,70 @@ impl SharedClientState {
 		&self.archives
 	}
 
-	/// Total file-IO memory budget in bytes (the semaphore's initial permit count). The HTTP
-	/// provider and zip downloads split it between a stream's read-ahead and everything else.
+	/// Total file-IO memory budget in bytes (the semaphore's size, as last set). The HTTP
+	/// provider and zip downloads split it between a stream's read-ahead and everything else,
+	/// each when it starts.
 	pub(crate) fn memory_budget(&self) -> usize {
-		self.file_io_memory_budget
+		self.memory.size()
 	}
 
-	/// How many chunk transfers run at once ([`ClientConfig::with_concurrency`], clamped): the
-	/// width transfer jobs fan out to (`io::dir_download`, the sync engine's apply window).
+	/// How many chunk transfers run at once ([`ClientConfig::with_concurrency`], clamped, or as
+	/// last set): the width transfer jobs fan out to (`io::dir_download`, the sync engine's apply
+	/// window), each when it starts.
 	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 	pub(crate) fn max_concurrency(&self) -> usize {
-		self.max_concurrency
+		self.limits.transfer_concurrency()
 	}
+
+	/// See [`Client::set_concurrency`].
+	pub(crate) fn set_concurrency(&self, concurrency: usize) {
+		self.limits.set_concurrency(concurrency);
+	}
+
+	/// See [`Client::set_file_io_memory_budget`]. Budgets above `Semaphore::MAX_PERMITS` count as
+	/// that, as they do in a `JsClientConfig`.
+	pub(crate) fn set_file_io_memory_budget(&self, budget: usize) -> Result<(), Error> {
+		let budget = budget.min(tokio::sync::Semaphore::MAX_PERMITS);
+		check_memory_budget(budget)?;
+		self.memory.resize(budget);
+		Ok(())
+	}
+}
+
+/// Rejects a file-IO memory budget no transfer could run in.
+fn check_memory_budget(budget: usize) -> Result<(), Error> {
+	// A budget below one full encrypted chunk can never satisfy `Chunk::acquire`, which calls
+	// `acquire_many(chunk_size)` on the memory semaphore: it would await more permits than the
+	// semaphore will ever hold and hang every upload/download forever. Reject it in *every*
+	// build, not only when `http-provider` (with its stricter half-budget rule below) is
+	// compiled in.
+	if budget < FULL_CHUNK_BYTES {
+		return Err(Error::custom(
+			crate::ErrorKind::InvalidState,
+			format!(
+				"file_io_memory_budget ({}) is too small: it must hold at least one chunk \
+				 ({} bytes)",
+				budget, FULL_CHUNK_BYTES
+			),
+		));
+	}
+
+	// The local HTTP provider caps a single stream's read-ahead window at half the shared
+	// memory budget, so one stream can never pin the whole budget and starve a concurrent
+	// download. That cap is meaningless if half the budget cannot hold even one chunk, so
+	// reject such a configuration rather than silently degrade.
+	#[cfg(feature = "http-provider")]
+	if budget / 2 < FULL_CHUNK_BYTES {
+		return Err(Error::custom(
+			crate::ErrorKind::InvalidState,
+			format!(
+				"file_io_memory_budget ({}) is too small: half of it must hold at least one \
+				 chunk ({} bytes)",
+				budget, FULL_CHUNK_BYTES
+			),
+		));
+	}
+	Ok(())
 }
 
 pub struct AuthClient {

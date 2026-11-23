@@ -22,3 +22,29 @@ async fn concurrency_is_clamped_at_both_ends() {
 		 headroom, not panic"
 	);
 }
+
+#[tokio::test]
+async fn set_concurrency_is_read_back_by_max_concurrency_with_the_same_clamp() {
+	let state = SharedClientState::new(ClientConfig::default().with_concurrency(16))
+		.expect("a valid config");
+	state.set_concurrency(4);
+	assert_eq!(state.max_concurrency(), 4);
+	state.set_concurrency(32);
+	assert_eq!(state.max_concurrency(), 32);
+	state.set_concurrency(0);
+	assert_eq!(state.max_concurrency(), 1, "0 must be floored to 1");
+	state.set_concurrency(usize::MAX);
+	assert_eq!(
+		state.max_concurrency(),
+		tokio::sync::Semaphore::MAX_PERMITS - 4
+	);
+}
+
+#[tokio::test]
+async fn set_concurrency_reaches_every_clone_of_the_state() {
+	let state = SharedClientState::new(ClientConfig::default().with_concurrency(16))
+		.expect("a valid config");
+	let clone = state.clone();
+	state.set_concurrency(3);
+	assert_eq!(clone.max_concurrency(), 3);
+}

@@ -611,6 +611,39 @@ impl Client {
 			.await;
 	}
 
+	/// How many file chunks upload or download at once from now on, at least 1 (0 counts as 1),
+	/// clamped as `ClientConfig::with_concurrency` is; other requests keep their 4 places more.
+	/// Every client descended from the same `UnauthClient` shares the limit and sees the change.
+	///
+	/// Nothing in flight is cancelled. Growing takes effect at once. Shrinking below the chunks in
+	/// flight lets them finish and starts no new one until fewer than the new limit run. Jobs fan
+	/// out to the width in effect when they start, so one already running keeps its width, but
+	/// its chunks still go through the new limit.
+	///
+	/// Call it within the SDK's runtime: a shrink below what is in flight takes the places back
+	/// on a task of its own.
+	pub fn set_concurrency(&self, concurrency: usize) {
+		self.client().state().set_concurrency(concurrency);
+	}
+
+	/// The file-IO memory budget, in bytes, from now on: what chunks being uploaded, downloaded
+	/// or read ahead may hold at once. A budget construction would reject (below one full chunk;
+	/// with `http-provider`, below two) is rejected with
+	/// [`ErrorKind::InvalidState`](crate::ErrorKind::InvalidState) and the budget stays as it
+	/// was. Every client descended from the same `UnauthClient` shares the budget and sees the
+	/// change.
+	///
+	/// Nothing in flight is cancelled, and nothing gives up memory it holds. Growing takes effect
+	/// at once. Shrinking below what is held hands out no more until less than the new budget is
+	/// held. Streams and archives size their read-ahead against the budget in effect when they
+	/// start.
+	///
+	/// Call it within the SDK's runtime: a shrink below what is held takes the memory back on a
+	/// task of its own.
+	pub fn set_file_io_memory_budget(&self, budget: usize) -> Result<(), Error> {
+		self.client().state().set_file_io_memory_budget(budget)
+	}
+
 	/// Upload limits below 16 KB/s are clamped up to 16 KB/s, the upload chunking granularity.
 	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 	pub async fn set_bandwidth_limits(

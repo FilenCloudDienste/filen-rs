@@ -175,6 +175,45 @@ impl JsClient {
 		.await
 	}
 
+	/// How many file chunks upload or download at once from now on, at least 1 (0 counts as 1),
+	/// as `concurrency` in the client's config; other requests keep their 4 places more. Nothing
+	/// in flight is cancelled: lowered below the chunks in flight, it lets them finish and starts
+	/// no new one until fewer than the new limit run. A transfer already running keeps the width
+	/// it fans out to, while its chunks go through the new limit. Clients sharing this client's
+	/// state (from one unauthed client) change with it.
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		wasm_bindgen(js_name = "setConcurrency")
+	)]
+	#[napi_export]
+	pub async fn set_concurrency(&self, concurrency: u32) -> Result<(), Error> {
+		let concurrency = usize::try_from(concurrency).unwrap_or(usize::MAX);
+		let this = self.inner();
+		do_on_commander(move || async move {
+			this.set_concurrency(concurrency);
+			Ok(())
+		})
+		.await
+	}
+
+	/// The file-IO memory budget from now on, in bytes, as `fileIoMemoryBudget` in the client's
+	/// config: rejected with `InvalidState` where construction rejects it (below one chunk; with
+	/// the HTTP provider, below two), leaving the budget as it was. Nothing in flight gives up
+	/// memory it holds: lowered below what is held, it hands out no more until less than the new
+	/// budget is held. Streams size their read-ahead against the budget in effect when they start.
+	/// Clients sharing this client's state (from one unauthed client) change with it.
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		wasm_bindgen(js_name = "setFileIoMemoryBudget")
+	)]
+	#[napi_export]
+	pub async fn set_file_io_memory_budget(&self, budget: u64) -> Result<(), Error> {
+		// clamped to the semaphore's ceiling by the setter, as a config's budget is
+		let budget = usize::try_from(budget).unwrap_or(usize::MAX);
+		let this = self.inner();
+		do_on_commander(move || async move { this.set_file_io_memory_budget(budget) }).await
+	}
+
 	/// Upload limits below 16 KB/s are clamped up to 16 KB/s, the upload chunking granularity.
 	/// Note the asymmetry with construction: `upload_bandwidth_kilobytes_per_sec` values in
 	/// 1..16 are rejected as an error there, while this runtime setter silently clamps them.

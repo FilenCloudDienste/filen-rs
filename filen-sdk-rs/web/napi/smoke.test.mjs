@@ -578,7 +578,7 @@ describe("UnauthJsClient", () => {
 		assert.equal(typeof client.health, "function")
 		assert.equal(typeof JsClient.prototype.health, "function")
 		assert.equal(typeof JsClient.prototype.reconnectSocket, "function")
-		for (const setter of ["setRequestRateLimit", "setBandwidthLimits"]) {
+		for (const setter of ["setRequestRateLimit", "setBandwidthLimits", "setConcurrency", "setFileIoMemoryBudget"]) {
 			assert.equal(typeof JsClient.prototype[setter], "function", setter)
 		}
 	})
