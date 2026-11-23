@@ -15,6 +15,8 @@ fn main() {
 	} else if env::var("CARGO_CFG_TARGET_OS").unwrap() == "android" {
 		// if we don't bundle libc++ this causes problems on android
 		println!("cargo:rustc-link-lib=static:-bundle=c++");
+	} else if is_windows_gnu() {
+		link_mingw_cxx_runtime();
 	} else if env::var("CARGO_CFG_TARGET_OS").unwrap() != "windows" {
 		println!("cargo:rustc-link-lib=c++");
 	}
@@ -40,6 +42,16 @@ fn main() {
 				"--sysroot={}",
 				wasi_sdk_path().join("share/wasi-sysroot").display()
 			));
+	}
+	if is_windows_gnullvm() {
+		// bindgen hands libclang cargo's triple, and clang refuses
+		// `*-pc-windows-gnullvm` (it reads `llvm` as an OS version). Its
+		// own name for the same ABI is `*-pc-windows-gnu`; an explicit
+		// `--target` replaces the one bindgen would derive.
+		builder = builder.clang_arg(format!(
+			"--target={}-pc-windows-gnu",
+			env::var("CARGO_CFG_TARGET_ARCH").unwrap()
+		));
 	}
 	let bindings = builder
 		.parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
@@ -276,6 +288,12 @@ fn config_cmake_for_libcxx(config: &mut Config) {
 		// C++ runtime wasi-sdk has.
 		return;
 	}
+	if is_windows_gnu() {
+		// `config_cmake_for_mingw` picks the triple-prefixed cross compilers;
+		// a bare `clang` would compile for the build machine, and mingw-w64's
+		// gcc has no libc++ to point `-stdlib` at.
+		return;
+	}
 
 	// Force CMake to use libc++ instead of libstdc++
 	config.define("CMAKE_CXX_FLAGS", "-stdlib=libc++");
@@ -298,6 +316,263 @@ fn config_cmake_for_libcxx(config: &mut Config) {
 	config.define("CMAKE_DISABLE_FIND_PACKAGE_Doxygen", "TRUE");
 }
 
+/// Windows on the GNU ABI, cross-built from macOS or Linux:
+/// `x86_64-pc-windows-gnu` with mingw-w64 (gcc and libstdc++) and
+/// `*-pc-windows-gnullvm` with llvm-mingw (clang and libc++). The MSVC targets
+/// build natively on Windows and take none of the mingw paths.
+fn is_windows_gnu() -> bool {
+	env::var("CARGO_CFG_TARGET_OS").unwrap() == "windows"
+		&& env::var("CARGO_CFG_TARGET_ENV").unwrap() == "gnu"
+}
+
+/// Every other Windows target: MSVC, built natively on Windows.
+fn is_windows_msvc() -> bool {
+	env::var("CARGO_CFG_TARGET_OS").unwrap() == "windows" && !is_windows_gnu()
+}
+
+/// `gnullvm` is `target_env = "gnu"` with `target_abi = "llvm"`: llvm-mingw's
+/// clang and libc++ rather than mingw-w64's gcc and libstdc++.
+fn is_windows_gnullvm() -> bool {
+	is_windows_gnu() && env::var("CARGO_CFG_TARGET_ABI").is_ok_and(|abi| abi == "llvm")
+}
+
+/// The architectures the mingw paths support, as `(the toolchains' triple
+/// prefix, CMake's system processor)`. Every other one stops the build here
+/// rather than inside a tool name nobody ships.
+fn mingw_arch() -> (&'static str, &'static str) {
+	match env::var("CARGO_CFG_TARGET_ARCH").unwrap().as_str() {
+		"x86_64" => ("x86_64", "AMD64"),
+		"aarch64" => ("aarch64", "ARM64"),
+		other => panic!(
+			"heif-decoder cross-builds for x86_64-pc-windows-gnu and \
+			 aarch64-pc-windows-gnullvm only, not for Windows on {other}"
+		),
+	}
+}
+
+/// Both mingw toolchains name their tools after the target triple, as in
+/// `x86_64-w64-mingw32-gcc` and `aarch64-w64-mingw32-ar`.
+fn mingw_tool(name: &str) -> String {
+	format!("{}-w64-mingw32-{name}", mingw_arch().0)
+}
+
+#[derive(Clone, Copy)]
+enum Language {
+	C,
+	Cxx,
+}
+
+/// A compiler as cc-rs reads one from the environment: an optional cache
+/// wrapper, the driver, and any arguments that follow it.
+struct MingwCompiler {
+	launcher: Option<String>,
+	program: String,
+	args: Vec<String>,
+}
+
+impl MingwCompiler {
+	/// cc-rs's reading of a `CC`-style value: an existing path is taken
+	/// whole, so a path with a space in it survives; anything else splits on
+	/// whitespace, with a known cache wrapper ahead of the driver.
+	fn parse(value: &str) -> Self {
+		const WRAPPERS: [&str; 6] = [
+			"ccache",
+			"distcc",
+			"sccache",
+			"icecc",
+			"cachepot",
+			"buildcache",
+		];
+		let value = value.trim();
+		if Path::new(value).is_file() {
+			return Self::bare(value.to_string());
+		}
+		let mut parts = value.split_whitespace().map(str::to_string);
+		let first = parts.next().expect("the compiler variable is empty");
+		let is_wrapper = Path::new(&first)
+			.file_stem()
+			.and_then(|stem| stem.to_str())
+			.is_some_and(|stem| WRAPPERS.contains(&stem));
+		let mut rest = parts.peekable();
+		if is_wrapper && rest.peek().is_some() {
+			let program = rest.next().expect("peeked above");
+			Self {
+				launcher: Some(first),
+				program,
+				args: rest.collect(),
+			}
+		} else {
+			Self {
+				launcher: None,
+				program: first,
+				args: rest.collect(),
+			}
+		}
+	}
+
+	fn bare(program: String) -> Self {
+		Self {
+			launcher: None,
+			program,
+			args: Vec::new(),
+		}
+	}
+
+	/// Every word of the command line, wrapper first, as meson's list form
+	/// of a binary takes it.
+	fn command_line(&self) -> impl Iterator<Item = &str> {
+		self.launcher
+			.iter()
+			.chain(std::iter::once(&self.program))
+			.chain(&self.args)
+			.map(String::as_str)
+	}
+}
+
+/// The compiler for a mingw target: the one `CC_<target>` / `CXX_<target>`
+/// (or `TARGET_CC` / `TARGET_CXX`) names, which is what cc-rs builds the rest
+/// of the crate graph's C with (SQLite), so every object in the exe comes from
+/// one toolchain; otherwise the toolchain's own triple-prefixed driver. A bare
+/// `CC` / `CXX` is not read, although cc-rs falls back to it: it usually names
+/// the build machine's compiler, which cc-rs points at the target with a
+/// `--target` of its own, and CMake and meson add no such flag.
+fn mingw_compiler(language: Language) -> MingwCompiler {
+	let (var, gcc, clang) = match language {
+		Language::C => ("CC", "gcc", "clang"),
+		Language::Cxx => ("CXX", "g++", "clang++"),
+	};
+	let target = env::var("TARGET").unwrap();
+	for name in [
+		format!("{var}_{target}"),
+		format!("{var}_{}", target.replace('-', "_")),
+		format!("TARGET_{var}"),
+	] {
+		println!("cargo:rerun-if-env-changed={name}");
+		if let Ok(value) = env::var(&name)
+			&& !value.trim().is_empty()
+		{
+			return MingwCompiler::parse(&value);
+		}
+	}
+	MingwCompiler::bare(mingw_tool(if is_windows_gnullvm() { clang } else { gcc }))
+}
+
+/// The C++ runtime libheif and libde265 need, linked statically: the helper
+/// exe ships on its own, and neither libstdc++'s nor libc++'s DLL is part of
+/// a stock Windows. `-bundle` as on Android: the archive stays out of the
+/// rlib and the final link finds it in the mingw driver's own lib directory.
+fn link_mingw_cxx_runtime() {
+	if is_windows_gnullvm() {
+		// llvm-mingw's libc++.a carries libc++abi; the unwinder it calls into
+		// is the libunwind Rust's std links on gnullvm anyway.
+		println!("cargo:rustc-link-lib=static:-bundle=c++");
+	} else {
+		require_mingw_posix_threads();
+		println!("cargo:rustc-link-lib=static:-bundle=stdc++");
+	}
+}
+
+/// libheif and libde265 use `std::thread` and `std::mutex`, which mingw-w64's
+/// libstdc++ provides under the posix thread model. Debian and Ubuntu install
+/// a `-win32` and a `-posix` variant of each driver side by side and choose the
+/// unsuffixed name with update-alternatives, and the final link runs that same
+/// unsuffixed `gcc`, so the fix belongs there rather than in a suffix picked
+/// here. Refused before any of the C++ is compiled, with that fix.
+fn require_mingw_posix_threads() {
+	let compiler = mingw_compiler(Language::Cxx);
+	let output = Command::new(&compiler.program)
+		.args(&compiler.args)
+		.arg("-v")
+		.output()
+		.unwrap_or_else(|err| {
+			panic!(
+				"could not run {} to cross-build heif-decoder for Windows: {err}; \
+				 install mingw-w64 (macOS: `brew install mingw-w64`; Debian/Ubuntu: \
+				 `apt-get install g++-mingw-w64-x86-64-posix`)",
+				compiler.program
+			)
+		});
+	let report = String::from_utf8_lossy(&output.stderr);
+	let model = report
+		.lines()
+		.find_map(|line| line.trim().strip_prefix("Thread model: "));
+	assert!(
+		model != Some("win32"),
+		"{} uses the win32 thread model, and heif-decoder's C++ needs the posix one \
+		 (libstdc++'s std::thread and std::mutex). On Debian/Ubuntu select the posix \
+		 variants for the compilers and for the final link: `update-alternatives --set \
+		 x86_64-w64-mingw32-gcc /usr/bin/x86_64-w64-mingw32-gcc-posix` and the same for \
+		 `x86_64-w64-mingw32-g++`",
+		compiler.program
+	);
+}
+
+/// cmake-rs derives part of a cross configuration from cc-rs (the system name,
+/// the compilers), but it leaves CMake free to search the build machine's
+/// libraries and headers. Spelled out in full here, so the result does not
+/// depend on what the build machine has installed.
+fn config_cmake_for_mingw(config: &mut Config) {
+	if !is_windows_gnu() {
+		return;
+	}
+
+	config.define("CMAKE_SYSTEM_NAME", "Windows");
+	// The names cmake-rs and CMake's own Windows platform files use.
+	config.define("CMAKE_SYSTEM_PROCESSOR", mingw_arch().1);
+
+	// Run the build machine's programs, but never link or include its
+	// libraries: Homebrew's or the distribution's libwebp, libjpeg or libtiff
+	// are built for the build machine, and libheif's always-built heifio
+	// helper picks them up (its Windows imported targets then fail CMake's
+	// generate step). The search root is this build's own output directory,
+	// so every search for a target library comes back empty: the ones libheif
+	// links are seeded by path in `build_libheif`, and the Threads probe
+	// compiles test programs instead of searching. CMake does no re-rooting
+	// at all while `CMAKE_FIND_ROOT_PATH` is empty, so it has to be set.
+	config.define("CMAKE_FIND_ROOT_PATH", env::var("OUT_DIR").unwrap());
+	config.define("CMAKE_FIND_ROOT_PATH_MODE_PROGRAM", "NEVER");
+	config.define("CMAKE_FIND_ROOT_PATH_MODE_LIBRARY", "ONLY");
+	config.define("CMAKE_FIND_ROOT_PATH_MODE_INCLUDE", "ONLY");
+	config.define("CMAKE_FIND_ROOT_PATH_MODE_PACKAGE", "ONLY");
+
+	// de265.h and heif_export.h mark the API `dllimport`/`dllexport` on every
+	// `_WIN32` unless told the library is static, which would give the exe an
+	// export table carrying both APIs. Defining the flags also stops cmake-rs
+	// from adding cc-rs's, so the section flags that let the final link drop
+	// unused code are repeated here.
+	//
+	// CMake takes the compiler as a single program, so a wrapper becomes its
+	// launcher and any arguments after the driver join the flags.
+	let base = "-ffunction-sections -fdata-sections -DLIBDE265_STATIC_BUILD -DLIBHEIF_STATIC_BUILD";
+	for (language, compiler_var, launcher_var, flags_var) in [
+		(
+			Language::C,
+			"CMAKE_C_COMPILER",
+			"CMAKE_C_COMPILER_LAUNCHER",
+			"CMAKE_C_FLAGS",
+		),
+		(
+			Language::Cxx,
+			"CMAKE_CXX_COMPILER",
+			"CMAKE_CXX_COMPILER_LAUNCHER",
+			"CMAKE_CXX_FLAGS",
+		),
+	] {
+		let compiler = mingw_compiler(language);
+		config.define(compiler_var, &compiler.program);
+		if let Some(launcher) = &compiler.launcher {
+			config.define(launcher_var, launcher);
+		}
+		let flags = std::iter::once(base)
+			.chain(compiler.args.iter().map(String::as_str))
+			.collect::<Vec<_>>()
+			.join(" ");
+		config.define(flags_var, flags);
+	}
+
+	config.define("CMAKE_DISABLE_FIND_PACKAGE_Doxygen", "TRUE");
+}
+
 fn build_libde265() -> PathBuf {
 	let mut config = Config::new("deps/libde265");
 	// Each cmake project needs its own out dir. cmake-rs builds in
@@ -312,6 +587,7 @@ fn build_libde265() -> PathBuf {
 	config_cmake_for_libcxx(&mut config);
 	config_cmake_for_ios(&mut config);
 	config_cmake_for_wasi(&mut config);
+	config_cmake_for_mingw(&mut config);
 
 	config.define("ENABLE_SDL", "OFF");
 	config.define("ENABLE_ENCODER", "OFF");
@@ -325,7 +601,9 @@ fn build_libde265() -> PathBuf {
 	println!("cargo:rerun-if-changed=deps/libde265");
 	println!("cargo:rustc-link-search=native={}/lib", dst.display());
 
-	if env::var("CARGO_CFG_TARGET_OS").unwrap() == "windows" {
+	// libde265 sets its Windows prefix to `lib` itself: `libde265.lib` under
+	// MSVC, and the usual `libde265.a` under mingw.
+	if is_windows_msvc() {
 		println!("cargo:rustc-link-lib=static=libde265");
 	} else {
 		println!("cargo:rustc-link-lib=static=de265");
@@ -404,8 +682,10 @@ fn build_dav1d() -> PathBuf {
 	// runner's, or a developer's — has no MSVC environment loaded: it would
 	// find whichever gcc the image ships and hand the MSVC link an archive it
 	// cannot use. `--vsenv` makes meson locate and activate Visual Studio
-	// itself. It is accepted (and inert) elsewhere, but only Windows needs it.
-	if cfg!(windows) {
+	// itself. It is accepted (and inert) elsewhere, but only Windows needs it,
+	// and only for MSVC: a gnu target's cross file names the mingw tools, and
+	// an activated Visual Studio would put its own ahead of them on PATH.
+	if cfg!(windows) && !is_windows_gnu() {
 		setup.arg("--vsenv");
 	}
 	if let Some(cross_file) = write_meson_cross_file(&out_dir) {
@@ -436,6 +716,10 @@ fn build_dav1d() -> PathBuf {
 ///
 /// `None` means "build for the host" — the one case meson works out itself.
 fn write_meson_cross_file(out_dir: &Path) -> Option<PathBuf> {
+	if is_windows_gnu() {
+		return Some(write_mingw_meson_cross_file(out_dir));
+	}
+
 	let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap();
 	let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
 
@@ -523,14 +807,7 @@ fn write_meson_cross_file(out_dir: &Path) -> Option<PathBuf> {
 		return None;
 	};
 
-	let cpu_family = match target_arch.as_str() {
-		"wasm32" => "wasm32",
-		"aarch64" => "aarch64",
-		"x86_64" => "x86_64",
-		"arm" => "arm",
-		"x86" => "x86",
-		other => panic!("no meson cpu_family mapping for {other}"),
-	};
+	let cpu_family = meson_cpu_family(&target_arch);
 	let tool = |name: &str| {
 		if bin_dir.as_os_str().is_empty() {
 			name.to_string()
@@ -580,9 +857,59 @@ fn write_meson_cross_file(out_dir: &Path) -> Option<PathBuf> {
 		tool(stripper),
 		quoted(&c_args.into_iter().map(str::to_string).collect::<Vec<_>>()),
 	);
+	Some(write_cross_file(out_dir, &contents))
+}
+
+/// The cross file for the Windows gnu targets, after dav1d's own
+/// `package/crossfiles/*-w64-mingw32.meson`. The compiler is the one the C++
+/// libraries build with (`mingw_compiler`); the other tools carry the
+/// toolchain's triple prefix in both mingw-w64 and llvm-mingw. `windres` is
+/// listed because dav1d imports meson's windows module on every Windows
+/// target, although only a DLL build compiles a resource. nasm, which the
+/// x86_64 SIMD needs, is found on PATH like on every other x86 target. The
+/// compiler is written in meson's list form, which takes a wrapper and
+/// arguments as words of their own.
+fn write_mingw_meson_cross_file(out_dir: &Path) -> PathBuf {
+	let cpu_family = meson_cpu_family(&env::var("CARGO_CFG_TARGET_ARCH").unwrap());
+	let compiler = mingw_compiler(Language::C)
+		.command_line()
+		.map(|word| format!("'{word}'"))
+		.collect::<Vec<_>>()
+		.join(", ");
+	let contents = format!(
+		"[binaries]\n\
+		 c = [{compiler}]\n\
+		 ar = '{}'\n\
+		 strip = '{}'\n\
+		 windres = '{}'\n\
+		 \n\
+		 [host_machine]\n\
+		 system = 'windows'\n\
+		 cpu_family = '{cpu_family}'\n\
+		 cpu = '{cpu_family}'\n\
+		 endian = 'little'\n",
+		mingw_tool("ar"),
+		mingw_tool("strip"),
+		mingw_tool("windres"),
+	);
+	write_cross_file(out_dir, &contents)
+}
+
+fn meson_cpu_family(target_arch: &str) -> &'static str {
+	match target_arch {
+		"wasm32" => "wasm32",
+		"aarch64" => "aarch64",
+		"x86_64" => "x86_64",
+		"arm" => "arm",
+		"x86" => "x86",
+		other => panic!("no meson cpu_family mapping for {other}"),
+	}
+}
+
+fn write_cross_file(out_dir: &Path, contents: &str) -> PathBuf {
 	let path = out_dir.join("dav1d-cross.ini");
 	std::fs::write(&path, contents).expect("could not write the dav1d meson cross file");
-	Some(path)
+	path
 }
 
 /// dav1d has no build system but meson's, and nothing else in this workspace
@@ -624,6 +951,7 @@ fn build_libheif(libde265_path: &Path, dav1d_path: &Path) -> PathBuf {
 	config_cmake_for_libcxx(&mut config);
 	config_cmake_for_ios(&mut config);
 	config_cmake_for_wasi(&mut config);
+	config_cmake_for_mingw(&mut config);
 
 	if is_wasm() {
 		// `ENABLE_MULTITHREADING_SUPPORT` is what compiles libheif's mutexes
@@ -661,7 +989,8 @@ fn build_libheif(libde265_path: &Path, dav1d_path: &Path) -> PathBuf {
 
 	config.define("LIBDE265_INCLUDE_DIR", libde265_path.join("include"));
 
-	if env::var("CARGO_CFG_TARGET_OS").unwrap() == "windows" {
+	// mingw takes the static-build defines from `config_cmake_for_mingw`.
+	if is_windows_msvc() {
 		config.define("LIBDE265_LIBRARY", libde265_path.join("lib/libde265.lib"));
 
 		config.define("CMAKE_C_FLAGS", "/DLIBDE265_STATIC_BUILD");
@@ -680,7 +1009,7 @@ fn build_libheif(libde265_path: &Path, dav1d_path: &Path) -> PathBuf {
 	config.define("DAV1D_INCLUDE_DIR", dav1d_path.join("include"));
 	config.define(
 		"DAV1D_LIBRARY",
-		dav1d_path.join(if env::var("CARGO_CFG_TARGET_OS").unwrap() == "windows" {
+		dav1d_path.join(if is_windows_msvc() {
 			"lib/dav1d.lib"
 		} else {
 			"lib/libdav1d.a"

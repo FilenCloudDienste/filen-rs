@@ -317,6 +317,20 @@ export WASI_SDK_PATH=~/wasi-sdk   # must contain share/wasi-sysroot
 `filen-sdk-rs/wasm-pack.sh` and the pre-push hook both refuse to run without it, rather than
 building a configuration that never ships.
 
+The Windows MSVC targets build `heif-decoder` natively on Windows only. The Windows gnu targets
+cross-build it from macOS or Linux with the same rows above plus the target's mingw toolchain on
+PATH; no other Windows architecture is supported. `x86_64-pc-windows-gnu` takes mingw-w64 (gcc,
+libstdc++) with the posix thread model, which libheif's `std::thread`/`std::mutex` need and the
+build script checks: `brew install mingw-w64` is posix; on Debian/Ubuntu install
+`g++-mingw-w64-x86-64-posix`, and if the `-win32` variant is installed too, point
+`update-alternatives --set` for `x86_64-w64-mingw32-gcc` and `x86_64-w64-mingw32-g++` at the
+`-posix` binaries, since the final link runs the unsuffixed driver. `aarch64-pc-windows-gnullvm`
+takes llvm-mingw (clang, libc++) with `CC_aarch64_pc_windows_gnullvm=aarch64-w64-mingw32-clang`,
+`AR_..=llvm-ar` and the cargo linker set to the same clang. `CC_<target>`/`CXX_<target>` (or
+`TARGET_CC`/`TARGET_CXX`, not a bare `CC`) override the compilers, a cache wrapper and arguments
+included. Keep llvm-mingw off PATH for the x86_64 build. The C++ runtime links statically; a
+gnullvm exe still needs llvm-mingw's `libunwind.dll` beside it, as without the feature.
+
 ## Workspace Structure
 
 | Crate | Purpose |
