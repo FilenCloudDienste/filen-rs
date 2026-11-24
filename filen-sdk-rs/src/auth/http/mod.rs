@@ -1369,7 +1369,7 @@ impl UnauthClient {
 			.layer(self.state.limits.layer(RequestClass::Control)) // the class's concurrency limits
 			.layer(self.state.retry.clone()) // required to map RetryError to Error
 			.layer(self.state.rate_limiter.clone()) // optional
-			.layer(deserialize::DeserializeLayer::<Res>::new()) // required to convert AsRef<u8> to T
+			.layer(deserialize::DeserializeLayer::<Res, deserialize::Json>::new()) // required to convert AsRef<u8> to T
 			.layer(download_body::full::DownloadLayer::new()); // required to download full response body to bytes
 
 		let builder = {
@@ -1389,12 +1389,11 @@ impl UnauthClient {
 
 		builder
 			.service_fn(move |request| execute_request(request, Arc::clone(&self.state.answers)))
-			.oneshot(Request {
-				method: RequestMethod::Post(()),
-				response_type: ResponseType::Standard,
+			.oneshot(Request::new(
+				RequestMethod::Post(()),
 				url,
-				client: self.reqwest_client.clone(),
-			})
+				self.reqwest_client.clone(),
+			))
 			.await
 	}
 
@@ -1436,12 +1435,11 @@ impl UnauthClient {
 
 		builder
 			.service_fn(move |request| execute_request(request, Arc::clone(&self.state.answers)))
-			.oneshot(Request {
-				method: RequestMethod::Get,
-				response_type: ResponseType::Standard,
+			.oneshot(Request::new(
+				RequestMethod::Get,
 				url,
-				client: self.reqwest_client.clone(),
-			})
+				self.reqwest_client.clone(),
+			))
 			.await
 	}
 
@@ -1465,7 +1463,7 @@ impl UnauthClient {
 			.layer(self.state.limits.layer(RequestClass::Control)) // the class's concurrency limits
 			.layer(self.state.retry.clone()) // required to map RetryError to Error
 			.layer(self.state.rate_limiter.clone()) // optional
-			.layer(deserialize::DeserializeLayer::<Res>::new()) // required to convert AsRef<u8> to T
+			.layer(deserialize::DeserializeLayer::<Res, deserialize::Msgpack>::new()) // required to convert AsRef<u8> to T
 			.layer(download_body::callback::DownloadWithCallbackLayer::new(
 				callback,
 			)); // required to download full response body to bytes
@@ -1487,12 +1485,11 @@ impl UnauthClient {
 
 		builder
 			.service_fn(move |request| execute_request(request, Arc::clone(&self.state.answers)))
-			.oneshot(Request {
-				method: RequestMethod::Post(()),
-				response_type: ResponseType::Large,
+			.oneshot(Request::new(
+				RequestMethod::Post(()),
 				url,
-				client: self.reqwest_client.clone(),
-			})
+				self.reqwest_client.clone(),
+			))
 	}
 
 	/// Streams a GET response body to bytes, invoking `callback(bytes_so_far, content_length)` as
@@ -1540,12 +1537,11 @@ impl UnauthClient {
 		};
 		builder
 			.service_fn(move |request| execute_request(request, Arc::clone(&self.state.answers)))
-			.oneshot(Request {
-				method: RequestMethod::Get,
-				response_type: ResponseType::Standard,
+			.oneshot(Request::new(
+				RequestMethod::Get,
 				url,
-				client: self.reqwest_client.clone(),
-			})
+				self.reqwest_client.clone(),
+			))
 			.await
 	}
 }
@@ -1563,7 +1559,7 @@ impl AuthClient {
 			.layer(self.unauthed.state.limits.layer(RequestClass::Control)) // the class's concurrency limits
 			.layer(self.unauthed.state.retry.clone()) // required to map RetryError to Error
 			.layer(self.unauthed.state.rate_limiter.clone()) // optional
-			.layer(deserialize::DeserializeLayer::<Res>::new()) // required to convert AsRef<u8> to T
+			.layer(deserialize::DeserializeLayer::<Res, deserialize::Json>::new()) // required to convert AsRef<u8> to T
 			.layer(download_body::full::DownloadLayer::new()) // required to download full response body to bytes
 			.map_request(|request: Request<(), reqwest::Url>| {
 				request.into_builder_map_body(|()| "")
@@ -1585,12 +1581,11 @@ impl AuthClient {
 			.service_fn(move |request| {
 				execute_request(request, Arc::clone(&self.unauthed.state.answers))
 			})
-			.oneshot(Request {
-				method: RequestMethod::Get,
-				response_type: ResponseType::Standard,
+			.oneshot(Request::new(
+				RequestMethod::Get,
 				url,
-				client: self.unauthed.reqwest_client.clone(),
-			})
+				self.unauthed.reqwest_client.clone(),
+			))
 			.await
 	}
 
@@ -1614,7 +1609,7 @@ impl AuthClient {
 			.layer(self.unauthed.state.limits.layer(RequestClass::Control)) // the class's concurrency limits
 			.layer(self.unauthed.state.retry.clone()) // required to map RetryError to Error
 			.layer(self.unauthed.state.rate_limiter.clone()) // optional
-			.layer(deserialize::DeserializeLayer::<Res>::new()) // required to convert AsRef<u8> to T
+			.layer(deserialize::DeserializeLayer::<Res, deserialize::Json>::new()) // required to convert AsRef<u8> to T
 			.layer(download_body::full::DownloadLayer::new()); // required to download full response body to bytes
 
 		let builder = {
@@ -1639,12 +1634,11 @@ impl AuthClient {
 			.service_fn(move |request| {
 				execute_request(request, Arc::clone(&self.unauthed.state.answers))
 			})
-			.oneshot(Request {
-				method: RequestMethod::Post(()),
-				response_type: ResponseType::Standard,
+			.oneshot(Request::new(
+				RequestMethod::Post(()),
 				url,
-				client: self.unauthed.reqwest_client.clone(),
-			})
+				self.unauthed.reqwest_client.clone(),
+			))
 			.await // optional
 	}
 
@@ -1734,7 +1728,7 @@ impl AuthClient {
 			.layer(self.unauthed.state.limits.layer(RequestClass::Control)) // the class's concurrency limits
 			.layer(self.unauthed.state.retry.clone()) // required to map RetryError to Error
 			.layer(self.unauthed.state.rate_limiter.clone()) // optional
-			.layer(deserialize::DeserializeLayer::<Res>::new())
+			.layer(deserialize::DeserializeLayer::<Res, deserialize::Msgpack>::new())
 			.layer(download_body::callback::DownloadWithCallbackLayer::new(
 				callback,
 			)); // required to download full response body to bytes
@@ -1759,12 +1753,11 @@ impl AuthClient {
 			.service_fn(move |request| {
 				execute_request(request, Arc::clone(&self.unauthed.state.answers))
 			})
-			.oneshot(Request {
-				method: RequestMethod::Post(()),
-				response_type: ResponseType::Large,
+			.oneshot(Request::new(
+				RequestMethod::Post(()),
 				url,
-				client: self.unauthed.reqwest_client.clone(),
-			})
+				self.unauthed.reqwest_client.clone(),
+			))
 			.await
 	}
 
@@ -1851,7 +1844,7 @@ impl AuthClient {
 			.layer(self.unauthed.state.retry.clone()) // required to map RetryError to Error
 			.layer(retry::OnFailedAttemptLayer::new(on_failed_attempt)) // sees every attempt's error
 			.layer(self.unauthed.state.rate_limiter.clone()) // optional
-			.layer(deserialize::DeserializeLayer::<Res>::new())
+			.layer(deserialize::DeserializeLayer::<Res, deserialize::Json>::new())
 			.layer(download_body::full::DownloadLayer::new()); // required to download full response body to bytes
 
 		let builder = {
@@ -1876,12 +1869,11 @@ impl AuthClient {
 			.service_fn(move |request| {
 				execute_request(request, Arc::clone(&self.unauthed.state.answers))
 			})
-			.oneshot(Request {
-				method: RequestMethod::Post(request),
-				response_type: ResponseType::Standard,
+			.oneshot(Request::new(
+				RequestMethod::Post(request),
 				url,
-				client: self.unauthed.reqwest_client.clone(),
-			})
+				self.unauthed.reqwest_client.clone(),
+			))
 			.await
 	}
 }
@@ -1902,9 +1894,22 @@ enum ResponseType {
 #[derive(Clone, Debug)]
 struct Request<Body, Url> {
 	method: RequestMethod<Body>,
+	/// Set by the stack's [`deserialize::DeserializeLayer`] to the format it decodes; a stack
+	/// without one asks for the default.
 	response_type: ResponseType,
 	url: Url,
 	client: reqwest::Client,
+}
+
+impl<Body, Url> Request<Body, Url> {
+	fn new(method: RequestMethod<Body>, url: Url, client: reqwest::Client) -> Self {
+		Self {
+			method,
+			response_type: ResponseType::Standard,
+			url,
+			client,
+		}
+	}
 }
 
 impl<Body> Request<Body, reqwest::Url> {

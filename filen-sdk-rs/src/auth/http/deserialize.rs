@@ -15,15 +15,37 @@ use crate::{Error, ErrorKind, auth::http::ResponseType};
 
 use super::{Request, retry::RetryError};
 
-/// Decodes a JSON body. The envelope is decoded by one function shared by every response type,
-/// and only `data` is decoded per type, so a decode error's line and column count from the start
-/// of `data`.
-fn decode_json<Res: DeserializeOwned>(
-	bytes: &[u8],
-) -> Result<FilenResponse<'_, Res>, RetryError<Error>> {
-	decode_json_envelope(bytes)?.try_map_data(|data| {
-		serde_json::from_str(data.get()).map_err(|e| json_decode_error(e, bytes.len()))
-	})
+/// How a [`DeserializeLayer`] decodes a response body, fixed per stack at compile time so each
+/// response type is compiled against one decoder only. It also names the [`ResponseType`] the
+/// layer asks the server for, so the request and the decoder cannot disagree.
+pub(crate) trait WireFormat {
+	/// What [`DeserializeService::call`] writes into the request, which picks its headers.
+	const RESPONSE_TYPE: ResponseType;
+
+	/// Decodes `bytes`; a failure is retryable when the body was cut short.
+	fn decode<Res: DeserializeOwned>(
+		bytes: &[u8],
+	) -> Result<FilenResponse<'_, Res>, RetryError<Error>>;
+}
+
+/// The gateway's default JSON body.
+pub(crate) struct Json;
+
+/// The msgpack body the gateway sends when the request carries the `msgpack` header.
+pub(crate) struct Msgpack;
+
+impl WireFormat for Json {
+	const RESPONSE_TYPE: ResponseType = ResponseType::Standard;
+
+	/// The envelope is decoded by one function shared by every response type, and only `data` is
+	/// decoded per type, so a decode error's line and column count from the start of `data`.
+	fn decode<Res: DeserializeOwned>(
+		bytes: &[u8],
+	) -> Result<FilenResponse<'_, Res>, RetryError<Error>> {
+		decode_json_envelope(bytes)?.try_map_data(|data| {
+			serde_json::from_str(data.get()).map_err(|e| json_decode_error(e, bytes.len()))
+		})
+	}
 }
 
 /// The JSON envelope of `bytes`, its `data` left undecoded.
@@ -43,6 +65,29 @@ fn json_decode_error(e: serde_json::Error, len: usize) -> RetryError<Error> {
 			Some(format!("Failed to deserialize json response ({len} bytes)")),
 		),
 	)
+}
+
+impl WireFormat for Msgpack {
+	const RESPONSE_TYPE: ResponseType = ResponseType::Large;
+
+	fn decode<Res: DeserializeOwned>(
+		bytes: &[u8],
+	) -> Result<FilenResponse<'_, Res>, RetryError<Error>> {
+		from_msgpack_slice(bytes).map_err(|e| {
+			let truncated = msgpack_error_is_truncation(&e);
+			RetryError::from_retryable(
+				truncated,
+				Error::custom_with_source(
+					ErrorKind::Response,
+					e,
+					Some(format!(
+						"Failed to deserialize msgpack response ({} bytes)",
+						bytes.len()
+					)),
+				),
+			)
+		})
+	}
 }
 
 /// The gateway msgpack-encodes the same string-keyed structures as its JSON responses (uuids as
@@ -69,11 +114,11 @@ fn msgpack_error_is_truncation(e: &rmp_serde::decode::Error) -> bool {
 	}
 }
 
-pub(crate) struct DeserializeLayer<Res> {
-	_phantom: std::marker::PhantomData<Res>,
+pub(crate) struct DeserializeLayer<Res, W> {
+	_phantom: std::marker::PhantomData<(Res, W)>,
 }
 
-impl<Res> Clone for DeserializeLayer<Res> {
+impl<Res, W> Clone for DeserializeLayer<Res, W> {
 	fn clone(&self) -> Self {
 		Self {
 			_phantom: self._phantom,
@@ -81,7 +126,7 @@ impl<Res> Clone for DeserializeLayer<Res> {
 	}
 }
 
-impl<T> DeserializeLayer<T> {
+impl<T, W> DeserializeLayer<T, W> {
 	pub(crate) fn new() -> Self {
 		Self {
 			_phantom: std::marker::PhantomData,
@@ -89,8 +134,8 @@ impl<T> DeserializeLayer<T> {
 	}
 }
 
-impl<S, Res> tower::Layer<S> for DeserializeLayer<Res> {
-	type Service = DeserializeService<S, Res>;
+impl<S, Res, W> tower::Layer<S> for DeserializeLayer<Res, W> {
+	type Service = DeserializeService<S, Res, W>;
 
 	fn layer(&self, inner: S) -> Self::Service {
 		DeserializeService {
@@ -100,12 +145,12 @@ impl<S, Res> tower::Layer<S> for DeserializeLayer<Res> {
 	}
 }
 
-pub(crate) struct DeserializeService<S, Res> {
+pub(crate) struct DeserializeService<S, Res, W> {
 	inner: S,
-	_phantom: std::marker::PhantomData<Res>,
+	_phantom: std::marker::PhantomData<(Res, W)>,
 }
 
-impl<S, Res> Clone for DeserializeService<S, Res>
+impl<S, Res, W> Clone for DeserializeService<S, Res, W>
 where
 	S: Clone,
 {
@@ -117,49 +162,52 @@ where
 	}
 }
 
-impl<S, Res, Body, Url> Service<Request<Body, Url>> for DeserializeService<S, Res>
+impl<S, Res, W, Body, Url> Service<Request<Body, Url>> for DeserializeService<S, Res, W>
 where
 	S: Service<Request<Body, Url>, Error = super::retry::RetryError<Error>>,
 	S::Response: AsRef<[u8]>,
 	Res: DeserializeOwned,
+	W: WireFormat,
 {
 	type Response = Res;
 	type Error = S::Error;
-	type Future = DeserializeFuture<S::Future, Res>;
+	type Future = DeserializeFuture<S::Future, Res, W>;
 
 	fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
 		self.inner.poll_ready(cx)
 	}
 
 	fn call(&mut self, req: Request<Body, Url>) -> Self::Future {
-		let response_type = req.response_type;
-		DeserializeFuture::new(self.inner.call(req), response_type)
+		let req = Request {
+			response_type: W::RESPONSE_TYPE,
+			..req
+		};
+		DeserializeFuture::new(self.inner.call(req))
 	}
 }
 
 #[pin_project::pin_project]
-pub(crate) struct DeserializeFuture<F, Res> {
-	response_type: ResponseType,
+pub(crate) struct DeserializeFuture<F, Res, W> {
 	#[pin]
 	fut: Option<F>,
-	_phantom: PhantomData<Res>,
+	_phantom: PhantomData<(Res, W)>,
 }
 
-impl<F, Res> DeserializeFuture<F, Res> {
-	fn new(fut: F, response_type: ResponseType) -> Self {
+impl<F, Res, W> DeserializeFuture<F, Res, W> {
+	fn new(fut: F) -> Self {
 		Self {
-			response_type,
 			fut: Some(fut),
 			_phantom: PhantomData,
 		}
 	}
 }
 
-impl<F, Res, InRes> Future for DeserializeFuture<F, Res>
+impl<F, Res, W, InRes> Future for DeserializeFuture<F, Res, W>
 where
 	F: Future<Output = Result<InRes, RetryError<Error>>>,
 	InRes: AsRef<[u8]>,
 	Res: DeserializeOwned,
+	W: WireFormat,
 {
 	type Output = Result<Res, RetryError<Error>>;
 
@@ -168,30 +216,9 @@ where
 		if let Some(fut) = this.fut.as_pin_mut() {
 			match fut.poll(cx) {
 				Poll::Ready(Ok(res)) => {
-					let response: FilenResponse<Res> = if *this.response_type == ResponseType::Large
-					{
-						match from_msgpack_slice(res.as_ref()) {
-							Ok(resp) => resp,
-							Err(e) => {
-								let truncated = msgpack_error_is_truncation(&e);
-								return Poll::Ready(Err(RetryError::from_retryable(
-									truncated,
-									Error::custom_with_source(
-										ErrorKind::Response,
-										e,
-										Some(format!(
-											"Failed to deserialize msgpack response ({} bytes)",
-											res.as_ref().len()
-										)),
-									),
-								)));
-							}
-						}
-					} else {
-						match decode_json(res.as_ref()) {
-							Ok(resp) => resp,
-							Err(e) => return Poll::Ready(Err(e)),
-						}
+					let response: FilenResponse<Res> = match W::decode(res.as_ref()) {
+						Ok(response) => response,
+						Err(e) => return Poll::Ready(Err(e)),
 					};
 
 					match ResponseIntoData::into_data(response) {
@@ -217,8 +244,14 @@ where
 
 #[cfg(test)]
 mod tests {
+	use std::cell::Cell;
+
 	use filen_types::{api::response::FilenResponse, fs::Uuid};
 	use serde::Deserialize;
+	use tower::{Layer, Service};
+
+	use super::{DeserializeFuture, DeserializeLayer, Json, Msgpack, WireFormat};
+	use crate::auth::http::{Request, RequestMethod, ResponseType, retry::RetryError};
 
 	#[derive(Deserialize, Debug)]
 	struct UuidHolder {
@@ -283,14 +316,11 @@ mod tests {
 	/// reproduces the 2026-08-16 nightly failure with an otherwise green suite).
 	#[test]
 	fn deserialize_layer_classifies_truncation_retryable() {
-		use crate::auth::http::{ResponseType, retry::RetryError};
-
-		let run = |bytes: Vec<u8>, response_type| {
-			futures::executor::block_on(super::DeserializeFuture::<_, UuidHolder>::new(
+		fn run<W: WireFormat>(bytes: Vec<u8>) -> Result<UuidHolder, RetryError<crate::Error>> {
+			futures::executor::block_on(DeserializeFuture::<_, UuidHolder, W>::new(
 				std::future::ready(Ok::<_, RetryError<crate::Error>>(bytes)),
-				response_type,
 			))
-		};
+		}
 
 		let uuid = Uuid::new_v4();
 		let document = serde_json::json!({
@@ -301,29 +331,53 @@ mod tests {
 		});
 
 		let msgpack = rmp_serde::to_vec(&document).unwrap();
-		match run(msgpack[..msgpack.len() / 2].to_vec(), ResponseType::Large) {
+		match run::<Msgpack>(msgpack[..msgpack.len() / 2].to_vec()) {
 			Err(RetryError::Retry(_)) => {}
 			other => panic!("a truncated msgpack response must be Retry, got {other:?}"),
 		}
-		match run(
+		match run::<Msgpack>(
 			rmp_serde::to_vec(&serde_json::json!({ "status": "not-a-bool" })).unwrap(),
-			ResponseType::Large,
 		) {
 			Err(RetryError::NoRetry(_)) => {}
 			other => panic!("a mistyped msgpack response must be NoRetry, got {other:?}"),
 		}
 
 		let json = serde_json::to_vec(&document).unwrap();
-		match run(json[..json.len() / 2].to_vec(), ResponseType::Standard) {
+		match run::<Json>(json[..json.len() / 2].to_vec()) {
 			Err(RetryError::Retry(_)) => {}
 			other => panic!("a truncated json response must be Retry, got {other:?}"),
 		}
-		match run(
-			b"{\"status\": \"not-a-bool\"}".to_vec(),
-			ResponseType::Standard,
-		) {
+		match run::<Json>(b"{\"status\": \"not-a-bool\"}".to_vec()) {
 			Err(RetryError::NoRetry(_)) => {}
 			other => panic!("a mistyped json response must be NoRetry, got {other:?}"),
+		}
+	}
+
+	/// The request a stack sends asks for the format its layer decodes, whatever the request
+	/// carried before: the `msgpack` header follows from [`WireFormat::RESPONSE_TYPE`].
+	#[test]
+	fn deserialize_service_asks_for_the_format_it_decodes() {
+		fn sent_response_type<W: WireFormat>(carried: ResponseType) -> ResponseType {
+			let sent = Cell::new(None);
+			let inner = tower::service_fn(|req: Request<(), ()>| {
+				sent.set(Some(req.response_type));
+				std::future::ready(Ok::<_, RetryError<crate::Error>>(Vec::<u8>::new()))
+			});
+			let mut service = DeserializeLayer::<(), W>::new().layer(inner);
+			let decoded = futures::executor::block_on(service.call(Request {
+				method: RequestMethod::Get,
+				response_type: carried,
+				url: (),
+				client: reqwest::Client::new(),
+			}));
+			// only the request the inner service saw matters here
+			assert!(decoded.is_err(), "an empty body must not decode");
+			sent.get().expect("the inner service was called")
+		}
+
+		for carried in [ResponseType::Standard, ResponseType::Large] {
+			assert_eq!(sent_response_type::<Json>(carried), ResponseType::Standard);
+			assert_eq!(sent_response_type::<Msgpack>(carried), ResponseType::Large);
 		}
 	}
 }
