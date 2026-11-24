@@ -40,7 +40,10 @@ use std::{
 
 use anyhow::{Context, Result, anyhow};
 use base64::{Engine as _, engine::general_purpose::STANDARD as base64};
-use clap::{ArgMatches, CommandFactory as _, FromArgMatches as _, Parser, parser::ValueSource};
+use clap::{
+	ArgMatches, CommandFactory as _, FromArgMatches as _, Parser, error::ErrorKind,
+	parser::ValueSource,
+};
 use filen_sdk_rs::auth::{Client, StringifiedClient, http::ClientConfig, unauth::UnauthClient};
 use ftail::Ftail;
 use log::{LevelFilter, info, warn};
@@ -907,7 +910,12 @@ fn print_argument_error(ui: &mut ui::UI, err: &clap::Error) -> LineOutcome {
 	let rendered = err.render();
 	match err.exit_code() {
 		0 => {
-			ui.print(styled(&rendered, console::colors_enabled()).trim_end());
+			let mut text = styled(&rendered, console::colors_enabled());
+			// `--version` shows the version as UI::version gives it, a placeholder while replay testing
+			if err.kind() == ErrorKind::DisplayVersion {
+				text = text.replace(env!("CARGO_PKG_VERSION"), &ui.version());
+			}
+			ui.print(text.trim_end());
 			LineOutcome::Done
 		}
 		code => {
@@ -1303,8 +1311,6 @@ pub fn deserialize_auth_config(
 
 #[cfg(test)]
 mod tests {
-	use clap::error::ErrorKind;
-
 	use super::*;
 	use crate::{commands::rclone_cmds::RcloneCommands, ui::test_support::Printed};
 
@@ -1369,6 +1375,23 @@ mod tests {
 			format!("Filen CLI {}", env!("CARGO_PKG_VERSION"))
 		);
 		assert_eq!(err.lines_or_empty(), "");
+	}
+
+	#[test]
+	fn a_repl_line_asking_for_the_version_prints_a_placeholder_while_replay_testing() {
+		let Err(ReplLineError::Arguments(e)) = parse_repl_line("--version") else {
+			panic!("parsed --version as a command line");
+		};
+		let printed = Printed::default();
+
+		assert_eq!(
+			print_argument_error(&mut printed.replay_testing_ui(), &e),
+			LineOutcome::Done
+		);
+		assert_eq!(
+			console::strip_ansi_codes(&printed.lines()),
+			"Filen CLI {{ version }}"
+		);
 	}
 
 	#[test]

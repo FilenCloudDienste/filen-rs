@@ -92,16 +92,16 @@ impl ShellCommands {
 /// Prints the CLI's version, the target it was built for, its config directory and whether it is
 /// the Docker image's, or with `--json`, an object of them.
 fn print_version(ui: &mut UI, config_dir: &Path) -> Result<()> {
-	let version = env!("CARGO_PKG_VERSION");
 	let config_dir = config_dir.to_string_lossy();
 	if ui.json {
 		return ui.print_json(json!({
-			"version": version,
+			"version": ui.plain_version(),
 			"target": BUILD_TARGET,
 			"configDir": config_dir,
 			"docker": IN_DOCKER_IMAGE,
 		}));
 	}
+	let version = ui.version();
 	ui.print(&format!("Filen CLI v{version}"));
 	ui.print_key_value_table(&[
 		("Target:", BUILD_TARGET),
@@ -346,6 +346,18 @@ mod tests {
 				"docker": IN_DOCKER_IMAGE,
 			})
 		);
+	}
+
+	#[test]
+	fn version_with_json_has_a_plain_placeholder_while_replay_testing() {
+		let printed = Printed::default();
+		let mut ui = printed.replay_testing_ui();
+		ui.json = true;
+
+		print_version(&mut ui, Path::new("/home/user/.config/filen-cli")).unwrap();
+
+		let printed: serde_json::Value = serde_json::from_str(&printed.lines()).unwrap();
+		assert_eq!(printed["version"], "{{ version }}");
 	}
 
 	#[test]

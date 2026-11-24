@@ -137,9 +137,10 @@ const DOC_OUTLINE: &[DocSection] = &[
 
 const MAIN_SECTION: &str = "usage";
 
-/// A doc fragment's content with the CLI's version filled in where it says `{{VERSION}}`.
-fn fill_in_version(content: &str) -> String {
-	content.replace("{{VERSION}}", env!("CARGO_PKG_VERSION"))
+/// A doc fragment's content with `version` filled in where it says `{{VERSION}}`. The outline
+/// keeps the placeholder, as the in-app help shows the version as [`UI::version`] gives it.
+fn fill_in_version(content: &str, version: &str) -> String {
+	content.replace("{{VERSION}}", version)
 }
 static PARSED_DOC_OUTLINE: LazyLock<Result<Vec<ParsedDocSection>>> = LazyLock::new(|| {
 	// parse doc elements
@@ -164,7 +165,8 @@ static PARSED_DOC_OUTLINE: LazyLock<Result<Vec<ParsedDocSection>>> = LazyLock::n
 						{
 							used_doc_fragments.insert(fragment.id.clone());
 							Ok(ParsedDocElement::DocFragment {
-								text: fill_in_version(&fragment.content),
+								// copied: the fragments are read again below, for the unused ones
+								text: fragment.content.clone(),
 							})
 						} else {
 							Err(anyhow::anyhow!(
@@ -283,7 +285,9 @@ fn format_markdown_section(section: &ParsedDocSection) -> String {
 		.iter()
 		.map(|element| match element {
 			ParsedDocElement::Heading1 { text } => format!("## {}", text),
-			ParsedDocElement::DocFragment { text } => text.to_string(),
+			ParsedDocElement::DocFragment { text } => {
+				fill_in_version(text, env!("CARGO_PKG_VERSION"))
+			}
 			ParsedDocElement::CommandHelp { command } => {
 				format_markdown_command_help(&mut command.clone())
 			}
@@ -400,6 +404,7 @@ pub(crate) fn print_in_app_docs(
 	let command_or_topic = section_or_command_or_topic.unwrap_or(String::from(MAIN_SECTION));
 	if let Some(section) = parsed_doc_outline.iter().find(|s| s.id == command_or_topic) {
 		// doc section
+		let version = ui.version();
 		ui.print(&UI::format_text_heading(&section.title));
 		ui.print("");
 		let elements = section
@@ -407,7 +412,7 @@ pub(crate) fn print_in_app_docs(
 			.iter()
 			.map(|element| match element {
 				ParsedDocElement::Heading1 { text } => UI::format_text_heading(text),
-				ParsedDocElement::DocFragment { text } => text.to_string(),
+				ParsedDocElement::DocFragment { text } => fill_in_version(text, &version),
 				ParsedDocElement::CommandHelp { command } => {
 					UI::format_text_blockquote(&UI::format_command_help(&mut command.clone()))
 				}
@@ -445,7 +450,8 @@ pub(crate) fn print_in_app_docs(
 		.find(|fragment| fragment.id == command_or_topic)
 	{
 		// doc fragment
-		ui.print(&fill_in_version(&doc_fragment.content));
+		let text = fill_in_version(&doc_fragment.content, &ui.version());
+		ui.print(&text);
 	} else if let Some(command) = CliArgs::command().find_subcommand_mut(&command_or_topic) {
 		// command help
 		ui.print(&UI::format_command_help(&mut command.clone()));
@@ -685,6 +691,37 @@ mod tests {
 		assert_eq!(
 			printed.lines().lines().next(),
 			Some(format!("Welcome to Filen CLI v{}!", env!("CARGO_PKG_VERSION")).as_str())
+		);
+	}
+
+	#[test]
+	fn the_help_shows_a_placeholder_for_the_version_while_replay_testing() {
+		let printed = Printed::default();
+
+		print_in_app_docs(&mut printed.replay_testing_ui(), None).unwrap();
+
+		let printed = console::strip_ansi_codes(&printed.lines()).into_owned();
+		assert!(
+			printed
+				.lines()
+				.any(|line| line == "Welcome to Filen CLI v{{ version }}!"),
+			"{printed}"
+		);
+	}
+
+	#[test]
+	fn the_markdown_docs_show_the_version() {
+		let outline = PARSED_DOC_OUTLINE.as_ref().unwrap();
+		let usage = outline.iter().find(|s| s.id == MAIN_SECTION).unwrap();
+
+		let markdown = format_markdown_section(usage);
+
+		assert!(
+			markdown.contains(&format!(
+				"Welcome to Filen CLI v{}!",
+				env!("CARGO_PKG_VERSION")
+			)),
+			"{markdown}"
 		);
 	}
 

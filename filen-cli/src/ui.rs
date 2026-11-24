@@ -1226,16 +1226,16 @@ impl Autocomplete for InquireCompleter {
 	}
 }
 
+/// What replay testing shows in place of the CLI's version ([`UI::version`]).
+const VERSION_PLACEHOLDER: &str = "{{ version }}";
+
 /// Redact output that depends on the runtime environment, so it can be matched in Manuel replay testing:
 /// - Environment variables: $HOME, $MANUEL_TMP, $MANUEL_REMOTE_CWD, $MANUEL_EMAIL
+///
+/// The CLI's version is not redacted here: text can spell the same version without being it, as an
+/// example in a help text does, and would then stop matching once the version moves on. Output
+/// that shows the version takes it from [`UI::version`] instead.
 fn make_output_environment_agnostic_for_replay_testing(mut output: String) -> String {
-	output = output.replace(
-		env!("CARGO_PKG_VERSION"),
-		&style(format!("{} version {}", "{{", "}}"))
-			.yellow()
-			.bold()
-			.to_string(),
-	);
 	for environment_variable in ["HOME", "MANUEL_TMP", "MANUEL_REMOTE_CWD", "MANUEL_EMAIL"] {
 		if let Ok(env_var_value) = std::env::var(environment_variable) {
 			output = output.replace(
@@ -1256,6 +1256,26 @@ impl UI {
 			make_output_environment_agnostic_for_replay_testing(output)
 		} else {
 			output
+		}
+	}
+
+	/// The CLI's version, or `{{ version }}` while replay testing, so that a recording matches every
+	/// release. For text: the placeholder is styled as the other redactions are, which
+	/// [`UI::plain_version`] is not, for JSON.
+	pub(crate) fn version(&self) -> String {
+		if self.make_output_environment_agnostic_for_replay_testing {
+			style(VERSION_PLACEHOLDER).yellow().bold().to_string()
+		} else {
+			env!("CARGO_PKG_VERSION").to_owned()
+		}
+	}
+
+	/// [`UI::version`] without styling, for JSON output.
+	pub(crate) fn plain_version(&self) -> &'static str {
+		if self.make_output_environment_agnostic_for_replay_testing {
+			VERSION_PLACEHOLDER
+		} else {
+			env!("CARGO_PKG_VERSION")
 		}
 	}
 
@@ -1296,6 +1316,13 @@ pub(crate) mod test_support {
 		/// A UI that prints into this buffer, as a terminal shows stdout and stderr together.
 		pub(crate) fn ui(&self) -> UI {
 			UI::with_writers(self.clone(), self.clone())
+		}
+
+		/// [`Printed::ui`], printing as it does while replay testing.
+		pub(crate) fn replay_testing_ui(&self) -> UI {
+			let mut ui = self.ui();
+			ui.initialize(false, false, None, true, true);
+			ui
 		}
 
 		/// [`Printed::ui`], as if stdin were a terminal, so that a prompt could be asked.
@@ -1369,6 +1396,33 @@ mod tests {
 		assert!(!ui.may_draw_progress());
 		ui.initialize(false, false, None, true, true);
 		assert!(!ui.may_draw_progress());
+	}
+
+	#[test]
+	fn the_version_is_a_placeholder_while_replay_testing() {
+		let printed = Printed::default();
+		assert_eq!(
+			console::strip_ansi_codes(&printed.replay_testing_ui().version()),
+			"{{ version }}"
+		);
+		assert_eq!(printed.ui().version(), env!("CARGO_PKG_VERSION"));
+	}
+
+	#[test]
+	fn the_plain_version_is_an_unstyled_placeholder_while_replay_testing() {
+		let printed = Printed::default();
+		assert_eq!(printed.replay_testing_ui().plain_version(), "{{ version }}");
+		assert_eq!(printed.ui().plain_version(), env!("CARGO_PKG_VERSION"));
+	}
+
+	#[test]
+	fn replay_testing_prints_text_spelling_the_version_as_it_is() {
+		let printed = Printed::default();
+		let text = format!("such as v{}", env!("CARGO_PKG_VERSION"));
+
+		printed.replay_testing_ui().print(&text);
+
+		assert_eq!(printed.lines(), text);
 	}
 
 	#[test]
