@@ -19,7 +19,7 @@ use tower::{ServiceBuilder, ServiceExt};
 
 use super::{
 	ClientConfig, Request, RequestMethod, ResponseType,
-	deserialize::{DeserializeLayer, Json, Msgpack, WireFormat},
+	deserialize::{DeserializeLayer, Json, Msgpack, ResponseSlot, WireFormat},
 	retry::RetryError,
 	test_support::client,
 };
@@ -135,17 +135,19 @@ async fn an_error_answer_is_not_sent_again() {
 }
 
 /// Sends one request through the client's retry layer and the response layer of format `W`, the
-/// attempts answered with `bodies` in turn: its result and how many attempts were made.
+/// attempts answered with `bodies` in turn, then takes the answer out as the entry points do: its
+/// result and how many attempts were made.
 async fn through_retry<W, Res>(bodies: &[Vec<u8>]) -> (Result<Res, Error>, usize)
 where
 	W: WireFormat,
-	Res: DeserializeOwned,
+	Res: DeserializeOwned + Send,
 {
 	let client = client(ClientConfig::default());
 	let attempts = AtomicUsize::new(0);
-	let result = ServiceBuilder::new()
+	let slot = ResponseSlot::new();
+	let accepted = ServiceBuilder::new()
 		.layer(client.unauthed.state.retry.clone())
-		.layer(DeserializeLayer::<Res, W>::new())
+		.layer(DeserializeLayer::<W>::new(&slot))
 		.service_fn(|req: Request<(), ()>| {
 			assert_eq!(req.response_type, W::RESPONSE_TYPE);
 			let body = bodies[attempts.fetch_add(1, Ordering::SeqCst)].clone();
@@ -158,6 +160,7 @@ where
 			client: reqwest::Client::new(),
 		})
 		.await;
+	let result = accepted.and_then(|accepted| slot.into_response(accepted));
 	(result, attempts.load(Ordering::SeqCst))
 }
 

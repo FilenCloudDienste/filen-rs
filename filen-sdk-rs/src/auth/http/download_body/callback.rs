@@ -4,12 +4,12 @@ use crate::Error;
 
 use super::super::retry::RetryError;
 
-pub(crate) struct DownloadWithCallbackLayer<'a, F> {
+pub(crate) struct DownloadWithCallbackLayer<'a, F: ?Sized> {
 	callback: Option<&'a F>,
 	max_body_len: Option<usize>,
 }
 
-impl<F> Clone for DownloadWithCallbackLayer<'_, F> {
+impl<F: ?Sized> Clone for DownloadWithCallbackLayer<'_, F> {
 	fn clone(&self) -> Self {
 		Self {
 			callback: self.callback,
@@ -20,7 +20,7 @@ impl<F> Clone for DownloadWithCallbackLayer<'_, F> {
 
 impl<'a, F> DownloadWithCallbackLayer<'a, F>
 where
-	F: Fn(u64, Option<u64>),
+	F: Fn(u64, Option<u64>) + ?Sized,
 {
 	pub(crate) fn new(callback: Option<&'a F>) -> Self {
 		Self {
@@ -40,7 +40,7 @@ where
 	}
 }
 
-impl<'a, S, F> Layer<S> for DownloadWithCallbackLayer<'a, F> {
+impl<'a, S, F: ?Sized> Layer<S> for DownloadWithCallbackLayer<'a, F> {
 	type Service = DownloadWithCallbackService<'a, S, F>;
 
 	fn layer(&self, inner: S) -> Self::Service {
@@ -52,13 +52,13 @@ impl<'a, S, F> Layer<S> for DownloadWithCallbackLayer<'a, F> {
 	}
 }
 
-pub(crate) struct DownloadWithCallbackService<'a, S, F> {
+pub(crate) struct DownloadWithCallbackService<'a, S, F: ?Sized> {
 	inner: S,
 	callback: Option<&'a F>,
 	max_body_len: Option<usize>,
 }
 
-impl<'a, S, F> Clone for DownloadWithCallbackService<'a, S, F>
+impl<'a, S, F: ?Sized> Clone for DownloadWithCallbackService<'a, S, F>
 where
 	S: Clone,
 {
@@ -75,7 +75,7 @@ impl<'a, S, Req, F> Service<Req> for DownloadWithCallbackService<'a, S, F>
 where
 	S: Service<Req, Response = reqwest::Response, Error = RetryError<Error>>,
 	S::Future: 'a,
-	F: Fn(u64, Option<u64>),
+	F: Fn(u64, Option<u64>) + ?Sized,
 {
 	type Response = Vec<u8>;
 	type Error = RetryError<Error>;
@@ -119,7 +119,7 @@ mod boxed {
 		) -> Self
 		where
 			SFut: Future<Output = Result<reqwest::Response, RetryError<Error>>> + 'a,
-			F: Fn(u64, Option<u64>) + 'a,
+			F: Fn(u64, Option<u64>) + ?Sized + 'a,
 		{
 			let fut = Box::pin(async move {
 				let resp = inner.await?;
@@ -235,7 +235,7 @@ mod native {
 	}
 
 	#[pin_project::pin_project(project = DownloadWithCallbackFutureProj)]
-	pub(crate) struct DownloadWithCallbackFuture<'a, S, F> {
+	pub(crate) struct DownloadWithCallbackFuture<'a, S, F: ?Sized> {
 		callback: Option<&'a F>,
 		max_body_len: Option<usize>,
 		#[pin]
@@ -245,7 +245,7 @@ mod native {
 	impl<'a, S, F> DownloadWithCallbackFuture<'a, S, F>
 	where
 		S: Future<Output = Result<reqwest::Response, RetryError<Error>>>,
-		F: Fn(u64, Option<u64>),
+		F: Fn(u64, Option<u64>) + ?Sized,
 	{
 		pub(crate) fn new(inner: S, callback: Option<&'a F>, max_body_len: Option<usize>) -> Self {
 			Self {
@@ -259,7 +259,7 @@ mod native {
 	impl<S, F> Future for DownloadWithCallbackFuture<'_, S, F>
 	where
 		S: Future<Output = Result<reqwest::Response, RetryError<Error>>>,
-		F: Fn(u64, Option<u64>),
+		F: Fn(u64, Option<u64>) + ?Sized,
 	{
 		type Output = Result<Vec<u8>, RetryError<Error>>;
 

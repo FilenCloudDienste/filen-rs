@@ -36,7 +36,7 @@ use crate::{
 	consts::{FULL_CHUNK_BYTES, gateway_url},
 	sync::lock::{LeaseTermsSlot, LockBoard, LockListenerSlot, PendingReleases},
 	thumbnail::{MAX_THUMBNAIL_SOURCE_BYTES, REMOTE_SOURCE_RESIDENT_BYTES},
-	util::{MaybeSend, MaybeSendSync},
+	util::{MaybeSend, MaybeSendSync, MaybeSendSyncRefFn},
 };
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 use bandwidth_limit::{
@@ -69,6 +69,7 @@ mod url_parser;
 pub(crate) use answers::AnswerMark;
 pub(crate) use answers::ServerAnswers;
 use class_limit::{RequestClass, RequestLimits};
+use deserialize::{Accepted, DeserializeLayer, Json, Msgpack, ResponseSlot, WireFormat};
 use resizable::ResizableSemaphore;
 use tower_wasm_time::tps_budget::TpsBudget;
 
@@ -1346,6 +1347,17 @@ impl AuthClient {
 	}
 }
 
+/// The progress callback a streamed response body reports to, as the stacks take it: one
+/// instantiation of the download layer whatever closure a caller passes.
+type ProgressCallback<'a> = dyn Fn(u64, Option<u64>) + Send + Sync + 'a;
+
+// Every typed entry point below is a thin wrapper: it serializes the request body and sends it
+// through a stack generic over the wire format alone (the stack is compiled once per format, not
+// once per request and response type), lending the stack a `deserialize::ResponseSlot` of its
+// response type. The stack's `deserialize::DeserializeLayer` decodes each attempt's body into that
+// slot inside the retry loop, so a body cut short or an `internal_error` answer is still sent
+// again, and the entry point takes the response out of the slot once the stack has answered.
+
 impl UnauthClient {
 	pub(crate) fn state(&self) -> &SharedClientState {
 		&self.state
@@ -1357,19 +1369,37 @@ impl UnauthClient {
 		body: &Req,
 	) -> Result<Res, Error>
 	where
-		Res: DeserializeOwned + Debug,
+		Res: DeserializeOwned + Debug + MaybeSend,
 		Req: Serialize + Debug,
 	{
+		let slot = ResponseSlot::new();
+		let accepted = self
+			.post_stack(
+				endpoint,
+				serialize::serialize_body(body),
+				DeserializeLayer::<Json>::new(&slot),
+			)
+			.await?;
+		slot.into_response(accepted)
+	}
+
+	/// The stack of [`Self::post`].
+	async fn post_stack<W: WireFormat>(
+		&self,
+		endpoint: Cow<'static, str>,
+		body: Result<Bytes, Error>,
+		decode: DeserializeLayer<'_, W>,
+	) -> Result<Accepted, Error> {
 		let url = gateway_url(&endpoint);
 
 		let builder = ServiceBuilder::new()
 			.layer(logging::LogLayer::new(endpoint)) // optional logging
-			.layer(serialize::SerializeLayer::<Req>::new(body)) // required to serialize body
+			.layer(serialize::SerializeLayer) // required to fail on a body that did not serialize
 			.layer(url_parser::UrlParseLayer) // required to parse URL string to reqwest::Url
 			.layer(self.state.limits.layer(RequestClass::Control)) // the class's concurrency limits
 			.layer(self.state.retry.clone()) // required to map RetryError to Error
 			.layer(self.state.rate_limiter.clone()) // optional
-			.layer(deserialize::DeserializeLayer::<Res, deserialize::Json>::new()) // required to convert AsRef<u8> to T
+			.layer(decode) // required to decode the body into the response, and retry one cut short
 			.layer(download_body::full::DownloadLayer::new()); // required to download full response body to bytes
 
 		let builder = {
@@ -1390,7 +1420,7 @@ impl UnauthClient {
 		builder
 			.service_fn(move |request| execute_request(request, Arc::clone(&self.state.answers)))
 			.oneshot(Request::new(
-				RequestMethod::Post(()),
+				RequestMethod::Post(body),
 				url,
 				self.reqwest_client.clone(),
 			))
@@ -1454,16 +1484,39 @@ impl UnauthClient {
 		Req: Serialize + Debug + Sync,
 		F: Fn(u64, Option<u64>) + Send + Sync,
 	{
+		let callback = callback.map(|callback| callback as &ProgressCallback<'_>);
+		async move {
+			let slot = ResponseSlot::new();
+			let accepted = self
+				.post_large_response_stack(
+					endpoint,
+					serialize::serialize_body(body),
+					callback,
+					DeserializeLayer::<Msgpack>::new(&slot),
+				)
+				.await?;
+			slot.into_response(accepted)
+		}
+	}
+
+	/// The stack of [`Self::post_large_response`].
+	async fn post_large_response_stack<W: WireFormat>(
+		&self,
+		endpoint: Cow<'static, str>,
+		body: Result<Bytes, Error>,
+		callback: Option<&ProgressCallback<'_>>,
+		decode: DeserializeLayer<'_, W>,
+	) -> Result<Accepted, Error> {
 		let url = gateway_url(&endpoint);
 
 		let builder = ServiceBuilder::new()
 			.layer(logging::LogLayer::new(endpoint)) // optional logging
-			.layer(serialize::SerializeLayer::<Req>::new(body)) // required to serialize body
+			.layer(serialize::SerializeLayer) // required to fail on a body that did not serialize
 			.layer(url_parser::UrlParseLayer) // required to parse URL string to reqwest::Url
 			.layer(self.state.limits.layer(RequestClass::Control)) // the class's concurrency limits
 			.layer(self.state.retry.clone()) // required to map RetryError to Error
 			.layer(self.state.rate_limiter.clone()) // optional
-			.layer(deserialize::DeserializeLayer::<Res, deserialize::Msgpack>::new()) // required to convert AsRef<u8> to T
+			.layer(decode) // required to decode the body into the response, and retry one cut short
 			.layer(download_body::callback::DownloadWithCallbackLayer::new(
 				callback,
 			)); // required to download full response body to bytes
@@ -1486,10 +1539,11 @@ impl UnauthClient {
 		builder
 			.service_fn(move |request| execute_request(request, Arc::clone(&self.state.answers)))
 			.oneshot(Request::new(
-				RequestMethod::Post(()),
+				RequestMethod::Post(body),
 				url,
 				self.reqwest_client.clone(),
 			))
+			.await
 	}
 
 	/// Streams a GET response body to bytes, invoking `callback(bytes_so_far, content_length)` as
@@ -1549,8 +1603,21 @@ impl UnauthClient {
 impl AuthClient {
 	pub(crate) async fn get_auth<Res>(&self, endpoint: Cow<'static, str>) -> Result<Res, Error>
 	where
-		Res: DeserializeOwned + Debug,
+		Res: DeserializeOwned + Debug + MaybeSend,
 	{
+		let slot = ResponseSlot::new();
+		let accepted = self
+			.get_auth_stack(endpoint, DeserializeLayer::<Json>::new(&slot))
+			.await?;
+		slot.into_response(accepted)
+	}
+
+	/// The stack of [`Self::get_auth`].
+	async fn get_auth_stack<W: WireFormat>(
+		&self,
+		endpoint: Cow<'static, str>,
+		decode: DeserializeLayer<'_, W>,
+	) -> Result<Accepted, Error> {
 		let url = gateway_url(&endpoint);
 
 		let builder = ServiceBuilder::new()
@@ -1559,7 +1626,7 @@ impl AuthClient {
 			.layer(self.unauthed.state.limits.layer(RequestClass::Control)) // the class's concurrency limits
 			.layer(self.unauthed.state.retry.clone()) // required to map RetryError to Error
 			.layer(self.unauthed.state.rate_limiter.clone()) // optional
-			.layer(deserialize::DeserializeLayer::<Res, deserialize::Json>::new()) // required to convert AsRef<u8> to T
+			.layer(decode) // required to decode the body into the response, and retry one cut short
 			.layer(download_body::full::DownloadLayer::new()) // required to download full response body to bytes
 			.map_request(|request: Request<(), reqwest::Url>| {
 				request.into_builder_map_body(|()| "")
@@ -1595,21 +1662,39 @@ impl AuthClient {
 		body: &Req,
 	) -> Result<Res, Error>
 	where
-		Res: DeserializeOwned + Debug,
+		Res: DeserializeOwned + Debug + MaybeSend,
 		Req: Serialize + Debug,
 	{
+		let slot = ResponseSlot::new();
+		let accepted = self
+			.post_auth_stack(
+				endpoint,
+				serialize::serialize_body(body),
+				DeserializeLayer::<Json>::new(&slot),
+			)
+			.await?;
+		slot.into_response(accepted)
+	}
+
+	/// The stack of [`Self::post_auth`].
+	async fn post_auth_stack<W: WireFormat>(
+		&self,
+		endpoint: Cow<'static, str>,
+		body: Result<Bytes, Error>,
+		decode: DeserializeLayer<'_, W>,
+	) -> Result<Accepted, Error> {
 		let url = gateway_url(&endpoint);
 
 		// This could be improved, all the boxes should be removable with type_alias_impl_trait
 		// and using references instead of Arcs
 		let builder = ServiceBuilder::new()
 			.layer(logging::LogLayer::new(endpoint)) // optional logging
-			.layer(serialize::SerializeLayer::<Req>::new(body)) // required to serialize body
+			.layer(serialize::SerializeLayer) // required to fail on a body that did not serialize
 			.layer(url_parser::UrlParseLayer) // required to parse URL string to reqwest::Url
 			.layer(self.unauthed.state.limits.layer(RequestClass::Control)) // the class's concurrency limits
 			.layer(self.unauthed.state.retry.clone()) // required to map RetryError to Error
 			.layer(self.unauthed.state.rate_limiter.clone()) // optional
-			.layer(deserialize::DeserializeLayer::<Res, deserialize::Json>::new()) // required to convert AsRef<u8> to T
+			.layer(decode) // required to decode the body into the response, and retry one cut short
 			.layer(download_body::full::DownloadLayer::new()); // required to download full response body to bytes
 
 		let builder = {
@@ -1635,7 +1720,7 @@ impl AuthClient {
 				execute_request(request, Arc::clone(&self.unauthed.state.answers))
 			})
 			.oneshot(Request::new(
-				RequestMethod::Post(()),
+				RequestMethod::Post(body),
 				url,
 				self.unauthed.reqwest_client.clone(),
 			))
@@ -1652,7 +1737,7 @@ impl AuthClient {
 		request: &Req,
 	) -> Result<Res, Error>
 	where
-		Res: DeserializeOwned + Debug,
+		Res: DeserializeOwned + Debug + MaybeSend,
 		Req: Serialize + Debug,
 	{
 		let single = || self.post_auth::<Req, Res>(endpoint.into(), request);
@@ -1713,22 +1798,42 @@ impl AuthClient {
 		callback: Option<&F>,
 	) -> Result<Res, Error>
 	where
-		Res: DeserializeOwned + Debug,
+		Res: DeserializeOwned + Debug + MaybeSend,
 		Req: Serialize + Debug,
 		F: Fn(u64, Option<u64>) + Send + Sync,
 	{
+		let slot = ResponseSlot::new();
+		let accepted = self
+			.post_large_response_auth_stack(
+				endpoint,
+				serialize::serialize_body(body),
+				callback.map(|callback| callback as &ProgressCallback<'_>),
+				DeserializeLayer::<Msgpack>::new(&slot),
+			)
+			.await?;
+		slot.into_response(accepted)
+	}
+
+	/// The stack of [`Self::post_large_response_auth`].
+	async fn post_large_response_auth_stack<W: WireFormat>(
+		&self,
+		endpoint: Cow<'static, str>,
+		body: Result<Bytes, Error>,
+		callback: Option<&ProgressCallback<'_>>,
+		decode: DeserializeLayer<'_, W>,
+	) -> Result<Accepted, Error> {
 		let url = gateway_url(&endpoint);
 
 		// This could be improved, all the boxes should be removable with type_alias_impl_trait
 		// and using references instead of Arcs
 		let builder = ServiceBuilder::new()
 			.layer(logging::LogLayer::new(endpoint)) // optional logging
-			.layer(serialize::SerializeLayer::<Req>::new(body)) // required to serialize body
+			.layer(serialize::SerializeLayer) // required to fail on a body that did not serialize
 			.layer(url_parser::UrlParseLayer) // required to parse URL string to reqwest::Url
 			.layer(self.unauthed.state.limits.layer(RequestClass::Control)) // the class's concurrency limits
 			.layer(self.unauthed.state.retry.clone()) // required to map RetryError to Error
 			.layer(self.unauthed.state.rate_limiter.clone()) // optional
-			.layer(deserialize::DeserializeLayer::<Res, deserialize::Msgpack>::new())
+			.layer(decode) // required to decode the body into the response, and retry one cut short
 			.layer(download_body::callback::DownloadWithCallbackLayer::new(
 				callback,
 			)); // required to download full response body to bytes
@@ -1754,7 +1859,7 @@ impl AuthClient {
 				execute_request(request, Arc::clone(&self.unauthed.state.answers))
 			})
 			.oneshot(Request::new(
-				RequestMethod::Post(()),
+				RequestMethod::Post(body),
 				url,
 				self.unauthed.reqwest_client.clone(),
 			))
@@ -1772,7 +1877,7 @@ impl AuthClient {
 		endpoint: Cow<'static, str>,
 	) -> Result<Res, Error>
 	where
-		Res: DeserializeOwned + Debug,
+		Res: DeserializeOwned + Debug + MaybeSend,
 	{
 		self.post_raw_bytes_auth_with(
 			request,
@@ -1793,7 +1898,7 @@ impl AuthClient {
 		endpoint: Cow<'static, str>,
 	) -> Result<Res, Error>
 	where
-		Res: DeserializeOwned + Debug,
+		Res: DeserializeOwned + Debug + MaybeSend,
 	{
 		self.post_raw_bytes_auth_lock_reporting(request, url, endpoint, ignore_failed_attempt)
 			.await
@@ -1810,7 +1915,7 @@ impl AuthClient {
 		on_failed_attempt: F,
 	) -> Result<Res, Error>
 	where
-		Res: DeserializeOwned + Debug,
+		Res: DeserializeOwned + Debug + MaybeSend,
 		F: Fn(&Error) + Clone + MaybeSendSync + 'static,
 	{
 		self.post_raw_bytes_auth_with(
@@ -1834,9 +1939,33 @@ impl AuthClient {
 		on_failed_attempt: F,
 	) -> Result<Res, Error>
 	where
-		Res: DeserializeOwned + Debug,
+		Res: DeserializeOwned + Debug + MaybeSend,
 		F: Fn(&Error) + Clone + MaybeSendSync + 'static,
 	{
+		let slot = ResponseSlot::new();
+		let accepted = self
+			.post_raw_bytes_auth_stack(
+				request,
+				url,
+				endpoint,
+				class,
+				&on_failed_attempt,
+				DeserializeLayer::<Json>::new(&slot),
+			)
+			.await?;
+		slot.into_response(accepted)
+	}
+
+	/// The stack of [`Self::post_raw_bytes_auth_with`].
+	async fn post_raw_bytes_auth_stack<W: WireFormat>(
+		&self,
+		request: Bytes,
+		url: &str,
+		endpoint: Cow<'static, str>,
+		class: RequestClass,
+		on_failed_attempt: &MaybeSendSyncRefFn<'_, Error>,
+		decode: DeserializeLayer<'_, W>,
+	) -> Result<Accepted, Error> {
 		let builder = ServiceBuilder::new()
 			.layer(logging::LogLayer::new(endpoint)) // optional logging
 			.layer(url_parser::UrlParseLayer) // required to parse URL string to reqwest::Url
@@ -1844,7 +1973,7 @@ impl AuthClient {
 			.layer(self.unauthed.state.retry.clone()) // required to map RetryError to Error
 			.layer(retry::OnFailedAttemptLayer::new(on_failed_attempt)) // sees every attempt's error
 			.layer(self.unauthed.state.rate_limiter.clone()) // optional
-			.layer(deserialize::DeserializeLayer::<Res, deserialize::Json>::new())
+			.layer(decode) // required to decode the body into the response, and retry one cut short
 			.layer(download_body::full::DownloadLayer::new()); // required to download full response body to bytes
 
 		let builder = {

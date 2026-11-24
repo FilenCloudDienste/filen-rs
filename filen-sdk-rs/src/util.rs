@@ -114,6 +114,13 @@ pub type MaybeSendCallback<'a, T> = std::sync::Arc<dyn Fn(T) + Send + Sync + 'a>
 #[cfg(target_family = "wasm")]
 pub type MaybeSendCallback<'a, T> = std::rc::Rc<dyn Fn(T) + 'a>;
 
+/// A borrowed callback on `&T`, `Send + Sync` where the target has threads, so a future holding a
+/// reference to it stays `Send` there.
+#[cfg(not(target_family = "wasm"))]
+pub(crate) type MaybeSendSyncRefFn<'a, T> = dyn Fn(&T) + Send + Sync + 'a;
+#[cfg(target_family = "wasm")]
+pub(crate) type MaybeSendSyncRefFn<'a, T> = dyn Fn(&T) + 'a;
+
 #[cfg(not(target_family = "wasm"))]
 pub type MaybeArc<T> = std::sync::Arc<T>;
 #[cfg(target_family = "wasm")]

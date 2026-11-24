@@ -1,5 +1,5 @@
 use std::{
-	marker::PhantomData,
+	sync::{Mutex, PoisonError},
 	task::{Context, Poll},
 };
 
@@ -11,13 +11,18 @@ use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::value::RawValue;
 use tower::Service;
 
-use crate::{Error, ErrorKind, auth::http::ResponseType};
+use crate::{
+	Error, ErrorKind,
+	auth::http::ResponseType,
+	util::{MaybeSend, MaybeSendSync},
+};
 
 use super::{Request, retry::RetryError};
 
-/// How a [`DeserializeLayer`] decodes a response body, fixed per stack at compile time so each
-/// response type is compiled against one decoder only. It also names the [`ResponseType`] the
-/// layer asks the server for, so the request and the decoder cannot disagree.
+/// How a [`DeserializeLayer`] decodes a response body, fixed per stack at compile time. It also
+/// names the [`ResponseType`] the layer asks the server for, so the request and the decoder cannot
+/// disagree: a stack is generic over the format alone, and decodes into the response's own type
+/// through a [`ResponseSink`] of that same format.
 pub(crate) trait WireFormat {
 	/// What [`DeserializeService::call`] writes into the request, which picks its headers.
 	const RESPONSE_TYPE: ResponseType;
@@ -114,64 +119,139 @@ fn msgpack_error_is_truncation(e: &rmp_serde::decode::Error) -> bool {
 	}
 }
 
-pub(crate) struct DeserializeLayer<Res, W> {
-	_phantom: std::marker::PhantomData<(Res, W)>,
-}
-
-impl<Res, W> Clone for DeserializeLayer<Res, W> {
-	fn clone(&self) -> Self {
-		Self {
-			_phantom: self._phantom,
+/// Decodes `bytes` into the answer's `data`: a body cut short and the server's `internal_error`
+/// answer are worth sending the request again for, a document that does not decode into `Res` and
+/// any other error answer are not.
+fn decode_response<W: WireFormat, Res: DeserializeOwned>(
+	bytes: &[u8],
+) -> Result<Res, RetryError<Error>> {
+	let response: FilenResponse<Res> = W::decode(bytes)?;
+	match ResponseIntoData::into_data(response) {
+		Ok(data) => Ok(data),
+		Err(ResponseError::ApiError { message, code })
+			if code.as_deref() == Some("internal_error") =>
+		{
+			Err(RetryError::Retry(
+				ResponseError::ApiError { message, code }.into(),
+			))
 		}
+		Err(e) => Err(RetryError::NoRetry(e.into())),
 	}
 }
 
-impl<T, W> DeserializeLayer<T, W> {
+/// Where a stack of format `W` decodes each attempt's body to, inside the retry loop. The stack
+/// sees it as a trait object, so it is compiled once per format whatever the response type, and
+/// only [`ResponseSlot`]'s small impl is compiled per response type.
+pub(crate) trait ResponseSink<W>: MaybeSendSync {
+	/// Decodes `bytes` with format `W` (see [`decode_response`]) and keeps the answer.
+	fn accept(&self, bytes: &[u8]) -> Result<(), RetryError<Error>>;
+}
+
+/// The response an entry point waits for, decoded by its stack's [`DeserializeLayer`]. The entry
+/// point creates it for its own response type, lends it to the stack it sends the request
+/// through, and takes the answer out once the stack has answered, so the type a body is decoded
+/// into is the one the entry point returns.
+pub(crate) struct ResponseSlot<Res> {
+	/// A lock because the stack's future, which borrows the slot, must stay `Send`. Only one
+	/// attempt decodes at a time, so it is never contended.
+	response: Mutex<Option<Res>>,
+}
+
+impl<Res> ResponseSlot<Res> {
 	pub(crate) fn new() -> Self {
 		Self {
-			_phantom: std::marker::PhantomData,
+			response: Mutex::new(None),
 		}
+	}
+
+	/// The answer the stack decoded. `accepted` is what a stack answers with, and only a
+	/// [`DeserializeFuture`] that just filled a slot makes one.
+	pub(crate) fn into_response(self, accepted: Accepted) -> Result<Res, Error> {
+		let Accepted(()) = accepted;
+		self.response
+			.into_inner()
+			// the lock is only held to store a decoded value, which cannot panic
+			.unwrap_or_else(PoisonError::into_inner)
+			.ok_or_else(|| {
+				Error::custom(
+					ErrorKind::Internal,
+					"a request's stack answered without decoding a response (should be impossible)",
+				)
+			})
 	}
 }
 
-impl<S, Res, W> tower::Layer<S> for DeserializeLayer<Res, W> {
-	type Service = DeserializeService<S, Res, W>;
+impl<W, Res> ResponseSink<W> for ResponseSlot<Res>
+where
+	W: WireFormat,
+	Res: DeserializeOwned + MaybeSend,
+{
+	fn accept(&self, bytes: &[u8]) -> Result<(), RetryError<Error>> {
+		let response = decode_response::<W, Res>(bytes)?;
+		*self.response.lock().unwrap_or_else(PoisonError::into_inner) = Some(response);
+		Ok(())
+	}
+}
+
+/// What a stack answers with once its [`DeserializeLayer`] has decoded a body into the
+/// [`ResponseSlot`] it was lent; [`ResponseSlot::into_response`] takes it.
+pub(crate) struct Accepted(());
+
+/// Asks the server for format `W` and decodes every attempt's body into its [`ResponseSink`],
+/// below the retry layer, so a body cut short or an `internal_error` answer is sent again.
+pub(crate) struct DeserializeLayer<'a, W> {
+	sink: &'a dyn ResponseSink<W>,
+}
+
+impl<W> Clone for DeserializeLayer<'_, W> {
+	fn clone(&self) -> Self {
+		Self { sink: self.sink }
+	}
+}
+
+impl<'a, W> DeserializeLayer<'a, W> {
+	pub(crate) fn new(sink: &'a dyn ResponseSink<W>) -> Self {
+		Self { sink }
+	}
+}
+
+impl<'a, S, W> tower::Layer<S> for DeserializeLayer<'a, W> {
+	type Service = DeserializeService<'a, S, W>;
 
 	fn layer(&self, inner: S) -> Self::Service {
 		DeserializeService {
 			inner,
-			_phantom: self._phantom,
+			sink: self.sink,
 		}
 	}
 }
 
-pub(crate) struct DeserializeService<S, Res, W> {
+/// See [`DeserializeLayer`].
+pub(crate) struct DeserializeService<'a, S, W> {
 	inner: S,
-	_phantom: std::marker::PhantomData<(Res, W)>,
+	sink: &'a dyn ResponseSink<W>,
 }
 
-impl<S, Res, W> Clone for DeserializeService<S, Res, W>
+impl<S, W> Clone for DeserializeService<'_, S, W>
 where
 	S: Clone,
 {
 	fn clone(&self) -> Self {
 		Self {
 			inner: self.inner.clone(),
-			_phantom: self._phantom,
+			sink: self.sink,
 		}
 	}
 }
 
-impl<S, Res, W, Body, Url> Service<Request<Body, Url>> for DeserializeService<S, Res, W>
+impl<'a, S, W, Body, Url> Service<Request<Body, Url>> for DeserializeService<'a, S, W>
 where
-	S: Service<Request<Body, Url>, Error = super::retry::RetryError<Error>>,
-	S::Response: AsRef<[u8]>,
-	Res: DeserializeOwned,
+	S: Service<Request<Body, Url>, Response = Vec<u8>, Error = RetryError<Error>>,
 	W: WireFormat,
 {
-	type Response = Res;
+	type Response = Accepted;
 	type Error = S::Error;
-	type Future = DeserializeFuture<S::Future, Res, W>;
+	type Future = DeserializeFuture<'a, S::Future, W>;
 
 	fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
 		self.inner.poll_ready(cx)
@@ -182,63 +262,32 @@ where
 			response_type: W::RESPONSE_TYPE,
 			..req
 		};
-		DeserializeFuture::new(self.inner.call(req))
-	}
-}
-
-#[pin_project::pin_project]
-pub(crate) struct DeserializeFuture<F, Res, W> {
-	#[pin]
-	fut: Option<F>,
-	_phantom: PhantomData<(Res, W)>,
-}
-
-impl<F, Res, W> DeserializeFuture<F, Res, W> {
-	fn new(fut: F) -> Self {
-		Self {
-			fut: Some(fut),
-			_phantom: PhantomData,
+		DeserializeFuture {
+			fut: self.inner.call(req),
+			sink: self.sink,
 		}
 	}
 }
 
-impl<F, Res, W, InRes> Future for DeserializeFuture<F, Res, W>
+/// See [`DeserializeLayer`].
+#[pin_project::pin_project]
+pub(crate) struct DeserializeFuture<'a, F, W> {
+	#[pin]
+	fut: F,
+	sink: &'a dyn ResponseSink<W>,
+}
+
+impl<F, W> Future for DeserializeFuture<'_, F, W>
 where
-	F: Future<Output = Result<InRes, RetryError<Error>>>,
-	InRes: AsRef<[u8]>,
-	Res: DeserializeOwned,
-	W: WireFormat,
+	F: Future<Output = Result<Vec<u8>, RetryError<Error>>>,
 {
-	type Output = Result<Res, RetryError<Error>>;
+	type Output = Result<Accepted, RetryError<Error>>;
 
 	fn poll(self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
 		let this = self.project();
-		if let Some(fut) = this.fut.as_pin_mut() {
-			match fut.poll(cx) {
-				Poll::Ready(Ok(res)) => {
-					let response: FilenResponse<Res> = match W::decode(res.as_ref()) {
-						Ok(response) => response,
-						Err(e) => return Poll::Ready(Err(e)),
-					};
-
-					match ResponseIntoData::into_data(response) {
-						Ok(data) => Poll::Ready(Ok(data)),
-						Err(ResponseError::ApiError { message, code })
-							if code.as_deref() == Some("internal_error") =>
-						{
-							Poll::Ready(Err(RetryError::Retry(
-								ResponseError::ApiError { message, code }.into(),
-							)))
-						}
-						Err(e) => Poll::Ready(Err(RetryError::NoRetry(e.into()))),
-					}
-				}
-				Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-				Poll::Pending => Poll::Pending,
-			}
-		} else {
-			panic!("future already completed")
-		}
+		let body = std::task::ready!(this.fut.poll(cx))?;
+		this.sink.accept(&body)?;
+		Poll::Ready(Ok(Accepted(())))
 	}
 }
 
@@ -250,7 +299,7 @@ mod tests {
 	use serde::Deserialize;
 	use tower::{Layer, Service};
 
-	use super::{DeserializeFuture, DeserializeLayer, Json, Msgpack, WireFormat};
+	use super::{DeserializeFuture, DeserializeLayer, Json, Msgpack, ResponseSlot, WireFormat};
 	use crate::auth::http::{Request, RequestMethod, ResponseType, retry::RetryError};
 
 	#[derive(Deserialize, Debug)]
@@ -317,9 +366,12 @@ mod tests {
 	#[test]
 	fn deserialize_layer_classifies_truncation_retryable() {
 		fn run<W: WireFormat>(bytes: Vec<u8>) -> Result<UuidHolder, RetryError<crate::Error>> {
-			futures::executor::block_on(DeserializeFuture::<_, UuidHolder, W>::new(
-				std::future::ready(Ok::<_, RetryError<crate::Error>>(bytes)),
-			))
+			let slot = ResponseSlot::<UuidHolder>::new();
+			let accepted = futures::executor::block_on(DeserializeFuture::<_, W> {
+				fut: std::future::ready(Ok::<_, RetryError<crate::Error>>(bytes)),
+				sink: &slot,
+			})?;
+			Ok(slot.into_response(accepted).unwrap())
 		}
 
 		let uuid = Uuid::new_v4();
@@ -363,7 +415,8 @@ mod tests {
 				sent.set(Some(req.response_type));
 				std::future::ready(Ok::<_, RetryError<crate::Error>>(Vec::<u8>::new()))
 			});
-			let mut service = DeserializeLayer::<(), W>::new().layer(inner);
+			let slot = ResponseSlot::<()>::new();
+			let mut service = DeserializeLayer::<W>::new(&slot).layer(inner);
 			let decoded = futures::executor::block_on(service.call(Request {
 				method: RequestMethod::Get,
 				response_type: carried,
