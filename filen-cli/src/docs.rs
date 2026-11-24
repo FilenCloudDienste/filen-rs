@@ -136,6 +136,11 @@ const DOC_OUTLINE: &[DocSection] = &[
 ];
 
 const MAIN_SECTION: &str = "usage";
+
+/// A doc fragment's content with the CLI's version filled in where it says `{{VERSION}}`.
+fn fill_in_version(content: &str) -> String {
+	content.replace("{{VERSION}}", env!("CARGO_PKG_VERSION"))
+}
 static PARSED_DOC_OUTLINE: LazyLock<Result<Vec<ParsedDocSection>>> = LazyLock::new(|| {
 	// parse doc elements
 	let mut commands = CliArgs::command();
@@ -159,9 +164,7 @@ static PARSED_DOC_OUTLINE: LazyLock<Result<Vec<ParsedDocSection>>> = LazyLock::n
 						{
 							used_doc_fragments.insert(fragment.id.clone());
 							Ok(ParsedDocElement::DocFragment {
-								text: fragment
-									.content
-									.replace("{{VERSION}}", env!("CARGO_PKG_VERSION")),
+								text: fill_in_version(&fragment.content),
 							})
 						} else {
 							Err(anyhow::anyhow!(
@@ -442,7 +445,7 @@ pub(crate) fn print_in_app_docs(
 		.find(|fragment| fragment.id == command_or_topic)
 	{
 		// doc fragment
-		ui.print(&doc_fragment.content);
+		ui.print(&fill_in_version(&doc_fragment.content));
 	} else if let Some(command) = CliArgs::command().find_subcommand_mut(&command_or_topic) {
 		// command help
 		ui.print(&UI::format_command_help(&mut command.clone()));
@@ -647,6 +650,7 @@ mod tests {
 	};
 
 	use super::*;
+	use crate::ui::test_support::Printed;
 
 	/// A docs server on a free port of the loopback interface, and its address.
 	fn local_server() -> (tiny_http::Server, std::net::SocketAddr) {
@@ -670,6 +674,18 @@ mod tests {
 				"{id}"
 			);
 		}
+	}
+
+	#[test]
+	fn a_fragment_asked_for_by_name_shows_the_version() {
+		let printed = Printed::default();
+
+		print_in_app_docs(&mut printed.ui(), Some("main-usage".to_owned())).unwrap();
+
+		assert_eq!(
+			printed.lines().lines().next(),
+			Some(format!("Welcome to Filen CLI v{}!", env!("CARGO_PKG_VERSION")).as_str())
+		);
 	}
 
 	/// The command `name`, as the help shows it.
