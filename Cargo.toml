@@ -42,6 +42,11 @@ opt-level = 3
 lto = true
 codegen-units = 1
 
+# The CLI's release binaries carry no symbol table: it was a fifth of their size, and nothing
+# reads it. The other release artifacts (the mobile library, the napi addon) keep theirs.
+[profile.release.package.filen-cli]
+strip = "symbols"
+
 [profile.web-release]
 inherits = "release"
 opt-level = "s"
