@@ -1957,6 +1957,10 @@ mod client_timeout_tests;
 #[cfg(all(test, not(all(target_family = "wasm", target_os = "unknown"))))]
 mod pre_send_connect_tests;
 
+// Native-only: the JSON cases drive a real local TCP server.
+#[cfg(all(test, not(all(target_family = "wasm", target_os = "unknown"))))]
+mod response_retry_tests;
+
 // Native-only: they drive the real entry points through a scripted local proxy.
 #[cfg(all(test, not(all(target_family = "wasm", target_os = "unknown"))))]
 mod request_class_tests;
