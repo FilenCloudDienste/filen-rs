@@ -43,15 +43,16 @@ else
     arch=x86_64
   fi
 
-  # for darwin-aarch64, use the darwin-x86_64 binary instead (might be changed later)
-  if [[ $platform == "darwin" && $arch == "aarch64" ]] ; then
-    arch=x86_64
-  fi
-
   # fetch release info
   latest_release=$(curl -s https://api.github.com/repos/FilenCloudDienste/filen-cli-releases/releases/latest)
   version=$(echo "$latest_release" | grep "tag_name" | cut -d \" -f 4)
   download_url=$(echo "$latest_release" | grep "browser_download_url.*$arch.*$platform" | cut -d \" -f 4)
+
+  # releases before the native Apple silicon binary only have the x86_64 one, which runs under Rosetta
+  if [[ ${#download_url} == 0 && $platform == "darwin" && $arch == "aarch64" ]] ; then
+    arch=x86_64
+    download_url=$(echo "$latest_release" | grep "browser_download_url.*$arch.*$platform" | cut -d \" -f 4)
+  fi
 
   if [[ ${#download_url} == 0 ]] ; then
 
