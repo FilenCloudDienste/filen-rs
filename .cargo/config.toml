@@ -27,6 +27,9 @@ rustflags = ["-Zhigher-ranked-assumptions", "-C", "link-arg=--ld-path=wild"]
 [target.x86_64-pc-windows-msvc]
 rustflags = ["-Zhigher-ranked-assumptions", "-C", "link-arg=/STACK:2097152"]
 
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-Zhigher-ranked-assumptions", "-C", "link-arg=/STACK:2097152"]
+
 # 64 bit Mingw
 [target.x86_64-pc-windows-gnu]
 rustflags = [

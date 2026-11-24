@@ -62,10 +62,20 @@ jobs:
           - target: aarch64-unknown-linux-musl
             os: ubuntu-latest
             command: cross
+          # macos-latest is arm64: the aarch64 binary builds natively, the x86_64 one is
+          # cross-compiled
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            command: cargo
           - target: x86_64-apple-darwin
             os: macos-latest
             command: cargo
           - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            command: cargo
+          # cross-compiled from the x86_64 runner, as npm-publish.yml builds the arm64 Windows
+          # napi addon
+          - target: aarch64-pc-windows-msvc
             os: windows-latest
             command: cargo
     runs-on: ${{ matrix.os }}
@@ -129,7 +139,7 @@ jobs:
           # (`-C link-arg=--ld-path=wild`), which the `cross` images' GNU linkers reject.
           # CARGO_TARGET_<triple>_RUSTFLAGS would be appended to that config list, not replace
           # it; RUSTFLAGS replaces it. Only set it for the gnu targets: it would also replace
-          # the Windows target's `/STACK` link arg, and even an empty value overrides.
+          # the Windows targets' `/STACK` link arg, and even an empty value overrides.
           if [[ $target == *-linux-gnu ]]; then
             export RUSTFLAGS=-Zhigher-ranked-assumptions
           fi

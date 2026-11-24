@@ -7,6 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+- release binaries for macOS on Apple silicon (`aarch64-apple-darwin`) and Windows on ARM (`aarch64-pc-windows-msvc`)
 - on Apple silicon, `install.sh` and `export-api-key.sh` download the native `aarch64-apple-darwin` binary when the release has one, and the x86_64 one (under Rosetta) otherwise
 
 ## 0.3.0 - 2026-11-23
