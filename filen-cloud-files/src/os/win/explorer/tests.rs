@@ -5,7 +5,7 @@
 
 use std::{
 	path::PathBuf,
-	sync::{Mutex, MutexGuard, PoisonError},
+	sync::{Mutex, MutexGuard, OnceLock, PoisonError},
 };
 
 use super::*;
@@ -111,8 +111,23 @@ fn set_value(hive: Hive, path: &str, name: Option<&str>, value: &str) {
 	set_string(&create(hive, path).unwrap(), name, value, false).unwrap();
 }
 
+/// The Windows user the tests write keys as: the owner of the keys this process creates, which
+/// `brand_as` and the sweep check every entry against. Not always the process's user: an elevated
+/// administrator's process creates keys owned by the Administrators group where the "default owner
+/// for objects created by members of the Administrators group" policy names the group, as it does
+/// by default on Windows Server, where CI runs the tests elevated. The helper refuses to start
+/// elevated, so for it the two are always the same SID.
 fn own() -> String {
-	own_sid().unwrap()
+	static OWNER: OnceLock<String> = OnceLock::new();
+	OWNER
+		.get_or_init(|| {
+			let probe = format!(r"Software\FilenCloudFilesTestOwner{}", std::process::id());
+			let owner = ffi::reg_owner_sid(&create(Hive::CurrentUser, &probe).unwrap()).unwrap();
+			delete_tree(Hive::CurrentUser, &probe).unwrap();
+			String::from_utf16(&owner).unwrap()
+		})
+		// Every test holds its own copy, as it did when this read the token each time.
+		.clone()
 }
 
 /// Removes, when dropped, what a test wrote for each of `users` as each of `sids`, and each of
@@ -874,7 +889,7 @@ fn the_sweep_removes_the_commands_once_no_entry_of_the_user_is_left() {
 #[test]
 fn a_build_serving_thumbnails_registers_its_class_then_names_it_on_the_entry() {
 	let _marked = marked_classes();
-	let sid = own_sid().unwrap();
+	let sid = own();
 	let user = test_user(40);
 	let root = test_root("thumbnails");
 	let (key, clsid) = test_thumbnail_class(1);
@@ -913,7 +928,7 @@ fn a_build_serving_thumbnails_registers_its_class_then_names_it_on_the_entry() {
 #[test]
 fn a_build_not_serving_thumbnails_removes_the_entrys_value_and_writes_no_class() {
 	let _marked = marked_classes();
-	let sid = own_sid().unwrap();
+	let sid = own();
 	let user = test_user(41);
 	let root = test_root("no-thumbnails");
 	let (key, clsid) = test_thumbnail_class(2);
