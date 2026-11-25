@@ -160,6 +160,24 @@ jobs:
       # harness examples, which no other pass compiles.
       - name: Run clippy on Cloud Files test-seams targets
         run: cargo clippy -p filen-cloud-files -F test-seams --all-targets -- -D warnings
+      # Cloud Files' Windows tests ask the Cloud Files filter (cldflt) about real directories. The
+      # Server image does not always have it loaded, and then every such call fails with
+      # ERROR_INVALID_FUNCTION. Print its state, load it when it is not running, and print the
+      # state again, so a failure below can be read against it. Never fails the job itself.
+      - name: Load the Cloud Files filter
+        shell: pwsh
+        run: |
+          sc.exe qc cldflt
+          sc.exe query cldflt
+          fltmc filters
+          if (-not ((sc.exe query cldflt | Out-String) -match 'RUNNING')) {
+            fltmc load cldflt
+            if ($LASTEXITCODE -ne 0) { sc.exe start cldflt }
+            sc.exe query cldflt
+            fltmc filters
+          }
+          fltmc instances -f cldflt
+          exit 0
       - name: Run unit tests
         run: cargo test --lib -F cache,sync-engine --no-fail-fast
         env:
@@ -169,8 +187,10 @@ jobs:
           TEST_SHARE_PASSWORD: 'test_share_password'
           RUST_LOG: debug
       # The helper binary as the desktop app spawns it, and the check that no line or log of the
-      # helper shows a session's secrets: offline, on fakes, with no account.
+      # helper shows a session's secrets: offline, on fakes, with no account. Runs after a unit
+      # test failure too, so one red step does not hide the state of the other.
       - name: Run Cloud Files helper tests
+        if: ${{ !cancelled() }}
         run: cargo test -p filen-cloud-files -F test-seams --test helper_secrets --test helper_spawn --no-fail-fast
 
   ci-macos:
