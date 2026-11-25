@@ -41,7 +41,10 @@ use tokio_tungstenite::{
 };
 use tower::ServiceExt;
 
-use crate::{Error, ErrorKind};
+use crate::{
+	Error, ErrorKind,
+	auth::http::resolver::{CappedResolver, SystemLookup},
+};
 
 #[cfg(target_os = "android")]
 pub mod android;
@@ -637,8 +640,15 @@ impl SocketTransport {
 	}
 
 	/// The connector a proxy is reached with: any scheme, as a SOCKS proxy's URL is not `http`.
-	fn proxy_connector(&self) -> HttpConnector {
-		let mut connector = HttpConnector::new();
+	/// Each connect attempt gets at least [`CONNECT_ATTEMPT_FLOOR`] of the connect timeout, as
+	/// for reqwest's connections.
+	///
+	/// [`CONNECT_ATTEMPT_FLOOR`]: crate::auth::http::resolver::CONNECT_ATTEMPT_FLOOR
+	fn proxy_connector(&self) -> HttpConnector<CappedResolver<SystemLookup>> {
+		let mut connector = HttpConnector::new_with_resolver(CappedResolver::new(
+			SystemLookup,
+			self.connect_timeout,
+		));
 		connector.enforce_http(false);
 		connector.set_connect_timeout(self.connect_timeout);
 		connector

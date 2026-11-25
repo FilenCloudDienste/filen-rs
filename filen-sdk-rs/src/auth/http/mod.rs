@@ -56,6 +56,8 @@ mod download_body;
 mod limit;
 mod logging;
 mod resizable;
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+pub(crate) mod resolver;
 mod retry;
 mod serialize;
 #[cfg(all(test, not(all(target_family = "wasm", target_os = "unknown"))))]
@@ -83,7 +85,10 @@ impl Client {
 }
 
 /// Default cap on the TCP/TLS connect phase. Connecting should be fast, so this mainly bounds a
-/// host that accepts no connection (SYN black-hole) instead of letting it hang.
+/// host that accepts no connection (SYN black-hole) instead of letting it hang. A host's addresses
+/// are tried one after the other within it, each for an even share of it among the addresses of
+/// its family, and only as many as leave each at least [`resolver::CONNECT_ATTEMPT_FLOOR`] (see
+/// there).
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Default read timeout. reqwest applies this as a deadline for the response to *start* (time to
@@ -306,7 +311,8 @@ impl ClientConfig {
 
 	/// Build the [`reqwest::Client`] backing every request, applying the connect/read timeouts
 	/// and the dead-peer detection (TCP keepalive, see [`TCP_KEEPALIVE_IDLE`]), which leaves the
-	/// read timeout to slow servers alone.
+	/// read timeout to slow servers alone. With a connect timeout, a host name resolves to only as
+	/// many addresses as leave each connect attempt [`resolver::CONNECT_ATTEMPT_FLOOR`] of it.
 	/// On the desktop and mobile targets (`platform_net`) it also builds the websocket's transport, which shares the
 	/// client's TLS configuration (see [`crate::platform_net`]).
 	///
@@ -315,21 +321,7 @@ impl ClientConfig {
 	pub(crate) fn build_http(&self) -> Result<HttpClients, Error> {
 		#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 		{
-			let mut builder = reqwest::Client::builder()
-				.tcp_keepalive(TCP_KEEPALIVE_IDLE)
-				.tcp_keepalive_interval(TCP_KEEPALIVE_INTERVAL)
-				.tcp_keepalive_retries(TCP_KEEPALIVE_RETRIES)
-				.pool_idle_timeout(POOL_IDLE_TIMEOUT);
-			#[cfg(any(target_os = "android", target_os = "linux"))]
-			{
-				builder = builder.tcp_user_timeout(TCP_USER_TIMEOUT);
-			}
-			if let Some(connect_timeout) = self.connect_timeout {
-				builder = builder.connect_timeout(connect_timeout);
-			}
-			if let Some(read_timeout) = self.read_timeout {
-				builder = builder.read_timeout(read_timeout);
-			}
+			let builder = self.reqwest_builder(resolver::SystemLookup);
 			#[cfg(platform_net)]
 			let (builder, socket_transport) = {
 				let tls = crate::platform_net::client_tls()?;
@@ -358,6 +350,34 @@ impl ClientConfig {
 				reqwest: reqwest::Client::new(),
 			})
 		}
+	}
+
+	/// The native [`reqwest::ClientBuilder`] [`build_http`](Self::build_http) starts from, its
+	/// host names resolved by `lookup`, before the TLS configuration.
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	fn reqwest_builder(&self, lookup: impl resolver::Lookup) -> reqwest::ClientBuilder {
+		let mut builder = reqwest::Client::builder()
+			.tcp_keepalive(TCP_KEEPALIVE_IDLE)
+			.tcp_keepalive_interval(TCP_KEEPALIVE_INTERVAL)
+			.tcp_keepalive_retries(TCP_KEEPALIVE_RETRIES)
+			.pool_idle_timeout(POOL_IDLE_TIMEOUT);
+		#[cfg(any(target_os = "android", target_os = "linux"))]
+		{
+			builder = builder.tcp_user_timeout(TCP_USER_TIMEOUT);
+		}
+		if let Some(connect_timeout) = self.connect_timeout {
+			// Without a connect timeout reqwest's own resolver stays: no attempt is cut short.
+			builder = builder
+				.connect_timeout(connect_timeout)
+				.dns_resolver(Arc::new(resolver::CappedResolver::new(
+					lookup,
+					Some(connect_timeout),
+				)));
+		}
+		if let Some(read_timeout) = self.read_timeout {
+			builder = builder.read_timeout(read_timeout);
+		}
+		builder
 	}
 
 	/// The [`reqwest::Client`] [`build_http`](Self::build_http) builds.
