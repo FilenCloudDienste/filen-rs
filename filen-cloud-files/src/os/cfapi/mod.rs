@@ -231,13 +231,39 @@ pub enum CfCall {
 }
 
 /// `ERROR_CLOUD_FILE_NOT_UNDER_SYNC_ROOT`: the path is in no sync root.
-// Only the Windows layer's calls answer with or need it.
-#[cfg(windows)]
+// Only the Windows layer's calls answer with or need it, and [`is_in_no_sync_root`]'s tests.
+#[cfg(any(windows, test))]
 pub(crate) const ERROR_CLOUD_FILE_NOT_UNDER_SYNC_ROOT: u32 = 390;
 /// `ERROR_NOT_A_CLOUD_SYNC_ROOT`: the path is not a sync root.
-// Only the Windows layer's calls answer with or need it.
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 pub(crate) const ERROR_NOT_A_CLOUD_SYNC_ROOT: u32 = 405;
+/// `ERROR_INVALID_FUNCTION`: see [`is_in_no_sync_root`].
+#[cfg(any(windows, test))]
+pub(crate) const ERROR_INVALID_FUNCTION: u32 = 1;
+
+/// Whether `code`, a failure of `CfGetSyncRootInfoByPath`, says the path is in no sync root: it
+/// is in none, it does not exist, or the Cloud Files filter is not attached to its volume.
+///
+/// `ERROR_INVALID_FUNCTION` is the last. Measured (Windows 11, in the VM): on a fresh NTFS volume
+/// the filter (cldflt) has no instance, and every query there fails with it, as it did on GitHub's
+/// Windows Server runner, where the filter ran on no volume. `CfRegisterSyncRoot` on such a volume
+/// succeeds and attaches the filter, which stays attached after the root is unregistered; queries
+/// there then fail with `ERROR_CLOUD_FILE_NOT_UNDER_SYNC_ROOT` or `ERROR_NOT_A_CLOUD_SYNC_ROOT` as
+/// usual, and with `ERROR_INVALID_FUNCTION` again once the filter is detached (`fltmc detach`).
+/// A FAT32 volume answers `ERROR_INVALID_FUNCTION` too: it holds no sync root either, and the
+/// helper refuses a root there before it asks (`RootRefusal::NotNtfs`).
+#[cfg(any(windows, test))]
+pub(crate) fn is_in_no_sync_root(code: Hresult) -> bool {
+	[
+		ERROR_CLOUD_FILE_NOT_UNDER_SYNC_ROOT,
+		ERROR_NOT_A_CLOUD_SYNC_ROOT,
+		ERROR_FILE_NOT_FOUND,
+		ERROR_PATH_NOT_FOUND,
+		ERROR_INVALID_FUNCTION,
+	]
+	.into_iter()
+	.any(|none| code == Hresult::from_win32(none))
+}
 
 /// The longest sync root identity cfapi stores, in bytes (`CfRegisterSyncRoot`: 64 KiB).
 // Only the Windows layer's calls answer with or need it.

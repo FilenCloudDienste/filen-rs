@@ -30,11 +30,9 @@ use crate::{
 		DeleteRequest, DeleteResponder, FetchDataRequest, LocalEvent, PopulateRequest,
 		PopulateResponder, RenameRequest, RenameResponder,
 		cfapi::{
-			CfCall, E_FAIL, ERROR_CLOUD_FILE_NOT_UNDER_SYNC_ROOT, ERROR_FILE_NOT_FOUND,
-			ERROR_NOT_A_CLOUD_SYNC_ROOT, ERROR_PATH_NOT_FOUND, Hresult, MAX_PROVIDER_NAME_UNITS,
-			MAX_PROVIDER_VERSION_UNITS, ProviderInfoError, SyncRootIdentity, SyncRootPathError,
-			SyncRootStandard, WideNul, WinError, parse_sync_root_info, provider_units,
-			sync_root_units,
+			CfCall, E_FAIL, Hresult, MAX_PROVIDER_NAME_UNITS, MAX_PROVIDER_VERSION_UNITS,
+			ProviderInfoError, SyncRootIdentity, SyncRootPathError, SyncRootStandard, WideNul,
+			WinError, is_in_no_sync_root, parse_sync_root_info, provider_units, sync_root_units,
 		},
 	},
 };
@@ -176,26 +174,16 @@ pub fn take_over(path: SyncRootPath) -> RegisteredRoot {
 	RegisteredRoot { path }
 }
 
-/// The registration of the sync root `path` is at or below, `None` when it is in none (or does not
-/// exist).
+/// The registration of the sync root `path` is at or below, `None` when it is in none, does not
+/// exist, or is on a volume the Cloud Files filter is not attached to (see
+/// [`is_in_no_sync_root`]).
 pub(crate) fn sync_root_info(path: &SyncRootPath) -> Result<Option<SyncRootStandard>, WinError> {
 	match ffi::sync_root_info(&path.0) {
 		Ok(bytes) => parse_sync_root_info(&bytes).map(Some).ok_or(WinError {
 			call: CfCall::SyncRootInfo,
 			code: Hresult::new(E_FAIL),
 		}),
-		Err(code)
-			if [
-				ERROR_CLOUD_FILE_NOT_UNDER_SYNC_ROOT,
-				ERROR_NOT_A_CLOUD_SYNC_ROOT,
-				ERROR_FILE_NOT_FOUND,
-				ERROR_PATH_NOT_FOUND,
-			]
-			.into_iter()
-			.any(|none| code == Hresult::from_win32(none)) =>
-		{
-			Ok(None)
-		}
+		Err(code) if is_in_no_sync_root(code) => Ok(None),
 		Err(code) => Err(WinError {
 			call: CfCall::SyncRootInfo,
 			code,

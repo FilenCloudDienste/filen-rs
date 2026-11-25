@@ -95,6 +95,7 @@ const _: () = {
 	assert!(cfapi::ERROR_CLOUD_FILE_IN_USE == Foundation::ERROR_CLOUD_FILE_IN_USE);
 	assert!(cfapi::ERROR_FILE_NOT_FOUND == Foundation::ERROR_FILE_NOT_FOUND);
 	assert!(cfapi::ERROR_PATH_NOT_FOUND == Foundation::ERROR_PATH_NOT_FOUND);
+	assert!(cfapi::ERROR_INVALID_FUNCTION == Foundation::ERROR_INVALID_FUNCTION);
 	assert!(cfapi::ERROR_SHARING_VIOLATION == Foundation::ERROR_SHARING_VIOLATION);
 	assert!(cfapi::ERROR_FILE_EXISTS == Foundation::ERROR_FILE_EXISTS);
 	assert!(cfapi::ERROR_ALREADY_EXISTS == Foundation::ERROR_ALREADY_EXISTS);

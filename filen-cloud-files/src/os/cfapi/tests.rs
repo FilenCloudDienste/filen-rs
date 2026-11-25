@@ -46,6 +46,31 @@ fn an_hresult_prints_in_hex_with_its_name_when_known() {
 }
 
 #[test]
+fn a_sync_root_query_failing_for_no_root_no_path_or_no_filter_finds_no_root() {
+	for code in [390, 405, 2, 3, 1] {
+		assert!(is_in_no_sync_root(Hresult::from_win32(code)), "{code}");
+	}
+}
+
+#[test]
+fn a_sync_root_query_failing_otherwise_is_a_failure() {
+	// Access denied, sharing violation, bad parameter, E_FAIL and E_INVALIDARG.
+	for code in [
+		Hresult::from_win32(5),
+		Hresult::from_win32(32),
+		Hresult::from_win32(87),
+		Hresult::new(E_FAIL),
+		Hresult::new(E_INVALIDARG),
+	] {
+		assert!(!is_in_no_sync_root(code), "{code}");
+	}
+	// The same low word outside facility 7 is no Win32 error.
+	assert!(!is_in_no_sync_root(Hresult::new(
+		0x8000_0001_u32.cast_signed()
+	)));
+}
+
+#[test]
 fn a_win_error_names_its_call_and_code() {
 	let error = WinError {
 		call: CfCall::Register,
