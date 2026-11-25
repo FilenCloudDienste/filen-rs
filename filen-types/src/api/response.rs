@@ -27,7 +27,20 @@ where
 	}
 }
 
-impl<T> FilenResponse<'_, T> {
+impl<'a, T> FilenResponse<'a, T> {
+	/// This response with its `data`, if it has any, mapped by `f`, or the error `f` returned.
+	pub fn try_map_data<U, E>(
+		self,
+		f: impl FnOnce(T) -> Result<U, E>,
+	) -> Result<FilenResponse<'a, U>, E> {
+		Ok(FilenResponse {
+			status: self.status,
+			message: self.message,
+			code: self.code,
+			data: self.data.map(f).transpose()?,
+		})
+	}
+
 	pub fn into_data(self) -> Result<T, ResponseError> {
 		match (self.status, self.data) {
 			(Some(true), Some(data)) => Ok(data),
@@ -85,5 +98,45 @@ impl ResponseIntoData<()> for FilenResponse<'_, ()> {
 				code: self.code.map(|s| s.into_owned()),
 			}),
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn response(data: Option<&str>) -> FilenResponse<'static, &str> {
+		FilenResponse {
+			status: Some(true),
+			message: Some(Cow::Borrowed("ok")),
+			code: Some(Cow::Borrowed("done")),
+			data,
+		}
+	}
+
+	#[test]
+	fn try_map_data_maps_the_data_and_keeps_the_envelope() {
+		let mapped = response(Some("7")).try_map_data(str::parse::<u32>).unwrap();
+		assert_eq!(mapped.status, Some(true));
+		assert_eq!(mapped.message.as_deref(), Some("ok"));
+		assert_eq!(mapped.code.as_deref(), Some("done"));
+		assert_eq!(mapped.data, Some(7));
+	}
+
+	#[test]
+	fn try_map_data_does_not_call_the_mapping_without_data() {
+		let mapped = response(None)
+			.try_map_data(|_| -> Result<u32, ()> { panic!("mapped absent data") })
+			.unwrap();
+		assert_eq!(mapped.data, None);
+		assert_eq!(mapped.code.as_deref(), Some("done"));
+	}
+
+	#[test]
+	fn try_map_data_returns_the_mapping_error() {
+		let e = response(Some("seven"))
+			.try_map_data(str::parse::<u32>)
+			.unwrap_err();
+		assert_eq!(e.to_string(), "invalid digit found in string");
 	}
 }

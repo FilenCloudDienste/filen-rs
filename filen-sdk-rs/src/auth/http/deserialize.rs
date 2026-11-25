@@ -8,11 +8,42 @@ use filen_types::{
 	error::ResponseError,
 };
 use serde::{Deserialize, de::DeserializeOwned};
+use serde_json::value::RawValue;
 use tower::Service;
 
 use crate::{Error, ErrorKind, auth::http::ResponseType};
 
 use super::{Request, retry::RetryError};
+
+/// Decodes a JSON body. The envelope is decoded by one function shared by every response type,
+/// and only `data` is decoded per type, so a decode error's line and column count from the start
+/// of `data`.
+fn decode_json<Res: DeserializeOwned>(
+	bytes: &[u8],
+) -> Result<FilenResponse<'_, Res>, RetryError<Error>> {
+	decode_json_envelope(bytes)?.try_map_data(|data| {
+		serde_json::from_str(data.get()).map_err(|e| json_decode_error(e, bytes.len()))
+	})
+}
+
+/// The JSON envelope of `bytes`, its `data` left undecoded.
+fn decode_json_envelope(bytes: &[u8]) -> Result<FilenResponse<'_, &RawValue>, RetryError<Error>> {
+	serde_json::from_slice(bytes).map_err(|e| json_decode_error(e, bytes.len()))
+}
+
+/// The error for a JSON body of `len` bytes that did not decode, retryable when it ran out of
+/// bytes. `data` is only decoded once the whole envelope has, so only the envelope can run out.
+fn json_decode_error(e: serde_json::Error, len: usize) -> RetryError<Error> {
+	let truncated = e.classify() == serde_json::error::Category::Eof;
+	RetryError::from_retryable(
+		truncated,
+		Error::custom_with_source(
+			ErrorKind::Response,
+			e,
+			Some(format!("Failed to deserialize json response ({len} bytes)")),
+		),
+	)
+}
 
 /// The gateway msgpack-encodes the same string-keyed structures as its JSON responses (uuids as
 /// hyphenated strings, not 16-byte arrays), so format-sensitive types like [`uuid::Uuid`] must be
@@ -157,22 +188,9 @@ where
 							}
 						}
 					} else {
-						match serde_json::from_slice(res.as_ref()) {
+						match decode_json(res.as_ref()) {
 							Ok(resp) => resp,
-							Err(e) => {
-								let truncated = e.classify() == serde_json::error::Category::Eof;
-								return Poll::Ready(Err(RetryError::from_retryable(
-									truncated,
-									Error::custom_with_source(
-										ErrorKind::Response,
-										e,
-										Some(format!(
-											"Failed to deserialize json response ({} bytes)",
-											res.as_ref().len()
-										)),
-									),
-								)));
-							}
+							Err(e) => return Poll::Ready(Err(e)),
 						}
 					};
 
