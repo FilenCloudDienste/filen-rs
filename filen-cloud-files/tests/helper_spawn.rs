@@ -1,5 +1,9 @@
 //! The helper binary as the desktop app spawns it. The exe comes from `FILEN_CLOUD_FILES_HELPER`
 //! when set, as the build machine's path is wrong in a Windows VM, and from Cargo otherwise.
+//!
+//! The helper refuses to run elevated, and GitHub's Windows runner runs every step elevated. There
+//! each test checks the refusal instead, and skips, saying so, what needs a serving helper; the
+//! Windows VM runs, as the signed-in user, cover those.
 
 #[cfg(windows)]
 use std::{
@@ -14,7 +18,11 @@ use std::{
 	process::{Command, Stdio},
 };
 
+#[cfg(windows)]
+use filen_cloud_files::is_elevated;
 use serde_json::Value;
+#[cfg(windows)]
+use serde_json::json;
 
 /// How long a helper may take to say its first line or to exit before the test fails: a hung
 /// helper fails the test instead of blocking the run.
@@ -80,7 +88,32 @@ impl Helper {
 			.recv_timeout(DEADLINE)
 			.expect("the helper wrote no line");
 		self.0.stdout = Some(stdout);
-		serde_json::from_str(&line).unwrap()
+		serde_json::from_str(&line).unwrap_or_else(|error| panic!("{line:?}: {error}"))
+	}
+
+	/// Whether the helper serves: its first line is `hello`. In an elevated test process, the
+	/// helper's refusal instead, checked whole with its exit code: `false`, and the test skips
+	/// the rest, which needs a serving helper, naming itself.
+	fn serves(&mut self, test: &str) -> bool {
+		let line = self.first_line();
+		if is_elevated().unwrap() {
+			assert_eq!(
+				line,
+				json!({
+					"t": "fatal",
+					"code": "elevated",
+					"message": "the helper runs elevated; run it as the signed-in user",
+				})
+			);
+			assert_eq!(self.exit_code(), Some(10));
+			eprintln!(
+				"{test}: this process is elevated; the helper refused as it must, and the checks \
+				 of a serving helper were skipped"
+			);
+			return false;
+		}
+		assert_eq!(line["t"], "hello", "{line}");
+		true
 	}
 
 	fn write(&mut self, line: &[u8]) {
@@ -118,7 +151,9 @@ impl Drop for Helper {
 fn the_helper_says_hello_and_exits_cleanly_on_shutdown() {
 	let temp = tempfile::tempdir().unwrap();
 	let mut child = Helper::spawn(temp.path());
-	assert_eq!(child.first_line()["t"], "hello");
+	if !child.serves("the_helper_says_hello_and_exits_cleanly_on_shutdown") {
+		return;
+	}
 	child.write(b"{\"t\":\"shutdown\",\"id\":1}\n");
 	assert_eq!(child.exit_code(), Some(0));
 }
@@ -128,10 +163,12 @@ fn the_helper_says_hello_and_exits_cleanly_on_shutdown() {
 fn a_second_helper_on_the_same_state_dir_is_refused() {
 	let temp = tempfile::tempdir().unwrap();
 	let mut first = Helper::spawn(temp.path());
-	assert_eq!(first.first_line()["t"], "hello");
+	if !first.serves("a_second_helper_on_the_same_state_dir_is_refused") {
+		return;
+	}
 	let mut second = Helper::spawn(temp.path());
 	let refused = second.first_line();
-	assert_eq!(refused["code"], "alreadyRunning");
+	assert_eq!(refused["code"], "alreadyRunning", "{refused}");
 	assert_eq!(second.exit_code(), Some(12));
 	first.close_stdin();
 	assert_eq!(first.exit_code(), Some(0));
@@ -142,7 +179,9 @@ fn a_second_helper_on_the_same_state_dir_is_refused() {
 fn a_closed_stdin_exits_cleanly() {
 	let temp = tempfile::tempdir().unwrap();
 	let mut child = Helper::spawn(temp.path());
-	assert_eq!(child.first_line()["t"], "hello");
+	if !child.serves("a_closed_stdin_exits_cleanly") {
+		return;
+	}
 	child.close_stdin();
 	assert_eq!(child.exit_code(), Some(0));
 }
