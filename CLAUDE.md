@@ -337,7 +337,11 @@ export WASI_SDK_PATH=~/wasi-sdk   # must contain share/wasi-sysroot
 `filen-sdk-rs/wasm-pack.sh` and the pre-push hook both refuse to run without it, rather than
 building a configuration that never ships.
 
-The Windows MSVC targets build `heif-decoder` natively on Windows only. The Windows gnu targets
+The Windows MSVC targets build `heif-decoder` natively on Windows only. `aarch64-pc-windows-msvc`
+builds it only on an arm64 Windows machine with an aarch64 Rust toolchain (the build script stops
+otherwise; cross-building it from x64 Windows is not supported), and builds dav1d with clang-cl:
+the full LLVM (clang-cl and lld-link) must be installed with its bin directory on PATH, and meson
+must be >= 0.58; it needs no nasm and no `gas-preprocessor.pl`. The Windows gnu targets
 cross-build it from macOS or Linux with the same rows above plus the target's mingw toolchain on
 PATH; no other Windows architecture is supported. `x86_64-pc-windows-gnu` takes mingw-w64 (gcc,
 libstdc++) with the posix thread model, which libheif's `std::thread`/`std::mutex` need and the

@@ -626,9 +626,10 @@ fn build_libde265() -> PathBuf {
 /// AV1 decoders in one tree would be pure maintenance cost.
 ///
 /// The price is dav1d's build system: meson + ninja, plus nasm for the x86
-/// SIMD. Those are demanded HERE, and note who meets them: this crate is a
-/// workspace member with no `default-members`, so any cargo command run at the
-/// workspace root builds it whatever features were asked for. Skipping the
+/// SIMD and clang-cl on aarch64 MSVC (`dav1d_clang_cl`). Those are demanded
+/// HERE, and note who meets them: this crate is a workspace member with no
+/// `default-members`, so any cargo command run at the workspace root builds it
+/// whatever features were asked for. Skipping the
 /// tooling means `--workspace --exclude heif-decoder`, or a package-scoped
 /// `-p` command — not leaving the feature off.
 fn build_dav1d() -> PathBuf {
@@ -688,6 +689,11 @@ fn build_dav1d() -> PathBuf {
 	if cfg!(windows) && !is_windows_gnu() {
 		setup.arg("--vsenv");
 	}
+	// Set on this one command: meson reads `CC` for a native build, and cc-rs
+	// and the CMake builds never see it.
+	if let Some(compiler) = dav1d_clang_cl() {
+		setup.env("CC", compiler);
+	}
 	if let Some(cross_file) = write_meson_cross_file(&out_dir) {
 		setup.arg(format!("--cross-file={}", cross_file.display()));
 	}
@@ -707,6 +713,85 @@ fn build_dav1d() -> PathBuf {
 	println!("cargo:rustc-link-lib=static=dav1d");
 
 	prefix
+}
+
+/// dav1d's C compiler on Windows on Arm with MSVC: clang-cl, as the `CC` value
+/// meson reads, or `None` for every other target. Under cl.exe, dav1d's
+/// meson.build sends its aarch64 assembly through `gas-preprocessor.pl` (a
+/// perl script no Windows image ships) and armasm64; clang-cl assembles the
+/// same `.S` files itself, from meson 0.58 on. The C++ decoders build with
+/// clang on MSVC targets already (`config_cmake_for_libcxx`).
+///
+/// Only with an aarch64 Rust toolchain on Windows: no cross file is written
+/// for MSVC, so this is a native build, and `--vsenv` activates the build
+/// machine's own Visual Studio tools. Any other Windows toolchain stops the
+/// build. An x64 one on x64 Windows would need a cross file; one emulated on
+/// arm64 Windows would leave meson, which takes the host from the OS, on
+/// cl.exe and the perl script. `cfg!` describes the toolchain the build
+/// script was compiled with, not the machine, so it cannot tell those two
+/// apart.
+///
+/// `CC_<target>` / `TARGET_CC` are not read, unlike on mingw, and a bare `CC`
+/// is overridden: on MSVC those steer cc-rs (cl.exe unless told otherwise),
+/// the CMake builds here pin their compiler and ignore them too, and a cl.exe
+/// in one would bring the perl script back. The path is resolved here, before
+/// `--vsenv` puts Visual Studio's directories ahead of LLVM's, and `--target`
+/// keeps an x64 LLVM running under emulation from compiling for x64 while
+/// meson takes the machine's arm64 as the host. meson finds `lld-link` on
+/// PATH for its link probes, which a full LLVM install puts beside clang-cl.
+fn dav1d_clang_cl() -> Option<String> {
+	// MSVC builds only on Windows; elsewhere this is left to fail as it did.
+	if !cfg!(windows)
+		|| !is_windows_msvc()
+		|| env::var("CARGO_CFG_TARGET_ARCH").unwrap() != "aarch64"
+	{
+		return None;
+	}
+	if !cfg!(target_arch = "aarch64") {
+		panic!(
+			"heif-decoder builds aarch64-pc-windows-msvc only on an arm64 Windows \
+			 machine with an aarch64 Rust toolchain, and this build's toolchain is \
+			 {}: on an arm64 machine, install the aarch64-pc-windows-msvc one \
+			 (`rustup set default-host aarch64-pc-windows-msvc`). Cross-building \
+			 it from x64 Windows is not supported.",
+			env::var("HOST").unwrap(),
+		);
+	}
+	let clang_cl = env::split_paths(&env::var_os("PATH").unwrap_or_default())
+		.map(|dir| dir.join("clang-cl.exe"))
+		.find(|path| path.is_file())
+		.expect(
+			"clang-cl.exe is required to build heif-decoder's AV1 decoder for \
+			 aarch64-pc-windows-msvc, and none is on PATH: install LLVM \
+			 (`winget install LLVM.LLVM`, which includes clang-cl and lld-link) \
+			 and put its bin directory on PATH. Under cl.exe, dav1d would need \
+			 gas-preprocessor.pl and armasm64.",
+		);
+	require_meson_version((0, 58), "dav1d assembles its aarch64 code with clang-cl");
+	Some(format!(
+		"\"{}\" --target=aarch64-pc-windows-msvc",
+		clang_cl.display()
+	))
+}
+
+/// Stops the build when `meson --version` is older than `minimum`, naming
+/// what needs the newer one.
+fn require_meson_version(minimum: (u32, u32), reason: &str) {
+	let output = Command::new("meson")
+		.arg("--version")
+		.output()
+		.expect("could not run `meson --version`");
+	let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+	let mut parts = version.split('.').map(|part| part.parse::<u32>().ok());
+	let found = parts.next().flatten().zip(parts.next().flatten());
+	assert!(
+		found.is_some_and(|found| found >= minimum),
+		"meson {}.{} or newer is required: {reason}, and `meson --version` \
+		 answered {version:?}. Upgrade it (`pip install --upgrade meson`, or \
+		 through the package manager that installed it).",
+		minimum.0,
+		minimum.1,
+	);
 }
 
 /// meson has no equivalent of cmake-rs's "derive the toolchain from cargo's
