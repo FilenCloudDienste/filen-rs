@@ -26,7 +26,7 @@ use crate::{
 	local::LocalEngine,
 	os::{WatchSignal, WatchSink},
 	sealed,
-	test_support::{FakeDrive, FakeEntry, FakeLocal, MemoryKeyStore},
+	test_support::{FakeConnection, FakeDrive, FakeEntry, FakeLocal, MemoryKeyStore},
 	thumbnails::ThumbnailHandler,
 };
 
@@ -796,6 +796,7 @@ impl Platform for FakePlatform {
 			});
 		}
 		state.connected.insert(registered.0.clone());
+		self.local.set_connection(FakeConnection::Serving);
 		state
 			.calls
 			.push(PlatformCall::Connect(registered.0.clone()));
@@ -810,6 +811,7 @@ impl Platform for FakePlatform {
 		{
 			let mut state = self.state();
 			state.connected.insert(registered.0.clone());
+			self.local.set_connection(FakeConnection::Refusing);
 			state
 				.calls
 				.push(PlatformCall::ConnectRefusing(registered.0.clone()));
@@ -826,6 +828,7 @@ impl Platform for FakePlatform {
 		{
 			let mut state = self.state();
 			state.connected.remove(&connected.0);
+			self.local.set_connection(FakeConnection::Disconnected);
 			state
 				.calls
 				.push(PlatformCall::Disconnect(connected.0.clone()));

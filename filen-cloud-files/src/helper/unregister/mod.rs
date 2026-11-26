@@ -89,7 +89,17 @@ pub(crate) struct Walked {
 	clean: Vec<(RootPath, PlaceholderIdentity)>,
 	kept: Vec<Kept>,
 	/// Every directory placeholder.
-	dirs: Vec<(RootPath, LocalFileId)>,
+	dirs: Vec<WalkedDir>,
+}
+
+/// A directory placeholder the walk found.
+#[derive(Debug)]
+struct WalkedDir {
+	path: RootPath,
+	id: LocalFileId,
+	/// The directory the platform has not populated yet, with its identity, which marking it
+	/// populated needs; `None` for one populated, or whose identity does not decode.
+	unpopulated: Option<PlaceholderIdentity>,
 }
 
 impl Walked {
@@ -205,9 +215,14 @@ pub(crate) fn walk<L: LocalFs>(local: &L, stop: &Stop) -> Result<Walked, WalkErr
 				LocalEntry::Placeholder {
 					kind: LocalKind::Dir { .. },
 					id,
-					..
+					identity,
+					state,
 				} => {
-					walked.dirs.push((path.clone(), id));
+					walked.dirs.push(WalkedDir {
+						path: path.clone(),
+						id,
+						unpopulated: identity.ok().filter(|_| state.partial()),
+					});
 					dirs.push(path);
 				}
 				LocalEntry::Placeholder {
@@ -368,19 +383,35 @@ fn settle<L: LocalFs>(
 		}
 	}
 	// Deepest first, each directory placeholder above a kept item.
-	dirs.sort_by_key(|(dir, _)| std::cmp::Reverse(dir.depth()));
-	for (dir, id) in &dirs {
-		if kept
+	dirs.sort_by_key(|dir| std::cmp::Reverse(dir.path.depth()));
+	for dir in &dirs {
+		let WalkedDir {
+			path,
+			id,
+			unpopulated,
+		} = dir;
+		if !kept
 			.iter()
-			.any(|item| item.path.starts_with(dir) && (item.inside || item.path != *dir))
+			.any(|item| item.path.starts_with(path) && (item.inside || item.path != *path))
 		{
-			local
-				.revert_to_plain(dir, *id)
-				.map_err(|error| Unsettled::Unkept {
-					path: dir.clone(),
-					error,
-				})?;
+			continue;
 		}
+		let unkept = |error| Unsettled::Unkept {
+			path: path.clone(),
+			error,
+		};
+		// Reverting a directory the platform has not populated asks the provider for its children
+		// first (measured: refused under this connection, 0x80070182), as when the engine adopted
+		// an ordinary directory, one an earlier unregister made ordinary before it stopped for one.
+		// Marked populated, it asks nothing: what is on disk stays, what only the drive holds stays
+		// there, and the walk listed what is on disk (measured: the walk of such a folder found the
+		// changed file in it).
+		if let Some(identity) = unpopulated {
+			local
+				.set_dir_populated(path, *id, *identity)
+				.map_err(unkept)?;
+		}
+		local.revert_to_plain(path, *id).map_err(unkept)?;
 	}
 	Ok(Settled {
 		deleted_hydrated,

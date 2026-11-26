@@ -210,6 +210,36 @@ async fn unregistering_keeps_every_changed_item_as_an_ordinary_one_and_moves_the
 }
 
 #[tokio::test(start_paused = true)]
+async fn an_unregister_makes_a_folder_adopted_unpopulated_ordinary_and_keeps_what_it_holds() {
+	// What a root served again after an unregister stopped past its settle holds: the engine
+	// adopted, unpopulated, the folder made ordinary, a file made ordinary in it, beside a clean
+	// one the drive holds.
+	let local = FakeLocal::new(PlaceholderIdentity::Root { root: ACCOUNT_ROOT });
+	local.place_dir_unpopulated(&root_path("d"), dir(5));
+	local.user_create(&root_path("d\\edited.txt"), b"new data");
+	local.place_file_with(&root_path("d\\cloud.txt"), file(2), b"cloud", false);
+	let platform = platform(&local);
+	let root = Path::new("/r");
+	let (_temp, mut index) = index(root);
+	let outcome = unregister(&platform, &mut index, root, false, "d")
+		.await
+		.unwrap_or_else(|stopped| panic!("{:?}", stopped.error));
+	let ops = local.ops();
+	let populated = ops
+		.iter()
+		.position(|op| *op == LocalOp::DirPopulated(root_path("d")))
+		.expect("marked populated");
+	let reverted = ops
+		.iter()
+		.position(|op| *op == LocalOp::Reverted(root_path("d")))
+		.expect("made ordinary");
+	assert!(populated < reverted, "{ops:?}");
+	let entries = platform.aside(&outcome.tidied.kept_in.unwrap()).unwrap();
+	assert_eq!(entry(&entries, "d\\edited.txt").unwrap().bytes, b"new data");
+	assert!(entries.iter().all(|entry| !entry.placeholder));
+}
+
+#[tokio::test(start_paused = true)]
 async fn clean_downloaded_files_stay_as_ordinary_files_unless_asked_to_go() {
 	let local = FakeLocal::new(PlaceholderIdentity::Root { root: ACCOUNT_ROOT });
 	local.place_file(&root_path("clean.txt"), file(1), b"clean");

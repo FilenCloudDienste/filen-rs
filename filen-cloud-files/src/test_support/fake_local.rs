@@ -122,6 +122,21 @@ pub enum LocalOp {
 	CopiedToPlain { from: RootPath, to: RootPath },
 }
 
+/// How the provider is connected to the fake root, which changes what its calls can ask of the
+/// provider, as on Windows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FakeConnection {
+	/// Connected to serve: the platform asks the provider for what a call needs.
+	Serving,
+	/// Connected to refuse every request ([`Platform::connect_refusing`]): what needs the provider
+	/// fails.
+	///
+	/// [`Platform::connect_refusing`]: crate::helper::Platform::connect_refusing
+	Refusing,
+	/// Not connected: what needs the provider fails.
+	Disconnected,
+}
+
 /// One item of the fake root, as a test sees it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FakeEntry {
@@ -235,7 +250,17 @@ struct LocalState {
 	swallowed: Vec<RootPath>,
 	/// The provider's calls a test holds, each until its gate opens ([`FakeLocal::gate`]).
 	gates: Vec<(Gated, CallGate)>,
+	/// How the provider is connected; [`FakeConnection::Serving`] until the fake platform changes
+	/// it.
+	connection: FakeConnection,
 }
+
+/// The HRESULT of `ERROR_CLOUD_FILE_AUTHENTICATION_FAILED` (386), what a request a root connected
+/// refusing refuses fails with.
+const REFUSED: i32 = 0x8007_0182_u32.cast_signed();
+/// The HRESULT of `ERROR_CLOUD_FILE_PROVIDER_NOT_RUNNING` (362), what a request with no provider
+/// connected fails with.
+const NOT_RUNNING: i32 = 0x8007_016A_u32.cast_signed();
 
 /// A call of the provider's a test can hold with [`FakeLocal::gate`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -636,7 +661,13 @@ impl FakeLocal {
 			fail_handle_paths: None,
 			swallowed: Vec::new(),
 			gates: Vec::new(),
+			connection: FakeConnection::Serving,
 		})))
+	}
+
+	/// Connects the provider as `connection`, as the fake platform's connects and disconnect do.
+	pub fn set_connection(&self, connection: FakeConnection) {
+		self.state().connection = connection;
 	}
 
 	fn state(&self) -> MutexGuard<'_, LocalState> {
@@ -1781,10 +1812,34 @@ impl LocalFs for FakeLocal {
 		if let Some(error) = state.fail_revert.get(&path.case_key()) {
 			return Err(*error);
 		}
+		let connection = state.connection;
 		let node = state
 			.get_mut(path)
 			.filter(|node| node.id == expect.get())
 			.ok_or(LocalError::NotFound)?;
+		// As measured on Windows: reverting a directory the platform has not populated asks the
+		// provider for its children first, which a root connected refusing refuses (386), and which
+		// fails with no provider connected.
+		if matches!(node.kind, NodeKind::Dir { .. })
+			&& node
+				.placeholder
+				.as_ref()
+				.is_some_and(|placeholder| !placeholder.populated)
+		{
+			match connection {
+				FakeConnection::Serving => {}
+				FakeConnection::Refusing => {
+					return Err(LocalError::Os(crate::os::OsError::Rejected {
+						code: REFUSED,
+					}));
+				}
+				FakeConnection::Disconnected => {
+					return Err(LocalError::Os(crate::os::OsError::Rejected {
+						code: NOT_RUNNING,
+					}));
+				}
+			}
+		}
 		node.placeholder = None;
 		state.ops.push(LocalOp::Reverted(path.clone()));
 		if let Some(left) = state.kill_after_reverts.as_mut() {

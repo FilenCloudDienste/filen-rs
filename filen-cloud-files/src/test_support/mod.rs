@@ -15,8 +15,8 @@ pub use crate::os::win::user_dehydrate;
 pub(crate) use fake_drive::place_files;
 pub use fake_drive::{DriveCall, DriveOp, FakeDrive, TIMESTAMP_MILLIS, ffi_dir, ffi_file, pattern};
 pub use fake_local::{
-	FakeDehydrate, FakeDelete, FakeEntry, FakeLocal, FakeRename, FakeSettled, FakeWriter, Gated,
-	LocalOp, ProviderAct, UserChange, name, root_path,
+	FakeConnection, FakeDehydrate, FakeDelete, FakeEntry, FakeLocal, FakeRename, FakeSettled,
+	FakeWriter, Gated, LocalOp, ProviderAct, UserChange, name, root_path,
 };
 pub use fake_os::{FakeData, FakeEvent, FakeOs, FakePopulate};
 pub use fake_platform::{
