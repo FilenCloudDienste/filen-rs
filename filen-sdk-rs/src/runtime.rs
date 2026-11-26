@@ -1374,12 +1374,12 @@ pub(crate) struct SpawnTaskHandle<T> {
 	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 	receiver: tokio::sync::oneshot::Receiver<T>,
 	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-	handle: tokio::task::JoinHandle<T>,
+	handle: TaskJoin<T>,
 }
 
 impl<T> SpawnTaskHandle<T> {
 	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-	pub(crate) fn new(handle: tokio::task::JoinHandle<T>) -> Self {
+	pub(crate) fn new(handle: TaskJoin<T>) -> Self {
 		Self { handle }
 	}
 
@@ -1389,7 +1389,7 @@ impl<T> SpawnTaskHandle<T> {
 	}
 }
 
-impl<T> std::future::Future for SpawnTaskHandle<T> {
+impl<T: 'static> std::future::Future for SpawnTaskHandle<T> {
 	type Output = T;
 
 	fn poll(
@@ -1426,7 +1426,7 @@ where
 	}
 	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 	{
-		SpawnTaskHandle::new(tokio::spawn(f))
+		SpawnTaskHandle::new(spawn_erased(f))
 	}
 }
 
@@ -1603,11 +1603,37 @@ mod erased_task {
 	};
 
 	use futures::FutureExt;
-	use tokio::task::{JoinError, JoinHandle};
+	use tokio::task::{AbortHandle, JoinError, JoinHandle};
+
+	/// What every [`spawn_erased`] task runs: the caller's future, boxed, resolving to its output
+	/// boxed.
+	type ErasedFuture = Pin<Box<dyn Future<Output = Box<dyn Any + Send>> + Send>>;
 
 	/// What every [`spawn_blocking`] task runs: the caller's closure, boxed, returning its output
 	/// boxed.
 	type ErasedWork = Box<dyn FnOnce() -> Box<dyn Any + Send> + Send>;
+
+	/// Runs `task` on the current tokio runtime, as [`tokio::spawn`] does, and returns a handle
+	/// that resolves to its output, or to the [`JoinError`] of a panic in it or of an abort.
+	///
+	/// Every future runs as the same boxed task type, so tokio's task code (polling,
+	/// completion, cancellation, the join handle, on both of its schedulers) is compiled once
+	/// for all of them instead of once per future. The price is an allocation for the future
+	/// and one for its output (none for a `()` output), next to the task tokio allocates anyway,
+	/// and an indirect call per poll.
+	///
+	/// `task` starts when this is called, not when the handle is first polled, and dropping the
+	/// handle detaches the task without stopping it, as with tokio's. Must be called from
+	/// within a tokio runtime.
+	pub fn spawn_erased<T, F>(task: F) -> TaskJoin<T>
+	where
+		F: Future<Output = T> + Send + 'static,
+		T: Send + 'static,
+	{
+		let task: ErasedFuture =
+			Box::pin(async move { Box::new(task.await) as Box<dyn Any + Send> });
+		TaskJoin::new(tokio::spawn(task))
+	}
 
 	/// Runs `work` on tokio's blocking thread pool, as [`tokio::task::spawn_blocking`] does, and
 	/// returns a handle that resolves to its output, or to the [`JoinError`] of a panic in it.
@@ -1619,8 +1645,9 @@ mod erased_task {
 	/// the task tokio allocates anyway.
 	///
 	/// `work` starts when this is called, not when the handle is first polled, and dropping the
-	/// handle detaches the task without stopping it, as with tokio's. Must be called from
-	/// within a tokio runtime.
+	/// handle detaches the task without stopping it, as with tokio's; nor does
+	/// [`abort`](TaskJoin::abort) stop it once it has started. Must be called from within a
+	/// tokio runtime.
 	pub fn spawn_blocking<T, F>(work: F) -> TaskJoin<T>
 	where
 		F: FnOnce() -> T + Send + 'static,
@@ -1630,8 +1657,8 @@ mod erased_task {
 		TaskJoin::new(tokio::task::spawn_blocking(work))
 	}
 
-	/// The handle of a [`spawn_blocking`] task: a future resolving to the task's output, or to
-	/// the [`JoinError`] of a panic in it.
+	/// The handle of a [`spawn_erased`] or [`spawn_blocking`] task: a future resolving to the
+	/// task's output, or to the [`JoinError`] of a panic in it or of an abort.
 	#[derive(Debug)]
 	pub struct TaskJoin<T> {
 		handle: JoinHandle<Box<dyn Any + Send>>,
@@ -1646,6 +1673,17 @@ mod erased_task {
 				handle,
 				output: PhantomData,
 			}
+		}
+
+		/// Aborts the task, as [`JoinHandle::abort`] does: awaiting the handle afterwards gives a
+		/// cancelled [`JoinError`], unless the task had finished already.
+		pub fn abort(&self) {
+			self.handle.abort();
+		}
+
+		/// A handle that aborts the task without owning it, as [`JoinHandle::abort_handle`] gives.
+		pub fn abort_handle(&self) -> AbortHandle {
+			self.handle.abort_handle()
 		}
 	}
 
@@ -1667,7 +1705,7 @@ mod erased_task {
 	mod tests {
 		use std::time::Duration;
 
-		use super::spawn_blocking;
+		use super::{spawn_blocking, spawn_erased};
 
 		#[tokio::test]
 		async fn a_task_resolves_to_the_output_of_its_closure() {
@@ -1705,11 +1743,61 @@ mod erased_task {
 				.expect("the detached task never ran");
 			assert_eq!(sent, Ok("ran"));
 		}
+
+		#[tokio::test]
+		async fn an_erased_task_resolves_to_the_output_of_its_future() {
+			let joined = spawn_erased(async { String::from("task output") }).await;
+			assert_eq!(joined.unwrap(), "task output");
+		}
+
+		#[tokio::test]
+		async fn erased_tasks_of_different_output_types_resolve_each_to_its_own() {
+			let number = spawn_erased(async { 42_u64 });
+			let pair = spawn_erased(async { (vec![1_u8, 2, 3], 'x') });
+			let unit = spawn_erased(async {});
+			assert_eq!(pair.await.unwrap(), (vec![1_u8, 2, 3], 'x'));
+			assert_eq!(number.await.unwrap(), 42);
+			unit.await.unwrap();
+		}
+
+		#[tokio::test]
+		async fn a_panic_in_an_erased_task_resolves_to_a_panic_join_error() {
+			let joined = spawn_erased::<u32, _>(async { panic!("the future panicked") }).await;
+			let error = joined.unwrap_err();
+			assert!(error.is_panic());
+			let payload = error.into_panic();
+			assert_eq!(payload.downcast_ref::<&str>(), Some(&"the future panicked"));
+		}
+
+		#[tokio::test]
+		async fn an_aborted_erased_task_resolves_to_a_cancelled_join_error() {
+			let task = spawn_erased(std::future::pending::<u32>());
+			task.abort();
+			assert!(task.await.unwrap_err().is_cancelled());
+		}
+
+		#[tokio::test]
+		async fn an_abort_handle_aborts_the_erased_task() {
+			let task = spawn_erased(std::future::pending::<u32>());
+			task.abort_handle().abort();
+			assert!(task.await.unwrap_err().is_cancelled());
+		}
+
+		#[tokio::test]
+		async fn a_dropped_handle_leaves_the_erased_task_running() {
+			let (finished, done) = tokio::sync::oneshot::channel();
+			drop(spawn_erased(async move { finished.send("ran") }));
+			// Only bounds a failure: a task stopped with its handle never sends.
+			let sent = tokio::time::timeout(Duration::from_secs(30), done)
+				.await
+				.expect("the detached task never ran");
+			assert_eq!(sent, Ok("ran"));
+		}
 	}
 }
 
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-pub use erased_task::{TaskJoin, spawn_blocking};
+pub use erased_task::{TaskJoin, spawn_blocking, spawn_erased};
 
 #[cfg(all(
 	test,

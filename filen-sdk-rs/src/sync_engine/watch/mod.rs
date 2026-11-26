@@ -157,7 +157,7 @@ pub struct WatchHandle {
 	// Dropping the sender closes the channel, which breaks the loop's shutdown select arm.
 	shutdown: tokio::sync::oneshot::Sender<()>,
 	// Resolves when the background loop has returned; `stop` awaits it.
-	loop_done: tokio::task::JoinHandle<()>,
+	loop_done: crate::runtime::TaskJoin<()>,
 	status: tokio::sync::watch::Receiver<WatchStatus>,
 }
 
@@ -377,7 +377,7 @@ impl SyncEngine {
 		let rules = self.user_ignore_changes();
 		// In the caller's span: every pass the loop runs logs `pair N`, and pair ids are per engine
 		// database, so two engines in one process are otherwise indistinguishable in the log.
-		let loop_done = tokio::spawn(
+		let loop_done = crate::runtime::spawn_erased(
 			run_loop(WatchLoop {
 				engine,
 				pair,
@@ -859,8 +859,12 @@ impl<H: RemoteLiveness> RemoteDoorbell<H> {
 				// this task is the only writer of the field.
 				if let Some(live) = handle.liveness() {
 					self.liveness = Some(
-						tokio::spawn(publish_remote_liveness(pair, live, status.clone()))
-							.abort_handle(),
+						crate::runtime::spawn_erased(publish_remote_liveness(
+							pair,
+							live,
+							status.clone(),
+						))
+						.abort_handle(),
 					);
 				}
 				self.handle = Some(handle);

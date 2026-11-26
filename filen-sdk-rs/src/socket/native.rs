@@ -23,7 +23,7 @@ impl IntoStableDeref for Utf8Bytes {
 }
 
 pub(super) struct NativeWriterTask {
-	task_handle: tokio::task::JoinHandle<()>,
+	task_handle: crate::runtime::TaskJoin<()>,
 }
 
 impl WriterTask for NativeWriterTask {
@@ -35,7 +35,7 @@ impl WriterTask for NativeWriterTask {
 		outbound: mpsc::Receiver<String>,
 	) -> Self {
 		Self {
-			task_handle: tokio::spawn(writer::run(sender, ping_interval, outbound)),
+			task_handle: crate::runtime::spawn_erased(writer::run(sender, ping_interval, outbound)),
 		}
 	}
 

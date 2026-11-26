@@ -318,9 +318,9 @@ impl Client {
 		bytes: Arc<ByteCounters>,
 		existing: ExistingRemoteFile,
 		journal: Option<Arc<dyn UploadJournalStore>>,
-	) -> tokio::task::JoinHandle<()> {
+	) -> crate::runtime::TaskJoin<()> {
 		let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_SMALL_PARALLEL_REQUESTS));
-		tokio::task::spawn(async move {
+		crate::runtime::spawn_erased(async move {
 			// propagate aborts to all spawned tasks
 			let mut join_set = tokio::task::JoinSet::new();
 			loop {

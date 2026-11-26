@@ -288,8 +288,8 @@ pub(crate) trait CategoryDirDownloadExt: CategoryFSExt {
 		counts: Arc<ByteCounts>,
 		keep: KeepLocalWhen,
 		partial: PartialDownload,
-	) -> tokio::task::JoinHandle<()> {
-		tokio::task::spawn(async move {
+	) -> crate::runtime::TaskJoin<()> {
+		crate::runtime::spawn_erased(async move {
 			let semaphore = Arc::new(tokio::sync::Semaphore::new(
 				client.get_unauth_client().state().max_concurrency(),
 			));

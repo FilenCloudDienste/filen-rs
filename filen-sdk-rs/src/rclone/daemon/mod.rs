@@ -479,7 +479,7 @@ impl RcloneDaemon {
 		let (exit_tx, exit) = watch::channel(None);
 		let (kill, kill_rx) = oneshot::channel();
 		let stopping = Arc::new(AtomicBool::new(false));
-		tokio::spawn(supervise(
+		crate::runtime::spawn_erased(supervise(
 			child,
 			stderr,
 			kill_rx,
@@ -945,7 +945,7 @@ async fn supervise(
 ) {
 	// Shared with the reader, which may outlive rclone while a process it started holds the pipe.
 	let tail = Arc::new(Mutex::new(StderrTail::default()));
-	let reader = tokio::spawn(read_stderr(stderr, Arc::clone(&tail)));
+	let reader = crate::runtime::spawn_erased(read_stderr(stderr, Arc::clone(&tail)));
 	let status = tokio::select! {
 		status = child.wait() => status,
 		_ = &mut kill => {

@@ -143,7 +143,7 @@ pub fn spawn_inflight_watchdog() {
 		return;
 	}
 	if !WATCHDOG_SPAWNED.swap(true, Ordering::Relaxed) {
-		tokio::spawn(run_inflight_watchdog());
+		crate::runtime::spawn_erased(run_inflight_watchdog());
 	}
 }
 

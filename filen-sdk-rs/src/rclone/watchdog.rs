@@ -79,7 +79,7 @@ pub(crate) fn arm(
 	let (disarm, disarmed) = oneshot::channel::<()>();
 	// The task reaps the watchdog when it exits by itself, and kills it once disarmed. When the
 	// host dies the task dies with it, and the watchdog lives on.
-	tokio::spawn(async move {
+	crate::runtime::spawn_erased(async move {
 		tokio::select! {
 			_ = child.wait() => {}
 			_ = disarmed => {
