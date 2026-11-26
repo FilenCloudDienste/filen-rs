@@ -21,6 +21,8 @@ mod listener;
 #[deny(unsafe_code)]
 mod promise;
 #[deny(unsafe_code)]
+mod stream;
+#[deny(unsafe_code)]
 mod wire;
 
 use napi_derive::napi;
@@ -33,6 +35,7 @@ pub(crate) use managed::{
 	ManagedAbortController, ManagedAbortSignal, PauseSignal, read_managed_future,
 };
 pub(crate) use promise::spawn_promise;
+pub(crate) use stream::StreamReader;
 pub(crate) use wire::{FromWire, IntoWire, OptionReturn, Wire};
 
 use crate::auth::{self, http::LogLevel};

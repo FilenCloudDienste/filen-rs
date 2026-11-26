@@ -22,6 +22,7 @@ import { tmpdir } from "node:os"
 import { basename, dirname, join } from "node:path"
 import { performance } from "node:perf_hooks"
 import { createInterface } from "node:readline"
+import { Readable } from "node:stream"
 import { after, before, describe, test } from "node:test"
 import { setTimeout as sleep } from "node:timers/promises"
 import { fileURLToPath } from "node:url"
@@ -479,6 +480,188 @@ describe("transfers against the server", { skip: email && password ? false : "TE
 			assert.equal(digest(await downloadBack(file, `from-bytes-${size}`)), digest(data))
 		})
 	}
+
+	/** The names of the files directly in `remoteDir`. */
+	const fileNames = async remoteDir => {
+		const listing = await client.listDirRecursiveWithPaths(asTarget(remoteDir), undefined, { onErrors() {} })
+		return listing.files.filter(({ path }) => !path.includes("/")).map(({ file }) => file.meta.inner[0].name)
+	}
+
+	/**
+	 * A ReadableStream pulling `size` random bytes `chunkSize` at a time, failing with `failWith`
+	 * instead of its last chunk when given. `produced()` is how many bytes it has enqueued so far,
+	 * `cancelled` resolves once the stream is cancelled, and `bytes` is everything it holds.
+	 */
+	const pulledStream = (size, chunkSize, failWith) => {
+		const bytes = randomBytes(size)
+		let produced = 0
+		let onCancel
+		const cancelled = new Promise(resolve => (onCancel = resolve))
+		const stream = new ReadableStream({
+			pull(controller) {
+				const end = Math.min(produced + chunkSize, size)
+				if (failWith && end === size) {
+					controller.error(failWith)
+				} else if (produced === size) {
+					controller.close()
+				} else {
+					controller.enqueue(new Uint8Array(bytes.subarray(produced, end)))
+					produced = end
+				}
+			},
+			cancel: () => onCancel(true)
+		})
+		return { stream, bytes, produced: () => produced, cancelled }
+	}
+
+	test("a file uploaded from a small stream with a known size downloads back the same", async () => {
+		const { stream, bytes } = pulledStream(1000, 1000)
+		let progress = 0n
+		const name = "from-small-stream.bin"
+		const file = await client.uploadFileFromReader({
+			parent: asNormalDir(remote),
+			name,
+			noExif: false,
+			noExifOverride: false,
+			reader: stream,
+			knownSize: bytes.length,
+			progress: total => (progress = total)
+		})
+		assert.equal(progress, 1000n)
+		assert.equal(file.size, 1000n)
+		assert.equal(file.meta.inner[0].name, name)
+		assert.equal(digest(await downloadBack(file, "from-small-stream")), digest(bytes))
+	})
+
+	test("a file uploaded from a Node Readable of many chunks, larger than one SDK chunk, is pulled as it is read", async () => {
+		const chunkSize = 64 * 1024
+		const { stream: source, bytes, produced } = pulledStream(3 * 1024 * 1024 + 17, chunkSize)
+		// through a Node Readable and back, as the desktop app's own streams come
+		const reader = Readable.toWeb(Readable.fromWeb(source, { objectMode: true, highWaterMark: 1 }))
+		const ahead = []
+		const totals = []
+		const name = "from-readable.bin"
+		const file = await client.uploadFileFromReader({
+			parent: asNormalDir(remote),
+			name,
+			noExif: false,
+			noExifOverride: false,
+			reader,
+			knownSize: undefined,
+			progress: total => {
+				totals.push(total)
+				ahead.push(produced() - Number(total))
+			}
+		})
+		assert.equal(file.size, BigInt(bytes.length))
+		assert.ok(totals.length > 1, "the stream was read in one go")
+		assert.ok(
+			totals.every((total, i) => i === 0 || total > totals[i - 1]),
+			"progress is not a growing running total"
+		)
+		assert.equal(totals.at(-1), BigInt(bytes.length))
+		assert.equal(digest(await downloadBack(file, "from-readable")), digest(bytes))
+		// What the source had produced beyond what the upload had read, after each read: what the
+		// queues between them hold, a chunk or so each, never the rest of the file.
+		assert.ok(Math.max(...ahead) <= 4 * chunkSize, `up to ${Math.max(...ahead)} bytes produced ahead of the upload`)
+	})
+
+	test("a file uploaded from an empty stream of unknown size is an empty file", async () => {
+		const { stream } = pulledStream(0, 1)
+		const progress = []
+		const name = "from-empty-stream.bin"
+		const file = await client.uploadFileFromReader({
+			parent: asNormalDir(remote),
+			name,
+			noExif: false,
+			noExifOverride: false,
+			reader: stream,
+			progress: total => progress.push(total)
+		})
+		assert.deepEqual(progress, [])
+		assert.equal(file.size, 0n)
+		assert.equal(file.meta.inner[0].name, name)
+		assert.equal((await downloadBack(file, "from-empty-stream")).length, 0)
+	})
+
+	test("an upload from a stream that errors past its first chunk rejects with an IO error and leaves no file", async () => {
+		const name = "from-failing-stream.bin"
+		const { stream } = pulledStream(3 * 1024 * 1024, 256 * 1024, new Error("the source failed"))
+		await assert.rejects(
+			client.uploadFileFromReader({ parent: asNormalDir(remote), name, reader: stream }),
+			e => {
+				assert.equal(kind(e), ErrorKind.Io)
+				assert.match(FilenSdkError.getInner(e).message(), /the source failed/)
+				return true
+			}
+		)
+		assert.equal((await fileNames(remote)).includes(name), false)
+	})
+
+	test("an upload from a stream aborted mid-way rejects as Cancelled, cancels the stream and leaves no file", async () => {
+		const name = "from-aborted-stream.bin"
+		const { stream, cancelled, produced } = pulledStream(16 * 1024 * 1024, 64 * 1024)
+		const controller = new ManagedAbortController()
+		let read = 0n
+		await assert.rejects(
+			client.uploadFileFromReader({
+				parent: asNormalDir(remote),
+				name,
+				noExif: false,
+				noExifOverride: false,
+				reader: stream,
+				// past the first SDK chunk, whose upload has started by then
+				progress: total => {
+					read = total
+					if (total > 2n * 1024n * 1024n && !controller.signal().aborted()) {
+						controller.abort()
+					}
+				},
+				managedFuture: { abortSignal: controller.signal(), pauseSignal: undefined }
+			}),
+			e => {
+				assert.equal(kind(e), ErrorKind.Cancelled)
+				return true
+			}
+		)
+		assert.equal(await cancelled, true)
+		assert.ok(produced() < 16 * 1024 * 1024, `the whole stream was produced (${read} bytes read)`)
+		assert.equal((await fileNames(remote)).includes(name), false)
+	})
+
+	test("an upload from a stream aborted mid-way through asyncOpts_ rejects with an AbortError, cancels the stream and leaves no file", async () => {
+		const name = "from-signal-aborted-stream.bin"
+		const { stream, cancelled, produced } = pulledStream(16 * 1024 * 1024, 64 * 1024)
+		const controller = new AbortController()
+		let read = 0n
+		await assert.rejects(
+			client.uploadFileFromReader(
+				{
+					parent: asNormalDir(remote),
+					name,
+					noExif: false,
+					noExifOverride: false,
+					reader: stream,
+					// past the first SDK chunk, whose upload has started by then
+					progress: total => {
+						read = total
+						if (total > 2n * 1024n * 1024n) {
+							controller.abort()
+						}
+					}
+				},
+				{ signal: controller.signal }
+			),
+			e => {
+				assert.equal(e.name, "AbortError")
+				assert.equal(FilenSdkError.hasInner(e), false)
+				return true
+			}
+		)
+		assert.equal(await cancelled, true)
+		assert.ok(produced() < 16 * 1024 * 1024, `the whole stream was produced (${read} bytes read)`)
+		assert.equal((await fileNames(remote)).includes(name), false)
+	})
 
 	test("a download paused before it starts makes no progress until resumed", async () => {
 		assert.ok(small, "the upload test did not run")

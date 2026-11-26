@@ -1,6 +1,8 @@
 //! The file transfers' napi exports, which take callback objects or params the macros cannot
 //! read: `JsClient.downloadFileToPath`, `JsClient.uploadFile`, `JsClient.downloadDirRecursively`
-//! and `JsClient.uploadDirRecursively`, and the upload from memory, `JsClient.uploadFileFromBytes`.
+//! and `JsClient.uploadDirRecursively`, the upload from memory, `JsClient.uploadFileFromBytes`, and
+//! the one from a stream, `JsClient.uploadFileFromReader` (which reads it through a
+//! [`StreamReader`]).
 //!
 //! A call's callback object becomes one [`Listener`], read and bound on the JS thread when the call
 //! is made; the SDK's progress reaches it from the commander runtime without waiting on JS. Every
@@ -16,21 +18,23 @@ use std::{path::PathBuf, sync::Arc};
 use napi::{
 	Env,
 	bindgen_prelude::{
-		BigInt, Either, FnArgs, FunctionRef, JsObjectValue, Object, PromiseRaw, Undefined,
+		BigInt, Either, FnArgs, FromNapiValue, Function, FunctionRef, JsObjectValue, Object,
+		PromiseRaw, Undefined,
 	},
 };
+use num_traits::ToPrimitive;
 
 use super::{DownloadError, PathToStringExt, UploadError};
 use crate::{
-	Error, auth,
+	Error, ErrorKind, auth,
 	fs::categories::{Category, NonRootItemType, fs::CategoryFS},
 	io::{DirDownloadCallback, DirUploadCallback, RemoteDirectory, RemoteFile},
 	js::{
 		AnyDirWithContext, AnyFile, Dir, DirWithPath, File, FileBuilderParams,
-		FileBuilderParamsOptionalName, FileWithPath, NonRootDir, NonRootItem,
+		FileBuilderParamsOptionalName, FileWithPath, ManagedFuture, NonRootDir, NonRootItem,
 		napi::{
-			FromWire, IntoWire, Listener, ListenerCall, OptionReturn, Wire, bound_method, bytes,
-			read_managed_future, spawn_promise,
+			FromWire, IntoWire, Listener, ListenerCall, OptionReturn, StreamReader, Wire,
+			bound_method, bytes, read_managed_future, spawn_promise,
 		},
 	},
 	util::MaybeSendCallback,
@@ -162,6 +166,96 @@ fn upload_file_from_bytes<'env>(
 			.into_js_managed_commander_future(move || async move {
 				let builder = file_builder_params.into_file_builder(&client)?;
 				client.upload_file(builder, &data).await.map(File::from)
+			})
+			.await
+	})
+}
+
+/// The largest integer a JS number holds exactly, and every one below it: 2^53 - 1.
+const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
+
+/// A stream's `knownSize`: a bigint, or a number as the wasm build takes it, either way a
+/// non-negative integer (a number no larger than `Number.MAX_SAFE_INTEGER`).
+fn known_size(size: Either<BigInt, f64>) -> Result<u64, Error> {
+	match size {
+		Either::A(size) => u64::from_wire(size),
+		Either::B(size) => (0.0..=MAX_SAFE_INTEGER)
+			.contains(&size)
+			.then(|| size.to_u64())
+			.flatten()
+			.filter(|whole| whole.to_f64() == Some(size))
+			.ok_or_else(|| {
+				Error::custom(
+					ErrorKind::Conversion,
+					format!("knownSize {size} is not a non-negative safe integer"),
+				)
+			}),
+	}
+}
+
+/// `object` read as a `T`, the way napi reads an argument of that type. napi converts a JS value
+/// safely only as an argument or a property, so it is read back as the property of a holder.
+fn read_object_as<T>(env: &Env, object: Object<'_>) -> napi::Result<T>
+where
+	T: FromNapiValue,
+{
+	let mut holder = Object::new(env)?;
+	holder.set_named_property("object", object)?;
+	holder.get_named_property_unchecked("object")
+}
+
+/// `uploadFileFromReader`'s body: the bytes `params.reader` gives become a file as the
+/// `FileBuilderParams` fields of `params` describe it, read a buffer at a time as the upload needs
+/// them (see [`StreamReader`]). `params.knownSize`, when given, sizes the upload's reads and caps
+/// it: a stream longer than that fails the upload. `params.progress` gets the bytes read from the
+/// stream so far after each read, a running total as on wasm, every call before the promise
+/// settles unless the upload was aborted. Without `params.managedFuture` the upload can still be
+/// aborted through `asyncOpts_`; either abort, or a failed upload, cancels the stream.
+///
+/// A `params.reader` that is no object with a `getReader` method, or a mistyped field, throws
+/// napi's own error synchronously; a stream that cannot be read (locked already), file params, a
+/// size or a managed future the SDK cannot read reject.
+// napi-derive registers the method calling this only outside `cfg(test)`.
+#[cfg_attr(test, allow(dead_code))]
+fn upload_file_from_reader<'env>(
+	client: &auth::JsClient,
+	env: &'env Env,
+	params: Object<'env>,
+	async_opts: Option<Object<'env>>,
+) -> napi::Result<PromiseRaw<'env, <File as Wire>::Wire>> {
+	// the file's fields sit in `params` itself, flattened as on wasm
+	let file_builder_params = FileBuilderParams::from_wire(read_object_as::<
+		<FileBuilderParams as Wire>::Wire,
+	>(env, params)?);
+	let stream: Object = params.get_named_property("reader")?;
+	let known_size = params
+		.get::<Either<BigInt, f64>>("knownSize")?
+		.map(known_size)
+		.transpose();
+	let progress = params.get::<Function<BigInt, ()>>("progress")?;
+	let managed_future = match params.get::<Object>("managedFuture")? {
+		Some(managed_future) => read_managed_future(&managed_future)?,
+		None => Ok(ManagedFuture {
+			abort_signal: None,
+			pause_signal: None,
+		}),
+	};
+	// Last, once nothing else can throw: from here on the stream is locked to the upload, which
+	// cancels it unless it reads it to the end.
+	let reader = StreamReader::new(env, &stream, progress)?;
+	let client = client.inner();
+	spawn_promise(env, async_opts, async move {
+		let mut reader = reader?;
+		let file_builder_params = file_builder_params?;
+		let known_size = known_size?;
+		let managed_future = managed_future?;
+		managed_future
+			.into_js_managed_commander_future(move || async move {
+				let builder = file_builder_params.into_file_builder(&client)?;
+				client
+					.upload_file_from_reader(builder, &mut reader, None, known_size)
+					.await
+					.map(File::from)
 			})
 			.await
 	})
@@ -529,7 +623,39 @@ fn upload_dir_recursively<'env>(
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::{ErrorKind, fs::categories::Normal, js::napi::listener_test_support::recording};
+	use crate::{fs::categories::Normal, js::napi::listener_test_support::recording};
+
+	#[test]
+	fn a_known_size_is_a_bigint_or_a_number_holding_a_safe_integer() {
+		assert_eq!(known_size(Either::B(0.0)).unwrap(), 0);
+		assert_eq!(known_size(Either::B(1024.0)).unwrap(), 1024);
+		assert_eq!(
+			known_size(Either::B(MAX_SAFE_INTEGER)).unwrap(),
+			9_007_199_254_740_991
+		);
+		assert_eq!(
+			known_size(Either::A(u64::MAX.into_wire())).unwrap(),
+			u64::MAX
+		);
+	}
+
+	#[test]
+	fn a_known_size_that_is_no_non_negative_integer_is_a_conversion_error() {
+		let negative = BigInt {
+			sign_bit: true,
+			words: vec![1],
+		};
+		for size in [
+			Either::A(negative),
+			Either::B(-1.0),
+			Either::B(1.5),
+			Either::B(MAX_SAFE_INTEGER + 2.0),
+			Either::B(f64::NAN),
+			Either::B(f64::INFINITY),
+		] {
+			assert_eq!(known_size(size).unwrap_err().kind(), ErrorKind::Conversion);
+		}
+	}
 
 	#[test]
 	fn a_dir_download_call_keeps_its_counts_on_the_wire() {
@@ -635,7 +761,7 @@ mod class {
 
 	use super::{
 		download_dir_recursively, download_file_to_path, upload_dir_recursively, upload_file,
-		upload_file_from_bytes,
+		upload_file_from_bytes, upload_file_from_reader,
 	};
 	use crate::js::{
 		AnyDirWithContext, AnyFile, Dir, File, FileBuilderParamsOptionalName,
@@ -715,6 +841,23 @@ mod class {
 			async_opts: Option<Object<'env>>,
 		) -> napi::Result<PromiseRaw<'env, <File as Wire>::Wire>> {
 			upload_file_from_bytes(&self.0, env, data, params, async_opts)
+		}
+
+		/// Upload the bytes `params.reader` gives as a file the rest of `params` describes, read a
+		/// buffer at a time as the upload needs them. The wasm build's `uploadFileFromReader`, its
+		/// `managedFuture` napi's plain object.
+		#[napi(
+			js_name = "uploadFileFromReader",
+			ts_args_type = "params: UploadFileStreamParams, asyncOpts_?: { signal: AbortSignal }",
+			ts_return_type = "Promise<File>"
+		)]
+		pub fn __napi_upload_file_from_reader<'env>(
+			&self,
+			env: &'env Env,
+			params: Object<'env>,
+			async_opts: Option<Object<'env>>,
+		) -> napi::Result<PromiseRaw<'env, <File as Wire>::Wire>> {
+			upload_file_from_reader(&self.0, env, params, async_opts)
 		}
 
 		/// Download `target` and everything below it into the local directory `dirPath`, each

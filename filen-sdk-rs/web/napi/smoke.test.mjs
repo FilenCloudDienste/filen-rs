@@ -1058,6 +1058,155 @@ describe("transfers, offline", () => {
 		})
 	}
 
+	// uploadFileFromReader's params: a file into the root of a synthesized account, from `reader`,
+	// with what the wasm build needs at least: noExif and noExifOverride default to false.
+	const streamParams = (reader, extra = {}) => ({
+		parent: { tag: AnyNormalDir_Tags.Root, inner: [{ uuid: randomUUID() }] },
+		name: "a.txt",
+		reader,
+		...extra
+	})
+
+	// A ReadableStream of `chunks`, then of `end` (undefined: the end of the stream, an Error: that
+	// error, "open": nothing more, for good), and a promise resolving once the stream is cancelled.
+	function streamOf(chunks, end) {
+		let onCancel
+		const cancelled = new Promise(resolve => (onCancel = resolve))
+		const queue = [...chunks]
+		const stream = new ReadableStream({
+			pull(controller) {
+				if (queue.length) {
+					controller.enqueue(queue.shift())
+				} else if (end instanceof Error) {
+					controller.error(end)
+				} else if (end !== "open") {
+					controller.close()
+				}
+			},
+			cancel: () => onCancel(true)
+		})
+		return { stream, cancelled }
+	}
+
+	// For the tests that wait on a stream's cancel: a cancel that never comes fails the test at
+	// this deadline instead of hanging the run.
+	const awaitsCancel = { timeout: 30_000 }
+
+	test("uploadFileFromReader is a JsClient method typed as the wasm build's", () => {
+		assert.equal(typeof JsClient.prototype.uploadFileFromReader, "function")
+		const typings = readFileSync(join(webDir, "node", "index.d.ts"), "utf8")
+		assert.ok(
+			typings.includes("  uploadFileFromReader(params: UploadFileStreamParams, asyncOpts_?: { signal: AbortSignal }): Promise<File>\n"),
+			"uploadFileFromReader's typing"
+		)
+		assert.match(typings, /^export type UploadFileStreamParams = FileBuilderParams & \{$/m)
+	})
+
+	test("uploadFileFromReader with an aborted signal rejects with an AbortError and cancels the stream", awaitsCancel, async () => {
+		const { stream, cancelled } = streamOf([new Uint8Array([1])])
+		await assert.rejects(synthClient(randomUUID()).uploadFileFromReader(streamParams(stream), { signal: AbortSignal.abort() }), e => {
+			assert.equal(e.name, "AbortError")
+			assert.equal(FilenSdkError.hasInner(e), false)
+			return true
+		})
+		assert.equal(await cancelled, true)
+	})
+
+	test("uploadFileFromReader with noExif and noExifOverride set gets past argument conversion", awaitsCancel, async () => {
+		const { stream, cancelled } = streamOf([new Uint8Array([1])])
+		await assert.rejects(
+			synthClient(randomUUID()).uploadFileFromReader(streamParams(stream, { noExif: true, noExifOverride: true }), {
+				signal: AbortSignal.abort()
+			}),
+			e => {
+				assert.equal(e.name, "AbortError")
+				return true
+			}
+		)
+		assert.equal(await cancelled, true)
+	})
+
+	test("uploadFileFromReader with an aborted ManagedAbortSignal rejects as Cancelled and cancels the stream", awaitsCancel, async () => {
+		const controller = new ManagedAbortController()
+		controller.abort()
+		const { stream, cancelled } = streamOf([new Uint8Array([1])])
+		await assert.rejects(
+			synthClient(randomUUID()).uploadFileFromReader(
+				streamParams(stream, { managedFuture: { abortSignal: controller.signal(), pauseSignal: undefined } })
+			),
+			e => {
+				assert.equal(assertThrownLikeUbrn(e).kind(), ErrorKind.Cancelled)
+				return true
+			}
+		)
+		assert.equal(await cancelled, true)
+	})
+
+	test("uploadFileFromReader of a stream that errors midway rejects with an IO error after its progress", async () => {
+		const progress = []
+		const { stream } = streamOf([new Uint8Array([1, 2, 3])], new Error("the source failed"))
+		let settled = false
+		await assert.rejects(
+			synthClient(randomUUID())
+				.uploadFileFromReader(streamParams(stream, { progress: bytes => progress.push([bytes, settled]) }))
+				.finally(() => (settled = true)),
+			e => {
+				const error = assertThrownLikeUbrn(e)
+				assert.equal(error.kind(), ErrorKind.Io)
+				assert.match(error.message(), /error reading from stream: .*the source failed/)
+				return true
+			}
+		)
+		assert.deepEqual(progress, [[3n, false]])
+	})
+
+	test("uploadFileFromReader of a stream whose chunk is not a Uint8Array rejects with an IO error and cancels it", awaitsCancel, async () => {
+		const { stream, cancelled } = streamOf([new Uint8Array([1]), "not bytes"], "open")
+		await assert.rejects(synthClient(randomUUID()).uploadFileFromReader(streamParams(stream)), e => {
+			const error = assertThrownLikeUbrn(e)
+			assert.equal(error.kind(), ErrorKind.Io)
+			assert.match(error.message(), /a stream chunk is not a Uint8Array \(String\)/)
+			return true
+		})
+		assert.equal(await cancelled, true)
+	})
+
+	test("uploadFileFromReader of a locked stream rejects with a conversion error", async () => {
+		const { stream } = streamOf([new Uint8Array([1])])
+		stream.getReader()
+		await assert.rejects(synthClient(randomUUID()).uploadFileFromReader(streamParams(stream)), e => {
+			assert.equal(assertThrownLikeUbrn(e).kind(), ErrorKind.Conversion)
+			return true
+		})
+	})
+
+	for (const knownSize of [-1, 1.5, Number.MAX_SAFE_INTEGER + 2, -1n]) {
+		test(`uploadFileFromReader with knownSize ${knownSize} rejects with a conversion error and cancels the stream`, awaitsCancel, async () => {
+			const { stream, cancelled } = streamOf([new Uint8Array([1])])
+			await assert.rejects(synthClient(randomUUID()).uploadFileFromReader(streamParams(stream, { knownSize })), e => {
+				assert.equal(assertThrownLikeUbrn(e).kind(), ErrorKind.Conversion)
+				return true
+			})
+			assert.equal(await cancelled, true)
+		})
+	}
+
+	for (const [what, reader] of [
+		["no reader", undefined],
+		["a reader without getReader", {}]
+	]) {
+		test(`uploadFileFromReader with ${what} throws napi's own error`, () => {
+			assert.throws(
+				() => synthClient(randomUUID()).uploadFileFromReader(streamParams(reader)),
+				e => {
+					assert.ok(e instanceof Error)
+					assert.equal(FilenSdkError.hasInner(e), false)
+					return true
+				}
+			)
+		})
+	}
+
 	// A JsDirDownloadCallback recording its calls by method name, without the methods `without`.
 	function dirDownloadCallback(calls, without = []) {
 		const methods = ["onQueryDownloadProgress", "onScanProgress", "onScanErrors", "onScanComplete", "onDownloadUpdate", "onDownloadErrors"]

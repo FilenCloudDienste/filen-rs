@@ -59,6 +59,14 @@
  * Buffer is one. uploadFileFromBytes copies its data once, when the call is made, so changing the
  * array afterwards does not change the upload.
  *
+ * uploadFileFromReader is the wasm build's, which ubrn has no counterpart of. It reads its stream
+ * only as the upload needs it, copying each read out of the stream's chunk on the JS thread. An
+ * abort, through asyncOpts_ or the managedFuture, or a failed upload cancels the stream (a
+ * rejection of that cancel is swallowed); a stream that errors, or a chunk that is not a
+ * Uint8Array, fails the upload with an IO error, and a stream already locked rejects with a
+ * Conversion error. progress is called on the JS thread, every call before the promise settles
+ * unless the upload was aborted.
+ *
  * A data enum (AnyFile, ParentUuid, FileMeta and the rest) is a plain { tag, inner } object,
  * not an instance of a class as ubrn's are: build one as an object literal, its tag taken from
  * the enum's X_Tags (ParentUuid_Tags.Uuid), and tell one apart by its tag. A variant without a
@@ -107,6 +115,25 @@ export type ManagedFuture = {
 export type UploadFileParams = {
 	fileBuilderParams: FileBuilderParams
 	managedFuture: ManagedFuture
+}
+
+/**
+ * What uploadFileFromReader takes: the wasm build's params of that name, the file's fields beside
+ * the stream. The stream is read a buffer at a time as the upload needs it, and only one read is
+ * asked of it at a time: besides what the stream queues itself, the addon holds one of its chunks,
+ * however large the source made it, and one read's copy.
+ *
+ * As on wasm, noExif and noExifOverride default to false, so `{ parent, name, reader }` is enough.
+ * One difference from the wasm build's type: knownSize also takes a bigint.
+ */
+export type UploadFileStreamParams = FileBuilderParams & {
+	/** The file's bytes, locked to the upload once the call is made. A Node Readable converts with Readable.toWeb. */
+	reader: ReadableStream<Uint8Array>
+	/** The stream's length, when known: it sizes the reads, and a longer stream fails the upload. */
+	knownSize?: number | bigint
+	/** The bytes read from the stream so far, a running total, after each read. */
+	progress?: (bytes: bigint) => void
+	managedFuture?: ManagedFuture
 }
 
 /**
