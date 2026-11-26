@@ -50,3 +50,64 @@ strip = "symbols"
 [profile.web-release]
 inherits = "release"
 opt-level = "s"
+
+# filen-cli's cold third-party code at opt-level z: argument parsing and completions, the HTML
+# docs and their local server, prompts and the terminal, YAML, the self-signed certificate for
+# `serve`, the keyring, self-update, version comparison, log files and size formatting. None of it
+# is on a transfer, crypto or cache path. Each crate listed is filen-cli's alone, or reaches the
+# mobile library and the napi addon only as code that never runs there (clap and semver, through
+# uniffi's bindgen and napi-derive's macros). chrono and tracing-subscriber stay at 3: the SDK
+# decodes timestamps and logs through them on every platform.
+[profile.release.package.clap]
+opt-level = "z"
+
+[profile.release.package.clap_builder]
+opt-level = "z"
+
+[profile.release.package.clap_lex]
+opt-level = "z"
+
+[profile.release.package.clap_complete]
+opt-level = "z"
+
+[profile.release.package.comrak]
+opt-level = "z"
+
+[profile.release.package.inquire]
+opt-level = "z"
+
+[profile.release.package.crossterm]
+opt-level = "z"
+
+[profile.release.package.serde_yaml]
+opt-level = "z"
+
+[profile.release.package.unsafe-libyaml]
+opt-level = "z"
+
+[profile.release.package.tiny_http]
+opt-level = "z"
+
+[profile.release.package.rcgen]
+opt-level = "z"
+
+[profile.release.package.yasna]
+opt-level = "z"
+
+[profile.release.package.keyring]
+opt-level = "z"
+
+[profile.release.package.self-replace]
+opt-level = "z"
+
+[profile.release.package.semver]
+opt-level = "z"
+
+[profile.release.package.ftail]
+opt-level = "z"
+
+[profile.release.package.humansize]
+opt-level = "z"
+
+[profile.release.package.tiny-gradient]
+opt-level = "z"
