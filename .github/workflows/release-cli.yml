@@ -155,7 +155,7 @@ jobs:
           elif [[ $target == x86_64-apple-darwin ]]; then
             export RUSTFLAGS="-Zhigher-ranked-assumptions -Cllvm-args=-emit-compact-unwind-non-canonical"
           fi
-          ${{ matrix.command }} build --release --verbose --locked --target $target
+          ${{ matrix.command }} build --profile cli-release --verbose --locked --target $target
         working-directory: ./filen-cli
         env:
           # A plain string overrides the config's `linker = "clang"`. Both stay set on every
@@ -168,9 +168,9 @@ jobs:
         run: |
           mkdir -p ./artifact
           if [[ $os =~ ^windows.*$ ]]; then
-            cp ./target/$target/release/filen-cli.exe ./artifact/filen-cli-$version-$target.exe
+            cp ./target/$target/cli-release/filen-cli.exe ./artifact/filen-cli-$version-$target.exe
           else
-            cp ./target/$target/release/filen-cli ./artifact/filen-cli-$version-$target
+            cp ./target/$target/cli-release/filen-cli ./artifact/filen-cli-$version-$target
             chmod +x ./artifact/filen-cli-$version-$target
           fi
       - name: Archive artifact

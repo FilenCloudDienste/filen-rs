@@ -111,3 +111,74 @@ opt-level = "z"
 
 [profile.release.package.tiny-gradient]
 opt-level = "z"
+
+# The CLI's release binaries (release-cli.yml, filen-cli/Dockerfile) are built for size, with
+# the crates a transfer spends its time in kept at 3: the SDK itself and the crypto it runs over
+# every chunk and every login (AES-GCM with GHASH and POLYVAL, ChaCha20, the SHA-1, SHA-2, MD5 and
+# BLAKE3 hashes, HMAC, Argon2 and PBKDF2, ring under rustls, and the RustCrypto traits they are
+# built on). A stanza names a package, so it covers every version of it in Cargo.lock. The
+# profile inherits release's package overrides too, so the cold crates above stay at z. The
+# release profile itself is unchanged: the mobile library and the napi addon build with it.
+[profile.cli-release]
+inherits = "release"
+opt-level = "s"
+
+[profile.cli-release.package.filen-sdk-rs]
+opt-level = 3
+
+[profile.cli-release.package.aes]
+opt-level = 3
+
+[profile.cli-release.package.aes-gcm]
+opt-level = 3
+
+[profile.cli-release.package.ghash]
+opt-level = 3
+
+[profile.cli-release.package.polyval]
+opt-level = 3
+
+[profile.cli-release.package.sha2]
+opt-level = 3
+
+[profile.cli-release.package.sha1]
+opt-level = 3
+
+[profile.cli-release.package.blake3]
+opt-level = 3
+
+[profile.cli-release.package.argon2]
+opt-level = 3
+
+[profile.cli-release.package.pbkdf2]
+opt-level = 3
+
+[profile.cli-release.package.ring]
+opt-level = 3
+
+[profile.cli-release.package.chacha20]
+opt-level = 3
+
+[profile.cli-release.package.hmac]
+opt-level = 3
+
+[profile.cli-release.package.md-5]
+opt-level = 3
+
+[profile.cli-release.package.cipher]
+opt-level = 3
+
+[profile.cli-release.package.ctr]
+opt-level = 3
+
+[profile.cli-release.package.universal-hash]
+opt-level = 3
+
+[profile.cli-release.package.cpufeatures]
+opt-level = 3
+
+[profile.cli-release.package.digest]
+opt-level = 3
+
+[profile.cli-release.package.block-buffer]
+opt-level = 3

@@ -16,8 +16,8 @@ RUN if [ "$TARGETARCH" = "amd64" ]; then \
     echo "Unsupported architecture"; exit 1; \
     fi && \
     rustup target add ${arch}-unknown-linux-musl && \
-    cargo build --release --verbose --locked -p filen-cli --target ${arch}-unknown-linux-musl -F is_docker && \
-    cp /usr/src/filen-rs/target/${arch}-unknown-linux-musl/release/filen-cli /filen-cli
+    cargo build --profile cli-release --verbose --locked -p filen-cli --target ${arch}-unknown-linux-musl -F is_docker && \
+    cp /usr/src/filen-rs/target/${arch}-unknown-linux-musl/cli-release/filen-cli /filen-cli
 
 FROM alpine:latest
 # runtime dependencies needed for rclone
