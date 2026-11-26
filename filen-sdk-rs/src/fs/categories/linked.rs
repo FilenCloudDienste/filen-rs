@@ -7,7 +7,10 @@ use rayon::iter::ParallelIterator;
 use crate::{
 	Error,
 	api::{self},
-	auth::unauth::UnauthClient,
+	auth::{
+		http::{ProgressCallback, dyn_progress},
+		unauth::UnauthClient,
+	},
 	connect::DirPublicLink,
 	fs::{
 		HasUUID,
@@ -42,62 +45,7 @@ impl CategoryFS for Linked {
 	where
 		F: Fn(u64, Option<u64>) + Send + Sync,
 	{
-		let crypter = context.crypter();
-
-		let response = api::v3::dir::link::content::post_large(
-			client,
-			&api::v3::dir::link::content::Request {
-				uuid: (*context.uuid()),
-				password: context.get_password_hash()?,
-				parent: parent.uuid(),
-			},
-			progress,
-		)
-		.await?;
-
-		do_cpu_intensive(|| {
-			let (dirs, files) = blocking_join!(
-				|| response
-					.dirs
-					.into_maybe_par_iter()
-					.map(|d| {
-						LinkedDirectory(RemoteDirectory::blocking_from_encrypted(
-							d.uuid,
-							d.parent.into(),
-							d.color,
-							false,
-							d.timestamp,
-							d.metadata,
-							crypter,
-						))
-					})
-					.collect::<Vec<_>>(),
-				|| response
-					.files
-					.into_maybe_par_iter()
-					.map(|f| {
-						let meta =
-							FileMeta::blocking_from_encrypted(f.metadata, crypter, f.version);
-						Ok::<AnonymousRemoteFile, Error>(RemoteFile::from_meta(
-							f.uuid,
-							// link surfaces never carry a stable id on the wire
-							(),
-							f.parent.into(),
-							f.size,
-							f.chunks,
-							f.region,
-							f.bucket,
-							f.timestamp,
-							false,
-							meta,
-						))
-					})
-					.collect::<Result<Vec<_>, Error>>()
-			);
-
-			Ok((dirs, files?))
-		})
-		.await
+		list_dir_contents(client, parent, dyn_progress(progress), context).await
 	}
 
 	async fn list_dir_recursive<F>(
@@ -109,67 +57,7 @@ impl CategoryFS for Linked {
 	where
 		F: Fn(u64, Option<u64>) + Send + Sync,
 	{
-		let response = api::v3::dir::download::link::post_large(
-			client,
-			&api::v3::dir::download::link::Request {
-				uuid: (*context.uuid()),
-				password: context.get_password_hash()?,
-				parent: parent.uuid(),
-				skip_cache: false,
-			},
-			progress,
-		)
-		.await?;
-
-		let crypter = context.crypter();
-
-		do_cpu_intensive(|| {
-			let (dirs, files) = blocking_join!(
-				|| response
-					.dirs
-					.into_maybe_par_iter()
-					.filter_map(|response_dir| {
-						Some(LinkedDirectory(RemoteDirectory::blocking_from_encrypted(
-							response_dir.uuid,
-							match response_dir.parent {
-								// the request returns the base dir for the request as one of its dirs, we filter it out here
-								None => return None,
-								Some(parent) => parent,
-							},
-							// link rows carry no color or favorited
-							DirColor::Default,
-							false,
-							response_dir.timestamp,
-							response_dir.meta,
-							crypter,
-						)))
-					})
-					.collect::<Vec<_>>(),
-				|| response
-					.files
-					.into_maybe_par_iter()
-					.map(|f| {
-						let meta =
-							FileMeta::blocking_from_encrypted(f.metadata, crypter, f.version);
-						Ok::<AnonymousRemoteFile, Error>(RemoteFile::from_meta(
-							f.uuid,
-							// link surfaces never carry a stable id on the wire
-							(),
-							f.parent,
-							f.chunks_size,
-							f.chunks,
-							f.region,
-							f.bucket,
-							f.timestamp,
-							false,
-							meta,
-						))
-					})
-					.collect::<Result<Vec<_>, _>>()
-			);
-			Ok((dirs, files?))
-		})
-		.await
+		list_dir_recursive_contents(client, parent, dyn_progress(progress), context).await
 	}
 
 	async fn dir_size(
@@ -213,4 +101,139 @@ impl<'a> From<&'a RootDirectoryWithMeta> for DirType<'a, Linked> {
 	fn from(value: &'a RootDirectoryWithMeta) -> Self {
 		Self::Root(Cow::Borrowed(value))
 	}
+}
+
+/// The body of [`CategoryFS::list_dir`] for [`Linked`], outside the trait method's progress
+/// generic so it is compiled once.
+async fn list_dir_contents(
+	client: &UnauthClient,
+	parent: &DirType<'_, Linked>,
+	progress: Option<&ProgressCallback<'_>>,
+	context: Cow<'_, DirPublicLink>,
+) -> Result<(Vec<LinkedDirectory>, Vec<AnonymousRemoteFile>), Error> {
+	let crypter = context.crypter();
+
+	let response = api::v3::dir::link::content::post_large(
+		client,
+		&api::v3::dir::link::content::Request {
+			uuid: (*context.uuid()),
+			password: context.get_password_hash()?,
+			parent: parent.uuid(),
+		},
+		progress,
+	)
+	.await?;
+
+	do_cpu_intensive(|| {
+		let (dirs, files) = blocking_join!(
+			|| response
+				.dirs
+				.into_maybe_par_iter()
+				.map(|d| {
+					LinkedDirectory(RemoteDirectory::blocking_from_encrypted(
+						d.uuid,
+						d.parent.into(),
+						d.color,
+						false,
+						d.timestamp,
+						d.metadata,
+						crypter,
+					))
+				})
+				.collect::<Vec<_>>(),
+			|| response
+				.files
+				.into_maybe_par_iter()
+				.map(|f| {
+					let meta = FileMeta::blocking_from_encrypted(f.metadata, crypter, f.version);
+					Ok::<AnonymousRemoteFile, Error>(RemoteFile::from_meta(
+						f.uuid,
+						// link surfaces never carry a stable id on the wire
+						(),
+						f.parent.into(),
+						f.size,
+						f.chunks,
+						f.region,
+						f.bucket,
+						f.timestamp,
+						false,
+						meta,
+					))
+				})
+				.collect::<Result<Vec<_>, Error>>()
+		);
+
+		Ok((dirs, files?))
+	})
+	.await
+}
+
+/// The body of [`CategoryFS::list_dir_recursive`] for [`Linked`], outside the trait method's
+/// progress generic so it is compiled once.
+async fn list_dir_recursive_contents(
+	client: &UnauthClient,
+	parent: &DirType<'_, Linked>,
+	progress: Option<&ProgressCallback<'_>>,
+	context: Cow<'_, DirPublicLink>,
+) -> Result<(Vec<LinkedDirectory>, Vec<AnonymousRemoteFile>), Error> {
+	let response = api::v3::dir::download::link::post_large(
+		client,
+		&api::v3::dir::download::link::Request {
+			uuid: (*context.uuid()),
+			password: context.get_password_hash()?,
+			parent: parent.uuid(),
+			skip_cache: false,
+		},
+		progress,
+	)
+	.await?;
+
+	let crypter = context.crypter();
+
+	do_cpu_intensive(|| {
+		let (dirs, files) = blocking_join!(
+			|| response
+				.dirs
+				.into_maybe_par_iter()
+				.filter_map(|response_dir| {
+					Some(LinkedDirectory(RemoteDirectory::blocking_from_encrypted(
+						response_dir.uuid,
+						match response_dir.parent {
+							// the request returns the base dir for the request as one of its dirs, we filter it out here
+							None => return None,
+							Some(parent) => parent,
+						},
+						// link rows carry no color or favorited
+						DirColor::Default,
+						false,
+						response_dir.timestamp,
+						response_dir.meta,
+						crypter,
+					)))
+				})
+				.collect::<Vec<_>>(),
+			|| response
+				.files
+				.into_maybe_par_iter()
+				.map(|f| {
+					let meta = FileMeta::blocking_from_encrypted(f.metadata, crypter, f.version);
+					Ok::<AnonymousRemoteFile, Error>(RemoteFile::from_meta(
+						f.uuid,
+						// link surfaces never carry a stable id on the wire
+						(),
+						f.parent,
+						f.chunks_size,
+						f.chunks,
+						f.region,
+						f.bucket,
+						f.timestamp,
+						false,
+						meta,
+					))
+				})
+				.collect::<Result<Vec<_>, _>>()
+		);
+		Ok((dirs, files?))
+	})
+	.await
 }

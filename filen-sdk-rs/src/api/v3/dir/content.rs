@@ -1,15 +1,15 @@
 pub use filen_types::api::v3::dir::content::{ENDPOINT, Request, Response};
 
-use crate::{auth::http::AuthClient, error::Error};
+use crate::{
+	auth::http::{AuthClient, ProgressCallback},
+	error::Error,
+};
 
-pub(crate) async fn post_large<F>(
+pub(crate) async fn post_large(
 	client: &AuthClient,
 	request: &Request,
-	callback: Option<&F>,
-) -> Result<Response<'static>, Error>
-where
-	F: Fn(u64, Option<u64>) + Send + Sync,
-{
+	callback: Option<&ProgressCallback<'_>>,
+) -> Result<Response<'static>, Error> {
 	client
 		.post_large_response_auth(ENDPOINT.into(), request, callback)
 		.await

@@ -9,7 +9,7 @@ use filen_types::traits::CowHelpers;
 use crate::error::ResultExt;
 use crate::{
 	api,
-	auth::Client,
+	auth::{Client, http::dyn_progress},
 	connect::ParentTargets,
 	crypto::shared::MetaCrypter,
 	error::{Error, ErrorExt, InvalidTypeError, MetadataWasNotDecryptedError},
@@ -299,7 +299,12 @@ impl Client {
 		F: Fn(u64, Option<u64>) + Send + Sync,
 	{
 		// todo check if returned parent is ParentUuid::Linked or not
-		crate::fs::categories::normal::list_parent_uuid(self, ParentUuid::Links, progress).await
+		crate::fs::categories::normal::list_parent_uuid(
+			self,
+			ParentUuid::Links,
+			dyn_progress(progress),
+		)
+		.await
 	}
 
 	pub async fn list_favorites<F>(
@@ -310,7 +315,12 @@ impl Client {
 		F: Fn(u64, Option<u64>) + Send + Sync,
 	{
 		// todo check if returned parent is ParentUuid::Favorites or not
-		crate::fs::categories::normal::list_parent_uuid(self, ParentUuid::Favorites, progress).await
+		crate::fs::categories::normal::list_parent_uuid(
+			self,
+			ParentUuid::Favorites,
+			dyn_progress(progress),
+		)
+		.await
 	}
 
 	pub async fn list_recents<F>(
@@ -321,7 +331,12 @@ impl Client {
 		F: Fn(u64, Option<u64>) + Send + Sync,
 	{
 		// todo check if returned parent is ParentUuid::Recents or not
-		crate::fs::categories::normal::list_parent_uuid(self, ParentUuid::Recents, progress).await
+		crate::fs::categories::normal::list_parent_uuid(
+			self,
+			ParentUuid::Recents,
+			dyn_progress(progress),
+		)
+		.await
 	}
 
 	pub async fn list_trash<F>(
@@ -336,7 +351,7 @@ impl Client {
 		crate::fs::categories::normal::list_parent_uuid(
 			self,
 			ParentUuid::Trash(Uuid::nil()),
-			progress,
+			dyn_progress(progress),
 		)
 		.await
 	}

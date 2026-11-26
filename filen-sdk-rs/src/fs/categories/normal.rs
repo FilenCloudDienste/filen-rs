@@ -6,7 +6,10 @@ use rayon::iter::ParallelIterator;
 
 use crate::{
 	Error, api,
-	auth::Client,
+	auth::{
+		Client,
+		http::{ProgressCallback, dyn_progress},
+	},
 	fs::{
 		HasParent, HasUUID,
 		categories::{Category, DirType, NonRootItemType, fs::CategoryFS},
@@ -40,7 +43,12 @@ impl CategoryFS for Normal {
 	where
 		F: Fn(u64, Option<u64>) + Send + Sync,
 	{
-		list_parent_uuid(client, ParentUuid::Uuid(parent.uuid()), progress).await
+		list_parent_uuid(
+			client,
+			ParentUuid::Uuid(parent.uuid()),
+			dyn_progress(progress),
+		)
+		.await
 	}
 
 	async fn list_dir_recursive<F>(
@@ -52,7 +60,7 @@ impl CategoryFS for Normal {
 	where
 		F: Fn(u64, Option<u64>) + Send + Sync,
 	{
-		list_recursive_parent_uuid(client, parent.uuid(), progress).await
+		list_recursive_parent_uuid(client, parent.uuid(), dyn_progress(progress)).await
 	}
 
 	async fn dir_size(
@@ -85,14 +93,11 @@ impl CategoryFS for Normal {
 }
 
 #[tracing::instrument(name = "list_dir_recursive", skip_all, fields(parent_uuid = %parent_uuid))]
-pub(crate) async fn list_recursive_parent_uuid<F>(
+pub(crate) async fn list_recursive_parent_uuid(
 	client: &Client,
 	parent_uuid: Uuid,
-	progress: Option<&F>,
-) -> Result<(Vec<RemoteDirectory>, Vec<RemoteFile>), Error>
-where
-	F: Fn(u64, Option<u64>) + Send + Sync,
-{
+	progress: Option<&ProgressCallback<'_>>,
+) -> Result<(Vec<RemoteDirectory>, Vec<RemoteFile>), Error> {
 	let response = api::v3::dir::download::post_large(
 		client.client(),
 		&api::v3::dir::download::Request {
@@ -162,14 +167,11 @@ fn wrap_trash_parent(parent: ParentUuid, is_trash: bool) -> ParentUuid {
 }
 
 #[tracing::instrument(name = "list_dir_contents", skip_all, fields(parent = %parent_uuid))]
-pub(crate) async fn list_parent_uuid<F>(
+pub(crate) async fn list_parent_uuid(
 	client: &Client,
 	parent_uuid: ParentUuid,
-	progress: Option<&F>,
-) -> Result<(Vec<RemoteDirectory>, Vec<RemoteFile>), Error>
-where
-	F: Fn(u64, Option<u64>) + Send + Sync,
-{
+	progress: Option<&ProgressCallback<'_>>,
+) -> Result<(Vec<RemoteDirectory>, Vec<RemoteFile>), Error> {
 	let is_trash = parent_uuid.is_trash();
 	let (files, dirs) = api::v3::dir::content::post_large(
 		client.client(),

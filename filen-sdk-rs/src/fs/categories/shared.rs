@@ -13,7 +13,10 @@ use rsa::PrivateKey;
 
 use crate::{
 	Error, api,
-	auth::Client,
+	auth::{
+		Client,
+		http::{ProgressCallback, dyn_progress},
+	},
 	connect::fs::{
 		DirInfo, ShareInfo, SharedDirectory, SharedRootDirectory, SharedRootFile, SharingRole,
 	},
@@ -57,97 +60,7 @@ impl CategoryFS for Shared {
 	where
 		F: Fn(u64, Option<u64>) + Send + Sync,
 	{
-		match &context {
-			SharingRole::Sharer(_) => {
-				let response = api::v3::shared::in_uuid::post_large(
-					client.client(),
-					&api::v3::shared::in_uuid::Request {
-						uuid: parent.uuid(),
-					},
-					progress,
-				)
-				.await?;
-				let key = client.private_key();
-
-				do_cpu_intensive(|| {
-					let (dirs, files) = blocking_join!(
-						|| {
-							response
-								.dirs
-								.into_maybe_par_iter()
-								.map(|d| {
-									SharedDirectory::from_dir_info(DirInfo {
-										uuid: d.uuid,
-										parent: d.parent,
-										color: d.color,
-										timestamp: d.timestamp,
-										metadata: DirectoryMeta::blocking_from_rsa_encrypted(
-											d.metadata, key,
-										),
-									})
-								})
-								.collect::<Vec<_>>()
-						},
-						|| {
-							response
-								.files
-								.into_maybe_par_iter()
-								.map(|f| blocking_remote_file_from_shared_in(f, key))
-								.collect::<Result<Vec<_>, _>>()
-						}
-					);
-
-					Ok((dirs, files?))
-				})
-				.await
-			}
-			SharingRole::Receiver(_) => {
-				let response = api::v3::shared::out_uuid::post_large(
-					client.client(),
-					&api::v3::shared::out_uuid::Request {
-						uuid: parent.uuid(),
-						receiver_id: match context {
-							SharingRole::Sharer(share_info) => share_info.id,
-							SharingRole::Receiver(share_info) => share_info.id,
-						},
-					},
-					progress,
-				)
-				.await?;
-				let crypter = client.crypter();
-
-				do_cpu_intensive(|| {
-					let (dirs, files) = blocking_join!(
-						|| {
-							response
-								.dirs
-								.into_maybe_par_iter()
-								.map(|d| {
-									SharedDirectory::from_dir_info(DirInfo {
-										uuid: d.uuid,
-										parent: d.parent,
-										color: d.color,
-										timestamp: d.timestamp,
-										metadata: DirectoryMeta::blocking_from_encrypted(
-											d.metadata, &*crypter,
-										),
-									})
-								})
-								.collect::<Vec<_>>()
-						},
-						|| {
-							response
-								.files
-								.into_maybe_par_iter()
-								.map(|f| blocking_remote_file_from_shared_out(f, &*crypter))
-								.collect::<Result<Vec<_>, _>>()
-						}
-					);
-					Ok((dirs, files?))
-				})
-				.await
-			}
-		}
+		list_dir_contents(client, parent, dyn_progress(progress), context).await
 	}
 
 	async fn list_dir_recursive<F>(
@@ -159,78 +72,7 @@ impl CategoryFS for Shared {
 	where
 		F: Fn(u64, Option<u64>) + Send + Sync,
 	{
-		if let SharingRole::Receiver(_) = context {
-			let (dirs, files) =
-				super::normal::list_recursive_parent_uuid(client, parent.uuid(), progress).await?;
-			return Ok((
-				dirs.into_iter()
-					.map(|d| SharedDirectory { inner: d })
-					.collect(),
-				// The normal listing reports stable ids, but shared browsing does
-				// not model lifetime identity; see `SharedListedFile`.
-				files.into_iter().map(RemoteFile::into_anonymous).collect(),
-			));
-		}
-
-		let response = api::v3::dir::download::shared::post_large(
-			client.client(),
-			&api::v3::dir::download::shared::Request {
-				uuid: parent.uuid(),
-				skip_cache: true,
-			},
-			progress,
-		)
-		.await?;
-
-		let key = client.private_key();
-
-		do_cpu_intensive(|| {
-			let (dirs, files) = blocking_join!(
-				|| {
-					response
-						.dirs
-						.into_maybe_par_iter()
-						.filter_map(|d| match d.parent {
-							Some(parent) => Some(SharedDirectory::from_dir_info(DirInfo {
-								uuid: d.uuid,
-								parent,
-								color: DirColor::Default,
-								timestamp: d.timestamp,
-								metadata: DirectoryMeta::blocking_from_rsa_encrypted(d.meta, key),
-							})),
-							None => None,
-						})
-						.collect::<Vec<_>>()
-				},
-				|| {
-					response
-						.files
-						.into_maybe_par_iter()
-						.map(|f| {
-							let meta =
-								FileMeta::blocking_from_rsa_encrypted(f.metadata, key, f.version)
-									.into_owned_cow();
-
-							RemoteFile::from_meta(
-								f.uuid,
-								// shared-in surfaces never carry a stable id on the wire
-								(),
-								f.parent.into(),
-								f.chunks_size,
-								f.chunks,
-								f.region.into_owned(),
-								f.bucket.into_owned(),
-								f.timestamp,
-								false,
-								meta,
-							)
-						})
-						.collect::<Vec<_>>()
-				}
-			);
-			Ok((dirs, files))
-		})
-		.await
+		list_dir_recursive_contents(client, parent, dyn_progress(progress), context).await
 	}
 
 	async fn dir_size(
@@ -311,13 +153,10 @@ fn blocking_remote_file_from_shared_in(
 	))
 }
 
-pub(crate) async fn list_all_in_shared<F>(
+pub(crate) async fn list_all_in_shared(
 	client: &Client,
-	callback: Option<&F>,
-) -> Result<(Vec<SharedRootDirectory>, Vec<SharedRootFile>), Error>
-where
-	F: Fn(u64, Option<u64>) + Send + Sync,
-{
+	callback: Option<&ProgressCallback<'_>>,
+) -> Result<(Vec<SharedRootDirectory>, Vec<SharedRootFile>), Error> {
 	let response = api::v3::shared::in_root::post_large(client.client(), callback).await?;
 
 	let priv_key = client.private_key();
@@ -344,14 +183,11 @@ where
 	.await
 }
 
-pub(crate) async fn list_all_out_shared<F>(
+pub(crate) async fn list_all_out_shared(
 	client: &Client,
 	user_id: Option<u64>,
-	callback: Option<&F>,
-) -> Result<(Vec<SharedRootDirectory>, Vec<SharedRootFile>), Error>
-where
-	F: Fn(u64, Option<u64>) + Send + Sync,
-{
+	callback: Option<&ProgressCallback<'_>>,
+) -> Result<(Vec<SharedRootDirectory>, Vec<SharedRootFile>), Error> {
 	let response = api::v3::shared::out_root::post_large(
 		client.client(),
 		&api::v3::shared::out_root::Request {
@@ -407,4 +243,187 @@ impl<'a> From<&'a SharedRootDirectory> for DirType<'a, Shared> {
 	fn from(value: &'a SharedRootDirectory) -> Self {
 		Self::Root(Cow::Borrowed(value))
 	}
+}
+
+/// The body of [`CategoryFS::list_dir`] for [`Shared`], outside the trait method's progress
+/// generic so it is compiled once.
+async fn list_dir_contents(
+	client: &Client,
+	parent: &DirType<'_, Shared>,
+	progress: Option<&ProgressCallback<'_>>,
+	context: &SharingRole,
+) -> Result<(Vec<SharedDirectory>, Vec<SharedListedFile>), Error> {
+	match &context {
+		SharingRole::Sharer(_) => {
+			let response = api::v3::shared::in_uuid::post_large(
+				client.client(),
+				&api::v3::shared::in_uuid::Request {
+					uuid: parent.uuid(),
+				},
+				progress,
+			)
+			.await?;
+			let key = client.private_key();
+
+			do_cpu_intensive(|| {
+				let (dirs, files) = blocking_join!(
+					|| {
+						response
+							.dirs
+							.into_maybe_par_iter()
+							.map(|d| {
+								SharedDirectory::from_dir_info(DirInfo {
+									uuid: d.uuid,
+									parent: d.parent,
+									color: d.color,
+									timestamp: d.timestamp,
+									metadata: DirectoryMeta::blocking_from_rsa_encrypted(
+										d.metadata, key,
+									),
+								})
+							})
+							.collect::<Vec<_>>()
+					},
+					|| {
+						response
+							.files
+							.into_maybe_par_iter()
+							.map(|f| blocking_remote_file_from_shared_in(f, key))
+							.collect::<Result<Vec<_>, _>>()
+					}
+				);
+
+				Ok((dirs, files?))
+			})
+			.await
+		}
+		SharingRole::Receiver(_) => {
+			let response = api::v3::shared::out_uuid::post_large(
+				client.client(),
+				&api::v3::shared::out_uuid::Request {
+					uuid: parent.uuid(),
+					receiver_id: match context {
+						SharingRole::Sharer(share_info) => share_info.id,
+						SharingRole::Receiver(share_info) => share_info.id,
+					},
+				},
+				progress,
+			)
+			.await?;
+			let crypter = client.crypter();
+
+			do_cpu_intensive(|| {
+				let (dirs, files) = blocking_join!(
+					|| {
+						response
+							.dirs
+							.into_maybe_par_iter()
+							.map(|d| {
+								SharedDirectory::from_dir_info(DirInfo {
+									uuid: d.uuid,
+									parent: d.parent,
+									color: d.color,
+									timestamp: d.timestamp,
+									metadata: DirectoryMeta::blocking_from_encrypted(
+										d.metadata, &*crypter,
+									),
+								})
+							})
+							.collect::<Vec<_>>()
+					},
+					|| {
+						response
+							.files
+							.into_maybe_par_iter()
+							.map(|f| blocking_remote_file_from_shared_out(f, &*crypter))
+							.collect::<Result<Vec<_>, _>>()
+					}
+				);
+				Ok((dirs, files?))
+			})
+			.await
+		}
+	}
+}
+
+/// The body of [`CategoryFS::list_dir_recursive`] for [`Shared`], outside the trait method's
+/// progress generic so it is compiled once.
+async fn list_dir_recursive_contents(
+	client: &Client,
+	parent: &DirType<'_, Shared>,
+	progress: Option<&ProgressCallback<'_>>,
+	context: &SharingRole,
+) -> Result<(Vec<SharedDirectory>, Vec<SharedListedFile>), Error> {
+	if let SharingRole::Receiver(_) = context {
+		let (dirs, files) =
+			super::normal::list_recursive_parent_uuid(client, parent.uuid(), progress).await?;
+		return Ok((
+			dirs.into_iter()
+				.map(|d| SharedDirectory { inner: d })
+				.collect(),
+			// The normal listing reports stable ids, but shared browsing does
+			// not model lifetime identity; see `SharedListedFile`.
+			files.into_iter().map(RemoteFile::into_anonymous).collect(),
+		));
+	}
+
+	let response = api::v3::dir::download::shared::post_large(
+		client.client(),
+		&api::v3::dir::download::shared::Request {
+			uuid: parent.uuid(),
+			skip_cache: true,
+		},
+		progress,
+	)
+	.await?;
+
+	let key = client.private_key();
+
+	do_cpu_intensive(|| {
+		let (dirs, files) = blocking_join!(
+			|| {
+				response
+					.dirs
+					.into_maybe_par_iter()
+					.filter_map(|d| match d.parent {
+						Some(parent) => Some(SharedDirectory::from_dir_info(DirInfo {
+							uuid: d.uuid,
+							parent,
+							color: DirColor::Default,
+							timestamp: d.timestamp,
+							metadata: DirectoryMeta::blocking_from_rsa_encrypted(d.meta, key),
+						})),
+						None => None,
+					})
+					.collect::<Vec<_>>()
+			},
+			|| {
+				response
+					.files
+					.into_maybe_par_iter()
+					.map(|f| {
+						let meta =
+							FileMeta::blocking_from_rsa_encrypted(f.metadata, key, f.version)
+								.into_owned_cow();
+
+						RemoteFile::from_meta(
+							f.uuid,
+							// shared-in surfaces never carry a stable id on the wire
+							(),
+							f.parent.into(),
+							f.chunks_size,
+							f.chunks,
+							f.region.into_owned(),
+							f.bucket.into_owned(),
+							f.timestamp,
+							false,
+							meta,
+						)
+					})
+					.collect::<Vec<_>>()
+			}
+		);
+		Ok((dirs, files))
+	})
+	.await
 }

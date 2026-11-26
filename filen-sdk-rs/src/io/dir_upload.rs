@@ -453,10 +453,9 @@ impl Client {
 		match existing {
 			ExistingRemoteFile::Replace => Ok(ExistingFiles::new()),
 			ExistingRemoteFile::Keep | ExistingRemoteFile::ReplaceIfChanged => {
-				let (_, files) =
-					list_parent_uuid(self, ParentUuid::Uuid(dir), None::<&fn(u64, Option<u64>)>)
-						.await
-						.context("listing the files already in a directory during folder upload")?;
+				let (_, files) = list_parent_uuid(self, ParentUuid::Uuid(dir), None)
+					.await
+					.context("listing the files already in a directory during folder upload")?;
 				Ok(files
 					.into_iter()
 					.filter_map(|file| Some((name_key(file.name()?), Box::new(file))))

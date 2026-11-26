@@ -1347,9 +1347,19 @@ impl AuthClient {
 	}
 }
 
-/// The progress callback a streamed response body reports to, as the stacks take it: one
-/// instantiation of the download layer whatever closure a caller passes.
-type ProgressCallback<'a> = dyn Fn(u64, Option<u64>) + Send + Sync + 'a;
+/// The progress callback a streamed response body reports to (bytes received, and the total when
+/// the response states one), as the stacks and the listings above them take it: one instantiation
+/// of each whatever closure a caller passes.
+pub(crate) type ProgressCallback<'a> = dyn Fn(u64, Option<u64>) + Send + Sync + 'a;
+
+/// A caller's progress closure as a [`ProgressCallback`], for a public entry point generic over
+/// the closure to hand on to the listing code compiled once.
+pub(crate) fn dyn_progress<F>(progress: Option<&F>) -> Option<&ProgressCallback<'_>>
+where
+	F: Fn(u64, Option<u64>) + Send + Sync,
+{
+	progress.map(|progress| progress as &ProgressCallback<'_>)
+}
 
 // Every typed entry point below is a thin wrapper: it serializes the request body and sends it
 // through a stack generic over the wire format alone (the stack is compiled once per format, not
@@ -1473,30 +1483,26 @@ impl UnauthClient {
 			.await
 	}
 
-	pub(crate) fn post_large_response<Req, Res, F>(
+	pub(crate) async fn post_large_response<Req, Res>(
 		&self,
 		endpoint: Cow<'static, str>,
 		body: &Req,
-		callback: Option<&F>,
-	) -> impl Future<Output = Result<Res, Error>> + MaybeSend
+		callback: Option<&ProgressCallback<'_>>,
+	) -> Result<Res, Error>
 	where
 		Res: DeserializeOwned + Debug + Send,
 		Req: Serialize + Debug + Sync,
-		F: Fn(u64, Option<u64>) + Send + Sync,
 	{
-		let callback = callback.map(|callback| callback as &ProgressCallback<'_>);
-		async move {
-			let slot = ResponseSlot::new();
-			let accepted = self
-				.post_large_response_stack(
-					endpoint,
-					serialize::serialize_body(body),
-					callback,
-					DeserializeLayer::<Msgpack>::new(&slot),
-				)
-				.await?;
-			slot.into_response(accepted)
-		}
+		let slot = ResponseSlot::new();
+		let accepted = self
+			.post_large_response_stack(
+				endpoint,
+				serialize::serialize_body(body),
+				callback,
+				DeserializeLayer::<Msgpack>::new(&slot),
+			)
+			.await?;
+		slot.into_response(accepted)
 	}
 
 	/// The stack of [`Self::post_large_response`].
@@ -1791,23 +1797,22 @@ impl AuthClient {
 		}
 	}
 
-	pub(crate) async fn post_large_response_auth<Req, Res, F>(
+	pub(crate) async fn post_large_response_auth<Req, Res>(
 		&self,
 		endpoint: Cow<'static, str>,
 		body: &Req,
-		callback: Option<&F>,
+		callback: Option<&ProgressCallback<'_>>,
 	) -> Result<Res, Error>
 	where
 		Res: DeserializeOwned + Debug + MaybeSend,
 		Req: Serialize + Debug,
-		F: Fn(u64, Option<u64>) + Send + Sync,
 	{
 		let slot = ResponseSlot::new();
 		let accepted = self
 			.post_large_response_auth_stack(
 				endpoint,
 				serialize::serialize_body(body),
-				callback.map(|callback| callback as &ProgressCallback<'_>),
+				callback,
 				DeserializeLayer::<Msgpack>::new(&slot),
 			)
 			.await?;

@@ -26,7 +26,7 @@ use futures::stream::{FuturesUnordered, StreamExt};
 
 use crate::{
 	ErrorKind, api,
-	auth::{Client, MetaKey, shared_client::SharedClient},
+	auth::{Client, MetaKey, http::dyn_progress, shared_client::SharedClient},
 	connect::fs::{SharedRootDirectory, SharingRole},
 	crypto::{file::FileKey, shared::MetaCrypter},
 	error::{Error, MetadataWasNotDecryptedError},
@@ -1403,7 +1403,7 @@ impl Client {
 	where
 		F: Fn(u64, Option<u64>) + Send + Sync,
 	{
-		list_all_out_shared(self, contact.map(|c| c.user_id), callback).await
+		list_all_out_shared(self, contact.map(|c| c.user_id), dyn_progress(callback)).await
 	}
 
 	pub async fn list_shared_dir<F>(
@@ -1437,7 +1437,7 @@ impl Client {
 	where
 		F: Fn(u64, Option<u64>) + Send + Sync,
 	{
-		list_all_in_shared(self, callback).await
+		list_all_in_shared(self, dyn_progress(callback)).await
 	}
 
 	/// Leaves a share someone else made with this account, or revokes one this account made.

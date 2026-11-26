@@ -75,11 +75,7 @@ where
 async fn a_listing_reaches_the_network_beside_a_stalled_chunk_upload() {
 	control_request_beside_a_stalled_transfer(Stall::Upload, |client| async move {
 		let _ = client
-			.post_large_response_auth::<(), (), fn(u64, Option<u64>)>(
-				"v3/dir/content".into(),
-				&(),
-				None,
-			)
+			.post_large_response_auth::<(), ()>("v3/dir/content".into(), &(), None)
 			.await;
 	})
 	.await;
@@ -119,11 +115,7 @@ async fn a_public_link_listing_reaches_the_network_beside_a_stalled_chunk_upload
 	control_request_beside_a_stalled_transfer(Stall::Upload, |client| async move {
 		let _ = client
 			.unauthed
-			.post_large_response::<(), (), fn(u64, Option<u64>)>(
-				"v3/dir/link/content".into(),
-				&(),
-				None,
-			)
+			.post_large_response::<(), ()>("v3/dir/link/content".into(), &(), None)
 			.await;
 	})
 	.await;
