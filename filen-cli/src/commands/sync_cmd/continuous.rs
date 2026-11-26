@@ -224,7 +224,7 @@ fn forward_status(
 	mut status: watch::Receiver<WatchStatus>,
 	updates: mpsc::UnboundedSender<(PairId, Update)>,
 ) {
-	tokio::spawn(async move {
+	filen_sdk_rs::runtime::spawn_erased(async move {
 		// The one the watch started with: it may have lost a change source before its first pass.
 		// Each is cloned out of the channel, which keeps the latest for the watch to replace.
 		let mut current = status.borrow_and_update().clone();

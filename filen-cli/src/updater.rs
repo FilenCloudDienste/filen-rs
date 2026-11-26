@@ -192,7 +192,7 @@ pub(crate) struct PendingUpdateCheck {
 	automatically_update: bool,
 	/// Where the time of the check is written, `None` for a forced check.
 	last_checked_config: Option<LastCheckedConfig>,
-	fetched: tokio::task::JoinHandle<Fetched>,
+	fetched: filen_sdk_rs::runtime::TaskJoin<Fetched>,
 }
 
 /// Starts the update check of a command, or of commands piped in, unless it is not due (see
@@ -210,7 +210,7 @@ pub(crate) async fn start_update_check(
 		announcements_url,
 		..
 	} = env;
-	let fetched = tokio::spawn(async move {
+	let fetched = filen_sdk_rs::runtime::spawn_erased(async move {
 		let github_api = GitHubApiClient::new(&releases_url, &announcements_url);
 		tokio::join!(
 			github_api.get_latest_release(),
@@ -2119,7 +2119,9 @@ mod tests {
 			version: "0.2.9".to_owned(),
 			automatically_update: false,
 			last_checked_config: None,
-			fetched: tokio::spawn(async { (Ok(release("v0.3.0")), Ok(Vec::new())) }),
+			fetched: filen_sdk_rs::runtime::spawn_erased(async {
+				(Ok(release("v0.3.0")), Ok(Vec::new()))
+			}),
 		};
 
 		ui.print("output");
