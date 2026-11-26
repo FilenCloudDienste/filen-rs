@@ -29,6 +29,8 @@ const RCLONE_CHECKSUM_WINDOWS_AMD64: [u8; 32] =
 const RCLONE_CHECKSUM_WINDOWS_ARM64: [u8; 32] =
 	hex!("72194ad0aaf210d7a55808801191fecc7e175444dab7be7491b7a63074521f3a");
 // info: when updating the rclone version here, also update the expected SHA256 checksums by copying them from the supplied file, and both in scripts/fetch-rclone.sh
+// The zip reader is built with Deflate only (filen-sdk-rs/Cargo.toml), which every release zip up to
+// this one uses; check a new release's entries are still Deflated.
 
 /// Returns the path to the managed rclone binary in `config_dir`, downloading it first if it is
 /// not there and `allow_download` is set. Without it, a missing binary is the error "Rclone not
@@ -324,7 +326,11 @@ async fn remove_if_present(path: &Path) {
 
 #[cfg(test)]
 mod tests {
-	use std::time::SystemTime;
+	#[cfg(unix)]
+	use std::os::unix::fs::PermissionsExt as _;
+	use std::{io::Write as _, time::SystemTime};
+
+	use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
 
 	use super::*;
 
@@ -416,6 +422,33 @@ mod tests {
 
 		assert_eq!(std::fs::read(&target).unwrap(), b"installed first");
 		assert_eq!(names_in(dir.path()), ["rclone"]);
+	}
+
+	#[tokio::test]
+	async fn extracting_reads_the_deflated_entry_into_the_binary() {
+		let dir = tempfile::tempdir().unwrap();
+		let zip_path = dir.path().join("rclone.zip");
+		let binary = b"rclone binary rclone binary rclone binary";
+		let mut writer = ZipWriter::new(std::fs::File::create(&zip_path).unwrap());
+		let deflated = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+		writer.start_file("rclone-v1/README.txt", deflated).unwrap();
+		writer.write_all(b"readme").unwrap();
+		writer.start_file("rclone-v1/rclone", deflated).unwrap();
+		writer.write_all(binary).unwrap();
+		writer.finish().unwrap();
+		let target = dir.path().join("rclone");
+
+		extract_rclone(&zip_path, "rclone-v1/rclone".to_string(), &target)
+			.await
+			.unwrap();
+
+		assert_eq!(std::fs::read(&target).unwrap(), binary);
+		// Executable by its owner; the group and other bits depend on the umask.
+		#[cfg(unix)]
+		assert_eq!(
+			std::fs::metadata(&target).unwrap().permissions().mode() & 0o700,
+			0o700
+		);
 	}
 
 	#[tokio::test]

@@ -62,9 +62,16 @@ sync-engine = [
 # ships. Native-only (the module is cfg'd off on wasm).
 rclone = ["dep:port_check", "dep:sysinfo", "tokio/process", "tokio/net"]
 # `rclone` plus the managed installation filen-cli uses: it downloads a pinned rclone release, which
-# brings the zip reader the desktop addon does without, and `nix` for whether a foreground rclone
-# shares the terminal's process group.
-rclone-managed = ["rclone", "dep:hex-literal", "dep:zip", "dep:nix"]
+# brings the zip reader the desktop addon does without (and `flate2`, its Deflate backend, which
+# `archive` may leave off), and `nix` for whether a foreground rclone shares the terminal's process
+# group.
+rclone-managed = [
+	"rclone",
+	"dep:hex-literal",
+	"dep:zip",
+	"dep:flate2",
+	"dep:nix",
+]
 # Exposes the otherwise-`pub(crate)` cache apply path (`cache::bench_support`) for the criterion
 # insertion benchmark only, and `nix` for the sync engine probe's peak resident set. Never enable
 # in production builds.
@@ -390,15 +397,11 @@ dunce = { version = "1.0.5", optional = true }
 hex-literal = { version = "1.1.0", optional = true }
 port_check = { version = "0.3.0", optional = true }
 sysinfo = { version = "0.37.2", optional = true }
-# most default features except for encryption, which we definitely won't need to extract Rclone zip
+# Reads Deflate only: every pinned rclone release zip stores its entries Deflated, so the other
+# methods' decoders would be dead code. Its flate2 takes the SDK's own `rust_backend` (miniz_oxide),
+# which `rclone-managed` turns on, so the build holds one Deflate implementation.
 zip = { version = "9.0.5", default-features = false, features = [
-	"bzip2",
-	"deflate",
-	"deflate64",
-	"lzma",
-	"ppmd",
-	"xz",
-	"zstd",
+	"deflate-flate2",
 ], optional = true }
 
 # Desktop and mobile targets (build.rs's `platform_net` cfg; keep the two lists alike): TLS
