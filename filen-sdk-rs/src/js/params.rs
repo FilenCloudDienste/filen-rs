@@ -191,3 +191,59 @@ pub struct LoginParams {
 	)]
 	pub two_factor_code: Option<String>,
 }
+
+#[cfg(all(test, feature = "napi"))]
+mod napi_tests {
+	use filen_types::fs::Uuid;
+
+	use super::*;
+	use crate::js::{
+		Root,
+		napi::{FromWire, IntoWire, Wire},
+	};
+
+	type ParentWire = <AnyNormalDir as Wire>::Wire;
+	type OptionalNameWire = <FileBuilderParamsOptionalName as Wire>::Wire;
+
+	fn root() -> ParentWire {
+		ParentWire::Root {
+			inner: (Root {
+				uuid: Uuid::from_u128(1),
+			}
+			.into_wire(),),
+		}
+	}
+
+	fn optional_name_params(
+		no_exif: Option<bool>,
+		no_exif_override: Option<bool>,
+	) -> FileBuilderParamsOptionalName {
+		FileBuilderParamsOptionalName::from_wire(OptionalNameWire {
+			parent: root(),
+			name: None,
+			created: None,
+			modified: None,
+			mime: None,
+			no_exif,
+			no_exif_override,
+		})
+		.unwrap()
+	}
+
+	#[test]
+	fn optional_name_params_without_the_exif_flags_read_them_as_false() {
+		let params = optional_name_params(None, None);
+		assert!(!params.no_exif);
+		assert!(!params.no_exif_override);
+	}
+
+	#[test]
+	fn optional_name_params_keep_the_exif_flags_they_are_given() {
+		let params = optional_name_params(Some(true), Some(false));
+		assert!(params.no_exif);
+		assert!(!params.no_exif_override);
+		let params = optional_name_params(Some(false), Some(true));
+		assert!(!params.no_exif);
+		assert!(params.no_exif_override);
+	}
+}

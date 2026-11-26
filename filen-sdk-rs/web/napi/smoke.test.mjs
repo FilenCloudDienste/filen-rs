@@ -862,12 +862,60 @@ describe("transfers, offline", () => {
 		})
 	}
 
-	// Upload params into the root of a synthesized account.
-	const uploadParams = () => ({
+	// Upload params into the root of a synthesized account. noExif and noExifOverride are left out:
+	// they default to false, as uniffi defaults them.
+	const uploadParams = (extra = {}) => ({
 		parent: { tag: AnyNormalDir_Tags.Root, inner: [{ uuid: randomUUID() }] },
-		noExif: false,
-		noExifOverride: false
+		...extra
 	})
+
+	test("FileBuilderParamsOptionalName's noExif and noExifOverride are optional, as uniffi defaults them", () => {
+		const typings = readFileSync(join(webDir, "node", "index.d.ts"), "utf8")
+		assert.match(
+			typings,
+			/^export interface FileBuilderParamsOptionalName \{\n(?: {2}.*\n)*? {2}noExif\?: boolean \| undefined\n {2}noExifOverride\?: boolean \| undefined\n\}$/m
+		)
+	})
+
+	for (const [what, flags] of [
+		["noExif and noExifOverride true", { noExif: true, noExifOverride: true }],
+		["noExif and noExifOverride undefined", { noExif: undefined, noExifOverride: undefined }]
+	]) {
+		test(`uploadFile with ${what} gets past argument conversion`, async () => {
+			const source = join(dir, "upload-flags.txt")
+			writeFileSync(source, "a")
+			await assert.rejects(
+				synthClient(randomUUID()).uploadFile(uploadParams(flags), source, { onUpdate: () => {} }, noSignals, {
+					signal: AbortSignal.abort()
+				}),
+				e => {
+					assert.equal(e.name, "AbortError")
+					return true
+				}
+			)
+		})
+	}
+
+	// A defaulted key reads null as napi reads it for every optional key, an Option's too: as a
+	// value of the wrong type.
+	for (const [what, flags, code] of [
+		["a noExif that is not a boolean", { noExif: "yes" }, "BooleanExpected"],
+		["a null noExif", { noExif: null }, "BooleanExpected"],
+		["a null noExifOverride", { noExifOverride: null }, "BooleanExpected"],
+		["a null mime", { mime: null }, "StringExpected"]
+	]) {
+		test(`uploadFile with ${what} throws napi's own error`, () => {
+			assert.throws(
+				() => synthClient(randomUUID()).uploadFile(uploadParams(flags), join(dir, "never.txt"), { onUpdate: () => {} }, noSignals),
+				e => {
+					assert.ok(e instanceof Error)
+					assert.equal(e.code, code)
+					assert.equal(FilenSdkError.hasInner(e), false)
+					return true
+				}
+			)
+		})
+	}
 
 	test("uploadFile of a missing path rejects with an IO error before any request", async () => {
 		const updates = []

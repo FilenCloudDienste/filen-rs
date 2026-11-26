@@ -15,6 +15,13 @@
 //! `<Option<T> as Wire>::Wire`, because napi-derive tells an optional object field by the literal
 //! `Option` segment of its type. A `Vec<u8>` is the leaf `crate::js::napi::bytes::Bytes`, read and
 //! written by `bytes::read` and `bytes::write`: a `Wire` impl for it would overlap `Vec<T>`'s.
+//!
+//! A field uniffi gives a default (`uniffi(default = ..)`, read inside a `cfg_attr` too) may be
+//! left out of an imported mirror, as ubrn's record factory lets it be: its wire type is an
+//! `Option` around the field's and its TypeScript `T | undefined`, and a missing key or
+//! `undefined` reads as that default. A `null` is a value of the wrong type, as napi reads it for
+//! every optional key. The attribute is only read here: the item reaches the wasm and uniffi
+//! derives as it was written.
 
 #[cfg(test)]
 mod tests;
@@ -250,11 +257,44 @@ struct MirrorField<'a> {
 	ty: Type,
 	/// The mirror's field definition.
 	def: TokenStream2,
+	/// What the field reads as when JS leaves it out, if it may (see the module docs).
+	default: Option<TokenStream2>,
 }
 
+impl MirrorField<'_> {
+	/// Reads `wire`, the field's wire value, in a fn returning `Result<_, crate::Error>`.
+	fn read(&self, wire: TokenStream2) -> TokenStream2 {
+		match &self.default {
+			Some(default) => {
+				let read = read_wire(&self.ty, quote!(value));
+				quote! {
+					match #wire {
+						::std::option::Option::Some(value) => #read,
+						::std::option::Option::None => #default,
+					}
+				}
+			}
+			None => read_wire(&self.ty, wire),
+		}
+	}
+
+	/// Writes `value`, the field's value, as its wire value.
+	fn write(&self, value: TokenStream2) -> TokenStream2 {
+		let write = write_wire(&self.ty, value);
+		if self.default.is_some() {
+			quote!(::std::option::Option::Some(#write))
+		} else {
+			write
+		}
+	}
+}
+
+/// The fields of a mirror; `import` says whether it is read from JS, and so whether a field
+/// uniffi defaults may be left out.
 fn mirror_fields<'a>(
 	fields: &'a Punctuated<Field, Comma>,
 	item_ident: &Ident,
+	import: bool,
 ) -> syn::Result<Vec<MirrorField<'a>>> {
 	fields
 		.iter()
@@ -267,8 +307,20 @@ fn mirror_fields<'a>(
 			};
 			let js_name = lower_camel(&ident.unraw().to_string());
 			let ty = rebased(&field.ty, item_ident);
-			let ts_type = ubrn_ts(&ty, Position::Field)?;
-			let wire = wire_type(&ty);
+			let default = if import {
+				match uniffi_default(&field.attrs)? {
+					Some(value) => napi_default(&ty, &value)?,
+					None => None,
+				}
+			} else {
+				None
+			};
+			let mut ts_type = ubrn_ts(&ty, Position::Field)?;
+			let mut wire = wire_type(&ty);
+			if default.is_some() {
+				ts_type.push_str(" | undefined");
+				wire = quote!(::std::option::Option<#wire>);
+			}
 			let docs = docs(&field.attrs);
 			Ok(MirrorField {
 				ident,
@@ -278,9 +330,77 @@ fn mirror_fields<'a>(
 					#[napi(js_name = #js_name, ts_type = #ts_type)]
 					pub #ident: #wire
 				},
+				default,
 			})
 		})
 		.collect()
+}
+
+/// The value of the `default` in a `uniffi(..)` among `attrs`, or in one a `cfg_attr` (at any
+/// depth) holds.
+fn uniffi_default(attrs: &[Attribute]) -> syn::Result<Option<syn::Expr>> {
+	for attr in attrs {
+		if let Some(value) = meta_uniffi_default(&attr.meta)? {
+			return Ok(Some(value));
+		}
+	}
+	Ok(None)
+}
+
+fn meta_uniffi_default(meta: &Meta) -> syn::Result<Option<syn::Expr>> {
+	let Meta::List(list) = meta else {
+		return Ok(None);
+	};
+	let nested = || list.parse_args_with(Punctuated::<Meta, Comma>::parse_terminated);
+	if list.path.is_ident("cfg_attr") {
+		// The first is the predicate, the rest the attributes it applies.
+		for meta in nested()?.iter().skip(1) {
+			if let Some(value) = meta_uniffi_default(meta)? {
+				return Ok(Some(value));
+			}
+		}
+	} else if list.path.is_ident("uniffi") {
+		for meta in nested()? {
+			if let Meta::NameValue(pair) = meta
+				&& pair.path.is_ident("default")
+			{
+				return Ok(Some(pair.value));
+			}
+		}
+	}
+	Ok(None)
+}
+
+/// The Rust value uniffi's default `value` gives a field of type `ty`, or `None` for an `Option`
+/// field, which is optional already and reads a missing key as uniffi's `None`.
+fn napi_default(ty: &Type, value: &syn::Expr) -> syn::Result<Option<TokenStream2>> {
+	if first_type_arg(ty, "Option").is_some() {
+		return match value {
+			syn::Expr::Path(path) if path.path.is_ident("None") => Ok(None),
+			other => Err(syn::Error::new_spanned(
+				other,
+				"an `Option` field defaulted to anything but `None` has no napi rule yet: napi \
+				 reads a missing key as `None`",
+			)),
+		};
+	}
+	match value {
+		syn::Expr::Lit(syn::ExprLit {
+			lit: lit @ (syn::Lit::Bool(_) | syn::Lit::Int(_) | syn::Lit::Float(_)),
+			..
+		}) => Ok(Some(quote!(#lit))),
+		syn::Expr::Lit(syn::ExprLit {
+			lit: lit @ syn::Lit::Str(_),
+			..
+		}) => Ok(Some(quote!(::std::convert::From::from(#lit)))),
+		syn::Expr::Array(array) if array.elems.is_empty() => {
+			Ok(Some(quote!(::std::default::Default::default())))
+		}
+		other => Err(syn::Error::new_spanned(
+			other,
+			"this uniffi default has no napi rule yet",
+		)),
+	}
 }
 
 fn struct_mirror(item: &ItemStruct, directions: Directions) -> syn::Result<TokenStream2> {
@@ -295,12 +415,13 @@ fn struct_mirror(item: &ItemStruct, directions: Directions) -> syn::Result<Token
 	let js_name = upper_camel(&name.unraw().to_string());
 	let flags = directions.napi_flags();
 	let item_docs = docs(&item.attrs);
-	let fields = mirror_fields(&named.named, name)?;
+	let fields = mirror_fields(&named.named, name, directions.import)?;
 	let defs = fields.iter().map(|field| &field.def);
 
 	let from_wire = directions.import.then(|| {
-		let reads = fields.iter().map(|MirrorField { ident, ty, .. }| {
-			let read = read_wire(ty, quote!(wire.#ident));
+		let reads = fields.iter().map(|field| {
+			let ident = field.ident;
+			let read = field.read(quote!(wire.#ident));
 			quote!(#ident: #read)
 		});
 		quote! {
@@ -312,8 +433,9 @@ fn struct_mirror(item: &ItemStruct, directions: Directions) -> syn::Result<Token
 		}
 	});
 	let into_wire = directions.export.then(|| {
-		let writes = fields.iter().map(|MirrorField { ident, ty, .. }| {
-			let write = write_wire(ty, quote!(self.#ident));
+		let writes = fields.iter().map(|field| {
+			let ident = field.ident;
+			let write = field.write(quote!(self.#ident));
 			quote!(#ident: #write)
 		});
 		quote! {
@@ -476,7 +598,7 @@ fn data_enum_mirror(item: &ItemEnum, directions: Directions) -> syn::Result<Toke
 			Fields::Named(named) => {
 				let payload = format_ident!("{}{}Inner", name.unraw(), key);
 				let payload_js_name = format!("{js_name}_{key}_Inner");
-				let fields = mirror_fields(&named.named, name)?;
+				let fields = mirror_fields(&named.named, name, directions.import)?;
 				let defs = fields.iter().map(|field| &field.def);
 				payloads.push(quote! {
 					#[::napi_derive::napi(object, js_name = #payload_js_name #flags)]
@@ -491,8 +613,9 @@ fn data_enum_mirror(item: &ItemEnum, directions: Directions) -> syn::Result<Toke
 						inner: #payload,
 					}
 				});
-				let field_reads = fields.iter().map(|MirrorField { ident, ty, .. }| {
-					let read = read_wire(ty, quote!(inner.#ident));
+				let field_reads = fields.iter().map(|field| {
+					let ident = field.ident;
+					let read = field.read(quote!(inner.#ident));
 					quote!(#ident: #read)
 				});
 				reads.push(quote! {
@@ -501,8 +624,9 @@ fn data_enum_mirror(item: &ItemEnum, directions: Directions) -> syn::Result<Toke
 				let bindings = fields
 					.iter()
 					.map(|MirrorField { ident, .. }| quote!(#ident));
-				let field_writes = fields.iter().map(|MirrorField { ident, ty, .. }| {
-					let write = write_wire(ty, quote!(#ident));
+				let field_writes = fields.iter().map(|field| {
+					let ident = field.ident;
+					let write = field.write(quote!(#ident));
 					quote!(#ident: #write)
 				});
 				writes.push(quote! {

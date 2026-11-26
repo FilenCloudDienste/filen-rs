@@ -26,7 +26,7 @@
 	"DirWithPath": "holds a FileMeta or DirMeta, whose DecryptedRaw bytes cross as a Uint8Array where ubrn has an ArrayBuffer",
 	"FileWithPath": "holds a FileMeta or DirMeta, whose DecryptedRaw bytes cross as a Uint8Array where ubrn has an ArrayBuffer",
 	"DirsAndFilesWithPaths": "holds a FileMeta or DirMeta, whose DecryptedRaw bytes cross as a Uint8Array where ubrn has an ArrayBuffer",
-	"FileBuilderParamsOptionalName": "holds a FileMeta or DirMeta, whose DecryptedRaw bytes cross as a Uint8Array where ubrn has an ArrayBuffer",
+	"FileBuilderParamsOptionalName": "holds a FileMeta or DirMeta, whose DecryptedRaw bytes cross as a Uint8Array where ubrn has an ArrayBuffer; and its noExif and noExifOverride may be left out, as ubrn's record factory allows, where ubrn's type requires them",
 	"JsClient.getDir": "takes or returns a Dir, whose meta's DecryptedRaw bytes cross as a Uint8Array where ubrn has an ArrayBuffer",
 	"JsClient.createDir": "takes or returns a Dir, whose meta's DecryptedRaw bytes cross as a Uint8Array where ubrn has an ArrayBuffer",
 	"JsClient.downloadFileToPath": "takes an AnyFile, whose file meta's DecryptedRaw bytes cross as a Uint8Array where ubrn has an ArrayBuffer",

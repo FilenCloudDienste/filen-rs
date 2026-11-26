@@ -428,7 +428,7 @@ describe("transfers against the server", { skip: email && password ? false : "TE
 		let uploadSettled = false
 		const up = fileProgress(() => uploadSettled)
 		const file = await client
-			.uploadFile({ parent: asNormalDir(remote), noExif: false, noExifOverride: false }, smallSource, up, noSignals)
+			.uploadFile({ parent: asNormalDir(remote) }, smallSource, up, noSignals)
 			.then(uploaded => {
 				uploadSettled = true
 				return uploaded

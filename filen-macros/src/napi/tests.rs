@@ -680,6 +680,280 @@ fn an_sdk_error_field_is_a_filen_sdk_error_interface() {
 }
 
 #[test]
+fn a_field_uniffi_defaults_is_optional_on_an_imported_mirror_and_reads_as_its_default() {
+	let item: Item = syn::parse_quote! {
+		pub struct UploadParams {
+			pub name: String,
+			#[cfg_attr(all(target_family = "wasm", target_os = "unknown"), serde(default))]
+			#[cfg_attr(feature = "uniffi", uniffi(default = false))]
+			pub no_exif: bool,
+		}
+	};
+	let expected = quote! {
+		#[cfg(all(feature = "napi"))]
+		#[allow(unsafe_code)]
+		mod __napi_upload_params {
+			use super::*;
+
+			#[::napi_derive::napi(object, js_name = "UploadParams", object_to_js = false)]
+			pub struct UploadParamsNapi {
+				#[napi(js_name = "name", ts_type = "string")]
+				pub name: <String as crate::js::napi::Wire>::Wire,
+				#[napi(js_name = "noExif", ts_type = "boolean | undefined")]
+				pub no_exif: ::std::option::Option<<bool as crate::js::napi::Wire>::Wire>,
+			}
+
+			impl crate::js::napi::Wire for UploadParams {
+				type Wire = UploadParamsNapi;
+			}
+
+			impl crate::js::napi::FromWire for UploadParams {
+				fn from_wire(wire: UploadParamsNapi) -> ::std::result::Result<Self, crate::Error> {
+					::std::result::Result::Ok(Self {
+						name: <String as crate::js::napi::FromWire>::from_wire(wire.name)?,
+						no_exif: match wire.no_exif {
+							::std::option::Option::Some(value) =>
+								<bool as crate::js::napi::FromWire>::from_wire(value)?,
+							::std::option::Option::None => false,
+						},
+					})
+				}
+			}
+		}
+	};
+	assert_eq!(mirror_of(true, false, item), compact(expected));
+}
+
+#[test]
+fn a_default_is_read_from_a_bare_uniffi_attribute_and_keeps_its_value() {
+	let item: Item = syn::parse_quote! {
+		pub struct SearchConfig {
+			#[uniffi(default = true)]
+			pub recursive: bool,
+			#[uniffi(default = 3)]
+			pub depth: u32,
+			#[uniffi(default = "root")]
+			pub label: String,
+			#[uniffi(default = [])]
+			pub roots: Vec<Uuid>,
+		}
+	};
+	let tokens = mirror_of(true, false, item);
+	for (field, wire, ts, default) in [
+		(
+			"recursive",
+			quote!(<bool as crate::js::napi::Wire>::Wire),
+			"boolean | undefined",
+			quote!(true),
+		),
+		(
+			"depth",
+			quote!(<u32 as crate::js::napi::Wire>::Wire),
+			"number | undefined",
+			quote!(3),
+		),
+		(
+			"label",
+			quote!(<String as crate::js::napi::Wire>::Wire),
+			"string | undefined",
+			quote!(::std::convert::From::from("root")),
+		),
+		(
+			"roots",
+			quote!(::std::vec::Vec<<Uuid as crate::js::napi::Wire>::Wire>),
+			"Array<string> | undefined",
+			quote!(::std::default::Default::default()),
+		),
+	] {
+		let ident = syn::Ident::new(field, proc_macro2::Span::call_site());
+		assert!(
+			tokens.contains(&compact(quote! {
+				#[napi(js_name = #field, ts_type = #ts)]
+				pub #ident: ::std::option::Option<#wire>,
+			})),
+			"{field}: {tokens}"
+		);
+		assert!(
+			tokens.contains(&compact(quote!(::std::option::Option::None => #default,))),
+			"{field}: {tokens}"
+		);
+	}
+}
+
+#[test]
+fn option_and_defaulted_fields_mix_and_an_option_defaulted_to_none_is_unchanged() {
+	let item: Item = syn::parse_quote! {
+		pub struct UploadParams {
+			#[cfg_attr(feature = "uniffi", uniffi(default = None))]
+			pub mime: Option<String>,
+			pub created: Option<DateTime<Utc>>,
+			#[cfg_attr(feature = "uniffi", uniffi(default = false))]
+			pub no_exif: bool,
+			pub parent: AnyNormalDir,
+		}
+	};
+	let tokens = mirror_of(true, false, item);
+	assert!(
+		tokens.contains(&compact(quote! {
+			pub struct UploadParamsNapi {
+				#[napi(js_name = "mime", ts_type = "string | undefined")]
+				pub mime: ::std::option::Option<<String as crate::js::napi::Wire>::Wire>,
+				#[napi(js_name = "created", ts_type = "bigint | undefined")]
+				pub created: ::std::option::Option<<DateTime<Utc> as crate::js::napi::Wire>::Wire>,
+				#[napi(js_name = "noExif", ts_type = "boolean | undefined")]
+				pub no_exif: ::std::option::Option<<bool as crate::js::napi::Wire>::Wire>,
+				#[napi(js_name = "parent", ts_type = "AnyNormalDir")]
+				pub parent: <AnyNormalDir as crate::js::napi::Wire>::Wire,
+			}
+		})),
+		"{tokens}"
+	);
+	assert!(
+		tokens.contains(&compact(quote! {
+			mime: <Option<String> as crate::js::napi::FromWire>::from_wire(wire.mime)?,
+			created: <Option<DateTime<Utc>> as crate::js::napi::FromWire>::from_wire(wire.created)?,
+		})),
+		"{tokens}"
+	);
+	assert!(
+		tokens.contains(&compact(quote! {
+			parent: <AnyNormalDir as crate::js::napi::FromWire>::from_wire(wire.parent)?,
+		})),
+		"{tokens}"
+	);
+}
+
+#[test]
+fn an_export_only_mirror_keeps_a_defaulted_field_required() {
+	let item: Item = syn::parse_quote! {
+		pub struct Report {
+			#[cfg_attr(feature = "uniffi", uniffi(default = false))]
+			pub skipped: bool,
+		}
+	};
+	let tokens = mirror_of(false, true, item);
+	assert!(
+		tokens.contains(&compact(quote! {
+			#[napi(js_name = "skipped", ts_type = "boolean")]
+			pub skipped: <bool as crate::js::napi::Wire>::Wire,
+		})),
+		"{tokens}"
+	);
+	assert!(
+		tokens.contains(&compact(quote! {
+			skipped: <bool as crate::js::napi::IntoWire>::into_wire(self.skipped),
+		})),
+		"{tokens}"
+	);
+}
+
+#[test]
+fn a_mirror_read_and_written_writes_a_defaulted_field_as_present() {
+	let item: Item = syn::parse_quote! {
+		pub struct Options {
+			#[cfg_attr(feature = "uniffi", uniffi(default = false))]
+			pub verbose: bool,
+		}
+	};
+	let tokens = mirror_of(true, true, item);
+	assert!(
+		tokens.contains(&compact(quote! {
+			verbose: ::std::option::Option::Some(
+				<bool as crate::js::napi::IntoWire>::into_wire(self.verbose)
+			),
+		})),
+		"{tokens}"
+	);
+}
+
+#[test]
+fn a_defaulted_field_of_a_struct_variant_is_optional_too() {
+	let item: Item = syn::parse_quote! {
+		pub enum Filter {
+			Name {
+				pattern: String,
+				#[cfg_attr(feature = "uniffi", uniffi(default = false))]
+				case_sensitive: bool,
+			},
+		}
+	};
+	let tokens = mirror_of(true, false, item);
+	assert!(
+		tokens.contains(&compact(quote! {
+			#[napi(js_name = "caseSensitive", ts_type = "boolean | undefined")]
+			pub case_sensitive: ::std::option::Option<<bool as crate::js::napi::Wire>::Wire>,
+		})),
+		"{tokens}"
+	);
+	assert!(
+		tokens.contains(&compact(quote! {
+			case_sensitive: match inner.case_sensitive {
+				::std::option::Option::Some(value) =>
+					<bool as crate::js::napi::FromWire>::from_wire(value)?,
+				::std::option::Option::None => false,
+			},
+		})),
+		"{tokens}"
+	);
+}
+
+#[test]
+fn uniffi_defaults_without_a_napi_rule_are_errors() {
+	assert!(
+		mirror_error(syn::parse_quote!(
+			pub struct Page {
+				#[uniffi(default = Some(10))]
+				pub limit: Option<u32>,
+			}
+		))
+		.contains("defaulted to anything but `None`")
+	);
+	assert!(
+		mirror_error(syn::parse_quote!(
+			pub struct Page {
+				#[uniffi(default = b"x")]
+				pub tag: Vec<u8>,
+			}
+		))
+		.contains("this uniffi default has no napi rule yet")
+	);
+}
+
+#[test]
+fn with_napi_js_type_appends_a_mirror_to_what_it_writes_without_it_for_a_defaulted_field() {
+	// The napi mirror only reads the attribute: the item and its wasm and uniffi derives are
+	// written exactly as without `napi`, the attribute where it was. This compares the two
+	// outputs of the current macro; that they match the macro before napi read the attribute
+	// is shown by diffing the generated wasm and ubrn typings, not here.
+	let item: Item = syn::parse_quote! {
+		pub struct UploadParams {
+			pub name: String,
+			#[cfg_attr(all(target_family = "wasm", target_os = "unknown"), serde(default))]
+			#[cfg_attr(feature = "uniffi", uniffi(default = false))]
+			pub no_exif: bool,
+		}
+	};
+	let without = js_type(quote!(import, no_ser), item.clone());
+	let with = js_type(quote!(import, no_ser, napi), item);
+	assert!(!without.contains("napi"), "{without}");
+	assert!(
+		without.contains(&compact(quote! {
+			#[cfg_attr(all(target_family = "wasm", target_os = "unknown"), serde(default))]
+			#[cfg_attr(feature = "uniffi", uniffi(default = false))]
+			pub no_exif: bool,
+		})),
+		"{without}"
+	);
+	let mirror = with.strip_prefix(&without).expect(&with);
+	assert!(
+		mirror.starts_with(
+			r#"#[cfg(all(feature="napi"))]#[allow(unsafe_code)]mod__napi_upload_params{"#
+		),
+		"{mirror}"
+	);
+}
+
+#[test]
 fn napi_mirror_takes_import_and_export_only() {
 	let args = syn::parse::Parser::parse2(
 		Punctuated::<Meta, Comma>::parse_terminated,
