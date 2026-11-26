@@ -4,12 +4,13 @@ use std::{
 };
 
 use filen_types::fs::Uuid;
+use tokio::sync::watch;
 
 use super::*;
 use crate::{
 	helper::protocol::RootDir,
 	identity::PlaceholderIdentity,
-	test_support::{FakeEntry, FakeLocal, FakePlatform, LocalOp, PlatformCall, root_path},
+	test_support::{FakeEntry, FakeLocal, FakePlatform, Gated, LocalOp, PlatformCall, root_path},
 };
 
 /// The user whose root the tests unregister.
@@ -68,7 +69,7 @@ fn kept(walked: &Walked) -> Vec<(String, KeptItemReason, bool)> {
 
 #[test]
 fn every_item_holding_data_the_drive_lacks_is_kept() {
-	let walked = walk(&every_kind()).unwrap();
+	let walked = walk(&every_kind(), &Stop::never()).unwrap();
 	assert_eq!(
 		kept(&walked),
 		[
@@ -135,11 +136,14 @@ async fn unregister(
 	unregister_root(
 		platform,
 		index,
-		user(),
-		root,
 		registered,
-		delete_hydrated,
-		date.to_owned(),
+		Unregistering {
+			user: user(),
+			root,
+			delete_hydrated,
+			date: date.to_owned(),
+			stop: &Stop::never(),
+		},
 	)
 	.await
 }
@@ -279,7 +283,7 @@ async fn a_changed_file_not_all_on_disk_stops_the_unregister_before_anything_is_
 fn a_file_edited_after_the_walk_is_kept_not_deleted() {
 	let local = FakeLocal::new(PlaceholderIdentity::Root { root: ACCOUNT_ROOT });
 	local.place_file(&root_path("clean.txt"), file(1), b"clean");
-	let walked = walk(&local).unwrap();
+	let walked = walk(&local, &Stop::never()).unwrap();
 	local
 		.user_write(&root_path("clean.txt"), b"edited")
 		.unwrap();
@@ -632,7 +636,7 @@ async fn a_directory_above_a_kept_item_that_cannot_be_made_ordinary_stops_the_un
 fn a_file_edited_after_the_walk_whose_state_then_cannot_be_read_is_left_and_kept() {
 	let local = FakeLocal::new(PlaceholderIdentity::Root { root: ACCOUNT_ROOT });
 	local.place_file(&root_path("clean.txt"), file(1), b"clean");
-	let walked = walk(&local).unwrap();
+	let walked = walk(&local, &Stop::never()).unwrap();
 	local
 		.user_write(&root_path("clean.txt"), b"edited")
 		.unwrap();
@@ -649,5 +653,164 @@ fn a_file_edited_after_the_walk_whose_state_then_cannot_be_read_is_left_and_kept
 	assert_eq!(
 		local.entry(&root_path("clean.txt")).unwrap().bytes,
 		b"edited"
+	);
+}
+
+/// A root holding two changed files whose data is not all on disk.
+fn two_partial_edits() -> FakeLocal {
+	let local = FakeLocal::new(PlaceholderIdentity::Root { root: ACCOUNT_ROOT });
+	for (n, name) in [(1, "a.txt"), (2, "b.txt")] {
+		local.place_file(&root_path(name), file(n), b"old data");
+		local.user_write(&root_path(name), b"new data").unwrap();
+		local.set_on_disk(&root_path(name), 3);
+	}
+	local
+}
+
+/// A stop and what asks for it.
+fn stop() -> (watch::Sender<bool>, Stop) {
+	let (ask, stopping) = watch::channel(false);
+	(ask, Stop::new(stopping))
+}
+
+fn hydrated(local: &FakeLocal) -> usize {
+	local
+		.ops()
+		.iter()
+		.filter(|op| matches!(op, LocalOp::Hydrated(_)))
+		.count()
+}
+
+#[test]
+fn a_walk_asked_to_stop_lists_nothing() {
+	let local = every_kind();
+	// A listing would fail the walk otherwise.
+	local.fail_list_dir(&RootPath::root(), Some(LocalError::Busy));
+	let (ask, stop) = stop();
+	ask.send_replace(true);
+	assert!(matches!(
+		walk(&local, &stop),
+		Err(WalkError::Stopping(Stopping))
+	));
+}
+
+#[test]
+fn fetching_asked_to_stop_fetches_nothing() {
+	let local = two_partial_edits();
+	let walked = walk(&local, &Stop::never()).unwrap();
+	let (ask, stop) = stop();
+	ask.send_replace(true);
+	assert_eq!(hydrate_kept(&local, &walked, &stop), Err(Stopping));
+	assert_eq!(hydrated(&local), 0);
+}
+
+#[test]
+fn a_stop_during_a_fetch_fetches_no_further_file() {
+	let local = two_partial_edits();
+	let walked = walk(&local, &Stop::never()).unwrap();
+	assert_eq!(walked.partial().count(), 2);
+	let gate = local.gate(Gated::Hydrate);
+	let (ask, stop) = stop();
+	let fetching = {
+		let local = local.clone();
+		std::thread::spawn(move || hydrate_kept(&local, &walked, &stop))
+	};
+	gate.wait_entered();
+	ask.send_replace(true);
+	gate.open();
+	assert_eq!(fetching.join().unwrap(), Err(Stopping));
+	assert_eq!(hydrated(&local), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_unregister_asked_to_stop_before_it_starts_leaves_the_root_as_it_was() {
+	let local = two_partial_edits();
+	let platform = platform(&local);
+	let root = Path::new("/home/u/Filen");
+	let (_temp, mut index) = index(root);
+	let registered = platform.register(root, ACCOUNT_ROOT).unwrap();
+	let (ask, stop) = stop();
+	ask.send_replace(true);
+	let Err(stopped) = unregister_root(
+		&platform,
+		&mut index,
+		registered,
+		Unregistering {
+			user: user(),
+			root,
+			delete_hydrated: true,
+			date: "2026-11-26".to_owned(),
+			stop: &stop,
+		},
+	)
+	.await
+	else {
+		panic!("the unregister went ahead");
+	};
+	assert_eq!(stopped.error.code, ErrorCode::ShuttingDown);
+	assert!(matches!(stopped.held, Held::Registered(_)));
+	assert_eq!(
+		platform.calls(),
+		[PlatformCall::Register {
+			root: root.to_path_buf(),
+			account_root: ACCOUNT_ROOT
+		}]
+	);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stop_during_the_walk_of_the_refusing_root_disconnects_it_and_changes_nothing() {
+	let local = every_kind();
+	let platform = platform(&local);
+	let root = Path::new("/home/u/Filen");
+	let (_temp, mut index) = index(root);
+	let before = local.entries();
+	let registered = platform.register(root, ACCOUNT_ROOT).unwrap();
+	let gate = local.gate(Gated::ListDir);
+	let (ask, stop) = stop();
+	let unregistering = unregister_root(
+		&platform,
+		&mut index,
+		registered,
+		Unregistering {
+			user: user(),
+			root,
+			delete_hydrated: true,
+			date: "2026-11-26".to_owned(),
+			stop: &stop,
+		},
+	);
+	let stopping = async {
+		{
+			let gate = gate.clone();
+			blocking(move || gate.wait_entered()).await;
+		}
+		ask.send_replace(true);
+		gate.open();
+	};
+	let (unregistered, ()) = tokio::join!(unregistering, stopping);
+	let Err(stopped) = unregistered else {
+		panic!("the unregister went ahead");
+	};
+	assert_eq!(stopped.error.code, ErrorCode::ShuttingDown);
+	assert!(matches!(stopped.held, Held::Registered(_)));
+	assert_eq!(
+		platform.calls(),
+		[
+			PlatformCall::Register {
+				root: root.to_path_buf(),
+				account_root: ACCOUNT_ROOT
+			},
+			PlatformCall::ConnectRefusing(root.to_path_buf()),
+			PlatformCall::Disconnect(root.to_path_buf()),
+		]
+	);
+	assert_eq!(local.entries(), before);
+	assert!(index.entry(user()).unwrap().kept.is_empty());
+	assert!(
+		!local
+			.ops()
+			.iter()
+			.any(|op| matches!(op, LocalOp::Reverted(_) | LocalOp::Hydrated(_)))
 	);
 }

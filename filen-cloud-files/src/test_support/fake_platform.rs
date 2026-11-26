@@ -121,7 +121,7 @@ struct PlatformState {
 	watchers: Vec<LiveWatcher>,
 	next_watcher: u64,
 	fail_watch_starts: u32,
-	watch_gate: Option<WatchGate>,
+	watch_gate: Option<CallGate>,
 	refusal: Option<RootRefusal>,
 	fail_connect: bool,
 	panic_check_root: bool,
@@ -304,24 +304,25 @@ fn lock(state: &Mutex<PlatformState>) -> MutexGuard<'_, PlatformState> {
 	state.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct GateState {
-	/// Starts that reached the gate.
+	/// Calls that reached the gate.
 	entered: usize,
 	open: bool,
 }
 
-/// Holds watcher starts until it opens, as an OS slow to start a watcher does. Clones share one
-/// gate.
-#[derive(Clone, Default)]
-pub struct WatchGate(Arc<(Mutex<GateState>, Condvar)>);
+/// Holds the calls of one kind, on the threads making them, until it opens: watcher starts, as an
+/// OS slow to start a watcher does, or one of the sync root's calls ([`FakeLocal::gate`]). Clones
+/// share one gate.
+#[derive(Debug, Clone, Default)]
+pub struct CallGate(Arc<(Mutex<GateState>, Condvar)>);
 
-impl WatchGate {
+impl CallGate {
 	fn gate(&self) -> MutexGuard<'_, GateState> {
 		self.0.0.lock().unwrap_or_else(PoisonError::into_inner)
 	}
 
-	/// Blocks until a start reached the gate.
+	/// Blocks until a call reached the gate.
 	pub fn wait_entered(&self) {
 		let mut gate = self.gate();
 		while gate.entered == 0 {
@@ -329,14 +330,14 @@ impl WatchGate {
 		}
 	}
 
-	/// Lets every held start and every later one through.
+	/// Lets every held call and every later one through.
 	pub fn open(&self) {
 		self.gate().open = true;
 		self.0.1.notify_all();
 	}
 
-	/// Blocks the calling start until the gate opens.
-	fn pass(&self) {
+	/// Blocks the calling thread until the gate opens.
+	pub(crate) fn pass(&self) {
 		let mut gate = self.gate();
 		gate.entered += 1;
 		self.0.1.notify_all();
@@ -443,8 +444,8 @@ impl FakePlatform {
 	}
 
 	/// Holds every later watcher start, before it does anything, until the gate returned opens.
-	pub fn hold_watch_starts(&self) -> WatchGate {
-		let gate = WatchGate::default();
+	pub fn hold_watch_starts(&self) -> CallGate {
+		let gate = CallGate::default();
 		self.state().watch_gate = Some(gate.clone());
 		gate
 	}

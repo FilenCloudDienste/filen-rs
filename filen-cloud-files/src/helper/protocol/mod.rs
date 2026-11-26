@@ -230,7 +230,11 @@ pub enum Request {
 	/// `clearAuth`: only a served root fetches the data of a changed file not all on disk first;
 	/// without a session such a file stops the unregister (`unsyncedChanges`) and the root stays
 	/// registered. It has no time bound, as it walks the whole root and may download, and requests
-	/// sent after it wait for it.
+	/// sent after it wait for it. A `shutdown`, or the input closing, while it waits for the
+	/// session to sign in, walks the root or fetches files answers it `shuttingDown` at once (a
+	/// fetch in flight is cut short), with the root still registered, its session sealed and
+	/// nothing kept aside, for a later `unregister`; once it has begun settling the items
+	/// (deleting clean downloads, making kept items ordinary) it runs to its end.
 	Unregister {
 		/// Whose root to unregister.
 		user: UserId,

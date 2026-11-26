@@ -6,6 +6,7 @@ use std::{
 	mem,
 	panic::AssertUnwindSafe,
 	path::PathBuf,
+	pin::pin,
 	sync::{
 		Arc,
 		atomic::{AtomicBool, Ordering},
@@ -31,7 +32,7 @@ use crate::{
 	dispatch::{CloudFilesCallback, DispatchConfig, Dispatcher},
 	drive::Drive,
 	helper::{
-		blocking,
+		Stop, blocking,
 		events::{self, HelperCallback, Out},
 		framing::{Frame, next_frame},
 		identify::{self, NOT_SERVING},
@@ -42,7 +43,10 @@ use crate::{
 			ParseError, PhaseName, Registration, ReplyError, ReplyValue, Request, RootDir,
 			RootListing, StateReport, StatusEvent, UnregisterReport, UserId, parse_line,
 		},
-		unregister::{self, EntryUnregistered, Held, Stopped, unregister_entry},
+		unregister::{
+			self, EntryUnregistered, Held, Stopped, Stopping, WalkError, shutting_down,
+			unregister_entry,
+		},
 		validate,
 		watch_keeper::{Keeper, Keeping, keep_watching},
 	},
@@ -206,8 +210,8 @@ struct Helper<P: Platform, O: DriveOpener> {
 	out: Out,
 	callback: Arc<HelperCallback>,
 	/// Set once the parent asked the helper to stop or closed its input: a sign-in still waited
-	/// for gives up.
-	stopping: watch::Receiver<bool>,
+	/// for gives up, and an unregister stops at its next safe point.
+	stopping: Stop,
 	phase: Phase<P, O::Drive>,
 	/// The kept reports the last reply carried, by user: the parent's next request says it read
 	/// them, and their records go.
@@ -364,7 +368,7 @@ where
 		index,
 		out,
 		callback,
-		stopping,
+		stopping: Stop::new(stopping),
 		phase: Phase::Idle,
 		reported: Vec::new(),
 		thumbnails,
@@ -619,10 +623,9 @@ impl<P: Platform, O: DriveOpener> Helper<P, O> {
 				watching: serving.watching.load(Ordering::Relaxed),
 				pending_uploads: {
 					// Not past a stop the parent asked for: its shutdown budget is the parent's.
-					let mut stopping = self.stopping.clone();
 					tokio::select! {
 						counted = serving.engine.unsynced_count_after_walk(STATE_WALK_LIMIT) => counted,
-						_ = stopping.wait_for(|stopping| *stopping) => None,
+						() = self.stopping.asked() => None,
 					}
 				},
 			},
@@ -1134,7 +1137,6 @@ impl<P: Platform, O: DriveOpener> Helper<P, O> {
 		account_root: Uuid,
 	) -> Result<(), ReplyError> {
 		let deadline = Instant::now() + self.config.auth_wait;
-		let mut stopping = self.stopping.clone();
 		loop {
 			match drive.root_uuid().await {
 				Ok(root) if Uuid::parse_str(&root).ok() == Some(account_root) => return Ok(()),
@@ -1152,7 +1154,7 @@ impl<P: Platform, O: DriveOpener> Helper<P, O> {
 					warn!(error = %log_safe::error(&error), "the cache could not name its root yet");
 				}
 			}
-			if *stopping.borrow_and_update() {
+			if self.stopping.requested() {
 				return Err(ReplyError::new(
 					ErrorCode::ShuttingDown,
 					"the helper is stopping; the session stays for its next start",
@@ -1166,7 +1168,7 @@ impl<P: Platform, O: DriveOpener> Helper<P, O> {
 			}
 			tokio::select! {
 				() = sleep(self.config.auth_poll) => {}
-				Ok(()) = stopping.changed() => {}
+				() = self.stopping.asked() => {}
 			}
 		}
 	}
@@ -1288,7 +1290,9 @@ impl<P: Platform, O: DriveOpener> Helper<P, O> {
 
 	/// Unregisters `user`'s root without losing local data, then forgets it and deletes the user's
 	/// data and sealing key. A served root first fetches the data of its changed files not all on
-	/// disk, while a session can.
+	/// disk, while a session can. A stop asked for before the root's items are settled answers
+	/// `shuttingDown` at the next safe point, leaving the root registered with its session, and
+	/// the loop then stops as for any shutdown.
 	async fn unregister(
 		&mut self,
 		user: UserId,
@@ -1309,21 +1313,20 @@ impl<P: Platform, O: DriveOpener> Helper<P, O> {
 			}));
 		};
 		self.serve_to_unregister(&entry).await;
+		// A sign-in the serve waited for gave up on the stop, or the stop came after it.
+		if self.stopping.requested() {
+			return Err(shutting_down());
+		}
 		// What this run held of the root: its registration, and the account it served, so a served
 		// root that cannot be unregistered is served again.
 		let (held, served) = match mem::replace(&mut self.phase, Phase::Idle) {
 			Phase::Serving(serving) if serving.user == user => {
+				if self.fetch_kept(&serving).await.is_err() {
+					// Left served: the loop's own stop stops it.
+					self.phase = Phase::Serving(serving);
+					return Err(shutting_down());
+				}
 				let account_root = serving.account_root;
-				let platform = Arc::clone(&self.platform);
-				let root = serving.root.clone();
-				blocking(move || {
-					let local = platform.local_fs(&root);
-					match unregister::walk(&*local) {
-						Ok(walked) => unregister::hydrate_kept(&*local, &walked),
-						Err(error) => warn!(%error, "walking the root before unregistering failed"),
-					}
-				})
-				.await;
 				let (registered, _, _) = self.stop_serving(*serving).await;
 				(Some(registered), Some(account_root))
 			}
@@ -1338,7 +1341,16 @@ impl<P: Platform, O: DriveOpener> Helper<P, O> {
 			Some(Registered { cf, data_dir, .. }) => (cf, Some(data_dir)),
 			None => (None, None),
 		};
-		match unregister_entry(&self.platform, &mut self.index, &entry, cf, delete_hydrated).await {
+		match unregister_entry(
+			&self.platform,
+			&mut self.index,
+			&entry,
+			cf,
+			delete_hydrated,
+			&self.stopping,
+		)
+		.await
+		{
 			Ok(EntryUnregistered { report, .. }) => {
 				if active {
 					self.status();
@@ -1367,7 +1379,8 @@ impl<P: Platform, O: DriveOpener> Helper<P, O> {
 						branding: entry.branding.clone(),
 					};
 					self.phase = match served {
-						Some(account_root) => {
+						// Not while stopping: the serve would wait for a sign-in.
+						Some(account_root) if !self.stopping.requested() => {
 							match self.serve(registered, None, account_root).await {
 								Ok(serving) => Phase::Serving(Box::new(serving)),
 								Err((registered, resume)) => {
@@ -1376,13 +1389,49 @@ impl<P: Platform, O: DriveOpener> Helper<P, O> {
 								}
 							}
 						}
-						None => Phase::Registered(registered),
+						Some(_) | None => Phase::Registered(registered),
 					};
 					self.status();
 				}
 				Err(error)
 			}
 		}
+	}
+
+	/// Walks the served root and fetches the data of its changed files not all on disk, before it
+	/// is unregistered. A stop asked for meanwhile closes the dispatcher, which fails the fetch in
+	/// flight and every later one, so the platform's hydrate returns; then it waits for the walk to
+	/// give up. [`Stopping`] once a stop was asked for, whenever it came.
+	async fn fetch_kept(&self, serving: &Serving<P, O::Drive>) -> Result<(), Stopping> {
+		let fetching = {
+			let platform = Arc::clone(&self.platform);
+			let root = serving.root.clone();
+			let stop = self.stopping.clone();
+			blocking(move || {
+				let local = platform.local_fs(&root);
+				match unregister::walk(&*local, &stop) {
+					Ok(walked) => unregister::hydrate_kept(&*local, &walked, &stop),
+					Err(WalkError::Stopping(stopping)) => Err(stopping),
+					Err(WalkError::Local(error)) => {
+						warn!(%error, "walking the root before unregistering failed");
+						Ok(())
+					}
+				}
+			})
+		};
+		let mut fetching = pin!(fetching);
+		let fetched = tokio::select! {
+			fetched = &mut fetching => fetched,
+			() = self.stopping.asked() => {
+				serving.dispatcher.close().await;
+				fetching.await
+			}
+		};
+		// A stop that came just after the fetches is honoured too: the root is not settled yet.
+		if self.stopping.requested() {
+			return Err(Stopping);
+		}
+		fetched
 	}
 
 	/// Serves `entry`'s root with the session sealed in its data directory before it is

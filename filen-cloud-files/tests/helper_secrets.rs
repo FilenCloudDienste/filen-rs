@@ -111,17 +111,20 @@ fn capture() -> &'static Capture {
 async fn read_all(output: DuplexStream) -> Vec<Value> {
 	let mut output = BufReader::new(output);
 	let mut lines = Vec::new();
-	let mut line = String::new();
-	while timeout(Duration::from_secs(3600), output.read_line(&mut line))
-		.await
-		.unwrap()
-		.unwrap()
-		> 0
-	{
-		lines.push(serde_json::from_str::<Value>(&line).unwrap());
-		line.clear();
+	while let Some(line) = next_line(&mut output).await {
+		lines.push(line);
 	}
 	lines
+}
+
+/// The helper's next line, `None` once it closed its output; fails after an hour of quiet.
+async fn next_line(output: &mut BufReader<DuplexStream>) -> Option<Value> {
+	let mut line = String::new();
+	let read = timeout(Duration::from_secs(3600), output.read_line(&mut line))
+		.await
+		.unwrap()
+		.unwrap();
+	(read > 0).then(|| serde_json::from_str(&line).unwrap())
 }
 
 #[tokio::test(start_paused = true)]
@@ -377,13 +380,18 @@ async fn unregister_through_the_helper() {
 			.unwrap();
 		input.write_all(b"\n").await.unwrap();
 	}
+	// The input stays open until the unregister is answered: closing it asks the helper to stop,
+	// which an unregister still walking the root answers `shuttingDown`.
+	let mut output = BufReader::new(output);
+	let unregistered = loop {
+		let line = next_line(&mut output).await.unwrap();
+		if line["t"] == "reply" && line["id"] == 3 {
+			break line;
+		}
+	};
 	drop(input);
-	let lines = read_all(output).await;
+	while next_line(&mut output).await.is_some() {}
 	helper.await.unwrap();
-	let unregistered = lines
-		.iter()
-		.find(|line| line["t"] == "reply" && line["id"] == 3)
-		.unwrap();
 	assert_eq!(
 		unregistered["error"]["code"], "unsyncedChanges",
 		"{unregistered}"

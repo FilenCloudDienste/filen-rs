@@ -32,7 +32,7 @@ use tracing::{info, warn};
 use crate::{
 	auth::{DataDir, KeyStore, SessionStore},
 	helper::{
-		blocking,
+		Stop, blocking,
 		index::{IndexError, KeptPlace, KeptRecord, RootEntry, RootsIndex, StateDir, index_error},
 		platform::{BrandingScope, Platform, PlatformError, RootRefusal, platform_error},
 		protocol::{
@@ -99,19 +99,46 @@ impl Walked {
 	}
 }
 
+/// The helper was asked to stop: an unregister gives up before the point of no return.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("the helper is stopping")]
+pub(crate) struct Stopping;
+
+/// Why the walk of a root ended without classifying it.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum WalkError {
+	/// A stop was asked for.
+	#[error(transparent)]
+	Stopping(#[from] Stopping),
+	/// The root itself cannot be listed.
+	#[error(transparent)]
+	Local(#[from] LocalError),
+}
+
+/// The reply to an unregister a stop gave up: the root stays registered, its session with it.
+pub(crate) fn shutting_down() -> ReplyError {
+	ReplyError::new(
+		ErrorCode::ShuttingDown,
+		"the helper is stopping; the root stays registered for a later unregister",
+	)
+}
+
 /// Classifies every item in the root, every directory walked, populated or not. A link or reparse
 /// point is kept and never followed. Only a root that cannot be listed fails the walk: an item
 /// whose state cannot be read, or a directory below the root that cannot be listed, is kept as it
 /// is, never changed. The platform's unregister keeps such a file as an ordinary one when all its
 /// data is on disk, and deletes it when not, which loses nothing the drive lacks: a write hydrates
-/// the whole file first (measured).
-pub(crate) fn walk<L: LocalFs>(local: &L) -> Result<Walked, LocalError> {
+/// the whole file first (measured). Gives up before listing a directory once `stop` is asked for.
+pub(crate) fn walk<L: LocalFs>(local: &L, stop: &Stop) -> Result<Walked, WalkError> {
 	let mut walked = Walked::default();
 	let mut dirs = vec![RootPath::root()];
 	while let Some(dir) = dirs.pop() {
+		if stop.requested() {
+			return Err(Stopping.into());
+		}
 		let children = match local.list_dir(&dir) {
 			Ok(children) => children,
-			Err(error) if dir.is_root() => return Err(error),
+			Err(error) if dir.is_root() => return Err(error.into()),
 			Err(error) => {
 				warn!(%error, dir = %path_tag(&dir), "a directory cannot be listed before unregistering; it is left as it is");
 				walked.kept.push(Kept {
@@ -219,15 +246,24 @@ pub(crate) fn walk<L: LocalFs>(local: &L) -> Result<Walked, LocalError> {
 }
 
 /// Fetches the data of every kept file not all on disk, while the root is still served.
-/// Best effort: what is still not all on disk afterwards stops the unregister.
-pub(crate) fn hydrate_kept<L: LocalFs>(local: &L, walked: &Walked) {
+/// Best effort: what is still not all on disk afterwards stops the unregister. Gives up before the
+/// next file once `stop` is asked for; a fetch in flight is cut short by the dispatcher's close.
+pub(crate) fn hydrate_kept<L: LocalFs>(
+	local: &L,
+	walked: &Walked,
+	stop: &Stop,
+) -> Result<(), Stopping> {
 	for kept in walked.partial() {
+		if stop.requested() {
+			return Err(Stopping);
+		}
 		if let Some(id) = kept.revert
 			&& let Err(error) = local.hydrate(&kept.path, id)
 		{
 			warn!(%error, item = %path_tag(&kept.path), "fetching a changed file's data before unregistering failed");
 		}
 	}
+	Ok(())
 }
 
 /// What the unregister did to the items, before the OS's own unregister.
@@ -410,6 +446,18 @@ fn name_copy<L: LocalFs>(
 	Err(last)
 }
 
+/// What the walk under the refusing connection came to, before the OS's unregister.
+enum Prepared {
+	/// Every kept item made ordinary: the root may go.
+	Settled(Settled),
+	/// These changed files are not all on disk.
+	Partial(Vec<String>),
+	/// A stop was asked for before anything changed.
+	Stopping,
+	/// The root could not be walked or an item kept, with why.
+	Failed(String),
+}
+
 /// What unregistering a root did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RootOutcome {
@@ -517,19 +565,44 @@ fn refusal_error(refusal: &RootRefusal) -> ReplyError {
 	)
 }
 
-/// Unregisters `registered`, `user`'s root at `root`, keeping every item that holds data the drive
-/// may not have, and deleting clean downloaded files when `delete_hydrated`. Stops, with the root
-/// still registered, before anything is deleted when a kept item's data is not all on disk. What
-/// is kept is recorded in `index` before the OS lets the root go.
+/// What an unregister of one root is asked to do.
+pub(crate) struct Unregistering<'a> {
+	/// Whose root it is.
+	pub(crate) user: UserId,
+	/// The root's path.
+	pub(crate) root: &'a Path,
+	/// Whether clean downloaded files are deleted too.
+	pub(crate) delete_hydrated: bool,
+	/// The day the aside the root moves to is named after, `YYYY-MM-DD`.
+	pub(crate) date: String,
+	/// Set once the helper is asked to stop.
+	pub(crate) stop: &'a Stop,
+}
+
+/// Unregisters `registered`, the root `asked` names, keeping every item that holds data the drive
+/// may not have, and deleting clean downloaded files when asked to. Stops, with the root still
+/// registered, before anything is deleted when a kept item's data is not all on disk, or when a
+/// stop is asked for before the items are settled (answered [`shutting_down`]); from there on it
+/// runs to its end. What is kept is recorded in `index` before the OS lets the root go.
 pub(crate) async fn unregister_root<P: Platform>(
 	platform: &Arc<P>,
 	index: &mut RootsIndex,
-	user: UserId,
-	root: &Path,
 	registered: P::Registered,
-	delete_hydrated: bool,
-	date: String,
+	asked: Unregistering<'_>,
 ) -> Result<RootOutcome, Stopped<P::Registered>> {
+	let Unregistering {
+		user,
+		root,
+		delete_hydrated,
+		date,
+		stop,
+	} = asked;
+	if stop.requested() {
+		return Err(Stopped {
+			held: Held::Registered(registered),
+			error: shutting_down(),
+		});
+	}
 	let connected = {
 		let platform = Arc::clone(platform);
 		blocking(move || platform.connect_refusing(registered)).await
@@ -543,20 +616,29 @@ pub(crate) async fn unregister_root<P: Platform>(
 			});
 		}
 	};
-	let settled = {
+	let prepared = {
 		let platform = Arc::clone(platform);
 		let root = root.to_path_buf();
+		let stop = stop.clone();
 		blocking(move || {
 			let local = platform.local_fs(&root);
-			let walked = walk(&*local).map_err(|error| error.to_string())?;
+			let walked = match walk(&*local, &stop) {
+				Ok(walked) => walked,
+				Err(WalkError::Stopping(Stopping)) => return Prepared::Stopping,
+				Err(WalkError::Local(error)) => return Prepared::Failed(error.to_string()),
+			};
 			let partial: Vec<String> = walked.partial().map(|kept| kept.path.to_string()).collect();
 			if !partial.is_empty() {
-				return Ok(Err(partial));
+				return Prepared::Partial(partial);
+			}
+			// The last safe point: settling changes the items.
+			if stop.requested() {
+				return Prepared::Stopping;
 			}
 			match settle(&*local, walked, delete_hydrated) {
-				Ok(settled) => Ok(Ok(settled)),
-				Err(Unsettled::Partial(path)) => Ok(Err(vec![path.to_string()])),
-				Err(unsettled) => Err(unsettled.message()),
+				Ok(settled) => Prepared::Settled(settled),
+				Err(Unsettled::Partial(path)) => Prepared::Partial(vec![path.to_string()]),
+				Err(unsettled) => Prepared::Failed(unsettled.message()),
 			}
 		})
 		.await
@@ -574,9 +656,15 @@ pub(crate) async fn unregister_root<P: Platform>(
 			});
 		}
 	};
-	let settled = match settled {
-		Ok(Ok(settled)) => settled,
-		Ok(Err(partial)) => {
+	let settled = match prepared {
+		Prepared::Settled(settled) => settled,
+		Prepared::Stopping => {
+			return Err(Stopped {
+				held: Held::Registered(registered),
+				error: shutting_down(),
+			});
+		}
+		Prepared::Partial(partial) => {
 			return Err(Stopped {
 				held: Held::Registered(registered),
 				error: ReplyError::new(
@@ -590,7 +678,7 @@ pub(crate) async fn unregister_root<P: Platform>(
 				),
 			});
 		}
-		Err(error) => {
+		Prepared::Failed(error) => {
 			return Err(Stopped {
 				held: Held::Registered(registered),
 				error: ReplyError::new(
@@ -869,7 +957,8 @@ fn foreign_root() -> ReplyError {
 }
 
 /// Unregisters the root `entry` records, `registered` when this run holds its registration, then
-/// wipes the user's data directory, deletes the sealing key and forgets the root.
+/// wipes the user's data directory, deletes the sealing key and forgets the root. A `stop` asked
+/// for before the root's items are settled leaves it registered ([`unregister_root`]).
 ///
 /// The index is a file any process of the user can write, so its paths are checked again here
 /// before anything is done to them. An elevated process (the uninstaller) does nothing to a path
@@ -882,6 +971,7 @@ pub(crate) async fn unregister_entry<P: Platform>(
 	entry: &RootEntry,
 	registered: Option<P::Registered>,
 	delete_hydrated: bool,
+	stop: &Stop,
 ) -> Result<EntryUnregistered, Stopped<P::Registered>> {
 	let stopped = |error: ReplyError| Stopped {
 		held: Held::Unknown,
@@ -954,11 +1044,14 @@ pub(crate) async fn unregister_entry<P: Platform>(
 			unregister_root(
 				platform,
 				index,
-				entry.user,
-				&entry.root,
 				registered,
-				delete_hydrated,
-				date,
+				Unregistering {
+					user: entry.user,
+					root: &entry.root,
+					delete_hydrated,
+					date,
+					stop,
+				},
 			)
 			.await?
 		}
@@ -1104,7 +1197,15 @@ pub async fn unregister_all<P: Platform>(
 	};
 	let mut roots = Vec::new();
 	for entry in index.entries().to_vec() {
-		let outcome = unregister_entry(&platform, &mut index, &entry, None, delete_hydrated).await;
+		let outcome = unregister_entry(
+			&platform,
+			&mut index,
+			&entry,
+			None,
+			delete_hydrated,
+			&Stop::never(),
+		)
+		.await;
 		let (outcome, key_left, branding_left) = match outcome {
 			Ok(done) => {
 				let key_left = !done.report.key_deleted;

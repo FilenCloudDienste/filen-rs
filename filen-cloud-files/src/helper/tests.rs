@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::{
 	io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream},
-	task::JoinHandle,
+	task::{JoinHandle, yield_now},
 	time::{sleep, timeout},
 };
 
@@ -16,13 +16,13 @@ use crate::{
 	branding::{Branding, ExplorerCommands},
 	helper::{
 		BrandingScope, ErrorCode, ExitReason, HelperConfig, Platform, RootRefusal, StateDir,
-		UserId, run_helper, unregister_all,
+		UserId, blocking, run_helper, unregister_all,
 	},
 	identity::PlaceholderIdentity,
 	os::LocalError,
 	test_support::{
-		BrandingCall, FakeDrive, FakeEntry, FakeLocal, FakeOpener, FakePlatform, FakeStep,
-		KillPoint, PlatformCall, ffi_dir, ffi_file, root_path,
+		BrandingCall, FakeDrive, FakeEntry, FakeLocal, FakeOpener, FakePlatform, FakeStep, Gated,
+		KillPoint, LocalOp, PlatformCall, ffi_dir, ffi_file, root_path,
 	},
 };
 
@@ -2694,7 +2694,7 @@ async fn eventually(what: &str, done: impl Fn() -> bool) {
 			started.elapsed() < Duration::from_secs(60),
 			"never happened: {what}"
 		);
-		tokio::task::yield_now().await;
+		yield_now().await;
 	}
 }
 
@@ -2969,4 +2969,190 @@ async fn signing_out_of_a_root_not_served_withdraws_the_class_an_earlier_run_nam
 		.await);
 	assert!(!platform.thumbnail_provider(&disk.root()));
 	assert_eq!(platform.root_thumbnail_withdrawals(), 1);
+}
+
+// ---- a stop during an unregister ----
+//
+// The parent's `shutdown` (or its closed input) reaches the helper while an unregister walks the
+// root or fetches what it keeps: the unregister answers `shuttingDown` at its next safe point, the
+// root stays registered with its session, and nothing is kept aside; once the items are being
+// settled it runs to its end instead.
+
+/// The changed files not all on disk the stop tests put in the served root, in the order the
+/// unregister fetches them.
+const PARTIAL_EDITS: [&str; 2] = ["a.txt", "b.txt"];
+
+/// A served root whose engine walked it, then holding [`PARTIAL_EDITS`], which the engine never
+/// sees: only the unregister fetches them.
+async fn served_with_partial_edits(
+	disk: &Disk,
+	platform: &FakePlatform,
+	drive: &Arc<FakeDrive>,
+) -> Rig {
+	let mut rig = Rig::start(disk, platform, drive);
+	ok(&rig.register(disk).await);
+	ok(&rig.set_auth("42", ACCOUNT_ROOT).await);
+	rig.until(|line| line["t"] == "pendingUploads" && line["count"] == 0)
+		.await;
+	let local = platform.local();
+	for (n, name) in (10..).zip(PARTIAL_EDITS) {
+		let path = root_path(name);
+		local.swallow_events(&path);
+		local.place_file(&path, file_identity(n), b"old data");
+		local.user_write(&path, b"new data").unwrap();
+		local.set_on_disk(&path, 3);
+	}
+	rig
+}
+
+/// Sends an unregister held at `call` and, once it reached it, a shutdown; lets the reader take
+/// the shutdown before the gate opens. The two requests' ids.
+async fn unregister_then_shut_down(
+	rig: &mut Rig,
+	platform: &FakePlatform,
+	call: Gated,
+) -> (u64, u64) {
+	let gate = platform.local().gate(call);
+	let unregister = rig.send(unregister_request()).await;
+	{
+		let gate = gate.clone();
+		blocking(move || gate.wait_entered()).await;
+	}
+	let shutdown = rig.send(json!({ "t": "shutdown" })).await;
+	// The runtime has one thread: the reader takes the shutdown while this task yields.
+	for _ in 0..100 {
+		yield_now().await;
+	}
+	gate.open();
+	(unregister, shutdown)
+}
+
+/// The unregister answered `shuttingDown` and the helper stopped, leaving the root registered
+/// with its session, nothing kept and no item made ordinary.
+async fn stopped_before_settling(
+	mut rig: Rig,
+	disk: &Disk,
+	platform: &FakePlatform,
+	(unregister, shutdown): (u64, u64),
+) {
+	assert_eq!(code(&rig.reply_to(unregister).await), "shuttingDown");
+	ok(&rig.reply_to(shutdown).await);
+	assert_eq!(rig.task.await.unwrap(), ExitReason::Shutdown);
+	assert!(
+		!platform.calls().iter().any(|call| matches!(
+			call,
+			PlatformCall::ConnectRefusing(_) | PlatformCall::Unregister(_)
+		)),
+		"{:?}",
+		platform.calls()
+	);
+	assert_eq!(
+		platform.registration(&disk.root()),
+		Some(Some(ACCOUNT_ROOT))
+	);
+	assert!(disk.has_session());
+	assert!(!index_text(disk).contains("kept"), "{}", index_text(disk));
+}
+
+/// Whether every one of [`PARTIAL_EDITS`] is still a placeholder not all on disk.
+fn partial_edits_untouched(platform: &FakePlatform) -> bool {
+	PARTIAL_EDITS.iter().all(|name| {
+		platform
+			.local()
+			.entry(&root_path(name))
+			.is_some_and(|entry| entry.placeholder && entry.on_disk == 3)
+	})
+}
+
+/// The files the helper fetched, in order.
+fn hydrated(platform: &FakePlatform) -> Vec<String> {
+	platform
+		.local()
+		.ops()
+		.iter()
+		.filter_map(|op| match op {
+			LocalOp::Hydrated(path) => Some(path.to_string()),
+			_ => None,
+		})
+		.collect()
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_shutdown_during_the_fetches_before_an_unregister_answers_shutting_down() {
+	let disk = Disk::new();
+	let (platform, drive) = world();
+	let mut rig = served_with_partial_edits(&disk, &platform, &drive).await;
+	let ids = unregister_then_shut_down(&mut rig, &platform, Gated::Hydrate).await;
+	stopped_before_settling(rig, &disk, &platform, ids).await;
+	assert_eq!(hydrated(&platform), ["a.txt"], "no file after the stop");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_shutdown_during_the_walk_before_an_unregister_answers_shutting_down() {
+	let disk = Disk::new();
+	let (platform, drive) = world();
+	let mut rig = served_with_partial_edits(&disk, &platform, &drive).await;
+	let ids = unregister_then_shut_down(&mut rig, &platform, Gated::ListDir).await;
+	stopped_before_settling(rig, &disk, &platform, ids).await;
+	assert_eq!(hydrated(&platform), Vec::<String>::new());
+	assert!(partial_edits_untouched(&platform));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_shutdown_while_the_unregister_waits_for_the_sign_in_unregisters_nothing() {
+	let disk = Disk::new();
+	let (platform, drive) = world();
+	let mut rig = Rig::start(&disk, &platform, &drive);
+	ok(&rig.register(&disk).await);
+	ok(&rig.set_auth("42", ACCOUNT_ROOT).await);
+	rig.close().await;
+	drive.fail_root_always(Some(unauthenticated));
+	let mut rig = Rig::start(&disk, &platform, &drive);
+	let started = tokio::time::Instant::now();
+	let unregister = rig.send(unregister_request()).await;
+	sleep(Duration::from_secs(2)).await;
+	let shutdown = rig.send(json!({ "t": "shutdown" })).await;
+	stopped_before_settling(rig, &disk, &platform, (unregister, shutdown)).await;
+	assert!(started.elapsed() < Duration::from_secs(5));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_shutdown_once_the_items_are_settled_lets_the_unregister_finish() {
+	let disk = Disk::new();
+	let (platform, drive) = world();
+	let mut rig = served_with_changes(&disk, &platform, &drive).await;
+	let (unregister, shutdown) =
+		unregister_then_shut_down(&mut rig, &platform, Gated::Revert).await;
+	let report = ok(&rig.reply_to(unregister).await).clone();
+	assert_eq!(report["unregistered"], true, "{report}");
+	assert_eq!(report["keptCount"], 3, "{report}");
+	ok(&rig.reply_to(shutdown).await);
+	assert_eq!(rig.task.await.unwrap(), ExitReason::Shutdown);
+	assert_eq!(platform.registration(&disk.root()), None);
+	assert!(
+		kept_place(&disk, &platform).is_some(),
+		"the kept files were lost"
+	);
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_unregister_a_shutdown_stopped_finishes_on_the_next_run() {
+	let disk = Disk::new();
+	let (platform, drive) = world();
+	let mut rig = served_with_partial_edits(&disk, &platform, &drive).await;
+	let ids = unregister_then_shut_down(&mut rig, &platform, Gated::Hydrate).await;
+	stopped_before_settling(rig, &disk, &platform, ids).await;
+	let mut rig = Rig::start(&disk, &platform, &drive);
+	let report = ok(&rig.request(unregister_request()).await).clone();
+	assert_eq!(report["unregistered"], true, "{report}");
+	assert_eq!(
+		report["kept"],
+		json!([
+			{ "path": "a.txt", "reason": "modified" },
+			{ "path": "b.txt", "reason": "modified" },
+		]),
+		"{report}"
+	);
+	assert_eq!(platform.registration(&disk.root()), None);
+	assert!(!disk.has_session());
 }

@@ -85,6 +85,9 @@ struct Inner<D> {
 	next_id: AtomicU64,
 	/// Every task spawned; a std Mutex, held only to spawn into or take the set.
 	tasks: Mutex<JoinSet<()>>,
+	/// Set by [`Dispatcher::close`], read and written only under `tasks`' lock: no task is spawned
+	/// once it is set.
+	closed: AtomicBool,
 	/// Who to tell of populations, reads and out-of-date placeholders, once set.
 	hints: OnceLock<Arc<RemoteHints>>,
 }
@@ -190,6 +193,7 @@ impl<D: Drive> Dispatcher<D> {
 				in_flight: Mutex::new(HashMap::new()),
 				next_id: AtomicU64::new(0),
 				tasks: Mutex::new(JoinSet::new()),
+				closed: AtomicBool::new(false),
 				hints: OnceLock::new(),
 			}),
 		}
@@ -215,9 +219,15 @@ impl<D: Drive> Dispatcher<D> {
 		self.inner.runtime.runtime_flavor()
 	}
 
-	/// Spawns `task` on the runtime, reaping the tasks that finished.
+	/// Spawns `task` on the runtime, reaping the tasks that finished. Once the dispatcher is closed
+	/// the task is dropped instead, which fails its request as its responder drops.
 	fn spawn(&self, task: impl Future<Output = ()> + Send + 'static) {
 		let mut tasks = lock(&self.inner.tasks);
+		if self.inner.closed.load(Ordering::Relaxed) {
+			drop(tasks);
+			drop(task);
+			return;
+		}
 		while tasks.try_join_next().is_some() {}
 		tasks.spawn_on(task, &self.inner.runtime);
 	}
@@ -424,10 +434,29 @@ impl<D: Drive> Dispatcher<D> {
 	/// dropping the task stops the read anyway. A request arriving during or after the shutdown is
 	/// spawned as usual; dropping the dispatcher aborts it.
 	pub async fn shutdown(&self) {
-		let mut tasks = mem::take(&mut *lock(&self.inner.tasks));
-		tasks.abort_all();
-		while tasks.join_next().await.is_some() {}
+		let tasks = mem::take(&mut *lock(&self.inner.tasks));
+		end(tasks).await;
 	}
+
+	/// As [`Dispatcher::shutdown`], and every request arriving after it fails at once as
+	/// [`Failure::Transient`], the helper's own included: no read or population runs again. A
+	/// request either was spawned before the close, and is aborted, or is refused, as both happen
+	/// under the task set's lock. For a stop that must not wait on a fetch the helper itself started
+	/// (its hydrate returns once its `FETCH_DATA` fails).
+	pub async fn close(&self) {
+		let tasks = {
+			let mut tasks = lock(&self.inner.tasks);
+			self.inner.closed.store(true, Ordering::Relaxed);
+			mem::take(&mut *tasks)
+		};
+		end(tasks).await;
+	}
+}
+
+/// Aborts every task in `tasks` and waits for them to end.
+async fn end(mut tasks: JoinSet<()>) {
+	tasks.abort_all();
+	while tasks.join_next().await.is_some() {}
 }
 
 impl<D: Drive> Drop for Dispatcher<D> {

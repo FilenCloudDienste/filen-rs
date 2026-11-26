@@ -16,6 +16,8 @@ mod unregister;
 mod validate;
 mod watch_keeper;
 
+use tokio::sync::watch;
+
 pub(crate) use identify::{HOST, below_root};
 pub use index::{StateDir, StateDirError};
 pub use launch::{
@@ -40,6 +42,38 @@ pub use protocol::{
 	SkippedPlace, StateReport, StatusEvent, UnregisterAllEntry, UnregisterReport, UserId,
 	parse_line,
 };
+
+/// Whether the parent asked the helper to stop: set once it sent `shutdown` or closed its input,
+/// and never unset. Readable on the blocking pool too; clones share it.
+#[derive(Debug, Clone)]
+pub(crate) struct Stop(watch::Receiver<bool>);
+
+impl Stop {
+	/// The stop `stopping` reports, set by the input's reader.
+	pub(crate) fn new(stopping: watch::Receiver<bool>) -> Self {
+		Self(stopping)
+	}
+
+	/// A stop never asked for, as the uninstaller's unregister has.
+	pub(crate) fn never() -> Self {
+		let (_, never) = watch::channel(false);
+		Self(never)
+	}
+
+	/// Whether a stop was asked for.
+	pub(crate) fn requested(&self) -> bool {
+		*self.0.borrow()
+	}
+
+	/// Waits until a stop is asked for: forever for one that never is.
+	pub(crate) async fn asked(&self) {
+		let mut stopping = self.0.clone();
+		if stopping.wait_for(|stopping| *stopping).await.is_err() {
+			// Nothing can set it any more.
+			std::future::pending::<()>().await;
+		}
+	}
+}
 
 /// Runs `f` on the blocking pool: every platform, key store and session store call blocks.
 pub(crate) async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {

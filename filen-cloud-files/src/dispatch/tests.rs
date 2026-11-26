@@ -392,6 +392,46 @@ async fn shutdown_fails_every_pending_request() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_close_fails_the_read_in_flight_and_every_request_after_it_without_reading() {
+	let (drive, os) = placed();
+	let _gate = drive.gate_reads();
+	let (dispatcher, _) = dispatcher(Arc::clone(&drive), 8);
+	let (request, responder) = os.fetch_data(&FILE, (0, 10_000), (0, 0));
+	let first = request.transfer();
+	dispatcher.on_fetch_data(request, responder);
+	drive.reads_started(1).await;
+	dispatcher.close().await;
+	assert_eq!(ends(&os, first), [FakeEvent::Abandoned(first)]);
+	let (request, responder) = os.fetch_data(&FILE, (0, 4096), (0, 0));
+	let later = request.transfer();
+	dispatcher.on_fetch_data(request, responder);
+	// The root not populated yet, as the population would find it.
+	let unpopulated = FakeOs::with_root(ROOT);
+	let (request, responder) = unpopulated.fetch_placeholders(&ROOT);
+	dispatcher.on_fetch_placeholders(request, responder);
+	run_until_idle().await;
+	assert_eq!(ends(&os, later), [FakeEvent::Abandoned(later)]);
+	assert_eq!(
+		unpopulated.events(),
+		[FakeEvent::PopulateAbandoned { dir: ROOT }]
+	);
+	assert_eq!(drive.reads().len(), 1, "only the read before the close");
+	assert_eq!(registered(&dispatcher), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_request_after_a_shutdown_is_still_served() {
+	let (drive, os) = placed();
+	let (dispatcher, _) = dispatcher(Arc::clone(&drive), 8);
+	dispatcher.shutdown().await;
+	let (request, responder) = os.fetch_data(&FILE, (0, 4096), (0, 0));
+	let key = request.transfer();
+	dispatcher.on_fetch_data(request, responder);
+	settle(&dispatcher).await;
+	assert_eq!(ends(&os, key), [FakeEvent::Completed(key)]);
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_cancel_adjacent_to_the_read_aborts_nothing() {
 	let (drive, os) = placed();
 	let gate = drive.gate_reads();

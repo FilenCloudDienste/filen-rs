@@ -29,6 +29,7 @@ use crate::{
 	placeholder::{PlaceholderSpec, SpecKind},
 	root_path::{CaseKey, RootPath, RootPathError},
 	sealed,
+	test_support::CallGate,
 };
 
 /// The prefix [`LocalFs::upload_path`] gives the fake's paths, which [`FakeLocal::read_upload`]
@@ -232,6 +233,19 @@ struct LocalState {
 	fail_handle_paths: Option<LocalError>,
 	/// Paths at or under which the watcher's events reach no job ([`FakeLocal::swallow_events`]).
 	swallowed: Vec<RootPath>,
+	/// The provider's calls a test holds, each until its gate opens ([`FakeLocal::gate`]).
+	gates: Vec<(Gated, CallGate)>,
+}
+
+/// A call of the provider's a test can hold with [`FakeLocal::gate`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Gated {
+	/// [`LocalFs::hydrate`].
+	Hydrate,
+	/// [`LocalFs::list_dir`].
+	ListDir,
+	/// [`LocalFs::revert_to_plain`].
+	Revert,
 }
 
 /// What the user does to a file while the provider hashes it.
@@ -621,11 +635,34 @@ impl FakeLocal {
 			kill_after_reverts: None,
 			fail_handle_paths: None,
 			swallowed: Vec::new(),
+			gates: Vec::new(),
 		})))
 	}
 
 	fn state(&self) -> MutexGuard<'_, LocalState> {
 		self.0.lock().unwrap_or_else(PoisonError::into_inner)
+	}
+
+	/// Holds every later call of the provider's `call`, on the thread making it and before it does
+	/// anything, until the gate handed back opens.
+	pub fn gate(&self, call: Gated) -> CallGate {
+		let gate = CallGate::default();
+		self.state().gates.push((call, gate.clone()));
+		gate
+	}
+
+	/// Waits at every gate held for `call`; the state is not locked meanwhile.
+	fn pass_gates(&self, call: Gated) {
+		let gates: Vec<CallGate> = self
+			.state()
+			.gates
+			.iter()
+			.filter(|(gated, _)| *gated == call)
+			.map(|(_, gate)| gate.clone())
+			.collect();
+		for gate in gates {
+			gate.pass();
+		}
 	}
 
 	// ---- set-up ----
@@ -1739,6 +1776,7 @@ impl sealed::Sealed for FakeLocal {}
 
 impl LocalFs for FakeLocal {
 	fn revert_to_plain(&self, path: &RootPath, expect: LocalFileId) -> Result<(), LocalError> {
+		self.pass_gates(Gated::Revert);
 		let mut state = self.state();
 		if let Some(error) = state.fail_revert.get(&path.case_key()) {
 			return Err(*error);
@@ -1868,6 +1906,7 @@ impl LocalFs for FakeLocal {
 		&self,
 		path: &RootPath,
 	) -> Result<Vec<Result<RootPath, RootPathError>>, LocalError> {
+		self.pass_gates(Gated::ListDir);
 		let state = self.state();
 		if let Some(error) = state.fail_list.get(&path.case_key()) {
 			return Err(*error);
@@ -2224,6 +2263,7 @@ impl LocalFs for FakeLocal {
 	}
 
 	fn hydrate(&self, path: &RootPath, expect: LocalFileId) -> Result<(), LocalError> {
+		self.pass_gates(Gated::Hydrate);
 		let mut state = self.state();
 		if let Some(error) = state.fail_hydrate.take().or(state.fail_hydrations) {
 			return Err(error);
