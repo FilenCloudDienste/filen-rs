@@ -366,7 +366,7 @@ fn ask(question: Question, label: &str) -> Pending {
 	match question {
 		Question::Deletions(batch) => {
 			let message = format!("Apply these {} deletion(s) of {label}?", batch.count);
-			let prompt = tokio::task::spawn_blocking(move || {
+			let prompt = filen_sdk_rs::runtime::spawn_blocking(move || {
 				inquire::Confirm::new(&message)
 					.with_default(false)
 					.with_help_message(
@@ -383,7 +383,7 @@ fn ask(question: Question, label: &str) -> Pending {
 			reason,
 		} => {
 			let message = format!("Which version of {rel_path} in {label} do you keep?");
-			let prompt = tokio::task::spawn_blocking(move || {
+			let prompt = filen_sdk_rs::runtime::spawn_blocking(move || {
 				inquire::Select::new(&message, choices(reason)).prompt()
 			});
 			Box::pin(async move { conflict_decision(pair, rel_path, reason, prompt.await) })

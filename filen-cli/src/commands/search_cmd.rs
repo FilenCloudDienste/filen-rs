@@ -152,7 +152,7 @@ pub(crate) async fn search_cmd(
 		};
 		ui.ensure_can_prompt(&prompt_text)?;
 		let prompt_text = ui.redact_for_replay_testing(prompt_text);
-		tokio::task::spawn_blocking(move || {
+		filen_sdk_rs::runtime::spawn_blocking(move || {
 			inquire::Text::new(&prompt_text)
 				.with_placeholder("(your query)")
 				.with_help_message(

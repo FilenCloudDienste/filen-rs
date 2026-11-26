@@ -782,7 +782,7 @@ async fn install_release(
 		let update_path = current_executable.with_file_name(renamed);
 		// writing, syncing and renaming a multi-MB binary blocks, so keep it off the
 		// runtime's workers
-		let (update_path, old_binary) = tokio::task::spawn_blocking(move || {
+		let (update_path, old_binary) = filen_sdk_rs::runtime::spawn_blocking(move || {
 			install_renamed_update(&executable_dir, &content, &update_path, || {
 				self_replace::self_delete()
 			})
@@ -795,7 +795,7 @@ async fn install_release(
 			old_binary,
 		})
 	} else {
-		tokio::task::spawn_blocking(move || {
+		filen_sdk_rs::runtime::spawn_blocking(move || {
 			install_replacing_update(&executable_dir, &content, |staged| {
 				self_replace::self_replace(staged)
 			})

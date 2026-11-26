@@ -725,7 +725,7 @@ async fn use_self_signed_cert(config_dir: &Path, servers: &mut [Server]) -> Resu
 		.filter(|server| serves_tls(server.protocol))
 		.map(|server| server.host.clone())
 		.collect::<Vec<_>>();
-	let cert = tokio::task::spawn_blocking(move || {
+	let cert = filen_sdk_rs::runtime::spawn_blocking(move || {
 		let hosts = hosts.iter().map(String::as_str).collect::<Vec<_>>();
 		serve_cert::ensure(&config_dir, &hosts, Utc::now())
 	})

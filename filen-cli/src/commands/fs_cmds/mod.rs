@@ -1595,7 +1595,7 @@ async fn edit_locally(ui: &mut UI, editor: Option<&EditorCommand>, local: &Path)
 		}
 		None => {
 			let opened = local.to_path_buf();
-			tokio::task::spawn_blocking(move || open::that(opened))
+			filen_sdk_rs::runtime::spawn_blocking(move || open::that(opened))
 				.await
 				.context("Failed to open file")?
 				.map_err(|e| UI::failure(&format!("Failed to open {}: {e}", local.display())))?;
@@ -1608,7 +1608,7 @@ async fn edit_locally(ui: &mut UI, editor: Option<&EditorCommand>, local: &Path)
 /// A temporary copy of the file at `path`, deleted when it is dropped.
 async fn copy_of(path: &Path) -> Result<NamedTempFile> {
 	let path = path.to_path_buf();
-	tokio::task::spawn_blocking(move || {
+	filen_sdk_rs::runtime::spawn_blocking(move || {
 		let copy = NamedTempFile::new()?;
 		fs::copy(&path, copy.path())?;
 		Ok::<_, io::Error>(copy)
@@ -1621,7 +1621,7 @@ async fn copy_of(path: &Path) -> Result<NamedTempFile> {
 /// Whether the files at `a` and `b` hold the same bytes.
 async fn same_file_content(a: &Path, b: &Path) -> Result<bool> {
 	let (a, b) = (a.to_path_buf(), b.to_path_buf());
-	tokio::task::spawn_blocking(move || same_content(File::open(a)?, File::open(b)?))
+	filen_sdk_rs::runtime::spawn_blocking(move || same_content(File::open(a)?, File::open(b)?))
 		.await
 		.context("Failed to compare the edited file with the downloaded one")?
 		.context("Failed to compare the edited file with the downloaded one")

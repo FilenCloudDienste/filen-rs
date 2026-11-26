@@ -433,7 +433,7 @@ async fn read_content_file(path: &Path) -> Result<String> {
 }
 
 async fn read_stdin() -> Result<String> {
-	tokio::task::spawn_blocking(|| {
+	filen_sdk_rs::runtime::spawn_blocking(|| {
 		let mut content = String::new();
 		io::stdin()
 			.read_to_string(&mut content)

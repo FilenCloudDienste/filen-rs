@@ -236,7 +236,7 @@ fn forward_status(
 				return;
 			}
 			// The watch publishes its status once a pass has returned and dropped what it held.
-			tokio::task::spawn_blocking(memory::release_free_memory);
+			filen_sdk_rs::runtime::spawn_blocking(memory::release_free_memory);
 			current = status.borrow_and_update().clone();
 		}
 	});

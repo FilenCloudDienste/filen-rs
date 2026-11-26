@@ -252,7 +252,7 @@ async fn follow_up_pass(
 		let _ = messages.send((pair, Message::Event(Box::new(event))));
 	};
 	let report = engine.sync_once_observed(pair, &mut observer).await;
-	tokio::task::spawn_blocking(memory::release_free_memory);
+	filen_sdk_rs::runtime::spawn_blocking(memory::release_free_memory);
 	report.ok()
 }
 
@@ -289,7 +289,7 @@ async fn pass_pair(
 	};
 	let mut observer = |event: SyncEvent| send(Message::Event(Box::new(event)));
 	let report = engine.sync_once_observed(pair, &mut observer).await;
-	tokio::task::spawn_blocking(memory::release_free_memory);
+	filen_sdk_rs::runtime::spawn_blocking(memory::release_free_memory);
 	let report = report.ok()?;
 	if report.paused {
 		send(Message::Paused);
@@ -301,7 +301,7 @@ async fn pass_pair(
 		return Some(report);
 	}
 	let report = engine.sync_once_observed(pair, &mut observer).await;
-	tokio::task::spawn_blocking(memory::release_free_memory);
+	filen_sdk_rs::runtime::spawn_blocking(memory::release_free_memory);
 	report.ok()
 }
 
