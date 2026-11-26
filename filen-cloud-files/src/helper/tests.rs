@@ -13,7 +13,9 @@ use tokio::{
 };
 
 use crate::{
+	auth::DATA_DIR_MARKER_NAME,
 	branding::{Branding, ExplorerCommands},
+	failure::Failure,
 	helper::{
 		BrandingScope, ErrorCode, ExitReason, HelperConfig, Platform, RootRefusal, StateDir,
 		UserId, blocking, run_helper, unregister_all,
@@ -21,9 +23,11 @@ use crate::{
 	identity::PlaceholderIdentity,
 	os::LocalError,
 	test_support::{
-		BrandingCall, DriveOp, FakeDrive, FakeEntry, FakeLocal, FakeOpener, FakePlatform, FakeStep,
-		Gated, KillPoint, LocalOp, PlatformCall, ffi_dir, ffi_file, root_path,
+		BrandingCall, DriveOp, FakeDrive, FakeEntry, FakeEvent, FakeLocal, FakeOpener,
+		FakePlatform, FakeStep, Gated, KillPoint, LocalOp, PlatformCall, ffi_dir, ffi_file,
+		root_path,
 	},
+	thumbnails::{ThumbnailCancel, ThumbnailRefusal},
 };
 
 const ACCOUNT_ROOT: Uuid = Uuid::from_u128(0x100);
@@ -3199,4 +3203,444 @@ async fn an_unregister_a_shutdown_stopped_finishes_on_the_next_run() {
 	);
 	assert_eq!(platform.registration(&disk.root()), None);
 	assert!(!disk.has_session());
+}
+
+// ---- a held root ----
+//
+// An unregister asked to hold the root holds it before anything else: still served with the
+// signed-out user's session, so its changes go on up to the drive, but closed to every other
+// process's download, and so until a sign-in of the user or the unregister succeeding.
+
+fn held_unregister() -> Value {
+	json!({ "t": "unregister", "userId": "42", "deleteHydrated": true, "hold": true })
+}
+
+/// A served root holding an edit not all on disk that no fetch completes, held by an unregister
+/// that answered `unsyncedChanges`.
+async fn held_with_an_unfetched_edit(
+	disk: &Disk,
+	platform: &FakePlatform,
+	drive: &Arc<FakeDrive>,
+) -> Rig {
+	let mut rig = Rig::start(disk, platform, drive);
+	ok(&rig.register(disk).await);
+	ok(&rig.set_auth("42", ACCOUNT_ROOT).await);
+	rig.until(|line| line["t"] == "pendingUploads" && line["count"] == 0)
+		.await;
+	let local = platform.local();
+	local.place_file(&root_path("edited.txt"), file_identity(3), b"old data");
+	local
+		.user_write(&root_path("edited.txt"), b"new data")
+		.unwrap();
+	local.set_on_disk(&root_path("edited.txt"), 3);
+	local.fail_hydrations(Some(LocalError::Busy));
+	assert_eq!(
+		code(&rig.request(held_unregister()).await),
+		"unsyncedChanges"
+	);
+	rig
+}
+
+fn is_status(state: &'static str) -> impl Fn(&Value) -> bool {
+	move |line| line["t"] == "status" && line["state"] == state
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_unregister_that_holds_a_root_it_cannot_unregister_keeps_it_served_and_held() {
+	let disk = Disk::new();
+	let (platform, drive) = world();
+	let mut rig = held_with_an_unfetched_edit(&disk, &platform, &drive).await;
+	rig.until(is_status("held")).await;
+	let state = ok(&rig.request(json!({ "t": "getState" })).await).clone();
+	assert_eq!(state["state"], "held", "{state}");
+	assert_eq!(state["userId"], "42");
+	let roots = ok(&rig.request(json!({ "t": "listRoots" })).await).clone();
+	assert_eq!(roots["roots"][0]["serving"], true, "{roots}");
+	assert_eq!(roots["roots"][0]["held"], true, "{roots}");
+	assert!(
+		index_text(&disk).contains(r#""held":true"#),
+		"{}",
+		index_text(&disk)
+	);
+	assert!(platform.is_connected(&disk.root()));
+	assert!(
+		!platform.calls().iter().any(|call| matches!(
+			call,
+			PlatformCall::ConnectRefusing(_) | PlatformCall::Disconnect(_)
+		)),
+		"still served: {:?}",
+		platform.calls()
+	);
+	assert!(disk.has_session());
+	let identified = rig
+		.request(json!({
+			"t": "identify",
+			"path": disk.root().join("edited.txt").to_str().unwrap(),
+		}))
+		.await;
+	assert_eq!(code(&identified), "notServing");
+	assert_eq!(identified["error"]["message"], "the root is held");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_held_root_refuses_another_users_register_and_answers_its_own_as_held() {
+	let disk = Disk::new();
+	let (platform, drive) = world();
+	let mut rig = held_with_an_unfetched_edit(&disk, &platform, &drive).await;
+	let mut other = register(&disk, "43");
+	other["root"] = json!(disk.0.path().join("Other").to_str().unwrap());
+	other["dataDir"] = json!(disk.0.path().join("data43").to_str().unwrap());
+	assert_eq!(code(&rig.request(other).await), "alreadyRegistered");
+	assert_eq!(
+		ok(&rig.register(&disk).await),
+		&json!({ "state": "held", "resumed": false })
+	);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_helper_started_anew_serves_a_held_root_held_with_no_request() {
+	let disk = Disk::new();
+	let (platform, drive) = world();
+	let rig = held_with_an_unfetched_edit(&disk, &platform, &drive).await;
+	rig.close().await;
+	let connects = |platform: &FakePlatform| {
+		platform
+			.calls()
+			.iter()
+			.filter(|call| matches!(call, PlatformCall::Connect(_)))
+			.count()
+	};
+	assert_eq!(connects(&platform), 1);
+	let mut rig = Rig::start(&disk, &platform, &drive);
+	rig.until(is_status("held")).await;
+	assert_eq!(connects(&platform), 2);
+	assert!(platform.is_connected(&disk.root()));
+	let state = ok(&rig.request(json!({ "t": "getState" })).await).clone();
+	assert_eq!(state["state"], "held", "{state}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_held_root_whose_session_does_not_sign_in_stays_registered_held_after_a_restart() {
+	let disk = Disk::new();
+	let (platform, drive) = world();
+	let rig = held_with_an_unfetched_edit(&disk, &platform, &drive).await;
+	rig.close().await;
+	drive.fail_root_always(Some(unauthenticated));
+	let started = tokio::time::Instant::now();
+	let mut rig = Rig::start(&disk, &platform, &drive);
+	let state = ok(&rig.request(json!({ "t": "getState" })).await).clone();
+	assert!(
+		started.elapsed() <= Duration::from_secs(6),
+		"waited {:?}",
+		started.elapsed()
+	);
+	assert_eq!(state["state"], "held", "{state}");
+	assert!(!platform.is_connected(&disk.root()));
+	assert!(index_text(&disk).contains(r#""held":true"#));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_request_at_start_ends_the_wait_for_a_held_roots_sign_in() {
+	let disk = Disk::new();
+	let (platform, drive) = world();
+	let rig = held_with_an_unfetched_edit(&disk, &platform, &drive).await;
+	rig.close().await;
+	drive.fail_root_always(Some(unauthenticated));
+	let started = tokio::time::Instant::now();
+	let mut rig = Rig::start(&disk, &platform, &drive);
+	let state = ok(&rig.request(json!({ "t": "getState" })).await).clone();
+	assert!(
+		started.elapsed() < Duration::from_secs(1),
+		"waited {:?}",
+		started.elapsed()
+	);
+	assert_eq!(state["state"], "held", "{state}");
+	assert!(!platform.is_connected(&disk.root()));
+}
+
+/// A file of 4 KiB the drive holds, which another process reads in [`foreign_read`].
+fn readable_file(drive: &FakeDrive) -> PlaceholderIdentity {
+	drive.add_file(Uuid::from_u128(7), Uuid::from_u128(1007), &[7; 4096]);
+	file_identity(7)
+}
+
+/// How another process's read of `file` at the served root ends, as the dispatcher the root was
+/// connected with answers it.
+async fn foreign_read(
+	platform: &FakePlatform,
+	disk: &Disk,
+	file: PlaceholderIdentity,
+) -> FakeEvent {
+	let (os, key) = platform
+		.foreign_read(&disk.root(), file)
+		.expect("the root is served");
+	for _ in 0..1000 {
+		let end = os.events().into_iter().find(|event| match event {
+			FakeEvent::Completed(k)
+			| FakeEvent::Incomplete(k)
+			| FakeEvent::Failed(k, _)
+			| FakeEvent::Cancelled(k)
+			| FakeEvent::Abandoned(k) => *k == key,
+			_ => false,
+		});
+		if let Some(end) = end {
+			return end;
+		}
+		sleep(Duration::from_millis(10)).await;
+	}
+	panic!("the read never ended");
+}
+
+#[tokio::test(start_paused = true)]
+async fn another_processs_read_of_a_held_root_is_refused_until_a_sign_in_lifts_the_hold() {
+	let disk = Disk::new();
+	let (platform, drive) = world();
+	let file = readable_file(&drive);
+	let mut rig = held_with_an_unfetched_edit(&disk, &platform, &drive).await;
+	assert!(matches!(
+		foreign_read(&platform, &disk, file).await,
+		FakeEvent::Failed(_, Failure::NotAuthenticated)
+	));
+	assert_eq!(
+		drive.reads(),
+		Vec::new(),
+		"the refused read reached no drive"
+	);
+	ok(&rig.set_auth("42", ACCOUNT_ROOT).await);
+	// Served: read from the drive (the fake OS then refuses a transfer to a file it never placed).
+	foreign_read(&platform, &disk, file).await;
+	assert_eq!(drive.reads(), vec![(0, 4096)]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_held_root_served_anew_refuses_another_processs_read() {
+	let disk = Disk::new();
+	let (platform, drive) = world();
+	let file = readable_file(&drive);
+	let rig = held_with_an_unfetched_edit(&disk, &platform, &drive).await;
+	rig.close().await;
+	let mut rig = Rig::start(&disk, &platform, &drive);
+	rig.until(is_status("held")).await;
+	assert!(matches!(
+		foreign_read(&platform, &disk, file).await,
+		FakeEvent::Failed(_, Failure::NotAuthenticated)
+	));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_sign_in_that_does_not_complete_leaves_the_root_held() {
+	let disk = Disk::new();
+	let (platform, drive) = world();
+	let mut rig = held_with_an_unfetched_edit(&disk, &platform, &drive).await;
+	drive.fail_root_always(Some(unauthenticated));
+	assert_eq!(
+		code(&rig.set_auth("42", ACCOUNT_ROOT).await),
+		"sessionRejected"
+	);
+	let state = ok(&rig.request(json!({ "t": "getState" })).await).clone();
+	assert_eq!(state["state"], "held", "{state}");
+	assert!(index_text(&disk).contains(r#""held":true"#));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_root_registered_again_after_a_kill_once_the_os_let_its_held_root_go_is_not_held() {
+	let disk = Disk::new();
+	let (platform, drive) = world();
+	let rig = held_with_an_unfetched_edit(&disk, &platform, &drive).await;
+	platform.local().fail_hydrations(None);
+	platform.kill_at(KillPoint::After(FakeStep::Unregister));
+	killed_unregister(rig, &platform).await;
+	assert!(index_text(&disk).contains(r#""held":true"#));
+	let mut rig = Rig::start(&disk, &platform, &drive);
+	ok(&rig.register(&disk).await);
+	assert!(!index_text(&disk).contains("held"), "{}", index_text(&disk));
+	ok(&rig.set_auth("42", ACCOUNT_ROOT).await);
+	let state = ok(&rig.request(json!({ "t": "getState" })).await).clone();
+	assert_eq!(state["state"], "serving", "{state}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_unregistered_held_root_whose_data_stays_holds_up_no_other_users_register() {
+	let disk = Disk::new();
+	let (platform, drive) = world();
+	let mut rig = held_with_an_unfetched_edit(&disk, &platform, &drive).await;
+	platform.local().fail_hydrations(None);
+	// A data directory without its marker is never wiped.
+	std::fs::remove_file(disk.data().join(DATA_DIR_MARKER_NAME)).unwrap();
+	let report = ok(&rig.request(held_unregister()).await).clone();
+	assert_eq!(report["unregistered"], true, "{report}");
+	assert_eq!(report["dataDeleted"], false, "{report}");
+	assert!(!index_text(&disk).contains("held"), "{}", index_text(&disk));
+	let other = Disk::new();
+	let reply = rig.request(register(&other, "43")).await;
+	assert_ne!(reply["error"]["code"], "alreadyRegistered", "{reply}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_sign_in_of_the_same_user_lifts_the_hold_and_the_unregister_then_finishes() {
+	let disk = Disk::new();
+	let (platform, drive) = world();
+	let mut rig = held_with_an_unfetched_edit(&disk, &platform, &drive).await;
+	assert_eq!(
+		ok(&rig.set_auth("42", ACCOUNT_ROOT).await),
+		&json!({ "state": "serving", "adopted": true })
+	);
+	let lines_before = rig.lines.len();
+	let state = ok(&rig.request(json!({ "t": "getState" })).await).clone();
+	assert_eq!(state["state"], "serving", "{state}");
+	assert!(
+		rig.lines[..lines_before]
+			.iter()
+			.rev()
+			.find(|line| line["t"] == "status")
+			.is_some_and(|line| line["state"] == "serving"),
+		"the last status before is serving"
+	);
+	assert!(!index_text(&disk).contains("held"), "{}", index_text(&disk));
+	platform.local().fail_hydrations(None);
+	let report = ok(&rig
+		.request(json!({ "t": "unregister", "userId": "42", "deleteHydrated": true }))
+		.await)
+	.clone();
+	assert_eq!(report["unregistered"], true, "{report}");
+	assert_eq!(report["kept"][0]["path"], "edited.txt");
+	assert_eq!(platform.registration(&disk.root()), None);
+	assert_eq!(
+		ok(&rig.request(json!({ "t": "listRoots" })).await),
+		&json!({ "roots": [] })
+	);
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_unregister_that_succeeds_forgets_the_hold_with_the_root() {
+	let disk = Disk::new();
+	let (platform, drive) = world();
+	let mut rig = held_with_an_unfetched_edit(&disk, &platform, &drive).await;
+	platform.local().fail_hydrations(None);
+	let report = ok(&rig.request(held_unregister()).await).clone();
+	assert_eq!(report["unregistered"], true, "{report}");
+	assert_eq!(platform.registration(&disk.root()), None);
+	assert_eq!(
+		ok(&rig.request(json!({ "t": "listRoots" })).await),
+		&json!({ "roots": [] })
+	);
+	assert_eq!(rig.until(is_status("idle")).await["state"], "idle");
+}
+
+#[tokio::test(start_paused = true)]
+async fn clearing_the_session_of_a_held_root_stops_serving_it_and_leaves_it_held() {
+	let disk = Disk::new();
+	let (platform, drive) = world();
+	let mut rig = held_with_an_unfetched_edit(&disk, &platform, &drive).await;
+	assert_eq!(
+		ok(&rig
+			.request(json!({ "t": "clearAuth", "userId": "42" }))
+			.await),
+		&json!({ "cleared": true })
+	);
+	assert!(!disk.has_session());
+	assert!(!platform.is_connected(&disk.root()));
+	assert_eq!(
+		platform.registration(&disk.root()),
+		Some(Some(ACCOUNT_ROOT))
+	);
+	let state = ok(&rig.request(json!({ "t": "getState" })).await).clone();
+	assert_eq!(state["state"], "held", "{state}");
+	assert!(index_text(&disk).contains(r#""held":true"#));
+	assert!(
+		platform
+			.local()
+			.entry(&root_path("edited.txt"))
+			.unwrap()
+			.placeholder,
+		"the edit stays in place"
+	);
+	// A sign-in serves it again and lifts the hold.
+	ok(&rig.set_auth("42", ACCOUNT_ROOT).await);
+	let state = ok(&rig.request(json!({ "t": "getState" })).await).clone();
+	assert_eq!(state["state"], "serving", "{state}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_held_root_goes_on_uploading_through_the_unregisters_retries() {
+	let disk = Disk::new();
+	let (platform, drive) = world();
+	let gate = drive.gate_uploads();
+	let mut rig = held_with_an_unfetched_edit(&disk, &platform, &drive).await;
+	let pump = {
+		let platform = platform.clone();
+		tokio::spawn(async move {
+			loop {
+				platform.deliver();
+				sleep(Duration::from_secs(1)).await;
+			}
+		})
+	};
+	platform
+		.local()
+		.user_create(&root_path("new.txt"), b"hello");
+	sleep(Duration::from_secs(10)).await;
+	assert_eq!(
+		code(&rig.request(held_unregister()).await),
+		"unsyncedChanges"
+	);
+	gate.add_permits(100);
+	rig.until(|line| {
+		line["t"] == "activity"
+			&& line["entries"]
+				.as_array()
+				.unwrap()
+				.iter()
+				.any(|entry| entry["kind"] == "uploaded" && entry["path"] == "new.txt")
+	})
+	.await;
+	pump.abort();
+	assert!(drive.child(&ACCOUNT_ROOT.to_string(), "new.txt").is_some());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_held_root_serves_no_thumbnail_until_the_hold_is_lifted() {
+	let disk = Disk::new();
+	let (platform, drive) = world();
+	let mut rig = serving_thumbnails(&disk, &platform, &drive).await;
+	// From a thread outside the runtime, as File Explorer's COM threads ask.
+	let ask = |platform: &FakePlatform, path: PathBuf| {
+		let handler = platform.thumbnail_handler().unwrap();
+		let asking = std::thread::spawn(move || handler(&path, 96, &ThumbnailCancel::default()));
+		blocking(move || asking.join().unwrap())
+	};
+	let local = platform.local();
+	local.place_file(&root_path("edited.txt"), file_identity(3), b"old data");
+	local
+		.user_write(&root_path("edited.txt"), b"new data")
+		.unwrap();
+	local.set_on_disk(&root_path("edited.txt"), 3);
+	local.fail_hydrations(Some(LocalError::Busy));
+	let path = disk.root().join("photo.jpg");
+	let answer = ask(&platform, path.clone()).await;
+	assert!(
+		!matches!(
+			answer,
+			Err(ThumbnailRefusal::SignedOut | ThumbnailRefusal::Busy)
+		),
+		"{answer:?}"
+	);
+	assert_eq!(
+		code(&rig.request(held_unregister()).await),
+		"unsyncedChanges"
+	);
+	let answer = ask(&platform, path.clone()).await;
+	assert!(
+		matches!(answer, Err(ThumbnailRefusal::SignedOut)),
+		"{answer:?}"
+	);
+	ok(&rig.set_auth("42", ACCOUNT_ROOT).await);
+	let answer = ask(&platform, path).await;
+	assert!(
+		!matches!(
+			answer,
+			Err(ThumbnailRefusal::SignedOut | ThumbnailRefusal::Busy)
+		),
+		"{answer:?}"
+	);
 }

@@ -519,11 +519,13 @@ fn unwritten_online_only(state: PlaceholderState) -> bool {
 /// Fetches the data of every kept file not all on disk, while the root is still served.
 /// Best effort: what is still not all on disk afterwards stops the unregister. Gives up before the
 /// next file once `stop` is asked for; a fetch in flight is cut short by the dispatcher's close.
+/// The files whose fetch failed, in the order walked.
 pub(crate) fn hydrate_kept<L: LocalFs>(
 	local: &L,
 	walked: &Walked,
 	stop: &Stop,
-) -> Result<(), Stopping> {
+) -> Result<Vec<RootPath>, Stopping> {
+	let mut unfetched = Vec::new();
 	for kept in walked.partial() {
 		if stop.requested() {
 			return Err(Stopping);
@@ -532,9 +534,22 @@ pub(crate) fn hydrate_kept<L: LocalFs>(
 			&& let Err(error) = local.hydrate(&kept.path, id)
 		{
 			warn!(%error, item = %path_tag(&kept.path), "fetching a changed file's data before unregistering failed");
+			unfetched.push(kept.path.clone());
 		}
 	}
-	Ok(())
+	Ok(unfetched)
+}
+
+/// The reply to an unregister stopped by `count` changed files not all on disk, the first at
+/// `first`, which no session could fetch.
+pub(crate) fn unsynced(count: usize, first: &str) -> ReplyError {
+	ReplyError::new(
+		ErrorCode::UnsyncedChanges,
+		format!(
+			"{count} changed file(s) are not all on disk and no session can fetch them, first \
+			 {first}"
+		),
+	)
 }
 
 /// What the unregister did to the items, before the OS's own unregister.
@@ -980,15 +995,7 @@ pub(crate) async fn unregister_root<P: Platform>(
 		Prepared::Partial(partial) => {
 			return Err(Stopped {
 				held: Held::Registered(registered),
-				error: ReplyError::new(
-					ErrorCode::UnsyncedChanges,
-					format!(
-						"{} changed file(s) are not all on disk and no session can fetch them, \
-						 first {}",
-						partial.len(),
-						partial.first().map_or("", String::as_str)
-					),
-				),
+				error: unsynced(partial.len(), partial.first().map_or("", String::as_str)),
 			});
 		}
 		Prepared::Failed(error) => {
@@ -1297,7 +1304,11 @@ pub(crate) async fn finish_stopped<P: Platform>(
 	)
 	.await
 	.map_err(|e| e.reply())?;
-	Ok(())
+	// The OS let the root go: a hold the stopped unregister left goes with it, so the root
+	// registered anew is not served held.
+	index
+		.set_held(entry.user, false)
+		.map_err(|e| index_error(&e))
 }
 
 /// Another provider holds the root's path registered.
@@ -1439,6 +1450,11 @@ pub(crate) async fn unregister_entry<P: Platform>(
 			}
 		}
 	};
+	// The OS holds the root no more, so nothing is held, even when the data below cannot be wiped
+	// and the entry stays.
+	if let Err(error) = index.set_held(entry.user, false) {
+		warn!(%error, "recording that the unregistered root is no longer held failed");
+	}
 	let (data_deleted, key_deleted) = if elevated {
 		(false, false)
 	} else {

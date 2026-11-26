@@ -33,8 +33,11 @@ use crate::{
 /// a message bumps it, an added field included, as both sides refuse unknown fields; but for an
 /// optional request field the helper takes, with a reply field sent only to a parent that sent it
 /// (`register`'s `displayName`, `iconPath`, `iconIndex` and `explorerCommands`, and `branded`),
-/// which a parent of the same version that knows neither never sees; and but for a request only a
-/// parent that knows it sends (`identify`, with the error codes only its reply carries).
+/// which a parent of the same version that knows neither never sees; but for a request only a
+/// parent that knows it sends (`identify`, with the error codes only its reply carries); and but
+/// for `unregister`'s optional `hold`, whose new values (the phase `held` in `status`, `getState`
+/// and `register`'s reply, and `held` in `listRoots`) appear only once a parent sent it, as only
+/// it holds a root, the hold persisting across the helper's restarts.
 pub const PROTOCOL_VERSION: u32 = 1;
 
 /// The longest input line taken, in bytes, its newline excluded: a pushed session of 1 MiB
@@ -235,11 +238,29 @@ pub enum Request {
 	/// fetch in flight is cut short), with the root still registered, its session sealed and
 	/// nothing kept aside, for a later `unregister`; once it has begun settling the items
 	/// (deleting clean downloads, making kept items ordinary) it runs to its end.
+	///
+	/// With `hold`, the root is held first, and stays held unless the unregister succeeds: it
+	/// stays registered and served with the signed-out user's session, so its changes still go up
+	/// to the drive, but every other process's download (a read of a file not on disk, a listing
+	/// of a folder never opened) is refused, nothing new from the drive is placed or downloaded,
+	/// other processes' deletes and renames are vetoed, no thumbnail is served and `identify`
+	/// answers `notServing`. What is on disk already stays readable. A held root whose fetches
+	/// leave a changed file not all on disk answers `unsyncedChanges` at once, still served. The
+	/// hold persists: a helper started anew serves the held root by itself (waiting for the
+	/// sign-in at most [`HelperConfig::resume_wait`](crate::HelperConfig::resume_wait), and no
+	/// longer than until the parent's first request, which a root left unserved so does not
+	/// hold up), and every state report names the phase `held`. Only a `setAuth` of the same user
+	/// for the root's account, once the drive answers as that account, or the unregister
+	/// succeeding, ends it; the drive goes on with the session it signed in with, so a `setAuth`
+	/// lifts the hold as the parent's word that the user signed in again. An `unregister` without
+	/// `hold` never ends it, and `clearAuth` stops serving the root and leaves it held.
 	Unregister {
 		/// Whose root to unregister.
 		user: UserId,
 		/// Whether clean downloaded files are deleted too, rather than left as ordinary files.
 		delete_hydrated: bool,
+		/// Whether the root is held first (optional, default false).
+		hold: bool,
 	},
 	/// Lists the roots the helper knows.
 	ListRoots,
@@ -470,6 +491,9 @@ struct UnregisterWire {
 	_id: IgnoredAny,
 	user_id: String,
 	delete_hydrated: bool,
+	// Optional, so a parent that holds nothing is answered as before.
+	#[serde(default)]
+	hold: bool,
 }
 
 #[derive(Deserialize)]
@@ -564,6 +588,7 @@ pub fn parse_line(line: &str) -> Result<InMessage, ParseError> {
 			Request::Unregister {
 				user: user_id(id, &wire.user_id)?,
 				delete_hydrated: wire.delete_hydrated,
+				hold: wire.hold,
 			}
 		}
 		"identify" => {
@@ -660,6 +685,9 @@ pub enum PhaseName {
 	Registered,
 	/// A root served.
 	Serving,
+	/// A root held by an `unregister` that asked for it: served to the helper's own uploads alone
+	/// when this run serves it, registered and not served otherwise.
+	Held,
 	/// Stopping.
 	Stopping,
 }
@@ -817,6 +845,9 @@ pub struct RootListing {
 	pub registered: bool,
 	/// Whether this helper serves it with a session, connected to the OS.
 	pub serving: bool,
+	/// Whether the root is held (see `unregister`'s `hold`), served or not; left out when false.
+	#[serde(skip_serializing_if = "is_false")]
+	pub held: bool,
 	/// What unregisters of the root kept and no reply the parent answered reported, as in a
 	/// `register` or `unregister` reply; left out when empty.
 	#[serde(rename = "keptEarlier", skip_serializing_if = "Vec::is_empty")]

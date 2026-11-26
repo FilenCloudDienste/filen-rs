@@ -30,7 +30,7 @@ use crate::{
 		blocking,
 		events::Out,
 		platform::Platform,
-		protocol::{OutMessage, StatusEvent},
+		protocol::{OutMessage, PhaseName, StatusEvent},
 	},
 	os::{LocalEvent, WatchSignal},
 };
@@ -64,8 +64,12 @@ pub(crate) struct Keeper<P> {
 	pub(crate) on_event: Arc<dyn Fn(LocalEvent) + Send + Sync>,
 	/// Whether a watcher runs, for `getState`.
 	pub(crate) watching: Arc<AtomicBool>,
-	/// The status sent when the watcher goes up or down, its `watching` set then.
+	/// The status sent when the watcher goes up or down, its `watching` set then, and its state
+	/// [`PhaseName::Held`] while `held` is set.
 	pub(crate) status: StatusEvent,
+	/// Whether the served root is held: the command loop sets it as it holds the root or lifts the
+	/// hold, and sends a status of its own then.
+	pub(crate) held: Arc<AtomicBool>,
 	pub(crate) out: Out,
 	pub(crate) rearm: Duration,
 }
@@ -125,7 +129,13 @@ impl<P: Platform> Keeper<P> {
 	fn set_watching(&self, watching: bool) {
 		if self.watching.swap(watching, Ordering::Relaxed) != watching {
 			// The writer is gone only once the helper stops.
+			let state = if self.held.load(Ordering::Relaxed) {
+				PhaseName::Held
+			} else {
+				self.status.state
+			};
 			let _ = self.out.send(OutMessage::Status(StatusEvent {
+				state,
 				watching,
 				..self.status.clone()
 			}));
@@ -250,6 +260,7 @@ mod tests {
 				root: None,
 				watching: false,
 			},
+			held: Arc::new(AtomicBool::new(false)),
 			out,
 			rearm,
 		});

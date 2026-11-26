@@ -5,7 +5,9 @@ use serde::Deserialize;
 use serde_json::{Value, value::RawValue};
 
 use super::*;
-use crate::helper::identify::{NOT_FOUND, NOT_IN_ROOT, NOT_SERVING, NOT_SYNCED, UNKNOWN_ITEM};
+use crate::helper::identify::{
+	HELD, NOT_FOUND, NOT_IN_ROOT, NOT_SERVING, NOT_SYNCED, UNKNOWN_ITEM,
+};
 
 /// The golden fixtures the desktop app reads too.
 const FIXTURES: &str = include_str!(concat!(
@@ -212,6 +214,7 @@ fn out_message(case: &str) -> OutMessage {
 					root: root(),
 					registered: true,
 					serving: true,
+					held: false,
 					kept_earlier: Vec::new(),
 				}],
 			},
@@ -224,6 +227,7 @@ fn out_message(case: &str) -> OutMessage {
 					root: root(),
 					registered: false,
 					serving: false,
+					held: false,
 					kept_earlier: vec![KeptEarlier {
 						id: KeptId::from(0xab),
 						kept: Vec::new(),
@@ -401,6 +405,45 @@ fn out_message(case: &str) -> OutMessage {
 		"reply error unknownItem" => identify_error(ErrorCode::UnknownItem, UNKNOWN_ITEM),
 		"reply error notServing" => identify_error(ErrorCode::NotServing, NOT_SERVING),
 		"reply error notFound" => identify_error(ErrorCode::NotFound, NOT_FOUND),
+		"reply error notServing held" => identify_error(ErrorCode::NotServing, HELD),
+		"reply register held" => reply(
+			1,
+			ReplyValue::Registered {
+				state: PhaseName::Held,
+				resumed: true,
+				kept_earlier: Vec::new(),
+				branded: None,
+			},
+		),
+		"reply getState held" => reply(
+			6,
+			ReplyValue::State(StateReport {
+				state: PhaseName::Held,
+				user,
+				root: Some(root()),
+				watching: true,
+				pending_uploads: Some(2),
+			}),
+		),
+		"status held" => OutMessage::Status(StatusEvent {
+			state: PhaseName::Held,
+			user,
+			root: Some(root()),
+			watching: true,
+		}),
+		"reply listRoots held" => reply(
+			5,
+			ReplyValue::Roots {
+				roots: vec![RootListing {
+					user: UserId::from(42),
+					root: root(),
+					registered: true,
+					serving: true,
+					held: true,
+					kept_earlier: Vec::new(),
+				}],
+			},
+		),
 		other => panic!("no message for the output case {other}"),
 	}
 }
@@ -430,7 +473,7 @@ fn every_output_fixture_is_byte_for_byte_what_the_helper_writes() {
 		assert_eq!(line, expected, "{}", case.case);
 		checked += 1;
 	}
-	assert_eq!(checked, 35);
+	assert_eq!(checked, 40);
 }
 
 /// `identify`'s refusal of `code`, as the command loop words it.
@@ -594,4 +637,21 @@ fn a_kept_id_is_16_lowercase_hex_digits() {
 		assert_eq!(KeptId::parse(text), None, "{text}");
 	}
 	assert_ne!(KeptId::random(), KeptId::random());
+}
+
+#[test]
+fn an_unregister_holds_only_when_it_says_so() {
+	let hold = |line: &str| match parse_line(line).unwrap().request {
+		Request::Unregister { hold, .. } => hold,
+		other => panic!("not an unregister: {other:?}"),
+	};
+	assert!(!hold(
+		r#"{"t":"unregister","id":4,"userId":"42","deleteHydrated":true}"#
+	));
+	assert!(hold(
+		r#"{"t":"unregister","id":4,"userId":"42","deleteHydrated":true,"hold":true}"#
+	));
+	assert!(!hold(
+		r#"{"t":"unregister","id":4,"userId":"42","deleteHydrated":true,"hold":false}"#
+	));
 }

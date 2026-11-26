@@ -57,6 +57,7 @@ pub(crate) const NOT_IN_ROOT: &str = "the path is not inside the served root";
 pub(crate) const NOT_SYNCED: &str = "the item is not synced with the drive";
 pub(crate) const UNKNOWN_ITEM: &str = "the drive holds no such item, or holds it in the trash";
 pub(crate) const NOT_FOUND: &str = "nothing is at the path";
+pub(crate) const HELD: &str = "the root is held";
 
 /// The components of `path` below `root`, as `spelling` spells both, compared without case as
 /// Windows compares names; empty for the root itself. `None` when `path` is not absolute as

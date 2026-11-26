@@ -88,6 +88,10 @@ pub(crate) struct RootEntry {
 	/// default. Kept so a root served again without a `register` (before an unregister) shows the
 	/// same.
 	pub(crate) branding: Option<Branding>,
+	/// The root is held (an `unregister` asked it, and its changes are not all on the drive yet):
+	/// served, it refuses other processes' downloads, until a sign-in of the user lifts it or the
+	/// root is unregistered. Never set on an unregistered entry.
+	pub(crate) held: bool,
 }
 
 impl RootEntry {
@@ -205,6 +209,8 @@ struct EntryWire {
 	icon_path: Option<String>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	icon_index: Option<i32>,
+	#[serde(default, skip_serializing_if = "is_false")]
+	held: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -275,12 +281,14 @@ impl RootsIndex {
 	}
 
 	/// Records `entry`, replacing what the index held for its user but the kept records, which stay
-	/// until reported.
+	/// until reported, and the hold of a root still registered, which only a sign-in or the
+	/// unregister lifts.
 	pub(crate) fn upsert(&mut self, mut entry: RootEntry) -> Result<(), IndexError> {
 		let mut entries = self.entries.clone();
 		match entries.iter_mut().find(|held| held.user == entry.user) {
 			Some(held) => {
 				entry.kept = std::mem::take(&mut held.kept);
+				entry.held = held.held && !held.unregistered && !entry.unregistered;
 				*held = entry;
 			}
 			None => entries.push(entry),
@@ -311,6 +319,12 @@ impl RootsIndex {
 		self.change(user, |entry| entry.branding = branding)
 	}
 
+	/// Records whether `user`'s root is held, if the index holds it; an unregistered root is never
+	/// held.
+	pub(crate) fn set_held(&mut self, user: UserId, held: bool) -> Result<(), IndexError> {
+		self.change(user, |entry| entry.held = held && !entry.unregistered)
+	}
+
 	/// Records what an unregister of `user`'s root kept, replacing the record with its id, or the
 	/// record of an unregister whose items are still in the root (one stopped part way, whose
 	/// items a new walk found again). A settled record that kept nothing is dropped instead.
@@ -331,11 +345,14 @@ impl RootsIndex {
 		self.change(user, |entry| entry.kept.retain(KeptRecord::settled))
 	}
 
-	/// Forgets `user`'s root, unregistered and its data wiped; while a record of what was kept
-	/// waits to be reported, the entry stays, marked unregistered, for it.
+	/// Forgets `user`'s root, unregistered and its data wiped, its hold with it; while a record of
+	/// what was kept waits to be reported, the entry stays, marked unregistered, for it.
 	pub(crate) fn forget(&mut self, user: UserId) -> Result<(), IndexError> {
 		if self.entry(user).is_some_and(|entry| !entry.kept.is_empty()) {
-			return self.change(user, |entry| entry.unregistered = true);
+			return self.change(user, |entry| {
+				entry.unregistered = true;
+				entry.held = false;
+			});
 		}
 		self.remove(user)
 	}
@@ -407,6 +424,7 @@ impl RootsIndex {
 						.as_ref()
 						.filter(|branding| branding.icon.is_some())
 						.map(|branding| branding.icon_index),
+					held: entry.held,
 				})
 				.collect(),
 		};
@@ -449,6 +467,8 @@ fn parse(bytes: &[u8]) -> Option<Vec<RootEntry>> {
 					entry.icon_path.as_deref(),
 					entry.icon_index,
 				),
+				// An unregistered root holds nothing: a hold an edited index names is dropped.
+				held: entry.held && !entry.unregistered,
 			})
 		})
 		.collect()
@@ -519,7 +539,57 @@ mod tests {
 			kept: Vec::new(),
 			unregistered: false,
 			branding: None,
+			held: false,
 		}
+	}
+
+	#[test]
+	fn a_hold_is_written_through_read_back_and_kept_by_a_register() {
+		let (_temp, dir) = state_dir();
+		let mut index = RootsIndex::load(&dir).unwrap();
+		let user = UserId::from(42);
+		index.upsert(entry(42, "/r")).unwrap();
+		index.set_held(user, true).unwrap();
+		assert_eq!(
+			std::fs::read_to_string(dir.path().join(INDEX_FILE_NAME)).unwrap(),
+			r#"{"version":1,"roots":[{"userId":"42","root":"/r","dataDir":"/r-data","accountRoot":null,"held":true}]}"#
+		);
+		assert!(RootsIndex::load(&dir).unwrap().entries()[0].held);
+		index.upsert(entry(42, "/r")).unwrap();
+		assert!(index.entry(user).unwrap().held, "a register keeps the hold");
+		index.set_held(user, false).unwrap();
+		assert_eq!(
+			std::fs::read_to_string(dir.path().join(INDEX_FILE_NAME)).unwrap(),
+			r#"{"version":1,"roots":[{"userId":"42","root":"/r","dataDir":"/r-data","accountRoot":null}]}"#
+		);
+	}
+
+	#[test]
+	fn forgetting_a_held_root_drops_its_hold_with_it() {
+		let (_temp, dir) = state_dir();
+		let mut index = RootsIndex::load(&dir).unwrap();
+		let user = UserId::from(42);
+		index.upsert(entry(42, "/r")).unwrap();
+		index.set_held(user, true).unwrap();
+		index
+			.put_kept(user, record(1, KeptPlace::Settled { kept_in: None }))
+			.unwrap();
+		index.forget(user).unwrap();
+		let kept_only = index.entry(user).unwrap();
+		assert!(kept_only.unregistered);
+		assert!(!kept_only.held);
+		index.set_held(user, true).unwrap();
+		assert!(
+			!index.entry(user).unwrap().held,
+			"an unregistered root is never held"
+		);
+		// A register of the root again, once let go, starts unheld.
+		index.upsert(entry(42, "/r")).unwrap();
+		assert!(!index.entry(user).unwrap().held);
+		index.set_held(user, true).unwrap();
+		index.acknowledge(user, &[KeptId::from(1)]).unwrap();
+		index.forget(user).unwrap();
+		assert!(index.entry(user).is_none());
 	}
 
 	#[test]

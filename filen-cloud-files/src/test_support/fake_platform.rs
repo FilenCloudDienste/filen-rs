@@ -23,12 +23,19 @@ use crate::{
 		BrandingScope, Cleared, DriveOpener, ExistingRoot, Platform, PlatformError, PlatformFailed,
 		PlatformOp, RootRefusal, UserId,
 	},
+	identity::PlaceholderIdentity,
 	local::LocalEngine,
-	os::{WatchSignal, WatchSink},
+	os::{FetchDataRequest, RequestedRange, TransferKey, WatchSignal, WatchSink},
 	sealed,
-	test_support::{FakeConnection, FakeDrive, FakeEntry, FakeLocal, MemoryKeyStore},
+	test_support::{
+		FakeConnection, FakeData, FakeDrive, FakeEntry, FakeLocal, FakeOs, MemoryKeyStore,
+	},
 	thumbnails::ThumbnailHandler,
 };
+
+/// Hands a read to the dispatcher a root was connected to serve with, while it lives; a read it
+/// drops is failed as the responder drops.
+type Reader = Arc<dyn Fn(FetchDataRequest, FakeData) + Send + Sync>;
 
 /// The time the fake platform's clock always reads, in seconds since the Unix epoch: 2026-11-12
 /// 12:00 UTC.
@@ -117,6 +124,8 @@ struct PlatformState {
 	/// The roots registered, with their account root; `None` for another provider's.
 	registered: HashMap<PathBuf, Option<Uuid>>,
 	connected: HashSet<PathBuf>,
+	/// The dispatcher each root connected to serve was connected with.
+	readers: HashMap<PathBuf, Reader>,
 	calls: Vec<PlatformCall>,
 	watchers: Vec<LiveWatcher>,
 	next_watcher: u64,
@@ -405,6 +414,25 @@ impl FakePlatform {
 	/// Whether `root` is connected.
 	pub fn is_connected(&self, root: &Path) -> bool {
 		self.state().connected.contains(root)
+	}
+
+	/// Sends another process's read of the first 4 KiB of a file `file`, of 4 KiB, to the
+	/// dispatcher `root` was connected to serve with, as the OS would: the OS seam that records how
+	/// it ends, with its transfer key. `None` while `root` is not connected to serve.
+	pub fn foreign_read(
+		&self,
+		root: &Path,
+		file: PlaceholderIdentity,
+	) -> Option<(FakeOs, TransferKey)> {
+		let reader = self.state().readers.get(root).map(Arc::clone)?;
+		let os = FakeOs::with_root(PlaceholderIdentity::Root {
+			root: Uuid::from_u128(0),
+		});
+		let (request, responder) =
+			os.fetch_data_raw(file.encode(), RequestedRange::new(4096, 0, 4096, None));
+		let key = request.transfer();
+		reader(request, responder);
+		Some((os, key))
 	}
 
 	/// Refuses every root with `refusal`.
@@ -782,7 +810,7 @@ impl Platform for FakePlatform {
 	fn connect<D: Drive>(
 		&self,
 		registered: FakeRegistered,
-		_dispatcher: Arc<Dispatcher<D>>,
+		dispatcher: Arc<Dispatcher<D>>,
 		_engine: Arc<LocalEngine<D, FakeLocal>>,
 	) -> Result<FakeConnected, PlatformFailed<FakeRegistered>> {
 		let mut state = self.state();
@@ -797,6 +825,18 @@ impl Platform for FakePlatform {
 		}
 		state.connected.insert(registered.0.clone());
 		self.local.set_connection(FakeConnection::Serving);
+		state.readers.insert(
+			registered.0.clone(),
+			// Weak: a helper killed before it disconnects must not keep the dispatcher alive.
+			{
+				let dispatcher = Arc::downgrade(&dispatcher);
+				Arc::new(move |request, responder| {
+					if let Some(dispatcher) = dispatcher.upgrade() {
+						dispatcher.on_fetch_data(request, responder);
+					}
+				})
+			},
+		);
 		state
 			.calls
 			.push(PlatformCall::Connect(registered.0.clone()));
@@ -828,6 +868,7 @@ impl Platform for FakePlatform {
 		{
 			let mut state = self.state();
 			state.connected.remove(&connected.0);
+			state.readers.remove(&connected.0);
 			self.local.set_connection(FakeConnection::Disconnected);
 			state
 				.calls

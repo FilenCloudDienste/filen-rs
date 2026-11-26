@@ -122,6 +122,7 @@ fn index(root: &Path) -> (tempfile::TempDir, RootsIndex) {
 			kept: Vec::new(),
 			unregistered: false,
 			branding: None,
+			held: false,
 		})
 		.unwrap();
 	(temp, index)
@@ -336,7 +337,10 @@ fn a_renamed_file_with_no_byte_on_disk_is_not_kept_nor_fetched() {
 	let local = renamed_online_only();
 	let walked = walk(&local, &Stop::never()).unwrap();
 	assert!(walked.kept.is_empty(), "{:?}", walked.kept);
-	assert_eq!(hydrate_kept(&local, &walked, &Stop::never()), Ok(()));
+	assert_eq!(
+		hydrate_kept(&local, &walked, &Stop::never()),
+		Ok(Vec::new())
+	);
 	assert!(
 		!local
 			.ops()
@@ -836,6 +840,26 @@ fn a_stop_during_a_fetch_fetches_no_further_file() {
 	gate.open();
 	assert_eq!(fetching.join().unwrap(), Err(Stopping));
 	assert_eq!(hydrated(&local), 1);
+}
+
+#[test]
+fn fetching_names_the_files_it_could_not_fetch() {
+	let local = two_partial_edits();
+	let walked = walk(&local, &Stop::never()).unwrap();
+	assert_eq!(
+		hydrate_kept(&local, &walked, &Stop::never()),
+		Ok(Vec::new())
+	);
+	let local = two_partial_edits();
+	let walked = walk(&local, &Stop::never()).unwrap();
+	local.fail_hydrations(Some(LocalError::Busy));
+	let mut unfetched: Vec<String> = hydrate_kept(&local, &walked, &Stop::never())
+		.unwrap()
+		.iter()
+		.map(ToString::to_string)
+		.collect();
+	unfetched.sort();
+	assert_eq!(unfetched, ["a.txt", "b.txt"]);
 }
 
 #[tokio::test(start_paused = true)]

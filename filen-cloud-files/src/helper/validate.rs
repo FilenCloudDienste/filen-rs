@@ -165,6 +165,7 @@ mod tests {
 			kept: Vec::new(),
 			unregistered: false,
 			branding: None,
+			held: false,
 		}
 	}
 

@@ -35,7 +35,7 @@ use crate::{
 		Stop, blocking,
 		events::{self, HelperCallback, Out},
 		framing::{Frame, next_frame},
-		identify::{self, NOT_SERVING},
+		identify::{self, HELD, NOT_SERVING},
 		index::{RootEntry, RootsIndex, StateDir, index_error},
 		platform::{DriveOpener, Platform, PlatformError, RootRefusal, platform_error},
 		protocol::{
@@ -45,7 +45,7 @@ use crate::{
 		},
 		unregister::{
 			self, EntryUnregistered, Held, Stopped, Stopping, WalkError, shutting_down,
-			unregister_entry,
+			unregister_entry, unsynced,
 		},
 		validate,
 		watch_keeper::{Keeper, Keeping, keep_watching},
@@ -53,6 +53,7 @@ use crate::{
 	local::{LocalConfig, LocalEngine},
 	log_safe,
 	os::LocalFs,
+	root_path::RootPath,
 	thumbnails::{ThumbnailConfig, ThumbnailHandler, ThumbnailService},
 };
 
@@ -73,6 +74,11 @@ pub struct HelperConfig {
 	pub state_dir: StateDir,
 	/// How long a new session has to sign the cache in. Default 30 s.
 	pub auth_wait: Duration,
+	/// How long a helper starting with a held root waits for its sealed session to sign the cache
+	/// in before it takes the parent's first request; the root stays registered, held, past it, and
+	/// a later `register` or `unregister` serves it. Default 5 s, as the desktop app gives its
+	/// first requests little more.
+	pub resume_wait: Duration,
 	/// How often the cache is asked whether it signed in meanwhile. Default 250 ms: it re-reads
 	/// auth.json at most once a second while signed out.
 	pub auth_poll: Duration,
@@ -97,6 +103,7 @@ impl HelperConfig {
 		Self {
 			state_dir,
 			auth_wait: Duration::from_secs(30),
+			resume_wait: Duration::from_secs(5),
 			auth_poll: Duration::from_millis(250),
 			pending_poll: Duration::from_secs(5),
 			revoke_probe: Duration::from_secs(30),
@@ -185,10 +192,15 @@ struct Serving<P: Platform, D: Drive> {
 	drive: Arc<D>,
 	dispatcher: Arc<Dispatcher<D>>,
 	engine: Arc<LocalEngine<D, P::Local>>,
+	/// The root's file system, for the thumbnail service a lifted hold serves again.
+	thumbnail_local: Arc<P::Local>,
 	connected: P::Connected,
 	/// Keeps the root's watcher running; stopped before the engine stops.
 	keeper: Keeping,
 	watching: Arc<AtomicBool>,
+	/// Whether the root is held: other processes' downloads refused, no thumbnail served. Reason
+	/// for the Arc: the watch keeper reads it for the status it sends.
+	held: Arc<AtomicBool>,
 	/// The pending-upload poll and the revocation probe.
 	probes: Vec<JoinHandle<()>>,
 }
@@ -212,6 +224,10 @@ struct Helper<P: Platform, O: DriveOpener> {
 	/// Set once the parent asked the helper to stop or closed its input: a sign-in still waited
 	/// for gives up, and an unregister stops at its next safe point.
 	stopping: Stop,
+	/// Set only while the helper serves a held root of its own accord, as it starts: set in turn
+	/// once the parent's first line is read, so a sign-in waited for then gives up and holds up no
+	/// request.
+	yield_to: Option<Stop>,
 	phase: Phase<P, O::Drive>,
 	/// The kept reports the last reply carried, by user: the parent's next request says it read
 	/// them, and their records go.
@@ -233,12 +249,13 @@ enum Incoming {
 
 /// Reads frames from `input` and hands them on until the input ends or the loop closes its end.
 /// Sets `stop` as soon as it reads a `shutdown` or the input ends, so a request still waiting gives
-/// up. Returns the line it read but could not hand on, as the loop closed its end meanwhile, so
-/// the loop answers it.
+/// up, and `arrived` as it hands on the first line. Returns the line it read but could not hand
+/// on, as the loop closed its end meanwhile, so the loop answers it.
 async fn read_input<R: AsyncRead + Unpin + Send>(
 	input: R,
 	tx: mpsc::Sender<Incoming>,
 	stop: watch::Sender<bool>,
+	arrived: watch::Sender<bool>,
 ) -> Option<Incoming> {
 	let mut input = BufReader::new(input);
 	let mut buf = Vec::new();
@@ -270,6 +287,7 @@ async fn read_input<R: AsyncRead + Unpin + Send>(
 				return None;
 			}
 		};
+		arrived.send_replace(true);
 		if let Err(mpsc::error::SendError(incoming)) = tx.send(incoming).await {
 			return Some(incoming);
 		}
@@ -351,7 +369,8 @@ where
 	// Bounded, so a parent writing faster than the helper answers waits on its pipe.
 	let (tx, mut incoming) = mpsc::channel(INCOMING_LEN);
 	let (stop, stopping) = watch::channel(false);
-	let reader = tokio::spawn(read_input(input, tx, stop));
+	let (arrived, first_line) = watch::channel(false);
+	let reader = tokio::spawn(read_input(input, tx, stop, arrived));
 	let callback = events::reporting(out.clone(), config.coalesce);
 	let thumbnails = Arc::new(ThumbnailService::new(
 		ThumbnailConfig::default(),
@@ -369,66 +388,76 @@ where
 		out,
 		callback,
 		stopping: Stop::new(stopping),
+		yield_to: None,
 		phase: Phase::Idle,
 		reported: Vec::new(),
 		thumbnails,
 		thumbnail_server: None,
 	};
 	helper.status();
-	let reason = loop {
-		tokio::select! {
-			biased;
-			_ = &mut writer => break ExitReason::OutputClosed,
-			started = &mut thumbnail_start, if thumbnails_starting => {
-				thumbnails_starting = false;
-				// Guarded as a request is: a panic stops the helper in order.
-				let answered = AssertUnwindSafe(helper.thumbnails_started(started.ok()))
-					.catch_unwind()
-					.await;
-				if answered.is_err() {
-					break ExitReason::Internal;
-				}
-			}
-			next = incoming.recv() => match next {
-				None => break ExitReason::InputClosed,
-				Some(Incoming::Unframed(code)) => helper.send(OutMessage::ProtocolError { code }),
-				Some(Incoming::Refused(error)) => match error.id {
-					Some(id) => {
-						// A request after a reply: the parent read it.
-						helper.acknowledge();
-						helper.send(OutMessage::Reply { id, outcome: Err(error.into()) });
+	// A held root goes on uploading what it holds without waiting for the parent; guarded as a
+	// request is.
+	let resumed = AssertUnwindSafe(helper.resume_held(Stop::new(first_line)))
+		.catch_unwind()
+		.await;
+	let reason = if resumed.is_err() {
+		ExitReason::Internal
+	} else {
+		loop {
+			tokio::select! {
+				biased;
+				_ = &mut writer => break ExitReason::OutputClosed,
+				started = &mut thumbnail_start, if thumbnails_starting => {
+					thumbnails_starting = false;
+					// Guarded as a request is: a panic stops the helper in order.
+					let answered = AssertUnwindSafe(helper.thumbnails_started(started.ok()))
+						.catch_unwind()
+						.await;
+					if answered.is_err() {
+						break ExitReason::Internal;
 					}
-					None => {
-						warn!(code = ?error.code, message = %error.message, "refused a line");
-						helper.send(OutMessage::ProtocolError { code: error.code });
+				}
+				next = incoming.recv() => match next {
+					None => break ExitReason::InputClosed,
+					Some(Incoming::Unframed(code)) => helper.send(OutMessage::ProtocolError { code }),
+					Some(Incoming::Refused(error)) => match error.id {
+						Some(id) => {
+							// A request after a reply: the parent read it.
+							helper.acknowledge();
+							helper.send(OutMessage::Reply { id, outcome: Err(error.into()) });
+						}
+						None => {
+							warn!(code = ?error.code, message = %error.message, "refused a line");
+							helper.send(OutMessage::ProtocolError { code: error.code });
+						}
+					},
+					Some(Incoming::Message(InMessage { id, request })) => {
+						helper.acknowledge();
+						let shutdown = matches!(request, Request::Shutdown);
+						let outcome = match AssertUnwindSafe(helper.handle(request)).catch_unwind().await {
+							Ok(outcome) => outcome,
+							Err(_) => {
+								// The panic's message went to the log through the panic hook.
+								helper.send(OutMessage::Reply {
+									id,
+									outcome: Err(ReplyError::new(
+										ErrorCode::Internal,
+										"the request failed inside the helper, which stops",
+									)),
+								});
+								break ExitReason::Internal;
+							}
+						};
+						if let Err(error) = &outcome {
+							info!(id = id.get(), code = ?reply_code(error), "request refused");
+						}
+						helper.send(OutMessage::Reply { id, outcome });
+						if shutdown {
+							break ExitReason::Shutdown;
+						}
 					}
 				},
-				Some(Incoming::Message(InMessage { id, request })) => {
-					helper.acknowledge();
-					let shutdown = matches!(request, Request::Shutdown);
-					let outcome = match AssertUnwindSafe(helper.handle(request)).catch_unwind().await {
-						Ok(outcome) => outcome,
-						Err(_) => {
-							// The panic's message went to the log through the panic hook.
-							helper.send(OutMessage::Reply {
-								id,
-								outcome: Err(ReplyError::new(
-									ErrorCode::Internal,
-									"the request failed inside the helper, which stops",
-								)),
-							});
-							break ExitReason::Internal;
-						}
-					};
-					if let Err(error) = &outcome {
-						info!(id = id.get(), code = ?reply_code(error), "request refused");
-					}
-					helper.send(OutMessage::Reply { id, outcome });
-					if shutdown {
-						break ExitReason::Shutdown;
-					}
-				}
-			},
+			}
 		}
 	};
 	info!(?reason, "stopping");
@@ -538,17 +567,31 @@ impl<P: Platform, O: DriveOpener> Helper<P, O> {
 		}
 	}
 
+	/// Whether `user`'s root is held, as the index records it.
+	fn held(&self, user: UserId) -> bool {
+		self.index.entry(user).is_some_and(|entry| entry.held)
+	}
+
+	/// The phase as reports name it: [`PhaseName::Held`] for a root this run holds registered
+	/// whose entry is held, or serves held.
+	fn phase_name(&self) -> PhaseName {
+		match &self.phase {
+			Phase::Idle => PhaseName::Idle,
+			Phase::Registered(registered) if self.held(registered.user) => PhaseName::Held,
+			Phase::Registered(_) => PhaseName::Registered,
+			Phase::Serving(serving) if serving.held.load(Ordering::Relaxed) => PhaseName::Held,
+			Phase::Serving(_) => PhaseName::Serving,
+		}
+	}
+
 	fn status(&self) {
-		let (state, user, root, watching) = match &self.phase {
-			Phase::Idle => (PhaseName::Idle, None, None, false),
-			Phase::Registered(registered) => (
-				PhaseName::Registered,
-				Some(registered.user),
-				Some(registered.root.clone()),
-				false,
-			),
+		let state = self.phase_name();
+		let (user, root, watching) = match &self.phase {
+			Phase::Idle => (None, None, false),
+			Phase::Registered(registered) => {
+				(Some(registered.user), Some(registered.root.clone()), false)
+			}
 			Phase::Serving(serving) => (
-				PhaseName::Serving,
 				Some(serving.user),
 				Some(serving.root.clone()),
 				serving.watching.load(Ordering::Relaxed),
@@ -570,7 +613,8 @@ impl<P: Platform, O: DriveOpener> Helper<P, O> {
 			Request::Unregister {
 				user,
 				delete_hydrated,
-			} => self.unregister(user, delete_hydrated).await,
+				hold,
+			} => self.unregister(user, delete_hydrated, hold).await,
 			Request::Identify { path } => self.identify(&path).await.map(ReplyValue::Identified),
 			Request::ListRoots => Ok(self.list_roots().await),
 			Request::GetState => Ok(ReplyValue::State(self.state().await)),
@@ -586,6 +630,9 @@ impl<P: Platform, O: DriveOpener> Helper<P, O> {
 				"no root is registered",
 			)),
 			Phase::Registered(_) => Err(ReplyError::new(ErrorCode::NotServing, NOT_SERVING)),
+			Phase::Serving(serving) if serving.held.load(Ordering::Relaxed) => {
+				Err(ReplyError::new(ErrorCode::NotServing, HELD))
+			}
 			Phase::Serving(serving) => {
 				identify::identify(
 					&self.platform,
@@ -601,6 +648,7 @@ impl<P: Platform, O: DriveOpener> Helper<P, O> {
 
 	/// The helper's state as `getState` reports it.
 	async fn state(&self) -> StateReport {
+		let state = self.phase_name();
 		match &self.phase {
 			Phase::Idle => StateReport {
 				state: PhaseName::Idle,
@@ -610,14 +658,14 @@ impl<P: Platform, O: DriveOpener> Helper<P, O> {
 				pending_uploads: None,
 			},
 			Phase::Registered(registered) => StateReport {
-				state: PhaseName::Registered,
+				state,
 				user: Some(registered.user),
 				root: Some(registered.root.clone()),
 				watching: false,
 				pending_uploads: None,
 			},
 			Phase::Serving(serving) => StateReport {
-				state: PhaseName::Serving,
+				state,
 				user: Some(serving.user),
 				root: Some(serving.root.clone()),
 				watching: serving.watching.load(Ordering::Relaxed),
@@ -659,6 +707,7 @@ impl<P: Platform, O: DriveOpener> Helper<P, O> {
 				root: entry.root.clone(),
 				registered,
 				serving,
+				held: entry.held,
 				kept_earlier,
 			});
 		}
@@ -669,6 +718,16 @@ impl<P: Platform, O: DriveOpener> Helper<P, O> {
 	}
 
 	async fn register(&mut self, registration: Registration) -> Result<ReplyValue, ReplyError> {
+		self.register_waiting(registration, self.config.auth_wait)
+			.await
+	}
+
+	/// [`Helper::register`], a sealed session it resumes given `wait` to sign the cache in.
+	async fn register_waiting(
+		&mut self,
+		registration: Registration,
+		wait: Duration,
+	) -> Result<ReplyValue, ReplyError> {
 		let Registration {
 			root,
 			user,
@@ -677,22 +736,32 @@ impl<P: Platform, O: DriveOpener> Helper<P, O> {
 		} = registration;
 		let data_dir = DataDir::new(data_dir)
 			.map_err(|e| ReplyError::new(ErrorCode::DataDirInvalid, e.to_string()))?;
+		// Held for changes not on the drive yet, whatever this run holds of it: only its user's
+		// sign-in or its unregister ends that.
+		if self
+			.index
+			.entries()
+			.iter()
+			.any(|entry| entry.held && entry.user != user)
+		{
+			return Err(ReplyError::new(
+				ErrorCode::AlreadyRegistered,
+				"another user's root is held for changes not on the drive yet; unregister it first",
+			));
+		}
+		let state = self.phase_name();
 		let held = match &self.phase {
 			Phase::Idle => None,
 			Phase::Registered(registered) => Some((
 				registered.user,
 				registered.root.as_path(),
 				&registered.data_dir,
-				PhaseName::Registered,
 			)),
-			Phase::Serving(serving) => Some((
-				serving.user,
-				serving.root.as_path(),
-				&serving.data_dir,
-				PhaseName::Serving,
-			)),
+			Phase::Serving(serving) => {
+				Some((serving.user, serving.root.as_path(), &serving.data_dir))
+			}
 		};
-		if let Some((held, held_root, held_data, state)) = held {
+		if let Some((held, held_root, held_data)) = held {
 			if held == user
 				&& validate::same_path(held_root, &root)
 				&& validate::same_path(held_data.path(), data_dir.path())
@@ -789,6 +858,8 @@ impl<P: Platform, O: DriveOpener> Helper<P, O> {
 				kept: Vec::new(),
 				unregistered: false,
 				branding: branding.clone(),
+				// Kept as the index has it: only a sign-in or the unregister lifts a hold.
+				held: false,
 			})
 			.map_err(|e| index_error(&e))?;
 		let asked = branding.is_some();
@@ -804,20 +875,23 @@ impl<P: Platform, O: DriveOpener> Helper<P, O> {
 		let resumable = account_root.filter(|account| Some(*account) == known);
 		let resume = resumable.is_some() && SessionStore::has_session(&registered.data_dir);
 		let (phase, resumed) = match (resume, resumable) {
-			(true, Some(account_root)) => match self.serve(registered, None, account_root).await {
-				Ok(serving) => (Phase::Serving(Box::new(serving)), true),
-				Err((registered, error)) => {
-					warn!(code = ?reply_code(&error), "resuming the sealed session failed");
-					(Phase::Registered(registered), false)
+			(true, Some(account_root)) => {
+				match self.serve(registered, None, account_root, wait).await {
+					Ok(serving) => (Phase::Serving(Box::new(serving)), true),
+					Err((registered, error)) => {
+						warn!(code = ?reply_code(&error), "resuming the sealed session failed");
+						(Phase::Registered(registered), false)
+					}
 				}
-			},
+			}
 			_ => (Phase::Registered(registered), false),
 		};
 		self.phase = phase;
 		self.status();
-		let (state, branded) = match &self.phase {
-			Phase::Serving(serving) => (PhaseName::Serving, asked.then_some(serving.branded)),
-			Phase::Idle | Phase::Registered(_) => (PhaseName::Registered, None),
+		let state = self.phase_name();
+		let branded = match &self.phase {
+			Phase::Serving(serving) => asked.then_some(serving.branded),
+			Phase::Idle | Phase::Registered(_) => None,
 		};
 		let kept_earlier = self
 			.index
@@ -924,8 +998,18 @@ impl<P: Platform, O: DriveOpener> Helper<P, O> {
 			}
 			Phase::Serving(serving) => {
 				let sealed = serving.store.seal(&payload).map_err(session_error);
+				let lifted = match sealed {
+					Ok(()) if serving.held.load(Ordering::Relaxed) => {
+						Some(self.lift_hold(&serving).await)
+					}
+					Ok(()) => None,
+					Err(error) => Some(Err(error)),
+				};
 				self.phase = Phase::Serving(serving);
-				sealed?;
+				if let Some(lifted) = lifted {
+					lifted?;
+					self.status();
+				}
 				Ok(ReplyValue::Serving {
 					adopted: true,
 					branded: None,
@@ -934,13 +1018,25 @@ impl<P: Platform, O: DriveOpener> Helper<P, O> {
 			Phase::Registered(registered) => {
 				let asked = registered.branding.is_some();
 				match self
-					.serve(registered, Some(payload), owner.account_root)
+					.serve(
+						registered,
+						Some(payload),
+						owner.account_root,
+						self.config.auth_wait,
+					)
 					.await
 				{
 					Ok(serving) => {
 						let branded = asked.then_some(serving.branded);
+						// The drive signed in with the session as the serve started.
+						let lifted = if serving.held.load(Ordering::Relaxed) {
+							self.lift_hold(&serving).await
+						} else {
+							Ok(())
+						};
 						self.phase = Phase::Serving(Box::new(serving));
 						self.status();
+						lifted?;
 						Ok(ReplyValue::Serving {
 							adopted: false,
 							branded,
@@ -960,14 +1056,17 @@ impl<P: Platform, O: DriveOpener> Helper<P, O> {
 	}
 
 	/// Serves `registered` with the sealed session, after sealing `payload` into it when given:
-	/// registers the root for `account_root` if this run has not, opens the drive, waits for it to
-	/// sign in as that account, connects the root and starts the engine and the watcher. Hands the
-	/// root back, as it was, on a failure.
+	/// registers the root for `account_root` if this run has not, opens the drive, waits at most
+	/// `wait` for it to sign in as that account, connects the root and starts the engine and the
+	/// watcher. A root the index holds is served held from the first request on: the dispatcher
+	/// and the engine hold it before it is connected, and no thumbnail is served. Hands the root
+	/// back, as it was, on a failure.
 	async fn serve(
 		&mut self,
 		mut registered: Registered<P>,
 		payload: Option<Box<AuthPayload>>,
 		account_root: Uuid,
+		wait: Duration,
 	) -> Result<Serving<P, O::Drive>, (Registered<P>, ReplyError)> {
 		let opened = {
 			let platform = Arc::clone(&self.platform);
@@ -995,7 +1094,7 @@ impl<P: Platform, O: DriveOpener> Helper<P, O> {
 			})
 			.await
 		};
-		if let Err(error) = self.signed_in(&drive, &store, account_root).await {
+		if let Err(error) = self.signed_in(&drive, &store, account_root, wait).await {
 			drive.stop().await;
 			return Err((registered, error));
 		}
@@ -1054,6 +1153,11 @@ impl<P: Platform, O: DriveOpener> Helper<P, O> {
 			)
 			.with_hints(engine.hints()),
 		);
+		let held = self.held(registered.user);
+		if held {
+			dispatcher.hold();
+			engine.set_held(true);
+		}
 		let connected = {
 			let platform = Arc::clone(&self.platform);
 			let (dispatcher, engine) = (Arc::clone(&dispatcher), Arc::clone(&engine));
@@ -1068,9 +1172,15 @@ impl<P: Platform, O: DriveOpener> Helper<P, O> {
 			}
 		};
 		engine.start();
-		self.thumbnails
-			.serve(registered.root.clone(), thumbnail_local, Arc::clone(&drive));
+		if !held {
+			self.thumbnails.serve(
+				registered.root.clone(),
+				Arc::clone(&thumbnail_local),
+				Arc::clone(&drive),
+			);
+		}
 		let watching = Arc::new(AtomicBool::new(false));
+		let held = Arc::new(AtomicBool::new(held));
 		let keeper = {
 			let engine = Arc::clone(&engine);
 			keep_watching(Keeper {
@@ -1084,6 +1194,7 @@ impl<P: Platform, O: DriveOpener> Helper<P, O> {
 					root: Some(registered.root.clone()),
 					watching: false,
 				},
+				held: Arc::clone(&held),
 				out: self.out.clone(),
 				rearm: self.config.watch_rearm,
 			})
@@ -1121,22 +1232,127 @@ impl<P: Platform, O: DriveOpener> Helper<P, O> {
 			drive,
 			dispatcher,
 			engine,
+			thumbnail_local,
 			connected,
 			keeper,
 			watching,
+			held,
 			probes,
 		})
 	}
 
-	/// Waits for `drive` to sign in with `store`'s session as the account whose root is
-	/// `account_root`. Another account's session is cleared.
+	/// Holds `user`'s root, recorded first: a write that fails answers `io` and changes nothing
+	/// else. A root this run serves is held at once, and the change reported. Nothing for a user
+	/// the index does not know, or whose root is unregistered.
+	fn hold(&mut self, user: UserId) -> Result<(), ReplyError> {
+		let Some(was_held) = self
+			.index
+			.entry(user)
+			.filter(|entry| !entry.unregistered)
+			.map(|entry| entry.held)
+		else {
+			return Ok(());
+		};
+		if !was_held {
+			self.index
+				.set_held(user, true)
+				.map_err(|e| index_error(&e))?;
+		}
+		let changed = match &self.phase {
+			Phase::Serving(serving) if serving.user == user => {
+				let was = serving.held.load(Ordering::Relaxed);
+				self.enter_hold(serving);
+				!was
+			}
+			Phase::Registered(registered) if registered.user == user => !was_held,
+			Phase::Idle | Phase::Registered(_) | Phase::Serving(_) => false,
+		};
+		if changed {
+			self.status();
+		}
+		Ok(())
+	}
+
+	/// Holds the served root: other processes' downloads are refused from now on, those in flight
+	/// failed, only local changes go up to the drive, and no thumbnail is served.
+	fn enter_hold(&self, serving: &Serving<P, O::Drive>) {
+		serving.dispatcher.hold();
+		serving.engine.set_held(true);
+		self.thumbnails.stop_serving();
+		serving.held.store(true, Ordering::Relaxed);
+	}
+
+	/// Lifts the hold of the served root, once the drive answers as the root's account: records it,
+	/// then serves every process again, the engine walking the root for what the hold left undone.
+	/// A failure leaves the root held. What lifts it is the parent's `setAuth` of the held user for
+	/// the root's account, which it sends once the user signed in again: the drive of a served root
+	/// goes on with the session it signed in with, which the sealed payload replaces only at its
+	/// next open, so the check proves the account, not that the payload just sealed signs in.
+	async fn lift_hold(&mut self, serving: &Serving<P, O::Drive>) -> Result<(), ReplyError> {
+		self.signed_in(
+			&serving.drive,
+			&serving.store,
+			serving.account_root,
+			self.config.auth_wait,
+		)
+		.await?;
+		self.index
+			.set_held(serving.user, false)
+			.map_err(|e| index_error(&e))?;
+		serving.dispatcher.release();
+		serving.engine.set_held(false);
+		self.thumbnails.serve(
+			serving.root.clone(),
+			Arc::clone(&serving.thumbnail_local),
+			Arc::clone(&serving.drive),
+		);
+		serving.held.store(false, Ordering::Relaxed);
+		info!("the root's hold is lifted");
+		Ok(())
+	}
+
+	/// Serves the held root the index names, as an unregister would before it fetches, so its
+	/// changes go on up to the drive without waiting for the parent; at most
+	/// [`HelperConfig::resume_wait`] for the sign-in, and only until `first_line` is set (the
+	/// parent's first line read), after which it stays registered, held, for a later request to
+	/// serve. Nothing for a run that serves no root, or no held one. Opening the drive and connecting
+	/// the root are not cut short, as for a `register`.
+	async fn resume_held(&mut self, first_line: Stop) {
+		let held: Vec<RootEntry> = self
+			.index
+			.entries()
+			.iter()
+			.filter(|entry| entry.held)
+			.cloned()
+			.collect();
+		let Some(entry) = held.first() else {
+			return;
+		};
+		if held.len() > 1 {
+			warn!(
+				count = held.len(),
+				"the index holds more than one held root; only the first is served"
+			);
+		}
+		info!("serving the held root");
+		self.yield_to = Some(first_line);
+		self.serve_to_unregister(entry, self.config.resume_wait)
+			.await;
+		self.yield_to = None;
+	}
+
+	/// Waits at most `wait` for `drive` to sign in with `store`'s session as the account whose root
+	/// is `account_root`, and no longer than until a stop is asked for or, while the helper serves
+	/// a held root of its own accord, until the parent's first line is read. Another account's
+	/// session is cleared.
 	async fn signed_in(
 		&self,
 		drive: &Arc<O::Drive>,
 		store: &SessionStore,
 		account_root: Uuid,
+		wait: Duration,
 	) -> Result<(), ReplyError> {
-		let deadline = Instant::now() + self.config.auth_wait;
+		let deadline = Instant::now() + wait;
 		loop {
 			match drive.root_uuid().await {
 				Ok(root) if Uuid::parse_str(&root).ok() == Some(account_root) => return Ok(()),
@@ -1160,6 +1376,12 @@ impl<P: Platform, O: DriveOpener> Helper<P, O> {
 					"the helper is stopping; the session stays for its next start",
 				));
 			}
+			if self.yield_to.as_ref().is_some_and(Stop::requested) {
+				return Err(ReplyError::new(
+					ErrorCode::SessionRejected,
+					"the cache did not sign in before the parent's first request",
+				));
+			}
 			if Instant::now() >= deadline {
 				return Err(ReplyError::new(
 					ErrorCode::SessionRejected,
@@ -1169,6 +1391,12 @@ impl<P: Platform, O: DriveOpener> Helper<P, O> {
 			tokio::select! {
 				() = sleep(self.config.auth_poll) => {}
 				() = self.stopping.asked() => {}
+				() = async {
+					match &self.yield_to {
+						Some(first_line) => first_line.asked().await,
+						None => std::future::pending().await,
+					}
+				} => {}
 			}
 		}
 	}
@@ -1292,12 +1520,18 @@ impl<P: Platform, O: DriveOpener> Helper<P, O> {
 	/// data and sealing key. A served root first fetches the data of its changed files not all on
 	/// disk, while a session can. A stop asked for before the root's items are settled answers
 	/// `shuttingDown` at the next safe point, leaving the root registered with its session, and
-	/// the loop then stops as for any shutdown.
+	/// the loop then stops as for any shutdown. With `hold`, the root is held first and stays so
+	/// unless the unregister succeeds; a held root whose fetches leave a changed file not all on
+	/// disk answers `unsyncedChanges` at once, still served, so its uploads go on.
 	async fn unregister(
 		&mut self,
 		user: UserId,
 		delete_hydrated: bool,
+		hold: bool,
 	) -> Result<ReplyValue, ReplyError> {
+		if hold {
+			self.hold(user)?;
+		}
 		let Some(entry) = self.index.entry(user).cloned() else {
 			return Ok(ReplyValue::Unregistered(UnregisterReport {
 				unregistered: false,
@@ -1312,7 +1546,8 @@ impl<P: Platform, O: DriveOpener> Helper<P, O> {
 				kept_earlier: Vec::new(),
 			}));
 		};
-		self.serve_to_unregister(&entry).await;
+		self.serve_to_unregister(&entry, self.config.auth_wait)
+			.await;
 		// A sign-in the serve waited for gave up on the stop, or the stop came after it.
 		if self.stopping.requested() {
 			return Err(shutting_down());
@@ -1321,10 +1556,18 @@ impl<P: Platform, O: DriveOpener> Helper<P, O> {
 		// root that cannot be unregistered is served again.
 		let (held, served) = match mem::replace(&mut self.phase, Phase::Idle) {
 			Phase::Serving(serving) if serving.user == user => {
-				if self.fetch_kept(&serving).await.is_err() {
+				let Ok(unfetched) = self.fetch_kept(&serving).await else {
 					// Left served: the loop's own stop stops it.
 					self.phase = Phase::Serving(serving);
 					return Err(shutting_down());
+				};
+				// Only the provider's own fetches fill such a file, so the walk under the refusing
+				// connection could only find it again; the root stays served for its uploads.
+				if entry.held
+					&& let Some(first) = unfetched.first()
+				{
+					self.phase = Phase::Serving(serving);
+					return Err(unsynced(unfetched.len(), &first.to_string()));
 				}
 				let account_root = serving.account_root;
 				let (registered, _, _) = self.stop_serving(*serving).await;
@@ -1381,7 +1624,10 @@ impl<P: Platform, O: DriveOpener> Helper<P, O> {
 					self.phase = match served {
 						// Not while stopping: the serve would wait for a sign-in.
 						Some(account_root) if !self.stopping.requested() => {
-							match self.serve(registered, None, account_root).await {
+							match self
+								.serve(registered, None, account_root, self.config.auth_wait)
+								.await
+							{
 								Ok(serving) => Phase::Serving(Box::new(serving)),
 								Err((registered, resume)) => {
 									warn!(code = ?reply_code(&resume), "serving the root again after its unregister stopped failed");
@@ -1401,8 +1647,9 @@ impl<P: Platform, O: DriveOpener> Helper<P, O> {
 	/// Walks the served root and fetches the data of its changed files not all on disk, before it
 	/// is unregistered. A stop asked for meanwhile closes the dispatcher, which fails the fetch in
 	/// flight and every later one, so the platform's hydrate returns; then it waits for the walk to
-	/// give up. [`Stopping`] once a stop was asked for, whenever it came.
-	async fn fetch_kept(&self, serving: &Serving<P, O::Drive>) -> Result<(), Stopping> {
+	/// give up. The changed files it could not fetch; [`Stopping`] once a stop was asked for,
+	/// whenever it came.
+	async fn fetch_kept(&self, serving: &Serving<P, O::Drive>) -> Result<Vec<RootPath>, Stopping> {
 		let fetching = {
 			let platform = Arc::clone(&self.platform);
 			let root = serving.root.clone();
@@ -1412,9 +1659,10 @@ impl<P: Platform, O: DriveOpener> Helper<P, O> {
 				match unregister::walk(&*local, &stop) {
 					Ok(walked) => unregister::hydrate_kept(&*local, &walked, &stop),
 					Err(WalkError::Stopping(stopping)) => Err(stopping),
+					// The unregister's own walk fails on it in turn.
 					Err(WalkError::Local(error)) => {
 						warn!(%error, "walking the root before unregistering failed");
-						Ok(())
+						Ok(Vec::new())
 					}
 				}
 			})
@@ -1441,8 +1689,9 @@ impl<P: Platform, O: DriveOpener> Helper<P, O> {
 	/// included). Only while the OS holds this provider's registration of the root for its
 	/// account: nothing for an elevated run, a root with no session or no known account, an
 	/// unregister the OS let go of (its record is finished as it is), or while another user's root
-	/// is held; a serve that fails leaves the unregister as it was.
-	async fn serve_to_unregister(&mut self, entry: &RootEntry) {
+	/// is held; a serve that fails leaves the unregister as it was. A sealed session is given
+	/// `wait` to sign the cache in.
+	async fn serve_to_unregister(&mut self, entry: &RootEntry, wait: Duration) {
 		if entry.unregistered || entry.unsettled().is_some() || self.platform.elevated() {
 			return;
 		}
@@ -1486,13 +1735,13 @@ impl<P: Platform, O: DriveOpener> Helper<P, O> {
 					data_dir: entry.data_dir.clone(),
 					branding: entry.branding.clone(),
 				};
-				if let Err(error) = self.register(registration).await {
+				if let Err(error) = self.register_waiting(registration, wait).await {
 					warn!(code = ?reply_code(&error), "serving the root before unregistering it failed");
 				}
 				self.reported.truncate(reported);
 			}
 			Phase::Registered(registered) if registered.user == entry.user => {
-				self.phase = match self.serve(registered, None, account_root).await {
+				self.phase = match self.serve(registered, None, account_root, wait).await {
 					Ok(serving) => Phase::Serving(Box::new(serving)),
 					Err((registered, error)) => {
 						warn!(code = ?reply_code(&error), "serving the root before unregistering it failed");

@@ -54,7 +54,7 @@ const DB_DIR_NAME: &str = "db";
 const FILES_DIR_NAME: &str = "files";
 /// Written into a data directory the helper creates, or finds empty, before anything else goes in
 /// it: nothing is wiped from a directory without it, nor kept in one that holds anything else.
-const DATA_DIR_MARKER_NAME: &str = "filen-cloud-files-data";
+pub(crate) const DATA_DIR_MARKER_NAME: &str = "filen-cloud-files-data";
 /// What the marker says, for a person who finds it.
 const DATA_DIR_MARKER_TEXT: &[u8] =
 	b"The Filen desktop app's Cloud Files provider keeps a session and a cache here.\n";

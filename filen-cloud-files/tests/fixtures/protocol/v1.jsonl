@@ -99,3 +99,10 @@
 {"case":"reply error unknownItem","dir":"out","line":{"t":"reply","id":9,"ok":false,"error":{"code":"unknownItem","message":"the drive holds no such item, or holds it in the trash"}}}
 {"case":"reply error notServing","dir":"out","line":{"t":"reply","id":9,"ok":false,"error":{"code":"notServing","message":"the root is not served"}}}
 {"case":"reply error notFound","dir":"out","line":{"t":"reply","id":9,"ok":false,"error":{"code":"notFound","message":"nothing is at the path"}}}
+{"case":"unregister holding","dir":"in","line":{"t":"unregister","id":89,"userId":"42","deleteHydrated":false,"hold":true},"expect":{"t":"unregister"}}
+{"case":"hold not a bool","dir":"in","line":{"t":"unregister","id":90,"userId":"42","deleteHydrated":false,"hold":"yes"},"expect":{"code":"invalidMessage","id":90}}
+{"case":"reply register held","dir":"out","line":{"t":"reply","id":1,"ok":true,"value":{"state":"held","resumed":true}}}
+{"case":"reply getState held","dir":"out","line":{"t":"reply","id":6,"ok":true,"value":{"state":"held","userId":"42","root":"C:\\Users\\u\\Filen","watching":true,"pendingUploads":2}}}
+{"case":"status held","dir":"out","line":{"t":"status","state":"held","userId":"42","root":"C:\\Users\\u\\Filen","watching":true}}
+{"case":"reply listRoots held","dir":"out","line":{"t":"reply","id":5,"ok":true,"value":{"roots":[{"userId":"42","root":"C:\\Users\\u\\Filen","registered":true,"serving":true,"held":true}]}}}
+{"case":"reply error notServing held","dir":"out","line":{"t":"reply","id":9,"ok":false,"error":{"code":"notServing","message":"the root is held"}}}
