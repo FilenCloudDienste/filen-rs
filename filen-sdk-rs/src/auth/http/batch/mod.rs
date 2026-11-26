@@ -126,6 +126,36 @@ pub(crate) enum Reply<Res> {
 	Failed(Error),
 }
 
+/// What [`Batcher::call`] returns: a [`Reply`] before its item's answer is decoded, so the
+/// batching does not depend on the response type and is compiled once for every route.
+pub(crate) enum UndecodedReply {
+	/// See [`Reply::Alone`].
+	Alone,
+	/// This item's answer, its data not decoded yet: only [`Self::decode`] decodes it, as the
+	/// caller's type.
+	Answer(Answer<Undecoded>),
+	/// See [`Reply::Failed`].
+	Failed(Error),
+}
+
+/// The data type of an [`UndecodedReply::Answer`], which has no values and so no `ItemData`: the
+/// answer cannot be decoded before [`UndecodedReply::decode`] gives it the caller's type.
+pub(crate) enum Undecoded {}
+
+impl UndecodedReply {
+	/// Decodes the item's answer as `Res`, as its single route decodes it. An item answered
+	/// `internal_error` becomes [`Reply::Alone`].
+	pub(crate) fn decode<Res: ItemData>(self) -> Reply<Res> {
+		match self {
+			Self::Alone => Reply::Alone,
+			Self::Answer(answer) => {
+				answered::<Res>(answer.into_as()).map_or(Reply::Alone, Reply::Item)
+			}
+			Self::Failed(e) => Reply::Failed(e),
+		}
+	}
+}
+
 /// The lane of the calling task: one window never spans two runtimes (native) or two web workers
 /// (wasm), so one runtime's timer, stall or teardown never holds up another's callers.
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
@@ -237,24 +267,23 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 impl Batcher {
-	/// Sends `split` with the calls for the same key that arrive within `window`, through `post`.
-	/// The lock order is always the map, then a window's phase; nothing holds either across an
-	/// await.
-	pub(crate) async fn call<Res, P, Fut>(
+	/// Sends `split` with the calls for the same key that arrive within `window`, through `post`,
+	/// and returns this call's answer for the caller to decode. The lock order is always the map,
+	/// then a window's phase; nothing holds either across an await.
+	pub(crate) async fn call<P, Fut>(
 		&self,
 		route: &BulkRoute,
 		lane: Lane,
 		split: Split,
 		window: Duration,
 		post: P,
-	) -> Reply<Res>
+	) -> UndecodedReply
 	where
-		Res: ItemData,
 		P: FnOnce(Arc<Taken>) -> Fut,
 		Fut: Future<Output = Result<Response<'static, Box<RawValue>>, Error>>,
 	{
 		let Joined::Member(window, slot) = self.join(route, lane, split, window) else {
-			return Reply::Alone;
+			return UndecodedReply::Alone;
 		};
 		let _waiter = Waiter {
 			window: &window,
@@ -276,12 +305,12 @@ impl Batcher {
 					.flatten()
 					.and_then(|i| answers.get(i))
 				else {
-					return Reply::Alone;
+					return UndecodedReply::Alone;
 				};
-				answered::<Res>(answer.copy_as()).map_or(Reply::Alone, Reply::Item)
+				UndecodedReply::Answer(answer.copy_as())
 			}
-			Outcome::Alone => Reply::Alone,
-			Outcome::Failed(e) => Reply::Failed(Error::unshared(Arc::clone(e))),
+			Outcome::Alone => UndecodedReply::Alone,
+			Outcome::Failed(e) => UndecodedReply::Failed(Error::unshared(Arc::clone(e))),
 		}
 	}
 

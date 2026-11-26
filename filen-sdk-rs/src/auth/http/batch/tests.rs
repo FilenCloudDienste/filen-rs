@@ -119,7 +119,10 @@ where
 	Fut: Future<Output = BulkAnswer>,
 {
 	let split = route.split(&request).expect("a test request splits");
-	batcher.call(route, lane, split, WINDOW, post).await
+	batcher
+		.call(route, lane, split, WINDOW, post)
+		.await
+		.decode()
 }
 
 async fn call<Res, P, Fut>(

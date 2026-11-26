@@ -29,7 +29,7 @@ use crate::{
 		Client,
 		http::{
 			auth::AuthLayer,
-			batch::{Batcher, BulkRoute, Reply},
+			batch::{Batcher, BulkRoute, Lane, Reply, Split, UndecodedReply},
 		},
 		unauth::UnauthClient,
 	},
@@ -1347,6 +1347,19 @@ impl AuthClient {
 	}
 }
 
+/// Logs a batched call's failure as its single call's failure is logged, naming the bulk route it
+/// went through, and returns it.
+fn log_batched_failure(route: &BulkRoute, endpoint: &'static str, e: Error) -> Error {
+	logging::log_request_failure!(
+		&e,
+		endpoint,
+		via = route.endpoint,
+		error = %e,
+		"request failed"
+	);
+	e
+}
+
 /// The progress callback a streamed response body reports to (bytes received, and the total when
 /// the response states one), as the stacks and the listings above them take it: one instantiation
 /// of each whatever closure a caller passes.
@@ -1746,55 +1759,61 @@ impl AuthClient {
 		Res: DeserializeOwned + Debug + MaybeSend,
 		Req: Serialize + Debug,
 	{
-		let single = || self.post_auth::<Req, Res>(endpoint.into(), request);
+		// only the decode depends on `Res`: the batching itself is compiled once for every route
+		let reply = match self.batch_lane() {
+			Some((lane, window)) => {
+				self.call_batcher(route, endpoint, lane, window, route.split(request))
+					.await
+			}
+			None => UndecodedReply::Alone,
+		};
+		match reply.decode::<Res>() {
+			Reply::Alone => self.post_auth::<Req, Res>(endpoint.into(), request).await,
+			Reply::Item(Ok(data)) => Ok(data),
+			Reply::Item(Err(e)) => Err(log_batched_failure(
+				route,
+				endpoint,
+				e.with_context(endpoint),
+			)),
+			// no context of its own: the stand-in reads as the shared error, which names the
+			// bulk endpoint
+			Reply::Failed(e) => Err(log_batched_failure(route, endpoint, e)),
+		}
+	}
+
+	/// The calling task's lane and the batch window, or `None` when the call goes alone: the
+	/// window is zero, or the task has no lane.
+	fn batch_lane(&self) -> Option<(Lane, Duration)> {
 		let window = self.unauthed.state.batch_window();
 		if window.is_zero() {
-			return single().await;
+			return None;
 		}
-		let Some(lane) = batch::lane() else {
-			return single().await;
-		};
-		let Some(split) = route.split(request) else {
+		Some((batch::lane()?, window))
+	}
+
+	/// The batched part of [`Self::post_batched`]: `split` sent through the batcher, or
+	/// [`UndecodedReply::Alone`] when the request did not split into a bulk item.
+	async fn call_batcher(
+		&self,
+		route: &'static BulkRoute,
+		endpoint: &'static str,
+		lane: Lane,
+		window: Duration,
+		split: Option<Split>,
+	) -> UndecodedReply {
+		let Some(split) = split else {
 			tracing::warn!(
 				endpoint,
 				via = route.endpoint,
 				"request does not split into a bulk item; sending it alone"
 			);
-			return single().await;
+			return UndecodedReply::Alone;
 		};
-		let reply = self
-			.batcher
-			.call::<Res, _, _>(route, lane, split, window, move |taken| async move {
+		self.batcher
+			.call(route, lane, split, window, move |taken| async move {
 				self.post_auth(route.endpoint.into(), &*taken).await
 			})
-			.await;
-		match reply {
-			Reply::Alone => single().await,
-			Reply::Item(Ok(data)) => Ok(data),
-			Reply::Item(Err(e)) => {
-				let e = e.with_context(endpoint);
-				logging::log_request_failure!(
-					&e,
-					endpoint,
-					via = route.endpoint,
-					error = %e,
-					"request failed"
-				);
-				Err(e)
-			}
-			// no context of its own: the stand-in reads as the shared error, which names the
-			// bulk endpoint
-			Reply::Failed(e) => {
-				logging::log_request_failure!(
-					&e,
-					endpoint,
-					via = route.endpoint,
-					error = %e,
-					"request failed"
-				);
-				Err(e)
-			}
-		}
+			.await
 	}
 
 	pub(crate) async fn post_large_response_auth<Req, Res>(

@@ -69,6 +69,15 @@ impl<T> Answer<T> {
 			data: PhantomData,
 		}
 	}
+
+	/// This answer, to be decoded as `U`: the request batcher hands each caller its answer
+	/// undecoded, and the caller decodes it as its own type.
+	pub(crate) fn into_as<U>(self) -> Answer<U> {
+		Answer {
+			envelope: self.envelope,
+			data: PhantomData,
+		}
+	}
 }
 
 /// Why a chunk failed before or after it was sent.
