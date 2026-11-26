@@ -35,9 +35,9 @@ use windows_sys::Win32::{
 use windows_sys::{
 	Win32::{
 		Foundation::{
-			ERROR_FILE_NOT_FOUND, ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_PARAMETER,
-			ERROR_MORE_DATA, ERROR_NO_MORE_ITEMS, ERROR_NOT_SUPPORTED, ERROR_SUCCESS, HANDLE,
-			INVALID_HANDLE_VALUE, LocalFree, STATUS_SUCCESS, WIN32_ERROR,
+			ERROR_FILE_NOT_FOUND, ERROR_HANDLE_EOF, ERROR_INSUFFICIENT_BUFFER,
+			ERROR_INVALID_PARAMETER, ERROR_MORE_DATA, ERROR_NO_MORE_ITEMS, ERROR_NOT_SUPPORTED,
+			ERROR_SUCCESS, HANDLE, INVALID_HANDLE_VALUE, LocalFree, STATUS_SUCCESS, WIN32_ERROR,
 		},
 		Graphics::Gdi::{
 			BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateDIBSection, DIB_RGB_COLORS, DeleteObject,
@@ -90,11 +90,11 @@ use super::{
 use crate::{
 	identity::{IdentityBlob, MAX_IDENTITY_LEN},
 	os::{
-		OptionalRange, RequestedRange,
+		ByteRange, OptionalRange, RequestedRange,
 		cfapi::{
-			CreateValues, E_FAIL, E_INVALIDARG, Hresult, MAX_SYNC_ROOT_IDENTITY_LEN,
-			SyncRootIdentity, WideNul, create_values, field_present, identity_len, image_file_name,
-			take_until_nul, volume_path,
+			CfCall, CreateValues, E_FAIL, E_INVALIDARG, Hresult, MAX_SYNC_ROOT_IDENTITY_LEN,
+			RangeListError, RangePages, SyncRootIdentity, WideNul, WinError, create_values,
+			field_present, identity_len, image_file_name, take_until_nul, volume_path,
 		},
 	},
 	placeholder::PlaceholderSpec,
@@ -1718,6 +1718,94 @@ pub(super) fn placeholder_info(file: &File) -> Result<StandardInfo, Hresult> {
 	let bytes: Vec<u8> = buffer.iter().flat_map(|word| word.to_ne_bytes()).collect();
 	let returned = usize::try_from(returned).map_or(bytes.len(), |len| len.min(bytes.len()));
 	parse_standard_info(bytes.get(..returned).unwrap_or_default()).ok_or(Hresult::new(E_FAIL))
+}
+
+/// How many ranges one `CfGetPlaceholderRangeInfo` call of [`on_disk_ranges`] has room for: a file
+/// with more takes several calls.
+const RANGES_PER_CALL: usize = 512;
+
+/// The ranges of `file`'s data that are on disk (`CfGetPlaceholderRangeInfo` with
+/// `CF_PLACEHOLDER_RANGE_INFO_ONDISK`), over its first `size` bytes, in order, adjacent ones
+/// merged: page by page of [`RANGES_PER_CALL`], each call starting where the last range of the
+/// one before ended, until a call says none follow, and refused past
+/// [`MAX_PLACEHOLDER_RANGES`](crate::os::cfapi::MAX_PLACEHOLDER_RANGES) (see [`RangePages`]).
+/// The call reads no data and needs only `FILE_READ_ATTRIBUTES` on the handle (Microsoft's
+/// documentation). Measured (Windows 11 ARM64, in the VM): `ReturnedLength` counts bytes, 16 per
+/// range; a buffer too small for every range takes as many as fit and the call answers
+/// `ERROR_MORE_DATA`; a call starting inside a range returns it cut at the start; each call took
+/// under 60 µs, connected, disconnected and with the file's root no longer registered. A range
+/// that holds the end of a file whose size is no multiple of 4096 ends at the file's end, also
+/// when asked about past it, and `OnDiskDataSize` counts the same bytes: the last 5000 bytes of a
+/// file of 16 MiB + 5000 on disk report `(16777216, 5000)` and 5000, written to or appended to
+/// (`(16777216, 5006)`) as much as read. Every
+/// failure is the call's: its own `HRESULT` (`ERROR_NOT_A_CLOUD_FILE` for an ordinary file),
+/// `ERROR_MORE_DATA` for a file with more ranges than taken, and `E_FAIL` for a reply that does not
+/// hold whole ranges in order within the file (logged).
+#[allow(unsafe_code)] // cfapi FFI: reads which ranges of a placeholder's data are on disk.
+pub(super) fn on_disk_ranges(file: &File, size: u64) -> Result<Vec<ByteRange>, WinError> {
+	let failed = |code| WinError {
+		call: CfCall::PlaceholderRangeInfo,
+		code,
+	};
+	let mut buffer = vec![CF_FILE_RANGE::default(); RANGES_PER_CALL];
+	let entry = size_of::<CF_FILE_RANGE>();
+	let Ok(buffer_len) = u32::try_from(size_of_val(buffer.as_slice())) else {
+		return Err(failed(Hresult::new(E_INVALIDARG)));
+	};
+	let mut pages = RangePages::new(size);
+	while let Some(query) = pages.next_query() {
+		let (Ok(start), Ok(len)) = (i64::try_from(query.offset), i64::try_from(query.len)) else {
+			return Err(failed(Hresult::new(E_INVALIDARG)));
+		};
+		let mut returned = 0_u32;
+		// SAFETY: the handle is borrowed from a live `File` for the call; the buffer is an
+		// exclusively borrowed array of `CF_FILE_RANGE`, the entries the call writes, `buffer_len`
+		// bytes long; `returned` is a live out-param. The call completes before it returns.
+		let hr = Hresult::new(unsafe {
+			CfGetPlaceholderRangeInfo(
+				file.as_raw_handle(),
+				CF_PLACEHOLDER_RANGE_INFO_ONDISK,
+				start,
+				len,
+				buffer.as_mut_ptr().cast(),
+				buffer_len,
+				&mut returned,
+			)
+		});
+		let more = hr == Hresult::from_win32(ERROR_MORE_DATA);
+		if hr == Hresult::from_win32(ERROR_HANDLE_EOF) {
+			// The start is at or past the file's end: the file shrank since its size was read,
+			// and has no range past it.
+			break;
+		}
+		if !hr.is_ok() && !more {
+			return Err(failed(hr));
+		}
+		let Some(page) = usize::try_from(returned)
+			.ok()
+			.filter(|returned| returned % entry == 0)
+			.and_then(|returned| buffer.get(..returned / entry))
+		else {
+			warn!(
+				returned,
+				"a placeholder range query wrote no whole number of ranges"
+			);
+			return Err(failed(Hresult::new(E_FAIL)));
+		};
+		let taken = pages.take(
+			page.iter()
+				.map(|range| (range.StartingOffset, range.Length)),
+			more,
+		);
+		if let Err(error) = taken {
+			warn!(%error, "a placeholder range query returned ranges that cannot be taken");
+			return Err(failed(match error {
+				RangeListError::TooMany => Hresult::from_win32(ERROR_MORE_DATA),
+				RangeListError::Malformed | RangeListError::NoProgress => Hresult::new(E_FAIL),
+			}));
+		}
+	}
+	Ok(pages.into_ranges())
 }
 
 /// What `GetFileInformationByHandleEx` reports of a local item.

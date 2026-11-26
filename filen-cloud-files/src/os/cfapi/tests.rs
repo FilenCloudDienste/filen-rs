@@ -895,3 +895,120 @@ fn only_the_file_name_of_a_readers_image_is_logged() {
 	assert_eq!(image_file_name(&wide(&long)), None);
 	assert!(image_file_name(&wide(&format!(r"C:\{}", "a".repeat(255)))).is_some());
 }
+
+fn range(offset: u64, len: u64) -> ByteRange {
+	ByteRange { offset, len }
+}
+
+#[test]
+fn one_call_returning_every_range_ends_the_query() {
+	let mut pages = RangePages::new(1 << 20);
+	assert_eq!(pages.next_query(), Some(range(0, 1 << 20)));
+	pages
+		.take([(0, 8192), (65536, 4096), (1_044_480, 4096)], false)
+		.unwrap();
+	assert_eq!(pages.next_query(), None);
+	assert_eq!(
+		pages.into_ranges(),
+		vec![range(0, 8192), range(65536, 4096), range(1_044_480, 4096)]
+	);
+}
+
+#[test]
+fn a_call_that_says_more_follow_makes_the_next_start_where_its_last_range_ends() {
+	let mut pages = RangePages::new(1 << 20);
+	pages.take([(0, 4096), (8192, 4096)], true).unwrap();
+	assert_eq!(pages.next_query(), Some(range(12288, (1 << 20) - 12288)));
+	pages.take([(16384, 4096)], true).unwrap();
+	assert_eq!(pages.next_query(), Some(range(20480, (1 << 20) - 20480)));
+	pages.take([], false).unwrap();
+	assert_eq!(pages.next_query(), None);
+	assert_eq!(
+		pages.into_ranges(),
+		vec![range(0, 4096), range(8192, 4096), range(16384, 4096)]
+	);
+}
+
+#[test]
+fn adjacent_ranges_across_calls_are_merged() {
+	let mut pages = RangePages::new(16384);
+	pages.take([(0, 4096)], true).unwrap();
+	pages.take([(4096, 4096), (12288, 4096)], false).unwrap();
+	assert_eq!(
+		pages.into_ranges(),
+		vec![range(0, 8192), range(12288, 4096)]
+	);
+}
+
+#[test]
+fn a_range_before_the_last_one_ends_is_refused() {
+	let mut pages = RangePages::new(16384);
+	pages.take([(4096, 4096)], true).unwrap();
+	assert_eq!(
+		pages.take([(4096, 4096)], false),
+		Err(RangeListError::Malformed)
+	);
+	let mut pages = RangePages::new(16384);
+	assert_eq!(
+		pages.take([(8192, 4096), (0, 4096)], false),
+		Err(RangeListError::Malformed)
+	);
+}
+
+#[test]
+fn an_empty_negative_or_overlong_range_is_refused() {
+	for bad in [
+		(0, 0),
+		(-1, 4096),
+		(0, -4096),
+		(12288, 8192),
+		(i64::MAX, i64::MAX),
+	] {
+		let mut pages = RangePages::new(16384);
+		assert_eq!(
+			pages.take([bad], false),
+			Err(RangeListError::Malformed),
+			"{bad:?}"
+		);
+	}
+}
+
+#[test]
+fn a_range_ending_at_the_end_of_the_file_is_taken() {
+	let mut pages = RangePages::new(u64::MAX);
+	pages.take([(i64::MAX - 4096, 4096)], false).unwrap();
+	assert_eq!(
+		pages.into_ranges(),
+		vec![range(i64::MAX.cast_unsigned() - 4096, 4096)]
+	);
+}
+
+#[test]
+fn a_call_that_says_more_follow_but_returns_none_is_refused() {
+	let mut pages = RangePages::new(16384);
+	assert_eq!(pages.take([], true), Err(RangeListError::NoProgress));
+}
+
+#[test]
+fn the_ranges_are_capped_at_the_limit_and_one_more_is_refused() {
+	let mut pages = RangePages::new(u64::MAX);
+	let at_limit = (0..MAX_PLACEHOLDER_RANGES).map(|n| {
+		let n = i64::try_from(n).unwrap();
+		(n * 8192, 4096)
+	});
+	pages.take(at_limit, true).unwrap();
+	let next = i64::try_from(MAX_PLACEHOLDER_RANGES).unwrap() * 8192;
+	assert_eq!(
+		pages.take([(next, 4096)], false),
+		Err(RangeListError::TooMany)
+	);
+	// Adjacent to the last one, it is merged and takes no new entry.
+	let mut pages = RangePages::new(u64::MAX);
+	let at_limit = (0..MAX_PLACEHOLDER_RANGES).map(|n| {
+		let n = i64::try_from(n).unwrap();
+		(n * 8192, 4096)
+	});
+	pages.take(at_limit, true).unwrap();
+	pages.take([(next - 4096, 4096)], false).unwrap();
+	assert_eq!(pages.into_ranges().len(), MAX_PLACEHOLDER_RANGES);
+}

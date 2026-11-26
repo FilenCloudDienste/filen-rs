@@ -203,6 +203,15 @@ pub struct CheckedHash {
 	pub after: FileSnapshot,
 }
 
+/// A byte range of a file: `len` bytes from `offset`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ByteRange {
+	/// Where it starts.
+	pub offset: u64,
+	/// How many bytes it holds.
+	pub len: u64,
+}
+
 /// Why the core skips a local item it cannot sync safely.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnsupportedKind {
@@ -500,6 +509,16 @@ pub trait LocalFs: sealed::Sealed + Send + Sync + 'static {
 		path: &RootPath,
 		expect: LocalFileId,
 	) -> Result<Box<dyn ByteSource>, LocalError>;
+
+	/// The ranges of the file placeholder at `path`, if it is still the item `expect`, whose bytes
+	/// are on disk, in order, none adjacent to another: read without opening the file's data, so
+	/// nothing is fetched. [`LocalError::NotFound`] when the file is another item or a directory;
+	/// an ordinary file, which has no such ranges, fails as the OS refused it.
+	fn on_disk_ranges(
+		&self,
+		path: &RootPath,
+		expect: LocalFileId,
+	) -> Result<Vec<ByteRange>, LocalError>;
 
 	/// Copies the bytes of the file at `path`, if it is still the item `expect` and all its data is
 	/// on disk, into a new ordinary file at `to`: [`LocalError::Exists`] when anything is at `to`,

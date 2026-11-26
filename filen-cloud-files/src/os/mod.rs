@@ -13,10 +13,10 @@ pub(crate) mod win;
 
 pub(crate) use local::ticks_to_unix_millis;
 pub use local::{
-	CheckedHash, Completed, DehydrateReason, DehydrateRequest, DehydrateResponder, DeleteRequest,
-	DeleteResponder, FileSnapshot, FileStamp, IfPinned, LocalEntry, LocalError, LocalEvent,
-	LocalFileId, LocalFs, LocalKind, PinAttr, PlaceholderState, RenameRequest, RenameResponder,
-	RenameTarget, UnsupportedKind, Updated,
+	ByteRange, CheckedHash, Completed, DehydrateReason, DehydrateRequest, DehydrateResponder,
+	DeleteRequest, DeleteResponder, FileSnapshot, FileStamp, IfPinned, LocalEntry, LocalError,
+	LocalEvent, LocalFileId, LocalFs, LocalKind, PinAttr, PlaceholderState, RenameRequest,
+	RenameResponder, RenameTarget, UnsupportedKind, Updated,
 };
 pub use watch::{LocalWatcher, WatchError, WatchSignal, WatchSink};
 

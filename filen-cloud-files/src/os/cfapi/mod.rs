@@ -16,7 +16,7 @@ use filen_types::fs::Uuid;
 use crate::{
 	failure::Failure,
 	identity::{IdentityError, MAX_IDENTITY_LEN},
-	os::{DehydrateReason, EntryOutcome, LocalError, OsError, PinAttr, UnsupportedKind},
+	os::{ByteRange, DehydrateReason, EntryOutcome, LocalError, OsError, PinAttr, UnsupportedKind},
 	placeholder::{PlaceholderSpec, SpecKind},
 	root_path::{RootPath, RootPathError},
 };
@@ -228,6 +228,104 @@ pub enum CfCall {
 	Disconnect,
 	/// `CfGetSyncRootInfoByPath`.
 	SyncRootInfo,
+	/// `CfGetPlaceholderRangeInfo`.
+	PlaceholderRangeInfo,
+}
+
+/// The most ranges [`RangePages`] takes of one file. A placeholder whose ranges on disk are cut
+/// into more is refused, not read in part: a range is at least the platform's 4096 bytes, so the
+/// cap is reached only by a file of at least 512 MiB cut into a range on disk every other 4096
+/// bytes.
+pub(crate) const MAX_PLACEHOLDER_RANGES: usize = 1 << 16;
+
+/// Why the ranges `CfGetPlaceholderRangeInfo` returned could not be taken.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum RangeListError {
+	/// More than [`MAX_PLACEHOLDER_RANGES`] ranges, once adjacent ones are merged.
+	#[error("the file has more than {MAX_PLACEHOLDER_RANGES} ranges")]
+	TooMany,
+	/// A range that is empty or negative, starts before the range before it ends, or ends past
+	/// the part of the file asked about.
+	#[error("a range is empty, out of order or past the end")]
+	Malformed,
+	/// A call said more ranges follow but returned none, so the next call could not start later.
+	#[error("a call that said more ranges follow returned none")]
+	NoProgress,
+}
+
+/// The ranges of one file `CfGetPlaceholderRangeInfo` returns, collected call by call: a call
+/// returns as many as its buffer holds and `ERROR_MORE_DATA` when more follow, and the next call
+/// starts where the last range returned ends (Microsoft's documentation of the call). Each range
+/// is checked to lie within the part of the file asked about, after the ranges before it, so the
+/// list ends sorted and disjoint, adjacent ranges merged, and every call starts later than the one
+/// before: the loop always ends.
+#[derive(Debug)]
+pub(crate) struct RangePages {
+	ranges: Vec<ByteRange>,
+	/// Where the next call starts: the end of the last range taken.
+	next: u64,
+	/// The file's size: the end of the part asked about.
+	end: u64,
+}
+
+impl RangePages {
+	/// The ranges of a file of `size` bytes, none taken yet.
+	pub(crate) fn new(size: u64) -> Self {
+		Self {
+			ranges: Vec::new(),
+			next: 0,
+			end: size,
+		}
+	}
+
+	/// What the next call asks about, from where the last range ended to the end of the file;
+	/// `None` once nothing is left to ask about.
+	pub(crate) fn next_query(&self) -> Option<ByteRange> {
+		(self.next < self.end).then(|| ByteRange {
+			offset: self.next,
+			len: self.end - self.next,
+		})
+	}
+
+	/// Takes one call's ranges, each `(StartingOffset, Length)` as the call wrote it; `more` when
+	/// the call said more follow (`ERROR_MORE_DATA`), else the file has none after these.
+	pub(crate) fn take(
+		&mut self,
+		page: impl IntoIterator<Item = (i64, i64)>,
+		more: bool,
+	) -> Result<(), RangeListError> {
+		let mut took = false;
+		for (offset, len) in page {
+			let (Ok(offset), Ok(len)) = (u64::try_from(offset), u64::try_from(len)) else {
+				return Err(RangeListError::Malformed);
+			};
+			let end = offset.checked_add(len).ok_or(RangeListError::Malformed)?;
+			if len == 0 || offset < self.next || end > self.end {
+				return Err(RangeListError::Malformed);
+			}
+			let full = self.ranges.len() >= MAX_PLACEHOLDER_RANGES;
+			match self.ranges.last_mut() {
+				Some(last) if last.offset.checked_add(last.len) == Some(offset) => {
+					last.len = last.len.checked_add(len).ok_or(RangeListError::Malformed)?;
+				}
+				_ if full => return Err(RangeListError::TooMany),
+				_ => self.ranges.push(ByteRange { offset, len }),
+			}
+			self.next = end;
+			took = true;
+		}
+		if !more {
+			self.next = self.end;
+		} else if !took {
+			return Err(RangeListError::NoProgress);
+		}
+		Ok(())
+	}
+
+	/// The ranges taken, in order, none adjacent to another.
+	pub(crate) fn into_ranges(self) -> Vec<ByteRange> {
+		self.ranges
+	}
 }
 
 /// `ERROR_CLOUD_FILE_NOT_UNDER_SYNC_ROOT`: the path is in no sync root.

@@ -21,10 +21,10 @@ use crate::{
 	identity::{IdentityBlob, PlaceholderIdentity},
 	names::PlaceholderName,
 	os::{
-		CheckedHash, DehydrateReason, DehydrateRequest, DehydrateResponder, DeleteRequest,
-		DeleteResponder, EntryOutcome, FileSnapshot, FileStamp, IfPinned, LocalEntry, LocalError,
-		LocalEvent, LocalFileId, LocalFs, LocalKind, PinAttr, PlaceholderState, RenameRequest,
-		RenameResponder, RenameTarget, UnsupportedKind, Updated,
+		ByteRange, CheckedHash, DehydrateReason, DehydrateRequest, DehydrateResponder,
+		DeleteRequest, DeleteResponder, EntryOutcome, FileSnapshot, FileStamp, IfPinned,
+		LocalEntry, LocalError, LocalEvent, LocalFileId, LocalFs, LocalKind, PinAttr,
+		PlaceholderState, RenameRequest, RenameResponder, RenameTarget, UnsupportedKind, Updated,
 	},
 	placeholder::{PlaceholderSpec, SpecKind},
 	root_path::{CaseKey, RootPath, RootPathError},
@@ -35,6 +35,9 @@ use crate::{
 /// The prefix [`LocalFs::upload_path`] gives the fake's paths, which [`FakeLocal::read_upload`]
 /// resolves.
 const UPLOAD_PREFIX: &str = "fake-root:";
+/// The HRESULT of `ERROR_NOT_A_CLOUD_FILE` (376), what a placeholder call on an ordinary file
+/// fails with.
+const NOT_A_CLOUD_FILE: i32 = 0x8007_0178_u32.cast_signed();
 
 /// What the provider did to the fake root, or how a request it answered ended, in order.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -347,6 +350,10 @@ struct FakePlaceholder {
 	identity: IdentityBlob,
 	in_sync: bool,
 	on_disk: u64,
+	/// The ranges on disk of a file whose bytes on disk are not its first `on_disk` ones
+	/// ([`FakeLocal::set_on_disk_ranges`]); `None` for that prefix. Every other change of the bytes
+	/// on disk drops it ([`FakePlaceholder::hold_prefix`]).
+	ranges: Option<Vec<ByteRange>>,
 	modified_bytes: u64,
 	/// A directory's: whether the platform populated it. A file's is always `true`.
 	populated: bool,
@@ -361,9 +368,30 @@ impl FakePlaceholder {
 			identity: identity.encode(),
 			in_sync: true,
 			on_disk,
+			ranges: None,
 			modified_bytes: 0,
 			populated,
 			pin: PinAttr::Unspecified,
+		}
+	}
+
+	/// Holds the first `on_disk` bytes of the file on disk, and no other.
+	fn hold_prefix(&mut self, on_disk: u64) {
+		self.on_disk = on_disk;
+		self.ranges = None;
+	}
+
+	/// The ranges on disk, in order, none adjacent to another.
+	fn on_disk_ranges(&self) -> Vec<ByteRange> {
+		match &self.ranges {
+			Some(ranges) => ranges.clone(),
+			None => (self.on_disk > 0)
+				.then_some(ByteRange {
+					offset: 0,
+					len: self.on_disk,
+				})
+				.into_iter()
+				.collect(),
 		}
 	}
 }
@@ -831,7 +859,30 @@ impl FakeLocal {
 	pub fn set_on_disk(&self, path: &RootPath, on_disk: u64) {
 		let mut state = self.state();
 		let node = state.get_mut(path).expect("the item exists");
-		node.placeholder.as_mut().expect("a placeholder").on_disk = on_disk;
+		node.placeholder
+			.as_mut()
+			.expect("a placeholder")
+			.hold_prefix(on_disk);
+	}
+
+	/// Makes the file placeholder at `path` hold exactly `ranges` of its bytes on disk, given in
+	/// order and none adjacent to another, as a file read in places is.
+	pub fn set_on_disk_ranges(&self, path: &RootPath, ranges: &[ByteRange]) {
+		let mut state = self.state();
+		let node = state.get_mut(path).expect("the item exists");
+		let size = node.size();
+		let placeholder = node.placeholder.as_mut().expect("a placeholder");
+		let mut end = None;
+		for range in ranges {
+			assert!(
+				range.len > 0 && end.is_none_or(|end| range.offset > end),
+				"ranges in order, none empty or adjacent"
+			);
+			end = Some(range.offset + range.len);
+			assert!(end <= Some(size), "ranges within the file");
+		}
+		placeholder.on_disk = ranges.iter().map(|range| range.len).sum();
+		placeholder.ranges = Some(ranges.to_vec());
 	}
 
 	/// Makes the item at `path` a symbolic link.
@@ -950,8 +1001,10 @@ impl FakeLocal {
 		};
 		assert_eq!(held.len(), bytes.len(), "a download fills the file's size");
 		*held = bytes.to_vec();
-		node.placeholder.as_mut().expect("a placeholder").on_disk =
-			u64::try_from(bytes.len()).expect("fits a u64");
+		node.placeholder
+			.as_mut()
+			.expect("a placeholder")
+			.hold_prefix(u64::try_from(bytes.len()).expect("fits a u64"));
 		state.watch.push(LocalEvent::Modified(path.clone()));
 	}
 
@@ -1283,7 +1336,7 @@ impl FakeLocal {
 				placeholder.on_disk, size,
 				"a write to {path} hydrates it first; hydrate it in the test"
 			);
-			placeholder.on_disk = new_len;
+			placeholder.hold_prefix(new_len);
 			if append_only {
 				placeholder.modified_bytes += new_len.saturating_sub(old_len);
 			} else {
@@ -2116,6 +2169,27 @@ impl LocalFs for FakeLocal {
 		Ok(())
 	}
 
+	fn on_disk_ranges(
+		&self,
+		path: &RootPath,
+		expect: LocalFileId,
+	) -> Result<Vec<ByteRange>, LocalError> {
+		let state = self.state();
+		let node = state
+			.get(path)
+			.filter(|node| node.id == expect.get())
+			.ok_or(LocalError::NotFound)?;
+		let (NodeKind::File { .. }, Some(placeholder)) = (&node.kind, &node.placeholder) else {
+			return match node.kind {
+				NodeKind::File { .. } => Err(LocalError::Os(crate::os::OsError::Rejected {
+					code: NOT_A_CLOUD_FILE,
+				})),
+				NodeKind::Dir { .. } => Err(LocalError::NotFound),
+			};
+		};
+		Ok(placeholder.on_disk_ranges())
+	}
+
 	fn copy_to_plain(
 		&self,
 		path: &RootPath,
@@ -2293,7 +2367,7 @@ impl LocalFs for FakeLocal {
 			&& let Some(placeholder) = node.placeholder.as_mut()
 			&& placeholder.on_disk < size
 		{
-			placeholder.on_disk = size;
+			placeholder.hold_prefix(size);
 			let stable = held_stable(placeholder);
 			fill_from(node, stable, source);
 			let path = node.path.clone();
@@ -2376,6 +2450,7 @@ impl LocalFs for FakeLocal {
 			identity: identity.encode(),
 			in_sync,
 			on_disk: size,
+			ranges: None,
 			modified_bytes: if in_sync { 0 } else { size },
 			populated: true,
 			pin: PinAttr::Unspecified,
@@ -2629,7 +2704,7 @@ impl LocalFs for FakeLocal {
 		let placeholder = node.placeholder.as_mut().ok_or(LocalError::NotFound)?;
 		let stable = held_stable(placeholder);
 		if !stall {
-			placeholder.on_disk = size;
+			placeholder.hold_prefix(size);
 			fill_from(node, stable, source);
 		}
 		state.ops.push(LocalOp::Hydrated(path.clone()));
@@ -2761,7 +2836,10 @@ impl LocalFs for FakeLocal {
 			return Err(LocalError::Busy);
 		}
 		let node = state.get_mut(path).expect("found above");
-		node.placeholder.as_mut().expect("found above").on_disk = 0;
+		node.placeholder
+			.as_mut()
+			.expect("found above")
+			.hold_prefix(0);
 		state.ops.push(LocalOp::Dehydrated(path.clone()));
 		state.watch.push(LocalEvent::Modified(path.clone()));
 		Ok(())
@@ -2824,7 +2902,7 @@ impl LocalFs for FakeLocal {
 		*changed = now;
 		let placeholder = node.placeholder.as_mut().expect("found above");
 		placeholder.identity = to.identity().encode();
-		placeholder.on_disk = 0;
+		placeholder.hold_prefix(0);
 		let was_pinned = placeholder.pin == PinAttr::Pinned;
 		state.ops.push(LocalOp::RemoteUpdated {
 			path: path.clone(),
@@ -2949,4 +3027,98 @@ pub fn root_path(text: &str) -> RootPath {
 /// The name `text`: a test helper.
 pub fn name(text: &str) -> PlaceholderName {
 	PlaceholderName::parse(text).expect("a valid name")
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::{os::OsError, test_support::root_path};
+
+	fn file() -> PlaceholderIdentity {
+		PlaceholderIdentity::File {
+			stable: Uuid::from_u128(1),
+			version: Uuid::from_u128(2),
+		}
+	}
+
+	fn local() -> FakeLocal {
+		FakeLocal::new(PlaceholderIdentity::Root {
+			root: Uuid::from_u128(0x100),
+		})
+	}
+
+	fn id(local: &FakeLocal, path: &RootPath) -> LocalFileId {
+		match local.inspect(path).unwrap() {
+			LocalEntry::Placeholder { id, .. } | LocalEntry::Plain { id, .. } => id,
+			entry => panic!("{path}: {entry:?}"),
+		}
+	}
+
+	#[test]
+	fn a_file_holding_a_prefix_reports_it_as_its_one_range_on_disk() {
+		let local = local();
+		let path = root_path("a.bin");
+		local.place_file_with(&path, file(), &[7; 16384], false);
+		let id = id(&local, &path);
+		assert_eq!(local.on_disk_ranges(&path, id), Ok(vec![]));
+		local.set_on_disk(&path, 8192);
+		assert_eq!(
+			local.on_disk_ranges(&path, id),
+			Ok(vec![ByteRange {
+				offset: 0,
+				len: 8192
+			}])
+		);
+	}
+
+	#[test]
+	fn a_file_read_in_places_reports_exactly_those_ranges_until_it_is_hydrated() {
+		let local = local();
+		let path = root_path("a.bin");
+		local.place_file_with(&path, file(), &[7; 16384], false);
+		let id = id(&local, &path);
+		let ranges = [
+			ByteRange {
+				offset: 4096,
+				len: 4096,
+			},
+			ByteRange {
+				offset: 12288,
+				len: 4096,
+			},
+		];
+		local.set_on_disk_ranges(&path, &ranges);
+		assert_eq!(local.on_disk_ranges(&path, id), Ok(ranges.to_vec()));
+		let LocalEntry::Placeholder { state, .. } = local.inspect(&path).unwrap() else {
+			panic!("a placeholder");
+		};
+		assert_eq!(state.on_disk(), 8192);
+		local.hydrate(&path, id).unwrap();
+		assert_eq!(
+			local.on_disk_ranges(&path, id),
+			Ok(vec![ByteRange {
+				offset: 0,
+				len: 16384
+			}])
+		);
+	}
+
+	#[test]
+	fn the_ranges_of_another_item_or_an_ordinary_file_are_refused() {
+		let local = local();
+		let path = root_path("a.bin");
+		local.place_file(&path, file(), b"abc");
+		local.user_create(&root_path("plain.txt"), b"plain");
+		let plain = id(&local, &root_path("plain.txt"));
+		assert_eq!(
+			local.on_disk_ranges(&path, plain),
+			Err(LocalError::NotFound)
+		);
+		assert_eq!(
+			local.on_disk_ranges(&root_path("plain.txt"), plain),
+			Err(LocalError::Os(OsError::Rejected {
+				code: NOT_A_CLOUD_FILE
+			}))
+		);
+	}
 }

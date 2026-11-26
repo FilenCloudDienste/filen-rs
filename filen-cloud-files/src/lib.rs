@@ -69,7 +69,7 @@ pub use local::{
 };
 pub use names::{NameRejection, PlaceholderName};
 pub use os::{
-	AlignedChunk, CancelRequest, CancelledRange, CheckedHash, Completed, DataResponder,
+	AlignedChunk, ByteRange, CancelRequest, CancelledRange, CheckedHash, Completed, DataResponder,
 	DehydrateReason, DehydrateRequest, DehydrateResponder, DeleteRequest, DeleteResponder,
 	EntryOutcome, FetchDataRequest, FileSnapshot, FileStamp, IfPinned, LocalEntry, LocalError,
 	LocalEvent, LocalFileId, LocalFs, LocalKind, LocalWatcher, OptionalRange, OsError, PinAttr,

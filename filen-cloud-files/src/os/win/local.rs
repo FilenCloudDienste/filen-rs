@@ -41,8 +41,8 @@ use crate::{
 	identity::{IdentityBlob, PlaceholderIdentity},
 	names::PlaceholderName,
 	os::{
-		CheckedHash, EntryOutcome, FileSnapshot, FileStamp, IfPinned, LocalEntry, LocalError,
-		LocalFileId, LocalFs, LocalKind, OsError, PinAttr, PlaceholderState, Updated,
+		ByteRange, CheckedHash, EntryOutcome, FileSnapshot, FileStamp, IfPinned, LocalEntry,
+		LocalError, LocalFileId, LocalFs, LocalKind, OsError, PinAttr, PlaceholderState, Updated,
 		cfapi::{
 			CreateValues, E_FAIL, E_INVALIDARG, ERROR_NOT_A_CLOUD_FILE, Hresult, ReparseKind,
 			WideNul, create_values, entry_outcomes, is_partial, local_error, long_path, path_nul,
@@ -412,6 +412,25 @@ impl LocalFs for WinLocalFs {
 			return Err(io_error(&error));
 		}
 		Ok(())
+	}
+
+	/// Through a handle for reading attributes only, which the range query needs (Microsoft's
+	/// documentation of `CfGetPlaceholderRangeInfo`) and which never hydrates a placeholder, its id
+	/// checked through it; the ranges over the file's size as read through it.
+	fn on_disk_ranges(
+		&self,
+		path: &RootPath,
+		expect: LocalFileId,
+	) -> Result<Vec<ByteRange>, LocalError> {
+		let file = open(&self.full(path), FILE_READ_ATTRIBUTES, SHARE_ALL, 0)?;
+		let info = ffi::item_info(&file).map_err(|error| io_error(&error))?;
+		let LocalKind::File(stamp) = kind_of(&file, &info)? else {
+			return Err(LocalError::NotFound);
+		};
+		if info.file_id != expect.get() {
+			return Err(LocalError::NotFound);
+		}
+		ffi::on_disk_ranges(&file, stamp.size).map_err(|error| local_error(error.code))
 	}
 
 	/// Read through a handle for reading shared with every other, after its id and, for a
