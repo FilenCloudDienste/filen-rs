@@ -143,18 +143,8 @@ jobs:
           if [[ $target == *-linux-gnu ]]; then
             export RUSTFLAGS=-Zhigher-ranked-assumptions
           fi
-          # On macOS, compact unwind entries for frames LLVM does not lay out canonically, so
-          # nearly every function leaves __eh_frame for __unwind_info. On aarch64 that also takes
-          # unwind tables that hold only at call sites, which is all a panic needs
-          # (-Zuse-sync-unwind drops the epilogue CFI); on x86_64 the compact unwind flag alone
-          # saves more, and adding -Zuse-sync-unwind grows __text. The config has no Apple target
-          # list, so RUSTFLAGS only has to carry the build-wide flag over. Only the CLI's release
-          # binaries get these flags.
-          if [[ $target == aarch64-apple-darwin ]]; then
-            export RUSTFLAGS="-Zhigher-ranked-assumptions -Zuse-sync-unwind=yes -Cllvm-args=-emit-compact-unwind-non-canonical"
-          elif [[ $target == x86_64-apple-darwin ]]; then
-            export RUSTFLAGS="-Zhigher-ranked-assumptions -Cllvm-args=-emit-compact-unwind-non-canonical"
-          fi
+          # The Apple legs take their unwind flags from .cargo/config.toml's Apple tables, so
+          # RUSTFLAGS stays unset there.
           ${{ matrix.command }} build --profile cli-release --verbose --locked --target $target
         working-directory: ./filen-cli
         env:

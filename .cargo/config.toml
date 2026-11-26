@@ -51,3 +51,22 @@ rustflags = [
 	"-C",
 	"link-arg=-Wl,-z,max-page-size=16384",
 ]
+
+# Apple targets: compact unwind entries for the frames LLVM does not lay out canonically, so
+# nearly every function's unwind info goes to __unwind_info instead of __eh_frame. On aarch64 the
+# unwind tables also hold only at call sites (-Zuse-sync-unwind), which is all a panic needs; on
+# x86_64 that flag grows __text, and the compact unwind flag alone saves more. No [target.<triple>]
+# table matches these targets (cargo would join its rustflags with these), so each list repeats
+# the build-wide flag.
+[target.'cfg(all(target_vendor = "apple", target_arch = "aarch64"))']
+rustflags = [
+	"-Zhigher-ranked-assumptions",
+	"-Zuse-sync-unwind=yes",
+	"-Cllvm-args=-emit-compact-unwind-non-canonical",
+]
+
+[target.'cfg(all(target_vendor = "apple", target_arch = "x86_64"))']
+rustflags = [
+	"-Zhigher-ranked-assumptions",
+	"-Cllvm-args=-emit-compact-unwind-non-canonical",
+]
