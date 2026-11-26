@@ -93,6 +93,10 @@ jobs:
         working-directory: ./filen-sdk-rs/web
         env:
           target: ${{ matrix.target }}
+          # The addon ships without its symbol table, about a quarter of its size. Through
+          # cargo's profile, since napi's --strip would replace RUSTFLAGS and with it the
+          # config's flags.
+          CARGO_PROFILE_RELEASE_STRIP: symbols
       - name: Check the linux-gnu addon's C compiler and glibc floor
         if: endsWith(matrix.target, '-linux-gnu')
         shell: bash

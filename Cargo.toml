@@ -43,7 +43,7 @@ lto = true
 codegen-units = 1
 
 # The CLI's release binaries carry no symbol table: it was a fifth of their size, and nothing
-# reads it. The other release artifacts (the mobile library, the napi addon) keep theirs.
+# reads it. The mobile library keeps its own; npm-publish.yml strips the napi addon.
 [profile.release.package.filen-cli]
 strip = "symbols"
 
