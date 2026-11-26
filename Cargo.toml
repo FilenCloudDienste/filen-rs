@@ -54,10 +54,10 @@ opt-level = "s"
 # filen-cli's cold third-party code at opt-level z: argument parsing and completions, the HTML
 # docs and their local server, prompts and the terminal, YAML, the self-signed certificate for
 # `serve`, the keyring, self-update, version comparison, log files and size formatting. None of it
-# is on a transfer, crypto or cache path. Each crate listed is filen-cli's alone, or reaches the
-# mobile library and the napi addon only as code that never runs there (clap and semver, through
-# uniffi's bindgen and napi-derive's macros). chrono and tracing-subscriber stay at 3: the SDK
-# decodes timestamps and logs through them on every platform.
+# is on a transfer, crypto or cache path. Each crate listed is filen-cli's alone but semver, which
+# reaches the mobile library only as code that never runs there (through uniffi's cargo_metadata),
+# and the napi addon's build only inside napi-derive's macros, which run on the host. chrono and
+# tracing-subscriber stay at 3: the SDK decodes timestamps and logs through them on every platform.
 [profile.release.package.clap]
 opt-level = "z"
 
