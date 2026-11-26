@@ -448,6 +448,81 @@ async fn a_changed_file_the_platform_cannot_make_ordinary_is_kept_as_a_copy_besi
 	assert!(entries.iter().all(|entry| !entry.placeholder));
 }
 
+/// A root holding `edited.txt`, changed, which the platform refuses to make ordinary.
+fn unrevertable_edit() -> FakeLocal {
+	let local = FakeLocal::new(PlaceholderIdentity::Root { root: ACCOUNT_ROOT });
+	local.place_file(&root_path("edited.txt"), file(3), b"old");
+	local.user_write(&root_path("edited.txt"), b"new").unwrap();
+	local.fail_revert(&root_path("edited.txt"), Some(tag_mismatch()));
+	local
+}
+
+/// Whether `path` is a name a copy is written under before it takes its own.
+fn is_copy_name(path: &RootPath) -> bool {
+	crate::names::is_upload_name(path.name().unwrap().as_str())
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_kept_files_copy_takes_its_old_name_only_once_whole() {
+	let local = unrevertable_edit();
+	local.user_create(&root_path("edited.old.txt"), b"the user's own");
+	let platform = platform(&local);
+	let root = Path::new("/r");
+	let (_temp, mut index) = index(root);
+	let outcome = unregister(&platform, &mut index, root, false, "d")
+		.await
+		.unwrap_or_else(|stopped| panic!("{:?}", stopped.error));
+	let copies: Vec<LocalOp> = local
+		.ops()
+		.into_iter()
+		.filter(|op| matches!(op, LocalOp::CopiedToPlain { .. } | LocalOp::Renamed { .. }))
+		.collect();
+	let [
+		LocalOp::CopiedToPlain { from, to: copy },
+		LocalOp::Renamed {
+			from: renamed,
+			to: named,
+		},
+	] = copies.as_slice()
+	else {
+		panic!("{copies:?}");
+	};
+	assert_eq!(from, &root_path("edited.txt"));
+	assert!(is_copy_name(copy), "{copy}");
+	assert_eq!(renamed, copy);
+	assert_eq!(named, &root_path("edited.old.1.txt"));
+	let entries = platform.aside(&outcome.tidied.kept_in.unwrap()).unwrap();
+	assert_eq!(entry(&entries, "edited.old.1.txt").unwrap().bytes, b"new");
+	assert_eq!(
+		entry(&entries, "edited.old.txt").unwrap().bytes,
+		b"the user's own"
+	);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_copy_that_cannot_take_its_old_name_stays_under_its_own_and_stops_the_unregister() {
+	let local = unrevertable_edit();
+	local.fail_rename(LocalError::Busy);
+	let platform = platform(&local);
+	let root = Path::new("/r");
+	let (_temp, mut index) = index(root);
+	let Err(stopped) = unregister(&platform, &mut index, root, false, "d").await else {
+		panic!("the unregister went ahead");
+	};
+	assert_eq!(stopped.error.code, ErrorCode::Os);
+	assert!(matches!(stopped.held, Held::Registered(_)));
+	assert!(!unregistered(&platform, root));
+	let entries = local.entries();
+	assert!(entry(&entries, "edited.old.txt").is_none());
+	let copy = entries
+		.iter()
+		.find(|entry| is_copy_name(&entry.path))
+		.expect("the copy is under its own name");
+	assert_eq!(copy.bytes, b"new");
+	assert!(!copy.placeholder);
+	assert_eq!(entry(&entries, "edited.txt").unwrap().bytes, b"new");
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_changed_file_that_can_be_neither_made_ordinary_nor_copied_stops_the_unregister() {
 	let local = FakeLocal::new(PlaceholderIdentity::Root { root: ACCOUNT_ROOT });

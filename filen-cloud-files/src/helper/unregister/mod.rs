@@ -42,7 +42,7 @@ use crate::{
 	},
 	identity::PlaceholderIdentity,
 	log_safe::path_tag,
-	names::PlaceholderName,
+	names::{PlaceholderName, copy_name},
 	os::{LocalEntry, LocalError, LocalFileId, LocalFs, LocalKind},
 	root_path::RootPath,
 };
@@ -355,7 +355,10 @@ fn settle<L: LocalFs>(
 /// Keeps the kept file `id` at `path`, which the platform refused to make an ordinary file with
 /// `error`, by copying its bytes, all on disk, to a new ordinary file beside it under the first
 /// free `.old` name: the copy is what is kept, and the file is left to the platform's unregister.
-/// Where the copy went, or [`Unsettled::Unkept`] when it could not be made.
+/// The copy is written under a name of its own ([`copy_name`]) and takes its `.old` name only once
+/// whole, so a run killed while it copies leaves no short copy under a name the user reads as the
+/// file's, only one under that name, which nothing uploads. Where the copy went, or
+/// [`Unsettled::Unkept`] when it could not be made.
 fn copy_kept<L: LocalFs>(
 	local: &L,
 	path: &RootPath,
@@ -372,24 +375,39 @@ fn copy_kept<L: LocalFs>(
 		.ok_or_else(|| unkept(error))?
 		.as_str()
 		.to_owned();
-	let mut last = error;
-	for candidate in aside_names(&name).take(COPY_ATTEMPTS) {
-		let Some(to) = PlaceholderName::parse(&candidate)
-			.ok()
-			.and_then(|candidate| path.with_name(candidate))
-		else {
-			continue;
-		};
-		if !matches!(local.inspect(&to), Ok(LocalEntry::Missing)) {
-			continue;
-		}
-		match local.copy_to_plain(path, id, &to) {
+	let copy = PlaceholderName::parse(&copy_name())
+		.ok()
+		.and_then(|copy| path.with_name(copy))
+		.ok_or_else(|| unkept(error))?;
+	local.copy_to_plain(path, id, &copy).map_err(unkept)?;
+	let candidates = aside_names(&name)
+		.take(COPY_ATTEMPTS)
+		.filter_map(|candidate| PlaceholderName::parse(&candidate).ok())
+		.filter_map(|candidate| path.with_name(candidate));
+	name_copy(local, &copy, candidates).map_err(unkept)
+}
+
+/// Gives the whole copy at `copy` the first of `candidates` nothing is at, never over an item put
+/// there meanwhile. Where it went; the last refusal when none was free, the copy left under its
+/// own name, an ordinary file nothing uploads, which a later unregister keeps as it keeps any.
+fn name_copy<L: LocalFs>(
+	local: &L,
+	copy: &RootPath,
+	candidates: impl Iterator<Item = RootPath>,
+) -> Result<RootPath, LocalError> {
+	let mut last = LocalError::Exists;
+	for to in candidates {
+		match local.rename_no_replace(copy, &to) {
 			Ok(()) => return Ok(to),
 			Err(LocalError::Exists) => last = LocalError::Exists,
-			Err(error) => return Err(unkept(error)),
+			Err(error) => {
+				warn!(%error, item = %path_tag(copy), "naming a copy failed; it stays under its own name");
+				return Err(error);
+			}
 		}
 	}
-	Err(unkept(last))
+	warn!(item = %path_tag(copy), "no free name for a copy; it stays under its own name");
+	Err(last)
 }
 
 /// What unregistering a root did.
