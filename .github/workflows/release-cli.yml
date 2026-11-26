@@ -141,7 +141,12 @@ jobs:
           # it; RUSTFLAGS replaces it. Only set it for the gnu targets: it would also replace
           # the Windows targets' `/STACK` link arg, and even an empty value overrides.
           if [[ $target == *-linux-gnu ]]; then
-            export RUSTFLAGS=-Zhigher-ranked-assumptions
+            # aarch64 also repeats the config's -Zuse-sync-unwind.
+            if [[ $target == aarch64-* ]]; then
+              export RUSTFLAGS="-Zhigher-ranked-assumptions -Zuse-sync-unwind=yes"
+            else
+              export RUSTFLAGS=-Zhigher-ranked-assumptions
+            fi
           fi
           # The Apple legs take their unwind flags from .cargo/config.toml's Apple tables, so
           # RUSTFLAGS stays unset there.

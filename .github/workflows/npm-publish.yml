@@ -80,7 +80,12 @@ jobs:
           # on a host of their own architecture, so C code (ring) is compiled by the runner's gcc,
           # never the toolchain's 4.8.5; the next step checks that.
           if [[ $target == *-linux-gnu ]]; then
-            export RUSTFLAGS=-Zhigher-ranked-assumptions
+            # aarch64 also repeats the config's -Zuse-sync-unwind.
+            if [[ $target == aarch64-* ]]; then
+              export RUSTFLAGS="-Zhigher-ranked-assumptions -Zuse-sync-unwind=yes"
+            else
+              export RUSTFLAGS=-Zhigher-ranked-assumptions
+            fi
             npm run build:napi:release -- --target "$target" --use-napi-cross
           else
             npm run build:napi:release -- --target "$target"

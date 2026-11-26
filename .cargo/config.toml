@@ -16,9 +16,19 @@ rustflags = [
 	"getrandom_backend=\"wasm_js\"",
 ]
 
+# aarch64 Linux and Android: unwind tables that hold only at call sites, which is all a panic
+# needs, so the epilogue CFI leaves .eh_frame. Not on x86_64, where it saves nothing.
 [target.aarch64-unknown-linux-gnu]
 linker = "clang"
-rustflags = ["-Zhigher-ranked-assumptions", "-C", "link-arg=--ld-path=wild"]
+rustflags = [
+	"-Zhigher-ranked-assumptions",
+	"-Zuse-sync-unwind=yes",
+	"-C",
+	"link-arg=--ld-path=wild",
+]
+
+[target.aarch64-unknown-linux-musl]
+rustflags = ["-Zhigher-ranked-assumptions", "-Zuse-sync-unwind=yes"]
 
 [target.x86_64-unknown-linux-gnu]
 linker = "clang"
@@ -41,6 +51,7 @@ rustflags = [
 [target.aarch64-linux-android]
 rustflags = [
 	"-Zhigher-ranked-assumptions",
+	"-Zuse-sync-unwind=yes",
 	"-C",
 	"link-arg=-Wl,-z,max-page-size=16384",
 ]
