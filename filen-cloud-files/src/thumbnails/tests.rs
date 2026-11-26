@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use filen_mobile_native_cache::CacheError;
+use filen_sdk_rs::thumbnail::might_be_thumbnailable;
 use filen_types::fs::Uuid;
 
 use super::*;
@@ -1688,9 +1689,15 @@ const HEIF_IMAGES: [(&str, &[u8]); 3] = [
 	),
 ];
 
+/// Whether the SDK in this build decodes HEIF and AVIF. This crate's `heif-decoder` feature turns
+/// that on, and so does any other member of the same cargo run that asks the SDK for it: cargo
+/// builds one SDK for all of them. The SDK's own gate is what knows.
+fn decodes_heif() -> bool {
+	might_be_thumbnailable(Some("a.heic"), None)
+}
+
 /// What a HEIF image's thumbnail at the icon size measures: the photos decoded and fitted into 256
 /// pixels, the grid answered from its embedded 160 x 106 `thmb` item, with no tile decoded.
-#[cfg(feature = "heif-decoder")]
 fn heif_dimensions(name: &str) -> (u32, u32) {
 	if name.starts_with("parrot") {
 		(256, 170)
@@ -1700,8 +1707,13 @@ fn heif_dimensions(name: &str) -> (u32, u32) {
 }
 
 #[cfg(feature = "heif-decoder")]
+#[test]
+fn the_heif_decoder_feature_gives_the_sdk_its_decoder() {
+	assert!(decodes_heif());
+}
+
 #[tokio::test(start_paused = true)]
-async fn heif_and_avif_files_online_only_are_thumbnailed_from_the_drive() {
+async fn heif_and_avif_files_online_only_are_thumbnailed_when_the_sdk_decodes_them() {
 	let setup = served();
 	for (stable, (name, bytes)) in (20..).zip(HEIF_IMAGES) {
 		placed_other(&setup, name, stable, bytes);
@@ -1709,6 +1721,10 @@ async fn heif_and_avif_files_online_only_are_thumbnailed_from_the_drive() {
 
 		let answer = setup.service.request(&full(name), 256).await;
 
+		if !decodes_heif() {
+			assert_eq!(answer, Err(ThumbnailRefusal::Unsupported), "{name}");
+			continue;
+		}
 		assert_eq!(dimensions(answer), heif_dimensions(name), "{name}");
 		// Kept: asked again, it is answered with nothing made.
 		let again = setup.service.request(&full(name), 96).await;
@@ -1720,36 +1736,18 @@ async fn heif_and_avif_files_online_only_are_thumbnailed_from_the_drive() {
 	assert_eq!(setup.local.ops(), vec![]);
 }
 
-#[cfg(feature = "heif-decoder")]
 #[tokio::test(start_paused = true)]
-async fn heif_and_avif_files_on_disk_are_thumbnailed_from_their_bytes() {
+async fn heif_and_avif_files_on_disk_are_thumbnailed_when_the_sdk_decodes_them() {
 	let setup = served();
 	for (name, bytes) in HEIF_IMAGES {
 		setup.local.user_create(&root_path(name), bytes);
 
 		let answer = setup.service.request(&full(name), 256).await;
 
-		assert_eq!(dimensions(answer), heif_dimensions(name), "{name}");
-	}
-}
-
-#[cfg(not(feature = "heif-decoder"))]
-#[tokio::test(start_paused = true)]
-async fn heif_and_avif_files_are_unsupported_without_the_decoder() {
-	let setup = served();
-	for (stable, (name, bytes)) in (20..).zip(HEIF_IMAGES) {
-		placed_other(&setup, name, stable, bytes);
-		assert_eq!(
-			setup.service.request(&full(name), 256).await,
-			Err(ThumbnailRefusal::Unsupported),
-			"{name} online only"
-		);
-		let local = format!("local-{name}");
-		setup.local.user_create(&root_path(&local), bytes);
-		assert_eq!(
-			setup.service.request(&full(&local), 256).await,
-			Err(ThumbnailRefusal::Unsupported),
-			"{name} on disk"
-		);
+		if decodes_heif() {
+			assert_eq!(dimensions(answer), heif_dimensions(name), "{name}");
+		} else {
+			assert_eq!(answer, Err(ThumbnailRefusal::Unsupported), "{name}");
+		}
 	}
 }
