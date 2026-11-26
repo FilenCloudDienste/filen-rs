@@ -82,7 +82,7 @@ impl LocalRoom {
 	pub(super) async fn admits(&mut self, root: &Path, size: u64) -> bool {
 		if let Self::Due(free_space) = *self {
 			let root: PathBuf = root.to_path_buf();
-			*self = match tokio::task::spawn_blocking(move || free_space(&root)).await {
+			*self = match crate::runtime::spawn_blocking(move || free_space(&root)).await {
 				Ok(Ok(free)) => Self::Left(free),
 				Ok(Err(error)) => {
 					tracing::warn!(

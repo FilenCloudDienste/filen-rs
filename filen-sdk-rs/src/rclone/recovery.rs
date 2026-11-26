@@ -359,7 +359,7 @@ pub async fn clear_cache(state_dir: &Path, cache_dir: &Path) -> Result<(), Error
 		}
 	};
 	let cache_dir = cache_dir.to_path_buf();
-	tokio::task::spawn_blocking(move || {
+	crate::runtime::spawn_blocking(move || {
 		let _lock = lock;
 		let pending = dirty_files(&cache_dir.join(VFS_META_DIR))?;
 		if pending > 0 {
@@ -445,7 +445,7 @@ pub(crate) enum MountState {
 #[cfg(unix)]
 pub(crate) async fn mount_state(path: &Path) -> Result<MountState, Error> {
 	let owned = path.to_path_buf();
-	let stat = tokio::task::spawn_blocking(move || stat_mount(&owned));
+	let stat = crate::runtime::spawn_blocking(move || stat_mount(&owned));
 	match tokio::time::timeout(STAT_TIMEOUT, stat).await {
 		Err(_) => Ok(MountState::Stale),
 		Ok(Err(e)) => Err(Error::custom_with_source(

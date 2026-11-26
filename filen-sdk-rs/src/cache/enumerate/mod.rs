@@ -354,7 +354,7 @@ pub(crate) async fn hydrate_cached_items_at(
 	if uuids.is_empty() {
 		return Ok(Vec::new());
 	}
-	tokio::task::spawn_blocking(move || hydrate_by_uuids(&path, &uuids))
+	crate::runtime::spawn_blocking(move || hydrate_by_uuids(&path, &uuids))
 		.await
 		.map_err(|e| {
 			Error::custom(
@@ -395,7 +395,7 @@ impl Client {
 				"cache is not configured; call configure_cache first",
 			)
 		})?;
-		tokio::task::spawn_blocking(move || read_ancestors(&path, uuid))
+		crate::runtime::spawn_blocking(move || read_ancestors(&path, uuid))
 			.await
 			.map_err(|e| {
 				Error::custom(
@@ -448,7 +448,7 @@ impl Client {
 				"cache is not configured; call configure_cache first",
 			)
 		})?;
-		tokio::task::spawn_blocking(move || {
+		crate::runtime::spawn_blocking(move || {
 			let mark = read_subtree_snapshot_into(&path, root, &mut sink)?;
 			Ok::<_, rusqlite::Error>((sink, mark))
 		})
@@ -479,7 +479,7 @@ impl Client {
 				"cache is not configured; call configure_cache first",
 			)
 		})?;
-		tokio::task::spawn_blocking(move || {
+		crate::runtime::spawn_blocking(move || {
 			converged_generation_on(&open_read_connection(&path)?, root)
 		})
 		.await

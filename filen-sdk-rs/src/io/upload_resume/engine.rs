@@ -485,7 +485,7 @@ where
 			return Err(self.changed().await);
 		}
 		let path = self.path.to_owned();
-		let (stat, path) = tokio::task::spawn_blocking(move || (std::fs::metadata(&path), path))
+		let (stat, path) = crate::runtime::spawn_blocking(move || (std::fs::metadata(&path), path))
 			.await
 			.map_err(std::io::Error::from)?;
 		let stat = stat.map_err(|e| {

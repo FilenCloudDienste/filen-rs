@@ -241,7 +241,7 @@ fn running(system: &System, pid: Pid, started_at: u64) -> Option<&sysinfo::Proce
 
 /// Runs `f`, which reads the process table, off the async threads.
 async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Result<T, Error> {
-	tokio::task::spawn_blocking(f).await.map_err(|e| {
+	crate::runtime::spawn_blocking(f).await.map_err(|e| {
 		Error::custom_with_source(
 			ErrorKind::Internal,
 			e,

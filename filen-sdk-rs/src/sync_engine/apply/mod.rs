@@ -3591,7 +3591,7 @@ async fn apply_transfer(
 				// for by the pre-download stash.
 				None => {
 					let landed = path.clone();
-					tokio::task::spawn_blocking(move || hash_file(&landed))
+					crate::runtime::spawn_blocking(move || hash_file(&landed))
 						.await
 						.map_err(|e| {
 							internal_owned(format!("hashing a downloaded file panicked: {e}"))
@@ -4137,7 +4137,7 @@ async fn stash_local_target(
 	let path = local_target(local_root, rel_path);
 	let base = base.cloned();
 	let unsynced =
-		tokio::task::spawn_blocking(move || local_holds_unsynced_content(&path, base.as_ref()))
+		crate::runtime::spawn_blocking(move || local_holds_unsynced_content(&path, base.as_ref()))
 			.await
 			.map_err(|e| internal_owned(format!("reading a local write target panicked: {e}")))?;
 	if unsynced {

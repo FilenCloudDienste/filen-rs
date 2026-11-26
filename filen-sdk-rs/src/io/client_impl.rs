@@ -337,7 +337,7 @@ impl Client {
 						format!("File at path {} was modified during upload", path.display()),
 					));
 				}
-				let res = tokio::task::spawn_blocking(move || (std::fs::metadata(&path), path))
+				let res = crate::runtime::spawn_blocking(move || (std::fs::metadata(&path), path))
 					.await
 					.unwrap();
 				let (new_meta, path) = match res.0 {
@@ -465,7 +465,7 @@ impl Client {
 /// Opens the file at `path` and reads its metadata, on a blocking thread.
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 async fn open_source(path: PathBuf) -> Result<(std::fs::Metadata, std::fs::File, PathBuf), Error> {
-	let (meta, file, path) = tokio::task::spawn_blocking(|| {
+	let (meta, file, path) = crate::runtime::spawn_blocking(|| {
 		let file = std::fs::File::open(&path)?;
 		let meta = file.metadata()?;
 		Ok::<_, std::io::Error>((meta, file, path))
@@ -505,7 +505,7 @@ where
 	let drop_canceller = AtomicDropCanceller::default();
 	let cancelled = Arc::clone(drop_canceller.cancelled());
 	let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
-	let scan = tokio::task::spawn_blocking(move || scan(&events, &cancelled));
+	let scan = crate::runtime::spawn_blocking(move || scan(&events, &cancelled));
 	// The channel closes when `scan` returns and drops its sender.
 	while let Some(event) = received.recv().await {
 		on_event(event);
@@ -595,7 +595,7 @@ pub(super) async fn on_blocking_thread(
 	mut data: Vec<u8>,
 	op: impl FnOnce(&mut std::fs::File, &mut Vec<u8>) -> std::io::Result<()> + Send + 'static,
 ) -> Result<(std::fs::File, Vec<u8>), Error> {
-	let (file, data, done) = tokio::task::spawn_blocking(move || {
+	let (file, data, done) = crate::runtime::spawn_blocking(move || {
 		let done = op(&mut file, &mut data);
 		(file, data, done)
 	})
@@ -694,7 +694,7 @@ impl TmpFileGuard {
 			)
 		})?;
 		let path = parent.join(name);
-		let (path, file, held) = tokio::task::spawn_blocking(move || {
+		let (path, file, held) = crate::runtime::spawn_blocking(move || {
 			let mut file = std::fs::OpenOptions::new()
 				.write(true)
 				.create(true)
@@ -836,7 +836,7 @@ where
 		&& let Some(hash) = remote_file.hash()
 	{
 		let tmp_path = tmp_guard.path().to_path_buf();
-		let matches = tokio::task::spawn_blocking(move || has_hash(&tmp_path, hash))
+		let matches = crate::runtime::spawn_blocking(move || has_hash(&tmp_path, hash))
 			.await
 			.map_err(std::io::Error::from)??;
 		if !matches {
@@ -853,7 +853,7 @@ where
 
 	let file_times = FileTimesExt::get_file_times(remote_file);
 
-	tokio::task::spawn_blocking(move || tmp_file.set_times(file_times))
+	crate::runtime::spawn_blocking(move || tmp_file.set_times(file_times))
 		.await
 		.unwrap()?;
 
@@ -962,7 +962,7 @@ where
 	let mtime = remote_file
 		.last_modified()
 		.unwrap_or_else(|| remote_file.timestamp());
-	let (need_download, path) = tokio::task::spawn_blocking(move || {
+	let (need_download, path) = crate::runtime::spawn_blocking(move || {
 		(needs_download(path.as_ref(), size, hash, mtime, keep), path)
 	})
 	.await

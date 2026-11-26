@@ -1593,6 +1593,124 @@ macro_rules! blocking_join {
 
 pub(crate) use blocking_join;
 
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+mod erased_task {
+	use std::{
+		any::Any,
+		marker::PhantomData,
+		pin::Pin,
+		task::{Context, Poll},
+	};
+
+	use futures::FutureExt;
+	use tokio::task::{JoinError, JoinHandle};
+
+	/// What every [`spawn_blocking`] task runs: the caller's closure, boxed, returning its output
+	/// boxed.
+	type ErasedWork = Box<dyn FnOnce() -> Box<dyn Any + Send> + Send>;
+
+	/// Runs `work` on tokio's blocking thread pool, as [`tokio::task::spawn_blocking`] does, and
+	/// returns a handle that resolves to its output, or to the [`JoinError`] of a panic in it.
+	///
+	/// Every closure runs as the same boxed task type, so tokio's task code (polling,
+	/// completion, cancellation, the join handle) is compiled once for all of them instead of
+	/// once per closure; that is most of what a blocking call site adds to a binary. The price
+	/// is two small allocations per call, one for the closure and one for its output, next to
+	/// the task tokio allocates anyway.
+	///
+	/// `work` starts when this is called, not when the handle is first polled, and dropping the
+	/// handle detaches the task without stopping it, as with tokio's. Must be called from
+	/// within a tokio runtime.
+	pub fn spawn_blocking<T, F>(work: F) -> TaskJoin<T>
+	where
+		F: FnOnce() -> T + Send + 'static,
+		T: Send + 'static,
+	{
+		let work: ErasedWork = Box::new(move || Box::new(work()));
+		TaskJoin::new(tokio::task::spawn_blocking(work))
+	}
+
+	/// The handle of a [`spawn_blocking`] task: a future resolving to the task's output, or to
+	/// the [`JoinError`] of a panic in it.
+	#[derive(Debug)]
+	pub struct TaskJoin<T> {
+		handle: JoinHandle<Box<dyn Any + Send>>,
+		/// The type the task's boxed output is taken back out as. `fn() -> T` so that the handle
+		/// is `Send` and `Sync` whatever `T` is: it holds no `T` until it hands one out.
+		output: PhantomData<fn() -> T>,
+	}
+
+	impl<T> TaskJoin<T> {
+		fn new(handle: JoinHandle<Box<dyn Any + Send>>) -> Self {
+			Self {
+				handle,
+				output: PhantomData,
+			}
+		}
+	}
+
+	impl<T: 'static> Future for TaskJoin<T> {
+		type Output = Result<T, JoinError>;
+
+		fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+			self.handle.poll_unpin(cx).map(|joined| {
+				joined.map(|output| {
+					*output.downcast::<T>().expect(
+						"a TaskJoin<T>'s task returns a T, as its spawn boxed it (should be impossible)",
+					)
+				})
+			})
+		}
+	}
+
+	#[cfg(test)]
+	mod tests {
+		use std::time::Duration;
+
+		use super::spawn_blocking;
+
+		#[tokio::test]
+		async fn a_task_resolves_to_the_output_of_its_closure() {
+			let joined = spawn_blocking(|| String::from("blocking output")).await;
+			assert_eq!(joined.unwrap(), "blocking output");
+		}
+
+		#[tokio::test]
+		async fn tasks_of_different_output_types_resolve_each_to_its_own() {
+			let number = spawn_blocking(|| 42_u64);
+			let pair = spawn_blocking(|| (vec![1_u8, 2, 3], 'x'));
+			assert_eq!(pair.await.unwrap(), (vec![1_u8, 2, 3], 'x'));
+			assert_eq!(number.await.unwrap(), 42);
+		}
+
+		#[tokio::test]
+		async fn a_panic_in_the_closure_resolves_to_a_panic_join_error() {
+			let joined = spawn_blocking(|| -> u32 { panic!("the closure panicked") }).await;
+			let error = joined.unwrap_err();
+			assert!(error.is_panic());
+			let payload = error.into_panic();
+			assert_eq!(
+				payload.downcast_ref::<&str>(),
+				Some(&"the closure panicked")
+			);
+		}
+
+		#[tokio::test]
+		async fn a_dropped_handle_leaves_the_task_running() {
+			let (finished, done) = tokio::sync::oneshot::channel();
+			drop(spawn_blocking(move || finished.send("ran")));
+			// Only bounds a failure: a task stopped with its handle never sends.
+			let sent = tokio::time::timeout(Duration::from_secs(30), done)
+				.await
+				.expect("the detached task never ran");
+			assert_eq!(sent, Ok("ran"));
+		}
+	}
+}
+
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+pub use erased_task::{TaskJoin, spawn_blocking};
+
 #[cfg(all(
 	test,
 	feature = "multi-threaded-crypto",

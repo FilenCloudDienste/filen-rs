@@ -667,7 +667,7 @@ impl RcloneDaemon {
 		if roots.is_empty() {
 			return Ok(queued);
 		}
-		let dirty = tokio::task::spawn_blocking(move || {
+		let dirty = crate::runtime::spawn_blocking(move || {
 			roots.iter().try_fold(0_u32, |dirty, root| {
 				dirty::count_dirty(root).map(|n| dirty.saturating_add(n))
 			})

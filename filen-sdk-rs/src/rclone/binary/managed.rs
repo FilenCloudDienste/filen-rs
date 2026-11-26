@@ -224,7 +224,7 @@ async fn download_verified(
 /// Extracts the zip entry `entry` of the zip at `zip_path` to `binary_path`, executable on Unix.
 async fn extract_rclone(zip_path: &Path, entry: String, binary_path: &Path) -> Result<(), Error> {
 	let (zip_path, binary_path) = (zip_path.to_path_buf(), binary_path.to_path_buf());
-	tokio::task::spawn_blocking(move || -> Result<(), Error> {
+	crate::runtime::spawn_blocking(move || -> Result<(), Error> {
 		let zip_file =
 			std::fs::File::open(&zip_path).context("Failed to open the downloaded Rclone zip")?;
 		let mut zip = zip::ZipArchive::new(zip_file).map_err(|e| {

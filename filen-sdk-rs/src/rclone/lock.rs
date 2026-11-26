@@ -46,7 +46,7 @@ pub(crate) fn try_lock(path: &Path) -> io::Result<Option<FileLock>> {
 /// Takes the lock on the file at `path`, created (0600 on Unix) if it is missing, waiting for the
 /// holder to release it. The wait runs on a blocking thread.
 pub(crate) async fn lock(path: PathBuf) -> Result<FileLock, Error> {
-	tokio::task::spawn_blocking(move || {
+	crate::runtime::spawn_blocking(move || {
 		let file = open(&path).and_then(|file| file.lock().map(|()| file));
 		match file {
 			Ok(file) => Ok(FileLock { file }),

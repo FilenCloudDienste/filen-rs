@@ -156,7 +156,7 @@ impl FileUploadJournalStore {
 
 	/// [`Self::open`], with `now` as the current time.
 	pub(crate) async fn open_at(dir: PathBuf, now: DateTime<Utc>) -> Result<Self, Error> {
-		let dir = tokio::task::spawn_blocking(move || {
+		let dir = crate::runtime::spawn_blocking(move || {
 			prepare_dir(&dir)?;
 			purge(&dir, now)?;
 			Ok::<_, Error>(dir)
@@ -183,7 +183,7 @@ impl UploadJournalStore for FileUploadJournalStore {
 	) -> MaybeSendBoxFuture<'a, Result<Option<SealedUploadJournal>, Error>> {
 		let path = self.journal_path(id);
 		Box::pin(async move {
-			let (path, read) = tokio::task::spawn_blocking(move || {
+			let (path, read) = crate::runtime::spawn_blocking(move || {
 				let read = std::fs::read(&path);
 				(path, read)
 			})
@@ -223,7 +223,7 @@ impl UploadJournalStore for FileUploadJournalStore {
 		})
 		.expect("a journal file is a number and a string (should be impossible)");
 		Box::pin(async move {
-			let (path, written) = tokio::task::spawn_blocking(move || {
+			let (path, written) = crate::runtime::spawn_blocking(move || {
 				let written = write_private_file_atomically(&temp, &path, &contents);
 				(path, written)
 			})
@@ -236,7 +236,7 @@ impl UploadJournalStore for FileUploadJournalStore {
 	fn remove<'a>(&'a self, id: &'a UploadJournalId) -> MaybeSendBoxFuture<'a, Result<(), Error>> {
 		let path = self.journal_path(id);
 		Box::pin(async move {
-			let (path, removed) = tokio::task::spawn_blocking(move || {
+			let (path, removed) = crate::runtime::spawn_blocking(move || {
 				let removed = remove_file_if_present(&path);
 				(path, removed)
 			})

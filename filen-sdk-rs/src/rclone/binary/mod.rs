@@ -120,7 +120,7 @@ impl RcloneBinary {
 /// `path` once it is known to be a file and, with `sha256`, to hash to it. Takes the path by value
 /// to move it into the blocking task that hashes the file, and to return it.
 async fn resolve_bundled(path: PathBuf, sha256: Option<[u8; 32]>) -> Result<PathBuf, Error> {
-	tokio::task::spawn_blocking(move || {
+	crate::runtime::spawn_blocking(move || {
 		let mut file = match std::fs::File::open(&path) {
 			Ok(file) if file.metadata()?.is_file() => file,
 			Ok(_) => return Err(RcloneRefusal::BinaryMissing.into()),

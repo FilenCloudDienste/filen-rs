@@ -1108,7 +1108,7 @@ mod remote_chunks {
 		let cancel = Arc::new(AtomicBool::new(false));
 		let mut guard = CancelOnDrop(Some(cancel.clone()));
 		let source = source(client, cancel)?;
-		let joined = tokio::task::spawn_blocking(move || {
+		let joined = crate::runtime::spawn_blocking(move || {
 			let _decode_permit = decode_permit;
 			job(source)
 		})

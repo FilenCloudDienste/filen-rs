@@ -1732,7 +1732,7 @@ async fn off_runtime<T>(what: &str, work: impl FnOnce() -> T + Send + 'static) -
 where
 	T: Send + 'static,
 {
-	tokio::task::spawn_blocking(work)
+	crate::runtime::spawn_blocking(work)
 		.await
 		.map_err(|e| Error::custom(ErrorKind::Internal, format!("{what} panicked: {e}")))
 }
