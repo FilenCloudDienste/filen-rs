@@ -12,7 +12,8 @@ use crate::{
 	js::AnyNormalDir,
 };
 
-// Managed futures are not on napi yet, nor the uploads that take one.
+// Only the wasm and uniffi upload params hold a ManagedFuture: napi's uploads read theirs out of a
+// plain object when the call is made.
 #[cfg(any(feature = "wasm-full", feature = "uniffi"))]
 use crate::js::ManagedFuture;
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
@@ -21,7 +22,7 @@ use {
 	web_sys::js_sys::{self},
 };
 
-#[js_type(import, no_ser)]
+#[js_type(import, no_ser, napi)]
 pub struct FileBuilderParams {
 	pub parent: AnyNormalDir,
 	pub name: String,
@@ -126,8 +127,6 @@ pub struct UploadFileParams {
 	pub managed_future: ManagedFuture,
 }
 
-// Only the upload params, which napi does not build yet, turn these into a file builder.
-#[cfg_attr(feature = "napi", allow(dead_code))]
 impl FileBuilderParams {
 	pub(crate) fn into_file_builder(self, client: &Client) -> Result<FileBuilder, Error> {
 		let mut file_builder = client.make_file_builder(
@@ -204,6 +203,7 @@ mod napi_tests {
 
 	type ParentWire = <AnyNormalDir as Wire>::Wire;
 	type OptionalNameWire = <FileBuilderParamsOptionalName as Wire>::Wire;
+	type ParamsWire = <FileBuilderParams as Wire>::Wire;
 
 	fn root() -> ParentWire {
 		ParentWire::Root {
@@ -245,5 +245,35 @@ mod napi_tests {
 		let params = optional_name_params(Some(false), Some(true));
 		assert!(!params.no_exif);
 		assert!(params.no_exif_override);
+	}
+
+	fn params(no_exif: Option<bool>, no_exif_override: Option<bool>) -> FileBuilderParams {
+		FileBuilderParams::from_wire(ParamsWire {
+			parent: root(),
+			name: "a.txt".to_owned(),
+			created: None,
+			modified: None,
+			mime: None,
+			no_exif,
+			no_exif_override,
+		})
+		.unwrap()
+	}
+
+	#[test]
+	fn params_without_the_exif_flags_read_them_as_false() {
+		let params = params(None, None);
+		assert!(!params.no_exif);
+		assert!(!params.no_exif_override);
+	}
+
+	#[test]
+	fn params_keep_the_exif_flags_they_are_given() {
+		let given = params(Some(true), Some(false));
+		assert!(given.no_exif);
+		assert!(!given.no_exif_override);
+		let given = params(Some(false), Some(true));
+		assert!(!given.no_exif);
+		assert!(given.no_exif_override);
 	}
 }

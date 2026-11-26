@@ -453,6 +453,33 @@ describe("transfers against the server", { skip: email && password ? false : "TE
 		assert.deepEqual(readdirSync(target), ["copy.bin"], "a temp file was left beside the download")
 	})
 
+	/** Downloads `file` to a new local directory `name` and returns the bytes it holds. */
+	const downloadBack = async (file, name) => {
+		const path = join(localDir(name), "copy.bin")
+		await client.downloadFileToPath(asAnyFile(file), path, undefined, noSignals)
+		return readFileSync(path)
+	}
+
+	const digest = bytes => createHash("sha256").update(bytes).digest("hex")
+
+	for (const [what, size] of [
+		["zero bytes make an empty file", 0],
+		["bytes larger than one chunk", 3 * 1024 * 1024 + 17]
+	]) {
+		test(`a file uploaded from memory: ${what}, which downloads back the same`, async () => {
+			const data = randomBytes(size)
+			const name = `from-bytes-${size}.bin`
+			const file = await client.uploadFileFromBytes(data, {
+				fileBuilderParams: { parent: asNormalDir(remote), name },
+				managedFuture: noSignals
+			})
+			assert.equal(file.size, BigInt(size))
+			assert.equal(file.meta.tag, FileMeta_Tags.Decoded)
+			assert.equal(file.meta.inner[0].name, name)
+			assert.equal(digest(await downloadBack(file, `from-bytes-${size}`)), digest(data))
+		})
+	}
+
 	test("a download paused before it starts makes no progress until resumed", async () => {
 		assert.ok(small, "the upload test did not run")
 		const target = localDir("paused")

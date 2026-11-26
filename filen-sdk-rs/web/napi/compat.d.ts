@@ -55,7 +55,9 @@
  * napi has no ManagedFuture.create: a managed call takes a plain object, whose abortSignal and
  * pauseSignal are a ManagedAbortSignal and a PauseSignal or undefined.
  *
- * Bytes cross as a Uint8Array where ubrn has an ArrayBuffer: napi has no owned ArrayBuffer.
+ * Bytes cross as a Uint8Array where ubrn has an ArrayBuffer: napi has no owned ArrayBuffer. A
+ * Buffer is one. uploadFileFromBytes copies its data once, when the call is made, so changing the
+ * array afterwards does not change the upload.
  *
  * A data enum (AnyFile, ParentUuid, FileMeta and the rest) is a plain { tag, inner } object,
  * not an instance of a class as ubrn's are: build one as an object literal, its tag taken from
@@ -97,6 +99,14 @@ export type MaybeEncryptedStatic = MaybeEncryptedUniffi
 export type ManagedFuture = {
 	abortSignal: ManagedAbortSignalInterface | undefined
 	pauseSignal: PauseSignalInterface | undefined
+}
+
+/**
+ * How uploadFileFromBytes names and places the file, and what it can be paused and aborted through.
+ */
+export type UploadFileParams = {
+	fileBuilderParams: FileBuilderParams
+	managedFuture: ManagedFuture
 }
 
 /**

@@ -1,6 +1,6 @@
-//! The path transfers' napi exports, which take callback objects the macros cannot read:
-//! `JsClient.downloadFileToPath`, `JsClient.uploadFile`, `JsClient.downloadDirRecursively` and
-//! `JsClient.uploadDirRecursively`.
+//! The file transfers' napi exports, which take callback objects or params the macros cannot
+//! read: `JsClient.downloadFileToPath`, `JsClient.uploadFile`, `JsClient.downloadDirRecursively`
+//! and `JsClient.uploadDirRecursively`, and the upload from memory, `JsClient.uploadFileFromBytes`.
 //!
 //! A call's callback object becomes one [`Listener`], read and bound on the JS thread when the call
 //! is made; the SDK's progress reaches it from the commander runtime without waiting on JS. Every
@@ -15,7 +15,9 @@ use std::{path::PathBuf, sync::Arc};
 
 use napi::{
 	Env,
-	bindgen_prelude::{BigInt, Either, FnArgs, FunctionRef, Object, PromiseRaw, Undefined},
+	bindgen_prelude::{
+		BigInt, Either, FnArgs, FunctionRef, JsObjectValue, Object, PromiseRaw, Undefined,
+	},
 };
 
 use super::{DownloadError, PathToStringExt, UploadError};
@@ -24,10 +26,10 @@ use crate::{
 	fs::categories::{Category, NonRootItemType, fs::CategoryFS},
 	io::{DirDownloadCallback, DirUploadCallback, RemoteDirectory, RemoteFile},
 	js::{
-		AnyDirWithContext, AnyFile, Dir, DirWithPath, File, FileBuilderParamsOptionalName,
-		FileWithPath, NonRootDir, NonRootItem,
+		AnyDirWithContext, AnyFile, Dir, DirWithPath, File, FileBuilderParams,
+		FileBuilderParamsOptionalName, FileWithPath, NonRootDir, NonRootItem,
 		napi::{
-			FromWire, IntoWire, Listener, ListenerCall, OptionReturn, Wire, bound_method,
+			FromWire, IntoWire, Listener, ListenerCall, OptionReturn, Wire, bound_method, bytes,
 			read_managed_future, spawn_promise,
 		},
 	},
@@ -126,6 +128,42 @@ fn upload_file<'env>(
 			listener.flushed().await;
 		}
 		uploaded
+	})
+}
+
+/// `uploadFileFromBytes`'s body, as uniffi's `upload_file_from_bytes`: `data` becomes a file as
+/// `params.fileBuilderParams` describe it, zero bytes an empty one, under `params.managedFuture`.
+/// No progress is reported, as on uniffi. A `params` without a `managedFuture` object throws napi's
+/// own error synchronously; file params or a managed future the SDK cannot read reject.
+// napi-derive registers the method calling this only outside `cfg(test)`.
+#[cfg_attr(test, allow(dead_code))]
+fn upload_file_from_bytes<'env>(
+	client: &auth::JsClient,
+	env: &'env Env,
+	data: bytes::Bytes,
+	params: Object<'env>,
+	async_opts: Option<Object<'env>>,
+) -> napi::Result<PromiseRaw<'env, <File as Wire>::Wire>> {
+	// The one copy of the data, here on the JS thread: JS may change its buffer once this returns.
+	let data = bytes::read(data);
+	// Read as napi reads an argument of that type, which checks it is an object field by field.
+	let file_builder_params = FileBuilderParams::from_wire(
+		params.get_named_property_unchecked::<<FileBuilderParams as Wire>::Wire>(
+			"fileBuilderParams",
+		)?,
+	);
+	let managed_future =
+		read_managed_future(&params.get_named_property::<Object>("managedFuture")?)?;
+	let client = client.inner();
+	spawn_promise(env, async_opts, async move {
+		let file_builder_params = file_builder_params?;
+		let managed_future = managed_future?;
+		managed_future
+			.into_js_managed_commander_future(move || async move {
+				let builder = file_builder_params.into_file_builder(&client)?;
+				client.upload_file(builder, &data).await.map(File::from)
+			})
+			.await
 	})
 }
 
@@ -597,10 +635,11 @@ mod class {
 
 	use super::{
 		download_dir_recursively, download_file_to_path, upload_dir_recursively, upload_file,
+		upload_file_from_bytes,
 	};
 	use crate::js::{
 		AnyDirWithContext, AnyFile, Dir, File, FileBuilderParamsOptionalName,
-		napi::{JsClient, Wire},
+		napi::{JsClient, Wire, bytes},
 	};
 
 	#[napi]
@@ -659,6 +698,23 @@ mod class {
 				managed_future,
 				async_opts,
 			)
+		}
+
+		/// Upload `data` as a file `params.fileBuilderParams` describes; zero bytes make an empty
+		/// file. The bytes are copied once, when the call is made.
+		#[napi(
+			js_name = "uploadFileFromBytes",
+			ts_args_type = "data: Uint8Array, params: UploadFileParams, asyncOpts_?: { signal: AbortSignal }",
+			ts_return_type = "Promise<File>"
+		)]
+		pub fn __napi_upload_file_from_bytes<'env>(
+			&self,
+			env: &'env Env,
+			data: bytes::Bytes,
+			params: Object<'env>,
+			async_opts: Option<Object<'env>>,
+		) -> napi::Result<PromiseRaw<'env, <File as Wire>::Wire>> {
+			upload_file_from_bytes(&self.0, env, data, params, async_opts)
 		}
 
 		/// Download `target` and everything below it into the local directory `dirPath`, each

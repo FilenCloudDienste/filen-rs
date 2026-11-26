@@ -6,7 +6,7 @@ import assert from "node:assert/strict"
 import { spawnSync } from "node:child_process"
 import { generateKeyPairSync, randomUUID } from "node:crypto"
 import { once } from "node:events"
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs"
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import { performance } from "node:perf_hooks"
@@ -950,6 +950,113 @@ describe("transfers, offline", () => {
 		)
 		assert.deepEqual(updates, [])
 	})
+
+	// uploadFileFromBytes' params: a file into the root of a synthesized account, noExif and
+	// noExifOverride left to their defaults.
+	const bytesParams = (managedFuture = noSignals, name = "a.txt", flags = {}) => ({
+		fileBuilderParams: {
+			parent: { tag: AnyNormalDir_Tags.Root, inner: [{ uuid: randomUUID() }] },
+			name,
+			...flags
+		},
+		managedFuture
+	})
+
+	test("uploadFileFromBytes is a JsClient method typed as ubrn's, its bytes a Uint8Array", () => {
+		assert.equal(typeof JsClient.prototype.uploadFileFromBytes, "function")
+		const typings = readFileSync(join(webDir, "node", "index.d.ts"), "utf8")
+		assert.ok(
+			typings.includes(
+				"  uploadFileFromBytes(data: Uint8Array, params: UploadFileParams, asyncOpts_?: { signal: AbortSignal }): Promise<File>\n"
+			),
+			"uploadFileFromBytes' typing"
+		)
+		assert.match(typings, /^export type UploadFileParams = \{\n\tfileBuilderParams: FileBuilderParams\n\tmanagedFuture: ManagedFuture\n\}$/m)
+		assert.match(
+			typings,
+			/^export interface FileBuilderParams \{\n(?: {2}.*\n)*? {2}noExif\?: boolean \| undefined\n(?: {2}.*\n)*? {2}noExifOverride\?: boolean \| undefined\n\}$/m
+		)
+	})
+
+	test("uploadFileFromBytes with noExif and noExifOverride set gets past argument conversion", async () => {
+		await assert.rejects(
+			synthClient(randomUUID()).uploadFileFromBytes(new Uint8Array(1), bytesParams(noSignals, "a.txt", { noExif: true, noExifOverride: true }), {
+				signal: AbortSignal.abort()
+			}),
+			e => {
+				assert.equal(e.name, "AbortError")
+				return true
+			}
+		)
+	})
+
+	for (const [what, data] of [
+		["an empty Uint8Array", new Uint8Array(0)],
+		["a Buffer", Buffer.from("abc")]
+	]) {
+		test(`uploadFileFromBytes of ${what} with an aborted signal rejects with an AbortError`, async () => {
+			await assert.rejects(
+				synthClient(randomUUID()).uploadFileFromBytes(data, bytesParams(), { signal: AbortSignal.abort() }),
+				e => {
+					assert.equal(e.name, "AbortError")
+					assert.equal(FilenSdkError.hasInner(e), false)
+					return true
+				}
+			)
+		})
+	}
+
+	test("uploadFileFromBytes with an aborted ManagedAbortSignal rejects as Cancelled", async () => {
+		const controller = new ManagedAbortController()
+		controller.abort()
+		await assert.rejects(
+			synthClient(randomUUID()).uploadFileFromBytes(
+				new Uint8Array([1, 2, 3]),
+				bytesParams({ abortSignal: controller.signal(), pauseSignal: undefined })
+			),
+			e => {
+				assert.equal(assertThrownLikeUbrn(e).kind(), ErrorKind.Cancelled)
+				return true
+			}
+		)
+	})
+
+	test("uploadFileFromBytes with a parent uuid that is not one rejects with a conversion error", async () => {
+		const params = bytesParams()
+		params.fileBuilderParams.parent.inner[0].uuid = "not-a-uuid"
+		const pending = synthClient(randomUUID()).uploadFileFromBytes(new Uint8Array(1), params)
+		assert.ok(pending instanceof Promise)
+		await assert.rejects(pending, e => {
+			assert.equal(assertThrownLikeUbrn(e).kind(), ErrorKind.Conversion)
+			return true
+		})
+	})
+
+	test("uploadFileFromBytes with a null abortSignal rejects with a conversion error", async () => {
+		await assert.rejects(
+			synthClient(randomUUID()).uploadFileFromBytes(new Uint8Array(1), bytesParams({ abortSignal: null, pauseSignal: undefined })),
+			e => {
+				assert.equal(assertThrownLikeUbrn(e).kind(), ErrorKind.Conversion)
+				return true
+			}
+		)
+	})
+
+	for (const [what, call] of [
+		["params without a managedFuture", client => client.uploadFileFromBytes(new Uint8Array(1), { fileBuilderParams: bytesParams().fileBuilderParams })],
+		["an ArrayBuffer for its data", client => client.uploadFileFromBytes(new ArrayBuffer(1), bytesParams())]
+	]) {
+		test(`uploadFileFromBytes with ${what} throws napi's own error`, () => {
+			assert.throws(
+				() => call(synthClient(randomUUID())),
+				e => {
+					assert.ok(e instanceof Error)
+					assert.equal(FilenSdkError.hasInner(e), false)
+					return true
+				}
+			)
+		})
+	}
 
 	// A JsDirDownloadCallback recording its calls by method name, without the methods `without`.
 	function dirDownloadCallback(calls, without = []) {
