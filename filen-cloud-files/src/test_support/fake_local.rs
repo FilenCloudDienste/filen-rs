@@ -23,8 +23,10 @@ use crate::{
 	os::{
 		ByteRange, CheckedHash, DehydrateReason, DehydrateRequest, DehydrateResponder,
 		DeleteRequest, DeleteResponder, EntryOutcome, FileSnapshot, FileStamp, IfPinned,
-		LocalEntry, LocalError, LocalEvent, LocalFileId, LocalFs, LocalKind, PinAttr,
-		PlaceholderState, RenameRequest, RenameResponder, RenameTarget, UnsupportedKind, Updated,
+		IncompleteCopy, LocalEntry, LocalError, LocalEvent, LocalFileId, LocalFs, LocalKind,
+		PinAttr, PlaceholderState, RenameRequest, RenameResponder, RenameTarget, UnsupportedKind,
+		Updated,
+		incomplete::{self, CopyFailure},
 	},
 	placeholder::{PlaceholderSpec, SpecKind},
 	root_path::{CaseKey, RootPath, RootPathError},
@@ -35,9 +37,6 @@ use crate::{
 /// The prefix [`LocalFs::upload_path`] gives the fake's paths, which [`FakeLocal::read_upload`]
 /// resolves.
 const UPLOAD_PREFIX: &str = "fake-root:";
-/// The HRESULT of `ERROR_NOT_A_CLOUD_FILE` (376), what a placeholder call on an ordinary file
-/// fails with.
-const NOT_A_CLOUD_FILE: i32 = 0x8007_0178_u32.cast_signed();
 
 /// What the provider did to the fake root, or how a request it answered ended, in order.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -123,12 +122,16 @@ pub enum LocalOp {
 	Reverted(RootPath),
 	/// A file's bytes were copied into the new ordinary file `to`.
 	CopiedToPlain { from: RootPath, to: RootPath },
+	/// What was on disk of a file was copied into the new ordinary file `to`, the rest zeros.
+	CopiedOnDisk { from: RootPath, to: RootPath },
+	/// The provider created the ordinary file at the path.
+	CreatedPlain(RootPath),
 	/// The provider opened the file at the path as a guard, which refuses every writer.
 	Guarded(RootPath),
 }
 
-/// How the provider is connected to the fake root, which changes what its calls can ask of the
-/// provider, as on Windows.
+/// How the provider is connected to the fake root, which changes what its own calls see and what
+/// a user's write does, as on Windows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FakeConnection {
 	/// Connected to serve: the platform asks the provider for what a call needs.
@@ -138,7 +141,8 @@ pub enum FakeConnection {
 	///
 	/// [`Platform::connect_refusing`]: crate::helper::Platform::connect_refusing
 	Refusing,
-	/// Not connected: what needs the provider fails.
+	/// Not connected. Measured (Windows 11, in the VM, twice): the provider's own state reads then
+	/// see every placeholder disguised as an ordinary item, as other processes always do.
 	Disconnected,
 }
 
@@ -231,6 +235,8 @@ struct LocalState {
 	/// `ERROR_NOT_A_CLOUD_FILE` race leaves a file.
 	stall_hydration: bool,
 	fail_rename: Option<LocalError>,
+	/// Fails the next ordinary file created with its bytes.
+	fail_create_plain: Option<LocalError>,
 	/// Paths whose next allowed delete or rename fails after the answer.
 	fail_completion: HashSet<CaseKey>,
 	/// Directories that hold, beside their items, one whose name is not valid Unicode.
@@ -254,6 +260,8 @@ struct LocalState {
 	fail_copy: HashMap<CaseKey, LocalError>,
 	/// How many more reverts to plain before a test kills the helper.
 	kill_after_reverts: Option<u32>,
+	/// How many more copies of what is on disk before a test kills the helper.
+	kill_after_copies: Option<u32>,
 	/// Every read of where an open item is now fails with this, while set.
 	fail_handle_paths: Option<LocalError>,
 	/// Paths at or under which the watcher's events reach no job ([`FakeLocal::swallow_events`]).
@@ -263,6 +271,30 @@ struct LocalState {
 	/// How the provider is connected; [`FakeConnection::Serving`] until the fake platform changes
 	/// it.
 	connection: FakeConnection,
+	/// What a test runs once the provider's next copy of what is on disk of a file is made.
+	after_copy: Option<Hook>,
+	/// What a test runs once the provider's next read of a file's ranges on disk returns.
+	after_ranges: Option<Hook>,
+	/// Paths every read of a range not on disk of which waits out the platform's limit and fails
+	/// with `ERROR_CLOUD_FILE_REQUEST_TIMEOUT`, as a file left with a fetch nobody serves does
+	/// (measured on Windows); any other file's such read is refused.
+	stuck_reads: HashSet<CaseKey>,
+	/// Paths whose reads by a copy of what is on disk come back short, while set.
+	short_reads: HashSet<CaseKey>,
+	/// Paths every read of a range on disk of which, by a copy of what is on disk, waits out the
+	/// platform's limit and fails with `ERROR_CLOUD_FILE_REQUEST_TIMEOUT`, while set: as the
+	/// provider's read of a range on disk of a file left with a fetch in flight was once seen to
+	/// (measured on Windows, not reproduced).
+	stalled_reads: HashSet<CaseKey>,
+}
+
+/// What a test runs when the fake reaches a point.
+struct Hook(Box<dyn FnOnce() + Send>);
+
+impl fmt::Debug for Hook {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		f.write_str("Hook")
+	}
 }
 
 /// The HRESULT of `ERROR_CLOUD_FILE_AUTHENTICATION_FAILED` (386), what a request a root connected
@@ -271,6 +303,14 @@ const REFUSED: i32 = 0x8007_0182_u32.cast_signed();
 /// The HRESULT of `ERROR_CLOUD_FILE_PROVIDER_NOT_RUNNING` (362), what a request with no provider
 /// connected fails with.
 const NOT_RUNNING: i32 = 0x8007_016A_u32.cast_signed();
+/// The HRESULT of `ERROR_NOT_A_CLOUD_FILE` (376), what a placeholder call on an ordinary file
+/// fails with.
+const NOT_A_CLOUD_FILE: i32 = 0x8007_0178_u32.cast_signed();
+/// The HRESULT of `ERROR_CLOUD_FILE_REQUEST_TIMEOUT` (426), what a read waiting on a fetch nobody
+/// serves fails with at the platform's limit (measured, about 2 minutes).
+const TIMED_OUT: i32 = 0x8007_01AA_u32.cast_signed();
+/// `E_FAIL`, what the Windows layer answers for a copy that found the file changed.
+const FAILED: i32 = 0x8000_4005_u32.cast_signed();
 /// The HRESULT of `ERROR_ACCESS_DENIED` (5), what another process's open of a file left delete
 /// pending fails with (measured).
 const ACCESS_DENIED: i32 = 0x8007_0005_u32.cast_signed();
@@ -393,6 +433,14 @@ impl FakePlaceholder {
 				.into_iter()
 				.collect(),
 		}
+	}
+
+	/// Whether the `len` bytes at `offset` are all on disk.
+	fn holds(&self, offset: u64, len: u64) -> bool {
+		let end = offset.saturating_add(len);
+		self.on_disk_ranges()
+			.iter()
+			.any(|range| range.offset <= offset && end <= range.offset.saturating_add(range.len))
 	}
 }
 
@@ -728,6 +776,7 @@ impl FakeLocal {
 			fail_hydrations: None,
 			stall_hydration: false,
 			fail_rename: None,
+			fail_create_plain: None,
 			fail_completion: HashSet::new(),
 			unrepresentable: HashSet::new(),
 			fail_placements: None,
@@ -739,16 +788,62 @@ impl FakeLocal {
 			fail_revert: HashMap::new(),
 			fail_copy: HashMap::new(),
 			kill_after_reverts: None,
+			kill_after_copies: None,
 			fail_handle_paths: None,
 			swallowed: Vec::new(),
 			gates: Vec::new(),
 			connection: FakeConnection::Serving,
+			after_copy: None,
+			after_ranges: None,
+			stuck_reads: HashSet::new(),
+			short_reads: HashSet::new(),
+			stalled_reads: HashSet::new(),
 		})))
 	}
 
 	/// Connects the provider as `connection`, as the fake platform's connects and disconnect do.
 	pub fn set_connection(&self, connection: FakeConnection) {
 		self.state().connection = connection;
+	}
+
+	/// Runs `hook` once the provider's next copy of what is on disk of a file is made, before the
+	/// copy returns, the state not locked meanwhile.
+	pub fn after_next_copy(&self, hook: impl FnOnce() + Send + 'static) {
+		self.state().after_copy = Some(Hook(Box::new(hook)));
+	}
+
+	/// Runs `hook` once the provider's next read of a file's ranges on disk returned what it read,
+	/// before the read returns, the state not locked meanwhile.
+	pub fn after_next_ranges(&self, hook: impl FnOnce() + Send + 'static) {
+		self.state().after_ranges = Some(Hook(Box::new(hook)));
+	}
+
+	/// Makes every read of a range of `path` not on disk wait out the platform's limit and fail,
+	/// as reads of a file left with a fetch nobody serves do, instead of being refused at once.
+	pub fn stick_reads(&self, path: &RootPath) {
+		self.state().stuck_reads.insert(path.case_key());
+	}
+
+	/// Makes every read of `path` by a copy of what is on disk come back short while `short`.
+	pub fn short_reads(&self, path: &RootPath, short: bool) {
+		let mut state = self.state();
+		if short {
+			state.short_reads.insert(path.case_key());
+		} else {
+			state.short_reads.remove(&path.case_key());
+		}
+	}
+
+	/// Makes every read of a range on disk of `path` by a copy of what is on disk wait out the
+	/// platform's limit and fail while `stalled`, as a read of one not on disk does under
+	/// [`FakeLocal::stick_reads`].
+	pub fn stall_reads(&self, path: &RootPath, stalled: bool) {
+		let mut state = self.state();
+		if stalled {
+			state.stalled_reads.insert(path.case_key());
+		} else {
+			state.stalled_reads.remove(&path.case_key());
+		}
 	}
 
 	fn state(&self) -> MutexGuard<'_, LocalState> {
@@ -1111,6 +1206,11 @@ impl FakeLocal {
 		self.state().fail_rename = Some(error);
 	}
 
+	/// Fails the provider's next creation of an ordinary file with its bytes with `error`.
+	pub fn fail_create_plain(&self, error: LocalError) {
+		self.state().fail_create_plain = Some(error);
+	}
+
 	/// Makes the next allowed delete or rename of `path` fail after the provider allowed it, as a
 	/// local error after the acknowledgement would.
 	pub fn fail_completion(&self, path: &RootPath) {
@@ -1153,8 +1253,8 @@ impl FakeLocal {
 
 	/// Writes `bytes` over the file `path` at `offset`, in place, as a write through a handle opened
 	/// for writing does, and closes the handle: a placeholder is no longer in sync and counts the
-	/// bytes as written. Within the file's size, and for a placeholder not all on disk within the
-	/// bytes it holds. Measured on Windows: such a write to a placeholder not all on disk while the
+	/// bytes as written. Within the file's size, and for a placeholder not all on disk within what
+	/// it holds. Measured on Windows: such a write to a placeholder not all on disk while the
 	/// provider is connected first fetches the whole file, then writes; with no provider connected
 	/// it lands over bytes on disk, fetching nothing, and leaves the file as partly on disk as it
 	/// was, and fails with `ERROR_CLOUD_FILE_PROVIDER_NOT_RUNNING` over a byte not on disk, a file
@@ -1185,7 +1285,7 @@ impl FakeLocal {
 		{
 			match connection {
 				FakeConnection::Serving => {
-					placeholder.on_disk = size;
+					placeholder.hold_prefix(size);
 					let stable = held_stable(placeholder);
 					fill_from(node, stable, source);
 				}
@@ -1194,7 +1294,7 @@ impl FakeLocal {
 						code: REFUSED,
 					}));
 				}
-				FakeConnection::Disconnected if end > placeholder.on_disk => {
+				FakeConnection::Disconnected if !placeholder.holds(offset, len) => {
 					return Err(LocalError::Os(crate::os::OsError::Rejected {
 						code: NOT_RUNNING,
 					}));
@@ -1236,9 +1336,16 @@ impl FakeLocal {
 		let now = state.tick();
 		state.refuses_change_past_end(path)?;
 		let node = state.get_mut(path).expect("found by the check");
+		let old = node.size();
 		let len = u64::try_from(bytes.len()).expect("fits a u64");
 		let placeholder = node.placeholder.as_mut().expect("a placeholder");
+		let mut ranges = placeholder.on_disk_ranges();
+		match ranges.last_mut() {
+			Some(last) if last.offset.saturating_add(last.len) == old => last.len += len,
+			_ => ranges.push(ByteRange { offset: old, len }),
+		}
 		placeholder.on_disk = placeholder.on_disk.saturating_add(len);
+		placeholder.ranges = Some(ranges);
 		placeholder.modified_bytes = placeholder.modified_bytes.saturating_add(len);
 		let NodeKind::File {
 			bytes: held,
@@ -1676,6 +1783,12 @@ impl FakeLocal {
 	/// Kills the helper, by a panic, once the provider made `count` more kept items ordinary.
 	pub fn kill_after_reverts(&self, count: u32) {
 		self.state().kill_after_reverts = Some(count);
+	}
+
+	/// Kills the helper, by a panic, once the provider copied what is on disk of `count` more
+	/// files.
+	pub fn kill_after_copies(&self, count: u32) {
+		self.state().kill_after_copies = Some(count);
 	}
 
 	/// Every watcher event since the last call, in order; `[Rescan]` after
@@ -2169,27 +2282,6 @@ impl LocalFs for FakeLocal {
 		Ok(())
 	}
 
-	fn on_disk_ranges(
-		&self,
-		path: &RootPath,
-		expect: LocalFileId,
-	) -> Result<Vec<ByteRange>, LocalError> {
-		let state = self.state();
-		let node = state
-			.get(path)
-			.filter(|node| node.id == expect.get())
-			.ok_or(LocalError::NotFound)?;
-		let (NodeKind::File { .. }, Some(placeholder)) = (&node.kind, &node.placeholder) else {
-			return match node.kind {
-				NodeKind::File { .. } => Err(LocalError::Os(crate::os::OsError::Rejected {
-					code: NOT_A_CLOUD_FILE,
-				})),
-				NodeKind::Dir { .. } => Err(LocalError::NotFound),
-			};
-		};
-		Ok(placeholder.on_disk_ranges())
-	}
-
 	fn copy_to_plain(
 		&self,
 		path: &RootPath,
@@ -2233,6 +2325,189 @@ impl LocalFs for FakeLocal {
 			from: path.clone(),
 			to: to.clone(),
 		});
+		Ok(())
+	}
+
+	fn on_disk_ranges(
+		&self,
+		path: &RootPath,
+		expect: LocalFileId,
+	) -> Result<Vec<ByteRange>, LocalError> {
+		let mut state = self.state();
+		let node = state
+			.get(path)
+			.filter(|node| node.id == expect.get())
+			.ok_or(LocalError::NotFound)?;
+		let (NodeKind::File { .. }, Some(placeholder)) = (&node.kind, &node.placeholder) else {
+			return match node.kind {
+				NodeKind::File { .. } => Err(LocalError::Os(crate::os::OsError::Rejected {
+					code: NOT_A_CLOUD_FILE,
+				})),
+				NodeKind::Dir { .. } => Err(LocalError::NotFound),
+			};
+		};
+		let ranges = placeholder.on_disk_ranges();
+		let hook = state.after_ranges.take();
+		drop(state);
+		if let Some(Hook(hook)) = hook {
+			hook();
+		}
+		Ok(ranges)
+	}
+
+	/// On the fake's model of a file's ranges on disk, read range by range as Windows reads them,
+	/// under the refusing connection an abandon copies under: a read of a byte not on disk fails.
+	fn copy_on_disk_to_plain(
+		&self,
+		path: &RootPath,
+		expect: LocalFileId,
+		ranges: &[ByteRange],
+		to: &RootPath,
+		stop: &dyn Fn() -> bool,
+	) -> Result<IncompleteCopy, LocalError> {
+		let mut state = self.state();
+		if let Some(error) = state.fail_copy.get(&path.case_key()) {
+			return Err(*error);
+		}
+		if stop() {
+			return Err(LocalError::Busy);
+		}
+		let stuck = state.stuck_reads.contains(&path.case_key());
+		let short = state.short_reads.contains(&path.case_key());
+		let stalled = state.stalled_reads.contains(&path.case_key());
+		let node = state
+			.get(path)
+			.filter(|node| node.id == expect.get())
+			.ok_or(LocalError::NotFound)?;
+		let (NodeKind::File { bytes, .. }, Some(placeholder)) = (&node.kind, &node.placeholder)
+		else {
+			return Err(LocalError::NotFound);
+		};
+		let size = node.size();
+		let modified = placeholder.modified_bytes;
+		if placeholder.on_disk_ranges() != ranges {
+			return Err(LocalError::Os(crate::os::OsError::Rejected {
+				code: FAILED,
+			}));
+		}
+		let mut copied = vec![0; bytes.len()];
+		let copying = incomplete::copy_ranges(
+			size,
+			ranges,
+			placeholder.on_disk,
+			|offset, buffer| {
+				let len = u64::try_from(buffer.len()).expect("fits a u64");
+				if !placeholder.holds(offset, len) {
+					let code = if stuck { TIMED_OUT } else { REFUSED };
+					return Err(LocalError::Os(crate::os::OsError::Rejected { code }));
+				}
+				if short {
+					return Err(LocalError::NotFound);
+				}
+				if stalled {
+					return Err(LocalError::Os(crate::os::OsError::Rejected {
+						code: TIMED_OUT,
+					}));
+				}
+				let start = usize::try_from(offset).expect("fits a usize");
+				buffer.copy_from_slice(
+					bytes
+						.get(start..start + buffer.len())
+						.expect("within the file"),
+				);
+				Ok(())
+			},
+			|offset, piece| {
+				let start = usize::try_from(offset).expect("fits a usize");
+				copied
+					.get_mut(start..start + piece.len())
+					.expect("within the file")
+					.copy_from_slice(piece);
+				Ok(())
+			},
+			stop,
+		);
+		let copying = copying.and_then(|copy| {
+			incomplete::check_read_back(ranges, &copy, |offset, buffer| {
+				let start = usize::try_from(offset).expect("fits a usize");
+				buffer.copy_from_slice(
+					copied
+						.get(start..start + buffer.len())
+						.expect("within the copy"),
+				);
+				Ok(())
+			})
+			.map(|()| copy)
+		});
+		let copy = match copying {
+			Ok(copy) => copy,
+			Err(CopyFailure::Stopped) => return Err(LocalError::Busy),
+			Err(CopyFailure::Local(error)) => return Err(error),
+			Err(CopyFailure::Mismatch { .. } | CopyFailure::Ranges | CopyFailure::ReadBack) => {
+				return Err(LocalError::Os(crate::os::OsError::Rejected {
+					code: FAILED,
+				}));
+			}
+		};
+		if state.get(to).is_some() {
+			return Err(LocalError::Exists);
+		}
+		let now = state.tick();
+		state.insert(
+			to.clone(),
+			NodeKind::File {
+				bytes: copied,
+				created: now,
+				modified: now,
+				changed: now,
+			},
+			None,
+		);
+		state.ops.push(LocalOp::CopiedOnDisk {
+			from: path.clone(),
+			to: to.clone(),
+		});
+		if let Some(left) = state.kill_after_copies.as_mut() {
+			*left = left.saturating_sub(1);
+			if *left == 0 {
+				state.kill_after_copies = None;
+				drop(state);
+				panic!("the fake root killed the helper after a copy");
+			}
+		}
+		let hook = state.after_copy.take();
+		drop(state);
+		if let Some(Hook(hook)) = hook {
+			hook();
+		}
+		Ok(IncompleteCopy {
+			size,
+			on_disk: copy.on_disk,
+			modified,
+			zeroed: copy.zeroed,
+		})
+	}
+
+	fn create_plain(&self, to: &RootPath, bytes: &[u8]) -> Result<(), LocalError> {
+		let mut state = self.state();
+		if let Some(error) = state.fail_create_plain.take() {
+			return Err(error);
+		}
+		if state.get(to).is_some() {
+			return Err(LocalError::Exists);
+		}
+		let now = state.tick();
+		state.insert(
+			to.clone(),
+			NodeKind::File {
+				bytes: bytes.to_vec(),
+				created: now,
+				modified: now,
+				changed: now,
+			},
+			None,
+		);
+		state.ops.push(LocalOp::CreatedPlain(to.clone()));
 		Ok(())
 	}
 
@@ -2290,6 +2565,14 @@ impl LocalFs for FakeLocal {
 			.snapshot()
 	}
 
+	fn guarded_ranges(&self, guard: &FakeGuard) -> Result<Vec<ByteRange>, LocalError> {
+		self.state()
+			.by_id(guard.id)
+			.and_then(|node| node.placeholder.as_ref())
+			.map(FakePlaceholder::on_disk_ranges)
+			.ok_or(LocalError::NotFound)
+	}
+
 	type Guard = FakeGuard;
 
 	type Settled = FakeSettled;
@@ -2313,7 +2596,14 @@ impl LocalFs for FakeLocal {
 			return Ok(LocalEntry::Unsupported(kind));
 		}
 		let id = LocalFileId::new(node.id);
+		// As measured: with no provider connected, the provider's own reads see a placeholder as an
+		// ordinary item, its id, size and times as they are.
+		let disguised = state.connection == FakeConnection::Disconnected;
 		Ok(match &node.placeholder {
+			_ if disguised => LocalEntry::Plain {
+				kind: node.local_kind(),
+				id,
+			},
 			None => LocalEntry::Plain {
 				kind: node.local_kind(),
 				id,

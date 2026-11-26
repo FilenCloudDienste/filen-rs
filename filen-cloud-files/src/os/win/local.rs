@@ -6,8 +6,11 @@
 
 use std::{
 	fs::{self, File, OpenOptions},
-	io::{self, Read, Seek, SeekFrom},
-	os::windows::{ffi::OsStrExt, fs::OpenOptionsExt},
+	io::{self, Read, Seek, SeekFrom, Write},
+	os::windows::{
+		ffi::OsStrExt,
+		fs::{FileExt, OpenOptionsExt},
+	},
 	path::{Path, PathBuf},
 	slice,
 	sync::atomic::{AtomicBool, Ordering},
@@ -41,13 +44,15 @@ use crate::{
 	identity::{IdentityBlob, PlaceholderIdentity},
 	names::PlaceholderName,
 	os::{
-		ByteRange, CheckedHash, EntryOutcome, FileSnapshot, FileStamp, IfPinned, LocalEntry,
-		LocalError, LocalFileId, LocalFs, LocalKind, OsError, PinAttr, PlaceholderState, Updated,
+		ByteRange, CheckedHash, EntryOutcome, FileSnapshot, FileStamp, IfPinned, IncompleteCopy,
+		LocalEntry, LocalError, LocalFileId, LocalFs, LocalKind, OsError, PinAttr,
+		PlaceholderState, Updated,
 		cfapi::{
 			CreateValues, E_FAIL, E_INVALIDARG, ERROR_NOT_A_CLOUD_FILE, Hresult, ReparseKind,
 			WideNul, create_values, entry_outcomes, is_partial, local_error, long_path, path_nul,
 			pin_attr, reparse_kind, root_path_of, root_relative, win32_local_error,
 		},
+		incomplete::{self, Copied, CopyFailure},
 	},
 	placeholder::{PlaceholderSpec, SpecKind},
 	root_path::{RootPath, RootPathError},
@@ -359,6 +364,85 @@ pub fn user_dehydrate(path: &Path) -> Hresult {
 	}
 }
 
+/// Copies the bytes of `ranges` of `file`, `size` bytes of which `on_disk` are on disk, into
+/// `copy` at the same offsets, then gives `copy` the file's length, syncs it and reads it back over
+/// those ranges.
+fn copy_incomplete(
+	file: &File,
+	copy: &File,
+	size: u64,
+	ranges: &[ByteRange],
+	on_disk: u64,
+	stop: &dyn Fn() -> bool,
+) -> Result<Copied, CopyFailure> {
+	let copied = incomplete::copy_ranges(
+		size,
+		ranges,
+		on_disk,
+		|offset, buffer| read_whole_at(file, offset, buffer),
+		|offset, bytes| write_whole_at(copy, offset, bytes).map_err(|error| io_error(&error)),
+		stop,
+	)?;
+	copy.set_len(size)
+		.and_then(|()| copy.sync_all())
+		.map_err(|error| CopyFailure::Local(io_error(&error)))?;
+	incomplete::check_read_back(ranges, &copied, |offset, buffer| {
+		read_whole_at(copy, offset, buffer)
+	})?;
+	Ok(copied)
+}
+
+/// Fills `buffer` from `file` at `offset`, whole: [`LocalError::NotFound`] when the file ends
+/// first, and the read's error when it fails.
+fn read_whole_at(file: &File, offset: u64, buffer: &mut [u8]) -> Result<(), LocalError> {
+	let mut filled = 0_usize;
+	while let Some(rest) = buffer.get_mut(filled..).filter(|rest| !rest.is_empty()) {
+		let at = u64::try_from(filled)
+			.ok()
+			.and_then(|filled| offset.checked_add(filled))
+			.ok_or(LocalError::NotFound)?;
+		match file.seek_read(rest, at) {
+			Ok(0) => return Err(LocalError::NotFound),
+			Ok(read) => filled = filled.saturating_add(read),
+			Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+			Err(error) => return Err(io_error(&error)),
+		}
+	}
+	Ok(())
+}
+
+/// Writes all of `bytes` to `file` at `offset`.
+fn write_whole_at(file: &File, offset: u64, bytes: &[u8]) -> io::Result<()> {
+	let mut written = 0_usize;
+	while let Some(rest) = bytes.get(written..).filter(|rest| !rest.is_empty()) {
+		let at = u64::try_from(written)
+			.ok()
+			.and_then(|written| offset.checked_add(written))
+			.ok_or_else(|| io::Error::other("the offset overflows"))?;
+		match file.seek_write(rest, at) {
+			Ok(0) => return Err(io::Error::from(io::ErrorKind::WriteZero)),
+			Ok(count) => written = written.saturating_add(count),
+			Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+			Err(error) => return Err(error),
+		}
+	}
+	Ok(())
+}
+
+/// What a copy of what is on disk that ended without being whole tells the core: a stop as
+/// [`LocalError::Busy`], a read or write as its error, and a file found changed or a copy that does
+/// not read back as rejected (logged).
+fn copy_failed(failure: CopyFailure) -> LocalError {
+	match failure {
+		CopyFailure::Stopped => LocalError::Busy,
+		CopyFailure::Local(error) => error,
+		failure @ (CopyFailure::Mismatch { .. } | CopyFailure::Ranges | CopyFailure::ReadBack) => {
+			warn!(%failure, "copying what is on disk of a file failed");
+			LocalError::Os(OsError::Rejected { code: E_FAIL })
+		}
+	}
+}
+
 /// A byte count cfapi reports as an `i64`, a negative one read as 0.
 fn byte_count(count: i64) -> u64 {
 	u64::try_from(count).unwrap_or(0)
@@ -431,6 +515,91 @@ impl LocalFs for WinLocalFs {
 			return Err(LocalError::NotFound);
 		}
 		ffi::on_disk_ranges(&file, stamp.size).map_err(|error| local_error(error.code))
+	}
+
+	/// Read through a handle for reading shared with every other, as [`LocalFs::copy_to_plain`]
+	/// reads, after its id was checked through it, and the ranges on disk read through it again and
+	/// compared with `ranges`, with the bytes on disk and written since read from its placeholder
+	/// state; then exactly those ranges, window by window ([`incomplete::copy_ranges`]). Written at
+	/// the same offsets to a file created new (`CREATE_NEW`), given the file's length, synced, then
+	/// read back over the ranges copied before this returns. Measured (Windows 11 ARM64, in the VM,
+	/// a changed file of 67,109,864 bytes, its first 32 MiB on disk, left so that a read of its last
+	/// 66,536 bytes from the provider's process waits about 60 s for a fetch nobody serves and then
+	/// fails with `ERROR_CLOUD_FILE_REQUEST_TIMEOUT`): under the refusing connection the 32 MiB on
+	/// disk read in about 0.44 s, each read raising a fetch of a range not on disk that the
+	/// connection refused at once, and the copy held the file's bytes there and zeros elsewhere.
+	fn copy_on_disk_to_plain(
+		&self,
+		path: &RootPath,
+		expect: LocalFileId,
+		ranges: &[ByteRange],
+		to: &RootPath,
+		stop: &dyn Fn() -> bool,
+	) -> Result<IncompleteCopy, LocalError> {
+		let file = open(&self.full(path), GENERIC_READ, SHARE_ALL, 0)?;
+		let info = ffi::item_info(&file).map_err(|error| io_error(&error))?;
+		let LocalKind::File(stamp) = kind_of(&file, &info)? else {
+			return Err(LocalError::NotFound);
+		};
+		if info.file_id != expect.get() {
+			return Err(LocalError::NotFound);
+		}
+		let standard = ffi::placeholder_info(&file).map_err(local_error)?;
+		let now =
+			ffi::on_disk_ranges(&file, stamp.size).map_err(|error| local_error(error.code))?;
+		if now != ranges {
+			return Err(copy_failed(CopyFailure::Ranges));
+		}
+		let target = self.full(to);
+		let copy = OpenOptions::new()
+			.read(true)
+			.write(true)
+			.create_new(true)
+			.open(&target)
+			.map_err(|error| io_error(&error))?;
+		let copied = copy_incomplete(
+			&file,
+			&copy,
+			stamp.size,
+			ranges,
+			byte_count(standard.on_disk),
+			stop,
+		);
+		let copied = match copied {
+			Ok(copied) => copied,
+			Err(failure) => {
+				drop(copy);
+				if let Err(removing) = fs::remove_file(&target) {
+					warn!(%removing, "removing an incomplete copy cut short failed");
+				}
+				return Err(copy_failed(failure));
+			}
+		};
+		Ok(IncompleteCopy {
+			size: stamp.size,
+			on_disk: copied.on_disk,
+			modified: byte_count(standard.modified),
+			zeroed: copied.zeroed,
+		})
+	}
+
+	/// Created new (`CREATE_NEW`), written and synced.
+	/// A file cut short by a failed write is removed, so a retry finds the name free.
+	fn create_plain(&self, to: &RootPath, bytes: &[u8]) -> Result<(), LocalError> {
+		let full = self.full(to);
+		let mut file = OpenOptions::new()
+			.write(true)
+			.create_new(true)
+			.open(&full)
+			.map_err(|error| io_error(&error))?;
+		let written = file.write_all(bytes).and_then(|()| file.sync_all());
+		drop(file);
+		written.map_err(|error| {
+			if let Err(removing) = fs::remove_file(&full) {
+				warn!(%removing, "removing a file cut short failed");
+			}
+			io_error(&error)
+		})
 	}
 
 	/// Read through a handle for reading shared with every other, after its id and, for a
@@ -511,6 +680,15 @@ impl LocalFs for WinLocalFs {
 	/// while the attributes showed the disguise.
 	fn guarded_snapshot(&self, guard: &WinGuard) -> Result<FileSnapshot, LocalError> {
 		snapshot(&guard.file)
+	}
+
+	fn guarded_ranges(&self, guard: &WinGuard) -> Result<Vec<ByteRange>, LocalError> {
+		let size = guard
+			.file
+			.metadata()
+			.map_err(|error| io_error(&error))?
+			.len();
+		ffi::on_disk_ranges(&guard.file, size).map_err(|error| local_error(error.code))
 	}
 
 	type Guard = WinGuard;

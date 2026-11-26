@@ -44,8 +44,8 @@ use crate::{
 			RootListing, StateReport, StatusEvent, UnregisterReport, UserId, parse_line,
 		},
 		unregister::{
-			self, EntryUnregistered, Held, Stopped, Stopping, WalkError, shutting_down,
-			unregister_entry, unsynced,
+			self, EntryUnregistered, Held, Mode, NOT_HELD, Stopped, Stopping, WalkError,
+			shutting_down, unregister_entry, unsynced,
 		},
 		validate,
 		watch_keeper::{Keeper, Keeping, keep_watching},
@@ -615,6 +615,10 @@ impl<P: Platform, O: DriveOpener> Helper<P, O> {
 				delete_hydrated,
 				hold,
 			} => self.unregister(user, delete_hydrated, hold).await,
+			Request::Abandon {
+				user,
+				delete_hydrated,
+			} => self.abandon(user, delete_hydrated).await,
 			Request::Identify { path } => self.identify(&path).await.map(ReplyValue::Identified),
 			Request::ListRoots => Ok(self.list_roots().await),
 			Request::GetState => Ok(ReplyValue::State(self.state().await)),
@@ -1544,8 +1548,49 @@ impl<P: Platform, O: DriveOpener> Helper<P, O> {
 				data_deleted: false,
 				kept_id: None,
 				kept_earlier: Vec::new(),
+				abandoned: None,
 			}));
 		};
+		self.unregister_entry_as(entry, delete_hydrated, Mode::Unregister)
+			.await
+	}
+
+	/// Unregisters `user`'s held root as [`Helper::unregister`] does, but saves what is on disk of
+	/// each changed file it cannot fetch instead of stopping on it (see `Request::Abandon`). The
+	/// fetches are tried a second time when the first left a file not all on disk while the drive
+	/// answers. Refused `notHeld` for a root that is not held, and `notRegistered` for a user the
+	/// index does not know; a root an earlier abandon or unregister finished is reported as
+	/// `unregister` reports it.
+	async fn abandon(
+		&mut self,
+		user: UserId,
+		delete_hydrated: bool,
+	) -> Result<ReplyValue, ReplyError> {
+		let entry = match self.index.entry(user) {
+			None => {
+				return Err(ReplyError::new(
+					ErrorCode::NotRegistered,
+					"the index knows no root of the user's",
+				));
+			}
+			Some(entry) if !entry.held && !entry.unregistered => {
+				return Err(ReplyError::new(ErrorCode::NotHeld, NOT_HELD));
+			}
+			Some(entry) => entry.clone(),
+		};
+		self.unregister_entry_as(entry, delete_hydrated, Mode::Abandon)
+			.await
+	}
+
+	/// The unregister of `entry`'s root, in `mode`, once it is known (see [`Helper::unregister`]
+	/// and [`Helper::abandon`]).
+	async fn unregister_entry_as(
+		&mut self,
+		entry: RootEntry,
+		delete_hydrated: bool,
+		mode: Mode,
+	) -> Result<ReplyValue, ReplyError> {
+		let user = entry.user;
 		self.serve_to_unregister(&entry, self.config.auth_wait)
 			.await;
 		// A sign-in the serve waited for gave up on the stop, or the stop came after it.
@@ -1553,30 +1598,46 @@ impl<P: Platform, O: DriveOpener> Helper<P, O> {
 			return Err(shutting_down());
 		}
 		// What this run held of the root: its registration, and the account it served, so a served
-		// root that cannot be unregistered is served again.
-		let (held, served) = match mem::replace(&mut self.phase, Phase::Idle) {
+		// root that cannot be unregistered is served again; and how many changes the engine had
+		// not carried to the drive yet.
+		let (held, served, pending) = match mem::replace(&mut self.phase, Phase::Idle) {
 			Phase::Serving(serving) if serving.user == user => {
-				let Ok(unfetched) = self.fetch_kept(&serving).await else {
+				let Ok(mut unfetched) = self.fetch_kept(&serving).await else {
 					// Left served: the loop's own stop stops it.
 					self.phase = Phase::Serving(serving);
 					return Err(shutting_down());
 				};
+				// Given up only on files the drive does not serve now either.
+				if mode == Mode::Abandon
+					&& !unfetched.is_empty()
+					&& serving.drive.root_uuid().await.is_ok()
+				{
+					let Ok(again) = self.fetch_kept(&serving).await else {
+						self.phase = Phase::Serving(serving);
+						return Err(shutting_down());
+					};
+					unfetched = again;
+				}
 				// Only the provider's own fetches fill such a file, so the walk under the refusing
 				// connection could only find it again; the root stays served for its uploads.
 				if entry.held
+					&& mode == Mode::Unregister
 					&& let Some(first) = unfetched.first()
 				{
 					self.phase = Phase::Serving(serving);
 					return Err(unsynced(unfetched.len(), &first.to_string()));
 				}
 				let account_root = serving.account_root;
+				let pending = serving.engine.unsynced_count();
 				let (registered, _, _) = self.stop_serving(*serving).await;
-				(Some(registered), Some(account_root))
+				(Some(registered), Some(account_root), pending)
 			}
-			Phase::Registered(registered) if registered.user == user => (Some(registered), None),
+			Phase::Registered(registered) if registered.user == user => {
+				(Some(registered), None, None)
+			}
 			phase => {
 				self.phase = phase;
-				(None, None)
+				(None, None, None)
 			}
 		};
 		let active = held.is_some();
@@ -1591,12 +1652,18 @@ impl<P: Platform, O: DriveOpener> Helper<P, O> {
 			cf,
 			delete_hydrated,
 			&self.stopping,
+			mode,
 		)
 		.await
 		{
-			Ok(EntryUnregistered { report, .. }) => {
+			Ok(EntryUnregistered { mut report, .. }) => {
 				if active {
 					self.status();
+				}
+				// Only an abandon that saved in this run reports it: one that finishes what a killed
+				// run left, or found the root unregistered, reports the copies among what was kept.
+				if let Some(abandoned) = report.abandoned.as_mut() {
+					abandoned.pending_operations = pending;
 				}
 				self.reporting(user, report.kept_ids());
 				Ok(ReplyValue::Unregistered(report))

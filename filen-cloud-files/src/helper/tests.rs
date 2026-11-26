@@ -3644,3 +3644,412 @@ async fn a_held_root_serves_no_thumbnail_until_the_hold_is_lifted() {
 		"{answer:?}"
 	);
 }
+
+// ---- abandon ----
+//
+// An abandon unregisters a held root whose changed files not all on disk cannot be fetched,
+// saving what is on disk of each beside it, and so only on the user's explicit request.
+
+fn abandon_request() -> Value {
+	json!({ "t": "abandon", "userId": "42", "deleteHydrated": false })
+}
+
+/// The items the aside `report` names holds.
+fn aside_of(platform: &FakePlatform, report: &Value) -> Vec<FakeEntry> {
+	let kept_in = PathBuf::from(report["keptIn"].as_str().expect("kept aside"));
+	platform.aside(&kept_in).expect("an aside")
+}
+
+fn bytes_at(entries: &[FakeEntry], path: &str) -> Option<Vec<u8>> {
+	entries
+		.iter()
+		.find(|entry| entry.path.to_string() == path)
+		.map(|entry| entry.bytes.clone())
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_abandon_of_a_held_root_saves_what_is_on_disk_of_an_edit_it_cannot_fetch() {
+	let disk = Disk::new();
+	let (platform, drive) = world();
+	let mut rig = held_with_an_unfetched_edit(&disk, &platform, &drive).await;
+	let report = ok(&rig.request(abandon_request()).await).clone();
+	assert_eq!(report["unregistered"], true, "{report}");
+	assert_eq!(
+		report["kept"],
+		json!([{ "path": "edited.txt.incomplete", "reason": "incomplete" }]),
+		"{report}"
+	);
+	assert_eq!(
+		report["abandoned"]["incomplete"],
+		json!([{
+			"path": "edited.txt.incomplete",
+			"from": "edited.txt",
+			"size": 8,
+			"onDisk": 3,
+			"modified": 8,
+		}]),
+		"{report}"
+	);
+	assert_eq!(report["abandoned"]["incompleteCount"], 1);
+	assert_eq!(report["abandoned"]["manifest"], "Incomplete files.txt");
+	let entries = aside_of(&platform, &report);
+	assert_eq!(
+		bytes_at(&entries, "edited.txt.incomplete").as_deref(),
+		Some(&b"new\0\0\0\0\0"[..])
+	);
+	assert!(bytes_at(&entries, "Incomplete files.txt").is_some());
+	assert_eq!(platform.registration(&disk.root()), None);
+	assert!(!disk.has_session());
+	assert_eq!(
+		ok(&rig.request(json!({ "t": "listRoots" })).await),
+		&json!({ "roots": [] })
+	);
+	assert_eq!(rig.until(is_status("idle")).await["state"], "idle");
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_abandon_reports_how_many_changes_were_pending_and_files_dropped() {
+	let disk = Disk::new();
+	let (platform, drive) = world();
+	let mut rig = held_with_an_unfetched_edit(&disk, &platform, &drive).await;
+	let local = platform.local();
+	local.place_file_with(&root_path("cloud.txt"), file_identity(2), b"cloud", false);
+	// A new file the drive, unreachable, cannot take.
+	drive.set_offline(true);
+	local.user_create(&root_path("new.txt"), b"never uploaded");
+	platform.deliver();
+	sleep(Duration::from_secs(10)).await;
+	let report = ok(&rig.request(abandon_request()).await).clone();
+	assert_eq!(report["abandoned"]["dropped"], 1, "{report}");
+	// The edit not all on disk and the new file, neither on the drive.
+	assert_eq!(report["abandoned"]["pendingOperations"], 2, "{report}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_abandon_fetches_again_what_its_first_try_could_not() {
+	let disk = Disk::new();
+	let (platform, drive) = world();
+	let mut rig = held_with_an_unfetched_edit(&disk, &platform, &drive).await;
+	let local = platform.local();
+	local.fail_hydrations(None);
+	local.fail_hydrate(LocalError::Busy);
+	let report = ok(&rig.request(abandon_request()).await).clone();
+	assert_eq!(
+		report["kept"],
+		json!([{ "path": "edited.txt", "reason": "modified" }]),
+		"{report}"
+	);
+	assert_eq!(report["abandoned"]["incompleteCount"], 0, "{report}");
+	assert_eq!(
+		bytes_at(&aside_of(&platform, &report), "edited.txt").as_deref(),
+		Some(&b"new data"[..])
+	);
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_abandon_that_finishes_a_killed_one_reports_its_copies_as_kept_only() {
+	let disk = Disk::new();
+	let (platform, drive) = world();
+	let mut rig = held_with_an_unfetched_edit(&disk, &platform, &drive).await;
+	platform.kill_at(KillPoint::After(FakeStep::Unregister));
+	assert_eq!(code(&rig.request(abandon_request()).await), "internal");
+	let (reason, _) = rig.close().await;
+	assert_eq!(reason, ExitReason::Internal);
+	let mut rig = Rig::start(&disk, &platform, &drive);
+	let report = ok(&rig.request(abandon_request()).await).clone();
+	assert_eq!(report["unregistered"], true, "{report}");
+	assert!(report.get("abandoned").is_none(), "{report}");
+	let kept = report["kept"].as_array().expect("kept");
+	assert_eq!(kept.len(), 1, "{report}");
+	assert_eq!(kept[0]["reason"], "incomplete", "{report}");
+	// Killed before it took its name: it stays under the one it was written under.
+	let path = kept[0]["path"].as_str().unwrap();
+	assert!(path.starts_with(".filen-upload-copy-"), "{report}");
+	assert_eq!(
+		bytes_at(&aside_of(&platform, &report), path).as_deref(),
+		Some(&b"new\0\0\0\0\0"[..])
+	);
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_abandon_of_a_root_that_is_not_held_is_refused_and_changes_nothing() {
+	let disk = Disk::new();
+	let (platform, drive) = world();
+	let mut rig = Rig::start(&disk, &platform, &drive);
+	ok(&rig.register(&disk).await);
+	ok(&rig.set_auth("42", ACCOUNT_ROOT).await);
+	let refused = rig.request(abandon_request()).await;
+	assert_eq!(code(&refused), "notHeld");
+	assert_eq!(
+		refused["error"]["message"],
+		"the root is not held; an unregister with hold holds it"
+	);
+	assert!(platform.is_connected(&disk.root()));
+	assert!(disk.has_session());
+	assert_eq!(
+		code(
+			&rig.request(json!({ "t": "abandon", "userId": "43", "deleteHydrated": false }))
+				.await
+		),
+		"notRegistered"
+	);
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_abandon_fetches_what_it_can_first() {
+	let disk = Disk::new();
+	let (platform, drive) = world();
+	let mut rig = held_with_an_unfetched_edit(&disk, &platform, &drive).await;
+	platform.local().fail_hydrations(None);
+	let report = ok(&rig.request(abandon_request()).await).clone();
+	assert_eq!(
+		report["kept"],
+		json!([{ "path": "edited.txt", "reason": "modified" }]),
+		"{report}"
+	);
+	assert_eq!(report["abandoned"]["incompleteCount"], 0, "{report}");
+	assert_eq!(report["abandoned"]["manifest"], Value::Null, "{report}");
+	assert_eq!(
+		bytes_at(&aside_of(&platform, &report), "edited.txt").as_deref(),
+		Some(&b"new data"[..])
+	);
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_abandon_whose_copy_fails_unregisters_nothing_and_keeps_the_root_held() {
+	let disk = Disk::new();
+	let (platform, drive) = world();
+	let mut rig = held_with_an_unfetched_edit(&disk, &platform, &drive).await;
+	platform
+		.local()
+		.fail_copy(&root_path("edited.txt"), Some(LocalError::Busy));
+	assert_eq!(code(&rig.request(abandon_request()).await), "os");
+	assert_eq!(
+		platform.registration(&disk.root()),
+		Some(Some(ACCOUNT_ROOT))
+	);
+	assert!(index_text(&disk).contains(r#""held":true"#));
+	assert!(disk.has_session());
+	let edit = platform.local().entry(&root_path("edited.txt")).unwrap();
+	assert!(edit.placeholder && edit.on_disk == 3, "{edit:?}");
+	assert!(
+		platform
+			.local()
+			.entry(&root_path("edited.txt.incomplete"))
+			.is_none()
+	);
+	let state = ok(&rig.request(json!({ "t": "getState" })).await).clone();
+	assert_eq!(state["state"], "held", "{state}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_kill_after_an_incomplete_copy_loses_nothing_and_a_resent_abandon_finishes() {
+	let disk = Disk::new();
+	let (platform, drive) = world();
+	let mut rig = held_with_an_unfetched_edit(&disk, &platform, &drive).await;
+	platform.local().kill_after_copies(1);
+	assert_eq!(code(&rig.request(abandon_request()).await), "internal");
+	let (reason, _) = rig.close().await;
+	assert_eq!(reason, ExitReason::Internal);
+	assert_eq!(
+		platform.registration(&disk.root()),
+		Some(Some(ACCOUNT_ROOT))
+	);
+	let edit = platform.local().entry(&root_path("edited.txt")).unwrap();
+	assert!(edit.placeholder && edit.on_disk == 3, "{edit:?}");
+	let uploads = || {
+		drive
+			.ops()
+			.iter()
+			.filter(|op| matches!(op, DriveOp::Upload { .. }))
+			.count()
+	};
+	let uploaded = uploads();
+	let mut rig = Rig::start(&disk, &platform, &drive);
+	// Served again, held, the engine walks the root: the copy goes up to no drive.
+	rig.until(is_status("held")).await;
+	sleep(Duration::from_secs(120)).await;
+	assert_eq!(uploads(), uploaded, "{:?}", drive.ops());
+	let report = ok(&rig.request(abandon_request()).await).clone();
+	assert_eq!(report["unregistered"], true, "{report}");
+	assert_eq!(report["abandoned"]["incompleteCount"], 1, "{report}");
+	// The copy the killed run made stays, under the name it was written under, beside the new one.
+	let entries = aside_of(&platform, &report);
+	let copies: Vec<&FakeEntry> = entries
+		.iter()
+		.filter(|entry| entry.bytes == b"new\0\0\0\0\0")
+		.collect();
+	assert_eq!(copies.len(), 2, "{entries:?}");
+	assert!(
+		copies
+			.iter()
+			.any(|entry| entry.path.to_string() == "edited.txt.incomplete")
+	);
+	assert_eq!(platform.registration(&disk.root()), None);
+}
+
+/// [`held_with_an_unfetched_edit`] with the edit in `d`, a folder the drive holds beside
+/// `remote.txt`, which is not on disk; the folder's uuid.
+async fn held_with_an_unfetched_edit_in_a_folder(
+	disk: &Disk,
+	platform: &FakePlatform,
+	drive: &Arc<FakeDrive>,
+) -> (Rig, Uuid) {
+	let mut rig = Rig::start(disk, platform, drive);
+	ok(&rig.register(disk).await);
+	ok(&rig.set_auth("42", ACCOUNT_ROOT).await);
+	rig.until(|line| line["t"] == "pendingUploads" && line["count"] == 0)
+		.await;
+	let remote = drive.add_remote_dir(&ACCOUNT_ROOT.to_string(), "d");
+	let uuid = Uuid::parse_str(&remote.uuid).unwrap();
+	drive.add_remote_file(&format!("stable/{uuid}"), "remote.txt", b"remote");
+	let local = platform.local();
+	local.place_dir(&root_path("d"), PlaceholderIdentity::Dir { uuid });
+	local.place_file(&root_path(r"d\edited.txt"), file_identity(3), b"old data");
+	local
+		.user_write(&root_path(r"d\edited.txt"), b"new data")
+		.unwrap();
+	local.set_on_disk(&root_path(r"d\edited.txt"), 3);
+	local.fail_hydrations(Some(LocalError::Busy));
+	assert_eq!(
+		code(&rig.request(held_unregister()).await),
+		"unsyncedChanges"
+	);
+	(rig, uuid)
+}
+
+/// Whether the engine took the folder `d`, made ordinary, in again as a populated directory of the
+/// drive's `uuid`.
+fn adopted_populated(platform: &FakePlatform, uuid: Uuid) -> bool {
+	platform.local().ops().contains(&LocalOp::ConvertedDir {
+		path: root_path("d"),
+		identity: PlaceholderIdentity::Dir { uuid },
+		populated: true,
+	})
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_abandon_the_os_refuses_past_its_settle_leaves_the_folder_listable_and_a_retry_finishes()
+{
+	let disk = Disk::new();
+	let (platform, drive) = world();
+	let (mut rig, uuid) = held_with_an_unfetched_edit_in_a_folder(&disk, &platform, &drive).await;
+	platform.fail_unregisters(1);
+	let refused = rig.request(abandon_request()).await;
+	assert_eq!(refused["ok"], false, "{refused}");
+	assert_eq!(
+		platform.registration(&disk.root()),
+		Some(Some(ACCOUNT_ROOT))
+	);
+	assert!(index_text(&disk).contains(r#""held":true"#));
+	// Served again, held: the folder the settle made ordinary is taken in again, populated, so it
+	// lists what it holds while held, and nothing of the drive's is placed in it.
+	sleep(Duration::from_secs(60)).await;
+	assert!(
+		adopted_populated(&platform, uuid),
+		"{:?}",
+		platform.local().ops()
+	);
+	assert!(
+		platform
+			.local()
+			.entry(&root_path(r"d\remote.txt"))
+			.is_none()
+	);
+	let report = ok(&rig.request(abandon_request()).await).clone();
+	assert_eq!(report["unregistered"], true, "{report}");
+	assert_eq!(report["abandoned"]["incompleteCount"], 1, "{report}");
+	let entries = aside_of(&platform, &report);
+	assert_eq!(
+		bytes_at(&entries, r"d\edited.txt.incomplete").as_deref(),
+		Some(&b"new\0\0\0\0\0"[..])
+	);
+	// The first try's copy stays beside it, under the name nothing uploads.
+	let copies = entries
+		.iter()
+		.filter(|entry| entry.bytes == b"new\0\0\0\0\0")
+		.count();
+	assert_eq!(copies, 2, "{entries:?}");
+	assert_eq!(platform.registration(&disk.root()), None);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_sign_in_after_an_abandon_refused_past_its_settle_serves_the_folder_whole() {
+	let disk = Disk::new();
+	let (platform, drive) = world();
+	let (mut rig, uuid) = held_with_an_unfetched_edit_in_a_folder(&disk, &platform, &drive).await;
+	platform.fail_unregisters(1);
+	assert_eq!(rig.request(abandon_request()).await["ok"], false);
+	sleep(Duration::from_secs(60)).await;
+	assert!(adopted_populated(&platform, uuid));
+	ok(&rig.set_auth("42", ACCOUNT_ROOT).await);
+	assert_eq!(rig.until(is_status("serving")).await["state"], "serving");
+	sleep(Duration::from_secs(60)).await;
+	let local = platform.local();
+	let placed = local.entry(&root_path(r"d\remote.txt")).unwrap();
+	assert!(placed.placeholder && placed.in_sync, "{placed:?}");
+	let edit = local.entry(&root_path(r"d\edited.txt")).unwrap();
+	assert!(edit.placeholder && edit.on_disk == 3, "{edit:?}");
+	assert_eq!(&edit.bytes[..3], b"new");
+	assert!(!index_text(&disk).contains(r#""held":true"#));
+	assert!(disk.has_session());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_kill_past_an_abandons_settle_loses_nothing_and_a_resent_abandon_finishes() {
+	let disk = Disk::new();
+	let (platform, drive) = world();
+	let (mut rig, uuid) = held_with_an_unfetched_edit_in_a_folder(&disk, &platform, &drive).await;
+	// The folder is the one item the settle makes ordinary.
+	platform.local().kill_after_reverts(1);
+	assert_eq!(code(&rig.request(abandon_request()).await), "internal");
+	let (reason, _) = rig.close().await;
+	assert_eq!(reason, ExitReason::Internal);
+	assert!(!platform.local().entry(&root_path("d")).unwrap().placeholder);
+	let mut rig = Rig::start(&disk, &platform, &drive);
+	rig.until(is_status("held")).await;
+	sleep(Duration::from_secs(60)).await;
+	assert!(adopted_populated(&platform, uuid));
+	let report = ok(&rig.request(abandon_request()).await).clone();
+	assert_eq!(report["unregistered"], true, "{report}");
+	assert_eq!(
+		bytes_at(&aside_of(&platform, &report), r"d\edited.txt.incomplete").as_deref(),
+		Some(&b"new\0\0\0\0\0"[..])
+	);
+	assert_eq!(platform.registration(&disk.root()), None);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_shutdown_during_an_abandons_fetches_answers_shutting_down() {
+	let disk = Disk::new();
+	let (platform, drive) = world();
+	let mut rig = held_with_an_unfetched_edit(&disk, &platform, &drive).await;
+	let gate = platform.local().gate(Gated::Hydrate);
+	let abandon = rig.send(abandon_request()).await;
+	{
+		let gate = gate.clone();
+		blocking(move || gate.wait_entered()).await;
+	}
+	let shutdown = rig.send(json!({ "t": "shutdown" })).await;
+	for _ in 0..100 {
+		yield_now().await;
+	}
+	gate.open();
+	assert_eq!(code(&rig.reply_to(abandon).await), "shuttingDown");
+	ok(&rig.reply_to(shutdown).await);
+	assert_eq!(rig.task.await.unwrap(), ExitReason::Shutdown);
+	assert_eq!(
+		platform.registration(&disk.root()),
+		Some(Some(ACCOUNT_ROOT))
+	);
+	assert!(disk.has_session());
+	assert!(index_text(&disk).contains(r#""held":true"#));
+	assert!(
+		!platform
+			.local()
+			.ops()
+			.iter()
+			.any(|op| matches!(op, LocalOp::CopiedOnDisk { .. })),
+		"nothing copied"
+	);
+}

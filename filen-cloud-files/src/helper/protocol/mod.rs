@@ -37,7 +37,14 @@ use crate::{
 /// parent that knows it sends (`identify`, with the error codes only its reply carries); and but
 /// for `unregister`'s optional `hold`, whose new values (the phase `held` in `status`, `getState`
 /// and `register`'s reply, and `held` in `listRoots`) appear only once a parent sent it, as only
-/// it holds a root, the hold persisting across the helper's restarts.
+/// it holds a root, the hold persisting across the helper's restarts; and but for `abandon`, a
+/// request only a parent that knows it sends, whose reply alone carries `abandoned` and the error
+/// code `notHeld`, and whose kept reason `incomplete` is reported again only in later reports of
+/// what that abandon kept. A parent of this version tells a helper that predates `hold` and
+/// `abandon` by its replies, as `hello` carries the same version: `abandon` is answered
+/// `unknownMessage`, and `unregister` with `hold` `invalidMessage` (its fields refused), either
+/// having changed nothing. A helper that predates `hold` refuses a roots index naming a held root
+/// (`stateDirInvalid`), as it refuses any field it does not know.
 pub const PROTOCOL_VERSION: u32 = 1;
 
 /// The longest input line taken, in bytes, its newline excluded: a pushed session of 1 MiB
@@ -262,6 +269,31 @@ pub enum Request {
 		/// Whether the root is held first (optional, default false).
 		hold: bool,
 	},
+	/// Unregisters a held root (see `unregister`'s `hold`) even though changed files are not all on
+	/// disk and cannot be fetched: only on the user's explicit request, as what the drive held of
+	/// such a file and the disk does not is given up. It first does what `unregister` does: serves
+	/// the root with the sealed session when it can and fetches what it can. Then, before any item
+	/// is changed, each changed file still not all on disk is copied as far as it is on disk to a
+	/// new ordinary file beside it, as long as the file, every range not on disk filled with zero
+	/// bytes; the copy is kept, with the reason `incomplete`, and the file itself is left to the OS,
+	/// which removes it once the root goes. Each copy is written under a name nothing uploads
+	/// (`.filen-upload-copy-…`) and takes its name, `<name>.incomplete`, only once the OS let the
+	/// root go; a text file in the root, moved aside with it, then lists each copy and its
+	/// zero-filled ranges. Everything else is as for `unregister`: whole changes are kept, clean
+	/// downloads deleted when `deleteHydrated`, and the reply is `unregister`'s with `abandoned`
+	/// beside it. A copy that cannot be made, or a copied file written to before the OS's
+	/// unregister, stops it with `os` before the root goes, the root still registered and held;
+	/// the copies made by then stay under the names nothing uploads, and a later `abandon` keeps
+	/// them as it keeps any ordinary file and copies anew. A root that is not held is refused
+	/// `notHeld`. A stop is honoured as in `unregister`, the copies included: a copy cut short is
+	/// removed. Nothing of it persists: a helper started anew does not resume it, and one killed
+	/// after the OS let the root go leaves the copies under the names they were written under.
+	Abandon {
+		/// Whose root to unregister.
+		user: UserId,
+		/// Whether clean downloaded files are deleted too, rather than left as ordinary files.
+		delete_hydrated: bool,
+	},
 	/// Lists the roots the helper knows.
 	ListRoots,
 	/// Which drive item the path names in the served root: read from the placeholder there and the
@@ -352,6 +384,8 @@ pub enum ErrorCode {
 	NotSynced,
 	/// The cache holds no item for the placeholder, or holds it in the trash.
 	UnknownItem,
+	/// `abandon` needs the user's root held, and it is not.
+	NotHeld,
 }
 
 /// Why the helper refused to start: sent as the only line before it exits, with the exit code
@@ -497,6 +531,17 @@ struct UnregisterWire {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct AbandonWire {
+	#[serde(rename = "t")]
+	_t: IgnoredAny,
+	#[serde(rename = "id")]
+	_id: IgnoredAny,
+	user_id: String,
+	delete_hydrated: bool,
+}
+
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct IdentifyWire {
 	#[serde(rename = "t")]
@@ -589,6 +634,13 @@ pub fn parse_line(line: &str) -> Result<InMessage, ParseError> {
 				user: user_id(id, &wire.user_id)?,
 				delete_hydrated: wire.delete_hydrated,
 				hold: wire.hold,
+			}
+		}
+		"abandon" => {
+			let wire: AbandonWire = serde_json::from_str(line).map_err(schema)?;
+			Request::Abandon {
+				user: user_id(id, &wire.user_id)?,
+				delete_hydrated: wire.delete_hydrated,
 			}
 		}
 		"identify" => {
@@ -711,6 +763,8 @@ pub enum KeptItemReason {
 	/// An item in this directory whose name the provider cannot spell; the directory is kept as
 	/// an ordinary one with it.
 	UnrepresentableName,
+	/// A copy `abandon` made of a changed file not all on disk: what was on disk, the rest zeros.
+	Incomplete,
 }
 
 /// A local item `unregister` kept, by its path below the root as Windows spells it.
@@ -821,6 +875,51 @@ pub struct UnregisterReport {
 	/// out when empty.
 	#[serde(skip_serializing_if = "Vec::is_empty")]
 	pub kept_earlier: Vec<KeptEarlier>,
+	/// What an `abandon` gave up, beside what it kept; only in the reply to an `abandon` that saved
+	/// the root's changes itself. One that only finished what an earlier abandon left (a helper
+	/// killed once the OS let the root go) reports that abandon's copies in `kept` or `keptEarlier`
+	/// only, with the reason `incomplete`, and leaves this out.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub abandoned: Option<AbandonReport>,
+}
+
+/// What `abandon` gave up, beside what it kept.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AbandonReport {
+	/// The first [`MAX_LIST_ENTRIES`] changed files saved incomplete.
+	pub incomplete: Vec<IncompleteItem>,
+	/// How many were.
+	pub incomplete_count: u64,
+	/// The text file listing every incomplete copy and its zero-filled ranges, below the root
+	/// (moved aside with it); `None` (`null`) when there was none to list, or it could not be
+	/// written.
+	pub manifest: Option<String>,
+	/// How many files not all on disk, holding nothing the drive lacks, the OS removed with the
+	/// root.
+	pub dropped: u64,
+	/// How many local changes the served root had not carried to the drive yet when it stopped
+	/// being served, deletes and renames included, which are given up as operations (what they
+	/// changed locally stays); `None` (`null`) when the root was not served, or the count was not
+	/// known.
+	pub pending_operations: Option<u64>,
+}
+
+/// A changed file not all on disk, saved as far as it was on disk.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IncompleteItem {
+	/// The copy, below the root: `<name>.incomplete` beside the file, or the name it was written
+	/// under (`.filen-upload-copy-…`) when it could not take that one.
+	pub path: String,
+	/// The file it was copied from, below the root.
+	pub from: String,
+	/// The file's size in bytes; the copy's too.
+	pub size: u64,
+	/// How many of its bytes were on disk and copied; the rest are zeros.
+	pub on_disk: u64,
+	/// How many bytes were written to it since it was last in sync (`ModifiedDataSize`).
+	pub modified: u64,
 }
 
 impl UnregisterReport {

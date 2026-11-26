@@ -52,6 +52,24 @@
 //! root is disconnected is not measured).
 //! What stays in the root afterwards is moved aside with the root, which is renamed.
 //!
+//! An abandon ([`Mode::Abandon`], only on the user's explicit request) does not stop on a kept file
+//! not all on disk: before anything is changed, it copies what is on disk of each to a new ordinary
+//! file beside it, zeros where the file was not on disk, and keeps the copy; the file itself is
+//! left to the OS's unregister, which removes it (measured on Windows 11 ARM64: the OS's unregister
+//! deleted a changed file partly on disk). Each copy stays under a name the engine never uploads
+//! until the OS let the root go, then takes the name `<name>.incomplete`, and a text file in the
+//! root lists the copies and their zero-filled ranges: an abandon that stops before, the root
+//! served again, uploads no zero-filled copy as a file of its own. Each file to copy is guarded as a
+//! clean file not all on disk is, every guard taken before the first copy, so a file that cannot be
+//! guarded stops the abandon with nothing copied. Each is read through its guard once copied,
+//! before anything is settled, and once more just before the OS's unregister, its ranges on disk
+//! included: a change since it was looked at stops the abandon. A stop or a failure once copies
+//! were made (a change found at either check, a stop at the second, the record, the disconnect or
+//! the OS's unregister failing) leaves them, under their names of their own, beside the files they
+//! copy: a retry copies each file again, and lists the copies left before as kept files the drive
+//! never had. They are not removed, as nothing tells such a run the files they copy are still
+//! whole.
+//!
 //! What was kept is recorded in the roots index, with where the root goes, before the OS lets the
 //! root go, and settled once it went. A helper killed anywhere in between finds the record on its
 //! next `unregister` or `register` of the root, finishes the move, and reports it; the record goes
@@ -74,14 +92,17 @@ use crate::{
 		index::{IndexError, KeptPlace, KeptRecord, RootEntry, RootsIndex, StateDir, index_error},
 		platform::{BrandingScope, Platform, PlatformError, RootRefusal, platform_error},
 		protocol::{
-			ErrorCode, KeptId, KeptItem, KeptItemReason, MAX_LIST_ENTRIES, OutMessage, ReplyError,
-			UnregisterAllEntry, UnregisterReport, UserId,
+			AbandonReport, ErrorCode, IncompleteItem, KeptId, KeptItem, KeptItemReason,
+			MAX_LIST_ENTRIES, OutMessage, ReplyError, UnregisterAllEntry, UnregisterReport, UserId,
 		},
 	},
 	identity::PlaceholderIdentity,
 	log_safe::path_tag,
 	names::{PlaceholderName, copy_name},
-	os::{FileSnapshot, LocalEntry, LocalError, LocalFileId, LocalFs, LocalKind, PlaceholderState},
+	os::{
+		ByteRange, FileSnapshot, IncompleteCopy, LocalEntry, LocalError, LocalFileId, LocalFs,
+		LocalKind, PlaceholderState,
+	},
 	root_path::RootPath,
 };
 
@@ -128,18 +149,30 @@ pub(crate) struct Walked {
 	kept: Vec<Kept>,
 	/// Every directory placeholder.
 	dirs: Vec<WalkedDir>,
-	/// The clean file placeholders not all on disk, as the walk found them: the OS's unregister
-	/// removes them, and once the root is disconnected a write to a range on disk of one, or past
-	/// its end, lands without a fetch (measured, for a file with no byte on disk too), so each is
-	/// guarded from its last check until the OS let the root go ([`guard_files`]).
+	/// How many file placeholders not all on disk the platform's unregister removes: the clean ones,
+	/// and those whose name or attributes only changed ([`unwritten_online_only`]).
+	dropped: u64,
+	/// Each of them, as the walk found it: once the root is disconnected, a write to a range on
+	/// disk, or past the end, lands without a fetch (measured, for a file with no byte on disk too),
+	/// and the OS's unregister would remove the file with the write, so each is guarded from its last
+	/// check until the OS let the root go ([`guard_files`]).
 	exposed: Vec<Seen>,
 }
 
-/// A file as the walk found it.
+/// A file as the walk, or an abandon's copy, found it.
 #[derive(Debug)]
 struct Seen {
 	path: RootPath,
 	was: FileSnapshot,
+}
+
+/// What a file the OS's unregister removes is to the unregister.
+#[derive(Debug)]
+enum Role {
+	/// A file not all on disk holding nothing the drive lacks ([`Walked::exposed`]).
+	Clean,
+	/// A changed file an abandon copied what is on disk of, with its ranges on disk as copied.
+	Saved(Vec<ByteRange>),
 }
 
 /// A file the OS's unregister removes, as last seen, held by a guard that no writer opening the
@@ -150,6 +183,7 @@ struct Seen {
 #[derive(Debug)]
 struct Guarded<G> {
 	seen: Seen,
+	role: Role,
 	guard: G,
 }
 
@@ -195,17 +229,17 @@ enum NotGuarded {
 /// for (see the module docs).
 fn guard_files<L: LocalFs>(
 	local: &L,
-	files: impl IntoIterator<Item = Seen>,
+	files: impl IntoIterator<Item = (Seen, Role)>,
 	stop: &Stop,
 ) -> Result<Vec<Guarded<L::Guard>>, NotGuarded> {
 	files
 		.into_iter()
-		.map(|seen| {
+		.map(|(seen, role)| {
 			if stop.requested() {
 				return Err(NotGuarded::Stopping);
 			}
 			match local.guard_file(&seen.path, seen.was.id) {
-				Ok(guard) => Ok(Guarded { seen, guard }),
+				Ok(guard) => Ok(Guarded { seen, role, guard }),
 				Err(error) => {
 					warn!(%error, item = %path_tag(&seen.path), "a file the unregister removes could not be guarded; the root stays");
 					Err(NotGuarded::Refused(Unguarded {
@@ -216,92 +250,6 @@ fn guard_files<L: LocalFs>(
 			}
 		})
 		.collect()
-}
-
-/// What a guarded file shows changed since it was seen: the first field found differing, with what
-/// it was and what it is now.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Change {
-	/// Its state cannot be read through its guard, or it is no placeholder any more.
-	Unreadable(LocalError),
-	/// Another file is held.
-	Id,
-	/// Its size, in bytes.
-	Size { was: u64, now: u64 },
-	/// Its write time, in FILETIME ticks.
-	WriteTime { was: i64, now: i64 },
-	/// Its bytes on disk.
-	OnDisk { was: u64, now: u64 },
-	/// Its bytes written since it was last in sync.
-	Written { was: u64, now: u64 },
-}
-
-/// What `now` shows changed of the file as `was` had it; `None` when nothing did. Whether it is
-/// partial is not compared: through a guard it reads as the attributes say, which a disconnected
-/// root disguises, and its bytes on disk are compared instead.
-fn change_since(now: Result<FileSnapshot, LocalError>, was: &FileSnapshot) -> Option<Change> {
-	let now = match now {
-		Ok(now) => now,
-		Err(error) => return Some(Change::Unreadable(error)),
-	};
-	if now.id != was.id {
-		return Some(Change::Id);
-	}
-	if now.stamp.size != was.stamp.size {
-		return Some(Change::Size {
-			was: was.stamp.size,
-			now: now.stamp.size,
-		});
-	}
-	if now.stamp.modified != was.stamp.modified {
-		return Some(Change::WriteTime {
-			was: was.stamp.modified,
-			now: now.stamp.modified,
-		});
-	}
-	if now.state.on_disk() != was.state.on_disk() {
-		return Some(Change::OnDisk {
-			was: was.state.on_disk(),
-			now: now.state.on_disk(),
-		});
-	}
-	if now.state.modified_bytes() != was.state.modified_bytes() {
-		return Some(Change::Written {
-			was: was.state.modified_bytes(),
-			now: now.state.modified_bytes(),
-		});
-	}
-	None
-}
-
-/// The reply's message, after "preparing the root failed: ", for the first file of `guarded` that
-/// changed since it was seen, read through its guard: another item, size, write time, or bytes on
-/// disk or written. The platform answers through the guard as it does connected, the root
-/// connected or not (measured on Windows), so the check is the same at both points it runs. `None`
-/// when none changed. Which field differed is logged. Gives up before the next file once `stop` is
-/// asked for, as a root holding many files takes long to check.
-fn first_changed<L: LocalFs>(
-	local: &L,
-	guarded: &[Guarded<L::Guard>],
-	stop: &Stop,
-) -> Result<Option<String>, Stopping> {
-	for Guarded { seen, guard } in guarded {
-		if stop.requested() {
-			return Err(Stopping);
-		}
-		if let Some(change) = change_since(local.guarded_snapshot(guard), &seen.was) {
-			debug!(item = %path_tag(&seen.path), ?change, "a file differs from what it was before the unregister");
-			warn!(item = %path_tag(&seen.path), "a clean file not all on disk was written to during the unregister; the root stays");
-			return Ok(Some(written_during_unregister(&seen.path)));
-		}
-	}
-	Ok(None)
-}
-
-/// The reply's message, after "preparing the root failed: ", for the clean file at `path`, not all
-/// on disk, written to since the walk.
-fn written_during_unregister(path: &RootPath) -> String {
-	format!("{path} was written to during the unregister; nothing was unregistered")
 }
 
 /// Closes `guarded` on the blocking pool: closing the guard on a file the OS's unregister left
@@ -350,6 +298,9 @@ pub(crate) fn shutting_down() -> ReplyError {
 		"the helper is stopping; the root stays registered for a later unregister",
 	)
 }
+
+/// The message of an `abandon` of a root that is not held.
+pub(crate) const NOT_HELD: &str = "the root is not held; an unregister with hold holds it";
 
 /// Classifies every item in the root, every directory walked, populated or not. A link or reparse
 /// point is kept and never followed. Only a root that cannot be listed fails the walk: an item
@@ -463,6 +414,7 @@ pub(crate) fn walk<L: LocalFs>(local: &L, stop: &Stop) -> Result<Walked, WalkErr
 								unsynced_online_only = unsynced_online_only.saturating_add(1);
 							}
 							if state.partial() {
+								walked.dropped = walked.dropped.saturating_add(1);
 								walked.exposed.push(Seen {
 									path,
 									was: FileSnapshot { id, stamp, state },
@@ -591,6 +543,7 @@ fn settle<L: LocalFs>(
 		clean,
 		mut kept,
 		mut dirs,
+		dropped: _,
 		exposed: _,
 	} = walked;
 	let mut deleted_hydrated = 0_u64;
@@ -749,17 +702,445 @@ fn name_copy<L: LocalFs>(
 	Err(last)
 }
 
+/// What an unregister is asked to do with the changed files not all on disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Mode {
+	/// Stop before anything changes: they hold what the drive may hold alone.
+	Unregister,
+	/// Save what is on disk of each, as the user gives the rest up (`abandon`).
+	Abandon,
+}
+
+/// The extension an incomplete copy's name ends in, after the file's whole name, so no
+/// application opens its zero-filled ranges unawares.
+const INCOMPLETE_EXTENSION: &str = ".incomplete";
+/// The most UTF-16 units a name Windows holds has.
+const MAX_NAME_UNITS: usize = 255;
+/// The name of the text file an abandon leaves in the root, listing its incomplete copies.
+const MANIFEST_NAME: &str = "Incomplete files.txt";
+
+/// The `n`th name, from 1, an incomplete copy of the file `name` may take: `<name>.incomplete`,
+/// then `<name> (2).incomplete` and so on; the file's stem cut short (its extension kept when it
+/// fits) so the whole name fits [`MAX_NAME_UNITS`].
+fn incomplete_name(name: &str, n: usize) -> String {
+	let tag = match n {
+		0 | 1 => INCOMPLETE_EXTENSION.to_owned(),
+		n => format!(" ({n}){INCOMPLETE_EXTENSION}"),
+	};
+	let budget = MAX_NAME_UNITS.saturating_sub(tag.encode_utf16().count());
+	let units = |text: &str| text.encode_utf16().count();
+	if units(name) <= budget {
+		return format!("{name}{tag}");
+	}
+	let (stem, ext) = match name.rfind('.') {
+		Some(dot) if dot > 0 && units(name.get(dot..).unwrap_or_default()) < budget => (
+			name.get(..dot).unwrap_or_default(),
+			name.get(dot..).unwrap_or_default(),
+		),
+		_ => (name, ""),
+	};
+	let room = budget.saturating_sub(units(ext));
+	let mut kept = String::new();
+	for ch in stem.chars() {
+		if units(&kept) + ch.len_utf16() > room {
+			break;
+		}
+		kept.push(ch);
+	}
+	format!("{kept}{ext}{tag}")
+}
+
+/// A changed file not all on disk an abandon copied: where the copy is and what it holds.
+#[derive(Debug)]
+struct Saved {
+	from: RootPath,
+	/// The copy's name of its own ([`copy_name`]), which nothing uploads.
+	copied_to: RootPath,
+	/// The [`incomplete_name`] the copy took once the OS let the root go; `None` until then, and
+	/// for one that could not be named.
+	named: Option<RootPath>,
+	copy: IncompleteCopy,
+}
+
+impl Saved {
+	/// Where the copy is.
+	fn path(&self) -> &RootPath {
+		self.named.as_ref().unwrap_or(&self.copied_to)
+	}
+}
+
+/// Why an abandon could not save a changed file not all on disk.
+#[derive(Debug)]
+enum Unsaved {
+	/// A stop was asked for; the copy in flight was removed.
+	Stopping,
+	/// The file at the path could not be copied.
+	Failed { path: RootPath, error: LocalError },
+}
+
+impl Unsaved {
+	/// What the unregister came to: it stops with nothing changed but the copies made.
+	fn prepared<G>(self) -> Prepared<G> {
+		match self {
+			Self::Stopping => Prepared::Stopping,
+			Self::Failed { path, error } => {
+				warn!(%error, item = %path_tag(&path), "saving what is on disk of a changed file failed");
+				Prepared::Failed(format!(
+					"{path} could not be saved as far as it is on disk: {error}"
+				))
+			}
+		}
+	}
+}
+
+/// Looks at every kept file not all on disk an abandon copies, before any is guarded or copied: the
+/// file as it is, and its ranges on disk, which its copy reads and its guard is checked against
+/// ([`guard_files`]). In the walk's order. Gives up before the next file once `stop` is asked for.
+fn look_at_changed<L: LocalFs>(
+	local: &L,
+	walked: &Walked,
+	stop: &Stop,
+) -> Result<Vec<(Seen, Role)>, Unsaved> {
+	let mut seen = Vec::new();
+	for kept in walked.partial() {
+		if stop.requested() {
+			return Err(Unsaved::Stopping);
+		}
+		let path = &kept.path;
+		let failed = |error| Unsaved::Failed {
+			path: path.clone(),
+			error,
+		};
+		let Some(id) = kept.revert else {
+			return Err(failed(LocalError::NotFound));
+		};
+		let was = match local.inspect(path) {
+			Ok(LocalEntry::Placeholder {
+				kind: LocalKind::File(stamp),
+				id: found,
+				state,
+				..
+			}) if found == id => FileSnapshot { id, stamp, state },
+			Ok(_) => return Err(failed(LocalError::NotFound)),
+			Err(error) => return Err(failed(error)),
+		};
+		let ranges = local.on_disk_ranges(path, id).map_err(failed)?;
+		debug!(item = %path_tag(path), ranges = ranges.len(), "read the ranges on disk of a changed file");
+		seen.push((
+			Seen {
+				path: path.clone(),
+				was,
+			},
+			Role::Saved(ranges),
+		));
+	}
+	Ok(seen)
+}
+
+/// Copies what is on disk of every kept file not all on disk, each held by its guard in `guarded`,
+/// in the walk's order as [`look_at_changed`] looked at them, as `abandon` does before anything is
+/// changed, and keeps the copy instead of the file, which is left to the platform's unregister:
+/// exactly the ranges the platform reported on disk, read after the file's state, so a read never
+/// asks the provider for a byte (measured on Windows: every read of a file left with a fetch the
+/// provider never serves waits for it, about 2 minutes, then fails, a read of a range on disk
+/// included when the provider is the reader). The copy reads through a handle of its own, which
+/// the guard admits, as it shares reading.
+/// Each copy stays under a name of its own ([`copy_name`]), which the engine never uploads, until
+/// the OS let the root go ([`name_saved`]): an abandon that stops or fails before then, or a run
+/// killed, leaves no copy the root, served again, would upload as a new file. Gives up before the
+/// next file once `stop` is asked for, and within a file's copy, which is then removed.
+fn save_incomplete<G>(
+	local: &impl LocalFs,
+	walked: &mut Walked,
+	guarded: &[Guarded<G>],
+	stop: &Stop,
+) -> Result<Vec<Saved>, Unsaved> {
+	let mut saved = Vec::new();
+	// Both in the walk's order of the kept files not all on disk.
+	let changed = walked.kept.iter_mut().filter(|kept| kept.partial);
+	for (kept, guarded) in changed.zip(guarded) {
+		if stop.requested() {
+			return Err(Unsaved::Stopping);
+		}
+		let Guarded { seen, role, .. } = guarded;
+		let path = &seen.path;
+		let failed = |error| Unsaved::Failed {
+			path: path.clone(),
+			error,
+		};
+		let Role::Saved(ranges) = role else {
+			return Err(failed(LocalError::NotFound));
+		};
+		let copied_to = PlaceholderName::parse(&copy_name())
+			.ok()
+			.and_then(|copy| path.with_name(copy))
+			.ok_or_else(|| failed(LocalError::NotFound))?;
+		let copied = local
+			.copy_on_disk_to_plain(path, seen.was.id, ranges, &copied_to, &|| stop.requested());
+		let copy = match copied {
+			Ok(copy) => copy,
+			Err(_) if stop.requested() => return Err(Unsaved::Stopping),
+			Err(error) => return Err(failed(error)),
+		};
+		info!(item = %path_tag(path), on_disk = copy.on_disk, size = copy.size, "saved what is on disk of a changed file");
+		kept.path = copied_to.clone();
+		kept.reason = KeptItemReason::Incomplete;
+		kept.revert = None;
+		kept.partial = false;
+		saved.push(Saved {
+			// The report names the file, as the guard taken on it does.
+			from: path.clone(),
+			copied_to,
+			named: None,
+			copy,
+		});
+	}
+	Ok(saved)
+}
+
+/// What a guarded file shows changed since it was seen: the first field found differing, with what
+/// it was and what it is now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Change {
+	/// Its state cannot be read through its guard, or it is no placeholder any more.
+	Unreadable(LocalError),
+	/// Another file is held.
+	Id,
+	/// Its size, in bytes.
+	Size { was: u64, now: u64 },
+	/// Its write time, in FILETIME ticks.
+	WriteTime { was: i64, now: i64 },
+	/// Its bytes on disk.
+	OnDisk { was: u64, now: u64 },
+	/// Its bytes written since it was last in sync.
+	Written { was: u64, now: u64 },
+	/// Its ranges on disk: as many bytes, elsewhere in the file.
+	Ranges,
+}
+
+/// What `now` shows changed of the file as `was` had it; `None` when nothing did. Whether it is
+/// partial is not compared: through a guard it reads as the attributes say, which a disconnected
+/// root disguises, and its bytes on disk are compared instead.
+fn change_since(now: Result<FileSnapshot, LocalError>, was: &FileSnapshot) -> Option<Change> {
+	let now = match now {
+		Ok(now) => now,
+		Err(error) => return Some(Change::Unreadable(error)),
+	};
+	if now.id != was.id {
+		return Some(Change::Id);
+	}
+	if now.stamp.size != was.stamp.size {
+		return Some(Change::Size {
+			was: was.stamp.size,
+			now: now.stamp.size,
+		});
+	}
+	if now.stamp.modified != was.stamp.modified {
+		return Some(Change::WriteTime {
+			was: was.stamp.modified,
+			now: now.stamp.modified,
+		});
+	}
+	if now.state.on_disk() != was.state.on_disk() {
+		return Some(Change::OnDisk {
+			was: was.state.on_disk(),
+			now: now.state.on_disk(),
+		});
+	}
+	if now.state.modified_bytes() != was.state.modified_bytes() {
+		return Some(Change::Written {
+			was: was.state.modified_bytes(),
+			now: now.state.modified_bytes(),
+		});
+	}
+	None
+}
+
+/// The reply's message, after "preparing the root failed: ", for the first file of `guarded` that
+/// changed since it was seen, read through its guard: another item, size, write time, bytes on disk
+/// or written, or, for a file an abandon copied, other ranges on disk. The platform answers through
+/// the guard as it does connected, the root connected or not (measured on Windows), so the check is
+/// the same at both points it runs. `None` when none changed. Which field differed is logged.
+/// Gives up before the next file once `stop` is asked for, as a root holding many files takes long
+/// to check.
+fn first_changed<L: LocalFs>(
+	local: &L,
+	guarded: &[Guarded<L::Guard>],
+	stop: &Stop,
+) -> Result<Option<String>, Stopping> {
+	for guarded in guarded {
+		if stop.requested() {
+			return Err(Stopping);
+		}
+		if let Some(changed) = changed_since_seen(local, guarded) {
+			return Ok(Some(changed));
+		}
+	}
+	Ok(None)
+}
+
+/// The reply's message for `guarded`, read through its guard, when it changed since it was seen
+/// (see [`first_changed`]).
+fn changed_since_seen<L: LocalFs>(local: &L, guarded: &Guarded<L::Guard>) -> Option<String> {
+	let Guarded { seen, role, guard } = guarded;
+	let change = change_since(local.guarded_snapshot(guard), &seen.was).or_else(|| match role {
+		Role::Clean => None,
+		Role::Saved(ranges) => match local.guarded_ranges(guard) {
+			Ok(now) if now == *ranges => None,
+			Ok(_) => Some(Change::Ranges),
+			Err(error) => Some(Change::Unreadable(error)),
+		},
+	})?;
+	debug!(item = %path_tag(&seen.path), ?change, "a file differs from what it was before the unregister");
+	Some(match role {
+		Role::Clean => {
+			warn!(item = %path_tag(&seen.path), "a clean file not all on disk was written to during the unregister; the root stays");
+			written_during_unregister(&seen.path)
+		}
+		Role::Saved(_) => {
+			warn!(item = %path_tag(&seen.path), "a changed file was written to after it was saved; the root stays");
+			written_since_saved(&seen.path)
+		}
+	})
+}
+
+/// The reply's message, after "preparing the root failed: ", for the saved file at `path` changed
+/// since it was copied.
+fn written_since_saved(path: &RootPath) -> String {
+	format!("{path} was written to after it was saved; nothing was unregistered")
+}
+
+/// The reply's message, after "preparing the root failed: ", for the clean file at `path`, not all
+/// on disk, written to since the walk.
+fn written_during_unregister(path: &RootPath) -> String {
+	format!("{path} was written to during the unregister; nothing was unregistered")
+}
+
+/// Names each copy of `saved`, the OS having let the root go, so nothing serves it any more: the
+/// first free [`incomplete_name`] beside its file, never over an item put there meanwhile. A copy
+/// that cannot be named stays under its own name, and is reported so. Then lists the copies, with
+/// their zero-filled ranges, in a text file in the root: where it is, `None` when it could not be
+/// written (logged).
+fn name_saved<L: LocalFs>(local: &L, saved: &mut [Saved]) -> Option<RootPath> {
+	for saved in &mut *saved {
+		let Some(name) = saved.from.name().map(|name| name.as_str().to_owned()) else {
+			continue;
+		};
+		let candidates = (1..=COPY_ATTEMPTS)
+			.filter_map(|n| PlaceholderName::parse(&incomplete_name(&name, n)).ok())
+			.filter_map(|candidate| saved.from.with_name(candidate));
+		saved.named = name_copy(local, &saved.copied_to, candidates).ok();
+	}
+	if saved.is_empty() {
+		return None;
+	}
+	let text = manifest(saved);
+	for n in 1..=COPY_ATTEMPTS {
+		let name = match n {
+			1 => MANIFEST_NAME.to_owned(),
+			n => format!("Incomplete files ({n}).txt"),
+		};
+		let Ok(name) = PlaceholderName::parse(&name) else {
+			continue;
+		};
+		let at = RootPath::root().join(name);
+		match local.create_plain(&at, text.as_bytes()) {
+			Ok(()) => return Some(at),
+			Err(LocalError::Exists) => {}
+			Err(error) => {
+				warn!(%error, "writing the list of incomplete copies failed");
+				return None;
+			}
+		}
+	}
+	warn!("no free name for the list of incomplete copies");
+	None
+}
+
+/// `record` with each copy of `saved` that took its name listed under it.
+fn named_in(record: &mut KeptRecord, saved: &[Saved]) {
+	for item in &mut record.kept {
+		if let Some(named) = saved
+			.iter()
+			.find(|saved| item.path == saved.copied_to.to_string())
+			.and_then(|saved| saved.named.as_ref())
+		{
+			item.path = named.to_string();
+		}
+	}
+}
+
+/// The text listing what `saved` holds, for the user who finds the copies.
+fn manifest(saved: &[Saved]) -> String {
+	let mut text = String::from(
+		"These files were changed on this computer but were not all on disk when the folder was \
+		 disconnected from Filen, and the rest could not be downloaded. Each copy below holds \
+		 what was on disk; the byte ranges listed were not, and are zeros in the copy.\r\n\r\n",
+	);
+	for saved in saved {
+		let copy = &saved.copy;
+		text.push_str(&format!(
+			"{} (copied from {}): {} bytes, {} of them on disk, {} changed here\r\n",
+			saved.path(),
+			saved.from,
+			copy.size,
+			copy.on_disk,
+			copy.modified
+		));
+		for range in &copy.zeroed {
+			let last = range.offset.saturating_add(range.len).saturating_sub(1);
+			text.push_str(&format!("\tzeros at bytes {} to {last}\r\n", range.offset));
+		}
+	}
+	text
+}
+
 /// What the walk under the refusing connection came to, before the OS's unregister.
 enum Prepared<G> {
-	/// Every kept item made ordinary: the root may go; with the guards on the files the OS's
-	/// unregister removes, held until it did.
-	Settled(Settled, Vec<Guarded<G>>),
+	/// Every kept item made ordinary: the root may go; with what an abandon saved, and the guards
+	/// on the files the OS's unregister removes, held until it did.
+	Settled(Settled, Option<Abandoned>, Vec<Guarded<G>>),
 	/// These changed files are not all on disk.
 	Partial(Vec<String>),
 	/// A stop was asked for before anything changed.
 	Stopping,
 	/// The root could not be walked or an item kept, with why.
 	Failed(String),
+}
+
+/// What an abandon saved of the changed files not all on disk, and gave up.
+#[derive(Debug)]
+struct Abandoned {
+	saved: Vec<Saved>,
+	/// The text file listing them, written once the OS let the root go.
+	manifest: Option<RootPath>,
+	/// How many files not all on disk holding nothing the drive lacks the platform's unregister
+	/// removes ([`Walked::dropped`]).
+	dropped: u64,
+}
+
+impl Abandoned {
+	/// The report of it, the pending operations left to the caller.
+	fn report(self) -> AbandonReport {
+		AbandonReport {
+			incomplete_count: u64::try_from(self.saved.len()).unwrap_or(u64::MAX),
+			incomplete: self
+				.saved
+				.into_iter()
+				.take(MAX_LIST_ENTRIES)
+				.map(|saved| IncompleteItem {
+					path: saved.path().to_string(),
+					from: saved.from.to_string(),
+					size: saved.copy.size,
+					on_disk: saved.copy.on_disk,
+					modified: saved.copy.modified,
+				})
+				.collect(),
+			manifest: self.manifest.map(|manifest| manifest.to_string()),
+			dropped: self.dropped,
+			pending_operations: None,
+		}
+	}
 }
 
 /// What unregistering a root did.
@@ -771,6 +1152,8 @@ pub(crate) struct RootOutcome {
 	pub(crate) record: Option<KeptRecord>,
 	/// Whether anything that showed the root in File Explorer may be left (see [`unbrand`]).
 	pub(crate) branding_left: bool,
+	/// What an abandon saved and gave up; `None` for an unregister.
+	pub(crate) abandoned: Option<AbandonReport>,
 }
 
 /// What [`unregister_entry`] did.
@@ -881,6 +1264,8 @@ pub(crate) struct Unregistering<'a> {
 	pub(crate) date: String,
 	/// Set once the helper is asked to stop.
 	pub(crate) stop: &'a Stop,
+	/// What is done with the changed files not all on disk.
+	pub(crate) mode: Mode,
 }
 
 /// Unregisters `registered`, the root `asked` names, keeping every item that holds data the drive
@@ -904,6 +1289,7 @@ pub(crate) async fn unregister_root<P: Platform>(
 		delete_hydrated,
 		date,
 		stop,
+		mode,
 	} = asked;
 	if stop.requested() {
 		return Err(Stopped {
@@ -935,21 +1321,53 @@ pub(crate) async fn unregister_root<P: Platform>(
 				Err(WalkError::Stopping(Stopping)) => return Prepared::Stopping,
 				Err(WalkError::Local(error)) => return Prepared::Failed(error.to_string()),
 			};
-			let partial: Vec<String> = walked.partial().map(|kept| kept.path.to_string()).collect();
-			if !partial.is_empty() {
-				return Prepared::Partial(partial);
-			}
-			// Every file the OS's unregister removes, guarded before its first check and before
-			// anything is settled: one that cannot be guarded, or that changed since it was seen,
-			// stops the unregister with nothing changed. From here no writer opens such a file
-			// until the OS let the root go.
-			let guarded = match guard_files(&*local, std::mem::take(&mut walked.exposed), &stop) {
-				Ok(guarded) => guarded,
-				Err(NotGuarded::Stopping) => return Prepared::Stopping,
-				Err(NotGuarded::Refused(unguarded)) => {
-					return Prepared::Failed(unguarded.message());
+			if mode == Mode::Unregister {
+				let partial: Vec<String> =
+					walked.partial().map(|kept| kept.path.to_string()).collect();
+				if !partial.is_empty() {
+					return Prepared::Partial(partial);
 				}
+			}
+			let changed = match look_at_changed(&*local, &walked, &stop) {
+				Ok(changed) => changed,
+				Err(unsaved) => return unsaved.prepared(),
 			};
+			// Every file the OS's unregister removes, guarded before an abandon copies any, before
+			// its first check and before anything is settled: one that cannot be guarded stops the
+			// unregister with nothing changed, one that changed since it was seen with nothing
+			// changed but an abandon's copies, under names nothing uploads. From here no writer
+			// opens such a file until the OS let the root go.
+			let guard = |files| match guard_files(&*local, files, &stop) {
+				Ok(guarded) => Ok(guarded),
+				Err(NotGuarded::Stopping) => Err(Prepared::Stopping),
+				Err(NotGuarded::Refused(unguarded)) => Err(Prepared::Failed(unguarded.message())),
+			};
+			let mut guarded = match guard(changed) {
+				Ok(guarded) => guarded,
+				Err(prepared) => return prepared,
+			};
+			let exposed = std::mem::take(&mut walked.exposed)
+				.into_iter()
+				.map(|seen| (seen, Role::Clean))
+				.collect();
+			let exposed = match guard(exposed) {
+				Ok(exposed) => exposed,
+				Err(prepared) => return prepared,
+			};
+			// Before anything is changed: a stop or a kill meanwhile leaves the copies made under
+			// names nothing uploads, beside what they copy, and nothing else changed.
+			let abandoned = match mode {
+				Mode::Unregister => None,
+				Mode::Abandon => match save_incomplete(&*local, &mut walked, &guarded, &stop) {
+					Ok(saved) => Some(Abandoned {
+						saved,
+						manifest: None,
+						dropped: walked.dropped,
+					}),
+					Err(unsaved) => return unsaved.prepared(),
+				},
+			};
+			guarded.extend(exposed);
 			match first_changed(&*local, &guarded, &stop) {
 				Ok(None) => {}
 				Ok(Some(changed)) => return Prepared::Failed(changed),
@@ -961,7 +1379,7 @@ pub(crate) async fn unregister_root<P: Platform>(
 				return Prepared::Stopping;
 			}
 			match settle(&*local, walked, delete_hydrated) {
-				Ok(settled) => Prepared::Settled(settled, guarded),
+				Ok(settled) => Prepared::Settled(settled, abandoned, guarded),
 				Err(Unsettled::Partial(path)) => Prepared::Partial(vec![path.to_string()]),
 				Err(unsettled) => Prepared::Failed(unsettled.message()),
 			}
@@ -975,7 +1393,7 @@ pub(crate) async fn unregister_root<P: Platform>(
 	let registered = match disconnected {
 		Ok(registered) => registered,
 		Err(failed) => {
-			if let Prepared::Settled(_, guarded) = prepared {
+			if let Prepared::Settled(_, _, guarded) = prepared {
 				close_guards(guarded).await;
 			}
 			return Err(Stopped {
@@ -984,8 +1402,8 @@ pub(crate) async fn unregister_root<P: Platform>(
 			});
 		}
 	};
-	let (settled, guarded) = match prepared {
-		Prepared::Settled(settled, guarded) => (settled, guarded),
+	let (settled, abandoned, guarded) = match prepared {
+		Prepared::Settled(settled, abandoned, guarded) => (settled, abandoned, guarded),
 		Prepared::Stopping => {
 			return Err(Stopped {
 				held: Held::Registered(registered),
@@ -1014,7 +1432,7 @@ pub(crate) async fn unregister_root<P: Platform>(
 		let date = date.clone();
 		blocking(move || aside_path(&root, &date, |candidate| platform.exists(candidate))).await
 	};
-	let record = KeptRecord {
+	let mut record = KeptRecord {
 		id: KeptId::random(),
 		kept_count: u64::try_from(settled.kept.len()).unwrap_or(u64::MAX),
 		kept: settled
@@ -1087,6 +1505,26 @@ pub(crate) async fn unregister_root<P: Platform>(
 	// and goes with the file (measured). A file not all on disk they held is delete pending until
 	// then and goes as they close; the root cannot be renamed aside before (measured).
 	close_guards(guarded).await;
+	// The copies take their names only now, as nothing serves the root any more; a name not taken
+	// leaves the copy under its own, listed so.
+	let abandoned = match abandoned {
+		Some(mut abandoned) => {
+			let platform = Arc::clone(platform);
+			let root = root.to_path_buf();
+			let abandoned = blocking(move || {
+				abandoned.manifest = name_saved(&*platform.local_fs(&root), &mut abandoned.saved);
+				abandoned
+			})
+			.await;
+			named_in(&mut record, &abandoned.saved);
+			// A record still naming a copy by its own name is settled as it is by a later run.
+			if let Err(error) = index.put_kept(user, record.clone()) {
+				warn!(%error, "recording the names of the incomplete copies failed");
+			}
+			Some(abandoned)
+		}
+		None => None,
+	};
 	// Only now the OS let the root go, so a failed unregister keeps the root shown as it is; first
 	// of what follows, which may stop.
 	let branding_left = unbrand(platform, root, user).await;
@@ -1118,6 +1556,7 @@ pub(crate) async fn unregister_root<P: Platform>(
 		tidied,
 		record,
 		branding_left,
+		abandoned: abandoned.map(Abandoned::report),
 	})
 }
 
@@ -1335,6 +1774,7 @@ pub(crate) async fn unregister_entry<P: Platform>(
 	registered: Option<P::Registered>,
 	delete_hydrated: bool,
 	stop: &Stop,
+	mode: Mode,
 ) -> Result<EntryUnregistered, Stopped<P::Registered>> {
 	let stopped = |error: ReplyError| Stopped {
 		held: Held::Unknown,
@@ -1355,6 +1795,7 @@ pub(crate) async fn unregister_entry<P: Platform>(
 				data_deleted: true,
 				kept_id: None,
 				kept_earlier: entry.earlier(None),
+				abandoned: None,
 			},
 		});
 	}
@@ -1414,6 +1855,7 @@ pub(crate) async fn unregister_entry<P: Platform>(
 					delete_hydrated,
 					date,
 					stop,
+					mode,
 				},
 			)
 			.await?
@@ -1428,6 +1870,7 @@ pub(crate) async fn unregister_entry<P: Platform>(
 			record: None,
 			// A sync root list entry naming exactly the root is gone with the registration.
 			branding_left: unbrand(platform, &entry.root, entry.user).await,
+			abandoned: None,
 		},
 		// Not registered: an unregister stopped after the OS let the root go left the record of
 		// what it kept, finished here; a root without one holds ordinary items only (see
@@ -1447,6 +1890,7 @@ pub(crate) async fn unregister_entry<P: Platform>(
 				record,
 				// What an unregister stopped after the OS let the root go may have left.
 				branding_left: unbrand(platform, &entry.root, entry.user).await,
+				abandoned: None,
 			}
 		}
 	};
@@ -1499,6 +1943,7 @@ pub(crate) async fn unregister_entry<P: Platform>(
 			data_deleted,
 			kept_id,
 			kept_earlier,
+			abandoned: outcome.abandoned,
 		},
 		branding_left: outcome.branding_left,
 	})
@@ -1572,6 +2017,7 @@ pub async fn unregister_all<P: Platform>(
 			None,
 			delete_hydrated,
 			&Stop::never(),
+			Mode::Unregister,
 		)
 		.await;
 		let (outcome, key_left, branding_left) = match outcome {

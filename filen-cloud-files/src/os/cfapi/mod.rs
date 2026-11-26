@@ -53,6 +53,9 @@ pub(crate) const ERROR_NOT_A_CLOUD_FILE: u32 = 376;
 pub(crate) const ERROR_CLOUD_FILE_NOT_IN_SYNC: u32 = 377;
 /// `ERROR_CLOUD_FILE_INVALID_REQUEST`: a placeholder refused for an empty identity.
 pub(crate) const ERROR_CLOUD_FILE_INVALID_REQUEST: u32 = 380;
+/// `ERROR_CLOUD_FILE_AUTHENTICATION_FAILED`: what a reader of a range not on disk gets while the
+/// provider refuses every request (`STATUS_CLOUD_FILE_AUTHENTICATION_FAILED`).
+pub(crate) const ERROR_CLOUD_FILE_AUTHENTICATION_FAILED: u32 = 386;
 /// `ERROR_CLOUD_FILE_IN_USE`: a dehydrate while a transfer of the file was in flight; a call on a
 /// placeholder another handle has in use, which a later try may pass.
 pub(crate) const ERROR_CLOUD_FILE_IN_USE: u32 = 391;
@@ -176,7 +179,7 @@ impl Hresult {
 
 	/// The name of a code this layer meets, if it is one.
 	fn name(self) -> Option<&'static str> {
-		const WIN32: [(u32, &str); 6] = [
+		const WIN32: [(u32, &str); 7] = [
 			(
 				ERROR_CLOUD_FILE_REQUEST_CANCELED,
 				"ERROR_CLOUD_FILE_REQUEST_CANCELED",
@@ -191,6 +194,10 @@ impl Hresult {
 				"ERROR_CLOUD_FILE_INVALID_REQUEST",
 			),
 			(ERROR_CLOUD_FILE_IN_USE, "ERROR_CLOUD_FILE_IN_USE"),
+			(
+				ERROR_CLOUD_FILE_AUTHENTICATION_FAILED,
+				"ERROR_CLOUD_FILE_AUTHENTICATION_FAILED",
+			),
 			(ERROR_REPARSE_TAG_MISMATCH, "ERROR_REPARSE_TAG_MISMATCH"),
 		];
 		match self.0 {

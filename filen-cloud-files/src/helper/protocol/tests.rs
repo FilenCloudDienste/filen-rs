@@ -8,6 +8,7 @@ use super::*;
 use crate::helper::identify::{
 	HELD, NOT_FOUND, NOT_IN_ROOT, NOT_SERVING, NOT_SYNCED, UNKNOWN_ITEM,
 };
+use crate::helper::unregister::NOT_HELD;
 
 /// The golden fixtures the desktop app reads too.
 const FIXTURES: &str = include_str!(concat!(
@@ -38,6 +39,7 @@ fn request_type(request: &Request) -> &'static str {
 		Request::SetAuth { .. } => "setAuth",
 		Request::ClearAuth { .. } => "clearAuth",
 		Request::Unregister { .. } => "unregister",
+		Request::Abandon { .. } => "abandon",
 		Request::Identify { .. } => "identify",
 		Request::ListRoots => "listRoots",
 		Request::GetState => "getState",
@@ -95,6 +97,7 @@ fn report() -> UnregisterReport {
 		data_deleted: true,
 		kept_id: None,
 		kept_earlier: Vec::new(),
+		abandoned: None,
 	}
 }
 
@@ -346,6 +349,7 @@ fn out_message(case: &str) -> OutMessage {
 						data_deleted: false,
 						kept_id: None,
 						kept_earlier: Vec::new(),
+						abandoned: None,
 					}),
 					key_left: true,
 					branding_left: false,
@@ -374,6 +378,7 @@ fn out_message(case: &str) -> OutMessage {
 					data_deleted: false,
 					kept_id: None,
 					kept_earlier: Vec::new(),
+					abandoned: None,
 				}),
 				key_left: true,
 				branding_left: true,
@@ -444,6 +449,47 @@ fn out_message(case: &str) -> OutMessage {
 				}],
 			},
 		),
+		"reply abandon" => reply(
+			10,
+			ReplyValue::Unregistered(UnregisterReport {
+				kept: vec![
+					KeptItem {
+						path: "a\\b.txt.incomplete".to_owned(),
+						reason: KeptItemReason::Incomplete,
+					},
+					KeptItem {
+						path: "new.txt".to_owned(),
+						reason: KeptItemReason::NotUploaded,
+					},
+				],
+				kept_id: Some(KeptId::from(0xab)),
+				abandoned: Some(AbandonReport {
+					incomplete: vec![IncompleteItem {
+						path: "a\\b.txt.incomplete".to_owned(),
+						from: "a\\b.txt".to_owned(),
+						size: 3_145_728,
+						on_disk: 69_632,
+						modified: 4096,
+					}],
+					incomplete_count: 1,
+					manifest: Some("Incomplete files.txt".to_owned()),
+					dropped: 12,
+					pending_operations: Some(1),
+				}),
+				..report()
+			}),
+		),
+		"reply abandon nothing to list" => reply(
+			10,
+			ReplyValue::Unregistered(UnregisterReport {
+				abandoned: Some(AbandonReport::default()),
+				..report()
+			}),
+		),
+		"reply error notHeld" => OutMessage::Reply {
+			id: id(10),
+			outcome: Err(ReplyError::new(ErrorCode::NotHeld, NOT_HELD)),
+		},
 		other => panic!("no message for the output case {other}"),
 	}
 }
@@ -473,7 +519,7 @@ fn every_output_fixture_is_byte_for_byte_what_the_helper_writes() {
 		assert_eq!(line, expected, "{}", case.case);
 		checked += 1;
 	}
-	assert_eq!(checked, 40);
+	assert_eq!(checked, 43);
 }
 
 /// `identify`'s refusal of `code`, as the command loop words it.
@@ -637,6 +683,25 @@ fn a_kept_id_is_16_lowercase_hex_digits() {
 		assert_eq!(KeptId::parse(text), None, "{text}");
 	}
 	assert_ne!(KeptId::random(), KeptId::random());
+}
+
+#[test]
+fn an_abandon_carries_its_user_and_whether_it_deletes_downloads() {
+	let abandon = |line: &str| match parse_line(line).unwrap().request {
+		Request::Abandon {
+			user,
+			delete_hydrated,
+		} => (user, delete_hydrated),
+		other => panic!("not an abandon: {other:?}"),
+	};
+	assert_eq!(
+		abandon(r#"{"t":"abandon","id":4,"userId":"42","deleteHydrated":true}"#),
+		(UserId::from(42), true)
+	);
+	assert_eq!(
+		abandon(r#"{"t":"abandon","id":4,"userId":"7","deleteHydrated":false}"#),
+		(UserId::from(7), false)
+	);
 }
 
 #[test]

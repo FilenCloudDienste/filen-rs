@@ -12,6 +12,8 @@
 //!   whose every field is made up, which nothing may echo.
 //! - `leave`: as `fake`, only registers, serves, reads one file and shuts down, leaving the root
 //!   registered for an `--unregister-all` to find.
+//! - `abandon`: as `fake`, H20: an `abandon` of a held root whose changed file is partly on disk
+//!   while the drive is unreachable, which saves what is on disk of it.
 //!
 //! `user <op> <path> [text]` is the user: `read`, `write`, `append`, `delete`, `exists`, `list`,
 //! `readat` (`<offset>:<len>`) and `writeat` (`<offset>:<text>`), each answered by one JSON line
@@ -413,6 +415,7 @@ pub(crate) fn run(exe: &Path, out: &Path, mode: &str) -> Outcome {
 		"fake" => fake(exe, out, &layout, &mut report, &log, started),
 		"prod" => prod(exe, out, &layout, &mut report, &log, started),
 		"leave" => leave(exe, out, &layout, &mut report, &log, started),
+		"abandon" => abandon(exe, out, &layout, &mut report, &log, started),
 		_ => {
 			report.fail("mode", format!("unknown mode {mode}"));
 			Ok(false)
@@ -1275,6 +1278,137 @@ fn leave(
 	let exit = helper.exit_code(Duration::from_secs(120));
 	report.check(
 		"L-shutdown",
+		ok(reply.as_ref()) && exit == Some(0),
+		format!("exit {exit:?}"),
+	);
+	Ok(true)
+}
+
+/// H20: an abandon of a held root while the drive is unreachable, with a file changed while the
+/// root was not served and so only partly on disk (set up as H17 sets it up): the copy holds the
+/// change and the bytes on disk, zeros where the manifest says, and the root goes. What becomes of
+/// the file itself, and how the reads under the refusing connection went, are reported.
+fn abandon(
+	exe: &Path,
+	out: &Path,
+	layout: &Layout,
+	report: &mut Report,
+	log: &Arc<Mutex<File>>,
+	started: Instant,
+) -> Outcome {
+	let root = &layout.root;
+	let auth = session(USER, &tree::ROOT.to_string(), |n| {
+		format!("{}-{n}", MARKERS[n.min(4)])
+	});
+	let mut helper = Helper::spawn(exe, &serve_args(&layout.state, true), out, 1, log, started)?;
+	let _ = helper.recv(REPLY);
+	let file = root.join("slow.bin");
+	let reply = helper.request(register(root, &layout.data, USER));
+	report.check("H20-register", ok(reply.as_ref()), format!("{reply:?}"));
+	let reply = helper.request(json!({ "t": "setAuth", "userId": USER, "json": auth }));
+	report.check("H20-setAuth", ok(reply.as_ref()), format!("{reply:?}"));
+	let part = user("readat", &file, Some("0:4096"));
+	report.check("H20-read-part", part["ok"] == true, format!("{part}"));
+	let reply = helper.request(json!({ "t": "clearAuth", "userId": USER }));
+	report.info("H20-clearAuth", format!("{reply:?}"));
+	let patch = "changed while not served";
+	let wrote = user("writeat", &file, Some(&format!("0:{patch}")));
+	report.check("H20-write-partial", wrote["ok"] == true, format!("{wrote}"));
+	let left = user("exists", &file, None);
+	report.check(
+		"H20-partly-on-disk",
+		left["attributes"]
+			.as_u64()
+			.is_some_and(|attributes| attributes & RECALL_ON_DATA_ACCESS != 0),
+		format!("{left}"),
+	);
+	let offline = layout.state.with_file_name("offline");
+	fs::write(&offline, "offline")?;
+	thread::sleep(Duration::from_secs(2));
+	let reply = helper.request(json!({ "t": "setAuth", "userId": USER, "json": auth }));
+	report.check(
+		"H20-setAuth-offline",
+		ok(reply.as_ref()),
+		format!("{reply:?}"),
+	);
+	thread::sleep(Duration::from_secs(3));
+	let reply = helper.request(
+		json!({ "t": "unregister", "userId": USER, "deleteHydrated": false, "hold": true }),
+	);
+	report.check(
+		"H20-held",
+		code(reply.as_ref()).as_deref() == Some("unsyncedChanges"),
+		format!("{reply:?}"),
+	);
+	let reply = helper.request(json!({ "t": "abandon", "userId": USER, "deleteHydrated": false }));
+	report.info("H20-abandon-reply", format!("{reply:?}"));
+	let done = value(reply.as_ref());
+	report.check(
+		"H20-abandon",
+		done["unregistered"] == true,
+		format!("{reply:?}"),
+	);
+	let incomplete = &done["abandoned"]["incomplete"][0];
+	report.check(
+		"H20-incomplete-reported",
+		incomplete["from"] == "slow.bin" && incomplete["path"] == "slow.bin.incomplete",
+		format!("{incomplete}"),
+	);
+	let size = tree::size_of("slow.bin").unwrap_or(0);
+	match done["keptIn"].as_str().map(PathBuf::from) {
+		Some(kept_in) => {
+			let manifest = fs::read_to_string(kept_in.join("Incomplete files.txt"));
+			report.info("H20-manifest", format!("{manifest:?}"));
+			// What the copy should hold: the change, the drive's bytes that were on disk, zeros in
+			// the ranges the manifest names.
+			let mut want = pattern(size);
+			if let Some(target) = want.get_mut(..patch.len()) {
+				target.copy_from_slice(patch.as_bytes());
+			}
+			for line in manifest.as_deref().unwrap_or_default().lines() {
+				let Some((from, to)) = line
+					.trim()
+					.strip_prefix("zeros at bytes ")
+					.and_then(|range| range.split_once(" to "))
+				else {
+					continue;
+				};
+				if let (Ok(from), Ok(to)) = (from.parse::<usize>(), to.parse::<usize>())
+					&& let Some(zeros) = want.get_mut(from..=to)
+				{
+					zeros.fill(0);
+				}
+			}
+			let copy = user("read", &kept_in.join("slow.bin.incomplete"), None);
+			report.check(
+				"H20-copy-holds-what-was-on-disk",
+				copy["len"] == json!(size) && copy["hash"] == blake3::hash(&want).to_hex().as_str(),
+				format!("{copy}"),
+			);
+			let head = user(
+				"readat",
+				&kept_in.join("slow.bin.incomplete"),
+				Some(&format!("0:{}", patch.len())),
+			);
+			report.check(
+				"H20-copy-holds-the-change",
+				head["hash"] == blake3::hash(patch.as_bytes()).to_hex().as_str(),
+				format!("{head}"),
+			);
+			// Measured, not checked: whether the OS's unregister removed the changed file.
+			let original = user("exists", &kept_in.join("slow.bin"), None);
+			report.info("H20-original-after-unregister", format!("{original}"));
+			let listed = user("list", &kept_in, None);
+			report.info("H20-aside", format!("{listed}"));
+		}
+		None => report.fail("H20-kept-in", format!("{done}")),
+	}
+	report.check("H20-root-freed", !root.exists(), root.display());
+	let _ = fs::remove_file(&offline);
+	let reply = helper.request(json!({ "t": "shutdown" }));
+	let exit = helper.exit_code(Duration::from_secs(120));
+	report.check(
+		"H20-shutdown",
 		ok(reply.as_ref()) && exit == Some(0),
 		format!("exit {exit:?}"),
 	);

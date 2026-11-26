@@ -212,6 +212,19 @@ pub struct ByteRange {
 	pub len: u64,
 }
 
+/// What [`LocalFs::copy_on_disk_to_plain`] copied of a file not all on disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IncompleteCopy {
+	/// The file's size, and the copy's.
+	pub size: u64,
+	/// How many bytes were on disk and copied.
+	pub on_disk: u64,
+	/// How many bytes were written to the file since it was last in sync.
+	pub modified: u64,
+	/// The ranges not on disk, zeros in the copy, in order, none adjacent to another.
+	pub zeroed: Vec<ByteRange>,
+}
+
 /// Why the core skips a local item it cannot sync safely.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnsupportedKind {
@@ -531,6 +544,25 @@ pub trait LocalFs: sealed::Sealed + Send + Sync + 'static {
 		to: &RootPath,
 	) -> Result<(), LocalError>;
 
+	/// Copies what is on disk of the file placeholder at `path`, if it is still the item `expect`,
+	/// into a new ordinary file at `to` as long as the file: exactly the bytes of `ranges`, the
+	/// ranges [`LocalFs::on_disk_ranges`] reported, every other byte written as zero.
+	/// [`LocalError::Exists`] when anything is at `to`, [`LocalError::NotFound`] when the file is
+	/// another item. Reads nothing outside `ranges`, so it never asks the provider for a byte.
+	/// Refused before anything is read when `ranges` are no longer the file's ranges on disk, or do
+	/// not add up to what the platform says is on disk; a read of a range that fails or comes back
+	/// short ends the copy, so no byte reported on disk is written as zero. The bytes copied must
+	/// read back from the copy as they were read, or the copy fails. Synced before this returns; a
+	/// copy cut short, `stop` returning true included ([`LocalError::Busy`]), is removed.
+	fn copy_on_disk_to_plain(
+		&self,
+		path: &RootPath,
+		expect: LocalFileId,
+		ranges: &[ByteRange],
+		to: &RootPath,
+		stop: &dyn Fn() -> bool,
+	) -> Result<IncompleteCopy, LocalError>;
+
 	/// Opens the file at `path`, if it is still the item `expect`, as a [`LocalFs::Guard`]: until
 	/// the guard drops, every other open of the file for writing fails with a sharing violation, a
 	/// placeholder's data is neither read nor fetched, and the file can still be renamed and
@@ -559,6 +591,14 @@ pub trait LocalFs: sealed::Sealed + Send + Sync + 'static {
 	/// is read from its attributes, which a disconnected root disguises. [`LocalError::NotFound`]
 	/// once it is no placeholder.
 	fn guarded_snapshot(&self, guard: &Self::Guard) -> Result<FileSnapshot, LocalError>;
+
+	/// The ranges of the file placeholder `guard` holds whose bytes are on disk, as
+	/// [`LocalFs::on_disk_ranges`] reads them, through the guard.
+	fn guarded_ranges(&self, guard: &Self::Guard) -> Result<Vec<ByteRange>, LocalError>;
+
+	/// Creates the ordinary file `to` holding `bytes`, synced before this returns:
+	/// [`LocalError::Exists`] when anything is at `to`.
+	fn create_plain(&self, to: &RootPath, bytes: &[u8]) -> Result<(), LocalError>;
 
 	/// Gives the directory placeholder at `path`, if still the item `expect`, the identity
 	/// `identity`, and marks it in sync.

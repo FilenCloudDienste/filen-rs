@@ -51,16 +51,16 @@ pub use dispatch::{CacheDispatcher, CloudFilesCallback, DispatchConfig, Dispatch
 pub use drive::Drive;
 pub use failure::Failure;
 pub use helper::{
-	ActivityEntry, ActivityKind, BrandingScope, CacheOpener, Cleared, DriveOpener, ErrorCode,
-	ExistingRoot, ExitReason, FatalCode, Hello, HelperConfig, IdentifiedItem, InMessage, ItemPath,
-	KeptEarlier, KeptId, KeptItem, KeptItemReason, MAX_LINE_BYTES, MAX_LIST_ENTRIES,
-	MAX_MESSAGE_CHARS, MIN_BUILD, OutMessage, PROTOCOL_VERSION, ParseError, PhaseName, Platform,
-	PlatformError, PlatformFailed, PlatformOp, Registration, ReplyError, ReplyValue, Request,
-	RequestId, RootDir, RootDirError, RootListing, RootRefusal, SkippedEntry, SkippedPlace,
-	StateDir, StateDirError, StateLock, StateReport, StatusEvent, THUMBNAIL_SERVER_ARG,
-	THUMBNAIL_SERVER_IDLE, UnregisterAll, UnregisterAllEntry, UnregisterReport, UserId, fatal,
-	install_stderr_logging, parse_line, run_helper, serve_refusing_thumbnails, serve_stdio,
-	unregister_all, unregister_all_stdio,
+	AbandonReport, ActivityEntry, ActivityKind, BrandingScope, CacheOpener, Cleared, DriveOpener,
+	ErrorCode, ExistingRoot, ExitReason, FatalCode, Hello, HelperConfig, IdentifiedItem, InMessage,
+	IncompleteItem, ItemPath, KeptEarlier, KeptId, KeptItem, KeptItemReason, MAX_LINE_BYTES,
+	MAX_LIST_ENTRIES, MAX_MESSAGE_CHARS, MIN_BUILD, OutMessage, PROTOCOL_VERSION, ParseError,
+	PhaseName, Platform, PlatformError, PlatformFailed, PlatformOp, Registration, ReplyError,
+	ReplyValue, Request, RequestId, RootDir, RootDirError, RootListing, RootRefusal, SkippedEntry,
+	SkippedPlace, StateDir, StateDirError, StateLock, StateReport, StatusEvent,
+	THUMBNAIL_SERVER_ARG, THUMBNAIL_SERVER_IDLE, UnregisterAll, UnregisterAllEntry,
+	UnregisterReport, UserId, fatal, install_stderr_logging, parse_line, run_helper,
+	serve_refusing_thumbnails, serve_stdio, unregister_all, unregister_all_stdio,
 };
 pub use identity::{IdentityBlob, IdentityError, MAX_IDENTITY_LEN, PlaceholderIdentity};
 pub use local::{
@@ -71,9 +71,9 @@ pub use names::{NameRejection, PlaceholderName};
 pub use os::{
 	AlignedChunk, ByteRange, CancelRequest, CancelledRange, CheckedHash, Completed, DataResponder,
 	DehydrateReason, DehydrateRequest, DehydrateResponder, DeleteRequest, DeleteResponder,
-	EntryOutcome, FetchDataRequest, FileSnapshot, FileStamp, IfPinned, LocalEntry, LocalError,
-	LocalEvent, LocalFileId, LocalFs, LocalKind, LocalWatcher, OptionalRange, OsError, PinAttr,
-	PlaceholderState, PopulateRequest, PopulateResponder, RenameRequest, RenameResponder,
+	EntryOutcome, FetchDataRequest, FileSnapshot, FileStamp, IfPinned, IncompleteCopy, LocalEntry,
+	LocalError, LocalEvent, LocalFileId, LocalFs, LocalKind, LocalWatcher, OptionalRange, OsError,
+	PinAttr, PlaceholderState, PopulateRequest, PopulateResponder, RenameRequest, RenameResponder,
 	RenameTarget, RequestedRange, TransferKey, UnsupportedKind, Updated, WatchError, WatchSignal,
 	WatchSink,
 };

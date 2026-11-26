@@ -35,12 +35,12 @@ pub use unregister::{Cleared, UnregisterAll, unregister_all};
 pub(crate) use unregister::{clear_plain_root, path_taken, set_plain_root_aside};
 
 pub use protocol::{
-	ActivityEntry, ActivityKind, ErrorCode, FatalCode, Hello, IdentifiedItem, InMessage, ItemPath,
-	KeptEarlier, KeptId, KeptItem, KeptItemReason, MAX_LINE_BYTES, MAX_LIST_ENTRIES,
-	MAX_MESSAGE_CHARS, OutMessage, PROTOCOL_VERSION, ParseError, PhaseName, Registration,
-	ReplyError, ReplyValue, Request, RequestId, RootDir, RootDirError, RootListing, SkippedEntry,
-	SkippedPlace, StateReport, StatusEvent, UnregisterAllEntry, UnregisterReport, UserId,
-	parse_line,
+	AbandonReport, ActivityEntry, ActivityKind, ErrorCode, FatalCode, Hello, IdentifiedItem,
+	InMessage, IncompleteItem, ItemPath, KeptEarlier, KeptId, KeptItem, KeptItemReason,
+	MAX_LINE_BYTES, MAX_LIST_ENTRIES, MAX_MESSAGE_CHARS, OutMessage, PROTOCOL_VERSION, ParseError,
+	PhaseName, Registration, ReplyError, ReplyValue, Request, RequestId, RootDir, RootDirError,
+	RootListing, SkippedEntry, SkippedPlace, StateReport, StatusEvent, UnregisterAllEntry,
+	UnregisterReport, UserId, parse_line,
 };
 
 /// Whether the parent asked the helper to stop: set once it sent `shutdown` or closed its input,

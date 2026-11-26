@@ -93,6 +93,10 @@ const _: () = {
 		cfapi::ERROR_CLOUD_FILE_INVALID_REQUEST == Foundation::ERROR_CLOUD_FILE_INVALID_REQUEST
 	);
 	assert!(cfapi::ERROR_CLOUD_FILE_IN_USE == Foundation::ERROR_CLOUD_FILE_IN_USE);
+	assert!(
+		cfapi::ERROR_CLOUD_FILE_AUTHENTICATION_FAILED
+			== Foundation::ERROR_CLOUD_FILE_AUTHENTICATION_FAILED
+	);
 	assert!(cfapi::ERROR_FILE_NOT_FOUND == Foundation::ERROR_FILE_NOT_FOUND);
 	assert!(cfapi::ERROR_PATH_NOT_FOUND == Foundation::ERROR_PATH_NOT_FOUND);
 	assert!(cfapi::ERROR_INVALID_FUNCTION == Foundation::ERROR_INVALID_FUNCTION);

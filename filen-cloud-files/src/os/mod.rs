@@ -6,6 +6,9 @@
 // The Windows layer's rules, apart from the calls: built on Windows, and in tests on every host.
 #[cfg(any(windows, test))]
 pub(crate) mod cfapi;
+// The copy of what is on disk the Windows layer and the fake root share.
+#[cfg(any(windows, test, feature = "test-seams"))]
+pub(crate) mod incomplete;
 mod local;
 mod watch;
 #[cfg(windows)]
@@ -14,9 +17,9 @@ pub(crate) mod win;
 pub(crate) use local::ticks_to_unix_millis;
 pub use local::{
 	ByteRange, CheckedHash, Completed, DehydrateReason, DehydrateRequest, DehydrateResponder,
-	DeleteRequest, DeleteResponder, FileSnapshot, FileStamp, IfPinned, LocalEntry, LocalError,
-	LocalEvent, LocalFileId, LocalFs, LocalKind, PinAttr, PlaceholderState, RenameRequest,
-	RenameResponder, RenameTarget, UnsupportedKind, Updated,
+	DeleteRequest, DeleteResponder, FileSnapshot, FileStamp, IfPinned, IncompleteCopy, LocalEntry,
+	LocalError, LocalEvent, LocalFileId, LocalFs, LocalKind, PinAttr, PlaceholderState,
+	RenameRequest, RenameResponder, RenameTarget, UnsupportedKind, Updated,
 };
 pub use watch::{LocalWatcher, WatchError, WatchSignal, WatchSink};
 
