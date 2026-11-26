@@ -1553,3 +1553,19 @@ async fn a_dehydration_of_a_directory_or_with_an_unreadable_cache_row_is_vetoed(
 	);
 	assert_eq!(world.on_disk("a.bin"), u64::try_from(SIZE).unwrap());
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_pinned_file_of_a_held_root_is_hydrated_only_once_the_hold_ends() {
+	let world = unstarted();
+	let bytes = pattern(SIZE);
+	world.placed("a.bin", &bytes, &bytes, 0);
+	let world = world.started().await;
+	world.engine.set_held(true);
+	world.local.user_pin(&root_path("a.bin"), PinAttr::Pinned);
+	world.run(Duration::from_secs(60)).await;
+	assert_eq!(world.hydrations("a.bin"), 0);
+	assert_eq!(world.on_disk("a.bin"), 0);
+	world.engine.set_held(false);
+	world.run(Duration::from_secs(10)).await;
+	assert_eq!(world.on_disk("a.bin"), u64::try_from(SIZE).unwrap());
+}

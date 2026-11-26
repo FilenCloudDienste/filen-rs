@@ -89,6 +89,10 @@ impl Kinds {
 	/// No kind.
 	pub(super) const NONE: Self = Self(0);
 
+	/// Every kind.
+	pub(super) const ALL: Self =
+		Self(Kind::Local.bit() | Kind::Remote.bit() | Kind::Children.bit() | Kind::Hydration.bit());
+
 	/// The set holding `kind` alone.
 	pub(super) const fn of(kind: Kind) -> Self {
 		Self(kind.bit())
@@ -112,6 +116,11 @@ impl Kinds {
 	/// The kinds in both sets.
 	pub(super) fn intersect(self, other: Self) -> Self {
 		Self(self.0 & other.0)
+	}
+
+	/// The kinds in this set and not in `other`.
+	pub(super) fn minus(self, other: Self) -> Self {
+		Self(self.0 & !other.0)
 	}
 
 	/// Both sets together.
@@ -248,6 +257,9 @@ struct Entry {
 	waited: Option<Waited>,
 	/// The kinds of job the path waits for, beside those running.
 	kinds: Kinds,
+	/// Of those, the ones a local job waits on ([`Queue::push_for_local`]): they run while the root
+	/// is held, as the local change cannot go up before them.
+	for_local: Kinds,
 	/// Whether the path is known to hold a local change the drive lacks: a job on it found bytes to
 	/// carry, or ended without carrying its change, since the change was queued. Unset while its
 	/// change was only named by an event or a walk, which may have changed nothing.
@@ -290,6 +302,17 @@ impl Queue {
 		kind: Kind,
 	) -> Admit {
 		self.push_kinds(path, now, delay, Kinds::of(kind))
+	}
+
+	/// Queues a `kind` job on `path` at once, as [`Queue::push_kind`] does, for a local job that
+	/// cannot go on before it: it runs even where only local jobs may ([`Queue::take_due`]'s
+	/// `runnable`), once, until it ends.
+	pub(super) fn push_for_local(&mut self, path: &RootPath, now: Instant, kind: Kind) -> Admit {
+		let admit = self.push_kinds(path, now, Delay::Now, Kinds::of(kind));
+		if let Some(entry) = self.entries.get_mut(&path.case_key()) {
+			entry.for_local = entry.for_local.with(kind);
+		}
+		admit
 	}
 
 	fn push_kinds(&mut self, path: &RootPath, now: Instant, delay: Delay, kinds: Kinds) -> Admit {
@@ -339,6 +362,7 @@ impl Queue {
 				sent: None,
 				waited: None,
 				kinds,
+				for_local: Kinds::NONE,
 				looked: false,
 				state: State::Waiting { busy: None },
 			},
@@ -349,17 +373,24 @@ impl Queue {
 	/// Up to `limit` paths due at `now`, shallowest first so a directory goes before what it holds,
 	/// marked running, each with the kinds of job to run on it. Of the paths waiting for the
 	/// hydration job alone, at most `hydrations`: the others wait for a hydration to end, so they
-	/// never hold a job slot a user's change could run in.
+	/// never hold a job slot a user's change could run in. Only the `runnable` kinds run, and those a
+	/// local job waits on: a path waiting for none of them is not taken, and its other kinds stay
+	/// with its entry, to run once they may.
 	pub(super) fn take_due(
 		&mut self,
 		now: Instant,
 		limit: usize,
 		mut hydrations: usize,
+		runnable: Kinds,
 	) -> Vec<(RootPath, Kinds)> {
 		let mut due: Vec<(&CaseKey, &Entry)> = self
 			.entries
 			.iter()
-			.filter(|(_, entry)| matches!(entry.state, State::Waiting { .. }) && entry.due <= now)
+			.filter(|(_, entry)| {
+				matches!(entry.state, State::Waiting { .. })
+					&& entry.due <= now
+					&& !entry.runnable(runnable).is_empty()
+			})
 			.collect();
 		due.sort_by_key(|(_, entry)| (entry.path.depth(), entry.due));
 		let keys: Vec<CaseKey> = due
@@ -381,7 +412,8 @@ impl Queue {
 				let State::Waiting { busy } = entry.state else {
 					return None;
 				};
-				let running = std::mem::take(&mut entry.kinds);
+				let running = entry.runnable(runnable);
+				entry.kinds = entry.kinds.minus(running);
 				entry.state = State::Running {
 					again: false,
 					busy,
@@ -393,13 +425,15 @@ impl Queue {
 	}
 
 	/// When the next waiting path is due, leaving out those waiting for the hydration job alone
-	/// unless `hydrations` may start.
-	pub(super) fn next_due(&self, hydrations: bool) -> Option<Instant> {
+	/// unless `hydrations` may start, and those waiting for none of the `runnable` kinds nor any a
+	/// local job waits on.
+	pub(super) fn next_due(&self, hydrations: bool, runnable: Kinds) -> Option<Instant> {
 		self.entries
 			.values()
 			.filter(|entry| {
 				matches!(entry.state, State::Waiting { .. })
 					&& (hydrations || entry.kinds != Kinds::of(Kind::Hydration))
+					&& !entry.runnable(runnable).is_empty()
 			})
 			.map(|entry| entry.due)
 			.min()
@@ -438,13 +472,17 @@ impl Queue {
 			// drive yet.
 			entry.looked |= running.has(Kind::Local);
 		}
+		// What a local job waited on and still waits runs on; what ended is asked for anew.
+		entry.for_local = entry.for_local.intersect(entry.kinds);
 		let waited = entry.waited.take();
 		let failed = match outcome {
 			Outcome::Done | Outcome::Skipped => {
-				if again && !entry.kinds.is_empty() {
+				// Kinds are left when an event came while the job ran, or when they could not run
+				// as it started (`take_due`): those wait as they are, due at once.
+				if !entry.kinds.is_empty() {
 					entry.state = waiting(None);
 					entry.first_seen = now;
-					entry.due = now + self.debounce;
+					entry.due = if again { now + self.debounce } else { now };
 					entry.attempts = 0;
 					entry.agains = 0;
 					entry.hold = None;
@@ -781,6 +819,12 @@ impl Entry {
 			State::Waiting { .. } | State::Blocked(_) | State::Parked(_) => Kinds::NONE,
 		};
 		self.kinds.union(running).has(Kind::Local)
+	}
+
+	/// The kinds it waits for that may run where only the `runnable` kinds may: those, and those
+	/// a local job waits on.
+	fn runnable(&self, runnable: Kinds) -> Kinds {
+		self.kinds.intersect(runnable.union(self.for_local))
 	}
 }
 

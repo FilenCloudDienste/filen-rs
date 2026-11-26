@@ -88,6 +88,10 @@ struct Inner<D> {
 	/// Set by [`Dispatcher::close`], read and written only under `tasks`' lock: no task is spawned
 	/// once it is set.
 	closed: AtomicBool,
+	/// Set while the root is held ([`Dispatcher::hold`]), read and written only under
+	/// `in_flight`'s lock: another process's read is either registered before the hold, which
+	/// fails it, or refused.
+	held: AtomicBool,
 	/// Who to tell of populations, reads and out-of-date placeholders, once set.
 	hints: OnceLock<Arc<RemoteHints>>,
 }
@@ -99,17 +103,20 @@ struct InFlight {
 	offset: i64,
 	len: i64,
 	controller: FfiAbortController,
-	/// Set before an abort the OS did not ask for by name, so the read fails rather than ends
-	/// as cancelled: shared with its [`ReadResponder`].
-	given_up: Arc<AtomicBool>,
+	/// Whether the provider's own process raised the read: a hold leaves it running.
+	own: bool,
+	/// How the read fails, set before an abort the OS did not ask for by name, so the read fails
+	/// rather than ends as cancelled: shared with its [`ReadResponder`]. The first setter wins.
+	given_up: Arc<OnceLock<Failure>>,
 }
 
 /// The responder a read runs with, around the OS layer's. A read the dispatcher aborted without
-/// the OS naming it is failed as [`Failure::Transient`] instead of ended as cancelled, as its
-/// request may still be live and would otherwise wait out the OS's 60 s timeout.
+/// the OS naming it is failed (as [`Failure::Transient`], or [`Failure::NotAuthenticated`] for a
+/// hold) instead of ended as cancelled, as its request may still be live and would otherwise wait
+/// out the OS's 60 s timeout.
 struct ReadResponder<R> {
 	inner: R,
-	given_up: Arc<AtomicBool>,
+	given_up: Arc<OnceLock<Failure>>,
 	/// The read permit, once taken.
 	permit: Option<OwnedSemaphorePermit>,
 }
@@ -130,10 +137,9 @@ impl<R: DataResponder> DataResponder for ReadResponder<R> {
 	}
 
 	fn cancelled(self) {
-		if self.given_up.load(Ordering::Acquire) {
-			self.inner.fail(Failure::Transient);
-		} else {
-			self.inner.cancelled();
+		match self.given_up.get() {
+			Some(&failure) => self.inner.fail(failure),
+			None => self.inner.cancelled(),
 		}
 	}
 }
@@ -194,6 +200,7 @@ impl<D: Drive> Dispatcher<D> {
 				next_id: AtomicU64::new(0),
 				tasks: Mutex::new(JoinSet::new()),
 				closed: AtomicBool::new(false),
+				held: AtomicBool::new(false),
 				hints: OnceLock::new(),
 			}),
 		}
@@ -239,6 +246,11 @@ impl<D: Drive> Dispatcher<D> {
 		request: PopulateRequest,
 		responder: R,
 	) {
+		if !request.own_process() && self.inner.held.load(Ordering::Relaxed) {
+			debug!("refused another process's population of a held root");
+			responder.fail(Failure::NotAuthenticated);
+			return;
+		}
 		let inner = Arc::clone(&self.inner);
 		self.spawn(async move {
 			// Only a directory that decodes can have children to skip.
@@ -277,30 +289,40 @@ impl<D: Drive> Dispatcher<D> {
 
 	/// A `FETCH_DATA` request: registers the read so a cancel finds it, then hydrates it from a
 	/// task once a read permit is free. A cancel reaching the request while it waits for a permit
-	/// ends it there, so it neither reads nor holds up the requests behind it. Never blocks.
+	/// ends it there, so it neither reads nor holds up the requests behind it. Another process's
+	/// read of a held root fails at once as [`Failure::NotAuthenticated`]. Never blocks.
 	pub fn on_fetch_data<R: DataResponder>(&self, request: FetchDataRequest, responder: R) {
 		let key = request.transfer();
 		let range = request.range();
+		let own = request.own_process();
 		let controller = FfiAbortController::new();
 		let abort = controller.signal();
 		let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
-		let given_up = Arc::new(AtomicBool::new(false));
-		let mut responder = ReadResponder {
-			inner: responder,
-			given_up: Arc::clone(&given_up),
-			permit: None,
-		};
-		// Registered before the task exists, so a cancel arriving at once still finds it.
-		lock(&self.inner.in_flight)
-			.entry(key)
-			.or_default()
-			.push(InFlight {
+		let given_up = Arc::new(OnceLock::new());
+		{
+			// Registered before the task exists, so a cancel or a hold arriving at once still finds
+			// it; the hold is read under the same lock.
+			let mut in_flight = lock(&self.inner.in_flight);
+			if !own && self.inner.held.load(Ordering::Relaxed) {
+				drop(in_flight);
+				debug!(?key, "refused another process's read of a held root");
+				responder.fail(Failure::NotAuthenticated);
+				return;
+			}
+			in_flight.entry(key).or_default().push(InFlight {
 				id,
 				offset: range.required_offset(),
 				len: range.required_len(),
 				controller,
-				given_up,
+				own,
+				given_up: Arc::clone(&given_up),
 			});
+		}
+		let mut responder = ReadResponder {
+			inner: responder,
+			given_up,
+			permit: None,
+		};
 		let guard = InFlightGuard {
 			inner: Arc::clone(&self.inner),
 			key,
@@ -310,7 +332,6 @@ impl<D: Drive> Dispatcher<D> {
 			.ok()
 			.and_then(FileVersion::of);
 		let stable = file.map(|file| file.stable);
-		let own = request.own_process();
 		let reading = file
 			.zip(self.inner.hints.get())
 			.map(|(file, hints)| hints.reading(file, own));
@@ -416,16 +437,37 @@ impl<D: Drive> Dispatcher<D> {
 			let several = named().nth(1).is_some();
 			for read in named() {
 				if several {
-					read.given_up.store(true, Ordering::Release);
+					let _ = read.given_up.set(Failure::Transient);
 				}
 				read.controller.abort();
 			}
 		} else {
 			for read in reads {
-				read.given_up.store(true, Ordering::Release);
+				let _ = read.given_up.set(Failure::Transient);
 				read.controller.abort();
 			}
 		}
+	}
+
+	/// Holds the root: every later read and population another process raises fails at once as
+	/// [`Failure::NotAuthenticated`], and every read of another process's in flight, waiting for a
+	/// permit or transferring, fails so too (what it transferred stays). The provider's own reads
+	/// and populations are served as before, and populations in flight are left to finish: they
+	/// place names and sizes, no content. Until [`Dispatcher::release`].
+	pub fn hold(&self) {
+		let in_flight = lock(&self.inner.in_flight);
+		self.inner.held.store(true, Ordering::Relaxed);
+		for read in in_flight.values().flatten().filter(|read| !read.own) {
+			// A read given up already keeps the failure it was given.
+			let _ = read.given_up.set(Failure::NotAuthenticated);
+			read.controller.abort();
+		}
+	}
+
+	/// Ends a hold: every process's requests are served again.
+	pub fn release(&self) {
+		let _in_flight = lock(&self.inner.in_flight);
+		self.inner.held.store(false, Ordering::Relaxed);
 	}
 
 	/// Aborts every task and waits for them to end. Each request a task left unanswered fails as

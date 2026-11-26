@@ -732,3 +732,176 @@ async fn a_read_of_a_damaged_version_fails_damaged_without_reading() {
 	assert_eq!(drive.reads(), Vec::new());
 	os.assert_clean();
 }
+
+// ---- a held root ----
+
+/// A drive listing nothing in the root, and an OS whose root is not populated yet.
+fn unpopulated() -> (Arc<FakeDrive>, FakeOs) {
+	let drive = FakeDrive::new(ROOT_UUID);
+	drive.list(&ROOT_UUID.to_string(), Vec::new());
+	(Arc::new(drive), FakeOs::with_root(ROOT))
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_held_root_refuses_another_processs_read_and_serves_its_own() {
+	let (drive, os) = placed();
+	let (dispatcher, _) = dispatcher(Arc::clone(&drive), 8);
+	dispatcher.hold();
+	let (foreign, responder) = os.fetch_data(&FILE, (0, 4096), (0, 0));
+	let foreign = {
+		let key = foreign.transfer();
+		dispatcher.on_fetch_data(foreign, responder);
+		key
+	};
+	let (own, responder) = os.fetch_data_from_self(&FILE, (0, 4096), (0, 0));
+	let own = {
+		let key = own.transfer();
+		dispatcher.on_fetch_data(own, responder);
+		key
+	};
+	settle(&dispatcher).await;
+	assert_eq!(
+		ends(&os, foreign),
+		[FakeEvent::Failed(foreign, Failure::NotAuthenticated)]
+	);
+	assert_eq!(ends(&os, own), [FakeEvent::Completed(own)]);
+	assert_eq!(
+		drive.reads(),
+		[(0, 4096)],
+		"only the own read reached the drive"
+	);
+	assert_eq!(registered(&dispatcher), 0);
+	os.assert_clean();
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_hold_fails_another_processs_reads_in_flight_and_leaves_its_own() {
+	let (drive, os) = placed();
+	let gate = drive.gate_reads();
+	let (dispatcher, _) = dispatcher(Arc::clone(&drive), 2);
+	let send = |own: bool, range: (i64, i64)| {
+		let (request, responder) = if own {
+			os.fetch_data_from_self(&FILE, range, (0, 0))
+		} else {
+			os.fetch_data(&FILE, range, (0, 0))
+		};
+		let key = request.transfer();
+		dispatcher.on_fetch_data(request, responder);
+		key
+	};
+	let transferring = send(false, (0, 4096));
+	let own = send(true, (4096, 4096));
+	let queued = send(false, (8192, 1808));
+	drive.reads_started(2).await;
+	dispatcher.hold();
+	run_until_idle().await;
+	assert_eq!(
+		ends(&os, transferring),
+		[FakeEvent::Failed(transferring, Failure::NotAuthenticated)]
+	);
+	assert_eq!(
+		ends(&os, queued),
+		[FakeEvent::Failed(queued, Failure::NotAuthenticated)]
+	);
+	assert_eq!(ends(&os, own), []);
+	gate.add_permits(1);
+	settle(&dispatcher).await;
+	assert_eq!(ends(&os, own), [FakeEvent::Completed(own)]);
+	assert_eq!(
+		drive.reads(),
+		[(0, 4096), (4096, 8192)],
+		"the queued read never read"
+	);
+	assert_eq!(registered(&dispatcher), 0);
+	os.assert_clean();
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_held_root_refuses_another_processs_population_and_serves_its_own() {
+	let (drive, os) = unpopulated();
+	let (dispatcher, _) = dispatcher(Arc::clone(&drive), 8);
+	dispatcher.hold();
+	let (request, responder) = os.fetch_placeholders(&ROOT);
+	dispatcher.on_fetch_placeholders(request, responder);
+	settle(&dispatcher).await;
+	assert_eq!(
+		os.events(),
+		[FakeEvent::PopulateFailed(Failure::NotAuthenticated)]
+	);
+	let (request, responder) = os.fetch_placeholders_from_self(&ROOT);
+	dispatcher.on_fetch_placeholders(request, responder);
+	settle(&dispatcher).await;
+	assert_eq!(
+		os.events(),
+		[
+			FakeEvent::PopulateFailed(Failure::NotAuthenticated),
+			FakeEvent::Populated {
+				dir: ROOT,
+				entries: Vec::new()
+			}
+		]
+	);
+	os.assert_clean();
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_released_root_serves_every_process_again() {
+	let (drive, os) = placed();
+	let (dispatcher, _) = dispatcher(Arc::clone(&drive), 8);
+	dispatcher.hold();
+	dispatcher.release();
+	let (request, responder) = os.fetch_data(&FILE, (0, 4096), (0, 0));
+	let key = request.transfer();
+	dispatcher.on_fetch_data(request, responder);
+	settle(&dispatcher).await;
+	assert_eq!(ends(&os, key), [FakeEvent::Completed(key)]);
+	let (drive, os) = unpopulated();
+	let (dispatcher, _) = self::dispatcher(drive, 8);
+	dispatcher.hold();
+	dispatcher.release();
+	let (request, responder) = os.fetch_placeholders(&ROOT);
+	dispatcher.on_fetch_placeholders(request, responder);
+	settle(&dispatcher).await;
+	assert_eq!(
+		os.events(),
+		[FakeEvent::Populated {
+			dir: ROOT,
+			entries: Vec::new()
+		}]
+	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_read_racing_a_hold_is_refused_or_failed_never_served() {
+	const READS: usize = 200;
+	let (drive, os) = placed();
+	// No read reaches its bytes before the hold: one served would be one the race let through.
+	let gate = drive.gate_reads();
+	let (dispatcher, _) = dispatcher(Arc::clone(&drive), 8);
+	let dispatcher = Arc::new(dispatcher);
+	let os_thread = {
+		let (dispatcher, os) = (Arc::clone(&dispatcher), os.clone());
+		thread::spawn(move || {
+			(0..READS)
+				.map(|_| {
+					let (request, responder) = os.fetch_data(&FILE, (0, 4096), (0, 0));
+					let key = request.transfer();
+					dispatcher.on_fetch_data(request, responder);
+					key
+				})
+				.collect::<Vec<_>>()
+		})
+	};
+	dispatcher.hold();
+	let keys = os_thread.join().unwrap();
+	gate.add_permits(READS);
+	settle(&dispatcher).await;
+	for key in keys {
+		assert_eq!(
+			ends(&os, key),
+			[FakeEvent::Failed(key, Failure::NotAuthenticated)]
+		);
+	}
+	assert_eq!(registered(&dispatcher), 0);
+	os.assert_clean();
+}

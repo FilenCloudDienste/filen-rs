@@ -135,6 +135,7 @@ pub(super) fn fetch_placeholders(info: CallbackInfo) {
 		pid = info.pid,
 		"cf callback"
 	);
+	let own = own_process(&info);
 	let responder = WinPopulate::new(info.keys);
 	let identity = match info.identity {
 		Ok(identity) => identity,
@@ -148,14 +149,21 @@ pub(super) fn fetch_placeholders(info: CallbackInfo) {
 	let Some(target) = info.slot.and_then(ContextSlot::target) else {
 		return;
 	};
-	target.fetch_placeholders(PopulateRequest::new(identity), responder);
+	target.fetch_placeholders(PopulateRequest::new(identity, own), responder);
 }
 
 /// Whether the callback was raised by this process: the provider's own renames and deletes (an
 /// aside rename of a conflict's loser) are the core's doing, so they are allowed without asking
-/// it, and its own closes are not looked at.
+/// it, and its own closes are not looked at. A callback with no process id, which the connection
+/// asks the OS for (`CF_CONNECT_FLAG_REQUIRE_PROCESS_INFO`), counts as another process's, so a
+/// held root refuses it even when it is the provider's own read: logged, as the hold could then
+/// stop the root's own fetches.
 fn own_process(info: &CallbackInfo) -> bool {
-	info.pid == Some(process::id())
+	let Some(pid) = info.pid else {
+		warn!(target: LOG_TARGET, "a callback carried no process id; taken as another process's");
+		return false;
+	};
+	pid == process::id()
 }
 
 /// The identity a delete or rename notification carries, or `None`, logged, when it carries none

@@ -171,6 +171,9 @@ struct Inner<D, L> {
 	/// Set once the engine stops: a hash running on the blocking pool ends at it.
 	// Reason for the Arc: each blocking hash takes its own handle to it.
 	stop: Arc<AtomicBool>,
+	/// Set while the root is held ([`LocalEngine::set_held`]): only local changes are carried to
+	/// the drive, and other processes' deletes and renames are vetoed.
+	held: AtomicBool,
 	/// Every task spawned; a std Mutex, held only to spawn into or take the set.
 	tasks: Mutex<JoinSet<()>>,
 	// Reason for the Arc: the dispatcher holds it too.
@@ -395,6 +398,7 @@ impl<D: Drive, L: LocalFs> LocalEngine<D, L> {
 				uploads: Semaphore::new(clamp(config.max_concurrent_uploads)),
 				hydrations: Arc::new(Semaphore::new(clamp(config.max_concurrent_hydrations))),
 				stop: Arc::new(AtomicBool::new(false)),
+				held: AtomicBool::new(false),
 				tasks: Mutex::new(JoinSet::new()),
 				hints: Arc::new(RemoteHints::default()),
 				feed_wake: Arc::new(Notify::new()),
@@ -417,6 +421,28 @@ impl<D: Drive, L: LocalFs> LocalEngine<D, L> {
 		self.inner
 			.spawn(Inner::startup_and_safety_net(Arc::clone(&self.inner)));
 		self.inner.spawn(remote::run_hints(Arc::clone(&self.inner)));
+	}
+
+	/// Holds the root, or ends the hold. While held, only the local side's jobs run, so every local
+	/// change still goes up to the drive (an edit partly on disk is still hydrated first, through
+	/// the provider's own read); every other kind of job (a directory reconciled with the drive, a
+	/// remote change applied, a file hydrated or checked) waits in the queue, so nothing new from
+	/// the drive is placed or downloaded, and a job already running ends as it would. The one
+	/// exception is the remote job a local job waits on: the directory of a change, which the drive
+	/// trashed or moved, is brought to what the drive holds (its clean items removed, it created
+	/// on the drive anew) so the change can go up. Other
+	/// processes' deletes and renames are vetoed as [`Failure::NotAuthenticated`], so the tree
+	/// holds still and nothing on the drive is trashed or moved. Ending the hold runs what waited
+	/// and walks the root, which finds what the hold left undone (pinned files to hydrate). Callable
+	/// before [`LocalEngine::start`].
+	///
+	/// [`Failure::NotAuthenticated`]: crate::Failure::NotAuthenticated
+	pub fn set_held(&self, held: bool) {
+		let was = self.inner.held.swap(held, Ordering::Relaxed);
+		if was && !held {
+			Inner::request_walk(&self.inner);
+		}
+		self.inner.wake.notify_one();
 	}
 
 	/// What the dispatcher tells the remote side: a directory populated, a read in flight, a read
@@ -627,6 +653,11 @@ impl<D: Drive, L: LocalFs> Drop for LocalEngine<D, L> {
 }
 
 impl<D: Drive, L: LocalFs> Inner<D, L> {
+	/// Whether the root is held ([`LocalEngine::set_held`]).
+	fn held(&self) -> bool {
+		self.held.load(Ordering::Relaxed)
+	}
+
 	/// Spawns `task` on the runtime, reaping the tasks that finished; nothing once stopped.
 	fn spawn(&self, task: impl Future<Output = ()> + Send + 'static) {
 		if lock(&self.state).stopped {
@@ -745,6 +776,18 @@ impl<D: Drive, L: LocalFs> Inner<D, L> {
 		self.wake.notify_one();
 	}
 
+	/// Queues a `kind` job on `path` at once for a local job that cannot go on before it, so it
+	/// runs while the root is held too ([`Queue::push_for_local`]).
+	fn push_for_local(self: &Arc<Self>, path: &RootPath, kind: Kind) {
+		let admit = lock(&self.state)
+			.queue
+			.push_for_local(path, Instant::now(), kind);
+		if admit == Admit::Overflow {
+			self.overflowed();
+		}
+		self.wake.notify_one();
+	}
+
 	/// Drops the queue, which had no room for a path, and walks the root instead.
 	fn overflowed(self: &Arc<Self>) {
 		warn!("the local change queue is full; walking the sync root instead");
@@ -801,7 +844,12 @@ impl<D: Drive, L: LocalFs> Inner<D, L> {
 				let mut state = lock(&self.state);
 				let free = self.jobs.available_permits();
 				let hydrations = self.hydrations.available_permits();
-				let paths = state.queue.take_due(now, free, hydrations);
+				let runnable = if self.held() {
+					Kinds::of(Kind::Local)
+				} else {
+					Kinds::ALL
+				};
+				let paths = state.queue.take_due(now, free, hydrations, runnable);
 				// With every permit taken, the paths still due wait for a job to end, which wakes
 				// this loop, rather than for a time already past.
 				let queue_next = if paths.len() < free {
@@ -809,7 +857,7 @@ impl<D: Drive, L: LocalFs> Inner<D, L> {
 						.iter()
 						.filter(|(_, kinds)| *kinds == Kinds::of(Kind::Hydration))
 						.count() < hydrations;
-					state.queue.next_due(hydrations_left)
+					state.queue.next_due(hydrations_left, runnable)
 				} else {
 					None
 				};

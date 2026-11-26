@@ -207,11 +207,84 @@ async fn kinds_pushed_on_one_path_merge_and_run_together() {
 	let now = Instant::now();
 	queue.push_kind(&path, now, Delay::Now, Kind::Remote);
 	queue.push_kind(&path, now, Delay::Now, Kind::Local);
-	let taken = queue.take_due(now, 8, usize::MAX);
+	let taken = queue.take_due(now, 8, usize::MAX, Kinds::ALL);
 	assert_eq!(
 		taken,
 		vec![(path, Kinds::of(Kind::Remote).with(Kind::Local))]
 	);
+}
+
+#[tokio::test(start_paused = true)]
+async fn kinds_that_may_not_run_wait_with_the_path_until_they_may() {
+	let mut queue = queue();
+	let (both, remote) = (root_path("a.txt"), root_path("b.txt"));
+	let now = Instant::now();
+	let local = Kinds::of(Kind::Local);
+	queue.push_kind(&both, now, Delay::Now, Kind::Remote);
+	queue.push_kind(&both, now, Delay::Now, Kind::Local);
+	queue.push_kind(&remote, now, Delay::Now, Kind::Remote);
+	assert_eq!(
+		queue.take_due(now, 8, usize::MAX, local),
+		vec![(both.clone(), local)]
+	);
+	assert_eq!(queue.next_due(true, local), None, "nothing else may run");
+	queue.finish(
+		&both,
+		&Outcome::Done,
+		Kinds::NONE,
+		now,
+		Duration::from_secs(2),
+	);
+	assert_eq!(queue.take_due(now, 8, usize::MAX, local), Vec::new());
+	let mut taken = queue.take_due(now, 8, usize::MAX, Kinds::ALL);
+	taken.sort_by_key(|(path, _)| path.to_string());
+	assert_eq!(
+		taken,
+		vec![
+			(both, Kinds::of(Kind::Remote)),
+			(remote, Kinds::of(Kind::Remote))
+		]
+	);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_kind_a_local_job_waits_on_runs_where_only_local_jobs_may_until_it_ends() {
+	let mut queue = queue();
+	let dir = root_path("d");
+	let now = Instant::now();
+	let local = Kinds::of(Kind::Local);
+	let remote = Kinds::of(Kind::Remote);
+	queue.push_kind(&dir, now, Delay::Now, Kind::Remote);
+	assert_eq!(queue.take_due(now, 8, usize::MAX, local), Vec::new());
+	queue.push_for_local(&dir, now, Kind::Remote);
+	assert_eq!(queue.next_due(true, local), Some(now));
+	assert_eq!(
+		queue.take_due(now, 8, usize::MAX, local),
+		vec![(dir.clone(), remote)]
+	);
+	// Not finished: it waits on, and still may run.
+	queue.finish(
+		&dir,
+		&Outcome::Wait(Duration::ZERO),
+		remote,
+		now,
+		Duration::from_secs(2),
+	);
+	let later = now + Duration::from_secs(1);
+	assert_eq!(
+		queue.take_due(later, 8, usize::MAX, local),
+		vec![(dir.clone(), remote)]
+	);
+	queue.finish(
+		&dir,
+		&Outcome::Done,
+		Kinds::NONE,
+		later,
+		Duration::from_secs(2),
+	);
+	// Asked for again by the drive alone, it waits for the hold to end.
+	queue.push_kind(&dir, later, Delay::Now, Kind::Remote);
+	assert_eq!(queue.take_due(later, 8, usize::MAX, local), Vec::new());
 }
 
 #[tokio::test(start_paused = true)]
@@ -220,7 +293,7 @@ async fn a_job_that_did_not_finish_owes_its_kinds_and_one_that_did_owes_none() {
 	let path = root_path("a.txt");
 	let now = Instant::now();
 	queue.push_kind(&path, now, Delay::Now, Kind::Remote);
-	queue.take_due(now, 8, usize::MAX);
+	queue.take_due(now, 8, usize::MAX, Kinds::ALL);
 	queue.finish(
 		&path,
 		&Outcome::Busy,
@@ -230,7 +303,7 @@ async fn a_job_that_did_not_finish_owes_its_kinds_and_one_that_did_owes_none() {
 	);
 	let later = now + Duration::from_secs(2);
 	assert_eq!(
-		queue.take_due(later, 8, usize::MAX),
+		queue.take_due(later, 8, usize::MAX, Kinds::ALL),
 		vec![(path.clone(), Kinds::of(Kind::Remote))]
 	);
 	queue.finish(
@@ -240,7 +313,7 @@ async fn a_job_that_did_not_finish_owes_its_kinds_and_one_that_did_owes_none() {
 		later,
 		Duration::from_secs(2),
 	);
-	assert_eq!(queue.next_due(true), None);
+	assert_eq!(queue.next_due(true, Kinds::ALL), None);
 }
 
 #[tokio::test(start_paused = true)]
@@ -249,7 +322,7 @@ async fn an_event_during_a_job_queues_its_own_kind_after_it() {
 	let path = root_path("a.txt");
 	let now = Instant::now();
 	queue.push_kind(&path, now, Delay::Now, Kind::Remote);
-	queue.take_due(now, 8, usize::MAX);
+	queue.take_due(now, 8, usize::MAX, Kinds::ALL);
 	queue.push_kind(&path, now, Delay::Now, Kind::Local);
 	queue.finish(
 		&path,
@@ -260,7 +333,7 @@ async fn an_event_during_a_job_queues_its_own_kind_after_it() {
 	);
 	let later = now + Duration::from_secs(1);
 	assert_eq!(
-		queue.take_due(later, 8, usize::MAX),
+		queue.take_due(later, 8, usize::MAX, Kinds::ALL),
 		vec![(path, Kinds::of(Kind::Local))]
 	);
 }
@@ -272,7 +345,7 @@ async fn a_rebase_carries_the_kinds_a_path_waits_for() {
 	queue.push_kind(&root_path(r"d\a.txt"), now, Delay::Now, Kind::Children);
 	queue.rebase(&root_path("d"), &root_path("e"), now);
 	assert_eq!(
-		queue.take_due(now, 8, usize::MAX),
+		queue.take_due(now, 8, usize::MAX, Kinds::ALL),
 		vec![(root_path(r"e\a.txt"), Kinds::of(Kind::Children))]
 	);
 }
@@ -283,7 +356,7 @@ async fn a_running_job_at_or_under_a_path_makes_it_busy() {
 	let now = Instant::now();
 	queue.push_kind(&root_path(r"d\a.txt"), now, Delay::Now, Kind::Local);
 	queue.push_kind(&root_path("b.txt"), now, Delay::Now, Kind::Local);
-	queue.take_due(now, 8, usize::MAX);
+	queue.take_due(now, 8, usize::MAX, Kinds::ALL);
 	assert!(queue.busy_at_or_under(&root_path("d"), &root_path("x")));
 	assert!(!queue.busy_at_or_under(&root_path("e"), &root_path("x")));
 	assert!(!queue.busy_at_or_under(&root_path("b.txt"), &root_path("B.TXT")));
@@ -2846,4 +2919,39 @@ async fn atomic_saves_at_any_echo_timing_keep_one_item_per_file() {
 		!world.drive.trashed().is_empty(),
 		"some saves' temporary files were uploaded before their rename"
 	);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_held_root_places_no_new_remote_file_until_the_hold_ends() {
+	let world = unstarted().started().await;
+	world.engine.set_held(true);
+	let file = world.drive.add_remote_file(&root_dir(), "a.txt", b"hello");
+	world.settle().await;
+	assert_eq!(world.local.entry(&root_path("a.txt")), None);
+	assert_eq!(world.remote(), Vec::new());
+	world.engine.set_held(false);
+	world.settle().await;
+	assert_eq!(world.identity("a.txt"), Some(identity_of(&file)));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_held_root_uploads_a_new_file_whose_directory_the_drive_trashed() {
+	let (world, uuid, _) = with_dir_and_file();
+	let world = world.started().await;
+	world.engine.set_held(true);
+	world.drive.remote_trash(uuid);
+	world.settle().await;
+	world.local.user_create(&root_path(r"d\new.txt"), b"mine");
+	world.settle().await;
+	world.settle().await;
+	let Some(FfiNonRootObject::Dir(anew)) = world.drive.child(&root_dir(), "d") else {
+		panic!("the directory is created anew");
+	};
+	assert_ne!(anew.uuid, uuid.to_string());
+	let Some(FfiNonRootObject::File(uploaded)) = world.drive.child(&dir_id(&anew.uuid), "new.txt")
+	else {
+		panic!("the new file is on the drive, in the directory created anew");
+	};
+	assert_eq!(world.drive.content(stable_of(&uploaded)), b"mine");
+	assert_eq!(world.engine.unsynced_count(), Some(0));
 }

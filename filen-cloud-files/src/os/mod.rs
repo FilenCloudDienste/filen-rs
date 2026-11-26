@@ -165,12 +165,23 @@ impl FetchDataRequest {
 #[derive(Debug)]
 pub struct PopulateRequest {
 	identity: IdentityBlob,
+	own_process: bool,
 }
 
 impl PopulateRequest {
-	/// The request for the children of the directory placeholder `identity`.
-	pub fn new(identity: IdentityBlob) -> Self {
-		Self { identity }
+	/// The request for the children of the directory placeholder `identity`; `own_process` when
+	/// the provider's own process raised it (a rename or copy of its own into a directory not
+	/// populated yet).
+	pub fn new(identity: IdentityBlob, own_process: bool) -> Self {
+		Self {
+			identity,
+			own_process,
+		}
+	}
+
+	/// Whether the provider's own process raised the request.
+	pub fn own_process(&self) -> bool {
+		self.own_process
 	}
 
 	/// The directory placeholder's identity, unparsed.

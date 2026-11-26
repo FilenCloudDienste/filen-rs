@@ -325,9 +325,13 @@ async fn an_entry_a_local_item_holds_is_not_skipped() {
 #[tokio::test(start_paused = true)]
 async fn a_wrong_outcome_count_is_an_internal_failure() {
 	let drive = drive_listing(vec![file(0x200, "a.txt", 1)]);
-	let failed = populate(&drive, PopulateRequest::new(ROOT.encode()), NoOutcomes)
-		.await
-		.unwrap_err();
+	let failed = populate(
+		&drive,
+		PopulateRequest::new(ROOT.encode(), false),
+		NoOutcomes,
+	)
+	.await
+	.unwrap_err();
 	assert!(
 		matches!(
 			failed.error,
@@ -370,7 +374,7 @@ async fn a_file_identity_is_an_invalid_request() {
 	let drive = drive_listing(Vec::new());
 	let os = FakeOs::with_root(ROOT);
 	let (_, responder) = os.fetch_placeholders(&ROOT);
-	let request = PopulateRequest::new(file_identity(0x200).encode());
+	let request = PopulateRequest::new(file_identity(0x200).encode(), false);
 	let failed = populate(&drive, request, responder).await.unwrap_err();
 	assert!(
 		matches!(failed.error, PopulateError::NotADirectory),
@@ -416,7 +420,7 @@ async fn a_corrupt_identity_is_an_invalid_request() {
 	let drive = drive_listing(Vec::new());
 	let os = FakeOs::with_root(ROOT);
 	let (_, responder) = os.fetch_placeholders(&ROOT);
-	let request = PopulateRequest::new(IdentityBlob::try_from(&[9_u8][..]).unwrap());
+	let request = PopulateRequest::new(IdentityBlob::try_from(&[9_u8][..]).unwrap(), false);
 	let failed = populate(&drive, request, responder).await.unwrap_err();
 	assert!(
 		matches!(

@@ -185,6 +185,23 @@ impl FakeOs {
 	/// The OS asks for the children of `dir`, which must be a directory placeholder not yet
 	/// populated: Windows never asks again once a population turned it off.
 	pub fn fetch_placeholders(&self, dir: &PlaceholderIdentity) -> (PopulateRequest, FakePopulate) {
+		self.populate_request(dir, false)
+	}
+
+	/// As [`FakeOs::fetch_placeholders`], raised by the provider's own process, as its own rename
+	/// into a directory not populated yet does.
+	pub fn fetch_placeholders_from_self(
+		&self,
+		dir: &PlaceholderIdentity,
+	) -> (PopulateRequest, FakePopulate) {
+		self.populate_request(dir, true)
+	}
+
+	fn populate_request(
+		&self,
+		dir: &PlaceholderIdentity,
+		own_process: bool,
+	) -> (PopulateRequest, FakePopulate) {
 		let state = self.state();
 		let known = state
 			.dirs
@@ -196,7 +213,7 @@ impl FakeOs {
 		);
 		drop(state);
 		(
-			PopulateRequest::new(dir.encode()),
+			PopulateRequest::new(dir.encode(), own_process),
 			FakePopulate {
 				os: Some(self.clone()),
 				dir: *dir,

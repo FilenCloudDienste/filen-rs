@@ -352,7 +352,7 @@ const LOCAL: Kinds = Kinds::of(Kind::Local);
 /// The paths `take_due` hands out, without their kinds.
 fn take_paths(queue: &mut Queue, now: Instant, limit: usize) -> Vec<RootPath> {
 	queue
-		.take_due(now, limit, usize::MAX)
+		.take_due(now, limit, usize::MAX, Kinds::ALL)
 		.into_iter()
 		.map(|(path, _)| path)
 		.collect()
@@ -377,7 +377,8 @@ async fn a_burst_of_events_is_one_look_after_the_quiet_window() {
 			.take_due(
 				last + WATCH_DEBOUNCE - Duration::from_millis(1),
 				8,
-				usize::MAX
+				usize::MAX,
+				Kinds::ALL,
 			)
 			.is_empty()
 	);
@@ -392,16 +393,16 @@ async fn hydration_jobs_never_take_more_slots_than_the_hydrations_free() {
 		queue.push_kind(&root_path(name), now, Delay::Now, Kind::Hydration);
 	}
 	queue.push_kind(&root_path("edit.txt"), now, Delay::Now, Kind::Local);
-	let taken = queue.take_due(now, 8, 1);
+	let taken = queue.take_due(now, 8, 1, Kinds::ALL);
 	assert_eq!(taken.len(), 2, "{taken:?}");
 	assert!(taken.contains(&(root_path("edit.txt"), LOCAL)));
 	assert_eq!(
-		queue.next_due(false),
+		queue.next_due(false, Kinds::ALL),
 		None,
 		"the hydrations left wait for a hydration to end"
 	);
-	assert_eq!(queue.next_due(true), Some(now));
-	assert_eq!(queue.take_due(now, 8, 2).len(), 2);
+	assert_eq!(queue.next_due(true, Kinds::ALL), Some(now));
+	assert_eq!(queue.take_due(now, 8, 2, Kinds::ALL).len(), 2);
 }
 
 #[tokio::test(start_paused = true)]
@@ -415,7 +416,7 @@ async fn a_writer_that_never_stops_is_looked_at_after_the_burst_cap() {
 		queue.push_kind(&path, now, Delay::Debounce, Kind::Local);
 		now += Duration::from_millis(500);
 	}
-	assert_eq!(queue.next_due(true), Some(cap));
+	assert_eq!(queue.next_due(true, Kinds::ALL), Some(cap));
 }
 
 #[tokio::test(start_paused = true)]
@@ -425,7 +426,10 @@ async fn a_closed_file_is_looked_at_soon() {
 	let now = Instant::now();
 	queue.push_kind(&path, now, Delay::Debounce, Kind::Local);
 	queue.push_kind(&path, now, Delay::Close, Kind::Local);
-	assert_eq!(queue.next_due(true), Some(now + queue::CLOSE_DELAY));
+	assert_eq!(
+		queue.next_due(true, Kinds::ALL),
+		Some(now + queue::CLOSE_DELAY)
+	);
 }
 
 /// A writer that keeps writing a file a look found busy: its events, during the look or after it,
@@ -442,7 +446,7 @@ async fn a_busy_file_keeps_its_wait_through_its_writers_events() {
 		assert_eq!(take_paths(&mut queue, now, 8), vec![path.clone()]);
 		queue.push_kind(&path, now, Delay::Debounce, Kind::Local);
 		queue.finish(&path, &Outcome::Busy, LOCAL, now, SETTLE);
-		let due = queue.next_due(true).unwrap();
+		let due = queue.next_due(true, Kinds::ALL).unwrap();
 		// The writer writes every half second meanwhile.
 		let mut at = now + Duration::from_millis(500);
 		while at < due {
@@ -453,7 +457,7 @@ async fn a_busy_file_keeps_its_wait_through_its_writers_events() {
 			);
 			at += Duration::from_millis(500);
 		}
-		assert_eq!(queue.next_due(true), Some(due));
+		assert_eq!(queue.next_due(true, Kinds::ALL), Some(due));
 		waits.push(due - now);
 		now = due;
 	}
@@ -463,13 +467,16 @@ async fn a_busy_file_keeps_its_wait_through_its_writers_events() {
 	let last = now + Duration::from_secs(1);
 	queue.push_kind(&path, last, Delay::Debounce, Kind::Local);
 	assert_eq!(
-		queue.next_due(true),
+		queue.next_due(true, Kinds::ALL),
 		Some(now + Duration::from_secs(30)),
 		"a quiet spell after a write is no close"
 	);
 	let closed = last + Duration::from_millis(100);
 	queue.push_kind(&path, closed, Delay::Close, Kind::Local);
-	assert_eq!(queue.next_due(true), Some(closed + queue::CLOSE_DELAY));
+	assert_eq!(
+		queue.next_due(true, Kinds::ALL),
+		Some(closed + queue::CLOSE_DELAY)
+	);
 }
 
 #[tokio::test(start_paused = true)]
@@ -528,7 +535,7 @@ async fn failures_back_off_then_park_and_an_event_retries() {
 			SETTLE,
 		);
 		assert!(reports.is_empty());
-		let due = queue.next_due(true).unwrap();
+		let due = queue.next_due(true, Kinds::ALL).unwrap();
 		waits.push(due - now);
 		now = due;
 	}
@@ -552,11 +559,11 @@ async fn failures_back_off_then_park_and_an_event_retries() {
 			attempts: queue::PARK_AFTER,
 		}]
 	);
-	assert_eq!(queue.next_due(true), None, "parked");
+	assert_eq!(queue.next_due(true, Kinds::ALL), None, "parked");
 	queue.unpark_unreachable(now);
 	assert_eq!(take_paths(&mut queue, now, 8), vec![path.clone()]);
 	queue.finish(&path, &Outcome::Park(Failure::Internal), LOCAL, now, SETTLE);
-	assert_eq!(queue.next_due(true), None, "parked at once");
+	assert_eq!(queue.next_due(true, Kinds::ALL), None, "parked at once");
 	queue.push_kind(&path, now, Delay::Now, Kind::Local);
 	assert_eq!(take_paths(&mut queue, now, 8), vec![path]);
 }
@@ -575,7 +582,7 @@ async fn looks_that_come_to_nothing_back_off_and_park_whatever_events_come() {
 		// The job's own write raises an event at once: past the free looks, it never brings the path
 		// back before its backoff.
 		queue.push_kind(&path, now, Delay::Now, Kind::Local);
-		let due = queue.next_due(true).unwrap();
+		let due = queue.next_due(true, Kinds::ALL).unwrap();
 		waits.push(due - now);
 		now = due;
 	}
@@ -592,10 +599,10 @@ async fn looks_that_come_to_nothing_back_off_and_park_whatever_events_come() {
 			attempts: queue::PARK_AFTER,
 		}]
 	);
-	assert_eq!(queue.next_due(true), None, "parked");
+	assert_eq!(queue.next_due(true, Kinds::ALL), None, "parked");
 	queue.push_kind(&path, now, Delay::Now, Kind::Local);
 	assert_eq!(
-		queue.next_due(true),
+		queue.next_due(true, Kinds::ALL),
 		Some(now + Duration::from_secs(256)),
 		"an event retries it once its backoff ran out"
 	);
@@ -603,7 +610,11 @@ async fn looks_that_come_to_nothing_back_off_and_park_whatever_events_come() {
 	take_paths(&mut queue, now, 8);
 	queue.finish(&path, &Outcome::Done, LOCAL, now, SETTLE);
 	queue.push_kind(&path, now, Delay::Now, Kind::Local);
-	assert_eq!(queue.next_due(true), Some(now), "at rest, it starts afresh");
+	assert_eq!(
+		queue.next_due(true, Kinds::ALL),
+		Some(now),
+		"at rest, it starts afresh"
+	);
 }
 
 #[tokio::test(start_paused = true)]
@@ -617,7 +628,7 @@ async fn looks_that_send_new_bytes_start_their_count_afresh_and_the_same_bytes_d
 		queue.sent(&path, [n; 32]);
 		let reports = queue.finish(&path, &Outcome::Again(Duration::ZERO), LOCAL, now, SETTLE);
 		assert!(reports.is_empty());
-		let due = queue.next_due(true).unwrap();
+		let due = queue.next_due(true, Kinds::ALL).unwrap();
 		assert_eq!(
 			due,
 			now + Duration::from_millis(50),
@@ -630,7 +641,7 @@ async fn looks_that_send_new_bytes_start_their_count_afresh_and_the_same_bytes_d
 		assert_eq!(take_paths(&mut queue, now, 8), vec![path.clone()]);
 		queue.sent(&path, [255; 32]);
 		queue.finish(&path, &Outcome::Again(Duration::ZERO), LOCAL, now, SETTLE);
-		let due = queue.next_due(true).unwrap();
+		let due = queue.next_due(true, Kinds::ALL).unwrap();
 		waits.push(due - now);
 		now = due;
 	}
@@ -699,7 +710,7 @@ async fn waits_for_something_outside_the_job_never_park_and_are_reported_once_lo
 			now,
 			SETTLE,
 		));
-		let due = queue.next_due(true).unwrap();
+		let due = queue.next_due(true, Kinds::ALL).unwrap();
 		waits.push((now - start, due - now));
 		now = due;
 	}
@@ -724,7 +735,10 @@ async fn waits_for_something_outside_the_job_never_park_and_are_reported_once_lo
 	// Neither a look that came to nothing nor a failure was counted.
 	take_paths(&mut queue, now, 8);
 	queue.finish(&path, &Outcome::Again(Duration::ZERO), LOCAL, now, SETTLE);
-	assert_eq!(queue.next_due(true), Some(now + Duration::from_millis(50)));
+	assert_eq!(
+		queue.next_due(true, Kinds::ALL),
+		Some(now + Duration::from_millis(50))
+	);
 	now += Duration::from_millis(50);
 	take_paths(&mut queue, now, 8);
 	queue.finish(
@@ -734,7 +748,10 @@ async fn waits_for_something_outside_the_job_never_park_and_are_reported_once_lo
 		now,
 		SETTLE,
 	);
-	assert_eq!(queue.next_due(true), Some(now + Duration::from_secs(2)));
+	assert_eq!(
+		queue.next_due(true, Kinds::ALL),
+		Some(now + Duration::from_secs(2))
+	);
 	// Afresh: another ten minutes before the next report.
 	now += Duration::from_secs(2);
 	take_paths(&mut queue, now, 8);
@@ -746,14 +763,17 @@ async fn waits_for_something_outside_the_job_never_park_and_are_reported_once_lo
 		SETTLE,
 	);
 	assert!(reports.is_empty());
-	assert_eq!(queue.next_due(true), Some(now + Duration::from_secs(1)));
+	assert_eq!(
+		queue.next_due(true, Kinds::ALL),
+		Some(now + Duration::from_secs(1))
+	);
 }
 
 /// Ends `count` looks at `path` with [`Outcome::Again`] from `now`, each when it falls due; the time
 /// the last one ended.
 fn come_to_nothing(queue: &mut Queue, path: &RootPath, mut now: Instant, count: u32) -> Instant {
 	for _ in 0..count {
-		now = queue.next_due(true).unwrap().max(now);
+		now = queue.next_due(true, Kinds::ALL).unwrap().max(now);
 		assert_eq!(take_paths(queue, now, 8), vec![path.clone()]);
 		queue.finish(path, &Outcome::Again(Duration::ZERO), LOCAL, now, SETTLE);
 	}
@@ -781,7 +801,7 @@ async fn a_backoff_survives_a_move_onto_a_blocked_path_and_ends_when_the_drive_r
 	assert_eq!(take_paths(&mut queue, now, 8), vec![dir.clone()]);
 	queue.finish(&dir, &Outcome::Done, LOCAL, now, SETTLE);
 	assert_eq!(
-		queue.next_due(true),
+		queue.next_due(true, Kinds::ALL),
 		Some(hold),
 		"released, still backing off"
 	);
@@ -794,7 +814,11 @@ async fn a_backoff_survives_a_move_onto_a_blocked_path_and_ends_when_the_drive_r
 		SETTLE,
 	);
 	let next = hold + Duration::from_secs(4);
-	assert_eq!(queue.next_due(true), Some(next), "the second counted look");
+	assert_eq!(
+		queue.next_due(true, Kinds::ALL),
+		Some(next),
+		"the second counted look"
+	);
 	assert_eq!(take_paths(&mut queue, next, 8), vec![blocked.clone()]);
 	queue.finish(
 		&blocked,
@@ -803,7 +827,7 @@ async fn a_backoff_survives_a_move_onto_a_blocked_path_and_ends_when_the_drive_r
 		next,
 		SETTLE,
 	);
-	assert_eq!(queue.next_due(true), None, "parked");
+	assert_eq!(queue.next_due(true, Kinds::ALL), None, "parked");
 	queue.unpark_unreachable(next);
 	assert_eq!(take_paths(&mut queue, next, 8), vec![blocked.clone()]);
 	queue.finish(
@@ -814,7 +838,7 @@ async fn a_backoff_survives_a_move_onto_a_blocked_path_and_ends_when_the_drive_r
 		SETTLE,
 	);
 	assert_eq!(
-		queue.next_due(true),
+		queue.next_due(true, Kinds::ALL),
 		Some(next + Duration::from_millis(50)),
 		"started afresh"
 	);
@@ -892,7 +916,7 @@ async fn a_file_held_open_is_looked_at_less_often_then_reported_busy() {
 	while now.saturating_duration_since(Instant::now()) < Duration::from_secs(11 * 60) {
 		take_paths(&mut queue, now, 8);
 		reports.extend(queue.finish(&path, &Outcome::Busy, LOCAL, now, SETTLE));
-		let due = queue.next_due(true).unwrap();
+		let due = queue.next_due(true, Kinds::ALL).unwrap();
 		waits.push(due - now);
 		now = due;
 	}
@@ -5237,4 +5261,101 @@ async fn a_count_asked_for_during_the_start_waits_for_the_take_over() {
 	world.engine.start();
 	assert_eq!(world.unsynced(), None);
 	assert_eq!(world.unsynced_after_walk().await, Some(1));
+}
+
+// ---- a held root ----
+//
+// Held, the engine carries local changes to the drive and nothing else: no other kind of job
+// runs, and other processes' deletes and renames are vetoed.
+
+#[tokio::test(start_paused = true)]
+async fn a_held_root_still_uploads_a_new_file() {
+	let world = world().await;
+	world.engine.set_held(true);
+	world.local.user_create(&root_path("a.txt"), b"hello");
+	world.settle().await;
+	let remote = world.remote_file(&root_dir(), "a.txt");
+	assert_eq!(
+		world.drive.content(jobs::file_ids(&remote).unwrap().0),
+		b"hello"
+	);
+	assert!(world.in_sync("a.txt"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_held_root_adopts_a_folder_populated_and_places_what_only_the_drive_holds_once_lifted() {
+	let world = world().await;
+	world.local.set_populated(&RootPath::root(), true);
+	let remote = world.drive.add_remote_dir(&root_dir(), "d");
+	let uuid = Uuid::parse_str(&remote.uuid).unwrap();
+	world
+		.drive
+		.add_remote_file(&format!("stable/{uuid}"), "remote.txt", b"remote");
+	world.settle().await;
+	world.engine.set_held(true);
+	// The folder an unregister made ordinary before it stopped, the file in it made ordinary too.
+	world.local.user_mkdir(&root_path("d"));
+	world.local.user_create(&root_path("d\\mine.txt"), b"mine");
+	world.settle().await;
+	assert!(world.local.ops().contains(&LocalOp::ConvertedDir {
+		path: root_path("d"),
+		identity: PlaceholderIdentity::Dir { uuid },
+		populated: true,
+	}));
+	assert!(
+		world.local.entry(&root_path("d\\remote.txt")).is_none(),
+		"nothing new from the drive while held"
+	);
+	world.engine.set_held(false);
+	world.settle().await;
+	let placed = world.local.entry(&root_path("d\\remote.txt")).unwrap();
+	assert!(placed.placeholder && placed.in_sync, "{placed:?}");
+	assert_eq!(
+		world.local.entry(&root_path("d\\mine.txt")).unwrap().bytes,
+		b"mine"
+	);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_held_root_hydrates_and_uploads_an_edit_partly_on_disk() {
+	let world = world().await;
+	let (stable, _) = world.placed_file("a.txt", b"0123456789");
+	world.engine.set_held(true);
+	world
+		.local
+		.user_write(&root_path("a.txt"), b"abcdefghij")
+		.unwrap();
+	world.local.set_on_disk(&root_path("a.txt"), 4);
+	world.settle().await;
+	assert!(
+		world
+			.local
+			.ops()
+			.contains(&LocalOp::Hydrated(root_path("a.txt")))
+	);
+	assert_eq!(world.drive.content(stable), b"abcdefghij");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_held_root_vetoes_another_processs_delete_and_rename_until_the_hold_ends() {
+	let world = world().await;
+	world.placed_file("a.txt", b"one");
+	world.placed_file("b.txt", b"two");
+	world.engine.set_held(true);
+	world.delete("a.txt");
+	world.rename("b.txt", "c.txt");
+	world.settle().await;
+	assert_eq!(world.delete_answers(), [Err(Failure::NotAuthenticated)]);
+	assert_eq!(world.rename_answers(), [Err(Failure::NotAuthenticated)]);
+	assert!(world.local.entry(&root_path("a.txt")).is_some());
+	assert!(world.local.entry(&root_path("b.txt")).is_some());
+	assert_eq!(world.drive.writes(), []);
+	world.engine.set_held(false);
+	world.delete("a.txt");
+	world.settle().await;
+	assert_eq!(
+		world.delete_answers(),
+		[Err(Failure::NotAuthenticated), Ok(())]
+	);
+	assert_eq!(world.trashes(), 1);
 }

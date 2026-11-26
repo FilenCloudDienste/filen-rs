@@ -264,6 +264,10 @@ async fn decide_delete<D: Drive, L: LocalFs>(
 	request: &DeleteRequest,
 ) -> Result<(), Failure> {
 	let path = request.path();
+	if inner.held() && !request.undelete() {
+		// The tree holds still while held: nothing of the account's is trashed.
+		return Err(Failure::NotAuthenticated);
+	}
 	let Ok(identity) = PlaceholderIdentity::decode(request.identity()) else {
 		// No remote item this build can name: deleting it touches nothing remote.
 		debug!(%path, "allowed the delete of a placeholder with an unknown identity");
@@ -685,6 +689,10 @@ async fn decide_rename<D: Drive, L: LocalFs>(
 	decision: &Arc<RenameDecision>,
 ) -> Result<(), Failure> {
 	let from = request.from();
+	if inner.held() {
+		// The tree holds still while held: nothing of the account's is moved.
+		return Err(Failure::NotAuthenticated);
+	}
 	let Ok(identity) = PlaceholderIdentity::decode(request.identity()) else {
 		debug!(%from, "allowed the rename of a placeholder with an unknown identity");
 		return Ok(());

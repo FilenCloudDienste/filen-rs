@@ -274,7 +274,8 @@ impl<D: Drive, L: LocalFs> Inner<D, L> {
 			}) => {
 				let uuid_text = uuid.to_string();
 				if !self.in_drive_tree(&uuid_text).await? {
-					self.push_kind(&parent, Delay::Now, Kind::Remote);
+					// Run while the root is held too: the change cannot go up before it.
+					self.push_for_local(&parent, Kind::Remote);
 					return Err(Outcome::Wait(TREE_AGAIN));
 				}
 				Ok((stable_id(uuid), uuid_text))
@@ -1882,7 +1883,8 @@ async fn detach_left_behind<D: Drive, L: LocalFs>(
 
 /// An ordinary directory: created on the drive and converted, or, when the drive holds a directory
 /// of its name, converted into that one, which the platform then populates with what only the drive
-/// holds. A remote file of its name keeps both. Its children are looked at next, after it.
+/// holds; while the root is held, converted populated instead and reconciled with the drive once
+/// the hold ends. A remote file of its name keeps both. Its children are looked at next, after it.
 pub(super) async fn take_in_dir<D: Drive, L: LocalFs>(
 	inner: &Arc<Inner<D, L>>,
 	path: &RootPath,
@@ -1937,11 +1939,20 @@ pub(super) async fn take_in_dir<D: Drive, L: LocalFs>(
 		Err(outcome) => return outcome,
 	}
 	let identity = PlaceholderIdentity::Dir { uuid };
-	match inner.tag_dir(path, id, identity, populated).await {
+	// Held, nothing populates a directory: every other process's population is refused, so one
+	// adopted unpopulated could not be listed until the hold ends, what it holds on disk included (an
+	// unregister that made it ordinary and stopped leaves such a directory). Adopted populated, it
+	// lists what it holds, and its reconcile with the drive, which waits for the hold to end, places
+	// what only the drive holds. A hold that starts after this read leaves it unpopulated, as served.
+	let held = adopted && inner.held();
+	match inner.tag_dir(path, id, identity, populated || held).await {
 		Ok(Tagged::Here) => {
 			if adopted {
 				// A directory of the user's now stands for it.
 				leftover::claimed(inner, uuid);
+			}
+			if held {
+				inner.push_kind(path, Delay::Now, Kind::Children);
 			}
 		}
 		// Renamed away once converted, and taken back: the job where it went takes it in afresh.
