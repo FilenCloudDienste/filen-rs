@@ -11,6 +11,8 @@ use std::{
 	path::{Path, PathBuf},
 	slice,
 	sync::atomic::{AtomicBool, Ordering},
+	thread,
+	time::Duration,
 };
 
 use windows_sys::Win32::{
@@ -77,6 +79,21 @@ pub struct WinSettled {
 pub struct WinDir {
 	file: File,
 }
+
+/// A file opened for deleting and reading its attributes, shared for reading and deleting only
+/// ([`LocalFs::Guard`]).
+#[derive(Debug)]
+pub struct WinGuard {
+	file: File,
+}
+
+/// How many times [`LocalFs::guard_file`] opens a file another handle writes, [`GUARD_RETRY`]
+/// apart: measured on Windows, a writer that opens, writes and closes in a loop let the open
+/// through after 1 to 10 refusals, within 15 ms, and one that holds its handle refused it for as
+/// long as it did.
+const GUARD_ATTEMPTS: u32 = 50;
+/// How long [`LocalFs::guard_file`] waits between two of its opens.
+const GUARD_RETRY: Duration = Duration::from_millis(1);
 
 impl WinLocalFs {
 	/// The items of the sync root at `root`.
@@ -420,6 +437,64 @@ impl LocalFs for WinLocalFs {
 		let source = FileSource::new(file).map_err(|error| io_error(&error))?;
 		Ok(Box::new(source))
 	}
+
+	/// Opened for `DELETE` and reading attributes, shared for reading and deleting: `DELETE` takes
+	/// part in share checks, so every other open for writing, or without sharing deleting, fails
+	/// with `ERROR_SHARING_VIOLATION` while the guard is open, and the guard's own open fails so
+	/// while another handle writes the file or does not share deleting. Measured on Windows 11
+	/// ARM64, in the VM: writers that open, write and close in a loop were refused about two million
+	/// times and none got through; a write handle opened before, served or disconnected, refused the
+	/// guard for as long as it was open (seventh and eighth passes); a reader that did not share
+	/// deleting refused it too, and the OS's unregister leaves a file such a reader holds a
+	/// placeholder no process can read, guarded or not, so the unregister stops on it rather than
+	/// leave it so. The OS's unregister left a held file not all on disk delete pending until the
+	/// guard closed, and made a held file all on disk ordinary. An open for reading attributes only
+	/// refused no writer, and one for reading data fetches a placeholder whole. The share mode must
+	/// admit deleting: without it the OS's unregister was measured to leave every file held a
+	/// placeholder, those not all on disk unreadable. Not explained: once, with writes stuck in the
+	/// platform and every write of the holder failing, a guard opened for `FILE_EXECUTE` (which
+	/// share checks treat as reading) got past a write handle held open; a write handle that gets
+	/// past a guard, if one can, writes past both checks. An open refused for sharing is tried
+	/// again, [`GUARD_ATTEMPTS`] times at most, [`GUARD_RETRY`] apart, then [`LocalError::Busy`].
+	/// Its id and kind are checked through it. Opened with `FILE_FLAG_BACKUP_SEMANTICS`, as
+	/// [`open_expected`] opens, so a directory put at `path` opens too and is told apart
+	/// ([`LocalError::NotFound`]) rather than refused with access denied. The measured opens were
+	/// made without it; per `CreateFileW`'s documentation it changes nothing for a file unless the
+	/// process enabled its backup or restore privilege, which the helper never does.
+	fn guard_file(&self, path: &RootPath, expect: LocalFileId) -> Result<WinGuard, LocalError> {
+		let full = self.full(path);
+		let mut attempt = 1;
+		let file = loop {
+			match open(
+				&full,
+				DELETE | FILE_READ_ATTRIBUTES,
+				FILE_SHARE_READ | FILE_SHARE_DELETE,
+				FILE_FLAG_BACKUP_SEMANTICS,
+			) {
+				Ok(file) => break file,
+				Err(LocalError::Busy) if attempt < GUARD_ATTEMPTS => {
+					attempt += 1;
+					thread::sleep(GUARD_RETRY);
+				}
+				Err(error) => return Err(error),
+			}
+		};
+		let info = ffi::item_info(&file).map_err(|error| io_error(&error))?;
+		if info.file_id != expect.get() || info.attributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
+			return Err(LocalError::NotFound);
+		}
+		Ok(WinGuard { file })
+	}
+
+	/// Measured on Windows 11 ARM64 (in the VM): through a handle opened while the root was
+	/// connected refusing, the id, size, write time, `CfGetPlaceholderInfo` and the range query
+	/// answered as before through the disconnect and the OS's unregister, in under a millisecond,
+	/// while the attributes showed the disguise.
+	fn guarded_snapshot(&self, guard: &WinGuard) -> Result<FileSnapshot, LocalError> {
+		snapshot(&guard.file)
+	}
+
+	type Guard = WinGuard;
 
 	type Settled = WinSettled;
 

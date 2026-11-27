@@ -120,6 +120,8 @@ pub enum LocalOp {
 	Reverted(RootPath),
 	/// A file's bytes were copied into the new ordinary file `to`.
 	CopiedToPlain { from: RootPath, to: RootPath },
+	/// The provider opened the file at the path as a guard, which refuses every writer.
+	Guarded(RootPath),
 }
 
 /// How the provider is connected to the fake root, which changes what its calls can ask of the
@@ -191,6 +193,11 @@ struct LocalState {
 	readers: HashMap<u128, u32>,
 	/// Every open read handle, sharing deleting or not, by file id.
 	all_readers: HashMap<u128, u32>,
+	/// The provider's open guards ([`LocalFs::guard_file`]), by file id.
+	guards: HashMap<u128, u32>,
+	/// The file placeholders not all on disk the OS's unregister left delete pending, as a guard or
+	/// a reader that shares deleting held them: each goes once its last such handle closes.
+	delete_pending: HashSet<u128>,
 	/// The next dehydrate fails with this.
 	fail_dehydrate: Option<LocalError>,
 	/// How many dehydrates from now are refused as busy.
@@ -261,6 +268,9 @@ const REFUSED: i32 = 0x8007_0182_u32.cast_signed();
 /// The HRESULT of `ERROR_CLOUD_FILE_PROVIDER_NOT_RUNNING` (362), what a request with no provider
 /// connected fails with.
 const NOT_RUNNING: i32 = 0x8007_016A_u32.cast_signed();
+/// The HRESULT of `ERROR_ACCESS_DENIED` (5), what another process's open of a file left delete
+/// pending fails with (measured).
+const ACCESS_DENIED: i32 = 0x8007_0005_u32.cast_signed();
 
 /// A call of the provider's a test can hold with [`FakeLocal::gate`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -518,6 +528,47 @@ impl LocalState {
 		}
 	}
 
+	/// Why a user's open of the file `id` for writing fails, if it does: a sharing violation while
+	/// the provider holds it settled or guarded, access denied once it is delete pending (measured).
+	fn refuses_writer(&self, id: u128) -> Result<(), LocalError> {
+		if self.delete_pending.contains(&id) {
+			return Err(LocalError::Os(crate::os::OsError::Rejected {
+				code: ACCESS_DENIED,
+			}));
+		}
+		let open = |handles: &HashMap<u128, u32>| handles.get(&id).is_some_and(|open| *open > 0);
+		if open(&self.settled) || open(&self.guards) {
+			return Err(LocalError::Busy);
+		}
+		Ok(())
+	}
+
+	/// Removes the file `id` if it is delete pending and neither a guard nor a reader holds it any
+	/// more, as closing its last handle does.
+	fn close_delete_pending(&mut self, id: u128) {
+		let open = |handles: &HashMap<u128, u32>| handles.get(&id).is_some_and(|open| *open > 0);
+		if !open(&self.guards) && !open(&self.all_readers) && self.delete_pending.remove(&id) {
+			self.nodes.retain(|_, node| node.id != id);
+		}
+	}
+
+	/// Why a user's change past the end of the placeholder `path`, or of where its end is, fails
+	/// before it reaches the file, if it does: as [`LocalState::refuses_writer`], and refused under
+	/// a root connected refusing. Panics while served, which the fake does not model.
+	fn refuses_change_past_end(&self, path: &RootPath) -> Result<(), LocalError> {
+		let node = self.get(path).ok_or(LocalError::NotFound)?;
+		self.refuses_writer(node.id)?;
+		match self.connection {
+			FakeConnection::Serving => {
+				panic!("the fake changes a file's end only with the root refusing or disconnected")
+			}
+			FakeConnection::Refusing => Err(LocalError::Os(crate::os::OsError::Rejected {
+				code: REFUSED,
+			})),
+			FakeConnection::Disconnected => Ok(()),
+		}
+	}
+
 	fn taken(&self, from: &RootPath, to: &RootPath) -> bool {
 		from.case_key() != to.case_key() && self.get(to).is_some()
 	}
@@ -632,6 +683,8 @@ impl FakeLocal {
 			writers: HashMap::new(),
 			readers: HashMap::new(),
 			all_readers: HashMap::new(),
+			guards: HashMap::new(),
+			delete_pending: HashSet::new(),
 			fail_dehydrate: None,
 			busy_dehydrations: 0,
 			during_hash: None,
@@ -1045,6 +1098,138 @@ impl FakeLocal {
 		self.write(path, bytes, false)
 	}
 
+	/// Writes `bytes` over the file `path` at `offset`, in place, as a write through a handle opened
+	/// for writing does, and closes the handle: a placeholder is no longer in sync and counts the
+	/// bytes as written. Within the file's size, and for a placeholder not all on disk within the
+	/// bytes it holds. Measured on Windows: such a write to a placeholder not all on disk while the
+	/// provider is connected first fetches the whole file, then writes; with no provider connected
+	/// it lands over bytes on disk, fetching nothing, and leaves the file as partly on disk as it
+	/// was, and fails with `ERROR_CLOUD_FILE_PROVIDER_NOT_RUNNING` over a byte not on disk, a file
+	/// with no byte on disk included. Under a root
+	/// connected refusing, that fetch is refused as every read of a missing range is (measured for
+	/// reads), so the write fails and the file stays as it was (taken from the two measurements, not
+	/// measured as such). Refused while the provider holds it settled or guarded, and once it is
+	/// delete pending.
+	pub fn user_write_at(
+		&self,
+		path: &RootPath,
+		offset: u64,
+		bytes: &[u8],
+	) -> Result<(), LocalError> {
+		let mut state = self.state();
+		let now = state.tick();
+		let connection = state.connection;
+		let source = state.source.clone();
+		let node = state.get(path).ok_or(LocalError::NotFound)?;
+		state.refuses_writer(node.id)?;
+		let node = state.get_mut(path).expect("found above");
+		let size = node.size();
+		let len = u64::try_from(bytes.len()).expect("fits a u64");
+		let end = offset.checked_add(len).expect("within the file");
+		assert!(end <= size, "the fake writes within a file's size");
+		if let Some(placeholder) = node.placeholder.as_mut()
+			&& placeholder.on_disk < size
+		{
+			match connection {
+				FakeConnection::Serving => {
+					placeholder.on_disk = size;
+					let stable = held_stable(placeholder);
+					fill_from(node, stable, source);
+				}
+				FakeConnection::Refusing => {
+					return Err(LocalError::Os(crate::os::OsError::Rejected {
+						code: REFUSED,
+					}));
+				}
+				FakeConnection::Disconnected if end > placeholder.on_disk => {
+					return Err(LocalError::Os(crate::os::OsError::Rejected {
+						code: NOT_RUNNING,
+					}));
+				}
+				FakeConnection::Disconnected => {}
+			}
+		}
+		let NodeKind::File {
+			bytes: held,
+			modified,
+			changed,
+			..
+		} = &mut node.kind
+		else {
+			panic!("{path} is not a file");
+		};
+		let start = usize::try_from(offset).expect("fits a usize");
+		held.get_mut(start..start + bytes.len())
+			.expect("within the file")
+			.copy_from_slice(bytes);
+		*modified = now;
+		*changed = now;
+		if let Some(placeholder) = node.placeholder.as_mut() {
+			placeholder.in_sync = false;
+			placeholder.modified_bytes = placeholder.modified_bytes.saturating_add(len).min(size);
+		}
+		state.watch.push(LocalEvent::Modified(path.clone()));
+		Ok(())
+	}
+
+	/// Appends `bytes` past the end of the placeholder `path` through a handle opened for writing,
+	/// and closes the handle. Measured on Windows: with no provider connected it lands whatever is
+	/// on disk, a file with no byte on disk included, fetching nothing; the new bytes are on disk and
+	/// counted as written, and the placeholder stays marked in sync. Under a root connected
+	/// refusing it is refused. Not modelled while served. Refused while the provider holds the file
+	/// settled or guarded, and once it is delete pending.
+	pub fn user_append_past_end(&self, path: &RootPath, bytes: &[u8]) -> Result<(), LocalError> {
+		let mut state = self.state();
+		let now = state.tick();
+		state.refuses_change_past_end(path)?;
+		let node = state.get_mut(path).expect("found by the check");
+		let len = u64::try_from(bytes.len()).expect("fits a u64");
+		let placeholder = node.placeholder.as_mut().expect("a placeholder");
+		placeholder.on_disk = placeholder.on_disk.saturating_add(len);
+		placeholder.modified_bytes = placeholder.modified_bytes.saturating_add(len);
+		let NodeKind::File {
+			bytes: held,
+			modified,
+			changed,
+			..
+		} = &mut node.kind
+		else {
+			panic!("{path} is not a file");
+		};
+		held.extend_from_slice(bytes);
+		*modified = now;
+		*changed = now;
+		state.watch.push(LocalEvent::Modified(path.clone()));
+		Ok(())
+	}
+
+	/// Sets the end of the placeholder `path` at `len` bytes (`SetEndOfFile`) through a handle
+	/// opened for writing, and closes the handle. Measured on Windows, with no provider connected,
+	/// on a file with no byte on disk: an extension lands as an append of zeros does (the new bytes
+	/// on disk and counted as written, the placeholder still marked in sync), and a cut fails with
+	/// `ERROR_CLOUD_FILE_PROVIDER_NOT_RUNNING`. The fake refuses a cut so for any file not all on
+	/// disk. Under a root connected refusing it is refused, as an append is (taken from the append's
+	/// measurement). Not modelled while served, nor a cut of a file all on disk.
+	pub fn user_extend(&self, path: &RootPath, len: u64) -> Result<(), LocalError> {
+		let size = self.state().get(path).ok_or(LocalError::NotFound)?.size();
+		if let Some(more) = len.checked_sub(size).filter(|more| *more > 0) {
+			let zeros = vec![0; usize::try_from(more).expect("fits a usize")];
+			return self.user_append_past_end(path, &zeros);
+		}
+		let state = self.state();
+		state.refuses_change_past_end(path)?;
+		let node = state.get(path).expect("found by the check");
+		assert!(
+			node.placeholder
+				.as_ref()
+				.is_some_and(|placeholder| placeholder.on_disk < size),
+			"the fake cuts only a placeholder not all on disk"
+		);
+		Err(LocalError::Os(crate::os::OsError::Rejected {
+			code: NOT_RUNNING,
+		}))
+	}
+
 	/// Changes the attributes of the placeholder `path`, which clears its in-sync state and writes
 	/// no byte.
 	pub fn user_touch(&self, path: &RootPath) {
@@ -1076,10 +1261,7 @@ impl FakeLocal {
 		let mut state = self.state();
 		let now = state.tick();
 		let node = state.get(path).ok_or(LocalError::NotFound)?;
-		let id = node.id;
-		if state.settled.get(&id).is_some_and(|open| *open > 0) {
-			return Err(LocalError::Busy);
-		}
+		state.refuses_writer(node.id)?;
 		let node = state.get_mut(path).expect("found above");
 		let size = node.size();
 		let NodeKind::File {
@@ -1324,21 +1506,64 @@ impl FakeLocal {
 
 	/// Unregisters the root as Windows was measured to: every file placeholder not all on disk is
 	/// deleted, and every other placeholder becomes an ordinary item. An item whose revert fails
-	/// ([`FakeLocal::fail_revert`]) is deleted too, whatever it holds.
+	/// ([`FakeLocal::fail_revert`]) is deleted too, whatever it holds. A file placeholder not all on
+	/// disk that a guard of the provider's holds stays, delete pending, refusing every writer, until
+	/// its last guard drops (measured with handles shared for deleting); one a user's reader that
+	/// shares deleting holds too stays until that reader closes it as well, as a file delete
+	/// pending does until its last handle closes (not measured with a reader). One a user's reader
+	/// holds without sharing deleting stays a placeholder, guarded or not, which no process can
+	/// read (measured): the fake leaves it as it is.
 	pub fn unregister_root(&self) {
 		let mut state = self.state();
 		let unrevertable = std::mem::take(&mut state.fail_revert);
+		let doomed = |node: &Node| {
+			matches!(
+				(&node.kind, &node.placeholder),
+				(NodeKind::File { bytes, .. }, Some(placeholder))
+					if placeholder.on_disk < u64::try_from(bytes.len()).expect("fits a u64")
+			)
+		};
+		let open =
+			|handles: &HashMap<u128, u32>, id: u128| handles.get(&id).is_some_and(|open| *open > 0);
+		let orphaned: Vec<u128> = state
+			.nodes
+			.values()
+			.filter(|node| doomed(node) && open(&state.readers, node.id))
+			.map(|node| node.id)
+			.collect();
+		let held: Vec<u128> = state
+			.nodes
+			.values()
+			.filter(|node| {
+				doomed(node)
+					&& (open(&state.guards, node.id) || open(&state.all_readers, node.id))
+					&& !orphaned.contains(&node.id)
+			})
+			.map(|node| node.id)
+			.collect();
 		state.nodes.retain(|key, node| {
-			!unrevertable.contains_key(key)
-				&& !matches!(
-					(&node.kind, &node.placeholder),
-					(NodeKind::File { bytes, .. }, Some(placeholder))
-						if placeholder.on_disk < u64::try_from(bytes.len()).expect("fits a u64")
-				)
+			held.contains(&node.id)
+				|| orphaned.contains(&node.id)
+				|| (!unrevertable.contains_key(key) && !doomed(node))
 		});
 		for node in state.nodes.values_mut() {
-			node.placeholder = None;
+			if !held.contains(&node.id) && !orphaned.contains(&node.id) {
+				node.placeholder = None;
+			}
 		}
+		state.delete_pending.extend(held);
+	}
+
+	/// How many guards of the provider's are open.
+	pub fn guards_open(&self) -> u32 {
+		self.state().guards.values().sum()
+	}
+
+	/// Whether a file the OS's unregister left delete pending is still there, held by a guard or a
+	/// reader that shares deleting: a rename of the root then fails with access denied (measured
+	/// with a guard holding it).
+	pub fn holds_delete_pending(&self) -> bool {
+		!self.state().delete_pending.is_empty()
 	}
 
 	/// Removes every empty ordinary directory, deepest first, as the helper does after an
@@ -1639,6 +1864,7 @@ impl Drop for FakeReader {
 		if let Some(open) = state.all_readers.get_mut(&self.id) {
 			*open -= 1;
 		}
+		state.close_delete_pending(self.id);
 		if !self.counted {
 			return;
 		}
@@ -1660,6 +1886,26 @@ impl Drop for FakeSettled {
 		if let Some(open) = self.local.state().settled.get_mut(&self.id) {
 			*open -= 1;
 		}
+	}
+}
+
+/// A file the provider holds guarded: no writer opens it meanwhile. Dropping the last guard of a
+/// file left delete pending removes it once no reader holds it either, as closing the last handle
+/// does.
+#[derive(Debug)]
+pub struct FakeGuard {
+	local: FakeLocal,
+	id: u128,
+}
+
+impl Drop for FakeGuard {
+	fn drop(&mut self) {
+		let mut state = self.local.state();
+		let Some(open) = state.guards.get_mut(&self.id) else {
+			return;
+		};
+		*open = open.saturating_sub(1);
+		state.close_delete_pending(self.id);
 	}
 }
 
@@ -1938,6 +2184,39 @@ impl LocalFs for FakeLocal {
 		}
 		Ok(Box::new(MemSource(bytes.clone())))
 	}
+
+	/// Refused as busy while a user's writer has the file open, as a guard cannot shut out a
+	/// handle opened before it, and while a user's reader that does not share deleting has it
+	/// open (measured). A reader that shares deleting does not stop it.
+	fn guard_file(&self, path: &RootPath, expect: LocalFileId) -> Result<FakeGuard, LocalError> {
+		let mut state = self.state();
+		let node = state
+			.get(path)
+			.filter(|node| node.id == expect.get() && matches!(node.kind, NodeKind::File { .. }))
+			.ok_or(LocalError::NotFound)?;
+		let id = node.id;
+		let open = |handles: &HashMap<u128, u32>| handles.get(&id).is_some_and(|open| *open > 0);
+		if open(&state.writers) || open(&state.readers) {
+			return Err(LocalError::Busy);
+		}
+		*state.guards.entry(id).or_default() += 1;
+		state.ops.push(LocalOp::Guarded(path.clone()));
+		Ok(FakeGuard {
+			local: self.clone(),
+			id,
+		})
+	}
+
+	/// The file as it is, whatever the connection: through a handle, the platform reports a
+	/// placeholder's state disconnected too (measured).
+	fn guarded_snapshot(&self, guard: &FakeGuard) -> Result<FileSnapshot, LocalError> {
+		self.state()
+			.by_id(guard.id)
+			.ok_or(LocalError::NotFound)?
+			.snapshot()
+	}
+
+	type Guard = FakeGuard;
 
 	type Settled = FakeSettled;
 

@@ -13,8 +13,44 @@
 //! nor copied, or a directory above a kept item that cannot be made ordinary, stops the unregister,
 //! as the platform's unregister might take what they hold. A file not in sync with no byte on disk
 //! and none written, whose name or attributes only changed, holds nothing the drive lacks and goes
-//! with the root as a clean one does, never fetched to be kept. What stays in the root afterwards
-//! is moved aside with the root, which is renamed.
+//! with the root as a clean one does, never fetched to be kept.
+//!
+//! The platform's unregister deletes every file placeholder not all on disk, and once the root is
+//! disconnected a write to a range on disk of one lands without a fetch, as does an append past its
+//! end, one with no byte on disk included (measured; a write elsewhere, or cutting it shorter, is
+//! refused), so every such file is guarded ([`LocalFs::guard_file`]), from before the last look at
+//! it until the OS let the root go: no writer opens it meanwhile, and the look, through the guard,
+//! sees every write that landed before, which stops the unregister with the root registered. The
+//! guard is taken while the root is connected refusing, before anything is settled, checked again
+//! just before the OS's unregister, and closed only once it returned: measured on Windows 11 ARM64,
+//! the OS's unregister goes through with the guards open, leaves each guarded file delete pending
+//! until its guard closes, and no write landed meanwhile; closed just before it, writes landed in
+//! the gap and were lost with the file. Settling with the guards open was measured too: the
+//! directories above guarded files were marked populated and made ordinary, and the guards read the
+//! files as before. A guard holds one handle per file the OS's unregister removes; the guards are
+//! taken, checked and closed on the blocking pool, and taking and checking them gives up before
+//! the next file once a stop is asked for, the root left registered. Each open and each check is
+//! one system call the platform may hold up, with no bound: with writes stuck in the platform, one
+//! open was measured to take about 60 s, so a stop then waits for the file at hand. A file another
+//! program holds open for writing, or without sharing deleting, cannot be guarded, and stops the
+//! unregister (an `os` error naming it) until it is closed: the OS's unregister would leave a file
+//! such a reader holds as a placeholder no process can read (measured), the root not empty for the
+//! next register. A reader that shares deleting does not stop it; a file it still holds when the
+//! OS let the root go stays, delete pending, until it closes it, and the root is left where it is
+//! rather than renamed aside, as a file delete pending under a guard was measured to refuse the
+//! rename. A mapped view of a file is not shut out, but one made of a file partly on disk was
+//! measured to show the whole file written, which the second check sees. Not explained, and not
+//! prevented if it can happen: once, with writes stuck in the platform, a guard opened for reading
+//! in share checks got past a write handle held open, whose writes were all failing; a write
+//! through such a handle after the second check would go with the file. Not run against the
+//! `DELETE` guard used now.
+//! Measured too, and not prevented: an I/O on a file partly on disk still waiting in the platform
+//! when its unregister runs can leave such files behind as placeholders no process can read,
+//! whatever the guards; they hold nothing the drive or a kept copy lacks. The clean files all on
+//! disk are not guarded: the OS's unregister makes them ordinary, and one is taken to stay all on
+//! disk until it ran, as the refusing connection vetoes every dehydration (a dehydration once the
+//! root is disconnected is not measured).
+//! What stays in the root afterwards is moved aside with the root, which is renamed.
 //!
 //! What was kept is recorded in the roots index, with where the root goes, before the OS lets the
 //! root go, and settled once it went. A helper killed anywhere in between finds the record on its
@@ -45,7 +81,7 @@ use crate::{
 	identity::PlaceholderIdentity,
 	log_safe::path_tag,
 	names::{PlaceholderName, copy_name},
-	os::{LocalEntry, LocalError, LocalFileId, LocalFs, LocalKind, PlaceholderState},
+	os::{FileSnapshot, LocalEntry, LocalError, LocalFileId, LocalFs, LocalKind, PlaceholderState},
 	root_path::RootPath,
 };
 
@@ -92,6 +128,186 @@ pub(crate) struct Walked {
 	kept: Vec<Kept>,
 	/// Every directory placeholder.
 	dirs: Vec<WalkedDir>,
+	/// The clean file placeholders not all on disk, as the walk found them: the OS's unregister
+	/// removes them, and once the root is disconnected a write to a range on disk of one, or past
+	/// its end, lands without a fetch (measured, for a file with no byte on disk too), so each is
+	/// guarded from its last check until the OS let the root go ([`guard_files`]).
+	exposed: Vec<Seen>,
+}
+
+/// A file as the walk found it.
+#[derive(Debug)]
+struct Seen {
+	path: RootPath,
+	was: FileSnapshot,
+}
+
+/// A file the OS's unregister removes, as last seen, held by a guard that no writer opening the
+/// file gets past from before its last check until the OS let the root go: a write that landed
+/// after it was seen shows at a check, and none through a handle opened after the guard lands after
+/// one. Two gaps are named in the module docs: a mapped view, which share modes do not cover, and a
+/// write handle that once got past a guard with writes stuck in the platform (not explained).
+#[derive(Debug)]
+struct Guarded<G> {
+	seen: Seen,
+	guard: G,
+}
+
+/// A file that could not be guarded, and why.
+#[derive(Debug)]
+struct Unguarded {
+	path: RootPath,
+	error: LocalError,
+}
+
+impl Unguarded {
+	/// The reply's message, after "preparing the root failed: ".
+	fn message(&self) -> String {
+		let Self { path, error } = self;
+		match error {
+			LocalError::Busy => format!(
+				"{path} is open in another program; nothing was unregistered, and it may be tried \
+				 again once that program closed it"
+			),
+			error => format!(
+				"{path} could not be kept from being written during the unregister: {error}; \
+				 nothing was unregistered"
+			),
+		}
+	}
+}
+
+/// Why [`guard_files`] guarded nothing.
+#[derive(Debug)]
+enum NotGuarded {
+	/// A stop was asked for.
+	Stopping,
+	/// A file could not be guarded.
+	Refused(Unguarded),
+}
+
+/// Guards each of `files`, checked to be the item it was seen as ([`LocalFs::guard_file`]), in
+/// order. A file another handle writes, or holds without sharing deleting, cannot be guarded
+/// ([`LocalError::Busy`], after the platform's own short retries), nor one gone or replaced: either
+/// stops the unregister, the guards taken so far dropped with it, as the OS's unregister could
+/// remove the file with a write it never showed. Gives up before the next file once `stop` is asked
+/// for, as a root holding many files takes long to guard; an open the platform holds up is waited
+/// for (see the module docs).
+fn guard_files<L: LocalFs>(
+	local: &L,
+	files: impl IntoIterator<Item = Seen>,
+	stop: &Stop,
+) -> Result<Vec<Guarded<L::Guard>>, NotGuarded> {
+	files
+		.into_iter()
+		.map(|seen| {
+			if stop.requested() {
+				return Err(NotGuarded::Stopping);
+			}
+			match local.guard_file(&seen.path, seen.was.id) {
+				Ok(guard) => Ok(Guarded { seen, guard }),
+				Err(error) => {
+					warn!(%error, item = %path_tag(&seen.path), "a file the unregister removes could not be guarded; the root stays");
+					Err(NotGuarded::Refused(Unguarded {
+						path: seen.path,
+						error,
+					}))
+				}
+			}
+		})
+		.collect()
+}
+
+/// What a guarded file shows changed since it was seen: the first field found differing, with what
+/// it was and what it is now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Change {
+	/// Its state cannot be read through its guard, or it is no placeholder any more.
+	Unreadable(LocalError),
+	/// Another file is held.
+	Id,
+	/// Its size, in bytes.
+	Size { was: u64, now: u64 },
+	/// Its write time, in FILETIME ticks.
+	WriteTime { was: i64, now: i64 },
+	/// Its bytes on disk.
+	OnDisk { was: u64, now: u64 },
+	/// Its bytes written since it was last in sync.
+	Written { was: u64, now: u64 },
+}
+
+/// What `now` shows changed of the file as `was` had it; `None` when nothing did. Whether it is
+/// partial is not compared: through a guard it reads as the attributes say, which a disconnected
+/// root disguises, and its bytes on disk are compared instead.
+fn change_since(now: Result<FileSnapshot, LocalError>, was: &FileSnapshot) -> Option<Change> {
+	let now = match now {
+		Ok(now) => now,
+		Err(error) => return Some(Change::Unreadable(error)),
+	};
+	if now.id != was.id {
+		return Some(Change::Id);
+	}
+	if now.stamp.size != was.stamp.size {
+		return Some(Change::Size {
+			was: was.stamp.size,
+			now: now.stamp.size,
+		});
+	}
+	if now.stamp.modified != was.stamp.modified {
+		return Some(Change::WriteTime {
+			was: was.stamp.modified,
+			now: now.stamp.modified,
+		});
+	}
+	if now.state.on_disk() != was.state.on_disk() {
+		return Some(Change::OnDisk {
+			was: was.state.on_disk(),
+			now: now.state.on_disk(),
+		});
+	}
+	if now.state.modified_bytes() != was.state.modified_bytes() {
+		return Some(Change::Written {
+			was: was.state.modified_bytes(),
+			now: now.state.modified_bytes(),
+		});
+	}
+	None
+}
+
+/// The reply's message, after "preparing the root failed: ", for the first file of `guarded` that
+/// changed since it was seen, read through its guard: another item, size, write time, or bytes on
+/// disk or written. The platform answers through the guard as it does connected, the root
+/// connected or not (measured on Windows), so the check is the same at both points it runs. `None`
+/// when none changed. Which field differed is logged. Gives up before the next file once `stop` is
+/// asked for, as a root holding many files takes long to check.
+fn first_changed<L: LocalFs>(
+	local: &L,
+	guarded: &[Guarded<L::Guard>],
+	stop: &Stop,
+) -> Result<Option<String>, Stopping> {
+	for Guarded { seen, guard } in guarded {
+		if stop.requested() {
+			return Err(Stopping);
+		}
+		if let Some(change) = change_since(local.guarded_snapshot(guard), &seen.was) {
+			debug!(item = %path_tag(&seen.path), ?change, "a file differs from what it was before the unregister");
+			warn!(item = %path_tag(&seen.path), "a clean file not all on disk was written to during the unregister; the root stays");
+			return Ok(Some(written_during_unregister(&seen.path)));
+		}
+	}
+	Ok(None)
+}
+
+/// The reply's message, after "preparing the root failed: ", for the clean file at `path`, not all
+/// on disk, written to since the walk.
+fn written_during_unregister(path: &RootPath) -> String {
+	format!("{path} was written to during the unregister; nothing was unregistered")
+}
+
+/// Closes `guarded` on the blocking pool: closing the guard on a file the OS's unregister left
+/// delete pending deletes it, one file per guard.
+async fn close_guards<G: Send + 'static>(guarded: Vec<Guarded<G>>) {
+	blocking(move || drop(guarded)).await;
 }
 
 /// A directory placeholder the walk found.
@@ -139,8 +355,11 @@ pub(crate) fn shutting_down() -> ReplyError {
 /// point is kept and never followed. Only a root that cannot be listed fails the walk: an item
 /// whose state cannot be read, or a directory below the root that cannot be listed, is kept as it
 /// is, never changed. The platform's unregister keeps such a file as an ordinary one when all its
-/// data is on disk, and deletes it when not, which loses nothing the drive lacks: a write hydrates
-/// the whole file first (measured). Gives up before listing a directory once `stop` is asked for.
+/// data is on disk, and deletes it when not, which loses nothing the drive lacks as long as a
+/// provider was connected when it was written: a write then hydrates the whole file first
+/// (measured). With none connected, a write to a range on disk, or past the end, lands without a
+/// fetch (measured); the clean files not all on disk are guarded before the unregister for that
+/// reason (see [`Walked::exposed`]). Gives up before listing a directory once `stop` is asked for.
 pub(crate) fn walk<L: LocalFs>(local: &L, stop: &Stop) -> Result<Walked, WalkError> {
 	let mut walked = Walked::default();
 	let mut unsynced_online_only = 0_u64;
@@ -229,7 +448,7 @@ pub(crate) fn walk<L: LocalFs>(local: &L, stop: &Stop) -> Result<Walked, WalkErr
 					dirs.push(path);
 				}
 				LocalEntry::Placeholder {
-					kind: LocalKind::File(_),
+					kind: LocalKind::File(stamp),
 					id,
 					identity,
 					state,
@@ -243,7 +462,12 @@ pub(crate) fn walk<L: LocalFs>(local: &L, stop: &Stop) -> Result<Walked, WalkErr
 								debug!(item = %path_tag(&path), "a file not in sync with no byte on disk and none written goes with the root");
 								unsynced_online_only = unsynced_online_only.saturating_add(1);
 							}
-							if !state.partial() {
+							if state.partial() {
+								walked.exposed.push(Seen {
+									path,
+									was: FileSnapshot { id, stamp, state },
+								});
+							} else {
 								walked.clean.push((path, identity));
 							}
 							// A clean placeholder not all on disk holds nothing the drive lacks:
@@ -352,6 +576,7 @@ fn settle<L: LocalFs>(
 		clean,
 		mut kept,
 		mut dirs,
+		exposed: _,
 	} = walked;
 	let mut deleted_hydrated = 0_u64;
 	if delete_hydrated {
@@ -510,9 +735,10 @@ fn name_copy<L: LocalFs>(
 }
 
 /// What the walk under the refusing connection came to, before the OS's unregister.
-enum Prepared {
-	/// Every kept item made ordinary: the root may go.
-	Settled(Settled),
+enum Prepared<G> {
+	/// Every kept item made ordinary: the root may go; with the guards on the files the OS's
+	/// unregister removes, held until it did.
+	Settled(Settled, Vec<Guarded<G>>),
 	/// These changed files are not all on disk.
 	Partial(Vec<String>),
 	/// A stop was asked for before anything changed.
@@ -645,8 +871,12 @@ pub(crate) struct Unregistering<'a> {
 /// Unregisters `registered`, the root `asked` names, keeping every item that holds data the drive
 /// may not have, and deleting clean downloaded files when asked to. Stops, with the root still
 /// registered, before anything is deleted when a kept item's data is not all on disk, or when a
-/// stop is asked for before the items are settled (answered [`shutting_down`]); from there on it
-/// runs to its end. What is kept is recorded in `index` before the OS lets the root go.
+/// stop is asked for before the OS's unregister (answered [`shutting_down`]); from there on it runs
+/// to its end. A stop, or a change found, at the check just before the OS's unregister comes after
+/// the settle: the root stays registered with its kept items and the directories above them made
+/// ordinary, and, with `delete_hydrated`, its clean files all on disk deleted, as when recording
+/// what was kept or the OS's unregister fails. What is kept is recorded in `index` before the OS
+/// lets the root go.
 pub(crate) async fn unregister_root<P: Platform>(
 	platform: &Arc<P>,
 	index: &mut RootsIndex,
@@ -685,7 +915,7 @@ pub(crate) async fn unregister_root<P: Platform>(
 		let stop = stop.clone();
 		blocking(move || {
 			let local = platform.local_fs(&root);
-			let walked = match walk(&*local, &stop) {
+			let mut walked = match walk(&*local, &stop) {
 				Ok(walked) => walked,
 				Err(WalkError::Stopping(Stopping)) => return Prepared::Stopping,
 				Err(WalkError::Local(error)) => return Prepared::Failed(error.to_string()),
@@ -694,12 +924,29 @@ pub(crate) async fn unregister_root<P: Platform>(
 			if !partial.is_empty() {
 				return Prepared::Partial(partial);
 			}
-			// The last safe point: settling changes the items.
+			// Every file the OS's unregister removes, guarded before its first check and before
+			// anything is settled: one that cannot be guarded, or that changed since it was seen,
+			// stops the unregister with nothing changed. From here no writer opens such a file
+			// until the OS let the root go.
+			let guarded = match guard_files(&*local, std::mem::take(&mut walked.exposed), &stop) {
+				Ok(guarded) => guarded,
+				Err(NotGuarded::Stopping) => return Prepared::Stopping,
+				Err(NotGuarded::Refused(unguarded)) => {
+					return Prepared::Failed(unguarded.message());
+				}
+			};
+			match first_changed(&*local, &guarded, &stop) {
+				Ok(None) => {}
+				Ok(Some(changed)) => return Prepared::Failed(changed),
+				Err(Stopping) => return Prepared::Stopping,
+			}
+			// The last point with nothing settled: settling changes the items, and a stop or a
+			// change found at the second check leaves them settled.
 			if stop.requested() {
 				return Prepared::Stopping;
 			}
 			match settle(&*local, walked, delete_hydrated) {
-				Ok(settled) => Prepared::Settled(settled),
+				Ok(settled) => Prepared::Settled(settled, guarded),
 				Err(Unsettled::Partial(path)) => Prepared::Partial(vec![path.to_string()]),
 				Err(unsettled) => Prepared::Failed(unsettled.message()),
 			}
@@ -713,14 +960,17 @@ pub(crate) async fn unregister_root<P: Platform>(
 	let registered = match disconnected {
 		Ok(registered) => registered,
 		Err(failed) => {
+			if let Prepared::Settled(_, guarded) = prepared {
+				close_guards(guarded).await;
+			}
 			return Err(Stopped {
 				held: Held::Unknown,
 				error: platform_error(&failed.error),
 			});
 		}
 	};
-	let settled = match prepared {
-		Prepared::Settled(settled) => settled,
+	let (settled, guarded) = match prepared {
+		Prepared::Settled(settled, guarded) => (settled, guarded),
 		Prepared::Stopping => {
 			return Err(Stopped {
 				held: Held::Registered(registered),
@@ -772,14 +1022,49 @@ pub(crate) async fn unregister_root<P: Platform>(
 		place: KeptPlace::InRoot { aside },
 	};
 	if let Err(error) = index.put_kept(user, record.clone()) {
+		close_guards(guarded).await;
 		return Err(Stopped {
 			held: Held::Registered(registered),
 			error: index_error(&error),
 		});
 	}
+	// Checked once more through the guards, just before the OS's unregister: no writer opened them
+	// since the first check, but a mapped view is not shut out. A stop asked for meanwhile leaves
+	// the root registered, as a change found does, with its items settled.
+	let checked = {
+		let platform = Arc::clone(platform);
+		let root = root.to_path_buf();
+		let stop = stop.clone();
+		blocking(move || {
+			let error = match first_changed(&*platform.local_fs(&root), &guarded, &stop) {
+				Ok(None) => return Ok(guarded),
+				Ok(Some(changed)) => ReplyError::new(
+					ErrorCode::Os,
+					format!("preparing the root failed: {changed}"),
+				),
+				Err(Stopping) => shutting_down(),
+			};
+			drop(guarded);
+			Err(error)
+		})
+		.await
+	};
+	let guarded = match checked {
+		Ok(guarded) => guarded,
+		Err(error) => {
+			if let Err(error) = index.drop_unsettled(user) {
+				warn!(%error, "dropping the record of what the unregister kept failed");
+			}
+			return Err(Stopped {
+				held: Held::Registered(registered),
+				error,
+			});
+		}
+	};
 	{
 		let platform = Arc::clone(platform);
 		if let Err(failed) = blocking(move || platform.unregister(registered)).await {
+			close_guards(guarded).await;
 			// The root stays registered, its items in it. A record left by a failed write is
 			// harmless: the next unregister replaces it, and the next register drops it.
 			if let Err(error) = index.drop_unsettled(user) {
@@ -791,6 +1076,10 @@ pub(crate) async fn unregister_root<P: Platform>(
 			});
 		}
 	}
+	// The guards close only now the OS let the root go: closed any earlier, a write lands in the gap
+	// and goes with the file (measured). A file not all on disk they held is delete pending until
+	// then and goes as they close; the root cannot be renamed aside before (measured).
+	close_guards(guarded).await;
 	// Only now the OS let the root go, so a failed unregister keeps the root shown as it is; first
 	// of what follows, which may stop.
 	let branding_left = unbrand(platform, root, user).await;

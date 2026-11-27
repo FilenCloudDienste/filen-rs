@@ -892,7 +892,12 @@ impl Platform for FakePlatform {
 		self.kill_at_point(KillPoint::Before(FakeStep::SetAside));
 		{
 			let mut state = self.state();
-			if state.fail_set_asides > 0 || state.asides.contains_key(aside) {
+			// Measured on Windows: renaming the root fails with access denied while a file in it is
+			// delete pending under one of the provider's handles.
+			if state.fail_set_asides > 0
+				|| state.asides.contains_key(aside)
+				|| self.local.holds_delete_pending()
+			{
 				state.fail_set_asides = state.fail_set_asides.saturating_sub(1);
 				return Err(PlatformError::Failed {
 					op: PlatformOp::SetAside,

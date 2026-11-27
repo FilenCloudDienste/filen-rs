@@ -10,7 +10,10 @@ use super::*;
 use crate::{
 	helper::protocol::RootDir,
 	identity::PlaceholderIdentity,
-	test_support::{FakeEntry, FakeLocal, FakePlatform, Gated, LocalOp, PlatformCall, root_path},
+	test_support::{
+		FakeConnection, FakeEntry, FakeLocal, FakePlatform, FakeStep, Gated, KillPoint, LocalOp,
+		PlatformCall, root_path,
+	},
 };
 
 /// The user whose root the tests unregister.
@@ -925,5 +928,531 @@ async fn a_stop_during_the_walk_of_the_refusing_root_disconnects_it_and_changes_
 			.ops()
 			.iter()
 			.any(|op| matches!(op, LocalOp::Reverted(_) | LocalOp::Hydrated(_)))
+	);
+}
+
+/// A root holding `part.bin`, clean, four of its ten bytes on disk, which the OS's unregister
+/// deletes.
+fn clean_partly_on_disk() -> FakeLocal {
+	let local = FakeLocal::new(PlaceholderIdentity::Root { root: ACCOUNT_ROOT });
+	local.place_file(&root_path("part.bin"), file(7), b"drive data");
+	local.set_on_disk(&root_path("part.bin"), 4);
+	local
+}
+
+/// Every point of an unregister, from before the refusing connection to the rename aside, where a
+/// writer tries to write.
+const STEPS: [KillPoint; 10] = [
+	KillPoint::Before(FakeStep::ConnectRefusing),
+	KillPoint::After(FakeStep::ConnectRefusing),
+	KillPoint::Before(FakeStep::Disconnect),
+	KillPoint::After(FakeStep::Disconnect),
+	KillPoint::Before(FakeStep::Unregister),
+	KillPoint::After(FakeStep::Unregister),
+	KillPoint::Before(FakeStep::Clear),
+	KillPoint::After(FakeStep::Clear),
+	KillPoint::Before(FakeStep::SetAside),
+	KillPoint::After(FakeStep::SetAside),
+];
+
+/// [`clean_partly_on_disk`], beside `new.txt`, never uploaded, which keeps the root to move aside.
+fn clean_partly_on_disk_beside_a_new_file() -> FakeLocal {
+	let local = clean_partly_on_disk();
+	local.user_create(&root_path("new.txt"), b"never uploaded");
+	local
+}
+
+/// What a writer's attempt at a point of the unregister came to.
+type Attempt = Arc<std::sync::Mutex<Option<Result<(), LocalError>>>>;
+
+/// Has another process write `byte` at the start of `path` when the next unregister reaches
+/// `point`: what the attempt came to.
+fn write_at(
+	platform: &FakePlatform,
+	local: &FakeLocal,
+	point: KillPoint,
+	path: &str,
+	byte: u8,
+) -> Attempt {
+	let attempt = Attempt::default();
+	let (local, path, written) = (local.clone(), root_path(path), Arc::clone(&attempt));
+	platform.run_at(point, move || {
+		*written.lock().unwrap() = Some(local.user_write_at(&path, 0, &[byte]));
+	});
+	attempt
+}
+
+/// Every file at or beside `path` (its copies included), in the root and in each aside, with the
+/// bytes it holds.
+fn copies_of(platform: &FakePlatform, local: &FakeLocal, path: &str) -> Vec<Vec<u8>> {
+	let asides = platform
+		.asides()
+		.into_iter()
+		.filter_map(|aside| platform.aside(&aside));
+	std::iter::once(local.entries())
+		.chain(asides)
+		.flatten()
+		.filter(|entry| !entry.is_dir && entry.path.to_string().starts_with(path))
+		.map(|entry| entry.bytes)
+		.collect()
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_write_at_any_step_of_an_unregister_is_refused_or_kept() {
+	for point in STEPS {
+		let local = clean_partly_on_disk_beside_a_new_file();
+		let platform = platform(&local);
+		let root = Path::new("/r");
+		let (_temp, mut index) = index(root);
+		let attempt = write_at(&platform, &local, point, "part.bin", b'D');
+		let outcome = unregister(&platform, &mut index, root, false, "d").await;
+		let attempt = attempt.lock().unwrap().take().expect("the writer ran");
+		let copies = copies_of(&platform, &local, "part.bin");
+		if attempt.is_ok() {
+			assert!(
+				copies.iter().any(|bytes| bytes == b"Drive data"),
+				"{point:?}: the write was accepted and lost: {copies:?}"
+			);
+		}
+		if outcome.is_ok() {
+			assert!(!local.holds_delete_pending(), "{point:?}");
+		}
+		assert_eq!(local.guards_open(), 0, "{point:?}");
+	}
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_unregister_guards_a_clean_file_partly_on_disk_before_anything_is_settled() {
+	let local = clean_partly_on_disk();
+	local.place_file(&root_path("edited.txt"), file(3), b"old");
+	local.user_write(&root_path("edited.txt"), b"new").unwrap();
+	let platform = platform(&local);
+	let root = Path::new("/r");
+	let (_temp, mut index) = index(root);
+	unregister(&platform, &mut index, root, false, "d")
+		.await
+		.unwrap_or_else(|stopped| panic!("{:?}", stopped.error));
+	let ops = local.ops();
+	let guarded = ops
+		.iter()
+		.position(|op| *op == LocalOp::Guarded(root_path("part.bin")))
+		.expect("guarded");
+	let reverted = ops
+		.iter()
+		.position(|op| *op == LocalOp::Reverted(root_path("edited.txt")))
+		.expect("the changed file made ordinary");
+	assert!(guarded < reverted, "{ops:?}");
+	assert!(local.entry(&root_path("part.bin")).is_none());
+	assert_eq!(local.guards_open(), 0);
+}
+
+/// Asserts `stopped` says `path` is open in another program, with the root registered, the OS's
+/// unregister never run and nothing made ordinary or recorded.
+fn assert_held_open(
+	stopped: &Stopped<crate::test_support::FakeRegistered>,
+	path: &str,
+	platform: &FakePlatform,
+	local: &FakeLocal,
+	index: &RootsIndex,
+	root: &Path,
+) {
+	assert_eq!(stopped.error.code, ErrorCode::Os);
+	assert_eq!(
+		stopped.error.message,
+		format!(
+			"preparing the root failed: {path} is open in another program; nothing was \
+			 unregistered, and it may be tried again once that program closed it"
+		)
+	);
+	assert!(matches!(stopped.held, Held::Registered(_)));
+	assert!(!unregistered(platform, root));
+	assert!(
+		!local
+			.ops()
+			.iter()
+			.any(|op| matches!(op, LocalOp::Reverted(_) | LocalOp::Removed(_))),
+		"{:?}",
+		local.ops()
+	);
+	assert!(index.entry(user()).unwrap().kept.is_empty());
+	assert_eq!(local.guards_open(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_unregister_stops_on_a_file_another_program_writes_and_goes_on_once_it_closed_it() {
+	let local = clean_partly_on_disk();
+	local.place_file(&root_path("edited.txt"), file(3), b"old");
+	local.user_write(&root_path("edited.txt"), b"new").unwrap();
+	let platform = platform(&local);
+	let root = Path::new("/r");
+	let (_temp, mut index) = index(root);
+	let writer = local.user_open_for_write(&root_path("part.bin"));
+	let Err(stopped) = unregister(&platform, &mut index, root, false, "d").await else {
+		panic!("the unregister went ahead");
+	};
+	assert_held_open(&stopped, "part.bin", &platform, &local, &index, root);
+	let part = local.entry(&root_path("part.bin")).unwrap();
+	assert!(part.placeholder && part.on_disk == 4, "{part:?}");
+	drop(writer);
+	let outcome = unregister(&platform, &mut index, root, false, "d")
+		.await
+		.unwrap_or_else(|stopped| panic!("{:?}", stopped.error));
+	assert!(unregistered(&platform, root));
+	assert!(local.entry(&root_path("part.bin")).is_none());
+	let entries = platform.aside(&outcome.tidied.kept_in.unwrap()).unwrap();
+	assert_eq!(entry(&entries, "edited.txt").unwrap().bytes, b"new");
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_unregister_whose_clean_file_partly_on_disk_changes_once_disconnected_unregisters_nothing()
+ {
+	let local = clean_partly_on_disk();
+	let platform = platform(&local);
+	let root = Path::new("/r");
+	let (_temp, mut index) = index(root);
+	{
+		let local = local.clone();
+		platform.run_at(KillPoint::After(FakeStep::Disconnect), move || {
+			local.set_on_disk(&root_path("part.bin"), 10);
+		});
+	}
+	let Err(stopped) = unregister(&platform, &mut index, root, false, "d").await else {
+		panic!("the unregister went ahead");
+	};
+	assert_eq!(
+		stopped.error.message,
+		"preparing the root failed: part.bin was written to during the unregister; nothing was \
+		 unregistered"
+	);
+	assert!(matches!(stopped.held, Held::Registered(_)));
+	assert!(!unregistered(&platform, root));
+	assert!(local.entry(&root_path("part.bin")).unwrap().placeholder);
+}
+
+#[test]
+fn a_clean_file_partly_on_disk_replaced_since_the_walk_is_not_guarded() {
+	let local = clean_partly_on_disk();
+	let mut walked = walk(&local, &Stop::never()).unwrap();
+	let seen = walked.exposed.pop().expect("exposed");
+	local.vanish(&root_path("part.bin"));
+	local.place_file(&root_path("part.bin"), file(8), b"other data");
+	local.set_on_disk(&root_path("part.bin"), 2);
+	let Err(NotGuarded::Refused(unguarded)) = guard_files(&local, [seen], &Stop::never()) else {
+		panic!("another file was guarded");
+	};
+	assert_eq!(unguarded.path, root_path("part.bin"));
+	assert_eq!(unguarded.error, LocalError::NotFound);
+	assert_eq!(
+		unguarded.message(),
+		"part.bin could not be kept from being written during the unregister: the item is gone; \
+		 nothing was unregistered"
+	);
+	assert_eq!(local.guards_open(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_kill_at_any_step_of_an_unregister_leaves_no_guard_open() {
+	for point in STEPS {
+		let local = clean_partly_on_disk_beside_a_new_file();
+		let platform = platform(&local);
+		let root = Path::new("/r");
+		let (_temp, mut index) = index(root);
+		platform.kill_at(point);
+		let killed = {
+			let platform = Arc::clone(&platform);
+			tokio::spawn(async move {
+				let _ = unregister(&platform, &mut index, Path::new("/r"), false, "d").await;
+			})
+		};
+		assert!(killed.await.unwrap_err().is_panic(), "{point:?}");
+		assert_eq!(local.guards_open(), 0, "{point:?}");
+		assert!(!local.holds_delete_pending(), "{point:?}");
+		match local.entry(&root_path("part.bin")) {
+			Some(part) => assert!(
+				!unregistered(&platform, root) && part.placeholder && part.bytes == b"drive data",
+				"{point:?}: {part:?}"
+			),
+			None => assert!(unregistered(&platform, root), "{point:?}"),
+		}
+	}
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_unregister_deletes_a_clean_file_partly_on_disk_nothing_wrote_to() {
+	let local = clean_partly_on_disk();
+	let platform = platform(&local);
+	let root = Path::new("/r");
+	let (_temp, mut index) = index(root);
+	let outcome = unregister(&platform, &mut index, root, false, "d")
+		.await
+		.unwrap_or_else(|stopped| panic!("{:?}", stopped.error));
+	assert!(unregistered(&platform, root));
+	assert!(outcome.tidied.root_removed);
+	assert!(local.entry(&root_path("part.bin")).is_none());
+}
+
+/// A root holding `online.bin`, clean, no byte of it on disk, which the OS's unregister deletes,
+/// beside `new.txt`, never uploaded, which keeps the root to move aside.
+fn clean_online_only_beside_a_new_file() -> FakeLocal {
+	let local = FakeLocal::new(PlaceholderIdentity::Root { root: ACCOUNT_ROOT });
+	local.place_file(&root_path("online.bin"), file(7), b"drive data");
+	local.set_on_disk(&root_path("online.bin"), 0);
+	local.user_create(&root_path("new.txt"), b"never uploaded");
+	local
+}
+
+#[test]
+fn a_clean_file_with_no_byte_on_disk_is_guarded_as_one_partly_on_disk_is() {
+	let local = clean_online_only_beside_a_new_file();
+	let walked = walk(&local, &Stop::never()).unwrap();
+	let paths: Vec<&RootPath> = walked.exposed.iter().map(|seen| &seen.path).collect();
+	assert_eq!(paths, [&root_path("online.bin")]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_append_at_any_step_of_an_unregister_to_a_file_with_no_byte_on_disk_is_refused_or_kept()
+{
+	// From the refusing connection on: served, the platform fetches what it writes to first.
+	for point in STEPS.into_iter().skip(1) {
+		let local = clean_online_only_beside_a_new_file();
+		let platform = platform(&local);
+		let root = Path::new("/r");
+		let (_temp, mut index) = index(root);
+		let attempt = Attempt::default();
+		{
+			let (local, written) = (local.clone(), Arc::clone(&attempt));
+			platform.run_at(point, move || {
+				*written.lock().unwrap() =
+					Some(local.user_append_past_end(&root_path("online.bin"), b" appended"));
+			});
+		}
+		let outcome = unregister(&platform, &mut index, root, false, "d").await;
+		let attempt = attempt.lock().unwrap().take().expect("the writer ran");
+		let copies = copies_of(&platform, &local, "online.bin");
+		if attempt.is_ok() {
+			assert!(
+				copies.iter().any(|bytes| bytes.ends_with(b" appended")),
+				"{point:?}: the append was accepted and lost: {copies:?}"
+			);
+		}
+		if outcome.is_ok() {
+			assert!(!local.holds_delete_pending(), "{point:?}");
+		}
+		assert_eq!(local.guards_open(), 0, "{point:?}");
+	}
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_unregister_stops_on_a_file_a_reader_holds_without_sharing_deleting_and_goes_on_once_it_closed_it()
+ {
+	// The OS's unregister would leave the file a placeholder no process can read (measured).
+	let local = clean_partly_on_disk_beside_a_new_file();
+	let platform = platform(&local);
+	let root = Path::new("/r");
+	let (_temp, mut index) = index(root);
+	let reader = local.user_open_for_read(&root_path("part.bin"), false);
+	let Err(stopped) = unregister(&platform, &mut index, root, false, "d").await else {
+		panic!("the unregister went ahead");
+	};
+	assert_held_open(&stopped, "part.bin", &platform, &local, &index, root);
+	drop(reader);
+	unregister(&platform, &mut index, root, false, "d")
+		.await
+		.unwrap_or_else(|stopped| panic!("{:?}", stopped.error));
+	assert!(unregistered(&platform, root));
+	assert!(local.entry(&root_path("part.bin")).is_none());
+	assert_eq!(local.guards_open(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_unregister_goes_on_past_a_reader_that_shares_deleting_and_refuses_writers() {
+	let local = clean_partly_on_disk_beside_a_new_file();
+	let platform = platform(&local);
+	let root = Path::new("/r");
+	let (_temp, mut index) = index(root);
+	let reader = local.user_open_for_read(&root_path("part.bin"), true);
+	let attempt = write_at(
+		&platform,
+		&local,
+		KillPoint::Before(FakeStep::Unregister),
+		"part.bin",
+		b'D',
+	);
+	unregister(&platform, &mut index, root, false, "d")
+		.await
+		.unwrap_or_else(|stopped| panic!("{:?}", stopped.error));
+	assert_eq!(
+		attempt.lock().unwrap().take().expect("the writer ran"),
+		Err(LocalError::Busy)
+	);
+	assert!(unregistered(&platform, root));
+	assert_eq!(local.guards_open(), 0);
+	drop(reader);
+	assert!(local.entry(&root_path("part.bin")).is_none());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_file_a_reader_that_shares_deleting_still_holds_once_unregistered_keeps_the_root_in_place()
+ {
+	// The file stays delete pending until the reader closes it, so the root cannot be renamed aside
+	// (measured with the provider's guards holding it).
+	let local = clean_partly_on_disk_beside_a_new_file();
+	let platform = platform(&local);
+	let root = Path::new("/r");
+	let (_temp, mut index) = index(root);
+	let reader = local.user_open_for_read(&root_path("part.bin"), true);
+	let outcome = unregister(&platform, &mut index, root, false, "d")
+		.await
+		.unwrap_or_else(|stopped| panic!("{:?}", stopped.error));
+	assert!(unregistered(&platform, root));
+	assert_eq!(
+		outcome.tidied,
+		Tidied {
+			root_removed: false,
+			kept_in: Some(root.to_path_buf()),
+		}
+	);
+	assert!(local.holds_delete_pending());
+	assert!(local.entry(&root_path("new.txt")).is_some());
+	drop(reader);
+	assert!(!local.holds_delete_pending());
+	assert!(local.entry(&root_path("part.bin")).is_none());
+}
+
+#[test]
+fn guarding_asked_to_stop_guards_nothing() {
+	let local = clean_partly_on_disk();
+	let mut walked = walk(&local, &Stop::never()).unwrap();
+	let seen = walked.exposed.pop().expect("exposed");
+	let (stopping, stop) = stop();
+	stopping.send(true).unwrap();
+	assert!(matches!(
+		guard_files(&local, [seen], &stop),
+		Err(NotGuarded::Stopping)
+	));
+	assert_eq!(local.guards_open(), 0);
+}
+
+#[test]
+fn a_check_through_the_guards_asked_to_stop_stops() {
+	let local = clean_partly_on_disk();
+	let mut walked = walk(&local, &Stop::never()).unwrap();
+	let seen = walked.exposed.pop().expect("exposed");
+	let guarded = guard_files(&local, [seen], &Stop::never()).unwrap();
+	assert_eq!(first_changed(&local, &guarded, &Stop::never()), Ok(None));
+	let (stopping, stop) = stop();
+	stopping.send(true).unwrap();
+	assert_eq!(first_changed(&local, &guarded, &stop), Err(Stopping));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stop_asked_for_once_the_items_are_settled_leaves_the_root_registered_and_its_files() {
+	let local = clean_partly_on_disk_beside_a_new_file();
+	let platform = platform(&local);
+	let root = Path::new("/r");
+	let (_temp, mut index) = index(root);
+	let (ask, stop) = stop();
+	platform.run_at(KillPoint::After(FakeStep::Disconnect), move || {
+		ask.send_replace(true);
+	});
+	let registered = platform.register(root, ACCOUNT_ROOT).unwrap();
+	let Err(stopped) = unregister_root(
+		&platform,
+		&mut index,
+		registered,
+		Unregistering {
+			user: user(),
+			root,
+			delete_hydrated: false,
+			date: "d".to_owned(),
+			stop: &stop,
+		},
+	)
+	.await
+	else {
+		panic!("the unregister went ahead");
+	};
+	assert_eq!(stopped.error.code, ErrorCode::ShuttingDown);
+	assert!(matches!(stopped.held, Held::Registered(_)));
+	assert!(!unregistered(&platform, root));
+	assert!(local.entry(&root_path("part.bin")).unwrap().placeholder);
+	assert!(index.entry(user()).unwrap().kept.is_empty());
+	assert_eq!(local.guards_open(), 0);
+}
+
+/// Has another process extend `online.bin` to 16 bytes when the next unregister reaches `point`:
+/// what the attempt came to.
+fn extend_at(platform: &FakePlatform, local: &FakeLocal, point: KillPoint) -> Attempt {
+	let attempt = Attempt::default();
+	let (local, written) = (local.clone(), Arc::clone(&attempt));
+	platform.run_at(point, move || {
+		*written.lock().unwrap() = Some(local.user_extend(&root_path("online.bin"), 16));
+	});
+	attempt
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_extension_at_any_step_of_an_unregister_of_a_file_with_no_byte_on_disk_is_refused_or_kept()
+ {
+	// From the refusing connection on: served, the platform fetches what it extends first.
+	for point in STEPS.into_iter().skip(1) {
+		let local = clean_online_only_beside_a_new_file();
+		let platform = platform(&local);
+		let root = Path::new("/r");
+		let (_temp, mut index) = index(root);
+		let attempt = extend_at(&platform, &local, point);
+		let outcome = unregister(&platform, &mut index, root, false, "d").await;
+		let attempt = attempt.lock().unwrap().take().expect("the writer ran");
+		let copies = copies_of(&platform, &local, "online.bin");
+		if attempt.is_ok() {
+			assert!(
+				copies.iter().any(|bytes| bytes.len() == 16),
+				"{point:?}: the extension was accepted and lost: {copies:?}"
+			);
+		}
+		if outcome.is_ok() {
+			assert!(!local.holds_delete_pending(), "{point:?}");
+		}
+		assert_eq!(local.guards_open(), 0, "{point:?}");
+	}
+}
+
+#[test]
+fn an_extension_of_a_file_with_no_byte_on_disk_once_disconnected_lands_and_stays_in_sync() {
+	// Measured: size, bytes on disk and written all grow by the extension; in sync stays set.
+	let local = clean_online_only_beside_a_new_file();
+	local.set_connection(FakeConnection::Disconnected);
+	local.user_extend(&root_path("online.bin"), 16).unwrap();
+	// Connected, its state reads undisguised.
+	local.set_connection(FakeConnection::Serving);
+	let Ok(LocalEntry::Placeholder {
+		kind: LocalKind::File(stamp),
+		state,
+		..
+	}) = local.inspect(&root_path("online.bin"))
+	else {
+		panic!("no placeholder");
+	};
+	assert_eq!(stamp.size, 16);
+	assert_eq!((state.on_disk(), state.modified_bytes()), (6, 6));
+	assert!(state.in_sync());
+}
+
+#[test]
+fn a_file_with_no_byte_on_disk_once_disconnected_refuses_a_write_within_it_and_a_cut() {
+	// Measured: both fail with ERROR_CLOUD_FILE_PROVIDER_NOT_RUNNING.
+	let local = clean_online_only_beside_a_new_file();
+	local.set_connection(FakeConnection::Disconnected);
+	let not_running = Err(LocalError::Os(crate::os::OsError::Rejected {
+		code: 0x8007_016A_u32.cast_signed(),
+	}));
+	assert_eq!(
+		local.user_write_at(&root_path("online.bin"), 2, b"x"),
+		not_running
+	);
+	assert_eq!(local.user_extend(&root_path("online.bin"), 4), not_running);
+	assert_eq!(
+		local.entry(&root_path("online.bin")).unwrap().bytes,
+		b"drive data"
 	);
 }

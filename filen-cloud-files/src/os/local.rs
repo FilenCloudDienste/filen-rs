@@ -272,6 +272,13 @@ pub trait LocalFs: sealed::Sealed + Send + Sync + 'static {
 	/// the handle follows it.
 	type Dir: Send + 'static;
 
+	/// A file opened so that no other handle may open it for writing while this one is open, which
+	/// reads and changes nothing of it: what an unregister holds on each file the OS's unregister
+	/// removes, from its last look at the file until the OS let the root go ([`LocalFs::guard_file`]).
+	/// It does not shut out a mapped view of the file, and once, with writes stuck in the platform,
+	/// a guard got past a write handle held open (see [`LocalFs::guard_file`]).
+	type Guard: Send + 'static;
+
 	/// What is at `path`, read without opening the item's data, so a placeholder is not hydrated.
 	fn inspect(&self, path: &RootPath) -> Result<LocalEntry, LocalError>;
 
@@ -504,6 +511,35 @@ pub trait LocalFs: sealed::Sealed + Send + Sync + 'static {
 		expect: LocalFileId,
 		to: &RootPath,
 	) -> Result<(), LocalError>;
+
+	/// Opens the file at `path`, if it is still the item `expect`, as a [`LocalFs::Guard`]: until
+	/// the guard drops, every other open of the file for writing fails with a sharing violation, a
+	/// placeholder's data is neither read nor fetched, and the file can still be renamed and
+	/// deleted. [`LocalError::Busy`] while another handle has the file open for writing, which no
+	/// guard can shut out, or open without sharing deleting, which would leave the file to the OS's
+	/// unregister as a placeholder no process can read; a reader that shares deleting does not stop
+	/// it. [`LocalError::NotFound`] when another item or a directory is at `path`, or
+	/// [`LocalError::Busy`] for a directory another handle's share mode refuses the open. Each open
+	/// is one system call the platform may hold up, with no bound (one was measured at about 60 s
+	/// with writes stuck in the platform).
+	///
+	/// Measured on Windows 11 ARM64 (in the VM, about two million attempts by writers that open,
+	/// write and close in a loop, then single writes): no write landed while the guard was open,
+	/// through the root's disconnect and the OS's unregister, an append to a file with no byte on
+	/// disk included; a write handle opened before refused the guard; a file placeholder not all on
+	/// disk that the guard holds stays, delete pending, until the guard drops, and one all on disk
+	/// is made ordinary by the OS's unregister with the guard open. A mapped view of the file is not
+	/// shut out. Not explained: once, with writes stuck in the platform, a guard opened for reading
+	/// in share checks got past a write handle held open, whose writes were all failing (not run
+	/// against the guard's `DELETE` access used now).
+	fn guard_file(&self, path: &RootPath, expect: LocalFileId) -> Result<Self::Guard, LocalError>;
+
+	/// The file `guard` holds, as it is now, read through it: its id, its size and times, and its
+	/// placeholder state, which the platform reports through the guard as it does connected even
+	/// once the root is disconnected (measured on Windows), apart from whether it is partial: that
+	/// is read from its attributes, which a disconnected root disguises. [`LocalError::NotFound`]
+	/// once it is no placeholder.
+	fn guarded_snapshot(&self, guard: &Self::Guard) -> Result<FileSnapshot, LocalError>;
 
 	/// Gives the directory placeholder at `path`, if still the item `expect`, the identity
 	/// `identity`, and marks it in sync.
