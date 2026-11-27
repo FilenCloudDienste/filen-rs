@@ -21,8 +21,8 @@ use crate::{
 	identity::PlaceholderIdentity,
 	os::LocalError,
 	test_support::{
-		BrandingCall, FakeDrive, FakeEntry, FakeLocal, FakeOpener, FakePlatform, FakeStep, Gated,
-		KillPoint, LocalOp, PlatformCall, ffi_dir, ffi_file, root_path,
+		BrandingCall, DriveOp, FakeDrive, FakeEntry, FakeLocal, FakeOpener, FakePlatform, FakeStep,
+		Gated, KillPoint, LocalOp, PlatformCall, ffi_dir, ffi_file, root_path,
 	},
 };
 
@@ -1029,6 +1029,50 @@ async fn a_root_left_registered_with_its_session_is_served_again_to_fetch_what_i
 	assert_eq!(report["kept"][0]["path"], "edited.txt");
 	assert_eq!(platform.registration(&disk.root()), None);
 	assert!(!disk.has_session());
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_unregister_of_a_served_root_fetches_no_renamed_file_with_no_byte_on_disk() {
+	let disk = Disk::new();
+	let (platform, drive) = world();
+	let mut rig = Rig::start(&disk, &platform, &drive);
+	ok(&rig.register(&disk).await);
+	ok(&rig.set_auth("42", ACCOUNT_ROOT).await);
+	let local = platform.local();
+	local.place_file_with(
+		&root_path("cloud.txt"),
+		file_identity(3),
+		b"cloud data",
+		false,
+	);
+	// Renamed while nothing served the root, and still not in sync when the unregister walks it.
+	local.swallow_events(&root_path("renamed.txt"));
+	local.user_rename_unserved(&root_path("cloud.txt"), &root_path("renamed.txt"));
+	let report = ok(&rig
+		.request(json!({ "t": "unregister", "userId": "42", "deleteHydrated": true }))
+		.await)
+	.clone();
+	assert_eq!(report["unregistered"], true);
+	assert_eq!(report["keptCount"], 0);
+	assert_eq!(report["rootRemoved"], true);
+	assert!(
+		!local
+			.ops()
+			.iter()
+			.any(|op| matches!(op, LocalOp::Hydrated(_))),
+		"{:?}",
+		local.ops()
+	);
+	// The rename never reached the drive, and the unregister sends none: the drive keeps its name.
+	assert!(
+		!drive
+			.ops()
+			.iter()
+			.any(|op| matches!(op, DriveOp::Rename { .. })),
+		"{:?}",
+		drive.ops()
+	);
+	assert!(local.entries().is_empty());
 }
 
 #[tokio::test(start_paused = true)]

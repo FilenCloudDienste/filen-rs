@@ -11,8 +11,10 @@
 //! platform's unregister; an item whose state cannot be read, or a directory that cannot be
 //! listed, is left as it is and reported kept. Only a kept file that can be neither made ordinary
 //! nor copied, or a directory above a kept item that cannot be made ordinary, stops the unregister,
-//! as the platform's unregister might take what they hold. What stays in the root afterwards is
-//! moved aside with the root, which is renamed.
+//! as the platform's unregister might take what they hold. A file not in sync with no byte on disk
+//! and none written, whose name or attributes only changed, holds nothing the drive lacks and goes
+//! with the root as a clean one does, never fetched to be kept. What stays in the root afterwards
+//! is moved aside with the root, which is renamed.
 //!
 //! What was kept is recorded in the roots index, with where the root goes, before the OS lets the
 //! root go, and settled once it went. A helper killed anywhere in between finds the record on its
@@ -27,7 +29,7 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use filen_sdk_rs::fs::name::aside_names;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::{
 	auth::{DataDir, KeyStore, SessionStore},
@@ -43,7 +45,7 @@ use crate::{
 	identity::PlaceholderIdentity,
 	log_safe::path_tag,
 	names::{PlaceholderName, copy_name},
-	os::{LocalEntry, LocalError, LocalFileId, LocalFs, LocalKind},
+	os::{LocalEntry, LocalError, LocalFileId, LocalFs, LocalKind, PlaceholderState},
 	root_path::RootPath,
 };
 
@@ -141,6 +143,7 @@ pub(crate) fn shutting_down() -> ReplyError {
 /// the whole file first (measured). Gives up before listing a directory once `stop` is asked for.
 pub(crate) fn walk<L: LocalFs>(local: &L, stop: &Stop) -> Result<Walked, WalkError> {
 	let mut walked = Walked::default();
+	let mut unsynced_online_only = 0_u64;
 	let mut dirs = vec![RootPath::root()];
 	while let Some(dir) = dirs.pop() {
 		if stop.requested() {
@@ -233,7 +236,13 @@ pub(crate) fn walk<L: LocalFs>(local: &L, stop: &Stop) -> Result<Walked, WalkErr
 				} => {
 					let clean = state.in_sync() && state.modified_bytes() == 0;
 					let reason = match identity {
-						Ok(identity @ PlaceholderIdentity::File { .. }) if clean => {
+						Ok(identity @ PlaceholderIdentity::File { .. })
+							if clean || unwritten_online_only(state) =>
+						{
+							if !clean {
+								debug!(item = %path_tag(&path), "a file not in sync with no byte on disk and none written goes with the root");
+								unsynced_online_only = unsynced_online_only.saturating_add(1);
+							}
 							if !state.partial() {
 								walked.clean.push((path, identity));
 							}
@@ -257,7 +266,30 @@ pub(crate) fn walk<L: LocalFs>(local: &L, stop: &Stop) -> Result<Walked, WalkErr
 			}
 		}
 	}
+	if unsynced_online_only > 0 {
+		// Their name or attributes changed, which a session may have sent to the drive or not: a
+		// change made while nothing served the root never reached it, and goes with the file.
+		warn!(
+			count = unsynced_online_only,
+			"files not in sync with no byte on disk and none written go with the root; a change of name or attributes the drive never had is not kept"
+		);
+	}
 	Ok(walked)
+}
+
+/// Whether a file placeholder in `state`, not in sync, holds nothing the drive lacks: no byte of it
+/// is on disk and none was written since it was last in sync, so only its name or attributes
+/// changed, as a write hydrates the whole file first (measured; the engine marks such a file in
+/// sync again, `mark_partial_in_sync`). Removed with the root as a clean file not on disk is, never
+/// fetched to be kept. A rename made while the root was served reached the drive before it was
+/// allowed (see `local::veto`), so the drive holds the name; one made while nothing served the
+/// root never reached it, and is given up with the file (logged), as the engine gives it up when
+/// it marks the file in sync. A file partly on disk is not one of these: it stays a changed file.
+/// Read from the platform's counters, which count the file's data only: whether data written
+/// outside it, in an alternate data stream or extended attributes, shows in them, or would be
+/// kept by a fetch, is not measured, and such data goes with the file.
+fn unwritten_online_only(state: PlaceholderState) -> bool {
+	!state.in_sync() && state.modified_bytes() == 0 && state.on_disk() == 0 && state.partial()
 }
 
 /// Fetches the data of every kept file not all on disk, while the root is still served.

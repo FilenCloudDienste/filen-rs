@@ -309,6 +309,89 @@ async fn a_changed_file_not_all_on_disk_stops_the_unregister_before_anything_is_
 	);
 }
 
+/// A root holding `renamed.txt`, a file with no byte on disk renamed from `cloud.txt` while nothing
+/// served the root, and `touched.txt`, one whose attributes changed: neither in sync, neither
+/// holding a written byte.
+fn renamed_online_only() -> FakeLocal {
+	let local = FakeLocal::new(PlaceholderIdentity::Root { root: ACCOUNT_ROOT });
+	local.place_file_with(&root_path("cloud.txt"), file(2), b"cloud", false);
+	local.user_rename_unserved(&root_path("cloud.txt"), &root_path("renamed.txt"));
+	local.place_file_with(&root_path("touched.txt"), file(4), b"touched", false);
+	local.user_touch(&root_path("touched.txt"));
+	for path in ["renamed.txt", "touched.txt"] {
+		let entry = local.entry(&root_path(path)).unwrap();
+		assert!(
+			entry.placeholder && !entry.in_sync && entry.on_disk == 0,
+			"{entry:?}"
+		);
+	}
+	local
+}
+
+#[test]
+fn a_renamed_file_with_no_byte_on_disk_is_not_kept_nor_fetched() {
+	let local = renamed_online_only();
+	let walked = walk(&local, &Stop::never()).unwrap();
+	assert!(walked.kept.is_empty(), "{:?}", walked.kept);
+	assert_eq!(hydrate_kept(&local, &walked, &Stop::never()), Ok(()));
+	assert!(
+		!local
+			.ops()
+			.iter()
+			.any(|op| matches!(op, LocalOp::Hydrated(_))),
+		"{:?}",
+		local.ops()
+	);
+}
+
+#[test]
+fn a_renamed_file_partly_on_disk_is_still_kept_as_changed() {
+	let local = FakeLocal::new(PlaceholderIdentity::Root { root: ACCOUNT_ROOT });
+	local.place_file(&root_path("part.bin"), file(7), b"drive data");
+	local.set_on_disk(&root_path("part.bin"), 4);
+	local.user_rename_unserved(&root_path("part.bin"), &root_path("moved.bin"));
+	let walked = walk(&local, &Stop::never()).unwrap();
+	assert_eq!(
+		kept(&walked),
+		[("moved.bin".to_owned(), KeptItemReason::Modified, true)]
+	);
+	assert_eq!(walked.partial().count(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_unregister_removes_a_renamed_file_with_no_byte_on_disk_with_the_root() {
+	let local = renamed_online_only();
+	let platform = platform(&local);
+	let root = Path::new("/r");
+	let (_temp, mut index) = index(root);
+	let outcome = unregister(&platform, &mut index, root, true, "d")
+		.await
+		.unwrap_or_else(|stopped| panic!("{:?}", stopped.error));
+	assert!(unregistered(&platform, root));
+	assert_eq!(outcome.deleted_hydrated, 0);
+	assert_eq!(
+		outcome.record.as_ref().map(|record| record.kept_count),
+		Some(0)
+	);
+	assert_eq!(
+		outcome.tidied,
+		Tidied {
+			root_removed: true,
+			kept_in: None,
+		}
+	);
+	assert!(local.entries().is_empty());
+	assert!(index.entry(user()).unwrap().kept.is_empty());
+	assert!(
+		!local
+			.ops()
+			.iter()
+			.any(|op| matches!(op, LocalOp::Hydrated(_) | LocalOp::Reverted(_))),
+		"{:?}",
+		local.ops()
+	);
+}
+
 #[test]
 fn a_file_edited_after_the_walk_is_kept_not_deleted() {
 	let local = FakeLocal::new(PlaceholderIdentity::Root { root: ACCOUNT_ROOT });

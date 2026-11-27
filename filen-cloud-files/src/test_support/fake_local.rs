@@ -1279,6 +1279,23 @@ impl FakeLocal {
 		}
 	}
 
+	/// Renames the placeholder `from` to `to` while no provider is connected, so the platform asks
+	/// nothing: it moves, and is no longer in sync.
+	pub fn user_rename_unserved(&self, from: &RootPath, to: &RootPath) {
+		let mut state = self.state();
+		assert!(!state.taken(from, to), "{to} is taken");
+		state.move_tree(from, to);
+		state
+			.get_mut(to)
+			.and_then(|node| node.placeholder.as_mut())
+			.expect("a placeholder")
+			.in_sync = false;
+		state.watch.push(LocalEvent::Renamed {
+			from: from.clone(),
+			to: to.clone(),
+		});
+	}
+
 	/// Moves the ordinary file `from` over `to`, replacing what is there with no callback, as
 	/// `MoveFileEx(REPLACE_EXISTING)` was measured to over a placeholder.
 	pub fn user_replace(&self, from: &RootPath, to: &RootPath) {
