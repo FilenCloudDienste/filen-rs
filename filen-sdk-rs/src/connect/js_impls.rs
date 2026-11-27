@@ -19,7 +19,7 @@ use crate::{
 	js::{
 		AnyLinkedDir, AnySharedDir, Dir, DirPublicLink, DirPublicLinkRW, File, LinkedDir,
 		LinkedDirsAndFiles, LinkedFile, LinkedRootDir, NormalDirsAndFiles, SharedDir, SharedFile,
-		SharedRootDir, SharedRootItem,
+		SharedInItem, SharedRootDir, SharedRootItem,
 	},
 	runtime::{self, do_on_commander},
 };
@@ -893,6 +893,23 @@ impl JsClient {
 		})
 		.await?;
 		Ok(SharedRootDirsAndFiles { dirs, files })
+	}
+
+	/// Looks up an item shared with this account by its uuid. Resolves with `undefined` only when
+	/// the server checked and the item is not shared with this account; every other failure
+	/// rejects, since it cannot tell. See `Client::get_shared_in_item` for the details.
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		wasm_bindgen::prelude::wasm_bindgen(js_name = "getSharedInItem")
+	)]
+	pub async fn get_shared_in_item(&self, uuid: UuidStr) -> Result<Option<SharedInItem>, Error> {
+		let this = self.inner();
+		do_on_commander(move || async move {
+			this.get_shared_in_item(uuid.into())
+				.await
+				.map(|item| item.map(SharedInItem::from))
+		})
+		.await
 	}
 
 	#[cfg_attr(

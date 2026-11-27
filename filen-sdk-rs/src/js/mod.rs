@@ -56,7 +56,7 @@ pub(crate) use categories::{
 		NonRootLinkedItem,
 	},
 	normal::{AnyNormalDir, Dir, NonRootNormalItem, Root},
-	shared::{AnySharedDir, SharedDir, SharedFile, SharedRootDir, SharedRootItem},
+	shared::{AnySharedDir, SharedDir, SharedFile, SharedInItem, SharedRootDir, SharedRootItem},
 };
 
 #[cfg(any(feature = "wasm-full", feature = "uniffi", feature = "napi"))]

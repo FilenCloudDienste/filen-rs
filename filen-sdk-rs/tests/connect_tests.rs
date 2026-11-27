@@ -1,4 +1,4 @@
-use std::{borrow::Cow, sync::Arc};
+use std::{borrow::Cow, sync::Arc, time::Duration};
 
 use chrono::{DateTime, TimeDelta, Utc};
 use filen_macros::shared_test_runtime;
@@ -7,18 +7,25 @@ use filen_sdk_rs::crypto::shared::MetaCrypter;
 use filen_sdk_rs::{
 	ErrorKind,
 	auth::Client,
-	connect::{DirPublicLink, PublicLinkSharedClientExt},
+	connect::{
+		DirPublicLink, PublicLinkSharedClientExt,
+		fs::{ShareInfo, SharedInItem, SharingRole},
+	},
 	consts::CHUNK_SIZE,
 	fs::{
-		HasName, HasUUID,
-		categories::{DirType, Shared},
+		HasName, HasParent, HasUUID,
+		categories::{DirType, RootItemType, Shared},
 		copy::{CopyConfig, ItemSource, ItemSourceDir, JobControl},
 		dir::{RemoteDirectory, meta::DirectoryMetaChanges},
 		file::meta::FileMetaChanges,
 	},
 	io::{HasFileInfo, client_impl::IoSharedClientExt},
 };
-use filen_types::api::v3::{contacts::Contact, dir::link::PublicLinkExpiration};
+use filen_types::{
+	api::v3::{contacts::Contact, dir::link::PublicLinkExpiration},
+	fs::{ParentUuid, Uuid},
+};
+use test_utils::with_versioning;
 
 mod drive_helpers;
 use drive_helpers::{Recorder, SignalOnCreate, contents, copy, data, upload, wait_until_paused};
@@ -1546,4 +1553,235 @@ async fn copy_with_shares(
 		seen_files.iter().any(|f| f.name() == own_file.name()),
 		"items copied before the share was added are shared too"
 	);
+}
+
+async fn lookup(client: &Client, uuid: Uuid) -> Option<SharedInItem> {
+	client.get_shared_in_item(uuid).await.unwrap()
+}
+
+/// How long a revoke or a leave may take to delete its share root record: the backend deletes it
+/// in a background job, not in the request.
+const SHARE_ROOT_REMOVAL_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Waits until the backend's job has deleted `share_client`'s share root `uuid` after a revoke or
+/// a leave: the lookup no longer finds it and `list_in_shared_root` no longer lists it. Once the
+/// root record is gone, the lookup answers everything below it as not shared at once.
+async fn wait_until_share_root_removed(share_client: &Client, uuid: Uuid) {
+	let deadline = tokio::time::Instant::now() + SHARE_ROOT_REMOVAL_TIMEOUT;
+	loop {
+		let (dirs, files) = share_client
+			.list_in_shared_root::<fn(u64, Option<u64>)>(None)
+			.await
+			.unwrap();
+		let listed =
+			dirs.iter().any(|d| d.uuid() == uuid) || files.iter().any(|f| f.uuid() == uuid);
+		if !listed && lookup(share_client, uuid).await.is_none() {
+			return;
+		}
+		assert!(
+			tokio::time::Instant::now() < deadline,
+			"{uuid} is still a share root {SHARE_ROOT_REMOVAL_TIMEOUT:?} after its removal"
+		);
+		tokio::time::sleep(Duration::from_secs(1)).await;
+	}
+}
+
+/// `get_shared_in_item` answers as the receiver's listings do: a share root as
+/// `list_in_shared_root` lists it, an item inside a shared folder as `list_shared_dir` does with
+/// the sharer as its role, and `None` for an item that is not shared with the receiver: at once
+/// after a trash or a move out of the shared tree, and after a revoke or a leave once the
+/// backend has deleted the share root record. Every case runs in this one test, as
+/// `copy_with_shares` runs inside `share_dir`, to set up the contact once. Every fixture lives in
+/// the two accounts' per-test directories, which are deleted, with their shares, when the test
+/// ends.
+#[shared_test_runtime]
+async fn get_shared_in_item_answers_as_the_listings() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = &resources.dir;
+	let share_resources = test_utils::SHARE_RESOURCES.get_resources().await;
+	let share_client = &share_resources.client;
+
+	// shared: root/{nested/deep.txt, top.txt, gone/below.txt, moved/inside.txt}, left/left.txt
+	// and solo.txt; root/versioned.txt is uploaded once root is shared
+	let root = client.create_dir(&test_dir.into(), "root").await.unwrap();
+	let nested = client.create_dir(&(&root).into(), "nested").await.unwrap();
+	let deep = upload(client, &nested, "deep.txt", b"deep").await;
+	let mut top = upload(client, &root, "top.txt", b"top").await;
+	let mut gone = client.create_dir(&(&root).into(), "gone").await.unwrap();
+	let below = upload(client, &gone, "below.txt", b"below").await;
+	let mut moved = client.create_dir(&(&root).into(), "moved").await.unwrap();
+	let inside = upload(client, &moved, "inside.txt", b"inside").await;
+	let left = client.create_dir(&test_dir.into(), "left").await.unwrap();
+	let left_file = upload(client, &left, "left.txt", b"left").await;
+	let solo = upload(client, test_dir, "solo.txt", b"solo").await;
+
+	let (contact, _contact_locks) = test_utils::ensure_contact(client, share_client).await;
+	for dir in [&root, &left] {
+		client
+			.share_dir::<fn(u64, Option<u64>)>(dir, &contact, None, None)
+			.await
+			.unwrap();
+	}
+	client.share_file(&solo, &contact).await.unwrap();
+	// As in `share_dir`: a share can take a moment to become visible to its recipient.
+	tokio::time::sleep(Duration::from_secs(5)).await;
+
+	let sharer = SharingRole::Sharer(ShareInfo {
+		email: client.email().to_owned(),
+		id: client.get_user_info().await.unwrap().id,
+	});
+
+	// share roots: a folder and a file
+	let (in_dirs, in_files) = share_client
+		.list_in_shared_root::<fn(u64, Option<u64>)>(None)
+		.await
+		.unwrap();
+	let root_in = in_dirs.iter().find(|d| d.uuid() == root.uuid()).unwrap();
+	assert_eq!(root_in.name(), Some("root"));
+	assert_eq!(root_in.sharing_role(), &sharer);
+	assert_eq!(
+		lookup(share_client, root.uuid()).await,
+		Some(SharedInItem::RootDir(root_in.clone()))
+	);
+	let solo_in = in_files.iter().find(|f| f.uuid() == solo.uuid()).unwrap();
+	assert_eq!(solo_in.name(), Some("solo.txt"));
+	assert_eq!(solo_in.sharing_role(), &sharer);
+	assert_eq!(
+		lookup(share_client, solo.uuid()).await,
+		Some(SharedInItem::RootFile(solo_in.clone()))
+	);
+
+	// inside a shared folder: a folder, a file, and a file one level further down
+	let (dirs, files) = share_client
+		.list_shared_dir::<fn(u64, Option<u64>)>(&root_in.into(), &sharer, None)
+		.await
+		.unwrap();
+	let nested_in = dirs.iter().find(|d| d.uuid() == nested.uuid()).unwrap();
+	assert_eq!(nested_in.name(), Some("nested"));
+	assert_eq!(nested_in.parent(), &ParentUuid::Uuid(root.uuid()));
+	assert_eq!(
+		lookup(share_client, nested.uuid()).await,
+		Some(SharedInItem::Dir {
+			dir: nested_in.clone(),
+			role: sharer.clone(),
+		})
+	);
+	let top_in = files.iter().find(|f| f.uuid() == top.uuid()).unwrap();
+	assert_eq!(top_in.name(), Some("top.txt"));
+	assert_eq!(top_in.parent(), &ParentUuid::Uuid(root.uuid()));
+	assert_eq!(
+		lookup(share_client, top.uuid()).await,
+		Some(SharedInItem::File {
+			file: top_in.clone(),
+			role: sharer.clone(),
+		})
+	);
+	let (_, nested_files) = share_client
+		.list_shared_dir::<fn(u64, Option<u64>)>(&nested_in.into(), &sharer, None)
+		.await
+		.unwrap();
+	let deep_in = nested_files
+		.iter()
+		.find(|f| f.uuid() == deep.uuid())
+		.unwrap();
+	assert_eq!(deep_in.name(), Some("deep.txt"));
+	assert_eq!(deep_in.parent(), &ParentUuid::Uuid(nested.uuid()));
+	assert_eq!(
+		lookup(share_client, deep.uuid()).await,
+		Some(SharedInItem::File {
+			file: deep_in.clone(),
+			role: sharer.clone(),
+		})
+	);
+
+	// an older version's uuid answers with the current version, under its own uuid. With
+	// versioning on, a same-name upload keeps the first file as an older version of the second,
+	// under a uuid of its own; the upload shares the new one into root. The versions lock is held
+	// until the older version has been looked up.
+	let current_version = with_versioning(client, true, async {
+		let old_version = upload(client, &root, "versioned.txt", b"old").await;
+		let current_version = upload(client, &root, "versioned.txt", b"current").await;
+		assert_ne!(old_version.uuid(), current_version.uuid());
+		let (_, files) = share_client
+			.list_shared_dir::<fn(u64, Option<u64>)>(&root_in.into(), &sharer, None)
+			.await
+			.unwrap();
+		assert!(files.iter().all(|f| f.uuid() != old_version.uuid()));
+		let current_in = files
+			.iter()
+			.find(|f| f.uuid() == current_version.uuid())
+			.unwrap();
+		assert_eq!(
+			lookup(share_client, old_version.uuid()).await,
+			Some(SharedInItem::File {
+				file: current_in.clone(),
+				role: sharer.clone(),
+			})
+		);
+		current_version
+	})
+	.await;
+
+	// not shared with the receiver: its own drive, a uuid nothing has, and, for the sharer, an
+	// item it shared
+	assert_eq!(lookup(share_client, share_resources.dir.uuid()).await, None);
+	assert_eq!(lookup(share_client, Uuid::new_v4()).await, None);
+	assert_eq!(lookup(client, top.uuid()).await, None);
+
+	// trashing the item, or a folder above it, and moving it out of the shared tree end the
+	// share at once
+	client.trash_file(&mut top).await.unwrap();
+	assert_eq!(lookup(share_client, top.uuid()).await, None);
+	client.trash_dir(&mut gone).await.unwrap();
+	assert_eq!(lookup(share_client, gone.uuid()).await, None);
+	assert_eq!(lookup(share_client, below.uuid()).await, None);
+	client.move_dir(&mut moved, &test_dir.into()).await.unwrap();
+	assert_eq!(lookup(share_client, moved.uuid()).await, None);
+	assert_eq!(lookup(share_client, inside.uuid()).await, None);
+	// and the listing agrees
+	let (dirs, files) = share_client
+		.list_shared_dir::<fn(u64, Option<u64>)>(&root_in.into(), &sharer, None)
+		.await
+		.unwrap();
+	let mut listed = dirs
+		.iter()
+		.map(|d| d.uuid())
+		.chain(files.iter().map(|f| f.uuid()))
+		.collect::<Vec<_>>();
+	listed.sort_unstable();
+	let mut expected = vec![nested.uuid(), current_version.uuid()];
+	expected.sort_unstable();
+	assert_eq!(listed, expected);
+
+	// the receiver leaves a share: once its root record is gone, what is inside it is no longer
+	// shared either
+	let left_in = in_dirs
+		.into_iter()
+		.find(|d| d.uuid() == left.uuid())
+		.unwrap();
+	share_client
+		.remove_shared_item(&RootItemType::Dir(Cow::Owned(left_in)))
+		.await
+		.unwrap();
+	wait_until_share_root_removed(share_client, left.uuid()).await;
+	assert_eq!(lookup(share_client, left_file.uuid()).await, None);
+
+	// the sharer revokes a share: the same, nested items included
+	let (out_dirs, _) = client
+		.list_out_shared::<fn(u64, Option<u64>)>(Some(&contact), None)
+		.await
+		.unwrap();
+	let root_out = out_dirs
+		.into_iter()
+		.find(|d| d.uuid() == root.uuid())
+		.unwrap();
+	client
+		.remove_shared_item(&RootItemType::Dir(Cow::Owned(root_out)))
+		.await
+		.unwrap();
+	wait_until_share_root_removed(share_client, root.uuid()).await;
+	for uuid in [nested.uuid(), deep.uuid(), current_version.uuid()] {
+		assert_eq!(lookup(share_client, uuid).await, None, "{uuid}");
+	}
 }

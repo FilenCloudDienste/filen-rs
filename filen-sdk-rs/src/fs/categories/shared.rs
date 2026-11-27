@@ -3,8 +3,14 @@ use std::borrow::Cow;
 use filen_types::{
 	api::v3::{
 		dir::color::DirColor,
-		shared::{in_uuid::SharedFileIn, out_uuid::SharedFileOut},
+		shared::{
+			in_item::{self, SharedItemDirIn, SharedItemFileIn},
+			in_root::{SharedRootDirIn, SharedRootFileIn},
+			in_uuid::{SharedDirIn, SharedFileIn},
+			out_uuid::SharedFileOut,
+		},
 	},
+	fs::Uuid,
 	traits::CowHelpers,
 };
 #[cfg(feature = "multi-threaded-crypto")]
@@ -18,7 +24,8 @@ use crate::{
 		http::{ProgressCallback, dyn_progress},
 	},
 	connect::fs::{
-		DirInfo, ShareInfo, SharedDirectory, SharedRootDirectory, SharedRootFile, SharingRole,
+		DirInfo, ShareInfo, SharedDirectory, SharedInItem, SharedRootDirectory, SharedRootFile,
+		SharingRole,
 	},
 	crypto::shared::MetaCrypter,
 	fs::{
@@ -153,6 +160,19 @@ fn blocking_remote_file_from_shared_in(
 	))
 }
 
+fn blocking_shared_dir_from_shared_in(
+	shared_dir: SharedDirIn<'static>,
+	private_key: &PrivateKey,
+) -> SharedDirectory {
+	SharedDirectory::from_dir_info(DirInfo {
+		uuid: shared_dir.uuid,
+		parent: shared_dir.parent,
+		color: shared_dir.color,
+		timestamp: shared_dir.timestamp,
+		metadata: DirectoryMeta::blocking_from_rsa_encrypted(shared_dir.metadata, private_key),
+	})
+}
+
 pub(crate) async fn list_all_in_shared(
 	client: &Client,
 	callback: Option<&ProgressCallback<'_>>,
@@ -181,6 +201,159 @@ pub(crate) async fn list_all_in_shared(
 		Ok((dirs?, files?))
 	})
 	.await
+}
+
+/// `None` for `item_not_shared` alone. Every other error, a not-found code from elsewhere
+/// included, stays an error: a caller deletes its local state on `None`, so only the answer the
+/// endpoint gives after a completed check may produce it.
+fn none_if_not_shared<T>(result: Result<T, Error>) -> Result<Option<T>, Error> {
+	match result {
+		Ok(value) => Ok(Some(value)),
+		Err(e) if e.server_code().as_deref() == Some(in_item::ITEM_NOT_SHARED) => Ok(None),
+		Err(e) => Err(e),
+	}
+}
+
+pub(crate) async fn get_in_shared_item(
+	client: &Client,
+	uuid: Uuid,
+) -> Result<Option<SharedInItem>, Error> {
+	let Some(response) = none_if_not_shared(
+		api::v3::shared::in_item::post(client.client(), &in_item::Request { uuid }).await,
+	)?
+	else {
+		return Ok(None);
+	};
+	let key = client.private_key();
+	do_cpu_intensive(|| blocking_shared_in_item_from_response(response, key))
+		.await
+		.map(Some)
+}
+
+/// Builds a [`SharedInItem`] from a `v3/shared/in/item` row through the constructors the
+/// `v3/shared/in` listings use: a row with no parent is a share root, one with a parent an item
+/// inside a shared folder. The row's `writeAccess` goes only where those types already hold it
+/// (a root folder's [`SharedDirInfo`](crate::connect::fs::SharedDirInfo)); nothing enforces it.
+fn blocking_shared_in_item_from_response(
+	response: in_item::Response<'static>,
+	private_key: &PrivateKey,
+) -> Result<SharedInItem, Error> {
+	match response {
+		in_item::Response::Dir(dir) => blocking_shared_in_dir(dir, private_key),
+		in_item::Response::File(file) => blocking_shared_in_file(file, private_key),
+	}
+}
+
+fn blocking_shared_in_dir(
+	dir: SharedItemDirIn<'static>,
+	private_key: &PrivateKey,
+) -> Result<SharedInItem, Error> {
+	let SharedItemDirIn {
+		uuid,
+		parent,
+		metadata,
+		sharer_email,
+		sharer_id,
+		write_access,
+		color,
+		timestamp,
+		is_sync,
+		is_default,
+	} = dir;
+	Ok(match parent {
+		None => SharedInItem::RootDir(SharedRootDirectory::blocking_from_shared_in(
+			SharedRootDirIn {
+				uuid,
+				metadata,
+				sharer_email,
+				sharer_id,
+				write_access,
+				color,
+				timestamp,
+				is_sync,
+				is_default,
+			},
+			private_key,
+		)?),
+		Some(parent) => SharedInItem::Dir {
+			dir: blocking_shared_dir_from_shared_in(
+				SharedDirIn {
+					uuid,
+					parent,
+					metadata,
+					write_access,
+					color,
+					timestamp,
+					is_sync,
+					is_default,
+				},
+				private_key,
+			),
+			role: SharingRole::Sharer(ShareInfo {
+				email: sharer_email.into_owned(),
+				id: sharer_id,
+			}),
+		},
+	})
+}
+
+fn blocking_shared_in_file(
+	file: SharedItemFileIn<'_>,
+	private_key: &PrivateKey,
+) -> Result<SharedInItem, Error> {
+	let SharedItemFileIn {
+		uuid,
+		parent,
+		metadata,
+		bucket,
+		region,
+		chunks,
+		size,
+		version,
+		sharer_email,
+		sharer_id,
+		write_access,
+		timestamp,
+	} = file;
+	Ok(match parent {
+		None => SharedInItem::RootFile(SharedRootFile::blocking_from_shared_in(
+			SharedRootFileIn {
+				uuid,
+				metadata,
+				bucket,
+				region,
+				chunks,
+				size,
+				version,
+				sharer_email,
+				sharer_id,
+				write_access,
+				timestamp,
+			},
+			private_key,
+		)?),
+		Some(parent) => SharedInItem::File {
+			file: blocking_remote_file_from_shared_in(
+				SharedFileIn {
+					uuid,
+					parent,
+					metadata,
+					bucket,
+					region,
+					chunks,
+					size,
+					version,
+					write_access,
+					timestamp,
+				},
+				private_key,
+			)?,
+			role: SharingRole::Sharer(ShareInfo {
+				email: sharer_email.into_owned(),
+				id: sharer_id,
+			}),
+		},
+	})
 }
 
 pub(crate) async fn list_all_out_shared(
@@ -271,17 +444,7 @@ async fn list_dir_contents(
 						response
 							.dirs
 							.into_maybe_par_iter()
-							.map(|d| {
-								SharedDirectory::from_dir_info(DirInfo {
-									uuid: d.uuid,
-									parent: d.parent,
-									color: d.color,
-									timestamp: d.timestamp,
-									metadata: DirectoryMeta::blocking_from_rsa_encrypted(
-										d.metadata, key,
-									),
-								})
-							})
+							.map(|d| blocking_shared_dir_from_shared_in(d, key))
 							.collect::<Vec<_>>()
 					},
 					|| {
@@ -426,4 +589,198 @@ async fn list_dir_recursive_contents(
 		Ok((dirs, files))
 	})
 	.await
+}
+
+#[cfg(test)]
+mod tests {
+	use chrono::DateTime;
+	use filen_types::{
+		api::v3::shared::in_item::Response, auth::FileEncryptionVersion, error::ResponseError,
+		fs::ParentUuid,
+	};
+
+	use super::*;
+	use crate::{
+		ErrorKind,
+		fs::{
+			HasName, HasParent,
+			categories::RootItemType,
+			meta_recovery::test_support::{TEST_RSA_KEY, rsa_encrypt},
+		},
+		io::HasFileInfo,
+	};
+
+	const ITEM: Uuid = Uuid::from_u128(0x4f1c0d1e_5a3b_4c7a_9d8e_2b1f0a9c6e33);
+	const PARENT: Uuid = Uuid::from_u128(0xa7e20000_0000_4000_8000_000000000001);
+	const SHARER_ID: u64 = 123_456;
+	const SHARER_EMAIL: &str = "owner@example.com";
+	const FILE_META: &str = r#"{"name":"report.pdf","size":2500000,"mime":"application/pdf","key":"12345678901234567890123456789012","lastModified":1719000000000}"#;
+
+	fn sharer() -> SharingRole {
+		SharingRole::Sharer(ShareInfo {
+			email: SHARER_EMAIL.to_owned(),
+			id: SHARER_ID,
+		})
+	}
+
+	fn dir_row(parent: Option<Uuid>, write_access: bool) -> Response<'static> {
+		Response::Dir(SharedItemDirIn {
+			uuid: ITEM,
+			parent,
+			metadata: rsa_encrypt(br#"{"name":"Projects"}"#),
+			sharer_email: SHARER_EMAIL.into(),
+			sharer_id: SHARER_ID,
+			write_access,
+			color: DirColor::Blue,
+			timestamp: DateTime::from_timestamp(1_764_230_400, 0).unwrap(),
+			is_sync: false,
+			is_default: false,
+		})
+	}
+
+	/// A file row's `writeAccess` lands in none of the types it converts to, so it is fixed.
+	fn file_row(parent: Option<Uuid>) -> Response<'static> {
+		Response::File(SharedItemFileIn {
+			uuid: ITEM,
+			parent,
+			metadata: rsa_encrypt(FILE_META.as_bytes()),
+			bucket: "filen-1".into(),
+			region: "de-1".into(),
+			chunks: 3,
+			size: 2_500_000,
+			version: FileEncryptionVersion::V2,
+			sharer_email: SHARER_EMAIL.into(),
+			sharer_id: SHARER_ID,
+			write_access: true,
+			timestamp: DateTime::from_timestamp(1_764_230_400, 0).unwrap(),
+		})
+	}
+
+	fn convert(row: Response<'static>) -> SharedInItem {
+		blocking_shared_in_item_from_response(row, &TEST_RSA_KEY).unwrap()
+	}
+
+	#[test]
+	fn a_folder_row_without_a_parent_is_a_root_dir_carrying_its_sharer_and_access() {
+		// both values, so a hardcoded `write_access` fails
+		for write_access in [true, false] {
+			let SharedInItem::RootDir(root) = convert(dir_row(None, write_access)) else {
+				panic!("expected a root dir");
+			};
+			assert_eq!(root.uuid(), ITEM);
+			assert_eq!(root.name(), Some("Projects"));
+			assert_eq!(root.sharing_role(), &sharer());
+			assert_eq!(root.info.write_access, write_access);
+			assert_eq!(root.get_source_id(), SHARER_ID);
+		}
+	}
+
+	#[test]
+	fn a_file_row_without_a_parent_is_a_root_file_carrying_its_sharer() {
+		let SharedInItem::RootFile(file) = convert(file_row(None)) else {
+			panic!("expected a root file");
+		};
+		assert_eq!(file.uuid(), ITEM);
+		assert_eq!(file.name(), Some("report.pdf"));
+		assert_eq!(file.mime(), Some("application/pdf"));
+		assert_eq!(file.size(), 2_500_000);
+		assert_eq!(file.chunks(), 3);
+		assert_eq!(file.sharing_role(), &sharer());
+	}
+
+	#[test]
+	fn a_folder_row_with_a_parent_is_a_nested_dir_with_the_sharer_as_its_role() {
+		let SharedInItem::Dir { dir, role } = convert(dir_row(Some(PARENT), true)) else {
+			panic!("expected a nested dir");
+		};
+		assert_eq!(dir.uuid(), ITEM);
+		assert_eq!(dir.parent(), &ParentUuid::Uuid(PARENT));
+		assert_eq!(dir.name(), Some("Projects"));
+		assert_eq!(role, sharer());
+	}
+
+	#[test]
+	fn a_file_row_with_a_parent_is_a_nested_file_with_the_sharer_as_its_role() {
+		let SharedInItem::File { file, role } = convert(file_row(Some(PARENT))) else {
+			panic!("expected a nested file");
+		};
+		assert_eq!(file.uuid, ITEM);
+		assert_eq!(file.parent, ParentUuid::Uuid(PARENT));
+		assert_eq!(file.name(), Some("report.pdf"));
+		assert_eq!(file.size, 2_500_000);
+		assert_eq!(file.region, "de-1");
+		assert_eq!(file.bucket, "filen-1");
+		assert_eq!(role, sharer());
+	}
+
+	fn api_error(code: &str) -> Error {
+		ResponseError::ApiError {
+			message: None,
+			code: Some(code.to_owned()),
+		}
+		.into()
+	}
+
+	#[test]
+	fn only_item_not_shared_reads_as_not_shared() {
+		assert_eq!(
+			none_if_not_shared::<()>(Err(api_error("item_not_shared"))).unwrap(),
+			None
+		);
+		assert_eq!(none_if_not_shared(Ok(7)).unwrap(), Some(7));
+	}
+
+	#[test]
+	fn another_not_found_code_stays_an_error() {
+		let err = none_if_not_shared::<()>(Err(api_error("folder_not_found"))).unwrap_err();
+		assert_eq!(err.kind(), ErrorKind::FolderNotFound);
+	}
+
+	#[test]
+	fn a_transport_or_server_error_stays_an_error() {
+		let transport = none_if_not_shared::<()>(Err(Error::custom(ErrorKind::Reqwest, "offline")))
+			.unwrap_err();
+		assert_eq!(transport.kind(), ErrorKind::Reqwest);
+		let server = none_if_not_shared::<()>(Err(api_error("internal_error"))).unwrap_err();
+		assert_eq!(server.kind(), ErrorKind::Server);
+	}
+
+	/// Never run: it only has to compile, proving each result feeds the calls that browse,
+	/// compare with and leave a share.
+	#[expect(
+		dead_code,
+		reason = "a compile-time check of the result's types, never called"
+	)]
+	async fn a_looked_up_item_feeds_the_existing_share_calls(
+		client: &Client,
+		uuid: Uuid,
+	) -> Result<(), Error> {
+		let no_progress = None::<&fn(u64, Option<u64>)>;
+		match client.get_shared_in_item(uuid).await? {
+			None => {}
+			Some(SharedInItem::RootDir(root)) => {
+				client
+					.list_shared_dir(&DirType::from(&root), root.sharing_role(), no_progress)
+					.await?;
+				client
+					.remove_shared_item(&RootItemType::Dir(Cow::Owned(root)))
+					.await?;
+			}
+			Some(SharedInItem::RootFile(file)) => {
+				client
+					.remove_shared_item(&RootItemType::File(Cow::Owned(file)))
+					.await?;
+			}
+			Some(SharedInItem::Dir { dir, role }) => {
+				client
+					.list_shared_dir(&DirType::from(&dir), &role, no_progress)
+					.await?;
+			}
+			Some(SharedInItem::File { file, role: _ }) => {
+				// the type `list_shared_dir` lists a shared folder's files as
+				let _: &SharedListedFile = &file;
+			}
+		}
+		Ok(())
+	}
 }

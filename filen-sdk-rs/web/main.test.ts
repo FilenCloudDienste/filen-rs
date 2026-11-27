@@ -1068,6 +1068,55 @@ test("sharing", { timeout: CONTACT_TEST_TIMEOUT }, async () => {
 	await state.deleteContact(contact.uuid)
 })
 
+// getSharedInItem answers in the shapes the shared listings return, read at the same moment. The
+// contact is left in place, as in the thumbnail test: deleting it would make the next
+// ensureShareContact send a fresh request.
+test("getSharedInItem finds what the shared listings list", { timeout: CONTACT_TEST_TIMEOUT }, async () => {
+	using _contactLock = await state.acquireLock(CONTACT_LOCK)
+	using _shareContactLock = await shareClient.acquireLock(CONTACT_LOCK)
+	const dir = await state.createDir(testDir, "share-item-lookup-dir")
+	const sub = await state.createDir(dir, "sub")
+	const file = await state.uploadFile(new TextEncoder().encode("looked up"), {
+		parent: dir,
+		name: "looked-up.txt"
+	})
+	const solo = await state.uploadFile(new TextEncoder().encode("looked up alone"), {
+		parent: testDir,
+		name: "looked-up-solo.txt"
+	})
+	const contact = await ensureShareContact()
+	await state.shareDir(dir, contact, () => {})
+	await state.shareFile(solo, contact)
+
+	const inShared = await shareClient.listInShared()
+	const listedRoot = inShared.dirs.find(d => d.inner.uuid === dir.uuid)
+	const listedSolo = inShared.files.find(f => f.uuid === solo.uuid)
+	expect(listedRoot).toBeDefined()
+	expect(listedSolo).toBeDefined()
+	const listed = await shareClient.listSharedDir(listedRoot!, listedRoot!.sharingRole)
+	const listedSub = listed.dirs.find(d => d.inner.uuid === sub.uuid)
+	const listedFile = listed.files.find(f => f.uuid === file.uuid)
+	expect(listedSub).toBeDefined()
+	expect(listedFile).toBeDefined()
+
+	expect(await shareClient.getSharedInItem(dir.uuid)).toEqual({ type: "rootDir", dir: listedRoot })
+	expect(await shareClient.getSharedInItem(solo.uuid)).toEqual({ type: "rootFile", file: listedSolo })
+	expect(await shareClient.getSharedInItem(sub.uuid)).toEqual({
+		type: "dir",
+		dir: listedSub,
+		role: listedRoot!.sharingRole
+	})
+	expect(await shareClient.getSharedInItem(file.uuid)).toEqual({
+		type: "file",
+		file: listedFile,
+		role: listedRoot!.sharingRole
+	})
+
+	// an item of the account's own drive, and a uuid nothing has, are not shared with it
+	expect(await state.getSharedInItem(file.uuid)).toBeUndefined()
+	expect(await shareClient.getSharedInItem(crypto.randomUUID())).toBeUndefined()
+})
+
 test("block", { timeout: CONTACT_TEST_TIMEOUT }, async () => {
 	// Same lock, same order, as the native contact tests — see the shared/linked thumbnail test.
 	using _contactLock = await state.acquireLock(CONTACT_LOCK)

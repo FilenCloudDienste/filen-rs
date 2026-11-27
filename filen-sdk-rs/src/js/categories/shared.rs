@@ -6,8 +6,8 @@ use filen_types::fs::Uuid;
 
 use crate::{
 	connect::fs::{
-		SharedDirInfo, SharedDirectory, SharedRootDirectory, SharedRootFile as SharedRootFileRS,
-		SharingRole,
+		SharedDirInfo, SharedDirectory, SharedInItem as SharedInItemRS, SharedRootDirectory,
+		SharedRootFile as SharedRootFileRS, SharingRole,
 	},
 	crypto::error::ConversionError,
 	fs::{
@@ -15,7 +15,7 @@ use crate::{
 		categories::{DirType, RootItemType, Shared},
 		file::{RemoteRootFile, traits::HasFileInfo},
 	},
-	js::{FileMeta, categories::common::dir::RootDirWithMeta},
+	js::{File, FileMeta, categories::common::dir::RootDirWithMeta},
 	thumbnail::might_be_thumbnailable,
 };
 
@@ -174,6 +174,47 @@ impl From<DirType<'static, Shared>> for AnySharedDir {
 		match value {
 			DirType::Root(dir) => Self::Root(dir.into_owned().into()),
 			DirType::Dir(dir) => Self::Dir(dir.into_owned().into()),
+		}
+	}
+}
+
+/// FFI mirror of [`SharedInItemRS`]: an item shared with this account, as `getSharedInItem` finds
+/// it by uuid, in the shapes the shared listings return, with the sharer beside the ones that do
+/// not hold it.
+#[js_type(export, no_deser, tagged, camel_case_fields)]
+pub enum SharedInItem {
+	/// A folder shared with this account directly, as `listInShared` lists it. Its `writeAccess`
+	/// is the share's stored value, which nothing enforces: receivers cannot change shared items.
+	RootDir { dir: SharedRootDir },
+	/// A file shared with this account directly, as `listInShared` lists it.
+	RootFile { file: SharedFile },
+	/// A folder inside a shared folder, as `listSharedDir` lists it.
+	Dir {
+		dir: SharedDir,
+		/// The account that shared it, as `listSharedDir` takes it.
+		role: SharingRole,
+	},
+	/// A file inside a shared folder, as `listSharedDir` lists it.
+	File {
+		file: File,
+		/// The account that shared it.
+		role: SharingRole,
+	},
+}
+
+impl From<SharedInItemRS> for SharedInItem {
+	fn from(value: SharedInItemRS) -> Self {
+		match value {
+			SharedInItemRS::RootDir(dir) => Self::RootDir { dir: dir.into() },
+			SharedInItemRS::RootFile(file) => Self::RootFile { file: file.into() },
+			SharedInItemRS::Dir { dir, role } => Self::Dir {
+				dir: dir.into(),
+				role,
+			},
+			SharedInItemRS::File { file, role } => Self::File {
+				file: file.into(),
+				role,
+			},
 		}
 	}
 }

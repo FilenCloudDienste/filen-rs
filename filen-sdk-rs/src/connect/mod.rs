@@ -21,7 +21,7 @@ use filen_types::{
 	fs::{ObjectType, Uuid},
 	traits::CowHelpers,
 };
-use fs::{SharedDirectory, SharedRootFile};
+use fs::{SharedDirectory, SharedInItem, SharedRootFile};
 use futures::stream::{FuturesUnordered, StreamExt};
 
 use crate::{
@@ -35,7 +35,7 @@ use crate::{
 		categories::{
 			DirType, Linked, NonRootItemType, Normal, RootItemType, Shared,
 			fs::CategoryFS,
-			shared::{list_all_in_shared, list_all_out_shared},
+			shared::{get_in_shared_item, list_all_in_shared, list_all_out_shared},
 		},
 		dir::{LinkedDirectory, RemoteDirectory, RootDirectoryWithMeta, meta::DirectoryMeta},
 		file::{AnonymousRemoteFile, LinkedFile, RemoteFile},
@@ -1459,6 +1459,35 @@ impl Client {
 		F: Fn(u64, Option<u64>) + Send + Sync,
 	{
 		list_all_in_shared(self, dyn_progress(callback)).await
+	}
+
+	/// Looks up an item shared with this account by its uuid, through `v3/shared/in/item`.
+	///
+	/// `Ok(None)` means the server checked and the item is not shared with this account: it was
+	/// trashed, deleted, revoked, left or moved out of the shared tree, its sharer's account no
+	/// longer exists, or it is in this account's own drive or someone else's, or it never
+	/// existed. A revoke or a leave reads so once the server's background job has deleted the
+	/// share root record; a trash or a move out of the shared tree reads so at once. Every other
+	/// failure (transport, server, a server without the endpoint, a malformed body) is an `Err`:
+	/// it cannot tell whether the item is still shared. There is no fallback walk of the listings.
+	///
+	/// A share root comes back as [`SharedInItem::RootDir`] or [`SharedInItem::RootFile`], whose
+	/// parent is in the sharer's drive and not visible; an item inside a shared folder as
+	/// [`SharedInItem::Dir`] or [`SharedInItem::File`], with its parent and the role
+	/// [`list_shared_dir`](Self::list_shared_dir) takes to keep browsing. Leaving the share still
+	/// needs the root, from [`list_in_shared_root`](Self::list_in_shared_root), since
+	/// [`remove_shared_item`](Self::remove_shared_item) takes a root item. An item shared on its
+	/// own and also inside a shared folder comes back as the share root.
+	///
+	/// The uuid of an older version of a file shared with this account comes back as the current
+	/// version, whose uuid differs from `uuid`: the item was replaced by a new version, and a
+	/// caller keeping it by uuid moves to the returned one.
+	///
+	/// The sharer's email is read when the lookup runs, so it can be newer than the one
+	/// [`list_in_shared_root`](Self::list_in_shared_root) carries, which is stored when the item
+	/// is shared.
+	pub async fn get_shared_in_item(&self, uuid: Uuid) -> Result<Option<SharedInItem>, Error> {
+		get_in_shared_item(self, uuid).await
 	}
 
 	/// Leaves a share someone else made with this account, or revokes one this account made.

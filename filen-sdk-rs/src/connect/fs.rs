@@ -31,7 +31,7 @@ use crate::{
 			traits::{File, HasRemoteFileInfo},
 		},
 	},
-	io::HasFileInfo,
+	io::{AnonymousRemoteFile, HasFileInfo},
 };
 
 #[derive(serde::Deserialize, serde::Serialize)]
@@ -437,4 +437,37 @@ impl SharedRootFile {
 			SharingRole::Sharer(info) | SharingRole::Receiver(info) => info.id,
 		}
 	}
+}
+
+/// An item shared with this account, as [`Client::get_shared_in_item`](crate::auth::Client::get_shared_in_item)
+/// finds it by uuid.
+///
+/// A share root comes back as the type [`Client::list_in_shared_root`](crate::auth::Client::list_in_shared_root)
+/// lists, an item inside a shared folder as the one
+/// [`Client::list_shared_dir`](crate::auth::Client::list_shared_dir) lists, with the sharer beside
+/// it where that type does not hold it. A nested item's parent is read from the item
+/// ([`HasParent`]); a share root's parent is in the sharer's drive and is not visible.
+///
+/// The sharer's email is read when the lookup runs, while `list_in_shared_root` carries the one
+/// stored when the item was shared, so the two differ after a sharer changes their email; prefer
+/// this one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SharedInItem {
+	/// A folder shared with this account directly. It carries its sharer and the share's stored
+	/// write access, which nothing enforces: receivers cannot change shared items.
+	RootDir(SharedRootDirectory),
+	/// A file shared with this account directly. It carries its sharer.
+	RootFile(SharedRootFile),
+	/// A folder inside a folder shared with this account.
+	Dir {
+		dir: SharedDirectory,
+		/// The account that shared it, as `list_shared_dir` takes it to keep browsing.
+		role: SharingRole,
+	},
+	/// A file inside a folder shared with this account.
+	File {
+		file: AnonymousRemoteFile,
+		/// The account that shared it.
+		role: SharingRole,
+	},
 }

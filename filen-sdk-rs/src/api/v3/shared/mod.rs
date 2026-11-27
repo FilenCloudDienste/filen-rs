@@ -1,3 +1,4 @@
+pub(crate) mod in_item;
 pub(crate) mod in_root;
 pub(crate) mod in_uuid;
 pub(crate) mod out_root;
