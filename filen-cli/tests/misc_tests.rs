@@ -47,7 +47,7 @@ async fn public_link_show_and_a_run_without_a_terminal_change_nothing() {
 		.await
 		.unwrap();
 	let mut dir_link = client
-		.public_link_dir::<fn(u64, Option<u64>)>(&dir, None)
+		.public_link_dir::<fn(u64, Option<u64>)>(&dir, None, None)
 		.await
 		.unwrap();
 	dir_link.set_expiration(PublicLinkExpiration::OneWeek);
@@ -143,7 +143,7 @@ async fn list_public_links_shows_the_path_expiry_and_url_of_each_link() {
 		.await
 		.unwrap();
 	let dir_link = client
-		.public_link_dir::<fn(u64, Option<u64>)>(&dir, None)
+		.public_link_dir::<fn(u64, Option<u64>)>(&dir, None, None)
 		.await
 		.unwrap();
 	let file_path = path_in(test_dir, "listed.txt");

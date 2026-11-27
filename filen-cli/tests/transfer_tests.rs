@@ -1146,7 +1146,7 @@ async fn linked_directory(
 	};
 	let dir = dir.into_owned();
 	let link = client
-		.public_link_dir::<fn(u64, Option<u64>)>(&dir, None)
+		.public_link_dir::<fn(u64, Option<u64>)>(&dir, None, None)
 		.await
 		.unwrap();
 	(dir, link)

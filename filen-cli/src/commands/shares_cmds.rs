@@ -189,7 +189,7 @@ async fn share(ui: &mut UI, client: &mut LazyClient, path: &RemotePath, email: &
 	let item = find_existing_item(client, path).await?;
 	match item {
 		NonRootFileType::Dir(dir) => client
-			.share_dir(&dir, contact, no_progress())
+			.share_dir(&dir, contact, no_progress(), None)
 			.await
 			.with_context(|| format!("Failed to share {path}"))?,
 		NonRootFileType::File(file) => client

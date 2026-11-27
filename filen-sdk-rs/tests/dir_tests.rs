@@ -918,7 +918,7 @@ async fn download_linked_dir_to_zip() {
 
 	// Create a public link for the directory
 	let link = client
-		.public_link_dir::<fn(u64, Option<u64>)>(&dir_a, None)
+		.public_link_dir::<fn(u64, Option<u64>)>(&dir_a, None, None)
 		.await
 		.unwrap();
 
@@ -1041,7 +1041,7 @@ async fn download_linked_items_to_zip() {
 	}
 
 	let link = client
-		.public_link_dir::<fn(u64, Option<u64>)>(&linked, None)
+		.public_link_dir::<fn(u64, Option<u64>)>(&linked, None, None)
 		.await
 		.unwrap();
 

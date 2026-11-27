@@ -442,6 +442,29 @@ async fn drain_collecting_errors(
 	errors
 }
 
+/// Drives one post per item to completion, returning the first error, and reports
+/// `(items posted, items in total)` to `callback`: `(0, total)` once before any post completes,
+/// then once after each one that succeeds.
+async fn drain_reporting_items(
+	mut futures: FuturesUnordered<MaybeSendBoxFuture<'_, Result<(), Error>>>,
+	callback: Option<&(dyn Fn(u64, u64) + Send + Sync)>,
+) -> Result<(), Error> {
+	let total = futures.len() as u64;
+	let report = |posted| {
+		if let Some(callback) = callback {
+			callback(posted, total);
+		}
+	};
+	report(0);
+	let mut posted = 0;
+	while let Some(result) = futures.next().await {
+		result?;
+		posted += 1;
+		report(posted);
+	}
+	Ok(())
+}
+
 /// Which of its parent's links and shares an item is added to.
 #[derive(Clone, Copy)]
 pub(crate) enum ParentTargets {
@@ -1003,10 +1026,16 @@ impl Client {
 		Ok(())
 	}
 
+	/// Links `dir` and everything below it in a new public link.
+	///
+	/// `progress_callback` gets `(bytes listed, total bytes)` while the tree is listed, and
+	/// `items_callback` `(items linked, items in total)` while they are linked: `(0, total)` once
+	/// the listing is in, then after each item. The total counts `dir` itself.
 	pub async fn public_link_dir<F>(
 		&self,
 		dir: &RemoteDirectory,
 		progress_callback: Option<&F>,
+		items_callback: Option<&(dyn Fn(u64, u64) + Send + Sync)>,
 	) -> Result<DirPublicLinkRW, Error>
 	where
 		F: Fn(u64, Option<u64>) + Send + Sync,
@@ -1041,7 +1070,7 @@ impl Client {
 		// nothing is linked or shared. The posts below are issued together, so the lease is
 		// confirmed once here; one the HTTP stack queues past the lease is not checked again.
 		lock.confirm().await?;
-		let mut futures = FuturesUnordered::new();
+		let futures = FuturesUnordered::new();
 
 		// link main dir
 		let link = &link;
@@ -1080,14 +1109,7 @@ impl Client {
 			}) as MaybeSendBoxFuture<'_, Result<(), Error>>);
 		}
 
-		while let Some(result) = futures.next().await {
-			match result {
-				Ok(_) => continue,
-				Err(e) => return Err(e),
-			}
-		}
-
-		std::mem::drop(futures);
+		drain_reporting_items(futures, items_callback).await?;
 		Ok(public_link)
 	}
 
@@ -1313,11 +1335,17 @@ impl Client {
 		Ok(())
 	}
 
+	/// Shares `dir` and everything below it with `client`.
+	///
+	/// `progress_callback` gets `(bytes listed, total bytes)` while the tree is listed, and
+	/// `items_callback` `(items shared, items in total)` while they are shared: `(0, total)` once
+	/// the listing is in, then after each item. The total counts `dir` itself.
 	pub async fn share_dir<F>(
 		&self,
 		dir: &RemoteDirectory,
 		client: &Contact<'_>,
 		progress_callback: Option<&F>,
+		items_callback: Option<&(dyn Fn(u64, u64) + Send + Sync)>,
 	) -> Result<(), Error>
 	where
 		F: Fn(u64, Option<u64>) + Send + Sync,
@@ -1338,7 +1366,7 @@ impl Client {
 		let shared_user = client.into();
 		let shared_user = &shared_user;
 
-		let mut futures = FuturesUnordered::new();
+		let futures = FuturesUnordered::new();
 
 		futures.push(Box::pin(async move {
 			api::v3::item::share::post(
@@ -1368,14 +1396,7 @@ impl Client {
 				self.inner_share_item(&(&file).into(), shared_user).await
 			}) as MaybeSendBoxFuture<'_, Result<(), Error>>);
 		}
-		while let Some(result) = futures.next().await {
-			match result {
-				Ok(_) => continue,
-				Err(e) => return Err(e),
-			}
-		}
-		std::mem::drop(futures);
-		Ok(())
+		drain_reporting_items(futures, items_callback).await
 	}
 
 	pub async fn share_file(&self, file: &RemoteFile, contact: &Contact<'_>) -> Result<(), Error> {

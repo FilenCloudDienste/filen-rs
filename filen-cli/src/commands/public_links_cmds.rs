@@ -896,7 +896,7 @@ impl LinkableItem for RemoteDirectory {
 	}
 
 	async fn create_link(&self, client: &Client) -> Result<DirPublicLinkRW, Error> {
-		client.public_link_dir(self, Some(&(|_, _| {}))).await
+		client.public_link_dir(self, Some(&(|_, _| {})), None).await
 	}
 
 	async fn update_link(&self, client: &Client, link: &DirPublicLinkRW) -> Result<(), Error> {

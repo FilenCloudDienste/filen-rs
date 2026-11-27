@@ -549,7 +549,7 @@ async fn shared_reports_who_each_item_is_shared_with() {
 		.await
 		.unwrap();
 	client
-		.share_dir::<fn(u64, Option<u64>)>(&d, &contact, None)
+		.share_dir::<fn(u64, Option<u64>)>(&d, &contact, None, None)
 		.await
 		.unwrap();
 
@@ -598,7 +598,7 @@ async fn linked_reports_the_links_each_item_is_in() {
 	let f = drive_helpers::upload(client, &d, "f.txt", b"f").await;
 	let u = client.create_dir(&test_dir.into(), "u").await.unwrap();
 	let link = client
-		.public_link_dir::<fn(u64, Option<u64>)>(&d, None)
+		.public_link_dir::<fn(u64, Option<u64>)>(&d, None, None)
 		.await
 		.unwrap();
 
@@ -1223,7 +1223,7 @@ async fn shared_rename_updates_an_items_name_for_its_receiver() {
 		.await
 		.unwrap();
 	client
-		.share_dir::<fn(u64, Option<u64>)>(&d, &contact, None)
+		.share_dir::<fn(u64, Option<u64>)>(&d, &contact, None, None)
 		.await
 		.unwrap();
 	// The bulk metadata route renames on the drive alone, leaving the receiver's copy of the name.

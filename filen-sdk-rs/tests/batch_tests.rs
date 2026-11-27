@@ -337,7 +337,7 @@ async fn recorded_share(
 	let recorder = EndpointRecorder::default();
 	let subscriber = record_endpoints(&recorder);
 	client
-		.share_dir::<fn(u64, Option<u64>)>(&dir, contact, None)
+		.share_dir::<fn(u64, Option<u64>)>(&dir, contact, None, None)
 		.await
 		.expect("sharing the dir");
 	drop(subscriber);

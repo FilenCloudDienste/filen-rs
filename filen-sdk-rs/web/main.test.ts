@@ -1034,9 +1034,23 @@ test("sharing", { timeout: CONTACT_TEST_TIMEOUT }, async () => {
 	})
 
 	const contact = await ensureShareContact()
-	await state.shareDir(dir, contact, (downloaded: number, total: number | undefined) => {
-		console.log(`Shared dir upload progress: ${downloaded}/${total}`)
-	})
+	const shareReports: [number, number][] = []
+	await state.shareDir(
+		dir,
+		contact,
+		(downloaded: number, total: number | undefined) => {
+			console.log(`Shared dir upload progress: ${downloaded}/${total}`)
+		},
+		(sharedItems, totalItems) => {
+			shareReports.push([sharedItems, totalItems])
+		}
+	)
+	// the directory and its file, every report delivered before the call resolves
+	expect(shareReports).toEqual([
+		[0, 2],
+		[1, 2],
+		[2, 2]
+	])
 	const shared = await state.listOutShared(contact)
 	const sharedDir = shared.dirs.find(d => d.inner.uuid === dir.uuid)
 	expect(sharedDir).toBeDefined()
@@ -2027,9 +2041,22 @@ test("listLinkedItems", async () => {
 		parent: dir,
 		name: "linked-file.txt"
 	})
-	await state.publicLinkDir(dir, (downloaded, total) => {
-		console.log("callback", downloaded, total)
-	})
+	const linkReports: [number, number][] = []
+	await state.publicLinkDir(
+		dir,
+		(downloaded, total) => {
+			console.log("callback", downloaded, total)
+		},
+		(linkedItems, totalItems) => {
+			linkReports.push([linkedItems, totalItems])
+		}
+	)
+	// the directory and its file, every report delivered before the call resolves
+	expect(linkReports).toEqual([
+		[0, 2],
+		[1, 2],
+		[2, 2]
+	])
 	let linkedItems = await state.listLinkedItems()
 	const found = linkedItems.dirs.find(i => i.uuid === dir.uuid)
 	expect(found).toBeDefined()

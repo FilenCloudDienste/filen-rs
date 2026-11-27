@@ -75,7 +75,7 @@ pub fn noise(len: usize, seed: u8) -> Vec<u8> {
 /// A new public link to `dir`, as someone given it reads it.
 pub async fn dir_link_info(client: &Client, dir: &RemoteDirectory) -> DirPublicInfo {
 	let link: DirPublicLink = client
-		.public_link_dir::<fn(u64, Option<u64>)>(dir, None)
+		.public_link_dir::<fn(u64, Option<u64>)>(dir, None, None)
 		.await
 		.unwrap()
 		.try_into()

@@ -537,7 +537,7 @@ async fn scale_27_first_sync_into_a_linked_directory_reaches_the_link() {
 	let sc = single_client(SyncMode::LocalToRemote).await;
 	let client = &sc.resources.client;
 	client
-		.public_link_dir::<fn(u64, Option<u64>)>(&sc.resources.dir, None)
+		.public_link_dir::<fn(u64, Option<u64>)>(&sc.resources.dir, None, None)
 		.await
 		.unwrap();
 

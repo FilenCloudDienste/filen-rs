@@ -87,7 +87,7 @@ async fn make_rs_compat_dir() {
 	let share_client = test_utils::SHARE_RESOURCES.client().await;
 	let (contact, _contact_locks) = test_utils::ensure_contact(client, &share_client).await;
 	client
-		.share_dir::<fn(u64, Option<u64>)>(&compat_dir, &contact, None)
+		.share_dir::<fn(u64, Option<u64>)>(&compat_dir, &contact, None, None)
 		.await
 		.unwrap();
 

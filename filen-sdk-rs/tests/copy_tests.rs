@@ -359,7 +359,7 @@ async fn copies_from_public_links() {
 	// a password-protected directory link
 	let password = "copy-password";
 	let mut link_rw = client
-		.public_link_dir::<fn(u64, Option<u64>)>(&source, None)
+		.public_link_dir::<fn(u64, Option<u64>)>(&source, None, None)
 		.await
 		.unwrap();
 	link_rw.set_password(password.to_owned());

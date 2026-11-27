@@ -62,7 +62,7 @@ async fn dir_public_link() {
 	assert_eq!(no_link, None);
 
 	let mut link_rw = client
-		.public_link_dir::<fn(u64, Option<u64>)>(&dir, None)
+		.public_link_dir::<fn(u64, Option<u64>)>(&dir, None, None)
 		.await
 		.unwrap();
 
@@ -216,7 +216,7 @@ async fn move_into_linked_dir_propagates() {
 		.await
 		.unwrap();
 	client
-		.public_link_dir::<fn(u64, Option<u64>)>(&parent, None)
+		.public_link_dir::<fn(u64, Option<u64>)>(&parent, None, None)
 		.await
 		.unwrap();
 
@@ -278,7 +278,7 @@ async fn link_added_mid_hold_reaches_what_is_created_after_it() {
 	client.upload_file(f1, b"before the link").await.unwrap();
 
 	client
-		.public_link_dir::<fn(u64, Option<u64>)>(&dir, None)
+		.public_link_dir::<fn(u64, Option<u64>)>(&dir, None, None)
 		.await
 		.unwrap();
 
@@ -328,7 +328,7 @@ async fn move_into_linked_dir_mid_hold_reaches_what_is_uploaded_after_it() {
 
 	let linked = client.create_dir(&test_dir.into(), "l").await.unwrap();
 	client
-		.public_link_dir::<fn(u64, Option<u64>)>(&linked, None)
+		.public_link_dir::<fn(u64, Option<u64>)>(&linked, None, None)
 		.await
 		.unwrap();
 	let mut moved = client.create_dir(&test_dir.into(), "x").await.unwrap();
@@ -392,7 +392,7 @@ async fn share_added_mid_hold_reaches_what_is_uploaded_after_it() {
 	client.upload_file(f1, b"before the share").await.unwrap();
 
 	client
-		.share_dir::<fn(u64, Option<u64>)>(&dir, &contact, None)
+		.share_dir::<fn(u64, Option<u64>)>(&dir, &contact, None, None)
 		.await
 		.unwrap();
 
@@ -439,7 +439,7 @@ async fn create_dir_merged_into_unlinked_dir_adds_it_to_the_link() {
 		.await
 		.unwrap();
 	client
-		.public_link_dir::<fn(u64, Option<u64>)>(&parent, None)
+		.public_link_dir::<fn(u64, Option<u64>)>(&parent, None, None)
 		.await
 		.unwrap();
 	let link: DirPublicLink = client
@@ -515,7 +515,7 @@ async fn dir_public_link_remove() {
 
 	// Create the public link over the whole tree.
 	let link_rw = client
-		.public_link_dir::<fn(u64, Option<u64>)>(&dir, None)
+		.public_link_dir::<fn(u64, Option<u64>)>(&dir, None, None)
 		.await
 		.unwrap();
 
@@ -576,7 +576,7 @@ async fn dir_public_link_remove() {
 
 	// Removal leaves the directory in a clean state: it can be re-linked and re-removed.
 	client
-		.public_link_dir::<fn(u64, Option<u64>)>(&dir, None)
+		.public_link_dir::<fn(u64, Option<u64>)>(&dir, None, None)
 		.await
 		.unwrap();
 	assert!(client.get_dir_link_rw(&dir).await.unwrap().is_some());
@@ -883,7 +883,7 @@ async fn share_dir() {
 
 	let (contact, _contact_locks) = test_utils::ensure_contact(client, share_client).await;
 	client
-		.share_dir::<fn(u64, Option<u64>)>(&dir, &contact, None)
+		.share_dir::<fn(u64, Option<u64>)>(&dir, &contact, None, None)
 		.await
 		.unwrap();
 	// sleep because sometimes this takes a second to become available on the backend
@@ -1240,16 +1240,16 @@ async fn copy_with_shares(
 	let later = client.create_dir(&test_dir.into(), "later").await.unwrap();
 
 	client
-		.share_dir::<fn(u64, Option<u64>)>(&shared, contact, None)
+		.share_dir::<fn(u64, Option<u64>)>(&shared, contact, None, None)
 		.await
 		.unwrap();
 	client.share_file(&solo, contact).await.unwrap();
 	client
-		.share_dir::<fn(u64, Option<u64>)>(&dest, contact, None)
+		.share_dir::<fn(u64, Option<u64>)>(&dest, contact, None, None)
 		.await
 		.unwrap();
 	let dest_link: DirPublicLink = client
-		.public_link_dir::<fn(u64, Option<u64>)>(&dest, None)
+		.public_link_dir::<fn(u64, Option<u64>)>(&dest, None, None)
 		.await
 		.unwrap()
 		.try_into()
@@ -1336,7 +1336,7 @@ async fn copy_with_shares(
 	let mine_inside = upload(&share_client, &mine, "mine.txt", b"the copier's own").await;
 	let mine_file = upload(&share_client, share_test_dir, "mine-file.txt", b"own file").await;
 	let own_link: DirPublicLink = client
-		.public_link_dir::<fn(u64, Option<u64>)>(&own, None)
+		.public_link_dir::<fn(u64, Option<u64>)>(&own, None, None)
 		.await
 		.unwrap()
 		.try_into()
@@ -1519,7 +1519,7 @@ async fn copy_with_shares(
 	});
 	wait_until_paused(&recorder).await;
 	client
-		.share_dir::<fn(u64, Option<u64>)>(&later, contact, None)
+		.share_dir::<fn(u64, Option<u64>)>(&later, contact, None, None)
 		.await
 		.unwrap();
 	controller.resume();

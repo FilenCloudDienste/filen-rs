@@ -214,6 +214,68 @@ async fn drain_collecting_errors_awaits_all_and_aggregates_failures() {
 	);
 }
 
+// A UI switches from the listing to the posts on the first report, so `(0, total)` comes before
+// any post completes, then one report per completed post, the total counting every post.
+#[tokio::test]
+async fn drain_reporting_items_reports_zero_then_each_completed_post() {
+	let futures: FuturesUnordered<MaybeSendBoxFuture<'_, Result<(), Error>>> =
+		FuturesUnordered::new();
+	for _ in 0..3 {
+		futures.push(Box::pin(async { Ok(()) }) as MaybeSendBoxFuture<'_, Result<(), Error>>);
+	}
+	let reports = std::sync::Mutex::new(Vec::new());
+
+	drain_reporting_items(
+		futures,
+		Some(&|posted, total| reports.lock().unwrap().push((posted, total))),
+	)
+	.await
+	.unwrap();
+
+	assert_eq!(
+		reports.into_inner().unwrap(),
+		[(0, 3), (1, 3), (2, 3), (3, 3)]
+	);
+}
+
+// Unlike propagation, linking or sharing a directory stops at the first failed post, and the
+// failed post is not counted as done.
+#[tokio::test]
+async fn drain_reporting_items_stops_at_the_first_failure() {
+	let futures: FuturesUnordered<MaybeSendBoxFuture<'_, Result<(), Error>>> =
+		FuturesUnordered::new();
+	futures.push(Box::pin(async { Ok(()) }) as MaybeSendBoxFuture<'_, Result<(), Error>>);
+	futures.push(Box::pin(futures::future::pending()) as MaybeSendBoxFuture<'_, Result<(), Error>>);
+	// fails on its second poll, so the post above has completed by then whatever the order
+	futures.push(Box::pin(async {
+		tokio::task::yield_now().await;
+		Err(Error::custom(ErrorKind::Conversion, "failed post"))
+	}) as MaybeSendBoxFuture<'_, Result<(), Error>>);
+	let reports = std::sync::Mutex::new(Vec::new());
+
+	let error = drain_reporting_items(
+		futures,
+		Some(&|posted, total| reports.lock().unwrap().push((posted, total))),
+	)
+	.await
+	.unwrap_err();
+
+	assert_eq!(error.kind(), ErrorKind::Conversion);
+	assert_eq!(reports.into_inner().unwrap(), [(0, 3), (1, 3)]);
+}
+
+#[tokio::test]
+async fn drain_reporting_items_without_a_callback_still_returns_the_failure() {
+	let futures: FuturesUnordered<MaybeSendBoxFuture<'_, Result<(), Error>>> =
+		FuturesUnordered::new();
+	futures.push(
+		Box::pin(async { Err(Error::custom(ErrorKind::Conversion, "failed post")) })
+			as MaybeSendBoxFuture<'_, Result<(), Error>>,
+	);
+
+	assert!(drain_reporting_items(futures, None).await.is_err());
+}
+
 /// Locks built inside a runtime that is never driven, so dropping one queues its release
 /// and nothing leaves the process.
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]

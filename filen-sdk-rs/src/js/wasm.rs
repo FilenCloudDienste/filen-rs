@@ -27,7 +27,7 @@ pub fn main_js() -> Result<(), JsValue> {
 /// where the JS functions it calls live (they never leave the thread that got them). Dropping
 /// every returned sender ends the task, which then resolves the returned receiver: every item
 /// sent by then has been handled.
-fn spawn_local_dispatch<T: 'static>(
+pub(crate) fn spawn_local_dispatch<T: 'static>(
 	mut handler: impl FnMut(T) + 'static,
 ) -> (UnboundedSender<T>, oneshot::Receiver<()>) {
 	let (sender, mut receiver) = mpsc::unbounded_channel::<T>();

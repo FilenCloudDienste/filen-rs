@@ -24,7 +24,10 @@ use crate::{
 	runtime::{self, do_on_commander},
 };
 #[cfg(feature = "uniffi")]
-use crate::{auth::js_impls::UnauthJsClient, fs::dir::js_impl::DirContentDownloadProgressCallback};
+use crate::{
+	auth::js_impls::UnauthJsClient, fs::dir::js_impl::DirContentDownloadProgressCallback,
+	js::spawn_ordered_dispatch,
+};
 
 #[js_type(import, export)]
 pub struct Contact {
@@ -218,6 +221,47 @@ pub struct SharedRootDirsAndFiles {
 	pub files: Vec<SharedFile>,
 }
 
+/// The `items_callback` a directory job gets on the commander: sends each
+/// `(items processed, items in total)` to the thread that calls the caller's callback.
+#[cfg(any(feature = "uniffi", all(target_family = "wasm", target_os = "unknown")))]
+fn send_items_progress(
+	sender: tokio::sync::mpsc::UnboundedSender<(u64, u64)>,
+) -> impl Fn(u64, u64) + Send + Sync {
+	move |items_processed, total_items| {
+		let _ = sender.send((items_processed, total_items));
+	}
+}
+
+/// Returns once every report sent before the job ended was delivered: the job dropped its
+/// sender, which ends the dispatch.
+#[cfg(any(feature = "uniffi", all(target_family = "wasm", target_os = "unknown")))]
+async fn items_delivered(delivered: Option<tokio::sync::oneshot::Receiver<()>>) {
+	if let Some(delivered) = delivered {
+		let _ = delivered.await;
+	}
+}
+
+/// Gets `(items processed, items in total)` while a directory's items are linked or shared.
+#[cfg(feature = "uniffi")]
+#[uniffi::export(with_foreign)]
+pub trait ItemsProgressCallback: Send + Sync {
+	fn on_progress(&self, items_processed: u64, total_items: u64);
+}
+
+/// Calls `callback` with each `(items processed, items in total)` sent to the returned sender,
+/// in order, off the runtime; the receiver resolves once every report was delivered.
+#[cfg(feature = "uniffi")]
+fn foreign_items_dispatch(
+	callback: Arc<dyn ItemsProgressCallback>,
+) -> (
+	tokio::sync::mpsc::UnboundedSender<(u64, u64)>,
+	tokio::sync::oneshot::Receiver<()>,
+) {
+	spawn_ordered_dispatch(move |(items_processed, total_items)| {
+		callback.on_progress(items_processed, total_items);
+	})
+}
+
 #[cfg(feature = "uniffi")]
 // We need to separate these out because otherwise we get
 // implementation of `std::marker::Send` is not general enough
@@ -228,18 +272,27 @@ impl JsClient {
 		&self,
 		dir: Dir,
 		callback: Option<F>,
+		items_callback: Option<Arc<dyn ItemsProgressCallback>>,
 	) -> Result<DirPublicLinkRW, Error>
 	where
 		F: Fn(u64, Option<u64>) + Send + Sync + 'static,
 	{
 		let this = self.inner();
-		runtime::do_on_commander(move || async move {
+		let (items_sender, delivered) = items_callback.map(foreign_items_dispatch).unzip();
+		let result = runtime::do_on_commander(move || async move {
 			let dir = dir.into();
-			this.public_link_dir(&dir, callback.as_ref())
-				.await
-				.map(|link| link.into())
+			let items_callback = items_sender.map(send_items_progress);
+			this.public_link_dir(
+				&dir,
+				callback.as_ref(),
+				items_callback.as_ref().map(|c| c as _),
+			)
+			.await
+			.map(|link| link.into())
 		})
-		.await
+		.await;
+		items_delivered(delivered).await;
+		result
 	}
 
 	async fn inner_share_dir<F>(
@@ -247,27 +300,46 @@ impl JsClient {
 		dir: Dir,
 		contact: Contact,
 		callback: Option<F>,
+		items_callback: Option<Arc<dyn ItemsProgressCallback>>,
 	) -> Result<(), Error>
 	where
 		F: Fn(u64, Option<u64>) + Send + Sync + 'static,
 	{
 		let this = self.inner();
-		do_on_commander(move || {
+		let (items_sender, delivered) = items_callback.map(foreign_items_dispatch).unzip();
+		let result = do_on_commander(move || {
 			let contact = contact.into();
 			let dir = dir.into();
-			async move { this.share_dir(&dir, &contact, callback.as_ref()).await }
+			async move {
+				let items_callback = items_sender.map(send_items_progress);
+				this.share_dir(
+					&dir,
+					&contact,
+					callback.as_ref(),
+					items_callback.as_ref().map(|c| c as _),
+				)
+				.await
+			}
 		})
-		.await
+		.await;
+		items_delivered(delivered).await;
+		result
 	}
 }
 
 #[cfg(feature = "uniffi")]
 #[uniffi::export]
 impl JsClient {
+	/// `callback` gets `(bytes listed, total bytes)` while the tree is listed, `items_callback`
+	/// `(items linked, items in total)` while they are linked: `(0, total)` once the listing is
+	/// in, then after each item, the directory itself counted. Every items report is delivered
+	/// before the call returns.
+	#[uniffi::method(default(items_callback = None))]
 	pub async fn public_link_dir(
 		&self,
 		dir: Dir,
 		callback: Option<Arc<dyn DirContentDownloadProgressCallback>>,
+		items_callback: Option<Arc<dyn ItemsProgressCallback>>,
 	) -> Result<DirPublicLinkRW, Error> {
 		self.inner_public_link_dir(
 			dir,
@@ -279,15 +351,22 @@ impl JsClient {
 					});
 				}
 			}),
+			items_callback,
 		)
 		.await
 	}
 
+	/// `callback` gets `(bytes listed, total bytes)` while the tree is listed, `items_callback`
+	/// `(items shared, items in total)` while they are shared: `(0, total)` once the listing is
+	/// in, then after each item, the directory itself counted. Every items report is delivered
+	/// before the call returns.
+	#[uniffi::method(default(items_callback = None))]
 	pub async fn share_dir(
 		&self,
 		dir: Dir,
 		contact: Contact,
 		callback: Option<Arc<dyn DirContentDownloadProgressCallback>>,
+		items_callback: Option<Arc<dyn ItemsProgressCallback>>,
 	) -> Result<(), Error> {
 		self.inner_share_dir(
 			dir,
@@ -300,6 +379,7 @@ impl JsClient {
 					});
 				}
 			}),
+			items_callback,
 		)
 		.await
 	}
@@ -309,6 +389,10 @@ impl JsClient {
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 #[wasm_bindgen::prelude::wasm_bindgen(js_class = "Client")]
 impl JsClient {
+	/// `callback` gets `(bytes listed, total bytes)` while the tree is listed, `items_callback`
+	/// `(items linked, items in total)` while they are linked: `(0, total)` once the listing is
+	/// in, then after each item, the directory itself counted. Every items report is delivered
+	/// before the promise settles.
 	#[wasm_bindgen::prelude::wasm_bindgen(js_name = "publicLinkDir")]
 	pub async fn public_link_dir(
 		&self,
@@ -317,6 +401,10 @@ impl JsClient {
 			unchecked_param_type = "(downloadedBytes: number, totalBytes: number | undefined) => void | undefined"
 		)]
 		callback: web_sys::js_sys::Function,
+		#[wasm_bindgen(
+			unchecked_param_type = "((linkedItems: number, totalItems: number) => void) | void"
+		)]
+		items_callback: Option<web_sys::js_sys::Function>,
 	) -> Result<DirPublicLinkRW, Error> {
 		use crate::runtime;
 		use wasm_bindgen::JsValue;
@@ -342,16 +430,29 @@ impl JsClient {
 			})
 		};
 
+		let (items_sender, delivered) = items_callback.map(js_items_dispatch).unzip();
+
 		let this = self.inner();
-		runtime::do_on_commander(move || async move {
+		let result = runtime::do_on_commander(move || async move {
 			let dir = dir.into();
-			this.public_link_dir(&dir, callback.as_ref())
-				.await
-				.map(|link| link.into())
+			let items_callback = items_sender.map(send_items_progress);
+			this.public_link_dir(
+				&dir,
+				callback.as_ref(),
+				items_callback.as_ref().map(|c| c as _),
+			)
+			.await
+			.map(|link| link.into())
 		})
-		.await
+		.await;
+		items_delivered(delivered).await;
+		result
 	}
 
+	/// `callback` gets `(bytes listed, total bytes)` while the tree is listed, `items_callback`
+	/// `(items shared, items in total)` while they are shared: `(0, total)` once the listing is
+	/// in, then after each item, the directory itself counted. Every items report is delivered
+	/// before the promise settles.
 	#[wasm_bindgen::prelude::wasm_bindgen(js_name = "shareDir")]
 	pub async fn share_dir(
 		&self,
@@ -361,6 +462,10 @@ impl JsClient {
 			unchecked_param_type = "(downloadedBytes: number, totalBytes: number | undefined) => void | undefined"
 		)]
 		callback: web_sys::js_sys::Function,
+		#[wasm_bindgen(
+			unchecked_param_type = "((sharedItems: number, totalItems: number) => void) | void"
+		)]
+		items_callback: Option<web_sys::js_sys::Function>,
 	) -> Result<(), Error> {
 		use crate::runtime;
 		use wasm_bindgen::JsValue;
@@ -387,15 +492,46 @@ impl JsClient {
 			})
 		};
 
+		let (items_sender, delivered) = items_callback.map(js_items_dispatch).unzip();
+
 		let this = self.inner();
 
-		do_on_commander(move || {
+		let result = do_on_commander(move || {
 			let contact = contact.into();
 			let dir = dir.into();
-			async move { this.share_dir(&dir, &contact, callback.as_ref()).await }
+			async move {
+				let items_callback = items_sender.map(send_items_progress);
+				this.share_dir(
+					&dir,
+					&contact,
+					callback.as_ref(),
+					items_callback.as_ref().map(|c| c as _),
+				)
+				.await
+			}
 		})
-		.await
+		.await;
+		items_delivered(delivered).await;
+		result
 	}
+}
+
+/// Calls `callback` with each `(items processed, items in total)` sent to the returned sender,
+/// in order, on this thread; the receiver resolves once every report was delivered.
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+fn js_items_dispatch(
+	callback: web_sys::js_sys::Function,
+) -> (
+	tokio::sync::mpsc::UnboundedSender<(u64, u64)>,
+	tokio::sync::oneshot::Receiver<()>,
+) {
+	crate::js::spawn_local_dispatch(move |(items_processed, total_items): (u64, u64)| {
+		let _ = callback.call2(
+			&wasm_bindgen::JsValue::UNDEFINED,
+			&wasm_bindgen::JsValue::from_f64(items_processed as f64),
+			&wasm_bindgen::JsValue::from_f64(total_items as f64),
+		);
+	})
 }
 
 #[filen_macros::js_exports]
