@@ -825,6 +825,16 @@ impl SharedClientState {
 		// one was explicitly set. A default-config client leaves this `None` so routine client
 		// construction never reverts the host's or cache's configured verbosity (or a runtime
 		// `set_log_level`). No-op anyway if logging has not been initialised yet.
+		//
+		// The service-worker build (wasm without `wasm-full`) never installs the subscriber, since
+		// only `js::wasm::main_js` calls `obs::try_init` there, so the call would always be that
+		// no-op. Leaving it out keeps the env-filter parser and its regex engine out of that
+		// binary. A logger installed there would first need this call back.
+		#[cfg(not(all(
+			target_family = "wasm",
+			target_os = "unknown",
+			not(feature = "wasm-full")
+		)))]
 		if let Some(log_level) = config.log_level {
 			crate::obs::set_log_level(log_level);
 		}
