@@ -63,6 +63,10 @@ const webDir = join(dirname(fileURLToPath(import.meta.url)), "..")
 // A file URL, not a path: import() rejects an absolute Windows path (ERR_UNSUPPORTED_ESM_URL_SCHEME).
 const addon = new URL("../node/index.js", import.meta.url).href
 
+// The addon's typings with LF line endings: build:napi prefixes them with compat.d.ts as it is
+// checked out, which is CRLF on a Windows clone with autocrlf, above napi's own LF output.
+const readTypings = () => readFileSync(join(webDir, "node", "index.d.ts"), "utf8").replaceAll("\r\n", "\n")
+
 // A record that passes napi's own conversion but no SDK check: the keys cannot be parsed.
 const malformedStringified = {
 	email: "smoke@example.com",
@@ -870,7 +874,7 @@ describe("transfers, offline", () => {
 	})
 
 	test("FileBuilderParamsOptionalName's noExif and noExifOverride are optional, as uniffi defaults them", () => {
-		const typings = readFileSync(join(webDir, "node", "index.d.ts"), "utf8")
+		const typings = readTypings()
 		assert.match(
 			typings,
 			/^export interface FileBuilderParamsOptionalName \{\n(?: {2}.*\n)*? {2}noExif\?: boolean \| undefined\n {2}noExifOverride\?: boolean \| undefined\n\}$/m
@@ -964,7 +968,7 @@ describe("transfers, offline", () => {
 
 	test("uploadFileFromBytes is a JsClient method typed as ubrn's, its bytes a Uint8Array", () => {
 		assert.equal(typeof JsClient.prototype.uploadFileFromBytes, "function")
-		const typings = readFileSync(join(webDir, "node", "index.d.ts"), "utf8")
+		const typings = readTypings()
 		assert.ok(
 			typings.includes(
 				"  uploadFileFromBytes(data: Uint8Array, params: UploadFileParams, asyncOpts_?: { signal: AbortSignal }): Promise<File>\n"
@@ -1094,7 +1098,7 @@ describe("transfers, offline", () => {
 
 	test("uploadFileFromReader is a JsClient method typed as the wasm build's", () => {
 		assert.equal(typeof JsClient.prototype.uploadFileFromReader, "function")
-		const typings = readFileSync(join(webDir, "node", "index.d.ts"), "utf8")
+		const typings = readTypings()
 		assert.ok(
 			typings.includes("  uploadFileFromReader(params: UploadFileStreamParams, asyncOpts_?: { signal: AbortSignal }): Promise<File>\n"),
 			"uploadFileFromReader's typing"
