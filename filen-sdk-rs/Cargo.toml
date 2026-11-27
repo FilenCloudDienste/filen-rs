@@ -213,12 +213,12 @@ tokio-util = { version = "0.7.16", default-features = false, features = [
 ] }
 bytes = "1.10.1"
 tracing = "0.1"
-# Registry + EnvFilter are needed on every target (incl. wasm). The `fmt` layer (span
-# busy/idle timing) is added per-target below — wasm uses wasm-tracing instead, since
-# fmt's FmtSpan timing calls Instant::now() which panics on wasm32-unknown-unknown.
+# Registry + the Targets filter are needed on every target (incl. wasm). The `fmt` layer
+# (span busy/idle timing) and EnvFilter are added per-target below — wasm uses wasm-tracing
+# instead, since fmt's FmtSpan timing calls Instant::now() which panics on
+# wasm32-unknown-unknown, and has no environment for EnvFilter to read.
 tracing-subscriber = { version = "0.3", default-features = false, features = [
 	"registry",
-	"env-filter",
 	"std",
 ] }
 async_zip = { git = "https://github.com/Enduriel/rs-async-zip.git", rev = "6ad27fd1010b35de2a96143884c1bce95e939e5e", default-features = false, features = [
@@ -344,10 +344,11 @@ tracing-oslog = { version = "0.3", optional = true }
 
 # native (not wasm) only dependencies
 [target.'cfg(not(all(target_family = "wasm", target_os = "unknown")))'.dependencies]
-# fmt layer (span busy/idle timing) is native-only; LogTracer captures `log` records
-# emitted by deps (reqwest, tokio-tungstenite) into the tracing pipeline.
+# fmt layer (span busy/idle timing) and EnvFilter (RUST_LOG) are native-only; LogTracer
+# captures `log` records emitted by deps (reqwest, tokio-tungstenite) into the tracing pipeline.
 tracing-subscriber = { version = "0.3", default-features = false, features = [
 	"fmt",
+	"env-filter",
 ] }
 tracing-log = "0.2"
 microthumb = { path = "../microthumb", features = ["svg"] }

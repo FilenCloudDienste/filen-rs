@@ -828,8 +828,8 @@ impl SharedClientState {
 		//
 		// The service-worker build (wasm without `wasm-full`) never installs the subscriber, since
 		// only `js::wasm::main_js` calls `obs::try_init` there, so the call would always be that
-		// no-op. Leaving it out keeps the env-filter parser and its regex engine out of that
-		// binary. A logger installed there would first need this call back.
+		// no-op. Leaving it out keeps the filter and its directive parser out of that binary. A
+		// logger installed there would first need this call back.
 		#[cfg(not(all(
 			target_family = "wasm",
 			target_os = "unknown",

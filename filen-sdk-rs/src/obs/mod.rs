@@ -10,10 +10,14 @@
 //!   This also collapses the two historical init sites into one and removes the
 //!   competing-global-logger panic hazard.
 //!
-//! - **Filtering — global `EnvFilter` + runtime reload.** A single process-wide
-//!   [`EnvFilter`] (seeded from a [`LogLevel`], honouring `RUST_LOG` where an env exists)
-//!   is wrapped in a [`reload`] layer. [`set_log_level`] flips verbosity live via the
-//!   stored [`reload::Handle`] — e.g. a "verbose logging" toggle on a device.
+//! - **Filtering — global filter + runtime reload.** A single process-wide filter (seeded
+//!   from a [`LogLevel`]) is wrapped in a [`reload`] layer. [`set_log_level`] flips verbosity
+//!   live via the stored [`reload::Handle`] — e.g. a "verbose logging" toggle on a device.
+//!   Natively it is an `EnvFilter`, which also honours `RUST_LOG`. On wasm, where there is no
+//!   environment, it is a [`Targets`](tracing_subscriber::filter::Targets) filter built from
+//!   the same directives: they only name targets and levels, and leaving `EnvFilter` (and the
+//!   regex engine its span/field directives parse with) out of wasm takes about 150 KB off
+//!   the full build's binary. The service-worker build installs no filter at all.
 //!
 //! - **Sinks (per target).** native desktop → `fmt` to stdout · iOS (and other Apple targets
 //!   with the `oslog` feature) → `tracing-oslog` ·
@@ -31,15 +35,20 @@
 
 use std::sync::OnceLock;
 
-use tracing_subscriber::{EnvFilter, Registry, filter::LevelFilter, reload};
+use tracing_subscriber::{Registry, filter::LevelFilter, reload};
 
 use crate::auth::http::LogLevel;
 
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 pub use inflight::{inflight_count, warn_stale_operations};
 
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+type GlobalFilter = tracing_subscriber::EnvFilter;
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+type GlobalFilter = tracing_subscriber::filter::Targets;
+
 /// Handle to the reloadable global filter, populated iff *we* installed the subscriber.
-static RELOAD_HANDLE: OnceLock<reload::Handle<EnvFilter, Registry>> = OnceLock::new();
+static RELOAD_HANDLE: OnceLock<reload::Handle<GlobalFilter, Registry>> = OnceLock::new();
 
 fn level_filter(level: LogLevel) -> LevelFilter {
 	match level {
@@ -52,14 +61,25 @@ fn level_filter(level: LogLevel) -> LevelFilter {
 	}
 }
 
-fn build_filter(level: LogLevel) -> EnvFilter {
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+fn build_filter(level: LogLevel) -> GlobalFilter {
 	let (floor, default_directives) = first_party_directives(level);
 	// RUST_LOG overrides everything where an env exists (native dev); otherwise use the scoped
 	// default. `parse_lossy` never panics on a malformed directive or a target without an env.
 	let directives = std::env::var("RUST_LOG").unwrap_or(default_directives);
-	EnvFilter::builder()
+	GlobalFilter::builder()
 		.with_default_directive(floor.into())
 		.parse_lossy(directives)
+}
+
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+fn build_filter(level: LogLevel) -> GlobalFilter {
+	let (floor, directives) = first_party_directives(level);
+	// The directives are ours and parse; should that ever break, fall back to the floor alone
+	// rather than lose the floor's scoping of third-party crates.
+	directives
+		.parse()
+		.unwrap_or_else(|_| GlobalFilter::new().with_default(floor))
 }
 
 /// First-party crates track `level`; non-first-party crates (reqwest, hyper, tokio-tungstenite, ...)
@@ -430,5 +450,44 @@ mod tests {
 			directives.starts_with("warn,") && directives.contains("filen_sdk_rs=debug"),
 			"got: {directives}"
 		);
+	}
+
+	/// wasm builds its filter by parsing these directives as a `Targets` filter: every level must
+	/// parse, keep its floor for third-party crates, and let first-party crates track the level.
+	#[test]
+	fn directives_parse_as_a_targets_filter() {
+		use tracing::Level;
+		use tracing_subscriber::filter::Targets;
+
+		for (level, lvl) in [
+			(LogLevel::Off, LevelFilter::OFF),
+			(LogLevel::Error, LevelFilter::ERROR),
+			(LogLevel::Warn, LevelFilter::WARN),
+			(LogLevel::Info, LevelFilter::INFO),
+			(LogLevel::Debug, LevelFilter::DEBUG),
+			(LogLevel::Trace, LevelFilter::TRACE),
+		] {
+			let (floor, directives) = first_party_directives(level);
+			let targets: Targets = directives.parse().expect(&directives);
+			assert_eq!(targets.default_level(), Some(floor), "{directives}");
+			for event in [
+				Level::ERROR,
+				Level::WARN,
+				Level::INFO,
+				Level::DEBUG,
+				Level::TRACE,
+			] {
+				assert_eq!(
+					targets.would_enable("filen_sdk_rs::obs", &event),
+					event <= lvl,
+					"{directives}: first-party {event}"
+				);
+				assert_eq!(
+					targets.would_enable("reqwest::connect", &event),
+					event <= floor,
+					"{directives}: third-party {event}"
+				);
+			}
+		}
 	}
 }
