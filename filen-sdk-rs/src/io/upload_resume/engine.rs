@@ -39,7 +39,7 @@ use crate::{
 		client_impl::{fill_from, on_blocking_thread},
 	},
 	progress::ThrottledProgress,
-	util::{MaybeArc, MaybeSendCallback},
+	util::{MaybeArc, MaybeParallelHasher, MaybeSendCallback},
 };
 
 /// The local file a resuming upload sends, opened and stated once by the caller.
@@ -445,7 +445,7 @@ where
 			if data.len() < len {
 				return Err(self.changed().await);
 			}
-			hasher.update_rayon(&data);
+			hasher.update_maybe_par(&data);
 			if let Some(tee) = exif_tee.as_mut() {
 				// Backpressure first, then hand the bytes over once: on Pending the tee keeps
 				// them, and the next wait sends them first.

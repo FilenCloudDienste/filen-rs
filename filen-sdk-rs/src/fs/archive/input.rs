@@ -34,7 +34,7 @@ use crate::{
 		JobControl, Stopped,
 		report::{JobPhase, JobState, OpGuard, Ops, Reporter},
 	},
-	util::{MaybeArc, MaybeSend, MaybeSendBoxFuture, sleep},
+	util::{MaybeArc, MaybeParallelHasher, MaybeSend, MaybeSendBoxFuture, sleep},
 };
 
 /// Longest a job that only reads its archive waits on where its entries go before it fails and
@@ -313,7 +313,7 @@ impl ArchiveInput {
 			self.next_fetch = index + 1;
 			self.served = index + 1;
 			self.run += 1;
-			self.hasher.update_rayon(&data);
+			self.hasher.update_maybe_par(&data);
 			let _ = reply.send(data);
 			return;
 		}
@@ -389,7 +389,7 @@ impl ArchiveInput {
 		self.reading = Some(permit);
 		self.served += 1;
 		self.run += 1;
-		self.hasher.update_rayon(&data);
+		self.hasher.update_maybe_par(&data);
 		let data = Arc::new(data);
 		if let Some(kept) = &self.kept {
 			kept.keep_chunk(index, Arc::clone(&data));

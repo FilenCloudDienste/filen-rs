@@ -7,7 +7,7 @@ use blake3::{
 	hazmat::{ChainingValue, HasherExt, Mode, merge_subtrees_non_root, merge_subtrees_root},
 };
 
-use crate::consts::CHUNK_SIZE_U64;
+use crate::{consts::CHUNK_SIZE_U64, util::MaybeParallelHasher};
 
 // every chunk but the last is a whole BLAKE3 subtree: a power of two of its 1 KiB chunks
 const _: () = assert!(CHUNK_SIZE_U64.is_power_of_two() && CHUNK_SIZE_U64 >= CHUNK_LEN as u64);
@@ -45,7 +45,7 @@ impl HeadLastHasher {
 		self.chunks += 1;
 		let mut hasher = blake3::Hasher::new();
 		hasher.set_input_offset(self.chunks * CHUNK_SIZE_U64);
-		hasher.update_rayon(data);
+		hasher.update_maybe_par(data);
 		self.pending = Some(hasher.finalize_non_root());
 	}
 
@@ -75,7 +75,7 @@ impl HeadLastHasher {
 		};
 		let mut hasher = blake3::Hasher::new();
 		hasher.set_input_offset(0);
-		hasher.update_rayon(head);
+		hasher.update_maybe_par(head);
 		let left = self
 			.head_siblings
 			.iter()

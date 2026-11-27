@@ -67,7 +67,7 @@ use crate::{
 		JobControl, Stopped,
 		report::{JobReport, OpGuard},
 	},
-	util::{MaybeArc, MaybeSendBoxFuture, sleep},
+	util::{MaybeArc, MaybeParallelHasher, MaybeSendBoxFuture, sleep},
 };
 
 use super::{
@@ -575,7 +575,7 @@ impl<B: DisposalBackend> Driver<B> {
 			.ok()
 			.and_then(|source| self.sources.get_mut(source))
 			.expect("the driver fetches only its sources");
-		state.hasher.update_rayon(&data);
+		state.hasher.update_maybe_par(&data);
 		state.served += 1;
 		// a source whose data is not what its metadata declares fails the job before its last
 		// chunk reaches the codec: nothing is registered and no source is disposed of
@@ -694,7 +694,7 @@ impl<B: DisposalBackend> Driver<B> {
 		}
 		let (index, data) = match (chunk, &mut self.hash) {
 			(ArchiveChunk::Next(data), ArchiveHash::Streaming(hasher)) => {
-				hasher.update_rayon(&data);
+				hasher.update_maybe_par(&data);
 				self.next_index += 1;
 				(self.next_index - 1, data)
 			}

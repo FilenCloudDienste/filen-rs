@@ -70,7 +70,7 @@ use crate::{
 		JobControl, JobTasks, Stopped,
 		report::{JobReport, OpGuard},
 	},
-	util::{MaybeArc, MaybeSendBoxFuture, MaybeSendSync, sleep},
+	util::{MaybeArc, MaybeParallelHasher, MaybeSendBoxFuture, MaybeSendSync, sleep},
 };
 
 use super::report::{
@@ -943,7 +943,7 @@ async fn copy_file_inner<B: DriveBackend>(
 			},
 			Some((chunk, result, reservation)) = fetches.next() => match result {
 				Ok(data) => {
-					hasher.update_rayon(&data);
+					hasher.update_maybe_par(&data);
 					written += data.len() as u64;
 					let backend = Arc::clone(&backend);
 					let upload = Arc::clone(&upload);

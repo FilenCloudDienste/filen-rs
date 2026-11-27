@@ -37,7 +37,7 @@ use crate::{
 		file::write::{RemoteFileInfo, UploadCompletion},
 		name::keep_both::NameShape,
 	},
-	util::MaybeSendBoxFuture,
+	util::{MaybeParallelHasher, MaybeSendBoxFuture},
 };
 
 use super::{
@@ -168,7 +168,7 @@ impl<B: DisposalBackend> Driver<B> {
 			.files
 			.get_mut(&ordinal)
 			.expect("an uploading file is known");
-		file.hasher.update_rayon(&data);
+		file.hasher.update_maybe_par(&data);
 		file.written += len;
 		file.uploading += 1;
 		let index = file.next_index;

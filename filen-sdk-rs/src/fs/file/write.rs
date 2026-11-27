@@ -26,7 +26,7 @@ use crate::{
 	progress::ThrottledProgress,
 	runtime::{blocking_join, do_cpu_intensive},
 	sync::lock::{ResourceLock, confirm_or_retake},
-	util::{MaybeArc, MaybeSend, MaybeSendBoxFuture, MaybeSendCallback},
+	util::{MaybeArc, MaybeParallelHasher, MaybeSend, MaybeSendBoxFuture, MaybeSendCallback},
 };
 
 use super::{BaseFile, RemoteFile, meta::DecryptedFileMeta};
@@ -347,7 +347,7 @@ where
 		let file = self.file.clone();
 		let upload_key = self.upload_key.clone();
 		let progress = self.progress.clone();
-		self.hasher.update_rayon(out_data.as_ref());
+		self.hasher.update_maybe_par(out_data.as_ref());
 		let remote_file_info = self.remote_file_info.clone();
 		self.futures.push(Box::pin(async move {
 			let len = out_data.as_ref().len() as u64;

@@ -203,6 +203,22 @@ pub(crate) trait IntoMaybeParallelIterator: IntoIterator {
 #[cfg(not(feature = "multi-threaded-crypto"))]
 impl<T> IntoMaybeParallelIterator for T where T: IntoIterator {}
 
+/// BLAKE3 hashing on the rayon pool when there is one: without `multi-threaded-crypto` the
+/// crate links no rayon, so blake3's `rayon` feature (which pulls in rayon-core for
+/// `update_rayon`) is enabled only with it.
+pub(crate) trait MaybeParallelHasher {
+	fn update_maybe_par(&mut self, data: &[u8]);
+}
+
+impl MaybeParallelHasher for blake3::Hasher {
+	fn update_maybe_par(&mut self, data: &[u8]) {
+		#[cfg(feature = "multi-threaded-crypto")]
+		self.update_rayon(data);
+		#[cfg(not(feature = "multi-threaded-crypto"))]
+		self.update(data);
+	}
+}
+
 pub(crate) struct AtomicDropCanceller {
 	cancelled: Arc<std::sync::atomic::AtomicBool>,
 }

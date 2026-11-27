@@ -14,7 +14,7 @@ use crate::{
 	consts::{CHUNK_SIZE_U64, FILE_CHUNK_SIZE, FILE_CHUNK_SIZE_EXTRA},
 	crypto::shared::DataCrypter,
 	error::{ContentHashMismatchError, Error, ErrorKind, MetadataWasNotDecryptedError},
-	util::{MaybeSendBoxFuture, MaybeSendCallback},
+	util::{MaybeParallelHasher, MaybeSendBoxFuture, MaybeSendCallback},
 };
 
 use super::{chunk::Chunk, traits::File};
@@ -243,9 +243,8 @@ impl ContentVerifier {
 	pub(crate) fn update(&mut self, data: &[u8]) {
 		let left = usize::try_from(self.size.saturating_sub(self.hashed)).unwrap_or(usize::MAX);
 		let data = data.get(..left).unwrap_or(data);
-		// as `FileWriter` hashes what it uploads; where there are no threads (wasm without a
-		// worker pool) rayon runs it on the current thread
-		self.hasher.update_rayon(data);
+		// as `FileWriter` hashes what it uploads
+		self.hasher.update_maybe_par(data);
 		self.hashed = self
 			.hashed
 			.saturating_add(u64::try_from(data.len()).unwrap_or(u64::MAX));
