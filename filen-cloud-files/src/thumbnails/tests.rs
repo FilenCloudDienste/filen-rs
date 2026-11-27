@@ -892,7 +892,7 @@ async fn a_request_past_its_deadline_is_finished_in_the_background_and_answered_
 	assert_eq!(started.elapsed(), Duration::ZERO);
 	assert_eq!(setup.drive.thumbnail_cache_lookups(), lookups + 1);
 	assert_eq!(made_of(&setup, STABLE), 1, "the drive was asked once");
-	tokio::task::yield_now().await;
+	settle().await;
 	assert_eq!(setup.local.notified_items(), vec![root_path("a.bmp")]);
 	// Never hydrated, nor counted as a read.
 	assert_eq!(setup.drive.reads(), vec![]);
@@ -1177,7 +1177,7 @@ async fn stopping_cancels_the_background_at_once() {
 
 	// Its gate's permit is left for the next session's request.
 	gate.add_permits(1);
-	tokio::task::yield_now().await;
+	settle().await;
 	assert!(!setup.drive.keeps_thumbnail(VERSION, ICON_SIDE));
 	assert_eq!(setup.local.notified_items(), vec![]);
 	setup.service.serve(
@@ -1237,11 +1237,13 @@ fn told(setup: &Setup, name: &str) -> usize {
 		.count()
 }
 
-/// Lets every task ready to run, the background's included, run on the paused clock.
+/// Waits until nothing is left to run: every task idle and every blocking-pool task ended, the
+/// notifications among them, which the service hands to a blocking thread without waiting for
+/// them. A sleep on the paused clock ends only then, where a number of yields ends whenever the
+/// test's thread has run them, before a blocking thread that was slow to wake has done its work.
+/// It moves the clock by a millisecond, far below every deadline and window here.
 async fn settle() {
-	for _ in 0..64 {
-		tokio::task::yield_now().await;
-	}
+	tokio::time::sleep(Duration::from_millis(1)).await;
 }
 
 #[tokio::test(start_paused = true)]
